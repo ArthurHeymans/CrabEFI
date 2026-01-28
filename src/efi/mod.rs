@@ -22,15 +22,11 @@ pub fn init(cb_info: &CorebootInfo) {
     // Initialize the memory allocator from coreboot memory map
     allocator::init(&cb_info.memory_map);
 
-    // Reserve the runtime services memory region BEFORE any other allocations.
-    // This marks the System Table, Runtime Services table, and runtime code as
-    // EfiRuntimeServicesData/Code with EFI_MEMORY_RUNTIME attribute, which tells
-    // the OS to keep these regions mapped after ExitBootServices.
-    let system_table_addr = system_table::get_system_table() as u64;
-    let runtime_services_addr = runtime_services::get_runtime_services() as u64;
-    // Get address of a runtime function to locate the code section
-    let runtime_code_addr = runtime_services::get_runtime_code_address();
-    allocator::reserve_runtime_region(system_table_addr, runtime_services_addr, runtime_code_addr);
+    // Reserve the runtime services memory regions using linker-provided boundaries.
+    // This marks CrabEFI's code and data sections as EfiRuntimeServicesCode/Data
+    // with EFI_MEMORY_RUNTIME attribute, which tells the OS to keep these regions
+    // mapped after ExitBootServices.
+    allocator::reserve_runtime_region();
 
     // Initialize system table with boot and runtime services
     unsafe {

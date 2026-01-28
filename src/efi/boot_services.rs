@@ -1339,9 +1339,9 @@ extern "efiapi" fn protocols_per_handle(
 extern "efiapi" fn locate_handle_buffer(
     search_type: efi::LocateSearchType,
     protocol: *mut Guid,
-    _search_key: *mut c_void,
-    _no_handles: *mut usize,
-    _buffer: *mut *mut Handle,
+    search_key: *mut c_void,
+    no_handles: *mut usize,
+    buffer: *mut *mut Handle,
 ) -> Status {
     let guid_name = if protocol.is_null() {
         "NULL"
@@ -1349,11 +1349,79 @@ extern "efiapi" fn locate_handle_buffer(
         format_guid(unsafe { &*protocol })
     };
     log::debug!(
-        "BS.LocateHandleBuffer(type={}, protocol={}) -> UNSUPPORTED",
+        "BS.LocateHandleBuffer(type={}, protocol={})",
         search_type,
         guid_name
     );
-    Status::UNSUPPORTED
+
+    if no_handles.is_null() || buffer.is_null() {
+        log::debug!("  -> INVALID_PARAMETER");
+        return Status::INVALID_PARAMETER;
+    }
+
+    // First, call locate_handle with null buffer to get required size
+    let mut buffer_size: usize = 0;
+    let status = locate_handle(
+        search_type,
+        protocol,
+        search_key,
+        &mut buffer_size as *mut usize,
+        core::ptr::null_mut(),
+    );
+
+    // If no handles found, buffer_size is 0
+    if status == Status::NOT_FOUND {
+        unsafe {
+            *no_handles = 0;
+            *buffer = core::ptr::null_mut();
+        }
+        log::debug!("  -> NOT_FOUND");
+        return Status::NOT_FOUND;
+    }
+
+    // Should get BUFFER_TOO_SMALL with required size
+    if status != Status::BUFFER_TOO_SMALL {
+        log::debug!("  -> {:?} (unexpected from locate_handle)", status);
+        return status;
+    }
+
+    // Calculate number of handles
+    let handle_count = buffer_size / core::mem::size_of::<Handle>();
+
+    // Allocate buffer for handles
+    let alloc_result = allocator::allocate_pool(MemoryType::BootServicesData, buffer_size);
+    let handle_buffer = match alloc_result {
+        Ok(ptr) => ptr as *mut Handle,
+        Err(e) => {
+            log::debug!("  -> OUT_OF_RESOURCES (pool allocation failed: {:?})", e);
+            return Status::OUT_OF_RESOURCES;
+        }
+    };
+
+    // Call locate_handle again with the allocated buffer
+    let status = locate_handle(
+        search_type,
+        protocol,
+        search_key,
+        &mut buffer_size as *mut usize,
+        handle_buffer,
+    );
+
+    if status != Status::SUCCESS {
+        // Free the allocated buffer on failure
+        let _ = allocator::free_pool(handle_buffer as *mut u8);
+        log::debug!("  -> {:?} (second locate_handle call failed)", status);
+        return status;
+    }
+
+    // Return results to caller
+    unsafe {
+        *no_handles = handle_count;
+        *buffer = handle_buffer;
+    }
+
+    log::debug!("  -> SUCCESS ({} handles)", handle_count);
+    Status::SUCCESS
 }
 
 extern "efiapi" fn locate_protocol(

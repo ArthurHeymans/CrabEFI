@@ -11,6 +11,9 @@ SECTIONS
 {
     . = PAYLOAD_BASE;
     
+    /* Runtime code starts here - everything executable */
+    __runtime_code_start = .;
+    
     /* 32-bit entry code - must be first */
     .entry32 : ALIGN(4096) {
         *(.entry32)
@@ -22,6 +25,12 @@ SECTIONS
         *(.text .text.*)
         _text_end = .;
     }
+    
+    /* Runtime code ends here */
+    __runtime_code_end = .;
+
+    /* Runtime data starts here - everything non-executable */
+    __runtime_data_start = .;
 
     /* Read-only data */
     .rodata : ALIGN(4096) {
@@ -58,6 +67,9 @@ SECTIONS
         . += 0x200000;
         _stack_top = .;
     }
+
+    /* Runtime data ends here (after BSS and stack) */
+    __runtime_data_end = .;
 
     _end = .;
 

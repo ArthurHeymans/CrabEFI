@@ -500,10 +500,14 @@ impl MemoryAllocator {
 
         // RuntimeServicesCode/Data must have EFI_MEMORY_RUNTIME attribute
         // so the OS knows to keep them mapped after ExitBootServices
-        if memory_type == MemoryType::RuntimeServicesCode
-            || memory_type == MemoryType::RuntimeServicesData
-        {
+        if memory_type == MemoryType::RuntimeServicesCode {
+            // Code must be executable: clear EFI_MEMORY_XP (NX bit)
             attribute |= attributes::EFI_MEMORY_RUNTIME;
+            attribute &= !attributes::EFI_MEMORY_XP;
+        } else if memory_type == MemoryType::RuntimeServicesData {
+            // Data should not be executable: set EFI_MEMORY_XP (NX bit)
+            attribute |= attributes::EFI_MEMORY_RUNTIME;
+            attribute |= attributes::EFI_MEMORY_XP;
         }
 
         // Region before the carved out portion
@@ -719,97 +723,85 @@ pub fn free_pool(buffer: *mut u8) -> efi::Status {
     free_pages(addr, num_pages)
 }
 
-/// Reserve the CrabEFI runtime regions
+// Linker symbols for section boundaries
+unsafe extern "C" {
+    static __runtime_code_start: u8;
+    static __runtime_code_end: u8;
+    static __runtime_data_start: u8;
+    static __runtime_data_end: u8;
+}
+
+/// Reserve the CrabEFI runtime regions using linker-provided section boundaries
 ///
-/// This marks the memory containing our System Table, Runtime Services table,
-/// and runtime code so that the OS keeps them mapped after ExitBootServices.
-///
-/// # Arguments
-/// * `system_table_addr` - Address of the EFI System Table
-/// * `runtime_services_addr` - Address of the Runtime Services table
-/// * `runtime_code_addr` - Address of a runtime services function (to find code section)
-pub fn reserve_runtime_region(
-    system_table_addr: u64,
-    runtime_services_addr: u64,
-    runtime_code_addr: u64,
-) {
-    // Reserve the DATA region (System Table, Runtime Services table, variables, etc.)
-    // The static variables are likely in the same BSS segment.
-    let data_min = system_table_addr.min(runtime_services_addr);
-    let data_max = system_table_addr.max(runtime_services_addr);
+/// This marks the memory containing our code and data sections so that the OS
+/// keeps them mapped after ExitBootServices. The boundaries come from the
+/// linker script symbols.
+pub fn reserve_runtime_region() {
+    // Get section boundaries from linker symbols
+    let code_start = unsafe { &__runtime_code_start as *const u8 as u64 };
+    let code_end = unsafe { &__runtime_code_end as *const u8 as u64 };
+    let data_start = unsafe { &__runtime_data_start as *const u8 as u64 };
+    let data_end = unsafe { &__runtime_data_end as *const u8 as u64 };
 
     // Align to page boundaries
-    let data_start = data_min & !(PAGE_SIZE - 1);
-    // Cover at least 64KB to include related static data (variables, config tables, etc.)
-    let data_end = ((data_max + 0x10000) + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
-    let data_pages = (data_end - data_start) / PAGE_SIZE;
+    let code_start_aligned = code_start & !(PAGE_SIZE - 1);
+    let code_end_aligned = (code_end + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+    let data_start_aligned = data_start & !(PAGE_SIZE - 1);
+    let data_end_aligned = (data_end + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
 
-    log::debug!(
-        "Reserving runtime data region: {:#x}-{:#x} ({} pages)",
-        data_start,
-        data_end,
+    let code_pages = (code_end_aligned - code_start_aligned) / PAGE_SIZE;
+    let data_pages = (data_end_aligned - data_start_aligned) / PAGE_SIZE;
+
+    log::info!(
+        "Runtime code region from linker: {:#x}-{:#x} ({} pages)",
+        code_start_aligned,
+        code_end_aligned,
+        code_pages
+    );
+    log::info!(
+        "Runtime data region from linker: {:#x}-{:#x} ({} pages)",
+        data_start_aligned,
+        data_end_aligned,
         data_pages
     );
 
-    match reserve_region(data_start, data_pages, MemoryType::RuntimeServicesData) {
-        Ok(()) => {
-            log::info!(
-                "Reserved runtime services data region: {:#x}-{:#x}",
-                data_start,
-                data_end
-            );
-        }
-        Err(status) => {
-            log::warn!(
-                "Failed to reserve runtime data region: {:?} (may already be allocated)",
-                status
-            );
-        }
-    }
-
-    // Reserve the CODE region (runtime services functions)
-    // The code is typically loaded at a lower address than data/bss.
-    // Coreboot loads ELF payloads starting at 0x100000, and the code section
-    // comes first. We use the function pointer to find the code section but
-    // need to reserve from the START of the section (0x100000), not from
-    // where this particular function happens to be.
-    //
-    // The function address tells us roughly where code is, but we need to
-    // reserve from the beginning of the code section to cover all functions.
-    let code_function_page = runtime_code_addr & !(PAGE_SIZE - 1);
-
-    // Start from 0x100000 (standard coreboot payload load address) or 64KB before
-    // the function address, whichever is lower. This ensures we cover all code.
-    let code_start = if code_function_page >= 0x100000 && code_function_page < 0x200000 {
-        // Function is in the expected range, start from payload base
-        0x100000
-    } else {
-        // Function is elsewhere, start 64KB before it
-        code_function_page.saturating_sub(0x10000)
-    };
-
-    // End 64KB after the function address to cover code that comes after
-    let code_end = ((code_function_page + 0x10000) + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
-    let code_pages = (code_end - code_start) / PAGE_SIZE;
-
-    log::debug!(
-        "Reserving runtime code region: {:#x}-{:#x} ({} pages)",
-        code_start,
-        code_end,
-        code_pages
-    );
-
-    match reserve_region(code_start, code_pages, MemoryType::RuntimeServicesCode) {
+    // Reserve the CODE region (executable, no XP attribute)
+    match reserve_region(
+        code_start_aligned,
+        code_pages,
+        MemoryType::RuntimeServicesCode,
+    ) {
         Ok(()) => {
             log::info!(
                 "Reserved runtime services code region: {:#x}-{:#x}",
-                code_start,
-                code_end
+                code_start_aligned,
+                code_end_aligned
             );
         }
         Err(status) => {
             log::warn!(
                 "Failed to reserve runtime code region: {:?} (may already be allocated)",
+                status
+            );
+        }
+    }
+
+    // Reserve the DATA region (non-executable, XP attribute set)
+    match reserve_region(
+        data_start_aligned,
+        data_pages,
+        MemoryType::RuntimeServicesData,
+    ) {
+        Ok(()) => {
+            log::info!(
+                "Reserved runtime services data region: {:#x}-{:#x}",
+                data_start_aligned,
+                data_end_aligned
+            );
+        }
+        Err(status) => {
+            log::warn!(
+                "Failed to reserve runtime data region: {:?} (may already be allocated)",
                 status
             );
         }
