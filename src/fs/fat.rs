@@ -291,8 +291,44 @@ impl<'a, R: SectorRead> FatFilesystem<'a, R> {
         let bpb =
             unsafe { core::ptr::read_unaligned(buffer.as_ptr() as *const BiosParameterBlock) };
 
-        // Validate BPB
-        if bpb.bytes_per_sector == 0 || bpb.sectors_per_cluster == 0 || bpb.num_fats == 0 {
+        // Copy fields from packed struct to avoid alignment issues
+        let bpb_bytes_per_sector = bpb.bytes_per_sector;
+        let bpb_sectors_per_cluster = bpb.sectors_per_cluster;
+        let bpb_num_fats = bpb.num_fats;
+        let bpb_reserved_sectors = bpb.reserved_sectors;
+
+        // Validate BPB with strict checks
+        // bytes_per_sector must be 512, 1024, 2048, or 4096
+        let valid_sector_sizes = [512u16, 1024, 2048, 4096];
+        if !valid_sector_sizes.contains(&bpb_bytes_per_sector) {
+            log::debug!(
+                "Invalid bytes_per_sector: {} (expected 512/1024/2048/4096)",
+                bpb_bytes_per_sector
+            );
+            return Err(FatError::InvalidBpb);
+        }
+
+        // sectors_per_cluster must be a power of 2 between 1 and 128
+        if bpb_sectors_per_cluster == 0
+            || bpb_sectors_per_cluster > 128
+            || !bpb_sectors_per_cluster.is_power_of_two()
+        {
+            log::debug!(
+                "Invalid sectors_per_cluster: {} (expected power of 2, 1-128)",
+                bpb_sectors_per_cluster
+            );
+            return Err(FatError::InvalidBpb);
+        }
+
+        // num_fats must be 1 or 2
+        if bpb_num_fats == 0 || bpb_num_fats > 2 {
+            log::debug!("Invalid num_fats: {} (expected 1 or 2)", bpb_num_fats);
+            return Err(FatError::InvalidBpb);
+        }
+
+        // reserved_sectors must be at least 1 (boot sector)
+        if bpb_reserved_sectors == 0 {
+            log::debug!("Invalid reserved_sectors: 0 (expected >= 1)");
             return Err(FatError::InvalidBpb);
         }
 
@@ -530,7 +566,8 @@ impl<'a, R: SectorRead> FatFilesystem<'a, R> {
 
     /// Find an entry in a directory
     fn find_in_directory(&mut self, cluster: u32, name: &str) -> Result<DirectoryEntry, FatError> {
-        let mut buffer = [0u8; 4096]; // Max cluster size we support
+        // FAT cluster sizes can be up to 128 sectors * 512 bytes = 65536 bytes
+        let mut buffer = [0u8; 65536]; // Max cluster size (128 sectors * 512 bytes)
         let entries_per_sector = self.bytes_per_sector as usize / 32;
 
         if cluster == 0 && self.fat_type != FatType::Fat32 {
@@ -629,7 +666,7 @@ impl<'a, R: SectorRead> FatFilesystem<'a, R> {
             }
         }
 
-        let mut cluster_buffer = [0u8; 4096]; // Max cluster size
+        let mut cluster_buffer = [0u8; 65536]; // Max cluster size (128 sectors * 512 bytes)
         let mut bytes_read = 0;
 
         // Read first (potentially partial) cluster
