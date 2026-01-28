@@ -57,7 +57,10 @@ pub struct UnicodeCollationProtocol {
 }
 
 // Static storage for supported languages string
-static SUPPORTED_LANGUAGES: [u8; 3] = *b"en\0";
+// Note: Unicode Collation v1 uses ISO 639-2 three-letter codes (e.g., "eng")
+// Unicode Collation v2 uses RFC 4646 codes (e.g., "en")
+// We use "eng" which works for v1, and many v2 implementations accept it too
+static SUPPORTED_LANGUAGES: [u8; 4] = *b"eng\0";
 
 /// Static protocol instance
 static mut UNICODE_COLLATION: UnicodeCollationProtocol = UnicodeCollationProtocol {
@@ -104,6 +107,7 @@ extern "efiapi" fn stri_coll(
     s1: *mut Char16,
     s2: *mut Char16,
 ) -> isize {
+    log::debug!("UnicodeCollation.StriColl()");
     if s1.is_null() || s2.is_null() {
         return 0;
     }
@@ -136,6 +140,7 @@ extern "efiapi" fn metai_match(
     string: *mut Char16,
     pattern: *mut Char16,
 ) -> Boolean {
+    log::debug!("UnicodeCollation.MetaiMatch()");
     if string.is_null() || pattern.is_null() {
         return Boolean::FALSE;
     }
@@ -235,6 +240,7 @@ extern "efiapi" fn fat_to_str(
     fat: *mut Char8,
     string: *mut Char16,
 ) {
+    log::debug!("UnicodeCollation.FatToStr(size={})", fat_size);
     if fat.is_null() || string.is_null() {
         return;
     }
@@ -260,6 +266,7 @@ extern "efiapi" fn str_to_fat(
     fat_size: usize,
     fat: *mut Char8,
 ) -> Boolean {
+    log::debug!("UnicodeCollation.StrToFat(size={})", fat_size);
     if string.is_null() || fat.is_null() {
         return Boolean::FALSE;
     }

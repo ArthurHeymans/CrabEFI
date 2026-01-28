@@ -356,6 +356,205 @@ pub struct FilePathDevicePath {
     // Path name follows (variable length, null-terminated UCS-2)
 }
 
+// ============================================================================
+// NVMe Device Paths
+// ============================================================================
+
+/// NVMe Namespace Device Path Node (UEFI Spec 10.3.4.17)
+#[repr(C, packed)]
+pub struct NvmeDevicePathNode {
+    pub r#type: u8,
+    pub sub_type: u8,
+    pub length: [u8; 2],
+    /// Namespace Identifier (NSID)
+    pub namespace_id: u32,
+    /// IEEE Extended Unique Identifier (EUI-64)
+    pub eui64: [u8; 8],
+}
+
+/// Sub-type for NVMe namespace device path
+const SUBTYPE_NVME: u8 = 0x17;
+
+/// Full NVMe device path: ACPI + PCI + NVMe + End
+#[repr(C, packed)]
+pub struct FullNvmeDevicePath {
+    pub acpi: AcpiDevicePathNode,
+    pub pci: PciDevicePathNode,
+    pub nvme: NvmeDevicePathNode,
+    pub end: End,
+}
+
+/// Full NVMe partition device path: ACPI + PCI + NVMe + HardDrive + End
+#[repr(C, packed)]
+pub struct FullNvmePartitionDevicePath {
+    pub acpi: AcpiDevicePathNode,
+    pub pci: PciDevicePathNode,
+    pub nvme: NvmeDevicePathNode,
+    pub hard_drive: HardDriveMedia,
+    pub end: End,
+}
+
+/// Create a device path for an NVMe namespace (whole disk)
+///
+/// Creates a device path: ACPI(PNP0A03,0)/PCI(dev,func)/NVMe(nsid,eui64)/End
+///
+/// # Arguments
+/// * `pci_device` - PCI device number of the NVMe controller
+/// * `pci_function` - PCI function number
+/// * `namespace_id` - NVMe namespace ID
+///
+/// # Returns
+/// A pointer to the device path protocol, or null on failure
+pub fn create_nvme_device_path(
+    pci_device: u8,
+    pci_function: u8,
+    namespace_id: u32,
+) -> *mut Protocol {
+    let size = core::mem::size_of::<FullNvmeDevicePath>();
+
+    let ptr = match allocate_pool(MemoryType::BootServicesData, size) {
+        Ok(p) => p as *mut FullNvmeDevicePath,
+        Err(_) => {
+            log::error!("Failed to allocate NVMe device path");
+            return core::ptr::null_mut();
+        }
+    };
+
+    unsafe {
+        // ACPI node for PCI root bridge
+        (*ptr).acpi.r#type = TYPE_ACPI;
+        (*ptr).acpi.sub_type = SUBTYPE_ACPI;
+        (*ptr).acpi.length = (core::mem::size_of::<AcpiDevicePathNode>() as u16).to_le_bytes();
+        (*ptr).acpi.hid = EISA_PNP_ID_PCI_ROOT;
+        (*ptr).acpi.uid = 0;
+
+        // PCI node for NVMe controller
+        (*ptr).pci.r#type = TYPE_HARDWARE;
+        (*ptr).pci.sub_type = SUBTYPE_PCI;
+        (*ptr).pci.length = (core::mem::size_of::<PciDevicePathNode>() as u16).to_le_bytes();
+        (*ptr).pci.function = pci_function;
+        (*ptr).pci.device = pci_device;
+
+        // NVMe namespace node
+        (*ptr).nvme.r#type = TYPE_MESSAGING;
+        (*ptr).nvme.sub_type = SUBTYPE_NVME;
+        (*ptr).nvme.length = (core::mem::size_of::<NvmeDevicePathNode>() as u16).to_le_bytes();
+        (*ptr).nvme.namespace_id = namespace_id;
+        (*ptr).nvme.eui64 = [0; 8]; // EUI-64 is optional, use zeros
+
+        // End node
+        (*ptr).end.header.r#type = TYPE_END;
+        (*ptr).end.header.sub_type = End::SUBTYPE_ENTIRE;
+        (*ptr).end.header.length = (core::mem::size_of::<End>() as u16).to_le_bytes();
+    }
+
+    log::debug!(
+        "Created NVMe device path: ACPI/PCI({:02x},{:x})/NVMe({})",
+        pci_device,
+        pci_function,
+        namespace_id
+    );
+
+    ptr as *mut Protocol
+}
+
+/// Create a device path for a partition on an NVMe namespace
+///
+/// Creates a device path: ACPI(PNP0A03,0)/PCI(dev,func)/NVMe(nsid,eui64)/HD(part,...)/End
+///
+/// This is the proper hierarchical device path that allows GRUB to match
+/// partitions to their parent disk.
+///
+/// # Arguments
+/// * `pci_device` - PCI device number of the NVMe controller
+/// * `pci_function` - PCI function number
+/// * `namespace_id` - NVMe namespace ID
+/// * `partition_number` - The partition number (1-based)
+/// * `partition_start` - Start LBA of the partition
+/// * `partition_size` - Size of the partition in sectors
+/// * `partition_guid` - The GPT partition GUID (unique identifier)
+///
+/// # Returns
+/// A pointer to the device path protocol, or null on failure
+pub fn create_nvme_partition_device_path(
+    pci_device: u8,
+    pci_function: u8,
+    namespace_id: u32,
+    partition_number: u32,
+    partition_start: u64,
+    partition_size: u64,
+    partition_guid: &[u8; 16],
+) -> *mut Protocol {
+    let size = core::mem::size_of::<FullNvmePartitionDevicePath>();
+
+    let ptr = match allocate_pool(MemoryType::BootServicesData, size) {
+        Ok(p) => p as *mut FullNvmePartitionDevicePath,
+        Err(_) => {
+            log::error!("Failed to allocate NVMe partition device path");
+            return core::ptr::null_mut();
+        }
+    };
+
+    unsafe {
+        // ACPI node for PCI root bridge
+        (*ptr).acpi.r#type = TYPE_ACPI;
+        (*ptr).acpi.sub_type = SUBTYPE_ACPI;
+        (*ptr).acpi.length = (core::mem::size_of::<AcpiDevicePathNode>() as u16).to_le_bytes();
+        (*ptr).acpi.hid = EISA_PNP_ID_PCI_ROOT;
+        (*ptr).acpi.uid = 0;
+
+        // PCI node for NVMe controller
+        (*ptr).pci.r#type = TYPE_HARDWARE;
+        (*ptr).pci.sub_type = SUBTYPE_PCI;
+        (*ptr).pci.length = (core::mem::size_of::<PciDevicePathNode>() as u16).to_le_bytes();
+        (*ptr).pci.function = pci_function;
+        (*ptr).pci.device = pci_device;
+
+        // NVMe namespace node
+        (*ptr).nvme.r#type = TYPE_MESSAGING;
+        (*ptr).nvme.sub_type = SUBTYPE_NVME;
+        (*ptr).nvme.length = (core::mem::size_of::<NvmeDevicePathNode>() as u16).to_le_bytes();
+        (*ptr).nvme.namespace_id = namespace_id;
+        (*ptr).nvme.eui64 = [0; 8]; // EUI-64 is optional, use zeros
+
+        // HardDrive node for partition
+        (*ptr).hard_drive.header.r#type = TYPE_MEDIA;
+        (*ptr).hard_drive.header.sub_type = Media::SUBTYPE_HARDDRIVE;
+        (*ptr).hard_drive.header.length =
+            (core::mem::size_of::<HardDriveMedia>() as u16).to_le_bytes();
+        (*ptr).hard_drive.partition_number = partition_number;
+        (*ptr).hard_drive.partition_start = partition_start;
+        (*ptr).hard_drive.partition_size = partition_size;
+        (*ptr)
+            .hard_drive
+            .partition_signature
+            .copy_from_slice(partition_guid);
+        (*ptr).hard_drive.partition_format = PARTITION_FORMAT_GPT;
+        (*ptr).hard_drive.signature_type = SIGNATURE_TYPE_GUID;
+
+        // End node
+        (*ptr).end.header.r#type = TYPE_END;
+        (*ptr).end.header.sub_type = End::SUBTYPE_ENTIRE;
+        (*ptr).end.header.length = (core::mem::size_of::<End>() as u16).to_le_bytes();
+    }
+
+    log::debug!(
+        "Created NVMe partition device path: ACPI/PCI({:02x},{:x})/NVMe({})/HD({},{},{})",
+        pci_device,
+        pci_function,
+        namespace_id,
+        partition_number,
+        partition_start,
+        partition_size
+    );
+
+    ptr as *mut Protocol
+}
+
+// ============================================================================
+// File Path Device Paths
+// ============================================================================
+
 /// Create a file path device path for a bootloader path like "\EFI\BOOT\BOOTX64.EFI"
 ///
 /// # Arguments

@@ -250,13 +250,13 @@ pub fn get_boot_services() -> *mut efi::BootServices {
 // ============================================================================
 
 extern "efiapi" fn raise_tpl(new_tpl: Tpl) -> Tpl {
-    log::trace!("BS.RaiseTpl({:?})", new_tpl);
+    log::debug!("BS.RaiseTpl({:?})", new_tpl);
     // No interrupt handling, return current TPL (APPLICATION)
     efi::TPL_APPLICATION
 }
 
 extern "efiapi" fn restore_tpl(old_tpl: Tpl) {
-    log::trace!("BS.RestoreTpl({:?})", old_tpl);
+    log::debug!("BS.RestoreTpl({:?})", old_tpl);
     // No-op
 }
 
@@ -373,7 +373,7 @@ extern "efiapi" fn allocate_pool(
     size: usize,
     buffer: *mut *mut c_void,
 ) -> Status {
-    log::trace!("BS.AllocatePool(type={}, size={})", pool_type, size);
+    log::debug!("BS.AllocatePool(type={}, size={})", pool_type, size);
 
     if buffer.is_null() || size == 0 {
         return Status::INVALID_PARAMETER;
@@ -394,6 +394,7 @@ extern "efiapi" fn allocate_pool(
 }
 
 extern "efiapi" fn free_pool(buffer: *mut c_void) -> Status {
+    log::debug!("BS.FreePool({:?})", buffer);
     if buffer.is_null() {
         return Status::INVALID_PARAMETER;
     }
@@ -529,7 +530,7 @@ extern "efiapi" fn wait_for_event(
 
 extern "efiapi" fn signal_event(event: efi::Event) -> Status {
     let event_id = event as usize;
-    log::trace!("BS.SignalEvent(event={})", event_id);
+    log::debug!("BS.SignalEvent(event={})", event_id);
 
     if event_id > 0 && event_id < MAX_EVENTS {
         let mut events = EVENTS.lock();
@@ -541,7 +542,7 @@ extern "efiapi" fn signal_event(event: efi::Event) -> Status {
 
 extern "efiapi" fn close_event(event: efi::Event) -> Status {
     let event_id = event as usize;
-    log::trace!("BS.CloseEvent(event={})", event_id);
+    log::debug!("BS.CloseEvent(event={})", event_id);
 
     if event_id > 0 && event_id < MAX_EVENTS {
         let mut events = EVENTS.lock();
@@ -553,7 +554,7 @@ extern "efiapi" fn close_event(event: efi::Event) -> Status {
 
 extern "efiapi" fn check_event(event: efi::Event) -> Status {
     let event_id = event as usize;
-    log::trace!("BS.CheckEvent(event={})", event_id);
+    log::debug!("BS.CheckEvent(event={})", event_id);
 
     // Special case for keyboard event
     if event_id == KEYBOARD_EVENT_ID {
@@ -690,7 +691,7 @@ extern "efiapi" fn handle_protocol(
     } else {
         unsafe { *protocol }
     };
-    log::debug!(
+    log::info!(
         "BS.HandleProtocol(handle={:?}, protocol={})",
         handle,
         format_guid(&guid)
@@ -737,10 +738,12 @@ extern "efiapi" fn locate_handle(
     } else {
         format_guid(unsafe { &*protocol })
     };
-    log::debug!(
-        "BS.LocateHandle(type={}, protocol={})",
+    log::info!(
+        "BS.LocateHandle(type={}, protocol={}, buf_size={}, buf={:?})",
         search_type,
-        guid_name
+        guid_name,
+        unsafe { *buffer_size },
+        buffer
     );
 
     // Log raw GUID if unknown
@@ -787,10 +790,11 @@ extern "efiapi" fn locate_handle(
     unsafe { *buffer_size = required_size };
 
     if matching.is_empty() {
-        log::debug!("  -> NOT_FOUND");
+        log::info!("  -> NOT_FOUND");
         Status::NOT_FOUND
     } else {
-        log::debug!("  -> found {} handles", matching.len());
+        log::info!("  -> found {} handles: {:?}", matching.len(), &matching[..]);
+        log::info!("  -> returning from LocateHandle");
         Status::SUCCESS
     }
 }
@@ -1217,6 +1221,7 @@ extern "efiapi" fn get_next_monotonic_count(_count: *mut u64) -> Status {
 }
 
 extern "efiapi" fn stall(microseconds: usize) -> Status {
+    log::debug!("BS.Stall({}us)", microseconds);
     // Busy-wait using CPU cycles
     // This is a rough approximation - real implementation would use TSC or HPET
     for _ in 0..microseconds {
@@ -1267,7 +1272,7 @@ extern "efiapi" fn open_protocol(
 
     let guid = unsafe { *protocol };
     let guid_name = format_guid(&guid);
-    log::debug!(
+    log::info!(
         "BS.OpenProtocol(handle={:?}, protocol={}, attr={:#x})",
         handle,
         guid_name,
@@ -1292,11 +1297,20 @@ extern "efiapi" fn open_protocol(
                     }
                     log::debug!("  -> SUCCESS (interface={:?})", iface);
 
-                    // For LOADED_IMAGE, log the DeviceHandle the bootloader will use
+                    // For LOADED_IMAGE, log important fields
                     if guid_name == "LOADED_IMAGE" && !iface.is_null() {
                         let lip = iface as *const r_efi::protocols::loaded_image::Protocol;
                         let dev_handle = unsafe { (*lip).device_handle };
+                        let sys_table = unsafe { (*lip).system_table };
                         log::debug!("  -> LOADED_IMAGE.DeviceHandle = {:?}", dev_handle);
+                        log::debug!("  -> LOADED_IMAGE.SystemTable = {:?}", sys_table);
+                        // Check if SystemTable looks valid
+                        if !sys_table.is_null() {
+                            let bs = unsafe { (*sys_table).boot_services };
+                            log::debug!("  -> LOADED_IMAGE.SystemTable->BootServices = {:?}", bs);
+                        } else {
+                            log::error!("  -> LOADED_IMAGE.SystemTable is NULL!");
+                        }
                     }
                     return Status::SUCCESS;
                 }
@@ -1348,7 +1362,7 @@ extern "efiapi" fn locate_handle_buffer(
     } else {
         format_guid(unsafe { &*protocol })
     };
-    log::debug!(
+    log::info!(
         "BS.LocateHandleBuffer(type={}, protocol={})",
         search_type,
         guid_name
@@ -1435,7 +1449,7 @@ extern "efiapi" fn locate_protocol(
 
     let guid = unsafe { *protocol };
     let guid_name = format_guid(&guid);
-    log::debug!("BS.LocateProtocol(protocol={})", guid_name);
+    log::info!("BS.LocateProtocol(protocol={})", guid_name);
 
     // Log raw GUID if unknown
     if guid_name == "UNKNOWN" {

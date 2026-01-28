@@ -4,6 +4,7 @@
 //! including the 32-bit to 64-bit mode transition and page table setup.
 
 pub mod entry;
+pub mod idt;
 pub mod paging;
 pub mod sse;
 

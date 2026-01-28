@@ -3,7 +3,7 @@
 //! This module provides a minimal NVMe driver for reading from NVMe SSDs.
 //! It implements the basic NVMe command set needed for booting.
 
-use crate::drivers::pci::{self, PciDevice};
+use crate::drivers::pci::{self, PciAddress, PciDevice};
 use crate::efi;
 use core::ptr;
 use core::sync::atomic::{fence, Ordering};
@@ -322,6 +322,8 @@ pub struct NvmeNamespace {
 
 /// NVMe controller
 pub struct NvmeController {
+    /// PCI address (bus:device.function)
+    pci_address: PciAddress,
     /// MMIO base address
     mmio_base: u64,
     /// Doorbell stride (in bytes)
@@ -350,6 +352,8 @@ pub struct NvmeController {
     io_cq_phase: bool,
     /// Detected namespaces
     namespaces: heapless::Vec<NvmeNamespace, 8>,
+    /// Page-aligned DMA buffer for data transfers (avoids corruption from misaligned buffers)
+    dma_buffer: *mut u8,
 }
 
 /// NVMe error type
@@ -402,6 +406,10 @@ impl NvmeController {
         let admin_cq =
             efi::allocate_pages(1).ok_or(NvmeError::AllocationFailed)? as *mut CompletionQueueEntry;
 
+        // Allocate a page-aligned DMA buffer for data transfers
+        // This prevents corruption when callers pass misaligned buffers
+        let dma_buffer = efi::allocate_pages(1).ok_or(NvmeError::AllocationFailed)? as *mut u8;
+
         // Zero the queues
         unsafe {
             ptr::write_bytes(admin_sq, 0, ADMIN_QUEUE_SIZE);
@@ -409,6 +417,7 @@ impl NvmeController {
         }
 
         let mut controller = Self {
+            pci_address: pci_dev.address,
             mmio_base,
             doorbell_stride,
             admin_sq,
@@ -423,6 +432,7 @@ impl NvmeController {
             io_cq_head: 0,
             io_cq_phase: true,
             namespaces: heapless::Vec::new(),
+            dma_buffer,
         };
 
         controller.init()?;
@@ -740,6 +750,11 @@ impl NvmeController {
         self.namespaces.first()
     }
 
+    /// Get the PCI address of this controller
+    pub fn pci_address(&self) -> PciAddress {
+        self.pci_address
+    }
+
     /// Submit an I/O command
     fn submit_io_command(&mut self, cmd: &SubmissionQueueEntry) -> u16 {
         let tail = self.io_sq_tail as usize;
@@ -784,6 +799,9 @@ impl NvmeController {
     }
 
     /// Read sectors from a namespace
+    ///
+    /// Uses an internal page-aligned DMA buffer to avoid corruption when
+    /// callers pass misaligned buffers (e.g., stack buffers).
     pub fn read_sectors(
         &mut self,
         nsid: u32,
@@ -800,26 +818,52 @@ impl NvmeController {
             return Err(NvmeError::InvalidParameter);
         }
 
-        // Build read command
+        let transfer_size = num_sectors as u64 * block_size as u64;
+
+        // Our DMA buffer is one page (4096 bytes), so we can only transfer up to 4KB at a time
+        // For larger transfers, we need to loop
+        if transfer_size > 4096 {
+            // Handle large transfers by reading one page at a time
+            let sectors_per_page = 4096 / block_size;
+            let mut remaining_sectors = num_sectors;
+            let mut current_lba = start_lba;
+            let mut current_buffer = buffer;
+
+            while remaining_sectors > 0 {
+                let sectors_this_read = core::cmp::min(remaining_sectors, sectors_per_page);
+                self.read_sectors_internal(nsid, current_lba, sectors_this_read, current_buffer)?;
+                remaining_sectors -= sectors_this_read;
+                current_lba += sectors_this_read as u64;
+                current_buffer =
+                    unsafe { current_buffer.add((sectors_this_read * block_size) as usize) };
+            }
+            return Ok(());
+        }
+
+        self.read_sectors_internal(nsid, start_lba, num_sectors, buffer)
+    }
+
+    /// Internal read function that uses the page-aligned DMA buffer
+    fn read_sectors_internal(
+        &mut self,
+        nsid: u32,
+        start_lba: u64,
+        num_sectors: u32,
+        buffer: *mut u8,
+    ) -> Result<(), NvmeError> {
+        let ns = self
+            .get_namespace(nsid)
+            .ok_or(NvmeError::InvalidNamespace)?;
+        let block_size = ns.block_size;
+        let transfer_size = (num_sectors * block_size) as usize;
+
+        // Use our page-aligned DMA buffer to avoid corruption from misaligned caller buffers
+        // The DMA buffer is guaranteed to be 4KB aligned by allocate_pages()
         let mut cmd = SubmissionQueueEntry::new();
         cmd.set_opcode(io_cmd::READ);
         cmd.set_cid(self.next_command_id());
         cmd.nsid = nsid;
-        cmd.prp1 = buffer as u64;
-
-        // If transfer spans more than one page, we need PRP list
-        let transfer_size = num_sectors as u64 * block_size as u64;
-        if transfer_size > 4096 {
-            // For simplicity, we require contiguous memory for now
-            // In a full implementation, we would set up a PRP list
-            // For transfers <= 8KB, we can use prp2 directly
-            if transfer_size <= 8192 {
-                cmd.prp2 = buffer as u64 + 4096;
-            } else {
-                log::warn!("Large transfers (>{} KB) not yet supported", 8);
-                return Err(NvmeError::InvalidParameter);
-            }
-        }
+        cmd.prp1 = self.dma_buffer as u64; // Use aligned DMA buffer
 
         cmd.cdw10 = start_lba as u32;
         cmd.cdw11 = (start_lba >> 32) as u32;
@@ -827,6 +871,11 @@ impl NvmeController {
 
         let cid = self.submit_io_command(&cmd);
         self.wait_io_completion(cid)?;
+
+        // Copy data from DMA buffer to caller's buffer
+        unsafe {
+            ptr::copy_nonoverlapping(self.dma_buffer, buffer, transfer_size);
+        }
 
         Ok(())
     }
@@ -913,3 +962,94 @@ pub fn get_controller(index: usize) -> Option<&'static mut NvmeController> {
 
 // Ensure NvmeController can be sent between threads
 unsafe impl Send for NvmeController {}
+
+// ============================================================================
+// Global NVMe Device for SimpleFileSystem Protocol
+// ============================================================================
+
+/// Global NVMe device info for filesystem reads
+struct GlobalNvmeDevice {
+    controller_index: usize,
+    nsid: u32,
+}
+
+/// Pointer wrapper for global storage
+struct GlobalNvmeDevicePtr(*mut GlobalNvmeDevice);
+
+// Safety: We use mutex protection for all access
+unsafe impl Send for GlobalNvmeDevicePtr {}
+
+/// Global NVMe device for filesystem protocol
+static GLOBAL_NVME_DEVICE: Mutex<Option<GlobalNvmeDevicePtr>> = Mutex::new(None);
+
+/// Store NVMe device info globally for SimpleFileSystem protocol
+///
+/// # Arguments
+/// * `controller_index` - Index of the NVMe controller
+/// * `nsid` - Namespace ID to use for reads
+///
+/// # Returns
+/// `true` if the device was stored successfully
+pub fn store_global_device(controller_index: usize, nsid: u32) -> bool {
+    // Allocate memory for the device info
+    let size = core::mem::size_of::<GlobalNvmeDevice>();
+    let pages = (size + 4095) / 4096;
+
+    if let Some(ptr) = efi::allocate_pages(pages as u64) {
+        let device_ptr = ptr as *mut GlobalNvmeDevice;
+        unsafe {
+            core::ptr::write(
+                device_ptr,
+                GlobalNvmeDevice {
+                    controller_index,
+                    nsid,
+                },
+            );
+        }
+
+        *GLOBAL_NVME_DEVICE.lock() = Some(GlobalNvmeDevicePtr(device_ptr));
+        log::info!(
+            "NVMe device stored globally (controller={}, nsid={})",
+            controller_index,
+            nsid
+        );
+        true
+    } else {
+        log::error!("Failed to allocate memory for global NVMe device");
+        false
+    }
+}
+
+/// Read a sector from the global NVMe device
+///
+/// This function is used as the read callback for the SimpleFileSystem protocol.
+pub fn global_read_sector(lba: u64, buffer: &mut [u8]) -> Result<(), ()> {
+    // Get the device info
+    let (controller_index, nsid) = match GLOBAL_NVME_DEVICE.lock().as_ref() {
+        Some(ptr) => unsafe {
+            let device = &*ptr.0;
+            (device.controller_index, device.nsid)
+        },
+        None => {
+            log::error!("global_read_sector: no NVMe device stored");
+            return Err(());
+        }
+    };
+
+    // Get the controller
+    let controller = match get_controller(controller_index) {
+        Some(c) => c,
+        None => {
+            log::error!(
+                "global_read_sector: no NVMe controller at index {}",
+                controller_index
+            );
+            return Err(());
+        }
+    };
+
+    // Read the sector
+    controller.read_sector(nsid, lba, buffer).map_err(|e| {
+        log::error!("global_read_sector: read failed at LBA {}: {:?}", lba, e);
+    })
+}

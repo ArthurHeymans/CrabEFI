@@ -2,7 +2,7 @@
 //!
 //! This module provides a minimal xHCI driver for USB mass storage devices.
 
-use crate::drivers::pci::{self, PciDevice};
+use crate::drivers::pci::{self, PciAddress, PciDevice};
 use crate::efi;
 use core::ptr;
 use core::sync::atomic::{fence, Ordering};
@@ -590,6 +590,8 @@ pub struct UsbSlot {
 
 /// xHCI Controller
 pub struct XhciController {
+    /// PCI address (bus:device.function)
+    pci_address: PciAddress,
     /// MMIO base address
     mmio_base: u64,
     /// Operational registers base
@@ -693,6 +695,7 @@ impl XhciController {
         let page_size = (page_size_reg & 0xFFFF) << 12;
 
         let mut controller = Self {
+            pci_address: pci_dev.address,
             mmio_base,
             op_base,
             rt_base,
@@ -1486,6 +1489,11 @@ impl XhciController {
     /// Get mutable slot info
     pub fn get_slot_mut(&mut self, slot_id: u8) -> Option<&mut UsbSlot> {
         self.slots[slot_id as usize].as_mut()
+    }
+
+    /// Get the PCI address of this controller
+    pub fn pci_address(&self) -> PciAddress {
+        self.pci_address
     }
 }
 

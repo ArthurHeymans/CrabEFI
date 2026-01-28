@@ -98,6 +98,10 @@ pub fn init(coreboot_table_ptr: u64) {
     #[cfg(target_arch = "x86_64")]
     arch::x86_64::paging::init(&cb_info.memory_map);
 
+    // Initialize IDT for exception handling
+    #[cfg(target_arch = "x86_64")]
+    arch::x86_64::idt::init();
+
     // Initialize EFI environment
     efi::init(&cb_info);
 
@@ -155,26 +159,67 @@ fn try_boot_from_nvme() -> bool {
     if let Some(controller) = drivers::nvme::get_controller(0) {
         log::info!("Probing NVMe controller for ESP...");
 
-        match fs::gpt::find_esp_on_nvme(controller) {
-            Ok(esp) => {
-                log::info!(
-                    "Found ESP on NVMe: LBA {}-{} ({} MB)",
-                    esp.first_lba,
-                    esp.last_lba,
-                    esp.size_bytes() / (1024 * 1024)
-                );
+        if let Some(ns) = controller.default_namespace() {
+            let nsid = ns.nsid;
 
-                if let Some(ns) = controller.default_namespace() {
-                    let nsid = ns.nsid;
-                    let mut disk = fs::gpt::NvmeDisk::new(controller, nsid);
+            // Store the device globally for SimpleFileSystem protocol
+            if !drivers::nvme::store_global_device(0, nsid) {
+                log::error!("Failed to store NVMe device globally");
+                return false;
+            }
 
-                    if try_boot_from_esp(&mut disk, &esp) {
-                        return true;
-                    }
+            // Get actual PCI address from the controller before creating disk (which borrows it)
+            let pci_addr = controller.pci_address();
+
+            let mut disk = fs::gpt::NvmeDisk::new(controller, nsid);
+
+            // Read GPT to find ESP with partition number
+            let header = match fs::gpt::read_gpt_header(&mut disk) {
+                Ok(h) => h,
+                Err(e) => {
+                    log::debug!("No GPT found on NVMe: {:?}", e);
+                    return false;
+                }
+            };
+
+            let partitions = match fs::gpt::read_partitions(&mut disk, &header) {
+                Ok(p) => p,
+                Err(e) => {
+                    log::debug!("Failed to read partitions: {:?}", e);
+                    return false;
+                }
+            };
+
+            // Find ESP and its partition number
+            let mut esp_info: Option<(u32, fs::gpt::Partition)> = None;
+            for (i, partition) in partitions.iter().enumerate() {
+                if partition.is_esp {
+                    let partition_num = (i + 1) as u32;
+                    log::info!(
+                        "Found ESP on NVMe: partition {}, LBA {}-{} ({} MB)",
+                        partition_num,
+                        partition.first_lba,
+                        partition.last_lba,
+                        partition.size_bytes() / (1024 * 1024)
+                    );
+                    esp_info = Some((partition_num, partition.clone()));
+                    break;
                 }
             }
-            Err(e) => {
-                log::debug!("No ESP found on NVMe: {:?}", e);
+
+            if let Some((partition_num, esp)) = esp_info {
+                if try_boot_from_esp_nvme(
+                    &mut disk,
+                    &esp,
+                    partition_num,
+                    pci_addr.device,
+                    pci_addr.function,
+                    nsid,
+                ) {
+                    return true;
+                }
+            } else {
+                log::debug!("No ESP found on NVMe");
             }
         }
     }
@@ -249,13 +294,10 @@ fn try_boot_from_usb() -> bool {
                     };
 
                     // Install BlockIO for all partitions
-                    // Note: xHCI controller is typically at PCI 00:03.0 in QEMU
-                    // TODO: Get actual PCI device/function from xHCI controller
-                    const XHCI_PCI_DEVICE: u8 = 3;
-                    const XHCI_PCI_FUNCTION: u8 = 0;
-
                     if let Some(usb_device) = drivers::usb::mass_storage::get_global_device() {
                         if let Some(xhci) = drivers::usb::get_controller(0) {
+                            // Get actual PCI address from the xHCI controller
+                            let pci_addr = xhci.pci_address();
                             let mut disk = fs::gpt::UsbDisk::new(usb_device, xhci);
 
                             if let Some((partition_num, esp)) = install_block_io_for_disk(
@@ -263,8 +305,8 @@ fn try_boot_from_usb() -> bool {
                                 storage_id,
                                 block_size,
                                 num_blocks,
-                                XHCI_PCI_DEVICE,
-                                XHCI_PCI_FUNCTION,
+                                pci_addr.device,
+                                pci_addr.function,
                                 usb_port,
                             ) {
                                 // Boot from ESP
@@ -272,14 +314,15 @@ fn try_boot_from_usb() -> bool {
                                     drivers::usb::mass_storage::get_global_device()
                                 {
                                     if let Some(xhci) = drivers::usb::get_controller(0) {
+                                        let pci_addr = xhci.pci_address();
                                         let mut disk = fs::gpt::UsbDisk::new(usb_device, xhci);
 
                                         if try_boot_from_esp_usb(
                                             &mut disk,
                                             &esp,
                                             partition_num,
-                                            XHCI_PCI_DEVICE,
-                                            XHCI_PCI_FUNCTION,
+                                            pci_addr.device,
+                                            pci_addr.function,
                                             usb_port,
                                         ) {
                                             return true;
@@ -642,7 +685,149 @@ fn try_boot_from_esp_usb(
     false
 }
 
-/// Extract FAT filesystem state for the SimpleFileSystem protocol
+/// Debug helper: check if system table is intact
+fn check_system_table_integrity(label: &str) {
+    let st = efi::get_system_table();
+    unsafe {
+        let bs = (*st).boot_services;
+        if bs.is_null() {
+            log::error!("[{}] CORRUPTION: boot_services is NULL!", label);
+        } else {
+            let sig = (*bs).hdr.signature;
+            if sig != 0x56524553544f4f42 {
+                // "BOOTSERV"
+                log::error!(
+                    "[{}] CORRUPTION: boot_services signature wrong: {:#x}",
+                    label,
+                    sig
+                );
+            } else {
+                log::debug!("[{}] SystemTable OK, BS={:?}", label, bs);
+            }
+        }
+    }
+}
+
+/// Try to boot from an ESP on NVMe (with SimpleFileSystem support)
+///
+/// # Arguments
+/// * `disk` - NVMe disk to read from
+/// * `esp` - ESP partition info
+/// * `partition_num` - 1-based partition number of the ESP
+/// * `pci_device` - PCI device number of NVMe controller
+/// * `pci_function` - PCI function number
+/// * `namespace_id` - NVMe namespace ID
+fn try_boot_from_esp_nvme(
+    disk: &mut fs::gpt::NvmeDisk,
+    esp: &fs::gpt::Partition,
+    partition_num: u32,
+    pci_device: u8,
+    pci_function: u8,
+    namespace_id: u32,
+) -> bool {
+    use efi::boot_services;
+    use efi::protocols::device_path::{self, DEVICE_PATH_PROTOCOL_GUID};
+    use efi::protocols::simple_file_system::{self, SIMPLE_FILE_SYSTEM_GUID};
+    use r_efi::efi::Status;
+
+    check_system_table_integrity("NVMe: start");
+
+    match fs::fat::FatFilesystem::new(disk, esp.first_lba) {
+        Ok(mut fat) => {
+            log::info!("FAT filesystem mounted on ESP");
+            check_system_table_integrity("NVMe: after FAT mount");
+
+            // Extract filesystem state for the SimpleFileSystem protocol
+            let fs_state = extract_fat_state_nvme(esp.first_lba);
+            check_system_table_integrity("NVMe: after extract_fat_state");
+
+            // Initialize SimpleFileSystem protocol with NVMe read function
+            let sfs_protocol =
+                simple_file_system::init(fs_state, drivers::nvme::global_read_sector);
+            check_system_table_integrity("NVMe: after SFS init");
+
+            // Create a device handle with SimpleFileSystem and DevicePath protocols
+            let device_handle = match boot_services::create_handle() {
+                Some(h) => h,
+                None => {
+                    log::error!("Failed to create device handle");
+                    return false;
+                }
+            };
+
+            // Install DevicePath protocol on the device handle
+            // Use full NVMe partition path for proper hierarchy matching
+            let partition_size = esp.size_sectors();
+            let device_path = device_path::create_nvme_partition_device_path(
+                pci_device,
+                pci_function,
+                namespace_id,
+                partition_num,
+                esp.first_lba,
+                partition_size,
+                &esp.partition_guid,
+            );
+
+            if !device_path.is_null() {
+                let status = boot_services::install_protocol(
+                    device_handle,
+                    &DEVICE_PATH_PROTOCOL_GUID,
+                    device_path as *mut core::ffi::c_void,
+                );
+                if status == Status::SUCCESS {
+                    log::info!(
+                        "DevicePath protocol installed on device handle {:?}",
+                        device_handle
+                    );
+                } else {
+                    log::warn!("Failed to install DevicePath protocol: {:?}", status);
+                }
+            }
+
+            // Install SimpleFileSystem protocol on the device handle
+            let status = boot_services::install_protocol(
+                device_handle,
+                &SIMPLE_FILE_SYSTEM_GUID,
+                sfs_protocol as *mut core::ffi::c_void,
+            );
+
+            if status != Status::SUCCESS {
+                log::error!("Failed to install SimpleFileSystem protocol: {:?}", status);
+                return false;
+            }
+
+            log::info!(
+                "SimpleFileSystem protocol installed on device handle {:?}",
+                device_handle
+            );
+
+            // Look for EFI bootloader
+            let boot_path = "EFI\\BOOT\\BOOTX64.EFI";
+            match fat.file_size(boot_path) {
+                Ok(size) => {
+                    log::info!("Found bootloader: {} ({} bytes)", boot_path, size);
+
+                    // Load and execute the bootloader with device handle
+                    match load_and_execute_bootloader(&mut fat, boot_path, size, device_handle) {
+                        Ok(()) => return true,
+                        Err(e) => {
+                            log::error!("Failed to execute bootloader: {:?}", e);
+                        }
+                    }
+                }
+                Err(e) => {
+                    log::warn!("Bootloader not found: {:?}", e);
+                }
+            }
+        }
+        Err(e) => {
+            log::error!("Failed to mount FAT filesystem: {:?}", e);
+        }
+    }
+    false
+}
+
+/// Extract FAT filesystem state for the SimpleFileSystem protocol (USB version)
 fn extract_fat_state<R: fs::gpt::SectorRead>(
     _fat: &fs::fat::FatFilesystem<R>,
     partition_start: u64,
@@ -662,6 +847,33 @@ fn extract_fat_state<R: fs::gpt::SectorRead>(
         log::error!("Failed to read boot sector for filesystem state");
         return FilesystemState::empty();
     }
+
+    parse_fat_bpb(&buffer, partition_start)
+}
+
+/// Extract FAT filesystem state for NVMe devices
+fn extract_fat_state_nvme(
+    partition_start: u64,
+) -> efi::protocols::simple_file_system::FilesystemState {
+    use efi::protocols::simple_file_system::FilesystemState;
+    use fs::fat::SECTOR_SIZE;
+
+    // Read boot sector directly using NVMe global read
+    let mut buffer = [0u8; SECTOR_SIZE];
+    if let Err(_) = drivers::nvme::global_read_sector(partition_start, &mut buffer) {
+        log::error!("Failed to read boot sector for NVMe filesystem state");
+        return FilesystemState::empty();
+    }
+
+    parse_fat_bpb(&buffer, partition_start)
+}
+
+/// Parse FAT BPB from boot sector buffer
+fn parse_fat_bpb(
+    buffer: &[u8],
+    partition_start: u64,
+) -> efi::protocols::simple_file_system::FilesystemState {
+    use efi::protocols::simple_file_system::FilesystemState;
 
     // Parse BPB
     let bytes_per_sector = u16::from_le_bytes([buffer[11], buffer[12]]);
@@ -833,6 +1045,26 @@ fn load_and_execute_bootloader<R: fs::gpt::SectorRead>(
         );
     }
     log::info!("Executing bootloader...");
+
+    // Debug: verify system table integrity before execution
+    unsafe {
+        let st = &*system_table;
+        log::debug!(
+            "SystemTable check: boot_services={:?}, runtime_services={:?}",
+            st.boot_services,
+            st.runtime_services
+        );
+        if !st.boot_services.is_null() {
+            let bs = &*st.boot_services;
+            log::debug!(
+                "BootServices check: signature={:#x}, check_event={:?}",
+                bs.hdr.signature,
+                bs.check_event
+            );
+        } else {
+            log::error!("CRITICAL: boot_services is NULL!");
+        }
+    }
 
     // Execute the bootloader
     let exec_status = pe::execute_image(&loaded_image, image_handle, system_table);
