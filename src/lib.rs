@@ -18,6 +18,7 @@ pub mod efi;
 pub mod fs;
 pub mod logger;
 pub mod pe;
+pub mod time;
 
 use core::panic::PanicInfo;
 
@@ -84,6 +85,9 @@ pub fn init(coreboot_table_ptr: u64) {
         log::info!("  ACPI RSDP: {:#x}", rsdp);
     }
     log::info!("  Memory regions: {}", cb_info.memory_map.len());
+
+    // Initialize timing subsystem (calibrate TSC using ACPI PM timer)
+    time::init(cb_info.acpi_rsdp);
 
     // Print memory map summary
     let total_ram: u64 = cb_info

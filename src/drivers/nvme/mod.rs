@@ -5,6 +5,7 @@
 
 use crate::drivers::pci::{self, PciAddress, PciDevice};
 use crate::efi;
+use crate::time::Timeout;
 use core::ptr;
 use core::sync::atomic::{fence, Ordering};
 use spin::Mutex;
@@ -485,12 +486,14 @@ impl NvmeController {
         cc &= !0x1; // Clear EN bit
         self.write_reg32(regs::CC, cc);
 
-        // Wait for controller to become disabled
-        for _ in 0..1000000 {
+        // Wait for controller to become disabled (up to 1 second)
+        let timeout = Timeout::from_ms(1000);
+        while !timeout.is_expired() {
             let csts = self.read_reg32(regs::CSTS);
             if (csts & 0x1) == 0 {
                 break;
             }
+            core::hint::spin_loop();
         }
 
         // Set admin queue attributes
@@ -513,17 +516,19 @@ impl NvmeController {
         let cc = 0x00460001u32; // EN=1, CSS=0, MPS=0, IOSQES=6, IOCQES=4
         self.write_reg32(regs::CC, cc);
 
-        // Wait for controller to become ready
-        for i in 0..1000000 {
+        // Wait for controller to become ready (up to 2 seconds per spec)
+        let timeout = Timeout::from_ms(2000);
+        while !timeout.is_expired() {
             let csts = self.read_reg32(regs::CSTS);
             if (csts & 0x1) != 0 {
-                log::debug!("Controller ready after {} iterations", i);
+                log::debug!("NVMe controller ready");
                 break;
             }
             if (csts & 0x2) != 0 {
                 log::error!("Controller fatal status!");
                 return Err(NvmeError::NotReady);
             }
+            core::hint::spin_loop();
         }
 
         let csts = self.read_reg32(regs::CSTS);
@@ -568,7 +573,9 @@ impl NvmeController {
 
     /// Wait for admin command completion
     fn wait_admin_completion(&mut self, cid: u16) -> Result<CompletionQueueEntry, NvmeError> {
-        for _ in 0..10000000 {
+        let timeout = Timeout::from_ms(5000); // 5 second timeout for admin commands
+
+        while !timeout.is_expired() {
             fence(Ordering::SeqCst);
             let head = self.admin_cq_head as usize;
             let entry = unsafe { ptr::read_volatile(self.admin_cq.add(head)) };
@@ -591,6 +598,7 @@ impl NvmeController {
                     return Ok(entry);
                 }
             }
+            core::hint::spin_loop();
         }
         Err(NvmeError::Timeout)
     }
@@ -771,7 +779,9 @@ impl NvmeController {
 
     /// Wait for I/O command completion
     fn wait_io_completion(&mut self, cid: u16) -> Result<CompletionQueueEntry, NvmeError> {
-        for _ in 0..10000000 {
+        let timeout = Timeout::from_ms(1000); // 1 second timeout for I/O
+
+        while !timeout.is_expired() {
             fence(Ordering::SeqCst);
             let head = self.io_cq_head as usize;
             let entry = unsafe { ptr::read_volatile(self.io_cq.add(head)) };
@@ -794,6 +804,7 @@ impl NvmeController {
                     return Ok(entry);
                 }
             }
+            core::hint::spin_loop();
         }
         Err(NvmeError::Timeout)
     }

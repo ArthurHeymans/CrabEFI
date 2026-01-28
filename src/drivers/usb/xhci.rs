@@ -4,6 +4,7 @@
 
 use crate::drivers::pci::{self, PciAddress, PciDevice};
 use crate::efi;
+use crate::time::Timeout;
 use core::ptr;
 use core::sync::atomic::{fence, Ordering};
 
@@ -765,36 +766,42 @@ impl XhciController {
 
     /// Initialize the controller
     fn init(&mut self) -> Result<(), XhciError> {
-        // Wait for controller to be ready
-        for _ in 0..100000 {
+        // Wait for controller to be ready (up to 100ms)
+        let timeout = Timeout::from_ms(100);
+        while !timeout.is_expired() {
             let sts = self.read_op_reg(op_regs::USBSTS);
             if sts & usbsts::CNR == 0 {
                 break;
             }
+            core::hint::spin_loop();
         }
 
         // Stop the controller
         let cmd = self.read_op_reg(op_regs::USBCMD);
         self.write_op_reg(op_regs::USBCMD, cmd & !usbcmd::RS);
 
-        // Wait for halt
-        for _ in 0..100000 {
+        // Wait for halt (up to 100ms)
+        let timeout = Timeout::from_ms(100);
+        while !timeout.is_expired() {
             let sts = self.read_op_reg(op_regs::USBSTS);
             if sts & usbsts::HCH != 0 {
                 break;
             }
+            core::hint::spin_loop();
         }
 
         // Reset the controller
         self.write_op_reg(op_regs::USBCMD, usbcmd::HCRST);
 
-        // Wait for reset to complete
-        for _ in 0..100000 {
+        // Wait for reset to complete (up to 500ms per USB spec)
+        let timeout = Timeout::from_ms(500);
+        while !timeout.is_expired() {
             let cmd = self.read_op_reg(op_regs::USBCMD);
             let sts = self.read_op_reg(op_regs::USBSTS);
             if cmd & usbcmd::HCRST == 0 && sts & usbsts::CNR == 0 {
                 break;
             }
+            core::hint::spin_loop();
         }
 
         // Set max device slots
@@ -841,12 +848,14 @@ impl XhciController {
         let cmd = self.read_op_reg(op_regs::USBCMD);
         self.write_op_reg(op_regs::USBCMD, cmd | usbcmd::RS);
 
-        // Wait for running
-        for _ in 0..100000 {
+        // Wait for running (up to 100ms)
+        let timeout = Timeout::from_ms(100);
+        while !timeout.is_expired() {
             let sts = self.read_op_reg(op_regs::USBSTS);
             if sts & usbsts::HCH == 0 {
                 break;
             }
+            core::hint::spin_loop();
         }
 
         log::info!("xHCI controller initialized");
@@ -855,7 +864,9 @@ impl XhciController {
 
     /// Wait for and process a command completion event
     fn wait_command_completion(&mut self) -> Result<Trb, XhciError> {
-        for _ in 0..1000000 {
+        let timeout = Timeout::from_ms(5000); // 5 second timeout for commands
+
+        while !timeout.is_expired() {
             // Read event ring dequeue pointer
             let erdp = self.event_ring.base + (self.event_ring.dequeue_idx * 16) as u64;
             let event = unsafe { &*(erdp as *const Trb) };
@@ -888,13 +899,16 @@ impl XhciController {
                     continue;
                 }
             }
+            core::hint::spin_loop();
         }
         Err(XhciError::Timeout)
     }
 
     /// Wait for transfer completion
     fn wait_transfer_completion(&mut self, _slot: u8, _ep: u8) -> Result<Trb, XhciError> {
-        for i in 0..10000000 {
+        let timeout = Timeout::from_ms(5000); // 5 second timeout for transfers
+
+        while !timeout.is_expired() {
             let erdp = self.event_ring.base + (self.event_ring.dequeue_idx * 16) as u64;
             let event = unsafe { &*(erdp as *const Trb) };
 
@@ -930,13 +944,7 @@ impl XhciController {
                     );
                 }
             }
-
-            // Small delay every 100000 iterations to avoid tight busy-loop
-            if i % 100000 == 99999 {
-                for _ in 0..1000 {
-                    core::hint::spin_loop();
-                }
-            }
+            core::hint::spin_loop();
         }
         log::warn!(
             "xHCI: Transfer timeout, event ring dequeue_idx={}, cycle={}",
@@ -1178,13 +1186,15 @@ impl XhciController {
                 let portsc = self.read_port_reg(port, port_regs::PORTSC);
                 self.write_port_reg(port, port_regs::PORTSC, portsc | portsc::PR);
 
-                // Wait for reset to complete
-                for _ in 0..100000 {
+                // Wait for reset to complete (up to 100ms per USB spec)
+                let timeout = Timeout::from_ms(100);
+                while !timeout.is_expired() {
                     let portsc = self.read_port_reg(port, port_regs::PORTSC);
                     if portsc & portsc::PRC != 0 {
                         self.write_port_reg(port, port_regs::PORTSC, portsc | portsc::PRC);
                         break;
                     }
+                    core::hint::spin_loop();
                 }
             }
 

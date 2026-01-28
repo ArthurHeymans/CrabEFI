@@ -4,6 +4,7 @@
 //! protocol with SCSI command set for reading from USB drives.
 
 use super::xhci::{XhciController, XhciError};
+use crate::time;
 use core::ptr;
 
 /// SCSI Commands
@@ -180,15 +181,13 @@ impl UsbMassStorage {
 
     /// Initialize the device
     fn init(&mut self, controller: &mut XhciController) -> Result<(), MassStorageError> {
-        // Test Unit Ready (may need multiple attempts)
+        // Test Unit Ready (may need multiple attempts as device spins up)
         for _ in 0..5 {
             if self.test_unit_ready(controller).is_ok() {
                 break;
             }
-            // Small delay
-            for _ in 0..100000 {
-                core::hint::spin_loop();
-            }
+            // Delay 100ms between retries
+            time::delay_ms(100);
         }
 
         // Inquiry

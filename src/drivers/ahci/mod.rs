@@ -5,6 +5,7 @@
 
 use crate::drivers::pci::{self, PciDevice};
 use crate::efi;
+use crate::time::Timeout;
 use core::ptr;
 use core::sync::atomic::{fence, Ordering};
 
@@ -502,11 +503,13 @@ impl AhciController {
                 // BIOS owns the HBA
                 log::debug!("Performing BIOS/OS handoff...");
                 Self::write_reg_static(mmio_base, regs::BOHC, bohc | 0x2); // Set OOS
-                for _ in 0..100000 {
+                let timeout = Timeout::from_ms(100);
+                while !timeout.is_expired() {
                     let bohc = Self::read_reg_static(mmio_base, regs::BOHC);
                     if bohc & 0x1 == 0 {
                         break;
                     }
+                    core::hint::spin_loop();
                 }
             }
         }
@@ -649,9 +652,10 @@ impl AhciController {
         // Start command processing (this also enables FIS receive)
         self.start_port(port_num)?;
 
-        // Wait for device to become ready (BSY=0, DRQ=0)
+        // Wait for device to become ready (BSY=0, DRQ=0) - up to 5 seconds
         let mut ready = false;
-        for _ in 0..1000000u32 {
+        let timeout = Timeout::from_ms(5000);
+        while !timeout.is_expired() {
             let tfd = self.read_port_reg(port_num, port_regs::TFD);
             if tfd & (port_tfd::STS_BSY | port_tfd::STS_DRQ) == 0 {
                 ready = true;
@@ -717,24 +721,28 @@ impl AhciController {
         // Clear ST (Start) bit
         self.write_port_reg(port_num, port_regs::CMD, cmd & !port_cmd::ST);
 
-        // Wait for CR (Command List Running) to clear
-        for _ in 0..500000 {
+        // Wait for CR (Command List Running) to clear (up to 500ms)
+        let timeout = Timeout::from_ms(500);
+        while !timeout.is_expired() {
             let cmd = self.read_port_reg(port_num, port_regs::CMD);
             if cmd & port_cmd::CR == 0 {
                 break;
             }
+            core::hint::spin_loop();
         }
 
         // Clear FRE (FIS Receive Enable) bit
         let cmd = self.read_port_reg(port_num, port_regs::CMD);
         self.write_port_reg(port_num, port_regs::CMD, cmd & !port_cmd::FRE);
 
-        // Wait for FR (FIS Receive Running) to clear
-        for _ in 0..500000 {
+        // Wait for FR (FIS Receive Running) to clear (up to 500ms)
+        let timeout = Timeout::from_ms(500);
+        while !timeout.is_expired() {
             let cmd = self.read_port_reg(port_num, port_regs::CMD);
             if cmd & port_cmd::FR == 0 {
                 return Ok(());
             }
+            core::hint::spin_loop();
         }
 
         Err(AhciError::Timeout)
@@ -742,12 +750,14 @@ impl AhciController {
 
     /// Start command processing on a port
     fn start_port(&mut self, port_num: u8) -> Result<(), AhciError> {
-        // Wait for CR to clear
-        for _ in 0..500000 {
+        // Wait for CR to clear (up to 500ms)
+        let timeout = Timeout::from_ms(500);
+        while !timeout.is_expired() {
             let cmd = self.read_port_reg(port_num, port_regs::CMD);
             if cmd & port_cmd::CR == 0 {
                 break;
             }
+            core::hint::spin_loop();
         }
 
         // Enable FIS receive
@@ -782,8 +792,9 @@ impl AhciController {
         // Issue command
         self.write_port_reg(port.port_num, port_regs::CI, 1 << slot);
 
-        // Wait for completion
-        for _ in 0..10000000u32 {
+        // Wait for completion (up to 30 seconds for slow devices)
+        let timeout = Timeout::from_ms(30000);
+        while !timeout.is_expired() {
             let ci = self.read_port_reg(port.port_num, port_regs::CI);
             if ci & (1 << slot) == 0 {
                 // Check for errors
@@ -803,6 +814,7 @@ impl AhciController {
                 log::error!("AHCI task file error: TFD={:#x}, IS={:#x}", tfd, is);
                 return Err(AhciError::CommandFailed);
             }
+            core::hint::spin_loop();
         }
 
         log::error!("AHCI: Command timeout");
@@ -1179,8 +1191,9 @@ impl AhciController {
         // Issue command
         self.write_port_reg(port_num, port_regs::CI, 1 << slot);
 
-        // Wait for completion
-        for i in 0..10000000u32 {
+        // Wait for completion (up to 30 seconds for slow devices)
+        let timeout = Timeout::from_ms(30000);
+        while !timeout.is_expired() {
             let ci = self.read_port_reg(port_num, port_regs::CI);
             if ci & (1 << slot) == 0 {
                 // Check for errors
@@ -1189,11 +1202,6 @@ impl AhciController {
                     log::error!("AHCI command error: TFD={:#x}", tfd);
                     return Err(AhciError::CommandFailed);
                 }
-                log::trace!(
-                    "issue_command_by_port: completed after {} iterations, TFD={:#x}",
-                    i,
-                    tfd
-                );
                 return Ok(());
             }
 
@@ -1205,6 +1213,7 @@ impl AhciController {
                 log::error!("AHCI task file error: TFD={:#x}, IS={:#x}", tfd, is);
                 return Err(AhciError::CommandFailed);
             }
+            core::hint::spin_loop();
         }
 
         log::error!("AHCI command timeout on port {}", port_num);
