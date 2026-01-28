@@ -232,6 +232,16 @@ macro_rules! exception_no_error {
 }
 
 // Exception handlers with error code
+// Stack layout after all pushes (15 regs + vector = 128 bytes):
+//   rsp + 0:   r15
+//   rsp + 8:   r14
+//   ...
+//   rsp + 112: rax
+//   rsp + 120: vector (pushed by us)
+//   rsp + 128: error_code (pushed by CPU)
+//   rsp + 136: rip (pushed by CPU)
+//   rsp + 144: cs (pushed by CPU)
+//   rsp + 152: rflags (pushed by CPU)
 macro_rules! exception_with_error {
     ($name:ident, $vector:expr) => {
         #[unsafe(naked)]
@@ -254,10 +264,10 @@ macro_rules! exception_with_error {
                 "push r14",
                 "push r15",
                 "mov rdi, {vector}", // vector
-                "mov rsi, [rsp + 120]", // error_code
-                "mov rdx, [rsp + 128]", // rip
-                "mov rcx, [rsp + 136]", // cs
-                "mov r8, [rsp + 144]",  // rflags
+                "mov rsi, [rsp + 128]", // error_code (CPU pushed before our handler)
+                "mov rdx, [rsp + 136]", // rip
+                "mov rcx, [rsp + 144]", // cs
+                "mov r8, [rsp + 152]",  // rflags
                 "call {handler}",
                 "2:",
                 "hlt",
