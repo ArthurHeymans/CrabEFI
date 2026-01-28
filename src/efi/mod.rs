@@ -41,6 +41,12 @@ pub fn init(cb_info: &CorebootInfo) {
     // Install Unicode Collation protocol
     init_unicode_collation();
 
+    // Install Memory Attribute protocol
+    init_memory_attribute();
+
+    // Install Serial IO protocol
+    init_serial_io();
+
     log::info!("EFI environment initialized");
 }
 
@@ -129,6 +135,72 @@ fn init_unicode_collation() {
     }
 
     log::debug!("Unicode Collation protocols installed");
+}
+
+/// Initialize Memory Attribute protocol
+fn init_memory_attribute() {
+    use protocols::memory_attribute::{create_protocol, MEMORY_ATTRIBUTE_PROTOCOL_GUID};
+
+    // Create a handle for Memory Attribute protocol
+    let handle = match boot_services::create_handle() {
+        Some(h) => h,
+        None => {
+            log::error!("Failed to create Memory Attribute handle");
+            return;
+        }
+    };
+
+    // Create and install the protocol
+    let protocol = create_protocol();
+    if protocol.is_null() {
+        log::error!("Failed to create Memory Attribute protocol");
+        return;
+    }
+
+    let status = boot_services::install_protocol(
+        handle,
+        &MEMORY_ATTRIBUTE_PROTOCOL_GUID,
+        protocol as *mut core::ffi::c_void,
+    );
+    if status != Status::SUCCESS {
+        log::error!("Failed to install Memory Attribute protocol: {:?}", status);
+        return;
+    }
+
+    log::debug!("Memory Attribute protocol installed on handle {:?}", handle);
+}
+
+/// Initialize Serial IO protocol
+fn init_serial_io() {
+    use protocols::serial_io::{create_protocol, SERIAL_IO_PROTOCOL_GUID};
+
+    // Create a handle for Serial IO protocol
+    let handle = match boot_services::create_handle() {
+        Some(h) => h,
+        None => {
+            log::error!("Failed to create Serial IO handle");
+            return;
+        }
+    };
+
+    // Create and install the protocol
+    let protocol = create_protocol();
+    if protocol.is_null() {
+        log::error!("Failed to create Serial IO protocol");
+        return;
+    }
+
+    let status = boot_services::install_protocol(
+        handle,
+        &SERIAL_IO_PROTOCOL_GUID,
+        protocol as *mut core::ffi::c_void,
+    );
+    if status != Status::SUCCESS {
+        log::error!("Failed to install Serial IO protocol: {:?}", status);
+        return;
+    }
+
+    log::debug!("Serial IO protocol installed on handle {:?}", handle);
 }
 
 /// Get the EFI system table pointer

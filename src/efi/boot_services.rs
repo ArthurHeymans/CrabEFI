@@ -22,6 +22,20 @@ const MAX_HANDLES: usize = 64;
 /// Maximum number of protocols per handle
 const MAX_PROTOCOLS_PER_HANDLE: usize = 8;
 
+/// Maximum number of events we can track
+const MAX_EVENTS: usize = 32;
+
+/// Event types
+pub const EVT_TIMER: u32 = 0x80000000;
+pub const EVT_RUNTIME: u32 = 0x40000000;
+pub const EVT_NOTIFY_WAIT: u32 = 0x00000100;
+pub const EVT_NOTIFY_SIGNAL: u32 = 0x00000200;
+pub const EVT_SIGNAL_EXIT_BOOT_SERVICES: u32 = 0x00000201;
+pub const EVT_SIGNAL_VIRTUAL_ADDRESS_CHANGE: u32 = 0x60000202;
+
+/// Special event ID for keyboard input
+pub const KEYBOARD_EVENT_ID: usize = 1;
+
 /// Protocol interface entry
 #[derive(Clone, Copy)]
 struct ProtocolEntry {
@@ -63,6 +77,26 @@ impl HandleEntry {
     }
 }
 
+/// Event entry for tracking created events
+#[derive(Clone, Copy)]
+struct EventEntry {
+    event_type: u32,
+    notify_tpl: Tpl,
+    signaled: bool,
+    is_keyboard_event: bool,
+}
+
+impl EventEntry {
+    const fn empty() -> Self {
+        Self {
+            event_type: 0,
+            notify_tpl: 0,
+            signaled: false,
+            is_keyboard_event: false,
+        }
+    }
+}
+
 /// Handle database
 static HANDLES: Mutex<[HandleEntry; MAX_HANDLES]> =
     Mutex::new([const { HandleEntry::empty() }; MAX_HANDLES]);
@@ -70,6 +104,11 @@ static HANDLE_COUNT: Mutex<usize> = Mutex::new(0);
 
 /// Next handle value (used as a unique identifier)
 static NEXT_HANDLE: Mutex<usize> = Mutex::new(1);
+
+/// Event database
+static EVENTS: Mutex<[EventEntry; MAX_EVENTS]> =
+    Mutex::new([const { EventEntry::empty() }; MAX_EVENTS]);
+static NEXT_EVENT_ID: Mutex<usize> = Mutex::new(2); // Start at 2, reserve 1 for keyboard
 
 /// Static boot services table
 static mut BOOT_SERVICES: efi::BootServices = efi::BootServices {
@@ -296,14 +335,47 @@ extern "efiapi" fn create_event(
     notify_tpl: Tpl,
     _notify_function: Option<efi::EventNotify>,
     _notify_context: *mut c_void,
-    _event: *mut efi::Event,
+    event: *mut efi::Event,
 ) -> Status {
     log::debug!(
-        "BS.CreateEvent(type={:#x}, tpl={:?}) -> UNSUPPORTED",
+        "BS.CreateEvent(type={:#x}, tpl={:?})",
         event_type,
         notify_tpl
     );
-    Status::UNSUPPORTED
+
+    if event.is_null() {
+        return Status::INVALID_PARAMETER;
+    }
+
+    // Allocate an event ID
+    let mut next_id = NEXT_EVENT_ID.lock();
+    let event_id = *next_id;
+
+    if event_id >= MAX_EVENTS {
+        log::error!("  -> OUT_OF_RESOURCES (no more event slots)");
+        return Status::OUT_OF_RESOURCES;
+    }
+
+    *next_id += 1;
+    drop(next_id);
+
+    // Store event info
+    let mut events = EVENTS.lock();
+    events[event_id] = EventEntry {
+        event_type,
+        notify_tpl,
+        signaled: false,
+        is_keyboard_event: false,
+    };
+    drop(events);
+
+    // Return the event ID as the event handle
+    unsafe {
+        *event = event_id as *mut c_void;
+    }
+
+    log::debug!("  -> SUCCESS (event={:#x})", event_id);
+    Status::SUCCESS
 }
 
 extern "efiapi" fn set_timer(
@@ -312,36 +384,120 @@ extern "efiapi" fn set_timer(
     trigger_time: u64,
 ) -> Status {
     log::debug!(
-        "BS.SetTimer(event={:?}, type={}, time={}) -> UNSUPPORTED",
+        "BS.SetTimer(event={:?}, type={}, time={})",
         event,
         timer_type,
         trigger_time
     );
-    Status::UNSUPPORTED
+    // Timer events are not fully implemented, but we accept the call
+    // to allow bootloaders to proceed
+    log::debug!("  -> SUCCESS (stubbed)");
+    Status::SUCCESS
 }
 
 extern "efiapi" fn wait_for_event(
     number_of_events: usize,
-    _event: *mut efi::Event,
-    _index: *mut usize,
+    event: *mut efi::Event,
+    index: *mut usize,
 ) -> Status {
-    log::debug!("BS.WaitForEvent(count={}) -> UNSUPPORTED", number_of_events);
-    Status::UNSUPPORTED
+    log::debug!("BS.WaitForEvent(count={})", number_of_events);
+
+    if number_of_events == 0 || event.is_null() || index.is_null() {
+        return Status::INVALID_PARAMETER;
+    }
+
+    // Get the list of events to wait on
+    let events_to_wait = unsafe { core::slice::from_raw_parts(event, number_of_events) };
+
+    // Check if any of the events is a keyboard event
+    let has_keyboard_event = events_to_wait.iter().any(|e| {
+        let event_id = *e as usize;
+        event_id == KEYBOARD_EVENT_ID
+    });
+
+    // Poll for keyboard input
+    // In a real implementation, we'd use proper async I/O
+    // Here we poll the serial port for input
+    loop {
+        // Check each event
+        for (i, &evt) in events_to_wait.iter().enumerate() {
+            let event_id = evt as usize;
+
+            // Check if it's the keyboard event and there's input
+            if event_id == KEYBOARD_EVENT_ID || has_keyboard_event {
+                // Check if serial port has data
+                if crate::drivers::serial::has_input() {
+                    unsafe { *index = i };
+                    log::debug!("  -> SUCCESS (keyboard input ready, index={})", i);
+                    return Status::SUCCESS;
+                }
+            }
+
+            // Check if a regular event is signaled
+            if event_id > 0 && event_id < MAX_EVENTS {
+                let events = EVENTS.lock();
+                if events[event_id].signaled {
+                    drop(events);
+                    unsafe { *index = i };
+                    log::debug!("  -> SUCCESS (event signaled, index={})", i);
+                    return Status::SUCCESS;
+                }
+            }
+        }
+
+        // Small delay to avoid busy-waiting too aggressively
+        for _ in 0..1000 {
+            core::hint::spin_loop();
+        }
+    }
 }
 
 extern "efiapi" fn signal_event(event: efi::Event) -> Status {
-    log::trace!("BS.SignalEvent({:?}) -> UNSUPPORTED", event);
-    Status::UNSUPPORTED
+    let event_id = event as usize;
+    log::trace!("BS.SignalEvent(event={})", event_id);
+
+    if event_id > 0 && event_id < MAX_EVENTS {
+        let mut events = EVENTS.lock();
+        events[event_id].signaled = true;
+    }
+
+    Status::SUCCESS
 }
 
 extern "efiapi" fn close_event(event: efi::Event) -> Status {
-    log::trace!("BS.CloseEvent({:?}) -> UNSUPPORTED", event);
-    Status::UNSUPPORTED
+    let event_id = event as usize;
+    log::trace!("BS.CloseEvent(event={})", event_id);
+
+    if event_id > 0 && event_id < MAX_EVENTS {
+        let mut events = EVENTS.lock();
+        events[event_id] = EventEntry::empty();
+    }
+
+    Status::SUCCESS
 }
 
 extern "efiapi" fn check_event(event: efi::Event) -> Status {
-    log::trace!("BS.CheckEvent({:?}) -> UNSUPPORTED", event);
-    Status::UNSUPPORTED
+    let event_id = event as usize;
+    log::trace!("BS.CheckEvent(event={})", event_id);
+
+    // Special case for keyboard event
+    if event_id == KEYBOARD_EVENT_ID {
+        if crate::drivers::serial::has_input() {
+            return Status::SUCCESS;
+        } else {
+            return Status::NOT_READY;
+        }
+    }
+
+    // Check regular events
+    if event_id > 0 && event_id < MAX_EVENTS {
+        let events = EVENTS.lock();
+        if events[event_id].signaled {
+            return Status::SUCCESS;
+        }
+    }
+
+    Status::NOT_READY
 }
 
 extern "efiapi" fn create_event_ex(
@@ -350,14 +506,16 @@ extern "efiapi" fn create_event_ex(
     _notify_function: Option<efi::EventNotify>,
     _notify_context: *const c_void,
     _event_group: *const Guid,
-    _event: *mut efi::Event,
+    event: *mut efi::Event,
 ) -> Status {
     log::debug!(
-        "BS.CreateEventEx(type={:#x}, tpl={:?}) -> UNSUPPORTED",
+        "BS.CreateEventEx(type={:#x}, tpl={:?})",
         event_type,
         notify_tpl
     );
-    Status::UNSUPPORTED
+
+    // Forward to create_event (ignoring event_group for now)
+    create_event(event_type, notify_tpl, None, core::ptr::null_mut(), event)
 }
 
 // ============================================================================
@@ -725,8 +883,17 @@ extern "efiapi" fn open_protocol(
         if handles[i].handle == handle {
             for j in 0..handles[i].protocol_count {
                 if guid_eq(&handles[i].protocols[j].guid, &guid) {
+                    let iface = handles[i].protocols[j].interface;
                     if !interface.is_null() {
-                        unsafe { *interface = handles[i].protocols[j].interface };
+                        unsafe { *interface = iface };
+                    }
+                    log::debug!("  -> SUCCESS (interface={:?})", iface);
+
+                    // For LOADED_IMAGE, log the DeviceHandle the bootloader will use
+                    if guid_name == "LOADED_IMAGE" && !iface.is_null() {
+                        let lip = iface as *const r_efi::protocols::loaded_image::Protocol;
+                        let dev_handle = unsafe { (*lip).device_handle };
+                        log::debug!("  -> LOADED_IMAGE.DeviceHandle = {:?}", dev_handle);
                     }
                     return Status::SUCCESS;
                 }
@@ -1085,6 +1252,51 @@ fn format_guid(guid: &Guid) -> &'static str {
         0x56,
         &[0x49, 0xf9, 0x43, 0x04, 0xf7, 0x21],
     );
+    // EFI Memory Attribute Protocol (UEFI 2.10) - memory protection attributes
+    const MEMORY_ATTRIBUTE_GUID: Guid = Guid::from_fields(
+        0xf4560cf6,
+        0x40ec,
+        0x4b4a,
+        0xa1,
+        0x92,
+        &[0xbf, 0x1d, 0x57, 0xd0, 0xb1, 0x89],
+    );
+    // EFI TCG Protocol (TPM 1.2)
+    const TCG_GUID: Guid = Guid::from_fields(
+        0xf541796d,
+        0xa62e,
+        0x4954,
+        0xa7,
+        0x75,
+        &[0x95, 0x84, 0xf6, 0x1b, 0x9c, 0xdd],
+    );
+    // EFI TCG2 Protocol (TPM 2.0)
+    const TCG2_GUID: Guid = Guid::from_fields(
+        0x607f766c,
+        0x7455,
+        0x42be,
+        0x93,
+        0x0b,
+        &[0xe4, 0xd7, 0x6d, 0xb2, 0x72, 0x0f],
+    );
+    // EFI CC Measurement Protocol (Confidential Computing)
+    const CC_MEASUREMENT_GUID: Guid = Guid::from_fields(
+        0x96751a3d,
+        0x72f4,
+        0x41a6,
+        0xa7,
+        0x94,
+        &[0xed, 0x5d, 0x0e, 0x67, 0xae, 0x6b],
+    );
+    // EFI Simple Text Input Ex Protocol
+    const SIMPLE_TEXT_INPUT_EX_GUID: Guid = Guid::from_fields(
+        0xdd9e7534,
+        0x7762,
+        0x4698,
+        0x8c,
+        0x14,
+        &[0xf5, 0x85, 0x17, 0xa6, 0x25, 0xaa],
+    );
 
     if guid_eq(guid, &LOADED_IMAGE_GUID) {
         return "LOADED_IMAGE";
@@ -1154,6 +1366,21 @@ fn format_guid(guid: &Guid) -> &'static str {
     }
     if guid_eq(guid, &UNKNOWN_BOOTLOADER_GUID) {
         return "UNKNOWN_BOOTLOADER_F42F7782";
+    }
+    if guid_eq(guid, &MEMORY_ATTRIBUTE_GUID) {
+        return "MEMORY_ATTRIBUTE";
+    }
+    if guid_eq(guid, &TCG_GUID) {
+        return "TCG (TPM 1.2)";
+    }
+    if guid_eq(guid, &TCG2_GUID) {
+        return "TCG2 (TPM 2.0)";
+    }
+    if guid_eq(guid, &CC_MEASUREMENT_GUID) {
+        return "CC_MEASUREMENT";
+    }
+    if guid_eq(guid, &SIMPLE_TEXT_INPUT_EX_GUID) {
+        return "SIMPLE_TEXT_INPUT_EX";
     }
 
     "UNKNOWN"

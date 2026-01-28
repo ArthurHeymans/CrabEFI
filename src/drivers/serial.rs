@@ -206,6 +206,24 @@ pub fn write_byte(byte: u8) {
     }
 }
 
+/// Check if there is input available on the serial port
+pub fn has_input() -> bool {
+    if let Some(ref serial) = *SERIAL.lock() {
+        serial.can_receive()
+    } else {
+        false
+    }
+}
+
+/// Try to read a byte from the serial port (non-blocking)
+pub fn try_read() -> Option<u8> {
+    if let Some(ref mut serial) = *SERIAL.lock() {
+        serial.try_read_byte()
+    } else {
+        None
+    }
+}
+
 /// Macro for printing to serial
 #[macro_export]
 macro_rules! serial_print {

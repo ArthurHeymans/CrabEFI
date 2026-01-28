@@ -4,7 +4,9 @@
 //! for console I/O.
 
 use crate::drivers::serial;
-use r_efi::efi::{Boolean, Guid, Status};
+use crate::efi::boot_services::KEYBOARD_EVENT_ID;
+use core::ffi::c_void;
+use r_efi::efi::{Boolean, Event, Guid, Status};
 use r_efi::protocols::simple_text_input::{InputKey, Protocol as SimpleTextInputProtocol};
 use r_efi::protocols::simple_text_output::{
     Mode as SimpleTextOutputMode, Protocol as SimpleTextOutputProtocol,
@@ -41,10 +43,12 @@ static mut CONSOLE_MODE: SimpleTextOutputMode = SimpleTextOutputMode {
 };
 
 /// Static text input protocol
+/// Note: wait_for_key is set to KEYBOARD_EVENT_ID which is the special event
+/// used for keyboard input polling
 static mut TEXT_INPUT_PROTOCOL: SimpleTextInputProtocol = SimpleTextInputProtocol {
     reset: text_input_reset,
     read_key_stroke: text_input_read_key_stroke,
-    wait_for_key: core::ptr::null_mut(),
+    wait_for_key: KEYBOARD_EVENT_ID as *mut c_void as Event,
 };
 
 /// Static text output protocol
@@ -95,10 +99,55 @@ extern "efiapi" fn text_input_read_key_stroke(
     }
 
     // Try to read from serial port
-    // For now, we don't have async input, so this always returns NOT_READY
-    // TODO: Implement keyboard polling
+    match serial::try_read() {
+        Some(byte) => {
+            // Convert serial input to EFI key
+            let (scan_code, unicode_char) = convert_serial_to_efi_key(byte);
 
-    Status::NOT_READY
+            unsafe {
+                (*key).scan_code = scan_code;
+                (*key).unicode_char = unicode_char;
+            }
+
+            log::trace!(
+                "ConIn.ReadKeyStroke: byte={:#x} -> scan={:#x}, unicode={:#x}",
+                byte,
+                scan_code,
+                unicode_char
+            );
+
+            Status::SUCCESS
+        }
+        None => {
+            // No key available
+            Status::NOT_READY
+        }
+    }
+}
+
+/// Convert a serial port byte to EFI scan code and unicode character
+fn convert_serial_to_efi_key(byte: u8) -> (u16, u16) {
+    // Most ASCII characters map directly to unicode
+    // Special keys need scan codes
+    match byte {
+        // Enter key
+        b'\r' | b'\n' => (0, 0x000D), // CHAR_CARRIAGE_RETURN
+
+        // Backspace
+        0x7F | 0x08 => (0, 0x0008), // CHAR_BACKSPACE
+
+        // Tab
+        b'\t' => (0, 0x0009), // CHAR_TAB
+
+        // Escape - could be start of escape sequence or just ESC
+        0x1B => (0x17, 0), // SCAN_ESC
+
+        // Regular printable ASCII
+        0x20..=0x7E => (0, byte as u16),
+
+        // Other control characters
+        _ => (0, byte as u16),
+    }
 }
 
 // ============================================================================

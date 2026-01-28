@@ -224,3 +224,5 @@ impl SectorRead for MyDisk {
 ## Reference Implementations
 - U-Boot EFI loader: `~/src/u-boot/lib/efi_loader/`
 - coreboot libpayload: `~/src/coreboot/payloads/libpayload/`
+- rust-hypervisor-firmware: `~/src/rust-hypervisor-firmware`
+- EDK2: `~/src/edk2/` 

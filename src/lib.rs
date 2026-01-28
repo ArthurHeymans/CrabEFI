@@ -304,6 +304,7 @@ fn try_boot_from_esp<R: fs::gpt::SectorRead>(disk: &mut R, esp: &fs::gpt::Partit
 /// Try to boot from an ESP on USB (with SimpleFileSystem support)
 fn try_boot_from_esp_usb(disk: &mut fs::gpt::UsbDisk, esp: &fs::gpt::Partition) -> bool {
     use efi::boot_services;
+    use efi::protocols::device_path::{self, DEVICE_PATH_PROTOCOL_GUID};
     use efi::protocols::simple_file_system::{self, SIMPLE_FILE_SYSTEM_GUID};
     use r_efi::efi::Status;
 
@@ -318,7 +319,7 @@ fn try_boot_from_esp_usb(disk: &mut fs::gpt::UsbDisk, esp: &fs::gpt::Partition) 
             let sfs_protocol =
                 simple_file_system::init(fs_state, drivers::usb::mass_storage::global_read_sector);
 
-            // Create a device handle with SimpleFileSystem protocol
+            // Create a device handle with SimpleFileSystem and DevicePath protocols
             let device_handle = match boot_services::create_handle() {
                 Some(h) => h,
                 None => {
@@ -326,6 +327,32 @@ fn try_boot_from_esp_usb(disk: &mut fs::gpt::UsbDisk, esp: &fs::gpt::Partition) 
                     return false;
                 }
             };
+
+            // Install DevicePath protocol on the device handle
+            // This tells the bootloader what device it booted from
+            let partition_size = esp.size_sectors();
+            let device_path = device_path::create_hard_drive_device_path(
+                1, // partition number (ESP is typically partition 1)
+                esp.first_lba,
+                partition_size,
+                &esp.partition_guid,
+            );
+
+            if !device_path.is_null() {
+                let status = boot_services::install_protocol(
+                    device_handle,
+                    &DEVICE_PATH_PROTOCOL_GUID,
+                    device_path as *mut core::ffi::c_void,
+                );
+                if status == Status::SUCCESS {
+                    log::info!(
+                        "DevicePath protocol installed on device handle {:?}",
+                        device_handle
+                    );
+                } else {
+                    log::warn!("Failed to install DevicePath protocol: {:?}", status);
+                }
+            }
 
             // Install SimpleFileSystem protocol on the device handle
             let status = boot_services::install_protocol(
@@ -527,6 +554,18 @@ fn load_and_execute_bootloader<R: fs::gpt::SectorRead>(
         log::error!("Failed to create LoadedImageProtocol");
         pe::unload_image(&loaded_image);
         return Err(Status::OUT_OF_RESOURCES);
+    }
+
+    // Set the file path in LoadedImageProtocol (tells bootloader what file was loaded)
+    let file_path = efi::protocols::device_path::create_file_path_device_path(path);
+    if !file_path.is_null() {
+        unsafe {
+            efi::protocols::loaded_image::set_file_path(
+                loaded_image_protocol,
+                file_path as *mut r_efi::protocols::device_path::Protocol,
+            );
+        }
+        log::debug!("Set LoadedImage.FilePath to: {}", path);
     }
 
     let status = boot_services::install_protocol(
