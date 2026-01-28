@@ -1,0 +1,40 @@
+[package]
+name = "crabefi"
+version = "0.1.0"
+edition = "2024"
+authors = ["CrabEFI Contributors"]
+description = "A minimal UEFI implementation as a coreboot payload"
+license = "Apache-2.0 OR MIT"
+repository = "https://github.com/user/CrabEFI"
+readme = "README.md"
+
+[dependencies]
+r-efi = "5.3"
+log = "0.4"
+bitflags = "2"
+heapless = "0.8"
+atomic_refcell = "0.1"
+spin = "0.9"
+
+[target.'cfg(target_arch = "x86_64")'.dependencies]
+x86_64 = "0.15"
+
+[build-dependencies]
+cc = "1"
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+lto = true
+opt-level = "z"
+codegen-units = 1
+
+[lib]
+name = "crabefi"
+path = "src/lib.rs"
+
+[[bin]]
+name = "crabefi"
+path = "src/main.rs"
