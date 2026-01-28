@@ -211,6 +211,8 @@ fn try_boot_from_ahci() -> bool {
 
 /// Try to boot from USB mass storage
 fn try_boot_from_usb() -> bool {
+    use drivers::storage::{self, StorageType};
+
     if let Some(xhci) = drivers::usb::get_controller(0) {
         if let Some(slot_id) = xhci.find_mass_storage() {
             log::info!("Found USB mass storage device on slot {}", slot_id);
@@ -218,39 +220,71 @@ fn try_boot_from_usb() -> bool {
             // Create mass storage device
             match drivers::usb::UsbMassStorage::new(xhci, slot_id) {
                 Ok(usb_device) => {
+                    // Get disk info before storing
+                    let num_blocks = usb_device.num_blocks;
+                    let block_size = usb_device.block_size;
+                    // TODO: Get actual USB port from device - using 0 as default for QEMU
+                    let usb_port: u8 = 0;
+
                     // Store the device globally for later access by filesystem protocol
                     if !drivers::usb::mass_storage::store_global_device(usb_device) {
                         log::error!("Failed to store USB device globally");
                         return false;
                     }
 
-                    // Get the stored device for ESP detection
+                    // Register with storage abstraction
+                    let storage_id = match storage::register_device(
+                        StorageType::Usb { slot_id },
+                        num_blocks,
+                        block_size,
+                    ) {
+                        Some(id) => id,
+                        None => {
+                            log::error!("Failed to register USB device with storage");
+                            return false;
+                        }
+                    };
+
+                    // Install BlockIO for all partitions
+                    // Note: xHCI controller is typically at PCI 00:03.0 in QEMU
+                    // TODO: Get actual PCI device/function from xHCI controller
+                    const XHCI_PCI_DEVICE: u8 = 3;
+                    const XHCI_PCI_FUNCTION: u8 = 0;
+
                     if let Some(usb_device) = drivers::usb::mass_storage::get_global_device() {
                         if let Some(xhci) = drivers::usb::get_controller(0) {
-                            match fs::gpt::find_esp_on_usb(usb_device, xhci) {
-                                Ok(esp) => {
-                                    log::info!(
-                                        "Found ESP on USB: LBA {}-{} ({} MB)",
-                                        esp.first_lba,
-                                        esp.last_lba,
-                                        esp.size_bytes() / (1024 * 1024)
-                                    );
+                            let mut disk = fs::gpt::UsbDisk::new(usb_device, xhci);
 
-                                    if let Some(usb_device) =
-                                        drivers::usb::mass_storage::get_global_device()
-                                    {
-                                        if let Some(xhci) = drivers::usb::get_controller(0) {
-                                            let mut disk = fs::gpt::UsbDisk::new(usb_device, xhci);
+                            if let Some((partition_num, esp)) = install_block_io_for_disk(
+                                &mut disk,
+                                storage_id,
+                                block_size,
+                                num_blocks,
+                                XHCI_PCI_DEVICE,
+                                XHCI_PCI_FUNCTION,
+                                usb_port,
+                            ) {
+                                // Boot from ESP
+                                if let Some(usb_device) =
+                                    drivers::usb::mass_storage::get_global_device()
+                                {
+                                    if let Some(xhci) = drivers::usb::get_controller(0) {
+                                        let mut disk = fs::gpt::UsbDisk::new(usb_device, xhci);
 
-                                            if try_boot_from_esp_usb(&mut disk, &esp) {
-                                                return true;
-                                            }
+                                        if try_boot_from_esp_usb(
+                                            &mut disk,
+                                            &esp,
+                                            partition_num,
+                                            XHCI_PCI_DEVICE,
+                                            XHCI_PCI_FUNCTION,
+                                            usb_port,
+                                        ) {
+                                            return true;
                                         }
                                     }
                                 }
-                                Err(e) => {
-                                    log::debug!("No ESP found on USB device: {:?}", e);
-                                }
+                            } else {
+                                log::debug!("No ESP found on USB device");
                             }
                         }
                     }
@@ -262,6 +296,161 @@ fn try_boot_from_usb() -> bool {
         }
     }
     false
+}
+
+/// Install BlockIO protocols for a disk and all its partitions
+///
+/// Returns the ESP partition and its partition number (1-based) if found.
+///
+/// # Arguments
+/// * `disk` - Disk to read GPT from
+/// * `storage_id` - Storage device ID for BlockIO
+/// * `block_size` - Block size in bytes
+/// * `num_blocks` - Total number of blocks
+/// * `pci_device` - PCI device number of the controller (for USB device path)
+/// * `pci_function` - PCI function number
+/// * `usb_port` - USB port number (0 for non-USB devices)
+fn install_block_io_for_disk<R: fs::gpt::SectorRead>(
+    disk: &mut R,
+    storage_id: u32,
+    block_size: u32,
+    num_blocks: u64,
+    pci_device: u8,
+    pci_function: u8,
+    usb_port: u8,
+) -> Option<(u32, fs::gpt::Partition)> {
+    use efi::boot_services;
+    use efi::protocols::block_io::{self, BLOCK_IO_PROTOCOL_GUID};
+    use efi::protocols::device_path::{self, DEVICE_PATH_PROTOCOL_GUID};
+    use r_efi::efi::Status;
+
+    // First, create BlockIO for the raw disk (whole device)
+    let disk_block_io = block_io::create_disk_block_io(storage_id, num_blocks, block_size);
+
+    if !disk_block_io.is_null() {
+        if let Some(disk_handle) = boot_services::create_handle() {
+            // Install BlockIO protocol
+            let status = boot_services::install_protocol(
+                disk_handle,
+                &BLOCK_IO_PROTOCOL_GUID,
+                disk_block_io as *mut core::ffi::c_void,
+            );
+            if status == Status::SUCCESS {
+                log::info!(
+                    "BlockIO protocol installed for raw disk on handle {:?}",
+                    disk_handle
+                );
+            }
+
+            // Install DevicePath protocol for the raw disk (USB device path)
+            let disk_device_path =
+                device_path::create_usb_device_path(pci_device, pci_function, usb_port);
+            if !disk_device_path.is_null() {
+                let status = boot_services::install_protocol(
+                    disk_handle,
+                    &DEVICE_PATH_PROTOCOL_GUID,
+                    disk_device_path as *mut core::ffi::c_void,
+                );
+                if status == Status::SUCCESS {
+                    log::info!(
+                        "DevicePath protocol installed for raw disk on handle {:?}",
+                        disk_handle
+                    );
+                }
+            }
+        }
+    }
+
+    // Read GPT header and all partitions
+    let header = match fs::gpt::read_gpt_header(disk) {
+        Ok(h) => h,
+        Err(e) => {
+            log::debug!("Failed to read GPT header: {:?}", e);
+            return None;
+        }
+    };
+
+    let partitions = match fs::gpt::read_partitions(disk, &header) {
+        Ok(p) => p,
+        Err(e) => {
+            log::debug!("Failed to read partitions: {:?}", e);
+            return None;
+        }
+    };
+
+    let mut esp_partition: Option<(u32, fs::gpt::Partition)> = None;
+
+    // Create BlockIO for each partition
+    for (i, partition) in partitions.iter().enumerate() {
+        let partition_num = (i + 1) as u32;
+        let partition_blocks = partition.size_sectors();
+
+        let partition_block_io = block_io::create_partition_block_io(
+            storage_id,
+            partition_num,
+            partition.first_lba,
+            partition_blocks,
+            block_size,
+        );
+
+        if !partition_block_io.is_null() {
+            if let Some(part_handle) = boot_services::create_handle() {
+                // Install BlockIO
+                let status = boot_services::install_protocol(
+                    part_handle,
+                    &BLOCK_IO_PROTOCOL_GUID,
+                    partition_block_io as *mut core::ffi::c_void,
+                );
+                if status == Status::SUCCESS {
+                    log::info!(
+                        "BlockIO protocol installed for partition {} on handle {:?}",
+                        partition_num,
+                        part_handle
+                    );
+                }
+
+                // Install DevicePath for partition (with full USB prefix for proper hierarchy)
+                let device_path = device_path::create_usb_partition_device_path(
+                    pci_device,
+                    pci_function,
+                    usb_port,
+                    partition_num,
+                    partition.first_lba,
+                    partition_blocks,
+                    &partition.partition_guid,
+                );
+
+                if !device_path.is_null() {
+                    let status = boot_services::install_protocol(
+                        part_handle,
+                        &DEVICE_PATH_PROTOCOL_GUID,
+                        device_path as *mut core::ffi::c_void,
+                    );
+                    if status == Status::SUCCESS {
+                        log::info!(
+                            "DevicePath protocol installed for partition {} on handle {:?}",
+                            partition_num,
+                            part_handle
+                        );
+                    }
+                }
+            }
+        }
+
+        // Remember ESP for later (with partition number)
+        if partition.is_esp {
+            log::info!(
+                "Found ESP: partition {}, LBA {}-{} ({} MB)",
+                partition_num,
+                partition.first_lba,
+                partition.last_lba,
+                partition.size_bytes() / (1024 * 1024)
+            );
+            esp_partition = Some((partition_num, partition.clone()));
+        }
+    }
+
+    esp_partition
 }
 
 /// Try to boot from an ESP on a given disk (generic version)
@@ -302,7 +491,22 @@ fn try_boot_from_esp<R: fs::gpt::SectorRead>(disk: &mut R, esp: &fs::gpt::Partit
 }
 
 /// Try to boot from an ESP on USB (with SimpleFileSystem support)
-fn try_boot_from_esp_usb(disk: &mut fs::gpt::UsbDisk, esp: &fs::gpt::Partition) -> bool {
+///
+/// # Arguments
+/// * `disk` - USB disk to read from
+/// * `esp` - ESP partition info
+/// * `partition_num` - 1-based partition number of the ESP
+/// * `pci_device` - PCI device number of xHCI controller
+/// * `pci_function` - PCI function number
+/// * `usb_port` - USB port number
+fn try_boot_from_esp_usb(
+    disk: &mut fs::gpt::UsbDisk,
+    esp: &fs::gpt::Partition,
+    partition_num: u32,
+    pci_device: u8,
+    pci_function: u8,
+    usb_port: u8,
+) -> bool {
     use efi::boot_services;
     use efi::protocols::device_path::{self, DEVICE_PATH_PROTOCOL_GUID};
     use efi::protocols::simple_file_system::{self, SIMPLE_FILE_SYSTEM_GUID};
@@ -329,10 +533,13 @@ fn try_boot_from_esp_usb(disk: &mut fs::gpt::UsbDisk, esp: &fs::gpt::Partition) 
             };
 
             // Install DevicePath protocol on the device handle
-            // This tells the bootloader what device it booted from
+            // Use full USB partition path for proper hierarchy matching
             let partition_size = esp.size_sectors();
-            let device_path = device_path::create_hard_drive_device_path(
-                1, // partition number (ESP is typically partition 1)
+            let device_path = device_path::create_usb_partition_device_path(
+                pci_device,
+                pci_function,
+                usb_port,
+                partition_num,
                 esp.first_lba,
                 partition_size,
                 &esp.partition_guid,

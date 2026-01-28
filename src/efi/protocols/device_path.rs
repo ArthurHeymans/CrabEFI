@@ -89,6 +89,240 @@ pub fn create_hard_drive_device_path(
     ptr as *mut Protocol
 }
 
+/// USB device path for a USB mass storage device (whole disk)
+///
+/// Contains a USB Class node followed by an End node.
+#[repr(C, packed)]
+pub struct UsbDevicePath {
+    /// USB device path node (Type 0x03, SubType 0x05)
+    pub usb: UsbDevicePathNode,
+    /// End node
+    pub end: End,
+}
+
+/// USB Device Path Node (UEFI Spec 10.3.4.5)
+#[repr(C, packed)]
+pub struct UsbDevicePathNode {
+    pub r#type: u8,
+    pub sub_type: u8,
+    pub length: [u8; 2],
+    /// Parent port number
+    pub parent_port: u8,
+    /// USB interface number
+    pub interface: u8,
+}
+
+/// ACPI device path for the PCI root bridge
+#[repr(C, packed)]
+pub struct AcpiDevicePathNode {
+    pub r#type: u8,
+    pub sub_type: u8,
+    pub length: [u8; 2],
+    pub hid: u32,
+    pub uid: u32,
+}
+
+/// PCI device path node
+#[repr(C, packed)]
+pub struct PciDevicePathNode {
+    pub r#type: u8,
+    pub sub_type: u8,
+    pub length: [u8; 2],
+    pub function: u8,
+    pub device: u8,
+}
+
+/// Full USB device path: ACPI + PCI + USB + End
+#[repr(C, packed)]
+pub struct FullUsbDevicePath {
+    pub acpi: AcpiDevicePathNode,
+    pub pci: PciDevicePathNode,
+    pub usb: UsbDevicePathNode,
+    pub end: End,
+}
+
+/// Type for Messaging device paths
+const TYPE_MESSAGING: u8 = 0x03;
+/// Sub-type for USB device path
+const SUBTYPE_USB: u8 = 0x05;
+/// Type for ACPI device paths
+const TYPE_ACPI: u8 = 0x02;
+/// Sub-type for ACPI device path
+const SUBTYPE_ACPI: u8 = 0x01;
+/// Type for Hardware device paths
+const TYPE_HARDWARE: u8 = 0x01;
+/// Sub-type for PCI device path
+const SUBTYPE_PCI: u8 = 0x01;
+
+/// PNP ID for PCI root bridge (ACPI HID: PNP0A03 or PNP0A08)
+const EISA_PNP_ID_PCI_ROOT: u32 = 0x0a0341d0; // EISA ID for PNP0A03
+
+/// Create a device path for a USB mass storage device (whole disk)
+///
+/// Creates a device path: ACPI(PNP0A03,0)/PCI(dev,func)/USB(port,0)/End
+///
+/// # Arguments
+/// * `pci_device` - PCI device number of the xHCI controller
+/// * `pci_function` - PCI function number
+/// * `usb_port` - USB port number
+///
+/// # Returns
+/// A pointer to the device path protocol, or null on failure
+pub fn create_usb_device_path(pci_device: u8, pci_function: u8, usb_port: u8) -> *mut Protocol {
+    let size = core::mem::size_of::<FullUsbDevicePath>();
+
+    let ptr = match allocate_pool(MemoryType::BootServicesData, size) {
+        Ok(p) => p as *mut FullUsbDevicePath,
+        Err(_) => {
+            log::error!("Failed to allocate USB device path");
+            return core::ptr::null_mut();
+        }
+    };
+
+    unsafe {
+        // ACPI node for PCI root bridge
+        (*ptr).acpi.r#type = TYPE_ACPI;
+        (*ptr).acpi.sub_type = SUBTYPE_ACPI;
+        (*ptr).acpi.length = (core::mem::size_of::<AcpiDevicePathNode>() as u16).to_le_bytes();
+        (*ptr).acpi.hid = EISA_PNP_ID_PCI_ROOT;
+        (*ptr).acpi.uid = 0;
+
+        // PCI node for xHCI controller
+        (*ptr).pci.r#type = TYPE_HARDWARE;
+        (*ptr).pci.sub_type = SUBTYPE_PCI;
+        (*ptr).pci.length = (core::mem::size_of::<PciDevicePathNode>() as u16).to_le_bytes();
+        (*ptr).pci.function = pci_function;
+        (*ptr).pci.device = pci_device;
+
+        // USB node
+        (*ptr).usb.r#type = TYPE_MESSAGING;
+        (*ptr).usb.sub_type = SUBTYPE_USB;
+        (*ptr).usb.length = (core::mem::size_of::<UsbDevicePathNode>() as u16).to_le_bytes();
+        (*ptr).usb.parent_port = usb_port;
+        (*ptr).usb.interface = 0;
+
+        // End node
+        (*ptr).end.header.r#type = TYPE_END;
+        (*ptr).end.header.sub_type = End::SUBTYPE_ENTIRE;
+        (*ptr).end.header.length = (core::mem::size_of::<End>() as u16).to_le_bytes();
+    }
+
+    log::debug!(
+        "Created USB device path: ACPI/PCI({:02x},{:x})/USB({},0)",
+        pci_device,
+        pci_function,
+        usb_port
+    );
+
+    ptr as *mut Protocol
+}
+
+/// Full USB partition device path: ACPI + PCI + USB + HardDrive + End
+///
+/// This is the proper device path for a partition on a USB disk.
+/// GRUB uses device path prefixes to match partitions to their parent disk.
+#[repr(C, packed)]
+pub struct FullUsbPartitionDevicePath {
+    pub acpi: AcpiDevicePathNode,
+    pub pci: PciDevicePathNode,
+    pub usb: UsbDevicePathNode,
+    pub hard_drive: HardDriveMedia,
+    pub end: End,
+}
+
+/// Create a device path for a partition on a USB mass storage device
+///
+/// Creates a device path: ACPI(PNP0A03,0)/PCI(dev,func)/USB(port,0)/HD(part,...)/End
+///
+/// This is the proper hierarchical device path that allows GRUB to match
+/// partitions to their parent disk.
+///
+/// # Arguments
+/// * `pci_device` - PCI device number of the xHCI controller
+/// * `pci_function` - PCI function number
+/// * `usb_port` - USB port number
+/// * `partition_number` - The partition number (1-based)
+/// * `partition_start` - Start LBA of the partition
+/// * `partition_size` - Size of the partition in sectors
+/// * `partition_guid` - The GPT partition GUID (unique identifier)
+///
+/// # Returns
+/// A pointer to the device path protocol, or null on failure
+pub fn create_usb_partition_device_path(
+    pci_device: u8,
+    pci_function: u8,
+    usb_port: u8,
+    partition_number: u32,
+    partition_start: u64,
+    partition_size: u64,
+    partition_guid: &[u8; 16],
+) -> *mut Protocol {
+    let size = core::mem::size_of::<FullUsbPartitionDevicePath>();
+
+    let ptr = match allocate_pool(MemoryType::BootServicesData, size) {
+        Ok(p) => p as *mut FullUsbPartitionDevicePath,
+        Err(_) => {
+            log::error!("Failed to allocate USB partition device path");
+            return core::ptr::null_mut();
+        }
+    };
+
+    unsafe {
+        // ACPI node for PCI root bridge
+        (*ptr).acpi.r#type = TYPE_ACPI;
+        (*ptr).acpi.sub_type = SUBTYPE_ACPI;
+        (*ptr).acpi.length = (core::mem::size_of::<AcpiDevicePathNode>() as u16).to_le_bytes();
+        (*ptr).acpi.hid = EISA_PNP_ID_PCI_ROOT;
+        (*ptr).acpi.uid = 0;
+
+        // PCI node for xHCI controller
+        (*ptr).pci.r#type = TYPE_HARDWARE;
+        (*ptr).pci.sub_type = SUBTYPE_PCI;
+        (*ptr).pci.length = (core::mem::size_of::<PciDevicePathNode>() as u16).to_le_bytes();
+        (*ptr).pci.function = pci_function;
+        (*ptr).pci.device = pci_device;
+
+        // USB node
+        (*ptr).usb.r#type = TYPE_MESSAGING;
+        (*ptr).usb.sub_type = SUBTYPE_USB;
+        (*ptr).usb.length = (core::mem::size_of::<UsbDevicePathNode>() as u16).to_le_bytes();
+        (*ptr).usb.parent_port = usb_port;
+        (*ptr).usb.interface = 0;
+
+        // HardDrive node for partition
+        (*ptr).hard_drive.header.r#type = TYPE_MEDIA;
+        (*ptr).hard_drive.header.sub_type = Media::SUBTYPE_HARDDRIVE;
+        (*ptr).hard_drive.header.length =
+            (core::mem::size_of::<HardDriveMedia>() as u16).to_le_bytes();
+        (*ptr).hard_drive.partition_number = partition_number;
+        (*ptr).hard_drive.partition_start = partition_start;
+        (*ptr).hard_drive.partition_size = partition_size;
+        (*ptr)
+            .hard_drive
+            .partition_signature
+            .copy_from_slice(partition_guid);
+        (*ptr).hard_drive.partition_format = PARTITION_FORMAT_GPT;
+        (*ptr).hard_drive.signature_type = SIGNATURE_TYPE_GUID;
+
+        // End node
+        (*ptr).end.header.r#type = TYPE_END;
+        (*ptr).end.header.sub_type = End::SUBTYPE_ENTIRE;
+        (*ptr).end.header.length = (core::mem::size_of::<End>() as u16).to_le_bytes();
+    }
+
+    log::debug!(
+        "Created USB partition device path: ACPI/PCI({:02x},{:x})/USB({},0)/HD({},{},{})",
+        pci_device,
+        pci_function,
+        usb_port,
+        partition_number,
+        partition_start,
+        partition_size
+    );
+
+    ptr as *mut Protocol
+}
+
 /// Create a minimal "end-only" device path
 ///
 /// This is the simplest possible device path, just an end node.
