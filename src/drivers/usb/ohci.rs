@@ -1170,3 +1170,35 @@ impl UsbController for OhciController {
         self.get_device(device).and_then(|d| d.interrupt_in.clone())
     }
 }
+
+impl OhciController {
+    /// Clean up the controller before handing off to the OS
+    ///
+    /// This must be called before ExitBootServices to ensure Linux's OHCI
+    /// driver can properly initialize the controller. Following libpayload's
+    /// ohci_shutdown pattern.
+    pub fn cleanup(&mut self) {
+        log::debug!("OHCI cleanup: stopping and resetting controller");
+
+        // 1. Stop the controller (disable all list processing)
+        let control = self.read_reg(regs::HCCONTROL);
+        self.write_reg(
+            regs::HCCONTROL,
+            control & !(hccontrol::PLE | hccontrol::CLE | hccontrol::BLE | hccontrol::IE),
+        );
+
+        // 2. Reset the controller
+        self.write_reg(regs::HCCOMMANDSTATUS, hccommandstatus::HCR);
+
+        // Wait for reset to complete (should take at most 10us per spec)
+        crate::time::delay_ms(2);
+
+        // 3. Put controller in reset state
+        self.write_reg(regs::HCCONTROL, 0);
+
+        // Wait a bit more to ensure clean state
+        crate::time::delay_ms(10);
+
+        log::debug!("OHCI cleanup complete");
+    }
+}

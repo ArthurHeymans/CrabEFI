@@ -1122,3 +1122,40 @@ impl UsbController for UhciController {
         self.get_device(device).and_then(|d| d.interrupt_in.clone())
     }
 }
+
+impl UhciController {
+    /// Clean up the controller before handing off to the OS
+    ///
+    /// This must be called before ExitBootServices to ensure Linux's UHCI
+    /// driver can properly initialize the controller. Following libpayload's
+    /// uhci_shutdown and uhci_reset patterns.
+    pub fn cleanup(&mut self) {
+        log::debug!("UHCI cleanup: stopping and resetting controller");
+
+        // 1. Stop the controller
+        self.outw(regs::USBCMD, 0);
+
+        // 2. Global Reset (hold for at least 10ms per UHCI spec 2.1.1)
+        self.outw(regs::USBCMD, usbcmd::GRESET);
+        crate::time::delay_ms(50);
+        self.outw(regs::USBCMD, 0);
+        crate::time::delay_ms(10);
+
+        // 3. Host Controller Reset
+        self.outw(regs::USBCMD, usbcmd::HCRESET);
+
+        // Wait for reset to complete (should be quick, timeout after 100ms)
+        let timeout = Timeout::from_ms(100);
+        while !timeout.is_expired() {
+            if self.inw(regs::USBCMD) & usbcmd::HCRESET == 0 {
+                break;
+            }
+            core::hint::spin_loop();
+        }
+
+        // 4. Clear status register
+        self.outw(regs::USBSTS, 0x3F);
+
+        log::debug!("UHCI cleanup complete");
+    }
+}
