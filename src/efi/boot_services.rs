@@ -270,11 +270,16 @@ extern "efiapi" fn allocate_pages(
     pages: usize,
     memory: *mut efi::PhysicalAddress,
 ) -> Status {
-    log::debug!(
-        "BS.AllocatePages(type={}, mem_type={}, pages={})",
+    log::info!(
+        "BS.AllocatePages(type={}, mem_type={}, pages={}, addr={:#x})",
         alloc_type,
         memory_type,
-        pages
+        pages,
+        if memory.is_null() {
+            0
+        } else {
+            unsafe { *memory }
+        }
     );
 
     if memory.is_null() {
@@ -298,9 +303,9 @@ extern "efiapi" fn allocate_pages(
 
     if status == Status::SUCCESS {
         unsafe { *memory = addr };
-        log::debug!("  -> allocated at {:#x}", addr);
+        log::info!("  -> allocated at {:#x}", addr);
     } else {
-        log::debug!("  -> failed: {:?}", status);
+        log::info!("  -> failed: {:?}", status);
     }
 
     status
@@ -317,13 +322,14 @@ extern "efiapi" fn get_memory_map(
     descriptor_size: *mut usize,
     descriptor_version: *mut u32,
 ) -> Status {
-    log::debug!(
-        "BS.GetMemoryMap(buf_size={:?})",
+    log::info!(
+        "BS.GetMemoryMap(buf_size={:?}, map={:?})",
         if memory_map_size.is_null() {
             0
         } else {
             unsafe { *memory_map_size }
-        }
+        },
+        memory_map
     );
 
     if memory_map_size.is_null()
@@ -364,7 +370,7 @@ extern "efiapi" fn get_memory_map(
         *descriptor_version = desc_version;
     }
 
-    log::debug!("  -> {:?} (size={}, key={:#x})", status, size, key);
+    log::info!("  -> {:?} (size={}, key={:#x})", status, size, key);
     status
 }
 
@@ -1205,6 +1211,16 @@ extern "efiapi" fn exit_boot_services(image_handle: Handle, map_key: usize) -> S
 
     if status == Status::SUCCESS {
         log::info!("ExitBootServices SUCCESS - transitioning to OS");
+
+        // Clean up hardware state for OS handoff
+        // Re-enable keyboard interrupts so Linux's i8042 driver works
+        crate::drivers::keyboard::cleanup();
+
+        // CRITICAL: Set boot_services pointer to NULL in SystemTable
+        // This is REQUIRED by UEFI spec and Linux checks for this!
+        unsafe {
+            system_table::clear_boot_services();
+        }
     } else {
         log::warn!("ExitBootServices FAILED: {:?}", status);
     }
@@ -1463,7 +1479,9 @@ extern "efiapi" fn locate_protocol(
     for i in 0..*count {
         for j in 0..handles[i].protocol_count {
             if guid_eq(&handles[i].protocols[j].guid, &guid) {
-                unsafe { *interface = handles[i].protocols[j].interface };
+                let iface = handles[i].protocols[j].interface;
+                unsafe { *interface = iface };
+                log::debug!("  -> SUCCESS (interface={:p})", iface);
                 return Status::SUCCESS;
             }
         }
@@ -1855,8 +1873,8 @@ fn format_guid(guid: &Guid) -> &'static str {
         0x74,
         &[0xca, 0x55, 0x52, 0x31, 0xcc, 0x68],
     );
-    // Unknown GUID from bootloader: f42f7782-012e-4c12-9956-49f94304f721
-    const UNKNOWN_BOOTLOADER_GUID: Guid = Guid::from_fields(
+    // Console Control Protocol (legacy Intel EFI): f42f7782-012e-4c12-9956-49f94304f721
+    const CONSOLE_CONTROL_GUID: Guid = Guid::from_fields(
         0xf42f7782,
         0x012e,
         0x4c12,
@@ -1976,8 +1994,8 @@ fn format_guid(guid: &Guid) -> &'static str {
     if guid_eq(guid, &LINUX_INITRD_MEDIA_GUID) {
         return "LINUX_INITRD_MEDIA";
     }
-    if guid_eq(guid, &UNKNOWN_BOOTLOADER_GUID) {
-        return "UNKNOWN_BOOTLOADER_F42F7782";
+    if guid_eq(guid, &CONSOLE_CONTROL_GUID) {
+        return "CONSOLE_CONTROL";
     }
     if guid_eq(guid, &MEMORY_ATTRIBUTE_GUID) {
         return "MEMORY_ATTRIBUTE";

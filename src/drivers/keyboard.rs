@@ -348,8 +348,14 @@ pub fn init() {
     log::info!("PS/2 keyboard initialized");
 }
 
-/// Check if keyboard data is available
+/// Check if keyboard data is available (PS/2 or USB)
 pub fn has_key() -> bool {
+    // Check USB keyboard first
+    if crate::drivers::usb::keyboard_has_key() {
+        return true;
+    }
+
+    // Check PS/2 keyboard
     let kb = KEYBOARD.lock();
     if !kb.initialized {
         return false;
@@ -363,13 +369,66 @@ pub fn has_key() -> bool {
     }
 }
 
-/// Try to read a key from the keyboard
+/// Cleanup the keyboard controller before ExitBootServices
+///
+/// This re-enables keyboard interrupts (IRQ1) so Linux can properly
+/// initialize the i8042 driver. Without this, the keyboard may not
+/// work after booting Linux.
+pub fn cleanup() {
+    let kb = KEYBOARD.lock();
+    if !kb.initialized {
+        return;
+    }
+    drop(kb);
+
+    log::debug!("Cleaning up PS/2 keyboard controller for OS handoff");
+
+    // Read current controller configuration
+    if !send_controller_cmd(cmd::READ_CONFIG) {
+        log::warn!("Failed to read PS/2 controller config during cleanup");
+        return;
+    }
+
+    if !wait_output_ready() {
+        log::warn!("PS/2 controller config read timeout during cleanup");
+        return;
+    }
+
+    let mut config_byte = unsafe { inb(ports::DATA) };
+
+    // Re-enable keyboard interrupt (IRQ1) for the OS
+    // Keep translation enabled as most OSes expect scancode set 1
+    config_byte |= config::KB_INT;
+
+    if !send_controller_cmd(cmd::WRITE_CONFIG) {
+        log::warn!("Failed to write PS/2 controller config during cleanup");
+        return;
+    }
+
+    if !wait_input_ready() {
+        return;
+    }
+
+    unsafe {
+        outb(ports::DATA, config_byte);
+    }
+
+    log::debug!("PS/2 keyboard controller ready for OS (IRQ1 enabled)");
+}
+
+/// Try to read a key from the keyboard (PS/2 or USB)
 ///
 /// Returns Some((scan_code, unicode_char)) if a key is available, None otherwise.
 /// The scan_code and unicode_char follow EFI conventions:
 /// - For printable characters: scan_code = 0, unicode_char = ASCII code
 /// - For special keys: scan_code = EFI scan code, unicode_char = 0
 pub fn try_read_key() -> Option<(u16, u16)> {
+    // Try USB keyboard first
+    if let Some(key) = crate::drivers::usb::keyboard_get_key() {
+        return Some(key);
+    }
+
+    // Fall back to PS/2 keyboard
     let mut kb = KEYBOARD.lock();
 
     if !kb.initialized {

@@ -39,6 +39,8 @@ pub fn init(cb_info: &CorebootInfo) {
     // Install ACPI tables if available
     if let Some(rsdp) = cb_info.acpi_rsdp {
         system_table::install_acpi_tables(rsdp);
+    } else {
+        log::warn!("No ACPI RSDP from coreboot - Linux may not have ACPI support!");
     }
 
     // Create console handle - this will also have GOP installed on it
@@ -65,6 +67,9 @@ pub fn init(cb_info: &CorebootInfo) {
 
     // Install Console Control protocol (legacy, but some bootloaders need it)
     init_console_control();
+
+    // Dump configuration tables for debugging
+    system_table::dump_configuration_tables();
 
     log::info!("EFI environment initialized");
 }

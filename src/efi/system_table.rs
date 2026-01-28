@@ -275,29 +275,358 @@ fn guid_eq(a: &Guid, b: &Guid) -> bool {
     a_bytes == b_bytes
 }
 
-/// Install ACPI tables from coreboot
-pub fn install_acpi_tables(rsdp: u64) {
-    if rsdp == 0 {
+/// ACPI RSDP structure (Root System Description Pointer)
+#[repr(C, packed)]
+struct AcpiRsdp {
+    signature: [u8; 8], // "RSD PTR "
+    checksum: u8,
+    oem_id: [u8; 6],
+    revision: u8,
+    rsdt_address: u32,
+    // ACPI 2.0+ fields
+    length: u32,
+    xsdt_address: u64,
+    extended_checksum: u8,
+    reserved: [u8; 3],
+}
+
+/// ACPI SDT header (common to all tables)
+#[repr(C, packed)]
+struct AcpiSdtHeader {
+    signature: [u8; 4],
+    length: u32,
+    revision: u8,
+    checksum: u8,
+    oem_id: [u8; 6],
+    oem_table_id: [u8; 8],
+    oem_revision: u32,
+    creator_id: u32,
+    creator_revision: u32,
+}
+
+/// Maximum number of ACPI regions we can track
+const MAX_ACPI_REGIONS: usize = 32;
+
+/// An ACPI memory region (page-aligned)
+#[derive(Clone, Copy)]
+struct AcpiRegion {
+    start: u64,
+    end: u64,
+}
+
+/// Collect all ACPI table regions, merge overlapping ones, then mark them
+fn mark_acpi_tables_memory(rsdp_addr: u64) {
+    use super::allocator::{mark_as_acpi_reclaim, PAGE_SIZE};
+
+    log::info!("Marking ACPI table memory regions as AcpiReclaimMemory...");
+
+    // Collect all ACPI regions first
+    let mut regions: [AcpiRegion; MAX_ACPI_REGIONS] =
+        [AcpiRegion { start: 0, end: 0 }; MAX_ACPI_REGIONS];
+    let mut region_count = 0;
+
+    // Helper to add a region (page-aligned)
+    let mut add_region = |addr: u64, size: u64| {
+        if region_count >= MAX_ACPI_REGIONS || size == 0 {
+            return;
+        }
+        let page_start = addr & !(PAGE_SIZE - 1);
+        let page_end = (addr + size + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+        regions[region_count] = AcpiRegion {
+            start: page_start,
+            end: page_end,
+        };
+        region_count += 1;
+    };
+
+    let rsdp = unsafe { &*(rsdp_addr as *const AcpiRsdp) };
+
+    // Validate RSDP signature
+    if &rsdp.signature != b"RSD PTR " {
+        log::error!("Invalid RSDP signature, cannot mark ACPI memory");
         return;
     }
 
-    // Detect ACPI version from RSDP
-    let rsdp_ptr = rsdp as *const u8;
-    let revision = unsafe { *rsdp_ptr.add(15) }; // Revision field at offset 15
+    let revision = rsdp.revision;
 
+    // Add RSDP
+    let rsdp_size = if revision >= 2 {
+        unsafe { core::ptr::addr_of!(rsdp.length).read_unaligned() as u64 }
+    } else {
+        20 // ACPI 1.0 RSDP is 20 bytes
+    };
+    log::debug!(
+        "RSDP at {:#x}, size {} bytes, revision {}",
+        rsdp_addr,
+        rsdp_size,
+        revision
+    );
+    add_region(rsdp_addr, rsdp_size);
+
+    // Get RSDT or XSDT address
+    let (root_table_addr, is_xsdt) = if revision >= 2 {
+        let xsdt = unsafe { core::ptr::addr_of!(rsdp.xsdt_address).read_unaligned() };
+        if xsdt != 0 {
+            (xsdt, true)
+        } else {
+            (rsdp.rsdt_address as u64, false)
+        }
+    } else {
+        (rsdp.rsdt_address as u64, false)
+    };
+
+    if root_table_addr == 0 {
+        log::warn!("No RSDT/XSDT address in RSDP");
+        return;
+    }
+
+    // Add root table (RSDT or XSDT)
+    let root_header = unsafe { &*(root_table_addr as *const AcpiSdtHeader) };
+    let root_length = unsafe { core::ptr::addr_of!(root_header.length).read_unaligned() };
+    let root_sig = &root_header.signature;
+    log::debug!(
+        "{} at {:#x}, length {} bytes",
+        core::str::from_utf8(root_sig).unwrap_or("????"),
+        root_table_addr,
+        root_length
+    );
+    add_region(root_table_addr, root_length as u64);
+
+    // Parse each table entry
+    let header_size = core::mem::size_of::<AcpiSdtHeader>();
+    let entry_size = if is_xsdt { 8 } else { 4 };
+    let num_entries = (root_length as usize - header_size) / entry_size;
+    log::debug!(
+        "  {} has {} table entries",
+        if is_xsdt { "XSDT" } else { "RSDT" },
+        num_entries
+    );
+
+    let entries_base = root_table_addr + header_size as u64;
+    for i in 0..num_entries {
+        let table_addr = if is_xsdt {
+            unsafe { *((entries_base + (i * 8) as u64) as *const u64) }
+        } else {
+            unsafe { *((entries_base + (i * 4) as u64) as *const u32) as u64 }
+        };
+
+        if table_addr == 0 {
+            continue;
+        }
+
+        let table_header = unsafe { &*(table_addr as *const AcpiSdtHeader) };
+        let table_length = unsafe { core::ptr::addr_of!(table_header.length).read_unaligned() };
+        let table_sig = &table_header.signature;
+        let sig_str = core::str::from_utf8(table_sig).unwrap_or("????");
+
+        log::debug!(
+            "  Table[{}]: {} at {:#x}, length {} bytes",
+            i,
+            sig_str,
+            table_addr,
+            table_length
+        );
+        add_region(table_addr, table_length as u64);
+
+        // If this is FADT, also add DSDT and FACS
+        if table_sig == b"FACP" {
+            let fadt_ptr = table_addr as *const u8;
+
+            // Get DSDT address
+            let dsdt_addr = if table_length >= 148 {
+                let x_dsdt = unsafe { *(fadt_ptr.add(140) as *const u64) };
+                if x_dsdt != 0 {
+                    x_dsdt
+                } else {
+                    unsafe { *(fadt_ptr.add(40) as *const u32) as u64 }
+                }
+            } else {
+                unsafe { *(fadt_ptr.add(40) as *const u32) as u64 }
+            };
+
+            if dsdt_addr != 0 {
+                let dsdt_header = unsafe { &*(dsdt_addr as *const AcpiSdtHeader) };
+                let dsdt_length =
+                    unsafe { core::ptr::addr_of!(dsdt_header.length).read_unaligned() };
+                log::debug!("    DSDT at {:#x}, length {} bytes", dsdt_addr, dsdt_length);
+                add_region(dsdt_addr, dsdt_length as u64);
+            }
+
+            // Get FACS address
+            let facs_addr = if table_length >= 140 {
+                let x_facs = unsafe { *(fadt_ptr.add(132) as *const u64) };
+                if x_facs != 0 {
+                    x_facs
+                } else {
+                    unsafe { *(fadt_ptr.add(36) as *const u32) as u64 }
+                }
+            } else {
+                unsafe { *(fadt_ptr.add(36) as *const u32) as u64 }
+            };
+
+            if facs_addr != 0 {
+                // FACS has length at offset 4
+                let facs_len = unsafe { *((facs_addr + 4) as *const u32) };
+                log::debug!("    FACS at {:#x}, length {} bytes", facs_addr, facs_len);
+                add_region(facs_addr, facs_len as u64);
+            }
+        }
+    }
+
+    // Sort regions by start address (simple bubble sort)
+    for i in 0..region_count {
+        for j in (i + 1)..region_count {
+            if regions[j].start < regions[i].start {
+                let tmp = regions[i];
+                regions[i] = regions[j];
+                regions[j] = tmp;
+            }
+        }
+    }
+
+    // Merge overlapping/adjacent regions
+    let mut merged: [AcpiRegion; MAX_ACPI_REGIONS] =
+        [AcpiRegion { start: 0, end: 0 }; MAX_ACPI_REGIONS];
+    let mut merged_count = 0;
+
+    for i in 0..region_count {
+        if regions[i].start == 0 && regions[i].end == 0 {
+            continue;
+        }
+
+        if merged_count == 0 {
+            merged[0] = regions[i];
+            merged_count = 1;
+        } else {
+            let last = &mut merged[merged_count - 1];
+            // Check if this region overlaps or is adjacent to the last merged region
+            if regions[i].start <= last.end {
+                // Merge: extend the end if needed
+                if regions[i].end > last.end {
+                    last.end = regions[i].end;
+                }
+            } else {
+                // No overlap, add as new region
+                if merged_count < MAX_ACPI_REGIONS {
+                    merged[merged_count] = regions[i];
+                    merged_count += 1;
+                }
+            }
+        }
+    }
+
+    // Now mark each merged region once
+    log::info!("Marking {} merged ACPI memory regions:", merged_count);
+    for i in 0..merged_count {
+        let region = &merged[i];
+        let num_pages = (region.end - region.start) / PAGE_SIZE;
+
+        match mark_as_acpi_reclaim(region.start, num_pages) {
+            Ok(()) => {
+                log::info!(
+                    "  Marked {:#x}-{:#x} ({} pages) as AcpiReclaimMemory",
+                    region.start,
+                    region.end,
+                    num_pages
+                );
+            }
+            Err(e) => {
+                log::warn!(
+                    "  Failed to mark {:#x}-{:#x} as AcpiReclaimMemory: {:?}",
+                    region.start,
+                    region.end,
+                    e
+                );
+            }
+        }
+    }
+
+    log::info!("ACPI table memory marking complete");
+}
+
+/// Install ACPI tables from coreboot
+pub fn install_acpi_tables(rsdp: u64) {
+    use super::allocator::{get_memory_type_at, MemoryType};
+
+    if rsdp == 0 {
+        log::warn!("ACPI RSDP address is null, skipping ACPI table installation");
+        return;
+    }
+
+    // Validate RSDP signature first
+    let rsdp_ptr = rsdp as *const u8;
+    let signature = unsafe { core::slice::from_raw_parts(rsdp_ptr, 8) };
+    if signature != b"RSD PTR " {
+        log::error!("Invalid RSDP signature at {:#x}: {:?}", rsdp, signature);
+        return;
+    }
+
+    // Read revision field at offset 15
+    let revision = unsafe { *rsdp_ptr.add(15) };
+    log::info!(
+        "ACPI RSDP at {:#x}: signature valid, revision {}",
+        rsdp,
+        revision
+    );
+
+    // Check what memory type the RSDP is in and mark ACPI regions if needed
+    let needs_marking = match get_memory_type_at(rsdp) {
+        Some(MemoryType::AcpiReclaimMemory) => {
+            log::info!("RSDP is already in AcpiReclaimMemory (correct)");
+            false
+        }
+        Some(MemoryType::AcpiMemoryNvs) => {
+            log::info!("RSDP is in AcpiMemoryNvs (acceptable)");
+            false
+        }
+        Some(mem_type) => {
+            log::info!(
+                "RSDP at {:#x} is in {:?} memory - will mark ACPI regions",
+                rsdp,
+                mem_type
+            );
+            true
+        }
+        None => {
+            log::info!(
+                "RSDP at {:#x} is not in any known memory region - will mark ACPI regions",
+                rsdp
+            );
+            true
+        }
+    };
+
+    // Mark all ACPI tables as AcpiReclaimMemory if needed
+    if needs_marking {
+        mark_acpi_tables_memory(rsdp);
+    }
+
+    // Install in EFI configuration table
     if revision >= 2 {
         // ACPI 2.0+
         let status = install_configuration_table(&ACPI_20_TABLE_GUID, rsdp as *mut c_void);
         if status == efi::Status::SUCCESS {
-            log::info!("Installed ACPI 2.0 table at {:#x}", rsdp);
+            log::info!("Installed ACPI 2.0 configuration table");
+        } else {
+            log::error!("Failed to install ACPI 2.0 table: {:?}", status);
         }
     }
 
     // Also install as ACPI 1.0 for compatibility
     let status = install_configuration_table(&ACPI_TABLE_GUID, rsdp as *mut c_void);
     if status == efi::Status::SUCCESS {
-        log::debug!("Installed ACPI 1.0 table at {:#x}", rsdp);
+        log::info!("Installed ACPI 1.0 configuration table");
+    } else {
+        log::error!("Failed to install ACPI 1.0 table: {:?}", status);
     }
+
+    // Log final configuration table state
+    let count = CONFIG_TABLE_COUNT.lock();
+    log::info!(
+        "Configuration table has {} entries, SystemTable.number_of_table_entries = {}",
+        *count,
+        unsafe { SYSTEM_TABLE.number_of_table_entries }
+    );
 }
 
 /// Update the system table CRC32
@@ -307,4 +636,45 @@ pub fn update_crc32() {
     unsafe {
         SYSTEM_TABLE.hdr.crc32 = 0;
     }
+}
+
+/// Dump configuration table entries for debugging
+pub fn dump_configuration_tables() {
+    let tables = CONFIG_TABLES.lock();
+    let count = CONFIG_TABLE_COUNT.lock();
+
+    log::debug!("EFI Configuration Table ({} entries):", *count);
+    for i in 0..*count {
+        let entry = &tables[i];
+        let guid = &entry.vendor_guid;
+
+        // Try to identify known GUIDs
+        let name = if guid_eq(guid, &ACPI_20_TABLE_GUID) {
+            "ACPI 2.0 RSDP"
+        } else if guid_eq(guid, &ACPI_TABLE_GUID) {
+            "ACPI 1.0 RSDP"
+        } else if guid_eq(guid, &SMBIOS_TABLE_GUID) {
+            "SMBIOS"
+        } else if guid_eq(guid, &SMBIOS3_TABLE_GUID) {
+            "SMBIOS 3.0"
+        } else {
+            "Unknown"
+        };
+
+        log::debug!("  [{}] {} at {:p}", i, name, entry.vendor_table);
+    }
+}
+
+/// Clear the boot services pointer
+///
+/// This MUST be called after ExitBootServices() succeeds, as per UEFI spec:
+/// "After ExitBootServices() has been called, the EFI Boot Services Table
+/// Header field BootServices is set to NULL."
+///
+/// # Safety
+///
+/// This must only be called after ExitBootServices succeeds.
+pub unsafe fn clear_boot_services() {
+    SYSTEM_TABLE.boot_services = core::ptr::null_mut();
+    log::debug!("SystemTable.boot_services set to NULL");
 }

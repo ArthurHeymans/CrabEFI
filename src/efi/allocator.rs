@@ -289,6 +289,104 @@ impl MemoryAllocator {
         Ok(())
     }
 
+    /// Mark a memory region as ACPI Reclaim Memory
+    ///
+    /// This function finds the region containing the address (any memory type),
+    /// splits it if necessary, and marks the specified range as AcpiReclaimMemory.
+    /// Unlike carve_out, this works on any memory type, not just ConventionalMemory.
+    pub fn mark_as_acpi_reclaim(&mut self, addr: u64, num_pages: u64) -> Result<(), efi::Status> {
+        let size = num_pages * PAGE_SIZE;
+        let end = addr + size;
+
+        // Find the entry containing this region (any memory type)
+        let mut found_idx = None;
+        for (idx, entry) in self.entries.iter().enumerate() {
+            if entry.physical_start <= addr && entry.end() >= end {
+                found_idx = Some(idx);
+                break;
+            }
+        }
+
+        let idx = match found_idx {
+            Some(i) => i,
+            None => {
+                // Region not found - check if it overlaps with any existing region
+                for entry in self.entries.iter() {
+                    let entry_end = entry.end();
+                    // Check for overlap
+                    if addr < entry_end && end > entry.physical_start {
+                        // Overlaps - this is complex, skip for now
+                        return Err(efi::Status::INVALID_PARAMETER);
+                    }
+                }
+                // No overlap, we can add it as a new region
+                let desc = MemoryDescriptor::new(
+                    MemoryType::AcpiReclaimMemory,
+                    addr,
+                    num_pages,
+                    attributes::EFI_MEMORY_WB,
+                );
+                if self.entries.push(desc).is_err() {
+                    return Err(efi::Status::OUT_OF_RESOURCES);
+                }
+                self.map_key += 1;
+                self.sort_entries();
+                return Ok(());
+            }
+        };
+
+        let entry = self.entries[idx];
+        let original_type = entry
+            .get_memory_type()
+            .unwrap_or(MemoryType::ReservedMemoryType);
+
+        // If already ACPI reclaim, nothing to do
+        if original_type == MemoryType::AcpiReclaimMemory {
+            return Ok(());
+        }
+
+        // If already ACPI NVS, don't change it
+        if original_type == MemoryType::AcpiMemoryNvs {
+            return Ok(());
+        }
+
+        let attribute = entry.attribute;
+
+        // Remove the old entry
+        self.entries.remove(idx);
+
+        // Add up to 3 new entries: before, acpi, after
+        // Region before the ACPI portion (keep original type)
+        if entry.physical_start < addr {
+            let before_pages = (addr - entry.physical_start) / PAGE_SIZE;
+            let before =
+                MemoryDescriptor::new(original_type, entry.physical_start, before_pages, attribute);
+            if self.entries.push(before).is_err() {
+                return Err(efi::Status::OUT_OF_RESOURCES);
+            }
+        }
+
+        // The ACPI reclaim region
+        let acpi = MemoryDescriptor::new(MemoryType::AcpiReclaimMemory, addr, num_pages, attribute);
+        if self.entries.push(acpi).is_err() {
+            return Err(efi::Status::OUT_OF_RESOURCES);
+        }
+
+        // Region after the ACPI portion (keep original type)
+        if entry.end() > end {
+            let after_pages = (entry.end() - end) / PAGE_SIZE;
+            let after = MemoryDescriptor::new(original_type, end, after_pages, attribute);
+            if self.entries.push(after).is_err() {
+                return Err(efi::Status::OUT_OF_RESOURCES);
+            }
+        }
+
+        self.map_key += 1;
+        self.sort_entries();
+
+        Ok(())
+    }
+
     /// Allocate pages of memory
     pub fn allocate_pages(
         &mut self,
@@ -710,6 +808,14 @@ pub fn force_add_region(
     alloc.force_add_region(physical_start, num_pages, memory_type)
 }
 
+/// Mark a memory region as ACPI Reclaim Memory
+///
+/// This properly splits existing regions and marks the specified range as AcpiReclaimMemory.
+pub fn mark_as_acpi_reclaim(addr: u64, num_pages: u64) -> Result<(), efi::Status> {
+    let mut alloc = ALLOCATOR.lock();
+    alloc.mark_as_acpi_reclaim(addr, num_pages)
+}
+
 /// Allocate pages of memory
 pub fn allocate_pages(
     alloc_type: AllocateType,
@@ -737,6 +843,20 @@ pub fn get_memory_map_size() -> usize {
 pub fn get_map_key() -> usize {
     let alloc = ALLOCATOR.lock();
     alloc.map_key()
+}
+
+/// Find the memory type for a given physical address
+///
+/// Returns the memory type if the address is within a known memory region,
+/// or None if the address is not in any known region.
+pub fn get_memory_type_at(address: u64) -> Option<MemoryType> {
+    let alloc = ALLOCATOR.lock();
+    for entry in alloc.entries.iter() {
+        if address >= entry.physical_start && address < entry.end() {
+            return MemoryType::from_u32(entry.memory_type);
+        }
+    }
+    None
 }
 
 /// Get the memory map
