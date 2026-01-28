@@ -130,6 +130,14 @@ mod port_cmd {
     /// Interface Communication Control
     pub const ICC_SHIFT: u32 = 28;
     pub const ICC_MASK: u32 = 0xF;
+    /// ICC Active state
+    pub const ICC_ACTIVE: u32 = 1 << 28;
+}
+
+/// HBA Capabilities bits
+mod caps {
+    /// Supports Staggered Spin-up
+    pub const SSS: u32 = 1 << 27;
 }
 
 /// Port TFD (Task File Data) bits
@@ -472,11 +480,38 @@ impl AhciController {
         // Enable the device (bus master + memory space)
         pci::enable_device(pci_dev);
 
+        log::debug!("AHCI: MMIO base at {:#x}", mmio_base);
+
+        // Reset the HBA first (as libpayload does)
+        log::debug!("AHCI: Resetting HBA...");
+        Self::write_reg_static(mmio_base, regs::GHC, ghc::HR);
+
+        // Wait for reset to complete (up to 1 second)
+        let timeout = Timeout::from_ms(1000);
+        while !timeout.is_expired() {
+            let ghc_val = Self::read_reg_static(mmio_base, regs::GHC);
+            if ghc_val & ghc::HR == 0 {
+                break;
+            }
+            crate::time::delay_us(100);
+        }
+
+        let ghc_val = Self::read_reg_static(mmio_base, regs::GHC);
+        if ghc_val & ghc::HR != 0 {
+            log::error!("AHCI: HBA reset didn't complete within 1s");
+            return Err(AhciError::Timeout);
+        }
+        log::debug!("AHCI: HBA reset complete");
+
+        // Enable AHCI mode
+        Self::write_reg_static(mmio_base, regs::GHC, ghc::AE);
+
         // Read capabilities
         let cap = Self::read_reg_static(mmio_base, regs::CAP);
         let num_cmd_slots = (((cap >> 8) & 0x1F) + 1) as u8;
         let num_ports = ((cap & 0x1F) + 1) as u8;
         let ports_implemented = Self::read_reg_static(mmio_base, regs::PI);
+        let supports_sss = (cap & caps::SSS) != 0;
 
         // Read version
         let vs = Self::read_reg_static(mmio_base, regs::VS);
@@ -484,15 +519,12 @@ impl AhciController {
         let minor = vs & 0xFFFF;
         log::info!("AHCI version: {}.{}", major, minor);
         log::debug!(
-            "AHCI CAP: {:#x}, ports={}, cmd_slots={}",
+            "AHCI CAP: {:#x}, ports={}, cmd_slots={}, SSS={}",
             cap,
             num_ports,
-            num_cmd_slots
+            num_cmd_slots,
+            supports_sss
         );
-
-        // Enable AHCI mode
-        let ghc = Self::read_reg_static(mmio_base, regs::GHC);
-        Self::write_reg_static(mmio_base, regs::GHC, ghc | ghc::AE);
 
         // Perform BIOS/OS handoff if needed
         let cap2 = Self::read_reg_static(mmio_base, regs::CAP2);
@@ -509,7 +541,7 @@ impl AhciController {
                     if bohc & 0x1 == 0 {
                         break;
                     }
-                    core::hint::spin_loop();
+                    crate::time::delay_us(100);
                 }
             }
         }
@@ -523,8 +555,8 @@ impl AhciController {
             ports: heapless::Vec::new(),
         };
 
-        // Initialize ports
-        controller.init_ports()?;
+        // Initialize ports (pass SSS capability)
+        controller.init_ports_with_sss(supports_sss)?;
 
         Ok(controller)
     }
@@ -559,22 +591,56 @@ impl AhciController {
         unsafe { ptr::write_volatile(addr as *mut u32, value) }
     }
 
-    /// Initialize all implemented ports
-    fn init_ports(&mut self) -> Result<(), AhciError> {
+    /// Initialize all implemented ports (with staggered spin-up support)
+    fn init_ports_with_sss(&mut self, supports_sss: bool) -> Result<(), AhciError> {
         for port_num in 0..32u8 {
             if self.ports_implemented & (1 << port_num) == 0 {
                 continue;
             }
 
-            // Check if device is present
+            log::debug!("AHCI: Probing port {}...", port_num);
+
+            // If staggered spin-up is supported, spin up the device
+            if supports_sss {
+                let cmd = self.read_port_reg(port_num, port_regs::CMD);
+                self.write_port_reg(port_num, port_regs::CMD, cmd | port_cmd::SUD);
+            }
+
+            // Wait for port to become active (up to 10ms for first port, less for others)
+            // libpayload: "Wait 1s if we just told the device to spin up or if it's the first port"
+            let is_first = self.ports.is_empty();
+            let wait_time_ms = if supports_sss || is_first { 100 } else { 10 };
+
+            let timeout = Timeout::from_ms(wait_time_ms);
+            while !timeout.is_expired() {
+                let ssts = self.read_port_reg(port_num, port_regs::SSTS);
+                let det = ssts & 0xF;
+                let ipm = (ssts >> 8) & 0xF;
+                if det == 3 && ipm == 1 {
+                    break;
+                }
+                crate::time::delay_us(100);
+            }
+
+            // Check if device is present and active
             let ssts = self.read_port_reg(port_num, port_regs::SSTS);
             let det = ssts & 0xF; // Device Detection
             let ipm = (ssts >> 8) & 0xF; // Interface Power Management
 
             if det != 3 || ipm != 1 {
                 // No device or not active
+                log::debug!(
+                    "AHCI Port {}: No device (DET={}, IPM={})",
+                    port_num,
+                    det,
+                    ipm
+                );
                 continue;
             }
+
+            // Clear error and interrupt status before init (as libpayload does)
+            self.write_port_reg(port_num, port_regs::SERR, 0xFFFFFFFF);
+            self.write_port_reg(port_num, port_regs::IS, 0xFFFFFFFF);
 
             // Device is connected - initialize the port
             match self.init_port(port_num) {
@@ -606,6 +672,12 @@ impl AhciController {
 
         log::info!("AHCI: {} ports initialized", self.ports.len());
         Ok(())
+    }
+
+    /// Initialize all implemented ports (legacy version without SSS)
+    #[allow(dead_code)]
+    fn init_ports(&mut self) -> Result<(), AhciError> {
+        self.init_ports_with_sss(false)
     }
 
     /// Initialize a single port
@@ -652,16 +724,20 @@ impl AhciController {
         // Start command processing (this also enables FIS receive)
         self.start_port(port_num)?;
 
-        // Wait for device to become ready (BSY=0, DRQ=0) - up to 5 seconds
+        // Put port into active state (ICC = Active)
+        let cmd = self.read_port_reg(port_num, port_regs::CMD);
+        self.write_port_reg(port_num, port_regs::CMD, cmd | port_cmd::ICC_ACTIVE);
+
+        // Wait for device to become ready (BSY=0, DRQ=0) - up to 30 seconds (slow drives)
         let mut ready = false;
-        let timeout = Timeout::from_ms(5000);
+        let timeout = Timeout::from_ms(30000);
         while !timeout.is_expired() {
             let tfd = self.read_port_reg(port_num, port_regs::TFD);
             if tfd & (port_tfd::STS_BSY | port_tfd::STS_DRQ) == 0 {
                 ready = true;
                 break;
             }
-            core::hint::spin_loop();
+            crate::time::delay_us(10000); // 10ms between checks
         }
 
         if !ready {
@@ -721,43 +797,45 @@ impl AhciController {
         // Clear ST (Start) bit
         self.write_port_reg(port_num, port_regs::CMD, cmd & !port_cmd::ST);
 
-        // Wait for CR (Command List Running) to clear (up to 500ms)
-        let timeout = Timeout::from_ms(500);
+        // Wait for CR (Command List Running) to clear (libpayload uses 1ms)
+        let timeout = Timeout::from_ms(1);
         while !timeout.is_expired() {
             let cmd = self.read_port_reg(port_num, port_regs::CMD);
             if cmd & port_cmd::CR == 0 {
                 break;
             }
-            core::hint::spin_loop();
+            crate::time::delay_us(1);
         }
 
         // Clear FRE (FIS Receive Enable) bit
         let cmd = self.read_port_reg(port_num, port_regs::CMD);
         self.write_port_reg(port_num, port_regs::CMD, cmd & !port_cmd::FRE);
 
-        // Wait for FR (FIS Receive Running) to clear (up to 500ms)
-        let timeout = Timeout::from_ms(500);
+        // Wait for FR (FIS Receive Running) to clear (libpayload uses 1ms)
+        let timeout = Timeout::from_ms(1);
         while !timeout.is_expired() {
             let cmd = self.read_port_reg(port_num, port_regs::CMD);
             if cmd & port_cmd::FR == 0 {
                 return Ok(());
             }
-            core::hint::spin_loop();
+            crate::time::delay_us(1);
         }
 
-        Err(AhciError::Timeout)
+        // Timeout is not fatal for stop - just log a warning
+        log::warn!("AHCI Port {}: Timeout stopping command engine", port_num);
+        Ok(())
     }
 
     /// Start command processing on a port
     fn start_port(&mut self, port_num: u8) -> Result<(), AhciError> {
-        // Wait for CR to clear (up to 500ms)
-        let timeout = Timeout::from_ms(500);
+        // Wait for CR to clear (libpayload uses 1ms)
+        let timeout = Timeout::from_ms(1);
         while !timeout.is_expired() {
             let cmd = self.read_port_reg(port_num, port_regs::CMD);
             if cmd & port_cmd::CR == 0 {
                 break;
             }
-            core::hint::spin_loop();
+            crate::time::delay_us(1);
         }
 
         // Enable FIS receive
