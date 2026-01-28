@@ -154,25 +154,29 @@ impl CorebootInfo {
 pub fn parse(ptr: *const u8) -> CorebootInfo {
     let mut info = CorebootInfo::new();
 
-    if ptr.is_null() {
-        log::warn!("Coreboot table pointer is null");
-        return info;
-    }
+    // If pointer is null or invalid, scan for the tables in memory
+    let header = if ptr.is_null() {
+        log::warn!("Coreboot table pointer is null, scanning memory...");
+        unsafe { scan_for_header() }
+    } else {
+        unsafe { find_header(ptr) }
+    };
 
-    unsafe {
-        // Try to find the coreboot header
-        // It can be at the pointer directly, or we may need to search
-        let header = find_header(ptr);
-        if header.is_none() {
-            log::warn!("Could not find coreboot header");
+    let header = match header {
+        Some(h) => h,
+        None => {
+            log::warn!("Could not find coreboot header, using fallback memory map");
+            // Create a fallback memory map for QEMU
+            create_fallback_memory_map(&mut info);
             return info;
         }
+    };
 
-        let header = header.unwrap();
-
+    unsafe {
         // Verify signature "LBIO"
         if &(*header).signature != b"LBIO" {
             log::warn!("Invalid coreboot header signature");
+            create_fallback_memory_map(&mut info);
             return info;
         }
 
@@ -206,7 +210,55 @@ pub fn parse(ptr: *const u8) -> CorebootInfo {
         }
     }
 
+    // If we still have no memory map, create a fallback
+    if info.memory_map.is_empty() {
+        log::warn!("No memory map found in coreboot tables, using fallback");
+        create_fallback_memory_map(&mut info);
+    }
+
     info
+}
+
+/// Create a fallback memory map for when coreboot tables aren't available
+/// This is mainly useful for QEMU testing
+fn create_fallback_memory_map(info: &mut CorebootInfo) {
+    log::info!("Creating fallback memory map for QEMU");
+
+    // Standard QEMU/PC memory layout:
+    // 0x00000000 - 0x0009FFFF: Low memory (640 KB) - usable
+    // 0x000A0000 - 0x000FFFFF: VGA + ROM (384 KB) - reserved
+    // 0x00100000 - 0x07FFFFFF: Extended memory (up to ~128 MB for safety) - usable
+    // We reserve the first 2MB for our code and page tables
+
+    // Low memory (below 640KB), but reserve first 4KB
+    let _ = info.memory_map.push(MemoryRegion {
+        start: 0x1000,
+        size: 0x9F000, // 636 KB
+        region_type: MemoryType::Ram,
+    });
+
+    // Extended memory: start at 2MB to avoid our payload, go up to 128MB
+    // (QEMU typically has at least 128MB, we asked for 512MB)
+    let _ = info.memory_map.push(MemoryRegion {
+        start: 0x200000,   // 2 MB
+        size: 0x1E00_0000, // 480 MB (up to ~512MB total, leaving room for MMIO)
+        region_type: MemoryType::Ram,
+    });
+
+    // Add serial port info for QEMU (COM1)
+    info.serial = Some(SerialInfo {
+        serial_type: 1, // IO port
+        baseaddr: 0x3f8,
+        baud: 115200,
+        regwidth: 1,
+        input_hertz: 1843200,
+    });
+
+    log::info!(
+        "Fallback memory map: {} regions, {} MB total",
+        info.memory_map.len(),
+        (0x9F000 + 0x1E00_0000) / (1024 * 1024)
+    );
 }
 
 /// Find the coreboot header, following forward pointers if needed
@@ -218,11 +270,66 @@ unsafe fn find_header(ptr: *const u8) -> Option<*const CbHeader> {
         return Some(header);
     }
 
-    // It might be at a different location, search common areas
-    // Coreboot tables are typically at 0x0 or in high memory
+    // Try scanning from the given address
+    scan_for_header_at(ptr, 0x1000)
+}
 
-    // For now, assume the pointer is correct
-    // TODO: Search for the header in memory
+/// Scan memory for coreboot header signature "LBIO"
+unsafe fn scan_for_header() -> Option<*const CbHeader> {
+    // Coreboot tables can be found at several locations:
+    // 1. Low memory (0x00000 - 0x01000)
+    // 2. At the top of low memory / EBDA area
+    // 3. In the BIOS area (0xF0000 - 0xFFFFF)
+    // 4. In high memory (where coreboot typically puts them)
+
+    // First, try low memory
+    if let Some(header) = scan_for_header_at(0x0 as *const u8, 0x1000) {
+        log::debug!("Found coreboot tables in low memory");
+        return Some(header);
+    }
+
+    // Try EBDA area (usually around 0x9F000)
+    if let Some(header) = scan_for_header_at(0x9F000 as *const u8, 0x1000) {
+        log::debug!("Found coreboot tables in EBDA area");
+        return Some(header);
+    }
+
+    // Try BIOS area
+    if let Some(header) = scan_for_header_at(0xF0000 as *const u8, 0x10000) {
+        log::debug!("Found coreboot tables in BIOS area");
+        return Some(header);
+    }
+
+    // Try common high memory locations
+    for base in &[0x7EE00000u64, 0x7FE00000u64, 0xCFF00000u64] {
+        if let Some(header) = scan_for_header_at(*base as *const u8, 0x100000) {
+            log::debug!("Found coreboot tables at {:#x}", *base);
+            return Some(header);
+        }
+    }
+
+    None
+}
+
+/// Scan a memory region for the coreboot header
+unsafe fn scan_for_header_at(base: *const u8, size: usize) -> Option<*const CbHeader> {
+    // Scan in 16-byte increments (coreboot header is aligned)
+    let mut offset = 0;
+    while offset < size {
+        let ptr = base.add(offset);
+        let header = ptr as *const CbHeader;
+
+        // Check for "LBIO" signature
+        // We need to be careful not to read from invalid memory
+        // Use a simple check that won't fault on most systems
+        let sig_ptr = ptr as *const [u8; 4];
+        if *sig_ptr == *b"LBIO" {
+            log::debug!("Found LBIO signature at {:p}", ptr);
+            return Some(header);
+        }
+
+        offset += 16;
+    }
 
     None
 }

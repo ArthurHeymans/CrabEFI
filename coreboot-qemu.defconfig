@@ -1,0 +1,36 @@
+# CrabEFI coreboot configuration for QEMU x86_64
+#
+# Usage:
+#   cd ~/src/coreboot
+#   make defconfig KBUILD_DEFCONFIG=$HOME/src/CrabEFI/coreboot-qemu.defconfig
+#   make menuconfig  # Optional: adjust payload path
+#   make -j$(nproc)
+
+# Mainboard: QEMU x86 i440fx
+CONFIG_VENDOR_EMULATION=y
+CONFIG_BOARD_EMULATION_QEMU_X86_I440FX=y
+
+# Architecture
+CONFIG_ARCH_X86=y
+
+# Payload: ELF executable (CrabEFI)
+CONFIG_PAYLOAD_ELF=y
+# IMPORTANT: Edit this path to match your CrabEFI location!
+CONFIG_PAYLOAD_FILE="/home/arthur/src/CrabEFI/target/x86_64-unknown-none/release/crabefi"
+
+# Serial console for debugging
+CONFIG_CONSOLE_SERIAL=y
+CONFIG_TTYS0_BASE=0x3f8
+CONFIG_TTYS0_BAUD=115200
+
+# Debug options
+CONFIG_DEBUG_CBFS=y
+CONFIG_DEBUG_ACPI=y
+CONFIG_DEBUG_BOOT_STATE=y
+
+# Generate timestamps
+CONFIG_COLLECT_TIMESTAMPS=y
+
+# Enable CBMEM console
+CONFIG_CONSOLE_CBMEM=y
+CONFIG_CONSOLE_CBMEM_BUFFER_SIZE=0x20000

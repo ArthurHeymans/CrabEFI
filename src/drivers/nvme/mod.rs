@@ -1,0 +1,908 @@
+//! NVMe driver for CrabEFI
+//!
+//! This module provides a minimal NVMe driver for reading from NVMe SSDs.
+//! It implements the basic NVMe command set needed for booting.
+
+use crate::drivers::pci::{self, PciDevice};
+use crate::efi;
+use core::ptr;
+use core::sync::atomic::{fence, Ordering};
+use spin::Mutex;
+
+/// NVMe controller registers (MMIO base offsets)
+mod regs {
+    pub const CAP: u64 = 0x00; // Controller Capabilities
+    pub const VS: u64 = 0x08; // Version
+    pub const INTMS: u64 = 0x0C; // Interrupt Mask Set
+    pub const INTMC: u64 = 0x10; // Interrupt Mask Clear
+    pub const CC: u64 = 0x14; // Controller Configuration
+    pub const CSTS: u64 = 0x1C; // Controller Status
+    pub const NSSR: u64 = 0x20; // NVM Subsystem Reset
+    pub const AQA: u64 = 0x24; // Admin Queue Attributes
+    pub const ASQ: u64 = 0x28; // Admin Submission Queue Base Address
+    pub const ACQ: u64 = 0x30; // Admin Completion Queue Base Address
+}
+
+/// NVMe admin commands
+mod admin_cmd {
+    pub const DELETE_SQ: u8 = 0x00;
+    pub const CREATE_SQ: u8 = 0x01;
+    pub const GET_LOG_PAGE: u8 = 0x02;
+    pub const DELETE_CQ: u8 = 0x04;
+    pub const CREATE_CQ: u8 = 0x05;
+    pub const IDENTIFY: u8 = 0x06;
+    pub const ABORT: u8 = 0x08;
+    pub const SET_FEATURES: u8 = 0x09;
+    pub const GET_FEATURES: u8 = 0x0A;
+    pub const ASYNC_EVENT_REQUEST: u8 = 0x0C;
+}
+
+/// NVMe I/O commands
+mod io_cmd {
+    pub const FLUSH: u8 = 0x00;
+    pub const WRITE: u8 = 0x01;
+    pub const READ: u8 = 0x02;
+}
+
+/// Queue sizes (must be power of 2)
+const ADMIN_QUEUE_SIZE: usize = 16;
+const IO_QUEUE_SIZE: usize = 64;
+
+/// Sector size (for standard NVMe namespace)
+const SECTOR_SIZE: usize = 512;
+
+/// Maximum data transfer size per command
+const MAX_TRANSFER_SIZE: usize = 4096 * 256; // 1MB
+
+/// NVMe Submission Queue Entry (64 bytes)
+#[repr(C, align(64))]
+#[derive(Clone, Copy, Default)]
+struct SubmissionQueueEntry {
+    /// Command Dword 0: Opcode, Fused, reserved, PSDT, CID
+    cdw0: u32,
+    /// Namespace ID
+    nsid: u32,
+    /// Reserved
+    cdw2: u32,
+    /// Reserved
+    cdw3: u32,
+    /// Metadata Pointer
+    mptr: u64,
+    /// Data Pointer (PRP Entry 1)
+    prp1: u64,
+    /// Data Pointer (PRP Entry 2 or PRP List pointer)
+    prp2: u64,
+    /// Command Dwords 10-15 (command specific)
+    cdw10: u32,
+    cdw11: u32,
+    cdw12: u32,
+    cdw13: u32,
+    cdw14: u32,
+    cdw15: u32,
+}
+
+impl SubmissionQueueEntry {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    fn set_opcode(&mut self, opcode: u8) {
+        self.cdw0 = (self.cdw0 & 0xFFFFFF00) | (opcode as u32);
+    }
+
+    fn set_cid(&mut self, cid: u16) {
+        self.cdw0 = (self.cdw0 & 0x0000FFFF) | ((cid as u32) << 16);
+    }
+}
+
+/// NVMe Completion Queue Entry (16 bytes)
+#[repr(C, align(16))]
+#[derive(Clone, Copy, Default)]
+struct CompletionQueueEntry {
+    /// Command specific result
+    dw0: u32,
+    /// Reserved
+    dw1: u32,
+    /// Submission Queue Head Pointer & SQ Identifier
+    sq_head_sqid: u32,
+    /// Status Field & Command Identifier
+    status_cid: u32,
+}
+
+impl CompletionQueueEntry {
+    fn status_code(&self) -> u8 {
+        ((self.status_cid >> 17) & 0xFF) as u8
+    }
+
+    fn status_code_type(&self) -> u8 {
+        ((self.status_cid >> 25) & 0x7) as u8
+    }
+
+    fn phase(&self) -> bool {
+        // Phase bit is bit 16 of the status_cid field (DW3)
+        // DW3 layout: bits 0-15 = CID, bit 16 = Phase, bits 17-31 = Status
+        (self.status_cid & 0x10000) != 0
+    }
+
+    fn cid(&self) -> u16 {
+        // Command ID is in bits 0-15 of DW3
+        (self.status_cid & 0xFFFF) as u16
+    }
+
+    fn is_error(&self) -> bool {
+        self.status_code() != 0 || self.status_code_type() != 0
+    }
+}
+
+/// NVMe Identify Controller data structure (first 256 bytes of interest)
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct IdentifyController {
+    /// PCI Vendor ID
+    vid: u16,
+    /// PCI Subsystem Vendor ID
+    ssvid: u16,
+    /// Serial Number (20 bytes)
+    sn: [u8; 20],
+    /// Model Number (40 bytes)
+    mn: [u8; 40],
+    /// Firmware Revision (8 bytes)
+    fr: [u8; 8],
+    /// Recommended Arbitration Burst
+    rab: u8,
+    /// IEEE OUI Identifier
+    ieee: [u8; 3],
+    /// Controller Multi-Path I/O and Namespace Sharing Capabilities
+    cmic: u8,
+    /// Maximum Data Transfer Size
+    mdts: u8,
+    /// Controller ID
+    cntlid: u16,
+    /// Version
+    ver: u32,
+    /// RTD3 Resume Latency
+    rtd3r: u32,
+    /// RTD3 Entry Latency
+    rtd3e: u32,
+    /// Optional Asynchronous Events Supported
+    oaes: u32,
+    /// Controller Attributes
+    ctratt: u32,
+    /// Read Recovery Levels Supported
+    rrls: u16,
+    /// Reserved
+    _reserved1: [u8; 9],
+    /// Controller Type
+    cntrltype: u8,
+    /// FRU Globally Unique Identifier
+    fguid: [u8; 16],
+    /// Command Retry Delay Times
+    crdt1: u16,
+    crdt2: u16,
+    crdt3: u16,
+    /// Reserved
+    _reserved2: [u8; 106],
+    /// NVM Subsystem Report
+    nvmsr: u8,
+    /// VPD Write Cycle Information
+    vwci: u8,
+    /// Management Endpoint Capabilities
+    mec: u8,
+    /// Optional Admin Command Support
+    oacs: u16,
+    /// Abort Command Limit
+    acl: u8,
+    /// Asynchronous Event Request Limit
+    aerl: u8,
+    /// Firmware Updates
+    frmw: u8,
+    /// Log Page Attributes
+    lpa: u8,
+    /// Error Log Page Entries
+    elpe: u8,
+    /// Number of Power States Support
+    npss: u8,
+    /// Admin Vendor Specific Command Configuration
+    avscc: u8,
+    /// Autonomous Power State Transition Attributes
+    apsta: u8,
+    /// Warning Composite Temperature Threshold
+    wctemp: u16,
+    /// Critical Composite Temperature Threshold
+    cctemp: u16,
+    /// Maximum Time for Firmware Activation
+    mtfa: u16,
+    /// Host Memory Buffer Preferred Size
+    hmpre: u32,
+    /// Host Memory Buffer Minimum Size
+    hmmin: u32,
+    /// Total NVM Capacity (16 bytes)
+    tnvmcap: [u8; 16],
+    /// Unallocated NVM Capacity (16 bytes)
+    unvmcap: [u8; 16],
+}
+
+/// NVMe Identify Namespace data structure (first portion of interest)
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct IdentifyNamespace {
+    /// Namespace Size (in logical blocks)
+    nsze: u64,
+    /// Namespace Capacity (in logical blocks)
+    ncap: u64,
+    /// Namespace Utilization (in logical blocks)
+    nuse: u64,
+    /// Namespace Features
+    nsfeat: u8,
+    /// Number of LBA Formats
+    nlbaf: u8,
+    /// Formatted LBA Size
+    flbas: u8,
+    /// Metadata Capabilities
+    mc: u8,
+    /// End-to-end Data Protection Capabilities
+    dpc: u8,
+    /// End-to-end Data Protection Type Settings
+    dps: u8,
+    /// Namespace Multi-path I/O and Namespace Sharing Capabilities
+    nmic: u8,
+    /// Reservation Capabilities
+    rescap: u8,
+    /// Format Progress Indicator
+    fpi: u8,
+    /// Deallocate Logical Block Features
+    dlfeat: u8,
+    /// Namespace Atomic Write Unit Normal
+    nawun: u16,
+    /// Namespace Atomic Write Unit Power Fail
+    nawupf: u16,
+    /// Namespace Atomic Compare & Write Unit
+    nacwu: u16,
+    /// Namespace Atomic Boundary Size Normal
+    nabsn: u16,
+    /// Namespace Atomic Boundary Offset
+    nabo: u16,
+    /// Namespace Atomic Boundary Size Power Fail
+    nabspf: u16,
+    /// Namespace Optimal I/O Boundary
+    noiob: u16,
+    /// NVM Capacity (16 bytes)
+    nvmcap: [u8; 16],
+    /// Namespace Preferred Write Granularity
+    npwg: u16,
+    /// Namespace Preferred Write Alignment
+    npwa: u16,
+    /// Namespace Preferred Deallocate Granularity
+    npdg: u16,
+    /// Namespace Preferred Deallocate Alignment
+    npda: u16,
+    /// Namespace Optimal Write Size
+    nows: u16,
+    /// Reserved
+    _reserved: [u8; 18],
+    /// ANA Group Identifier
+    anagrpid: u32,
+    /// Reserved
+    _reserved2: [u8; 3],
+    /// Namespace Attributes
+    nsattr: u8,
+    /// NVM Set Identifier
+    nvmsetid: u16,
+    /// Endurance Group Identifier
+    endgid: u16,
+    /// Namespace Globally Unique Identifier
+    nguid: [u8; 16],
+    /// IEEE Extended Unique Identifier
+    eui64: [u8; 8],
+    /// LBA Format 0 Support
+    lbaf: [u32; 16],
+}
+
+/// LBA Format descriptor
+#[derive(Debug, Clone, Copy)]
+pub struct LbaFormat {
+    /// Logical block size (power of 2)
+    pub lba_size: u32,
+    /// Metadata size
+    pub metadata_size: u16,
+    /// Relative performance (0=best, 3=degraded)
+    pub relative_perf: u8,
+}
+
+/// NVMe namespace information
+#[derive(Debug)]
+pub struct NvmeNamespace {
+    /// Namespace ID
+    pub nsid: u32,
+    /// Number of logical blocks
+    pub num_blocks: u64,
+    /// Block size in bytes
+    pub block_size: u32,
+}
+
+/// NVMe controller
+pub struct NvmeController {
+    /// MMIO base address
+    mmio_base: u64,
+    /// Doorbell stride (in bytes)
+    doorbell_stride: usize,
+    /// Admin submission queue
+    admin_sq: *mut SubmissionQueueEntry,
+    /// Admin completion queue
+    admin_cq: *mut CompletionQueueEntry,
+    /// Admin submission queue tail
+    admin_sq_tail: u16,
+    /// Admin completion queue head
+    admin_cq_head: u16,
+    /// Admin completion queue phase
+    admin_cq_phase: bool,
+    /// Command ID counter
+    next_cid: u16,
+    /// I/O submission queue
+    io_sq: *mut SubmissionQueueEntry,
+    /// I/O completion queue
+    io_cq: *mut CompletionQueueEntry,
+    /// I/O submission queue tail
+    io_sq_tail: u16,
+    /// I/O completion queue head
+    io_cq_head: u16,
+    /// I/O completion queue phase
+    io_cq_phase: bool,
+    /// Detected namespaces
+    namespaces: heapless::Vec<NvmeNamespace, 8>,
+}
+
+/// NVMe error type
+#[derive(Debug)]
+pub enum NvmeError {
+    /// Controller not ready
+    NotReady,
+    /// Command failed
+    CommandFailed(u8, u8),
+    /// Timeout waiting for completion
+    Timeout,
+    /// No namespaces found
+    NoNamespaces,
+    /// Invalid namespace
+    InvalidNamespace,
+    /// Allocation failed
+    AllocationFailed,
+    /// Invalid parameter
+    InvalidParameter,
+}
+
+impl NvmeController {
+    /// Create a new NVMe controller from a PCI device
+    pub fn new(pci_dev: &PciDevice) -> Result<Self, NvmeError> {
+        let mmio_base = pci_dev.mmio_base().ok_or(NvmeError::NotReady)?;
+
+        // Enable the device (bus master + memory space)
+        pci::enable_device(pci_dev);
+
+        // Read capabilities
+        let cap = unsafe { ptr::read_volatile((mmio_base + regs::CAP) as *const u64) };
+        let doorbell_stride = 4 << ((cap >> 32) & 0xF);
+        let max_queue_entries = ((cap & 0xFFFF) + 1) as usize;
+
+        log::debug!("NVMe CAP: {:#018x}", cap);
+        log::debug!("  Doorbell stride: {} bytes", doorbell_stride);
+        log::debug!("  Max queue entries: {}", max_queue_entries);
+
+        // Read version
+        let vs = unsafe { ptr::read_volatile((mmio_base + regs::VS) as *const u32) };
+        let major = (vs >> 16) & 0xFFFF;
+        let minor = (vs >> 8) & 0xFF;
+        let tertiary = vs & 0xFF;
+        log::info!("NVMe version: {}.{}.{}", major, minor, tertiary);
+
+        // Allocate queues using EFI memory allocator
+        // Each queue needs to be 4KB aligned
+        let admin_sq =
+            efi::allocate_pages(1).ok_or(NvmeError::AllocationFailed)? as *mut SubmissionQueueEntry;
+        let admin_cq =
+            efi::allocate_pages(1).ok_or(NvmeError::AllocationFailed)? as *mut CompletionQueueEntry;
+
+        // Zero the queues
+        unsafe {
+            ptr::write_bytes(admin_sq, 0, ADMIN_QUEUE_SIZE);
+            ptr::write_bytes(admin_cq, 0, ADMIN_QUEUE_SIZE);
+        }
+
+        let mut controller = Self {
+            mmio_base,
+            doorbell_stride,
+            admin_sq,
+            admin_cq,
+            admin_sq_tail: 0,
+            admin_cq_head: 0,
+            admin_cq_phase: true,
+            next_cid: 0,
+            io_sq: ptr::null_mut(),
+            io_cq: ptr::null_mut(),
+            io_sq_tail: 0,
+            io_cq_head: 0,
+            io_cq_phase: true,
+            namespaces: heapless::Vec::new(),
+        };
+
+        controller.init()?;
+        Ok(controller)
+    }
+
+    /// Read a 32-bit register
+    fn read_reg32(&self, offset: u64) -> u32 {
+        unsafe { ptr::read_volatile((self.mmio_base + offset) as *const u32) }
+    }
+
+    /// Write a 32-bit register
+    fn write_reg32(&mut self, offset: u64, value: u32) {
+        unsafe { ptr::write_volatile((self.mmio_base + offset) as *mut u32, value) }
+    }
+
+    /// Read a 64-bit register
+    fn read_reg64(&self, offset: u64) -> u64 {
+        unsafe { ptr::read_volatile((self.mmio_base + offset) as *const u64) }
+    }
+
+    /// Write a 64-bit register
+    fn write_reg64(&mut self, offset: u64, value: u64) {
+        unsafe { ptr::write_volatile((self.mmio_base + offset) as *mut u64, value) }
+    }
+
+    /// Get doorbell register offset for a queue
+    fn doorbell_offset(&self, queue_id: u16, is_completion: bool) -> u64 {
+        let base = 0x1000u64;
+        let idx = (queue_id as u64) * 2 + if is_completion { 1 } else { 0 };
+        base + idx * (self.doorbell_stride as u64)
+    }
+
+    /// Ring the submission queue doorbell
+    fn ring_sq_doorbell(&mut self, queue_id: u16, tail: u16) {
+        let offset = self.doorbell_offset(queue_id, false);
+        self.write_reg32(offset, tail as u32);
+    }
+
+    /// Ring the completion queue doorbell
+    fn ring_cq_doorbell(&mut self, queue_id: u16, head: u16) {
+        let offset = self.doorbell_offset(queue_id, true);
+        self.write_reg32(offset, head as u32);
+    }
+
+    /// Initialize the controller
+    fn init(&mut self) -> Result<(), NvmeError> {
+        // Disable the controller
+        let mut cc = self.read_reg32(regs::CC);
+        cc &= !0x1; // Clear EN bit
+        self.write_reg32(regs::CC, cc);
+
+        // Wait for controller to become disabled
+        for _ in 0..1000000 {
+            let csts = self.read_reg32(regs::CSTS);
+            if (csts & 0x1) == 0 {
+                break;
+            }
+        }
+
+        // Set admin queue attributes
+        let aqa = ((ADMIN_QUEUE_SIZE - 1) as u32) << 16 | ((ADMIN_QUEUE_SIZE - 1) as u32);
+        self.write_reg32(regs::AQA, aqa);
+
+        // Set admin submission queue base address
+        self.write_reg64(regs::ASQ, self.admin_sq as u64);
+
+        // Set admin completion queue base address
+        self.write_reg64(regs::ACQ, self.admin_cq as u64);
+
+        // Configure controller:
+        // - Memory Page Size (MPS) = 0 (4KB)
+        // - Command Set Selected (CSS) = 0 (NVM)
+        // - Arbitration Mechanism Selected (AMS) = 0 (Round Robin)
+        // - Shutdown Notification (SHN) = 0
+        // - I/O Submission Queue Entry Size (IOSQES) = 6 (64 bytes)
+        // - I/O Completion Queue Entry Size (IOCQES) = 4 (16 bytes)
+        let cc = 0x00460001u32; // EN=1, CSS=0, MPS=0, IOSQES=6, IOCQES=4
+        self.write_reg32(regs::CC, cc);
+
+        // Wait for controller to become ready
+        for i in 0..1000000 {
+            let csts = self.read_reg32(regs::CSTS);
+            if (csts & 0x1) != 0 {
+                log::debug!("Controller ready after {} iterations", i);
+                break;
+            }
+            if (csts & 0x2) != 0 {
+                log::error!("Controller fatal status!");
+                return Err(NvmeError::NotReady);
+            }
+        }
+
+        let csts = self.read_reg32(regs::CSTS);
+        if (csts & 0x1) == 0 {
+            return Err(NvmeError::NotReady);
+        }
+
+        log::info!("NVMe controller initialized");
+
+        // Identify controller
+        self.identify_controller()?;
+
+        // Create I/O queues
+        self.create_io_queues()?;
+
+        // Identify namespaces
+        self.identify_namespaces()?;
+
+        Ok(())
+    }
+
+    /// Get the next command ID
+    fn next_command_id(&mut self) -> u16 {
+        let cid = self.next_cid;
+        self.next_cid = self.next_cid.wrapping_add(1);
+        cid
+    }
+
+    /// Submit a command to the admin queue
+    fn submit_admin_command(&mut self, cmd: &SubmissionQueueEntry) -> u16 {
+        let tail = self.admin_sq_tail as usize;
+        unsafe {
+            ptr::write_volatile(self.admin_sq.add(tail), *cmd);
+        }
+        fence(Ordering::SeqCst);
+
+        self.admin_sq_tail = ((tail + 1) % ADMIN_QUEUE_SIZE) as u16;
+        self.ring_sq_doorbell(0, self.admin_sq_tail);
+
+        (cmd.cdw0 >> 16) as u16 // Return CID
+    }
+
+    /// Wait for admin command completion
+    fn wait_admin_completion(&mut self, cid: u16) -> Result<CompletionQueueEntry, NvmeError> {
+        for _ in 0..10000000 {
+            fence(Ordering::SeqCst);
+            let head = self.admin_cq_head as usize;
+            let entry = unsafe { ptr::read_volatile(self.admin_cq.add(head)) };
+
+            if entry.phase() == self.admin_cq_phase {
+                if entry.cid() == cid {
+                    // Advance head
+                    self.admin_cq_head = ((head + 1) % ADMIN_QUEUE_SIZE) as u16;
+                    if self.admin_cq_head == 0 {
+                        self.admin_cq_phase = !self.admin_cq_phase;
+                    }
+                    self.ring_cq_doorbell(0, self.admin_cq_head);
+
+                    if entry.is_error() {
+                        return Err(NvmeError::CommandFailed(
+                            entry.status_code_type(),
+                            entry.status_code(),
+                        ));
+                    }
+                    return Ok(entry);
+                }
+            }
+        }
+        Err(NvmeError::Timeout)
+    }
+
+    /// Identify the controller
+    fn identify_controller(&mut self) -> Result<(), NvmeError> {
+        // Allocate a page for identify data
+        let identify_data = efi::allocate_pages(1).ok_or(NvmeError::AllocationFailed)?;
+
+        // Build identify command
+        let mut cmd = SubmissionQueueEntry::new();
+        cmd.set_opcode(admin_cmd::IDENTIFY);
+        cmd.set_cid(self.next_command_id());
+        cmd.nsid = 0;
+        cmd.prp1 = identify_data;
+        cmd.cdw10 = 0x01; // CNS = 01 (Identify Controller)
+
+        let cid = self.submit_admin_command(&cmd);
+        self.wait_admin_completion(cid)?;
+
+        // Parse identify data
+        let ctrl = unsafe { &*(identify_data as *const IdentifyController) };
+
+        // Extract model and serial number
+        let model = core::str::from_utf8(&ctrl.mn).unwrap_or("Unknown").trim();
+        let serial = core::str::from_utf8(&ctrl.sn).unwrap_or("Unknown").trim();
+        let firmware = core::str::from_utf8(&ctrl.fr).unwrap_or("Unknown").trim();
+
+        log::info!(
+            "NVMe Controller: {} (S/N: {}, FW: {})",
+            model,
+            serial,
+            firmware
+        );
+
+        // Free the identify data page
+        efi::free_pages(identify_data, 1);
+
+        Ok(())
+    }
+
+    /// Create I/O submission and completion queues
+    fn create_io_queues(&mut self) -> Result<(), NvmeError> {
+        // Allocate I/O queues
+        self.io_sq =
+            efi::allocate_pages(1).ok_or(NvmeError::AllocationFailed)? as *mut SubmissionQueueEntry;
+        self.io_cq =
+            efi::allocate_pages(1).ok_or(NvmeError::AllocationFailed)? as *mut CompletionQueueEntry;
+
+        // Zero the queues
+        unsafe {
+            ptr::write_bytes(self.io_sq, 0, IO_QUEUE_SIZE);
+            ptr::write_bytes(self.io_cq, 0, IO_QUEUE_SIZE);
+        }
+
+        // Create I/O Completion Queue (queue ID = 1)
+        let mut cmd = SubmissionQueueEntry::new();
+        cmd.set_opcode(admin_cmd::CREATE_CQ);
+        cmd.set_cid(self.next_command_id());
+        cmd.prp1 = self.io_cq as u64;
+        cmd.cdw10 = ((IO_QUEUE_SIZE - 1) as u32) << 16 | 1; // QSIZE | QCQID
+        cmd.cdw11 = 0x01; // PC=1 (physically contiguous), IEN=0, IV=0
+
+        let cid = self.submit_admin_command(&cmd);
+        self.wait_admin_completion(cid)?;
+        log::debug!("Created I/O completion queue 1");
+
+        // Create I/O Submission Queue (queue ID = 1)
+        let mut cmd = SubmissionQueueEntry::new();
+        cmd.set_opcode(admin_cmd::CREATE_SQ);
+        cmd.set_cid(self.next_command_id());
+        cmd.prp1 = self.io_sq as u64;
+        cmd.cdw10 = ((IO_QUEUE_SIZE - 1) as u32) << 16 | 1; // QSIZE | QSQID
+        cmd.cdw11 = (1 << 16) | 0x01; // CQID=1 | PC=1
+
+        let cid = self.submit_admin_command(&cmd);
+        self.wait_admin_completion(cid)?;
+        log::debug!("Created I/O submission queue 1");
+
+        Ok(())
+    }
+
+    /// Identify namespaces
+    fn identify_namespaces(&mut self) -> Result<(), NvmeError> {
+        // Allocate a page for identify data
+        let identify_data = efi::allocate_pages(1).ok_or(NvmeError::AllocationFailed)?;
+
+        // Get active namespace list
+        let mut cmd = SubmissionQueueEntry::new();
+        cmd.set_opcode(admin_cmd::IDENTIFY);
+        cmd.set_cid(self.next_command_id());
+        cmd.nsid = 0;
+        cmd.prp1 = identify_data;
+        cmd.cdw10 = 0x02; // CNS = 02 (Active Namespace ID list)
+
+        let cid = self.submit_admin_command(&cmd);
+        self.wait_admin_completion(cid)?;
+
+        // Parse namespace list
+        let ns_list = unsafe { core::slice::from_raw_parts(identify_data as *const u32, 1024) };
+
+        for &nsid in ns_list.iter() {
+            if nsid == 0 {
+                break;
+            }
+
+            // Identify this namespace
+            let mut cmd = SubmissionQueueEntry::new();
+            cmd.set_opcode(admin_cmd::IDENTIFY);
+            cmd.set_cid(self.next_command_id());
+            cmd.nsid = nsid;
+            cmd.prp1 = identify_data;
+            cmd.cdw10 = 0x00; // CNS = 00 (Identify Namespace)
+
+            let cid = self.submit_admin_command(&cmd);
+            self.wait_admin_completion(cid)?;
+
+            let ns = unsafe { &*(identify_data as *const IdentifyNamespace) };
+            let lba_format_idx = ns.flbas & 0x0F;
+            let lba_format = ns.lbaf[lba_format_idx as usize];
+            let lba_data_size = (lba_format >> 16) & 0xFF;
+            let block_size = 1u32 << lba_data_size;
+
+            let namespace = NvmeNamespace {
+                nsid,
+                num_blocks: ns.nsze,
+                block_size,
+            };
+
+            log::info!(
+                "NVMe Namespace {}: {} blocks x {} bytes = {} MB",
+                nsid,
+                namespace.num_blocks,
+                namespace.block_size,
+                (namespace.num_blocks * namespace.block_size as u64) / (1024 * 1024)
+            );
+
+            let _ = self.namespaces.push(namespace);
+        }
+
+        efi::free_pages(identify_data, 1);
+
+        if self.namespaces.is_empty() {
+            return Err(NvmeError::NoNamespaces);
+        }
+
+        Ok(())
+    }
+
+    /// Get the first namespace
+    pub fn get_namespace(&self, nsid: u32) -> Option<&NvmeNamespace> {
+        self.namespaces.iter().find(|ns| ns.nsid == nsid)
+    }
+
+    /// Get the default namespace (usually namespace 1)
+    pub fn default_namespace(&self) -> Option<&NvmeNamespace> {
+        self.namespaces.first()
+    }
+
+    /// Submit an I/O command
+    fn submit_io_command(&mut self, cmd: &SubmissionQueueEntry) -> u16 {
+        let tail = self.io_sq_tail as usize;
+        unsafe {
+            ptr::write_volatile(self.io_sq.add(tail), *cmd);
+        }
+        fence(Ordering::SeqCst);
+
+        self.io_sq_tail = ((tail + 1) % IO_QUEUE_SIZE) as u16;
+        self.ring_sq_doorbell(1, self.io_sq_tail);
+
+        (cmd.cdw0 >> 16) as u16 // Return CID
+    }
+
+    /// Wait for I/O command completion
+    fn wait_io_completion(&mut self, cid: u16) -> Result<CompletionQueueEntry, NvmeError> {
+        for _ in 0..10000000 {
+            fence(Ordering::SeqCst);
+            let head = self.io_cq_head as usize;
+            let entry = unsafe { ptr::read_volatile(self.io_cq.add(head)) };
+
+            if entry.phase() == self.io_cq_phase {
+                if entry.cid() == cid {
+                    // Advance head
+                    self.io_cq_head = ((head + 1) % IO_QUEUE_SIZE) as u16;
+                    if self.io_cq_head == 0 {
+                        self.io_cq_phase = !self.io_cq_phase;
+                    }
+                    self.ring_cq_doorbell(1, self.io_cq_head);
+
+                    if entry.is_error() {
+                        return Err(NvmeError::CommandFailed(
+                            entry.status_code_type(),
+                            entry.status_code(),
+                        ));
+                    }
+                    return Ok(entry);
+                }
+            }
+        }
+        Err(NvmeError::Timeout)
+    }
+
+    /// Read sectors from a namespace
+    pub fn read_sectors(
+        &mut self,
+        nsid: u32,
+        start_lba: u64,
+        num_sectors: u32,
+        buffer: *mut u8,
+    ) -> Result<(), NvmeError> {
+        let ns = self
+            .get_namespace(nsid)
+            .ok_or(NvmeError::InvalidNamespace)?;
+        let block_size = ns.block_size;
+
+        if num_sectors == 0 {
+            return Err(NvmeError::InvalidParameter);
+        }
+
+        // Build read command
+        let mut cmd = SubmissionQueueEntry::new();
+        cmd.set_opcode(io_cmd::READ);
+        cmd.set_cid(self.next_command_id());
+        cmd.nsid = nsid;
+        cmd.prp1 = buffer as u64;
+
+        // If transfer spans more than one page, we need PRP list
+        let transfer_size = num_sectors as u64 * block_size as u64;
+        if transfer_size > 4096 {
+            // For simplicity, we require contiguous memory for now
+            // In a full implementation, we would set up a PRP list
+            // For transfers <= 8KB, we can use prp2 directly
+            if transfer_size <= 8192 {
+                cmd.prp2 = buffer as u64 + 4096;
+            } else {
+                log::warn!("Large transfers (>{} KB) not yet supported", 8);
+                return Err(NvmeError::InvalidParameter);
+            }
+        }
+
+        cmd.cdw10 = start_lba as u32;
+        cmd.cdw11 = (start_lba >> 32) as u32;
+        cmd.cdw12 = num_sectors - 1; // Number of logical blocks (0-based)
+
+        let cid = self.submit_io_command(&cmd);
+        self.wait_io_completion(cid)?;
+
+        Ok(())
+    }
+
+    /// Read a single sector (convenience method)
+    pub fn read_sector(&mut self, nsid: u32, lba: u64, buffer: &mut [u8]) -> Result<(), NvmeError> {
+        let ns = self
+            .get_namespace(nsid)
+            .ok_or(NvmeError::InvalidNamespace)?;
+
+        if buffer.len() < ns.block_size as usize {
+            return Err(NvmeError::InvalidParameter);
+        }
+
+        self.read_sectors(nsid, lba, 1, buffer.as_mut_ptr())
+    }
+}
+
+/// Wrapper for NVMe controller pointer to implement Send
+struct NvmeControllerPtr(*mut NvmeController);
+
+// SAFETY: We ensure single-threaded access via the Mutex
+unsafe impl Send for NvmeControllerPtr {}
+
+/// Global list of NVMe controllers
+static NVME_CONTROLLERS: Mutex<heapless::Vec<NvmeControllerPtr, 4>> =
+    Mutex::new(heapless::Vec::new());
+
+/// Initialize NVMe controllers
+pub fn init() {
+    log::info!("Initializing NVMe controllers...");
+
+    let nvme_devices = pci::find_nvme_controllers();
+
+    if nvme_devices.is_empty() {
+        log::info!("No NVMe controllers found");
+        return;
+    }
+
+    let mut controllers = NVME_CONTROLLERS.lock();
+
+    for dev in nvme_devices.iter() {
+        match NvmeController::new(dev) {
+            Ok(controller) => {
+                // Box the controller (we don't have alloc, so use EFI allocator)
+                let controller_ptr = efi::allocate_pages(1);
+                if let Some(ptr) = controller_ptr {
+                    let controller_box = ptr as *mut NvmeController;
+                    unsafe {
+                        ptr::write(controller_box, controller);
+                    }
+                    let _ = controllers.push(NvmeControllerPtr(controller_box));
+                    log::info!("NVMe controller at {} initialized", dev.address);
+                }
+            }
+            Err(e) => {
+                log::error!(
+                    "Failed to initialize NVMe controller at {}: {:?}",
+                    dev.address,
+                    e
+                );
+            }
+        }
+    }
+
+    log::info!(
+        "NVMe initialization complete: {} controllers",
+        controllers.len()
+    );
+}
+
+/// Get the first NVMe controller
+pub fn get_controller(index: usize) -> Option<&'static mut NvmeController> {
+    let controllers = NVME_CONTROLLERS.lock();
+    controllers.get(index).map(|ptr| unsafe { &mut *ptr.0 })
+}
+
+// Ensure NvmeController can be sent between threads
+unsafe impl Send for NvmeController {}

@@ -1,5 +1,10 @@
 # Build artifacts
 /target/
+**/target/
+
+# Test artifacts
+test-disk.img
+test/*.efi
 
 # IDE/Editor
 .idea/

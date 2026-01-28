@@ -15,6 +15,9 @@ const MAX_MEMORY_ENTRIES: usize = 256;
 /// Page size (4KB)
 pub const PAGE_SIZE: u64 = 4096;
 
+/// Page size as usize for convenience
+pub const PAGE_SIZE_USIZE: usize = 4096;
+
 /// EFI memory allocation types
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u32)]

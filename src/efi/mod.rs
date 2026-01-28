@@ -93,3 +93,37 @@ fn init_console() {
 pub fn get_system_table() -> *mut efi::SystemTable {
     system_table::get_system_table_efi()
 }
+
+/// Get a firmware image handle (used as parent handle for loaded images)
+/// This creates a dummy handle to represent the firmware itself
+pub fn get_firmware_handle() -> efi::Handle {
+    // Use a fixed value for the firmware handle
+    // This is just a unique identifier, not a real pointer
+    FIRMWARE_HANDLE as *mut core::ffi::c_void
+}
+
+// Constant for firmware handle (high address unlikely to conflict)
+const FIRMWARE_HANDLE: usize = 0xF1F1_F1F1;
+
+/// Allocate pages of memory (convenience function for drivers)
+///
+/// Returns the physical address of the allocated pages, or None if allocation failed.
+pub fn allocate_pages(num_pages: u64) -> Option<u64> {
+    let mut addr = 0u64;
+    let status = allocator::allocate_pages(
+        allocator::AllocateType::AllocateAnyPages,
+        allocator::MemoryType::BootServicesData,
+        num_pages,
+        &mut addr,
+    );
+    if status == Status::SUCCESS {
+        Some(addr)
+    } else {
+        None
+    }
+}
+
+/// Free previously allocated pages (convenience function for drivers)
+pub fn free_pages(addr: u64, num_pages: u64) {
+    let _ = allocator::free_pages(addr, num_pages);
+}
