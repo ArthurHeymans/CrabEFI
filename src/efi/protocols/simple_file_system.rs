@@ -985,8 +985,21 @@ fn next_cluster(
 
     let next = match state.fat_type {
         12 => {
-            let entry = buffer[fat_offset as usize] as u16
-                | ((buffer[(fat_offset + 1) as usize] as u16) << 8);
+            // FAT12 entries are 1.5 bytes and can span sector boundaries
+            let byte1 = buffer[fat_offset as usize];
+            let byte2 = if fat_offset + 1 >= state.bytes_per_sector as u32 {
+                // Entry spans sector boundary - need to read next sector
+                let mut next_buffer = [0u8; 512];
+                read_fn(
+                    state.partition_start + sector_offset as u64 + 1,
+                    &mut next_buffer[..state.bytes_per_sector as usize],
+                )?;
+                next_buffer[0]
+            } else {
+                buffer[(fat_offset + 1) as usize]
+            };
+
+            let entry = byte1 as u16 | ((byte2 as u16) << 8);
             let val = if cluster & 1 != 0 {
                 entry >> 4
             } else {

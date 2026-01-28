@@ -35,8 +35,16 @@ pub fn init(cb_info: &CorebootInfo) {
         system_table::install_acpi_tables(rsdp);
     }
 
-    // Create console handles and install protocols
-    init_console();
+    // Create console handle - this will also have GOP installed on it
+    let console_handle = init_console();
+
+    // Install Graphics Output protocol on the SAME handle as console
+    // This is important - GRUB expects GOP and ConOut on the same handle
+    if let Some(ref fb) = cb_info.framebuffer {
+        if let Some(handle) = console_handle {
+            init_graphics_output_on_handle(fb, handle);
+        }
+    }
 
     // Install Unicode Collation protocol
     init_unicode_collation();
@@ -51,20 +59,35 @@ pub fn init(cb_info: &CorebootInfo) {
 }
 
 /// Initialize console I/O
-fn init_console() {
+/// Returns the console handle so GOP can be installed on it
+fn init_console() -> Option<efi::Handle> {
     use protocols::console::{
         get_text_input_protocol, get_text_output_protocol, SIMPLE_TEXT_INPUT_PROTOCOL_GUID,
         SIMPLE_TEXT_OUTPUT_PROTOCOL_GUID,
     };
+    use protocols::device_path::{create_video_device_path, DEVICE_PATH_PROTOCOL_GUID};
 
     // Create console handle
     let console_handle = match boot_services::create_handle() {
         Some(h) => h,
         None => {
             log::error!("Failed to create console handle");
-            return;
+            return None;
         }
     };
+
+    // Install device path on console handle - GRUB needs this for GOP
+    let device_path = create_video_device_path();
+    if !device_path.is_null() {
+        let status = boot_services::install_protocol(
+            console_handle,
+            &DEVICE_PATH_PROTOCOL_GUID,
+            device_path as *mut core::ffi::c_void,
+        );
+        if status != Status::SUCCESS {
+            log::error!("Failed to install device path on console: {:?}", status);
+        }
+    }
 
     // Install text input protocol
     let input_protocol = get_text_input_protocol();
@@ -95,7 +118,8 @@ fn init_console() {
         system_table::set_std_err(console_handle, output_protocol);
     }
 
-    log::debug!("Console protocols installed");
+    log::debug!("Console protocols installed on handle {:?}", console_handle);
+    Some(console_handle)
 }
 
 /// Initialize Unicode Collation protocol
@@ -201,6 +225,34 @@ fn init_serial_io() {
     }
 
     log::debug!("Serial IO protocol installed on handle {:?}", handle);
+}
+
+/// Initialize Graphics Output Protocol (GOP) on a specific handle
+/// Installing GOP on the same handle as ConOut is important for GRUB compatibility
+fn init_graphics_output_on_handle(
+    framebuffer: &crate::coreboot::FramebufferInfo,
+    handle: efi::Handle,
+) {
+    use protocols::graphics_output::{create_gop, GRAPHICS_OUTPUT_GUID};
+
+    // Create and install the protocol on the provided handle
+    let protocol = create_gop(framebuffer);
+    if protocol.is_null() {
+        log::error!("Failed to create GOP protocol");
+        return;
+    }
+
+    let status = boot_services::install_protocol(
+        handle,
+        &GRAPHICS_OUTPUT_GUID,
+        protocol as *mut core::ffi::c_void,
+    );
+    if status != Status::SUCCESS {
+        log::error!("Failed to install GOP protocol: {:?}", status);
+        return;
+    }
+
+    log::debug!("GOP protocol installed on console handle {:?}", handle);
 }
 
 /// Get the EFI system table pointer

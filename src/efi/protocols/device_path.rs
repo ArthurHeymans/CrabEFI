@@ -409,3 +409,52 @@ pub fn create_file_path_device_path(path: &str) -> *mut Protocol {
 
     ptr as *mut Protocol
 }
+
+/// ACPI device path for video/graphics output
+///
+/// Contains just an ACPI node followed by End node.
+/// This is used for the GOP handle to indicate it's a display device.
+#[repr(C, packed)]
+pub struct AcpiVideoDevicePath {
+    pub acpi: AcpiDevicePathNode,
+    pub end: End,
+}
+
+/// Create a device path for the video/graphics output device
+///
+/// Creates a simple ACPI device path: ACPI(PNP0A03,0)/End
+/// This indicates the graphics output is on the PCI bus root.
+/// GRUB needs a device path on the GOP handle to recognize it.
+///
+/// # Returns
+/// A pointer to the device path protocol, or null on failure
+pub fn create_video_device_path() -> *mut Protocol {
+    let size = core::mem::size_of::<AcpiVideoDevicePath>();
+
+    let ptr = match allocate_pool(MemoryType::BootServicesData, size) {
+        Ok(p) => p as *mut AcpiVideoDevicePath,
+        Err(_) => {
+            log::error!("Failed to allocate video device path");
+            return core::ptr::null_mut();
+        }
+    };
+
+    unsafe {
+        // ACPI node - using PCI root bridge HID
+        // In a real system this would point to the actual GPU
+        (*ptr).acpi.r#type = TYPE_ACPI;
+        (*ptr).acpi.sub_type = SUBTYPE_ACPI;
+        (*ptr).acpi.length = (core::mem::size_of::<AcpiDevicePathNode>() as u16).to_le_bytes();
+        (*ptr).acpi.hid = EISA_PNP_ID_PCI_ROOT; // PNP0A03
+        (*ptr).acpi.uid = 0;
+
+        // End node
+        (*ptr).end.header.r#type = TYPE_END;
+        (*ptr).end.header.sub_type = End::SUBTYPE_ENTIRE;
+        (*ptr).end.header.length = (core::mem::size_of::<End>() as u16).to_le_bytes();
+    }
+
+    log::debug!("Created video device path: ACPI(PNP0A03,0)");
+
+    ptr as *mut Protocol
+}
