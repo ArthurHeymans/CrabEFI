@@ -590,47 +590,5 @@ pub fn create_gop(framebuffer: &FramebufferInfo) -> *mut GraphicsOutputProtocol 
         pixel_format
     );
 
-    // Draw a test pattern to verify framebuffer is working
-    draw_test_pattern(framebuffer);
-
     protocol_ptr
-}
-
-/// Draw a simple test pattern to verify framebuffer access
-fn draw_test_pattern(fb: &FramebufferInfo) {
-    let fb_ptr = fb.physical_address as *mut u8;
-    let width = fb.x_resolution as usize;
-    let height = fb.y_resolution as usize;
-    let bar_height = 50; // Height of each color bar
-
-    log::info!(
-        "Drawing test pattern to framebuffer at {:#x}",
-        fb.physical_address
-    );
-
-    // Draw colored bars at the top of the screen
-    for y in 0..core::cmp::min(bar_height * 3, height) {
-        for x in 0..width {
-            let (r, g, b) = if y < bar_height {
-                (255u8, 0u8, 0u8) // Red
-            } else if y < bar_height * 2 {
-                (0u8, 255u8, 0u8) // Green
-            } else {
-                (0u8, 0u8, 255u8) // Blue
-            };
-
-            let pixel = BltPixel {
-                red: r,
-                green: g,
-                blue: b,
-                reserved: 0,
-            };
-
-            unsafe {
-                write_pixel_to_fb(fb, fb_ptr, x, y, &pixel);
-            }
-        }
-    }
-
-    log::info!("Test pattern drawn");
 }

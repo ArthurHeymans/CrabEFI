@@ -379,6 +379,8 @@ fn install_block_io_for_disk<R: fs::gpt::SectorRead>(
     };
 
     let mut esp_partition: Option<(u32, fs::gpt::Partition)> = None;
+    let mut candidate_partitions: heapless::Vec<(u32, fs::gpt::Partition), 8> =
+        heapless::Vec::new();
 
     // Create BlockIO for each partition
     for (i, partition) in partitions.iter().enumerate() {
@@ -447,10 +449,43 @@ fn install_block_io_for_disk<R: fs::gpt::SectorRead>(
                 partition.size_bytes() / (1024 * 1024)
             );
             esp_partition = Some((partition_num, partition.clone()));
+        } else {
+            // Track as candidate for fallback (small partitions are more likely to be EFI boot)
+            // Prioritize smaller partitions (< 512 MB) as they're more likely to be EFI boot partitions
+            let size_mb = partition.size_bytes() / (1024 * 1024);
+            if size_mb > 0 && size_mb < 512 && partition.first_lba > 0 {
+                let _ = candidate_partitions.push((partition_num, partition.clone()));
+            }
         }
     }
 
-    esp_partition
+    // If we found a proper ESP, return it
+    if esp_partition.is_some() {
+        return esp_partition;
+    }
+
+    // No proper ESP found - try candidate partitions (smaller ones first, as they're more likely EFI)
+    // Sort candidates by size (smallest first) - bubble sort since heapless doesn't have sort
+    for i in 0..candidate_partitions.len() {
+        for j in (i + 1)..candidate_partitions.len() {
+            if candidate_partitions[j].1.size_bytes() < candidate_partitions[i].1.size_bytes() {
+                let tmp = candidate_partitions[i].clone();
+                candidate_partitions[i] = candidate_partitions[j].clone();
+                candidate_partitions[j] = tmp;
+            }
+        }
+    }
+
+    for (partition_num, partition) in candidate_partitions.iter() {
+        log::debug!(
+            "Trying partition {} as potential ESP (no proper ESP found)",
+            partition_num
+        );
+        // Return the first candidate - the caller will try to mount it as FAT
+        return Some((*partition_num, partition.clone()));
+    }
+
+    None
 }
 
 /// Try to boot from an ESP on a given disk (generic version)
