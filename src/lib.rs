@@ -15,8 +15,10 @@ pub mod arch;
 pub mod coreboot;
 pub mod drivers;
 pub mod efi;
+pub mod framebuffer_console;
 pub mod fs;
 pub mod logger;
+pub mod menu;
 pub mod pe;
 pub mod time;
 
@@ -54,11 +56,29 @@ fn panic(info: &PanicInfo) -> ! {
 ///
 /// * `coreboot_table_ptr` - Pointer to the coreboot tables
 pub fn init(coreboot_table_ptr: u64) {
-    // Early serial initialization for debugging
-    drivers::serial::init_early();
+    // Parse coreboot tables first (before any I/O) to get hardware info
+    let cb_info = coreboot::tables::parse(coreboot_table_ptr as *const u8);
 
-    // Initialize logging
+    // Store framebuffer globally for menu rendering and draw life sign ASAP
+    if let Some(ref fb) = cb_info.framebuffer {
+        coreboot::store_framebuffer(fb.clone());
+        // Early life sign: draw a bright magenta rectangle in top-left corner
+        // This provides visual feedback before any other initialization
+        draw_life_sign_early(fb);
+    }
+
+    // Initialize serial port from coreboot info (if available)
+    if let Some(ref serial) = cb_info.serial {
+        drivers::serial::init_from_coreboot(serial.baseaddr, serial.baud);
+    }
+
+    // Initialize logging (now that serial is set up)
     logger::init();
+
+    // Set framebuffer for logging output (so we can see logs on screen)
+    if let Some(ref fb) = cb_info.framebuffer {
+        logger::set_framebuffer(fb.clone());
+    }
 
     // Initialize PS/2 keyboard (if available)
     drivers::keyboard::init();
@@ -66,12 +86,15 @@ pub fn init(coreboot_table_ptr: u64) {
     log::info!("CrabEFI v{} starting...", env!("CARGO_PKG_VERSION"));
     log::info!("Coreboot table pointer: {:#x}", coreboot_table_ptr);
 
-    // Parse coreboot tables
-    let cb_info = coreboot::tables::parse(coreboot_table_ptr as *const u8);
-
     log::info!("Parsed coreboot tables:");
     if let Some(ref serial) = cb_info.serial {
-        log::info!("  Serial: port={:#x}", serial.baseaddr);
+        log::info!(
+            "  Serial: port={:#x}, baud={}",
+            serial.baseaddr,
+            serial.baud
+        );
+    } else {
+        log::info!("  Serial: not available");
     }
     if let Some(ref fb) = cb_info.framebuffer {
         log::info!(
@@ -139,23 +162,235 @@ fn init_storage() {
     drivers::ahci::init();
     drivers::usb::init_all();
 
-    // Try to find ESP on NVMe first
-    if try_boot_from_nvme() {
+    // Discover boot entries and show menu
+    let mut boot_menu = menu::discover_boot_entries();
+
+    if boot_menu.entry_count() == 0 {
+        log::warn!("No bootable media found!");
+        log::info!("Storage initialization complete");
         return;
     }
 
-    // Try AHCI/SATA
-    if try_boot_from_ahci() {
-        return;
+    // If only one entry and no interactive mode requested, boot directly
+    // For now, always show the menu for testing
+    if let Some(selected_index) = menu::show_menu(&mut boot_menu) {
+        if let Some(entry) = boot_menu.get_entry(selected_index) {
+            log::info!("Booting: {} from {}", entry.name, entry.path);
+            boot_selected_entry(entry);
+        }
     }
 
-    // Try USB mass storage
-    if try_boot_from_usb() {
-        return;
-    }
+    log::info!("Boot menu returned, storage initialization complete");
+}
 
-    log::warn!("No bootable media found!");
-    log::info!("Storage initialization complete");
+/// Boot a selected menu entry
+fn boot_selected_entry(entry: &menu::BootEntry) {
+    match entry.device_type {
+        menu::DeviceType::Nvme {
+            controller_id,
+            nsid,
+        } => {
+            use drivers::storage::{self, StorageType};
+
+            // Ensure device is stored globally
+            if !drivers::nvme::store_global_device(controller_id, nsid) {
+                log::error!("Failed to store NVMe device globally");
+                return;
+            }
+
+            if let Some(controller) = drivers::nvme::get_controller(controller_id) {
+                // Get disk info for storage registration
+                let (num_blocks, block_size) = match controller.default_namespace() {
+                    Some(ns) => (ns.num_blocks, ns.block_size),
+                    None => {
+                        log::error!("Failed to get NVMe namespace info");
+                        return;
+                    }
+                };
+
+                // Register with storage abstraction (needed for BlockIO)
+                let storage_id = match storage::register_device(
+                    StorageType::Nvme {
+                        controller_id,
+                        nsid,
+                    },
+                    num_blocks,
+                    block_size,
+                ) {
+                    Some(id) => id,
+                    None => {
+                        log::error!("Failed to register NVMe device with storage");
+                        return;
+                    }
+                };
+
+                // Get PCI address
+                let pci_addr = controller.pci_address();
+
+                // Create disk for partition installation
+                let mut disk = fs::gpt::NvmeDisk::new(controller, nsid);
+
+                // Install BlockIO for ALL partitions (GRUB needs this to enumerate)
+                let _ = install_block_io_for_nvme_disk(
+                    &mut disk,
+                    storage_id,
+                    block_size,
+                    num_blocks,
+                    pci_addr.device,
+                    pci_addr.function,
+                    nsid,
+                );
+
+                // Re-create disk and boot from ESP
+                if let Some(controller) = drivers::nvme::get_controller(controller_id) {
+                    let mut disk = fs::gpt::NvmeDisk::new(controller, nsid);
+                    if try_boot_from_esp_nvme(
+                        &mut disk,
+                        &entry.partition,
+                        entry.partition_num,
+                        entry.pci_device,
+                        entry.pci_function,
+                        nsid,
+                    ) {
+                        return;
+                    }
+                }
+            }
+            log::error!("Failed to boot NVMe entry");
+        }
+        menu::DeviceType::Ahci {
+            controller_id,
+            port,
+        } => {
+            use drivers::storage::{self, StorageType};
+
+            // Ensure device is stored globally
+            if !drivers::ahci::store_global_device(controller_id, port) {
+                log::error!("Failed to store AHCI device globally");
+                return;
+            }
+
+            if let Some(controller) = drivers::ahci::get_controller(controller_id) {
+                // Get disk info for storage registration
+                let (num_blocks, block_size) = match controller.get_port(port) {
+                    Some(port_info) => (port_info.sector_count, port_info.sector_size),
+                    None => {
+                        log::error!("Failed to get AHCI port info");
+                        return;
+                    }
+                };
+
+                // Register with storage abstraction (needed for BlockIO)
+                let storage_id = match storage::register_device(
+                    StorageType::Ahci {
+                        controller_id,
+                        port,
+                    },
+                    num_blocks,
+                    block_size,
+                ) {
+                    Some(id) => id,
+                    None => {
+                        log::error!("Failed to register AHCI device with storage");
+                        return;
+                    }
+                };
+
+                // Get PCI address
+                let pci_addr = controller.pci_address();
+
+                // Create disk for partition installation
+                let mut disk = fs::gpt::AhciDisk::new(controller, port);
+
+                // Install BlockIO for ALL partitions (GRUB needs this to enumerate)
+                let _ = install_block_io_for_ahci_disk(
+                    &mut disk,
+                    storage_id,
+                    block_size,
+                    num_blocks,
+                    pci_addr.device,
+                    pci_addr.function,
+                    port as u16,
+                );
+
+                // Re-create disk and boot from ESP
+                if let Some(controller) = drivers::ahci::get_controller(controller_id) {
+                    let mut disk = fs::gpt::AhciDisk::new(controller, port);
+                    if try_boot_from_esp_ahci(
+                        &mut disk,
+                        &entry.partition,
+                        entry.partition_num,
+                        entry.pci_device,
+                        entry.pci_function,
+                        port as u16,
+                    ) {
+                        return;
+                    }
+                }
+            }
+            log::error!("Failed to boot AHCI entry");
+        }
+        menu::DeviceType::Usb { slot_id: _ } => {
+            use drivers::storage::{self, StorageType};
+
+            // USB device should already be stored globally from discovery
+            if let Some(usb_device) = drivers::usb::mass_storage::get_global_device() {
+                if let Some(xhci) = drivers::usb::get_controller(0) {
+                    // Get disk info for storage registration
+                    let num_blocks = usb_device.num_blocks;
+                    let block_size = usb_device.block_size;
+
+                    // Register with storage abstraction (needed for BlockIO)
+                    let storage_id = match storage::register_device(
+                        StorageType::Usb { slot_id: 0 },
+                        num_blocks,
+                        block_size,
+                    ) {
+                        Some(id) => id,
+                        None => {
+                            log::error!("Failed to register USB device with storage");
+                            return;
+                        }
+                    };
+
+                    // Get PCI address
+                    let pci_addr = xhci.pci_address();
+
+                    // Create disk for partition installation
+                    let mut disk = fs::gpt::UsbDisk::new(usb_device, xhci);
+
+                    // Install BlockIO for ALL partitions (GRUB needs this to enumerate)
+                    let _ = install_block_io_for_disk(
+                        &mut disk,
+                        storage_id,
+                        block_size,
+                        num_blocks,
+                        pci_addr.device,
+                        pci_addr.function,
+                        0, // USB port
+                    );
+
+                    // Re-create disk and boot from ESP
+                    if let Some(usb_device) = drivers::usb::mass_storage::get_global_device() {
+                        if let Some(xhci) = drivers::usb::get_controller(0) {
+                            let mut disk = fs::gpt::UsbDisk::new(usb_device, xhci);
+                            if try_boot_from_esp_usb(
+                                &mut disk,
+                                &entry.partition,
+                                entry.partition_num,
+                                entry.pci_device,
+                                entry.pci_function,
+                                0, // USB port (default)
+                            ) {
+                                return;
+                            }
+                        }
+                    }
+                }
+            }
+            log::error!("Failed to boot USB entry");
+        }
+    }
 }
 
 /// Try to boot from NVMe
@@ -1007,7 +1242,9 @@ fn try_boot_from_esp_usb(
     pci_function: u8,
     usb_port: u8,
 ) -> bool {
+    use drivers::storage::{self, StorageType};
     use efi::boot_services;
+    use efi::protocols::block_io::{self, BLOCK_IO_PROTOCOL_GUID};
     use efi::protocols::device_path::{self, DEVICE_PATH_PROTOCOL_GUID};
     use efi::protocols::simple_file_system::{self, SIMPLE_FILE_SYSTEM_GUID};
     use r_efi::efi::Status;
@@ -1058,6 +1295,44 @@ fn try_boot_from_esp_usb(
                     );
                 } else {
                     log::warn!("Failed to install DevicePath protocol: {:?}", status);
+                }
+            }
+
+            // Install BlockIO protocol on the device handle
+            // The bootloader needs this to access the disk
+            if let Some(usb_device) = drivers::usb::mass_storage::get_global_device() {
+                let block_size = usb_device.block_size;
+                let num_blocks = usb_device.num_blocks;
+                // Get slot_id from the device
+                let slot_id = usb_device.slot_id();
+
+                let storage_id =
+                    storage::register_device(StorageType::Usb { slot_id }, num_blocks, block_size);
+
+                if let Some(storage_id) = storage_id {
+                    let block_io = block_io::create_partition_block_io(
+                        storage_id,
+                        partition_num,
+                        esp.first_lba,
+                        partition_size,
+                        block_size,
+                    );
+
+                    if !block_io.is_null() {
+                        let status = boot_services::install_protocol(
+                            device_handle,
+                            &BLOCK_IO_PROTOCOL_GUID,
+                            block_io as *mut core::ffi::c_void,
+                        );
+                        if status == Status::SUCCESS {
+                            log::info!(
+                                "BlockIO protocol installed on device handle {:?}",
+                                device_handle
+                            );
+                        } else {
+                            log::warn!("Failed to install BlockIO protocol: {:?}", status);
+                        }
+                    }
                 }
             }
 
@@ -1144,7 +1419,9 @@ fn try_boot_from_esp_nvme(
     pci_function: u8,
     namespace_id: u32,
 ) -> bool {
+    use drivers::storage::{self, StorageType};
     use efi::boot_services;
+    use efi::protocols::block_io::{self, BLOCK_IO_PROTOCOL_GUID};
     use efi::protocols::device_path::{self, DEVICE_PATH_PROTOCOL_GUID};
     use efi::protocols::simple_file_system::{self, SIMPLE_FILE_SYSTEM_GUID};
     use r_efi::efi::Status;
@@ -1200,6 +1477,48 @@ fn try_boot_from_esp_nvme(
                     );
                 } else {
                     log::warn!("Failed to install DevicePath protocol: {:?}", status);
+                }
+            }
+
+            // Install BlockIO protocol on the device handle
+            // The bootloader needs this to access the disk
+            if let Some(controller) = drivers::nvme::get_controller(0) {
+                if let Some(ns) = controller.default_namespace() {
+                    let block_size = ns.block_size;
+                    let storage_id = storage::register_device(
+                        StorageType::Nvme {
+                            controller_id: 0,
+                            nsid: namespace_id,
+                        },
+                        ns.num_blocks,
+                        block_size,
+                    );
+
+                    if let Some(storage_id) = storage_id {
+                        let block_io = block_io::create_partition_block_io(
+                            storage_id,
+                            partition_num,
+                            esp.first_lba,
+                            partition_size,
+                            block_size,
+                        );
+
+                        if !block_io.is_null() {
+                            let status = boot_services::install_protocol(
+                                device_handle,
+                                &BLOCK_IO_PROTOCOL_GUID,
+                                block_io as *mut core::ffi::c_void,
+                            );
+                            if status == Status::SUCCESS {
+                                log::info!(
+                                    "BlockIO protocol installed on device handle {:?}",
+                                    device_handle
+                                );
+                            } else {
+                                log::warn!("Failed to install BlockIO protocol: {:?}", status);
+                            }
+                        }
+                    }
                 }
             }
 
@@ -1263,7 +1582,9 @@ fn try_boot_from_esp_ahci(
     pci_function: u8,
     port: u16,
 ) -> bool {
+    use drivers::storage::{self, StorageType};
     use efi::boot_services;
+    use efi::protocols::block_io::{self, BLOCK_IO_PROTOCOL_GUID};
     use efi::protocols::device_path::{self, DEVICE_PATH_PROTOCOL_GUID};
     use efi::protocols::simple_file_system::{self, SIMPLE_FILE_SYSTEM_GUID};
     use r_efi::efi::Status;
@@ -1314,6 +1635,49 @@ fn try_boot_from_esp_ahci(
                     );
                 } else {
                     log::warn!("Failed to install DevicePath protocol: {:?}", status);
+                }
+            }
+
+            // Install BlockIO protocol on the device handle
+            // The bootloader needs this to access the disk
+            // First register the storage device
+            if let Some(controller) = drivers::ahci::get_controller(0) {
+                if let Some(port_info) = controller.get_port(port as usize) {
+                    let block_size = port_info.sector_size;
+                    let storage_id = storage::register_device(
+                        StorageType::Ahci {
+                            controller_id: 0,
+                            port: port as usize,
+                        },
+                        port_info.sector_count,
+                        block_size,
+                    );
+
+                    if let Some(storage_id) = storage_id {
+                        let block_io = block_io::create_partition_block_io(
+                            storage_id,
+                            partition_num,
+                            esp.first_lba,
+                            partition_size,
+                            block_size,
+                        );
+
+                        if !block_io.is_null() {
+                            let status = boot_services::install_protocol(
+                                device_handle,
+                                &BLOCK_IO_PROTOCOL_GUID,
+                                block_io as *mut core::ffi::c_void,
+                            );
+                            if status == Status::SUCCESS {
+                                log::info!(
+                                    "BlockIO protocol installed on device handle {:?}",
+                                    device_handle
+                                );
+                            } else {
+                                log::warn!("Failed to install BlockIO protocol: {:?}", status);
+                            }
+                        }
+                    }
                 }
             }
 
@@ -1629,5 +1993,27 @@ fn load_and_execute_bootloader<R: fs::gpt::SectorRead>(
         Ok(())
     } else {
         Err(exec_status)
+    }
+}
+
+/// Draw an early life sign on the framebuffer
+///
+/// Draws a bright magenta rectangle in the top-left corner to indicate
+/// that CrabEFI has started and the framebuffer is accessible.
+///
+/// This is called BEFORE serial/logging is initialized, so no log calls.
+fn draw_life_sign_early(fb: &coreboot::FramebufferInfo) {
+    const RECT_WIDTH: u32 = 64;
+    const RECT_HEIGHT: u32 = 64;
+
+    // Bright magenta color (easy to spot)
+    let (r, g, b): (u8, u8, u8) = (255, 0, 255);
+
+    unsafe {
+        for y in 0..RECT_HEIGHT.min(fb.y_resolution) {
+            for x in 0..RECT_WIDTH.min(fb.x_resolution) {
+                fb.write_pixel(x, y, r, g, b);
+            }
+        }
     }
 }
