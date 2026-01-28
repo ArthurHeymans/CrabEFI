@@ -34,8 +34,8 @@ use crate::efi;
 use spin::Mutex;
 
 // Re-import from standard library (use :: prefix to avoid conflict with our core module)
-use core::mem;
-use core::ptr;
+use ::core::mem;
+use ::core::ptr;
 
 // ============================================================================
 // Controller Type Abstraction
@@ -470,13 +470,10 @@ impl UsbController for XhciController {
     }
 
     fn find_hid_keyboard(&self) -> Option<u8> {
-        // Check all slots for HID devices
+        // Check all slots for HID keyboard devices
         for slot_id in 0..4u8 {
             if let Some(slot) = self.get_slot(slot_id) {
-                // Check device class - HID is 0x03
-                let class = slot.device_desc.device_class;
-                if class == 0x03 || class == 0x00 {
-                    // Could be HID, check interface
+                if slot.is_hid_keyboard {
                     return Some(slot_id);
                 }
             }
@@ -494,8 +491,8 @@ impl UsbController for XhciController {
             product_id: slot.device_desc.product_id,
             device_class: slot.device_desc.device_class,
             is_mass_storage: slot.is_mass_storage,
-            is_hid: slot.device_desc.device_class == 0x03,
-            is_keyboard: false, // Would need to check interface
+            is_hid: slot.is_hid_keyboard || slot.device_desc.device_class == 0x03,
+            is_keyboard: slot.is_hid_keyboard,
         })
     }
 
@@ -529,9 +526,19 @@ impl UsbController for XhciController {
         Some((bulk_in, bulk_out))
     }
 
-    fn get_interrupt_endpoint(&self, _device: u8) -> Option<self::core::EndpointInfo> {
-        // xHCI doesn't store interrupt endpoint info currently
-        // Would need to re-parse config descriptor
-        None
+    fn get_interrupt_endpoint(&self, device: u8) -> Option<self::core::EndpointInfo> {
+        let slot = self.get_slot(device)?;
+        if !slot.is_hid_keyboard || slot.interrupt_in_ep == 0 {
+            return None;
+        }
+
+        Some(self::core::EndpointInfo {
+            number: slot.interrupt_in_ep,
+            direction: self::core::Direction::In,
+            transfer_type: self::core::EndpointType::Interrupt,
+            max_packet_size: slot.interrupt_max_packet,
+            interval: slot.interrupt_interval,
+            toggle: false,
+        })
     }
 }

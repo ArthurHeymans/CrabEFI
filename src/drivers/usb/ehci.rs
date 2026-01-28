@@ -421,6 +421,74 @@ impl EhciController {
     /// DMA buffer size (64KB)
     const DMA_BUFFER_SIZE: usize = 64 * 1024;
 
+    /// EHCI Extended Capability: USB Legacy Support
+    const EHCI_CAP_LEGACY: u8 = 0x01;
+
+    /// USBLEGSUP register offsets
+    const USBLEGSUP_OFFSET: u8 = 0x00;
+    const USBLEGCTLSTS_OFFSET: u8 = 0x04;
+
+    /// USBLEGSUP bits
+    const USBLEGSUP_BIOS_OWNED: u32 = 1 << 16;
+    const USBLEGSUP_OS_OWNED: u32 = 1 << 24;
+
+    /// Take ownership of the controller from BIOS/SMM
+    ///
+    /// EHCI has an optional extended capability for BIOS ownership handoff.
+    /// We need to claim ownership before initializing the controller.
+    fn take_bios_ownership(pci_addr: PciAddress, hccparams: u32) {
+        // EECP (Extended Capabilities Pointer) is in bits 15:8
+        let mut eecp = ((hccparams >> 8) & 0xFF) as u8;
+
+        if eecp == 0 {
+            // No extended capabilities
+            return;
+        }
+
+        // Walk the capability chain looking for USBLEGSUP (cap ID 0x01)
+        while eecp >= 0x40 {
+            let cap = pci::read_config_u32(pci_addr, eecp);
+            let cap_id = (cap & 0xFF) as u8;
+            let next_ptr = ((cap >> 8) & 0xFF) as u8;
+
+            if cap_id == Self::EHCI_CAP_LEGACY {
+                // Found USBLEGSUP - check if BIOS owns it
+                if (cap & Self::USBLEGSUP_BIOS_OWNED) != 0 {
+                    log::debug!("EHCI: Taking ownership from BIOS (USBLEGSUP={:#010x})", cap);
+
+                    // Set OS owned semaphore
+                    pci::write_config_u32(pci_addr, eecp, cap | Self::USBLEGSUP_OS_OWNED);
+
+                    // Wait for BIOS to release (up to 1 second)
+                    let timeout = Timeout::from_ms(1000);
+                    while !timeout.is_expired() {
+                        let new_cap = pci::read_config_u32(pci_addr, eecp);
+                        if (new_cap & Self::USBLEGSUP_BIOS_OWNED) == 0 {
+                            log::debug!("EHCI: BIOS released ownership");
+                            break;
+                        }
+                        crate::time::delay_ms(10);
+                    }
+
+                    // Clear any SMI enables in USBLEGCTLSTS
+                    let ctlsts_offset = eecp + Self::USBLEGCTLSTS_OFFSET;
+                    let ctlsts = pci::read_config_u32(pci_addr, ctlsts_offset);
+                    // Clear SMI enable bits (bits 0-6, 13-15, 29, 31) but preserve status bits
+                    let new_ctlsts = ctlsts & 0x1FFF1FFF;
+                    if ctlsts != new_ctlsts {
+                        pci::write_config_u32(pci_addr, ctlsts_offset, new_ctlsts);
+                    }
+                }
+                break;
+            }
+
+            eecp = next_ptr;
+            if eecp == 0 {
+                break;
+            }
+        }
+    }
+
     /// Create a new EHCI controller from a PCI device
     pub fn new(pci_dev: &PciDevice) -> Result<Self, UsbError> {
         let mmio_base = pci_dev.mmio_base().ok_or(UsbError::NotReady)?;
@@ -435,11 +503,14 @@ impl EhciController {
 
         let hcsparams =
             unsafe { ptr::read_volatile((mmio_base + cap_regs::HCSPARAMS as u64) as *const u32) };
-        let _hccparams =
+        let hccparams =
             unsafe { ptr::read_volatile((mmio_base + cap_regs::HCCPARAMS as u64) as *const u32) };
 
         let num_ports = (hcsparams & 0xF) as u8;
         let op_base = mmio_base + caplength as u64;
+
+        // Take ownership from BIOS/SMM before doing anything else
+        Self::take_bios_ownership(pci_dev.address, hccparams);
 
         log::info!(
             "EHCI version: {}.{:02}, ports: {}",
@@ -502,67 +573,99 @@ impl EhciController {
         unsafe { ptr::write_volatile(addr as *mut u32, value) }
     }
 
-    /// Initialize the controller
-    fn init(&mut self) -> Result<(), UsbError> {
-        // Stop the controller
-        let cmd = self.read_op_reg(op_regs::USBCMD);
-        self.write_op_reg(op_regs::USBCMD, cmd & !usbcmd::RS);
+    /// Enable or disable async schedule and wait for status to match
+    fn set_async_schedule(&mut self, enable: bool) -> Result<(), UsbError> {
+        // Memory barrier before modifying schedule
+        fence(Ordering::SeqCst);
 
-        // Wait for halt
+        let cmd = self.read_op_reg(op_regs::USBCMD);
+        if enable {
+            self.write_op_reg(op_regs::USBCMD, cmd | usbcmd::ASE);
+        } else {
+            self.write_op_reg(op_regs::USBCMD, cmd & !usbcmd::ASE);
+        }
+
+        // Wait for status to match (up to 100ms)
+        let expected = if enable { usbsts::ASS } else { 0 };
         let timeout = Timeout::from_ms(100);
         while !timeout.is_expired() {
-            if self.read_op_reg(op_regs::USBSTS) & usbsts::HCHALTED != 0 {
-                break;
+            if (self.read_op_reg(op_regs::USBSTS) & usbsts::ASS) == expected {
+                return Ok(());
             }
-            core::hint::spin_loop();
+            crate::time::delay_ms(1);
         }
 
-        // Reset the controller
-        self.write_op_reg(op_regs::USBCMD, usbcmd::HCRESET);
+        log::warn!("EHCI: async schedule status change timed out");
+        Err(UsbError::Timeout)
+    }
 
-        let timeout = Timeout::from_ms(500);
+    /// Enable or disable periodic schedule and wait for status to match
+    fn set_periodic_schedule(&mut self, enable: bool) -> Result<(), UsbError> {
+        let cmd = self.read_op_reg(op_regs::USBCMD);
+        if enable {
+            self.write_op_reg(op_regs::USBCMD, cmd | usbcmd::PSE);
+        } else {
+            self.write_op_reg(op_regs::USBCMD, cmd & !usbcmd::PSE);
+        }
+
+        // Wait for status to match (up to 100ms)
+        let expected = if enable { usbsts::PSS } else { 0 };
+        let timeout = Timeout::from_ms(100);
         while !timeout.is_expired() {
-            if self.read_op_reg(op_regs::USBCMD) & usbcmd::HCRESET == 0 {
-                break;
+            if (self.read_op_reg(op_regs::USBSTS) & usbsts::PSS) == expected {
+                return Ok(());
             }
-            core::hint::spin_loop();
+            crate::time::delay_ms(1);
         }
 
-        if self.read_op_reg(op_regs::USBCMD) & usbcmd::HCRESET != 0 {
-            return Err(UsbError::Timeout);
-        }
+        log::warn!("EHCI: periodic schedule status change timed out");
+        Err(UsbError::Timeout)
+    }
 
-        // Set up async list head (circular, pointing to itself)
-        let qh = unsafe { &mut *(self.async_qh as *mut QueueHead) };
-        qh.horiz_link_ptr = (self.async_qh as u32) | 2; // QH type
-        qh.ep_chars = 1 << 15; // Head of Reclamation List Flag
-        qh.overlay.next_qtd = 1; // Terminated
-        qh.overlay.alt_qtd = 1;
-        qh.overlay.token = 0;
+    /// Initialize the controller
+    /// Following libpayload's ehci_init pattern - start controller first, then configure
+    fn init(&mut self) -> Result<(), UsbError> {
+        // Set 64-bit segment to 0 if controller supports 64-bit addressing
+        self.write_op_reg(op_regs::CTRLDSSEGMENT, 0);
 
-        // Configure the controller
-        self.write_op_reg(op_regs::USBINTR, 0); // Disable interrupts
-        self.write_op_reg(op_regs::PERIODICLISTBASE, self.periodic_list as u32);
-        self.write_op_reg(op_regs::ASYNCLISTADDR, self.async_qh as u32);
-        self.write_op_reg(op_regs::CTRLDSSEGMENT, 0); // Use 32-bit addresses
+        // Start the controller first (just RS, no schedule enables yet)
+        self.write_op_reg(op_regs::USBCMD, usbcmd::RS);
 
-        // Set configured flag (take ownership from companion controllers)
+        // Take ownership from companion controllers
         self.write_op_reg(op_regs::CONFIGFLAG, 1);
 
-        // Start the controller
-        let cmd = usbcmd::RS | usbcmd::ASE | usbcmd::FLS_1024 | usbcmd::ITC_8;
-        self.write_op_reg(op_regs::USBCMD, cmd);
+        // Initialize dummy QH for periodic list (helps with broken controllers)
+        let dummy_qh = unsafe { &mut *(self.async_qh as *mut QueueHead) };
+        dummy_qh.horiz_link_ptr = 1; // Terminate
+        dummy_qh.ep_chars = 0;
+        dummy_qh.ep_caps = 0;
+        dummy_qh.cur_qtd = 0;
+        dummy_qh.overlay.next_qtd = 1; // Terminate
+        dummy_qh.overlay.alt_qtd = 1;
+        dummy_qh.overlay.token = 0;
 
-        // Wait for running
-        let timeout = Timeout::from_ms(100);
-        while !timeout.is_expired() {
-            if self.read_op_reg(op_regs::USBSTS) & usbsts::HCHALTED == 0 {
-                break;
+        // Fill periodic list with dummy QH
+        let periodic = self.periodic_list as *mut u32;
+        for i in 0..1024 {
+            unsafe {
+                ptr::write_volatile(periodic.add(i), (self.async_qh as u32) | 2);
+                // QH type
             }
-            core::hint::spin_loop();
         }
 
-        // Wait a bit for ports to stabilize
+        // Disable interrupts
+        self.write_op_reg(op_regs::USBINTR, 0);
+
+        // Disable periodic schedule first
+        let _ = self.set_periodic_schedule(false);
+
+        // Set periodic frame list base
+        self.write_op_reg(op_regs::PERIODICLISTBASE, self.periodic_list as u32);
+
+        // Enable periodic schedule
+        let _ = self.set_periodic_schedule(true);
+
+        // Wait for ports to stabilize
         crate::time::delay_ms(100);
 
         log::info!("EHCI controller initialized");
@@ -828,12 +931,22 @@ impl EhciController {
         qh.overlay.next_qtd = qtd_base as u32;
         qh.cur_qtd = 0;
 
-        // Insert QH into async list
-        let head_qh = unsafe { &mut *(self.async_qh as *mut QueueHead) };
-        qh.horiz_link_ptr = head_qh.horiz_link_ptr;
+        // Make QH point to itself (circular) with H flag (head of reclamation list)
+        qh.horiz_link_ptr = (qh_addr as u32) | 2; // QH type, points to self
+        qh.ep_chars |= 1 << 15; // H flag - head of reclamation list
         fence(Ordering::SeqCst);
-        head_qh.horiz_link_ptr = (qh_addr as u32) | 2; // QH type
+
+        // Disable async schedule first (following libpayload pattern)
+        let _ = self.set_async_schedule(false);
+
+        // Set async list address to our QH
+        self.write_op_reg(op_regs::ASYNCLISTADDR, qh_addr as u32);
         fence(Ordering::SeqCst);
+
+        // Enable async schedule and wait for it to start
+        if self.set_async_schedule(true).is_err() {
+            return Err(UsbError::Timeout);
+        }
 
         // Wait for completion
         let timeout = Timeout::from_ms(5000);
@@ -842,25 +955,11 @@ impl EhciController {
             if status_qtd.is_complete() {
                 break;
             }
-            core::hint::spin_loop();
+            crate::time::delay_ms(1);
         }
 
-        // Remove QH from async list
-        head_qh.horiz_link_ptr = qh.horiz_link_ptr;
-        fence(Ordering::SeqCst);
-
-        // Ring doorbell to ensure removal
-        let cmd = self.read_op_reg(op_regs::USBCMD);
-        self.write_op_reg(op_regs::USBCMD, cmd | usbcmd::IAAD);
-
-        let timeout = Timeout::from_ms(100);
-        while !timeout.is_expired() {
-            if self.read_op_reg(op_regs::USBSTS) & usbsts::IAA != 0 {
-                self.write_op_reg(op_regs::USBSTS, usbsts::IAA);
-                break;
-            }
-            core::hint::spin_loop();
-        }
+        // Disable async schedule
+        let _ = self.set_async_schedule(false);
 
         // Check for errors
         if !status_qtd.is_complete() {
@@ -989,12 +1088,22 @@ impl UsbController for EhciController {
         qh.overlay.next_qtd = qtd_addr as u32;
         qh.cur_qtd = 0;
 
-        // Insert into async list
-        let head_qh = unsafe { &mut *(self.async_qh as *mut QueueHead) };
-        qh.horiz_link_ptr = head_qh.horiz_link_ptr;
+        // Make QH point to itself (circular) with H flag
+        qh.horiz_link_ptr = (qh_addr as u32) | 2; // QH type, points to self
+        qh.ep_chars |= 1 << 15; // H flag - head of reclamation list
         fence(Ordering::SeqCst);
-        head_qh.horiz_link_ptr = (qh_addr as u32) | 2;
+
+        // Disable async schedule first (following libpayload pattern)
+        let _ = self.set_async_schedule(false);
+
+        // Set async list address to our QH
+        self.write_op_reg(op_regs::ASYNCLISTADDR, qh_addr as u32);
         fence(Ordering::SeqCst);
+
+        // Enable async schedule and wait for it to start
+        if self.set_async_schedule(true).is_err() {
+            return Err(UsbError::Timeout);
+        }
 
         // Wait for completion
         let timeout = Timeout::from_ms(5000);
@@ -1003,12 +1112,11 @@ impl UsbController for EhciController {
             if qtd.is_complete() {
                 break;
             }
-            core::hint::spin_loop();
+            crate::time::delay_ms(1);
         }
 
-        // Remove from list
-        head_qh.horiz_link_ptr = qh.horiz_link_ptr;
-        fence(Ordering::SeqCst);
+        // Disable async schedule
+        let _ = self.set_async_schedule(false);
 
         // Check result
         if !qtd.is_complete() {

@@ -587,6 +587,14 @@ pub struct UsbSlot {
     pub bulk_out_ep: u8,
     /// Max packet size for bulk endpoints
     pub bulk_max_packet: u16,
+    /// Is this a HID keyboard device?
+    pub is_hid_keyboard: bool,
+    /// Interrupt IN endpoint for HID
+    pub interrupt_in_ep: u8,
+    /// Max packet size for interrupt endpoint
+    pub interrupt_max_packet: u16,
+    /// Polling interval for interrupt endpoint (in ms)
+    pub interrupt_interval: u8,
 }
 
 /// xHCI Controller
@@ -647,6 +655,77 @@ pub enum XhciError {
 }
 
 impl XhciController {
+    /// xHCI Extended Capability: USB Legacy Support
+    const XHCI_CAP_LEGACY: u8 = 0x01;
+
+    /// USBLEGSUP register offsets (within the extended capability)
+    const USBLEGSUP_BIOS_OWNED: u32 = 1 << 16;
+    const USBLEGSUP_OS_OWNED: u32 = 1 << 24;
+
+    /// Take ownership of the controller from BIOS/SMM
+    ///
+    /// xHCI has an optional extended capability for BIOS ownership handoff.
+    /// Unlike EHCI, xHCI extended capabilities are memory-mapped, not in PCI config space.
+    /// The xECP (Extended Capabilities Pointer) is in HCCPARAMS1 bits 31:16.
+    fn take_bios_ownership(mmio_base: u64, hccparams1: u32) {
+        // xECP is in bits 31:16, gives offset in DWORDs from mmio_base
+        let xecp = ((hccparams1 >> 16) & 0xFFFF) as u64;
+
+        if xecp == 0 {
+            // No extended capabilities
+            return;
+        }
+
+        let mut cap_addr = mmio_base + (xecp * 4);
+
+        // Walk the capability chain looking for USBLEGSUP (cap ID 0x01)
+        loop {
+            let cap = unsafe { ptr::read_volatile(cap_addr as *const u32) };
+            let cap_id = (cap & 0xFF) as u8;
+            let next_ptr = ((cap >> 8) & 0xFF) as u8;
+
+            if cap_id == Self::XHCI_CAP_LEGACY {
+                // Found USBLEGSUP - check if BIOS owns it
+                if (cap & Self::USBLEGSUP_BIOS_OWNED) != 0 {
+                    log::debug!("xHCI: Taking ownership from BIOS (USBLEGSUP={:#010x})", cap);
+
+                    // Set OS owned semaphore
+                    unsafe {
+                        ptr::write_volatile(cap_addr as *mut u32, cap | Self::USBLEGSUP_OS_OWNED);
+                    }
+
+                    // Wait for BIOS to release (up to 1 second)
+                    let timeout = Timeout::from_ms(1000);
+                    while !timeout.is_expired() {
+                        let new_cap = unsafe { ptr::read_volatile(cap_addr as *const u32) };
+                        if (new_cap & Self::USBLEGSUP_BIOS_OWNED) == 0 {
+                            log::debug!("xHCI: BIOS released ownership");
+                            break;
+                        }
+                        crate::time::delay_ms(10);
+                    }
+
+                    // Clear any SMI enables in USBLEGCTLSTS (at offset +4)
+                    let ctlsts_addr = cap_addr + 4;
+                    let ctlsts = unsafe { ptr::read_volatile(ctlsts_addr as *const u32) };
+                    // Clear SMI enable bits but preserve status bits
+                    // Bits 0-4: SMI enables, Bits 16-20: SMI status (write-1-to-clear)
+                    // Clear enables (set to 0), clear any pending status (write 1s)
+                    let new_ctlsts = (ctlsts & 0xFFFF0000) | 0x00000000;
+                    unsafe {
+                        ptr::write_volatile(ctlsts_addr as *mut u32, new_ctlsts);
+                    }
+                }
+                break;
+            }
+
+            if next_ptr == 0 {
+                break;
+            }
+            cap_addr = mmio_base + (next_ptr as u64 * 4);
+        }
+    }
+
     /// Create a new xHCI controller from a PCI device
     pub fn new(pci_dev: &PciDevice) -> Result<Self, XhciError> {
         let mmio_base = pci_dev.mmio_base().ok_or(XhciError::NotReady)?;
@@ -662,7 +741,7 @@ impl XhciController {
 
         let hcsparams1 =
             unsafe { ptr::read_volatile((mmio_base + cap_regs::HCSPARAMS1 as u64) as *const u32) };
-        let _hccparams1 =
+        let hccparams1 =
             unsafe { ptr::read_volatile((mmio_base + cap_regs::HCCPARAMS1 as u64) as *const u32) };
         let dboff =
             unsafe { ptr::read_volatile((mmio_base + cap_regs::DBOFF as u64) as *const u32) };
@@ -670,6 +749,9 @@ impl XhciController {
             unsafe { ptr::read_volatile((mmio_base + cap_regs::RTSOFF as u64) as *const u32) };
 
         let op_base = mmio_base + caplength as u64;
+
+        // Take ownership from BIOS/SMM before doing anything else
+        Self::take_bios_ownership(mmio_base, hccparams1);
         let rt_base = mmio_base + (rtsoff & !0x1F) as u64;
         let db_base = mmio_base + (dboff & !0x3) as u64;
 
@@ -1039,6 +1121,10 @@ impl XhciController {
             bulk_in_ep: 0,
             bulk_out_ep: 0,
             bulk_max_packet: 0,
+            is_hid_keyboard: false,
+            interrupt_in_ep: 0,
+            interrupt_max_packet: 0,
+            interrupt_interval: 0,
         });
 
         Ok(())
@@ -1223,11 +1309,17 @@ impl XhciController {
                                 slot.device_desc = desc;
                             }
 
-                            // Check for mass storage (class 0x08)
+                            // Try to configure as mass storage (class 0x08)
                             if class == 0x08 || (class == 0x00 && num_configs > 0) {
-                                // Try to configure as mass storage
                                 if let Err(e) = self.configure_mass_storage(slot_id) {
                                     log::debug!("Not a mass storage device: {:?}", e);
+                                }
+                            }
+
+                            // Try to configure as HID keyboard (class 0x03 or class 0x00)
+                            if class == 0x03 || (class == 0x00 && num_configs > 0) {
+                                if let Err(e) = self.configure_hid_keyboard(slot_id) {
+                                    log::debug!("Not a HID keyboard: {:?}", e);
                                 }
                             }
                         }
@@ -1354,6 +1446,121 @@ impl XhciController {
         }
 
         log::info!("USB Mass Storage device configured on slot {}", slot_id);
+        Ok(())
+    }
+
+    /// Configure a HID keyboard device
+    fn configure_hid_keyboard(&mut self, slot_id: u8) -> Result<(), XhciError> {
+        // Get configuration descriptor
+        let mut config_buf = [0u8; 256];
+
+        // First get just the header
+        let mut header = [0u8; 9];
+        self.control_transfer(
+            slot_id,
+            usb_req_type::DIR_IN | usb_req_type::TYPE_STANDARD | usb_req_type::RCPT_DEVICE,
+            usb_req::GET_DESCRIPTOR,
+            (usb_desc_type::CONFIGURATION as u16) << 8,
+            0,
+            Some(&mut header),
+        )?;
+
+        let total_len = u16::from_le_bytes([header[2], header[3]]) as usize;
+        let total_len = total_len.min(config_buf.len());
+
+        // Get full configuration
+        self.control_transfer(
+            slot_id,
+            usb_req_type::DIR_IN | usb_req_type::TYPE_STANDARD | usb_req_type::RCPT_DEVICE,
+            usb_req::GET_DESCRIPTOR,
+            (usb_desc_type::CONFIGURATION as u16) << 8,
+            0,
+            Some(&mut config_buf[..total_len]),
+        )?;
+
+        // Parse configuration to find HID keyboard interface
+        let mut offset = 9; // Skip config descriptor
+        let mut interrupt_in = 0u8;
+        let mut interrupt_max_packet = 0u16;
+        let mut interrupt_interval = 0u8;
+        let mut is_hid_keyboard = false;
+        let mut _interface_num = 0u8;
+
+        while offset < total_len {
+            let len = config_buf[offset] as usize;
+            if len == 0 {
+                break;
+            }
+
+            let desc_type = config_buf[offset + 1];
+
+            if desc_type == usb_desc_type::INTERFACE && offset + 9 <= total_len {
+                let iface = unsafe {
+                    ptr::read_unaligned(
+                        config_buf[offset..].as_ptr() as *const UsbInterfaceDescriptor
+                    )
+                };
+
+                // HID class = 0x03, boot subclass = 0x01, keyboard protocol = 0x01
+                if iface.interface_class == 0x03
+                    && iface.interface_subclass == 0x01
+                    && iface.interface_protocol == 0x01
+                {
+                    is_hid_keyboard = true;
+                    _interface_num = iface.interface_number;
+                    log::info!("  Found USB HID Keyboard interface {}", _interface_num);
+                }
+            } else if desc_type == usb_desc_type::ENDPOINT
+                && offset + 7 <= total_len
+                && is_hid_keyboard
+            {
+                let ep = unsafe {
+                    ptr::read_unaligned(
+                        config_buf[offset..].as_ptr() as *const UsbEndpointDescriptor
+                    )
+                };
+
+                // Interrupt endpoint (type 3)
+                if (ep.attributes & 0x03) == 0x03 {
+                    let ep_addr = ep.endpoint_address;
+                    let max_packet = ep.max_packet_size;
+                    let interval = ep.interval;
+
+                    if ep_addr & 0x80 != 0 {
+                        // IN endpoint
+                        interrupt_in = ep_addr & 0x0F;
+                        interrupt_max_packet = max_packet;
+                        interrupt_interval = interval;
+                        log::debug!(
+                            "    Interrupt IN EP: {} max_packet: {} interval: {}",
+                            interrupt_in,
+                            max_packet,
+                            interval
+                        );
+                    }
+                }
+            }
+
+            offset += len;
+        }
+
+        if !is_hid_keyboard || interrupt_in == 0 {
+            return Err(XhciError::DeviceNotFound);
+        }
+
+        // Set configuration
+        let config_value = config_buf[5]; // bConfigurationValue
+        self.set_configuration(slot_id, config_value)?;
+
+        // Update slot info (but don't configure endpoint - we use control transfers for HID)
+        if let Some(slot) = &mut self.slots[slot_id as usize] {
+            slot.is_hid_keyboard = true;
+            slot.interrupt_in_ep = interrupt_in;
+            slot.interrupt_max_packet = interrupt_max_packet;
+            slot.interrupt_interval = interrupt_interval;
+        }
+
+        log::info!("USB HID Keyboard configured on slot {}", slot_id);
         Ok(())
     }
 

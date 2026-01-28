@@ -508,8 +508,43 @@ impl UhciController {
         }
     }
 
+    /// Disable UHCI legacy support (BIOS keyboard/mouse emulation)
+    ///
+    /// UHCI has a legacy support register at PCI config offset 0xC0 (USBLEGSUP)
+    /// that enables BIOS keyboard/mouse emulation via SMM. We need to disable
+    /// this before taking control of the controller.
+    fn disable_legacy_support(&mut self) {
+        // UHCI legacy support register is at PCI config offset 0xC0
+        const USBLEGSUP: u8 = 0xC0;
+
+        let legsup = pci::read_config_u16(self.pci_address, USBLEGSUP);
+
+        // Clear legacy support bits:
+        // Bit 13: PIRQ enable (disable SMM interrupt routing)
+        // Bit 4: Trap by 64h write
+        // Bit 3: Trap by 64h read
+        // Bit 2: Trap by 60h write
+        // Bit 1: Trap by 60h read
+        // Bit 0: SMI at end of pass-through
+        // Mask 0xDF80 clears bits 0-6 and bit 13 (from libpayload)
+        let new_legsup = legsup & 0xDF80;
+
+        if legsup != new_legsup {
+            log::debug!(
+                "UHCI: Disabling legacy support: {:#06x} -> {:#06x}",
+                legsup,
+                new_legsup
+            );
+            pci::write_config_u16(self.pci_address, USBLEGSUP, new_legsup);
+            crate::time::delay_ms(1);
+        }
+    }
+
     /// Initialize the controller
     fn init(&mut self) -> Result<(), UsbError> {
+        // First disable legacy support (BIOS keyboard emulation via SMM)
+        self.disable_legacy_support();
+
         // Stop the controller
         self.outw(regs::USBCMD, 0);
 

@@ -515,3 +515,47 @@ pub fn set_ecam_base(base: u64) {
     *ECAM_BASE.lock() = Some(base);
     log::debug!("ECAM base set to {:#x}", base);
 }
+
+// ============================================================================
+// Public PCI Configuration Space Access
+// ============================================================================
+
+/// Read a 32-bit value from PCI configuration space
+pub fn read_config_u32(addr: PciAddress, offset: u8) -> u32 {
+    pci_read_config_u32(addr, offset)
+}
+
+/// Write a 32-bit value to PCI configuration space
+pub fn write_config_u32(addr: PciAddress, offset: u8, value: u32) {
+    pci_write_config_u32(addr, offset, value)
+}
+
+/// Read a 16-bit value from PCI configuration space
+pub fn read_config_u16(addr: PciAddress, offset: u8) -> u16 {
+    pci_read_config_u16(addr, offset)
+}
+
+/// Write a 16-bit value to PCI configuration space
+pub fn write_config_u16(addr: PciAddress, offset: u8, value: u16) {
+    let aligned_offset = offset & 0xFC;
+    let shift = (offset & 0x02) * 8;
+    let current = pci_read_config_u32(addr, aligned_offset);
+    let mask = !(0xFFFF_u32 << shift);
+    let new_value = (current & mask) | ((value as u32) << shift);
+    pci_write_config_u32(addr, aligned_offset, new_value);
+}
+
+/// Read an 8-bit value from PCI configuration space
+pub fn read_config_u8(addr: PciAddress, offset: u8) -> u8 {
+    pci_read_config_u8(addr, offset)
+}
+
+/// Write an 8-bit value to PCI configuration space
+pub fn write_config_u8(addr: PciAddress, offset: u8, value: u8) {
+    let aligned_offset = offset & 0xFC;
+    let shift = (offset & 0x03) * 8;
+    let current = pci_read_config_u32(addr, aligned_offset);
+    let mask = !(0xFF_u32 << shift);
+    let new_value = (current & mask) | ((value as u32) << shift);
+    pci_write_config_u32(addr, aligned_offset, new_value);
+}
