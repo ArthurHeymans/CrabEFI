@@ -1581,3 +1581,37 @@ pub fn get_controller(index: usize) -> Option<&'static mut XhciController> {
 // Ensure XhciController can be sent between threads
 unsafe impl Send for XhciController {}
 unsafe impl Send for UsbSlot {}
+
+// ============================================================================
+// Helper functions for trait implementation (avoid name collision)
+// ============================================================================
+
+/// Perform a control transfer on an xHCI controller
+///
+/// This is a helper function to allow calling from the UsbController trait implementation
+/// without method name collision.
+pub fn do_control_transfer(
+    controller: &mut XhciController,
+    slot_id: u8,
+    request_type: u8,
+    request: u8,
+    value: u16,
+    index: u16,
+    data: Option<&mut [u8]>,
+) -> Result<usize, XhciError> {
+    controller.control_transfer(slot_id, request_type, request, value, index, data)
+}
+
+/// Perform a bulk transfer on an xHCI controller
+///
+/// This is a helper function to allow calling from the UsbController trait implementation
+/// without method name collision.
+pub fn do_bulk_transfer(
+    controller: &mut XhciController,
+    slot_id: u8,
+    endpoint: u8,
+    is_in: bool,
+    data: &mut [u8],
+) -> Result<usize, XhciError> {
+    controller.bulk_transfer(slot_id, endpoint, is_in, data)
+}
