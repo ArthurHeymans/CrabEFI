@@ -199,6 +199,13 @@ pub fn write_fmt(args: fmt::Arguments) {
     }
 }
 
+/// Write a single byte to the serial port
+pub fn write_byte(byte: u8) {
+    if let Some(ref mut serial) = *SERIAL.lock() {
+        serial.write_byte(byte);
+    }
+}
+
 /// Macro for printing to serial
 #[macro_export]
 macro_rules! serial_print {

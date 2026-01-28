@@ -82,16 +82,36 @@ pub fn init(coreboot_table_ptr: u64) {
     }
     log::info!("  Memory regions: {}", cb_info.memory_map.len());
 
+    // Print memory map summary
+    let total_ram: u64 = cb_info
+        .memory_map
+        .iter()
+        .filter(|r| r.region_type == coreboot::memory::MemoryType::Ram)
+        .map(|r| r.size)
+        .sum();
+    log::info!("  Total RAM: {} MB", total_ram / (1024 * 1024));
+
     // Initialize paging
     #[cfg(target_arch = "x86_64")]
     arch::x86_64::paging::init(&cb_info.memory_map);
 
+    // Initialize EFI environment
+    efi::init(&cb_info);
+
     log::info!("CrabEFI initialized successfully!");
+    log::info!("EFI System Table at: {:p}", efi::get_system_table());
 
-    // TODO: Initialize EFI system table
-    // TODO: Load and start boot loader
+    // At this point, we would:
+    // 1. Look for ESP (EFI System Partition) on storage devices
+    // 2. Read /EFI/BOOT/BOOTX64.EFI from the ESP
+    // 3. Load and execute it using pe::load_image() and pe::execute_image()
+    //
+    // For now, we just wait since we don't have storage drivers yet (Phase 3)
 
-    // For now, just loop
+    log::info!("Waiting for storage drivers (Phase 3) to load boot applications...");
+    log::info!("Press Ctrl+A X to exit QEMU");
+
+    // Halt and wait
     loop {
         #[cfg(target_arch = "x86_64")]
         unsafe {
