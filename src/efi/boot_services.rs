@@ -1216,6 +1216,9 @@ extern "efiapi" fn exit_boot_services(image_handle: Handle, map_key: usize) -> S
         // Re-enable keyboard interrupts so Linux's i8042 driver works
         crate::drivers::keyboard::cleanup();
 
+        // Stop and reset USB controllers so Linux can reinitialize them
+        crate::drivers::usb::cleanup();
+
         // CRITICAL: Set boot_services pointer to NULL in SystemTable
         // This is REQUIRED by UEFI spec and Linux checks for this!
         unsafe {
