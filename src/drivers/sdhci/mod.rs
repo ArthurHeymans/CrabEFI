@@ -10,8 +10,9 @@ use crate::drivers::pci::{self, PciAddress, PciDevice};
 use crate::efi;
 use crate::time::Timeout;
 use core::ptr;
-use core::sync::atomic::{fence, Ordering};
+use core::sync::atomic::{Ordering, fence};
 use spin::Mutex;
+use tock_registers::interfaces::{ReadWriteable, Readable, Writeable};
 
 use regs::*;
 
@@ -77,15 +78,15 @@ pub enum SdhciError {
 pub struct SdhciController {
     /// PCI address (bus:device.function)
     pci_address: PciAddress,
-    /// MMIO base address
-    mmio_base: u64,
+    /// Pointer to MMIO registers
+    regs: *const SdhciRegisters,
     /// SDHCI specification version
     version: u8,
     /// Maximum base clock frequency (Hz)
     max_clock: u32,
-    /// Capabilities register value
+    /// Capabilities register value (cached)
     capabilities: u32,
-    /// Capabilities 1 register value
+    /// Capabilities 1 register value (cached)
     capabilities_1: u32,
     /// Card is present
     card_present: bool,
@@ -112,9 +113,16 @@ pub struct SdhciController {
 unsafe impl Send for SdhciController {}
 
 impl SdhciController {
+    /// Get reference to registers
+    #[inline]
+    fn regs(&self) -> &SdhciRegisters {
+        unsafe { &*self.regs }
+    }
+
     /// Create a new SDHCI controller from a PCI device
     pub fn new(pci_dev: &PciDevice) -> Result<Self, SdhciError> {
         let mmio_base = pci_dev.mmio_base().ok_or(SdhciError::NotInitialized)?;
+        let regs = mmio_base as *const SdhciRegisters;
 
         // Enable the device (bus master + memory space)
         pci::enable_device(pci_dev);
@@ -124,7 +132,7 @@ impl SdhciController {
 
         let mut controller = Self {
             pci_address: pci_dev.address,
-            mmio_base,
+            regs,
             version: 0,
             max_clock: 0,
             capabilities: 0,
@@ -144,60 +152,84 @@ impl SdhciController {
 
     /// Initialize the SDHCI controller
     fn init(&mut self) -> Result<(), SdhciError> {
-        // Read version
-        let version_reg = self.read_reg16(SDHCI_HOST_VERSION);
-        self.version = (version_reg & SDHCI_SPEC_VER_MASK) as u8;
+        // Read version and capabilities - extract values before assigning to self
+        let (version, vendor_version, capabilities, capabilities_1, base_clk) = {
+            let regs = self.regs();
+            let version = regs.host_version.read(HOST_VERSION::SPEC_VERSION) as u8;
+            let vendor_version = regs.host_version.read(HOST_VERSION::VENDOR_VERSION);
+            let capabilities = regs.capabilities.get();
+            let capabilities_1 = regs.capabilities_1.get();
+            let base_clk = regs.capabilities.read(CAPABILITIES::BASE_CLK_FREQ) as u32;
+            (
+                version,
+                vendor_version,
+                capabilities,
+                capabilities_1,
+                base_clk,
+            )
+        };
+
+        // Now assign to self
+        self.version = version;
+        self.capabilities = capabilities;
+        self.capabilities_1 = capabilities_1;
+        self.max_clock = base_clk * 1_000_000;
 
         log::info!(
             "SDHCI controller version: {}.0 (vendor: {:#x})",
             self.version + 1,
-            (version_reg >> 8) & 0xFF
+            vendor_version
         );
-
-        // Read capabilities
-        self.capabilities = self.read_reg32(SDHCI_CAPABILITIES);
-        self.capabilities_1 = self.read_reg32(SDHCI_CAPABILITIES_1);
 
         log::debug!("SDHCI capabilities: {:#010x}", self.capabilities);
         log::debug!("SDHCI capabilities_1: {:#010x}", self.capabilities_1);
 
-        // Calculate max clock from capabilities
-        if self.version >= SDHCI_SPEC_300 {
-            self.max_clock = ((self.capabilities & SDHCI_CLOCK_V3_BASE_MASK)
-                >> SDHCI_CLOCK_BASE_SHIFT) as u32
-                * 1_000_000;
-        } else {
-            self.max_clock = ((self.capabilities & SDHCI_CLOCK_BASE_MASK) >> SDHCI_CLOCK_BASE_SHIFT)
-                as u32
-                * 1_000_000;
-        }
-
         log::info!("SDHCI max clock: {} MHz", self.max_clock / 1_000_000);
 
-        // Log capabilities
-        if self.capabilities & SDHCI_CAN_DO_SDMA != 0 {
-            log::info!("SDHCI: SDMA supported");
-        }
-        if self.capabilities & SDHCI_CAN_DO_ADMA2 != 0 {
-            log::info!("SDHCI: ADMA2 supported");
-        }
-        if self.capabilities & SDHCI_CAN_DO_HISPD != 0 {
-            log::info!("SDHCI: High-speed supported");
-        }
-        if self.capabilities & SDHCI_CAN_VDD_330 != 0 {
-            log::info!("SDHCI: 3.3V supported");
+        // Log capabilities using typed reads
+        {
+            let regs = self.regs();
+            if regs.capabilities.is_set(CAPABILITIES::SUPPORT_SDMA) {
+                log::info!("SDHCI: SDMA supported");
+            }
+            if regs.capabilities.is_set(CAPABILITIES::SUPPORT_ADMA2) {
+                log::info!("SDHCI: ADMA2 supported");
+            }
+            if regs.capabilities.is_set(CAPABILITIES::SUPPORT_HIGHSPEED) {
+                log::info!("SDHCI: High-speed supported");
+            }
+            if regs.capabilities.is_set(CAPABILITIES::SUPPORT_3V3) {
+                log::info!("SDHCI: 3.3V supported");
+            }
         }
 
         // Reset the controller
-        self.reset(SDHCI_RESET_ALL)?;
+        self.reset_all()?;
 
-        // Set power
-        self.set_power(SDHCI_POWER_330)?;
+        // Set power to 3.3V
+        self.set_power_3v3()?;
 
         // Enable interrupts
-        let int_mask = SDHCI_INT_CMD_MASK | SDHCI_INT_DATA_MASK;
-        self.write_reg32(SDHCI_INT_ENABLE, int_mask);
-        self.write_reg32(SDHCI_SIGNAL_ENABLE, 0); // Polling mode, no signal interrupts
+        {
+            let regs = self.regs();
+            let int_mask = INT_STATUS::CMD_COMPLETE::SET
+                + INT_STATUS::TRANSFER_COMPLETE::SET
+                + INT_STATUS::DMA_INT::SET
+                + INT_STATUS::BUFFER_WRITE_READY::SET
+                + INT_STATUS::BUFFER_READ_READY::SET
+                + INT_STATUS::ERROR::SET
+                + INT_STATUS::CMD_TIMEOUT::SET
+                + INT_STATUS::CMD_CRC::SET
+                + INT_STATUS::CMD_END_BIT::SET
+                + INT_STATUS::CMD_INDEX::SET
+                + INT_STATUS::DATA_TIMEOUT::SET
+                + INT_STATUS::DATA_CRC::SET
+                + INT_STATUS::DATA_END_BIT::SET
+                + INT_STATUS::ADMA::SET;
+
+            regs.int_enable.write(int_mask);
+            regs.signal_enable.set(0); // Polling mode, no signal interrupts
+        }
 
         // Check for card presence
         self.card_present = self.detect_card();
@@ -216,35 +248,69 @@ impl SdhciController {
         Ok(())
     }
 
-    /// Reset the controller
-    fn reset(&mut self, mask: u8) -> Result<(), SdhciError> {
-        self.write_reg8(SDHCI_SOFTWARE_RESET, mask);
+    /// Reset the controller (all)
+    fn reset_all(&mut self) -> Result<(), SdhciError> {
+        let regs = self.regs();
+        regs.software_reset.write(SOFTWARE_RESET::RESET_ALL::SET);
 
         // Wait for reset to complete (up to 100ms)
         let timeout = Timeout::from_ms(100);
         while !timeout.is_expired() {
-            if self.read_reg8(SDHCI_SOFTWARE_RESET) & mask == 0 {
+            if !regs.software_reset.is_set(SOFTWARE_RESET::RESET_ALL) {
                 return Ok(());
             }
             core::hint::spin_loop();
         }
 
-        log::error!("SDHCI: Reset timeout (mask={:#x})", mask);
+        log::error!("SDHCI: Reset timeout");
         Err(SdhciError::ResetFailed)
     }
 
-    /// Set bus power
-    fn set_power(&mut self, voltage: u8) -> Result<(), SdhciError> {
+    /// Reset command line
+    fn reset_cmd(&mut self) -> Result<(), SdhciError> {
+        let regs = self.regs();
+        regs.software_reset.write(SOFTWARE_RESET::RESET_CMD::SET);
+
+        let timeout = Timeout::from_ms(100);
+        while !timeout.is_expired() {
+            if !regs.software_reset.is_set(SOFTWARE_RESET::RESET_CMD) {
+                return Ok(());
+            }
+            core::hint::spin_loop();
+        }
+        Err(SdhciError::ResetFailed)
+    }
+
+    /// Reset data line
+    fn reset_data(&mut self) -> Result<(), SdhciError> {
+        let regs = self.regs();
+        regs.software_reset.write(SOFTWARE_RESET::RESET_DATA::SET);
+
+        let timeout = Timeout::from_ms(100);
+        while !timeout.is_expired() {
+            if !regs.software_reset.is_set(SOFTWARE_RESET::RESET_DATA) {
+                return Ok(());
+            }
+            core::hint::spin_loop();
+        }
+        Err(SdhciError::ResetFailed)
+    }
+
+    /// Set bus power to 3.3V
+    fn set_power_3v3(&mut self) -> Result<(), SdhciError> {
+        let regs = self.regs();
+
         // Turn off power first
-        self.write_reg8(SDHCI_POWER_CONTROL, 0);
+        regs.power_control.set(0);
 
         // Small delay
         for _ in 0..1000 {
             core::hint::spin_loop();
         }
 
-        // Turn on power with specified voltage
-        self.write_reg8(SDHCI_POWER_CONTROL, voltage | SDHCI_POWER_ON);
+        // Turn on power with 3.3V
+        regs.power_control
+            .write(POWER_CONTROL::BUS_POWER::SET + POWER_CONTROL::BUS_VOLTAGE::V3_3);
 
         // Wait for power to stabilize
         let timeout = Timeout::from_ms(50);
@@ -257,8 +323,10 @@ impl SdhciController {
 
     /// Set the SD clock frequency
     fn set_clock(&mut self, clock: u32) -> Result<(), SdhciError> {
+        let regs = self.regs();
+
         // Disable clock
-        self.write_reg16(SDHCI_CLOCK_CONTROL, 0);
+        regs.clock_control.set(0);
 
         if clock == 0 {
             return Ok(());
@@ -303,70 +371,82 @@ impl SdhciController {
         );
 
         // Encode divider into clock control register
-        let clk = if self.version >= SDHCI_SPEC_300 {
-            let div_lo = (divider & 0xFF) >> 1;
-            let div_hi = ((divider >> 8) & 0x03) << 6;
-            (div_lo << SDHCI_DIVIDER_SHIFT) | div_hi | SDHCI_CLOCK_INT_EN
-        } else {
-            ((divider & 0xFF) << SDHCI_DIVIDER_SHIFT) | SDHCI_CLOCK_INT_EN
-        };
+        let div_lo = (divider & 0xFF) >> 1;
+        let div_hi = ((divider >> 8) & 0x03) as u8;
 
-        self.write_reg16(SDHCI_CLOCK_CONTROL, clk);
+        regs.clock_control.write(
+            CLOCK_CONTROL::FREQ_SELECT.val(div_lo as u16)
+                + CLOCK_CONTROL::FREQ_SELECT_HI.val(div_hi as u16)
+                + CLOCK_CONTROL::INTERNAL_CLK_EN::SET,
+        );
 
         // Wait for internal clock stable
         let timeout = Timeout::from_ms(20);
         while !timeout.is_expired() {
-            if self.read_reg16(SDHCI_CLOCK_CONTROL) & SDHCI_CLOCK_INT_STABLE != 0 {
+            if regs
+                .clock_control
+                .is_set(CLOCK_CONTROL::INTERNAL_CLK_STABLE)
+            {
                 break;
             }
             core::hint::spin_loop();
         }
 
-        if self.read_reg16(SDHCI_CLOCK_CONTROL) & SDHCI_CLOCK_INT_STABLE == 0 {
+        if !regs
+            .clock_control
+            .is_set(CLOCK_CONTROL::INTERNAL_CLK_STABLE)
+        {
             log::error!("SDHCI: Internal clock not stable");
             return Err(SdhciError::ClockFailed);
         }
 
         // Enable card clock
-        let clk = self.read_reg16(SDHCI_CLOCK_CONTROL) | SDHCI_CLOCK_CARD_EN;
-        self.write_reg16(SDHCI_CLOCK_CONTROL, clk);
+        regs.clock_control.modify(CLOCK_CONTROL::SD_CLK_EN::SET);
 
         Ok(())
     }
 
     /// Set bus width
     fn set_bus_width(&mut self, width: u8) {
-        let mut ctrl = self.read_reg8(SDHCI_HOST_CONTROL);
-
-        // Clear bus width bits
-        ctrl &= !(SDHCI_CTRL_4BITBUS | SDHCI_CTRL_8BITBUS);
+        let regs = self.regs();
 
         match width {
-            4 => ctrl |= SDHCI_CTRL_4BITBUS,
-            8 => ctrl |= SDHCI_CTRL_8BITBUS,
-            _ => {} // 1-bit mode
+            4 => {
+                regs.host_control.modify(
+                    HOST_CONTROL::DATA_WIDTH_4BIT::SET + HOST_CONTROL::DATA_WIDTH_8BIT::CLEAR,
+                );
+            }
+            8 => {
+                regs.host_control.modify(
+                    HOST_CONTROL::DATA_WIDTH_4BIT::CLEAR + HOST_CONTROL::DATA_WIDTH_8BIT::SET,
+                );
+            }
+            _ => {
+                // 1-bit mode
+                regs.host_control.modify(
+                    HOST_CONTROL::DATA_WIDTH_4BIT::CLEAR + HOST_CONTROL::DATA_WIDTH_8BIT::CLEAR,
+                );
+            }
         }
-
-        self.write_reg8(SDHCI_HOST_CONTROL, ctrl);
     }
 
     /// Detect if a card is present
     fn detect_card(&self) -> bool {
-        let state = self.read_reg32(SDHCI_PRESENT_STATE);
-        (state & SDHCI_CARD_PRESENT) != 0 && (state & SDHCI_CARD_STATE_STABLE) != 0
+        let regs = self.regs();
+        regs.present_state.is_set(PRESENT_STATE::CARD_INSERTED)
+            && regs.present_state.is_set(PRESENT_STATE::CARD_STABLE)
     }
 
     /// Wait for command/data inhibit to clear
     fn wait_inhibit(&self, data: bool) -> Result<(), SdhciError> {
-        let mask = if data {
-            SDHCI_CMD_INHIBIT | SDHCI_DATA_INHIBIT
-        } else {
-            SDHCI_CMD_INHIBIT
-        };
+        let regs = self.regs();
 
         let timeout = Timeout::from_ms(CMD_TIMEOUT_MS);
         while !timeout.is_expired() {
-            if self.read_reg32(SDHCI_PRESENT_STATE) & mask == 0 {
+            let cmd_inhibit = regs.present_state.is_set(PRESENT_STATE::CMD_INHIBIT);
+            let dat_inhibit = data && regs.present_state.is_set(PRESENT_STATE::DAT_INHIBIT);
+
+            if !cmd_inhibit && !dat_inhibit {
                 return Ok(());
             }
             core::hint::spin_loop();
@@ -388,82 +468,98 @@ impl SdhciController {
         resp_type: u8,
         has_data: bool,
     ) -> Result<[u32; 4], SdhciError> {
+        let regs = self.regs();
+
         // Wait for command inhibit to clear
         self.wait_inhibit(has_data)?;
 
         // Clear all pending interrupts
-        self.write_reg32(SDHCI_INT_STATUS, SDHCI_INT_ALL_MASK);
+        regs.int_status.set(0xFFFFFFFF);
 
         // Set argument
-        self.write_reg32(SDHCI_ARGUMENT, arg);
+        regs.argument.set(arg);
 
-        // Build command flags
-        let mut flags: u16 = 0;
+        // Build command register value
+        let mut cmd_val = COMMAND::CMD_INDEX.val(cmd as u16);
 
         match resp_type {
-            MMC_RSP_NONE => flags |= SDHCI_CMD_RESP_NONE,
-            MMC_RSP_R1 | MMC_RSP_R6 | MMC_RSP_R7 => {
-                flags |= SDHCI_CMD_RESP_SHORT | SDHCI_CMD_CRC | SDHCI_CMD_INDEX
+            MMC_RSP_NONE => {
+                cmd_val = cmd_val + COMMAND::RESPONSE_TYPE::None;
             }
-            MMC_RSP_R1B => flags |= SDHCI_CMD_RESP_SHORT_BUSY | SDHCI_CMD_CRC | SDHCI_CMD_INDEX,
-            MMC_RSP_R2 => flags |= SDHCI_CMD_RESP_LONG | SDHCI_CMD_CRC,
-            MMC_RSP_R3 => flags |= SDHCI_CMD_RESP_SHORT,
-            _ => flags |= SDHCI_CMD_RESP_SHORT,
+            MMC_RSP_R1 | MMC_RSP_R6 | MMC_RSP_R7 => {
+                cmd_val = cmd_val
+                    + COMMAND::RESPONSE_TYPE::Short48
+                    + COMMAND::CRC_CHECK::SET
+                    + COMMAND::INDEX_CHECK::SET;
+            }
+            MMC_RSP_R1B => {
+                cmd_val = cmd_val
+                    + COMMAND::RESPONSE_TYPE::Short48Busy
+                    + COMMAND::CRC_CHECK::SET
+                    + COMMAND::INDEX_CHECK::SET;
+            }
+            MMC_RSP_R2 => {
+                cmd_val = cmd_val + COMMAND::RESPONSE_TYPE::Long136 + COMMAND::CRC_CHECK::SET;
+            }
+            MMC_RSP_R3 => {
+                cmd_val = cmd_val + COMMAND::RESPONSE_TYPE::Short48;
+            }
+            _ => {
+                cmd_val = cmd_val + COMMAND::RESPONSE_TYPE::Short48;
+            }
         }
 
         if has_data {
-            flags |= SDHCI_CMD_DATA;
+            cmd_val = cmd_val + COMMAND::DATA_PRESENT::SET;
         }
 
         // Send command
-        let cmd_reg = make_cmd(cmd, flags);
-        self.write_reg16(SDHCI_COMMAND, cmd_reg);
+        regs.command.write(cmd_val);
 
         // Wait for command complete
         let timeout = Timeout::from_ms(CMD_TIMEOUT_MS);
-        let mut status: u32;
 
         loop {
-            status = self.read_reg32(SDHCI_INT_STATUS);
+            let status = regs.int_status.get();
 
             // Check for errors
-            if status & SDHCI_INT_ERROR != 0 {
+            if regs.int_status.is_set(INT_STATUS::ERROR) {
                 // Clear status
-                self.write_reg32(SDHCI_INT_STATUS, status);
+                regs.int_status.set(status);
 
-                if status & SDHCI_INT_TIMEOUT != 0 {
+                if regs.int_status.is_set(INT_STATUS::CMD_TIMEOUT) {
                     log::debug!("SDHCI: CMD{} timeout", cmd);
-                    self.reset(SDHCI_RESET_CMD)?;
+                    let _ = self.reset_cmd();
                     return Err(SdhciError::CommandTimeout);
                 }
-                if status & SDHCI_INT_CRC != 0 {
+                if regs.int_status.is_set(INT_STATUS::CMD_CRC) {
                     log::debug!("SDHCI: CMD{} CRC error", cmd);
-                    self.reset(SDHCI_RESET_CMD)?;
+                    let _ = self.reset_cmd();
                     return Err(SdhciError::CommandCrcError);
                 }
-                if status & SDHCI_INT_INDEX != 0 {
+                if regs.int_status.is_set(INT_STATUS::CMD_INDEX) {
                     log::debug!("SDHCI: CMD{} index error", cmd);
-                    self.reset(SDHCI_RESET_CMD)?;
+                    let _ = self.reset_cmd();
                     return Err(SdhciError::CommandIndexError);
                 }
-                if status & SDHCI_INT_END_BIT != 0 {
+                if regs.int_status.is_set(INT_STATUS::CMD_END_BIT) {
                     log::debug!("SDHCI: CMD{} end bit error", cmd);
-                    self.reset(SDHCI_RESET_CMD)?;
+                    let _ = self.reset_cmd();
                     return Err(SdhciError::CommandEndBitError);
                 }
 
                 log::debug!("SDHCI: CMD{} unknown error: {:#x}", cmd, status);
-                self.reset(SDHCI_RESET_CMD)?;
+                let _ = self.reset_cmd();
                 return Err(SdhciError::GenericError);
             }
 
             // Check for command complete
-            if status & SDHCI_INT_RESPONSE != 0 {
+            if regs.int_status.is_set(INT_STATUS::CMD_COMPLETE) {
                 break;
             }
 
             if timeout.is_expired() {
-                self.reset(SDHCI_RESET_CMD)?;
+                let _ = self.reset_cmd();
                 return Err(SdhciError::CommandTimeout);
             }
 
@@ -471,14 +567,14 @@ impl SdhciController {
         }
 
         // Clear command complete status
-        self.write_reg32(SDHCI_INT_STATUS, SDHCI_INT_RESPONSE);
+        regs.int_status.write(INT_STATUS::CMD_COMPLETE::SET);
 
         // Read response
         let response = [
-            self.read_reg32(SDHCI_RESPONSE),
-            self.read_reg32(SDHCI_RESPONSE + 4),
-            self.read_reg32(SDHCI_RESPONSE + 8),
-            self.read_reg32(SDHCI_RESPONSE + 12),
+            regs.response0.get(),
+            regs.response1.get(),
+            regs.response2.get(),
+            regs.response3.get(),
         ];
 
         Ok(response)
@@ -622,7 +718,11 @@ impl SdhciController {
         self.set_clock(DEFAULT_CLOCK_HZ)?;
 
         // Try to enable high-speed mode if supported
-        if self.capabilities & SDHCI_CAN_DO_HISPD != 0 {
+        if self
+            .regs()
+            .capabilities
+            .is_set(CAPABILITIES::SUPPORT_HIGHSPEED)
+        {
             if self.try_high_speed().is_ok() {
                 log::info!("SDHCI: High-speed mode enabled (50 MHz)");
             }
@@ -641,7 +741,6 @@ impl SdhciController {
 
     /// Parse CSD register to get card capacity
     fn parse_csd(&mut self, csd: &[u32; 4]) {
-        // Debug: print raw CSD values
         log::debug!(
             "SDHCI: Raw CSD: [{:08x}, {:08x}, {:08x}, {:08x}]",
             csd[0],
@@ -650,27 +749,7 @@ impl SdhciController {
             csd[3]
         );
 
-        // SDHCI R2 response format:
-        // The 136-bit response is stored in RESPONSE[127:8] (bits 0-7 are CRC, not stored)
-        // RESPONSE register 0 contains bits [39:8]
-        // RESPONSE register 1 contains bits [71:40]
-        // RESPONSE register 2 contains bits [103:72]
-        // RESPONSE register 3 contains bits [127:104] (only 24 bits valid)
-        //
-        // CSD Version 2.0 layout (SDHC/SDXC):
-        // [127:126] CSD_STRUCTURE = 01b
-        // [69:48] C_SIZE (22 bits) - device size
-        //
-        // In our response array:
-        // csd[3] bits [23:22] = CSD_STRUCTURE (bits 127:126 - 8 = 119:118 shifted)
-        // Actually need to recalculate based on SDHCI spec
-
-        // CSD_STRUCTURE is at bits [127:126], stored in response[3] upper bits
-        // After removing the 8-bit shift: bits [119:118] in our data
-        // csd[3] holds bits [127:104]-8 = [119:96]
-        // So CSD_STRUCTURE is at csd[3] bits [23:22]
         let csd_structure = (csd[3] >> 22) & 0x03;
-
         log::debug!("SDHCI: CSD_STRUCTURE = {}", csd_structure);
 
         if csd_structure == 0 {
@@ -692,17 +771,8 @@ impl SdhciController {
             );
         } else {
             // CSD Version 2.0 (SDHC/SDXC)
-            // C_SIZE is at bits [69:48] of CSD
-            // After 8-bit shift: bits [61:40] in our response
-            // csd[1] holds bits [71:40]-8 = [63:32], so bits [61:40] span csd[1] and csd[0]
-            // Actually: response bits [63:32] are in csd[1], bits [31:0] are in csd[0]
-            // C_SIZE bits [61:48] are in csd[1] bits [29:16]
-            // C_SIZE bits [47:40] are in csd[1] bits [15:8]
-            // So full C_SIZE = csd[1] bits [29:8] (22 bits)
             let c_size = (csd[1] >> 8) & 0x3FFFFF;
-
             log::debug!("SDHCI: CSD v2.0: c_size={} (raw bits)", c_size);
-
             self.num_blocks = (c_size as u64 + 1) * 1024;
         }
 
@@ -716,19 +786,10 @@ impl SdhciController {
 
     /// Try to enable high-speed mode
     fn try_high_speed(&mut self) -> Result<(), SdhciError> {
-        // CMD6: SWITCH_FUNC would be used to check/switch high-speed mode
-        // Mode 0 = check, function group 1, function 1 = high-speed
-        // let _arg = 0x00FFFFF1; // Check high-speed
-        // Mode 1 = switch: let _arg = 0x80FFFFF1;
-        // We'd need to read the data for proper implementation
-
-        // For now, just set the clock and high-speed bit in the host controller
-        // This enables high-speed mode on the controller side
+        let regs = self.regs();
 
         // Enable high-speed in host control
-        let mut ctrl = self.read_reg8(SDHCI_HOST_CONTROL);
-        ctrl |= SDHCI_CTRL_HISPD;
-        self.write_reg8(SDHCI_HOST_CONTROL, ctrl);
+        regs.host_control.modify(HOST_CONTROL::HIGH_SPEED::SET);
 
         // Set 50 MHz clock
         self.set_clock(HIGH_SPEED_CLOCK_HZ)?;
@@ -787,69 +848,96 @@ impl SdhciController {
         // Wait for data inhibit to clear
         self.wait_inhibit(true)?;
 
-        // Clear all pending interrupts
-        self.write_reg32(SDHCI_INT_STATUS, SDHCI_INT_ALL_MASK);
+        // Setup DMA and send command (in a separate scope to release borrow)
+        {
+            let regs = self.regs();
 
-        // Set DMA address (use our page-aligned buffer)
-        let dma_addr = self.dma_buffer as u64;
-        self.write_reg32(SDHCI_DMA_ADDRESS, dma_addr as u32);
+            // Clear all pending interrupts
+            regs.int_status.set(0xFFFFFFFF);
 
-        // Set block size with SDMA boundary (512KB)
-        self.write_reg16(
-            SDHCI_BLOCK_SIZE,
-            make_blksz(SDHCI_DEFAULT_BOUNDARY_ARG, SD_BLOCK_SIZE as u16),
-        );
+            // Set DMA address (use our page-aligned buffer)
+            let dma_addr = self.dma_buffer as u32;
+            regs.sdma_addr.set(dma_addr);
 
-        // Set block count
-        self.write_reg16(SDHCI_BLOCK_COUNT, count as u16);
+            // Set block size with SDMA boundary (512KB)
+            regs.block_size.write(
+                BLOCK_SIZE::BLOCK_SIZE.val(SD_BLOCK_SIZE as u16)
+                    + BLOCK_SIZE::SDMA_BOUNDARY.val(SDHCI_DEFAULT_BOUNDARY_ARG),
+            );
 
-        // Set transfer mode (SDMA, read, block count enable)
-        let mut mode = SDHCI_TRNS_DMA | SDHCI_TRNS_READ | SDHCI_TRNS_BLK_CNT_EN;
-        if count > 1 {
-            mode |= SDHCI_TRNS_MULTI | SDHCI_TRNS_ACMD12;
+            // Set block count
+            regs.block_count.set(count as u16);
+
+            // Set transfer mode (SDMA, read, block count enable)
+            let mut mode = TRANSFER_MODE::DMA_ENABLE::SET
+                + TRANSFER_MODE::DATA_DIRECTION::SET
+                + TRANSFER_MODE::BLOCK_COUNT_ENABLE::SET;
+
+            if count > 1 {
+                mode = mode + TRANSFER_MODE::MULTI_BLOCK::SET + TRANSFER_MODE::AUTO_CMD12::SET;
+            }
+            regs.transfer_mode.write(mode);
+
+            // Calculate argument (LBA for SDHC, byte address for SDSC)
+            let arg = if self.high_capacity {
+                start_lba as u32
+            } else {
+                (start_lba * SD_BLOCK_SIZE as u64) as u32
+            };
+
+            // Set argument
+            regs.argument.set(arg);
+
+            // Send read command
+            let cmd = if count > 1 {
+                MMC_CMD_READ_MULTIPLE_BLOCK
+            } else {
+                MMC_CMD_READ_SINGLE_BLOCK
+            };
+
+            let cmd_val = COMMAND::CMD_INDEX.val(cmd as u16)
+                + COMMAND::RESPONSE_TYPE::Short48
+                + COMMAND::CRC_CHECK::SET
+                + COMMAND::INDEX_CHECK::SET
+                + COMMAND::DATA_PRESENT::SET;
+
+            regs.command.write(cmd_val);
         }
-        self.write_reg16(SDHCI_TRANSFER_MODE, mode);
-
-        // Calculate argument (LBA for SDHC, byte address for SDSC)
-        let arg = if self.high_capacity {
-            start_lba as u32
-        } else {
-            (start_lba * SD_BLOCK_SIZE as u64) as u32
-        };
-
-        // Set argument
-        self.write_reg32(SDHCI_ARGUMENT, arg);
-
-        // Send read command
-        let cmd = if count > 1 {
-            MMC_CMD_READ_MULTIPLE_BLOCK
-        } else {
-            MMC_CMD_READ_SINGLE_BLOCK
-        };
-
-        let flags = SDHCI_CMD_RESP_SHORT | SDHCI_CMD_CRC | SDHCI_CMD_INDEX | SDHCI_CMD_DATA;
-        let cmd_reg = make_cmd(cmd, flags);
-        self.write_reg16(SDHCI_COMMAND, cmd_reg);
 
         // Wait for command complete
         let timeout = Timeout::from_ms(CMD_TIMEOUT_MS);
         loop {
-            let status = self.read_reg32(SDHCI_INT_STATUS);
+            // Check for errors or completion in a scoped borrow
+            let (has_error, error_status, is_complete, is_timeout) = {
+                let regs = self.regs();
+                let has_error = regs.int_status.is_set(INT_STATUS::ERROR);
+                let error_status = if has_error { regs.int_status.get() } else { 0 };
+                let is_complete = regs.int_status.is_set(INT_STATUS::CMD_COMPLETE);
 
-            if status & SDHCI_INT_ERROR != 0 {
-                log::error!("SDHCI: Read command error: {:#x}", status);
-                self.write_reg32(SDHCI_INT_STATUS, status);
-                self.reset(SDHCI_RESET_CMD | SDHCI_RESET_DATA)?;
+                if has_error {
+                    regs.int_status.set(error_status);
+                }
+                if is_complete {
+                    regs.int_status.write(INT_STATUS::CMD_COMPLETE::SET);
+                }
+
+                (has_error, error_status, is_complete, timeout.is_expired())
+            };
+
+            if has_error {
+                log::error!("SDHCI: Read command error: {:#x}", error_status);
+                let _ = self.reset_cmd();
+                let _ = self.reset_data();
                 return Err(SdhciError::GenericError);
             }
 
-            if status & SDHCI_INT_RESPONSE != 0 {
-                self.write_reg32(SDHCI_INT_STATUS, SDHCI_INT_RESPONSE);
+            if is_complete {
                 break;
             }
 
-            if timeout.is_expired() {
-                self.reset(SDHCI_RESET_CMD | SDHCI_RESET_DATA)?;
+            if is_timeout {
+                let _ = self.reset_cmd();
+                let _ = self.reset_data();
                 return Err(SdhciError::CommandTimeout);
             }
 
@@ -859,47 +947,83 @@ impl SdhciController {
         // Wait for data transfer complete
         let timeout = Timeout::from_ms(DATA_TIMEOUT_MS);
         loop {
-            let status = self.read_reg32(SDHCI_INT_STATUS);
+            // Check status in a scoped borrow
+            enum DataResult {
+                Continue,
+                Complete,
+                Error {
+                    status: u32,
+                    is_timeout: bool,
+                    is_crc: bool,
+                    is_end_bit: bool,
+                    is_adma: bool,
+                },
+                Timeout,
+            }
 
-            if status & SDHCI_INT_ERROR != 0 {
-                log::error!("SDHCI: Data transfer error: {:#x}", status);
-                self.write_reg32(SDHCI_INT_STATUS, status);
-                self.reset(SDHCI_RESET_DATA)?;
+            let result = {
+                let regs = self.regs();
+                let status = regs.int_status.get();
 
-                if status & SDHCI_INT_DATA_TIMEOUT != 0 {
+                if regs.int_status.is_set(INT_STATUS::ERROR) {
+                    regs.int_status.set(status);
+                    DataResult::Error {
+                        status,
+                        is_timeout: regs.int_status.is_set(INT_STATUS::DATA_TIMEOUT),
+                        is_crc: regs.int_status.is_set(INT_STATUS::DATA_CRC),
+                        is_end_bit: regs.int_status.is_set(INT_STATUS::DATA_END_BIT),
+                        is_adma: regs.int_status.is_set(INT_STATUS::ADMA),
+                    }
+                } else if regs.int_status.is_set(INT_STATUS::DMA_INT) {
+                    // For SDMA, handle DMA interrupts if transfer crosses boundary
+                    let current_addr = regs.sdma_addr.get();
+                    regs.sdma_addr.set(current_addr);
+                    regs.int_status.write(INT_STATUS::DMA_INT::SET);
+                    DataResult::Continue
+                } else if regs.int_status.is_set(INT_STATUS::TRANSFER_COMPLETE) {
+                    regs.int_status.write(INT_STATUS::TRANSFER_COMPLETE::SET);
+                    DataResult::Complete
+                } else if timeout.is_expired() {
+                    DataResult::Timeout
+                } else {
+                    DataResult::Continue
+                }
+            };
+
+            match result {
+                DataResult::Continue => {
+                    core::hint::spin_loop();
+                }
+                DataResult::Complete => break,
+                DataResult::Error {
+                    status,
+                    is_timeout,
+                    is_crc,
+                    is_end_bit,
+                    is_adma,
+                } => {
+                    log::error!("SDHCI: Data transfer error: {:#x}", status);
+                    let _ = self.reset_data();
+
+                    if is_timeout {
+                        return Err(SdhciError::DataTimeout);
+                    }
+                    if is_crc {
+                        return Err(SdhciError::DataCrcError);
+                    }
+                    if is_end_bit {
+                        return Err(SdhciError::DataEndBitError);
+                    }
+                    if is_adma {
+                        return Err(SdhciError::DmaError);
+                    }
+                    return Err(SdhciError::GenericError);
+                }
+                DataResult::Timeout => {
+                    let _ = self.reset_data();
                     return Err(SdhciError::DataTimeout);
                 }
-                if status & SDHCI_INT_DATA_CRC != 0 {
-                    return Err(SdhciError::DataCrcError);
-                }
-                if status & SDHCI_INT_DATA_END_BIT != 0 {
-                    return Err(SdhciError::DataEndBitError);
-                }
-                if status & SDHCI_INT_ADMA_ERROR != 0 {
-                    return Err(SdhciError::DmaError);
-                }
-                return Err(SdhciError::GenericError);
             }
-
-            // For SDMA, we need to handle DMA interrupts if transfer crosses boundary
-            if status & SDHCI_INT_DMA_END != 0 {
-                // Update DMA address for next boundary
-                let current_addr = self.read_reg32(SDHCI_DMA_ADDRESS);
-                self.write_reg32(SDHCI_DMA_ADDRESS, current_addr);
-                self.write_reg32(SDHCI_INT_STATUS, SDHCI_INT_DMA_END);
-            }
-
-            if status & SDHCI_INT_DATA_END != 0 {
-                self.write_reg32(SDHCI_INT_STATUS, SDHCI_INT_DATA_END);
-                break;
-            }
-
-            if timeout.is_expired() {
-                self.reset(SDHCI_RESET_DATA)?;
-                return Err(SdhciError::DataTimeout);
-            }
-
-            core::hint::spin_loop();
         }
 
         // Memory fence to ensure DMA is complete
@@ -940,34 +1064,6 @@ impl SdhciController {
     /// Get the PCI address of this controller
     pub fn pci_address(&self) -> PciAddress {
         self.pci_address
-    }
-
-    // ========================================================================
-    // Register Access Methods
-    // ========================================================================
-
-    fn read_reg32(&self, offset: u16) -> u32 {
-        unsafe { ptr::read_volatile((self.mmio_base + offset as u64) as *const u32) }
-    }
-
-    fn write_reg32(&mut self, offset: u16, value: u32) {
-        unsafe { ptr::write_volatile((self.mmio_base + offset as u64) as *mut u32, value) }
-    }
-
-    fn read_reg16(&self, offset: u16) -> u16 {
-        unsafe { ptr::read_volatile((self.mmio_base + offset as u64) as *const u16) }
-    }
-
-    fn write_reg16(&mut self, offset: u16, value: u16) {
-        unsafe { ptr::write_volatile((self.mmio_base + offset as u64) as *mut u16, value) }
-    }
-
-    fn read_reg8(&self, offset: u16) -> u8 {
-        unsafe { ptr::read_volatile((self.mmio_base + offset as u64) as *const u8) }
-    }
-
-    fn write_reg8(&mut self, offset: u16, value: u8) {
-        unsafe { ptr::write_volatile((self.mmio_base + offset as u64) as *mut u8, value) }
     }
 }
 

@@ -282,7 +282,7 @@ struct AcpiRegion {
 
 /// Collect all ACPI table regions, merge overlapping ones, then mark them
 fn mark_acpi_tables_memory(rsdp_addr: u64) {
-    use super::allocator::{mark_as_acpi_reclaim, PAGE_SIZE};
+    use super::allocator::{PAGE_SIZE, mark_as_acpi_reclaim};
 
     log::info!("Marking ACPI table memory regions as AcpiReclaimMemory...");
 
@@ -512,7 +512,7 @@ fn mark_acpi_tables_memory(rsdp_addr: u64) {
 
 /// Install ACPI tables from coreboot
 pub fn install_acpi_tables(rsdp: u64) {
-    use super::allocator::{get_memory_type_at, MemoryType};
+    use super::allocator::{MemoryType, get_memory_type_at};
 
     if rsdp == 0 {
         log::warn!("ACPI RSDP address is null, skipping ACPI table installation");

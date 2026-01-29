@@ -7,15 +7,16 @@
 //! - OHCI Specification 1.0a
 //! - libpayload ohci.c
 
+use crate::drivers::mmio::MmioRegion;
 use crate::drivers::pci::{self, PciAddress, PciDevice};
 use crate::efi;
 use crate::time::Timeout;
 use core::ptr;
-use core::sync::atomic::{fence, Ordering};
+use core::sync::atomic::{Ordering, fence};
 
 use super::controller::{
-    desc_type, parse_configuration, req_type, request, DeviceDescriptor, DeviceInfo, Direction,
-    EndpointInfo, UsbController, UsbDevice, UsbError, UsbSpeed,
+    DeviceDescriptor, DeviceInfo, Direction, EndpointInfo, UsbController, UsbDevice, UsbError,
+    UsbSpeed, desc_type, parse_configuration, req_type, request,
 };
 
 // ============================================================================
@@ -379,12 +380,15 @@ const MAX_DEVICES: usize = 8;
 /// Maximum number of ports
 const MAX_PORTS: usize = 8;
 
+/// OHCI MMIO region size
+const OHCI_MMIO_SIZE: usize = 0x1000;
+
 /// OHCI Host Controller
 pub struct OhciController {
     /// PCI address
     pci_address: PciAddress,
-    /// MMIO base address
-    mmio_base: u64,
+    /// MMIO region for register access
+    mmio: MmioRegion,
     /// Number of ports
     num_ports: u8,
     /// Devices
@@ -408,20 +412,19 @@ impl OhciController {
     /// Create a new OHCI controller from a PCI device
     pub fn new(pci_dev: &PciDevice) -> Result<Self, UsbError> {
         let mmio_base = pci_dev.mmio_base().ok_or(UsbError::NotReady)?;
+        let mmio = MmioRegion::new(mmio_base, OHCI_MMIO_SIZE);
 
         // Enable the device (bus master + memory space)
         pci::enable_device(pci_dev);
 
         // Read revision
-        let revision =
-            unsafe { ptr::read_volatile((mmio_base + regs::HCREVISION as u64) as *const u32) };
+        let revision = mmio.read32(regs::HCREVISION as u64);
         let version = revision & 0xFF;
 
         log::info!("OHCI version: {}.{}", (version >> 4) & 0xF, version & 0xF);
 
         // Get number of ports from RhDescriptorA
-        let rh_desc_a =
-            unsafe { ptr::read_volatile((mmio_base + regs::HCRHDESCRIPTORA as u64) as *const u32) };
+        let rh_desc_a = mmio.read32(regs::HCRHDESCRIPTORA as u64);
         let num_ports = (rh_desc_a & 0xFF) as u8;
 
         log::info!("OHCI: {} ports", num_ports);
@@ -444,7 +447,7 @@ impl OhciController {
 
         let mut controller = Self {
             pci_address: pci_dev.address,
-            mmio_base,
+            mmio,
             num_ports: num_ports.min(MAX_PORTS as u8),
             devices: core::array::from_fn(|_| None),
             next_address: 1,
@@ -460,22 +463,30 @@ impl OhciController {
         Ok(controller)
     }
 
+    /// Read OHCI register
+    #[inline]
     fn read_reg(&self, offset: u32) -> u32 {
-        unsafe { ptr::read_volatile((self.mmio_base + offset as u64) as *const u32) }
+        self.mmio.read32(offset as u64)
     }
 
-    fn write_reg(&mut self, offset: u32, value: u32) {
-        unsafe { ptr::write_volatile((self.mmio_base + offset as u64) as *mut u32, value) }
+    /// Write OHCI register
+    #[inline]
+    fn write_reg(&self, offset: u32, value: u32) {
+        self.mmio.write32(offset as u64, value)
     }
 
+    /// Read port status register
+    #[inline]
     fn read_port_reg(&self, port: u8) -> u32 {
-        let addr = self.mmio_base + regs::HCRHPORTSTATUS as u64 + (port as u64 * 4);
-        unsafe { ptr::read_volatile(addr as *const u32) }
+        self.mmio
+            .read32(regs::HCRHPORTSTATUS as u64 + (port as u64 * 4))
     }
 
-    fn write_port_reg(&mut self, port: u8, value: u32) {
-        let addr = self.mmio_base + regs::HCRHPORTSTATUS as u64 + (port as u64 * 4);
-        unsafe { ptr::write_volatile(addr as *mut u32, value) }
+    /// Write port status register
+    #[inline]
+    fn write_port_reg(&self, port: u8, value: u32) {
+        self.mmio
+            .write32(regs::HCRHPORTSTATUS as u64 + (port as u64 * 4), value)
     }
 
     /// Initialize the controller

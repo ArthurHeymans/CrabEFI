@@ -5,6 +5,7 @@
 pub mod ahci;
 pub mod block;
 pub mod keyboard;
+pub mod mmio;
 pub mod nvme;
 pub mod pci;
 pub mod sdhci;

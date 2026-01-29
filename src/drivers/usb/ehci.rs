@@ -18,16 +18,17 @@
 //! - U-Boot drivers/usb/host/ehci-hcd.c
 //! - libpayload ehci.c
 
+use crate::drivers::mmio::MmioRegion;
 use crate::drivers::pci::{self, PciAddress, PciDevice};
 use crate::efi;
 use crate::time::Timeout;
 use core::ptr;
-use core::sync::atomic::{fence, Ordering};
+use core::sync::atomic::{Ordering, fence};
 
 use super::controller::{
-    class, desc_type, hub_feature, hub_port_status, parse_configuration, req_type, request,
-    DeviceDescriptor, DeviceInfo, EndpointInfo, HubDescriptor, UsbController, UsbDevice, UsbError,
-    UsbSpeed, HUB_DESCRIPTOR_TYPE,
+    DeviceDescriptor, DeviceInfo, EndpointInfo, HUB_DESCRIPTOR_TYPE, HubDescriptor, UsbController,
+    UsbDevice, UsbError, UsbSpeed, class, desc_type, hub_feature, hub_port_status,
+    parse_configuration, req_type, request,
 };
 
 // ============================================================================
@@ -556,18 +557,18 @@ const MAX_DEVICES: usize = 16;
 /// Maximum number of ports
 const MAX_PORTS: usize = 15;
 
+/// EHCI MMIO region size
+const EHCI_MMIO_SIZE: usize = 0x1000;
+
 /// EHCI Host Controller
 pub struct EhciController {
     /// PCI address
     pci_address: PciAddress,
-    /// MMIO base address (kept for hardware completeness)
+    /// Capability registers MMIO region (kept for hardware completeness)
     #[allow(dead_code)]
-    mmio_base: u64,
-    /// Capability registers base (kept for hardware completeness)
-    #[allow(dead_code)]
-    cap_regs: u64,
-    /// Operational registers base
-    op_regs: u64,
+    cap_mmio: MmioRegion,
+    /// Operational registers MMIO region
+    op_mmio: MmioRegion,
     /// Number of ports
     num_ports: u8,
     /// 64-bit addressing supported
@@ -613,8 +614,8 @@ impl EhciController {
         log::info!("EHCI controller at MMIO base {:#x}", mmio_base);
 
         // Read capability registers
-        let cap_regs = mmio_base;
-        let cap = unsafe { &*(cap_regs as *const EhciCapRegs) };
+        let cap_mmio = MmioRegion::new(mmio_base, EHCI_MMIO_SIZE);
+        let cap = unsafe { &*(mmio_base as *const EhciCapRegs) };
         let cap_length = cap.cap_length();
         let hci_version = cap.hci_version();
         let num_ports = cap.num_ports().min(MAX_PORTS as u8);
@@ -629,7 +630,8 @@ impl EhciController {
             eecp
         );
 
-        let op_regs = mmio_base + cap_length as u64;
+        let op_offset = cap_length as u64;
+        let op_mmio = MmioRegion::new(mmio_base + op_offset, EHCI_MMIO_SIZE - op_offset as usize);
 
         // Allocate memory structures below 4GB for DMA (EHCI uses 32-bit addresses)
         // Async QH (32-byte aligned)
@@ -659,9 +661,8 @@ impl EhciController {
 
         let mut controller = Self {
             pci_address: pci_dev.address,
-            mmio_base,
-            cap_regs,
-            op_regs,
+            cap_mmio,
+            op_mmio,
             num_ports,
             has_64bit,
             devices: core::array::from_fn(|_| None),
@@ -689,26 +690,30 @@ impl EhciController {
         Ok(controller)
     }
 
-    /// Get operational register
+    /// Read operational register
+    #[inline]
     fn read_op(&self, offset: usize) -> u32 {
-        unsafe { ptr::read_volatile((self.op_regs + offset as u64) as *const u32) }
+        self.op_mmio.read32(offset as u64)
     }
 
     /// Write operational register
-    fn write_op(&mut self, offset: usize, value: u32) {
-        unsafe { ptr::write_volatile((self.op_regs + offset as u64) as *mut u32, value) }
+    #[inline]
+    fn write_op(&self, offset: usize, value: u32) {
+        self.op_mmio.write32(offset as u64, value)
     }
 
     /// Read port status register
+    #[inline]
     fn read_portsc(&self, port: u8) -> u32 {
         let offset = 0x44 + (port as usize) * 4; // PORTSC starts at 0x44
-        self.read_op(offset)
+        self.op_mmio.read32(offset as u64)
     }
 
     /// Write port status register
-    fn write_portsc(&mut self, port: u8, value: u32) {
+    #[inline]
+    fn write_portsc(&self, port: u8, value: u32) {
         let offset = 0x44 + (port as usize) * 4;
-        self.write_op(offset, value);
+        self.op_mmio.write32(offset as u64, value)
     }
 
     /// Take ownership from BIOS via USBLEGSUP extended capability
@@ -1618,7 +1623,7 @@ impl EhciController {
             ptr::write_volatile(&mut (*qh).overlay.next_qtd, qtd_setup_addr as u32);
             ptr::write_volatile(&mut (*qh).overlay.alt_next_qtd, Qtd::TERMINATE);
             ptr::write_volatile(&mut (*qh).overlay.token, 0); // ACTIVE=0, HALTED=0 -> fetch qTD
-                                                              // Clear rest of overlay
+            // Clear rest of overlay
             for i in 0..5 {
                 ptr::write_volatile(&mut (*qh).overlay.buffer[i], 0);
                 ptr::write_volatile(&mut (*qh).overlay.buffer_hi[i], 0);

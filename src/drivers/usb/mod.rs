@@ -24,6 +24,7 @@ pub mod mass_storage;
 pub mod ohci;
 pub mod uhci;
 pub mod xhci;
+pub mod xhci_regs;
 
 pub use self::controller::{DeviceInfo, UsbController, UsbError, UsbSpeed};
 pub use mass_storage::UsbMassStorage;

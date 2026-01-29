@@ -7,22 +7,115 @@ use crate::drivers::pci::{self, PciAddress, PciDevice};
 use crate::efi;
 use crate::time::Timeout;
 use core::ptr;
-use core::sync::atomic::{fence, Ordering};
+use core::sync::atomic::{Ordering, fence};
 use spin::Mutex;
+use tock_registers::interfaces::{ReadWriteable, Readable, Writeable};
+use tock_registers::register_bitfields;
+use tock_registers::registers::{ReadOnly, ReadWrite};
 
-/// NVMe controller registers (MMIO base offsets)
-#[allow(dead_code)]
-mod regs {
-    pub const CAP: u64 = 0x00; // Controller Capabilities
-    pub const VS: u64 = 0x08; // Version
-    pub const INTMS: u64 = 0x0C; // Interrupt Mask Set
-    pub const INTMC: u64 = 0x10; // Interrupt Mask Clear
-    pub const CC: u64 = 0x14; // Controller Configuration
-    pub const CSTS: u64 = 0x1C; // Controller Status
-    pub const NSSR: u64 = 0x20; // NVM Subsystem Reset
-    pub const AQA: u64 = 0x24; // Admin Queue Attributes
-    pub const ASQ: u64 = 0x28; // Admin Submission Queue Base Address
-    pub const ACQ: u64 = 0x30; // Admin Completion Queue Base Address
+// NVMe Controller Register definitions using tock-registers
+register_bitfields! [
+    u64,
+    /// Controller Capabilities (CAP)
+    CAP [
+        /// Maximum Queue Entries Supported (0's based)
+        MQES OFFSET(0) NUMBITS(16) [],
+        /// Contiguous Queues Required
+        CQR OFFSET(16) NUMBITS(1) [],
+        /// Arbitration Mechanism Supported
+        AMS OFFSET(17) NUMBITS(2) [],
+        /// Timeout (in 500ms units)
+        TO OFFSET(24) NUMBITS(8) [],
+        /// Doorbell Stride (2^(2+DSTRD) bytes)
+        DSTRD OFFSET(32) NUMBITS(4) [],
+        /// NVM Subsystem Reset Supported
+        NSSRS OFFSET(36) NUMBITS(1) [],
+        /// Command Sets Supported
+        CSS OFFSET(37) NUMBITS(8) [],
+        /// Boot Partition Support
+        BPS OFFSET(45) NUMBITS(1) [],
+        /// Memory Page Size Minimum (2^(12+MPSMIN) bytes)
+        MPSMIN OFFSET(48) NUMBITS(4) [],
+        /// Memory Page Size Maximum (2^(12+MPSMAX) bytes)
+        MPSMAX OFFSET(52) NUMBITS(4) []
+    ]
+];
+
+register_bitfields! [
+    u32,
+    /// Version (VS)
+    VS [
+        /// Tertiary Version Number
+        TER OFFSET(0) NUMBITS(8) [],
+        /// Minor Version Number
+        MNR OFFSET(8) NUMBITS(8) [],
+        /// Major Version Number
+        MJR OFFSET(16) NUMBITS(16) []
+    ],
+    /// Controller Configuration (CC)
+    CC [
+        /// Enable
+        EN OFFSET(0) NUMBITS(1) [],
+        /// I/O Command Set Selected
+        CSS OFFSET(4) NUMBITS(3) [],
+        /// Memory Page Size (2^(12+MPS) bytes)
+        MPS OFFSET(7) NUMBITS(4) [],
+        /// Arbitration Mechanism Selected
+        AMS OFFSET(11) NUMBITS(3) [],
+        /// Shutdown Notification
+        SHN OFFSET(14) NUMBITS(2) [],
+        /// I/O Submission Queue Entry Size (2^IOSQES bytes)
+        IOSQES OFFSET(16) NUMBITS(4) [],
+        /// I/O Completion Queue Entry Size (2^IOCQES bytes)
+        IOCQES OFFSET(20) NUMBITS(4) []
+    ],
+    /// Controller Status (CSTS)
+    CSTS [
+        /// Ready
+        RDY OFFSET(0) NUMBITS(1) [],
+        /// Controller Fatal Status
+        CFS OFFSET(1) NUMBITS(1) [],
+        /// Shutdown Status
+        SHST OFFSET(2) NUMBITS(2) [],
+        /// NVM Subsystem Reset Occurred
+        NSSRO OFFSET(4) NUMBITS(1) [],
+        /// Processing Paused
+        PP OFFSET(5) NUMBITS(1) []
+    ],
+    /// Admin Queue Attributes (AQA)
+    AQA [
+        /// Admin Submission Queue Size (0's based)
+        ASQS OFFSET(0) NUMBITS(12) [],
+        /// Admin Completion Queue Size (0's based)
+        ACQS OFFSET(16) NUMBITS(12) []
+    ]
+];
+
+/// NVMe controller registers memory map
+#[repr(C)]
+pub struct NvmeRegisters {
+    /// Controller Capabilities
+    pub cap: ReadOnly<u64, CAP::Register>,
+    /// Version
+    pub vs: ReadOnly<u32, VS::Register>,
+    /// Interrupt Mask Set
+    pub intms: ReadWrite<u32>,
+    /// Interrupt Mask Clear
+    pub intmc: ReadWrite<u32>,
+    /// Controller Configuration
+    pub cc: ReadWrite<u32, CC::Register>,
+    /// Reserved
+    _reserved0: u32,
+    /// Controller Status
+    pub csts: ReadOnly<u32, CSTS::Register>,
+    /// NVM Subsystem Reset (optional)
+    pub nssr: ReadWrite<u32>,
+    /// Admin Queue Attributes
+    pub aqa: ReadWrite<u32, AQA::Register>,
+    /// Admin Submission Queue Base Address
+    pub asq: ReadWrite<u64>,
+    /// Admin Completion Queue Base Address
+    pub acq: ReadWrite<u64>,
 }
 
 /// NVMe admin commands
@@ -322,7 +415,9 @@ pub struct NvmeNamespace {
 pub struct NvmeController {
     /// PCI address (bus:device.function)
     pci_address: PciAddress,
-    /// MMIO base address
+    /// Pointer to memory-mapped registers
+    regs: *const NvmeRegisters,
+    /// MMIO base address (for doorbell access)
     mmio_base: u64,
     /// Doorbell stride (in bytes)
     doorbell_stride: usize,
@@ -377,24 +472,25 @@ impl NvmeController {
     /// Create a new NVMe controller from a PCI device
     pub fn new(pci_dev: &PciDevice) -> Result<Self, NvmeError> {
         let mmio_base = pci_dev.mmio_base().ok_or(NvmeError::NotReady)?;
+        let regs = mmio_base as *const NvmeRegisters;
 
         // Enable the device (bus master + memory space)
         pci::enable_device(pci_dev);
 
-        // Read capabilities
-        let cap = unsafe { ptr::read_volatile((mmio_base + regs::CAP) as *const u64) };
-        let doorbell_stride = 4 << ((cap >> 32) & 0xF);
-        let max_queue_entries = ((cap & 0xFFFF) + 1) as usize;
+        // Read capabilities using typed register access
+        let regs_ref = unsafe { &*regs };
+        let cap = regs_ref.cap.get();
+        let doorbell_stride = 4usize << regs_ref.cap.read(CAP::DSTRD);
+        let max_queue_entries = (regs_ref.cap.read(CAP::MQES) + 1) as usize;
 
         log::debug!("NVMe CAP: {:#018x}", cap);
         log::debug!("  Doorbell stride: {} bytes", doorbell_stride);
         log::debug!("  Max queue entries: {}", max_queue_entries);
 
-        // Read version
-        let vs = unsafe { ptr::read_volatile((mmio_base + regs::VS) as *const u32) };
-        let major = (vs >> 16) & 0xFFFF;
-        let minor = (vs >> 8) & 0xFF;
-        let tertiary = vs & 0xFF;
+        // Read version using typed register access
+        let major = regs_ref.vs.read(VS::MJR);
+        let minor = regs_ref.vs.read(VS::MNR);
+        let tertiary = regs_ref.vs.read(VS::TER);
         log::info!("NVMe version: {}.{}.{}", major, minor, tertiary);
 
         // Allocate queues using EFI memory allocator
@@ -416,6 +512,7 @@ impl NvmeController {
 
         let mut controller = Self {
             pci_address: pci_dev.address,
+            regs,
             mmio_base,
             doorbell_stride,
             admin_sq,
@@ -437,19 +534,12 @@ impl NvmeController {
         Ok(controller)
     }
 
-    /// Read a 32-bit register
-    fn read_reg32(&self, offset: u64) -> u32 {
-        unsafe { ptr::read_volatile((self.mmio_base + offset) as *const u32) }
-    }
-
-    /// Write a 32-bit register
-    fn write_reg32(&mut self, offset: u64, value: u32) {
-        unsafe { ptr::write_volatile((self.mmio_base + offset) as *mut u32, value) }
-    }
-
-    /// Write a 64-bit register
-    fn write_reg64(&mut self, offset: u64, value: u64) {
-        unsafe { ptr::write_volatile((self.mmio_base + offset) as *mut u64, value) }
+    /// Write a doorbell register (doorbells are outside the typed register struct)
+    #[inline]
+    fn write_doorbell(&self, offset: u64, value: u32) {
+        unsafe {
+            ptr::write_volatile((self.mmio_base + offset) as *mut u32, value);
+        }
     }
 
     /// Get doorbell register offset for a queue
@@ -462,41 +552,42 @@ impl NvmeController {
     /// Ring the submission queue doorbell
     fn ring_sq_doorbell(&mut self, queue_id: u16, tail: u16) {
         let offset = self.doorbell_offset(queue_id, false);
-        self.write_reg32(offset, tail as u32);
+        self.write_doorbell(offset, tail as u32);
     }
 
     /// Ring the completion queue doorbell
     fn ring_cq_doorbell(&mut self, queue_id: u16, head: u16) {
         let offset = self.doorbell_offset(queue_id, true);
-        self.write_reg32(offset, head as u32);
+        self.write_doorbell(offset, head as u32);
     }
 
     /// Initialize the controller
     fn init(&mut self) -> Result<(), NvmeError> {
+        let regs = unsafe { &*(self.regs as *const NvmeRegisters as *mut NvmeRegisters) };
+
         // Disable the controller
-        let mut cc = self.read_reg32(regs::CC);
-        cc &= !0x1; // Clear EN bit
-        self.write_reg32(regs::CC, cc);
+        regs.cc.modify(CC::EN::CLEAR);
 
         // Wait for controller to become disabled (up to 1 second)
         let timeout = Timeout::from_ms(1000);
         while !timeout.is_expired() {
-            let csts = self.read_reg32(regs::CSTS);
-            if (csts & 0x1) == 0 {
+            if regs.csts.read(CSTS::RDY) == 0 {
                 break;
             }
             core::hint::spin_loop();
         }
 
         // Set admin queue attributes
-        let aqa = ((ADMIN_QUEUE_SIZE - 1) as u32) << 16 | ((ADMIN_QUEUE_SIZE - 1) as u32);
-        self.write_reg32(regs::AQA, aqa);
+        regs.aqa.write(
+            AQA::ASQS.val((ADMIN_QUEUE_SIZE - 1) as u32)
+                + AQA::ACQS.val((ADMIN_QUEUE_SIZE - 1) as u32),
+        );
 
         // Set admin submission queue base address
-        self.write_reg64(regs::ASQ, self.admin_sq as u64);
+        regs.asq.set(self.admin_sq as u64);
 
         // Set admin completion queue base address
-        self.write_reg64(regs::ACQ, self.admin_cq as u64);
+        regs.acq.set(self.admin_cq as u64);
 
         // Configure controller:
         // - Memory Page Size (MPS) = 0 (4KB)
@@ -505,26 +596,31 @@ impl NvmeController {
         // - Shutdown Notification (SHN) = 0
         // - I/O Submission Queue Entry Size (IOSQES) = 6 (64 bytes)
         // - I/O Completion Queue Entry Size (IOCQES) = 4 (16 bytes)
-        let cc = 0x00460001u32; // EN=1, CSS=0, MPS=0, IOSQES=6, IOCQES=4
-        self.write_reg32(regs::CC, cc);
+        regs.cc.write(
+            CC::EN::SET
+                + CC::CSS.val(0)
+                + CC::MPS.val(0)
+                + CC::AMS.val(0)
+                + CC::SHN.val(0)
+                + CC::IOSQES.val(6)
+                + CC::IOCQES.val(4),
+        );
 
         // Wait for controller to become ready (up to 2 seconds per spec)
         let timeout = Timeout::from_ms(2000);
         while !timeout.is_expired() {
-            let csts = self.read_reg32(regs::CSTS);
-            if (csts & 0x1) != 0 {
+            if regs.csts.read(CSTS::RDY) != 0 {
                 log::debug!("NVMe controller ready");
                 break;
             }
-            if (csts & 0x2) != 0 {
+            if regs.csts.read(CSTS::CFS) != 0 {
                 log::error!("Controller fatal status!");
                 return Err(NvmeError::NotReady);
             }
             core::hint::spin_loop();
         }
 
-        let csts = self.read_reg32(regs::CSTS);
-        if (csts & 0x1) == 0 {
+        if regs.csts.read(CSTS::RDY) == 0 {
             return Err(NvmeError::NotReady);
         }
 
