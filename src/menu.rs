@@ -413,14 +413,24 @@ fn discover_usb_entries_generic(menu: &mut BootMenu) {
             device_addr
         );
 
+        // Get the controller pointer for storing globally
+        let controller_ptr = match usb::get_controller_ptr(controller_id) {
+            Some(ptr) => ptr,
+            None => {
+                log::error!("Failed to get controller {} pointer", controller_id);
+                return;
+            }
+        };
+
         // Use with_controller to create the mass storage device
         let device_created = usb::with_controller(controller_id, |controller| {
             match UsbMassStorage::new_generic(controller, device_addr) {
                 Ok(usb_device) => {
-                    // Store device globally WITH controller ID so global_read_sector knows which controller to use
-                    mass_storage::store_global_device_with_controller(
+                    // Store device globally WITH controller pointer so global_read_sector can use it directly
+                    // This avoids lock contention since we store the pointer, not just the ID
+                    mass_storage::store_global_device_with_controller_ptr(
                         usb_device,
-                        Some(controller_id),
+                        controller_ptr,
                     )
                 }
                 Err(e) => {

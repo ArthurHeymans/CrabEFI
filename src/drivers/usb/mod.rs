@@ -369,6 +369,28 @@ where
     Some(result)
 }
 
+/// Get a raw pointer to a controller
+///
+/// This is useful when you need to store the controller pointer for later use,
+/// such as in global_read_sector. The pointer remains valid for the entire boot
+/// process since controllers are allocated via efi::allocate_pages and never freed.
+///
+/// # Safety
+/// The caller must ensure the controller is not accessed after ExitBootServices.
+pub fn get_controller_ptr(index: usize) -> Option<*mut dyn UsbController> {
+    let controllers = ALL_CONTROLLERS.lock();
+    let handle = controllers.get(index)?;
+
+    let ptr: *mut dyn UsbController = match handle {
+        UsbControllerHandle::Xhci(p) => *p as *mut dyn UsbController,
+        UsbControllerHandle::Ehci(p) => *p as *mut dyn UsbController,
+        UsbControllerHandle::Ohci(p) => *p as *mut dyn UsbController,
+        UsbControllerHandle::Uhci(p) => *p as *mut dyn UsbController,
+    };
+
+    Some(ptr)
+}
+
 // ============================================================================
 // UsbController impl for XhciController (for compatibility)
 // ============================================================================

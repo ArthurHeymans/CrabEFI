@@ -490,30 +490,45 @@ impl UsbMassStorage {
 use crate::efi;
 use spin::Mutex;
 
-/// Pointer wrapper for global storage
-struct UsbMassStoragePtr(*mut UsbMassStorage);
-
-// Safety: We use mutex protection for all access
-unsafe impl Send for UsbMassStoragePtr {}
-
-/// Global USB mass storage device and its controller ID
-static GLOBAL_USB_DEVICE: Mutex<Option<UsbMassStoragePtr>> = Mutex::new(None);
-
-/// Controller ID for the global device (None = xHCI legacy, Some(id) = generic)
-static GLOBAL_CONTROLLER_ID: Mutex<Option<usize>> = Mutex::new(None);
-
-/// Store a USB mass storage device globally
-///
-/// This takes ownership of the device and stores it for later use by the
-/// filesystem protocol.
-pub fn store_global_device(device: UsbMassStorage) -> bool {
-    store_global_device_with_controller(device, None)
+/// Global state for USB mass storage
+struct GlobalUsbState {
+    /// Pointer to the mass storage device
+    device_ptr: *mut UsbMassStorage,
+    /// Pointer to the controller (as trait object)
+    /// This is stored directly to avoid lock contention during reads
+    controller_ptr: *mut dyn UsbController,
 }
 
-/// Store a USB mass storage device globally with a specific controller ID
-pub fn store_global_device_with_controller(
+// Safety: Pointers are only accessed with proper synchronization via the mutex
+unsafe impl Send for GlobalUsbState {}
+
+/// Global USB mass storage device and controller
+static GLOBAL_USB_STATE: Mutex<Option<GlobalUsbState>> = Mutex::new(None);
+
+/// Store a USB mass storage device globally (xHCI legacy path)
+///
+/// This takes ownership of the device and stores it for later use by the
+/// filesystem protocol. Uses xhci::get_controller(0) for the controller.
+pub fn store_global_device(device: UsbMassStorage) -> bool {
+    // Get the xHCI controller pointer for the legacy path
+    let controller_ptr = match super::xhci::get_controller(0) {
+        Some(c) => c as *mut dyn UsbController,
+        None => {
+            log::error!("Failed to get xHCI controller for global device");
+            return false;
+        }
+    };
+
+    store_global_device_with_controller_ptr(device, controller_ptr)
+}
+
+/// Store a USB mass storage device globally with a specific controller pointer
+///
+/// This version takes the controller pointer directly, avoiding the need to
+/// look up the controller later (which could cause lock contention).
+pub fn store_global_device_with_controller_ptr(
     device: UsbMassStorage,
-    controller_id: Option<usize>,
+    controller_ptr: *mut dyn UsbController,
 ) -> bool {
     // Allocate memory for the device
     let size = core::mem::size_of::<UsbMassStorage>();
@@ -525,12 +540,11 @@ pub fn store_global_device_with_controller(
             core::ptr::write(device_ptr, device);
         }
 
-        *GLOBAL_USB_DEVICE.lock() = Some(UsbMassStoragePtr(device_ptr));
-        *GLOBAL_CONTROLLER_ID.lock() = controller_id;
-        log::info!(
-            "USB mass storage device stored globally (controller: {:?})",
-            controller_id
-        );
+        *GLOBAL_USB_STATE.lock() = Some(GlobalUsbState {
+            device_ptr,
+            controller_ptr,
+        });
+        log::info!("USB mass storage device stored globally");
         true
     } else {
         log::error!("Failed to allocate memory for global USB device");
@@ -540,46 +554,35 @@ pub fn store_global_device_with_controller(
 
 /// Get a reference to the global USB mass storage device
 pub fn get_global_device() -> Option<&'static mut UsbMassStorage> {
-    GLOBAL_USB_DEVICE
+    GLOBAL_USB_STATE
         .lock()
         .as_ref()
-        .map(|ptr| unsafe { &mut *ptr.0 })
+        .map(|state| unsafe { &mut *state.device_ptr })
 }
 
 /// Read a sector from the global USB device
 ///
 /// This function can be used as the read callback for the SimpleFileSystem protocol.
+/// It uses the stored controller pointer directly to avoid lock contention.
 pub fn global_read_sector(lba: u64, buffer: &mut [u8]) -> Result<(), ()> {
     log::trace!("USB mass storage: read LBA {}", lba);
 
-    // Get the device pointer (release lock immediately to avoid deadlock)
-    let device_ptr = {
-        let guard = GLOBAL_USB_DEVICE.lock();
+    // Get the device and controller pointers (release lock immediately)
+    let (device_ptr, controller_ptr) = {
+        let guard = GLOBAL_USB_STATE.lock();
         match guard.as_ref() {
-            Some(ptr) => ptr.0,
+            Some(state) => (state.device_ptr, state.controller_ptr),
             None => {
                 log::error!("USB mass storage: no device configured");
                 return Err(());
             }
         }
     };
+
+    // Safety: Pointers were set up during store_global_device and remain valid
+    // for the entire boot process (memory is allocated via efi::allocate_pages)
     let device = unsafe { &mut *device_ptr };
-
-    // Get the controller ID (defaults to 0 if not set)
-    let controller_id = GLOBAL_CONTROLLER_ID.lock().unwrap_or(0);
-
-    // Use the xHCI-specific controller path to match how the device was initialized
-    // (the device is created via xhci::get_controller in try_boot_from_usb)
-    let controller = match super::xhci::get_controller(controller_id) {
-        Some(c) => c,
-        None => {
-            log::error!(
-                "USB mass storage: xHCI controller {} not found",
-                controller_id
-            );
-            return Err(());
-        }
-    };
+    let controller = unsafe { &mut *controller_ptr };
 
     device
         .read_sectors_generic(controller, lba, 1, buffer)

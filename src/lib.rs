@@ -418,6 +418,16 @@ fn boot_selected_entry(entry: &menu::BootEntry) {
         } => {
             use drivers::storage::{self, StorageType};
 
+            // Get the controller pointer directly (no lock needed for the boot phase
+            // since global_read_sector stores the pointer)
+            let controller_ptr = match drivers::usb::get_controller_ptr(controller_id) {
+                Some(ptr) => ptr,
+                None => {
+                    log::error!("Failed to get USB controller {}", controller_id);
+                    return;
+                }
+            };
+
             // USB device should already be stored globally from discovery
             if let Some(usb_device) = drivers::usb::mass_storage::get_global_device() {
                 // Get disk info for storage registration
@@ -437,45 +447,38 @@ fn boot_selected_entry(entry: &menu::BootEntry) {
                     }
                 };
 
-                // Use with_controller to set up protocols (but NOT execute bootloader)
-                // This avoids deadlock since bootloader execution needs global_read_sector
-                // which also tries to acquire the controller lock
-                let setup_success = drivers::usb::with_controller(controller_id, |controller| {
-                    if let Some(usb_device) = drivers::usb::mass_storage::get_global_device() {
-                        // Create disk for partition installation
-                        let mut disk = fs::gpt::GenericUsbDisk::new(usb_device, controller);
+                // Safety: controller_ptr is valid for the entire boot process
+                let controller = unsafe { &mut *controller_ptr };
 
-                        // Install BlockIO for ALL partitions (GRUB needs this to enumerate)
-                        let _ = install_block_io_for_disk(
-                            &mut disk,
-                            storage_id,
-                            block_size,
-                            num_blocks,
-                            entry.pci_device,
-                            entry.pci_function,
-                            0, // USB port
-                        );
+                // Create disk for partition installation
+                if let Some(usb_device) = drivers::usb::mass_storage::get_global_device() {
+                    let mut disk = fs::gpt::GenericUsbDisk::new(usb_device, controller);
 
-                        // Set up SimpleFileSystem protocol for the ESP
-                        if let Some(usb_device) = drivers::usb::mass_storage::get_global_device() {
-                            let mut disk = fs::gpt::GenericUsbDisk::new(usb_device, controller);
-                            return setup_usb_esp_protocols(
-                                &mut disk,
-                                &entry.partition,
-                                entry.partition_num,
-                                entry.pci_device,
-                                entry.pci_function,
-                                0, // USB port (default)
-                            );
-                        }
-                    }
-                    false
-                });
+                    // Install BlockIO for ALL partitions (GRUB needs this to enumerate)
+                    let _ = install_block_io_for_disk(
+                        &mut disk,
+                        storage_id,
+                        block_size,
+                        num_blocks,
+                        entry.pci_device,
+                        entry.pci_function,
+                        0, // USB port
+                    );
+                }
 
-                // Now that controller lock is released, execute the bootloader
-                // The bootloader will use global_read_sector which can now acquire the lock
-                if setup_success == Some(true) {
-                    if execute_usb_bootloader() {
+                // Re-get usb_device and controller for boot attempt
+                // (previous borrows have ended)
+                let controller = unsafe { &mut *controller_ptr };
+                if let Some(usb_device) = drivers::usb::mass_storage::get_global_device() {
+                    let mut disk = fs::gpt::GenericUsbDisk::new(usb_device, controller);
+                    if try_boot_from_esp_usb(
+                        &mut disk,
+                        &entry.partition,
+                        entry.partition_num,
+                        entry.pci_device,
+                        entry.pci_function,
+                        0, // USB port (default)
+                    ) {
                         return;
                     }
                 }
@@ -1278,140 +1281,6 @@ fn install_block_io_for_ahci_disk<R: fs::gpt::SectorRead>(
     }
 
     None
-}
-
-/// Set up ESP protocols for USB (SimpleFileSystem, DevicePath, BlockIO)
-/// Returns true if setup succeeded
-///
-/// This is used to set up protocols while holding the controller lock,
-/// before releasing it to execute the bootloader.
-fn setup_usb_esp_protocols<D: fs::gpt::SectorRead>(
-    disk: &mut D,
-    esp: &fs::gpt::Partition,
-    partition_num: u32,
-    pci_device: u8,
-    pci_function: u8,
-    usb_port: u8,
-) -> bool {
-    use drivers::storage::{self, StorageType};
-    use efi::boot_services;
-    use efi::protocols::block_io::{self, BLOCK_IO_PROTOCOL_GUID};
-    use efi::protocols::device_path::{self, DEVICE_PATH_PROTOCOL_GUID};
-    use efi::protocols::simple_file_system::{self, SIMPLE_FILE_SYSTEM_GUID};
-    use r_efi::efi::Status;
-
-    // Extract filesystem state BEFORE creating FatFilesystem to avoid borrow conflict
-    let fs_state = extract_fat_state(disk, esp.first_lba);
-
-    // Check if we can mount FAT
-    if fs::fat::FatFilesystem::new(disk, esp.first_lba).is_err() {
-        log::error!("Failed to mount FAT filesystem on ESP");
-        return false;
-    }
-
-    log::info!("FAT filesystem mountable on ESP");
-
-    // Initialize SimpleFileSystem protocol
-    let sfs_protocol =
-        simple_file_system::init(fs_state, drivers::usb::mass_storage::global_read_sector);
-
-    // Create a device handle with SimpleFileSystem and DevicePath protocols
-    let device_handle = match boot_services::create_handle() {
-        Some(h) => h,
-        None => {
-            log::error!("Failed to create device handle");
-            return false;
-        }
-    };
-
-    // Install DevicePath protocol
-    let partition_size = esp.size_sectors();
-    let device_path = device_path::create_usb_partition_device_path(
-        pci_device,
-        pci_function,
-        usb_port,
-        partition_num,
-        esp.first_lba,
-        partition_size,
-        &esp.partition_guid,
-    );
-
-    if !device_path.is_null() {
-        let status = boot_services::install_protocol(
-            device_handle,
-            &DEVICE_PATH_PROTOCOL_GUID,
-            device_path as *mut core::ffi::c_void,
-        );
-        if status == Status::SUCCESS {
-            log::info!(
-                "DevicePath protocol installed on device handle {:?}",
-                device_handle
-            );
-        }
-    }
-
-    // Install BlockIO protocol
-    if let Some(usb_device) = drivers::usb::mass_storage::get_global_device() {
-        let block_size = usb_device.block_size;
-        let num_blocks = usb_device.num_blocks;
-        let slot_id = usb_device.slot_id();
-
-        let storage_id =
-            storage::register_device(StorageType::Usb { slot_id }, num_blocks, block_size);
-
-        if let Some(storage_id) = storage_id {
-            let block_io = block_io::create_partition_block_io(
-                storage_id,
-                partition_num,
-                esp.first_lba,
-                partition_size,
-                block_size,
-            );
-
-            if !block_io.is_null() {
-                let status = boot_services::install_protocol(
-                    device_handle,
-                    &BLOCK_IO_PROTOCOL_GUID,
-                    block_io as *mut core::ffi::c_void,
-                );
-                if status == Status::SUCCESS {
-                    log::info!(
-                        "BlockIO protocol installed on device handle {:?}",
-                        device_handle
-                    );
-                }
-            }
-        }
-    }
-
-    // Install SimpleFileSystem protocol
-    let status = boot_services::install_protocol(
-        device_handle,
-        &SIMPLE_FILE_SYSTEM_GUID,
-        sfs_protocol as *mut core::ffi::c_void,
-    );
-
-    if status != Status::SUCCESS {
-        log::error!("Failed to install SimpleFileSystem protocol: {:?}", status);
-        return false;
-    }
-
-    log::info!(
-        "SimpleFileSystem protocol installed on device handle {:?}",
-        device_handle
-    );
-    true
-}
-
-/// Execute the USB bootloader after protocols have been set up
-///
-/// This is called after releasing the controller lock to avoid deadlocks.
-fn execute_usb_bootloader() -> bool {
-    // The bootloader will be loaded via the SimpleFileSystem protocol
-    // which uses global_read_sector that needs the controller lock
-    log::info!("USB bootloader execution via SimpleFileSystem not yet implemented");
-    log::info!("Use try_boot_from_esp_usb instead which handles locking correctly");
-    false
 }
 
 /// Try to boot from an ESP on a given disk (generic version)
