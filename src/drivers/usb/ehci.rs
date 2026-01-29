@@ -557,6 +557,14 @@ pub struct EhciController {
     qh_pool: u64,
     /// qTD pool
     qtd_pool: u64,
+    /// Bulk transfer QH (kept linked for performance)
+    bulk_qh: u64,
+    /// Bulk transfer qTD
+    bulk_qtd: u64,
+    /// Whether bulk QH is linked to async schedule
+    bulk_qh_linked: bool,
+    /// Async schedule is enabled
+    async_schedule_enabled: bool,
 }
 
 impl EhciController {
@@ -615,6 +623,11 @@ impl EhciController {
         let qtd_pool = efi::allocate_pages_below_4g(2).ok_or(UsbError::AllocationFailed)?;
         unsafe { ptr::write_bytes(qtd_pool as *mut u8, 0, 8192) };
 
+        // Dedicated bulk transfer structures (kept linked for performance)
+        // Use offsets within the pools: bulk_qh at qh_pool+256, bulk_qtd at qtd_pool+512
+        let bulk_qh = qh_pool + 256;
+        let bulk_qtd = qtd_pool + 512;
+
         let mut controller = Self {
             pci_address: pci_dev.address,
             mmio_base,
@@ -629,6 +642,10 @@ impl EhciController {
             dma_buffer,
             qh_pool,
             qtd_pool,
+            bulk_qh,
+            bulk_qtd,
+            bulk_qh_linked: false,
+            async_schedule_enabled: false,
         };
 
         // Take ownership from BIOS
@@ -1449,7 +1466,7 @@ impl EhciController {
         Ok(data_len)
     }
 
-    /// Perform a bulk transfer
+    /// Perform a bulk transfer (optimized - keeps QH linked)
     fn bulk_transfer_internal(
         &mut self,
         device: &UsbDevice,
@@ -1472,21 +1489,23 @@ impl EhciController {
                 .unwrap_or(512)
         };
 
-        // Use DMA buffer
+        // Use DMA buffer for data
         let data_addr = self.dma_buffer;
-        let qh_addr = self.qh_pool + 128;
-        let qtd_addr = self.qtd_pool + 256;
+        let qh_addr = self.bulk_qh;
+        let qtd_addr = self.bulk_qtd;
 
-        // Copy OUT data
+        // Copy OUT data to DMA buffer
         if !is_in {
             unsafe {
                 ptr::copy_nonoverlapping(data.as_ptr(), data_addr as *mut u8, data.len());
             }
+            flush_cache_range(data_addr, data.len());
         }
 
         // Build qTD
         let qtd = unsafe { &mut *(qtd_addr as *mut Qtd) };
-        *qtd = Qtd::new();
+        qtd.next_qtd = Qtd::TERMINATE;
+        qtd.alt_next_qtd = Qtd::TERMINATE;
         qtd.token = Qtd::TOKEN_STATUS_ACTIVE
             | (if is_in {
                 Qtd::TOKEN_PID_IN
@@ -1499,31 +1518,42 @@ impl EhciController {
             | ((data.len() as u32) << Qtd::TOKEN_BYTES_SHIFT);
         qtd.set_buffers(data_addr, data.len());
 
-        // Build QH
+        fence(Ordering::SeqCst);
+
+        // Configure QH - always update for correct device/endpoint
         let qh = unsafe { &mut *(qh_addr as *mut Qh) };
-        *qh = Qh::new();
+
+        // Link QH into async schedule if not already linked
+        if !self.bulk_qh_linked {
+            *qh = Qh::new();
+
+            // Link QH into async schedule (keep it linked)
+            let async_qh = unsafe { &mut *(self.async_qh as *mut Qh) };
+            qh.qh_link = async_qh.qh_link;
+            async_qh.qh_link = (qh_addr as u32) | Qh::TYPE_QH;
+            self.bulk_qh_linked = true;
+
+            fence(Ordering::SeqCst);
+        }
+
+        // Always reconfigure QH for current device/endpoint (ep_chars changes per transfer)
         qh.configure(device.address, endpoint, max_packet, device.speed, false);
+
+        // Update QH overlay to point to new qTD
         qh.overlay.next_qtd = qtd_addr as u32;
         qh.overlay.alt_next_qtd = Qtd::TERMINATE;
-        qh.overlay.token = 0;
+        qh.overlay.token = 0; // Clear ACTIVE to let HC fetch new qTD
 
         fence(Ordering::SeqCst);
 
-        // Link QH into async schedule
-        let async_qh = unsafe { &mut *(self.async_qh as *mut Qh) };
-        let old_link = async_qh.qh_link;
-        qh.qh_link = old_link;
-        async_qh.qh_link = (qh_addr as u32) | Qh::TYPE_QH;
-
-        fence(Ordering::SeqCst);
-
-        // Enable async schedule
-        let cmd = self.read_op(0x00);
-        if (cmd & usbcmd::ASE) == 0 {
+        // Enable async schedule if not already enabled
+        if !self.async_schedule_enabled {
+            let cmd = self.read_op(0x00);
             self.write_op(0x00, cmd | usbcmd::ASE);
             let timeout = Timeout::from_ms(100);
             while !timeout.is_expired() {
                 if (self.read_op(0x04) & usbsts::ASS) != 0 {
+                    self.async_schedule_enabled = true;
                     break;
                 }
                 core::hint::spin_loop();
@@ -1534,50 +1564,46 @@ impl EhciController {
         let timeout = Timeout::from_ms(5000);
         while !timeout.is_expired() {
             fence(Ordering::SeqCst);
-            if !qtd.is_active() {
+            let token = unsafe { ptr::read_volatile(&(*(qtd_addr as *const Qtd)).token) };
+            if (token & Qtd::TOKEN_STATUS_ACTIVE) == 0 {
                 break;
             }
             core::hint::spin_loop();
         }
 
-        // Unlink QH
-        async_qh.qh_link = old_link;
-        fence(Ordering::SeqCst);
+        // Check results (read token again)
+        let token = unsafe { ptr::read_volatile(&(*(qtd_addr as *const Qtd)).token) };
 
-        // Ring doorbell
-        self.write_op(0x04, usbsts::IAA);
-        let cmd = self.read_op(0x00);
-        self.write_op(0x00, cmd | usbcmd::IAAD);
-
-        let timeout2 = Timeout::from_ms(100);
-        while !timeout2.is_expired() {
-            if (self.read_op(0x04) & usbsts::IAA) != 0 {
-                self.write_op(0x04, usbsts::IAA);
-                break;
-            }
-            core::hint::spin_loop();
-        }
-
-        // Check results
-        if qtd.is_active() {
+        if (token & Qtd::TOKEN_STATUS_ACTIVE) != 0 {
             return Err(UsbError::Timeout);
         }
 
-        if qtd.has_error() {
-            if qtd.is_halted() {
+        if (token
+            & (Qtd::TOKEN_STATUS_HALTED
+                | Qtd::TOKEN_STATUS_BUFFER_ERR
+                | Qtd::TOKEN_STATUS_BABBLE
+                | Qtd::TOKEN_STATUS_XACT_ERR))
+            != 0
+        {
+            if (token & Qtd::TOKEN_STATUS_HALTED) != 0 {
+                // Clear halt by unlinking and relinking QH
+                self.bulk_qh_linked = false;
                 return Err(UsbError::Stall);
             }
             return Err(UsbError::TransactionError);
         }
 
-        let transferred = qtd.bytes_transferred(data.len());
+        // Calculate bytes transferred
+        let remaining = ((token >> Qtd::TOKEN_BYTES_SHIFT) & 0x7FFF) as usize;
+        let transferred = data.len().saturating_sub(remaining);
 
         // Toggle flips for each max-packet-sized transaction
         let packets = (transferred + max_packet as usize - 1) / max_packet as usize;
         let new_toggle = if packets % 2 == 1 { !toggle } else { toggle };
 
-        // Copy IN data
-        if is_in {
+        // Copy IN data from DMA buffer
+        if is_in && transferred > 0 {
+            invalidate_cache_range(data_addr, transferred);
             unsafe {
                 ptr::copy_nonoverlapping(data_addr as *const u8, data.as_mut_ptr(), transferred);
             }
