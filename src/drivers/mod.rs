@@ -7,6 +7,7 @@ pub mod block;
 pub mod keyboard;
 pub mod nvme;
 pub mod pci;
+pub mod sdhci;
 pub mod serial;
 pub mod storage;
 pub mod usb;

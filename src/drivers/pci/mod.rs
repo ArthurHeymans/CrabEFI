@@ -35,7 +35,11 @@ pub const CLASS_DISPLAY: u8 = 0x03;
 pub const CLASS_MULTIMEDIA: u8 = 0x04;
 pub const CLASS_MEMORY: u8 = 0x05;
 pub const CLASS_BRIDGE: u8 = 0x06;
+pub const CLASS_SYSTEM: u8 = 0x08;
 pub const CLASS_SERIAL: u8 = 0x0C;
+
+/// System peripheral subclasses
+pub const SUBCLASS_SDHCI: u8 = 0x05; // SD Host Controller
 
 /// Invalid vendor ID (no device present)
 const INVALID_VENDOR_ID: u16 = 0xFFFF;
@@ -170,6 +174,11 @@ impl PciDevice {
     /// Check if this is a USB host controller
     pub fn is_usb_controller(&self) -> bool {
         self.class_code == CLASS_SERIAL && self.subclass == 0x03
+    }
+
+    /// Check if this is an SDHCI (SD Host Controller Interface) device
+    pub fn is_sdhci(&self) -> bool {
+        self.class_code == CLASS_SYSTEM && self.subclass == SUBCLASS_SDHCI
     }
 }
 
@@ -467,6 +476,27 @@ pub fn find_ahci_controllers() -> Vec<PciDevice, 8> {
     }
 
     ahci_devices
+}
+
+/// Find all SDHCI controllers
+pub fn find_sdhci_controllers() -> Vec<PciDevice, 8> {
+    let drivers = state::drivers();
+    let devices = &drivers.pci_devices;
+    let mut sdhci_devices = Vec::new();
+
+    for dev in devices.iter() {
+        if dev.is_sdhci() {
+            log::info!(
+                "Found SDHCI controller at {}: {:04x}:{:04x}",
+                dev.address,
+                dev.vendor_id,
+                dev.device_id
+            );
+            let _ = sdhci_devices.push(dev.clone());
+        }
+    }
+
+    sdhci_devices
 }
 
 /// Get all enumerated PCI devices

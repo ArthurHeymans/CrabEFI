@@ -12,7 +12,7 @@
 //! - Future: file browser, EFI variable support
 
 use crate::coreboot;
-use crate::drivers::block::{AhciDisk, BlockDevice, NvmeDisk, UsbDisk};
+use crate::drivers::block::{AhciDisk, BlockDevice, NvmeDisk, SdhciDisk, UsbDisk};
 use crate::drivers::keyboard;
 use crate::drivers::serial as serial_driver;
 use crate::framebuffer_console::{
@@ -47,6 +47,8 @@ pub enum DeviceType {
         controller_id: usize,
         device_addr: u8,
     },
+    /// SDHCI (SD card)
+    Sdhci { controller_id: usize },
 }
 
 impl DeviceType {
@@ -56,6 +58,7 @@ impl DeviceType {
             DeviceType::Nvme { .. } => "NVMe",
             DeviceType::Ahci { .. } => "SATA",
             DeviceType::Usb { .. } => "USB",
+            DeviceType::Sdhci { .. } => "SD",
         }
     }
 }
@@ -197,6 +200,9 @@ pub fn discover_boot_entries() -> BootMenu {
 
     // Scan USB devices
     discover_usb_entries(&mut menu);
+
+    // Scan SDHCI devices (SD cards)
+    discover_sdhci_entries(&mut menu);
 
     log::info!("Found {} boot entries", menu.entry_count());
 
@@ -411,6 +417,66 @@ fn discover_usb_entries(menu: &mut BootMenu) {
                 }
             }
         });
+    }
+}
+
+/// Discover boot entries from SDHCI devices (SD cards)
+fn discover_sdhci_entries(menu: &mut BootMenu) {
+    use crate::drivers::sdhci;
+
+    for controller_id in 0..sdhci::controller_count() {
+        if let Some(controller) = sdhci::get_controller(controller_id) {
+            if !controller.is_ready() {
+                continue;
+            }
+
+            let pci_addr = controller.pci_address();
+
+            // Store device globally for reading
+            if !sdhci::store_global_device(controller_id) {
+                continue;
+            }
+
+            // Create disk for GPT reading
+            if let Some(controller) = sdhci::get_controller(controller_id) {
+                let mut disk = SdhciDisk::new(controller);
+
+                // Read GPT and find partitions
+                if let Ok(header) = gpt::read_gpt_header(&mut disk) {
+                    if let Ok(partitions) = gpt::read_partitions(&mut disk, &header) {
+                        for (i, partition) in partitions.iter().enumerate() {
+                            let partition_num = (i + 1) as u32;
+
+                            // Check if this is an ESP or potential boot partition
+                            if partition.is_esp || is_potential_esp(partition) {
+                                // Try to find bootloader on this partition
+                                if let Some(controller) = sdhci::get_controller(controller_id) {
+                                    let mut disk = SdhciDisk::new(controller);
+                                    if check_bootloader_exists(&mut disk, partition.first_lba) {
+                                        let mut name: String<64> = String::new();
+                                        let _ = write!(name, "Boot Entry (SD card)");
+
+                                        let entry = BootEntry::new(
+                                            &name,
+                                            "EFI\\BOOT\\BOOTX64.EFI",
+                                            DeviceType::Sdhci { controller_id },
+                                            partition_num,
+                                            partition.clone(),
+                                            pci_addr.device,
+                                            pci_addr.function,
+                                        );
+
+                                        if !menu.add_entry(entry) {
+                                            return; // Menu full
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 

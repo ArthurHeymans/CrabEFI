@@ -24,7 +24,7 @@ pub mod pe;
 pub mod state;
 pub mod time;
 
-use crate::drivers::block::{AhciDisk, BlockDevice, NvmeDisk, UsbDisk};
+use crate::drivers::block::{AhciDisk, BlockDevice, NvmeDisk, SdhciDisk, UsbDisk};
 use core::panic::PanicInfo;
 
 /// Global panic handler
@@ -198,6 +198,7 @@ fn init_storage() {
     drivers::nvme::init();
     drivers::ahci::init();
     drivers::usb::init_all();
+    drivers::sdhci::init();
 
     // Discover boot entries and show menu
     let mut boot_menu = menu::discover_boot_entries();
@@ -439,6 +440,65 @@ fn boot_selected_entry(entry: &menu::BootEntry) {
                 }
             }
             log::error!("Failed to boot USB entry");
+        }
+        menu::DeviceType::Sdhci { controller_id } => {
+            use drivers::storage::{self, StorageType};
+
+            // Ensure device is stored globally
+            if !drivers::sdhci::store_global_device(controller_id) {
+                log::error!("Failed to store SDHCI device globally");
+                return;
+            }
+
+            if let Some(controller) = drivers::sdhci::get_controller(controller_id) {
+                // Get disk info for storage registration
+                let num_blocks = controller.num_blocks();
+                let block_size = controller.block_size();
+
+                // Register with storage abstraction (needed for BlockIO)
+                let storage_id = match storage::register_device(
+                    StorageType::Sdhci { controller_id },
+                    num_blocks,
+                    block_size,
+                ) {
+                    Some(id) => id,
+                    None => {
+                        log::error!("Failed to register SDHCI device with storage");
+                        return;
+                    }
+                };
+
+                // Get PCI address
+                let pci_addr = controller.pci_address();
+
+                // Create disk for partition installation
+                let mut disk = SdhciDisk::new(controller);
+
+                // Install BlockIO for ALL partitions (GRUB needs this to enumerate)
+                let _ = install_block_io_for_sdhci_disk(
+                    &mut disk,
+                    storage_id,
+                    block_size,
+                    num_blocks,
+                    pci_addr.device,
+                    pci_addr.function,
+                );
+
+                // Re-create disk and boot from ESP
+                if let Some(controller) = drivers::sdhci::get_controller(controller_id) {
+                    let mut disk = SdhciDisk::new(controller);
+                    if try_boot_from_esp_sdhci(
+                        &mut disk,
+                        &entry.partition,
+                        entry.partition_num,
+                        entry.pci_device,
+                        entry.pci_function,
+                    ) {
+                        return;
+                    }
+                }
+            }
+            log::error!("Failed to boot SDHCI entry");
         }
     }
 }
@@ -1748,4 +1808,346 @@ fn load_and_execute_bootloader<R: BlockDevice>(
     } else {
         Err(exec_status)
     }
+}
+
+/// Install BlockIO protocols for an SDHCI disk and all its partitions
+///
+/// Returns the ESP partition and its partition number (1-based) if found.
+///
+/// # Arguments
+/// * `disk` - Disk to read GPT from
+/// * `storage_id` - Storage device ID for BlockIO
+/// * `block_size` - Block size in bytes
+/// * `num_blocks` - Total number of blocks
+/// * `pci_device` - PCI device number of the SDHCI controller
+/// * `pci_function` - PCI function number
+fn install_block_io_for_sdhci_disk<R: BlockDevice>(
+    disk: &mut R,
+    storage_id: u32,
+    block_size: u32,
+    num_blocks: u64,
+    pci_device: u8,
+    pci_function: u8,
+) -> Option<(u32, fs::gpt::Partition)> {
+    use efi::boot_services;
+    use efi::protocols::block_io::{self, BLOCK_IO_PROTOCOL_GUID};
+    use efi::protocols::device_path::{self, DEVICE_PATH_PROTOCOL_GUID};
+    use r_efi::efi::Status;
+
+    // First, create BlockIO for the raw disk (whole device)
+    let disk_block_io = block_io::create_disk_block_io(storage_id, num_blocks, block_size);
+
+    if !disk_block_io.is_null() {
+        if let Some(disk_handle) = boot_services::create_handle() {
+            // Install BlockIO protocol
+            let status = boot_services::install_protocol(
+                disk_handle,
+                &BLOCK_IO_PROTOCOL_GUID,
+                disk_block_io as *mut core::ffi::c_void,
+            );
+            if status == Status::SUCCESS {
+                log::info!(
+                    "BlockIO protocol installed for raw SDHCI disk on handle {:?}",
+                    disk_handle
+                );
+            }
+
+            // Install DevicePath protocol for the raw disk (SD device path)
+            // Use USB device path format for now (SD cards are often USB-connected logically)
+            let disk_device_path = device_path::create_usb_device_path(pci_device, pci_function, 0);
+            if !disk_device_path.is_null() {
+                let status = boot_services::install_protocol(
+                    disk_handle,
+                    &DEVICE_PATH_PROTOCOL_GUID,
+                    disk_device_path as *mut core::ffi::c_void,
+                );
+                if status == Status::SUCCESS {
+                    log::info!(
+                        "DevicePath protocol installed for raw SDHCI disk on handle {:?}",
+                        disk_handle
+                    );
+                }
+            }
+        }
+    }
+
+    // Read GPT header and all partitions
+    let header = match fs::gpt::read_gpt_header(disk) {
+        Ok(h) => h,
+        Err(e) => {
+            log::debug!("Failed to read GPT header: {:?}", e);
+            return None;
+        }
+    };
+
+    let partitions = match fs::gpt::read_partitions(disk, &header) {
+        Ok(p) => p,
+        Err(e) => {
+            log::debug!("Failed to read partitions: {:?}", e);
+            return None;
+        }
+    };
+
+    let mut esp_partition: Option<(u32, fs::gpt::Partition)> = None;
+    let mut candidate_partitions: heapless::Vec<(u32, fs::gpt::Partition), 8> =
+        heapless::Vec::new();
+
+    // Create BlockIO for each partition
+    for (i, partition) in partitions.iter().enumerate() {
+        let partition_num = (i + 1) as u32;
+        let partition_blocks = partition.size_sectors();
+
+        let partition_block_io = block_io::create_partition_block_io(
+            storage_id,
+            partition_num,
+            partition.first_lba,
+            partition_blocks,
+            block_size,
+        );
+
+        if !partition_block_io.is_null() {
+            if let Some(part_handle) = boot_services::create_handle() {
+                // Install BlockIO
+                let status = boot_services::install_protocol(
+                    part_handle,
+                    &BLOCK_IO_PROTOCOL_GUID,
+                    partition_block_io as *mut core::ffi::c_void,
+                );
+                if status == Status::SUCCESS {
+                    log::info!(
+                        "BlockIO protocol installed for SDHCI partition {} on handle {:?}",
+                        partition_num,
+                        part_handle
+                    );
+                }
+
+                // Install DevicePath for partition
+                let device_path = device_path::create_usb_partition_device_path(
+                    pci_device,
+                    pci_function,
+                    0,
+                    partition_num,
+                    partition.first_lba,
+                    partition_blocks,
+                    &partition.partition_guid,
+                );
+
+                if !device_path.is_null() {
+                    let status = boot_services::install_protocol(
+                        part_handle,
+                        &DEVICE_PATH_PROTOCOL_GUID,
+                        device_path as *mut core::ffi::c_void,
+                    );
+                    if status == Status::SUCCESS {
+                        log::info!(
+                            "DevicePath protocol installed for SDHCI partition {} on handle {:?}",
+                            partition_num,
+                            part_handle
+                        );
+                    }
+                }
+            }
+        }
+
+        // Remember ESP for later (with partition number)
+        if partition.is_esp {
+            log::info!(
+                "Found ESP on SDHCI: partition {}, LBA {}-{} ({} MB)",
+                partition_num,
+                partition.first_lba,
+                partition.last_lba,
+                partition.size_bytes() / (1024 * 1024)
+            );
+            esp_partition = Some((partition_num, partition.clone()));
+        } else {
+            // Track as candidate for fallback (small partitions are more likely to be EFI boot)
+            let size_mb = partition.size_bytes() / (1024 * 1024);
+            if size_mb > 0 && size_mb < 512 && partition.first_lba > 0 {
+                let _ = candidate_partitions.push((partition_num, partition.clone()));
+            }
+        }
+    }
+
+    // If we found a proper ESP, return it
+    if esp_partition.is_some() {
+        return esp_partition;
+    }
+
+    // No proper ESP found - try candidate partitions (smaller ones first)
+    for i in 0..candidate_partitions.len() {
+        for j in (i + 1)..candidate_partitions.len() {
+            if candidate_partitions[j].1.size_bytes() < candidate_partitions[i].1.size_bytes() {
+                let tmp = candidate_partitions[i].clone();
+                candidate_partitions[i] = candidate_partitions[j].clone();
+                candidate_partitions[j] = tmp;
+            }
+        }
+    }
+
+    for (partition_num, partition) in candidate_partitions.iter() {
+        log::debug!(
+            "Trying SDHCI partition {} as potential ESP (no proper ESP found)",
+            partition_num
+        );
+        return Some((*partition_num, partition.clone()));
+    }
+
+    None
+}
+
+/// Try to boot from an ESP on SDHCI (with SimpleFileSystem support)
+///
+/// # Arguments
+/// * `disk` - SDHCI disk to read from
+/// * `esp` - ESP partition info
+/// * `partition_num` - 1-based partition number of the ESP
+/// * `pci_device` - PCI device number of SDHCI controller
+/// * `pci_function` - PCI function number
+fn try_boot_from_esp_sdhci(
+    disk: &mut SdhciDisk,
+    esp: &fs::gpt::Partition,
+    partition_num: u32,
+    pci_device: u8,
+    pci_function: u8,
+) -> bool {
+    use drivers::storage::{self, StorageType};
+    use efi::boot_services;
+    use efi::protocols::block_io::{self, BLOCK_IO_PROTOCOL_GUID};
+    use efi::protocols::device_path::{self, DEVICE_PATH_PROTOCOL_GUID};
+    use efi::protocols::simple_file_system::{self, SIMPLE_FILE_SYSTEM_GUID};
+    use r_efi::efi::Status;
+
+    // Extract filesystem state BEFORE creating FatFilesystem to avoid borrow conflict
+    // This reads the boot sector directly from disk
+    let fs_state = extract_fat_state(disk, esp.first_lba);
+
+    log::debug!(
+        "SDHCI FAT state: type={}, partition_start={}, data_start={}",
+        fs_state.fat_type,
+        fs_state.partition_start,
+        fs_state.data_start
+    );
+
+    match fs::fat::FatFilesystem::new(disk, esp.first_lba) {
+        Ok(mut fat) => {
+            log::info!("FAT filesystem mounted on ESP");
+
+            // Initialize SimpleFileSystem protocol with SDHCI read function
+            let sfs_protocol =
+                simple_file_system::init(fs_state, drivers::sdhci::global_read_sector);
+
+            // Create a device handle with SimpleFileSystem and DevicePath protocols
+            let device_handle = match boot_services::create_handle() {
+                Some(h) => h,
+                None => {
+                    log::error!("Failed to create device handle");
+                    return false;
+                }
+            };
+
+            // Install DevicePath protocol on the device handle
+            let partition_size = esp.size_sectors();
+            let device_path = device_path::create_usb_partition_device_path(
+                pci_device,
+                pci_function,
+                0,
+                partition_num,
+                esp.first_lba,
+                partition_size,
+                &esp.partition_guid,
+            );
+
+            if !device_path.is_null() {
+                let status = boot_services::install_protocol(
+                    device_handle,
+                    &DEVICE_PATH_PROTOCOL_GUID,
+                    device_path as *mut core::ffi::c_void,
+                );
+                if status == Status::SUCCESS {
+                    log::info!(
+                        "DevicePath protocol installed on device handle {:?}",
+                        device_handle
+                    );
+                } else {
+                    log::warn!("Failed to install DevicePath protocol: {:?}", status);
+                }
+            }
+
+            // Install BlockIO protocol on the device handle
+            if let Some(controller) = drivers::sdhci::get_controller(0) {
+                let block_size = controller.block_size();
+                let storage_id = storage::register_device(
+                    StorageType::Sdhci { controller_id: 0 },
+                    controller.num_blocks(),
+                    block_size,
+                );
+
+                if let Some(storage_id) = storage_id {
+                    let block_io = block_io::create_partition_block_io(
+                        storage_id,
+                        partition_num,
+                        esp.first_lba,
+                        partition_size,
+                        block_size,
+                    );
+
+                    if !block_io.is_null() {
+                        let status = boot_services::install_protocol(
+                            device_handle,
+                            &BLOCK_IO_PROTOCOL_GUID,
+                            block_io as *mut core::ffi::c_void,
+                        );
+                        if status == Status::SUCCESS {
+                            log::info!(
+                                "BlockIO protocol installed on device handle {:?}",
+                                device_handle
+                            );
+                        } else {
+                            log::warn!("Failed to install BlockIO protocol: {:?}", status);
+                        }
+                    }
+                }
+            }
+
+            // Install SimpleFileSystem protocol on the device handle
+            let status = boot_services::install_protocol(
+                device_handle,
+                &SIMPLE_FILE_SYSTEM_GUID,
+                sfs_protocol as *mut core::ffi::c_void,
+            );
+
+            if status != Status::SUCCESS {
+                log::error!("Failed to install SimpleFileSystem protocol: {:?}", status);
+                return false;
+            }
+
+            log::info!(
+                "SimpleFileSystem protocol installed on device handle {:?}",
+                device_handle
+            );
+
+            // Look for EFI bootloader
+            let boot_path = "EFI\\BOOT\\BOOTX64.EFI";
+            match fat.file_size(boot_path) {
+                Ok(size) => {
+                    log::info!("Found bootloader: {} ({} bytes)", boot_path, size);
+
+                    // Load and execute the bootloader with device handle
+                    match load_and_execute_bootloader(&mut fat, boot_path, size, device_handle) {
+                        Ok(()) => return true,
+                        Err(e) => {
+                            log::error!("Failed to execute bootloader: {:?}", e);
+                        }
+                    }
+                }
+                Err(e) => {
+                    log::warn!("Bootloader not found: {:?}", e);
+                }
+            }
+        }
+        Err(e) => {
+            log::error!("Failed to mount FAT filesystem: {:?}", e);
+        }
+    }
+    false
 }

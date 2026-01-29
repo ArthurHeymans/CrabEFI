@@ -12,7 +12,7 @@
 //! The `AnyBlockDevice` enum provides type-safe dispatch without trait objects,
 //! similar to how `UsbControllerHandle` works for USB controllers.
 
-use crate::drivers::{ahci, nvme, usb};
+use crate::drivers::{ahci, nvme, sdhci, usb};
 
 /// Standard sector size (512 bytes)
 pub const SECTOR_SIZE: usize = 512;
@@ -76,6 +76,17 @@ impl From<usb::mass_storage::MassStorageError> for BlockError {
         match e {
             usb::mass_storage::MassStorageError::NotReady => BlockError::NoMedia,
             usb::mass_storage::MassStorageError::InvalidParameter => BlockError::InvalidParameter,
+            _ => BlockError::DeviceError,
+        }
+    }
+}
+
+impl From<sdhci::SdhciError> for BlockError {
+    fn from(e: sdhci::SdhciError) -> Self {
+        match e {
+            sdhci::SdhciError::NoCard => BlockError::NoMedia,
+            sdhci::SdhciError::InvalidParameter => BlockError::InvalidParameter,
+            sdhci::SdhciError::NotInitialized => BlockError::NoMedia,
             _ => BlockError::DeviceError,
         }
     }
@@ -323,6 +334,60 @@ impl BlockDevice for UsbBlockDevice {
 }
 
 // ============================================================================
+// SDHCI Block Device
+// ============================================================================
+
+/// SDHCI (SD card) block device
+pub struct SdhciBlockDevice {
+    /// Index into the global SDHCI controller array
+    controller_id: usize,
+    /// Cached device info
+    info: BlockDeviceInfo,
+}
+
+impl SdhciBlockDevice {
+    /// Create a new SDHCI block device
+    ///
+    /// # Arguments
+    /// * `controller_id` - Index of the controller in the global array
+    /// * `num_blocks` - Total number of blocks
+    /// * `block_size` - Block size in bytes
+    /// * `media_id` - Media ID for BlockIO
+    pub fn new(controller_id: usize, num_blocks: u64, block_size: u32, media_id: u32) -> Self {
+        Self {
+            controller_id,
+            info: BlockDeviceInfo {
+                num_blocks,
+                block_size,
+                media_id,
+                removable: true, // SD cards are removable
+                read_only: false,
+            },
+        }
+    }
+
+    /// Get the controller ID
+    pub fn controller_id(&self) -> usize {
+        self.controller_id
+    }
+}
+
+impl BlockDevice for SdhciBlockDevice {
+    fn info(&self) -> BlockDeviceInfo {
+        self.info
+    }
+
+    fn read_blocks(&mut self, lba: u64, count: u32, buffer: &mut [u8]) -> Result<(), BlockError> {
+        let controller =
+            sdhci::get_controller(self.controller_id).ok_or(BlockError::DeviceError)?;
+
+        controller
+            .read_sectors(lba, count, buffer.as_mut_ptr())
+            .map_err(BlockError::from)
+    }
+}
+
+// ============================================================================
 // Reference-Based Disk Wrappers (for use with borrowed controllers)
 // ============================================================================
 
@@ -451,6 +516,39 @@ impl<'a> BlockDevice for UsbDisk<'a> {
     }
 }
 
+/// SDHCI disk wrapper for use with borrowed controller reference
+///
+/// This type is useful when you have a temporary mutable reference to an
+/// SDHCI controller and want to use it with GPT/filesystem code.
+pub struct SdhciDisk<'a> {
+    controller: &'a mut sdhci::SdhciController,
+}
+
+impl<'a> SdhciDisk<'a> {
+    /// Create a new SDHCI disk wrapper
+    pub fn new(controller: &'a mut sdhci::SdhciController) -> Self {
+        Self { controller }
+    }
+}
+
+impl<'a> BlockDevice for SdhciDisk<'a> {
+    fn info(&self) -> BlockDeviceInfo {
+        BlockDeviceInfo {
+            num_blocks: self.controller.num_blocks(),
+            block_size: self.controller.block_size(),
+            media_id: 0,
+            removable: true,
+            read_only: false,
+        }
+    }
+
+    fn read_blocks(&mut self, lba: u64, count: u32, buffer: &mut [u8]) -> Result<(), BlockError> {
+        self.controller
+            .read_sectors(lba, count, buffer.as_mut_ptr())
+            .map_err(BlockError::from)
+    }
+}
+
 // ============================================================================
 // Unified Block Device Enum
 // ============================================================================
@@ -466,6 +564,8 @@ pub enum AnyBlockDevice {
     Ahci(AhciBlockDevice),
     /// USB mass storage device
     Usb(UsbBlockDevice),
+    /// SDHCI (SD card) device
+    Sdhci(SdhciBlockDevice),
 }
 
 impl BlockDevice for AnyBlockDevice {
@@ -474,6 +574,7 @@ impl BlockDevice for AnyBlockDevice {
             AnyBlockDevice::Nvme(dev) => dev.info(),
             AnyBlockDevice::Ahci(dev) => dev.info(),
             AnyBlockDevice::Usb(dev) => dev.info(),
+            AnyBlockDevice::Sdhci(dev) => dev.info(),
         }
     }
 
@@ -482,6 +583,7 @@ impl BlockDevice for AnyBlockDevice {
             AnyBlockDevice::Nvme(dev) => dev.read_blocks(lba, count, buffer),
             AnyBlockDevice::Ahci(dev) => dev.read_blocks(lba, count, buffer),
             AnyBlockDevice::Usb(dev) => dev.read_blocks(lba, count, buffer),
+            AnyBlockDevice::Sdhci(dev) => dev.read_blocks(lba, count, buffer),
         }
     }
 }
@@ -498,6 +600,7 @@ macro_rules! with_block_device {
             $crate::drivers::block::AnyBlockDevice::Nvme(ref mut $device) => $body,
             $crate::drivers::block::AnyBlockDevice::Ahci(ref mut $device) => $body,
             $crate::drivers::block::AnyBlockDevice::Usb(ref mut $device) => $body,
+            $crate::drivers::block::AnyBlockDevice::Sdhci(ref mut $device) => $body,
         }
     };
     // Immutable access version
@@ -506,6 +609,7 @@ macro_rules! with_block_device {
             $crate::drivers::block::AnyBlockDevice::Nvme(ref $device) => $body,
             $crate::drivers::block::AnyBlockDevice::Ahci(ref $device) => $body,
             $crate::drivers::block::AnyBlockDevice::Usb(ref $device) => $body,
+            $crate::drivers::block::AnyBlockDevice::Sdhci(ref $device) => $body,
         }
     };
 }
@@ -546,6 +650,22 @@ pub fn create_ahci_device(
         port,
         port_info.sector_count,
         port_info.sector_size,
+        media_id,
+    ))
+}
+
+/// Create an SDHCI block device from a controller
+pub fn create_sdhci_device(controller_id: usize, media_id: u32) -> Option<SdhciBlockDevice> {
+    let controller = sdhci::get_controller(controller_id)?;
+
+    if !controller.is_ready() {
+        return None;
+    }
+
+    Some(SdhciBlockDevice::new(
+        controller_id,
+        controller.num_blocks(),
+        controller.block_size(),
         media_id,
     ))
 }

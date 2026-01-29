@@ -17,6 +17,8 @@ pub enum StorageType {
     Nvme { controller_id: usize, nsid: u32 },
     /// AHCI/SATA
     Ahci { controller_id: usize, port: usize },
+    /// SDHCI (SD Card)
+    Sdhci { controller_id: usize },
 }
 
 /// Storage device information
@@ -120,6 +122,10 @@ pub fn read_sectors(device_id: u32, lba: u64, buffer: &mut [u8]) -> Result<(), (
         } => {
             // Use global_read_sector which handles sector size translation for SATAPI
             crate::drivers::ahci::global_read_sector(lba, buffer)
+        }
+        StorageType::Sdhci { controller_id: _ } => {
+            // Use global_read_sector for SDHCI
+            crate::drivers::sdhci::global_read_sector(lba, buffer)
         }
     }
 }
