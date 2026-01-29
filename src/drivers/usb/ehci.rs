@@ -22,11 +22,12 @@ use crate::drivers::pci::{self, PciAddress, PciDevice};
 use crate::efi;
 use crate::time::Timeout;
 use core::ptr;
-use core::sync::atomic::{fence, Ordering};
+use core::sync::atomic::{Ordering, fence};
 
 use super::controller::{
-    desc_type, parse_configuration, req_type, request, DeviceDescriptor, DeviceInfo, EndpointInfo,
-    UsbController, UsbDevice, UsbError, UsbSpeed,
+    DeviceDescriptor, DeviceInfo, EndpointInfo, HUB_DESCRIPTOR_TYPE, HubDescriptor, UsbController,
+    UsbDevice, UsbError, UsbSpeed, class, desc_type, hub_feature, hub_port_status,
+    parse_configuration, req_type, request,
 };
 
 // ============================================================================
@@ -498,6 +499,20 @@ impl Qh {
         speed: UsbSpeed,
         is_control: bool,
     ) {
+        self.configure_with_hub(device_addr, endpoint, max_packet, speed, is_control, 0, 0);
+    }
+
+    /// Configure QH with hub support for split transactions
+    pub fn configure_with_hub(
+        &mut self,
+        device_addr: u8,
+        endpoint: u8,
+        max_packet: u16,
+        speed: UsbSpeed,
+        is_control: bool,
+        hub_addr: u8,
+        hub_port: u8,
+    ) {
         let eps = match speed {
             UsbSpeed::Low => Self::EP_EPS_LOW,
             UsbSpeed::Full => Self::EP_EPS_FULL,
@@ -517,6 +532,15 @@ impl Qh {
 
         // High-bandwidth multiplier = 1
         self.ep_caps = 1 << Self::CAP_MULT_SHIFT;
+
+        // For low/full-speed devices behind a high-speed hub, set up split transactions
+        if hub_addr != 0 && speed != UsbSpeed::High {
+            self.ep_caps |= (hub_addr as u32) << Self::CAP_HUBADDR_SHIFT;
+            self.ep_caps |= (hub_port as u32) << Self::CAP_PORTNUM_SHIFT;
+            // Set split transaction masks
+            self.ep_caps |= 0x01 << Self::CAP_SMASK_SHIFT; // Start split in microframe 0
+            self.ep_caps |= 0x1C << Self::CAP_CMASK_SHIFT; // Complete splits in microframes 2,3,4
+        }
     }
 }
 
@@ -1018,6 +1042,13 @@ impl EhciController {
 
         device.config_info = parse_configuration(&config_buf[..total_len]);
 
+        // Check if this is a hub
+        let device_class = device.device_desc.device_class;
+        if device_class == class::HUB {
+            device.is_hub = true;
+            log::info!("    USB Hub detected");
+        }
+
         // Find interfaces
         for iface in &device.config_info.interfaces[..device.config_info.num_interfaces] {
             if iface.is_mass_storage() {
@@ -1029,6 +1060,10 @@ impl EhciController {
                 device.is_hid_keyboard = true;
                 device.interrupt_in = iface.find_interrupt_in().cloned();
                 log::info!("    HID Keyboard interface");
+            } else if iface.interface_class == class::HUB {
+                // Hub class in interface descriptor
+                device.is_hub = true;
+                log::info!("    USB Hub interface");
             }
         }
 
@@ -1044,7 +1079,365 @@ impl EhciController {
             )?;
         }
 
+        // Store the device
+        let is_hub = device.is_hub;
+        let hub_address = device.address;
         self.devices[slot] = Some(device);
+
+        // If this is a hub, enumerate its downstream ports
+        if is_hub {
+            if let Err(e) = self.enumerate_hub(slot, hub_address) {
+                log::warn!("Failed to enumerate hub ports: {:?}", e);
+                // Don't fail the device attachment, hub is still usable
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Attach a device on a hub port (for devices behind hubs)
+    fn attach_device_on_hub(
+        &mut self,
+        hub_port: u8,
+        speed: UsbSpeed,
+        hub_addr: u8,
+        hub_port_num: u8,
+    ) -> Result<(), UsbError> {
+        let address = self.next_address;
+        if address >= 128 {
+            return Err(UsbError::NoFreeSlots);
+        }
+
+        let slot = self
+            .devices
+            .iter()
+            .position(|d| d.is_none())
+            .ok_or(UsbError::NoFreeSlots)?;
+
+        let mut device = UsbDevice::new_on_hub(0, hub_port, speed, hub_addr, hub_port_num);
+
+        // Get initial device descriptor (first 8 bytes)
+        let mut desc_buf = [0u8; 8];
+        self.control_transfer_internal(
+            &device,
+            req_type::DIR_IN | req_type::TYPE_STANDARD | req_type::RCPT_DEVICE,
+            request::GET_DESCRIPTOR,
+            (desc_type::DEVICE as u16) << 8,
+            0,
+            Some(&mut desc_buf),
+        )?;
+
+        device.ep0_max_packet = desc_buf[7].max(8) as u16;
+
+        // Set address
+        self.control_transfer_internal(
+            &device,
+            req_type::DIR_OUT | req_type::TYPE_STANDARD | req_type::RCPT_DEVICE,
+            request::SET_ADDRESS,
+            address as u16,
+            0,
+            None,
+        )?;
+
+        crate::time::delay_ms(2);
+        device.address = address;
+        self.next_address += 1;
+
+        // Get full device descriptor
+        let mut desc_buf = [0u8; 18];
+        self.control_transfer_internal(
+            &device,
+            req_type::DIR_IN | req_type::TYPE_STANDARD | req_type::RCPT_DEVICE,
+            request::GET_DESCRIPTOR,
+            (desc_type::DEVICE as u16) << 8,
+            0,
+            Some(&mut desc_buf),
+        )?;
+
+        device.device_desc =
+            unsafe { ptr::read_unaligned(desc_buf.as_ptr() as *const DeviceDescriptor) };
+
+        let vid = { device.device_desc.vendor_id };
+        let pid = { device.device_desc.product_id };
+        log::info!(
+            "  Device {} (via hub {}:{}): VID={:04x} PID={:04x}",
+            address,
+            hub_addr,
+            hub_port_num,
+            vid,
+            pid
+        );
+
+        // Get configuration descriptor
+        let mut config_buf = [0u8; 256];
+        let mut header = [0u8; 9];
+
+        self.control_transfer_internal(
+            &device,
+            req_type::DIR_IN | req_type::TYPE_STANDARD | req_type::RCPT_DEVICE,
+            request::GET_DESCRIPTOR,
+            (desc_type::CONFIGURATION as u16) << 8,
+            0,
+            Some(&mut header),
+        )?;
+
+        let total_len = u16::from_le_bytes([header[2], header[3]]) as usize;
+        let total_len = total_len.min(config_buf.len());
+
+        self.control_transfer_internal(
+            &device,
+            req_type::DIR_IN | req_type::TYPE_STANDARD | req_type::RCPT_DEVICE,
+            request::GET_DESCRIPTOR,
+            (desc_type::CONFIGURATION as u16) << 8,
+            0,
+            Some(&mut config_buf[..total_len]),
+        )?;
+
+        device.config_info = parse_configuration(&config_buf[..total_len]);
+
+        // Check if this is a hub
+        let device_class = device.device_desc.device_class;
+        if device_class == class::HUB {
+            device.is_hub = true;
+            log::info!("    USB Hub detected (nested)");
+        }
+
+        // Find interfaces
+        for iface in &device.config_info.interfaces[..device.config_info.num_interfaces] {
+            if iface.is_mass_storage() {
+                device.is_mass_storage = true;
+                device.bulk_in = iface.find_bulk_in().cloned();
+                device.bulk_out = iface.find_bulk_out().cloned();
+                log::info!("    Mass Storage interface");
+            } else if iface.is_hid_keyboard() {
+                device.is_hid_keyboard = true;
+                device.interrupt_in = iface.find_interrupt_in().cloned();
+                log::info!("    HID Keyboard interface");
+            } else if iface.interface_class == class::HUB {
+                device.is_hub = true;
+                log::info!("    USB Hub interface");
+            }
+        }
+
+        // Set configuration
+        if device.config_info.configuration_value > 0 {
+            self.control_transfer_internal(
+                &device,
+                req_type::DIR_OUT | req_type::TYPE_STANDARD | req_type::RCPT_DEVICE,
+                request::SET_CONFIGURATION,
+                device.config_info.configuration_value as u16,
+                0,
+                None,
+            )?;
+        }
+
+        // Store the device
+        let is_hub = device.is_hub;
+        let new_hub_address = device.address;
+        self.devices[slot] = Some(device);
+
+        // If this is a hub, enumerate its downstream ports (recursive)
+        if is_hub {
+            if let Err(e) = self.enumerate_hub(slot, new_hub_address) {
+                log::warn!("Failed to enumerate nested hub ports: {:?}", e);
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Enumerate devices connected to a USB hub
+    ///
+    /// This gets the hub descriptor, powers on all ports, and enumerates
+    /// any connected devices.
+    fn enumerate_hub(&mut self, hub_slot: usize, hub_addr: u8) -> Result<(), UsbError> {
+        log::info!("Enumerating hub at address {}", hub_addr);
+
+        // Get the hub device
+        let hub_device = self.devices[hub_slot]
+            .as_ref()
+            .ok_or(UsbError::DeviceNotFound)?
+            .clone();
+
+        // Get hub descriptor (class-specific request)
+        // Request type: Device-to-Host | Class | Device = 0xA0
+        let mut hub_desc_buf = [0u8; 9];
+        self.control_transfer_internal(
+            &hub_device,
+            req_type::DIR_IN | req_type::TYPE_CLASS | req_type::RCPT_DEVICE,
+            request::GET_DESCRIPTOR,
+            (HUB_DESCRIPTOR_TYPE as u16) << 8,
+            0,
+            Some(&mut hub_desc_buf),
+        )?;
+
+        let hub_desc =
+            unsafe { ptr::read_unaligned(hub_desc_buf.as_ptr() as *const HubDescriptor) };
+        let num_ports = hub_desc.num_ports;
+        let power_on_delay = (hub_desc.power_on_to_power_good as u32) * 2; // Convert to ms
+
+        log::info!(
+            "  Hub has {} ports, power-on delay: {}ms",
+            num_ports,
+            power_on_delay
+        );
+
+        // Update the device's hub port count
+        if let Some(ref mut dev) = self.devices[hub_slot] {
+            dev.num_hub_ports = num_ports;
+        }
+
+        // Power on all hub ports
+        // Request type: Host-to-Device | Class | Other = 0x23
+        for port in 1..=num_ports {
+            log::debug!("  Powering on hub port {}", port);
+            let result = self.control_transfer_internal(
+                &hub_device,
+                req_type::DIR_OUT | req_type::TYPE_CLASS | req_type::RCPT_OTHER,
+                request::SET_FEATURE,
+                hub_feature::PORT_POWER,
+                port as u16,
+                None,
+            );
+            if let Err(e) = result {
+                log::warn!("  Failed to power on hub port {}: {:?}", port, e);
+            }
+        }
+
+        // Wait for power to stabilize
+        let delay = power_on_delay.max(100) as u64; // At least 100ms
+        crate::time::delay_ms(delay);
+
+        // Check each port for connected devices
+        for port in 1..=num_ports {
+            // Get port status
+            // Request type: Device-to-Host | Class | Other = 0xA3
+            let mut status_buf = [0u8; 4];
+            let result = self.control_transfer_internal(
+                &hub_device,
+                req_type::DIR_IN | req_type::TYPE_CLASS | req_type::RCPT_OTHER,
+                request::GET_STATUS,
+                0,
+                port as u16,
+                Some(&mut status_buf),
+            );
+
+            if let Err(e) = result {
+                log::debug!("  Failed to get status for hub port {}: {:?}", port, e);
+                continue;
+            }
+
+            let port_status = u16::from_le_bytes([status_buf[0], status_buf[1]]);
+            let port_change = u16::from_le_bytes([status_buf[2], status_buf[3]]);
+
+            log::debug!(
+                "  Hub port {} status: {:#06x}, change: {:#06x}",
+                port,
+                port_status,
+                port_change
+            );
+
+            // Check if device is connected
+            if (port_status & hub_port_status::CONNECTION) == 0 {
+                continue;
+            }
+
+            log::info!("  Device detected on hub port {}", port);
+
+            // Clear connection change bit if set
+            if port_change & 0x01 != 0 {
+                let _ = self.control_transfer_internal(
+                    &hub_device,
+                    req_type::DIR_OUT | req_type::TYPE_CLASS | req_type::RCPT_OTHER,
+                    request::CLEAR_FEATURE,
+                    hub_feature::C_PORT_CONNECTION,
+                    port as u16,
+                    None,
+                );
+            }
+
+            // Reset the port
+            log::debug!("  Resetting hub port {}", port);
+            self.control_transfer_internal(
+                &hub_device,
+                req_type::DIR_OUT | req_type::TYPE_CLASS | req_type::RCPT_OTHER,
+                request::SET_FEATURE,
+                hub_feature::PORT_RESET,
+                port as u16,
+                None,
+            )?;
+
+            // Wait for reset to complete (poll port status)
+            crate::time::delay_ms(50);
+
+            // Poll for reset completion
+            let mut reset_complete = false;
+            let timeout = Timeout::from_ms(500);
+            while !timeout.is_expired() {
+                let mut status_buf = [0u8; 4];
+                if self
+                    .control_transfer_internal(
+                        &hub_device,
+                        req_type::DIR_IN | req_type::TYPE_CLASS | req_type::RCPT_OTHER,
+                        request::GET_STATUS,
+                        0,
+                        port as u16,
+                        Some(&mut status_buf),
+                    )
+                    .is_err()
+                {
+                    break;
+                }
+
+                let port_status = u16::from_le_bytes([status_buf[0], status_buf[1]]);
+                let port_change = u16::from_le_bytes([status_buf[2], status_buf[3]]);
+
+                // Check if reset is complete (C_PORT_RESET bit in change)
+                if port_change & 0x10 != 0 {
+                    // Clear the reset change bit
+                    let _ = self.control_transfer_internal(
+                        &hub_device,
+                        req_type::DIR_OUT | req_type::TYPE_CLASS | req_type::RCPT_OTHER,
+                        request::CLEAR_FEATURE,
+                        hub_feature::C_PORT_RESET,
+                        port as u16,
+                        None,
+                    );
+
+                    // Check if port is enabled
+                    if (port_status & hub_port_status::ENABLE) != 0 {
+                        reset_complete = true;
+
+                        // Determine device speed
+                        let speed = if (port_status & hub_port_status::HIGH_SPEED) != 0 {
+                            UsbSpeed::High
+                        } else if (port_status & hub_port_status::LOW_SPEED) != 0 {
+                            UsbSpeed::Low
+                        } else {
+                            UsbSpeed::Full
+                        };
+
+                        log::info!("  Hub port {} reset complete, speed: {:?}", port, speed);
+
+                        // Recovery time after reset
+                        crate::time::delay_ms(10);
+
+                        // Enumerate the device
+                        if let Err(e) = self.attach_device_on_hub(port, speed, hub_addr, port) {
+                            log::warn!("  Failed to attach device on hub port {}: {:?}", port, e);
+                        }
+                    }
+                    break;
+                }
+
+                crate::time::delay_ms(10);
+            }
+
+            if !reset_complete {
+                log::warn!("  Hub port {} reset timed out", port);
+            }
+        }
+
         Ok(())
     }
 
@@ -1194,7 +1587,27 @@ impl EhciController {
             ep_chars |= Qh::EP_CTRL;
         }
 
-        let ep_caps = 1u32 << Qh::CAP_MULT_SHIFT; // High bandwidth pipe multiplier = 1
+        // Build ep_caps with high bandwidth multiplier
+        let mut ep_caps = 1u32 << Qh::CAP_MULT_SHIFT; // High bandwidth pipe multiplier = 1
+
+        // For low/full-speed devices behind a high-speed hub, set up split transactions
+        // This is needed when hub_addr != 0 (device is behind a hub)
+        if device.hub_addr != 0 && device.speed != UsbSpeed::High {
+            // Set hub address and port number for split transactions
+            ep_caps |= (device.hub_addr as u32) << Qh::CAP_HUBADDR_SHIFT;
+            ep_caps |= (device.hub_port as u32) << Qh::CAP_PORTNUM_SHIFT;
+            // Set split transaction masks (SMASK and CMASK)
+            // SMASK: start-split schedule mask (microframe 0)
+            // CMASK: complete-split schedule mask (microframes 2,3,4)
+            ep_caps |= 0x01 << Qh::CAP_SMASK_SHIFT; // Start split in microframe 0
+            ep_caps |= 0x1C << Qh::CAP_CMASK_SHIFT; // Complete splits in microframes 2,3,4
+            log::trace!(
+                "EHCI: Split transaction for dev {} via hub {}:{}",
+                device.address,
+                device.hub_addr,
+                device.hub_port
+            );
+        }
 
         unsafe {
             let qh = qh_addr as *mut Qh;
@@ -1205,7 +1618,7 @@ impl EhciController {
             ptr::write_volatile(&mut (*qh).overlay.next_qtd, qtd_setup_addr as u32);
             ptr::write_volatile(&mut (*qh).overlay.alt_next_qtd, Qtd::TERMINATE);
             ptr::write_volatile(&mut (*qh).overlay.token, 0); // ACTIVE=0, HALTED=0 -> fetch qTD
-                                                              // Clear rest of overlay
+            // Clear rest of overlay
             for i in 0..5 {
                 ptr::write_volatile(&mut (*qh).overlay.buffer[i], 0);
                 ptr::write_volatile(&mut (*qh).overlay.buffer_hi[i], 0);
@@ -1542,7 +1955,16 @@ impl EhciController {
         }
 
         // Always reconfigure QH for current device/endpoint (ep_chars changes per transfer)
-        qh.configure(device.address, endpoint, max_packet, device.speed, false);
+        // Include hub address/port for split transactions if device is behind a hub
+        qh.configure_with_hub(
+            device.address,
+            endpoint,
+            max_packet,
+            device.speed,
+            false,
+            device.hub_addr,
+            device.hub_port,
+        );
 
         // Update QH overlay to point to new qTD
         qh.overlay.next_qtd = qtd_addr as u32;
@@ -1688,22 +2110,8 @@ impl UsbController for EhciController {
         data: Option<&mut [u8]>,
     ) -> Result<usize, UsbError> {
         let dev = self.get_device(device).ok_or(UsbError::DeviceNotFound)?;
-        // Clone the relevant fields to avoid borrow issues
-        let dev_copy = UsbDevice {
-            address: dev.address,
-            port: dev.port,
-            speed: dev.speed,
-            device_desc: dev.device_desc.clone(),
-            config_info: dev.config_info.clone(),
-            is_mass_storage: dev.is_mass_storage,
-            is_hid_keyboard: dev.is_hid_keyboard,
-            bulk_in: dev.bulk_in.clone(),
-            bulk_out: dev.bulk_out.clone(),
-            interrupt_in: dev.interrupt_in.clone(),
-            ep0_max_packet: dev.ep0_max_packet,
-            bulk_in_toggle: dev.bulk_in_toggle,
-            bulk_out_toggle: dev.bulk_out_toggle,
-        };
+        // Clone the device to avoid borrow issues
+        let dev_copy = dev.clone();
         self.control_transfer_internal(&dev_copy, request_type, request, value, index, data)
     }
 
@@ -1722,21 +2130,8 @@ impl UsbController for EhciController {
             data.len()
         );
         let dev = self.get_device(device).ok_or(UsbError::DeviceNotFound)?;
-        let dev_copy = UsbDevice {
-            address: dev.address,
-            port: dev.port,
-            speed: dev.speed,
-            device_desc: dev.device_desc.clone(),
-            config_info: dev.config_info.clone(),
-            is_mass_storage: dev.is_mass_storage,
-            is_hid_keyboard: dev.is_hid_keyboard,
-            bulk_in: dev.bulk_in.clone(),
-            bulk_out: dev.bulk_out.clone(),
-            interrupt_in: dev.interrupt_in.clone(),
-            ep0_max_packet: dev.ep0_max_packet,
-            bulk_in_toggle: dev.bulk_in_toggle,
-            bulk_out_toggle: dev.bulk_out_toggle,
-        };
+        // Clone the device to avoid borrow issues
+        let dev_copy = dev.clone();
         let toggle = if is_in {
             dev.bulk_in_toggle
         } else {
@@ -1798,6 +2193,7 @@ impl UsbController for EhciController {
             is_mass_storage: d.is_mass_storage,
             is_hid: d.is_hid_keyboard,
             is_keyboard: d.is_hid_keyboard,
+            is_hub: d.is_hub,
         })
     }
 

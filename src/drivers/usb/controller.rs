@@ -325,6 +325,94 @@ pub mod hid_request {
     pub const SET_PROTOCOL: u8 = 0x0B;
 }
 
+// ============================================================================
+// USB Hub Class Support
+// ============================================================================
+
+/// USB Hub descriptor (USB 2.0 Section 11.23.2.1)
+#[repr(C, packed)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct HubDescriptor {
+    /// Descriptor length
+    pub length: u8,
+    /// Descriptor type (0x29 for hub)
+    pub descriptor_type: u8,
+    /// Number of downstream facing ports
+    pub num_ports: u8,
+    /// Hub characteristics (power switching, compound device, etc.)
+    pub characteristics: u16,
+    /// Time from power-on to power-good (in 2ms units)
+    pub power_on_to_power_good: u8,
+    /// Maximum current requirements of the hub controller
+    pub hub_controller_current: u8,
+    // DeviceRemovable and PortPwrCtrlMask bitmaps follow (variable length)
+}
+
+/// Hub descriptor type (class-specific)
+pub const HUB_DESCRIPTOR_TYPE: u8 = 0x29;
+
+/// Hub port features for SET_FEATURE/CLEAR_FEATURE
+pub mod hub_feature {
+    /// Port connection status (read-only)
+    pub const PORT_CONNECTION: u16 = 0;
+    /// Port enable/disable
+    pub const PORT_ENABLE: u16 = 1;
+    /// Port suspend
+    pub const PORT_SUSPEND: u16 = 2;
+    /// Port over-current indicator (read-only)
+    pub const PORT_OVER_CURRENT: u16 = 3;
+    /// Port reset
+    pub const PORT_RESET: u16 = 4;
+    /// Port power
+    pub const PORT_POWER: u16 = 8;
+    /// Port low-speed device attached (read-only)
+    pub const PORT_LOW_SPEED: u16 = 9;
+    /// Connection change (clear only)
+    pub const C_PORT_CONNECTION: u16 = 16;
+    /// Enable change (clear only)
+    pub const C_PORT_ENABLE: u16 = 17;
+    /// Suspend change (clear only)
+    pub const C_PORT_SUSPEND: u16 = 18;
+    /// Over-current change (clear only)
+    pub const C_PORT_OVER_CURRENT: u16 = 19;
+    /// Reset change (clear only)
+    pub const C_PORT_RESET: u16 = 20;
+}
+
+/// Hub port status bits (from GET_STATUS)
+pub mod hub_port_status {
+    /// Device is connected
+    pub const CONNECTION: u16 = 1 << 0;
+    /// Port is enabled
+    pub const ENABLE: u16 = 1 << 1;
+    /// Port is suspended
+    pub const SUSPEND: u16 = 1 << 2;
+    /// Over-current condition
+    pub const OVER_CURRENT: u16 = 1 << 3;
+    /// Port reset active
+    pub const RESET: u16 = 1 << 4;
+    /// Port power is on
+    pub const POWER: u16 = 1 << 8;
+    /// Attached device is low-speed
+    pub const LOW_SPEED: u16 = 1 << 9;
+    /// Attached device is high-speed
+    pub const HIGH_SPEED: u16 = 1 << 10;
+}
+
+/// Hub port status change bits (upper 16 bits of GET_STATUS)
+pub mod hub_port_change {
+    /// Connection status changed
+    pub const C_CONNECTION: u16 = 1 << 0;
+    /// Enable status changed
+    pub const C_ENABLE: u16 = 1 << 1;
+    /// Suspend status changed
+    pub const C_SUSPEND: u16 = 1 << 2;
+    /// Over-current status changed
+    pub const C_OVER_CURRENT: u16 = 1 << 3;
+    /// Reset complete
+    pub const C_RESET: u16 = 1 << 4;
+}
+
 /// USB device class codes
 pub mod class {
     /// Use class info in Interface Descriptor
@@ -588,6 +676,8 @@ pub struct DeviceInfo {
     pub is_hid: bool,
     /// Is this a keyboard?
     pub is_keyboard: bool,
+    /// Is this a hub?
+    pub is_hub: bool,
 }
 
 // ============================================================================
@@ -615,6 +705,10 @@ pub struct UsbDevice {
     pub is_mass_storage: bool,
     /// Is HID keyboard
     pub is_hid_keyboard: bool,
+    /// Is USB hub
+    pub is_hub: bool,
+    /// Number of hub ports (if is_hub)
+    pub num_hub_ports: u8,
     /// Bulk IN endpoint
     pub bulk_in: Option<EndpointInfo>,
     /// Bulk OUT endpoint
@@ -627,6 +721,10 @@ pub struct UsbDevice {
     pub bulk_in_toggle: bool,
     /// Data toggle for bulk OUT
     pub bulk_out_toggle: bool,
+    /// Hub address for split transactions (0 = directly connected to root hub)
+    pub hub_addr: u8,
+    /// Hub port for split transactions (1-based, 0 = root hub)
+    pub hub_port: u8,
 }
 
 impl UsbDevice {
@@ -640,13 +738,25 @@ impl UsbDevice {
             config_info: ConfigurationInfo::default(),
             is_mass_storage: false,
             is_hid_keyboard: false,
+            is_hub: false,
+            num_hub_ports: 0,
             bulk_in: None,
             bulk_out: None,
             interrupt_in: None,
             ep0_max_packet: speed.default_max_packet_size(),
             bulk_in_toggle: false,
             bulk_out_toggle: false,
+            hub_addr: 0,
+            hub_port: 0,
         }
+    }
+
+    /// Create a device connected through a hub
+    pub fn new_on_hub(address: u8, port: u8, speed: UsbSpeed, hub_addr: u8, hub_port: u8) -> Self {
+        let mut device = Self::new(address, port, speed);
+        device.hub_addr = hub_addr;
+        device.hub_port = hub_port;
+        device
     }
 
     /// Get DeviceInfo for this device
@@ -660,6 +770,7 @@ impl UsbDevice {
             is_mass_storage: self.is_mass_storage,
             is_hid: self.is_hid_keyboard,
             is_keyboard: self.is_hid_keyboard,
+            is_hub: self.is_hub,
         }
     }
 }

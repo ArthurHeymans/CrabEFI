@@ -11,11 +11,11 @@ use crate::drivers::pci::{self, PciAddress, PciDevice};
 use crate::efi;
 use crate::time::Timeout;
 use core::ptr;
-use core::sync::atomic::{fence, Ordering};
+use core::sync::atomic::{Ordering, fence};
 
 use super::controller::{
-    desc_type, parse_configuration, req_type, request, DeviceDescriptor, DeviceInfo, Direction,
-    EndpointInfo, UsbController, UsbDevice, UsbError, UsbSpeed,
+    DeviceDescriptor, DeviceInfo, Direction, EndpointInfo, UsbController, UsbDevice, UsbError,
+    UsbSpeed, desc_type, parse_configuration, req_type, request,
 };
 
 // ============================================================================
@@ -927,21 +927,8 @@ impl UsbController for OhciController {
         data: Option<&mut [u8]>,
     ) -> Result<usize, UsbError> {
         let dev = self.get_device(device).ok_or(UsbError::DeviceNotFound)?;
-        let dev_copy = UsbDevice {
-            address: dev.address,
-            port: dev.port,
-            speed: dev.speed,
-            device_desc: dev.device_desc.clone(),
-            config_info: dev.config_info.clone(),
-            is_mass_storage: dev.is_mass_storage,
-            is_hid_keyboard: dev.is_hid_keyboard,
-            bulk_in: dev.bulk_in.clone(),
-            bulk_out: dev.bulk_out.clone(),
-            interrupt_in: dev.interrupt_in.clone(),
-            ep0_max_packet: dev.ep0_max_packet,
-            bulk_in_toggle: dev.bulk_in_toggle,
-            bulk_out_toggle: dev.bulk_out_toggle,
-        };
+        // Clone the device to avoid borrow issues
+        let dev_copy = dev.clone();
         self.control_transfer_internal(&dev_copy, request_type, request, value, index, data)
     }
 
@@ -1105,6 +1092,7 @@ impl UsbController for OhciController {
             is_mass_storage: d.is_mass_storage,
             is_hid: d.is_hid_keyboard,
             is_keyboard: d.is_hid_keyboard,
+            is_hub: d.is_hub,
         })
     }
 
