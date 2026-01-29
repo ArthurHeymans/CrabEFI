@@ -219,9 +219,7 @@ impl TrbRing {
         }
 
         // Initialize all TRBs to 0
-        unsafe {
-            ptr::write_bytes(base as *mut u8, 0, size * 16);
-        }
+        unsafe { core::slice::from_raw_parts_mut(base as *mut u8, size * 16).fill(0) };
 
         // Set up link TRB at the end to wrap around
         let link_trb = unsafe { &mut *((base + ((size - 1) * 16) as u64) as *mut Trb) };
@@ -246,9 +244,7 @@ impl TrbRing {
 
         // Initialize all TRBs to 0 (cycle bits = 0)
         // Hardware will write with cycle = 1 initially
-        unsafe {
-            ptr::write_bytes(base as *mut u8, 0, size * 16);
-        }
+        unsafe { core::slice::from_raw_parts_mut(base as *mut u8, size * 16).fill(0) };
 
         Self {
             base,
@@ -636,7 +632,10 @@ impl XhciController {
         // Allocate and set up DCBAA (Device Context Base Address Array)
         let dcbaa_pages = ((self.max_slots as u64 + 1) * 8).div_ceil(4096);
         self.dcbaa = efi::allocate_pages(dcbaa_pages).ok_or(XhciError::AllocationFailed)?;
-        unsafe { ptr::write_bytes(self.dcbaa as *mut u8, 0, (dcbaa_pages * 4096) as usize) };
+        unsafe {
+            core::slice::from_raw_parts_mut(self.dcbaa as *mut u8, (dcbaa_pages * 4096) as usize)
+                .fill(0)
+        };
         self.write_op_reg64(OP_DCBAAP, self.dcbaa);
 
         // Allocate command ring (256 TRBs)
@@ -652,7 +651,7 @@ impl XhciController {
 
         // Allocate Event Ring Segment Table (ERST)
         self.erst = efi::allocate_pages(1).ok_or(XhciError::AllocationFailed)?;
-        unsafe { ptr::write_bytes(self.erst as *mut u8, 0, 4096) };
+        unsafe { core::slice::from_raw_parts_mut(self.erst as *mut u8, 4096).fill(0) };
 
         // Set up ERST entry
         let erst_entry = self.erst as *mut u64;
@@ -796,11 +795,11 @@ impl XhciController {
     fn address_device(&mut self, slot_id: u8, port: u8, speed: u8) -> Result<(), XhciError> {
         // Allocate device context
         let device_context = efi::allocate_pages(1).ok_or(XhciError::AllocationFailed)?;
-        unsafe { ptr::write_bytes(device_context as *mut u8, 0, 4096) };
+        unsafe { core::slice::from_raw_parts_mut(device_context as *mut u8, 4096).fill(0) };
 
         // Allocate input context
         let input_context = efi::allocate_pages(1).ok_or(XhciError::AllocationFailed)?;
-        unsafe { ptr::write_bytes(input_context as *mut u8, 0, 4096) };
+        unsafe { core::slice::from_raw_parts_mut(input_context as *mut u8, 4096).fill(0) };
 
         // Allocate transfer ring for control endpoint
         let transfer_ring = efi::allocate_pages(1).ok_or(XhciError::AllocationFailed)?;

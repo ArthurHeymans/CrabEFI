@@ -1522,9 +1522,7 @@ extern "efiapi" fn set_mem(buffer: *mut c_void, size: usize, value: u8) {
         return;
     }
 
-    unsafe {
-        core::ptr::write_bytes(buffer as *mut u8, value, size);
-    }
+    unsafe { core::slice::from_raw_parts_mut(buffer as *mut u8, size).fill(value) };
 }
 
 // ============================================================================

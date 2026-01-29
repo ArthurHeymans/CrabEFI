@@ -352,9 +352,7 @@ pub fn load_image(data: &[u8]) -> Result<LoadedImage, Status> {
 
     // Zero the memory
     // Safety: load_addr is valid and we allocated image_size bytes
-    unsafe {
-        core::ptr::write_bytes(load_addr as *mut u8, 0, image_size as usize);
-    }
+    unsafe { core::slice::from_raw_parts_mut(load_addr as *mut u8, image_size as usize).fill(0) };
 
     // Copy headers (already validated size_of_headers fits in both source and dest)
     // Safety: We validated size_of_headers <= data.len() and <= image_size

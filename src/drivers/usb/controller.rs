@@ -117,6 +117,47 @@ pub enum Direction {
 }
 
 // ============================================================================
+// USB Setup Packet
+// ============================================================================
+
+/// USB Setup Packet (8 bytes)
+///
+/// Used for control transfers to send commands to USB devices.
+/// All multi-byte fields are little-endian.
+#[repr(C, packed)]
+#[derive(Clone, Copy, Debug)]
+pub struct SetupPacket {
+    /// Request type (direction, type, recipient)
+    pub request_type: u8,
+    /// Specific request
+    pub request: u8,
+    /// Value parameter (little-endian)
+    pub value: u16,
+    /// Index parameter (little-endian)
+    pub index: u16,
+    /// Number of bytes to transfer (little-endian)
+    pub length: u16,
+}
+
+impl SetupPacket {
+    /// Create a new setup packet
+    pub const fn new(request_type: u8, request: u8, value: u16, index: u16, length: u16) -> Self {
+        Self {
+            request_type,
+            request,
+            value: value.to_le(),
+            index: index.to_le(),
+            length: length.to_le(),
+        }
+    }
+
+    /// Get the packet as a byte slice for DMA transfers
+    pub fn as_bytes(&self) -> &[u8] {
+        unsafe { core::slice::from_raw_parts(self as *const Self as *const u8, 8) }
+    }
+}
+
+// ============================================================================
 // USB Descriptors
 // ============================================================================
 
@@ -825,9 +866,7 @@ impl InterruptQueue {
         let pages = buffer_size.div_ceil(4096);
         let buffer = efi::allocate_pages(pages as u64)? as *mut u8;
 
-        unsafe {
-            ptr::write_bytes(buffer, 0, buffer_size);
-        }
+        unsafe { core::slice::from_raw_parts_mut(buffer, buffer_size).fill(0) };
 
         Some(Self {
             device,

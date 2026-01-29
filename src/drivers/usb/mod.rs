@@ -19,6 +19,7 @@
 
 pub mod controller;
 pub mod ehci;
+pub mod ehci_regs;
 pub mod hid_keyboard;
 pub mod mass_storage;
 pub mod ohci;

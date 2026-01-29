@@ -506,8 +506,8 @@ impl NvmeController {
 
         // Zero the queues
         unsafe {
-            ptr::write_bytes(admin_sq, 0, ADMIN_QUEUE_SIZE);
-            ptr::write_bytes(admin_cq, 0, ADMIN_QUEUE_SIZE);
+            core::slice::from_raw_parts_mut(admin_sq as *mut u8, ADMIN_QUEUE_SIZE).fill(0);
+            core::slice::from_raw_parts_mut(admin_cq as *mut u8, ADMIN_QUEUE_SIZE).fill(0);
         }
 
         let mut controller = Self {
@@ -736,8 +736,8 @@ impl NvmeController {
 
         // Zero the queues
         unsafe {
-            ptr::write_bytes(self.io_sq, 0, IO_QUEUE_SIZE);
-            ptr::write_bytes(self.io_cq, 0, IO_QUEUE_SIZE);
+            core::slice::from_raw_parts_mut(self.io_sq as *mut u8, IO_QUEUE_SIZE).fill(0);
+            core::slice::from_raw_parts_mut(self.io_cq as *mut u8, IO_QUEUE_SIZE).fill(0);
         }
 
         // Create I/O Completion Queue (queue ID = 1)

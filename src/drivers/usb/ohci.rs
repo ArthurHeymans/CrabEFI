@@ -15,8 +15,8 @@ use core::ptr;
 use core::sync::atomic::{Ordering, fence};
 
 use super::controller::{
-    DeviceDescriptor, DeviceInfo, Direction, EndpointInfo, UsbController, UsbDevice, UsbError,
-    UsbSpeed, desc_type, parse_configuration, req_type, request,
+    DeviceDescriptor, DeviceInfo, Direction, EndpointInfo, SetupPacket, UsbController, UsbDevice,
+    UsbError, UsbSpeed, desc_type, parse_configuration, req_type, request,
 };
 
 // ============================================================================
@@ -431,15 +431,15 @@ impl OhciController {
 
         // Allocate HCCA (256-byte aligned)
         let hcca = efi::allocate_pages(1).ok_or(UsbError::AllocationFailed)?;
-        unsafe { ptr::write_bytes(hcca as *mut u8, 0, 4096) };
+        unsafe { core::slice::from_raw_parts_mut(hcca as *mut u8, 4096).fill(0) };
 
         // Allocate control ED
         let control_ed = efi::allocate_pages(1).ok_or(UsbError::AllocationFailed)?;
-        unsafe { ptr::write_bytes(control_ed as *mut u8, 0, 4096) };
+        unsafe { core::slice::from_raw_parts_mut(control_ed as *mut u8, 4096).fill(0) };
 
         // Allocate bulk ED
         let bulk_ed = efi::allocate_pages(1).ok_or(UsbError::AllocationFailed)?;
-        unsafe { ptr::write_bytes(bulk_ed as *mut u8, 0, 4096) };
+        unsafe { core::slice::from_raw_parts_mut(bulk_ed as *mut u8, 4096).fill(0) };
 
         // Allocate DMA buffer
         let dma_pages = Self::DMA_BUFFER_SIZE.div_ceil(4096);
@@ -775,16 +775,9 @@ impl OhciController {
 
         // Build setup packet
         let setup_addr = self.dma_buffer;
-        let setup_packet = setup_addr as *mut u8;
+        let setup_packet = SetupPacket::new(request_type, request, value, index, data_len as u16);
         unsafe {
-            *setup_packet.add(0) = request_type;
-            *setup_packet.add(1) = request;
-            *setup_packet.add(2) = value as u8;
-            *setup_packet.add(3) = (value >> 8) as u8;
-            *setup_packet.add(4) = index as u8;
-            *setup_packet.add(5) = (index >> 8) as u8;
-            *setup_packet.add(6) = data_len as u8;
-            *setup_packet.add(7) = (data_len >> 8) as u8;
+            ptr::copy_nonoverlapping(setup_packet.as_bytes().as_ptr(), setup_addr as *mut u8, 8);
         }
 
         // Allocate ED and TDs

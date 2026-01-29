@@ -482,9 +482,9 @@ extern "efiapi" fn file_get_info(
             (*info).file_size = file_size;
             (*info).physical_size = file_size;
             // Zero out times (not tracked)
-            core::ptr::write_bytes(&raw mut (*info).create_time, 0, 1);
-            core::ptr::write_bytes(&raw mut (*info).last_access_time, 0, 1);
-            core::ptr::write_bytes(&raw mut (*info).modification_time, 0, 1);
+            (*info).create_time = core::mem::zeroed();
+            (*info).last_access_time = core::mem::zeroed();
+            (*info).modification_time = core::mem::zeroed();
             (*info).attribute = if is_directory { FILE_DIRECTORY } else { 0 };
 
             // Write filename as UTF-16 after the struct
@@ -1152,9 +1152,9 @@ fn read_directory(
                 (*info).size = required_size as u64;
                 (*info).file_size = entry.file_size as u64;
                 (*info).physical_size = entry.file_size as u64;
-                core::ptr::write_bytes(&raw mut (*info).create_time, 0, 1);
-                core::ptr::write_bytes(&raw mut (*info).last_access_time, 0, 1);
-                core::ptr::write_bytes(&raw mut (*info).modification_time, 0, 1);
+                (*info).create_time = core::mem::zeroed();
+                (*info).last_access_time = core::mem::zeroed();
+                (*info).modification_time = core::mem::zeroed();
                 (*info).attribute = if is_dir { FILE_DIRECTORY } else { 0 };
 
                 let filename_ptr =

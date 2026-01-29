@@ -479,16 +479,16 @@ impl AhciController {
 
         // Allocate command list (1KB, 1024-byte aligned)
         let cmd_list_addr = efi::allocate_pages(1).ok_or(AhciError::AllocationFailed)?;
-        unsafe { ptr::write_bytes(cmd_list_addr as *mut u8, 0, 4096) };
+        unsafe { core::slice::from_raw_parts_mut(cmd_list_addr as *mut u8, 4096).fill(0) };
 
         // Allocate received FIS (256 bytes, 256-byte aligned)
         let received_fis_addr = efi::allocate_pages(1).ok_or(AhciError::AllocationFailed)?;
-        unsafe { ptr::write_bytes(received_fis_addr as *mut u8, 0, 4096) };
+        unsafe { core::slice::from_raw_parts_mut(received_fis_addr as *mut u8, 4096).fill(0) };
 
         // Allocate command tables (one per slot, 256-byte aligned each)
         let mut cmd_tables = [ptr::null_mut(); 32];
         let cmd_tables_page = efi::allocate_pages(4).ok_or(AhciError::AllocationFailed)?;
-        unsafe { ptr::write_bytes(cmd_tables_page as *mut u8, 0, 4096 * 4) };
+        unsafe { core::slice::from_raw_parts_mut(cmd_tables_page as *mut u8, 4096 * 4).fill(0) };
 
         for (i, cmd_table) in cmd_tables
             .iter_mut()
@@ -695,7 +695,7 @@ impl AhciController {
 
         // Allocate buffer for identify data (512 bytes)
         let buffer = efi::allocate_pages(1).ok_or(AhciError::AllocationFailed)?;
-        unsafe { ptr::write_bytes(buffer as *mut u8, 0, 4096) };
+        unsafe { core::slice::from_raw_parts_mut(buffer as *mut u8, 4096).fill(0) };
 
         // Setup command header
         let header = unsafe { &mut *port.cmd_list.add(slot as usize) };
@@ -777,7 +777,7 @@ impl AhciController {
 
         // Allocate buffer for identify data (512 bytes)
         let buffer = efi::allocate_pages(1).ok_or(AhciError::AllocationFailed)?;
-        unsafe { ptr::write_bytes(buffer as *mut u8, 0, 4096) };
+        unsafe { core::slice::from_raw_parts_mut(buffer as *mut u8, 4096).fill(0) };
 
         // Setup command header (set ATAPI bit)
         let header = unsafe { &mut *port.cmd_list.add(slot as usize) };
@@ -834,7 +834,7 @@ impl AhciController {
 
         // Allocate buffer for capacity data (8 bytes)
         let buffer = efi::allocate_pages(1).ok_or(AhciError::AllocationFailed)?;
-        unsafe { ptr::write_bytes(buffer as *mut u8, 0, 4096) };
+        unsafe { core::slice::from_raw_parts_mut(buffer as *mut u8, 4096).fill(0) };
 
         // Setup command header (set ATAPI bit)
         let header = unsafe { &mut *port.cmd_list.add(slot as usize) };

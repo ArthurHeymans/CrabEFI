@@ -152,7 +152,7 @@ fn fb_scroll_up(fb: &FramebufferInfo, start_row: u32, total_rows: u32) {
         let offset = ((last_row_y + line) as usize) * row_stride;
         unsafe {
             let dst = (fb.physical_address as *mut u8).add(offset);
-            core::ptr::write_bytes(dst, 0, row_stride);
+            core::slice::from_raw_parts_mut(dst, row_stride).fill(0);
         }
     }
 }
