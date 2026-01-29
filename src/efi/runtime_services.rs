@@ -8,7 +8,7 @@ use r_efi::efi::{
     self, CapsuleHeader, Guid, ResetType, Status, TableHeader, Time, TimeCapabilities,
 };
 
-use crate::state::{self, MAX_VARIABLE_DATA_SIZE, MAX_VARIABLE_NAME_LEN, MAX_VARIABLES};
+use crate::state::{self, MAX_VARIABLES, MAX_VARIABLE_DATA_SIZE, MAX_VARIABLE_NAME_LEN};
 
 /// Runtime Services signature "RUNTSERV"
 const EFI_RUNTIME_SERVICES_SIGNATURE: u64 = 0x56524553544E5552;
@@ -506,12 +506,8 @@ unsafe fn x86_in8(port: u16) -> u8 {
     value
 }
 
-/// Compare two GUIDs for equality
-fn guid_eq(a: &Guid, b: &Guid) -> bool {
-    let a_bytes = unsafe { core::slice::from_raw_parts(a as *const Guid as *const u8, 16) };
-    let b_bytes = unsafe { core::slice::from_raw_parts(b as *const Guid as *const u8, 16) };
-    a_bytes == b_bytes
-}
+// Use common guid_eq from utils module
+use super::utils::guid_eq;
 
 /// Compare a UCS-2 string in array with a pointer
 fn name_eq(stored: &[u16], name: *const u16) -> bool {

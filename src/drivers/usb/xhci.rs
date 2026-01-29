@@ -6,9 +6,9 @@ use crate::drivers::pci::{self, PciAddress, PciDevice};
 use crate::efi;
 use crate::time::Timeout;
 use core::ptr;
-use core::sync::atomic::{Ordering, fence};
+use core::sync::atomic::{fence, Ordering};
 
-use super::controller::{DeviceDescriptor, desc_type, parse_configuration, req_type, request};
+use super::controller::{desc_type, parse_configuration, req_type, request, DeviceDescriptor};
 
 /// xHCI Capability Registers
 #[allow(dead_code)]
@@ -321,7 +321,10 @@ pub struct DeviceContext {
 
 impl Default for DeviceContext {
     fn default() -> Self {
-        unsafe { core::mem::zeroed() }
+        Self {
+            slot: SlotContext::default(),
+            endpoints: [EndpointContext::default(); 31],
+        }
     }
 }
 
@@ -335,7 +338,11 @@ pub struct InputContext {
 
 impl Default for InputContext {
     fn default() -> Self {
-        unsafe { core::mem::zeroed() }
+        Self {
+            control: InputControlContext::default(),
+            slot: SlotContext::default(),
+            endpoints: [EndpointContext::default(); 31],
+        }
     }
 }
 
@@ -1571,8 +1578,17 @@ impl XhciController {
     }
 }
 
-// Ensure XhciController can be sent between threads
+// SAFETY: XhciController contains raw pointers to MMIO registers, DCBAA, event rings,
+// and command rings. These are:
+// 1. MMIO addresses from PCI BAR that remain valid for the device's lifetime
+// 2. DMA-accessible buffers allocated via EFI page allocator with proper alignment
+// 3. Accessed only through the UsbControllerHandle abstraction which serializes access
+// The firmware is single-threaded and interrupts are disabled during USB operations.
 unsafe impl Send for XhciController {}
+
+// SAFETY: UsbSlot contains raw pointers to device/input contexts allocated via EFI.
+// These DMA buffers remain valid for the slot's lifetime and are only accessed
+// through the parent XhciController. Single-threaded firmware ensures no races.
 unsafe impl Send for UsbSlot {}
 
 // ============================================================================

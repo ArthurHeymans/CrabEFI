@@ -7,7 +7,7 @@ use crate::drivers::pci::{self, PciDevice};
 use crate::efi;
 use crate::time::Timeout;
 use core::ptr;
-use core::sync::atomic::{Ordering, fence};
+use core::sync::atomic::{fence, Ordering};
 
 use spin::Mutex;
 
@@ -412,7 +412,17 @@ pub struct ReceivedFis {
 
 impl Default for ReceivedFis {
     fn default() -> Self {
-        unsafe { core::mem::zeroed() }
+        Self {
+            dsfis: [0; 28],
+            reserved0: [0; 4],
+            psfis: [0; 20],
+            reserved1: [0; 12],
+            rfis: [0; 20],
+            reserved2: [0; 4],
+            sdbfis: [0; 8],
+            ufis: [0; 64],
+            reserved3: [0; 96],
+        }
     }
 }
 
@@ -653,7 +663,9 @@ impl AhciController {
                             port_num,
                             port.sector_count
                         );
-                        let _ = self.ports.push(port);
+                        if self.ports.push(port).is_err() {
+                            log::warn!("AHCI: Failed to add port {} - port list full", port_num);
+                        }
                     } else if port.device_type == DeviceType::Satapi {
                         log::info!(
                             "AHCI Port {}: SATAPI device, {} sectors (sector_size={})",
@@ -661,7 +673,9 @@ impl AhciController {
                             port.sector_count,
                             port.sector_size
                         );
-                        let _ = self.ports.push(port);
+                        if self.ports.push(port).is_err() {
+                            log::warn!("AHCI: Failed to add port {} - port list full", port_num);
+                        }
                     } else {
                         log::info!("AHCI Port {}: {:?} device", port_num, port.device_type);
                     }
@@ -1313,7 +1327,10 @@ impl AhciController {
 /// Wrapper for AHCI controller pointer to implement Send
 struct AhciControllerPtr(*mut AhciController);
 
-// SAFETY: We ensure single-threaded access via the Mutex
+// SAFETY: AhciControllerPtr wraps a pointer to an AhciController allocated via the EFI
+// page allocator. The pointer remains valid for the firmware's lifetime and all access
+// is protected by the AHCI_CONTROLLERS mutex. The firmware runs single-threaded with
+// interrupts disabled during AHCI operations.
 unsafe impl Send for AhciControllerPtr {}
 
 /// Global list of AHCI controllers
@@ -1351,8 +1368,14 @@ pub fn init() {
                     unsafe {
                         ptr::write(controller_box, controller);
                     }
-                    let _ = controllers.push(AhciControllerPtr(controller_box));
-                    log::info!("AHCI controller at {} initialized", dev.address);
+                    if controllers.push(AhciControllerPtr(controller_box)).is_err() {
+                        log::warn!(
+                            "AHCI: Failed to register controller at {} - controller list full",
+                            dev.address
+                        );
+                    } else {
+                        log::info!("AHCI controller at {} initialized", dev.address);
+                    }
                 }
             }
             Err(e) => {
@@ -1377,8 +1400,18 @@ pub fn get_controller(index: usize) -> Option<&'static mut AhciController> {
     controllers.get(index).map(|ptr| unsafe { &mut *ptr.0 })
 }
 
-// Ensure AhciController can be sent between threads
+// SAFETY: AhciController contains raw pointers to MMIO registers and DMA buffers.
+// These are:
+// 1. MMIO base address from PCI BAR that remains valid for the device's lifetime
+// 2. DMA buffers (command list, FIS, command tables) allocated via EFI page allocator
+// 3. Only accessed while holding the AHCI_CONTROLLERS mutex
+// The firmware is single-threaded; concurrent hardware access is not possible.
 unsafe impl Send for AhciController {}
+
+// SAFETY: AhciPort contains raw pointers to DMA buffers (command list, FIS, command tables).
+// These buffers are allocated via the EFI page allocator during port initialization and
+// remain valid for the firmware's lifetime. All port access is serialized through the
+// parent AhciController which is mutex-protected. Single-threaded firmware.
 unsafe impl Send for AhciPort {}
 
 // ============================================================================
@@ -1394,7 +1427,10 @@ struct GlobalAhciDevice {
 /// Pointer wrapper for global storage
 struct GlobalAhciDevicePtr(*mut GlobalAhciDevice);
 
-// Safety: We use mutex protection for all access
+// SAFETY: GlobalAhciDevicePtr wraps a pointer to GlobalAhciDevice allocated via EFI.
+// All access is protected by the GLOBAL_AHCI_DEVICE mutex, ensuring no concurrent
+// access. The pointed-to data contains only indices (not raw pointers to hardware),
+// and the firmware runs single-threaded.
 unsafe impl Send for GlobalAhciDevicePtr {}
 
 /// Global AHCI device for filesystem protocol

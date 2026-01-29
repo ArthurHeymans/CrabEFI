@@ -803,7 +803,13 @@ pub struct InterruptQueue {
     pub controller_data: u64,
 }
 
-// Safety: We protect access with mutex
+// SAFETY: InterruptQueue contains a raw pointer to a DMA-accessible buffer allocated
+// via the EFI page allocator. This buffer:
+// 1. Remains valid until the queue is explicitly destroyed
+// 2. Is only accessed through the owning USB controller which serializes access
+// 3. Contains data that may be written by hardware DMA, but firmware only reads
+//    after checking completion status
+// The firmware is single-threaded and interrupt queues are accessed serially.
 unsafe impl Send for InterruptQueue {}
 
 impl InterruptQueue {

@@ -384,30 +384,61 @@ impl<'a, D: BlockDevice> FatFilesystem<'a, D> {
     }
 
     /// Get the first sector of a cluster
-    fn cluster_to_sector(&self, cluster: u32) -> u64 {
-        let sector = self.data_start + (cluster - 2) * self.sectors_per_cluster as u32;
-        self.partition_start + sector as u64
+    ///
+    /// # Returns
+    /// Returns `None` if the cluster number is invalid (< 2 or beyond data region)
+    fn cluster_to_sector(&self, cluster: u32) -> Option<u64> {
+        // Clusters 0 and 1 are reserved in FAT
+        if cluster < 2 {
+            return None;
+        }
+        // Check cluster is within valid range
+        if cluster - 2 >= self.data_clusters {
+            return None;
+        }
+        // Calculate sector with overflow check
+        let cluster_offset = (cluster - 2).checked_mul(self.sectors_per_cluster as u32)?;
+        let sector = self.data_start.checked_add(cluster_offset)?;
+        Some(self.partition_start.checked_add(sector as u64)?)
     }
 
     /// Read the next cluster from the FAT
     fn next_cluster(&mut self, cluster: u32) -> Result<Option<u32>, FatError> {
+        // Validate cluster number is in valid range (clusters 0 and 1 are reserved)
+        if cluster < 2 {
+            return Err(FatError::InvalidCluster);
+        }
+
         let mut buffer = [0u8; SECTOR_SIZE];
+        let bytes_per_sector = self.bytes_per_sector as u32;
 
         let (fat_offset, sector_offset) = match self.fat_type {
             FatType::Fat12 => {
-                let offset = cluster + (cluster / 2);
-                let sector = self.fat_start + (offset / self.bytes_per_sector as u32);
-                (offset % self.bytes_per_sector as u32, sector)
+                // offset = cluster * 1.5, but we calculate as cluster + cluster/2 to avoid floats
+                let offset = cluster
+                    .checked_add(cluster / 2)
+                    .ok_or(FatError::InvalidCluster)?;
+                let sector = self
+                    .fat_start
+                    .checked_add(offset / bytes_per_sector)
+                    .ok_or(FatError::InvalidCluster)?;
+                (offset % bytes_per_sector, sector)
             }
             FatType::Fat16 => {
-                let offset = cluster * 2;
-                let sector = self.fat_start + (offset / self.bytes_per_sector as u32);
-                (offset % self.bytes_per_sector as u32, sector)
+                let offset = cluster.checked_mul(2).ok_or(FatError::InvalidCluster)?;
+                let sector = self
+                    .fat_start
+                    .checked_add(offset / bytes_per_sector)
+                    .ok_or(FatError::InvalidCluster)?;
+                (offset % bytes_per_sector, sector)
             }
             FatType::Fat32 => {
-                let offset = cluster * 4;
-                let sector = self.fat_start + (offset / self.bytes_per_sector as u32);
-                (offset % self.bytes_per_sector as u32, sector)
+                let offset = cluster.checked_mul(4).ok_or(FatError::InvalidCluster)?;
+                let sector = self
+                    .fat_start
+                    .checked_add(offset / bytes_per_sector)
+                    .ok_or(FatError::InvalidCluster)?;
+                (offset % bytes_per_sector, sector)
             }
         };
 
@@ -488,7 +519,9 @@ impl<'a, D: BlockDevice> FatFilesystem<'a, D> {
             return Err(FatError::BufferTooSmall);
         }
 
-        let start_sector = self.cluster_to_sector(cluster);
+        let start_sector = self
+            .cluster_to_sector(cluster)
+            .ok_or(FatError::InvalidCluster)?;
         let bytes_per_sector = self.bytes_per_sector as usize;
 
         (0..self.sectors_per_cluster).try_for_each(|i| {

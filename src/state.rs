@@ -139,7 +139,11 @@ pub fn try_get() -> Option<&'static FirmwareState> {
 #[inline]
 pub fn try_get_mut_ptr() -> Option<*mut FirmwareState> {
     let ptr = STATE_PTR.load(Ordering::Acquire);
-    if ptr.is_null() { None } else { Some(ptr) }
+    if ptr.is_null() {
+        None
+    } else {
+        Some(ptr)
+    }
 }
 
 // ============================================================================
@@ -219,7 +223,12 @@ pub struct ProtocolEntry {
     pub interface: *mut core::ffi::c_void,
 }
 
-// Safety: ProtocolEntry contains raw pointers but firmware is single-threaded
+// SAFETY: ProtocolEntry contains raw pointers to protocol interfaces.
+// These pointers are:
+// 1. Only dereferenced while holding the global HANDLES lock
+// 2. Point to memory allocated via the EFI allocator which remains valid
+//    for the lifetime of the firmware
+// 3. CrabEFI runs single-threaded with interrupts disabled during protocol calls
 unsafe impl Send for ProtocolEntry {}
 unsafe impl Sync for ProtocolEntry {}
 
@@ -239,7 +248,10 @@ pub struct HandleEntry {
     pub protocol_count: usize,
 }
 
-// Safety: HandleEntry contains raw pointers but firmware is single-threaded
+// SAFETY: HandleEntry contains EFI Handle (raw pointer) and ProtocolEntry array.
+// Handles are opaque identifiers that remain valid until explicitly closed.
+// All access is protected by the global HANDLES mutex, and the firmware
+// is single-threaded with no concurrent access to handle data.
 unsafe impl Send for HandleEntry {}
 unsafe impl Sync for HandleEntry {}
 
@@ -290,7 +302,10 @@ pub struct LoadedImageEntry {
     pub parent_handle: Handle,
 }
 
-// Safety: LoadedImageEntry contains raw pointers but firmware is single-threaded
+// SAFETY: LoadedImageEntry contains EFI Handle pointers for tracking loaded PE images.
+// These handles are opaque identifiers pointing to allocated image memory that
+// remains valid until the image is unloaded via UnloadImage(). The firmware is
+// single-threaded and all access to loaded image entries is serialized.
 unsafe impl Send for LoadedImageEntry {}
 unsafe impl Sync for LoadedImageEntry {}
 
@@ -315,7 +330,12 @@ pub struct ConfigurationTable {
     pub vendor_table: *mut core::ffi::c_void,
 }
 
-// Safety: ConfigurationTable contains raw pointers but firmware is single-threaded
+// SAFETY: ConfigurationTable contains a raw pointer to vendor-specific data (e.g., ACPI tables).
+// These pointers reference memory that:
+// 1. Is allocated and initialized before being added to the configuration table
+// 2. Remains valid for the entire firmware lifetime (ACPI tables, SMBIOS, etc.)
+// 3. Is only read by the OS after ExitBootServices, at which point the firmware
+//    is no longer running and there are no concurrent accesses
 unsafe impl Send for ConfigurationTable {}
 unsafe impl Sync for ConfigurationTable {}
 

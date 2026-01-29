@@ -168,8 +168,14 @@ impl MemoryDescriptor {
     }
 
     /// Get the end address (exclusive)
+    ///
+    /// Returns u64::MAX if the calculation would overflow, which ensures
+    /// the region comparison logic remains safe.
     pub fn end(&self) -> u64 {
-        self.physical_start + self.number_of_pages * PAGE_SIZE
+        self.number_of_pages
+            .checked_mul(PAGE_SIZE)
+            .and_then(|size| self.physical_start.checked_add(size))
+            .unwrap_or(u64::MAX)
     }
 
     /// Get the memory type as enum
@@ -206,7 +212,17 @@ impl MemoryAllocator {
         log::info!("Importing coreboot memory map ({} regions):", regions.len());
         for region in regions {
             let memory_type = cb_to_efi_memory_type(region.region_type);
-            let num_pages = (region.size + PAGE_SIZE - 1) / PAGE_SIZE;
+            // Safely calculate number of pages, skip regions that overflow
+            let num_pages = match region.size.checked_add(PAGE_SIZE - 1) {
+                Some(size_rounded) => size_rounded / PAGE_SIZE,
+                None => {
+                    log::warn!(
+                        "Region at {:#x} has size that overflows, skipping",
+                        region.start
+                    );
+                    continue;
+                }
+            };
 
             log::info!(
                 "  {:#010x}-{:#010x} {:?} -> {:?}",
@@ -300,8 +316,13 @@ impl MemoryAllocator {
     /// splits it if necessary, and marks the specified range as AcpiReclaimMemory.
     /// Unlike carve_out, this works on any memory type, not just ConventionalMemory.
     pub fn mark_as_acpi_reclaim(&mut self, addr: u64, num_pages: u64) -> Result<(), efi::Status> {
-        let size = num_pages * PAGE_SIZE;
-        let end = addr + size;
+        // Check for overflow in size calculation
+        let size = num_pages
+            .checked_mul(PAGE_SIZE)
+            .ok_or(efi::Status::INVALID_PARAMETER)?;
+        let end = addr
+            .checked_add(size)
+            .ok_or(efi::Status::INVALID_PARAMETER)?;
 
         // Find the entry containing this region (any memory type)
         let found_idx = self
@@ -405,7 +426,11 @@ impl MemoryAllocator {
             return efi::Status::UNSUPPORTED;
         }
 
-        let size = num_pages * PAGE_SIZE;
+        // Check for overflow in size calculation
+        let size = match num_pages.checked_mul(PAGE_SIZE) {
+            Some(s) => s,
+            None => return efi::Status::OUT_OF_RESOURCES,
+        };
 
         match alloc_type {
             AllocateType::AllocateAnyPages => {
@@ -596,7 +621,8 @@ impl MemoryAllocator {
 
     /// Find free pages that fit the requirements
     fn find_free_pages(&self, num_pages: u64, max_addr: u64) -> Option<u64> {
-        let size = num_pages * PAGE_SIZE;
+        // Check for overflow in size calculation
+        let size = num_pages.checked_mul(PAGE_SIZE)?;
 
         // Limit max_addr to the identity-mapped region
         // Our page tables only cover the first 4GB, so allocating above that
@@ -638,7 +664,11 @@ impl MemoryAllocator {
 
     /// Check if a region is free (all pages are ConventionalMemory)
     fn is_region_free(&self, start: u64, size: u64) -> bool {
-        let end = start + size;
+        // Check for overflow - if it overflows, the region can't be free
+        let end = match start.checked_add(size) {
+            Some(e) => e,
+            None => return false,
+        };
 
         self.entries.iter().any(|entry| {
             entry.get_memory_type() == Some(MemoryType::ConventionalMemory)
@@ -654,8 +684,13 @@ impl MemoryAllocator {
         num_pages: u64,
         memory_type: MemoryType,
     ) -> Result<(), efi::Status> {
-        let size = num_pages * PAGE_SIZE;
-        let end = addr + size;
+        // Check for overflow in size calculation
+        let size = num_pages
+            .checked_mul(PAGE_SIZE)
+            .ok_or(efi::Status::INVALID_PARAMETER)?;
+        let end = addr
+            .checked_add(size)
+            .ok_or(efi::Status::INVALID_PARAMETER)?;
 
         // Find the entry containing this region
         let found_idx = self.entries.iter().position(|entry| {
@@ -878,9 +913,18 @@ pub fn allocate_pool(memory_type: MemoryType, size: usize) -> Result<*mut u8, ef
         return Err(efi::Status::INVALID_PARAMETER);
     }
 
-    // Calculate total size including header, round up to pages
-    let total_size = size + core::mem::size_of::<PoolHeader>();
-    let num_pages = (total_size as u64 + PAGE_SIZE - 1) / PAGE_SIZE;
+    // Calculate total size including header, with overflow check
+    let header_size = core::mem::size_of::<PoolHeader>();
+    let total_size = size
+        .checked_add(header_size)
+        .ok_or(efi::Status::OUT_OF_RESOURCES)?;
+
+    // Round up to pages, with overflow check
+    let total_size_u64 = total_size as u64;
+    let num_pages = total_size_u64
+        .checked_add(PAGE_SIZE - 1)
+        .ok_or(efi::Status::OUT_OF_RESOURCES)?
+        / PAGE_SIZE;
 
     let mut addr = 0u64;
     let status = allocate_pages(

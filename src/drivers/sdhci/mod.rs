@@ -103,8 +103,12 @@ pub struct SdhciController {
     dma_buffer: *mut u8,
 }
 
-// Safety: SdhciController contains raw pointers but we ensure single-threaded
-// access via the Mutex in SDHCI_CONTROLLERS
+// SAFETY: SdhciController contains raw pointers to MMIO registers and DMA buffer.
+// These are:
+// 1. MMIO base from PCI BAR that remains valid for the device's lifetime
+// 2. DMA buffer allocated via EFI page allocator (persists until shutdown)
+// All access is protected by the SDHCI_CONTROLLERS mutex, and the firmware
+// is single-threaded with no concurrent SD card operations.
 unsafe impl Send for SdhciController {}
 
 impl SdhciController {
@@ -974,7 +978,10 @@ impl SdhciController {
 /// Wrapper for SDHCI controller pointer to implement Send
 struct SdhciControllerPtr(*mut SdhciController);
 
-// Safety: We ensure single-threaded access via the Mutex
+// SAFETY: SdhciControllerPtr wraps a pointer to an SdhciController allocated via the EFI
+// page allocator. The pointer remains valid for the firmware's lifetime and all access
+// is protected by the SDHCI_CONTROLLERS mutex. The firmware runs single-threaded with
+// no concurrent SD card operations.
 unsafe impl Send for SdhciControllerPtr {}
 
 /// Global list of SDHCI controllers
@@ -1058,7 +1065,10 @@ struct GlobalSdhciDevice {
 /// Pointer wrapper for global storage
 struct GlobalSdhciDevicePtr(*mut GlobalSdhciDevice);
 
-// Safety: We use mutex protection for all access
+// SAFETY: GlobalSdhciDevicePtr wraps a pointer to GlobalSdhciDevice allocated via EFI.
+// All access is protected by the GLOBAL_SDHCI_DEVICE mutex, ensuring no concurrent
+// access. The pointed-to data contains only the controller index (not raw pointers
+// to hardware), and the firmware runs single-threaded.
 unsafe impl Send for GlobalSdhciDevicePtr {}
 
 /// Global SDHCI device for filesystem protocol

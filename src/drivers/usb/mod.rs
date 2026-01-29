@@ -48,7 +48,13 @@ pub enum UsbControllerHandle {
     Uhci(*mut uhci::UhciController),
 }
 
-// Safety: Controllers are only accessed with proper synchronization
+// SAFETY: UsbControllerHandle wraps raw pointers to USB controller structs (xHCI, EHCI, etc.)
+// allocated via the EFI page allocator. These pointers:
+// 1. Remain valid for the firmware's lifetime
+// 2. Are only accessed through ALL_CONTROLLERS mutex-protected array
+// 3. Point to structs that themselves have MMIO and DMA buffer pointers, but
+//    all hardware access is serialized through this handle abstraction
+// The firmware is single-threaded; no concurrent USB operations are possible.
 unsafe impl Send for UsbControllerHandle {}
 
 /// Macro to dispatch to the appropriate controller type

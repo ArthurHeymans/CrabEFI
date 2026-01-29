@@ -8,6 +8,7 @@ pub mod boot_services;
 pub mod protocols;
 pub mod runtime_services;
 pub mod system_table;
+pub mod utils;
 
 use crate::coreboot::tables::CorebootInfo;
 use r_efi::efi::{self, Status};
@@ -78,10 +79,10 @@ pub fn init(cb_info: &CorebootInfo) {
 /// Returns the console handle so GOP can be installed on it
 fn init_console() -> Option<efi::Handle> {
     use protocols::console::{
-        SIMPLE_TEXT_INPUT_PROTOCOL_GUID, SIMPLE_TEXT_OUTPUT_PROTOCOL_GUID, get_text_input_protocol,
-        get_text_output_protocol,
+        get_text_input_protocol, get_text_output_protocol, SIMPLE_TEXT_INPUT_PROTOCOL_GUID,
+        SIMPLE_TEXT_OUTPUT_PROTOCOL_GUID,
     };
-    use protocols::device_path::{DEVICE_PATH_PROTOCOL_GUID, create_video_device_path};
+    use protocols::device_path::{create_video_device_path, DEVICE_PATH_PROTOCOL_GUID};
 
     // Create console handle
     let console_handle = match boot_services::create_handle() {
@@ -141,7 +142,7 @@ fn init_console() -> Option<efi::Handle> {
 /// Initialize Unicode Collation protocol
 fn init_unicode_collation() {
     use protocols::unicode_collation::{
-        UNICODE_COLLATION_PROTOCOL_GUID, UNICODE_COLLATION_PROTOCOL2_GUID, get_protocol_void,
+        get_protocol_void, UNICODE_COLLATION_PROTOCOL2_GUID, UNICODE_COLLATION_PROTOCOL_GUID,
     };
 
     // Create a handle for Unicode Collation
@@ -179,7 +180,7 @@ fn init_unicode_collation() {
 
 /// Initialize Memory Attribute protocol
 fn init_memory_attribute() {
-    use protocols::memory_attribute::{MEMORY_ATTRIBUTE_PROTOCOL_GUID, create_protocol};
+    use protocols::memory_attribute::{create_protocol, MEMORY_ATTRIBUTE_PROTOCOL_GUID};
 
     // Create a handle for Memory Attribute protocol
     let handle = match boot_services::create_handle() {
@@ -212,7 +213,7 @@ fn init_memory_attribute() {
 
 /// Initialize Serial IO protocol
 fn init_serial_io() {
-    use protocols::serial_io::{SERIAL_IO_PROTOCOL_GUID, create_protocol};
+    use protocols::serial_io::{create_protocol, SERIAL_IO_PROTOCOL_GUID};
 
     // Create a handle for Serial IO protocol
     let handle = match boot_services::create_handle() {
@@ -245,7 +246,7 @@ fn init_serial_io() {
 
 /// Initialize Console Control protocol (legacy Intel EFI protocol)
 fn init_console_control() {
-    use protocols::console_control::{CONSOLE_CONTROL_PROTOCOL_GUID, create_protocol};
+    use protocols::console_control::{create_protocol, CONSOLE_CONTROL_PROTOCOL_GUID};
 
     // Create a handle for Console Control protocol
     let handle = match boot_services::create_handle() {
@@ -282,7 +283,7 @@ fn init_graphics_output_on_handle(
     framebuffer: &crate::coreboot::FramebufferInfo,
     handle: efi::Handle,
 ) {
-    use protocols::graphics_output::{GRAPHICS_OUTPUT_GUID, create_gop};
+    use protocols::graphics_output::{create_gop, GRAPHICS_OUTPUT_GUID};
 
     // Create and install the protocol on the provided handle
     let protocol = create_gop(framebuffer);

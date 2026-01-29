@@ -9,12 +9,12 @@
 //! centralized `FirmwareState` structure. Access it via `crate::state::efi_mut()`.
 
 use super::allocator::{self, AllocateType, MemoryDescriptor, MemoryType};
-use super::protocols::loaded_image::{LOADED_IMAGE_PROTOCOL_GUID, create_loaded_image_protocol};
+use super::protocols::loaded_image::{create_loaded_image_protocol, LOADED_IMAGE_PROTOCOL_GUID};
 use super::system_table;
 use crate::pe;
 use crate::state::{
-    self, EventEntry, LoadedImageEntry, MAX_EVENTS, MAX_HANDLES, MAX_PROTOCOLS_PER_HANDLE,
-    ProtocolEntry,
+    self, EventEntry, LoadedImageEntry, ProtocolEntry, MAX_EVENTS, MAX_HANDLES,
+    MAX_PROTOCOLS_PER_HANDLE,
 };
 use core::ffi::c_void;
 use r_efi::efi::{self, Boolean, Guid, Handle, Status, SystemTable, TableHeader, Tpl};
@@ -1533,12 +1533,8 @@ extern "efiapi" fn set_mem(buffer: *mut c_void, size: usize, value: u8) {
 // Helper Functions
 // ============================================================================
 
-/// Compare two GUIDs for equality
-fn guid_eq(a: &Guid, b: &Guid) -> bool {
-    let a_bytes = unsafe { core::slice::from_raw_parts(a as *const Guid as *const u8, 16) };
-    let b_bytes = unsafe { core::slice::from_raw_parts(b as *const Guid as *const u8, 16) };
-    a_bytes == b_bytes
-}
+// Use common guid_eq from utils module
+use super::utils::guid_eq;
 
 /// Wrapper for GUID that displays name if known, raw GUID if unknown
 pub struct GuidFmt(pub Guid);

@@ -11,11 +11,11 @@ use crate::drivers::pci::{self, PciAddress, PciDevice};
 use crate::efi;
 use crate::time::Timeout;
 use core::ptr;
-use core::sync::atomic::{Ordering, fence};
+use core::sync::atomic::{fence, Ordering};
 
 use super::controller::{
-    DeviceDescriptor, DeviceInfo, Direction, EndpointInfo, UsbController, UsbDevice, UsbError,
-    UsbSpeed, desc_type, parse_configuration, req_type, request,
+    desc_type, parse_configuration, req_type, request, DeviceDescriptor, DeviceInfo, Direction,
+    EndpointInfo, UsbController, UsbDevice, UsbError, UsbSpeed,
 };
 
 // ============================================================================
@@ -163,7 +163,13 @@ pub struct Hcca {
 
 impl Default for Hcca {
     fn default() -> Self {
-        unsafe { core::mem::zeroed() }
+        Self {
+            interrupt_table: [0; 32],
+            frame_number: 0,
+            pad1: 0,
+            done_head: 0,
+            reserved: [0; 116],
+        }
     }
 }
 

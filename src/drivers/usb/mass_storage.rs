@@ -495,7 +495,12 @@ struct GlobalUsbState {
     controller_ptr: *mut dyn UsbController,
 }
 
-// Safety: Pointers are only accessed with proper synchronization via the mutex
+// SAFETY: GlobalUsbState contains raw pointers to UsbMassStorage and UsbController.
+// These pointers are:
+// 1. Allocated via EFI page allocator and remain valid for firmware lifetime
+// 2. Only accessed while holding the GLOBAL_USB_STATE mutex
+// 3. The UsbController pointer is a trait object stored in ALL_CONTROLLERS
+// The firmware is single-threaded and USB operations are serialized.
 unsafe impl Send for GlobalUsbState {}
 
 /// Global USB mass storage device and controller

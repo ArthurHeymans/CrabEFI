@@ -7,7 +7,7 @@ use crate::drivers::pci::{self, PciAddress, PciDevice};
 use crate::efi;
 use crate::time::Timeout;
 use core::ptr;
-use core::sync::atomic::{Ordering, fence};
+use core::sync::atomic::{fence, Ordering};
 use spin::Mutex;
 
 /// NVMe controller registers (MMIO base offsets)
@@ -728,7 +728,12 @@ impl NvmeController {
                 (namespace.num_blocks * namespace.block_size as u64) / (1024 * 1024)
             );
 
-            let _ = self.namespaces.push(namespace);
+            if self.namespaces.push(namespace).is_err() {
+                log::warn!(
+                    "NVMe: Failed to add namespace {} - namespace list full",
+                    nsid
+                );
+            }
         }
 
         efi::free_pages(identify_data, 1);
@@ -900,7 +905,10 @@ impl NvmeController {
 /// Wrapper for NVMe controller pointer to implement Send
 struct NvmeControllerPtr(*mut NvmeController);
 
-// SAFETY: We ensure single-threaded access via the Mutex
+// SAFETY: NvmeControllerPtr wraps a pointer to an NvmeController allocated via the EFI
+// page allocator. The pointer remains valid for the firmware's lifetime and all access
+// is protected by the NVME_CONTROLLERS mutex. The firmware runs single-threaded with
+// interrupts disabled during NVMe operations.
 unsafe impl Send for NvmeControllerPtr {}
 
 /// Global list of NVMe controllers
@@ -937,8 +945,14 @@ pub fn init() {
                     unsafe {
                         ptr::write(controller_box, controller);
                     }
-                    let _ = controllers.push(NvmeControllerPtr(controller_box));
-                    log::info!("NVMe controller at {} initialized", dev.address);
+                    if controllers.push(NvmeControllerPtr(controller_box)).is_err() {
+                        log::warn!(
+                            "NVMe: Failed to register controller at {} - controller list full",
+                            dev.address
+                        );
+                    } else {
+                        log::info!("NVMe controller at {} initialized", dev.address);
+                    }
                 }
             }
             Err(e) => {
@@ -963,7 +977,12 @@ pub fn get_controller(index: usize) -> Option<&'static mut NvmeController> {
     controllers.get(index).map(|ptr| unsafe { &mut *ptr.0 })
 }
 
-// Ensure NvmeController can be sent between threads
+// SAFETY: NvmeController contains raw pointers to MMIO registers and DMA buffers.
+// These are:
+// 1. Mapped from PCI BAR addresses that remain valid for the device's lifetime
+// 2. DMA buffers allocated via the EFI page allocator that persist until shutdown
+// 3. Only accessed while holding the NVME_CONTROLLERS mutex
+// The firmware is single-threaded; concurrent hardware access is not possible.
 unsafe impl Send for NvmeController {}
 
 // ============================================================================
@@ -979,7 +998,10 @@ struct GlobalNvmeDevice {
 /// Pointer wrapper for global storage
 struct GlobalNvmeDevicePtr(*mut GlobalNvmeDevice);
 
-// Safety: We use mutex protection for all access
+// SAFETY: GlobalNvmeDevicePtr wraps a pointer to GlobalNvmeDevice allocated via EFI.
+// All access is protected by the GLOBAL_NVME_DEVICE mutex, ensuring no concurrent
+// access. The pointed-to data contains only indices (not raw pointers to hardware),
+// and the firmware runs single-threaded.
 unsafe impl Send for GlobalNvmeDevicePtr {}
 
 /// Global NVMe device for filesystem protocol

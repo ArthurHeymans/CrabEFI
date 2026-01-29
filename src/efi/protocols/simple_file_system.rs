@@ -714,12 +714,8 @@ fn normalize_path(path: &mut [u8; MAX_PATH_LEN], len: usize) -> usize {
     }
 }
 
-/// Compare two GUIDs
-fn guid_eq(a: &Guid, b: &Guid) -> bool {
-    let a_bytes = unsafe { core::slice::from_raw_parts(a as *const Guid as *const u8, 16) };
-    let b_bytes = unsafe { core::slice::from_raw_parts(b as *const Guid as *const u8, 16) };
-    a_bytes == b_bytes
-}
+// Use common guid_eq from utils module
+use crate::efi::utils::guid_eq;
 
 // ============================================================================
 // FAT Filesystem Access

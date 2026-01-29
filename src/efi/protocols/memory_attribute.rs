@@ -7,7 +7,7 @@
 
 use r_efi::efi::{Guid, PhysicalAddress, Status};
 
-use crate::efi::allocator::{MemoryType, allocate_pool};
+use crate::efi::allocator::{allocate_pool, MemoryType};
 
 /// Memory Attribute Protocol GUID
 /// {f4560cf6-40ec-4b4a-a192-bf1d57d0b189}
