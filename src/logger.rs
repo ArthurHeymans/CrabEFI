@@ -1,13 +1,14 @@
 //! Logging infrastructure for CrabEFI
 //!
-//! This module provides logging via the `log` crate, outputting to both
-//! the serial port and the framebuffer console.
+//! This module provides logging via the `log` crate, outputting to the
+//! serial port, the coreboot CBMEM console, and the framebuffer.
 
 use core::fmt::Write;
 use core::sync::atomic::{AtomicU64, Ordering};
 use log::{Level, LevelFilter, Metadata, Record};
 use spin::Mutex;
 
+use crate::coreboot::cbmem_console;
 use crate::coreboot::FramebufferInfo;
 use crate::framebuffer_console::{Color, CHAR_HEIGHT, CHAR_WIDTH};
 
@@ -64,11 +65,32 @@ impl log::Log for CombinedLogger {
                 Level::Trace => "\x1b[35mTRACE\x1b[0m",
             };
 
+            // Level strings without ANSI colors (for CBMEM console)
+            let level_str_plain = match record.level() {
+                Level::Error => "ERROR",
+                Level::Warn => "WARN ",
+                Level::Info => "INFO ",
+                Level::Debug => "DEBUG",
+                Level::Trace => "TRACE",
+            };
+
             // Get timestamp (k-ticks since boot)
             let ts = get_timestamp_k();
 
             // Output to serial with timestamp
             crate::serial_println!("[{:>10}] [{}] {}", ts, level_str_serial, record.args());
+
+            // Output to CBMEM console (if available)
+            if cbmem_console::is_available() {
+                let mut writer = cbmem_console::CbmemConsoleWriter;
+                let _ = write!(
+                    writer,
+                    "[{:>10}] [{}] {}\n",
+                    ts,
+                    level_str_plain,
+                    record.args()
+                );
+            }
 
             // Output to framebuffer (if available)
             if let Some(ref fb_info) = *FB_INFO.lock() {

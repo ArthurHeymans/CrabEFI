@@ -2,8 +2,9 @@
 //!
 //! This module parses the coreboot tables to extract information about
 //! the system hardware, including memory map, serial port, framebuffer,
-//! and ACPI tables.
+//! CBMEM console, and ACPI tables.
 
+pub mod cbmem_console;
 pub mod framebuffer;
 pub mod memory;
 pub mod tables;

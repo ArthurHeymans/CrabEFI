@@ -110,6 +110,14 @@ struct CbAcpiRsdp {
     rsdp_pointer: u64,
 }
 
+/// CBMEM reference (used for console, timestamps, etc.)
+#[repr(C, packed)]
+struct CbCbmemRef {
+    tag: u32,
+    size: u32,
+    cbmem_addr: u64,
+}
+
 /// Serial port information
 #[derive(Debug, Clone)]
 pub struct SerialInfo {
@@ -132,6 +140,8 @@ pub struct CorebootInfo {
     pub acpi_rsdp: Option<u64>,
     /// Coreboot version string
     pub version: Option<&'static str>,
+    /// CBMEM console address
+    pub cbmem_console: Option<u64>,
 }
 
 impl CorebootInfo {
@@ -142,6 +152,7 @@ impl CorebootInfo {
             framebuffer: None,
             acpi_rsdp: None,
             version: None,
+            cbmem_console: None,
         }
     }
 }
@@ -353,6 +364,9 @@ unsafe fn parse_record(record: *const CbRecord, info: &mut CorebootInfo) {
         tags::CB_TAG_ACPI_RSDP => {
             parse_acpi_rsdp(record, info);
         }
+        tags::CB_TAG_CBMEM_CONSOLE => {
+            parse_cbmem_console(record, info);
+        }
         tags::CB_TAG_VERSION => {
             // Version string follows the record header
             let string_ptr = (record as *const u8).add(8);
@@ -536,4 +550,13 @@ unsafe fn parse_acpi_rsdp(record: *const CbRecord, info: &mut CorebootInfo) {
     info.acpi_rsdp = Some(rsdp_pointer);
 
     log::debug!("ACPI RSDP: {:#x}", rsdp_pointer);
+}
+
+/// Parse CBMEM console reference
+unsafe fn parse_cbmem_console(record: *const CbRecord, info: &mut CorebootInfo) {
+    let cbmem_ref = record as *const CbCbmemRef;
+    let cbmem_addr = core::ptr::addr_of!((*cbmem_ref).cbmem_addr).read_unaligned();
+    info.cbmem_console = Some(cbmem_addr);
+
+    log::debug!("CBMEM console: {:#x}", cbmem_addr);
 }

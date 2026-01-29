@@ -59,6 +59,11 @@ pub fn init(coreboot_table_ptr: u64) {
     // Parse coreboot tables first (before any I/O) to get hardware info
     let cb_info = coreboot::tables::parse(coreboot_table_ptr as *const u8);
 
+    // Initialize CBMEM console early (before logging) so all output goes there
+    if let Some(cbmem_addr) = cb_info.cbmem_console {
+        coreboot::cbmem_console::init(cbmem_addr);
+    }
+
     // Store framebuffer globally for menu rendering and draw life sign ASAP
     if let Some(ref fb) = cb_info.framebuffer {
         coreboot::store_framebuffer(fb.clone());
@@ -106,6 +111,9 @@ pub fn init(coreboot_table_ptr: u64) {
     }
     if let Some(rsdp) = cb_info.acpi_rsdp {
         log::info!("  ACPI RSDP: {:#x}", rsdp);
+    }
+    if let Some(cbmem_console) = cb_info.cbmem_console {
+        log::info!("  CBMEM console: {:#x}", cbmem_console);
     }
     log::info!("  Memory regions: {}", cb_info.memory_map.len());
 
