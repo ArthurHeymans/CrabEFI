@@ -3,8 +3,10 @@
 //! This module contains code specific to the x86_64 architecture,
 //! including the 32-bit to 64-bit mode transition and page table setup.
 
+pub mod cache;
 pub mod entry;
 pub mod idt;
+pub mod io;
 pub mod paging;
 pub mod sse;
 
@@ -158,4 +160,23 @@ pub fn read_cr4() -> u64 {
 #[inline]
 pub unsafe fn write_cr4(value: u64) {
     core::arch::asm!("mov cr4, {}", in(reg) value);
+}
+
+/// Read the Time Stamp Counter (TSC)
+///
+/// Returns the current value of the processor's time-stamp counter,
+/// which increments at a constant rate (typically the processor's base frequency).
+#[inline]
+pub fn rdtsc() -> u64 {
+    let lo: u32;
+    let hi: u32;
+    unsafe {
+        core::arch::asm!(
+            "rdtsc",
+            out("eax") lo,
+            out("edx") hi,
+            options(nomem, nostack, preserves_flags)
+        );
+    }
+    ((hi as u64) << 32) | (lo as u64)
 }

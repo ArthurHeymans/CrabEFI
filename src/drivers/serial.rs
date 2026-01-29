@@ -3,6 +3,7 @@
 //! This module provides a simple driver for the 16550-compatible UART
 //! typically found in PC-compatible systems.
 
+use crate::arch::x86_64::io;
 use core::fmt::{self, Write};
 use spin::Mutex;
 
@@ -200,26 +201,12 @@ impl SerialPort {
 
     /// Read a register
     unsafe fn read_reg(&self, offset: u16) -> u8 {
-        let port = self.base + offset;
-        let value: u8;
-        core::arch::asm!(
-            "in al, dx",
-            out("al") value,
-            in("dx") port,
-            options(nostack, preserves_flags)
-        );
-        value
+        io::inb(self.base + offset)
     }
 
     /// Write a register
     unsafe fn write_reg(&self, offset: u16, value: u8) {
-        let port = self.base + offset;
-        core::arch::asm!(
-            "out dx, al",
-            in("dx") port,
-            in("al") value,
-            options(nostack, preserves_flags)
-        );
+        io::outb(self.base + offset, value);
     }
 }
 

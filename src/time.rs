@@ -3,7 +3,11 @@
 //! This module provides timing primitives using the x86 TSC (Time Stamp Counter),
 //! calibrated against the ACPI PM timer for accurate real-time measurements.
 
+use crate::arch::x86_64::io;
 use core::sync::atomic::{AtomicU64, Ordering};
+
+// Re-export rdtsc from arch module for public API
+pub use crate::arch::x86_64::rdtsc;
 
 /// TSC frequency in Hz (cycles per second)
 /// Default to 2 GHz as a conservative fallback
@@ -21,35 +25,6 @@ static PM_TIMER_PORT: AtomicU64 = AtomicU64::new(0);
 /// PM timer is 32-bit (vs 24-bit)
 static PM_TIMER_32BIT: AtomicU64 = AtomicU64::new(0);
 
-/// Read the Time Stamp Counter
-#[inline]
-pub fn rdtsc() -> u64 {
-    unsafe {
-        let lo: u32;
-        let hi: u32;
-        core::arch::asm!(
-            "rdtsc",
-            out("eax") lo,
-            out("edx") hi,
-            options(nostack, preserves_flags),
-        );
-        ((hi as u64) << 32) | (lo as u64)
-    }
-}
-
-/// Read from an I/O port
-#[inline]
-unsafe fn inl(port: u16) -> u32 {
-    let value: u32;
-    core::arch::asm!(
-        "in eax, dx",
-        out("eax") value,
-        in("dx") port,
-        options(nostack, preserves_flags),
-    );
-    value
-}
-
 /// Read the ACPI PM timer value
 #[inline]
 fn read_pm_timer() -> u32 {
@@ -57,7 +32,7 @@ fn read_pm_timer() -> u32 {
     if port == 0 {
         return 0;
     }
-    unsafe { inl(port) }
+    unsafe { io::inl(port) }
 }
 
 /// ACPI RSDP structure (Root System Description Pointer)

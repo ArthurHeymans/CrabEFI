@@ -3,12 +3,12 @@
 //! This module implements the EFI Runtime Services table, which provides
 //! time, variable, and system reset services that persist after ExitBootServices.
 
+use crate::arch::x86_64::io;
+use crate::state::{self, MAX_VARIABLE_DATA_SIZE, MAX_VARIABLE_NAME_LEN, MAX_VARIABLES};
 use core::ffi::c_void;
 use r_efi::efi::{
     self, CapsuleHeader, Guid, ResetType, Status, TableHeader, Time, TimeCapabilities,
 };
-
-use crate::state::{self, MAX_VARIABLE_DATA_SIZE, MAX_VARIABLE_NAME_LEN, MAX_VARIABLES};
 
 /// Runtime Services signature "RUNTSERV"
 const EFI_RUNTIME_SERVICES_SIGNATURE: u64 = 0x56524553544E5552;
@@ -493,17 +493,15 @@ fn read_cmos(reg: u8) -> u8 {
     }
 }
 
-/// Port I/O functions
+/// Port I/O functions - wrapper for arch module
 #[inline]
 unsafe fn x86_out8(port: u16, value: u8) {
-    core::arch::asm!("out dx, al", in("dx") port, in("al") value, options(nostack, preserves_flags));
+    io::outb(port, value);
 }
 
 #[inline]
 unsafe fn x86_in8(port: u16) -> u8 {
-    let value: u8;
-    core::arch::asm!("in al, dx", out("al") value, in("dx") port, options(nostack, preserves_flags));
-    value
+    io::inb(port)
 }
 
 // Use common guid_eq from utils module

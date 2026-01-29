@@ -18,6 +18,7 @@
 //! - U-Boot drivers/usb/host/ehci-hcd.c
 //! - libpayload ehci.c
 
+use crate::arch::x86_64::cache::{flush_cache_range, invalidate_cache_range};
 use crate::drivers::mmio::MmioRegion;
 use crate::drivers::pci::{self, PciAddress, PciDevice};
 use crate::efi;
@@ -30,43 +31,6 @@ use super::controller::{
     UsbDevice, UsbError, UsbSpeed, class, desc_type, hub_feature, hub_port_status,
     parse_configuration, req_type, request,
 };
-
-// ============================================================================
-// Cache Management for DMA
-// ============================================================================
-
-/// Cache line size (typically 64 bytes on modern x86)
-const CACHE_LINE_SIZE: usize = 64;
-
-/// Flush a memory range from CPU cache to main memory
-///
-/// This ensures the EHCI controller (doing DMA) sees the data written by the CPU.
-#[inline]
-fn flush_cache_range(addr: u64, size: usize) {
-    let start = addr as usize & !(CACHE_LINE_SIZE - 1);
-    let end = (addr as usize + size + CACHE_LINE_SIZE - 1) & !(CACHE_LINE_SIZE - 1);
-
-    for line in (start..end).step_by(CACHE_LINE_SIZE) {
-        unsafe {
-            core::arch::asm!(
-                "clflush [{}]",
-                in(reg) line,
-                options(nostack, preserves_flags)
-            );
-        }
-    }
-    // Memory fence to ensure flushes complete before continuing
-    fence(Ordering::SeqCst);
-}
-
-/// Invalidate a memory range in CPU cache
-///
-/// This ensures the CPU sees data written by the EHCI controller (DMA).
-/// On x86, clflush both writes back and invalidates, so we use the same instruction.
-#[inline]
-fn invalidate_cache_range(addr: u64, size: usize) {
-    flush_cache_range(addr, size);
-}
 
 // ============================================================================
 // EHCI Register Definitions

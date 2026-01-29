@@ -7,6 +7,7 @@
 //! - UHCI Design Guide Revision 1.1
 //! - libpayload uhci.c
 
+use crate::arch::x86_64::io;
 use crate::drivers::pci::{self, PciAddress, PciDevice};
 use crate::efi;
 use crate::time::Timeout;
@@ -409,40 +410,17 @@ impl UhciController {
 
     /// Read from I/O port
     fn inw(&self, offset: u16) -> u16 {
-        unsafe {
-            let mut value: u16;
-            core::arch::asm!(
-                "in ax, dx",
-                out("ax") value,
-                in("dx") self.io_base + offset,
-                options(nostack, preserves_flags)
-            );
-            value
-        }
+        unsafe { io::inw(self.io_base + offset) }
     }
 
     /// Write to I/O port
     fn outw(&mut self, offset: u16, value: u16) {
-        unsafe {
-            core::arch::asm!(
-                "out dx, ax",
-                in("dx") self.io_base + offset,
-                in("ax") value,
-                options(nostack, preserves_flags)
-            );
-        }
+        unsafe { io::outw(self.io_base + offset, value) }
     }
 
     /// Write dword to I/O port
     fn outl(&mut self, offset: u16, value: u32) {
-        unsafe {
-            core::arch::asm!(
-                "out dx, eax",
-                in("dx") self.io_base + offset,
-                in("eax") value,
-                options(nostack, preserves_flags)
-            );
-        }
+        unsafe { io::outl(self.io_base + offset, value) }
     }
 
     /// Disable UHCI legacy support (BIOS keyboard/mouse emulation)

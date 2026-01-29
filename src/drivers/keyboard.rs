@@ -13,6 +13,7 @@
 //! - libpayload: `payloads/libpayload/drivers/i8042/keyboard.c`
 //! - OSDev Wiki: https://wiki.osdev.org/PS/2_Keyboard
 
+use crate::arch::x86_64::io;
 use spin::Mutex;
 
 /// i8042 controller I/O ports
@@ -142,35 +143,11 @@ impl KeyboardState {
 /// Global keyboard state
 static KEYBOARD: Mutex<KeyboardState> = Mutex::new(KeyboardState::new());
 
-/// Read a byte from an I/O port
-#[inline]
-unsafe fn inb(port: u16) -> u8 {
-    let value: u8;
-    core::arch::asm!(
-        "in al, dx",
-        out("al") value,
-        in("dx") port,
-        options(nostack, preserves_flags)
-    );
-    value
-}
-
-/// Write a byte to an I/O port
-#[inline]
-unsafe fn outb(port: u16, value: u8) {
-    core::arch::asm!(
-        "out dx, al",
-        in("dx") port,
-        in("al") value,
-        options(nostack, preserves_flags)
-    );
-}
-
 /// Wait for the controller input buffer to be empty (ready to accept commands)
 fn wait_input_ready() -> bool {
     for _ in 0..10000 {
         unsafe {
-            if (inb(ports::STATUS_CMD) & status::INPUT_FULL) == 0 {
+            if (io::inb(ports::STATUS_CMD) & status::INPUT_FULL) == 0 {
                 return true;
             }
         }
@@ -186,7 +163,7 @@ fn wait_input_ready() -> bool {
 fn wait_output_ready() -> bool {
     for _ in 0..10000 {
         unsafe {
-            if (inb(ports::STATUS_CMD) & status::OUTPUT_FULL) != 0 {
+            if (io::inb(ports::STATUS_CMD) & status::OUTPUT_FULL) != 0 {
                 return true;
             }
         }
@@ -204,7 +181,7 @@ fn send_controller_cmd(cmd: u8) -> bool {
         return false;
     }
     unsafe {
-        outb(ports::STATUS_CMD, cmd);
+        io::outb(ports::STATUS_CMD, cmd);
     }
     wait_input_ready()
 }
@@ -215,7 +192,7 @@ fn send_keyboard_cmd(cmd: u8) -> bool {
         return false;
     }
     unsafe {
-        outb(ports::DATA, cmd);
+        io::outb(ports::DATA, cmd);
     }
 
     // Wait for response
@@ -224,7 +201,7 @@ fn send_keyboard_cmd(cmd: u8) -> bool {
     }
 
     unsafe {
-        let response = inb(ports::DATA);
+        let response = io::inb(ports::DATA);
         response == response::ACK
     }
 }
@@ -233,10 +210,10 @@ fn send_keyboard_cmd(cmd: u8) -> bool {
 fn flush_output() {
     for _ in 0..100 {
         unsafe {
-            if (inb(ports::STATUS_CMD) & status::OUTPUT_FULL) == 0 {
+            if (io::inb(ports::STATUS_CMD) & status::OUTPUT_FULL) == 0 {
                 break;
             }
-            let _ = inb(ports::DATA);
+            let _ = io::inb(ports::DATA);
         }
         for _ in 0..10 {
             core::hint::spin_loop();
@@ -256,7 +233,7 @@ pub fn init() {
 
     // Check if controller exists
     unsafe {
-        if inb(ports::STATUS_CMD) == 0xFF {
+        if io::inb(ports::STATUS_CMD) == 0xFF {
             log::warn!("No PS/2 keyboard controller found");
             return;
         }
@@ -281,7 +258,7 @@ pub fn init() {
     }
 
     unsafe {
-        let result = inb(ports::DATA);
+        let result = io::inb(ports::DATA);
         if result != 0x55 {
             log::warn!("PS/2 controller self-test failed: {:#x}", result);
             return;
@@ -300,7 +277,7 @@ pub fn init() {
     }
 
     unsafe {
-        let result = inb(ports::DATA);
+        let result = io::inb(ports::DATA);
         if result != 0x00 {
             log::warn!("PS/2 keyboard port test failed: {:#x}", result);
             return;
@@ -321,7 +298,7 @@ pub fn init() {
         return;
     }
 
-    let mut config_byte = unsafe { inb(ports::DATA) };
+    let mut config_byte = unsafe { io::inb(ports::DATA) };
 
     // Enable translation (scancode set 2 -> set 1) and disable interrupts
     // We poll the keyboard instead of using interrupts
@@ -339,7 +316,7 @@ pub fn init() {
     }
 
     unsafe {
-        outb(ports::DATA, config_byte);
+        io::outb(ports::DATA, config_byte);
     }
 
     // Enable keyboard scanning
@@ -370,7 +347,7 @@ pub fn has_key() -> bool {
     drop(kb);
 
     unsafe {
-        let status = inb(ports::STATUS_CMD);
+        let status = io::inb(ports::STATUS_CMD);
         // Check output buffer full and not from auxiliary device
         (status & status::OUTPUT_FULL) != 0 && (status & status::AUX_DATA) == 0
     }
@@ -401,7 +378,7 @@ pub fn cleanup() {
         return;
     }
 
-    let mut config_byte = unsafe { inb(ports::DATA) };
+    let mut config_byte = unsafe { io::inb(ports::DATA) };
 
     // Re-enable keyboard interrupt (IRQ1) for the OS
     // Keep translation enabled as most OSes expect scancode set 1
@@ -417,7 +394,7 @@ pub fn cleanup() {
     }
 
     unsafe {
-        outb(ports::DATA, config_byte);
+        io::outb(ports::DATA, config_byte);
     }
 
     log::debug!("PS/2 keyboard controller ready for OS (IRQ1 enabled)");
@@ -446,7 +423,7 @@ pub fn try_read_key() -> Option<(u16, u16)> {
     }
 
     unsafe {
-        let status = inb(ports::STATUS_CMD);
+        let status = io::inb(ports::STATUS_CMD);
 
         // Check if keyboard data is available (not mouse data)
         if (status & status::OUTPUT_FULL) == 0 {
@@ -455,11 +432,11 @@ pub fn try_read_key() -> Option<(u16, u16)> {
 
         if (status & status::AUX_DATA) != 0 {
             // Mouse data, discard it
-            let _ = inb(ports::DATA);
+            let _ = io::inb(ports::DATA);
             return None;
         }
 
-        let scancode = inb(ports::DATA);
+        let scancode = io::inb(ports::DATA);
 
         // Handle the scancode
         process_scancode(&mut kb, scancode)
