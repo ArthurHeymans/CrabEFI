@@ -333,7 +333,7 @@ pub fn load_image(data: &[u8]) -> Result<LoadedImage, Status> {
     }
 
     // Allocate memory for the image
-    let num_pages = ((image_size as u64) + PAGE_SIZE - 1) / PAGE_SIZE;
+    let num_pages = (image_size as u64).div_ceil(PAGE_SIZE);
     let mut load_addr = 0u64;
 
     let status = allocator::allocate_pages(
@@ -468,14 +468,14 @@ pub fn load_image(data: &[u8]) -> Result<LoadedImage, Status> {
                 unsafe { read_unaligned(core::ptr::addr_of!(reloc_dir.virtual_address)) };
             let reloc_size = unsafe { read_unaligned(core::ptr::addr_of!(reloc_dir.size)) };
 
-            if reloc_rva > 0 && reloc_size > 0 {
-                if let Err(e) =
+            if reloc_rva > 0
+                && reloc_size > 0
+                && let Err(e) =
                     apply_relocations(load_addr, image_size, reloc_rva, reloc_size, delta)
-                {
-                    log::error!("PE: Failed to apply relocations");
-                    let _ = allocator::free_pages(load_addr, num_pages);
-                    return Err(e);
-                }
+            {
+                log::error!("PE: Failed to apply relocations");
+                let _ = allocator::free_pages(load_addr, num_pages);
+                return Err(e);
             }
         }
     }

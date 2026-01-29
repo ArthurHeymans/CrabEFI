@@ -108,6 +108,11 @@ pub fn read_cr3() -> u64 {
 }
 
 /// Write to the CR3 register (page table base)
+///
+/// # Safety
+///
+/// The caller must ensure that `value` is a valid page table base address.
+/// Invalid values can cause undefined behavior or system crashes.
 #[inline]
 pub unsafe fn write_cr3(value: u64) {
     core::arch::asm!("mov cr3, {}", in(reg) value);
@@ -124,6 +129,11 @@ pub fn read_cr0() -> u64 {
 }
 
 /// Write to the CR0 register
+///
+/// # Safety
+///
+/// The caller must ensure that `value` represents valid CR0 control bits.
+/// Invalid values can cause undefined behavior or system crashes.
 #[inline]
 pub unsafe fn write_cr0(value: u64) {
     core::arch::asm!("mov cr0, {}", in(reg) value);
@@ -140,6 +150,11 @@ pub fn read_cr4() -> u64 {
 }
 
 /// Write to the CR4 register
+///
+/// # Safety
+///
+/// The caller must ensure that `value` represents valid CR4 control bits.
+/// Invalid values can cause undefined behavior or system crashes.
 #[inline]
 pub unsafe fn write_cr4(value: u64) {
     core::arch::asm!("mov cr4, {}", in(reg) value);

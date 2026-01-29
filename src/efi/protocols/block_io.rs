@@ -105,10 +105,10 @@ fn find_context_index(protocol: *mut BlockIoProtocol) -> Option<usize> {
     unsafe {
         let contexts = core::ptr::addr_of!(PROTOCOL_TO_CONTEXT);
         for (i, p) in (*contexts).iter().enumerate() {
-            if let Some(ptr) = p {
-                if *ptr == protocol {
-                    return Some(i);
-                }
+            if let Some(ptr) = p
+                && *ptr == protocol
+            {
+                return Some(i);
             }
         }
     }
@@ -166,7 +166,7 @@ extern "efiapi" fn block_io_read_blocks(
 
     // Calculate number of blocks to read
     let block_size = ctx.block_size as usize;
-    if buffer_size % block_size != 0 {
+    if !buffer_size.is_multiple_of(block_size) {
         log::debug!(
             "BlockIO.ReadBlocks: buffer_size {} not multiple of block_size {}",
             buffer_size,

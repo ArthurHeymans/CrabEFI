@@ -247,7 +247,7 @@ extern "efiapi" fn fat_to_str(
 
     unsafe {
         for i in 0..fat_size {
-            let c = *fat.add(i) as u8;
+            let c = *fat.add(i);
             if c == 0 {
                 *string.add(i) = 0;
                 break;
@@ -295,7 +295,7 @@ extern "efiapi" fn str_to_fat(
             };
 
             // Check for illegal characters or non-ASCII
-            if c >= 128 || c < 0x20 || illegal.contains(&(c as u8)) {
+            if !(0x20..128).contains(&c) || illegal.contains(&(c as u8)) {
                 *fat.add(i) = b'_' as Char8;
                 has_illegal = Boolean::TRUE;
             } else {

@@ -443,9 +443,7 @@ fn mark_acpi_tables_memory(rsdp_addr: u64) {
     for i in 0..region_count {
         for j in (i + 1)..region_count {
             if regions[j].start < regions[i].start {
-                let tmp = regions[i];
-                regions[i] = regions[j];
-                regions[j] = tmp;
+                regions.swap(i, j);
             }
         }
     }
@@ -455,26 +453,26 @@ fn mark_acpi_tables_memory(rsdp_addr: u64) {
         [AcpiRegion { start: 0, end: 0 }; MAX_ACPI_REGIONS];
     let mut merged_count = 0;
 
-    for i in 0..region_count {
-        if regions[i].start == 0 && regions[i].end == 0 {
+    for region in regions.iter().take(region_count) {
+        if region.start == 0 && region.end == 0 {
             continue;
         }
 
         if merged_count == 0 {
-            merged[0] = regions[i];
+            merged[0] = *region;
             merged_count = 1;
         } else {
             let last = &mut merged[merged_count - 1];
             // Check if this region overlaps or is adjacent to the last merged region
-            if regions[i].start <= last.end {
+            if region.start <= last.end {
                 // Merge: extend the end if needed
-                if regions[i].end > last.end {
-                    last.end = regions[i].end;
+                if region.end > last.end {
+                    last.end = region.end;
                 }
             } else {
                 // No overlap, add as new region
                 if merged_count < MAX_ACPI_REGIONS {
-                    merged[merged_count] = regions[i];
+                    merged[merged_count] = *region;
                     merged_count += 1;
                 }
             }
@@ -483,8 +481,7 @@ fn mark_acpi_tables_memory(rsdp_addr: u64) {
 
     // Now mark each merged region once
     log::info!("Marking {} merged ACPI memory regions:", merged_count);
-    for i in 0..merged_count {
-        let region = &merged[i];
+    for region in merged.iter().take(merged_count) {
         let num_pages = (region.end - region.start) / PAGE_SIZE;
 
         match mark_as_acpi_reclaim(region.start, num_pages) {
@@ -611,8 +608,7 @@ pub fn dump_configuration_tables() {
     let count = efi.config_table_count;
 
     log::debug!("EFI Configuration Table ({} entries):", count);
-    for i in 0..count {
-        let entry = &tables[i];
+    for (i, entry) in tables.iter().enumerate().take(count) {
         let guid = &entry.vendor_guid;
 
         // Try to identify known GUIDs

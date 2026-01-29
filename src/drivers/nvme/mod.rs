@@ -563,7 +563,7 @@ impl NvmeController {
 
     /// Initialize the controller
     fn init(&mut self) -> Result<(), NvmeError> {
-        let regs = unsafe { &*(self.regs as *const NvmeRegisters as *mut NvmeRegisters) };
+        let regs = unsafe { &*(self.regs as *mut NvmeRegisters) };
 
         // Disable the controller
         regs.cc.modify(CC::EN::CLEAR);
@@ -668,23 +668,21 @@ impl NvmeController {
             let head = self.admin_cq_head as usize;
             let entry = unsafe { ptr::read_volatile(self.admin_cq.add(head)) };
 
-            if entry.phase() == self.admin_cq_phase {
-                if entry.cid() == cid {
-                    // Advance head
-                    self.admin_cq_head = ((head + 1) % ADMIN_QUEUE_SIZE) as u16;
-                    if self.admin_cq_head == 0 {
-                        self.admin_cq_phase = !self.admin_cq_phase;
-                    }
-                    self.ring_cq_doorbell(0, self.admin_cq_head);
-
-                    if entry.is_error() {
-                        return Err(NvmeError::CommandFailed(
-                            entry.status_code_type(),
-                            entry.status_code(),
-                        ));
-                    }
-                    return Ok(entry);
+            if entry.phase() == self.admin_cq_phase && entry.cid() == cid {
+                // Advance head
+                self.admin_cq_head = ((head + 1) % ADMIN_QUEUE_SIZE) as u16;
+                if self.admin_cq_head == 0 {
+                    self.admin_cq_phase = !self.admin_cq_phase;
                 }
+                self.ring_cq_doorbell(0, self.admin_cq_head);
+
+                if entry.is_error() {
+                    return Err(NvmeError::CommandFailed(
+                        entry.status_code_type(),
+                        entry.status_code(),
+                    ));
+                }
+                return Ok(entry);
             }
             core::hint::spin_loop();
         }
@@ -879,23 +877,21 @@ impl NvmeController {
             let head = self.io_cq_head as usize;
             let entry = unsafe { ptr::read_volatile(self.io_cq.add(head)) };
 
-            if entry.phase() == self.io_cq_phase {
-                if entry.cid() == cid {
-                    // Advance head
-                    self.io_cq_head = ((head + 1) % IO_QUEUE_SIZE) as u16;
-                    if self.io_cq_head == 0 {
-                        self.io_cq_phase = !self.io_cq_phase;
-                    }
-                    self.ring_cq_doorbell(1, self.io_cq_head);
-
-                    if entry.is_error() {
-                        return Err(NvmeError::CommandFailed(
-                            entry.status_code_type(),
-                            entry.status_code(),
-                        ));
-                    }
-                    return Ok(entry);
+            if entry.phase() == self.io_cq_phase && entry.cid() == cid {
+                // Advance head
+                self.io_cq_head = ((head + 1) % IO_QUEUE_SIZE) as u16;
+                if self.io_cq_head == 0 {
+                    self.io_cq_phase = !self.io_cq_phase;
                 }
+                self.ring_cq_doorbell(1, self.io_cq_head);
+
+                if entry.is_error() {
+                    return Err(NvmeError::CommandFailed(
+                        entry.status_code_type(),
+                        entry.status_code(),
+                    ));
+                }
+                return Ok(entry);
             }
             core::hint::spin_loop();
         }
@@ -1029,7 +1025,7 @@ pub fn init() {
             Ok(controller) => {
                 // Box the controller (we don't have alloc, so use EFI allocator)
                 let size = core::mem::size_of::<NvmeController>();
-                let pages = (size + 4095) / 4096;
+                let pages = size.div_ceil(4096);
                 log::debug!(
                     "NVMe: Allocating {} pages ({} bytes) for NvmeController",
                     pages,
@@ -1114,7 +1110,7 @@ static GLOBAL_NVME_DEVICE: Mutex<Option<GlobalNvmeDevicePtr>> = Mutex::new(None)
 pub fn store_global_device(controller_index: usize, nsid: u32) -> bool {
     // Allocate memory for the device info
     let size = core::mem::size_of::<GlobalNvmeDevice>();
-    let pages = (size + 4095) / 4096;
+    let pages = size.div_ceil(4096);
 
     if let Some(ptr) = efi::allocate_pages(pages as u64) {
         let device_ptr = ptr as *mut GlobalNvmeDevice;

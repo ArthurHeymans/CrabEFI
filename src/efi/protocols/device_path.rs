@@ -762,7 +762,7 @@ pub fn create_file_path_device_path(path: &str) -> *mut Protocol {
     let total_size = file_node_size + end_size;
 
     let ptr = match allocate_pool(MemoryType::BootServicesData, total_size) {
-        Ok(p) => p as *mut u8,
+        Ok(p) => p,
         Err(_) => {
             log::error!("Failed to allocate file path device path");
             return core::ptr::null_mut();

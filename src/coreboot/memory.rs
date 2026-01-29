@@ -75,12 +75,12 @@ impl MemoryRegion {
 
     /// Get the number of 4KB pages in this region
     pub fn page_count(&self) -> u64 {
-        (self.size + 0xFFF) / 0x1000
+        self.size.div_ceil(0x1000)
     }
 }
 
 /// Find usable RAM regions from a memory map
-pub fn find_usable_ram<'a>(regions: &'a [MemoryRegion]) -> impl Iterator<Item = &'a MemoryRegion> {
+pub fn find_usable_ram(regions: &[MemoryRegion]) -> impl Iterator<Item = &MemoryRegion> {
     regions.iter().filter(|r| r.region_type.is_usable())
 }
 

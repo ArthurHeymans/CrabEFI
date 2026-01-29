@@ -171,36 +171,19 @@ pub struct InputControlContext {
 
 /// Device Context (consists of Slot + 31 Endpoint Contexts)
 #[repr(C, align(64))]
+#[derive(Default)]
 pub struct DeviceContext {
     pub slot: SlotContext,
     pub endpoints: [EndpointContext; 31],
 }
 
-impl Default for DeviceContext {
-    fn default() -> Self {
-        Self {
-            slot: SlotContext::default(),
-            endpoints: [EndpointContext::default(); 31],
-        }
-    }
-}
-
 /// Input Context (Input Control + Device Context)
 #[repr(C, align(64))]
+#[derive(Default)]
 pub struct InputContext {
     pub control: InputControlContext,
     pub slot: SlotContext,
     pub endpoints: [EndpointContext; 31],
-}
-
-impl Default for InputContext {
-    fn default() -> Self {
-        Self {
-            control: InputControlContext::default(),
-            slot: SlotContext::default(),
-            endpoints: [EndpointContext::default(); 31],
-        }
-    }
 }
 
 /// Ring buffer for TRBs
@@ -464,7 +447,7 @@ impl XhciController {
                     // Clear SMI enable bits but preserve status bits
                     // Bits 0-4: SMI enables, Bits 16-20: SMI status (write-1-to-clear)
                     // Clear enables (set to 0), clear any pending status (write 1s)
-                    let new_ctlsts = (ctlsts & 0xFFFF0000) | 0x00000000;
+                    let new_ctlsts = ctlsts & 0xFFFF0000;
                     unsafe {
                         ptr::write_volatile(ctlsts_addr as *mut u32, new_ctlsts);
                     }
@@ -651,7 +634,7 @@ impl XhciController {
         self.write_op_reg(OP_CONFIG, self.max_slots as u32);
 
         // Allocate and set up DCBAA (Device Context Base Address Array)
-        let dcbaa_pages = (((self.max_slots as u64 + 1) * 8) + 4095) / 4096;
+        let dcbaa_pages = ((self.max_slots as u64 + 1) * 8).div_ceil(4096);
         self.dcbaa = efi::allocate_pages(dcbaa_pages).ok_or(XhciError::AllocationFailed)?;
         unsafe { ptr::write_bytes(self.dcbaa as *mut u8, 0, (dcbaa_pages * 4096) as usize) };
         self.write_op_reg64(OP_DCBAAP, self.dcbaa);
@@ -1071,17 +1054,17 @@ impl XhciController {
                             }
 
                             // Try to configure as mass storage (class 0x08)
-                            if class == 0x08 || (class == 0x00 && num_configs > 0) {
-                                if let Err(e) = self.configure_mass_storage(slot_id) {
-                                    log::debug!("Not a mass storage device: {:?}", e);
-                                }
+                            if (class == 0x08 || (class == 0x00 && num_configs > 0))
+                                && let Err(e) = self.configure_mass_storage(slot_id)
+                            {
+                                log::debug!("Not a mass storage device: {:?}", e);
                             }
 
                             // Try to configure as HID keyboard (class 0x03 or class 0x00)
-                            if class == 0x03 || (class == 0x00 && num_configs > 0) {
-                                if let Err(e) = self.configure_hid_keyboard(slot_id) {
-                                    log::debug!("Not a HID keyboard: {:?}", e);
-                                }
+                            if (class == 0x03 || (class == 0x00 && num_configs > 0))
+                                && let Err(e) = self.configure_hid_keyboard(slot_id)
+                            {
+                                log::debug!("Not a HID keyboard: {:?}", e);
                             }
                         }
                         Err(e) => {

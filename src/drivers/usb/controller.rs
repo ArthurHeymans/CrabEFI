@@ -822,7 +822,7 @@ impl InterruptQueue {
         num_buffers: usize,
     ) -> Option<Self> {
         let buffer_size = max_packet as usize * num_buffers;
-        let pages = (buffer_size + 4095) / 4096;
+        let pages = buffer_size.div_ceil(4096);
         let buffer = efi::allocate_pages(pages as u64)? as *mut u8;
 
         unsafe {
@@ -931,11 +931,11 @@ pub fn parse_configuration(config_data: &[u8]) -> ConfigurationInfo {
         match desc_type {
             desc_type::INTERFACE => {
                 // Save previous interface if any
-                if let Some(iface) = current_interface.take() {
-                    if info.num_interfaces < 8 {
-                        info.interfaces[info.num_interfaces] = iface;
-                        info.num_interfaces += 1;
-                    }
+                if let Some(iface) = current_interface.take()
+                    && info.num_interfaces < 8
+                {
+                    info.interfaces[info.num_interfaces] = iface;
+                    info.num_interfaces += 1;
                 }
 
                 if desc_data.len() >= 9 {
@@ -954,14 +954,15 @@ pub fn parse_configuration(config_data: &[u8]) -> ConfigurationInfo {
                 }
             }
             desc_type::ENDPOINT => {
-                if let Some(ref mut iface) = current_interface {
-                    if desc_data.len() >= 7 && iface.num_endpoints < 4 {
-                        let ep = unsafe {
-                            ptr::read_unaligned(desc_data.as_ptr() as *const EndpointDescriptor)
-                        };
-                        iface.endpoints[iface.num_endpoints] = EndpointInfo::from_descriptor(&ep);
-                        iface.num_endpoints += 1;
-                    }
+                if let Some(ref mut iface) = current_interface
+                    && desc_data.len() >= 7
+                    && iface.num_endpoints < 4
+                {
+                    let ep = unsafe {
+                        ptr::read_unaligned(desc_data.as_ptr() as *const EndpointDescriptor)
+                    };
+                    iface.endpoints[iface.num_endpoints] = EndpointInfo::from_descriptor(&ep);
+                    iface.num_endpoints += 1;
                 }
             }
             _ => {}
@@ -969,32 +970,22 @@ pub fn parse_configuration(config_data: &[u8]) -> ConfigurationInfo {
     }
 
     // Save last interface
-    if let Some(iface) = current_interface {
-        if info.num_interfaces < 8 {
-            info.interfaces[info.num_interfaces] = iface;
-            info.num_interfaces += 1;
-        }
+    if let Some(iface) = current_interface
+        && info.num_interfaces < 8
+    {
+        info.interfaces[info.num_interfaces] = iface;
+        info.num_interfaces += 1;
     }
 
     info
 }
 
 /// Parsed configuration information
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub struct ConfigurationInfo {
     pub configuration_value: u8,
     pub interfaces: [InterfaceInfo; 8],
     pub num_interfaces: usize,
-}
-
-impl Default for ConfigurationInfo {
-    fn default() -> Self {
-        Self {
-            configuration_value: 0,
-            interfaces: [InterfaceInfo::default(); 8],
-            num_interfaces: 0,
-        }
-    }
 }
 
 /// Parsed interface information

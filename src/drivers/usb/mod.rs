@@ -152,7 +152,7 @@ pub fn init() {
                 match XhciController::new(dev) {
                     Ok(controller) => {
                         let size = mem::size_of::<XhciController>();
-                        let pages = (size + 4095) / 4096;
+                        let pages = size.div_ceil(4096);
                         if let Some(p) = efi::allocate_pages(pages as u64) {
                             let controller_ptr = p as *mut XhciController;
                             unsafe { ptr::write(controller_ptr, controller) };
@@ -177,7 +177,7 @@ pub fn init() {
                 match ehci::EhciController::new(dev) {
                     Ok(controller) => {
                         let size = mem::size_of::<ehci::EhciController>();
-                        let pages = (size + 4095) / 4096;
+                        let pages = size.div_ceil(4096);
                         if let Some(p) = efi::allocate_pages(pages as u64) {
                             let controller_ptr = p as *mut ehci::EhciController;
                             unsafe { ptr::write(controller_ptr, controller) };
@@ -202,7 +202,7 @@ pub fn init() {
                 match ohci::OhciController::new(dev) {
                     Ok(controller) => {
                         let size = mem::size_of::<ohci::OhciController>();
-                        let pages = (size + 4095) / 4096;
+                        let pages = size.div_ceil(4096);
                         if let Some(p) = efi::allocate_pages(pages as u64) {
                             let controller_ptr = p as *mut ohci::OhciController;
                             unsafe { ptr::write(controller_ptr, controller) };
@@ -227,7 +227,7 @@ pub fn init() {
                 match uhci::UhciController::new(dev) {
                     Ok(controller) => {
                         let size = mem::size_of::<uhci::UhciController>();
-                        let pages = (size + 4095) / 4096;
+                        let pages = size.div_ceil(4096);
                         if let Some(p) = efi::allocate_pages(pages as u64) {
                             let controller_ptr = p as *mut uhci::UhciController;
                             unsafe { ptr::write(controller_ptr, controller) };

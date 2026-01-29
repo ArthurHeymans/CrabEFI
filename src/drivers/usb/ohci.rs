@@ -76,7 +76,7 @@ mod regs {
 #[allow(dead_code)]
 mod hccontrol {
     /// Control/Bulk Service Ratio
-    pub const CBSR_MASK: u32 = 3 << 0;
+    pub const CBSR_MASK: u32 = 3;
     /// Periodic List Enable
     pub const PLE: u32 = 1 << 2;
     /// Isochronous Enable
@@ -442,7 +442,7 @@ impl OhciController {
         unsafe { ptr::write_bytes(bulk_ed as *mut u8, 0, 4096) };
 
         // Allocate DMA buffer
-        let dma_pages = (Self::DMA_BUFFER_SIZE + 4095) / 4096;
+        let dma_pages = Self::DMA_BUFFER_SIZE.div_ceil(4096);
         let dma_buffer = efi::allocate_pages(dma_pages as u64).ok_or(UsbError::AllocationFailed)?;
 
         let mut controller = Self {
@@ -793,11 +793,11 @@ impl OhciController {
         let data_buffer = td_base + 128;
 
         // Copy data for OUT
-        if let Some(ref d) = data {
-            if !is_in {
-                unsafe {
-                    ptr::copy_nonoverlapping(d.as_ptr(), data_buffer as *mut u8, d.len());
-                }
+        if let Some(ref d) = data
+            && !is_in
+        {
+            unsafe {
+                ptr::copy_nonoverlapping(d.as_ptr(), data_buffer as *mut u8, d.len());
             }
         }
 
@@ -889,23 +889,23 @@ impl OhciController {
         }
 
         // Copy data for IN
-        if let Some(d) = data {
-            if is_in {
-                let data_td = unsafe { &*((td_base + 16) as *const TransferDescriptor) };
-                let transferred = if data_td.cbp == 0 {
-                    data_len
-                } else {
-                    (data_td.cbp - data_buffer as u32) as usize
-                };
-                unsafe {
-                    ptr::copy_nonoverlapping(
-                        data_buffer as *const u8,
-                        d.as_mut_ptr(),
-                        transferred.min(d.len()),
-                    );
-                }
-                return Ok(transferred);
+        if let Some(d) = data
+            && is_in
+        {
+            let data_td = unsafe { &*((td_base + 16) as *const TransferDescriptor) };
+            let transferred = if data_td.cbp == 0 {
+                data_len
+            } else {
+                (data_td.cbp - data_buffer as u32) as usize
+            };
+            unsafe {
+                ptr::copy_nonoverlapping(
+                    data_buffer as *const u8,
+                    d.as_mut_ptr(),
+                    transferred.min(d.len()),
+                );
             }
+            return Ok(transferred);
         }
 
         Ok(data_len)
@@ -1116,13 +1116,13 @@ impl UsbController for OhciController {
     fn get_bulk_endpoints(&self, device: u8) -> Option<(EndpointInfo, EndpointInfo)> {
         self.get_device(device)
             .and_then(|d| match (&d.bulk_in, &d.bulk_out) {
-                (Some(in_ep), Some(out_ep)) => Some((in_ep.clone(), out_ep.clone())),
+                (Some(in_ep), Some(out_ep)) => Some((*in_ep, *out_ep)),
                 _ => None,
             })
     }
 
     fn get_interrupt_endpoint(&self, device: u8) -> Option<EndpointInfo> {
-        self.get_device(device).and_then(|d| d.interrupt_in.clone())
+        self.get_device(device).and_then(|d| d.interrupt_in)
     }
 }
 

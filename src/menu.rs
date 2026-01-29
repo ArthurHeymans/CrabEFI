@@ -130,6 +130,12 @@ pub struct BootMenu {
     timeout_seconds: u32,
 }
 
+impl Default for BootMenu {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl BootMenu {
     /// Create a new boot menu
     pub fn new() -> Self {
@@ -213,51 +219,51 @@ pub fn discover_boot_entries() -> BootMenu {
 fn discover_nvme_entries(menu: &mut BootMenu) {
     use crate::drivers::nvme;
 
-    if let Some(controller) = nvme::get_controller(0) {
-        if let Some(ns) = controller.default_namespace() {
-            let nsid = ns.nsid;
-            let pci_addr = controller.pci_address();
+    if let Some(controller) = nvme::get_controller(0)
+        && let Some(ns) = controller.default_namespace()
+    {
+        let nsid = ns.nsid;
+        let pci_addr = controller.pci_address();
 
-            // Store device globally for reading
-            if !nvme::store_global_device(0, nsid) {
-                return;
-            }
+        // Store device globally for reading
+        if !nvme::store_global_device(0, nsid) {
+            return;
+        }
 
-            // Create disk for GPT reading
-            let mut disk = NvmeDisk::new(controller, nsid);
+        // Create disk for GPT reading
+        let mut disk = NvmeDisk::new(controller, nsid);
 
-            // Read GPT and find partitions
-            if let Ok(header) = gpt::read_gpt_header(&mut disk) {
-                if let Ok(partitions) = gpt::read_partitions(&mut disk, &header) {
-                    for (i, partition) in partitions.iter().enumerate() {
-                        let partition_num = (i + 1) as u32;
+        // Read GPT and find partitions
+        if let Ok(header) = gpt::read_gpt_header(&mut disk)
+            && let Ok(partitions) = gpt::read_partitions(&mut disk, &header)
+        {
+            for (i, partition) in partitions.iter().enumerate() {
+                let partition_num = (i + 1) as u32;
 
-                        // Check if this is an ESP or potential boot partition
-                        if partition.is_esp || is_potential_esp(partition) {
-                            // Try to find bootloader on this partition
-                            if let Some(controller) = nvme::get_controller(0) {
-                                let mut disk = NvmeDisk::new(controller, nsid);
-                                if check_bootloader_exists(&mut disk, partition.first_lba) {
-                                    let mut name: String<64> = String::new();
-                                    let _ = write!(name, "Boot Entry (NVMe ns{})", nsid);
+                // Check if this is an ESP or potential boot partition
+                if partition.is_esp || is_potential_esp(partition) {
+                    // Try to find bootloader on this partition
+                    if let Some(controller) = nvme::get_controller(0) {
+                        let mut disk = NvmeDisk::new(controller, nsid);
+                        if check_bootloader_exists(&mut disk, partition.first_lba) {
+                            let mut name: String<64> = String::new();
+                            let _ = write!(name, "Boot Entry (NVMe ns{})", nsid);
 
-                                    let entry = BootEntry::new(
-                                        &name,
-                                        "EFI\\BOOT\\BOOTX64.EFI",
-                                        DeviceType::Nvme {
-                                            controller_id: 0,
-                                            nsid,
-                                        },
-                                        partition_num,
-                                        partition.clone(),
-                                        pci_addr.device,
-                                        pci_addr.function,
-                                    );
+                            let entry = BootEntry::new(
+                                &name,
+                                "EFI\\BOOT\\BOOTX64.EFI",
+                                DeviceType::Nvme {
+                                    controller_id: 0,
+                                    nsid,
+                                },
+                                partition_num,
+                                partition.clone(),
+                                pci_addr.device,
+                                pci_addr.function,
+                            );
 
-                                    if !menu.add_entry(entry) {
-                                        return; // Menu full
-                                    }
-                                }
+                            if !menu.add_entry(entry) {
+                                return; // Menu full
                             }
                         }
                     }
@@ -285,37 +291,36 @@ fn discover_ahci_entries(menu: &mut BootMenu) {
                 let mut disk = AhciDisk::new(controller, port_index);
 
                 // Read GPT and find partitions
-                if let Ok(header) = gpt::read_gpt_header(&mut disk) {
-                    if let Ok(partitions) = gpt::read_partitions(&mut disk, &header) {
-                        for (i, partition) in partitions.iter().enumerate() {
-                            let partition_num = (i + 1) as u32;
+                if let Ok(header) = gpt::read_gpt_header(&mut disk)
+                    && let Ok(partitions) = gpt::read_partitions(&mut disk, &header)
+                {
+                    for (i, partition) in partitions.iter().enumerate() {
+                        let partition_num = (i + 1) as u32;
 
-                            // Check if this is an ESP or potential boot partition
-                            if partition.is_esp || is_potential_esp(partition) {
-                                // Try to find bootloader on this partition
-                                if let Some(controller) = ahci::get_controller(0) {
-                                    let mut disk = AhciDisk::new(controller, port_index);
-                                    if check_bootloader_exists(&mut disk, partition.first_lba) {
-                                        let mut name: String<64> = String::new();
-                                        let _ =
-                                            write!(name, "Boot Entry (SATA port {})", port_index);
+                        // Check if this is an ESP or potential boot partition
+                        if partition.is_esp || is_potential_esp(partition) {
+                            // Try to find bootloader on this partition
+                            if let Some(controller) = ahci::get_controller(0) {
+                                let mut disk = AhciDisk::new(controller, port_index);
+                                if check_bootloader_exists(&mut disk, partition.first_lba) {
+                                    let mut name: String<64> = String::new();
+                                    let _ = write!(name, "Boot Entry (SATA port {})", port_index);
 
-                                        let entry = BootEntry::new(
-                                            &name,
-                                            "EFI\\BOOT\\BOOTX64.EFI",
-                                            DeviceType::Ahci {
-                                                controller_id: 0,
-                                                port: port_index,
-                                            },
-                                            partition_num,
-                                            partition.clone(),
-                                            pci_addr.device,
-                                            pci_addr.function,
-                                        );
+                                    let entry = BootEntry::new(
+                                        &name,
+                                        "EFI\\BOOT\\BOOTX64.EFI",
+                                        DeviceType::Ahci {
+                                            controller_id: 0,
+                                            port: port_index,
+                                        },
+                                        partition_num,
+                                        partition.clone(),
+                                        pci_addr.device,
+                                        pci_addr.function,
+                                    );
 
-                                        if !menu.add_entry(entry) {
-                                            return; // Menu full
-                                        }
+                                    if !menu.add_entry(entry) {
+                                        return; // Menu full
                                     }
                                 }
                             }
@@ -354,10 +359,13 @@ fn discover_usb_entries(menu: &mut BootMenu) {
                 Ok(usb_device) => {
                     // Store device globally WITH controller pointer so global_read_sector can use it directly
                     // This avoids lock contention since we store the pointer, not just the ID
-                    mass_storage::store_global_device_with_controller_ptr(
-                        usb_device,
-                        controller_ptr,
-                    )
+                    // SAFETY: controller_ptr is obtained from get_controller_ptr and is valid
+                    unsafe {
+                        mass_storage::store_global_device_with_controller_ptr(
+                            usb_device,
+                            controller_ptr,
+                        )
+                    }
                 }
                 Err(e) => {
                     log::debug!("Failed to create USB mass storage: {:?}", e);
@@ -376,40 +384,39 @@ fn discover_usb_entries(menu: &mut BootMenu) {
                 let mut disk = UsbDisk::new(usb_device, controller);
 
                 // Read GPT and find partitions
-                if let Ok(header) = gpt::read_gpt_header(&mut disk) {
-                    if let Ok(partitions) = gpt::read_partitions(&mut disk, &header) {
-                        for (i, partition) in partitions.iter().enumerate() {
-                            let partition_num = (i + 1) as u32;
+                if let Ok(header) = gpt::read_gpt_header(&mut disk)
+                    && let Ok(partitions) = gpt::read_partitions(&mut disk, &header)
+                {
+                    for (i, partition) in partitions.iter().enumerate() {
+                        let partition_num = (i + 1) as u32;
 
-                            // Check if this is an ESP or potential boot partition
-                            if partition.is_esp || is_potential_esp(partition) {
-                                // We need to create a new disk reference for checking bootloader
-                                // This is a bit awkward due to borrowing rules
-                                if let Some(usb_device2) = mass_storage::get_global_device() {
-                                    let mut disk2 = UsbDisk::new(usb_device2, controller);
-                                    if check_bootloader_exists(&mut disk2, partition.first_lba) {
-                                        let mut name: String<64> = String::new();
-                                        let controller_type = controller.controller_type();
-                                        let _ =
-                                            write!(name, "Boot Entry ({} USB)", controller_type);
+                        // Check if this is an ESP or potential boot partition
+                        if partition.is_esp || is_potential_esp(partition) {
+                            // We need to create a new disk reference for checking bootloader
+                            // This is a bit awkward due to borrowing rules
+                            if let Some(usb_device2) = mass_storage::get_global_device() {
+                                let mut disk2 = UsbDisk::new(usb_device2, controller);
+                                if check_bootloader_exists(&mut disk2, partition.first_lba) {
+                                    let mut name: String<64> = String::new();
+                                    let controller_type = controller.controller_type();
+                                    let _ = write!(name, "Boot Entry ({} USB)", controller_type);
 
-                                        // Get PCI address - we need to handle this differently
-                                        // For now use placeholder values
-                                        let entry = BootEntry::new(
-                                            &name,
-                                            "EFI\\BOOT\\BOOTX64.EFI",
-                                            DeviceType::Usb {
-                                                controller_id,
-                                                device_addr,
-                                            },
-                                            partition_num,
-                                            partition.clone(),
-                                            0, // PCI device - TODO: get from controller
-                                            0, // PCI function - TODO: get from controller
-                                        );
+                                    // Get PCI address - we need to handle this differently
+                                    // For now use placeholder values
+                                    let entry = BootEntry::new(
+                                        &name,
+                                        "EFI\\BOOT\\BOOTX64.EFI",
+                                        DeviceType::Usb {
+                                            controller_id,
+                                            device_addr,
+                                        },
+                                        partition_num,
+                                        partition.clone(),
+                                        0, // PCI device - TODO: get from controller
+                                        0, // PCI function - TODO: get from controller
+                                    );
 
-                                        menu.add_entry(entry);
-                                    }
+                                    menu.add_entry(entry);
                                 }
                             }
                         }
@@ -442,33 +449,33 @@ fn discover_sdhci_entries(menu: &mut BootMenu) {
                 let mut disk = SdhciDisk::new(controller);
 
                 // Read GPT and find partitions
-                if let Ok(header) = gpt::read_gpt_header(&mut disk) {
-                    if let Ok(partitions) = gpt::read_partitions(&mut disk, &header) {
-                        for (i, partition) in partitions.iter().enumerate() {
-                            let partition_num = (i + 1) as u32;
+                if let Ok(header) = gpt::read_gpt_header(&mut disk)
+                    && let Ok(partitions) = gpt::read_partitions(&mut disk, &header)
+                {
+                    for (i, partition) in partitions.iter().enumerate() {
+                        let partition_num = (i + 1) as u32;
 
-                            // Check if this is an ESP or potential boot partition
-                            if partition.is_esp || is_potential_esp(partition) {
-                                // Try to find bootloader on this partition
-                                if let Some(controller) = sdhci::get_controller(controller_id) {
-                                    let mut disk = SdhciDisk::new(controller);
-                                    if check_bootloader_exists(&mut disk, partition.first_lba) {
-                                        let mut name: String<64> = String::new();
-                                        let _ = write!(name, "Boot Entry (SD card)");
+                        // Check if this is an ESP or potential boot partition
+                        if partition.is_esp || is_potential_esp(partition) {
+                            // Try to find bootloader on this partition
+                            if let Some(controller) = sdhci::get_controller(controller_id) {
+                                let mut disk = SdhciDisk::new(controller);
+                                if check_bootloader_exists(&mut disk, partition.first_lba) {
+                                    let mut name: String<64> = String::new();
+                                    let _ = write!(name, "Boot Entry (SD card)");
 
-                                        let entry = BootEntry::new(
-                                            &name,
-                                            "EFI\\BOOT\\BOOTX64.EFI",
-                                            DeviceType::Sdhci { controller_id },
-                                            partition_num,
-                                            partition.clone(),
-                                            pci_addr.device,
-                                            pci_addr.function,
-                                        );
+                                    let entry = BootEntry::new(
+                                        &name,
+                                        "EFI\\BOOT\\BOOTX64.EFI",
+                                        DeviceType::Sdhci { controller_id },
+                                        partition_num,
+                                        partition.clone(),
+                                        pci_addr.device,
+                                        pci_addr.function,
+                                    );
 
-                                        if !menu.add_entry(entry) {
-                                            return; // Menu full
-                                        }
+                                    if !menu.add_entry(entry) {
+                                        return; // Menu full
                                     }
                                 }
                             }
@@ -517,7 +524,7 @@ pub fn show_menu(menu: &mut BootMenu) -> Option<usize> {
     let fb_info = coreboot::get_framebuffer();
 
     // Create framebuffer console if available
-    let mut fb_console = fb_info.as_ref().map(|fb| FramebufferConsole::new(fb));
+    let mut fb_console = fb_info.as_ref().map(FramebufferConsole::new);
 
     // Clear screen
     clear_screen(&mut fb_console);

@@ -172,7 +172,7 @@ impl DirectoryEntry {
         }
 
         for (a, b) in entry_name.bytes().zip(name.bytes()) {
-            if a.to_ascii_uppercase() != b.to_ascii_uppercase() {
+            if !a.eq_ignore_ascii_case(&b) {
                 return false;
             }
         }
@@ -313,8 +313,7 @@ impl<'a, D: BlockDevice> FatFilesystem<'a, D> {
         let root_entry_count = bpb.root_entry_count as u32;
 
         // Root directory sectors (FAT12/16)
-        let root_dir_sectors =
-            ((root_entry_count * 32) + (bytes_per_sector as u32 - 1)) / bytes_per_sector as u32;
+        let root_dir_sectors = (root_entry_count * 32).div_ceil(bytes_per_sector as u32);
 
         // Sectors per FAT
         let sectors_per_fat = if bpb.sectors_per_fat_16 != 0 {
@@ -399,7 +398,7 @@ impl<'a, D: BlockDevice> FatFilesystem<'a, D> {
         // Calculate sector with overflow check
         let cluster_offset = (cluster - 2).checked_mul(self.sectors_per_cluster as u32)?;
         let sector = self.data_start.checked_add(cluster_offset)?;
-        Some(self.partition_start.checked_add(sector as u64)?)
+        self.partition_start.checked_add(sector as u64)
     }
 
     /// Read the next cluster from the FAT
@@ -545,10 +544,8 @@ impl<'a, D: BlockDevice> FatFilesystem<'a, D> {
             0 // Special case for FAT12/16 root directory
         };
 
-        let parts: heapless::Vec<&str, 16> = path
-            .split(|c| c == '/' || c == '\\')
-            .filter(|s| !s.is_empty())
-            .collect();
+        let parts: heapless::Vec<&str, 16> =
+            path.split(['/', '\\']).filter(|s| !s.is_empty()).collect();
 
         for (i, part) in parts.iter().enumerate() {
             let is_last = i == parts.len() - 1;

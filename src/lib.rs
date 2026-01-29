@@ -6,6 +6,10 @@
 #![no_std]
 #![feature(abi_x86_interrupt)]
 #![allow(unsafe_op_in_unsafe_fn)]
+// Allow common firmware code patterns
+#![allow(clippy::result_unit_err)] // Result<(), ()> is common in embedded code
+#![allow(clippy::too_many_arguments)] // USB/hardware APIs often require many parameters
+#![allow(clippy::field_reassign_with_default)] // Clearer than complex struct initializers
 
 // Note: We don't use alloc for now as we don't have a heap allocator yet
 // extern crate alloc;
@@ -85,7 +89,8 @@ pub fn init(coreboot_table_ptr: u64) {
     }
 
     // Parse coreboot tables first (before any I/O) to get hardware info
-    let cb_info = coreboot::tables::parse(coreboot_table_ptr as *const u8);
+    // SAFETY: coreboot_table_ptr is passed from coreboot and points to valid tables
+    let cb_info = unsafe { coreboot::tables::parse(coreboot_table_ptr as *const u8) };
 
     // Initialize CBMEM console early (before logging) so all output goes there
     if let Some(cbmem_addr) = cb_info.cbmem_console {
@@ -211,11 +216,11 @@ fn init_storage() {
 
     // If only one entry and no interactive mode requested, boot directly
     // For now, always show the menu for testing
-    if let Some(selected_index) = menu::show_menu(&mut boot_menu) {
-        if let Some(entry) = boot_menu.get_entry(selected_index) {
-            log::info!("Booting: {} from {}", entry.name, entry.path);
-            boot_selected_entry(entry);
-        }
+    if let Some(selected_index) = menu::show_menu(&mut boot_menu)
+        && let Some(entry) = boot_menu.get_entry(selected_index)
+    {
+        log::info!("Booting: {} from {}", entry.name, entry.path);
+        boot_selected_entry(entry);
     }
 
     log::info!("Boot menu returned, storage initialization complete");
@@ -532,36 +537,36 @@ fn install_block_io_for_disk<R: BlockDevice>(
     // First, create BlockIO for the raw disk (whole device)
     let disk_block_io = block_io::create_disk_block_io(storage_id, num_blocks, block_size);
 
-    if !disk_block_io.is_null() {
-        if let Some(disk_handle) = boot_services::create_handle() {
-            // Install BlockIO protocol
+    if !disk_block_io.is_null()
+        && let Some(disk_handle) = boot_services::create_handle()
+    {
+        // Install BlockIO protocol
+        let status = boot_services::install_protocol(
+            disk_handle,
+            &BLOCK_IO_PROTOCOL_GUID,
+            disk_block_io as *mut core::ffi::c_void,
+        );
+        if status == Status::SUCCESS {
+            log::info!(
+                "BlockIO protocol installed for raw disk on handle {:?}",
+                disk_handle
+            );
+        }
+
+        // Install DevicePath protocol for the raw disk (USB device path)
+        let disk_device_path =
+            device_path::create_usb_device_path(pci_device, pci_function, usb_port);
+        if !disk_device_path.is_null() {
             let status = boot_services::install_protocol(
                 disk_handle,
-                &BLOCK_IO_PROTOCOL_GUID,
-                disk_block_io as *mut core::ffi::c_void,
+                &DEVICE_PATH_PROTOCOL_GUID,
+                disk_device_path as *mut core::ffi::c_void,
             );
             if status == Status::SUCCESS {
                 log::info!(
-                    "BlockIO protocol installed for raw disk on handle {:?}",
+                    "DevicePath protocol installed for raw disk on handle {:?}",
                     disk_handle
                 );
-            }
-
-            // Install DevicePath protocol for the raw disk (USB device path)
-            let disk_device_path =
-                device_path::create_usb_device_path(pci_device, pci_function, usb_port);
-            if !disk_device_path.is_null() {
-                let status = boot_services::install_protocol(
-                    disk_handle,
-                    &DEVICE_PATH_PROTOCOL_GUID,
-                    disk_device_path as *mut core::ffi::c_void,
-                );
-                if status == Status::SUCCESS {
-                    log::info!(
-                        "DevicePath protocol installed for raw disk on handle {:?}",
-                        disk_handle
-                    );
-                }
             }
         }
     }
@@ -600,46 +605,46 @@ fn install_block_io_for_disk<R: BlockDevice>(
             block_size,
         );
 
-        if !partition_block_io.is_null() {
-            if let Some(part_handle) = boot_services::create_handle() {
-                // Install BlockIO
+        if !partition_block_io.is_null()
+            && let Some(part_handle) = boot_services::create_handle()
+        {
+            // Install BlockIO
+            let status = boot_services::install_protocol(
+                part_handle,
+                &BLOCK_IO_PROTOCOL_GUID,
+                partition_block_io as *mut core::ffi::c_void,
+            );
+            if status == Status::SUCCESS {
+                log::info!(
+                    "BlockIO protocol installed for partition {} on handle {:?}",
+                    partition_num,
+                    part_handle
+                );
+            }
+
+            // Install DevicePath for partition (with full USB prefix for proper hierarchy)
+            let device_path = device_path::create_usb_partition_device_path(
+                pci_device,
+                pci_function,
+                usb_port,
+                partition_num,
+                partition.first_lba,
+                partition_blocks,
+                &partition.partition_guid,
+            );
+
+            if !device_path.is_null() {
                 let status = boot_services::install_protocol(
                     part_handle,
-                    &BLOCK_IO_PROTOCOL_GUID,
-                    partition_block_io as *mut core::ffi::c_void,
+                    &DEVICE_PATH_PROTOCOL_GUID,
+                    device_path as *mut core::ffi::c_void,
                 );
                 if status == Status::SUCCESS {
                     log::info!(
-                        "BlockIO protocol installed for partition {} on handle {:?}",
+                        "DevicePath protocol installed for partition {} on handle {:?}",
                         partition_num,
                         part_handle
                     );
-                }
-
-                // Install DevicePath for partition (with full USB prefix for proper hierarchy)
-                let device_path = device_path::create_usb_partition_device_path(
-                    pci_device,
-                    pci_function,
-                    usb_port,
-                    partition_num,
-                    partition.first_lba,
-                    partition_blocks,
-                    &partition.partition_guid,
-                );
-
-                if !device_path.is_null() {
-                    let status = boot_services::install_protocol(
-                        part_handle,
-                        &DEVICE_PATH_PROTOCOL_GUID,
-                        device_path as *mut core::ffi::c_void,
-                    );
-                    if status == Status::SUCCESS {
-                        log::info!(
-                            "DevicePath protocol installed for partition {} on handle {:?}",
-                            partition_num,
-                            part_handle
-                        );
-                    }
                 }
             }
         }
@@ -712,36 +717,36 @@ fn install_block_io_for_nvme_disk<R: BlockDevice>(
     // First, create BlockIO for the raw disk (whole device)
     let disk_block_io = block_io::create_disk_block_io(storage_id, num_blocks, block_size);
 
-    if !disk_block_io.is_null() {
-        if let Some(disk_handle) = boot_services::create_handle() {
-            // Install BlockIO protocol
+    if !disk_block_io.is_null()
+        && let Some(disk_handle) = boot_services::create_handle()
+    {
+        // Install BlockIO protocol
+        let status = boot_services::install_protocol(
+            disk_handle,
+            &BLOCK_IO_PROTOCOL_GUID,
+            disk_block_io as *mut core::ffi::c_void,
+        );
+        if status == Status::SUCCESS {
+            log::info!(
+                "BlockIO protocol installed for raw NVMe disk on handle {:?}",
+                disk_handle
+            );
+        }
+
+        // Install DevicePath protocol for the raw disk (NVMe device path)
+        let disk_device_path =
+            device_path::create_nvme_device_path(pci_device, pci_function, namespace_id);
+        if !disk_device_path.is_null() {
             let status = boot_services::install_protocol(
                 disk_handle,
-                &BLOCK_IO_PROTOCOL_GUID,
-                disk_block_io as *mut core::ffi::c_void,
+                &DEVICE_PATH_PROTOCOL_GUID,
+                disk_device_path as *mut core::ffi::c_void,
             );
             if status == Status::SUCCESS {
                 log::info!(
-                    "BlockIO protocol installed for raw NVMe disk on handle {:?}",
+                    "DevicePath protocol installed for raw NVMe disk on handle {:?}",
                     disk_handle
                 );
-            }
-
-            // Install DevicePath protocol for the raw disk (NVMe device path)
-            let disk_device_path =
-                device_path::create_nvme_device_path(pci_device, pci_function, namespace_id);
-            if !disk_device_path.is_null() {
-                let status = boot_services::install_protocol(
-                    disk_handle,
-                    &DEVICE_PATH_PROTOCOL_GUID,
-                    disk_device_path as *mut core::ffi::c_void,
-                );
-                if status == Status::SUCCESS {
-                    log::info!(
-                        "DevicePath protocol installed for raw NVMe disk on handle {:?}",
-                        disk_handle
-                    );
-                }
             }
         }
     }
@@ -780,46 +785,46 @@ fn install_block_io_for_nvme_disk<R: BlockDevice>(
             block_size,
         );
 
-        if !partition_block_io.is_null() {
-            if let Some(part_handle) = boot_services::create_handle() {
-                // Install BlockIO
+        if !partition_block_io.is_null()
+            && let Some(part_handle) = boot_services::create_handle()
+        {
+            // Install BlockIO
+            let status = boot_services::install_protocol(
+                part_handle,
+                &BLOCK_IO_PROTOCOL_GUID,
+                partition_block_io as *mut core::ffi::c_void,
+            );
+            if status == Status::SUCCESS {
+                log::info!(
+                    "BlockIO protocol installed for NVMe partition {} on handle {:?}",
+                    partition_num,
+                    part_handle
+                );
+            }
+
+            // Install DevicePath for partition (with full NVMe prefix for proper hierarchy)
+            let device_path = device_path::create_nvme_partition_device_path(
+                pci_device,
+                pci_function,
+                namespace_id,
+                partition_num,
+                partition.first_lba,
+                partition_blocks,
+                &partition.partition_guid,
+            );
+
+            if !device_path.is_null() {
                 let status = boot_services::install_protocol(
                     part_handle,
-                    &BLOCK_IO_PROTOCOL_GUID,
-                    partition_block_io as *mut core::ffi::c_void,
+                    &DEVICE_PATH_PROTOCOL_GUID,
+                    device_path as *mut core::ffi::c_void,
                 );
                 if status == Status::SUCCESS {
                     log::info!(
-                        "BlockIO protocol installed for NVMe partition {} on handle {:?}",
+                        "DevicePath protocol installed for NVMe partition {} on handle {:?}",
                         partition_num,
                         part_handle
                     );
-                }
-
-                // Install DevicePath for partition (with full NVMe prefix for proper hierarchy)
-                let device_path = device_path::create_nvme_partition_device_path(
-                    pci_device,
-                    pci_function,
-                    namespace_id,
-                    partition_num,
-                    partition.first_lba,
-                    partition_blocks,
-                    &partition.partition_guid,
-                );
-
-                if !device_path.is_null() {
-                    let status = boot_services::install_protocol(
-                        part_handle,
-                        &DEVICE_PATH_PROTOCOL_GUID,
-                        device_path as *mut core::ffi::c_void,
-                    );
-                    if status == Status::SUCCESS {
-                        log::info!(
-                            "DevicePath protocol installed for NVMe partition {} on handle {:?}",
-                            partition_num,
-                            part_handle
-                        );
-                    }
                 }
             }
         }
@@ -891,36 +896,35 @@ fn install_block_io_for_ahci_disk<R: BlockDevice>(
     // First, create BlockIO for the raw disk (whole device)
     let disk_block_io = block_io::create_disk_block_io(storage_id, num_blocks, block_size);
 
-    if !disk_block_io.is_null() {
-        if let Some(disk_handle) = boot_services::create_handle() {
-            // Install BlockIO protocol
+    if !disk_block_io.is_null()
+        && let Some(disk_handle) = boot_services::create_handle()
+    {
+        // Install BlockIO protocol
+        let status = boot_services::install_protocol(
+            disk_handle,
+            &BLOCK_IO_PROTOCOL_GUID,
+            disk_block_io as *mut core::ffi::c_void,
+        );
+        if status == Status::SUCCESS {
+            log::info!(
+                "BlockIO protocol installed for raw AHCI disk on handle {:?}",
+                disk_handle
+            );
+        }
+
+        // Install DevicePath protocol for the raw disk (SATA device path)
+        let disk_device_path = device_path::create_sata_device_path(pci_device, pci_function, port);
+        if !disk_device_path.is_null() {
             let status = boot_services::install_protocol(
                 disk_handle,
-                &BLOCK_IO_PROTOCOL_GUID,
-                disk_block_io as *mut core::ffi::c_void,
+                &DEVICE_PATH_PROTOCOL_GUID,
+                disk_device_path as *mut core::ffi::c_void,
             );
             if status == Status::SUCCESS {
                 log::info!(
-                    "BlockIO protocol installed for raw AHCI disk on handle {:?}",
+                    "DevicePath protocol installed for raw AHCI disk on handle {:?}",
                     disk_handle
                 );
-            }
-
-            // Install DevicePath protocol for the raw disk (SATA device path)
-            let disk_device_path =
-                device_path::create_sata_device_path(pci_device, pci_function, port);
-            if !disk_device_path.is_null() {
-                let status = boot_services::install_protocol(
-                    disk_handle,
-                    &DEVICE_PATH_PROTOCOL_GUID,
-                    disk_device_path as *mut core::ffi::c_void,
-                );
-                if status == Status::SUCCESS {
-                    log::info!(
-                        "DevicePath protocol installed for raw AHCI disk on handle {:?}",
-                        disk_handle
-                    );
-                }
             }
         }
     }
@@ -959,46 +963,46 @@ fn install_block_io_for_ahci_disk<R: BlockDevice>(
             block_size,
         );
 
-        if !partition_block_io.is_null() {
-            if let Some(part_handle) = boot_services::create_handle() {
-                // Install BlockIO
+        if !partition_block_io.is_null()
+            && let Some(part_handle) = boot_services::create_handle()
+        {
+            // Install BlockIO
+            let status = boot_services::install_protocol(
+                part_handle,
+                &BLOCK_IO_PROTOCOL_GUID,
+                partition_block_io as *mut core::ffi::c_void,
+            );
+            if status == Status::SUCCESS {
+                log::info!(
+                    "BlockIO protocol installed for AHCI partition {} on handle {:?}",
+                    partition_num,
+                    part_handle
+                );
+            }
+
+            // Install DevicePath for partition (with full SATA prefix for proper hierarchy)
+            let device_path = device_path::create_sata_partition_device_path(
+                pci_device,
+                pci_function,
+                port,
+                partition_num,
+                partition.first_lba,
+                partition_blocks,
+                &partition.partition_guid,
+            );
+
+            if !device_path.is_null() {
                 let status = boot_services::install_protocol(
                     part_handle,
-                    &BLOCK_IO_PROTOCOL_GUID,
-                    partition_block_io as *mut core::ffi::c_void,
+                    &DEVICE_PATH_PROTOCOL_GUID,
+                    device_path as *mut core::ffi::c_void,
                 );
                 if status == Status::SUCCESS {
                     log::info!(
-                        "BlockIO protocol installed for AHCI partition {} on handle {:?}",
+                        "DevicePath protocol installed for AHCI partition {} on handle {:?}",
                         partition_num,
                         part_handle
                     );
-                }
-
-                // Install DevicePath for partition (with full SATA prefix for proper hierarchy)
-                let device_path = device_path::create_sata_partition_device_path(
-                    pci_device,
-                    pci_function,
-                    port,
-                    partition_num,
-                    partition.first_lba,
-                    partition_blocks,
-                    &partition.partition_guid,
-                );
-
-                if !device_path.is_null() {
-                    let status = boot_services::install_protocol(
-                        part_handle,
-                        &DEVICE_PATH_PROTOCOL_GUID,
-                        device_path as *mut core::ffi::c_void,
-                    );
-                    if status == Status::SUCCESS {
-                        log::info!(
-                            "DevicePath protocol installed for AHCI partition {} on handle {:?}",
-                            partition_num,
-                            part_handle
-                        );
-                    }
                 }
             }
         }
@@ -1299,41 +1303,41 @@ fn try_boot_from_esp_nvme(
 
             // Install BlockIO protocol on the device handle
             // The bootloader needs this to access the disk
-            if let Some(controller) = drivers::nvme::get_controller(0) {
-                if let Some(ns) = controller.default_namespace() {
-                    let block_size = ns.block_size;
-                    let storage_id = storage::register_device(
-                        StorageType::Nvme {
-                            controller_id: 0,
-                            nsid: namespace_id,
-                        },
-                        ns.num_blocks,
+            if let Some(controller) = drivers::nvme::get_controller(0)
+                && let Some(ns) = controller.default_namespace()
+            {
+                let block_size = ns.block_size;
+                let storage_id = storage::register_device(
+                    StorageType::Nvme {
+                        controller_id: 0,
+                        nsid: namespace_id,
+                    },
+                    ns.num_blocks,
+                    block_size,
+                );
+
+                if let Some(storage_id) = storage_id {
+                    let block_io = block_io::create_partition_block_io(
+                        storage_id,
+                        partition_num,
+                        esp.first_lba,
+                        partition_size,
                         block_size,
                     );
 
-                    if let Some(storage_id) = storage_id {
-                        let block_io = block_io::create_partition_block_io(
-                            storage_id,
-                            partition_num,
-                            esp.first_lba,
-                            partition_size,
-                            block_size,
+                    if !block_io.is_null() {
+                        let status = boot_services::install_protocol(
+                            device_handle,
+                            &BLOCK_IO_PROTOCOL_GUID,
+                            block_io as *mut core::ffi::c_void,
                         );
-
-                        if !block_io.is_null() {
-                            let status = boot_services::install_protocol(
-                                device_handle,
-                                &BLOCK_IO_PROTOCOL_GUID,
-                                block_io as *mut core::ffi::c_void,
+                        if status == Status::SUCCESS {
+                            log::info!(
+                                "BlockIO protocol installed on device handle {:?}",
+                                device_handle
                             );
-                            if status == Status::SUCCESS {
-                                log::info!(
-                                    "BlockIO protocol installed on device handle {:?}",
-                                    device_handle
-                                );
-                            } else {
-                                log::warn!("Failed to install BlockIO protocol: {:?}", status);
-                            }
+                        } else {
+                            log::warn!("Failed to install BlockIO protocol: {:?}", status);
                         }
                     }
                 }
@@ -1458,41 +1462,41 @@ fn try_boot_from_esp_ahci(
             // Install BlockIO protocol on the device handle
             // The bootloader needs this to access the disk
             // First register the storage device
-            if let Some(controller) = drivers::ahci::get_controller(0) {
-                if let Some(port_info) = controller.get_port(port as usize) {
-                    let block_size = port_info.sector_size;
-                    let storage_id = storage::register_device(
-                        StorageType::Ahci {
-                            controller_id: 0,
-                            port: port as usize,
-                        },
-                        port_info.sector_count,
+            if let Some(controller) = drivers::ahci::get_controller(0)
+                && let Some(port_info) = controller.get_port(port as usize)
+            {
+                let block_size = port_info.sector_size;
+                let storage_id = storage::register_device(
+                    StorageType::Ahci {
+                        controller_id: 0,
+                        port: port as usize,
+                    },
+                    port_info.sector_count,
+                    block_size,
+                );
+
+                if let Some(storage_id) = storage_id {
+                    let block_io = block_io::create_partition_block_io(
+                        storage_id,
+                        partition_num,
+                        esp.first_lba,
+                        partition_size,
                         block_size,
                     );
 
-                    if let Some(storage_id) = storage_id {
-                        let block_io = block_io::create_partition_block_io(
-                            storage_id,
-                            partition_num,
-                            esp.first_lba,
-                            partition_size,
-                            block_size,
+                    if !block_io.is_null() {
+                        let status = boot_services::install_protocol(
+                            device_handle,
+                            &BLOCK_IO_PROTOCOL_GUID,
+                            block_io as *mut core::ffi::c_void,
                         );
-
-                        if !block_io.is_null() {
-                            let status = boot_services::install_protocol(
-                                device_handle,
-                                &BLOCK_IO_PROTOCOL_GUID,
-                                block_io as *mut core::ffi::c_void,
+                        if status == Status::SUCCESS {
+                            log::info!(
+                                "BlockIO protocol installed on device handle {:?}",
+                                device_handle
                             );
-                            if status == Status::SUCCESS {
-                                log::info!(
-                                    "BlockIO protocol installed on device handle {:?}",
-                                    device_handle
-                                );
-                            } else {
-                                log::warn!("Failed to install BlockIO protocol: {:?}", status);
-                            }
+                        } else {
+                            log::warn!("Failed to install BlockIO protocol: {:?}", status);
                         }
                     }
                 }
@@ -1554,7 +1558,7 @@ fn extract_fat_state<R: BlockDevice>(
 
     // Read boot sector directly from the disk
     let mut buffer = [0u8; SECTOR_SIZE];
-    if let Err(_) = disk.read_block(partition_start, &mut buffer) {
+    if disk.read_block(partition_start, &mut buffer).is_err() {
         log::error!("Failed to read boot sector for filesystem state");
         return FilesystemState::empty();
     }
@@ -1571,7 +1575,7 @@ fn extract_fat_state_ahci(
 
     // Read boot sector directly using AHCI global read
     let mut buffer = [0u8; SECTOR_SIZE];
-    if let Err(_) = drivers::ahci::global_read_sector(partition_start, &mut buffer) {
+    if drivers::ahci::global_read_sector(partition_start, &mut buffer).is_err() {
         log::error!("Failed to read boot sector for AHCI filesystem state");
         return FilesystemState::empty();
     }
@@ -1588,7 +1592,7 @@ fn extract_fat_state_nvme(
 
     // Read boot sector directly using NVMe global read
     let mut buffer = [0u8; SECTOR_SIZE];
-    if let Err(_) = drivers::nvme::global_read_sector(partition_start, &mut buffer) {
+    if drivers::nvme::global_read_sector(partition_start, &mut buffer).is_err() {
         log::error!("Failed to read boot sector for NVMe filesystem state");
         return FilesystemState::empty();
     }
@@ -1629,8 +1633,7 @@ fn parse_fat_bpb(
         total_sectors_32
     };
 
-    let root_dir_sectors =
-        ((root_entry_count as u32 * 32) + (bytes_per_sector as u32 - 1)) / bytes_per_sector as u32;
+    let root_dir_sectors = (root_entry_count as u32 * 32).div_ceil(bytes_per_sector as u32);
     let fat_start = reserved_sectors as u32;
     let root_dir_start = fat_start + (num_fats as u32 * sectors_per_fat);
     let data_start = root_dir_start + root_dir_sectors;
@@ -1701,10 +1704,9 @@ fn load_and_execute_bootloader<R: BlockDevice>(
     log::info!("Read {} bytes from {}", bytes_read, path);
 
     // Load the PE image
-    let loaded_image = pe::load_image(&buffer[..bytes_read]).map_err(|status| {
+    let loaded_image = pe::load_image(&buffer[..bytes_read]).inspect_err(|&status| {
         log::error!("Failed to load PE image: {:?}", status);
         let _ = free_pool(buffer_ptr);
-        status
     })?;
 
     // Free the raw file buffer (we no longer need it - PE loader copied sections)
@@ -1745,10 +1747,7 @@ fn load_and_execute_bootloader<R: BlockDevice>(
     let file_path = efi::protocols::device_path::create_file_path_device_path(path);
     if !file_path.is_null() {
         unsafe {
-            efi::protocols::loaded_image::set_file_path(
-                loaded_image_protocol,
-                file_path as *mut r_efi::protocols::device_path::Protocol,
-            );
+            efi::protocols::loaded_image::set_file_path(loaded_image_protocol, file_path);
         }
         log::debug!("Set LoadedImage.FilePath to: {}", path);
     }
@@ -1837,36 +1836,36 @@ fn install_block_io_for_sdhci_disk<R: BlockDevice>(
     // First, create BlockIO for the raw disk (whole device)
     let disk_block_io = block_io::create_disk_block_io(storage_id, num_blocks, block_size);
 
-    if !disk_block_io.is_null() {
-        if let Some(disk_handle) = boot_services::create_handle() {
-            // Install BlockIO protocol
+    if !disk_block_io.is_null()
+        && let Some(disk_handle) = boot_services::create_handle()
+    {
+        // Install BlockIO protocol
+        let status = boot_services::install_protocol(
+            disk_handle,
+            &BLOCK_IO_PROTOCOL_GUID,
+            disk_block_io as *mut core::ffi::c_void,
+        );
+        if status == Status::SUCCESS {
+            log::info!(
+                "BlockIO protocol installed for raw SDHCI disk on handle {:?}",
+                disk_handle
+            );
+        }
+
+        // Install DevicePath protocol for the raw disk (SD device path)
+        // Use USB device path format for now (SD cards are often USB-connected logically)
+        let disk_device_path = device_path::create_usb_device_path(pci_device, pci_function, 0);
+        if !disk_device_path.is_null() {
             let status = boot_services::install_protocol(
                 disk_handle,
-                &BLOCK_IO_PROTOCOL_GUID,
-                disk_block_io as *mut core::ffi::c_void,
+                &DEVICE_PATH_PROTOCOL_GUID,
+                disk_device_path as *mut core::ffi::c_void,
             );
             if status == Status::SUCCESS {
                 log::info!(
-                    "BlockIO protocol installed for raw SDHCI disk on handle {:?}",
+                    "DevicePath protocol installed for raw SDHCI disk on handle {:?}",
                     disk_handle
                 );
-            }
-
-            // Install DevicePath protocol for the raw disk (SD device path)
-            // Use USB device path format for now (SD cards are often USB-connected logically)
-            let disk_device_path = device_path::create_usb_device_path(pci_device, pci_function, 0);
-            if !disk_device_path.is_null() {
-                let status = boot_services::install_protocol(
-                    disk_handle,
-                    &DEVICE_PATH_PROTOCOL_GUID,
-                    disk_device_path as *mut core::ffi::c_void,
-                );
-                if status == Status::SUCCESS {
-                    log::info!(
-                        "DevicePath protocol installed for raw SDHCI disk on handle {:?}",
-                        disk_handle
-                    );
-                }
             }
         }
     }
@@ -1905,46 +1904,46 @@ fn install_block_io_for_sdhci_disk<R: BlockDevice>(
             block_size,
         );
 
-        if !partition_block_io.is_null() {
-            if let Some(part_handle) = boot_services::create_handle() {
-                // Install BlockIO
+        if !partition_block_io.is_null()
+            && let Some(part_handle) = boot_services::create_handle()
+        {
+            // Install BlockIO
+            let status = boot_services::install_protocol(
+                part_handle,
+                &BLOCK_IO_PROTOCOL_GUID,
+                partition_block_io as *mut core::ffi::c_void,
+            );
+            if status == Status::SUCCESS {
+                log::info!(
+                    "BlockIO protocol installed for SDHCI partition {} on handle {:?}",
+                    partition_num,
+                    part_handle
+                );
+            }
+
+            // Install DevicePath for partition
+            let device_path = device_path::create_usb_partition_device_path(
+                pci_device,
+                pci_function,
+                0,
+                partition_num,
+                partition.first_lba,
+                partition_blocks,
+                &partition.partition_guid,
+            );
+
+            if !device_path.is_null() {
                 let status = boot_services::install_protocol(
                     part_handle,
-                    &BLOCK_IO_PROTOCOL_GUID,
-                    partition_block_io as *mut core::ffi::c_void,
+                    &DEVICE_PATH_PROTOCOL_GUID,
+                    device_path as *mut core::ffi::c_void,
                 );
                 if status == Status::SUCCESS {
                     log::info!(
-                        "BlockIO protocol installed for SDHCI partition {} on handle {:?}",
+                        "DevicePath protocol installed for SDHCI partition {} on handle {:?}",
                         partition_num,
                         part_handle
                     );
-                }
-
-                // Install DevicePath for partition
-                let device_path = device_path::create_usb_partition_device_path(
-                    pci_device,
-                    pci_function,
-                    0,
-                    partition_num,
-                    partition.first_lba,
-                    partition_blocks,
-                    &partition.partition_guid,
-                );
-
-                if !device_path.is_null() {
-                    let status = boot_services::install_protocol(
-                        part_handle,
-                        &DEVICE_PATH_PROTOCOL_GUID,
-                        device_path as *mut core::ffi::c_void,
-                    );
-                    if status == Status::SUCCESS {
-                        log::info!(
-                            "DevicePath protocol installed for SDHCI partition {} on handle {:?}",
-                            partition_num,
-                            part_handle
-                        );
-                    }
                 }
             }
         }
@@ -1984,7 +1983,7 @@ fn install_block_io_for_sdhci_disk<R: BlockDevice>(
         }
     }
 
-    for (partition_num, partition) in candidate_partitions.iter() {
+    if let Some((partition_num, partition)) = candidate_partitions.first() {
         log::debug!(
             "Trying SDHCI partition {} as potential ESP (no proper ESP found)",
             partition_num

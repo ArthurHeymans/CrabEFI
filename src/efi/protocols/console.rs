@@ -501,10 +501,7 @@ fn could_be_escape_sequence(buf: &[u8]) -> bool {
         return true;
     }
 
-    match buf[0] {
-        b'[' | b'O' => true,
-        _ => false,
-    }
+    matches!(buf[0], b'[' | b'O')
 }
 
 /// Finalize an incomplete escape sequence
@@ -716,8 +713,8 @@ extern "efiapi" fn text_output_set_attribute(
     // Send ANSI escape sequence
     let mut buf = [0u8; 16];
     let len = format_ansi_color(&mut buf, ansi_fg, ansi_bg);
-    for i in 0..len {
-        serial::write_byte(buf[i]);
+    for &byte in buf.iter().take(len) {
+        serial::write_byte(byte);
     }
 
     Status::SUCCESS
@@ -743,8 +740,8 @@ extern "efiapi" fn text_output_set_cursor_position(
     // ESC [ row ; column H
     let mut buf = [0u8; 16];
     let len = format_cursor_pos(&mut buf, row + 1, column + 1);
-    for i in 0..len {
-        serial::write_byte(buf[i]);
+    for &byte in buf.iter().take(len) {
+        serial::write_byte(byte);
     }
 
     unsafe {

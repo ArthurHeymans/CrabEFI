@@ -275,24 +275,24 @@ pub fn init(acpi_rsdp: Option<u64>) {
     log::debug!("Initializing timing subsystem...");
 
     // Try to find PM timer port from ACPI tables
-    if let Some(rsdp_addr) = acpi_rsdp {
-        if let Some((port, is_32bit)) = unsafe { find_pm_timer_port(rsdp_addr) } {
-            PM_TIMER_PORT.store(port as u64, Ordering::Relaxed);
-            PM_TIMER_32BIT.store(if is_32bit { 1 } else { 0 }, Ordering::Relaxed);
+    if let Some(rsdp_addr) = acpi_rsdp
+        && let Some((port, is_32bit)) = unsafe { find_pm_timer_port(rsdp_addr) }
+    {
+        PM_TIMER_PORT.store(port as u64, Ordering::Relaxed);
+        PM_TIMER_32BIT.store(if is_32bit { 1 } else { 0 }, Ordering::Relaxed);
 
-            // Calibrate TSC using PM timer
-            if let Some(freq) = calibrate_tsc_with_pm_timer() {
-                let cycles_per_us = freq / 1_000_000;
-                TSC_FREQ_HZ.store(freq, Ordering::Relaxed);
-                TSC_CYCLES_PER_US.store(cycles_per_us, Ordering::Relaxed);
+        // Calibrate TSC using PM timer
+        if let Some(freq) = calibrate_tsc_with_pm_timer() {
+            let cycles_per_us = freq / 1_000_000;
+            TSC_FREQ_HZ.store(freq, Ordering::Relaxed);
+            TSC_CYCLES_PER_US.store(cycles_per_us, Ordering::Relaxed);
 
-                log::info!(
-                    "TSC calibrated: {} MHz ({} cycles/us)",
-                    freq / 1_000_000,
-                    cycles_per_us
-                );
-                return;
-            }
+            log::info!(
+                "TSC calibrated: {} MHz ({} cycles/us)",
+                freq / 1_000_000,
+                cycles_per_us
+            );
+            return;
         }
     }
 

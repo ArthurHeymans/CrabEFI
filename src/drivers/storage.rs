@@ -83,10 +83,10 @@ pub fn register_device(device_type: StorageType, num_blocks: u64, block_size: u3
 pub fn get_device(device_id: u32) -> Option<StorageDevice> {
     let registry = STORAGE_REGISTRY.lock();
     for slot in registry.devices.iter() {
-        if let Some(dev) = slot {
-            if dev.device_id == device_id {
-                return Some(*dev);
-            }
+        if let Some(dev) = slot
+            && dev.device_id == device_id
+        {
+            return Some(*dev);
         }
     }
     None

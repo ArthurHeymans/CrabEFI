@@ -356,18 +356,16 @@ impl AhciController {
         );
 
         // Perform BIOS/OS handoff if needed
-        if hba.cap2.is_set(CAP2::BOH) {
-            if hba.bohc.is_set(BOHC::BOS) {
-                // BIOS owns the HBA
-                log::debug!("Performing BIOS/OS handoff...");
-                hba.bohc.modify(BOHC::OOS::SET);
-                let timeout = Timeout::from_ms(100);
-                while !timeout.is_expired() {
-                    if !hba.bohc.is_set(BOHC::BOS) {
-                        break;
-                    }
-                    crate::time::delay_us(100);
+        if hba.cap2.is_set(CAP2::BOH) && hba.bohc.is_set(BOHC::BOS) {
+            // BIOS owns the HBA
+            log::debug!("Performing BIOS/OS handoff...");
+            hba.bohc.modify(BOHC::OOS::SET);
+            let timeout = Timeout::from_ms(100);
+            while !timeout.is_expired() {
+                if !hba.bohc.is_set(BOHC::BOS) {
+                    break;
                 }
+                crate::time::delay_us(100);
             }
         }
 
@@ -492,9 +490,13 @@ impl AhciController {
         let cmd_tables_page = efi::allocate_pages(4).ok_or(AhciError::AllocationFailed)?;
         unsafe { ptr::write_bytes(cmd_tables_page as *mut u8, 0, 4096 * 4) };
 
-        for i in 0..self.num_cmd_slots as usize {
+        for (i, cmd_table) in cmd_tables
+            .iter_mut()
+            .enumerate()
+            .take(self.num_cmd_slots as usize)
+        {
             let table_addr = cmd_tables_page + (i * 256) as u64;
-            cmd_tables[i] = table_addr as *mut CommandTable;
+            *cmd_table = table_addr as *mut CommandTable;
 
             // Set command table address in command header
             let header = unsafe { &mut *(cmd_list_addr as *mut CommandHeader).add(i) };
@@ -572,10 +574,10 @@ impl AhciController {
             if let Err(e) = self.identify_device(&mut port) {
                 log::warn!("AHCI Port {}: IDENTIFY failed: {:?}", port_num, e);
             }
-        } else if device_type == DeviceType::Satapi {
-            if let Err(e) = self.identify_device_atapi(&mut port) {
-                log::warn!("AHCI Port {}: IDENTIFY PACKET failed: {:?}", port_num, e);
-            }
+        } else if device_type == DeviceType::Satapi
+            && let Err(e) = self.identify_device_atapi(&mut port)
+        {
+            log::warn!("AHCI Port {}: IDENTIFY PACKET failed: {:?}", port_num, e);
         }
 
         Ok(port)
@@ -642,12 +644,7 @@ impl AhciController {
         let ci = port_regs.ci.get();
         let slots = sact | ci;
 
-        for i in 0..self.num_cmd_slots {
-            if slots & (1 << i) == 0 {
-                return Some(i);
-            }
-        }
-        None
+        (0..self.num_cmd_slots).find(|&i| slots & (1 << i) == 0)
     }
 
     /// Issue a command and wait for completion
@@ -1121,7 +1118,7 @@ pub fn init() {
         match AhciController::new(dev) {
             Ok(controller) => {
                 let size = core::mem::size_of::<AhciController>();
-                let pages = (size + 4095) / 4096;
+                let pages = size.div_ceil(4096);
                 log::debug!(
                     "AHCI: Allocating {} pages ({} bytes) for AhciController",
                     pages,
@@ -1196,7 +1193,7 @@ static GLOBAL_AHCI_DEVICE: Mutex<Option<GlobalAhciDevicePtr>> = Mutex::new(None)
 /// Store AHCI device info globally for SimpleFileSystem protocol
 pub fn store_global_device(controller_index: usize, port_index: usize) -> bool {
     let size = core::mem::size_of::<GlobalAhciDevice>();
-    let pages = (size + 4095) / 4096;
+    let pages = size.div_ceil(4096);
 
     if let Some(ptr) = efi::allocate_pages(pages as u64) {
         let device_ptr = ptr as *mut GlobalAhciDevice;

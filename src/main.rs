@@ -5,8 +5,6 @@
 #![no_std]
 #![no_main]
 
-use crabefi;
-
 /// Rust entry point called from assembly after 64-bit mode transition
 ///
 /// # Arguments

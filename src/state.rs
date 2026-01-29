@@ -500,6 +500,12 @@ pub struct KeyboardState {
     pub write_pos: usize,
 }
 
+impl Default for KeyboardState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl KeyboardState {
     pub const fn new() -> Self {
         Self {
@@ -576,6 +582,12 @@ pub struct InputState {
     pub in_escape: bool,
     /// Queued key to return (scan_code, unicode_char)
     pub queued_key: Option<(u16, u16)>,
+}
+
+impl Default for InputState {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl InputState {

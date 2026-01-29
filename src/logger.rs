@@ -76,9 +76,9 @@ impl log::Log for CombinedLogger {
             // Output to CBMEM console (if available)
             if cbmem_console::is_available() {
                 let mut writer = cbmem_console::CbmemConsoleWriter;
-                let _ = write!(
+                let _ = writeln!(
                     writer,
-                    "[{:>10}] [{}] {}\n",
+                    "[{:>10}] [{}] {}",
                     ts,
                     level_str_plain,
                     record.args()

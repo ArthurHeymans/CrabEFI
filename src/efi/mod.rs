@@ -264,11 +264,7 @@ fn init_console_control() {
         return;
     }
 
-    let status = boot_services::install_protocol(
-        handle,
-        &CONSOLE_CONTROL_PROTOCOL_GUID,
-        protocol as *mut core::ffi::c_void,
-    );
+    let status = boot_services::install_protocol(handle, &CONSOLE_CONTROL_PROTOCOL_GUID, protocol);
     if status != Status::SUCCESS {
         log::error!("Failed to install Console Control protocol: {:?}", status);
         return;

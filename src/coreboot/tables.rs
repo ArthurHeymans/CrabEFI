@@ -163,7 +163,7 @@ impl CorebootInfo {
 /// # Safety
 ///
 /// The pointer must point to valid coreboot tables.
-pub fn parse(ptr: *const u8) -> CorebootInfo {
+pub unsafe fn parse(ptr: *const u8) -> CorebootInfo {
     let mut info = CorebootInfo::new();
 
     // If pointer is null or invalid, scan for the tables in memory
@@ -294,7 +294,7 @@ unsafe fn scan_for_header() -> Option<*const CbHeader> {
     // 4. In high memory (where coreboot typically puts them)
 
     // First, try low memory
-    if let Some(header) = scan_for_header_at(0x0 as *const u8, 0x1000) {
+    if let Some(header) = scan_for_header_at(core::ptr::null::<u8>(), 0x1000) {
         log::debug!("Found coreboot tables in low memory");
         return Some(header);
     }

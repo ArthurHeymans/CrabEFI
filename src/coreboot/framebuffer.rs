@@ -45,7 +45,7 @@ impl FramebufferInfo {
     /// # Safety
     ///
     /// The framebuffer must be identity-mapped and accessible.
-    pub unsafe fn as_slice_mut(&self) -> &mut [u8] {
+    pub unsafe fn as_slice_mut(&mut self) -> &mut [u8] {
         core::slice::from_raw_parts_mut(self.as_ptr(), self.size() as usize)
     }
 

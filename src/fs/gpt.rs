@@ -233,8 +233,7 @@ pub fn read_partitions<D: BlockDevice>(
     let mut buffer = [0u8; SECTOR_SIZE];
 
     let entries_per_sector = SECTOR_SIZE / header.partition_entry_size as usize;
-    let num_sectors =
-        (header.num_partition_entries as usize + entries_per_sector - 1) / entries_per_sector;
+    let num_sectors = (header.num_partition_entries as usize).div_ceil(entries_per_sector);
 
     let mut entry_index = 0u32;
     let mut consecutive_empty = 0u32;
@@ -323,14 +322,13 @@ pub fn find_esp<D: BlockDevice>(device: &mut D) -> Result<Partition, GptError> {
     partitions
         .into_iter()
         .find(|partition| partition.is_esp)
-        .map(|partition| {
+        .inspect(|partition| {
             log::info!(
                 "Found EFI System Partition: LBA {}-{} ({} MB)",
                 partition.first_lba,
                 partition.last_lba,
                 partition.size_bytes() / (1024 * 1024)
             );
-            partition
         })
         .ok_or(GptError::NoEsp)
 }

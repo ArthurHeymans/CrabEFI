@@ -523,20 +523,26 @@ pub fn store_global_device(device: UsbMassStorage, controller_index: usize) -> b
         }
     };
 
-    store_global_device_with_controller_ptr(device, controller_ptr)
+    // SAFETY: controller_ptr is obtained from get_controller_ptr which returns valid pointers
+    unsafe { store_global_device_with_controller_ptr(device, controller_ptr) }
 }
 
 /// Store a USB mass storage device globally with a specific controller pointer
 ///
 /// This version takes the controller pointer directly, avoiding the need to
 /// look up the controller later (which could cause lock contention).
-pub fn store_global_device_with_controller_ptr(
+///
+/// # Safety
+///
+/// The controller_ptr must point to a valid UsbController that remains valid
+/// for the lifetime of the firmware.
+pub unsafe fn store_global_device_with_controller_ptr(
     device: UsbMassStorage,
     controller_ptr: *mut dyn UsbController,
 ) -> bool {
     // Allocate memory for the device
     let size = core::mem::size_of::<UsbMassStorage>();
-    let pages = (size + 4095) / 4096;
+    let pages = size.div_ceil(4096);
 
     if let Some(ptr) = efi::allocate_pages(pages as u64) {
         let device_ptr = ptr as *mut UsbMassStorage;

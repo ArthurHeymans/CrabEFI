@@ -642,7 +642,7 @@ impl EhciController {
         let periodic_list = efi::allocate_pages_below_4g(1).ok_or(UsbError::AllocationFailed)?;
 
         // DMA buffer
-        let dma_pages = (Self::DMA_BUFFER_SIZE + 4095) / 4096;
+        let dma_pages = Self::DMA_BUFFER_SIZE.div_ceil(4096);
         let dma_buffer =
             efi::allocate_pages_below_4g(dma_pages as u64).ok_or(UsbError::AllocationFailed)?;
 
@@ -751,7 +751,7 @@ impl EhciController {
                     let cap = pci::read_config_u32(pci_addr, cap_offset);
                     if (cap & usblegsup::HC_BIOS_OWNED) != 0 {
                         log::warn!("EHCI: BIOS did not release ownership, forcing");
-                        pci::write_config_u32(pci_addr, cap_offset, usblegsup::HC_OS_OWNED as u32);
+                        pci::write_config_u32(pci_addr, cap_offset, usblegsup::HC_OS_OWNED);
                     }
                 }
 
@@ -1090,11 +1090,9 @@ impl EhciController {
         self.devices[slot] = Some(device);
 
         // If this is a hub, enumerate its downstream ports
-        if is_hub {
-            if let Err(e) = self.enumerate_hub(slot, hub_address) {
-                log::warn!("Failed to enumerate hub ports: {:?}", e);
-                // Don't fail the device attachment, hub is still usable
-            }
+        if is_hub && let Err(e) = self.enumerate_hub(slot, hub_address) {
+            log::warn!("Failed to enumerate hub ports: {:?}", e);
+            // Don't fail the device attachment, hub is still usable
         }
 
         Ok(())
@@ -1242,10 +1240,8 @@ impl EhciController {
         self.devices[slot] = Some(device);
 
         // If this is a hub, enumerate its downstream ports (recursive)
-        if is_hub {
-            if let Err(e) = self.enumerate_hub(slot, new_hub_address) {
-                log::warn!("Failed to enumerate nested hub ports: {:?}", e);
-            }
+        if is_hub && let Err(e) = self.enumerate_hub(slot, new_hub_address) {
+            log::warn!("Failed to enumerate nested hub ports: {:?}", e);
         }
 
         Ok(())
@@ -1503,11 +1499,11 @@ impl EhciController {
         }
 
         // Copy OUT data
-        if let Some(ref d) = data {
-            if !is_in {
-                unsafe {
-                    ptr::copy_nonoverlapping(d.as_ptr(), data_addr as *mut u8, d.len());
-                }
+        if let Some(ref d) = data
+            && !is_in
+        {
+            unsafe {
+                ptr::copy_nonoverlapping(d.as_ptr(), data_addr as *mut u8, d.len());
             }
         }
 
@@ -1769,7 +1765,7 @@ impl EhciController {
                         unsafe { ptr::read_volatile(&(*(qtd_data_addr as *const Qtd)).token) };
                     if (data_token & Qtd::TOKEN_STATUS_ACTIVE) != 0 {
                         poll_count += 1;
-                        if poll_count % 100000 == 0 {
+                        if poll_count.is_multiple_of(100000) {
                             log::trace!("EHCI: waiting for data qTD, token={:#x}", data_token);
                         }
                         crate::time::delay_us(1);
@@ -1782,7 +1778,7 @@ impl EhciController {
             }
 
             poll_count += 1;
-            if poll_count % 100000 == 0 {
+            if poll_count.is_multiple_of(100000) {
                 log::trace!(
                     "EHCI: waiting, setup_token={:#x} status_token={:#x} usbsts={:#x}",
                     setup_token,
@@ -1866,22 +1862,22 @@ impl EhciController {
             }
 
             // Copy IN data
-            if let Some(d) = data {
-                if is_in {
-                    // Calculate bytes transferred: original - remaining
-                    let remaining = ((final_data_token & Qtd::TOKEN_BYTES_MASK)
-                        >> Qtd::TOKEN_BYTES_SHIFT) as usize;
-                    let transferred = data_len.saturating_sub(remaining);
-                    unsafe {
-                        ptr::copy_nonoverlapping(
-                            data_addr as *const u8,
-                            d.as_mut_ptr(),
-                            transferred.min(d.len()),
-                        );
-                    }
-                    log::trace!("EHCI: control transfer complete, {} bytes", transferred);
-                    return Ok(transferred);
+            if let Some(d) = data
+                && is_in
+            {
+                // Calculate bytes transferred: original - remaining
+                let remaining =
+                    ((final_data_token & Qtd::TOKEN_BYTES_MASK) >> Qtd::TOKEN_BYTES_SHIFT) as usize;
+                let transferred = data_len.saturating_sub(remaining);
+                unsafe {
+                    ptr::copy_nonoverlapping(
+                        data_addr as *const u8,
+                        d.as_mut_ptr(),
+                        transferred.min(d.len()),
+                    );
                 }
+                log::trace!("EHCI: control transfer complete, {} bytes", transferred);
+                return Ok(transferred);
             }
         }
 
@@ -2030,7 +2026,7 @@ impl EhciController {
         let transferred = data.len().saturating_sub(remaining);
 
         // Toggle flips for each max-packet-sized transaction
-        let packets = (transferred + max_packet as usize - 1) / max_packet as usize;
+        let packets = transferred.div_ceil(max_packet as usize);
         let new_toggle = if packets % 2 == 1 { !toggle } else { toggle };
 
         // Copy IN data from DMA buffer
@@ -2205,12 +2201,12 @@ impl UsbController for EhciController {
     fn get_bulk_endpoints(&self, device: u8) -> Option<(EndpointInfo, EndpointInfo)> {
         self.get_device(device)
             .and_then(|d| match (&d.bulk_in, &d.bulk_out) {
-                (Some(in_ep), Some(out_ep)) => Some((in_ep.clone(), out_ep.clone())),
+                (Some(in_ep), Some(out_ep)) => Some((*in_ep, *out_ep)),
                 _ => None,
             })
     }
 
     fn get_interrupt_endpoint(&self, device: u8) -> Option<EndpointInfo> {
-        self.get_device(device).and_then(|d| d.interrupt_in.clone())
+        self.get_device(device).and_then(|d| d.interrupt_in)
     }
 }

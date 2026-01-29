@@ -46,44 +46,44 @@ static mut BOOT_SERVICES: efi::BootServices = efi::BootServices {
         crc32: 0,
         reserved: 0,
     },
-    raise_tpl: raise_tpl,
-    restore_tpl: restore_tpl,
-    allocate_pages: allocate_pages,
-    free_pages: free_pages,
-    get_memory_map: get_memory_map,
-    allocate_pool: allocate_pool,
-    free_pool: free_pool,
-    create_event: create_event,
-    set_timer: set_timer,
-    wait_for_event: wait_for_event,
-    signal_event: signal_event,
-    close_event: close_event,
-    check_event: check_event,
-    install_protocol_interface: install_protocol_interface,
-    reinstall_protocol_interface: reinstall_protocol_interface,
-    uninstall_protocol_interface: uninstall_protocol_interface,
-    handle_protocol: handle_protocol,
+    raise_tpl,
+    restore_tpl,
+    allocate_pages,
+    free_pages,
+    get_memory_map,
+    allocate_pool,
+    free_pool,
+    create_event,
+    set_timer,
+    wait_for_event,
+    signal_event,
+    close_event,
+    check_event,
+    install_protocol_interface,
+    reinstall_protocol_interface,
+    uninstall_protocol_interface,
+    handle_protocol,
     reserved: core::ptr::null_mut(),
-    register_protocol_notify: register_protocol_notify,
-    locate_handle: locate_handle,
-    locate_device_path: locate_device_path,
-    install_configuration_table: install_configuration_table,
-    load_image: load_image,
-    start_image: start_image,
-    exit: exit,
-    unload_image: unload_image,
-    exit_boot_services: exit_boot_services,
-    get_next_monotonic_count: get_next_monotonic_count,
-    stall: stall,
-    set_watchdog_timer: set_watchdog_timer,
-    connect_controller: connect_controller,
-    disconnect_controller: disconnect_controller,
-    open_protocol: open_protocol,
-    close_protocol: close_protocol,
-    open_protocol_information: open_protocol_information,
-    protocols_per_handle: protocols_per_handle,
-    locate_handle_buffer: locate_handle_buffer,
-    locate_protocol: locate_protocol,
+    register_protocol_notify,
+    locate_handle,
+    locate_device_path,
+    install_configuration_table,
+    load_image,
+    start_image,
+    exit,
+    unload_image,
+    exit_boot_services,
+    get_next_monotonic_count,
+    stall,
+    set_watchdog_timer,
+    connect_controller,
+    disconnect_controller,
+    open_protocol,
+    close_protocol,
+    open_protocol_information,
+    protocols_per_handle,
+    locate_handle_buffer,
+    locate_protocol,
     // These are variadic functions - we use transmute to cast our extended-signature
     // functions to the expected type. The caller passes all args regardless of signature.
     install_multiple_protocol_interfaces: unsafe {
@@ -118,10 +118,10 @@ static mut BOOT_SERVICES: efi::BootServices = efi::BootServices {
             extern "efiapi" fn(Handle, *mut c_void, *mut c_void) -> Status,
         >(uninstall_multiple_protocol_interfaces)
     },
-    calculate_crc32: calculate_crc32,
-    copy_mem: copy_mem,
-    set_mem: set_mem,
-    create_event_ex: create_event_ex,
+    calculate_crc32,
+    copy_mem,
+    set_mem,
+    create_event_ex,
 };
 
 /// Get a pointer to the boot services table
@@ -1484,15 +1484,13 @@ extern "efiapi" fn uninstall_multiple_protocol_interfaces(
             if let Some(entry) = efi_state.handles[..efi_state.handle_count]
                 .iter_mut()
                 .find(|e| e.handle == handle)
-            {
-                if let Some(j) = entry.protocols[..entry.protocol_count]
+                && let Some(j) = entry.protocols[..entry.protocol_count]
                     .iter()
                     .position(|p| guid_eq(&p.guid, &guid))
-                {
-                    // Remove by shifting remaining protocols down
-                    entry.protocols.copy_within(j + 1..entry.protocol_count, j);
-                    entry.protocol_count -= 1;
-                }
+            {
+                // Remove by shifting remaining protocols down
+                entry.protocols.copy_within(j + 1..entry.protocol_count, j);
+                entry.protocol_count -= 1;
             }
         });
     }

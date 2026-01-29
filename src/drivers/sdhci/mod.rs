@@ -159,7 +159,7 @@ impl SdhciController {
             let vendor_version = regs.host_version.read(HOST_VERSION::VENDOR_VERSION);
             let capabilities = regs.capabilities.get();
             let capabilities_1 = regs.capabilities_1.get();
-            let base_clk = regs.capabilities.read(CAPABILITIES::BASE_CLK_FREQ) as u32;
+            let base_clk = regs.capabilities.read(CAPABILITIES::BASE_CLK_FREQ);
             (
                 version,
                 vendor_version,
@@ -375,7 +375,7 @@ impl SdhciController {
         let div_hi = ((divider >> 8) & 0x03) as u8;
 
         regs.clock_control.write(
-            CLOCK_CONTROL::FREQ_SELECT.val(div_lo as u16)
+            CLOCK_CONTROL::FREQ_SELECT.val(div_lo)
                 + CLOCK_CONTROL::FREQ_SELECT_HI.val(div_hi as u16)
                 + CLOCK_CONTROL::INTERNAL_CLK_EN::SET,
         );
@@ -484,7 +484,7 @@ impl SdhciController {
 
         match resp_type {
             MMC_RSP_NONE => {
-                cmd_val = cmd_val + COMMAND::RESPONSE_TYPE::None;
+                cmd_val += COMMAND::RESPONSE_TYPE::None;
             }
             MMC_RSP_R1 | MMC_RSP_R6 | MMC_RSP_R7 => {
                 cmd_val = cmd_val
@@ -502,15 +502,15 @@ impl SdhciController {
                 cmd_val = cmd_val + COMMAND::RESPONSE_TYPE::Long136 + COMMAND::CRC_CHECK::SET;
             }
             MMC_RSP_R3 => {
-                cmd_val = cmd_val + COMMAND::RESPONSE_TYPE::Short48;
+                cmd_val += COMMAND::RESPONSE_TYPE::Short48;
             }
             _ => {
-                cmd_val = cmd_val + COMMAND::RESPONSE_TYPE::Short48;
+                cmd_val += COMMAND::RESPONSE_TYPE::Short48;
             }
         }
 
         if has_data {
-            cmd_val = cmd_val + COMMAND::DATA_PRESENT::SET;
+            cmd_val += COMMAND::DATA_PRESENT::SET;
         }
 
         // Send command
@@ -722,10 +722,9 @@ impl SdhciController {
             .regs()
             .capabilities
             .is_set(CAPABILITIES::SUPPORT_HIGHSPEED)
+            && self.try_high_speed().is_ok()
         {
-            if self.try_high_speed().is_ok() {
-                log::info!("SDHCI: High-speed mode enabled (50 MHz)");
-            }
+            log::info!("SDHCI: High-speed mode enabled (50 MHz)");
         }
 
         self.card_initialized = true;
@@ -1109,7 +1108,7 @@ pub fn init() {
             Ok(controller) => {
                 // Allocate memory for controller
                 let size = core::mem::size_of::<SdhciController>();
-                let pages = (size + 4095) / 4096;
+                let pages = size.div_ceil(4096);
 
                 if let Some(ptr) = efi::allocate_pages(pages as u64) {
                     let controller_ptr = ptr as *mut SdhciController;
@@ -1180,7 +1179,7 @@ static GLOBAL_SDHCI_DEVICE: Mutex<Option<GlobalSdhciDevicePtr>> = Mutex::new(Non
 pub fn store_global_device(controller_index: usize) -> bool {
     // Allocate memory for the device info
     let size = core::mem::size_of::<GlobalSdhciDevice>();
-    let pages = (size + 4095) / 4096;
+    let pages = size.div_ceil(4096);
 
     if let Some(ptr) = efi::allocate_pages(pages as u64) {
         let device_ptr = ptr as *mut GlobalSdhciDevice;

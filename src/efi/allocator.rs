@@ -194,6 +194,12 @@ pub struct MemoryAllocator {
     boot_services_exited: bool,
 }
 
+impl Default for MemoryAllocator {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl MemoryAllocator {
     /// Create a new allocator (const fn for static initialization)
     pub const fn new() -> Self {
@@ -465,7 +471,7 @@ impl MemoryAllocator {
             AllocateType::AllocateAddress => {
                 // Allocate at exact address
                 let addr = *memory;
-                if addr % PAGE_SIZE != 0 {
+                if !addr.is_multiple_of(PAGE_SIZE) {
                     return efi::Status::INVALID_PARAMETER;
                 }
 
@@ -484,7 +490,7 @@ impl MemoryAllocator {
 
     /// Free previously allocated pages
     pub fn free_pages(&mut self, memory: u64, num_pages: u64) -> efi::Status {
-        if memory % PAGE_SIZE != 0 {
+        if !memory.is_multiple_of(PAGE_SIZE) {
             return efi::Status::INVALID_PARAMETER;
         }
 
@@ -533,7 +539,7 @@ impl MemoryAllocator {
         *map_key = self.map_key;
 
         if let Some(map) = memory_map {
-            if map.len() * entry_size < required_size {
+            if core::mem::size_of_val(map) < required_size {
                 *memory_map_size = required_size;
                 return efi::Status::BUFFER_TOO_SMALL;
             }
@@ -605,10 +611,10 @@ impl MemoryAllocator {
 
         // Convert boot services memory to conventional memory
         for entry in self.entries.iter_mut() {
-            if let Some(mem_type) = entry.get_memory_type() {
-                if mem_type.is_boot_services() {
-                    entry.memory_type = MemoryType::ConventionalMemory as u32;
-                }
+            if let Some(mem_type) = entry.get_memory_type()
+                && mem_type.is_boot_services()
+            {
+                entry.memory_type = MemoryType::ConventionalMemory as u32;
             }
         }
 

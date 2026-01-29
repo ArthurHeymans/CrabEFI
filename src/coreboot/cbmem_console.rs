@@ -48,7 +48,7 @@ pub fn init(addr: u64) {
     unsafe {
         let size = core::ptr::addr_of!((*header).size).read_unaligned();
         // Sanity check: size should be reasonable (at least 1KB, at most 1MB)
-        if size >= 1024 && size <= 1024 * 1024 {
+        if (1024..=1024 * 1024).contains(&size) {
             CBMEM_CONSOLE_ADDR.store(addr, Ordering::Release);
             log::debug!(
                 "CBMEM console initialized: addr={:#x}, size={} bytes",

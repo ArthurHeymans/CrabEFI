@@ -70,7 +70,7 @@ impl KeyboardReport {
         self.keys
             .iter()
             .copied()
-            .filter(move |&k| k != 0 && !prev.keys.iter().any(|&pk| pk == k))
+            .filter(move |&k| k != 0 && !prev.keys.contains(&k))
     }
 }
 
@@ -239,7 +239,7 @@ impl UsbHidKeyboard {
         if self.last_key != 0 {
             self.repeat_counter += 1;
             // Initial delay of ~500ms (50 polls at 10ms), then repeat at ~30ms (3 polls)
-            if self.repeat_counter > 50 && (self.repeat_counter - 50) % 3 == 0 {
+            if self.repeat_counter > 50 && (self.repeat_counter - 50).is_multiple_of(3) {
                 self.enqueue_key(self.last_key);
             }
         }

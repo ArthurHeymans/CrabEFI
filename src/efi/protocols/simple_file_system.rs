@@ -671,11 +671,9 @@ fn build_full_path(parent: &[u8], name: &str, out: &mut [u8; MAX_PATH_LEN]) -> u
         }
 
         // Add separator if needed
-        if len > 0 && out[len - 1] != b'/' {
-            if len < MAX_PATH_LEN - 1 {
-                out[len] = b'/';
-                len += 1;
-            }
+        if len > 0 && out[len - 1] != b'/' && len < MAX_PATH_LEN - 1 {
+            out[len] = b'/';
+            len += 1;
         }
 
         // Add name
@@ -887,7 +885,7 @@ fn matches_name(entry: &DirEntry, name: &str) -> bool {
         return false;
     }
     for (a, b) in entry_name.bytes().zip(name.bytes()) {
-        if a.to_ascii_uppercase() != b.to_ascii_uppercase() {
+        if !a.eq_ignore_ascii_case(&b) {
             return false;
         }
     }
