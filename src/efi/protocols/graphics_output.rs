@@ -7,7 +7,7 @@
 use r_efi::efi::{Guid, Status};
 
 use crate::coreboot::FramebufferInfo;
-use crate::efi::allocator::{allocate_pool, MemoryType};
+use crate::efi::allocator::{MemoryType, allocate_pool};
 use crate::state;
 
 /// EFI_GRAPHICS_OUTPUT_PROTOCOL GUID
@@ -565,7 +565,9 @@ pub fn create_gop(framebuffer: &FramebufferInfo) -> *mut GraphicsOutputProtocol 
     }
 
     // Store global state for Blt operations
-    state::console_mut().gop_framebuffer = Some(framebuffer.clone());
+    state::with_console_mut(|console| {
+        console.gop_framebuffer = Some(framebuffer.clone());
+    });
 
     log::info!(
         "GraphicsOutputProtocol created: {}x{} @ {:#x}, {:?}",

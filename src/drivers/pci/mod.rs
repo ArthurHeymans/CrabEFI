@@ -370,10 +370,15 @@ pub fn enable_device(dev: &PciDevice) {
 pub fn init() {
     log::info!("Initializing PCI subsystem...");
 
-    let drivers = state::drivers_mut();
-    let devices = &mut drivers.pci_devices;
-    devices.clear();
+    state::with_drivers_mut(|drivers| {
+        let devices = &mut drivers.pci_devices;
+        devices.clear();
+        init_inner(devices);
+    });
+}
 
+/// Inner initialization that works with a mutable reference to devices
+fn init_inner(devices: &mut heapless::Vec<PciDevice, { state::MAX_PCI_DEVICES }>) {
     // Scan all buses, devices, and functions
     for bus in 0..=255u8 {
         for device in 0..32u8 {
@@ -503,7 +508,9 @@ pub fn print_devices() {
 
 /// Set ECAM base address (from ACPI MCFG table)
 pub fn set_ecam_base(base: u64) {
-    state::drivers_mut().ecam_base = Some(base);
+    state::with_drivers_mut(|drivers| {
+        drivers.ecam_base = Some(base);
+    });
     log::debug!("ECAM base set to {:#x}", base);
 }
 

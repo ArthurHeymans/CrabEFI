@@ -35,11 +35,12 @@ pub fn init_framebuffer(fb: FramebufferInfo) {
     // Use bottom half of screen for EFI console output
     let efi_start_row = rows / 2;
 
-    let console = state::console_mut();
-    console.dimensions = (cols, rows - efi_start_row);
-    console.cursor_pos = (0, efi_start_row);
-    console.start_row = efi_start_row;
-    console.efi_framebuffer = Some(fb);
+    state::with_console_mut(|console| {
+        console.dimensions = (cols, rows - efi_start_row);
+        console.cursor_pos = (0, efi_start_row);
+        console.start_row = efi_start_row;
+        console.efi_framebuffer = Some(fb);
+    });
 
     log::info!(
         "EFI console initialized: {}x{} chars, starting at row {}",
@@ -51,45 +52,46 @@ pub fn init_framebuffer(fb: FramebufferInfo) {
 
 /// Write a character to the EFI framebuffer console
 fn fb_put_char(c: char) {
-    let console = state::console_mut();
-    let Some(ref fb) = console.efi_framebuffer else {
-        return;
-    };
+    state::with_console_mut(|console| {
+        let Some(ref fb) = console.efi_framebuffer else {
+            return;
+        };
 
-    let (cols, _rows) = console.dimensions;
-    let total_rows = fb.y_resolution / CHAR_HEIGHT;
-    let start_row = console.start_row;
+        let (cols, _rows) = console.dimensions;
+        let total_rows = fb.y_resolution / CHAR_HEIGHT;
+        let start_row = console.start_row;
 
-    let (mut col, mut row) = console.cursor_pos;
+        let (mut col, mut row) = console.cursor_pos;
 
-    match c {
-        '\n' => {
-            col = 0;
-            row += 1;
-            if row >= total_rows {
-                // Scroll up the bottom half
-                fb_scroll_up(fb, start_row, total_rows);
-                row = total_rows - 1;
-            }
-        }
-        '\r' => {
-            col = 0;
-        }
-        _ => {
-            fb_draw_char(fb, c, col, row);
-            col += 1;
-            if col >= cols {
+        match c {
+            '\n' => {
                 col = 0;
                 row += 1;
                 if row >= total_rows {
+                    // Scroll up the bottom half
                     fb_scroll_up(fb, start_row, total_rows);
                     row = total_rows - 1;
                 }
             }
+            '\r' => {
+                col = 0;
+            }
+            _ => {
+                fb_draw_char(fb, c, col, row);
+                col += 1;
+                if col >= cols {
+                    col = 0;
+                    row += 1;
+                    if row >= total_rows {
+                        fb_scroll_up(fb, start_row, total_rows);
+                        row = total_rows - 1;
+                    }
+                }
+            }
         }
-    }
 
-    console.cursor_pos = (col, row);
+        console.cursor_pos = (col, row);
+    });
 }
 
 /// Draw a character at a specific position
@@ -278,81 +280,82 @@ extern "efiapi" fn text_input_read_key_stroke(
         return Status::INVALID_PARAMETER;
     }
 
-    let console = state::console_mut();
-    let input_state = &mut console.input;
+    state::with_console_mut(|console| {
+        let input_state = &mut console.input;
 
-    // First check if we have a queued key from previous escape sequence parsing
-    if let Some((scan_code, unicode_char)) = input_state.queued_key.take() {
-        unsafe {
-            (*key).scan_code = scan_code;
-            (*key).unicode_char = unicode_char;
-        }
-        log::trace!(
-            "ConIn.ReadKeyStroke: queued key -> scan={:#x}, unicode={:#x}",
-            scan_code,
-            unicode_char
-        );
-        return Status::SUCCESS;
-    }
-
-    // Try to get a key from PS/2 keyboard first
-    if let Some((scan_code, unicode_char)) = keyboard::try_read_key() {
-        unsafe {
-            (*key).scan_code = scan_code;
-            (*key).unicode_char = unicode_char;
-        }
-        log::trace!(
-            "ConIn.ReadKeyStroke: PS/2 -> scan={:#x}, unicode={:#x}",
-            scan_code,
-            unicode_char
-        );
-        return Status::SUCCESS;
-    }
-
-    // Try to read from serial port
-    match serial::try_read() {
-        Some(byte) => {
-            // Handle escape sequence parsing
-            let (scan_code, unicode_char) = process_serial_byte(input_state, byte);
-
-            if scan_code == 0 && unicode_char == 0 {
-                // Still collecting escape sequence, no key ready yet
-                return Status::NOT_READY;
-            }
-
+        // First check if we have a queued key from previous escape sequence parsing
+        if let Some((scan_code, unicode_char)) = input_state.queued_key.take() {
             unsafe {
                 (*key).scan_code = scan_code;
                 (*key).unicode_char = unicode_char;
             }
-
             log::trace!(
-                "ConIn.ReadKeyStroke: serial byte={:#x} -> scan={:#x}, unicode={:#x}",
-                byte,
+                "ConIn.ReadKeyStroke: queued key -> scan={:#x}, unicode={:#x}",
                 scan_code,
                 unicode_char
             );
-
-            Status::SUCCESS
+            return Status::SUCCESS;
         }
-        None => {
-            // Check if we're in the middle of an escape sequence that timed out
-            if input_state.in_escape && input_state.escape_len > 0 {
-                // Timeout: return what we have as individual characters
-                // This happens when user presses just ESC
-                let result = finalize_escape_sequence(input_state);
-                if let Some((scan_code, unicode_char)) = result {
-                    unsafe {
-                        (*key).scan_code = scan_code;
-                        (*key).unicode_char = unicode_char;
-                    }
-                    return Status::SUCCESS;
-                }
+
+        // Try to get a key from PS/2 keyboard first
+        if let Some((scan_code, unicode_char)) = keyboard::try_read_key() {
+            unsafe {
+                (*key).scan_code = scan_code;
+                (*key).unicode_char = unicode_char;
             }
-
-            // No key available
-            Status::NOT_READY
+            log::trace!(
+                "ConIn.ReadKeyStroke: PS/2 -> scan={:#x}, unicode={:#x}",
+                scan_code,
+                unicode_char
+            );
+            return Status::SUCCESS;
         }
-    }
+
+        // Try to read from serial port
+        match serial::try_read() {
+            Some(byte) => {
+                // Handle escape sequence parsing
+                let (scan_code, unicode_char) = process_serial_byte(input_state, byte);
+
+                if scan_code == 0 && unicode_char == 0 {
+                    // Still collecting escape sequence, no key ready yet
+                    return Status::NOT_READY;
+                }
+
+                unsafe {
+                    (*key).scan_code = scan_code;
+                    (*key).unicode_char = unicode_char;
+                }
+
+                log::trace!(
+                    "ConIn.ReadKeyStroke: serial byte={:#x} -> scan={:#x}, unicode={:#x}",
+                    byte,
+                    scan_code,
+                    unicode_char
+                );
+
+                Status::SUCCESS
+            }
+            None => {
+                // Check if we're in the middle of an escape sequence that timed out
+                if input_state.in_escape && input_state.escape_len > 0 {
+                    // Timeout: return what we have as individual characters
+                    // This happens when user presses just ESC
+                    let result = finalize_escape_sequence(input_state);
+                    if let Some((scan_code, unicode_char)) = result {
+                        unsafe {
+                            (*key).scan_code = scan_code;
+                            (*key).unicode_char = unicode_char;
+                        }
+                        return Status::SUCCESS;
+                    }
+                }
+
+                // No key available
+                Status::NOT_READY
+            }
+        }
+    })
 }
 
 /// Process a serial byte, handling escape sequences

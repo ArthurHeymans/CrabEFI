@@ -16,10 +16,10 @@ use crate::drivers::block::{AhciDisk, BlockDevice, NvmeDisk, UsbDisk};
 use crate::drivers::keyboard;
 use crate::drivers::serial as serial_driver;
 use crate::framebuffer_console::{
-    Color, FramebufferConsole, DEFAULT_BG, DEFAULT_FG, HIGHLIGHT_BG, HIGHLIGHT_FG, TITLE_COLOR,
+    Color, DEFAULT_BG, DEFAULT_FG, FramebufferConsole, HIGHLIGHT_BG, HIGHLIGHT_FG, TITLE_COLOR,
 };
 use crate::fs::{fat::FatFilesystem, gpt};
-use crate::time::{delay_ms, Timeout};
+use crate::time::{Timeout, delay_ms};
 use core::fmt::Write;
 use heapless::{String, Vec};
 
@@ -323,7 +323,7 @@ fn discover_ahci_entries(menu: &mut BootMenu) {
 
 /// Discover boot entries from USB devices (all controller types)
 fn discover_usb_entries(menu: &mut BootMenu) {
-    use crate::drivers::usb::{self, mass_storage, UsbMassStorage};
+    use crate::drivers::usb::{self, UsbMassStorage, mass_storage};
 
     // Check if we have any mass storage on any controller
     if let Some((controller_id, device_addr)) = usb::find_mass_storage() {

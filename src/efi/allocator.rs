@@ -762,8 +762,9 @@ impl MemoryAllocator {
 
 /// Initialize the global allocator from coreboot memory map
 pub fn init(regions: &[MemoryRegion]) {
-    let alloc = state::allocator_mut();
-    alloc.init_from_coreboot(regions);
+    state::with_allocator_mut(|alloc| {
+        alloc.init_from_coreboot(regions);
+    });
 }
 
 /// Reserve a region of memory
@@ -772,8 +773,7 @@ pub fn reserve_region(
     num_pages: u64,
     memory_type: MemoryType,
 ) -> Result<(), efi::Status> {
-    let alloc = state::allocator_mut();
-    alloc.reserve_region(physical_start, num_pages, memory_type)
+    state::with_allocator_mut(|alloc| alloc.reserve_region(physical_start, num_pages, memory_type))
 }
 
 /// Force-add a memory region to the map
@@ -784,16 +784,16 @@ pub fn force_add_region(
     num_pages: u64,
     memory_type: MemoryType,
 ) -> Result<(), efi::Status> {
-    let alloc = state::allocator_mut();
-    alloc.force_add_region(physical_start, num_pages, memory_type)
+    state::with_allocator_mut(|alloc| {
+        alloc.force_add_region(physical_start, num_pages, memory_type)
+    })
 }
 
 /// Mark a memory region as ACPI Reclaim Memory
 ///
 /// This properly splits existing regions and marks the specified range as AcpiReclaimMemory.
 pub fn mark_as_acpi_reclaim(addr: u64, num_pages: u64) -> Result<(), efi::Status> {
-    let alloc = state::allocator_mut();
-    alloc.mark_as_acpi_reclaim(addr, num_pages)
+    state::with_allocator_mut(|alloc| alloc.mark_as_acpi_reclaim(addr, num_pages))
 }
 
 /// Allocate pages of memory
@@ -803,14 +803,14 @@ pub fn allocate_pages(
     num_pages: u64,
     memory: &mut u64,
 ) -> efi::Status {
-    let alloc = state::allocator_mut();
-    alloc.allocate_pages(alloc_type, memory_type, num_pages, memory)
+    state::with_allocator_mut(|alloc| {
+        alloc.allocate_pages(alloc_type, memory_type, num_pages, memory)
+    })
 }
 
 /// Free previously allocated pages
 pub fn free_pages(memory: u64, num_pages: u64) -> efi::Status {
-    let alloc = state::allocator_mut();
-    alloc.free_pages(memory, num_pages)
+    state::with_allocator_mut(|alloc| alloc.free_pages(memory, num_pages))
 }
 
 /// Get the memory map size
@@ -858,8 +858,7 @@ pub fn get_memory_map(
 
 /// Exit boot services
 pub fn exit_boot_services(map_key: usize) -> efi::Status {
-    let alloc = state::allocator_mut();
-    alloc.exit_boot_services(map_key)
+    state::with_allocator_mut(|alloc| alloc.exit_boot_services(map_key))
 }
 
 /// Pool allocation header (for AllocatePool/FreePool)

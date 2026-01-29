@@ -96,7 +96,9 @@ pub fn init(coreboot_table_ptr: u64) {
     if let Some(ref fb) = cb_info.framebuffer {
         coreboot::store_framebuffer(fb.clone());
         // Also store in new state
-        state::drivers_mut().framebuffer = Some(fb.clone());
+        state::with_drivers_mut(|drivers| {
+            drivers.framebuffer = Some(fb.clone());
+        });
     }
 
     // Initialize serial port from coreboot info (if available)
@@ -1616,9 +1618,9 @@ fn load_and_execute_bootloader<R: BlockDevice>(
     file_size: u32,
     device_handle: r_efi::efi::Handle,
 ) -> Result<(), r_efi::efi::Status> {
-    use efi::allocator::{allocate_pool, free_pool, MemoryType};
+    use efi::allocator::{MemoryType, allocate_pool, free_pool};
     use efi::boot_services;
-    use efi::protocols::loaded_image::{create_loaded_image_protocol, LOADED_IMAGE_PROTOCOL_GUID};
+    use efi::protocols::loaded_image::{LOADED_IMAGE_PROTOCOL_GUID, create_loaded_image_protocol};
     use r_efi::efi::Status;
 
     log::info!("Loading bootloader: {} ({} bytes)", path, file_size);

@@ -8,7 +8,7 @@ use r_efi::efi::{
     self, CapsuleHeader, Guid, ResetType, Status, TableHeader, Time, TimeCapabilities,
 };
 
-use crate::state::{self, MAX_VARIABLES, MAX_VARIABLE_DATA_SIZE, MAX_VARIABLE_NAME_LEN};
+use crate::state::{self, MAX_VARIABLE_DATA_SIZE, MAX_VARIABLE_NAME_LEN, MAX_VARIABLES};
 
 /// Runtime Services signature "RUNTSERV"
 const EFI_RUNTIME_SERVICES_SIGNATURE: u64 = 0x56524553544E5552;
@@ -246,8 +246,6 @@ extern "efiapi" fn set_variable(
 
     let name = variable_name;
     let guid = unsafe { *vendor_guid };
-    let efi = state::efi_mut();
-    let variables = &mut efi.variables;
 
     // Check name length
     let name_len = ucs2_strlen_ptr(name);
@@ -255,71 +253,75 @@ extern "efiapi" fn set_variable(
         return Status::INVALID_PARAMETER;
     }
 
-    // Find existing variable or free slot
-    let mut existing_idx: Option<usize> = None;
-    let mut free_idx: Option<usize> = None;
-
-    for (i, var) in variables.iter().enumerate() {
-        if var.in_use {
-            if guid_eq(&var.vendor_guid, &guid) && name_eq(&var.name, name) {
-                existing_idx = Some(i);
-                break;
-            }
-        } else if free_idx.is_none() {
-            free_idx = Some(i);
-        }
-    }
-
-    // Delete variable if data_size is 0
-    if data_size == 0 {
-        if let Some(idx) = existing_idx {
-            variables[idx].in_use = false;
-            return Status::SUCCESS;
-        }
-        return Status::NOT_FOUND;
-    }
-
     // Check data size
     if data_size > MAX_VARIABLE_DATA_SIZE {
         return Status::OUT_OF_RESOURCES;
     }
 
-    if data.is_null() {
+    if data_size > 0 && data.is_null() {
         return Status::INVALID_PARAMETER;
     }
 
-    // Update or create variable
-    let idx = match existing_idx {
-        Some(i) => i,
-        None => match free_idx {
+    state::with_efi_mut(|efi| {
+        let variables = &mut efi.variables;
+
+        // Find existing variable or free slot
+        let mut existing_idx: Option<usize> = None;
+        let mut free_idx: Option<usize> = None;
+
+        for (i, var) in variables.iter().enumerate() {
+            if var.in_use {
+                if guid_eq(&var.vendor_guid, &guid) && name_eq(&var.name, name) {
+                    existing_idx = Some(i);
+                    break;
+                }
+            } else if free_idx.is_none() {
+                free_idx = Some(i);
+            }
+        }
+
+        // Delete variable if data_size is 0
+        if data_size == 0 {
+            if let Some(idx) = existing_idx {
+                variables[idx].in_use = false;
+                return Status::SUCCESS;
+            }
+            return Status::NOT_FOUND;
+        }
+
+        // Update or create variable
+        let idx = match existing_idx {
             Some(i) => i,
-            None => return Status::OUT_OF_RESOURCES,
-        },
-    };
+            None => match free_idx {
+                Some(i) => i,
+                None => return Status::OUT_OF_RESOURCES,
+            },
+        };
 
-    // Copy name
-    for i in 0..=name_len {
-        variables[idx].name[i] = unsafe { *name.add(i) };
-    }
-    for i in (name_len + 1)..MAX_VARIABLE_NAME_LEN {
-        variables[idx].name[i] = 0;
-    }
+        // Copy name
+        for i in 0..=name_len {
+            variables[idx].name[i] = unsafe { *name.add(i) };
+        }
+        for i in (name_len + 1)..MAX_VARIABLE_NAME_LEN {
+            variables[idx].name[i] = 0;
+        }
 
-    // Copy data
-    unsafe {
-        core::ptr::copy_nonoverlapping(
-            data as *const u8,
-            variables[idx].data.as_mut_ptr(),
-            data_size,
-        );
-    }
+        // Copy data
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                data as *const u8,
+                variables[idx].data.as_mut_ptr(),
+                data_size,
+            );
+        }
 
-    variables[idx].vendor_guid = guid;
-    variables[idx].attributes = attributes;
-    variables[idx].data_size = data_size;
-    variables[idx].in_use = true;
+        variables[idx].vendor_guid = guid;
+        variables[idx].attributes = attributes;
+        variables[idx].data_size = data_size;
+        variables[idx].in_use = true;
 
-    Status::SUCCESS
+        Status::SUCCESS
+    })
 }
 
 extern "efiapi" fn query_variable_info(

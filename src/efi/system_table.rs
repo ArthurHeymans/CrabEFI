@@ -188,46 +188,47 @@ pub unsafe fn set_std_err(handle: Handle, protocol: *mut SimpleTextOutputProtoco
 /// If a table with the same GUID already exists, it will be updated.
 /// If vendor_table is null, the table entry will be removed.
 pub fn install_configuration_table(guid: &Guid, table: *mut c_void) -> efi::Status {
-    let efi = state::efi_mut();
-    let tables = &mut efi.config_tables;
-    let count = &mut efi.config_table_count;
+    state::with_efi_mut(|efi| {
+        let tables = &mut efi.config_tables;
+        let count = &mut efi.config_table_count;
 
-    // First, check if this GUID already exists
-    for i in 0..*count {
-        if guid_eq(&tables[i].vendor_guid, guid) {
-            if table.is_null() {
-                // Remove the entry by shifting others down
-                for j in i..*count - 1 {
-                    tables[j] = tables[j + 1];
+        // First, check if this GUID already exists
+        for i in 0..*count {
+            if guid_eq(&tables[i].vendor_guid, guid) {
+                if table.is_null() {
+                    // Remove the entry by shifting others down
+                    for j in i..*count - 1 {
+                        tables[j] = tables[j + 1];
+                    }
+                    *count -= 1;
+                    update_table_count(*count);
+                    return efi::Status::SUCCESS;
+                } else {
+                    // Update existing entry
+                    tables[i].vendor_table = table;
+                    return efi::Status::SUCCESS;
                 }
-                *count -= 1;
-                update_table_count(*count);
-                return efi::Status::SUCCESS;
-            } else {
-                // Update existing entry
-                tables[i].vendor_table = table;
-                return efi::Status::SUCCESS;
             }
         }
-    }
 
-    // Adding a new entry
-    if table.is_null() {
-        return efi::Status::NOT_FOUND;
-    }
+        // Adding a new entry
+        if table.is_null() {
+            return efi::Status::NOT_FOUND;
+        }
 
-    if *count >= MAX_CONFIG_TABLES {
-        return efi::Status::OUT_OF_RESOURCES;
-    }
+        if *count >= MAX_CONFIG_TABLES {
+            return efi::Status::OUT_OF_RESOURCES;
+        }
 
-    tables[*count] = ConfigurationTable {
-        vendor_guid: *guid,
-        vendor_table: table,
-    };
-    *count += 1;
-    update_table_count(*count);
+        tables[*count] = ConfigurationTable {
+            vendor_guid: *guid,
+            vendor_table: table,
+        };
+        *count += 1;
+        update_table_count(*count);
 
-    efi::Status::SUCCESS
+        efi::Status::SUCCESS
+    })
 }
 
 /// Update the table count in the system table
@@ -286,7 +287,7 @@ struct AcpiRegion {
 
 /// Collect all ACPI table regions, merge overlapping ones, then mark them
 fn mark_acpi_tables_memory(rsdp_addr: u64) {
-    use super::allocator::{mark_as_acpi_reclaim, PAGE_SIZE};
+    use super::allocator::{PAGE_SIZE, mark_as_acpi_reclaim};
 
     log::info!("Marking ACPI table memory regions as AcpiReclaimMemory...");
 
@@ -516,7 +517,7 @@ fn mark_acpi_tables_memory(rsdp_addr: u64) {
 
 /// Install ACPI tables from coreboot
 pub fn install_acpi_tables(rsdp: u64) {
-    use super::allocator::{get_memory_type_at, MemoryType};
+    use super::allocator::{MemoryType, get_memory_type_at};
 
     if rsdp == 0 {
         log::warn!("ACPI RSDP address is null, skipping ACPI table installation");

@@ -9,12 +9,12 @@
 //! centralized `FirmwareState` structure. Access it via `crate::state::efi_mut()`.
 
 use super::allocator::{self, AllocateType, MemoryDescriptor, MemoryType};
-use super::protocols::loaded_image::{create_loaded_image_protocol, LOADED_IMAGE_PROTOCOL_GUID};
+use super::protocols::loaded_image::{LOADED_IMAGE_PROTOCOL_GUID, create_loaded_image_protocol};
 use super::system_table;
 use crate::pe;
 use crate::state::{
-    self, EventEntry, LoadedImageEntry, ProtocolEntry, MAX_EVENTS, MAX_HANDLES,
-    MAX_PROTOCOLS_PER_HANDLE,
+    self, EventEntry, LoadedImageEntry, MAX_EVENTS, MAX_HANDLES, MAX_PROTOCOLS_PER_HANDLE,
+    ProtocolEntry,
 };
 use core::ffi::c_void;
 use r_efi::efi::{self, Boolean, Guid, Handle, Status, SystemTable, TableHeader, Tpl};
@@ -314,31 +314,32 @@ extern "efiapi" fn create_event(
     }
 
     // Allocate an event ID from centralized state
-    let efi_state = state::efi_mut();
-    let event_id = efi_state.next_event_id;
+    state::with_efi_mut(|efi_state| {
+        let event_id = efi_state.next_event_id;
 
-    if event_id >= MAX_EVENTS {
-        log::error!("  -> OUT_OF_RESOURCES (no more event slots)");
-        return Status::OUT_OF_RESOURCES;
-    }
+        if event_id >= MAX_EVENTS {
+            log::error!("  -> OUT_OF_RESOURCES (no more event slots)");
+            return Status::OUT_OF_RESOURCES;
+        }
 
-    efi_state.next_event_id += 1;
+        efi_state.next_event_id += 1;
 
-    // Store event info
-    efi_state.events[event_id] = EventEntry {
-        event_type,
-        notify_tpl,
-        signaled: false,
-        is_keyboard_event: false,
-    };
+        // Store event info
+        efi_state.events[event_id] = EventEntry {
+            event_type,
+            notify_tpl,
+            signaled: false,
+            is_keyboard_event: false,
+        };
 
-    // Return the event ID as the event handle
-    unsafe {
-        *event = event_id as *mut c_void;
-    }
+        // Return the event ID as the event handle
+        unsafe {
+            *event = event_id as *mut c_void;
+        }
 
-    log::debug!("  -> SUCCESS (event={:#x})", event_id);
-    Status::SUCCESS
+        log::debug!("  -> SUCCESS (event={:#x})", event_id);
+        Status::SUCCESS
+    })
 }
 
 extern "efiapi" fn set_timer(
@@ -419,8 +420,9 @@ extern "efiapi" fn signal_event(event: efi::Event) -> Status {
     log::debug!("BS.SignalEvent(event={})", event_id);
 
     if event_id > 0 && event_id < MAX_EVENTS {
-        let efi_state = state::efi_mut();
-        efi_state.events[event_id].signaled = true;
+        state::with_efi_mut(|efi_state| {
+            efi_state.events[event_id].signaled = true;
+        });
     }
 
     Status::SUCCESS
@@ -431,8 +433,9 @@ extern "efiapi" fn close_event(event: efi::Event) -> Status {
     log::debug!("BS.CloseEvent(event={})", event_id);
 
     if event_id > 0 && event_id < MAX_EVENTS {
-        let efi_state = state::efi_mut();
-        efi_state.events[event_id] = EventEntry::empty();
+        state::with_efi_mut(|efi_state| {
+            efi_state.events[event_id] = EventEntry::empty();
+        });
     }
 
     Status::SUCCESS
@@ -503,51 +506,51 @@ extern "efiapi" fn install_protocol_interface(
     let guid = unsafe { *protocol };
     let handle_ptr = unsafe { *handle };
 
-    let efi_state = state::efi_mut();
+    state::with_efi_mut(|efi_state| {
+        // If handle is null, create a new handle
+        if handle_ptr.is_null() {
+            if efi_state.handle_count >= MAX_HANDLES {
+                return Status::OUT_OF_RESOURCES;
+            }
 
-    // If handle is null, create a new handle
-    if handle_ptr.is_null() {
-        if efi_state.handle_count >= MAX_HANDLES {
-            return Status::OUT_OF_RESOURCES;
+            let new_handle = efi_state.next_handle as *mut c_void;
+            efi_state.next_handle += 1;
+
+            let idx = efi_state.handle_count;
+            efi_state.handles[idx].handle = new_handle;
+            efi_state.handles[idx].protocols[0] = ProtocolEntry { guid, interface };
+            efi_state.handles[idx].protocol_count = 1;
+            efi_state.handle_count += 1;
+
+            unsafe { *handle = new_handle };
+            return Status::SUCCESS;
         }
 
-        let new_handle = efi_state.next_handle as *mut c_void;
-        efi_state.next_handle += 1;
-
-        let idx = efi_state.handle_count;
-        efi_state.handles[idx].handle = new_handle;
-        efi_state.handles[idx].protocols[0] = ProtocolEntry { guid, interface };
-        efi_state.handles[idx].protocol_count = 1;
-        efi_state.handle_count += 1;
-
-        unsafe { *handle = new_handle };
-        return Status::SUCCESS;
-    }
-
-    // Find existing handle
-    if let Some(entry) = efi_state.handles[..efi_state.handle_count]
-        .iter_mut()
-        .find(|e| e.handle == handle_ptr)
-    {
-        // Check if protocol already installed
-        if entry.protocols[..entry.protocol_count]
-            .iter()
-            .any(|p| guid_eq(&p.guid, &guid))
+        // Find existing handle
+        if let Some(entry) = efi_state.handles[..efi_state.handle_count]
+            .iter_mut()
+            .find(|e| e.handle == handle_ptr)
         {
-            return Status::INVALID_PARAMETER; // Protocol already installed
+            // Check if protocol already installed
+            if entry.protocols[..entry.protocol_count]
+                .iter()
+                .any(|p| guid_eq(&p.guid, &guid))
+            {
+                return Status::INVALID_PARAMETER; // Protocol already installed
+            }
+
+            // Add new protocol
+            if entry.protocol_count >= MAX_PROTOCOLS_PER_HANDLE {
+                return Status::OUT_OF_RESOURCES;
+            }
+
+            entry.protocols[entry.protocol_count] = ProtocolEntry { guid, interface };
+            entry.protocol_count += 1;
+            return Status::SUCCESS;
         }
 
-        // Add new protocol
-        if entry.protocol_count >= MAX_PROTOCOLS_PER_HANDLE {
-            return Status::OUT_OF_RESOURCES;
-        }
-
-        entry.protocols[entry.protocol_count] = ProtocolEntry { guid, interface };
-        entry.protocol_count += 1;
-        return Status::SUCCESS;
-    }
-
-    Status::INVALID_PARAMETER
+        Status::INVALID_PARAMETER
+    })
 }
 
 extern "efiapi" fn reinstall_protocol_interface(
@@ -874,8 +877,7 @@ extern "efiapi" fn load_image(
     }
 
     // Store the loaded image info so StartImage can find it
-    {
-        let efi_state = state::efi_mut();
+    let store_result = state::with_efi_mut(|efi_state| {
         let slot = efi_state
             .loaded_images
             .iter_mut()
@@ -889,13 +891,16 @@ extern "efiapi" fn load_image(
                 entry.entry_point = loaded_image.entry_point;
                 entry.num_pages = loaded_image.num_pages;
                 entry.parent_handle = parent_image_handle;
+                true
             }
-            None => {
-                log::error!("BS.LoadImage: No space in loaded images table");
-                pe::unload_image(&loaded_image);
-                return Status::OUT_OF_RESOURCES;
-            }
+            None => false,
         }
+    });
+
+    if !store_result {
+        log::error!("BS.LoadImage: No space in loaded images table");
+        pe::unload_image(&loaded_image);
+        return Status::OUT_OF_RESOURCES;
     }
 
     // Return the new handle
@@ -1034,8 +1039,7 @@ extern "efiapi" fn unload_image(image_handle: Handle) -> Status {
     }
 
     // Find and remove the loaded image entry
-    let image_info = {
-        let efi_state = state::efi_mut();
+    let image_info = state::with_efi_mut(|efi_state| {
         efi_state
             .loaded_images
             .iter_mut()
@@ -1046,7 +1050,7 @@ extern "efiapi" fn unload_image(image_handle: Handle) -> Status {
                 *entry = LoadedImageEntry::empty();
                 result
             })
-    };
+    });
 
     match image_info {
         Some((image_base, num_pages)) => {
@@ -1476,21 +1480,21 @@ extern "efiapi" fn uninstall_multiple_protocol_interfaces(
         log::debug!("  Uninstalling protocol: {}", GuidFmt(guid));
 
         // Find and remove the protocol from the handle
-        let efi_state = state::efi_mut();
-
-        if let Some(entry) = efi_state.handles[..efi_state.handle_count]
-            .iter_mut()
-            .find(|e| e.handle == handle)
-        {
-            if let Some(j) = entry.protocols[..entry.protocol_count]
-                .iter()
-                .position(|p| guid_eq(&p.guid, &guid))
+        state::with_efi_mut(|efi_state| {
+            if let Some(entry) = efi_state.handles[..efi_state.handle_count]
+                .iter_mut()
+                .find(|e| e.handle == handle)
             {
-                // Remove by shifting remaining protocols down
-                entry.protocols.copy_within(j + 1..entry.protocol_count, j);
-                entry.protocol_count -= 1;
+                if let Some(j) = entry.protocols[..entry.protocol_count]
+                    .iter()
+                    .position(|p| guid_eq(&p.guid, &guid))
+                {
+                    // Remove by shifting remaining protocols down
+                    entry.protocols.copy_within(j + 1..entry.protocol_count, j);
+                    entry.protocol_count -= 1;
+                }
             }
-        }
+        });
     }
 
     log::trace!("  -> SUCCESS");
@@ -1895,50 +1899,50 @@ fn format_guid(guid: &Guid) -> &'static str {
 
 /// Create a new handle and register it
 pub fn create_handle() -> Option<Handle> {
-    let efi_state = state::efi_mut();
+    state::with_efi_mut(|efi_state| {
+        if efi_state.handle_count >= MAX_HANDLES {
+            return None;
+        }
 
-    if efi_state.handle_count >= MAX_HANDLES {
-        return None;
-    }
+        let handle = efi_state.next_handle as *mut c_void;
+        efi_state.next_handle += 1;
 
-    let handle = efi_state.next_handle as *mut c_void;
-    efi_state.next_handle += 1;
+        let idx = efi_state.handle_count;
+        efi_state.handles[idx].handle = handle;
+        efi_state.handles[idx].protocol_count = 0;
+        efi_state.handle_count += 1;
 
-    let idx = efi_state.handle_count;
-    efi_state.handles[idx].handle = handle;
-    efi_state.handles[idx].protocol_count = 0;
-    efi_state.handle_count += 1;
-
-    Some(handle)
+        Some(handle)
+    })
 }
 
 /// Install a protocol on an existing handle
 pub fn install_protocol(handle: Handle, guid: &Guid, interface: *mut c_void) -> Status {
-    let efi_state = state::efi_mut();
-
-    if let Some(entry) = efi_state.handles[..efi_state.handle_count]
-        .iter_mut()
-        .find(|e| e.handle == handle)
-    {
-        // Check if protocol already installed
-        if entry.protocols[..entry.protocol_count]
-            .iter()
-            .any(|p| guid_eq(&p.guid, guid))
+    state::with_efi_mut(|efi_state| {
+        if let Some(entry) = efi_state.handles[..efi_state.handle_count]
+            .iter_mut()
+            .find(|e| e.handle == handle)
         {
-            return Status::INVALID_PARAMETER;
+            // Check if protocol already installed
+            if entry.protocols[..entry.protocol_count]
+                .iter()
+                .any(|p| guid_eq(&p.guid, guid))
+            {
+                return Status::INVALID_PARAMETER;
+            }
+
+            if entry.protocol_count >= MAX_PROTOCOLS_PER_HANDLE {
+                return Status::OUT_OF_RESOURCES;
+            }
+
+            entry.protocols[entry.protocol_count] = ProtocolEntry {
+                guid: *guid,
+                interface,
+            };
+            entry.protocol_count += 1;
+            return Status::SUCCESS;
         }
 
-        if entry.protocol_count >= MAX_PROTOCOLS_PER_HANDLE {
-            return Status::OUT_OF_RESOURCES;
-        }
-
-        entry.protocols[entry.protocol_count] = ProtocolEntry {
-            guid: *guid,
-            interface,
-        };
-        entry.protocol_count += 1;
-        return Status::SUCCESS;
-    }
-
-    Status::INVALID_PARAMETER
+        Status::INVALID_PARAMETER
+    })
 }

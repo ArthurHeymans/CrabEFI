@@ -101,9 +101,10 @@ pub fn init(
     fs_state: FilesystemState,
     read_fn: fn(u64, &mut [u8]) -> Result<(), ()>,
 ) -> *mut efi_sfs::Protocol {
-    let efi = state::efi_mut();
-    efi.filesystem = Some(fs_state);
-    efi.disk_read_fn = Some(read_fn);
+    state::with_efi_mut(|efi| {
+        efi.filesystem = Some(fs_state);
+        efi.disk_read_fn = Some(read_fn);
+    });
 
     log::info!(
         "SimpleFileSystem: initialized with partition at LBA {}",

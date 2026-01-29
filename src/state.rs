@@ -74,17 +74,49 @@ pub fn get() -> &'static FirmwareState {
     unsafe { &*ptr }
 }
 
-/// Get a mutable reference to the global firmware state.
+/// Get a raw mutable pointer to the global firmware state.
 ///
-/// # Safety
+/// This returns a raw pointer rather than a reference to avoid creating
+/// multiple aliasing `&mut` references which would be undefined behavior.
 ///
-/// The caller must ensure exclusive access. In practice, this is safe
-/// because CrabEFI is single-threaded and UEFI Boot Services are not reentrant.
+/// # Panics
+///
+/// Panics if called before `init()`.
+///
+/// # Safety Note
+///
+/// The returned pointer is valid for the firmware lifetime. Callers must
+/// ensure they don't create overlapping mutable references when dereferencing.
+/// In single-threaded firmware this is typically safe, but care must be taken
+/// with nested function calls.
 #[inline]
-pub fn get_mut() -> &'static mut FirmwareState {
+pub fn get_mut_ptr() -> *mut FirmwareState {
     let ptr = STATE_PTR.load(Ordering::Acquire);
     assert!(!ptr.is_null(), "FirmwareState not initialized");
-    unsafe { &mut *ptr }
+    ptr
+}
+
+/// Access the firmware state mutably through a closure.
+///
+/// This is the preferred way to mutate firmware state as it makes the
+/// borrowing scope explicit and prevents accidental aliasing.
+///
+/// # Example
+///
+/// ```ignore
+/// state::with_mut(|state| {
+///     state.efi.handle_count += 1;
+/// });
+/// ```
+#[inline]
+pub fn with_mut<F, R>(f: F) -> R
+where
+    F: FnOnce(&mut FirmwareState) -> R,
+{
+    let ptr = STATE_PTR.load(Ordering::Acquire);
+    assert!(!ptr.is_null(), "FirmwareState not initialized");
+    // Safety: Single-threaded firmware, closure scope limits aliasing
+    unsafe { f(&mut *ptr) }
 }
 
 /// Try to get a reference to the global firmware state.
@@ -100,17 +132,14 @@ pub fn try_get() -> Option<&'static FirmwareState> {
     }
 }
 
-/// Try to get a mutable reference to the global firmware state.
+/// Try to get a raw mutable pointer to the global firmware state.
 ///
 /// Returns `None` if state has not been initialized yet.
+/// See `get_mut_ptr()` for safety considerations.
 #[inline]
-pub fn try_get_mut() -> Option<&'static mut FirmwareState> {
+pub fn try_get_mut_ptr() -> Option<*mut FirmwareState> {
     let ptr = STATE_PTR.load(Ordering::Acquire);
-    if ptr.is_null() {
-        None
-    } else {
-        Some(unsafe { &mut *ptr })
-    }
+    if ptr.is_null() { None } else { Some(ptr) }
 }
 
 // ============================================================================
@@ -603,10 +632,22 @@ pub fn efi() -> &'static EfiState {
     &get().efi
 }
 
-/// Get a mutable reference to the EFI state.
+/// Get a raw mutable pointer to the EFI state.
+/// See `get_mut_ptr()` for safety considerations.
 #[inline]
-pub fn efi_mut() -> &'static mut EfiState {
-    &mut get_mut().efi
+pub fn efi_mut_ptr() -> *mut EfiState {
+    let ptr = get_mut_ptr();
+    // Safety: ptr is valid, we're just computing an offset
+    unsafe { core::ptr::addr_of_mut!((*ptr).efi) }
+}
+
+/// Access EFI state mutably through a closure.
+#[inline]
+pub fn with_efi_mut<F, R>(f: F) -> R
+where
+    F: FnOnce(&mut EfiState) -> R,
+{
+    with_mut(|state| f(&mut state.efi))
 }
 
 /// Get a reference to the driver state.
@@ -615,10 +656,22 @@ pub fn drivers() -> &'static DriverState {
     &get().drivers
 }
 
-/// Get a mutable reference to the driver state.
+/// Get a raw mutable pointer to the driver state.
+/// See `get_mut_ptr()` for safety considerations.
 #[inline]
-pub fn drivers_mut() -> &'static mut DriverState {
-    &mut get_mut().drivers
+pub fn drivers_mut_ptr() -> *mut DriverState {
+    let ptr = get_mut_ptr();
+    // Safety: ptr is valid, we're just computing an offset
+    unsafe { core::ptr::addr_of_mut!((*ptr).drivers) }
+}
+
+/// Access driver state mutably through a closure.
+#[inline]
+pub fn with_drivers_mut<F, R>(f: F) -> R
+where
+    F: FnOnce(&mut DriverState) -> R,
+{
+    with_mut(|state| f(&mut state.drivers))
 }
 
 /// Get a reference to the console state.
@@ -627,10 +680,22 @@ pub fn console() -> &'static ConsoleState {
     &get().console
 }
 
-/// Get a mutable reference to the console state.
+/// Get a raw mutable pointer to the console state.
+/// See `get_mut_ptr()` for safety considerations.
 #[inline]
-pub fn console_mut() -> &'static mut ConsoleState {
-    &mut get_mut().console
+pub fn console_mut_ptr() -> *mut ConsoleState {
+    let ptr = get_mut_ptr();
+    // Safety: ptr is valid, we're just computing an offset
+    unsafe { core::ptr::addr_of_mut!((*ptr).console) }
+}
+
+/// Access console state mutably through a closure.
+#[inline]
+pub fn with_console_mut<F, R>(f: F) -> R
+where
+    F: FnOnce(&mut ConsoleState) -> R,
+{
+    with_mut(|state| f(&mut state.console))
 }
 
 /// Get a reference to the memory allocator.
@@ -639,8 +704,20 @@ pub fn allocator() -> &'static MemoryAllocator {
     &get().efi.allocator
 }
 
-/// Get a mutable reference to the memory allocator.
+/// Get a raw mutable pointer to the memory allocator.
+/// See `get_mut_ptr()` for safety considerations.
 #[inline]
-pub fn allocator_mut() -> &'static mut MemoryAllocator {
-    &mut get_mut().efi.allocator
+pub fn allocator_mut_ptr() -> *mut MemoryAllocator {
+    let ptr = get_mut_ptr();
+    // Safety: ptr is valid, we're just computing an offset
+    unsafe { core::ptr::addr_of_mut!((*ptr).efi.allocator) }
+}
+
+/// Access allocator state mutably through a closure.
+#[inline]
+pub fn with_allocator_mut<F, R>(f: F) -> R
+where
+    F: FnOnce(&mut MemoryAllocator) -> R,
+{
+    with_mut(|state| f(&mut state.efi.allocator))
 }

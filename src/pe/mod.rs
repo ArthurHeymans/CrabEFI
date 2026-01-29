@@ -2,6 +2,13 @@
 //!
 //! This module provides a loader for PE32+ executables (EFI applications).
 //! It supports loading, relocating, and executing UEFI applications.
+//!
+//! # Security
+//!
+//! This loader validates all bounds before accessing untrusted PE data to prevent:
+//! - Out-of-bounds reads from malformed headers
+//! - Arbitrary memory writes via crafted relocations
+//! - Integer overflows in size calculations
 
 use crate::efi::allocator::{self, AllocateType, MemoryType, PAGE_SIZE};
 use r_efi::efi::{Handle, Status, SystemTable};
@@ -21,6 +28,21 @@ const IMAGE_FILE_MACHINE_AMD64: u16 = 0x8664;
 /// Relocation types
 const IMAGE_REL_BASED_ABSOLUTE: u16 = 0;
 const IMAGE_REL_BASED_DIR64: u16 = 10;
+
+/// Data directory index for base relocations
+const IMAGE_DIRECTORY_ENTRY_BASERELOC: usize = 5;
+
+/// Size of base relocation block header
+const BASE_RELOCATION_HEADER_SIZE: usize = 8;
+
+/// Maximum reasonable image size (256 MB) to prevent DoS
+const MAX_IMAGE_SIZE: u32 = 256 * 1024 * 1024;
+
+/// Maximum number of sections (reasonable limit)
+const MAX_SECTIONS: u16 = 96;
+
+/// Maximum number of data directories
+const MAX_DATA_DIRECTORIES: u32 = 16;
 
 /// DOS Header
 #[repr(C, packed)]
@@ -138,6 +160,15 @@ pub struct LoadedImage {
     pub num_pages: u64,
 }
 
+/// Helper to safely read an unaligned value from a packed struct field
+///
+/// # Safety
+/// The pointer must be valid and point to initialized memory of type T
+#[inline]
+unsafe fn read_unaligned<T: Copy>(ptr: *const T) -> T {
+    ptr.read_unaligned()
+}
+
 /// Load a PE32+ image from memory
 ///
 /// # Arguments
@@ -146,81 +177,160 @@ pub struct LoadedImage {
 /// # Returns
 /// * `Ok(LoadedImage)` - Successfully loaded image info
 /// * `Err(Status)` - Error status
+///
+/// # Security
+/// All header fields are validated before use to prevent out-of-bounds access.
 pub fn load_image(data: &[u8]) -> Result<LoadedImage, Status> {
+    // Validate minimum size for DOS header
     if data.len() < core::mem::size_of::<DosHeader>() {
         log::error!("PE: Data too small for DOS header");
         return Err(Status::INVALID_PARAMETER);
     }
 
-    // Parse DOS header
+    // Safety: We verified data.len() >= sizeof(DosHeader)
     let dos_header = unsafe { &*(data.as_ptr() as *const DosHeader) };
 
-    let dos_magic = unsafe { core::ptr::addr_of!(dos_header.e_magic).read_unaligned() };
+    let dos_magic = unsafe { read_unaligned(core::ptr::addr_of!(dos_header.e_magic)) };
     if dos_magic != DOS_MAGIC {
         log::error!("PE: Invalid DOS magic: {:#x}", dos_magic);
         return Err(Status::INVALID_PARAMETER);
     }
 
-    let pe_offset = unsafe { core::ptr::addr_of!(dos_header.e_lfanew).read_unaligned() } as usize;
-    if pe_offset + 4 > data.len() {
-        log::error!("PE: Invalid PE offset");
+    let pe_offset = unsafe { read_unaligned(core::ptr::addr_of!(dos_header.e_lfanew)) } as usize;
+
+    // Validate PE offset doesn't overflow and points within data
+    let pe_sig_end = pe_offset.checked_add(4).ok_or_else(|| {
+        log::error!("PE: PE offset overflow");
+        Status::INVALID_PARAMETER
+    })?;
+    if pe_sig_end > data.len() {
+        log::error!("PE: Invalid PE offset: {}", pe_offset);
         return Err(Status::INVALID_PARAMETER);
     }
 
     // Check PE signature
+    // Safety: We verified pe_offset + 4 <= data.len()
     let pe_sig = unsafe { *(data.as_ptr().add(pe_offset) as *const u32) };
     if pe_sig != PE_SIGNATURE {
         log::error!("PE: Invalid PE signature: {:#x}", pe_sig);
         return Err(Status::INVALID_PARAMETER);
     }
 
-    // Parse COFF header
-    let coff_offset = pe_offset + 4;
+    // Validate COFF header fits
+    let coff_offset = pe_offset.checked_add(4).ok_or(Status::INVALID_PARAMETER)?;
+    let coff_end = coff_offset
+        .checked_add(core::mem::size_of::<CoffHeader>())
+        .ok_or(Status::INVALID_PARAMETER)?;
+    if coff_end > data.len() {
+        log::error!("PE: COFF header extends beyond data");
+        return Err(Status::INVALID_PARAMETER);
+    }
+
+    // Safety: We verified the COFF header fits within data
     let coff_header = unsafe { &*(data.as_ptr().add(coff_offset) as *const CoffHeader) };
 
-    let machine = unsafe { core::ptr::addr_of!(coff_header.machine).read_unaligned() };
+    let machine = unsafe { read_unaligned(core::ptr::addr_of!(coff_header.machine)) };
     if machine != IMAGE_FILE_MACHINE_AMD64 {
         log::error!("PE: Unsupported machine type: {:#x}", machine);
         return Err(Status::UNSUPPORTED);
     }
 
     let num_sections =
-        unsafe { core::ptr::addr_of!(coff_header.number_of_sections).read_unaligned() };
+        unsafe { read_unaligned(core::ptr::addr_of!(coff_header.number_of_sections)) };
     let opt_header_size =
-        unsafe { core::ptr::addr_of!(coff_header.size_of_optional_header).read_unaligned() };
+        unsafe { read_unaligned(core::ptr::addr_of!(coff_header.size_of_optional_header)) };
 
-    // Parse optional header
-    let opt_offset = coff_offset + core::mem::size_of::<CoffHeader>();
-    if opt_offset + (opt_header_size as usize) > data.len() {
+    // Validate section count is reasonable
+    if num_sections > MAX_SECTIONS {
+        log::error!("PE: Too many sections: {}", num_sections);
+        return Err(Status::INVALID_PARAMETER);
+    }
+
+    // Validate optional header fits
+    let opt_offset = coff_end;
+    let opt_end = opt_offset
+        .checked_add(opt_header_size as usize)
+        .ok_or(Status::INVALID_PARAMETER)?;
+    if opt_end > data.len() {
         log::error!("PE: Optional header extends beyond data");
         return Err(Status::INVALID_PARAMETER);
     }
 
+    // Validate optional header is large enough for PE32+
+    if (opt_header_size as usize) < core::mem::size_of::<OptionalHeader64>() {
+        log::error!("PE: Optional header too small for PE32+");
+        return Err(Status::INVALID_PARAMETER);
+    }
+
+    // Safety: We verified the optional header fits within data
     let opt_header = unsafe { &*(data.as_ptr().add(opt_offset) as *const OptionalHeader64) };
 
-    let magic = unsafe { core::ptr::addr_of!(opt_header.magic).read_unaligned() };
+    let magic = unsafe { read_unaligned(core::ptr::addr_of!(opt_header.magic)) };
     if magic != PE32_PLUS_MAGIC {
         log::error!("PE: Not a PE32+ image: {:#x}", magic);
         return Err(Status::UNSUPPORTED);
     }
 
-    let image_size = unsafe { core::ptr::addr_of!(opt_header.size_of_image).read_unaligned() };
-    let image_base = unsafe { core::ptr::addr_of!(opt_header.image_base).read_unaligned() };
+    let image_size = unsafe { read_unaligned(core::ptr::addr_of!(opt_header.size_of_image)) };
+    let image_base_preferred =
+        unsafe { read_unaligned(core::ptr::addr_of!(opt_header.image_base)) };
     let entry_point_rva =
-        unsafe { core::ptr::addr_of!(opt_header.address_of_entry_point).read_unaligned() };
-    let _section_alignment =
-        unsafe { core::ptr::addr_of!(opt_header.section_alignment).read_unaligned() };
+        unsafe { read_unaligned(core::ptr::addr_of!(opt_header.address_of_entry_point)) };
     let size_of_headers =
-        unsafe { core::ptr::addr_of!(opt_header.size_of_headers).read_unaligned() };
+        unsafe { read_unaligned(core::ptr::addr_of!(opt_header.size_of_headers)) };
     let num_data_dirs =
-        unsafe { core::ptr::addr_of!(opt_header.number_of_rva_and_sizes).read_unaligned() };
+        unsafe { read_unaligned(core::ptr::addr_of!(opt_header.number_of_rva_and_sizes)) };
+
+    // Validate image size is reasonable
+    if image_size == 0 || image_size > MAX_IMAGE_SIZE {
+        log::error!("PE: Invalid image size: {}", image_size);
+        return Err(Status::INVALID_PARAMETER);
+    }
+
+    // Validate entry point is within image
+    if entry_point_rva as u64 >= image_size as u64 {
+        log::error!("PE: Entry point outside image bounds");
+        return Err(Status::INVALID_PARAMETER);
+    }
+
+    // Validate headers size
+    if size_of_headers > image_size || size_of_headers as usize > data.len() {
+        log::error!("PE: Invalid headers size: {}", size_of_headers);
+        return Err(Status::INVALID_PARAMETER);
+    }
+
+    // Validate data directories count
+    if num_data_dirs > MAX_DATA_DIRECTORIES {
+        log::error!("PE: Too many data directories: {}", num_data_dirs);
+        return Err(Status::INVALID_PARAMETER);
+    }
 
     log::debug!(
         "PE: image_base={:#x}, size={:#x}, entry_rva={:#x}",
-        image_base,
+        image_base_preferred,
         image_size,
         entry_point_rva
     );
+
+    // Validate section headers fit within data
+    let sections_offset = opt_offset
+        .checked_add(opt_header_size as usize)
+        .ok_or(Status::INVALID_PARAMETER)?;
+    let section_headers_size = (num_sections as usize)
+        .checked_mul(core::mem::size_of::<SectionHeader>())
+        .ok_or(Status::INVALID_PARAMETER)?;
+    let sections_end = sections_offset
+        .checked_add(section_headers_size)
+        .ok_or(Status::INVALID_PARAMETER)?;
+    if sections_end > data.len() {
+        log::error!(
+            "PE: Section headers extend beyond data (offset={}, size={}, data_len={})",
+            sections_offset,
+            section_headers_size,
+            data.len()
+        );
+        return Err(Status::INVALID_PARAMETER);
+    }
 
     // Allocate memory for the image
     let num_pages = ((image_size as u64) + PAGE_SIZE - 1) / PAGE_SIZE;
@@ -241,11 +351,13 @@ pub fn load_image(data: &[u8]) -> Result<LoadedImage, Status> {
     log::debug!("PE: Allocated {} pages at {:#x}", num_pages, load_addr);
 
     // Zero the memory
+    // Safety: load_addr is valid and we allocated image_size bytes
     unsafe {
         core::ptr::write_bytes(load_addr as *mut u8, 0, image_size as usize);
     }
 
-    // Copy headers
+    // Copy headers (already validated size_of_headers fits in both source and dest)
+    // Safety: We validated size_of_headers <= data.len() and <= image_size
     unsafe {
         core::ptr::copy_nonoverlapping(
             data.as_ptr(),
@@ -254,8 +366,7 @@ pub fn load_image(data: &[u8]) -> Result<LoadedImage, Status> {
         );
     }
 
-    // Parse section headers and copy sections
-    let sections_offset = opt_offset + (opt_header_size as usize);
+    // Safety: We verified section headers fit within data
     let section_headers = unsafe {
         core::slice::from_raw_parts(
             data.as_ptr().add(sections_offset) as *const SectionHeader,
@@ -263,32 +374,86 @@ pub fn load_image(data: &[u8]) -> Result<LoadedImage, Status> {
         )
     };
 
-    for section in section_headers {
-        let virt_addr = unsafe { core::ptr::addr_of!(section.virtual_address).read_unaligned() };
-        let virt_size = unsafe { core::ptr::addr_of!(section.virtual_size).read_unaligned() };
+    // Copy sections with full bounds validation
+    for (i, section) in section_headers.iter().enumerate() {
+        let virt_addr = unsafe { read_unaligned(core::ptr::addr_of!(section.virtual_address)) };
+        let virt_size = unsafe { read_unaligned(core::ptr::addr_of!(section.virtual_size)) };
         let raw_data_ptr =
-            unsafe { core::ptr::addr_of!(section.pointer_to_raw_data).read_unaligned() };
+            unsafe { read_unaligned(core::ptr::addr_of!(section.pointer_to_raw_data)) };
         let raw_data_size =
-            unsafe { core::ptr::addr_of!(section.size_of_raw_data).read_unaligned() };
+            unsafe { read_unaligned(core::ptr::addr_of!(section.size_of_raw_data)) };
 
-        if raw_data_size > 0 && raw_data_ptr > 0 {
-            let src = data.as_ptr() as usize + raw_data_ptr as usize;
-            let dst = load_addr as usize + virt_addr as usize;
-            let copy_size = raw_data_size.min(virt_size) as usize;
+        if raw_data_size == 0 || raw_data_ptr == 0 {
+            continue;
+        }
 
-            if src + copy_size <= data.as_ptr() as usize + data.len() {
-                unsafe {
-                    core::ptr::copy_nonoverlapping(src as *const u8, dst as *mut u8, copy_size);
-                }
-            }
+        let copy_size = raw_data_size.min(virt_size) as usize;
+
+        // Validate source bounds
+        let src_start = raw_data_ptr as usize;
+        let src_end = src_start.checked_add(copy_size).ok_or_else(|| {
+            log::error!("PE: Section {} source offset overflow", i);
+            Status::INVALID_PARAMETER
+        })?;
+        if src_end > data.len() {
+            log::error!(
+                "PE: Section {} raw data extends beyond file (ptr={}, size={}, file_len={})",
+                i,
+                raw_data_ptr,
+                copy_size,
+                data.len()
+            );
+            continue; // Skip this section rather than fail entirely
+        }
+
+        // Validate destination bounds
+        let dst_start = virt_addr as usize;
+        let dst_end = dst_start.checked_add(copy_size).ok_or_else(|| {
+            log::error!("PE: Section {} destination offset overflow", i);
+            Status::INVALID_PARAMETER
+        })?;
+        if dst_end > image_size as usize {
+            log::error!(
+                "PE: Section {} extends beyond image (vaddr={}, size={}, image_size={})",
+                i,
+                virt_addr,
+                copy_size,
+                image_size
+            );
+            // Free allocated memory and return error
+            let _ = allocator::free_pages(load_addr, num_pages);
+            return Err(Status::INVALID_PARAMETER);
+        }
+
+        // Safety: We validated both source and destination bounds
+        unsafe {
+            let src = data.as_ptr().add(src_start);
+            let dst = (load_addr as *mut u8).add(dst_start);
+            core::ptr::copy_nonoverlapping(src, dst, copy_size);
         }
     }
 
     // Apply relocations if we loaded at a different address
-    let delta = load_addr as i64 - image_base as i64;
+    let delta = load_addr as i64 - image_base_preferred as i64;
     if delta != 0 {
-        // Get relocation data directory
-        let data_dirs_offset = opt_offset + core::mem::size_of::<OptionalHeader64>();
+        // Validate data directories fit within optional header
+        let data_dirs_offset = opt_offset
+            .checked_add(core::mem::size_of::<OptionalHeader64>())
+            .ok_or(Status::INVALID_PARAMETER)?;
+        let data_dirs_size = (num_data_dirs as usize)
+            .checked_mul(core::mem::size_of::<DataDirectory>())
+            .ok_or(Status::INVALID_PARAMETER)?;
+        let data_dirs_end = data_dirs_offset
+            .checked_add(data_dirs_size)
+            .ok_or(Status::INVALID_PARAMETER)?;
+
+        if data_dirs_end > data.len() {
+            log::error!("PE: Data directories extend beyond file");
+            let _ = allocator::free_pages(load_addr, num_pages);
+            return Err(Status::INVALID_PARAMETER);
+        }
+
+        // Safety: We verified data directories fit within data
         let data_dirs = unsafe {
             core::slice::from_raw_parts(
                 data.as_ptr().add(data_dirs_offset) as *const DataDirectory,
@@ -296,15 +461,21 @@ pub fn load_image(data: &[u8]) -> Result<LoadedImage, Status> {
             )
         };
 
-        // Relocation directory is index 5
-        if num_data_dirs > 5 {
-            let reloc_dir = &data_dirs[5];
+        // Apply relocations if the relocation directory exists
+        if num_data_dirs as usize > IMAGE_DIRECTORY_ENTRY_BASERELOC {
+            let reloc_dir = &data_dirs[IMAGE_DIRECTORY_ENTRY_BASERELOC];
             let reloc_rva =
-                unsafe { core::ptr::addr_of!(reloc_dir.virtual_address).read_unaligned() };
-            let reloc_size = unsafe { core::ptr::addr_of!(reloc_dir.size).read_unaligned() };
+                unsafe { read_unaligned(core::ptr::addr_of!(reloc_dir.virtual_address)) };
+            let reloc_size = unsafe { read_unaligned(core::ptr::addr_of!(reloc_dir.size)) };
 
             if reloc_rva > 0 && reloc_size > 0 {
-                apply_relocations(load_addr, reloc_rva, reloc_size, delta)?;
+                if let Err(e) =
+                    apply_relocations(load_addr, image_size, reloc_rva, reloc_size, delta)
+                {
+                    log::error!("PE: Failed to apply relocations");
+                    let _ = allocator::free_pages(load_addr, num_pages);
+                    return Err(e);
+                }
             }
         }
     }
@@ -325,29 +496,77 @@ pub fn load_image(data: &[u8]) -> Result<LoadedImage, Status> {
     })
 }
 
-/// Apply base relocations
+/// Apply base relocations with full bounds validation
+///
+/// # Arguments
+/// * `image_base` - Base address where image is loaded
+/// * `image_size` - Size of the loaded image
+/// * `reloc_rva` - RVA of the relocation directory
+/// * `reloc_size` - Size of the relocation directory
+/// * `delta` - Difference between preferred and actual load address
 fn apply_relocations(
     image_base: u64,
+    image_size: u32,
     reloc_rva: u32,
     reloc_size: u32,
     delta: i64,
 ) -> Result<(), Status> {
+    // Validate relocation directory is within image bounds
+    let reloc_end = reloc_rva.checked_add(reloc_size).ok_or_else(|| {
+        log::error!("PE: Relocation directory size overflow");
+        Status::INVALID_PARAMETER
+    })?;
+    if reloc_end > image_size {
+        log::error!(
+            "PE: Relocation directory extends beyond image (rva={}, size={}, image_size={})",
+            reloc_rva,
+            reloc_size,
+            image_size
+        );
+        return Err(Status::INVALID_PARAMETER);
+    }
+
     let mut offset = 0u32;
     let reloc_data = (image_base + reloc_rva as u64) as *const u8;
 
     while offset < reloc_size {
+        // Validate we can read the block header
+        let remaining = reloc_size - offset;
+        if (remaining as usize) < BASE_RELOCATION_HEADER_SIZE {
+            log::warn!("PE: Truncated relocation block header");
+            break;
+        }
+
+        // Safety: We verified there's room for the header
         let block = unsafe { &*(reloc_data.add(offset as usize) as *const BaseRelocation) };
-        let block_rva = unsafe { core::ptr::addr_of!(block.virtual_address).read_unaligned() };
-        let block_size = unsafe { core::ptr::addr_of!(block.size_of_block).read_unaligned() };
+        let block_rva = unsafe { read_unaligned(core::ptr::addr_of!(block.virtual_address)) };
+        let block_size = unsafe { read_unaligned(core::ptr::addr_of!(block.size_of_block)) };
 
         if block_size == 0 {
             break;
         }
 
-        let num_entries = (block_size as usize - 8) / 2;
+        // Validate block size is reasonable
+        if block_size < BASE_RELOCATION_HEADER_SIZE as u32 {
+            log::error!("PE: Relocation block size too small: {}", block_size);
+            return Err(Status::INVALID_PARAMETER);
+        }
+
+        if block_size > remaining {
+            log::error!(
+                "PE: Relocation block extends beyond directory (size={}, remaining={})",
+                block_size,
+                remaining
+            );
+            return Err(Status::INVALID_PARAMETER);
+        }
+
+        let num_entries = (block_size as usize - BASE_RELOCATION_HEADER_SIZE) / 2;
+
+        // Safety: We verified the block fits within the relocation directory
         let entries = unsafe {
             core::slice::from_raw_parts(
-                reloc_data.add(offset as usize + 8) as *const u16,
+                reloc_data.add(offset as usize + BASE_RELOCATION_HEADER_SIZE) as *const u16,
                 num_entries,
             )
         };
@@ -358,10 +577,32 @@ fn apply_relocations(
 
             match reloc_type {
                 IMAGE_REL_BASED_ABSOLUTE => {
-                    // Skip padding entries
+                    // Padding entry, skip
                 }
                 IMAGE_REL_BASED_DIR64 => {
-                    let addr = image_base + block_rva as u64 + reloc_offset as u64;
+                    // Calculate target address and validate it's within image bounds
+                    let target_rva = block_rva.checked_add(reloc_offset).ok_or_else(|| {
+                        log::error!("PE: Relocation target RVA overflow");
+                        Status::INVALID_PARAMETER
+                    })?;
+
+                    // Ensure the 8-byte value we're modifying is within bounds
+                    let target_end = target_rva.checked_add(8).ok_or_else(|| {
+                        log::error!("PE: Relocation target end overflow");
+                        Status::INVALID_PARAMETER
+                    })?;
+
+                    if target_end > image_size {
+                        log::error!(
+                            "PE: Relocation target outside image bounds (rva={}, image_size={})",
+                            target_rva,
+                            image_size
+                        );
+                        return Err(Status::INVALID_PARAMETER);
+                    }
+
+                    let addr = image_base + target_rva as u64;
+                    // Safety: We validated addr + 8 is within the image
                     unsafe {
                         let ptr = addr as *mut u64;
                         let value = ptr.read_unaligned();
@@ -396,6 +637,7 @@ pub fn execute_image(
 ) -> Status {
     log::info!("PE: Executing image at {:#x}", image.entry_point);
 
+    // Safety: entry_point was validated to be within the image during load_image
     let entry: EfiEntryPoint = unsafe { core::mem::transmute(image.entry_point) };
 
     // Call the entry point

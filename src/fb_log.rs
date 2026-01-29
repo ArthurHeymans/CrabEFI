@@ -8,7 +8,7 @@ use log::Level;
 use spin::Mutex;
 
 use crate::coreboot::FramebufferInfo;
-use crate::framebuffer_console::{Color, CHAR_HEIGHT, CHAR_WIDTH, VGA_FONT_8X16};
+use crate::framebuffer_console::{CHAR_HEIGHT, CHAR_WIDTH, Color, VGA_FONT_8X16};
 
 /// Global framebuffer info for logging
 static FB_INFO: Mutex<Option<FramebufferInfo>> = Mutex::new(None);

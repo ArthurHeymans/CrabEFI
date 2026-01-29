@@ -7,7 +7,7 @@ use crate::drivers::pci::{self, PciDevice};
 use crate::efi;
 use crate::time::Timeout;
 use core::ptr;
-use core::sync::atomic::{fence, Ordering};
+use core::sync::atomic::{Ordering, fence};
 
 use spin::Mutex;
 
