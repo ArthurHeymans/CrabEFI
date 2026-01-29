@@ -147,22 +147,16 @@ impl DirectoryEntry {
         let mut s = heapless::String::new();
 
         // Add name part
-        for &c in &self.name {
-            if c == 0x20 {
-                break;
-            }
+        self.name.iter().take_while(|&&c| c != 0x20).for_each(|&c| {
             let _ = s.push(c as char);
-        }
+        });
 
         // Check if there's an extension
         if self.ext[0] != 0x20 {
             let _ = s.push('.');
-            for &c in &self.ext {
-                if c == 0x20 {
-                    break;
-                }
+            self.ext.iter().take_while(|&&c| c != 0x20).for_each(|&c| {
                 let _ = s.push(c as char);
-            }
+            });
         }
 
         s
@@ -495,18 +489,17 @@ impl<'a, R: SectorRead> FatFilesystem<'a, R> {
         }
 
         let start_sector = self.cluster_to_sector(cluster);
+        let bytes_per_sector = self.bytes_per_sector as usize;
 
-        for i in 0..self.sectors_per_cluster {
-            let offset = i as usize * self.bytes_per_sector as usize;
+        (0..self.sectors_per_cluster).try_for_each(|i| {
+            let offset = i as usize * bytes_per_sector;
             self.reader
                 .read_sector(
                     start_sector + i as u64,
-                    &mut buffer[offset..offset + self.bytes_per_sector as usize],
+                    &mut buffer[offset..offset + bytes_per_sector],
                 )
-                .map_err(|_| FatError::ReadError)?;
-        }
-
-        Ok(())
+                .map_err(|_| FatError::ReadError)
+        })
     }
 
     /// Find a file by path

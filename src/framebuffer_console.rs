@@ -327,17 +327,13 @@ impl<'a> FramebufferConsole<'a> {
         };
 
         self.set_position(col, row);
-        for c in s.chars() {
-            self.put_char(c);
-        }
+        s.chars().for_each(|c| self.put_char(c));
     }
 }
 
 impl<'a> Write for FramebufferConsole<'a> {
     fn write_str(&mut self, s: &str) -> fmt::Result {
-        for c in s.chars() {
-            self.put_char(c);
-        }
+        s.chars().for_each(|c| self.put_char(c));
         Ok(())
     }
 }

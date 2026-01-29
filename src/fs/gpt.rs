@@ -126,18 +126,14 @@ impl GptPartitionEntry {
         let ptr = self as *const Self as *const u8;
         // Name field is at offset 56 (16+16+8+8+8)
         let name_ptr = unsafe { ptr.add(56) as *const u16 };
-        for i in 0..36 {
-            let c = unsafe { core::ptr::read_unaligned(name_ptr.add(i)) };
-            if c == 0 {
-                break;
-            }
-            // Convert UTF-16LE to ASCII (simple conversion)
-            if c < 128 {
-                let _ = s.push(c as u8 as char);
-            } else {
-                let _ = s.push('?');
-            }
-        }
+
+        (0..36)
+            .map(|i| unsafe { core::ptr::read_unaligned(name_ptr.add(i)) })
+            .take_while(|&c| c != 0)
+            .for_each(|c| {
+                // Convert UTF-16LE to ASCII (simple conversion)
+                let _ = s.push(if c < 128 { c as u8 as char } else { '?' });
+            });
         s
     }
 }
@@ -349,19 +345,19 @@ pub fn find_esp<R: SectorRead>(reader: &mut R) -> Result<Partition, GptError> {
     let header = read_gpt_header(reader)?;
     let partitions = read_partitions(reader, &header)?;
 
-    for partition in partitions {
-        if partition.is_esp {
+    partitions
+        .into_iter()
+        .find(|partition| partition.is_esp)
+        .map(|partition| {
             log::info!(
                 "Found EFI System Partition: LBA {}-{} ({} MB)",
                 partition.first_lba,
                 partition.last_lba,
                 partition.size_bytes() / (1024 * 1024)
             );
-            return Ok(partition);
-        }
-    }
-
-    Err(GptError::NoEsp)
+            partition
+        })
+        .ok_or(GptError::NoEsp)
 }
 
 /// Find ESP on an NVMe controller

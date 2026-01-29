@@ -8,7 +8,7 @@ use r_efi::efi::{
     self, CapsuleHeader, Guid, ResetType, Status, TableHeader, Time, TimeCapabilities,
 };
 
-use crate::state::{self, MAX_VARIABLES, MAX_VARIABLE_DATA_SIZE, MAX_VARIABLE_NAME_LEN};
+use crate::state::{self, MAX_VARIABLE_DATA_SIZE, MAX_VARIABLE_NAME_LEN, MAX_VARIABLES};
 
 /// Runtime Services signature "RUNTSERV"
 const EFI_RUNTIME_SERVICES_SIGNATURE: u64 = 0x56524553544E5552;

@@ -304,25 +304,22 @@ impl MemoryAllocator {
         let end = addr + size;
 
         // Find the entry containing this region (any memory type)
-        let mut found_idx = None;
-        for (idx, entry) in self.entries.iter().enumerate() {
-            if entry.physical_start <= addr && entry.end() >= end {
-                found_idx = Some(idx);
-                break;
-            }
-        }
+        let found_idx = self
+            .entries
+            .iter()
+            .position(|entry| entry.physical_start <= addr && entry.end() >= end);
 
         let idx = match found_idx {
             Some(i) => i,
             None => {
                 // Region not found - check if it overlaps with any existing region
-                for entry in self.entries.iter() {
-                    let entry_end = entry.end();
-                    // Check for overlap
-                    if addr < entry_end && end > entry.physical_start {
-                        // Overlaps - this is complex, skip for now
-                        return Err(efi::Status::INVALID_PARAMETER);
-                    }
+                if self
+                    .entries
+                    .iter()
+                    .any(|entry| addr < entry.end() && end > entry.physical_start)
+                {
+                    // Overlaps - this is complex, skip for now
+                    return Err(efi::Status::INVALID_PARAMETER);
                 }
                 // No overlap, we can add it as a new region
                 let desc = MemoryDescriptor::new(
@@ -475,18 +472,13 @@ impl MemoryAllocator {
         }
 
         // Find the entry containing this allocation
-        let mut found_idx = None;
-        for (idx, entry) in self.entries.iter().enumerate() {
-            if entry.physical_start == memory && entry.number_of_pages == num_pages {
-                // Check if this is a type that can be freed
-                if let Some(mem_type) = entry.get_memory_type() {
-                    if mem_type.is_boot_services() || mem_type == MemoryType::ConventionalMemory {
-                        found_idx = Some(idx);
-                        break;
-                    }
-                }
-            }
-        }
+        let found_idx = self.entries.iter().position(|entry| {
+            entry.physical_start == memory
+                && entry.number_of_pages == num_pages
+                && entry
+                    .get_memory_type()
+                    .is_some_and(|mt| mt.is_boot_services() || mt == MemoryType::ConventionalMemory)
+        });
 
         if let Some(idx) = found_idx {
             // Change the type back to conventional memory
@@ -521,11 +513,8 @@ impl MemoryAllocator {
                 return efi::Status::BUFFER_TOO_SMALL;
             }
 
-            for (i, entry) in self.entries.iter().enumerate() {
-                if i < map.len() {
-                    map[i] = *entry;
-                }
-            }
+            let copy_len = self.entries.len().min(map.len());
+            map[..copy_len].copy_from_slice(&self.entries[..copy_len]);
 
             *memory_map_size = required_size;
             efi::Status::SUCCESS
@@ -651,17 +640,11 @@ impl MemoryAllocator {
     fn is_region_free(&self, start: u64, size: u64) -> bool {
         let end = start + size;
 
-        for entry in self.entries.iter() {
-            if entry.get_memory_type() != Some(MemoryType::ConventionalMemory) {
-                continue;
-            }
-
-            if entry.physical_start <= start && entry.end() >= end {
-                return true;
-            }
-        }
-
-        false
+        self.entries.iter().any(|entry| {
+            entry.get_memory_type() == Some(MemoryType::ConventionalMemory)
+                && entry.physical_start <= start
+                && entry.end() >= end
+        })
     }
 
     /// Carve out a region from conventional memory and mark it as a new type
@@ -675,16 +658,11 @@ impl MemoryAllocator {
         let end = addr + size;
 
         // Find the entry containing this region
-        let mut found_idx = None;
-        for (idx, entry) in self.entries.iter().enumerate() {
-            if entry.get_memory_type() == Some(MemoryType::ConventionalMemory)
+        let found_idx = self.entries.iter().position(|entry| {
+            entry.get_memory_type() == Some(MemoryType::ConventionalMemory)
                 && entry.physical_start <= addr
                 && entry.end() >= end
-            {
-                found_idx = Some(idx);
-                break;
-            }
-        }
+        });
 
         let idx = found_idx.ok_or(efi::Status::NOT_FOUND)?;
         let entry = self.entries[idx];
@@ -853,12 +831,11 @@ pub fn get_map_key() -> usize {
 /// or None if the address is not in any known region.
 pub fn get_memory_type_at(address: u64) -> Option<MemoryType> {
     let alloc = state::allocator();
-    for entry in alloc.entries.iter() {
-        if address >= entry.physical_start && address < entry.end() {
-            return MemoryType::from_u32(entry.memory_type);
-        }
-    }
-    None
+    alloc
+        .entries
+        .iter()
+        .find(|entry| address >= entry.physical_start && address < entry.end())
+        .and_then(|entry| MemoryType::from_u32(entry.memory_type))
 }
 
 /// Get the memory map

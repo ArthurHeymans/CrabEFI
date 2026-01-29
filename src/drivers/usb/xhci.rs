@@ -6,9 +6,9 @@ use crate::drivers::pci::{self, PciAddress, PciDevice};
 use crate::efi;
 use crate::time::Timeout;
 use core::ptr;
-use core::sync::atomic::{fence, Ordering};
+use core::sync::atomic::{Ordering, fence};
 
-use super::controller::{desc_type, parse_configuration, req_type, request, DeviceDescriptor};
+use super::controller::{DeviceDescriptor, desc_type, parse_configuration, req_type, request};
 
 /// xHCI Capability Registers
 #[allow(dead_code)]
@@ -1511,14 +1511,11 @@ impl XhciController {
 
     /// Find a mass storage device
     pub fn find_mass_storage(&self) -> Option<u8> {
-        for (slot_id, slot) in self.slots.iter().enumerate() {
-            if let Some(s) = slot {
-                if s.is_mass_storage {
-                    return Some(slot_id as u8);
-                }
-            }
-        }
-        None
+        self.slots.iter().enumerate().find_map(|(slot_id, slot)| {
+            slot.as_ref()
+                .filter(|s| s.is_mass_storage)
+                .map(|_| slot_id as u8)
+        })
     }
 
     /// Get slot info

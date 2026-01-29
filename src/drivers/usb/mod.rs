@@ -309,15 +309,10 @@ pub fn controller_count() -> usize {
 pub fn find_mass_storage() -> Option<(usize, u8)> {
     let controllers = ALL_CONTROLLERS.lock();
 
-    for (idx, handle) in controllers.iter().enumerate() {
+    controllers.iter().enumerate().find_map(|(idx, handle)| {
         let device = with_usb_controller!(handle, |controller| controller.find_mass_storage());
-
-        if let Some(addr) = device {
-            return Some((idx, addr));
-        }
-    }
-
-    None
+        device.map(|addr| (idx, addr))
+    })
 }
 
 /// Poll USB keyboards
@@ -457,14 +452,11 @@ impl UsbController for XhciController {
 
     fn find_hid_keyboard(&self) -> Option<u8> {
         // Check all slots for HID keyboard devices
-        for slot_id in 0..4u8 {
-            if let Some(slot) = self.get_slot(slot_id) {
-                if slot.is_hid_keyboard {
-                    return Some(slot_id);
-                }
-            }
-        }
-        None
+        (0..4u8).find(|&slot_id| {
+            self.get_slot(slot_id)
+                .map(|slot| slot.is_hid_keyboard)
+                .unwrap_or(false)
+        })
     }
 
     fn get_device_info(&self, device: u8) -> Option<self::controller::DeviceInfo> {

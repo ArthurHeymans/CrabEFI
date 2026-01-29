@@ -11,11 +11,11 @@ use crate::drivers::pci::{self, PciAddress, PciDevice};
 use crate::efi;
 use crate::time::Timeout;
 use core::ptr;
-use core::sync::atomic::{fence, Ordering};
+use core::sync::atomic::{Ordering, fence};
 
 use super::controller::{
-    desc_type, parse_configuration, req_type, request, DeviceDescriptor, DeviceInfo, EndpointInfo,
-    UsbController, UsbDevice, UsbError, UsbSpeed,
+    DeviceDescriptor, DeviceInfo, EndpointInfo, UsbController, UsbDevice, UsbError, UsbSpeed,
+    desc_type, parse_configuration, req_type, request,
 };
 
 // ============================================================================

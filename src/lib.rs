@@ -50,6 +50,20 @@ fn panic(info: &PanicInfo) -> ! {
     }
 }
 
+/// Sort partition candidates by size (smallest first)
+///
+/// Uses bubble sort since heapless::Vec doesn't have sort methods.
+/// Smaller partitions are tried first as they're more likely to be EFI boot partitions.
+fn sort_partitions_by_size(partitions: &mut heapless::Vec<(u32, fs::gpt::Partition), 8>) {
+    for i in 0..partitions.len() {
+        for j in (i + 1)..partitions.len() {
+            if partitions[j].1.size_bytes() < partitions[i].1.size_bytes() {
+                partitions.swap(i, j);
+            }
+        }
+    }
+}
+
 /// Initialize the CrabEFI firmware
 ///
 /// This is called from the entry point after switching to 64-bit mode.
@@ -593,23 +607,13 @@ fn install_block_io_for_disk<R: fs::gpt::SectorRead>(
     }
 
     // No proper ESP found - try candidate partitions (smaller ones first, as they're more likely EFI)
-    // Sort candidates by size (smallest first) - bubble sort since heapless doesn't have sort
-    for i in 0..candidate_partitions.len() {
-        for j in (i + 1)..candidate_partitions.len() {
-            if candidate_partitions[j].1.size_bytes() < candidate_partitions[i].1.size_bytes() {
-                let tmp = candidate_partitions[i].clone();
-                candidate_partitions[i] = candidate_partitions[j].clone();
-                candidate_partitions[j] = tmp;
-            }
-        }
-    }
+    sort_partitions_by_size(&mut candidate_partitions);
 
-    for (partition_num, partition) in candidate_partitions.iter() {
+    if let Some((partition_num, partition)) = candidate_partitions.first() {
         log::debug!(
             "Trying partition {} as potential ESP (no proper ESP found)",
             partition_num
         );
-        // Return the first candidate - the caller will try to mount it as FAT
         return Some((*partition_num, partition.clone()));
     }
 
@@ -782,17 +786,9 @@ fn install_block_io_for_nvme_disk<R: fs::gpt::SectorRead>(
     }
 
     // No proper ESP found - try candidate partitions (smaller ones first)
-    for i in 0..candidate_partitions.len() {
-        for j in (i + 1)..candidate_partitions.len() {
-            if candidate_partitions[j].1.size_bytes() < candidate_partitions[i].1.size_bytes() {
-                let tmp = candidate_partitions[i].clone();
-                candidate_partitions[i] = candidate_partitions[j].clone();
-                candidate_partitions[j] = tmp;
-            }
-        }
-    }
+    sort_partitions_by_size(&mut candidate_partitions);
 
-    for (partition_num, partition) in candidate_partitions.iter() {
+    if let Some((partition_num, partition)) = candidate_partitions.first() {
         log::debug!(
             "Trying NVMe partition {} as potential ESP (no proper ESP found)",
             partition_num
@@ -969,17 +965,9 @@ fn install_block_io_for_ahci_disk<R: fs::gpt::SectorRead>(
     }
 
     // No proper ESP found - try candidate partitions (smaller ones first)
-    for i in 0..candidate_partitions.len() {
-        for j in (i + 1)..candidate_partitions.len() {
-            if candidate_partitions[j].1.size_bytes() < candidate_partitions[i].1.size_bytes() {
-                let tmp = candidate_partitions[i].clone();
-                candidate_partitions[i] = candidate_partitions[j].clone();
-                candidate_partitions[j] = tmp;
-            }
-        }
-    }
+    sort_partitions_by_size(&mut candidate_partitions);
 
-    for (partition_num, partition) in candidate_partitions.iter() {
+    if let Some((partition_num, partition)) = candidate_partitions.first() {
         log::debug!(
             "Trying AHCI partition {} as potential ESP (no proper ESP found)",
             partition_num
@@ -1627,9 +1615,9 @@ fn load_and_execute_bootloader<R: fs::gpt::SectorRead>(
     file_size: u32,
     device_handle: r_efi::efi::Handle,
 ) -> Result<(), r_efi::efi::Status> {
-    use efi::allocator::{allocate_pool, free_pool, MemoryType};
+    use efi::allocator::{MemoryType, allocate_pool, free_pool};
     use efi::boot_services;
-    use efi::protocols::loaded_image::{create_loaded_image_protocol, LOADED_IMAGE_PROTOCOL_GUID};
+    use efi::protocols::loaded_image::{LOADED_IMAGE_PROTOCOL_GUID, create_loaded_image_protocol};
     use r_efi::efi::Status;
 
     log::info!("Loading bootloader: {} ({} bytes)", path, file_size);

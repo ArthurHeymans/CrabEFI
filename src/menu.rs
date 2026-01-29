@@ -15,10 +15,10 @@ use crate::coreboot;
 use crate::drivers::keyboard;
 use crate::drivers::serial as serial_driver;
 use crate::framebuffer_console::{
-    Color, FramebufferConsole, DEFAULT_BG, DEFAULT_FG, HIGHLIGHT_BG, HIGHLIGHT_FG, TITLE_COLOR,
+    Color, DEFAULT_BG, DEFAULT_FG, FramebufferConsole, HIGHLIGHT_BG, HIGHLIGHT_FG, TITLE_COLOR,
 };
 use crate::fs::{fat::FatFilesystem, gpt};
-use crate::time::{delay_ms, Timeout};
+use crate::time::{Timeout, delay_ms};
 use core::fmt::Write;
 use heapless::{String, Vec};
 
@@ -322,7 +322,7 @@ fn discover_ahci_entries(menu: &mut BootMenu) {
 
 /// Discover boot entries from USB devices (all controller types)
 fn discover_usb_entries(menu: &mut BootMenu) {
-    use crate::drivers::usb::{self, mass_storage, UsbMassStorage};
+    use crate::drivers::usb::{self, UsbMassStorage, mass_storage};
 
     // Check if we have any mass storage on any controller
     if let Some((controller_id, device_addr)) = usb::find_mass_storage() {
@@ -598,9 +598,7 @@ fn draw_header(fb_console: &mut Option<FramebufferConsole>, cols: usize) {
     // Build horizontal line
     let mut line = [0u8; 128];
     let line_len = cols.min(line.len());
-    for byte in line[..line_len].iter_mut() {
-        *byte = b'=';
-    }
+    line[..line_len].fill(b'=');
     let line_str = core::str::from_utf8(&line[..line_len]).unwrap_or("");
 
     // Serial output

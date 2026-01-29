@@ -9,12 +9,12 @@
 //! centralized `FirmwareState` structure. Access it via `crate::state::efi_mut()`.
 
 use super::allocator::{self, AllocateType, MemoryDescriptor, MemoryType};
-use super::protocols::loaded_image::{create_loaded_image_protocol, LOADED_IMAGE_PROTOCOL_GUID};
+use super::protocols::loaded_image::{LOADED_IMAGE_PROTOCOL_GUID, create_loaded_image_protocol};
 use super::system_table;
 use crate::pe;
 use crate::state::{
-    self, EventEntry, LoadedImageEntry, ProtocolEntry, MAX_EVENTS, MAX_HANDLES,
-    MAX_PROTOCOLS_PER_HANDLE,
+    self, EventEntry, LoadedImageEntry, MAX_EVENTS, MAX_HANDLES, MAX_PROTOCOLS_PER_HANDLE,
+    ProtocolEntry,
 };
 use core::ffi::c_void;
 use r_efi::efi::{self, Boolean, Guid, Handle, Status, SystemTable, TableHeader, Tpl};
@@ -525,25 +525,26 @@ extern "efiapi" fn install_protocol_interface(
     }
 
     // Find existing handle
-    for i in 0..efi_state.handle_count {
-        if efi_state.handles[i].handle == handle_ptr {
-            // Check if protocol already installed
-            for j in 0..efi_state.handles[i].protocol_count {
-                if guid_eq(&efi_state.handles[i].protocols[j].guid, &guid) {
-                    return Status::INVALID_PARAMETER; // Protocol already installed
-                }
-            }
-
-            // Add new protocol
-            if efi_state.handles[i].protocol_count >= MAX_PROTOCOLS_PER_HANDLE {
-                return Status::OUT_OF_RESOURCES;
-            }
-
-            let proto_idx = efi_state.handles[i].protocol_count;
-            efi_state.handles[i].protocols[proto_idx] = ProtocolEntry { guid, interface };
-            efi_state.handles[i].protocol_count += 1;
-            return Status::SUCCESS;
+    if let Some(entry) = efi_state.handles[..efi_state.handle_count]
+        .iter_mut()
+        .find(|e| e.handle == handle_ptr)
+    {
+        // Check if protocol already installed
+        if entry.protocols[..entry.protocol_count]
+            .iter()
+            .any(|p| guid_eq(&p.guid, &guid))
+        {
+            return Status::INVALID_PARAMETER; // Protocol already installed
         }
+
+        // Add new protocol
+        if entry.protocol_count >= MAX_PROTOCOLS_PER_HANDLE {
+            return Status::OUT_OF_RESOURCES;
+        }
+
+        entry.protocols[entry.protocol_count] = ProtocolEntry { guid, interface };
+        entry.protocol_count += 1;
+        return Status::SUCCESS;
     }
 
     Status::INVALID_PARAMETER
@@ -648,16 +649,16 @@ extern "efiapi" fn locate_handle(
     let guid = unsafe { *protocol };
     let efi_state = state::efi();
 
-    // Count matching handles
-    let mut matching: heapless::Vec<Handle, MAX_HANDLES> = heapless::Vec::new();
-    for i in 0..efi_state.handle_count {
-        for j in 0..efi_state.handles[i].protocol_count {
-            if guid_eq(&efi_state.handles[i].protocols[j].guid, &guid) {
-                let _ = matching.push(efi_state.handles[i].handle);
-                break;
-            }
-        }
-    }
+    // Collect matching handles
+    let matching: heapless::Vec<Handle, MAX_HANDLES> = efi_state.handles[..efi_state.handle_count]
+        .iter()
+        .filter(|entry| {
+            entry.protocols[..entry.protocol_count]
+                .iter()
+                .any(|p| guid_eq(&p.guid, &guid))
+        })
+        .map(|entry| entry.handle)
+        .collect();
 
     let required_size = matching.len() * core::mem::size_of::<Handle>();
 
@@ -875,23 +876,25 @@ extern "efiapi" fn load_image(
     // Store the loaded image info so StartImage can find it
     {
         let efi_state = state::efi_mut();
-        let mut stored = false;
-        for entry in efi_state.loaded_images.iter_mut() {
-            if entry.handle.is_null() {
+        let slot = efi_state
+            .loaded_images
+            .iter_mut()
+            .find(|entry| entry.handle.is_null());
+
+        match slot {
+            Some(entry) => {
                 entry.handle = new_handle;
                 entry.image_base = loaded_image.image_base;
                 entry.image_size = loaded_image.image_size;
                 entry.entry_point = loaded_image.entry_point;
                 entry.num_pages = loaded_image.num_pages;
                 entry.parent_handle = parent_image_handle;
-                stored = true;
-                break;
             }
-        }
-        if !stored {
-            log::error!("BS.LoadImage: No space in loaded images table");
-            pe::unload_image(&loaded_image);
-            return Status::OUT_OF_RESOURCES;
+            None => {
+                log::error!("BS.LoadImage: No space in loaded images table");
+                pe::unload_image(&loaded_image);
+                return Status::OUT_OF_RESOURCES;
+            }
         }
     }
 
@@ -918,20 +921,24 @@ fn get_device_handle_from_parent(parent_handle: Handle) -> Handle {
 
     // Try to get the LoadedImageProtocol from the parent
     let efi_state = state::efi();
-    for entry in efi_state.handles.iter() {
-        if entry.handle == parent_handle {
-            for proto in &entry.protocols[..entry.protocol_count] {
-                if proto.guid == LOADED_IMAGE_PROTOCOL_GUID && !proto.interface.is_null() {
+    efi_state
+        .handles
+        .iter()
+        .find(|entry| entry.handle == parent_handle)
+        .and_then(|entry| {
+            entry.protocols[..entry.protocol_count]
+                .iter()
+                .find(|proto| {
+                    proto.guid == LOADED_IMAGE_PROTOCOL_GUID && !proto.interface.is_null()
+                })
+                .map(|proto| {
                     let loaded_image = unsafe {
                         &*(proto.interface as *const r_efi::protocols::loaded_image::Protocol)
                     };
-                    return loaded_image.device_handle;
-                }
-            }
-            break;
-        }
-    }
-    core::ptr::null_mut()
+                    loaded_image.device_handle
+                })
+        })
+        .unwrap_or(core::ptr::null_mut())
 }
 
 extern "efiapi" fn start_image(
@@ -949,14 +956,12 @@ extern "efiapi" fn start_image(
     // Find the loaded image entry
     let (entry_point, image_base) = {
         let efi_state = state::efi();
-        let mut found = None;
-        for entry in efi_state.loaded_images.iter() {
-            if entry.handle == image_handle {
-                found = Some((entry.entry_point, entry.image_base));
-                break;
-            }
-        }
-        match found {
+        match efi_state
+            .loaded_images
+            .iter()
+            .find(|entry| entry.handle == image_handle)
+            .map(|entry| (entry.entry_point, entry.image_base))
+        {
             Some(info) => info,
             None => {
                 log::error!(
@@ -1031,16 +1036,16 @@ extern "efiapi" fn unload_image(image_handle: Handle) -> Status {
     // Find and remove the loaded image entry
     let image_info = {
         let efi_state = state::efi_mut();
-        let mut found = None;
-        for entry in efi_state.loaded_images.iter_mut() {
-            if entry.handle == image_handle {
-                found = Some((entry.image_base, entry.num_pages));
+        efi_state
+            .loaded_images
+            .iter_mut()
+            .find(|entry| entry.handle == image_handle)
+            .map(|entry| {
+                let result = (entry.image_base, entry.num_pages);
                 // Clear the entry
                 *entry = LoadedImageEntry::empty();
-                break;
-            }
-        }
-        found
+                result
+            })
     };
 
     match image_info {
@@ -1342,15 +1347,15 @@ extern "efiapi" fn locate_protocol(
     let efi_state = state::efi();
 
     // Find first handle with this protocol
-    for i in 0..efi_state.handle_count {
-        for j in 0..efi_state.handles[i].protocol_count {
-            if guid_eq(&efi_state.handles[i].protocols[j].guid, &guid) {
-                let iface = efi_state.handles[i].protocols[j].interface;
-                unsafe { *interface = iface };
-                log::trace!("  -> SUCCESS (interface={:p})", iface);
-                return Status::SUCCESS;
-            }
-        }
+    let found = efi_state.handles[..efi_state.handle_count]
+        .iter()
+        .flat_map(|entry| entry.protocols[..entry.protocol_count].iter())
+        .find(|proto| guid_eq(&proto.guid, &guid));
+
+    if let Some(proto) = found {
+        unsafe { *interface = proto.interface };
+        log::trace!("  -> SUCCESS (interface={:p})", proto.interface);
+        return Status::SUCCESS;
     }
 
     log::trace!("  -> NOT_FOUND");
@@ -1381,13 +1386,10 @@ extern "efiapi" fn install_multiple_protocol_interfaces(
     let args = [(arg1, arg2), (arg3, arg4), (arg5, arg6), (arg7, arg8)];
 
     // Count how many valid protocol pairs we have (until NULL GUID)
-    let mut pair_count = 0;
-    for (guid_ptr, _iface_ptr) in &args {
-        if guid_ptr.is_null() {
-            break;
-        }
-        pair_count += 1;
-    }
+    let pair_count = args
+        .iter()
+        .take_while(|(guid_ptr, _)| !guid_ptr.is_null())
+        .count();
 
     log::debug!(
         "BS.InstallMultipleProtocolInterfaces(handle={:?}, {} protocols)",
@@ -1469,31 +1471,24 @@ extern "efiapi" fn uninstall_multiple_protocol_interfaces(
     let args = [(arg1, arg2), (arg3, arg4), (arg5, arg6), (arg7, arg8)];
 
     // Uninstall each protocol
-    for (guid_ptr, _iface_ptr) in &args {
-        if guid_ptr.is_null() {
-            break;
-        }
-
+    for (guid_ptr, _) in args.iter().take_while(|(g, _)| !g.is_null()) {
         let guid = unsafe { *(*guid_ptr as *const Guid) };
         log::debug!("  Uninstalling protocol: {}", GuidFmt(guid));
 
         // Find and remove the protocol from the handle
         let efi_state = state::efi_mut();
 
-        for i in 0..efi_state.handle_count {
-            if efi_state.handles[i].handle == handle {
-                for j in 0..efi_state.handles[i].protocol_count {
-                    if guid_eq(&efi_state.handles[i].protocols[j].guid, &guid) {
-                        // Remove by shifting remaining protocols down
-                        for k in j..efi_state.handles[i].protocol_count - 1 {
-                            efi_state.handles[i].protocols[k] =
-                                efi_state.handles[i].protocols[k + 1];
-                        }
-                        efi_state.handles[i].protocol_count -= 1;
-                        break;
-                    }
-                }
-                break;
+        if let Some(entry) = efi_state.handles[..efi_state.handle_count]
+            .iter_mut()
+            .find(|e| e.handle == handle)
+        {
+            if let Some(j) = entry.protocols[..entry.protocol_count]
+                .iter()
+                .position(|p| guid_eq(&p.guid, &guid))
+            {
+                // Remove by shifting remaining protocols down
+                entry.protocols.copy_within(j + 1..entry.protocol_count, j);
+                entry.protocol_count -= 1;
             }
         }
     }
@@ -1556,11 +1551,22 @@ impl core::fmt::Display for GuidFmt {
             write!(
                 f,
                 "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
-                bytes[3], bytes[2], bytes[1], bytes[0], // Data1 (LE)
-                bytes[5], bytes[4],                     // Data2 (LE)
-                bytes[7], bytes[6],                     // Data3 (LE)
-                bytes[8], bytes[9],                     // Data4[0-1]
-                bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15]
+                bytes[3],
+                bytes[2],
+                bytes[1],
+                bytes[0], // Data1 (LE)
+                bytes[5],
+                bytes[4], // Data2 (LE)
+                bytes[7],
+                bytes[6], // Data3 (LE)
+                bytes[8],
+                bytes[9], // Data4[0-1]
+                bytes[10],
+                bytes[11],
+                bytes[12],
+                bytes[13],
+                bytes[14],
+                bytes[15]
             )
         }
     }
@@ -1568,328 +1574,323 @@ impl core::fmt::Display for GuidFmt {
 
 /// Format a GUID for logging with well-known names
 fn format_guid(guid: &Guid) -> &'static str {
-    // Well-known GUIDs
-    const LOADED_IMAGE_GUID: Guid = Guid::from_fields(
-        0x5B1B31A1,
-        0x9562,
-        0x11d2,
-        0x8E,
-        0x3F,
-        &[0x00, 0xA0, 0xC9, 0x69, 0x72, 0x3B],
-    );
-    const DEVICE_PATH_GUID: Guid = Guid::from_fields(
-        0x09576e91,
-        0x6d3f,
-        0x11d2,
-        0x8e,
-        0x39,
-        &[0x00, 0xa0, 0xc9, 0x69, 0x72, 0x3b],
-    );
-    const SIMPLE_FILE_SYSTEM_GUID: Guid = Guid::from_fields(
-        0x0964e5b22,
-        0x6459,
-        0x11d2,
-        0x8e,
-        0x39,
-        &[0x00, 0xa0, 0xc9, 0x69, 0x72, 0x3b],
-    );
-    const GOP_GUID: Guid = Guid::from_fields(
-        0x9042a9de,
-        0x23dc,
-        0x4a38,
-        0x96,
-        0xfb,
-        &[0x7a, 0xde, 0xd0, 0x80, 0x51, 0x6a],
-    );
-    const SIMPLE_TEXT_INPUT_GUID: Guid = Guid::from_fields(
-        0x387477c1,
-        0x69c7,
-        0x11d2,
-        0x8e,
-        0x39,
-        &[0x00, 0xa0, 0xc9, 0x69, 0x72, 0x3b],
-    );
-    const SIMPLE_TEXT_OUTPUT_GUID: Guid = Guid::from_fields(
-        0x387477c2,
-        0x69c7,
-        0x11d2,
-        0x8e,
-        0x39,
-        &[0x00, 0xa0, 0xc9, 0x69, 0x72, 0x3b],
-    );
-    const BLOCK_IO_GUID: Guid = Guid::from_fields(
-        0x964e5b21,
-        0x6459,
-        0x11d2,
-        0x8e,
-        0x39,
-        &[0x00, 0xa0, 0xc9, 0x69, 0x72, 0x3b],
-    );
-    const DISK_IO_GUID: Guid = Guid::from_fields(
-        0xCE345171,
-        0xBA0B,
-        0x11d2,
-        0x8e,
-        0x4F,
-        &[0x00, 0xa0, 0xc9, 0x69, 0x72, 0x3b],
-    );
-    const ACPI_TABLE_GUID: Guid = Guid::from_fields(
-        0xeb9d2d30,
-        0x2d88,
-        0x11d3,
-        0x9a,
-        0x16,
-        &[0x00, 0x90, 0x27, 0x3f, 0xc1, 0x4d],
-    );
-    const SMBIOS_TABLE_GUID: Guid = Guid::from_fields(
-        0xeb9d2d31,
-        0x2d88,
-        0x11d3,
-        0x9a,
-        0x16,
-        &[0x00, 0x90, 0x27, 0x3f, 0xc1, 0x4d],
-    );
-    const LOAD_FILE_GUID: Guid = Guid::from_fields(
-        0x56EC3091,
-        0x954C,
-        0x11d2,
-        0x8e,
-        0x3f,
-        &[0x00, 0xa0, 0xc9, 0x69, 0x72, 0x3b],
-    );
-    const LOAD_FILE2_GUID: Guid = Guid::from_fields(
-        0x4006c0c1,
-        0xfcb3,
-        0x403e,
-        0x99,
-        0x6d,
-        &[0x4a, 0x6c, 0x87, 0x24, 0xe0, 0x6d],
-    );
-    const SERIAL_IO_GUID: Guid = Guid::from_fields(
-        0xBB25CF6F,
-        0xF1D4,
-        0x11D2,
-        0x9a,
-        0x0c,
-        &[0x00, 0x90, 0x27, 0x3f, 0xc1, 0xfd],
-    );
-    const PXE_BASE_CODE_GUID: Guid = Guid::from_fields(
-        0x03C4E603,
-        0xAC28,
-        0x11d3,
-        0x9a,
-        0x2d,
-        &[0x00, 0x90, 0x27, 0x3f, 0xc1, 0x4d],
-    );
-    const HII_DATABASE_GUID: Guid = Guid::from_fields(
-        0xef9fc172,
-        0xa1b2,
-        0x4693,
-        0xb3,
-        0x27,
-        &[0x6d, 0x32, 0xfc, 0x41, 0x60, 0x42],
-    );
-    const HII_CONFIG_ROUTING_GUID: Guid = Guid::from_fields(
-        0x587e72d7,
-        0xcc50,
-        0x4f79,
-        0x82,
-        0x09,
-        &[0xca, 0x29, 0x1f, 0xc1, 0xa1, 0x0f],
-    );
-    const EDID_DISCOVERED_GUID: Guid = Guid::from_fields(
-        0x1C0C34F6,
-        0xD380,
-        0x41FA,
-        0xA0,
-        0x49,
-        &[0x8a, 0xd0, 0x6c, 0x1a, 0x66, 0xaa],
-    );
-    const EDID_ACTIVE_GUID: Guid = Guid::from_fields(
-        0xBD8C1056,
-        0x9F36,
-        0x44EC,
-        0x92,
-        0xA8,
-        &[0xa6, 0x33, 0x7f, 0x81, 0x79, 0x86],
-    );
-    // Unicode Collation Protocol
-    const UNICODE_COLLATION_GUID: Guid = Guid::from_fields(
-        0x1d85cd7f,
-        0xf43d,
-        0x11d2,
-        0x9a,
-        0x0c,
-        &[0x00, 0x90, 0x27, 0x3f, 0xc1, 0x4d],
-    );
-    // SHIM Lock Protocol (Secure Boot)
-    const SHIM_LOCK_GUID: Guid = Guid::from_fields(
-        0x605dab50,
-        0xe046,
-        0x4300,
-        0xab,
-        0xb6,
-        &[0x3d, 0xd8, 0x10, 0xdd, 0x8b, 0x23],
-    );
-    // Shell Parameters Protocol
-    const SHELL_PARAMETERS_GUID: Guid = Guid::from_fields(
-        0x752f3136,
-        0x4e16,
-        0x4fdc,
-        0xa2,
-        0x2a,
-        &[0xe5, 0xf4, 0x68, 0x12, 0xf4, 0xca],
-    );
-    // Load File 2 (initrd loading)
-    const LINUX_INITRD_MEDIA_GUID: Guid = Guid::from_fields(
-        0x5568e427,
-        0x68fc,
-        0x4f3d,
-        0xac,
-        0x74,
-        &[0xca, 0x55, 0x52, 0x31, 0xcc, 0x68],
-    );
-    // Console Control Protocol (legacy Intel EFI): f42f7782-012e-4c12-9956-49f94304f721
-    const CONSOLE_CONTROL_GUID: Guid = Guid::from_fields(
-        0xf42f7782,
-        0x012e,
-        0x4c12,
-        0x99,
-        0x56,
-        &[0x49, 0xf9, 0x43, 0x04, 0xf7, 0x21],
-    );
-    // EFI Memory Attribute Protocol (UEFI 2.10) - memory protection attributes
-    const MEMORY_ATTRIBUTE_GUID: Guid = Guid::from_fields(
-        0xf4560cf6,
-        0x40ec,
-        0x4b4a,
-        0xa1,
-        0x92,
-        &[0xbf, 0x1d, 0x57, 0xd0, 0xb1, 0x89],
-    );
-    // EFI TCG Protocol (TPM 1.2)
-    const TCG_GUID: Guid = Guid::from_fields(
-        0xf541796d,
-        0xa62e,
-        0x4954,
-        0xa7,
-        0x75,
-        &[0x95, 0x84, 0xf6, 0x1b, 0x9c, 0xdd],
-    );
-    // EFI TCG2 Protocol (TPM 2.0)
-    const TCG2_GUID: Guid = Guid::from_fields(
-        0x607f766c,
-        0x7455,
-        0x42be,
-        0x93,
-        0x0b,
-        &[0xe4, 0xd7, 0x6d, 0xb2, 0x72, 0x0f],
-    );
-    // EFI CC Measurement Protocol (Confidential Computing)
-    const CC_MEASUREMENT_GUID: Guid = Guid::from_fields(
-        0x96751a3d,
-        0x72f4,
-        0x41a6,
-        0xa7,
-        0x94,
-        &[0xed, 0x5d, 0x0e, 0x67, 0xae, 0x6b],
-    );
-    // EFI Simple Text Input Ex Protocol
-    const SIMPLE_TEXT_INPUT_EX_GUID: Guid = Guid::from_fields(
-        0xdd9e7534,
-        0x7762,
-        0x4698,
-        0x8c,
-        0x14,
-        &[0xf5, 0x85, 0x17, 0xa6, 0x25, 0xaa],
-    );
+    // Well-known GUID lookup table
+    const GUID_NAMES: &[(Guid, &str)] = &[
+        (
+            Guid::from_fields(
+                0x5B1B31A1,
+                0x9562,
+                0x11d2,
+                0x8E,
+                0x3F,
+                &[0x00, 0xA0, 0xC9, 0x69, 0x72, 0x3B],
+            ),
+            "LOADED_IMAGE",
+        ),
+        (
+            Guid::from_fields(
+                0x09576e91,
+                0x6d3f,
+                0x11d2,
+                0x8e,
+                0x39,
+                &[0x00, 0xa0, 0xc9, 0x69, 0x72, 0x3b],
+            ),
+            "DEVICE_PATH",
+        ),
+        (
+            Guid::from_fields(
+                0x0964e5b22,
+                0x6459,
+                0x11d2,
+                0x8e,
+                0x39,
+                &[0x00, 0xa0, 0xc9, 0x69, 0x72, 0x3b],
+            ),
+            "SIMPLE_FILE_SYSTEM",
+        ),
+        (
+            Guid::from_fields(
+                0x9042a9de,
+                0x23dc,
+                0x4a38,
+                0x96,
+                0xfb,
+                &[0x7a, 0xde, 0xd0, 0x80, 0x51, 0x6a],
+            ),
+            "GRAPHICS_OUTPUT (GOP)",
+        ),
+        (
+            Guid::from_fields(
+                0x387477c1,
+                0x69c7,
+                0x11d2,
+                0x8e,
+                0x39,
+                &[0x00, 0xa0, 0xc9, 0x69, 0x72, 0x3b],
+            ),
+            "SIMPLE_TEXT_INPUT",
+        ),
+        (
+            Guid::from_fields(
+                0x387477c2,
+                0x69c7,
+                0x11d2,
+                0x8e,
+                0x39,
+                &[0x00, 0xa0, 0xc9, 0x69, 0x72, 0x3b],
+            ),
+            "SIMPLE_TEXT_OUTPUT",
+        ),
+        (
+            Guid::from_fields(
+                0x964e5b21,
+                0x6459,
+                0x11d2,
+                0x8e,
+                0x39,
+                &[0x00, 0xa0, 0xc9, 0x69, 0x72, 0x3b],
+            ),
+            "BLOCK_IO",
+        ),
+        (
+            Guid::from_fields(
+                0xCE345171,
+                0xBA0B,
+                0x11d2,
+                0x8e,
+                0x4F,
+                &[0x00, 0xa0, 0xc9, 0x69, 0x72, 0x3b],
+            ),
+            "DISK_IO",
+        ),
+        (
+            Guid::from_fields(
+                0xeb9d2d30,
+                0x2d88,
+                0x11d3,
+                0x9a,
+                0x16,
+                &[0x00, 0x90, 0x27, 0x3f, 0xc1, 0x4d],
+            ),
+            "ACPI_TABLE",
+        ),
+        (
+            Guid::from_fields(
+                0xeb9d2d31,
+                0x2d88,
+                0x11d3,
+                0x9a,
+                0x16,
+                &[0x00, 0x90, 0x27, 0x3f, 0xc1, 0x4d],
+            ),
+            "SMBIOS_TABLE",
+        ),
+        (
+            Guid::from_fields(
+                0x56EC3091,
+                0x954C,
+                0x11d2,
+                0x8e,
+                0x3f,
+                &[0x00, 0xa0, 0xc9, 0x69, 0x72, 0x3b],
+            ),
+            "LOAD_FILE",
+        ),
+        (
+            Guid::from_fields(
+                0x4006c0c1,
+                0xfcb3,
+                0x403e,
+                0x99,
+                0x6d,
+                &[0x4a, 0x6c, 0x87, 0x24, 0xe0, 0x6d],
+            ),
+            "LOAD_FILE2",
+        ),
+        (
+            Guid::from_fields(
+                0xBB25CF6F,
+                0xF1D4,
+                0x11D2,
+                0x9a,
+                0x0c,
+                &[0x00, 0x90, 0x27, 0x3f, 0xc1, 0xfd],
+            ),
+            "SERIAL_IO",
+        ),
+        (
+            Guid::from_fields(
+                0x03C4E603,
+                0xAC28,
+                0x11d3,
+                0x9a,
+                0x2d,
+                &[0x00, 0x90, 0x27, 0x3f, 0xc1, 0x4d],
+            ),
+            "PXE_BASE_CODE",
+        ),
+        (
+            Guid::from_fields(
+                0xef9fc172,
+                0xa1b2,
+                0x4693,
+                0xb3,
+                0x27,
+                &[0x6d, 0x32, 0xfc, 0x41, 0x60, 0x42],
+            ),
+            "HII_DATABASE",
+        ),
+        (
+            Guid::from_fields(
+                0x587e72d7,
+                0xcc50,
+                0x4f79,
+                0x82,
+                0x09,
+                &[0xca, 0x29, 0x1f, 0xc1, 0xa1, 0x0f],
+            ),
+            "HII_CONFIG_ROUTING",
+        ),
+        (
+            Guid::from_fields(
+                0x1C0C34F6,
+                0xD380,
+                0x41FA,
+                0xA0,
+                0x49,
+                &[0x8a, 0xd0, 0x6c, 0x1a, 0x66, 0xaa],
+            ),
+            "EDID_DISCOVERED",
+        ),
+        (
+            Guid::from_fields(
+                0xBD8C1056,
+                0x9F36,
+                0x44EC,
+                0x92,
+                0xA8,
+                &[0xa6, 0x33, 0x7f, 0x81, 0x79, 0x86],
+            ),
+            "EDID_ACTIVE",
+        ),
+        (
+            Guid::from_fields(
+                0x1d85cd7f,
+                0xf43d,
+                0x11d2,
+                0x9a,
+                0x0c,
+                &[0x00, 0x90, 0x27, 0x3f, 0xc1, 0x4d],
+            ),
+            "UNICODE_COLLATION",
+        ),
+        (
+            Guid::from_fields(
+                0x605dab50,
+                0xe046,
+                0x4300,
+                0xab,
+                0xb6,
+                &[0x3d, 0xd8, 0x10, 0xdd, 0x8b, 0x23],
+            ),
+            "SHIM_LOCK",
+        ),
+        (
+            Guid::from_fields(
+                0x752f3136,
+                0x4e16,
+                0x4fdc,
+                0xa2,
+                0x2a,
+                &[0xe5, 0xf4, 0x68, 0x12, 0xf4, 0xca],
+            ),
+            "SHELL_PARAMETERS",
+        ),
+        (
+            Guid::from_fields(
+                0x5568e427,
+                0x68fc,
+                0x4f3d,
+                0xac,
+                0x74,
+                &[0xca, 0x55, 0x52, 0x31, 0xcc, 0x68],
+            ),
+            "LINUX_INITRD_MEDIA",
+        ),
+        (
+            Guid::from_fields(
+                0xf42f7782,
+                0x012e,
+                0x4c12,
+                0x99,
+                0x56,
+                &[0x49, 0xf9, 0x43, 0x04, 0xf7, 0x21],
+            ),
+            "CONSOLE_CONTROL",
+        ),
+        (
+            Guid::from_fields(
+                0xf4560cf6,
+                0x40ec,
+                0x4b4a,
+                0xa1,
+                0x92,
+                &[0xbf, 0x1d, 0x57, 0xd0, 0xb1, 0x89],
+            ),
+            "MEMORY_ATTRIBUTE",
+        ),
+        (
+            Guid::from_fields(
+                0xf541796d,
+                0xa62e,
+                0x4954,
+                0xa7,
+                0x75,
+                &[0x95, 0x84, 0xf6, 0x1b, 0x9c, 0xdd],
+            ),
+            "TCG (TPM 1.2)",
+        ),
+        (
+            Guid::from_fields(
+                0x607f766c,
+                0x7455,
+                0x42be,
+                0x93,
+                0x0b,
+                &[0xe4, 0xd7, 0x6d, 0xb2, 0x72, 0x0f],
+            ),
+            "TCG2 (TPM 2.0)",
+        ),
+        (
+            Guid::from_fields(
+                0x96751a3d,
+                0x72f4,
+                0x41a6,
+                0xa7,
+                0x94,
+                &[0xed, 0x5d, 0x0e, 0x67, 0xae, 0x6b],
+            ),
+            "CC_MEASUREMENT",
+        ),
+        (
+            Guid::from_fields(
+                0xdd9e7534,
+                0x7762,
+                0x4698,
+                0x8c,
+                0x14,
+                &[0xf5, 0x85, 0x17, 0xa6, 0x25, 0xaa],
+            ),
+            "SIMPLE_TEXT_INPUT_EX",
+        ),
+    ];
 
-    if guid_eq(guid, &LOADED_IMAGE_GUID) {
-        return "LOADED_IMAGE";
-    }
-    if guid_eq(guid, &DEVICE_PATH_GUID) {
-        return "DEVICE_PATH";
-    }
-    if guid_eq(guid, &SIMPLE_FILE_SYSTEM_GUID) {
-        return "SIMPLE_FILE_SYSTEM";
-    }
-    if guid_eq(guid, &GOP_GUID) {
-        return "GRAPHICS_OUTPUT (GOP)";
-    }
-    if guid_eq(guid, &SIMPLE_TEXT_INPUT_GUID) {
-        return "SIMPLE_TEXT_INPUT";
-    }
-    if guid_eq(guid, &SIMPLE_TEXT_OUTPUT_GUID) {
-        return "SIMPLE_TEXT_OUTPUT";
-    }
-    if guid_eq(guid, &BLOCK_IO_GUID) {
-        return "BLOCK_IO";
-    }
-    if guid_eq(guid, &DISK_IO_GUID) {
-        return "DISK_IO";
-    }
-    if guid_eq(guid, &ACPI_TABLE_GUID) {
-        return "ACPI_TABLE";
-    }
-    if guid_eq(guid, &SMBIOS_TABLE_GUID) {
-        return "SMBIOS_TABLE";
-    }
-    if guid_eq(guid, &LOAD_FILE_GUID) {
-        return "LOAD_FILE";
-    }
-    if guid_eq(guid, &LOAD_FILE2_GUID) {
-        return "LOAD_FILE2";
-    }
-    if guid_eq(guid, &SERIAL_IO_GUID) {
-        return "SERIAL_IO";
-    }
-    if guid_eq(guid, &PXE_BASE_CODE_GUID) {
-        return "PXE_BASE_CODE";
-    }
-    if guid_eq(guid, &HII_DATABASE_GUID) {
-        return "HII_DATABASE";
-    }
-    if guid_eq(guid, &HII_CONFIG_ROUTING_GUID) {
-        return "HII_CONFIG_ROUTING";
-    }
-    if guid_eq(guid, &EDID_DISCOVERED_GUID) {
-        return "EDID_DISCOVERED";
-    }
-    if guid_eq(guid, &EDID_ACTIVE_GUID) {
-        return "EDID_ACTIVE";
-    }
-    if guid_eq(guid, &UNICODE_COLLATION_GUID) {
-        return "UNICODE_COLLATION";
-    }
-    if guid_eq(guid, &SHIM_LOCK_GUID) {
-        return "SHIM_LOCK";
-    }
-    if guid_eq(guid, &SHELL_PARAMETERS_GUID) {
-        return "SHELL_PARAMETERS";
-    }
-    if guid_eq(guid, &LINUX_INITRD_MEDIA_GUID) {
-        return "LINUX_INITRD_MEDIA";
-    }
-    if guid_eq(guid, &CONSOLE_CONTROL_GUID) {
-        return "CONSOLE_CONTROL";
-    }
-    if guid_eq(guid, &MEMORY_ATTRIBUTE_GUID) {
-        return "MEMORY_ATTRIBUTE";
-    }
-    if guid_eq(guid, &TCG_GUID) {
-        return "TCG (TPM 1.2)";
-    }
-    if guid_eq(guid, &TCG2_GUID) {
-        return "TCG2 (TPM 2.0)";
-    }
-    if guid_eq(guid, &CC_MEASUREMENT_GUID) {
-        return "CC_MEASUREMENT";
-    }
-    if guid_eq(guid, &SIMPLE_TEXT_INPUT_EX_GUID) {
-        return "SIMPLE_TEXT_INPUT_EX";
-    }
-
-    "UNKNOWN"
+    GUID_NAMES
+        .iter()
+        .find(|(g, _)| guid_eq(guid, g))
+        .map(|(_, name)| *name)
+        .unwrap_or("UNKNOWN")
 }
 
 /// Create a new handle and register it
@@ -1915,27 +1916,28 @@ pub fn create_handle() -> Option<Handle> {
 pub fn install_protocol(handle: Handle, guid: &Guid, interface: *mut c_void) -> Status {
     let efi_state = state::efi_mut();
 
-    for i in 0..efi_state.handle_count {
-        if efi_state.handles[i].handle == handle {
-            // Check if protocol already installed
-            for j in 0..efi_state.handles[i].protocol_count {
-                if guid_eq(&efi_state.handles[i].protocols[j].guid, guid) {
-                    return Status::INVALID_PARAMETER;
-                }
-            }
-
-            if efi_state.handles[i].protocol_count >= MAX_PROTOCOLS_PER_HANDLE {
-                return Status::OUT_OF_RESOURCES;
-            }
-
-            let proto_idx = efi_state.handles[i].protocol_count;
-            efi_state.handles[i].protocols[proto_idx] = ProtocolEntry {
-                guid: *guid,
-                interface,
-            };
-            efi_state.handles[i].protocol_count += 1;
-            return Status::SUCCESS;
+    if let Some(entry) = efi_state.handles[..efi_state.handle_count]
+        .iter_mut()
+        .find(|e| e.handle == handle)
+    {
+        // Check if protocol already installed
+        if entry.protocols[..entry.protocol_count]
+            .iter()
+            .any(|p| guid_eq(&p.guid, guid))
+        {
+            return Status::INVALID_PARAMETER;
         }
+
+        if entry.protocol_count >= MAX_PROTOCOLS_PER_HANDLE {
+            return Status::OUT_OF_RESOURCES;
+        }
+
+        entry.protocols[entry.protocol_count] = ProtocolEntry {
+            guid: *guid,
+            interface,
+        };
+        entry.protocol_count += 1;
+        return Status::SUCCESS;
     }
 
     Status::INVALID_PARAMETER
