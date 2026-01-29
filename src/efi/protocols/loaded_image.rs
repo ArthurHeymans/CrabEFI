@@ -36,7 +36,7 @@ pub fn create_loaded_image_protocol(
 ) -> *mut loaded_image::Protocol {
     // We allocate this using the EFI allocator and leak it
     // In a real implementation, this would be freed when the image is unloaded
-    use crate::efi::allocator::{MemoryType, allocate_pool};
+    use crate::efi::allocator::{allocate_pool, MemoryType};
 
     let size = core::mem::size_of::<loaded_image::Protocol>();
     let ptr = match allocate_pool(MemoryType::BootServicesData, size) {

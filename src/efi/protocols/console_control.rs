@@ -7,7 +7,7 @@
 use core::ffi::c_void;
 use r_efi::efi::{Boolean, Guid, Status};
 
-use crate::efi::allocator::{MemoryType, allocate_pool};
+use crate::efi::allocator::{allocate_pool, MemoryType};
 
 /// Console Control Protocol GUID
 /// {F42F7782-012E-4C12-9956-49F94304F721}

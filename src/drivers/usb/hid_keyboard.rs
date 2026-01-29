@@ -8,7 +8,7 @@
 //! - USB HID Specification 1.11
 //! - libpayload usbhid.c
 
-use super::controller::{UsbController, UsbError, hid_request, req_type};
+use super::controller::{hid_request, req_type, UsbController, UsbError};
 use spin::Mutex;
 
 // ============================================================================

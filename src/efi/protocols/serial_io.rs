@@ -10,7 +10,7 @@ use core::ffi::c_void;
 use r_efi::efi::{Guid, Status};
 
 use crate::drivers::serial::{self, COM1};
-use crate::efi::allocator::{MemoryType, allocate_pool};
+use crate::efi::allocator::{allocate_pool, MemoryType};
 
 /// Serial IO Protocol GUID
 /// {BB25CF6F-F1D4-11D2-9A0C-0090273FC1FD}

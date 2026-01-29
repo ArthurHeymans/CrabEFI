@@ -14,6 +14,8 @@ pub mod arch;
 pub mod coreboot;
 pub mod drivers;
 pub mod efi;
+#[cfg(feature = "fb-log")]
+pub mod fb_log;
 pub mod framebuffer_console;
 pub mod fs;
 pub mod logger;
@@ -75,14 +77,11 @@ pub fn init(coreboot_table_ptr: u64) {
         coreboot::cbmem_console::init(cbmem_addr);
     }
 
-    // Store framebuffer globally for menu rendering and draw life sign ASAP
+    // Store framebuffer globally for menu rendering
     if let Some(ref fb) = cb_info.framebuffer {
         coreboot::store_framebuffer(fb.clone());
         // Also store in new state
         state::drivers_mut().framebuffer = Some(fb.clone());
-        // Early life sign: draw a bright magenta rectangle in top-left corner
-        // This provides visual feedback before any other initialization
-        draw_life_sign_early(fb);
     }
 
     // Initialize serial port from coreboot info (if available)
@@ -1628,9 +1627,9 @@ fn load_and_execute_bootloader<R: fs::gpt::SectorRead>(
     file_size: u32,
     device_handle: r_efi::efi::Handle,
 ) -> Result<(), r_efi::efi::Status> {
-    use efi::allocator::{MemoryType, allocate_pool, free_pool};
+    use efi::allocator::{allocate_pool, free_pool, MemoryType};
     use efi::boot_services;
-    use efi::protocols::loaded_image::{LOADED_IMAGE_PROTOCOL_GUID, create_loaded_image_protocol};
+    use efi::protocols::loaded_image::{create_loaded_image_protocol, LOADED_IMAGE_PROTOCOL_GUID};
     use r_efi::efi::Status;
 
     log::info!("Loading bootloader: {} ({} bytes)", path, file_size);
@@ -1757,27 +1756,5 @@ fn load_and_execute_bootloader<R: fs::gpt::SectorRead>(
         Ok(())
     } else {
         Err(exec_status)
-    }
-}
-
-/// Draw an early life sign on the framebuffer
-///
-/// Draws a bright magenta rectangle in the top-left corner to indicate
-/// that CrabEFI has started and the framebuffer is accessible.
-///
-/// This is called BEFORE serial/logging is initialized, so no log calls.
-fn draw_life_sign_early(fb: &coreboot::FramebufferInfo) {
-    const RECT_WIDTH: u32 = 64;
-    const RECT_HEIGHT: u32 = 64;
-
-    // Bright magenta color (easy to spot)
-    let (r, g, b): (u8, u8, u8) = (255, 0, 255);
-
-    unsafe {
-        for y in 0..RECT_HEIGHT.min(fb.y_resolution) {
-            for x in 0..RECT_WIDTH.min(fb.x_resolution) {
-                fb.write_pixel(x, y, r, g, b);
-            }
-        }
     }
 }

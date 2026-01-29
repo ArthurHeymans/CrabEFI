@@ -8,6 +8,11 @@ license = "Apache-2.0 OR MIT"
 repository = "https://github.com/user/CrabEFI"
 readme = "README.md"
 
+[features]
+default = []
+# Enable logging output to framebuffer (very slow, for debugging only)
+fb-log = []
+
 [dependencies]
 r-efi = "5.3"
 log = "0.4"

@@ -6,7 +6,7 @@
 use core::ffi::c_void;
 use r_efi::efi::{Guid, Status};
 
-use crate::efi::allocator::{MemoryType, allocate_pool};
+use crate::efi::allocator::{allocate_pool, MemoryType};
 
 /// Block I/O Protocol GUID
 pub const BLOCK_IO_PROTOCOL_GUID: Guid = Guid::from_fields(

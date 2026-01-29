@@ -9,7 +9,7 @@ use r_efi::protocols::device_path::{
     self, End, HardDriveMedia, Media, Protocol, TYPE_END, TYPE_MEDIA,
 };
 
-use crate::efi::allocator::{MemoryType, allocate_pool};
+use crate::efi::allocator::{allocate_pool, MemoryType};
 
 /// Re-export the GUID for external use
 pub const DEVICE_PATH_PROTOCOL_GUID: Guid = device_path::PROTOCOL_GUID;

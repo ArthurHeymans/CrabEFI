@@ -22,12 +22,12 @@ use crate::drivers::pci::{self, PciAddress, PciDevice};
 use crate::efi;
 use crate::time::Timeout;
 use core::ptr;
-use core::sync::atomic::{Ordering, fence};
+use core::sync::atomic::{fence, Ordering};
 
 use super::controller::{
-    DeviceDescriptor, DeviceInfo, EndpointInfo, HUB_DESCRIPTOR_TYPE, HubDescriptor, UsbController,
-    UsbDevice, UsbError, UsbSpeed, class, desc_type, hub_feature, hub_port_status,
-    parse_configuration, req_type, request,
+    class, desc_type, hub_feature, hub_port_status, parse_configuration, req_type, request,
+    DeviceDescriptor, DeviceInfo, EndpointInfo, HubDescriptor, UsbController, UsbDevice, UsbError,
+    UsbSpeed, HUB_DESCRIPTOR_TYPE,
 };
 
 // ============================================================================
@@ -1618,7 +1618,7 @@ impl EhciController {
             ptr::write_volatile(&mut (*qh).overlay.next_qtd, qtd_setup_addr as u32);
             ptr::write_volatile(&mut (*qh).overlay.alt_next_qtd, Qtd::TERMINATE);
             ptr::write_volatile(&mut (*qh).overlay.token, 0); // ACTIVE=0, HALTED=0 -> fetch qTD
-            // Clear rest of overlay
+                                                              // Clear rest of overlay
             for i in 0..5 {
                 ptr::write_volatile(&mut (*qh).overlay.buffer[i], 0);
                 ptr::write_volatile(&mut (*qh).overlay.buffer_hi[i], 0);

@@ -9,12 +9,12 @@
 //! centralized `FirmwareState` structure. Access it via `crate::state::efi_mut()`.
 
 use super::allocator::{self, AllocateType, MemoryDescriptor, MemoryType};
-use super::protocols::loaded_image::{LOADED_IMAGE_PROTOCOL_GUID, create_loaded_image_protocol};
+use super::protocols::loaded_image::{create_loaded_image_protocol, LOADED_IMAGE_PROTOCOL_GUID};
 use super::system_table;
 use crate::pe;
 use crate::state::{
-    self, EventEntry, LoadedImageEntry, MAX_EVENTS, MAX_HANDLES, MAX_PROTOCOLS_PER_HANDLE,
-    ProtocolEntry,
+    self, EventEntry, LoadedImageEntry, ProtocolEntry, MAX_EVENTS, MAX_HANDLES,
+    MAX_PROTOCOLS_PER_HANDLE,
 };
 use core::ffi::c_void;
 use r_efi::efi::{self, Boolean, Guid, Handle, Status, SystemTable, TableHeader, Tpl};
@@ -154,7 +154,7 @@ extern "efiapi" fn allocate_pages(
     pages: usize,
     memory: *mut efi::PhysicalAddress,
 ) -> Status {
-    log::info!(
+    log::debug!(
         "BS.AllocatePages(type={}, mem_type={}, pages={}, addr={:#x})",
         alloc_type,
         memory_type,
@@ -187,9 +187,9 @@ extern "efiapi" fn allocate_pages(
 
     if status == Status::SUCCESS {
         unsafe { *memory = addr };
-        log::info!("  -> allocated at {:#x}", addr);
+        log::debug!("  -> allocated at {:#x}", addr);
     } else {
-        log::info!("  -> failed: {:?}", status);
+        log::debug!("  -> failed: {:?}", status);
     }
 
     status
@@ -206,7 +206,7 @@ extern "efiapi" fn get_memory_map(
     descriptor_size: *mut usize,
     descriptor_version: *mut u32,
 ) -> Status {
-    log::info!(
+    log::debug!(
         "BS.GetMemoryMap(buf_size={:?}, map={:?})",
         if memory_map_size.is_null() {
             0
@@ -254,7 +254,7 @@ extern "efiapi" fn get_memory_map(
         *descriptor_version = desc_version;
     }
 
-    log::info!("  -> {:?} (size={}, key={:#x})", status, size, key);
+    log::debug!("  -> {:?} (size={}, key={:#x})", status, size, key);
     status
 }
 
@@ -576,10 +576,10 @@ extern "efiapi" fn handle_protocol(
     } else {
         unsafe { *protocol }
     };
-    log::info!(
+    log::debug!(
         "BS.HandleProtocol(handle={:?}, protocol={})",
         handle,
-        format_guid(&guid)
+        GuidFmt(guid)
     );
 
     // Forward to open_protocol with simpler semantics
@@ -618,23 +618,22 @@ extern "efiapi" fn locate_handle(
         return Status::INVALID_PARAMETER;
     }
 
-    let guid_name = if protocol.is_null() {
-        "NULL"
+    let guid_display = if protocol.is_null() {
+        None
     } else {
-        format_guid(unsafe { &*protocol })
+        Some(GuidFmt(unsafe { *protocol }))
     };
-    log::info!(
+
+    log::debug!(
         "BS.LocateHandle(type={}, protocol={}, buf_size={}, buf={:?})",
         search_type,
-        guid_name,
+        guid_display
+            .as_ref()
+            .map(|g| g as &dyn core::fmt::Display)
+            .unwrap_or(&"NULL" as &dyn core::fmt::Display),
         unsafe { *buffer_size },
         buffer
     );
-
-    // Log raw GUID if unknown
-    if !protocol.is_null() && guid_name == "UNKNOWN" {
-        log_guid(unsafe { &*protocol });
-    }
 
     // Only ByProtocol search is supported
     if search_type != efi::BY_PROTOCOL {
@@ -693,11 +692,7 @@ extern "efiapi" fn locate_device_path(
     }
 
     let guid = unsafe { *protocol };
-    let guid_name = format_guid(&guid);
-    log::debug!("BS.LocateDevicePath(protocol={})", guid_name);
-    if guid_name == "UNKNOWN" {
-        log_guid(&guid);
-    }
+    log::debug!("BS.LocateDevicePath(protocol={})", GuidFmt(guid));
 
     let input_dp = unsafe { *device_path };
     if input_dp.is_null() {
@@ -1168,17 +1163,12 @@ extern "efiapi" fn open_protocol(
 
     let guid = unsafe { *protocol };
     let guid_name = format_guid(&guid);
-    log::info!(
+    log::debug!(
         "BS.OpenProtocol(handle={:?}, protocol={}, attr={:#x})",
         handle,
-        guid_name,
+        GuidFmt(guid),
         attributes
     );
-
-    // Log raw GUID if unknown
-    if guid_name == "UNKNOWN" {
-        log_guid(&guid);
-    }
 
     let efi_state = state::efi();
 
@@ -1210,12 +1200,12 @@ extern "efiapi" fn open_protocol(
                     return Status::SUCCESS;
                 }
             }
-            log::trace!("  -> UNSUPPORTED (protocol not on handle)");
+            log::warn!("  -> UNSUPPORTED (protocol not on handle)");
             return Status::UNSUPPORTED; // Handle exists but protocol not found
         }
     }
 
-    log::debug!("  -> INVALID_PARAMETER (handle not found)");
+    log::warn!("  -> INVALID_PARAMETER (handle not found)");
     Status::INVALID_PARAMETER // Handle not found
 }
 
@@ -1252,15 +1242,19 @@ extern "efiapi" fn locate_handle_buffer(
     no_handles: *mut usize,
     buffer: *mut *mut Handle,
 ) -> Status {
-    let guid_name = if protocol.is_null() {
-        "NULL"
+    let guid_display = if protocol.is_null() {
+        None
     } else {
-        format_guid(unsafe { &*protocol })
+        Some(GuidFmt(unsafe { *protocol }))
     };
-    log::info!(
+
+    log::debug!(
         "BS.LocateHandleBuffer(type={}, protocol={})",
         search_type,
-        guid_name
+        guid_display
+            .as_ref()
+            .map(|g| g as &dyn core::fmt::Display)
+            .unwrap_or(&"NULL" as &dyn core::fmt::Display)
     );
 
     if no_handles.is_null() || buffer.is_null() {
@@ -1284,7 +1278,7 @@ extern "efiapi" fn locate_handle_buffer(
             *no_handles = 0;
             *buffer = core::ptr::null_mut();
         }
-        log::debug!("  -> NOT_FOUND");
+        log::warn!("  -> NOT_FOUND");
         return Status::NOT_FOUND;
     }
 
@@ -1302,7 +1296,7 @@ extern "efiapi" fn locate_handle_buffer(
     let handle_buffer = match alloc_result {
         Ok(ptr) => ptr as *mut Handle,
         Err(e) => {
-            log::debug!("  -> OUT_OF_RESOURCES (pool allocation failed: {:?})", e);
+            log::warn!("  -> OUT_OF_RESOURCES (pool allocation failed: {:?})", e);
             return Status::OUT_OF_RESOURCES;
         }
     };
@@ -1343,13 +1337,7 @@ extern "efiapi" fn locate_protocol(
     }
 
     let guid = unsafe { *protocol };
-    let guid_name = format_guid(&guid);
-    log::info!("BS.LocateProtocol(protocol={})", guid_name);
-
-    // Log raw GUID if unknown
-    if guid_name == "UNKNOWN" {
-        log_guid(&guid);
-    }
+    log::trace!("BS.LocateProtocol(protocol={})", GuidFmt(guid));
 
     let efi_state = state::efi();
 
@@ -1439,15 +1427,15 @@ extern "efiapi" fn install_multiple_protocol_interfaces(
         }
 
         let guid = unsafe { *guid_ptr };
-        let guid_name = format_guid(&guid);
-        log::debug!("  Installing protocol: {}", guid_name);
-        if guid_name == "UNKNOWN" {
-            log_guid(&guid);
-        }
+        log::debug!("  Installing protocol: {}", GuidFmt(guid));
 
         let status = install_protocol(target_handle, &guid, interface);
         if status != Status::SUCCESS {
-            log::error!("  Failed to install protocol {}: {:?}", guid_name, status);
+            log::error!(
+                "  Failed to install protocol {}: {:?}",
+                GuidFmt(guid),
+                status
+            );
             // On failure, we should uninstall previously installed protocols
             // For simplicity, we just return the error
             return status;
@@ -1487,8 +1475,7 @@ extern "efiapi" fn uninstall_multiple_protocol_interfaces(
         }
 
         let guid = unsafe { *(*guid_ptr as *const Guid) };
-        let guid_name = format_guid(&guid);
-        log::debug!("  Uninstalling protocol: {}", guid_name);
+        log::debug!("  Uninstalling protocol: {}", GuidFmt(guid));
 
         // Find and remove the protocol from the handle
         let efi_state = state::efi_mut();
@@ -1554,29 +1541,29 @@ fn guid_eq(a: &Guid, b: &Guid) -> bool {
     a_bytes == b_bytes
 }
 
-/// Log a GUID with its raw bytes (for debugging unknown GUIDs)
-fn log_guid(guid: &Guid) {
-    let bytes = unsafe { core::slice::from_raw_parts(guid as *const Guid as *const u8, 16) };
-    // Format as standard GUID: xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
-    log::trace!(
-        "  GUID: {:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
-        bytes[3],
-        bytes[2],
-        bytes[1],
-        bytes[0], // Data1 (LE)
-        bytes[5],
-        bytes[4], // Data2 (LE)
-        bytes[7],
-        bytes[6], // Data3 (LE)
-        bytes[8],
-        bytes[9], // Data4[0-1]
-        bytes[10],
-        bytes[11],
-        bytes[12],
-        bytes[13],
-        bytes[14],
-        bytes[15] // Data4[2-7]
-    );
+/// Wrapper for GUID that displays name if known, raw GUID if unknown
+pub struct GuidFmt(pub Guid);
+
+impl core::fmt::Display for GuidFmt {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let name = format_guid(&self.0);
+        if name != "UNKNOWN" {
+            write!(f, "{}", name)
+        } else {
+            // Format as standard GUID: xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
+            let bytes =
+                unsafe { core::slice::from_raw_parts(&self.0 as *const Guid as *const u8, 16) };
+            write!(
+                f,
+                "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+                bytes[3], bytes[2], bytes[1], bytes[0], // Data1 (LE)
+                bytes[5], bytes[4],                     // Data2 (LE)
+                bytes[7], bytes[6],                     // Data3 (LE)
+                bytes[8], bytes[9],                     // Data4[0-1]
+                bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15]
+            )
+        }
+    }
 }
 
 /// Format a GUID for logging with well-known names
