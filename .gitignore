@@ -16,3 +16,7 @@ test/*.efi
 # OS
 .DS_Store
 Thumbs.db
+
+# AI SLOP
+.opencode
+AGENTS.md
