@@ -10,6 +10,7 @@ pub mod protocols;
 pub mod runtime_services;
 pub mod system_table;
 pub mod utils;
+pub mod varstore;
 
 use crate::coreboot::tables::CorebootInfo;
 use r_efi::efi::{self, Status};

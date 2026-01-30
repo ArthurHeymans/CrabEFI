@@ -139,7 +139,11 @@ pub fn try_get() -> Option<&'static FirmwareState> {
 #[inline]
 pub fn try_get_mut_ptr() -> Option<*mut FirmwareState> {
     let ptr = STATE_PTR.load(Ordering::Acquire);
-    if ptr.is_null() { None } else { Some(ptr) }
+    if ptr.is_null() {
+        None
+    } else {
+        Some(ptr)
+    }
 }
 
 // ============================================================================
@@ -396,6 +400,11 @@ pub struct EfiState {
     /// Memory allocator
     pub allocator: MemoryAllocator,
 
+    /// Flag indicating ExitBootServices has been called
+    /// After this is set, SPI flash is locked and variable writes
+    /// must go to ESP file instead.
+    pub exit_boot_services_called: bool,
+
     /// Filesystem state for SimpleFileSystem protocol
     pub filesystem: Option<FilesystemState>,
 
@@ -416,6 +425,7 @@ impl EfiState {
             config_table_count: 0,
             variables: [const { VariableEntry::empty() }; MAX_VARIABLES],
             allocator: MemoryAllocator::new(),
+            exit_boot_services_called: false,
             filesystem: None,
             block_device: None,
         }
@@ -768,4 +778,27 @@ where
     F: FnOnce(&mut crate::drivers::block::AnyBlockDevice) -> R,
 {
     with_mut(|state| state.efi.block_device.as_mut().map(f))
+}
+
+// ============================================================================
+// ExitBootServices State
+// ============================================================================
+
+/// Check if ExitBootServices has been called.
+///
+/// After ExitBootServices, SPI flash is locked and variable writes
+/// must be stored to ESP file instead.
+#[inline]
+pub fn is_exit_boot_services_called() -> bool {
+    get().efi.exit_boot_services_called
+}
+
+/// Mark that ExitBootServices has been called.
+///
+/// This should only be called from boot_services::exit_boot_services.
+#[inline]
+pub fn set_exit_boot_services_called() {
+    with_efi_mut(|efi| {
+        efi.exit_boot_services_called = true;
+    });
 }

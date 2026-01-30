@@ -10,5 +10,6 @@ pub mod nvme;
 pub mod pci;
 pub mod sdhci;
 pub mod serial;
+pub mod spi;
 pub mod storage;
 pub mod usb;
