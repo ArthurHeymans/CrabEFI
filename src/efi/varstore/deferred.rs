@@ -19,6 +19,7 @@
 //! |   CRC32          |
 //! +------------------+
 //! | Entry 1          |
+//! |   Entry header   |  <- flags (pre_verified, is_auth)
 //! |   Record length  |
 //! |   VariableRecord |
 //! +------------------+
@@ -36,10 +37,23 @@
 //! - **Cold boot** (power cycle): RAM cleared, no pending changes
 //!
 //! We use a CRC to detect corrupted/stale data from cold boots.
+//!
+//! # Authenticated Variables
+//!
+//! For authenticated variables (those with TIME_BASED_AUTHENTICATED_WRITE_ACCESS):
+//! - Signature is verified at queue time (when key databases are accessible)
+//! - Entry is marked as "pre-verified"
+//! - On next boot, pre-verified entries are applied without re-verification
+//!
+//! This is necessary because:
+//! 1. The original timestamp would be stale on next boot
+//! 2. We can't re-sign without the private key
+//! 3. We trust our own verification from before ExitBootServices
 
 use core::sync::atomic::{AtomicBool, Ordering};
 
 use super::{crc32, VarStoreError, VariableRecord};
+use crate::efi::auth;
 
 /// Magic value for the deferred buffer header: "CVBF" (CrabVariable Buffer)
 const DEFERRED_MAGIC: u32 = 0x46425643;
@@ -65,6 +79,28 @@ const HEADER_SIZE: usize = 32;
 
 /// Maximum size of a single entry (including length prefix)
 const MAX_ENTRY_SIZE: usize = 8 * 1024;
+
+/// Entry flags
+mod entry_flags {
+    /// Entry contains an authenticated variable
+    pub const IS_AUTHENTICATED: u8 = 0x01;
+    /// Entry was pre-verified at queue time (signature checked)
+    pub const PRE_VERIFIED: u8 = 0x02;
+    /// Entry is a deletion (not a write)
+    pub const IS_DELETION: u8 = 0x04;
+}
+
+/// Entry header (8 bytes)
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct EntryHeader {
+    /// Entry flags (IS_AUTHENTICATED, PRE_VERIFIED, IS_DELETION)
+    flags: u8,
+    /// Reserved
+    _reserved: [u8; 3],
+    /// Length of the serialized VariableRecord
+    record_len: u32,
+}
 
 /// Header structure for the deferred buffer
 #[repr(C)]
@@ -218,6 +254,11 @@ pub fn check_pending() -> usize {
 /// This reads each entry from the buffer, applies it to SPI flash,
 /// then clears the buffer.
 ///
+/// For authenticated variables:
+/// - If the entry is marked as PRE_VERIFIED, the signature was verified at queue time
+///   and we apply the change directly
+/// - If not pre-verified, we skip the entry (shouldn't happen for authenticated vars)
+///
 /// Returns the number of entries processed.
 pub fn process_pending() -> Result<usize, VarStoreError> {
     let pending_count = check_pending();
@@ -230,30 +271,50 @@ pub fn process_pending() -> Result<usize, VarStoreError> {
 
     let mut offset = HEADER_SIZE;
     let mut processed = 0usize;
+    let entry_header_size = core::mem::size_of::<EntryHeader>();
 
     for i in 0..header.entry_count {
-        // Read entry length (4 bytes)
-        let entry_len = unsafe {
-            let len_ptr = base.add(offset) as *const u32;
-            core::ptr::read_unaligned(len_ptr) as usize
+        // Read entry header
+        let entry_hdr = unsafe {
+            let hdr_ptr = base.add(offset) as *const EntryHeader;
+            core::ptr::read_unaligned(hdr_ptr)
         };
 
-        if entry_len == 0 || entry_len > MAX_ENTRY_SIZE {
-            log::warn!("Invalid entry length {} at index {}", entry_len, i);
+        let record_len = entry_hdr.record_len as usize;
+        let flags = entry_hdr.flags;
+
+        if record_len == 0 || record_len > MAX_ENTRY_SIZE {
+            log::warn!("Invalid record length {} at index {}", record_len, i);
             break;
         }
 
-        offset += 4;
+        offset += entry_header_size;
 
-        // Read entry data
-        let entry_data = unsafe { core::slice::from_raw_parts(base.add(offset), entry_len) };
+        // Read record data
+        let record_data = unsafe { core::slice::from_raw_parts(base.add(offset), record_len) };
+
+        // Check if this is an authenticated variable that wasn't pre-verified
+        let is_authenticated = flags & entry_flags::IS_AUTHENTICATED != 0;
+        let is_pre_verified = flags & entry_flags::PRE_VERIFIED != 0;
+
+        if is_authenticated && !is_pre_verified {
+            // Skip - we can't verify the signature now (key databases may have changed)
+            log::warn!(
+                "Skipping non-pre-verified authenticated variable at entry {}",
+                i
+            );
+            offset += record_len;
+            continue;
+        }
 
         // Deserialize the variable record
-        match VariableRecord::deserialize(entry_data) {
+        match VariableRecord::deserialize(record_data) {
             Ok(record) => {
                 let guid = record.guid.to_guid();
 
-                if record.is_active() {
+                let is_deletion = flags & entry_flags::IS_DELETION != 0;
+
+                if !is_deletion && record.is_active() {
                     // Write to SPI
                     if let Err(e) = super::persistence::write_variable_to_spi_internal(
                         &guid,
@@ -271,6 +332,10 @@ pub fn process_pending() -> Result<usize, VarStoreError> {
                             &record.data,
                         );
                         processed += 1;
+
+                        if is_pre_verified {
+                            log::debug!("Applied pre-verified authenticated variable");
+                        }
                     }
                 } else {
                     // Delete from SPI
@@ -290,7 +355,7 @@ pub fn process_pending() -> Result<usize, VarStoreError> {
             }
         }
 
-        offset += entry_len;
+        offset += record_len;
     }
 
     // Clear the buffer
@@ -303,31 +368,64 @@ pub fn process_pending() -> Result<usize, VarStoreError> {
 /// Queue a variable write for deferred processing
 ///
 /// This is called after ExitBootServices when we can't write to SPI directly.
+///
+/// For authenticated variables (those with TIME_BASED_AUTHENTICATED_WRITE_ACCESS),
+/// the signature is verified before queuing. The entry is marked as pre-verified
+/// so it can be applied on next boot without re-verification.
 pub fn queue_write(
     guid: &r_efi::efi::Guid,
     name: &[u16],
     attributes: u32,
     data: &[u8],
 ) -> Result<(), VarStoreError> {
+    let is_authenticated =
+        (attributes & auth::attributes::TIME_BASED_AUTHENTICATED_WRITE_ACCESS) != 0;
+
+    let mut flags: u8 = 0;
+
+    if is_authenticated {
+        flags |= entry_flags::IS_AUTHENTICATED;
+
+        // Verify the authenticated variable before queuing
+        // This is done while we still have access to the key databases
+        match auth::verify_authenticated_variable(name, guid, attributes, data) {
+            Ok(actual_data) => {
+                // Signature verified - mark as pre-verified and use the actual data
+                flags |= entry_flags::PRE_VERIFIED;
+                log::info!("Authenticated variable verified for deferred write");
+
+                // Create record with the actual data (without auth header)
+                let record = VariableRecord::new(guid, name, attributes, &actual_data)?;
+                return queue_record_with_flags(&record, flags);
+            }
+            Err(e) => {
+                // Verification failed - reject the write
+                log::warn!("Authenticated variable verification failed: {:?}", e);
+                return Err(VarStoreError::InvalidArgument);
+            }
+        }
+    }
+
+    // Non-authenticated variable - just queue it
     let record = VariableRecord::new(guid, name, attributes, data)?;
-    queue_record(&record)
+    queue_record_with_flags(&record, flags)
 }
 
 /// Queue a variable deletion for deferred processing
 pub fn queue_deletion(guid: &r_efi::efi::Guid, name: &[u16]) -> Result<(), VarStoreError> {
     let record = VariableRecord::new_deleted(guid, name)?;
-    queue_record(&record)
+    queue_record_with_flags(&record, entry_flags::IS_DELETION)
 }
 
-/// Queue a variable record
-fn queue_record(record: &VariableRecord) -> Result<(), VarStoreError> {
+/// Queue a variable record with flags
+fn queue_record_with_flags(record: &VariableRecord, flags: u8) -> Result<(), VarStoreError> {
     let base = buffer_base();
 
     // Serialize the record
     let record_bytes = record.serialize()?;
-    let entry_len = record_bytes.len();
+    let record_len = record_bytes.len();
 
-    if entry_len > MAX_ENTRY_SIZE {
+    if record_len > MAX_ENTRY_SIZE {
         return Err(VarStoreError::DataTooLarge);
     }
 
@@ -341,24 +439,31 @@ fn queue_record(record: &VariableRecord) -> Result<(), VarStoreError> {
     }
 
     // Calculate where to write
+    // Entry format: EntryHeader (8 bytes) + record data
     let data_offset = HEADER_SIZE + header.total_size as usize;
-    let new_entry_size = 4 + entry_len; // length prefix + data
+    let entry_header_size = core::mem::size_of::<EntryHeader>();
+    let new_entry_size = entry_header_size + record_len;
 
     if data_offset + new_entry_size > DEFERRED_BUFFER_SIZE {
         log::warn!("Deferred buffer full");
         return Err(VarStoreError::StoreFull);
     }
 
-    // Write entry length
+    // Write entry header
+    let entry_hdr = EntryHeader {
+        flags,
+        _reserved: [0; 3],
+        record_len: record_len as u32,
+    };
     unsafe {
-        let len_ptr = base.add(data_offset) as *mut u32;
-        core::ptr::write_unaligned(len_ptr, entry_len as u32);
+        let hdr_ptr = base.add(data_offset) as *mut EntryHeader;
+        core::ptr::write_unaligned(hdr_ptr, entry_hdr);
     }
 
-    // Write entry data
+    // Write record data
     unsafe {
-        let data_ptr = base.add(data_offset + 4);
-        core::ptr::copy_nonoverlapping(record_bytes.as_ptr(), data_ptr, entry_len);
+        let data_ptr = base.add(data_offset + entry_header_size);
+        core::ptr::copy_nonoverlapping(record_bytes.as_ptr(), data_ptr, record_len);
     }
 
     // Update header
@@ -377,10 +482,19 @@ fn queue_record(record: &VariableRecord) -> Result<(), VarStoreError> {
         core::ptr::write(base as *mut DeferredHeader, header);
     }
 
+    let flag_desc = if flags & entry_flags::PRE_VERIFIED != 0 {
+        " (pre-verified)"
+    } else if flags & entry_flags::IS_DELETION != 0 {
+        " (deletion)"
+    } else {
+        ""
+    };
+
     log::debug!(
-        "Queued deferred variable write (entry {}, {} bytes)",
+        "Queued deferred variable write{} (entry {}, {} bytes)",
+        flag_desc,
         header.entry_count,
-        entry_len
+        record_len
     );
 
     Ok(())

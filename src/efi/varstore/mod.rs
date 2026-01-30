@@ -40,8 +40,8 @@ use serde::{Deserialize, Serialize};
 
 // Re-export key items from persistence
 pub use persistence::{
-    delete_variable, init as init_persistence, is_smmstore_initialized, is_spi_available,
-    persist_variable,
+    compact_smmstore, delete_variable, init as init_persistence, is_smmstore_initialized,
+    is_spi_available, persist_variable,
 };
 
 // Re-export key items from deferred

@@ -102,6 +102,11 @@ pub fn init(coreboot_table_ptr: u64) {
         });
     }
 
+    // Store SMMSTORE v2 info globally for variable persistence
+    if let Some(ref smmstore) = cb_info.smmstorev2 {
+        coreboot::store_smmstorev2(smmstore.clone());
+    }
+
     // Initialize serial port from coreboot info (if available)
     if let Some(ref serial) = cb_info.serial {
         drivers::serial::init_from_coreboot(serial.baseaddr, serial.baud);
@@ -144,6 +149,14 @@ pub fn init(coreboot_table_ptr: u64) {
     }
     if let Some(cbmem_console) = cb_info.cbmem_console {
         log::info!("  CBMEM console: {:#x}", cbmem_console);
+    }
+    if let Some(ref smmstore) = cb_info.smmstorev2 {
+        log::info!(
+            "  SMMSTORE v2: {} blocks x {} KB at {:#x}",
+            smmstore.num_blocks,
+            smmstore.block_size / 1024,
+            smmstore.mmap_addr
+        );
     }
     log::info!("  Memory regions: {}", cb_info.memory_map.len());
 

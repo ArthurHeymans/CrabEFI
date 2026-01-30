@@ -35,6 +35,7 @@ mod tags {
     pub const CB_TAG_TIMESTAMPS: u32 = 0x0016;
     pub const CB_TAG_CBMEM_CONSOLE: u32 = 0x0017;
     pub const CB_TAG_CBMEM_ENTRY: u32 = 0x0031;
+    pub const CB_TAG_SMMSTOREV2: u32 = 0x0039;
     pub const CB_TAG_ACPI_RSDP: u32 = 0x0043;
 }
 
@@ -156,6 +157,35 @@ struct CbCbmemEntry {
     id: u32,
 }
 
+/// SMMSTORE v2 record
+///
+/// This record contains information for accessing UEFI variable storage
+/// via the coreboot SMMSTORE v2 interface.
+/// Reference: coreboot/src/commonlib/include/commonlib/coreboot_tables.h
+#[repr(C, packed)]
+#[derive(FromBytes, Immutable, KnownLayout, Unaligned)]
+struct CbSmmstorev2 {
+    tag: u32,
+    size: u32,
+    /// Number of writable blocks in SMM
+    num_blocks: u32,
+    /// Size of a block in bytes (default: 64 KiB)
+    block_size: u32,
+    /// 32-bit MMIO address (deprecated, use mmap_addr)
+    mmap_addr_deprecated: u32,
+    /// Physical address of the communication buffer
+    com_buffer: u32,
+    /// Size of the communication buffer in bytes
+    com_buffer_size: u32,
+    /// The command byte to write to the APM I/O port
+    apm_cmd: u8,
+    /// Reserved/unused bytes
+    unused: [u8; 3],
+    /// 64-bit MMIO address of the store for read-only access
+    /// Note: Only present if record size is large enough
+    mmap_addr: u64,
+}
+
 /// Serial port information
 #[derive(Debug, Clone)]
 pub struct SerialInfo {
@@ -164,6 +194,26 @@ pub struct SerialInfo {
     pub baud: u32,
     pub regwidth: u32,
     pub input_hertz: u32,
+}
+
+/// SMMSTORE v2 information
+///
+/// This provides information for accessing UEFI variable storage
+/// through coreboot's SMMSTORE v2 interface.
+#[derive(Debug, Clone)]
+pub struct Smmstorev2Info {
+    /// Number of writable blocks in SMM
+    pub num_blocks: u32,
+    /// Size of each block in bytes (typically 64 KiB)
+    pub block_size: u32,
+    /// MMIO address for read-only access to the store
+    pub mmap_addr: u64,
+    /// Physical address of the SMM communication buffer
+    pub com_buffer: u32,
+    /// Size of the communication buffer in bytes
+    pub com_buffer_size: u32,
+    /// APM command byte for SMM communication
+    pub apm_cmd: u8,
 }
 
 /// Information extracted from coreboot tables
@@ -182,6 +232,8 @@ pub struct CorebootInfo {
     pub cbmem_console: Option<u64>,
     /// SMBIOS tables address (from CBMEM entry)
     pub smbios: Option<u64>,
+    /// SMMSTORE v2 information for UEFI variable storage
+    pub smmstorev2: Option<Smmstorev2Info>,
 }
 
 impl CorebootInfo {
@@ -194,6 +246,7 @@ impl CorebootInfo {
             version: None,
             cbmem_console: None,
             smbios: None,
+            smmstorev2: None,
         }
     }
 }
@@ -425,6 +478,9 @@ fn parse_record(record_bytes: &[u8], info: &mut CorebootInfo) {
         }
         tags::CB_TAG_CBMEM_ENTRY => {
             parse_cbmem_entry(record_bytes, info);
+        }
+        tags::CB_TAG_SMMSTOREV2 => {
+            parse_smmstorev2(record_bytes, info);
         }
         tags::CB_TAG_VERSION => {
             // Version string follows the 8-byte record header
@@ -704,4 +760,63 @@ fn parse_cbmem_entry(record_bytes: &[u8], info: &mut CorebootInfo) {
             );
         }
     }
+}
+
+/// Parse SMMSTORE v2 record
+///
+/// SMMSTORE v2 provides information for accessing UEFI variable storage
+/// through coreboot's SMM-based interface.
+///
+/// This function is safe - it uses zerocopy to parse the SMMSTORE v2 struct.
+fn parse_smmstorev2(record_bytes: &[u8], info: &mut CorebootInfo) {
+    let Ok((smmstore, _)) = CbSmmstorev2::read_from_prefix(record_bytes) else {
+        log::warn!("Failed to parse SMMSTORE v2 record");
+        return;
+    };
+
+    let num_blocks = smmstore.num_blocks;
+    let block_size = smmstore.block_size;
+    let com_buffer = smmstore.com_buffer;
+    let com_buffer_size = smmstore.com_buffer_size;
+    let apm_cmd = smmstore.apm_cmd;
+
+    // The 64-bit mmap_addr field was added later.
+    // Check record size to determine if it's present.
+    // Base struct without mmap_addr would be 28 bytes (tag+size+fields up to unused[3])
+    // With mmap_addr it's 36 bytes
+    let record_size = record_bytes.len();
+    let mmap_addr = if record_size >= 36 {
+        // 64-bit address is available
+        smmstore.mmap_addr
+    } else if smmstore.mmap_addr_deprecated != 0 {
+        // Fall back to 32-bit address
+        smmstore.mmap_addr_deprecated as u64
+    } else {
+        0
+    };
+
+    let total_size = num_blocks as u64 * block_size as u64;
+
+    info.smmstorev2 = Some(Smmstorev2Info {
+        num_blocks,
+        block_size,
+        mmap_addr,
+        com_buffer,
+        com_buffer_size,
+        apm_cmd,
+    });
+
+    log::info!(
+        "SMMSTORE v2: {} blocks x {} KB = {} KB at {:#x}",
+        num_blocks,
+        block_size / 1024,
+        total_size / 1024,
+        mmap_addr
+    );
+    log::debug!(
+        "  COM buffer: {:#x} ({} bytes), APM cmd: {:#x}",
+        com_buffer,
+        com_buffer_size,
+        apm_cmd
+    );
 }
