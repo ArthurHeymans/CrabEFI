@@ -56,8 +56,13 @@ pub fn verify_pkcs7_signature(
     use cms::signed_data::SignedData;
     use der::{Decode, Encode};
 
+    // WIN_CERTIFICATE is 8-byte aligned, so there may be trailing padding bytes
+    // after the actual PKCS#7 content. We need to calculate the real DER length
+    // and only parse that portion.
+    let actual_pkcs7 = trim_der_trailing_bytes(pkcs7_data)?;
+
     // Parse the PKCS#7 ContentInfo structure
-    let content_info = ContentInfo::from_der(pkcs7_data).map_err(|e| {
+    let content_info = ContentInfo::from_der(actual_pkcs7).map_err(|e| {
         log::debug!("Failed to parse PKCS#7 ContentInfo: {:?}", e);
         AuthError::InvalidHeader
     })?;
@@ -252,6 +257,40 @@ fn parse_der_length(data: &[u8]) -> Result<(usize, usize), AuthError> {
 
         Ok((length, 1 + num_bytes))
     }
+}
+
+/// Trim trailing bytes from a DER-encoded structure
+///
+/// WIN_CERTIFICATE structures are 8-byte aligned, which means the PKCS#7
+/// data may have padding bytes after the actual DER content. This function
+/// reads the DER length and returns a slice containing only the valid data.
+fn trim_der_trailing_bytes(data: &[u8]) -> Result<&[u8], AuthError> {
+    if data.is_empty() {
+        return Err(AuthError::InvalidHeader);
+    }
+
+    // DER structures start with a tag byte, then length, then content
+    // For PKCS#7, it's a SEQUENCE (0x30)
+    if data[0] != 0x30 {
+        // Not a SEQUENCE - return as-is and let the parser handle it
+        return Ok(data);
+    }
+
+    // Parse the length to find actual content size
+    if data.len() < 2 {
+        return Ok(data);
+    }
+
+    let (content_len, len_bytes) = parse_der_length(&data[1..])?;
+    let total_len = 1 + len_bytes + content_len;
+
+    if total_len > data.len() {
+        // Content extends beyond buffer - invalid, but let parser handle it
+        return Ok(data);
+    }
+
+    // Return only the valid DER portion
+    Ok(&data[..total_len])
 }
 
 // ============================================================================
