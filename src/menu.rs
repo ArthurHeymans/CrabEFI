@@ -33,7 +33,7 @@ const DEFAULT_TIMEOUT_SECONDS: u32 = 5;
 const MENU_TITLE: &str = "CrabEFI Boot Menu";
 
 /// Help text
-const HELP_TEXT: &str = "Use arrow keys to select, Enter to boot";
+const HELP_TEXT: &str = "Arrows: Select | Enter: Boot | S: Secure Boot Settings";
 
 /// Storage device type
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -617,6 +617,13 @@ pub fn show_menu(menu: &mut BootMenu) -> Option<usize> {
                 KeyPress::Escape => {
                     // Future: file browser
                     draw_status("File browser not yet implemented", &mut fb_console);
+                }
+                KeyPress::Char('s') | KeyPress::Char('S') => {
+                    // Open Secure Boot settings menu
+                    crate::secure_boot_menu::show_secure_boot_menu();
+                    // Redraw boot menu after returning
+                    clear_screen(&mut fb_console);
+                    draw_menu(menu, &mut fb_console);
                 }
                 KeyPress::Char(c) if c.is_ascii_digit() => {
                     // Direct selection by number
