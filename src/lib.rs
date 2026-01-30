@@ -246,6 +246,29 @@ pub fn init(coreboot_table_ptr: u64) {
                     Err(e) => log::warn!("Failed to process deferred writes: {:?}", e),
                 }
             }
+
+            // Initialize Secure Boot state (load keys from variables, create status vars)
+            // This must be called after variables are loaded from SMMSTORE
+            match efi::auth::boot::init_secure_boot_default() {
+                Ok(status) => {
+                    log::info!("Secure Boot initialized:");
+                    log::info!(
+                        "  Mode: {}",
+                        if status.setup_mode { "Setup" } else { "User" }
+                    );
+                    log::info!(
+                        "  Keys: PK={}, KEK={}, db={}, dbx={}",
+                        status.pk_count,
+                        status.kek_count,
+                        status.db_count,
+                        status.dbx_count
+                    );
+                    if status.secure_boot_enabled {
+                        log::info!("  Secure Boot: ENABLED");
+                    }
+                }
+                Err(e) => log::warn!("Secure Boot initialization failed: {:?}", e),
+            }
         }
         Err(e) => log::warn!("Variable store persistence not available: {:?}", e),
     }

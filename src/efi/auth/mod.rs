@@ -26,6 +26,7 @@
 //! - **Setup Mode**: When PK is empty, authenticated writes skip signature verification
 //! - **User Mode**: When PK is enrolled, all authenticated variable writes require valid signatures
 
+pub mod boot;
 mod crypto;
 pub mod enrollment;
 mod signature;
