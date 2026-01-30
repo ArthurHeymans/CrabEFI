@@ -506,8 +506,19 @@ impl<'a, D: BlockDevice> FatFilesystem<'a, D> {
                 }
             }
             FatType::Fat16 => {
-                let entry =
-                    u16::from_le_bytes([buffer[offset_in_block], buffer[offset_in_block + 1]]);
+                let entry = if offset_in_block + 1 < device_block_size {
+                    u16::from_le_bytes([buffer[offset_in_block], buffer[offset_in_block + 1]])
+                } else {
+                    // Entry spans device blocks - need to read next block
+                    let low = buffer[offset_in_block];
+                    self.device
+                        .read_block(
+                            self.partition_start + device_block + 1,
+                            &mut buffer[..device_block_size],
+                        )
+                        .map_err(|_| FatError::ReadError)?;
+                    u16::from_le_bytes([low, buffer[0]])
+                };
 
                 if entry >= 0xFFF8 {
                     None
@@ -518,12 +529,30 @@ impl<'a, D: BlockDevice> FatFilesystem<'a, D> {
                 }
             }
             FatType::Fat32 => {
-                let entry = u32::from_le_bytes([
-                    buffer[offset_in_block],
-                    buffer[offset_in_block + 1],
-                    buffer[offset_in_block + 2],
-                    buffer[offset_in_block + 3],
-                ]) & 0x0FFFFFFF;
+                let entry = if offset_in_block + 3 < device_block_size {
+                    u32::from_le_bytes([
+                        buffer[offset_in_block],
+                        buffer[offset_in_block + 1],
+                        buffer[offset_in_block + 2],
+                        buffer[offset_in_block + 3],
+                    ])
+                } else {
+                    // Entry spans device blocks - read bytes from current and next block
+                    let bytes_in_current = device_block_size - offset_in_block;
+                    let mut entry_bytes = [0u8; 4];
+                    entry_bytes[..bytes_in_current].copy_from_slice(
+                        &buffer[offset_in_block..offset_in_block + bytes_in_current],
+                    );
+                    self.device
+                        .read_block(
+                            self.partition_start + device_block + 1,
+                            &mut buffer[..device_block_size],
+                        )
+                        .map_err(|_| FatError::ReadError)?;
+                    entry_bytes[bytes_in_current..4]
+                        .copy_from_slice(&buffer[..4 - bytes_in_current]);
+                    u32::from_le_bytes(entry_bytes)
+                } & 0x0FFFFFFF;
 
                 if entry >= 0x0FFFFFF8 {
                     None
@@ -898,25 +927,9 @@ impl<'a, D: BlockDevice> FatFilesystem<'a, D> {
 
         // Cluster chain directory
         let mut current_cluster = cluster;
-        let device_block_size = self.device_block_size as usize;
-        let device_blocks_per_cluster = cluster_size.div_ceil(device_block_size).max(1);
 
         loop {
-            // Read cluster using device blocks
-            let start_device_block = self
-                .cluster_to_device_block(current_cluster)
-                .ok_or(FatError::InvalidCluster)?;
-
-            for b in 0..device_blocks_per_cluster {
-                let offset = b * device_block_size;
-                let read_size = device_block_size.min(cluster_size - offset);
-                self.device
-                    .read_block(
-                        start_device_block + b as u64,
-                        &mut buffer[offset..offset + read_size],
-                    )
-                    .map_err(|_| FatError::ReadError)?;
-            }
+            self.read_cluster(current_cluster, &mut buffer[..cluster_size])?;
 
             // Search entries
             for i in 0..entries_per_cluster {
