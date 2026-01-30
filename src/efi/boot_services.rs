@@ -808,6 +808,24 @@ extern "efiapi" fn load_image(
     // Create a slice from the source buffer
     let data = unsafe { core::slice::from_raw_parts(source_buffer as *const u8, source_size) };
 
+    // Secure Boot verification (if enabled)
+    if super::auth::is_secure_boot_enabled() {
+        log::debug!("BS.LoadImage: Secure Boot verification required");
+        match super::auth::verify_pe_image_secure_boot(data) {
+            Ok(true) => {
+                log::info!("BS.LoadImage: Secure Boot verification passed");
+            }
+            Ok(false) => {
+                log::error!("BS.LoadImage: Secure Boot verification FAILED - image not authorized");
+                return Status::SECURITY_VIOLATION;
+            }
+            Err(e) => {
+                log::error!("BS.LoadImage: Secure Boot verification error: {:?}", e);
+                return Status::SECURITY_VIOLATION;
+            }
+        }
+    }
+
     // Load the PE image using our PE loader
     let loaded_image = match pe::load_image(data) {
         Ok(img) => img,
