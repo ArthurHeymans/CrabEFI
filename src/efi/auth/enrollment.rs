@@ -43,7 +43,7 @@ const MICROSOFT_OWNER_GUID: [u8; 16] = [
 
 /// CrabEFI vendor GUID for the default PK
 /// {a0b7e8f2-4c5d-4e6f-8091-a1b2c3d4e5f6}
-const CRABEFI_OWNER_GUID: [u8; 16] = [
+pub const CRABEFI_OWNER_GUID: [u8; 16] = [
     0xf2, 0xe8, 0xb7, 0xa0, 0x5d, 0x4c, 0x6f, 0x4e, 0x80, 0x91, 0xa1, 0xb2, 0xc3, 0xd4, 0xe5, 0xf6,
 ];
 
