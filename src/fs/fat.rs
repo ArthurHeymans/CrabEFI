@@ -5,8 +5,11 @@
 
 use crate::drivers::block::BlockDevice;
 
-/// Sector size (usually 512 bytes)
+/// Standard sector size (512 bytes) - used for FAT calculations
 pub const SECTOR_SIZE: usize = 512;
+
+/// Maximum block size we support (4KB - handles CD-ROMs with 2048-byte blocks)
+const MAX_BLOCK_SIZE: usize = 4096;
 
 /// FAT Boot Parameter Block (BPB) - common fields
 #[repr(C, packed)]
@@ -228,8 +231,10 @@ pub struct FatFilesystem<'a, D: BlockDevice> {
     partition_start: u64,
     /// FAT type
     fat_type: FatType,
-    /// Bytes per sector
+    /// Bytes per sector (from FAT BPB)
     bytes_per_sector: u16,
+    /// Device block size (for buffer allocation)
+    device_block_size: u32,
     /// Sectors per cluster
     sectors_per_cluster: u8,
     /// First FAT sector (relative to partition start)
@@ -253,11 +258,14 @@ pub struct FatFilesystem<'a, D: BlockDevice> {
 impl<'a, D: BlockDevice> FatFilesystem<'a, D> {
     /// Create a new FAT filesystem instance
     pub fn new(device: &'a mut D, partition_start: u64) -> Result<Self, FatError> {
-        let mut buffer = [0u8; SECTOR_SIZE];
+        // Use device's actual block size for reading
+        let info = device.info();
+        let block_size = (info.block_size as usize).min(MAX_BLOCK_SIZE);
+        let mut buffer = [0u8; MAX_BLOCK_SIZE];
 
         // Read the boot sector
         device
-            .read_block(partition_start, &mut buffer)
+            .read_block(partition_start, &mut buffer[..block_size])
             .map_err(|_| FatError::ReadError)?;
 
         // Parse BPB
@@ -365,12 +373,26 @@ impl<'a, D: BlockDevice> FatFilesystem<'a, D> {
             data_clusters,
             sectors_per_cluster as u32 * bytes_per_sector as u32
         );
+        log::debug!(
+            "FAT layout: bytes_per_sector={}, sectors_per_cluster={}, device_block_size={}",
+            bytes_per_sector,
+            sectors_per_cluster,
+            block_size
+        );
+        log::debug!(
+            "FAT layout: fat_start={}, root_dir_start={}, root_dir_sectors={}, data_start={}",
+            fat_start,
+            root_dir_start,
+            root_dir_sectors,
+            data_start
+        );
 
         Ok(Self {
             device,
             partition_start,
             fat_type,
             bytes_per_sector,
+            device_block_size: block_size as u32,
             sectors_per_cluster,
             fat_start,
             sectors_per_fat,
@@ -382,11 +404,11 @@ impl<'a, D: BlockDevice> FatFilesystem<'a, D> {
         })
     }
 
-    /// Get the first sector of a cluster
+    /// Get the first device block of a cluster
     ///
     /// # Returns
     /// Returns `None` if the cluster number is invalid (< 2 or beyond data region)
-    fn cluster_to_sector(&self, cluster: u32) -> Option<u64> {
+    fn cluster_to_device_block(&self, cluster: u32) -> Option<u64> {
         // Clusters 0 and 1 are reserved in FAT
         if cluster < 2 {
             return None;
@@ -395,10 +417,12 @@ impl<'a, D: BlockDevice> FatFilesystem<'a, D> {
         if cluster - 2 >= self.data_clusters {
             return None;
         }
-        // Calculate sector with overflow check
+        // Calculate FAT sector with overflow check
         let cluster_offset = (cluster - 2).checked_mul(self.sectors_per_cluster as u32)?;
-        let sector = self.data_start.checked_add(cluster_offset)?;
-        self.partition_start.checked_add(sector as u64)
+        let fat_sector = self.data_start.checked_add(cluster_offset)?;
+        // Translate to device block
+        let device_block = self.fat_sector_to_device_block(fat_sector as u64);
+        self.partition_start.checked_add(device_block)
     }
 
     /// Read the next cluster from the FAT
@@ -408,55 +432,50 @@ impl<'a, D: BlockDevice> FatFilesystem<'a, D> {
             return Err(FatError::InvalidCluster);
         }
 
-        let mut buffer = [0u8; SECTOR_SIZE];
-        let bytes_per_sector = self.bytes_per_sector as u32;
+        // Use device block size for buffer to avoid overflow
+        let device_block_size = self.device_block_size as usize;
+        let mut buffer = [0u8; MAX_BLOCK_SIZE];
+        let bytes_per_sector = self.bytes_per_sector as u64;
 
-        let (fat_offset, sector_offset) = match self.fat_type {
+        // Calculate byte offset of FAT entry from partition start
+        let entry_byte_offset = match self.fat_type {
             FatType::Fat12 => {
-                // offset = cluster * 1.5, but we calculate as cluster + cluster/2 to avoid floats
-                let offset = cluster
-                    .checked_add(cluster / 2)
-                    .ok_or(FatError::InvalidCluster)?;
-                let sector = self
-                    .fat_start
-                    .checked_add(offset / bytes_per_sector)
-                    .ok_or(FatError::InvalidCluster)?;
-                (offset % bytes_per_sector, sector)
+                // offset = cluster * 1.5
+                let fat_byte_offset = (cluster as u64 * 3) / 2;
+                (self.fat_start as u64 * bytes_per_sector) + fat_byte_offset
             }
             FatType::Fat16 => {
-                let offset = cluster.checked_mul(2).ok_or(FatError::InvalidCluster)?;
-                let sector = self
-                    .fat_start
-                    .checked_add(offset / bytes_per_sector)
-                    .ok_or(FatError::InvalidCluster)?;
-                (offset % bytes_per_sector, sector)
+                let fat_byte_offset = cluster as u64 * 2;
+                (self.fat_start as u64 * bytes_per_sector) + fat_byte_offset
             }
             FatType::Fat32 => {
-                let offset = cluster.checked_mul(4).ok_or(FatError::InvalidCluster)?;
-                let sector = self
-                    .fat_start
-                    .checked_add(offset / bytes_per_sector)
-                    .ok_or(FatError::InvalidCluster)?;
-                (offset % bytes_per_sector, sector)
+                let fat_byte_offset = cluster as u64 * 4;
+                (self.fat_start as u64 * bytes_per_sector) + fat_byte_offset
             }
         };
 
+        // Translate byte offset to device block
+        let device_block = entry_byte_offset / device_block_size as u64;
+        let offset_in_block = (entry_byte_offset % device_block_size as u64) as usize;
+
         self.device
-            .read_block(self.partition_start + sector_offset as u64, &mut buffer)
+            .read_block(
+                self.partition_start + device_block,
+                &mut buffer[..device_block_size],
+            )
             .map_err(|_| FatError::ReadError)?;
 
         let next = match self.fat_type {
             FatType::Fat12 => {
-                let entry = if fat_offset + 1 < self.bytes_per_sector as u32 {
-                    buffer[fat_offset as usize] as u16
-                        | ((buffer[(fat_offset + 1) as usize] as u16) << 8)
+                let entry = if offset_in_block + 1 < device_block_size {
+                    buffer[offset_in_block] as u16 | ((buffer[offset_in_block + 1] as u16) << 8)
                 } else {
-                    // Entry spans sectors - need to read next sector
-                    let low = buffer[fat_offset as usize] as u16;
+                    // Entry spans device blocks - need to read next block
+                    let low = buffer[offset_in_block] as u16;
                     self.device
                         .read_block(
-                            self.partition_start + (sector_offset + 1) as u64,
-                            &mut buffer,
+                            self.partition_start + device_block + 1,
+                            &mut buffer[..device_block_size],
                         )
                         .map_err(|_| FatError::ReadError)?;
                     low | ((buffer[0] as u16) << 8)
@@ -477,10 +496,8 @@ impl<'a, D: BlockDevice> FatFilesystem<'a, D> {
                 }
             }
             FatType::Fat16 => {
-                let entry = u16::from_le_bytes([
-                    buffer[fat_offset as usize],
-                    buffer[(fat_offset + 1) as usize],
-                ]);
+                let entry =
+                    u16::from_le_bytes([buffer[offset_in_block], buffer[offset_in_block + 1]]);
 
                 if entry >= 0xFFF8 {
                     None
@@ -492,10 +509,10 @@ impl<'a, D: BlockDevice> FatFilesystem<'a, D> {
             }
             FatType::Fat32 => {
                 let entry = u32::from_le_bytes([
-                    buffer[fat_offset as usize],
-                    buffer[(fat_offset + 1) as usize],
-                    buffer[(fat_offset + 2) as usize],
-                    buffer[(fat_offset + 3) as usize],
+                    buffer[offset_in_block],
+                    buffer[offset_in_block + 1],
+                    buffer[offset_in_block + 2],
+                    buffer[offset_in_block + 3],
                 ]) & 0x0FFFFFFF;
 
                 if entry >= 0x0FFFFFF8 {
@@ -518,25 +535,31 @@ impl<'a, D: BlockDevice> FatFilesystem<'a, D> {
             return Err(FatError::BufferTooSmall);
         }
 
-        let start_sector = self
-            .cluster_to_sector(cluster)
+        let start_device_block = self
+            .cluster_to_device_block(cluster)
             .ok_or(FatError::InvalidCluster)?;
-        let bytes_per_sector = self.bytes_per_sector as usize;
 
-        (0..self.sectors_per_cluster).try_for_each(|i| {
-            let offset = i as usize * bytes_per_sector;
+        // Calculate how many device blocks make up one cluster
+        let device_block_size = self.device_block_size as usize;
+        let device_blocks_per_cluster = cluster_size.div_ceil(device_block_size);
+
+        for i in 0..device_blocks_per_cluster {
+            let offset = i * device_block_size;
+            let read_size = device_block_size.min(cluster_size - offset);
             self.device
                 .read_block(
-                    start_sector + i as u64,
-                    &mut buffer[offset..offset + bytes_per_sector],
+                    start_device_block + i as u64,
+                    &mut buffer[offset..offset + read_size],
                 )
-                .map_err(|_| FatError::ReadError)
-        })
+                .map_err(|_| FatError::ReadError)?;
+        }
+        Ok(())
     }
 
     /// Find a file by path
     pub fn find_file(&mut self, path: &str) -> Result<DirectoryEntry, FatError> {
         let path = path.trim_start_matches('/').trim_start_matches('\\');
+        log::debug!("FAT: looking for path '{}'", path);
 
         let mut current_dir_cluster = if self.fat_type == FatType::Fat32 {
             self.root_cluster
@@ -546,6 +569,12 @@ impl<'a, D: BlockDevice> FatFilesystem<'a, D> {
 
         let parts: heapless::Vec<&str, 16> =
             path.split(['/', '\\']).filter(|s| !s.is_empty()).collect();
+
+        log::debug!(
+            "FAT: path has {} components, starting at cluster {}",
+            parts.len(),
+            current_dir_cluster
+        );
 
         for (i, part) in parts.iter().enumerate() {
             let is_last = i == parts.len() - 1;
@@ -566,33 +595,69 @@ impl<'a, D: BlockDevice> FatFilesystem<'a, D> {
         Err(FatError::NotFound)
     }
 
+    /// Translate a FAT sector offset to a device block offset
+    ///
+    /// When the device block size differs from FAT's bytes_per_sector,
+    /// we need to translate FAT sector numbers to device block numbers.
+    fn fat_sector_to_device_block(&self, fat_sector: u64) -> u64 {
+        let bytes_per_sector = self.bytes_per_sector as u64;
+        let device_block_size = self.device_block_size as u64;
+
+        if bytes_per_sector == device_block_size {
+            fat_sector
+        } else {
+            // Convert FAT sector to byte offset, then to device block
+            (fat_sector * bytes_per_sector) / device_block_size
+        }
+    }
+
     /// Find an entry in a directory
     fn find_in_directory(&mut self, cluster: u32, name: &str) -> Result<DirectoryEntry, FatError> {
         // FAT cluster sizes can be up to 128 sectors * 512 bytes = 65536 bytes
         let mut buffer = [0u8; 65536]; // Max cluster size (128 sectors * 512 bytes)
         let entries_per_sector = self.bytes_per_sector as usize / 32;
+        // Use the larger of FAT sector size or device block size for reads
+        let read_size = (self.bytes_per_sector as usize).max(self.device_block_size as usize);
 
         if cluster == 0 && self.fat_type != FatType::Fat32 {
             // FAT12/16 root directory (fixed location)
-            for sector_idx in 0..self.root_dir_sectors {
-                let sector = self.partition_start + (self.root_dir_start + sector_idx) as u64;
+            // Translate FAT sectors to device blocks
+            let root_dir_device_block = self.fat_sector_to_device_block(self.root_dir_start as u64);
+            let sectors_per_device_block =
+                self.device_block_size as usize / self.bytes_per_sector as usize;
+            let entries_per_device_block = entries_per_sector * sectors_per_device_block.max(1);
+            let device_blocks_for_root =
+                (self.root_dir_sectors as usize).div_ceil(sectors_per_device_block.max(1));
+
+            for block_idx in 0..device_blocks_for_root as u64 {
+                let device_block = self.partition_start + root_dir_device_block + block_idx;
                 self.device
-                    .read_block(sector, &mut buffer[..self.bytes_per_sector as usize])
+                    .read_block(device_block, &mut buffer[..read_size])
                     .map_err(|_| FatError::ReadError)?;
 
-                for i in 0..entries_per_sector {
+                for i in 0..entries_per_device_block {
                     let offset = i * 32;
+                    if offset + 32 > read_size {
+                        break;
+                    }
                     let entry = unsafe {
                         core::ptr::read_unaligned(buffer[offset..].as_ptr() as *const DirectoryEntry)
                     };
 
                     if entry.is_end() {
+                        log::debug!("FAT: end of directory, '{}' not found", name);
                         return Err(FatError::NotFound);
                     }
 
                     if entry.is_free() || entry.is_lfn() || entry.is_volume_id() {
                         continue;
                     }
+
+                    log::debug!(
+                        "FAT: found entry '{}' (looking for '{}')",
+                        entry.short_name(),
+                        name
+                    );
 
                     if entry.matches_name(name) {
                         return Ok(entry);
@@ -615,12 +680,24 @@ impl<'a, D: BlockDevice> FatFilesystem<'a, D> {
                     };
 
                     if entry.is_end() {
+                        log::debug!(
+                            "FAT: end of directory in cluster {}, '{}' not found",
+                            current_cluster,
+                            name
+                        );
                         return Err(FatError::NotFound);
                     }
 
                     if entry.is_free() || entry.is_lfn() || entry.is_volume_id() {
                         continue;
                     }
+
+                    log::debug!(
+                        "FAT: found entry '{}' in cluster {} (looking for '{}')",
+                        entry.short_name(),
+                        current_cluster,
+                        name
+                    );
 
                     if entry.matches_name(name) {
                         return Ok(entry);
@@ -629,7 +706,10 @@ impl<'a, D: BlockDevice> FatFilesystem<'a, D> {
 
                 match self.next_cluster(current_cluster)? {
                     Some(next) => current_cluster = next,
-                    None => return Err(FatError::NotFound),
+                    None => {
+                        log::debug!("FAT: end of cluster chain, '{}' not found", name);
+                        return Err(FatError::NotFound);
+                    }
                 }
             }
         }

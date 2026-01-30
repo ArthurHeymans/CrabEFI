@@ -1170,3 +1170,18 @@ pub fn global_read_sector(lba: u64, buffer: &mut [u8]) -> Result<(), ()> {
         log::error!("global_read_sector: read failed at LBA {}: {:?}", lba, e);
     })
 }
+
+/// Get the sector size of the global NVMe device
+pub fn global_sector_size() -> Option<u32> {
+    let (controller_index, nsid) = match GLOBAL_NVME_DEVICE.lock().as_ref() {
+        Some(ptr) => unsafe {
+            let device = &*ptr.0;
+            (device.controller_index, device.nsid)
+        },
+        None => return None,
+    };
+
+    let controller = get_controller(controller_index)?;
+    let ns = controller.get_namespace(nsid)?;
+    Some(ns.block_size)
+}

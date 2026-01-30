@@ -3,7 +3,13 @@
 //! This module provides parsing of GPT partitioned disks to find the EFI
 //! System Partition (ESP).
 
-use crate::drivers::block::{BlockDevice, BlockError, SECTOR_SIZE};
+use crate::drivers::block::{BlockDevice, BlockError};
+
+/// Maximum supported block size (4KB - handles most devices including CD-ROMs)
+const MAX_BLOCK_SIZE: usize = 4096;
+
+/// Minimum block size for GPT calculations
+const MIN_BLOCK_SIZE: usize = 512;
 
 /// GPT header signature "EFI PART"
 const GPT_SIGNATURE: u64 = 0x5452415020494645;
@@ -110,9 +116,13 @@ impl GptPartitionEntry {
         }
     }
 
-    /// Get partition size in bytes
+    /// Get partition size in bytes (assumes 512-byte sectors)
+    ///
+    /// Note: For devices with larger block sizes (e.g., CD-ROMs with 2048-byte blocks),
+    /// this will underestimate the actual size. The LBA values are relative to the
+    /// device's native block size.
     pub fn size_bytes(&self) -> u64 {
-        self.size_sectors() * SECTOR_SIZE as u64
+        self.size_sectors() * MIN_BLOCK_SIZE as u64
     }
 
     /// Get partition name as ASCII (for display)
@@ -141,18 +151,20 @@ pub struct Partition {
     pub type_guid: [u8; 16],
     /// Unique partition GUID
     pub partition_guid: [u8; 16],
-    /// First LBA
+    /// First LBA (in device block terms)
     pub first_lba: u64,
-    /// Last LBA (inclusive)
+    /// Last LBA (inclusive, in device block terms)
     pub last_lba: u64,
     /// Attributes
     pub attributes: u64,
     /// Is this the EFI System Partition?
     pub is_esp: bool,
+    /// Block size of the device (for size calculations)
+    pub block_size: u32,
 }
 
 impl Partition {
-    /// Get partition size in sectors
+    /// Get partition size in blocks
     pub fn size_sectors(&self) -> u64 {
         if self.last_lba >= self.first_lba {
             self.last_lba - self.first_lba + 1
@@ -163,7 +175,7 @@ impl Partition {
 
     /// Get partition size in bytes
     pub fn size_bytes(&self) -> u64 {
-        self.size_sectors() * SECTOR_SIZE as u64
+        self.size_sectors() * self.block_size as u64
     }
 }
 
@@ -192,16 +204,40 @@ impl From<BlockError> for GptError {
 }
 
 /// Read and parse the GPT header
+///
+/// Handles both standard disks (512-byte sectors) and hybrid ISOs on CD-ROMs
+/// (2048-byte sectors with GPT embedded at byte offset 512).
 pub fn read_gpt_header<D: BlockDevice>(device: &mut D) -> Result<GptHeader, GptError> {
-    let mut buffer = [0u8; SECTOR_SIZE];
+    // Use device's actual block size, capped at MAX_BLOCK_SIZE
+    let info = device.info();
+    let block_size = (info.block_size as usize).min(MAX_BLOCK_SIZE);
 
-    log::debug!("Reading GPT header from LBA 1...");
+    // Allocate buffer large enough for any supported block size
+    let mut buffer = [0u8; MAX_BLOCK_SIZE];
 
-    // GPT header is at LBA 1 (sector 1)
-    device.read_block(1, &mut buffer)?;
+    // For devices with block sizes > 512 bytes (like CD-ROMs), the GPT on hybrid
+    // ISOs is at byte offset 512, which is inside the first block (LBA 0).
+    // For standard 512-byte sector devices, GPT is at LBA 1.
+    let (lba, gpt_offset) = if block_size > MIN_BLOCK_SIZE {
+        // Hybrid ISO: GPT header at byte 512 (inside LBA 0)
+        (0, MIN_BLOCK_SIZE)
+    } else {
+        // Standard disk: GPT header at LBA 1
+        (1, 0)
+    };
 
-    // Parse header (copy to avoid alignment issues with packed struct)
-    let header = unsafe { core::ptr::read_unaligned(buffer.as_ptr() as *const GptHeader) };
+    log::debug!(
+        "Reading GPT header from LBA {} offset {} (block_size={})...",
+        lba,
+        gpt_offset,
+        block_size
+    );
+
+    device.read_block(lba, &mut buffer[..block_size])?;
+
+    // Parse header from the appropriate offset
+    let header =
+        unsafe { core::ptr::read_unaligned(buffer[gpt_offset..].as_ptr() as *const GptHeader) };
 
     // Copy fields to avoid alignment issues with packed struct
     let signature = header.signature;
@@ -225,25 +261,49 @@ pub fn read_gpt_header<D: BlockDevice>(device: &mut D) -> Result<GptHeader, GptE
 }
 
 /// Read partition entries from GPT
+///
+/// Handles both standard disks (512-byte sectors) and hybrid ISOs on CD-ROMs
+/// (2048-byte sectors with GPT written assuming 512-byte blocks).
 pub fn read_partitions<D: BlockDevice>(
     device: &mut D,
     header: &GptHeader,
 ) -> Result<heapless::Vec<Partition, 16>, GptError> {
     let mut partitions = heapless::Vec::new();
-    let mut buffer = [0u8; SECTOR_SIZE];
 
-    let entries_per_sector = SECTOR_SIZE / header.partition_entry_size as usize;
-    let num_sectors = (header.num_partition_entries as usize).div_ceil(entries_per_sector);
+    // Use device's actual block size, capped at MAX_BLOCK_SIZE
+    let info = device.info();
+    let block_size = (info.block_size as usize).clamp(MIN_BLOCK_SIZE, MAX_BLOCK_SIZE);
+
+    let mut buffer = [0u8; MAX_BLOCK_SIZE];
+
+    // For hybrid ISOs on large-block devices, the GPT's LBA values are in 512-byte terms.
+    // We need to translate to actual device blocks.
+    let is_hybrid = block_size > MIN_BLOCK_SIZE;
+
+    // Calculate where partition entries start in byte terms
+    // For hybrid ISOs, partition_entry_lba is in 512-byte terms
+    let entries_byte_offset = if is_hybrid {
+        header.partition_entry_lba as usize * MIN_BLOCK_SIZE
+    } else {
+        header.partition_entry_lba as usize * block_size
+    };
+
+    let entry_size = header.partition_entry_size as usize;
+    let total_entries = header.num_partition_entries as usize;
+    let total_bytes_needed = total_entries * entry_size;
 
     let mut entry_index = 0u32;
     let mut consecutive_empty = 0u32;
+    let mut bytes_read = 0usize;
 
-    'outer: for sector_offset in 0..num_sectors {
-        let lba = header.partition_entry_lba + sector_offset as u64;
+    'outer: while bytes_read < total_bytes_needed {
+        // Calculate which device block to read
+        let current_byte_offset = entries_byte_offset + bytes_read;
+        let lba = (current_byte_offset / block_size) as u64;
+        let offset_in_block = current_byte_offset % block_size;
 
-        // Try to read the sector, but don't fail if we've already found partitions
-        // and encounter a read error (some ISOs have truncated partition tables)
-        if let Err(e) = device.read_block(lba, &mut buffer) {
+        // Try to read the block
+        if let Err(e) = device.read_block(lba, &mut buffer[..block_size]) {
             if !partitions.is_empty() {
                 log::debug!(
                     "Stopping partition scan at LBA {} (read error after finding {} partitions): {:?}",
@@ -256,34 +316,45 @@ pub fn read_partitions<D: BlockDevice>(
             return Err(e.into());
         }
 
-        for i in 0..entries_per_sector {
-            if entry_index >= header.num_partition_entries {
-                break 'outer;
-            }
-
-            let offset = i * header.partition_entry_size as usize;
+        // Process entries from this block
+        let mut pos = offset_in_block;
+        while pos + entry_size <= block_size && entry_index < header.num_partition_entries {
             let entry = unsafe {
-                core::ptr::read_unaligned(buffer[offset..].as_ptr() as *const GptPartitionEntry)
+                core::ptr::read_unaligned(buffer[pos..].as_ptr() as *const GptPartitionEntry)
             };
 
             if !entry.is_empty() {
                 consecutive_empty = 0;
+
+                // For hybrid ISOs, translate GPT LBAs (512-byte terms) to device LBAs
+                let (first_lba, last_lba) = if is_hybrid {
+                    // GPT LBA * 512 / block_size = device LBA
+                    // This works because hybrid ISO partitions are aligned to 2048 bytes
+                    let first = entry.first_lba * MIN_BLOCK_SIZE as u64 / block_size as u64;
+                    let last = entry.last_lba * MIN_BLOCK_SIZE as u64 / block_size as u64;
+                    (first, last)
+                } else {
+                    (entry.first_lba, entry.last_lba)
+                };
+
                 let partition = Partition {
                     type_guid: entry.type_guid,
                     partition_guid: entry.partition_guid,
-                    first_lba: entry.first_lba,
-                    last_lba: entry.last_lba,
+                    first_lba,
+                    last_lba,
                     attributes: entry.attributes,
                     is_esp: entry.is_esp(),
+                    block_size: block_size as u32,
                 };
 
                 log::debug!(
-                    "Partition {}: LBA {}-{} ({} MB) ESP={}",
+                    "Partition {}: LBA {}-{} ({} MB) ESP={}{}",
                     entry_index,
                     partition.first_lba,
                     partition.last_lba,
                     partition.size_bytes() / (1024 * 1024),
-                    partition.is_esp
+                    partition.is_esp,
+                    if is_hybrid { " [hybrid]" } else { "" }
                 );
 
                 if partitions.push(partition).is_err() {
@@ -292,7 +363,7 @@ pub fn read_partitions<D: BlockDevice>(
                 }
             } else {
                 consecutive_empty += 1;
-                // Stop scanning after 8 consecutive empty entries (2 sectors worth)
+                // Stop scanning after 8 consecutive empty entries (2 blocks worth)
                 // This handles truncated partition tables in ISOs
                 if consecutive_empty >= 8 && !partitions.is_empty() {
                     log::debug!(
@@ -303,7 +374,14 @@ pub fn read_partitions<D: BlockDevice>(
                 }
             }
 
+            pos += entry_size;
+            bytes_read += entry_size;
             entry_index += 1;
+        }
+
+        // If we didn't process any entries, move to next block
+        if pos == offset_in_block {
+            bytes_read += block_size - offset_in_block;
         }
     }
 

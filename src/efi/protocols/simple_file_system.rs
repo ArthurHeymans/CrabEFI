@@ -787,19 +787,29 @@ fn find_in_directory(
     cluster: u32,
     name: &str,
 ) -> Result<DirEntry, ()> {
-    let mut buffer = [0u8; 4096];
+    let mut buffer = [0u8; 65536]; // Max cluster size
     let cluster_size = state.sectors_per_cluster as usize * state.bytes_per_sector as usize;
     let entries_per_cluster = cluster_size / 32;
+    let device_block_size = state.device_block_size as usize;
 
     // Handle FAT12/16 root directory (fixed location)
     if cluster == 0 && state.fat_type != 32 {
-        for sector_idx in 0..state.root_dir_sectors {
-            let sector = state.partition_start + (state.root_dir_start + sector_idx) as u64;
-            read_fn(sector, &mut buffer[..state.bytes_per_sector as usize])?;
+        let root_dir_device_block = state.fat_sector_to_device_block(state.root_dir_start as u64);
+        let sectors_per_device_block = device_block_size / state.bytes_per_sector as usize;
+        let entries_per_device_block =
+            (state.bytes_per_sector as usize / 32) * sectors_per_device_block.max(1);
+        let device_blocks_for_root =
+            (state.root_dir_sectors as usize).div_ceil(sectors_per_device_block.max(1));
 
-            let entries_per_sector = state.bytes_per_sector as usize / 32;
-            for i in 0..entries_per_sector {
+        for block_idx in 0..device_blocks_for_root as u64 {
+            let device_block = state.partition_start + root_dir_device_block + block_idx;
+            read_fn(device_block, &mut buffer[..device_block_size])?;
+
+            for i in 0..entries_per_device_block {
                 let offset = i * 32;
+                if offset + 32 > device_block_size {
+                    break;
+                }
                 let entry = unsafe {
                     core::ptr::read_unaligned(buffer[offset..].as_ptr() as *const DirEntry)
                 };
@@ -822,15 +832,19 @@ fn find_in_directory(
 
     // Cluster chain directory
     let mut current_cluster = cluster;
+    let cluster_size = state.sectors_per_cluster as usize * state.bytes_per_sector as usize;
+    let device_block_size = state.device_block_size as usize;
+    let device_blocks_per_cluster = cluster_size.div_ceil(device_block_size).max(1);
 
     loop {
-        // Read cluster
-        let start_sector = cluster_to_sector(state, current_cluster);
-        for s in 0..state.sectors_per_cluster {
-            let offset = s as usize * state.bytes_per_sector as usize;
+        // Read cluster using device blocks
+        let start_block = cluster_to_device_block(state, current_cluster);
+        for b in 0..device_blocks_per_cluster {
+            let offset = b * device_block_size;
+            let read_size = device_block_size.min(cluster_size - offset);
             read_fn(
-                start_sector + s as u64,
-                &mut buffer[offset..offset + state.bytes_per_sector as usize],
+                start_block + b as u64,
+                &mut buffer[offset..offset + read_size],
             )?;
         }
 
@@ -892,10 +906,11 @@ fn matches_name(entry: &DirEntry, name: &str) -> bool {
     true
 }
 
-/// Convert cluster number to sector
-fn cluster_to_sector(state: &FilesystemState, cluster: u32) -> u64 {
-    let sector = state.data_start + (cluster - 2) * state.sectors_per_cluster as u32;
-    state.partition_start + sector as u64
+/// Convert cluster number to device block
+fn cluster_to_device_block(state: &FilesystemState, cluster: u32) -> u64 {
+    let fat_sector = state.data_start + (cluster - 2) * state.sectors_per_cluster as u32;
+    let device_block = state.fat_sector_to_device_block(fat_sector as u64);
+    state.partition_start + device_block
 }
 
 /// Get next cluster from FAT
@@ -904,46 +919,40 @@ fn next_cluster(
     read_fn: fn(u64, &mut [u8]) -> Result<(), ()>,
     cluster: u32,
 ) -> Result<Option<u32>, ()> {
-    let mut buffer = [0u8; 512];
+    let device_block_size = state.device_block_size as usize;
+    let mut buffer = [0u8; 4096]; // Max block size
 
-    let (fat_offset, sector_offset) = match state.fat_type {
-        12 => {
-            let offset = cluster + (cluster / 2);
-            let sector = state.fat_start + (offset / state.bytes_per_sector as u32);
-            (offset % state.bytes_per_sector as u32, sector)
-        }
-        16 => {
-            let offset = cluster * 2;
-            let sector = state.fat_start + (offset / state.bytes_per_sector as u32);
-            (offset % state.bytes_per_sector as u32, sector)
-        }
-        32 => {
-            let offset = cluster * 4;
-            let sector = state.fat_start + (offset / state.bytes_per_sector as u32);
-            (offset % state.bytes_per_sector as u32, sector)
-        }
+    // Calculate byte offset of FAT entry from partition start
+    let bytes_per_sector = state.bytes_per_sector as u64;
+    let entry_byte_offset = match state.fat_type {
+        12 => (state.fat_start as u64 * bytes_per_sector) + (cluster as u64 * 3 / 2),
+        16 => (state.fat_start as u64 * bytes_per_sector) + (cluster as u64 * 2),
+        32 => (state.fat_start as u64 * bytes_per_sector) + (cluster as u64 * 4),
         _ => return Err(()),
     };
 
+    // Translate to device block and offset
+    let device_block = entry_byte_offset / device_block_size as u64;
+    let offset_in_block = (entry_byte_offset % device_block_size as u64) as usize;
+
     read_fn(
-        state.partition_start + sector_offset as u64,
-        &mut buffer[..state.bytes_per_sector as usize],
+        state.partition_start + device_block,
+        &mut buffer[..device_block_size],
     )?;
 
     let next = match state.fat_type {
         12 => {
-            // FAT12 entries are 1.5 bytes and can span sector boundaries
-            let byte1 = buffer[fat_offset as usize];
-            let byte2 = if fat_offset + 1 >= state.bytes_per_sector as u32 {
-                // Entry spans sector boundary - need to read next sector
-                let mut next_buffer = [0u8; 512];
+            // FAT12 entries are 1.5 bytes and can span block boundaries
+            let byte1 = buffer[offset_in_block];
+            let byte2 = if offset_in_block + 1 >= device_block_size {
+                // Entry spans block boundary - need to read next block
                 read_fn(
-                    state.partition_start + sector_offset as u64 + 1,
-                    &mut next_buffer[..state.bytes_per_sector as usize],
+                    state.partition_start + device_block + 1,
+                    &mut buffer[..device_block_size],
                 )?;
-                next_buffer[0]
+                buffer[0]
             } else {
-                buffer[(fat_offset + 1) as usize]
+                buffer[offset_in_block + 1]
             };
 
             let entry = byte1 as u16 | ((byte2 as u16) << 8);
@@ -959,10 +968,7 @@ fn next_cluster(
             }
         }
         16 => {
-            let entry = u16::from_le_bytes([
-                buffer[fat_offset as usize],
-                buffer[(fat_offset + 1) as usize],
-            ]);
+            let entry = u16::from_le_bytes([buffer[offset_in_block], buffer[offset_in_block + 1]]);
             if entry >= 0xFFF8 {
                 None
             } else {
@@ -971,10 +977,10 @@ fn next_cluster(
         }
         32 => {
             let entry = u32::from_le_bytes([
-                buffer[fat_offset as usize],
-                buffer[(fat_offset + 1) as usize],
-                buffer[(fat_offset + 2) as usize],
-                buffer[(fat_offset + 3) as usize],
+                buffer[offset_in_block],
+                buffer[offset_in_block + 1],
+                buffer[offset_in_block + 2],
+                buffer[offset_in_block + 3],
             ]) & 0x0FFFFFFF;
             if entry >= 0x0FFFFFF8 {
                 None
@@ -1072,12 +1078,17 @@ fn read_cluster(
     cluster: u32,
     buffer: &mut [u8],
 ) -> Result<(), ()> {
-    let start_sector = cluster_to_sector(state, cluster);
-    for s in 0..state.sectors_per_cluster {
-        let offset = s as usize * state.bytes_per_sector as usize;
+    let cluster_size = state.sectors_per_cluster as usize * state.bytes_per_sector as usize;
+    let device_block_size = state.device_block_size as usize;
+    let device_blocks_per_cluster = cluster_size.div_ceil(device_block_size).max(1);
+
+    let start_block = cluster_to_device_block(state, cluster);
+    for b in 0..device_blocks_per_cluster {
+        let offset = b * device_block_size;
+        let read_size = device_block_size.min(cluster_size - offset);
         read_fn(
-            start_sector + s as u64,
-            &mut buffer[offset..offset + state.bytes_per_sector as usize],
+            start_block + b as u64,
+            &mut buffer[offset..offset + read_size],
         )?;
     }
     Ok(())
@@ -1190,20 +1201,30 @@ fn get_directory_entry_at_position(
     cluster: u32,
     position: usize,
 ) -> Result<Option<DirEntry>, ()> {
-    let mut buffer = [0u8; 4096];
+    let mut buffer = [0u8; 65536]; // Max cluster size
     let cluster_size = state.sectors_per_cluster as usize * state.bytes_per_sector as usize;
     let entries_per_cluster = cluster_size / 32;
+    let device_block_size = state.device_block_size as usize;
     let mut current_position = 0usize;
 
     // Handle FAT12/16 root directory
     if cluster == 0 && state.fat_type != 32 {
-        for sector_idx in 0..state.root_dir_sectors {
-            let sector = state.partition_start + (state.root_dir_start + sector_idx) as u64;
-            read_fn(sector, &mut buffer[..state.bytes_per_sector as usize])?;
+        let root_dir_device_block = state.fat_sector_to_device_block(state.root_dir_start as u64);
+        let sectors_per_device_block = device_block_size / state.bytes_per_sector as usize;
+        let entries_per_device_block =
+            (state.bytes_per_sector as usize / 32) * sectors_per_device_block.max(1);
+        let device_blocks_for_root =
+            (state.root_dir_sectors as usize).div_ceil(sectors_per_device_block.max(1));
 
-            let entries_per_sector = state.bytes_per_sector as usize / 32;
-            for i in 0..entries_per_sector {
+        for block_idx in 0..device_blocks_for_root as u64 {
+            let device_block = state.partition_start + root_dir_device_block + block_idx;
+            read_fn(device_block, &mut buffer[..device_block_size])?;
+
+            for i in 0..entries_per_device_block {
                 let offset = i * 32;
+                if offset + 32 > device_block_size {
+                    break;
+                }
                 let entry = unsafe {
                     core::ptr::read_unaligned(buffer[offset..].as_ptr() as *const DirEntry)
                 };
@@ -1227,15 +1248,17 @@ fn get_directory_entry_at_position(
 
     // Cluster chain directory
     let mut current_cluster = cluster;
+    let device_blocks_per_cluster = cluster_size.div_ceil(device_block_size).max(1);
 
     loop {
-        // Read cluster
-        let start_sector = cluster_to_sector(state, current_cluster);
-        for s in 0..state.sectors_per_cluster {
-            let offset = s as usize * state.bytes_per_sector as usize;
+        // Read cluster using device blocks
+        let start_block = cluster_to_device_block(state, current_cluster);
+        for b in 0..device_blocks_per_cluster {
+            let offset = b * device_block_size;
+            let read_size = device_block_size.min(cluster_size - offset);
             read_fn(
-                start_sector + s as u64,
-                &mut buffer[offset..offset + state.bytes_per_sector as usize],
+                start_block + b as u64,
+                &mut buffer[offset..offset + read_size],
             )?;
         }
 

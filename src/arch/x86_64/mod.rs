@@ -8,6 +8,7 @@ pub mod entry;
 pub mod idt;
 pub mod io;
 pub mod paging;
+pub mod port_regs;
 pub mod sse;
 
 /// CPU feature flags

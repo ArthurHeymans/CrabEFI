@@ -1017,7 +1017,7 @@ impl AhciController {
         table.prdt[0].set_address(buffer as u64);
         table.prdt[0].set_byte_count(byte_count, true);
 
-        log::debug!(
+        log::trace!(
             "read_sectors_atapi: LBA={}, count={}, byte_count={}, buffer={:p}",
             start_lba,
             num_sectors,
@@ -1028,7 +1028,7 @@ impl AhciController {
         // Issue command
         self.issue_command_by_port(port_num, slot)?;
 
-        log::debug!("read_sectors_atapi: command completed successfully");
+        log::trace!("read_sectors_atapi: command completed successfully");
 
         Ok(())
     }
@@ -1221,6 +1221,9 @@ pub fn store_global_device(controller_index: usize, port_index: usize) -> bool {
 }
 
 /// Read a sector from the global AHCI device
+///
+/// The LBA is interpreted as a device block LBA (in terms of the device's native
+/// sector size - 512 bytes for SATA, 2048 bytes for SATAPI/CD-ROM).
 pub fn global_read_sector(lba: u64, buffer: &mut [u8]) -> Result<(), ()> {
     let (controller_index, port_index) = match GLOBAL_AHCI_DEVICE.lock().as_ref() {
         Some(ptr) => unsafe {
@@ -1244,51 +1247,26 @@ pub fn global_read_sector(lba: u64, buffer: &mut [u8]) -> Result<(), ()> {
         }
     };
 
-    let (device_type, sector_size) = match controller.get_port(port_index) {
-        Some(port) => (port.device_type, port.sector_size),
-        None => {
-            log::error!("global_read_sector: no port at index {}", port_index);
-            return Err(());
-        }
+    // Read directly using the device's native sector size
+    // The caller is responsible for providing the correct LBA in device block terms
+    controller
+        .read_sectors(port_index, lba, 1, buffer.as_mut_ptr())
+        .map_err(|e| {
+            log::error!("global_read_sector: read failed at LBA {}: {:?}", lba, e);
+        })
+}
+
+/// Get the sector size of the global AHCI device
+pub fn global_sector_size() -> Option<u32> {
+    let (controller_index, port_index) = match GLOBAL_AHCI_DEVICE.lock().as_ref() {
+        Some(ptr) => unsafe {
+            let device = &*ptr.0;
+            (device.controller_index, device.port_index)
+        },
+        None => return None,
     };
 
-    // For SATAPI devices with 2048-byte sectors, translate 512-byte LBA
-    if device_type == DeviceType::Satapi && sector_size == 2048 {
-        let cd_lba = lba / 4;
-        let offset_in_sector = ((lba % 4) * 512) as usize;
-
-        // Allocate a buffer for the full CD sector
-        let cd_buffer = match efi::allocate_pages(1) {
-            Some(ptr) => ptr as *mut u8,
-            None => {
-                log::error!("global_read_sector: failed to allocate CD sector buffer");
-                return Err(());
-            }
-        };
-
-        // Read the full CD sector
-        let result = controller.read_sectors(port_index, cd_lba, 1, cd_buffer);
-        if result.is_err() {
-            efi::free_pages(cd_buffer as u64, 1);
-            log::error!("global_read_sector: ATAPI read failed at CD LBA {}", cd_lba);
-            return Err(());
-        }
-
-        // Copy the requested 512-byte portion
-        unsafe {
-            ptr::copy_nonoverlapping(
-                cd_buffer.add(offset_in_sector),
-                buffer.as_mut_ptr(),
-                512.min(buffer.len()),
-            );
-        }
-
-        efi::free_pages(cd_buffer as u64, 1);
-        Ok(())
-    } else {
-        // Direct read for SATA devices
-        controller
-            .read_sectors(port_index, lba, 1, buffer.as_mut_ptr())
-            .map_err(|_| ())
-    }
+    let controller = get_controller(controller_index)?;
+    let port = controller.get_port(port_index)?;
+    Some(port.sector_size)
 }

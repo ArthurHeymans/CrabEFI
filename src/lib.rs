@@ -1554,16 +1554,23 @@ fn extract_fat_state<R: BlockDevice>(
     partition_start: u64,
 ) -> efi::protocols::simple_file_system::FilesystemState {
     use efi::protocols::simple_file_system::FilesystemState;
-    use fs::fat::SECTOR_SIZE;
 
-    // Read boot sector directly from the disk
-    let mut buffer = [0u8; SECTOR_SIZE];
-    if disk.read_block(partition_start, &mut buffer).is_err() {
+    // Get device block size
+    let info = disk.info();
+    let device_block_size = info.block_size;
+
+    // Read boot sector directly from the disk (use device block size)
+    let mut buffer = [0u8; 4096]; // Max block size
+    let read_size = (device_block_size as usize).min(buffer.len());
+    if disk
+        .read_block(partition_start, &mut buffer[..read_size])
+        .is_err()
+    {
         log::error!("Failed to read boot sector for filesystem state");
         return FilesystemState::empty();
     }
 
-    parse_fat_bpb(&buffer, partition_start)
+    parse_fat_bpb(&buffer, partition_start, device_block_size)
 }
 
 /// Extract FAT filesystem state for AHCI devices
@@ -1571,16 +1578,19 @@ fn extract_fat_state_ahci(
     partition_start: u64,
 ) -> efi::protocols::simple_file_system::FilesystemState {
     use efi::protocols::simple_file_system::FilesystemState;
-    use fs::fat::SECTOR_SIZE;
+
+    // Get device block size from AHCI
+    let device_block_size = drivers::ahci::global_sector_size().unwrap_or(512);
 
     // Read boot sector directly using AHCI global read
-    let mut buffer = [0u8; SECTOR_SIZE];
-    if drivers::ahci::global_read_sector(partition_start, &mut buffer).is_err() {
+    let mut buffer = [0u8; 4096]; // Max block size
+    let read_size = (device_block_size as usize).min(buffer.len());
+    if drivers::ahci::global_read_sector(partition_start, &mut buffer[..read_size]).is_err() {
         log::error!("Failed to read boot sector for AHCI filesystem state");
         return FilesystemState::empty();
     }
 
-    parse_fat_bpb(&buffer, partition_start)
+    parse_fat_bpb(&buffer, partition_start, device_block_size)
 }
 
 /// Extract FAT filesystem state for NVMe devices
@@ -1588,22 +1598,26 @@ fn extract_fat_state_nvme(
     partition_start: u64,
 ) -> efi::protocols::simple_file_system::FilesystemState {
     use efi::protocols::simple_file_system::FilesystemState;
-    use fs::fat::SECTOR_SIZE;
+
+    // Get device block size from NVMe (typically 512 for NVMe)
+    let device_block_size = drivers::nvme::global_sector_size().unwrap_or(512);
 
     // Read boot sector directly using NVMe global read
-    let mut buffer = [0u8; SECTOR_SIZE];
-    if drivers::nvme::global_read_sector(partition_start, &mut buffer).is_err() {
+    let mut buffer = [0u8; 4096]; // Max block size
+    let read_size = (device_block_size as usize).min(buffer.len());
+    if drivers::nvme::global_read_sector(partition_start, &mut buffer[..read_size]).is_err() {
         log::error!("Failed to read boot sector for NVMe filesystem state");
         return FilesystemState::empty();
     }
 
-    parse_fat_bpb(&buffer, partition_start)
+    parse_fat_bpb(&buffer, partition_start, device_block_size)
 }
 
 /// Parse FAT BPB from boot sector buffer
 fn parse_fat_bpb(
     buffer: &[u8],
     partition_start: u64,
+    device_block_size: u32,
 ) -> efi::protocols::simple_file_system::FilesystemState {
     use efi::protocols::simple_file_system::FilesystemState;
 
@@ -1664,6 +1678,7 @@ fn parse_fat_bpb(
         partition_start,
         fat_type,
         bytes_per_sector,
+        device_block_size,
         sectors_per_cluster,
         fat_start,
         sectors_per_fat,

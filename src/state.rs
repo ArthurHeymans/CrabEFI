@@ -608,23 +608,25 @@ impl InputState {
 /// Filesystem state - stores partition info for reading files
 #[derive(Clone, Copy)]
 pub struct FilesystemState {
-    /// First LBA of the partition
+    /// First LBA of the partition (in device blocks)
     pub partition_start: u64,
     /// FAT type (12, 16, or 32)
     pub fat_type: u8,
-    /// Bytes per sector
+    /// Bytes per sector (FAT's logical sector size)
     pub bytes_per_sector: u16,
+    /// Device block size (physical block size, may differ from bytes_per_sector)
+    pub device_block_size: u32,
     /// Sectors per cluster
     pub sectors_per_cluster: u8,
-    /// First FAT sector (relative to partition start)
+    /// First FAT sector (relative to partition start, in FAT sectors)
     pub fat_start: u32,
     /// Sectors per FAT
     pub sectors_per_fat: u32,
-    /// First data sector (relative to partition start)
+    /// First data sector (relative to partition start, in FAT sectors)
     pub data_start: u32,
     /// Root directory cluster (FAT32) or 0 (FAT12/16)
     pub root_cluster: u32,
-    /// Root directory sector start (FAT12/16 only)
+    /// Root directory sector start (FAT12/16 only, in FAT sectors)
     pub root_dir_start: u32,
     /// Root directory sector count (FAT12/16 only)
     pub root_dir_sectors: u32,
@@ -636,6 +638,7 @@ impl FilesystemState {
             partition_start: 0,
             fat_type: 0,
             bytes_per_sector: 0,
+            device_block_size: 0,
             sectors_per_cluster: 0,
             fat_start: 0,
             sectors_per_fat: 0,
@@ -643,6 +646,15 @@ impl FilesystemState {
             root_cluster: 0,
             root_dir_start: 0,
             root_dir_sectors: 0,
+        }
+    }
+
+    /// Translate FAT sector to device block
+    pub fn fat_sector_to_device_block(&self, fat_sector: u64) -> u64 {
+        if self.bytes_per_sector as u32 == self.device_block_size {
+            fat_sector
+        } else {
+            (fat_sector * self.bytes_per_sector as u64) / self.device_block_size as u64
         }
     }
 }
