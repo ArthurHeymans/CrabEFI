@@ -108,6 +108,38 @@ impl EfiTime {
     pub fn is_after(&self, other: &EfiTime) -> bool {
         matches!(self.compare(other), core::cmp::Ordering::Greater)
     }
+
+    /// Convert from SerializedTime (from varstore)
+    pub fn from_serialized(st: &crate::efi::varstore::SerializedTime) -> Self {
+        Self {
+            year: st.year,
+            month: st.month,
+            day: st.day,
+            hour: st.hour,
+            minute: st.minute,
+            second: st.second,
+            pad1: 0,
+            nanosecond: st.nanosecond,
+            timezone: st.timezone,
+            daylight: st.daylight,
+            pad2: 0,
+        }
+    }
+
+    /// Convert to SerializedTime (for varstore)
+    pub fn to_serialized(&self) -> crate::efi::varstore::SerializedTime {
+        crate::efi::varstore::SerializedTime {
+            year: self.year,
+            month: self.month,
+            day: self.day,
+            hour: self.hour,
+            minute: self.minute,
+            second: self.second,
+            nanosecond: self.nanosecond,
+            timezone: self.timezone,
+            daylight: self.daylight,
+        }
+    }
 }
 
 // ============================================================================

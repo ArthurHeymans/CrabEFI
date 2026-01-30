@@ -40,8 +40,8 @@ use serde::{Deserialize, Serialize};
 
 // Re-export key items from persistence
 pub use persistence::{
-    compact_smmstore, delete_variable, init as init_persistence, is_smmstore_initialized,
-    is_spi_available, persist_variable,
+    compact_smmstore, delete_variable, get_variable_timestamp, init as init_persistence,
+    is_smmstore_initialized, is_spi_available, persist_variable, persist_variable_with_timestamp,
 };
 
 // Re-export key items from deferred
@@ -255,6 +255,87 @@ pub struct SerializedTime {
     pub daylight: u8,
 }
 
+impl SerializedTime {
+    /// Create from raw EFI_TIME-like fields
+    pub fn new(
+        year: u16,
+        month: u8,
+        day: u8,
+        hour: u8,
+        minute: u8,
+        second: u8,
+        nanosecond: u32,
+        timezone: i16,
+        daylight: u8,
+    ) -> Self {
+        Self {
+            year,
+            month,
+            day,
+            hour,
+            minute,
+            second,
+            nanosecond,
+            timezone,
+            daylight,
+        }
+    }
+
+    /// Check if this is a zero/default timestamp
+    pub fn is_zero(&self) -> bool {
+        self.year == 0
+            && self.month == 0
+            && self.day == 0
+            && self.hour == 0
+            && self.minute == 0
+            && self.second == 0
+            && self.nanosecond == 0
+    }
+
+    /// Compare two timestamps, returns true if self is strictly after other
+    pub fn is_after(&self, other: &SerializedTime) -> bool {
+        use core::cmp::Ordering;
+
+        // If other is zero (initial), any non-zero timestamp is "after"
+        if other.is_zero() {
+            return !self.is_zero();
+        }
+
+        // Compare year, month, day, hour, minute, second, nanosecond in order
+        match self.year.cmp(&other.year) {
+            Ordering::Greater => return true,
+            Ordering::Less => return false,
+            Ordering::Equal => {}
+        }
+        match self.month.cmp(&other.month) {
+            Ordering::Greater => return true,
+            Ordering::Less => return false,
+            Ordering::Equal => {}
+        }
+        match self.day.cmp(&other.day) {
+            Ordering::Greater => return true,
+            Ordering::Less => return false,
+            Ordering::Equal => {}
+        }
+        match self.hour.cmp(&other.hour) {
+            Ordering::Greater => return true,
+            Ordering::Less => return false,
+            Ordering::Equal => {}
+        }
+        match self.minute.cmp(&other.minute) {
+            Ordering::Greater => return true,
+            Ordering::Less => return false,
+            Ordering::Equal => {}
+        }
+        match self.second.cmp(&other.second) {
+            Ordering::Greater => return true,
+            Ordering::Less => return false,
+            Ordering::Equal => {}
+        }
+        self.nanosecond > other.nanosecond
+    }
+}
+
 impl VariableRecord {
     /// Create a new variable record
     pub fn new(
@@ -279,6 +360,38 @@ impl VariableRecord {
             data: data.to_vec(),
             monotonic_count: 0,
             timestamp: SerializedTime::default(),
+            crc: 0,
+        };
+        record.crc = record.compute_crc();
+        Ok(record)
+    }
+
+    /// Create a new variable record with a specific timestamp
+    ///
+    /// This is used for authenticated variables where the timestamp must be preserved.
+    pub fn new_with_timestamp(
+        guid: &r_efi::efi::Guid,
+        name: &[u16],
+        attributes: u32,
+        data: &[u8],
+        timestamp: SerializedTime,
+    ) -> Result<Self> {
+        if name.len() > MAX_NAME_LEN {
+            return Err(VarStoreError::NameTooLong);
+        }
+        if data.len() > MAX_DATA_SIZE {
+            return Err(VarStoreError::DataTooLarge);
+        }
+
+        let mut record = Self {
+            magic: RECORD_MAGIC,
+            state: STATE_VALID,
+            attributes,
+            guid: SerializedGuid::from_guid(guid),
+            name: name.to_vec(),
+            data: data.to_vec(),
+            monotonic_count: 0,
+            timestamp,
             crc: 0,
         };
         record.crc = record.compute_crc();
@@ -343,6 +456,11 @@ impl VariableRecord {
     /// Deserialize a record from bytes
     pub fn deserialize(bytes: &[u8]) -> Result<Self> {
         postcard::from_bytes(bytes).map_err(|_| VarStoreError::SerdeError)
+    }
+
+    /// Get the timestamp from this record
+    pub fn get_timestamp(&self) -> &SerializedTime {
+        &self.timestamp
     }
 }
 

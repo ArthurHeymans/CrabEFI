@@ -23,6 +23,7 @@ enum MenuOption {
     ToggleSecureBoot,
     EnrollDefaultKeys,
     EnrollCustomPK,
+    ImportDbxUpdate,
     ClearAllKeys,
     ReturnToBootMenu,
 }
@@ -53,6 +54,7 @@ impl MenuOption {
                     "Enroll Custom PK (requires Setup Mode)"
                 }
             }
+            MenuOption::ImportDbxUpdate => "Import dbx Update from ESP (EFI\\keys\\dbx.bin)",
             MenuOption::ClearAllKeys => "Clear All Keys (return to Setup Mode)",
             MenuOption::ReturnToBootMenu => "Return to Boot Menu",
         }
@@ -63,16 +65,18 @@ impl MenuOption {
             MenuOption::ToggleSecureBoot => !setup_mode, // Can only toggle in User Mode
             MenuOption::EnrollDefaultKeys => setup_mode, // Can only enroll in Setup Mode
             MenuOption::EnrollCustomPK => setup_mode,    // Can only enroll in Setup Mode
+            MenuOption::ImportDbxUpdate => true,         // Can import dbx anytime
             MenuOption::ClearAllKeys => true,            // Always available
             MenuOption::ReturnToBootMenu => true,        // Always available
         }
     }
 }
 
-const MENU_OPTIONS: [MenuOption; 5] = [
+const MENU_OPTIONS: [MenuOption; 6] = [
     MenuOption::ToggleSecureBoot,
     MenuOption::EnrollDefaultKeys,
     MenuOption::EnrollCustomPK,
+    MenuOption::ImportDbxUpdate,
     MenuOption::ClearAllKeys,
     MenuOption::ReturnToBootMenu,
 ];
@@ -203,6 +207,31 @@ pub fn show_secure_boot_menu() {
                                     }
                                 }
                             }
+                            MenuOption::ImportDbxUpdate => {
+                                status_message = Some(("Searching for dbx on ESP...", true));
+                                // Redraw to show "searching" message
+                                clear_screen(&mut fb_console);
+                                draw_menu(
+                                    &mut fb_console,
+                                    selected,
+                                    setup_mode,
+                                    secure_boot_enabled,
+                                    pk_count,
+                                    kek_count,
+                                    db_count,
+                                    dbx_count,
+                                    status_message,
+                                );
+
+                                match import_dbx_update() {
+                                    Ok(msg) => {
+                                        status_message = Some((msg, true));
+                                    }
+                                    Err(msg) => {
+                                        status_message = Some((msg, false));
+                                    }
+                                }
+                            }
                             MenuOption::ClearAllKeys => {
                                 // Confirm before clearing
                                 if confirm_action(&mut fb_console, "Clear ALL Secure Boot keys?") {
@@ -271,6 +300,36 @@ fn enroll_custom_pk() -> Result<&'static str, &'static str> {
         }
         Err(auth::AuthError::CertificateParseError) => Err("Invalid certificate format"),
         Err(_) => Err("Failed to enroll custom PK"),
+    }
+}
+
+/// Import dbx (forbidden signature database) update from ESP
+fn import_dbx_update() -> Result<&'static str, &'static str> {
+    use crate::efi::auth::dbx_update;
+
+    match dbx_update::enroll_dbx_from_file() {
+        Ok(result) => {
+            // Log the details
+            log::info!(
+                "dbx update imported: {} SHA-256 hashes, {} certificates from {}",
+                result.sha256_count,
+                result.x509_count,
+                result.source
+            );
+
+            // Return a success message with the source
+            match result.source {
+                "NVMe" => Ok("dbx update imported from NVMe ESP!"),
+                "SATA" => Ok("dbx update imported from SATA ESP!"),
+                "SD" => Ok("dbx update imported from SD card ESP!"),
+                _ => Ok("dbx update imported successfully!"),
+            }
+        }
+        Err(auth::AuthError::NoSuitableKey) => {
+            Err("No dbx file found (place dbx.bin in EFI\\keys\\)")
+        }
+        Err(auth::AuthError::InvalidHeader) => Err("Invalid dbx file format"),
+        Err(_) => Err("Failed to import dbx update"),
     }
 }
 

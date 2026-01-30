@@ -29,6 +29,7 @@
 pub mod authenticode;
 pub mod boot;
 mod crypto;
+pub mod dbx_update;
 pub mod enrollment;
 pub mod key_files;
 mod signature;
