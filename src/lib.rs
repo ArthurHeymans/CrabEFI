@@ -1730,6 +1730,26 @@ fn load_and_execute_bootloader(
 
     log::info!("Read {} bytes from {}", bytes_read, path);
 
+    // Secure Boot verification (if enabled)
+    if efi::auth::is_secure_boot_enabled() {
+        log::debug!("Secure Boot: Verifying image...");
+        match efi::auth::verify_pe_image_secure_boot(&buffer[..bytes_read]) {
+            Ok(true) => {
+                log::info!("Secure Boot: Image verification passed");
+            }
+            Ok(false) => {
+                log::error!("Secure Boot: Image verification FAILED - not authorized");
+                let _ = free_pool(buffer_ptr);
+                return Err(Status::SECURITY_VIOLATION);
+            }
+            Err(e) => {
+                log::error!("Secure Boot: Verification error: {:?}", e);
+                let _ = free_pool(buffer_ptr);
+                return Err(Status::SECURITY_VIOLATION);
+            }
+        }
+    }
+
     // Load the PE image
     let loaded_image = pe::load_image(&buffer[..bytes_read]).inspect_err(|&status| {
         log::error!("Failed to load PE image: {:?}", status);

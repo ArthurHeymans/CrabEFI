@@ -308,12 +308,8 @@ fn verify_rsa_signature_raw(
 /// - The Certificate Table entry in the optional header
 /// - The attribute certificate table
 pub fn compute_pe_hash(pe_data: &[u8]) -> Result<[u8; 32], AuthError> {
-    // For now, return a simple SHA-256 hash of the entire image
-    // A full implementation would need to parse the PE header and
-    // exclude the appropriate sections
-    //
-    // TODO: Implement proper Authenticode hash calculation
-    Ok(sha256(pe_data))
+    // Use the proper Authenticode hash calculation
+    super::authenticode::compute_authenticode_hash(pe_data)
 }
 
 /// Verify a PE image signature
@@ -321,24 +317,6 @@ pub fn compute_pe_hash(pe_data: &[u8]) -> Result<[u8; 32], AuthError> {
 /// This checks if the image's embedded signature is valid and signed by
 /// a certificate in the allowed database (db) and not in the forbidden database (dbx).
 pub fn verify_pe_image(pe_data: &[u8]) -> Result<bool, AuthError> {
-    // Compute the image hash
-    let image_hash = compute_pe_hash(pe_data)?;
-
-    // Check if the hash is in the forbidden database
-    if super::signature::is_hash_forbidden(&image_hash) {
-        log::warn!("PE image hash is in forbidden database (dbx)");
-        return Ok(false);
-    }
-
-    // Check if the hash is in the allowed database
-    if super::signature::is_hash_allowed(&image_hash) {
-        log::info!("PE image hash found in allowed database (db)");
-        return Ok(true);
-    }
-
-    // TODO: Extract and verify embedded Authenticode signature
-    // For now, we only support hash-based verification
-
-    log::warn!("PE image not found in signature database");
-    Ok(false)
+    // Use the full Authenticode verification
+    super::authenticode::verify_pe_image_secure_boot(pe_data)
 }
