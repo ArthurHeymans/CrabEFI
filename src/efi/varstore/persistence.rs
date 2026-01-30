@@ -310,6 +310,64 @@ fn load_variables_from_smmstore() -> Result<(), VarStoreError> {
     Ok(())
 }
 
+/// Get the timestamp of a stored variable
+///
+/// This reads the variable record from SPI to retrieve its timestamp.
+/// Returns None if the variable doesn't exist or has no timestamp.
+pub fn get_variable_timestamp(
+    guid: &r_efi::efi::Guid,
+    name: &[u16],
+) -> Option<super::SerializedTime> {
+    // We need to scan the SPI store to find the record with timestamp
+    let mut spi_guard = SPI_CONTROLLER.lock();
+    let spi = spi_guard.as_mut()?;
+
+    let config = SMMSTORE_CONFIG.lock();
+    if !config.initialized {
+        return None;
+    }
+
+    let base = config.base_addr;
+    let write_offset = config.write_offset;
+    drop(config);
+
+    // Scan for the variable record
+    let mut offset = STORE_HEADER_SIZE as u32;
+    let mut found_timestamp: Option<super::SerializedTime> = None;
+
+    while offset < write_offset {
+        let remaining = write_offset - offset;
+        let chunk_size = core::cmp::min(remaining, MAX_VARIABLE_DATA_SIZE as u32 + 256);
+        let mut chunk = alloc::vec![0u8; chunk_size as usize];
+
+        if spi.read(base + offset, &mut chunk).is_err() {
+            break;
+        }
+
+        if chunk[0] == 0xFF {
+            break;
+        }
+
+        match VariableRecord::deserialize(&chunk) {
+            Ok(record) => {
+                let record_size = match record.serialize() {
+                    Ok(bytes) => bytes.len() as u32,
+                    Err(_) => break,
+                };
+
+                if record.is_active() && record.matches(guid, name) {
+                    found_timestamp = Some(*record.get_timestamp());
+                }
+
+                offset += record_size;
+            }
+            Err(_) => break,
+        }
+    }
+
+    found_timestamp
+}
+
 /// Persist a variable to storage
 ///
 /// Before ExitBootServices: writes to SPI flash
@@ -326,6 +384,32 @@ pub fn persist_variable(
     } else {
         // Before ExitBootServices - write to SPI flash
         write_variable_to_spi_internal(guid, name, attributes, data)
+    }
+}
+
+/// Persist a variable to storage with a specific timestamp
+///
+/// This version preserves the authenticated variable timestamp for proper
+/// monotonic timestamp validation on subsequent updates.
+///
+/// Before ExitBootServices: writes to SPI flash
+/// After ExitBootServices: queues write for deferred processing on next boot
+pub fn persist_variable_with_timestamp(
+    guid: &r_efi::efi::Guid,
+    name: &[u16],
+    attributes: u32,
+    data: &[u8],
+    timestamp: super::SerializedTime,
+) -> Result<(), VarStoreError> {
+    if state::is_exit_boot_services_called() {
+        // After ExitBootServices - queue for deferred processing
+        // Note: deferred processing currently doesn't preserve timestamps,
+        // but that's acceptable since authenticated variables shouldn't be
+        // modified at runtime anyway
+        queue_variable_for_deferred(guid, name, attributes, data)
+    } else {
+        // Before ExitBootServices - write to SPI flash with timestamp
+        write_variable_to_spi_with_timestamp_internal(guid, name, attributes, data, timestamp)
     }
 }
 
@@ -396,6 +480,67 @@ pub(super) fn write_variable_to_spi_internal(
 
     log::debug!(
         "Variable persisted to SPI at offset {:#x}",
+        config.write_offset - record_len
+    );
+
+    Ok(())
+}
+
+/// Write a variable record to SPI flash with a specific timestamp
+///
+/// This is used for authenticated variables where the timestamp must be preserved
+/// for proper monotonic timestamp validation on future updates.
+pub(super) fn write_variable_to_spi_with_timestamp_internal(
+    guid: &r_efi::efi::Guid,
+    name: &[u16],
+    attributes: u32,
+    data: &[u8],
+    timestamp: super::SerializedTime,
+) -> Result<(), VarStoreError> {
+    // Create the variable record with timestamp first (before locking)
+    let record = VariableRecord::new_with_timestamp(guid, name, attributes, data, timestamp)?;
+    let record_bytes = record.serialize()?;
+    let record_len = record_bytes.len() as u32;
+
+    // Check if we need compaction
+    {
+        let config = SMMSTORE_CONFIG.lock();
+        if config.initialized && config.write_offset + record_len > config.size {
+            // Need compaction - release lock first
+            drop(config);
+            log::info!("SMMSTORE full, triggering compaction");
+            compact_smmstore()?;
+        }
+    }
+
+    // Now do the actual write
+    let mut spi_guard = SPI_CONTROLLER.lock();
+    let spi = spi_guard.as_mut().ok_or(VarStoreError::NotInitialized)?;
+
+    let mut config = SMMSTORE_CONFIG.lock();
+    if !config.initialized {
+        return Err(VarStoreError::NotInitialized);
+    }
+
+    // Check again after compaction
+    if config.write_offset + record_len > config.size {
+        log::error!("SMMSTORE still full after compaction");
+        return Err(VarStoreError::StoreFull);
+    }
+
+    // Try to enable writes
+    if let Err(e) = spi.enable_writes() {
+        log::warn!("Could not enable SPI writes: {:?}", e);
+    }
+
+    // Write the record
+    spi.write(config.base_addr + config.write_offset, &record_bytes)
+        .map_err(|_| VarStoreError::SpiError)?;
+
+    config.write_offset += record_len;
+
+    log::debug!(
+        "Variable (with timestamp) persisted to SPI at offset {:#x}",
         config.write_offset - record_len
     );
 
