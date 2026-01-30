@@ -462,6 +462,12 @@ extern "efiapi" fn set_variable(
                     handle_secure_boot_variable_delete(var_type);
                 }
 
+                // Persist the deletion to storage
+                let name_slice = unsafe { core::slice::from_raw_parts(name, name_len + 1) };
+                if let Err(e) = crate::efi::varstore::delete_variable(&guid, name_slice) {
+                    log::debug!("Variable deletion not persisted: {:?}", e);
+                }
+
                 return Status::SUCCESS;
             }
             return Status::NOT_FOUND;
@@ -485,6 +491,17 @@ extern "efiapi" fn set_variable(
 
                         // Update the key database
                         update_key_database(var_type, &combined);
+
+                        // Persist the updated variable
+                        if (attributes & crate::efi::auth::attributes::NON_VOLATILE) != 0 {
+                            let name_slice =
+                                unsafe { core::slice::from_raw_parts(name, name_len + 1) };
+                            if let Err(e) = crate::efi::varstore::persist_variable(
+                                &guid, name_slice, attributes, &combined,
+                            ) {
+                                log::debug!("Variable not persisted: {:?}", e);
+                            }
+                        }
 
                         return Status::SUCCESS;
                     }
@@ -531,6 +548,19 @@ extern "efiapi" fn set_variable(
             let var_data = &variables[idx].data[..final_data_size];
             update_key_database(var_type, var_data);
             handle_secure_boot_variable_update(var_type);
+        }
+
+        // Persist variable to storage (SPI flash or ESP file)
+        // Only persist non-volatile variables
+        if (attributes & crate::efi::auth::attributes::NON_VOLATILE) != 0 {
+            let name_slice = unsafe { core::slice::from_raw_parts(name, name_len + 1) };
+            let data_slice = unsafe { core::slice::from_raw_parts(data_ptr, final_data_size) };
+            if let Err(e) =
+                crate::efi::varstore::persist_variable(&guid, name_slice, attributes, data_slice)
+            {
+                log::debug!("Variable not persisted: {:?}", e);
+                // Don't fail the operation - in-memory storage succeeded
+            }
         }
 
         Status::SUCCESS

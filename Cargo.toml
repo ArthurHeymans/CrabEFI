@@ -33,6 +33,10 @@ signature = { version = "2.2", default-features = false }
 cms = { version = "0.2", default-features = false }
 spki = { version = "0.7", default-features = false }
 
+# Serialization for variable store
+serde = { version = "1.0", default-features = false, features = ["derive", "alloc"] }
+postcard = { version = "1.0", default-features = false, features = ["alloc"] }
+
 [target.'cfg(target_arch = "x86_64")'.dependencies]
 x86_64 = "0.15"
 

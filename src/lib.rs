@@ -178,6 +178,15 @@ pub fn init(coreboot_table_ptr: u64) {
     log::info!("CrabEFI initialized successfully!");
     log::info!("EFI System Table at: {:p}", efi::get_system_table());
 
+    // Initialize PCI early so we can detect SPI controller
+    drivers::pci::init();
+
+    // Initialize variable store persistence (loads variables from SPI flash)
+    match efi::varstore::init_persistence() {
+        Ok(()) => log::info!("Variable store persistence initialized"),
+        Err(e) => log::warn!("Variable store persistence not available: {:?}", e),
+    }
+
     // Initialize storage subsystem
     init_storage();
 
@@ -196,8 +205,7 @@ pub fn init(coreboot_table_ptr: u64) {
 fn init_storage() {
     log::info!("Initializing storage subsystem...");
 
-    // Enumerate PCI devices
-    drivers::pci::init();
+    // Print PCI devices (already initialized earlier for SPI detection)
     drivers::pci::print_devices();
 
     // Initialize all storage controllers
