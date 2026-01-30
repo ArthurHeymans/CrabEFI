@@ -613,27 +613,28 @@ impl XhciController {
 
         // Allocate and set up DCBAA (Device Context Base Address Array)
         let dcbaa_pages = ((self.max_slots as u64 + 1) * 8).div_ceil(4096);
-        self.dcbaa = efi::allocate_pages(dcbaa_pages).ok_or(XhciError::AllocationFailed)?;
-        unsafe {
-            core::slice::from_raw_parts_mut(self.dcbaa as *mut u8, (dcbaa_pages * 4096) as usize)
-                .fill(0)
-        };
+        let dcbaa_mem = efi::allocate_pages(dcbaa_pages).ok_or(XhciError::AllocationFailed)?;
+        dcbaa_mem.fill(0);
+        self.dcbaa = dcbaa_mem.as_ptr() as u64;
         self.write_op_reg64(OP_DCBAAP, self.dcbaa);
 
         // Allocate command ring (256 TRBs)
-        let cmd_ring_base = efi::allocate_pages(1).ok_or(XhciError::AllocationFailed)?;
+        let cmd_ring_mem = efi::allocate_pages(1).ok_or(XhciError::AllocationFailed)?;
+        let cmd_ring_base = cmd_ring_mem.as_ptr() as u64;
         self.cmd_ring = TrbRing::new(cmd_ring_base, 256);
 
         // Set command ring pointer
         self.write_op_reg64(OP_CRCR, self.cmd_ring.physical_addr());
 
         // Allocate event ring (256 TRBs) - no link TRB for event rings
-        let event_ring_base = efi::allocate_pages(1).ok_or(XhciError::AllocationFailed)?;
+        let event_ring_mem = efi::allocate_pages(1).ok_or(XhciError::AllocationFailed)?;
+        let event_ring_base = event_ring_mem.as_ptr() as u64;
         self.event_ring = TrbRing::new_event_ring(event_ring_base, 256);
 
         // Allocate Event Ring Segment Table (ERST)
-        self.erst = efi::allocate_pages(1).ok_or(XhciError::AllocationFailed)?;
-        unsafe { core::slice::from_raw_parts_mut(self.erst as *mut u8, 4096).fill(0) };
+        let erst_mem = efi::allocate_pages(1).ok_or(XhciError::AllocationFailed)?;
+        erst_mem.fill(0);
+        self.erst = erst_mem.as_ptr() as u64;
 
         // Set up ERST entry
         let erst_entry = self.erst as *mut u64;
@@ -769,17 +770,20 @@ impl XhciController {
     /// Address a device
     fn address_device(&mut self, slot_id: u8, port: u8, speed: u8) -> Result<(), XhciError> {
         // Allocate device context
-        let device_context = efi::allocate_pages(1).ok_or(XhciError::AllocationFailed)?;
-        unsafe { core::slice::from_raw_parts_mut(device_context as *mut u8, 4096).fill(0) };
+        let device_context_mem = efi::allocate_pages(1).ok_or(XhciError::AllocationFailed)?;
+        device_context_mem.fill(0);
+        let device_context = device_context_mem.as_ptr() as u64;
 
         // Allocate input context
-        let input_context = efi::allocate_pages(1).ok_or(XhciError::AllocationFailed)?;
-        unsafe { core::slice::from_raw_parts_mut(input_context as *mut u8, 4096).fill(0) };
+        let input_context_mem = efi::allocate_pages(1).ok_or(XhciError::AllocationFailed)?;
+        input_context_mem.fill(0);
+        let input_context = input_context_mem.as_ptr() as u64;
 
         // Allocate transfer ring for control endpoint
-        let transfer_ring = efi::allocate_pages(1).ok_or(XhciError::AllocationFailed)?;
+        let transfer_ring_mem = efi::allocate_pages(1).ok_or(XhciError::AllocationFailed)?;
+        let transfer_ring = transfer_ring_mem.as_ptr() as u64;
 
-        let input = unsafe { &mut *(input_context as *mut InputContext) };
+        let input = unsafe { &mut *(input_context_mem.as_mut_ptr() as *mut InputContext) };
 
         // Set up input control context
         input.control.add_flags = 0x3; // Add slot and EP0
@@ -1241,8 +1245,10 @@ impl XhciController {
             .ok_or(XhciError::DeviceNotFound)?;
 
         // Allocate transfer rings for bulk endpoints
-        let in_ring_addr = efi::allocate_pages(1).ok_or(XhciError::AllocationFailed)?;
-        let out_ring_addr = efi::allocate_pages(1).ok_or(XhciError::AllocationFailed)?;
+        let in_ring_mem = efi::allocate_pages(1).ok_or(XhciError::AllocationFailed)?;
+        let in_ring_addr = in_ring_mem.as_ptr() as u64;
+        let out_ring_mem = efi::allocate_pages(1).ok_or(XhciError::AllocationFailed)?;
+        let out_ring_addr = out_ring_mem.as_ptr() as u64;
 
         let in_ring = TrbRing::new(in_ring_addr, 256);
         let out_ring = TrbRing::new(out_ring_addr, 256);

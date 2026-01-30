@@ -154,8 +154,8 @@ pub fn init() {
                     Ok(controller) => {
                         let size = mem::size_of::<XhciController>();
                         let pages = size.div_ceil(4096);
-                        if let Some(p) = efi::allocate_pages(pages as u64) {
-                            let controller_ptr = p as *mut XhciController;
+                        if let Some(mem) = efi::allocate_pages(pages as u64) {
+                            let controller_ptr = mem.as_mut_ptr() as *mut XhciController;
                             unsafe { ptr::write(controller_ptr, controller) };
                             let _ = controllers.push(UsbControllerHandle::Xhci(controller_ptr));
                             xhci_count += 1;
@@ -179,8 +179,8 @@ pub fn init() {
                     Ok(controller) => {
                         let size = mem::size_of::<ehci::EhciController>();
                         let pages = size.div_ceil(4096);
-                        if let Some(p) = efi::allocate_pages(pages as u64) {
-                            let controller_ptr = p as *mut ehci::EhciController;
+                        if let Some(mem) = efi::allocate_pages(pages as u64) {
+                            let controller_ptr = mem.as_mut_ptr() as *mut ehci::EhciController;
                             unsafe { ptr::write(controller_ptr, controller) };
                             let _ = controllers.push(UsbControllerHandle::Ehci(controller_ptr));
                             ehci_count += 1;
@@ -204,8 +204,8 @@ pub fn init() {
                     Ok(controller) => {
                         let size = mem::size_of::<ohci::OhciController>();
                         let pages = size.div_ceil(4096);
-                        if let Some(p) = efi::allocate_pages(pages as u64) {
-                            let controller_ptr = p as *mut ohci::OhciController;
+                        if let Some(mem) = efi::allocate_pages(pages as u64) {
+                            let controller_ptr = mem.as_mut_ptr() as *mut ohci::OhciController;
                             unsafe { ptr::write(controller_ptr, controller) };
                             let _ = controllers.push(UsbControllerHandle::Ohci(controller_ptr));
                             ohci_count += 1;
@@ -229,8 +229,8 @@ pub fn init() {
                     Ok(controller) => {
                         let size = mem::size_of::<uhci::UhciController>();
                         let pages = size.div_ceil(4096);
-                        if let Some(p) = efi::allocate_pages(pages as u64) {
-                            let controller_ptr = p as *mut uhci::UhciController;
+                        if let Some(mem) = efi::allocate_pages(pages as u64) {
+                            let controller_ptr = mem.as_mut_ptr() as *mut uhci::UhciController;
                             unsafe { ptr::write(controller_ptr, controller) };
                             let _ = controllers.push(UsbControllerHandle::Uhci(controller_ptr));
                             uhci_count += 1;

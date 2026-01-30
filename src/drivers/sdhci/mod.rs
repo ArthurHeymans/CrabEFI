@@ -128,7 +128,8 @@ impl SdhciController {
         pci::enable_device(pci_dev);
 
         // Allocate a page-aligned DMA buffer for data transfers
-        let dma_buffer = efi::allocate_pages(1).ok_or(SdhciError::AllocationFailed)? as *mut u8;
+        let dma_buffer_mem = efi::allocate_pages(1).ok_or(SdhciError::AllocationFailed)?;
+        let dma_buffer = dma_buffer_mem.as_mut_ptr();
 
         let mut controller = Self {
             pci_address: pci_dev.address,
@@ -1088,8 +1089,8 @@ pub fn init() {
                 let size = core::mem::size_of::<SdhciController>();
                 let pages = size.div_ceil(4096);
 
-                if let Some(ptr) = efi::allocate_pages(pages as u64) {
-                    let controller_ptr = ptr as *mut SdhciController;
+                if let Some(mem) = efi::allocate_pages(pages as u64) {
+                    let controller_ptr = mem.as_mut_ptr() as *mut SdhciController;
                     unsafe {
                         ptr::write(controller_ptr, controller);
                     }
@@ -1159,8 +1160,8 @@ pub fn store_global_device(controller_index: usize) -> bool {
     let size = core::mem::size_of::<GlobalSdhciDevice>();
     let pages = size.div_ceil(4096);
 
-    if let Some(ptr) = efi::allocate_pages(pages as u64) {
-        let device_ptr = ptr as *mut GlobalSdhciDevice;
+    if let Some(mem) = efi::allocate_pages(pages as u64) {
+        let device_ptr = mem.as_mut_ptr() as *mut GlobalSdhciDevice;
         unsafe {
             ptr::write(device_ptr, GlobalSdhciDevice { controller_index });
         }

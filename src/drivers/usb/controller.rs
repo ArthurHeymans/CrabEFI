@@ -864,9 +864,9 @@ impl InterruptQueue {
     ) -> Option<Self> {
         let buffer_size = max_packet as usize * num_buffers;
         let pages = buffer_size.div_ceil(4096);
-        let buffer = efi::allocate_pages(pages as u64)? as *mut u8;
-
-        unsafe { core::slice::from_raw_parts_mut(buffer, buffer_size).fill(0) };
+        let buffer_mem = efi::allocate_pages(pages as u64)?;
+        buffer_mem.fill(0);
+        let buffer = buffer_mem.as_mut_ptr();
 
         Some(Self {
             device,

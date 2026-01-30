@@ -423,24 +423,30 @@ impl EhciController {
 
         // Allocate memory structures below 4GB for DMA (EHCI uses 32-bit addresses)
         // Async QH (32-byte aligned)
-        let async_qh = efi::allocate_pages_below_4g(1).ok_or(UsbError::AllocationFailed)?;
-        unsafe { core::slice::from_raw_parts_mut(async_qh as *mut u8, 4096).fill(0) };
+        let async_qh_mem = efi::allocate_pages_below_4g(1).ok_or(UsbError::AllocationFailed)?;
+        async_qh_mem.fill(0);
+        let async_qh = async_qh_mem.as_ptr() as u64;
 
         // Periodic frame list (4KB aligned, 4KB)
-        let periodic_list = efi::allocate_pages_below_4g(1).ok_or(UsbError::AllocationFailed)?;
+        let periodic_list_mem =
+            efi::allocate_pages_below_4g(1).ok_or(UsbError::AllocationFailed)?;
+        let periodic_list = periodic_list_mem.as_ptr() as u64;
 
         // DMA buffer
         let dma_pages = Self::DMA_BUFFER_SIZE.div_ceil(4096);
-        let dma_buffer =
+        let dma_buffer_mem =
             efi::allocate_pages_below_4g(dma_pages as u64).ok_or(UsbError::AllocationFailed)?;
+        let dma_buffer = dma_buffer_mem.as_ptr() as u64;
 
         // QH pool (enough for multiple QHs)
-        let qh_pool = efi::allocate_pages_below_4g(1).ok_or(UsbError::AllocationFailed)?;
-        unsafe { core::slice::from_raw_parts_mut(qh_pool as *mut u8, 4096).fill(0) };
+        let qh_pool_mem = efi::allocate_pages_below_4g(1).ok_or(UsbError::AllocationFailed)?;
+        qh_pool_mem.fill(0);
+        let qh_pool = qh_pool_mem.as_ptr() as u64;
 
         // qTD pool (enough for multiple qTDs)
-        let qtd_pool = efi::allocate_pages_below_4g(2).ok_or(UsbError::AllocationFailed)?;
-        unsafe { core::slice::from_raw_parts_mut(qtd_pool as *mut u8, 8192).fill(0) };
+        let qtd_pool_mem = efi::allocate_pages_below_4g(2).ok_or(UsbError::AllocationFailed)?;
+        qtd_pool_mem.fill(0);
+        let qtd_pool = qtd_pool_mem.as_ptr() as u64;
 
         // Dedicated bulk transfer structures (kept linked for performance)
         // Use offsets within the pools: bulk_qh at qh_pool+256, bulk_qtd at qtd_pool+512

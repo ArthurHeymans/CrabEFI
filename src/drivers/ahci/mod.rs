@@ -464,17 +464,20 @@ impl AhciController {
         self.stop_port(port_num)?;
 
         // Allocate command list (1KB, 1024-byte aligned)
-        let cmd_list_addr = efi::allocate_pages(1).ok_or(AhciError::AllocationFailed)?;
-        unsafe { core::slice::from_raw_parts_mut(cmd_list_addr as *mut u8, 4096).fill(0) };
+        let cmd_list_mem = efi::allocate_pages(1).ok_or(AhciError::AllocationFailed)?;
+        cmd_list_mem.fill(0);
+        let cmd_list_addr = cmd_list_mem.as_ptr() as u64;
 
         // Allocate received FIS (256 bytes, 256-byte aligned)
-        let received_fis_addr = efi::allocate_pages(1).ok_or(AhciError::AllocationFailed)?;
-        unsafe { core::slice::from_raw_parts_mut(received_fis_addr as *mut u8, 4096).fill(0) };
+        let received_fis_mem = efi::allocate_pages(1).ok_or(AhciError::AllocationFailed)?;
+        received_fis_mem.fill(0);
+        let received_fis_addr = received_fis_mem.as_ptr() as u64;
 
         // Allocate command tables (one per slot, 256-byte aligned each)
         let mut cmd_tables = [ptr::null_mut(); 32];
-        let cmd_tables_page = efi::allocate_pages(4).ok_or(AhciError::AllocationFailed)?;
-        unsafe { core::slice::from_raw_parts_mut(cmd_tables_page as *mut u8, 4096 * 4).fill(0) };
+        let cmd_tables_mem = efi::allocate_pages(4).ok_or(AhciError::AllocationFailed)?;
+        cmd_tables_mem.fill(0);
+        let cmd_tables_page = cmd_tables_mem.as_ptr() as u64;
 
         for (i, cmd_table) in cmd_tables
             .iter_mut()
@@ -663,7 +666,8 @@ impl AhciController {
 
         // Allocate buffer for identify data (512 bytes)
         let buffer = efi::allocate_pages(1).ok_or(AhciError::AllocationFailed)?;
-        unsafe { core::slice::from_raw_parts_mut(buffer as *mut u8, 4096).fill(0) };
+        buffer.fill(0);
+        let buffer_addr = buffer.as_ptr() as u64;
 
         // Setup command header
         let header = unsafe { &mut *port.cmd_list.add(slot as usize) };
@@ -683,14 +687,14 @@ impl AhciController {
         fis.set_command(ATA_CMD_IDENTIFY);
 
         // Setup PRDT
-        table.prdt[0].set_address(buffer);
+        table.prdt[0].set_address(buffer_addr);
         table.prdt[0].set_byte_count(512, true);
 
         // Issue command
         self.issue_command(port, slot)?;
 
         // Parse identify data
-        let identify = unsafe { core::slice::from_raw_parts(buffer as *const u16, 256) };
+        let identify = unsafe { core::slice::from_raw_parts(buffer.as_ptr() as *const u16, 256) };
 
         // Word 60-61: Total number of user addressable sectors (28-bit LBA)
         let lba28_sectors = (identify[61] as u64) << 16 | identify[60] as u64;
@@ -745,7 +749,7 @@ impl AhciController {
 
         // Allocate buffer for identify data (512 bytes)
         let buffer = efi::allocate_pages(1).ok_or(AhciError::AllocationFailed)?;
-        unsafe { core::slice::from_raw_parts_mut(buffer as *mut u8, 4096).fill(0) };
+        buffer.fill(0);
 
         // Setup command header (set ATAPI bit)
         let header = unsafe { &mut *port.cmd_list.add(slot as usize) };
@@ -766,14 +770,15 @@ impl AhciController {
         fis.set_command(ATA_CMD_IDENTIFY_PACKET);
 
         // Setup PRDT
-        table.prdt[0].set_address(buffer);
+        let buffer_addr = buffer.as_ptr() as u64;
+        table.prdt[0].set_address(buffer_addr);
         table.prdt[0].set_byte_count(512, true);
 
         // Issue command
         self.issue_command(port, slot)?;
 
         // Parse identify packet data
-        let identify = unsafe { core::slice::from_raw_parts(buffer as *const u16, 256) };
+        let identify = unsafe { core::slice::from_raw_parts(buffer.as_ptr() as *const u16, 256) };
 
         // Get model number (words 27-46)
         let mut model = [0u8; 40];
@@ -802,7 +807,8 @@ impl AhciController {
 
         // Allocate buffer for capacity data (8 bytes)
         let buffer = efi::allocate_pages(1).ok_or(AhciError::AllocationFailed)?;
-        unsafe { core::slice::from_raw_parts_mut(buffer as *mut u8, 4096).fill(0) };
+        buffer.fill(0);
+        let buffer_addr = buffer.as_ptr() as u64;
 
         // Setup command header (set ATAPI bit)
         let header = unsafe { &mut *port.cmd_list.add(slot as usize) };
@@ -829,7 +835,7 @@ impl AhciController {
         table.acmd[0] = SCSI_CMD_READ_CAPACITY_10;
 
         // Setup PRDT
-        table.prdt[0].set_address(buffer);
+        table.prdt[0].set_address(buffer_addr);
         table.prdt[0].set_byte_count(8, true);
 
         // Issue command
@@ -842,7 +848,7 @@ impl AhciController {
         }
 
         // Parse capacity data (big-endian)
-        let data = unsafe { core::slice::from_raw_parts(buffer as *const u8, 8) };
+        let data = &buffer[..8];
         let last_lba = u32::from_be_bytes([data[0], data[1], data[2], data[3]]);
         let block_size = u32::from_be_bytes([data[4], data[5], data[6], data[7]]);
 
@@ -1092,9 +1098,9 @@ pub fn init() {
                     pages,
                     size
                 );
-                let controller_ptr = efi::allocate_pages(pages as u64);
-                if let Some(ptr) = controller_ptr {
-                    let controller_box = ptr as *mut AhciController;
+                let controller_mem = efi::allocate_pages(pages as u64);
+                if let Some(mem) = controller_mem {
+                    let controller_box = mem.as_mut_ptr() as *mut AhciController;
                     unsafe {
                         ptr::write(controller_box, controller);
                     }
@@ -1163,8 +1169,8 @@ pub fn store_global_device(controller_index: usize, port_index: usize) -> bool {
     let size = core::mem::size_of::<GlobalAhciDevice>();
     let pages = size.div_ceil(4096);
 
-    if let Some(ptr) = efi::allocate_pages(pages as u64) {
-        let device_ptr = ptr as *mut GlobalAhciDevice;
+    if let Some(mem) = efi::allocate_pages(pages as u64) {
+        let device_ptr = mem.as_mut_ptr() as *mut GlobalAhciDevice;
         unsafe {
             core::ptr::write(
                 device_ptr,

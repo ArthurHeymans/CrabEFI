@@ -430,20 +430,25 @@ impl OhciController {
         log::info!("OHCI: {} ports", num_ports);
 
         // Allocate HCCA (256-byte aligned)
-        let hcca = efi::allocate_pages(1).ok_or(UsbError::AllocationFailed)?;
-        unsafe { core::slice::from_raw_parts_mut(hcca as *mut u8, 4096).fill(0) };
+        let hcca_mem = efi::allocate_pages(1).ok_or(UsbError::AllocationFailed)?;
+        hcca_mem.fill(0);
+        let hcca = hcca_mem.as_ptr() as u64;
 
         // Allocate control ED
-        let control_ed = efi::allocate_pages(1).ok_or(UsbError::AllocationFailed)?;
-        unsafe { core::slice::from_raw_parts_mut(control_ed as *mut u8, 4096).fill(0) };
+        let control_ed_mem = efi::allocate_pages(1).ok_or(UsbError::AllocationFailed)?;
+        control_ed_mem.fill(0);
+        let control_ed = control_ed_mem.as_ptr() as u64;
 
         // Allocate bulk ED
-        let bulk_ed = efi::allocate_pages(1).ok_or(UsbError::AllocationFailed)?;
-        unsafe { core::slice::from_raw_parts_mut(bulk_ed as *mut u8, 4096).fill(0) };
+        let bulk_ed_mem = efi::allocate_pages(1).ok_or(UsbError::AllocationFailed)?;
+        bulk_ed_mem.fill(0);
+        let bulk_ed = bulk_ed_mem.as_ptr() as u64;
 
         // Allocate DMA buffer
         let dma_pages = Self::DMA_BUFFER_SIZE.div_ceil(4096);
-        let dma_buffer = efi::allocate_pages(dma_pages as u64).ok_or(UsbError::AllocationFailed)?;
+        let dma_buffer_mem =
+            efi::allocate_pages(dma_pages as u64).ok_or(UsbError::AllocationFailed)?;
+        let dma_buffer = dma_buffer_mem.as_ptr() as u64;
 
         let mut controller = Self {
             pci_address: pci_dev.address,

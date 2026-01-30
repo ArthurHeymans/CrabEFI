@@ -544,8 +544,8 @@ pub unsafe fn store_global_device_with_controller_ptr(
     let size = core::mem::size_of::<UsbMassStorage>();
     let pages = size.div_ceil(4096);
 
-    if let Some(ptr) = efi::allocate_pages(pages as u64) {
-        let device_ptr = ptr as *mut UsbMassStorage;
+    if let Some(mem) = efi::allocate_pages(pages as u64) {
+        let device_ptr = mem.as_mut_ptr() as *mut UsbMassStorage;
         unsafe {
             core::ptr::write(device_ptr, device);
         }

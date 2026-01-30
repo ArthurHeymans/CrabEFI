@@ -381,15 +381,19 @@ impl UhciController {
         log::info!("UHCI controller at I/O base {:#x}", io_base);
 
         // Allocate frame list (4KB aligned)
-        let frame_list = efi::allocate_pages(1).ok_or(UsbError::AllocationFailed)?;
+        let frame_list_mem = efi::allocate_pages(1).ok_or(UsbError::AllocationFailed)?;
+        let frame_list = frame_list_mem.as_ptr() as u64;
 
         // Allocate QH
-        let qh = efi::allocate_pages(1).ok_or(UsbError::AllocationFailed)?;
-        unsafe { core::slice::from_raw_parts_mut(qh as *mut u8, 4096).fill(0) };
+        let qh_mem = efi::allocate_pages(1).ok_or(UsbError::AllocationFailed)?;
+        qh_mem.fill(0);
+        let qh = qh_mem.as_ptr() as u64;
 
         // Allocate DMA buffer
         let dma_pages = Self::DMA_BUFFER_SIZE.div_ceil(4096);
-        let dma_buffer = efi::allocate_pages(dma_pages as u64).ok_or(UsbError::AllocationFailed)?;
+        let dma_buffer_mem =
+            efi::allocate_pages(dma_pages as u64).ok_or(UsbError::AllocationFailed)?;
+        let dma_buffer = dma_buffer_mem.as_ptr() as u64;
 
         let mut controller = Self {
             pci_address: pci_dev.address,

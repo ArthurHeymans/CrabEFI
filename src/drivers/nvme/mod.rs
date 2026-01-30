@@ -495,20 +495,18 @@ impl NvmeController {
 
         // Allocate queues using EFI memory allocator
         // Each queue needs to be 4KB aligned
-        let admin_sq =
-            efi::allocate_pages(1).ok_or(NvmeError::AllocationFailed)? as *mut SubmissionQueueEntry;
-        let admin_cq =
-            efi::allocate_pages(1).ok_or(NvmeError::AllocationFailed)? as *mut CompletionQueueEntry;
+        let admin_sq_mem = efi::allocate_pages(1).ok_or(NvmeError::AllocationFailed)?;
+        admin_sq_mem.fill(0);
+        let admin_sq = admin_sq_mem.as_mut_ptr() as *mut SubmissionQueueEntry;
+
+        let admin_cq_mem = efi::allocate_pages(1).ok_or(NvmeError::AllocationFailed)?;
+        admin_cq_mem.fill(0);
+        let admin_cq = admin_cq_mem.as_mut_ptr() as *mut CompletionQueueEntry;
 
         // Allocate a page-aligned DMA buffer for data transfers
         // This prevents corruption when callers pass misaligned buffers
-        let dma_buffer = efi::allocate_pages(1).ok_or(NvmeError::AllocationFailed)? as *mut u8;
-
-        // Zero the queues
-        unsafe {
-            core::slice::from_raw_parts_mut(admin_sq as *mut u8, ADMIN_QUEUE_SIZE).fill(0);
-            core::slice::from_raw_parts_mut(admin_cq as *mut u8, ADMIN_QUEUE_SIZE).fill(0);
-        }
+        let dma_buffer_mem = efi::allocate_pages(1).ok_or(NvmeError::AllocationFailed)?;
+        let dma_buffer = dma_buffer_mem.as_mut_ptr();
 
         let mut controller = Self {
             pci_address: pci_dev.address,
@@ -686,21 +684,22 @@ impl NvmeController {
     /// Identify the controller
     fn identify_controller(&mut self) -> Result<(), NvmeError> {
         // Allocate a page for identify data
-        let identify_data = efi::allocate_pages(1).ok_or(NvmeError::AllocationFailed)?;
+        let identify_mem = efi::allocate_pages(1).ok_or(NvmeError::AllocationFailed)?;
+        let identify_addr = identify_mem.as_ptr() as u64;
 
         // Build identify command
         let mut cmd = SubmissionQueueEntry::new();
         cmd.set_opcode(admin_cmd::IDENTIFY);
         cmd.set_cid(self.next_command_id());
         cmd.nsid = 0;
-        cmd.prp1 = identify_data;
+        cmd.prp1 = identify_addr;
         cmd.cdw10 = 0x01; // CNS = 01 (Identify Controller)
 
         let cid = self.submit_admin_command(&cmd);
         self.wait_admin_completion(cid)?;
 
         // Parse identify data
-        let ctrl = unsafe { &*(identify_data as *const IdentifyController) };
+        let ctrl = unsafe { &*(identify_mem.as_ptr() as *const IdentifyController) };
 
         // Extract model and serial number
         let model = core::str::from_utf8(&ctrl.mn).unwrap_or("Unknown").trim();
@@ -715,7 +714,7 @@ impl NvmeController {
         );
 
         // Free the identify data page
-        efi::free_pages(identify_data, 1);
+        efi::free_pages(identify_mem, 1);
 
         Ok(())
     }
@@ -723,16 +722,13 @@ impl NvmeController {
     /// Create I/O submission and completion queues
     fn create_io_queues(&mut self) -> Result<(), NvmeError> {
         // Allocate I/O queues
-        self.io_sq =
-            efi::allocate_pages(1).ok_or(NvmeError::AllocationFailed)? as *mut SubmissionQueueEntry;
-        self.io_cq =
-            efi::allocate_pages(1).ok_or(NvmeError::AllocationFailed)? as *mut CompletionQueueEntry;
+        let io_sq_mem = efi::allocate_pages(1).ok_or(NvmeError::AllocationFailed)?;
+        io_sq_mem.fill(0);
+        self.io_sq = io_sq_mem.as_mut_ptr() as *mut SubmissionQueueEntry;
 
-        // Zero the queues
-        unsafe {
-            core::slice::from_raw_parts_mut(self.io_sq as *mut u8, IO_QUEUE_SIZE).fill(0);
-            core::slice::from_raw_parts_mut(self.io_cq as *mut u8, IO_QUEUE_SIZE).fill(0);
-        }
+        let io_cq_mem = efi::allocate_pages(1).ok_or(NvmeError::AllocationFailed)?;
+        io_cq_mem.fill(0);
+        self.io_cq = io_cq_mem.as_mut_ptr() as *mut CompletionQueueEntry;
 
         // Create I/O Completion Queue (queue ID = 1)
         let mut cmd = SubmissionQueueEntry::new();
@@ -764,21 +760,23 @@ impl NvmeController {
     /// Identify namespaces
     fn identify_namespaces(&mut self) -> Result<(), NvmeError> {
         // Allocate a page for identify data
-        let identify_data = efi::allocate_pages(1).ok_or(NvmeError::AllocationFailed)?;
+        let identify_mem = efi::allocate_pages(1).ok_or(NvmeError::AllocationFailed)?;
+        let identify_addr = identify_mem.as_ptr() as u64;
 
         // Get active namespace list
         let mut cmd = SubmissionQueueEntry::new();
         cmd.set_opcode(admin_cmd::IDENTIFY);
         cmd.set_cid(self.next_command_id());
         cmd.nsid = 0;
-        cmd.prp1 = identify_data;
+        cmd.prp1 = identify_addr;
         cmd.cdw10 = 0x02; // CNS = 02 (Active Namespace ID list)
 
         let cid = self.submit_admin_command(&cmd);
         self.wait_admin_completion(cid)?;
 
         // Parse namespace list
-        let ns_list = unsafe { core::slice::from_raw_parts(identify_data as *const u32, 1024) };
+        let ns_list =
+            unsafe { core::slice::from_raw_parts(identify_mem.as_ptr() as *const u32, 1024) };
 
         for &nsid in ns_list.iter() {
             if nsid == 0 {
@@ -790,13 +788,13 @@ impl NvmeController {
             cmd.set_opcode(admin_cmd::IDENTIFY);
             cmd.set_cid(self.next_command_id());
             cmd.nsid = nsid;
-            cmd.prp1 = identify_data;
+            cmd.prp1 = identify_addr;
             cmd.cdw10 = 0x00; // CNS = 00 (Identify Namespace)
 
             let cid = self.submit_admin_command(&cmd);
             self.wait_admin_completion(cid)?;
 
-            let ns = unsafe { &*(identify_data as *const IdentifyNamespace) };
+            let ns = unsafe { &*(identify_mem.as_ptr() as *const IdentifyNamespace) };
             let lba_format_idx = ns.flbas & 0x0F;
             let lba_format = ns.lbaf[lba_format_idx as usize];
             let lba_data_size = (lba_format >> 16) & 0xFF;
@@ -824,7 +822,7 @@ impl NvmeController {
             }
         }
 
-        efi::free_pages(identify_data, 1);
+        efi::free_pages(identify_mem, 1);
 
         if self.namespaces.is_empty() {
             return Err(NvmeError::NoNamespaces);
@@ -1025,9 +1023,9 @@ pub fn init() {
                     pages,
                     size
                 );
-                let controller_ptr = efi::allocate_pages(pages as u64);
-                if let Some(ptr) = controller_ptr {
-                    let controller_box = ptr as *mut NvmeController;
+                let controller_mem = efi::allocate_pages(pages as u64);
+                if let Some(mem) = controller_mem {
+                    let controller_box = mem.as_mut_ptr() as *mut NvmeController;
                     unsafe {
                         ptr::write(controller_box, controller);
                     }
@@ -1106,8 +1104,8 @@ pub fn store_global_device(controller_index: usize, nsid: u32) -> bool {
     let size = core::mem::size_of::<GlobalNvmeDevice>();
     let pages = size.div_ceil(4096);
 
-    if let Some(ptr) = efi::allocate_pages(pages as u64) {
-        let device_ptr = ptr as *mut GlobalNvmeDevice;
+    if let Some(mem) = efi::allocate_pages(pages as u64) {
+        let device_ptr = mem.as_mut_ptr() as *mut GlobalNvmeDevice;
         unsafe {
             core::ptr::write(
                 device_ptr,

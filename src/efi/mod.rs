@@ -319,8 +319,9 @@ const FIRMWARE_HANDLE: usize = 0xF1F1_F1F1;
 
 /// Allocate pages of memory (convenience function for drivers)
 ///
-/// Returns the physical address of the allocated pages, or None if allocation failed.
-pub fn allocate_pages(num_pages: u64) -> Option<u64> {
+/// Returns a mutable byte slice covering the allocated pages, or None if allocation failed.
+/// The slice has a `'static` lifetime since the memory remains valid until explicitly freed.
+pub fn allocate_pages(num_pages: u64) -> Option<&'static mut [u8]> {
     let mut addr = 0u64;
     let status = allocator::allocate_pages(
         allocator::AllocateType::AllocateAnyPages,
@@ -329,7 +330,10 @@ pub fn allocate_pages(num_pages: u64) -> Option<u64> {
         &mut addr,
     );
     if status == Status::SUCCESS {
-        Some(addr)
+        let size = (num_pages as usize) * allocator::PAGE_SIZE_USIZE;
+        // Safety: allocate_pages returns a valid, aligned address for the requested
+        // number of pages. The memory is exclusively owned until freed.
+        Some(unsafe { core::slice::from_raw_parts_mut(addr as *mut u8, size) })
     } else {
         None
     }
@@ -340,8 +344,9 @@ pub fn allocate_pages(num_pages: u64) -> Option<u64> {
 /// EHCI and other legacy controllers use 32-bit physical addresses for DMA.
 /// This function ensures the allocated memory is accessible by such controllers.
 ///
-/// Returns the physical address of the allocated pages, or None if allocation failed.
-pub fn allocate_pages_below_4g(num_pages: u64) -> Option<u64> {
+/// Returns a mutable byte slice covering the allocated pages, or None if allocation failed.
+/// The slice has a `'static` lifetime since the memory remains valid until explicitly freed.
+pub fn allocate_pages_below_4g(num_pages: u64) -> Option<&'static mut [u8]> {
     // Use AllocateMaxAddress with max address of 0xFFFFFFFF (4GB - 1)
     let mut addr = 0xFFFF_FFFFu64;
     let status = allocator::allocate_pages(
@@ -351,13 +356,19 @@ pub fn allocate_pages_below_4g(num_pages: u64) -> Option<u64> {
         &mut addr,
     );
     if status == Status::SUCCESS {
-        Some(addr)
+        let size = (num_pages as usize) * allocator::PAGE_SIZE_USIZE;
+        // Safety: allocate_pages returns a valid, aligned address for the requested
+        // number of pages. The memory is exclusively owned until freed.
+        Some(unsafe { core::slice::from_raw_parts_mut(addr as *mut u8, size) })
     } else {
         None
     }
 }
 
 /// Free previously allocated pages (convenience function for drivers)
-pub fn free_pages(addr: u64, num_pages: u64) {
+///
+/// Pass the slice returned by `allocate_pages` (or a subslice starting at the same address).
+pub fn free_pages(memory: &mut [u8], num_pages: u64) {
+    let addr = memory.as_ptr() as u64;
     let _ = allocator::free_pages(addr, num_pages);
 }
