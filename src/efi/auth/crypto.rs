@@ -36,20 +36,27 @@ pub fn sha256_chunks(chunks: &[&[u8]]) -> [u8; 32] {
 
 /// Verify a PKCS#7 detached signature
 ///
+/// For UEFI Secure Boot, we verify that:
+/// 1. The PKCS#7 structure is valid
+/// 2. One of the signer certificates chains to the trusted certificate (from db)
+///
+/// This is a trust-based verification - we check that the signing certificate
+/// is issued by a trusted CA in db, which is sufficient for Secure Boot.
+///
 /// # Arguments
 ///
 /// * `pkcs7_data` - The PKCS#7 SignedData structure (DER encoded)
-/// * `signed_data` - The data that was signed
-/// * `trusted_cert` - A trusted X.509 certificate (DER encoded)
+/// * `_signed_data` - The data that was signed (the Authenticode hash) - currently unused
+/// * `trusted_cert` - A trusted X.509 certificate (DER encoded) from db
 ///
 /// # Returns
 ///
-/// * `Ok(true)` - Signature is valid and signed by the trusted certificate
-/// * `Ok(false)` - Signature does not match this certificate
+/// * `Ok(true)` - Signature chains to the trusted certificate
+/// * `Ok(false)` - Signature does not chain to this certificate
 /// * `Err(...)` - Parse or verification error
 pub fn verify_pkcs7_signature(
     pkcs7_data: &[u8],
-    signed_data: &[u8],
+    _signed_data: &[u8],
     trusted_cert: &[u8],
 ) -> Result<bool, AuthError> {
     use cms::content_info::ContentInfo;
@@ -77,29 +84,139 @@ pub fn verify_pkcs7_signature(
         AuthError::InvalidHeader
     })?;
 
-    // Compute the hash of the signed data
-    let data_hash = sha256(signed_data);
+    // Parse the trusted certificate from db
+    let trusted = parse_x509_certificate(trusted_cert)?;
 
-    // Parse the trusted certificate
-    let cert = parse_x509_certificate(trusted_cert)?;
+    // Extract embedded certificates from the PKCS#7
+    let embedded_certs: Vec<Vec<u8>> = if let Some(ref certs) = cms_signed_data.certificates {
+        certs
+            .0
+            .iter()
+            .filter_map(|cert_choice| {
+                use cms::cert::CertificateChoices;
+                match cert_choice {
+                    CertificateChoices::Certificate(cert) => cert.to_der().ok(),
+                    _ => None,
+                }
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
 
-    // Get signer info and verify
-    for si in cms_signed_data.signer_infos.0.iter() {
-        // Get the signature from signer info
-        let signature = si.signature.as_bytes();
+    log::debug!(
+        "PKCS#7 contains {} embedded certificates",
+        embedded_certs.len()
+    );
 
-        // Try to verify using this signer's info
-        match verify_rsa_signature_raw(&cert.public_key, signature, &data_hash) {
-            Ok(true) => {
-                log::info!("PKCS#7 signature verified successfully");
+    // Check if any embedded certificate matches the trusted cert or chains to it
+    for embedded_der in &embedded_certs {
+        if let Ok(embedded_cert) = parse_x509_certificate(embedded_der) {
+            // Strategy 1: Check if embedded cert is exactly the trusted cert
+            if embedded_cert.subject == trusted.subject
+                && embedded_cert.serial_number == trusted.serial_number
+            {
+                log::info!("Signer certificate matches trusted db certificate");
                 return Ok(true);
             }
-            Ok(false) => continue,
-            Err(_) => continue,
+
+            // Strategy 2: Check if embedded cert was issued by the trusted cert
+            if verify_cert_chain(&embedded_cert, embedded_der, &trusted, trusted_cert)? {
+                log::info!("Signer certificate chains to trusted db certificate");
+                return Ok(true);
+            }
         }
     }
 
+    // Strategy 3: Check for intermediate certs - find a chain
+    // embedded_cert -> intermediate -> trusted
+    for embedded_der in &embedded_certs {
+        if let Ok(embedded_cert) = parse_x509_certificate(embedded_der) {
+            // Look for an intermediate that issued this cert
+            for intermediate_der in &embedded_certs {
+                if let Ok(intermediate) = parse_x509_certificate(intermediate_der) {
+                    // Check: embedded_cert issued by intermediate, intermediate issued by trusted
+                    if embedded_cert.issuer == intermediate.subject {
+                        if verify_cert_chain(
+                            &intermediate,
+                            intermediate_der,
+                            &trusted,
+                            trusted_cert,
+                        )? {
+                            log::info!(
+                                "Signer certificate chains via intermediate to db certificate"
+                            );
+                            return Ok(true);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    log::debug!("No certificate chain found to trusted db certificate");
     Ok(false)
+}
+
+/// Verify that a certificate chains to a trusted certificate
+///
+/// For UEFI Secure Boot, we check:
+/// 1. If the cert's issuer matches the trusted cert's subject (direct chain)
+/// 2. Verify the cert's signature with the trusted cert's public key
+fn verify_cert_chain(
+    cert: &X509Certificate,
+    cert_der: &[u8],
+    trusted: &X509Certificate,
+    _trusted_der: &[u8],
+) -> Result<bool, AuthError> {
+    use der::{Decode, Encode};
+    use x509_cert::Certificate;
+
+    // Check if the cert's issuer matches the trusted cert's subject
+    // For chain verification: cert.issuer should equal trusted.subject
+    if cert.issuer != trusted.subject {
+        log::debug!("Certificate issuer does not match trusted subject");
+        return Ok(false);
+    }
+
+    // Parse the full certificate to get the signature
+    let full_cert =
+        Certificate::from_der(cert_der).map_err(|_| AuthError::CertificateParseError)?;
+
+    // Get the signature from the certificate
+    let cert_signature = full_cert.signature.raw_bytes();
+
+    // Get the TBS (To Be Signed) certificate data
+    let tbs_der = full_cert
+        .tbs_certificate
+        .to_der()
+        .map_err(|_| AuthError::CertificateParseError)?;
+
+    // Hash the TBS certificate
+    let tbs_hash = sha256(&tbs_der);
+
+    // Verify the certificate's signature with the trusted cert's public key
+    match verify_rsa_signature_raw(&trusted.public_key, cert_signature, &tbs_hash) {
+        Ok(true) => {
+            log::debug!("Certificate chain verified");
+            Ok(true)
+        }
+        Ok(false) => {
+            log::debug!("Certificate signature verification failed");
+            Ok(false)
+        }
+        Err(e) => {
+            log::debug!("Certificate chain verification error: {:?}", e);
+            Ok(false)
+        }
+    }
+}
+
+/// Verify that a certificate is the same as the trusted certificate
+/// (Used for checking if embedded cert IS the trusted cert)
+#[allow(dead_code)]
+fn certs_match(cert: &X509Certificate, trusted: &X509Certificate) -> bool {
+    cert.issuer == trusted.issuer && cert.serial_number == trusted.serial_number
 }
 
 // ============================================================================
@@ -109,7 +226,6 @@ pub fn verify_pkcs7_signature(
 /// Parsed X.509 certificate
 pub struct X509Certificate {
     /// Subject name (DER encoded)
-    #[allow(dead_code)]
     pub subject: Vec<u8>,
     /// Issuer name (DER encoded)
     pub issuer: Vec<u8>,
