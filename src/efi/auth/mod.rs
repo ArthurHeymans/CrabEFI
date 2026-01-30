@@ -27,6 +27,7 @@
 //! - **User Mode**: When PK is enrolled, all authenticated variable writes require valid signatures
 
 mod crypto;
+pub mod enrollment;
 mod signature;
 mod structures;
 mod variables;
