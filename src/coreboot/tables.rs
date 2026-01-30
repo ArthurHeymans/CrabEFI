@@ -67,6 +67,14 @@ struct CbMemoryRange {
 }
 
 /// Coreboot serial port info
+///
+/// Matches coreboot's `struct lb_serial` from coreboot_tables.h:
+/// - tag, size: record header (8 bytes)
+/// - type: LB_SERIAL_TYPE_IO_MAPPED (1) or LB_SERIAL_TYPE_MEMORY_MAPPED (2)
+/// - baseaddr: I/O port or MMIO address
+/// - baud: baud rate (e.g., 115200)
+/// - regwidth: register width in bytes
+/// - input_hertz: crystal/input frequency
 #[repr(C, packed)]
 #[derive(FromBytes, Immutable, KnownLayout, Unaligned)]
 struct CbSerial {
@@ -77,7 +85,6 @@ struct CbSerial {
     baud: u32,
     regwidth: u32,
     input_hertz: u32,
-    uart_pci_addr: u32,
 }
 
 /// Coreboot framebuffer info
