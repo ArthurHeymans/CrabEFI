@@ -115,22 +115,6 @@ pub trait BlockDevice {
     fn read_block(&mut self, lba: u64, buffer: &mut [u8]) -> Result<(), BlockError> {
         self.read_blocks(lba, 1, buffer)
     }
-
-    /// Write blocks to the device
-    ///
-    /// # Arguments
-    /// * `lba` - Starting logical block address
-    /// * `count` - Number of blocks to write
-    /// * `buffer` - Buffer containing data to write (must be at least count * block_size bytes)
-    ///
-    /// # Returns
-    /// Ok(()) on success, Err(BlockError) on failure
-    fn write_blocks(&mut self, lba: u64, count: u32, buffer: &[u8]) -> Result<(), BlockError>;
-
-    /// Write a single block (convenience method)
-    fn write_block(&mut self, lba: u64, buffer: &[u8]) -> Result<(), BlockError> {
-        self.write_blocks(lba, 1, buffer)
-    }
 }
 
 // ============================================================================
@@ -199,14 +183,6 @@ impl BlockDevice for NvmeBlockDevice {
             .read_sectors(self.nsid, lba, count, buffer.as_mut_ptr())
             .map_err(BlockError::from)
     }
-
-    fn write_blocks(&mut self, lba: u64, count: u32, buffer: &[u8]) -> Result<(), BlockError> {
-        let controller = nvme::get_controller(self.controller_id).ok_or(BlockError::DeviceError)?;
-
-        controller
-            .write_sectors(self.nsid, lba, count, buffer.as_ptr())
-            .map_err(BlockError::from)
-    }
 }
 
 // ============================================================================
@@ -273,14 +249,6 @@ impl BlockDevice for AhciBlockDevice {
 
         controller
             .read_sectors(self.port, lba, count, buffer.as_mut_ptr())
-            .map_err(BlockError::from)
-    }
-
-    fn write_blocks(&mut self, lba: u64, count: u32, buffer: &[u8]) -> Result<(), BlockError> {
-        let controller = ahci::get_controller(self.controller_id).ok_or(BlockError::DeviceError)?;
-
-        controller
-            .write_sectors(self.port, lba, count, buffer.as_ptr())
             .map_err(BlockError::from)
     }
 }
@@ -363,22 +331,6 @@ impl BlockDevice for UsbBlockDevice {
 
         Ok(())
     }
-
-    fn write_blocks(&mut self, lba: u64, count: u32, buffer: &[u8]) -> Result<(), BlockError> {
-        // USB mass storage write - use global write function
-        // Write sectors one at a time
-        let block_size = self.info.block_size as usize;
-        for i in 0..count {
-            let offset = i as usize * block_size;
-            let sector_lba = lba + i as u64;
-            usb::mass_storage::global_write_sector(
-                sector_lba,
-                &buffer[offset..offset + block_size],
-            )
-            .map_err(|()| BlockError::DeviceError)?;
-        }
-        Ok(())
-    }
 }
 
 // ============================================================================
@@ -433,15 +385,6 @@ impl BlockDevice for SdhciBlockDevice {
             .read_sectors(lba, count, buffer.as_mut_ptr())
             .map_err(BlockError::from)
     }
-
-    fn write_blocks(&mut self, lba: u64, count: u32, buffer: &[u8]) -> Result<(), BlockError> {
-        let controller =
-            sdhci::get_controller(self.controller_id).ok_or(BlockError::DeviceError)?;
-
-        controller
-            .write_sectors(lba, count, buffer.as_ptr())
-            .map_err(BlockError::from)
-    }
 }
 
 // ============================================================================
@@ -490,12 +433,6 @@ impl<'a> BlockDevice for NvmeDisk<'a> {
             .read_sectors(self.nsid, lba, count, buffer.as_mut_ptr())
             .map_err(BlockError::from)
     }
-
-    fn write_blocks(&mut self, lba: u64, count: u32, buffer: &[u8]) -> Result<(), BlockError> {
-        self.controller
-            .write_sectors(self.nsid, lba, count, buffer.as_ptr())
-            .map_err(BlockError::from)
-    }
 }
 
 /// AHCI disk wrapper for use with borrowed controller reference
@@ -540,12 +477,6 @@ impl<'a> BlockDevice for AhciDisk<'a> {
             .read_sectors(self.port, lba, count, buffer.as_mut_ptr())
             .map_err(BlockError::from)
     }
-
-    fn write_blocks(&mut self, lba: u64, count: u32, buffer: &[u8]) -> Result<(), BlockError> {
-        self.controller
-            .write_sectors(self.port, lba, count, buffer.as_ptr())
-            .map_err(BlockError::from)
-    }
 }
 
 /// USB disk wrapper for use with borrowed controller and mass storage device
@@ -583,12 +514,6 @@ impl<'a> BlockDevice for UsbDisk<'a> {
             .read_sectors_generic(self.controller, lba, count, buffer)
             .map_err(BlockError::from)
     }
-
-    fn write_blocks(&mut self, lba: u64, count: u32, buffer: &[u8]) -> Result<(), BlockError> {
-        self.device
-            .write_sectors_generic(self.controller, lba, count, buffer)
-            .map_err(BlockError::from)
-    }
 }
 
 /// SDHCI disk wrapper for use with borrowed controller reference
@@ -620,12 +545,6 @@ impl<'a> BlockDevice for SdhciDisk<'a> {
     fn read_blocks(&mut self, lba: u64, count: u32, buffer: &mut [u8]) -> Result<(), BlockError> {
         self.controller
             .read_sectors(lba, count, buffer.as_mut_ptr())
-            .map_err(BlockError::from)
-    }
-
-    fn write_blocks(&mut self, lba: u64, count: u32, buffer: &[u8]) -> Result<(), BlockError> {
-        self.controller
-            .write_sectors(lba, count, buffer.as_ptr())
             .map_err(BlockError::from)
     }
 }
@@ -665,15 +584,6 @@ impl BlockDevice for AnyBlockDevice {
             AnyBlockDevice::Ahci(dev) => dev.read_blocks(lba, count, buffer),
             AnyBlockDevice::Usb(dev) => dev.read_blocks(lba, count, buffer),
             AnyBlockDevice::Sdhci(dev) => dev.read_blocks(lba, count, buffer),
-        }
-    }
-
-    fn write_blocks(&mut self, lba: u64, count: u32, buffer: &[u8]) -> Result<(), BlockError> {
-        match self {
-            AnyBlockDevice::Nvme(dev) => dev.write_blocks(lba, count, buffer),
-            AnyBlockDevice::Ahci(dev) => dev.write_blocks(lba, count, buffer),
-            AnyBlockDevice::Usb(dev) => dev.write_blocks(lba, count, buffer),
-            AnyBlockDevice::Sdhci(dev) => dev.write_blocks(lba, count, buffer),
         }
     }
 }
