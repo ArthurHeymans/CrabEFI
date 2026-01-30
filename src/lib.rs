@@ -11,9 +11,10 @@
 #![allow(clippy::too_many_arguments)] // USB/hardware APIs often require many parameters
 #![allow(clippy::field_reassign_with_default)] // Clearer than complex struct initializers
 
-// Note: We don't use alloc for now as we don't have a heap allocator yet
-// extern crate alloc;
+// Enable alloc crate for heap allocations (needed for RustCrypto)
+extern crate alloc;
 
+pub mod heap;
 pub mod arch;
 pub mod coreboot;
 pub mod drivers;
@@ -168,6 +169,11 @@ pub fn init(coreboot_table_ptr: u64) {
 
     // Initialize EFI environment
     efi::init(&cb_info);
+
+    // Initialize heap allocator (needed for crypto operations)
+    if !heap::init() {
+        log::error!("Failed to initialize heap allocator!");
+    }
 
     log::info!("CrabEFI initialized successfully!");
     log::info!("EFI System Table at: {:p}", efi::get_system_table());
