@@ -11,7 +11,7 @@ use r_efi::protocols::device_path::{
     self, End, HardDriveMedia, Media, Protocol, TYPE_END, TYPE_MEDIA,
 };
 
-use crate::efi::allocator::{MemoryType, allocate_pool};
+use crate::efi::allocator::{allocate_pool, MemoryType};
 
 /// Re-export the GUID for external use
 pub const DEVICE_PATH_PROTOCOL_GUID: Guid = device_path::PROTOCOL_GUID;
@@ -708,6 +708,111 @@ pub fn create_sata_partition_device_path(
         pci_function,
         port,
         partition_number,
+        partition_start,
+        partition_size
+    );
+
+    dest as *mut Protocol
+}
+
+// ============================================================================
+// CD-ROM Device Paths (El Torito)
+// ============================================================================
+
+/// CD-ROM Device Path Node (UEFI Spec 10.3.5.2)
+#[repr(C, packed)]
+pub struct CdromDevicePathNode {
+    pub r#type: u8,
+    pub sub_type: u8,
+    pub length: [u8; 2],
+    /// Boot Entry number from El Torito boot catalog
+    pub boot_entry: u32,
+    /// Starting LBA of the partition
+    pub partition_start: u64,
+    /// Size of the partition in blocks
+    pub partition_size: u64,
+}
+
+/// Sub-type for CD-ROM device path (Media type)
+const SUBTYPE_CDROM: u8 = 0x02;
+
+impl CdromDevicePathNode {
+    /// Create a CD-ROM device path node
+    #[inline]
+    const fn new(boot_entry: u32, partition_start: u64, partition_size: u64) -> Self {
+        Self {
+            r#type: TYPE_MEDIA,
+            sub_type: SUBTYPE_CDROM,
+            length: (core::mem::size_of::<Self>() as u16).to_le_bytes(),
+            boot_entry,
+            partition_start,
+            partition_size,
+        }
+    }
+}
+
+/// Full SATA CD-ROM device path: ACPI + PCI + SATA + CDROM + End
+#[repr(C, packed)]
+pub struct FullSataCdromDevicePath {
+    pub acpi: AcpiDevicePathNode,
+    pub pci: PciDevicePathNode,
+    pub sata: SataDevicePathNode,
+    pub cdrom: CdromDevicePathNode,
+    pub end: End,
+}
+
+/// Create a device path for a CD-ROM El Torito boot image on SATA
+///
+/// Creates a device path: ACPI(PNP0A03,0)/PCI(dev,func)/SATA(port)/CDROM(entry,start,size)/End
+///
+/// This is used when booting from an ISO image via El Torito boot specification.
+///
+/// # Arguments
+/// * `pci_device` - PCI device number of the AHCI controller
+/// * `pci_function` - PCI function number
+/// * `port` - AHCI port number
+/// * `boot_entry` - El Torito boot catalog entry number
+/// * `partition_start` - Start LBA of the boot image
+/// * `partition_size` - Size of the boot image in blocks
+///
+/// # Returns
+/// A pointer to the device path protocol, or null on failure
+pub fn create_sata_cdrom_device_path(
+    pci_device: u8,
+    pci_function: u8,
+    port: u16,
+    boot_entry: u32,
+    partition_start: u64,
+    partition_size: u64,
+) -> *mut Protocol {
+    let size = core::mem::size_of::<FullSataCdromDevicePath>();
+
+    let dest = match allocate_pool(MemoryType::BootServicesData, size) {
+        Ok(p) => p as *mut FullSataCdromDevicePath,
+        Err(_) => {
+            log::error!("Failed to allocate SATA CDROM device path");
+            return core::ptr::null_mut();
+        }
+    };
+
+    // Build the device path on the stack (safe), then write to allocated memory
+    let device_path = FullSataCdromDevicePath {
+        acpi: AcpiDevicePathNode::new(0),
+        pci: PciDevicePathNode::new(pci_device, pci_function),
+        sata: SataDevicePathNode::new(port),
+        cdrom: CdromDevicePathNode::new(boot_entry, partition_start, partition_size),
+        end: create_end_node(),
+    };
+
+    // Safety: dest points to valid, properly aligned memory of sufficient size
+    unsafe { ptr::write(dest, device_path) };
+
+    log::debug!(
+        "Created SATA CDROM device path: ACPI/PCI({:02x},{:x})/SATA({})/CDROM({},{},{})",
+        pci_device,
+        pci_function,
+        port,
+        boot_entry,
         partition_start,
         partition_size
     );

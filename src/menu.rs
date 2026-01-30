@@ -18,7 +18,7 @@ use crate::drivers::serial as serial_driver;
 use crate::framebuffer_console::{
     Color, DEFAULT_BG, DEFAULT_FG, FramebufferConsole, HIGHLIGHT_BG, HIGHLIGHT_FG, TITLE_COLOR,
 };
-use crate::fs::{fat::FatFilesystem, gpt};
+use crate::fs::{fat::FatFilesystem, gpt, iso9660};
 use crate::time::{Timeout, delay_ms};
 use core::fmt::Write;
 use heapless::{String, Vec};
@@ -290,7 +290,7 @@ fn discover_ahci_entries(menu: &mut BootMenu) {
             if let Some(controller) = ahci::get_controller(0) {
                 let mut disk = AhciDisk::new(controller, port_index);
 
-                // Read GPT and find partitions
+                // Try GPT first
                 if let Ok(header) = gpt::read_gpt_header(&mut disk)
                     && let Ok(partitions) = gpt::read_partitions(&mut disk, &header)
                 {
@@ -315,6 +315,52 @@ fn discover_ahci_entries(menu: &mut BootMenu) {
                                         },
                                         partition_num,
                                         partition.clone(),
+                                        pci_addr.device,
+                                        pci_addr.function,
+                                    );
+
+                                    if !menu.add_entry(entry) {
+                                        return; // Menu full
+                                    }
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    // GPT failed - try El Torito (ISO9660) as fallback
+                    if let Some(controller) = ahci::get_controller(0) {
+                        let mut disk = AhciDisk::new(controller, port_index);
+                        if let Ok(efi_image) = iso9660::find_efi_boot_image(&mut disk) {
+                            // Create a synthetic partition for the El Torito boot image
+                            let block_size = disk.info().block_size;
+                            let partition = gpt::Partition {
+                                type_guid: [0u8; 16], // Not a real GUID
+                                partition_guid: [0u8; 16],
+                                first_lba: efi_image.start_sector,
+                                last_lba: efi_image.start_sector
+                                    + efi_image.sector_count as u64
+                                    - 1,
+                                attributes: 0,
+                                is_esp: true, // Treat it as ESP
+                                block_size,
+                            };
+
+                            // Check if the boot image contains BOOTX64.EFI
+                            if let Some(controller) = ahci::get_controller(0) {
+                                let mut disk = AhciDisk::new(controller, port_index);
+                                if check_bootloader_exists(&mut disk, efi_image.start_sector) {
+                                    let mut name: String<64> = String::new();
+                                    let _ = write!(name, "ISO Boot (SATA port {})", port_index);
+
+                                    let entry = BootEntry::new(
+                                        &name,
+                                        "EFI\\BOOT\\BOOTX64.EFI",
+                                        DeviceType::Ahci {
+                                            controller_id: 0,
+                                            port: port_index,
+                                        },
+                                        0, // No partition number for El Torito
+                                        partition,
                                         pci_addr.device,
                                         pci_addr.function,
                                     );

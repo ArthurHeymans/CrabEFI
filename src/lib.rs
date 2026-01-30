@@ -1468,17 +1468,31 @@ fn try_boot_from_esp_ahci(
             };
 
             // Install DevicePath protocol on the device handle
-            // Use full SATA partition path for proper hierarchy matching
+            // Use CDROM device path for El Torito (partition_num = 0) or
+            // HardDrive device path for GPT partitions
             let partition_size = esp.size_sectors();
-            let device_path = device_path::create_sata_partition_device_path(
-                pci_device,
-                pci_function,
-                port,
-                partition_num,
-                esp.first_lba,
-                partition_size,
-                &esp.partition_guid,
-            );
+            let device_path = if partition_num == 0 {
+                // El Torito boot - use CD-ROM device path
+                device_path::create_sata_cdrom_device_path(
+                    pci_device,
+                    pci_function,
+                    port,
+                    0, // boot_entry (El Torito catalog entry)
+                    esp.first_lba,
+                    partition_size,
+                )
+            } else {
+                // GPT partition - use HardDrive device path
+                device_path::create_sata_partition_device_path(
+                    pci_device,
+                    pci_function,
+                    port,
+                    partition_num,
+                    esp.first_lba,
+                    partition_size,
+                    &esp.partition_guid,
+                )
+            };
 
             if !device_path.is_null() {
                 let status = boot_services::install_protocol(
