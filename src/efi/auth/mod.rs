@@ -30,6 +30,7 @@ pub mod authenticode;
 pub mod boot;
 mod crypto;
 pub mod enrollment;
+pub mod key_files;
 mod signature;
 mod structures;
 mod variables;

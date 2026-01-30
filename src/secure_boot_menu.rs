@@ -22,6 +22,7 @@ const MENU_TITLE: &str = "Secure Boot Settings";
 enum MenuOption {
     ToggleSecureBoot,
     EnrollDefaultKeys,
+    EnrollCustomPK,
     ClearAllKeys,
     ReturnToBootMenu,
 }
@@ -45,6 +46,13 @@ impl MenuOption {
                     "Enroll Default Keys (requires Setup Mode)"
                 }
             }
+            MenuOption::EnrollCustomPK => {
+                if setup_mode {
+                    "Enroll Custom PK from ESP (EFI\\keys\\PK.cer)"
+                } else {
+                    "Enroll Custom PK (requires Setup Mode)"
+                }
+            }
             MenuOption::ClearAllKeys => "Clear All Keys (return to Setup Mode)",
             MenuOption::ReturnToBootMenu => "Return to Boot Menu",
         }
@@ -54,15 +62,17 @@ impl MenuOption {
         match self {
             MenuOption::ToggleSecureBoot => !setup_mode, // Can only toggle in User Mode
             MenuOption::EnrollDefaultKeys => setup_mode, // Can only enroll in Setup Mode
+            MenuOption::EnrollCustomPK => setup_mode,    // Can only enroll in Setup Mode
             MenuOption::ClearAllKeys => true,            // Always available
             MenuOption::ReturnToBootMenu => true,        // Always available
         }
     }
 }
 
-const MENU_OPTIONS: [MenuOption; 4] = [
+const MENU_OPTIONS: [MenuOption; 5] = [
     MenuOption::ToggleSecureBoot,
     MenuOption::EnrollDefaultKeys,
+    MenuOption::EnrollCustomPK,
     MenuOption::ClearAllKeys,
     MenuOption::ReturnToBootMenu,
 ];
@@ -168,6 +178,31 @@ pub fn show_secure_boot_menu() {
                                     }
                                 }
                             }
+                            MenuOption::EnrollCustomPK => {
+                                status_message = Some(("Searching for PK on ESP...", true));
+                                // Redraw to show "searching" message
+                                clear_screen(&mut fb_console);
+                                draw_menu(
+                                    &mut fb_console,
+                                    selected,
+                                    setup_mode,
+                                    secure_boot_enabled,
+                                    pk_count,
+                                    kek_count,
+                                    db_count,
+                                    dbx_count,
+                                    status_message,
+                                );
+
+                                match enroll_custom_pk() {
+                                    Ok(source) => {
+                                        status_message = Some((source, true));
+                                    }
+                                    Err(msg) => {
+                                        status_message = Some((msg, false));
+                                    }
+                                }
+                            }
                             MenuOption::ClearAllKeys => {
                                 // Confirm before clearing
                                 if confirm_action(&mut fb_console, "Clear ALL Secure Boot keys?") {
@@ -215,6 +250,28 @@ fn enroll_default_keys() -> Result<(), &'static str> {
     secure_boot::update_status_variables().map_err(|_| "Failed to update status")?;
 
     Ok(())
+}
+
+/// Enroll custom PK from ESP
+fn enroll_custom_pk() -> Result<&'static str, &'static str> {
+    use crate::efi::auth::key_files;
+
+    match key_files::enroll_pk_from_file() {
+        Ok(source) => {
+            // Return a success message with the source
+            match source {
+                "NVMe" => Ok("Custom PK enrolled from NVMe ESP!"),
+                "SATA" => Ok("Custom PK enrolled from SATA ESP!"),
+                "SD" => Ok("Custom PK enrolled from SD card ESP!"),
+                _ => Ok("Custom PK enrolled successfully!"),
+            }
+        }
+        Err(auth::AuthError::NoSuitableKey) => {
+            Err("No PK file found (place PK.cer in EFI\\keys\\)")
+        }
+        Err(auth::AuthError::CertificateParseError) => Err("Invalid certificate format"),
+        Err(_) => Err("Failed to enroll custom PK"),
+    }
 }
 
 /// Show a confirmation dialog
