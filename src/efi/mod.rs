@@ -4,6 +4,7 @@
 //! implementations.
 
 pub mod allocator;
+pub mod auth;
 pub mod boot_services;
 pub mod protocols;
 pub mod runtime_services;
