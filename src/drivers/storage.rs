@@ -130,17 +130,4 @@ pub fn read_sectors(device_id: u32, lba: u64, buffer: &mut [u8]) -> Result<(), (
     }
 }
 
-/// Create a read function for a specific device ID
-///
-/// Returns a function pointer that can be used with BlockIO.
-/// Note: This is a placeholder - the actual device_id is stored in BlockIO context.
-pub fn make_read_fn(_device_id: u32) -> fn(u64, &mut [u8]) -> Result<(), ()> {
-    // We need to capture the device_id, but fn pointers can't capture.
-    // Instead, we'll use the device_id embedded in the BlockIO context.
-    // This function exists for API compatibility.
-    |lba, buffer| {
-        // This will be replaced by the actual device read in BlockIO
-        // For now, try device 0 (USB) as fallback
-        read_sectors(0, lba, buffer)
-    }
-}
+

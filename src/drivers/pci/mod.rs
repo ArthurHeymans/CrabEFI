@@ -10,9 +10,6 @@ use crate::state;
 #[cfg(target_arch = "x86_64")]
 use x86_64::instructions::port::{Port, PortWriteOnly};
 
-/// Maximum number of PCI devices we can track
-const MAX_PCI_DEVICES: usize = 64;
-
 /// PCI configuration space ports (legacy CAM)
 const PCI_CONFIG_ADDRESS: u16 = 0xCF8;
 const PCI_CONFIG_DATA: u16 = 0xCFC;
@@ -500,7 +497,7 @@ pub fn find_sdhci_controllers() -> Vec<PciDevice, 8> {
 }
 
 /// Get all enumerated PCI devices
-pub fn get_all_devices() -> Vec<PciDevice, MAX_PCI_DEVICES> {
+pub fn get_all_devices() -> Vec<PciDevice, { state::MAX_PCI_DEVICES }> {
     state::drivers().pci_devices.clone()
 }
 
