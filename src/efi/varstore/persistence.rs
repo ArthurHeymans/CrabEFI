@@ -16,7 +16,7 @@ use spin::Mutex;
 use crate::drivers::spi::{self, AnySpiController, SpiController};
 use crate::state::{self, MAX_VARIABLE_DATA_SIZE, MAX_VARIABLE_NAME_LEN};
 
-use super::{EspVariableFile, StoreHeader, VarStoreError, VariableRecord, STORE_HEADER_SIZE};
+use super::{StoreHeader, VarStoreError, VariableRecord, STORE_HEADER_SIZE};
 
 /// Default SMMSTORE base address in SPI flash
 /// This is typically at the end of the flash region
@@ -28,9 +28,6 @@ pub const DEFAULT_SMMSTORE_SIZE: u32 = 256 * 1024;
 
 /// Global SPI controller (initialized at boot)
 static SPI_CONTROLLER: Mutex<Option<AnySpiController>> = Mutex::new(None);
-
-/// Global pending writes for ESP file (used after ExitBootServices)
-static PENDING_WRITES: Mutex<Option<EspVariableFile>> = Mutex::new(None);
 
 /// SMMSTORE configuration
 static SMMSTORE_CONFIG: Mutex<SmmstoreConfig> = Mutex::new(SmmstoreConfig {
@@ -247,7 +244,7 @@ fn load_variables_from_smmstore() -> Result<(), VarStoreError> {
 /// Persist a variable to storage
 ///
 /// Before ExitBootServices: writes to SPI flash
-/// After ExitBootServices: queues write for ESP file
+/// After ExitBootServices: queues write for deferred processing on next boot
 pub fn persist_variable(
     guid: &r_efi::efi::Guid,
     name: &[u16],
@@ -255,27 +252,30 @@ pub fn persist_variable(
     data: &[u8],
 ) -> Result<(), VarStoreError> {
     if state::is_exit_boot_services_called() {
-        // After ExitBootServices - queue for ESP file
-        queue_variable_for_esp(guid, name, attributes, data)
+        // After ExitBootServices - queue for deferred processing
+        queue_variable_for_deferred(guid, name, attributes, data)
     } else {
         // Before ExitBootServices - write to SPI flash
-        write_variable_to_spi(guid, name, attributes, data)
+        write_variable_to_spi_internal(guid, name, attributes, data)
     }
 }
 
 /// Delete a variable from storage
 pub fn delete_variable(guid: &r_efi::efi::Guid, name: &[u16]) -> Result<(), VarStoreError> {
     if state::is_exit_boot_services_called() {
-        // After ExitBootServices - queue deletion for ESP file
-        queue_variable_deletion_for_esp(guid, name)
+        // After ExitBootServices - queue deletion for deferred processing
+        queue_variable_deletion_for_deferred(guid, name)
     } else {
         // Before ExitBootServices - mark deleted in SPI flash
-        write_variable_deletion_to_spi(guid, name)
+        write_variable_deletion_to_spi_internal(guid, name)
     }
 }
 
 /// Write a variable record to SPI flash
-fn write_variable_to_spi(
+///
+/// This is the internal function that actually writes to SPI.
+/// It's exposed to the deferred module for applying queued changes.
+pub(super) fn write_variable_to_spi_internal(
     guid: &r_efi::efi::Guid,
     name: &[u16],
     attributes: u32,
@@ -320,7 +320,10 @@ fn write_variable_to_spi(
 }
 
 /// Write a deletion record to SPI flash
-fn write_variable_deletion_to_spi(
+///
+/// This is the internal function that actually writes the deletion to SPI.
+/// It's exposed to the deferred module for applying queued changes.
+pub(super) fn write_variable_deletion_to_spi_internal(
     guid: &r_efi::efi::Guid,
     name: &[u16],
 ) -> Result<(), VarStoreError> {
@@ -358,98 +361,30 @@ fn write_variable_deletion_to_spi(
     Ok(())
 }
 
-/// Queue a variable write for ESP file (after ExitBootServices)
-fn queue_variable_for_esp(
+/// Queue a variable write for deferred processing (after ExitBootServices)
+///
+/// When SPI is locked, variable changes are stored in a reserved memory
+/// region that survives warm reboot. On next boot, these changes are
+/// applied to SPI flash.
+fn queue_variable_for_deferred(
     guid: &r_efi::efi::Guid,
     name: &[u16],
     attributes: u32,
     data: &[u8],
 ) -> Result<(), VarStoreError> {
-    let mut pending = PENDING_WRITES.lock();
-
-    // Initialize if needed
-    if pending.is_none() {
-        *pending = Some(EspVariableFile::new());
-    }
-
-    let file = pending.as_mut().unwrap();
-    let record = VariableRecord::new(guid, name, attributes, data)?;
-    file.add(record, None);
-
-    log::debug!("Variable queued for ESP file");
+    super::deferred::queue_write(guid, name, attributes, data)?;
+    log::debug!("Variable queued for deferred processing");
     Ok(())
 }
 
-/// Queue a variable deletion for ESP file (after ExitBootServices)
-fn queue_variable_deletion_for_esp(
+/// Queue a variable deletion for deferred processing (after ExitBootServices)
+fn queue_variable_deletion_for_deferred(
     guid: &r_efi::efi::Guid,
     name: &[u16],
 ) -> Result<(), VarStoreError> {
-    let mut pending = PENDING_WRITES.lock();
-
-    // Initialize if needed
-    if pending.is_none() {
-        *pending = Some(EspVariableFile::new());
-    }
-
-    let file = pending.as_mut().unwrap();
-    let record = VariableRecord::new_deleted(guid, name)?;
-    file.add(record, None);
-
-    log::debug!("Variable deletion queued for ESP file");
+    super::deferred::queue_deletion(guid, name)?;
+    log::debug!("Variable deletion queued for deferred processing");
     Ok(())
-}
-
-/// Get pending ESP file data (for writing to ESP partition)
-///
-/// Returns serialized ESP variable file data, or None if no pending writes.
-pub fn get_pending_esp_data() -> Option<Vec<u8>> {
-    let mut pending = PENDING_WRITES.lock();
-
-    if let Some(ref mut file) = *pending {
-        if file.pending.is_empty() {
-            return None;
-        }
-
-        match file.serialize() {
-            Ok(data) => Some(data),
-            Err(_) => None,
-        }
-    } else {
-        None
-    }
-}
-
-/// Clear pending ESP writes
-pub fn clear_pending_esp_data() {
-    let mut pending = PENDING_WRITES.lock();
-    *pending = None;
-}
-
-/// Write pending variable changes to ESP file
-///
-/// This should be called before shutdown/reboot if there are pending changes
-/// that couldn't be written to SPI (e.g., after ExitBootServices).
-/// On next boot, the ESP file will be read and applied to SPI.
-///
-/// # Arguments
-/// * `write_fn` - A function that writes data to the ESP variable file
-///
-/// Returns Ok(true) if data was written, Ok(false) if no pending data.
-pub fn flush_pending_to_esp<F>(mut write_fn: F) -> Result<bool, VarStoreError>
-where
-    F: FnMut(&[u8]) -> Result<(), VarStoreError>,
-{
-    let data = match get_pending_esp_data() {
-        Some(d) => d,
-        None => return Ok(false),
-    };
-
-    write_fn(&data)?;
-    clear_pending_esp_data();
-
-    log::info!("Flushed pending variable changes to ESP file");
-    Ok(true)
 }
 
 /// Check if SPI controller is available
@@ -468,66 +403,80 @@ pub fn get_smmstore_stats() -> (u32, u32, u32) {
     (config.base_addr, config.size, config.write_offset)
 }
 
-/// Process ESP variable file on boot
+/// Update a variable in the in-memory cache
 ///
-/// This reads the ESP variable file, authenticates the variables (if needed),
-/// applies them to SPI flash, and then deletes the file.
-///
-/// # Arguments
-/// * `file_data` - The contents of the ESP variable file
-/// * `delete_fn` - A function to delete the ESP file after processing
-///
-/// Returns the number of variables processed, or an error.
-pub fn process_esp_file<F>(file_data: &[u8], mut delete_fn: F) -> Result<usize, VarStoreError>
-where
-    F: FnMut() -> Result<(), VarStoreError>,
-{
-    // Deserialize the ESP variable file
-    let esp_file = EspVariableFile::deserialize(file_data)?;
+/// This is used when applying deferred variable changes on boot.
+pub(super) fn update_variable_in_memory(
+    guid: &r_efi::efi::Guid,
+    name: &[u16],
+    attributes: u32,
+    data: &[u8],
+) {
+    use crate::state::{self, MAX_VARIABLE_DATA_SIZE, MAX_VARIABLE_NAME_LEN};
 
-    log::info!(
-        "Processing ESP variable file with {} pending writes",
-        esp_file.pending.len()
-    );
+    state::with_efi_mut(|efi| {
+        // Find existing or free slot
+        let existing_idx = efi.variables.iter().position(|var| {
+            var.in_use && var.vendor_guid == *guid && name_eq_slice(&var.name, name)
+        });
 
-    let mut count = 0;
+        let idx = match existing_idx {
+            Some(i) => i,
+            None => match efi.variables.iter().position(|var| !var.in_use) {
+                Some(i) => i,
+                None => {
+                    log::warn!("No free variable slots");
+                    return;
+                }
+            },
+        };
 
-    // Process each pending variable
-    for pending in &esp_file.pending {
-        let record = &pending.record;
-        let guid = record.guid.to_guid();
-
-        // TODO: Verify authentication signature if present
-        // For now, we skip authentication (variables in ESP file should have been
-        // authenticated when they were originally written)
-
-        if record.is_active() {
-            // Write variable to SPI
-            if let Err(e) =
-                write_variable_to_spi(&guid, &record.name, record.attributes, &record.data)
-            {
-                log::warn!("Failed to apply variable from ESP file: {:?}", e);
-                continue;
-            }
-        } else {
-            // Delete variable from SPI
-            if let Err(e) = write_variable_deletion_to_spi(&guid, &record.name) {
-                log::warn!("Failed to apply variable deletion from ESP file: {:?}", e);
-                continue;
-            }
+        // Copy name
+        let name_len = name.len().min(MAX_VARIABLE_NAME_LEN);
+        efi.variables[idx].name[..name_len].copy_from_slice(&name[..name_len]);
+        if name_len < MAX_VARIABLE_NAME_LEN {
+            efi.variables[idx].name[name_len..].fill(0);
         }
 
-        count += 1;
-    }
+        // Copy data
+        let data_len = data.len().min(MAX_VARIABLE_DATA_SIZE);
+        efi.variables[idx].data[..data_len].copy_from_slice(&data[..data_len]);
 
-    // Delete the ESP file
-    if let Err(e) = delete_fn() {
-        log::warn!("Failed to delete ESP variable file: {:?}", e);
-    }
-
-    log::info!("Applied {} variables from ESP file", count);
-    Ok(count)
+        efi.variables[idx].vendor_guid = *guid;
+        efi.variables[idx].attributes = attributes;
+        efi.variables[idx].data_size = data_len;
+        efi.variables[idx].in_use = true;
+    });
 }
 
-/// ESP variable file path (relative to ESP root)
-pub const ESP_VAR_FILE_PATH: &str = "EFI\\CRABEFI\\VARS.BIN";
+/// Delete a variable from the in-memory cache
+///
+/// This is used when applying deferred variable deletions on boot.
+pub(super) fn delete_variable_from_memory(guid: &r_efi::efi::Guid, name: &[u16]) {
+    use crate::state;
+
+    state::with_efi_mut(|efi| {
+        if let Some(var) = efi
+            .variables
+            .iter_mut()
+            .find(|var| var.in_use && var.vendor_guid == *guid && name_eq_slice(&var.name, name))
+        {
+            var.in_use = false;
+        }
+    });
+}
+
+/// Compare a stored name array with a name slice
+fn name_eq_slice(stored: &[u16], name: &[u16]) -> bool {
+    // Get length of stored name (up to null terminator)
+    let stored_len = stored.iter().position(|&c| c == 0).unwrap_or(stored.len());
+
+    // Get length of name (up to null terminator)
+    let name_len = name.iter().position(|&c| c == 0).unwrap_or(name.len());
+
+    if stored_len != name_len {
+        return false;
+    }
+
+    stored[..stored_len] == name[..name_len]
+}
