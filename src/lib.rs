@@ -1062,6 +1062,7 @@ fn try_boot_from_esp_usb<D: BlockDevice>(
     pci_function: u8,
     usb_port: u8,
 ) -> bool {
+    use drivers::block::{AnyBlockDevice, UsbBlockDevice};
     use drivers::storage::{self, StorageType};
     use efi::boot_services;
     use efi::protocols::block_io::{self, BLOCK_IO_PROTOCOL_GUID};
@@ -1069,17 +1070,37 @@ fn try_boot_from_esp_usb<D: BlockDevice>(
     use efi::protocols::simple_file_system::{self, SIMPLE_FILE_SYSTEM_GUID};
     use r_efi::efi::Status;
 
-    // Extract filesystem state BEFORE creating FatFilesystem to avoid borrow conflict
-    // This reads the boot sector directly from disk
-    let fs_state = extract_fat_state(disk, esp.first_lba);
+    // Get USB device info for creating block device
+    let (controller_id, device_addr, num_blocks, block_size) =
+        match drivers::usb::mass_storage::get_global_device() {
+            Some(usb_device) => (
+                0usize, // Controller ID (we only support one controller)
+                usb_device.slot_id(),
+                usb_device.num_blocks,
+                usb_device.block_size,
+            ),
+            None => {
+                log::error!("USB device not available");
+                return false;
+            }
+        };
 
+    // Create a UsbBlockDevice for the SimpleFileSystem protocol
+    let usb_block_device =
+        UsbBlockDevice::new(controller_id, device_addr, num_blocks, block_size, 0);
+    let block_device = AnyBlockDevice::Usb(usb_block_device);
+
+    // Initialize SimpleFileSystem protocol with the block device
+    let sfs_protocol = simple_file_system::init(block_device, esp.first_lba);
+    if sfs_protocol.is_null() {
+        log::error!("Failed to initialize SimpleFileSystem protocol");
+        return false;
+    }
+
+    // Verify filesystem is accessible by creating a temporary FatFilesystem
     match fs::fat::FatFilesystem::new(disk, esp.first_lba) {
         Ok(mut fat) => {
             log::info!("FAT filesystem mounted on ESP");
-
-            // Initialize SimpleFileSystem protocol
-            let sfs_protocol =
-                simple_file_system::init(fs_state, drivers::usb::mass_storage::global_read_sector);
 
             // Create a device handle with SimpleFileSystem and DevicePath protocols
             let device_handle = match boot_services::create_handle() {
@@ -1240,6 +1261,7 @@ fn try_boot_from_esp_nvme(
     pci_function: u8,
     namespace_id: u32,
 ) -> bool {
+    use drivers::block::{AnyBlockDevice, NvmeBlockDevice};
     use drivers::storage::{self, StorageType};
     use efi::boot_services;
     use efi::protocols::block_io::{self, BLOCK_IO_PROTOCOL_GUID};
@@ -1249,19 +1271,28 @@ fn try_boot_from_esp_nvme(
 
     check_system_table_integrity("NVMe: start");
 
+    // Get NVMe device info for creating block device
+    let (num_blocks, block_size) = {
+        let info = disk.info();
+        (info.num_blocks, info.block_size)
+    };
+
+    // Create an NvmeBlockDevice for the SimpleFileSystem protocol
+    let nvme_block_device = NvmeBlockDevice::new(0, namespace_id, num_blocks, block_size, 0);
+    let block_device = AnyBlockDevice::Nvme(nvme_block_device);
+
+    // Initialize SimpleFileSystem protocol with the block device
+    let sfs_protocol = simple_file_system::init(block_device, esp.first_lba);
+    if sfs_protocol.is_null() {
+        log::error!("Failed to initialize SimpleFileSystem protocol");
+        return false;
+    }
+    check_system_table_integrity("NVMe: after SFS init");
+
     match fs::fat::FatFilesystem::new(disk, esp.first_lba) {
         Ok(mut fat) => {
             log::info!("FAT filesystem mounted on ESP");
             check_system_table_integrity("NVMe: after FAT mount");
-
-            // Extract filesystem state for the SimpleFileSystem protocol
-            let fs_state = extract_fat_state_nvme(esp.first_lba);
-            check_system_table_integrity("NVMe: after extract_fat_state");
-
-            // Initialize SimpleFileSystem protocol with NVMe read function
-            let sfs_protocol =
-                simple_file_system::init(fs_state, drivers::nvme::global_read_sector);
-            check_system_table_integrity("NVMe: after SFS init");
 
             // Create a device handle with SimpleFileSystem and DevicePath protocols
             let device_handle = match boot_services::create_handle() {
@@ -1403,6 +1434,7 @@ fn try_boot_from_esp_ahci(
     pci_function: u8,
     port: u16,
 ) -> bool {
+    use drivers::block::{AhciBlockDevice, AnyBlockDevice};
     use drivers::storage::{self, StorageType};
     use efi::boot_services;
     use efi::protocols::block_io::{self, BLOCK_IO_PROTOCOL_GUID};
@@ -1410,16 +1442,26 @@ fn try_boot_from_esp_ahci(
     use efi::protocols::simple_file_system::{self, SIMPLE_FILE_SYSTEM_GUID};
     use r_efi::efi::Status;
 
+    // Get AHCI device info for creating block device
+    let (num_blocks, block_size) = {
+        let info = disk.info();
+        (info.num_blocks, info.block_size)
+    };
+
+    // Create an AhciBlockDevice for the SimpleFileSystem protocol
+    let ahci_block_device = AhciBlockDevice::new(0, port as usize, num_blocks, block_size, 0);
+    let block_device = AnyBlockDevice::Ahci(ahci_block_device);
+
+    // Initialize SimpleFileSystem protocol with the block device
+    let sfs_protocol = simple_file_system::init(block_device, esp.first_lba);
+    if sfs_protocol.is_null() {
+        log::error!("Failed to initialize SimpleFileSystem protocol");
+        return false;
+    }
+
     match fs::fat::FatFilesystem::new(disk, esp.first_lba) {
         Ok(mut fat) => {
             log::info!("FAT filesystem mounted on ESP");
-
-            // Extract filesystem state for the SimpleFileSystem protocol
-            let fs_state = extract_fat_state_ahci(esp.first_lba);
-
-            // Initialize SimpleFileSystem protocol with AHCI read function
-            let sfs_protocol =
-                simple_file_system::init(fs_state, drivers::ahci::global_read_sector);
 
             // Create a device handle with SimpleFileSystem and DevicePath protocols
             let device_handle = match boot_services::create_handle() {
@@ -1543,150 +1585,6 @@ fn try_boot_from_esp_ahci(
         }
     }
     false
-}
-
-/// Extract FAT filesystem state for the SimpleFileSystem protocol (generic version)
-///
-/// This version uses the provided disk directly instead of global_read_sector,
-/// which avoids deadlocks when called from within a with_controller closure.
-fn extract_fat_state<R: BlockDevice>(
-    disk: &mut R,
-    partition_start: u64,
-) -> efi::protocols::simple_file_system::FilesystemState {
-    use efi::protocols::simple_file_system::FilesystemState;
-
-    // Get device block size
-    let info = disk.info();
-    let device_block_size = info.block_size;
-
-    // Read boot sector directly from the disk (use device block size)
-    let mut buffer = [0u8; 4096]; // Max block size
-    let read_size = (device_block_size as usize).min(buffer.len());
-    if disk
-        .read_block(partition_start, &mut buffer[..read_size])
-        .is_err()
-    {
-        log::error!("Failed to read boot sector for filesystem state");
-        return FilesystemState::empty();
-    }
-
-    parse_fat_bpb(&buffer, partition_start, device_block_size)
-}
-
-/// Extract FAT filesystem state for AHCI devices
-fn extract_fat_state_ahci(
-    partition_start: u64,
-) -> efi::protocols::simple_file_system::FilesystemState {
-    use efi::protocols::simple_file_system::FilesystemState;
-
-    // Get device block size from AHCI
-    let device_block_size = drivers::ahci::global_sector_size().unwrap_or(512);
-
-    // Read boot sector directly using AHCI global read
-    let mut buffer = [0u8; 4096]; // Max block size
-    let read_size = (device_block_size as usize).min(buffer.len());
-    if drivers::ahci::global_read_sector(partition_start, &mut buffer[..read_size]).is_err() {
-        log::error!("Failed to read boot sector for AHCI filesystem state");
-        return FilesystemState::empty();
-    }
-
-    parse_fat_bpb(&buffer, partition_start, device_block_size)
-}
-
-/// Extract FAT filesystem state for NVMe devices
-fn extract_fat_state_nvme(
-    partition_start: u64,
-) -> efi::protocols::simple_file_system::FilesystemState {
-    use efi::protocols::simple_file_system::FilesystemState;
-
-    // Get device block size from NVMe (typically 512 for NVMe)
-    let device_block_size = drivers::nvme::global_sector_size().unwrap_or(512);
-
-    // Read boot sector directly using NVMe global read
-    let mut buffer = [0u8; 4096]; // Max block size
-    let read_size = (device_block_size as usize).min(buffer.len());
-    if drivers::nvme::global_read_sector(partition_start, &mut buffer[..read_size]).is_err() {
-        log::error!("Failed to read boot sector for NVMe filesystem state");
-        return FilesystemState::empty();
-    }
-
-    parse_fat_bpb(&buffer, partition_start, device_block_size)
-}
-
-/// Parse FAT BPB from boot sector buffer
-fn parse_fat_bpb(
-    buffer: &[u8],
-    partition_start: u64,
-    device_block_size: u32,
-) -> efi::protocols::simple_file_system::FilesystemState {
-    use efi::protocols::simple_file_system::FilesystemState;
-
-    // Parse BPB
-    let bytes_per_sector = u16::from_le_bytes([buffer[11], buffer[12]]);
-    let sectors_per_cluster = buffer[13];
-    let reserved_sectors = u16::from_le_bytes([buffer[14], buffer[15]]);
-    let num_fats = buffer[16];
-    let root_entry_count = u16::from_le_bytes([buffer[17], buffer[18]]);
-    let total_sectors_16 = u16::from_le_bytes([buffer[19], buffer[20]]);
-    let sectors_per_fat_16 = u16::from_le_bytes([buffer[22], buffer[23]]);
-    let total_sectors_32 = u32::from_le_bytes([buffer[32], buffer[33], buffer[34], buffer[35]]);
-
-    // FAT32 extended BPB
-    let sectors_per_fat_32 = u32::from_le_bytes([buffer[36], buffer[37], buffer[38], buffer[39]]);
-    let root_cluster = u32::from_le_bytes([buffer[44], buffer[45], buffer[46], buffer[47]]);
-
-    let sectors_per_fat = if sectors_per_fat_16 != 0 {
-        sectors_per_fat_16 as u32
-    } else {
-        sectors_per_fat_32
-    };
-
-    let total_sectors = if total_sectors_16 != 0 {
-        total_sectors_16 as u32
-    } else {
-        total_sectors_32
-    };
-
-    let root_dir_sectors = (root_entry_count as u32 * 32).div_ceil(bytes_per_sector as u32);
-    let fat_start = reserved_sectors as u32;
-    let root_dir_start = fat_start + (num_fats as u32 * sectors_per_fat);
-    let data_start = root_dir_start + root_dir_sectors;
-
-    let data_sectors = total_sectors - data_start;
-    let data_clusters = data_sectors / sectors_per_cluster as u32;
-
-    // Determine FAT type
-    let fat_type = if data_clusters < 4085 {
-        12
-    } else if data_clusters < 65525 {
-        16
-    } else {
-        32
-    };
-
-    let root_cluster_val = if fat_type == 32 { root_cluster } else { 0 };
-
-    log::debug!(
-        "FAT state: type={}, start={}, bps={}, spc={}",
-        fat_type,
-        partition_start,
-        bytes_per_sector,
-        sectors_per_cluster
-    );
-
-    FilesystemState {
-        partition_start,
-        fat_type,
-        bytes_per_sector,
-        device_block_size,
-        sectors_per_cluster,
-        fat_start,
-        sectors_per_fat,
-        data_start,
-        root_cluster: root_cluster_val,
-        root_dir_start,
-        root_dir_sectors,
-    }
 }
 
 /// Load and execute an EFI bootloader from the filesystem
@@ -2024,6 +1922,7 @@ fn try_boot_from_esp_sdhci(
     pci_device: u8,
     pci_function: u8,
 ) -> bool {
+    use drivers::block::{AnyBlockDevice, SdhciBlockDevice};
     use drivers::storage::{self, StorageType};
     use efi::boot_services;
     use efi::protocols::block_io::{self, BLOCK_IO_PROTOCOL_GUID};
@@ -2031,24 +1930,32 @@ fn try_boot_from_esp_sdhci(
     use efi::protocols::simple_file_system::{self, SIMPLE_FILE_SYSTEM_GUID};
     use r_efi::efi::Status;
 
-    // Extract filesystem state BEFORE creating FatFilesystem to avoid borrow conflict
-    // This reads the boot sector directly from disk
-    let fs_state = extract_fat_state(disk, esp.first_lba);
+    // Get SDHCI device info for creating block device
+    let (num_blocks, block_size) = {
+        let info = disk.info();
+        (info.num_blocks, info.block_size)
+    };
 
     log::debug!(
-        "SDHCI FAT state: type={}, partition_start={}, data_start={}",
-        fs_state.fat_type,
-        fs_state.partition_start,
-        fs_state.data_start
+        "SDHCI device: num_blocks={}, block_size={}",
+        num_blocks,
+        block_size
     );
+
+    // Create an SdhciBlockDevice for the SimpleFileSystem protocol
+    let sdhci_block_device = SdhciBlockDevice::new(0, num_blocks, block_size, 0);
+    let block_device = AnyBlockDevice::Sdhci(sdhci_block_device);
+
+    // Initialize SimpleFileSystem protocol with the block device
+    let sfs_protocol = simple_file_system::init(block_device, esp.first_lba);
+    if sfs_protocol.is_null() {
+        log::error!("Failed to initialize SimpleFileSystem protocol");
+        return false;
+    }
 
     match fs::fat::FatFilesystem::new(disk, esp.first_lba) {
         Ok(mut fat) => {
             log::info!("FAT filesystem mounted on ESP");
-
-            // Initialize SimpleFileSystem protocol with SDHCI read function
-            let sfs_protocol =
-                simple_file_system::init(fs_state, drivers::sdhci::global_read_sector);
 
             // Create a device handle with SimpleFileSystem and DevicePath protocols
             let device_handle = match boot_services::create_handle() {

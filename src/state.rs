@@ -399,8 +399,8 @@ pub struct EfiState {
     /// Filesystem state for SimpleFileSystem protocol
     pub filesystem: Option<FilesystemState>,
 
-    /// Disk read function for filesystem access
-    pub disk_read_fn: Option<DiskReadFn>,
+    /// Block device for filesystem access
+    pub block_device: Option<crate::drivers::block::AnyBlockDevice>,
 }
 
 impl EfiState {
@@ -417,7 +417,7 @@ impl EfiState {
             variables: [const { VariableEntry::empty() }; MAX_VARIABLES],
             allocator: MemoryAllocator::new(),
             filesystem: None,
-            disk_read_fn: None,
+            block_device: None,
         }
     }
 }
@@ -659,9 +659,6 @@ impl FilesystemState {
     }
 }
 
-/// Disk read function type
-pub type DiskReadFn = fn(u64, &mut [u8]) -> Result<(), ()>;
-
 // ============================================================================
 // Helper functions for accessing state components
 // ============================================================================
@@ -760,4 +757,15 @@ where
     F: FnOnce(&mut MemoryAllocator) -> R,
 {
     with_mut(|state| f(&mut state.efi.allocator))
+}
+
+/// Access the block device mutably through a closure.
+///
+/// Returns `None` if no block device is configured.
+#[inline]
+pub fn with_block_device_mut<F, R>(f: F) -> Option<R>
+where
+    F: FnOnce(&mut crate::drivers::block::AnyBlockDevice) -> R,
+{
+    with_mut(|state| state.efi.block_device.as_mut().map(f))
 }

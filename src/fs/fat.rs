@@ -182,6 +182,11 @@ impl DirectoryEntry {
 
         true
     }
+
+    /// Get the file size in bytes
+    pub fn file_size(&self) -> u32 {
+        self.file_size
+    }
 }
 
 /// Directory entry attributes
@@ -807,5 +812,126 @@ impl<'a, D: BlockDevice> FatFilesystem<'a, D> {
     pub fn file_size(&mut self, path: &str) -> Result<u32, FatError> {
         let entry = self.find_file(path)?;
         Ok(entry.file_size)
+    }
+
+    /// Get root directory cluster
+    pub fn root_cluster(&self) -> u32 {
+        self.root_cluster
+    }
+
+    /// Get the FAT type (12, 16, or 32)
+    pub fn fat_type(&self) -> FatType {
+        self.fat_type
+    }
+
+    /// Get a directory entry at a specific position (for directory enumeration)
+    ///
+    /// # Arguments
+    /// * `cluster` - First cluster of directory (0 for FAT12/16 root directory)
+    /// * `position` - Entry index (skipping deleted/LFN/volume entries)
+    ///
+    /// # Returns
+    /// * `Ok(Some(entry))` - The entry at the given position
+    /// * `Ok(None)` - End of directory reached
+    /// * `Err(e)` - Read error
+    pub fn get_directory_entry_at_position(
+        &mut self,
+        cluster: u32,
+        position: usize,
+    ) -> Result<Option<DirectoryEntry>, FatError> {
+        let mut buffer = [0u8; 65536]; // Max cluster size
+        let cluster_size = self.sectors_per_cluster as usize * self.bytes_per_sector as usize;
+        let entries_per_cluster = cluster_size / 32;
+        let mut current_position = 0usize;
+
+        if cluster == 0 && self.fat_type != FatType::Fat32 {
+            // FAT12/16 root directory (fixed location)
+            let root_dir_device_block = self.fat_sector_to_device_block(self.root_dir_start as u64);
+            let device_block_size = self.device_block_size as usize;
+            let sectors_per_device_block = device_block_size / self.bytes_per_sector as usize;
+            let entries_per_device_block =
+                (self.bytes_per_sector as usize / 32) * sectors_per_device_block.max(1);
+            let device_blocks_for_root =
+                (self.root_dir_sectors as usize).div_ceil(sectors_per_device_block.max(1));
+
+            for block_idx in 0..device_blocks_for_root as u64 {
+                let device_block = self.partition_start + root_dir_device_block + block_idx;
+                self.device
+                    .read_block(device_block, &mut buffer[..device_block_size])
+                    .map_err(|_| FatError::ReadError)?;
+
+                for i in 0..entries_per_device_block {
+                    let offset = i * 32;
+                    if offset + 32 > device_block_size {
+                        break;
+                    }
+                    let entry = unsafe {
+                        core::ptr::read_unaligned(buffer[offset..].as_ptr() as *const DirectoryEntry)
+                    };
+
+                    if entry.is_end() {
+                        return Ok(None);
+                    }
+                    if entry.is_free() || entry.is_lfn() || entry.is_volume_id() {
+                        continue;
+                    }
+
+                    if current_position == position {
+                        return Ok(Some(entry));
+                    }
+                    current_position += 1;
+                }
+            }
+            return Ok(None);
+        }
+
+        // Cluster chain directory
+        let mut current_cluster = cluster;
+        let device_block_size = self.device_block_size as usize;
+        let device_blocks_per_cluster = cluster_size.div_ceil(device_block_size).max(1);
+
+        loop {
+            // Read cluster using device blocks
+            let start_device_block = self
+                .cluster_to_device_block(current_cluster)
+                .ok_or(FatError::InvalidCluster)?;
+
+            for b in 0..device_blocks_per_cluster {
+                let offset = b * device_block_size;
+                let read_size = device_block_size.min(cluster_size - offset);
+                self.device
+                    .read_block(
+                        start_device_block + b as u64,
+                        &mut buffer[offset..offset + read_size],
+                    )
+                    .map_err(|_| FatError::ReadError)?;
+            }
+
+            // Search entries
+            for i in 0..entries_per_cluster {
+                let offset = i * 32;
+                let entry = unsafe {
+                    core::ptr::read_unaligned(buffer[offset..].as_ptr() as *const DirectoryEntry)
+                };
+
+                if entry.is_end() {
+                    return Ok(None);
+                }
+                if entry.is_free() || entry.is_lfn() || entry.is_volume_id() {
+                    continue;
+                }
+
+                if current_position == position {
+                    return Ok(Some(entry));
+                }
+                current_position += 1;
+            }
+
+            // Get next cluster
+            current_cluster = match self.next_cluster(current_cluster)? {
+                Some(c) => c,
+                None => return Ok(None),
+            };
+        }
     }
 }

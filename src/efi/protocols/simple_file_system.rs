@@ -2,6 +2,9 @@
 //!
 //! This module provides the EFI_SIMPLE_FILE_SYSTEM_PROTOCOL and EFI_FILE_PROTOCOL
 //! which allow UEFI applications to access files on the boot filesystem.
+//!
+//! File operations delegate to `FatFilesystem` from `fs/fat.rs` for all FAT-specific
+//! logic, avoiding code duplication.
 
 use core::ffi::c_void;
 use r_efi::efi::{Char16, Guid, Status};
@@ -9,6 +12,8 @@ use r_efi::protocols::file as efi_file;
 use r_efi::protocols::simple_file_system as efi_sfs;
 use spin::Mutex;
 
+use crate::drivers::block::{AnyBlockDevice, BlockDevice};
+use crate::fs::fat::{DirectoryEntry, FatFilesystem, FatType};
 use crate::state;
 
 // Re-export FilesystemState for backward compatibility with lib.rs
@@ -96,19 +101,56 @@ static mut SFS_PROTOCOL: efi_sfs::Protocol = efi_sfs::Protocol {
     open_volume: sfs_open_volume,
 };
 
-/// Initialize the simple file system protocol with filesystem parameters
-pub fn init(
-    fs_state: FilesystemState,
-    read_fn: fn(u64, &mut [u8]) -> Result<(), ()>,
-) -> *mut efi_sfs::Protocol {
+/// Initialize the simple file system protocol with a block device
+///
+/// # Arguments
+/// * `block_device` - The block device containing the FAT filesystem
+/// * `partition_start` - LBA of the partition start
+///
+/// # Returns
+/// Pointer to the SimpleFileSystem protocol, or null on failure
+pub fn init(block_device: AnyBlockDevice, partition_start: u64) -> *mut efi_sfs::Protocol {
+    // Get device info before creating FatFilesystem to avoid borrow conflicts
+    let mut temp_device = block_device;
+    let device_block_size = temp_device.info().block_size;
+
+    // Create a temporary FatFilesystem to get filesystem info
+    let fs_state = match FatFilesystem::new(&mut temp_device, partition_start) {
+        Ok(fat) => {
+            let fat_type = fat.fat_type();
+            let root_cluster = fat.root_cluster();
+            FilesystemState {
+                partition_start,
+                fat_type: match fat_type {
+                    FatType::Fat12 => 12,
+                    FatType::Fat16 => 16,
+                    FatType::Fat32 => 32,
+                },
+                bytes_per_sector: 512, // Standard FAT sector size
+                device_block_size,
+                sectors_per_cluster: 0, // Not needed anymore
+                fat_start: 0,           // Not needed anymore
+                sectors_per_fat: 0,     // Not needed anymore
+                data_start: 0,          // Not needed anymore
+                root_cluster,
+                root_dir_start: 0,   // Not needed anymore
+                root_dir_sectors: 0, // Not needed anymore
+            }
+        }
+        Err(e) => {
+            log::error!("SimpleFileSystem: failed to mount FAT filesystem: {:?}", e);
+            return core::ptr::null_mut();
+        }
+    };
+
     state::with_efi_mut(|efi| {
         efi.filesystem = Some(fs_state);
-        efi.disk_read_fn = Some(read_fn);
+        efi.block_device = Some(temp_device);
     });
 
     log::info!(
         "SimpleFileSystem: initialized with partition at LBA {}",
-        fs_state.partition_start
+        partition_start
     );
 
     &raw mut SFS_PROTOCOL
@@ -222,21 +264,31 @@ extern "efiapi" fn file_open(
 
     log::info!("File.Open: full path = {:?}", full_path_str);
 
-    // Look up the file in the filesystem
-    let efi = state::efi();
-    let fs_state = match efi.filesystem {
-        Some(s) => s,
+    // Get partition start
+    let partition_start = match state::efi().filesystem {
+        Some(s) => s.partition_start,
         None => return Status::NOT_READY,
     };
 
-    let read_fn = match efi.disk_read_fn {
-        Some(f) => f,
-        None => return Status::NOT_READY,
-    };
+    // Find the file using FatFilesystem
+    let result = state::with_block_device_mut(|device| {
+        let mut fat = match FatFilesystem::new(device, partition_start) {
+            Ok(f) => f,
+            Err(_) => return Err(()),
+        };
 
-    // Find the file
-    match find_file(&fs_state, read_fn, full_path_str) {
-        Ok((cluster, size, is_dir)) => {
+        match fat.find_file(full_path_str) {
+            Ok(entry) => Ok((
+                entry.first_cluster(),
+                entry.file_size(),
+                entry.is_directory(),
+            )),
+            Err(_) => Err(()),
+        }
+    });
+
+    match result {
+        Some(Ok((cluster, size, is_dir))) => {
             // Allocate a new file handle
             let mut handles = FILE_HANDLES.lock();
             let handle_idx = match handles.iter().position(|h| !h.in_use) {
@@ -264,9 +316,13 @@ extern "efiapi" fn file_open(
             );
             Status::SUCCESS
         }
-        Err(e) => {
-            log::debug!("File.Open: not found ({:?})", e);
+        Some(Err(_)) => {
+            log::debug!("File.Open: not found");
             Status::NOT_FOUND
+        }
+        None => {
+            log::error!("File.Open: block device not available");
+            Status::NOT_READY
         }
     }
 }
@@ -318,7 +374,7 @@ extern "efiapi" fn file_read(
     };
 
     if is_dir {
-        return read_directory(this, buffer_size, buffer, handle_idx);
+        return read_directory(buffer_size, buffer, handle_idx);
     }
 
     // File read
@@ -339,27 +395,29 @@ extern "efiapi" fn file_read(
         return Status::SUCCESS;
     }
 
-    let efi = state::efi();
-    let fs_state = match efi.filesystem {
-        Some(s) => s,
-        None => return Status::NOT_READY,
-    };
-
-    let read_fn = match efi.disk_read_fn {
-        Some(f) => f,
+    let partition_start = match state::efi().filesystem {
+        Some(s) => s.partition_start,
         None => return Status::NOT_READY,
     };
 
     let buf_slice = unsafe { core::slice::from_raw_parts_mut(buffer as *mut u8, bytes_to_read) };
 
-    match read_file_data(
-        &fs_state,
-        read_fn,
-        first_cluster,
-        position as u32,
-        buf_slice,
-    ) {
-        Ok(bytes_read) => {
+    // Create a fake DirectoryEntry for read_file
+    // We need to read using the stored cluster and position
+    let result = state::with_block_device_mut(|device| {
+        let mut fat = match FatFilesystem::new(device, partition_start) {
+            Ok(f) => f,
+            Err(_) => return Err(()),
+        };
+
+        // Create a minimal entry for reading
+        let entry = create_file_entry(first_cluster, file_size as u32);
+        fat.read_file(&entry, position as u32, buf_slice)
+            .map_err(|_| ())
+    });
+
+    match result {
+        Some(Ok(bytes_read)) => {
             // Update position
             {
                 let mut handles = FILE_HANDLES.lock();
@@ -370,9 +428,13 @@ extern "efiapi" fn file_read(
             log::trace!("File.Read: read {} bytes", bytes_read);
             Status::SUCCESS
         }
-        Err(_) => {
+        Some(Err(_)) => {
             log::error!("File.Read: device error");
             Status::DEVICE_ERROR
+        }
+        None => {
+            log::error!("File.Read: block device not available");
+            Status::NOT_READY
         }
     }
 }
@@ -529,7 +591,7 @@ extern "efiapi" fn file_get_info(
             (*info).read_only = r_efi::efi::Boolean::TRUE; // Read-only
             (*info).volume_size = 0; // Unknown
             (*info).free_space = 0;
-            (*info).block_size = fs_state.bytes_per_sector as u32;
+            (*info).block_size = fs_state.device_block_size;
 
             // Write label as UTF-16 after the struct
             let label_ptr =
@@ -715,400 +777,40 @@ fn normalize_path(path: &mut [u8; MAX_PATH_LEN], len: usize) -> usize {
 // Use common guid_eq from utils module
 use crate::efi::utils::guid_eq;
 
-// ============================================================================
-// FAT Filesystem Access
-// ============================================================================
+/// Create a minimal DirectoryEntry for file reading
+///
+/// This is needed because FatFilesystem::read_file takes a DirectoryEntry,
+/// but we only have the cluster and size stored in our handle.
+fn create_file_entry(first_cluster: u32, file_size: u32) -> DirectoryEntry {
+    // DirectoryEntry is #[repr(C, packed)], so we create it via raw bytes
+    let mut bytes = [0u8; 32];
 
-/// Find a file by path, returns (first_cluster, size, is_directory)
-fn find_file(
-    state: &FilesystemState,
-    read_fn: fn(u64, &mut [u8]) -> Result<(), ()>,
-    path: &str,
-) -> Result<(u32, u32, bool), ()> {
-    let path = path.trim_start_matches('/');
+    // first_cluster_hi at offset 20 (2 bytes)
+    let hi = (first_cluster >> 16) as u16;
+    bytes[20] = hi as u8;
+    bytes[21] = (hi >> 8) as u8;
 
-    if path.is_empty() {
-        // Root directory
-        return Ok((state.root_cluster, 0, true));
-    }
+    // first_cluster_lo at offset 26 (2 bytes)
+    let lo = first_cluster as u16;
+    bytes[26] = lo as u8;
+    bytes[27] = (lo >> 8) as u8;
 
-    let mut current_cluster = state.root_cluster;
+    // file_size at offset 28 (4 bytes)
+    bytes[28] = file_size as u8;
+    bytes[29] = (file_size >> 8) as u8;
+    bytes[30] = (file_size >> 16) as u8;
+    bytes[31] = (file_size >> 24) as u8;
 
-    for (i, part) in path.split('/').filter(|s| !s.is_empty()).enumerate() {
-        let is_last = i == path.split('/').filter(|s| !s.is_empty()).count() - 1;
+    // attr at offset 11 - set to 0 (regular file)
+    bytes[11] = 0;
 
-        match find_in_directory(state, read_fn, current_cluster, part) {
-            Ok(entry) => {
-                if is_last {
-                    let cluster =
-                        ((entry.first_cluster_hi as u32) << 16) | (entry.first_cluster_lo as u32);
-                    let is_dir = (entry.attr & 0x10) != 0;
-                    return Ok((cluster, entry.file_size, is_dir));
-                }
-
-                // Not last component - must be directory
-                if (entry.attr & 0x10) == 0 {
-                    return Err(());
-                }
-
-                current_cluster =
-                    ((entry.first_cluster_hi as u32) << 16) | (entry.first_cluster_lo as u32);
-            }
-            Err(_) => return Err(()),
-        }
-    }
-
-    Err(())
-}
-
-/// FAT directory entry (from fs/fat.rs)
-#[repr(C, packed)]
-#[derive(Clone, Copy)]
-struct DirEntry {
-    name: [u8; 8],
-    ext: [u8; 3],
-    attr: u8,
-    nt_reserved: u8,
-    creation_time_tenths: u8,
-    creation_time: u16,
-    creation_date: u16,
-    last_access_date: u16,
-    first_cluster_hi: u16,
-    modification_time: u16,
-    modification_date: u16,
-    first_cluster_lo: u16,
-    file_size: u32,
-}
-
-/// Find an entry in a directory
-fn find_in_directory(
-    state: &FilesystemState,
-    read_fn: fn(u64, &mut [u8]) -> Result<(), ()>,
-    cluster: u32,
-    name: &str,
-) -> Result<DirEntry, ()> {
-    let mut buffer = [0u8; 65536]; // Max cluster size
-    let cluster_size = state.sectors_per_cluster as usize * state.bytes_per_sector as usize;
-    let entries_per_cluster = cluster_size / 32;
-    let device_block_size = state.device_block_size as usize;
-
-    // Handle FAT12/16 root directory (fixed location)
-    if cluster == 0 && state.fat_type != 32 {
-        let root_dir_device_block = state.fat_sector_to_device_block(state.root_dir_start as u64);
-        let sectors_per_device_block = device_block_size / state.bytes_per_sector as usize;
-        let entries_per_device_block =
-            (state.bytes_per_sector as usize / 32) * sectors_per_device_block.max(1);
-        let device_blocks_for_root =
-            (state.root_dir_sectors as usize).div_ceil(sectors_per_device_block.max(1));
-
-        for block_idx in 0..device_blocks_for_root as u64 {
-            let device_block = state.partition_start + root_dir_device_block + block_idx;
-            read_fn(device_block, &mut buffer[..device_block_size])?;
-
-            for i in 0..entries_per_device_block {
-                let offset = i * 32;
-                if offset + 32 > device_block_size {
-                    break;
-                }
-                let entry = unsafe {
-                    core::ptr::read_unaligned(buffer[offset..].as_ptr() as *const DirEntry)
-                };
-
-                if entry.name[0] == 0x00 {
-                    return Err(());
-                }
-                if entry.name[0] == 0xE5 || (entry.attr & 0x0F) == 0x0F || (entry.attr & 0x08) != 0
-                {
-                    continue;
-                }
-
-                if matches_name(&entry, name) {
-                    return Ok(entry);
-                }
-            }
-        }
-        return Err(());
-    }
-
-    // Cluster chain directory
-    let mut current_cluster = cluster;
-    let cluster_size = state.sectors_per_cluster as usize * state.bytes_per_sector as usize;
-    let device_block_size = state.device_block_size as usize;
-    let device_blocks_per_cluster = cluster_size.div_ceil(device_block_size).max(1);
-
-    loop {
-        // Read cluster using device blocks
-        let start_block = cluster_to_device_block(state, current_cluster);
-        for b in 0..device_blocks_per_cluster {
-            let offset = b * device_block_size;
-            let read_size = device_block_size.min(cluster_size - offset);
-            read_fn(
-                start_block + b as u64,
-                &mut buffer[offset..offset + read_size],
-            )?;
-        }
-
-        // Search entries
-        for i in 0..entries_per_cluster {
-            let offset = i * 32;
-            let entry =
-                unsafe { core::ptr::read_unaligned(buffer[offset..].as_ptr() as *const DirEntry) };
-
-            if entry.name[0] == 0x00 {
-                return Err(());
-            }
-            if entry.name[0] == 0xE5 || (entry.attr & 0x0F) == 0x0F || (entry.attr & 0x08) != 0 {
-                continue;
-            }
-
-            if matches_name(&entry, name) {
-                return Ok(entry);
-            }
-        }
-
-        // Get next cluster
-        current_cluster = match next_cluster(state, read_fn, current_cluster)? {
-            Some(c) => c,
-            None => return Err(()),
-        };
-    }
-}
-
-/// Check if a directory entry matches a name (case-insensitive)
-fn matches_name(entry: &DirEntry, name: &str) -> bool {
-    // Build short name from entry
-    let mut entry_name = heapless::String::<12>::new();
-    for &c in &entry.name {
-        if c == 0x20 {
-            break;
-        }
-        let _ = entry_name.push(c as char);
-    }
-    if entry.ext[0] != 0x20 {
-        let _ = entry_name.push('.');
-        for &c in &entry.ext {
-            if c == 0x20 {
-                break;
-            }
-            let _ = entry_name.push(c as char);
-        }
-    }
-
-    // Case-insensitive comparison
-    if entry_name.len() != name.len() {
-        return false;
-    }
-    for (a, b) in entry_name.bytes().zip(name.bytes()) {
-        if !a.eq_ignore_ascii_case(&b) {
-            return false;
-        }
-    }
-    true
-}
-
-/// Convert cluster number to device block
-fn cluster_to_device_block(state: &FilesystemState, cluster: u32) -> u64 {
-    let fat_sector = state.data_start + (cluster - 2) * state.sectors_per_cluster as u32;
-    let device_block = state.fat_sector_to_device_block(fat_sector as u64);
-    state.partition_start + device_block
-}
-
-/// Get next cluster from FAT
-fn next_cluster(
-    state: &FilesystemState,
-    read_fn: fn(u64, &mut [u8]) -> Result<(), ()>,
-    cluster: u32,
-) -> Result<Option<u32>, ()> {
-    let device_block_size = state.device_block_size as usize;
-    let mut buffer = [0u8; 4096]; // Max block size
-
-    // Calculate byte offset of FAT entry from partition start
-    let bytes_per_sector = state.bytes_per_sector as u64;
-    let entry_byte_offset = match state.fat_type {
-        12 => (state.fat_start as u64 * bytes_per_sector) + (cluster as u64 * 3 / 2),
-        16 => (state.fat_start as u64 * bytes_per_sector) + (cluster as u64 * 2),
-        32 => (state.fat_start as u64 * bytes_per_sector) + (cluster as u64 * 4),
-        _ => return Err(()),
-    };
-
-    // Translate to device block and offset
-    let device_block = entry_byte_offset / device_block_size as u64;
-    let offset_in_block = (entry_byte_offset % device_block_size as u64) as usize;
-
-    read_fn(
-        state.partition_start + device_block,
-        &mut buffer[..device_block_size],
-    )?;
-
-    let next = match state.fat_type {
-        12 => {
-            // FAT12 entries are 1.5 bytes and can span block boundaries
-            let byte1 = buffer[offset_in_block];
-            let byte2 = if offset_in_block + 1 >= device_block_size {
-                // Entry spans block boundary - need to read next block
-                read_fn(
-                    state.partition_start + device_block + 1,
-                    &mut buffer[..device_block_size],
-                )?;
-                buffer[0]
-            } else {
-                buffer[offset_in_block + 1]
-            };
-
-            let entry = byte1 as u16 | ((byte2 as u16) << 8);
-            let val = if cluster & 1 != 0 {
-                entry >> 4
-            } else {
-                entry & 0x0FFF
-            };
-            if val >= 0x0FF8 {
-                None
-            } else {
-                Some(val as u32)
-            }
-        }
-        16 => {
-            let entry = u16::from_le_bytes([buffer[offset_in_block], buffer[offset_in_block + 1]]);
-            if entry >= 0xFFF8 {
-                None
-            } else {
-                Some(entry as u32)
-            }
-        }
-        32 => {
-            let entry = u32::from_le_bytes([
-                buffer[offset_in_block],
-                buffer[offset_in_block + 1],
-                buffer[offset_in_block + 2],
-                buffer[offset_in_block + 3],
-            ]) & 0x0FFFFFFF;
-            if entry >= 0x0FFFFFF8 {
-                None
-            } else {
-                Some(entry)
-            }
-        }
-        _ => return Err(()),
-    };
-
-    Ok(next)
-}
-
-/// Read file data starting at offset
-fn read_file_data(
-    state: &FilesystemState,
-    read_fn: fn(u64, &mut [u8]) -> Result<(), ()>,
-    first_cluster: u32,
-    offset: u32,
-    buffer: &mut [u8],
-) -> Result<usize, ()> {
-    let cluster_size = state.sectors_per_cluster as u32 * state.bytes_per_sector as u32;
-
-    // Find starting cluster
-    let mut cluster = first_cluster;
-    let skip_clusters = offset / cluster_size;
-    let cluster_offset = (offset % cluster_size) as usize;
-
-    for _ in 0..skip_clusters {
-        cluster = match next_cluster(state, read_fn, cluster)? {
-            Some(c) => c,
-            None => return Ok(0),
-        };
-    }
-
-    let mut bytes_read = 0;
-    let mut cluster_buffer = [0u8; 4096];
-
-    // Read first (potentially partial) cluster
-    if cluster_offset > 0 || buffer.len() < cluster_size as usize {
-        read_cluster(
-            state,
-            read_fn,
-            cluster,
-            &mut cluster_buffer[..cluster_size as usize],
-        )?;
-
-        let copy_len = core::cmp::min(buffer.len(), cluster_size as usize - cluster_offset);
-        buffer[..copy_len]
-            .copy_from_slice(&cluster_buffer[cluster_offset..cluster_offset + copy_len]);
-        bytes_read += copy_len;
-
-        cluster = match next_cluster(state, read_fn, cluster)? {
-            Some(c) => c,
-            None => return Ok(bytes_read),
-        };
-    }
-
-    // Read full clusters
-    while bytes_read + cluster_size as usize <= buffer.len() {
-        read_cluster(
-            state,
-            read_fn,
-            cluster,
-            &mut buffer[bytes_read..bytes_read + cluster_size as usize],
-        )?;
-        bytes_read += cluster_size as usize;
-
-        cluster = match next_cluster(state, read_fn, cluster)? {
-            Some(c) => c,
-            None => return Ok(bytes_read),
-        };
-    }
-
-    // Read last partial cluster
-    if bytes_read < buffer.len() {
-        read_cluster(
-            state,
-            read_fn,
-            cluster,
-            &mut cluster_buffer[..cluster_size as usize],
-        )?;
-        let remaining = buffer.len() - bytes_read;
-        buffer[bytes_read..].copy_from_slice(&cluster_buffer[..remaining]);
-        bytes_read += remaining;
-    }
-
-    Ok(bytes_read)
-}
-
-/// Read a single cluster
-fn read_cluster(
-    state: &FilesystemState,
-    read_fn: fn(u64, &mut [u8]) -> Result<(), ()>,
-    cluster: u32,
-    buffer: &mut [u8],
-) -> Result<(), ()> {
-    let cluster_size = state.sectors_per_cluster as usize * state.bytes_per_sector as usize;
-    let device_block_size = state.device_block_size as usize;
-    let device_blocks_per_cluster = cluster_size.div_ceil(device_block_size).max(1);
-
-    let start_block = cluster_to_device_block(state, cluster);
-    for b in 0..device_blocks_per_cluster {
-        let offset = b * device_block_size;
-        let read_size = device_block_size.min(cluster_size - offset);
-        read_fn(
-            start_block + b as u64,
-            &mut buffer[offset..offset + read_size],
-        )?;
-    }
-    Ok(())
+    unsafe { core::ptr::read_unaligned(bytes.as_ptr() as *const DirectoryEntry) }
 }
 
 /// Read directory entries
-fn read_directory(
-    _this: *mut efi_file::Protocol,
-    buffer_size: *mut usize,
-    buffer: *mut c_void,
-    handle_idx: usize,
-) -> Status {
-    let efi = state::efi();
-    let fs_state = match efi.filesystem {
-        Some(s) => s,
-        None => return Status::NOT_READY,
-    };
-
-    let read_fn = match efi.disk_read_fn {
-        Some(f) => f,
+fn read_directory(buffer_size: *mut usize, buffer: *mut c_void, handle_idx: usize) -> Status {
+    let partition_start = match state::efi().filesystem {
+        Some(s) => s.partition_start,
         None => return Status::NOT_READY,
     };
 
@@ -1120,28 +822,21 @@ fn read_directory(
         )
     };
 
-    // Find the entry at current position
-    let entry_result = get_directory_entry_at_position(&fs_state, read_fn, cluster, position);
+    // Get directory entry at current position
+    let entry_result = state::with_block_device_mut(|device| {
+        let mut fat = match FatFilesystem::new(device, partition_start) {
+            Ok(f) => f,
+            Err(_) => return Err(()),
+        };
+
+        fat.get_directory_entry_at_position(cluster, position)
+            .map_err(|_| ())
+    });
 
     match entry_result {
-        Ok(Some(entry)) => {
-            // Build filename
-            let mut filename = heapless::String::<12>::new();
-            for &c in &entry.name {
-                if c == 0x20 {
-                    break;
-                }
-                let _ = filename.push(c as char);
-            }
-            if entry.ext[0] != 0x20 {
-                let _ = filename.push('.');
-                for &c in &entry.ext {
-                    if c == 0x20 {
-                        break;
-                    }
-                    let _ = filename.push(c as char);
-                }
-            }
+        Some(Ok(Some(entry))) => {
+            // Build filename from entry
+            let filename = entry.short_name();
 
             let filename_u16_len = filename.len() + 1;
             let required_size = core::mem::size_of::<efi_file::Info>() + filename_u16_len * 2;
@@ -1158,11 +853,12 @@ fn read_directory(
 
             // Fill info
             let info = buffer as *mut efi_file::Info;
-            let is_dir = (entry.attr & 0x10) != 0;
+            let is_dir = entry.is_directory();
+            let file_size = entry.file_size();
             unsafe {
                 (*info).size = required_size as u64;
-                (*info).file_size = entry.file_size as u64;
-                (*info).physical_size = entry.file_size as u64;
+                (*info).file_size = file_size as u64;
+                (*info).physical_size = file_size as u64;
                 (*info).create_time = core::mem::zeroed();
                 (*info).last_access_time = core::mem::zeroed();
                 (*info).modification_time = core::mem::zeroed();
@@ -1185,106 +881,11 @@ fn read_directory(
             unsafe { *buffer_size = required_size };
             Status::SUCCESS
         }
-        Ok(None) => {
+        Some(Ok(None)) => {
             // End of directory
             unsafe { *buffer_size = 0 };
             Status::SUCCESS
         }
-        Err(_) => Status::DEVICE_ERROR,
-    }
-}
-
-/// Get directory entry at a specific position (index)
-fn get_directory_entry_at_position(
-    state: &FilesystemState,
-    read_fn: fn(u64, &mut [u8]) -> Result<(), ()>,
-    cluster: u32,
-    position: usize,
-) -> Result<Option<DirEntry>, ()> {
-    let mut buffer = [0u8; 65536]; // Max cluster size
-    let cluster_size = state.sectors_per_cluster as usize * state.bytes_per_sector as usize;
-    let entries_per_cluster = cluster_size / 32;
-    let device_block_size = state.device_block_size as usize;
-    let mut current_position = 0usize;
-
-    // Handle FAT12/16 root directory
-    if cluster == 0 && state.fat_type != 32 {
-        let root_dir_device_block = state.fat_sector_to_device_block(state.root_dir_start as u64);
-        let sectors_per_device_block = device_block_size / state.bytes_per_sector as usize;
-        let entries_per_device_block =
-            (state.bytes_per_sector as usize / 32) * sectors_per_device_block.max(1);
-        let device_blocks_for_root =
-            (state.root_dir_sectors as usize).div_ceil(sectors_per_device_block.max(1));
-
-        for block_idx in 0..device_blocks_for_root as u64 {
-            let device_block = state.partition_start + root_dir_device_block + block_idx;
-            read_fn(device_block, &mut buffer[..device_block_size])?;
-
-            for i in 0..entries_per_device_block {
-                let offset = i * 32;
-                if offset + 32 > device_block_size {
-                    break;
-                }
-                let entry = unsafe {
-                    core::ptr::read_unaligned(buffer[offset..].as_ptr() as *const DirEntry)
-                };
-
-                if entry.name[0] == 0x00 {
-                    return Ok(None);
-                }
-                if entry.name[0] == 0xE5 || (entry.attr & 0x0F) == 0x0F || (entry.attr & 0x08) != 0
-                {
-                    continue;
-                }
-
-                if current_position == position {
-                    return Ok(Some(entry));
-                }
-                current_position += 1;
-            }
-        }
-        return Ok(None);
-    }
-
-    // Cluster chain directory
-    let mut current_cluster = cluster;
-    let device_blocks_per_cluster = cluster_size.div_ceil(device_block_size).max(1);
-
-    loop {
-        // Read cluster using device blocks
-        let start_block = cluster_to_device_block(state, current_cluster);
-        for b in 0..device_blocks_per_cluster {
-            let offset = b * device_block_size;
-            let read_size = device_block_size.min(cluster_size - offset);
-            read_fn(
-                start_block + b as u64,
-                &mut buffer[offset..offset + read_size],
-            )?;
-        }
-
-        // Search entries
-        for i in 0..entries_per_cluster {
-            let offset = i * 32;
-            let entry =
-                unsafe { core::ptr::read_unaligned(buffer[offset..].as_ptr() as *const DirEntry) };
-
-            if entry.name[0] == 0x00 {
-                return Ok(None);
-            }
-            if entry.name[0] == 0xE5 || (entry.attr & 0x0F) == 0x0F || (entry.attr & 0x08) != 0 {
-                continue;
-            }
-
-            if current_position == position {
-                return Ok(Some(entry));
-            }
-            current_position += 1;
-        }
-
-        // Get next cluster
-        current_cluster = match next_cluster(state, read_fn, current_cluster)? {
-            Some(c) => c,
-            None => return Ok(None),
-        };
+        Some(Err(_)) | None => Status::DEVICE_ERROR,
     }
 }
