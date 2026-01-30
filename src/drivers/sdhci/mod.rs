@@ -8,9 +8,9 @@ pub mod regs;
 
 use crate::drivers::pci::{self, PciAddress, PciDevice};
 use crate::efi;
-use crate::time::{wait_for, Timeout};
+use crate::time::{Timeout, wait_for};
 use core::ptr;
-use core::sync::atomic::{fence, Ordering};
+use core::sync::atomic::{Ordering, fence};
 use spin::Mutex;
 use tock_registers::interfaces::{ReadWriteable, Readable, Writeable};
 
@@ -1022,22 +1022,6 @@ impl SdhciController {
         }
 
         self.read_sectors(lba, 1, buffer.as_mut_ptr())
-    }
-
-    /// Write sectors to the card
-    ///
-    /// Note: SD card write support is not yet implemented.
-    /// This is a stub that returns an error.
-    pub fn write_sectors(
-        &mut self,
-        _start_lba: u64,
-        _count: u32,
-        _buffer: *const u8,
-    ) -> Result<(), SdhciError> {
-        // TODO: Implement SD card write support
-        // This requires implementing CMD24 (WRITE_SINGLE_BLOCK) and
-        // CMD25 (WRITE_MULTIPLE_BLOCK) commands with SDMA
-        Err(SdhciError::GenericError)
     }
 
     /// Get the number of blocks on the card

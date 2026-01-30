@@ -5,9 +5,9 @@
 
 use crate::drivers::pci::{self, PciAddress, PciDevice};
 use crate::efi;
-use crate::time::{wait_for, Timeout};
+use crate::time::{Timeout, wait_for};
 use core::ptr;
-use core::sync::atomic::{fence, Ordering};
+use core::sync::atomic::{Ordering, fence};
 use spin::Mutex;
 use tock_registers::interfaces::{ReadWriteable, Readable, Writeable};
 use tock_registers::register_bitfields;
@@ -983,101 +983,6 @@ impl NvmeController {
         }
 
         self.read_sectors(nsid, lba, 1, buffer.as_mut_ptr())
-    }
-
-    /// Write sectors to a namespace
-    ///
-    /// Uses an internal page-aligned DMA buffer to avoid corruption when
-    /// callers pass misaligned buffers (e.g., stack buffers).
-    pub fn write_sectors(
-        &mut self,
-        nsid: u32,
-        start_lba: u64,
-        num_sectors: u32,
-        buffer: *const u8,
-    ) -> Result<(), NvmeError> {
-        let ns = self
-            .get_namespace(nsid)
-            .ok_or(NvmeError::InvalidNamespace)?;
-        let block_size = ns.block_size;
-
-        if num_sectors == 0 {
-            return Err(NvmeError::InvalidParameter);
-        }
-
-        let transfer_size = num_sectors as u64 * block_size as u64;
-
-        // Our DMA buffer is one page (4096 bytes), so we can only transfer up to 4KB at a time
-        // For larger transfers, we need to loop
-        if transfer_size > 4096 {
-            // Handle large transfers by writing one page at a time
-            let sectors_per_page = 4096 / block_size;
-            let mut remaining_sectors = num_sectors;
-            let mut current_lba = start_lba;
-            let mut current_buffer = buffer;
-
-            while remaining_sectors > 0 {
-                let sectors_this_write = core::cmp::min(remaining_sectors, sectors_per_page);
-                self.write_sectors_internal(nsid, current_lba, sectors_this_write, current_buffer)?;
-                remaining_sectors -= sectors_this_write;
-                current_lba += sectors_this_write as u64;
-                current_buffer =
-                    unsafe { current_buffer.add((sectors_this_write * block_size) as usize) };
-            }
-            return Ok(());
-        }
-
-        self.write_sectors_internal(nsid, start_lba, num_sectors, buffer)
-    }
-
-    /// Internal write function that uses the page-aligned DMA buffer
-    fn write_sectors_internal(
-        &mut self,
-        nsid: u32,
-        start_lba: u64,
-        num_sectors: u32,
-        buffer: *const u8,
-    ) -> Result<(), NvmeError> {
-        let ns = self
-            .get_namespace(nsid)
-            .ok_or(NvmeError::InvalidNamespace)?;
-        let block_size = ns.block_size;
-        let transfer_size = (num_sectors * block_size) as usize;
-
-        // Copy data from caller's buffer to DMA buffer first
-        unsafe {
-            ptr::copy_nonoverlapping(buffer, self.dma_buffer, transfer_size);
-        }
-
-        // Use our page-aligned DMA buffer to avoid corruption from misaligned caller buffers
-        // The DMA buffer is guaranteed to be 4KB aligned by allocate_pages()
-        let mut cmd = SubmissionQueueEntry::new();
-        cmd.set_opcode(io_cmd::WRITE);
-        cmd.set_cid(self.next_command_id());
-        cmd.nsid = nsid;
-        cmd.prp1 = self.dma_buffer as u64; // Use aligned DMA buffer
-
-        cmd.cdw10 = start_lba as u32;
-        cmd.cdw11 = (start_lba >> 32) as u32;
-        cmd.cdw12 = num_sectors - 1; // Number of logical blocks (0-based)
-
-        let cid = self.submit_io_command(&cmd);
-        self.wait_io_completion(cid)?;
-
-        Ok(())
-    }
-
-    /// Write a single sector (convenience method)
-    pub fn write_sector(&mut self, nsid: u32, lba: u64, buffer: &[u8]) -> Result<(), NvmeError> {
-        let ns = self
-            .get_namespace(nsid)
-            .ok_or(NvmeError::InvalidNamespace)?;
-
-        if buffer.len() < ns.block_size as usize {
-            return Err(NvmeError::InvalidParameter);
-        }
-
-        self.write_sectors(nsid, lba, 1, buffer.as_ptr())
     }
 }
 
