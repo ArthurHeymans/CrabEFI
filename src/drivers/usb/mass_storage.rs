@@ -474,6 +474,69 @@ impl UsbMassStorage {
         Ok(())
     }
 
+    /// Write sectors to the device (generic version)
+    pub fn write_sectors_generic(
+        &mut self,
+        controller: &mut dyn UsbController,
+        start_lba: u64,
+        num_sectors: u32,
+        buffer: &[u8],
+    ) -> Result<(), MassStorageError> {
+        if buffer.len() < (num_sectors as usize * self.block_size as usize) {
+            return Err(MassStorageError::InvalidParameter);
+        }
+
+        // Use WRITE(10) for small LBAs
+        if start_lba + num_sectors as u64 <= 0xFFFFFFFF {
+            self.write_10(controller, start_lba as u32, num_sectors as u16, buffer)
+        } else {
+            // Large LBA write not implemented
+            Err(MassStorageError::InvalidParameter)
+        }
+    }
+
+    /// WRITE(10) command
+    fn write_10(
+        &mut self,
+        controller: &mut dyn UsbController,
+        lba: u32,
+        count: u16,
+        buffer: &[u8],
+    ) -> Result<(), MassStorageError> {
+        let lba_bytes = lba.to_be_bytes();
+        let count_bytes = count.to_be_bytes();
+
+        let cdb = [
+            scsi_cmd::WRITE_10,
+            0,
+            lba_bytes[0],
+            lba_bytes[1],
+            lba_bytes[2],
+            lba_bytes[3],
+            0,
+            count_bytes[0],
+            count_bytes[1],
+            0,
+        ];
+
+        let transfer_len = count as usize * self.block_size as usize;
+
+        // Copy to mutable buffer for bulk transfer (which requires &mut [u8])
+        let mut temp_buffer = [0u8; 4096];
+        let copy_len = transfer_len.min(temp_buffer.len());
+        temp_buffer[..copy_len].copy_from_slice(&buffer[..copy_len]);
+
+        // Use existing scsi_command with is_read=false for write direction
+        self.scsi_command(
+            controller,
+            &cdb,
+            Some(&mut temp_buffer[..transfer_len]),
+            false,
+        )?;
+
+        Ok(())
+    }
+
     /// Get the device address (slot ID for xHCI, device address for others)
     pub fn device_addr(&self) -> u8 {
         self.device_addr
@@ -610,6 +673,42 @@ pub fn global_read_sector(lba: u64, buffer: &mut [u8]) -> Result<(), ()> {
     if let Err(ref e) = result {
         log::error!(
             "USB mass storage: read failed at LBA {} via {}: {:?}",
+            lba,
+            controller.controller_type(),
+            e
+        );
+    }
+    result.map_err(|_| ())
+}
+
+/// Write a sector to the global USB device
+///
+/// This function can be used as the write callback for the SimpleFileSystem protocol.
+/// It uses the stored controller pointer directly to avoid lock contention.
+pub fn global_write_sector(lba: u64, buffer: &[u8]) -> Result<(), ()> {
+    log::trace!("USB mass storage: write LBA {}", lba);
+
+    // Get the device and controller pointers (release lock immediately)
+    let (device_ptr, controller_ptr) = {
+        let guard = GLOBAL_USB_STATE.lock();
+        match guard.as_ref() {
+            Some(state) => (state.device_ptr, state.controller_ptr),
+            None => {
+                log::error!("USB mass storage: no device configured");
+                return Err(());
+            }
+        }
+    };
+
+    // Safety: Pointers were set up during store_global_device and remain valid
+    // for the entire boot process (memory is allocated via efi::allocate_pages)
+    let device = unsafe { &mut *device_ptr };
+    let controller = unsafe { &mut *controller_ptr };
+
+    let result = device.write_sectors_generic(controller, lba, 1, buffer);
+    if let Err(ref e) = result {
+        log::error!(
+            "USB mass storage: write failed at LBA {} via {}: {:?}",
             lba,
             controller.controller_type(),
             e

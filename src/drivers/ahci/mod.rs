@@ -1007,6 +1007,74 @@ impl AhciController {
         Ok(())
     }
 
+    /// Write sectors to a device
+    pub fn write_sectors(
+        &mut self,
+        port_index: usize,
+        start_lba: u64,
+        num_sectors: u32,
+        buffer: *const u8,
+    ) -> Result<(), AhciError> {
+        if port_index >= self.ports.len() {
+            return Err(AhciError::InvalidParameter);
+        }
+
+        let device_type = self.ports[port_index].device_type;
+
+        if device_type == DeviceType::Satapi {
+            // ATAPI devices (CD/DVD) are typically read-only
+            return Err(AhciError::InvalidParameter);
+        }
+
+        self.write_sectors_sata(port_index, start_lba, num_sectors, buffer)
+    }
+
+    /// Write sectors to a SATA device using WRITE DMA EXT
+    fn write_sectors_sata(
+        &mut self,
+        port_index: usize,
+        start_lba: u64,
+        num_sectors: u32,
+        buffer: *const u8,
+    ) -> Result<(), AhciError> {
+        let port_num = self.ports[port_index].port_num;
+        let cmd_list = self.ports[port_index].cmd_list;
+        let cmd_tables = self.ports[port_index].cmd_tables;
+
+        let slot = self
+            .find_free_slot(port_num)
+            .ok_or(AhciError::PortNotReady)?;
+
+        // Setup command header
+        let header = unsafe { &mut *cmd_list.add(slot as usize) };
+        header.dw0 = 0;
+        header.set_cfl(5);
+        header.set_write(true); // This is a write command
+        header.set_prdtl(1);
+        header.prdbc = 0;
+
+        // Setup command table
+        let table = unsafe { &mut *cmd_tables[slot as usize] };
+        *table = CommandTable::default();
+
+        // Setup FIS for WRITE DMA EXT
+        let fis = unsafe { &mut *(table.cfis.as_mut_ptr() as *mut FisRegH2D) };
+        *fis = FisRegH2D::new();
+        fis.set_command(ATA_CMD_WRITE_DMA_EXT);
+        fis.set_lba(start_lba);
+        fis.set_count(num_sectors as u16);
+
+        // Setup PRDT
+        let byte_count = num_sectors * 512;
+        table.prdt[0].set_address(buffer as u64);
+        table.prdt[0].set_byte_count(byte_count, true);
+
+        // Issue command
+        self.issue_command_by_port(port_num, slot)?;
+
+        Ok(())
+    }
+
     /// Issue a command by port number and wait for completion
     fn issue_command_by_port(&mut self, port_num: u8, slot: u8) -> Result<(), AhciError> {
         fence(Ordering::SeqCst);
