@@ -153,7 +153,7 @@ extern "efiapi" fn get_variable(
     // Find the variable using iterator
     let found = variables
         .iter()
-        .find(|var| var.in_use && guid_eq(&var.vendor_guid, &guid) && name_eq(&var.name, name));
+        .find(|var| var.in_use && var.vendor_guid == guid && name_eq(&var.name, name));
 
     match found {
         Some(var) => {
@@ -206,7 +206,7 @@ extern "efiapi" fn get_next_variable_name(
         // Skip until we find the current variable, then get the next one
         var_iter
             .skip_while(|var| {
-                !(guid_eq(&var.vendor_guid, &current_guid) && name_eq(&var.name, current_name))
+                !(var.vendor_guid == current_guid && name_eq(&var.name, current_name))
             })
             .nth(1) // Skip the current one and get the next
     };
@@ -267,9 +267,9 @@ extern "efiapi" fn set_variable(
         let variables = &mut efi.variables;
 
         // Find existing variable using position()
-        let existing_idx = variables.iter().position(|var| {
-            var.in_use && guid_eq(&var.vendor_guid, &guid) && name_eq(&var.name, name)
-        });
+        let existing_idx = variables
+            .iter()
+            .position(|var| var.in_use && var.vendor_guid == guid && name_eq(&var.name, name));
 
         // Find first free slot using position()
         let free_idx = variables.iter().position(|var| !var.in_use);
@@ -493,9 +493,6 @@ unsafe fn x86_out8(port: u16, value: u8) {
 unsafe fn x86_in8(port: u16) -> u8 {
     io::inb(port)
 }
-
-// Use common guid_eq from utils module
-use super::utils::guid_eq;
 
 /// Compare a UCS-2 string in array with a pointer
 fn name_eq(stored: &[u16], name: *const u16) -> bool {

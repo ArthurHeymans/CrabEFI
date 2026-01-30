@@ -534,7 +534,7 @@ extern "efiapi" fn install_protocol_interface(
             // Check if protocol already installed
             if entry.protocols[..entry.protocol_count]
                 .iter()
-                .any(|p| guid_eq(&p.guid, &guid))
+                .any(|p| p.guid == guid)
             {
                 return Status::INVALID_PARAMETER; // Protocol already installed
             }
@@ -658,7 +658,7 @@ extern "efiapi" fn locate_handle(
         .filter(|entry| {
             entry.protocols[..entry.protocol_count]
                 .iter()
-                .any(|p| guid_eq(&p.guid, &guid))
+                .any(|p| p.guid == guid)
         })
         .map(|entry| entry.handle)
         .collect();
@@ -711,11 +711,11 @@ extern "efiapi" fn locate_device_path(
         .filter_map(|entry| {
             let protocols = &entry.protocols[..entry.protocol_count];
 
-            let has_protocol = protocols.iter().any(|p| guid_eq(&p.guid, &guid));
+            let has_protocol = protocols.iter().any(|p| p.guid == guid);
 
             let handle_dp = protocols
                 .iter()
-                .find(|p| guid_eq(&p.guid, &r_efi::protocols::device_path::PROTOCOL_GUID))
+                .find(|p| p.guid == r_efi::protocols::device_path::PROTOCOL_GUID)
                 .map(|p| p.interface as *mut DevicePathProtocol);
 
             match (has_protocol, handle_dp) {
@@ -1194,7 +1194,7 @@ extern "efiapi" fn open_protocol(
     // Find the protocol on this handle
     let proto = entry.protocols[..entry.protocol_count]
         .iter()
-        .find(|p| guid_eq(&p.guid, &guid));
+        .find(|p| p.guid == guid);
 
     let Some(proto) = proto else {
         log::warn!("  -> UNSUPPORTED (protocol not on handle)");
@@ -1362,7 +1362,7 @@ extern "efiapi" fn locate_protocol(
     let found = efi_state.handles[..efi_state.handle_count]
         .iter()
         .flat_map(|entry| entry.protocols[..entry.protocol_count].iter())
-        .find(|proto| guid_eq(&proto.guid, &guid));
+        .find(|proto| proto.guid == guid);
 
     if let Some(proto) = found {
         unsafe { *interface = proto.interface };
@@ -1494,7 +1494,7 @@ extern "efiapi" fn uninstall_multiple_protocol_interfaces(
                 .find(|e| e.handle == handle)
                 && let Some(j) = entry.protocols[..entry.protocol_count]
                     .iter()
-                    .position(|p| guid_eq(&p.guid, &guid))
+                    .position(|p| p.guid == guid)
             {
                 // Remove by shifting remaining protocols down
                 entry.protocols.copy_within(j + 1..entry.protocol_count, j);
@@ -1536,9 +1536,6 @@ extern "efiapi" fn set_mem(buffer: *mut c_void, size: usize, value: u8) {
 // ============================================================================
 // Helper Functions
 // ============================================================================
-
-// Use common guid_eq from utils module
-use super::utils::guid_eq;
 
 /// Wrapper for GUID that displays name if known, raw GUID if unknown
 pub struct GuidFmt(pub Guid);
@@ -1892,7 +1889,7 @@ fn format_guid(guid: &Guid) -> &'static str {
 
     GUID_NAMES
         .iter()
-        .find(|(g, _)| guid_eq(guid, g))
+        .find(|(g, _)| *guid == *g)
         .map(|(_, name)| *name)
         .unwrap_or("UNKNOWN")
 }
@@ -1926,7 +1923,7 @@ pub fn install_protocol(handle: Handle, guid: &Guid, interface: *mut c_void) -> 
             // Check if protocol already installed
             if entry.protocols[..entry.protocol_count]
                 .iter()
-                .any(|p| guid_eq(&p.guid, guid))
+                .any(|p| p.guid == *guid)
             {
                 return Status::INVALID_PARAMETER;
             }

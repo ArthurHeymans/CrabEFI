@@ -520,7 +520,7 @@ extern "efiapi" fn file_get_info(
         (path, len, handles[idx].file_size, handles[idx].is_directory)
     };
 
-    if guid_eq(&guid, &FILE_INFO_GUID) {
+    if guid == FILE_INFO_GUID {
         // EFI_FILE_INFO
         let path_str = core::str::from_utf8(&path[..path_len]).unwrap_or("");
         let filename = path_str.rsplit(['/', '\\']).next().unwrap_or("");
@@ -566,7 +566,7 @@ extern "efiapi" fn file_get_info(
             is_directory
         );
         Status::SUCCESS
-    } else if guid_eq(&guid, &FILE_SYSTEM_INFO_GUID) {
+    } else if guid == FILE_SYSTEM_INFO_GUID {
         // EFI_FILE_SYSTEM_INFO
         let label = "EFI";
         let label_u16_len = label.len() + 1;
@@ -774,9 +774,6 @@ fn normalize_path(path: &mut [u8; MAX_PATH_LEN], len: usize) -> usize {
         len
     }
 }
-
-// Use common guid_eq from utils module
-use crate::efi::utils::guid_eq;
 
 /// Create a minimal DirectoryEntry for file reading
 ///

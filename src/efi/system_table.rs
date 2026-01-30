@@ -194,10 +194,7 @@ pub fn install_configuration_table(guid: &Guid, table: *mut c_void) -> efi::Stat
         let count = &mut efi.config_table_count;
 
         // First, check if this GUID already exists
-        if let Some(i) = tables[..*count]
-            .iter()
-            .position(|t| guid_eq(&t.vendor_guid, guid))
-        {
+        if let Some(i) = tables[..*count].iter().position(|t| t.vendor_guid == *guid) {
             if table.is_null() {
                 // Remove the entry by shifting others down
                 tables.copy_within(i + 1..*count, i);
@@ -237,9 +234,6 @@ fn update_table_count(count: usize) {
         SYSTEM_TABLE.number_of_table_entries = count;
     }
 }
-
-// Use common guid_eq from utils module
-use super::utils::guid_eq;
 
 /// ACPI RSDP structure (Root System Description Pointer)
 #[repr(C, packed)]
@@ -284,7 +278,7 @@ struct AcpiRegion {
 
 /// Collect all ACPI table regions, merge overlapping ones, then mark them
 fn mark_acpi_tables_memory(rsdp_addr: u64) {
-    use super::allocator::{mark_as_acpi_reclaim, PAGE_SIZE};
+    use super::allocator::{PAGE_SIZE, mark_as_acpi_reclaim};
 
     log::info!("Marking ACPI table memory regions as AcpiReclaimMemory...");
 
@@ -504,7 +498,7 @@ fn mark_acpi_tables_memory(rsdp_addr: u64) {
 
 /// Install ACPI tables from coreboot
 pub fn install_acpi_tables(rsdp: u64) {
-    use super::allocator::{get_memory_type_at, MemoryType};
+    use super::allocator::{MemoryType, get_memory_type_at};
 
     if rsdp == 0 {
         log::warn!("ACPI RSDP address is null, skipping ACPI table installation");
@@ -607,13 +601,13 @@ pub fn dump_configuration_tables() {
         let guid = &entry.vendor_guid;
 
         // Try to identify known GUIDs
-        let name = if guid_eq(guid, &ACPI_20_TABLE_GUID) {
+        let name = if *guid == ACPI_20_TABLE_GUID {
             "ACPI 2.0 RSDP"
-        } else if guid_eq(guid, &ACPI_TABLE_GUID) {
+        } else if *guid == ACPI_TABLE_GUID {
             "ACPI 1.0 RSDP"
-        } else if guid_eq(guid, &SMBIOS_TABLE_GUID) {
+        } else if *guid == SMBIOS_TABLE_GUID {
             "SMBIOS"
-        } else if guid_eq(guid, &SMBIOS3_TABLE_GUID) {
+        } else if *guid == SMBIOS3_TABLE_GUID {
             "SMBIOS 3.0"
         } else {
             "Unknown"

@@ -452,14 +452,16 @@ pub fn load_image(data: &[u8]) -> Result<LoadedImage, Status> {
 
         // Apply relocations if the relocation directory exists
         if num_data_dirs as usize > IMAGE_DIRECTORY_ENTRY_BASERELOC {
-            let reloc_dir_offset = IMAGE_DIRECTORY_ENTRY_BASERELOC * core::mem::size_of::<DataDirectory>();
-            let reloc_dir = match DataDirectory::ref_from_prefix(&data_dirs_data[reloc_dir_offset..]) {
-                Ok((d, _)) => d,
-                Err(_) => {
-                    let _ = allocator::free_pages(load_addr, num_pages);
-                    return Err(Status::INVALID_PARAMETER);
-                }
-            };
+            let reloc_dir_offset =
+                IMAGE_DIRECTORY_ENTRY_BASERELOC * core::mem::size_of::<DataDirectory>();
+            let reloc_dir =
+                match DataDirectory::ref_from_prefix(&data_dirs_data[reloc_dir_offset..]) {
+                    Ok((d, _)) => d,
+                    Err(_) => {
+                        let _ = allocator::free_pages(load_addr, num_pages);
+                        return Err(Status::INVALID_PARAMETER);
+                    }
+                };
             let reloc_rva = reloc_dir.virtual_address;
             let reloc_size = reloc_dir.size;
 
