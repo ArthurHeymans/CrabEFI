@@ -26,6 +26,7 @@ pub mod fs;
 pub mod logger;
 pub mod menu;
 pub mod pe;
+pub mod secure_boot_menu;
 pub mod state;
 pub mod time;
 
