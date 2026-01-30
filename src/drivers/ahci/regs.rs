@@ -485,6 +485,12 @@ pub const ATA_CMD_IDENTIFY_PACKET: u8 = 0xA1;
 /// ATAPI Packet Command
 pub const ATA_CMD_PACKET: u8 = 0xA0;
 
+/// Trusted Receive (DMA) - for TCG Opal/IEEE 1667
+pub const ATA_CMD_TRUSTED_RECEIVE_DMA: u8 = 0x5C;
+
+/// Trusted Send (DMA) - for TCG Opal/IEEE 1667
+pub const ATA_CMD_TRUSTED_SEND_DMA: u8 = 0x5E;
+
 // ============================================================================
 // SCSI Commands (used with ATAPI)
 // ============================================================================

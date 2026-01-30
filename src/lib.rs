@@ -200,6 +200,9 @@ fn init_storage() {
     drivers::usb::init_all();
     drivers::sdhci::init();
 
+    // Initialize pass-through protocols for TCG Opal support
+    efi::protocols::pass_thru_init::init();
+
     // Discover boot entries and show menu
     let mut boot_menu = menu::discover_boot_entries();
 

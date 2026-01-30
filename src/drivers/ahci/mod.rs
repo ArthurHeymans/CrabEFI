@@ -1061,6 +1061,216 @@ impl AhciController {
     pub fn pci_address(&self) -> pci::PciAddress {
         self.pci_address
     }
+
+    // ========================================================================
+    // Security Commands (TCG Opal, IEEE 1667)
+    // ========================================================================
+
+    /// ATA TRUSTED RECEIVE (command 0x5C)
+    ///
+    /// Receives data from the security subsystem (e.g., TCG Opal response).
+    ///
+    /// # Arguments
+    /// * `port_index` - Port index
+    /// * `protocol_id` - Security Protocol ID (0x00=enumerate, 0x01=TCG, 0xEE=IEEE 1667)
+    /// * `sp_specific` - Protocol-specific value (e.g., ComID for TCG)
+    /// * `buffer` - Buffer to receive data
+    ///
+    /// # Returns
+    /// Number of bytes transferred on success
+    pub fn trusted_receive(
+        &mut self,
+        port_index: usize,
+        protocol_id: u8,
+        sp_specific: u16,
+        buffer: &mut [u8],
+    ) -> Result<usize, AhciError> {
+        if port_index >= self.ports.len() {
+            return Err(AhciError::InvalidParameter);
+        }
+
+        if buffer.is_empty() || buffer.len() > 65536 {
+            return Err(AhciError::InvalidParameter);
+        }
+
+        log::debug!(
+            "AHCI Trusted Receive: port={}, protocol={:#x}, sp_specific={:#x}, len={}",
+            port_index,
+            protocol_id,
+            sp_specific,
+            buffer.len()
+        );
+
+        let port_num = self.ports[port_index].port_num;
+        let cmd_list = self.ports[port_index].cmd_list;
+        let cmd_tables = self.ports[port_index].cmd_tables;
+
+        let slot = self.find_free_slot(port_num).ok_or(AhciError::PortNotReady)?;
+
+        // Allocate aligned buffer for DMA
+        let dma_buffer = efi::allocate_pages(1).ok_or(AhciError::AllocationFailed)?;
+        let dma_addr = dma_buffer.as_ptr() as u64;
+
+        // Setup command header
+        let header = unsafe { &mut *cmd_list.add(slot as usize) };
+        header.dw0 = 0;
+        header.set_cfl(5); // 5 DWORDs for H2D FIS
+        header.set_write(false); // Read from device
+        header.set_prdtl(1);
+        header.prdbc = 0;
+
+        // Setup command table
+        let table = unsafe { &mut *cmd_tables[slot as usize] };
+        *table = CommandTable::default();
+
+        // Setup FIS for TRUSTED RECEIVE DMA
+        // The ATA TRUSTED RECEIVE DMA command layout:
+        // - Command: 0x5C
+        // - Features (7:0): Security Protocol
+        // - LBA (15:0): Transfer Length in 512-byte blocks
+        // - LBA (31:24): Security Protocol Specific (high byte)
+        // - Device (7:0): Security Protocol Specific (low byte) | 0x40 (LBA mode)
+        let fis = unsafe { &mut *(table.cfis.as_mut_ptr() as *mut FisRegH2D) };
+        *fis = FisRegH2D::new();
+        fis.set_command(ATA_CMD_TRUSTED_RECEIVE_DMA);
+        fis.feature_l = protocol_id;
+        
+        // Transfer length in 512-byte blocks
+        let transfer_blocks = (buffer.len() as u32 + 511) / 512;
+        fis.lba0 = (transfer_blocks & 0xFF) as u8;
+        fis.lba1 = ((transfer_blocks >> 8) & 0xFF) as u8;
+        fis.lba2 = 0;
+        fis.lba3 = (sp_specific >> 8) as u8;
+        fis.device = ((sp_specific & 0xFF) as u8) | 0x40; // LBA mode
+
+        // Setup PRDT
+        table.prdt[0].set_address(dma_addr);
+        table.prdt[0].set_byte_count(transfer_blocks * 512, true);
+
+        // Issue command
+        let result = self.issue_command_by_port(port_num, slot);
+
+        // Copy data from DMA buffer to caller's buffer
+        let bytes_transferred = if result.is_ok() {
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    dma_buffer.as_ptr(),
+                    buffer.as_mut_ptr(),
+                    buffer.len(),
+                );
+            }
+            buffer.len()
+        } else {
+            0
+        };
+
+        efi::free_pages(dma_buffer, 1);
+
+        result.map(|_| {
+            log::debug!("AHCI Trusted Receive: {} bytes transferred", bytes_transferred);
+            bytes_transferred
+        })
+    }
+
+    /// ATA TRUSTED SEND (command 0x5E)
+    ///
+    /// Sends data to the security subsystem (e.g., TCG Opal command).
+    ///
+    /// # Arguments
+    /// * `port_index` - Port index
+    /// * `protocol_id` - Security Protocol ID (0x00=enumerate, 0x01=TCG, 0xEE=IEEE 1667)
+    /// * `sp_specific` - Protocol-specific value (e.g., ComID for TCG)
+    /// * `buffer` - Buffer containing data to send
+    ///
+    /// # Returns
+    /// Ok(()) on success
+    pub fn trusted_send(
+        &mut self,
+        port_index: usize,
+        protocol_id: u8,
+        sp_specific: u16,
+        buffer: &[u8],
+    ) -> Result<(), AhciError> {
+        if port_index >= self.ports.len() {
+            return Err(AhciError::InvalidParameter);
+        }
+
+        if buffer.len() > 65536 {
+            return Err(AhciError::InvalidParameter);
+        }
+
+        log::debug!(
+            "AHCI Trusted Send: port={}, protocol={:#x}, sp_specific={:#x}, len={}",
+            port_index,
+            protocol_id,
+            sp_specific,
+            buffer.len()
+        );
+
+        let port_num = self.ports[port_index].port_num;
+        let cmd_list = self.ports[port_index].cmd_list;
+        let cmd_tables = self.ports[port_index].cmd_tables;
+
+        let slot = self.find_free_slot(port_num).ok_or(AhciError::PortNotReady)?;
+
+        // Allocate aligned buffer for DMA
+        let dma_buffer = efi::allocate_pages(1).ok_or(AhciError::AllocationFailed)?;
+        let dma_addr = dma_buffer.as_ptr() as u64;
+
+        // Copy data to DMA buffer
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                buffer.as_ptr(),
+                dma_buffer.as_mut_ptr(),
+                buffer.len(),
+            );
+        }
+
+        // Setup command header
+        let header = unsafe { &mut *cmd_list.add(slot as usize) };
+        header.dw0 = 0;
+        header.set_cfl(5); // 5 DWORDs for H2D FIS
+        header.set_write(true); // Write to device
+        header.set_prdtl(1);
+        header.prdbc = 0;
+
+        // Setup command table
+        let table = unsafe { &mut *cmd_tables[slot as usize] };
+        *table = CommandTable::default();
+
+        // Setup FIS for TRUSTED SEND DMA
+        // The ATA TRUSTED SEND DMA command layout:
+        // - Command: 0x5E
+        // - Features (7:0): Security Protocol
+        // - LBA (15:0): Transfer Length in 512-byte blocks
+        // - LBA (31:24): Security Protocol Specific (high byte)
+        // - Device (7:0): Security Protocol Specific (low byte) | 0x40 (LBA mode)
+        let fis = unsafe { &mut *(table.cfis.as_mut_ptr() as *mut FisRegH2D) };
+        *fis = FisRegH2D::new();
+        fis.set_command(ATA_CMD_TRUSTED_SEND_DMA);
+        fis.feature_l = protocol_id;
+        
+        // Transfer length in 512-byte blocks
+        let transfer_blocks = (buffer.len() as u32 + 511) / 512;
+        fis.lba0 = (transfer_blocks & 0xFF) as u8;
+        fis.lba1 = ((transfer_blocks >> 8) & 0xFF) as u8;
+        fis.lba2 = 0;
+        fis.lba3 = (sp_specific >> 8) as u8;
+        fis.device = ((sp_specific & 0xFF) as u8) | 0x40; // LBA mode
+
+        // Setup PRDT
+        table.prdt[0].set_address(dma_addr);
+        table.prdt[0].set_byte_count(transfer_blocks * 512, true);
+
+        // Issue command
+        let result = self.issue_command_by_port(port_num, slot);
+
+        efi::free_pages(dma_buffer, 1);
+
+        result.map(|_| {
+            log::debug!("AHCI Trusted Send: success");
+        })
+    }
 }
 
 /// Wrapper for AHCI controller pointer to implement Send

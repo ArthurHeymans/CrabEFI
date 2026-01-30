@@ -5,9 +5,9 @@
 
 use crate::drivers::pci::{self, PciAddress, PciDevice};
 use crate::efi;
-use crate::time::{Timeout, wait_for};
+use crate::time::{wait_for, Timeout};
 use core::ptr;
-use core::sync::atomic::{Ordering, fence};
+use core::sync::atomic::{fence, Ordering};
 use spin::Mutex;
 use tock_registers::interfaces::{ReadWriteable, Readable, Writeable};
 use tock_registers::register_bitfields;
@@ -131,6 +131,10 @@ mod admin_cmd {
     pub const SET_FEATURES: u8 = 0x09;
     pub const GET_FEATURES: u8 = 0x0A;
     pub const ASYNC_EVENT_REQUEST: u8 = 0x0C;
+    /// Security Send (for TCG Opal, IEEE 1667, etc.)
+    pub const SECURITY_SEND: u8 = 0x81;
+    /// Security Receive (for TCG Opal, IEEE 1667, etc.)
+    pub const SECURITY_RECEIVE: u8 = 0x82;
 }
 
 /// NVMe I/O commands
@@ -983,6 +987,140 @@ impl NvmeController {
         }
 
         self.read_sectors(nsid, lba, 1, buffer.as_mut_ptr())
+    }
+
+    // ========================================================================
+    // Security Commands (TCG Opal, IEEE 1667)
+    // ========================================================================
+
+    /// NVMe Security Receive (admin opcode 0x82)
+    ///
+    /// Receives data from the security subsystem (e.g., TCG Opal response).
+    ///
+    /// # Arguments
+    /// * `nsid` - Namespace ID (use 0 for controller-level operations)
+    /// * `protocol_id` - Security Protocol ID (0x00=enumerate, 0x01=TCG, 0xEE=IEEE 1667)
+    /// * `sp_specific` - Protocol-specific value (e.g., ComID for TCG)
+    /// * `buffer` - Buffer to receive data
+    ///
+    /// # Returns
+    /// Number of bytes transferred on success
+    pub fn security_receive(
+        &mut self,
+        nsid: u32,
+        protocol_id: u8,
+        sp_specific: u16,
+        buffer: &mut [u8],
+    ) -> Result<usize, NvmeError> {
+        if buffer.is_empty() || buffer.len() > 4096 {
+            return Err(NvmeError::InvalidParameter);
+        }
+
+        log::debug!(
+            "NVMe Security Receive: nsid={}, protocol={:#x}, sp_specific={:#x}, len={}",
+            nsid,
+            protocol_id,
+            sp_specific,
+            buffer.len()
+        );
+
+        // Build security receive command
+        // CDW10: Security Protocol ID (bits 31:24), reserved (bits 23:16), SP Specific (bits 15:0)
+        // CDW11: Allocation Length (transfer length in dwords)
+        let mut cmd = SubmissionQueueEntry::new();
+        cmd.set_opcode(admin_cmd::SECURITY_RECEIVE);
+        cmd.set_cid(self.next_command_id());
+        cmd.nsid = nsid;
+        cmd.prp1 = self.dma_buffer as u64;
+        cmd.cdw10 = ((protocol_id as u32) << 24) | (sp_specific as u32);
+        cmd.cdw11 = (buffer.len() as u32 + 3) / 4; // Allocation length in dwords
+
+        let cid = self.submit_admin_command(&cmd);
+        let completion = self.wait_admin_completion(cid)?;
+
+        // The completion DW0 contains the number of bytes transferred (for some implementations)
+        // For simplicity, we assume the full buffer was used if no error
+        let bytes_transferred = if completion.dw0 > 0 && completion.dw0 <= buffer.len() as u32 {
+            completion.dw0 as usize
+        } else {
+            buffer.len()
+        };
+
+        // Copy data from DMA buffer to caller's buffer
+        unsafe {
+            ptr::copy_nonoverlapping(self.dma_buffer, buffer.as_mut_ptr(), bytes_transferred);
+        }
+
+        log::debug!(
+            "NVMe Security Receive: {} bytes transferred",
+            bytes_transferred
+        );
+        Ok(bytes_transferred)
+    }
+
+    /// NVMe Security Send (admin opcode 0x81)
+    ///
+    /// Sends data to the security subsystem (e.g., TCG Opal command).
+    ///
+    /// # Arguments
+    /// * `nsid` - Namespace ID (use 0 for controller-level operations)
+    /// * `protocol_id` - Security Protocol ID (0x00=enumerate, 0x01=TCG, 0xEE=IEEE 1667)
+    /// * `sp_specific` - Protocol-specific value (e.g., ComID for TCG)
+    /// * `buffer` - Buffer containing data to send
+    ///
+    /// # Returns
+    /// Ok(()) on success
+    pub fn security_send(
+        &mut self,
+        nsid: u32,
+        protocol_id: u8,
+        sp_specific: u16,
+        buffer: &[u8],
+    ) -> Result<(), NvmeError> {
+        if buffer.len() > 4096 {
+            return Err(NvmeError::InvalidParameter);
+        }
+
+        log::debug!(
+            "NVMe Security Send: nsid={}, protocol={:#x}, sp_specific={:#x}, len={}",
+            nsid,
+            protocol_id,
+            sp_specific,
+            buffer.len()
+        );
+
+        // Copy data to DMA buffer
+        unsafe {
+            ptr::copy_nonoverlapping(buffer.as_ptr(), self.dma_buffer, buffer.len());
+        }
+
+        // Build security send command
+        // CDW10: Security Protocol ID (bits 31:24), reserved (bits 23:16), SP Specific (bits 15:0)
+        // CDW11: Transfer Length (in dwords)
+        let mut cmd = SubmissionQueueEntry::new();
+        cmd.set_opcode(admin_cmd::SECURITY_SEND);
+        cmd.set_cid(self.next_command_id());
+        cmd.nsid = nsid;
+        cmd.prp1 = self.dma_buffer as u64;
+        cmd.cdw10 = ((protocol_id as u32) << 24) | (sp_specific as u32);
+        cmd.cdw11 = (buffer.len() as u32 + 3) / 4; // Transfer length in dwords
+
+        let cid = self.submit_admin_command(&cmd);
+        self.wait_admin_completion(cid)?;
+
+        log::debug!("NVMe Security Send: success");
+        Ok(())
+    }
+
+    /// Get the list of namespaces
+    pub fn namespaces(&self) -> &[NvmeNamespace] {
+        &self.namespaces
+    }
+
+    /// Get the NVMe version from the controller
+    pub fn nvme_version(&self) -> u32 {
+        let regs = unsafe { &*self.regs };
+        regs.vs.get()
     }
 }
 

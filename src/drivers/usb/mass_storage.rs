@@ -483,6 +483,140 @@ impl UsbMassStorage {
     pub fn slot_id(&self) -> u8 {
         self.device_addr
     }
+
+    // ============================================================================
+    // TCG Security Protocol Commands (for Opal SED support)
+    // ============================================================================
+
+    /// SCSI SECURITY PROTOCOL IN command (opcode 0xA2)
+    ///
+    /// Receives security protocol data from the device. Used for TCG Opal discovery
+    /// and receiving data from the security subsystem.
+    ///
+    /// # Arguments
+    /// * `controller` - USB controller for transfers
+    /// * `protocol_id` - Security protocol ID (0x00 = enumerate, 0x01 = TCG)
+    /// * `sp_specific` - Protocol-specific parameter (ComID for TCG)
+    /// * `buffer` - Buffer to receive data
+    ///
+    /// # Returns
+    /// Number of bytes received, or error
+    pub fn security_protocol_in(
+        &mut self,
+        controller: &mut dyn UsbController,
+        protocol_id: u8,
+        sp_specific: u16,
+        buffer: &mut [u8],
+    ) -> Result<usize, MassStorageError> {
+        let alloc_len = buffer.len().min(0xFFFFFFFF) as u32;
+        let alloc_bytes = alloc_len.to_be_bytes();
+        let sp_bytes = sp_specific.to_be_bytes();
+
+        // Build SECURITY PROTOCOL IN CDB (12 bytes)
+        let cdb = [
+            0xA2,           // Opcode: SECURITY PROTOCOL IN
+            protocol_id,    // Security Protocol
+            sp_bytes[0],    // Security Protocol Specific (MSB)
+            sp_bytes[1],    // Security Protocol Specific (LSB)
+            0x80,           // INC_512 = 1 (transfer length in 512-byte units)
+            0,              // Reserved
+            alloc_bytes[0], // Allocation Length (MSB)
+            alloc_bytes[1],
+            alloc_bytes[2],
+            alloc_bytes[3], // Allocation Length (LSB)
+            0,              // Reserved
+            0,              // Control
+        ];
+
+        log::debug!(
+            "USB SECURITY PROTOCOL IN: protocol={:#x}, sp_specific={:#x}, len={}",
+            protocol_id,
+            sp_specific,
+            alloc_len
+        );
+
+        self.scsi_command(controller, &cdb, Some(buffer), true)
+    }
+
+    /// SCSI SECURITY PROTOCOL OUT command (opcode 0xB5)
+    ///
+    /// Sends security protocol data to the device. Used for TCG Opal commands
+    /// and configuring the security subsystem.
+    ///
+    /// # Arguments
+    /// * `controller` - USB controller for transfers
+    /// * `protocol_id` - Security protocol ID (0x01 = TCG)
+    /// * `sp_specific` - Protocol-specific parameter (ComID for TCG)
+    /// * `data` - Data to send
+    ///
+    /// # Returns
+    /// Ok on success, or error
+    pub fn security_protocol_out(
+        &mut self,
+        controller: &mut dyn UsbController,
+        protocol_id: u8,
+        sp_specific: u16,
+        data: &[u8],
+    ) -> Result<(), MassStorageError> {
+        let transfer_len = data.len().min(0xFFFFFFFF) as u32;
+        let len_bytes = transfer_len.to_be_bytes();
+        let sp_bytes = sp_specific.to_be_bytes();
+
+        // Build SECURITY PROTOCOL OUT CDB (12 bytes)
+        let cdb = [
+            0xB5,         // Opcode: SECURITY PROTOCOL OUT
+            protocol_id,  // Security Protocol
+            sp_bytes[0],  // Security Protocol Specific (MSB)
+            sp_bytes[1],  // Security Protocol Specific (LSB)
+            0x80,         // INC_512 = 1 (transfer length in 512-byte units)
+            0,            // Reserved
+            len_bytes[0], // Transfer Length (MSB)
+            len_bytes[1],
+            len_bytes[2],
+            len_bytes[3], // Transfer Length (LSB)
+            0,            // Reserved
+            0,            // Control
+        ];
+
+        log::debug!(
+            "USB SECURITY PROTOCOL OUT: protocol={:#x}, sp_specific={:#x}, len={}",
+            protocol_id,
+            sp_specific,
+            transfer_len
+        );
+
+        // For write operations, we need to copy data to a mutable buffer
+        // since scsi_command takes Option<&mut [u8]>
+        let mut buf = [0u8; 4096];
+        let len = data.len().min(buf.len());
+        buf[..len].copy_from_slice(&data[..len]);
+
+        self.scsi_command(controller, &cdb, Some(&mut buf[..len]), false)?;
+        Ok(())
+    }
+
+    /// Execute a raw SCSI command
+    ///
+    /// This is a public wrapper around the internal scsi_command method
+    /// for use by the SCSI Pass Through protocol.
+    ///
+    /// # Arguments
+    /// * `controller` - USB controller for transfers
+    /// * `cdb` - Command Descriptor Block
+    /// * `data` - Optional data buffer (for read or write)
+    /// * `is_read` - True if reading data from device, false if writing
+    ///
+    /// # Returns
+    /// Number of bytes transferred, or error
+    pub fn execute_scsi_command(
+        &mut self,
+        controller: &mut dyn UsbController,
+        cdb: &[u8],
+        data: Option<&mut [u8]>,
+        is_read: bool,
+    ) -> Result<usize, MassStorageError> {
+        self.scsi_command(controller, cdb, data, is_read)
+    }
 }
 
 // ============================================================================

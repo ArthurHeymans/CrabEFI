@@ -317,8 +317,14 @@ pub fn controller_count() -> usize {
 pub fn find_mass_storage() -> Option<(usize, u8)> {
     let controllers = ALL_CONTROLLERS.lock();
 
+    log::debug!("find_mass_storage: checking {} controllers", controllers.len());
+    
     controllers.iter().enumerate().find_map(|(idx, handle)| {
-        let device = with_usb_controller!(handle, |controller| controller.find_mass_storage());
+        let device = with_usb_controller!(handle, |controller| {
+            let result = controller.find_mass_storage();
+            log::debug!("  Controller {}: find_mass_storage() = {:?}", idx, result);
+            result
+        });
         device.map(|addr| (idx, addr))
     })
 }

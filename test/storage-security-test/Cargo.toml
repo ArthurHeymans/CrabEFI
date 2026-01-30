@@ -1,0 +1,16 @@
+[package]
+name = "storage-security-test"
+version = "0.1.0"
+edition = "2021"
+description = "Test EFI application for Storage Security and Pass-Through protocols"
+
+[dependencies]
+r-efi = "5.3"
+
+[profile.release]
+panic = "abort"
+lto = true
+opt-level = "z"
+
+[profile.dev]
+panic = "abort"
