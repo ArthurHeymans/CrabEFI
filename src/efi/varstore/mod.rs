@@ -31,6 +31,7 @@
 //! - **After ExitBootServices**: SPI is locked; write to ESP file instead
 //! - **On Reset**: Read ESP file, authenticate, apply to SPI, delete ESP file
 
+pub mod deferred;
 pub mod persistence;
 
 use alloc::vec;
@@ -39,8 +40,16 @@ use serde::{Deserialize, Serialize};
 
 // Re-export key items from persistence
 pub use persistence::{
-    delete_variable, get_pending_esp_data, init as init_persistence, is_smmstore_initialized,
-    is_spi_available, persist_variable,
+    delete_variable, init as init_persistence, is_smmstore_initialized, is_spi_available,
+    persist_variable,
+};
+
+// Re-export key items from deferred
+pub use deferred::{
+    check_pending as check_deferred_pending, configure_buffer as configure_deferred_buffer,
+    get_stats as get_deferred_stats, init_buffer as init_deferred_buffer,
+    process_pending as process_deferred_pending, DEFAULT_DEFERRED_BUFFER_BASE,
+    DEFERRED_BUFFER_SIZE,
 };
 
 /// Store header magic value: "CRAB" in little-endian

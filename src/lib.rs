@@ -181,11 +181,65 @@ pub fn init(coreboot_table_ptr: u64) {
     // Initialize PCI early so we can detect SPI controller
     drivers::pci::init();
 
+    // Reserve and initialize the deferred variable buffer (for runtime variable persistence)
+    // This buffer survives warm reboot and allows variable changes after ExitBootServices
+    // to be applied on the next boot.
+    {
+        use efi::allocator::{MemoryType, PAGE_SIZE};
+        use efi::varstore::{DEFAULT_DEFERRED_BUFFER_BASE, DEFERRED_BUFFER_SIZE};
+
+        let buffer_pages = (DEFERRED_BUFFER_SIZE as u64 + PAGE_SIZE - 1) / PAGE_SIZE;
+
+        // Reserve the memory region as ReservedMemoryType so the OS won't overwrite it
+        state::with_allocator_mut(|alloc| {
+            if let Err(e) = alloc.reserve_region(
+                DEFAULT_DEFERRED_BUFFER_BASE,
+                buffer_pages,
+                MemoryType::ReservedMemoryType,
+            ) {
+                log::warn!(
+                    "Could not reserve deferred buffer region at {:#x}: {:?}",
+                    DEFAULT_DEFERRED_BUFFER_BASE,
+                    e
+                );
+            } else {
+                log::debug!(
+                    "Reserved {} pages for deferred buffer at {:#x}",
+                    buffer_pages,
+                    DEFAULT_DEFERRED_BUFFER_BASE
+                );
+            }
+        });
+
+    }
+
     // Initialize variable store persistence (loads variables from SPI flash)
     match efi::varstore::init_persistence() {
-        Ok(()) => log::info!("Variable store persistence initialized"),
+        Ok(()) => {
+            log::info!("Variable store persistence initialized");
+
+            // Check for pending deferred writes from previous boot BEFORE clearing the buffer
+            // This must be done after SPI init so we can write to SMMSTORE
+            let pending_count = efi::varstore::check_deferred_pending();
+            if pending_count > 0 {
+                log::info!(
+                    "Found {} pending deferred writes from previous boot",
+                    pending_count
+                );
+
+                // Apply the deferred writes to SPI
+                match efi::varstore::process_deferred_pending() {
+                    Ok(n) => log::info!("Applied {} deferred variable writes", n),
+                    Err(e) => log::warn!("Failed to process deferred writes: {:?}", e),
+                }
+            }
+        }
         Err(e) => log::warn!("Variable store persistence not available: {:?}", e),
     }
+
+    // Now initialize the deferred buffer for this boot session
+    // This clears the buffer so new runtime writes can be accumulated
+    efi::varstore::init_deferred_buffer();
 
     // Initialize storage subsystem
     init_storage();
