@@ -5,7 +5,7 @@
 
 use crate::drivers::pci::{self, PciAddress, PciDevice};
 use crate::efi;
-use crate::time::Timeout;
+use crate::time::{Timeout, wait_for};
 use core::ptr;
 use core::sync::atomic::{Ordering, fence};
 use spin::Mutex;
@@ -569,13 +569,7 @@ impl NvmeController {
         regs.cc.modify(CC::EN::CLEAR);
 
         // Wait for controller to become disabled (up to 1 second)
-        let timeout = Timeout::from_ms(1000);
-        while !timeout.is_expired() {
-            if regs.csts.read(CSTS::RDY) == 0 {
-                break;
-            }
-            core::hint::spin_loop();
-        }
+        wait_for(1000, || regs.csts.read(CSTS::RDY) == 0);
 
         // Set admin queue attributes
         regs.aqa.write(

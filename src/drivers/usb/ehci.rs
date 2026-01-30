@@ -21,15 +21,15 @@
 use crate::arch::x86_64::cache::{flush_cache_range, invalidate_cache_range};
 use crate::drivers::pci::{self, PciAddress, PciDevice};
 use crate::efi;
-use crate::time::Timeout;
+use crate::time::{Timeout, wait_for};
 use core::ptr;
 use core::sync::atomic::{Ordering, fence};
 use tock_registers::interfaces::{ReadWriteable, Readable, Writeable};
 
 use super::controller::{
-    DeviceDescriptor, DeviceInfo, EndpointInfo, HUB_DESCRIPTOR_TYPE, HubDescriptor, SetupPacket,
-    UsbController, UsbDevice, UsbError, UsbSpeed, class, desc_type, hub_feature, hub_port_status,
-    parse_configuration, req_type, request,
+    DeviceInfo, EndpointInfo, HUB_DESCRIPTOR_TYPE, HubDescriptor, SetupPacket, UsbController,
+    UsbDevice, UsbError, UsbSpeed, enumerate_device, hub_feature, hub_port_status, req_type,
+    request,
 };
 
 // Import register definitions from ehci_regs module
@@ -550,30 +550,14 @@ impl EhciController {
         self.op().usbcmd.modify(USBCMD::RS::CLEAR);
 
         // Wait for halt
-        let timeout = Timeout::from_ms(100);
-        while !timeout.is_expired() {
-            if self.op().usbsts.is_set(USBSTS::HCHALTED) {
-                break;
-            }
-            core::hint::spin_loop();
-        }
-
-        if !self.op().usbsts.is_set(USBSTS::HCHALTED) {
+        if !wait_for(100, || self.op().usbsts.is_set(USBSTS::HCHALTED)) {
             log::warn!("EHCI: Controller did not halt");
         }
 
         // Reset the controller
         self.op().usbcmd.write(USBCMD::HCRESET::SET);
 
-        let timeout = Timeout::from_ms(250);
-        while !timeout.is_expired() {
-            if !self.op().usbcmd.is_set(USBCMD::HCRESET) {
-                break;
-            }
-            core::hint::spin_loop();
-        }
-
-        if self.op().usbcmd.is_set(USBCMD::HCRESET) {
+        if !wait_for(250, || !self.op().usbcmd.is_set(USBCMD::HCRESET)) {
             return Err(UsbError::Timeout);
         }
 
@@ -629,15 +613,7 @@ impl EhciController {
             .write(USBCMD::RS::SET + USBCMD::ITC::Micro8);
 
         // Wait for running
-        let timeout = Timeout::from_ms(100);
-        while !timeout.is_expired() {
-            if !self.op().usbsts.is_set(USBSTS::HCHALTED) {
-                break;
-            }
-            core::hint::spin_loop();
-        }
-
-        if self.op().usbsts.is_set(USBSTS::HCHALTED) {
+        if !wait_for(100, || !self.op().usbsts.is_set(USBSTS::HCHALTED)) {
             log::error!("EHCI: Controller did not start");
             return Err(UsbError::Timeout);
         }
@@ -743,116 +719,13 @@ impl EhciController {
             .position(|d| d.is_none())
             .ok_or(UsbError::NoFreeSlots)?;
 
-        let mut device = UsbDevice::new(0, port, speed);
+        // Use the shared enumeration helper
+        let initial_device = UsbDevice::new(0, port, speed);
+        let device = enumerate_device(initial_device, address, |dev, rt, req, val, idx, data| {
+            self.control_transfer_internal(dev, rt, req, val, idx, data)
+        })?;
 
-        // Get initial device descriptor (first 8 bytes)
-        let mut desc_buf = [0u8; 8];
-        self.control_transfer_internal(
-            &device,
-            req_type::DIR_IN | req_type::TYPE_STANDARD | req_type::RCPT_DEVICE,
-            request::GET_DESCRIPTOR,
-            (desc_type::DEVICE as u16) << 8,
-            0,
-            Some(&mut desc_buf),
-        )?;
-
-        device.ep0_max_packet = desc_buf[7].max(8) as u16;
-
-        // Set address
-        self.control_transfer_internal(
-            &device,
-            req_type::DIR_OUT | req_type::TYPE_STANDARD | req_type::RCPT_DEVICE,
-            request::SET_ADDRESS,
-            address as u16,
-            0,
-            None,
-        )?;
-
-        crate::time::delay_ms(2);
-        device.address = address;
         self.next_address += 1;
-
-        // Get full device descriptor
-        let mut desc_buf = [0u8; 18];
-        self.control_transfer_internal(
-            &device,
-            req_type::DIR_IN | req_type::TYPE_STANDARD | req_type::RCPT_DEVICE,
-            request::GET_DESCRIPTOR,
-            (desc_type::DEVICE as u16) << 8,
-            0,
-            Some(&mut desc_buf),
-        )?;
-
-        device.device_desc =
-            unsafe { ptr::read_unaligned(desc_buf.as_ptr() as *const DeviceDescriptor) };
-
-        let vid = { device.device_desc.vendor_id };
-        let pid = { device.device_desc.product_id };
-        log::info!("  Device {}: VID={:04x} PID={:04x}", address, vid, pid);
-
-        // Get configuration descriptor
-        let mut config_buf = [0u8; 256];
-        let mut header = [0u8; 9];
-
-        self.control_transfer_internal(
-            &device,
-            req_type::DIR_IN | req_type::TYPE_STANDARD | req_type::RCPT_DEVICE,
-            request::GET_DESCRIPTOR,
-            (desc_type::CONFIGURATION as u16) << 8,
-            0,
-            Some(&mut header),
-        )?;
-
-        let total_len = u16::from_le_bytes([header[2], header[3]]) as usize;
-        let total_len = total_len.min(config_buf.len());
-
-        self.control_transfer_internal(
-            &device,
-            req_type::DIR_IN | req_type::TYPE_STANDARD | req_type::RCPT_DEVICE,
-            request::GET_DESCRIPTOR,
-            (desc_type::CONFIGURATION as u16) << 8,
-            0,
-            Some(&mut config_buf[..total_len]),
-        )?;
-
-        device.config_info = parse_configuration(&config_buf[..total_len]);
-
-        // Check if this is a hub
-        let device_class = device.device_desc.device_class;
-        if device_class == class::HUB {
-            device.is_hub = true;
-            log::info!("    USB Hub detected");
-        }
-
-        // Find interfaces
-        for iface in &device.config_info.interfaces[..device.config_info.num_interfaces] {
-            if iface.is_mass_storage() {
-                device.is_mass_storage = true;
-                device.bulk_in = iface.find_bulk_in().cloned();
-                device.bulk_out = iface.find_bulk_out().cloned();
-                log::info!("    Mass Storage interface");
-            } else if iface.is_hid_keyboard() {
-                device.is_hid_keyboard = true;
-                device.interrupt_in = iface.find_interrupt_in().cloned();
-                log::info!("    HID Keyboard interface");
-            } else if iface.interface_class == class::HUB {
-                // Hub class in interface descriptor
-                device.is_hub = true;
-                log::info!("    USB Hub interface");
-            }
-        }
-
-        // Set configuration
-        if device.config_info.configuration_value > 0 {
-            self.control_transfer_internal(
-                &device,
-                req_type::DIR_OUT | req_type::TYPE_STANDARD | req_type::RCPT_DEVICE,
-                request::SET_CONFIGURATION,
-                device.config_info.configuration_value as u16,
-                0,
-                None,
-            )?;
-        }
 
         // Store the device
         let is_hub = device.is_hub;
@@ -887,122 +760,13 @@ impl EhciController {
             .position(|d| d.is_none())
             .ok_or(UsbError::NoFreeSlots)?;
 
-        let mut device = UsbDevice::new_on_hub(0, hub_port, speed, hub_addr, hub_port_num);
+        // Use the shared enumeration helper
+        let initial_device = UsbDevice::new_on_hub(0, hub_port, speed, hub_addr, hub_port_num);
+        let device = enumerate_device(initial_device, address, |dev, rt, req, val, idx, data| {
+            self.control_transfer_internal(dev, rt, req, val, idx, data)
+        })?;
 
-        // Get initial device descriptor (first 8 bytes)
-        let mut desc_buf = [0u8; 8];
-        self.control_transfer_internal(
-            &device,
-            req_type::DIR_IN | req_type::TYPE_STANDARD | req_type::RCPT_DEVICE,
-            request::GET_DESCRIPTOR,
-            (desc_type::DEVICE as u16) << 8,
-            0,
-            Some(&mut desc_buf),
-        )?;
-
-        device.ep0_max_packet = desc_buf[7].max(8) as u16;
-
-        // Set address
-        self.control_transfer_internal(
-            &device,
-            req_type::DIR_OUT | req_type::TYPE_STANDARD | req_type::RCPT_DEVICE,
-            request::SET_ADDRESS,
-            address as u16,
-            0,
-            None,
-        )?;
-
-        crate::time::delay_ms(2);
-        device.address = address;
         self.next_address += 1;
-
-        // Get full device descriptor
-        let mut desc_buf = [0u8; 18];
-        self.control_transfer_internal(
-            &device,
-            req_type::DIR_IN | req_type::TYPE_STANDARD | req_type::RCPT_DEVICE,
-            request::GET_DESCRIPTOR,
-            (desc_type::DEVICE as u16) << 8,
-            0,
-            Some(&mut desc_buf),
-        )?;
-
-        device.device_desc =
-            unsafe { ptr::read_unaligned(desc_buf.as_ptr() as *const DeviceDescriptor) };
-
-        let vid = { device.device_desc.vendor_id };
-        let pid = { device.device_desc.product_id };
-        log::info!(
-            "  Device {} (via hub {}:{}): VID={:04x} PID={:04x}",
-            address,
-            hub_addr,
-            hub_port_num,
-            vid,
-            pid
-        );
-
-        // Get configuration descriptor
-        let mut config_buf = [0u8; 256];
-        let mut header = [0u8; 9];
-
-        self.control_transfer_internal(
-            &device,
-            req_type::DIR_IN | req_type::TYPE_STANDARD | req_type::RCPT_DEVICE,
-            request::GET_DESCRIPTOR,
-            (desc_type::CONFIGURATION as u16) << 8,
-            0,
-            Some(&mut header),
-        )?;
-
-        let total_len = u16::from_le_bytes([header[2], header[3]]) as usize;
-        let total_len = total_len.min(config_buf.len());
-
-        self.control_transfer_internal(
-            &device,
-            req_type::DIR_IN | req_type::TYPE_STANDARD | req_type::RCPT_DEVICE,
-            request::GET_DESCRIPTOR,
-            (desc_type::CONFIGURATION as u16) << 8,
-            0,
-            Some(&mut config_buf[..total_len]),
-        )?;
-
-        device.config_info = parse_configuration(&config_buf[..total_len]);
-
-        // Check if this is a hub
-        let device_class = device.device_desc.device_class;
-        if device_class == class::HUB {
-            device.is_hub = true;
-            log::info!("    USB Hub detected (nested)");
-        }
-
-        // Find interfaces
-        for iface in &device.config_info.interfaces[..device.config_info.num_interfaces] {
-            if iface.is_mass_storage() {
-                device.is_mass_storage = true;
-                device.bulk_in = iface.find_bulk_in().cloned();
-                device.bulk_out = iface.find_bulk_out().cloned();
-                log::info!("    Mass Storage interface");
-            } else if iface.is_hid_keyboard() {
-                device.is_hid_keyboard = true;
-                device.interrupt_in = iface.find_interrupt_in().cloned();
-                log::info!("    HID Keyboard interface");
-            } else if iface.interface_class == class::HUB {
-                device.is_hub = true;
-                log::info!("    USB Hub interface");
-            }
-        }
-
-        // Set configuration
-        if device.config_info.configuration_value > 0 {
-            self.control_transfer_internal(
-                &device,
-                req_type::DIR_OUT | req_type::TYPE_STANDARD | req_type::RCPT_DEVICE,
-                request::SET_CONFIGURATION,
-                device.config_info.configuration_value as u16,
-                0,
-                None,
-            )?;
-        }
 
         // Store the device
         let is_hub = device.is_hub;
@@ -1443,15 +1207,7 @@ impl EhciController {
             self.op().usbcmd.modify(USBCMD::ASE::SET);
 
             // Wait for async schedule to become active
-            let timeout = Timeout::from_ms(100);
-            while !timeout.is_expired() {
-                if self.op().usbsts.is_set(USBSTS::ASS) {
-                    break;
-                }
-                crate::time::delay_us(10);
-            }
-
-            if !self.op().usbsts.is_set(USBSTS::ASS) {
+            if !wait_for(100, || self.op().usbsts.is_set(USBSTS::ASS)) {
                 log::error!("EHCI: Async schedule failed to start");
                 // Unlink and return error
                 async_qh.qh_link = old_link;
@@ -1694,13 +1450,8 @@ impl EhciController {
         // Enable async schedule if not already enabled
         if !self.async_schedule_enabled {
             self.op().usbcmd.modify(USBCMD::ASE::SET);
-            let timeout = Timeout::from_ms(100);
-            while !timeout.is_expired() {
-                if self.op().usbsts.is_set(USBSTS::ASS) {
-                    self.async_schedule_enabled = true;
-                    break;
-                }
-                core::hint::spin_loop();
+            if wait_for(100, || self.op().usbsts.is_set(USBSTS::ASS)) {
+                self.async_schedule_enabled = true;
             }
         }
 
@@ -1786,24 +1537,12 @@ impl EhciController {
             .modify(USBCMD::ASE::CLEAR + USBCMD::PSE::CLEAR + USBCMD::RS::CLEAR);
 
         // Wait for halt
-        let timeout = Timeout::from_ms(100);
-        while !timeout.is_expired() {
-            if self.op().usbsts.is_set(USBSTS::HCHALTED) {
-                break;
-            }
-            core::hint::spin_loop();
-        }
+        wait_for(100, || self.op().usbsts.is_set(USBSTS::HCHALTED));
 
         // Reset
         self.op().usbcmd.write(USBCMD::HCRESET::SET);
 
-        let timeout = Timeout::from_ms(250);
-        while !timeout.is_expired() {
-            if !self.op().usbcmd.is_set(USBCMD::HCRESET) {
-                break;
-            }
-            core::hint::spin_loop();
-        }
+        wait_for(250, || !self.op().usbcmd.is_set(USBCMD::HCRESET));
 
         // Clear configure flag
         self.op().configflag.set(0);

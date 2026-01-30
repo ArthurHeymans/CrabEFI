@@ -7,7 +7,7 @@ pub mod regs;
 
 use crate::drivers::pci::{self, PciDevice};
 use crate::efi;
-use crate::time::Timeout;
+use crate::time::{Timeout, wait_for};
 use core::ptr;
 use core::sync::atomic::{Ordering, fence};
 use spin::Mutex;
@@ -320,15 +320,7 @@ impl AhciController {
         hba.ghc.modify(GHC::HR::SET);
 
         // Wait for reset to complete (up to 1 second)
-        let timeout = Timeout::from_ms(1000);
-        while !timeout.is_expired() {
-            if !hba.ghc.is_set(GHC::HR) {
-                break;
-            }
-            crate::time::delay_us(100);
-        }
-
-        if hba.ghc.is_set(GHC::HR) {
+        if !wait_for(1000, || !hba.ghc.is_set(GHC::HR)) {
             log::error!("AHCI: HBA reset didn't complete within 1s");
             return Err(AhciError::Timeout);
         }
@@ -360,13 +352,7 @@ impl AhciController {
             // BIOS owns the HBA
             log::debug!("Performing BIOS/OS handoff...");
             hba.bohc.modify(BOHC::OOS::SET);
-            let timeout = Timeout::from_ms(100);
-            while !timeout.is_expired() {
-                if !hba.bohc.is_set(BOHC::BOS) {
-                    break;
-                }
-                crate::time::delay_us(100);
-            }
+            wait_for(100, || !hba.bohc.is_set(BOHC::BOS));
         }
 
         let mut controller = Self {
@@ -591,27 +577,15 @@ impl AhciController {
         port_regs.cmd.modify(PORT_CMD::ST::CLEAR);
 
         // Wait for CR (Command List Running) to clear
-        let timeout = Timeout::from_ms(1);
-        while !timeout.is_expired() {
-            if !port_regs.cmd.is_set(PORT_CMD::CR) {
-                break;
-            }
-            crate::time::delay_us(1);
-        }
+        wait_for(1, || !port_regs.cmd.is_set(PORT_CMD::CR));
 
         // Clear FRE (FIS Receive Enable) bit
         port_regs.cmd.modify(PORT_CMD::FRE::CLEAR);
 
         // Wait for FR (FIS Receive Running) to clear
-        let timeout = Timeout::from_ms(1);
-        while !timeout.is_expired() {
-            if !port_regs.cmd.is_set(PORT_CMD::FR) {
-                return Ok(());
-            }
-            crate::time::delay_us(1);
+        if !wait_for(1, || !port_regs.cmd.is_set(PORT_CMD::FR)) {
+            log::warn!("AHCI Port {}: Timeout stopping command engine", port_num);
         }
-
-        log::warn!("AHCI Port {}: Timeout stopping command engine", port_num);
         Ok(())
     }
 
@@ -620,13 +594,7 @@ impl AhciController {
         let port_regs = self.port_regs(port_num);
 
         // Wait for CR to clear
-        let timeout = Timeout::from_ms(1);
-        while !timeout.is_expired() {
-            if !port_regs.cmd.is_set(PORT_CMD::CR) {
-                break;
-            }
-            crate::time::delay_us(1);
-        }
+        wait_for(1, || !port_regs.cmd.is_set(PORT_CMD::CR));
 
         // Enable FIS receive
         port_regs.cmd.modify(PORT_CMD::FRE::SET);

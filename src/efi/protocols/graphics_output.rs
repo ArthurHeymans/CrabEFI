@@ -8,6 +8,7 @@ use r_efi::efi::{Guid, Status};
 
 use crate::coreboot::FramebufferInfo;
 use crate::efi::allocator::{MemoryType, allocate_pool};
+use crate::efi::utils::allocate_protocol_with_log;
 use crate::state;
 
 /// EFI_GRAPHICS_OUTPUT_PROTOCOL GUID
@@ -464,13 +465,6 @@ unsafe fn read_pixel_from_fb(
 /// # Returns
 /// A pointer to the GraphicsOutputProtocol, or null on failure
 pub fn create_gop(framebuffer: &FramebufferInfo) -> *mut GraphicsOutputProtocol {
-    // Allocate mode info
-    let mode_info_size = core::mem::size_of::<GopModeInfo>();
-    let mode_info_ptr = match allocate_pool(MemoryType::BootServicesData, mode_info_size) {
-        Ok(p) => p as *mut GopModeInfo,
-        Err(_) => return core::ptr::null_mut(),
-    };
-
     // Determine pixel format based on mask positions
     let (pixel_format, pixel_bitmask) = if framebuffer.bits_per_pixel == 32 {
         if framebuffer.red_mask_pos == 16
@@ -512,56 +506,43 @@ pub fn create_gop(framebuffer: &FramebufferInfo) -> *mut GraphicsOutputProtocol 
         (PixelFormat::BitMask, bitmask)
     };
 
-    // Fill in mode info
-    let mode_info = GopModeInfo {
-        version: 0,
-        horizontal_resolution: framebuffer.x_resolution,
-        vertical_resolution: framebuffer.y_resolution,
-        pixel_format,
-        pixel_information: pixel_bitmask,
-        pixels_per_scan_line: framebuffer.bytes_per_line / (framebuffer.bits_per_pixel as u32 / 8),
-    };
-
-    unsafe {
-        core::ptr::write(mode_info_ptr, mode_info);
+    // Allocate mode info
+    let mode_info_ptr = allocate_protocol_with_log::<GopModeInfo>("GopModeInfo", |m| {
+        m.version = 0;
+        m.horizontal_resolution = framebuffer.x_resolution;
+        m.vertical_resolution = framebuffer.y_resolution;
+        m.pixel_format = pixel_format;
+        m.pixel_information = pixel_bitmask;
+        m.pixels_per_scan_line =
+            framebuffer.bytes_per_line / (framebuffer.bits_per_pixel as u32 / 8);
+    });
+    if mode_info_ptr.is_null() {
+        return core::ptr::null_mut();
     }
 
     // Allocate GOP mode structure
-    let mode_size = core::mem::size_of::<GopMode>();
-    let mode_ptr = match allocate_pool(MemoryType::BootServicesData, mode_size) {
-        Ok(p) => p as *mut GopMode,
-        Err(_) => return core::ptr::null_mut(),
-    };
-
-    let gop_mode = GopMode {
-        max_mode: 1, // We support 1 mode (mode 0)
-        mode: 0,
-        info: mode_info_ptr,
-        size_of_info: mode_info_size,
-        frame_buffer_base: framebuffer.physical_address,
-        frame_buffer_size: framebuffer.size() as usize,
-    };
-
-    unsafe {
-        core::ptr::write(mode_ptr, gop_mode);
+    let mode_ptr = allocate_protocol_with_log::<GopMode>("GopMode", |m| {
+        m.max_mode = 1; // We support 1 mode (mode 0)
+        m.mode = 0;
+        m.info = mode_info_ptr;
+        m.size_of_info = core::mem::size_of::<GopModeInfo>();
+        m.frame_buffer_base = framebuffer.physical_address;
+        m.frame_buffer_size = framebuffer.size() as usize;
+    });
+    if mode_ptr.is_null() {
+        return core::ptr::null_mut();
     }
 
     // Allocate protocol structure
-    let protocol_size = core::mem::size_of::<GraphicsOutputProtocol>();
-    let protocol_ptr = match allocate_pool(MemoryType::BootServicesData, protocol_size) {
-        Ok(p) => p as *mut GraphicsOutputProtocol,
-        Err(_) => return core::ptr::null_mut(),
-    };
-
-    let protocol = GraphicsOutputProtocol {
-        query_mode: gop_query_mode,
-        set_mode: gop_set_mode,
-        blt: gop_blt,
-        mode: mode_ptr,
-    };
-
-    unsafe {
-        core::ptr::write(protocol_ptr, protocol);
+    let protocol_ptr =
+        allocate_protocol_with_log::<GraphicsOutputProtocol>("GraphicsOutputProtocol", |p| {
+            p.query_mode = gop_query_mode;
+            p.set_mode = gop_set_mode;
+            p.blt = gop_blt;
+            p.mode = mode_ptr;
+        });
+    if protocol_ptr.is_null() {
+        return core::ptr::null_mut();
     }
 
     // Store global state for Blt operations

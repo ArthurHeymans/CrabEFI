@@ -340,3 +340,73 @@ impl Timeout {
         diff <= 0
     }
 }
+
+/// Wait for a condition to become true, with timeout
+///
+/// Spins until `condition()` returns `true` or the timeout expires.
+/// Returns `true` if the condition was met, `false` if timeout expired.
+///
+/// # Arguments
+///
+/// * `timeout_ms` - Maximum time to wait in milliseconds
+/// * `condition` - Closure that returns `true` when the wait should end
+///
+/// # Example
+///
+/// ```ignore
+/// // Wait up to 100ms for device to become ready
+/// if !wait_for(100, || device.is_ready()) {
+///     return Err(TimeoutError);
+/// }
+/// ```
+#[inline]
+pub fn wait_for<F>(timeout_ms: u64, condition: F) -> bool
+where
+    F: Fn() -> bool,
+{
+    let timeout = Timeout::from_ms(timeout_ms);
+    while !timeout.is_expired() {
+        if condition() {
+            return true;
+        }
+        core::hint::spin_loop();
+    }
+    false
+}
+
+/// Wait for a condition with a custom action on each iteration
+///
+/// Similar to `wait_for`, but calls `action()` on each loop iteration
+/// before checking the condition. Useful when polling requires side effects.
+///
+/// # Arguments
+///
+/// * `timeout_ms` - Maximum time to wait in milliseconds
+/// * `mut action` - Mutable closure called each iteration (e.g., to read a register)
+/// * `condition` - Closure that checks if the wait should end
+///
+/// # Example
+///
+/// ```ignore
+/// // Poll a register until a bit is set
+/// let mut status = 0u32;
+/// if !wait_for_with(100, || status = read_status(), || status & READY_BIT != 0) {
+///     return Err(TimeoutError);
+/// }
+/// ```
+#[inline]
+pub fn wait_for_with<A, C>(timeout_ms: u64, mut action: A, condition: C) -> bool
+where
+    A: FnMut(),
+    C: Fn() -> bool,
+{
+    let timeout = Timeout::from_ms(timeout_ms);
+    while !timeout.is_expired() {
+        action();
+        if condition() {
+            return true;
+        }
+        core::hint::spin_loop();
+    }
+    false
+}

@@ -10,7 +10,7 @@ use core::ffi::c_void;
 use r_efi::efi::{Guid, Status};
 
 use crate::drivers::serial::{self, COM1};
-use crate::efi::allocator::{MemoryType, allocate_pool};
+use crate::efi::utils::allocate_protocol_with_log;
 
 /// Serial IO Protocol GUID
 /// {BB25CF6F-F1D4-11D2-9A0C-0090273FC1FD}
@@ -294,26 +294,20 @@ static mut SERIAL_MODE: SerialIoMode = SerialIoMode {
 /// # Returns
 /// A pointer to the protocol instance, or null on allocation failure
 pub fn create_protocol() -> *mut Protocol {
-    let size = core::mem::size_of::<Protocol>();
-
-    let ptr = match allocate_pool(MemoryType::BootServicesData, size) {
-        Ok(p) => p as *mut Protocol,
-        Err(_) => {
-            log::error!("Failed to allocate SerialIoProtocol");
-            return core::ptr::null_mut();
-        }
-    };
-
-    unsafe {
-        (*ptr).revision = EFI_SERIAL_IO_PROTOCOL_REVISION1P1;
-        (*ptr).reset = serial_reset;
-        (*ptr).set_attributes = serial_set_attributes;
-        (*ptr).set_control = serial_set_control;
-        (*ptr).get_control = serial_get_control;
-        (*ptr).write = serial_write;
-        (*ptr).read = serial_read;
-        (*ptr).mode = &raw mut SERIAL_MODE;
-        (*ptr).device_type_guid = core::ptr::null(); // No specific device type
+    // SAFETY: The helper already operates within an unsafe block for initialization
+    let ptr = allocate_protocol_with_log::<Protocol>("SerialIoProtocol", |p| {
+        p.revision = EFI_SERIAL_IO_PROTOCOL_REVISION1P1;
+        p.reset = serial_reset;
+        p.set_attributes = serial_set_attributes;
+        p.set_control = serial_set_control;
+        p.get_control = serial_get_control;
+        p.write = serial_write;
+        p.read = serial_read;
+        p.mode = &raw mut SERIAL_MODE;
+        p.device_type_guid = core::ptr::null();
+    });
+    if ptr.is_null() {
+        return ptr;
     }
 
     log::info!("SerialIoProtocol created (COM1 @ {:#x})", COM1);

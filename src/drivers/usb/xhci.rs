@@ -5,7 +5,7 @@
 use crate::drivers::mmio::MmioRegion;
 use crate::drivers::pci::{self, PciAddress, PciDevice};
 use crate::efi;
-use crate::time::Timeout;
+use crate::time::{Timeout, wait_for};
 use core::ptr;
 use core::sync::atomic::{Ordering, fence};
 
@@ -589,42 +589,24 @@ impl XhciController {
     /// Initialize the controller
     fn init(&mut self) -> Result<(), XhciError> {
         // Wait for controller to be ready (up to 100ms)
-        let timeout = Timeout::from_ms(100);
-        while !timeout.is_expired() {
-            let sts = self.read_op_reg(OP_USBSTS);
-            if sts & USBSTS_CNR == 0 {
-                break;
-            }
-            core::hint::spin_loop();
-        }
+        wait_for(100, || self.read_op_reg(OP_USBSTS) & USBSTS_CNR == 0);
 
         // Stop the controller
         let cmd = self.read_op_reg(OP_USBCMD);
         self.write_op_reg(OP_USBCMD, cmd & !USBCMD_RS);
 
         // Wait for halt (up to 100ms)
-        let timeout = Timeout::from_ms(100);
-        while !timeout.is_expired() {
-            let sts = self.read_op_reg(OP_USBSTS);
-            if sts & USBSTS_HCH != 0 {
-                break;
-            }
-            core::hint::spin_loop();
-        }
+        wait_for(100, || self.read_op_reg(OP_USBSTS) & USBSTS_HCH != 0);
 
         // Reset the controller
         self.write_op_reg(OP_USBCMD, USBCMD_HCRST);
 
         // Wait for reset to complete (up to 500ms per USB spec)
-        let timeout = Timeout::from_ms(500);
-        while !timeout.is_expired() {
+        wait_for(500, || {
             let cmd = self.read_op_reg(OP_USBCMD);
             let sts = self.read_op_reg(OP_USBSTS);
-            if cmd & USBCMD_HCRST == 0 && sts & USBSTS_CNR == 0 {
-                break;
-            }
-            core::hint::spin_loop();
-        }
+            cmd & USBCMD_HCRST == 0 && sts & USBSTS_CNR == 0
+        });
 
         // Set max device slots
         self.write_op_reg(OP_CONFIG, self.max_slots as u32);
@@ -674,14 +656,7 @@ impl XhciController {
         self.write_op_reg(OP_USBCMD, cmd | USBCMD_RS);
 
         // Wait for running (up to 100ms)
-        let timeout = Timeout::from_ms(100);
-        while !timeout.is_expired() {
-            let sts = self.read_op_reg(OP_USBSTS);
-            if sts & USBSTS_HCH == 0 {
-                break;
-            }
-            core::hint::spin_loop();
-        }
+        wait_for(100, || self.read_op_reg(OP_USBSTS) & USBSTS_HCH == 0);
 
         log::info!("xHCI controller initialized");
         Ok(())
@@ -1411,27 +1386,17 @@ impl XhciController {
         self.write_op_reg(OP_USBCMD, cmd & !USBCMD_RS);
 
         // Wait for halt (HCH bit set)
-        let timeout = Timeout::from_ms(100);
-        while !timeout.is_expired() {
-            if self.read_op_reg(OP_USBSTS) & USBSTS_HCH != 0 {
-                break;
-            }
-            core::hint::spin_loop();
-        }
+        wait_for(100, || self.read_op_reg(OP_USBSTS) & USBSTS_HCH != 0);
 
         // 2. Reset the controller (optional but helps ensure clean state)
         self.write_op_reg(OP_USBCMD, USBCMD_HCRST);
 
         // Wait for reset to complete (HCRST clears and CNR clears)
-        let timeout = Timeout::from_ms(500);
-        while !timeout.is_expired() {
+        wait_for(500, || {
             let cmd = self.read_op_reg(OP_USBCMD);
             let sts = self.read_op_reg(OP_USBSTS);
-            if (cmd & USBCMD_HCRST) == 0 && (sts & USBSTS_CNR) == 0 {
-                break;
-            }
-            core::hint::spin_loop();
-        }
+            (cmd & USBCMD_HCRST) == 0 && (sts & USBSTS_CNR) == 0
+        });
 
         log::debug!("xHCI cleanup complete");
     }

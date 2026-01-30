@@ -7,7 +7,7 @@
 
 use r_efi::efi::{Guid, PhysicalAddress, Status};
 
-use crate::efi::allocator::{MemoryType, allocate_pool};
+use crate::efi::utils::allocate_protocol_with_log;
 
 /// Memory Attribute Protocol GUID
 /// {f4560cf6-40ec-4b4a-a192-bf1d57d0b189}
@@ -192,20 +192,13 @@ extern "efiapi" fn clear_memory_attributes(
 /// # Returns
 /// A pointer to the protocol instance, or null on allocation failure
 pub fn create_protocol() -> *mut Protocol {
-    let size = core::mem::size_of::<Protocol>();
-
-    let ptr = match allocate_pool(MemoryType::BootServicesData, size) {
-        Ok(p) => p as *mut Protocol,
-        Err(_) => {
-            log::error!("Failed to allocate MemoryAttributeProtocol");
-            return core::ptr::null_mut();
-        }
-    };
-
-    unsafe {
-        (*ptr).get_memory_attributes = get_memory_attributes;
-        (*ptr).set_memory_attributes = set_memory_attributes;
-        (*ptr).clear_memory_attributes = clear_memory_attributes;
+    let ptr = allocate_protocol_with_log::<Protocol>("MemoryAttributeProtocol", |p| {
+        p.get_memory_attributes = get_memory_attributes;
+        p.set_memory_attributes = set_memory_attributes;
+        p.clear_memory_attributes = clear_memory_attributes;
+    });
+    if ptr.is_null() {
+        return ptr;
     }
 
     log::info!("MemoryAttributeProtocol created");

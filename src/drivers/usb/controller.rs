@@ -1087,3 +1087,148 @@ impl InterfaceInfo {
             .find(|ep| ep.transfer_type == EndpointType::Interrupt && ep.direction == Direction::In)
     }
 }
+
+// ============================================================================
+// Device Enumeration Helper
+// ============================================================================
+
+/// Helper for enumerating a newly connected USB device
+///
+/// This function handles the common device enumeration sequence used by all
+/// USB host controllers (EHCI, OHCI, UHCI). It performs the following steps:
+///
+/// 1. Get initial 8-byte device descriptor to discover EP0 max packet size
+/// 2. Assign a device address (SET_ADDRESS)
+/// 3. Get full device descriptor
+/// 4. Get configuration descriptor
+/// 5. Parse configuration to find interfaces and endpoints
+/// 6. Set configuration
+///
+/// # Arguments
+/// * `device` - Pre-created UsbDevice with address=0 and appropriate speed
+/// * `address` - The device address to assign
+/// * `do_control` - Callback to perform a control transfer
+///
+/// # Returns
+/// The fully enumerated UsbDevice on success, or an error
+pub fn enumerate_device<F>(
+    mut device: UsbDevice,
+    address: u8,
+    mut do_control: F,
+) -> Result<UsbDevice, UsbError>
+where
+    F: FnMut(&UsbDevice, u8, u8, u16, u16, Option<&mut [u8]>) -> Result<usize, UsbError>,
+{
+    if address >= 128 {
+        return Err(UsbError::NoFreeSlots);
+    }
+
+    // Step 1: Get initial device descriptor (first 8 bytes) to learn EP0 max packet size
+    let mut desc_buf = [0u8; 8];
+    do_control(
+        &device,
+        req_type::DIR_IN | req_type::TYPE_STANDARD | req_type::RCPT_DEVICE,
+        request::GET_DESCRIPTOR,
+        (desc_type::DEVICE as u16) << 8,
+        0,
+        Some(&mut desc_buf),
+    )?;
+
+    device.ep0_max_packet = desc_buf[7].max(8) as u16;
+
+    // Step 2: Set address
+    do_control(
+        &device,
+        req_type::DIR_OUT | req_type::TYPE_STANDARD | req_type::RCPT_DEVICE,
+        request::SET_ADDRESS,
+        address as u16,
+        0,
+        None,
+    )?;
+
+    crate::time::delay_ms(2);
+    device.address = address;
+
+    // Step 3: Get full device descriptor (18 bytes)
+    let mut desc_buf = [0u8; 18];
+    do_control(
+        &device,
+        req_type::DIR_IN | req_type::TYPE_STANDARD | req_type::RCPT_DEVICE,
+        request::GET_DESCRIPTOR,
+        (desc_type::DEVICE as u16) << 8,
+        0,
+        Some(&mut desc_buf),
+    )?;
+
+    device.device_desc =
+        unsafe { ptr::read_unaligned(desc_buf.as_ptr() as *const DeviceDescriptor) };
+
+    let vid = device.device_desc.vendor_id;
+    let pid = device.device_desc.product_id;
+    log::info!("  Device {}: VID={:04x} PID={:04x}", address, vid, pid);
+
+    // Step 4: Get configuration descriptor
+    let mut config_buf = [0u8; 256];
+    let mut header = [0u8; 9];
+
+    do_control(
+        &device,
+        req_type::DIR_IN | req_type::TYPE_STANDARD | req_type::RCPT_DEVICE,
+        request::GET_DESCRIPTOR,
+        (desc_type::CONFIGURATION as u16) << 8,
+        0,
+        Some(&mut header),
+    )?;
+
+    let total_len = u16::from_le_bytes([header[2], header[3]]) as usize;
+    let total_len = total_len.min(config_buf.len());
+
+    do_control(
+        &device,
+        req_type::DIR_IN | req_type::TYPE_STANDARD | req_type::RCPT_DEVICE,
+        request::GET_DESCRIPTOR,
+        (desc_type::CONFIGURATION as u16) << 8,
+        0,
+        Some(&mut config_buf[..total_len]),
+    )?;
+
+    // Step 5: Parse configuration
+    device.config_info = parse_configuration(&config_buf[..total_len]);
+
+    // Check if this is a hub (device class)
+    if device.device_desc.device_class == class::HUB {
+        device.is_hub = true;
+        log::info!("    USB Hub detected");
+    }
+
+    // Find interfaces and their endpoints
+    for iface in &device.config_info.interfaces[..device.config_info.num_interfaces] {
+        if iface.is_mass_storage() {
+            device.is_mass_storage = true;
+            device.bulk_in = iface.find_bulk_in().cloned();
+            device.bulk_out = iface.find_bulk_out().cloned();
+            log::info!("    Mass Storage interface");
+        } else if iface.is_hid_keyboard() {
+            device.is_hid_keyboard = true;
+            device.interrupt_in = iface.find_interrupt_in().cloned();
+            log::info!("    HID Keyboard interface");
+        } else if iface.interface_class == class::HUB {
+            device.is_hub = true;
+            log::info!("    USB Hub interface");
+        }
+    }
+
+    // Step 6: Set configuration
+    if device.config_info.configuration_value > 0 {
+        do_control(
+            &device,
+            req_type::DIR_OUT | req_type::TYPE_STANDARD | req_type::RCPT_DEVICE,
+            request::SET_CONFIGURATION,
+            device.config_info.configuration_value as u16,
+            0,
+            None,
+        )?;
+    }
+
+    Ok(device)
+}

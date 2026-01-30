@@ -8,7 +8,7 @@ pub mod regs;
 
 use crate::drivers::pci::{self, PciAddress, PciDevice};
 use crate::efi;
-use crate::time::Timeout;
+use crate::time::{Timeout, wait_for};
 use core::ptr;
 use core::sync::atomic::{Ordering, fence};
 use spin::Mutex;
@@ -254,16 +254,13 @@ impl SdhciController {
         regs.software_reset.write(SOFTWARE_RESET::RESET_ALL::SET);
 
         // Wait for reset to complete (up to 100ms)
-        let timeout = Timeout::from_ms(100);
-        while !timeout.is_expired() {
-            if !regs.software_reset.is_set(SOFTWARE_RESET::RESET_ALL) {
-                return Ok(());
-            }
-            core::hint::spin_loop();
+        if !wait_for(100, || {
+            !regs.software_reset.is_set(SOFTWARE_RESET::RESET_ALL)
+        }) {
+            log::error!("SDHCI: Reset timeout");
+            return Err(SdhciError::ResetFailed);
         }
-
-        log::error!("SDHCI: Reset timeout");
-        Err(SdhciError::ResetFailed)
+        Ok(())
     }
 
     /// Reset command line
@@ -271,14 +268,12 @@ impl SdhciController {
         let regs = self.regs();
         regs.software_reset.write(SOFTWARE_RESET::RESET_CMD::SET);
 
-        let timeout = Timeout::from_ms(100);
-        while !timeout.is_expired() {
-            if !regs.software_reset.is_set(SOFTWARE_RESET::RESET_CMD) {
-                return Ok(());
-            }
-            core::hint::spin_loop();
+        if !wait_for(100, || {
+            !regs.software_reset.is_set(SOFTWARE_RESET::RESET_CMD)
+        }) {
+            return Err(SdhciError::ResetFailed);
         }
-        Err(SdhciError::ResetFailed)
+        Ok(())
     }
 
     /// Reset data line
@@ -286,14 +281,12 @@ impl SdhciController {
         let regs = self.regs();
         regs.software_reset.write(SOFTWARE_RESET::RESET_DATA::SET);
 
-        let timeout = Timeout::from_ms(100);
-        while !timeout.is_expired() {
-            if !regs.software_reset.is_set(SOFTWARE_RESET::RESET_DATA) {
-                return Ok(());
-            }
-            core::hint::spin_loop();
+        if !wait_for(100, || {
+            !regs.software_reset.is_set(SOFTWARE_RESET::RESET_DATA)
+        }) {
+            return Err(SdhciError::ResetFailed);
         }
-        Err(SdhciError::ResetFailed)
+        Ok(())
     }
 
     /// Set bus power to 3.3V
@@ -381,21 +374,10 @@ impl SdhciController {
         );
 
         // Wait for internal clock stable
-        let timeout = Timeout::from_ms(20);
-        while !timeout.is_expired() {
-            if regs
-                .clock_control
+        if !wait_for(20, || {
+            regs.clock_control
                 .is_set(CLOCK_CONTROL::INTERNAL_CLK_STABLE)
-            {
-                break;
-            }
-            core::hint::spin_loop();
-        }
-
-        if !regs
-            .clock_control
-            .is_set(CLOCK_CONTROL::INTERNAL_CLK_STABLE)
-        {
+        }) {
             log::error!("SDHCI: Internal clock not stable");
             return Err(SdhciError::ClockFailed);
         }
@@ -441,18 +423,14 @@ impl SdhciController {
     fn wait_inhibit(&self, data: bool) -> Result<(), SdhciError> {
         let regs = self.regs();
 
-        let timeout = Timeout::from_ms(CMD_TIMEOUT_MS);
-        while !timeout.is_expired() {
+        if !wait_for(CMD_TIMEOUT_MS, || {
             let cmd_inhibit = regs.present_state.is_set(PRESENT_STATE::CMD_INHIBIT);
             let dat_inhibit = data && regs.present_state.is_set(PRESENT_STATE::DAT_INHIBIT);
-
-            if !cmd_inhibit && !dat_inhibit {
-                return Ok(());
-            }
-            core::hint::spin_loop();
+            !cmd_inhibit && !dat_inhibit
+        }) {
+            return Err(SdhciError::CommandTimeout);
         }
-
-        Err(SdhciError::CommandTimeout)
+        Ok(())
     }
 
     /// Send a command (without data)

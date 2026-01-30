@@ -36,31 +36,25 @@ pub fn create_loaded_image_protocol(
 ) -> *mut loaded_image::Protocol {
     // We allocate this using the EFI allocator and leak it
     // In a real implementation, this would be freed when the image is unloaded
-    use crate::efi::allocator::{MemoryType, allocate_pool};
+    use crate::efi::utils::allocate_protocol_with_log;
 
-    let size = core::mem::size_of::<loaded_image::Protocol>();
-    let ptr = match allocate_pool(MemoryType::BootServicesData, size) {
-        Ok(p) => p as *mut loaded_image::Protocol,
-        Err(_) => {
-            log::error!("Failed to allocate LoadedImageProtocol");
-            return core::ptr::null_mut();
-        }
-    };
-
-    unsafe {
-        (*ptr).revision = loaded_image::REVISION;
-        (*ptr).parent_handle = parent_handle;
-        (*ptr).system_table = system_table;
-        (*ptr).device_handle = device_handle;
-        (*ptr).file_path = core::ptr::null_mut(); // TODO: Create device path
-        (*ptr).reserved = core::ptr::null_mut();
-        (*ptr).load_options_size = 0;
-        (*ptr).load_options = core::ptr::null_mut();
-        (*ptr).image_base = image_base as *mut c_void;
-        (*ptr).image_size = image_size;
-        (*ptr).image_code_type = r_efi::efi::LOADER_CODE;
-        (*ptr).image_data_type = r_efi::efi::LOADER_DATA;
-        (*ptr).unload = Some(unload_image);
+    let ptr = allocate_protocol_with_log::<loaded_image::Protocol>("LoadedImageProtocol", |p| {
+        p.revision = loaded_image::REVISION;
+        p.parent_handle = parent_handle;
+        p.system_table = system_table;
+        p.device_handle = device_handle;
+        p.file_path = core::ptr::null_mut(); // TODO: Create device path
+        p.reserved = core::ptr::null_mut();
+        p.load_options_size = 0;
+        p.load_options = core::ptr::null_mut();
+        p.image_base = image_base as *mut c_void;
+        p.image_size = image_size;
+        p.image_code_type = r_efi::efi::LOADER_CODE;
+        p.image_data_type = r_efi::efi::LOADER_DATA;
+        p.unload = Some(unload_image);
+    });
+    if ptr.is_null() {
+        return ptr;
     }
 
     log::debug!(

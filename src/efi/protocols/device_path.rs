@@ -58,25 +58,14 @@ pub fn create_hard_drive_device_path(
     };
 
     unsafe {
-        // Initialize HardDriveMedia node
-        (*ptr).hard_drive.header.r#type = TYPE_MEDIA;
-        (*ptr).hard_drive.header.sub_type = Media::SUBTYPE_HARDDRIVE;
-        (*ptr).hard_drive.header.length =
-            (core::mem::size_of::<HardDriveMedia>() as u16).to_le_bytes();
-        (*ptr).hard_drive.partition_number = partition_number;
-        (*ptr).hard_drive.partition_start = partition_start;
-        (*ptr).hard_drive.partition_size = partition_size;
-        (*ptr)
-            .hard_drive
-            .partition_signature
-            .copy_from_slice(partition_guid);
-        (*ptr).hard_drive.partition_format = PARTITION_FORMAT_GPT;
-        (*ptr).hard_drive.signature_type = SIGNATURE_TYPE_GUID;
-
-        // Initialize End node
-        (*ptr).end.header.r#type = TYPE_END;
-        (*ptr).end.header.sub_type = End::SUBTYPE_ENTIRE;
-        (*ptr).end.header.length = (core::mem::size_of::<End>() as u16).to_le_bytes();
+        init_hard_drive_node(
+            core::ptr::addr_of_mut!((*ptr).hard_drive),
+            partition_number,
+            partition_start,
+            partition_size,
+            partition_guid,
+        );
+        init_end_node(core::ptr::addr_of_mut!((*ptr).end));
     }
 
     log::debug!(
@@ -157,6 +146,110 @@ const SUBTYPE_PCI: u8 = 0x01;
 /// PNP ID for PCI root bridge (ACPI HID: PNP0A03 or PNP0A08)
 const EISA_PNP_ID_PCI_ROOT: u32 = 0x0a0341d0; // EISA ID for PNP0A03
 
+// ============================================================================
+// Node Initialization Helpers
+// ============================================================================
+
+/// Initialize an ACPI device path node for the PCI root bridge
+///
+/// # Safety
+/// `node` must point to valid, writable memory of size `AcpiDevicePathNode`
+#[inline]
+unsafe fn init_acpi_node(node: *mut AcpiDevicePathNode, uid: u32) {
+    (*node).r#type = TYPE_ACPI;
+    (*node).sub_type = SUBTYPE_ACPI;
+    (*node).length = (core::mem::size_of::<AcpiDevicePathNode>() as u16).to_le_bytes();
+    (*node).hid = EISA_PNP_ID_PCI_ROOT;
+    (*node).uid = uid;
+}
+
+/// Initialize a PCI device path node
+///
+/// # Safety
+/// `node` must point to valid, writable memory of size `PciDevicePathNode`
+#[inline]
+unsafe fn init_pci_node(node: *mut PciDevicePathNode, device: u8, function: u8) {
+    (*node).r#type = TYPE_HARDWARE;
+    (*node).sub_type = SUBTYPE_PCI;
+    (*node).length = (core::mem::size_of::<PciDevicePathNode>() as u16).to_le_bytes();
+    (*node).device = device;
+    (*node).function = function;
+}
+
+/// Initialize an End device path node
+///
+/// # Safety
+/// `node` must point to valid, writable memory of size `End`
+#[inline]
+unsafe fn init_end_node(node: *mut End) {
+    (*node).header.r#type = TYPE_END;
+    (*node).header.sub_type = End::SUBTYPE_ENTIRE;
+    (*node).header.length = (core::mem::size_of::<End>() as u16).to_le_bytes();
+}
+
+/// Initialize a HardDrive (partition) device path node
+///
+/// # Safety
+/// `node` must point to valid, writable memory of size `HardDriveMedia`
+#[inline]
+unsafe fn init_hard_drive_node(
+    node: *mut HardDriveMedia,
+    partition_number: u32,
+    partition_start: u64,
+    partition_size: u64,
+    partition_guid: &[u8; 16],
+) {
+    (*node).header.r#type = TYPE_MEDIA;
+    (*node).header.sub_type = Media::SUBTYPE_HARDDRIVE;
+    (*node).header.length = (core::mem::size_of::<HardDriveMedia>() as u16).to_le_bytes();
+    (*node).partition_number = partition_number;
+    (*node).partition_start = partition_start;
+    (*node).partition_size = partition_size;
+    (*node).partition_signature.copy_from_slice(partition_guid);
+    (*node).partition_format = PARTITION_FORMAT_GPT;
+    (*node).signature_type = SIGNATURE_TYPE_GUID;
+}
+
+/// Initialize a USB device path node
+///
+/// # Safety
+/// `node` must point to valid, writable memory of size `UsbDevicePathNode`
+#[inline]
+unsafe fn init_usb_node(node: *mut UsbDevicePathNode, port: u8, interface: u8) {
+    (*node).r#type = TYPE_MESSAGING;
+    (*node).sub_type = SUBTYPE_USB;
+    (*node).length = (core::mem::size_of::<UsbDevicePathNode>() as u16).to_le_bytes();
+    (*node).parent_port = port;
+    (*node).interface = interface;
+}
+
+/// Initialize an NVMe device path node
+///
+/// # Safety
+/// `node` must point to valid, writable memory of size `NvmeDevicePathNode`
+#[inline]
+unsafe fn init_nvme_node(node: *mut NvmeDevicePathNode, namespace_id: u32) {
+    (*node).r#type = TYPE_MESSAGING;
+    (*node).sub_type = SUBTYPE_NVME;
+    (*node).length = (core::mem::size_of::<NvmeDevicePathNode>() as u16).to_le_bytes();
+    (*node).namespace_id = namespace_id;
+    (*node).eui64 = [0; 8]; // EUI-64 is optional, use zeros
+}
+
+/// Initialize a SATA device path node
+///
+/// # Safety
+/// `node` must point to valid, writable memory of size `SataDevicePathNode`
+#[inline]
+unsafe fn init_sata_node(node: *mut SataDevicePathNode, port: u16) {
+    (*node).r#type = TYPE_MESSAGING;
+    (*node).sub_type = SUBTYPE_SATA;
+    (*node).length = (core::mem::size_of::<SataDevicePathNode>() as u16).to_le_bytes();
+    (*node).hba_port = port;
+    (*node).port_multiplier_port = 0xFFFF; // No port multiplier
+    (*node).lun = 0;
+}
+
 /// Create a device path for a USB mass storage device (whole disk)
 ///
 /// Creates a device path: ACPI(PNP0A03,0)/PCI(dev,func)/USB(port,0)/End
@@ -180,31 +273,14 @@ pub fn create_usb_device_path(pci_device: u8, pci_function: u8, usb_port: u8) ->
     };
 
     unsafe {
-        // ACPI node for PCI root bridge
-        (*ptr).acpi.r#type = TYPE_ACPI;
-        (*ptr).acpi.sub_type = SUBTYPE_ACPI;
-        (*ptr).acpi.length = (core::mem::size_of::<AcpiDevicePathNode>() as u16).to_le_bytes();
-        (*ptr).acpi.hid = EISA_PNP_ID_PCI_ROOT;
-        (*ptr).acpi.uid = 0;
-
-        // PCI node for xHCI controller
-        (*ptr).pci.r#type = TYPE_HARDWARE;
-        (*ptr).pci.sub_type = SUBTYPE_PCI;
-        (*ptr).pci.length = (core::mem::size_of::<PciDevicePathNode>() as u16).to_le_bytes();
-        (*ptr).pci.function = pci_function;
-        (*ptr).pci.device = pci_device;
-
-        // USB node
-        (*ptr).usb.r#type = TYPE_MESSAGING;
-        (*ptr).usb.sub_type = SUBTYPE_USB;
-        (*ptr).usb.length = (core::mem::size_of::<UsbDevicePathNode>() as u16).to_le_bytes();
-        (*ptr).usb.parent_port = usb_port;
-        (*ptr).usb.interface = 0;
-
-        // End node
-        (*ptr).end.header.r#type = TYPE_END;
-        (*ptr).end.header.sub_type = End::SUBTYPE_ENTIRE;
-        (*ptr).end.header.length = (core::mem::size_of::<End>() as u16).to_le_bytes();
+        init_acpi_node(core::ptr::addr_of_mut!((*ptr).acpi), 0);
+        init_pci_node(
+            core::ptr::addr_of_mut!((*ptr).pci),
+            pci_device,
+            pci_function,
+        );
+        init_usb_node(core::ptr::addr_of_mut!((*ptr).usb), usb_port, 0);
+        init_end_node(core::ptr::addr_of_mut!((*ptr).end));
     }
 
     log::debug!(
@@ -268,46 +344,21 @@ pub fn create_usb_partition_device_path(
     };
 
     unsafe {
-        // ACPI node for PCI root bridge
-        (*ptr).acpi.r#type = TYPE_ACPI;
-        (*ptr).acpi.sub_type = SUBTYPE_ACPI;
-        (*ptr).acpi.length = (core::mem::size_of::<AcpiDevicePathNode>() as u16).to_le_bytes();
-        (*ptr).acpi.hid = EISA_PNP_ID_PCI_ROOT;
-        (*ptr).acpi.uid = 0;
-
-        // PCI node for xHCI controller
-        (*ptr).pci.r#type = TYPE_HARDWARE;
-        (*ptr).pci.sub_type = SUBTYPE_PCI;
-        (*ptr).pci.length = (core::mem::size_of::<PciDevicePathNode>() as u16).to_le_bytes();
-        (*ptr).pci.function = pci_function;
-        (*ptr).pci.device = pci_device;
-
-        // USB node
-        (*ptr).usb.r#type = TYPE_MESSAGING;
-        (*ptr).usb.sub_type = SUBTYPE_USB;
-        (*ptr).usb.length = (core::mem::size_of::<UsbDevicePathNode>() as u16).to_le_bytes();
-        (*ptr).usb.parent_port = usb_port;
-        (*ptr).usb.interface = 0;
-
-        // HardDrive node for partition
-        (*ptr).hard_drive.header.r#type = TYPE_MEDIA;
-        (*ptr).hard_drive.header.sub_type = Media::SUBTYPE_HARDDRIVE;
-        (*ptr).hard_drive.header.length =
-            (core::mem::size_of::<HardDriveMedia>() as u16).to_le_bytes();
-        (*ptr).hard_drive.partition_number = partition_number;
-        (*ptr).hard_drive.partition_start = partition_start;
-        (*ptr).hard_drive.partition_size = partition_size;
-        (*ptr)
-            .hard_drive
-            .partition_signature
-            .copy_from_slice(partition_guid);
-        (*ptr).hard_drive.partition_format = PARTITION_FORMAT_GPT;
-        (*ptr).hard_drive.signature_type = SIGNATURE_TYPE_GUID;
-
-        // End node
-        (*ptr).end.header.r#type = TYPE_END;
-        (*ptr).end.header.sub_type = End::SUBTYPE_ENTIRE;
-        (*ptr).end.header.length = (core::mem::size_of::<End>() as u16).to_le_bytes();
+        init_acpi_node(core::ptr::addr_of_mut!((*ptr).acpi), 0);
+        init_pci_node(
+            core::ptr::addr_of_mut!((*ptr).pci),
+            pci_device,
+            pci_function,
+        );
+        init_usb_node(core::ptr::addr_of_mut!((*ptr).usb), usb_port, 0);
+        init_hard_drive_node(
+            core::ptr::addr_of_mut!((*ptr).hard_drive),
+            partition_number,
+            partition_start,
+            partition_size,
+            partition_guid,
+        );
+        init_end_node(core::ptr::addr_of_mut!((*ptr).end));
     }
 
     log::debug!(
@@ -421,31 +472,14 @@ pub fn create_nvme_device_path(
     };
 
     unsafe {
-        // ACPI node for PCI root bridge
-        (*ptr).acpi.r#type = TYPE_ACPI;
-        (*ptr).acpi.sub_type = SUBTYPE_ACPI;
-        (*ptr).acpi.length = (core::mem::size_of::<AcpiDevicePathNode>() as u16).to_le_bytes();
-        (*ptr).acpi.hid = EISA_PNP_ID_PCI_ROOT;
-        (*ptr).acpi.uid = 0;
-
-        // PCI node for NVMe controller
-        (*ptr).pci.r#type = TYPE_HARDWARE;
-        (*ptr).pci.sub_type = SUBTYPE_PCI;
-        (*ptr).pci.length = (core::mem::size_of::<PciDevicePathNode>() as u16).to_le_bytes();
-        (*ptr).pci.function = pci_function;
-        (*ptr).pci.device = pci_device;
-
-        // NVMe namespace node
-        (*ptr).nvme.r#type = TYPE_MESSAGING;
-        (*ptr).nvme.sub_type = SUBTYPE_NVME;
-        (*ptr).nvme.length = (core::mem::size_of::<NvmeDevicePathNode>() as u16).to_le_bytes();
-        (*ptr).nvme.namespace_id = namespace_id;
-        (*ptr).nvme.eui64 = [0; 8]; // EUI-64 is optional, use zeros
-
-        // End node
-        (*ptr).end.header.r#type = TYPE_END;
-        (*ptr).end.header.sub_type = End::SUBTYPE_ENTIRE;
-        (*ptr).end.header.length = (core::mem::size_of::<End>() as u16).to_le_bytes();
+        init_acpi_node(core::ptr::addr_of_mut!((*ptr).acpi), 0);
+        init_pci_node(
+            core::ptr::addr_of_mut!((*ptr).pci),
+            pci_device,
+            pci_function,
+        );
+        init_nvme_node(core::ptr::addr_of_mut!((*ptr).nvme), namespace_id);
+        init_end_node(core::ptr::addr_of_mut!((*ptr).end));
     }
 
     log::debug!(
@@ -496,46 +530,21 @@ pub fn create_nvme_partition_device_path(
     };
 
     unsafe {
-        // ACPI node for PCI root bridge
-        (*ptr).acpi.r#type = TYPE_ACPI;
-        (*ptr).acpi.sub_type = SUBTYPE_ACPI;
-        (*ptr).acpi.length = (core::mem::size_of::<AcpiDevicePathNode>() as u16).to_le_bytes();
-        (*ptr).acpi.hid = EISA_PNP_ID_PCI_ROOT;
-        (*ptr).acpi.uid = 0;
-
-        // PCI node for NVMe controller
-        (*ptr).pci.r#type = TYPE_HARDWARE;
-        (*ptr).pci.sub_type = SUBTYPE_PCI;
-        (*ptr).pci.length = (core::mem::size_of::<PciDevicePathNode>() as u16).to_le_bytes();
-        (*ptr).pci.function = pci_function;
-        (*ptr).pci.device = pci_device;
-
-        // NVMe namespace node
-        (*ptr).nvme.r#type = TYPE_MESSAGING;
-        (*ptr).nvme.sub_type = SUBTYPE_NVME;
-        (*ptr).nvme.length = (core::mem::size_of::<NvmeDevicePathNode>() as u16).to_le_bytes();
-        (*ptr).nvme.namespace_id = namespace_id;
-        (*ptr).nvme.eui64 = [0; 8]; // EUI-64 is optional, use zeros
-
-        // HardDrive node for partition
-        (*ptr).hard_drive.header.r#type = TYPE_MEDIA;
-        (*ptr).hard_drive.header.sub_type = Media::SUBTYPE_HARDDRIVE;
-        (*ptr).hard_drive.header.length =
-            (core::mem::size_of::<HardDriveMedia>() as u16).to_le_bytes();
-        (*ptr).hard_drive.partition_number = partition_number;
-        (*ptr).hard_drive.partition_start = partition_start;
-        (*ptr).hard_drive.partition_size = partition_size;
-        (*ptr)
-            .hard_drive
-            .partition_signature
-            .copy_from_slice(partition_guid);
-        (*ptr).hard_drive.partition_format = PARTITION_FORMAT_GPT;
-        (*ptr).hard_drive.signature_type = SIGNATURE_TYPE_GUID;
-
-        // End node
-        (*ptr).end.header.r#type = TYPE_END;
-        (*ptr).end.header.sub_type = End::SUBTYPE_ENTIRE;
-        (*ptr).end.header.length = (core::mem::size_of::<End>() as u16).to_le_bytes();
+        init_acpi_node(core::ptr::addr_of_mut!((*ptr).acpi), 0);
+        init_pci_node(
+            core::ptr::addr_of_mut!((*ptr).pci),
+            pci_device,
+            pci_function,
+        );
+        init_nvme_node(core::ptr::addr_of_mut!((*ptr).nvme), namespace_id);
+        init_hard_drive_node(
+            core::ptr::addr_of_mut!((*ptr).hard_drive),
+            partition_number,
+            partition_start,
+            partition_size,
+            partition_guid,
+        );
+        init_end_node(core::ptr::addr_of_mut!((*ptr).end));
     }
 
     log::debug!(
@@ -614,32 +623,14 @@ pub fn create_sata_device_path(pci_device: u8, pci_function: u8, port: u16) -> *
     };
 
     unsafe {
-        // ACPI node for PCI root bridge
-        (*ptr).acpi.r#type = TYPE_ACPI;
-        (*ptr).acpi.sub_type = SUBTYPE_ACPI;
-        (*ptr).acpi.length = (core::mem::size_of::<AcpiDevicePathNode>() as u16).to_le_bytes();
-        (*ptr).acpi.hid = EISA_PNP_ID_PCI_ROOT;
-        (*ptr).acpi.uid = 0;
-
-        // PCI node for AHCI controller
-        (*ptr).pci.r#type = TYPE_HARDWARE;
-        (*ptr).pci.sub_type = SUBTYPE_PCI;
-        (*ptr).pci.length = (core::mem::size_of::<PciDevicePathNode>() as u16).to_le_bytes();
-        (*ptr).pci.function = pci_function;
-        (*ptr).pci.device = pci_device;
-
-        // SATA node
-        (*ptr).sata.r#type = TYPE_MESSAGING;
-        (*ptr).sata.sub_type = SUBTYPE_SATA;
-        (*ptr).sata.length = (core::mem::size_of::<SataDevicePathNode>() as u16).to_le_bytes();
-        (*ptr).sata.hba_port = port;
-        (*ptr).sata.port_multiplier_port = 0xFFFF; // No port multiplier
-        (*ptr).sata.lun = 0;
-
-        // End node
-        (*ptr).end.header.r#type = TYPE_END;
-        (*ptr).end.header.sub_type = End::SUBTYPE_ENTIRE;
-        (*ptr).end.header.length = (core::mem::size_of::<End>() as u16).to_le_bytes();
+        init_acpi_node(core::ptr::addr_of_mut!((*ptr).acpi), 0);
+        init_pci_node(
+            core::ptr::addr_of_mut!((*ptr).pci),
+            pci_device,
+            pci_function,
+        );
+        init_sata_node(core::ptr::addr_of_mut!((*ptr).sata), port);
+        init_end_node(core::ptr::addr_of_mut!((*ptr).end));
     }
 
     log::debug!(
@@ -687,47 +678,21 @@ pub fn create_sata_partition_device_path(
     };
 
     unsafe {
-        // ACPI node for PCI root bridge
-        (*ptr).acpi.r#type = TYPE_ACPI;
-        (*ptr).acpi.sub_type = SUBTYPE_ACPI;
-        (*ptr).acpi.length = (core::mem::size_of::<AcpiDevicePathNode>() as u16).to_le_bytes();
-        (*ptr).acpi.hid = EISA_PNP_ID_PCI_ROOT;
-        (*ptr).acpi.uid = 0;
-
-        // PCI node for AHCI controller
-        (*ptr).pci.r#type = TYPE_HARDWARE;
-        (*ptr).pci.sub_type = SUBTYPE_PCI;
-        (*ptr).pci.length = (core::mem::size_of::<PciDevicePathNode>() as u16).to_le_bytes();
-        (*ptr).pci.function = pci_function;
-        (*ptr).pci.device = pci_device;
-
-        // SATA node
-        (*ptr).sata.r#type = TYPE_MESSAGING;
-        (*ptr).sata.sub_type = SUBTYPE_SATA;
-        (*ptr).sata.length = (core::mem::size_of::<SataDevicePathNode>() as u16).to_le_bytes();
-        (*ptr).sata.hba_port = port;
-        (*ptr).sata.port_multiplier_port = 0xFFFF; // No port multiplier
-        (*ptr).sata.lun = 0;
-
-        // HardDrive node for partition
-        (*ptr).hard_drive.header.r#type = TYPE_MEDIA;
-        (*ptr).hard_drive.header.sub_type = Media::SUBTYPE_HARDDRIVE;
-        (*ptr).hard_drive.header.length =
-            (core::mem::size_of::<HardDriveMedia>() as u16).to_le_bytes();
-        (*ptr).hard_drive.partition_number = partition_number;
-        (*ptr).hard_drive.partition_start = partition_start;
-        (*ptr).hard_drive.partition_size = partition_size;
-        (*ptr)
-            .hard_drive
-            .partition_signature
-            .copy_from_slice(partition_guid);
-        (*ptr).hard_drive.partition_format = PARTITION_FORMAT_GPT;
-        (*ptr).hard_drive.signature_type = SIGNATURE_TYPE_GUID;
-
-        // End node
-        (*ptr).end.header.r#type = TYPE_END;
-        (*ptr).end.header.sub_type = End::SUBTYPE_ENTIRE;
-        (*ptr).end.header.length = (core::mem::size_of::<End>() as u16).to_le_bytes();
+        init_acpi_node(core::ptr::addr_of_mut!((*ptr).acpi), 0);
+        init_pci_node(
+            core::ptr::addr_of_mut!((*ptr).pci),
+            pci_device,
+            pci_function,
+        );
+        init_sata_node(core::ptr::addr_of_mut!((*ptr).sata), port);
+        init_hard_drive_node(
+            core::ptr::addr_of_mut!((*ptr).hard_drive),
+            partition_number,
+            partition_start,
+            partition_size,
+            partition_guid,
+        );
+        init_end_node(core::ptr::addr_of_mut!((*ptr).end));
     }
 
     log::debug!(
@@ -833,16 +798,8 @@ pub fn create_video_device_path() -> *mut Protocol {
     unsafe {
         // ACPI node - using PCI root bridge HID
         // In a real system this would point to the actual GPU
-        (*ptr).acpi.r#type = TYPE_ACPI;
-        (*ptr).acpi.sub_type = SUBTYPE_ACPI;
-        (*ptr).acpi.length = (core::mem::size_of::<AcpiDevicePathNode>() as u16).to_le_bytes();
-        (*ptr).acpi.hid = EISA_PNP_ID_PCI_ROOT; // PNP0A03
-        (*ptr).acpi.uid = 0;
-
-        // End node
-        (*ptr).end.header.r#type = TYPE_END;
-        (*ptr).end.header.sub_type = End::SUBTYPE_ENTIRE;
-        (*ptr).end.header.length = (core::mem::size_of::<End>() as u16).to_le_bytes();
+        init_acpi_node(core::ptr::addr_of_mut!((*ptr).acpi), 0);
+        init_end_node(core::ptr::addr_of_mut!((*ptr).end));
     }
 
     log::debug!("Created video device path: ACPI(PNP0A03,0)");

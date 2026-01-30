@@ -10,13 +10,13 @@
 use crate::drivers::mmio::MmioRegion;
 use crate::drivers::pci::{self, PciAddress, PciDevice};
 use crate::efi;
-use crate::time::Timeout;
+use crate::time::{Timeout, wait_for};
 use core::ptr;
 use core::sync::atomic::{Ordering, fence};
 
 use super::controller::{
-    DeviceDescriptor, DeviceInfo, Direction, EndpointInfo, SetupPacket, UsbController, UsbDevice,
-    UsbError, UsbSpeed, desc_type, parse_configuration, req_type, request,
+    DeviceInfo, Direction, EndpointInfo, SetupPacket, UsbController, UsbDevice, UsbError, UsbSpeed,
+    enumerate_device,
 };
 
 // ============================================================================
@@ -500,14 +500,9 @@ impl OhciController {
         if (control & hccontrol::IR) != 0 {
             // Request ownership
             self.write_reg(regs::HCCOMMANDSTATUS, hccommandstatus::OCR);
-
-            let timeout = Timeout::from_ms(500);
-            while !timeout.is_expired() {
-                if (self.read_reg(regs::HCCONTROL) & hccontrol::IR) == 0 {
-                    break;
-                }
-                core::hint::spin_loop();
-            }
+            wait_for(500, || {
+                (self.read_reg(regs::HCCONTROL) & hccontrol::IR) == 0
+            });
         }
 
         // Determine current state
@@ -522,15 +517,9 @@ impl OhciController {
         // Reset the controller
         self.write_reg(regs::HCCOMMANDSTATUS, hccommandstatus::HCR);
 
-        let timeout = Timeout::from_ms(100);
-        while !timeout.is_expired() {
-            if (self.read_reg(regs::HCCOMMANDSTATUS) & hccommandstatus::HCR) == 0 {
-                break;
-            }
-            core::hint::spin_loop();
-        }
-
-        if (self.read_reg(regs::HCCOMMANDSTATUS) & hccommandstatus::HCR) != 0 {
+        if !wait_for(100, || {
+            (self.read_reg(regs::HCCOMMANDSTATUS) & hccommandstatus::HCR) == 0
+        }) {
             return Err(UsbError::Timeout);
         }
 
@@ -606,14 +595,7 @@ impl OhciController {
             self.write_port_reg(port, rhportstatus::PRS);
 
             // Wait for reset complete
-            let timeout = Timeout::from_ms(100);
-            while !timeout.is_expired() {
-                let portsc = self.read_port_reg(port);
-                if (portsc & rhportstatus::PRS) == 0 {
-                    break;
-                }
-                core::hint::spin_loop();
-            }
+            wait_for(100, || (self.read_port_reg(port) & rhportstatus::PRS) == 0);
 
             crate::time::delay_ms(10); // Recovery time
 
@@ -655,107 +637,18 @@ impl OhciController {
             .position(|d| d.is_none())
             .ok_or(UsbError::NoFreeSlots)?;
 
-        let mut device = UsbDevice::new(0, port, speed);
+        let initial_device = UsbDevice::new(0, port, speed);
 
-        // Get initial device descriptor (8 bytes)
-        let mut desc_buf = [0u8; 8];
-        self.control_transfer_internal(
-            &device,
-            req_type::DIR_IN | req_type::TYPE_STANDARD | req_type::RCPT_DEVICE,
-            request::GET_DESCRIPTOR,
-            (desc_type::DEVICE as u16) << 8,
-            0,
-            Some(&mut desc_buf),
+        // Use the common enumeration helper with a closure for control transfers
+        let device = enumerate_device(
+            initial_device,
+            address,
+            |dev, req_type, req, value, index, data| {
+                self.control_transfer_internal(dev, req_type, req, value, index, data)
+            },
         )?;
 
-        device.ep0_max_packet = desc_buf[7].max(8) as u16;
-
-        // Set address
-        self.control_transfer_internal(
-            &device,
-            req_type::DIR_OUT | req_type::TYPE_STANDARD | req_type::RCPT_DEVICE,
-            request::SET_ADDRESS,
-            address as u16,
-            0,
-            None,
-        )?;
-
-        crate::time::delay_ms(2);
-        device.address = address;
         self.next_address += 1;
-
-        // Get full device descriptor
-        let mut desc_buf = [0u8; 18];
-        self.control_transfer_internal(
-            &device,
-            req_type::DIR_IN | req_type::TYPE_STANDARD | req_type::RCPT_DEVICE,
-            request::GET_DESCRIPTOR,
-            (desc_type::DEVICE as u16) << 8,
-            0,
-            Some(&mut desc_buf),
-        )?;
-
-        device.device_desc =
-            unsafe { ptr::read_unaligned(desc_buf.as_ptr() as *const DeviceDescriptor) };
-
-        // Copy fields to avoid unaligned access on packed struct
-        let vid = { device.device_desc.vendor_id };
-        let pid = { device.device_desc.product_id };
-        log::info!("  Device {}: VID={:04x} PID={:04x}", address, vid, pid);
-
-        // Get configuration descriptor
-        let mut config_buf = [0u8; 256];
-        let mut header = [0u8; 9];
-
-        self.control_transfer_internal(
-            &device,
-            req_type::DIR_IN | req_type::TYPE_STANDARD | req_type::RCPT_DEVICE,
-            request::GET_DESCRIPTOR,
-            (desc_type::CONFIGURATION as u16) << 8,
-            0,
-            Some(&mut header),
-        )?;
-
-        let total_len = u16::from_le_bytes([header[2], header[3]]) as usize;
-        let total_len = total_len.min(config_buf.len());
-
-        self.control_transfer_internal(
-            &device,
-            req_type::DIR_IN | req_type::TYPE_STANDARD | req_type::RCPT_DEVICE,
-            request::GET_DESCRIPTOR,
-            (desc_type::CONFIGURATION as u16) << 8,
-            0,
-            Some(&mut config_buf[..total_len]),
-        )?;
-
-        device.config_info = parse_configuration(&config_buf[..total_len]);
-
-        // Find interfaces
-        for iface in &device.config_info.interfaces[..device.config_info.num_interfaces] {
-            if iface.is_mass_storage() {
-                device.is_mass_storage = true;
-                device.bulk_in = iface.find_bulk_in().cloned();
-                device.bulk_out = iface.find_bulk_out().cloned();
-                log::info!("    Mass Storage interface");
-            } else if iface.is_hid_keyboard() {
-                device.is_hid_keyboard = true;
-                device.interrupt_in = iface.find_interrupt_in().cloned();
-                log::info!("    HID Keyboard interface");
-            }
-        }
-
-        // Set configuration
-        if device.config_info.configuration_value > 0 {
-            self.control_transfer_internal(
-                &device,
-                req_type::DIR_OUT | req_type::TYPE_STANDARD | req_type::RCPT_DEVICE,
-                request::SET_CONFIGURATION,
-                device.config_info.configuration_value as u16,
-                0,
-                None,
-            )?;
-        }
-
         self.devices[slot] = Some(device);
         Ok(())
     }
