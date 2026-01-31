@@ -455,7 +455,21 @@ impl VariableRecord {
 
     /// Deserialize a record from bytes
     pub fn deserialize(bytes: &[u8]) -> Result<Self> {
-        postcard::from_bytes(bytes).map_err(|_| VarStoreError::SerdeError)
+        match postcard::from_bytes(bytes) {
+            Ok(record) => Ok(record),
+            Err(e) => {
+                // Log first few bytes to help debug
+                if bytes.len() >= 8 {
+                    log::debug!(
+                        "postcard deserialize error at bytes: {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x}... err={:?}",
+                        bytes[0], bytes[1], bytes[2], bytes[3],
+                        bytes[4], bytes[5], bytes[6], bytes[7],
+                        e
+                    );
+                }
+                Err(VarStoreError::SerdeError)
+            }
+        }
     }
 
     /// Get the timestamp from this record
