@@ -39,6 +39,7 @@ pub mod amd;
 pub mod amd_chipsets;
 pub mod intel;
 pub mod intel_chipsets;
+pub mod qemu;
 pub mod regs;
 
 use crate::drivers::pci::{self, PciDevice};
@@ -105,6 +106,7 @@ pub enum SpiMode {
 pub enum ChipsetVendor {
     Intel,
     Amd,
+    Qemu,
 }
 
 /// Information about a detected chipset
@@ -149,10 +151,11 @@ pub trait SpiController {
     fn mode(&self) -> SpiMode;
 }
 
-/// Enum containing either Intel or AMD SPI controller
+/// Enum containing Intel, AMD, or QEMU SPI controller
 pub enum AnySpiController {
     Intel(intel::IntelSpiController),
     Amd(amd::AmdSpi100Controller),
+    Qemu(qemu::QemuPflashController),
 }
 
 impl SpiController for AnySpiController {
@@ -160,6 +163,7 @@ impl SpiController for AnySpiController {
         match self {
             Self::Intel(c) => c.name(),
             Self::Amd(c) => c.name(),
+            Self::Qemu(c) => c.name(),
         }
     }
 
@@ -167,6 +171,7 @@ impl SpiController for AnySpiController {
         match self {
             Self::Intel(c) => c.is_locked(),
             Self::Amd(c) => c.is_locked(),
+            Self::Qemu(c) => c.is_locked(),
         }
     }
 
@@ -174,6 +179,7 @@ impl SpiController for AnySpiController {
         match self {
             Self::Intel(c) => c.writes_enabled(),
             Self::Amd(c) => c.writes_enabled(),
+            Self::Qemu(c) => c.writes_enabled(),
         }
     }
 
@@ -181,6 +187,7 @@ impl SpiController for AnySpiController {
         match self {
             Self::Intel(c) => c.enable_writes(),
             Self::Amd(c) => c.enable_writes(),
+            Self::Qemu(c) => c.enable_writes(),
         }
     }
 
@@ -188,6 +195,7 @@ impl SpiController for AnySpiController {
         match self {
             Self::Intel(c) => c.read(addr, buf),
             Self::Amd(c) => c.read(addr, buf),
+            Self::Qemu(c) => c.read(addr, buf),
         }
     }
 
@@ -195,6 +203,7 @@ impl SpiController for AnySpiController {
         match self {
             Self::Intel(c) => c.write(addr, data),
             Self::Amd(c) => c.write(addr, data),
+            Self::Qemu(c) => c.write(addr, data),
         }
     }
 
@@ -202,6 +211,7 @@ impl SpiController for AnySpiController {
         match self {
             Self::Intel(c) => c.erase(addr, len),
             Self::Amd(c) => c.erase(addr, len),
+            Self::Qemu(c) => c.erase(addr, len),
         }
     }
 
@@ -209,6 +219,7 @@ impl SpiController for AnySpiController {
         match self {
             Self::Intel(c) => c.mode(),
             Self::Amd(c) => c.mode(),
+            Self::Qemu(c) => c.mode(),
         }
     }
 }
@@ -279,40 +290,81 @@ pub fn detect_chipset() -> Option<DetectedChipset> {
 ///
 /// This is the main entry point for using the SPI flash controller.
 /// It detects the chipset type and initializes the appropriate driver.
+///
+/// Detection order:
+/// 1. Check if running in QEMU - if so, prefer pflash backend
+/// 2. Try Intel/AMD chipset detection for real hardware
+/// 3. Fall back to QEMU pflash if nothing else works
 pub fn detect_and_init() -> Option<AnySpiController> {
-    let chipset = detect_chipset()?;
+    // First check if we're running in QEMU - if so, prefer pflash
+    // QEMU emulates chipsets like ICH9, but the SPI controller doesn't
+    // actually work like real hardware. The pflash backend is more reliable.
+    log::debug!("Checking for QEMU environment...");
+    let is_qemu = qemu::detect_qemu_pflash();
+    log::debug!("QEMU detection result: {}", is_qemu);
 
-    match chipset.vendor {
-        ChipsetVendor::Intel => {
-            let intel_type = chipset.intel_type?;
-            match intel::IntelSpiController::new(&chipset.pci_device, intel_type, SpiMode::Auto) {
-                Ok(controller) => {
-                    log::info!(
-                        "Intel SPI controller initialized in {:?} mode",
-                        controller.mode()
-                    );
-                    Some(AnySpiController::Intel(controller))
-                }
-                Err(e) => {
-                    log::error!("Failed to initialize Intel SPI controller: {:?}", e);
-                    None
-                }
+    if is_qemu {
+        log::info!("QEMU environment detected, trying pflash backend...");
+        match qemu::QemuPflashController::new() {
+            Ok(controller) => {
+                log::info!("QEMU pflash controller initialized");
+                return Some(AnySpiController::Qemu(controller));
+            }
+            Err(e) => {
+                log::warn!("QEMU pflash not available: {:?}", e);
+                // Fall through to try Intel/AMD
             }
         }
-        ChipsetVendor::Amd => {
-            let amd_type = chipset.amd_type?;
-            match amd::AmdSpi100Controller::new(&chipset.pci_device, amd_type) {
-                Ok(controller) => {
-                    log::info!("AMD SPI100 controller initialized");
-                    Some(AnySpiController::Amd(controller))
+    }
+
+    // Try to detect Intel/AMD chipsets (for real hardware)
+    if let Some(chipset) = detect_chipset() {
+        match chipset.vendor {
+            ChipsetVendor::Intel => {
+                let intel_type = chipset.intel_type?;
+                match intel::IntelSpiController::new(&chipset.pci_device, intel_type, SpiMode::Auto)
+                {
+                    Ok(controller) => {
+                        log::info!(
+                            "Intel SPI controller initialized in {:?} mode",
+                            controller.mode()
+                        );
+                        return Some(AnySpiController::Intel(controller));
+                    }
+                    Err(e) => {
+                        log::error!("Failed to initialize Intel SPI controller: {:?}", e);
+                    }
                 }
-                Err(e) => {
-                    log::error!("Failed to initialize AMD SPI100 controller: {:?}", e);
-                    None
+            }
+            ChipsetVendor::Amd => {
+                let amd_type = chipset.amd_type?;
+                match amd::AmdSpi100Controller::new(&chipset.pci_device, amd_type) {
+                    Ok(controller) => {
+                        log::info!("AMD SPI100 controller initialized");
+                        return Some(AnySpiController::Amd(controller));
+                    }
+                    Err(e) => {
+                        log::error!("Failed to initialize AMD SPI100 controller: {:?}", e);
+                    }
+                }
+            }
+            ChipsetVendor::Qemu => {
+                // Should not happen from detect_chipset, but handle it anyway
+                match qemu::QemuPflashController::new() {
+                    Ok(controller) => {
+                        log::info!("QEMU pflash controller initialized");
+                        return Some(AnySpiController::Qemu(controller));
+                    }
+                    Err(e) => {
+                        log::error!("Failed to initialize QEMU pflash controller: {:?}", e);
+                    }
                 }
             }
         }
     }
+
+    log::warn!("No SPI controller found");
+    None
 }
 
 /// Delay for a specified number of microseconds

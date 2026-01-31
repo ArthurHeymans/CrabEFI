@@ -33,7 +33,7 @@ const DEFAULT_TIMEOUT_SECONDS: u32 = 5;
 const MENU_TITLE: &str = "CrabEFI Boot Menu";
 
 /// Help text
-const HELP_TEXT: &str = "Arrows: Select | Enter: Boot | S: Secure Boot Settings";
+const HELP_TEXT: &str = "Arrows: Select | Enter: Boot | S: Secure Boot | R: Reset";
 
 /// Storage device type
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -625,6 +625,12 @@ pub fn show_menu(menu: &mut BootMenu) -> Option<usize> {
                     clear_screen(&mut fb_console);
                     draw_menu(menu, &mut fb_console);
                 }
+                KeyPress::Char('r') | KeyPress::Char('R') => {
+                    // Reset the system
+                    draw_status("Resetting system...", &mut fb_console);
+                    delay_ms(500);
+                    perform_system_reset();
+                }
                 KeyPress::Char(c) if c.is_ascii_digit() => {
                     // Direct selection by number
                     let num = (c as u8 - b'0') as usize;
@@ -877,6 +883,45 @@ fn draw_status(message: &str, fb_console: &mut Option<FramebufferConsole>) {
         console.set_fg_color(Color::new(255, 0, 0)); // Red
         console.write_centered(row, message);
         console.reset_colors();
+    }
+}
+
+/// Perform a system reset
+///
+/// This attempts to reset the system using various methods:
+/// 1. Keyboard controller reset (port 0x64, command 0xFE)
+/// 2. Triple fault (if keyboard controller fails)
+fn perform_system_reset() -> ! {
+    use crate::arch::x86_64::io;
+
+    log::info!("System reset requested");
+
+    // Method 1: Keyboard controller reset
+    unsafe {
+        // Wait for keyboard controller to be ready
+        for _ in 0..1000 {
+            let status = io::inb(0x64);
+            if status & 0x02 == 0 {
+                break;
+            }
+        }
+        // Send reset command
+        io::outb(0x64, 0xFE);
+    }
+
+    // Wait a bit for reset to take effect
+    delay_ms(100);
+
+    // Method 2: Triple fault (if keyboard reset failed)
+    unsafe {
+        // Load a null IDT and trigger an interrupt
+        let null_idt: [u8; 6] = [0; 6];
+        core::arch::asm!(
+            "lidt [{}]",
+            "int3",
+            in(reg) null_idt.as_ptr(),
+            options(noreturn)
+        );
     }
 }
 

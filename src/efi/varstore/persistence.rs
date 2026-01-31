@@ -162,17 +162,39 @@ fn init_smmstore() -> Result<(), VarStoreError> {
     spi.read(config.base_addr, &mut header_bytes)
         .map_err(|_| VarStoreError::SpiError)?;
 
+    // Log raw header bytes for debugging
+    log::debug!(
+        "SMMSTORE header bytes: {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x}",
+        header_bytes[0], header_bytes[1], header_bytes[2], header_bytes[3],
+        header_bytes[4], header_bytes[5], header_bytes[6], header_bytes[7],
+        header_bytes[8], header_bytes[9], header_bytes[10], header_bytes[11],
+        header_bytes[12], header_bytes[13], header_bytes[14], header_bytes[15]
+    );
+
     // Check if the header is valid
-    if let Ok(header) = postcard::from_bytes::<StoreHeader>(&header_bytes) {
-        if header.is_valid() {
-            log::info!(
-                "SMMSTORE found at {:#x}, size {} KB",
-                config.base_addr,
-                header.store_size / 1024
+    match postcard::from_bytes::<StoreHeader>(&header_bytes) {
+        Ok(header) => {
+            log::debug!(
+                "SMMSTORE header parsed: magic={:#x}, version={}, size={}",
+                header.magic,
+                header.version,
+                header.store_size
             );
-            config.size = header.store_size;
-            config.initialized = true;
-            return Ok(());
+            if header.is_valid() {
+                log::info!(
+                    "SMMSTORE found at {:#x}, size {} KB",
+                    config.base_addr,
+                    header.store_size / 1024
+                );
+                config.size = header.store_size;
+                config.initialized = true;
+                return Ok(());
+            } else {
+                log::debug!("SMMSTORE header CRC mismatch or invalid magic");
+            }
+        }
+        Err(e) => {
+            log::debug!("SMMSTORE header parse error: {:?}", e);
         }
     }
 
