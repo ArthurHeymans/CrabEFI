@@ -19,35 +19,12 @@ use super::AuthError;
 use super::crypto::verify_pkcs7_signature;
 use super::signature::{is_certificate_forbidden, is_hash_allowed, is_hash_forbidden};
 use super::variables::db_database;
+use crate::pe::{DATA_DIRECTORY_ENTRY_SIZE, IMAGE_DIRECTORY_ENTRY_SECURITY, parse_headers};
 use alloc::vec::Vec;
 use sha2::{Digest, Sha256};
 
-/// DOS header magic "MZ"
-const DOS_MAGIC: u16 = 0x5A4D;
-
-/// PE signature "PE\0\0"
-const PE_SIGNATURE: u32 = 0x00004550;
-
-/// PE32+ magic
-const PE32_PLUS_MAGIC: u16 = 0x020B;
-
-/// PE32 magic
-const PE32_MAGIC: u16 = 0x010B;
-
-/// Data directory index for the Certificate Table (Security Directory)
-const IMAGE_DIRECTORY_ENTRY_SECURITY: usize = 4;
-
 /// WIN_CERTIFICATE header type for PKCS#7
 const WIN_CERT_TYPE_PKCS_SIGNED_DATA: u16 = 0x0002;
-
-/// Offset of checksum field in PE32+ optional header (from start of optional header)
-const PE32_PLUS_CHECKSUM_OFFSET: usize = 64;
-
-/// Offset of checksum field in PE32 optional header
-const PE32_CHECKSUM_OFFSET: usize = 64;
-
-/// Size of a data directory entry
-const DATA_DIRECTORY_SIZE: usize = 8;
 
 /// PE file information extracted during parsing
 struct PeInfo {
@@ -117,7 +94,7 @@ pub fn compute_authenticode_hash(pe_data: &[u8]) -> Result<[u8; 32], AuthError> 
         hasher.update(&pe_data[after_checksum..info.cert_table_entry_offset]);
 
         // Skip certificate table entry (8 bytes)
-        let after_cert_entry = info.cert_table_entry_offset + DATA_DIRECTORY_SIZE;
+        let after_cert_entry = info.cert_table_entry_offset + DATA_DIRECTORY_ENTRY_SIZE;
 
         // Region 3: From after cert table entry to end of headers
         if after_cert_entry <= info.size_of_headers && info.size_of_headers <= pe_data.len() {
@@ -168,164 +145,31 @@ pub fn compute_authenticode_hash(pe_data: &[u8]) -> Result<[u8; 32], AuthError> 
 
 /// Parse PE file to extract information needed for hash calculation
 fn parse_pe_for_hash(pe_data: &[u8]) -> Result<PeInfo, AuthError> {
-    // Check minimum size for DOS header
-    if pe_data.len() < 64 {
-        return Err(AuthError::InvalidHeader);
-    }
+    // Use the shared PE parser from pe/mod.rs
+    let headers = parse_headers(pe_data).map_err(|_| AuthError::InvalidHeader)?;
 
-    // Check DOS magic
-    let dos_magic = u16::from_le_bytes([pe_data[0], pe_data[1]]);
-    if dos_magic != DOS_MAGIC {
-        return Err(AuthError::InvalidHeader);
-    }
-
-    // Get PE offset from DOS header
-    let pe_offset =
-        u32::from_le_bytes([pe_data[60], pe_data[61], pe_data[62], pe_data[63]]) as usize;
-
-    // Validate PE offset
-    if pe_offset + 4 > pe_data.len() {
-        return Err(AuthError::InvalidHeader);
-    }
-
-    // Check PE signature
-    let pe_sig = u32::from_le_bytes([
-        pe_data[pe_offset],
-        pe_data[pe_offset + 1],
-        pe_data[pe_offset + 2],
-        pe_data[pe_offset + 3],
-    ]);
-    if pe_sig != PE_SIGNATURE {
-        return Err(AuthError::InvalidHeader);
-    }
-
-    // COFF header starts after PE signature
-    let coff_offset = pe_offset + 4;
-    if coff_offset + 20 > pe_data.len() {
-        return Err(AuthError::InvalidHeader);
-    }
-
-    // Get number of sections and optional header size
-    let num_sections =
-        u16::from_le_bytes([pe_data[coff_offset + 2], pe_data[coff_offset + 3]]) as usize;
-    let opt_header_size =
-        u16::from_le_bytes([pe_data[coff_offset + 16], pe_data[coff_offset + 17]]) as usize;
-
-    // Optional header offset
-    let opt_header_offset = coff_offset + 20;
-    if opt_header_offset + 2 > pe_data.len() {
-        return Err(AuthError::InvalidHeader);
-    }
-
-    // Check PE32 vs PE32+ magic
-    let magic = u16::from_le_bytes([pe_data[opt_header_offset], pe_data[opt_header_offset + 1]]);
-    let is_pe32_plus = match magic {
-        PE32_PLUS_MAGIC => true,
-        PE32_MAGIC => false,
-        _ => return Err(AuthError::InvalidHeader),
-    };
-
-    // Calculate checksum offset
-    let checksum_offset = opt_header_offset
-        + if is_pe32_plus {
-            PE32_PLUS_CHECKSUM_OFFSET
-        } else {
-            PE32_CHECKSUM_OFFSET
-        };
-
-    // Get size of headers
-    let headers_size_offset = opt_header_offset + 60; // Same for PE32 and PE32+
-    if headers_size_offset + 4 > pe_data.len() {
-        return Err(AuthError::InvalidHeader);
-    }
-    let size_of_headers = u32::from_le_bytes([
-        pe_data[headers_size_offset],
-        pe_data[headers_size_offset + 1],
-        pe_data[headers_size_offset + 2],
-        pe_data[headers_size_offset + 3],
-    ]) as usize;
-
-    // Get number of data directories
-    let num_rva_offset = if is_pe32_plus {
-        opt_header_offset + 108
-    } else {
-        opt_header_offset + 92
-    };
-    if num_rva_offset + 4 > pe_data.len() {
-        return Err(AuthError::InvalidHeader);
-    }
-    let num_data_dirs = u32::from_le_bytes([
-        pe_data[num_rva_offset],
-        pe_data[num_rva_offset + 1],
-        pe_data[num_rva_offset + 2],
-        pe_data[num_rva_offset + 3],
-    ]);
-
-    // Data directories start after the fixed optional header fields
-    let data_dirs_offset = if is_pe32_plus {
-        opt_header_offset + 112
-    } else {
-        opt_header_offset + 96
-    };
+    // Calculate checksum offset (same offset from optional header for PE32 and PE32+)
+    let checksum_offset = headers.checksum_offset();
 
     // Calculate certificate table entry offset
-    let cert_table_entry_offset = if num_data_dirs as usize > IMAGE_DIRECTORY_ENTRY_SECURITY {
-        data_dirs_offset + IMAGE_DIRECTORY_ENTRY_SECURITY * DATA_DIRECTORY_SIZE
-    } else {
-        // No certificate table entry
-        pe_data.len()
-    };
+    let cert_table_entry_offset = headers
+        .data_directory_offset(IMAGE_DIRECTORY_ENTRY_SECURITY)
+        .unwrap_or(pe_data.len());
 
-    // Read certificate table info
-    let (cert_table_rva, cert_table_size) =
-        if cert_table_entry_offset + DATA_DIRECTORY_SIZE <= pe_data.len() {
-            let rva = u32::from_le_bytes([
-                pe_data[cert_table_entry_offset],
-                pe_data[cert_table_entry_offset + 1],
-                pe_data[cert_table_entry_offset + 2],
-                pe_data[cert_table_entry_offset + 3],
-            ]);
-            let size = u32::from_le_bytes([
-                pe_data[cert_table_entry_offset + 4],
-                pe_data[cert_table_entry_offset + 5],
-                pe_data[cert_table_entry_offset + 6],
-                pe_data[cert_table_entry_offset + 7],
-            ]);
-            (rva, size)
-        } else {
-            (0, 0)
-        };
+    // Read certificate table info (RVA and size)
+    let (cert_table_rva, cert_table_size) = headers
+        .data_directory(IMAGE_DIRECTORY_ENTRY_SECURITY)
+        .unwrap_or((0, 0));
 
-    // Parse sections and sort by file offset
-    let sections_offset = opt_header_offset + opt_header_size;
-    let mut sections = Vec::with_capacity(num_sections);
-
-    for i in 0..num_sections {
-        let section_offset = sections_offset + i * 40;
-        if section_offset + 40 > pe_data.len() {
-            break;
-        }
-
-        let size_of_raw_data = u32::from_le_bytes([
-            pe_data[section_offset + 16],
-            pe_data[section_offset + 17],
-            pe_data[section_offset + 18],
-            pe_data[section_offset + 19],
-        ]);
-        let pointer_to_raw_data = u32::from_le_bytes([
-            pe_data[section_offset + 20],
-            pe_data[section_offset + 21],
-            pe_data[section_offset + 22],
-            pe_data[section_offset + 23],
-        ]);
-
-        if size_of_raw_data > 0 && pointer_to_raw_data > 0 {
-            sections.push(SectionInfo {
-                file_offset: pointer_to_raw_data,
-                size_of_raw_data,
-            });
-        }
-    }
+    // Collect sections and sort by file offset
+    let mut sections: Vec<SectionInfo> = headers
+        .sections()
+        .filter(|s| s.size_of_raw_data > 0 && s.pointer_to_raw_data > 0)
+        .map(|s| SectionInfo {
+            file_offset: s.pointer_to_raw_data,
+            size_of_raw_data: s.size_of_raw_data,
+        })
+        .collect();
 
     // Sort sections by file offset
     sections.sort_by_key(|s| s.file_offset);
@@ -333,7 +177,7 @@ fn parse_pe_for_hash(pe_data: &[u8]) -> Result<PeInfo, AuthError> {
     Ok(PeInfo {
         checksum_offset,
         cert_table_entry_offset,
-        size_of_headers,
+        size_of_headers: headers.size_of_headers as usize,
         cert_table_rva,
         cert_table_size,
         sections,

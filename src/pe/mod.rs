@@ -15,13 +15,16 @@ use r_efi::efi::{Handle, Status, SystemTable};
 use zerocopy::{FromBytes, Immutable, KnownLayout, Unaligned};
 
 /// DOS header magic "MZ"
-const DOS_MAGIC: u16 = 0x5A4D;
+pub const DOS_MAGIC: u16 = 0x5A4D;
 
 /// PE signature "PE\0\0"
-const PE_SIGNATURE: u32 = 0x00004550;
+pub const PE_SIGNATURE: u32 = 0x00004550;
 
 /// PE32+ magic
-const PE32_PLUS_MAGIC: u16 = 0x020B;
+pub const PE32_PLUS_MAGIC: u16 = 0x020B;
+
+/// PE32 magic
+pub const PE32_MAGIC: u16 = 0x010B;
 
 /// Machine type: AMD64
 const IMAGE_FILE_MACHINE_AMD64: u16 = 0x8664;
@@ -30,11 +33,20 @@ const IMAGE_FILE_MACHINE_AMD64: u16 = 0x8664;
 const IMAGE_REL_BASED_ABSOLUTE: u16 = 0;
 const IMAGE_REL_BASED_DIR64: u16 = 10;
 
+/// Data directory index for the Certificate Table (Security Directory)
+pub const IMAGE_DIRECTORY_ENTRY_SECURITY: usize = 4;
+
 /// Data directory index for base relocations
 const IMAGE_DIRECTORY_ENTRY_BASERELOC: usize = 5;
 
 /// Size of base relocation block header
 const BASE_RELOCATION_HEADER_SIZE: usize = 8;
+
+/// Size of a data directory entry
+pub const DATA_DIRECTORY_ENTRY_SIZE: usize = 8;
+
+/// Offset of checksum field in optional header (same for PE32 and PE32+)
+pub const CHECKSUM_FIELD_OFFSET: usize = 64;
 
 /// Maximum reasonable image size (256 MB) to prevent DoS
 const MAX_IMAGE_SIZE: u32 = 256 * 1024 * 1024;
@@ -48,99 +60,99 @@ const MAX_DATA_DIRECTORIES: u32 = 16;
 /// DOS Header
 #[repr(C, packed)]
 #[derive(FromBytes, Immutable, KnownLayout, Unaligned)]
-struct DosHeader {
-    e_magic: u16,
-    e_cblp: u16,
-    e_cp: u16,
-    e_crlc: u16,
-    e_cparhdr: u16,
-    e_minalloc: u16,
-    e_maxalloc: u16,
-    e_ss: u16,
-    e_sp: u16,
-    e_csum: u16,
-    e_ip: u16,
-    e_cs: u16,
-    e_lfarlc: u16,
-    e_ovno: u16,
-    e_res: [u16; 4],
-    e_oemid: u16,
-    e_oeminfo: u16,
-    e_res2: [u16; 10],
-    e_lfanew: u32,
+pub struct DosHeader {
+    pub e_magic: u16,
+    pub e_cblp: u16,
+    pub e_cp: u16,
+    pub e_crlc: u16,
+    pub e_cparhdr: u16,
+    pub e_minalloc: u16,
+    pub e_maxalloc: u16,
+    pub e_ss: u16,
+    pub e_sp: u16,
+    pub e_csum: u16,
+    pub e_ip: u16,
+    pub e_cs: u16,
+    pub e_lfarlc: u16,
+    pub e_ovno: u16,
+    pub e_res: [u16; 4],
+    pub e_oemid: u16,
+    pub e_oeminfo: u16,
+    pub e_res2: [u16; 10],
+    pub e_lfanew: u32,
 }
 
 /// COFF File Header
 #[repr(C, packed)]
 #[derive(FromBytes, Immutable, KnownLayout, Unaligned)]
-struct CoffHeader {
-    machine: u16,
-    number_of_sections: u16,
-    time_date_stamp: u32,
-    pointer_to_symbol_table: u32,
-    number_of_symbols: u32,
-    size_of_optional_header: u16,
-    characteristics: u16,
+pub struct CoffHeader {
+    pub machine: u16,
+    pub number_of_sections: u16,
+    pub time_date_stamp: u32,
+    pub pointer_to_symbol_table: u32,
+    pub number_of_symbols: u32,
+    pub size_of_optional_header: u16,
+    pub characteristics: u16,
 }
 
 /// Optional Header (PE32+)
 #[repr(C, packed)]
 #[derive(FromBytes, Immutable, KnownLayout, Unaligned)]
-struct OptionalHeader64 {
-    magic: u16,
-    major_linker_version: u8,
-    minor_linker_version: u8,
-    size_of_code: u32,
-    size_of_initialized_data: u32,
-    size_of_uninitialized_data: u32,
-    address_of_entry_point: u32,
-    base_of_code: u32,
-    image_base: u64,
-    section_alignment: u32,
-    file_alignment: u32,
-    major_os_version: u16,
-    minor_os_version: u16,
-    major_image_version: u16,
-    minor_image_version: u16,
-    major_subsystem_version: u16,
-    minor_subsystem_version: u16,
-    win32_version_value: u32,
-    size_of_image: u32,
-    size_of_headers: u32,
-    checksum: u32,
-    subsystem: u16,
-    dll_characteristics: u16,
-    size_of_stack_reserve: u64,
-    size_of_stack_commit: u64,
-    size_of_heap_reserve: u64,
-    size_of_heap_commit: u64,
-    loader_flags: u32,
-    number_of_rva_and_sizes: u32,
+pub struct OptionalHeader64 {
+    pub magic: u16,
+    pub major_linker_version: u8,
+    pub minor_linker_version: u8,
+    pub size_of_code: u32,
+    pub size_of_initialized_data: u32,
+    pub size_of_uninitialized_data: u32,
+    pub address_of_entry_point: u32,
+    pub base_of_code: u32,
+    pub image_base: u64,
+    pub section_alignment: u32,
+    pub file_alignment: u32,
+    pub major_os_version: u16,
+    pub minor_os_version: u16,
+    pub major_image_version: u16,
+    pub minor_image_version: u16,
+    pub major_subsystem_version: u16,
+    pub minor_subsystem_version: u16,
+    pub win32_version_value: u32,
+    pub size_of_image: u32,
+    pub size_of_headers: u32,
+    pub checksum: u32,
+    pub subsystem: u16,
+    pub dll_characteristics: u16,
+    pub size_of_stack_reserve: u64,
+    pub size_of_stack_commit: u64,
+    pub size_of_heap_reserve: u64,
+    pub size_of_heap_commit: u64,
+    pub loader_flags: u32,
+    pub number_of_rva_and_sizes: u32,
     // Data directories follow
 }
 
 /// Data Directory entry
 #[repr(C, packed)]
 #[derive(FromBytes, Immutable, KnownLayout, Unaligned)]
-struct DataDirectory {
-    virtual_address: u32,
-    size: u32,
+pub struct DataDirectory {
+    pub virtual_address: u32,
+    pub size: u32,
 }
 
 /// Section Header
 #[repr(C, packed)]
 #[derive(FromBytes, Immutable, KnownLayout, Unaligned)]
-struct SectionHeader {
-    name: [u8; 8],
-    virtual_size: u32,
-    virtual_address: u32,
-    size_of_raw_data: u32,
-    pointer_to_raw_data: u32,
-    pointer_to_relocations: u32,
-    pointer_to_linenumbers: u32,
-    number_of_relocations: u16,
-    number_of_linenumbers: u16,
-    characteristics: u32,
+pub struct SectionHeader {
+    pub name: [u8; 8],
+    pub virtual_size: u32,
+    pub virtual_address: u32,
+    pub size_of_raw_data: u32,
+    pub pointer_to_raw_data: u32,
+    pub pointer_to_relocations: u32,
+    pub pointer_to_linenumbers: u32,
+    pub number_of_relocations: u16,
+    pub number_of_linenumbers: u16,
+    pub characteristics: u32,
 }
 
 /// Base Relocation Block
@@ -154,6 +166,180 @@ struct BaseRelocation {
 
 /// EFI application entry point type
 pub type EfiEntryPoint = extern "efiapi" fn(Handle, *mut SystemTable) -> Status;
+
+/// Parsed PE headers information (for reading PE metadata without loading)
+pub struct PeHeaders<'a> {
+    /// Reference to the original PE data
+    data: &'a [u8],
+    /// Offset of the optional header from start of file
+    pub opt_header_offset: usize,
+    /// Size of the optional header
+    pub opt_header_size: usize,
+    /// Whether this is a PE32+ (64-bit) image
+    pub is_pe32_plus: bool,
+    /// Number of sections
+    pub num_sections: u16,
+    /// Number of data directories
+    pub num_data_dirs: u32,
+    /// Size of headers
+    pub size_of_headers: u32,
+    /// Offset where data directories start
+    pub data_dirs_offset: usize,
+    /// Offset where section headers start
+    pub sections_offset: usize,
+}
+
+impl<'a> PeHeaders<'a> {
+    /// Get the offset of the checksum field from start of file
+    pub fn checksum_offset(&self) -> usize {
+        self.opt_header_offset + CHECKSUM_FIELD_OFFSET
+    }
+
+    /// Get the offset of a specific data directory entry from start of file
+    pub fn data_directory_offset(&self, index: usize) -> Option<usize> {
+        if index >= self.num_data_dirs as usize {
+            return None;
+        }
+        Some(self.data_dirs_offset + index * DATA_DIRECTORY_ENTRY_SIZE)
+    }
+
+    /// Get a data directory entry by index
+    pub fn data_directory(&self, index: usize) -> Option<(u32, u32)> {
+        let offset = self.data_directory_offset(index)?;
+        if offset + DATA_DIRECTORY_ENTRY_SIZE > self.data.len() {
+            return None;
+        }
+        let dir = DataDirectory::ref_from_prefix(&self.data[offset..]).ok()?.0;
+        Some((dir.virtual_address, dir.size))
+    }
+
+    /// Get section headers iterator
+    pub fn sections(&self) -> impl Iterator<Item = &SectionHeader> {
+        let section_size = core::mem::size_of::<SectionHeader>();
+        (0..self.num_sections as usize).filter_map(move |i| {
+            let offset = self.sections_offset + i * section_size;
+            if offset + section_size > self.data.len() {
+                return None;
+            }
+            SectionHeader::ref_from_prefix(&self.data[offset..])
+                .ok()
+                .map(|(s, _)| s)
+        })
+    }
+}
+
+/// Parse PE headers without loading the image
+///
+/// This is useful for reading PE metadata (like Authenticode signature info)
+/// without allocating memory or loading the image.
+///
+/// # Arguments
+/// * `data` - Raw PE file data
+///
+/// # Returns
+/// * `Ok(PeHeaders)` - Parsed header information
+/// * `Err(Status)` - Error status
+pub fn parse_headers(data: &[u8]) -> Result<PeHeaders<'_>, Status> {
+    // Parse DOS header
+    let dos_header = DosHeader::ref_from_prefix(data)
+        .map_err(|_| Status::INVALID_PARAMETER)?
+        .0;
+
+    if dos_header.e_magic != DOS_MAGIC {
+        return Err(Status::INVALID_PARAMETER);
+    }
+
+    let pe_offset = dos_header.e_lfanew as usize;
+
+    // Validate PE signature
+    let pe_sig_end = pe_offset.checked_add(4).ok_or(Status::INVALID_PARAMETER)?;
+    if pe_sig_end > data.len() {
+        return Err(Status::INVALID_PARAMETER);
+    }
+
+    let pe_sig = u32::from_le_bytes([
+        data[pe_offset],
+        data[pe_offset + 1],
+        data[pe_offset + 2],
+        data[pe_offset + 3],
+    ]);
+    if pe_sig != PE_SIGNATURE {
+        return Err(Status::INVALID_PARAMETER);
+    }
+
+    // Parse COFF header
+    let coff_offset = pe_offset.checked_add(4).ok_or(Status::INVALID_PARAMETER)?;
+    let coff_header = CoffHeader::ref_from_prefix(&data[coff_offset..])
+        .map_err(|_| Status::INVALID_PARAMETER)?
+        .0;
+
+    let num_sections = coff_header.number_of_sections;
+    let opt_header_size = coff_header.size_of_optional_header as usize;
+
+    // Parse optional header (just the magic to determine PE32 vs PE32+)
+    let opt_header_offset = coff_offset
+        .checked_add(core::mem::size_of::<CoffHeader>())
+        .ok_or(Status::INVALID_PARAMETER)?;
+
+    if opt_header_offset + 2 > data.len() {
+        return Err(Status::INVALID_PARAMETER);
+    }
+
+    let magic = u16::from_le_bytes([data[opt_header_offset], data[opt_header_offset + 1]]);
+    let is_pe32_plus = match magic {
+        PE32_PLUS_MAGIC => true,
+        PE32_MAGIC => false,
+        _ => return Err(Status::INVALID_PARAMETER),
+    };
+
+    // Get size_of_headers and number_of_rva_and_sizes from optional header
+    let (size_of_headers, num_data_dirs, data_dirs_offset) = if is_pe32_plus {
+        let opt_header = OptionalHeader64::ref_from_prefix(&data[opt_header_offset..])
+            .map_err(|_| Status::INVALID_PARAMETER)?
+            .0;
+        let dirs_offset = opt_header_offset + core::mem::size_of::<OptionalHeader64>();
+        (
+            opt_header.size_of_headers,
+            opt_header.number_of_rva_and_sizes,
+            dirs_offset,
+        )
+    } else {
+        // PE32: size_of_headers at offset 60, num_rva_and_sizes at offset 92
+        // For PE32, the optional header is smaller (no 64-bit image_base)
+        if opt_header_offset + 96 > data.len() {
+            return Err(Status::INVALID_PARAMETER);
+        }
+        let size_of_headers = u32::from_le_bytes([
+            data[opt_header_offset + 60],
+            data[opt_header_offset + 61],
+            data[opt_header_offset + 62],
+            data[opt_header_offset + 63],
+        ]);
+        let num_data_dirs = u32::from_le_bytes([
+            data[opt_header_offset + 92],
+            data[opt_header_offset + 93],
+            data[opt_header_offset + 94],
+            data[opt_header_offset + 95],
+        ]);
+        (size_of_headers, num_data_dirs, opt_header_offset + 96)
+    };
+
+    let sections_offset = opt_header_offset
+        .checked_add(opt_header_size)
+        .ok_or(Status::INVALID_PARAMETER)?;
+
+    Ok(PeHeaders {
+        data,
+        opt_header_offset,
+        opt_header_size,
+        is_pe32_plus,
+        num_sections,
+        num_data_dirs,
+        size_of_headers,
+        data_dirs_offset,
+        sections_offset,
+    })
+}
 
 /// Loaded PE image information
 pub struct LoadedImage {
