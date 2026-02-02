@@ -6,6 +6,29 @@
 use crate::arch::x86_64::io;
 use crate::efi::auth;
 use crate::state::{self, MAX_VARIABLE_DATA_SIZE, MAX_VARIABLE_NAME_LEN, MAX_VARIABLES};
+
+// ============================================================================
+// Runtime Access Control
+// ============================================================================
+
+/// Check if a variable is accessible at runtime based on its attributes.
+///
+/// Per UEFI Specification Section 8.2:
+/// - Variables with EFI_VARIABLE_BOOTSERVICE_ACCESS but without EFI_VARIABLE_RUNTIME_ACCESS
+///   are only accessible before ExitBootServices() is called.
+/// - After ExitBootServices(), these boot-services-only variables should return NOT_FOUND.
+///
+/// Returns true if the variable is accessible, false if it should be hidden at runtime.
+#[inline]
+fn is_variable_accessible_at_runtime(attributes: u32) -> bool {
+    // If ExitBootServices hasn't been called, all variables are accessible
+    if !state::is_exit_boot_services_called() {
+        return true;
+    }
+
+    // At runtime, only variables with RUNTIME_ACCESS are accessible
+    (attributes & auth::attributes::RUNTIME_ACCESS) != 0
+}
 use alloc::vec::Vec;
 use core::ffi::c_void;
 use r_efi::efi::{
@@ -183,6 +206,12 @@ extern "efiapi" fn get_variable(
 
     match found {
         Some(var) => {
+            // Check if variable is accessible at runtime
+            // Boot-services-only variables are hidden after ExitBootServices
+            if !is_variable_accessible_at_runtime(var.attributes) {
+                return Status::NOT_FOUND;
+            }
+
             let required_size = var.data_size;
 
             if data.is_null() || unsafe { *data_size } < required_size {
@@ -290,10 +319,14 @@ extern "efiapi" fn get_next_variable_name(
 
         if name_eq_const(current_name, auth::SECURE_BOOT_NAME) {
             // After SecureBoot, continue with the first stored variable
+            // that is accessible at runtime (if we're at runtime)
             let efi = state::efi();
             let variables = &efi.variables;
 
-            if let Some(var) = variables.iter().find(|var| var.in_use) {
+            if let Some(var) = variables
+                .iter()
+                .find(|var| var.in_use && is_variable_accessible_at_runtime(var.attributes))
+            {
                 return copy_stored_variable_name(
                     var,
                     variable_name_size,
@@ -310,9 +343,10 @@ extern "efiapi" fn get_next_variable_name(
     let variables = &efi.variables;
 
     // Create iterator over in-use variables and skip to next after current
+    // Filter by runtime accessibility to hide boot-services-only variables after ExitBootServices
     let next_var = variables
         .iter()
-        .filter(|var| var.in_use)
+        .filter(|var| var.in_use && is_variable_accessible_at_runtime(var.attributes))
         .skip_while(|var| !(var.vendor_guid == current_guid && name_eq(&var.name, current_name)))
         .nth(1); // Skip the current one and get the next
 
@@ -398,6 +432,18 @@ extern "efiapi" fn set_variable(
 
     if data_size > 0 && data.is_null() {
         return Status::INVALID_PARAMETER;
+    }
+
+    // Check if we're at runtime and trying to modify a boot-services-only variable
+    // Per UEFI spec, BS-only variables cannot be modified at runtime
+    if state::is_exit_boot_services_called() {
+        let has_runtime_access = (attributes & auth::attributes::RUNTIME_ACCESS) != 0;
+        if !has_runtime_access {
+            log::debug!(
+                "Rejecting SetVariable at runtime: variable lacks RUNTIME_ACCESS attribute"
+            );
+            return Status::INVALID_PARAMETER;
+        }
     }
 
     // Check if this is a read-only variable that cannot be written via SetVariable
