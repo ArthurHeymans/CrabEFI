@@ -817,10 +817,12 @@ extern "efiapi" fn load_image(
             }
             Ok(false) => {
                 log::error!("BS.LoadImage: Secure Boot verification FAILED - image not authorized");
+                crate::display_secure_boot_error();
                 return Status::SECURITY_VIOLATION;
             }
             Err(e) => {
                 log::error!("BS.LoadImage: Secure Boot verification error: {:?}", e);
+                crate::display_secure_boot_error();
                 return Status::SECURITY_VIOLATION;
             }
         }

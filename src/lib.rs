@@ -57,6 +57,51 @@ fn panic(info: &PanicInfo) -> ! {
     }
 }
 
+/// Display a Secure Boot violation error on screen
+///
+/// This function displays a prominent red error message in the center of the screen
+/// when Secure Boot verification fails. It also outputs to the serial console.
+/// The display persists for a few seconds so the user can see it.
+pub fn display_secure_boot_error() {
+    use framebuffer_console::{Color, FramebufferConsole, DEFAULT_BG};
+
+    const ERROR_MESSAGE: &str = "SECURE BOOT VIOLATION: Image not authorized";
+
+    // Output to serial console with red color (ANSI escape codes)
+    drivers::serial::write_str("\r\n\x1b[1;31m"); // Bold red
+    drivers::serial::write_str("================================================================================\r\n");
+    drivers::serial::write_str("                    SECURE BOOT VIOLATION: Image not authorized                 \r\n");
+    drivers::serial::write_str("================================================================================\r\n");
+    drivers::serial::write_str("\x1b[0m\r\n"); // Reset color
+
+    // Output to framebuffer if available
+    if let Some(fb_info) = coreboot::get_framebuffer() {
+        let mut console = FramebufferConsole::new(&fb_info);
+
+        // Calculate center position
+        let rows = console.rows();
+        let center_row = rows / 2;
+
+        // Set red foreground color
+        let error_color = Color::new(255, 0, 0); // Bright red
+
+        // Draw a border above the message
+        console.set_colors(error_color, DEFAULT_BG);
+        console.write_centered(center_row - 2, "========================================");
+
+        // Draw the error message
+        console.write_centered(center_row, ERROR_MESSAGE);
+
+        // Draw a border below the message
+        console.write_centered(center_row + 2, "========================================");
+
+        console.reset_colors();
+    }
+
+    // Wait 3 seconds so the user can see the message
+    time::delay_ms(3000);
+}
+
 /// Sort partition candidates by size (smallest first)
 ///
 /// Smaller partitions are tried first as they're more likely to be EFI boot partitions.
@@ -1751,11 +1796,13 @@ fn load_and_execute_bootloader(
             }
             Ok(false) => {
                 log::error!("Secure Boot: Image verification FAILED - not authorized");
+                display_secure_boot_error();
                 let _ = free_pool(buffer_ptr);
                 return Err(Status::SECURITY_VIOLATION);
             }
             Err(e) => {
                 log::error!("Secure Boot: Verification error: {:?}", e);
+                display_secure_boot_error();
                 let _ = free_pool(buffer_ptr);
                 return Err(Status::SECURITY_VIOLATION);
             }
