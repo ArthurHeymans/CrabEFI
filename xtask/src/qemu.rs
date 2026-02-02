@@ -237,6 +237,82 @@ pub fn run_tests(config: &QemuConfig, disk_path: &Path, app_name: &str) -> Resul
                 passed += 1;
             }
         }
+        "secure-boot-test" => {
+            // Check for Secure Boot test markers
+            if result.output.contains("Secure Boot Test Suite") {
+                println!("[PASS] test_started: Secure Boot test suite started");
+                passed += 1;
+            } else {
+                println!("[FAIL] test_started: Secure Boot test did not start");
+                failed += 1;
+            }
+
+            // Check for passing tests section
+            if result.output.contains("Passing Tests") {
+                println!("[PASS] passing_tests_section: Passing tests section found");
+                passed += 1;
+            } else {
+                println!("[FAIL] passing_tests_section: Missing passing tests section");
+                failed += 1;
+            }
+
+            // Check for failing tests section
+            if result.output.contains("Failing Tests") {
+                println!("[PASS] failing_tests_section: Failing tests section found");
+                passed += 1;
+            } else {
+                println!("[FAIL] failing_tests_section: Missing failing tests section");
+                failed += 1;
+            }
+
+            // Check for results summary
+            if result.output.contains("Results:") {
+                println!("[PASS] results_summary: Test results summary found");
+                passed += 1;
+            } else {
+                println!("[FAIL] results_summary: Missing results summary");
+                failed += 1;
+            }
+
+            // Check for specific SecureBoot tests
+            if result.output.contains("read_secure_boot") {
+                println!("[PASS] sb_read_test: SecureBoot read test executed");
+                passed += 1;
+            }
+
+            if result.output.contains("read_setup_mode") {
+                println!("[PASS] sm_read_test: SetupMode read test executed");
+                passed += 1;
+            }
+
+            if result.output.contains("mode_consistency") {
+                println!("[PASS] consistency_test: Mode consistency test executed");
+                passed += 1;
+            }
+
+            // Check for any failed tests in output
+            // Count [FAIL] occurrences in the actual test output
+            let fail_count = result.output.matches("[FAIL]").count();
+            if fail_count == 0 {
+                println!("[PASS] no_internal_failures: No test failures detected");
+                passed += 1;
+            } else {
+                println!(
+                    "[WARN] internal_failures: {} test failures detected",
+                    fail_count
+                );
+                // Don't count this as a framework failure - the tests themselves report status
+            }
+
+            // Final check: did all tests pass?
+            if result.output.contains("All Secure Boot tests passed!") {
+                println!("[PASS] all_tests_passed: All Secure Boot tests passed");
+                passed += 1;
+            } else if result.output.contains("Some Secure Boot tests failed!") {
+                println!("[FAIL] all_tests_passed: Some Secure Boot tests failed");
+                failed += 1;
+            }
+        }
         _ => {
             // Generic test: just check if CrabEFI booted
             if result.output.contains("CrabEFI") {

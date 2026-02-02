@@ -400,6 +400,23 @@ extern "efiapi" fn set_variable(
         return Status::INVALID_PARAMETER;
     }
 
+    // Check if this is a read-only variable that cannot be written via SetVariable
+    // SecureBoot and SetupMode are computed status variables, not writable
+    let name_slice = unsafe { core::slice::from_raw_parts(name, name_len + 1) };
+    if guid == auth::EFI_GLOBAL_VARIABLE_GUID
+        && (name_slice == auth::SECURE_BOOT_NAME || name_slice == auth::SETUP_MODE_NAME)
+    {
+        log::debug!(
+            "Rejecting write to read-only variable: {:?}",
+            if name_slice == auth::SECURE_BOOT_NAME {
+                "SecureBoot"
+            } else {
+                "SetupMode"
+            }
+        );
+        return Status::WRITE_PROTECTED;
+    }
+
     // Check if this is an authenticated variable write
     let is_authenticated =
         (attributes & auth::attributes::TIME_BASED_AUTHENTICATED_WRITE_ACCESS) != 0;
