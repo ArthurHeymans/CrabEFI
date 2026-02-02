@@ -51,10 +51,9 @@ pub use persistence::{
 
 // Re-export key items from deferred
 pub use deferred::{
-    check_pending as check_deferred_pending, configure_buffer as configure_deferred_buffer,
-    get_stats as get_deferred_stats, init_buffer as init_deferred_buffer,
-    process_pending as process_deferred_pending, DEFAULT_DEFERRED_BUFFER_BASE,
-    DEFERRED_BUFFER_SIZE,
+    DEFAULT_DEFERRED_BUFFER_BASE, DEFERRED_BUFFER_SIZE, check_pending as check_deferred_pending,
+    configure_buffer as configure_deferred_buffer, get_stats as get_deferred_stats,
+    init_buffer as init_deferred_buffer, process_pending as process_deferred_pending,
 };
 
 /// Store header magic value: "CRAB" in little-endian

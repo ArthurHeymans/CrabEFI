@@ -2,7 +2,7 @@
 //!
 //! Common utility functions used across EFI modules.
 
-use crate::efi::allocator::{allocate_pool, MemoryType};
+use crate::efi::allocator::{MemoryType, allocate_pool};
 
 // ============================================================================
 // UCS-2 String Utilities

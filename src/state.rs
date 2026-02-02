@@ -139,11 +139,7 @@ pub fn try_get() -> Option<&'static FirmwareState> {
 #[inline]
 pub fn try_get_mut_ptr() -> Option<*mut FirmwareState> {
     let ptr = STATE_PTR.load(Ordering::Acquire);
-    if ptr.is_null() {
-        None
-    } else {
-        Some(ptr)
-    }
+    if ptr.is_null() { None } else { Some(ptr) }
 }
 
 // ============================================================================

@@ -29,7 +29,7 @@ use crate::drivers::spi::{self, SpiController};
 use crate::state::{self, MAX_VARIABLE_DATA_SIZE, MAX_VARIABLE_NAME_LEN};
 
 use super::storage::{SpiStorageBackend, StorageBackend};
-use super::{StoreHeader, VarStoreError, VariableRecord, STORE_HEADER_SIZE};
+use super::{STORE_HEADER_SIZE, StoreHeader, VarStoreError, VariableRecord};
 
 /// Default variable store base address in SPI flash
 /// This is typically at the end of the flash region
@@ -192,7 +192,11 @@ fn calculate_spi_offset(mmap_addr: u64, bios_region: Option<(u32, u32)>) -> u32 
             let flash_offset = bios_base + offset_in_bios;
             log::debug!(
                 "SPI offset calculation: mmap_addr={:#x}, bios_base={:#x}, bios_size={:#x}, mmap_base={:#x}, flash_offset={:#x}",
-                mmap_addr, bios_base, bios_size, mmap_base, flash_offset
+                mmap_addr,
+                bios_base,
+                bios_size,
+                mmap_base,
+                flash_offset
             );
             return flash_offset;
         }
@@ -237,10 +241,22 @@ fn init_varstore() -> Result<(), VarStoreError> {
     // Log raw header bytes for debugging
     log::debug!(
         "Variable store header bytes: {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x}",
-        header_bytes[0], header_bytes[1], header_bytes[2], header_bytes[3],
-        header_bytes[4], header_bytes[5], header_bytes[6], header_bytes[7],
-        header_bytes[8], header_bytes[9], header_bytes[10], header_bytes[11],
-        header_bytes[12], header_bytes[13], header_bytes[14], header_bytes[15]
+        header_bytes[0],
+        header_bytes[1],
+        header_bytes[2],
+        header_bytes[3],
+        header_bytes[4],
+        header_bytes[5],
+        header_bytes[6],
+        header_bytes[7],
+        header_bytes[8],
+        header_bytes[9],
+        header_bytes[10],
+        header_bytes[11],
+        header_bytes[12],
+        header_bytes[13],
+        header_bytes[14],
+        header_bytes[15]
     );
 
     // Check if the header is valid

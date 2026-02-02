@@ -52,7 +52,7 @@
 
 use core::sync::atomic::{AtomicBool, Ordering};
 
-use super::{crc32, SerializedTime, VarStoreError, VariableRecord};
+use super::{SerializedTime, VarStoreError, VariableRecord, crc32};
 use crate::efi::auth;
 
 /// Magic value for the deferred buffer header: "CVBF" (CrabVariable Buffer)
@@ -448,8 +448,12 @@ pub fn queue_write(
 
         log::info!(
             "Queuing authenticated variable for deferred verification (timestamp: {}-{:02}-{:02} {:02}:{:02}:{:02})",
-            timestamp.year, timestamp.month, timestamp.day,
-            timestamp.hour, timestamp.minute, timestamp.second
+            timestamp.year,
+            timestamp.month,
+            timestamp.day,
+            timestamp.hour,
+            timestamp.minute,
+            timestamp.second
         );
 
         // Store the data as-is (includes the auth header) along with the extracted timestamp
