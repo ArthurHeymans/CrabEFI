@@ -3,6 +3,7 @@
 //! This module handles the Secure Boot key databases and provides
 //! functions for managing authenticated variables.
 
+use super::crypto::constant_time_eq;
 use super::structures::{EfiTime, SignatureIterator, SignatureListIterator};
 use super::{AuthError, EFI_CERT_SHA256_GUID, EFI_CERT_X509_GUID};
 use alloc::vec::Vec;
@@ -239,11 +240,16 @@ impl KeyDatabase {
     }
 
     /// Check if a SHA-256 hash is in the database
+    ///
+    /// Uses constant-time comparison to prevent timing side-channel attacks
+    /// that could leak information about which hashes are in the database.
     pub fn contains_sha256_hash(&self, hash: &[u8; 32]) -> bool {
         let sha256_guid = guid_to_bytes(&EFI_CERT_SHA256_GUID);
-        self.entries
-            .iter()
-            .any(|e| e.cert_type == sha256_guid && e.data.len() >= 32 && e.data[..32] == hash[..])
+        self.entries.iter().any(|e| {
+            e.cert_type == sha256_guid
+                && e.data.len() >= 32
+                && constant_time_eq(&e.data[..32], hash)
+        })
     }
 
     /// Get all X.509 certificates in the database

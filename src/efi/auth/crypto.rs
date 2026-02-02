@@ -312,8 +312,22 @@ fn build_signed_attrs_digest(
 }
 
 /// Constant-time byte array comparison to prevent timing attacks
+///
+/// This function compares two byte slices in constant time to prevent
+/// timing side-channel attacks. The execution time is independent of
+/// where (or whether) the bytes differ.
+///
+/// # Security
+///
+/// Use this function when comparing:
+/// - Cryptographic hashes (SHA-256, etc.)
+/// - Message authentication codes (HMACs)
+/// - Any security-sensitive byte comparisons
+///
+/// Do NOT use regular `==` for these comparisons as it may short-circuit
+/// on the first differing byte, leaking information through timing.
 #[inline(never)]
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;
     }
