@@ -108,12 +108,12 @@ fn build_qemu_command(config: &QemuConfig, disk_path: &Path) -> Result<Command> 
             cmd.args(["-device", "nvme,serial=deadbeef,drive=nvme0"]);
         }
         StorageType::Sdhci => {
+            cmd.args(["-device", "sdhci-pci"]);
             cmd.args([
                 "-drive",
-                &format!("file={},if=none,id=sd0,format=raw", disk_path_str),
+                &format!("file={},if=none,id=sddrive0,format=raw", disk_path_str),
             ]);
-            cmd.args(["-device", "sdhci-pci"]);
-            cmd.args(["-device", "sd-card,drive=sd0"]);
+            cmd.args(["-device", "sd-card,drive=sddrive0"]);
         }
     }
 
@@ -320,12 +320,12 @@ fn run_qemu_with_capture(config: &QemuConfig, disk_path: &Path) -> Result<TestRe
             cmd.args(["-device", "nvme,serial=deadbeef,drive=nvme0"]);
         }
         StorageType::Sdhci => {
+            cmd.args(["-device", "sdhci-pci"]);
             cmd.args([
                 "-drive",
-                &format!("file={},if=none,id=sd0,format=raw", disk_path_str),
+                &format!("file={},if=none,id=sddrive0,format=raw", disk_path_str),
             ]);
-            cmd.args(["-device", "sdhci-pci"]);
-            cmd.args(["-device", "sd-card,drive=sd0"]);
+            cmd.args(["-device", "sd-card,drive=sddrive0"]);
         }
     }
 
