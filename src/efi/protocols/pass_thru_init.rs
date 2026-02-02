@@ -11,7 +11,7 @@ use crate::efi::protocols::ata_pass_thru::{self, ATA_PASS_THRU_GUID};
 use crate::efi::protocols::device_path;
 use crate::efi::protocols::nvme_pass_thru::{self, NVM_EXPRESS_PASS_THRU_GUID};
 use crate::efi::protocols::scsi_pass_thru::{self, EXT_SCSI_PASS_THRU_GUID};
-use crate::efi::protocols::storage_security::{self, StorageType, STORAGE_SECURITY_COMMAND_GUID};
+use crate::efi::protocols::storage_security::{self, STORAGE_SECURITY_COMMAND_GUID, StorageType};
 
 /// Initialize all pass-through protocols for detected storage devices
 ///

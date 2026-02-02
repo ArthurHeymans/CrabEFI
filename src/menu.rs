@@ -337,8 +337,7 @@ fn discover_ahci_entries(menu: &mut BootMenu) {
                                 type_guid: [0u8; 16], // Not a real GUID
                                 partition_guid: [0u8; 16],
                                 first_lba: efi_image.start_sector,
-                                last_lba: efi_image.start_sector
-                                    + efi_image.sector_count as u64
+                                last_lba: efi_image.start_sector + efi_image.sector_count as u64
                                     - 1,
                                 attributes: 0,
                                 is_esp: true, // Treat it as ESP

@@ -1105,7 +1105,9 @@ impl AhciController {
         let cmd_list = self.ports[port_index].cmd_list;
         let cmd_tables = self.ports[port_index].cmd_tables;
 
-        let slot = self.find_free_slot(port_num).ok_or(AhciError::PortNotReady)?;
+        let slot = self
+            .find_free_slot(port_num)
+            .ok_or(AhciError::PortNotReady)?;
 
         // Allocate aligned buffer for DMA
         let dma_buffer = efi::allocate_pages(1).ok_or(AhciError::AllocationFailed)?;
@@ -1134,9 +1136,9 @@ impl AhciController {
         *fis = FisRegH2D::new();
         fis.set_command(ATA_CMD_TRUSTED_RECEIVE_DMA);
         fis.feature_l = protocol_id;
-        
+
         // Transfer length in 512-byte blocks
-        let transfer_blocks = (buffer.len() as u32 + 511) / 512;
+        let transfer_blocks = (buffer.len() as u32).div_ceil(512);
         fis.lba0 = (transfer_blocks & 0xFF) as u8;
         fis.lba1 = ((transfer_blocks >> 8) & 0xFF) as u8;
         fis.lba2 = 0;
@@ -1167,7 +1169,10 @@ impl AhciController {
         efi::free_pages(dma_buffer, 1);
 
         result.map(|_| {
-            log::debug!("AHCI Trusted Receive: {} bytes transferred", bytes_transferred);
+            log::debug!(
+                "AHCI Trusted Receive: {} bytes transferred",
+                bytes_transferred
+            );
             bytes_transferred
         })
     }
@@ -1211,7 +1216,9 @@ impl AhciController {
         let cmd_list = self.ports[port_index].cmd_list;
         let cmd_tables = self.ports[port_index].cmd_tables;
 
-        let slot = self.find_free_slot(port_num).ok_or(AhciError::PortNotReady)?;
+        let slot = self
+            .find_free_slot(port_num)
+            .ok_or(AhciError::PortNotReady)?;
 
         // Allocate aligned buffer for DMA
         let dma_buffer = efi::allocate_pages(1).ok_or(AhciError::AllocationFailed)?;
@@ -1219,11 +1226,7 @@ impl AhciController {
 
         // Copy data to DMA buffer
         unsafe {
-            core::ptr::copy_nonoverlapping(
-                buffer.as_ptr(),
-                dma_buffer.as_mut_ptr(),
-                buffer.len(),
-            );
+            core::ptr::copy_nonoverlapping(buffer.as_ptr(), dma_buffer.as_mut_ptr(), buffer.len());
         }
 
         // Setup command header
@@ -1249,9 +1252,9 @@ impl AhciController {
         *fis = FisRegH2D::new();
         fis.set_command(ATA_CMD_TRUSTED_SEND_DMA);
         fis.feature_l = protocol_id;
-        
+
         // Transfer length in 512-byte blocks
-        let transfer_blocks = (buffer.len() as u32 + 511) / 512;
+        let transfer_blocks = (buffer.len() as u32).div_ceil(512);
         fis.lba0 = (transfer_blocks & 0xFF) as u8;
         fis.lba1 = ((transfer_blocks >> 8) & 0xFF) as u8;
         fis.lba2 = 0;

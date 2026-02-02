@@ -129,5 +129,3 @@ pub fn read_sectors(device_id: u32, lba: u64, buffer: &mut [u8]) -> Result<(), (
         }
     }
 }
-
-

@@ -169,16 +169,11 @@ pub struct ExtScsiPassThruProtocol {
     /// Reset the SCSI channel
     pub reset_channel: extern "efiapi" fn(this: *mut ExtScsiPassThruProtocol) -> Status,
     /// Reset a target and LUN
-    pub reset_target_lun: extern "efiapi" fn(
-        this: *mut ExtScsiPassThruProtocol,
-        target: *mut u8,
-        lun: u64,
-    ) -> Status,
+    pub reset_target_lun:
+        extern "efiapi" fn(this: *mut ExtScsiPassThruProtocol, target: *mut u8, lun: u64) -> Status,
     /// Get next target (without LUN iteration)
-    pub get_next_target: extern "efiapi" fn(
-        this: *mut ExtScsiPassThruProtocol,
-        target: *mut *mut u8,
-    ) -> Status,
+    pub get_next_target:
+        extern "efiapi" fn(this: *mut ExtScsiPassThruProtocol, target: *mut *mut u8) -> Status,
 }
 
 /// Internal context for SCSI Pass Thru protocol instance
@@ -263,7 +258,8 @@ extern "efiapi" fn scsi_pass_thru(
         return Status::INVALID_PARAMETER;
     }
 
-    let cdb = unsafe { core::slice::from_raw_parts(packet.cdb as *const u8, packet.cdb_length as usize) };
+    let cdb =
+        unsafe { core::slice::from_raw_parts(packet.cdb as *const u8, packet.cdb_length as usize) };
     let opcode = cdb[0];
 
     log::debug!(
@@ -315,13 +311,19 @@ extern "efiapi" fn scsi_pass_thru(
                         }
                     }
                     _ => {
-                        log::warn!("ScsiPassThru: unsupported data direction {}", packet.data_direction);
+                        log::warn!(
+                            "ScsiPassThru: unsupported data direction {}",
+                            packet.data_direction
+                        );
                         Status::UNSUPPORTED
                     }
                 }
             }
             Err(e) => {
-                log::error!("ScsiPassThru: failed to create mass storage device: {:?}", e);
+                log::error!(
+                    "ScsiPassThru: failed to create mass storage device: {:?}",
+                    e
+                );
                 packet.host_adapter_status = HOST_ADAPTER_OTHER;
                 Status::DEVICE_ERROR
             }
@@ -369,7 +371,7 @@ fn execute_scsi_write(
     let mut buf_copy = [0u8; 4096];
     let len = buffer.len().min(buf_copy.len());
     buf_copy[..len].copy_from_slice(&buffer[..len]);
-    
+
     match send_scsi_command(device, controller, cdb, Some(&mut buf_copy[..len]), false) {
         Ok(_) => {
             packet.host_adapter_status = HOST_ADAPTER_OK;
@@ -397,7 +399,7 @@ fn send_scsi_command(
     // For now, we only support specific security-related commands
     // A full implementation would need direct access to the scsi_command method
     let opcode = cdb[0];
-    
+
     match opcode {
         SCSI_SECURITY_PROTOCOL_IN | SCSI_SECURITY_PROTOCOL_OUT => {
             // These need direct SCSI command support in mass_storage.rs
@@ -492,17 +494,10 @@ extern "efiapi" fn scsi_build_device_path(
         }
     };
 
-    log::debug!(
-        "ScsiPassThru.BuildDevicePath: lun={}",
-        lun
-    );
+    log::debug!("ScsiPassThru.BuildDevicePath: lun={}", lun);
 
     // Create USB device path
-    let path = device_path::create_usb_device_path(
-        ctx.pci_device,
-        ctx.pci_function,
-        ctx.usb_port,
-    );
+    let path = device_path::create_usb_device_path(ctx.pci_device, ctx.pci_function, ctx.usb_port);
 
     if path.is_null() {
         return Status::OUT_OF_RESOURCES;
@@ -547,7 +542,7 @@ extern "efiapi" fn scsi_get_target_lun(
             let usb_node = current as *const UsbDevicePathNode;
             let port = unsafe { (*usb_node).parent_port };
             log::debug!("ScsiPassThru.GetTargetLun: found USB port={}", port);
-            
+
             // Return target ID 0 and LUN 0
             unsafe {
                 let target_storage = core::ptr::addr_of_mut!(TARGET_IDS);
@@ -577,7 +572,7 @@ extern "efiapi" fn scsi_reset_channel(this: *mut ExtScsiPassThruProtocol) -> Sta
     }
 
     log::info!("ScsiPassThru.ResetChannel: not implemented for USB");
-    
+
     // USB mass storage doesn't have a channel reset concept
     // Just return success
     Status::SUCCESS
@@ -598,7 +593,7 @@ extern "efiapi" fn scsi_reset_target_lun(
     }
 
     log::info!("ScsiPassThru.ResetTargetLun: not implemented for USB");
-    
+
     // USB mass storage device reset would require sending a USB reset
     // For now, just return success
     Status::SUCCESS
@@ -693,23 +688,19 @@ pub fn create_scsi_pass_thru_protocol(
     };
 
     // Allocate mode structure
-    let mode_ptr = allocate_protocol_with_log::<ExtScsiPassThruMode>(
-        "ExtScsiPassThruMode",
-        |m| {
-            m.adapter_id = controller_index as u32;
-            m.attributes = ATTRIBUTES_PHYSICAL | ATTRIBUTES_LOGICAL;
-            m.io_align = 4; // 4-byte alignment
-        },
-    );
+    let mode_ptr = allocate_protocol_with_log::<ExtScsiPassThruMode>("ExtScsiPassThruMode", |m| {
+        m.adapter_id = controller_index as u32;
+        m.attributes = ATTRIBUTES_PHYSICAL | ATTRIBUTES_LOGICAL;
+        m.io_align = 4; // 4-byte alignment
+    });
 
     if mode_ptr.is_null() {
         return core::ptr::null_mut();
     }
 
     // Allocate protocol structure
-    let protocol_ptr = allocate_protocol_with_log::<ExtScsiPassThruProtocol>(
-        "ExtScsiPassThruProtocol",
-        |p| {
+    let protocol_ptr =
+        allocate_protocol_with_log::<ExtScsiPassThruProtocol>("ExtScsiPassThruProtocol", |p| {
             p.mode = mode_ptr;
             p.pass_thru = scsi_pass_thru;
             p.get_next_target_lun = scsi_get_next_target_lun;
@@ -718,8 +709,7 @@ pub fn create_scsi_pass_thru_protocol(
             p.reset_channel = scsi_reset_channel;
             p.reset_target_lun = scsi_reset_target_lun;
             p.get_next_target = scsi_get_next_target;
-        },
-    );
+        });
 
     if protocol_ptr.is_null() {
         return core::ptr::null_mut();

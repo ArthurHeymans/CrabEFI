@@ -193,10 +193,7 @@ pub struct AtaPassThruProtocol {
         event: Event,
     ) -> Status,
     /// Get next port function
-    pub get_next_port: extern "efiapi" fn(
-        this: *mut AtaPassThruProtocol,
-        port: *mut u16,
-    ) -> Status,
+    pub get_next_port: extern "efiapi" fn(this: *mut AtaPassThruProtocol, port: *mut u16) -> Status,
     /// Get next device on a port
     pub get_next_device: extern "efiapi" fn(
         this: *mut AtaPassThruProtocol,
@@ -218,10 +215,7 @@ pub struct AtaPassThruProtocol {
         port_multiplier_port: *mut u16,
     ) -> Status,
     /// Reset a port
-    pub reset_port: extern "efiapi" fn(
-        this: *mut AtaPassThruProtocol,
-        port: u16,
-    ) -> Status,
+    pub reset_port: extern "efiapi" fn(this: *mut AtaPassThruProtocol, port: u16) -> Status,
     /// Reset a device
     pub reset_device: extern "efiapi" fn(
         this: *mut AtaPassThruProtocol,
@@ -327,11 +321,11 @@ extern "efiapi" fn ata_pass_thru(
     let port_index = {
         let mut found = None;
         for i in 0..controller.num_active_ports() {
-            if let Some(p) = controller.get_port(i) {
-                if p.port_num as u16 == port {
-                    found = Some(i);
-                    break;
-                }
+            if let Some(p) = controller.get_port(i)
+                && p.port_num as u16 == port
+            {
+                found = Some(i);
+                break;
             }
         }
         match found {
@@ -355,7 +349,8 @@ extern "efiapi" fn ata_pass_thru(
                     )
                 };
                 let protocol_id = acb.ata_features;
-                let sp_specific = ((acb.ata_device_head & 0x0F) as u16) | ((acb.ata_cylinder_high as u16) << 8);
+                let sp_specific =
+                    ((acb.ata_device_head & 0x0F) as u16) | ((acb.ata_cylinder_high as u16) << 8);
 
                 match controller.trusted_receive(port_index, protocol_id, sp_specific, buffer) {
                     Ok(bytes) => {
@@ -389,7 +384,8 @@ extern "efiapi" fn ata_pass_thru(
                     )
                 };
                 let protocol_id = acb.ata_features;
-                let sp_specific = ((acb.ata_device_head & 0x0F) as u16) | ((acb.ata_cylinder_high as u16) << 8);
+                let sp_specific =
+                    ((acb.ata_device_head & 0x0F) as u16) | ((acb.ata_cylinder_high as u16) << 8);
 
                 match controller.trusted_send(port_index, protocol_id, sp_specific, buffer) {
                     Ok(()) => {
@@ -424,10 +420,7 @@ extern "efiapi" fn ata_pass_thru(
 /// Get the next port number
 ///
 /// Used to enumerate ports. Pass 0xFFFF to get the first port.
-extern "efiapi" fn ata_get_next_port(
-    this: *mut AtaPassThruProtocol,
-    port: *mut u16,
-) -> Status {
+extern "efiapi" fn ata_get_next_port(this: *mut AtaPassThruProtocol, port: *mut u16) -> Status {
     if this.is_null() || port.is_null() {
         return Status::INVALID_PARAMETER;
     }
@@ -466,15 +459,15 @@ extern "efiapi" fn ata_get_next_port(
 
     // Find current port and return the next one
     for i in 0..controller.num_active_ports() {
-        if let Some(p) = controller.get_port(i) {
-            if p.port_num as u16 == current_port {
-                // Found current, return next
-                if let Some(next_p) = controller.get_port(i + 1) {
-                    unsafe { *port = next_p.port_num as u16 };
-                    return Status::SUCCESS;
-                }
-                return Status::NOT_FOUND;
+        if let Some(p) = controller.get_port(i)
+            && p.port_num as u16 == current_port
+        {
+            // Found current, return next
+            if let Some(next_p) = controller.get_port(i + 1) {
+                unsafe { *port = next_p.port_num as u16 };
+                return Status::SUCCESS;
             }
+            return Status::NOT_FOUND;
         }
     }
 
@@ -510,7 +503,9 @@ extern "efiapi" fn ata_get_next_device(
 
     // Verify the port exists
     let port_exists = (0..controller.num_active_ports()).any(|i| {
-        controller.get_port(i).is_some_and(|p| p.port_num as u16 == port)
+        controller
+            .get_port(i)
+            .is_some_and(|p| p.port_num as u16 == port)
     });
 
     if !port_exists {
@@ -555,17 +550,10 @@ extern "efiapi" fn ata_build_device_path(
         }
     };
 
-    log::debug!(
-        "AtaPassThru.BuildDevicePath: port={}",
-        port
-    );
+    log::debug!("AtaPassThru.BuildDevicePath: port={}", port);
 
     // Create SATA device path
-    let path = device_path::create_sata_device_path(
-        ctx.pci_device,
-        ctx.pci_function,
-        port,
-    );
+    let path = device_path::create_sata_device_path(ctx.pci_device, ctx.pci_function, port);
 
     if path.is_null() {
         return Status::OUT_OF_RESOURCES;
@@ -603,7 +591,11 @@ extern "efiapi" fn ata_get_device(
             let sata_node = current as *const SataDevicePathNode;
             let found_port = unsafe { (*sata_node).hba_port };
             let found_pmp = unsafe { (*sata_node).port_multiplier_port };
-            log::debug!("AtaPassThru.GetDevice: found port={}, pmp={}", found_port, found_pmp);
+            log::debug!(
+                "AtaPassThru.GetDevice: found port={}, pmp={}",
+                found_port,
+                found_pmp
+            );
             unsafe {
                 *port = found_port;
                 *port_multiplier_port = found_pmp;
@@ -624,10 +616,7 @@ extern "efiapi" fn ata_get_device(
 }
 
 /// Reset a port
-extern "efiapi" fn ata_reset_port(
-    this: *mut AtaPassThruProtocol,
-    port: u16,
-) -> Status {
+extern "efiapi" fn ata_reset_port(this: *mut AtaPassThruProtocol, port: u16) -> Status {
     if this.is_null() {
         return Status::INVALID_PARAMETER;
     }
@@ -651,7 +640,9 @@ extern "efiapi" fn ata_reset_port(
 
     // Verify the port exists
     let port_exists = (0..controller.num_active_ports()).any(|i| {
-        controller.get_port(i).is_some_and(|p| p.port_num as u16 == port)
+        controller
+            .get_port(i)
+            .is_some_and(|p| p.port_num as u16 == port)
     });
 
     if !port_exists {
@@ -718,22 +709,18 @@ pub fn create_ata_pass_thru_protocol(
     }
 
     // Allocate mode structure
-    let mode_ptr = allocate_protocol_with_log::<AtaPassThruMode>(
-        "AtaPassThruMode",
-        |m| {
-            m.attributes = ATTRIBUTES_PHYSICAL | ATTRIBUTES_LOGICAL;
-            m.io_align = 4; // 4-byte alignment
-        },
-    );
+    let mode_ptr = allocate_protocol_with_log::<AtaPassThruMode>("AtaPassThruMode", |m| {
+        m.attributes = ATTRIBUTES_PHYSICAL | ATTRIBUTES_LOGICAL;
+        m.io_align = 4; // 4-byte alignment
+    });
 
     if mode_ptr.is_null() {
         return core::ptr::null_mut();
     }
 
     // Allocate protocol structure
-    let protocol_ptr = allocate_protocol_with_log::<AtaPassThruProtocol>(
-        "AtaPassThruProtocol",
-        |p| {
+    let protocol_ptr =
+        allocate_protocol_with_log::<AtaPassThruProtocol>("AtaPassThruProtocol", |p| {
             p.mode = mode_ptr;
             p.pass_thru = ata_pass_thru;
             p.get_next_port = ata_get_next_port;
@@ -742,8 +729,7 @@ pub fn create_ata_pass_thru_protocol(
             p.get_device = ata_get_device;
             p.reset_port = ata_reset_port;
             p.reset_device = ata_reset_device;
-        },
-    );
+        });
 
     if protocol_ptr.is_null() {
         return core::ptr::null_mut();

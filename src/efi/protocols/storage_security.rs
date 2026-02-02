@@ -31,19 +31,14 @@ pub const STORAGE_SECURITY_COMMAND_GUID: Guid = Guid::from_fields(
 #[derive(Clone, Copy, Debug)]
 pub enum StorageType {
     /// NVMe storage with controller index and namespace ID
-    Nvme {
-        controller_index: usize,
-        nsid: u32,
-    },
+    Nvme { controller_index: usize, nsid: u32 },
     /// AHCI/SATA storage with controller index and port number
     Ahci {
         controller_index: usize,
         port: usize,
     },
     /// USB Mass Storage with device index
-    UsbScsi {
-        device_index: usize,
-    },
+    UsbScsi { device_index: usize },
 }
 
 /// Storage Security Command Protocol
@@ -88,7 +83,8 @@ struct StorageSecurityContext {
 const MAX_INSTANCES: usize = 16;
 
 /// Global storage for contexts
-static mut CONTEXTS: [Option<StorageSecurityContext>; MAX_INSTANCES] = [const { None }; MAX_INSTANCES];
+static mut CONTEXTS: [Option<StorageSecurityContext>; MAX_INSTANCES] =
+    [const { None }; MAX_INSTANCES];
 
 /// Protocol instance to context mapping
 static mut PROTOCOL_TO_CONTEXT: [Option<*mut StorageSecurityCommandProtocol>; MAX_INSTANCES] =
@@ -110,7 +106,9 @@ fn find_context_index(protocol: *mut StorageSecurityCommandProtocol) -> Option<u
 }
 
 /// Get context for a protocol instance
-fn get_context(protocol: *mut StorageSecurityCommandProtocol) -> Option<&'static StorageSecurityContext> {
+fn get_context(
+    protocol: *mut StorageSecurityCommandProtocol,
+) -> Option<&'static StorageSecurityContext> {
     let idx = find_context_index(protocol)?;
     unsafe {
         let contexts = core::ptr::addr_of!(CONTEXTS);
@@ -169,27 +167,46 @@ extern "efiapi" fn storage_security_receive_data(
     }
 
     // Create buffer slice
-    let buffer = unsafe {
-        core::slice::from_raw_parts_mut(payload_buffer as *mut u8, payload_buffer_size)
-    };
+    let buffer =
+        unsafe { core::slice::from_raw_parts_mut(payload_buffer as *mut u8, payload_buffer_size) };
 
     // Dispatch based on storage type
     let result = match ctx.storage_type {
-        StorageType::Nvme { controller_index, nsid } => {
-            nvme_security_receive(controller_index, nsid, security_protocol_id, security_protocol_specific, buffer)
-        }
-        StorageType::Ahci { controller_index, port } => {
-            ahci_security_receive(controller_index, port, security_protocol_id, security_protocol_specific, buffer)
-        }
-        StorageType::UsbScsi { device_index } => {
-            usb_security_receive(device_index, security_protocol_id, security_protocol_specific, buffer)
-        }
+        StorageType::Nvme {
+            controller_index,
+            nsid,
+        } => nvme_security_receive(
+            controller_index,
+            nsid,
+            security_protocol_id,
+            security_protocol_specific,
+            buffer,
+        ),
+        StorageType::Ahci {
+            controller_index,
+            port,
+        } => ahci_security_receive(
+            controller_index,
+            port,
+            security_protocol_id,
+            security_protocol_specific,
+            buffer,
+        ),
+        StorageType::UsbScsi { device_index } => usb_security_receive(
+            device_index,
+            security_protocol_id,
+            security_protocol_specific,
+            buffer,
+        ),
     };
 
     match result {
         Ok(bytes_transferred) => {
             unsafe { *payload_transfer_size = bytes_transferred };
-            log::debug!("StorageSecurity.ReceiveData: transferred {} bytes", bytes_transferred);
+            log::debug!(
+                "StorageSecurity.ReceiveData: transferred {} bytes",
+                bytes_transferred
+            );
             Status::SUCCESS
         }
         Err(e) => {
@@ -248,21 +265,37 @@ extern "efiapi" fn storage_security_send_data(
     }
 
     // Create buffer slice
-    let buffer = unsafe {
-        core::slice::from_raw_parts(payload_buffer as *const u8, payload_buffer_size)
-    };
+    let buffer =
+        unsafe { core::slice::from_raw_parts(payload_buffer as *const u8, payload_buffer_size) };
 
     // Dispatch based on storage type
     let result = match ctx.storage_type {
-        StorageType::Nvme { controller_index, nsid } => {
-            nvme_security_send(controller_index, nsid, security_protocol_id, security_protocol_specific, buffer)
-        }
-        StorageType::Ahci { controller_index, port } => {
-            ahci_security_send(controller_index, port, security_protocol_id, security_protocol_specific, buffer)
-        }
-        StorageType::UsbScsi { device_index } => {
-            usb_security_send(device_index, security_protocol_id, security_protocol_specific, buffer)
-        }
+        StorageType::Nvme {
+            controller_index,
+            nsid,
+        } => nvme_security_send(
+            controller_index,
+            nsid,
+            security_protocol_id,
+            security_protocol_specific,
+            buffer,
+        ),
+        StorageType::Ahci {
+            controller_index,
+            port,
+        } => ahci_security_send(
+            controller_index,
+            port,
+            security_protocol_id,
+            security_protocol_specific,
+            buffer,
+        ),
+        StorageType::UsbScsi { device_index } => usb_security_send(
+            device_index,
+            security_protocol_id,
+            security_protocol_specific,
+            buffer,
+        ),
     };
 
     match result {
@@ -289,10 +322,10 @@ fn nvme_security_receive(
     sp_specific: u16,
     buffer: &mut [u8],
 ) -> Result<usize, &'static str> {
-    let controller = nvme::get_controller(controller_index)
-        .ok_or("NVMe controller not found")?;
-    
-    controller.security_receive(nsid, protocol_id, sp_specific, buffer)
+    let controller = nvme::get_controller(controller_index).ok_or("NVMe controller not found")?;
+
+    controller
+        .security_receive(nsid, protocol_id, sp_specific, buffer)
         .map_err(|_| "NVMe security receive failed")
 }
 
@@ -304,10 +337,10 @@ fn nvme_security_send(
     sp_specific: u16,
     buffer: &[u8],
 ) -> Result<(), &'static str> {
-    let controller = nvme::get_controller(controller_index)
-        .ok_or("NVMe controller not found")?;
-    
-    controller.security_send(nsid, protocol_id, sp_specific, buffer)
+    let controller = nvme::get_controller(controller_index).ok_or("NVMe controller not found")?;
+
+    controller
+        .security_send(nsid, protocol_id, sp_specific, buffer)
         .map_err(|_| "NVMe security send failed")
 }
 
@@ -323,10 +356,10 @@ fn ahci_security_receive(
     sp_specific: u16,
     buffer: &mut [u8],
 ) -> Result<usize, &'static str> {
-    let controller = ahci::get_controller(controller_index)
-        .ok_or("AHCI controller not found")?;
-    
-    controller.trusted_receive(port, protocol_id, sp_specific, buffer)
+    let controller = ahci::get_controller(controller_index).ok_or("AHCI controller not found")?;
+
+    controller
+        .trusted_receive(port, protocol_id, sp_specific, buffer)
         .map_err(|_| "AHCI trusted receive failed")
 }
 
@@ -338,10 +371,10 @@ fn ahci_security_send(
     sp_specific: u16,
     buffer: &[u8],
 ) -> Result<(), &'static str> {
-    let controller = ahci::get_controller(controller_index)
-        .ok_or("AHCI controller not found")?;
-    
-    controller.trusted_send(port, protocol_id, sp_specific, buffer)
+    let controller = ahci::get_controller(controller_index).ok_or("AHCI controller not found")?;
+
+    controller
+        .trusted_send(port, protocol_id, sp_specific, buffer)
         .map_err(|_| "AHCI trusted send failed")
 }
 
@@ -364,7 +397,8 @@ fn usb_security_receive(
         };
 
         // Call security_protocol_in on the device
-        device.security_protocol_in(controller, protocol_id, sp_specific, buffer)
+        device
+            .security_protocol_in(controller, protocol_id, sp_specific, buffer)
             .map_err(|_| "USB security protocol in failed")
     });
 
@@ -390,7 +424,8 @@ fn usb_security_send(
         };
 
         // Call security_protocol_out on the device
-        device.security_protocol_out(controller, protocol_id, sp_specific, buffer)
+        device
+            .security_protocol_out(controller, protocol_id, sp_specific, buffer)
             .map_err(|_| "USB security protocol out failed")
     });
 
@@ -444,7 +479,7 @@ pub fn create_storage_security_protocol(
             p.send_data = storage_security_send_data;
         },
     );
-    
+
     if protocol_ptr.is_null() {
         return core::ptr::null_mut();
     }

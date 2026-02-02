@@ -146,10 +146,8 @@ pub struct NvmExpressPassThruProtocol {
         event: Event,
     ) -> Status,
     /// Get next namespace function
-    pub get_next_namespace: extern "efiapi" fn(
-        this: *mut NvmExpressPassThruProtocol,
-        namespace_id: *mut u32,
-    ) -> Status,
+    pub get_next_namespace:
+        extern "efiapi" fn(this: *mut NvmExpressPassThruProtocol, namespace_id: *mut u32) -> Status,
     /// Build device path function
     pub build_device_path: extern "efiapi" fn(
         this: *mut NvmExpressPassThruProtocol,
@@ -232,14 +230,14 @@ extern "efiapi" fn nvme_pass_thru(
     };
 
     let packet = unsafe { &mut *packet };
-    
+
     if packet.nvme_cmd.is_null() {
         return Status::INVALID_PARAMETER;
     }
 
     let cmd = unsafe { &*packet.nvme_cmd };
     let opcode = (cmd.cdw0 & 0xFF) as u8;
-    
+
     log::debug!(
         "NvmePassThru.PassThru: nsid={}, opcode={:#x}, queue_type={}",
         namespace_id,
@@ -258,7 +256,7 @@ extern "efiapi" fn nvme_pass_thru(
 
     // For now, we support a limited set of commands via the existing API
     // In a full implementation, we would submit raw commands to the queues
-    
+
     // Check if this is a security command
     if packet.queue_type == NVME_ADMIN_QUEUE {
         match opcode {
@@ -273,8 +271,13 @@ extern "efiapi" fn nvme_pass_thru(
                     };
                     let protocol_id = ((cmd.cdw10 >> 24) & 0xFF) as u8;
                     let sp_specific = (cmd.cdw10 & 0xFFFF) as u16;
-                    
-                    match controller.security_receive(namespace_id, protocol_id, sp_specific, buffer) {
+
+                    match controller.security_receive(
+                        namespace_id,
+                        protocol_id,
+                        sp_specific,
+                        buffer,
+                    ) {
                         Ok(bytes) => {
                             if !packet.nvme_completion.is_null() {
                                 let completion = unsafe { &mut *packet.nvme_completion };
@@ -300,7 +303,7 @@ extern "efiapi" fn nvme_pass_thru(
                     };
                     let protocol_id = ((cmd.cdw10 >> 24) & 0xFF) as u8;
                     let sp_specific = (cmd.cdw10 & 0xFFFF) as u16;
-                    
+
                     match controller.security_send(namespace_id, protocol_id, sp_specific, buffer) {
                         Ok(()) => {
                             if !packet.nvme_completion.is_null() {
@@ -406,17 +409,10 @@ extern "efiapi" fn nvme_build_device_path(
         }
     };
 
-    log::debug!(
-        "NvmePassThru.BuildDevicePath: nsid={}",
-        namespace_id
-    );
+    log::debug!("NvmePassThru.BuildDevicePath: nsid={}", namespace_id);
 
     // Create NVMe device path
-    let path = device_path::create_nvme_device_path(
-        ctx.pci_device,
-        ctx.pci_function,
-        namespace_id,
-    );
+    let path = device_path::create_nvme_device_path(ctx.pci_device, ctx.pci_function, namespace_id);
 
     if path.is_null() {
         return Status::OUT_OF_RESOURCES;
@@ -439,15 +435,15 @@ extern "efiapi" fn nvme_get_namespace(
     // Parse the device path to find the NVMe node
     // Device path format: ACPI/PCI/NVMe/End
     let mut current = device_path;
-    
+
     loop {
         let header = unsafe { &*current };
-        
+
         // Check for end node
         if header.r#type == 0x7F {
             break;
         }
-        
+
         // Check for NVMe namespace node (Type 0x03, SubType 0x17)
         if header.r#type == 0x03 && header.sub_type == 0x17 {
             let nvme_node = current as *const NvmeDevicePathNode;
@@ -456,7 +452,7 @@ extern "efiapi" fn nvme_get_namespace(
             unsafe { *namespace_id = nsid };
             return Status::SUCCESS;
         }
-        
+
         // Move to next node
         let length = u16::from_le_bytes(header.length) as usize;
         if length < 4 {
@@ -516,15 +512,13 @@ pub fn create_nvme_pass_thru_protocol(
     };
 
     // Allocate mode structure
-    let mode_ptr = allocate_protocol_with_log::<NvmExpressPassThruMode>(
-        "NvmExpressPassThruMode",
-        |m| {
+    let mode_ptr =
+        allocate_protocol_with_log::<NvmExpressPassThruMode>("NvmExpressPassThruMode", |m| {
             m.attributes = ATTRIBUTES_PHYSICAL | ATTRIBUTES_LOGICAL | ATTRIBUTES_CMD_SET_NVM;
             m.io_align = 4; // 4-byte alignment
             m.nvme_version = nvme_version;
-        },
-    );
-    
+        });
+
     if mode_ptr.is_null() {
         return core::ptr::null_mut();
     }
@@ -540,7 +534,7 @@ pub fn create_nvme_pass_thru_protocol(
             p.get_namespace = nvme_get_namespace;
         },
     );
-    
+
     if protocol_ptr.is_null() {
         return core::ptr::null_mut();
     }

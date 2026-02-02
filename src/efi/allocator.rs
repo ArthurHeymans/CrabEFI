@@ -692,9 +692,10 @@ impl MemoryAllocator {
 
         if !found {
             // Debug: find what's at this address
-            let containing = self.entries.iter().find(|entry| {
-                entry.physical_start <= start && entry.end() > start
-            });
+            let containing = self
+                .entries
+                .iter()
+                .find(|entry| entry.physical_start <= start && entry.end() > start);
             if let Some(entry) = containing {
                 log::debug!(
                     "is_region_free({:#x}, {:#x}): found {:?} at {:#x}-{:#x} (need end >= {:#x})",

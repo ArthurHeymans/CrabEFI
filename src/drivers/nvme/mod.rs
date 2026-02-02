@@ -5,9 +5,9 @@
 
 use crate::drivers::pci::{self, PciAddress, PciDevice};
 use crate::efi;
-use crate::time::{wait_for, Timeout};
+use crate::time::{Timeout, wait_for};
 use core::ptr;
-use core::sync::atomic::{fence, Ordering};
+use core::sync::atomic::{Ordering, fence};
 use spin::Mutex;
 use tock_registers::interfaces::{ReadWriteable, Readable, Writeable};
 use tock_registers::register_bitfields;
@@ -1033,7 +1033,7 @@ impl NvmeController {
         cmd.nsid = nsid;
         cmd.prp1 = self.dma_buffer as u64;
         cmd.cdw10 = ((protocol_id as u32) << 24) | (sp_specific as u32);
-        cmd.cdw11 = (buffer.len() as u32 + 3) / 4; // Allocation length in dwords
+        cmd.cdw11 = (buffer.len() as u32).div_ceil(4); // Allocation length in dwords
 
         let cid = self.submit_admin_command(&cmd);
         let completion = self.wait_admin_completion(cid)?;
@@ -1103,7 +1103,7 @@ impl NvmeController {
         cmd.nsid = nsid;
         cmd.prp1 = self.dma_buffer as u64;
         cmd.cdw10 = ((protocol_id as u32) << 24) | (sp_specific as u32);
-        cmd.cdw11 = (buffer.len() as u32 + 3) / 4; // Transfer length in dwords
+        cmd.cdw11 = (buffer.len() as u32).div_ceil(4); // Transfer length in dwords
 
         let cid = self.submit_admin_command(&cmd);
         self.wait_admin_completion(cid)?;

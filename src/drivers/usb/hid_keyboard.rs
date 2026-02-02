@@ -8,7 +8,7 @@
 //! - USB HID Specification 1.11
 //! - libpayload usbhid.c
 
-use super::controller::{hid_request, req_type, UsbController, UsbError};
+use super::controller::{UsbController, UsbError, hid_request, req_type};
 use crate::time::Timeout;
 use spin::Mutex;
 
@@ -265,12 +265,12 @@ impl UsbHidKeyboard {
         }
 
         // Check repeat interval
-        if let Some(ref interval_timeout) = self.repeat_interval_timeout {
-            if interval_timeout.is_expired() {
-                // Time for another repeat
-                self.enqueue_key(self.last_key);
-                self.repeat_interval_timeout = Some(Timeout::from_ms(REPEAT_INTERVAL_MS));
-            }
+        if let Some(ref interval_timeout) = self.repeat_interval_timeout
+            && interval_timeout.is_expired()
+        {
+            // Time for another repeat
+            self.enqueue_key(self.last_key);
+            self.repeat_interval_timeout = Some(Timeout::from_ms(REPEAT_INTERVAL_MS));
         }
     }
 
@@ -726,17 +726,17 @@ pub fn poll<C: UsbController>(controller: &mut C) {
     // Rate limit: only poll every MIN_POLL_INTERVAL_MS
     {
         let mut timeout_guard = NEXT_POLL_TIMEOUT.lock();
-        if let Some(ref timeout) = *timeout_guard {
-            if !timeout.is_expired() {
-                // Not enough time has passed, skip this poll
-                // But still check key repeat with the current keyboard state
-                drop(timeout_guard); // Release lock before acquiring keyboard lock
-                let mut keyboard_guard = USB_KEYBOARD.lock();
-                if let Some(keyboard) = keyboard_guard.as_mut() {
-                    keyboard.handle_repeat();
-                }
-                return;
+        if let Some(ref timeout) = *timeout_guard
+            && !timeout.is_expired()
+        {
+            // Not enough time has passed, skip this poll
+            // But still check key repeat with the current keyboard state
+            drop(timeout_guard); // Release lock before acquiring keyboard lock
+            let mut keyboard_guard = USB_KEYBOARD.lock();
+            if let Some(keyboard) = keyboard_guard.as_mut() {
+                keyboard.handle_repeat();
             }
+            return;
         }
         // Set next poll timeout
         *timeout_guard = Some(Timeout::from_ms(MIN_POLL_INTERVAL_MS));
