@@ -1,0 +1,10 @@
+# xtask uses host target (requires std), not the x86_64-unknown-none target
+# This file overrides the parent .cargo/config.toml settings
+
+[build]
+# Use host target instead of x86_64-unknown-none
+target = "x86_64-unknown-linux-gnu"
+
+[target.x86_64-unknown-linux-gnu]
+# No special rustflags needed for host target
+rustflags = []

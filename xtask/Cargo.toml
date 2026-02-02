@@ -1,0 +1,17 @@
+[package]
+name = "xtask"
+version = "0.1.0"
+edition = "2024"
+description = "Build and test automation for CrabEFI"
+
+[[bin]]
+name = "crabefi-xtask"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+fs-err = "3"
+regex = "1"
+serde_json = "1"
+tempfile = "3"

@@ -1,0 +1,15 @@
+#!/bin/bash
+# CrabEFI build and test wrapper
+#
+# This script runs the xtask build system on the host (not the firmware target).
+# Usage: ./crabefi [command] [options]
+
+set -e
+
+# Get the directory where this script is located
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+
+# Run xtask from within its own directory
+# Use stable toolchain to avoid nightly-only build-std feature from parent config
+cd "$SCRIPT_DIR/xtask"
+exec env RUSTUP_TOOLCHAIN=stable cargo run -q -- --project-dir "$SCRIPT_DIR" "$@"
