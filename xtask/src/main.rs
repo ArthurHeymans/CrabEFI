@@ -68,6 +68,10 @@ enum Commands {
         #[arg(long)]
         nvme: bool,
 
+        /// Use SDHCI (SD card) storage instead of USB
+        #[arg(long)]
+        sdhci: bool,
+
         /// Run without graphical display (serial only)
         #[arg(long)]
         headless: bool,
@@ -102,6 +106,10 @@ enum Commands {
         /// Use NVMe storage
         #[arg(long)]
         nvme: bool,
+
+        /// Use SDHCI (SD card) storage
+        #[arg(long)]
+        sdhci: bool,
 
         /// Disable KVM acceleration
         #[arg(long)]
@@ -154,19 +162,30 @@ fn main() -> Result<()> {
             coreboot_rom,
             ahci,
             nvme,
+            sdhci,
             headless,
             disable_kvm,
             app,
             disk,
-        } => cmd_run(coreboot_rom, ahci, nvme, headless, disable_kvm, app, disk),
+        } => cmd_run(
+            coreboot_rom,
+            ahci,
+            nvme,
+            sdhci,
+            headless,
+            disable_kvm,
+            app,
+            disk,
+        ),
         Commands::Test {
             coreboot_rom,
             app,
             ahci,
             nvme,
+            sdhci,
             disable_kvm,
             timeout,
-        } => cmd_test(coreboot_rom, &app, ahci, nvme, disable_kvm, timeout),
+        } => cmd_test(coreboot_rom, &app, ahci, nvme, sdhci, disable_kvm, timeout),
         Commands::BuildTestApp { name } => cmd_build_test_app(&name),
         Commands::ListTestApps => cmd_list_test_apps(),
         Commands::CreateDisk { output, efi_app } => cmd_create_disk(&output, efi_app.as_deref()),
@@ -201,6 +220,7 @@ fn cmd_run(
     coreboot_rom: Option<String>,
     ahci: bool,
     nvme: bool,
+    sdhci: bool,
     headless: bool,
     disable_kvm: bool,
     app: Option<String>,
@@ -210,6 +230,8 @@ fn cmd_run(
         qemu::StorageType::Ahci
     } else if nvme {
         qemu::StorageType::Nvme
+    } else if sdhci {
+        qemu::StorageType::Sdhci
     } else {
         qemu::StorageType::Usb
     };
@@ -268,6 +290,7 @@ fn cmd_test(
     app: &str,
     ahci: bool,
     nvme: bool,
+    sdhci: bool,
     disable_kvm: bool,
     timeout: u64,
 ) -> Result<()> {
@@ -275,6 +298,8 @@ fn cmd_test(
         qemu::StorageType::Ahci
     } else if nvme {
         qemu::StorageType::Nvme
+    } else if sdhci {
+        qemu::StorageType::Sdhci
     } else {
         qemu::StorageType::Usb
     };

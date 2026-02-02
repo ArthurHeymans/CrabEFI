@@ -17,6 +17,8 @@ pub enum StorageType {
     Ahci,
     /// NVMe storage
     Nvme,
+    /// SDHCI (SD card)
+    Sdhci,
 }
 
 /// QEMU configuration
@@ -105,6 +107,14 @@ fn build_qemu_command(config: &QemuConfig, disk_path: &Path) -> Result<Command> 
             ]);
             cmd.args(["-device", "nvme,serial=deadbeef,drive=nvme0"]);
         }
+        StorageType::Sdhci => {
+            cmd.args([
+                "-drive",
+                &format!("file={},if=none,id=sd0,format=raw", disk_path_str),
+            ]);
+            cmd.args(["-device", "sdhci-pci"]);
+            cmd.args(["-device", "sd-card,drive=sd0"]);
+        }
     }
 
     // KVM acceleration
@@ -129,6 +139,10 @@ fn is_kvm_available() -> bool {
             .map(|m| m.permissions().readonly() == false)
             .unwrap_or(false)
 }
+
+/// Wrapper to kill child process on drop
+#[allow(dead_code)]
+struct ChildGuard(Child);
 
 impl Drop for ChildGuard {
     fn drop(&mut self) {
@@ -304,6 +318,14 @@ fn run_qemu_with_capture(config: &QemuConfig, disk_path: &Path) -> Result<TestRe
                 &format!("file={},if=none,id=nvme0,format=raw", disk_path_str),
             ]);
             cmd.args(["-device", "nvme,serial=deadbeef,drive=nvme0"]);
+        }
+        StorageType::Sdhci => {
+            cmd.args([
+                "-drive",
+                &format!("file={},if=none,id=sd0,format=raw", disk_path_str),
+            ]);
+            cmd.args(["-device", "sdhci-pci"]);
+            cmd.args(["-device", "sd-card,drive=sd0"]);
         }
     }
 
