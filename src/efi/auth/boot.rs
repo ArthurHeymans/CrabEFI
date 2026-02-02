@@ -22,17 +22,17 @@
 
 use super::enrollment::{self, EnrollmentStatus};
 use super::variables::{
-    DB_NAME, DBX_NAME, KEK_NAME, PK_NAME, SECURE_BOOT_NAME, SETUP_MODE_NAME, SecureBootVariable,
-    db_database, dbx_database, kek_database, pk_database,
+    db_database, dbx_database, kek_database, pk_database, SecureBootVariable, DBX_NAME, DB_NAME,
+    KEK_NAME, PK_NAME, SECURE_BOOT_NAME, SETUP_MODE_NAME,
 };
 use super::{
-    AuthError, EFI_GLOBAL_VARIABLE_GUID, EFI_IMAGE_SECURITY_DATABASE_GUID, enter_setup_mode,
-    enter_user_mode, is_setup_mode,
+    enter_setup_mode, enter_user_mode, is_setup_mode, AuthError, EFI_GLOBAL_VARIABLE_GUID,
+    EFI_IMAGE_SECURITY_DATABASE_GUID,
 };
 use crate::efi::varstore::{
-    VarStoreError, get_variable_timestamp, persist_variable_with_timestamp,
+    get_variable_timestamp, persist_variable_with_timestamp, VarStoreError,
 };
-use crate::state::{self, MAX_VARIABLE_DATA_SIZE, MAX_VARIABLE_NAME_LEN};
+use crate::state;
 use alloc::vec::Vec;
 
 /// Variable attributes for read-only status variables
@@ -130,8 +130,8 @@ pub fn init_secure_boot(config: &SecureBootConfig) -> Result<EnrollmentStatus, A
 ///
 /// Returns true if Secure Boot was previously enabled by the user.
 fn load_secure_boot_enable_preference() -> bool {
-    use super::EFI_GLOBAL_VARIABLE_GUID;
     use super::variables::SECURE_BOOT_ENABLE_NAME;
+    use super::EFI_GLOBAL_VARIABLE_GUID;
 
     if let Some(data) = get_variable_data(&EFI_GLOBAL_VARIABLE_GUID, SECURE_BOOT_ENABLE_NAME) {
         if !data.is_empty() && data[0] == 1 {
@@ -267,7 +267,7 @@ fn get_variable_data(guid: &r_efi::efi::Guid, name: &[u16]) -> Option<Vec<u8>> {
             }
 
             // Compare name
-            if !name_matches(&var.name, name) {
+            if !crate::efi::utils::ucs2_eq(&var.name, name) {
                 continue;
             }
 
@@ -281,21 +281,7 @@ fn get_variable_data(guid: &r_efi::efi::Guid, name: &[u16]) -> Option<Vec<u8>> {
     result
 }
 
-/// Check if stored name matches the expected name
-fn name_matches(stored: &[u16], expected: &[u16]) -> bool {
-    // Get effective lengths (up to null terminator)
-    let stored_len = stored.iter().position(|&c| c == 0).unwrap_or(stored.len());
-    let expected_len = expected
-        .iter()
-        .position(|&c| c == 0)
-        .unwrap_or(expected.len());
-
-    if stored_len != expected_len {
-        return false;
-    }
-
-    stored[..stored_len] == expected[..expected_len]
-}
+// name_matches consolidated into crate::efi::utils::ucs2_eq
 
 /// Enroll default keys and persist them to SMMSTORE
 fn enroll_and_persist_default_keys() -> Result<(), AuthError> {
@@ -399,53 +385,18 @@ fn persist_key_variable(
         })?;
 
     // Also update in-memory variable cache
-    update_variable_in_memory(&guid, name, SECURE_BOOT_KEY_ATTRS, data);
+    crate::efi::varstore::update_variable_in_memory(&guid, name, SECURE_BOOT_KEY_ATTRS, data);
 
     Ok(())
 }
 
-/// Update a variable in the in-memory cache
-fn update_variable_in_memory(guid: &r_efi::efi::Guid, name: &[u16], attributes: u32, data: &[u8]) {
-    state::with_efi_mut(|efi| {
-        // Find existing or free slot
-        let existing_idx = efi.variables.iter().position(|var| {
-            var.in_use && var.vendor_guid == *guid && name_matches(&var.name, name)
-        });
-
-        let idx = match existing_idx {
-            Some(i) => i,
-            None => match efi.variables.iter().position(|var| !var.in_use) {
-                Some(i) => i,
-                None => {
-                    log::warn!("No free variable slots for status variable");
-                    return;
-                }
-            },
-        };
-
-        // Copy name
-        let name_len = name.len().min(MAX_VARIABLE_NAME_LEN);
-        efi.variables[idx].name[..name_len].copy_from_slice(&name[..name_len]);
-        if name_len < MAX_VARIABLE_NAME_LEN {
-            efi.variables[idx].name[name_len..].fill(0);
-        }
-
-        // Copy data
-        let data_len = data.len().min(MAX_VARIABLE_DATA_SIZE);
-        efi.variables[idx].data[..data_len].copy_from_slice(&data[..data_len]);
-
-        efi.variables[idx].vendor_guid = *guid;
-        efi.variables[idx].attributes = attributes;
-        efi.variables[idx].data_size = data_len;
-        efi.variables[idx].in_use = true;
-    });
-}
+// update_variable_in_memory consolidated into crate::efi::varstore::update_variable_in_memory
 
 /// Create or update the SecureBoot and SetupMode status variables
 fn create_status_variables() -> Result<(), AuthError> {
     // SetupMode: 1 if in Setup Mode, 0 if in User Mode
     let setup_mode_value: u8 = if is_setup_mode() { 1 } else { 0 };
-    update_variable_in_memory(
+    crate::efi::varstore::update_variable_in_memory(
         &EFI_GLOBAL_VARIABLE_GUID,
         SETUP_MODE_NAME,
         STATUS_VAR_ATTRS,
@@ -459,7 +410,7 @@ fn create_status_variables() -> Result<(), AuthError> {
     } else {
         0
     };
-    update_variable_in_memory(
+    crate::efi::varstore::update_variable_in_memory(
         &EFI_GLOBAL_VARIABLE_GUID,
         SECURE_BOOT_NAME,
         STATUS_VAR_ATTRS,
@@ -541,15 +492,15 @@ pub fn clear_all_keys() -> Result<(), AuthError> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::efi::utils::ucs2_eq;
 
     #[test]
-    fn test_name_matches() {
+    fn test_ucs2_eq() {
         let name1 = [0x50, 0x4B, 0x00]; // "PK\0"
         let name2 = [0x50, 0x4B, 0x00, 0x00, 0x00]; // "PK\0" with padding
 
-        assert!(name_matches(&name1, &name1));
-        assert!(name_matches(&name2, &name1));
-        assert!(name_matches(&name1, &name2));
+        assert!(ucs2_eq(&name1, &name1));
+        assert!(ucs2_eq(&name2, &name1));
+        assert!(ucs2_eq(&name1, &name2));
     }
 }

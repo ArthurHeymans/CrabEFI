@@ -5,7 +5,7 @@
 
 use crate::arch::x86_64::io;
 use crate::efi::auth;
-use crate::state::{self, MAX_VARIABLE_DATA_SIZE, MAX_VARIABLE_NAME_LEN, MAX_VARIABLES};
+use crate::state::{self, MAX_VARIABLES, MAX_VARIABLE_DATA_SIZE, MAX_VARIABLE_NAME_LEN};
 use alloc::vec::Vec;
 use core::ffi::c_void;
 use r_efi::efi::{
@@ -354,7 +354,7 @@ fn copy_stored_variable_name(
     variable_name: *mut u16,
     vendor_guid: *mut Guid,
 ) -> Status {
-    let name_len = ucs2_strlen(&var.name) + 1; // Include null terminator
+    let name_len = crate::efi::utils::ucs2_len(&var.name) + 1; // Include null terminator
     let required_size = name_len * 2;
 
     if unsafe { *variable_name_size } < required_size {
@@ -850,10 +850,7 @@ fn name_eq(stored: &[u16], name: *const u16) -> bool {
     }
 }
 
-/// Get length of UCS-2 string in array (not including null terminator)
-fn ucs2_strlen(s: &[u16]) -> usize {
-    s.iter().position(|&c| c == 0).unwrap_or(s.len())
-}
+// ucs2_strlen consolidated into crate::efi::utils::ucs2_len
 
 /// Get length of UCS-2 string from pointer (not including null terminator)
 fn ucs2_strlen_ptr(s: *const u16) -> usize {

@@ -47,9 +47,10 @@ pub use persistence::{
 
 // Re-export key items from deferred
 pub use deferred::{
-    DEFAULT_DEFERRED_BUFFER_BASE, DEFERRED_BUFFER_SIZE, check_pending as check_deferred_pending,
-    configure_buffer as configure_deferred_buffer, get_stats as get_deferred_stats,
-    init_buffer as init_deferred_buffer, process_pending as process_deferred_pending,
+    check_pending as check_deferred_pending, configure_buffer as configure_deferred_buffer,
+    get_stats as get_deferred_stats, init_buffer as init_deferred_buffer,
+    process_pending as process_deferred_pending, DEFAULT_DEFERRED_BUFFER_BASE,
+    DEFERRED_BUFFER_SIZE,
 };
 
 /// Store header magic value: "CRAB" in little-endian
@@ -146,20 +147,24 @@ impl StoreHeader {
 
     /// Compute CRC32 of the header (excluding the CRC field itself)
     pub fn compute_crc(&self) -> u32 {
-        // Simple CRC32 of the first 12 bytes (before header_crc)
+        // CRC32 of the first 12 bytes (before header_crc)
+        let magic_bytes = self.magic.to_le_bytes();
+        let reserved_bytes = self.reserved.to_le_bytes();
+        let store_size_bytes = self.store_size.to_le_bytes();
+
         let bytes = [
-            (self.magic & 0xFF) as u8,
-            ((self.magic >> 8) & 0xFF) as u8,
-            ((self.magic >> 16) & 0xFF) as u8,
-            ((self.magic >> 24) & 0xFF) as u8,
+            magic_bytes[0],
+            magic_bytes[1],
+            magic_bytes[2],
+            magic_bytes[3],
             self.version,
             self.flags,
-            (self.reserved & 0xFF) as u8,
-            ((self.reserved >> 8) & 0xFF) as u8,
-            (self.store_size & 0xFF) as u8,
-            ((self.store_size >> 8) & 0xFF) as u8,
-            ((self.store_size >> 16) & 0xFF) as u8,
-            ((self.store_size >> 24) & 0xFF) as u8,
+            reserved_bytes[0],
+            reserved_bytes[1],
+            store_size_bytes[0],
+            store_size_bytes[1],
+            store_size_bytes[2],
+            store_size_bytes[3],
         ];
         crc32(&bytes)
     }
@@ -242,7 +247,11 @@ pub struct VariableRecord {
 }
 
 /// Serialized EFI_TIME structure
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+///
+/// Implements `Ord` for lexicographic comparison of timestamp fields.
+/// Note: timezone and daylight are not used in ordering as they don't affect
+/// the actual point in time for authenticated variable timestamp comparison.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SerializedTime {
     pub year: u16,
     pub month: u8,
@@ -253,6 +262,37 @@ pub struct SerializedTime {
     pub nanosecond: u32,
     pub timezone: i16,
     pub daylight: u8,
+}
+
+impl PartialOrd for SerializedTime {
+    fn partial_cmp(&self, other: &Self) -> Option<core::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for SerializedTime {
+    fn cmp(&self, other: &Self) -> core::cmp::Ordering {
+        // Compare in order: year, month, day, hour, minute, second, nanosecond
+        // Timezone and daylight are not used for ordering
+        (
+            self.year,
+            self.month,
+            self.day,
+            self.hour,
+            self.minute,
+            self.second,
+            self.nanosecond,
+        )
+            .cmp(&(
+                other.year,
+                other.month,
+                other.day,
+                other.hour,
+                other.minute,
+                other.second,
+                other.nanosecond,
+            ))
+    }
 }
 
 impl SerializedTime {
@@ -293,46 +333,18 @@ impl SerializedTime {
     }
 
     /// Compare two timestamps, returns true if self is strictly after other
+    ///
+    /// Special handling: if `other` is zero (uninitialized), any non-zero timestamp
+    /// is considered "after". This is important for Secure Boot timestamp validation
+    /// where a zero timestamp represents the initial state.
     pub fn is_after(&self, other: &SerializedTime) -> bool {
-        use core::cmp::Ordering;
-
         // If other is zero (initial), any non-zero timestamp is "after"
         if other.is_zero() {
             return !self.is_zero();
         }
 
-        // Compare year, month, day, hour, minute, second, nanosecond in order
-        match self.year.cmp(&other.year) {
-            Ordering::Greater => return true,
-            Ordering::Less => return false,
-            Ordering::Equal => {}
-        }
-        match self.month.cmp(&other.month) {
-            Ordering::Greater => return true,
-            Ordering::Less => return false,
-            Ordering::Equal => {}
-        }
-        match self.day.cmp(&other.day) {
-            Ordering::Greater => return true,
-            Ordering::Less => return false,
-            Ordering::Equal => {}
-        }
-        match self.hour.cmp(&other.hour) {
-            Ordering::Greater => return true,
-            Ordering::Less => return false,
-            Ordering::Equal => {}
-        }
-        match self.minute.cmp(&other.minute) {
-            Ordering::Greater => return true,
-            Ordering::Less => return false,
-            Ordering::Equal => {}
-        }
-        match self.second.cmp(&other.second) {
-            Ordering::Greater => return true,
-            Ordering::Less => return false,
-            Ordering::Equal => {}
-        }
-        self.nanosecond > other.nanosecond
+        // Use the Ord implementation for standard comparison
+        self > other
     }
 }
 

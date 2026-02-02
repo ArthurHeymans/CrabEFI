@@ -42,16 +42,17 @@
 //!
 //! For authenticated variables (those with TIME_BASED_AUTHENTICATED_WRITE_ACCESS):
 //! - The original signed data (with EFI_VARIABLE_AUTHENTICATION_2 header) is stored
+//! - The timestamp from the authentication header is extracted and preserved
 //! - On next boot, the signature is verified against current key databases
-//! - Only after successful verification is the variable written to NVS
+//! - Only after successful verification is the variable written to NVS with its timestamp
 //!
 //! This ensures that if key databases change between boots, the verification
-//! uses the current trusted state. The timestamp validation will still pass
-//! because we haven't committed the update to NVS yet.
+//! uses the current trusted state. The timestamp is preserved to maintain
+//! monotonicity requirements for future authenticated writes.
 
 use core::sync::atomic::{AtomicBool, Ordering};
 
-use super::{VarStoreError, VariableRecord, crc32};
+use super::{crc32, SerializedTime, VarStoreError, VariableRecord};
 use crate::efi::auth;
 
 /// Magic value for the deferred buffer header: "CVBF" (CrabVariable Buffer)
@@ -138,19 +139,23 @@ impl DeferredHeader {
 
     /// Compute CRC of header fields
     fn compute_header_crc(&self) -> u32 {
+        let magic_bytes = self.magic.to_le_bytes();
+        let entry_count_bytes = self.entry_count.to_le_bytes();
+        let total_size_bytes = self.total_size.to_le_bytes();
+
         let bytes = [
-            (self.magic & 0xFF) as u8,
-            ((self.magic >> 8) & 0xFF) as u8,
-            ((self.magic >> 16) & 0xFF) as u8,
-            ((self.magic >> 24) & 0xFF) as u8,
+            magic_bytes[0],
+            magic_bytes[1],
+            magic_bytes[2],
+            magic_bytes[3],
             self.version,
             self.flags,
-            (self.entry_count & 0xFF) as u8,
-            ((self.entry_count >> 8) & 0xFF) as u8,
-            (self.total_size & 0xFF) as u8,
-            ((self.total_size >> 8) & 0xFF) as u8,
-            ((self.total_size >> 16) & 0xFF) as u8,
-            ((self.total_size >> 24) & 0xFF) as u8,
+            entry_count_bytes[0],
+            entry_count_bytes[1],
+            total_size_bytes[0],
+            total_size_bytes[1],
+            total_size_bytes[2],
+            total_size_bytes[3],
         ];
         crc32(&bytes)
     }
@@ -271,6 +276,20 @@ pub fn process_pending() -> Result<usize, VarStoreError> {
     let entry_header_size = core::mem::size_of::<EntryHeader>();
 
     for i in 0..header.entry_count {
+        // Bounds check: ensure we can read the entry header
+        if offset
+            .checked_add(entry_header_size)
+            .map_or(true, |end| end > DEFERRED_BUFFER_SIZE)
+        {
+            log::warn!(
+                "Entry header at index {} would exceed buffer bounds (offset={}, header_size={})",
+                i,
+                offset,
+                entry_header_size
+            );
+            break;
+        }
+
         // Read entry header
         let entry_hdr = unsafe {
             let hdr_ptr = base.add(offset) as *const EntryHeader;
@@ -286,6 +305,20 @@ pub fn process_pending() -> Result<usize, VarStoreError> {
         }
 
         offset += entry_header_size;
+
+        // Bounds check: ensure we can read the record data
+        if offset
+            .checked_add(record_len)
+            .map_or(true, |end| end > DEFERRED_BUFFER_SIZE)
+        {
+            log::warn!(
+                "Record data at index {} would exceed buffer bounds (offset={}, record_len={})",
+                i,
+                offset,
+                record_len
+            );
+            break;
+        }
 
         // Read record data
         let record_data = unsafe { core::slice::from_raw_parts(base.add(offset), record_len) };
@@ -310,9 +343,10 @@ pub fn process_pending() -> Result<usize, VarStoreError> {
                         processed += 1;
                     }
                 } else if record.is_active() {
-                    // Determine the actual data to write
-                    let actual_data = if is_authenticated {
+                    // Determine the actual data to write and timestamp to preserve
+                    let (actual_data, timestamp_to_use) = if is_authenticated {
                         // Authenticated variable: record.data contains the original signed blob
+                        // The timestamp was extracted and stored in record.timestamp when queued
                         // Verify it against current key databases before writing to NVS
                         match auth::verify_authenticated_variable(
                             &record.name,
@@ -322,7 +356,8 @@ pub fn process_pending() -> Result<usize, VarStoreError> {
                         ) {
                             Ok(verified_data) => {
                                 log::info!("Deferred authenticated variable verified successfully");
-                                verified_data
+                                // Use the timestamp that was stored with the record
+                                (verified_data, Some(record.timestamp.clone()))
                             }
                             Err(e) => {
                                 log::warn!(
@@ -334,20 +369,33 @@ pub fn process_pending() -> Result<usize, VarStoreError> {
                             }
                         }
                     } else {
-                        // Non-authenticated variable - use data directly
-                        record.data.clone()
+                        // Non-authenticated variable - use data directly, no timestamp needed
+                        (record.data.clone(), None)
                     };
 
-                    // Write to SPI
-                    if let Err(e) = super::persistence::write_variable_to_spi_internal(
-                        &guid,
-                        &record.name,
-                        record.attributes,
-                        &actual_data,
-                    ) {
+                    // Write to SPI (with timestamp for authenticated variables)
+                    let write_result = if let Some(ref timestamp) = timestamp_to_use {
+                        // Use persist_variable_with_timestamp to preserve the timestamp
+                        super::persistence::persist_variable_with_timestamp(
+                            &guid,
+                            &record.name,
+                            record.attributes,
+                            &actual_data,
+                            timestamp.clone(),
+                        )
+                    } else {
+                        super::persistence::write_variable_to_spi_internal(
+                            &guid,
+                            &record.name,
+                            record.attributes,
+                            &actual_data,
+                        )
+                    };
+
+                    if let Err(e) = write_result {
                         log::warn!("Failed to apply deferred variable write: {:?}", e);
                     } else {
-                        // Also update in-memory
+                        // Also update in-memory (timestamp is handled by persist functions)
                         super::persistence::update_variable_in_memory(
                             &guid,
                             &record.name,
@@ -378,8 +426,9 @@ pub fn process_pending() -> Result<usize, VarStoreError> {
 /// This is called after ExitBootServices when we can't write to SPI directly.
 ///
 /// For authenticated variables (those with TIME_BASED_AUTHENTICATED_WRITE_ACCESS),
-/// the original signed data (with EFI_VARIABLE_AUTHENTICATION_2 header) is stored.
-/// The signature will be verified on next boot before writing to NVS.
+/// the original signed data (with EFI_VARIABLE_AUTHENTICATION_2 header) is stored
+/// along with the extracted timestamp. The signature will be verified on next boot
+/// before writing to NVS, and the timestamp will be preserved.
 pub fn queue_write(
     guid: &r_efi::efi::Guid,
     name: &[u16],
@@ -391,15 +440,40 @@ pub fn queue_write(
 
     let mut flags: u8 = 0;
 
-    if is_authenticated {
+    let record = if is_authenticated {
         flags |= entry_flags::IS_AUTHENTICATED;
-        // Store the original signed data - will be verified on next boot
-        log::info!("Queuing authenticated variable for deferred verification");
-    }
 
-    // Store the data as-is (for authenticated vars, this includes the auth header)
-    let record = VariableRecord::new(guid, name, attributes, data)?;
+        // Extract the timestamp from the authentication header
+        // This is critical for maintaining timestamp monotonicity after reboot
+        let timestamp = extract_auth_timestamp(data)?;
+
+        log::info!(
+            "Queuing authenticated variable for deferred verification (timestamp: {}-{:02}-{:02} {:02}:{:02}:{:02})",
+            timestamp.year, timestamp.month, timestamp.day,
+            timestamp.hour, timestamp.minute, timestamp.second
+        );
+
+        // Store the data as-is (includes the auth header) along with the extracted timestamp
+        VariableRecord::new_with_timestamp(guid, name, attributes, data, timestamp)?
+    } else {
+        // Non-authenticated variable - no timestamp needed
+        VariableRecord::new(guid, name, attributes, data)?
+    };
+
     queue_record_with_flags(&record, flags)
+}
+
+/// Extract the timestamp from an EFI_VARIABLE_AUTHENTICATION_2 header
+fn extract_auth_timestamp(data: &[u8]) -> Result<SerializedTime, VarStoreError> {
+    use auth::EfiVariableAuthentication2;
+
+    let auth = EfiVariableAuthentication2::from_bytes(data).ok_or_else(|| {
+        log::warn!("Failed to parse authentication header for timestamp extraction");
+        VarStoreError::InvalidArgument
+    })?;
+
+    // Convert EfiTime to SerializedTime
+    Ok(auth.time_stamp.to_serialized())
 }
 
 /// Queue a variable deletion for deferred processing
@@ -433,9 +507,26 @@ fn queue_record_with_flags(record: &VariableRecord, flags: u8) -> Result<(), Var
     // Entry format: EntryHeader (8 bytes) + record data
     let data_offset = HEADER_SIZE + header.total_size as usize;
     let entry_header_size = core::mem::size_of::<EntryHeader>();
-    let new_entry_size = entry_header_size + record_len;
 
-    if data_offset + new_entry_size > DEFERRED_BUFFER_SIZE {
+    // Use checked_add to prevent integer overflow in bounds check
+    let new_entry_size = match entry_header_size.checked_add(record_len) {
+        Some(size) => size,
+        None => {
+            log::warn!("Entry size overflow");
+            return Err(VarStoreError::DataTooLarge);
+        }
+    };
+
+    // Use checked_add to prevent integer overflow when checking buffer space
+    let required_space = match data_offset.checked_add(new_entry_size) {
+        Some(space) => space,
+        None => {
+            log::warn!("Buffer space calculation overflow");
+            return Err(VarStoreError::StoreFull);
+        }
+    };
+
+    if required_space > DEFERRED_BUFFER_SIZE {
         log::warn!("Deferred buffer full");
         return Err(VarStoreError::StoreFull);
     }

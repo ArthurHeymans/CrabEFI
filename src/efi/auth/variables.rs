@@ -303,18 +303,20 @@ pub fn dbx_database() -> spin::MutexGuard<'static, KeyDatabase> {
 pub fn identify_key_database(name: &[u16], guid: &Guid) -> Option<SecureBootVariable> {
     use super::{EFI_GLOBAL_VARIABLE_GUID, EFI_IMAGE_SECURITY_DATABASE_GUID};
 
+    use crate::efi::utils::ucs2_eq;
+
     if *guid == EFI_GLOBAL_VARIABLE_GUID {
-        if name_matches(name, PK_NAME) {
+        if ucs2_eq(name, PK_NAME) {
             return Some(SecureBootVariable::PK);
         }
-        if name_matches(name, KEK_NAME) {
+        if ucs2_eq(name, KEK_NAME) {
             return Some(SecureBootVariable::KEK);
         }
     } else if *guid == EFI_IMAGE_SECURITY_DATABASE_GUID {
-        if name_matches(name, DB_NAME) {
+        if ucs2_eq(name, DB_NAME) {
             return Some(SecureBootVariable::Db);
         }
-        if name_matches(name, DBX_NAME) {
+        if ucs2_eq(name, DBX_NAME) {
             return Some(SecureBootVariable::Dbx);
         }
     }
@@ -357,20 +359,4 @@ impl SecureBootVariable {
     }
 }
 
-/// Compare two UCS-2 variable names
-fn name_matches(name: &[u16], expected: &[u16]) -> bool {
-    if name.len() < expected.len() {
-        return false;
-    }
-
-    for (a, b) in name.iter().zip(expected.iter()) {
-        if *a != *b {
-            return false;
-        }
-        if *a == 0 {
-            return true;
-        }
-    }
-
-    true
-}
+// name_matches consolidated into crate::efi::utils::ucs2_eq

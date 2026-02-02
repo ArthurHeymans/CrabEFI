@@ -889,7 +889,7 @@ pub fn update_variable_in_memory(
     state::with_efi_mut(|efi| {
         // Find existing or free slot
         let existing_idx = efi.variables.iter().position(|var| {
-            var.in_use && var.vendor_guid == *guid && name_eq_slice(&var.name, name)
+            var.in_use && var.vendor_guid == *guid && crate::efi::utils::ucs2_eq(&var.name, name)
         });
 
         let idx = match existing_idx {
@@ -928,27 +928,12 @@ pub(super) fn delete_variable_from_memory(guid: &r_efi::efi::Guid, name: &[u16])
     use crate::state;
 
     state::with_efi_mut(|efi| {
-        if let Some(var) = efi
-            .variables
-            .iter_mut()
-            .find(|var| var.in_use && var.vendor_guid == *guid && name_eq_slice(&var.name, name))
-        {
+        if let Some(var) = efi.variables.iter_mut().find(|var| {
+            var.in_use && var.vendor_guid == *guid && crate::efi::utils::ucs2_eq(&var.name, name)
+        }) {
             var.in_use = false;
         }
     });
 }
 
-/// Compare a stored name array with a name slice
-fn name_eq_slice(stored: &[u16], name: &[u16]) -> bool {
-    // Get length of stored name (up to null terminator)
-    let stored_len = stored.iter().position(|&c| c == 0).unwrap_or(stored.len());
-
-    // Get length of name (up to null terminator)
-    let name_len = name.iter().position(|&c| c == 0).unwrap_or(name.len());
-
-    if stored_len != name_len {
-        return false;
-    }
-
-    stored[..stored_len] == name[..name_len]
-}
+// name_eq_slice consolidated into crate::efi::utils::ucs2_eq
