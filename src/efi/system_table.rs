@@ -57,6 +57,98 @@ pub const SMBIOS3_TABLE_GUID: Guid = Guid::from_fields(
     &[0xe5, 0xbb, 0xcf, 0x20, 0xe3, 0x94],
 );
 
+/// EFI Runtime Properties Table GUID (UEFI 2.8+)
+///
+/// This configuration table tells the OS which runtime services are available.
+/// Linux uses this to determine if SetVariable is supported (needed for efi_pstore).
+pub const EFI_RT_PROPERTIES_TABLE_GUID: Guid = Guid::from_fields(
+    0xeb66918a,
+    0x7eef,
+    0x402a,
+    0x84,
+    0x2e,
+    &[0x93, 0x1d, 0x21, 0xc3, 0x8a, 0xe9],
+);
+
+// ============================================================================
+// EFI Runtime Services Supported Flags (from UEFI Specification)
+// ============================================================================
+
+/// GetTime() is supported
+pub const EFI_RT_SUPPORTED_GET_TIME: u32 = 0x0001;
+/// SetTime() is supported
+pub const EFI_RT_SUPPORTED_SET_TIME: u32 = 0x0002;
+/// GetWakeupTime() is supported
+pub const EFI_RT_SUPPORTED_GET_WAKEUP_TIME: u32 = 0x0004;
+/// SetWakeupTime() is supported
+pub const EFI_RT_SUPPORTED_SET_WAKEUP_TIME: u32 = 0x0008;
+/// GetVariable() is supported
+pub const EFI_RT_SUPPORTED_GET_VARIABLE: u32 = 0x0010;
+/// GetNextVariableName() is supported
+pub const EFI_RT_SUPPORTED_GET_NEXT_VARIABLE_NAME: u32 = 0x0020;
+/// SetVariable() is supported
+pub const EFI_RT_SUPPORTED_SET_VARIABLE: u32 = 0x0040;
+/// SetVirtualAddressMap() is supported
+pub const EFI_RT_SUPPORTED_SET_VIRTUAL_ADDRESS_MAP: u32 = 0x0080;
+/// ConvertPointer() is supported
+pub const EFI_RT_SUPPORTED_CONVERT_POINTER: u32 = 0x0100;
+/// GetNextHighMonotonicCount() is supported
+pub const EFI_RT_SUPPORTED_GET_NEXT_HIGH_MONOTONIC_COUNT: u32 = 0x0200;
+/// ResetSystem() is supported
+pub const EFI_RT_SUPPORTED_RESET_SYSTEM: u32 = 0x0400;
+/// UpdateCapsule() is supported
+pub const EFI_RT_SUPPORTED_UPDATE_CAPSULE: u32 = 0x0800;
+/// QueryCapsuleCapabilities() is supported
+pub const EFI_RT_SUPPORTED_QUERY_CAPSULE_CAPABILITIES: u32 = 0x1000;
+/// QueryVariableInfo() is supported
+pub const EFI_RT_SUPPORTED_QUERY_VARIABLE_INFO: u32 = 0x2000;
+
+/// All runtime services supported
+pub const EFI_RT_SUPPORTED_ALL: u32 = 0x3fff;
+
+/// EFI Runtime Properties Table version
+pub const EFI_RT_PROPERTIES_TABLE_VERSION: u16 = 0x1;
+
+/// EFI Runtime Properties Table
+///
+/// This table advertises which EFI Runtime Services are supported.
+/// Reference: UEFI Specification 2.8+, Section 4.6
+#[repr(C)]
+pub struct EfiRtPropertiesTable {
+    /// Version of the table (must be EFI_RT_PROPERTIES_TABLE_VERSION)
+    pub version: u16,
+    /// Length of the table in bytes
+    pub length: u16,
+    /// Bitmask of supported runtime services
+    pub runtime_services_supported: u32,
+}
+
+/// Static RT Properties Table
+///
+/// CrabEFI supports:
+/// - GetTime (reads from CMOS RTC)
+/// - GetVariable, GetNextVariableName, SetVariable, QueryVariableInfo (full variable services)
+/// - SetVirtualAddressMap (accepts but identity-maps)
+/// - ResetSystem (keyboard controller reset or triple fault)
+///
+/// CrabEFI does NOT support:
+/// - SetTime (not implemented)
+/// - GetWakeupTime/SetWakeupTime (not implemented)
+/// - ConvertPointer (not implemented)
+/// - GetNextHighMonotonicCount (not implemented)
+/// - UpdateCapsule/QueryCapsuleCapabilities (not implemented)
+static RT_PROPERTIES_TABLE: EfiRtPropertiesTable = EfiRtPropertiesTable {
+    version: EFI_RT_PROPERTIES_TABLE_VERSION,
+    length: core::mem::size_of::<EfiRtPropertiesTable>() as u16,
+    runtime_services_supported: EFI_RT_SUPPORTED_GET_TIME
+        | EFI_RT_SUPPORTED_GET_VARIABLE
+        | EFI_RT_SUPPORTED_GET_NEXT_VARIABLE_NAME
+        | EFI_RT_SUPPORTED_SET_VARIABLE
+        | EFI_RT_SUPPORTED_SET_VIRTUAL_ADDRESS_MAP
+        | EFI_RT_SUPPORTED_RESET_SYSTEM
+        | EFI_RT_SUPPORTED_QUERY_VARIABLE_INFO,
+};
+
 /// SMBIOS 2.1 Entry Point structure (32-bit)
 ///
 /// Reference: SMBIOS Reference Specification, Chapter 5.2.1
@@ -816,6 +908,55 @@ pub fn update_crc32() {
     }
 }
 
+/// Install the EFI Runtime Properties Table
+///
+/// This table (UEFI 2.8+) tells the OS which runtime services are available.
+/// Linux's efi_pstore module needs this to know SetVariable is supported.
+///
+/// The table is installed with the EFI_RT_PROPERTIES_TABLE_GUID and contains
+/// a bitmask of supported runtime services.
+pub fn install_rt_properties_table() {
+    let table_ptr = &RT_PROPERTIES_TABLE as *const EfiRtPropertiesTable as *mut c_void;
+
+    let status = install_configuration_table(&EFI_RT_PROPERTIES_TABLE_GUID, table_ptr);
+    if status == efi::Status::SUCCESS {
+        log::info!(
+            "Installed EFI RT Properties Table (supported services: {:#06x})",
+            RT_PROPERTIES_TABLE.runtime_services_supported
+        );
+
+        // Log which services are advertised
+        let supported = RT_PROPERTIES_TABLE.runtime_services_supported;
+        log::debug!("  Runtime services supported:");
+        if supported & EFI_RT_SUPPORTED_GET_TIME != 0 {
+            log::debug!("    - GetTime");
+        }
+        if supported & EFI_RT_SUPPORTED_SET_TIME != 0 {
+            log::debug!("    - SetTime");
+        }
+        if supported & EFI_RT_SUPPORTED_GET_VARIABLE != 0 {
+            log::debug!("    - GetVariable");
+        }
+        if supported & EFI_RT_SUPPORTED_GET_NEXT_VARIABLE_NAME != 0 {
+            log::debug!("    - GetNextVariableName");
+        }
+        if supported & EFI_RT_SUPPORTED_SET_VARIABLE != 0 {
+            log::debug!("    - SetVariable");
+        }
+        if supported & EFI_RT_SUPPORTED_SET_VIRTUAL_ADDRESS_MAP != 0 {
+            log::debug!("    - SetVirtualAddressMap");
+        }
+        if supported & EFI_RT_SUPPORTED_RESET_SYSTEM != 0 {
+            log::debug!("    - ResetSystem");
+        }
+        if supported & EFI_RT_SUPPORTED_QUERY_VARIABLE_INFO != 0 {
+            log::debug!("    - QueryVariableInfo");
+        }
+    } else {
+        log::error!("Failed to install RT Properties Table: {:?}", status);
+    }
+}
+
 /// Dump configuration table entries for debugging
 pub fn dump_configuration_tables() {
     let efi = state::efi();
@@ -835,6 +976,8 @@ pub fn dump_configuration_tables() {
             "SMBIOS"
         } else if *guid == SMBIOS3_TABLE_GUID {
             "SMBIOS 3.0"
+        } else if *guid == EFI_RT_PROPERTIES_TABLE_GUID {
+            "RT Properties"
         } else {
             "Unknown"
         };

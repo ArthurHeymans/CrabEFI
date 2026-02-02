@@ -53,6 +53,11 @@ pub fn init(cb_info: &CorebootInfo) {
         log::debug!("No SMBIOS tables from coreboot");
     }
 
+    // Install EFI Runtime Properties Table (UEFI 2.8+)
+    // This tells Linux which runtime services are supported.
+    // Required for efi_pstore, efivars, and other kernel modules.
+    system_table::install_rt_properties_table();
+
     // Create console handle - this will also have GOP installed on it
     let console_handle = init_console();
 

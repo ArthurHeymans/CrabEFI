@@ -260,6 +260,35 @@ fn get_secure_boot_status_variable(
     Status::SUCCESS
 }
 
+/// Check if a stored variable would shadow a synthesized variable.
+///
+/// We synthesize SetupMode and SecureBoot variables with EFI_GLOBAL_VARIABLE_GUID.
+/// If a stored variable has the same name and GUID, we must skip it during
+/// enumeration to avoid infinite loops.
+fn is_synthesized_variable(name: &[u16], guid: &Guid) -> bool {
+    if *guid != auth::EFI_GLOBAL_VARIABLE_GUID {
+        return false;
+    }
+    // Check if name matches SetupMode or SecureBoot
+    name_eq_slice(name, auth::SETUP_MODE_NAME) || name_eq_slice(name, auth::SECURE_BOOT_NAME)
+}
+
+/// Compare two UCS-2 slices for equality
+fn name_eq_slice(a: &[u16], b: &[u16]) -> bool {
+    let mut i = 0;
+    loop {
+        let ca = a.get(i).copied().unwrap_or(0);
+        let cb = b.get(i).copied().unwrap_or(0);
+        if ca == 0 && cb == 0 {
+            return true;
+        }
+        if ca != cb {
+            return false;
+        }
+        i += 1;
+    }
+}
+
 /// Compare a pointer-based UCS-2 string with a constant UCS-2 slice
 fn name_eq_const(name: *const u16, expected: &[u16]) -> bool {
     let mut i = 0;
@@ -289,10 +318,37 @@ extern "efiapi" fn get_next_variable_name(
     let current_name = variable_name;
     let current_guid = unsafe { *vendor_guid };
 
+    // Debug: log input (only first 16 chars of name to avoid huge logs)
+    let mut input_name_buf = [0u8; 32];
+    let input_name_len = unsafe {
+        let mut i = 0;
+        while i < 16 {
+            let c = *current_name.add(i);
+            if c == 0 {
+                break;
+            }
+            input_name_buf[i] = c as u8;
+            i += 1;
+        }
+        i
+    };
+    let input_name_str = core::str::from_utf8(&input_name_buf[..input_name_len]).unwrap_or("?");
+    // Convert GUID to bytes for logging (first 4 bytes)
+    let guid_bytes: [u8; 16] = unsafe { core::mem::transmute(current_guid) };
+    log::trace!(
+        "GetNextVariableName: input name='{}' guid={:02x}{:02x}{:02x}{:02x}-...",
+        input_name_str,
+        guid_bytes[0],
+        guid_bytes[1],
+        guid_bytes[2],
+        guid_bytes[3]
+    );
+
     // If name is empty, return first synthesized variable (SetupMode)
     let is_first = unsafe { *current_name == 0 };
 
     if is_first {
+        log::trace!("GetNextVariableName: first call, returning SetupMode");
         // Return SetupMode as the first variable
         return copy_variable_name(
             auth::SETUP_MODE_NAME,
@@ -307,6 +363,7 @@ extern "efiapi" fn get_next_variable_name(
     // and return the next one in sequence
     if current_guid == auth::EFI_GLOBAL_VARIABLE_GUID {
         if name_eq_const(current_name, auth::SETUP_MODE_NAME) {
+            log::trace!("GetNextVariableName: after SetupMode, returning SecureBoot");
             // After SetupMode, return SecureBoot
             return copy_variable_name(
                 auth::SECURE_BOOT_NAME,
@@ -320,13 +377,18 @@ extern "efiapi" fn get_next_variable_name(
         if name_eq_const(current_name, auth::SECURE_BOOT_NAME) {
             // After SecureBoot, continue with the first stored variable
             // that is accessible at runtime (if we're at runtime)
+            // IMPORTANT: Skip any stored variables that shadow our synthesized
+            // variables (SetupMode, SecureBoot with EFI_GLOBAL_VARIABLE_GUID)
+            // to avoid infinite enumeration loops.
             let efi = state::efi();
             let variables = &efi.variables;
 
-            if let Some(var) = variables
-                .iter()
-                .find(|var| var.in_use && is_variable_accessible_at_runtime(var.attributes))
-            {
+            if let Some(var) = variables.iter().find(|var| {
+                var.in_use
+                    && is_variable_accessible_at_runtime(var.attributes)
+                    && !is_synthesized_variable(&var.name, &var.vendor_guid)
+            }) {
+                log::trace!("GetNextVariableName: after SecureBoot, returning first stored var");
                 return copy_stored_variable_name(
                     var,
                     variable_name_size,
@@ -334,6 +396,9 @@ extern "efiapi" fn get_next_variable_name(
                     vendor_guid,
                 );
             }
+            log::trace!(
+                "GetNextVariableName: after SecureBoot, no stored vars, returning NOT_FOUND"
+            );
             return Status::NOT_FOUND;
         }
     }
@@ -342,17 +407,44 @@ extern "efiapi" fn get_next_variable_name(
     let efi = state::efi();
     let variables = &efi.variables;
 
+    // Count how many variables are accessible (excluding synthesized ones)
+    let accessible_count = variables
+        .iter()
+        .filter(|var| {
+            var.in_use
+                && is_variable_accessible_at_runtime(var.attributes)
+                && !is_synthesized_variable(&var.name, &var.vendor_guid)
+        })
+        .count();
+
     // Create iterator over in-use variables and skip to next after current
     // Filter by runtime accessibility to hide boot-services-only variables after ExitBootServices
+    // Also skip synthesized variables (SetupMode, SecureBoot) which we handle separately
     let next_var = variables
         .iter()
-        .filter(|var| var.in_use && is_variable_accessible_at_runtime(var.attributes))
+        .filter(|var| {
+            var.in_use
+                && is_variable_accessible_at_runtime(var.attributes)
+                && !is_synthesized_variable(&var.name, &var.vendor_guid)
+        })
         .skip_while(|var| !(var.vendor_guid == current_guid && name_eq(&var.name, current_name)))
         .nth(1); // Skip the current one and get the next
 
     match next_var {
-        Some(var) => copy_stored_variable_name(var, variable_name_size, variable_name, vendor_guid),
-        None => Status::NOT_FOUND,
+        Some(var) => {
+            log::trace!(
+                "GetNextVariableName: returning next stored var (total accessible: {})",
+                accessible_count
+            );
+            copy_stored_variable_name(var, variable_name_size, variable_name, vendor_guid)
+        }
+        None => {
+            log::trace!(
+                "GetNextVariableName: no more vars, returning NOT_FOUND (total accessible: {})",
+                accessible_count
+            );
+            Status::NOT_FOUND
+        }
     }
 }
 
