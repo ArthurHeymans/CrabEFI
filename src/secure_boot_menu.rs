@@ -120,9 +120,7 @@ pub fn show_secure_boot_menu() {
             if let Some(key) = read_key() {
                 match key {
                     KeyPress::Up | KeyPress::Char('k') => {
-                        if selected > 0 {
-                            selected -= 1;
-                        }
+                        selected = selected.saturating_sub(1);
                         break;
                     }
                     KeyPress::Down | KeyPress::Char('j') => {

@@ -116,10 +116,10 @@ fn verify_secure_boot_variable(
 
     // Check timestamp monotonicity
     let current_timestamp = match var_type {
-        SecureBootVariable::PK => pk_database().timestamp().clone(),
-        SecureBootVariable::KEK => kek_database().timestamp().clone(),
-        SecureBootVariable::Db => db_database().timestamp().clone(),
-        SecureBootVariable::Dbx => dbx_database().timestamp().clone(),
+        SecureBootVariable::PK => *pk_database().timestamp(),
+        SecureBootVariable::KEK => *kek_database().timestamp(),
+        SecureBootVariable::Db => *db_database().timestamp(),
+        SecureBootVariable::Dbx => *dbx_database().timestamp(),
     };
 
     if !timestamp.is_after(&current_timestamp) {

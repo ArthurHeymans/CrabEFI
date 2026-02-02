@@ -136,18 +136,16 @@ pub fn verify_pkcs7_signature(
             for intermediate_der in &embedded_certs {
                 if let Ok(intermediate) = parse_x509_certificate(intermediate_der) {
                     // Check: embedded_cert issued by intermediate, intermediate issued by trusted
-                    if embedded_cert.issuer == intermediate.subject {
-                        if verify_cert_chain(
+                    if embedded_cert.issuer == intermediate.subject
+                        && verify_cert_chain(
                             &intermediate,
                             intermediate_der,
                             &trusted,
                             trusted_cert,
-                        )? {
-                            log::info!(
-                                "Signer certificate chains via intermediate to db certificate"
-                            );
-                            return Ok(true);
-                        }
+                        )?
+                    {
+                        log::info!("Signer certificate chains via intermediate to db certificate");
+                        return Ok(true);
                     }
                 }
             }

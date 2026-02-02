@@ -279,7 +279,7 @@ pub fn process_pending() -> Result<usize, VarStoreError> {
         // Bounds check: ensure we can read the entry header
         if offset
             .checked_add(entry_header_size)
-            .map_or(true, |end| end > DEFERRED_BUFFER_SIZE)
+            .is_none_or(|end| end > DEFERRED_BUFFER_SIZE)
         {
             log::warn!(
                 "Entry header at index {} would exceed buffer bounds (offset={}, header_size={})",
@@ -309,7 +309,7 @@ pub fn process_pending() -> Result<usize, VarStoreError> {
         // Bounds check: ensure we can read the record data
         if offset
             .checked_add(record_len)
-            .map_or(true, |end| end > DEFERRED_BUFFER_SIZE)
+            .is_none_or(|end| end > DEFERRED_BUFFER_SIZE)
         {
             log::warn!(
                 "Record data at index {} would exceed buffer bounds (offset={}, record_len={})",
@@ -356,7 +356,7 @@ pub fn process_pending() -> Result<usize, VarStoreError> {
                             Ok(verified_data) => {
                                 log::info!("Deferred authenticated variable verified successfully");
                                 // Use the timestamp that was stored with the record
-                                (verified_data, Some(record.timestamp.clone()))
+                                (verified_data, Some(record.timestamp))
                             }
                             Err(e) => {
                                 log::warn!(
@@ -380,7 +380,7 @@ pub fn process_pending() -> Result<usize, VarStoreError> {
                             &record.name,
                             record.attributes,
                             &actual_data,
-                            timestamp.clone(),
+                            *timestamp,
                         )
                     } else {
                         super::persistence::write_variable_to_storage_internal(

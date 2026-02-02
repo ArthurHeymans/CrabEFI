@@ -38,7 +38,8 @@ use alloc::vec::Vec;
 /// Maximum dbx update file size (1MB should be plenty)
 const MAX_DBX_SIZE: usize = 1024 * 1024;
 
-/// Microsoft's vendor GUID for dbx entries
+/// Microsoft's vendor GUID for dbx entries (for future dbx entry verification)
+#[allow(dead_code)]
 const MICROSOFT_OWNER_GUID: [u8; 16] = [
     0xbd, 0x9a, 0xfa, 0x77, 0x59, 0x03, 0x32, 0x4d, 0xbd, 0x60, 0x28, 0xf4, 0xe7, 0x8f, 0x78, 0x4b,
 ];
@@ -183,15 +184,16 @@ fn search_disk_for_dbx(
 /// Try to load a dbx file from any of the known paths
 fn try_load_dbx_file(fat: &mut FatFilesystem<'_>) -> Option<Vec<u8>> {
     for path in DBX_PATHS {
-        if let Ok(size) = fat.file_size(path) {
-            if size > 0 && size <= MAX_DBX_SIZE as u32 {
-                let mut buffer = alloc::vec![0u8; size as usize];
-                if let Ok(bytes_read) = fat.read_file_all(path, &mut buffer) {
-                    if bytes_read == size as usize {
-                        log::info!("Loaded dbx update file: {} ({} bytes)", path, bytes_read);
-                        return Some(buffer);
-                    }
-                }
+        if let Ok(size) = fat.file_size(path)
+            && size > 0
+            && size <= MAX_DBX_SIZE as u32
+        {
+            let mut buffer = alloc::vec![0u8; size as usize];
+            if let Ok(bytes_read) = fat.read_file_all(path, &mut buffer)
+                && bytes_read == size as usize
+            {
+                log::info!("Loaded dbx update file: {} ({} bytes)", path, bytes_read);
+                return Some(buffer);
             }
         }
     }

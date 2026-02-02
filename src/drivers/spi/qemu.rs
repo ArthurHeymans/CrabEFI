@@ -477,8 +477,7 @@ impl QemuPflashController {
 
         // Align to erase block boundaries
         let aligned_offset = flash_offset & !(ERASE_BLOCK_SIZE - 1);
-        let aligned_len =
-            ((actual_len + ERASE_BLOCK_SIZE - 1) / ERASE_BLOCK_SIZE) * ERASE_BLOCK_SIZE;
+        let aligned_len = actual_len.div_ceil(ERASE_BLOCK_SIZE) * ERASE_BLOCK_SIZE;
 
         log::debug!(
             "pflash erase: offset={:#x}, len={:#x} (aligned: offset={:#x}, len={:#x})",

@@ -474,39 +474,38 @@ extern "efiapi" fn set_variable(
         }
 
         // Handle APPEND_WRITE for signature databases
-        if is_append && existing_idx.is_some() {
-            if let Some(var_type) = secure_boot_var {
-                let idx = existing_idx.unwrap();
-                let existing_data = &variables[idx].data[..variables[idx].data_size];
+        if is_append
+            && let Some(idx) = existing_idx
+            && let Some(var_type) = secure_boot_var
+        {
+            let existing_data = &variables[idx].data[..variables[idx].data_size];
 
-                // Append the new signature lists to existing data
-                match append_signature_data(existing_data, data_ptr, final_data_size, var_type) {
-                    Ok(combined) => {
-                        if combined.len() > MAX_VARIABLE_DATA_SIZE {
-                            return Status::OUT_OF_RESOURCES;
-                        }
-
-                        variables[idx].data[..combined.len()].copy_from_slice(&combined);
-                        variables[idx].data_size = combined.len();
-
-                        // Update the key database
-                        update_key_database(var_type, &combined);
-
-                        // Persist the updated variable
-                        if (attributes & crate::efi::auth::attributes::NON_VOLATILE) != 0 {
-                            let name_slice =
-                                unsafe { core::slice::from_raw_parts(name, name_len + 1) };
-                            if let Err(e) = crate::efi::varstore::persist_variable(
-                                &guid, name_slice, attributes, &combined,
-                            ) {
-                                log::debug!("Variable not persisted: {:?}", e);
-                            }
-                        }
-
-                        return Status::SUCCESS;
+            // Append the new signature lists to existing data
+            match append_signature_data(existing_data, data_ptr, final_data_size, var_type) {
+                Ok(combined) => {
+                    if combined.len() > MAX_VARIABLE_DATA_SIZE {
+                        return Status::OUT_OF_RESOURCES;
                     }
-                    Err(e) => return e.into(),
+
+                    variables[idx].data[..combined.len()].copy_from_slice(&combined);
+                    variables[idx].data_size = combined.len();
+
+                    // Update the key database
+                    update_key_database(var_type, &combined);
+
+                    // Persist the updated variable
+                    if (attributes & crate::efi::auth::attributes::NON_VOLATILE) != 0 {
+                        let name_slice = unsafe { core::slice::from_raw_parts(name, name_len + 1) };
+                        if let Err(e) = crate::efi::varstore::persist_variable(
+                            &guid, name_slice, attributes, &combined,
+                        ) {
+                            log::debug!("Variable not persisted: {:?}", e);
+                        }
+                    }
+
+                    return Status::SUCCESS;
                 }
+                Err(e) => return e.into(),
             }
         }
 

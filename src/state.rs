@@ -139,7 +139,11 @@ pub fn try_get() -> Option<&'static FirmwareState> {
 #[inline]
 pub fn try_get_mut_ptr() -> Option<*mut FirmwareState> {
     let ptr = STATE_PTR.load(Ordering::Acquire);
-    if ptr.is_null() { None } else { Some(ptr) }
+    if ptr.is_null() {
+        None
+    } else {
+        Some(ptr)
+    }
 }
 
 // ============================================================================
@@ -499,6 +503,22 @@ pub struct DriverState {
     /// Global framebuffer info (from coreboot)
     pub framebuffer: Option<FramebufferInfo>,
 
+    /// SMMSTORE v2 info (from coreboot tables)
+    ///
+    /// Contains information for accessing UEFI variable storage through
+    /// coreboot's SMMSTORE v2 interface.
+    pub smmstorev2: Option<crate::coreboot::Smmstorev2Info>,
+
+    /// SPI flash info (from coreboot tables)
+    ///
+    /// Contains information about the system's SPI flash chip.
+    pub spi_flash: Option<crate::coreboot::SpiFlashInfo>,
+
+    /// Boot media params (from coreboot tables)
+    ///
+    /// Contains information about the boot media layout including FMAP location.
+    pub boot_media: Option<crate::coreboot::BootMediaInfo>,
+
     /// Storage backend for variable persistence (SPI flash, etc.)
     ///
     /// This is initialized during boot from detected SPI controller.
@@ -515,6 +535,9 @@ impl DriverState {
             serial_port: None,
             keyboard: KeyboardState::new(),
             framebuffer: None,
+            smmstorev2: None,
+            spi_flash: None,
+            boot_media: None,
             storage: None,
         }
     }

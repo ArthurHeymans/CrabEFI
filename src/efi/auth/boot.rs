@@ -133,11 +133,12 @@ fn load_secure_boot_enable_preference() -> bool {
     use super::EFI_GLOBAL_VARIABLE_GUID;
     use super::variables::SECURE_BOOT_ENABLE_NAME;
 
-    if let Some(data) = get_variable_data(&EFI_GLOBAL_VARIABLE_GUID, SECURE_BOOT_ENABLE_NAME) {
-        if !data.is_empty() && data[0] == 1 {
-            log::debug!("Loaded SecureBootEnable preference: enabled");
-            return true;
-        }
+    if let Some(data) = get_variable_data(&EFI_GLOBAL_VARIABLE_GUID, SECURE_BOOT_ENABLE_NAME)
+        && !data.is_empty()
+        && data[0] == 1
+    {
+        log::debug!("Loaded SecureBootEnable preference: enabled");
+        return true;
     }
     log::debug!("SecureBootEnable preference not set or disabled");
     false
@@ -158,92 +159,89 @@ fn load_keys_from_variables() -> EnrollmentStatus {
     use super::structures::EfiTime;
 
     // Load PK
-    if let Some(data) = get_variable_data(&EFI_GLOBAL_VARIABLE_GUID, PK_NAME) {
-        if !data.is_empty() {
-            let mut pk = pk_database();
-            if let Err(e) = pk.load_from_signature_lists(&data) {
-                log::warn!("Failed to parse PK variable: {:?}", e);
-            } else {
-                log::debug!("Loaded {} PK entries", pk.len());
-                // Restore timestamp from stored variable for monotonic validation
-                if let Some(ts) = get_variable_timestamp(&EFI_GLOBAL_VARIABLE_GUID, PK_NAME) {
-                    pk.set_timestamp(EfiTime::from_serialized(&ts));
-                    log::debug!(
-                        "Restored PK timestamp: {}-{:02}-{:02}",
-                        ts.year,
-                        ts.month,
-                        ts.day
-                    );
-                }
+    if let Some(data) = get_variable_data(&EFI_GLOBAL_VARIABLE_GUID, PK_NAME)
+        && !data.is_empty()
+    {
+        let mut pk = pk_database();
+        if let Err(e) = pk.load_from_signature_lists(&data) {
+            log::warn!("Failed to parse PK variable: {:?}", e);
+        } else {
+            log::debug!("Loaded {} PK entries", pk.len());
+            // Restore timestamp from stored variable for monotonic validation
+            if let Some(ts) = get_variable_timestamp(&EFI_GLOBAL_VARIABLE_GUID, PK_NAME) {
+                pk.set_timestamp(EfiTime::from_serialized(&ts));
+                log::debug!(
+                    "Restored PK timestamp: {}-{:02}-{:02}",
+                    ts.year,
+                    ts.month,
+                    ts.day
+                );
             }
         }
     }
 
     // Load KEK
-    if let Some(data) = get_variable_data(&EFI_GLOBAL_VARIABLE_GUID, KEK_NAME) {
-        if !data.is_empty() {
-            let mut kek = kek_database();
-            if let Err(e) = kek.load_from_signature_lists(&data) {
-                log::warn!("Failed to parse KEK variable: {:?}", e);
-            } else {
-                log::debug!("Loaded {} KEK entries", kek.len());
-                // Restore timestamp
-                if let Some(ts) = get_variable_timestamp(&EFI_GLOBAL_VARIABLE_GUID, KEK_NAME) {
-                    kek.set_timestamp(EfiTime::from_serialized(&ts));
-                    log::debug!(
-                        "Restored KEK timestamp: {}-{:02}-{:02}",
-                        ts.year,
-                        ts.month,
-                        ts.day
-                    );
-                }
+    if let Some(data) = get_variable_data(&EFI_GLOBAL_VARIABLE_GUID, KEK_NAME)
+        && !data.is_empty()
+    {
+        let mut kek = kek_database();
+        if let Err(e) = kek.load_from_signature_lists(&data) {
+            log::warn!("Failed to parse KEK variable: {:?}", e);
+        } else {
+            log::debug!("Loaded {} KEK entries", kek.len());
+            // Restore timestamp
+            if let Some(ts) = get_variable_timestamp(&EFI_GLOBAL_VARIABLE_GUID, KEK_NAME) {
+                kek.set_timestamp(EfiTime::from_serialized(&ts));
+                log::debug!(
+                    "Restored KEK timestamp: {}-{:02}-{:02}",
+                    ts.year,
+                    ts.month,
+                    ts.day
+                );
             }
         }
     }
 
     // Load db
-    if let Some(data) = get_variable_data(&EFI_IMAGE_SECURITY_DATABASE_GUID, DB_NAME) {
-        if !data.is_empty() {
-            let mut db = db_database();
-            if let Err(e) = db.load_from_signature_lists(&data) {
-                log::warn!("Failed to parse db variable: {:?}", e);
-            } else {
-                log::debug!("Loaded {} db entries", db.len());
-                // Restore timestamp
-                if let Some(ts) = get_variable_timestamp(&EFI_IMAGE_SECURITY_DATABASE_GUID, DB_NAME)
-                {
-                    db.set_timestamp(EfiTime::from_serialized(&ts));
-                    log::debug!(
-                        "Restored db timestamp: {}-{:02}-{:02}",
-                        ts.year,
-                        ts.month,
-                        ts.day
-                    );
-                }
+    if let Some(data) = get_variable_data(&EFI_IMAGE_SECURITY_DATABASE_GUID, DB_NAME)
+        && !data.is_empty()
+    {
+        let mut db = db_database();
+        if let Err(e) = db.load_from_signature_lists(&data) {
+            log::warn!("Failed to parse db variable: {:?}", e);
+        } else {
+            log::debug!("Loaded {} db entries", db.len());
+            // Restore timestamp
+            if let Some(ts) = get_variable_timestamp(&EFI_IMAGE_SECURITY_DATABASE_GUID, DB_NAME) {
+                db.set_timestamp(EfiTime::from_serialized(&ts));
+                log::debug!(
+                    "Restored db timestamp: {}-{:02}-{:02}",
+                    ts.year,
+                    ts.month,
+                    ts.day
+                );
             }
         }
     }
 
     // Load dbx
-    if let Some(data) = get_variable_data(&EFI_IMAGE_SECURITY_DATABASE_GUID, DBX_NAME) {
-        if !data.is_empty() {
-            let mut dbx = dbx_database();
-            if let Err(e) = dbx.load_from_signature_lists(&data) {
-                log::warn!("Failed to parse dbx variable: {:?}", e);
-            } else {
-                log::debug!("Loaded {} dbx entries", dbx.len());
-                // Restore timestamp
-                if let Some(ts) =
-                    get_variable_timestamp(&EFI_IMAGE_SECURITY_DATABASE_GUID, DBX_NAME)
-                {
-                    dbx.set_timestamp(EfiTime::from_serialized(&ts));
-                    log::debug!(
-                        "Restored dbx timestamp: {}-{:02}-{:02}",
-                        ts.year,
-                        ts.month,
-                        ts.day
-                    );
-                }
+    if let Some(data) = get_variable_data(&EFI_IMAGE_SECURITY_DATABASE_GUID, DBX_NAME)
+        && !data.is_empty()
+    {
+        let mut dbx = dbx_database();
+        if let Err(e) = dbx.load_from_signature_lists(&data) {
+            log::warn!("Failed to parse dbx variable: {:?}", e);
+        } else {
+            log::debug!("Loaded {} dbx entries", dbx.len());
+            // Restore timestamp
+            if let Some(ts) = get_variable_timestamp(&EFI_IMAGE_SECURITY_DATABASE_GUID, DBX_NAME) {
+                dbx.set_timestamp(EfiTime::from_serialized(&ts));
+                log::debug!(
+                    "Restored dbx timestamp: {}-{:02}-{:02}",
+                    ts.year,
+                    ts.month,
+                    ts.day
+                );
             }
         }
     }
@@ -304,7 +302,7 @@ pub fn persist_key_databases() -> Result<(), AuthError> {
         let pk = pk_database();
         if !pk.is_empty() {
             let data = pk.to_signature_lists();
-            let timestamp = pk.timestamp().clone();
+            let timestamp = *pk.timestamp();
             if !data.is_empty() {
                 persist_key_variable(SecureBootVariable::PK, &data, &timestamp)?;
                 log::debug!("Persisted PK ({} bytes)", data.len());
@@ -317,7 +315,7 @@ pub fn persist_key_databases() -> Result<(), AuthError> {
         let kek = kek_database();
         if !kek.is_empty() {
             let data = kek.to_signature_lists();
-            let timestamp = kek.timestamp().clone();
+            let timestamp = *kek.timestamp();
             if !data.is_empty() {
                 persist_key_variable(SecureBootVariable::KEK, &data, &timestamp)?;
                 log::debug!("Persisted KEK ({} bytes)", data.len());
@@ -330,7 +328,7 @@ pub fn persist_key_databases() -> Result<(), AuthError> {
         let db = db_database();
         if !db.is_empty() {
             let data = db.to_signature_lists();
-            let timestamp = db.timestamp().clone();
+            let timestamp = *db.timestamp();
             if !data.is_empty() {
                 persist_key_variable(SecureBootVariable::Db, &data, &timestamp)?;
                 log::debug!("Persisted db ({} bytes)", data.len());
@@ -343,7 +341,7 @@ pub fn persist_key_databases() -> Result<(), AuthError> {
         let dbx = dbx_database();
         if !dbx.is_empty() {
             let data = dbx.to_signature_lists();
-            let timestamp = dbx.timestamp().clone();
+            let timestamp = *dbx.timestamp();
             if !data.is_empty() {
                 persist_key_variable(SecureBootVariable::Dbx, &data, &timestamp)?;
                 log::debug!("Persisted dbx ({} bytes)", data.len());

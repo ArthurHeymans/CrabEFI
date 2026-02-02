@@ -14,77 +14,59 @@ pub mod framebuffer;
 pub mod memory;
 pub mod tables;
 
-use spin::Mutex;
-
 pub use framebuffer::FramebufferInfo;
 pub use memory::{MemoryRegion, MemoryType};
 pub use tables::{
     BootMediaInfo, CorebootInfo, FlashMmapWindow, SerialInfo, Smmstorev2Info, SpiFlashInfo,
 };
 
-/// Global framebuffer info storage
-///
-/// This is populated during coreboot table parsing and can be accessed
-/// by other modules (like the boot menu) for framebuffer rendering.
-static GLOBAL_FRAMEBUFFER: Mutex<Option<FramebufferInfo>> = Mutex::new(None);
-
-/// Global SMMSTORE v2 info storage
-///
-/// This is populated during coreboot table parsing and can be accessed
-/// by the variable store persistence layer for UEFI variable storage.
-static GLOBAL_SMMSTOREV2: Mutex<Option<Smmstorev2Info>> = Mutex::new(None);
-
-/// Global SPI flash info storage
-///
-/// This is populated during coreboot table parsing and provides
-/// information about the system's SPI flash chip.
-static GLOBAL_SPI_FLASH: Mutex<Option<SpiFlashInfo>> = Mutex::new(None);
-
-/// Global boot media params storage
-///
-/// This is populated during coreboot table parsing and provides
-/// information about the boot media layout including FMAP location.
-static GLOBAL_BOOT_MEDIA: Mutex<Option<BootMediaInfo>> = Mutex::new(None);
-
-/// Store framebuffer info globally for later access
+/// Store framebuffer info in global state
 pub fn store_framebuffer(fb: FramebufferInfo) {
-    *GLOBAL_FRAMEBUFFER.lock() = Some(fb);
+    crate::state::with_drivers_mut(|drivers| {
+        drivers.framebuffer = Some(fb);
+    });
 }
 
 /// Get access to the global framebuffer info
 ///
 /// Returns a clone of the framebuffer info if available.
 pub fn get_framebuffer() -> Option<FramebufferInfo> {
-    GLOBAL_FRAMEBUFFER.lock().clone()
+    crate::state::try_get().and_then(|state| state.drivers.framebuffer.clone())
 }
 
-/// Store SMMSTORE v2 info globally for later access
+/// Store SMMSTORE v2 info in global state
 pub fn store_smmstorev2(smmstore: Smmstorev2Info) {
-    *GLOBAL_SMMSTOREV2.lock() = Some(smmstore);
+    crate::state::with_drivers_mut(|drivers| {
+        drivers.smmstorev2 = Some(smmstore);
+    });
 }
 
 /// Get access to the global SMMSTORE v2 info
 ///
 /// Returns a clone of the SMMSTORE v2 info if available.
 pub fn get_smmstorev2() -> Option<Smmstorev2Info> {
-    GLOBAL_SMMSTOREV2.lock().clone()
+    crate::state::try_get().and_then(|state| state.drivers.smmstorev2.clone())
 }
 
-/// Store SPI flash info globally for later access
+/// Store SPI flash info in global state
 pub fn store_spi_flash(spi_flash: SpiFlashInfo) {
-    *GLOBAL_SPI_FLASH.lock() = Some(spi_flash);
+    crate::state::with_drivers_mut(|drivers| {
+        drivers.spi_flash = Some(spi_flash);
+    });
 }
 
 /// Get access to the global SPI flash info
 ///
 /// Returns a clone of the SPI flash info if available.
 pub fn get_spi_flash() -> Option<SpiFlashInfo> {
-    GLOBAL_SPI_FLASH.lock().clone()
+    crate::state::try_get().and_then(|state| state.drivers.spi_flash.clone())
 }
 
-/// Store boot media params globally for later access
+/// Store boot media params in global state
 pub fn store_boot_media(boot_media: BootMediaInfo) {
-    *GLOBAL_BOOT_MEDIA.lock() = Some(boot_media);
+    crate::state::with_drivers_mut(|drivers| {
+        drivers.boot_media = Some(boot_media);
+    });
 }
 
 /// Get access to the global boot media params
@@ -92,5 +74,5 @@ pub fn store_boot_media(boot_media: BootMediaInfo) {
 /// Returns a clone of the boot media info if available.
 /// This includes the FMAP offset which can be used to locate flash regions.
 pub fn get_boot_media() -> Option<BootMediaInfo> {
-    GLOBAL_BOOT_MEDIA.lock().clone()
+    crate::state::try_get().and_then(|state| state.drivers.boot_media.clone())
 }

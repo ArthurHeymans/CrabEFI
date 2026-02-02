@@ -77,9 +77,11 @@ const AMD_LPC_FUNCTION: u8 = 3;
 pub struct AmdSpi100Controller {
     /// Memory-mapped SPI registers
     spibar: MmioRegion,
-    /// Chipset type
+    /// Chipset type (kept for future diagnostics/logging)
+    #[allow(dead_code)]
     chipset: AmdChipset,
-    /// PCI address of the SMBus device
+    /// PCI address of the SMBus device (kept for future use)
+    #[allow(dead_code)]
     pci_addr: PciAddress,
     /// Original alternate speed (for restoration on shutdown)
     _altspeed: u8,
@@ -221,9 +223,8 @@ impl AmdSpi100Controller {
 
         // Write remaining bytes to FIFO
         if writecnt > 1 {
-            for i in 1..writecnt {
-                self.spibar
-                    .write8(regs::FIFO_BASE + (i - 1) as u64, writearr[i]);
+            for (i, &byte) in writearr.iter().enumerate().skip(1).take(writecnt - 1) {
+                self.spibar.write8(regs::FIFO_BASE + (i - 1) as u64, byte);
             }
         }
 
@@ -260,8 +261,8 @@ impl AmdSpi100Controller {
         // Read response data from FIFO
         if readcnt > 0 {
             let fifo_offset = writecnt - 1;
-            for i in 0..readcnt {
-                readarr[i] = self
+            for (i, byte) in readarr.iter_mut().enumerate().take(readcnt) {
+                *byte = self
                     .spibar
                     .read8(regs::FIFO_BASE + (fifo_offset + i) as u64);
             }

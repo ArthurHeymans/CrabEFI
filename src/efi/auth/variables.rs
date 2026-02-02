@@ -20,7 +20,8 @@ fn guid_to_bytes(guid: &Guid) -> [u8; 16] {
     result
 }
 
-/// Compare a raw GUID (as bytes) with an r_efi Guid
+/// Compare a raw GUID (as bytes) with an r_efi Guid (for future use in GUID-based lookups)
+#[allow(dead_code)]
 fn guid_bytes_match(bytes: &[u8; 16], guid: &Guid) -> bool {
     *bytes == guid_to_bytes(guid)
 }

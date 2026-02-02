@@ -193,15 +193,16 @@ fn search_disk_for_keys(
 /// Try to load a file from any of the given paths
 fn try_load_file(fat: &mut FatFilesystem<'_>, paths: &[&str]) -> Option<Vec<u8>> {
     for path in paths {
-        if let Ok(size) = fat.file_size(path) {
-            if size > 0 && size <= MAX_CERT_SIZE as u32 {
-                let mut buffer = alloc::vec![0u8; size as usize];
-                if let Ok(bytes_read) = fat.read_file_all(path, &mut buffer) {
-                    if bytes_read == size as usize {
-                        log::info!("Loaded key file: {} ({} bytes)", path, bytes_read);
-                        return Some(buffer);
-                    }
-                }
+        if let Ok(size) = fat.file_size(path)
+            && size > 0
+            && size <= MAX_CERT_SIZE as u32
+        {
+            let mut buffer = alloc::vec![0u8; size as usize];
+            if let Ok(bytes_read) = fat.read_file_all(path, &mut buffer)
+                && bytes_read == size as usize
+            {
+                log::info!("Loaded key file: {} ({} bytes)", path, bytes_read);
+                return Some(buffer);
             }
         }
     }

@@ -63,15 +63,21 @@ fn panic(info: &PanicInfo) -> ! {
 /// when Secure Boot verification fails. It also outputs to the serial console.
 /// The display persists for a few seconds so the user can see it.
 pub fn display_secure_boot_error() {
-    use framebuffer_console::{Color, FramebufferConsole, DEFAULT_BG};
+    use framebuffer_console::{Color, DEFAULT_BG, FramebufferConsole};
 
     const ERROR_MESSAGE: &str = "SECURE BOOT VIOLATION: Image not authorized";
 
     // Output to serial console with red color (ANSI escape codes)
     drivers::serial::write_str("\r\n\x1b[1;31m"); // Bold red
-    drivers::serial::write_str("================================================================================\r\n");
-    drivers::serial::write_str("                    SECURE BOOT VIOLATION: Image not authorized                 \r\n");
-    drivers::serial::write_str("================================================================================\r\n");
+    drivers::serial::write_str(
+        "================================================================================\r\n",
+    );
+    drivers::serial::write_str(
+        "                    SECURE BOOT VIOLATION: Image not authorized                 \r\n",
+    );
+    drivers::serial::write_str(
+        "================================================================================\r\n",
+    );
     drivers::serial::write_str("\x1b[0m\r\n"); // Reset color
 
     // Output to framebuffer if available
@@ -139,13 +145,9 @@ pub fn init(coreboot_table_ptr: u64) {
         coreboot::cbmem_console::init(cbmem_addr);
     }
 
-    // Store framebuffer globally for menu rendering
+    // Store framebuffer in global state for menu rendering
     if let Some(ref fb) = cb_info.framebuffer {
         coreboot::store_framebuffer(fb.clone());
-        // Also store in new state
-        state::with_drivers_mut(|drivers| {
-            drivers.framebuffer = Some(fb.clone());
-        });
     }
 
     // Store SMMSTORE v2 info globally for variable persistence
@@ -257,7 +259,7 @@ pub fn init(coreboot_table_ptr: u64) {
         use efi::allocator::{MemoryType, PAGE_SIZE};
         use efi::varstore::{DEFAULT_DEFERRED_BUFFER_BASE, DEFERRED_BUFFER_SIZE};
 
-        let buffer_pages = (DEFERRED_BUFFER_SIZE as u64 + PAGE_SIZE - 1) / PAGE_SIZE;
+        let buffer_pages = (DEFERRED_BUFFER_SIZE as u64).div_ceil(PAGE_SIZE);
 
         // Reserve the memory region as ReservedMemoryType so the OS won't overwrite it
         state::with_allocator_mut(|alloc| {

@@ -386,10 +386,7 @@ pub static INTEL_CHIPSETS: &[ChipsetEnable] = &[
 
 /// Find a chipset enable entry by PCI vendor/device ID
 pub fn find_chipset(vendor_id: u16, device_id: u16) -> Option<&'static ChipsetEnable> {
-    for enable in INTEL_CHIPSETS {
-        if enable.vendor_id == vendor_id && enable.device_id == device_id {
-            return Some(enable);
-        }
-    }
-    None
+    INTEL_CHIPSETS
+        .iter()
+        .find(|enable| enable.vendor_id == vendor_id && enable.device_id == device_id)
 }
