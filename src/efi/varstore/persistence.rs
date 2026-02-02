@@ -245,8 +245,9 @@ fn load_variables_from_smmstore() -> Result<(), VarStoreError> {
 
     while offset < size {
         // Read a chunk to try deserializing
+        // Use MAX_DATA_SIZE from varstore module (4096) not state module's smaller limit
         let remaining = size - offset;
-        let chunk_size = core::cmp::min(remaining, MAX_VARIABLE_DATA_SIZE as u32 + 256);
+        let chunk_size = core::cmp::min(remaining, super::MAX_DATA_SIZE as u32 + 256);
         let mut chunk = alloc::vec![0u8; chunk_size as usize];
 
         spi.read(base + offset, &mut chunk)
@@ -358,8 +359,9 @@ pub fn get_variable_timestamp(
     let mut found_timestamp: Option<super::SerializedTime> = None;
 
     while offset < write_offset {
+        // Use MAX_DATA_SIZE from varstore module (4096) not state module's smaller limit
         let remaining = write_offset - offset;
-        let chunk_size = core::cmp::min(remaining, MAX_VARIABLE_DATA_SIZE as u32 + 256);
+        let chunk_size = core::cmp::min(remaining, super::MAX_DATA_SIZE as u32 + 256);
         let mut chunk = alloc::vec![0u8; chunk_size as usize];
 
         if spi.read(base + offset, &mut chunk).is_err() {
@@ -783,8 +785,9 @@ pub fn compact_smmstore() -> Result<u32, VarStoreError> {
 
 /// Update a variable in the in-memory cache
 ///
-/// This is used when applying deferred variable changes on boot.
-pub(super) fn update_variable_in_memory(
+/// This is used when applying deferred variable changes on boot,
+/// or when directly updating a variable without going through SetVariable.
+pub fn update_variable_in_memory(
     guid: &r_efi::efi::Guid,
     name: &[u16],
     attributes: u32,

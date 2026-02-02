@@ -49,6 +49,14 @@ pub const SECURE_BOOT_NAME: &[u16] = &[
     0x53, 0x65, 0x63, 0x75, 0x72, 0x65, 0x42, 0x6F, 0x6F, 0x74, 0x00,
 ]; // "SecureBoot\0"
 
+/// SecureBootEnable variable name (UCS-2)
+/// This is a non-volatile variable that stores the user's preference for enabling Secure Boot.
+/// Unlike SecureBoot (which is a read-only status variable), this persists across resets.
+pub const SECURE_BOOT_ENABLE_NAME: &[u16] = &[
+    0x53, 0x65, 0x63, 0x75, 0x72, 0x65, 0x42, 0x6F, 0x6F, 0x74, 0x45, 0x6E, 0x61, 0x62, 0x6C, 0x65,
+    0x00,
+]; // "SecureBootEnable\0"
+
 // ============================================================================
 // Secure Boot Key Database
 // ============================================================================

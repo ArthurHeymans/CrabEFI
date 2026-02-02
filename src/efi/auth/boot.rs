@@ -109,13 +109,38 @@ pub fn init_secure_boot(config: &SecureBootConfig) -> Result<EnrollmentStatus, A
     // Step 4: Create/update status variables
     create_status_variables()?;
 
-    // Step 5: Enable Secure Boot if configured
-    if config.enable_secure_boot && !is_setup_mode() {
-        super::enable_secure_boot();
+    // Step 5: Load and apply SecureBootEnable preference from persistent storage
+    // This is the user's saved preference from previous boot
+    if !is_setup_mode() {
+        let enable_from_storage = load_secure_boot_enable_preference();
+        if enable_from_storage || config.enable_secure_boot {
+            // Use internal function to avoid re-persisting what we just loaded
+            super::SECURE_BOOT_ENABLED.store(true, core::sync::atomic::Ordering::Release);
+            log::info!("Secure Boot: Enabled (from persisted preference)");
+            // Update status variables to reflect the enabled state
+            let _ = update_status_variables();
+        }
     }
 
     // Return final enrollment status
     Ok(enrollment::get_enrollment_status())
+}
+
+/// Load the SecureBootEnable preference from persistent storage
+///
+/// Returns true if Secure Boot was previously enabled by the user.
+fn load_secure_boot_enable_preference() -> bool {
+    use super::variables::SECURE_BOOT_ENABLE_NAME;
+    use super::EFI_GLOBAL_VARIABLE_GUID;
+
+    if let Some(data) = get_variable_data(&EFI_GLOBAL_VARIABLE_GUID, SECURE_BOOT_ENABLE_NAME) {
+        if !data.is_empty() && data[0] == 1 {
+            log::debug!("Loaded SecureBootEnable preference: enabled");
+            return true;
+        }
+    }
+    log::debug!("SecureBootEnable preference not set or disabled");
+    false
 }
 
 /// Initialize Secure Boot with default configuration

@@ -41,14 +41,13 @@
 //! # Authenticated Variables
 //!
 //! For authenticated variables (those with TIME_BASED_AUTHENTICATED_WRITE_ACCESS):
-//! - Signature is verified at queue time (when key databases are accessible)
-//! - Entry is marked as "pre-verified"
-//! - On next boot, pre-verified entries are applied without re-verification
+//! - The original signed data (with EFI_VARIABLE_AUTHENTICATION_2 header) is stored
+//! - On next boot, the signature is verified against current key databases
+//! - Only after successful verification is the variable written to NVS
 //!
-//! This is necessary because:
-//! 1. The original timestamp would be stale on next boot
-//! 2. We can't re-sign without the private key
-//! 3. We trust our own verification from before ExitBootServices
+//! This ensures that if key databases change between boots, the verification
+//! uses the current trusted state. The timestamp validation will still pass
+//! because we haven't committed the update to NVS yet.
 
 use core::sync::atomic::{AtomicBool, Ordering};
 
@@ -84,8 +83,6 @@ const MAX_ENTRY_SIZE: usize = 8 * 1024;
 mod entry_flags {
     /// Entry contains an authenticated variable
     pub const IS_AUTHENTICATED: u8 = 0x01;
-    /// Entry was pre-verified at queue time (signature checked)
-    pub const PRE_VERIFIED: u8 = 0x02;
     /// Entry is a deletion (not a write)
     pub const IS_DELETION: u8 = 0x04;
 }
@@ -94,7 +91,7 @@ mod entry_flags {
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct EntryHeader {
-    /// Entry flags (IS_AUTHENTICATED, PRE_VERIFIED, IS_DELETION)
+    /// Entry flags (IS_AUTHENTICATED, IS_DELETION)
     flags: u8,
     /// Reserved
     _reserved: [u8; 3],
@@ -255,9 +252,9 @@ pub fn check_pending() -> usize {
 /// then clears the buffer.
 ///
 /// For authenticated variables:
-/// - If the entry is marked as PRE_VERIFIED, the signature was verified at queue time
-///   and we apply the change directly
-/// - If not pre-verified, we skip the entry (shouldn't happen for authenticated vars)
+/// - The signature is verified against the current key databases
+/// - Only if verification succeeds is the variable written to NVS
+/// - If verification fails, the entry is skipped (security policy)
 ///
 /// Returns the number of entries processed.
 pub fn process_pending() -> Result<usize, VarStoreError> {
@@ -293,51 +290,15 @@ pub fn process_pending() -> Result<usize, VarStoreError> {
         // Read record data
         let record_data = unsafe { core::slice::from_raw_parts(base.add(offset), record_len) };
 
-        // Check if this is an authenticated variable that wasn't pre-verified
         let is_authenticated = flags & entry_flags::IS_AUTHENTICATED != 0;
-        let is_pre_verified = flags & entry_flags::PRE_VERIFIED != 0;
-
-        if is_authenticated && !is_pre_verified {
-            // Skip - we can't verify the signature now (key databases may have changed)
-            log::warn!(
-                "Skipping non-pre-verified authenticated variable at entry {}",
-                i
-            );
-            offset += record_len;
-            continue;
-        }
+        let is_deletion = flags & entry_flags::IS_DELETION != 0;
 
         // Deserialize the variable record
         match VariableRecord::deserialize(record_data) {
             Ok(record) => {
                 let guid = record.guid.to_guid();
 
-                let is_deletion = flags & entry_flags::IS_DELETION != 0;
-
-                if !is_deletion && record.is_active() {
-                    // Write to SPI
-                    if let Err(e) = super::persistence::write_variable_to_spi_internal(
-                        &guid,
-                        &record.name,
-                        record.attributes,
-                        &record.data,
-                    ) {
-                        log::warn!("Failed to apply deferred variable write: {:?}", e);
-                    } else {
-                        // Also update in-memory
-                        super::persistence::update_variable_in_memory(
-                            &guid,
-                            &record.name,
-                            record.attributes,
-                            &record.data,
-                        );
-                        processed += 1;
-
-                        if is_pre_verified {
-                            log::debug!("Applied pre-verified authenticated variable");
-                        }
-                    }
-                } else {
+                if is_deletion {
                     // Delete from SPI
                     if let Err(e) = super::persistence::write_variable_deletion_to_spi_internal(
                         &guid,
@@ -346,6 +307,53 @@ pub fn process_pending() -> Result<usize, VarStoreError> {
                         log::warn!("Failed to apply deferred variable deletion: {:?}", e);
                     } else {
                         super::persistence::delete_variable_from_memory(&guid, &record.name);
+                        processed += 1;
+                    }
+                } else if record.is_active() {
+                    // Determine the actual data to write
+                    let actual_data = if is_authenticated {
+                        // Authenticated variable: record.data contains the original signed blob
+                        // Verify it against current key databases before writing to NVS
+                        match auth::verify_authenticated_variable(
+                            &record.name,
+                            &guid,
+                            record.attributes,
+                            &record.data,
+                        ) {
+                            Ok(verified_data) => {
+                                log::info!("Deferred authenticated variable verified successfully");
+                                verified_data
+                            }
+                            Err(e) => {
+                                log::warn!(
+                                    "Deferred authenticated variable verification failed: {:?}, skipping",
+                                    e
+                                );
+                                offset += record_len;
+                                continue;
+                            }
+                        }
+                    } else {
+                        // Non-authenticated variable - use data directly
+                        record.data.clone()
+                    };
+
+                    // Write to SPI
+                    if let Err(e) = super::persistence::write_variable_to_spi_internal(
+                        &guid,
+                        &record.name,
+                        record.attributes,
+                        &actual_data,
+                    ) {
+                        log::warn!("Failed to apply deferred variable write: {:?}", e);
+                    } else {
+                        // Also update in-memory
+                        super::persistence::update_variable_in_memory(
+                            &guid,
+                            &record.name,
+                            record.attributes,
+                            &actual_data,
+                        );
                         processed += 1;
                     }
                 }
@@ -370,8 +378,8 @@ pub fn process_pending() -> Result<usize, VarStoreError> {
 /// This is called after ExitBootServices when we can't write to SPI directly.
 ///
 /// For authenticated variables (those with TIME_BASED_AUTHENTICATED_WRITE_ACCESS),
-/// the signature is verified before queuing. The entry is marked as pre-verified
-/// so it can be applied on next boot without re-verification.
+/// the original signed data (with EFI_VARIABLE_AUTHENTICATION_2 header) is stored.
+/// The signature will be verified on next boot before writing to NVS.
 pub fn queue_write(
     guid: &r_efi::efi::Guid,
     name: &[u16],
@@ -385,28 +393,11 @@ pub fn queue_write(
 
     if is_authenticated {
         flags |= entry_flags::IS_AUTHENTICATED;
-
-        // Verify the authenticated variable before queuing
-        // This is done while we still have access to the key databases
-        match auth::verify_authenticated_variable(name, guid, attributes, data) {
-            Ok(actual_data) => {
-                // Signature verified - mark as pre-verified and use the actual data
-                flags |= entry_flags::PRE_VERIFIED;
-                log::info!("Authenticated variable verified for deferred write");
-
-                // Create record with the actual data (without auth header)
-                let record = VariableRecord::new(guid, name, attributes, &actual_data)?;
-                return queue_record_with_flags(&record, flags);
-            }
-            Err(e) => {
-                // Verification failed - reject the write
-                log::warn!("Authenticated variable verification failed: {:?}", e);
-                return Err(VarStoreError::InvalidArgument);
-            }
-        }
+        // Store the original signed data - will be verified on next boot
+        log::info!("Queuing authenticated variable for deferred verification");
     }
 
-    // Non-authenticated variable - just queue it
+    // Store the data as-is (for authenticated vars, this includes the auth header)
     let record = VariableRecord::new(guid, name, attributes, data)?;
     queue_record_with_flags(&record, flags)
 }
@@ -482,10 +473,10 @@ fn queue_record_with_flags(record: &VariableRecord, flags: u8) -> Result<(), Var
         core::ptr::write(base as *mut DeferredHeader, header);
     }
 
-    let flag_desc = if flags & entry_flags::PRE_VERIFIED != 0 {
-        " (pre-verified)"
-    } else if flags & entry_flags::IS_DELETION != 0 {
+    let flag_desc = if flags & entry_flags::IS_DELETION != 0 {
         " (deletion)"
+    } else if flags & entry_flags::IS_AUTHENTICATED != 0 {
+        " (authenticated, will verify on next boot)"
     } else {
         ""
     };

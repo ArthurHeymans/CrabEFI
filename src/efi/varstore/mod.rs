@@ -42,6 +42,7 @@ use serde::{Deserialize, Serialize};
 pub use persistence::{
     compact_smmstore, delete_variable, get_variable_timestamp, init as init_persistence,
     is_smmstore_initialized, is_spi_available, persist_variable, persist_variable_with_timestamp,
+    update_variable_in_memory,
 };
 
 // Re-export key items from deferred

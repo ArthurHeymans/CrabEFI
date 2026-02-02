@@ -167,6 +167,11 @@ static SETUP_MODE: AtomicBool = AtomicBool::new(true);
 /// Whether Secure Boot is enabled
 static SECURE_BOOT_ENABLED: AtomicBool = AtomicBool::new(false);
 
+/// Variable attributes for the SecureBootEnable user preference variable
+/// This is non-volatile so it persists across resets
+const SECURE_BOOT_ENABLE_ATTRS: u32 =
+    attributes::NON_VOLATILE | attributes::BOOTSERVICE_ACCESS | attributes::RUNTIME_ACCESS;
+
 /// Check if we're in Setup Mode
 pub fn is_setup_mode() -> bool {
     SETUP_MODE.load(Ordering::Acquire)
@@ -195,6 +200,8 @@ pub fn enable_secure_boot() {
     if !is_setup_mode() {
         SECURE_BOOT_ENABLED.store(true, Ordering::Release);
         log::info!("Secure Boot: Enabled");
+        // Persist the user preference to SPI flash
+        persist_secure_boot_enable_preference(true);
     }
 }
 
@@ -202,6 +209,36 @@ pub fn enable_secure_boot() {
 pub fn disable_secure_boot() {
     SECURE_BOOT_ENABLED.store(false, Ordering::Release);
     log::info!("Secure Boot: Disabled");
+    // Persist the user preference to SPI flash
+    persist_secure_boot_enable_preference(false);
+}
+
+/// Persist the SecureBootEnable preference to non-volatile storage
+fn persist_secure_boot_enable_preference(enabled: bool) {
+    use crate::efi::varstore::{persist_variable, update_variable_in_memory};
+    use variables::SECURE_BOOT_ENABLE_NAME;
+
+    let value: u8 = if enabled { 1 } else { 0 };
+
+    // Update the in-memory cache
+    update_variable_in_memory(
+        &EFI_GLOBAL_VARIABLE_GUID,
+        SECURE_BOOT_ENABLE_NAME,
+        SECURE_BOOT_ENABLE_ATTRS,
+        &[value],
+    );
+
+    // Persist to SPI flash
+    if let Err(e) = persist_variable(
+        &EFI_GLOBAL_VARIABLE_GUID,
+        SECURE_BOOT_ENABLE_NAME,
+        SECURE_BOOT_ENABLE_ATTRS,
+        &[value],
+    ) {
+        log::warn!("Failed to persist SecureBootEnable preference: {:?}", e);
+    } else {
+        log::debug!("SecureBootEnable preference persisted: {}", enabled);
+    }
 }
 
 // ============================================================================
