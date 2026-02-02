@@ -130,9 +130,6 @@ fn is_kvm_available() -> bool {
             .unwrap_or(false)
 }
 
-/// Wrapper to kill child process on drop
-struct ChildGuard(Child);
-
 impl Drop for ChildGuard {
     fn drop(&mut self) {
         let _ = self.0.kill();

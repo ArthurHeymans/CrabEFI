@@ -338,16 +338,6 @@ fn install_efi_app(disk_path: &str, app_path: &str) -> Result<()> {
     Ok(())
 }
 
-/// Find a command in PATH
-fn which(cmd: &str) -> Option<String> {
-    Command::new("which")
-        .arg(cmd)
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
