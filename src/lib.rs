@@ -257,27 +257,26 @@ pub fn init(coreboot_table_ptr: u64) {
     // to be applied on the next boot.
     {
         use efi::allocator::{MemoryType, PAGE_SIZE};
-        use efi::varstore::{DEFAULT_DEFERRED_BUFFER_BASE, DEFERRED_BUFFER_SIZE};
+        use efi::varstore::{deferred_buffer_base, deferred_buffer_size};
 
-        let buffer_pages = (DEFERRED_BUFFER_SIZE as u64).div_ceil(PAGE_SIZE);
+        let buffer_base = deferred_buffer_base();
+        let buffer_pages = (deferred_buffer_size() as u64).div_ceil(PAGE_SIZE);
 
         // Reserve the memory region as ReservedMemoryType so the OS won't overwrite it
         state::with_allocator_mut(|alloc| {
-            if let Err(e) = alloc.reserve_region(
-                DEFAULT_DEFERRED_BUFFER_BASE,
-                buffer_pages,
-                MemoryType::ReservedMemoryType,
-            ) {
+            if let Err(e) =
+                alloc.reserve_region(buffer_base, buffer_pages, MemoryType::ReservedMemoryType)
+            {
                 log::warn!(
                     "Could not reserve deferred buffer region at {:#x}: {:?}",
-                    DEFAULT_DEFERRED_BUFFER_BASE,
+                    buffer_base,
                     e
                 );
             } else {
                 log::debug!(
                     "Reserved {} pages for deferred buffer at {:#x}",
                     buffer_pages,
-                    DEFAULT_DEFERRED_BUFFER_BASE
+                    buffer_base
                 );
             }
         });

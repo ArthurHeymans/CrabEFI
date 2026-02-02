@@ -382,24 +382,5 @@ pub fn detect_and_init() -> Option<AnySpiController> {
     None
 }
 
-/// Delay for a specified number of microseconds
-///
-/// This is a simple busy-wait delay using the x86 TSC (Time Stamp Counter).
-/// On modern CPUs, TSC typically runs at a fixed frequency regardless of
-/// CPU frequency scaling.
-#[inline]
-pub fn delay_us(us: u32) {
-    // Use a simple busy loop with approximate timing
-    // On modern x86, each iteration is roughly a few nanoseconds
-    // We'll use a conservative estimate of 100 iterations per microsecond
-    let iterations = us as u64 * 100;
-    for _ in 0..iterations {
-        core::hint::spin_loop();
-    }
-}
-
-/// Delay for a specified number of milliseconds
-#[inline]
-pub fn delay_ms(ms: u32) {
-    delay_us(ms * 1000);
-}
+// Re-export delay functions from the calibrated time module
+pub use crate::time::{delay_ms, delay_us};

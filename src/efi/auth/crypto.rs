@@ -210,13 +210,6 @@ fn verify_cert_chain(
     }
 }
 
-/// Verify that a certificate is the same as the trusted certificate
-/// (Used for checking if embedded cert IS the trusted cert)
-#[allow(dead_code)]
-fn certs_match(cert: &X509Certificate, trusted: &X509Certificate) -> bool {
-    cert.issuer == trusted.issuer && cert.serial_number == trusted.serial_number
-}
-
 // ============================================================================
 // X.509 Certificate Parsing
 // ============================================================================

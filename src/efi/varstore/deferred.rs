@@ -10,7 +10,7 @@
 //! # Memory Layout
 //!
 //! ```text
-//! +------------------+ <- DEFERRED_BUFFER_BASE
+//! +------------------+ <- _deferred_buffer_start
 //! | Header (32 bytes)|
 //! |   Magic "CVBF"   |
 //! |   Version        |
@@ -28,7 +28,7 @@
 //! | ...              |
 //! +------------------+
 //! | Free space       |
-//! +------------------+ <- DEFERRED_BUFFER_BASE + DEFERRED_BUFFER_SIZE
+//! +------------------+ <- _deferred_buffer_end
 //! ```
 //!
 //! # Warm vs Cold Boot
@@ -61,18 +61,34 @@ const DEFERRED_MAGIC: u32 = 0x46425643;
 /// Current buffer format version
 const DEFERRED_VERSION: u8 = 1;
 
-/// Default base address for the deferred buffer
-/// This should be in a region that:
-/// 1. Is marked as EfiReservedMemoryType in the memory map
-/// 2. Is unlikely to be overwritten during warm reset
-/// 3. Is below 4GB for easy access
-///
-/// We use 0x1000_0000 (256MB) as a default - this should be adjusted
-/// based on the actual memory map from coreboot.
-pub const DEFAULT_DEFERRED_BUFFER_BASE: u64 = 0x0100_0000; // 16MB
+// Linker symbols for deferred buffer section (defined in x86_64-coreboot.ld)
+// The .deferred_buffer section is a NOLOAD region allocated by the linker.
+unsafe extern "C" {
+    static _deferred_buffer_start: u8;
+    static _deferred_buffer_end: u8;
+}
 
-/// Size of the deferred buffer (64KB should be plenty for variable changes)
-pub const DEFERRED_BUFFER_SIZE: usize = 64 * 1024;
+/// Get the deferred buffer base address from linker script
+#[inline]
+pub fn deferred_buffer_base() -> u64 {
+    unsafe { &_deferred_buffer_start as *const u8 as u64 }
+}
+
+/// Get the deferred buffer size from linker script
+#[inline]
+pub fn deferred_buffer_size() -> usize {
+    unsafe {
+        let start = &_deferred_buffer_start as *const u8 as usize;
+        let end = &_deferred_buffer_end as *const u8 as usize;
+        end - start
+    }
+}
+
+/// Get the deferred buffer base as a mutable pointer
+#[inline]
+fn linker_buffer_base() -> *mut u8 {
+    unsafe { &_deferred_buffer_start as *const u8 as *mut u8 }
+}
 
 /// Header size
 const HEADER_SIZE: usize = 32;
@@ -168,25 +184,37 @@ impl DeferredHeader {
     }
 }
 
-/// Configured buffer base address
-static BUFFER_BASE: core::sync::atomic::AtomicU64 =
-    core::sync::atomic::AtomicU64::new(DEFAULT_DEFERRED_BUFFER_BASE);
+/// Configured buffer base address override (0 = use linker default)
+static BUFFER_BASE_OVERRIDE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 /// Whether the deferred buffer has been initialized
 static INITIALIZED: AtomicBool = AtomicBool::new(false);
 
-/// Configure the deferred buffer base address
+/// Configure an alternate deferred buffer base address
 ///
-/// This should be called early in boot, before any variable operations.
+/// This can be called early in boot to override the linker-allocated buffer.
 /// The address should point to reserved memory that survives warm reset.
+/// If not called, the linker-allocated .deferred_buffer section is used.
 pub fn configure_buffer(base_addr: u64) {
-    BUFFER_BASE.store(base_addr, Ordering::SeqCst);
+    BUFFER_BASE_OVERRIDE.store(base_addr, Ordering::SeqCst);
     log::info!("Deferred variable buffer configured at {:#x}", base_addr);
 }
 
 /// Get the buffer base address
+///
+/// Returns the override address if configured, otherwise the linker-allocated buffer.
 fn buffer_base() -> *mut u8 {
-    BUFFER_BASE.load(Ordering::SeqCst) as *mut u8
+    let override_addr = BUFFER_BASE_OVERRIDE.load(Ordering::SeqCst);
+    if override_addr != 0 {
+        override_addr as *mut u8
+    } else {
+        linker_buffer_base()
+    }
+}
+
+/// Get the buffer size
+fn buffer_size() -> usize {
+    deferred_buffer_size()
 }
 
 /// Initialize the deferred buffer
@@ -197,7 +225,7 @@ pub fn init_buffer() {
 
     // Zero out the entire buffer
     unsafe {
-        core::ptr::write_bytes(base, 0, DEFERRED_BUFFER_SIZE);
+        core::ptr::write_bytes(base, 0, buffer_size());
     }
 
     // Write fresh header
@@ -279,7 +307,7 @@ pub fn process_pending() -> Result<usize, VarStoreError> {
         // Bounds check: ensure we can read the entry header
         if offset
             .checked_add(entry_header_size)
-            .is_none_or(|end| end > DEFERRED_BUFFER_SIZE)
+            .is_none_or(|end| end > buffer_size())
         {
             log::warn!(
                 "Entry header at index {} would exceed buffer bounds (offset={}, header_size={})",
@@ -309,7 +337,7 @@ pub fn process_pending() -> Result<usize, VarStoreError> {
         // Bounds check: ensure we can read the record data
         if offset
             .checked_add(record_len)
-            .is_none_or(|end| end > DEFERRED_BUFFER_SIZE)
+            .is_none_or(|end| end > buffer_size())
         {
             log::warn!(
                 "Record data at index {} would exceed buffer bounds (offset={}, record_len={})",
@@ -529,7 +557,7 @@ fn queue_record_with_flags(record: &VariableRecord, flags: u8) -> Result<(), Var
         }
     };
 
-    if required_space > DEFERRED_BUFFER_SIZE {
+    if required_space > buffer_size() {
         log::warn!("Deferred buffer full");
         return Err(VarStoreError::StoreFull);
     }
@@ -596,11 +624,11 @@ pub fn get_stats() -> (usize, usize, usize) {
     let header = unsafe { core::ptr::read(base as *const DeferredHeader) };
 
     if !header.is_valid() {
-        return (0, 0, DEFERRED_BUFFER_SIZE - HEADER_SIZE);
+        return (0, 0, buffer_size() - HEADER_SIZE);
     }
 
     let used = header.total_size as usize;
-    let free = DEFERRED_BUFFER_SIZE - HEADER_SIZE - used;
+    let free = buffer_size() - HEADER_SIZE - used;
 
     (header.entry_count as usize, used, free)
 }
