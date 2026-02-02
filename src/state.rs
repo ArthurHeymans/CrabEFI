@@ -139,7 +139,11 @@ pub fn try_get() -> Option<&'static FirmwareState> {
 #[inline]
 pub fn try_get_mut_ptr() -> Option<*mut FirmwareState> {
     let ptr = STATE_PTR.load(Ordering::Acquire);
-    if ptr.is_null() { None } else { Some(ptr) }
+    if ptr.is_null() {
+        None
+    } else {
+        Some(ptr)
+    }
 }
 
 // ============================================================================
@@ -368,6 +372,34 @@ impl VariableEntry {
     }
 }
 
+/// Variable store persistence state
+///
+/// Tracks the runtime state of the persistent variable store region.
+/// The actual storage location is determined at runtime from coreboot
+/// tables (SMMSTORE v2) or FMAP (SMMSTORE region).
+#[derive(Clone, Copy)]
+pub struct VarStoreState {
+    /// Whether the store header has been validated/written
+    pub initialized: bool,
+    /// Next free location for appending records (relative to store start)
+    pub write_offset: u32,
+}
+
+impl VarStoreState {
+    pub const fn new() -> Self {
+        Self {
+            initialized: false,
+            write_offset: 16, // STORE_HEADER_SIZE
+        }
+    }
+}
+
+impl Default for VarStoreState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// EFI subsystem state
 pub struct EfiState {
     /// Handle database
@@ -392,6 +424,9 @@ pub struct EfiState {
 
     /// EFI variables
     pub variables: [VariableEntry; MAX_VARIABLES],
+
+    /// Variable store persistence state (SMMSTORE tracking)
+    pub varstore: VarStoreState,
 
     /// Memory allocator
     pub allocator: MemoryAllocator,
@@ -420,6 +455,7 @@ impl EfiState {
             config_tables: [ConfigurationTable::empty(); MAX_CONFIG_TABLES],
             config_table_count: 0,
             variables: [const { VariableEntry::empty() }; MAX_VARIABLES],
+            varstore: VarStoreState::new(),
             allocator: MemoryAllocator::new(),
             exit_boot_services_called: false,
             filesystem: None,
@@ -466,6 +502,13 @@ pub struct DriverState {
 
     /// Global framebuffer info (from coreboot)
     pub framebuffer: Option<FramebufferInfo>,
+
+    /// Storage backend for variable persistence (SPI flash, etc.)
+    ///
+    /// This is initialized during boot from detected SPI controller.
+    /// The storage handles offset translation so reads/writes are
+    /// relative to the variable store region.
+    pub storage: Option<crate::efi::varstore::SpiStorageBackend>,
 }
 
 impl DriverState {
@@ -476,6 +519,7 @@ impl DriverState {
             serial_port: None,
             keyboard: KeyboardState::new(),
             framebuffer: None,
+            storage: None,
         }
     }
 }
@@ -774,6 +818,32 @@ where
     F: FnOnce(&mut crate::drivers::block::AnyBlockDevice) -> R,
 {
     with_mut(|state| state.efi.block_device.as_mut().map(f))
+}
+
+/// Access the storage backend mutably through a closure.
+///
+/// Returns `None` if no storage backend is configured.
+#[inline]
+pub fn with_storage_mut<F, R>(f: F) -> Option<R>
+where
+    F: FnOnce(&mut crate::efi::varstore::SpiStorageBackend) -> R,
+{
+    with_mut(|state| state.drivers.storage.as_mut().map(f))
+}
+
+/// Get a reference to the varstore state.
+#[inline]
+pub fn varstore() -> &'static VarStoreState {
+    &get().efi.varstore
+}
+
+/// Access varstore state mutably through a closure.
+#[inline]
+pub fn with_varstore_mut<F, R>(f: F) -> R
+where
+    F: FnOnce(&mut VarStoreState) -> R,
+{
+    with_mut(|state| f(&mut state.efi.varstore))
 }
 
 // ============================================================================

@@ -332,11 +332,10 @@ pub fn process_pending() -> Result<usize, VarStoreError> {
                 let guid = record.guid.to_guid();
 
                 if is_deletion {
-                    // Delete from SPI
-                    if let Err(e) = super::persistence::write_variable_deletion_to_spi_internal(
-                        &guid,
-                        &record.name,
-                    ) {
+                    // Delete from storage
+                    if let Err(e) =
+                        super::persistence::write_variable_deletion_internal(&guid, &record.name)
+                    {
                         log::warn!("Failed to apply deferred variable deletion: {:?}", e);
                     } else {
                         super::persistence::delete_variable_from_memory(&guid, &record.name);
@@ -373,7 +372,7 @@ pub fn process_pending() -> Result<usize, VarStoreError> {
                         (record.data.clone(), None)
                     };
 
-                    // Write to SPI (with timestamp for authenticated variables)
+                    // Write to storage (with timestamp for authenticated variables)
                     let write_result = if let Some(ref timestamp) = timestamp_to_use {
                         // Use persist_variable_with_timestamp to preserve the timestamp
                         super::persistence::persist_variable_with_timestamp(
@@ -384,7 +383,7 @@ pub fn process_pending() -> Result<usize, VarStoreError> {
                             timestamp.clone(),
                         )
                     } else {
-                        super::persistence::write_variable_to_spi_internal(
+                        super::persistence::write_variable_to_storage_internal(
                             &guid,
                             &record.name,
                             record.attributes,

@@ -1,70 +1,57 @@
 //! Variable Store Persistence Layer
 //!
-//! This module handles persisting UEFI variables to SPI flash and ESP files.
-//! It bridges the in-memory variable storage in `state::EfiState::variables`
-//! with persistent storage.
+//! This module handles persisting UEFI variables to storage (SPI flash, etc.)
+//! and ESP files. It bridges the in-memory variable storage in
+//! `state::EfiState::variables` with persistent storage.
 //!
 //! # Storage Strategy
 //!
-//! - **Before ExitBootServices**: Variables are written to SPI flash
-//! - **After ExitBootServices**: SPI is locked; variables are queued for ESP file
-//! - **On Reset**: ESP file is read, authenticated, applied to SPI, then deleted
+//! - **Before ExitBootServices**: Variables are written to storage (SPI flash)
+//! - **After ExitBootServices**: Storage may be locked; variables are queued for ESP file
+//! - **On Reset**: ESP file is read, authenticated, applied to storage, then deleted
 //!
-//! # SMMSTORE v2 Support
+//! # Storage Backend Abstraction
 //!
-//! When available, SMMSTORE configuration is read from coreboot tables (LB_TAG_SMMSTOREV2).
-//! This provides the memory-mapped address and size of the variable store region.
+//! This module uses the `StorageBackend` trait to abstract storage operations,
+//! allowing different backends (SPI flash, memory for testing, etc.) to be used.
+//! The storage backend is stored in `state::DriverState::storage`.
+//!
+//! # Persistent Config Region
+//!
+//! The location of the variable store region is determined at runtime from:
+//! 1. Coreboot tables (SMMSTORE v2 record)
+//! 2. FMAP (SMMSTORE region)
 
 use alloc::vec::Vec;
-use spin::Mutex;
 
 use crate::coreboot;
-use crate::drivers::spi::{self, AnySpiController, SpiController};
+use crate::drivers::spi::{self, SpiController};
 use crate::state::{self, MAX_VARIABLE_DATA_SIZE, MAX_VARIABLE_NAME_LEN};
 
+use super::storage::{SpiStorageBackend, StorageBackend};
 use super::{StoreHeader, VarStoreError, VariableRecord, STORE_HEADER_SIZE};
 
-/// Default SMMSTORE base address in SPI flash
+/// Default variable store base address in SPI flash
 /// This is typically at the end of the flash region
-/// Used only as fallback if coreboot tables don't provide SMMSTORE v2 info
-pub const DEFAULT_SMMSTORE_BASE: u32 = 0x00F00000; // 15MB offset (for 16MB flash)
+/// Used only as fallback if coreboot tables don't provide config info
+pub const DEFAULT_VARSTORE_BASE: u32 = 0x00F00000; // 15MB offset (for 16MB flash)
 
-/// Default SMMSTORE size (256KB)
-/// Used only as fallback if coreboot tables don't provide SMMSTORE v2 info
-pub const DEFAULT_SMMSTORE_SIZE: u32 = 256 * 1024;
-
-/// Global SPI controller (initialized at boot)
-static SPI_CONTROLLER: Mutex<Option<AnySpiController>> = Mutex::new(None);
-
-/// SMMSTORE configuration
-static SMMSTORE_CONFIG: Mutex<SmmstoreConfig> = Mutex::new(SmmstoreConfig {
-    base_addr: DEFAULT_SMMSTORE_BASE,
-    size: DEFAULT_SMMSTORE_SIZE,
-    initialized: false,
-    write_offset: STORE_HEADER_SIZE as u32,
-});
-
-/// SMMSTORE configuration
-struct SmmstoreConfig {
-    base_addr: u32,
-    size: u32,
-    initialized: bool,
-    write_offset: u32,
-}
+/// Default variable store size (256KB)
+/// Used only as fallback if coreboot tables don't provide config info
+pub const DEFAULT_VARSTORE_SIZE: u32 = 256 * 1024;
 
 /// Initialize the variable store persistence layer
 ///
 /// This should be called early in boot to:
-/// 1. Detect and initialize the SPI controller
-/// 2. Check for SMMSTORE v2 configuration from coreboot tables
-/// 3. If not available, try to find SMMSTORE from FMAP in SPI flash
-/// 4. Read existing variables from SMMSTORE
-/// 5. Load them into the in-memory variable cache
+/// 1. Detect and initialize the storage backend (SPI controller)
+/// 2. Check for persistent config region from coreboot tables or FMAP
+/// 3. Read existing variables from storage
+/// 4. Load them into the in-memory variable cache
 pub fn init() -> Result<(), VarStoreError> {
     log::info!("Initializing variable store persistence...");
 
     // Detect SPI controller first (we need it for FMAP parsing)
-    let mut controller = match spi::detect_and_init() {
+    let controller = match spi::detect_and_init() {
         Some(c) => c,
         None => {
             log::warn!("No SPI controller found - variables will not be persistent");
@@ -72,63 +59,71 @@ pub fn init() -> Result<(), VarStoreError> {
         }
     };
 
-    log::info!("SPI controller: {}", controller.name());
+    log::info!("Storage backend: {}", controller.name());
 
-    // Try to get SMMSTORE configuration from multiple sources:
+    // Create storage backend with default values (will be updated after config detection)
+    let mut backend =
+        SpiStorageBackend::new(controller, DEFAULT_VARSTORE_BASE, DEFAULT_VARSTORE_SIZE);
+
+    // Try to get persistent config region from multiple sources:
     // 1. Coreboot tables (SMMSTORE v2 record)
     // 2. FMAP in SPI flash
-    // 3. Fall back to defaults
-    let smmstore_configured = configure_smmstore_from_coreboot(&controller)
-        || configure_smmstore_from_fmap(&mut controller);
+    // 3. Fall back to defaults (DISABLED for safety)
+    let config_found =
+        configure_from_coreboot_tables(&mut backend) || configure_from_fmap(&mut backend);
 
-    if !smmstore_configured {
-        // DANGER: Using default SMMSTORE base (0xF00000) without verification
+    if !config_found {
+        // DANGER: Using default base address without verification
         // could overwrite boot code on small flash chips!
-        // For safety, we disable persistence if we can't find SMMSTORE info.
-        log::warn!("No SMMSTORE info found in coreboot tables or FMAP - persistence DISABLED");
+        // For safety, we disable persistence if we can't find config info.
+        log::warn!(
+            "No persistent config region found in coreboot tables or FMAP - persistence DISABLED"
+        );
         log::warn!("Variables will be lost on reboot. Add SMMSTORE region to your FMAP.");
         return Err(VarStoreError::NotInitialized);
     }
 
-    // Store the controller globally
-    {
-        let mut spi = SPI_CONTROLLER.lock();
-        *spi = Some(controller);
-    }
+    // Store the backend in global state
+    state::with_mut(|s| {
+        s.drivers.storage = Some(backend);
+    });
 
-    // Initialize SMMSTORE
-    init_smmstore()?;
+    // Initialize the variable store region
+    init_varstore()?;
 
-    // Load existing variables from SMMSTORE into memory
-    load_variables_from_smmstore()?;
+    // Load existing variables from storage into memory
+    load_variables_from_storage()?;
 
     log::info!("Variable store persistence initialized");
     Ok(())
 }
 
-/// Try to configure SMMSTORE from coreboot tables (SMMSTORE v2 record)
+/// Try to configure variable store from coreboot tables (SMMSTORE v2 record)
 ///
 /// Returns true if configuration was found and applied.
-fn configure_smmstore_from_coreboot(spi: &spi::AnySpiController) -> bool {
+fn configure_from_coreboot_tables(backend: &mut SpiStorageBackend) -> bool {
     if let Some(smmstore_info) = coreboot::get_smmstorev2() {
         log::info!(
-            "Using SMMSTORE v2 from coreboot tables: {} blocks x {} KB at {:#x}",
+            "Found SMMSTORE v2 in coreboot tables: {} blocks x {} KB at {:#x}",
             smmstore_info.num_blocks,
             smmstore_info.block_size / 1024,
             smmstore_info.mmap_addr
         );
 
-        // Update the SMMSTORE configuration with values from coreboot
-        let mut config = SMMSTORE_CONFIG.lock();
         // The mmap_addr is the memory-mapped address for read-only access
         // For SPI flash writes, we need to convert to the flash offset
         // Use the BIOS region from IFD to calculate the correct offset
-        config.base_addr = calculate_spi_offset(smmstore_info.mmap_addr, spi.get_bios_region());
-        config.size = smmstore_info.num_blocks * smmstore_info.block_size;
+        let base_addr = calculate_spi_offset(smmstore_info.mmap_addr, backend.get_bios_region());
+        let size = smmstore_info.num_blocks * smmstore_info.block_size;
+
+        // Update the storage backend with the region location
+        backend.set_base_offset(base_addr);
+        backend.set_storage_size(size);
+
         log::info!(
-            "SMMSTORE configured from coreboot: base={:#x}, size={} KB",
-            config.base_addr,
-            config.size / 1024
+            "Variable store configured: base={:#x}, size={} KB",
+            base_addr,
+            size / 1024
         );
         return true;
     }
@@ -137,40 +132,41 @@ fn configure_smmstore_from_coreboot(spi: &spi::AnySpiController) -> bool {
     false
 }
 
-/// Try to configure SMMSTORE from FMAP in SPI flash
+/// Try to configure variable store from FMAP in SPI flash
 ///
 /// This is a fallback when coreboot tables don't provide SMMSTORE v2 info.
-/// We read the FMAP structure from flash (probing at common offsets if needed)
-/// and look for the SMMSTORE region.
+/// We read the FMAP structure from flash and look for the SMMSTORE region.
 ///
 /// Returns true if configuration was found and applied.
-fn configure_smmstore_from_fmap(spi: &mut spi::AnySpiController) -> bool {
+fn configure_from_fmap(backend: &mut SpiStorageBackend) -> bool {
     use crate::coreboot::fmap;
 
-    log::info!("Looking for SMMSTORE in FMAP...");
+    log::info!("Looking for variable store region in FMAP...");
 
     // Read FMAP from flash (uses boot_media_params if available, otherwise probes)
-    if let Some(smmstore_info) = fmap::get_smmstore_from_fmap(spi) {
+    // Note: fmap::get_smmstore_from_fmap expects an AnySpiController, so we access
+    // the underlying controller directly
+    if let Some(region_info) = fmap::get_smmstore_from_fmap(backend.controller_mut()) {
         log::info!(
-            "Found SMMSTORE '{}' from FMAP: offset={:#x}, size={} KB",
-            smmstore_info.name.as_str(),
-            smmstore_info.offset,
-            smmstore_info.size / 1024
+            "Found '{}' in FMAP: offset={:#x}, size={} KB",
+            region_info.name.as_str(),
+            region_info.offset,
+            region_info.size / 1024
         );
 
-        // Update the SMMSTORE configuration
-        let mut config = SMMSTORE_CONFIG.lock();
-        config.base_addr = smmstore_info.offset;
-        config.size = smmstore_info.size;
+        // Update the storage backend with the region location
+        backend.set_base_offset(region_info.offset);
+        backend.set_storage_size(region_info.size);
+
         log::info!(
-            "SMMSTORE configured from FMAP: base={:#x}, size={} KB",
-            config.base_addr,
-            config.size / 1024
+            "Variable store configured: base={:#x}, size={} KB",
+            region_info.offset,
+            region_info.size / 1024
         );
         return true;
     }
 
-    log::debug!("SMMSTORE not found in FMAP (boot media params may not be available)");
+    log::debug!("Variable store region not found in FMAP");
     false
 }
 
@@ -183,11 +179,6 @@ fn configure_smmstore_from_fmap(spi: &mut spi::AnySpiController) -> bool {
 /// (0x100000000). The `bios_region` parameter provides the base and limit of the
 /// BIOS region from the Intel Flash Descriptor (IFD), which allows us to calculate
 /// the correct offset.
-///
-/// For example, on a system with 8MB flash where BIOS occupies the entire flash:
-/// - BIOS region: base=0x000000, limit=0x7FFFFF (8MB)
-/// - Memory-mapped base: 0x100000000 - 0x800000 = 0xFF800000
-/// - mmap_addr 0xffd10000 -> offset within BIOS = 0xffd10000 - 0xFF800000 = 0x510000
 fn calculate_spi_offset(mmap_addr: u64, bios_region: Option<(u32, u32)>) -> u32 {
     // If we have BIOS region info from IFD, use it for accurate calculation
     if let Some((bios_base, bios_limit)) = bios_region {
@@ -222,113 +213,113 @@ fn calculate_spi_offset(mmap_addr: u64, bios_region: Option<(u32, u32)>) -> u32 
         (mmap_addr - 0xFC000000) as u32
     } else if mmap_addr == 0 {
         // No address provided, use default
-        DEFAULT_SMMSTORE_BASE
+        DEFAULT_VARSTORE_BASE
     } else {
         // Assume the address is already a flash offset
         mmap_addr as u32
     }
 }
 
-/// Initialize the SMMSTORE region
-fn init_smmstore() -> Result<(), VarStoreError> {
-    let mut spi_guard = SPI_CONTROLLER.lock();
-    let spi = spi_guard.as_mut().ok_or(VarStoreError::NotInitialized)?;
-
-    let mut config = SMMSTORE_CONFIG.lock();
-
-    // Read the store header
+/// Initialize the variable store region
+///
+/// Reads the store header to validate the region, or formats it if invalid.
+fn init_varstore() -> Result<(), VarStoreError> {
+    // Read the store header (offset 0 within the storage region)
     let mut header_bytes = [0u8; STORE_HEADER_SIZE];
-    spi.read(config.base_addr, &mut header_bytes)
-        .map_err(|_| VarStoreError::SpiError)?;
+    let storage_size = state::with_storage_mut(|storage| {
+        storage
+            .read(0, &mut header_bytes)
+            .map_err(|_| VarStoreError::SpiError)?;
+        Ok::<u32, VarStoreError>(storage.size())
+    })
+    .ok_or(VarStoreError::NotInitialized)??;
 
     // Log raw header bytes for debugging
     log::debug!(
-        "SMMSTORE header bytes: {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x}",
-        header_bytes[0],
-        header_bytes[1],
-        header_bytes[2],
-        header_bytes[3],
-        header_bytes[4],
-        header_bytes[5],
-        header_bytes[6],
-        header_bytes[7],
-        header_bytes[8],
-        header_bytes[9],
-        header_bytes[10],
-        header_bytes[11],
-        header_bytes[12],
-        header_bytes[13],
-        header_bytes[14],
-        header_bytes[15]
+        "Variable store header bytes: {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x}",
+        header_bytes[0], header_bytes[1], header_bytes[2], header_bytes[3],
+        header_bytes[4], header_bytes[5], header_bytes[6], header_bytes[7],
+        header_bytes[8], header_bytes[9], header_bytes[10], header_bytes[11],
+        header_bytes[12], header_bytes[13], header_bytes[14], header_bytes[15]
     );
 
     // Check if the header is valid
     match postcard::from_bytes::<StoreHeader>(&header_bytes) {
         Ok(header) => {
             log::debug!(
-                "SMMSTORE header parsed: magic={:#x}, version={}, size={}",
+                "Variable store header parsed: magic={:#x}, version={}, size={}",
                 header.magic,
                 header.version,
                 header.store_size
             );
             if header.is_valid() {
-                log::info!(
-                    "SMMSTORE found at {:#x}, size {} KB",
-                    config.base_addr,
-                    header.store_size / 1024
-                );
-                config.size = header.store_size;
-                config.initialized = true;
+                log::info!("Variable store found, size {} KB", header.store_size / 1024);
+                // Update storage size if header specifies a different size
+                if header.store_size != storage_size {
+                    state::with_storage_mut(|storage| {
+                        storage.set_storage_size(header.store_size);
+                    });
+                }
+                state::with_varstore_mut(|vs| {
+                    vs.initialized = true;
+                });
                 return Ok(());
             } else {
-                log::debug!("SMMSTORE header CRC mismatch or invalid magic");
+                log::debug!("Variable store header CRC mismatch or invalid magic");
             }
         }
         Err(e) => {
-            log::debug!("SMMSTORE header parse error: {:?}", e);
+            log::debug!("Variable store header parse error: {:?}", e);
         }
     }
 
     // Header invalid or missing - format the store
-    log::info!("Formatting SMMSTORE at {:#x}...", config.base_addr);
+    log::info!(
+        "Formatting variable store (size {} KB)...",
+        storage_size / 1024
+    );
 
-    // Try to enable writes
-    if let Err(e) = spi.enable_writes() {
-        log::warn!("Could not enable SPI writes: {:?}", e);
-        // Continue anyway - the erase/write will fail if truly locked
-    }
+    // Try to enable writes, erase, and write header
+    state::with_storage_mut(|storage| {
+        if let Err(e) = storage.enable_writes() {
+            log::warn!("Could not enable storage writes: {:?}", e);
+            // Continue anyway - the erase/write will fail if truly locked
+        }
 
-    // Erase the region
-    spi.erase(config.base_addr, config.size)
-        .map_err(|_| VarStoreError::SpiError)?;
+        // Erase the region
+        storage
+            .erase(0, storage_size)
+            .map_err(|_| VarStoreError::SpiError)?;
 
-    // Write new header
-    let header = StoreHeader::new(config.size);
-    let header_bytes = postcard::to_allocvec(&header).map_err(|_| VarStoreError::SerdeError)?;
+        // Write new header
+        let header = StoreHeader::new(storage_size);
+        let header_bytes = postcard::to_allocvec(&header).map_err(|_| VarStoreError::SerdeError)?;
 
-    spi.write(config.base_addr, &header_bytes)
-        .map_err(|_| VarStoreError::SpiError)?;
+        storage
+            .write(0, &header_bytes)
+            .map_err(|_| VarStoreError::SpiError)?;
 
-    config.initialized = true;
-    config.write_offset = STORE_HEADER_SIZE as u32;
+        Ok::<(), VarStoreError>(())
+    })
+    .ok_or(VarStoreError::NotInitialized)??;
 
-    log::info!("SMMSTORE formatted successfully");
+    state::with_varstore_mut(|vs| {
+        vs.initialized = true;
+        vs.write_offset = STORE_HEADER_SIZE as u32;
+    });
+
+    log::info!("Variable store formatted successfully");
     Ok(())
 }
 
-/// Load variables from SMMSTORE into the in-memory cache
-fn load_variables_from_smmstore() -> Result<(), VarStoreError> {
-    let mut spi_guard = SPI_CONTROLLER.lock();
-    let spi = spi_guard.as_mut().ok_or(VarStoreError::NotInitialized)?;
-
-    let config = SMMSTORE_CONFIG.lock();
-    if !config.initialized {
+/// Load variables from storage into the in-memory cache
+fn load_variables_from_storage() -> Result<(), VarStoreError> {
+    if !state::varstore().initialized {
         return Err(VarStoreError::NotInitialized);
     }
 
-    let base = config.base_addr;
-    let size = config.size;
-    drop(config); // Release lock before calling state functions
+    let size =
+        state::with_storage_mut(|storage| storage.size()).ok_or(VarStoreError::NotInitialized)?;
 
     // Scan for variable records
     let mut offset = STORE_HEADER_SIZE as u32;
@@ -341,8 +332,12 @@ fn load_variables_from_smmstore() -> Result<(), VarStoreError> {
         let chunk_size = core::cmp::min(remaining, super::MAX_DATA_SIZE as u32 + 256);
         let mut chunk = alloc::vec![0u8; chunk_size as usize];
 
-        spi.read(base + offset, &mut chunk)
-            .map_err(|_| VarStoreError::SpiError)?;
+        let read_result = state::with_storage_mut(|storage| storage.read(offset, &mut chunk))
+            .ok_or(VarStoreError::NotInitialized)?;
+
+        if read_result.is_err() {
+            return Err(VarStoreError::SpiError);
+        }
 
         // Check for empty space (0xFF means erased flash)
         if chunk[0] == 0xFF {
@@ -377,10 +372,9 @@ fn load_variables_from_smmstore() -> Result<(), VarStoreError> {
     }
 
     // Update write offset
-    {
-        let mut config = SMMSTORE_CONFIG.lock();
-        config.write_offset = offset;
-    }
+    state::with_varstore_mut(|vs| {
+        vs.write_offset = offset;
+    });
 
     // Load records into in-memory variable cache
     state::with_efi_mut(|efi| {
@@ -403,7 +397,7 @@ fn load_variables_from_smmstore() -> Result<(), VarStoreError> {
                 slot.in_use = true;
 
                 log::debug!(
-                    "Loaded variable from SMMSTORE: {:?}",
+                    "Loaded variable: {:?}",
                     core::str::from_utf8(
                         &record
                             .name
@@ -420,30 +414,23 @@ fn load_variables_from_smmstore() -> Result<(), VarStoreError> {
         }
     });
 
-    log::info!("Loaded variables from SMMSTORE");
+    log::info!("Loaded variables from storage");
     Ok(())
 }
 
 /// Get the timestamp of a stored variable
 ///
-/// This reads the variable record from SPI to retrieve its timestamp.
+/// This reads the variable record from storage to retrieve its timestamp.
 /// Returns None if the variable doesn't exist or has no timestamp.
 pub fn get_variable_timestamp(
     guid: &r_efi::efi::Guid,
     name: &[u16],
 ) -> Option<super::SerializedTime> {
-    // We need to scan the SPI store to find the record with timestamp
-    let mut spi_guard = SPI_CONTROLLER.lock();
-    let spi = spi_guard.as_mut()?;
-
-    let config = SMMSTORE_CONFIG.lock();
-    if !config.initialized {
+    let vs = state::varstore();
+    if !vs.initialized {
         return None;
     }
-
-    let base = config.base_addr;
-    let write_offset = config.write_offset;
-    drop(config);
+    let write_offset = vs.write_offset;
 
     // Scan for the variable record
     let mut offset = STORE_HEADER_SIZE as u32;
@@ -455,7 +442,9 @@ pub fn get_variable_timestamp(
         let chunk_size = core::cmp::min(remaining, super::MAX_DATA_SIZE as u32 + 256);
         let mut chunk = alloc::vec![0u8; chunk_size as usize];
 
-        if spi.read(base + offset, &mut chunk).is_err() {
+        let read_result = state::with_storage_mut(|storage| storage.read(offset, &mut chunk));
+
+        if read_result.is_none() || read_result.unwrap().is_err() {
             break;
         }
 
@@ -485,7 +474,7 @@ pub fn get_variable_timestamp(
 
 /// Persist a variable to storage
 ///
-/// Before ExitBootServices: writes to SPI flash
+/// Before ExitBootServices: writes to storage directly
 /// After ExitBootServices: queues write for deferred processing on next boot
 pub fn persist_variable(
     guid: &r_efi::efi::Guid,
@@ -497,8 +486,8 @@ pub fn persist_variable(
         // After ExitBootServices - queue for deferred processing
         queue_variable_for_deferred(guid, name, attributes, data)
     } else {
-        // Before ExitBootServices - write to SPI flash
-        write_variable_to_spi_internal(guid, name, attributes, data)
+        // Before ExitBootServices - write to storage
+        write_variable_to_storage_internal(guid, name, attributes, data)
     }
 }
 
@@ -507,7 +496,7 @@ pub fn persist_variable(
 /// This version preserves the authenticated variable timestamp for proper
 /// monotonic timestamp validation on subsequent updates.
 ///
-/// Before ExitBootServices: writes to SPI flash
+/// Before ExitBootServices: writes to storage directly
 /// After ExitBootServices: queues write for deferred processing on next boot
 pub fn persist_variable_with_timestamp(
     guid: &r_efi::efi::Guid,
@@ -523,8 +512,8 @@ pub fn persist_variable_with_timestamp(
         // modified at runtime anyway
         queue_variable_for_deferred(guid, name, attributes, data)
     } else {
-        // Before ExitBootServices - write to SPI flash with timestamp
-        write_variable_to_spi_with_timestamp_internal(guid, name, attributes, data, timestamp)
+        // Before ExitBootServices - write to storage with timestamp
+        write_variable_with_timestamp_internal(guid, name, attributes, data, timestamp)
     }
 }
 
@@ -534,196 +523,217 @@ pub fn delete_variable(guid: &r_efi::efi::Guid, name: &[u16]) -> Result<(), VarS
         // After ExitBootServices - queue deletion for deferred processing
         queue_variable_deletion_for_deferred(guid, name)
     } else {
-        // Before ExitBootServices - mark deleted in SPI flash
-        write_variable_deletion_to_spi_internal(guid, name)
+        // Before ExitBootServices - mark deleted in storage
+        write_variable_deletion_internal(guid, name)
     }
 }
 
-/// Write a variable record to SPI flash
+/// Write a variable record to storage
 ///
-/// This is the internal function that actually writes to SPI.
+/// This is the internal function that actually writes to storage.
 /// It's exposed to the deferred module for applying queued changes.
 ///
 /// If the store is full, this function will attempt compaction first.
-pub(super) fn write_variable_to_spi_internal(
+pub(super) fn write_variable_to_storage_internal(
     guid: &r_efi::efi::Guid,
     name: &[u16],
     attributes: u32,
     data: &[u8],
 ) -> Result<(), VarStoreError> {
-    // Create the variable record first (before locking)
+    // Create the variable record first
     let record = VariableRecord::new(guid, name, attributes, data)?;
     let record_bytes = record.serialize()?;
     let record_len = record_bytes.len() as u32;
 
     // Check if we need compaction
-    {
-        let config = SMMSTORE_CONFIG.lock();
-        if config.initialized && config.write_offset + record_len > config.size {
-            // Need compaction - release lock first
-            drop(config);
-            log::info!("SMMSTORE full, triggering compaction");
-            compact_smmstore()?;
-        }
+    let vs = state::varstore();
+    let storage_size =
+        state::with_storage_mut(|s| s.size()).ok_or(VarStoreError::NotInitialized)?;
+
+    if vs.initialized && vs.write_offset + record_len > storage_size {
+        log::info!("Variable store full, triggering compaction");
+        compact_varstore()?;
     }
 
-    // Now do the actual write
-    let mut spi_guard = SPI_CONTROLLER.lock();
-    let spi = spi_guard.as_mut().ok_or(VarStoreError::NotInitialized)?;
-
-    let mut config = SMMSTORE_CONFIG.lock();
-    if !config.initialized {
+    // Get current state again after potential compaction
+    let vs = state::varstore();
+    if !vs.initialized {
         return Err(VarStoreError::NotInitialized);
     }
 
     // Check again after compaction
-    if config.write_offset + record_len > config.size {
-        log::error!("SMMSTORE still full after compaction");
+    if vs.write_offset + record_len > storage_size {
+        log::error!("Variable store still full after compaction");
         return Err(VarStoreError::StoreFull);
     }
 
-    // Try to enable writes
-    if let Err(e) = spi.enable_writes() {
-        log::warn!("Could not enable SPI writes: {:?}", e);
-    }
+    let write_offset = vs.write_offset;
 
-    // Write the record
-    spi.write(config.base_addr + config.write_offset, &record_bytes)
-        .map_err(|_| VarStoreError::SpiError)?;
+    // Do the actual write
+    state::with_storage_mut(|storage| {
+        // Try to enable writes
+        if let Err(e) = storage.enable_writes() {
+            log::warn!("Could not enable storage writes: {:?}", e);
+        }
 
-    config.write_offset += record_len;
+        // Write the record
+        storage
+            .write(write_offset, &record_bytes)
+            .map_err(|_| VarStoreError::SpiError)?;
 
-    log::debug!(
-        "Variable persisted to SPI at offset {:#x}",
-        config.write_offset - record_len
-    );
+        Ok::<(), VarStoreError>(())
+    })
+    .ok_or(VarStoreError::NotInitialized)??;
+
+    // Update write offset
+    state::with_varstore_mut(|vs| {
+        vs.write_offset += record_len;
+    });
+
+    log::debug!("Variable persisted at offset {:#x}", write_offset);
 
     Ok(())
 }
 
-/// Write a variable record to SPI flash with a specific timestamp
+/// Write a variable record to storage with a specific timestamp
 ///
 /// This is used for authenticated variables where the timestamp must be preserved
 /// for proper monotonic timestamp validation on future updates.
-pub(super) fn write_variable_to_spi_with_timestamp_internal(
+pub(super) fn write_variable_with_timestamp_internal(
     guid: &r_efi::efi::Guid,
     name: &[u16],
     attributes: u32,
     data: &[u8],
     timestamp: super::SerializedTime,
 ) -> Result<(), VarStoreError> {
-    // Create the variable record with timestamp first (before locking)
+    // Create the variable record with timestamp first
     let record = VariableRecord::new_with_timestamp(guid, name, attributes, data, timestamp)?;
     let record_bytes = record.serialize()?;
     let record_len = record_bytes.len() as u32;
 
     // Check if we need compaction
-    {
-        let config = SMMSTORE_CONFIG.lock();
-        if config.initialized && config.write_offset + record_len > config.size {
-            // Need compaction - release lock first
-            drop(config);
-            log::info!("SMMSTORE full, triggering compaction");
-            compact_smmstore()?;
-        }
+    let vs = state::varstore();
+    let storage_size =
+        state::with_storage_mut(|s| s.size()).ok_or(VarStoreError::NotInitialized)?;
+
+    if vs.initialized && vs.write_offset + record_len > storage_size {
+        log::info!("Variable store full, triggering compaction");
+        compact_varstore()?;
     }
 
-    // Now do the actual write
-    let mut spi_guard = SPI_CONTROLLER.lock();
-    let spi = spi_guard.as_mut().ok_or(VarStoreError::NotInitialized)?;
-
-    let mut config = SMMSTORE_CONFIG.lock();
-    if !config.initialized {
+    // Get current state again after potential compaction
+    let vs = state::varstore();
+    if !vs.initialized {
         return Err(VarStoreError::NotInitialized);
     }
 
     // Check again after compaction
-    if config.write_offset + record_len > config.size {
-        log::error!("SMMSTORE still full after compaction");
+    if vs.write_offset + record_len > storage_size {
+        log::error!("Variable store still full after compaction");
         return Err(VarStoreError::StoreFull);
     }
 
-    // Try to enable writes
-    if let Err(e) = spi.enable_writes() {
-        log::warn!("Could not enable SPI writes: {:?}", e);
-    }
+    let write_offset = vs.write_offset;
 
-    // Write the record
-    spi.write(config.base_addr + config.write_offset, &record_bytes)
-        .map_err(|_| VarStoreError::SpiError)?;
+    // Do the actual write
+    state::with_storage_mut(|storage| {
+        // Try to enable writes
+        if let Err(e) = storage.enable_writes() {
+            log::warn!("Could not enable storage writes: {:?}", e);
+        }
 
-    config.write_offset += record_len;
+        // Write the record
+        storage
+            .write(write_offset, &record_bytes)
+            .map_err(|_| VarStoreError::SpiError)?;
+
+        Ok::<(), VarStoreError>(())
+    })
+    .ok_or(VarStoreError::NotInitialized)??;
+
+    // Update write offset
+    state::with_varstore_mut(|vs| {
+        vs.write_offset += record_len;
+    });
 
     log::debug!(
-        "Variable (with timestamp) persisted to SPI at offset {:#x}",
-        config.write_offset - record_len
+        "Variable (with timestamp) persisted at offset {:#x}",
+        write_offset
     );
 
     Ok(())
 }
 
-/// Write a deletion record to SPI flash
+/// Write a deletion record to storage
 ///
-/// This is the internal function that actually writes the deletion to SPI.
+/// This is the internal function that actually writes the deletion.
 /// It's exposed to the deferred module for applying queued changes.
 ///
 /// If the store is full, this function will attempt compaction first.
-pub(super) fn write_variable_deletion_to_spi_internal(
+pub(super) fn write_variable_deletion_internal(
     guid: &r_efi::efi::Guid,
     name: &[u16],
 ) -> Result<(), VarStoreError> {
-    // Create a deletion record first (before locking)
+    // Create a deletion record first
     let record = VariableRecord::new_deleted(guid, name)?;
     let record_bytes = record.serialize()?;
     let record_len = record_bytes.len() as u32;
 
     // Check if we need compaction
-    {
-        let config = SMMSTORE_CONFIG.lock();
-        if config.initialized && config.write_offset + record_len > config.size {
-            // Need compaction - release lock first
-            drop(config);
-            log::info!("SMMSTORE full, triggering compaction for deletion");
-            compact_smmstore()?;
-        }
+    let vs = state::varstore();
+    let storage_size =
+        state::with_storage_mut(|s| s.size()).ok_or(VarStoreError::NotInitialized)?;
+
+    if vs.initialized && vs.write_offset + record_len > storage_size {
+        log::info!("Variable store full, triggering compaction for deletion");
+        compact_varstore()?;
     }
 
-    // Now do the actual write
-    let mut spi_guard = SPI_CONTROLLER.lock();
-    let spi = spi_guard.as_mut().ok_or(VarStoreError::NotInitialized)?;
-
-    let mut config = SMMSTORE_CONFIG.lock();
-    if !config.initialized {
+    // Get current state again after potential compaction
+    let vs = state::varstore();
+    if !vs.initialized {
         return Err(VarStoreError::NotInitialized);
     }
 
     // Check again after compaction
-    if config.write_offset + record_len > config.size {
-        log::error!("SMMSTORE still full after compaction");
+    if vs.write_offset + record_len > storage_size {
+        log::error!("Variable store still full after compaction");
         return Err(VarStoreError::StoreFull);
     }
 
-    // Try to enable writes
-    if let Err(e) = spi.enable_writes() {
-        log::warn!("Could not enable SPI writes: {:?}", e);
-    }
+    let write_offset = vs.write_offset;
 
-    // Write the record
-    spi.write(config.base_addr + config.write_offset, &record_bytes)
-        .map_err(|_| VarStoreError::SpiError)?;
+    // Do the actual write
+    state::with_storage_mut(|storage| {
+        // Try to enable writes
+        if let Err(e) = storage.enable_writes() {
+            log::warn!("Could not enable storage writes: {:?}", e);
+        }
 
-    config.write_offset += record_len;
+        // Write the record
+        storage
+            .write(write_offset, &record_bytes)
+            .map_err(|_| VarStoreError::SpiError)?;
 
-    log::debug!("Variable deletion persisted to SPI");
+        Ok::<(), VarStoreError>(())
+    })
+    .ok_or(VarStoreError::NotInitialized)??;
+
+    // Update write offset
+    state::with_varstore_mut(|vs| {
+        vs.write_offset += record_len;
+    });
+
+    log::debug!("Variable deletion persisted");
 
     Ok(())
 }
 
 /// Queue a variable write for deferred processing (after ExitBootServices)
 ///
-/// When SPI is locked, variable changes are stored in a reserved memory
+/// When storage is locked, variable changes are stored in a reserved memory
 /// region that survives warm reboot. On next boot, these changes are
-/// applied to SPI flash.
+/// applied to storage.
 fn queue_variable_for_deferred(
     guid: &r_efi::efi::Guid,
     name: &[u16],
@@ -745,45 +755,44 @@ fn queue_variable_deletion_for_deferred(
     Ok(())
 }
 
-/// Check if SPI controller is available
-pub fn is_spi_available() -> bool {
-    SPI_CONTROLLER.lock().is_some()
+/// Check if storage backend is available
+pub fn is_storage_available() -> bool {
+    state::with_storage_mut(|_| ()).is_some()
 }
 
-/// Check if SMMSTORE is initialized
-pub fn is_smmstore_initialized() -> bool {
-    SMMSTORE_CONFIG.lock().initialized
+/// Check if variable store is initialized
+pub fn is_varstore_initialized() -> bool {
+    state::varstore().initialized
 }
 
-/// Get SMMSTORE statistics
-pub fn get_smmstore_stats() -> (u32, u32, u32) {
-    let config = SMMSTORE_CONFIG.lock();
-    (config.base_addr, config.size, config.write_offset)
+/// Get variable store statistics
+///
+/// Returns (base_offset, size, write_offset)
+pub fn get_varstore_stats() -> Option<(u32, u32, u32)> {
+    let vs = state::varstore();
+    let (base, size) = state::with_storage_mut(|s| (s.base_offset(), s.size()))?;
+    Some((base, size, vs.write_offset))
 }
 
-/// Compact the SMMSTORE by rewriting only active variables
+/// Compact the variable store by rewriting only active variables
 ///
 /// This is called when the store is full. It:
-/// 1. Reads all active variables from flash into memory
-/// 2. Erases the entire SMMSTORE region
+/// 1. Reads all active variables from storage into memory
+/// 2. Erases the entire region
 /// 3. Writes a fresh header
 /// 4. Rewrites all active variables
 ///
 /// Returns the number of bytes reclaimed.
-pub fn compact_smmstore() -> Result<u32, VarStoreError> {
-    log::info!("Compacting SMMSTORE...");
+pub fn compact_varstore() -> Result<u32, VarStoreError> {
+    log::info!("Compacting variable store...");
 
-    let mut spi_guard = SPI_CONTROLLER.lock();
-    let spi = spi_guard.as_mut().ok_or(VarStoreError::NotInitialized)?;
-
-    let mut config = SMMSTORE_CONFIG.lock();
-    if !config.initialized {
+    let vs = state::varstore();
+    if !vs.initialized {
         return Err(VarStoreError::NotInitialized);
     }
 
-    let base = config.base_addr;
-    let size = config.size;
-    let old_write_offset = config.write_offset;
+    let old_write_offset = vs.write_offset;
+    let size = state::with_storage_mut(|s| s.size()).ok_or(VarStoreError::NotInitialized)?;
 
     // Step 1: Collect all active variable records
     let mut active_records: Vec<VariableRecord> = Vec::new();
@@ -794,8 +803,12 @@ pub fn compact_smmstore() -> Result<u32, VarStoreError> {
         let chunk_size = core::cmp::min(remaining, super::MAX_DATA_SIZE as u32 + 256);
         let mut chunk = alloc::vec![0u8; chunk_size as usize];
 
-        spi.read(base + offset, &mut chunk)
-            .map_err(|_| VarStoreError::SpiError)?;
+        let read_result = state::with_storage_mut(|storage| storage.read(offset, &mut chunk))
+            .ok_or(VarStoreError::NotInitialized)?;
+
+        if read_result.is_err() {
+            return Err(VarStoreError::SpiError);
+        }
 
         // Check for empty space (0xFF = erased flash)
         if chunk[0] == 0xFF {
@@ -829,19 +842,27 @@ pub fn compact_smmstore() -> Result<u32, VarStoreError> {
         active_records.len()
     );
 
-    // Step 2: Try to enable writes and erase the region
-    if let Err(e) = spi.enable_writes() {
-        log::warn!("Could not enable SPI writes for compaction: {:?}", e);
-    }
+    // Step 2: Enable writes and erase the region
+    state::with_storage_mut(|storage| {
+        if let Err(e) = storage.enable_writes() {
+            log::warn!("Could not enable storage writes for compaction: {:?}", e);
+        }
 
-    spi.erase(base, size).map_err(|_| VarStoreError::SpiError)?;
+        storage
+            .erase(0, size)
+            .map_err(|_| VarStoreError::SpiError)?;
 
-    // Step 3: Write fresh header
-    let header = StoreHeader::new(size);
-    let header_bytes = postcard::to_allocvec(&header).map_err(|_| VarStoreError::SerdeError)?;
+        // Step 3: Write fresh header
+        let header = StoreHeader::new(size);
+        let header_bytes = postcard::to_allocvec(&header).map_err(|_| VarStoreError::SerdeError)?;
 
-    spi.write(base, &header_bytes)
-        .map_err(|_| VarStoreError::SpiError)?;
+        storage
+            .write(0, &header_bytes)
+            .map_err(|_| VarStoreError::SpiError)?;
+
+        Ok::<(), VarStoreError>(())
+    })
+    .ok_or(VarStoreError::NotInitialized)??;
 
     // Step 4: Rewrite all active variables
     let mut new_offset = STORE_HEADER_SIZE as u32;
@@ -850,23 +871,29 @@ pub fn compact_smmstore() -> Result<u32, VarStoreError> {
         let record_bytes = record.serialize()?;
 
         if new_offset + record_bytes.len() as u32 > size {
-            log::error!("SMMSTORE full even after compaction - data loss!");
-            config.write_offset = new_offset;
+            log::error!("Variable store full even after compaction - data loss!");
+            state::with_varstore_mut(|vs| vs.write_offset = new_offset);
             return Err(VarStoreError::StoreFull);
         }
 
-        spi.write(base + new_offset, &record_bytes)
-            .map_err(|_| VarStoreError::SpiError)?;
+        state::with_storage_mut(|storage| {
+            storage
+                .write(new_offset, &record_bytes)
+                .map_err(|_| VarStoreError::SpiError)
+        })
+        .ok_or(VarStoreError::NotInitialized)??;
 
         new_offset += record_bytes.len() as u32;
     }
 
-    // Update configuration
-    config.write_offset = new_offset;
+    // Update write offset
+    state::with_varstore_mut(|vs| {
+        vs.write_offset = new_offset;
+    });
 
     let reclaimed = old_write_offset - new_offset;
     log::info!(
-        "SMMSTORE compaction complete: reclaimed {} bytes, new write offset {:#x}",
+        "Variable store compaction complete: reclaimed {} bytes, new write offset {:#x}",
         reclaimed,
         new_offset
     );

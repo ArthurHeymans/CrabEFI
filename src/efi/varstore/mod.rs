@@ -33,6 +33,10 @@
 
 pub mod deferred;
 pub mod persistence;
+pub mod storage;
+
+// Re-export storage types
+pub use storage::{SpiStorageBackend, StorageBackend, StorageError};
 
 use alloc::vec;
 use alloc::vec::Vec;
@@ -40,9 +44,9 @@ use serde::{Deserialize, Serialize};
 
 // Re-export key items from persistence
 pub use persistence::{
-    compact_smmstore, delete_variable, get_variable_timestamp, init as init_persistence,
-    is_smmstore_initialized, is_spi_available, persist_variable, persist_variable_with_timestamp,
-    update_variable_in_memory,
+    compact_varstore, delete_variable, get_variable_timestamp, get_varstore_stats,
+    init as init_persistence, is_storage_available, is_varstore_initialized, persist_variable,
+    persist_variable_with_timestamp, update_variable_in_memory,
 };
 
 // Re-export key items from deferred
