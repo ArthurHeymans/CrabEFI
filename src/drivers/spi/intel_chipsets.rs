@@ -2,6 +2,33 @@
 //!
 //! This module contains the PCI device IDs for Intel chipsets and their
 //! corresponding SPI controller types, ported from flashprog's chipset_enable.c.
+//!
+//! # TODO: Missing chipsets from rflasher
+//!
+//! The following chipset types are defined in rflasher but not here:
+//! - `TunnelCreek` (Atom E6xx, device ID 0x8186)
+//! - `Centerton` (Atom S1220/S1240/S1260)
+//! - `Series8Wellsburg`
+//! - `SnowRidge`
+//!
+//! Additional PCI device IDs missing (partial list):
+//! - More 6 Series variants: 0x1c47 (UM67), 0x1c4b (HM67), 0x1c4c (Q65), 0x1c50 (B65), etc.
+//! - More 7 Series variants: 0x1e41/42/43 (samples), 0x1e46 (Z75), 0x1e48 (Q75), etc.
+//! - DH89xxCC (Cave Creek) 0x2310, Coleto Creek 0x2390
+//! - ICH9 Eng. Sample 0x2910
+//! - ICH10R Eng. Sample 0x3a10, ICH10 Eng. Sample 0x3a1e
+//! - More 5 Series: 0x3b00/01/08/0a/0b/0d/0e/12/16/1e
+//! - EP80579 0x5031
+//! - More 8 Series variants: 0x8c40/41/42/43/46/49/4c/4e/52/56
+//! - More 9 Series: 0x8cc1/cc2/cc3
+//! - More 8 Series LP: 0x9c41/47
+//! - More 9 Series LP: 0x9cc1/cc2/cc6/cc7/cc9/ccb
+//! - More 100 Series: 0x9d41/43/46/4b/50/51/53/56, 0xa141/42/47/4a/4d/4e/52/53/54
+//! - More C620: 0xa1c0/c4/c5
+//! - More 300 Series: 0xa30e, 0xa323
+//! - 500 Series: 0x438f (W580)
+//!
+//! Full list: compare with rflasher/crates/rflasher-internal/src/intel_pci.rs
 
 use super::INTEL_VID;
 
@@ -14,6 +41,13 @@ use super::INTEL_VID;
 pub enum IchChipset {
     /// Unknown chipset
     Unknown = 0,
+    // TODO: Add these pre-SPI chipsets from rflasher if needed:
+    // Ich,       // Original ICH
+    // Ich2345,   // ICH2/ICH3/ICH4/ICH5
+    // Ich6,      // ICH6
+    // Poulsbo,   // Intel SCH Poulsbo
+    // TunnelCreek, // Atom E6xx (device ID 0x8186)
+    // Centerton, // Atom S1220/S1240/S1260
     /// ICH7
     Ich7,
 
@@ -38,6 +72,7 @@ pub enum IchChipset {
     Series8LynxPoint,
     /// 8 Series LP (Lynx Point LP)
     Series8LynxPointLp,
+    // TODO: Add Series8Wellsburg from rflasher
     /// 9 Series (Wildcat Point)
     Series9WildcatPoint,
     /// 9 Series LP (Wildcat Point LP)
@@ -62,6 +97,7 @@ pub enum IchChipset {
     // ======== New access permissions from here on ========
     /// C740 Series (Emmitsburg)
     C740Emmitsburg,
+    // TODO: Add SnowRidge from rflasher
     /// Meteor Lake
     MeteorLake,
     /// Lunar Lake

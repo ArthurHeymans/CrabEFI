@@ -22,7 +22,7 @@ use crate::coreboot;
 use crate::drivers::spi::{self, AnySpiController, SpiController};
 use crate::state::{self, MAX_VARIABLE_DATA_SIZE, MAX_VARIABLE_NAME_LEN};
 
-use super::{STORE_HEADER_SIZE, StoreHeader, VarStoreError, VariableRecord};
+use super::{StoreHeader, VarStoreError, VariableRecord, STORE_HEADER_SIZE};
 
 /// Default SMMSTORE base address in SPI flash
 /// This is typically at the end of the flash region
@@ -78,8 +78,8 @@ pub fn init() -> Result<(), VarStoreError> {
     // 1. Coreboot tables (SMMSTORE v2 record)
     // 2. FMAP in SPI flash
     // 3. Fall back to defaults
-    let smmstore_configured =
-        configure_smmstore_from_coreboot() || configure_smmstore_from_fmap(&mut controller);
+    let smmstore_configured = configure_smmstore_from_coreboot(&controller)
+        || configure_smmstore_from_fmap(&mut controller);
 
     if !smmstore_configured {
         // DANGER: Using default SMMSTORE base (0xF00000) without verification
@@ -109,7 +109,7 @@ pub fn init() -> Result<(), VarStoreError> {
 /// Try to configure SMMSTORE from coreboot tables (SMMSTORE v2 record)
 ///
 /// Returns true if configuration was found and applied.
-fn configure_smmstore_from_coreboot() -> bool {
+fn configure_smmstore_from_coreboot(spi: &spi::AnySpiController) -> bool {
     if let Some(smmstore_info) = coreboot::get_smmstorev2() {
         log::info!(
             "Using SMMSTORE v2 from coreboot tables: {} blocks x {} KB at {:#x}",
@@ -122,9 +122,8 @@ fn configure_smmstore_from_coreboot() -> bool {
         let mut config = SMMSTORE_CONFIG.lock();
         // The mmap_addr is the memory-mapped address for read-only access
         // For SPI flash writes, we need to convert to the flash offset
-        // The mmap_addr is typically in the 0xFF... range (memory-mapped SPI)
-        // We'll calculate the actual base address based on the memory map
-        config.base_addr = calculate_spi_offset(smmstore_info.mmap_addr);
+        // Use the BIOS region from IFD to calculate the correct offset
+        config.base_addr = calculate_spi_offset(smmstore_info.mmap_addr, spi.get_bios_region());
         config.size = smmstore_info.num_blocks * smmstore_info.block_size;
         log::info!(
             "SMMSTORE configured from coreboot: base={:#x}, size={} KB",
@@ -180,20 +179,46 @@ fn configure_smmstore_from_fmap(spi: &mut spi::AnySpiController) -> bool {
 /// Coreboot's SMMSTORE v2 provides a memory-mapped address for read-only access.
 /// We need to convert this to the SPI flash offset for write operations.
 ///
-/// On x86 systems, the SPI flash is typically mapped at the end of the 32-bit
-/// address space (starting at 0xFF000000 for 16MB flash, 0xFE000000 for 32MB, etc.)
-fn calculate_spi_offset(mmap_addr: u64) -> u32 {
-    // If the address is in the memory-mapped range (top of 4GB)
+/// On x86 systems, the BIOS region of the flash is memory-mapped to end at 4GB
+/// (0x100000000). The `bios_region` parameter provides the base and limit of the
+/// BIOS region from the Intel Flash Descriptor (IFD), which allows us to calculate
+/// the correct offset.
+///
+/// For example, on a system with 8MB flash where BIOS occupies the entire flash:
+/// - BIOS region: base=0x000000, limit=0x7FFFFF (8MB)
+/// - Memory-mapped base: 0x100000000 - 0x800000 = 0xFF800000
+/// - mmap_addr 0xffd10000 -> offset within BIOS = 0xffd10000 - 0xFF800000 = 0x510000
+fn calculate_spi_offset(mmap_addr: u64, bios_region: Option<(u32, u32)>) -> u32 {
+    // If we have BIOS region info from IFD, use it for accurate calculation
+    if let Some((bios_base, bios_limit)) = bios_region {
+        let bios_size = (bios_limit - bios_base + 1) as u64;
+        // BIOS region is mapped to end at 4GB
+        let mmap_base = 0x1_0000_0000u64 - bios_size;
+
+        if mmap_addr >= mmap_base && mmap_addr < 0x1_0000_0000u64 {
+            // Calculate offset within BIOS region, then add BIOS base in flash
+            let offset_in_bios = (mmap_addr - mmap_base) as u32;
+            let flash_offset = bios_base + offset_in_bios;
+            log::debug!(
+                "SPI offset calculation: mmap_addr={:#x}, bios_base={:#x}, bios_size={:#x}, mmap_base={:#x}, flash_offset={:#x}",
+                mmap_addr, bios_base, bios_size, mmap_base, flash_offset
+            );
+            return flash_offset;
+        }
+    }
+
+    // Fallback: assume the address is in a standard memory-mapped range
+    // This is a heuristic based on common flash sizes
+    log::warn!("No BIOS region info available, using fallback address calculation");
+
     if mmap_addr >= 0xFF000000 {
-        // For 16MB flash mapped at 0xFF000000:
-        // mmap_addr 0xFF000000 -> SPI offset 0x000000
-        // mmap_addr 0xFFF00000 -> SPI offset 0xF00000
+        // Assume 16MB flash mapped at 0xFF000000
         (mmap_addr - 0xFF000000) as u32
     } else if mmap_addr >= 0xFE000000 {
-        // For 32MB flash mapped at 0xFE000000
+        // Assume 32MB flash mapped at 0xFE000000
         (mmap_addr - 0xFE000000) as u32
     } else if mmap_addr >= 0xFC000000 {
-        // For 64MB flash mapped at 0xFC000000
+        // Assume 64MB flash mapped at 0xFC000000
         (mmap_addr - 0xFC000000) as u32
     } else if mmap_addr == 0 {
         // No address provided, use default

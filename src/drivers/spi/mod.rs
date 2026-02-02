@@ -149,6 +149,13 @@ pub trait SpiController {
 
     /// Get the operating mode
     fn mode(&self) -> SpiMode;
+
+    /// Get the BIOS region from flash descriptor (Intel IFD)
+    ///
+    /// Returns (base, limit) in flash offsets, or None if not available.
+    /// This is used to calculate the correct SPI offset from memory-mapped addresses.
+    /// The BIOS region is mapped to end at 4GB in the CPU address space.
+    fn get_bios_region(&self) -> Option<(u32, u32)>;
 }
 
 /// Enum containing Intel, AMD, or QEMU SPI controller
@@ -220,6 +227,14 @@ impl SpiController for AnySpiController {
             Self::Intel(c) => c.mode(),
             Self::Amd(c) => c.mode(),
             Self::Qemu(c) => c.mode(),
+        }
+    }
+
+    fn get_bios_region(&self) -> Option<(u32, u32)> {
+        match self {
+            Self::Intel(c) => c.get_bios_region(),
+            Self::Amd(c) => c.get_bios_region(),
+            Self::Qemu(c) => c.get_bios_region(),
         }
     }
 }

@@ -581,6 +581,11 @@ impl SpiController for QemuPflashController {
     fn mode(&self) -> SpiMode {
         SpiMode::HardwareSequencing
     }
+
+    fn get_bios_region(&self) -> Option<(u32, u32)> {
+        // QEMU pflash doesn't have Intel Flash Descriptor
+        None
+    }
 }
 
 /// Detect QEMU pflash

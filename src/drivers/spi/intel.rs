@@ -17,10 +17,39 @@
 //!   operations internally. This is the default for PCH100+.
 //! - **Software Sequencing**: We control the SPI protocol directly.
 //!   More flexible but may not be available on locked-down systems.
+//!
+//! # TODO: Missing features from rflasher/flashprog
+//!
+//! The following features are implemented in rflasher but not yet here:
+//!
+//! ## Software Sequencing (HIGH priority)
+//! - `ich9_run_opcode()` - Core swseq execution for ICH9+
+//! - `ich7_run_opcode()` - Core swseq execution for ICH7
+//! - `swseq_send_command()` / `ich7_swseq_send_command()` - Raw SPI command interface
+//! - `swseq_read/write/erase()` and `ich7_swseq_read/write/erase()`
+//! - `swseq_wait_wip()` / `ich7_swseq_wait_wip()` - Poll for Write-In-Progress
+//! - Without swseq, ICH7 systems won't work at all
+//!
+//! ## Opcode Table Management (required for swseq)
+//! - `Opcodes` struct with `preop[2]` (WREN, EWSR) and `opcode[8]` arrays
+//! - `generate_opcodes()` / `generate_ich7_opcodes()` - Read from locked controller
+//! - `program_opcodes()` / `program_ich7_opcodes()` - Program PREOP/OPTYPE/OPMENU
+//! - `find_opcode_index()` - Find opcode in OPMENU table
+//! - `get_atomic_for_opcode()` - Determine if WREN preop is needed
+//! - `missing_opcodes()` - Check if READ/RDSR are available
+//!
+//! ## BBAR Handling (MEDIUM priority)
+//! - `set_bbar()` - Set BIOS Base Address Register to 0 to allow full flash access
+//! - Currently we don't manipulate BBAR at all
+//!
+//! ## Access Permission Handling (MEDIUM priority)
+//! - `handle_access_permissions()` - Check FRAP/FREG for region access
+//! - `handle_protected_ranges()` - Check/clear PRx registers when not locked
+//! - BIOS_BM_WAP/RAP reading for C740+ chipsets
 
 use super::intel_chipsets::IchChipset;
 use super::regs::*;
-use super::{Result, SpiController, SpiError, SpiMode, delay_us};
+use super::{delay_us, Result, SpiController, SpiError, SpiMode};
 use crate::drivers::mmio::MmioRegion;
 use crate::drivers::pci::{self, PciAddress, PciDevice};
 
@@ -46,6 +75,12 @@ pub struct IntelSpiController {
     hwseq_addr_mask: u32,
     /// HSFC FCYCLE field mask
     hsfc_fcycle_mask: u16,
+    // TODO: Add opcode table for swseq support:
+    // /// Current opcodes (for software sequencing)
+    // opcodes: Option<Opcodes>,
+    // TODO: Add BBAR tracking:
+    // /// BBAR value (BIOS Base Address Register)
+    // bbar: u32,
 }
 
 impl IntelSpiController {
@@ -159,6 +194,12 @@ impl IntelSpiController {
     }
 
     /// Initialize ICH7 SPI controller
+    ///
+    /// TODO: ICH7 swseq implementation needed (see rflasher ichspi.rs):
+    /// - Read/program PREOP, OPTYPE, OPMENU registers at ICH7 offsets (0x54-0x5f)
+    /// - Log PBR (Protected BIOS Range) registers at 0x60-0x68
+    /// - Set BBAR to 0 at offset 0x50 if not locked (allow full flash access)
+    /// - Store opcode table for later use in swseq operations
     fn init_ich7(&mut self) -> Result<()> {
         let spis = self.spibar.read16(ICH7_REG_SPIS);
         log::debug!("ICH7 SPIS: {:#06x}", spis);
@@ -169,6 +210,14 @@ impl IntelSpiController {
             self.locked = true;
         }
 
+        // TODO: Initialize opcodes - if locked, read from hardware; if not, program defaults
+        // See init_ich7_opcodes() in rflasher
+
+        // TODO: Set BBAR to 0 if not locked
+        // let bbar = self.spibar.read32(0x50);
+        // log::debug!("ICH7 BBAR: {:#010x}", bbar);
+        // if !self.locked { self.spibar.write32(0x50, 0); }
+
         // ICH7 only supports swseq
         self.mode = SpiMode::SoftwareSequencing;
         self.desc_valid = false;
@@ -178,6 +227,13 @@ impl IntelSpiController {
     }
 
     /// Initialize ICH9+ SPI controller (including PCH100+)
+    ///
+    /// TODO: Additional init steps from rflasher:
+    /// - init_opcodes() - Read/program PREOP, OPTYPE, OPMENU for swseq
+    /// - handle_access_permissions() - Check FRAP/FREG region access
+    /// - handle_protected_ranges() - Check/clear PRx registers
+    /// - Set BBAR to 0 for non-PCH100+ if not locked (ICH9_REG_BBAR = 0xA0)
+    /// - Log SSFS/SSFC registers for debugging
     fn init_ich9(&mut self, requested_mode: SpiMode) -> Result<()> {
         // Read HSFS
         let hsfs = self.spibar.read16(ICH9_REG_HSFS);
@@ -196,16 +252,23 @@ impl IntelSpiController {
             log::debug!("Flash Descriptor is valid");
         }
 
+        // TODO: Initialize opcodes for swseq
+        // self.init_opcodes()?;
+
         // PCH100+ specific: check DLOCK.SSEQ_LOCKDN
         if self.generation.is_pch100_compatible() {
             let dlock = self.spibar.read32(PCH100_REG_DLOCK);
             log::debug!("DLOCK: {:#010x}", dlock);
+            // TODO: Log all DLOCK bits like rflasher's print_dlock()
 
             if dlock & DLOCK_SSEQ_LOCKDN != 0 {
                 log::info!("Software sequencing is locked (DLOCK.SSEQ_LOCKDN=1)");
                 self.swseq_locked = true;
             }
         }
+
+        // TODO: handle_access_permissions() - check FRAP/FREG
+        // TODO: handle_protected_ranges() - check/clear PRx registers
 
         // Determine operating mode
         self.determine_mode(requested_mode)?;
@@ -217,10 +280,20 @@ impl IntelSpiController {
             self.spibar.write16(ICH9_REG_HSFS, HSFS_FCERR);
         }
 
+        // TODO: Handle BBAR for older chipsets (non-PCH100+)
+        // if self.desc_valid && !self.generation.is_pch100_compatible() && !self.locked {
+        //     self.bbar = self.spibar.read32(ICH9_REG_BBAR);
+        //     self.set_bbar(0); // Allow access to all flash addresses
+        // }
+
         Ok(())
     }
 
     /// Determine the operating mode based on hardware and user request
+    ///
+    /// Note: Since software sequencing (swseq) is not yet implemented, we prefer
+    /// hardware sequencing (hwseq) for any chipset that supports it when the
+    /// flash descriptor is valid. hwseq was introduced with ICH8.
     fn determine_mode(&mut self, requested: SpiMode) -> Result<()> {
         // Validate user's explicit request
         if requested == SpiMode::HardwareSequencing {
@@ -237,24 +310,32 @@ impl IntelSpiController {
                 log::error!("Software sequencing requested but locked");
                 return Err(SpiError::NotSupported);
             }
+            // Warn that swseq is not implemented yet
+            log::warn!("Software sequencing requested but not yet implemented");
         }
 
         // Determine effective mode for Auto
         let effective_mode = if requested != SpiMode::Auto {
             requested
         } else if !self.generation.supports_hwseq() {
+            // ICH7: swseq only (hwseq not available)
             log::debug!("Using swseq (ICH7 has no hwseq support)");
             SpiMode::SoftwareSequencing
-        } else if self.swseq_locked {
-            log::info!("Using hwseq because swseq is locked");
-            if !self.desc_valid {
-                return Err(SpiError::InvalidDescriptor);
+        } else if self.desc_valid {
+            // ICH8+ with valid flash descriptor: prefer hwseq
+            // This works for both locked and unlocked systems, and hwseq is
+            // currently the only implemented mode for ICH9+ chipsets.
+            // TODO: Once swseq is implemented, consider preferring swseq for
+            // non-PCH100+ chipsets when not locked (more flexible opcode support)
+            if self.swseq_locked {
+                log::info!("Using hwseq (swseq is locked via DLOCK.SSEQ_LOCKDN)");
+            } else {
+                log::debug!("Using hwseq (flash descriptor valid, swseq not yet implemented)");
             }
             SpiMode::HardwareSequencing
-        } else if self.generation.defaults_to_hwseq() && self.desc_valid {
-            log::debug!("Enabling hwseq by default for {}", self.generation);
-            SpiMode::HardwareSequencing
         } else {
+            // No valid flash descriptor - must use swseq (but it's not implemented)
+            log::warn!("Flash descriptor not valid, falling back to swseq (NOT IMPLEMENTED)");
             SpiMode::SoftwareSequencing
         };
 
@@ -583,8 +664,18 @@ impl SpiController for IntelSpiController {
         match self.mode {
             SpiMode::HardwareSequencing => self.hwseq_read(addr, buf),
             SpiMode::SoftwareSequencing => {
-                // Software sequencing read would go here
-                // For now, we'll return an error
+                // TODO: Implement swseq_read() / ich7_swseq_read()
+                // See rflasher ichspi.rs lines 2049-2084 (ich7) and 2309-2344 (ich9+)
+                //
+                // Algorithm:
+                // 1. Find read opcode (JEDEC_READ 0x03 or JEDEC_FAST_READ 0x0B) in opcode table
+                // 2. Loop in 64-byte chunks:
+                //    a. Build write array: [opcode, addr_hi, addr_mid, addr_lo]
+                //    b. Call swseq_send_command() or ich7_swseq_send_command()
+                //    c. Copy data from response to buffer
+                //
+                // For ICH7: Uses SPIS/SPIC/SPIA/SPID0 registers
+                // For ICH9+: Uses SSFS/SSFC/FADDR/FDATA0 registers
                 log::error!("Software sequencing read not implemented");
                 Err(SpiError::NotSupported)
             }
@@ -596,6 +687,18 @@ impl SpiController for IntelSpiController {
         match self.mode {
             SpiMode::HardwareSequencing => self.hwseq_write(addr, data),
             SpiMode::SoftwareSequencing => {
+                // TODO: Implement swseq_write() / ich7_swseq_write()
+                // See rflasher ichspi.rs lines 2086-2122 (ich7) and 2346-2382 (ich9+)
+                //
+                // Algorithm:
+                // 1. Find JEDEC_BYTE_PROGRAM (0x02) in opcode table
+                // 2. Loop respecting 256-byte page boundaries and 64-byte max transfer:
+                //    a. Build write array: [0x02, addr_hi, addr_mid, addr_lo, data...]
+                //    b. Call swseq_send_command() with atomic=1 (sends WREN first)
+                //    c. Call swseq_wait_wip() to poll status register until WIP clears
+                //
+                // IMPORTANT: The atomic mode handles WREN automatically via preop table
+                // get_atomic_for_opcode() returns 1 for BYTE_PROGRAM to use preop[0]=WREN
                 log::error!("Software sequencing write not implemented");
                 Err(SpiError::NotSupported)
             }
@@ -607,6 +710,20 @@ impl SpiController for IntelSpiController {
         match self.mode {
             SpiMode::HardwareSequencing => self.hwseq_erase(addr, len),
             SpiMode::SoftwareSequencing => {
+                // TODO: Implement swseq_erase() / ich7_swseq_erase()
+                // See rflasher ichspi.rs lines 2124-2162 (ich7) and 2384-2423 (ich9+)
+                //
+                // Algorithm:
+                // 1. Find erase opcode in table - prefer JEDEC_SE (0x20, 4KB) for granularity
+                //    Fallback to JEDEC_BE_52 (0x52, 32KB) or JEDEC_BE_D8 (0xD8, 64KB)
+                // 2. Verify address/length are aligned to erase block size
+                // 3. Loop for each erase block:
+                //    a. Build erase command: [opcode, addr_hi, addr_mid, addr_lo]
+                //    b. Call swseq_send_command() with atomic=1 (sends WREN first)
+                //    c. Call swseq_wait_wip() to poll until erase completes
+                //
+                // swseq_wait_wip() polls JEDEC_RDSR (0x05) until bit 0 (WIP) clears
+                // Timeout should be ~60 seconds for chip erase operations
                 log::error!("Software sequencing erase not implemented");
                 Err(SpiError::NotSupported)
             }
@@ -616,5 +733,36 @@ impl SpiController for IntelSpiController {
 
     fn mode(&self) -> SpiMode {
         self.mode
+    }
+
+    fn get_bios_region(&self) -> Option<(u32, u32)> {
+        // Only return BIOS region if flash descriptor is valid
+        if !self.desc_valid {
+            return None;
+        }
+
+        // Read FREG1 (BIOS region) - offset 0x58 = FREG0 (0x54) + 4
+        let freg1 = self.spibar.read32(ICH9_REG_FREG0 + 4);
+        let base = freg_base(freg1);
+        let limit = freg_limit(freg1);
+
+        // Check if region is valid (base <= limit)
+        if base > limit {
+            log::debug!(
+                "BIOS region disabled (base {:#x} > limit {:#x})",
+                base,
+                limit
+            );
+            return None;
+        }
+
+        log::debug!(
+            "BIOS region (FREG1): base={:#x}, limit={:#x}, size={} KB",
+            base,
+            limit,
+            (limit - base + 1) / 1024
+        );
+
+        Some((base, limit))
     }
 }

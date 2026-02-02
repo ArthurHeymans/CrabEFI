@@ -8,6 +8,18 @@
 //! - ICH7: Original SPI controller, software sequencing only
 //! - ICH8/ICH9: Hardware sequencing introduced, dual flash support
 //! - PCH100+: New register layout at different offsets
+//!
+//! # TODO: Missing register constants from rflasher
+//!
+//! - ICH8_REG_VSCC (0xC1) - Vendor Specific Component Capabilities
+//! - SPIS_RESERVED_MASK (0x7ff0) - ICH7 SPIS reserved bits
+//! - SSFS_RESERVED_MASK (0x000000e2) - ICH9 SSFS reserved bits  
+//! - SSFC_RESERVED_MASK (0xf8008100) - ICH9 SSFC reserved bits
+//! - SSFC_SME_OFF/SSFC_SME (bit 23) - SPI SMI# Enable
+//! - FPB_FPBA_OFF/FPB_FPBA - Flash Partition Boundary bits
+//! - HSFS_WRSDIS (bit 11) - Write Status Disable for PCH100+
+//! - HSFS_PRR34_LOCKDN (bit 12) - PRR3/PRR4 Lock-Down for PCH100+
+//! - HSFC_WET (bit 5) - Write Enable Type
 
 // ============================================================================
 // ICH7 Register Definitions
@@ -37,6 +49,10 @@ pub const SPIS_GRANT: u16 = 0x0002;
 pub const SPIS_CDS: u16 = 0x0004;
 /// Flash Cycle Error
 pub const SPIS_FCERR: u16 = 0x0008;
+
+// ICH7 SPIS reserved bits mask (for read-modify-write)
+/// Reserved bits in SPIS that should be preserved
+pub const SPIS_RESERVED_MASK: u16 = 0x7ff0;
 
 // ICH7 SPIC bits
 /// SPI Cycle Go
@@ -78,6 +94,8 @@ pub const ICH9_REG_OPTYPE: u64 = 0x96;
 pub const ICH9_REG_OPMENU: u64 = 0x98;
 /// ICH9 BIOS Base Address Configuration (32 bits)
 pub const ICH9_REG_BBAR: u64 = 0xA0;
+/// ICH8 Vendor Specific Component Capabilities (32 bits)
+pub const ICH8_REG_VSCC: u64 = 0xC1;
 /// ICH9 Lower Vendor Specific Component Capabilities (32 bits)
 pub const ICH9_REG_LVSCC: u64 = 0xC4;
 /// ICH9 Upper Vendor Specific Component Capabilities (32 bits)
@@ -111,6 +129,14 @@ pub const HSFS_FDV: u16 = 1 << HSFS_FDV_OFF;
 pub const HSFS_FLOCKDN_OFF: u16 = 15;
 pub const HSFS_FLOCKDN: u16 = 1 << HSFS_FLOCKDN_OFF;
 
+// PCH100+ specific HSFS bits
+/// Write Status Disable (Sunrise Point+)
+pub const HSFS_WRSDIS_OFF: u16 = 11;
+pub const HSFS_WRSDIS: u16 = 1 << HSFS_WRSDIS_OFF;
+/// PRR3 PRR4 Lock-Down
+pub const HSFS_PRR34_LOCKDN_OFF: u16 = 12;
+pub const HSFS_PRR34_LOCKDN: u16 = 1 << HSFS_PRR34_LOCKDN_OFF;
+
 // HSFC bits
 /// Flash Cycle Go
 pub const HSFC_FGO_OFF: u16 = 0;
@@ -129,6 +155,9 @@ pub const HSFC_SME: u16 = 1 << HSFC_SME_OFF;
 /// Flash Cycle (PCH100) - 4 bits instead of 2
 pub const PCH100_HSFC_FCYCLE_OFF: u16 = 17 - 16; // Offset within HSFC
 pub const PCH100_HSFC_FCYCLE: u16 = 0xf << PCH100_HSFC_FCYCLE_OFF;
+/// Write Enable Type
+pub const HSFC_WET_OFF: u16 = 21 - 16;
+pub const HSFC_WET: u16 = 1 << HSFC_WET_OFF;
 
 // FADDR masks
 /// ICH9 Flash Address mask (25 bits)
@@ -176,6 +205,13 @@ pub const SSFC_SCF: u32 = 0x7 << SSFC_SCF_OFF;
 pub const SSFC_SCF_20MHZ: u32 = 0x00000000;
 /// 33 MHz clock
 pub const SSFC_SCF_33MHZ: u32 = 0x01000000;
+/// SPI SMI# Enable
+pub const SSFC_SME_OFF: u32 = 15 + 8;
+pub const SSFC_SME: u32 = 1 << SSFC_SME_OFF;
+/// Reserved bits in SSFS that should be preserved
+pub const SSFS_RESERVED_MASK: u32 = 0x000000e2;
+/// Reserved bits in SSFC that should be preserved
+pub const SSFC_RESERVED_MASK: u32 = 0xf8008100;
 
 // BBAR bits
 /// Bottom of System Flash mask
@@ -354,3 +390,60 @@ pub enum HwSeqCycle {
     /// Erase cycle (4KB)
     Erase = 3,
 }
+
+// ============================================================================
+// TODO: Software Sequencing Data Structures
+// ============================================================================
+//
+// The following structures are needed for software sequencing support.
+// See rflasher/crates/rflasher-internal/src/ichspi.rs for reference.
+//
+// /// Opcode entry for software sequencing
+// #[derive(Debug, Clone, Copy, Default)]
+// pub struct Opcode {
+//     /// SPI opcode byte
+//     pub opcode: u8,
+//     /// Opcode type (SPI_OPCODE_TYPE_*)
+//     pub spi_type: u8,
+//     /// Atomic operation: 0 = none, 1 = preop0, 2 = preop1
+//     pub atomic: u8,
+// }
+//
+// /// Opcode table for software sequencing
+// #[derive(Debug, Clone)]
+// pub struct Opcodes {
+//     /// Pre-opcodes [WREN=0x06, EWSR=0x50]
+//     pub preop: [u8; 2],
+//     /// Main opcodes (8 slots in OPMENU register)
+//     pub opcode: [Opcode; 8],
+// }
+//
+// Default opcode configuration (like O_ST_M25P in flashprog):
+// preop: [JEDEC_WREN (0x06), JEDEC_EWSR (0x50)]
+// opcode[0]: JEDEC_BYTE_PROGRAM (0x02), WRITE_WITH_ADDRESS
+// opcode[1]: JEDEC_READ (0x03), READ_WITH_ADDRESS
+// opcode[2]: JEDEC_SE (0x20), WRITE_WITH_ADDRESS (4KB erase)
+// opcode[3]: JEDEC_RDSR (0x05), READ_NO_ADDRESS
+// opcode[4]: JEDEC_REMS (0x90), READ_WITH_ADDRESS
+// opcode[5]: JEDEC_WRSR (0x01), WRITE_NO_ADDRESS
+// opcode[6]: JEDEC_RDID (0x9F), READ_NO_ADDRESS
+// opcode[7]: JEDEC_CE_C7 (0xC7), WRITE_NO_ADDRESS (chip erase)
+//
+// /// ICH7 software sequencing register offsets
+// pub struct Ich7SwseqRegs {
+//     pub spis: u64,   // 0x00 - Status
+//     pub spic: u64,   // 0x02 - Control
+//     pub spia: u64,   // 0x04 - Address
+//     pub spid0: u64,  // 0x08 - Data (64 bytes)
+//     pub preop: u64,  // 0x54
+//     pub optype: u64, // 0x56
+//     pub opmenu: u64, // 0x58 (64-bit)
+// }
+//
+// /// ICH9+ software sequencing register offsets
+// pub struct SwseqRegs {
+//     pub ssfsc: u64,  // ICH9: 0x90 (SSFS+SSFC combined), PCH100: 0xA0
+//     pub preop: u64,  // ICH9: 0x94, PCH100: 0xA4
+//     pub optype: u64, // ICH9: 0x96, PCH100: 0xA6
+//     pub opmenu: u64, // ICH9: 0x98, PCH100: 0xA8 (64-bit)
+// }

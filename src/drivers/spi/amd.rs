@@ -19,7 +19,7 @@
 
 use super::amd_chipsets::AmdChipset;
 use super::regs::*;
-use super::{Result, SpiController, SpiError, SpiMode, delay_us};
+use super::{delay_us, Result, SpiController, SpiError, SpiMode};
 use crate::drivers::mmio::MmioRegion;
 use crate::drivers::pci::{self, PciAddress, PciDevice};
 
@@ -423,5 +423,10 @@ impl SpiController for AmdSpi100Controller {
     fn mode(&self) -> SpiMode {
         // AMD SPI100 uses software-controlled SPI commands
         SpiMode::SoftwareSequencing
+    }
+
+    fn get_bios_region(&self) -> Option<(u32, u32)> {
+        // AMD doesn't have Intel Flash Descriptor
+        None
     }
 }
