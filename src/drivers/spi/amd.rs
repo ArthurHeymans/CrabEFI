@@ -306,6 +306,12 @@ impl AmdSpi100Controller {
             let page_remaining = 256 - (current_addr as usize & 0xFF);
             let chunk_len = remaining.min(SPI100_MAX_DATA - 3).min(page_remaining);
 
+            // Prevent infinite loop if chunk_len is somehow 0
+            if chunk_len == 0 {
+                log::error!("SPI write: zero chunk length, aborting to prevent infinite loop");
+                return Err(SpiError::InvalidArgument);
+            }
+
             // Send WREN (Write Enable) first
             self.send_command(&[JEDEC_WREN], &mut [])?;
 
@@ -338,7 +344,7 @@ impl AmdSpi100Controller {
         }
 
         let mut current_addr = addr;
-        let end_addr = addr + len;
+        let end_addr = addr.checked_add(len).ok_or(SpiError::InvalidArgument)?;
 
         while current_addr < end_addr {
             // Send WREN (Write Enable) first

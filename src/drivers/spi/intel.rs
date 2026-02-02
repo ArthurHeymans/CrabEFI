@@ -548,7 +548,7 @@ impl IntelSpiController {
         }
 
         let mut current_addr = addr;
-        let end_addr = addr + len;
+        let end_addr = addr.checked_add(len).ok_or(SpiError::InvalidArgument)?;
 
         // Clear any pending status
         let hsfs = self.spibar.read16(ICH9_REG_HSFS);

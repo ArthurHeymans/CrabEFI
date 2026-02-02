@@ -38,25 +38,24 @@ pub fn sha256_chunks(chunks: &[&[u8]]) -> [u8; 32] {
 ///
 /// For UEFI Secure Boot, we verify that:
 /// 1. The PKCS#7 structure is valid
-/// 2. One of the signer certificates chains to the trusted certificate (from db)
-///
-/// This is a trust-based verification - we check that the signing certificate
-/// is issued by a trusted CA in db, which is sufficient for Secure Boot.
+/// 2. The signature in SignerInfo is cryptographically valid
+/// 3. The messageDigest attribute matches the hash of the signed data
+/// 4. One of the signer certificates chains to the trusted certificate (from db)
 ///
 /// # Arguments
 ///
 /// * `pkcs7_data` - The PKCS#7 SignedData structure (DER encoded)
-/// * `_signed_data` - The data that was signed (the Authenticode hash) - currently unused
+/// * `signed_data` - The data that was signed (the Authenticode hash or authenticated variable data)
 /// * `trusted_cert` - A trusted X.509 certificate (DER encoded) from db
 ///
 /// # Returns
 ///
-/// * `Ok(true)` - Signature chains to the trusted certificate
+/// * `Ok(true)` - Signature is valid and chains to the trusted certificate
 /// * `Ok(false)` - Signature does not chain to this certificate
 /// * `Err(...)` - Parse or verification error
 pub fn verify_pkcs7_signature(
     pkcs7_data: &[u8],
-    _signed_data: &[u8],
+    signed_data: &[u8],
     trusted_cert: &[u8],
 ) -> Result<bool, AuthError> {
     use cms::content_info::ContentInfo;
@@ -109,51 +108,220 @@ pub fn verify_pkcs7_signature(
         embedded_certs.len()
     );
 
-    // Check if any embedded certificate matches the trusted cert or chains to it
-    for embedded_der in &embedded_certs {
-        if let Ok(embedded_cert) = parse_x509_certificate(embedded_der) {
-            // Strategy 1: Check if embedded cert is exactly the trusted cert
-            if embedded_cert.subject == trusted.subject
-                && embedded_cert.serial_number == trusted.serial_number
-            {
-                log::info!("Signer certificate matches trusted db certificate");
-                return Ok(true);
-            }
+    // Compute the hash of the actual signed data
+    let computed_hash = sha256(signed_data);
 
-            // Strategy 2: Check if embedded cert was issued by the trusted cert
-            if verify_cert_chain(&embedded_cert, embedded_der, &trusted, trusted_cert)? {
-                log::info!("Signer certificate chains to trusted db certificate");
-                return Ok(true);
-            }
-        }
+    // Get SignerInfos and verify the signature
+    if cms_signed_data.signer_infos.0.is_empty() {
+        log::warn!("PKCS#7 contains no SignerInfo");
+        return Err(AuthError::InvalidHeader);
     }
 
-    // Strategy 3: Check for intermediate certs - find a chain
-    // embedded_cert -> intermediate -> trusted
-    for embedded_der in &embedded_certs {
-        if let Ok(embedded_cert) = parse_x509_certificate(embedded_der) {
-            // Look for an intermediate that issued this cert
-            for intermediate_der in &embedded_certs {
-                if let Ok(intermediate) = parse_x509_certificate(intermediate_der) {
-                    // Check: embedded_cert issued by intermediate, intermediate issued by trusted
-                    if embedded_cert.issuer == intermediate.subject
-                        && verify_cert_chain(
-                            &intermediate,
-                            intermediate_der,
-                            &trusted,
-                            trusted_cert,
-                        )?
-                    {
-                        log::info!("Signer certificate chains via intermediate to db certificate");
+    // Verify each signer info
+    for signer_info in cms_signed_data.signer_infos.0.iter() {
+        // Extract the messageDigest from signed attributes (if present)
+        // The messageDigest attribute contains the hash that was actually signed
+        let message_digest = extract_message_digest(signer_info)?;
+
+        // CRITICAL: Verify the messageDigest matches the hash of the actual data
+        // This prevents signature replay attacks
+        if let Some(ref md) = message_digest {
+            if !constant_time_eq(md, &computed_hash) {
+                log::warn!("messageDigest does not match computed hash - possible tampering");
+                log::debug!(
+                    "messageDigest: {:02x?}, computed: {:02x?}",
+                    &md[..core::cmp::min(8, md.len())],
+                    &computed_hash[..8]
+                );
+                continue; // Try next signer
+            }
+            log::debug!("messageDigest matches computed hash");
+        }
+
+        // Get the signature from SignerInfo
+        let signature = signer_info.signature.as_bytes();
+
+        // Find the signing certificate in the embedded certs
+        let signer_cert_der =
+            find_signer_certificate(&cms_signed_data, signer_info, &embedded_certs)?;
+
+        if let Some(signer_der) = signer_cert_der {
+            let signer_cert = parse_x509_certificate(&signer_der)?;
+
+            // Build the data that was signed (signed attributes or content)
+            let data_to_verify = build_signed_attrs_digest(signer_info, &computed_hash)?;
+
+            // CRITICAL: Verify the RSA signature cryptographically
+            match verify_rsa_signature_raw(&signer_cert.public_key, signature, &data_to_verify) {
+                Ok(true) => {
+                    log::debug!("RSA signature verification succeeded");
+
+                    // Now verify the certificate chains to a trusted cert
+                    // Check if signer is exactly the trusted cert (cryptographic comparison)
+                    if verify_cert_chain(&signer_cert, &signer_der, &trusted, trusted_cert)? {
+                        log::info!("Signer certificate chains to trusted db certificate");
                         return Ok(true);
                     }
+
+                    // Check if signer cert is issued by trusted cert
+                    if signer_cert.issuer == trusted.subject
+                        && verify_cert_chain(&signer_cert, &signer_der, &trusted, trusted_cert)?
+                    {
+                        log::info!("Signer certificate issued by trusted db certificate");
+                        return Ok(true);
+                    }
+
+                    // Check for intermediate chain
+                    for intermediate_der in &embedded_certs {
+                        if let Ok(intermediate) = parse_x509_certificate(intermediate_der)
+                            && signer_cert.issuer == intermediate.subject
+                            && verify_cert_chain(
+                                &intermediate,
+                                intermediate_der,
+                                &trusted,
+                                trusted_cert,
+                            )?
+                        {
+                            log::info!(
+                                "Signer certificate chains via intermediate to db certificate"
+                            );
+                            return Ok(true);
+                        }
+                    }
+                }
+                Ok(false) => {
+                    log::debug!("RSA signature verification failed");
+                    continue;
+                }
+                Err(e) => {
+                    log::debug!("RSA signature verification error: {:?}", e);
+                    continue;
                 }
             }
         }
     }
 
-    log::debug!("No certificate chain found to trusted db certificate");
+    log::debug!("No valid signature chain found to trusted db certificate");
     Ok(false)
+}
+
+/// Extract the messageDigest attribute from SignerInfo
+fn extract_message_digest(
+    signer_info: &cms::signed_data::SignerInfo,
+) -> Result<Option<Vec<u8>>, AuthError> {
+    use der::Encode;
+
+    // The messageDigest is in the signed attributes
+    if let Some(ref attrs) = signer_info.signed_attrs {
+        for attr in attrs.iter() {
+            // messageDigest OID: 1.2.840.113549.1.9.4
+            const MESSAGE_DIGEST_OID: &[u8] =
+                &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x09, 0x04];
+            let attr_oid = attr.oid.as_bytes();
+            if attr_oid == MESSAGE_DIGEST_OID {
+                // Extract the OCTET STRING value
+                if let Some(value) = attr.values.get(0) {
+                    let value_bytes = value.to_der().map_err(|_| AuthError::InvalidHeader)?;
+                    // Parse the OCTET STRING to get the hash
+                    if value_bytes.len() > 2 && value_bytes[0] == 0x04 {
+                        let (len, offset) = parse_der_length(&value_bytes[1..])?;
+                        if offset + len < value_bytes.len() {
+                            return Ok(Some(value_bytes[1 + offset..1 + offset + len].to_vec()));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// Find the certificate that corresponds to a SignerInfo
+fn find_signer_certificate(
+    _cms_signed_data: &cms::signed_data::SignedData,
+    signer_info: &cms::signed_data::SignerInfo,
+    embedded_certs: &[Vec<u8>],
+) -> Result<Option<Vec<u8>>, AuthError> {
+    use cms::signed_data::SignerIdentifier;
+
+    match &signer_info.sid {
+        SignerIdentifier::IssuerAndSerialNumber(issuer_and_serial) => {
+            // Find cert matching issuer and serial number
+            for cert_der in embedded_certs {
+                if let Ok(cert) = parse_x509_certificate(cert_der) {
+                    // Compare issuer (DER encoded) and serial number
+                    use der::Encode;
+                    if let Ok(issuer_bytes) = issuer_and_serial.issuer.to_der()
+                        && cert.issuer == issuer_bytes
+                        && cert.serial_number == issuer_and_serial.serial_number.as_bytes()
+                    {
+                        return Ok(Some(cert_der.clone()));
+                    }
+                }
+            }
+        }
+        SignerIdentifier::SubjectKeyIdentifier(ski) => {
+            // Find cert matching subject key identifier
+            // This requires parsing the cert's SKI extension
+            let ski_bytes = ski.0.as_bytes();
+            for cert_der in embedded_certs {
+                if let Ok(ski_from_cert) = extract_subject_key_identifier(cert_der)
+                    && ski_from_cert == ski_bytes
+                {
+                    return Ok(Some(cert_der.clone()));
+                }
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// Extract Subject Key Identifier from a certificate
+fn extract_subject_key_identifier(cert_der: &[u8]) -> Result<Vec<u8>, AuthError> {
+    use der::Decode;
+    use x509_cert::Certificate;
+
+    let cert = Certificate::from_der(cert_der).map_err(|_| AuthError::CertificateParseError)?;
+
+    if let Some(extensions) = &cert.tbs_certificate.extensions {
+        for ext in extensions.iter() {
+            // Subject Key Identifier OID: 2.5.29.14
+            if ext.extn_id.as_bytes() == [0x55, 0x1d, 0x0e] {
+                return Ok(ext.extn_value.as_bytes().to_vec());
+            }
+        }
+    }
+    Err(AuthError::CertificateParseError)
+}
+
+/// Build the digest of signed attributes for verification
+fn build_signed_attrs_digest(
+    signer_info: &cms::signed_data::SignerInfo,
+    content_hash: &[u8; 32],
+) -> Result<[u8; 32], AuthError> {
+    use der::Encode;
+
+    if let Some(ref attrs) = signer_info.signed_attrs {
+        // Hash the DER-encoded signed attributes (with SET OF tag)
+        let attrs_der = attrs.to_der().map_err(|_| AuthError::InvalidHeader)?;
+        Ok(sha256(&attrs_der))
+    } else {
+        // No signed attributes - hash the content directly
+        Ok(*content_hash)
+    }
+}
+
+/// Constant-time byte array comparison to prevent timing attacks
+#[inline(never)]
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut result = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        result |= x ^ y;
+    }
+    result == 0
 }
 
 /// Verify that a certificate chains to a trusted certificate
@@ -161,19 +329,26 @@ pub fn verify_pkcs7_signature(
 /// For UEFI Secure Boot, we check:
 /// 1. If the cert's issuer matches the trusted cert's subject (direct chain)
 /// 2. Verify the cert's signature with the trusted cert's public key
+/// 3. Validate the certificate's validity period (notBefore/notAfter)
 fn verify_cert_chain(
     cert: &X509Certificate,
     cert_der: &[u8],
     trusted: &X509Certificate,
     _trusted_der: &[u8],
 ) -> Result<bool, AuthError> {
-    use der::{Decode, Encode};
+    use der::Decode;
     use x509_cert::Certificate;
 
     // Check if the cert's issuer matches the trusted cert's subject
     // For chain verification: cert.issuer should equal trusted.subject
     if cert.issuer != trusted.subject {
         log::debug!("Certificate issuer does not match trusted subject");
+        return Ok(false);
+    }
+
+    // Validate certificate time validity
+    if let Err(e) = validate_certificate_time(cert_der) {
+        log::warn!("Certificate validity period check failed: {:?}", e);
         return Ok(false);
     }
 
@@ -184,14 +359,13 @@ fn verify_cert_chain(
     // Get the signature from the certificate
     let cert_signature = full_cert.signature.raw_bytes();
 
-    // Get the TBS (To Be Signed) certificate data
-    let tbs_der = full_cert
-        .tbs_certificate
-        .to_der()
-        .map_err(|_| AuthError::CertificateParseError)?;
+    // CRITICAL FIX: Extract the ORIGINAL TBS bytes from the raw DER
+    // instead of re-encoding, which may produce different bytes due to
+    // DER canonicalization differences.
+    let tbs_bytes = extract_tbs_bytes(cert_der)?;
 
     // Hash the TBS certificate
-    let tbs_hash = sha256(&tbs_der);
+    let tbs_hash = sha256(tbs_bytes);
 
     // Verify the certificate's signature with the trusted cert's public key
     match verify_rsa_signature_raw(&trusted.public_key, cert_signature, &tbs_hash) {
@@ -208,6 +382,236 @@ fn verify_cert_chain(
             Ok(false)
         }
     }
+}
+
+/// Validate a certificate's validity period (notBefore/notAfter)
+///
+/// Checks that the current time is within the certificate's validity period.
+/// This prevents use of expired or not-yet-valid certificates.
+fn validate_certificate_time(cert_der: &[u8]) -> Result<(), AuthError> {
+    use der::Decode;
+    use x509_cert::Certificate;
+
+    let cert = Certificate::from_der(cert_der).map_err(|_| AuthError::CertificateParseError)?;
+    let validity = &cert.tbs_certificate.validity;
+
+    // Get current time from the system
+    // Note: In a real implementation, this should come from a trusted time source
+    let current_time = get_current_time_for_cert_validation();
+
+    // Parse notBefore
+    let not_before = parse_x509_time(&validity.not_before)?;
+
+    // Parse notAfter
+    let not_after = parse_x509_time(&validity.not_after)?;
+
+    // Check if current time is before notBefore
+    if current_time < not_before {
+        log::warn!(
+            "Certificate not yet valid: notBefore={}, current={}",
+            not_before,
+            current_time
+        );
+        return Err(AuthError::CertificateNotYetValid);
+    }
+
+    // Check if current time is after notAfter
+    if current_time > not_after {
+        log::warn!(
+            "Certificate expired: notAfter={}, current={}",
+            not_after,
+            current_time
+        );
+        return Err(AuthError::CertificateExpired);
+    }
+
+    log::debug!("Certificate validity period OK");
+    Ok(())
+}
+
+/// Parse X.509 Time (UTCTime or GeneralizedTime) to Unix timestamp
+fn parse_x509_time(time: &x509_cert::time::Time) -> Result<i64, AuthError> {
+    use x509_cert::time::Time;
+
+    let datetime = match time {
+        Time::UtcTime(t) => t.to_date_time(),
+        Time::GeneralTime(t) => t.to_date_time(),
+    };
+
+    // Convert to approximate Unix timestamp (seconds since 1970)
+    // This is simplified - a full implementation would handle leap seconds, etc.
+    let year = datetime.year() as i64;
+    let month = datetime.month() as i64;
+    let day = datetime.day() as i64;
+    let hour = datetime.hour() as i64;
+    let minute = datetime.minutes() as i64;
+    let second = datetime.seconds() as i64;
+
+    // Approximate days since epoch (1970-01-01)
+    let years_since_1970 = year - 1970;
+    let leap_years = (year - 1969) / 4 - (year - 1901) / 100 + (year - 1601) / 400;
+    let days_in_year = match month {
+        1 => 0,
+        2 => 31,
+        3 => 59,
+        4 => 90,
+        5 => 120,
+        6 => 151,
+        7 => 181,
+        8 => 212,
+        9 => 243,
+        10 => 273,
+        11 => 304,
+        12 => 334,
+        _ => 0,
+    };
+    let is_leap = (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0);
+    let leap_day_adjustment = if is_leap && month > 2 { 1 } else { 0 };
+
+    let total_days =
+        years_since_1970 * 365 + leap_years + days_in_year + day - 1 + leap_day_adjustment;
+    let total_seconds = total_days * 86400 + hour * 3600 + minute * 60 + second;
+
+    Ok(total_seconds)
+}
+
+/// Get current time for certificate validation
+///
+/// Returns Unix timestamp (seconds since 1970-01-01 00:00:00 UTC)
+fn get_current_time_for_cert_validation() -> i64 {
+    // Read time from CMOS RTC
+    // This is a simplified implementation - production code should use
+    // a more reliable time source
+    let (year, month, day, hour, minute, second) = read_rtc_time_for_crypto();
+
+    let year = year as i64;
+    let month = month as i64;
+    let day = day as i64;
+    let hour = hour as i64;
+    let minute = minute as i64;
+    let second = second as i64;
+
+    // Same calculation as parse_x509_time
+    let years_since_1970 = year - 1970;
+    let leap_years = (year - 1969) / 4 - (year - 1901) / 100 + (year - 1601) / 400;
+    let days_in_year = match month {
+        1 => 0,
+        2 => 31,
+        3 => 59,
+        4 => 90,
+        5 => 120,
+        6 => 151,
+        7 => 181,
+        8 => 212,
+        9 => 243,
+        10 => 273,
+        11 => 304,
+        12 => 334,
+        _ => 0,
+    };
+    let is_leap = (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0);
+    let leap_day_adjustment = if is_leap && month > 2 { 1 } else { 0 };
+
+    let total_days =
+        years_since_1970 * 365 + leap_years + days_in_year + day - 1 + leap_day_adjustment;
+    total_days * 86400 + hour * 3600 + minute * 60 + second
+}
+
+/// Read time from CMOS RTC (simplified version for crypto module)
+fn read_rtc_time_for_crypto() -> (u16, u8, u8, u8, u8, u8) {
+    use crate::arch::x86_64::io;
+
+    // Wait for RTC update to complete
+    loop {
+        unsafe {
+            io::outb(0x70, 0x0A);
+            if io::inb(0x71) & 0x80 == 0 {
+                break;
+            }
+        }
+    }
+
+    let read_cmos = |reg: u8| -> u8 {
+        unsafe {
+            io::outb(0x70, reg);
+            io::inb(0x71)
+        }
+    };
+
+    let second = read_cmos(0x00);
+    let minute = read_cmos(0x02);
+    let hour = read_cmos(0x04);
+    let day = read_cmos(0x07);
+    let month = read_cmos(0x08);
+    let year = read_cmos(0x09);
+    let century = read_cmos(0x32);
+
+    // Check if BCD mode
+    let status_b = read_cmos(0x0B);
+    let is_bcd = (status_b & 0x04) == 0;
+
+    let convert = |val: u8| -> u8 {
+        if is_bcd {
+            (val & 0x0F) + ((val >> 4) * 10)
+        } else {
+            val
+        }
+    };
+
+    let second = convert(second);
+    let minute = convert(minute);
+    let hour = convert(hour);
+    let day = convert(day);
+    let month = convert(month);
+    let year = convert(year);
+    let century = if century > 0 { convert(century) } else { 20 };
+
+    let full_year = (century as u16) * 100 + (year as u16);
+
+    (full_year, month, day, hour, minute, second)
+}
+
+/// Extract the original TBS (To Be Signed) certificate bytes from raw DER
+///
+/// Certificate ::= SEQUENCE {
+///     tbsCertificate       TBSCertificate,
+///     signatureAlgorithm   AlgorithmIdentifier,
+///     signatureValue       BIT STRING
+/// }
+///
+/// We need to extract the first element of the outer SEQUENCE, preserving
+/// the original DER encoding exactly as it was signed.
+fn extract_tbs_bytes(cert_der: &[u8]) -> Result<&[u8], AuthError> {
+    // Certificate is a SEQUENCE
+    if cert_der.is_empty() || cert_der[0] != 0x30 {
+        return Err(AuthError::CertificateParseError);
+    }
+
+    // Parse the outer SEQUENCE length
+    let (outer_len, outer_len_bytes) = parse_der_length(&cert_der[1..])?;
+    let content_start = 1 + outer_len_bytes;
+
+    if content_start + outer_len > cert_der.len() {
+        return Err(AuthError::CertificateParseError);
+    }
+
+    let content = &cert_der[content_start..content_start + outer_len];
+
+    // The first element is the TBSCertificate (also a SEQUENCE)
+    if content.is_empty() || content[0] != 0x30 {
+        return Err(AuthError::CertificateParseError);
+    }
+
+    // Parse the TBS SEQUENCE length
+    let (tbs_len, tbs_len_bytes) = parse_der_length(&content[1..])?;
+    let tbs_total_len = 1 + tbs_len_bytes + tbs_len;
+
+    if tbs_total_len > content.len() {
+        return Err(AuthError::CertificateParseError);
+    }
+
+    // Return the complete TBS including tag and length
+    Ok(&content[..tbs_total_len])
 }
 
 // ============================================================================
@@ -337,6 +741,10 @@ fn parse_rsa_public_key_der(data: &[u8]) -> Result<RsaPublicKey, AuthError> {
     Ok(RsaPublicKey { modulus, exponent })
 }
 
+/// Maximum DER length we'll accept (64 MB)
+/// This prevents DoS attacks with maliciously crafted length fields
+const MAX_DER_LENGTH: usize = 64 * 1024 * 1024;
+
 /// Parse DER length encoding
 fn parse_der_length(data: &[u8]) -> Result<(usize, usize), AuthError> {
     if data.is_empty() {
@@ -360,6 +768,12 @@ fn parse_der_length(data: &[u8]) -> Result<(usize, usize), AuthError> {
         let mut length = 0usize;
         for i in 0..num_bytes {
             length = (length << 8) | (data[1 + i] as usize);
+        }
+
+        // Reject unreasonably large lengths to prevent DoS
+        if length > MAX_DER_LENGTH {
+            log::warn!("DER length {} exceeds maximum {}", length, MAX_DER_LENGTH);
+            return Err(AuthError::CertificateParseError);
         }
 
         Ok((length, 1 + num_bytes))
@@ -405,6 +819,10 @@ fn trim_der_trailing_bytes(data: &[u8]) -> Result<&[u8], AuthError> {
 // ============================================================================
 
 /// Verify an RSA signature using raw operations
+///
+/// CRITICAL: Uses the standard PKCS#1 v1.5 verification with proper algorithm
+/// identifier prefix to prevent algorithm substitution attacks. The signature
+/// must contain the correct DigestInfo structure including the SHA-256 OID.
 fn verify_rsa_signature_raw(
     public_key: &RsaPublicKey,
     signature: &[u8],
@@ -421,9 +839,10 @@ fn verify_rsa_signature_raw(
         AuthError::CryptoError
     })?;
 
-    // Create a verifying key for PKCS#1 v1.5 with SHA-256
-    // Use new_unprefixed to avoid OID requirements
-    let verifying_key = rsa::pkcs1v15::VerifyingKey::<Sha256>::new_unprefixed(rsa_key);
+    // CRITICAL FIX: Use `new()` instead of `new_unprefixed()` to require proper
+    // DigestInfo structure with SHA-256 OID. This prevents algorithm substitution
+    // attacks where an attacker could use a different hash algorithm.
+    let verifying_key = rsa::pkcs1v15::VerifyingKey::<Sha256>::new(rsa_key);
 
     // Parse the signature
     let sig = rsa::pkcs1v15::Signature::try_from(signature).map_err(|e| {

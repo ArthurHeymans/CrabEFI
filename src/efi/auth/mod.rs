@@ -258,6 +258,10 @@ pub enum AuthError {
     NoSuitableKey,
     /// Certificate parsing error
     CertificateParseError,
+    /// Certificate is not yet valid (current time < notBefore)
+    CertificateNotYetValid,
+    /// Certificate has expired (current time > notAfter)
+    CertificateExpired,
     /// Invalid variable name for authenticated variable
     InvalidVariableName,
     /// Access denied (wrong key database used)
@@ -282,6 +286,8 @@ impl From<AuthError> for r_efi::efi::Status {
             AuthError::SignatureVerificationFailed => r_efi::efi::Status::SECURITY_VIOLATION,
             AuthError::NoSuitableKey => r_efi::efi::Status::SECURITY_VIOLATION,
             AuthError::CertificateParseError => r_efi::efi::Status::INVALID_PARAMETER,
+            AuthError::CertificateNotYetValid => r_efi::efi::Status::SECURITY_VIOLATION,
+            AuthError::CertificateExpired => r_efi::efi::Status::SECURITY_VIOLATION,
             AuthError::InvalidVariableName => r_efi::efi::Status::INVALID_PARAMETER,
             AuthError::AccessDenied => r_efi::efi::Status::ACCESS_DENIED,
             AuthError::SecureBootDisabled => r_efi::efi::Status::SECURITY_VIOLATION,

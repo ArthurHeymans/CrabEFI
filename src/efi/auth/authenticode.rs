@@ -81,7 +81,10 @@ pub fn compute_authenticode_hash(pe_data: &[u8]) -> Result<[u8; 32], AuthError> 
     hasher.update(&pe_data[..info.checksum_offset]);
 
     // Skip checksum (4 bytes)
-    let after_checksum = info.checksum_offset + 4;
+    let after_checksum = info
+        .checksum_offset
+        .checked_add(4)
+        .ok_or(AuthError::InvalidHeader)?;
 
     // Region 2: From after checksum to certificate table entry (exclusive)
     if info.cert_table_entry_offset < after_checksum {
@@ -94,7 +97,10 @@ pub fn compute_authenticode_hash(pe_data: &[u8]) -> Result<[u8; 32], AuthError> 
         hasher.update(&pe_data[after_checksum..info.cert_table_entry_offset]);
 
         // Skip certificate table entry (8 bytes)
-        let after_cert_entry = info.cert_table_entry_offset + DATA_DIRECTORY_ENTRY_SIZE;
+        let after_cert_entry = info
+            .cert_table_entry_offset
+            .checked_add(DATA_DIRECTORY_ENTRY_SIZE)
+            .ok_or(AuthError::InvalidHeader)?;
 
         // Region 3: From after cert table entry to end of headers
         if after_cert_entry <= info.size_of_headers && info.size_of_headers <= pe_data.len() {
@@ -108,7 +114,9 @@ pub fn compute_authenticode_hash(pe_data: &[u8]) -> Result<[u8; 32], AuthError> 
 
     for section in &info.sections {
         let section_start = section.file_offset as usize;
-        let section_end = section_start + section.size_of_raw_data as usize;
+        let section_end = section_start
+            .checked_add(section.size_of_raw_data as usize)
+            .ok_or(AuthError::InvalidHeader)?;
 
         // Skip if section has no raw data
         if section.size_of_raw_data == 0 {
@@ -205,7 +213,9 @@ pub fn extract_authenticode_signature(
 
     // Certificate table is at a file offset (not RVA)
     let cert_offset = info.cert_table_rva as usize;
-    let cert_end = cert_offset + info.cert_table_size as usize;
+    let cert_end = cert_offset
+        .checked_add(info.cert_table_size as usize)
+        .ok_or(AuthError::InvalidHeader)?;
 
     if cert_end > pe_data.len() {
         log::warn!("Certificate table extends beyond file");
@@ -238,15 +248,18 @@ pub fn extract_authenticode_signature(
     }
 
     // Extract PKCS#7 data (after 8-byte header)
-    let pkcs7_start = cert_offset + 8;
+    let pkcs7_start = cert_offset.checked_add(8).ok_or(AuthError::InvalidHeader)?;
     let pkcs7_len = dw_length.saturating_sub(8);
+    let pkcs7_end = pkcs7_start
+        .checked_add(pkcs7_len)
+        .ok_or(AuthError::InvalidHeader)?;
 
-    if pkcs7_start + pkcs7_len > pe_data.len() {
+    if pkcs7_end > pe_data.len() {
         return Err(AuthError::InvalidHeader);
     }
 
     Ok(Some(AuthenticodeSignature {
-        pkcs7_data: &pe_data[pkcs7_start..pkcs7_start + pkcs7_len],
+        pkcs7_data: &pe_data[pkcs7_start..pkcs7_end],
     }))
 }
 

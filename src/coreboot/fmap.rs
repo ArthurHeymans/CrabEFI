@@ -226,13 +226,17 @@ fn parse_fmap_at(spi: &mut AnySpiController, offset: u32) -> Option<FmapInfo> {
     );
 
     // Read all area descriptors
-    let areas_size = nareas * FMAP_AREA_SIZE;
+    let Some(areas_size) = nareas.checked_mul(FMAP_AREA_SIZE) else {
+        log::warn!("FMAP areas size overflow");
+        return None;
+    };
     let mut areas_bytes = alloc::vec![0u8; areas_size];
 
-    if spi
-        .read(offset + FMAP_HEADER_SIZE as u32, &mut areas_bytes)
-        .is_err()
-    {
+    let Some(areas_offset) = offset.checked_add(FMAP_HEADER_SIZE as u32) else {
+        log::warn!("FMAP areas offset overflow");
+        return None;
+    };
+    if spi.read(areas_offset, &mut areas_bytes).is_err() {
         log::warn!("Failed to read FMAP areas");
         return None;
     }
