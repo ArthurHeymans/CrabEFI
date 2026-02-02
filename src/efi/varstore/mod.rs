@@ -47,10 +47,9 @@ pub use persistence::{
 
 // Re-export key items from deferred
 pub use deferred::{
-    check_pending as check_deferred_pending, configure_buffer as configure_deferred_buffer,
-    get_stats as get_deferred_stats, init_buffer as init_deferred_buffer,
-    process_pending as process_deferred_pending, DEFAULT_DEFERRED_BUFFER_BASE,
-    DEFERRED_BUFFER_SIZE,
+    DEFAULT_DEFERRED_BUFFER_BASE, DEFERRED_BUFFER_SIZE, check_pending as check_deferred_pending,
+    configure_buffer as configure_deferred_buffer, get_stats as get_deferred_stats,
+    init_buffer as init_deferred_buffer, process_pending as process_deferred_pending,
 };
 
 /// Store header magic value: "CRAB" in little-endian
@@ -463,8 +462,14 @@ impl VariableRecord {
                 if bytes.len() >= 8 {
                     log::debug!(
                         "postcard deserialize error at bytes: {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x}... err={:?}",
-                        bytes[0], bytes[1], bytes[2], bytes[3],
-                        bytes[4], bytes[5], bytes[6], bytes[7],
+                        bytes[0],
+                        bytes[1],
+                        bytes[2],
+                        bytes[3],
+                        bytes[4],
+                        bytes[5],
+                        bytes[6],
+                        bytes[7],
                         e
                     );
                 }

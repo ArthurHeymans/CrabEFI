@@ -16,7 +16,7 @@
 //! - `.cer` or `.der` - DER-encoded X.509 certificate
 
 use super::enrollment::{self, CRABEFI_OWNER_GUID};
-use super::{enter_user_mode, AuthError};
+use super::{AuthError, enter_user_mode};
 use crate::drivers::block::{AhciDisk, BlockDevice, NvmeDisk, SdhciDisk};
 use crate::fs::fat::FatFilesystem;
 use crate::fs::gpt;
@@ -94,10 +94,10 @@ fn search_nvme_devices() -> Option<KeyFileSearchResult> {
         && let Some(ns) = controller.default_namespace()
     {
         let nsid = ns.nsid;
-        
+
         if let Some(controller) = nvme::get_controller(0) {
             let mut disk = NvmeDisk::new(controller, nsid);
-            
+
             if let Some(result) = search_disk_for_keys(&mut disk, "NVMe") {
                 return Some(result);
             }
@@ -117,7 +117,7 @@ fn search_ahci_devices() -> Option<KeyFileSearchResult> {
         for port_index in 0..num_ports {
             if let Some(controller) = ahci::get_controller(0) {
                 let mut disk = AhciDisk::new(controller, port_index);
-                
+
                 if let Some(result) = search_disk_for_keys(&mut disk, "SATA") {
                     return Some(result);
                 }
@@ -140,7 +140,7 @@ fn search_sdhci_devices() -> Option<KeyFileSearchResult> {
 
             if let Some(controller) = sdhci::get_controller(controller_id) {
                 let mut disk = SdhciDisk::new(controller);
-                
+
                 if let Some(result) = search_disk_for_keys(&mut disk, "SD") {
                     return Some(result);
                 }
@@ -152,7 +152,10 @@ fn search_sdhci_devices() -> Option<KeyFileSearchResult> {
 }
 
 /// Search a disk for ESP partitions with key files
-fn search_disk_for_keys(disk: &mut dyn BlockDevice, source: &'static str) -> Option<KeyFileSearchResult> {
+fn search_disk_for_keys(
+    disk: &mut dyn BlockDevice,
+    source: &'static str,
+) -> Option<KeyFileSearchResult> {
     // Read GPT
     let header = gpt::read_gpt_header(disk).ok()?;
     let partitions = gpt::read_partitions(disk, &header).ok()?;
@@ -222,7 +225,11 @@ pub fn enroll_pk_from_file() -> Result<&'static str, AuthError> {
         AuthError::NoSuitableKey
     })?;
 
-    log::info!("Found PK certificate ({} bytes) on {}", pk_data.len(), result.source);
+    log::info!(
+        "Found PK certificate ({} bytes) on {}",
+        pk_data.len(),
+        result.source
+    );
 
     // Validate it's a valid X.509 certificate
     validate_certificate(&pk_data)?;

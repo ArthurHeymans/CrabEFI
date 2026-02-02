@@ -34,8 +34,11 @@ mod tags {
     pub const CB_TAG_FRAMEBUFFER: u32 = 0x0012;
     pub const CB_TAG_TIMESTAMPS: u32 = 0x0016;
     pub const CB_TAG_CBMEM_CONSOLE: u32 = 0x0017;
+    pub const CB_TAG_SPI_FLASH: u32 = 0x0029;
+    pub const CB_TAG_BOOT_MEDIA_PARAMS: u32 = 0x0030;
     pub const CB_TAG_CBMEM_ENTRY: u32 = 0x0031;
     pub const CB_TAG_SMMSTOREV2: u32 = 0x0039;
+    pub const CB_TAG_FMAP: u32 = 0x0037;
     pub const CB_TAG_ACPI_RSDP: u32 = 0x0043;
 }
 
@@ -186,6 +189,61 @@ struct CbSmmstorev2 {
     mmap_addr: u64,
 }
 
+/// Memory map window for translating between SPI flash and host address space
+#[repr(C, packed)]
+#[derive(FromBytes, Immutable, KnownLayout, Unaligned, Debug, Clone, Copy)]
+pub struct FlashMmapWindow {
+    /// Base address in SPI flash address space
+    pub flash_base: u32,
+    /// Base address in host/CPU address space
+    pub host_base: u32,
+    /// Size of the window in bytes
+    pub size: u32,
+}
+
+/// SPI flash information record
+///
+/// Contains information about the system's SPI flash chip.
+/// Reference: coreboot/src/commonlib/include/commonlib/coreboot_tables.h
+#[repr(C, packed)]
+#[derive(FromBytes, Immutable, KnownLayout, Unaligned)]
+struct CbSpiFlash {
+    tag: u32,
+    size: u32,
+    /// Total flash size in bytes
+    flash_size: u32,
+    /// Sector (erase block) size in bytes
+    sector_size: u32,
+    /// Erase command opcode
+    erase_cmd: u8,
+    /// Flags (bit 0: in 4-byte address mode)
+    flags: u8,
+    /// Reserved
+    reserved: u16,
+    /// Number of memory map windows
+    mmap_count: u32,
+    // Followed by mmap_count FlashMmapWindow entries
+}
+
+/// Boot media parameters record
+///
+/// Contains information about the boot media layout including FMAP location.
+/// Reference: coreboot/src/commonlib/include/commonlib/coreboot_tables.h
+#[repr(C, packed)]
+#[derive(FromBytes, Immutable, KnownLayout, Unaligned)]
+struct CbBootMediaParams {
+    tag: u32,
+    size: u32,
+    /// Offset of FMAP in boot media (relative to start)
+    fmap_offset: u64,
+    /// Offset of CBFS in boot media
+    cbfs_offset: u64,
+    /// Size of CBFS region
+    cbfs_size: u64,
+    /// Total size of boot media
+    boot_media_size: u64,
+}
+
 /// Serial port information
 #[derive(Debug, Clone)]
 pub struct SerialInfo {
@@ -216,6 +274,39 @@ pub struct Smmstorev2Info {
     pub apm_cmd: u8,
 }
 
+/// Maximum number of flash memory map windows
+pub const MAX_FLASH_MMAP_WINDOWS: usize = 4;
+
+/// SPI flash information
+///
+/// Contains information about the system's SPI flash from coreboot tables.
+#[derive(Debug, Clone)]
+pub struct SpiFlashInfo {
+    /// Total flash size in bytes
+    pub flash_size: u32,
+    /// Sector (erase block) size in bytes
+    pub sector_size: u32,
+    /// Erase command opcode
+    pub erase_cmd: u8,
+    /// Memory map windows for address translation
+    pub mmap_windows: heapless::Vec<FlashMmapWindow, MAX_FLASH_MMAP_WINDOWS>,
+}
+
+/// Boot media parameters
+///
+/// Contains information about the boot media layout from coreboot tables.
+#[derive(Debug, Clone)]
+pub struct BootMediaInfo {
+    /// Offset of FMAP in boot media (relative to start of flash)
+    pub fmap_offset: u64,
+    /// Offset of CBFS in boot media
+    pub cbfs_offset: u64,
+    /// Size of CBFS region
+    pub cbfs_size: u64,
+    /// Total size of boot media
+    pub boot_media_size: u64,
+}
+
 /// Information extracted from coreboot tables
 pub struct CorebootInfo {
     /// Memory map
@@ -234,6 +325,10 @@ pub struct CorebootInfo {
     pub smbios: Option<u64>,
     /// SMMSTORE v2 information for UEFI variable storage
     pub smmstorev2: Option<Smmstorev2Info>,
+    /// SPI flash information
+    pub spi_flash: Option<SpiFlashInfo>,
+    /// Boot media parameters (includes FMAP location)
+    pub boot_media: Option<BootMediaInfo>,
 }
 
 impl CorebootInfo {
@@ -247,6 +342,8 @@ impl CorebootInfo {
             cbmem_console: None,
             smbios: None,
             smmstorev2: None,
+            spi_flash: None,
+            boot_media: None,
         }
     }
 }
@@ -481,6 +578,12 @@ fn parse_record(record_bytes: &[u8], info: &mut CorebootInfo) {
         }
         tags::CB_TAG_SMMSTOREV2 => {
             parse_smmstorev2(record_bytes, info);
+        }
+        tags::CB_TAG_SPI_FLASH => {
+            parse_spi_flash(record_bytes, info);
+        }
+        tags::CB_TAG_BOOT_MEDIA_PARAMS => {
+            parse_boot_media_params(record_bytes, info);
         }
         tags::CB_TAG_VERSION => {
             // Version string follows the 8-byte record header
@@ -819,4 +922,99 @@ fn parse_smmstorev2(record_bytes: &[u8], info: &mut CorebootInfo) {
         com_buffer_size,
         apm_cmd
     );
+}
+
+/// Parse SPI flash information
+///
+/// This function is safe - it uses zerocopy to parse the SPI flash struct.
+fn parse_spi_flash(record_bytes: &[u8], info: &mut CorebootInfo) {
+    let Ok((spi_flash, _)) = CbSpiFlash::read_from_prefix(record_bytes) else {
+        log::warn!("Failed to parse SPI flash record");
+        return;
+    };
+
+    // Copy packed fields to local variables
+    let flash_size = spi_flash.flash_size;
+    let sector_size = spi_flash.sector_size;
+    let erase_cmd = spi_flash.erase_cmd;
+    let mmap_count = spi_flash.mmap_count as usize;
+
+    log::info!(
+        "SPI flash: {} MB, sector size {} KB, {} mmap windows",
+        flash_size / (1024 * 1024),
+        sector_size / 1024,
+        mmap_count
+    );
+
+    // Parse memory map windows
+    let mut mmap_windows = heapless::Vec::new();
+
+    if mmap_count > 0 && record_bytes.len() > core::mem::size_of::<CbSpiFlash>() {
+        let windows_data = &record_bytes[core::mem::size_of::<CbSpiFlash>()..];
+        let mut remaining = windows_data;
+
+        for i in 0..mmap_count.min(MAX_FLASH_MMAP_WINDOWS) {
+            let Ok((window, rest)) = FlashMmapWindow::read_from_prefix(remaining) else {
+                break;
+            };
+
+            // Copy packed fields
+            let flash_base = window.flash_base;
+            let host_base = window.host_base;
+            let win_size = window.size;
+
+            log::debug!(
+                "  mmap window {}: flash {:#x} -> host {:#x}, size {} MB",
+                i,
+                flash_base,
+                host_base,
+                win_size / (1024 * 1024)
+            );
+
+            let _ = mmap_windows.push(FlashMmapWindow {
+                flash_base,
+                host_base,
+                size: win_size,
+            });
+            remaining = rest;
+        }
+    }
+
+    info.spi_flash = Some(SpiFlashInfo {
+        flash_size,
+        sector_size,
+        erase_cmd,
+        mmap_windows,
+    });
+}
+
+/// Parse boot media parameters
+///
+/// This function is safe - it uses zerocopy to parse the boot media params struct.
+fn parse_boot_media_params(record_bytes: &[u8], info: &mut CorebootInfo) {
+    let Ok((params, _)) = CbBootMediaParams::read_from_prefix(record_bytes) else {
+        log::warn!("Failed to parse boot media params record");
+        return;
+    };
+
+    // Copy packed fields to local variables
+    let fmap_offset = params.fmap_offset;
+    let cbfs_offset = params.cbfs_offset;
+    let cbfs_size = params.cbfs_size;
+    let boot_media_size = params.boot_media_size;
+
+    log::info!(
+        "Boot media: {} MB, FMAP at {:#x}, CBFS at {:#x} ({} MB)",
+        boot_media_size / (1024 * 1024),
+        fmap_offset,
+        cbfs_offset,
+        cbfs_size / (1024 * 1024)
+    );
+
+    info.boot_media = Some(BootMediaInfo {
+        fmap_offset,
+        cbfs_offset,
+        cbfs_size,
+        boot_media_size,
+    });
 }

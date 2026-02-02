@@ -51,7 +51,7 @@
 
 use core::sync::atomic::{AtomicBool, Ordering};
 
-use super::{crc32, VarStoreError, VariableRecord};
+use super::{VarStoreError, VariableRecord, crc32};
 use crate::efi::auth;
 
 /// Magic value for the deferred buffer header: "CVBF" (CrabVariable Buffer)

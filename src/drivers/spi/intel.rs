@@ -20,7 +20,7 @@
 
 use super::intel_chipsets::IchChipset;
 use super::regs::*;
-use super::{delay_us, Result, SpiController, SpiError, SpiMode};
+use super::{Result, SpiController, SpiError, SpiMode, delay_us};
 use crate::drivers::mmio::MmioRegion;
 use crate::drivers::pci::{self, PciAddress, PciDevice};
 

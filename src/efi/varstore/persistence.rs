@@ -22,7 +22,7 @@ use crate::coreboot;
 use crate::drivers::spi::{self, AnySpiController, SpiController};
 use crate::state::{self, MAX_VARIABLE_DATA_SIZE, MAX_VARIABLE_NAME_LEN};
 
-use super::{StoreHeader, VarStoreError, VariableRecord, STORE_HEADER_SIZE};
+use super::{STORE_HEADER_SIZE, StoreHeader, VarStoreError, VariableRecord};
 
 /// Default SMMSTORE base address in SPI flash
 /// This is typically at the end of the flash region
@@ -55,47 +55,16 @@ struct SmmstoreConfig {
 /// Initialize the variable store persistence layer
 ///
 /// This should be called early in boot to:
-/// 1. Check for SMMSTORE v2 configuration from coreboot tables
-/// 2. Detect and initialize the SPI controller
-/// 3. Read existing variables from SMMSTORE
-/// 4. Load them into the in-memory variable cache
+/// 1. Detect and initialize the SPI controller
+/// 2. Check for SMMSTORE v2 configuration from coreboot tables
+/// 3. If not available, try to find SMMSTORE from FMAP in SPI flash
+/// 4. Read existing variables from SMMSTORE
+/// 5. Load them into the in-memory variable cache
 pub fn init() -> Result<(), VarStoreError> {
     log::info!("Initializing variable store persistence...");
 
-    // Check for SMMSTORE v2 info from coreboot tables
-    if let Some(smmstore_info) = coreboot::get_smmstorev2() {
-        log::info!(
-            "Using SMMSTORE v2 from coreboot: {} blocks x {} KB at {:#x}",
-            smmstore_info.num_blocks,
-            smmstore_info.block_size / 1024,
-            smmstore_info.mmap_addr
-        );
-
-        // Update the SMMSTORE configuration with values from coreboot
-        {
-            let mut config = SMMSTORE_CONFIG.lock();
-            // The mmap_addr is the memory-mapped address for read-only access
-            // For SPI flash writes, we need to convert to the flash offset
-            // The mmap_addr is typically in the 0xFF... range (memory-mapped SPI)
-            // We'll calculate the actual base address based on the memory map
-            config.base_addr = calculate_spi_offset(smmstore_info.mmap_addr);
-            config.size = smmstore_info.num_blocks * smmstore_info.block_size;
-            log::info!(
-                "SMMSTORE: base={:#x}, size={} KB",
-                config.base_addr,
-                config.size / 1024
-            );
-        }
-    } else {
-        log::info!(
-            "No SMMSTORE v2 in coreboot tables, using defaults: base={:#x}, size={} KB",
-            DEFAULT_SMMSTORE_BASE,
-            DEFAULT_SMMSTORE_SIZE / 1024
-        );
-    }
-
-    // Detect SPI controller
-    let controller = match spi::detect_and_init() {
+    // Detect SPI controller first (we need it for FMAP parsing)
+    let mut controller = match spi::detect_and_init() {
         Some(c) => c,
         None => {
             log::warn!("No SPI controller found - variables will not be persistent");
@@ -104,6 +73,22 @@ pub fn init() -> Result<(), VarStoreError> {
     };
 
     log::info!("SPI controller: {}", controller.name());
+
+    // Try to get SMMSTORE configuration from multiple sources:
+    // 1. Coreboot tables (SMMSTORE v2 record)
+    // 2. FMAP in SPI flash
+    // 3. Fall back to defaults
+    let smmstore_configured =
+        configure_smmstore_from_coreboot() || configure_smmstore_from_fmap(&mut controller);
+
+    if !smmstore_configured {
+        // DANGER: Using default SMMSTORE base (0xF00000) without verification
+        // could overwrite boot code on small flash chips!
+        // For safety, we disable persistence if we can't find SMMSTORE info.
+        log::warn!("No SMMSTORE info found in coreboot tables or FMAP - persistence DISABLED");
+        log::warn!("Variables will be lost on reboot. Add SMMSTORE region to your FMAP.");
+        return Err(VarStoreError::NotInitialized);
+    }
 
     // Store the controller globally
     {
@@ -119,6 +104,75 @@ pub fn init() -> Result<(), VarStoreError> {
 
     log::info!("Variable store persistence initialized");
     Ok(())
+}
+
+/// Try to configure SMMSTORE from coreboot tables (SMMSTORE v2 record)
+///
+/// Returns true if configuration was found and applied.
+fn configure_smmstore_from_coreboot() -> bool {
+    if let Some(smmstore_info) = coreboot::get_smmstorev2() {
+        log::info!(
+            "Using SMMSTORE v2 from coreboot tables: {} blocks x {} KB at {:#x}",
+            smmstore_info.num_blocks,
+            smmstore_info.block_size / 1024,
+            smmstore_info.mmap_addr
+        );
+
+        // Update the SMMSTORE configuration with values from coreboot
+        let mut config = SMMSTORE_CONFIG.lock();
+        // The mmap_addr is the memory-mapped address for read-only access
+        // For SPI flash writes, we need to convert to the flash offset
+        // The mmap_addr is typically in the 0xFF... range (memory-mapped SPI)
+        // We'll calculate the actual base address based on the memory map
+        config.base_addr = calculate_spi_offset(smmstore_info.mmap_addr);
+        config.size = smmstore_info.num_blocks * smmstore_info.block_size;
+        log::info!(
+            "SMMSTORE configured from coreboot: base={:#x}, size={} KB",
+            config.base_addr,
+            config.size / 1024
+        );
+        return true;
+    }
+
+    log::debug!("No SMMSTORE v2 record in coreboot tables");
+    false
+}
+
+/// Try to configure SMMSTORE from FMAP in SPI flash
+///
+/// This is a fallback when coreboot tables don't provide SMMSTORE v2 info.
+/// We read the FMAP structure from flash (probing at common offsets if needed)
+/// and look for the SMMSTORE region.
+///
+/// Returns true if configuration was found and applied.
+fn configure_smmstore_from_fmap(spi: &mut spi::AnySpiController) -> bool {
+    use crate::coreboot::fmap;
+
+    log::info!("Looking for SMMSTORE in FMAP...");
+
+    // Read FMAP from flash (uses boot_media_params if available, otherwise probes)
+    if let Some(smmstore_info) = fmap::get_smmstore_from_fmap(spi) {
+        log::info!(
+            "Found SMMSTORE '{}' from FMAP: offset={:#x}, size={} KB",
+            smmstore_info.name.as_str(),
+            smmstore_info.offset,
+            smmstore_info.size / 1024
+        );
+
+        // Update the SMMSTORE configuration
+        let mut config = SMMSTORE_CONFIG.lock();
+        config.base_addr = smmstore_info.offset;
+        config.size = smmstore_info.size;
+        log::info!(
+            "SMMSTORE configured from FMAP: base={:#x}, size={} KB",
+            config.base_addr,
+            config.size / 1024
+        );
+        return true;
+    }
+
+    log::debug!("SMMSTORE not found in FMAP (boot media params may not be available)");
+    false
 }
 
 /// Calculate SPI flash offset from memory-mapped address
@@ -165,10 +219,22 @@ fn init_smmstore() -> Result<(), VarStoreError> {
     // Log raw header bytes for debugging
     log::debug!(
         "SMMSTORE header bytes: {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x}",
-        header_bytes[0], header_bytes[1], header_bytes[2], header_bytes[3],
-        header_bytes[4], header_bytes[5], header_bytes[6], header_bytes[7],
-        header_bytes[8], header_bytes[9], header_bytes[10], header_bytes[11],
-        header_bytes[12], header_bytes[13], header_bytes[14], header_bytes[15]
+        header_bytes[0],
+        header_bytes[1],
+        header_bytes[2],
+        header_bytes[3],
+        header_bytes[4],
+        header_bytes[5],
+        header_bytes[6],
+        header_bytes[7],
+        header_bytes[8],
+        header_bytes[9],
+        header_bytes[10],
+        header_bytes[11],
+        header_bytes[12],
+        header_bytes[13],
+        header_bytes[14],
+        header_bytes[15]
     );
 
     // Check if the header is valid

@@ -15,10 +15,10 @@
 //! - Microsoft PE Authenticode specification
 //! - UEFI Specification Section 32 (Secure Boot)
 
+use super::AuthError;
 use super::crypto::verify_pkcs7_signature;
 use super::signature::{is_certificate_forbidden, is_hash_allowed, is_hash_forbidden};
 use super::variables::db_database;
-use super::AuthError;
 use alloc::vec::Vec;
 use sha2::{Digest, Sha256};
 

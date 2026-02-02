@@ -5,7 +5,7 @@
 
 use crate::arch::x86_64::io;
 use crate::efi::auth;
-use crate::state::{self, MAX_VARIABLES, MAX_VARIABLE_DATA_SIZE, MAX_VARIABLE_NAME_LEN};
+use crate::state::{self, MAX_VARIABLE_DATA_SIZE, MAX_VARIABLE_NAME_LEN, MAX_VARIABLES};
 use alloc::vec::Vec;
 use core::ffi::c_void;
 use r_efi::efi::{

@@ -14,7 +14,6 @@
 // Enable alloc crate for heap allocations (needed for RustCrypto)
 extern crate alloc;
 
-pub mod heap;
 pub mod arch;
 pub mod coreboot;
 pub mod drivers;
@@ -23,6 +22,7 @@ pub mod efi;
 pub mod fb_log;
 pub mod framebuffer_console;
 pub mod fs;
+pub mod heap;
 pub mod logger;
 pub mod menu;
 pub mod pe;
@@ -106,6 +106,16 @@ pub fn init(coreboot_table_ptr: u64) {
     // Store SMMSTORE v2 info globally for variable persistence
     if let Some(ref smmstore) = cb_info.smmstorev2 {
         coreboot::store_smmstorev2(smmstore.clone());
+    }
+
+    // Store SPI flash info globally (used for FMAP parsing)
+    if let Some(ref spi_flash) = cb_info.spi_flash {
+        coreboot::store_spi_flash(spi_flash.clone());
+    }
+
+    // Store boot media info globally (contains FMAP offset)
+    if let Some(ref boot_media) = cb_info.boot_media {
+        coreboot::store_boot_media(boot_media.clone());
     }
 
     // Initialize serial port from coreboot info (if available)
@@ -224,7 +234,6 @@ pub fn init(coreboot_table_ptr: u64) {
                 );
             }
         });
-
     }
 
     // Initialize variable store persistence (loads variables from SPI flash)

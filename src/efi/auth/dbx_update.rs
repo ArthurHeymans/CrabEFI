@@ -28,7 +28,7 @@
 //! }
 //! ```
 
-use super::variables::{dbx_database, KeyDatabaseEntry};
+use super::variables::{KeyDatabaseEntry, dbx_database};
 use super::{AuthError, EFI_CERT_SHA256_GUID, EFI_CERT_X509_GUID};
 use crate::drivers::block::{AhciDisk, BlockDevice, NvmeDisk, SdhciDisk};
 use crate::fs::fat::FatFilesystem;
@@ -152,7 +152,10 @@ fn search_sdhci_for_dbx() -> Option<(Vec<u8>, &'static str)> {
 }
 
 /// Search a disk for ESP partitions with dbx files
-fn search_disk_for_dbx(disk: &mut dyn BlockDevice, source: &'static str) -> Option<(Vec<u8>, &'static str)> {
+fn search_disk_for_dbx(
+    disk: &mut dyn BlockDevice,
+    source: &'static str,
+) -> Option<(Vec<u8>, &'static str)> {
     // Read GPT
     let header = gpt::read_gpt_header(disk).ok()?;
     let partitions = gpt::read_partitions(disk, &header).ok()?;
@@ -232,7 +235,10 @@ pub fn enroll_dbx_from_file() -> Result<DbxEnrollmentResult, AuthError> {
 /// Apply a dbx update from raw signature list data
 ///
 /// The data should be in EFI_SIGNATURE_LIST format (one or more lists).
-pub fn apply_dbx_update(data: &[u8], source: &'static str) -> Result<DbxEnrollmentResult, AuthError> {
+pub fn apply_dbx_update(
+    data: &[u8],
+    source: &'static str,
+) -> Result<DbxEnrollmentResult, AuthError> {
     use super::structures::{SignatureIterator, SignatureListIterator};
 
     let mut sha256_count = 0usize;
@@ -301,7 +307,11 @@ pub fn apply_dbx_update(data: &[u8], source: &'static str) -> Result<DbxEnrollme
 }
 
 /// Check if an entry already exists in the dbx database
-fn entry_exists_in_dbx(dbx: &spin::MutexGuard<'_, super::variables::KeyDatabase>, cert_type: &[u8; 16], data: &[u8]) -> bool {
+fn entry_exists_in_dbx(
+    dbx: &spin::MutexGuard<'_, super::variables::KeyDatabase>,
+    cert_type: &[u8; 16],
+    data: &[u8],
+) -> bool {
     let sha256_guid = guid_to_bytes(&EFI_CERT_SHA256_GUID);
     let x509_guid = guid_to_bytes(&EFI_CERT_X509_GUID);
 

@@ -22,15 +22,15 @@
 
 use super::enrollment::{self, EnrollmentStatus};
 use super::variables::{
-    db_database, dbx_database, kek_database, pk_database, SecureBootVariable, DBX_NAME, DB_NAME,
-    KEK_NAME, PK_NAME, SECURE_BOOT_NAME, SETUP_MODE_NAME,
+    DB_NAME, DBX_NAME, KEK_NAME, PK_NAME, SECURE_BOOT_NAME, SETUP_MODE_NAME, SecureBootVariable,
+    db_database, dbx_database, kek_database, pk_database,
 };
 use super::{
-    enter_setup_mode, enter_user_mode, is_setup_mode, AuthError, EFI_GLOBAL_VARIABLE_GUID,
-    EFI_IMAGE_SECURITY_DATABASE_GUID,
+    AuthError, EFI_GLOBAL_VARIABLE_GUID, EFI_IMAGE_SECURITY_DATABASE_GUID, enter_setup_mode,
+    enter_user_mode, is_setup_mode,
 };
 use crate::efi::varstore::{
-    get_variable_timestamp, persist_variable_with_timestamp, VarStoreError,
+    VarStoreError, get_variable_timestamp, persist_variable_with_timestamp,
 };
 use crate::state::{self, MAX_VARIABLE_DATA_SIZE, MAX_VARIABLE_NAME_LEN};
 use alloc::vec::Vec;
@@ -130,8 +130,8 @@ pub fn init_secure_boot(config: &SecureBootConfig) -> Result<EnrollmentStatus, A
 ///
 /// Returns true if Secure Boot was previously enabled by the user.
 fn load_secure_boot_enable_preference() -> bool {
-    use super::variables::SECURE_BOOT_ENABLE_NAME;
     use super::EFI_GLOBAL_VARIABLE_GUID;
+    use super::variables::SECURE_BOOT_ENABLE_NAME;
 
     if let Some(data) = get_variable_data(&EFI_GLOBAL_VARIABLE_GUID, SECURE_BOOT_ENABLE_NAME) {
         if !data.is_empty() && data[0] == 1 {

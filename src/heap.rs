@@ -155,7 +155,7 @@ static ALLOCATOR: BumpAllocator = BumpAllocator::new();
 ///
 /// `true` if initialization succeeded, `false` otherwise.
 pub fn init() -> bool {
-    use crate::efi::allocator::{allocate_pages, AllocateType, MemoryType};
+    use crate::efi::allocator::{AllocateType, MemoryType, allocate_pages};
     use r_efi::efi::Status;
 
     // Allocate heap pages from the EFI allocator
