@@ -33,6 +33,9 @@ use super::xhci_regs::{
     // PORTSC register bits
     PORTSC_CHANGE_MASK,
     PORTSC_PED,
+    PORTSC_PLS_MASK,
+    PORTSC_PLS_RXDETECT,
+    PORTSC_PLS_U0,
     PORTSC_PR,
     PORTSC_PRC,
     PORTSC_SPEED_MASK,
@@ -978,8 +981,9 @@ impl XhciController {
                 continue;
             }
 
-            // Get speed
+            // Get speed and link state
             let speed = ((portsc & PORTSC_SPEED_MASK) >> 10) as u8;
+            let pls = portsc & PORTSC_PLS_MASK;
             let speed_name = match speed {
                 1 => "Full",
                 2 => "Low",
@@ -987,10 +991,51 @@ impl XhciController {
                 4 => "Super",
                 _ => "Unknown",
             };
+            let pls_name = match pls >> 5 {
+                0 => "U0",
+                5 => "RxDetect",
+                7 => "Polling",
+                _ => "Other",
+            };
 
-            log::info!("USB device on port {}: {} speed", port, speed_name);
+            log::info!(
+                "USB device on port {}: {} speed, PLS={}",
+                port,
+                speed_name,
+                pls_name
+            );
+
+            // If port shows connected but link isn't up (U0), it might be a phantom
+            // device like a Thunderbolt controller internal port. Give it a brief
+            // chance to train, then skip if link still isn't up.
+            if pls != PORTSC_PLS_U0 && portsc & PORTSC_PED == 0 {
+                // Wait briefly for link training (up to 50ms)
+                let timeout = Timeout::from_ms(50);
+                let mut link_up = false;
+                while !timeout.is_expired() {
+                    let portsc = self.read_port_reg(port, PORT_PORTSC);
+                    if portsc & PORTSC_PLS_MASK == PORTSC_PLS_U0 {
+                        link_up = true;
+                        break;
+                    }
+                    // If link went to RxDetect, device isn't really there
+                    if portsc & PORTSC_PLS_MASK == PORTSC_PLS_RXDETECT {
+                        break;
+                    }
+                    core::hint::spin_loop();
+                }
+                if !link_up {
+                    log::debug!(
+                        "Port {}: link not up (PLS={}), skipping",
+                        port,
+                        (self.read_port_reg(port, PORT_PORTSC) & PORTSC_PLS_MASK) >> 5
+                    );
+                    continue;
+                }
+            }
 
             // Clear status change bits
+            let portsc = self.read_port_reg(port, PORT_PORTSC);
             self.write_port_reg(port, PORT_PORTSC, portsc | PORTSC_CHANGE_MASK);
 
             // Reset the port if needed
@@ -1007,6 +1052,17 @@ impl XhciController {
                         break;
                     }
                     core::hint::spin_loop();
+                }
+
+                // After reset, verify link is actually up
+                let portsc = self.read_port_reg(port, PORT_PORTSC);
+                if portsc & PORTSC_PLS_MASK != PORTSC_PLS_U0 {
+                    log::debug!(
+                        "Port {}: link not up after reset (PLS={}), skipping",
+                        port,
+                        (portsc & PORTSC_PLS_MASK) >> 5
+                    );
+                    continue;
                 }
             }
 

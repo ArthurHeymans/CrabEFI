@@ -515,5 +515,13 @@ pub const PORTSC_PR: u32 = 1 << 4;
 pub const PORTSC_PP: u32 = 1 << 9;
 /// Port Speed Mask (bits 10-13)
 pub const PORTSC_SPEED_MASK: u32 = 0xF << 10;
+/// Port Link State Mask (bits 5-8)
+pub const PORTSC_PLS_MASK: u32 = 0xF << 5;
+/// Port Link State: U0 (link is up and operational)
+pub const PORTSC_PLS_U0: u32 = 0 << 5;
+/// Port Link State: RxDetect (looking for device, not connected)
+pub const PORTSC_PLS_RXDETECT: u32 = 5 << 5;
+/// Port Link State: Polling (link training in progress)
+pub const PORTSC_PLS_POLLING: u32 = 7 << 5;
 /// Port Reset Change
 pub const PORTSC_PRC: u32 = 1 << 21;
