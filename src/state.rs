@@ -139,7 +139,11 @@ pub fn try_get() -> Option<&'static FirmwareState> {
 #[inline]
 pub fn try_get_mut_ptr() -> Option<*mut FirmwareState> {
     let ptr = STATE_PTR.load(Ordering::Acquire);
-    if ptr.is_null() { None } else { Some(ptr) }
+    if ptr.is_null() {
+        None
+    } else {
+        Some(ptr)
+    }
 }
 
 // ============================================================================
@@ -483,6 +487,9 @@ pub const MAX_STORAGE_CONTROLLERS: usize = 4;
 /// Maximum number of storage devices in registry
 pub const MAX_STORAGE_DEVICES: usize = 16;
 
+/// Maximum number of memory regions we can store
+pub const MAX_MEMORY_REGIONS: usize = 64;
+
 /// Hardware driver state
 pub struct DriverState {
     /// PCI device list
@@ -521,6 +528,12 @@ pub struct DriverState {
     /// The storage handles offset translation so reads/writes are
     /// relative to the variable store region.
     pub storage: Option<crate::efi::varstore::SpiStorageBackend>,
+
+    /// Coreboot memory regions (for direct Linux boot)
+    pub memory_regions: HeaplessVec<crate::coreboot::memory::MemoryRegion, MAX_MEMORY_REGIONS>,
+
+    /// ACPI RSDP address (from coreboot)
+    pub acpi_rsdp: Option<u64>,
 }
 
 impl DriverState {
@@ -535,6 +548,8 @@ impl DriverState {
             spi_flash: None,
             boot_media: None,
             storage: None,
+            memory_regions: HeaplessVec::new(),
+            acpi_rsdp: None,
         }
     }
 }

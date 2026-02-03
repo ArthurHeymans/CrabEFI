@@ -198,6 +198,179 @@ const ATTR_VOLUME_ID: u8 = 0x08;
 const ATTR_DIRECTORY: u8 = 0x10;
 const ATTR_LFN: u8 = ATTR_READ_ONLY | ATTR_HIDDEN | ATTR_SYSTEM | ATTR_VOLUME_ID;
 
+/// Maximum length of a long filename we support (255 chars as per VFAT spec)
+const MAX_LFN_LENGTH: usize = 255;
+
+/// Long File Name (LFN) entry structure
+///
+/// LFN entries store up to 13 UTF-16 characters each and precede the 8.3 entry.
+/// They are stored in reverse order (last part first).
+#[derive(Clone, Copy)]
+#[repr(C, packed)]
+struct LfnEntry {
+    /// Sequence number (0x40 | n for last, n for others)
+    seq: u8,
+    /// Characters 1-5 (UTF-16LE)
+    name1: [u8; 10],
+    /// Attributes (always 0x0F)
+    attr: u8,
+    /// Type (always 0x00)
+    entry_type: u8,
+    /// Checksum of 8.3 name
+    checksum: u8,
+    /// Characters 6-11 (UTF-16LE)
+    name2: [u8; 12],
+    /// First cluster (always 0)
+    first_cluster: u16,
+    /// Characters 12-13 (UTF-16LE)
+    name3: [u8; 4],
+}
+
+impl LfnEntry {
+    /// Check if this is the last (first encountered) LFN entry
+    fn is_last(&self) -> bool {
+        (self.seq & 0x40) != 0
+    }
+
+    /// Get the sequence number (1-based, without the last flag)
+    fn sequence_number(&self) -> u8 {
+        self.seq & 0x1F
+    }
+
+    /// Extract the 13 UTF-16 characters from this entry into a buffer
+    /// Returns the number of valid characters (may be less than 13 if null-terminated)
+    fn extract_chars(&self, out: &mut [u16; 13]) -> usize {
+        let mut count = 0;
+
+        // Characters 1-5 from name1
+        for i in 0..5 {
+            let ch = u16::from_le_bytes([self.name1[i * 2], self.name1[i * 2 + 1]]);
+            if ch == 0x0000 || ch == 0xFFFF {
+                return count;
+            }
+            out[count] = ch;
+            count += 1;
+        }
+
+        // Characters 6-11 from name2
+        for i in 0..6 {
+            let ch = u16::from_le_bytes([self.name2[i * 2], self.name2[i * 2 + 1]]);
+            if ch == 0x0000 || ch == 0xFFFF {
+                return count;
+            }
+            out[count] = ch;
+            count += 1;
+        }
+
+        // Characters 12-13 from name3
+        for i in 0..2 {
+            let ch = u16::from_le_bytes([self.name3[i * 2], self.name3[i * 2 + 1]]);
+            if ch == 0x0000 || ch == 0xFFFF {
+                return count;
+            }
+            out[count] = ch;
+            count += 1;
+        }
+
+        count
+    }
+}
+
+/// Buffer for accumulating Long File Name characters
+struct LfnBuffer {
+    /// UTF-16 characters (stored in correct order after reconstruction)
+    chars: [u16; MAX_LFN_LENGTH],
+    /// Number of valid characters
+    len: usize,
+    /// Whether we're currently collecting an LFN
+    active: bool,
+    /// Expected next sequence number
+    expected_seq: u8,
+}
+
+impl LfnBuffer {
+    const fn new() -> Self {
+        Self {
+            chars: [0; MAX_LFN_LENGTH],
+            len: 0,
+            active: false,
+            expected_seq: 0,
+        }
+    }
+
+    /// Reset the buffer
+    fn reset(&mut self) {
+        self.len = 0;
+        self.active = false;
+        self.expected_seq = 0;
+    }
+
+    /// Process an LFN entry
+    fn process_lfn(&mut self, entry: &LfnEntry) {
+        let seq = entry.sequence_number();
+
+        if entry.is_last() {
+            // Start of a new LFN sequence (entries are in reverse order)
+            self.reset();
+            self.active = true;
+            self.expected_seq = seq;
+        } else if !self.active || seq != self.expected_seq - 1 {
+            // Sequence broken, reset
+            self.reset();
+            return;
+        }
+
+        self.expected_seq = seq;
+
+        // Extract characters from this entry
+        let mut chars = [0u16; 13];
+        let char_count = entry.extract_chars(&mut chars);
+
+        // Calculate position in final string (seq is 1-based)
+        let start_pos = (seq as usize - 1) * 13;
+        let end_pos = start_pos + char_count;
+
+        if end_pos <= MAX_LFN_LENGTH {
+            self.chars[start_pos..end_pos].copy_from_slice(&chars[..char_count]);
+            if end_pos > self.len {
+                self.len = end_pos;
+            }
+        }
+    }
+
+    /// Check if the accumulated LFN matches a name (case-insensitive)
+    fn matches(&self, name: &str) -> bool {
+        if !self.active || self.len == 0 {
+            return false;
+        }
+
+        // Compare UTF-16 LFN with UTF-8 name (case-insensitive)
+        let mut lfn_idx = 0;
+        for ch in name.chars() {
+            if lfn_idx >= self.len {
+                return false;
+            }
+
+            let lfn_ch = self.chars[lfn_idx];
+            // Simple ASCII case-insensitive comparison
+            // For full Unicode support, we'd need more complex normalization
+            let matches = if lfn_ch < 128 && ch.is_ascii() {
+                (lfn_ch as u8 as char).eq_ignore_ascii_case(&ch)
+            } else {
+                lfn_ch == ch as u16
+            };
+
+            if !matches {
+                return false;
+            }
+            lfn_idx += 1;
+        }
+
+        // Check that we consumed the entire LFN
+        lfn_idx == self.len
+    }
+}
+
 /// FAT filesystem type
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FatType {
@@ -259,6 +432,10 @@ pub struct FatFilesystem<'a> {
     /// Total data clusters (kept for filesystem completeness)
     #[allow(dead_code)]
     data_clusters: u32,
+    /// Cached FAT block for faster chain traversal
+    fat_block_cache: [u8; MAX_BLOCK_SIZE],
+    /// Block number currently in cache (u64::MAX = invalid)
+    fat_block_cached: u64,
 }
 
 impl<'a> FatFilesystem<'a> {
@@ -411,6 +588,8 @@ impl<'a> FatFilesystem<'a> {
             root_dir_start,
             root_dir_sectors,
             data_clusters,
+            fat_block_cache: [0u8; MAX_BLOCK_SIZE],
+            fat_block_cached: u64::MAX, // Invalid, forces first read
         })
     }
 
@@ -436,7 +615,7 @@ impl<'a> FatFilesystem<'a> {
         Some((self.partition_start.checked_add(device_block)?, offset))
     }
 
-    /// Read the next cluster from the FAT
+    /// Read the next cluster from the FAT (with single-block caching)
     fn next_cluster(&mut self, cluster: u32) -> Result<Option<u32>, FatError> {
         // Validate cluster number is in valid range (clusters 0 and 1 are reserved)
         if cluster < 2 {
@@ -445,7 +624,6 @@ impl<'a> FatFilesystem<'a> {
 
         // Use device block size for buffer to avoid overflow
         let device_block_size = self.device_block_size as usize;
-        let mut buffer = [0u8; MAX_BLOCK_SIZE];
         let bytes_per_sector = self.bytes_per_sector as u64;
 
         // Calculate byte offset of FAT entry from partition start
@@ -469,27 +647,32 @@ impl<'a> FatFilesystem<'a> {
         let device_block = entry_byte_offset / device_block_size as u64;
         let offset_in_block = (entry_byte_offset % device_block_size as u64) as usize;
 
-        self.device
-            .read_block(
-                self.partition_start + device_block,
-                &mut buffer[..device_block_size],
-            )
-            .map_err(|_| FatError::ReadError)?;
+        // Check if we need to read this block (cache miss)
+        let abs_block = self.partition_start + device_block;
+        if self.fat_block_cached != abs_block {
+            self.device
+                .read_block(abs_block, &mut self.fat_block_cache[..device_block_size])
+                .map_err(|_| FatError::ReadError)?;
+            self.fat_block_cached = abs_block;
+        }
 
         let next = match self.fat_type {
             FatType::Fat12 => {
                 let entry = if offset_in_block + 1 < device_block_size {
-                    buffer[offset_in_block] as u16 | ((buffer[offset_in_block + 1] as u16) << 8)
+                    self.fat_block_cache[offset_in_block] as u16
+                        | ((self.fat_block_cache[offset_in_block + 1] as u16) << 8)
                 } else {
                     // Entry spans device blocks - need to read next block
-                    let low = buffer[offset_in_block] as u16;
+                    let low = self.fat_block_cache[offset_in_block] as u16;
+                    // Read next block (invalidates cache for current block)
                     self.device
                         .read_block(
                             self.partition_start + device_block + 1,
-                            &mut buffer[..device_block_size],
+                            &mut self.fat_block_cache[..device_block_size],
                         )
                         .map_err(|_| FatError::ReadError)?;
-                    low | ((buffer[0] as u16) << 8)
+                    self.fat_block_cached = self.partition_start + device_block + 1;
+                    low | ((self.fat_block_cache[0] as u16) << 8)
                 };
 
                 let val = if cluster & 1 != 0 {
@@ -508,17 +691,21 @@ impl<'a> FatFilesystem<'a> {
             }
             FatType::Fat16 => {
                 let entry = if offset_in_block + 1 < device_block_size {
-                    u16::from_le_bytes([buffer[offset_in_block], buffer[offset_in_block + 1]])
+                    u16::from_le_bytes([
+                        self.fat_block_cache[offset_in_block],
+                        self.fat_block_cache[offset_in_block + 1],
+                    ])
                 } else {
                     // Entry spans device blocks - need to read next block
-                    let low = buffer[offset_in_block];
+                    let low = self.fat_block_cache[offset_in_block];
                     self.device
                         .read_block(
                             self.partition_start + device_block + 1,
-                            &mut buffer[..device_block_size],
+                            &mut self.fat_block_cache[..device_block_size],
                         )
                         .map_err(|_| FatError::ReadError)?;
-                    u16::from_le_bytes([low, buffer[0]])
+                    self.fat_block_cached = self.partition_start + device_block + 1;
+                    u16::from_le_bytes([low, self.fat_block_cache[0]])
                 };
 
                 if entry >= 0xFFF8 {
@@ -532,26 +719,27 @@ impl<'a> FatFilesystem<'a> {
             FatType::Fat32 => {
                 let entry = if offset_in_block + 3 < device_block_size {
                     u32::from_le_bytes([
-                        buffer[offset_in_block],
-                        buffer[offset_in_block + 1],
-                        buffer[offset_in_block + 2],
-                        buffer[offset_in_block + 3],
+                        self.fat_block_cache[offset_in_block],
+                        self.fat_block_cache[offset_in_block + 1],
+                        self.fat_block_cache[offset_in_block + 2],
+                        self.fat_block_cache[offset_in_block + 3],
                     ])
                 } else {
                     // Entry spans device blocks - read bytes from current and next block
                     let bytes_in_current = device_block_size - offset_in_block;
                     let mut entry_bytes = [0u8; 4];
                     entry_bytes[..bytes_in_current].copy_from_slice(
-                        &buffer[offset_in_block..offset_in_block + bytes_in_current],
+                        &self.fat_block_cache[offset_in_block..offset_in_block + bytes_in_current],
                     );
                     self.device
                         .read_block(
                             self.partition_start + device_block + 1,
-                            &mut buffer[..device_block_size],
+                            &mut self.fat_block_cache[..device_block_size],
                         )
                         .map_err(|_| FatError::ReadError)?;
+                    self.fat_block_cached = self.partition_start + device_block + 1;
                     entry_bytes[bytes_in_current..4]
-                        .copy_from_slice(&buffer[..4 - bytes_in_current]);
+                        .copy_from_slice(&self.fat_block_cache[..4 - bytes_in_current]);
                     u32::from_le_bytes(entry_bytes)
                 } & 0x0FFFFFFF;
 
@@ -699,6 +887,8 @@ impl<'a> FatFilesystem<'a> {
             // Read the root directory, handling device block boundaries
             let mut bytes_processed = 0usize;
 
+            let mut lfn_buffer = LfnBuffer::new();
+
             while bytes_processed < root_dir_bytes {
                 // Calculate which device block to read
                 let current_byte_pos = root_dir_byte_start + bytes_processed;
@@ -726,18 +916,41 @@ impl<'a> FatFilesystem<'a> {
                         return Err(FatError::NotFound);
                     }
 
-                    if !entry.is_free() && !entry.is_lfn() && !entry.is_volume_id() {
-                        log::debug!(
-                            "FAT: found entry '{}' (looking for '{}')",
-                            entry.short_name(),
-                            name
-                        );
-
-                        if entry.matches_name(name) {
-                            return Ok(entry);
-                        }
+                    if entry.is_free() {
+                        lfn_buffer.reset();
+                        pos += 32;
+                        bytes_processed += 32;
+                        continue;
                     }
 
+                    if entry.is_lfn() {
+                        // Process LFN entry
+                        let lfn_entry = unsafe { &*(&buffer[pos] as *const u8 as *const LfnEntry) };
+                        lfn_buffer.process_lfn(lfn_entry);
+                        pos += 32;
+                        bytes_processed += 32;
+                        continue;
+                    }
+
+                    if entry.is_volume_id() {
+                        lfn_buffer.reset();
+                        pos += 32;
+                        bytes_processed += 32;
+                        continue;
+                    }
+
+                    log::debug!(
+                        "FAT: found entry '{}' (looking for '{}')",
+                        entry.short_name(),
+                        name
+                    );
+
+                    // Check LFN first, then fall back to short name
+                    if lfn_buffer.matches(name) || entry.matches_name(name) {
+                        return Ok(entry);
+                    }
+
+                    lfn_buffer.reset();
                     pos += 32;
                     bytes_processed += 32;
                 }
@@ -752,6 +965,7 @@ impl<'a> FatFilesystem<'a> {
             let mut current_cluster = cluster;
             let cluster_size = self.sectors_per_cluster as usize * self.bytes_per_sector as usize;
             let entries_per_cluster = cluster_size / 32;
+            let mut lfn_buffer = LfnBuffer::new();
 
             loop {
                 self.read_cluster(current_cluster, &mut buffer[..cluster_size])?;
@@ -773,7 +987,22 @@ impl<'a> FatFilesystem<'a> {
                         return Err(FatError::NotFound);
                     }
 
-                    if entry.is_free() || entry.is_lfn() || entry.is_volume_id() {
+                    if entry.is_free() {
+                        lfn_buffer.reset();
+                        continue;
+                    }
+
+                    if entry.is_lfn() {
+                        // Process LFN entry - reinterpret the bytes as LfnEntry
+                        // Safety: LfnEntry has the same size (32 bytes) as DirectoryEntry
+                        let lfn_entry =
+                            unsafe { &*(&buffer[offset] as *const u8 as *const LfnEntry) };
+                        lfn_buffer.process_lfn(lfn_entry);
+                        continue;
+                    }
+
+                    if entry.is_volume_id() {
+                        lfn_buffer.reset();
                         continue;
                     }
 
@@ -784,9 +1013,13 @@ impl<'a> FatFilesystem<'a> {
                         name
                     );
 
-                    if entry.matches_name(name) {
+                    // Check LFN first, then fall back to short name
+                    if lfn_buffer.matches(name) || entry.matches_name(name) {
                         return Ok(entry);
                     }
+
+                    // Reset LFN buffer for next entry
+                    lfn_buffer.reset();
                 }
 
                 match self.next_cluster(current_cluster)? {

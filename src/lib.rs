@@ -5,6 +5,7 @@
 
 #![no_std]
 #![feature(abi_x86_interrupt)]
+#![feature(never_type)]
 #![allow(unsafe_op_in_unsafe_fn)]
 // Allow common firmware code patterns
 #![allow(clippy::result_unit_err)] // Result<(), ()> is common in embedded code
@@ -15,6 +16,7 @@
 extern crate alloc;
 
 pub mod arch;
+pub mod bls;
 pub mod coreboot;
 pub mod drivers;
 pub mod efi;
@@ -22,9 +24,12 @@ pub mod efi;
 pub mod fb_log;
 pub mod framebuffer_console;
 pub mod fs;
+pub mod grub;
 pub mod heap;
+pub mod linux_boot;
 pub mod logger;
 pub mod menu;
+pub mod payload;
 pub mod pe;
 pub mod secure_boot_menu;
 pub mod state;
@@ -164,6 +169,16 @@ pub fn init(coreboot_table_ptr: u64) {
     if let Some(ref boot_media) = cb_info.boot_media {
         coreboot::store_boot_media(boot_media.clone());
     }
+
+    // Store memory regions and ACPI RSDP for direct Linux boot
+    state::with_drivers_mut(|drivers| {
+        // Copy memory regions
+        for region in cb_info.memory_map.iter() {
+            let _ = drivers.memory_regions.push(*region);
+        }
+        // Store ACPI RSDP
+        drivers.acpi_rsdp = cb_info.acpi_rsdp;
+    });
 
     // Initialize serial port from coreboot info (if available)
     if let Some(ref serial) = cb_info.serial {
@@ -374,18 +389,70 @@ fn init_storage() {
 
     // If only one entry and no interactive mode requested, boot directly
     // For now, always show the menu for testing
-    if let Some(selected_index) = menu::show_menu(&mut boot_menu)
-        && let Some(entry) = boot_menu.get_entry(selected_index)
-    {
-        log::info!("Booting: {} from {}", entry.name, entry.path);
-        boot_selected_entry(entry);
+    log::debug!("Showing boot menu...");
+    let selected = menu::show_menu(&mut boot_menu);
+    log::info!("Menu returned: {:?}", selected);
+
+    if let Some(selected_index) = selected {
+        log::info!("Selected index: {}", selected_index);
+        if let Some(entry) = boot_menu.get_entry(selected_index) {
+            log::info!("Booting: {} from {}", entry.name, entry.path);
+            log::info!("Entry kind: {:?}", entry.kind);
+            log::info!("Device type: {:?}", entry.device_type);
+            boot_selected_entry(entry);
+            log::warn!("boot_selected_entry returned - boot failed!");
+        } else {
+            log::error!("Failed to get entry at index {}", selected_index);
+        }
+    } else {
+        log::warn!("No entry selected from menu");
     }
 
     log::info!("Boot menu returned, storage initialization complete");
 }
 
 /// Boot a selected menu entry
+///
+/// Dispatches to the appropriate boot method based on the entry kind:
+/// - UEFI/UKI entries: Load and execute EFI application
+/// - BLS/GRUB Linux entries: Direct Linux boot via linux_boot module
+/// - Payload entries: Chainload coreboot payload
 fn boot_selected_entry(entry: &menu::BootEntry) {
+    log::info!("boot_selected_entry called");
+
+    // First, dispatch based on entry kind
+    match &entry.kind {
+        // UEFI entries use the existing EFI boot path
+        menu::BootEntryKind::Uefi | menu::BootEntryKind::BlsUki => {
+            log::info!("Dispatching to UEFI boot path");
+            boot_uefi_entry(entry);
+        }
+
+        // Direct Linux boot entries (BLS Type #1 or GRUB)
+        menu::BootEntryKind::BlsLinux {
+            linux_path,
+            initrd_path,
+            cmdline,
+        }
+        | menu::BootEntryKind::GrubLinux {
+            linux_path,
+            initrd_path,
+            cmdline,
+        } => {
+            log::info!("Dispatching to direct Linux boot");
+            boot_linux_entry(entry, linux_path, initrd_path, cmdline);
+        }
+
+        // Coreboot payload chainloading
+        menu::BootEntryKind::Payload { path, format } => {
+            log::info!("Dispatching to payload chainload");
+            boot_payload_entry(entry, path, *format);
+        }
+    }
+}
+
+/// Boot a UEFI entry (EFI application or UKI)
+fn boot_uefi_entry(entry: &menu::BootEntry) {
     match entry.device_type {
         menu::DeviceType::Nvme {
             controller_id,
@@ -664,6 +731,280 @@ fn boot_selected_entry(entry: &menu::BootEntry) {
             log::error!("Failed to boot SDHCI entry");
         }
     }
+}
+
+/// Boot a direct Linux entry (BLS Type #1 or GRUB)
+///
+/// This uses the linux_boot module to load and boot the kernel directly,
+/// bypassing UEFI bootloaders like GRUB or systemd-boot.
+fn boot_linux_entry(
+    entry: &menu::BootEntry,
+    linux_path: &heapless::String<128>,
+    initrd_path: &heapless::String<128>,
+    cmdline: &heapless::String<512>,
+) {
+    log::info!("Direct Linux boot: {}", entry.name);
+    log::info!("  Kernel: {}", linux_path);
+    if !initrd_path.is_empty() {
+        log::info!("  Initrd: {}", initrd_path);
+    }
+    log::info!("  Cmdline: {}", cmdline);
+
+    // Convert Linux-style paths (forward slashes) to FAT-style paths (backslashes)
+    let kernel_path = convert_linux_path_to_fat(linux_path);
+    let initrd_fat_path = if !initrd_path.is_empty() {
+        Some(convert_linux_path_to_fat(initrd_path))
+    } else {
+        None
+    };
+
+    log::debug!("FAT kernel path: {}", kernel_path);
+    if let Some(ref p) = initrd_fat_path {
+        log::debug!("FAT initrd path: {}", p);
+    }
+
+    // Get memory regions and ACPI RSDP from state
+    let (memory_regions, acpi_rsdp) = {
+        let state = state::get();
+        // Copy memory regions to a local buffer (we can't borrow across the disk operations)
+        let mut regions = heapless::Vec::<crate::coreboot::memory::MemoryRegion, 64>::new();
+        for region in state.drivers.memory_regions.iter() {
+            let _ = regions.push(*region);
+        }
+        (regions, state.drivers.acpi_rsdp)
+    };
+
+    // Get framebuffer info for Linux console
+    let framebuffer = coreboot::get_framebuffer();
+
+    if memory_regions.is_empty() {
+        log::error!("No memory regions available for Linux boot");
+        return;
+    }
+
+    log::debug!(
+        "Memory regions: {}, ACPI RSDP: {:?}, Framebuffer: {}",
+        memory_regions.len(),
+        acpi_rsdp,
+        if framebuffer.is_some() { "yes" } else { "no" }
+    );
+
+    // Dispatch based on device type
+    match entry.device_type {
+        menu::DeviceType::Nvme {
+            controller_id,
+            nsid,
+        } => {
+            // Ensure device is stored globally
+            if !drivers::nvme::store_global_device(controller_id, nsid) {
+                log::error!("Failed to store NVMe device globally");
+                return;
+            }
+
+            if let Some(controller) = drivers::nvme::get_controller(controller_id) {
+                log::info!("Got NVMe controller {}", controller_id);
+                let mut disk = NvmeDisk::new(controller, nsid);
+
+                // Load and boot Linux
+                match linux_boot::load_linux_from_disk(
+                    &mut disk,
+                    entry.partition.first_lba,
+                    &kernel_path,
+                    initrd_fat_path.as_deref(),
+                    cmdline,
+                    &memory_regions,
+                    acpi_rsdp,
+                    framebuffer.as_ref(),
+                    false, // Don't use EFI handover for direct boot
+                ) {
+                    Ok(mut loaded) => {
+                        log::info!("Linux loaded successfully, booting...");
+                        unsafe {
+                            loaded.boot_direct();
+                        }
+                    }
+                    Err(e) => {
+                        log::error!("Failed to load Linux: {:?}", e);
+                    }
+                }
+            } else {
+                log::error!("Failed to get NVMe controller {}", controller_id);
+            }
+        }
+
+        menu::DeviceType::Ahci {
+            controller_id,
+            port,
+        } => {
+            // Ensure device is stored globally
+            if !drivers::ahci::store_global_device(controller_id, port) {
+                log::error!("Failed to store AHCI device globally");
+                return;
+            }
+
+            if let Some(controller) = drivers::ahci::get_controller(controller_id) {
+                log::info!("Got AHCI controller {}", controller_id);
+                let mut disk = AhciDisk::new(controller, port);
+
+                // Load and boot Linux
+                match linux_boot::load_linux_from_disk(
+                    &mut disk,
+                    entry.partition.first_lba,
+                    &kernel_path,
+                    initrd_fat_path.as_deref(),
+                    cmdline,
+                    &memory_regions,
+                    acpi_rsdp,
+                    framebuffer.as_ref(),
+                    false,
+                ) {
+                    Ok(mut loaded) => {
+                        log::info!("Linux loaded successfully, booting...");
+                        unsafe {
+                            loaded.boot_direct();
+                        }
+                    }
+                    Err(e) => {
+                        log::error!("Failed to load Linux: {:?}", e);
+                    }
+                }
+            } else {
+                log::error!("Failed to get AHCI controller {}", controller_id);
+            }
+        }
+
+        menu::DeviceType::Usb {
+            controller_id,
+            device_addr: _,
+        } => {
+            // Get the controller pointer
+            let controller_ptr = match drivers::usb::get_controller_ptr(controller_id) {
+                Some(ptr) => ptr,
+                None => {
+                    log::error!("Failed to get USB controller {}", controller_id);
+                    return;
+                }
+            };
+
+            if let Some(usb_device) = drivers::usb::mass_storage::get_global_device() {
+                log::info!("Got USB mass storage device");
+                // Safety: controller_ptr is valid for the entire boot process
+                let controller = unsafe { &mut *controller_ptr };
+                let mut disk = UsbDisk::new(usb_device, controller);
+
+                // Load and boot Linux
+                match linux_boot::load_linux_from_disk(
+                    &mut disk,
+                    entry.partition.first_lba,
+                    &kernel_path,
+                    initrd_fat_path.as_deref(),
+                    cmdline,
+                    &memory_regions,
+                    acpi_rsdp,
+                    framebuffer.as_ref(),
+                    false,
+                ) {
+                    Ok(mut loaded) => {
+                        log::info!("Linux loaded successfully, booting...");
+                        unsafe {
+                            loaded.boot_direct();
+                        }
+                    }
+                    Err(e) => {
+                        log::error!("Failed to load Linux: {:?}", e);
+                    }
+                }
+            } else {
+                log::error!("USB mass storage device not available");
+            }
+        }
+
+        menu::DeviceType::Sdhci { controller_id } => {
+            // Ensure device is stored globally
+            if !drivers::sdhci::store_global_device(controller_id) {
+                log::error!("Failed to store SDHCI device globally");
+                return;
+            }
+
+            if let Some(controller) = drivers::sdhci::get_controller(controller_id) {
+                log::info!("Got SDHCI controller {}", controller_id);
+                let mut disk = SdhciDisk::new(controller);
+
+                // Load and boot Linux
+                match linux_boot::load_linux_from_disk(
+                    &mut disk,
+                    entry.partition.first_lba,
+                    &kernel_path,
+                    initrd_fat_path.as_deref(),
+                    cmdline,
+                    &memory_regions,
+                    acpi_rsdp,
+                    framebuffer.as_ref(),
+                    false,
+                ) {
+                    Ok(mut loaded) => {
+                        log::info!("Linux loaded successfully, booting...");
+                        unsafe {
+                            loaded.boot_direct();
+                        }
+                    }
+                    Err(e) => {
+                        log::error!("Failed to load Linux: {:?}", e);
+                    }
+                }
+            } else {
+                log::error!("Failed to get SDHCI controller {}", controller_id);
+            }
+        }
+    }
+
+    // Note: We intentionally don't fall back to UEFI boot here.
+    // If the user selected a direct Linux boot entry, they want Linux,
+    // not a UEFI bootloader. If it fails, show an error and return to menu.
+    log::error!("Direct Linux boot failed - returning to menu");
+}
+
+/// Convert a Linux-style path (forward slashes) to FAT-style path (backslashes)
+///
+/// Also strips leading slash if present.
+fn convert_linux_path_to_fat(path: &str) -> heapless::String<128> {
+    let mut fat_path: heapless::String<128> = heapless::String::new();
+
+    // Strip leading slash
+    let path = path.trim_start_matches('/');
+
+    // Convert forward slashes to backslashes
+    for c in path.chars() {
+        if c == '/' {
+            let _ = fat_path.push('\\');
+        } else {
+            let _ = fat_path.push(c);
+        }
+    }
+
+    fat_path
+}
+
+/// Boot a coreboot payload entry
+///
+/// This uses the payload module to load and chainload another coreboot payload.
+fn boot_payload_entry(
+    entry: &menu::BootEntry,
+    path: &heapless::String<128>,
+    format: payload::PayloadFormat,
+) {
+    log::info!("Chainloading payload: {}", entry.name);
+    log::info!("  Path: {}", path);
+    log::info!("  Format: {:?}", format);
+
+    // TODO: Implement full payload chainloading
+    // This requires:
+    // 1. Mount FAT filesystem on the partition
+    // 2. Create PayloadEntry from the menu entry
+    // 3. Call payload::chainload_payload()
+    //
+    // For now, log the attempt and return
+    log::warn!("Payload chainloading not yet fully implemented");
 }
 
 /// Install BlockIO protocols for a disk and all its partitions

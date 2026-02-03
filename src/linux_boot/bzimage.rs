@@ -1,0 +1,397 @@
+//! bzImage Loader
+//!
+//! This module handles loading and validating Linux bzImage kernels.
+//! It parses the setup header, loads the protected-mode kernel code,
+//! and prepares for direct boot or EFI handover.
+//!
+//! Reference: https://www.kernel.org/doc/html/latest/arch/x86/boot.html
+
+use super::params::{BootParams, HEADER_OFFSET, SetupHeader};
+
+/// Errors that can occur during bzImage loading
+#[derive(Debug)]
+pub enum BzImageError {
+    /// File is too small to contain a valid header
+    FileTooSmall,
+    /// Invalid magic number in boot sector
+    InvalidMagic,
+    /// Boot protocol version too old
+    UnsupportedVersion,
+    /// Kernel is not relocatable
+    NotRelocatable,
+    /// Failed to read from disk
+    ReadError,
+    /// Kernel too large to fit in memory
+    KernelTooLarge,
+    /// No suitable memory region for initrd
+    NoInitrdMemory,
+    /// Command line too long
+    CmdLineTooLong,
+}
+
+/// Default kernel load address (16 MB)
+///
+/// For 64-bit relocatable kernels, we load at 16MB to avoid conflicts with:
+/// - CrabEFI itself (loaded at 1MB by coreboot)
+/// - Legacy BIOS data areas
+///
+/// Note: 1MB (0x100000) is the traditional address for 32-bit kernels, but
+/// CrabEFI occupies that space, so we use the 64-bit preferred address.
+pub const DEFAULT_KERNEL_ADDR: u64 = 0x1000000;
+
+/// Boot parameters address (zero page)
+///
+/// This must be at a fixed, low memory address that won't be overwritten.
+/// Traditional location is around 0x10000 (64KB).
+pub const BOOT_PARAMS_ADDR: u64 = 0x10000;
+
+/// Default command line address
+pub const CMDLINE_ADDR: u32 = 0x4b000;
+
+/// Maximum command line size (64 KB)
+pub const CMDLINE_MAX_SIZE: usize = 0x10000;
+
+/// bzImage kernel information
+#[derive(Debug)]
+pub struct BzImage {
+    /// Setup header from the kernel
+    pub header: SetupHeader,
+    /// Size of setup code (boot sector + setup sectors)
+    pub setup_size: u32,
+    /// Size of protected-mode kernel code
+    pub kernel_size: u32,
+    /// Total file size
+    pub file_size: u32,
+}
+
+impl BzImage {
+    /// Parse bzImage header from the first 1KB of the kernel file
+    ///
+    /// # Arguments
+    ///
+    /// * `data` - First 1024 bytes of the bzImage file
+    /// * `total_size` - Total size of the bzImage file
+    ///
+    /// # Returns
+    ///
+    /// `BzImage` containing parsed header and size information
+    pub fn parse_header(data: &[u8], total_size: u32) -> Result<Self, BzImageError> {
+        if data.len() < 1024 {
+            return Err(BzImageError::FileTooSmall);
+        }
+
+        // Read the setup header at offset 0x1f1
+        let header = unsafe {
+            let ptr = data.as_ptr().add(HEADER_OFFSET) as *const SetupHeader;
+            ptr.read_unaligned()
+        };
+
+        // Validate magic numbers
+        if !header.is_valid() {
+            // Copy packed fields to local variables to avoid unaligned access
+            let boot_flag = header.boot_flag;
+            let hdr = header.header;
+            log::error!(
+                "Invalid bzImage magic: boot_flag={:#x}, header={:?}",
+                boot_flag,
+                hdr
+            );
+            return Err(BzImageError::InvalidMagic);
+        }
+
+        // Check protocol version
+        if !header.is_version_supported() {
+            // Copy packed field to local variable
+            let version = header.version;
+            log::error!(
+                "Unsupported boot protocol version: {:#x} (need >= {:#x})",
+                version,
+                SetupHeader::MIN_VERSION
+            );
+            return Err(BzImageError::UnsupportedVersion);
+        }
+
+        // Check if kernel is relocatable
+        if !header.is_relocatable() {
+            log::error!("Kernel is not relocatable");
+            return Err(BzImageError::NotRelocatable);
+        }
+
+        let setup_size = header.setup_size();
+        let kernel_size = total_size.saturating_sub(setup_size);
+
+        // Copy packed fields to local variables
+        let version = header.version;
+        let relocatable = header.is_relocatable();
+        log::info!(
+            "bzImage: version={:#x}, setup={}B, kernel={}B, relocatable={}",
+            version,
+            setup_size,
+            kernel_size,
+            relocatable
+        );
+
+        if header.supports_efi_handover() {
+            log::info!(
+                "  EFI handover supported at offset {:#x}",
+                header.efi_handover_offset_64()
+            );
+        }
+
+        Ok(Self {
+            header,
+            setup_size,
+            kernel_size,
+            file_size: total_size,
+        })
+    }
+
+    /// Load the protected-mode kernel code to memory
+    ///
+    /// # Arguments
+    ///
+    /// * `kernel_data` - Full kernel image data
+    /// * `load_addr` - Address to load the kernel (default: 0x100000)
+    ///
+    /// # Safety
+    ///
+    /// Caller must ensure `load_addr` points to valid, writable memory
+    /// large enough to hold the kernel.
+    pub unsafe fn load_kernel(
+        &self,
+        kernel_data: &[u8],
+        load_addr: u64,
+    ) -> Result<(), BzImageError> {
+        if kernel_data.len() < self.file_size as usize {
+            return Err(BzImageError::FileTooSmall);
+        }
+
+        let setup_size = self.setup_size as usize;
+        let kernel_size = self.kernel_size as usize;
+
+        // Skip setup sectors, copy protected-mode code
+        let src = &kernel_data[setup_size..setup_size + kernel_size];
+        let dst = load_addr as *mut u8;
+
+        log::info!(
+            "Loading kernel: {} bytes from offset {} to {:#x}",
+            kernel_size,
+            setup_size,
+            load_addr
+        );
+
+        // Verify source is readable (read first and last bytes)
+        log::debug!(
+            "Source check: first={:#x}, last={:#x}",
+            src[0],
+            src[kernel_size - 1]
+        );
+
+        // Copy in smaller chunks with progress logging
+        const CHUNK_SIZE: usize = 1024 * 1024; // 1MB chunks
+        let mut copied = 0usize;
+        while copied < kernel_size {
+            let remaining = kernel_size - copied;
+            let chunk = core::cmp::min(remaining, CHUNK_SIZE);
+
+            core::ptr::copy_nonoverlapping(src.as_ptr().add(copied), dst.add(copied), chunk);
+
+            copied += chunk;
+            if copied % (4 * 1024 * 1024) == 0 || copied == kernel_size {
+                log::info!(
+                    "  Copied {} / {} MB",
+                    copied / (1024 * 1024),
+                    kernel_size / (1024 * 1024)
+                );
+            }
+        }
+
+        log::info!("Kernel copy complete");
+        Ok(())
+    }
+
+    /// Get the 64-bit entry point address
+    ///
+    /// # Arguments
+    ///
+    /// * `kernel_addr` - Address where kernel was loaded
+    pub fn entry_point_64(&self, kernel_addr: u64) -> u64 {
+        kernel_addr + self.header.entry64_offset()
+    }
+
+    /// Get the EFI handover entry point address (64-bit)
+    ///
+    /// # Arguments
+    ///
+    /// * `kernel_addr` - Address where kernel was loaded
+    pub fn efi_handover_entry(&self, kernel_addr: u64) -> Option<u64> {
+        if self.header.supports_efi_handover() {
+            Some(kernel_addr + self.header.efi_handover_offset_64() as u64)
+        } else {
+            None
+        }
+    }
+}
+
+/// Load an initrd into memory
+///
+/// Places the initrd at the highest suitable address below `initrd_addr_max`.
+///
+/// # Arguments
+///
+/// * `data` - Initrd data
+/// * `boot_params` - Boot parameters (for memory map and initrd_addr_max)
+///
+/// # Returns
+///
+/// The address where the initrd was loaded
+///
+/// # Safety
+///
+/// Caller must ensure there is enough free memory for the initrd.
+pub unsafe fn load_initrd(data: &[u8], boot_params: &BootParams) -> Result<u64, BzImageError> {
+    let size = data.len() as u64;
+    if size == 0 {
+        return Ok(0);
+    }
+
+    // Get maximum initrd address from header, default to 0x37FFFFFF
+    let initrd_addr_max = match boot_params.hdr.initrd_addr_max {
+        0 => 0x37FF_FFFF,
+        a => a as u64,
+    };
+
+    // Limit to 4GB identity-mapped area
+    let initrd_addr_max = initrd_addr_max.min((4u64 << 30) - 1);
+
+    // Find a suitable address - look for highest RAM region that fits
+    let mut best_addr: Option<u64> = None;
+
+    for i in 0..boot_params.num_e820_entries() {
+        if let Some(entry) = boot_params.e820_entry(i) {
+            // Only consider RAM regions
+            if entry.entry_type != super::params::E820Entry::RAM_TYPE {
+                continue;
+            }
+
+            // Skip regions that start beyond max
+            if entry.addr > initrd_addr_max {
+                continue;
+            }
+
+            // Skip regions that are too small
+            if entry.size < size {
+                continue;
+            }
+
+            // Calculate highest address in this region that fits
+            let region_end = entry.addr + entry.size;
+            let potential_addr = region_end.saturating_sub(size);
+
+            // Align to 2MB boundary
+            let potential_addr = potential_addr & !((2u64 << 20) - 1);
+
+            // Clamp to max
+            let potential_addr = potential_addr.min(initrd_addr_max + 1 - size);
+
+            // Use the highest address we can find
+            if let Some(current) = best_addr {
+                if potential_addr > current {
+                    best_addr = Some(potential_addr);
+                }
+            } else if potential_addr >= entry.addr {
+                best_addr = Some(potential_addr);
+            }
+        }
+    }
+
+    let addr = best_addr.ok_or(BzImageError::NoInitrdMemory)?;
+
+    log::info!("Loading initrd: {} bytes to {:#x}", size, addr);
+
+    let dst = addr as *mut u8;
+    core::ptr::copy_nonoverlapping(data.as_ptr(), dst, data.len());
+
+    Ok(addr)
+}
+
+/// Copy command line to low memory
+///
+/// # Arguments
+///
+/// * `cmdline` - Command line string (will be null-terminated)
+/// * `addr` - Destination address (default: CMDLINE_ADDR)
+///
+/// # Safety
+///
+/// Caller must ensure the destination address is valid and writable.
+pub unsafe fn set_cmdline(cmdline: &str, addr: u32) -> Result<(), BzImageError> {
+    if cmdline.len() >= CMDLINE_MAX_SIZE {
+        return Err(BzImageError::CmdLineTooLong);
+    }
+
+    let dst = addr as *mut u8;
+    let bytes = cmdline.as_bytes();
+
+    // Copy command line
+    core::ptr::copy_nonoverlapping(bytes.as_ptr(), dst, bytes.len());
+
+    // Null terminate
+    *dst.add(bytes.len()) = 0;
+
+    log::debug!("Command line at {:#x}: {}", addr, cmdline);
+
+    Ok(())
+}
+
+/// Prepare boot parameters for direct Linux boot
+///
+/// # Arguments
+///
+/// * `bzimage` - Parsed bzImage information
+/// * `memory_regions` - Coreboot memory map
+/// * `acpi_rsdp` - ACPI RSDP address (optional)
+/// * `framebuffer` - Framebuffer info (optional)
+/// * `kernel_addr` - Address where kernel is loaded
+/// * `cmdline_addr` - Address of command line
+///
+/// # Returns
+///
+/// Initialized boot parameters structure
+pub fn prepare_boot_params(
+    bzimage: &BzImage,
+    memory_regions: &[crate::coreboot::memory::MemoryRegion],
+    acpi_rsdp: Option<u64>,
+    framebuffer: Option<&crate::coreboot::FramebufferInfo>,
+    kernel_addr: u32,
+    cmdline_addr: u32,
+) -> BootParams {
+    let mut params = BootParams::new();
+
+    // Copy the setup header from the bzImage
+    params.hdr = bzimage.header;
+
+    // Set memory map
+    params.set_memory_map(memory_regions);
+
+    // Set ACPI RSDP if available
+    if let Some(rsdp) = acpi_rsdp {
+        params.set_acpi_rsdp(rsdp);
+    }
+
+    // Set framebuffer info if available
+    if let Some(fb) = framebuffer {
+        params.set_framebuffer(fb);
+    }
+
+    // Set loader type (unknown)
+    params.set_loader_type();
+
+    // Set kernel address
+    params.set_kernel_addr(kernel_addr);
+
+    // Set command line pointer
+    params.set_cmdline(cmdline_addr);
+
+    params
+}

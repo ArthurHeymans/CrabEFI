@@ -5,11 +5,15 @@
 //!
 //! # Features
 //!
-//! - Discovers boot entries from NVMe, AHCI, and USB storage devices
+//! - Discovers boot entries from NVMe, AHCI, USB, and SD card storage devices
+//! - Supports multiple boot entry types:
+//!   - UEFI bootloaders (EFI\\BOOT\\BOOTX64.EFI)
+//!   - BLS (Boot Loader Specification) entries in /loader/entries/
+//!   - GRUB configuration entries from grub.cfg
+//!   - Coreboot payload chainloading
 //! - Displays menu on serial (with ANSI escape codes) and framebuffer
 //! - Arrow key navigation and Enter to select
 //! - Configurable auto-boot timeout with countdown
-//! - Future: file browser, EFI variable support
 
 use crate::coreboot;
 use crate::drivers::block::{AhciDisk, BlockDevice, NvmeDisk, SdhciDisk, UsbDisk};
@@ -24,7 +28,8 @@ use core::fmt::Write;
 use heapless::{String, Vec};
 
 /// Maximum number of boot entries
-const MAX_BOOT_ENTRIES: usize = 8;
+/// Increased to accommodate BLS, GRUB, and payload entries
+const MAX_BOOT_ENTRIES: usize = 16;
 
 /// Default timeout in seconds for auto-boot
 const DEFAULT_TIMEOUT_SECONDS: u32 = 5;
@@ -51,6 +56,70 @@ pub enum DeviceType {
     Sdhci { controller_id: usize },
 }
 
+/// Boot entry kind - how this entry should be booted
+#[derive(Debug, Clone, Default)]
+pub enum BootEntryKind {
+    /// UEFI executable (EFI\BOOT\BOOTX64.EFI)
+    #[default]
+    Uefi,
+
+    /// BLS Type #1 - direct Linux boot
+    BlsLinux {
+        /// Path to Linux kernel
+        linux_path: String<128>,
+        /// Path to initrd
+        initrd_path: String<128>,
+        /// Kernel command line
+        cmdline: String<512>,
+    },
+
+    /// BLS Type #2 - Unified Kernel Image (still EFI)
+    BlsUki,
+
+    /// GRUB menu entry - direct Linux boot
+    GrubLinux {
+        /// Path to Linux kernel
+        linux_path: String<128>,
+        /// Path to initrd
+        initrd_path: String<128>,
+        /// Kernel command line
+        cmdline: String<512>,
+    },
+
+    /// Coreboot payload (ELF or flat binary)
+    Payload {
+        /// Path to payload file
+        path: String<128>,
+        /// Payload format
+        format: crate::payload::PayloadFormat,
+    },
+}
+
+/// Category for menu grouping
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BootCategory {
+    /// UEFI boot entries (BOOTX64.EFI)
+    Uefi,
+    /// Boot Loader Specification entries
+    Bls,
+    /// GRUB configuration entries
+    Grub,
+    /// Coreboot payload entries
+    Payload,
+}
+
+impl BootCategory {
+    /// Get a display name for this category
+    pub fn display_name(&self) -> &'static str {
+        match self {
+            BootCategory::Uefi => "UEFI Boot",
+            BootCategory::Bls => "Boot Loader Spec",
+            BootCategory::Grub => "GRUB Entries",
+            BootCategory::Payload => "Coreboot Payloads",
+        }
+    }
+}
+
 impl DeviceType {
     /// Get a short description of the device type
     pub fn description(&self) -> &'static str {
@@ -68,7 +137,7 @@ impl DeviceType {
 pub struct BootEntry {
     /// Display name for the menu
     pub name: String<64>,
-    /// Path to the EFI application
+    /// Path to the EFI application (for UEFI entries)
     pub path: String<128>,
     /// Device type and identifier
     pub device_type: DeviceType,
@@ -80,10 +149,14 @@ pub struct BootEntry {
     pub pci_device: u8,
     /// PCI function number
     pub pci_function: u8,
+    /// Boot entry kind (how to boot this entry)
+    pub kind: BootEntryKind,
+    /// Boot category (for menu grouping)
+    pub category: BootCategory,
 }
 
 impl BootEntry {
-    /// Create a new boot entry
+    /// Create a new boot entry (defaults to UEFI type)
     pub fn new(
         name: &str,
         path: &str,
@@ -101,6 +174,36 @@ impl BootEntry {
             partition,
             pci_device,
             pci_function,
+            kind: BootEntryKind::Uefi,
+            category: BootCategory::Uefi,
+        };
+        let _ = entry.name.push_str(name);
+        let _ = entry.path.push_str(path);
+        entry
+    }
+
+    /// Create a new boot entry with specific kind and category
+    pub fn new_with_kind(
+        name: &str,
+        path: &str,
+        device_type: DeviceType,
+        partition_num: u32,
+        partition: gpt::Partition,
+        pci_device: u8,
+        pci_function: u8,
+        kind: BootEntryKind,
+        category: BootCategory,
+    ) -> Self {
+        let mut entry = BootEntry {
+            name: String::new(),
+            path: String::new(),
+            device_type,
+            partition_num,
+            partition,
+            pci_device,
+            pci_function,
+            kind,
+            category,
         };
         let _ = entry.name.push_str(name);
         let _ = entry.path.push_str(path);
@@ -117,6 +220,24 @@ impl BootEntry {
             self.device_type.description(),
             self.partition_num
         );
+    }
+
+    /// Check if this is a direct Linux boot entry
+    pub fn is_linux_boot(&self) -> bool {
+        matches!(
+            self.kind,
+            BootEntryKind::BlsLinux { .. } | BootEntryKind::GrubLinux { .. }
+        )
+    }
+
+    /// Check if this is a UEFI entry
+    pub fn is_uefi(&self) -> bool {
+        matches!(self.kind, BootEntryKind::Uefi | BootEntryKind::BlsUki)
+    }
+
+    /// Check if this is a payload entry
+    pub fn is_payload(&self) -> bool {
+        matches!(self.kind, BootEntryKind::Payload { .. })
     }
 }
 
@@ -218,6 +339,7 @@ pub fn discover_boot_entries() -> BootMenu {
 /// Discover boot entries from NVMe devices
 fn discover_nvme_entries(menu: &mut BootMenu) {
     use crate::drivers::nvme;
+    use crate::fs::fat::FatFilesystem;
 
     if let Some(controller) = nvme::get_controller(0)
         && let Some(ns) = controller.default_namespace()
@@ -242,29 +364,45 @@ fn discover_nvme_entries(menu: &mut BootMenu) {
 
                 // Check if this is an ESP or potential boot partition
                 if partition.is_esp || is_potential_esp(partition) {
-                    // Try to find bootloader on this partition
+                    // Try to mount FAT filesystem on this partition
                     if let Some(controller) = nvme::get_controller(0) {
                         let mut disk = NvmeDisk::new(controller, nsid);
-                        if check_bootloader_exists(&mut disk, partition.first_lba) {
-                            let mut name: String<64> = String::new();
-                            let _ = write!(name, "Boot Entry (NVMe ns{})", nsid);
+                        if let Ok(mut fat) = FatFilesystem::new(&mut disk, partition.first_lba) {
+                            let device_type = DeviceType::Nvme {
+                                controller_id: 0,
+                                nsid,
+                            };
 
-                            let entry = BootEntry::new(
-                                &name,
-                                "EFI\\BOOT\\BOOTX64.EFI",
-                                DeviceType::Nvme {
-                                    controller_id: 0,
-                                    nsid,
-                                },
+                            // Check for UEFI bootloader
+                            if fat.file_size("EFI\\BOOT\\BOOTX64.EFI").is_ok() {
+                                let mut name: String<64> = String::new();
+                                let _ = write!(name, "Boot Entry (NVMe ns{})", nsid);
+
+                                let entry = BootEntry::new(
+                                    &name,
+                                    "EFI\\BOOT\\BOOTX64.EFI",
+                                    device_type,
+                                    partition_num,
+                                    partition.clone(),
+                                    pci_addr.device,
+                                    pci_addr.function,
+                                );
+
+                                if !menu.add_entry(entry) {
+                                    return; // Menu full
+                                }
+                            }
+
+                            // Scan for additional entries (BLS, GRUB, payloads)
+                            scan_partition_for_entries(
+                                &mut fat,
+                                device_type,
                                 partition_num,
-                                partition.clone(),
+                                partition,
                                 pci_addr.device,
                                 pci_addr.function,
+                                menu,
                             );
-
-                            if !menu.add_entry(entry) {
-                                return; // Menu full
-                            }
                         }
                     }
                 }
@@ -276,6 +414,7 @@ fn discover_nvme_entries(menu: &mut BootMenu) {
 /// Discover boot entries from AHCI devices
 fn discover_ahci_entries(menu: &mut BootMenu) {
     use crate::drivers::ahci;
+    use crate::fs::fat::FatFilesystem;
 
     if let Some(controller) = ahci::get_controller(0) {
         let pci_addr = controller.pci_address();
@@ -299,29 +438,48 @@ fn discover_ahci_entries(menu: &mut BootMenu) {
 
                         // Check if this is an ESP or potential boot partition
                         if partition.is_esp || is_potential_esp(partition) {
-                            // Try to find bootloader on this partition
+                            // Try to mount FAT filesystem on this partition
                             if let Some(controller) = ahci::get_controller(0) {
                                 let mut disk = AhciDisk::new(controller, port_index);
-                                if check_bootloader_exists(&mut disk, partition.first_lba) {
-                                    let mut name: String<64> = String::new();
-                                    let _ = write!(name, "Boot Entry (SATA port {})", port_index);
+                                if let Ok(mut fat) =
+                                    FatFilesystem::new(&mut disk, partition.first_lba)
+                                {
+                                    let device_type = DeviceType::Ahci {
+                                        controller_id: 0,
+                                        port: port_index,
+                                    };
 
-                                    let entry = BootEntry::new(
-                                        &name,
-                                        "EFI\\BOOT\\BOOTX64.EFI",
-                                        DeviceType::Ahci {
-                                            controller_id: 0,
-                                            port: port_index,
-                                        },
+                                    // Check for UEFI bootloader
+                                    if fat.file_size("EFI\\BOOT\\BOOTX64.EFI").is_ok() {
+                                        let mut name: String<64> = String::new();
+                                        let _ =
+                                            write!(name, "Boot Entry (SATA port {})", port_index);
+
+                                        let entry = BootEntry::new(
+                                            &name,
+                                            "EFI\\BOOT\\BOOTX64.EFI",
+                                            device_type,
+                                            partition_num,
+                                            partition.clone(),
+                                            pci_addr.device,
+                                            pci_addr.function,
+                                        );
+
+                                        if !menu.add_entry(entry) {
+                                            return; // Menu full
+                                        }
+                                    }
+
+                                    // Scan for additional entries (BLS, GRUB, payloads)
+                                    scan_partition_for_entries(
+                                        &mut fat,
+                                        device_type,
                                         partition_num,
-                                        partition.clone(),
+                                        partition,
                                         pci_addr.device,
                                         pci_addr.function,
+                                        menu,
                                     );
-
-                                    if !menu.add_entry(entry) {
-                                        return; // Menu full
-                                    }
                                 }
                             }
                         }
@@ -380,6 +538,7 @@ fn discover_ahci_entries(menu: &mut BootMenu) {
 /// Discover boot entries from USB devices (all controller types)
 fn discover_usb_entries(menu: &mut BootMenu) {
     use crate::drivers::usb::{self, UsbMassStorage, mass_storage};
+    use crate::fs::fat::FatFilesystem;
 
     // Check if we have any mass storage on any controller
     if let Some((controller_id, device_addr)) = usb::find_mass_storage() {
@@ -425,6 +584,9 @@ fn discover_usb_entries(menu: &mut BootMenu) {
 
         // Now read partitions using the stored device
         usb::with_controller(controller_id, |controller| {
+            // Get controller type early (before any mutable borrows)
+            let controller_type = controller.controller_type();
+
             if let Some(usb_device) = mass_storage::get_global_device() {
                 let mut disk = UsbDisk::new(usb_device, controller);
 
@@ -437,31 +599,46 @@ fn discover_usb_entries(menu: &mut BootMenu) {
 
                         // Check if this is an ESP or potential boot partition
                         if partition.is_esp || is_potential_esp(partition) {
-                            // We need to create a new disk reference for checking bootloader
-                            // This is a bit awkward due to borrowing rules
+                            // Try to mount FAT filesystem on this partition
                             if let Some(usb_device2) = mass_storage::get_global_device() {
                                 let mut disk2 = UsbDisk::new(usb_device2, controller);
-                                if check_bootloader_exists(&mut disk2, partition.first_lba) {
-                                    let mut name: String<64> = String::new();
-                                    let controller_type = controller.controller_type();
-                                    let _ = write!(name, "Boot Entry ({} USB)", controller_type);
+                                if let Ok(mut fat) =
+                                    FatFilesystem::new(&mut disk2, partition.first_lba)
+                                {
+                                    let device_type = DeviceType::Usb {
+                                        controller_id,
+                                        device_addr,
+                                    };
 
-                                    // Get PCI address - we need to handle this differently
-                                    // For now use placeholder values
-                                    let entry = BootEntry::new(
-                                        &name,
-                                        "EFI\\BOOT\\BOOTX64.EFI",
-                                        DeviceType::Usb {
-                                            controller_id,
-                                            device_addr,
-                                        },
+                                    // Check for UEFI bootloader
+                                    if fat.file_size("EFI\\BOOT\\BOOTX64.EFI").is_ok() {
+                                        let mut name: String<64> = String::new();
+                                        let _ =
+                                            write!(name, "Boot Entry ({} USB)", controller_type);
+
+                                        let entry = BootEntry::new(
+                                            &name,
+                                            "EFI\\BOOT\\BOOTX64.EFI",
+                                            device_type,
+                                            partition_num,
+                                            partition.clone(),
+                                            0, // PCI device - TODO: get from controller
+                                            0, // PCI function - TODO: get from controller
+                                        );
+
+                                        menu.add_entry(entry);
+                                    }
+
+                                    // Scan for additional entries (BLS, GRUB, payloads)
+                                    scan_partition_for_entries(
+                                        &mut fat,
+                                        device_type,
                                         partition_num,
-                                        partition.clone(),
+                                        partition,
                                         0, // PCI device - TODO: get from controller
-                                        0, // PCI function - TODO: get from controller
+                                        0, // PCI function
+                                        menu,
                                     );
-
-                                    menu.add_entry(entry);
                                 }
                             }
                         }
@@ -475,6 +652,7 @@ fn discover_usb_entries(menu: &mut BootMenu) {
 /// Discover boot entries from SDHCI devices (SD cards)
 fn discover_sdhci_entries(menu: &mut BootMenu) {
     use crate::drivers::sdhci;
+    use crate::fs::fat::FatFilesystem;
 
     for controller_id in 0..sdhci::controller_count() {
         if let Some(controller) = sdhci::get_controller(controller_id) {
@@ -502,26 +680,44 @@ fn discover_sdhci_entries(menu: &mut BootMenu) {
 
                         // Check if this is an ESP or potential boot partition
                         if partition.is_esp || is_potential_esp(partition) {
-                            // Try to find bootloader on this partition
+                            // Try to mount FAT filesystem on this partition
                             if let Some(controller) = sdhci::get_controller(controller_id) {
                                 let mut disk = SdhciDisk::new(controller);
-                                if check_bootloader_exists(&mut disk, partition.first_lba) {
-                                    let mut name: String<64> = String::new();
-                                    let _ = write!(name, "Boot Entry (SD card)");
+                                if let Ok(mut fat) =
+                                    FatFilesystem::new(&mut disk, partition.first_lba)
+                                {
+                                    let device_type = DeviceType::Sdhci { controller_id };
 
-                                    let entry = BootEntry::new(
-                                        &name,
-                                        "EFI\\BOOT\\BOOTX64.EFI",
-                                        DeviceType::Sdhci { controller_id },
+                                    // Check for UEFI bootloader
+                                    if fat.file_size("EFI\\BOOT\\BOOTX64.EFI").is_ok() {
+                                        let mut name: String<64> = String::new();
+                                        let _ = write!(name, "Boot Entry (SD card)");
+
+                                        let entry = BootEntry::new(
+                                            &name,
+                                            "EFI\\BOOT\\BOOTX64.EFI",
+                                            device_type,
+                                            partition_num,
+                                            partition.clone(),
+                                            pci_addr.device,
+                                            pci_addr.function,
+                                        );
+
+                                        if !menu.add_entry(entry) {
+                                            return; // Menu full
+                                        }
+                                    }
+
+                                    // Scan for additional entries (BLS, GRUB, payloads)
+                                    scan_partition_for_entries(
+                                        &mut fat,
+                                        device_type,
                                         partition_num,
-                                        partition.clone(),
+                                        partition,
                                         pci_addr.device,
                                         pci_addr.function,
+                                        menu,
                                     );
-
-                                    if !menu.add_entry(entry) {
-                                        return; // Menu full
-                                    }
                                 }
                             }
                         }
@@ -539,6 +735,28 @@ fn is_potential_esp(partition: &gpt::Partition) -> bool {
     size_mb > 0 && size_mb < 512 && partition.first_lba > 0
 }
 
+/// Convert a Linux-style path to FAT-style path
+///
+/// - Strips leading slash
+/// - Converts forward slashes to backslashes
+fn linux_path_to_fat(path: &str) -> String<128> {
+    let mut fat_path: String<128> = String::new();
+
+    // Strip leading slash
+    let path = path.trim_start_matches('/');
+
+    // Convert forward slashes to backslashes
+    for c in path.chars() {
+        if c == '/' {
+            let _ = fat_path.push('\\');
+        } else {
+            let _ = fat_path.push(c);
+        }
+    }
+
+    fat_path
+}
+
 /// Check if a bootloader exists on the given partition
 fn check_bootloader_exists<D: BlockDevice>(disk: &mut D, partition_start: u64) -> bool {
     match FatFilesystem::new(disk, partition_start) {
@@ -547,6 +765,168 @@ fn check_bootloader_exists<D: BlockDevice>(disk: &mut D, partition_start: u64) -
             Err(_) => false,
         },
         Err(_) => false,
+    }
+}
+
+/// Scan a partition for additional boot entries (BLS, GRUB, payloads)
+///
+/// This function scans the given FAT filesystem for:
+/// - BLS (Boot Loader Specification) entries in /loader/entries/
+/// - GRUB configuration entries in grub.cfg
+/// - Coreboot payloads in common payload directories
+///
+/// # Arguments
+///
+/// * `fat` - Mounted FAT filesystem
+/// * `device_type` - Device type for the boot entries
+/// * `partition_num` - 1-based partition number
+/// * `partition` - Partition info
+/// * `pci_device` - PCI device number
+/// * `pci_function` - PCI function number
+/// * `menu` - Boot menu to add entries to
+fn scan_partition_for_entries(
+    fat: &mut FatFilesystem<'_>,
+    device_type: DeviceType,
+    partition_num: u32,
+    partition: &gpt::Partition,
+    pci_device: u8,
+    pci_function: u8,
+    menu: &mut BootMenu,
+) {
+    // 1. Scan for BLS entries
+    // BLS entries should have kernels on the same partition (ESP or XBOOTLDR)
+    if let Ok(bls_discovery) = crate::bls::discover_entries(fat) {
+        for bls_entry in bls_discovery.entries.iter() {
+            // Convert Linux path to FAT path and check if file exists
+            let fat_path = linux_path_to_fat(&bls_entry.linux);
+
+            // Only add the entry if the kernel file exists on this partition
+            if fat.file_size(&fat_path).is_ok() {
+                let mut name: String<64> = String::new();
+                let _ = name.push_str(bls_entry.display_title());
+
+                // Also convert initrd path
+                let initrd_fat_path = if !bls_entry.initrd.is_empty() {
+                    linux_path_to_fat(&bls_entry.initrd)
+                } else {
+                    String::new()
+                };
+
+                let entry = BootEntry::new_with_kind(
+                    &name,
+                    &fat_path,
+                    device_type,
+                    partition_num,
+                    partition.clone(),
+                    pci_device,
+                    pci_function,
+                    BootEntryKind::BlsLinux {
+                        linux_path: fat_path.clone(),
+                        initrd_path: initrd_fat_path,
+                        cmdline: bls_entry.options.clone(),
+                    },
+                    BootCategory::Bls,
+                );
+
+                if !menu.add_entry(entry) {
+                    return; // Menu full
+                }
+
+                log::debug!(
+                    "Added BLS entry '{}' (kernel exists on partition)",
+                    bls_entry.display_title()
+                );
+            } else {
+                log::debug!(
+                    "Skipping BLS entry '{}' (kernel '{}' not found on this partition)",
+                    bls_entry.display_title(),
+                    fat_path
+                );
+            }
+        }
+    }
+
+    // 2. Scan for GRUB config entries
+    // NOTE: GRUB entries from grub.cfg often reference kernels on the root partition,
+    // not the ESP where grub.cfg lives. We only add entries if the kernel file
+    // actually exists on this partition (for direct boot to work).
+    if let Ok(grub_config) = crate::grub::parse_config(fat) {
+        // If GRUB has blscfg directive, BLS entries were already added above
+        // Only add GRUB entries that have explicit linux/initrd paths AND
+        // where the kernel file actually exists on this partition
+        for grub_entry in grub_config.entries.iter() {
+            if !grub_entry.linux.is_empty() {
+                // Convert Linux path to FAT path and check if file exists
+                let fat_path = linux_path_to_fat(&grub_entry.linux);
+
+                // Only add the entry if the kernel file exists on this partition
+                if fat.file_size(&fat_path).is_ok() {
+                    let mut name: String<64> = String::new();
+                    let _ = name.push_str(&grub_entry.title);
+
+                    // Also convert initrd path
+                    let initrd_fat_path = if !grub_entry.initrd.is_empty() {
+                        linux_path_to_fat(&grub_entry.initrd)
+                    } else {
+                        String::new()
+                    };
+
+                    let entry = BootEntry::new_with_kind(
+                        &name,
+                        &fat_path,
+                        device_type,
+                        partition_num,
+                        partition.clone(),
+                        pci_device,
+                        pci_function,
+                        BootEntryKind::GrubLinux {
+                            linux_path: fat_path.clone(),
+                            initrd_path: initrd_fat_path,
+                            cmdline: grub_entry.options.clone(),
+                        },
+                        BootCategory::Grub,
+                    );
+
+                    if !menu.add_entry(entry) {
+                        return; // Menu full
+                    }
+
+                    log::debug!(
+                        "Added GRUB entry '{}' (kernel exists on partition)",
+                        grub_entry.title
+                    );
+                } else {
+                    log::debug!(
+                        "Skipping GRUB entry '{}' (kernel '{}' not found on this partition)",
+                        grub_entry.title,
+                        fat_path
+                    );
+                }
+            }
+        }
+    }
+
+    // 3. Scan for coreboot payloads
+    let payloads = crate::payload::discover_payloads(fat);
+    for payload_entry in payloads.iter() {
+        let entry = BootEntry::new_with_kind(
+            &payload_entry.name,
+            &payload_entry.path,
+            device_type,
+            partition_num,
+            partition.clone(),
+            pci_device,
+            pci_function,
+            BootEntryKind::Payload {
+                path: payload_entry.path.clone(),
+                format: payload_entry.format,
+            },
+            BootCategory::Payload,
+        );
+
+        if !menu.add_entry(entry) {
+            return; // Menu full
+        }
     }
 }
 
@@ -611,6 +991,22 @@ pub fn show_menu(menu: &mut BootMenu) -> Option<usize> {
                     draw_menu(menu, &mut fb_console);
                 }
                 KeyPress::Enter => {
+                    // Show booting message before returning
+                    if let Some(entry) = menu.entries.get(menu.selected) {
+                        log::info!(
+                            "Selected entry: name='{}', path='{}'",
+                            entry.name,
+                            entry.path
+                        );
+                        let mut msg: String<64> = String::new();
+                        let _ = msg.push_str("Booting ");
+                        let _ = msg.push_str(&entry.name);
+                        let _ = msg.push_str("...");
+                        draw_status(&msg, &mut fb_console);
+                    } else {
+                        log::error!("No entry at selected index {}", menu.selected);
+                        draw_status("Error: No entry selected", &mut fb_console);
+                    }
                     return Some(menu.selected);
                 }
                 KeyPress::Escape => {
