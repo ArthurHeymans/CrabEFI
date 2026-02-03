@@ -2,6 +2,14 @@
 
 A minimal UEFI implementation written in Rust, designed to run as a coreboot payload.
 
+## Documentation
+
+For detailed documentation, see the [docs/](docs/README.md) directory:
+
+- [Building](docs/BUILDING.md) - How to build CrabEFI and run tests
+- [Architecture](docs/ARCHITECTURE.md) - Repository layout and code organization
+- [Memory Management](docs/MEMORY.md) - Memory layout, allocators, and EFI memory map
+
 ## Goals
 
 CrabEFI implements just enough UEFI to boot Linux via shim/GRUB2 or systemd-boot on real hardware. It is not intended to be a full UEFI implementation. 
@@ -40,8 +48,6 @@ nix develop
 # See all commands
 ./crabefi --help
 ```
-
-See [AGENTS.md](AGENTS.md) for detailed documentation.
 
 ## License
 
