@@ -32,6 +32,7 @@ mod crypto;
 pub mod dbx_update;
 pub mod enrollment;
 pub mod key_files;
+pub mod revocation;
 mod signature;
 mod structures;
 mod variables;
@@ -292,6 +293,12 @@ pub enum AuthError {
     CryptoError,
     /// Buffer too small
     BufferTooSmall,
+    /// Certificate has been revoked
+    CertificateRevoked,
+    /// Certificate chain too deep (exceeded maximum allowed depth)
+    ChainTooDeep,
+    /// Could not build a valid certificate chain to a trusted root
+    ChainBuildingFailed,
 }
 
 impl From<AuthError> for r_efi::efi::Status {
@@ -313,6 +320,9 @@ impl From<AuthError> for r_efi::efi::Status {
             AuthError::InvalidSignatureList => r_efi::efi::Status::INVALID_PARAMETER,
             AuthError::CryptoError => r_efi::efi::Status::DEVICE_ERROR,
             AuthError::BufferTooSmall => r_efi::efi::Status::BUFFER_TOO_SMALL,
+            AuthError::CertificateRevoked => r_efi::efi::Status::SECURITY_VIOLATION,
+            AuthError::ChainTooDeep => r_efi::efi::Status::SECURITY_VIOLATION,
+            AuthError::ChainBuildingFailed => r_efi::efi::Status::SECURITY_VIOLATION,
         }
     }
 }

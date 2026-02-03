@@ -5,10 +5,86 @@
 //! - PKCS#7/CMS signature verification
 //! - X.509 certificate parsing
 //! - RSA signature verification
+//! - Full certificate chain building and validation
+//! - Certificate revocation checking (CRL/OCSP)
 
 use super::AuthError;
+use super::revocation::{RevocationCheckResult, RevocationConfig, check_certificate_revocation};
+use alloc::vec;
 use alloc::vec::Vec;
 use sha2::{Digest, Sha256};
+
+// ============================================================================
+// Certificate Chain Building Configuration
+// ============================================================================
+
+/// Maximum certificate chain depth allowed
+/// This prevents infinite loops and excessive resource consumption
+pub const MAX_CHAIN_DEPTH: usize = 10;
+
+/// Default maximum chain depth for normal operations
+const DEFAULT_MAX_CHAIN_DEPTH: usize = 5;
+
+/// Configuration for certificate chain building and validation
+#[derive(Debug, Clone)]
+pub struct ChainBuildingConfig {
+    /// Maximum chain depth allowed (default: 5)
+    pub max_depth: usize,
+    /// Whether to check certificate revocation status
+    pub check_revocation: bool,
+    /// Revocation checking configuration
+    pub revocation_config: RevocationConfig,
+    /// Current time as Unix timestamp (for validity period checking)
+    pub current_time: i64,
+    /// Whether to require CA certificates to have basicConstraints
+    pub require_basic_constraints: bool,
+    /// Whether to require CA certificates to have keyCertSign keyUsage
+    pub require_key_usage: bool,
+}
+
+impl Default for ChainBuildingConfig {
+    fn default() -> Self {
+        ChainBuildingConfig {
+            max_depth: DEFAULT_MAX_CHAIN_DEPTH,
+            check_revocation: true,
+            revocation_config: RevocationConfig::default(),
+            current_time: get_current_time_for_cert_validation(),
+            require_basic_constraints: true,
+            require_key_usage: true,
+        }
+    }
+}
+
+/// A built certificate chain
+#[derive(Debug, Clone)]
+pub struct CertificateChain {
+    /// Certificates in the chain, from end-entity to root
+    /// Index 0 is the end-entity (signer) certificate
+    /// Last index is the trust anchor (root CA)
+    pub certificates: Vec<Vec<u8>>,
+}
+
+impl CertificateChain {
+    /// Get the end-entity (signer) certificate
+    pub fn end_entity(&self) -> Option<&[u8]> {
+        self.certificates.first().map(|v| v.as_slice())
+    }
+
+    /// Get the trust anchor (root CA) certificate
+    pub fn trust_anchor(&self) -> Option<&[u8]> {
+        self.certificates.last().map(|v| v.as_slice())
+    }
+
+    /// Get the chain length
+    pub fn len(&self) -> usize {
+        self.certificates.len()
+    }
+
+    /// Check if the chain is empty
+    pub fn is_empty(&self) -> bool {
+        self.certificates.is_empty()
+    }
+}
 
 // ============================================================================
 // SHA-256 Hashing
@@ -75,7 +151,7 @@ pub fn verify_pkcs7_signature(
     })?;
 
     // Parse the trusted certificate from db
-    let trusted = parse_x509_certificate(trusted_cert)?;
+    let _trusted = parse_x509_certificate(trusted_cert)?;
 
     // Extract embedded certificates from the PKCS#7
     let embedded_certs: Vec<Vec<u8>> = if let Some(ref certs) = cms_signed_data.certificates {
@@ -147,36 +223,26 @@ pub fn verify_pkcs7_signature(
                 Ok(true) => {
                     log::debug!("RSA signature verification succeeded");
 
-                    // Now verify the certificate chains to a trusted cert
-                    // Check if signer is exactly the trusted cert (cryptographic comparison)
-                    if verify_cert_chain(&signer_cert, &signer_der, &trusted, trusted_cert)? {
-                        log::info!("Signer certificate chains to trusted db certificate");
-                        return Ok(true);
-                    }
+                    // Build and verify the certificate chain using the full chain building algorithm
+                    let config = ChainBuildingConfig::default();
 
-                    // Check if signer cert is issued by trusted cert
-                    if signer_cert.issuer == trusted.subject
-                        && verify_cert_chain(&signer_cert, &signer_der, &trusted, trusted_cert)?
-                    {
-                        log::info!("Signer certificate issued by trusted db certificate");
-                        return Ok(true);
-                    }
-
-                    // Check for intermediate chain
-                    for intermediate_der in &embedded_certs {
-                        if let Ok(intermediate) = parse_x509_certificate(intermediate_der)
-                            && signer_cert.issuer == intermediate.subject
-                            && verify_cert_chain(
-                                &intermediate,
-                                intermediate_der,
-                                &trusted,
-                                trusted_cert,
-                            )?
-                        {
+                    // Try to build a chain from the signer certificate to the trusted certificate
+                    match build_and_verify_chain(
+                        &signer_der,
+                        trusted_cert,
+                        &embedded_certs,
+                        &config,
+                    ) {
+                        Ok(chain) => {
                             log::info!(
-                                "Signer certificate chains via intermediate to db certificate"
+                                "Certificate chain verified successfully (depth: {})",
+                                chain.len()
                             );
                             return Ok(true);
+                        }
+                        Err(e) => {
+                            log::debug!("Chain building failed: {:?}", e);
+                            // Continue trying other signers
                         }
                     }
                 }
@@ -329,79 +395,376 @@ pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     result == 0
 }
 
-/// Verify that a certificate chains to a trusted certificate
+// ============================================================================
+// Full Certificate Chain Building
+// ============================================================================
+
+/// Build and verify a complete certificate chain from end-entity to trust anchor
 ///
-/// For UEFI Secure Boot, we check:
-/// 1. If the cert's issuer matches the trusted cert's subject (direct chain)
-/// 2. Verify the cert's signature with the trusted cert's public key
-/// 3. Validate the certificate's validity period (notBefore/notAfter)
-/// 4. Validate the trusted cert has basicConstraints with CA:TRUE
-/// 5. Validate the trusted cert has keyUsage with keyCertSign
-fn verify_cert_chain(
-    cert: &X509Certificate,
+/// This function implements full certificate chain building that supports
+/// arbitrary chain depths (up to the configured maximum), proper path validation,
+/// and optional revocation checking.
+///
+/// # Arguments
+///
+/// * `end_entity_der` - The end-entity (signer) certificate in DER format
+/// * `trust_anchor_der` - The trusted root certificate in DER format  
+/// * `intermediates` - Pool of intermediate certificates to use for chain building
+/// * `config` - Chain building configuration
+///
+/// # Returns
+///
+/// On success, returns the validated certificate chain.
+/// On failure, returns an appropriate AuthError.
+pub fn build_and_verify_chain(
+    end_entity_der: &[u8],
+    trust_anchor_der: &[u8],
+    intermediates: &[Vec<u8>],
+    config: &ChainBuildingConfig,
+) -> Result<CertificateChain, AuthError> {
+    log::debug!(
+        "Building certificate chain (max depth: {}, intermediates available: {})",
+        config.max_depth,
+        intermediates.len()
+    );
+
+    // Parse the end-entity and trust anchor certificates
+    let end_entity = parse_x509_certificate(end_entity_der)?;
+    let trust_anchor = parse_x509_certificate(trust_anchor_der)?;
+
+    // Quick check: is the end-entity directly the trust anchor?
+    if end_entity.subject == trust_anchor.subject
+        && end_entity.serial_number == trust_anchor.serial_number
+    {
+        // Self-signed or directly trusted - verify the chain
+        if verify_single_cert(end_entity_der, trust_anchor_der, config)? {
+            return Ok(CertificateChain {
+                certificates: vec![end_entity_der.to_vec()],
+            });
+        }
+    }
+
+    // Quick check: is the end-entity directly issued by the trust anchor?
+    if end_entity.issuer == trust_anchor.subject
+        && verify_single_cert(end_entity_der, trust_anchor_der, config)?
+    {
+        return Ok(CertificateChain {
+            certificates: vec![end_entity_der.to_vec(), trust_anchor_der.to_vec()],
+        });
+    }
+
+    // Need to build a chain through intermediates
+    let mut chain = vec![end_entity_der.to_vec()];
+
+    // Use recursive chain building with cycle detection
+    let mut visited: Vec<Vec<u8>> = vec![end_entity.subject.clone()];
+
+    match build_chain_recursive(
+        &end_entity,
+        end_entity_der,
+        &trust_anchor,
+        trust_anchor_der,
+        intermediates,
+        &mut chain,
+        &mut visited,
+        1, // Current depth (end-entity is depth 0)
+        config,
+    ) {
+        Ok(()) => {
+            // Chain building succeeded
+            log::info!(
+                "Successfully built certificate chain with {} certificates",
+                chain.len()
+            );
+            Ok(CertificateChain {
+                certificates: chain,
+            })
+        }
+        Err(e) => {
+            log::debug!("Chain building failed: {:?}", e);
+            Err(e)
+        }
+    }
+}
+
+/// Recursively build the certificate chain
+fn build_chain_recursive(
+    current_cert: &X509Certificate,
+    current_cert_der: &[u8],
+    trust_anchor: &X509Certificate,
+    trust_anchor_der: &[u8],
+    intermediates: &[Vec<u8>],
+    chain: &mut Vec<Vec<u8>>,
+    visited: &mut Vec<Vec<u8>>,
+    depth: usize,
+    config: &ChainBuildingConfig,
+) -> Result<(), AuthError> {
+    // Check maximum depth
+    if depth >= config.max_depth {
+        log::warn!(
+            "Certificate chain depth {} exceeds maximum {}",
+            depth,
+            config.max_depth
+        );
+        return Err(AuthError::ChainTooDeep);
+    }
+
+    // Check if current cert is issued by trust anchor
+    if current_cert.issuer == trust_anchor.subject {
+        // Verify this link
+        if verify_chain_link(current_cert_der, trust_anchor_der, config)? {
+            chain.push(trust_anchor_der.to_vec());
+            return Ok(());
+        }
+    }
+
+    // Search for an intermediate that issued the current certificate
+    for intermediate_der in intermediates {
+        if let Ok(intermediate) = parse_x509_certificate(intermediate_der) {
+            // Check if this intermediate issued the current certificate
+            if current_cert.issuer != intermediate.subject {
+                continue;
+            }
+
+            // Check for cycles (prevent infinite loops)
+            if visited.contains(&intermediate.subject) {
+                log::debug!("Cycle detected in certificate chain");
+                continue;
+            }
+
+            // Verify the chain link
+            if !verify_chain_link(current_cert_der, intermediate_der, config)? {
+                continue;
+            }
+
+            // Check revocation status of intermediate if enabled
+            if config.check_revocation {
+                // Find the issuer of this intermediate for revocation checking
+                let issuer_der = if intermediate.issuer == trust_anchor.subject {
+                    Some(trust_anchor_der)
+                } else {
+                    intermediates
+                        .iter()
+                        .find(|c| {
+                            parse_x509_certificate(c)
+                                .map(|p| p.subject == intermediate.issuer)
+                                .unwrap_or(false)
+                        })
+                        .map(|v| v.as_slice())
+                };
+
+                if let Some(issuer) = issuer_der {
+                    match check_certificate_revocation(
+                        intermediate_der,
+                        issuer,
+                        &config.revocation_config,
+                        config.current_time,
+                    ) {
+                        RevocationCheckResult::Revoked { reason, .. } => {
+                            log::warn!("Intermediate certificate is revoked: {:?}", reason);
+                            return Err(AuthError::CertificateRevoked);
+                        }
+                        RevocationCheckResult::Good => {
+                            log::debug!("Intermediate certificate revocation check: good");
+                        }
+                        RevocationCheckResult::Unknown => {
+                            if !config.revocation_config.allow_soft_fail {
+                                log::warn!("Could not determine intermediate revocation status");
+                                return Err(AuthError::CryptoError);
+                            }
+                        }
+                        RevocationCheckResult::Skipped => {
+                            // Soft-fail mode
+                        }
+                    }
+                }
+            }
+
+            // Add intermediate to chain and continue building
+            chain.push(intermediate_der.clone());
+            visited.push(intermediate.subject.clone());
+
+            // Recursively continue building the chain
+            match build_chain_recursive(
+                &intermediate,
+                intermediate_der,
+                trust_anchor,
+                trust_anchor_der,
+                intermediates,
+                chain,
+                visited,
+                depth + 1,
+                config,
+            ) {
+                Ok(()) => return Ok(()),
+                Err(_) => {
+                    // This path didn't work, backtrack
+                    chain.pop();
+                    visited.pop();
+                    continue;
+                }
+            }
+        }
+    }
+
+    // No valid path found
+    Err(AuthError::ChainBuildingFailed)
+}
+
+/// Verify a single link in the certificate chain
+fn verify_chain_link(
     cert_der: &[u8],
-    trusted: &X509Certificate,
-    trusted_der: &[u8],
+    issuer_der: &[u8],
+    config: &ChainBuildingConfig,
 ) -> Result<bool, AuthError> {
+    let cert = parse_x509_certificate(cert_der)?;
+    let issuer = parse_x509_certificate(issuer_der)?;
+
+    // Check issuer/subject match
+    if cert.issuer != issuer.subject {
+        return Ok(false);
+    }
+
+    // Validate certificate time
+    if let Err(e) = validate_certificate_time(cert_der) {
+        log::debug!("Certificate validity check failed: {:?}", e);
+        return Ok(false);
+    }
+
+    // Validate issuer can act as CA (if required)
+    if config.require_basic_constraints
+        && let Err(e) = validate_basic_constraints_for_ca(issuer_der)
+    {
+        log::debug!("Issuer basicConstraints check failed: {:?}", e);
+        return Ok(false);
+    }
+
+    if config.require_key_usage
+        && let Err(e) = validate_key_usage_for_ca(issuer_der)
+    {
+        log::debug!("Issuer keyUsage check failed: {:?}", e);
+        return Ok(false);
+    }
+
+    // Verify the signature
     use der::Decode;
     use x509_cert::Certificate;
 
-    // Check if the cert's issuer matches the trusted cert's subject
-    // For chain verification: cert.issuer should equal trusted.subject
-    if cert.issuer != trusted.subject {
-        log::debug!("Certificate issuer does not match trusted subject");
-        return Ok(false);
-    }
-
-    // Validate certificate time validity
-    if let Err(e) = validate_certificate_time(cert_der) {
-        log::warn!("Certificate validity period check failed: {:?}", e);
-        return Ok(false);
-    }
-
-    // Validate that the trusted certificate can be used as a CA
-    // (has basicConstraints with CA:TRUE)
-    if let Err(e) = validate_basic_constraints_for_ca(trusted_der) {
-        log::warn!("Trusted certificate basicConstraints check failed: {:?}", e);
-        return Ok(false);
-    }
-
-    // Validate that the trusted certificate has keyCertSign in keyUsage
-    if let Err(e) = validate_key_usage_for_ca(trusted_der) {
-        log::warn!("Trusted certificate keyUsage check failed: {:?}", e);
-        return Ok(false);
-    }
-
-    // Parse the full certificate to get the signature
     let full_cert =
         Certificate::from_der(cert_der).map_err(|_| AuthError::CertificateParseError)?;
-
-    // Get the signature from the certificate
     let cert_signature = full_cert.signature.raw_bytes();
-
-    // CRITICAL FIX: Extract the ORIGINAL TBS bytes from the raw DER
-    // instead of re-encoding, which may produce different bytes due to
-    // DER canonicalization differences.
     let tbs_bytes = extract_tbs_bytes(cert_der)?;
-
-    // Hash the TBS certificate
     let tbs_hash = sha256(tbs_bytes);
 
-    // Verify the certificate's signature with the trusted cert's public key
-    match verify_rsa_signature_raw(&trusted.public_key, cert_signature, &tbs_hash) {
-        Ok(true) => {
-            log::debug!("Certificate chain verified");
-            Ok(true)
+    verify_rsa_signature_raw(&issuer.public_key, cert_signature, &tbs_hash)
+}
+
+/// Verify a single certificate against a trust anchor (for direct trust)
+fn verify_single_cert(
+    cert_der: &[u8],
+    trust_anchor_der: &[u8],
+    config: &ChainBuildingConfig,
+) -> Result<bool, AuthError> {
+    let cert = parse_x509_certificate(cert_der)?;
+    let trust_anchor = parse_x509_certificate(trust_anchor_der)?;
+
+    // For self-signed certs, verify signature against self
+    let issuer_der = if cert.issuer == cert.subject {
+        cert_der
+    } else if cert.issuer == trust_anchor.subject {
+        trust_anchor_der
+    } else {
+        return Ok(false);
+    };
+
+    verify_chain_link(cert_der, issuer_der, config)
+}
+
+/// Verify a certificate chain with full revocation checking
+///
+/// This function verifies an already-built certificate chain, checking:
+/// - Each certificate's validity period
+/// - Each certificate's signature
+/// - CA constraints (basicConstraints, keyUsage)
+/// - Path length constraints
+/// - Revocation status (if enabled)
+///
+/// # Arguments
+///
+/// * `chain` - The certificate chain to verify
+/// * `config` - Verification configuration
+///
+/// # Returns
+///
+/// `Ok(())` if the chain is valid, otherwise an appropriate error.
+pub fn verify_certificate_chain(
+    chain: &CertificateChain,
+    config: &ChainBuildingConfig,
+) -> Result<(), AuthError> {
+    if chain.is_empty() {
+        return Err(AuthError::ChainBuildingFailed);
+    }
+
+    // Verify each link in the chain
+    for i in 0..chain.certificates.len() - 1 {
+        let cert_der = &chain.certificates[i];
+        let issuer_der = &chain.certificates[i + 1];
+
+        // Verify the chain link
+        if !verify_chain_link(cert_der, issuer_der, config)? {
+            log::warn!("Chain link verification failed at index {}", i);
+            return Err(AuthError::SignatureVerificationFailed);
         }
-        Ok(false) => {
-            log::debug!("Certificate signature verification failed");
-            Ok(false)
+
+        // Check path length constraints
+        if let Ok(Some(bc)) = extract_basic_constraints(issuer_der)
+            && let Some(path_len) = bc.path_len_constraint
+        {
+            // Path length constraint limits how many certificates can follow
+            // the CA in the path (not including the CA itself)
+            let remaining = chain.certificates.len() - i - 2;
+            if remaining > path_len as usize {
+                log::warn!(
+                    "Path length constraint violated: {} > {} at index {}",
+                    remaining,
+                    path_len,
+                    i + 1
+                );
+                return Err(AuthError::ChainTooDeep);
+            }
         }
-        Err(e) => {
-            log::debug!("Certificate chain verification error: {:?}", e);
-            Ok(false)
+
+        // Check revocation if enabled
+        if config.check_revocation {
+            match check_certificate_revocation(
+                cert_der,
+                issuer_der,
+                &config.revocation_config,
+                config.current_time,
+            ) {
+                RevocationCheckResult::Revoked { reason, .. } => {
+                    log::warn!("Certificate at index {} is revoked: {:?}", i, reason);
+                    return Err(AuthError::CertificateRevoked);
+                }
+                RevocationCheckResult::Good => {
+                    log::debug!("Certificate at index {} revocation check: good", i);
+                }
+                RevocationCheckResult::Unknown => {
+                    if !config.revocation_config.allow_soft_fail {
+                        log::warn!("Could not determine revocation status for index {}", i);
+                        return Err(AuthError::CryptoError);
+                    }
+                    log::debug!("Revocation status unknown for index {} (soft-fail)", i);
+                }
+                RevocationCheckResult::Skipped => {
+                    log::debug!("Revocation check skipped for index {}", i);
+                }
+            }
         }
     }
+
+    log::info!("Certificate chain verification successful");
+    Ok(())
 }
 
 /// Validate a certificate's validity period (notBefore/notAfter)
@@ -740,14 +1103,14 @@ fn parse_key_usage(data: &[u8]) -> Result<KeyUsage, AuthError> {
         // Bit 6 = nonRepudiation (bit 1)
         // etc.
         let byte1 = bit_string[1];
-        bits |= (((byte1 >> 7) & 1) as u16) << 0; // digitalSignature
+        bits |= ((byte1 >> 7) & 1) as u16; // digitalSignature
         bits |= (((byte1 >> 6) & 1) as u16) << 1; // nonRepudiation
         bits |= (((byte1 >> 5) & 1) as u16) << 2; // keyEncipherment
         bits |= (((byte1 >> 4) & 1) as u16) << 3; // dataEncipherment
         bits |= (((byte1 >> 3) & 1) as u16) << 4; // keyAgreement
         bits |= (((byte1 >> 2) & 1) as u16) << 5; // keyCertSign
         bits |= (((byte1 >> 1) & 1) as u16) << 6; // cRLSign
-        bits |= (((byte1 >> 0) & 1) as u16) << 7; // encipherOnly
+        bits |= ((byte1 & 1) as u16) << 7; // encipherOnly
     }
 
     if bit_string.len() > 2 {
