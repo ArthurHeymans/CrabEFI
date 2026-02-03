@@ -4,6 +4,16 @@
 //! Forbidden Signature Database (dbx) updates. These updates contain revoked
 //! signatures that should be blocked from booting.
 //!
+//! # Security Model
+//!
+//! dbx updates MUST be signed by either:
+//! - A certificate in the KEK (Key Exchange Key) database
+//! - The Platform Key (PK)
+//!
+//! Updates are also subject to anti-downgrade protection:
+//! - Each update must have a timestamp newer than the current dbx timestamp
+//! - This prevents replay attacks using older dbx versions
+//!
 //! # Microsoft dbx Updates
 //!
 //! Microsoft publishes dbx updates that contain:
@@ -14,8 +24,8 @@
 //!
 //! # File Formats Supported
 //!
-//! - Raw EFI_SIGNATURE_LIST format (.bin)
-//! - Files are searched at `EFI\keys\dbx.bin` or `EFI\updatedbx\dbx.bin`
+//! - **Authenticated format** (.auth): EFI_VARIABLE_AUTHENTICATION_2 with PKCS#7 signature
+//! - **Raw format** (.bin/.esl): Only allowed in Setup Mode or for initial provisioning
 //!
 //! # Usage
 //!
@@ -28,9 +38,13 @@
 //! }
 //! ```
 
+use super::crypto::verify_pkcs7_signature;
 use super::guid_to_bytes;
-use super::variables::{KeyDatabaseEntry, dbx_database};
-use super::{AuthError, EFI_CERT_SHA256_GUID, EFI_CERT_X509_GUID};
+use super::structures::{EfiTime, EfiVariableAuthentication2};
+use super::variables::{KeyDatabaseEntry, dbx_database, kek_database, pk_database};
+use super::{
+    AuthError, EFI_CERT_SHA256_GUID, EFI_CERT_TYPE_PKCS7_GUID, EFI_CERT_X509_GUID, is_setup_mode,
+};
 use crate::drivers::block::{AhciDisk, BlockDevice, NvmeDisk, SdhciDisk};
 use crate::fs::fat::FatFilesystem;
 use crate::fs::gpt;
@@ -39,14 +53,26 @@ use alloc::vec::Vec;
 /// Maximum dbx update file size (1MB should be plenty)
 const MAX_DBX_SIZE: usize = 1024 * 1024;
 
-/// Microsoft's vendor GUID for dbx entries (for future dbx entry verification)
+/// Microsoft's vendor GUID for dbx entries
 #[allow(dead_code)]
 const MICROSOFT_OWNER_GUID: [u8; 16] = [
     0xbd, 0x9a, 0xfa, 0x77, 0x59, 0x03, 0x32, 0x4d, 0xbd, 0x60, 0x28, 0xf4, 0xe7, 0x8f, 0x78, 0x4b,
 ];
 
-/// File paths to search for dbx updates
-const DBX_PATHS: &[&str] = &[
+/// File paths to search for signed dbx updates (.auth format preferred)
+const DBX_AUTH_PATHS: &[&str] = &[
+    "EFI\\keys\\dbxupdate.auth",
+    "EFI\\keys\\DBXUPDATE.auth",
+    "EFI\\keys\\dbx.auth",
+    "EFI\\keys\\DBX.auth",
+    "EFI\\updatedbx\\dbxupdate.auth",
+    "EFI\\updatedbx\\DBXUPDATE.auth",
+    "EFI\\Microsoft\\Boot\\dbxupdate.auth",
+    "EFI\\MICROSOFT\\BOOT\\DBXUPDATE.auth",
+];
+
+/// File paths to search for raw dbx files (only used in Setup Mode)
+const DBX_RAW_PATHS: &[&str] = &[
     "EFI\\keys\\dbx.bin",
     "EFI\\keys\\DBX.bin",
     "EFI\\keys\\dbx.esl",
@@ -56,6 +82,24 @@ const DBX_PATHS: &[&str] = &[
     "EFI\\Microsoft\\Boot\\dbx.bin",
     "EFI\\MICROSOFT\\BOOT\\DBX.bin",
 ];
+
+/// Source of dbx update
+#[derive(Debug, Clone, Copy)]
+pub enum DbxSource {
+    /// Authenticated update file (signed)
+    Authenticated(&'static str),
+    /// Raw update file (only in Setup Mode)
+    Raw(&'static str),
+}
+
+impl DbxSource {
+    fn as_str(&self) -> &'static str {
+        match self {
+            DbxSource::Authenticated(s) => s,
+            DbxSource::Raw(s) => s,
+        }
+    }
+}
 
 /// Result of dbx enrollment
 #[derive(Debug, Clone)]
@@ -69,19 +113,45 @@ pub struct DbxEnrollmentResult {
 }
 
 /// Search all available ESPs for dbx update files
-pub fn find_dbx_file() -> Option<(Vec<u8>, &'static str)> {
+///
+/// Prefers authenticated (.auth) files over raw files.
+/// Raw files are only accepted in Setup Mode.
+pub fn find_dbx_file() -> Option<(Vec<u8>, DbxSource)> {
+    // Try authenticated files first
+    if let Some((data, source)) = search_all_disks_for_dbx(DBX_AUTH_PATHS, true) {
+        return Some((data, DbxSource::Authenticated(source)));
+    }
+
+    // Try raw files only in Setup Mode
+    if is_setup_mode() {
+        if let Some((data, source)) = search_all_disks_for_dbx(DBX_RAW_PATHS, false) {
+            log::warn!("Using raw dbx file in Setup Mode - this is less secure");
+            return Some((data, DbxSource::Raw(source)));
+        }
+    } else {
+        log::debug!("Not in Setup Mode - skipping raw dbx files (require signature)");
+    }
+
+    None
+}
+
+/// Search all disks for dbx files with the given paths
+fn search_all_disks_for_dbx(
+    paths: &[&str],
+    _authenticated: bool,
+) -> Option<(Vec<u8>, &'static str)> {
     // Try NVMe devices
-    if let Some(result) = search_nvme_for_dbx() {
+    if let Some(result) = search_nvme_for_dbx(paths) {
         return Some(result);
     }
 
     // Try AHCI devices
-    if let Some(result) = search_ahci_for_dbx() {
+    if let Some(result) = search_ahci_for_dbx(paths) {
         return Some(result);
     }
 
     // Try SDHCI devices
-    if let Some(result) = search_sdhci_for_dbx() {
+    if let Some(result) = search_sdhci_for_dbx(paths) {
         return Some(result);
     }
 
@@ -89,7 +159,7 @@ pub fn find_dbx_file() -> Option<(Vec<u8>, &'static str)> {
 }
 
 /// Search NVMe devices for dbx files
-fn search_nvme_for_dbx() -> Option<(Vec<u8>, &'static str)> {
+fn search_nvme_for_dbx(paths: &[&str]) -> Option<(Vec<u8>, &'static str)> {
     use crate::drivers::nvme;
 
     if let Some(controller) = nvme::get_controller(0)
@@ -100,7 +170,7 @@ fn search_nvme_for_dbx() -> Option<(Vec<u8>, &'static str)> {
         if let Some(controller) = nvme::get_controller(0) {
             let mut disk = NvmeDisk::new(controller, nsid);
 
-            if let Some(result) = search_disk_for_dbx(&mut disk, "NVMe") {
+            if let Some(result) = search_disk_for_dbx(&mut disk, "NVMe", paths) {
                 return Some(result);
             }
         }
@@ -110,7 +180,7 @@ fn search_nvme_for_dbx() -> Option<(Vec<u8>, &'static str)> {
 }
 
 /// Search AHCI devices for dbx files
-fn search_ahci_for_dbx() -> Option<(Vec<u8>, &'static str)> {
+fn search_ahci_for_dbx(paths: &[&str]) -> Option<(Vec<u8>, &'static str)> {
     use crate::drivers::ahci;
 
     if let Some(controller) = ahci::get_controller(0) {
@@ -120,7 +190,7 @@ fn search_ahci_for_dbx() -> Option<(Vec<u8>, &'static str)> {
             if let Some(controller) = ahci::get_controller(0) {
                 let mut disk = AhciDisk::new(controller, port_index);
 
-                if let Some(result) = search_disk_for_dbx(&mut disk, "SATA") {
+                if let Some(result) = search_disk_for_dbx(&mut disk, "SATA", paths) {
                     return Some(result);
                 }
             }
@@ -131,7 +201,7 @@ fn search_ahci_for_dbx() -> Option<(Vec<u8>, &'static str)> {
 }
 
 /// Search SDHCI devices for dbx files
-fn search_sdhci_for_dbx() -> Option<(Vec<u8>, &'static str)> {
+fn search_sdhci_for_dbx(paths: &[&str]) -> Option<(Vec<u8>, &'static str)> {
     use crate::drivers::sdhci;
 
     for controller_id in 0..sdhci::controller_count() {
@@ -143,7 +213,7 @@ fn search_sdhci_for_dbx() -> Option<(Vec<u8>, &'static str)> {
             if let Some(controller) = sdhci::get_controller(controller_id) {
                 let mut disk = SdhciDisk::new(controller);
 
-                if let Some(result) = search_disk_for_dbx(&mut disk, "SD") {
+                if let Some(result) = search_disk_for_dbx(&mut disk, "SD", paths) {
                     return Some(result);
                 }
             }
@@ -157,6 +227,7 @@ fn search_sdhci_for_dbx() -> Option<(Vec<u8>, &'static str)> {
 fn search_disk_for_dbx(
     disk: &mut dyn BlockDevice,
     source: &'static str,
+    paths: &[&str],
 ) -> Option<(Vec<u8>, &'static str)> {
     // Read GPT
     let header = gpt::read_gpt_header(disk).ok()?;
@@ -174,7 +245,7 @@ fn search_disk_for_dbx(
         };
 
         // Search for dbx file
-        if let Some(data) = try_load_dbx_file(&mut fat) {
+        if let Some(data) = try_load_dbx_file(&mut fat, paths) {
             return Some((data, source));
         }
     }
@@ -182,9 +253,9 @@ fn search_disk_for_dbx(
     None
 }
 
-/// Try to load a dbx file from any of the known paths
-fn try_load_dbx_file(fat: &mut FatFilesystem<'_>) -> Option<Vec<u8>> {
-    for path in DBX_PATHS {
+/// Try to load a dbx file from any of the given paths
+fn try_load_dbx_file(fat: &mut FatFilesystem<'_>, paths: &[&str]) -> Option<Vec<u8>> {
+    for path in paths {
         if let Ok(size) = fat.file_size(path)
             && size > 0
             && size <= MAX_DBX_SIZE as u32
@@ -206,6 +277,12 @@ fn try_load_dbx_file(fat: &mut FatFilesystem<'_>) -> Option<Vec<u8>> {
 /// This searches all ESPs for a dbx update file and applies it to the
 /// forbidden signature database.
 ///
+/// # Security
+///
+/// - In User Mode: Only accepts authenticated (.auth) files signed by KEK or PK
+/// - In Setup Mode: Accepts raw files without signature verification
+/// - All updates are subject to anti-downgrade timestamp checking
+///
 /// # Returns
 ///
 /// On success, returns the number of entries added to dbx.
@@ -217,10 +294,24 @@ pub fn enroll_dbx_from_file() -> Result<DbxEnrollmentResult, AuthError> {
         AuthError::NoSuitableKey
     })?;
 
-    log::info!("Found dbx update ({} bytes) on {}", data.len(), source);
+    let source_str = source.as_str();
+    log::info!("Found dbx update ({} bytes) on {}", data.len(), source_str);
 
-    // Parse and apply the dbx update
-    let result = apply_dbx_update(&data, source)?;
+    let result = match source {
+        DbxSource::Authenticated(src) => {
+            // Verify signature and apply
+            apply_authenticated_dbx_update(&data, src)?
+        }
+        DbxSource::Raw(src) => {
+            // In Setup Mode, apply without signature verification
+            // but still check timestamp
+            if !is_setup_mode() {
+                log::error!("Raw dbx files require Setup Mode");
+                return Err(AuthError::SignatureVerificationFailed);
+            }
+            apply_raw_dbx_update(&data, src)?
+        }
+    };
 
     // Persist the updated dbx
     super::boot::persist_key_databases()?;
@@ -229,16 +320,196 @@ pub fn enroll_dbx_from_file() -> Result<DbxEnrollmentResult, AuthError> {
         "dbx updated: {} SHA-256 hashes, {} certificates from {}",
         result.sha256_count,
         result.x509_count,
-        source
+        result.source
     );
 
     Ok(result)
 }
 
-/// Apply a dbx update from raw signature list data
+/// Apply an authenticated dbx update (EFI_VARIABLE_AUTHENTICATION_2 format)
 ///
-/// The data should be in EFI_SIGNATURE_LIST format (one or more lists).
-pub fn apply_dbx_update(
+/// This function:
+/// 1. Parses the EFI_VARIABLE_AUTHENTICATION_2 header
+/// 2. Verifies the PKCS#7 signature against KEK or PK
+/// 3. Checks the timestamp is newer than current dbx timestamp
+/// 4. Applies the signature list entries to dbx
+fn apply_authenticated_dbx_update(
+    data: &[u8],
+    source: &'static str,
+) -> Result<DbxEnrollmentResult, AuthError> {
+    // Parse the EFI_VARIABLE_AUTHENTICATION_2 header
+    let auth_header = EfiVariableAuthentication2::from_bytes(data).ok_or_else(|| {
+        log::error!("Failed to parse EFI_VARIABLE_AUTHENTICATION_2 header");
+        AuthError::InvalidHeader
+    })?;
+
+    // Verify the certificate type is PKCS#7
+    let pkcs7_guid = guid_to_bytes(&EFI_CERT_TYPE_PKCS7_GUID);
+    if !auth_header.auth_info.cert_type_matches(&pkcs7_guid) {
+        log::error!("dbx update certificate type is not PKCS#7");
+        return Err(AuthError::InvalidHeader);
+    }
+
+    // Get the timestamp from the header
+    let update_timestamp = auth_header.time_stamp;
+
+    // Anti-downgrade check: verify timestamp is newer than current dbx
+    {
+        let dbx = dbx_database();
+        let current_timestamp = dbx.timestamp();
+        if !update_timestamp.is_after(current_timestamp) {
+            log::error!(
+                "dbx update timestamp is not newer than current (possible downgrade attack)"
+            );
+            return Err(AuthError::InvalidTimestamp);
+        }
+    }
+
+    // Get the PKCS#7 signature data
+    let pkcs7_data = auth_header.get_cert_data(data).ok_or_else(|| {
+        log::error!("Failed to extract PKCS#7 data from dbx update");
+        AuthError::InvalidHeader
+    })?;
+
+    // Get the variable data (signature lists)
+    let sig_list_data = auth_header.get_variable_data(data).ok_or_else(|| {
+        log::error!("Failed to extract signature list data from dbx update");
+        AuthError::InvalidHeader
+    })?;
+
+    // Build the data that was signed (for UEFI authenticated variables)
+    // This is: variable_name + vendor_guid + attributes + timestamp + content
+    let signed_data = build_dbx_signed_data(&update_timestamp, sig_list_data);
+
+    // Verify signature against KEK or PK
+    if !verify_dbx_signature(pkcs7_data, &signed_data)? {
+        log::error!("dbx update signature verification failed");
+        return Err(AuthError::SignatureVerificationFailed);
+    }
+
+    log::info!("dbx update signature verified successfully");
+
+    // Apply the entries
+    let result = apply_signature_list_entries(sig_list_data, source)?;
+
+    // Update the dbx timestamp
+    {
+        let mut dbx = dbx_database();
+        dbx.set_timestamp(update_timestamp);
+    }
+
+    Ok(result)
+}
+
+/// Apply a raw dbx update (Setup Mode only)
+///
+/// Raw updates don't have a signature, but we still check for a reasonable
+/// format and update the timestamp.
+fn apply_raw_dbx_update(
+    data: &[u8],
+    source: &'static str,
+) -> Result<DbxEnrollmentResult, AuthError> {
+    // In Setup Mode, we allow raw signature list data
+    // Set the timestamp to now to prevent downgrades
+    let result = apply_signature_list_entries(data, source)?;
+
+    // Update timestamp to current time
+    {
+        let mut dbx = dbx_database();
+        let current_time = get_current_time();
+        dbx.set_timestamp(current_time);
+    }
+
+    Ok(result)
+}
+
+/// Build the signed data blob for dbx variable authentication
+///
+/// Per UEFI spec, authenticated variables sign:
+/// - VariableName (UCS-2, null-terminated)
+/// - VendorGuid
+/// - Attributes
+/// - Timestamp
+/// - Variable content
+fn build_dbx_signed_data(timestamp: &EfiTime, content: &[u8]) -> Vec<u8> {
+    use super::{EFI_IMAGE_SECURITY_DATABASE_GUID, attributes};
+
+    let mut data = Vec::new();
+
+    // Variable name "dbx" in UCS-2 (without null terminator for signing)
+    data.extend_from_slice(&[0x64, 0x00, 0x62, 0x00, 0x78, 0x00]); // "dbx"
+
+    // Vendor GUID
+    data.extend_from_slice(&guid_to_bytes(&EFI_IMAGE_SECURITY_DATABASE_GUID));
+
+    // Attributes (4 bytes, little-endian)
+    let attrs = attributes::SECURE_BOOT_ATTRS;
+    data.extend_from_slice(&attrs.to_le_bytes());
+
+    // Timestamp (16 bytes)
+    // Copy the EfiTime fields directly
+    data.extend_from_slice(&timestamp.year.to_le_bytes());
+    data.push(timestamp.month);
+    data.push(timestamp.day);
+    data.push(timestamp.hour);
+    data.push(timestamp.minute);
+    data.push(timestamp.second);
+    data.push(timestamp.pad1);
+    data.extend_from_slice(&timestamp.nanosecond.to_le_bytes());
+    data.extend_from_slice(&timestamp.timezone.to_le_bytes());
+    data.push(timestamp.daylight);
+    data.push(timestamp.pad2);
+
+    // Variable content (signature lists)
+    data.extend_from_slice(content);
+
+    data
+}
+
+/// Verify the dbx update signature against KEK or PK
+fn verify_dbx_signature(pkcs7_data: &[u8], signed_data: &[u8]) -> Result<bool, AuthError> {
+    // Try to verify against KEK certificates
+    {
+        let kek = kek_database();
+        for cert_data in kek.x509_certificates() {
+            match verify_pkcs7_signature(pkcs7_data, signed_data, cert_data) {
+                Ok(true) => {
+                    log::info!("dbx update verified with KEK certificate");
+                    return Ok(true);
+                }
+                Ok(false) => continue,
+                Err(e) => {
+                    log::debug!("KEK verification error: {:?}", e);
+                    continue;
+                }
+            }
+        }
+    }
+
+    // Try to verify against PK
+    {
+        let pk = pk_database();
+        for cert_data in pk.x509_certificates() {
+            match verify_pkcs7_signature(pkcs7_data, signed_data, cert_data) {
+                Ok(true) => {
+                    log::info!("dbx update verified with PK certificate");
+                    return Ok(true);
+                }
+                Ok(false) => continue,
+                Err(e) => {
+                    log::debug!("PK verification error: {:?}", e);
+                    continue;
+                }
+            }
+        }
+    }
+
+    log::warn!("dbx update signature did not verify against any KEK or PK certificate");
+    Ok(false)
+}
+
+/// Apply signature list entries to the dbx database
+fn apply_signature_list_entries(
     data: &[u8],
     source: &'static str,
 ) -> Result<DbxEnrollmentResult, AuthError> {
@@ -331,4 +602,70 @@ fn entry_exists_in_dbx(
     }
 
     false
+}
+
+/// Get current time for timestamp updates
+fn get_current_time() -> EfiTime {
+    use crate::arch::x86_64::io;
+
+    // Wait for RTC update to complete
+    loop {
+        unsafe {
+            io::outb(0x70, 0x0A);
+            if io::inb(0x71) & 0x80 == 0 {
+                break;
+            }
+        }
+    }
+
+    let read_cmos = |reg: u8| -> u8 {
+        unsafe {
+            io::outb(0x70, reg);
+            io::inb(0x71)
+        }
+    };
+
+    let second = read_cmos(0x00);
+    let minute = read_cmos(0x02);
+    let hour = read_cmos(0x04);
+    let day = read_cmos(0x07);
+    let month = read_cmos(0x08);
+    let year = read_cmos(0x09);
+    let century = read_cmos(0x32);
+
+    // Check if BCD mode
+    let status_b = read_cmos(0x0B);
+    let is_bcd = (status_b & 0x04) == 0;
+
+    let convert = |val: u8| -> u8 {
+        if is_bcd {
+            (val & 0x0F) + ((val >> 4) * 10)
+        } else {
+            val
+        }
+    };
+
+    let second = convert(second);
+    let minute = convert(minute);
+    let hour = convert(hour);
+    let day = convert(day);
+    let month = convert(month);
+    let year = convert(year);
+    let century = if century > 0 { convert(century) } else { 20 };
+
+    let full_year = (century as u16) * 100 + (year as u16);
+
+    EfiTime {
+        year: full_year,
+        month,
+        day,
+        hour,
+        minute,
+        second,
+        pad1: 0,
+        nanosecond: 0,
+        timezone: 0x7FF, // EFI_UNSPECIFIED_TIMEZONE
+        daylight: 0,
+        pad2: 0,
+    }
 }

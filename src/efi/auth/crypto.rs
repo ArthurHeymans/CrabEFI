@@ -335,11 +335,13 @@ pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 /// 1. If the cert's issuer matches the trusted cert's subject (direct chain)
 /// 2. Verify the cert's signature with the trusted cert's public key
 /// 3. Validate the certificate's validity period (notBefore/notAfter)
+/// 4. Validate the trusted cert has basicConstraints with CA:TRUE
+/// 5. Validate the trusted cert has keyUsage with keyCertSign
 fn verify_cert_chain(
     cert: &X509Certificate,
     cert_der: &[u8],
     trusted: &X509Certificate,
-    _trusted_der: &[u8],
+    trusted_der: &[u8],
 ) -> Result<bool, AuthError> {
     use der::Decode;
     use x509_cert::Certificate;
@@ -354,6 +356,19 @@ fn verify_cert_chain(
     // Validate certificate time validity
     if let Err(e) = validate_certificate_time(cert_der) {
         log::warn!("Certificate validity period check failed: {:?}", e);
+        return Ok(false);
+    }
+
+    // Validate that the trusted certificate can be used as a CA
+    // (has basicConstraints with CA:TRUE)
+    if let Err(e) = validate_basic_constraints_for_ca(trusted_der) {
+        log::warn!("Trusted certificate basicConstraints check failed: {:?}", e);
+        return Ok(false);
+    }
+
+    // Validate that the trusted certificate has keyCertSign in keyUsage
+    if let Err(e) = validate_key_usage_for_ca(trusted_der) {
+        log::warn!("Trusted certificate keyUsage check failed: {:?}", e);
         return Ok(false);
     }
 
@@ -432,6 +447,316 @@ fn validate_certificate_time(cert_der: &[u8]) -> Result<(), AuthError> {
 
     log::debug!("Certificate validity period OK");
     Ok(())
+}
+
+// ============================================================================
+// Certificate Extension Validation (basicConstraints, keyUsage)
+// ============================================================================
+
+/// X.509 extension OIDs
+mod extension_oids {
+    /// basicConstraints: 2.5.29.19
+    pub const BASIC_CONSTRAINTS: &[u8] = &[0x55, 0x1d, 0x13];
+    /// keyUsage: 2.5.29.15
+    pub const KEY_USAGE: &[u8] = &[0x55, 0x1d, 0x0f];
+}
+
+/// Key usage bits (as defined in RFC 5280)
+#[allow(dead_code)]
+pub mod key_usage_bits {
+    pub const DIGITAL_SIGNATURE: u8 = 0; // Bit 0
+    pub const NON_REPUDIATION: u8 = 1; // Bit 1 (contentCommitment)
+    pub const KEY_ENCIPHERMENT: u8 = 2; // Bit 2
+    pub const DATA_ENCIPHERMENT: u8 = 3; // Bit 3
+    pub const KEY_AGREEMENT: u8 = 4; // Bit 4
+    pub const KEY_CERT_SIGN: u8 = 5; // Bit 5 - required for CA certificates
+    pub const CRL_SIGN: u8 = 6; // Bit 6
+    pub const ENCIPHER_ONLY: u8 = 7; // Bit 7
+    pub const DECIPHER_ONLY: u8 = 8; // Bit 8 (in second byte)
+}
+
+/// Parsed basicConstraints extension
+#[derive(Debug, Clone, Copy)]
+pub struct BasicConstraints {
+    /// Whether this certificate is a CA
+    pub ca: bool,
+    /// Path length constraint (if present)
+    pub path_len_constraint: Option<u32>,
+}
+
+/// Parsed keyUsage extension
+#[derive(Debug, Clone, Copy)]
+pub struct KeyUsage {
+    /// Raw key usage bits (up to 9 bits)
+    bits: u16,
+}
+
+impl KeyUsage {
+    /// Check if a specific key usage bit is set
+    pub fn has_bit(&self, bit: u8) -> bool {
+        if bit > 8 {
+            return false;
+        }
+        (self.bits & (1 << bit)) != 0
+    }
+
+    /// Check if digitalSignature is set
+    pub fn digital_signature(&self) -> bool {
+        self.has_bit(key_usage_bits::DIGITAL_SIGNATURE)
+    }
+
+    /// Check if keyCertSign is set
+    pub fn key_cert_sign(&self) -> bool {
+        self.has_bit(key_usage_bits::KEY_CERT_SIGN)
+    }
+}
+
+/// Validate that a certificate can be used as a CA (issuer)
+///
+/// Per RFC 5280 Section 4.2.1.9:
+/// - If basicConstraints is present, cA must be TRUE
+/// - For PKIX-compliant CAs, basicConstraints MUST be present with cA=TRUE
+///
+/// Returns Ok(()) if the certificate can be used as a CA.
+pub fn validate_basic_constraints_for_ca(cert_der: &[u8]) -> Result<(), AuthError> {
+    match extract_basic_constraints(cert_der) {
+        Ok(Some(bc)) => {
+            if bc.ca {
+                log::debug!("Certificate has basicConstraints CA:TRUE");
+                Ok(())
+            } else {
+                log::warn!("Certificate has basicConstraints but CA:FALSE");
+                Err(AuthError::CertificateNotCA)
+            }
+        }
+        Ok(None) => {
+            // No basicConstraints extension - this is an end-entity certificate
+            // It cannot be used as a CA to sign other certificates
+            log::warn!("Certificate missing basicConstraints extension - cannot be used as CA");
+            Err(AuthError::CertificateNotCA)
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// Validate that a certificate has appropriate keyUsage for signing other certificates
+///
+/// Per RFC 5280 Section 4.2.1.3:
+/// - The keyCertSign bit MUST be asserted when the certificate is used to verify
+///   a signature on a certificate
+///
+/// Returns Ok(()) if the certificate can be used to sign other certificates.
+pub fn validate_key_usage_for_ca(cert_der: &[u8]) -> Result<(), AuthError> {
+    match extract_key_usage(cert_der) {
+        Ok(Some(ku)) => {
+            if ku.key_cert_sign() {
+                log::debug!("Certificate has keyUsage with keyCertSign");
+                Ok(())
+            } else {
+                log::warn!(
+                    "Certificate has keyUsage but keyCertSign not set (bits: {:04x})",
+                    ku.bits
+                );
+                Err(AuthError::InvalidKeyUsage)
+            }
+        }
+        Ok(None) => {
+            // No keyUsage extension
+            // Per RFC 5280, if the extension is absent, all key usages are allowed
+            // However, for security, we should warn but allow for compatibility
+            // with older certificates that may not have keyUsage
+            log::debug!("Certificate has no keyUsage extension - allowing for compatibility");
+            Ok(())
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// Validate that a certificate has appropriate keyUsage for code signing
+///
+/// For Authenticode verification, the signing certificate should have
+/// digitalSignature set (bit 0).
+///
+/// Returns Ok(()) if the certificate can be used for code signing.
+#[allow(dead_code)]
+pub fn validate_key_usage_for_code_signing(cert_der: &[u8]) -> Result<(), AuthError> {
+    match extract_key_usage(cert_der) {
+        Ok(Some(ku)) => {
+            if ku.digital_signature() {
+                log::debug!("Certificate has keyUsage with digitalSignature");
+                Ok(())
+            } else {
+                log::warn!(
+                    "Certificate has keyUsage but digitalSignature not set (bits: {:04x})",
+                    ku.bits
+                );
+                Err(AuthError::InvalidKeyUsage)
+            }
+        }
+        Ok(None) => {
+            // No keyUsage extension - allow for compatibility
+            log::debug!("Certificate has no keyUsage extension - allowing for compatibility");
+            Ok(())
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// Extract the basicConstraints extension from a certificate
+fn extract_basic_constraints(cert_der: &[u8]) -> Result<Option<BasicConstraints>, AuthError> {
+    use der::Decode;
+    use x509_cert::Certificate;
+
+    let cert = Certificate::from_der(cert_der).map_err(|_| AuthError::CertificateParseError)?;
+
+    if let Some(extensions) = &cert.tbs_certificate.extensions {
+        for ext in extensions.iter() {
+            if ext.extn_id.as_bytes() == extension_oids::BASIC_CONSTRAINTS {
+                // Parse the basicConstraints value
+                // BasicConstraints ::= SEQUENCE {
+                //     cA                      BOOLEAN DEFAULT FALSE,
+                //     pathLenConstraint       INTEGER (0..MAX) OPTIONAL
+                // }
+                let value = ext.extn_value.as_bytes();
+                return parse_basic_constraints(value).map(Some);
+            }
+        }
+    }
+
+    Ok(None)
+}
+
+/// Parse the basicConstraints extension value
+fn parse_basic_constraints(data: &[u8]) -> Result<BasicConstraints, AuthError> {
+    // BasicConstraints is a SEQUENCE
+    if data.is_empty() || data[0] != 0x30 {
+        return Err(AuthError::CertificateParseError);
+    }
+
+    let (seq_len, seq_offset) = parse_der_length(&data[1..])?;
+    if 1 + seq_offset + seq_len > data.len() {
+        return Err(AuthError::CertificateParseError);
+    }
+
+    let seq_data = &data[1 + seq_offset..1 + seq_offset + seq_len];
+
+    // Empty sequence means cA=FALSE (the default)
+    if seq_data.is_empty() {
+        return Ok(BasicConstraints {
+            ca: false,
+            path_len_constraint: None,
+        });
+    }
+
+    // First element should be BOOLEAN cA (tag 0x01)
+    let mut offset = 0;
+    let mut ca = false;
+    let mut path_len_constraint = None;
+
+    if seq_data[offset] == 0x01 {
+        // BOOLEAN
+        if offset + 3 > seq_data.len() {
+            return Err(AuthError::CertificateParseError);
+        }
+        let len = seq_data[offset + 1] as usize;
+        if len != 1 || offset + 2 + len > seq_data.len() {
+            return Err(AuthError::CertificateParseError);
+        }
+        ca = seq_data[offset + 2] != 0;
+        offset += 2 + len;
+    }
+
+    // Optional pathLenConstraint (INTEGER, tag 0x02)
+    if offset < seq_data.len() && seq_data[offset] == 0x02 {
+        let (int_len, int_offset) = parse_der_length(&seq_data[offset + 1..])?;
+        if offset + 1 + int_offset + int_len > seq_data.len() {
+            return Err(AuthError::CertificateParseError);
+        }
+        let int_data = &seq_data[offset + 1 + int_offset..offset + 1 + int_offset + int_len];
+
+        // Parse the integer (simple case for small values)
+        let mut val = 0u32;
+        for &b in int_data {
+            val = val.saturating_mul(256).saturating_add(b as u32);
+        }
+        path_len_constraint = Some(val);
+    }
+
+    Ok(BasicConstraints {
+        ca,
+        path_len_constraint,
+    })
+}
+
+/// Extract the keyUsage extension from a certificate
+fn extract_key_usage(cert_der: &[u8]) -> Result<Option<KeyUsage>, AuthError> {
+    use der::Decode;
+    use x509_cert::Certificate;
+
+    let cert = Certificate::from_der(cert_der).map_err(|_| AuthError::CertificateParseError)?;
+
+    if let Some(extensions) = &cert.tbs_certificate.extensions {
+        for ext in extensions.iter() {
+            if ext.extn_id.as_bytes() == extension_oids::KEY_USAGE {
+                // Parse the keyUsage value
+                // KeyUsage ::= BIT STRING
+                let value = ext.extn_value.as_bytes();
+                return parse_key_usage(value).map(Some);
+            }
+        }
+    }
+
+    Ok(None)
+}
+
+/// Parse the keyUsage extension value
+fn parse_key_usage(data: &[u8]) -> Result<KeyUsage, AuthError> {
+    // keyUsage is a BIT STRING (tag 0x03)
+    if data.is_empty() || data[0] != 0x03 {
+        return Err(AuthError::CertificateParseError);
+    }
+
+    let (len, offset) = parse_der_length(&data[1..])?;
+    if 1 + offset + len > data.len() || len < 2 {
+        return Err(AuthError::CertificateParseError);
+    }
+
+    let bit_string = &data[1 + offset..1 + offset + len];
+
+    // First byte is the number of unused bits in the last byte
+    let unused_bits = bit_string[0];
+    if unused_bits > 7 {
+        return Err(AuthError::CertificateParseError);
+    }
+
+    // Parse the key usage bits
+    // The bits are in network order (MSB first), but we want bit 0 to be digitalSignature
+    // In the encoding, digitalSignature is the MSB of the first byte
+    let mut bits: u16 = 0;
+
+    if bit_string.len() > 1 {
+        // First byte of the bit string (after unused bits count)
+        // Bit 7 = digitalSignature (bit 0 in our numbering)
+        // Bit 6 = nonRepudiation (bit 1)
+        // etc.
+        let byte1 = bit_string[1];
+        bits |= (((byte1 >> 7) & 1) as u16) << 0; // digitalSignature
+        bits |= (((byte1 >> 6) & 1) as u16) << 1; // nonRepudiation
+        bits |= (((byte1 >> 5) & 1) as u16) << 2; // keyEncipherment
+        bits |= (((byte1 >> 4) & 1) as u16) << 3; // dataEncipherment
+        bits |= (((byte1 >> 3) & 1) as u16) << 4; // keyAgreement
+        bits |= (((byte1 >> 2) & 1) as u16) << 5; // keyCertSign
+        bits |= (((byte1 >> 1) & 1) as u16) << 6; // cRLSign
+        bits |= (((byte1 >> 0) & 1) as u16) << 7; // encipherOnly
+    }
+
+    if bit_string.len() > 2 {
+        // Second byte for decipherOnly
+        let byte2 = bit_string[2];
+        bits |= (((byte2 >> 7) & 1) as u16) << 8; // decipherOnly
+    }
+
+    Ok(KeyUsage { bits })
 }
 
 /// Convert a date/time to approximate Unix timestamp (seconds since 1970-01-01 00:00:00 UTC)

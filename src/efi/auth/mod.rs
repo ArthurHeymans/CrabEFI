@@ -274,6 +274,10 @@ pub enum AuthError {
     CertificateNotYetValid,
     /// Certificate has expired (current time > notAfter)
     CertificateExpired,
+    /// Certificate is not a CA (missing basicConstraints CA:TRUE)
+    CertificateNotCA,
+    /// Certificate has invalid key usage for the operation
+    InvalidKeyUsage,
     /// Invalid variable name for authenticated variable
     InvalidVariableName,
     /// Access denied (wrong key database used)
@@ -300,6 +304,8 @@ impl From<AuthError> for r_efi::efi::Status {
             AuthError::CertificateParseError => r_efi::efi::Status::INVALID_PARAMETER,
             AuthError::CertificateNotYetValid => r_efi::efi::Status::SECURITY_VIOLATION,
             AuthError::CertificateExpired => r_efi::efi::Status::SECURITY_VIOLATION,
+            AuthError::CertificateNotCA => r_efi::efi::Status::SECURITY_VIOLATION,
+            AuthError::InvalidKeyUsage => r_efi::efi::Status::SECURITY_VIOLATION,
             AuthError::InvalidVariableName => r_efi::efi::Status::INVALID_PARAMETER,
             AuthError::AccessDenied => r_efi::efi::Status::ACCESS_DENIED,
             AuthError::SecureBootDisabled => r_efi::efi::Status::SECURITY_VIOLATION,
