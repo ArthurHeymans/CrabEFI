@@ -293,6 +293,12 @@ pub struct ScreenInfo {
     _reserved: [u8; 2],   // 0x3e
 }
 
+impl Default for ScreenInfo {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ScreenInfo {
     /// VIDEO_TYPE_EFI - EFI/UEFI framebuffer
     pub const VIDEO_TYPE_EFI: u8 = 0x70;
@@ -463,7 +469,7 @@ impl BootParams {
 
         // Calculate framebuffer size in 64KB units
         let fb_size = fb.bytes_per_line as u64 * fb.y_resolution as u64;
-        self.screen_info.lfb_size = ((fb_size + 0xFFFF) / 0x10000) as u32;
+        self.screen_info.lfb_size = fb_size.div_ceil(0x10000) as u32;
 
         // Set color mask information
         self.screen_info.red_size = fb.red_mask_size;
