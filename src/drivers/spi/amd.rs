@@ -19,6 +19,7 @@
 
 use super::amd_chipsets::AmdChipset;
 use super::regs::*;
+use super::sfdp::{self, SfdpInfo, SfdpReader, SfdpResult};
 use super::{Result, SpiController, SpiError, SpiMode, delay_us};
 use crate::drivers::mmio::MmioRegion;
 use crate::drivers::pci::{self, PciAddress, PciDevice};
@@ -73,6 +74,10 @@ const AMD_SPI_BAR_OFFSET: u8 = 0xa0;
 /// LPC function number in AMD FCH
 const AMD_LPC_FUNCTION: u8 = 3;
 
+/// Maximum addressable flash size with 24-bit addressing (16 MB)
+/// AMD SPI100 uses 3-byte addresses, limiting addressable range to 16 MB
+const MAX_FLASH_SIZE: u32 = 16 * 1024 * 1024;
+
 /// AMD SPI100 Controller
 pub struct AmdSpi100Controller {
     /// Memory-mapped SPI registers
@@ -85,6 +90,12 @@ pub struct AmdSpi100Controller {
     pci_addr: PciAddress,
     /// Original alternate speed (for restoration on shutdown)
     _altspeed: u8,
+    /// Total flash size in bytes (from SFDP or default)
+    flash_size: u32,
+    /// Page size in bytes for programming (from SFDP or default)
+    page_size: u32,
+    /// SFDP information (if probed successfully)
+    sfdp_info: Option<SfdpInfo>,
 }
 
 impl AmdSpi100Controller {
@@ -145,6 +156,10 @@ impl AmdSpi100Controller {
             chipset,
             pci_addr: pci_dev.address,
             _altspeed: altspeed,
+            // Defaults - will be updated by SFDP probe if available
+            flash_size: MAX_FLASH_SIZE,
+            page_size: 256,
+            sfdp_info: None,
         };
 
         // Initialize the controller
@@ -167,7 +182,43 @@ impl AmdSpi100Controller {
         // Set speed to 33MHz for better compatibility
         self.set_altspeed();
 
+        // Probe SFDP to discover flash parameters
+        self.probe_sfdp();
+
         Ok(())
+    }
+
+    /// Probe SFDP to discover flash parameters
+    fn probe_sfdp(&mut self) {
+        match sfdp::probe(self) {
+            Ok(info) => {
+                log::info!(
+                    "SFDP probe successful: {} MB flash, {} byte pages",
+                    info.density_bytes / (1024 * 1024),
+                    info.page_size
+                );
+
+                // Update controller parameters from SFDP
+                self.flash_size = info.density_bytes;
+                self.page_size = info.page_size;
+
+                // Log discovered erase types
+                for et in &info.erase_types {
+                    if et.is_valid() {
+                        log::debug!("  Erase: {} KB (opcode {:#04x})", et.size / 1024, et.opcode);
+                    }
+                }
+
+                self.sfdp_info = Some(info);
+            }
+            Err(e) => {
+                log::debug!("SFDP probe failed ({:?}), using defaults", e);
+                log::info!(
+                    "Flash size: {} MB (default, 24-bit addressing)",
+                    self.flash_size / (1024 * 1024)
+                );
+            }
+        }
     }
 
     /// Set alternate speed for programming
@@ -274,6 +325,24 @@ impl AmdSpi100Controller {
     /// Read data from flash using SPI READ command
     fn spi_read(&mut self, addr: u32, buf: &mut [u8]) -> Result<()> {
         let len = buf.len();
+        if len == 0 {
+            return Ok(());
+        }
+
+        // Validate that the entire read range fits within flash
+        let end_addr = addr
+            .checked_add(len as u32)
+            .ok_or(SpiError::AddressOutOfRange)?;
+        if end_addr > self.flash_size {
+            log::error!(
+                "Read range [{:#x}, {:#x}) exceeds flash size {:#x}",
+                addr,
+                end_addr,
+                self.flash_size
+            );
+            return Err(SpiError::AddressOutOfRange);
+        }
+
         let mut offset = 0;
 
         while offset < len {
@@ -297,13 +366,32 @@ impl AmdSpi100Controller {
     /// Write data to flash using SPI PAGE PROGRAM command
     fn spi_write(&mut self, addr: u32, data: &[u8]) -> Result<()> {
         let len = data.len();
+        if len == 0 {
+            return Ok(());
+        }
+
+        // Validate that the entire write range fits within flash
+        let end_addr = addr
+            .checked_add(len as u32)
+            .ok_or(SpiError::AddressOutOfRange)?;
+        if end_addr > self.flash_size {
+            log::error!(
+                "Write range [{:#x}, {:#x}) exceeds flash size {:#x}",
+                addr,
+                end_addr,
+                self.flash_size
+            );
+            return Err(SpiError::AddressOutOfRange);
+        }
+
         let mut offset = 0;
 
         while offset < len {
-            // Calculate chunk size (max 64 bytes, respect 256-byte page boundaries)
+            // Calculate chunk size (max 64 bytes, respect page boundaries)
             let remaining = len - offset;
             let current_addr = addr + offset as u32;
-            let page_remaining = 256 - (current_addr as usize & 0xFF);
+            let page_mask = (self.page_size - 1) as usize;
+            let page_remaining = self.page_size as usize - (current_addr as usize & page_mask);
             let chunk_len = remaining.min(SPI100_MAX_DATA - 3).min(page_remaining);
 
             // Prevent infinite loop if chunk_len is somehow 0
@@ -344,7 +432,25 @@ impl AmdSpi100Controller {
         }
 
         let mut current_addr = addr;
-        let end_addr = addr.checked_add(len).ok_or(SpiError::InvalidArgument)?;
+        let end_addr = addr.checked_add(len).ok_or(SpiError::AddressOutOfRange)?;
+
+        // Validate that the entire erase range fits within flash
+        if end_addr > self.flash_size {
+            log::error!(
+                "Erase range [{:#x}, {:#x}) exceeds flash size {:#x}",
+                addr,
+                end_addr,
+                self.flash_size
+            );
+            return Err(SpiError::AddressOutOfRange);
+        }
+
+        // Get the 4KB erase opcode from SFDP if available, otherwise use default
+        let erase_opcode = self
+            .sfdp_info
+            .as_ref()
+            .and_then(|info| info.erase_opcode_for_size(ERASE_SIZE))
+            .unwrap_or(JEDEC_SE);
 
         while current_addr < end_addr {
             // Send WREN (Write Enable) first
@@ -352,7 +458,7 @@ impl AmdSpi100Controller {
 
             // Build SECTOR ERASE command: opcode + 3-byte address
             let writearr = [
-                JEDEC_SE,
+                erase_opcode,
                 (current_addr >> 16) as u8,
                 (current_addr >> 8) as u8,
                 current_addr as u8,
@@ -435,5 +541,29 @@ impl SpiController for AmdSpi100Controller {
     fn get_bios_region(&self) -> Option<(u32, u32)> {
         // AMD doesn't have Intel Flash Descriptor
         None
+    }
+}
+
+// ============================================================================
+// SFDP Support
+// ============================================================================
+
+impl SfdpReader for AmdSpi100Controller {
+    /// Read SFDP data at the given address
+    ///
+    /// The RDSFDP command (0x5A) uses:
+    /// - 3-byte address
+    /// - 8 dummy cycles (1 byte) before data
+    fn read_sfdp(&mut self, addr: u32, buf: &mut [u8]) -> SfdpResult<()> {
+        // Build RDSFDP command: opcode + 3-byte address + 1 dummy byte
+        let cmd = sfdp::build_rdsfdp_command(addr);
+
+        // Send command and receive data
+        // We need to send 5 bytes (opcode + addr + dummy) and receive buf.len() bytes
+        if self.send_command(&cmd, buf).is_err() {
+            return Err(sfdp::SfdpError::ReadError);
+        }
+
+        Ok(())
     }
 }

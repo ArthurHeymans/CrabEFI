@@ -303,5 +303,3 @@ fn validate_certificate(data: &[u8]) -> Result<(), AuthError> {
         }
     }
 }
-
-

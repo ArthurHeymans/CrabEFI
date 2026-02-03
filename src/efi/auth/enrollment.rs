@@ -26,8 +26,8 @@
 //! enrollment::enroll_default_pk()?;
 //! ```
 
-use super::variables::{db_database, kek_database, pk_database, KeyDatabase, KeyDatabaseEntry};
-use super::{enter_user_mode, AuthError, EFI_CERT_X509_GUID};
+use super::variables::{KeyDatabase, KeyDatabaseEntry, db_database, kek_database, pk_database};
+use super::{AuthError, EFI_CERT_X509_GUID, enter_user_mode};
 
 // ============================================================================
 // Microsoft Owner GUID (used for signature entries)

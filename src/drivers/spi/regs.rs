@@ -369,6 +369,8 @@ pub const JEDEC_RDID: u8 = 0x9F;
 pub const JEDEC_REMS: u8 = 0x90;
 /// Read Electronic Signature
 pub const JEDEC_RES: u8 = 0xAB;
+/// Read SFDP (Serial Flash Discoverable Parameters)
+pub const JEDEC_RDSFDP: u8 = 0x5A;
 
 // ============================================================================
 // Hardware Sequencing Constants

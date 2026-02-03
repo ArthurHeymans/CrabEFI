@@ -75,6 +75,8 @@ pub struct IntelSpiController {
     hwseq_addr_mask: u32,
     /// HSFC FCYCLE field mask
     hsfc_fcycle_mask: u16,
+    /// Total flash size in bytes (derived from flash descriptor or address mask)
+    flash_size: u32,
     // TODO: Add opcode table for swseq support:
     // /// Current opcodes (for software sequencing)
     // opcodes: Option<Opcodes>,
@@ -97,7 +99,16 @@ impl IntelSpiController {
         // Map the SPI registers (512 bytes should be enough for all generations)
         let spibar = MmioRegion::new(spibar_addr, 0x200);
 
+        // Determine address mask based on generation
+        let hwseq_addr_mask = if generation.is_pch100_compatible() {
+            PCH100_FADDR_FLA
+        } else {
+            ICH9_FADDR_FLA
+        };
+
         // Initialize controller with default values
+        // flash_size starts as the maximum addressable size based on address mask,
+        // and will be refined during init() if a valid flash descriptor is present
         let mut controller = Self {
             spibar,
             generation,
@@ -107,16 +118,14 @@ impl IntelSpiController {
             desc_valid: false,
             mode: SpiMode::Auto,
             writes_enabled: false,
-            hwseq_addr_mask: if generation.is_pch100_compatible() {
-                PCH100_FADDR_FLA
-            } else {
-                ICH9_FADDR_FLA
-            },
+            hwseq_addr_mask,
             hsfc_fcycle_mask: if generation.is_pch100_compatible() {
                 PCH100_HSFC_FCYCLE
             } else {
                 HSFC_FCYCLE
             },
+            // Default to max addressable size; will be refined from flash descriptor
+            flash_size: hwseq_addr_mask + 1,
         };
 
         // Initialize the controller
@@ -273,6 +282,9 @@ impl IntelSpiController {
         // Determine operating mode
         self.determine_mode(requested_mode)?;
 
+        // Calculate flash size from descriptor regions
+        self.calculate_flash_size();
+
         // Clear any pending errors
         let hsfs = self.spibar.read16(ICH9_REG_HSFS);
         if hsfs & HSFS_FCERR != 0 {
@@ -350,6 +362,61 @@ impl IntelSpiController {
         Ok(())
     }
 
+    /// Calculate flash size from flash descriptor regions
+    ///
+    /// When the flash descriptor is valid, we read all FREG registers to find
+    /// the highest region limit, which gives us the total flash size.
+    /// If no valid descriptor, we fall back to the maximum addressable size.
+    fn calculate_flash_size(&mut self) {
+        if !self.desc_valid {
+            // No valid descriptor, use max addressable size from address mask
+            self.flash_size = self.hwseq_addr_mask + 1;
+            log::debug!(
+                "No flash descriptor, using max addressable size: {} MB",
+                self.flash_size / (1024 * 1024)
+            );
+            return;
+        }
+
+        // Read all 5 FREG registers (FREG0-FREG4) to find highest limit
+        // FREG0 = Flash Descriptor, FREG1 = BIOS, FREG2 = ME, FREG3 = GbE, FREG4 = Platform Data
+        let mut max_limit: u32 = 0;
+
+        for i in 0..5 {
+            let freg = self.spibar.read32(ICH9_REG_FREG0 + (i * 4) as u64);
+            let base = freg_base(freg);
+            let limit = freg_limit(freg);
+
+            // A valid region has base <= limit
+            if base <= limit {
+                if limit > max_limit {
+                    max_limit = limit;
+                }
+                log::debug!("FREG{}: base={:#x}, limit={:#x}", i, base, limit);
+            }
+        }
+
+        // Flash size is the limit + 1 (since limit is the last valid address)
+        // Use saturating_add to prevent overflow
+        self.flash_size = max_limit.saturating_add(1);
+
+        // Sanity check: flash_size should not exceed address mask capability
+        let max_addressable = self.hwseq_addr_mask + 1;
+        if self.flash_size > max_addressable {
+            log::warn!(
+                "Flash size {} MB exceeds addressable range {} MB, capping",
+                self.flash_size / (1024 * 1024),
+                max_addressable / (1024 * 1024)
+            );
+            self.flash_size = max_addressable;
+        }
+
+        log::info!(
+            "Flash size: {} MB (from descriptor)",
+            self.flash_size / (1024 * 1024)
+        );
+    }
+
     /// Print HSFS register bits for debugging
     fn print_hsfs(&self, hsfs: u16) {
         log::debug!(
@@ -406,10 +473,34 @@ impl IntelSpiController {
     // ========================================================================
 
     /// Set the flash address for hardware sequencing
-    #[inline(always)]
-    fn hwseq_set_addr(&self, addr: u32) {
-        self.spibar
-            .write32(ICH9_REG_FADDR, addr & self.hwseq_addr_mask);
+    ///
+    /// Returns an error if the address exceeds the flash size or address mask.
+    /// Unlike the previous implementation, this does NOT silently truncate
+    /// out-of-range addresses, which could lead to data corruption.
+    fn hwseq_set_addr(&self, addr: u32) -> Result<()> {
+        // Check if address exceeds flash size
+        if addr >= self.flash_size {
+            log::error!(
+                "Address {:#x} exceeds flash size {:#x}",
+                addr,
+                self.flash_size
+            );
+            return Err(SpiError::AddressOutOfRange);
+        }
+
+        // Check if address exceeds the hardware address mask
+        // This catches addresses that would be silently truncated
+        if addr != (addr & self.hwseq_addr_mask) {
+            log::error!(
+                "Address {:#x} exceeds hardware address space (mask {:#x})",
+                addr,
+                self.hwseq_addr_mask
+            );
+            return Err(SpiError::AddressOutOfRange);
+        }
+
+        self.spibar.write32(ICH9_REG_FADDR, addr);
+        Ok(())
     }
 
     /// Wait for hardware sequencing cycle to complete
@@ -449,6 +540,20 @@ impl IntelSpiController {
             return Ok(());
         }
 
+        // Validate that the entire read range fits within flash
+        let end_addr = addr
+            .checked_add(len as u32)
+            .ok_or(SpiError::AddressOutOfRange)?;
+        if end_addr > self.flash_size {
+            log::error!(
+                "Read range [{:#x}, {:#x}) exceeds flash size {:#x}",
+                addr,
+                end_addr,
+                self.flash_size
+            );
+            return Err(SpiError::AddressOutOfRange);
+        }
+
         let mut offset = 0;
         let mut current_addr = addr;
 
@@ -462,7 +567,7 @@ impl IntelSpiController {
             let page_remaining = 256 - (current_addr as usize & 0xFF);
             let block_len = remaining.min(HWSEQ_MAX_DATA).min(page_remaining);
 
-            self.hwseq_set_addr(current_addr);
+            self.hwseq_set_addr(current_addr)?;
 
             // Set up read cycle
             let mut hsfc = self.spibar.read16(ICH9_REG_HSFC);
@@ -496,6 +601,20 @@ impl IntelSpiController {
             return Err(SpiError::WriteProtected);
         }
 
+        // Validate that the entire write range fits within flash
+        let end_addr = addr
+            .checked_add(len as u32)
+            .ok_or(SpiError::AddressOutOfRange)?;
+        if end_addr > self.flash_size {
+            log::error!(
+                "Write range [{:#x}, {:#x}) exceeds flash size {:#x}",
+                addr,
+                end_addr,
+                self.flash_size
+            );
+            return Err(SpiError::AddressOutOfRange);
+        }
+
         let mut offset = 0;
         let mut current_addr = addr;
 
@@ -509,7 +628,7 @@ impl IntelSpiController {
             let page_remaining = 256 - (current_addr as usize & 0xFF);
             let block_len = remaining.min(HWSEQ_MAX_DATA).min(page_remaining);
 
-            self.hwseq_set_addr(current_addr);
+            self.hwseq_set_addr(current_addr)?;
 
             // Fill data registers first (before starting cycle)
             self.write_fdata(&data[offset..offset + block_len]);
@@ -548,14 +667,25 @@ impl IntelSpiController {
         }
 
         let mut current_addr = addr;
-        let end_addr = addr.checked_add(len).ok_or(SpiError::InvalidArgument)?;
+        let end_addr = addr.checked_add(len).ok_or(SpiError::AddressOutOfRange)?;
+
+        // Validate that the entire erase range fits within flash
+        if end_addr > self.flash_size {
+            log::error!(
+                "Erase range [{:#x}, {:#x}) exceeds flash size {:#x}",
+                addr,
+                end_addr,
+                self.flash_size
+            );
+            return Err(SpiError::AddressOutOfRange);
+        }
 
         // Clear any pending status
         let hsfs = self.spibar.read16(ICH9_REG_HSFS);
         self.spibar.write16(ICH9_REG_HSFS, hsfs);
 
         while current_addr < end_addr {
-            self.hwseq_set_addr(current_addr);
+            self.hwseq_set_addr(current_addr)?;
 
             // Set up erase cycle
             let mut hsfc = self.spibar.read16(ICH9_REG_HSFC);

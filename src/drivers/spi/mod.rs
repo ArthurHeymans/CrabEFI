@@ -41,6 +41,7 @@ pub mod intel;
 pub mod intel_chipsets;
 pub mod qemu;
 pub mod regs;
+pub mod sfdp;
 
 use crate::drivers::pci::{self, PciDevice};
 
@@ -80,6 +81,8 @@ pub enum SpiError {
     Timeout,
     /// Invalid address or length
     InvalidArgument,
+    /// Address out of range for flash size
+    AddressOutOfRange,
     /// Flash descriptor not valid (Intel)
     InvalidDescriptor,
     /// Operation not supported by this controller
