@@ -743,6 +743,17 @@ fn boot_linux_entry(
     initrd_path: &heapless::String<128>,
     cmdline: &heapless::String<512>,
 ) {
+    // Direct Linux boot bypasses Secure Boot verification, so we must
+    // disable it when Secure Boot is active. In the future, we could
+    // implement kernel signature verification to allow this.
+    if efi::auth::is_secure_boot_enabled() {
+        log::warn!("Direct Linux boot disabled: Secure Boot is active");
+        log::info!("Falling back to UEFI boot path for secure verification");
+        // Fall back to UEFI boot which will verify the bootloader signature
+        boot_uefi_entry(entry);
+        return;
+    }
+
     log::info!("Direct Linux boot: {}", entry.name);
     log::info!("  Kernel: {}", linux_path);
     if !initrd_path.is_empty() {
