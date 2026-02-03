@@ -260,26 +260,16 @@ unsafe fn jump_to_payload(entry: u64, cbtable: *const u8) -> ! {
 }
 
 /// Determine payload format from file extension
+///
+/// Checks if the path ends with a known payload extension (case-insensitive).
 pub fn format_from_extension(path: &str) -> Option<PayloadFormat> {
+    // Use alloc::string::String for to_ascii_lowercase
+    // (available since we have `extern crate alloc`)
+    let lower_path = path.to_ascii_lowercase();
     for (ext, format) in PAYLOAD_EXTENSIONS {
-        if path.to_ascii_lowercase().ends_with(ext) {
+        if lower_path.ends_with(ext) {
             return Some(*format);
         }
     }
     None
-}
-
-// Helper trait for to_ascii_lowercase on &str (no_std compatible)
-trait AsciiLowercase {
-    fn to_ascii_lowercase(&self) -> heapless::String<128>;
-}
-
-impl AsciiLowercase for str {
-    fn to_ascii_lowercase(&self) -> heapless::String<128> {
-        let mut s = heapless::String::new();
-        for c in self.chars() {
-            let _ = s.push(c.to_ascii_lowercase());
-        }
-        s
-    }
 }

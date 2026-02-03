@@ -252,6 +252,7 @@ pub const HEADER_END: usize = HEADER_OFFSET + HEADER_SIZE;
 /// For EFI framebuffers, we set orig_video_isVGA = VIDEO_TYPE_EFI.
 #[derive(Clone, Copy)]
 #[repr(C, packed)]
+#[allow(non_snake_case)] // orig_video_isVGA matches Linux kernel struct field name
 pub struct ScreenInfo {
     orig_x: u8,             // 0x00
     orig_y: u8,             // 0x01

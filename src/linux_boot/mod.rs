@@ -46,6 +46,34 @@ const MAX_KERNEL_SIZE: usize = 64 * 1024 * 1024;
 /// Maximum initrd size we support (256 MB)
 const MAX_INITRD_SIZE: usize = 256 * 1024 * 1024;
 
+/// Check if an address range is usable RAM according to the boot params memory map
+///
+/// # Arguments
+///
+/// * `boot_params` - Boot parameters containing the E820 memory map
+/// * `addr` - Start address of the region to check
+/// * `size` - Size of the region in bytes
+///
+/// # Returns
+///
+/// `true` if the entire address range falls within a usable RAM region
+fn is_valid_ram_region(boot_params: &BootParams, addr: u64, size: u64) -> bool {
+    for i in 0..boot_params.num_e820_entries() {
+        if let Some(entry) = boot_params.e820_entry(i)
+            && entry.entry_type == E820Entry::RAM_TYPE
+        {
+            let region_end = entry.addr.saturating_add(entry.size);
+            let range_end = addr.saturating_add(size);
+
+            // Check if our range is fully contained in this RAM region
+            if addr >= entry.addr && range_end <= region_end {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// Errors that can occur during Linux boot
 #[derive(Debug)]
 pub enum LinuxBootError {
@@ -113,6 +141,15 @@ impl LoadedLinux {
             "Booting Linux via direct 64-bit entry at {:#x}",
             self.entry_point
         );
+
+        // Validate that the boot params address is in usable RAM
+        let boot_params_size = core::mem::size_of::<BootParams>() as u64;
+        if !is_valid_ram_region(&self.boot_params, BOOT_PARAMS_ADDR, boot_params_size) {
+            panic!(
+                "Boot params address {:#x} (size {}) is not in usable RAM",
+                BOOT_PARAMS_ADDR, boot_params_size
+            );
+        }
 
         // Copy boot_params to fixed address (0x10000) so it survives the jump
         // The stack-allocated boot_params would be corrupted when Linux sets up its own stack
@@ -334,6 +371,28 @@ pub fn load_linux_from_disk<D: BlockDevice>(
         DEFAULT_KERNEL_ADDR as u32,
         CMDLINE_ADDR,
     );
+
+    // Validate that all hardcoded addresses are in usable RAM
+    // This ensures we don't write to reserved memory regions
+    let cmdline_size = cmdline.len() as u64 + 1; // +1 for null terminator
+    if !is_valid_ram_region(&boot_params, CMDLINE_ADDR as u64, cmdline_size) {
+        log::error!(
+            "Command line address {:#x} (size {}) is not in usable RAM",
+            CMDLINE_ADDR,
+            cmdline_size
+        );
+        return Err(LinuxBootError::MemoryError);
+    }
+
+    // Validate kernel load address
+    if !is_valid_ram_region(&boot_params, DEFAULT_KERNEL_ADDR, pm_kernel_size as u64) {
+        log::error!(
+            "Kernel address {:#x} (size {}) is not in usable RAM",
+            DEFAULT_KERNEL_ADDR,
+            pm_kernel_size
+        );
+        return Err(LinuxBootError::MemoryError);
+    }
 
     // Set up command line
     unsafe {

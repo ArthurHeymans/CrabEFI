@@ -169,88 +169,6 @@ impl BzImage {
     }
 }
 
-/// Load an initrd into memory
-///
-/// Places the initrd at the highest suitable address below `initrd_addr_max`.
-///
-/// # Arguments
-///
-/// * `data` - Initrd data
-/// * `boot_params` - Boot parameters (for memory map and initrd_addr_max)
-///
-/// # Returns
-///
-/// The address where the initrd was loaded
-///
-/// # Safety
-///
-/// Caller must ensure there is enough free memory for the initrd.
-pub unsafe fn load_initrd(data: &[u8], boot_params: &BootParams) -> Result<u64, BzImageError> {
-    let size = data.len() as u64;
-    if size == 0 {
-        return Ok(0);
-    }
-
-    // Get maximum initrd address from header, default to 0x37FFFFFF
-    let initrd_addr_max = match boot_params.hdr.initrd_addr_max {
-        0 => 0x37FF_FFFF,
-        a => a as u64,
-    };
-
-    // Limit to 4GB identity-mapped area
-    let initrd_addr_max = initrd_addr_max.min((4u64 << 30) - 1);
-
-    // Find a suitable address - look for highest RAM region that fits
-    let mut best_addr: Option<u64> = None;
-
-    for i in 0..boot_params.num_e820_entries() {
-        if let Some(entry) = boot_params.e820_entry(i) {
-            // Only consider RAM regions
-            if entry.entry_type != super::params::E820Entry::RAM_TYPE {
-                continue;
-            }
-
-            // Skip regions that start beyond max
-            if entry.addr > initrd_addr_max {
-                continue;
-            }
-
-            // Skip regions that are too small
-            if entry.size < size {
-                continue;
-            }
-
-            // Calculate highest address in this region that fits
-            let region_end = entry.addr + entry.size;
-            let potential_addr = region_end.saturating_sub(size);
-
-            // Align to 2MB boundary
-            let potential_addr = potential_addr & !((2u64 << 20) - 1);
-
-            // Clamp to max
-            let potential_addr = potential_addr.min(initrd_addr_max + 1 - size);
-
-            // Use the highest address we can find
-            if let Some(current) = best_addr {
-                if potential_addr > current {
-                    best_addr = Some(potential_addr);
-                }
-            } else if potential_addr >= entry.addr {
-                best_addr = Some(potential_addr);
-            }
-        }
-    }
-
-    let addr = best_addr.ok_or(BzImageError::NoInitrdMemory)?;
-
-    log::info!("Loading initrd: {} bytes to {:#x}", size, addr);
-
-    let dst = addr as *mut u8;
-    core::ptr::copy_nonoverlapping(data.as_ptr(), dst, data.len());
-
-    Ok(addr)
-}
-
 /// Copy command line to low memory
 ///
 /// # Arguments
@@ -261,10 +179,14 @@ pub unsafe fn load_initrd(data: &[u8], boot_params: &BootParams) -> Result<u64, 
 /// # Safety
 ///
 /// Caller must ensure the destination address is valid and writable.
+/// The caller should validate that the address is in usable RAM before calling.
 pub unsafe fn set_cmdline(cmdline: &str, addr: u32) -> Result<(), BzImageError> {
     if cmdline.len() >= CMDLINE_MAX_SIZE {
         return Err(BzImageError::CmdLineTooLong);
     }
+
+    // Note: Memory validation should be done by the caller with the full memory map
+    // We can't easily validate here without access to boot_params
 
     let dst = addr as *mut u8;
     let bytes = cmdline.as_bytes();

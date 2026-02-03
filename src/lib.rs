@@ -5,7 +5,7 @@
 
 #![no_std]
 #![feature(abi_x86_interrupt)]
-#![feature(never_type)]
+#![feature(never_type)] // Used for -> ! return type in payload chainloading
 #![allow(unsafe_op_in_unsafe_fn)]
 // Allow common firmware code patterns
 #![allow(clippy::result_unit_err)] // Result<(), ()> is common in embedded code
@@ -743,9 +743,10 @@ fn boot_linux_entry(
     initrd_path: &heapless::String<128>,
     cmdline: &heapless::String<512>,
 ) {
-    // Direct Linux boot bypasses Secure Boot verification, so we must
-    // disable it when Secure Boot is active. In the future, we could
-    // implement kernel signature verification to allow this.
+    // Defense in depth: Direct Linux boot entries should not appear in the menu
+    // when Secure Boot is active (filtered in scan_partition_for_entries), but
+    // check here as well in case an entry somehow makes it through.
+    // Direct boot bypasses signature verification which violates Secure Boot.
     if efi::auth::is_secure_boot_enabled() {
         log::warn!("Direct Linux boot disabled: Secure Boot is active");
         log::info!("Falling back to UEFI boot path for secure verification");
@@ -762,9 +763,21 @@ fn boot_linux_entry(
     log::info!("  Cmdline: {}", cmdline);
 
     // Convert Linux-style paths (forward slashes) to FAT-style paths (backslashes)
-    let kernel_path = convert_linux_path_to_fat(linux_path);
+    let kernel_path = match fs::linux_path_to_fat(linux_path) {
+        Ok(p) => p,
+        Err(e) => {
+            log::error!("Invalid kernel path '{}': {:?}", linux_path, e);
+            return;
+        }
+    };
     let initrd_fat_path = if !initrd_path.is_empty() {
-        Some(convert_linux_path_to_fat(initrd_path))
+        match fs::linux_path_to_fat(initrd_path) {
+            Ok(p) => Some(p),
+            Err(e) => {
+                log::error!("Invalid initrd path '{}': {:?}", initrd_path, e);
+                return;
+            }
+        }
     } else {
         None
     };
@@ -973,27 +986,6 @@ fn boot_linux_entry(
     // If the user selected a direct Linux boot entry, they want Linux,
     // not a UEFI bootloader. If it fails, show an error and return to menu.
     log::error!("Direct Linux boot failed - returning to menu");
-}
-
-/// Convert a Linux-style path (forward slashes) to FAT-style path (backslashes)
-///
-/// Also strips leading slash if present.
-fn convert_linux_path_to_fat(path: &str) -> heapless::String<128> {
-    let mut fat_path: heapless::String<128> = heapless::String::new();
-
-    // Strip leading slash
-    let path = path.trim_start_matches('/');
-
-    // Convert forward slashes to backslashes
-    for c in path.chars() {
-        if c == '/' {
-            let _ = fat_path.push('\\');
-        } else {
-            let _ = fat_path.push(c);
-        }
-    }
-
-    fat_path
 }
 
 /// Boot a coreboot payload entry

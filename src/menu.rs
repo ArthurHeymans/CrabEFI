@@ -737,24 +737,16 @@ fn is_potential_esp(partition: &gpt::Partition) -> bool {
 
 /// Convert a Linux-style path to FAT-style path
 ///
-/// - Strips leading slash
-/// - Converts forward slashes to backslashes
+/// Wrapper around fs::linux_path_to_fat that returns an empty string on error
+/// for backward compatibility in menu scanning (errors are logged but not fatal).
 fn linux_path_to_fat(path: &str) -> String<128> {
-    let mut fat_path: String<128> = String::new();
-
-    // Strip leading slash
-    let path = path.trim_start_matches('/');
-
-    // Convert forward slashes to backslashes
-    for c in path.chars() {
-        if c == '/' {
-            let _ = fat_path.push('\\');
-        } else {
-            let _ = fat_path.push(c);
+    match crate::fs::linux_path_to_fat(path) {
+        Ok(p) => p,
+        Err(e) => {
+            log::warn!("Invalid path '{}': {:?}", path, e);
+            String::new()
         }
     }
-
-    fat_path
 }
 
 /// Check if a bootloader exists on the given partition
@@ -775,6 +767,10 @@ fn check_bootloader_exists<D: BlockDevice>(disk: &mut D, partition_start: u64) -
 /// - GRUB configuration entries in grub.cfg
 /// - Coreboot payloads in common payload directories
 ///
+/// Note: When Secure Boot is enabled, direct Linux boot entries (BLS Type #1
+/// and GRUB Linux entries) are not added because they bypass signature
+/// verification. Only UEFI boot entries are shown in that case.
+///
 /// # Arguments
 ///
 /// * `fat` - Mounted FAT filesystem
@@ -793,9 +789,17 @@ fn scan_partition_for_entries(
     pci_function: u8,
     menu: &mut BootMenu,
 ) {
-    // 1. Scan for BLS entries
+    // Check if Secure Boot is active - if so, skip direct Linux boot entries
+    // because they bypass signature verification
+    let secure_boot_active = crate::efi::auth::is_secure_boot_enabled();
+    if secure_boot_active {
+        log::debug!("Secure Boot active: skipping direct Linux boot entry discovery");
+    }
+
+    // 1. Scan for BLS entries - only if Secure Boot is off
     // BLS entries should have kernels on the same partition (ESP or XBOOTLDR)
-    if let Ok(bls_discovery) = crate::bls::discover_entries(fat) {
+    // Direct boot bypasses signature verification, so we disable it with Secure Boot
+    if !secure_boot_active && let Ok(bls_discovery) = crate::bls::discover_entries(fat) {
         for bls_entry in bls_discovery.entries.iter() {
             // Convert Linux path to FAT path and check if file exists
             let fat_path = linux_path_to_fat(&bls_entry.linux);
@@ -846,11 +850,12 @@ fn scan_partition_for_entries(
         }
     }
 
-    // 2. Scan for GRUB config entries
+    // 2. Scan for GRUB config entries - only if Secure Boot is off
     // NOTE: GRUB entries from grub.cfg often reference kernels on the root partition,
     // not the ESP where grub.cfg lives. We only add entries if the kernel file
     // actually exists on this partition (for direct boot to work).
-    if let Ok(grub_config) = crate::grub::parse_config(fat) {
+    // Direct boot bypasses signature verification, so we disable it with Secure Boot
+    if !secure_boot_active && let Ok(grub_config) = crate::grub::parse_config(fat) {
         // If GRUB has blscfg directive, BLS entries were already added above
         // Only add GRUB entries that have explicit linux/initrd paths AND
         // where the kernel file actually exists on this partition
@@ -907,27 +912,32 @@ fn scan_partition_for_entries(
     }
 
     // 3. Scan for coreboot payloads
-    let payloads = crate::payload::discover_payloads(fat);
-    for payload_entry in payloads.iter() {
-        let entry = BootEntry::new_with_kind(
-            &payload_entry.name,
-            &payload_entry.path,
-            device_type,
-            partition_num,
-            partition.clone(),
-            pci_device,
-            pci_function,
-            BootEntryKind::Payload {
-                path: payload_entry.path.clone(),
-                format: payload_entry.format,
-            },
-            BootCategory::Payload,
-        );
-
-        if !menu.add_entry(entry) {
-            return; // Menu full
-        }
-    }
+    // NOTE: Payload discovery is disabled until boot_payload_entry() is fully
+    // implemented. Currently selecting a payload entry does nothing useful.
+    // See: src/lib.rs boot_payload_entry() and src/payload/mod.rs chainload_payload()
+    //
+    // TODO: Re-enable once payload chainloading is implemented:
+    // let payloads = crate::payload::discover_payloads(fat);
+    // for payload_entry in payloads.iter() {
+    //     let entry = BootEntry::new_with_kind(
+    //         &payload_entry.name,
+    //         &payload_entry.path,
+    //         device_type,
+    //         partition_num,
+    //         partition.clone(),
+    //         pci_device,
+    //         pci_function,
+    //         BootEntryKind::Payload {
+    //             path: payload_entry.path.clone(),
+    //             format: payload_entry.format,
+    //         },
+    //         BootCategory::Payload,
+    //     );
+    //
+    //     if !menu.add_entry(entry) {
+    //         return; // Menu full
+    //     }
+    // }
 }
 
 /// Show the boot menu and wait for user selection
