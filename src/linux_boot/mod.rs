@@ -280,43 +280,50 @@ pub fn load_linux_from_disk<D: BlockDevice>(
         return Err(LinuxBootError::NoEfiHandover);
     }
 
-    // Read full kernel to temp buffer, then copy protected-mode portion to target
-    // We use a temp buffer because bzImage format requires skipping setup sectors
+    // DMA the protected-mode kernel directly to the target address
+    // We skip the setup sectors by using the offset parameter in read_file
+    // This avoids an intermediate buffer and extra memcpy
+    let setup_size = bzimage.setup_size;
+    let pm_kernel_size = bzimage.kernel_size as usize;
+
     log::info!(
-        "Loading kernel to {:#x} (file size: {} bytes)",
+        "Loading kernel to {:#x} (skip {} setup bytes, {} kernel bytes)",
         DEFAULT_KERNEL_ADDR,
-        kernel_size
+        setup_size,
+        pm_kernel_size
     );
 
-    // Use high memory for temp buffer to avoid conflicts
-    let temp_addr = 0x8000000u64; // 128MB - well above kernel destination (16MB)
-    let kernel_buffer =
-        unsafe { core::slice::from_raw_parts_mut(temp_addr as *mut u8, kernel_size as usize) };
+    // Create a slice pointing directly to the kernel load address
+    // This allows DMA to go directly to the target memory
+    let kernel_dest =
+        unsafe { core::slice::from_raw_parts_mut(DEFAULT_KERNEL_ADDR as *mut u8, pm_kernel_size) };
 
     // Re-mount filesystem (previous borrow ended)
     let mut fs = FatFilesystem::new(disk, partition_start).map_err(|_| LinuxBootError::FileRead)?;
 
-    // Read entire kernel file (uses optimized batch reads)
-    let bytes_read = fs.read_file_all(kernel_path, kernel_buffer).map_err(|e| {
-        log::error!("Failed to read kernel: {:?}", e);
-        LinuxBootError::FileRead
-    })?;
+    // Read kernel directly to target address, skipping setup sectors
+    // The FAT read_file function with offset will DMA directly to our buffer
+    let bytes_read = fs
+        .read_file(&kernel_entry, setup_size, kernel_dest)
+        .map_err(|e| {
+            log::error!("Failed to read kernel: {:?}", e);
+            LinuxBootError::FileRead
+        })?;
 
-    if bytes_read != kernel_size as usize {
+    if bytes_read != pm_kernel_size {
         log::error!(
             "Kernel read size mismatch: {} != {}",
             bytes_read,
-            kernel_size
+            pm_kernel_size
         );
         return Err(LinuxBootError::FileRead);
     }
 
-    log::info!("Kernel file read, loading to {:#x}...", DEFAULT_KERNEL_ADDR);
-
-    // Load the protected-mode kernel code to memory (skips setup sectors)
-    unsafe {
-        bzimage.load_kernel(kernel_buffer, DEFAULT_KERNEL_ADDR)?;
-    }
+    log::info!(
+        "Kernel loaded directly to {:#x} ({} bytes via DMA)",
+        DEFAULT_KERNEL_ADDR,
+        bytes_read
+    );
 
     // Prepare boot parameters
     let mut boot_params = bzimage::prepare_boot_params(
