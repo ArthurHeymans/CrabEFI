@@ -41,7 +41,9 @@ impl MemoryType {
             MemoryType::AcpiReclaimable => efi::ACPI_RECLAIM_MEMORY,
             MemoryType::AcpiNvs => efi::ACPI_MEMORY_NVS,
             MemoryType::Unusable => efi::UNUSABLE_MEMORY,
-            MemoryType::Table => efi::BOOT_SERVICES_DATA,
+            // Coreboot's Table type includes cbmem regions that must persist
+            // after boot for Linux kernel modules (cbmem, memconsole, etc.)
+            MemoryType::Table => efi::ACPI_MEMORY_NVS,
         }
     }
 }

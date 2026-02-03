@@ -110,7 +110,12 @@ fn cb_to_efi_memory_type(cb_type: CbMemoryType) -> MemoryType {
         CbMemoryType::AcpiReclaimable => MemoryType::AcpiReclaimMemory,
         CbMemoryType::AcpiNvs => MemoryType::AcpiMemoryNvs,
         CbMemoryType::Unusable => MemoryType::UnusableMemory,
-        CbMemoryType::Table => MemoryType::BootServicesData,
+        // Coreboot's Table type includes cbmem regions (console, SMBIOS, etc.)
+        // that Linux kernel modules need to access after boot. Using AcpiMemoryNvs
+        // ensures these regions are preserved and not reclaimed as usable RAM.
+        // BootServicesData would be incorrect because it gets converted to
+        // ConventionalMemory at ExitBootServices, causing memremap failures.
+        CbMemoryType::Table => MemoryType::AcpiMemoryNvs,
     }
 }
 
