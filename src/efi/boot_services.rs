@@ -10,6 +10,7 @@
 
 use super::allocator::{self, AllocateType, MemoryDescriptor, MemoryType};
 use super::protocols::loaded_image::{LOADED_IMAGE_PROTOCOL_GUID, create_loaded_image_protocol};
+use super::protocols::simple_file_system::SIMPLE_FILE_SYSTEM_GUID;
 use super::system_table;
 use crate::pe;
 use crate::state::{
@@ -18,7 +19,16 @@ use crate::state::{
 };
 use core::ffi::c_void;
 use r_efi::efi::{self, Boolean, Guid, Handle, Status, SystemTable, TableHeader, Tpl};
-use r_efi::protocols::device_path::Protocol as DevicePathProtocol;
+use r_efi::protocols::device_path::{self, Media, Protocol as DevicePathProtocol};
+use r_efi::protocols::file::Protocol as FileProtocol;
+use r_efi::protocols::simple_file_system::Protocol as SimpleFileSystemProtocol;
+
+/// Device path type for Media
+const DEVICE_PATH_TYPE_MEDIA: u8 = device_path::TYPE_MEDIA;
+/// Device path subtype for File Path
+const DEVICE_PATH_SUBTYPE_FILE_PATH: u8 = Media::SUBTYPE_FILE_PATH;
+/// Device path type for End
+const DEVICE_PATH_TYPE_END: u8 = device_path::TYPE_END;
 
 /// Boot Services signature "BOOTSERV"
 const EFI_BOOT_SERVICES_SIGNATURE: u64 = 0x56524553544F4F42;
@@ -663,10 +673,17 @@ extern "efiapi" fn locate_handle(
         .map(|entry| entry.handle)
         .collect();
 
+    // Check for no matches FIRST, before buffer size checks
+    if matching.is_empty() {
+        log::debug!("  -> NOT_FOUND (no handles with this protocol)");
+        return Status::NOT_FOUND;
+    }
+
     let required_size = matching.len() * core::mem::size_of::<Handle>();
 
     if buffer.is_null() || unsafe { *buffer_size } < required_size {
         unsafe { *buffer_size = required_size };
+        log::debug!("  -> BUFFER_TOO_SMALL (need {} bytes)", required_size);
         return Status::BUFFER_TOO_SMALL;
     }
 
@@ -675,14 +692,8 @@ extern "efiapi" fn locate_handle(
     dest.copy_from_slice(&matching[..]);
     unsafe { *buffer_size = required_size };
 
-    if matching.is_empty() {
-        log::info!("  -> NOT_FOUND");
-        Status::NOT_FOUND
-    } else {
-        log::info!("  -> found {} handles: {:?}", matching.len(), &matching[..]);
-        log::info!("  -> returning from LocateHandle");
-        Status::SUCCESS
-    }
+    log::debug!("  -> found {} handles: {:?}", matching.len(), &matching[..]);
+    Status::SUCCESS
 }
 
 extern "efiapi" fn locate_device_path(
@@ -776,6 +787,244 @@ extern "efiapi" fn install_configuration_table(guid: *mut Guid, table: *mut c_vo
 // Image Functions
 // ============================================================================
 
+/// Extract file path string from a device path
+///
+/// Walks the device path nodes looking for a Media File Path node,
+/// then extracts the UTF-16 path string from it.
+///
+/// # Arguments
+/// * `device_path` - The device path to parse
+///
+/// # Returns
+/// A tuple of (file_path_utf16, length_in_u16_chars) or None if no file path found
+fn extract_file_path_from_device_path(
+    device_path: *mut DevicePathProtocol,
+) -> Option<(*const u16, usize)> {
+    if device_path.is_null() {
+        return None;
+    }
+
+    let mut current = device_path;
+
+    unsafe {
+        loop {
+            let node_type = (*current).r#type;
+            let node_subtype = (*current).sub_type;
+            let node_length =
+                u16::from_le_bytes([(*current).length[0], (*current).length[1]]) as usize;
+
+            // Check for end of device path
+            if node_type == DEVICE_PATH_TYPE_END {
+                break;
+            }
+
+            // Check for file path node
+            if node_type == DEVICE_PATH_TYPE_MEDIA && node_subtype == DEVICE_PATH_SUBTYPE_FILE_PATH
+            {
+                // File path node: header (4 bytes) + UTF-16 path
+                if node_length > 4 {
+                    let path_ptr = (current as *const u8).add(4) as *const u16;
+                    let path_len = (node_length - 4) / 2; // Convert bytes to UTF-16 chars
+                    return Some((path_ptr, path_len));
+                }
+            }
+
+            // Move to next node
+            if node_length < 4 {
+                break; // Invalid length
+            }
+            current = (current as *const u8).add(node_length) as *mut DevicePathProtocol;
+        }
+    }
+
+    None
+}
+
+/// Load an image from a device path
+///
+/// This function is called when LoadImage is invoked with source_buffer=NULL.
+/// It parses the device path to find the file path, locates the SimpleFileSystem
+/// protocol, opens and reads the file, then returns the data.
+///
+/// # Arguments
+/// * `device_path` - The device path containing a file path node
+///
+/// # Returns
+/// A tuple of (buffer_ptr, buffer_size, device_handle) on success, or an error status
+fn load_image_from_device_path(
+    device_path: *mut DevicePathProtocol,
+) -> Result<(*mut c_void, usize, Handle), Status> {
+    // Extract the file path from the device path
+    let (path_ptr, path_len) =
+        extract_file_path_from_device_path(device_path).ok_or_else(|| {
+            log::error!("BS.LoadImage: No file path found in device path");
+            Status::INVALID_PARAMETER
+        })?;
+
+    // Log the file path for debugging
+    let mut path_str = [0u8; 256];
+    let mut str_len = 0;
+    unsafe {
+        for i in 0..path_len {
+            let c = *path_ptr.add(i);
+            if c == 0 {
+                break;
+            }
+            if str_len < path_str.len() - 1 && c < 128 {
+                path_str[str_len] = c as u8;
+                str_len += 1;
+            }
+        }
+    }
+    let path_display = core::str::from_utf8(&path_str[..str_len]).unwrap_or("<invalid>");
+    log::info!("BS.LoadImage: Loading from device path: {}", path_display);
+
+    // Find a handle with SimpleFileSystem protocol
+    let sfs_handle = find_handle_with_protocol(&SIMPLE_FILE_SYSTEM_GUID).ok_or_else(|| {
+        log::error!("BS.LoadImage: No SimpleFileSystem handle found");
+        Status::NOT_FOUND
+    })?;
+
+    // Get the SimpleFileSystem protocol
+    let mut sfs_interface: *mut c_void = core::ptr::null_mut();
+    let status = open_protocol(
+        sfs_handle,
+        &SIMPLE_FILE_SYSTEM_GUID as *const Guid as *mut Guid,
+        &mut sfs_interface,
+        core::ptr::null_mut(),
+        core::ptr::null_mut(),
+        efi::OPEN_PROTOCOL_BY_HANDLE_PROTOCOL,
+    );
+
+    if status != Status::SUCCESS || sfs_interface.is_null() {
+        log::error!(
+            "BS.LoadImage: Failed to get SimpleFileSystem protocol: {:?}",
+            status
+        );
+        return Err(status);
+    }
+
+    let sfs = sfs_interface as *mut SimpleFileSystemProtocol;
+
+    // Open the volume (root directory)
+    let mut root: *mut FileProtocol = core::ptr::null_mut();
+    let status = unsafe { ((*sfs).open_volume)(sfs, &mut root) };
+
+    if status != Status::SUCCESS || root.is_null() {
+        log::error!("BS.LoadImage: Failed to open volume: {:?}", status);
+        return Err(status);
+    }
+
+    // Open the file
+    let mut file: *mut FileProtocol = core::ptr::null_mut();
+    let status = unsafe {
+        ((*root).open)(
+            root,
+            &mut file,
+            path_ptr as *mut u16,
+            r_efi::protocols::file::MODE_READ,
+            0,
+        )
+    };
+
+    if status != Status::SUCCESS || file.is_null() {
+        log::error!("BS.LoadImage: Failed to open file: {:?}", status);
+        unsafe { ((*root).close)(root) };
+        return Err(status);
+    }
+
+    // Get file size using GetInfo
+    let mut info_buffer = [0u8; 256];
+    let mut info_size = info_buffer.len();
+
+    let status = unsafe {
+        ((*file).get_info)(
+            file,
+            &r_efi::protocols::file::INFO_ID as *const Guid as *mut Guid,
+            &mut info_size,
+            info_buffer.as_mut_ptr() as *mut c_void,
+        )
+    };
+
+    if status != Status::SUCCESS || info_size < 16 {
+        log::error!(
+            "BS.LoadImage: Failed to get file info: {:?}, info_size={}",
+            status,
+            info_size
+        );
+        unsafe {
+            ((*file).close)(file);
+            ((*root).close)(root);
+        }
+        return Err(Status::DEVICE_ERROR);
+    }
+
+    // EFI_FILE_INFO starts with Size (8 bytes) then FileSize (8 bytes)
+    let file_size = u64::from_le_bytes(info_buffer[8..16].try_into().unwrap_or([0; 8]));
+    log::debug!("BS.LoadImage: File size = {} bytes", file_size);
+
+    if file_size == 0 || file_size > 256 * 1024 * 1024 {
+        // Sanity check: reject empty files or files > 256MB
+        log::error!("BS.LoadImage: Invalid file size: {}", file_size);
+        unsafe {
+            ((*file).close)(file);
+            ((*root).close)(root);
+        }
+        return Err(Status::INVALID_PARAMETER);
+    }
+
+    // Allocate buffer for the file
+    let buffer = match allocator::allocate_pool(MemoryType::BootServicesData, file_size as usize) {
+        Ok(ptr) => ptr,
+        Err(status) => {
+            log::error!("BS.LoadImage: Failed to allocate {} bytes", file_size);
+            unsafe {
+                ((*file).close)(file);
+                ((*root).close)(root);
+            }
+            return Err(status);
+        }
+    };
+
+    // Read the file
+    let mut read_size = file_size as usize;
+    let status = unsafe { ((*file).read)(file, &mut read_size, buffer as *mut c_void) };
+
+    // Close file handles
+    unsafe {
+        ((*file).close)(file);
+        ((*root).close)(root);
+    }
+
+    if status != Status::SUCCESS {
+        log::error!("BS.LoadImage: Failed to read file: {:?}", status);
+        let _ = allocator::free_pool(buffer);
+        return Err(status);
+    }
+
+    log::info!(
+        "BS.LoadImage: Successfully loaded {} bytes from device path",
+        read_size
+    );
+
+    Ok((buffer as *mut c_void, read_size, sfs_handle))
+}
+
+/// Find a handle that has a specific protocol installed
+fn find_handle_with_protocol(protocol_guid: &Guid) -> Option<Handle> {
+    let efi_state = state::efi();
+
+    for entry in &efi_state.handles[..efi_state.handle_count] {
+        for proto in &entry.protocols[..entry.protocol_count] {
+            if proto.guid == *protocol_guid {
+                return Some(entry.handle);
+            }
+        }
+    }
+
+    None
+}
+
 extern "efiapi" fn load_image(
     boot_policy: Boolean,
     parent_image_handle: Handle,
@@ -799,14 +1048,35 @@ extern "efiapi" fn load_image(
         return Status::INVALID_PARAMETER;
     }
 
-    // We only support loading from a memory buffer currently
-    if source_buffer.is_null() || source_size == 0 {
-        log::error!("BS.LoadImage: source_buffer is NULL or size is 0");
+    // Determine the source: either from buffer or from device path
+    // Also track the device handle if loading from device path
+    let (data_ptr, data_size, allocated_buffer, loaded_from_device): (
+        *mut c_void,
+        usize,
+        bool,
+        Option<Handle>,
+    ) = if !source_buffer.is_null() && source_size > 0 {
+        // Load from provided buffer
+        (source_buffer, source_size, false, None)
+    } else if !device_path.is_null() {
+        // Load from device path
+        match load_image_from_device_path(device_path) {
+            Ok((ptr, size, dev_handle)) => (ptr, size, true, Some(dev_handle)),
+            Err(status) => {
+                log::error!(
+                    "BS.LoadImage: Failed to load from device path: {:?}",
+                    status
+                );
+                return status;
+            }
+        }
+    } else {
+        log::error!("BS.LoadImage: No source buffer and no device path provided");
         return Status::INVALID_PARAMETER;
-    }
+    };
 
     // Create a slice from the source buffer
-    let data = unsafe { core::slice::from_raw_parts(source_buffer as *const u8, source_size) };
+    let data = unsafe { core::slice::from_raw_parts(data_ptr as *const u8, data_size) };
 
     // Secure Boot verification (if enabled)
     if super::auth::is_secure_boot_enabled() {
@@ -818,11 +1088,17 @@ extern "efiapi" fn load_image(
             Ok(false) => {
                 log::error!("BS.LoadImage: Secure Boot verification FAILED - image not authorized");
                 crate::display_secure_boot_error();
+                if allocated_buffer {
+                    let _ = allocator::free_pool(data_ptr as *mut u8);
+                }
                 return Status::SECURITY_VIOLATION;
             }
             Err(e) => {
                 log::error!("BS.LoadImage: Secure Boot verification error: {:?}", e);
                 crate::display_secure_boot_error();
+                if allocated_buffer {
+                    let _ = allocator::free_pool(data_ptr as *mut u8);
+                }
                 return Status::SECURITY_VIOLATION;
             }
         }
@@ -833,9 +1109,18 @@ extern "efiapi" fn load_image(
         Ok(img) => img,
         Err(status) => {
             log::error!("BS.LoadImage: Failed to load PE image: {:?}", status);
+            // Free the temporary buffer if we allocated it
+            if allocated_buffer {
+                let _ = allocator::free_pool(data_ptr as *mut u8);
+            }
             return status;
         }
     };
+
+    // Free the temporary buffer now that PE is loaded (it makes its own copy)
+    if allocated_buffer {
+        let _ = allocator::free_pool(data_ptr as *mut u8);
+    }
 
     log::debug!(
         "BS.LoadImage: PE loaded at {:#x}, entry={:#x}, size={:#x}",
@@ -855,8 +1140,10 @@ extern "efiapi" fn load_image(
     };
 
     // Create LoadedImageProtocol for this image
-    // Get the parent's device handle if available
-    let device_handle = get_device_handle_from_parent(parent_image_handle);
+    // Use the device handle from loading if we loaded from device path,
+    // otherwise try to get it from the parent
+    let device_handle =
+        loaded_from_device.unwrap_or_else(|| get_device_handle_from_parent(parent_image_handle));
 
     let system_table = super::get_system_table();
     let loaded_image_protocol = create_loaded_image_protocol(
@@ -1251,12 +1538,49 @@ extern "efiapi" fn open_protocol(
 }
 
 extern "efiapi" fn close_protocol(
-    _handle: Handle,
-    _protocol: *mut Guid,
+    handle: Handle,
+    protocol: *mut Guid,
     _agent_handle: Handle,
     _controller_handle: Handle,
 ) -> Status {
-    Status::UNSUPPORTED
+    let guid = if protocol.is_null() {
+        log::debug!("BS.CloseProtocol: protocol is NULL");
+        return Status::INVALID_PARAMETER;
+    } else {
+        unsafe { *protocol }
+    };
+
+    log::debug!(
+        "BS.CloseProtocol(handle={:?}, protocol={})",
+        handle,
+        GuidFmt(guid)
+    );
+
+    if handle.is_null() {
+        log::debug!("  -> INVALID_PARAMETER (handle is NULL)");
+        return Status::INVALID_PARAMETER;
+    }
+
+    // Verify the handle exists and has this protocol
+    let efi_state = state::efi();
+    let handle_exists = efi_state.handles[..efi_state.handle_count]
+        .iter()
+        .any(|entry| {
+            entry.handle == handle
+                && entry.protocols[..entry.protocol_count]
+                    .iter()
+                    .any(|p| p.guid == guid)
+        });
+
+    if !handle_exists {
+        log::debug!("  -> NOT_FOUND");
+        return Status::NOT_FOUND;
+    }
+
+    // In our simple implementation, we don't track open protocol usage,
+    // so close is effectively a no-op but we return SUCCESS
+    log::debug!("  -> SUCCESS");
+    Status::SUCCESS
 }
 
 extern "efiapi" fn open_protocol_information(

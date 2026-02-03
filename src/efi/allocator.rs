@@ -523,7 +523,9 @@ impl MemoryAllocator {
             // Change the type back to conventional memory
             self.entries[idx].memory_type = MemoryType::ConventionalMemory as u32;
             self.map_key += 1;
-            self.merge_entries();
+            // Don't merge here - merging should only happen at ExitBootServices
+            // to keep the memory map clean for the OS. Merging during normal
+            // operation breaks subsequent free_pages calls that need exact matches.
             efi::Status::SUCCESS
         } else {
             efi::Status::NOT_FOUND
@@ -831,7 +833,8 @@ impl MemoryAllocator {
 
         self.map_key += 1;
         self.sort_entries();
-        self.merge_entries(); // Consolidate to reduce fragmentation
+        // Don't merge here - merging breaks subsequent free_pages calls
+        // that need exact matches. Merge only at ExitBootServices.
         true
     }
 
@@ -929,7 +932,8 @@ impl MemoryAllocator {
 
         self.map_key += 1;
         self.sort_entries();
-        self.merge_entries(); // Always merge after carving to reduce fragmentation
+        // Don't merge here - merging breaks subsequent free_pages calls
+        // that need exact matches. Merge only at ExitBootServices.
 
         Ok(())
     }
