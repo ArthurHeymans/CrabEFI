@@ -45,6 +45,18 @@ pub use variables::*;
 use r_efi::efi::Guid;
 
 // ============================================================================
+// GUID Helper Functions
+// ============================================================================
+
+/// Convert a Guid to raw bytes (shared utility for auth submodules)
+pub(crate) fn guid_to_bytes(guid: &Guid) -> [u8; 16] {
+    let bytes = guid.as_bytes();
+    let mut result = [0u8; 16];
+    result.copy_from_slice(bytes);
+    result
+}
+
+// ============================================================================
 // Variable Attributes
 // ============================================================================
 

@@ -304,7 +304,4 @@ fn validate_certificate(data: &[u8]) -> Result<(), AuthError> {
     }
 }
 
-/// Check if any key files exist on the ESP
-pub fn key_files_available() -> bool {
-    find_key_files().map(|r| r.pk.is_some()).unwrap_or(false)
-}
+

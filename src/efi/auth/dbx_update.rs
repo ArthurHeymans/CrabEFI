@@ -28,6 +28,7 @@
 //! }
 //! ```
 
+use super::guid_to_bytes;
 use super::variables::{KeyDatabaseEntry, dbx_database};
 use super::{AuthError, EFI_CERT_SHA256_GUID, EFI_CERT_X509_GUID};
 use crate::drivers::block::{AhciDisk, BlockDevice, NvmeDisk, SdhciDisk};
@@ -330,63 +331,4 @@ fn entry_exists_in_dbx(
     }
 
     false
-}
-
-/// Convert a GUID to bytes
-fn guid_to_bytes(guid: &r_efi::efi::Guid) -> [u8; 16] {
-    let bytes = guid.as_bytes();
-    let mut result = [0u8; 16];
-    result.copy_from_slice(bytes);
-    result
-}
-
-/// Check if a dbx update file is available on any ESP
-pub fn dbx_update_available() -> bool {
-    find_dbx_file().is_some()
-}
-
-/// Get information about available dbx updates without applying them
-pub fn check_dbx_update() -> Option<DbxUpdateInfo> {
-    let (data, source) = find_dbx_file()?;
-
-    // Parse to count entries without applying
-    use super::structures::{SignatureIterator, SignatureListIterator};
-
-    let sha256_guid = guid_to_bytes(&EFI_CERT_SHA256_GUID);
-    let x509_guid = guid_to_bytes(&EFI_CERT_X509_GUID);
-
-    let mut sha256_count = 0usize;
-    let mut x509_count = 0usize;
-
-    for (list, list_data) in SignatureListIterator::new(&data) {
-        let sig_type = list.signature_type;
-
-        for (_owner, sig_data) in SignatureIterator::new(list, list_data) {
-            if sig_type == sha256_guid && sig_data.len() >= 32 {
-                sha256_count += 1;
-            } else if sig_type == x509_guid {
-                x509_count += 1;
-            }
-        }
-    }
-
-    Some(DbxUpdateInfo {
-        file_size: data.len(),
-        sha256_count,
-        x509_count,
-        source,
-    })
-}
-
-/// Information about an available dbx update
-#[derive(Debug, Clone)]
-pub struct DbxUpdateInfo {
-    /// Size of the dbx file in bytes
-    pub file_size: usize,
-    /// Number of SHA-256 hash entries
-    pub sha256_count: usize,
-    /// Number of X.509 certificate entries
-    pub x509_count: usize,
-    /// Source where the file was found
-    pub source: &'static str,
 }

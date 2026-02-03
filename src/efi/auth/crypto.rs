@@ -21,15 +21,6 @@ pub fn sha256(data: &[u8]) -> [u8; 32] {
     hasher.finalize().into()
 }
 
-/// Compute SHA-256 hash of multiple data chunks
-pub fn sha256_chunks(chunks: &[&[u8]]) -> [u8; 32] {
-    let mut hasher = Sha256::new();
-    for chunk in chunks {
-        hasher.update(chunk);
-    }
-    hasher.finalize().into()
-}
-
 // ============================================================================
 // PKCS#7/CMS Signature Verification
 // ============================================================================
@@ -443,28 +434,24 @@ fn validate_certificate_time(cert_der: &[u8]) -> Result<(), AuthError> {
     Ok(())
 }
 
-/// Parse X.509 Time (UTCTime or GeneralizedTime) to Unix timestamp
-fn parse_x509_time(time: &x509_cert::time::Time) -> Result<i64, AuthError> {
-    use x509_cert::time::Time;
-
-    let datetime = match time {
-        Time::UtcTime(t) => t.to_date_time(),
-        Time::GeneralTime(t) => t.to_date_time(),
-    };
-
-    // Convert to approximate Unix timestamp (seconds since 1970)
-    // This is simplified - a full implementation would handle leap seconds, etc.
-    let year = datetime.year() as i64;
-    let month = datetime.month() as i64;
-    let day = datetime.day() as i64;
-    let hour = datetime.hour() as i64;
-    let minute = datetime.minutes() as i64;
-    let second = datetime.seconds() as i64;
-
-    // Approximate days since epoch (1970-01-01)
+/// Convert a date/time to approximate Unix timestamp (seconds since 1970-01-01 00:00:00 UTC)
+///
+/// This is a simplified implementation that doesn't handle leap seconds,
+/// but is sufficient for certificate validity period checks.
+fn datetime_to_unix_timestamp(
+    year: i64,
+    month: i64,
+    day: i64,
+    hour: i64,
+    minute: i64,
+    second: i64,
+) -> i64 {
+    // Calculate days since epoch (1970-01-01)
     let years_since_1970 = year - 1970;
     let leap_years = (year - 1969) / 4 - (year - 1901) / 100 + (year - 1601) / 400;
-    let days_in_year = match month {
+
+    // Days before the start of each month (non-leap year)
+    let days_before_month = match month {
         1 => 0,
         2 => 31,
         3 => 59,
@@ -479,14 +466,34 @@ fn parse_x509_time(time: &x509_cert::time::Time) -> Result<i64, AuthError> {
         12 => 334,
         _ => 0,
     };
+
+    // Add leap day if we're past February in a leap year
     let is_leap = (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0);
     let leap_day_adjustment = if is_leap && month > 2 { 1 } else { 0 };
 
     let total_days =
-        years_since_1970 * 365 + leap_years + days_in_year + day - 1 + leap_day_adjustment;
-    let total_seconds = total_days * 86400 + hour * 3600 + minute * 60 + second;
+        years_since_1970 * 365 + leap_years + days_before_month + day - 1 + leap_day_adjustment;
 
-    Ok(total_seconds)
+    total_days * 86400 + hour * 3600 + minute * 60 + second
+}
+
+/// Parse X.509 Time (UTCTime or GeneralizedTime) to Unix timestamp
+fn parse_x509_time(time: &x509_cert::time::Time) -> Result<i64, AuthError> {
+    use x509_cert::time::Time;
+
+    let datetime = match time {
+        Time::UtcTime(t) => t.to_date_time(),
+        Time::GeneralTime(t) => t.to_date_time(),
+    };
+
+    Ok(datetime_to_unix_timestamp(
+        datetime.year() as i64,
+        datetime.month() as i64,
+        datetime.day() as i64,
+        datetime.hour() as i64,
+        datetime.minutes() as i64,
+        datetime.seconds() as i64,
+    ))
 }
 
 /// Get current time for certificate validation
@@ -498,37 +505,14 @@ fn get_current_time_for_cert_validation() -> i64 {
     // a more reliable time source
     let (year, month, day, hour, minute, second) = read_rtc_time_for_crypto();
 
-    let year = year as i64;
-    let month = month as i64;
-    let day = day as i64;
-    let hour = hour as i64;
-    let minute = minute as i64;
-    let second = second as i64;
-
-    // Same calculation as parse_x509_time
-    let years_since_1970 = year - 1970;
-    let leap_years = (year - 1969) / 4 - (year - 1901) / 100 + (year - 1601) / 400;
-    let days_in_year = match month {
-        1 => 0,
-        2 => 31,
-        3 => 59,
-        4 => 90,
-        5 => 120,
-        6 => 151,
-        7 => 181,
-        8 => 212,
-        9 => 243,
-        10 => 273,
-        11 => 304,
-        12 => 334,
-        _ => 0,
-    };
-    let is_leap = (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0);
-    let leap_day_adjustment = if is_leap && month > 2 { 1 } else { 0 };
-
-    let total_days =
-        years_since_1970 * 365 + leap_years + days_in_year + day - 1 + leap_day_adjustment;
-    total_days * 86400 + hour * 3600 + minute * 60 + second
+    datetime_to_unix_timestamp(
+        year as i64,
+        month as i64,
+        day as i64,
+        hour as i64,
+        minute as i64,
+        second as i64,
+    )
 }
 
 /// Read time from CMOS RTC (simplified version for crypto module)
@@ -875,27 +859,4 @@ fn verify_rsa_signature_raw(
     }
 }
 
-// ============================================================================
-// Image Hash Verification
-// ============================================================================
 
-/// Compute the Authenticode PE hash of a binary image
-///
-/// This implements the PE/COFF hash algorithm used by UEFI Secure Boot.
-/// The hash excludes:
-/// - The checksum field in the optional header
-/// - The Certificate Table entry in the optional header
-/// - The attribute certificate table
-pub fn compute_pe_hash(pe_data: &[u8]) -> Result<[u8; 32], AuthError> {
-    // Use the proper Authenticode hash calculation
-    super::authenticode::compute_authenticode_hash(pe_data)
-}
-
-/// Verify a PE image signature
-///
-/// This checks if the image's embedded signature is valid and signed by
-/// a certificate in the allowed database (db) and not in the forbidden database (dbx).
-pub fn verify_pe_image(pe_data: &[u8]) -> Result<bool, AuthError> {
-    // Use the full Authenticode verification
-    super::authenticode::verify_pe_image_secure_boot(pe_data)
-}

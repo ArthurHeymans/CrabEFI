@@ -4,22 +4,11 @@
 //! functions for managing authenticated variables.
 
 use super::crypto::constant_time_eq;
+use super::guid_to_bytes;
 use super::structures::{EfiTime, SignatureIterator, SignatureListIterator};
 use super::{AuthError, EFI_CERT_SHA256_GUID, EFI_CERT_X509_GUID};
 use alloc::vec::Vec;
 use r_efi::efi::Guid;
-
-// ============================================================================
-// GUID Helper Functions
-// ============================================================================
-
-/// Convert a Guid to raw bytes
-fn guid_to_bytes(guid: &Guid) -> [u8; 16] {
-    let bytes = guid.as_bytes();
-    let mut result = [0u8; 16];
-    result.copy_from_slice(bytes);
-    result
-}
 
 /// Compare a raw GUID (as bytes) with an r_efi Guid (for future use in GUID-based lookups)
 #[allow(dead_code)]
@@ -144,11 +133,6 @@ impl KeyDatabase {
             }
         }
         Ok(())
-    }
-
-    /// Append entries from a signature list blob (for APPEND_WRITE)
-    pub fn append_from_signature_lists(&mut self, data: &[u8]) -> Result<(), AuthError> {
-        self.load_from_signature_lists(data)
     }
 
     /// Serialize the database to signature list format

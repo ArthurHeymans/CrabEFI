@@ -113,9 +113,6 @@ impl IchChipset {
     /// Marker for PCH100-compatible SPI engine
     pub const SPI_ENGINE_PCH100: Self = Self::Series100SunrisePoint;
 
-    /// Marker for new access permission registers (BM_RAP/WAP)
-    pub const HAS_NEW_ACCESS_PERM: Self = Self::C740Emmitsburg;
-
     /// Returns true if this chipset uses ICH9-compatible SPI engine
     pub fn is_ich9_compatible(self) -> bool {
         self >= Self::SPI_ENGINE_ICH9
@@ -126,25 +123,12 @@ impl IchChipset {
         self >= Self::SPI_ENGINE_PCH100
     }
 
-    /// Returns true if this chipset has new access permission registers
-    pub fn has_new_access_perm(self) -> bool {
-        self >= Self::HAS_NEW_ACCESS_PERM
-    }
-
     /// Returns true if this chipset supports hardware sequencing (hwseq)
     ///
     /// Hardware sequencing was introduced with ICH8. ICH7 only supports
     /// software sequencing.
     pub fn supports_hwseq(self) -> bool {
         self >= Self::SPI_ENGINE_ICH9
-    }
-
-    /// Returns true if this chipset defaults to hwseq when in auto mode
-    ///
-    /// PCH100+ series defaults to hwseq because swseq is often locked
-    /// and hwseq provides better compatibility.
-    pub fn defaults_to_hwseq(self) -> bool {
-        self >= Self::SPI_ENGINE_PCH100
     }
 }
 

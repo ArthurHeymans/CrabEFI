@@ -26,10 +26,8 @@
 //! enrollment::enroll_default_pk()?;
 //! ```
 
-use super::structures::EfiSignatureList;
-use super::variables::{KeyDatabase, KeyDatabaseEntry, db_database, kek_database, pk_database};
-use super::{AuthError, EFI_CERT_X509_GUID, enter_user_mode};
-use alloc::vec::Vec;
+use super::variables::{db_database, kek_database, pk_database, KeyDatabase, KeyDatabaseEntry};
+use super::{enter_user_mode, AuthError, EFI_CERT_X509_GUID};
 
 // ============================================================================
 // Microsoft Owner GUID (used for signature entries)
@@ -530,66 +528,6 @@ pub fn enroll_default_keys() -> Result<(), AuthError> {
     Ok(())
 }
 
-/// Enroll only Microsoft db certificates (for Linux-focused systems)
-///
-/// This enrolls only the db certificates needed for shim/GRUB:
-/// - Microsoft Corporation UEFI CA 2011 -> db
-///
-/// Note: Without a PK enrolled, the system remains in Setup Mode.
-pub fn enroll_microsoft_db_only() -> Result<(), AuthError> {
-    log::info!("Enrolling Microsoft UEFI CA for shim/GRUB");
-    enroll_microsoft_uefi_ca_db()?;
-    log::info!("Microsoft UEFI CA enrolled - system remains in Setup Mode");
-    Ok(())
-}
-
-/// Build a signature list for the given certificates
-///
-/// This creates a valid EFI_SIGNATURE_LIST structure that can be passed
-/// to SetVariable for authenticated writes.
-pub fn build_signature_list(certificates: &[(&[u8], &[u8; 16])]) -> Vec<u8> {
-    let mut result = Vec::new();
-    let x509_type = x509_cert_type();
-
-    for (cert_data, owner) in certificates {
-        // Each X.509 cert gets its own signature list (variable size)
-        let sig_size = 16 + cert_data.len(); // Owner GUID + cert data
-        let list_size = EfiSignatureList::HEADER_SIZE + sig_size;
-
-        // Write EFI_SIGNATURE_LIST header
-        result.extend_from_slice(&x509_type); // SignatureType
-        result.extend_from_slice(&(list_size as u32).to_le_bytes()); // SignatureListSize
-        result.extend_from_slice(&0u32.to_le_bytes()); // SignatureHeaderSize
-        result.extend_from_slice(&(sig_size as u32).to_le_bytes()); // SignatureSize
-
-        // Write EFI_SIGNATURE_DATA
-        result.extend_from_slice(*owner); // SignatureOwner
-        result.extend_from_slice(cert_data); // SignatureData
-    }
-
-    result
-}
-
-/// Get the Microsoft KEK certificate DER data
-pub fn microsoft_kek_ca_2011() -> &'static [u8] {
-    MICROSOFT_KEK_CA_2011
-}
-
-/// Get the Microsoft Windows Production PCA certificate DER data
-pub fn microsoft_windows_production_pca_2011() -> &'static [u8] {
-    MICROSOFT_WINDOWS_PRODUCTION_PCA_2011
-}
-
-/// Get the Microsoft UEFI CA certificate DER data
-pub fn microsoft_uefi_ca_2011() -> &'static [u8] {
-    MICROSOFT_UEFI_CA_2011
-}
-
-/// Get the Microsoft owner GUID
-pub fn microsoft_owner_guid() -> &'static [u8; 16] {
-    &MICROSOFT_OWNER_GUID
-}
-
 // ============================================================================
 // Status Functions
 // ============================================================================
@@ -629,12 +567,4 @@ pub struct EnrollmentStatus {
     pub setup_mode: bool,
     /// Whether Secure Boot is enabled
     pub secure_boot_enabled: bool,
-}
-
-impl EnrollmentStatus {
-    /// Check if default Microsoft keys are enrolled
-    pub fn has_microsoft_defaults(&self) -> bool {
-        // Microsoft defaults: 1 KEK, 2 db certs minimum
-        self.kek_count >= 1 && self.db_count >= 2 && self.pk_enrolled
-    }
 }
