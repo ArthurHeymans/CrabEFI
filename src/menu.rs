@@ -1117,6 +1117,8 @@ pub fn show_menu(menu: &mut BootMenu) -> Option<usize> {
 enum KeyPress {
     Up,
     Down,
+    Left,
+    Right,
     Enter,
     Escape,
     Char(char),
@@ -1129,6 +1131,8 @@ fn read_key() -> Option<KeyPress> {
         return match scan_code {
             0x01 => Some(KeyPress::Up),                         // SCAN_UP
             0x02 => Some(KeyPress::Down),                       // SCAN_DOWN
+            0x03 => Some(KeyPress::Right),                      // SCAN_RIGHT
+            0x04 => Some(KeyPress::Left),                       // SCAN_LEFT
             0x17 => Some(KeyPress::Escape),                     // SCAN_ESC
             0 if unicode_char == 0x0D => Some(KeyPress::Enter), // Carriage return
             0 if unicode_char > 0 => Some(KeyPress::Char(unicode_char as u8 as char)),
@@ -1146,6 +1150,8 @@ fn read_key() -> Option<KeyPress> {
                     match serial_driver::try_read() {
                         Some(b'A') => Some(KeyPress::Up),
                         Some(b'B') => Some(KeyPress::Down),
+                        Some(b'C') => Some(KeyPress::Right),
+                        Some(b'D') => Some(KeyPress::Left),
                         _ => Some(KeyPress::Escape),
                     }
                 } else {
@@ -1584,20 +1590,22 @@ fn edit_cmdline(entry: &mut BootEntry, fb_console: &mut Option<FramebufferConsol
                         _ => {}
                     }
                 }
-                KeyPress::Up => {
+                KeyPress::Left => {
                     // Move cursor left
                     if cursor_pos > 0 {
                         cursor_pos -= 1;
                         needs_redraw = true;
                     }
                 }
-                KeyPress::Down => {
+                KeyPress::Right => {
                     // Move cursor right
                     if cursor_pos < buffer.len() {
                         cursor_pos += 1;
                         needs_redraw = true;
                     }
                 }
+                // Ignore Up/Down in editor
+                KeyPress::Up | KeyPress::Down => {}
             }
         }
 
@@ -1650,7 +1658,7 @@ fn draw_cmdline_editor_static(
     // Help text (row 9-10)
     serial_driver::write_str("\x1b[36m"); // Cyan
     serial_driver::write_str(
-        "Enter: Confirm | Esc: Cancel | Ctrl+X: Boot | Arrows: Move cursor\r\n",
+        "Enter: Confirm | Esc: Cancel | Ctrl+X: Boot | Left/Right: Move cursor\r\n",
     );
     serial_driver::write_str(
         "Ctrl+A: Start | Ctrl+E: End | Ctrl+K: Delete to end | Ctrl+U: Delete to start",
@@ -1688,8 +1696,8 @@ fn draw_cmdline_editor_static(
         // Help text
         console.set_position(0, 9);
         console.set_fg_color(Color::new(0, 192, 192));
-        let _ =
-            console.write_str("Enter: Confirm | Esc: Cancel | Ctrl+X: Boot | Arrows: Move cursor");
+        let _ = console
+            .write_str("Enter: Confirm | Esc: Cancel | Ctrl+X: Boot | Left/Right: Move cursor");
         console.set_position(0, 10);
         let _ = console.write_str(
             "Ctrl+A: Start | Ctrl+E: End | Ctrl+K: Delete to end | Ctrl+U: Delete to start",
