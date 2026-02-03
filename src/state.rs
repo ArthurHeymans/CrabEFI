@@ -139,7 +139,11 @@ pub fn try_get() -> Option<&'static FirmwareState> {
 #[inline]
 pub fn try_get_mut_ptr() -> Option<*mut FirmwareState> {
     let ptr = STATE_PTR.load(Ordering::Acquire);
-    if ptr.is_null() { None } else { Some(ptr) }
+    if ptr.is_null() {
+        None
+    } else {
+        Some(ptr)
+    }
 }
 
 // ============================================================================
@@ -499,6 +503,11 @@ pub struct DriverState {
     /// Global framebuffer info (from coreboot)
     pub framebuffer: Option<FramebufferInfo>,
 
+    /// Address of the coreboot framebuffer record in the coreboot tables.
+    /// This is stored so we can invalidate it at ExitBootServices to prevent
+    /// Linux from trying to use both the coreboot framebuffer and the EFI GOP.
+    pub coreboot_fb_record_addr: Option<u64>,
+
     /// SMMSTORE v2 info (from coreboot tables)
     ///
     /// Contains information for accessing UEFI variable storage through
@@ -531,6 +540,7 @@ impl DriverState {
             serial_port: None,
             keyboard: KeyboardState::new(),
             framebuffer: None,
+            coreboot_fb_record_addr: None,
             smmstorev2: None,
             spi_flash: None,
             boot_media: None,

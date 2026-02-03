@@ -1124,6 +1124,15 @@ extern "efiapi" fn exit_boot_services(image_handle: Handle, map_key: usize) -> S
         // Stop and reset USB controllers so Linux can reinitialize them
         crate::drivers::usb::cleanup();
 
+        // Invalidate the coreboot framebuffer record to prevent a race condition
+        // between Linux's simplefb (coreboot) and efifb (EFI GOP) drivers.
+        // By setting the tag to CB_TAG_UNUSED, Linux will only use the EFI GOP.
+        // SAFETY: This modifies the coreboot tables in memory, which is safe at
+        // ExitBootServices since coreboot has already finished using them.
+        unsafe {
+            crate::coreboot::invalidate_framebuffer_record();
+        }
+
         // CRITICAL: Set boot_services pointer to NULL in SystemTable
         // This is REQUIRED by UEFI spec and Linux checks for this!
         unsafe {

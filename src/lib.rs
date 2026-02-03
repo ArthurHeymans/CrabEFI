@@ -150,6 +150,12 @@ pub fn init(coreboot_table_ptr: u64) {
         coreboot::store_framebuffer(fb.clone());
     }
 
+    // Store the coreboot framebuffer record address so we can invalidate it
+    // at ExitBootServices to prevent a race between Linux's simplefb and efifb
+    if let Some(addr) = cb_info.framebuffer_record_addr {
+        coreboot::store_framebuffer_record_addr(addr);
+    }
+
     // Store SMMSTORE v2 info globally for variable persistence
     if let Some(ref smmstore) = cb_info.smmstorev2 {
         coreboot::store_smmstorev2(smmstore.clone());

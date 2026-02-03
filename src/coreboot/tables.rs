@@ -13,7 +13,7 @@ const MAX_MEMORY_REGIONS: usize = 64;
 
 /// Coreboot table tags
 #[allow(dead_code)]
-mod tags {
+pub mod tags {
     pub const CB_TAG_UNUSED: u32 = 0x0000;
     pub const CB_TAG_MEMORY: u32 = 0x0001;
     pub const CB_TAG_HWRPB: u32 = 0x0002;
@@ -315,6 +315,10 @@ pub struct CorebootInfo {
     pub serial: Option<SerialInfo>,
     /// Framebuffer information
     pub framebuffer: Option<FramebufferInfo>,
+    /// Physical address of the framebuffer record in the coreboot tables.
+    /// This is stored so we can invalidate it at ExitBootServices to prevent
+    /// a race condition between Linux's simplefb (coreboot) and efifb (EFI GOP).
+    pub framebuffer_record_addr: Option<u64>,
     /// ACPI RSDP pointer
     pub acpi_rsdp: Option<u64>,
     /// Coreboot version string
@@ -337,6 +341,7 @@ impl CorebootInfo {
             memory_map: Vec::new(),
             serial: None,
             framebuffer: None,
+            framebuffer_record_addr: None,
             acpi_rsdp: None,
             version: None,
             cbmem_console: None,
@@ -723,12 +728,21 @@ fn parse_framebuffer(record_bytes: &[u8], info: &mut CorebootInfo) {
         blue_mask_size,
     });
 
+    // Store the record address so we can invalidate it at ExitBootServices.
+    // This prevents Linux from trying to use both simplefb (coreboot) and efifb (EFI GOP).
+    //
+    // SAFETY: Coreboot tables are placed in reserved memory (LB_MEM_TABLE type) that
+    // persists throughout the boot process. The address remains valid and stable until
+    // the OS takes over, at which point we've already invalidated the record.
+    info.framebuffer_record_addr = Some(record_bytes.as_ptr() as u64);
+
     log::debug!(
-        "Framebuffer: {}x{} @ {:#x}, {} bpp",
+        "Framebuffer: {}x{} @ {:#x}, {} bpp (record at {:#x})",
         x_resolution,
         y_resolution,
         physical_address,
-        bits_per_pixel
+        bits_per_pixel,
+        record_bytes.as_ptr() as u64
     );
 }
 
