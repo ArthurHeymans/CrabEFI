@@ -389,8 +389,85 @@ pub const TRB_CC_USB_TRANSACTION_ERROR: u32 = 4;
 pub const TRB_CC_TRB_ERROR: u32 = 5;
 /// Stall Error
 pub const TRB_CC_STALL_ERROR: u32 = 6;
+/// Resource Error
+pub const TRB_CC_RESOURCE_ERROR: u32 = 7;
+/// Bandwidth Error
+pub const TRB_CC_BANDWIDTH_ERROR: u32 = 8;
+/// No Slots Available
+pub const TRB_CC_NO_SLOTS: u32 = 9;
+/// Invalid Stream Type
+pub const TRB_CC_INVALID_STREAM_TYPE: u32 = 10;
+/// Slot Not Enabled
+pub const TRB_CC_SLOT_NOT_ENABLED: u32 = 11;
+/// Endpoint Not Enabled
+pub const TRB_CC_EP_NOT_ENABLED: u32 = 12;
 /// Short Packet
 pub const TRB_CC_SHORT_PACKET: u32 = 13;
+/// Ring Underrun
+pub const TRB_CC_RING_UNDERRUN: u32 = 14;
+/// Ring Overrun
+pub const TRB_CC_RING_OVERRUN: u32 = 15;
+/// VF Event Ring Full Error
+pub const TRB_CC_VF_EVENT_RING_FULL: u32 = 16;
+/// Parameter Error
+pub const TRB_CC_PARAMETER_ERROR: u32 = 17;
+/// Bandwidth Overrun Error
+pub const TRB_CC_BW_OVERRUN: u32 = 18;
+/// Context State Error
+pub const TRB_CC_CONTEXT_STATE_ERROR: u32 = 19;
+/// No Ping Response Error
+pub const TRB_CC_NO_PING_RESPONSE: u32 = 20;
+/// Event Ring Full Error
+pub const TRB_CC_EVENT_RING_FULL: u32 = 21;
+/// Incompatible Device Error
+pub const TRB_CC_INCOMPATIBLE_DEVICE: u32 = 22;
+/// Missed Service Error
+pub const TRB_CC_MISSED_SERVICE: u32 = 23;
+/// Command Ring Stopped
+pub const TRB_CC_COMMAND_RING_STOPPED: u32 = 24;
+/// Command Aborted
+pub const TRB_CC_COMMAND_ABORTED: u32 = 25;
+/// Stopped
+pub const TRB_CC_STOPPED: u32 = 26;
+/// Stopped - Length Invalid
+pub const TRB_CC_STOPPED_LENGTH_INVALID: u32 = 27;
+/// Stopped - Short Packet
+pub const TRB_CC_STOPPED_SHORT_PACKET: u32 = 28;
+
+/// Convert completion code to string for debugging
+pub fn trb_cc_name(cc: u32) -> &'static str {
+    match cc {
+        TRB_CC_SUCCESS => "SUCCESS",
+        TRB_CC_DATA_BUFFER_ERROR => "DATA_BUFFER_ERROR",
+        TRB_CC_BABBLE_DETECTED => "BABBLE_DETECTED",
+        TRB_CC_USB_TRANSACTION_ERROR => "USB_TRANSACTION_ERROR",
+        TRB_CC_TRB_ERROR => "TRB_ERROR",
+        TRB_CC_STALL_ERROR => "STALL_ERROR",
+        TRB_CC_RESOURCE_ERROR => "RESOURCE_ERROR",
+        TRB_CC_BANDWIDTH_ERROR => "BANDWIDTH_ERROR",
+        TRB_CC_NO_SLOTS => "NO_SLOTS",
+        TRB_CC_INVALID_STREAM_TYPE => "INVALID_STREAM_TYPE",
+        TRB_CC_SLOT_NOT_ENABLED => "SLOT_NOT_ENABLED",
+        TRB_CC_EP_NOT_ENABLED => "EP_NOT_ENABLED",
+        TRB_CC_SHORT_PACKET => "SHORT_PACKET",
+        TRB_CC_RING_UNDERRUN => "RING_UNDERRUN",
+        TRB_CC_RING_OVERRUN => "RING_OVERRUN",
+        TRB_CC_VF_EVENT_RING_FULL => "VF_EVENT_RING_FULL",
+        TRB_CC_PARAMETER_ERROR => "PARAMETER_ERROR",
+        TRB_CC_BW_OVERRUN => "BW_OVERRUN",
+        TRB_CC_CONTEXT_STATE_ERROR => "CONTEXT_STATE_ERROR",
+        TRB_CC_NO_PING_RESPONSE => "NO_PING_RESPONSE",
+        TRB_CC_EVENT_RING_FULL => "EVENT_RING_FULL",
+        TRB_CC_INCOMPATIBLE_DEVICE => "INCOMPATIBLE_DEVICE",
+        TRB_CC_MISSED_SERVICE => "MISSED_SERVICE",
+        TRB_CC_COMMAND_RING_STOPPED => "COMMAND_RING_STOPPED",
+        TRB_CC_COMMAND_ABORTED => "COMMAND_ABORTED",
+        TRB_CC_STOPPED => "STOPPED",
+        TRB_CC_STOPPED_LENGTH_INVALID => "STOPPED_LENGTH_INVALID",
+        TRB_CC_STOPPED_SHORT_PACKET => "STOPPED_SHORT_PACKET",
+        _ => "UNKNOWN",
+    }
+}
 
 // ============================================================================
 // Extended Capability IDs
@@ -421,8 +498,17 @@ pub const USBLEGSUP_OS_OWNED: u32 = 1 << 24;
 // ============================================================================
 
 /// All status change bits that can be cleared by writing 1
+/// CSC(17), PEC(18), WRC(19), OCC(20), PRC(21), PLC(22), CEC(23)
 pub const PORTSC_CHANGE_MASK: u32 =
     (1 << 17) | (1 << 18) | (1 << 19) | (1 << 20) | (1 << 21) | (1 << 22) | (1 << 23);
+
+/// Read/Write bits that should be preserved when writing to PORTSC
+/// PP(9), PIC(14:15), WCE(25), WDE(26), WOE(27)
+/// Note: PED(1) is RW1C, PR(4) is RW1S, WPR(31) is RW1S - don't preserve these!
+/// Note: LWS(16) is intentionally excluded - setting it triggers a link state
+/// write strobe which would cause unintended link state changes. Only set LWS
+/// when deliberately changing the Port Link State (PLS) field.
+pub const PORTSC_RW_MASK: u32 = (1 << 9) | (3 << 14) | (1 << 25) | (1 << 26) | (1 << 27);
 
 // ============================================================================
 // Capability Register Offsets
@@ -525,3 +611,7 @@ pub const PORTSC_PLS_RXDETECT: u32 = 5 << 5;
 pub const PORTSC_PLS_POLLING: u32 = 7 << 5;
 /// Port Reset Change
 pub const PORTSC_PRC: u32 = 1 << 21;
+/// Warm Port Reset Change (USB3 only)
+pub const PORTSC_WRC: u32 = 1 << 19;
+/// Warm Port Reset (USB3 only)
+pub const PORTSC_WPR: u32 = 1 << 31;

@@ -208,6 +208,30 @@ impl MmioRegion {
         reg.set(value);
     }
 
+    /// Write a 64-bit register as two 32-bit writes (low dword first, then high).
+    ///
+    /// Some hardware (notably xHCI) requires that 64-bit MMIO registers be
+    /// written as two separate 32-bit writes rather than a single 64-bit write.
+    /// The xHCI specification mandates low-dword-first ordering. On many PCI/PCIe
+    /// implementations, a single 64-bit MMIO write may be split arbitrarily by
+    /// the bus, causing the controller to see partial updates.
+    ///
+    /// This follows the Linux kernel's `lo_hi_writeq()` pattern.
+    #[inline]
+    pub fn write64_lo_hi(&self, offset: u64, value: u64) {
+        #[cfg(debug_assertions)]
+        self.check_bounds(offset, 8);
+
+        let lo = value as u32;
+        let hi = (value >> 32) as u32;
+        let lo_reg =
+            unsafe { &*(self.base.as_ptr().add(offset as usize) as *const WriteOnly<u32>) };
+        let hi_reg =
+            unsafe { &*(self.base.as_ptr().add(offset as usize + 4) as *const WriteOnly<u32>) };
+        lo_reg.set(lo);
+        hi_reg.set(hi);
+    }
+
     /// Read-modify-write a 64-bit register at the given offset.
     #[inline]
     pub fn modify64<F>(&self, offset: u64, f: F)

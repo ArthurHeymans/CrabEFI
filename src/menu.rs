@@ -589,6 +589,12 @@ fn discover_usb_entries(menu: &mut BootMenu) {
         let device_created = usb::with_controller(controller_id, |controller| {
             match UsbMassStorage::new(controller, device_addr) {
                 Ok(usb_device) => {
+                    // Skip devices with no media (e.g., card reader without card)
+                    if usb_device.num_blocks == 0 {
+                        log::info!("USB Mass Storage: no media present, skipping");
+                        return false;
+                    }
+
                     // Store device globally WITH controller pointer so global_read_sector can use it directly
                     // This avoids lock contention since we store the pointer, not just the ID
                     // SAFETY: controller_ptr is obtained from get_controller_ptr and is valid

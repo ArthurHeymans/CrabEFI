@@ -199,20 +199,69 @@ impl UsbMassStorage {
 
     /// Initialize the device
     fn init(&mut self, controller: &mut dyn UsbController) -> Result<(), MassStorageError> {
+        log::debug!(
+            "USB Mass Storage: init device={} bulk_in={} bulk_out={}",
+            self.device_addr,
+            self.bulk_in,
+            self.bulk_out
+        );
+
         // Test Unit Ready (may need multiple attempts as device spins up)
-        for _ in 0..5 {
-            if self.test_unit_ready(controller).is_ok() {
-                break;
+        let mut tur_ok = false;
+        for attempt in 0..5 {
+            match self.test_unit_ready(controller) {
+                Ok(()) => {
+                    log::debug!(
+                        "USB Mass Storage: TEST_UNIT_READY succeeded on attempt {}",
+                        attempt
+                    );
+                    tur_ok = true;
+                    break;
+                }
+                Err(e) => {
+                    log::debug!(
+                        "USB Mass Storage: TEST_UNIT_READY failed attempt {}: {:?}",
+                        attempt,
+                        e
+                    );
+                    // Delay 100ms between retries
+                    time::delay_ms(100);
+                }
             }
-            // Delay 100ms between retries
-            time::delay_ms(100);
+        }
+
+        if !tur_ok {
+            log::debug!("USB Mass Storage: TEST_UNIT_READY failed all attempts, continuing anyway");
         }
 
         // Inquiry
+        log::debug!("USB Mass Storage: sending INQUIRY");
         self.inquiry(controller)?;
+        log::debug!(
+            "USB Mass Storage: INQUIRY succeeded, vendor={:?}",
+            core::str::from_utf8(&self.vendor).unwrap_or("?").trim()
+        );
 
-        // Read Capacity
-        self.read_capacity(controller)?;
+        // Read Capacity - may fail if no media is present (e.g., card reader without card)
+        log::debug!("USB Mass Storage: sending READ_CAPACITY");
+        match self.read_capacity(controller) {
+            Ok(()) => {
+                log::debug!(
+                    "USB Mass Storage: READ_CAPACITY succeeded, blocks={} size={}",
+                    self.num_blocks,
+                    self.block_size
+                );
+            }
+            Err(e) => {
+                // READ_CAPACITY failure is not fatal - might just be a card reader without media
+                log::debug!(
+                    "USB Mass Storage: READ_CAPACITY failed: {:?} (no media?)",
+                    e
+                );
+                // Keep default values: num_blocks=0, block_size=512
+                // This allows enumeration but filesystem operations will fail
+            }
+        }
 
         log::info!(
             "USB Mass Storage: {} {} - {} blocks x {} bytes = {} MB",
@@ -253,48 +302,107 @@ impl UsbMassStorage {
         cbw.cb_length = cdb.len().min(16) as u8;
         cbw.cb[..cdb.len().min(16)].copy_from_slice(&cdb[..cdb.len().min(16)]);
 
+        // Save tag before logging (packed struct)
+        let cbw_tag = cbw.tag;
+
+        log::trace!(
+            "USB SCSI: cmd={:#04x} tag={} len={} dir={}",
+            cdb[0],
+            cbw_tag,
+            data_len,
+            if is_read { "IN" } else { "OUT" }
+        );
+
         // Send CBW (OUT)
         let cbw_bytes = unsafe { core::slice::from_raw_parts(&cbw as *const _ as *const u8, 31) };
         let mut cbw_buf = [0u8; 31];
         cbw_buf.copy_from_slice(cbw_bytes);
 
-        controller.bulk_transfer(self.device_addr, self.bulk_out, false, &mut cbw_buf)?;
+        if let Err(e) =
+            controller.bulk_transfer(self.device_addr, self.bulk_out, false, &mut cbw_buf)
+        {
+            log::debug!("USB SCSI: CBW transfer failed: {:?}", e);
+            return Err(MassStorageError::Usb(e));
+        }
 
         // Data phase (if any)
         let transferred = if let Some(buf) = data {
-            controller.bulk_transfer(
+            match controller.bulk_transfer(
                 self.device_addr,
                 if is_read { self.bulk_in } else { self.bulk_out },
                 is_read,
                 buf,
-            )?
+            ) {
+                Ok(n) => n,
+                Err(e) => {
+                    log::debug!("USB SCSI: Data phase failed: {:?}", e);
+                    return Err(MassStorageError::Usb(e));
+                }
+            }
         } else {
             0
         };
 
         // Receive CSW (IN)
         let mut csw_buf = [0u8; 13];
-        controller.bulk_transfer(self.device_addr, self.bulk_in, true, &mut csw_buf)?;
+        if let Err(e) = controller.bulk_transfer(self.device_addr, self.bulk_in, true, &mut csw_buf)
+        {
+            log::debug!("USB SCSI: CSW transfer failed: {:?}", e);
+            return Err(MassStorageError::Usb(e));
+        }
 
         // Parse CSW using zerocopy
         let csw = CommandStatusWrapper::read_from_prefix(&csw_buf)
             .map_err(|_| MassStorageError::InvalidCsw)?
             .0;
 
+        // Copy fields from packed struct to avoid alignment issues
+        let csw_sig = csw.signature;
+        let csw_tag = csw.tag;
+        let csw_residue = csw.data_residue;
+        let csw_stat = csw.status;
+
+        log::trace!(
+            "USB SCSI: CSW sig={:#x} tag={} residue={} status={}",
+            csw_sig,
+            csw_tag,
+            csw_residue,
+            csw_stat
+        );
+
         // Verify CSW
-        if csw.signature != CSW_SIGNATURE {
+        if csw_sig != CSW_SIGNATURE {
+            log::debug!(
+                "USB SCSI: Invalid CSW signature {:#x} (expected {:#x})",
+                csw_sig,
+                CSW_SIGNATURE
+            );
             return Err(MassStorageError::InvalidCsw);
         }
 
-        if csw.tag != cbw.tag {
+        if csw_tag != cbw_tag {
+            log::debug!(
+                "USB SCSI: CSW tag mismatch: got {} expected {}",
+                csw_tag,
+                cbw_tag
+            );
             return Err(MassStorageError::InvalidCsw);
         }
 
-        match csw.status {
+        match csw_stat {
             csw_status::PASSED => Ok(transferred),
-            csw_status::FAILED => Err(MassStorageError::CommandFailed),
-            csw_status::PHASE_ERROR => Err(MassStorageError::PhaseError),
-            _ => Err(MassStorageError::InvalidCsw),
+            csw_status::FAILED => {
+                log::debug!("USB SCSI: Command {:#04x} failed (CSW status=1)", cdb[0]);
+                Err(MassStorageError::CommandFailed)
+            }
+            csw_status::PHASE_ERROR => {
+                log::debug!("USB SCSI: Phase error for command {:#04x}", cdb[0]);
+                Err(MassStorageError::PhaseError)
+            }
+            _ => {
+                log::debug!("USB SCSI: Unknown CSW status {}", csw_stat);
+                Err(MassStorageError::InvalidCsw)
+            }
         }
     }
 

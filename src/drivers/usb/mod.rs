@@ -469,7 +469,7 @@ impl UsbController for XhciController {
 
     fn find_hid_keyboard(&self) -> Option<u8> {
         // Check all slots for HID keyboard devices
-        (0..4u8).find(|&slot_id| {
+        (0..xhci::MAX_SLOTS as u8).find(|&slot_id| {
             self.get_slot(slot_id)
                 .map(|slot| slot.is_hid_keyboard)
                 .unwrap_or(false)
