@@ -202,6 +202,9 @@ pub fn init(coreboot_table_ptr: u64) {
     // Initialize PS/2 keyboard (if available)
     drivers::keyboard::init();
 
+    // Store coreboot table pointer for payload chainloading
+    state::set_coreboot_table_ptr(coreboot_table_ptr);
+
     log::info!("CrabEFI v{} starting...", env!("CARGO_PKG_VERSION"));
     log::info!("Coreboot table pointer: {:#x}", coreboot_table_ptr);
 
@@ -235,6 +238,13 @@ pub fn init(coreboot_table_ptr: u64) {
             smmstore.num_blocks,
             smmstore.block_size / 1024,
             smmstore.mmap_addr
+        );
+    }
+    if let Some(ref boot_media) = cb_info.boot_media {
+        log::info!(
+            "  CBFS: offset {:#x}, size {} KB",
+            boot_media.cbfs_offset,
+            boot_media.cbfs_size / 1024
         );
     }
     log::info!("  Memory regions: {}", cb_info.memory_map.len());
@@ -422,7 +432,8 @@ fn init_storage() {
 /// Dispatches to the appropriate boot method based on the entry kind:
 /// - UEFI/UKI entries: Load and execute EFI application
 /// - BLS/GRUB Linux entries: Direct Linux boot via linux_boot module
-/// - Payload entries: Chainload coreboot payload
+/// - Payload entries: Chainload coreboot payload from disk
+/// - CBFS Payload entries: Chainload coreboot payload from flash
 fn boot_selected_entry(entry: &menu::BootEntry) {
     log::info!("boot_selected_entry called");
 
@@ -449,10 +460,16 @@ fn boot_selected_entry(entry: &menu::BootEntry) {
             boot_linux_entry(entry, linux_path, initrd_path, cmdline);
         }
 
-        // Coreboot payload chainloading
+        // Coreboot payload chainloading from disk
         menu::BootEntryKind::Payload { path, format } => {
-            log::info!("Dispatching to payload chainload");
+            log::info!("Dispatching to payload chainload (disk)");
             boot_payload_entry(entry, path, *format);
+        }
+
+        // CBFS payload chainloading from flash
+        menu::BootEntryKind::CbfsPayload { cbfs_name } => {
+            log::info!("Dispatching to CBFS payload chainload");
+            boot_cbfs_payload_entry(cbfs_name);
         }
     }
 }
@@ -736,6 +753,10 @@ fn boot_uefi_entry(entry: &menu::BootEntry) {
             }
             log::error!("Failed to boot SDHCI entry");
         }
+        menu::DeviceType::Cbfs => {
+            // CBFS entries should use boot_cbfs_payload_entry, not UEFI boot path
+            log::error!("CBFS entries cannot use UEFI boot path");
+        }
     }
 }
 
@@ -986,6 +1007,10 @@ fn boot_linux_entry(
                 log::error!("Failed to get SDHCI controller {}", controller_id);
             }
         }
+        menu::DeviceType::Cbfs => {
+            // CBFS entries don't have disk storage for Linux boot
+            log::error!("CBFS entries cannot boot Linux directly");
+        }
     }
 
     // Note: We intentionally don't fall back to UEFI boot here.
@@ -1006,14 +1031,177 @@ fn boot_payload_entry(
     log::info!("  Path: {}", path);
     log::info!("  Format: {:?}", format);
 
-    // TODO: Implement full payload chainloading
-    // This requires:
-    // 1. Mount FAT filesystem on the partition
-    // 2. Create PayloadEntry from the menu entry
-    // 3. Call payload::chainload_payload()
-    //
-    // For now, log the attempt and return
-    log::warn!("Payload chainloading not yet fully implemented");
+    // Get the coreboot table pointer
+    let cbtable_ptr = match state::get_coreboot_table_ptr() {
+        Some(ptr) => ptr as *const u8,
+        None => {
+            log::error!("Coreboot table pointer not available");
+            return;
+        }
+    };
+
+    // Create PayloadEntry from menu entry
+    let mut payload_entry = payload::PayloadEntry {
+        name: heapless::String::new(),
+        path: path.clone(),
+        format,
+        size: 0, // Will be determined when reading
+    };
+    let _ = payload_entry.name.push_str(&entry.name);
+
+    // Dispatch based on device type to mount the filesystem
+    match entry.device_type {
+        menu::DeviceType::Nvme {
+            controller_id,
+            nsid,
+        } => {
+            if !drivers::nvme::store_global_device(controller_id, nsid) {
+                log::error!("Failed to store NVMe device globally");
+                return;
+            }
+            if let Some(controller) = drivers::nvme::get_controller(controller_id) {
+                let mut disk = NvmeDisk::new(controller, nsid);
+                if let Ok(mut fat) =
+                    fs::fat::FatFilesystem::new(&mut disk, entry.partition.first_lba)
+                {
+                    boot_payload_from_fat(&mut fat, &payload_entry, cbtable_ptr);
+                } else {
+                    log::error!("Failed to mount FAT filesystem on NVMe partition");
+                }
+            }
+        }
+        menu::DeviceType::Ahci {
+            controller_id,
+            port,
+        } => {
+            if !drivers::ahci::store_global_device(controller_id, port) {
+                log::error!("Failed to store AHCI device globally");
+                return;
+            }
+            if let Some(controller) = drivers::ahci::get_controller(controller_id) {
+                let mut disk = AhciDisk::new(controller, port);
+                if let Ok(mut fat) =
+                    fs::fat::FatFilesystem::new(&mut disk, entry.partition.first_lba)
+                {
+                    boot_payload_from_fat(&mut fat, &payload_entry, cbtable_ptr);
+                } else {
+                    log::error!("Failed to mount FAT filesystem on AHCI partition");
+                }
+            }
+        }
+        menu::DeviceType::Usb {
+            controller_id,
+            device_addr: _,
+        } => {
+            let controller_ptr = match drivers::usb::get_controller_ptr(controller_id) {
+                Some(ptr) => ptr,
+                None => {
+                    log::error!("Failed to get USB controller {}", controller_id);
+                    return;
+                }
+            };
+            if let Some(usb_device) = drivers::usb::mass_storage::get_global_device() {
+                let controller = unsafe { &mut *controller_ptr };
+                let mut disk = UsbDisk::new(usb_device, controller);
+                if let Ok(mut fat) =
+                    fs::fat::FatFilesystem::new(&mut disk, entry.partition.first_lba)
+                {
+                    boot_payload_from_fat(&mut fat, &payload_entry, cbtable_ptr);
+                } else {
+                    log::error!("Failed to mount FAT filesystem on USB partition");
+                }
+            }
+        }
+        menu::DeviceType::Sdhci { controller_id } => {
+            if !drivers::sdhci::store_global_device(controller_id) {
+                log::error!("Failed to store SDHCI device globally");
+                return;
+            }
+            if let Some(controller) = drivers::sdhci::get_controller(controller_id) {
+                let mut disk = SdhciDisk::new(controller);
+                if let Ok(mut fat) =
+                    fs::fat::FatFilesystem::new(&mut disk, entry.partition.first_lba)
+                {
+                    boot_payload_from_fat(&mut fat, &payload_entry, cbtable_ptr);
+                } else {
+                    log::error!("Failed to mount FAT filesystem on SDHCI partition");
+                }
+            }
+        }
+        menu::DeviceType::Cbfs => {
+            // CBFS payloads should use boot_cbfs_payload_entry, not disk-based boot
+            log::error!("Use boot_cbfs_payload_entry for CBFS payloads");
+        }
+    }
+
+    log::error!("Payload chainloading failed - returning to menu");
+}
+
+/// Boot a payload from a mounted FAT filesystem
+fn boot_payload_from_fat(
+    fat: &mut fs::fat::FatFilesystem<'_>,
+    entry: &payload::PayloadEntry,
+    cbtable_ptr: *const u8,
+) {
+    // Get file size to create a proper entry
+    let size = match fat.file_size(&entry.path) {
+        Ok(s) => s,
+        Err(e) => {
+            log::error!("Failed to get payload size: {:?}", e);
+            return;
+        }
+    };
+
+    if size == 0 {
+        log::error!("Payload file is empty");
+        return;
+    }
+
+    let full_entry = payload::PayloadEntry {
+        name: entry.name.clone(),
+        path: entry.path.clone(),
+        format: entry.format,
+        size,
+    };
+
+    log::info!("Loading payload: {} ({} bytes)", full_entry.name, size);
+
+    // Chainload the payload (this should not return on success)
+    unsafe {
+        match payload::chainload_payload(fat, &full_entry, cbtable_ptr) {
+            Err(e) => {
+                log::error!("Payload chainload failed: {:?}", e);
+            }
+        }
+    }
+}
+
+/// Boot a CBFS payload entry
+///
+/// This loads and executes a payload stored in the CBFS region of flash.
+/// Payloads are discovered by discover_cbfs_payloads() in the menu module.
+fn boot_cbfs_payload_entry(cbfs_name: &heapless::String<128>) {
+    log::info!("Chainloading CBFS payload: {}", cbfs_name);
+
+    // Get the coreboot table pointer
+    let cbtable_ptr = match state::get_coreboot_table_ptr() {
+        Some(ptr) => ptr as *const u8,
+        None => {
+            log::error!("Coreboot table pointer not available");
+            return;
+        }
+    };
+
+    // Load and execute the payload (this should not return on success)
+    unsafe {
+        match coreboot::cbfs::load_and_execute_payload(cbfs_name, cbtable_ptr) {
+            Err(e) => {
+                log::error!("CBFS payload chainload failed: {:?}", e);
+            }
+        }
+    }
+
+    log::error!("CBFS payload chainloading failed - returning to menu");
 }
 
 /// Install BlockIO protocols for a disk and all its partitions

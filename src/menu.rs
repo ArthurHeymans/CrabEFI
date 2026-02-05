@@ -54,6 +54,8 @@ pub enum DeviceType {
     },
     /// SDHCI (SD card)
     Sdhci { controller_id: usize },
+    /// CBFS (Coreboot File System) - payloads in flash
+    Cbfs,
 }
 
 /// Boot entry kind - how this entry should be booted
@@ -86,12 +88,18 @@ pub enum BootEntryKind {
         cmdline: String<512>,
     },
 
-    /// Coreboot payload (ELF or flat binary)
+    /// Coreboot payload from disk (ELF or flat binary)
     Payload {
         /// Path to payload file
         path: String<128>,
         /// Payload format
         format: crate::payload::PayloadFormat,
+    },
+
+    /// CBFS payload (payload stored in flash)
+    CbfsPayload {
+        /// CBFS file name
+        cbfs_name: String<128>,
     },
 }
 
@@ -128,6 +136,7 @@ impl DeviceType {
             DeviceType::Ahci { .. } => "SATA",
             DeviceType::Usb { .. } => "USB",
             DeviceType::Sdhci { .. } => "SD",
+            DeviceType::Cbfs => "CBFS",
         }
     }
 }
@@ -237,7 +246,15 @@ impl BootEntry {
 
     /// Check if this is a payload entry
     pub fn is_payload(&self) -> bool {
-        matches!(self.kind, BootEntryKind::Payload { .. })
+        matches!(
+            self.kind,
+            BootEntryKind::Payload { .. } | BootEntryKind::CbfsPayload { .. }
+        )
+    }
+
+    /// Check if this is a CBFS payload entry
+    pub fn is_cbfs_payload(&self) -> bool {
+        matches!(self.kind, BootEntryKind::CbfsPayload { .. })
     }
 
     /// Check if this entry has an editable command line
@@ -337,7 +354,7 @@ impl BootMenu {
 
 /// Discover boot entries from all storage devices
 ///
-/// Scans NVMe, AHCI, and USB devices for ESPs containing `EFI\BOOT\BOOTX64.EFI`.
+/// Scans NVMe, AHCI, USB devices, and CBFS for bootable entries.
 ///
 /// # Returns
 ///
@@ -347,6 +364,7 @@ pub fn discover_boot_entries() -> BootMenu {
 
     log::info!("Discovering boot entries...");
 
+    // Scan storage devices first (they take priority)
     // Scan NVMe devices
     discover_nvme_entries(&mut menu);
 
@@ -359,9 +377,53 @@ pub fn discover_boot_entries() -> BootMenu {
     // Scan SDHCI devices (SD cards)
     discover_sdhci_entries(&mut menu);
 
+    // Scan CBFS for chainloadable payloads (lower priority)
+    discover_cbfs_payloads(&mut menu);
+
     log::info!("Found {} boot entries", menu.entry_count());
 
     menu
+}
+
+/// Discover chainloadable payloads in CBFS
+fn discover_cbfs_payloads(menu: &mut BootMenu) {
+    use crate::coreboot::cbfs;
+
+    let payloads = cbfs::discover_payloads();
+
+    for payload in payloads {
+        // Create a synthetic partition for CBFS entries
+        // (partition_num = 0, empty partition info)
+        let empty_partition = gpt::Partition {
+            type_guid: [0u8; 16],
+            partition_guid: [0u8; 16],
+            first_lba: 0,
+            last_lba: 0,
+            attributes: 0,
+            is_esp: false,
+            block_size: 0,
+        };
+
+        let mut cbfs_name: String<128> = String::new();
+        let _ = cbfs_name.push_str(&payload.cbfs_name);
+
+        let entry = BootEntry::new_with_kind(
+            &payload.name,
+            &payload.cbfs_name, // Use CBFS name as path
+            DeviceType::Cbfs,
+            0, // No partition
+            empty_partition,
+            0, // No PCI device
+            0, // No PCI function
+            BootEntryKind::CbfsPayload { cbfs_name },
+            BootCategory::Payload,
+        );
+
+        if !menu.add_entry(entry) {
+            log::warn!("Boot menu full, skipping CBFS payload: {}", payload.name);
+            return;
+        }
+    }
 }
 
 /// Discover boot entries from NVMe devices

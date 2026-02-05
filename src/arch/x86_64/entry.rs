@@ -180,16 +180,17 @@ long_mode_start:
     mov gs, ax
     mov ss, ax
 
-    // Set up stack
-    lea rsp, [rip + _stack_top]
-
-    // Zero BSS
+    // Zero all NOLOAD sections (BSS, stack, deferred_buffer) before using stack
+    // They are contiguous: _bss_start to _deferred_buffer_end
     lea rdi, [rip + _bss_start]
-    lea rcx, [rip + _bss_end]
+    lea rcx, [rip + _deferred_buffer_end]
     sub rcx, rdi
-    shr rcx, 3
+    shr rcx, 3                    // Convert bytes to qwords
     xor rax, rax
     rep stosq
+
+    // Set up stack (now pointing to zeroed memory)
+    lea rsp, [rip + _stack_top]
 
     // Enable SSE
     mov rax, cr0
