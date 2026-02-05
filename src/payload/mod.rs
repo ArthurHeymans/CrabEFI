@@ -227,36 +227,41 @@ pub unsafe fn chainload_payload(
     jump_to_payload(entry_point, cbtable_ptr)
 }
 
-/// Jump to a loaded payload
+/// Jump to a loaded payload, switching from 64-bit long mode to 32-bit protected mode
+///
+/// Coreboot payloads (SeaBIOS, etc.) expect to be entered in 32-bit protected mode
+/// with the coreboot table pointer in EBX.
 ///
 /// # Arguments
 ///
 /// * `entry` - Entry point address
-/// * `cbtable` - Pointer to coreboot tables (passed in RDI)
+/// * `cbtable` - Pointer to coreboot tables (passed in EBX in 32-bit mode)
 ///
 /// # Safety
 ///
 /// The payload must be loaded at the entry address and be valid.
+/// This function never returns - it switches CPU mode and jumps to the entry point.
 unsafe fn jump_to_payload(entry: u64, cbtable: *const u8) -> ! {
-    // Disable interrupts
-    core::arch::asm!("cli");
+    use crate::coreboot::trampoline::{self, TrampolineParams};
 
-    // Clear registers and jump to payload
-    // Pass coreboot table pointer in RDI (x86-64 calling convention)
-    core::arch::asm!(
-        "mov rdi, {cbtable}",   // Coreboot table pointer
-        "xor rsi, rsi",         // Clear RSI
-        "xor rdx, rdx",         // Clear RDX
-        "xor rcx, rcx",         // Clear RCX
-        "xor r8, r8",           // Clear R8
-        "xor r9, r9",           // Clear R9
-        "xor r10, r10",         // Clear R10
-        "xor r11, r11",         // Clear R11
-        "jmp {entry}",
-        cbtable = in(reg) cbtable as u64,
-        entry = in(reg) entry,
-        options(noreturn)
-    );
+    // We reuse the trampoline's mode-switching code
+    // Create params that don't need to copy anything (src=dst, size=0)
+    let params = TrampolineParams {
+        src_addr: 0,
+        dst_addr: 0,
+        copy_size: 0,
+        bss_size: 0,
+        entry_point: entry,
+        coreboot_table_ptr: cbtable as u64,
+    };
+
+    // This never returns
+    match trampoline::execute_trampoline(&params) {
+        Err(e) => {
+            log::error!("Failed to jump to payload: {:?}", e);
+            panic!("Failed to execute payload");
+        }
+    }
 }
 
 /// Determine payload format from file extension
