@@ -535,6 +535,9 @@ pub struct DriverState {
 
     /// ACPI RSDP address (from coreboot)
     pub acpi_rsdp: Option<u64>,
+
+    /// Coreboot table pointer (needed for payload chainloading)
+    pub coreboot_table_ptr: Option<u64>,
 }
 
 impl DriverState {
@@ -552,6 +555,7 @@ impl DriverState {
             storage: None,
             memory_regions: HeaplessVec::new(),
             acpi_rsdp: None,
+            coreboot_table_ptr: None,
         }
     }
 }
@@ -899,4 +903,24 @@ pub fn set_exit_boot_services_called() {
     with_efi_mut(|efi| {
         efi.exit_boot_services_called = true;
     });
+}
+
+// ============================================================================
+// Coreboot Table Pointer
+// ============================================================================
+
+/// Store the coreboot table pointer for payload chainloading.
+#[inline]
+pub fn set_coreboot_table_ptr(ptr: u64) {
+    with_drivers_mut(|drivers| {
+        drivers.coreboot_table_ptr = Some(ptr);
+    });
+}
+
+/// Get the coreboot table pointer.
+///
+/// Returns `None` if not yet stored.
+#[inline]
+pub fn get_coreboot_table_ptr() -> Option<u64> {
+    try_get().and_then(|state| state.drivers.coreboot_table_ptr)
 }
