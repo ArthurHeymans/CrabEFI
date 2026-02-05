@@ -1189,6 +1189,64 @@ unsafe extern "C" {
     static __runtime_data_end: u8;
 }
 
+/// Get CrabEFI's memory region boundaries (code + data)
+///
+/// Returns (start_addr, end_addr) of the region occupied by CrabEFI.
+/// This includes code, data, BSS, and stack.
+pub fn get_runtime_bounds() -> (u64, u64) {
+    let code_start = unsafe { &__runtime_code_start as *const u8 as u64 };
+    let data_end = unsafe { &__runtime_data_end as *const u8 as u64 };
+
+    // Align to page boundaries
+    let start = code_start & !(PAGE_SIZE - 1);
+    let end = (data_end + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+
+    (start, end)
+}
+
+/// Check if a memory region conflicts with CrabEFI's code/data
+///
+/// Returns true if the region [addr, addr+size) overlaps with CrabEFI.
+pub fn conflicts_with_runtime(addr: u64, size: u64) -> bool {
+    let (runtime_start, runtime_end) = get_runtime_bounds();
+    let region_end = addr.saturating_add(size);
+
+    // Check for overlap: regions overlap if one starts before the other ends
+    addr < runtime_end && region_end > runtime_start
+}
+
+/// Check if a memory region is in usable RAM
+///
+/// Returns true if the entire region [addr, addr+size) is within conventional
+/// or boot services memory that can be safely written to.
+pub fn is_usable_memory(addr: u64, size: u64) -> bool {
+    let alloc = state::allocator();
+    let region_end = addr.saturating_add(size);
+
+    // Find a single contiguous region that contains the entire target
+    for entry in alloc.entries.iter() {
+        let entry_end = entry.end();
+
+        // Check if this entry contains the entire region
+        if entry.physical_start <= addr && entry_end >= region_end {
+            // Check if the memory type is usable (conventional memory or boot services)
+            let mem_type = MemoryType::from_u32(entry.memory_type);
+            return matches!(
+                mem_type,
+                Some(
+                    MemoryType::ConventionalMemory
+                        | MemoryType::BootServicesCode
+                        | MemoryType::BootServicesData
+                        | MemoryType::LoaderCode
+                        | MemoryType::LoaderData
+                )
+            );
+        }
+    }
+
+    false
+}
+
 /// Reserve the CrabEFI runtime regions using linker-provided section boundaries
 ///
 /// This marks the memory containing our code and data sections so that the OS
