@@ -4,16 +4,22 @@
 //! the system hardware, including memory map, serial port, framebuffer,
 //! CBMEM console, and ACPI tables.
 //!
-//! It also provides FMAP (Flash Map) parsing for locating flash regions
-//! like SMMSTORE. The FMAP location is obtained from coreboot's
+//! It also provides:
+//! - FMAP (Flash Map) parsing for locating flash regions like SMMSTORE
+//! - CBFS (Coreboot File System) parsing for reading files from flash
+//!
+//! The FMAP and CBFS locations are obtained from coreboot's
 //! LB_TAG_BOOT_MEDIA_PARAMS table entry.
 
+pub mod cbfs;
 pub mod cbmem_console;
 pub mod fmap;
 pub mod framebuffer;
 pub mod memory;
 pub mod tables;
+pub mod trampoline;
 
+pub use cbfs::{Cbfs, CbfsCompression, CbfsError, CbfsFileInfo, CbfsType};
 pub use framebuffer::FramebufferInfo;
 pub use memory::{MemoryRegion, MemoryType};
 pub use tables::{
