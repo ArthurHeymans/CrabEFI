@@ -247,10 +247,10 @@ fn get_trampoline_code() -> &'static [u8] {
 /// Allocated buffer as a raw slice, or None if allocation fails.
 /// The caller is responsible for not freeing this memory (use `core::mem::forget`).
 pub fn allocate_bounce_buffer(size: usize) -> Option<&'static mut [u8]> {
-    use crate::efi::allocator::{allocate_pages, AllocateType, MemoryType, PAGE_SIZE};
+    use crate::efi::allocator::{AllocateType, MemoryType, PAGE_SIZE, allocate_pages};
 
     // Round up to pages
-    let num_pages = (size as u64 + PAGE_SIZE - 1) / PAGE_SIZE;
+    let num_pages = (size as u64).div_ceil(PAGE_SIZE);
 
     let mut addr = 0u64;
     let status = allocate_pages(

@@ -698,7 +698,7 @@ impl Cbfs {
         );
 
         // Allocate bounce buffer for decompression
-        let mut bounce_buffer = trampoline::allocate_bounce_buffer(file.decompressed_size as usize)
+        let bounce_buffer = trampoline::allocate_bounce_buffer(file.decompressed_size as usize)
             .ok_or_else(|| {
                 log::error!("CBFS: failed to allocate bounce buffer");
                 CbfsError::AllocationFailed
@@ -711,7 +711,7 @@ impl Cbfs {
         );
 
         // Decompress to bounce buffer
-        let decompressed_size = self.read(file, &mut bounce_buffer)?;
+        let decompressed_size = self.read(file, bounce_buffer)?;
 
         // Calculate BSS size
         let bss_size = (load_info.mem_size as usize).saturating_sub(decompressed_size);
