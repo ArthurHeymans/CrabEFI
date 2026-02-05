@@ -21,8 +21,9 @@ use core::cell::UnsafeCell;
 use core::ptr::null_mut;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-/// Heap size (2 MB should be sufficient for crypto operations)
-const HEAP_SIZE: usize = 2 * 1024 * 1024;
+/// Heap size - LZMA decompression needs dictionary buffers up to 64MB
+/// The heap is allocated from EFI pages at runtime, not compiled into the binary
+const HEAP_SIZE: usize = 4 * 1024 * 1024;
 
 /// Page size (4KB)
 const PAGE_SIZE: usize = 4096;
@@ -155,7 +156,7 @@ static ALLOCATOR: BumpAllocator = BumpAllocator::new();
 ///
 /// `true` if initialization succeeded, `false` otherwise.
 pub fn init() -> bool {
-    use crate::efi::allocator::{AllocateType, MemoryType, allocate_pages};
+    use crate::efi::allocator::{allocate_pages, AllocateType, MemoryType};
     use r_efi::efi::Status;
 
     // Allocate heap pages from the EFI allocator
@@ -179,16 +180,4 @@ pub fn init() -> bool {
     }
 
     true
-}
-
-/// Check if the allocator is initialized
-pub fn is_initialized() -> bool {
-    ALLOCATOR.is_initialized()
-}
-
-/// Get heap usage statistics
-pub fn stats() -> (usize, usize) {
-    let used = ALLOCATOR.offset.load(Ordering::Acquire);
-    let total = ALLOCATOR.heap_size;
-    (used, total)
 }
