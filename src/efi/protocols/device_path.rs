@@ -920,3 +920,140 @@ pub fn create_video_device_path() -> *mut Protocol {
 
     dest as *mut Protocol
 }
+
+// ============================================================================
+// Unified Device Path Info (Driver Model)
+// ============================================================================
+
+/// Device-specific information needed to construct EFI device paths
+///
+/// This enum captures the differences between storage device types for
+/// device path construction, allowing a single generic boot path to
+/// work with any storage device.
+#[derive(Debug, Clone, Copy)]
+pub enum DevicePathInfo {
+    /// NVMe namespace
+    Nvme {
+        pci_device: u8,
+        pci_function: u8,
+        namespace_id: u32,
+    },
+    /// AHCI/SATA port
+    Ahci {
+        pci_device: u8,
+        pci_function: u8,
+        port: u16,
+    },
+    /// USB mass storage
+    Usb {
+        pci_device: u8,
+        pci_function: u8,
+        usb_port: u8,
+    },
+    /// SDHCI (SD card) - uses USB device path with port=0
+    Sdhci { pci_device: u8, pci_function: u8 },
+}
+
+/// Create a whole-disk device path from a DevicePathInfo
+///
+/// # Arguments
+/// * `info` - Device-specific path information
+///
+/// # Returns
+/// A pointer to the device path protocol, or null on failure
+pub fn create_disk_device_path(info: &DevicePathInfo) -> *mut Protocol {
+    match *info {
+        DevicePathInfo::Nvme {
+            pci_device,
+            pci_function,
+            namespace_id,
+        } => create_nvme_device_path(pci_device, pci_function, namespace_id),
+        DevicePathInfo::Ahci {
+            pci_device,
+            pci_function,
+            port,
+        } => create_sata_device_path(pci_device, pci_function, port),
+        DevicePathInfo::Usb {
+            pci_device,
+            pci_function,
+            usb_port,
+        } => create_usb_device_path(pci_device, pci_function, usb_port),
+        DevicePathInfo::Sdhci {
+            pci_device,
+            pci_function,
+        } => create_usb_device_path(pci_device, pci_function, 0),
+    }
+}
+
+/// Create a partition device path from a DevicePathInfo
+///
+/// # Arguments
+/// * `info` - Device-specific path information
+/// * `partition_number` - 1-based partition number
+/// * `partition_start` - Start LBA of the partition
+/// * `partition_size` - Size of the partition in sectors
+/// * `partition_guid` - GPT partition GUID
+///
+/// # Returns
+/// A pointer to the device path protocol, or null on failure
+pub fn create_partition_device_path(
+    info: &DevicePathInfo,
+    partition_number: u32,
+    partition_start: u64,
+    partition_size: u64,
+    partition_guid: &[u8; 16],
+) -> *mut Protocol {
+    match *info {
+        DevicePathInfo::Nvme {
+            pci_device,
+            pci_function,
+            namespace_id,
+        } => create_nvme_partition_device_path(
+            pci_device,
+            pci_function,
+            namespace_id,
+            partition_number,
+            partition_start,
+            partition_size,
+            partition_guid,
+        ),
+        DevicePathInfo::Ahci {
+            pci_device,
+            pci_function,
+            port,
+        } => create_sata_partition_device_path(
+            pci_device,
+            pci_function,
+            port,
+            partition_number,
+            partition_start,
+            partition_size,
+            partition_guid,
+        ),
+        DevicePathInfo::Usb {
+            pci_device,
+            pci_function,
+            usb_port,
+        } => create_usb_partition_device_path(
+            pci_device,
+            pci_function,
+            usb_port,
+            partition_number,
+            partition_start,
+            partition_size,
+            partition_guid,
+        ),
+        DevicePathInfo::Sdhci {
+            pci_device,
+            pci_function,
+        } => create_usb_partition_device_path(
+            pci_device,
+            pci_function,
+            0,
+            partition_number,
+            partition_start,
+            partition_size,
+            partition_guid,
+        ),
+    }
+}

@@ -1288,7 +1288,82 @@ unsafe impl Send for AhciControllerPtr {}
 static AHCI_CONTROLLERS: Mutex<heapless::Vec<AhciControllerPtr, 4>> =
     Mutex::new(heapless::Vec::new());
 
-/// Initialize AHCI controllers
+/// Initialize a single AHCI controller from a PCI device
+///
+/// Called by the PCI driver model when an AHCI device is discovered.
+///
+/// # Arguments
+/// * `dev` - The PCI device to initialize as an AHCI controller
+pub fn init_device(dev: &pci::PciDevice) -> Result<(), ()> {
+    log::info!(
+        "Initializing AHCI controller at {}: {:04x}:{:04x}",
+        dev.address,
+        dev.vendor_id,
+        dev.device_id
+    );
+
+    match AhciController::new(dev) {
+        Ok(controller) => {
+            let size = core::mem::size_of::<AhciController>();
+            let pages = size.div_ceil(4096);
+            log::debug!(
+                "AHCI: Allocating {} pages ({} bytes) for AhciController",
+                pages,
+                size
+            );
+            let controller_mem = efi::allocate_pages(pages as u64);
+            if let Some(mem) = controller_mem {
+                let controller_box = mem.as_mut_ptr() as *mut AhciController;
+                unsafe {
+                    ptr::write(controller_box, controller);
+                }
+                let mut controllers = AHCI_CONTROLLERS.lock();
+                if controllers.push(AhciControllerPtr(controller_box)).is_err() {
+                    log::warn!(
+                        "AHCI: Failed to register controller at {} - controller list full",
+                        dev.address
+                    );
+                    // Free the allocated pages to avoid a leak
+                    efi::free_pages(mem, pages as u64);
+                    return Err(());
+                }
+                log::info!("AHCI controller at {} initialized", dev.address);
+                Ok(())
+            } else {
+                log::error!("AHCI: Failed to allocate memory for controller");
+                Err(())
+            }
+        }
+        Err(e) => {
+            log::error!(
+                "Failed to initialize AHCI controller at {}: {:?}",
+                dev.address,
+                e
+            );
+            Err(())
+        }
+    }
+}
+
+/// Shutdown all AHCI controllers
+///
+/// Called during ExitBootServices to prepare for OS handoff.
+/// Currently a placeholder — the OS will reset controllers during its own init.
+pub fn shutdown() {
+    let controllers = AHCI_CONTROLLERS.lock();
+    if controllers.is_empty() {
+        return;
+    }
+    log::info!(
+        "AHCI: {} controllers ready for OS handoff",
+        controllers.len()
+    );
+}
+
+/// Initialize AHCI controllers (legacy entry point)
+///
+/// Scans PCI bus for AHCI controllers and initializes each one.
+/// Prefer using `init_device()` via the PCI driver model instead.
 pub fn init() {
     log::info!("Initializing AHCI controllers...");
 
@@ -1299,44 +1374,11 @@ pub fn init() {
         return;
     }
 
-    let mut controllers = AHCI_CONTROLLERS.lock();
-
     for dev in ahci_devices.iter() {
-        match AhciController::new(dev) {
-            Ok(controller) => {
-                let size = core::mem::size_of::<AhciController>();
-                let pages = size.div_ceil(4096);
-                log::debug!(
-                    "AHCI: Allocating {} pages ({} bytes) for AhciController",
-                    pages,
-                    size
-                );
-                let controller_mem = efi::allocate_pages(pages as u64);
-                if let Some(mem) = controller_mem {
-                    let controller_box = mem.as_mut_ptr() as *mut AhciController;
-                    unsafe {
-                        ptr::write(controller_box, controller);
-                    }
-                    if controllers.push(AhciControllerPtr(controller_box)).is_err() {
-                        log::warn!(
-                            "AHCI: Failed to register controller at {} - controller list full",
-                            dev.address
-                        );
-                    } else {
-                        log::info!("AHCI controller at {} initialized", dev.address);
-                    }
-                }
-            }
-            Err(e) => {
-                log::error!(
-                    "Failed to initialize AHCI controller at {}: {:?}",
-                    dev.address,
-                    e
-                );
-            }
-        }
+        let _ = init_device(dev);
     }
 
+    let controllers = AHCI_CONTROLLERS.lock();
     log::info!(
         "AHCI initialization complete: {} controllers",
         controllers.len()

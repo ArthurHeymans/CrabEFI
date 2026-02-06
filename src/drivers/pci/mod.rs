@@ -1,18 +1,34 @@
-//! PCI/PCIe enumeration and configuration
+//! PCI/PCIe Enumeration, Configuration, and Driver Binding
 //!
-//! This module provides PCI device enumeration and configuration space access.
-//! It supports both legacy I/O port-based access (CAM) and memory-mapped access (ECAM).
+//! This module provides PCI device enumeration, configuration space access,
+//! and a driver model for automatic device binding.
+//!
+//! # Architecture
+//!
+//! - **access**: PCI config space access abstraction (`PciAccess` trait)
+//!   with I/O CAM and PCIe ECAM implementations
+//! - **driver**: PCI driver lifecycle trait (`PciDriver`) with table-driven
+//!   binding during enumeration
+//!
+//! # PCI Access
+//!
+//! The access method is selected at runtime:
+//! - If an ECAM base is available (from ACPI MCFG or coreboot) → ECAM
+//! - Otherwise → legacy I/O ports 0xCF8/0xCFC
+//!
+//! # Driver Model
+//!
+//! Each PCI driver registers match criteria (class/subclass) and lifecycle
+//! methods (probe/init/shutdown). During `init_and_bind_drivers()`, discovered
+//! devices are matched against drivers automatically.
 
-use heapless::Vec;
+pub mod access;
+pub mod driver;
+
+use access::{AnyPciAccess, IoCamAccess, PciAccess};
+use spin::Mutex;
 
 use crate::state;
-
-#[cfg(target_arch = "x86_64")]
-use x86_64::instructions::port::{Port, PortWriteOnly};
-
-/// PCI configuration space ports (legacy CAM)
-const PCI_CONFIG_ADDRESS: u16 = 0xCF8;
-const PCI_CONFIG_DATA: u16 = 0xCFC;
 
 /// PCI class codes for storage controllers
 pub const CLASS_STORAGE: u8 = 0x01;
@@ -43,11 +59,30 @@ const INVALID_VENDOR_ID: u16 = 0xFFFF;
 
 /// PCI header types
 const HEADER_TYPE_NORMAL: u8 = 0x00;
-#[allow(dead_code)]
-const HEADER_TYPE_BRIDGE: u8 = 0x01;
-#[allow(dead_code)]
-const HEADER_TYPE_CARDBUS: u8 = 0x02;
 const HEADER_TYPE_MULTI_FUNCTION: u8 = 0x80;
+
+// ============================================================================
+// Global PCI Access
+// ============================================================================
+
+/// Global PCI config space access method
+///
+/// Initialized during `init()` and used by all subsequent PCI operations.
+/// Defaults to legacy I/O CAM; upgraded to ECAM if available.
+static PCI_ACCESS: Mutex<AnyPciAccess> = Mutex::new(AnyPciAccess::IoCam(IoCamAccess));
+
+/// Helper: run a closure with the global PCI access method
+fn with_access<F, R>(f: F) -> R
+where
+    F: FnOnce(&AnyPciAccess) -> R,
+{
+    let access = PCI_ACCESS.lock();
+    f(&access)
+}
+
+// ============================================================================
+// PCI Address and Device Types
+// ============================================================================
 
 /// PCI device location (Bus:Device.Function)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -67,7 +102,7 @@ impl PciAddress {
     }
 
     /// Calculate legacy CAM address for a register
-    fn cam_address(&self, offset: u8) -> u32 {
+    pub(crate) fn cam_address(&self, offset: u8) -> u32 {
         let mut addr = 1u32 << 31; // Enable bit
         addr |= (self.bus as u32) << 16;
         addr |= (self.device as u32) << 11;
@@ -179,58 +214,20 @@ impl PciDevice {
     }
 }
 
-/// Read a 32-bit value from PCI configuration space using legacy I/O
-#[cfg(target_arch = "x86_64")]
-fn pci_read_config_u32(addr: PciAddress, offset: u8) -> u32 {
-    let mut address_port: PortWriteOnly<u32> = PortWriteOnly::new(PCI_CONFIG_ADDRESS);
-    let mut data_port: Port<u32> = Port::new(PCI_CONFIG_DATA);
-
-    unsafe {
-        address_port.write(addr.cam_address(offset));
-        data_port.read()
-    }
-}
-
-/// Write a 32-bit value to PCI configuration space using legacy I/O
-#[cfg(target_arch = "x86_64")]
-fn pci_write_config_u32(addr: PciAddress, offset: u8, value: u32) {
-    let mut address_port: PortWriteOnly<u32> = PortWriteOnly::new(PCI_CONFIG_ADDRESS);
-    let mut data_port: Port<u32> = Port::new(PCI_CONFIG_DATA);
-
-    unsafe {
-        address_port.write(addr.cam_address(offset));
-        data_port.write(value);
-    }
-}
-
-/// Read a 16-bit value from PCI configuration space
-#[cfg(target_arch = "x86_64")]
-fn pci_read_config_u16(addr: PciAddress, offset: u8) -> u16 {
-    let aligned_offset = offset & 0xFC;
-    let shift = (offset & 0x02) * 8;
-    let value = pci_read_config_u32(addr, aligned_offset);
-    ((value >> shift) & 0xFFFF) as u16
-}
-
-/// Read an 8-bit value from PCI configuration space
-#[cfg(target_arch = "x86_64")]
-fn pci_read_config_u8(addr: PciAddress, offset: u8) -> u8 {
-    let aligned_offset = offset & 0xFC;
-    let shift = (offset & 0x03) * 8;
-    let value = pci_read_config_u32(addr, aligned_offset);
-    ((value >> shift) & 0xFF) as u8
-}
+// ============================================================================
+// PCI Enumeration (using PciAccess trait)
+// ============================================================================
 
 /// Get vendor and device ID for a PCI address
-fn get_device_ids(addr: PciAddress) -> (u16, u16) {
-    let data = pci_read_config_u32(addr, 0x00);
+fn get_device_ids(access: &AnyPciAccess, addr: PciAddress) -> (u16, u16) {
+    let data = access.read32(addr, 0x00);
     ((data & 0xFFFF) as u16, (data >> 16) as u16)
 }
 
 /// Probe a single BAR and return its type, address, and size
-fn probe_bar(addr: PciAddress, bar_index: usize) -> PciBar {
-    let bar_offset = (0x10 + bar_index * 4) as u8;
-    let original = pci_read_config_u32(addr, bar_offset);
+fn probe_bar(access: &AnyPciAccess, addr: PciAddress, bar_index: usize) -> PciBar {
+    let bar_offset = (0x10 + bar_index * 4) as u16;
+    let original = access.read32(addr, bar_offset);
 
     // Empty BAR
     if original == 0 {
@@ -240,9 +237,9 @@ fn probe_bar(addr: PciAddress, bar_index: usize) -> PciBar {
     // Check if it's I/O or memory
     if original & 1 == 1 {
         // I/O BAR
-        pci_write_config_u32(addr, bar_offset, 0xFFFFFFFF);
-        let sized = pci_read_config_u32(addr, bar_offset);
-        pci_write_config_u32(addr, bar_offset, original);
+        access.write32(addr, bar_offset, 0xFFFFFFFF);
+        let sized = access.read32(addr, bar_offset);
+        access.write32(addr, bar_offset, original);
 
         let io_mask = sized | 0x3;
         let size = (!io_mask).wrapping_add(1) as u64;
@@ -262,9 +259,9 @@ fn probe_bar(addr: PciAddress, bar_index: usize) -> PciBar {
     match mem_type {
         0 => {
             // 32-bit memory
-            pci_write_config_u32(addr, bar_offset, 0xFFFFFFFF);
-            let sized = pci_read_config_u32(addr, bar_offset);
-            pci_write_config_u32(addr, bar_offset, original);
+            access.write32(addr, bar_offset, 0xFFFFFFFF);
+            let sized = access.read32(addr, bar_offset);
+            access.write32(addr, bar_offset, original);
 
             let mem_mask = sized | 0xF;
             let size = (!mem_mask).wrapping_add(1) as u64;
@@ -279,14 +276,14 @@ fn probe_bar(addr: PciAddress, bar_index: usize) -> PciBar {
         2 => {
             // 64-bit memory (consumes two BARs)
             let bar_offset_hi = bar_offset + 4;
-            let original_hi = pci_read_config_u32(addr, bar_offset_hi);
+            let original_hi = access.read32(addr, bar_offset_hi);
 
-            pci_write_config_u32(addr, bar_offset, 0xFFFFFFFF);
-            pci_write_config_u32(addr, bar_offset_hi, 0xFFFFFFFF);
-            let sized_lo = pci_read_config_u32(addr, bar_offset);
-            let sized_hi = pci_read_config_u32(addr, bar_offset_hi);
-            pci_write_config_u32(addr, bar_offset, original);
-            pci_write_config_u32(addr, bar_offset_hi, original_hi);
+            access.write32(addr, bar_offset, 0xFFFFFFFF);
+            access.write32(addr, bar_offset_hi, 0xFFFFFFFF);
+            let sized_lo = access.read32(addr, bar_offset);
+            let sized_hi = access.read32(addr, bar_offset_hi);
+            access.write32(addr, bar_offset, original);
+            access.write32(addr, bar_offset_hi, original_hi);
 
             let sized = ((sized_hi as u64) << 32) | (sized_lo as u64);
             let mem_mask = sized | 0xF;
@@ -306,9 +303,9 @@ fn probe_bar(addr: PciAddress, bar_index: usize) -> PciBar {
 }
 
 /// Scan a single device/function and add to device list if valid
-fn scan_device(bus: u8, device: u8, function: u8) -> Option<PciDevice> {
+fn scan_device(access: &AnyPciAccess, bus: u8, device: u8, function: u8) -> Option<PciDevice> {
     let addr = PciAddress::new(bus, device, function);
-    let (vendor_id, device_id) = get_device_ids(addr);
+    let (vendor_id, device_id) = get_device_ids(access, addr);
 
     if vendor_id == INVALID_VENDOR_ID {
         return None;
@@ -319,18 +316,18 @@ fn scan_device(bus: u8, device: u8, function: u8) -> Option<PciDevice> {
     dev.device_id = device_id;
 
     // Read class/subclass/prog_if/revision (offset 0x08)
-    let class_data = pci_read_config_u32(addr, 0x08);
+    let class_data = access.read32(addr, 0x08);
     dev.revision = (class_data & 0xFF) as u8;
     dev.prog_if = ((class_data >> 8) & 0xFF) as u8;
     dev.subclass = ((class_data >> 16) & 0xFF) as u8;
     dev.class_code = ((class_data >> 24) & 0xFF) as u8;
 
     // Read header type (offset 0x0C, bits 16-23)
-    let header_data = pci_read_config_u32(addr, 0x0C);
+    let header_data = access.read32(addr, 0x0C);
     dev.header_type = ((header_data >> 16) & 0xFF) as u8;
 
     // Read interrupt info (offset 0x3C)
-    let irq_data = pci_read_config_u32(addr, 0x3C);
+    let irq_data = access.read32(addr, 0x3C);
     dev.interrupt_line = (irq_data & 0xFF) as u8;
     dev.interrupt_pin = ((irq_data >> 8) & 0xFF) as u8;
 
@@ -338,7 +335,7 @@ fn scan_device(bus: u8, device: u8, function: u8) -> Option<PciDevice> {
     if (dev.header_type & 0x7F) == HEADER_TYPE_NORMAL {
         let mut bar_index = 0;
         while bar_index < 6 {
-            let bar = probe_bar(addr, bar_index);
+            let bar = probe_bar(access, addr, bar_index);
             dev.bars[bar_index] = bar;
 
             // 64-bit BARs consume two slots
@@ -355,41 +352,59 @@ fn scan_device(bus: u8, device: u8, function: u8) -> Option<PciDevice> {
 
 /// Enable bus mastering, memory space, and I/O space for a device
 pub fn enable_device(dev: &PciDevice) {
-    let cmd = pci_read_config_u16(dev.address, 0x04);
-    // Set bit 0 (I/O space), bit 1 (memory space) and bit 2 (bus master)
-    let new_cmd = cmd | 0x07;
+    with_access(|access| {
+        let cmd = access.read16(dev.address, 0x04);
+        // Set bit 0 (I/O space), bit 1 (memory space) and bit 2 (bus master)
+        let new_cmd = cmd | 0x07;
+        access.write16(dev.address, 0x04, new_cmd);
 
-    let aligned_offset = 0x04 & 0xFC;
-    let current = pci_read_config_u32(dev.address, aligned_offset as u8);
-    let new_value = (current & 0xFFFF0000) | (new_cmd as u32);
-    pci_write_config_u32(dev.address, aligned_offset as u8, new_value);
-
-    log::debug!(
-        "Enabled device {}: cmd {:#06x} -> {:#06x}",
-        dev.address,
-        cmd,
-        new_cmd
-    );
-}
-
-/// Initialize PCI subsystem and enumerate all devices
-pub fn init() {
-    log::info!("Initializing PCI subsystem...");
-
-    state::with_drivers_mut(|drivers| {
-        let devices = &mut drivers.pci_devices;
-        devices.clear();
-        init_inner(devices);
+        log::debug!(
+            "Enabled device {}: cmd {:#06x} -> {:#06x}",
+            dev.address,
+            cmd,
+            new_cmd
+        );
     });
 }
 
-/// Inner initialization that works with a mutable reference to devices
-fn init_inner(devices: &mut heapless::Vec<PciDevice, { state::MAX_PCI_DEVICES }>) {
-    // Scan all buses, devices, and functions
+// ============================================================================
+// Initialization
+// ============================================================================
+
+/// Initialize PCI subsystem: select access method and enumerate devices
+///
+/// This only enumerates devices. Call `bind_drivers()` separately to
+/// initialize device drivers (needed because SPI detection happens between
+/// enumeration and driver binding).
+pub fn init() {
+    log::info!("Initializing PCI subsystem...");
+
+    // Select access method based on ECAM availability
+    let ecam_base = state::drivers().ecam_base;
+    {
+        let new_access = access::create_access(ecam_base);
+        let mut access = PCI_ACCESS.lock();
+        *access = new_access;
+    }
+
+    // Enumerate devices
+    let access = PCI_ACCESS.lock();
+    state::with_drivers_mut(|drivers| {
+        let devices = &mut drivers.pci_devices;
+        devices.clear();
+        enumerate_devices(&access, devices);
+    });
+}
+
+/// Enumerate all PCI devices
+fn enumerate_devices(
+    access: &AnyPciAccess,
+    devices: &mut heapless::Vec<PciDevice, { state::MAX_PCI_DEVICES }>,
+) {
     for bus in 0..=255u8 {
         for device in 0..32u8 {
             // First check function 0
-            if let Some(dev) = scan_device(bus, device, 0) {
+            if let Some(dev) = scan_device(access, bus, device, 0) {
                 let is_multi_function = (dev.header_type & HEADER_TYPE_MULTI_FUNCTION) != 0;
 
                 log::debug!(
@@ -409,7 +424,7 @@ fn init_inner(devices: &mut heapless::Vec<PciDevice, { state::MAX_PCI_DEVICES }>
                 // Check other functions if multi-function
                 if is_multi_function {
                     for function in 1..8u8 {
-                        if let Some(dev) = scan_device(bus, device, function) {
+                        if let Some(dev) = scan_device(access, bus, device, function) {
                             log::debug!(
                                 "PCI {}: {:04x}:{:04x} class={:02x}:{:02x}",
                                 dev.address,
@@ -433,12 +448,45 @@ fn init_inner(devices: &mut heapless::Vec<PciDevice, { state::MAX_PCI_DEVICES }>
     log::info!("PCI enumeration complete: {} devices found", devices.len());
 }
 
+/// Bind drivers to all enumerated PCI devices
+///
+/// This iterates all discovered PCI devices and uses the driver registry
+/// to find and initialize appropriate drivers.
+///
+/// Called from `init_storage()` after SPI controller detection, because
+/// SPI needs PCI enumeration but storage drivers need SPI to be done first.
+pub fn bind_drivers() {
+    log::info!("Binding PCI drivers to devices...");
+
+    let devices = state::drivers().pci_devices.clone();
+
+    let mut bound_count = 0;
+    for device in devices.iter() {
+        if driver::bind_driver(device).is_some() {
+            bound_count += 1;
+        }
+    }
+
+    log::info!("PCI driver binding complete: {} devices bound", bound_count);
+}
+
+/// Shutdown all PCI drivers
+///
+/// Called during ExitBootServices to cleanly quiesce hardware.
+pub fn shutdown_drivers() {
+    driver::shutdown_all();
+}
+
+// ============================================================================
+// Legacy find_*_controllers functions (kept for SPI detection which
+// happens before driver binding)
+// ============================================================================
+
 /// Find all NVMe controllers
-pub fn find_nvme_controllers() -> Vec<PciDevice, 8> {
+pub fn find_nvme_controllers() -> heapless::Vec<PciDevice, 8> {
     let drivers = state::drivers();
     let devices = &drivers.pci_devices;
-    let mut nvme_devices = Vec::new();
-
+    let mut result = heapless::Vec::new();
     for dev in devices.iter() {
         if dev.is_nvme() {
             log::info!(
@@ -447,19 +495,17 @@ pub fn find_nvme_controllers() -> Vec<PciDevice, 8> {
                 dev.vendor_id,
                 dev.device_id
             );
-            let _ = nvme_devices.push(dev.clone());
+            let _ = result.push(dev.clone());
         }
     }
-
-    nvme_devices
+    result
 }
 
 /// Find all AHCI controllers
-pub fn find_ahci_controllers() -> Vec<PciDevice, 8> {
+pub fn find_ahci_controllers() -> heapless::Vec<PciDevice, 8> {
     let drivers = state::drivers();
     let devices = &drivers.pci_devices;
-    let mut ahci_devices = Vec::new();
-
+    let mut result = heapless::Vec::new();
     for dev in devices.iter() {
         if dev.is_ahci() {
             log::info!(
@@ -468,19 +514,17 @@ pub fn find_ahci_controllers() -> Vec<PciDevice, 8> {
                 dev.vendor_id,
                 dev.device_id
             );
-            let _ = ahci_devices.push(dev.clone());
+            let _ = result.push(dev.clone());
         }
     }
-
-    ahci_devices
+    result
 }
 
 /// Find all SDHCI controllers
-pub fn find_sdhci_controllers() -> Vec<PciDevice, 8> {
+pub fn find_sdhci_controllers() -> heapless::Vec<PciDevice, 8> {
     let drivers = state::drivers();
     let devices = &drivers.pci_devices;
-    let mut sdhci_devices = Vec::new();
-
+    let mut result = heapless::Vec::new();
     for dev in devices.iter() {
         if dev.is_sdhci() {
             log::info!(
@@ -489,15 +533,14 @@ pub fn find_sdhci_controllers() -> Vec<PciDevice, 8> {
                 dev.vendor_id,
                 dev.device_id
             );
-            let _ = sdhci_devices.push(dev.clone());
+            let _ = result.push(dev.clone());
         }
     }
-
-    sdhci_devices
+    result
 }
 
 /// Get all enumerated PCI devices
-pub fn get_all_devices() -> Vec<PciDevice, { state::MAX_PCI_DEVICES }> {
+pub fn get_all_devices() -> heapless::Vec<PciDevice, { state::MAX_PCI_DEVICES }> {
     state::drivers().pci_devices.clone()
 }
 
@@ -542,45 +585,35 @@ pub fn set_ecam_base(base: u64) {
 }
 
 // ============================================================================
-// Public PCI Configuration Space Access
+// Public PCI Configuration Space Access (via trait)
 // ============================================================================
 
 /// Read a 32-bit value from PCI configuration space
 pub fn read_config_u32(addr: PciAddress, offset: u8) -> u32 {
-    pci_read_config_u32(addr, offset)
+    with_access(|access| access.read32(addr, offset as u16))
 }
 
 /// Write a 32-bit value to PCI configuration space
 pub fn write_config_u32(addr: PciAddress, offset: u8, value: u32) {
-    pci_write_config_u32(addr, offset, value)
+    with_access(|access| access.write32(addr, offset as u16, value))
 }
 
 /// Read a 16-bit value from PCI configuration space
 pub fn read_config_u16(addr: PciAddress, offset: u8) -> u16 {
-    pci_read_config_u16(addr, offset)
+    with_access(|access| access.read16(addr, offset as u16))
 }
 
 /// Write a 16-bit value to PCI configuration space
 pub fn write_config_u16(addr: PciAddress, offset: u8, value: u16) {
-    let aligned_offset = offset & 0xFC;
-    let shift = (offset & 0x02) * 8;
-    let current = pci_read_config_u32(addr, aligned_offset);
-    let mask = !(0xFFFF_u32 << shift);
-    let new_value = (current & mask) | ((value as u32) << shift);
-    pci_write_config_u32(addr, aligned_offset, new_value);
+    with_access(|access| access.write16(addr, offset as u16, value))
 }
 
 /// Read an 8-bit value from PCI configuration space
 pub fn read_config_u8(addr: PciAddress, offset: u8) -> u8 {
-    pci_read_config_u8(addr, offset)
+    with_access(|access| access.read8(addr, offset as u16))
 }
 
 /// Write an 8-bit value to PCI configuration space
 pub fn write_config_u8(addr: PciAddress, offset: u8, value: u8) {
-    let aligned_offset = offset & 0xFC;
-    let shift = (offset & 0x03) * 8;
-    let current = pci_read_config_u32(addr, aligned_offset);
-    let mask = !(0xFF_u32 << shift);
-    let new_value = (current & mask) | ((value as u32) << shift);
-    pci_write_config_u32(addr, aligned_offset, new_value);
+    with_access(|access| access.write8(addr, offset as u16, value))
 }

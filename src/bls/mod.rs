@@ -230,6 +230,5 @@ fn try_load_entry(fs: &mut FatFilesystem<'_>, path: &str) -> Option<BlsEntry> {
 /// * `fs` - FAT filesystem to check
 pub fn has_bls_entries(fs: &mut FatFilesystem<'_>) -> bool {
     // Check if loader.conf or the entries directory exists
-    fs.file_size(LOADER_CONF_PATH).is_ok()
-        || fs.find_file(ENTRIES_DIR).is_ok()
+    fs.file_size(LOADER_CONF_PATH).is_ok() || fs.find_file(ENTRIES_DIR).is_ok()
 }

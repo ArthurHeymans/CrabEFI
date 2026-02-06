@@ -1067,7 +1067,80 @@ unsafe impl Send for SdhciControllerPtr {}
 static SDHCI_CONTROLLERS: Mutex<heapless::Vec<SdhciControllerPtr, MAX_SDHCI_CONTROLLERS>> =
     Mutex::new(heapless::Vec::new());
 
-/// Initialize SDHCI controllers
+/// Initialize a single SDHCI controller from a PCI device
+///
+/// Called by the PCI driver model when an SDHCI device is discovered.
+///
+/// # Arguments
+/// * `dev` - The PCI device to initialize as an SDHCI controller
+pub fn init_device(dev: &pci::PciDevice) -> Result<(), ()> {
+    log::info!(
+        "Initializing SDHCI controller at {}: {:04x}:{:04x}",
+        dev.address,
+        dev.vendor_id,
+        dev.device_id
+    );
+
+    match SdhciController::new(dev) {
+        Ok(controller) => {
+            let size = core::mem::size_of::<SdhciController>();
+            let pages = size.div_ceil(4096);
+
+            if let Some(mem) = efi::allocate_pages(pages as u64) {
+                let controller_ptr = mem.as_mut_ptr() as *mut SdhciController;
+                unsafe {
+                    ptr::write(controller_ptr, controller);
+                }
+                let mut controllers = SDHCI_CONTROLLERS.lock();
+                if controllers
+                    .push(SdhciControllerPtr(controller_ptr))
+                    .is_err()
+                {
+                    log::warn!(
+                        "SDHCI: Failed to register controller at {} - controller list full",
+                        dev.address
+                    );
+                    // Free the allocated pages to avoid a leak
+                    efi::free_pages(mem, pages as u64);
+                    return Err(());
+                }
+                log::info!("SDHCI controller at {} initialized", dev.address);
+                Ok(())
+            } else {
+                log::error!("SDHCI: Failed to allocate memory for controller");
+                Err(())
+            }
+        }
+        Err(e) => {
+            log::error!(
+                "Failed to initialize SDHCI controller at {}: {:?}",
+                dev.address,
+                e
+            );
+            Err(())
+        }
+    }
+}
+
+/// Shutdown all SDHCI controllers
+///
+/// Called during ExitBootServices to prepare for OS handoff.
+/// Currently a placeholder — the OS will reset controllers during its own init.
+pub fn shutdown() {
+    let controllers = SDHCI_CONTROLLERS.lock();
+    if controllers.is_empty() {
+        return;
+    }
+    log::info!(
+        "SDHCI: {} controllers ready for OS handoff",
+        controllers.len()
+    );
+}
+
+/// Initialize SDHCI controllers (legacy entry point)
+///
+/// Scans PCI bus for SDHCI controllers and initializes each one.
+/// Prefer using `init_device()` via the PCI driver model instead.
 pub fn init() {
     log::info!("Initializing SDHCI controllers...");
 
@@ -1078,43 +1151,11 @@ pub fn init() {
         return;
     }
 
-    let mut controllers = SDHCI_CONTROLLERS.lock();
-
     for dev in sdhci_devices.iter() {
-        log::info!(
-            "Probing SDHCI controller at {}: {:04x}:{:04x}",
-            dev.address,
-            dev.vendor_id,
-            dev.device_id
-        );
-
-        match SdhciController::new(dev) {
-            Ok(controller) => {
-                // Allocate memory for controller
-                let size = core::mem::size_of::<SdhciController>();
-                let pages = size.div_ceil(4096);
-
-                if let Some(mem) = efi::allocate_pages(pages as u64) {
-                    let controller_ptr = mem.as_mut_ptr() as *mut SdhciController;
-                    unsafe {
-                        ptr::write(controller_ptr, controller);
-                    }
-                    let _ = controllers.push(SdhciControllerPtr(controller_ptr));
-                    log::info!("SDHCI controller at {} initialized", dev.address);
-                } else {
-                    log::error!("Failed to allocate memory for SDHCI controller");
-                }
-            }
-            Err(e) => {
-                log::error!(
-                    "Failed to initialize SDHCI controller at {}: {:?}",
-                    dev.address,
-                    e
-                );
-            }
-        }
+        let _ = init_device(dev);
     }
 
+    let controllers = SDHCI_CONTROLLERS.lock();
     log::info!(
         "SDHCI initialization complete: {} controllers",
         controllers.len()
