@@ -38,8 +38,7 @@ const MAX_BLS_ENTRIES: usize = 16;
 /// Maximum size of a .conf file we'll read
 const MAX_CONF_SIZE: usize = 4096;
 
-/// Path to BLS entries directory (used for directory listing when available)
-#[allow(dead_code)]
+/// Path to BLS entries directory
 const ENTRIES_DIR: &str = "loader\\entries";
 
 /// Path to loader.conf
@@ -146,37 +145,16 @@ pub fn discover_entries(fs: &mut FatFilesystem<'_>) -> Result<BlsDiscovery, BlsE
         }
     }
 
-    // List entries in the entries directory
-    // Since our FAT implementation doesn't have directory listing,
-    // we'll try common entry filename patterns
-    let entry_patterns = [
-        // Fedora/RHEL pattern
-        "loader\\entries\\fedora.conf",
-        // Generic patterns with version numbers
-        "loader\\entries\\linux.conf",
-        "loader\\entries\\arch.conf",
-        "loader\\entries\\ubuntu.conf",
-        "loader\\entries\\debian.conf",
-    ];
-
-    // Also try numbered entries (common pattern)
-    let mut numbered_entries: Vec<String<64>, 10> = Vec::new();
-    for i in 0..10 {
-        let mut path: String<64> = String::new();
-        let _ = core::fmt::write(&mut path, format_args!("loader\\entries\\{}.conf", i));
-        let _ = numbered_entries.push(path);
-    }
-
-    // Try each potential entry file
-    for pattern in entry_patterns.iter() {
-        if let Some(entry) = try_load_entry(fs, pattern) {
-            let _ = discovery.entries.push(entry);
-        }
-    }
-
-    for path in numbered_entries.iter() {
-        if let Some(entry) = try_load_entry(fs, path.as_str()) {
-            let _ = discovery.entries.push(entry);
+    // List .conf files in the entries directory using directory enumeration
+    // This is much faster than probing hardcoded filenames one-by-one
+    if let Ok(conf_files) = fs.list_directory_files(ENTRIES_DIR, ".conf") {
+        log::debug!("Found {} .conf files in {}", conf_files.len(), ENTRIES_DIR);
+        for filename in conf_files.iter() {
+            let mut path: String<64> = String::new();
+            let _ = core::fmt::write(&mut path, format_args!("{}\\{}", ENTRIES_DIR, filename));
+            if let Some(entry) = try_load_entry(fs, path.as_str()) {
+                let _ = discovery.entries.push(entry);
+            }
         }
     }
 
@@ -245,15 +223,13 @@ fn try_load_entry(fs: &mut FatFilesystem<'_>, path: &str) -> Option<BlsEntry> {
 
 /// Check if a filesystem has BLS entries
 ///
-/// Quick check without fully parsing entries.
+/// Quick check: verifies the loader.conf or entries directory exists.
 ///
 /// # Arguments
 ///
 /// * `fs` - FAT filesystem to check
 pub fn has_bls_entries(fs: &mut FatFilesystem<'_>) -> bool {
-    // Check if the entries directory marker exists
-    // Try loader.conf as a quick indicator
+    // Check if loader.conf or the entries directory exists
     fs.file_size(LOADER_CONF_PATH).is_ok()
-        || fs.file_size("loader\\entries\\linux.conf").is_ok()
-        || fs.file_size("loader\\entries\\fedora.conf").is_ok()
+        || fs.find_file(ENTRIES_DIR).is_ok()
 }

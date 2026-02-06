@@ -26,18 +26,12 @@ const MAX_GRUB_ENTRIES: usize = 16;
 /// Maximum size of grub.cfg we'll read
 const MAX_CONFIG_SIZE: usize = 32768;
 
-/// Common paths to check for grub.cfg
-const GRUB_CONFIG_PATHS: &[&str] = &[
+/// Common non-EFI paths to check for grub.cfg
+const GRUB_TOPLEVEL_PATHS: &[&str] = &[
     "boot\\grub\\grub.cfg",
     "grub\\grub.cfg",
     "grub2\\grub.cfg",
     "boot\\grub2\\grub.cfg",
-    "EFI\\fedora\\grub.cfg",
-    "EFI\\centos\\grub.cfg",
-    "EFI\\redhat\\grub.cfg",
-    "EFI\\ubuntu\\grub.cfg",
-    "EFI\\debian\\grub.cfg",
-    "EFI\\arch\\grub.cfg",
 ];
 
 /// A parsed GRUB menu entry
@@ -136,19 +130,43 @@ pub enum GrubError {
 /// Parse GRUB configuration from a FAT filesystem
 ///
 /// Searches common paths for grub.cfg and parses the first one found.
+/// For EFI subdirectories, dynamically lists `EFI\*` and checks each
+/// for grub.cfg rather than probing hardcoded distro names.
 ///
 /// # Arguments
 ///
 /// * `fs` - FAT filesystem to search
 pub fn parse_config(fs: &mut FatFilesystem<'_>) -> Result<GrubConfig, GrubError> {
-    // Try each possible config path
-    for path in GRUB_CONFIG_PATHS {
+    // Try common top-level paths first
+    for path in GRUB_TOPLEVEL_PATHS {
         if let Ok(size) = fs.file_size(path)
             && size > 0
             && size <= MAX_CONFIG_SIZE as u32
         {
             log::debug!("Found grub.cfg at {}", path);
             return parse_config_file(fs, path);
+        }
+    }
+
+    // Dynamically scan EFI subdirectories for grub.cfg
+    // This avoids probing hardcoded distro names one-by-one
+    if let Ok(subdirs) = fs.list_subdirectories("EFI") {
+        for subdir in subdirs.iter() {
+            // Skip BOOT directory (that's for the UEFI bootloader, not GRUB config)
+            if subdir.as_str().eq_ignore_ascii_case("BOOT") {
+                continue;
+            }
+            let mut path = heapless::String::<128>::new();
+            if core::fmt::write(&mut path, format_args!("EFI\\{}\\grub.cfg", subdir)).is_err() {
+                continue;
+            }
+            if let Ok(size) = fs.file_size(&path)
+                && size > 0
+                && size <= MAX_CONFIG_SIZE as u32
+            {
+                log::debug!("Found grub.cfg at {}", path);
+                return parse_config_file(fs, &path);
+            }
         }
     }
 
@@ -383,7 +401,27 @@ fn normalize_grub_path(path: &str) -> String<128> {
 
 /// Check if a filesystem has a GRUB configuration
 pub fn has_grub_config(fs: &mut FatFilesystem<'_>) -> bool {
-    GRUB_CONFIG_PATHS
+    // Check top-level paths
+    if GRUB_TOPLEVEL_PATHS
         .iter()
         .any(|path| fs.file_size(path).is_ok())
+    {
+        return true;
+    }
+    // Dynamically check EFI subdirectories
+    if let Ok(subdirs) = fs.list_subdirectories("EFI") {
+        for subdir in subdirs.iter() {
+            if subdir.as_str().eq_ignore_ascii_case("BOOT") {
+                continue;
+            }
+            let mut path = heapless::String::<128>::new();
+            if core::fmt::write(&mut path, format_args!("EFI\\{}\\grub.cfg", subdir)).is_err() {
+                continue;
+            }
+            if fs.file_size(&path).is_ok() {
+                return true;
+            }
+        }
+    }
+    false
 }
