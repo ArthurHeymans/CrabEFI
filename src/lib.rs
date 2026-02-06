@@ -605,7 +605,7 @@ fn boot_uefi_entry(entry: &menu::BootEntry) {
             use drivers::storage::{self, StorageType};
 
             // Get the controller pointer directly (no lock needed for the boot phase
-            // since global_read_sector stores the pointer)
+            // since global_read_sectors stores the pointer)
             let controller_ptr = match drivers::usb::get_controller_ptr(controller_id) {
                 Some(ptr) => ptr,
                 None => {

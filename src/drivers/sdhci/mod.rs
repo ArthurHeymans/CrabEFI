@@ -1183,17 +1183,18 @@ pub fn store_global_device(controller_index: usize) -> bool {
     }
 }
 
-/// Read a sector from the global SDHCI device
+/// Read sectors from the global SDHCI device
 ///
 /// This function is used as the read callback for the SimpleFileSystem protocol.
-pub fn global_read_sector(lba: u64, buffer: &mut [u8]) -> Result<(), ()> {
-    log::trace!("SDHCI global_read_sector: LBA={}", lba);
+/// Supports reading multiple sectors by inferring sector count from buffer size.
+pub fn global_read_sectors(lba: u64, buffer: &mut [u8]) -> Result<(), ()> {
+    log::trace!("SDHCI global_read_sectors: LBA={}", lba);
 
     // Get the device info
     let controller_index = match GLOBAL_SDHCI_DEVICE.lock().as_ref() {
         Some(ptr) => unsafe { (*ptr.0).controller_index },
         None => {
-            log::error!("global_read_sector: no SDHCI device stored");
+            log::error!("global_read_sectors: no SDHCI device stored");
             return Err(());
         }
     };
@@ -1203,7 +1204,7 @@ pub fn global_read_sector(lba: u64, buffer: &mut [u8]) -> Result<(), ()> {
         Some(c) => c,
         None => {
             log::error!(
-                "global_read_sector: no SDHCI controller at index {}",
+                "global_read_sectors: no SDHCI controller at index {}",
                 controller_index
             );
             return Err(());
@@ -1213,7 +1214,7 @@ pub fn global_read_sector(lba: u64, buffer: &mut [u8]) -> Result<(), ()> {
     // Read the sector
     let result = controller.read_sector(lba, buffer);
     if let Err(ref e) = result {
-        log::error!("global_read_sector: read failed at LBA {}: {:?}", lba, e);
+        log::error!("global_read_sectors: read failed at LBA {}: {:?}", lba, e);
     }
     result.map_err(|_| ())
 }

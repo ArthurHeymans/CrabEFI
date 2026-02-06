@@ -313,10 +313,10 @@ impl BlockDevice for UsbBlockDevice {
     }
 
     fn read_blocks(&mut self, lba: u64, count: u32, buffer: &mut [u8]) -> Result<(), BlockError> {
-        // Read all sectors in a single call — global_read_sector now supports
+        // Read all sectors in a single call — global_read_sectors supports
         // multi-sector reads by inferring sector count from buffer size.
         let total_bytes = count as usize * self.info.block_size as usize;
-        usb::mass_storage::global_read_sector(lba, &mut buffer[..total_bytes])
+        usb::mass_storage::global_read_sectors(lba, &mut buffer[..total_bytes])
             .map_err(|()| BlockError::DeviceError)
     }
 }

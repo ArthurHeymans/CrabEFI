@@ -380,7 +380,7 @@ where
 /// Get a raw pointer to a controller
 ///
 /// This is useful when you need to store the controller pointer for later use,
-/// such as in global_read_sector. The pointer remains valid for the entire boot
+/// such as in global_read_sectors. The pointer remains valid for the entire boot
 /// process since controllers are allocated via efi::allocate_pages and never freed.
 ///
 /// # Safety

@@ -1056,7 +1056,7 @@ pub fn get_global_device() -> Option<&'static mut UsbMassStorage> {
 /// This function can be used as the read callback for the SimpleFileSystem protocol.
 /// It uses the stored controller pointer directly to avoid lock contention.
 /// Supports reading multiple sectors in a single SCSI command for performance.
-pub fn global_read_sector(lba: u64, buffer: &mut [u8]) -> Result<(), ()> {
+pub fn global_read_sectors(lba: u64, buffer: &mut [u8]) -> Result<(), ()> {
     log::trace!("USB mass storage: read LBA {}", lba);
 
     // Get the device and controller pointers (release lock immediately)

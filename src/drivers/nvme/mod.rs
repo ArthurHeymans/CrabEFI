@@ -1272,10 +1272,11 @@ pub fn store_global_device(controller_index: usize, nsid: u32) -> bool {
     }
 }
 
-/// Read a sector from the global NVMe device
+/// Read sectors from the global NVMe device
 ///
 /// This function is used as the read callback for the SimpleFileSystem protocol.
-pub fn global_read_sector(lba: u64, buffer: &mut [u8]) -> Result<(), ()> {
+/// Supports reading multiple sectors by inferring sector count from buffer size.
+pub fn global_read_sectors(lba: u64, buffer: &mut [u8]) -> Result<(), ()> {
     // Get the device info
     let (controller_index, nsid) = match GLOBAL_NVME_DEVICE.lock().as_ref() {
         Some(ptr) => unsafe {
@@ -1283,7 +1284,7 @@ pub fn global_read_sector(lba: u64, buffer: &mut [u8]) -> Result<(), ()> {
             (device.controller_index, device.nsid)
         },
         None => {
-            log::error!("global_read_sector: no NVMe device stored");
+            log::error!("global_read_sectors: no NVMe device stored");
             return Err(());
         }
     };
@@ -1293,7 +1294,7 @@ pub fn global_read_sector(lba: u64, buffer: &mut [u8]) -> Result<(), ()> {
         Some(c) => c,
         None => {
             log::error!(
-                "global_read_sector: no NVMe controller at index {}",
+                "global_read_sectors: no NVMe controller at index {}",
                 controller_index
             );
             return Err(());
@@ -1302,7 +1303,7 @@ pub fn global_read_sector(lba: u64, buffer: &mut [u8]) -> Result<(), ()> {
 
     // Read the sector
     controller.read_sector(nsid, lba, buffer).map_err(|e| {
-        log::error!("global_read_sector: read failed at LBA {}: {:?}", lba, e);
+        log::error!("global_read_sectors: read failed at LBA {}: {:?}", lba, e);
     })
 }
 

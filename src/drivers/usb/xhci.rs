@@ -908,8 +908,8 @@ impl XhciController {
 
         // Enable interrupter 0 (IMAN.IE = 1)
         // Some controllers won't generate events at all unless the interrupter
-        // is enabled, even when using polling mode. Clear any pending interrupt
-        // (IP bit is W1C at bit 0) and set IE (bit 1).
+        // is enabled, even when using polling mode. Preserve IP (bit 0 is W1C,
+        // so writing 0 leaves it unchanged) and set IE (bit 1).
         // This follows Linux's xhci_run_finished() pattern.
         let iman = self.read_interrupter_reg(0x00);
         self.write_interrupter_reg(0x00, (iman & !0x1) | 0x2);
@@ -983,8 +983,12 @@ impl XhciController {
                     self.event_ring.cycle = !self.event_ring.cycle;
                 }
 
+                // Update ERDP for every consumed event to prevent event ring overflow.
+                // Unhandled events (e.g., stale transfer events) would otherwise
+                // occupy ring slots indefinitely.
+                self.update_erdp();
+
                 if trb.get_type() == TRB_TYPE_COMMAND_COMPLETION {
-                    self.update_erdp();
                     let cc = trb.completion_code();
                     if cc == TRB_CC_SUCCESS {
                         return Ok(trb);
@@ -992,12 +996,9 @@ impl XhciController {
                         return Err(XhciError::CommandFailed(cc));
                     }
                 } else if trb.get_type() == TRB_TYPE_PORT_STATUS_CHANGE {
-                    // Ignore port status change events during command wait,
-                    // but update ERDP so the controller knows we consumed the slot
-                    self.update_erdp();
+                    // Ignore port status change events during command wait
                     continue;
                 } else if trb.get_type() == TRB_TYPE_HOST_CONTROLLER {
-                    self.update_erdp();
                     // Host Controller Event indicates a fatal error (HSE)
                     log::error!(
                         "xHCI: Host Controller Event (fatal HSE), cc={}",
@@ -1028,16 +1029,19 @@ impl XhciController {
     /// successful events before returning. ERDP is updated after each event
     /// to keep the event ring flowing (required since each TRB generates its
     /// own event).
+    ///
+    /// Returns the cumulative residual across all TRBs (sum of each TRB's
+    /// individual residual). This is needed because each TRB is an independent
+    /// TD, so a short packet on any TRB only affects that TRB's residual.
     fn wait_transfer_completion(
         &mut self,
         _slot: u8,
         _ep: u8,
         expected_trbs: usize,
-    ) -> Result<Trb, XhciError> {
+    ) -> Result<u32, XhciError> {
         let timeout = Timeout::from_ms(5000); // 5 second timeout for transfers
         let mut completed = 0usize;
-        #[allow(unused_assignments)]
-        let mut last_trb = Trb::default();
+        let mut total_residual: u32 = 0;
 
         while !timeout.is_expired() {
             let erdp = self.event_ring.base + (self.event_ring.dequeue_idx * 16) as u64;
@@ -1059,20 +1063,21 @@ impl XhciController {
 
                 if trb.get_type() == TRB_TYPE_TRANSFER_EVENT {
                     let cc = trb.completion_code();
+                    let residual = trb.status & 0xFFFFFF;
                     log::trace!(
                         "xHCI: Transfer event cc={} ({}) residue={} [{}/{}]",
                         cc,
                         trb_cc_name(cc),
-                        trb.status & 0xFFFFFF,
+                        residual,
                         completed + 1,
                         expected_trbs
                     );
 
                     if cc == TRB_CC_SUCCESS || cc == TRB_CC_SHORT_PACKET {
                         completed += 1;
-                        last_trb = trb;
+                        total_residual += residual;
                         if completed >= expected_trbs {
-                            return Ok(last_trb);
+                            return Ok(total_residual);
                         }
                         // More TRBs to collect — continue
                     } else if cc == TRB_CC_STALL_ERROR {
@@ -1129,6 +1134,7 @@ impl XhciController {
     fn drain_remaining_transfer_events(&mut self, max_events: usize) {
         let timeout = Timeout::from_ms(100); // Short timeout — events should already be there
         let mut drained = 0usize;
+        let mut consumed = 0usize;
 
         while drained < max_events && !timeout.is_expired() {
             let erdp = self.event_ring.base + (self.event_ring.dequeue_idx * 16) as u64;
@@ -1140,6 +1146,7 @@ impl XhciController {
                     self.event_ring.dequeue_idx = 0;
                     self.event_ring.cycle = !self.event_ring.cycle;
                 }
+                consumed += 1;
 
                 if event.get_type() == TRB_TYPE_TRANSFER_EVENT {
                     drained += 1;
@@ -1150,9 +1157,13 @@ impl XhciController {
             core::hint::spin_loop();
         }
 
-        if drained > 0 {
+        if consumed > 0 {
             self.update_erdp();
-            log::trace!("xHCI: drained {} orphaned transfer events", drained);
+            log::trace!(
+                "xHCI: drained {} orphaned transfer events ({} total consumed)",
+                drained,
+                consumed
+            );
         }
     }
 
@@ -1392,7 +1403,6 @@ impl XhciController {
         data: Option<&mut [u8]>,
     ) -> Result<usize, XhciError> {
         const DCI_EP0: u8 = 1; // Control endpoint is always DCI 1
-        const TRB_ISP: u32 = 1 << 2; // Interrupt on Short Packet
 
         let slot = self
             .slots
@@ -1427,6 +1437,11 @@ impl XhciController {
         let first_trb_addr = ring.enqueue(&setup, true); // defer_cycle = true
 
         // Data Stage TRB (if needed)
+        // Note: We intentionally do NOT set ISP (Interrupt on Short Packet) on the
+        // Data Stage TRB. With ISP, a short packet would generate an extra event
+        // before the Status Stage's IOC event, but wait_transfer_completion only
+        // expects 1 event. The orphaned Status event would corrupt later transfers.
+        // EDK2 also relies solely on IOC on the Status Stage TRB.
         if let Some(data_buf) = data {
             let mut data_trb = Trb::default();
             data_trb.param = data_buf.as_ptr() as u64;
@@ -1434,7 +1449,6 @@ impl XhciController {
             data_trb.set_type(TRB_TYPE_DATA);
             if is_in {
                 data_trb.control |= 1 << 16; // DIR = IN
-                data_trb.control |= TRB_ISP; // Interrupt on Short Packet for IN
             }
 
             ring.enqueue(&data_trb, false);
@@ -1459,10 +1473,9 @@ impl XhciController {
 
         // Wait for completion
         match self.wait_transfer_completion(slot_id, 0, 1) {
-            Ok(completion) => {
+            Ok(total_residual) => {
                 // Return transfer length
-                let residual = completion.status & 0xFFFFFF;
-                Ok(data_len.saturating_sub(residual as usize))
+                Ok(data_len.saturating_sub(total_residual as usize))
             }
             Err(XhciError::StallError) => {
                 // Control endpoint stalled - reset it
@@ -2066,13 +2079,12 @@ impl XhciController {
 
         // Wait for all TRB completions
         match self.wait_transfer_completion(slot_id, ep, trb_count) {
-            Ok(completion) => {
-                let residual = completion.status & 0xFFFFFF;
-                let transferred = data.len().saturating_sub(residual as usize);
+            Ok(total_residual) => {
+                let transferred = data.len().saturating_sub(total_residual as usize);
                 log::trace!(
                     "xHCI: bulk transfer complete, len={} residual={} transferred={}",
                     data.len(),
-                    residual,
+                    total_residual,
                     transferred
                 );
                 Ok(transferred)

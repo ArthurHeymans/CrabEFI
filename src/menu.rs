@@ -595,7 +595,7 @@ fn discover_usb_entries(menu: &mut BootMenu) {
                         return false;
                     }
 
-                    // Store device globally WITH controller pointer so global_read_sector can use it directly
+                    // Store device globally WITH controller pointer so global_read_sectors can use it directly
                     // This avoids lock contention since we store the pointer, not just the ID
                     // SAFETY: controller_ptr is obtained from get_controller_ptr and is valid
                     unsafe {

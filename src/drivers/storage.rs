@@ -101,7 +101,7 @@ pub fn read_sectors(device_id: u32, lba: u64, buffer: &mut [u8]) -> Result<(), (
     match device.device_type {
         StorageType::Usb { slot_id: _ } => {
             // Use the global USB read function
-            crate::drivers::usb::mass_storage::global_read_sector(lba, buffer)
+            crate::drivers::usb::mass_storage::global_read_sectors(lba, buffer)
         }
         StorageType::Nvme {
             controller_id,
@@ -120,12 +120,12 @@ pub fn read_sectors(device_id: u32, lba: u64, buffer: &mut [u8]) -> Result<(), (
             controller_id: _,
             port: _,
         } => {
-            // Use global_read_sector which handles sector size translation for SATAPI
-            crate::drivers::ahci::global_read_sector(lba, buffer)
+            // Use global_read_sectors which handles sector size translation for SATAPI
+            crate::drivers::ahci::global_read_sectors(lba, buffer)
         }
         StorageType::Sdhci { controller_id: _ } => {
-            // Use global_read_sector for SDHCI
-            crate::drivers::sdhci::global_read_sector(lba, buffer)
+            // Use global_read_sectors for SDHCI
+            crate::drivers::sdhci::global_read_sectors(lba, buffer)
         }
     }
 }

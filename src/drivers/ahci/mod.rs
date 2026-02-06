@@ -1411,14 +1411,14 @@ pub fn store_global_device(controller_index: usize, port_index: usize) -> bool {
 ///
 /// The LBA is interpreted as a device block LBA (in terms of the device's native
 /// sector size - 512 bytes for SATA, 2048 bytes for SATAPI/CD-ROM).
-pub fn global_read_sector(lba: u64, buffer: &mut [u8]) -> Result<(), ()> {
+pub fn global_read_sectors(lba: u64, buffer: &mut [u8]) -> Result<(), ()> {
     let (controller_index, port_index) = match GLOBAL_AHCI_DEVICE.lock().as_ref() {
         Some(ptr) => unsafe {
             let device = &*ptr.0;
             (device.controller_index, device.port_index)
         },
         None => {
-            log::error!("global_read_sector: no AHCI device stored");
+            log::error!("global_read_sectors: no AHCI device stored");
             return Err(());
         }
     };
@@ -1427,7 +1427,7 @@ pub fn global_read_sector(lba: u64, buffer: &mut [u8]) -> Result<(), ()> {
         Some(c) => c,
         None => {
             log::error!(
-                "global_read_sector: no AHCI controller at index {}",
+                "global_read_sectors: no AHCI controller at index {}",
                 controller_index
             );
             return Err(());
@@ -1445,7 +1445,7 @@ pub fn global_read_sector(lba: u64, buffer: &mut [u8]) -> Result<(), ()> {
     controller
         .read_sectors(port_index, lba, num_sectors, buffer.as_mut_ptr())
         .map_err(|e| {
-            log::error!("global_read_sector: read failed at LBA {}: {:?}", lba, e);
+            log::error!("global_read_sectors: read failed at LBA {}: {:?}", lba, e);
         })
 }
 

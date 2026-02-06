@@ -880,6 +880,9 @@ fn load_image_from_device_path(
     log::info!("BS.LoadImage: Loading from device path: {}", path_display);
 
     // Find a handle with SimpleFileSystem protocol
+    // TODO: This always uses the first SFS handle found. The UEFI spec requires
+    // matching the device path against handles' device paths to find the correct
+    // volume. On multi-disk systems, this could load from the wrong disk.
     let sfs_handle = find_handle_with_protocol(&SIMPLE_FILE_SYSTEM_GUID).ok_or_else(|| {
         log::error!("BS.LoadImage: No SimpleFileSystem handle found");
         Status::NOT_FOUND
