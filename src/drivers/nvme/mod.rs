@@ -976,17 +976,23 @@ impl NvmeController {
         Ok(())
     }
 
-    /// Read a single sector (convenience method)
+    /// Read one or more sectors into a buffer
+    ///
+    /// The number of sectors to read is inferred from the buffer size.
+    /// If the buffer is larger than one sector, multiple sectors are read
+    /// in a single operation for performance.
     pub fn read_sector(&mut self, nsid: u32, lba: u64, buffer: &mut [u8]) -> Result<(), NvmeError> {
         let ns = self
             .get_namespace(nsid)
             .ok_or(NvmeError::InvalidNamespace)?;
 
-        if buffer.len() < ns.block_size as usize {
+        let block_size = ns.block_size as usize;
+        if buffer.len() < block_size {
             return Err(NvmeError::InvalidParameter);
         }
 
-        self.read_sectors(nsid, lba, 1, buffer.as_mut_ptr())
+        let num_sectors = (buffer.len() / block_size) as u32;
+        self.read_sectors(nsid, lba, num_sectors, buffer.as_mut_ptr())
     }
     // ========================================================================
     // Security Commands (TCG Opal, IEEE 1667)

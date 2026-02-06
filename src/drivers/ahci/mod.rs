@@ -1434,10 +1434,16 @@ pub fn global_read_sector(lba: u64, buffer: &mut [u8]) -> Result<(), ()> {
         }
     };
 
-    // Read directly using the device's native sector size
-    // The caller is responsible for providing the correct LBA in device block terms
+    // Compute sector count from buffer size for multi-sector reads.
+    // The caller is responsible for providing the correct LBA in device block terms.
+    let sector_size = controller
+        .get_port(port_index)
+        .map(|p| p.sector_size as usize)
+        .unwrap_or(512);
+    let num_sectors = (buffer.len() / sector_size).max(1) as u32;
+
     controller
-        .read_sectors(port_index, lba, 1, buffer.as_mut_ptr())
+        .read_sectors(port_index, lba, num_sectors, buffer.as_mut_ptr())
         .map_err(|e| {
             log::error!("global_read_sector: read failed at LBA {}: {:?}", lba, e);
         })

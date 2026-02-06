@@ -793,21 +793,67 @@ impl<'a> FatFilesystem<'a> {
             }
         } else {
             // Cluster spans multiple device blocks (cluster_size > device_block_size)
-            // This means device blocks are smaller than clusters, so offset should be 0
+            // Read all blocks in a single call for performance — avoids per-block
+            // USB BOT overhead (CBW + data + CSW per 512-byte sector).
             let device_blocks_per_cluster = cluster_size.div_ceil(device_block_size);
 
-            for i in 0..device_blocks_per_cluster {
-                let buf_offset = i * device_block_size;
-                let read_size = device_block_size.min(cluster_size - buf_offset);
-                self.device
-                    .read_block(
-                        start_device_block + i as u64,
-                        &mut buffer[buf_offset..buf_offset + read_size],
-                    )
-                    .map_err(|_| FatError::ReadError)?;
-            }
+            self.device
+                .read_blocks(
+                    start_device_block,
+                    device_blocks_per_cluster as u32,
+                    &mut buffer[..cluster_size],
+                )
+                .map_err(|_| FatError::ReadError)?;
         }
         Ok(())
+    }
+
+    /// Read a contiguous run of clusters directly into a buffer
+    ///
+    /// Given a starting cluster and a count of physically-contiguous clusters,
+    /// issues a single multi-block read to the device. This amortizes USB BOT
+    /// overhead (CBW + CSW) across many clusters instead of paying it per-cluster.
+    fn read_contiguous_clusters(
+        &mut self,
+        start_cluster: u32,
+        count: u32,
+        buffer: &mut [u8],
+    ) -> Result<(), FatError> {
+        let sectors_per_cluster = self.sectors_per_cluster as u32;
+        let device_block_size = self.device_block_size as usize;
+        let cluster_size = sectors_per_cluster as usize * self.bytes_per_sector as usize;
+        let total_bytes = count as usize * cluster_size;
+
+        if buffer.len() < total_bytes {
+            return Err(FatError::BufferTooSmall);
+        }
+
+        let (start_device_block, start_offset) = self
+            .cluster_to_device_block(start_cluster)
+            .ok_or(FatError::InvalidCluster)?;
+
+        if start_offset != 0 {
+            // Cluster not aligned to device block — fall back to per-cluster reads
+            for i in 0..count {
+                let offset = i as usize * cluster_size;
+                self.read_cluster(
+                    start_cluster + i,
+                    &mut buffer[offset..offset + cluster_size],
+                )?;
+            }
+            return Ok(());
+        }
+
+        // Calculate total device blocks for the entire run
+        let total_device_blocks = (total_bytes.div_ceil(device_block_size)) as u32;
+
+        self.device
+            .read_blocks(
+                start_device_block,
+                total_device_blocks,
+                &mut buffer[..total_bytes],
+            )
+            .map_err(|_| FatError::ReadError)
     }
 
     /// Find a file by path
@@ -1084,15 +1130,41 @@ impl<'a> FatFilesystem<'a> {
             }
         }
 
-        // Read full clusters
+        // Read full clusters — coalesce contiguous runs for performance.
+        // Instead of reading one cluster at a time (each requiring a separate USB
+        // BOT transaction), detect runs of physically-contiguous clusters and read
+        // them in a single multi-block device call.
         while bytes_read + cluster_size as usize <= bytes_to_read {
-            self.read_cluster(
-                cluster,
-                &mut buffer[bytes_read..bytes_read + cluster_size as usize],
-            )?;
-            bytes_read += cluster_size as usize;
+            let run_start = cluster;
+            let mut run_len: u32 = 1;
 
-            match self.next_cluster(cluster)? {
+            // Follow cluster chain, counting contiguous clusters
+            let mut current = cluster;
+            loop {
+                // Check if we have enough remaining data for another cluster in this run
+                if bytes_read + (run_len as usize + 1) * cluster_size as usize > bytes_to_read {
+                    break;
+                }
+                match self.next_cluster(current)? {
+                    Some(next) if next == current + 1 => {
+                        run_len += 1;
+                        current = next;
+                    }
+                    _ => break,
+                }
+            }
+
+            // Read entire contiguous run in one call
+            let run_bytes = run_len as usize * cluster_size as usize;
+            self.read_contiguous_clusters(
+                run_start,
+                run_len,
+                &mut buffer[bytes_read..bytes_read + run_bytes],
+            )?;
+            bytes_read += run_bytes;
+
+            // Advance to the next cluster after the run
+            match self.next_cluster(current)? {
                 Some(next) => cluster = next,
                 None => return Ok(bytes_read),
             }

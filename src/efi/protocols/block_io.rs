@@ -196,18 +196,20 @@ extern "efiapi" fn block_io_read_blocks(
         buffer_size
     );
 
-    // Read each block using the storage abstraction
+    // Read all blocks in a single call — the storage layer (USB mass storage, NVMe,
+    // AHCI) supports multi-sector reads and will chunk internally at optimal sizes
+    // (e.g., 128 sectors / 64KB per SCSI command for USB). This avoids the massive
+    // overhead of issuing one BOT transaction (CBW + data + CSW) per 512-byte sector.
     let buffer_slice = unsafe { core::slice::from_raw_parts_mut(buffer as *mut u8, buffer_size) };
+    let absolute_lba = ctx.start_lba + lba;
 
-    for i in 0..num_blocks {
-        let absolute_lba = ctx.start_lba + lba + i as u64;
-        let offset = i * block_size;
-        let block_buf = &mut buffer_slice[offset..offset + block_size];
-
-        if storage::read_sectors(ctx.storage_device_id, absolute_lba, block_buf).is_err() {
-            log::error!("BlockIO.ReadBlocks: read failed at LBA {}", absolute_lba);
-            return Status::DEVICE_ERROR;
-        }
+    if storage::read_sectors(ctx.storage_device_id, absolute_lba, buffer_slice).is_err() {
+        log::error!(
+            "BlockIO.ReadBlocks: read failed at LBA {} ({} blocks)",
+            absolute_lba,
+            num_blocks
+        );
+        return Status::DEVICE_ERROR;
     }
 
     Status::SUCCESS

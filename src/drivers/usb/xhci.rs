@@ -956,24 +956,16 @@ impl XhciController {
     fn wait_command_completion(&mut self) -> Result<Trb, XhciError> {
         let timeout = Timeout::from_ms(5000); // 5 second timeout for commands
 
-        // Log initial state for debugging
-        let erdp_init = self.event_ring.base + (self.event_ring.dequeue_idx * 16) as u64;
-        let event_init = unsafe { &*(erdp_init as *const Trb) };
         log::debug!(
-            "xHCI: Waiting for command, event_ring_base={:#x}, dequeue_idx={}, expect_cycle={}, first_event_cycle={}",
-            self.event_ring.base,
+            "xHCI: Waiting for command, dequeue_idx={}, expect_cycle={}",
             self.event_ring.dequeue_idx,
             self.event_ring.cycle,
-            event_init.get_cycle()
         );
 
-        let mut logged_once = false;
         while !timeout.is_expired() {
-            // Read event ring dequeue pointer
             let erdp = self.event_ring.base + (self.event_ring.dequeue_idx * 16) as u64;
             let event = unsafe { &*(erdp as *const Trb) };
 
-            // Check if event is ready
             if event.get_cycle() == self.event_ring.cycle {
                 let trb = *event;
 
@@ -984,21 +976,15 @@ impl XhciController {
                     trb.param
                 );
 
-                // Advance dequeue pointer
+                // Advance dequeue pointer (software only — defer MMIO write)
                 self.event_ring.dequeue_idx += 1;
                 if self.event_ring.dequeue_idx >= self.event_ring.size {
                     self.event_ring.dequeue_idx = 0;
                     self.event_ring.cycle = !self.event_ring.cycle;
                 }
 
-                // Update ERDP with EHB (Event Handler Busy) bit cleared
-                // ERDP bits 63:4 = dequeue pointer, bit 3 = EHB (write-1-to-clear)
-                // We write 1 to EHB to clear it, signaling event handling is complete
-                let new_erdp = self.event_ring.base + (self.event_ring.dequeue_idx * 16) as u64;
-                let erdp_with_ehb = (new_erdp & !0xF) | (1 << 3);
-                self.write_interrupter_reg64(0x18, erdp_with_ehb);
-
                 if trb.get_type() == TRB_TYPE_COMMAND_COMPLETION {
+                    self.update_erdp();
                     let cc = trb.completion_code();
                     if cc == TRB_CC_SUCCESS {
                         return Ok(trb);
@@ -1006,9 +992,12 @@ impl XhciController {
                         return Err(XhciError::CommandFailed(cc));
                     }
                 } else if trb.get_type() == TRB_TYPE_PORT_STATUS_CHANGE {
-                    // Ignore port status change events during command wait
+                    // Ignore port status change events during command wait,
+                    // but update ERDP so the controller knows we consumed the slot
+                    self.update_erdp();
                     continue;
                 } else if trb.get_type() == TRB_TYPE_HOST_CONTROLLER {
+                    self.update_erdp();
                     // Host Controller Event indicates a fatal error (HSE)
                     log::error!(
                         "xHCI: Host Controller Event (fatal HSE), cc={}",
@@ -1016,23 +1005,12 @@ impl XhciController {
                     );
                     return Err(XhciError::CommandFailed(trb.completion_code()));
                 }
-            } else if !logged_once {
-                // Log just once after 100ms if no event yet
-                crate::time::delay_ms(100);
-                if !timeout.is_expired() {
-                    let event_now = unsafe { &*(erdp as *const Trb) };
-                    log::debug!(
-                        "xHCI: No event after 100ms, control={:#x}, cycle_bit={}",
-                        event_now.control,
-                        event_now.get_cycle()
-                    );
-                    logged_once = true;
-                }
             }
             core::hint::spin_loop();
         }
 
-        // Timeout - dump some debug info
+        // Timeout — still update ERDP for any events we consumed
+        self.update_erdp();
         let usbsts = self.read_op_reg(OP_USBSTS);
         log::warn!(
             "xHCI: Command timeout, USBSTS={:#x}, event_ring[0].control={:#x}",
@@ -1043,9 +1021,23 @@ impl XhciController {
         Err(XhciError::Timeout)
     }
 
-    /// Wait for transfer completion
-    fn wait_transfer_completion(&mut self, _slot: u8, _ep: u8) -> Result<Trb, XhciError> {
+    /// Wait for transfer completion events
+    ///
+    /// Each TRB is its own independent TD with IOC=1, so the controller
+    /// generates one Transfer Event per TRB. We collect `expected_trbs`
+    /// successful events before returning. ERDP is updated after each event
+    /// to keep the event ring flowing (required since each TRB generates its
+    /// own event).
+    fn wait_transfer_completion(
+        &mut self,
+        _slot: u8,
+        _ep: u8,
+        expected_trbs: usize,
+    ) -> Result<Trb, XhciError> {
         let timeout = Timeout::from_ms(5000); // 5 second timeout for transfers
+        let mut completed = 0usize;
+        #[allow(unused_assignments)]
+        let mut last_trb = Trb::default();
 
         while !timeout.is_expired() {
             let erdp = self.event_ring.base + (self.event_ring.dequeue_idx * 16) as u64;
@@ -1061,26 +1053,45 @@ impl XhciController {
                     self.event_ring.cycle = !self.event_ring.cycle;
                 }
 
-                // Update ERDP with EHB (Event Handler Busy) bit cleared
-                let new_erdp = self.event_ring.base + (self.event_ring.dequeue_idx * 16) as u64;
-                let erdp_with_ehb = (new_erdp & !0xF) | (1 << 3);
-                self.write_interrupter_reg64(0x18, erdp_with_ehb);
+                // Update ERDP after each event — required since every TRB
+                // generates its own completion event
+                self.update_erdp();
 
                 if trb.get_type() == TRB_TYPE_TRANSFER_EVENT {
                     let cc = trb.completion_code();
                     log::trace!(
-                        "xHCI: Transfer event cc={} ({}) residue={}",
+                        "xHCI: Transfer event cc={} ({}) residue={} [{}/{}]",
                         cc,
                         trb_cc_name(cc),
-                        trb.status & 0xFFFFFF
+                        trb.status & 0xFFFFFF,
+                        completed + 1,
+                        expected_trbs
                     );
+
                     if cc == TRB_CC_SUCCESS || cc == TRB_CC_SHORT_PACKET {
-                        return Ok(trb);
+                        completed += 1;
+                        last_trb = trb;
+                        if completed >= expected_trbs {
+                            return Ok(last_trb);
+                        }
+                        // More TRBs to collect — continue
                     } else if cc == TRB_CC_STALL_ERROR {
-                        log::debug!("xHCI: Transfer stalled");
+                        log::debug!(
+                            "xHCI: Transfer stalled [{}/{}]",
+                            completed + 1,
+                            expected_trbs
+                        );
+                        self.drain_remaining_transfer_events(expected_trbs - completed - 1);
                         return Err(XhciError::StallError);
                     } else {
-                        log::debug!("xHCI: Transfer failed with cc={} ({})", cc, trb_cc_name(cc));
+                        log::debug!(
+                            "xHCI: Transfer failed with cc={} ({}) [{}/{}]",
+                            cc,
+                            trb_cc_name(cc),
+                            completed + 1,
+                            expected_trbs
+                        );
+                        self.drain_remaining_transfer_events(expected_trbs - completed - 1);
                         return Err(XhciError::TransferFailed(cc));
                     }
                 } else if trb.get_type() == TRB_TYPE_HOST_CONTROLLER {
@@ -1091,7 +1102,6 @@ impl XhciController {
                     );
                     return Err(XhciError::TransferFailed(trb.completion_code()));
                 } else {
-                    // Got a non-transfer event, log and continue waiting
                     log::trace!(
                         "xHCI: Got event type {} while waiting for transfer",
                         trb.get_type()
@@ -1100,12 +1110,63 @@ impl XhciController {
             }
             core::hint::spin_loop();
         }
+
         log::warn!(
-            "xHCI: Transfer timeout, event ring dequeue_idx={}, cycle={}",
+            "xHCI: Transfer timeout, completed={}/{}, event ring dequeue_idx={}, cycle={}",
+            completed,
+            expected_trbs,
             self.event_ring.dequeue_idx,
             self.event_ring.cycle
         );
         Err(XhciError::Timeout)
+    }
+
+    /// Drain remaining transfer events after an error
+    ///
+    /// When a multi-TRB transfer fails on one TRB, the controller may have
+    /// already queued completion events for subsequent TRBs. These must be
+    /// consumed to prevent them from confusing later transfers.
+    fn drain_remaining_transfer_events(&mut self, max_events: usize) {
+        let timeout = Timeout::from_ms(100); // Short timeout — events should already be there
+        let mut drained = 0usize;
+
+        while drained < max_events && !timeout.is_expired() {
+            let erdp = self.event_ring.base + (self.event_ring.dequeue_idx * 16) as u64;
+            let event = unsafe { &*(erdp as *const Trb) };
+
+            if event.get_cycle() == self.event_ring.cycle {
+                self.event_ring.dequeue_idx += 1;
+                if self.event_ring.dequeue_idx >= self.event_ring.size {
+                    self.event_ring.dequeue_idx = 0;
+                    self.event_ring.cycle = !self.event_ring.cycle;
+                }
+
+                if event.get_type() == TRB_TYPE_TRANSFER_EVENT {
+                    drained += 1;
+                }
+            } else {
+                break; // No more events ready
+            }
+            core::hint::spin_loop();
+        }
+
+        if drained > 0 {
+            self.update_erdp();
+            log::trace!("xHCI: drained {} orphaned transfer events", drained);
+        }
+    }
+
+    /// Update the Event Ring Dequeue Pointer (ERDP) in hardware
+    ///
+    /// This writes the current software dequeue pointer to the interrupter's
+    /// ERDP register with the EHB (Event Handler Busy) bit set to clear it.
+    /// This is a 64-bit split write (two PCIe MMIO writes), so it should be
+    /// called as infrequently as possible.
+    #[inline]
+    fn update_erdp(&self) {
+        let new_erdp = self.event_ring.base + (self.event_ring.dequeue_idx * 16) as u64;
+        let erdp_with_ehb = (new_erdp & !0xF) | (1 << 3);
+        self.write_interrupter_reg64(0x18, erdp_with_ehb);
     }
 
     /// Reset an endpoint after a stall or other error
@@ -1397,7 +1458,7 @@ impl XhciController {
         self.ring_doorbell(slot_id, DCI_EP0);
 
         // Wait for completion
-        match self.wait_transfer_completion(slot_id, 0) {
+        match self.wait_transfer_completion(slot_id, 0, 1) {
             Ok(completion) => {
                 // Return transfer length
                 let residual = completion.status & 0xFFFFFF;
@@ -1468,26 +1529,31 @@ impl XhciController {
     /// Enumerate ports and attach devices
     fn enumerate_ports(&mut self) -> Result<(), XhciError> {
         for port in 0..self.num_ports {
-            // Debounce: check connection is stable for 100ms
+            // Quick check — skip immediately if nothing connected.
+            // This avoids the 100ms debounce cost for every empty port.
+            let portsc = self.read_port_reg(port, PORT_PORTSC);
+            if portsc & PORTSC_CCS == 0 {
+                continue;
+            }
+
+            // Debounce: check connection is stable for 50ms
             // This prevents detecting phantom connections during cable settling
             let mut stable_count = 0;
-            let mut last_connected = false;
 
-            for _ in 0..10 {
+            for _ in 0..5 {
                 let portsc = self.read_port_reg(port, PORT_PORTSC);
                 let connected = portsc & PORTSC_CCS != 0;
 
-                if connected == last_connected && connected {
+                if connected {
                     stable_count += 1;
                 } else {
                     stable_count = 0;
                 }
-                last_connected = connected;
                 crate::time::delay_ms(10);
             }
 
-            // Need at least 5 stable reads to consider device connected
-            if stable_count < 5 {
+            // Need at least 3 stable reads to consider device connected
+            if stable_count < 3 {
                 continue;
             }
 
@@ -1960,11 +2026,11 @@ impl XhciController {
 
     /// Bulk transfer
     ///
-    /// Handles 64KB boundary restrictions by splitting transfers across multiple TRBs
-    /// as required by the xHCI specification (Table 49 and Section 6.4.1).
+    /// Splits large transfers into ≤ 64KB TRBs, each as its own independent TD
+    /// with IOC (matching EDK2's approach). Collects one completion event per TRB.
     ///
     /// Features:
-    /// - Splits transfers at 64KB boundaries using TRB chaining
+    /// - Splits transfers into independent 64KB TRBs (no chaining)
     /// - Sets ISP (Interrupt on Short Packet) for IN transfers to detect short packets
     /// - Automatically recovers from stall errors by resetting the endpoint
     pub fn bulk_transfer(
@@ -1992,20 +2058,14 @@ impl XhciController {
         );
 
         // Queue all TRBs for this transfer
-        let first_trb_addr = self.queue_bulk_trbs(slot_id, dci, is_in, data)?;
+        let trb_count = self.queue_bulk_trbs(slot_id, dci, is_in, data)?;
 
         // Memory barrier and ring doorbell
         fence(Ordering::SeqCst);
-        log::trace!(
-            "xHCI: bulk TRBs queued starting at {:#x}, ringing doorbell slot={} dci={}",
-            first_trb_addr,
-            slot_id,
-            dci
-        );
         self.ring_doorbell(slot_id, dci as u8);
 
-        // Wait for completion
-        match self.wait_transfer_completion(slot_id, ep) {
+        // Wait for all TRB completions
+        match self.wait_transfer_completion(slot_id, ep, trb_count) {
             Ok(completion) => {
                 let residual = completion.status & 0xFFFFFF;
                 let transferred = data.len().saturating_sub(residual as usize);
@@ -2056,22 +2116,25 @@ impl XhciController {
         }
     }
 
-    /// Queue TRBs for a bulk transfer, handling 64KB boundary splitting
+    /// Queue TRBs for a bulk transfer
     ///
-    /// Uses the "deferred first TRB" technique to prevent the HC from processing
-    /// a partially-built multi-TRB TD. Also sets TD_SIZE on intermediate TRBs
-    /// to help the controller with buffer pre-fetching.
+    /// Splits large transfers into ≤ 64KB (0x10000 byte) TRBs, matching EDK2's
+    /// proven approach: **each TRB is its own independent TD** with IOC=1 and
+    /// ISP=1. No chaining, no deferred first TRB, no TD_SIZE — just simple
+    /// per-TRB completion events that the wait loop collects.
     ///
-    /// Returns the address of the first TRB queued.
+    /// This avoids complex chained-TRB interactions that cause BABBLE on some
+    /// Intel xHCI controllers (e.g. ThinkPad T480).
+    ///
+    /// Returns the number of TRBs queued.
     fn queue_bulk_trbs(
         &mut self,
         slot_id: u8,
         dci: usize,
         is_in: bool,
         data: &mut [u8],
-    ) -> Result<u64, XhciError> {
-        const TRB_MAX_TRANSFER_SIZE: usize = 64 * 1024; // 64KB boundary
-        const TRB_CHAIN: u32 = 1 << 4; // Chain bit
+    ) -> Result<usize, XhciError> {
+        const TRB_MAX_TRANSFER_SIZE: usize = 0x10000; // 64KB per TRB (EDK2 convention)
         const TRB_IOC: u32 = 1 << 5; // Interrupt on Completion
         const TRB_ISP: u32 = 1 << 2; // Interrupt on Short Packet
 
@@ -2081,90 +2144,41 @@ impl XhciController {
             .and_then(|s| s.as_mut())
             .ok_or(XhciError::DeviceNotFound)?;
 
-        let max_packet = slot.bulk_max_packet.max(1) as usize;
-
         let ring = slot.transfer_rings[dci - 1]
             .as_mut()
             .ok_or(XhciError::DeviceNotFound)?;
 
-        // Save cycle state before enqueuing the first (deferred) TRB
-        let first_trb_cycle = ring.cycle;
-
-        // Calculate how many TRBs we need, respecting 64KB boundaries
-        // A TRB buffer cannot cross a 64KB boundary (xHCI spec Table 49)
         let mut buf_addr = data.as_ptr() as u64;
         let mut remaining = data.len();
-        let total_len = data.len();
-        let mut transferred_so_far = 0usize;
-        let mut first_trb_addr = 0u64;
-        let mut trb_count = 0;
-
-        // Calculate total packet count for TD_SIZE computation
-        let total_packets = total_len.div_ceil(max_packet);
+        let mut trb_count = 0usize;
 
         while remaining > 0 {
-            // Calculate how much we can transfer before the next 64KB boundary
-            let next_boundary = (buf_addr & !0xFFFF) + TRB_MAX_TRANSFER_SIZE as u64;
-            let until_boundary = (next_boundary - buf_addr) as usize;
-            let chunk_size = remaining.min(until_boundary);
-            let is_last = remaining <= chunk_size;
+            let chunk_size = remaining.min(TRB_MAX_TRANSFER_SIZE);
 
-            // Calculate TD_SIZE: number of remaining packets after this TRB
-            // Capped at 31 (5-bit field), last TRB must have TD_SIZE = 0
-            let td_size = if is_last {
-                0u32
-            } else {
-                let packets_done = (transferred_so_far + chunk_size) / max_packet;
-                let packets_remaining = total_packets.saturating_sub(packets_done);
-                (packets_remaining as u32).min(31)
-            };
-
-            // Create Normal TRB
             let mut trb = Trb::default();
             trb.param = buf_addr;
-            // Status field: bits 0-16 = TRB Transfer Length, bits 21-17 = TD Size
-            trb.status = (chunk_size as u32) | (td_size << 17);
+            trb.status = chunk_size as u32; // TRB Transfer Length, TD_SIZE = 0
             trb.set_type(TRB_TYPE_NORMAL);
-
-            // Set ISP (Interrupt on Short Packet) for IN endpoints
-            // This allows us to detect when the device sends less data than expected
+            trb.control |= TRB_IOC; // Every TRB gets its own completion event
             if is_in {
                 trb.control |= TRB_ISP;
             }
 
-            // If this is not the last TRB, set the Chain bit
-            if !is_last {
-                trb.control |= TRB_CHAIN;
-            } else {
-                // Last TRB: set IOC (Interrupt on Completion)
-                trb.control |= TRB_IOC;
-            }
-
-            // First TRB uses deferred cycle, rest use normal cycle
-            let defer = trb_count == 0;
-            let trb_addr = ring.enqueue(&trb, defer);
-            if trb_count == 0 {
-                first_trb_addr = trb_addr;
-            }
+            ring.enqueue(&trb, false);
             trb_count += 1;
 
-            transferred_so_far += chunk_size;
             buf_addr += chunk_size as u64;
             remaining -= chunk_size;
         }
 
-        // Commit the deferred first TRB — atomically makes the entire TD live
-        if trb_count > 0 {
-            TrbRing::commit_deferred_trb(first_trb_addr, first_trb_cycle);
-        }
-
         log::trace!(
-            "xHCI: queued {} TRBs for bulk transfer, first={:#x}",
+            "xHCI: queued {} TRBs for bulk transfer ({}B each, {}B total)",
             trb_count,
-            first_trb_addr
+            TRB_MAX_TRANSFER_SIZE,
+            data.len()
         );
 
-        Ok(first_trb_addr)
+        Ok(trb_count)
     }
 
     /// Find a mass storage device

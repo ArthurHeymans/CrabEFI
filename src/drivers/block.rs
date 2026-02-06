@@ -313,23 +313,11 @@ impl BlockDevice for UsbBlockDevice {
     }
 
     fn read_blocks(&mut self, lba: u64, count: u32, buffer: &mut [u8]) -> Result<(), BlockError> {
-        // Get the USB controller and mass storage device, then read
-        // This uses the global USB mass storage read function
-        usb::mass_storage::global_read_sector(lba, buffer).map_err(|()| BlockError::DeviceError)?;
-
-        // Handle multi-block reads by reading sectors one at a time
-        // (global_read_sector handles single sectors)
-        if count > 1 {
-            let block_size = self.info.block_size as usize;
-            for i in 1..count {
-                let offset = i as usize * block_size;
-                let sector_lba = lba + i as u64;
-                usb::mass_storage::global_read_sector(sector_lba, &mut buffer[offset..])
-                    .map_err(|()| BlockError::DeviceError)?;
-            }
-        }
-
-        Ok(())
+        // Read all sectors in a single call — global_read_sector now supports
+        // multi-sector reads by inferring sector count from buffer size.
+        let total_bytes = count as usize * self.info.block_size as usize;
+        usb::mass_storage::global_read_sector(lba, &mut buffer[..total_bytes])
+            .map_err(|()| BlockError::DeviceError)
     }
 }
 

@@ -641,11 +641,22 @@ impl UsbMassStorage {
     /// want to stall too long.
     const MAX_READ_RETRIES: u32 = 3;
 
-    /// Read sectors from the device with retry logic.
+    /// Maximum number of sectors per SCSI READ command.
     ///
-    /// Retries all failed reads up to MAX_READ_RETRIES times. Inspired by
-    /// EDK2's UsbBootExecCmdWithRetry which retries up to 5 times with a
-    /// 60-second overall timeout. Our BOT-level error recovery (endpoint
+    /// USB mass storage devices vary in how many sectors they can handle per
+    /// command. 128 sectors (64KB) is a safe maximum that works reliably
+    /// across all devices while still being a large enough chunk to amortize
+    /// the BOT protocol overhead (CBW + CSW per command).
+    const MAX_SECTORS_PER_CMD: u32 = 128;
+
+    /// Read sectors from the device with chunking and retry logic.
+    ///
+    /// Large reads are split into chunks of MAX_SECTORS_PER_CMD to ensure
+    /// compatibility with all USB mass storage devices. Each chunk is retried
+    /// up to MAX_READ_RETRIES times on failure.
+    ///
+    /// Inspired by EDK2's UsbBootExecCmdWithRetry which retries up to 5 times
+    /// with a 60-second overall timeout. Our BOT-level error recovery (endpoint
     /// halt clearing, CSW draining, BOT reset) happens inside `scsi_command`,
     /// so by the time we retry here the device should be in a clean state.
     pub fn read_sectors_generic(
@@ -655,18 +666,48 @@ impl UsbMassStorage {
         num_sectors: u32,
         buffer: &mut [u8],
     ) -> Result<(), MassStorageError> {
-        if buffer.len() < (num_sectors as usize * self.block_size as usize) {
+        let block_size = self.block_size as usize;
+        if buffer.len() < (num_sectors as usize * block_size) {
             return Err(MassStorageError::InvalidParameter);
         }
 
+        let mut lba = start_lba;
+        let mut remaining = num_sectors;
+        let mut offset = 0usize;
+
+        while remaining > 0 {
+            let chunk = remaining.min(Self::MAX_SECTORS_PER_CMD);
+            self.read_sectors_with_retry(
+                controller,
+                lba,
+                chunk,
+                &mut buffer[offset..offset + chunk as usize * block_size],
+            )?;
+
+            lba += chunk as u64;
+            remaining -= chunk;
+            offset += chunk as usize * block_size;
+        }
+
+        Ok(())
+    }
+
+    /// Read a chunk of sectors with retry logic
+    fn read_sectors_with_retry(
+        &mut self,
+        controller: &mut dyn UsbController,
+        lba: u64,
+        count: u32,
+        buffer: &mut [u8],
+    ) -> Result<(), MassStorageError> {
         let mut last_error = MassStorageError::NotReady;
 
         for attempt in 0..=Self::MAX_READ_RETRIES {
             // Use READ(10) for small LBAs, READ(16) for large
-            let result = if start_lba + num_sectors as u64 <= 0xFFFFFFFF {
-                self.read_10(controller, start_lba as u32, num_sectors as u16, buffer)
+            let result = if lba + count as u64 <= 0xFFFFFFFF {
+                self.read_10(controller, lba as u32, count as u16, buffer)
             } else {
-                self.read_16(controller, start_lba, num_sectors, buffer)
+                self.read_16(controller, lba, count, buffer)
             };
 
             match result {
@@ -674,8 +715,9 @@ impl UsbMassStorage {
                 Err(e) => {
                     if attempt < Self::MAX_READ_RETRIES {
                         log::debug!(
-                            "USB mass storage: read LBA {} failed (attempt {}/{}): {:?}, retrying",
-                            start_lba,
+                            "USB mass storage: read LBA {} ({} sectors) failed (attempt {}/{}): {:?}, retrying",
+                            lba,
+                            count,
                             attempt + 1,
                             Self::MAX_READ_RETRIES + 1,
                             e
@@ -684,8 +726,9 @@ impl UsbMassStorage {
                         time::delay_ms(10);
                     } else {
                         log::error!(
-                            "USB mass storage: read LBA {} failed after {} attempts: {:?}",
-                            start_lba,
+                            "USB mass storage: read LBA {} ({} sectors) failed after {} attempts: {:?}",
+                            lba,
+                            count,
                             Self::MAX_READ_RETRIES + 1,
                             e
                         );
@@ -1008,10 +1051,11 @@ pub fn get_global_device() -> Option<&'static mut UsbMassStorage> {
         .map(|state| unsafe { &mut *state.device_ptr })
 }
 
-/// Read a sector from the global USB device
+/// Read sectors from the global USB device
 ///
 /// This function can be used as the read callback for the SimpleFileSystem protocol.
 /// It uses the stored controller pointer directly to avoid lock contention.
+/// Supports reading multiple sectors in a single SCSI command for performance.
 pub fn global_read_sector(lba: u64, buffer: &mut [u8]) -> Result<(), ()> {
     log::trace!("USB mass storage: read LBA {}", lba);
 
@@ -1032,11 +1076,16 @@ pub fn global_read_sector(lba: u64, buffer: &mut [u8]) -> Result<(), ()> {
     let device = unsafe { &mut *device_ptr };
     let controller = unsafe { &mut *controller_ptr };
 
-    let result = device.read_sectors_generic(controller, lba, 1, buffer);
+    // Calculate how many sectors the buffer can hold
+    let block_size = device.block_size as usize;
+    let num_sectors = buffer.len().checked_div(block_size).unwrap_or(1).max(1) as u32;
+
+    let result = device.read_sectors_generic(controller, lba, num_sectors, buffer);
     if let Err(ref e) = result {
         log::error!(
-            "USB mass storage: read failed at LBA {} via {}: {:?}",
+            "USB mass storage: read failed at LBA {} ({} sectors) via {}: {:?}",
             lba,
+            num_sectors,
             controller.controller_type(),
             e
         );

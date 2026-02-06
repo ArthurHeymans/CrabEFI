@@ -1015,13 +1015,18 @@ impl SdhciController {
         Ok(())
     }
 
-    /// Read a single sector (convenience method)
+    /// Read one or more sectors into a buffer
+    ///
+    /// The number of sectors to read is inferred from the buffer size.
+    /// If the buffer is larger than one sector, multiple sectors are read
+    /// in a single operation for performance.
     pub fn read_sector(&mut self, lba: u64, buffer: &mut [u8]) -> Result<(), SdhciError> {
         if buffer.len() < SD_BLOCK_SIZE as usize {
             return Err(SdhciError::InvalidParameter);
         }
 
-        self.read_sectors(lba, 1, buffer.as_mut_ptr())
+        let num_sectors = (buffer.len() / SD_BLOCK_SIZE as usize).max(1) as u32;
+        self.read_sectors(lba, num_sectors, buffer.as_mut_ptr())
     }
 
     /// Get the number of blocks on the card
