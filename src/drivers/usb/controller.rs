@@ -714,6 +714,8 @@ pub struct DeviceInfo {
     pub device_class: u8,
     /// Is this a mass storage device?
     pub is_mass_storage: bool,
+    /// Mass storage interface number (for BOT reset recovery)
+    pub mass_storage_interface: u8,
     /// Is this a HID device?
     pub is_hid: bool,
     /// Is this a keyboard?
@@ -745,6 +747,8 @@ pub struct UsbDevice {
     pub config_info: ConfigurationInfo,
     /// Is mass storage device
     pub is_mass_storage: bool,
+    /// Mass storage interface number (for BOT reset recovery)
+    pub mass_storage_interface: u8,
     /// Is HID keyboard
     pub is_hid_keyboard: bool,
     /// Is USB hub
@@ -779,6 +783,7 @@ impl UsbDevice {
             device_desc: DeviceDescriptor::default(),
             config_info: ConfigurationInfo::default(),
             is_mass_storage: false,
+            mass_storage_interface: 0,
             is_hid_keyboard: false,
             is_hub: false,
             num_hub_ports: 0,
@@ -810,6 +815,7 @@ impl UsbDevice {
             product_id: self.device_desc.product_id,
             device_class: self.device_desc.device_class,
             is_mass_storage: self.is_mass_storage,
+            mass_storage_interface: self.mass_storage_interface,
             is_hid: self.is_hid_keyboard,
             is_keyboard: self.is_hid_keyboard,
             is_hub: self.is_hub,
@@ -1206,9 +1212,10 @@ where
     for iface in &device.config_info.interfaces[..device.config_info.num_interfaces] {
         if iface.is_mass_storage() {
             device.is_mass_storage = true;
+            device.mass_storage_interface = iface.interface_number;
             device.bulk_in = iface.find_bulk_in().cloned();
             device.bulk_out = iface.find_bulk_out().cloned();
-            log::info!("    Mass Storage interface");
+            log::info!("    Mass Storage interface {}", iface.interface_number);
         } else if iface.is_hid_keyboard() {
             device.is_hid_keyboard = true;
             device.interrupt_in = iface.find_interrupt_in().cloned();

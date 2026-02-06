@@ -45,9 +45,11 @@ use super::xhci_regs::{
     PORTSC_SPEED_MASK,
     PORTSC_WPR,
     PORTSC_WRC,
+    TRB_CC_BABBLE_DETECTED,
     TRB_CC_SHORT_PACKET,
     TRB_CC_STALL_ERROR,
     TRB_CC_SUCCESS,
+    TRB_CC_USB_TRANSACTION_ERROR,
     // TRB types
     TRB_TYPE_ADDRESS_DEVICE,
     TRB_TYPE_COMMAND_COMPLETION,
@@ -387,6 +389,8 @@ pub struct UsbSlot {
     pub speed: u8,
     /// Is this a mass storage device?
     pub is_mass_storage: bool,
+    /// Mass storage interface number (for BOT reset recovery)
+    pub mass_storage_interface: u8,
     /// Bulk IN endpoint
     pub bulk_in_ep: u8,
     /// Bulk OUT endpoint
@@ -1297,6 +1301,7 @@ impl XhciController {
             port,
             speed,
             is_mass_storage: false,
+            mass_storage_interface: 0,
             bulk_in_ep: 0,
             bulk_out_ep: 0,
             bulk_max_packet: 0,
@@ -1732,6 +1737,7 @@ impl XhciController {
         let mut bulk_in = 0u8;
         let mut bulk_out = 0u8;
         let mut bulk_max_packet = 0u16;
+        let mut ms_interface_number = 0u8;
         let mut found = false;
 
         for iface in &config_info.interfaces[..config_info.num_interfaces] {
@@ -1740,6 +1746,7 @@ impl XhciController {
                     "  Found USB Mass Storage interface {}",
                     iface.interface_number
                 );
+                ms_interface_number = iface.interface_number;
 
                 if let Some(ep) = iface.find_bulk_in() {
                     bulk_in = ep.number;
@@ -1780,6 +1787,7 @@ impl XhciController {
             .and_then(|s| s.as_mut())
         {
             slot.is_mass_storage = true;
+            slot.mass_storage_interface = ms_interface_number;
             slot.bulk_in_ep = bulk_in;
             slot.bulk_out_ep = bulk_out;
             slot.bulk_max_packet = bulk_max_packet;
@@ -2021,6 +2029,28 @@ impl XhciController {
                     log::warn!("xHCI: Failed to reset endpoint after stall: {:?}", e);
                 }
                 Err(XhciError::StallError)
+            }
+            Err(XhciError::TransferFailed(cc))
+                if cc == TRB_CC_BABBLE_DETECTED || cc == TRB_CC_USB_TRANSACTION_ERROR =>
+            {
+                // Babble and transaction errors halt bulk endpoints (xHCI spec 4.8.3).
+                // Recovery is the same as for stalls: Reset Endpoint + Set TR Dequeue Pointer.
+                // Both EDK2 (XhcRecoverHaltedEndpoint) and Linux (xhci_handle_halted_endpoint
+                // with EP_HARD_RESET) perform identical recovery for these errors.
+                log::debug!(
+                    "xHCI: Bulk transfer failed with {} on slot={} dci={}, resetting endpoint",
+                    trb_cc_name(cc),
+                    slot_id,
+                    dci
+                );
+                if let Err(e) = self.reset_endpoint(slot_id, dci as u8) {
+                    log::warn!(
+                        "xHCI: Failed to reset endpoint after {}: {:?}",
+                        trb_cc_name(cc),
+                        e
+                    );
+                }
+                Err(XhciError::TransferFailed(cc))
             }
             Err(e) => Err(e),
         }

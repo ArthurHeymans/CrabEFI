@@ -1657,6 +1657,7 @@ impl UsbController for EhciController {
             product_id: d.device_desc.product_id,
             device_class: d.device_desc.device_class,
             is_mass_storage: d.is_mass_storage,
+            mass_storage_interface: d.mass_storage_interface,
             is_hid: d.is_hid_keyboard,
             is_keyboard: d.is_hid_keyboard,
             is_hub: d.is_hub,

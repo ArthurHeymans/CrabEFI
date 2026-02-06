@@ -117,6 +117,8 @@ pub struct UsbMassStorage {
     /// Maximum packet size (kept for hardware completeness)
     #[allow(dead_code)]
     max_packet: u16,
+    /// USB interface number for BOT reset recovery
+    interface_number: u8,
     /// LUN
     lun: u8,
     /// Command tag counter
@@ -183,6 +185,7 @@ impl UsbMassStorage {
             bulk_in: bulk_in_ep.number,
             bulk_out: bulk_out_ep.number,
             max_packet: bulk_in_ep.max_packet_size,
+            interface_number: device_info.mass_storage_interface,
             lun: 0,
             tag: 1,
             num_blocks: 0,
@@ -282,7 +285,92 @@ impl UsbMassStorage {
         tag
     }
 
-    /// Send a SCSI command (generic version for any UsbController)
+    /// Perform a Bulk-Only Transport (BOT) Reset Recovery.
+    ///
+    /// Per USB Mass Storage Class Bulk-Only Transport spec section 5.3.4:
+    /// 1. Send class-specific Bulk-Only Mass Storage Reset (bRequest=0xFF)
+    /// 2. Clear HALT on Bulk-In endpoint
+    /// 3. Clear HALT on Bulk-Out endpoint
+    ///
+    /// This is the same sequence used by EDK2 (UsbBotResetDevice) and
+    /// Linux (usb_stor_Bulk_reset + usb_stor_reset_common).
+    fn bot_reset_recovery(&mut self, controller: &mut dyn UsbController) {
+        log::debug!("USB BOT: Performing reset recovery");
+
+        // Step 1: Send class-specific Bulk-Only Mass Storage Reset
+        // bmRequestType=0x21 (class, interface), bRequest=0xFF, wValue=0, wIndex=interface
+        let result = controller.control_transfer(
+            self.device_addr,
+            0x21,                         // Class request, Host-to-Device, Interface
+            0xFF,                         // Bulk-Only Mass Storage Reset
+            0,                            // wValue
+            self.interface_number as u16, // wIndex = interface number
+            None,                         // No data
+        );
+        if let Err(e) = result {
+            log::warn!("USB BOT: Mass Storage Reset request failed: {:?}", e);
+            // Continue with clear halts anyway
+        }
+
+        // Step 2: Wait for device recovery (EDK2 uses 100ms, Linux uses 6 seconds)
+        time::delay_ms(100);
+
+        // Step 3: Clear HALT on Bulk-In endpoint
+        // CLEAR_FEATURE(ENDPOINT_HALT): bmRequestType=0x02, bRequest=0x01, wValue=0, wIndex=endpoint
+        let bulk_in_addr = self.bulk_in | 0x80; // IN endpoint address
+        let result = controller.control_transfer(
+            self.device_addr,
+            0x02, // Standard request, Host-to-Device, Endpoint
+            0x01, // CLEAR_FEATURE
+            0,    // ENDPOINT_HALT feature selector
+            bulk_in_addr as u16,
+            None,
+        );
+        if let Err(e) = result {
+            log::warn!("USB BOT: Clear Bulk-In halt failed: {:?}", e);
+        }
+
+        // Step 4: Clear HALT on Bulk-Out endpoint
+        let result = controller.control_transfer(
+            self.device_addr,
+            0x02, // Standard request, Host-to-Device, Endpoint
+            0x01, // CLEAR_FEATURE
+            0,    // ENDPOINT_HALT feature selector
+            self.bulk_out as u16,
+            None,
+        );
+        if let Err(e) = result {
+            log::warn!("USB BOT: Clear Bulk-Out halt failed: {:?}", e);
+        }
+
+        log::debug!("USB BOT: Reset recovery complete");
+    }
+
+    /// Clear a stalled endpoint by sending CLEAR_FEATURE(ENDPOINT_HALT).
+    ///
+    /// Per EDK2's UsbBotDataTransfer: on a data phase stall, clear the
+    /// stalled endpoint before attempting to read the CSW.
+    fn clear_endpoint_halt(&self, controller: &mut dyn UsbController, endpoint: u8, is_in: bool) {
+        let ep_addr = if is_in { endpoint | 0x80 } else { endpoint };
+        log::debug!("USB BOT: Clearing halt on endpoint {:#x}", ep_addr);
+        let _ = controller.control_transfer(
+            self.device_addr,
+            0x02, // Standard, Host-to-Device, Endpoint
+            0x01, // CLEAR_FEATURE
+            0,    // ENDPOINT_HALT
+            ep_addr as u16,
+            None,
+        );
+    }
+
+    /// Send a SCSI command using the Bulk-Only Transport protocol.
+    ///
+    /// Implements the three-phase BOT protocol (CBW → Data → CSW) with
+    /// proper error recovery modeled after EDK2's UsbBotExecCommand:
+    /// - Data phase errors do NOT prevent the CSW read (the spec requires
+    ///   the host to always attempt to receive the CSW)
+    /// - Stalled data endpoints are cleared before reading CSW
+    /// - Phase errors and invalid CSW trigger BOT Reset Recovery
     fn scsi_command(
         &mut self,
         controller: &mut dyn UsbController,
@@ -313,7 +401,7 @@ impl UsbMassStorage {
             if is_read { "IN" } else { "OUT" }
         );
 
-        // Send CBW (OUT)
+        // Phase 1: Send CBW (OUT)
         let cbw_bytes = unsafe { core::slice::from_raw_parts(&cbw as *const _ as *const u8, 31) };
         let mut cbw_buf = [0u8; 31];
         cbw_buf.copy_from_slice(cbw_bytes);
@@ -322,10 +410,17 @@ impl UsbMassStorage {
             controller.bulk_transfer(self.device_addr, self.bulk_out, false, &mut cbw_buf)
         {
             log::debug!("USB SCSI: CBW transfer failed: {:?}", e);
+            if matches!(e, UsbError::Stall) {
+                // Per BOT spec 5.3.1: Bulk-Out stall on CBW requires Reset Recovery
+                self.bot_reset_recovery(controller);
+            }
             return Err(MassStorageError::Usb(e));
         }
 
-        // Data phase (if any)
+        // Phase 2: Data transfer (if any)
+        // Per EDK2 and the BOT spec: even if the data phase fails, we MUST
+        // attempt to read the CSW. The device may have a CSW ready regardless.
+        let mut data_phase_error: Option<UsbError> = None;
         let transferred = if let Some(buf) = data {
             match controller.bulk_transfer(
                 self.device_addr,
@@ -336,19 +431,47 @@ impl UsbMassStorage {
                 Ok(n) => n,
                 Err(e) => {
                     log::debug!("USB SCSI: Data phase failed: {:?}", e);
-                    return Err(MassStorageError::Usb(e));
+                    if matches!(e, UsbError::Stall) {
+                        // Per EDK2's UsbBotDataTransfer: clear the stalled endpoint
+                        let ep = if is_read { self.bulk_in } else { self.bulk_out };
+                        self.clear_endpoint_halt(controller, ep, is_read);
+                    } else if matches!(e, UsbError::Timeout) {
+                        // Per EDK2: timeout during data phase triggers full reset
+                        self.bot_reset_recovery(controller);
+                        return Err(MassStorageError::Usb(e));
+                    }
+                    // For babble and transaction errors: continue to CSW phase
+                    // (the xHCI layer has already recovered the halted endpoint)
+                    data_phase_error = Some(e);
+                    0
                 }
             }
         } else {
             0
         };
 
-        // Receive CSW (IN)
+        // Phase 3: Receive CSW (IN) — always attempted per BOT spec
         let mut csw_buf = [0u8; 13];
-        if let Err(e) = controller.bulk_transfer(self.device_addr, self.bulk_in, true, &mut csw_buf)
-        {
+        let csw_result =
+            controller.bulk_transfer(self.device_addr, self.bulk_in, true, &mut csw_buf);
+
+        // Handle CSW transfer errors with retry (like EDK2's 3-retry loop)
+        let csw_result = match csw_result {
+            Ok(n) => Ok(n),
+            Err(UsbError::Stall) => {
+                // Per EDK2: clear the stall and retry CSW once
+                self.clear_endpoint_halt(controller, self.bulk_in, true);
+                controller.bulk_transfer(self.device_addr, self.bulk_in, true, &mut csw_buf)
+            }
+            Err(e) => Err(e),
+        };
+
+        if let Err(e) = csw_result {
             log::debug!("USB SCSI: CSW transfer failed: {:?}", e);
-            return Err(MassStorageError::Usb(e));
+            // CSW transfer failed even after retry — perform full reset recovery
+            self.bot_reset_recovery(controller);
+            // Return the original data phase error if there was one
+            return Err(MassStorageError::Usb(data_phase_error.unwrap_or(e)));
         }
 
         // Parse CSW using zerocopy
@@ -370,13 +493,15 @@ impl UsbMassStorage {
             csw_stat
         );
 
-        // Verify CSW
+        // Verify CSW signature
         if csw_sig != CSW_SIGNATURE {
             log::debug!(
                 "USB SCSI: Invalid CSW signature {:#x} (expected {:#x})",
                 csw_sig,
                 CSW_SIGNATURE
             );
+            // Invalid CSW requires Reset Recovery per BOT spec
+            self.bot_reset_recovery(controller);
             return Err(MassStorageError::InvalidCsw);
         }
 
@@ -386,7 +511,19 @@ impl UsbMassStorage {
                 csw_tag,
                 cbw_tag
             );
+            self.bot_reset_recovery(controller);
             return Err(MassStorageError::InvalidCsw);
+        }
+
+        // If the data phase had an error, report it even if CSW says success
+        // (like Linux's fake_sense approach for babble)
+        if let Some(e) = data_phase_error {
+            log::debug!(
+                "USB SCSI: Data phase error {:?}, CSW status={}",
+                e,
+                csw_stat
+            );
+            return Err(MassStorageError::Usb(e));
         }
 
         match csw_stat {
@@ -397,10 +534,13 @@ impl UsbMassStorage {
             }
             csw_status::PHASE_ERROR => {
                 log::debug!("USB SCSI: Phase error for command {:#04x}", cdb[0]);
+                // Phase error requires Reset Recovery per BOT spec
+                self.bot_reset_recovery(controller);
                 Err(MassStorageError::PhaseError)
             }
             _ => {
                 log::debug!("USB SCSI: Unknown CSW status {}", csw_stat);
+                self.bot_reset_recovery(controller);
                 Err(MassStorageError::InvalidCsw)
             }
         }
@@ -494,7 +634,20 @@ impl UsbMassStorage {
         Ok(())
     }
 
-    /// Read sectors from the device (generic version)
+    /// Maximum number of retries for failed SCSI read commands.
+    ///
+    /// EDK2 uses 5 retries (USB_BOOT_COMMAND_RETRY) with a 60-second overall
+    /// timeout. We use 3 retries since we're a firmware bootloader and don't
+    /// want to stall too long.
+    const MAX_READ_RETRIES: u32 = 3;
+
+    /// Read sectors from the device with retry logic.
+    ///
+    /// Retries all failed reads up to MAX_READ_RETRIES times. Inspired by
+    /// EDK2's UsbBootExecCmdWithRetry which retries up to 5 times with a
+    /// 60-second overall timeout. Our BOT-level error recovery (endpoint
+    /// halt clearing, CSW draining, BOT reset) happens inside `scsi_command`,
+    /// so by the time we retry here the device should be in a clean state.
     pub fn read_sectors_generic(
         &mut self,
         controller: &mut dyn UsbController,
@@ -506,12 +659,43 @@ impl UsbMassStorage {
             return Err(MassStorageError::InvalidParameter);
         }
 
-        // Use READ(10) for small LBAs, READ(16) for large
-        if start_lba + num_sectors as u64 <= 0xFFFFFFFF {
-            self.read_10(controller, start_lba as u32, num_sectors as u16, buffer)
-        } else {
-            self.read_16(controller, start_lba, num_sectors, buffer)
+        let mut last_error = MassStorageError::NotReady;
+
+        for attempt in 0..=Self::MAX_READ_RETRIES {
+            // Use READ(10) for small LBAs, READ(16) for large
+            let result = if start_lba + num_sectors as u64 <= 0xFFFFFFFF {
+                self.read_10(controller, start_lba as u32, num_sectors as u16, buffer)
+            } else {
+                self.read_16(controller, start_lba, num_sectors, buffer)
+            };
+
+            match result {
+                Ok(()) => return Ok(()),
+                Err(e) => {
+                    if attempt < Self::MAX_READ_RETRIES {
+                        log::debug!(
+                            "USB mass storage: read LBA {} failed (attempt {}/{}): {:?}, retrying",
+                            start_lba,
+                            attempt + 1,
+                            Self::MAX_READ_RETRIES + 1,
+                            e
+                        );
+                        // Brief delay before retry to let the device recover
+                        time::delay_ms(10);
+                    } else {
+                        log::error!(
+                            "USB mass storage: read LBA {} failed after {} attempts: {:?}",
+                            start_lba,
+                            Self::MAX_READ_RETRIES + 1,
+                            e
+                        );
+                    }
+                    last_error = e;
+                }
+            }
         }
+
+        Err(last_error)
     }
 
     // Note: read_sectors() was removed - use read_sectors_generic() instead

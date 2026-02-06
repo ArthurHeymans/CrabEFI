@@ -425,6 +425,9 @@ impl UsbController for XhciController {
             XhciError::Timeout => self::controller::UsbError::Timeout,
             XhciError::StallError => self::controller::UsbError::Stall,
             XhciError::DeviceNotFound => self::controller::UsbError::DeviceNotFound,
+            XhciError::TransferFailed(cc) if cc == xhci_regs::TRB_CC_BABBLE_DETECTED => {
+                self::controller::UsbError::Babble
+            }
             _ => self::controller::UsbError::TransactionError,
         })
     }
@@ -441,6 +444,9 @@ impl UsbController for XhciController {
             XhciError::Timeout => self::controller::UsbError::Timeout,
             XhciError::StallError => self::controller::UsbError::Stall,
             XhciError::DeviceNotFound => self::controller::UsbError::DeviceNotFound,
+            XhciError::TransferFailed(cc) if cc == xhci_regs::TRB_CC_BABBLE_DETECTED => {
+                self::controller::UsbError::Babble
+            }
             _ => self::controller::UsbError::TransactionError,
         })
     }
@@ -486,6 +492,7 @@ impl UsbController for XhciController {
             product_id: slot.device_desc.product_id,
             device_class: slot.device_desc.device_class,
             is_mass_storage: slot.is_mass_storage,
+            mass_storage_interface: slot.mass_storage_interface,
             is_hid: slot.is_hid_keyboard || slot.device_desc.device_class == 0x03,
             is_keyboard: slot.is_hid_keyboard,
             is_hub: slot.device_desc.device_class == 0x09,
