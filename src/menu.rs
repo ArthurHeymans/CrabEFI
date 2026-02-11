@@ -530,43 +530,48 @@ fn discover_ahci_entries(menu: &mut BootMenu) {
                         let controller = unsafe { &mut *controller_ptr };
                         let mut disk = AhciDisk::new(controller, port_index);
                         if let Ok(efi_image) = iso9660::find_efi_boot_image(&mut disk) {
-                            // Create a synthetic partition for the El Torito boot image
-                            let block_size = disk.info().block_size;
-                            let partition = gpt::Partition {
-                                type_guid: [0u8; 16], // Not a real GUID
-                                partition_guid: [0u8; 16],
-                                first_lba: efi_image.start_sector,
-                                last_lba: efi_image.start_sector + efi_image.sector_count as u64
-                                    - 1,
-                                attributes: 0,
-                                is_esp: true, // Treat it as ESP
-                                block_size,
-                            };
+                            if efi_image.sector_count == 0 {
+                                log::warn!("El Torito: EFI image has unknown size, skipping");
+                            } else {
+                                // Create a synthetic partition for the El Torito boot image
+                                let block_size = disk.info().block_size;
+                                let partition = gpt::Partition {
+                                    type_guid: [0u8; 16], // Not a real GUID
+                                    partition_guid: [0u8; 16],
+                                    first_lba: efi_image.start_sector,
+                                    last_lba: efi_image.start_sector
+                                        + efi_image.sector_count as u64
+                                        - 1,
+                                    attributes: 0,
+                                    is_esp: true, // Treat it as ESP
+                                    block_size,
+                                };
 
-                            // Check if the boot image contains BOOTX64.EFI
-                            if let Some(controller_ptr) = ahci::get_controller(0) {
-                                // Safety: pointer valid for firmware lifetime; no overlapping &mut created
-                                let controller = unsafe { &mut *controller_ptr };
-                                let mut disk = AhciDisk::new(controller, port_index);
-                                if check_bootloader_exists(&mut disk, efi_image.start_sector) {
-                                    let mut name: String<64> = String::new();
-                                    let _ = write!(name, "ISO Boot (SATA port {})", port_index);
+                                // Check if the boot image contains BOOTX64.EFI
+                                if let Some(controller_ptr) = ahci::get_controller(0) {
+                                    // Safety: pointer valid for firmware lifetime; no overlapping &mut created
+                                    let controller = unsafe { &mut *controller_ptr };
+                                    let mut disk = AhciDisk::new(controller, port_index);
+                                    if check_bootloader_exists(&mut disk, efi_image.start_sector) {
+                                        let mut name: String<64> = String::new();
+                                        let _ = write!(name, "ISO Boot (SATA port {})", port_index);
 
-                                    let entry = BootEntry::new(
-                                        &name,
-                                        "EFI\\BOOT\\BOOTX64.EFI",
-                                        DeviceType::Ahci {
-                                            controller_id: 0,
-                                            port: port_index,
-                                        },
-                                        0, // No partition number for El Torito
-                                        partition,
-                                        pci_addr.device,
-                                        pci_addr.function,
-                                    );
+                                        let entry = BootEntry::new(
+                                            &name,
+                                            "EFI\\BOOT\\BOOTX64.EFI",
+                                            DeviceType::Ahci {
+                                                controller_id: 0,
+                                                port: port_index,
+                                            },
+                                            0, // No partition number for El Torito
+                                            partition,
+                                            pci_addr.device,
+                                            pci_addr.function,
+                                        );
 
-                                    if !menu.add_entry(entry) {
-                                        return; // Menu full
+                                        if !menu.add_entry(entry) {
+                                            return; // Menu full
+                                        }
                                     }
                                 }
                             }

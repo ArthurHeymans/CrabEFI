@@ -284,6 +284,12 @@ pub struct EventEntry {
     pub notify_tpl: efi::Tpl,
     pub signaled: bool,
     pub is_keyboard_event: bool,
+    /// Timer type: 0 = cancelled, 1 = periodic, 2 = relative (one-shot)
+    pub timer_type: u32,
+    /// Timer period in 100-ns units (for periodic timers)
+    pub timer_period_100ns: u64,
+    /// TSC deadline for the next timer firing (0 = no timer)
+    pub timer_deadline: u64,
 }
 
 impl EventEntry {
@@ -293,6 +299,9 @@ impl EventEntry {
             notify_tpl: 0,
             signaled: false,
             is_keyboard_event: false,
+            timer_type: 0,
+            timer_period_100ns: 0,
+            timer_deadline: 0,
         }
     }
 }

@@ -16,8 +16,14 @@ use crate::efi::allocator::{MemoryType, allocate_pool};
 /// Re-export the GUID for external use
 pub const DEVICE_PATH_PROTOCOL_GUID: Guid = device_path::PROTOCOL_GUID;
 
+/// No partition signature (e.g., El Torito / synthetic partitions)
+const SIGNATURE_TYPE_NONE: u8 = 0x00;
+
 /// Signature type for GPT partitions
 const SIGNATURE_TYPE_GUID: u8 = 0x02;
+
+/// No defined partition format
+const PARTITION_FORMAT_NONE: u8 = 0x00;
 
 /// Partition format for GPT
 const PARTITION_FORMAT_GPT: u8 = 0x02;
@@ -217,6 +223,15 @@ fn create_hard_drive_node(
     partition_size: u64,
     partition_guid: &[u8; 16],
 ) -> HardDriveMedia {
+    // Use GPT signature type when we have a real partition GUID,
+    // otherwise use no signature (e.g., El Torito synthetic partitions).
+    let has_guid = partition_guid.iter().any(|&b| b != 0);
+    let (sig_type, fmt) = if has_guid {
+        (SIGNATURE_TYPE_GUID, PARTITION_FORMAT_GPT)
+    } else {
+        (SIGNATURE_TYPE_NONE, PARTITION_FORMAT_NONE)
+    };
+
     let mut node = HardDriveMedia {
         header: Protocol {
             r#type: TYPE_MEDIA,
@@ -227,8 +242,8 @@ fn create_hard_drive_node(
         partition_start,
         partition_size,
         partition_signature: [0; 16],
-        partition_format: PARTITION_FORMAT_GPT,
-        signature_type: SIGNATURE_TYPE_GUID,
+        partition_format: fmt,
+        signature_type: sig_type,
     };
     node.partition_signature.copy_from_slice(partition_guid);
     node
@@ -874,6 +889,100 @@ pub fn create_file_path_device_path(path: &str) -> *mut Protocol {
     }
 
     log::debug!("Created file path device path: {}", path);
+
+    ptr as *mut Protocol
+}
+
+/// Return the total byte length of a device path (including the End node).
+///
+/// Walks the node chain until the End-Entire node is found.
+/// Returns 0 if the pointer is null or invalid.
+fn device_path_size(dp: *const Protocol) -> usize {
+    if dp.is_null() {
+        return 0;
+    }
+    unsafe {
+        let mut p = dp as *const u8;
+        loop {
+            let node_type = *p;
+            let node_len = u16::from_le_bytes([*p.add(2), *p.add(3)]) as usize;
+            if node_len < 4 {
+                break 0;
+            }
+            if node_type == TYPE_END {
+                return (p as usize - dp as usize) + node_len;
+            }
+            p = p.add(node_len);
+        }
+    }
+}
+
+/// Create a loaded image device path by appending a file path node to a device path.
+///
+/// This is used for `EFI_LOADED_IMAGE_DEVICE_PATH_PROTOCOL`.
+/// The result is: `<device_path_nodes> / FilePath(path) / End`
+///
+/// # Arguments
+/// * `device_dp` - Device path of the device (partition) handle
+/// * `file_path` - ASCII file path (e.g. `EFI\BOOT\BOOTX64.EFI`)
+///
+/// # Returns
+/// A new device path, or null on failure
+pub fn create_loaded_image_device_path(
+    device_dp: *const Protocol,
+    file_path: &str,
+) -> *mut Protocol {
+    if device_dp.is_null() {
+        return create_file_path_device_path(file_path);
+    }
+
+    let dp_size = device_path_size(device_dp);
+    if dp_size == 0 {
+        return create_file_path_device_path(file_path);
+    }
+
+    // Size of the device path nodes WITHOUT the End node
+    let end_size = core::mem::size_of::<End>();
+    let dp_nodes_size = dp_size - end_size;
+
+    // File path node: header(4) + UCS-2 path + null terminator
+    let path_ucs2_size = (file_path.len() + 1) * 2;
+    let file_node_size = 4 + path_ucs2_size;
+
+    let total_size = dp_nodes_size + file_node_size + end_size;
+
+    let ptr = match allocate_pool(MemoryType::BootServicesData, total_size) {
+        Ok(p) => p,
+        Err(_) => return ptr::null_mut(),
+    };
+
+    unsafe {
+        // Copy device path nodes (without End)
+        ptr::copy_nonoverlapping(device_dp as *const u8, ptr, dp_nodes_size);
+
+        // Append file path node
+        let fp = ptr.add(dp_nodes_size);
+        *fp.add(0) = TYPE_MEDIA;
+        *fp.add(1) = Media::SUBTYPE_FILE_PATH;
+        let len_bytes = (file_node_size as u16).to_le_bytes();
+        *fp.add(2) = len_bytes[0];
+        *fp.add(3) = len_bytes[1];
+
+        let path_ptr = fp.add(4) as *mut u16;
+        for (i, c) in file_path.chars().enumerate() {
+            let ch = if c == '/' { '\\' } else { c };
+            *path_ptr.add(i) = ch as u16;
+        }
+        *path_ptr.add(file_path.len()) = 0;
+
+        // Append End node
+        let end = fp.add(file_node_size);
+        *end.add(0) = TYPE_END;
+        *end.add(1) = End::SUBTYPE_ENTIRE;
+        let end_len = (end_size as u16).to_le_bytes();
+        *end.add(2) = end_len[0];
+        *end.add(3) = end_len[1];
+    }
 
     ptr as *mut Protocol
 }

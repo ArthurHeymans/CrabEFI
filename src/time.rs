@@ -299,6 +299,22 @@ pub fn delay_ms(ms: u64) {
     delay_us(ms * 1000);
 }
 
+/// Return a TSC deadline value that is `us` microseconds from now.
+///
+/// Useful for storing raw deadlines in structures that cannot hold a `Timeout`.
+#[inline]
+pub fn deadline_after_us(us: u64) -> u64 {
+    let cycles = us * TSC_CYCLES_PER_US.load(Ordering::Relaxed);
+    rdtsc().wrapping_add(cycles)
+}
+
+/// Check whether a TSC deadline (from [`deadline_after_us`]) has been reached.
+#[inline]
+pub fn deadline_expired(deadline: u64) -> bool {
+    let diff = deadline.wrapping_sub(rdtsc()) as i64;
+    diff <= 0
+}
+
 /// A deadline-based timeout for polling loops
 ///
 /// # Example

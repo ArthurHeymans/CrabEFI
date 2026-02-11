@@ -422,6 +422,17 @@ fn load_and_execute_bootloader(
     use crate::display_secure_boot_error;
     use efi::allocator::{MemoryType, allocate_pool, free_pool};
     use efi::protocols::loaded_image::{LOADED_IMAGE_PROTOCOL_GUID, create_loaded_image_protocol};
+    use r_efi::efi::Guid;
+
+    /// EFI_LOADED_IMAGE_DEVICE_PATH_PROTOCOL_GUID
+    const LOADED_IMAGE_DEVICE_PATH_GUID: Guid = Guid::from_fields(
+        0xbc62157e,
+        0x3e33,
+        0x4fec,
+        0x99,
+        0x20,
+        &[0x2d, 0x3b, 0x36, 0xd7, 0x50, 0xdf],
+    );
 
     log::info!("Loading bootloader: {} ({} bytes)", path, file_size);
 
@@ -524,6 +535,31 @@ fn load_and_execute_bootloader(
     }
 
     log::info!("LoadedImageProtocol installed on handle {:?}", image_handle);
+
+    // Install EFI_LOADED_IMAGE_DEVICE_PATH_PROTOCOL
+    // This is the full device path: <partition device path> / FilePath(bootloader)
+    // Windows Boot Manager uses this to locate its boot device.
+    let device_dp =
+        boot_services::get_protocol_on_handle(device_handle, &DEVICE_PATH_PROTOCOL_GUID);
+    let loaded_image_dp = device_path::create_loaded_image_device_path(
+        device_dp as *const r_efi::protocols::device_path::Protocol,
+        path,
+    );
+    if !loaded_image_dp.is_null() {
+        let status = boot_services::install_protocol(
+            image_handle,
+            &LOADED_IMAGE_DEVICE_PATH_GUID,
+            loaded_image_dp as *mut core::ffi::c_void,
+        );
+        if status == Status::SUCCESS {
+            log::info!(
+                "LoadedImageDevicePath protocol installed on handle {:?}",
+                image_handle
+            );
+        } else {
+            log::warn!("Failed to install LoadedImageDevicePath: {:?}", status);
+        }
+    }
     if !device_handle.is_null() {
         log::info!(
             "DeviceHandle set to {:?} (with SimpleFileSystem)",
@@ -531,6 +567,9 @@ fn load_and_execute_bootloader(
         );
     }
     log::info!("Executing bootloader...");
+
+    // Recompute CRC32 checksums since we've installed new protocols/handles
+    efi::system_table::update_crc32();
 
     // Debug: verify system table integrity before execution
     unsafe {

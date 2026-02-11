@@ -86,6 +86,10 @@ pub fn init(cb_info: &CorebootInfo) {
     // Dump configuration tables for debugging
     system_table::dump_configuration_tables();
 
+    // Compute CRC32 checksums for all EFI table headers.
+    // Must be done after all configuration tables and protocols are installed.
+    system_table::update_crc32();
+
     log::info!("EFI environment initialized");
 }
 

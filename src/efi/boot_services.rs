@@ -29,6 +29,8 @@ const DEVICE_PATH_TYPE_MEDIA: u8 = device_path::TYPE_MEDIA;
 const DEVICE_PATH_SUBTYPE_FILE_PATH: u8 = Media::SUBTYPE_FILE_PATH;
 /// Device path type for End
 const DEVICE_PATH_TYPE_END: u8 = device_path::TYPE_END;
+/// Device path protocol GUID
+const DEVICE_PATH_GUID: Guid = device_path::PROTOCOL_GUID;
 
 /// Boot Services signature "BOOTSERV"
 const EFI_BOOT_SERVICES_SIGNATURE: u64 = 0x56524553544F4F42;
@@ -340,6 +342,9 @@ extern "efiapi" fn create_event(
             notify_tpl,
             signaled: false,
             is_keyboard_event: false,
+            timer_type: 0,
+            timer_period_100ns: 0,
+            timer_deadline: 0,
         };
 
         // Return the event ID as the event handle
@@ -357,16 +362,49 @@ extern "efiapi" fn set_timer(
     timer_type: efi::TimerDelay,
     trigger_time: u64,
 ) -> Status {
+    let event_id = event as usize;
     log::debug!(
-        "BS.SetTimer(event={:?}, type={}, time={})",
-        event,
+        "BS.SetTimer(event={}, type={}, time={} 100ns units)",
+        event_id,
         timer_type,
         trigger_time
     );
-    // Timer events are not fully implemented, but we accept the call
-    // to allow bootloaders to proceed
-    log::debug!("  -> SUCCESS (stubbed)");
-    Status::SUCCESS
+
+    if event_id == 0 || event_id >= MAX_EVENTS {
+        return Status::INVALID_PARAMETER;
+    }
+
+    state::with_efi_mut(|efi_state| {
+        let entry = &mut efi_state.events[event_id];
+
+        // UEFI TimerDelay: 0 = TimerCancel, 1 = TimerPeriodic, 2 = TimerRelative
+        match timer_type {
+            0 => {
+                // TimerCancel
+                entry.timer_type = 0;
+                entry.timer_deadline = 0;
+                entry.timer_period_100ns = 0;
+                entry.signaled = false;
+                log::debug!("  -> SUCCESS (timer cancelled)");
+            }
+            1 | 2 => {
+                // TimerPeriodic or TimerRelative
+                entry.timer_type = timer_type;
+                entry.timer_period_100ns = trigger_time;
+                entry.signaled = false;
+
+                // Convert 100-ns units to microseconds and set TSC deadline
+                let us = trigger_time / 10;
+                entry.timer_deadline = crate::time::deadline_after_us(us);
+                log::debug!("  -> SUCCESS ({}us deadline set)", us);
+            }
+            _ => {
+                return Status::INVALID_PARAMETER;
+            }
+        }
+
+        Status::SUCCESS
+    })
 }
 
 extern "efiapi" fn wait_for_event(
@@ -384,7 +422,6 @@ extern "efiapi" fn wait_for_event(
     let events_to_wait = unsafe { core::slice::from_raw_parts(event, number_of_events) };
 
     // Poll for events
-    // In a real implementation, we'd use proper async I/O
     loop {
         // Check each event
         for (i, &evt) in events_to_wait.iter().enumerate() {
@@ -401,8 +438,18 @@ extern "efiapi" fn wait_for_event(
                 return Status::SUCCESS;
             }
 
-            // Check if a regular event is signaled
+            // Check if event is signaled or timer has expired
             if event_id > 0 && event_id < MAX_EVENTS {
+                if check_and_fire_timer(event_id) {
+                    unsafe { *index = i };
+                    log::debug!(
+                        "  -> SUCCESS (timer fired, event={}, index={})",
+                        event_id,
+                        i
+                    );
+                    return Status::SUCCESS;
+                }
+
                 let efi_state = state::efi();
                 if efi_state.events[event_id].signaled {
                     unsafe { *index = i };
@@ -445,6 +492,40 @@ extern "efiapi" fn close_event(event: efi::Event) -> Status {
     Status::SUCCESS
 }
 
+/// Check if a timer event has reached its deadline and fire it if so.
+///
+/// Returns `true` if the timer fired (event is now signaled).
+/// For periodic timers, resets the deadline for the next period.
+fn check_and_fire_timer(event_id: usize) -> bool {
+    state::with_efi_mut(|efi_state| {
+        let entry = &mut efi_state.events[event_id];
+
+        // Only check events that have a timer set (deadline != 0)
+        if entry.timer_deadline == 0 || entry.timer_type == 0 {
+            return false;
+        }
+
+        if !crate::time::deadline_expired(entry.timer_deadline) {
+            return false; // Not yet expired
+        }
+
+        // Timer fired
+        entry.signaled = true;
+
+        if entry.timer_type == 1 {
+            // Periodic: reset deadline for next period
+            let us = entry.timer_period_100ns / 10;
+            entry.timer_deadline = crate::time::deadline_after_us(us);
+        } else {
+            // Relative (one-shot): clear timer
+            entry.timer_deadline = 0;
+            entry.timer_type = 0;
+        }
+
+        true
+    })
+}
+
 extern "efiapi" fn check_event(event: efi::Event) -> Status {
     let event_id = event as usize;
     log::debug!("BS.CheckEvent(event={})", event_id);
@@ -462,8 +543,12 @@ extern "efiapi" fn check_event(event: efi::Event) -> Status {
         }
     }
 
-    // Check regular events
+    // Check timer events
     if event_id > 0 && event_id < MAX_EVENTS {
+        if check_and_fire_timer(event_id) {
+            return Status::SUCCESS;
+        }
+
         let efi_state = state::efi();
         if efi_state.events[event_id].signaled {
             return Status::SUCCESS;
@@ -876,14 +961,13 @@ fn load_image_from_device_path(
     let path_display = core::str::from_utf8(&path_str[..str_len]).unwrap_or("<invalid>");
     log::info!("BS.LoadImage: Loading from device path: {}", path_display);
 
-    // Find a handle with SimpleFileSystem protocol
-    // TODO: This always uses the first SFS handle found. The UEFI spec requires
-    // matching the device path against handles' device paths to find the correct
-    // volume. On multi-disk systems, this could load from the wrong disk.
-    let sfs_handle = find_handle_with_protocol(&SIMPLE_FILE_SYSTEM_GUID).ok_or_else(|| {
-        log::error!("BS.LoadImage: No SimpleFileSystem handle found");
-        Status::NOT_FOUND
-    })?;
+    // Find the handle whose device path matches the non-file portion of the
+    // requested device path and that carries SimpleFileSystem.
+    let sfs_handle =
+        find_handle_with_protocol(&SIMPLE_FILE_SYSTEM_GUID, device_path).ok_or_else(|| {
+            log::error!("BS.LoadImage: No SimpleFileSystem handle found");
+            Status::NOT_FOUND
+        })?;
 
     // Get the SimpleFileSystem protocol
     let mut sfs_interface: *mut c_void = core::ptr::null_mut();
@@ -1010,10 +1094,58 @@ fn load_image_from_device_path(
     Ok((buffer as *mut c_void, read_size, sfs_handle))
 }
 
-/// Find a handle that has a specific protocol installed
-fn find_handle_with_protocol(protocol_guid: &Guid) -> Option<Handle> {
+/// Find a handle that has a specific protocol installed.
+///
+/// If `device_path_prefix` is non-null, the function tries to find a handle
+/// whose DEVICE_PATH protocol matches the non-file-path prefix of
+/// `device_path_prefix`.  Falls back to returning the first handle that
+/// carries `protocol_guid`.
+fn find_handle_with_protocol(
+    protocol_guid: &Guid,
+    device_path_prefix: *mut DevicePathProtocol,
+) -> Option<Handle> {
     let efi_state = state::efi();
 
+    // Calculate the device-path prefix length (everything before the first
+    // FilePath or End node) so we can match against installed device paths.
+    let prefix_len = device_path_node_prefix_len(device_path_prefix);
+
+    // First pass: try to match by device path prefix (most accurate)
+    if prefix_len > 0 {
+        let prefix_bytes =
+            unsafe { core::slice::from_raw_parts(device_path_prefix as *const u8, prefix_len) };
+
+        for entry in &efi_state.handles[..efi_state.handle_count] {
+            let has_target = entry.protocols[..entry.protocol_count]
+                .iter()
+                .any(|p| p.guid == *protocol_guid);
+            if !has_target {
+                continue;
+            }
+
+            for proto in &entry.protocols[..entry.protocol_count] {
+                if proto.guid == DEVICE_PATH_GUID && !proto.interface.is_null() {
+                    let handle_dp_len =
+                        device_path_total_len(proto.interface as *const DevicePathProtocol);
+                    // The handle's full device path (including End) must start with our prefix
+                    if handle_dp_len >= prefix_len {
+                        let handle_bytes = unsafe {
+                            core::slice::from_raw_parts(proto.interface as *const u8, prefix_len)
+                        };
+                        if handle_bytes == prefix_bytes {
+                            log::debug!(
+                                "  LoadImage: matched device path on handle {:?}",
+                                entry.handle
+                            );
+                            return Some(entry.handle);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Fallback: return the first handle with the requested protocol
     for entry in &efi_state.handles[..efi_state.handle_count] {
         for proto in &entry.protocols[..entry.protocol_count] {
             if proto.guid == *protocol_guid {
@@ -1023,6 +1155,58 @@ fn find_handle_with_protocol(protocol_guid: &Guid) -> Option<Handle> {
     }
 
     None
+}
+
+/// Return the byte length of all nodes before the first FilePath or End node.
+///
+/// This gives us the "device portion" of a full device path that ends with
+/// `FilePath(…)/End`.
+fn device_path_node_prefix_len(dp: *mut DevicePathProtocol) -> usize {
+    if dp.is_null() {
+        return 0;
+    }
+    unsafe {
+        let base = dp as *const u8;
+        let mut p = base;
+        loop {
+            let node_type = *p;
+            let node_len = u16::from_le_bytes([*p.add(2), *p.add(3)]) as usize;
+            if node_len < 4 {
+                break;
+            }
+            // Stop before FilePath or End nodes
+            if node_type == DEVICE_PATH_TYPE_END
+                || (node_type == DEVICE_PATH_TYPE_MEDIA
+                    && *p.add(1) == DEVICE_PATH_SUBTYPE_FILE_PATH)
+            {
+                return p as usize - base as usize;
+            }
+            p = p.add(node_len);
+        }
+    }
+    0
+}
+
+/// Return the total byte length of a device path, **including** the End node.
+fn device_path_total_len(dp: *const DevicePathProtocol) -> usize {
+    if dp.is_null() {
+        return 0;
+    }
+    unsafe {
+        let base = dp as *const u8;
+        let mut p = base;
+        loop {
+            let node_type = *p;
+            let node_len = u16::from_le_bytes([*p.add(2), *p.add(3)]) as usize;
+            if node_len < 4 {
+                return p as usize - base as usize;
+            }
+            if node_type == DEVICE_PATH_TYPE_END {
+                return (p as usize - base as usize) + node_len;
+            }
+            p = p.add(node_len);
+        }
+    }
 }
 
 extern "efiapi" fn load_image(
@@ -2382,4 +2566,24 @@ pub fn install_protocol(handle: Handle, guid: &Guid, interface: *mut c_void) -> 
 
         Status::INVALID_PARAMETER
     })
+}
+
+/// Look up a protocol interface on a handle (internal helper).
+///
+/// Returns the interface pointer, or null if not found.
+pub fn get_protocol_on_handle(handle: Handle, guid: &Guid) -> *mut c_void {
+    let efi_state = state::efi();
+
+    for entry in &efi_state.handles[..efi_state.handle_count] {
+        if entry.handle == handle {
+            for proto in &entry.protocols[..entry.protocol_count] {
+                if proto.guid == *guid {
+                    return proto.interface;
+                }
+            }
+            break;
+        }
+    }
+
+    core::ptr::null_mut()
 }

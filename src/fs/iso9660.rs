@@ -96,6 +96,80 @@ impl From<BlockError> for IsoError {
     }
 }
 
+/// Read the FAT BPB from the start of a boot image to determine its actual size.
+///
+/// El Torito `sector_count` is often 0 or 1 for EFI images (meaning "entire image").
+/// The real size must be determined from the embedded FAT filesystem's BPB.
+///
+/// # Arguments
+/// * `device` - Block device to read from
+/// * `image_start_device_block` - Start of the boot image in device blocks
+///
+/// # Returns
+/// The image size in bytes, or `None` if the BPB couldn't be read/parsed.
+fn probe_fat_image_size(
+    device: &mut dyn BlockDevice,
+    image_start_device_block: u64,
+) -> Option<u64> {
+    let block_size = device.info().block_size as usize;
+    let mut buf = [0u8; ISO_SECTOR_SIZE];
+
+    // Read enough to cover the BPB (first 512 bytes minimum)
+    if block_size <= ISO_SECTOR_SIZE {
+        let blocks_needed = ISO_SECTOR_SIZE / block_size;
+        for i in 0..blocks_needed {
+            let offset = i * block_size;
+            if device
+                .read_block(
+                    image_start_device_block + i as u64,
+                    &mut buf[offset..offset + block_size],
+                )
+                .is_err()
+            {
+                return None;
+            }
+        }
+    } else {
+        let mut big_buf = [0u8; 4096];
+        if device
+            .read_block(image_start_device_block, &mut big_buf[..block_size])
+            .is_err()
+        {
+            return None;
+        }
+        buf.copy_from_slice(&big_buf[..ISO_SECTOR_SIZE]);
+    }
+
+    // Parse BPB fields directly (bytes_per_sector at offset 11, total_sectors_16 at 19, total_sectors_32 at 32)
+    let bytes_per_sector = u16::from_le_bytes([buf[11], buf[12]]) as u64;
+    let total_sectors_16 = u16::from_le_bytes([buf[19], buf[20]]) as u64;
+    let total_sectors_32 = u32::from_le_bytes([buf[32], buf[33], buf[34], buf[35]]) as u64;
+
+    // Sanity check
+    if bytes_per_sector == 0 || (bytes_per_sector & (bytes_per_sector - 1)) != 0 {
+        return None;
+    }
+
+    let total_sectors = if total_sectors_16 != 0 {
+        total_sectors_16
+    } else {
+        total_sectors_32
+    };
+
+    if total_sectors == 0 {
+        return None;
+    }
+
+    let size = total_sectors * bytes_per_sector;
+    log::debug!(
+        "El Torito: FAT BPB probe: {} sectors x {} bytes = {} bytes",
+        total_sectors,
+        bytes_per_sector,
+        size
+    );
+    Some(size)
+}
+
 /// Check if a device contains an ISO9660 image with El Torito EFI boot support
 ///
 /// Returns the EFI boot image location if found.
@@ -187,11 +261,13 @@ pub fn find_efi_boot_image(device: &mut dyn BlockDevice) -> Result<EfiBootImage,
             sector_count
         );
 
-        return Ok(EfiBootImage {
-            start_sector: load_rba as u64 * sectors_per_iso_sector as u64,
-            sector_count: sector_count * sectors_per_iso_sector as u32,
-            size_bytes: sector_count as u64 * ISO_SECTOR_SIZE as u64,
-        });
+        return Ok(build_efi_boot_image(
+            device,
+            load_rba,
+            sector_count,
+            sectors_per_iso_sector,
+            block_size,
+        ));
     }
 
     // Scan section entries for EFI platform
@@ -237,21 +313,13 @@ pub fn find_efi_boot_image(device: &mut dyn BlockDevice) -> Result<EfiBootImage,
                     sector_count
                 );
 
-                // For EFI images, sector_count might be 1 or 0, meaning "rest of image"
-                // We'll need to determine the actual size from the FAT BPB
-                return Ok(EfiBootImage {
-                    start_sector: load_rba as u64 * sectors_per_iso_sector as u64,
-                    sector_count: if sector_count > 0 {
-                        sector_count * sectors_per_iso_sector as u32
-                    } else {
-                        0
-                    },
-                    size_bytes: if sector_count > 0 {
-                        sector_count as u64 * ISO_SECTOR_SIZE as u64
-                    } else {
-                        0
-                    },
-                });
+                return Ok(build_efi_boot_image(
+                    device,
+                    load_rba,
+                    sector_count,
+                    sectors_per_iso_sector,
+                    block_size,
+                ));
             }
 
             offset += 32;
@@ -265,6 +333,61 @@ pub fn find_efi_boot_image(device: &mut dyn BlockDevice) -> Result<EfiBootImage,
 
     log::debug!("El Torito: No EFI boot entry found");
     Err(IsoError::NoEfiEntry)
+}
+
+/// Build an [`EfiBootImage`] from El Torito catalog fields.
+///
+/// When the catalog's `sector_count` is 0 or 1, the El Torito spec says the
+/// entry covers "the entire image" — the actual size must be determined by
+/// probing the FAT BPB at the start of the boot image.
+fn build_efi_boot_image(
+    device: &mut dyn BlockDevice,
+    load_rba: u32,
+    sector_count: u32,
+    sectors_per_iso_sector: usize,
+    block_size: usize,
+) -> EfiBootImage {
+    let start_device_block = load_rba as u64 * sectors_per_iso_sector as u64;
+
+    if sector_count > 1 {
+        // Catalog gives a trustworthy size
+        return EfiBootImage {
+            start_sector: start_device_block,
+            sector_count: sector_count * sectors_per_iso_sector as u32,
+            size_bytes: sector_count as u64 * ISO_SECTOR_SIZE as u64,
+        };
+    }
+
+    // sector_count is 0 or 1 — probe the embedded FAT image for its real size
+    if let Some(size_bytes) = probe_fat_image_size(device, start_device_block) {
+        // Round up to whole device blocks
+        let device_blocks = size_bytes.div_ceil(block_size as u64);
+        log::info!(
+            "El Torito: probed FAT image size = {} bytes ({} device blocks)",
+            size_bytes,
+            device_blocks
+        );
+        return EfiBootImage {
+            start_sector: start_device_block,
+            sector_count: device_blocks as u32,
+            size_bytes,
+        };
+    }
+
+    // Couldn't probe — fall back to the catalog value (best effort)
+    log::warn!(
+        "El Torito: could not probe FAT image size, using catalog sector_count={}",
+        sector_count
+    );
+    EfiBootImage {
+        start_sector: start_device_block,
+        sector_count: if sector_count > 0 {
+            sector_count * sectors_per_iso_sector as u32
+        } else {
+            0
+        },
+        size_bytes: sector_count as u64 * ISO_SECTOR_SIZE as u64,
+    }
 }
 
 /// Check if a device looks like an ISO9660 image

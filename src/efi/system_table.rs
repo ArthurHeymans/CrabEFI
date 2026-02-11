@@ -899,13 +899,53 @@ pub fn install_smbios_tables(smbios_addr: u64) {
     }
 }
 
-/// Update the system table CRC32
-pub fn update_crc32() {
-    // For now, we leave CRC32 as 0
-    // A proper implementation would calculate CRC32 of the table
-    unsafe {
-        SYSTEM_TABLE.hdr.crc32 = 0;
+/// Compute CRC32 (ISO 3309 / UEFI spec) for a byte slice
+fn compute_crc32(data: &[u8]) -> u32 {
+    let mut crc: u32 = 0xFFFF_FFFF;
+    for &byte in data {
+        crc ^= byte as u32;
+        for _ in 0..8 {
+            if crc & 1 != 0 {
+                crc = (crc >> 1) ^ 0xEDB8_8320;
+            } else {
+                crc >>= 1;
+            }
+        }
     }
+    crc ^ 0xFFFF_FFFF
+}
+
+/// Update CRC32 in a UEFI table header.
+///
+/// Per the UEFI spec, the CRC is computed over `header_size` bytes with the
+/// `crc32` field itself zeroed during computation.
+unsafe fn update_table_header_crc32(header: *mut TableHeader) {
+    let hdr = &mut *header;
+    hdr.crc32 = 0;
+    let size = hdr.header_size as usize;
+    let bytes = core::slice::from_raw_parts(header as *const u8, size);
+    hdr.crc32 = compute_crc32(bytes);
+}
+
+/// Recompute CRC32 checksums for the System Table, Boot Services, and Runtime Services.
+///
+/// Must be called after any modification to these tables (e.g., after installing
+/// configuration tables, setting console pointers, etc.) and before handing the
+/// system table to an EFI application.
+pub fn update_crc32() {
+    unsafe {
+        // Update Boot Services CRC32
+        if !SYSTEM_TABLE.boot_services.is_null() {
+            update_table_header_crc32(&raw mut (*SYSTEM_TABLE.boot_services).hdr);
+        }
+        // Update Runtime Services CRC32
+        if !SYSTEM_TABLE.runtime_services.is_null() {
+            update_table_header_crc32(&raw mut (*SYSTEM_TABLE.runtime_services).hdr);
+        }
+        // Update System Table CRC32 (must be last since it covers the whole table)
+        update_table_header_crc32(&raw mut SYSTEM_TABLE.hdr);
+    }
+    log::debug!("Updated CRC32 checksums for System/BS/RT tables");
 }
 
 /// Install the EFI Runtime Properties Table
