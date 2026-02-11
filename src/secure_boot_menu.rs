@@ -8,7 +8,7 @@ use crate::drivers::keyboard;
 use crate::drivers::serial as serial_driver;
 use crate::efi::auth::{self, boot as secure_boot};
 use crate::framebuffer_console::{
-    Color, DEFAULT_BG, DEFAULT_FG, FramebufferConsole, HIGHLIGHT_BG, HIGHLIGHT_FG, TITLE_COLOR,
+    Color, FramebufferConsole, DEFAULT_BG, DEFAULT_FG, HIGHLIGHT_BG, HIGHLIGHT_FG, TITLE_COLOR,
 };
 use crate::time::delay_ms;
 use core::fmt::Write;
@@ -680,10 +680,22 @@ enum KeyPress {
     Char(char),
 }
 
-/// Read a key from keyboard or serial
+/// Read a key from keyboard (PS/2, USB, or serial)
 fn read_key() -> Option<KeyPress> {
     // Try PS/2 keyboard first
     if let Some((scan_code, unicode_char)) = keyboard::try_read_key() {
+        return match scan_code {
+            0x01 => Some(KeyPress::Up),
+            0x02 => Some(KeyPress::Down),
+            0x17 => Some(KeyPress::Escape),
+            0 if unicode_char == 0x0D => Some(KeyPress::Enter),
+            0 if unicode_char > 0 => Some(KeyPress::Char(unicode_char as u8 as char)),
+            _ => None,
+        };
+    }
+
+    // Try USB keyboard
+    if let Some((scan_code, unicode_char)) = crate::drivers::usb::keyboard_get_key() {
         return match scan_code {
             0x01 => Some(KeyPress::Up),
             0x02 => Some(KeyPress::Down),

@@ -383,28 +383,22 @@ extern "efiapi" fn wait_for_event(
     // Get the list of events to wait on
     let events_to_wait = unsafe { core::slice::from_raw_parts(event, number_of_events) };
 
-    // Check if any of the events is a keyboard event
-    let has_keyboard_event = events_to_wait.iter().any(|e| {
-        let event_id = *e as usize;
-        event_id == KEYBOARD_EVENT_ID
-    });
-
-    // Poll for keyboard input
+    // Poll for events
     // In a real implementation, we'd use proper async I/O
-    // Here we poll the serial port for input
     loop {
         // Check each event
         for (i, &evt) in events_to_wait.iter().enumerate() {
             let event_id = evt as usize;
 
-            // Check if it's the keyboard event and there's input
-            if event_id == KEYBOARD_EVENT_ID || has_keyboard_event {
-                // Check if serial port or PS/2 keyboard has data
-                if crate::drivers::serial::has_input() || crate::drivers::keyboard::has_key() {
-                    unsafe { *index = i };
-                    log::debug!("  -> SUCCESS (keyboard input ready, index={})", i);
-                    return Status::SUCCESS;
-                }
+            // Only check keyboard input for the actual keyboard event
+            if event_id == KEYBOARD_EVENT_ID
+                && (crate::drivers::serial::has_input()
+                    || crate::drivers::keyboard::has_key()
+                    || crate::drivers::usb::keyboard_has_key())
+            {
+                unsafe { *index = i };
+                log::debug!("  -> SUCCESS (keyboard input ready, index={})", i);
+                return Status::SUCCESS;
             }
 
             // Check if a regular event is signaled
@@ -457,8 +451,11 @@ extern "efiapi" fn check_event(event: efi::Event) -> Status {
 
     // Special case for keyboard event
     if event_id == KEYBOARD_EVENT_ID {
-        // Check serial port or PS/2 keyboard for input
-        if crate::drivers::serial::has_input() || crate::drivers::keyboard::has_key() {
+        // Check serial port, PS/2 keyboard, or USB keyboard for input
+        if crate::drivers::serial::has_input()
+            || crate::drivers::keyboard::has_key()
+            || crate::drivers::usb::keyboard_has_key()
+        {
             return Status::SUCCESS;
         } else {
             return Status::NOT_READY;
@@ -1445,13 +1442,8 @@ extern "efiapi" fn get_next_monotonic_count(_count: *mut u64) -> Status {
 
 extern "efiapi" fn stall(microseconds: usize) -> Status {
     log::debug!("BS.Stall({}us)", microseconds);
-    // Busy-wait using CPU cycles
-    // This is a rough approximation - real implementation would use TSC or HPET
-    for _ in 0..microseconds {
-        for _ in 0..1000 {
-            core::hint::spin_loop();
-        }
-    }
+    // Use TSC-calibrated delay for accurate timing
+    crate::time::delay_us(microseconds as u64);
     Status::SUCCESS
 }
 
