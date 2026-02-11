@@ -216,11 +216,11 @@ impl Default for ReceivedFis {
 pub struct AhciPort {
     /// Port number
     pub port_num: u8,
-    /// Pointer to port registers
-    port_regs: *const AhciPortRegisters,
     /// Command list (32 entries, 1KB)
     cmd_list: *mut CommandHeader,
     /// Received FIS (256 bytes)
+    // This field appears unused but must be kept alive — the HBA hardware
+    // writes DMA data to the memory this pointer refers to.
     #[allow(dead_code)]
     received_fis: *mut ReceivedFis,
     /// Command tables (one per command slot)
@@ -231,14 +231,6 @@ pub struct AhciPort {
     pub sector_count: u64,
     /// Sector size
     pub sector_size: u32,
-}
-
-impl AhciPort {
-    /// Get reference to port registers
-    #[inline]
-    fn regs(&self) -> &AhciPortRegisters {
-        unsafe { &*self.port_regs }
-    }
 }
 
 /// Device type detected on port
@@ -255,16 +247,10 @@ pub enum DeviceType {
 pub struct AhciController {
     /// PCI address (bus:device.function)
     pci_address: pci::PciAddress,
-    /// Pointer to HBA registers (kept for potential future use/debugging)
-    #[allow(dead_code)]
-    hba_regs: *const AhciHbaRegisters,
     /// MMIO base address (for port register calculation)
     mmio_base: u64,
     /// Number of command slots
     num_cmd_slots: u8,
-    /// Number of ports
-    #[allow(dead_code)]
-    num_ports: u8,
     /// Ports implemented bitmap
     ports_implemented: u32,
     /// Active ports
@@ -289,13 +275,6 @@ pub enum AhciError {
 }
 
 impl AhciController {
-    /// Get reference to HBA registers (kept for potential future use)
-    #[inline]
-    #[allow(dead_code)]
-    fn hba(&self) -> &AhciHbaRegisters {
-        unsafe { &*self.hba_regs }
-    }
-
     /// Get reference to port registers
     #[inline]
     fn port_regs(&self, port: u8) -> &AhciPortRegisters {
@@ -357,10 +336,8 @@ impl AhciController {
 
         let mut controller = Self {
             pci_address: pci_dev.address,
-            hba_regs,
             mmio_base,
             num_cmd_slots,
-            num_ports,
             ports_implemented,
             ports: heapless::Vec::new(),
         };
@@ -457,9 +434,6 @@ impl AhciController {
 
     /// Initialize a single port
     fn init_port(&mut self, port_num: u8) -> Result<AhciPort, AhciError> {
-        // Get port register pointer for later use
-        let port_regs_ptr = self.port_regs(port_num) as *const AhciPortRegisters;
-
         // Stop command processing
         self.stop_port(port_num)?;
 
@@ -549,7 +523,6 @@ impl AhciController {
 
         let mut port = AhciPort {
             port_num,
-            port_regs: port_regs_ptr,
             cmd_list: cmd_list_addr as *mut CommandHeader,
             received_fis: received_fis_addr as *mut ReceivedFis,
             cmd_tables,
@@ -619,43 +592,11 @@ impl AhciController {
     }
 
     /// Issue a command and wait for completion
+    ///
+    /// On error or timeout, performs port recovery per AHCI spec section 6.2.2:
+    /// stops the command engine, clears error bits, and restarts.
     fn issue_command(&mut self, port: &AhciPort, slot: u8) -> Result<(), AhciError> {
-        fence(Ordering::SeqCst);
-
-        let port_regs = port.regs();
-
-        // Issue command
-        port_regs.ci.set(1 << slot);
-
-        // Wait for completion (up to 30 seconds)
-        let timeout = Timeout::from_ms(30000);
-        while !timeout.is_expired() {
-            let ci = port_regs.ci.get();
-            if ci & (1 << slot) == 0 {
-                // Check for errors
-                if port_regs.tfd.is_set(PORT_TFD::STS_ERR)
-                    || port_regs.tfd.is_set(PORT_TFD::STS_DRQ)
-                {
-                    log::error!("AHCI command error: TFD={:#x}", port_regs.tfd.get());
-                    return Err(AhciError::CommandFailed);
-                }
-                return Ok(());
-            }
-
-            // Check for fatal errors (Task File Error)
-            if port_regs.is.is_set(PORT_IS::TFES) {
-                log::error!(
-                    "AHCI task file error: TFD={:#x}, IS={:#x}",
-                    port_regs.tfd.get(),
-                    port_regs.is.get()
-                );
-                return Err(AhciError::CommandFailed);
-            }
-            core::hint::spin_loop();
-        }
-
-        log::error!("AHCI: Command timeout");
-        Err(AhciError::Timeout)
+        self.issue_command_on_port(port.port_num, slot)
     }
 
     /// Identify a SATA device
@@ -898,6 +839,7 @@ impl AhciController {
         buffer: *mut u8,
     ) -> Result<(), AhciError> {
         let port_num = self.ports[port_index].port_num;
+        let sector_size = self.ports[port_index].sector_size;
         let cmd_list = self.ports[port_index].cmd_list;
         let cmd_tables = self.ports[port_index].cmd_tables;
 
@@ -924,13 +866,13 @@ impl AhciController {
         fis.set_lba(start_lba);
         fis.set_count(num_sectors as u16);
 
-        // Setup PRDT
-        let byte_count = num_sectors * 512;
+        // Setup PRDT - use actual sector size instead of assuming 512
+        let byte_count = num_sectors * sector_size;
         table.prdt[0].set_address(buffer as u64);
         table.prdt[0].set_byte_count(byte_count, true);
 
         // Issue command
-        self.issue_command_by_port(port_num, slot)?;
+        self.issue_command_on_port(port_num, slot)?;
 
         Ok(())
     }
@@ -1000,15 +942,20 @@ impl AhciController {
         );
 
         // Issue command
-        self.issue_command_by_port(port_num, slot)?;
+        self.issue_command_on_port(port_num, slot)?;
 
         log::trace!("read_sectors_atapi: command completed successfully");
 
         Ok(())
     }
 
-    /// Issue a command by port number and wait for completion
-    fn issue_command_by_port(&mut self, port_num: u8, slot: u8) -> Result<(), AhciError> {
+    /// Issue a command on a port by number and wait for completion
+    ///
+    /// On error or timeout, performs AHCI error recovery per spec section 6.2.2:
+    /// 1. Stop the command engine (clear PxCMD.ST)
+    /// 2. Clear error bits (PxSERR, PxIS)
+    /// 3. Restart the command engine (set PxCMD.ST)
+    fn issue_command_on_port(&mut self, port_num: u8, slot: u8) -> Result<(), AhciError> {
         fence(Ordering::SeqCst);
 
         let port_regs = self.port_regs(port_num);
@@ -1018,33 +965,76 @@ impl AhciController {
 
         // Wait for completion (up to 30 seconds)
         let timeout = Timeout::from_ms(30000);
+        let mut error = None;
         while !timeout.is_expired() {
             let ci = port_regs.ci.get();
             if ci & (1 << slot) == 0 {
-                // Check for errors
+                // Command completed - check for errors
                 if port_regs.tfd.is_set(PORT_TFD::STS_ERR)
                     || port_regs.tfd.is_set(PORT_TFD::STS_DRQ)
                 {
-                    log::error!("AHCI command error: TFD={:#x}", port_regs.tfd.get());
-                    return Err(AhciError::CommandFailed);
+                    log::error!(
+                        "AHCI port {}: command error TFD={:#x}",
+                        port_num,
+                        port_regs.tfd.get()
+                    );
+                    error = Some(AhciError::CommandFailed);
+                    break;
                 }
                 return Ok(());
             }
 
-            // Check for fatal errors
+            // Check for fatal errors (Task File Error)
             if port_regs.is.is_set(PORT_IS::TFES) {
                 log::error!(
-                    "AHCI task file error: TFD={:#x}, IS={:#x}",
+                    "AHCI port {}: task file error TFD={:#x}, IS={:#x}",
+                    port_num,
                     port_regs.tfd.get(),
                     port_regs.is.get()
                 );
-                return Err(AhciError::CommandFailed);
+                error = Some(AhciError::CommandFailed);
+                break;
             }
             core::hint::spin_loop();
         }
 
-        log::error!("AHCI command timeout on port {}", port_num);
-        Err(AhciError::Timeout)
+        let error = error.unwrap_or_else(|| {
+            log::error!("AHCI port {}: command timeout", port_num);
+            AhciError::Timeout
+        });
+
+        // Error recovery per AHCI spec section 6.2.2
+        self.recover_port(port_num);
+
+        Err(error)
+    }
+
+    /// Perform error recovery on a port per AHCI spec section 6.2.2
+    ///
+    /// This stops the command engine, clears error and interrupt status bits,
+    /// and restarts the command engine so subsequent commands can succeed.
+    fn recover_port(&mut self, port_num: u8) {
+        log::warn!("AHCI port {}: performing error recovery", port_num);
+
+        let port_regs = self.port_regs(port_num);
+
+        // 1. Clear PxCMD.ST to stop the command engine
+        port_regs.cmd.modify(PORT_CMD::ST::CLEAR);
+
+        // 2. Wait for PxCMD.CR to clear (command list no longer running)
+        if !wait_for(500, || !port_regs.cmd.is_set(PORT_CMD::CR)) {
+            log::warn!("AHCI port {}: CR did not clear during recovery", port_num);
+        }
+
+        // 3. Clear error bits
+        port_regs.serr.set(0xFFFFFFFF); // Clear all SError bits
+        port_regs.is.set(0xFFFFFFFF); // Clear all interrupt status bits
+
+        // 4. Restart the command engine
+        port_regs.cmd.modify(PORT_CMD::FRE::SET);
+        port_regs.cmd.modify(PORT_CMD::ST::SET);
+
+        log::debug!("AHCI port {}: error recovery complete", port_num);
     }
 
     /// Get the number of active ports
@@ -1150,7 +1140,7 @@ impl AhciController {
         table.prdt[0].set_byte_count(transfer_blocks * 512, true);
 
         // Issue command
-        let result = self.issue_command_by_port(port_num, slot);
+        let result = self.issue_command_on_port(port_num, slot);
 
         // Copy data from DMA buffer to caller's buffer
         let bytes_transferred = if result.is_ok() {
@@ -1266,7 +1256,7 @@ impl AhciController {
         table.prdt[0].set_byte_count(transfer_blocks * 512, true);
 
         // Issue command
-        let result = self.issue_command_by_port(port_num, slot);
+        let result = self.issue_command_on_port(port_num, slot);
 
         efi::free_pages(dma_buffer, 1);
 
@@ -1385,10 +1375,20 @@ pub fn init() {
     );
 }
 
-/// Get an AHCI controller
-pub fn get_controller(index: usize) -> Option<&'static mut AhciController> {
+/// Get a raw pointer to an AHCI controller
+///
+/// Returns a raw pointer rather than `&'static mut` to avoid aliasing UB.
+/// Callers must ensure they do not create overlapping mutable references.
+///
+/// # Safety
+///
+/// The returned pointer is valid for the firmware lifetime. Callers must
+/// convert to `&mut` only for the duration of their immediate operation
+/// and must not hold the reference across calls that may also access
+/// the same controller.
+pub fn get_controller(index: usize) -> Option<*mut AhciController> {
     let controllers = AHCI_CONTROLLERS.lock();
-    controllers.get(index).map(|ptr| unsafe { &mut *ptr.0 })
+    controllers.get(index).map(|ptr| ptr.0)
 }
 
 // SAFETY: AhciController contains raw pointers to MMIO registers and DMA buffers.
@@ -1465,8 +1465,9 @@ pub fn global_read_sectors(lba: u64, buffer: &mut [u8]) -> Result<(), ()> {
         }
     };
 
+    // Safety: pointer valid for firmware lifetime; no overlapping &mut created
     let controller = match get_controller(controller_index) {
-        Some(c) => c,
+        Some(ptr) => unsafe { &mut *ptr },
         None => {
             log::error!(
                 "global_read_sectors: no AHCI controller at index {}",
@@ -1501,7 +1502,8 @@ pub fn global_sector_size() -> Option<u32> {
         None => return None,
     };
 
-    let controller = get_controller(controller_index)?;
+    // Safety: pointer valid for firmware lifetime; no overlapping &mut created
+    let controller = unsafe { &mut *get_controller(controller_index)? };
     let port = controller.get_port(port_index)?;
     Some(port.sector_size)
 }

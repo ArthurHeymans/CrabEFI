@@ -53,12 +53,6 @@ use alloc::vec::Vec;
 /// Maximum dbx update file size (1MB should be plenty)
 const MAX_DBX_SIZE: usize = 1024 * 1024;
 
-/// Microsoft's vendor GUID for dbx entries
-#[allow(dead_code)]
-const MICROSOFT_OWNER_GUID: [u8; 16] = [
-    0xbd, 0x9a, 0xfa, 0x77, 0x59, 0x03, 0x32, 0x4d, 0xbd, 0x60, 0x28, 0xf4, 0xe7, 0x8f, 0x78, 0x4b,
-];
-
 /// File paths to search for signed dbx updates (.auth format preferred)
 const DBX_AUTH_PATHS: &[&str] = &[
     "EFI\\keys\\dbxupdate.auth",
@@ -162,16 +156,20 @@ fn search_all_disks_for_dbx(
 fn search_nvme_for_dbx(paths: &[&str]) -> Option<(Vec<u8>, &'static str)> {
     use crate::drivers::nvme;
 
-    if let Some(controller) = nvme::get_controller(0)
-        && let Some(ns) = controller.default_namespace()
-    {
-        let nsid = ns.nsid;
+    if let Some(controller_ptr) = nvme::get_controller(0) {
+        // Safety: pointer valid for firmware lifetime; no overlapping &mut created
+        let controller = unsafe { &mut *controller_ptr };
+        if let Some(ns) = controller.default_namespace() {
+            let nsid = ns.nsid;
 
-        if let Some(controller) = nvme::get_controller(0) {
-            let mut disk = NvmeDisk::new(controller, nsid);
+            if let Some(controller_ptr) = nvme::get_controller(0) {
+                // Safety: pointer valid for firmware lifetime; no overlapping &mut created
+                let controller = unsafe { &mut *controller_ptr };
+                let mut disk = NvmeDisk::new(controller, nsid);
 
-            if let Some(result) = search_disk_for_dbx(&mut disk, "NVMe", paths) {
-                return Some(result);
+                if let Some(result) = search_disk_for_dbx(&mut disk, "NVMe", paths) {
+                    return Some(result);
+                }
             }
         }
     }
@@ -183,11 +181,15 @@ fn search_nvme_for_dbx(paths: &[&str]) -> Option<(Vec<u8>, &'static str)> {
 fn search_ahci_for_dbx(paths: &[&str]) -> Option<(Vec<u8>, &'static str)> {
     use crate::drivers::ahci;
 
-    if let Some(controller) = ahci::get_controller(0) {
+    if let Some(controller_ptr) = ahci::get_controller(0) {
+        // Safety: pointer valid for firmware lifetime; no overlapping &mut created
+        let controller = unsafe { &mut *controller_ptr };
         let num_ports = controller.num_active_ports();
 
         for port_index in 0..num_ports {
-            if let Some(controller) = ahci::get_controller(0) {
+            if let Some(controller_ptr) = ahci::get_controller(0) {
+                // Safety: pointer valid for firmware lifetime; no overlapping &mut created
+                let controller = unsafe { &mut *controller_ptr };
                 let mut disk = AhciDisk::new(controller, port_index);
 
                 if let Some(result) = search_disk_for_dbx(&mut disk, "SATA", paths) {

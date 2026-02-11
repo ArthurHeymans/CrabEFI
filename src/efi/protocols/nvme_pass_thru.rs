@@ -246,8 +246,9 @@ extern "efiapi" fn nvme_pass_thru(
     );
 
     // Get the controller
+    // Safety: pointer valid for firmware lifetime; no overlapping &mut created
     let controller = match nvme::get_controller(ctx.controller_index) {
-        Some(c) => c,
+        Some(ptr) => unsafe { &mut *ptr },
         None => {
             log::error!("NvmePassThru.PassThru: controller not found");
             return Status::DEVICE_ERROR;
@@ -352,8 +353,9 @@ extern "efiapi" fn nvme_get_next_namespace(
         }
     };
 
+    // Safety: pointer valid for firmware lifetime; no overlapping &mut created
     let controller = match nvme::get_controller(ctx.controller_index) {
-        Some(c) => c,
+        Some(ptr) => unsafe { &mut *ptr },
         None => {
             return Status::DEVICE_ERROR;
         }
@@ -503,8 +505,9 @@ pub fn create_nvme_pass_thru_protocol(
     };
 
     // Get controller to read version
+    // Safety: pointer valid for firmware lifetime; no overlapping &mut created
     let nvme_version = match nvme::get_controller(controller_index) {
-        Some(c) => c.nvme_version(),
+        Some(ptr) => unsafe { &mut *ptr }.nvme_version(),
         None => {
             log::error!("NvmePassThru: controller {} not found", controller_index);
             return core::ptr::null_mut();

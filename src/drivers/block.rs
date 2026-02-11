@@ -177,7 +177,10 @@ impl BlockDevice for NvmeBlockDevice {
     }
 
     fn read_blocks(&mut self, lba: u64, count: u32, buffer: &mut [u8]) -> Result<(), BlockError> {
-        let controller = nvme::get_controller(self.controller_id).ok_or(BlockError::DeviceError)?;
+        // Safety: pointer valid for firmware lifetime; no overlapping &mut created
+        let controller = unsafe {
+            &mut *nvme::get_controller(self.controller_id).ok_or(BlockError::DeviceError)?
+        };
 
         controller
             .read_sectors(self.nsid, lba, count, buffer.as_mut_ptr())
@@ -245,7 +248,10 @@ impl BlockDevice for AhciBlockDevice {
     }
 
     fn read_blocks(&mut self, lba: u64, count: u32, buffer: &mut [u8]) -> Result<(), BlockError> {
-        let controller = ahci::get_controller(self.controller_id).ok_or(BlockError::DeviceError)?;
+        // Safety: pointer valid for firmware lifetime; no overlapping &mut created
+        let controller = unsafe {
+            &mut *ahci::get_controller(self.controller_id).ok_or(BlockError::DeviceError)?
+        };
 
         controller
             .read_sectors(self.port, lba, count, buffer.as_mut_ptr())
@@ -612,7 +618,8 @@ pub fn create_nvme_device(
     nsid: u32,
     media_id: u32,
 ) -> Option<NvmeBlockDevice> {
-    let controller = nvme::get_controller(controller_id)?;
+    // Safety: pointer valid for firmware lifetime; no overlapping &mut created
+    let controller = unsafe { &mut *nvme::get_controller(controller_id)? };
     let ns = controller.get_namespace(nsid)?;
 
     Some(NvmeBlockDevice::new(
@@ -630,7 +637,8 @@ pub fn create_ahci_device(
     port: usize,
     media_id: u32,
 ) -> Option<AhciBlockDevice> {
-    let controller = ahci::get_controller(controller_id)?;
+    // Safety: pointer valid for firmware lifetime; no overlapping &mut created
+    let controller = unsafe { &mut *ahci::get_controller(controller_id)? };
     let port_info = controller.get_port(port)?;
 
     Some(AhciBlockDevice::new(

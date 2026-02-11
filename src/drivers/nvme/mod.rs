@@ -5,9 +5,9 @@
 
 use crate::drivers::pci::{self, PciAddress, PciDevice};
 use crate::efi;
-use crate::time::{Timeout, wait_for};
+use crate::time::{wait_for, Timeout};
 use core::ptr;
-use core::sync::atomic::{Ordering, fence};
+use core::sync::atomic::{fence, Ordering};
 use spin::Mutex;
 use tock_registers::interfaces::{ReadWriteable, Readable, Writeable};
 use tock_registers::register_bitfields;
@@ -1239,10 +1239,20 @@ pub fn init() {
     );
 }
 
-/// Get the first NVMe controller
-pub fn get_controller(index: usize) -> Option<&'static mut NvmeController> {
+/// Get a raw pointer to an NVMe controller
+///
+/// Returns a raw pointer rather than `&'static mut` to avoid aliasing UB.
+/// Callers must ensure they do not create overlapping mutable references.
+///
+/// # Safety
+///
+/// The returned pointer is valid for the firmware lifetime. Callers must
+/// convert to `&mut` only for the duration of their immediate operation
+/// and must not hold the reference across calls that may also access
+/// the same controller.
+pub fn get_controller(index: usize) -> Option<*mut NvmeController> {
     let controllers = NVME_CONTROLLERS.lock();
-    controllers.get(index).map(|ptr| unsafe { &mut *ptr.0 })
+    controllers.get(index).map(|ptr| ptr.0)
 }
 
 // SAFETY: NvmeController contains raw pointers to MMIO registers and DMA buffers.
@@ -1331,8 +1341,9 @@ pub fn global_read_sectors(lba: u64, buffer: &mut [u8]) -> Result<(), ()> {
     };
 
     // Get the controller
+    // Safety: pointer valid for firmware lifetime; no overlapping &mut created
     let controller = match get_controller(controller_index) {
-        Some(c) => c,
+        Some(ptr) => unsafe { &mut *ptr },
         None => {
             log::error!(
                 "global_read_sectors: no NVMe controller at index {}",
@@ -1358,7 +1369,8 @@ pub fn global_sector_size() -> Option<u32> {
         None => return None,
     };
 
-    let controller = get_controller(controller_index)?;
+    // Safety: pointer valid for firmware lifetime; no overlapping &mut created
+    let controller = unsafe { &mut *get_controller(controller_index)? };
     let ns = controller.get_namespace(nsid)?;
     Some(ns.block_size)
 }

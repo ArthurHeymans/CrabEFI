@@ -107,7 +107,9 @@ pub fn read_sectors(device_id: u32, lba: u64, buffer: &mut [u8]) -> Result<(), (
             controller_id,
             nsid,
         } => {
-            if let Some(controller) = crate::drivers::nvme::get_controller(controller_id) {
+            if let Some(controller_ptr) = crate::drivers::nvme::get_controller(controller_id) {
+                // Safety: pointer valid for firmware lifetime; no overlapping &mut created
+                let controller = unsafe { &mut *controller_ptr };
                 controller.read_sector(nsid, lba, buffer).map_err(|e| {
                     log::error!("NVMe read failed at LBA {}: {:?}", lba, e);
                 })

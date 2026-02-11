@@ -90,16 +90,20 @@ pub fn find_key_files() -> Option<KeyFileSearchResult> {
 fn search_nvme_devices() -> Option<KeyFileSearchResult> {
     use crate::drivers::nvme;
 
-    if let Some(controller) = nvme::get_controller(0)
-        && let Some(ns) = controller.default_namespace()
-    {
-        let nsid = ns.nsid;
+    if let Some(controller_ptr) = nvme::get_controller(0) {
+        // Safety: pointer valid for firmware lifetime; no overlapping &mut created
+        let controller = unsafe { &mut *controller_ptr };
+        if let Some(ns) = controller.default_namespace() {
+            let nsid = ns.nsid;
 
-        if let Some(controller) = nvme::get_controller(0) {
-            let mut disk = NvmeDisk::new(controller, nsid);
+            if let Some(controller_ptr) = nvme::get_controller(0) {
+                // Safety: pointer valid for firmware lifetime; no overlapping &mut created
+                let controller = unsafe { &mut *controller_ptr };
+                let mut disk = NvmeDisk::new(controller, nsid);
 
-            if let Some(result) = search_disk_for_keys(&mut disk, "NVMe") {
-                return Some(result);
+                if let Some(result) = search_disk_for_keys(&mut disk, "NVMe") {
+                    return Some(result);
+                }
             }
         }
     }
@@ -111,11 +115,15 @@ fn search_nvme_devices() -> Option<KeyFileSearchResult> {
 fn search_ahci_devices() -> Option<KeyFileSearchResult> {
     use crate::drivers::ahci;
 
-    if let Some(controller) = ahci::get_controller(0) {
+    if let Some(controller_ptr) = ahci::get_controller(0) {
+        // Safety: pointer valid for firmware lifetime; no overlapping &mut created
+        let controller = unsafe { &mut *controller_ptr };
         let num_ports = controller.num_active_ports();
 
         for port_index in 0..num_ports {
-            if let Some(controller) = ahci::get_controller(0) {
+            if let Some(controller_ptr) = ahci::get_controller(0) {
+                // Safety: pointer valid for firmware lifetime; no overlapping &mut created
+                let controller = unsafe { &mut *controller_ptr };
                 let mut disk = AhciDisk::new(controller, port_index);
 
                 if let Some(result) = search_disk_for_keys(&mut disk, "SATA") {

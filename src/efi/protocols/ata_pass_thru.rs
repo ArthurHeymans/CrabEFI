@@ -309,8 +309,9 @@ extern "efiapi" fn ata_pass_thru(
     );
 
     // Get the controller
+    // Safety: pointer valid for firmware lifetime; no overlapping &mut created
     let controller = match ahci::get_controller(ctx.controller_index) {
-        Some(c) => c,
+        Some(ptr) => unsafe { &mut *ptr },
         None => {
             log::error!("AtaPassThru.PassThru: controller not found");
             return Status::DEVICE_ERROR;
@@ -433,8 +434,9 @@ extern "efiapi" fn ata_get_next_port(this: *mut AtaPassThruProtocol, port: *mut 
         }
     };
 
+    // Safety: pointer valid for firmware lifetime; no overlapping &mut created
     let controller = match ahci::get_controller(ctx.controller_index) {
-        Some(c) => c,
+        Some(ptr) => unsafe { &mut *ptr },
         None => {
             return Status::DEVICE_ERROR;
         }
@@ -494,8 +496,9 @@ extern "efiapi" fn ata_get_next_device(
         }
     };
 
+    // Safety: pointer valid for firmware lifetime; no overlapping &mut created
     let controller = match ahci::get_controller(ctx.controller_index) {
-        Some(c) => c,
+        Some(ptr) => unsafe { &mut *ptr },
         None => {
             return Status::DEVICE_ERROR;
         }
@@ -631,8 +634,9 @@ extern "efiapi" fn ata_reset_port(this: *mut AtaPassThruProtocol, port: u16) -> 
 
     log::info!("AtaPassThru.ResetPort: port={}", port);
 
+    // Safety: pointer valid for firmware lifetime; no overlapping &mut created
     let controller = match ahci::get_controller(ctx.controller_index) {
-        Some(c) => c,
+        Some(ptr) => unsafe { &mut *ptr },
         None => {
             return Status::DEVICE_ERROR;
         }
