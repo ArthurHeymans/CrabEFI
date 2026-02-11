@@ -20,7 +20,7 @@
 use super::amd_chipsets::AmdChipset;
 use super::regs::*;
 use super::sfdp::{self, SfdpInfo, SfdpReader, SfdpResult};
-use super::{delay_us, Result, SpiController, SpiError, SpiMode};
+use super::{Result, SpiController, SpiError, SpiMode, delay_us};
 use crate::drivers::mmio::MmioRegion;
 use crate::drivers::pci::{self, PciAddress, PciDevice};
 

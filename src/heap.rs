@@ -11,10 +11,12 @@
 //!
 //! # Memory Management
 //!
-//! - Heap is allocated as `BootServicesData` memory type
+//! - Heap is allocated as `RuntimeServicesData` with EFI_MEMORY_RUNTIME attribute
+//! - This ensures the OS preserves the heap after ExitBootServices, so runtime
+//!   services (SetVariable, etc.) can continue to use heap allocations for
+//!   authenticated variable verification, varstore persistence, etc.
 //! - Allocations are bump-pointer style (fast allocation)
-//! - Deallocation is a no-op (memory is released when boot services exit)
-//! - This is appropriate for firmware where allocations are temporary
+//! - Deallocation is a no-op (bump allocator never frees)
 
 use core::alloc::{GlobalAlloc, Layout};
 use core::cell::UnsafeCell;
@@ -137,8 +139,8 @@ unsafe impl GlobalAlloc for BumpAllocator {
 
     unsafe fn dealloc(&self, _ptr: *mut u8, _layout: Layout) {
         // Bump allocator doesn't deallocate individual allocations.
-        // Memory is freed when boot services exit (all BootServicesData is released).
-        // This is acceptable for firmware where allocations are temporary.
+        // The heap is RuntimeServicesData, so it persists after ExitBootServices
+        // and remains available for runtime service calls.
     }
 }
 
@@ -158,11 +160,14 @@ pub fn init() -> bool {
     use crate::efi::allocator::{AllocateType, MemoryType, allocate_pages};
     use r_efi::efi::Status;
 
-    // Allocate heap pages from the EFI allocator
+    // Allocate heap pages as RuntimeServicesData so the OS preserves them
+    // after ExitBootServices. Runtime services (SetVariable, etc.) need
+    // heap allocations for authenticated variable verification, varstore
+    // persistence, and crypto operations.
     let mut heap_addr: u64 = 0;
     let status = allocate_pages(
         AllocateType::AllocateAnyPages,
-        MemoryType::BootServicesData,
+        MemoryType::RuntimeServicesData,
         HEAP_PAGES,
         &mut heap_addr,
     );

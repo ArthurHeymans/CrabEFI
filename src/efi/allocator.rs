@@ -110,12 +110,14 @@ fn cb_to_efi_memory_type(cb_type: CbMemoryType) -> MemoryType {
         CbMemoryType::AcpiReclaimable => MemoryType::AcpiReclaimMemory,
         CbMemoryType::AcpiNvs => MemoryType::AcpiMemoryNvs,
         CbMemoryType::Unusable => MemoryType::UnusableMemory,
-        // Coreboot's Table type includes cbmem regions (console, SMBIOS, etc.)
-        // that Linux kernel modules need to access after boot. Using AcpiMemoryNvs
-        // ensures these regions are preserved and not reclaimed as usable RAM.
-        // BootServicesData would be incorrect because it gets converted to
-        // ConventionalMemory at ExitBootServices, causing memremap failures.
-        CbMemoryType::Table => MemoryType::AcpiMemoryNvs,
+        // Coreboot's Table type covers cbmem regions (console, SMBIOS,
+        // timestamps, ACPI tables, etc.). Using ReservedMemoryType ensures
+        // the OS preserves them without bloating ACPI NVS.
+        // Linux accesses cbmem regions via the coreboot_table driver which
+        // uses memremap() — it works with Reserved or NVS.
+        // ACPI tables within these regions are later marked as
+        // AcpiReclaimMemory by mark_acpi_tables_memory().
+        CbMemoryType::Table => MemoryType::ReservedMemoryType,
     }
 }
 
@@ -848,12 +850,35 @@ impl MemoryAllocator {
         true
     }
 
-    /// Carve out a region from conventional memory and mark it as a new type
+    /// Carve out a region from existing memory and mark it as a new type
+    ///
+    /// By default, carves from ConventionalMemory. Use `carve_out_from` to
+    /// specify which source types are acceptable.
     fn carve_out(
         &mut self,
         addr: u64,
         num_pages: u64,
         memory_type: MemoryType,
+    ) -> Result<(), efi::Status> {
+        self.carve_out_from(
+            addr,
+            num_pages,
+            memory_type,
+            &[MemoryType::ConventionalMemory],
+        )
+    }
+
+    /// Carve out a region from memory of any of the given source types
+    ///
+    /// Splits the containing entry (which must be one of `source_types`) into
+    /// up to 3 entries: a prefix of the original type, the carved region with
+    /// `memory_type`, and a suffix of the original type.
+    fn carve_out_from(
+        &mut self,
+        addr: u64,
+        num_pages: u64,
+        memory_type: MemoryType,
+        source_types: &[MemoryType],
     ) -> Result<(), efi::Status> {
         // Check for overflow in size calculation
         let size = num_pages
@@ -863,15 +888,20 @@ impl MemoryAllocator {
             .checked_add(size)
             .ok_or(efi::Status::INVALID_PARAMETER)?;
 
-        // Find the entry containing this region
+        // Find the entry containing this region (must be one of source_types)
         let found_idx = self.entries.iter().position(|entry| {
-            entry.get_memory_type() == Some(MemoryType::ConventionalMemory)
+            entry
+                .get_memory_type()
+                .is_some_and(|mt| source_types.contains(&mt))
                 && entry.physical_start <= addr
                 && entry.end() >= end
         });
 
         let idx = found_idx.ok_or(efi::Status::NOT_FOUND)?;
         let entry = self.entries[idx];
+        let original_type = entry
+            .get_memory_type()
+            .unwrap_or(MemoryType::ReservedMemoryType);
 
         // Calculate how many new entries we need (1-3: before?, carved, after?)
         let need_before = entry.physical_start < addr;
@@ -912,14 +942,14 @@ impl MemoryAllocator {
             attribute |= attributes::EFI_MEMORY_XP;
         }
 
-        // Region before the carved out portion
+        // Region before the carved out portion (keep original type)
         if need_before {
             let before_pages = (addr - entry.physical_start) / PAGE_SIZE;
             let before = MemoryDescriptor::new(
-                MemoryType::ConventionalMemory,
+                original_type,
                 entry.physical_start,
                 before_pages,
-                entry.attribute, // Use original attribute for ConventionalMemory
+                entry.attribute, // Use original attribute
             );
             let _ = self.entries.push(before); // We pre-checked space
         }
@@ -928,14 +958,14 @@ impl MemoryAllocator {
         let carved = MemoryDescriptor::new(memory_type, addr, num_pages, attribute);
         let _ = self.entries.push(carved); // We pre-checked space
 
-        // Region after the carved out portion
+        // Region after the carved out portion (keep original type)
         if need_after {
             let after_pages = (entry.end() - end) / PAGE_SIZE;
             let after = MemoryDescriptor::new(
-                MemoryType::ConventionalMemory,
+                original_type,
                 end,
                 after_pages,
-                entry.attribute, // Use original attribute for ConventionalMemory
+                entry.attribute, // Use original attribute
             );
             let _ = self.entries.push(after); // We pre-checked space
         }
@@ -954,8 +984,6 @@ impl MemoryAllocator {
             .as_mut_slice()
             .sort_unstable_by_key(|entry| entry.physical_start);
     }
-
-
 
     /// Merge adjacent entries of the same type and attributes
     fn merge_entries(&mut self) {
@@ -1173,6 +1201,10 @@ unsafe extern "C" {
 /// This marks the memory containing our code and data sections so that the OS
 /// keeps them mapped after ExitBootServices. The boundaries come from the
 /// linker script symbols.
+///
+/// CrabEFI lives in a coreboot `Reserved` region. We carve RuntimeServicesCode
+/// and RuntimeServicesData from it (or from ConventionalMemory if the layout
+/// differs). The remaining portion stays as the original type.
 pub fn reserve_runtime_region() {
     // Get section boundaries from linker symbols
     let code_start = unsafe { &__runtime_code_start as *const u8 as u64 };
@@ -1217,12 +1249,23 @@ pub fn reserve_runtime_region() {
         data_pages
     );
 
+    // Types we can carve runtime regions from: the payload sits in either
+    // a Reserved region (coreboot marks the payload area as CB_MEM_RESERVED)
+    // or ConventionalMemory (if the mapping differs).
+    let source_types = &[
+        MemoryType::ReservedMemoryType,
+        MemoryType::ConventionalMemory,
+    ];
+
     // Reserve the CODE region (executable, no XP attribute)
-    match reserve_region(
-        code_start_aligned,
-        code_pages,
-        MemoryType::RuntimeServicesCode,
-    ) {
+    match state::with_allocator_mut(|alloc| {
+        alloc.carve_out_from(
+            code_start_aligned,
+            code_pages,
+            MemoryType::RuntimeServicesCode,
+            source_types,
+        )
+    }) {
         Ok(()) => {
             log::info!(
                 "Reserved runtime services code region: {:#x}-{:#x}",
@@ -1230,39 +1273,22 @@ pub fn reserve_runtime_region() {
                 code_end_aligned
             );
         }
-        Err(status) => {
-            log::warn!(
-                "carve_out failed for code region: {:?}, trying force_add",
-                status
-            );
-            // The region might not be in the memory map at all - force add it
-            match force_add_region(
-                code_start_aligned,
-                code_pages,
-                MemoryType::RuntimeServicesCode,
-            ) {
-                Ok(()) => {
-                    log::info!(
-                        "Force-added runtime services code region: {:#x}-{:#x}",
-                        code_start_aligned,
-                        code_end_aligned
-                    );
-                }
-                Err(e) => {
-                    log::error!("CRITICAL: Failed to add runtime code region: {:?}", e);
-                }
-            }
+        Err(e) => {
+            log::error!("CRITICAL: Failed to reserve runtime code region: {:?}", e);
         }
     }
 
     // Reserve the DATA region (non-executable, XP attribute set)
     // Skip if there are no pages to reserve
     if data_pages > 0 {
-        match reserve_region(
-            data_start_aligned,
-            data_pages,
-            MemoryType::RuntimeServicesData,
-        ) {
+        match state::with_allocator_mut(|alloc| {
+            alloc.carve_out_from(
+                data_start_aligned,
+                data_pages,
+                MemoryType::RuntimeServicesData,
+                source_types,
+            )
+        }) {
             Ok(()) => {
                 log::info!(
                     "Reserved runtime services data region: {:#x}-{:#x}",
@@ -1270,28 +1296,8 @@ pub fn reserve_runtime_region() {
                     data_end_aligned
                 );
             }
-            Err(status) => {
-                log::warn!(
-                    "carve_out failed for data region: {:?}, trying force_add",
-                    status
-                );
-                // The region might not be in the memory map at all - force add it
-                match force_add_region(
-                    data_start_aligned,
-                    data_pages,
-                    MemoryType::RuntimeServicesData,
-                ) {
-                    Ok(()) => {
-                        log::info!(
-                            "Force-added runtime services data region: {:#x}-{:#x}",
-                            data_start_aligned,
-                            data_end_aligned
-                        );
-                    }
-                    Err(e) => {
-                        log::error!("CRITICAL: Failed to add runtime data region: {:?}", e);
-                    }
-                }
+            Err(e) => {
+                log::error!("CRITICAL: Failed to reserve runtime data region: {:?}", e);
             }
         }
     }

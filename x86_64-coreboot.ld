@@ -68,19 +68,18 @@ SECTIONS
         _stack_top = .;
     }
 
-    /* Runtime data ends here (after BSS and stack) */
-    __runtime_data_end = .;
-
     /* Deferred variable buffer - 64KB
      * Used for queuing variable writes after ExitBootServices.
-     * This region should survive warm reboot on most hardware.
-     * Mark as EfiReservedMemoryType in the memory map.
+     * Included in runtime data region so OS preserves the mapping.
      */
     .deferred_buffer (NOLOAD) : ALIGN(4096) {
         _deferred_buffer_start = .;
         . += 64K;
         _deferred_buffer_end = .;
     }
+
+    /* Runtime data ends here (after BSS, stack, and deferred buffer) */
+    __runtime_data_end = .;
 
     _end = .;
 

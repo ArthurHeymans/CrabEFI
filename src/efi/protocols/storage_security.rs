@@ -323,9 +323,8 @@ fn nvme_security_receive(
     buffer: &mut [u8],
 ) -> Result<usize, &'static str> {
     // Safety: pointer valid for firmware lifetime; no overlapping &mut created
-    let controller = unsafe {
-        &mut *nvme::get_controller(controller_index).ok_or("NVMe controller not found")?
-    };
+    let controller =
+        unsafe { &mut *nvme::get_controller(controller_index).ok_or("NVMe controller not found")? };
 
     controller
         .security_receive(nsid, protocol_id, sp_specific, buffer)
@@ -341,9 +340,8 @@ fn nvme_security_send(
     buffer: &[u8],
 ) -> Result<(), &'static str> {
     // Safety: pointer valid for firmware lifetime; no overlapping &mut created
-    let controller = unsafe {
-        &mut *nvme::get_controller(controller_index).ok_or("NVMe controller not found")?
-    };
+    let controller =
+        unsafe { &mut *nvme::get_controller(controller_index).ok_or("NVMe controller not found")? };
 
     controller
         .security_send(nsid, protocol_id, sp_specific, buffer)
@@ -363,9 +361,8 @@ fn ahci_security_receive(
     buffer: &mut [u8],
 ) -> Result<usize, &'static str> {
     // Safety: pointer valid for firmware lifetime; no overlapping &mut created
-    let controller = unsafe {
-        &mut *ahci::get_controller(controller_index).ok_or("AHCI controller not found")?
-    };
+    let controller =
+        unsafe { &mut *ahci::get_controller(controller_index).ok_or("AHCI controller not found")? };
 
     controller
         .trusted_receive(port, protocol_id, sp_specific, buffer)
@@ -381,9 +378,8 @@ fn ahci_security_send(
     buffer: &[u8],
 ) -> Result<(), &'static str> {
     // Safety: pointer valid for firmware lifetime; no overlapping &mut created
-    let controller = unsafe {
-        &mut *ahci::get_controller(controller_index).ok_or("AHCI controller not found")?
-    };
+    let controller =
+        unsafe { &mut *ahci::get_controller(controller_index).ok_or("AHCI controller not found")? };
 
     controller
         .trusted_send(port, protocol_id, sp_specific, buffer)

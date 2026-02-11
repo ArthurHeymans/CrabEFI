@@ -1420,6 +1420,11 @@ extern "efiapi" fn exit_boot_services(image_handle: Handle, map_key: usize) -> S
             crate::coreboot::invalidate_framebuffer_record();
         }
 
+        // Disable CBMEM console - the buffer lives in a coreboot Reserved
+        // region that the OS does not map for EFI runtime use. Any log call
+        // from runtime services would page-fault trying to write there.
+        crate::coreboot::cbmem_console::disable();
+
         // CRITICAL: Set boot_services pointer to NULL in SystemTable
         // This is REQUIRED by UEFI spec and Linux checks for this!
         unsafe {
@@ -1597,11 +1602,74 @@ extern "efiapi" fn open_protocol_information(
 }
 
 extern "efiapi" fn protocols_per_handle(
-    _handle: Handle,
-    _protocol_buffer: *mut *mut *mut Guid,
-    _protocol_buffer_count: *mut usize,
+    handle: Handle,
+    protocol_buffer: *mut *mut *mut Guid,
+    protocol_buffer_count: *mut usize,
 ) -> Status {
-    Status::UNSUPPORTED
+    log::debug!("BS.ProtocolsPerHandle(handle={:?})", handle);
+
+    if handle.is_null() || protocol_buffer.is_null() || protocol_buffer_count.is_null() {
+        return Status::INVALID_PARAMETER;
+    }
+
+    let efi_state = state::efi();
+
+    // Find the handle entry
+    let entry = match efi_state.handles[..efi_state.handle_count]
+        .iter()
+        .find(|e| e.handle == handle)
+    {
+        Some(e) => e,
+        None => {
+            log::debug!("  -> NOT_FOUND");
+            return Status::NOT_FOUND;
+        }
+    };
+
+    let count = entry.protocol_count;
+
+    if count == 0 {
+        unsafe {
+            *protocol_buffer = core::ptr::null_mut();
+            *protocol_buffer_count = 0;
+        }
+        return Status::SUCCESS;
+    }
+
+    // Allocate a buffer to hold the GUID pointers
+    let buf_size = count * core::mem::size_of::<*mut Guid>();
+    let alloc_result = allocator::allocate_pool(MemoryType::BootServicesData, buf_size);
+    let guid_ptr_buf = match alloc_result {
+        Ok(ptr) => ptr as *mut *mut Guid,
+        Err(_) => return Status::OUT_OF_RESOURCES,
+    };
+
+    // Allocate storage for the GUIDs themselves (contiguous array)
+    let guids_size = count * core::mem::size_of::<Guid>();
+    let guids_alloc = allocator::allocate_pool(MemoryType::BootServicesData, guids_size);
+    let guids_buf = match guids_alloc {
+        Ok(ptr) => ptr as *mut Guid,
+        Err(_) => {
+            let _ = allocator::free_pool(guid_ptr_buf as *mut u8);
+            return Status::OUT_OF_RESOURCES;
+        }
+    };
+
+    // Fill in the GUIDs and pointer array
+    for i in 0..count {
+        unsafe {
+            *guids_buf.add(i) = entry.protocols[i].guid;
+            *guid_ptr_buf.add(i) = guids_buf.add(i);
+        }
+    }
+
+    unsafe {
+        *protocol_buffer = guid_ptr_buf;
+        *protocol_buffer_count = count;
+    }
+
+    log::debug!("  -> SUCCESS ({} protocols)", count);
+    Status::SUCCESS
 }
 
 extern "efiapi" fn locate_handle_buffer(
@@ -1859,12 +1927,32 @@ extern "efiapi" fn uninstall_multiple_protocol_interfaces(
     Status::SUCCESS
 }
 
-extern "efiapi" fn calculate_crc32(
-    _data: *mut c_void,
-    _data_size: usize,
-    _crc32: *mut u32,
-) -> Status {
-    Status::UNSUPPORTED
+extern "efiapi" fn calculate_crc32(data: *mut c_void, data_size: usize, crc32: *mut u32) -> Status {
+    if data.is_null() || crc32.is_null() || data_size == 0 {
+        return Status::INVALID_PARAMETER;
+    }
+
+    let bytes = unsafe { core::slice::from_raw_parts(data as *const u8, data_size) };
+
+    // CRC-32 (ISO 3309 / ITU-T V.42 / UEFI spec) with polynomial 0xEDB88320
+    let mut crc: u32 = 0xFFFF_FFFF;
+    for &byte in bytes {
+        crc ^= byte as u32;
+        for _ in 0..8 {
+            if crc & 1 != 0 {
+                crc = (crc >> 1) ^ 0xEDB8_8320;
+            } else {
+                crc >>= 1;
+            }
+        }
+    }
+    crc ^= 0xFFFF_FFFF;
+
+    unsafe {
+        *crc32 = crc;
+    }
+
+    Status::SUCCESS
 }
 
 extern "efiapi" fn copy_mem(destination: *mut c_void, source: *mut c_void, length: usize) {

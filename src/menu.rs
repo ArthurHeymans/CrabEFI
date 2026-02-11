@@ -398,8 +398,7 @@ fn discover_nvme_entries(menu: &mut BootMenu) {
                             // Safety: pointer valid for firmware lifetime; no overlapping &mut created
                             let controller = unsafe { &mut *controller_ptr };
                             let mut disk = NvmeDisk::new(controller, nsid);
-                            if let Ok(mut fat) =
-                                FatFilesystem::new(&mut disk, partition.first_lba)
+                            if let Ok(mut fat) = FatFilesystem::new(&mut disk, partition.first_lba)
                             {
                                 let device_type = DeviceType::Nvme {
                                     controller_id: 0,

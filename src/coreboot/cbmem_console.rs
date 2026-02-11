@@ -73,6 +73,15 @@ pub fn is_available() -> bool {
     CBMEM_CONSOLE_ADDR.load(Ordering::Acquire) != 0
 }
 
+/// Disable the CBMEM console
+///
+/// Called at ExitBootServices to prevent runtime code from accessing the
+/// cbmem buffer, which lives in a coreboot Reserved region that the OS
+/// does not map for EFI runtime use.
+pub fn disable() {
+    CBMEM_CONSOLE_ADDR.store(0, Ordering::Release);
+}
+
 /// Write bytes to the CBMEM console (ring buffer)
 ///
 /// This function handles buffer wraparound following libpayload's implementation:

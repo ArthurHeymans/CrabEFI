@@ -8,7 +8,7 @@ use crate::drivers::keyboard;
 use crate::drivers::serial as serial_driver;
 use crate::efi::auth::{self, boot as secure_boot};
 use crate::framebuffer_console::{
-    Color, FramebufferConsole, DEFAULT_BG, DEFAULT_FG, HIGHLIGHT_BG, HIGHLIGHT_FG, TITLE_COLOR,
+    Color, DEFAULT_BG, DEFAULT_FG, FramebufferConsole, HIGHLIGHT_BG, HIGHLIGHT_FG, TITLE_COLOR,
 };
 use crate::time::delay_ms;
 use core::fmt::Write;
