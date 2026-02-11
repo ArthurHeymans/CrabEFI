@@ -10,12 +10,6 @@ use super::{AuthError, EFI_CERT_SHA256_GUID, EFI_CERT_X509_GUID};
 use alloc::vec::Vec;
 use r_efi::efi::Guid;
 
-/// Compare a raw GUID (as bytes) with an r_efi Guid (for future use in GUID-based lookups)
-#[allow(dead_code)]
-fn guid_bytes_match(bytes: &[u8; 16], guid: &Guid) -> bool {
-    *bytes == guid_to_bytes(guid)
-}
-
 // ============================================================================
 // Secure Boot Variable Names
 // ============================================================================

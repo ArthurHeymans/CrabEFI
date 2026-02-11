@@ -247,8 +247,8 @@ impl LoadedLinux {
 /// # Returns
 ///
 /// `LoadedLinux` ready to boot
-pub fn load_linux_from_disk<D: BlockDevice>(
-    disk: &mut D,
+pub fn load_linux_from_disk(
+    disk: &mut dyn BlockDevice,
     partition_start: u64,
     kernel_path: &str,
     initrd_path: Option<&str>,

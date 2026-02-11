@@ -343,7 +343,7 @@ const MAX_PORTS: usize = 15;
 pub struct EhciController {
     /// PCI address
     pci_address: PciAddress,
-    /// Pointer to capability registers (kept for debugging/future use)
+    /// Pointer to capability registers (hardware MMIO region — must remain referenced)
     #[allow(dead_code)]
     cap_regs: *const EhciCapRegs,
     /// Pointer to operational registers

@@ -422,7 +422,7 @@ pub const MAX_SLOTS: usize = 16;
 pub struct XhciController {
     /// PCI address (bus:device.function)
     pci_address: PciAddress,
-    /// Capability registers MMIO region (kept for potential future use)
+    /// Capability registers MMIO region (hardware state — must remain allocated)
     #[allow(dead_code)]
     cap_regs: MmioRegion,
     /// Operational registers MMIO region
@@ -439,7 +439,7 @@ pub struct XhciController {
     page_size: u32,
     /// Context size (32 or 64 bytes based on HCCPARAMS1.CSZ)
     /// Currently only 32-byte contexts are fully supported.
-    #[allow(dead_code)]
+    #[allow(dead_code)] // Hardware property needed for correct context layout
     context_size: u8,
     /// Device Context Base Address Array
     dcbaa: u64,

@@ -20,7 +20,7 @@
 use super::amd_chipsets::AmdChipset;
 use super::regs::*;
 use super::sfdp::{self, SfdpInfo, SfdpReader, SfdpResult};
-use super::{Result, SpiController, SpiError, SpiMode, delay_us};
+use super::{delay_us, Result, SpiController, SpiError, SpiMode};
 use crate::drivers::mmio::MmioRegion;
 use crate::drivers::pci::{self, PciAddress, PciDevice};
 
@@ -82,10 +82,10 @@ const MAX_FLASH_SIZE: u32 = 16 * 1024 * 1024;
 pub struct AmdSpi100Controller {
     /// Memory-mapped SPI registers
     spibar: MmioRegion,
-    /// Chipset type (kept for future diagnostics/logging)
+    /// Chipset type (hardware identity)
     #[allow(dead_code)]
     chipset: AmdChipset,
-    /// PCI address of the SMBus device (kept for future use)
+    /// PCI address of the SMBus device (hardware address)
     #[allow(dead_code)]
     pci_addr: PciAddress,
     /// Original alternate speed (for restoration on shutdown)

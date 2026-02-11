@@ -418,9 +418,6 @@ pub struct FatFilesystem<'a> {
     sectors_per_cluster: u8,
     /// First FAT sector (relative to partition start)
     fat_start: u32,
-    /// Sectors per FAT (kept for filesystem completeness)
-    #[allow(dead_code)]
-    sectors_per_fat: u32,
     /// First data sector (relative to partition start)
     data_start: u32,
     /// Root directory first cluster (FAT32) or sector count (FAT12/16)
@@ -429,8 +426,7 @@ pub struct FatFilesystem<'a> {
     root_dir_start: u32,
     /// Root directory sector count (FAT12/16 only)
     root_dir_sectors: u32,
-    /// Total data clusters (kept for filesystem completeness)
-    #[allow(dead_code)]
+    /// Total data clusters
     data_clusters: u32,
     /// Cached FAT block for faster chain traversal
     fat_block_cache: [u8; MAX_BLOCK_SIZE],
@@ -582,7 +578,6 @@ impl<'a> FatFilesystem<'a> {
             device_block_size: block_size as u32,
             sectors_per_cluster,
             fat_start,
-            sectors_per_fat,
             data_start,
             root_cluster,
             root_dir_start,

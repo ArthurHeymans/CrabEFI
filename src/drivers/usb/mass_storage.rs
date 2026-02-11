@@ -114,7 +114,7 @@ pub struct UsbMassStorage {
     bulk_in: u8,
     /// Bulk OUT endpoint number
     bulk_out: u8,
-    /// Maximum packet size (kept for hardware completeness)
+    /// Maximum packet size (USB endpoint hardware property)
     #[allow(dead_code)]
     max_packet: u16,
     /// USB interface number for BOT reset recovery

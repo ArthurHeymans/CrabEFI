@@ -473,7 +473,9 @@ fn boot_uefi_entry(entry: &menu::BootEntry) {
                 return;
             }
 
-            if let Some(controller) = drivers::nvme::get_controller(controller_id) {
+            if let Some(controller_ptr) = drivers::nvme::get_controller(controller_id) {
+                // Safety: pointer valid for firmware lifetime; no overlapping &mut created
+                let controller = unsafe { &mut *controller_ptr };
                 let (num_blocks, block_size) = match controller.default_namespace() {
                     Some(ns) => (ns.num_blocks, ns.block_size),
                     None => {
@@ -504,10 +506,15 @@ fn boot_uefi_entry(entry: &menu::BootEntry) {
             }
 
             // Re-create disk for ESP boot (previous borrows ended)
-            if let Some(controller) = drivers::nvme::get_controller(controller_id) {
-                let info = {
-                    let ns = controller.default_namespace().unwrap();
-                    (ns.num_blocks, ns.block_size)
+            if let Some(controller_ptr) = drivers::nvme::get_controller(controller_id) {
+                // Safety: pointer valid for firmware lifetime; no overlapping &mut created
+                let controller = unsafe { &mut *controller_ptr };
+                let info = match controller.default_namespace() {
+                    Some(ns) => (ns.num_blocks, ns.block_size),
+                    None => {
+                        log::error!("Failed to get NVMe namespace for ESP boot");
+                        return;
+                    }
                 };
                 let mut disk = NvmeDisk::new(controller, nsid);
                 if boot::try_boot_from_esp(
@@ -533,7 +540,9 @@ fn boot_uefi_entry(entry: &menu::BootEntry) {
                 return;
             }
 
-            if let Some(controller) = drivers::ahci::get_controller(controller_id) {
+            if let Some(controller_ptr) = drivers::ahci::get_controller(controller_id) {
+                // Safety: pointer valid for firmware lifetime; no overlapping &mut created
+                let controller = unsafe { &mut *controller_ptr };
                 let (num_blocks, block_size) = match controller.get_port(port) {
                     Some(port_info) => (port_info.sector_count, port_info.sector_size),
                     None => {
@@ -563,7 +572,9 @@ fn boot_uefi_entry(entry: &menu::BootEntry) {
                 );
             }
 
-            if let Some(controller) = drivers::ahci::get_controller(controller_id) {
+            if let Some(controller_ptr) = drivers::ahci::get_controller(controller_id) {
+                // Safety: pointer valid for firmware lifetime; no overlapping &mut created
+                let controller = unsafe { &mut *controller_ptr };
                 let info = match controller.get_port(port) {
                     Some(p) => (p.sector_count, p.sector_size),
                     None => return,
@@ -688,6 +699,57 @@ fn boot_uefi_entry(entry: &menu::BootEntry) {
     }
 }
 
+/// Boot Linux from a block device (shared logic for all device types)
+///
+/// Loads the kernel, optional initrd, and command line from a FAT partition
+/// on the given block device, then boots Linux directly.
+///
+/// # Arguments
+/// * `disk` - Any block device implementing BlockDevice
+/// * `partition_first_lba` - First LBA of the boot partition
+/// * `kernel_path` - FAT-style path to the kernel
+/// * `initrd_fat_path` - Optional FAT-style path to the initrd
+/// * `cmdline` - Kernel command line
+/// * `memory_regions` - Memory map from coreboot
+/// * `acpi_rsdp` - Optional ACPI RSDP address
+/// * `framebuffer` - Optional framebuffer info for Linux console
+///
+/// # Returns
+/// `true` if boot was initiated (unreachable in practice), `false` on failure
+fn boot_linux_from_device(
+    disk: &mut dyn crate::drivers::block::BlockDevice,
+    partition_first_lba: u64,
+    kernel_path: &str,
+    initrd_fat_path: Option<&str>,
+    cmdline: &str,
+    memory_regions: &[crate::coreboot::memory::MemoryRegion],
+    acpi_rsdp: Option<u64>,
+    framebuffer: Option<&crate::coreboot::FramebufferInfo>,
+) -> bool {
+    match linux_boot::load_linux_from_disk(
+        disk,
+        partition_first_lba,
+        kernel_path,
+        initrd_fat_path,
+        cmdline,
+        memory_regions,
+        acpi_rsdp,
+        framebuffer,
+        false, // Don't use EFI handover for direct boot
+    ) {
+        Ok(mut loaded) => {
+            log::info!("Linux loaded successfully, booting...");
+            unsafe {
+                loaded.boot_direct();
+            }
+        }
+        Err(e) => {
+            log::error!("Failed to load Linux: {:?}", e);
+            false
+        }
+    }
+}
+
 /// Boot a direct Linux entry (BLS Type #1 or GRUB)
 ///
 /// This uses the linux_boot module to load and boot the kernel directly,
@@ -768,24 +830,24 @@ fn boot_linux_entry(
         if framebuffer.is_some() { "yes" } else { "no" }
     );
 
-    // Dispatch based on device type
+    // Dispatch based on device type - each arm does device-specific setup,
+    // then delegates to boot_linux_from_device for the shared load+boot logic.
     match entry.device_type {
         menu::DeviceType::Nvme {
             controller_id,
             nsid,
         } => {
-            // Ensure device is stored globally
             if !drivers::nvme::store_global_device(controller_id, nsid) {
                 log::error!("Failed to store NVMe device globally");
                 return;
             }
 
-            if let Some(controller) = drivers::nvme::get_controller(controller_id) {
+            if let Some(controller_ptr) = drivers::nvme::get_controller(controller_id) {
+                // Safety: pointer valid for firmware lifetime; no overlapping &mut created
+                let controller = unsafe { &mut *controller_ptr };
                 log::info!("Got NVMe controller {}", controller_id);
                 let mut disk = NvmeDisk::new(controller, nsid);
-
-                // Load and boot Linux
-                match linux_boot::load_linux_from_disk(
+                boot_linux_from_device(
                     &mut disk,
                     entry.partition.first_lba,
                     &kernel_path,
@@ -794,18 +856,7 @@ fn boot_linux_entry(
                     &memory_regions,
                     acpi_rsdp,
                     framebuffer.as_ref(),
-                    false, // Don't use EFI handover for direct boot
-                ) {
-                    Ok(mut loaded) => {
-                        log::info!("Linux loaded successfully, booting...");
-                        unsafe {
-                            loaded.boot_direct();
-                        }
-                    }
-                    Err(e) => {
-                        log::error!("Failed to load Linux: {:?}", e);
-                    }
-                }
+                );
             } else {
                 log::error!("Failed to get NVMe controller {}", controller_id);
             }
@@ -815,18 +866,17 @@ fn boot_linux_entry(
             controller_id,
             port,
         } => {
-            // Ensure device is stored globally
             if !drivers::ahci::store_global_device(controller_id, port) {
                 log::error!("Failed to store AHCI device globally");
                 return;
             }
 
-            if let Some(controller) = drivers::ahci::get_controller(controller_id) {
+            if let Some(controller_ptr) = drivers::ahci::get_controller(controller_id) {
+                // Safety: pointer valid for firmware lifetime; no overlapping &mut created
+                let controller = unsafe { &mut *controller_ptr };
                 log::info!("Got AHCI controller {}", controller_id);
                 let mut disk = AhciDisk::new(controller, port);
-
-                // Load and boot Linux
-                match linux_boot::load_linux_from_disk(
+                boot_linux_from_device(
                     &mut disk,
                     entry.partition.first_lba,
                     &kernel_path,
@@ -835,18 +885,7 @@ fn boot_linux_entry(
                     &memory_regions,
                     acpi_rsdp,
                     framebuffer.as_ref(),
-                    false,
-                ) {
-                    Ok(mut loaded) => {
-                        log::info!("Linux loaded successfully, booting...");
-                        unsafe {
-                            loaded.boot_direct();
-                        }
-                    }
-                    Err(e) => {
-                        log::error!("Failed to load Linux: {:?}", e);
-                    }
-                }
+                );
             } else {
                 log::error!("Failed to get AHCI controller {}", controller_id);
             }
@@ -856,7 +895,6 @@ fn boot_linux_entry(
             controller_id,
             device_addr: _,
         } => {
-            // Get the controller pointer
             let controller_ptr = match drivers::usb::get_controller_ptr(controller_id) {
                 Some(ptr) => ptr,
                 None => {
@@ -870,9 +908,7 @@ fn boot_linux_entry(
                 // Safety: controller_ptr is valid for the entire boot process
                 let controller = unsafe { &mut *controller_ptr };
                 let mut disk = UsbDisk::new(usb_device, controller);
-
-                // Load and boot Linux
-                match linux_boot::load_linux_from_disk(
+                boot_linux_from_device(
                     &mut disk,
                     entry.partition.first_lba,
                     &kernel_path,
@@ -881,25 +917,13 @@ fn boot_linux_entry(
                     &memory_regions,
                     acpi_rsdp,
                     framebuffer.as_ref(),
-                    false,
-                ) {
-                    Ok(mut loaded) => {
-                        log::info!("Linux loaded successfully, booting...");
-                        unsafe {
-                            loaded.boot_direct();
-                        }
-                    }
-                    Err(e) => {
-                        log::error!("Failed to load Linux: {:?}", e);
-                    }
-                }
+                );
             } else {
                 log::error!("USB mass storage device not available");
             }
         }
 
         menu::DeviceType::Sdhci { controller_id } => {
-            // Ensure device is stored globally
             if !drivers::sdhci::store_global_device(controller_id) {
                 log::error!("Failed to store SDHCI device globally");
                 return;
@@ -908,9 +932,7 @@ fn boot_linux_entry(
             if let Some(controller) = drivers::sdhci::get_controller(controller_id) {
                 log::info!("Got SDHCI controller {}", controller_id);
                 let mut disk = SdhciDisk::new(controller);
-
-                // Load and boot Linux
-                match linux_boot::load_linux_from_disk(
+                boot_linux_from_device(
                     &mut disk,
                     entry.partition.first_lba,
                     &kernel_path,
@@ -919,18 +941,7 @@ fn boot_linux_entry(
                     &memory_regions,
                     acpi_rsdp,
                     framebuffer.as_ref(),
-                    false,
-                ) {
-                    Ok(mut loaded) => {
-                        log::info!("Linux loaded successfully, booting...");
-                        unsafe {
-                            loaded.boot_direct();
-                        }
-                    }
-                    Err(e) => {
-                        log::error!("Failed to load Linux: {:?}", e);
-                    }
-                }
+                );
             } else {
                 log::error!("Failed to get SDHCI controller {}", controller_id);
             }

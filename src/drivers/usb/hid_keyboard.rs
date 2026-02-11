@@ -90,13 +90,13 @@ pub struct UsbHidKeyboard {
     controller_idx: usize,
     /// Device address
     device_address: u8,
-    /// Interrupt endpoint number (kept for hardware completeness)
+    /// Interrupt endpoint number (USB endpoint hardware property)
     #[allow(dead_code)]
     endpoint: u8,
-    /// Max packet size (kept for hardware completeness)
+    /// Max packet size (USB endpoint hardware property)
     #[allow(dead_code)]
     max_packet: u16,
-    /// Polling interval (ms, kept for hardware completeness)
+    /// Polling interval in ms (USB endpoint hardware property)
     #[allow(dead_code)]
     interval: u8,
     /// Previous report (for detecting changes)

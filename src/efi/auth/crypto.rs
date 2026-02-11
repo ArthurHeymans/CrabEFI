@@ -941,7 +941,6 @@ pub fn validate_key_usage_for_ca(cert_der: &[u8]) -> Result<(), AuthError> {
 /// digitalSignature set (bit 0).
 ///
 /// Returns Ok(()) if the certificate can be used for code signing.
-#[allow(dead_code)]
 pub fn validate_key_usage_for_code_signing(cert_der: &[u8]) -> Result<(), AuthError> {
     match extract_key_usage(cert_der) {
         Ok(Some(ku)) => {

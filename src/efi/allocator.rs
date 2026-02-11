@@ -773,7 +773,12 @@ impl MemoryAllocator {
         };
 
         let entry = self.entries[idx];
-        let original_type = entry.get_memory_type().unwrap();
+        // Safety: the position() search above already matched on get_memory_type()
+        // returning Some(LoaderCode | LoaderData), so this cannot be None.
+        let original_type = match entry.get_memory_type() {
+            Some(t) => t,
+            None => return false,
+        };
 
         // If the requested type is the same as the existing type, this is effectively
         // a no-op - the memory is already allocated as the requested type.
@@ -950,37 +955,7 @@ impl MemoryAllocator {
             .sort_unstable_by_key(|entry| entry.physical_start);
     }
 
-    /// Debug: dump memory map to log
-    #[allow(dead_code)]
-    pub fn dump_memory_map(&self) {
-        log::info!("Memory map ({} entries):", self.entries.len());
-        for (i, entry) in self.entries.iter().enumerate() {
-            log::info!(
-                "  [{}] {:#010x}-{:#010x} {:?}",
-                i,
-                entry.physical_start,
-                entry.end(),
-                entry.get_memory_type()
-            );
-        }
-    }
 
-    /// Check for gaps in the memory map and report them
-    #[allow(dead_code)]
-    pub fn check_for_gaps(&self) {
-        for i in 0..self.entries.len().saturating_sub(1) {
-            let current_end = self.entries[i].end();
-            let next_start = self.entries[i + 1].physical_start;
-            if current_end < next_start {
-                log::warn!(
-                    "GAP in memory map: {:#x}-{:#x} ({} bytes)",
-                    current_end,
-                    next_start,
-                    next_start - current_end
-                );
-            }
-        }
-    }
 
     /// Merge adjacent entries of the same type and attributes
     fn merge_entries(&mut self) {
