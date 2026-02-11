@@ -38,13 +38,20 @@
 //! mutability without the overhead of `Mutex`. The UEFI spec guarantees
 //! that Boot Services are not reentrant.
 
-use core::sync::atomic::{AtomicPtr, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 
 /// Global pointer to the firmware state.
 ///
 /// This is the ONLY global mutable state. It points to a `FirmwareState`
 /// allocated on the stack in `init()`.
 static STATE_PTR: AtomicPtr<FirmwareState> = AtomicPtr::new(core::ptr::null_mut());
+
+/// Runtime borrow flag to detect reentrant mutable access.
+///
+/// Set to `true` while a `with_mut` closure is executing. If a nested
+/// `with_mut` call is attempted, we panic rather than silently creating
+/// aliased `&mut` references (which would be undefined behavior).
+static BORROW_FLAG: AtomicBool = AtomicBool::new(false);
 
 /// Initialize the global state pointer.
 ///
@@ -101,6 +108,11 @@ pub fn get_mut_ptr() -> *mut FirmwareState {
 /// This is the preferred way to mutate firmware state as it makes the
 /// borrowing scope explicit and prevents accidental aliasing.
 ///
+/// # Panics
+///
+/// Panics if called reentrantly (i.e., from within another `with_mut` closure).
+/// This runtime check prevents undefined behavior from aliased `&mut` references.
+///
 /// # Example
 ///
 /// ```ignore
@@ -115,8 +127,18 @@ where
 {
     let ptr = STATE_PTR.load(Ordering::Acquire);
     assert!(!ptr.is_null(), "FirmwareState not initialized");
-    // Safety: Single-threaded firmware, closure scope limits aliasing
-    unsafe { f(&mut *ptr) }
+
+    // Runtime borrow check: detect reentrant mutable access
+    assert!(
+        !BORROW_FLAG.swap(true, Ordering::Acquire),
+        "BUG: reentrant with_mut() call detected - this would create aliased &mut references"
+    );
+
+    // Safety: Single-threaded firmware, borrow flag prevents reentrant aliasing
+    let result = unsafe { f(&mut *ptr) };
+
+    BORROW_FLAG.store(false, Ordering::Release);
+    result
 }
 
 /// Try to get a reference to the global firmware state.
@@ -139,7 +161,11 @@ pub fn try_get() -> Option<&'static FirmwareState> {
 #[inline]
 pub fn try_get_mut_ptr() -> Option<*mut FirmwareState> {
     let ptr = STATE_PTR.load(Ordering::Acquire);
-    if ptr.is_null() { None } else { Some(ptr) }
+    if ptr.is_null() {
+        None
+    } else {
+        Some(ptr)
+    }
 }
 
 // ============================================================================
@@ -220,13 +246,9 @@ pub struct ProtocolEntry {
 }
 
 // SAFETY: ProtocolEntry contains raw pointers to protocol interfaces.
-// These pointers are:
-// 1. Only dereferenced while holding the global HANDLES lock
-// 2. Point to memory allocated via the EFI allocator which remains valid
-//    for the lifetime of the firmware
-// 3. CrabEFI runs single-threaded with interrupts disabled during protocol calls
+// These pointers point to memory allocated via the EFI allocator which
+// remains valid for the lifetime of the firmware. CrabEFI is single-threaded.
 unsafe impl Send for ProtocolEntry {}
-unsafe impl Sync for ProtocolEntry {}
 
 impl ProtocolEntry {
     pub const fn empty() -> Self {
@@ -246,10 +268,8 @@ pub struct HandleEntry {
 
 // SAFETY: HandleEntry contains EFI Handle (raw pointer) and ProtocolEntry array.
 // Handles are opaque identifiers that remain valid until explicitly closed.
-// All access is protected by the global HANDLES mutex, and the firmware
-// is single-threaded with no concurrent access to handle data.
+// CrabEFI is single-threaded with no concurrent access to handle data.
 unsafe impl Send for HandleEntry {}
-unsafe impl Sync for HandleEntry {}
 
 impl HandleEntry {
     pub const fn empty() -> Self {
