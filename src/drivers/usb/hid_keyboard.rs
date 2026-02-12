@@ -783,6 +783,58 @@ pub fn poll<C: UsbController>(controller: &mut C) {
     keyboard.handle_repeat();
 }
 
+/// Get EFI shift/toggle state bits from USB keyboard
+///
+/// Returns (shift_state_bits, toggle_state_bits) without the VALID flags.
+pub fn get_efi_state() -> (u32, u8) {
+    use crate::drivers::keyboard::efi_shift_state::*;
+    use crate::drivers::keyboard::efi_toggle_state::*;
+
+    let guard = USB_KEYBOARD.lock();
+    let keyboard = match guard.as_ref() {
+        Some(k) => k,
+        None => return (0, 0),
+    };
+
+    let mods = keyboard.prev_report.modifiers;
+    let mut shift_state = 0u32;
+    let mut toggle_state = 0u8;
+
+    if mods & KeyboardReport::MOD_LEFT_SHIFT != 0 {
+        shift_state |= LEFT_SHIFT_PRESSED;
+    }
+    if mods & KeyboardReport::MOD_RIGHT_SHIFT != 0 {
+        shift_state |= RIGHT_SHIFT_PRESSED;
+    }
+    if mods & KeyboardReport::MOD_LEFT_CTRL != 0 {
+        shift_state |= LEFT_CONTROL_PRESSED;
+    }
+    if mods & KeyboardReport::MOD_RIGHT_CTRL != 0 {
+        shift_state |= RIGHT_CONTROL_PRESSED;
+    }
+    if mods & KeyboardReport::MOD_LEFT_ALT != 0 {
+        shift_state |= LEFT_ALT_PRESSED;
+    }
+    if mods & KeyboardReport::MOD_RIGHT_ALT != 0 {
+        shift_state |= RIGHT_ALT_PRESSED;
+    }
+    if mods & KeyboardReport::MOD_LEFT_GUI != 0 {
+        shift_state |= LEFT_LOGO_PRESSED;
+    }
+    if mods & KeyboardReport::MOD_RIGHT_GUI != 0 {
+        shift_state |= RIGHT_LOGO_PRESSED;
+    }
+
+    if keyboard.caps_lock {
+        toggle_state |= CAPS_LOCK_ACTIVE;
+    }
+    if keyboard.num_lock {
+        toggle_state |= NUM_LOCK_ACTIVE;
+    }
+
+    (shift_state, toggle_state)
+}
+
 /// Check if USB keyboard is available
 pub fn is_available() -> bool {
     USB_KEYBOARD.lock().is_some()

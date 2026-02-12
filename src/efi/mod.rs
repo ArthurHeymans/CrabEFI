@@ -143,6 +143,28 @@ fn init_console() -> Option<efi::Handle> {
         log::error!("Failed to install text input protocol: {:?}", status);
     }
 
+    // Install text input ex protocol on the same console handle
+    {
+        use protocols::simple_text_input_ex::{
+            SIMPLE_TEXT_INPUT_EX_PROTOCOL_GUID, create_protocol as create_text_input_ex,
+        };
+        let input_ex = create_text_input_ex();
+        if input_ex.is_null() {
+            log::error!("Failed to create SimpleTextInputEx protocol");
+        } else {
+            let status = boot_services::install_protocol(
+                console_handle,
+                &SIMPLE_TEXT_INPUT_EX_PROTOCOL_GUID,
+                input_ex,
+            );
+            if status != Status::SUCCESS {
+                log::error!("Failed to install SimpleTextInputEx protocol: {:?}", status);
+            } else {
+                log::debug!("SimpleTextInputEx protocol installed on console handle");
+            }
+        }
+    }
+
     // Install text output protocol
     let output_protocol = get_text_output_protocol();
     let status = boot_services::install_protocol(

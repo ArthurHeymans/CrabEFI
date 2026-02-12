@@ -448,6 +448,66 @@ pub fn cleanup() {
     log::debug!("PS/2 keyboard controller ready for OS (IRQ1 enabled)");
 }
 
+/// EFI shift state flags (from UEFI spec Table 107)
+pub mod efi_shift_state {
+    pub const SHIFT_STATE_VALID: u32 = 0x8000_0000;
+    pub const RIGHT_SHIFT_PRESSED: u32 = 0x0000_0001;
+    pub const LEFT_SHIFT_PRESSED: u32 = 0x0000_0002;
+    pub const RIGHT_CONTROL_PRESSED: u32 = 0x0000_0004;
+    pub const LEFT_CONTROL_PRESSED: u32 = 0x0000_0008;
+    pub const RIGHT_ALT_PRESSED: u32 = 0x0000_0010;
+    pub const LEFT_ALT_PRESSED: u32 = 0x0000_0020;
+    pub const RIGHT_LOGO_PRESSED: u32 = 0x0000_0040;
+    pub const LEFT_LOGO_PRESSED: u32 = 0x0000_0080;
+}
+
+/// EFI toggle state flags (from UEFI spec Table 108)
+pub mod efi_toggle_state {
+    pub const TOGGLE_STATE_VALID: u8 = 0x80;
+    pub const KEY_STATE_EXPOSED: u8 = 0x40;
+    pub const SCROLL_LOCK_ACTIVE: u8 = 0x01;
+    pub const NUM_LOCK_ACTIVE: u8 = 0x02;
+    pub const CAPS_LOCK_ACTIVE: u8 = 0x04;
+}
+
+/// Get the current EFI key shift state and toggle state from all keyboards
+///
+/// Returns (shift_state, toggle_state) with the VALID bits set.
+/// Combines state from PS/2 and USB keyboards.
+pub fn get_efi_key_state() -> (u32, u8) {
+    use efi_shift_state::*;
+    use efi_toggle_state::*;
+
+    let mut shift_state = SHIFT_STATE_VALID;
+    let mut toggle_state = TOGGLE_STATE_VALID;
+
+    // PS/2 keyboard modifier state
+    {
+        let kb = KEYBOARD.lock();
+        if kb.initialized {
+            if kb.modifiers.shift {
+                shift_state |= LEFT_SHIFT_PRESSED;
+            }
+            if kb.modifiers.ctrl {
+                shift_state |= LEFT_CONTROL_PRESSED;
+            }
+            if kb.modifiers.alt {
+                shift_state |= LEFT_ALT_PRESSED;
+            }
+            if kb.modifiers.caps_lock {
+                toggle_state |= CAPS_LOCK_ACTIVE;
+            }
+        }
+    }
+
+    // USB keyboard modifier state (provides left/right distinction)
+    let usb_state = crate::drivers::usb::keyboard_get_efi_state();
+    shift_state |= usb_state.0;
+    toggle_state |= usb_state.1;
+
+    (shift_state, toggle_state)
+}
+
 /// Try to read a key from the keyboard (PS/2 or USB)
 ///
 /// Returns Some((scan_code, unicode_char)) if a key is available, None otherwise.

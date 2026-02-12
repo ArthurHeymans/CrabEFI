@@ -57,34 +57,37 @@ fn fb_put_char(c: char) {
             return;
         };
 
-        let (cols, _rows) = console.dimensions;
-        let total_rows = fb.y_resolution / CHAR_HEIGHT;
+        let (cols, rows) = console.dimensions;
         let start_row = console.start_row;
+        let delta_x = console.delta_x;
+        let delta_y = console.delta_y;
+        let fg_color = console.fg_color;
+        let bg_color = console.bg_color;
 
         let (mut col, mut row) = console.cursor_pos;
+        let max_row = start_row + rows;
 
         match c {
             '\n' => {
                 col = 0;
                 row += 1;
-                if row >= total_rows {
-                    // Scroll up the bottom half
-                    fb_scroll_up(fb, start_row, total_rows);
-                    row = total_rows - 1;
+                if row >= max_row {
+                    fb_scroll_up(fb, start_row, max_row, delta_x, delta_y, cols);
+                    row = max_row - 1;
                 }
             }
             '\r' => {
                 col = 0;
             }
             _ => {
-                fb_draw_char(fb, c, col, row);
+                fb_draw_char(fb, c, col, row, delta_x, delta_y, fg_color, bg_color);
                 col += 1;
                 if col >= cols {
                     col = 0;
                     row += 1;
-                    if row >= total_rows {
-                        fb_scroll_up(fb, start_row, total_rows);
-                        row = total_rows - 1;
+                    if row >= max_row {
+                        fb_scroll_up(fb, start_row, max_row, delta_x, delta_y, cols);
+                        row = max_row - 1;
                     }
                 }
             }
@@ -94,10 +97,21 @@ fn fb_put_char(c: char) {
     });
 }
 
-/// Draw a character at a specific position
-fn fb_draw_char(fb: &FramebufferInfo, c: char, col: u32, row: u32) {
-    let x_base = col * CHAR_WIDTH;
-    let y_base = row * CHAR_HEIGHT;
+/// Draw a character at a specific position, applying centering offsets.
+///
+/// Uses the current foreground/background colors from ConsoleState.
+fn fb_draw_char(
+    fb: &FramebufferInfo,
+    c: char,
+    col: u32,
+    row: u32,
+    delta_x: u32,
+    delta_y: u32,
+    fg_color: (u8, u8, u8),
+    bg_color: (u8, u8, u8),
+) {
+    let x_base = col * CHAR_WIDTH + delta_x;
+    let y_base = row * CHAR_HEIGHT + delta_y;
 
     let glyph = if (c as usize) < 256 {
         &VGA_FONT_8X16[c as usize]
@@ -105,9 +119,8 @@ fn fb_draw_char(fb: &FramebufferInfo, c: char, col: u32, row: u32) {
         &VGA_FONT_8X16[b'?' as usize]
     };
 
-    // White on black for EFI console
-    let (fg_r, fg_g, fg_b) = (255u8, 255u8, 255u8);
-    let (bg_r, bg_g, bg_b) = (0u8, 0u8, 0u8);
+    let (fg_r, fg_g, fg_b) = fg_color;
+    let (bg_r, bg_g, bg_b) = bg_color;
 
     for glyph_row in 0..CHAR_HEIGHT {
         let bits = glyph[glyph_row as usize];
@@ -126,33 +139,46 @@ fn fb_draw_char(fb: &FramebufferInfo, c: char, col: u32, row: u32) {
 }
 
 /// Scroll the EFI console area up by one line
-fn fb_scroll_up(fb: &FramebufferInfo, start_row: u32, total_rows: u32) {
+///
+/// Only scrolls the centered text region (delta_x..delta_x + cols*CHAR_WIDTH)
+/// within the row range start_row..max_row.
+fn fb_scroll_up(
+    fb: &FramebufferInfo,
+    start_row: u32,
+    max_row: u32,
+    delta_x: u32,
+    delta_y: u32,
+    cols: u32,
+) {
     let row_stride = fb.bytes_per_line as usize;
+    let bpp = (fb.bits_per_pixel / 8) as usize;
+    let text_width_bytes = (cols * CHAR_WIDTH) as usize * bpp;
+    let x_offset_bytes = delta_x as usize * bpp;
 
-    // Copy each row up
-    for row in start_row..(total_rows - 1) {
-        let src_y = (row + 1) * CHAR_HEIGHT;
-        let dst_y = row * CHAR_HEIGHT;
+    // Copy each row up within the text region
+    for row in start_row..(max_row - 1) {
+        let src_y = (row + 1) * CHAR_HEIGHT + delta_y;
+        let dst_y = row * CHAR_HEIGHT + delta_y;
 
         for line in 0..CHAR_HEIGHT {
-            let src_offset = ((src_y + line) as usize) * row_stride;
-            let dst_offset = ((dst_y + line) as usize) * row_stride;
+            let src_offset = ((src_y + line) as usize) * row_stride + x_offset_bytes;
+            let dst_offset = ((dst_y + line) as usize) * row_stride + x_offset_bytes;
 
             unsafe {
                 let src = (fb.physical_address as *const u8).add(src_offset);
                 let dst = (fb.physical_address as *mut u8).add(dst_offset);
-                core::ptr::copy(src, dst, row_stride);
+                core::ptr::copy(src, dst, text_width_bytes);
             }
         }
     }
 
-    // Clear the last row
-    let last_row_y = (total_rows - 1) * CHAR_HEIGHT;
+    // Clear the last row within the text region
+    let last_row_y = (max_row - 1) * CHAR_HEIGHT + delta_y;
     for line in 0..CHAR_HEIGHT {
-        let offset = ((last_row_y + line) as usize) * row_stride;
+        let offset = ((last_row_y + line) as usize) * row_stride + x_offset_bytes;
         unsafe {
             let dst = (fb.physical_address as *mut u8).add(offset);
-            core::slice::from_raw_parts_mut(dst, row_stride).fill(0);
+            core::slice::from_raw_parts_mut(dst, text_width_bytes).fill(0);
         }
     }
 }
@@ -283,79 +309,61 @@ extern "efiapi" fn text_input_read_key_stroke(
     state::with_console_mut(|console| {
         let input_state = &mut console.input;
 
-        // First check if we have a queued key from previous escape sequence parsing
-        if let Some((scan_code, unicode_char)) = input_state.queued_key.take() {
-            unsafe {
-                (*key).scan_code = scan_code;
-                (*key).unicode_char = unicode_char;
-            }
-            log::trace!(
-                "ConIn.ReadKeyStroke: queued key -> scan={:#x}, unicode={:#x}",
-                scan_code,
-                unicode_char
-            );
-            return Status::SUCCESS;
-        }
-
-        // Try to get a key from PS/2 keyboard first
-        if let Some((scan_code, unicode_char)) = keyboard::try_read_key() {
-            unsafe {
-                (*key).scan_code = scan_code;
-                (*key).unicode_char = unicode_char;
-            }
-            log::trace!(
-                "ConIn.ReadKeyStroke: PS/2 -> scan={:#x}, unicode={:#x}",
-                scan_code,
-                unicode_char
-            );
-            return Status::SUCCESS;
-        }
-
-        // Try to read from serial port
-        match serial::try_read() {
-            Some(byte) => {
-                // Handle escape sequence parsing
-                let (scan_code, unicode_char) = process_serial_byte(input_state, byte);
-
-                if scan_code == 0 && unicode_char == 0 {
-                    // Still collecting escape sequence, no key ready yet
-                    return Status::NOT_READY;
-                }
-
+        match try_read_key(input_state) {
+            Some((scan_code, unicode_char)) => {
                 unsafe {
                     (*key).scan_code = scan_code;
                     (*key).unicode_char = unicode_char;
                 }
-
                 log::trace!(
-                    "ConIn.ReadKeyStroke: serial byte={:#x} -> scan={:#x}, unicode={:#x}",
-                    byte,
+                    "ConIn.ReadKeyStroke: scan={:#x}, unicode={:#x}",
                     scan_code,
                     unicode_char
                 );
-
                 Status::SUCCESS
             }
-            None => {
-                // Check if we're in the middle of an escape sequence that timed out
-                if input_state.in_escape && input_state.escape_len > 0 {
-                    // Timeout: return what we have as individual characters
-                    // This happens when user presses just ESC
-                    let result = finalize_escape_sequence(input_state);
-                    if let Some((scan_code, unicode_char)) = result {
-                        unsafe {
-                            (*key).scan_code = scan_code;
-                            (*key).unicode_char = unicode_char;
-                        }
-                        return Status::SUCCESS;
-                    }
-                }
-
-                // No key available
-                Status::NOT_READY
-            }
+            None => Status::NOT_READY,
         }
     })
+}
+
+/// Try to read a key from all input sources.
+///
+/// This is the single key-reading function shared by both SimpleTextInput and
+/// SimpleTextInputEx, ensuring they consume from the same path and cannot
+/// steal keys from each other.
+///
+/// Returns `Some((scan_code, unicode_char))` if a key is available, `None` otherwise.
+pub(crate) fn try_read_key(input_state: &mut InputState) -> Option<(u16, u16)> {
+    // Check queued key from previous escape sequence parsing
+    if let Some((scan_code, unicode_char)) = input_state.queued_key.take() {
+        return Some((scan_code, unicode_char));
+    }
+
+    // Try PS/2 and USB keyboards
+    if let Some((scan_code, unicode_char)) = keyboard::try_read_key() {
+        return Some((scan_code, unicode_char));
+    }
+
+    // Try serial port
+    if let Some(byte) = serial::try_read() {
+        let (scan_code, unicode_char) = process_serial_byte(input_state, byte);
+        if scan_code != 0 || unicode_char != 0 {
+            return Some((scan_code, unicode_char));
+        }
+        // Still collecting escape sequence
+        return None;
+    }
+
+    // Check escape sequence timeout
+    if input_state.in_escape
+        && input_state.escape_len > 0
+        && let Some((scan_code, unicode_char)) = finalize_escape_sequence(input_state)
+    {
+        return Some((scan_code, unicode_char));
+    }
+
+    None
 }
 
 /// Process a serial byte, handling escape sequences
@@ -637,15 +645,19 @@ extern "efiapi" fn text_output_query_mode(
         return Status::INVALID_PARAMETER;
     }
 
-    // We only support one mode: 80x25
+    // We only support one mode (mode 0)
     if mode_number != 0 {
         return Status::UNSUPPORTED;
     }
 
-    unsafe {
-        *columns = 80;
-        *rows = 25;
-    }
+    // Return the actual text dimensions from the framebuffer
+    state::with_console_mut(|console| {
+        let (cols, r) = console.dimensions;
+        unsafe {
+            *columns = cols as usize;
+            *rows = r as usize;
+        }
+    });
 
     Status::SUCCESS
 }
@@ -665,6 +677,40 @@ extern "efiapi" fn text_output_set_mode(
     Status::SUCCESS
 }
 
+/// EFI text color index to RGB mapping (UEFI spec Table 105)
+///
+/// Index 0-15: EFI_BLACK, EFI_BLUE, EFI_GREEN, EFI_CYAN,
+/// EFI_RED, EFI_MAGENTA, EFI_BROWN, EFI_LIGHTGRAY,
+/// EFI_DARKGRAY, EFI_LIGHTBLUE, EFI_LIGHTGREEN, EFI_LIGHTCYAN,
+/// EFI_LIGHTRED, EFI_LIGHTMAGENTA, EFI_YELLOW, EFI_WHITE
+const EFI_COLORS: [(u8, u8, u8); 16] = [
+    (0, 0, 0),       // 0  EFI_BLACK
+    (0, 0, 170),     // 1  EFI_BLUE
+    (0, 170, 0),     // 2  EFI_GREEN
+    (0, 170, 170),   // 3  EFI_CYAN
+    (170, 0, 0),     // 4  EFI_RED
+    (170, 0, 170),   // 5  EFI_MAGENTA
+    (170, 85, 0),    // 6  EFI_BROWN
+    (170, 170, 170), // 7  EFI_LIGHTGRAY
+    (85, 85, 85),    // 8  EFI_DARKGRAY
+    (85, 85, 255),   // 9  EFI_LIGHTBLUE
+    (85, 255, 85),   // 10 EFI_LIGHTGREEN
+    (85, 255, 255),  // 11 EFI_LIGHTCYAN
+    (255, 85, 85),   // 12 EFI_LIGHTRED
+    (255, 85, 255),  // 13 EFI_LIGHTMAGENTA
+    (255, 255, 85),  // 14 EFI_YELLOW
+    (255, 255, 255), // 15 EFI_WHITE
+];
+
+/// Convert an EFI color attribute index to RGB
+fn efi_color_to_rgb(index: usize) -> (u8, u8, u8) {
+    if index < EFI_COLORS.len() {
+        EFI_COLORS[index]
+    } else {
+        EFI_COLORS[7] // Default: light gray
+    }
+}
+
 extern "efiapi" fn text_output_set_attribute(
     _this: *mut SimpleTextOutputProtocol,
     attribute: usize,
@@ -673,11 +719,18 @@ extern "efiapi" fn text_output_set_attribute(
         CONSOLE_MODE.attribute = attribute as i32;
     }
 
-    // Convert EFI attribute to ANSI escape sequence
     let fg = attribute & 0x0F;
-    let bg = (attribute >> 4) & 0x0F;
+    let bg = (attribute >> 4) & 0x07; // Background is only 3 bits (0-7)
 
-    // Map EFI colors to ANSI
+    // Update framebuffer console colors
+    let fg_rgb = efi_color_to_rgb(fg);
+    let bg_rgb = efi_color_to_rgb(bg);
+    state::with_console_mut(|console| {
+        console.fg_color = fg_rgb;
+        console.bg_color = bg_rgb;
+    });
+
+    // Also send ANSI escape sequence to serial
     let ansi_fg = match fg {
         0 => 30,  // Black
         1 => 34,  // Blue
@@ -734,25 +787,22 @@ extern "efiapi" fn text_output_clear_screen(_this: *mut SimpleTextOutputProtocol
             return;
         };
 
-        let total_rows = fb.y_resolution / CHAR_HEIGHT;
-        let row_stride = fb.bytes_per_line as usize;
+        let fb_size = fb.y_resolution as usize * fb.bytes_per_line as usize;
 
-        // Clear the entire screen (from row 0 to bottom)
-        for row in 0..total_rows {
-            let y_base = row * CHAR_HEIGHT;
-            for line in 0..CHAR_HEIGHT {
-                let offset = ((y_base + line) as usize) * row_stride;
-                unsafe {
-                    let dst = (fb.physical_address as *mut u8).add(offset);
-                    core::slice::from_raw_parts_mut(dst, row_stride).fill(0);
-                }
-            }
+        // Clear entire framebuffer in one go
+        unsafe {
+            let dst = fb.physical_address as *mut u8;
+            core::slice::from_raw_parts_mut(dst, fb_size).fill(0);
         }
 
-        // Reset console to use full screen (bootloader wants the whole display)
+        // Reset console to use full screen with centering
+        let (cols, rows, delta_x, delta_y) = compute_centered_text_layout(fb);
+
         console.start_row = 0;
-        console.dimensions = (fb.x_resolution / CHAR_WIDTH, total_rows);
+        console.dimensions = (cols, rows);
         console.cursor_pos = (0, 0);
+        console.delta_x = delta_x;
+        console.delta_y = delta_y;
     });
 
     Status::SUCCESS
@@ -876,6 +926,21 @@ fn format_cursor_pos(buf: &mut [u8], row: usize, col: usize) -> usize {
     pos += 1;
 
     pos
+}
+
+/// Compute the centered text layout for a framebuffer.
+///
+/// Returns `(cols, rows, delta_x, delta_y)` where `cols`/`rows` are the text
+/// grid dimensions and `delta_x`/`delta_y` are the pixel offsets to center
+/// the grid within the framebuffer (matching EDK2 GraphicsConsole behavior).
+pub(crate) fn compute_centered_text_layout(
+    fb: &crate::coreboot::FramebufferInfo,
+) -> (u32, u32, u32, u32) {
+    let cols = fb.x_resolution / CHAR_WIDTH;
+    let rows = fb.y_resolution / CHAR_HEIGHT;
+    let delta_x = (fb.x_resolution - cols * CHAR_WIDTH) / 2;
+    let delta_y = (fb.y_resolution - rows * CHAR_HEIGHT) / 2;
+    (cols, rows, delta_x, delta_y)
 }
 
 /// Output a string to the console (helper for internal use)

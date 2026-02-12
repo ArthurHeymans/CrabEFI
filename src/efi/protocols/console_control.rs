@@ -80,6 +80,10 @@ extern "efiapi" fn console_get_mode(
 }
 
 /// Set the console mode
+///
+/// When switching to text mode, we set up the framebuffer console with
+/// centered text rendering (like EDK2's GraphicsConsole DeltaX/DeltaY).
+/// When switching to graphics mode, we clear the screen for GOP use.
 extern "efiapi" fn console_set_mode(
     _this: *mut ConsoleControlProtocol,
     mode: ScreenMode,
@@ -88,12 +92,66 @@ extern "efiapi" fn console_set_mode(
         return Status::INVALID_PARAMETER;
     }
 
+    let prev_mode = unsafe { CURRENT_MODE };
     unsafe {
         CURRENT_MODE = mode;
     }
 
-    // In a full implementation, we would switch between text and graphics
-    // rendering here. For now, we just track the mode.
+    log::debug!("ConsoleControl.SetMode({:?} -> {:?})", prev_mode, mode);
+
+    match mode {
+        ScreenMode::Text => {
+            // Switch to text mode: set up centered text area
+            crate::state::with_console_mut(|console| {
+                let Some(ref fb) = console.efi_framebuffer else {
+                    return;
+                };
+
+                let (cols, rows, delta_x, delta_y) =
+                    crate::efi::protocols::console::compute_centered_text_layout(fb);
+
+                // Clear entire framebuffer
+                let fb_size = fb.y_resolution as usize * fb.bytes_per_line as usize;
+                unsafe {
+                    let dst = fb.physical_address as *mut u8;
+                    core::slice::from_raw_parts_mut(dst, fb_size).fill(0);
+                }
+
+                console.start_row = 0;
+                console.dimensions = (cols, rows);
+                console.cursor_pos = (0, 0);
+                console.delta_x = delta_x;
+                console.delta_y = delta_y;
+
+                log::debug!(
+                    "ConsoleControl: text mode {}x{} chars, centered at ({}, {}) px",
+                    cols,
+                    rows,
+                    delta_x,
+                    delta_y
+                );
+            });
+        }
+        ScreenMode::Graphics => {
+            // Switch to graphics mode: clear screen for GOP consumers
+            crate::state::with_console_mut(|console| {
+                let Some(ref fb) = console.efi_framebuffer else {
+                    return;
+                };
+
+                let fb_size = fb.y_resolution as usize * fb.bytes_per_line as usize;
+                unsafe {
+                    let dst = fb.physical_address as *mut u8;
+                    core::slice::from_raw_parts_mut(dst, fb_size).fill(0);
+                }
+
+                // Reset centering offsets (GOP uses raw pixel addressing)
+                console.delta_x = 0;
+                console.delta_y = 0;
+            });
+        }
+        _ => {}
+    }
 
     Status::SUCCESS
 }

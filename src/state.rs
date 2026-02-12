@@ -152,7 +152,11 @@ pub fn try_get() -> Option<&'static FirmwareState> {
 #[inline]
 pub fn try_get_mut_ptr() -> Option<*mut FirmwareState> {
     let ptr = STATE_PTR.load(Ordering::Acquire);
-    if ptr.is_null() { None } else { Some(ptr) }
+    if ptr.is_null() {
+        None
+    } else {
+        Some(ptr)
+    }
 }
 
 // ============================================================================
@@ -671,6 +675,16 @@ pub struct ConsoleState {
     /// Console start row (EFI console uses bottom half of screen)
     pub start_row: u32,
 
+    /// Pixel offset for centering the text region horizontally (EDK2 DeltaX)
+    pub delta_x: u32,
+    /// Pixel offset for centering the text region vertically (EDK2 DeltaY)
+    pub delta_y: u32,
+
+    /// Current foreground color (RGB) set by SetAttribute
+    pub fg_color: (u8, u8, u8),
+    /// Current background color (RGB) set by SetAttribute
+    pub bg_color: (u8, u8, u8),
+
     /// Input state for escape sequence parsing
     pub input: InputState,
 
@@ -690,6 +704,10 @@ impl ConsoleState {
             cursor_pos: (0, 0),
             dimensions: (80, 25),
             start_row: 0,
+            delta_x: 0,
+            delta_y: 0,
+            fg_color: (255, 255, 255), // EFI_LIGHTGRAY default
+            bg_color: (0, 0, 0),       // EFI_BLACK default
             input: InputState::new(),
             logger_framebuffer: None,
             logger_cursor: (0, 0),

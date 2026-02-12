@@ -16,5 +16,6 @@ pub mod pass_thru_init;
 pub mod scsi_pass_thru;
 pub mod serial_io;
 pub mod simple_file_system;
+pub mod simple_text_input_ex;
 pub mod storage_security;
 pub mod unicode_collation;
