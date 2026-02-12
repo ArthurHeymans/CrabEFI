@@ -8,9 +8,9 @@ pub mod regs;
 
 use crate::drivers::pci::{self, PciAddress, PciDevice};
 use crate::efi;
-use crate::time::{Timeout, wait_for};
+use crate::time::{wait_for, Timeout};
 use core::ptr;
-use core::sync::atomic::{Ordering, fence};
+use core::sync::atomic::{fence, Ordering};
 use spin::Mutex;
 use tock_registers::interfaces::{ReadWriteable, Readable, Writeable};
 
@@ -501,27 +501,28 @@ impl SdhciController {
         loop {
             let status = regs.int_status.get();
 
-            // Check for errors
-            if regs.int_status.is_set(INT_STATUS::ERROR) {
-                // Clear status
+            // Check for errors -- must check saved status BEFORE clearing,
+            // because the interrupt status register is write-1-to-clear
+            if status & INT_STATUS::ERROR::SET.value != 0 {
+                // Clear status after saving it
                 regs.int_status.set(status);
 
-                if regs.int_status.is_set(INT_STATUS::CMD_TIMEOUT) {
+                if status & INT_STATUS::CMD_TIMEOUT::SET.value != 0 {
                     log::debug!("SDHCI: CMD{} timeout", cmd);
                     let _ = self.reset_cmd();
                     return Err(SdhciError::CommandTimeout);
                 }
-                if regs.int_status.is_set(INT_STATUS::CMD_CRC) {
+                if status & INT_STATUS::CMD_CRC::SET.value != 0 {
                     log::debug!("SDHCI: CMD{} CRC error", cmd);
                     let _ = self.reset_cmd();
                     return Err(SdhciError::CommandCrcError);
                 }
-                if regs.int_status.is_set(INT_STATUS::CMD_INDEX) {
+                if status & INT_STATUS::CMD_INDEX::SET.value != 0 {
                     log::debug!("SDHCI: CMD{} index error", cmd);
                     let _ = self.reset_cmd();
                     return Err(SdhciError::CommandIndexError);
                 }
-                if regs.int_status.is_set(INT_STATUS::CMD_END_BIT) {
+                if status & INT_STATUS::CMD_END_BIT::SET.value != 0 {
                     log::debug!("SDHCI: CMD{} end bit error", cmd);
                     let _ = self.reset_cmd();
                     return Err(SdhciError::CommandEndBitError);
@@ -834,8 +835,16 @@ impl SdhciController {
             regs.int_status.set(0xFFFFFFFF);
 
             // Set DMA address (use our page-aligned buffer)
-            let dma_addr = self.dma_buffer as u32;
-            regs.sdma_addr.set(dma_addr);
+            // SDMA only supports 32-bit addresses; verify buffer is below 4 GiB
+            let dma_addr = self.dma_buffer as u64;
+            if dma_addr > u32::MAX as u64 {
+                log::error!(
+                    "SDHCI: DMA buffer at {:#x} exceeds 32-bit SDMA limit",
+                    dma_addr
+                );
+                return Err(SdhciError::DmaError);
+            }
+            regs.sdma_addr.set(dma_addr as u32);
 
             // Set block size with SDMA boundary (512KB)
             regs.block_size.write(
@@ -885,21 +894,21 @@ impl SdhciController {
         // Wait for command complete
         let timeout = Timeout::from_ms(CMD_TIMEOUT_MS);
         loop {
-            // Check for errors or completion in a scoped borrow
+            // Read status once to avoid TOCTOU races with hardware
             let (has_error, error_status, is_complete, is_timeout) = {
                 let regs = self.regs();
-                let has_error = regs.int_status.is_set(INT_STATUS::ERROR);
-                let error_status = if has_error { regs.int_status.get() } else { 0 };
-                let is_complete = regs.int_status.is_set(INT_STATUS::CMD_COMPLETE);
+                let status = regs.int_status.get();
+                let has_error = status & INT_STATUS::ERROR::SET.value != 0;
+                let is_complete = status & INT_STATUS::CMD_COMPLETE::SET.value != 0;
 
                 if has_error {
-                    regs.int_status.set(error_status);
+                    regs.int_status.set(status);
                 }
                 if is_complete {
                     regs.int_status.write(INT_STATUS::CMD_COMPLETE::SET);
                 }
 
-                (has_error, error_status, is_complete, timeout.is_expired())
+                (has_error, status, is_complete, timeout.is_expired())
             };
 
             if has_error {
@@ -943,14 +952,15 @@ impl SdhciController {
                 let regs = self.regs();
                 let status = regs.int_status.get();
 
-                if regs.int_status.is_set(INT_STATUS::ERROR) {
+                if status & INT_STATUS::ERROR::SET.value != 0 {
+                    // Clear status after saving -- check saved value, not register
                     regs.int_status.set(status);
                     DataResult::Error {
                         status,
-                        is_timeout: regs.int_status.is_set(INT_STATUS::DATA_TIMEOUT),
-                        is_crc: regs.int_status.is_set(INT_STATUS::DATA_CRC),
-                        is_end_bit: regs.int_status.is_set(INT_STATUS::DATA_END_BIT),
-                        is_adma: regs.int_status.is_set(INT_STATUS::ADMA),
+                        is_timeout: status & INT_STATUS::DATA_TIMEOUT::SET.value != 0,
+                        is_crc: status & INT_STATUS::DATA_CRC::SET.value != 0,
+                        is_end_bit: status & INT_STATUS::DATA_END_BIT::SET.value != 0,
+                        is_adma: status & INT_STATUS::ADMA::SET.value != 0,
                     }
                 } else if regs.int_status.is_set(INT_STATUS::DMA_INT) {
                     // For SDMA, handle DMA interrupts if transfer crosses boundary
@@ -1163,9 +1173,12 @@ pub fn init() {
 }
 
 /// Get an SDHCI controller by index
-pub fn get_controller(index: usize) -> Option<&'static mut SdhciController> {
+///
+/// Returns a raw pointer to avoid `&'static mut` aliasing UB.
+/// The caller must ensure no overlapping mutable references are created.
+pub fn get_controller(index: usize) -> Option<*mut SdhciController> {
     let controllers = SDHCI_CONTROLLERS.lock();
-    controllers.get(index).map(|ptr| unsafe { &mut *ptr.0 })
+    controllers.get(index).map(|ptr| ptr.0)
 }
 
 /// Get the number of initialized SDHCI controllers
@@ -1241,8 +1254,9 @@ pub fn global_read_sectors(lba: u64, buffer: &mut [u8]) -> Result<(), ()> {
     };
 
     // Get the controller
+    // Safety: pointer valid for firmware lifetime; no overlapping &mut created
     let controller = match get_controller(controller_index) {
-        Some(c) => c,
+        Some(c) => unsafe { &mut *c },
         None => {
             log::error!(
                 "global_read_sectors: no SDHCI controller at index {}",

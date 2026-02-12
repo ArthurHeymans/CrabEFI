@@ -248,15 +248,10 @@ static mut PROTOCOL_TO_CONTEXT: [Option<*mut AtaPassThruProtocol>; MAX_INSTANCES
 fn find_context_index(protocol: *mut AtaPassThruProtocol) -> Option<usize> {
     unsafe {
         let proto_map = core::ptr::addr_of!(PROTOCOL_TO_CONTEXT);
-        for (i, p) in (*proto_map).iter().enumerate() {
-            if let Some(ptr) = p
-                && *ptr == protocol
-            {
-                return Some(i);
-            }
-        }
+        (*proto_map)
+            .iter()
+            .position(|p| p.is_some_and(|ptr| ptr == protocol))
     }
-    None
 }
 
 /// Get context for a protocol instance
@@ -319,22 +314,13 @@ extern "efiapi" fn ata_pass_thru(
     };
 
     // Find the port index that matches the requested port number
-    let port_index = {
-        let mut found = None;
-        for i in 0..controller.num_active_ports() {
-            if let Some(p) = controller.get_port(i)
-                && p.port_num as u16 == port
-            {
-                found = Some(i);
-                break;
-            }
-        }
-        match found {
-            Some(idx) => idx,
-            None => {
-                log::error!("AtaPassThru.PassThru: port {} not found", port);
-                return Status::INVALID_PARAMETER;
-            }
+    let port_index = match (0..controller.num_active_ports())
+        .find(|&i| controller.get_port(i).is_some_and(|p| p.port_num as u16 == port))
+    {
+        Some(idx) => idx,
+        None => {
+            log::error!("AtaPassThru.PassThru: port {} not found", port);
+            return Status::INVALID_PARAMETER;
         }
     };
 
@@ -523,14 +509,14 @@ extern "efiapi" fn ata_get_next_device(
         current_pmp
     );
 
-    // No port multiplier support - each port has device at PMP 0xFFFF
+    // No port multiplier support - each port has device at PMP 0
     if current_pmp == 0xFFFF {
-        // 0xFFFF means "get first device", return 0xFFFF (no port multiplier)
-        unsafe { *port_multiplier_port = 0xFFFF };
+        // 0xFFFF means "get first device", return PMP 0 (no port multiplier)
+        unsafe { *port_multiplier_port = 0 };
         return Status::SUCCESS;
     }
 
-    // Already returned the only device
+    // Already returned the only device (PMP 0)
     Status::NOT_FOUND
 }
 
@@ -689,15 +675,8 @@ pub fn create_ata_pass_thru_protocol(
 ) -> *mut AtaPassThruProtocol {
     // Find a free context slot
     let ctx_idx = unsafe {
-        let mut found = None;
         let contexts = core::ptr::addr_of!(CONTEXTS);
-        for (i, slot) in (*contexts).iter().enumerate() {
-            if slot.is_none() {
-                found = Some(i);
-                break;
-            }
-        }
-        match found {
+        match (*contexts).iter().position(|slot| slot.is_none()) {
             Some(i) => i,
             None => {
                 log::error!("AtaPassThru: no free context slots");
@@ -736,6 +715,7 @@ pub fn create_ata_pass_thru_protocol(
         });
 
     if protocol_ptr.is_null() {
+        crate::efi::allocator::free_pool(mode_ptr as *mut u8);
         return core::ptr::null_mut();
     }
 

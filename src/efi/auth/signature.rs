@@ -4,8 +4,8 @@
 //! authenticated variables.
 
 use super::structures::{EfiTime, EfiVariableAuthentication2};
-use super::variables::{SecureBootVariable, db_database, dbx_database, kek_database, pk_database};
-use super::{AuthError, WIN_CERT_TYPE_EFI_GUID, is_setup_mode};
+use super::variables::{db_database, dbx_database, kek_database, pk_database, SecureBootVariable};
+use super::{is_setup_mode, AuthError, WIN_CERT_TYPE_EFI_GUID};
 use alloc::vec::Vec;
 use r_efi::efi::Guid;
 
@@ -208,12 +208,12 @@ fn build_signed_data(
 ) -> Vec<u8> {
     let mut result = Vec::new();
 
-    // VariableName (UCS-2, including null terminator)
+    // VariableName (UCS-2, NOT including null terminator per UEFI spec Section 8.2.2)
     for &ch in variable_name {
-        result.extend_from_slice(&ch.to_le_bytes());
         if ch == 0 {
             break;
         }
+        result.extend_from_slice(&ch.to_le_bytes());
     }
 
     // VendorGuid (16 bytes)

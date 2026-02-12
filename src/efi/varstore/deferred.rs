@@ -52,7 +52,7 @@
 
 use core::sync::atomic::{AtomicBool, Ordering};
 
-use super::{SerializedTime, VarStoreError, VariableRecord, crc32};
+use super::{crc32, SerializedTime, VarStoreError, VariableRecord};
 use crate::efi::auth;
 
 /// Magic value for the deferred buffer header: "CVBF" (CrabVariable Buffer)
@@ -258,9 +258,19 @@ pub fn check_pending() -> usize {
         return 0;
     }
 
+    // Verify data size is within buffer bounds
+    let total_size = header.total_size as usize;
+    if HEADER_SIZE.saturating_add(total_size) > buffer_size() {
+        log::warn!(
+            "Deferred buffer header total_size ({}) exceeds buffer bounds",
+            total_size
+        );
+        return 0;
+    }
+
     // Verify data CRC
     let data_start = unsafe { base.add(HEADER_SIZE) };
-    let data_slice = unsafe { core::slice::from_raw_parts(data_start, header.total_size as usize) };
+    let data_slice = unsafe { core::slice::from_raw_parts(data_start, total_size) };
     let computed_crc = crc32(data_slice);
 
     if computed_crc != header.data_crc {

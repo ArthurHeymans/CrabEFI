@@ -5,9 +5,9 @@
 
 use crate::drivers::pci::{self, PciAddress, PciDevice};
 use crate::efi;
-use crate::time::{Timeout, wait_for};
+use crate::time::{wait_for, Timeout};
 use core::ptr;
-use core::sync::atomic::{Ordering, fence};
+use core::sync::atomic::{fence, Ordering};
 use spin::Mutex;
 use tock_registers::interfaces::{ReadWriteable, Readable, Writeable};
 use tock_registers::register_bitfields;
@@ -571,7 +571,10 @@ impl NvmeController {
         regs.cc.modify(CC::EN::CLEAR);
 
         // Wait for controller to become disabled (up to 1 second)
-        wait_for(1000, || regs.csts.read(CSTS::RDY) == 0);
+        if !wait_for(1000, || regs.csts.read(CSTS::RDY) == 0) {
+            log::error!("NVMe: Timeout waiting for controller to disable");
+            return Err(NvmeError::Timeout);
+        }
 
         // Set admin queue attributes
         regs.aqa.write(
@@ -1038,7 +1041,7 @@ impl NvmeController {
         cmd.nsid = nsid;
         cmd.prp1 = self.dma_buffer as u64;
         cmd.cdw10 = ((protocol_id as u32) << 24) | (sp_specific as u32);
-        cmd.cdw11 = (buffer.len() as u32).div_ceil(4); // Allocation length in dwords
+        cmd.cdw11 = buffer.len() as u32; // Allocation length in bytes per NVMe spec
 
         let cid = self.submit_admin_command(&cmd);
         let completion = self.wait_admin_completion(cid)?;
@@ -1108,7 +1111,7 @@ impl NvmeController {
         cmd.nsid = nsid;
         cmd.prp1 = self.dma_buffer as u64;
         cmd.cdw10 = ((protocol_id as u32) << 24) | (sp_specific as u32);
-        cmd.cdw11 = (buffer.len() as u32).div_ceil(4); // Transfer length in dwords
+        cmd.cdw11 = buffer.len() as u32; // Transfer length in bytes per NVMe spec
 
         let cid = self.submit_admin_command(&cmd);
         self.wait_admin_completion(cid)?;

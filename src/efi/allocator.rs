@@ -856,14 +856,29 @@ impl MemoryAllocator {
 
         // Check if we have space BEFORE modifying
         let entries_after_op = self.entries.len() + new_entries_needed - 1;
-        if entries_after_op > MAX_MEMORY_ENTRIES {
+        let idx = if entries_after_op > MAX_MEMORY_ENTRIES {
             self.merge_entries();
             if self.entries.len() + new_entries_needed - 1 > MAX_MEMORY_ENTRIES {
                 log::warn!("Memory map full, cannot split loader region");
                 return false;
             }
-        }
+            // Re-find the entry after merging since indices may have changed
+            match self.entries.iter().position(|entry| {
+                let is_loader = matches!(
+                    entry.get_memory_type(),
+                    Some(MemoryType::LoaderCode) | Some(MemoryType::LoaderData)
+                );
+                is_loader && entry.physical_start <= addr && entry.end() >= end
+            }) {
+                Some(i) => i,
+                None => return false,
+            }
+        } else {
+            idx
+        };
 
+        // Re-read the entry in case merge changed the index
+        let entry = self.entries[idx];
         let attribute = entry.attribute;
 
         // Remove the old entry
@@ -956,7 +971,7 @@ impl MemoryAllocator {
         // Check if we have space BEFORE modifying anything
         // We remove 1 entry and add new_entries_needed, so net change is new_entries_needed - 1
         let entries_after_op = self.entries.len() + new_entries_needed - 1;
-        if entries_after_op > MAX_MEMORY_ENTRIES {
+        let idx = if entries_after_op > MAX_MEMORY_ENTRIES {
             // Try to make room by merging first
             self.merge_entries();
             let entries_after_merge = self.entries.len() + new_entries_needed - 1;
@@ -967,7 +982,20 @@ impl MemoryAllocator {
                 );
                 return Err(efi::Status::OUT_OF_RESOURCES);
             }
-        }
+            // Re-find the entry after merging since indices may have changed
+            self.entries
+                .iter()
+                .position(|entry| {
+                    entry
+                        .get_memory_type()
+                        .is_some_and(|mt| source_types.contains(&mt))
+                        && entry.physical_start <= addr
+                        && entry.end() >= end
+                })
+                .ok_or(efi::Status::NOT_FOUND)?
+        } else {
+            idx
+        };
 
         // Now safe to remove the old entry
         self.entries.remove(idx);

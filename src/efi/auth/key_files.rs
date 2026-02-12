@@ -90,25 +90,19 @@ pub fn find_key_files() -> Option<KeyFileSearchResult> {
 fn search_nvme_devices() -> Option<KeyFileSearchResult> {
     use crate::drivers::nvme;
 
-    if let Some(controller_ptr) = nvme::get_controller(0) {
-        // Safety: pointer valid for firmware lifetime; no overlapping &mut created
-        let controller = unsafe { &mut *controller_ptr };
-        if let Some(ns) = controller.default_namespace() {
-            let nsid = ns.nsid;
+    // First borrow: get namespace info, then drop the reference
+    let nsid = {
+        let controller_ptr = nvme::get_controller(0)?;
+        let controller = unsafe { &*controller_ptr };
+        controller.default_namespace().map(|ns| ns.nsid)?
+    };
 
-            if let Some(controller_ptr) = nvme::get_controller(0) {
-                // Safety: pointer valid for firmware lifetime; no overlapping &mut created
-                let controller = unsafe { &mut *controller_ptr };
-                let mut disk = NvmeDisk::new(controller, nsid);
+    // Second borrow: use the controller for disk I/O (no aliased &mut)
+    let controller_ptr = nvme::get_controller(0)?;
+    let controller = unsafe { &mut *controller_ptr };
+    let mut disk = NvmeDisk::new(controller, nsid);
 
-                if let Some(result) = search_disk_for_keys(&mut disk, "NVMe") {
-                    return Some(result);
-                }
-            }
-        }
-    }
-
-    None
+    search_disk_for_keys(&mut disk, "NVMe")
 }
 
 /// Search AHCI devices for key files
@@ -141,12 +135,16 @@ fn search_sdhci_devices() -> Option<KeyFileSearchResult> {
     use crate::drivers::sdhci;
 
     for controller_id in 0..sdhci::controller_count() {
-        if let Some(controller) = sdhci::get_controller(controller_id) {
+        if let Some(controller_ptr) = sdhci::get_controller(controller_id) {
+            // Safety: pointer valid for firmware lifetime
+            let controller = unsafe { &mut *controller_ptr };
             if !controller.is_ready() {
                 continue;
             }
 
-            if let Some(controller) = sdhci::get_controller(controller_id) {
+            if let Some(controller_ptr) = sdhci::get_controller(controller_id) {
+                // Safety: pointer valid for firmware lifetime
+                let controller = unsafe { &mut *controller_ptr };
                 let mut disk = SdhciDisk::new(controller);
 
                 if let Some(result) = search_disk_for_keys(&mut disk, "SD") {

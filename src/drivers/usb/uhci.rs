@@ -800,7 +800,7 @@ impl UsbController for UhciController {
     ) -> Result<usize, UsbError> {
         let dev = self.get_device(device).ok_or(UsbError::DeviceNotFound)?;
 
-        let _ep_info = if is_in {
+        let ep_info = if is_in {
             dev.bulk_in.as_ref()
         } else {
             dev.bulk_out.as_ref()
@@ -808,89 +808,118 @@ impl UsbController for UhciController {
         .ok_or(UsbError::InvalidParameter)?;
 
         let is_low_speed = dev.speed == UsbSpeed::Low;
-        let toggle = if is_in {
+        let address = dev.address;
+        // UHCI TDs can encode up to 2048 bytes (11-bit MaxLen field), but we
+        // limit to max_packet_size to stay within spec and avoid crossing page
+        // boundaries in a single TD.
+        let max_packet = ep_info.max_packet_size as usize;
+        let max_per_td = if max_packet > 0 { max_packet } else { 64 };
+
+        let td_addr = self.dma_buffer;
+        let data_buffer = td_addr + 64;
+
+        let mut total_transferred = 0usize;
+        let mut offset = 0usize;
+        let mut toggle = if is_in {
             dev.bulk_in_toggle
         } else {
             dev.bulk_out_toggle
         };
 
-        // Allocate TD
-        let td_addr = self.dma_buffer;
-        let data_buffer = td_addr + 64;
+        while offset < data.len() {
+            let chunk = (data.len() - offset).min(max_per_td);
 
-        // Copy data for OUT
-        if !is_in {
-            unsafe {
-                ptr::copy_nonoverlapping(data.as_ptr(), data_buffer as *mut u8, data.len());
+            // Copy data for OUT
+            if !is_in {
+                unsafe {
+                    ptr::copy_nonoverlapping(
+                        data.as_ptr().add(offset),
+                        data_buffer as *mut u8,
+                        chunk,
+                    );
+                }
             }
-        }
 
-        // Create TD
-        let td = unsafe { &mut *(td_addr as *mut TransferDescriptor) };
-        *td = TransferDescriptor::data(
-            dev.address,
-            endpoint,
-            data_buffer as u32,
-            data.len(),
-            is_in,
-            toggle,
-            0,
-            is_low_speed,
-        );
-        td.ctrl_sts |= TransferDescriptor::CS_IOC;
+            // Create TD for this chunk
+            let td = unsafe { &mut *(td_addr as *mut TransferDescriptor) };
+            *td = TransferDescriptor::data(
+                address,
+                endpoint,
+                data_buffer as u32,
+                chunk,
+                is_in,
+                toggle,
+                0,
+                is_low_speed,
+            );
+            td.ctrl_sts |= TransferDescriptor::CS_IOC;
 
-        fence(Ordering::SeqCst);
-
-        // Point QH to TD
-        let qh = unsafe { &mut *(self.qh as *mut QueueHead) };
-        qh.element_link = td_addr as u32;
-        fence(Ordering::SeqCst);
-
-        // Wait for completion
-        let timeout = Timeout::from_ms(5000);
-        while !timeout.is_expired() {
             fence(Ordering::SeqCst);
-            if !td.is_active() {
+
+            // Point QH to TD
+            let qh = unsafe { &mut *(self.qh as *mut QueueHead) };
+            qh.element_link = td_addr as u32;
+            fence(Ordering::SeqCst);
+
+            // Wait for completion
+            let timeout = Timeout::from_ms(5000);
+            while !timeout.is_expired() {
+                fence(Ordering::SeqCst);
+                if !td.is_active() {
+                    break;
+                }
+                core::hint::spin_loop();
+            }
+
+            // Clear QH
+            qh.element_link = QueueHead::TERMINATE;
+            fence(Ordering::SeqCst);
+
+            // Check result
+            if td.is_active() {
+                return Err(UsbError::Timeout);
+            }
+
+            if td.has_error() {
+                if td.is_stalled() {
+                    return Err(UsbError::Stall);
+                }
+                return Err(UsbError::TransactionError);
+            }
+
+            let transferred = td.actual_length();
+
+            // Copy data for IN
+            if is_in && transferred > 0 {
+                unsafe {
+                    ptr::copy_nonoverlapping(
+                        data_buffer as *const u8,
+                        data.as_mut_ptr().add(offset),
+                        transferred,
+                    );
+                }
+            }
+
+            toggle = !toggle;
+            total_transferred += transferred;
+            offset += chunk;
+
+            // Short packet means transfer is done (device had less data)
+            if transferred < chunk {
                 break;
             }
-            core::hint::spin_loop();
         }
-
-        // Clear QH
-        qh.element_link = QueueHead::TERMINATE;
-        fence(Ordering::SeqCst);
-
-        // Check result
-        if td.is_active() {
-            return Err(UsbError::Timeout);
-        }
-
-        if td.has_error() {
-            if td.is_stalled() {
-                return Err(UsbError::Stall);
-            }
-            return Err(UsbError::TransactionError);
-        }
-
-        let transferred = td.actual_length();
 
         // Update toggle
         if let Some(dev) = self.get_device_mut(device) {
             if is_in {
-                dev.bulk_in_toggle = !toggle;
+                dev.bulk_in_toggle = toggle;
             } else {
-                dev.bulk_out_toggle = !toggle;
+                dev.bulk_out_toggle = toggle;
             }
         }
 
-        // Copy data for IN
-        if is_in {
-            unsafe {
-                ptr::copy_nonoverlapping(data_buffer as *const u8, data.as_mut_ptr(), transferred);
-            }
-        }
-
-        Ok(transferred)
+        Ok(total_transferred)
     }
 
     fn create_interrupt_queue(

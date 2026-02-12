@@ -399,13 +399,17 @@ pub fn is_iso9660(device: &mut dyn BlockDevice) -> bool {
     // Check for Primary Volume Descriptor at sector 16
     let pvd_sector = 16 * sectors_per_iso_sector as u64;
 
-    let mut buffer = [0u8; 8];
+    // Buffer must be at least block_size to avoid buffer overflow from read_block
+    let mut buffer = [0u8; 4096]; // MAX_BLOCK_SIZE
+    let read_size = block_size.min(buffer.len());
 
-    // Just read enough to check the signature
-    if device.read_block(pvd_sector, &mut buffer).is_err() {
+    if device
+        .read_block(pvd_sector, &mut buffer[..read_size])
+        .is_err()
+    {
         return false;
     }
 
     // Check for CD001 signature at offset 1
-    &buffer[1..6] == CD001_SIGNATURE
+    read_size >= 6 && &buffer[1..6] == CD001_SIGNATURE
 }

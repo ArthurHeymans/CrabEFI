@@ -397,6 +397,14 @@ pub unsafe fn parse(ptr: *const u8) -> CorebootInfo {
         let mut offset = 0u32;
 
         while offset < table_bytes {
+            let remaining = table_bytes - offset;
+
+            // Need at least 8 bytes for the record header
+            if remaining < 8 {
+                log::warn!("Truncated record header at offset {}", offset);
+                break;
+            }
+
             let record_ptr = table_start.add(offset as usize);
 
             // Read record header to get size
@@ -409,6 +417,16 @@ pub unsafe fn parse(ptr: *const u8) -> CorebootInfo {
 
             if record_size < 8 {
                 log::warn!("Invalid record size: {}", record_size);
+                break;
+            }
+
+            if record_size > remaining {
+                log::warn!(
+                    "Record size {} exceeds remaining table bytes {} at offset {}",
+                    record_size,
+                    remaining,
+                    offset
+                );
                 break;
             }
 
@@ -493,7 +511,8 @@ unsafe fn scan_for_header() -> Option<*const CbHeader> {
     // 4. In high memory (where coreboot typically puts them)
 
     // First, try low memory
-    if let Some(header) = scan_for_header_at(core::ptr::null::<u8>(), 0x1000) {
+    // Use without_provenance instead of null to avoid UB with ptr::add on null
+    if let Some(header) = scan_for_header_at(core::ptr::without_provenance::<u8>(0), 0x1000) {
         log::debug!("Found coreboot tables in low memory");
         return Some(header);
     }
@@ -791,6 +810,13 @@ unsafe fn parse_forward(record_bytes: &[u8], info: &mut CorebootInfo) {
     let mut offset = 0u32;
 
     while offset < table_bytes {
+        let remaining = table_bytes - offset;
+
+        if remaining < 8 {
+            log::warn!("Truncated record header at offset {}", offset);
+            break;
+        }
+
         let record_ptr = table_start.add(offset as usize);
 
         // Read record header to get size
@@ -803,6 +829,16 @@ unsafe fn parse_forward(record_bytes: &[u8], info: &mut CorebootInfo) {
 
         if record_size < 8 {
             log::warn!("Invalid record size: {}", record_size);
+            break;
+        }
+
+        if record_size > remaining {
+            log::warn!(
+                "Record size {} exceeds remaining table bytes {} at offset {}",
+                record_size,
+                remaining,
+                offset
+            );
             break;
         }
 

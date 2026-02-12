@@ -547,8 +547,11 @@ impl OhciController {
         self.write_reg(regs::HCBULKHEADED, self.bulk_ed as u32);
 
         // Restore frame interval with toggle inverted
-        let new_fminterval = (fminterval & 0x3FFF)
-            | ((fminterval & 0x3FFF) << 16)
+        // FSLargestDataPacket = ((FrameInterval - 210) * 6 / 7) per OHCI spec
+        let frame_interval = fminterval & 0x3FFF;
+        let fslpd = ((frame_interval.saturating_sub(210)) * 6) / 7;
+        let new_fminterval = frame_interval
+            | (fslpd << 16)
             | (!fminterval_toggle & (1 << 31));
         self.write_reg(regs::HCFMINTERVAL, new_fminterval);
 
@@ -857,108 +860,142 @@ impl UsbController for OhciController {
         .ok_or(UsbError::InvalidParameter)?;
 
         let max_packet = ep_info.max_packet_size;
-        let toggle = if is_in {
+        let address = dev.address;
+        let is_low_speed = dev.speed == UsbSpeed::Low;
+        // OHCI TDs can span up to 8KB (two 4KB pages), but we limit to
+        // 4096 bytes per TD to avoid crossing page boundaries and to stay
+        // within safe limits for all controllers.
+        let max_per_td = if max_packet > 0 {
+            4096usize.min(data.len())
+        } else {
+            4096usize
+        };
+
+        let ed_addr = self.dma_buffer;
+        let td_addr = ed_addr + 32;
+        let data_buffer = td_addr + 32;
+
+        let mut total_transferred = 0usize;
+        let mut offset = 0usize;
+        let mut toggle = if is_in {
             dev.bulk_in_toggle
         } else {
             dev.bulk_out_toggle
         };
 
-        // Allocate ED and TD
-        let ed_addr = self.dma_buffer;
-        let td_addr = ed_addr + 32;
-        let data_buffer = td_addr + 32;
+        while offset < data.len() {
+            let chunk = (data.len() - offset).min(max_per_td);
 
-        // Copy data for OUT
-        if !is_in {
-            unsafe {
-                ptr::copy_nonoverlapping(data.as_ptr(), data_buffer as *mut u8, data.len());
+            // Copy data for OUT
+            if !is_in {
+                unsafe {
+                    ptr::copy_nonoverlapping(
+                        data.as_ptr().add(offset),
+                        data_buffer as *mut u8,
+                        chunk,
+                    );
+                }
             }
-        }
 
-        // Create ED
-        let ed = unsafe { &mut *(ed_addr as *mut EndpointDescriptor) };
-        *ed = EndpointDescriptor::new(
-            dev.address,
-            endpoint,
-            max_packet,
-            dev.speed == UsbSpeed::Low,
-            Some(if is_in { Direction::In } else { Direction::Out }),
-        );
+            // Create ED
+            let ed = unsafe { &mut *(ed_addr as *mut EndpointDescriptor) };
+            *ed = EndpointDescriptor::new(
+                address,
+                endpoint,
+                max_packet,
+                is_low_speed,
+                Some(if is_in { Direction::In } else { Direction::Out }),
+            );
 
-        // Create TD
-        let td = unsafe { &mut *(td_addr as *mut TransferDescriptor) };
-        *td = TransferDescriptor::data(data_buffer as u32, data.len(), is_in, toggle, 0);
-        td.control &= !TransferDescriptor::CTRL_DI_NONE;
-        td.control |= 0 << TransferDescriptor::CTRL_DI_SHIFT;
+            // Create TD for this chunk
+            let td = unsafe { &mut *(td_addr as *mut TransferDescriptor) };
+            *td = TransferDescriptor::data(data_buffer as u32, chunk, is_in, toggle, 0);
+            td.control &= !TransferDescriptor::CTRL_DI_NONE;
+            td.control |= 0 << TransferDescriptor::CTRL_DI_SHIFT;
 
-        ed.head_td = td_addr as u32 | if toggle { 2 } else { 0 };
-        ed.tail_td = (td_addr + 16) as u32;
+            ed.head_td = td_addr as u32 | if toggle { 2 } else { 0 };
+            ed.tail_td = (td_addr + 16) as u32;
 
-        fence(Ordering::SeqCst);
-
-        // Insert into bulk list
-        let head_ed = unsafe { &mut *(self.bulk_ed as *mut EndpointDescriptor) };
-        ed.next_ed = head_ed.next_ed;
-        fence(Ordering::SeqCst);
-        head_ed.next_ed = ed_addr as u32;
-        fence(Ordering::SeqCst);
-
-        // Trigger bulk list
-        self.write_reg(regs::HCCOMMANDSTATUS, hccommandstatus::BLF);
-
-        // Wait for completion
-        let timeout = Timeout::from_ms(5000);
-        while !timeout.is_expired() {
             fence(Ordering::SeqCst);
-            if td.is_complete() {
+
+            // Insert into bulk list
+            let head_ed = unsafe { &mut *(self.bulk_ed as *mut EndpointDescriptor) };
+            ed.next_ed = head_ed.next_ed;
+            fence(Ordering::SeqCst);
+            head_ed.next_ed = ed_addr as u32;
+            fence(Ordering::SeqCst);
+
+            // Trigger bulk list
+            self.write_reg(regs::HCCOMMANDSTATUS, hccommandstatus::BLF);
+
+            // Wait for completion
+            let timeout = Timeout::from_ms(5000);
+            while !timeout.is_expired() {
+                fence(Ordering::SeqCst);
+                if td.is_complete() {
+                    break;
+                }
+                core::hint::spin_loop();
+            }
+
+            // Remove from list
+            head_ed.next_ed = ed.next_ed;
+            fence(Ordering::SeqCst);
+
+            // Check result
+            if !td.is_complete() {
+                return Err(UsbError::Timeout);
+            }
+
+            if td.has_error() {
+                if td.condition_code() == TransferDescriptor::CC_STALL {
+                    return Err(UsbError::Stall);
+                }
+                return Err(UsbError::TransactionError);
+            }
+
+            // Calculate transferred for this chunk
+            let transferred = if td.cbp == 0 {
+                chunk
+            } else if td.cbp > data_buffer as u32 {
+                (td.cbp - data_buffer as u32) as usize
+            } else {
+                chunk
+            };
+
+            // Get toggle from hardware
+            toggle = (ed.head_td & EndpointDescriptor::HEAD_TOGGLE) != 0;
+
+            // Copy data for IN
+            if is_in && transferred > 0 {
+                unsafe {
+                    ptr::copy_nonoverlapping(
+                        data_buffer as *const u8,
+                        data.as_mut_ptr().add(offset),
+                        transferred,
+                    );
+                }
+            }
+
+            total_transferred += transferred;
+            offset += chunk;
+
+            // Short packet means transfer is done
+            if transferred < chunk {
                 break;
             }
-            core::hint::spin_loop();
         }
-
-        // Remove from list
-        head_ed.next_ed = ed.next_ed;
-        fence(Ordering::SeqCst);
-
-        // Check result
-        if !td.is_complete() {
-            return Err(UsbError::Timeout);
-        }
-
-        if td.has_error() {
-            if td.condition_code() == TransferDescriptor::CC_STALL {
-                return Err(UsbError::Stall);
-            }
-            return Err(UsbError::TransactionError);
-        }
-
-        // Calculate transferred
-        let transferred = if td.cbp == 0 {
-            data.len()
-        } else if td.cbp > data_buffer as u32 {
-            (td.cbp - data_buffer as u32) as usize
-        } else {
-            data.len()
-        };
 
         // Update toggle
         if let Some(dev) = self.get_device_mut(device) {
-            let new_toggle = (ed.head_td & EndpointDescriptor::HEAD_TOGGLE) != 0;
             if is_in {
-                dev.bulk_in_toggle = new_toggle;
+                dev.bulk_in_toggle = toggle;
             } else {
-                dev.bulk_out_toggle = new_toggle;
+                dev.bulk_out_toggle = toggle;
             }
         }
 
-        // Copy data for IN
-        if is_in {
-            unsafe {
-                ptr::copy_nonoverlapping(data_buffer as *const u8, data.as_mut_ptr(), transferred);
-            }
-        }
-
-        Ok(transferred)
+        Ok(total_transferred)
     }
 
     fn create_interrupt_queue(
