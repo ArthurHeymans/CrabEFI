@@ -15,69 +15,75 @@ use crate::state::{self, MAX_VARIABLE_DATA_SIZE, MAX_VARIABLE_NAME_LEN, MAX_VARI
 // `&dyn Log` vtable pointer becomes a stale physical address. These functions
 // write directly to the serial port (COM1, 0x3F8) using x86 port I/O, which
 // is completely independent of the virtual memory address space.
+//
+// Gated behind the `rt-debug` feature flag (default off) to avoid overhead.
 
-/// COM1 base I/O port
-const COM1: u16 = 0x3F8;
+#[cfg(feature = "rt-debug")]
+mod rt_serial {
+    use super::*;
 
-/// Write a single byte to the serial port (blocking, waits for TX ready).
-#[allow(dead_code)]
-#[inline]
-fn rt_serial_byte(byte: u8) {
-    unsafe {
-        // Wait for Transmitter Holding Register Empty (bit 5 of LSR)
-        while io::inb(COM1 + 5) & 0x20 == 0 {
-            core::hint::spin_loop();
+    /// COM1 base I/O port
+    const COM1: u16 = 0x3F8;
+
+    /// Write a single byte to the serial port (blocking, waits for TX ready).
+    #[inline]
+    pub fn byte(b: u8) {
+        unsafe {
+            // Wait for Transmitter Holding Register Empty (bit 5 of LSR)
+            while io::inb(COM1 + 5) & 0x20 == 0 {
+                core::hint::spin_loop();
+            }
+            io::outb(COM1, b);
         }
-        io::outb(COM1, byte);
     }
-}
 
-/// Write a string to the serial port (with \n -> \r\n conversion).
-#[allow(dead_code)]
-fn rt_serial_str(s: &str) {
-    for &b in s.as_bytes() {
-        if b == b'\n' {
-            rt_serial_byte(b'\r');
+    /// Write a string to the serial port (with \n -> \r\n conversion).
+    pub fn str(s: &str) {
+        for &b in s.as_bytes() {
+            if b == b'\n' {
+                byte(b'\r');
+            }
+            byte(b);
         }
-        rt_serial_byte(b);
     }
-}
 
-/// Write a u64 as hex to the serial port.
-#[allow(dead_code)]
-fn rt_serial_hex(val: u64) {
-    rt_serial_str("0x");
-    if val == 0 {
-        rt_serial_byte(b'0');
-        return;
-    }
-    let mut started = false;
-    for i in (0..16).rev() {
-        let nibble = ((val >> (i * 4)) & 0xF) as u8;
-        if nibble != 0 || started {
-            started = true;
-            rt_serial_byte(if nibble < 10 {
-                b'0' + nibble
-            } else {
-                b'a' + nibble - 10
-            });
+    /// Write a u64 as hex to the serial port.
+    pub fn hex(val: u64) {
+        str("0x");
+        if val == 0 {
+            byte(b'0');
+            return;
+        }
+        let mut started = false;
+        for i in (0..16).rev() {
+            let nibble = ((val >> (i * 4)) & 0xF) as u8;
+            if nibble != 0 || started {
+                started = true;
+                byte(if nibble < 10 { b'0' + nibble } else { b'a' + nibble - 10 });
+            }
         }
     }
 }
 
 /// Runtime serial print -- tagged with "[RT] " prefix.
-#[allow(unused_macros)]
+/// No-op when the `rt-debug` feature is disabled.
 macro_rules! rt_serial_print {
     ($msg:expr) => {
-        rt_serial_str("[RT] ");
-        rt_serial_str($msg);
-        rt_serial_str("\n");
+        #[cfg(feature = "rt-debug")]
+        {
+            rt_serial::str("[RT] ");
+            rt_serial::str($msg);
+            rt_serial::str("\n");
+        }
     };
     ($msg:expr, $hex:expr) => {
-        rt_serial_str("[RT] ");
-        rt_serial_str($msg);
-        rt_serial_hex($hex as u64);
-        rt_serial_str("\n");
+        #[cfg(feature = "rt-debug")]
+        {
+            rt_serial::str("[RT] ");
+            rt_serial::str($msg);
+            rt_serial::hex($hex as u64);
+            rt_serial::str("\n");
+        }
     };
 }
 
@@ -158,6 +164,7 @@ pub fn get_runtime_code_address() -> u64 {
 // ============================================================================
 
 extern "efiapi" fn get_time(time: *mut Time, capabilities: *mut TimeCapabilities) -> Status {
+    #[cfg(feature = "rt-debug")]
     if unsafe { VIRTUAL_MODE } {
         rt_serial_print!("GetTime");
     }
@@ -194,6 +201,7 @@ extern "efiapi" fn get_time(time: *mut Time, capabilities: *mut TimeCapabilities
 }
 
 extern "efiapi" fn set_time(_time: *mut Time) -> Status {
+    #[cfg(feature = "rt-debug")]
     if unsafe { VIRTUAL_MODE } {
         rt_serial_print!("SetTime -> UNSUPPORTED");
     }
@@ -205,6 +213,7 @@ extern "efiapi" fn get_wakeup_time(
     _pending: *mut efi::Boolean,
     _time: *mut Time,
 ) -> Status {
+    #[cfg(feature = "rt-debug")]
     if unsafe { VIRTUAL_MODE } {
         rt_serial_print!("GetWakeupTime -> UNSUPPORTED");
     }
@@ -212,6 +221,7 @@ extern "efiapi" fn get_wakeup_time(
 }
 
 extern "efiapi" fn set_wakeup_time(_enable: efi::Boolean, _time: *mut Time) -> Status {
+    #[cfg(feature = "rt-debug")]
     if unsafe { VIRTUAL_MODE } {
         rt_serial_print!("SetWakeupTime -> UNSUPPORTED");
     }
@@ -502,7 +512,8 @@ extern "efiapi" fn set_virtual_address_map(
     // pointer dereference.
     log::set_max_level(log::LevelFilter::Off);
 
-    rt_serial_str("[RT] SetVirtualAddressMap returning SUCCESS\n");
+    #[cfg(feature = "rt-debug")]
+    rt_serial::str("[RT] SetVirtualAddressMap returning SUCCESS\n");
 
     Status::SUCCESS
 }
@@ -576,18 +587,19 @@ extern "efiapi" fn get_variable(
     data_size: *mut usize,
     data: *mut c_void,
 ) -> Status {
+    #[cfg(feature = "rt-debug")]
     if unsafe { VIRTUAL_MODE } {
-        rt_serial_str("[RT] GetVariable name=");
+        rt_serial::str("[RT] GetVariable name=");
         if !variable_name.is_null() {
             for i in 0..32 {
                 let c = unsafe { *variable_name.add(i) };
                 if c == 0 {
                     break;
                 }
-                rt_serial_byte(c as u8);
+                rt_serial::byte(c as u8);
             }
         }
-        rt_serial_str("\n");
+        rt_serial::str("\n");
     }
     if variable_name.is_null() || vendor_guid.is_null() || data_size.is_null() {
         return Status::INVALID_PARAMETER;
@@ -734,18 +746,19 @@ extern "efiapi" fn get_next_variable_name(
     variable_name: *mut u16,
     vendor_guid: *mut Guid,
 ) -> Status {
+    #[cfg(feature = "rt-debug")]
     if unsafe { VIRTUAL_MODE } {
-        rt_serial_str("[RT] GetNextVariableName name=");
+        rt_serial::str("[RT] GetNextVariableName name=");
         if !variable_name.is_null() {
             for i in 0..32 {
                 let c = unsafe { *variable_name.add(i) };
                 if c == 0 {
                     break;
                 }
-                rt_serial_byte(c as u8);
+                rt_serial::byte(c as u8);
             }
         }
-        rt_serial_str("\n");
+        rt_serial::str("\n");
     }
     if variable_name_size.is_null() || variable_name.is_null() || vendor_guid.is_null() {
         return Status::INVALID_PARAMETER;
@@ -940,22 +953,23 @@ extern "efiapi" fn set_variable(
     data_size: usize,
     data: *mut c_void,
 ) -> Status {
+    #[cfg(feature = "rt-debug")]
     if unsafe { VIRTUAL_MODE } {
-        rt_serial_str("[RT] SetVariable name=");
+        rt_serial::str("[RT] SetVariable name=");
         if !variable_name.is_null() {
             for i in 0..32 {
                 let c = unsafe { *variable_name.add(i) };
                 if c == 0 {
                     break;
                 }
-                rt_serial_byte(c as u8);
+                rt_serial::byte(c as u8);
             }
         }
-        rt_serial_str(" attr=");
-        rt_serial_hex(attributes as u64);
-        rt_serial_str(" size=");
-        rt_serial_hex(data_size as u64);
-        rt_serial_str("\n");
+        rt_serial::str(" attr=");
+        rt_serial::hex(attributes as u64);
+        rt_serial::str(" size=");
+        rt_serial::hex(data_size as u64);
+        rt_serial::str("\n");
     }
     if variable_name.is_null() || vendor_guid.is_null() {
         return Status::INVALID_PARAMETER;
@@ -1268,6 +1282,7 @@ extern "efiapi" fn query_variable_info(
     remaining_variable_storage_size: *mut u64,
     maximum_variable_size: *mut u64,
 ) -> Status {
+    #[cfg(feature = "rt-debug")]
     if unsafe { VIRTUAL_MODE } {
         rt_serial_print!("QueryVariableInfo attr=", attributes);
     }
@@ -1305,6 +1320,7 @@ extern "efiapi" fn query_variable_info(
 // ============================================================================
 
 extern "efiapi" fn get_next_high_mono_count(_high_count: *mut u32) -> Status {
+    #[cfg(feature = "rt-debug")]
     if unsafe { VIRTUAL_MODE } {
         rt_serial_print!("GetNextHighMonoCount -> UNSUPPORTED");
     }
@@ -1366,6 +1382,7 @@ extern "efiapi" fn update_capsule(
     _capsule_count: usize,
     _scatter_gather_list: efi::PhysicalAddress,
 ) -> Status {
+    #[cfg(feature = "rt-debug")]
     if unsafe { VIRTUAL_MODE } {
         rt_serial_print!("UpdateCapsule -> UNSUPPORTED");
     }
@@ -1378,6 +1395,7 @@ extern "efiapi" fn query_capsule_capabilities(
     _maximum_capsule_size: *mut u64,
     _reset_type: *mut ResetType,
 ) -> Status {
+    #[cfg(feature = "rt-debug")]
     if unsafe { VIRTUAL_MODE } {
         rt_serial_print!("QueryCapsuleCapabilities -> UNSUPPORTED");
     }

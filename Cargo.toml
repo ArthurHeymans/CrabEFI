@@ -16,6 +16,8 @@ readme = "README.md"
 default = []
 # Enable logging output to framebuffer (very slow, for debugging only)
 fb-log = []
+# Enable runtime services serial debug logging (post-SetVirtualAddressMap)
+rt-debug = []
 
 [dependencies]
 r-efi = "5.3"
