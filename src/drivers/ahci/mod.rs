@@ -768,9 +768,9 @@ impl AhciController {
         let fis = unsafe { &mut *(table.cfis.as_mut_ptr() as *mut FisRegH2D) };
         *fis = FisRegH2D::new();
         fis.set_command(ATA_CMD_PACKET);
-        fis.feature_l = 0;
-        fis.lba1 = 8;
-        fis.lba2 = 0;
+        fis.feature_l = 1; // DMA mode (required for AHCI DMA transfers)
+        fis.lba1 = 8; // Byte count limit (low)
+        fis.lba2 = 0; // Byte count limit (high)
 
         // Setup ATAPI command (SCSI READ CAPACITY(10))
         table.acmd[0] = SCSI_CMD_READ_CAPACITY_10;
@@ -808,7 +808,21 @@ impl AhciController {
         Ok(())
     }
 
-    /// Read sectors from a port
+    /// Maximum sectors per ATA READ DMA EXT command (64KB at 512-byte sectors)
+    const MAX_SATA_SECTORS_PER_CMD: u32 = 128;
+    /// Maximum sectors per ATAPI PACKET READ(10) command (32KB at 2048-byte sectors)
+    /// Limited by the 16-bit byte count field in the PACKET FIS
+    const MAX_ATAPI_SECTORS_PER_CMD: u32 = 16;
+    /// Maximum number of retries for a failed read
+    const MAX_RETRIES: u32 = 3;
+
+    /// Read sectors from a port with automatic chunking and retry
+    ///
+    /// Large reads are split into chunks appropriate for the device type:
+    /// - SATA: 128 sectors (64KB) per ATA READ DMA EXT
+    /// - SATAPI: 16 sectors (32KB) per SCSI READ(10) via ATAPI PACKET
+    ///
+    /// Each chunk is retried up to 3 times on transient errors.
     pub fn read_sectors(
         &mut self,
         port_index: usize,
@@ -822,12 +836,65 @@ impl AhciController {
 
         let device_type = self.ports[port_index].device_type;
         let sector_size = self.ports[port_index].sector_size;
-
-        if device_type == DeviceType::Satapi {
-            self.read_sectors_atapi(port_index, start_lba, num_sectors, buffer, sector_size)
+        let max_chunk = if device_type == DeviceType::Satapi {
+            Self::MAX_ATAPI_SECTORS_PER_CMD
         } else {
-            self.read_sectors_sata(port_index, start_lba, num_sectors, buffer)
+            Self::MAX_SATA_SECTORS_PER_CMD
+        };
+
+        let mut remaining = num_sectors;
+        let mut lba = start_lba;
+        let mut buf_offset: usize = 0;
+
+        while remaining > 0 {
+            let chunk = remaining.min(max_chunk);
+            let buf_ptr = unsafe { buffer.add(buf_offset) };
+
+            self.read_chunk_with_retry(port_index, device_type, lba, chunk, buf_ptr, sector_size)?;
+
+            remaining -= chunk;
+            lba += chunk as u64;
+            buf_offset += (chunk * sector_size) as usize;
         }
+
+        Ok(())
+    }
+
+    /// Read a single chunk with retry logic
+    fn read_chunk_with_retry(
+        &mut self,
+        port_index: usize,
+        device_type: DeviceType,
+        lba: u64,
+        num_sectors: u32,
+        buffer: *mut u8,
+        sector_size: u32,
+    ) -> Result<(), AhciError> {
+        for attempt in 0..Self::MAX_RETRIES {
+            let result = if device_type == DeviceType::Satapi {
+                self.read_sectors_atapi(port_index, lba, num_sectors, buffer, sector_size)
+            } else {
+                self.read_sectors_sata(port_index, lba, num_sectors, buffer)
+            };
+
+            match result {
+                Ok(()) => return Ok(()),
+                Err(e) if attempt + 1 < Self::MAX_RETRIES => {
+                    log::warn!(
+                        "AHCI port {}: read LBA {} failed ({:?}), retry {}/{}",
+                        self.ports[port_index].port_num,
+                        lba,
+                        e,
+                        attempt + 1,
+                        Self::MAX_RETRIES
+                    );
+                    crate::time::delay_us(1000);
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        // All code paths return inside the loop (Ok on success, Err on final attempt)
+        unreachable!()
     }
 
     /// Read sectors from a SATA device using READ DMA EXT
@@ -911,23 +978,25 @@ impl AhciController {
         let fis = unsafe { &mut *(table.cfis.as_mut_ptr() as *mut FisRegH2D) };
         *fis = FisRegH2D::new();
         fis.set_command(ATA_CMD_PACKET);
-        fis.feature_l = 0;
+        fis.feature_l = 1; // DMA mode (required for AHCI DMA transfers)
 
         let byte_count = num_sectors * sector_size;
-        fis.lba1 = (byte_count & 0xFF) as u8;
-        fis.lba2 = ((byte_count >> 8) & 0xFF) as u8;
+        // Cap byte count hint to 16-bit max to avoid overflow in LBA Mid/High fields
+        let byte_count_hint = byte_count.min(0xFFFE);
+        fis.lba1 = (byte_count_hint & 0xFF) as u8;
+        fis.lba2 = ((byte_count_hint >> 8) & 0xFF) as u8;
 
         // Setup ATAPI command (SCSI READ(10))
+        // acmd[] is already zeroed by CommandTable::default()
+        // READ(10) transfer length is 16-bit; chunking limits us to 16 sectors
+        debug_assert!(num_sectors <= 0xFFFF, "SCSI READ(10) transfer length overflow");
         table.acmd[0] = SCSI_CMD_READ_10;
-        table.acmd[1] = 0;
         table.acmd[2] = ((start_lba >> 24) & 0xFF) as u8;
         table.acmd[3] = ((start_lba >> 16) & 0xFF) as u8;
         table.acmd[4] = ((start_lba >> 8) & 0xFF) as u8;
         table.acmd[5] = (start_lba & 0xFF) as u8;
-        table.acmd[6] = 0;
         table.acmd[7] = ((num_sectors >> 8) & 0xFF) as u8;
         table.acmd[8] = (num_sectors & 0xFF) as u8;
-        table.acmd[9] = 0;
 
         // Setup PRDT
         table.prdt[0].set_address(buffer as u64);
@@ -959,6 +1028,12 @@ impl AhciController {
         fence(Ordering::SeqCst);
 
         let port_regs = self.port_regs(port_num);
+
+        // Clear stale interrupt and error status before issuing the command.
+        // This prevents a leftover TFES from a previous failed command from
+        // immediately failing the new one.
+        port_regs.is.set(0xFFFFFFFF);
+        port_regs.serr.set(0xFFFFFFFF);
 
         // Issue command
         port_regs.ci.set(1 << slot);
@@ -1030,9 +1105,24 @@ impl AhciController {
         port_regs.serr.set(0xFFFFFFFF); // Clear all SError bits
         port_regs.is.set(0xFFFFFFFF); // Clear all interrupt status bits
 
-        // 4. Restart the command engine
-        port_regs.cmd.modify(PORT_CMD::FRE::SET);
+        // 4. Re-enable FIS receive if needed
+        if !port_regs.cmd.is_set(PORT_CMD::FRE) {
+            port_regs.cmd.modify(PORT_CMD::FRE::SET);
+        }
+
+        // 5. Restart the command engine
         port_regs.cmd.modify(PORT_CMD::ST::SET);
+
+        // 6. Wait for device ready (BSY=0, DRQ=0) up to 5 seconds
+        if !wait_for(5000, || {
+            !port_regs.tfd.is_set(PORT_TFD::STS_BSY) && !port_regs.tfd.is_set(PORT_TFD::STS_DRQ)
+        }) {
+            log::warn!(
+                "AHCI port {}: device not ready after recovery (TFD={:#x})",
+                port_num,
+                port_regs.tfd.get()
+            );
+        }
 
         log::debug!("AHCI port {}: error recovery complete", port_num);
     }
