@@ -70,7 +70,7 @@ SECTIONS
         _bss_end = .;
     }
 
-    /* Stack - 256KB (increased from 64KB for large structs) */
+    /* Stack - 2MB (increased from 64KB for large structs like FirmwareState) */
     .stack : ALIGN(4096) {
         _stack_bottom = .;
         . += 0x200000;

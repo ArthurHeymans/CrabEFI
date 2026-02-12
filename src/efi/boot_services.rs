@@ -404,9 +404,14 @@ extern "efiapi" fn set_timer(
             }
             state::TimerType::Periodic | state::TimerType::Relative => {
                 // Convert 100ns units to TSC ticks
-                let tsc_per_us = crate::time::tsc_frequency() / 1_000_000;
+                let tsc_freq = crate::time::tsc_frequency();
+                if tsc_freq == 0 {
+                    log::error!("  -> DEVICE_ERROR (TSC not calibrated)");
+                    return Status::DEVICE_ERROR;
+                }
+                let tsc_per_us = tsc_freq / 1_000_000;
                 let us = trigger_time / 10;
-                let tsc_offset = us * tsc_per_us;
+                let tsc_offset = us * tsc_per_us.max(1);
                 let now = crate::time::rdtsc();
                 entry.timer_deadline_tsc = now + tsc_offset;
                 log::debug!("  -> SUCCESS (deadline in {}us)", us);
@@ -559,7 +564,7 @@ fn check_timer_event(event_id: usize) {
             match entry.timer_type {
                 state::TimerType::Periodic => {
                     // Reset deadline for next period
-                    let tsc_per_us = crate::time::tsc_frequency() / 1_000_000;
+                    let tsc_per_us = (crate::time::tsc_frequency() / 1_000_000).max(1);
                     let us = entry.timer_trigger_time / 10;
                     let tsc_offset = us * tsc_per_us;
                     entry.timer_deadline_tsc = now + tsc_offset;
@@ -1244,6 +1249,9 @@ fn find_handle_with_protocol(protocol_guid: &Guid) -> Option<Handle> {
     None
 }
 
+/// Maximum device path depth to prevent runaway walks on corrupted paths.
+const MAX_DEVICE_PATH_NODES: usize = 64;
+
 /// Compare two device path node sequences byte-by-byte, returning the number of
 /// consecutive matching nodes from the start.
 unsafe fn match_device_path_prefix(
@@ -1254,7 +1262,7 @@ unsafe fn match_device_path_prefix(
     let mut inp = input_dp;
     let mut hdl = handle_dp;
 
-    loop {
+    for _ in 0..MAX_DEVICE_PATH_NODES {
         let inp_type = (*inp).r#type;
         let inp_sub = (*inp).sub_type;
         let inp_len = u16::from_le_bytes([(*inp).length[0], (*inp).length[1]]) as usize;
@@ -1300,7 +1308,7 @@ unsafe fn match_device_path_prefix(
 unsafe fn count_device_path_prefix_nodes(dp: *const DevicePathProtocol) -> usize {
     let mut count = 0usize;
     let mut current = dp;
-    loop {
+    for _ in 0..MAX_DEVICE_PATH_NODES {
         let node_type = (*current).r#type;
         let node_subtype = (*current).sub_type;
         let node_length = u16::from_le_bytes([(*current).length[0], (*current).length[1]]) as usize;
@@ -2296,7 +2304,7 @@ extern "efiapi" fn install_multiple_protocol_interfaces(
         unsafe { *handle }
     };
 
-    // Install each protocol
+    // Install each protocol, rolling back on failure
     for i in 0..pair_count {
         let guid_ptr = args[i].0 as *mut Guid;
         let interface = args[i].1;
@@ -2315,8 +2323,27 @@ extern "efiapi" fn install_multiple_protocol_interfaces(
                 GuidFmt(guid),
                 status
             );
-            // On failure, we should uninstall previously installed protocols
-            // For simplicity, we just return the error
+            // Rollback: uninstall previously installed protocols from this call
+            for j in (0..i).rev() {
+                let prev_guid_ptr = args[j].0 as *const Guid;
+                if !prev_guid_ptr.is_null() {
+                    let prev_guid = unsafe { *prev_guid_ptr };
+                    state::with_efi_mut(|efi_state| {
+                        if let Some(entry) = efi_state.handles[..efi_state.handle_count]
+                            .iter_mut()
+                            .find(|e| e.handle == target_handle)
+                            && let Some(pos) = entry.protocols[..entry.protocol_count]
+                                .iter()
+                                .position(|p| p.guid == prev_guid)
+                        {
+                            entry
+                                .protocols
+                                .copy_within(pos + 1..entry.protocol_count, pos);
+                            entry.protocol_count -= 1;
+                        }
+                    });
+                }
+            }
             return status;
         }
     }

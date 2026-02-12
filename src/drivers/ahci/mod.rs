@@ -898,8 +898,10 @@ impl AhciController {
                 Err(e) => return Err(e),
             }
         }
-        // All code paths return inside the loop (Ok on success, Err on final attempt)
-        unreachable!()
+        // All code paths return inside the loop: Ok on success, Err on final attempt
+        // (the `Err(e) if attempt + 1 < MAX_RETRIES` guard ensures the last iteration
+        // falls through to the unconditional `Err(e)` arm).
+        unreachable!("MAX_RETRIES must be >= 1")
     }
 
     /// Read sectors from a SATA device using READ DMA EXT

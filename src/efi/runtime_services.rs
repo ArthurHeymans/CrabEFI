@@ -279,6 +279,19 @@ extern "efiapi" fn set_virtual_address_map(
     }
 
     let num_entries = memory_map_size / descriptor_size;
+
+    // Sanity check: a realistic memory map has at most a few hundred entries.
+    // Reject obviously corrupted sizes to prevent walking off into unmapped memory.
+    const MAX_REASONABLE_ENTRIES: usize = 4096;
+    if num_entries > MAX_REASONABLE_ENTRIES {
+        log::error!(
+            "SetVirtualAddressMap: unreasonable entry count {} (max {})",
+            num_entries,
+            MAX_REASONABLE_ENTRIES
+        );
+        return Status::INVALID_PARAMETER;
+    }
+
     log::info!("SetVirtualAddressMap: {} entries", num_entries);
 
     // Step 0: Disable CBMEM console -- its buffer is not in a runtime region
