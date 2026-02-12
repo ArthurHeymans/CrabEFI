@@ -6,7 +6,8 @@ target = "x86_64-unknown-none"
 [target.x86_64-unknown-none]
 rustflags = [
     "-C", "link-arg=-Tx86_64-coreboot.ld",
-    "-C", "relocation-model=static",
+    "-C", "link-arg=-no-pie",
+    "-C", "relocation-model=pic",
     "-C", "code-model=kernel",
 ]
 

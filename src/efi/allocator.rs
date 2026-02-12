@@ -540,6 +540,11 @@ impl MemoryAllocator {
     }
 
     /// Get the current memory map
+    ///
+    /// Adjacent entries with the same type and attributes are merged in the
+    /// output to produce a compact map. The internal entry list is NOT modified
+    /// (free_pages needs exact entries), so merging is done on the fly when
+    /// copying into the caller's buffer.
     pub fn get_memory_map(
         &self,
         memory_map_size: &mut usize,
@@ -549,11 +554,13 @@ impl MemoryAllocator {
         descriptor_version: &mut u32,
     ) -> efi::Status {
         let entry_size = core::mem::size_of::<MemoryDescriptor>();
-        let required_size = self.entries.len() * entry_size;
 
         *descriptor_size = entry_size;
         *descriptor_version = 1;
         *map_key = self.map_key;
+
+        let merged_count = self.count_merged_entries();
+        let required_size = merged_count * entry_size;
 
         if let Some(map) = memory_map {
             if core::mem::size_of_val(map) < required_size {
@@ -561,15 +568,53 @@ impl MemoryAllocator {
                 return efi::Status::BUFFER_TOO_SMALL;
             }
 
-            let copy_len = self.entries.len().min(map.len());
-            map[..copy_len].copy_from_slice(&self.entries[..copy_len]);
+            // Merge adjacent same-type/attribute entries into the output buffer
+            let out_count = self.entries.iter().fold(0usize, |out_idx, entry| {
+                if out_idx > 0
+                    && map[out_idx - 1].memory_type == entry.memory_type
+                    && map[out_idx - 1].attribute == entry.attribute
+                    && map[out_idx - 1].end() == entry.physical_start
+                {
+                    map[out_idx - 1].number_of_pages += entry.number_of_pages;
+                    out_idx
+                } else {
+                    map[out_idx] = *entry;
+                    out_idx + 1
+                }
+            });
 
-            *memory_map_size = required_size;
+            // Strip memory protection attributes (RO, XP, RP) from returned
+            // descriptors.  EDK2's CoreGetMemoryMap does the same.  Some OSes
+            // (notably Windows) treat these as mandatory page-table attributes
+            // and will set NX or read-only on runtime memory — causing crashes
+            // when calling runtime services.  The separate Memory Attributes
+            // Table carries the authoritative protection info instead.
+            const STRIP_MASK: u64 = !(attributes::EFI_MEMORY_RO
+                | attributes::EFI_MEMORY_XP
+                | attributes::EFI_MEMORY_RP);
+            for desc in map[..out_count].iter_mut() {
+                desc.attribute &= STRIP_MASK;
+            }
+
+            *memory_map_size = out_count * entry_size;
             efi::Status::SUCCESS
         } else {
             *memory_map_size = required_size;
             efi::Status::BUFFER_TOO_SMALL
         }
+    }
+
+    /// Count how many entries the memory map has after merging adjacent regions
+    fn count_merged_entries(&self) -> usize {
+        self.entries
+            .windows(2)
+            .filter(|pair| {
+                pair[0].memory_type != pair[1].memory_type
+                    || pair[0].attribute != pair[1].attribute
+                    || pair[0].end() != pair[1].physical_start
+            })
+            .count()
+            + if self.entries.is_empty() { 0 } else { 1 }
     }
 
     /// Get the current map key

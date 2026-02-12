@@ -637,6 +637,12 @@ fn signal_event_group(group_guid: &Guid) {
     }
 }
 
+/// Public wrapper for signal_event_group, used by SetVirtualAddressMap
+/// in runtime_services.rs to fire VIRTUAL_ADDRESS_CHANGE events.
+pub fn signal_event_group_for_runtime(group_guid: &Guid) {
+    signal_event_group(group_guid);
+}
+
 extern "efiapi" fn create_event_ex(
     event_type: u32,
     notify_tpl: Tpl,
@@ -1756,36 +1762,46 @@ extern "efiapi" fn exit_boot_services(image_handle: Handle, map_key: usize) -> S
         map_key
     );
 
+    // Signal EXIT_BOOT_SERVICES event group BEFORE finalizing the memory map.
+    // Windows Boot Manager registers callbacks that must run before we lock
+    // the memory map.
+    signal_event_group(&EFI_EVENT_GROUP_EXIT_BOOT_SERVICES);
+
+    // Also signal any legacy EVT_SIGNAL_EXIT_BOOT_SERVICES events
+    {
+        let mut legacy_events: heapless::Vec<usize, MAX_EVENTS> = heapless::Vec::new();
+        state::with_efi_mut(|efi_state| {
+            for i in 0..MAX_EVENTS {
+                if efi_state.events[i].event_type == EVT_SIGNAL_EXIT_BOOT_SERVICES {
+                    efi_state.events[i].signaled = true;
+                    let _ = legacy_events.push(i);
+                }
+            }
+        });
+        for event_id in &legacy_events {
+            let notify_fn = {
+                let efi_state = state::efi();
+                let entry = &efi_state.events[*event_id];
+                entry.notify_function.map(|f| (f, entry.notify_context))
+            };
+            if let Some((func, context)) = notify_fn {
+                func(*event_id as efi::Event, context);
+            }
+        }
+    }
+
+    // Rebuild the Memory Attributes Table in-place BEFORE locking the allocator.
+    // At efi::init() time only 2 runtime regions existed; the third
+    // (deferred variable buffer at 0x7fb38000) is registered later.
+    // A stale MEMATTR table with missing entries causes Windows to crash.
+    // We use the in-place variant that overwrites the existing page without
+    // calling allocate_pages(), so the map_key stays valid for the caller.
+    system_table::rebuild_memory_attributes_table_in_place();
+
     let status = allocator::exit_boot_services(map_key);
 
     if status == Status::SUCCESS {
         log::info!("ExitBootServices SUCCESS - transitioning to OS");
-
-        // Signal EXIT_BOOT_SERVICES event group and legacy EVT_SIGNAL_EXIT_BOOT_SERVICES events
-        signal_event_group(&EFI_EVENT_GROUP_EXIT_BOOT_SERVICES);
-
-        // Also signal any legacy EVT_SIGNAL_EXIT_BOOT_SERVICES events
-        {
-            let mut legacy_events: heapless::Vec<usize, MAX_EVENTS> = heapless::Vec::new();
-            state::with_efi_mut(|efi_state| {
-                for i in 0..MAX_EVENTS {
-                    if efi_state.events[i].event_type == EVT_SIGNAL_EXIT_BOOT_SERVICES {
-                        efi_state.events[i].signaled = true;
-                        let _ = legacy_events.push(i);
-                    }
-                }
-            });
-            for event_id in &legacy_events {
-                let notify_fn = {
-                    let efi_state = state::efi();
-                    let entry = &efi_state.events[*event_id];
-                    entry.notify_function.map(|f| (f, entry.notify_context))
-                };
-                if let Some((func, context)) = notify_fn {
-                    func(*event_id as efi::Event, context);
-                }
-            }
-        }
 
         // Mark that ExitBootServices has been called
         // After this, SPI flash is locked and variable writes go to ESP file
@@ -1801,8 +1817,6 @@ extern "efiapi" fn exit_boot_services(image_handle: Handle, map_key: usize) -> S
         // Invalidate the coreboot framebuffer record to prevent a race condition
         // between Linux's simplefb (coreboot) and efifb (EFI GOP) drivers.
         // By setting the tag to CB_TAG_UNUSED, Linux will only use the EFI GOP.
-        // SAFETY: This modifies the coreboot tables in memory, which is safe at
-        // ExitBootServices since coreboot has already finished using them.
         unsafe {
             crate::coreboot::invalidate_framebuffer_record();
         }

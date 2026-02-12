@@ -254,6 +254,25 @@ pub fn init(coreboot_table_ptr: u64) {
     // Initialize EFI environment
     efi::init(&cb_info);
 
+    // FirmwareState lives on the stack, which is inside the .stack section.
+    // The .stack section is between __runtime_data_start and __runtime_data_end,
+    // so reserve_runtime_region() (called by efi::init) already marks the entire
+    // region — including FirmwareState — as RuntimeServicesData.
+    //
+    // DO NOT add a separate entry here; that would create overlapping memory map
+    // entries which violates the UEFI spec and causes Windows to BSOD during
+    // SetVirtualAddressMap processing.
+    {
+        let state_addr = &firmware_state as *const _ as u64;
+        let state_size = core::mem::size_of::<state::FirmwareState>() as u64;
+        log::info!(
+            "FirmwareState at {:#x}-{:#x} ({} bytes) — covered by runtime data region",
+            state_addr,
+            state_addr + state_size,
+            state_size
+        );
+    }
+
     // Initialize heap allocator (needed for crypto operations)
     if !heap::init() {
         log::error!("Failed to initialize heap allocator!");

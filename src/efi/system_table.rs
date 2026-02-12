@@ -981,6 +981,342 @@ pub fn install_rt_properties_table() {
     }
 }
 
+/// EFI Memory Attributes Table GUID
+pub const EFI_MEMORY_ATTRIBUTES_TABLE_GUID: Guid = Guid::from_fields(
+    0xdcfa911d,
+    0x26eb,
+    0x469f,
+    0xa2,
+    0x20,
+    &[0x38, 0xb7, 0xdc, 0x46, 0x12, 0x20],
+);
+
+/// EFI Memory Attributes Table
+///
+/// Describes the memory protection attributes of runtime regions.
+/// Linux and Windows use this to set proper page permissions (RO for code, XP for data)
+/// for EFI runtime services memory.
+///
+/// Reference: UEFI Specification 2.6+, Section 4.6
+#[repr(C)]
+pub struct EfiMemoryAttributesTable {
+    /// Version of the table (must be 1)
+    pub version: u32,
+    /// Number of EFI_MEMORY_DESCRIPTOR entries
+    pub number_of_entries: u32,
+    /// Size of each EFI_MEMORY_DESCRIPTOR
+    pub descriptor_size: u32,
+    /// Reserved, must be zero
+    pub reserved: u32,
+    // Followed by number_of_entries memory descriptors
+}
+
+/// TCG2 Final Events Table GUID
+pub const EFI_TCG2_FINAL_EVENTS_TABLE_GUID: Guid = Guid::from_fields(
+    0x1e2ed096,
+    0x30e2,
+    0x4254,
+    0xbd,
+    0x89,
+    &[0x86, 0x3b, 0xbe, 0xf8, 0x23, 0x25],
+);
+
+/// TCG2 Final Events Table structure
+#[repr(C)]
+pub struct Tcg2FinalEventsTable {
+    /// Version (must be 1)
+    pub version: u64,
+    /// Number of events
+    pub number_of_events: u64,
+}
+
+/// Install minimal TPM2 event log configuration tables
+///
+/// These tables prevent the kernel from trying to read the TPM event log
+/// via ACPI (which fails with CrabEFI's memory layout). An empty log is
+/// valid and indicates no measured boot events occurred.
+pub fn install_tpm_event_log() {
+    static FINAL_EVENTS: Tcg2FinalEventsTable = Tcg2FinalEventsTable {
+        version: 1,
+        number_of_events: 0,
+    };
+
+    let table_ptr = &FINAL_EVENTS as *const Tcg2FinalEventsTable as *mut c_void;
+    let status = install_configuration_table(&EFI_TCG2_FINAL_EVENTS_TABLE_GUID, table_ptr);
+    if status == efi::Status::SUCCESS {
+        log::info!("Installed TCG2 Final Events Table (empty)");
+    } else {
+        log::error!("Failed to install TCG2 Final Events Table: {:?}", status);
+    }
+}
+
+/// Install the EFI Memory Attributes Table
+///
+/// This table describes memory protection attributes for runtime regions.
+/// Linux uses it to set proper page permissions (RO for code, XP for data).
+/// Windows uses it to validate runtime region mappings.
+///
+/// Reference: UEFI Specification 2.6+, Section 4.6
+pub fn install_memory_attributes_table() {
+    use super::allocator::{self, attributes, MemoryDescriptor, MemoryType};
+
+    // Query the memory map size
+    let mut map_size: usize = 0;
+    let mut map_key: usize = 0;
+    let mut desc_size: usize = 0;
+    let mut desc_version: u32 = 0;
+
+    let _ = allocator::get_memory_map(
+        &mut map_size,
+        None,
+        &mut map_key,
+        &mut desc_size,
+        &mut desc_version,
+    );
+
+    // Allocate a stack buffer for the memory map (max 512 entries)
+    let mut map_buf = [MemoryDescriptor::new(MemoryType::ReservedMemoryType, 0, 0, 0); 512];
+    let num_entries = map_size / core::mem::size_of::<MemoryDescriptor>();
+    let entries_to_use = num_entries.min(512);
+
+    let status = allocator::get_memory_map(
+        &mut map_size,
+        Some(&mut map_buf[..entries_to_use]),
+        &mut map_key,
+        &mut desc_size,
+        &mut desc_version,
+    );
+
+    if status != efi::Status::SUCCESS {
+        log::error!("Failed to get memory map for MEMATTR table: {:?}", status);
+        return;
+    }
+
+    let actual_entries = map_size / core::mem::size_of::<MemoryDescriptor>();
+
+    // Count runtime entries
+    let mut runtime_count: u32 = 0;
+    for entry in map_buf[..actual_entries].iter() {
+        if entry.attribute & attributes::EFI_MEMORY_RUNTIME != 0 {
+            runtime_count += 1;
+        }
+    }
+
+    if runtime_count == 0 {
+        log::warn!("No runtime memory regions found, skipping MEMATTR table");
+        return;
+    }
+
+    // Allocate memory for the table: header + runtime_count descriptors
+    let descriptor_size = core::mem::size_of::<MemoryDescriptor>() as u32;
+    let table_size = core::mem::size_of::<EfiMemoryAttributesTable>()
+        + (runtime_count as usize) * (descriptor_size as usize);
+    let table_pages = ((table_size as u64) + 4095) / 4096;
+
+    let mut table_addr: u64 = 0;
+    let alloc_status = allocator::allocate_pages(
+        allocator::AllocateType::AllocateAnyPages,
+        MemoryType::BootServicesData,
+        table_pages,
+        &mut table_addr,
+    );
+
+    if alloc_status != efi::Status::SUCCESS {
+        log::error!(
+            "Failed to allocate memory for MEMATTR table: {:?}",
+            alloc_status
+        );
+        return;
+    }
+
+    // Fill in the header
+    let header = unsafe { &mut *(table_addr as *mut EfiMemoryAttributesTable) };
+    header.version = 1;
+    header.number_of_entries = runtime_count;
+    header.descriptor_size = descriptor_size;
+    header.reserved = 0;
+
+    // Fill in runtime descriptors after the header
+    let descs_base = table_addr + core::mem::size_of::<EfiMemoryAttributesTable>() as u64;
+    let mut desc_idx: u32 = 0;
+    for entry in map_buf[..actual_entries].iter() {
+        if entry.attribute & attributes::EFI_MEMORY_RUNTIME != 0 {
+            let dest = unsafe {
+                &mut *((descs_base + (desc_idx as u64) * (descriptor_size as u64))
+                    as *mut MemoryDescriptor)
+            };
+            *dest = *entry;
+
+            // Set memory protection attributes based on type:
+            // RuntimeServicesCode: RO + executable (no XP)
+            // RuntimeServicesData: XP + writable (no RO)
+            if let Some(mem_type) = entry.get_memory_type() {
+                match mem_type {
+                    MemoryType::RuntimeServicesCode => {
+                        dest.attribute |= attributes::EFI_MEMORY_RO;
+                        dest.attribute &= !attributes::EFI_MEMORY_XP;
+                    }
+                    MemoryType::RuntimeServicesData => {
+                        dest.attribute |= attributes::EFI_MEMORY_XP;
+                        dest.attribute &= !attributes::EFI_MEMORY_RO;
+                    }
+                    _ => {
+                        dest.attribute |= attributes::EFI_MEMORY_XP;
+                    }
+                }
+            }
+
+            desc_idx += 1;
+        }
+    }
+
+    // Install as configuration table
+    let status =
+        install_configuration_table(&EFI_MEMORY_ATTRIBUTES_TABLE_GUID, table_addr as *mut c_void);
+    if status == efi::Status::SUCCESS {
+        log::info!(
+            "Installed EFI Memory Attributes Table ({} runtime entries, {} bytes)",
+            runtime_count,
+            table_size
+        );
+    } else {
+        log::error!(
+            "Failed to install EFI Memory Attributes Table: {:?}",
+            status
+        );
+    }
+}
+
+/// Rebuild the Memory Attributes Table in-place without allocating.
+///
+/// The initial `install_memory_attributes_table()` allocates a full page for the
+/// table. This function overwrites that page with the current runtime entries.
+/// It must be called just before ExitBootServices locks the allocator, because
+/// runtime regions may have been added since init time (e.g. the deferred
+/// variable buffer).
+///
+/// This function does NOT call allocate_pages and does NOT change the map_key.
+pub fn rebuild_memory_attributes_table_in_place() {
+    use super::allocator::{self, attributes, MemoryDescriptor, MemoryType};
+
+    // Find the existing MEMATTR table pointer from the config table
+    let existing_addr = {
+        let efi = state::efi();
+        efi.config_tables[..efi.config_table_count]
+            .iter()
+            .find(|t| t.vendor_guid == EFI_MEMORY_ATTRIBUTES_TABLE_GUID)
+            .map(|t| t.vendor_table as u64)
+    };
+
+    let table_addr = match existing_addr {
+        Some(addr) if addr != 0 => addr,
+        _ => {
+            log::warn!("No existing MEMATTR table to rebuild");
+            return;
+        }
+    };
+
+    // Query the memory map onto a stack buffer
+    let mut map_size: usize = 0;
+    let mut map_key: usize = 0;
+    let mut desc_size: usize = 0;
+    let mut desc_version: u32 = 0;
+
+    let _ = allocator::get_memory_map(
+        &mut map_size,
+        None,
+        &mut map_key,
+        &mut desc_size,
+        &mut desc_version,
+    );
+
+    let mut map_buf = [MemoryDescriptor::new(MemoryType::ReservedMemoryType, 0, 0, 0); 512];
+    let entries_to_use = (map_size / core::mem::size_of::<MemoryDescriptor>()).min(512);
+
+    let status = allocator::get_memory_map(
+        &mut map_size,
+        Some(&mut map_buf[..entries_to_use]),
+        &mut map_key,
+        &mut desc_size,
+        &mut desc_version,
+    );
+
+    if status != efi::Status::SUCCESS {
+        log::error!("Failed to get memory map for MEMATTR rebuild: {:?}", status);
+        return;
+    }
+
+    let actual_entries = map_size / core::mem::size_of::<MemoryDescriptor>();
+    let descriptor_size = core::mem::size_of::<MemoryDescriptor>() as u32;
+
+    // Count runtime entries
+    let runtime_count = map_buf[..actual_entries]
+        .iter()
+        .filter(|e| e.attribute & attributes::EFI_MEMORY_RUNTIME != 0)
+        .count() as u32;
+
+    if runtime_count == 0 {
+        log::warn!("No runtime regions for MEMATTR rebuild");
+        return;
+    }
+
+    // Sanity: ensure the table fits in the originally allocated page
+    let table_size = core::mem::size_of::<EfiMemoryAttributesTable>()
+        + (runtime_count as usize) * (descriptor_size as usize);
+    if table_size > 4096 {
+        log::error!(
+            "MEMATTR table too large for page ({} bytes, {} entries)",
+            table_size,
+            runtime_count
+        );
+        return;
+    }
+
+    // Overwrite the header
+    let header = unsafe { &mut *(table_addr as *mut EfiMemoryAttributesTable) };
+    header.version = 1;
+    header.number_of_entries = runtime_count;
+    header.descriptor_size = descriptor_size;
+    header.reserved = 0;
+
+    // Fill runtime descriptors
+    let descs_base = table_addr + core::mem::size_of::<EfiMemoryAttributesTable>() as u64;
+    let mut desc_idx: u32 = 0;
+    for entry in map_buf[..actual_entries].iter() {
+        if entry.attribute & attributes::EFI_MEMORY_RUNTIME != 0 {
+            let dest = unsafe {
+                &mut *((descs_base + (desc_idx as u64) * (descriptor_size as u64))
+                    as *mut MemoryDescriptor)
+            };
+            *dest = *entry;
+
+            if let Some(mem_type) = entry.get_memory_type() {
+                match mem_type {
+                    MemoryType::RuntimeServicesCode => {
+                        dest.attribute |= attributes::EFI_MEMORY_RO;
+                        dest.attribute &= !attributes::EFI_MEMORY_XP;
+                    }
+                    MemoryType::RuntimeServicesData => {
+                        dest.attribute |= attributes::EFI_MEMORY_XP;
+                        dest.attribute &= !attributes::EFI_MEMORY_RO;
+                    }
+                    _ => {
+                        dest.attribute |= attributes::EFI_MEMORY_XP;
+                    }
+                }
+            }
+
+            desc_idx += 1;
+        }
+    }
+
+    log::info!(
+        "Rebuilt Memory Attributes Table in-place ({} runtime entries, {} bytes)",
+        runtime_count,
+        table_size
+    );
+}
+
 /// Dump configuration table entries for debugging
 pub fn dump_configuration_tables() {
     let efi = state::efi();
@@ -1002,6 +1338,10 @@ pub fn dump_configuration_tables() {
             "SMBIOS 3.0"
         } else if *guid == EFI_RT_PROPERTIES_TABLE_GUID {
             "RT Properties"
+        } else if *guid == EFI_MEMORY_ATTRIBUTES_TABLE_GUID {
+            "Memory Attributes"
+        } else if *guid == EFI_TCG2_FINAL_EVENTS_TABLE_GUID {
+            "TCG2 Final Events"
         } else {
             "Unknown"
         };

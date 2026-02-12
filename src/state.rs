@@ -62,6 +62,19 @@ pub fn is_initialized() -> bool {
     !STATE_PTR.load(Ordering::Acquire).is_null()
 }
 
+/// Relocate the global state pointer to a new virtual address.
+///
+/// Called by `SetVirtualAddressMap` when the OS remaps runtime services
+/// memory from physical to virtual addresses.
+///
+/// # Safety
+///
+/// The new pointer must point to valid `FirmwareState` memory that has been
+/// remapped by the OS.
+pub unsafe fn relocate_state_ptr(new_ptr: *mut FirmwareState) {
+    STATE_PTR.store(new_ptr, Ordering::Release);
+}
+
 /// Get a reference to the global firmware state.
 ///
 /// # Panics

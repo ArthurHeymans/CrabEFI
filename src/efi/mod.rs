@@ -58,6 +58,10 @@ pub fn init(cb_info: &CorebootInfo) {
     // Required for efi_pstore, efivars, and other kernel modules.
     system_table::install_rt_properties_table();
 
+    // Install minimal TPM2 event log tables
+    // Prevents kernel errors about failing to map ACPI memory for TPM log
+    system_table::install_tpm_event_log();
+
     // Create console handle - this will also have GOP installed on it
     let console_handle = init_console();
 
@@ -82,6 +86,10 @@ pub fn init(cb_info: &CorebootInfo) {
 
     // Install Console Control protocol (legacy, but some bootloaders need it)
     init_console_control();
+
+    // Install EFI Memory Attributes Table
+    // Linux and Windows use this to set proper page permissions for runtime regions
+    system_table::install_memory_attributes_table();
 
     // Dump configuration tables for debugging
     system_table::dump_configuration_tables();

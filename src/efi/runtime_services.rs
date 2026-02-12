@@ -8,6 +8,80 @@ use crate::efi::auth;
 use crate::state::{self, MAX_VARIABLE_DATA_SIZE, MAX_VARIABLE_NAME_LEN, MAX_VARIABLES};
 
 // ============================================================================
+// Runtime Serial Logging (post-SetVirtualAddressMap)
+// ============================================================================
+//
+// After SetVirtualAddressMap, the `log` crate is disabled because its stored
+// `&dyn Log` vtable pointer becomes a stale physical address. These functions
+// write directly to the serial port (COM1, 0x3F8) using x86 port I/O, which
+// is completely independent of the virtual memory address space.
+
+/// COM1 base I/O port
+const COM1: u16 = 0x3F8;
+
+/// Write a single byte to the serial port (blocking, waits for TX ready).
+#[allow(dead_code)]
+#[inline]
+fn rt_serial_byte(byte: u8) {
+    unsafe {
+        // Wait for Transmitter Holding Register Empty (bit 5 of LSR)
+        while io::inb(COM1 + 5) & 0x20 == 0 {
+            core::hint::spin_loop();
+        }
+        io::outb(COM1, byte);
+    }
+}
+
+/// Write a string to the serial port (with \n -> \r\n conversion).
+#[allow(dead_code)]
+fn rt_serial_str(s: &str) {
+    for &b in s.as_bytes() {
+        if b == b'\n' {
+            rt_serial_byte(b'\r');
+        }
+        rt_serial_byte(b);
+    }
+}
+
+/// Write a u64 as hex to the serial port.
+#[allow(dead_code)]
+fn rt_serial_hex(val: u64) {
+    rt_serial_str("0x");
+    if val == 0 {
+        rt_serial_byte(b'0');
+        return;
+    }
+    let mut started = false;
+    for i in (0..16).rev() {
+        let nibble = ((val >> (i * 4)) & 0xF) as u8;
+        if nibble != 0 || started {
+            started = true;
+            rt_serial_byte(if nibble < 10 {
+                b'0' + nibble
+            } else {
+                b'a' + nibble - 10
+            });
+        }
+    }
+}
+
+/// Runtime serial print -- tagged with "[RT] " prefix.
+#[allow(unused_macros)]
+macro_rules! rt_serial_print {
+    ($msg:expr) => {
+        rt_serial_str("[RT] ");
+        rt_serial_str($msg);
+        rt_serial_str("\n");
+    };
+    ($msg:expr, $hex:expr) => {
+        rt_serial_str("[RT] ");
+        rt_serial_str($msg);
+        rt_serial_hex($hex as u64);
+        rt_serial_str("\n");
+    };
+}
+
+// ============================================================================
 // Runtime Access Control
 // ============================================================================
 
@@ -84,6 +158,9 @@ pub fn get_runtime_code_address() -> u64 {
 // ============================================================================
 
 extern "efiapi" fn get_time(time: *mut Time, capabilities: *mut TimeCapabilities) -> Status {
+    if unsafe { VIRTUAL_MODE } {
+        rt_serial_print!("GetTime");
+    }
     if time.is_null() {
         return Status::INVALID_PARAMETER;
     }
@@ -117,7 +194,9 @@ extern "efiapi" fn get_time(time: *mut Time, capabilities: *mut TimeCapabilities
 }
 
 extern "efiapi" fn set_time(_time: *mut Time) -> Status {
-    // Writing to RTC is typically not needed for boot
+    if unsafe { VIRTUAL_MODE } {
+        rt_serial_print!("SetTime -> UNSUPPORTED");
+    }
     Status::UNSUPPORTED
 }
 
@@ -126,10 +205,16 @@ extern "efiapi" fn get_wakeup_time(
     _pending: *mut efi::Boolean,
     _time: *mut Time,
 ) -> Status {
+    if unsafe { VIRTUAL_MODE } {
+        rt_serial_print!("GetWakeupTime -> UNSUPPORTED");
+    }
     Status::UNSUPPORTED
 }
 
 extern "efiapi" fn set_wakeup_time(_enable: efi::Boolean, _time: *mut Time) -> Status {
+    if unsafe { VIRTUAL_MODE } {
+        rt_serial_print!("SetWakeupTime -> UNSUPPORTED");
+    }
     Status::UNSUPPORTED
 }
 
@@ -137,22 +222,347 @@ extern "efiapi" fn set_wakeup_time(_enable: efi::Boolean, _time: *mut Time) -> S
 // Virtual Memory Services
 // ============================================================================
 
+/// EFI_OPTIONAL_PTR: if set, a NULL pointer is acceptable
+const EFI_OPTIONAL_PTR: usize = 0x00000001;
+/// EFI_MEMORY_RUNTIME attribute bit (bit 63)
+const EFI_MEMORY_RUNTIME: u64 = 0x8000000000000000;
+/// Page size constant
+const EFI_PAGE_SIZE: u64 = 4096;
+
+/// Global state for ConvertPointer -- only valid during SetVirtualAddressMap.
+static mut VIRTUAL_MAP_PTR: *const u8 = core::ptr::null();
+static mut VIRTUAL_MAP_DESCRIPTOR_SIZE: usize = 0;
+static mut VIRTUAL_MAP_ENTRY_COUNT: usize = 0;
+/// Whether SetVirtualAddressMap has been called (one-shot operation)
+static mut VIRTUAL_MODE: bool = false;
+
 extern "efiapi" fn set_virtual_address_map(
-    _memory_map_size: usize,
-    _descriptor_size: usize,
-    _descriptor_version: u32,
-    _virtual_map: *mut efi::MemoryDescriptor,
+    memory_map_size: usize,
+    descriptor_size: usize,
+    descriptor_version: u32,
+    virtual_map: *mut efi::MemoryDescriptor,
 ) -> Status {
-    // For now, we don't support virtual address remapping
-    // The OS can use identity mapping
+    log::info!(
+        "RT.SetVirtualAddressMap(size={}, desc_size={}, version={}, map={:?})",
+        memory_map_size,
+        descriptor_size,
+        descriptor_version,
+        virtual_map
+    );
+
+    unsafe {
+        if VIRTUAL_MODE {
+            return Status::UNSUPPORTED;
+        }
+    }
+
+    if virtual_map.is_null() || descriptor_size == 0 {
+        return Status::INVALID_PARAMETER;
+    }
+
+    if descriptor_size < core::mem::size_of::<efi::MemoryDescriptor>() {
+        return Status::INVALID_PARAMETER;
+    }
+
+    let num_entries = memory_map_size / descriptor_size;
+    log::info!("SetVirtualAddressMap: {} entries", num_entries);
+
+    // Step 0: Disable CBMEM console -- its buffer is not in a runtime region
+    // and would page-fault after the OS switches to virtual addressing.
+    crate::coreboot::cbmem_console::disable();
+
+    // Step 1: Commit to virtual mode
+    unsafe {
+        VIRTUAL_MODE = true;
+    }
+
+    // Step 2: Set up globals so ConvertPointer can access the virtual map
+    unsafe {
+        VIRTUAL_MAP_PTR = virtual_map as *const u8;
+        VIRTUAL_MAP_DESCRIPTOR_SIZE = descriptor_size;
+        VIRTUAL_MAP_ENTRY_COUNT = num_entries;
+    }
+
+    // Step 3: Signal EVT_SIGNAL_VIRTUAL_ADDRESS_CHANGE events
+    {
+        use crate::efi::boot_services::{
+            signal_event_group_for_runtime, EVT_SIGNAL_VIRTUAL_ADDRESS_CHANGE,
+        };
+
+        const EFI_EVENT_GROUP_VIRTUAL_ADDRESS_CHANGE: efi::Guid = efi::Guid::from_fields(
+            0x13FA7698,
+            0xC831,
+            0x49C7,
+            0x87,
+            0xEA,
+            &[0x8F, 0x43, 0xFC, 0xC2, 0x51, 0x96],
+        );
+        signal_event_group_for_runtime(&EFI_EVENT_GROUP_VIRTUAL_ADDRESS_CHANGE);
+
+        // Signal legacy EVT_SIGNAL_VIRTUAL_ADDRESS_CHANGE events
+        state::with_efi_mut(|efi_state| {
+            for entry in efi_state.events.iter_mut() {
+                if entry.event_type == EVT_SIGNAL_VIRTUAL_ADDRESS_CHANGE {
+                    entry.signaled = true;
+                    if let Some(func) = entry.notify_function {
+                        func(core::ptr::null_mut(), entry.notify_context);
+                    }
+                }
+            }
+        });
+    }
+
+    // Step 4: Relocate our own internal pointers
+    let state_phys = state::get() as *const _ as u64;
+    let rt_ptr = get_runtime_services();
+    let rt_phys = rt_ptr as u64;
+    let mut state_relocated = false;
+
+    for i in 0..num_entries {
+        let desc = unsafe {
+            &*((virtual_map as *const u8).add(i * descriptor_size) as *const efi::MemoryDescriptor)
+        };
+
+        if (desc.attribute & EFI_MEMORY_RUNTIME) == 0 {
+            continue;
+        }
+
+        let phys_start = desc.physical_start;
+        let phys_end = phys_start + desc.number_of_pages * EFI_PAGE_SIZE;
+        let virt_start = desc.virtual_start;
+
+        // Relocate STATE_PTR
+        if !state_relocated && state_phys >= phys_start && state_phys < phys_end {
+            let offset = virt_start as i64 - phys_start as i64;
+            let new_state = (state_phys as i64 + offset) as u64;
+            unsafe {
+                state::relocate_state_ptr(new_state as *mut state::FirmwareState);
+            }
+            state_relocated = true;
+            log::debug!(
+                "SetVirtualAddressMap: relocated state ptr {:#x} -> {:#x}",
+                state_phys,
+                new_state
+            );
+        }
+
+        // Relocate RuntimeServices function pointers
+        if rt_phys >= phys_start && rt_phys < phys_end {
+            let offset = virt_start as i64 - phys_start as i64;
+            // NOTE: set_virtual_address_map and convert_pointer are NOT relocated
+            // per EDK2 convention -- they are never called again after this point.
+            unsafe {
+                let rt = &mut *rt_ptr;
+                relocate_fn_ptr(&mut rt.get_time, offset);
+                relocate_fn_ptr(&mut rt.set_time, offset);
+                relocate_fn_ptr(&mut rt.get_wakeup_time, offset);
+                relocate_fn_ptr(&mut rt.set_wakeup_time, offset);
+                relocate_fn_ptr(&mut rt.get_variable, offset);
+                relocate_fn_ptr(&mut rt.get_next_variable_name, offset);
+                relocate_fn_ptr(&mut rt.set_variable, offset);
+                relocate_fn_ptr(&mut rt.get_next_high_mono_count, offset);
+                relocate_fn_ptr(&mut rt.reset_system, offset);
+                relocate_fn_ptr(&mut rt.update_capsule, offset);
+                relocate_fn_ptr(&mut rt.query_capsule_capabilities, offset);
+                relocate_fn_ptr(&mut rt.query_variable_info, offset);
+            }
+            log::debug!(
+                "SetVirtualAddressMap: relocated RT function pointers (offset {:#x})",
+                virt_start as i64 - phys_start as i64
+            );
+        }
+    }
+
+    // Step 4b: Relocate GOT (Global Offset Table) entries.
+    //
+    // With relocation-model=pic, the compiler emits `call *GOT(%rip)` for
+    // compiler_builtins intrinsics (memcpy, memset, memmove, memcmp).
+    // The linker fills these GOT entries with absolute physical addresses.
+    // After SVAM, the physical addresses are unmapped, so we must adjust
+    // each GOT entry by the appropriate virtual offset.
+    {
+        unsafe extern "C" {
+            static _got_start: u8;
+            static _got_end: u8;
+        }
+        let got_start = &raw const _got_start as *mut u64;
+        let got_end = &raw const _got_end as *const u8;
+        let got_count =
+            (got_end as usize - got_start as usize) / core::mem::size_of::<u64>();
+
+        for slot in 0..got_count {
+            let entry_ptr = unsafe { got_start.add(slot) };
+            let phys_val = unsafe { core::ptr::read_volatile(entry_ptr) };
+
+            // Find which runtime region this GOT entry points into
+            for i in 0..num_entries {
+                let desc = unsafe {
+                    &*((virtual_map as *const u8).add(i * descriptor_size)
+                        as *const efi::MemoryDescriptor)
+                };
+                if (desc.attribute & EFI_MEMORY_RUNTIME) == 0 {
+                    continue;
+                }
+                let p_start = desc.physical_start;
+                let p_end = p_start + desc.number_of_pages * EFI_PAGE_SIZE;
+                if phys_val >= p_start && phys_val < p_end {
+                    let offset = desc.virtual_start as i64 - p_start as i64;
+                    let new_val = (phys_val as i64 + offset) as u64;
+                    unsafe { core::ptr::write_volatile(entry_ptr, new_val) };
+                    break;
+                }
+            }
+        }
+        log::debug!(
+            "SetVirtualAddressMap: relocated {} GOT entries",
+            got_count
+        );
+    }
+
+    // Step 5: Recompute CRC32 on RuntimeServices table (Windows validates this)
+    unsafe {
+        use super::boot_services::compute_crc32;
+        let rt = &mut *rt_ptr;
+        rt.hdr.crc32 = 0;
+        let rt_bytes =
+            core::slice::from_raw_parts(rt_ptr as *const u8, rt.hdr.header_size as usize);
+        rt.hdr.crc32 = compute_crc32(rt_bytes);
+    }
+
+    // Step 6: Convert System Table pointers (firmware_vendor, configuration_table, runtime_services)
+    // Per EDK2, we must also convert VendorTable pointers inside each configuration
+    // table entry -- otherwise the OS dereferences stale physical addresses.
+    {
+        use super::system_table;
+        let st = system_table::get_system_table();
+        unsafe {
+            // Convert VendorTable pointers inside each configuration table entry.
+            // This MUST happen before converting the configuration_table pointer itself,
+            // since we need the physical address to access the entries.
+            // (EDK2: CoreConvertPointer for each ConfigurationTable[i].VendorTable)
+            if !(*st).configuration_table.is_null() {
+                let config = (*st).configuration_table as *mut state::ConfigurationTable;
+                let count = (*st).number_of_table_entries;
+                for i in 0..count {
+                    let entry = &mut *config.add(i);
+                    if !entry.vendor_table.is_null() {
+                        // Use EFI_OPTIONAL_PTR: if the pointer doesn't fall in a
+                        // runtime region (e.g. ACPI tables in ACPIReclaimMemory),
+                        // ConvertPointer returns NOT_FOUND and we leave it unchanged.
+                        let _ = convert_pointer_internal(0, &mut entry.vendor_table);
+                    }
+                }
+            }
+
+            // Convert firmware_vendor
+            if !(*st).firmware_vendor.is_null() {
+                let mut vendor_ptr = (*st).firmware_vendor as *mut c_void;
+                if convert_pointer_internal(0, &mut vendor_ptr) == Status::SUCCESS {
+                    (*st).firmware_vendor = vendor_ptr as *const u16;
+                }
+            }
+
+            // Convert configuration_table pointer itself
+            if !(*st).configuration_table.is_null() {
+                let mut config_ptr = (*st).configuration_table as *mut c_void;
+                if convert_pointer_internal(EFI_OPTIONAL_PTR, &mut config_ptr) == Status::SUCCESS {
+                    (*st).configuration_table = config_ptr as *mut state::ConfigurationTable;
+                }
+            }
+
+            // Convert runtime_services pointer
+            if !(*st).runtime_services.is_null() {
+                let mut rt_svc_ptr = (*st).runtime_services as *mut c_void;
+                if convert_pointer_internal(0, &mut rt_svc_ptr) == Status::SUCCESS {
+                    (*st).runtime_services = rt_svc_ptr as *mut efi::RuntimeServices;
+                }
+            }
+
+            // Recompute System Table CRC32
+            (*st).hdr.crc32 = 0;
+            let st_bytes =
+                core::slice::from_raw_parts(st as *const u8, (*st).hdr.header_size as usize);
+            (*st).hdr.crc32 = super::boot_services::compute_crc32(st_bytes);
+        }
+    }
+
+    // Step 7: Clear virtual map globals
+    unsafe {
+        VIRTUAL_MAP_PTR = core::ptr::null();
+        VIRTUAL_MAP_DESCRIPTOR_SIZE = 0;
+        VIRTUAL_MAP_ENTRY_COUNT = 0;
+    }
+
+    log::info!("SetVirtualAddressMap: complete, disabling log crate for virtual mode");
+
+    // CRITICAL: Disable the log crate. After SVAM returns, the OS uses virtual
+    // addresses. The log crate stores a &'static dyn Log fat pointer at physical
+    // addresses -- any log! call would dereference stale pointers and page-fault.
+    // Setting max_level to Off makes the log! macros short-circuit before any
+    // pointer dereference.
+    log::set_max_level(log::LevelFilter::Off);
+
+    rt_serial_str("[RT] SetVirtualAddressMap returning SUCCESS\n");
+
     Status::SUCCESS
 }
 
+/// Relocate a function pointer by a signed offset.
+///
+/// # Safety
+///
+/// The offset must produce a valid function address within the relocated region.
+unsafe fn relocate_fn_ptr<T>(ptr: &mut T, offset: i64) {
+    let old = core::ptr::read(ptr as *const T as *const u64);
+    let new = (old as i64 + offset) as u64;
+    core::ptr::write(ptr as *mut T as *mut u64, new);
+}
+
+/// Internal ConvertPointer implementation used by both the EFI callback and
+/// our own SetVirtualAddressMap.
+fn convert_pointer_internal(debug_disposition: usize, address: &mut *mut c_void) -> Status {
+    let phys_addr = *address as u64;
+
+    if phys_addr == 0 {
+        return if (debug_disposition & EFI_OPTIONAL_PTR) != 0 {
+            Status::SUCCESS
+        } else {
+            Status::INVALID_PARAMETER
+        };
+    }
+
+    unsafe {
+        if VIRTUAL_MAP_PTR.is_null() {
+            return Status::NOT_FOUND;
+        }
+
+        for i in 0..VIRTUAL_MAP_ENTRY_COUNT {
+            let desc = &*(VIRTUAL_MAP_PTR.add(i * VIRTUAL_MAP_DESCRIPTOR_SIZE)
+                as *const efi::MemoryDescriptor);
+
+            if (desc.attribute & EFI_MEMORY_RUNTIME) == 0 {
+                continue;
+            }
+
+            let phys_end = desc.physical_start + desc.number_of_pages * EFI_PAGE_SIZE;
+            if phys_addr >= desc.physical_start && phys_addr < phys_end {
+                *address = (phys_addr - desc.physical_start + desc.virtual_start) as *mut c_void;
+                return Status::SUCCESS;
+            }
+        }
+    }
+
+    Status::NOT_FOUND
+}
+
 extern "efiapi" fn convert_pointer(
-    _debug_disposition: usize,
-    _address: *mut *mut c_void,
+    debug_disposition: usize,
+    address: *mut *mut c_void,
 ) -> Status {
-    Status::UNSUPPORTED
+    if address.is_null() {
+        return Status::INVALID_PARAMETER;
+    }
+    convert_pointer_internal(debug_disposition, unsafe { &mut *address })
 }
 
 // ============================================================================
@@ -166,6 +576,19 @@ extern "efiapi" fn get_variable(
     data_size: *mut usize,
     data: *mut c_void,
 ) -> Status {
+    if unsafe { VIRTUAL_MODE } {
+        rt_serial_str("[RT] GetVariable name=");
+        if !variable_name.is_null() {
+            for i in 0..32 {
+                let c = unsafe { *variable_name.add(i) };
+                if c == 0 {
+                    break;
+                }
+                rt_serial_byte(c as u8);
+            }
+        }
+        rt_serial_str("\n");
+    }
     if variable_name.is_null() || vendor_guid.is_null() || data_size.is_null() {
         return Status::INVALID_PARAMETER;
     }
@@ -311,6 +734,19 @@ extern "efiapi" fn get_next_variable_name(
     variable_name: *mut u16,
     vendor_guid: *mut Guid,
 ) -> Status {
+    if unsafe { VIRTUAL_MODE } {
+        rt_serial_str("[RT] GetNextVariableName name=");
+        if !variable_name.is_null() {
+            for i in 0..32 {
+                let c = unsafe { *variable_name.add(i) };
+                if c == 0 {
+                    break;
+                }
+                rt_serial_byte(c as u8);
+            }
+        }
+        rt_serial_str("\n");
+    }
     if variable_name_size.is_null() || variable_name.is_null() || vendor_guid.is_null() {
         return Status::INVALID_PARAMETER;
     }
@@ -504,6 +940,23 @@ extern "efiapi" fn set_variable(
     data_size: usize,
     data: *mut c_void,
 ) -> Status {
+    if unsafe { VIRTUAL_MODE } {
+        rt_serial_str("[RT] SetVariable name=");
+        if !variable_name.is_null() {
+            for i in 0..32 {
+                let c = unsafe { *variable_name.add(i) };
+                if c == 0 {
+                    break;
+                }
+                rt_serial_byte(c as u8);
+            }
+        }
+        rt_serial_str(" attr=");
+        rt_serial_hex(attributes as u64);
+        rt_serial_str(" size=");
+        rt_serial_hex(data_size as u64);
+        rt_serial_str("\n");
+    }
     if variable_name.is_null() || vendor_guid.is_null() {
         return Status::INVALID_PARAMETER;
     }
@@ -815,6 +1268,9 @@ extern "efiapi" fn query_variable_info(
     remaining_variable_storage_size: *mut u64,
     maximum_variable_size: *mut u64,
 ) -> Status {
+    if unsafe { VIRTUAL_MODE } {
+        rt_serial_print!("QueryVariableInfo attr=", attributes);
+    }
     if maximum_variable_storage_size.is_null()
         || remaining_variable_storage_size.is_null()
         || maximum_variable_size.is_null()
@@ -849,6 +1305,9 @@ extern "efiapi" fn query_variable_info(
 // ============================================================================
 
 extern "efiapi" fn get_next_high_mono_count(_high_count: *mut u32) -> Status {
+    if unsafe { VIRTUAL_MODE } {
+        rt_serial_print!("GetNextHighMonoCount -> UNSUPPORTED");
+    }
     Status::UNSUPPORTED
 }
 
@@ -858,7 +1317,9 @@ extern "efiapi" fn reset_system(
     _data_size: usize,
     _reset_data: *mut c_void,
 ) {
-    log::info!("ResetSystem called with type {:?}", reset_type);
+    // Use rt_serial_print! instead of log:: — after SetVirtualAddressMap the log
+    // crate's vtable pointer is stale and would page-fault.
+    rt_serial_print!("ResetSystem called");
 
     // Try different reset methods
     match reset_type {
@@ -889,9 +1350,7 @@ extern "efiapi" fn reset_system(
             }
         }
         efi::RESET_SHUTDOWN => {
-            // Try ACPI shutdown (S5)
-            // This requires parsing ACPI tables which we don't do yet
-            log::warn!("Shutdown not implemented, halting instead");
+            rt_serial_print!("Shutdown not implemented, halting");
         }
         _ => {}
     }
@@ -907,6 +1366,9 @@ extern "efiapi" fn update_capsule(
     _capsule_count: usize,
     _scatter_gather_list: efi::PhysicalAddress,
 ) -> Status {
+    if unsafe { VIRTUAL_MODE } {
+        rt_serial_print!("UpdateCapsule -> UNSUPPORTED");
+    }
     Status::UNSUPPORTED
 }
 
@@ -916,6 +1378,9 @@ extern "efiapi" fn query_capsule_capabilities(
     _maximum_capsule_size: *mut u64,
     _reset_type: *mut ResetType,
 ) -> Status {
+    if unsafe { VIRTUAL_MODE } {
+        rt_serial_print!("QueryCapsuleCapabilities -> UNSUPPORTED");
+    }
     Status::UNSUPPORTED
 }
 

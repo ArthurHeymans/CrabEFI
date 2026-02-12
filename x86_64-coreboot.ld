@@ -39,6 +39,15 @@ SECTIONS
         _rodata_end = .;
     }
 
+    /* Global Offset Table (PIC indirect calls to memcpy/memset/etc.)
+     * These entries contain absolute addresses that must be relocated
+     * during SetVirtualAddressMap. */
+    .got : ALIGN(8) {
+        _got_start = .;
+        *(.got .got.*)
+        _got_end = .;
+    }
+
     /* Initialized data */
     .data : ALIGN(4096) {
         _data_start = .;
