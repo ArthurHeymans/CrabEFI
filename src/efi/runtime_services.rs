@@ -59,7 +59,11 @@ mod rt_serial {
             let nibble = ((val >> (i * 4)) & 0xF) as u8;
             if nibble != 0 || started {
                 started = true;
-                byte(if nibble < 10 { b'0' + nibble } else { b'a' + nibble - 10 });
+                byte(if nibble < 10 {
+                    b'0' + nibble
+                } else {
+                    b'a' + nibble - 10
+                });
             }
         }
     }
@@ -296,7 +300,7 @@ extern "efiapi" fn set_virtual_address_map(
     // Step 3: Signal EVT_SIGNAL_VIRTUAL_ADDRESS_CHANGE events
     {
         use crate::efi::boot_services::{
-            signal_event_group_for_runtime, EVT_SIGNAL_VIRTUAL_ADDRESS_CHANGE,
+            EVT_SIGNAL_VIRTUAL_ADDRESS_CHANGE, signal_event_group_for_runtime,
         };
 
         const EFI_EVENT_GROUP_VIRTUAL_ADDRESS_CHANGE: efi::Guid = efi::Guid::from_fields(
@@ -396,9 +400,8 @@ extern "efiapi" fn set_virtual_address_map(
             static _got_end: u8;
         }
         let got_start = &raw const _got_start as *mut u64;
-        let got_end = &raw const _got_end as *const u8;
-        let got_count =
-            (got_end as usize - got_start as usize) / core::mem::size_of::<u64>();
+        let got_end = &raw const _got_end;
+        let got_count = (got_end as usize - got_start as usize) / core::mem::size_of::<u64>();
 
         for slot in 0..got_count {
             let entry_ptr = unsafe { got_start.add(slot) };
@@ -423,10 +426,7 @@ extern "efiapi" fn set_virtual_address_map(
                 }
             }
         }
-        log::debug!(
-            "SetVirtualAddressMap: relocated {} GOT entries",
-            got_count
-        );
+        log::debug!("SetVirtualAddressMap: relocated {} GOT entries", got_count);
     }
 
     // Step 5: Recompute CRC32 on RuntimeServices table (Windows validates this)
@@ -451,7 +451,7 @@ extern "efiapi" fn set_virtual_address_map(
             // since we need the physical address to access the entries.
             // (EDK2: CoreConvertPointer for each ConfigurationTable[i].VendorTable)
             if !(*st).configuration_table.is_null() {
-                let config = (*st).configuration_table as *mut state::ConfigurationTable;
+                let config = (*st).configuration_table;
                 let count = (*st).number_of_table_entries;
                 for i in 0..count {
                     let entry = &mut *config.add(i);
@@ -566,10 +566,7 @@ fn convert_pointer_internal(debug_disposition: usize, address: &mut *mut c_void)
     Status::NOT_FOUND
 }
 
-extern "efiapi" fn convert_pointer(
-    debug_disposition: usize,
-    address: *mut *mut c_void,
-) -> Status {
+extern "efiapi" fn convert_pointer(debug_disposition: usize, address: *mut *mut c_void) -> Status {
     if address.is_null() {
         return Status::INVALID_PARAMETER;
     }

@@ -253,8 +253,8 @@ impl BlockDevice for AhciBlockDevice {
             &mut *ahci::get_controller(self.controller_id).ok_or(BlockError::DeviceError)?
         };
 
-        controller
-            .read_sectors(self.port, lba, count, buffer.as_mut_ptr())
+        // Safety: buffer.as_mut_ptr() is valid for buffer.len() bytes
+        unsafe { controller.read_sectors(self.port, lba, count, buffer.as_mut_ptr()) }
             .map_err(BlockError::from)
     }
 }
@@ -467,9 +467,12 @@ impl<'a> BlockDevice for AhciDisk<'a> {
     }
 
     fn read_blocks(&mut self, lba: u64, count: u32, buffer: &mut [u8]) -> Result<(), BlockError> {
-        self.controller
-            .read_sectors(self.port, lba, count, buffer.as_mut_ptr())
-            .map_err(BlockError::from)
+        // Safety: buffer.as_mut_ptr() is valid for buffer.len() bytes
+        unsafe {
+            self.controller
+                .read_sectors(self.port, lba, count, buffer.as_mut_ptr())
+        }
+        .map_err(BlockError::from)
     }
 }
 

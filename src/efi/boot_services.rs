@@ -597,8 +597,10 @@ const EFI_EVENT_GROUP_EXIT_BOOT_SERVICES: Guid = Guid::from_fields(
 /// Signal all events belonging to a specific event group
 fn signal_event_group(group_guid: &Guid) {
     // Collect events to signal (need to avoid holding state lock during callbacks)
-    let mut events_to_signal: heapless::Vec<(usize, Option<efi::EventNotify>, *mut c_void), MAX_EVENTS> =
-        heapless::Vec::new();
+    let mut events_to_signal: heapless::Vec<
+        (usize, Option<efi::EventNotify>, *mut c_void),
+        MAX_EVENTS,
+    > = heapless::Vec::new();
 
     state::with_efi_mut(|efi_state| {
         for i in 0..MAX_EVENTS {
@@ -875,7 +877,10 @@ extern "efiapi" fn locate_handle(
                 .collect()
         }
         _ => {
-            log::debug!("  -> INVALID_PARAMETER (unknown search type {})", search_type);
+            log::debug!(
+                "  -> INVALID_PARAMETER (unknown search type {})",
+                search_type
+            );
             return Status::INVALID_PARAMETER;
         }
     };
@@ -1298,8 +1303,7 @@ unsafe fn count_device_path_prefix_nodes(dp: *const DevicePathProtocol) -> usize
     loop {
         let node_type = (*current).r#type;
         let node_subtype = (*current).sub_type;
-        let node_length =
-            u16::from_le_bytes([(*current).length[0], (*current).length[1]]) as usize;
+        let node_length = u16::from_le_bytes([(*current).length[0], (*current).length[1]]) as usize;
 
         // Stop at End node
         if node_type == DEVICE_PATH_TYPE_END {
@@ -2368,11 +2372,7 @@ extern "efiapi" fn uninstall_multiple_protocol_interfaces(
     Status::SUCCESS
 }
 
-extern "efiapi" fn calculate_crc32(
-    data: *mut c_void,
-    data_size: usize,
-    crc32: *mut u32,
-) -> Status {
+extern "efiapi" fn calculate_crc32(data: *mut c_void, data_size: usize, crc32: *mut u32) -> Status {
     if data.is_null() || crc32.is_null() || data_size == 0 {
         return Status::INVALID_PARAMETER;
     }

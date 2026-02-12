@@ -823,7 +823,12 @@ impl AhciController {
     /// - SATAPI: 16 sectors (32KB) per SCSI READ(10) via ATAPI PACKET
     ///
     /// Each chunk is retried up to 3 times on transient errors.
-    pub fn read_sectors(
+    ///
+    /// # Safety
+    ///
+    /// `buffer` must point to a valid, writable region of at least
+    /// `num_sectors * sector_size` bytes.
+    pub unsafe fn read_sectors(
         &mut self,
         port_index: usize,
         start_lba: u64,
@@ -989,7 +994,10 @@ impl AhciController {
         // Setup ATAPI command (SCSI READ(10))
         // acmd[] is already zeroed by CommandTable::default()
         // READ(10) transfer length is 16-bit; chunking limits us to 16 sectors
-        debug_assert!(num_sectors <= 0xFFFF, "SCSI READ(10) transfer length overflow");
+        debug_assert!(
+            num_sectors <= 0xFFFF,
+            "SCSI READ(10) transfer length overflow"
+        );
         table.acmd[0] = SCSI_CMD_READ_10;
         table.acmd[2] = ((start_lba >> 24) & 0xFF) as u8;
         table.acmd[3] = ((start_lba >> 16) & 0xFF) as u8;
@@ -1575,11 +1583,13 @@ pub fn global_read_sectors(lba: u64, buffer: &mut [u8]) -> Result<(), ()> {
         .unwrap_or(512);
     let num_sectors = (buffer.len() / sector_size).max(1) as u32;
 
-    controller
-        .read_sectors(port_index, lba, num_sectors, buffer.as_mut_ptr())
-        .map_err(|e| {
+    // Safety: buffer.as_mut_ptr() points to a valid slice of `buffer.len()` bytes,
+    // and num_sectors * sector_size <= buffer.len() by construction above.
+    unsafe { controller.read_sectors(port_index, lba, num_sectors, buffer.as_mut_ptr()) }.map_err(
+        |e| {
             log::error!("global_read_sectors: read failed at LBA {}: {:?}", lba, e);
-        })
+        },
+    )
 }
 
 /// Get the sector size of the global AHCI device

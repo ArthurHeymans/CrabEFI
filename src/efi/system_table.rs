@@ -434,7 +434,7 @@ struct AcpiRegion {
 
 /// Collect all ACPI table regions, merge overlapping ones, then mark them
 fn mark_acpi_tables_memory(rsdp_addr: u64) {
-    use super::allocator::{mark_as_acpi_reclaim, PAGE_SIZE};
+    use super::allocator::{PAGE_SIZE, mark_as_acpi_reclaim};
 
     log::info!("Marking ACPI table memory regions as AcpiReclaimMemory...");
 
@@ -654,7 +654,7 @@ fn mark_acpi_tables_memory(rsdp_addr: u64) {
 
 /// Install ACPI tables from coreboot
 pub fn install_acpi_tables(rsdp: u64) {
-    use super::allocator::{get_memory_type_at, MemoryType};
+    use super::allocator::{MemoryType, get_memory_type_at};
 
     if rsdp == 0 {
         log::warn!("ACPI RSDP address is null, skipping ACPI table installation");
@@ -1058,7 +1058,7 @@ pub fn install_tpm_event_log() {
 ///
 /// Reference: UEFI Specification 2.6+, Section 4.6
 pub fn install_memory_attributes_table() {
-    use super::allocator::{self, attributes, MemoryDescriptor, MemoryType};
+    use super::allocator::{self, MemoryDescriptor, MemoryType, attributes};
 
     // Query the memory map size
     let mut map_size: usize = 0;
@@ -1111,7 +1111,7 @@ pub fn install_memory_attributes_table() {
     let descriptor_size = core::mem::size_of::<MemoryDescriptor>() as u32;
     let table_size = core::mem::size_of::<EfiMemoryAttributesTable>()
         + (runtime_count as usize) * (descriptor_size as usize);
-    let table_pages = ((table_size as u64) + 4095) / 4096;
+    let table_pages = (table_size as u64).div_ceil(4096);
 
     let mut table_addr: u64 = 0;
     let alloc_status = allocator::allocate_pages(
@@ -1197,7 +1197,7 @@ pub fn install_memory_attributes_table() {
 ///
 /// This function does NOT call allocate_pages and does NOT change the map_key.
 pub fn rebuild_memory_attributes_table_in_place() {
-    use super::allocator::{self, attributes, MemoryDescriptor, MemoryType};
+    use super::allocator::{self, MemoryDescriptor, MemoryType, attributes};
 
     // Find the existing MEMATTR table pointer from the config table
     let existing_addr = {

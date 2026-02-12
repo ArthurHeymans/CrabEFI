@@ -268,10 +268,7 @@ pub fn install_disk_io_on_handle(handle: Handle) {
     );
 
     if status == Status::SUCCESS {
-        log::info!(
-            "DiskIO protocol installed on handle {:?}",
-            handle
-        );
+        log::info!("DiskIO protocol installed on handle {:?}", handle);
     } else {
         log::error!(
             "DiskIO: failed to install on handle {:?}: {:?}",
