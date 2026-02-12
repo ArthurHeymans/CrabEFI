@@ -131,11 +131,7 @@ impl GptPartitionEntry {
         let mut s = heapless::String::new();
         // Copy name array to avoid reference to packed struct field
         let name = self.name;
-        for c in name {
-            if c == 0 {
-                break;
-            }
-            // Convert UTF-16LE to ASCII (simple conversion)
+        for &c in name.iter().take_while(|&&c| c != 0) {
             let _ = s.push(if c < 128 { c as u8 as char } else { '?' });
         }
         s

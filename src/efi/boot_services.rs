@@ -1238,15 +1238,14 @@ fn load_image_from_device_path(
 fn find_handle_with_protocol(protocol_guid: &Guid) -> Option<Handle> {
     let efi_state = state::efi();
 
-    for entry in &efi_state.handles[..efi_state.handle_count] {
-        for proto in &entry.protocols[..entry.protocol_count] {
-            if proto.guid == *protocol_guid {
-                return Some(entry.handle);
-            }
-        }
-    }
-
-    None
+    efi_state.handles[..efi_state.handle_count]
+        .iter()
+        .find(|e| {
+            e.protocols[..e.protocol_count]
+                .iter()
+                .any(|p| p.guid == *protocol_guid)
+        })
+        .map(|e| e.handle)
 }
 
 /// Maximum device path depth to prevent runaway walks on corrupted paths.
@@ -2877,16 +2876,13 @@ pub fn install_protocol(handle: Handle, guid: &Guid, interface: *mut c_void) -> 
 pub fn get_protocol_on_handle(handle: Handle, guid: &Guid) -> *mut c_void {
     let efi_state = state::efi();
 
-    for entry in &efi_state.handles[..efi_state.handle_count] {
-        if entry.handle == handle {
-            for proto in &entry.protocols[..entry.protocol_count] {
-                if proto.guid == *guid {
-                    return proto.interface;
-                }
-            }
-            break;
-        }
-    }
-
-    core::ptr::null_mut()
+    efi_state.handles[..efi_state.handle_count]
+        .iter()
+        .find(|e| e.handle == handle)
+        .and_then(|e| {
+            e.protocols[..e.protocol_count]
+                .iter()
+                .find(|p| p.guid == *guid)
+        })
+        .map_or(core::ptr::null_mut(), |p| p.interface)
 }

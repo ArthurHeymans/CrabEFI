@@ -158,30 +158,14 @@ pub fn discover_entries(fs: &mut FatFilesystem<'_>) -> Result<BlsDiscovery, BlsE
         }
     }
 
-    // Sort entries - convert to slice, sort, and copy back
-    // heapless Vec doesn't have sort_by, so we do a simple insertion sort
-    let len = discovery.entries.len();
-    for i in 1..len {
-        let mut j = i;
-        while j > 0 {
-            let should_swap = {
-                let a = &discovery.entries[j - 1];
-                let b = &discovery.entries[j];
-                // First by sort-key, then by version (descending - newer first)
-                if !a.sort_key.is_empty() || !b.sort_key.is_empty() {
-                    a.sort_key > b.sort_key
-                } else {
-                    a.version < b.version
-                }
-            };
-            if should_swap {
-                discovery.entries.swap(j - 1, j);
-                j -= 1;
-            } else {
-                break;
-            }
+    // Sort entries: by sort-key ascending, then by version descending (newer first)
+    discovery.entries.as_mut_slice().sort_by(|a, b| {
+        if !a.sort_key.is_empty() || !b.sort_key.is_empty() {
+            a.sort_key.cmp(&b.sort_key)
+        } else {
+            b.version.cmp(&a.version)
         }
-    }
+    });
 
     if discovery.is_empty() {
         log::debug!("No BLS entries found");

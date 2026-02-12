@@ -159,8 +159,6 @@ impl BlsEntry {
 pub enum BlsParseError {
     /// Missing required fields (title or linux)
     MissingRequired,
-    /// Invalid format
-    InvalidFormat,
 }
 
 /// Split a line into key and value

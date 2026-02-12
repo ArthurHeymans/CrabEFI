@@ -138,11 +138,7 @@ where
 #[inline]
 pub fn try_get() -> Option<&'static FirmwareState> {
     let ptr = STATE_PTR.load(Ordering::Acquire);
-    if ptr.is_null() {
-        None
-    } else {
-        Some(unsafe { &*ptr })
-    }
+    (!ptr.is_null()).then(|| unsafe { &*ptr })
 }
 
 /// Try to get a raw mutable pointer to the global firmware state.
@@ -152,7 +148,7 @@ pub fn try_get() -> Option<&'static FirmwareState> {
 #[inline]
 pub fn try_get_mut_ptr() -> Option<*mut FirmwareState> {
     let ptr = STATE_PTR.load(Ordering::Acquire);
-    if ptr.is_null() { None } else { Some(ptr) }
+    (!ptr.is_null()).then_some(ptr)
 }
 
 // ============================================================================
