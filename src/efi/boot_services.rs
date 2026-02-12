@@ -442,11 +442,11 @@ extern "efiapi" fn wait_for_event(
         for (i, &evt) in events_to_wait.iter().enumerate() {
             let event_id = evt as usize;
 
-            // Check if it's the keyboard event and there's input
+            // Check if it's the keyboard event and there's actual key input.
+            // We do a real read-ahead (not just peek at status registers) to
+            // avoid false positives from modifier keys, mouse data, etc.
             if event_id == KEYBOARD_EVENT_ID
-                && (crate::drivers::serial::has_input()
-                    || crate::drivers::keyboard::has_key()
-                    || crate::drivers::usb::keyboard_has_key())
+                && crate::efi::protocols::console::keyboard_check_ready()
             {
                 unsafe { *index = i };
                 log::debug!("  -> SUCCESS (keyboard input ready, index={})", i);
@@ -516,13 +516,9 @@ extern "efiapi" fn check_event(event: efi::Event) -> Status {
     let event_id = event as usize;
     log::trace!("BS.CheckEvent(event={})", event_id);
 
-    // Special case for keyboard event
+    // Special case for keyboard event — do a real read-ahead check
     if event_id == KEYBOARD_EVENT_ID {
-        // Check serial port, PS/2 keyboard, or USB keyboard for input
-        if crate::drivers::serial::has_input()
-            || crate::drivers::keyboard::has_key()
-            || crate::drivers::usb::keyboard_has_key()
-        {
+        if crate::efi::protocols::console::keyboard_check_ready() {
             return Status::SUCCESS;
         } else {
             return Status::NOT_READY;

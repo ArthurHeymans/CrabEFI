@@ -138,6 +138,12 @@ extern "efiapi" fn text_input_ex_reset(
     _extended_verification: Boolean,
 ) -> Status {
     log::debug!("SimpleTextInputEx.Reset()");
+    state::with_console_mut(|console| {
+        console.input.pending_key = None;
+        console.input.queued_key = None;
+        console.input.in_escape = false;
+        console.input.escape_len = 0;
+    });
     Status::SUCCESS
 }
 

@@ -110,11 +110,10 @@ extern "efiapi" fn console_set_mode(
                 let (cols, rows, delta_x, delta_y) =
                     crate::efi::protocols::console::compute_centered_text_layout(fb);
 
-                // Clear entire framebuffer
-                let fb_size = fb.y_resolution as usize * fb.bytes_per_line as usize;
+                // Clear entire framebuffer with the current background color
+                let (bg_r, bg_g, bg_b) = console.bg_color;
                 unsafe {
-                    let dst = fb.physical_address as *mut u8;
-                    core::slice::from_raw_parts_mut(dst, fb_size).fill(0);
+                    fb.fill_solid(bg_r, bg_g, bg_b);
                 }
 
                 console.start_row = 0;
@@ -139,10 +138,9 @@ extern "efiapi" fn console_set_mode(
                     return;
                 };
 
-                let fb_size = fb.y_resolution as usize * fb.bytes_per_line as usize;
+                // Graphics mode always clears to black (GOP starts fresh)
                 unsafe {
-                    let dst = fb.physical_address as *mut u8;
-                    core::slice::from_raw_parts_mut(dst, fb_size).fill(0);
+                    fb.fill_solid(0, 0, 0);
                 }
 
                 // Reset centering offsets (GOP uses raw pixel addressing)

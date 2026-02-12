@@ -72,7 +72,7 @@ fn fb_put_char(c: char) {
                 col = 0;
                 row += 1;
                 if row >= max_row {
-                    fb_scroll_up(fb, start_row, max_row, delta_x, delta_y, cols);
+                    fb_scroll_up(fb, start_row, max_row, delta_x, delta_y, cols, bg_color);
                     row = max_row - 1;
                 }
             }
@@ -86,7 +86,7 @@ fn fb_put_char(c: char) {
                     col = 0;
                     row += 1;
                     if row >= max_row {
-                        fb_scroll_up(fb, start_row, max_row, delta_x, delta_y, cols);
+                        fb_scroll_up(fb, start_row, max_row, delta_x, delta_y, cols, bg_color);
                         row = max_row - 1;
                     }
                 }
@@ -149,6 +149,7 @@ fn fb_scroll_up(
     delta_x: u32,
     delta_y: u32,
     cols: u32,
+    bg_color: (u8, u8, u8),
 ) {
     let row_stride = fb.bytes_per_line as usize;
     let bpp = (fb.bits_per_pixel / 8) as usize;
@@ -172,13 +173,14 @@ fn fb_scroll_up(
         }
     }
 
-    // Clear the last row within the text region
+    // Clear the last row within the text region using the current bg color
     let last_row_y = (max_row - 1) * CHAR_HEIGHT + delta_y;
+    let (bg_r, bg_g, bg_b) = bg_color;
     for line in 0..CHAR_HEIGHT {
         let offset = ((last_row_y + line) as usize) * row_stride + x_offset_bytes;
         unsafe {
             let dst = (fb.physical_address as *mut u8).add(offset);
-            core::slice::from_raw_parts_mut(dst, text_width_bytes).fill(0);
+            fb.fill_pixels(dst, (cols * CHAR_WIDTH) as usize, bg_r, bg_g, bg_b);
         }
     }
 }
@@ -294,7 +296,13 @@ extern "efiapi" fn text_input_reset(
     _this: *mut SimpleTextInputProtocol,
     _extended_verification: Boolean,
 ) -> Status {
-    // Nothing to reset for serial input
+    log::debug!("ConIn.Reset()");
+    state::with_console_mut(|console| {
+        console.input.pending_key = None;
+        console.input.queued_key = None;
+        console.input.in_escape = false;
+        console.input.escape_len = 0;
+    });
     Status::SUCCESS
 }
 
@@ -335,6 +343,11 @@ extern "efiapi" fn text_input_read_key_stroke(
 ///
 /// Returns `Some((scan_code, unicode_char))` if a key is available, `None` otherwise.
 pub(crate) fn try_read_key(input_state: &mut InputState) -> Option<(u16, u16)> {
+    // Check if WaitForEvent/CheckEvent already read ahead a key for us
+    if let Some(key) = input_state.pending_key.take() {
+        return Some(key);
+    }
+
     // Check queued key from previous escape sequence parsing
     if let Some((scan_code, unicode_char)) = input_state.queued_key.take() {
         return Some((scan_code, unicode_char));
@@ -787,12 +800,10 @@ extern "efiapi" fn text_output_clear_screen(_this: *mut SimpleTextOutputProtocol
             return;
         };
 
-        let fb_size = fb.y_resolution as usize * fb.bytes_per_line as usize;
-
-        // Clear entire framebuffer in one go
+        // Clear entire framebuffer with the current background color
+        let (bg_r, bg_g, bg_b) = console.bg_color;
         unsafe {
-            let dst = fb.physical_address as *mut u8;
-            core::slice::from_raw_parts_mut(dst, fb_size).fill(0);
+            fb.fill_solid(bg_r, bg_g, bg_b);
         }
 
         // Reset console to use full screen with centering
@@ -926,6 +937,34 @@ fn format_cursor_pos(buf: &mut [u8], row: usize, col: usize) -> usize {
     pos += 1;
 
     pos
+}
+
+/// Check if keyboard input is truly available.
+///
+/// This attempts to actually read a key from all input sources. If a key
+/// is obtained, it is stashed in `pending_key` so the next `ReadKeyStroke`
+/// or `ReadKeyStrokeEx` call will return it immediately. This prevents
+/// false positives from modifier-only scancodes or mouse data in the PS/2
+/// output buffer that would cause `has_key()` to return true without any
+/// actual EFI key being produced.
+pub(crate) fn keyboard_check_ready() -> bool {
+    state::with_console_mut(|console| {
+        let input = &mut console.input;
+
+        // Already have a pending key from a previous check
+        if input.pending_key.is_some() || input.queued_key.is_some() {
+            return true;
+        }
+
+        // Attempt to read a real key
+        if let Some(key) = try_read_key(input) {
+            // Stash it for the next ReadKeyStroke/ReadKeyStrokeEx call
+            input.pending_key = Some(key);
+            true
+        } else {
+            false
+        }
+    })
 }
 
 /// Compute the centered text layout for a framebuffer.

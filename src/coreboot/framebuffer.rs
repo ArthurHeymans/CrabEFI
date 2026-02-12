@@ -101,6 +101,79 @@ impl FramebufferInfo {
         }
     }
 
+    /// Encode a pixel value as a 32-bit word (for use in bulk fill operations).
+    ///
+    /// For 32bpp, returns the native pixel encoding.
+    /// For 16bpp, returns the 16-bit pixel zero-extended to u32.
+    /// For other bpp, returns 0.
+    pub fn encode_pixel(&self, r: u8, g: u8, b: u8) -> u32 {
+        match self.bits_per_pixel {
+            32 => self.encode_pixel_32(r, g, b),
+            16 => self.encode_pixel_16(r, g, b) as u32,
+            _ => 0,
+        }
+    }
+
+    /// Fill a framebuffer byte region with a solid color.
+    ///
+    /// Writes `pixel_count` pixels starting at `dst`, using the native pixel
+    /// encoding for the given RGB color. This is much faster than calling
+    /// `write_pixel` in a loop because it avoids per-pixel bounds checks.
+    ///
+    /// # Safety
+    ///
+    /// `dst` must point to `pixel_count * (bits_per_pixel/8)` writable bytes
+    /// within the framebuffer.
+    pub unsafe fn fill_pixels(&self, dst: *mut u8, pixel_count: usize, r: u8, g: u8, b: u8) {
+        match self.bits_per_pixel {
+            32 => {
+                let pixel = self.encode_pixel_32(r, g, b);
+                let ptr = dst as *mut u32;
+                for i in 0..pixel_count {
+                    ptr.add(i).write_volatile(pixel);
+                }
+            }
+            16 => {
+                let pixel = self.encode_pixel_16(r, g, b);
+                let ptr = dst as *mut u16;
+                for i in 0..pixel_count {
+                    ptr.add(i).write_volatile(pixel);
+                }
+            }
+            _ => {
+                // Fallback: zero-fill
+                core::slice::from_raw_parts_mut(
+                    dst,
+                    pixel_count * (self.bits_per_pixel as usize / 8),
+                )
+                .fill(0);
+            }
+        }
+    }
+
+    /// Fill the entire framebuffer with a solid color (fast path).
+    ///
+    /// # Safety
+    ///
+    /// The framebuffer must be accessible.
+    pub unsafe fn fill_solid(&self, r: u8, g: u8, b: u8) {
+        let total_pixels = self.x_resolution as usize * self.y_resolution as usize;
+        // For non-packed scanlines, fill row by row to avoid overwriting padding
+        if self.bytes_per_line as usize
+            == self.x_resolution as usize * (self.bits_per_pixel as usize / 8)
+        {
+            // Packed: fill entire buffer at once
+            self.fill_pixels(self.as_ptr(), total_pixels, r, g, b);
+        } else {
+            // Padded scanlines: fill each row
+            for y in 0..self.y_resolution {
+                let offset = (y * self.bytes_per_line) as usize;
+                let dst = self.as_ptr().add(offset);
+                self.fill_pixels(dst, self.x_resolution as usize, r, g, b);
+            }
+        }
+    }
+
     /// Encode a 32-bit pixel value
     fn encode_pixel_32(&self, r: u8, g: u8, b: u8) -> u32 {
         let r = (r as u32) << self.red_mask_pos;

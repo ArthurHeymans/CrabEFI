@@ -152,11 +152,7 @@ pub fn try_get() -> Option<&'static FirmwareState> {
 #[inline]
 pub fn try_get_mut_ptr() -> Option<*mut FirmwareState> {
     let ptr = STATE_PTR.load(Ordering::Acquire);
-    if ptr.is_null() {
-        None
-    } else {
-        Some(ptr)
-    }
+    if ptr.is_null() { None } else { Some(ptr) }
 }
 
 // ============================================================================
@@ -706,7 +702,7 @@ impl ConsoleState {
             start_row: 0,
             delta_x: 0,
             delta_y: 0,
-            fg_color: (255, 255, 255), // EFI_LIGHTGRAY default
+            fg_color: (170, 170, 170), // EFI_LIGHTGRAY (attribute 0x07, index 7)
             bg_color: (0, 0, 0),       // EFI_BLACK default
             input: InputState::new(),
             logger_framebuffer: None,
@@ -735,6 +731,10 @@ pub struct InputState {
     pub in_escape: bool,
     /// Queued key to return (scan_code, unicode_char)
     pub queued_key: Option<(u16, u16)>,
+    /// Key read-ahead by CheckEvent/WaitForEvent to confirm real input
+    /// This prevents false "keyboard ready" signals from modifier-only
+    /// or mouse data in the PS/2 output buffer.
+    pub pending_key: Option<(u16, u16)>,
 }
 
 impl Default for InputState {
@@ -750,6 +750,7 @@ impl InputState {
             escape_len: 0,
             in_escape: false,
             queued_key: None,
+            pending_key: None,
         }
     }
 }
