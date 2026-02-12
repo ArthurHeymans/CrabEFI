@@ -5,6 +5,7 @@
 pub mod ata_pass_thru;
 pub mod block_io;
 pub mod console;
+pub mod disk_io;
 pub mod console_control;
 pub mod device_path;
 pub mod graphics_output;

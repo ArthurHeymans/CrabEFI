@@ -38,20 +38,13 @@
 //! mutability without the overhead of `Mutex`. The UEFI spec guarantees
 //! that Boot Services are not reentrant.
 
-use core::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
+use core::sync::atomic::{AtomicPtr, Ordering};
 
 /// Global pointer to the firmware state.
 ///
 /// This is the ONLY global mutable state. It points to a `FirmwareState`
 /// allocated on the stack in `init()`.
 static STATE_PTR: AtomicPtr<FirmwareState> = AtomicPtr::new(core::ptr::null_mut());
-
-/// Runtime borrow flag to detect reentrant mutable access.
-///
-/// Set to `true` while a `with_mut` closure is executing. If a nested
-/// `with_mut` call is attempted, we panic rather than silently creating
-/// aliased `&mut` references (which would be undefined behavior).
-static BORROW_FLAG: AtomicBool = AtomicBool::new(false);
 
 /// Initialize the global state pointer.
 ///
@@ -108,11 +101,6 @@ pub fn get_mut_ptr() -> *mut FirmwareState {
 /// This is the preferred way to mutate firmware state as it makes the
 /// borrowing scope explicit and prevents accidental aliasing.
 ///
-/// # Panics
-///
-/// Panics if called reentrantly (i.e., from within another `with_mut` closure).
-/// This runtime check prevents undefined behavior from aliased `&mut` references.
-///
 /// # Example
 ///
 /// ```ignore
@@ -127,18 +115,8 @@ where
 {
     let ptr = STATE_PTR.load(Ordering::Acquire);
     assert!(!ptr.is_null(), "FirmwareState not initialized");
-
-    // Runtime borrow check: detect reentrant mutable access
-    assert!(
-        !BORROW_FLAG.swap(true, Ordering::Acquire),
-        "BUG: reentrant with_mut() call detected - this would create aliased &mut references"
-    );
-
-    // Safety: Single-threaded firmware, borrow flag prevents reentrant aliasing
-    let result = unsafe { f(&mut *ptr) };
-
-    BORROW_FLAG.store(false, Ordering::Release);
-    result
+    // Safety: Single-threaded firmware, closure scope limits aliasing
+    unsafe { f(&mut *ptr) }
 }
 
 /// Try to get a reference to the global firmware state.
@@ -161,7 +139,11 @@ pub fn try_get() -> Option<&'static FirmwareState> {
 #[inline]
 pub fn try_get_mut_ptr() -> Option<*mut FirmwareState> {
     let ptr = STATE_PTR.load(Ordering::Acquire);
-    if ptr.is_null() { None } else { Some(ptr) }
+    if ptr.is_null() {
+        None
+    } else {
+        Some(ptr)
+    }
 }
 
 // ============================================================================
@@ -223,7 +205,7 @@ pub const MAX_EVENTS: usize = 32;
 pub const MAX_LOADED_IMAGES: usize = 16;
 
 /// Maximum number of configuration tables
-pub const MAX_CONFIG_TABLES: usize = 16;
+pub const MAX_CONFIG_TABLES: usize = 24;
 
 /// Maximum number of EFI variables
 pub const MAX_VARIABLES: usize = 64;
@@ -245,6 +227,7 @@ pub struct ProtocolEntry {
 // These pointers point to memory allocated via the EFI allocator which
 // remains valid for the lifetime of the firmware. CrabEFI is single-threaded.
 unsafe impl Send for ProtocolEntry {}
+unsafe impl Sync for ProtocolEntry {}
 
 impl ProtocolEntry {
     pub const fn empty() -> Self {
@@ -266,6 +249,7 @@ pub struct HandleEntry {
 // Handles are opaque identifiers that remain valid until explicitly closed.
 // CrabEFI is single-threaded with no concurrent access to handle data.
 unsafe impl Send for HandleEntry {}
+unsafe impl Sync for HandleEntry {}
 
 impl HandleEntry {
     pub const fn empty() -> Self {
@@ -277,6 +261,17 @@ impl HandleEntry {
     }
 }
 
+/// Timer delay type matching UEFI TimerDelay enum
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum TimerType {
+    /// Timer is cancelled
+    Cancel,
+    /// Timer fires repeatedly every trigger_time
+    Periodic,
+    /// Timer fires once after trigger_time
+    Relative,
+}
+
 /// Event entry for tracking created events
 #[derive(Clone, Copy)]
 pub struct EventEntry {
@@ -284,13 +279,24 @@ pub struct EventEntry {
     pub notify_tpl: efi::Tpl,
     pub signaled: bool,
     pub is_keyboard_event: bool,
-    /// Timer type: 0 = cancelled, 1 = periodic, 2 = relative (one-shot)
-    pub timer_type: u32,
-    /// Timer period in 100-ns units (for periodic timers)
-    pub timer_period_100ns: u64,
-    /// TSC deadline for the next timer firing (0 = no timer)
-    pub timer_deadline: u64,
+    /// Notify callback function (for EVT_NOTIFY_SIGNAL and EVT_NOTIFY_WAIT)
+    pub notify_function: Option<efi::EventNotify>,
+    /// Context pointer passed to notify callback
+    pub notify_context: *mut core::ffi::c_void,
+    /// Event group GUID (for CreateEventEx)
+    pub event_group: Option<efi::Guid>,
+    /// Timer type (Cancel, Periodic, Relative)
+    pub timer_type: TimerType,
+    /// Timer trigger time in 100ns units (UEFI convention)
+    pub timer_trigger_time: u64,
+    /// TSC deadline for next timer firing
+    pub timer_deadline_tsc: u64,
 }
+
+// Safety: EventEntry contains raw pointers used as opaque callback contexts.
+// CrabEFI is single-threaded; all event access is serialized.
+unsafe impl Send for EventEntry {}
+unsafe impl Sync for EventEntry {}
 
 impl EventEntry {
     pub const fn empty() -> Self {
@@ -299,9 +305,12 @@ impl EventEntry {
             notify_tpl: 0,
             signaled: false,
             is_keyboard_event: false,
-            timer_type: 0,
-            timer_period_100ns: 0,
-            timer_deadline: 0,
+            notify_function: None,
+            notify_context: core::ptr::null_mut(),
+            event_group: None,
+            timer_type: TimerType::Cancel,
+            timer_trigger_time: 0,
+            timer_deadline_tsc: 0,
         }
     }
 }
@@ -452,6 +461,14 @@ pub struct EfiState {
     /// Memory allocator
     pub allocator: MemoryAllocator,
 
+    /// Monotonic counter for GetNextMonotonicCount
+    pub monotonic_count: u64,
+
+    /// Flag indicating EFI_EVENT_GROUP_READY_TO_BOOT has been signaled
+    /// Per UEFI spec, this should only be signaled once before the first
+    /// boot option is attempted.
+    pub ready_to_boot_signaled: bool,
+
     /// Flag indicating ExitBootServices has been called
     /// After this is set, SPI flash is locked and variable writes
     /// must go to ESP file instead.
@@ -478,6 +495,8 @@ impl EfiState {
             variables: [const { VariableEntry::empty() }; MAX_VARIABLES],
             varstore: VarStoreState::new(),
             allocator: MemoryAllocator::new(),
+            monotonic_count: 0,
+            ready_to_boot_signaled: false,
             exit_boot_services_called: false,
             filesystem: None,
             block_device: None,

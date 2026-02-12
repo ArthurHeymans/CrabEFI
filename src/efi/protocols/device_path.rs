@@ -11,7 +11,7 @@ use r_efi::protocols::device_path::{
     self, End, HardDriveMedia, Media, Protocol, TYPE_END, TYPE_MEDIA,
 };
 
-use crate::efi::allocator::{MemoryType, allocate_pool};
+use crate::efi::allocator::{allocate_pool, MemoryType};
 
 /// Re-export the GUID for external use
 pub const DEVICE_PATH_PROTOCOL_GUID: Guid = device_path::PROTOCOL_GUID;
@@ -1059,6 +1059,18 @@ pub enum DevicePathInfo {
         pci_function: u8,
         usb_port: u8,
     },
+    /// AHCI/SATA CD-ROM (El Torito)
+    AhciCdrom {
+        pci_device: u8,
+        pci_function: u8,
+        port: u16,
+        /// El Torito boot catalog entry number (usually 0)
+        boot_entry: u32,
+        /// Start LBA of the El Torito boot image
+        partition_start: u64,
+        /// Size of the El Torito boot image in blocks
+        partition_size: u64,
+    },
     /// SDHCI (SD card) - uses USB device path with port=0
     Sdhci { pci_device: u8, pci_function: u8 },
 }
@@ -1081,6 +1093,12 @@ pub fn create_disk_device_path(info: &DevicePathInfo) -> *mut Protocol {
             pci_device,
             pci_function,
             port,
+        } => create_sata_device_path(pci_device, pci_function, port),
+        DevicePathInfo::AhciCdrom {
+            pci_device,
+            pci_function,
+            port,
+            ..
         } => create_sata_device_path(pci_device, pci_function, port),
         DevicePathInfo::Usb {
             pci_device,
@@ -1138,6 +1156,21 @@ pub fn create_partition_device_path(
             partition_start,
             partition_size,
             partition_guid,
+        ),
+        DevicePathInfo::AhciCdrom {
+            pci_device,
+            pci_function,
+            port,
+            boot_entry,
+            partition_start: cdrom_start,
+            partition_size: cdrom_size,
+        } => create_sata_cdrom_device_path(
+            pci_device,
+            pci_function,
+            port,
+            boot_entry,
+            cdrom_start,
+            cdrom_size,
         ),
         DevicePathInfo::Usb {
             pci_device,

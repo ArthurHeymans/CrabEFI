@@ -434,7 +434,7 @@ struct AcpiRegion {
 
 /// Collect all ACPI table regions, merge overlapping ones, then mark them
 fn mark_acpi_tables_memory(rsdp_addr: u64) {
-    use super::allocator::{PAGE_SIZE, mark_as_acpi_reclaim};
+    use super::allocator::{mark_as_acpi_reclaim, PAGE_SIZE};
 
     log::info!("Marking ACPI table memory regions as AcpiReclaimMemory...");
 
@@ -654,7 +654,7 @@ fn mark_acpi_tables_memory(rsdp_addr: u64) {
 
 /// Install ACPI tables from coreboot
 pub fn install_acpi_tables(rsdp: u64) {
-    use super::allocator::{MemoryType, get_memory_type_at};
+    use super::allocator::{get_memory_type_at, MemoryType};
 
     if rsdp == 0 {
         log::warn!("ACPI RSDP address is null, skipping ACPI table installation");
@@ -899,22 +899,6 @@ pub fn install_smbios_tables(smbios_addr: u64) {
     }
 }
 
-/// Compute CRC32 (ISO 3309 / UEFI spec) for a byte slice
-fn compute_crc32(data: &[u8]) -> u32 {
-    let mut crc: u32 = 0xFFFF_FFFF;
-    for &byte in data {
-        crc ^= byte as u32;
-        for _ in 0..8 {
-            if crc & 1 != 0 {
-                crc = (crc >> 1) ^ 0xEDB8_8320;
-            } else {
-                crc >>= 1;
-            }
-        }
-    }
-    crc ^ 0xFFFF_FFFF
-}
-
 /// Update CRC32 in a UEFI table header.
 ///
 /// Per the UEFI spec, the CRC is computed over `header_size` bytes with the
@@ -924,7 +908,7 @@ unsafe fn update_table_header_crc32(header: *mut TableHeader) {
     hdr.crc32 = 0;
     let size = hdr.header_size as usize;
     let bytes = core::slice::from_raw_parts(header as *const u8, size);
-    hdr.crc32 = compute_crc32(bytes);
+    hdr.crc32 = super::boot_services::compute_crc32(bytes);
 }
 
 /// Recompute CRC32 checksums for the System Table, Boot Services, and Runtime Services.

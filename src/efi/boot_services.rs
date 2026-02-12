@@ -29,8 +29,6 @@ const DEVICE_PATH_TYPE_MEDIA: u8 = device_path::TYPE_MEDIA;
 const DEVICE_PATH_SUBTYPE_FILE_PATH: u8 = Media::SUBTYPE_FILE_PATH;
 /// Device path type for End
 const DEVICE_PATH_TYPE_END: u8 = device_path::TYPE_END;
-/// Device path protocol GUID
-const DEVICE_PATH_GUID: Guid = device_path::PROTOCOL_GUID;
 
 /// Boot Services signature "BOOTSERV"
 const EFI_BOOT_SERVICES_SIGNATURE: u64 = 0x56524553544F4F42;
@@ -311,8 +309,8 @@ extern "efiapi" fn free_pool(buffer: *mut c_void) -> Status {
 extern "efiapi" fn create_event(
     event_type: u32,
     notify_tpl: Tpl,
-    _notify_function: Option<efi::EventNotify>,
-    _notify_context: *mut c_void,
+    notify_function: Option<efi::EventNotify>,
+    notify_context: *mut c_void,
     event: *mut efi::Event,
 ) -> Status {
     log::debug!(
@@ -336,15 +334,18 @@ extern "efiapi" fn create_event(
 
         efi_state.next_event_id += 1;
 
-        // Store event info
+        // Store event info including notify callback
         efi_state.events[event_id] = EventEntry {
             event_type,
             notify_tpl,
             signaled: false,
             is_keyboard_event: false,
-            timer_type: 0,
-            timer_period_100ns: 0,
-            timer_deadline: 0,
+            notify_function,
+            notify_context,
+            event_group: None,
+            timer_type: state::TimerType::Cancel,
+            timer_trigger_time: 0,
+            timer_deadline_tsc: 0,
         };
 
         // Return the event ID as the event handle
@@ -362,44 +363,53 @@ extern "efiapi" fn set_timer(
     timer_type: efi::TimerDelay,
     trigger_time: u64,
 ) -> Status {
-    let event_id = event as usize;
     log::debug!(
-        "BS.SetTimer(event={}, type={}, time={} 100ns units)",
-        event_id,
+        "BS.SetTimer(event={:?}, type={}, time={})",
+        event,
         timer_type,
         trigger_time
     );
 
+    let event_id = event as usize;
     if event_id == 0 || event_id >= MAX_EVENTS {
         return Status::INVALID_PARAMETER;
     }
 
+    // Convert UEFI timer type to our enum
+    // TimerCancel=0, TimerPeriodic=1, TimerRelative=2
+    let timer = match timer_type {
+        0 => state::TimerType::Cancel,
+        1 => state::TimerType::Periodic,
+        2 => state::TimerType::Relative,
+        _ => return Status::INVALID_PARAMETER,
+    };
+
     state::with_efi_mut(|efi_state| {
         let entry = &mut efi_state.events[event_id];
 
-        // UEFI TimerDelay: 0 = TimerCancel, 1 = TimerPeriodic, 2 = TimerRelative
-        match timer_type {
-            0 => {
-                // TimerCancel
-                entry.timer_type = 0;
-                entry.timer_deadline = 0;
-                entry.timer_period_100ns = 0;
+        // Verify this is a timer event
+        if entry.event_type & EVT_TIMER == 0 {
+            log::debug!("  -> INVALID_PARAMETER (not a timer event)");
+            return Status::INVALID_PARAMETER;
+        }
+
+        entry.timer_type = timer;
+        entry.timer_trigger_time = trigger_time;
+
+        match timer {
+            state::TimerType::Cancel => {
+                entry.timer_deadline_tsc = 0;
                 entry.signaled = false;
                 log::debug!("  -> SUCCESS (timer cancelled)");
             }
-            1 | 2 => {
-                // TimerPeriodic or TimerRelative
-                entry.timer_type = timer_type;
-                entry.timer_period_100ns = trigger_time;
-                entry.signaled = false;
-
-                // Convert 100-ns units to microseconds and set TSC deadline
+            state::TimerType::Periodic | state::TimerType::Relative => {
+                // Convert 100ns units to TSC ticks
+                let tsc_per_us = crate::time::tsc_frequency() / 1_000_000;
                 let us = trigger_time / 10;
-                entry.timer_deadline = crate::time::deadline_after_us(us);
-                log::debug!("  -> SUCCESS ({}us deadline set)", us);
-            }
-            _ => {
-                return Status::INVALID_PARAMETER;
+                let tsc_offset = us * tsc_per_us;
+                let now = crate::time::rdtsc();
+                entry.timer_deadline_tsc = now + tsc_offset;
+                log::debug!("  -> SUCCESS (deadline in {}us)", us);
             }
         }
 
@@ -421,13 +431,13 @@ extern "efiapi" fn wait_for_event(
     // Get the list of events to wait on
     let events_to_wait = unsafe { core::slice::from_raw_parts(event, number_of_events) };
 
-    // Poll for events
+    // Poll for events (keyboard input, timers, signaled events)
     loop {
         // Check each event
         for (i, &evt) in events_to_wait.iter().enumerate() {
             let event_id = evt as usize;
 
-            // Only check keyboard input for the actual keyboard event
+            // Check if it's the keyboard event and there's input
             if event_id == KEYBOARD_EVENT_ID
                 && (crate::drivers::serial::has_input()
                     || crate::drivers::keyboard::has_key()
@@ -438,17 +448,9 @@ extern "efiapi" fn wait_for_event(
                 return Status::SUCCESS;
             }
 
-            // Check if event is signaled or timer has expired
+            // Check if a regular event is signaled (including timer check)
             if event_id > 0 && event_id < MAX_EVENTS {
-                if check_and_fire_timer(event_id) {
-                    unsafe { *index = i };
-                    log::debug!(
-                        "  -> SUCCESS (timer fired, event={}, index={})",
-                        event_id,
-                        i
-                    );
-                    return Status::SUCCESS;
-                }
+                check_timer_event(event_id);
 
                 let efi_state = state::efi();
                 if efi_state.events[event_id].signaled {
@@ -471,9 +473,22 @@ extern "efiapi" fn signal_event(event: efi::Event) -> Status {
     log::debug!("BS.SignalEvent(event={})", event_id);
 
     if event_id > 0 && event_id < MAX_EVENTS {
-        state::with_efi_mut(|efi_state| {
+        // Get notify function if present, then mark signaled
+        let notify_fn = state::with_efi_mut(|efi_state| {
             efi_state.events[event_id].signaled = true;
+            let entry = &efi_state.events[event_id];
+            if entry.event_type & EVT_NOTIFY_SIGNAL != 0 {
+                entry.notify_function.map(|f| (f, entry.notify_context))
+            } else {
+                None
+            }
         });
+
+        // Call notify function outside the state lock
+        if let Some((func, context)) = notify_fn {
+            log::debug!("  -> Calling notify function for event {}", event_id);
+            func(event, context);
+        }
     }
 
     Status::SUCCESS
@@ -492,43 +507,9 @@ extern "efiapi" fn close_event(event: efi::Event) -> Status {
     Status::SUCCESS
 }
 
-/// Check if a timer event has reached its deadline and fire it if so.
-///
-/// Returns `true` if the timer fired (event is now signaled).
-/// For periodic timers, resets the deadline for the next period.
-fn check_and_fire_timer(event_id: usize) -> bool {
-    state::with_efi_mut(|efi_state| {
-        let entry = &mut efi_state.events[event_id];
-
-        // Only check events that have a timer set (deadline != 0)
-        if entry.timer_deadline == 0 || entry.timer_type == 0 {
-            return false;
-        }
-
-        if !crate::time::deadline_expired(entry.timer_deadline) {
-            return false; // Not yet expired
-        }
-
-        // Timer fired
-        entry.signaled = true;
-
-        if entry.timer_type == 1 {
-            // Periodic: reset deadline for next period
-            let us = entry.timer_period_100ns / 10;
-            entry.timer_deadline = crate::time::deadline_after_us(us);
-        } else {
-            // Relative (one-shot): clear timer
-            entry.timer_deadline = 0;
-            entry.timer_type = 0;
-        }
-
-        true
-    })
-}
-
 extern "efiapi" fn check_event(event: efi::Event) -> Status {
     let event_id = event as usize;
-    log::debug!("BS.CheckEvent(event={})", event_id);
+    log::trace!("BS.CheckEvent(event={})", event_id);
 
     // Special case for keyboard event
     if event_id == KEYBOARD_EVENT_ID {
@@ -543,11 +524,10 @@ extern "efiapi" fn check_event(event: efi::Event) -> Status {
         }
     }
 
-    // Check timer events
+    // Check regular events
     if event_id > 0 && event_id < MAX_EVENTS {
-        if check_and_fire_timer(event_id) {
-            return Status::SUCCESS;
-        }
+        // Check timer expiration
+        check_timer_event(event_id);
 
         let efi_state = state::efi();
         if efi_state.events[event_id].signaled {
@@ -558,22 +538,152 @@ extern "efiapi" fn check_event(event: efi::Event) -> Status {
     Status::NOT_READY
 }
 
+/// Check if a timer event has expired and signal it if so
+fn check_timer_event(event_id: usize) {
+    state::with_efi_mut(|efi_state| {
+        let entry = &mut efi_state.events[event_id];
+
+        // Only process timer events with an active deadline
+        if entry.event_type & EVT_TIMER == 0 || entry.timer_type == state::TimerType::Cancel {
+            return;
+        }
+
+        if entry.timer_deadline_tsc == 0 {
+            return;
+        }
+
+        let now = crate::time::rdtsc();
+        if now >= entry.timer_deadline_tsc {
+            entry.signaled = true;
+
+            match entry.timer_type {
+                state::TimerType::Periodic => {
+                    // Reset deadline for next period
+                    let tsc_per_us = crate::time::tsc_frequency() / 1_000_000;
+                    let us = entry.timer_trigger_time / 10;
+                    let tsc_offset = us * tsc_per_us;
+                    entry.timer_deadline_tsc = now + tsc_offset;
+                }
+                state::TimerType::Relative => {
+                    // One-shot: clear the deadline
+                    entry.timer_deadline_tsc = 0;
+                }
+                state::TimerType::Cancel => {}
+            }
+        }
+    });
+}
+
+/// EFI_EVENT_GROUP_READY_TO_BOOT GUID
+const EFI_EVENT_GROUP_READY_TO_BOOT: Guid = Guid::from_fields(
+    0x7CE88FB3,
+    0x4BD7,
+    0x4679,
+    0x87,
+    0xA8,
+    &[0xA8, 0xD8, 0xDE, 0xE5, 0x0D, 0x2B],
+);
+
+/// EFI_EVENT_GROUP_EXIT_BOOT_SERVICES GUID
+const EFI_EVENT_GROUP_EXIT_BOOT_SERVICES: Guid = Guid::from_fields(
+    0x27ABF055,
+    0xB1B8,
+    0x4C26,
+    0x80,
+    0x48,
+    &[0x74, 0x8F, 0x37, 0xBA, 0xA2, 0xDF],
+);
+
+/// Signal all events belonging to a specific event group
+fn signal_event_group(group_guid: &Guid) {
+    // Collect events to signal (need to avoid holding state lock during callbacks)
+    let mut events_to_signal: heapless::Vec<(usize, Option<efi::EventNotify>, *mut c_void), MAX_EVENTS> =
+        heapless::Vec::new();
+
+    state::with_efi_mut(|efi_state| {
+        for i in 0..MAX_EVENTS {
+            let entry = &mut efi_state.events[i];
+            if let Some(ref group) = entry.event_group
+                && *group == *group_guid
+            {
+                entry.signaled = true;
+                let notify = if entry.event_type & EVT_NOTIFY_SIGNAL != 0 {
+                    entry.notify_function.map(|f| (f, entry.notify_context))
+                } else {
+                    None
+                };
+                let _ = events_to_signal.push((
+                    i,
+                    notify.map(|(f, _)| f),
+                    notify.map(|(_, c)| c).unwrap_or(core::ptr::null_mut()),
+                ));
+            }
+        }
+    });
+
+    // Call notify functions outside the state lock
+    for (event_id, notify_fn, context) in &events_to_signal {
+        if let Some(func) = notify_fn {
+            log::debug!("signal_event_group: calling notify for event {}", event_id);
+            func(*event_id as efi::Event, *context);
+        }
+    }
+
+    if !events_to_signal.is_empty() {
+        log::info!(
+            "signal_event_group: signaled {} events",
+            events_to_signal.len()
+        );
+    }
+}
+
 extern "efiapi" fn create_event_ex(
     event_type: u32,
     notify_tpl: Tpl,
-    _notify_function: Option<efi::EventNotify>,
-    _notify_context: *const c_void,
-    _event_group: *const Guid,
+    notify_function: Option<efi::EventNotify>,
+    notify_context: *const c_void,
+    event_group: *const Guid,
     event: *mut efi::Event,
 ) -> Status {
+    let group_display = if event_group.is_null() {
+        None
+    } else {
+        Some(GuidFmt(unsafe { *event_group }))
+    };
     log::debug!(
-        "BS.CreateEventEx(type={:#x}, tpl={:?})",
+        "BS.CreateEventEx(type={:#x}, tpl={:?}, group={})",
         event_type,
-        notify_tpl
+        notify_tpl,
+        group_display
+            .as_ref()
+            .map(|g| g as &dyn core::fmt::Display)
+            .unwrap_or(&"NULL" as &dyn core::fmt::Display)
     );
 
-    // Forward to create_event (ignoring event_group for now)
-    create_event(event_type, notify_tpl, None, core::ptr::null_mut(), event)
+    if event.is_null() {
+        return Status::INVALID_PARAMETER;
+    }
+
+    // Create the event with full parameters
+    let status = create_event(
+        event_type,
+        notify_tpl,
+        notify_function,
+        notify_context as *mut c_void,
+        event,
+    );
+
+    if status == Status::SUCCESS && !event_group.is_null() {
+        // Store the event group GUID on the newly created event
+        let event_id = unsafe { *event } as usize;
+        if event_id > 0 && event_id < MAX_EVENTS {
+            state::with_efi_mut(|efi_state| {
+                efi_state.events[event_id].event_group = Some(unsafe { *event_group });
+            });
+        }
+    }
+
+    status
 }
 
 // ============================================================================
@@ -731,33 +841,42 @@ extern "efiapi" fn locate_handle(
         buffer
     );
 
-    // Only ByProtocol search is supported
-    if search_type != efi::BY_PROTOCOL {
-        log::debug!("  -> UNSUPPORTED (only BY_PROTOCOL supported)");
-        return Status::UNSUPPORTED;
-    }
-
-    if protocol.is_null() {
-        return Status::INVALID_PARAMETER;
-    }
-
-    let guid = unsafe { *protocol };
     let efi_state = state::efi();
 
-    // Collect matching handles
-    let matching: heapless::Vec<Handle, MAX_HANDLES> = efi_state.handles[..efi_state.handle_count]
-        .iter()
-        .filter(|entry| {
-            entry.protocols[..entry.protocol_count]
+    // Collect matching handles based on search type
+    let matching: heapless::Vec<Handle, MAX_HANDLES> = match search_type {
+        efi::ALL_HANDLES => efi_state.handles[..efi_state.handle_count]
+            .iter()
+            .map(|entry| entry.handle)
+            .collect(),
+        efi::BY_REGISTER_NOTIFY => {
+            log::debug!("  -> NOT_FOUND (BY_REGISTER_NOTIFY not fully supported)");
+            return Status::NOT_FOUND;
+        }
+        efi::BY_PROTOCOL => {
+            if protocol.is_null() {
+                return Status::INVALID_PARAMETER;
+            }
+            let guid = unsafe { *protocol };
+            efi_state.handles[..efi_state.handle_count]
                 .iter()
-                .any(|p| p.guid == guid)
-        })
-        .map(|entry| entry.handle)
-        .collect();
+                .filter(|entry| {
+                    entry.protocols[..entry.protocol_count]
+                        .iter()
+                        .any(|p| p.guid == guid)
+                })
+                .map(|entry| entry.handle)
+                .collect()
+        }
+        _ => {
+            log::debug!("  -> INVALID_PARAMETER (unknown search type {})", search_type);
+            return Status::INVALID_PARAMETER;
+        }
+    };
 
     // Check for no matches FIRST, before buffer size checks
     if matching.is_empty() {
-        log::debug!("  -> NOT_FOUND (no handles with this protocol)");
+        log::debug!("  -> NOT_FOUND (no matching handles)");
         return Status::NOT_FOUND;
     }
 
@@ -961,10 +1080,15 @@ fn load_image_from_device_path(
     let path_display = core::str::from_utf8(&path_str[..str_len]).unwrap_or("<invalid>");
     log::info!("BS.LoadImage: Loading from device path: {}", path_display);
 
-    // Find the handle whose device path matches the non-file portion of the
-    // requested device path and that carries SimpleFileSystem.
-    let sfs_handle =
-        find_handle_with_protocol(&SIMPLE_FILE_SYSTEM_GUID, device_path).ok_or_else(|| {
+    // Find the best matching SFS handle by comparing device paths.
+    // Walk the input device path's non-file-path prefix and score each SFS handle
+    // by how many leading device path nodes match.
+    let sfs_handle = find_best_sfs_handle_for_device_path(device_path)
+        .or_else(|| {
+            log::warn!("BS.LoadImage: No device path match, falling back to first SFS handle");
+            find_handle_with_protocol(&SIMPLE_FILE_SYSTEM_GUID)
+        })
+        .ok_or_else(|| {
             log::error!("BS.LoadImage: No SimpleFileSystem handle found");
             Status::NOT_FOUND
         })?;
@@ -1094,58 +1218,10 @@ fn load_image_from_device_path(
     Ok((buffer as *mut c_void, read_size, sfs_handle))
 }
 
-/// Find a handle that has a specific protocol installed.
-///
-/// If `device_path_prefix` is non-null, the function tries to find a handle
-/// whose DEVICE_PATH protocol matches the non-file-path prefix of
-/// `device_path_prefix`.  Falls back to returning the first handle that
-/// carries `protocol_guid`.
-fn find_handle_with_protocol(
-    protocol_guid: &Guid,
-    device_path_prefix: *mut DevicePathProtocol,
-) -> Option<Handle> {
+/// Find a handle that has a specific protocol installed
+fn find_handle_with_protocol(protocol_guid: &Guid) -> Option<Handle> {
     let efi_state = state::efi();
 
-    // Calculate the device-path prefix length (everything before the first
-    // FilePath or End node) so we can match against installed device paths.
-    let prefix_len = device_path_node_prefix_len(device_path_prefix);
-
-    // First pass: try to match by device path prefix (most accurate)
-    if prefix_len > 0 {
-        let prefix_bytes =
-            unsafe { core::slice::from_raw_parts(device_path_prefix as *const u8, prefix_len) };
-
-        for entry in &efi_state.handles[..efi_state.handle_count] {
-            let has_target = entry.protocols[..entry.protocol_count]
-                .iter()
-                .any(|p| p.guid == *protocol_guid);
-            if !has_target {
-                continue;
-            }
-
-            for proto in &entry.protocols[..entry.protocol_count] {
-                if proto.guid == DEVICE_PATH_GUID && !proto.interface.is_null() {
-                    let handle_dp_len =
-                        device_path_total_len(proto.interface as *const DevicePathProtocol);
-                    // The handle's full device path (including End) must start with our prefix
-                    if handle_dp_len >= prefix_len {
-                        let handle_bytes = unsafe {
-                            core::slice::from_raw_parts(proto.interface as *const u8, prefix_len)
-                        };
-                        if handle_bytes == prefix_bytes {
-                            log::debug!(
-                                "  LoadImage: matched device path on handle {:?}",
-                                entry.handle
-                            );
-                            return Some(entry.handle);
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    // Fallback: return the first handle with the requested protocol
     for entry in &efi_state.handles[..efi_state.handle_count] {
         for proto in &entry.protocols[..entry.protocol_count] {
             if proto.guid == *protocol_guid {
@@ -1157,56 +1233,138 @@ fn find_handle_with_protocol(
     None
 }
 
-/// Return the byte length of all nodes before the first FilePath or End node.
-///
-/// This gives us the "device portion" of a full device path that ends with
-/// `FilePath(…)/End`.
-fn device_path_node_prefix_len(dp: *mut DevicePathProtocol) -> usize {
-    if dp.is_null() {
-        return 0;
-    }
-    unsafe {
-        let base = dp as *const u8;
-        let mut p = base;
-        loop {
-            let node_type = *p;
-            let node_len = u16::from_le_bytes([*p.add(2), *p.add(3)]) as usize;
-            if node_len < 4 {
-                break;
-            }
-            // Stop before FilePath or End nodes
-            if node_type == DEVICE_PATH_TYPE_END
-                || (node_type == DEVICE_PATH_TYPE_MEDIA
-                    && *p.add(1) == DEVICE_PATH_SUBTYPE_FILE_PATH)
-            {
-                return p as usize - base as usize;
-            }
-            p = p.add(node_len);
+/// Compare two device path node sequences byte-by-byte, returning the number of
+/// consecutive matching nodes from the start.
+unsafe fn match_device_path_prefix(
+    input_dp: *const DevicePathProtocol,
+    handle_dp: *const DevicePathProtocol,
+) -> usize {
+    let mut matches = 0usize;
+    let mut inp = input_dp;
+    let mut hdl = handle_dp;
+
+    loop {
+        let inp_type = (*inp).r#type;
+        let inp_sub = (*inp).sub_type;
+        let inp_len = u16::from_le_bytes([(*inp).length[0], (*inp).length[1]]) as usize;
+
+        let hdl_type = (*hdl).r#type;
+        let hdl_sub = (*hdl).sub_type;
+        let hdl_len = u16::from_le_bytes([(*hdl).length[0], (*hdl).length[1]]) as usize;
+
+        // Stop at End or FilePath nodes on either side
+        if inp_type == DEVICE_PATH_TYPE_END || hdl_type == DEVICE_PATH_TYPE_END {
+            break;
         }
+        if (inp_type == DEVICE_PATH_TYPE_MEDIA && inp_sub == DEVICE_PATH_SUBTYPE_FILE_PATH)
+            || (hdl_type == DEVICE_PATH_TYPE_MEDIA && hdl_sub == DEVICE_PATH_SUBTYPE_FILE_PATH)
+        {
+            break;
+        }
+
+        // Compare nodes: type, subtype, length, then content
+        if inp_type != hdl_type || inp_sub != hdl_sub || inp_len != hdl_len {
+            break;
+        }
+        if inp_len < 4 || hdl_len < 4 {
+            break;
+        }
+
+        // Byte-compare the full node
+        let inp_bytes = core::slice::from_raw_parts(inp as *const u8, inp_len);
+        let hdl_bytes = core::slice::from_raw_parts(hdl as *const u8, hdl_len);
+        if inp_bytes != hdl_bytes {
+            break;
+        }
+
+        matches += 1;
+        inp = (inp as *const u8).add(inp_len) as *const DevicePathProtocol;
+        hdl = (hdl as *const u8).add(hdl_len) as *const DevicePathProtocol;
     }
-    0
+
+    matches
 }
 
-/// Return the total byte length of a device path, **including** the End node.
-fn device_path_total_len(dp: *const DevicePathProtocol) -> usize {
-    if dp.is_null() {
-        return 0;
+/// Count the number of device path nodes before the End or FilePath node
+unsafe fn count_device_path_prefix_nodes(dp: *const DevicePathProtocol) -> usize {
+    let mut count = 0usize;
+    let mut current = dp;
+    loop {
+        let node_type = (*current).r#type;
+        let node_subtype = (*current).sub_type;
+        let node_length =
+            u16::from_le_bytes([(*current).length[0], (*current).length[1]]) as usize;
+
+        // Stop at End node
+        if node_type == DEVICE_PATH_TYPE_END {
+            break;
+        }
+        // Stop at File Path node (that's the file-specific part, not device identity)
+        if node_type == DEVICE_PATH_TYPE_MEDIA && node_subtype == DEVICE_PATH_SUBTYPE_FILE_PATH {
+            break;
+        }
+        if node_length < 4 {
+            break;
+        }
+        count += 1;
+        current = (current as *const u8).add(node_length) as *const DevicePathProtocol;
     }
-    unsafe {
-        let base = dp as *const u8;
-        let mut p = base;
-        loop {
-            let node_type = *p;
-            let node_len = u16::from_le_bytes([*p.add(2), *p.add(3)]) as usize;
-            if node_len < 4 {
-                return p as usize - base as usize;
+    count
+}
+
+/// Find the SFS handle whose device path best matches the input device path.
+/// Returns the handle with the most matching prefix nodes, or None.
+fn find_best_sfs_handle_for_device_path(device_path: *mut DevicePathProtocol) -> Option<Handle> {
+    if device_path.is_null() {
+        return None;
+    }
+
+    let input_prefix_count = unsafe { count_device_path_prefix_nodes(device_path) };
+    if input_prefix_count == 0 {
+        return None;
+    }
+
+    let efi_state = state::efi();
+    let dp_guid = r_efi::protocols::device_path::PROTOCOL_GUID;
+
+    let mut best_handle: Option<Handle> = None;
+    let mut best_score: usize = 0;
+
+    for entry in &efi_state.handles[..efi_state.handle_count] {
+        // Must have SimpleFileSystem
+        let has_sfs = entry.protocols[..entry.protocol_count]
+            .iter()
+            .any(|p| p.guid == SIMPLE_FILE_SYSTEM_GUID);
+        if !has_sfs {
+            continue;
+        }
+
+        // Get handle's device path
+        let handle_dp = entry.protocols[..entry.protocol_count]
+            .iter()
+            .find(|p| p.guid == dp_guid)
+            .map(|p| p.interface as *const DevicePathProtocol);
+
+        if let Some(hdp) = handle_dp
+            && !hdp.is_null()
+        {
+            let score = unsafe { match_device_path_prefix(device_path, hdp) };
+            if score > best_score {
+                best_score = score;
+                best_handle = Some(entry.handle);
             }
-            if node_type == DEVICE_PATH_TYPE_END {
-                return (p as usize - base as usize) + node_len;
-            }
-            p = p.add(node_len);
         }
     }
+
+    if best_score > 0 {
+        log::info!(
+            "BS.LoadImage: Best SFS handle {:?} matched {} device path nodes",
+            best_handle,
+            best_score
+        );
+    }
+
+    best_handle
 }
 
 extern "efiapi" fn load_image(
@@ -1475,6 +1633,25 @@ extern "efiapi" fn start_image(
         image_base
     );
 
+    // Signal EFI_EVENT_GROUP_READY_TO_BOOT before the first image is started.
+    // Per UEFI spec, this should only be signaled once (before the first boot
+    // option is attempted), not on every StartImage call.
+    let should_signal = crate::state::with_efi_mut(|efi| {
+        if !efi.ready_to_boot_signaled {
+            efi.ready_to_boot_signaled = true;
+            true
+        } else {
+            false
+        }
+    });
+    if should_signal {
+        signal_event_group(&EFI_EVENT_GROUP_READY_TO_BOOT);
+    }
+
+    // Update table CRC32s one final time before handing off to the image
+    // (config tables may have changed since efi::init())
+    super::system_table::update_crc32();
+
     // Get the system table
     let system_table = super::get_system_table();
 
@@ -1584,6 +1761,32 @@ extern "efiapi" fn exit_boot_services(image_handle: Handle, map_key: usize) -> S
     if status == Status::SUCCESS {
         log::info!("ExitBootServices SUCCESS - transitioning to OS");
 
+        // Signal EXIT_BOOT_SERVICES event group and legacy EVT_SIGNAL_EXIT_BOOT_SERVICES events
+        signal_event_group(&EFI_EVENT_GROUP_EXIT_BOOT_SERVICES);
+
+        // Also signal any legacy EVT_SIGNAL_EXIT_BOOT_SERVICES events
+        {
+            let mut legacy_events: heapless::Vec<usize, MAX_EVENTS> = heapless::Vec::new();
+            state::with_efi_mut(|efi_state| {
+                for i in 0..MAX_EVENTS {
+                    if efi_state.events[i].event_type == EVT_SIGNAL_EXIT_BOOT_SERVICES {
+                        efi_state.events[i].signaled = true;
+                        let _ = legacy_events.push(i);
+                    }
+                }
+            });
+            for event_id in &legacy_events {
+                let notify_fn = {
+                    let efi_state = state::efi();
+                    let entry = &efi_state.events[*event_id];
+                    entry.notify_function.map(|f| (f, entry.notify_context))
+                };
+                if let Some((func, context)) = notify_fn {
+                    func(*event_id as efi::Event, context);
+                }
+            }
+        }
+
         // Mark that ExitBootServices has been called
         // After this, SPI flash is locked and variable writes go to ESP file
         crate::state::set_exit_boot_services_called();
@@ -1625,8 +1828,16 @@ extern "efiapi" fn exit_boot_services(image_handle: Handle, map_key: usize) -> S
 // Miscellaneous Functions
 // ============================================================================
 
-extern "efiapi" fn get_next_monotonic_count(_count: *mut u64) -> Status {
-    Status::DEVICE_ERROR
+extern "efiapi" fn get_next_monotonic_count(count: *mut u64) -> Status {
+    if count.is_null() {
+        return Status::INVALID_PARAMETER;
+    }
+
+    state::with_efi_mut(|efi_state| {
+        efi_state.monotonic_count += 1;
+        unsafe { *count = efi_state.monotonic_count };
+        Status::SUCCESS
+    })
 }
 
 extern "efiapi" fn stall(microseconds: usize) -> Status {
@@ -1637,29 +1848,49 @@ extern "efiapi" fn stall(microseconds: usize) -> Status {
 }
 
 extern "efiapi" fn set_watchdog_timer(
-    _timeout: usize,
-    _watchdog_code: u64,
+    timeout: usize,
+    watchdog_code: u64,
     _data_size: usize,
     _watchdog_data: *mut u16,
 ) -> Status {
-    Status::UNSUPPORTED
+    log::debug!(
+        "BS.SetWatchdogTimer(timeout={}, code={:#x})",
+        timeout,
+        watchdog_code
+    );
+    // Accept the call but don't implement actual watchdog.
+    // The UEFI spec default is a 5-minute watchdog that bootloaders disable
+    // by calling SetWatchdogTimer(0, 0, 0, NULL). Returning SUCCESS lets
+    // Windows Boot Manager proceed without error.
+    Status::SUCCESS
 }
 
 extern "efiapi" fn connect_controller(
-    _controller_handle: Handle,
+    controller_handle: Handle,
     _driver_image_handle: *mut Handle,
     _remaining_device_path: *mut DevicePathProtocol,
     _recursive: Boolean,
 ) -> Status {
-    Status::UNSUPPORTED
+    log::debug!("BS.ConnectController(handle={:?})", controller_handle);
+    // CrabEFI doesn't use the UEFI driver model -- all drivers are built-in.
+    // Return SUCCESS so callers (like Windows Boot Manager) don't fail.
+    if controller_handle.is_null() {
+        return Status::INVALID_PARAMETER;
+    }
+    Status::SUCCESS
 }
 
 extern "efiapi" fn disconnect_controller(
-    _controller_handle: Handle,
+    controller_handle: Handle,
     _driver_image_handle: Handle,
     _child_handle: Handle,
 ) -> Status {
-    Status::UNSUPPORTED
+    log::debug!("BS.DisconnectController(handle={:?})", controller_handle);
+    // No-op for the same reason as ConnectController.
+    if controller_handle.is_null() {
+        return Status::INVALID_PARAMETER;
+    }
+    Status::SUCCESS
 }
 
 extern "efiapi" fn open_protocol(
@@ -1777,12 +2008,25 @@ extern "efiapi" fn close_protocol(
 }
 
 extern "efiapi" fn open_protocol_information(
-    _handle: Handle,
-    _protocol: *mut Guid,
-    _entry_buffer: *mut *mut efi::OpenProtocolInformationEntry,
-    _entry_count: *mut usize,
+    handle: Handle,
+    protocol: *mut Guid,
+    entry_buffer: *mut *mut efi::OpenProtocolInformationEntry,
+    entry_count: *mut usize,
 ) -> Status {
-    Status::UNSUPPORTED
+    log::debug!("BS.OpenProtocolInformation(handle={:?})", handle);
+
+    if handle.is_null() || protocol.is_null() || entry_buffer.is_null() || entry_count.is_null() {
+        return Status::INVALID_PARAMETER;
+    }
+
+    // We don't track protocol open/close agents in our simple implementation.
+    // Return an empty list -- this is valid per UEFI spec (zero agents have opened it).
+    unsafe {
+        *entry_buffer = core::ptr::null_mut();
+        *entry_count = 0;
+    }
+
+    Status::SUCCESS
 }
 
 extern "efiapi" fn protocols_per_handle(
@@ -1813,42 +2057,41 @@ extern "efiapi" fn protocols_per_handle(
     let count = entry.protocol_count;
 
     if count == 0 {
+        // No protocols on this handle -- return empty buffer
         unsafe {
             *protocol_buffer = core::ptr::null_mut();
             *protocol_buffer_count = 0;
         }
+        log::debug!("  -> SUCCESS (0 protocols)");
         return Status::SUCCESS;
     }
 
-    // Allocate a buffer to hold the GUID pointers
-    let buf_size = count * core::mem::size_of::<*mut Guid>();
-    let alloc_result = allocator::allocate_pool(MemoryType::BootServicesData, buf_size);
-    let guid_ptr_buf = match alloc_result {
-        Ok(ptr) => ptr as *mut *mut Guid,
+    // Allocate a single contiguous buffer: array of Guid pointers followed by
+    // the Guid values themselves. Per UEFI spec, the caller frees only the
+    // returned buffer with a single FreePool call, so all data must live in
+    // one allocation.
+    let ptrs_size = count * core::mem::size_of::<*mut Guid>();
+    let guids_size = count * core::mem::size_of::<Guid>();
+    let total_size = ptrs_size + guids_size;
+    let buf = match allocator::allocate_pool(MemoryType::BootServicesData, total_size) {
+        Ok(ptr) => ptr,
         Err(_) => return Status::OUT_OF_RESOURCES,
     };
 
-    // Allocate storage for the GUIDs themselves (contiguous array)
-    let guids_size = count * core::mem::size_of::<Guid>();
-    let guids_alloc = allocator::allocate_pool(MemoryType::BootServicesData, guids_size);
-    let guids_buf = match guids_alloc {
-        Ok(ptr) => ptr as *mut Guid,
-        Err(_) => {
-            let _ = allocator::free_pool(guid_ptr_buf as *mut u8);
-            return Status::OUT_OF_RESOURCES;
-        }
-    };
+    // Layout: [*mut Guid; count] [Guid; count]
+    let ptr_array = buf as *mut *mut Guid;
+    let guid_array = unsafe { buf.add(ptrs_size) } as *mut Guid;
 
-    // Fill in the GUIDs and pointer array
     for i in 0..count {
         unsafe {
-            *guids_buf.add(i) = entry.protocols[i].guid;
-            *guid_ptr_buf.add(i) = guids_buf.add(i);
+            let guid_ptr = guid_array.add(i);
+            *guid_ptr = entry.protocols[i].guid;
+            *ptr_array.add(i) = guid_ptr;
         }
     }
 
     unsafe {
-        *protocol_buffer = guid_ptr_buf;
+        *protocol_buffer = ptr_array;
         *protocol_buffer_count = count;
     }
 
@@ -2111,32 +2354,51 @@ extern "efiapi" fn uninstall_multiple_protocol_interfaces(
     Status::SUCCESS
 }
 
-extern "efiapi" fn calculate_crc32(data: *mut c_void, data_size: usize, crc32: *mut u32) -> Status {
+extern "efiapi" fn calculate_crc32(
+    data: *mut c_void,
+    data_size: usize,
+    crc32: *mut u32,
+) -> Status {
     if data.is_null() || crc32.is_null() || data_size == 0 {
         return Status::INVALID_PARAMETER;
     }
 
-    let bytes = unsafe { core::slice::from_raw_parts(data as *const u8, data_size) };
+    let slice = unsafe { core::slice::from_raw_parts(data as *const u8, data_size) };
+    let result = compute_crc32(slice);
+    unsafe { *crc32 = result };
+    Status::SUCCESS
+}
 
-    // CRC-32 (ISO 3309 / ITU-T V.42 / UEFI spec) with polynomial 0xEDB88320
-    let mut crc: u32 = 0xFFFF_FFFF;
-    for &byte in bytes {
-        crc ^= byte as u32;
-        for _ in 0..8 {
+/// CRC32 lookup table (IEEE 802.3 polynomial, generated at compile time)
+const CRC32_TABLE: [u32; 256] = {
+    const POLY: u32 = 0xEDB8_8320; // IEEE 802.3 polynomial (reversed)
+    let mut table = [0u32; 256];
+    let mut i = 0;
+    while i < 256 {
+        let mut crc = i as u32;
+        let mut j = 0;
+        while j < 8 {
             if crc & 1 != 0 {
-                crc = (crc >> 1) ^ 0xEDB8_8320;
+                crc = (crc >> 1) ^ POLY;
             } else {
                 crc >>= 1;
             }
+            j += 1;
         }
+        table[i] = crc;
+        i += 1;
     }
-    crc ^= 0xFFFF_FFFF;
+    table
+};
 
-    unsafe {
-        *crc32 = crc;
+/// Compute CRC32 of a byte slice (IEEE 802.3 polynomial)
+pub fn compute_crc32(data: &[u8]) -> u32 {
+    let mut crc = 0xFFFF_FFFF_u32;
+    for &byte in data {
+        let index = ((crc ^ byte as u32) & 0xFF) as usize;
+        crc = CRC32_TABLE[index] ^ (crc >> 8);
     }
-
-    Status::SUCCESS
+    !crc
 }
 
 extern "efiapi" fn copy_mem(destination: *mut c_void, source: *mut c_void, length: usize) {

@@ -64,6 +64,9 @@ pub fn install_block_io_protocols<D: BlockDevice>(
             );
         }
 
+        // Install DiskIO protocol on raw disk handle
+        efi::protocols::disk_io::install_disk_io_on_handle(disk_handle);
+
         // Install DevicePath protocol for the raw disk
         let disk_device_path = device_path::create_disk_device_path(path_info);
         if !disk_device_path.is_null() {
@@ -131,6 +134,9 @@ pub fn install_block_io_protocols<D: BlockDevice>(
                     part_handle
                 );
             }
+
+            // Install DiskIO protocol on partition handle
+            efi::protocols::disk_io::install_disk_io_on_handle(part_handle);
 
             // Install DevicePath for partition
             let part_device_path = device_path::create_partition_device_path(
@@ -368,6 +374,9 @@ pub fn try_boot_from_esp<D: BlockDevice>(
                     }
                 }
             }
+
+            // Install DiskIO protocol (byte-granular I/O wrapper over BlockIO)
+            efi::protocols::disk_io::install_disk_io_on_handle(device_handle);
 
             // Install SimpleFileSystem protocol on the device handle
             let status = boot_services::install_protocol(
@@ -608,6 +617,12 @@ fn load_and_execute_bootloader(
 }
 
 /// Create DevicePathInfo from a BootEntry's device type and PCI info
+///
+/// For El Torito (ISO) boot entries on AHCI, this detects the case where
+/// `partition_num == 0` (no GPT partition) and creates an `AhciCdrom` device
+/// path instead of the normal `Ahci` hard drive path. This is critical for
+/// Windows Boot Manager, which expects a CDROM media device path node
+/// (type=0x04, subtype=0x02) rather than a HardDrive node.
 pub fn device_path_info_from_entry(entry: &menu::BootEntry) -> DevicePathInfo {
     match entry.device_type {
         menu::DeviceType::Nvme {
@@ -621,11 +636,31 @@ pub fn device_path_info_from_entry(entry: &menu::BootEntry) -> DevicePathInfo {
         menu::DeviceType::Ahci {
             controller_id: _,
             port,
-        } => DevicePathInfo::Ahci {
-            pci_device: entry.pci_device,
-            pci_function: entry.pci_function,
-            port: port as u16,
-        },
+        } => {
+            // Detect El Torito boot: partition_num == 0 means this came from
+            // ISO9660 El Torito discovery (not GPT). Use CDROM device path.
+            if entry.partition_num == 0 {
+                let partition_size = entry
+                    .partition
+                    .last_lba
+                    .saturating_sub(entry.partition.first_lba)
+                    + 1;
+                DevicePathInfo::AhciCdrom {
+                    pci_device: entry.pci_device,
+                    pci_function: entry.pci_function,
+                    port: port as u16,
+                    boot_entry: 0, // Default boot catalog entry
+                    partition_start: entry.partition.first_lba,
+                    partition_size,
+                }
+            } else {
+                DevicePathInfo::Ahci {
+                    pci_device: entry.pci_device,
+                    pci_function: entry.pci_function,
+                    port: port as u16,
+                }
+            }
+        }
         menu::DeviceType::Usb {
             controller_id: _,
             device_addr: _,
