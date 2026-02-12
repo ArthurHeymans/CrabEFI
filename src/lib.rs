@@ -243,10 +243,6 @@ pub fn init(coreboot_table_ptr: u64) {
         .sum();
     log::info!("  Total RAM: {} MB", total_ram / (1024 * 1024));
 
-    // Initialize paging
-    #[cfg(target_arch = "x86_64")]
-    arch::x86_64::paging::init(&cb_info.memory_map);
-
     // Initialize IDT for exception handling
     #[cfg(target_arch = "x86_64")]
     arch::x86_64::idt::init();
@@ -273,9 +269,10 @@ pub fn init(coreboot_table_ptr: u64) {
         );
     }
 
-    // Initialize heap allocator (needed for crypto operations)
+    // Initialize heap allocator (needed for crypto operations and alloc-dependent features)
     if !heap::init() {
-        log::error!("Failed to initialize heap allocator!");
+        log::error!("Failed to initialize heap allocator! Secure Boot and other alloc-dependent features will be unavailable.");
+        // Continue boot -- features requiring alloc will fail gracefully
     }
 
     log::info!("CrabEFI initialized successfully!");
@@ -675,7 +672,9 @@ fn boot_uefi_entry(entry: &menu::BootEntry) {
                 return;
             }
 
-            if let Some(controller) = drivers::sdhci::get_controller(controller_id) {
+            if let Some(controller_ptr) = drivers::sdhci::get_controller(controller_id) {
+                // Safety: pointer valid for firmware lifetime
+                let controller = unsafe { &mut *controller_ptr };
                 let num_blocks = controller.num_blocks();
                 let block_size = controller.block_size();
 
@@ -697,7 +696,9 @@ fn boot_uefi_entry(entry: &menu::BootEntry) {
                 );
             }
 
-            if let Some(controller) = drivers::sdhci::get_controller(controller_id) {
+            if let Some(controller_ptr) = drivers::sdhci::get_controller(controller_id) {
+                // Safety: pointer valid for firmware lifetime
+                let controller = unsafe { &mut *controller_ptr };
                 let num_blocks = controller.num_blocks();
                 let block_size = controller.block_size();
                 let mut disk = SdhciDisk::new(controller);
@@ -948,7 +949,9 @@ fn boot_linux_entry(
                 return;
             }
 
-            if let Some(controller) = drivers::sdhci::get_controller(controller_id) {
+            if let Some(controller_ptr) = drivers::sdhci::get_controller(controller_id) {
+                // Safety: pointer valid for firmware lifetime
+                let controller = unsafe { &mut *controller_ptr };
                 log::info!("Got SDHCI controller {}", controller_id);
                 let mut disk = SdhciDisk::new(controller);
                 boot_linux_from_device(

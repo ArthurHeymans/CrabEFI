@@ -207,12 +207,16 @@ fn search_sdhci_for_dbx(paths: &[&str]) -> Option<(Vec<u8>, &'static str)> {
     use crate::drivers::sdhci;
 
     for controller_id in 0..sdhci::controller_count() {
-        if let Some(controller) = sdhci::get_controller(controller_id) {
+        if let Some(controller_ptr) = sdhci::get_controller(controller_id) {
+            // Safety: pointer valid for firmware lifetime
+            let controller = unsafe { &mut *controller_ptr };
             if !controller.is_ready() {
                 continue;
             }
 
-            if let Some(controller) = sdhci::get_controller(controller_id) {
+            if let Some(controller_ptr) = sdhci::get_controller(controller_id) {
+                // Safety: pointer valid for firmware lifetime
+                let controller = unsafe { &mut *controller_ptr };
                 let mut disk = SdhciDisk::new(controller);
 
                 if let Some(result) = search_disk_for_dbx(&mut disk, "SD", paths) {

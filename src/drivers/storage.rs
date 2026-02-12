@@ -82,14 +82,12 @@ pub fn register_device(device_type: StorageType, num_blocks: u64, block_size: u3
 /// Get a storage device by ID
 pub fn get_device(device_id: u32) -> Option<StorageDevice> {
     let registry = STORAGE_REGISTRY.lock();
-    for slot in registry.devices.iter() {
-        if let Some(dev) = slot
-            && dev.device_id == device_id
-        {
-            return Some(*dev);
-        }
-    }
-    None
+    registry
+        .devices
+        .iter()
+        .flatten()
+        .find(|dev| dev.device_id == device_id)
+        .copied()
 }
 
 /// Read sectors from a storage device
@@ -100,7 +98,9 @@ pub fn read_sectors(device_id: u32, lba: u64, buffer: &mut [u8]) -> Result<(), (
 
     match device.device_type {
         StorageType::Usb { slot_id: _ } => {
-            // Use the global USB read function
+            // TODO: USB mass storage currently only supports a single global device.
+            // A per-device registry (similar to NVMe/AHCI) is needed to support
+            // multiple USB storage devices simultaneously.
             crate::drivers::usb::mass_storage::global_read_sectors(lba, buffer)
         }
         StorageType::Nvme {
@@ -110,24 +110,47 @@ pub fn read_sectors(device_id: u32, lba: u64, buffer: &mut [u8]) -> Result<(), (
             if let Some(controller_ptr) = crate::drivers::nvme::get_controller(controller_id) {
                 // Safety: pointer valid for firmware lifetime; no overlapping &mut created
                 let controller = unsafe { &mut *controller_ptr };
-                controller.read_sector(nsid, lba, buffer).map_err(|e| {
-                    log::error!("NVMe read failed at LBA {}: {:?}", lba, e);
-                })
+                let num_sectors = (buffer.len() as u32 + device.block_size - 1) / device.block_size;
+                controller
+                    .read_sectors(nsid, lba, num_sectors, buffer.as_mut_ptr())
+                    .map_err(|e| {
+                        log::error!("NVMe read failed at LBA {}: {:?}", lba, e);
+                    })
             } else {
                 log::error!("NVMe controller {} not found", controller_id);
                 Err(())
             }
         }
         StorageType::Ahci {
-            controller_id: _,
-            port: _,
+            controller_id,
+            port,
         } => {
-            // Use global_read_sectors which handles sector size translation for SATAPI
-            crate::drivers::ahci::global_read_sectors(lba, buffer)
+            if let Some(controller_ptr) = crate::drivers::ahci::get_controller(controller_id) {
+                let controller = unsafe { &mut *controller_ptr };
+                let num_sectors = (buffer.len() as u32 + device.block_size - 1) / device.block_size;
+                unsafe {
+                    controller
+                        .read_sectors(port, lba, num_sectors, buffer.as_mut_ptr())
+                        .map_err(|e| {
+                            log::error!("AHCI read failed at LBA {}: {:?}", lba, e);
+                        })
+                }
+            } else {
+                log::error!("AHCI controller {} not found", controller_id);
+                Err(())
+            }
         }
-        StorageType::Sdhci { controller_id: _ } => {
-            // Use global_read_sectors for SDHCI
-            crate::drivers::sdhci::global_read_sectors(lba, buffer)
+        StorageType::Sdhci { controller_id } => {
+            if let Some(controller_ptr) = crate::drivers::sdhci::get_controller(controller_id) {
+                // Safety: pointer valid for firmware lifetime; no overlapping &mut created
+                let controller = unsafe { &mut *controller_ptr };
+                controller.read_sector(lba, buffer).map_err(|e| {
+                    log::error!("SDHCI read failed at LBA {}: {:?}", lba, e);
+                })
+            } else {
+                log::error!("SDHCI controller {} not found", controller_id);
+                Err(())
+            }
         }
     }
 }

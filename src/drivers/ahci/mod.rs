@@ -552,14 +552,16 @@ impl AhciController {
         // Clear ST (Start) bit
         port_regs.cmd.modify(PORT_CMD::ST::CLEAR);
 
-        // Wait for CR (Command List Running) to clear
-        wait_for(1, || !port_regs.cmd.is_set(PORT_CMD::CR));
+        // Wait for CR (Command List Running) to clear (AHCI spec: up to 500ms)
+        if !wait_for(500, || !port_regs.cmd.is_set(PORT_CMD::CR)) {
+            log::warn!("AHCI Port {}: Timeout waiting for CR to clear", port_num);
+        }
 
         // Clear FRE (FIS Receive Enable) bit
         port_regs.cmd.modify(PORT_CMD::FRE::CLEAR);
 
         // Wait for FR (FIS Receive Running) to clear
-        if !wait_for(1, || !port_regs.cmd.is_set(PORT_CMD::FR)) {
+        if !wait_for(500, || !port_regs.cmd.is_set(PORT_CMD::FR)) {
             log::warn!("AHCI Port {}: Timeout stopping command engine", port_num);
         }
         Ok(())

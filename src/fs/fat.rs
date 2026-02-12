@@ -169,19 +169,11 @@ impl DirectoryEntry {
     /// Check if this entry matches a short name (case-insensitive)
     pub fn matches_name(&self, name: &str) -> bool {
         let entry_name = self.short_name();
-
-        // Case-insensitive comparison
-        if entry_name.len() != name.len() {
-            return false;
-        }
-
-        for (a, b) in entry_name.bytes().zip(name.bytes()) {
-            if !a.eq_ignore_ascii_case(&b) {
-                return false;
-            }
-        }
-
-        true
+        entry_name.len() == name.len()
+            && entry_name
+                .bytes()
+                .zip(name.bytes())
+                .all(|(a, b)| a.eq_ignore_ascii_case(&b))
     }
 
     /// Get the file size in bytes
@@ -526,8 +518,8 @@ impl<'a> FatFilesystem<'a> {
         let root_dir_start = fat_start + (num_fats * sectors_per_fat);
         let data_start = root_dir_start + root_dir_sectors;
 
-        // Calculate total data clusters
-        let data_sectors = total_sectors - data_start;
+        // Calculate total data clusters (with underflow protection for malformed BPBs)
+        let data_sectors = total_sectors.checked_sub(data_start).ok_or(FatError::InvalidBpb)?;
         let data_clusters = data_sectors / sectors_per_cluster as u32;
 
         // Determine FAT type

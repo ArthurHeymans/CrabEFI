@@ -99,19 +99,6 @@ impl From<BzImageError> for LinuxBootError {
     }
 }
 
-/// Linux boot configuration
-#[derive(Debug, Clone)]
-pub struct LinuxBootConfig<'a> {
-    /// Path to the kernel (bzImage)
-    pub kernel_path: &'a str,
-    /// Path to the initrd (optional)
-    pub initrd_path: Option<&'a str>,
-    /// Kernel command line
-    pub cmdline: &'a str,
-    /// Use EFI handover protocol if available
-    pub use_efi_handover: bool,
-}
-
 /// Loaded Linux kernel ready for boot
 pub struct LoadedLinux {
     /// Boot parameters (zero page)
@@ -330,6 +317,37 @@ pub fn load_linux_from_disk(
         pm_kernel_size
     );
 
+    // Prepare boot parameters first so we can validate addresses BEFORE writing
+    let mut boot_params = bzimage::prepare_boot_params(
+        &bzimage,
+        memory_regions,
+        acpi_rsdp,
+        framebuffer,
+        DEFAULT_KERNEL_ADDR as u32,
+        CMDLINE_ADDR,
+    );
+
+    // Validate that all hardcoded addresses are in usable RAM BEFORE writing to them
+    let cmdline_size = cmdline.len() as u64 + 1; // +1 for null terminator
+    if !is_valid_ram_region(&boot_params, CMDLINE_ADDR as u64, cmdline_size) {
+        log::error!(
+            "Command line address {:#x} (size {}) is not in usable RAM",
+            CMDLINE_ADDR,
+            cmdline_size
+        );
+        return Err(LinuxBootError::MemoryError);
+    }
+
+    // Validate kernel load address before loading
+    if !is_valid_ram_region(&boot_params, DEFAULT_KERNEL_ADDR, pm_kernel_size as u64) {
+        log::error!(
+            "Kernel address {:#x} (size {}) is not in usable RAM",
+            DEFAULT_KERNEL_ADDR,
+            pm_kernel_size
+        );
+        return Err(LinuxBootError::MemoryError);
+    }
+
     // Create a slice pointing directly to the kernel load address
     // This allows DMA to go directly to the target memory
     let kernel_dest =
@@ -361,38 +379,6 @@ pub fn load_linux_from_disk(
         DEFAULT_KERNEL_ADDR,
         bytes_read
     );
-
-    // Prepare boot parameters
-    let mut boot_params = bzimage::prepare_boot_params(
-        &bzimage,
-        memory_regions,
-        acpi_rsdp,
-        framebuffer,
-        DEFAULT_KERNEL_ADDR as u32,
-        CMDLINE_ADDR,
-    );
-
-    // Validate that all hardcoded addresses are in usable RAM
-    // This ensures we don't write to reserved memory regions
-    let cmdline_size = cmdline.len() as u64 + 1; // +1 for null terminator
-    if !is_valid_ram_region(&boot_params, CMDLINE_ADDR as u64, cmdline_size) {
-        log::error!(
-            "Command line address {:#x} (size {}) is not in usable RAM",
-            CMDLINE_ADDR,
-            cmdline_size
-        );
-        return Err(LinuxBootError::MemoryError);
-    }
-
-    // Validate kernel load address
-    if !is_valid_ram_region(&boot_params, DEFAULT_KERNEL_ADDR, pm_kernel_size as u64) {
-        log::error!(
-            "Kernel address {:#x} (size {}) is not in usable RAM",
-            DEFAULT_KERNEL_ADDR,
-            pm_kernel_size
-        );
-        return Err(LinuxBootError::MemoryError);
-    }
 
     // Set up command line
     unsafe {
@@ -571,9 +557,13 @@ fn find_initrd_address(boot_params: &BootParams, size: u64) -> Result<u64, Linux
         }
     }
 
-    // Fallback: use 0x10000000 (256 MB) if no suitable region found
-    // This should work on most systems with >= 512 MB RAM
-    let addr = best_addr.unwrap_or(0x1000_0000);
+    let addr = best_addr.ok_or_else(|| {
+        log::error!(
+            "No suitable RAM region found for initrd ({} bytes)",
+            size
+        );
+        LinuxBootError::MemoryError
+    })?;
 
     log::debug!("Selected initrd address: {:#x}", addr);
 

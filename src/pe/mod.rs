@@ -395,9 +395,13 @@ pub fn load_image(data: &[u8]) -> Result<LoadedImage, Status> {
         return Err(Status::INVALID_PARAMETER);
     }
 
-    // Check PE signature
-    // Safety: We verified pe_offset + 4 <= data.len()
-    let pe_sig = unsafe { *(data.as_ptr().add(pe_offset) as *const u32) };
+    // Check PE signature using safe byte-level read (avoids unaligned pointer UB)
+    let pe_sig = u32::from_le_bytes([
+        data[pe_offset],
+        data[pe_offset + 1],
+        data[pe_offset + 2],
+        data[pe_offset + 3],
+    ]);
     if pe_sig != PE_SIGNATURE {
         log::error!("PE: Invalid PE signature: {:#x}", pe_sig);
         return Err(Status::INVALID_PARAMETER);
@@ -533,9 +537,10 @@ pub fn load_image(data: &[u8]) -> Result<LoadedImage, Status> {
 
     log::debug!("PE: Allocated {} pages at {:#x}", num_pages, load_addr);
 
-    // Zero the memory
-    // Safety: load_addr is valid and we allocated image_size bytes
-    unsafe { core::slice::from_raw_parts_mut(load_addr as *mut u8, image_size as usize).fill(0) };
+    // Zero the full allocation (including any tail bytes from page rounding)
+    let alloc_size = num_pages as usize * 4096;
+    // Safety: load_addr is valid and we allocated num_pages * PAGE_SIZE bytes
+    unsafe { core::slice::from_raw_parts_mut(load_addr as *mut u8, alloc_size).fill(0) };
 
     // Copy headers (already validated size_of_headers fits in both source and dest)
     // Safety: We validated size_of_headers <= data.len() and <= image_size

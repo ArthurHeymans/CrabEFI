@@ -111,6 +111,28 @@ pub trait BlockDevice {
     /// Ok(()) on success, Err(BlockError) on failure
     fn read_blocks(&mut self, lba: u64, count: u32, buffer: &mut [u8]) -> Result<(), BlockError>;
 
+    /// Validate parameters for a read operation
+    ///
+    /// Checks that the LBA range is within bounds and the buffer is large enough.
+    /// Implementations should call this at the start of `read_blocks`.
+    fn validate_read(&self, lba: u64, count: u32, buffer: &[u8]) -> Result<(), BlockError> {
+        let info = self.info();
+        if count == 0 {
+            return Ok(());
+        }
+        let end_lba = lba
+            .checked_add(count as u64)
+            .ok_or(BlockError::OutOfRange)?;
+        if end_lba > info.num_blocks {
+            return Err(BlockError::OutOfRange);
+        }
+        let required = count as usize * info.block_size as usize;
+        if buffer.len() < required {
+            return Err(BlockError::InvalidParameter);
+        }
+        Ok(())
+    }
+
     /// Read a single block (convenience method)
     fn read_block(&mut self, lba: u64, buffer: &mut [u8]) -> Result<(), BlockError> {
         self.read_blocks(lba, 1, buffer)
@@ -177,6 +199,7 @@ impl BlockDevice for NvmeBlockDevice {
     }
 
     fn read_blocks(&mut self, lba: u64, count: u32, buffer: &mut [u8]) -> Result<(), BlockError> {
+        self.validate_read(lba, count, buffer)?;
         // Safety: pointer valid for firmware lifetime; no overlapping &mut created
         let controller = unsafe {
             &mut *nvme::get_controller(self.controller_id).ok_or(BlockError::DeviceError)?
@@ -248,6 +271,7 @@ impl BlockDevice for AhciBlockDevice {
     }
 
     fn read_blocks(&mut self, lba: u64, count: u32, buffer: &mut [u8]) -> Result<(), BlockError> {
+        self.validate_read(lba, count, buffer)?;
         // Safety: pointer valid for firmware lifetime; no overlapping &mut created
         let controller = unsafe {
             &mut *ahci::get_controller(self.controller_id).ok_or(BlockError::DeviceError)?
@@ -319,6 +343,7 @@ impl BlockDevice for UsbBlockDevice {
     }
 
     fn read_blocks(&mut self, lba: u64, count: u32, buffer: &mut [u8]) -> Result<(), BlockError> {
+        self.validate_read(lba, count, buffer)?;
         // Read all sectors in a single call — global_read_sectors supports
         // multi-sector reads by inferring sector count from buffer size.
         let total_bytes = count as usize * self.info.block_size as usize;
@@ -372,8 +397,11 @@ impl BlockDevice for SdhciBlockDevice {
     }
 
     fn read_blocks(&mut self, lba: u64, count: u32, buffer: &mut [u8]) -> Result<(), BlockError> {
-        let controller =
-            sdhci::get_controller(self.controller_id).ok_or(BlockError::DeviceError)?;
+        self.validate_read(lba, count, buffer)?;
+        // Safety: pointer valid for firmware lifetime; no overlapping &mut created
+        let controller = unsafe {
+            &mut *sdhci::get_controller(self.controller_id).ok_or(BlockError::DeviceError)?
+        };
 
         controller
             .read_sectors(lba, count, buffer.as_mut_ptr())
@@ -423,6 +451,7 @@ impl<'a> BlockDevice for NvmeDisk<'a> {
     }
 
     fn read_blocks(&mut self, lba: u64, count: u32, buffer: &mut [u8]) -> Result<(), BlockError> {
+        self.validate_read(lba, count, buffer)?;
         self.controller
             .read_sectors(self.nsid, lba, count, buffer.as_mut_ptr())
             .map_err(BlockError::from)
@@ -467,6 +496,7 @@ impl<'a> BlockDevice for AhciDisk<'a> {
     }
 
     fn read_blocks(&mut self, lba: u64, count: u32, buffer: &mut [u8]) -> Result<(), BlockError> {
+        self.validate_read(lba, count, buffer)?;
         // Safety: buffer.as_mut_ptr() is valid for buffer.len() bytes
         unsafe {
             self.controller
@@ -507,6 +537,7 @@ impl<'a> BlockDevice for UsbDisk<'a> {
     }
 
     fn read_blocks(&mut self, lba: u64, count: u32, buffer: &mut [u8]) -> Result<(), BlockError> {
+        self.validate_read(lba, count, buffer)?;
         self.device
             .read_sectors_generic(self.controller, lba, count, buffer)
             .map_err(BlockError::from)
@@ -540,6 +571,7 @@ impl<'a> BlockDevice for SdhciDisk<'a> {
     }
 
     fn read_blocks(&mut self, lba: u64, count: u32, buffer: &mut [u8]) -> Result<(), BlockError> {
+        self.validate_read(lba, count, buffer)?;
         self.controller
             .read_sectors(lba, count, buffer.as_mut_ptr())
             .map_err(BlockError::from)
@@ -583,32 +615,6 @@ impl BlockDevice for AnyBlockDevice {
             AnyBlockDevice::Sdhci(dev) => dev.read_blocks(lba, count, buffer),
         }
     }
-}
-
-/// Macro for dispatching to the appropriate block device type
-///
-/// This reduces repetition when implementing functions that need to work
-/// with any block device type through the BlockDevice trait.
-#[macro_export]
-macro_rules! with_block_device {
-    // Mutable access version
-    ($handle:expr, mut |$device:ident| $body:expr) => {
-        match $handle {
-            $crate::drivers::block::AnyBlockDevice::Nvme(ref mut $device) => $body,
-            $crate::drivers::block::AnyBlockDevice::Ahci(ref mut $device) => $body,
-            $crate::drivers::block::AnyBlockDevice::Usb(ref mut $device) => $body,
-            $crate::drivers::block::AnyBlockDevice::Sdhci(ref mut $device) => $body,
-        }
-    };
-    // Immutable access version
-    ($handle:expr, |$device:ident| $body:expr) => {
-        match $handle {
-            $crate::drivers::block::AnyBlockDevice::Nvme(ref $device) => $body,
-            $crate::drivers::block::AnyBlockDevice::Ahci(ref $device) => $body,
-            $crate::drivers::block::AnyBlockDevice::Usb(ref $device) => $body,
-            $crate::drivers::block::AnyBlockDevice::Sdhci(ref $device) => $body,
-        }
-    };
 }
 
 // ============================================================================
@@ -655,7 +661,8 @@ pub fn create_ahci_device(
 
 /// Create an SDHCI block device from a controller
 pub fn create_sdhci_device(controller_id: usize, media_id: u32) -> Option<SdhciBlockDevice> {
-    let controller = sdhci::get_controller(controller_id)?;
+    // Safety: pointer valid for firmware lifetime; no overlapping &mut created
+    let controller = unsafe { &mut *sdhci::get_controller(controller_id)? };
 
     if !controller.is_ready() {
         return None;

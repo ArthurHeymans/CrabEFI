@@ -65,15 +65,6 @@ pub struct FmapArea {
     pub flags: u16,
 }
 
-/// FMAP area flag: area is static (not updated after initial programming)
-pub const FMAP_AREA_STATIC: u16 = 1 << 0;
-/// FMAP area flag: area is compressed
-pub const FMAP_AREA_COMPRESSED: u16 = 1 << 1;
-/// FMAP area flag: area is read-only
-pub const FMAP_AREA_RO: u16 = 1 << 2;
-/// FMAP area flag: area is preserved across updates
-pub const FMAP_AREA_PRESERVE: u16 = 1 << 3;
-
 /// Size of FMAP header in bytes
 pub const FMAP_HEADER_SIZE: usize = core::mem::size_of::<FmapHeader>();
 
@@ -110,18 +101,6 @@ impl FmapHeader {
     /// Check if the signature is valid
     pub fn is_valid(&self) -> bool {
         &self.signature == FMAP_SIGNATURE && self.ver_major == FMAP_VER_MAJOR
-    }
-}
-
-impl FmapArea {
-    /// Get the area name as a string (trimmed of null bytes)
-    pub fn name_str(&self) -> &str {
-        let len = self
-            .name
-            .iter()
-            .position(|&c| c == 0)
-            .unwrap_or(self.name.len());
-        core::str::from_utf8(&self.name[..len]).unwrap_or("")
     }
 }
 
@@ -327,21 +306,19 @@ pub fn find_region<'a>(fmap: &'a FmapInfo, name: &str) -> Option<&'a FmapAreaInf
 /// The SMMSTORE area info if found, or None if not found.
 pub fn find_smmstore_region(fmap: &FmapInfo) -> Option<&FmapAreaInfo> {
     // Try common names for the SMMSTORE region
-    const SMMSTORE_NAMES: &[&str] = &["SMMSTORE", "RW_NVRAM", "NVRAM", "RW_ELOG"];
+    // Note: RW_ELOG is the event log region and must NOT be used as variable storage
+    const SMMSTORE_NAMES: &[&str] = &["SMMSTORE", "RW_NVRAM", "NVRAM"];
 
-    for name in SMMSTORE_NAMES {
-        if let Some(area) = find_region(fmap, name) {
+    SMMSTORE_NAMES.iter().find_map(|name| {
+        find_region(fmap, name).inspect(|area| {
             log::info!(
                 "Found SMMSTORE region '{}' at {:#x}, size {} KB",
                 area.name.as_str(),
                 area.offset,
                 area.size / 1024
             );
-            return Some(area);
-        }
-    }
-
-    None
+        })
+    })
 }
 
 /// SMMSTORE information derived from FMAP
