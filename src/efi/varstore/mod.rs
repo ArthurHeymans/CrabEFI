@@ -377,7 +377,7 @@ impl VariableRecord {
             timestamp: SerializedTime::default(),
             crc: 0,
         };
-        record.crc = record.compute_crc();
+        record.crc = record.compute_crc().ok_or(VarStoreError::SerdeError)?;
         Ok(record)
     }
 
@@ -409,7 +409,7 @@ impl VariableRecord {
             timestamp,
             crc: 0,
         };
-        record.crc = record.compute_crc();
+        record.crc = record.compute_crc().ok_or(VarStoreError::SerdeError)?;
         Ok(record)
     }
 
@@ -430,27 +430,26 @@ impl VariableRecord {
             timestamp: SerializedTime::default(),
             crc: 0,
         };
-        record.crc = record.compute_crc();
+        record.crc = record.compute_crc().ok_or(VarStoreError::SerdeError)?;
         Ok(record)
     }
 
     /// Compute CRC32 of the record
-    pub fn compute_crc(&self) -> u32 {
+    ///
+    /// Returns `None` if serialization fails, so callers can distinguish
+    /// a real CRC of 0 from a serialization error.
+    pub fn compute_crc(&self) -> Option<u32> {
         // Serialize all fields except CRC, then compute CRC
         let temp = Self {
             crc: 0,
             ..self.clone()
         };
-        if let Ok(bytes) = postcard::to_allocvec(&temp) {
-            crc32(&bytes)
-        } else {
-            0
-        }
+        postcard::to_allocvec(&temp).ok().map(|bytes| crc32(&bytes))
     }
 
     /// Validate the record
     pub fn is_valid(&self) -> bool {
-        self.magic == RECORD_MAGIC && self.crc == self.compute_crc()
+        self.magic == RECORD_MAGIC && self.compute_crc() == Some(self.crc)
     }
 
     /// Check if record is active (not deleted)

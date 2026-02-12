@@ -7,7 +7,7 @@
 use r_efi::efi::{Guid, Status};
 
 use crate::coreboot::FramebufferInfo;
-use crate::efi::allocator::{MemoryType, allocate_pool};
+use crate::efi::allocator::{allocate_pool, MemoryType};
 use crate::efi::utils::allocate_protocol_with_log;
 use crate::state;
 
@@ -530,6 +530,7 @@ pub fn create_gop(framebuffer: &FramebufferInfo) -> *mut GraphicsOutputProtocol 
         m.frame_buffer_size = framebuffer.size() as usize;
     });
     if mode_ptr.is_null() {
+        crate::efi::allocator::free_pool(mode_info_ptr as *mut u8);
         return core::ptr::null_mut();
     }
 
@@ -542,6 +543,8 @@ pub fn create_gop(framebuffer: &FramebufferInfo) -> *mut GraphicsOutputProtocol 
             p.mode = mode_ptr;
         });
     if protocol_ptr.is_null() {
+        crate::efi::allocator::free_pool(mode_info_ptr as *mut u8);
+        crate::efi::allocator::free_pool(mode_ptr as *mut u8);
         return core::ptr::null_mut();
     }
 

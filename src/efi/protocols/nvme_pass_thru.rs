@@ -186,15 +186,10 @@ static mut PROTOCOL_TO_CONTEXT: [Option<*mut NvmExpressPassThruProtocol>; MAX_IN
 fn find_context_index(protocol: *mut NvmExpressPassThruProtocol) -> Option<usize> {
     unsafe {
         let proto_map = core::ptr::addr_of!(PROTOCOL_TO_CONTEXT);
-        for (i, p) in (*proto_map).iter().enumerate() {
-            if let Some(ptr) = p
-                && *ptr == protocol
-            {
-                return Some(i);
-            }
-        }
+        (*proto_map)
+            .iter()
+            .position(|p| p.is_some_and(|ptr| ptr == protocol))
     }
-    None
 }
 
 /// Get context for a protocol instance
@@ -487,15 +482,8 @@ pub fn create_nvme_pass_thru_protocol(
 ) -> *mut NvmExpressPassThruProtocol {
     // Find a free context slot
     let ctx_idx = unsafe {
-        let mut found = None;
         let contexts = core::ptr::addr_of!(CONTEXTS);
-        for (i, slot) in (*contexts).iter().enumerate() {
-            if slot.is_none() {
-                found = Some(i);
-                break;
-            }
-        }
-        match found {
+        match (*contexts).iter().position(|slot| slot.is_none()) {
             Some(i) => i,
             None => {
                 log::error!("NvmePassThru: no free context slots");
@@ -539,6 +527,7 @@ pub fn create_nvme_pass_thru_protocol(
     );
 
     if protocol_ptr.is_null() {
+        crate::efi::allocator::free_pool(mode_ptr as *mut u8);
         return core::ptr::null_mut();
     }
 

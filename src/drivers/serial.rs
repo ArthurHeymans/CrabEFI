@@ -111,9 +111,6 @@ register_bitfields![u8,
 /// Standard COM1 port address
 pub const COM1: u16 = 0x3F8;
 
-/// Standard COM2 port address
-pub const COM2: u16 = 0x2F8;
-
 /// Serial port register offsets
 mod offsets {
     pub const DATA: u16 = 0; // Data register (read/write), also DLL when DLAB=1
@@ -240,6 +237,10 @@ impl SerialPort {
             return false;
         }
 
+        if baud == 0 {
+            self.functional = false;
+            return false;
+        }
         let divisor = 115200 / baud;
 
         // Disable interrupts
@@ -295,16 +296,6 @@ impl SerialPort {
         self.regs.data.set(byte);
     }
 
-    /// Read a byte from the serial port (blocking)
-    pub fn read_byte(&mut self) -> u8 {
-        // Wait for data to be available
-        while !self.regs.lsr.is_set(LSR::DATA_READY) {
-            core::hint::spin_loop();
-        }
-
-        self.regs.data.get()
-    }
-
     /// Try to read a byte from the serial port (non-blocking)
     pub fn try_read_byte(&mut self) -> Option<u8> {
         if self.regs.lsr.is_set(LSR::DATA_READY) {
@@ -316,12 +307,12 @@ impl SerialPort {
 
     /// Check if the serial port is ready to receive data
     pub fn can_receive(&self) -> bool {
-        self.regs.lsr.is_set(LSR::DATA_READY)
+        self.functional && self.regs.lsr.is_set(LSR::DATA_READY)
     }
 
     /// Check if the serial port is ready to send data
     pub fn can_send(&self) -> bool {
-        self.regs.lsr.is_set(LSR::TX_EMPTY)
+        self.functional && self.regs.lsr.is_set(LSR::TX_EMPTY)
     }
 }
 
@@ -340,15 +331,6 @@ impl Write for SerialPort {
 // ============================================================================
 // Global API
 // ============================================================================
-
-/// Initialize the global serial port for early debug output
-///
-/// This is a no-op now - we wait for coreboot tables to tell us the serial port.
-/// Call `init_from_coreboot()` after parsing coreboot tables.
-pub fn init_early() {
-    // Don't initialize serial until we know from coreboot tables if one exists
-    // and what address it's at. This prevents hanging on systems without serial.
-}
 
 /// Initialize serial port from coreboot table information
 ///

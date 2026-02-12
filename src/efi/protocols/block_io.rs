@@ -104,15 +104,10 @@ static mut PROTOCOL_TO_CONTEXT: [Option<*mut BlockIoProtocol>; MAX_BLOCK_IO_INST
 fn find_context_index(protocol: *mut BlockIoProtocol) -> Option<usize> {
     unsafe {
         let contexts = core::ptr::addr_of!(PROTOCOL_TO_CONTEXT);
-        for (i, p) in (*contexts).iter().enumerate() {
-            if let Some(ptr) = p
-                && *ptr == protocol
-            {
-                return Some(i);
-            }
-        }
+        (*contexts)
+            .iter()
+            .position(|p| p.is_some_and(|ptr| ptr == protocol))
     }
-    None
 }
 
 /// Reset the block device
@@ -289,15 +284,8 @@ fn create_block_io_internal(
 ) -> *mut BlockIoProtocol {
     // Find a free context slot
     let ctx_idx = unsafe {
-        let mut found = None;
         let contexts = core::ptr::addr_of!(BLOCK_IO_CONTEXTS);
-        for (i, slot) in (*contexts).iter().enumerate() {
-            if slot.is_none() {
-                found = Some(i);
-                break;
-            }
-        }
-        match found {
+        match (*contexts).iter().position(|slot| slot.is_none()) {
             Some(i) => i,
             None => {
                 log::error!("BlockIO: no free context slots");
@@ -333,6 +321,7 @@ fn create_block_io_internal(
         p.flush_blocks = block_io_flush_blocks;
     });
     if protocol_ptr.is_null() {
+        crate::efi::allocator::free_pool(media_ptr as *mut u8);
         return core::ptr::null_mut();
     }
 

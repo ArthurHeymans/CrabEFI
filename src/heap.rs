@@ -38,8 +38,8 @@ struct BumpAllocator {
     heap_start: UnsafeCell<usize>,
     /// Current allocation pointer (offset from heap_start)
     offset: AtomicUsize,
-    /// Heap size
-    heap_size: usize,
+    /// Heap size (written once during init)
+    heap_size: UnsafeCell<usize>,
     /// Whether the allocator has been initialized
     initialized: AtomicBool,
 }
@@ -55,7 +55,7 @@ impl BumpAllocator {
         Self {
             heap_start: UnsafeCell::new(0),
             offset: AtomicUsize::new(0),
-            heap_size: 0,
+            heap_size: UnsafeCell::new(0),
             initialized: AtomicBool::new(false),
         }
     }
@@ -69,11 +69,7 @@ impl BumpAllocator {
         // Store the heap start address
         *self.heap_start.get() = heap_start;
 
-        // We need to update heap_size, but it's not mutable.
-        // Since we're single-threaded and this is called before any allocations,
-        // we can use a pointer cast to update it.
-        let self_mut = self as *const Self as *mut Self;
-        (*self_mut).heap_size = heap_size;
+        *self.heap_size.get() = heap_size;
 
         // Reset the offset
         self.offset.store(0, Ordering::Release);
@@ -114,12 +110,14 @@ unsafe impl GlobalAlloc for BumpAllocator {
             let new_offset = current_offset + padding + size;
 
             // Check if we have enough space
-            if new_offset > self.heap_size {
+            // Safety: heap_size is only written once during init, before any allocations
+            let heap_size = unsafe { *self.heap_size.get() };
+            if new_offset > heap_size {
                 log::error!(
                     "Heap exhausted: requested {} bytes, offset {}, heap_size {}",
                     size,
                     current_offset,
-                    self.heap_size
+                    heap_size
                 );
                 return null_mut();
             }
@@ -157,7 +155,7 @@ static ALLOCATOR: BumpAllocator = BumpAllocator::new();
 ///
 /// `true` if initialization succeeded, `false` otherwise.
 pub fn init() -> bool {
-    use crate::efi::allocator::{AllocateType, MemoryType, allocate_pages};
+    use crate::efi::allocator::{allocate_pages, AllocateType, MemoryType};
     use r_efi::efi::Status;
 
     // Allocate heap pages as RuntimeServicesData so the OS preserves them
@@ -194,6 +192,7 @@ pub fn is_initialized() -> bool {
 /// Get heap usage statistics
 pub fn stats() -> (usize, usize) {
     let used = ALLOCATOR.offset.load(Ordering::Acquire);
-    let total = ALLOCATOR.heap_size;
+    // Safety: heap_size is only written once during init
+    let total = unsafe { *ALLOCATOR.heap_size.get() };
     (used, total)
 }

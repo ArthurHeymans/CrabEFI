@@ -160,13 +160,24 @@ pub fn discover_payloads(fs: &mut FatFilesystem<'_>) -> Vec<PayloadEntry, MAX_PA
     entries
 }
 
+/// Known payload filenames (must match discover_payloads)
+const PAYLOAD_FILENAMES: &[&str] = &[
+    "seabios.elf",
+    "seabios.bin",
+    "coreinfo.elf",
+    "edk2.fd",
+    "tianocore.fd",
+];
+
 /// Check if a filesystem has any payloads
 pub fn has_payloads(fs: &mut FatFilesystem<'_>) -> bool {
     for base_path in PAYLOAD_PATHS {
-        let mut path: String<128> = String::new();
-        let _ = core::fmt::write(&mut path, format_args!("{}\\seabios.elf", base_path));
-        if fs.file_size(&path).is_ok() {
-            return true;
+        for filename in PAYLOAD_FILENAMES {
+            let mut path: String<128> = String::new();
+            let _ = core::fmt::write(&mut path, format_args!("{}\\{}", base_path, filename));
+            if fs.file_size(&path).is_ok() {
+                return true;
+            }
         }
     }
     false
@@ -263,13 +274,10 @@ unsafe fn jump_to_payload(entry: u64, cbtable: *const u8) -> ! {
 ///
 /// Checks if the path ends with a known payload extension (case-insensitive).
 pub fn format_from_extension(path: &str) -> Option<PayloadFormat> {
-    // Use alloc::string::String for to_ascii_lowercase
-    // (available since we have `extern crate alloc`)
-    let lower_path = path.to_ascii_lowercase();
-    for (ext, format) in PAYLOAD_EXTENSIONS {
-        if lower_path.ends_with(ext) {
-            return Some(*format);
-        }
-    }
-    None
+    PAYLOAD_EXTENSIONS.iter().find_map(|(ext, format)| {
+        let suffix = path.as_bytes().get(path.len().checked_sub(ext.len())?..)?;
+        suffix
+            .eq_ignore_ascii_case(ext.as_bytes())
+            .then_some(*format)
+    })
 }

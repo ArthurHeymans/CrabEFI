@@ -21,8 +21,8 @@ pub mod iso9660;
 ///
 /// FAT-style path (e.g., "boot\\vmlinuz-linux") or an error if the path is invalid
 pub fn linux_path_to_fat(path: &str) -> Result<heapless::String<128>, PathConversionError> {
-    // Reject directory traversal attempts
-    if path.contains("..") {
+    // Reject directory traversal attempts (check each path component, not substring)
+    if path.split('/').any(|component| component == "..") {
         return Err(PathConversionError::DirectoryTraversal);
     }
 
@@ -33,15 +33,10 @@ pub fn linux_path_to_fat(path: &str) -> Result<heapless::String<128>, PathConver
 
     // Convert forward slashes to backslashes
     for c in path.chars() {
-        if c == '/' {
-            fat_path
-                .push('\\')
-                .map_err(|_| PathConversionError::PathTooLong)?;
-        } else {
-            fat_path
-                .push(c)
-                .map_err(|_| PathConversionError::PathTooLong)?;
-        }
+        let ch = if c == '/' { '\\' } else { c };
+        fat_path
+            .push(ch)
+            .map_err(|_| PathConversionError::PathTooLong)?;
     }
 
     Ok(fat_path)

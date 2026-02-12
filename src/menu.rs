@@ -709,7 +709,9 @@ fn discover_sdhci_entries(menu: &mut BootMenu) {
     use crate::fs::fat::FatFilesystem;
 
     for controller_id in 0..sdhci::controller_count() {
-        if let Some(controller) = sdhci::get_controller(controller_id) {
+        if let Some(controller_ptr) = sdhci::get_controller(controller_id) {
+            // Safety: pointer valid for firmware lifetime
+            let controller = unsafe { &mut *controller_ptr };
             if !controller.is_ready() {
                 continue;
             }
@@ -722,7 +724,9 @@ fn discover_sdhci_entries(menu: &mut BootMenu) {
             }
 
             // Create disk for GPT reading
-            if let Some(controller) = sdhci::get_controller(controller_id) {
+            if let Some(controller_ptr) = sdhci::get_controller(controller_id) {
+                // Safety: pointer valid for firmware lifetime
+                let controller = unsafe { &mut *controller_ptr };
                 let mut disk = SdhciDisk::new(controller);
 
                 // Read GPT and find partitions
@@ -735,7 +739,9 @@ fn discover_sdhci_entries(menu: &mut BootMenu) {
                         // Check if this is an ESP or potential boot partition
                         if partition.is_esp || is_potential_esp(partition) {
                             // Try to mount FAT filesystem on this partition
-                            if let Some(controller) = sdhci::get_controller(controller_id) {
+                            if let Some(controller_ptr) = sdhci::get_controller(controller_id) {
+                                // Safety: pointer valid for firmware lifetime
+                                let controller = unsafe { &mut *controller_ptr };
                                 let mut disk = SdhciDisk::new(controller);
                                 if let Ok(mut fat) =
                                     FatFilesystem::new(&mut disk, partition.first_lba)

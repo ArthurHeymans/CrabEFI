@@ -8,7 +8,7 @@
 use core::ffi::c_void;
 use r_efi::efi::{Handle, Status};
 
-use super::block_io::{BLOCK_IO_PROTOCOL_GUID, BlockIoProtocol};
+use super::block_io::{BlockIoProtocol, BLOCK_IO_PROTOCOL_GUID};
 use crate::efi::boot_services;
 use crate::efi::utils::allocate_protocol_with_log;
 
@@ -66,15 +66,10 @@ static mut PROTOCOL_TO_CONTEXT: [Option<*mut DiskIoProtocol>; MAX_DISK_IO_INSTAN
 fn find_context_index(protocol: *mut DiskIoProtocol) -> Option<usize> {
     unsafe {
         let map = core::ptr::addr_of!(PROTOCOL_TO_CONTEXT);
-        for (i, p) in (*map).iter().enumerate() {
-            if let Some(ptr) = p
-                && *ptr == protocol
-            {
-                return Some(i);
-            }
-        }
+        (*map)
+            .iter()
+            .position(|p| p.is_some_and(|ptr| ptr == protocol))
     }
-    None
 }
 
 /// Read from the disk at a byte offset
@@ -224,15 +219,8 @@ pub fn install_disk_io_on_handle(handle: Handle) {
 
     // Find a free context slot
     let ctx_idx = unsafe {
-        let mut found = None;
         let contexts = core::ptr::addr_of!(DISK_IO_CONTEXTS);
-        for (i, slot) in (*contexts).iter().enumerate() {
-            if slot.is_none() {
-                found = Some(i);
-                break;
-            }
-        }
-        match found {
+        match (*contexts).iter().position(|slot| slot.is_none()) {
             Some(i) => i,
             None => {
                 log::error!("DiskIO: no free context slots");

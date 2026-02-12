@@ -718,37 +718,25 @@ fn is_synthesized_variable(name: &[u16], guid: &Guid) -> bool {
     name_eq_slice(name, auth::SETUP_MODE_NAME) || name_eq_slice(name, auth::SECURE_BOOT_NAME)
 }
 
-/// Compare two UCS-2 slices for equality
+/// Compare two UCS-2 slices for equality (delegates to shared utility)
 fn name_eq_slice(a: &[u16], b: &[u16]) -> bool {
-    let mut i = 0;
-    loop {
-        let ca = a.get(i).copied().unwrap_or(0);
-        let cb = b.get(i).copied().unwrap_or(0);
-        if ca == 0 && cb == 0 {
-            return true;
-        }
-        if ca != cb {
-            return false;
-        }
-        i += 1;
-    }
+    crate::efi::utils::ucs2_eq(a, b)
 }
 
 /// Compare a pointer-based UCS-2 string with a constant UCS-2 slice
+///
+/// Bounded by the expected slice length + 1 (for null terminator check)
+/// to avoid unbounded reads from the name pointer.
 fn name_eq_const(name: *const u16, expected: &[u16]) -> bool {
-    let mut i = 0;
-    loop {
+    let expected_len = crate::efi::utils::ucs2_len(expected);
+    for i in 0..expected_len {
         let a = unsafe { *name.add(i) };
-        let b = expected.get(i).copied().unwrap_or(0);
-
-        if a == 0 && b == 0 {
-            return true;
-        }
-        if a != b {
+        if a != expected[i] {
             return false;
         }
-        i += 1;
     }
+    // Check that the name pointer is also null-terminated at this position
+    unsafe { *name.add(expected_len) == 0 }
 }
 
 extern "efiapi" fn get_next_variable_name(
@@ -1418,9 +1406,9 @@ extern "efiapi" fn query_capsule_capabilities(
 
 /// Read time from CMOS RTC
 fn read_rtc_time() -> (u16, u8, u8, u8, u8, u8) {
-    // Wait for RTC update to complete
+    // Wait for RTC update to complete (timeout after ~10ms)
     unsafe {
-        loop {
+        for _ in 0..10_000 {
             x86_out8(0x70, 0x0A);
             if x86_in8(0x71) & 0x80 == 0 {
                 break;
@@ -1500,10 +1488,13 @@ fn name_eq(stored: &[u16], name: *const u16) -> bool {
 // ucs2_strlen consolidated into crate::efi::utils::ucs2_len
 
 /// Get length of UCS-2 string from pointer (not including null terminator)
+///
+/// Bounded to MAX_VARIABLE_NAME_LEN to prevent unbounded reads from
+/// potentially malformed (non-null-terminated) buffers.
 fn ucs2_strlen_ptr(s: *const u16) -> usize {
     let mut len = 0;
     unsafe {
-        while *s.add(len) != 0 {
+        while len < MAX_VARIABLE_NAME_LEN && *s.add(len) != 0 {
             len += 1;
         }
     }
