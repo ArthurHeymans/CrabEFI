@@ -1028,10 +1028,13 @@ pub fn show_menu(menu: &mut BootMenu) -> Option<usize> {
 
     // Handle input with timeout
     let mut remaining_seconds = menu.timeout_seconds;
-    let mut last_second_check = Timeout::from_ms(0); // Immediately update
+    let mut last_second_check = Timeout::from_ms(1000);
+
+    // Show initial countdown
+    draw_countdown(remaining_seconds, &mut fb_console);
 
     loop {
-        // Check for timeout
+        // Check for timeout (first tick fires after 1 real second)
         if remaining_seconds > 0 && last_second_check.is_expired() {
             remaining_seconds -= 1;
             last_second_check = Timeout::from_ms(1000);

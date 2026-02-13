@@ -417,6 +417,9 @@ pub const MMC_CMD_APP_CMD: u8 = 55;
 /// SEND_RELATIVE_ADDR (SD) - Ask card to publish new RCA
 pub const SD_CMD_SEND_RELATIVE_ADDR: u8 = 3;
 
+/// SWITCH_FUNC (CMD6) - Check/switch card function (e.g., high-speed mode)
+pub const SD_CMD_SWITCH_FUNC: u8 = 6;
+
 /// SEND_IF_COND - Sends SD interface condition
 pub const SD_CMD_SEND_IF_COND: u8 = 8;
 

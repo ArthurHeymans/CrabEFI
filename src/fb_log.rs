@@ -32,8 +32,11 @@ pub fn set_framebuffer(fb: FramebufferInfo) {
 
 /// Log a message to the framebuffer
 pub fn log_to_framebuffer(level: Level, ts: u64, args: &core::fmt::Arguments) {
-    let Some(ref fb_info) = *FB_INFO.lock() else {
-        return;
+    // Clone fb_info out of the lock to avoid holding FB_INFO while acquiring
+    // FB_CURSOR, which would risk deadlock if the lock order were ever reversed.
+    let fb_info = match FB_INFO.lock().clone() {
+        Some(fb) => fb,
+        None => return,
     };
 
     // Level strings for framebuffer (no ANSI)
@@ -45,7 +48,7 @@ pub fn log_to_framebuffer(level: Level, ts: u64, args: &core::fmt::Arguments) {
         Level::Trace => ("TRACE", Color::new(192, 64, 192)), // Purple
     };
 
-    // Get cursor position
+    // Get cursor position (FB_INFO lock is already released)
     let (mut row, mut col) = *FB_CURSOR.lock();
     let cols = fb_info.x_resolution / CHAR_WIDTH;
     let rows = fb_info.y_resolution / CHAR_HEIGHT;
@@ -59,13 +62,13 @@ pub fn log_to_framebuffer(level: Level, ts: u64, args: &core::fmt::Arguments) {
     let bg = Color::new(0, 0, 0); // Black background
 
     // Clear the current line first (remove stale content)
-    clear_line(fb_info, row, cols, bg);
+    clear_line(&fb_info, row, cols, bg);
 
     // Draw timestamp (first 9 chars: "XXXXXXXX ")
     let timestamp_color = Color::new(128, 128, 128); // Gray for timestamp
     for (i, c) in buf.as_str().chars().take(9).enumerate() {
         if col < cols {
-            draw_char_at(fb_info, c, col + i as u32, row, timestamp_color, bg);
+            draw_char_at(&fb_info, c, col + i as u32, row, timestamp_color, bg);
         }
     }
     col += 9;
@@ -73,7 +76,7 @@ pub fn log_to_framebuffer(level: Level, ts: u64, args: &core::fmt::Arguments) {
     // Draw level with color (skip the space after timestamp)
     for (i, c) in level_str_fb.chars().enumerate() {
         if col < cols {
-            draw_char_at(fb_info, c, col + 1 + i as u32, row, level_color, bg);
+            draw_char_at(&fb_info, c, col + 1 + i as u32, row, level_color, bg);
         }
     }
     col += 7; // "[LEVEL]"
@@ -89,12 +92,12 @@ pub fn log_to_framebuffer(level: Level, ts: u64, args: &core::fmt::Arguments) {
                 row = 0;
             }
             // Clear the new line before writing
-            clear_line(fb_info, row, cols, bg);
+            clear_line(&fb_info, row, cols, bg);
             if c == '\n' {
                 continue;
             }
         }
-        draw_char_at(fb_info, c, col, row, fg, bg);
+        draw_char_at(&fb_info, c, col, row, fg, bg);
         col += 1;
     }
 

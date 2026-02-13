@@ -275,26 +275,10 @@ impl PartialOrd for SerializedTime {
 
 impl Ord for SerializedTime {
     fn cmp(&self, other: &Self) -> core::cmp::Ordering {
-        // Compare in order: year, month, day, hour, minute, second, nanosecond
-        // Timezone and daylight are not used for ordering
-        (
-            self.year,
-            self.month,
-            self.day,
-            self.hour,
-            self.minute,
-            self.second,
-            self.nanosecond,
-        )
-            .cmp(&(
-                other.year,
-                other.month,
-                other.day,
-                other.hour,
-                other.minute,
-                other.second,
-                other.nanosecond,
-            ))
+        // Normalize both to UTC minutes for consistent comparison, matching
+        // EfiTime::compare behavior. This handles cases where timestamps
+        // have different timezone offsets.
+        self.to_utc_minutes().cmp(&other.to_utc_minutes())
     }
 }
 
@@ -322,6 +306,38 @@ impl SerializedTime {
             timezone,
             daylight,
         }
+    }
+
+    /// EFI_UNSPECIFIED_TIMEZONE value (0x7FF = 2047)
+    const UNSPECIFIED_TIMEZONE: i16 = 0x7FF;
+
+    /// Convert to approximate UTC minutes for ordering purposes.
+    ///
+    /// This matches the normalization in `EfiTime::to_utc_minutes` to ensure
+    /// consistent ordering regardless of timezone differences.
+    fn to_utc_minutes(self) -> i64 {
+        let year = self.year as i64;
+        let month = self.month as i64;
+        let day = self.day as i64;
+        let hour = self.hour as i64;
+        let minute = self.minute as i64;
+        let second = self.second as i64;
+        let nanosecond = self.nanosecond as i64;
+        let timezone = self.timezone;
+
+        let days_from_years = year * 365 + year / 4 - year / 100 + year / 400;
+        let days_from_months = (month - 1) * 30; // Approximation (same as EfiTime)
+        let total_days = days_from_years + days_from_months + day;
+
+        let total_minutes = total_days * 24 * 60 + hour * 60 + minute;
+        let fractional = (second * 1_000_000_000 + nanosecond) / 60_000_000_000;
+        let mut total = total_minutes * 1_000_000 + fractional;
+
+        if timezone != Self::UNSPECIFIED_TIMEZONE && (-1440..=1440).contains(&timezone) {
+            total -= (timezone as i64) * 1_000_000;
+        }
+
+        total
     }
 
     /// Check if this is a zero/default timestamp

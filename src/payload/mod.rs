@@ -201,12 +201,20 @@ pub unsafe fn chainload_payload(
 ) -> Result<!, PayloadError> {
     log::info!("Loading payload: {} from {}", entry.name, entry.path);
 
-    // Allocate buffer for payload
-    // In a real implementation, we'd use the EFI allocator
-    // For now, we'll use a static buffer (limited)
-    static mut PAYLOAD_BUFFER: [u8; MAX_PAYLOAD_SIZE] = [0; MAX_PAYLOAD_SIZE];
+    // Static buffer for payload loading. Using UnsafeCell wrapped in a
+    // Sync newtype instead of `static mut` for soundness. Safety: this
+    // function is only called once during chainloading and never returns,
+    // so no aliased references exist.
+    use core::cell::UnsafeCell;
 
-    let buffer = &mut PAYLOAD_BUFFER[..entry.size as usize];
+    #[repr(transparent)]
+    struct SyncBuffer(UnsafeCell<[u8; MAX_PAYLOAD_SIZE]>);
+    // Safety: only accessed from a single call site that never returns.
+    unsafe impl Sync for SyncBuffer {}
+
+    static PAYLOAD_BUFFER: SyncBuffer = SyncBuffer(UnsafeCell::new([0; MAX_PAYLOAD_SIZE]));
+
+    let buffer = &mut (&mut *PAYLOAD_BUFFER.0.get())[..entry.size as usize];
 
     // Read payload file
     let bytes_read = fs

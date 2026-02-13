@@ -385,15 +385,30 @@ fn normalize_grub_path(path: &str) -> String<128> {
     // Strip leading slashes (including double slashes like //)
     let path = path.trim_start_matches('/');
 
-    // Copy the rest, preserving the path structure
-    for c in path.chars() {
-        // Skip any remaining problematic characters
+    // Copy the rest, skipping GRUB variable references like $prefix or ${prefix}
+    let mut chars = path.chars().peekable();
+    while let Some(c) = chars.next() {
         if c == '$' {
-            // Skip variable references - find the end of the variable
-            // This is a simplification; real GRUB variables are more complex
-            continue;
+            // Skip the entire variable name (alphanumeric + underscore)
+            if chars.peek() == Some(&'{') {
+                // ${var} form — skip until closing '}'
+                for vc in chars.by_ref() {
+                    if vc == '}' {
+                        break;
+                    }
+                }
+            } else {
+                // $var form — skip while alphanumeric or underscore
+                while chars
+                    .peek()
+                    .is_some_and(|&ch| ch.is_ascii_alphanumeric() || ch == '_')
+                {
+                    chars.next();
+                }
+            }
+        } else {
+            let _ = result.push(c);
         }
-        let _ = result.push(c);
     }
 
     result

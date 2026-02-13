@@ -70,6 +70,8 @@ pub enum SdhciError {
     AllocationFailed,
     /// Clock configuration failed
     ClockFailed,
+    /// Feature not supported by the card
+    NotSupported,
     /// Generic error
     GenericError,
 }
@@ -763,15 +765,128 @@ impl SdhciController {
         );
     }
 
-    /// Try to enable high-speed mode
+    /// Try to enable high-speed mode by negotiating with the card via CMD6
+    ///
+    /// Per SD specification, the host must:
+    /// 1. Send CMD6 in check mode to verify the card supports high-speed
+    /// 2. Send CMD6 in switch mode to actually switch
+    /// 3. Only then enable high-speed on the host controller
     fn try_high_speed(&mut self) -> Result<(), SdhciError> {
-        let regs = self.regs();
+        // CMD6 argument: [31] Mode (0=check, 1=switch), [3:0] Access Mode (1=high-speed)
+        const CMD6_CHECK_HIGH_SPEED: u32 = 0x00FF_FFF1; // Check mode, function group 1 = HS
+        const CMD6_SWITCH_HIGH_SPEED: u32 = 0x80FF_FFF1; // Switch mode, function group 1 = HS
 
-        // Enable high-speed in host control
+        // CMD6 returns 64 bytes (512 bits) of status data. We use the DMA
+        // buffer to receive it. Check mode first to see if the card supports
+        // high-speed.
+        self.cmd6_transfer(CMD6_CHECK_HIGH_SPEED)?;
+
+        // Read the 64-byte status from the DMA buffer
+        // Byte 13 (bits [379:376]) contains the function selected for group 1
+        // If the card supports high-speed, it will report function 1
+        let status_byte = unsafe { *self.dma_buffer.add(13) };
+        let selected_function = status_byte & 0x0F;
+
+        if selected_function != 1 {
+            log::debug!(
+                "SDHCI: Card does not support high-speed (function={})",
+                selected_function
+            );
+            return Err(SdhciError::NotSupported);
+        }
+
+        // Now send CMD6 in switch mode to actually enable high-speed on the card
+        self.cmd6_transfer(CMD6_SWITCH_HIGH_SPEED)?;
+
+        // Verify the switch was successful
+        let status_byte = unsafe { *self.dma_buffer.add(13) };
+        let selected_function = status_byte & 0x0F;
+
+        if selected_function != 1 {
+            log::warn!(
+                "SDHCI: High-speed switch failed (function={})",
+                selected_function
+            );
+            return Err(SdhciError::GenericError);
+        }
+
+        // Card is now in high-speed mode — enable it on the host controller
+        let regs = self.regs();
         regs.host_control.modify(HOST_CONTROL::HIGH_SPEED::SET);
 
         // Set 50 MHz clock
         self.set_clock(HIGH_SPEED_CLOCK_HZ)?;
+
+        Ok(())
+    }
+
+    /// Send CMD6 (SWITCH_FUNC) and receive 64 bytes of status data via SDMA
+    fn cmd6_transfer(&mut self, arg: u32) -> Result<(), SdhciError> {
+        self.wait_inhibit(true)?;
+
+        {
+            let regs = self.regs();
+
+            regs.int_status.set(0xFFFFFFFF);
+
+            // SDMA address — use existing page-aligned DMA buffer
+            let dma_addr = self.dma_buffer as u64;
+            if dma_addr > u32::MAX as u64 {
+                return Err(SdhciError::DmaError);
+            }
+            regs.sdma_addr.set(dma_addr as u32);
+
+            // CMD6 returns exactly 64 bytes (1 block of 64 bytes)
+            regs.block_size
+                .write(BLOCK_SIZE::BLOCK_SIZE.val(64) + BLOCK_SIZE::SDMA_BOUNDARY.val(0));
+            regs.block_count.set(1);
+
+            // Transfer mode: DMA, read, single block
+            regs.transfer_mode.write(
+                TRANSFER_MODE::DMA_ENABLE::SET
+                    + TRANSFER_MODE::DATA_DIRECTION::SET
+                    + TRANSFER_MODE::BLOCK_COUNT_ENABLE::SET,
+            );
+
+            regs.argument.set(arg);
+
+            // CMD6 uses R1 response with data
+            let cmd_val = COMMAND::CMD_INDEX.val(SD_CMD_SWITCH_FUNC as u16)
+                + COMMAND::RESPONSE_TYPE::Short48
+                + COMMAND::CRC_CHECK::SET
+                + COMMAND::INDEX_CHECK::SET
+                + COMMAND::DATA_PRESENT::SET;
+
+            regs.command.write(cmd_val);
+        }
+
+        // Wait for transfer complete
+        let timeout = Timeout::from_ms(CMD_TIMEOUT_MS);
+        loop {
+            let regs = self.regs();
+            let status = regs.int_status.get();
+
+            if status & INT_STATUS::ERROR::SET.value != 0 {
+                regs.int_status.set(status);
+                let _ = self.reset_cmd();
+                let _ = self.reset_data();
+                return Err(SdhciError::GenericError);
+            }
+
+            if status & INT_STATUS::TRANSFER_COMPLETE::SET.value != 0 {
+                regs.int_status
+                    .write(INT_STATUS::TRANSFER_COMPLETE::SET + INT_STATUS::CMD_COMPLETE::SET);
+                break;
+            }
+
+            if timeout.is_expired() {
+                let _ = self.reset_cmd();
+                let _ = self.reset_data();
+                return Err(SdhciError::CommandTimeout);
+            }
+
+            core::hint::spin_loop();
+        }
 
         Ok(())
     }

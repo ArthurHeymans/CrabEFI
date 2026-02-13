@@ -355,7 +355,9 @@ impl AhciController {
             // BIOS owns the HBA
             log::debug!("Performing BIOS/OS handoff...");
             hba.bohc.modify(BOHC::OOS::SET);
-            wait_for(100, || !hba.bohc.is_set(BOHC::BOS));
+            if !wait_for(100, || !hba.bohc.is_set(BOHC::BOS)) {
+                log::warn!("AHCI: BIOS/OS handoff timed out");
+            }
         }
 
         let mut controller = Self {
@@ -595,8 +597,10 @@ impl AhciController {
     fn start_port(&mut self, port_num: u8) -> Result<(), AhciError> {
         let port_regs = self.port_regs(port_num);
 
-        // Wait for CR to clear
-        wait_for(1, || !port_regs.cmd.is_set(PORT_CMD::CR));
+        // Wait for CR to clear before starting new commands
+        if !wait_for(500, || !port_regs.cmd.is_set(PORT_CMD::CR)) {
+            log::warn!("AHCI: port {} CR did not clear before start", port_num);
+        }
 
         // Enable FIS receive
         port_regs.cmd.modify(PORT_CMD::FRE::SET);
