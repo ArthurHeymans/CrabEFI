@@ -17,8 +17,8 @@ use super::controller::{
 
 // Import typed register structs and bitfield modules
 use super::xhci_regs::{
-    CAPLENGTH_HCIVERSION, CONFIG, ERSTSZ, HCCPARAMS1, HCSPARAMS1, HCSPARAMS2, PAGESIZE,
-    PORTSC, USBCMD, USBSTS, XhciCapRegs, XhciOpRegs, XhciPortRegs, XhciRuntimeRegs,
+    CAPLENGTH_HCIVERSION, CONFIG, ERSTSZ, HCCPARAMS1, HCSPARAMS1, HCSPARAMS2, PAGESIZE, PORTSC,
+    USBCMD, USBSTS, XhciCapRegs, XhciOpRegs, XhciPortRegs, XhciRuntimeRegs,
 };
 
 // Import constants that don't have typed equivalents (TRB types, completion codes,

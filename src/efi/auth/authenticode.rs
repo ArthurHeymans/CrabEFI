@@ -302,7 +302,7 @@ pub fn verify_pe_image_secure_boot(pe_data: &[u8]) -> Result<bool, AuthError> {
     match extract_authenticode_signature(pe_data)? {
         Some(sig) => {
             log::debug!("Secure Boot: Found embedded Authenticode signature");
-            verify_authenticode_signature(pe_data, &sig)
+            verify_authenticode_signature(&image_hash, &sig)
         }
         None => {
             log::warn!("Secure Boot: Unsigned image not in db");
@@ -313,12 +313,9 @@ pub fn verify_pe_image_secure_boot(pe_data: &[u8]) -> Result<bool, AuthError> {
 
 /// Verify an Authenticode signature against the db database
 fn verify_authenticode_signature(
-    pe_data: &[u8],
+    image_hash: &[u8],
     sig: &AuthenticodeSignature,
 ) -> Result<bool, AuthError> {
-    // Compute what was signed (the Authenticode hash)
-    let image_hash = compute_authenticode_hash(pe_data)?;
-
     // Get all X.509 certificates from db
     let db = db_database();
     let certificates: Vec<&[u8]> = db.x509_certificates().collect();
@@ -336,7 +333,7 @@ fn verify_authenticode_signature(
             continue;
         }
 
-        match verify_pkcs7_signature(sig.pkcs7_data, &image_hash, cert_der) {
+        match verify_pkcs7_signature(sig.pkcs7_data, image_hash, cert_der) {
             Ok(true) => {
                 log::info!("Secure Boot: Signature verified successfully");
                 return Ok(true);

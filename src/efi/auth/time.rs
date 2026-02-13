@@ -130,6 +130,27 @@ pub(crate) fn read_rtc_time() -> (u16, u8, u8, u8, u8, u8) {
 
     let full_year = (century as u16) * 100 + (year as u16);
 
+    // Validate RTC values to guard against corrupted CMOS or garbage BCD data.
+    // Invalid values could cause incorrect certificate validity checks.
+    // Fall back to a safe default (2025-01-01 00:00:00) on failure.
+    if !(1..=12).contains(&month)
+        || !(1..=31).contains(&day)
+        || hour > 23
+        || minute > 59
+        || second > 59
+    {
+        log::warn!(
+            "RTC: invalid time values: {}-{:02}-{:02} {:02}:{:02}:{:02}, using fallback",
+            full_year,
+            month,
+            day,
+            hour,
+            minute,
+            second
+        );
+        return (2025, 1, 1, 0, 0, 0);
+    }
+
     (full_year, month, day, hour, minute, second)
 }
 
