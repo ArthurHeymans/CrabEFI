@@ -1058,57 +1058,19 @@ pub fn install_tpm_event_log() {
 ///
 /// Reference: UEFI Specification 2.6+, Section 4.6
 pub fn install_memory_attributes_table() {
-    use super::allocator::{self, MemoryDescriptor, MemoryType, attributes};
+    use super::allocator::{self, MemoryType};
 
-    // Query the memory map size
-    let mut map_size: usize = 0;
-    let mut map_key: usize = 0;
-    let mut desc_size: usize = 0;
-    let mut desc_version: u32 = 0;
-
-    let _ = allocator::get_memory_map(
-        &mut map_size,
-        None,
-        &mut map_key,
-        &mut desc_size,
-        &mut desc_version,
-    );
-
-    // Allocate a stack buffer for the memory map (max 512 entries)
-    let mut map_buf = [MemoryDescriptor::new(MemoryType::ReservedMemoryType, 0, 0, 0); 512];
-    let num_entries = map_size / core::mem::size_of::<MemoryDescriptor>();
-    let entries_to_use = num_entries.min(512);
-
-    let status = allocator::get_memory_map(
-        &mut map_size,
-        Some(&mut map_buf[..entries_to_use]),
-        &mut map_key,
-        &mut desc_size,
-        &mut desc_version,
-    );
-
-    if status != efi::Status::SUCCESS {
-        log::error!("Failed to get memory map for MEMATTR table: {:?}", status);
-        return;
-    }
-
-    let actual_entries = map_size / core::mem::size_of::<MemoryDescriptor>();
-
-    // Count runtime entries
-    let mut runtime_count: u32 = 0;
-    for entry in map_buf[..actual_entries].iter() {
-        if entry.attribute & attributes::EFI_MEMORY_RUNTIME != 0 {
-            runtime_count += 1;
+    // Count runtime entries first to determine how much memory to allocate
+    let runtime_count = match count_runtime_entries() {
+        Some(n) if n > 0 => n,
+        _ => {
+            log::warn!("No runtime memory regions found, skipping MEMATTR table");
+            return;
         }
-    }
-
-    if runtime_count == 0 {
-        log::warn!("No runtime memory regions found, skipping MEMATTR table");
-        return;
-    }
+    };
 
     // Allocate memory for the table: header + runtime_count descriptors
-    let descriptor_size = core::mem::size_of::<MemoryDescriptor>() as u32;
+    let descriptor_size = core::mem::size_of::<allocator::MemoryDescriptor>() as u32;
     let table_size = core::mem::size_of::<EfiMemoryAttributesTable>()
         + (runtime_count as usize) * (descriptor_size as usize);
     let table_pages = (table_size as u64).div_ceil(4096);
@@ -1129,46 +1091,10 @@ pub fn install_memory_attributes_table() {
         return;
     }
 
-    // Fill in the header
-    let header = unsafe { &mut *(table_addr as *mut EfiMemoryAttributesTable) };
-    header.version = 1;
-    header.number_of_entries = runtime_count;
-    header.descriptor_size = descriptor_size;
-    header.reserved = 0;
-
-    // Fill in runtime descriptors after the header
-    let descs_base = table_addr + core::mem::size_of::<EfiMemoryAttributesTable>() as u64;
-    let mut desc_idx: u32 = 0;
-    for entry in map_buf[..actual_entries].iter() {
-        if entry.attribute & attributes::EFI_MEMORY_RUNTIME != 0 {
-            let dest = unsafe {
-                &mut *((descs_base + (desc_idx as u64) * (descriptor_size as u64))
-                    as *mut MemoryDescriptor)
-            };
-            *dest = *entry;
-
-            // Set memory protection attributes based on type:
-            // RuntimeServicesCode: RO + executable (no XP)
-            // RuntimeServicesData: XP + writable (no RO)
-            if let Some(mem_type) = entry.get_memory_type() {
-                match mem_type {
-                    MemoryType::RuntimeServicesCode => {
-                        dest.attribute |= attributes::EFI_MEMORY_RO;
-                        dest.attribute &= !attributes::EFI_MEMORY_XP;
-                    }
-                    MemoryType::RuntimeServicesData => {
-                        dest.attribute |= attributes::EFI_MEMORY_XP;
-                        dest.attribute &= !attributes::EFI_MEMORY_RO;
-                    }
-                    _ => {
-                        dest.attribute |= attributes::EFI_MEMORY_XP;
-                    }
-                }
-            }
-
-            desc_idx += 1;
-        }
-    }
+    // Fill the table (re-queries the memory map to capture the allocation above)
+    let Some((filled_count, filled_size)) = fill_memory_attributes_table(table_addr) else {
+        return;
+    };
 
     // Install as configuration table
     let status =
@@ -1176,8 +1102,8 @@ pub fn install_memory_attributes_table() {
     if status == efi::Status::SUCCESS {
         log::info!(
             "Installed EFI Memory Attributes Table ({} runtime entries, {} bytes)",
-            runtime_count,
-            table_size
+            filled_count,
+            filled_size
         );
     } else {
         log::error!(
@@ -1197,8 +1123,6 @@ pub fn install_memory_attributes_table() {
 ///
 /// This function does NOT call allocate_pages and does NOT change the map_key.
 pub fn rebuild_memory_attributes_table_in_place() {
-    use super::allocator::{self, MemoryDescriptor, MemoryType, attributes};
-
     // Find the existing MEMATTR table pointer from the config table
     let existing_addr = {
         let efi = state::efi();
@@ -1215,6 +1139,64 @@ pub fn rebuild_memory_attributes_table_in_place() {
             return;
         }
     };
+
+    if let Some((runtime_count, table_size)) = fill_memory_attributes_table(table_addr) {
+        log::info!(
+            "Rebuilt Memory Attributes Table in-place ({} runtime entries, {} bytes)",
+            runtime_count,
+            table_size
+        );
+    }
+}
+
+/// Count the number of runtime memory entries in the current memory map.
+///
+/// Returns `None` if the memory map cannot be queried.
+fn count_runtime_entries() -> Option<u32> {
+    use super::allocator::{self, MemoryDescriptor, MemoryType, attributes};
+
+    let mut map_size: usize = 0;
+    let mut map_key: usize = 0;
+    let mut desc_size: usize = 0;
+    let mut desc_version: u32 = 0;
+
+    let _ = allocator::get_memory_map(
+        &mut map_size,
+        None,
+        &mut map_key,
+        &mut desc_size,
+        &mut desc_version,
+    );
+
+    let mut map_buf = [MemoryDescriptor::new(MemoryType::ReservedMemoryType, 0, 0, 0); 512];
+    let entries_to_use = (map_size / core::mem::size_of::<MemoryDescriptor>()).min(512);
+
+    let status = allocator::get_memory_map(
+        &mut map_size,
+        Some(&mut map_buf[..entries_to_use]),
+        &mut map_key,
+        &mut desc_size,
+        &mut desc_version,
+    );
+
+    if status != efi::Status::SUCCESS {
+        return None;
+    }
+
+    let actual_entries = map_size / core::mem::size_of::<MemoryDescriptor>();
+    let count = map_buf[..actual_entries]
+        .iter()
+        .filter(|e| e.attribute & attributes::EFI_MEMORY_RUNTIME != 0)
+        .count() as u32;
+    Some(count)
+}
+
+/// Query the memory map and fill the MEMATTR table at the given address.
+///
+/// Writes the header and runtime descriptors with appropriate RO/XP protection
+/// attributes. Returns `(runtime_count, table_size_bytes)` on success.
+fn fill_memory_attributes_table(table_addr: u64) -> Option<(u32, usize)> {
+    use super::allocator::{self, MemoryDescriptor, MemoryType, attributes};
 
     // Query the memory map onto a stack buffer
     let mut map_size: usize = 0;
@@ -1242,8 +1224,8 @@ pub fn rebuild_memory_attributes_table_in_place() {
     );
 
     if status != efi::Status::SUCCESS {
-        log::error!("Failed to get memory map for MEMATTR rebuild: {:?}", status);
-        return;
+        log::error!("Failed to get memory map for MEMATTR table: {:?}", status);
+        return None;
     }
 
     let actual_entries = map_size / core::mem::size_of::<MemoryDescriptor>();
@@ -1256,30 +1238,23 @@ pub fn rebuild_memory_attributes_table_in_place() {
         .count() as u32;
 
     if runtime_count == 0 {
-        log::warn!("No runtime regions for MEMATTR rebuild");
-        return;
+        log::warn!("No runtime memory regions for MEMATTR table");
+        return None;
     }
 
-    // Sanity: ensure the table fits in the originally allocated page
     let table_size = core::mem::size_of::<EfiMemoryAttributesTable>()
         + (runtime_count as usize) * (descriptor_size as usize);
-    if table_size > 4096 {
-        log::error!(
-            "MEMATTR table too large for page ({} bytes, {} entries)",
-            table_size,
-            runtime_count
-        );
-        return;
-    }
 
-    // Overwrite the header
+    // Fill in the header
     let header = unsafe { &mut *(table_addr as *mut EfiMemoryAttributesTable) };
     header.version = 1;
     header.number_of_entries = runtime_count;
     header.descriptor_size = descriptor_size;
     header.reserved = 0;
 
-    // Fill runtime descriptors
+    // Fill in runtime descriptors with protection attributes
+    // RuntimeServicesCode: RO + executable (no XP)
+    // RuntimeServicesData: XP + writable (no RO)
     let descs_base = table_addr + core::mem::size_of::<EfiMemoryAttributesTable>() as u64;
     let mut desc_idx: u32 = 0;
     for entry in map_buf[..actual_entries].iter() {
@@ -1310,11 +1285,7 @@ pub fn rebuild_memory_attributes_table_in_place() {
         }
     }
 
-    log::info!(
-        "Rebuilt Memory Attributes Table in-place ({} runtime entries, {} bytes)",
-        runtime_count,
-        table_size
-    );
+    Some((runtime_count, table_size))
 }
 
 /// Dump configuration table entries for debugging
