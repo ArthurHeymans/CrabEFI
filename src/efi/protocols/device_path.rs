@@ -13,6 +13,27 @@ use r_efi::protocols::device_path::{
 
 use crate::efi::allocator::{MemoryType, allocate_pool};
 
+/// Allocate a device path on the EFI heap and write a stack-built value into it.
+///
+/// This is the shared helper for all fixed-size device path constructors.
+/// The value is `Copy` so it can be written via `ptr::write` without drop issues.
+///
+/// # Returns
+/// A pointer to the device path protocol, or null on allocation failure.
+fn allocate_device_path<T: Copy>(value: T) -> *mut Protocol {
+    let size = core::mem::size_of::<T>();
+    let dest = match allocate_pool(MemoryType::BootServicesData, size) {
+        Ok(p) => p as *mut T,
+        Err(_) => {
+            log::error!("Failed to allocate device path ({} bytes)", size);
+            return core::ptr::null_mut();
+        }
+    };
+    // Safety: dest points to valid, properly aligned memory of sufficient size
+    unsafe { ptr::write(dest, value) };
+    dest as *mut Protocol
+}
+
 /// Re-export the GUID for external use
 pub const DEVICE_PATH_PROTOCOL_GUID: Guid = device_path::PROTOCOL_GUID;
 
@@ -34,6 +55,7 @@ const PARTITION_FORMAT_GPT: u8 = 0x02;
 /// 1. HardDriveMedia node (describes the partition)
 /// 2. End node (terminates the device path)
 #[repr(C, packed)]
+#[derive(Clone, Copy)]
 pub struct HardDriveDevicePath {
     pub hard_drive: HardDriveMedia,
     pub end: End,
@@ -55,18 +77,7 @@ pub fn create_hard_drive_device_path(
     partition_size: u64,
     partition_guid: &[u8; 16],
 ) -> *mut Protocol {
-    let size = core::mem::size_of::<HardDriveDevicePath>();
-
-    let dest = match allocate_pool(MemoryType::BootServicesData, size) {
-        Ok(p) => p as *mut HardDriveDevicePath,
-        Err(_) => {
-            log::error!("Failed to allocate device path");
-            return core::ptr::null_mut();
-        }
-    };
-
-    // Build the device path on the stack (safe), then write to allocated memory
-    let device_path = HardDriveDevicePath {
+    let dp = HardDriveDevicePath {
         hard_drive: create_hard_drive_node(
             partition_number,
             partition_start,
@@ -75,18 +86,13 @@ pub fn create_hard_drive_device_path(
         ),
         end: create_end_node(),
     };
-
-    // Safety: dest points to valid, properly aligned memory of sufficient size
-    unsafe { ptr::write(dest, device_path) };
-
     log::debug!(
         "Created HardDrive device path: partition={}, start={}, size={}",
         partition_number,
         partition_start,
         partition_size
     );
-
-    dest as *mut Protocol
+    allocate_device_path(dp)
 }
 
 /// USB device path for a USB mass storage device (whole disk)
@@ -102,6 +108,7 @@ pub struct UsbDevicePath {
 
 /// USB Device Path Node (UEFI Spec 10.3.4.5)
 #[repr(C, packed)]
+#[derive(Clone, Copy)]
 pub struct UsbDevicePathNode {
     pub r#type: u8,
     pub sub_type: u8,
@@ -114,6 +121,7 @@ pub struct UsbDevicePathNode {
 
 /// ACPI device path for the PCI root bridge
 #[repr(C, packed)]
+#[derive(Clone, Copy)]
 pub struct AcpiDevicePathNode {
     pub r#type: u8,
     pub sub_type: u8,
@@ -124,6 +132,7 @@ pub struct AcpiDevicePathNode {
 
 /// PCI device path node
 #[repr(C, packed)]
+#[derive(Clone, Copy)]
 pub struct PciDevicePathNode {
     pub r#type: u8,
     pub sub_type: u8,
@@ -134,6 +143,7 @@ pub struct PciDevicePathNode {
 
 /// Full USB device path: ACPI + PCI + USB + End
 #[repr(C, packed)]
+#[derive(Clone, Copy)]
 pub struct FullUsbDevicePath {
     pub acpi: AcpiDevicePathNode,
     pub pci: PciDevicePathNode,
@@ -261,35 +271,19 @@ fn create_hard_drive_node(
 /// # Returns
 /// A pointer to the device path protocol, or null on failure
 pub fn create_usb_device_path(pci_device: u8, pci_function: u8, usb_port: u8) -> *mut Protocol {
-    let size = core::mem::size_of::<FullUsbDevicePath>();
-
-    let dest = match allocate_pool(MemoryType::BootServicesData, size) {
-        Ok(p) => p as *mut FullUsbDevicePath,
-        Err(_) => {
-            log::error!("Failed to allocate USB device path");
-            return core::ptr::null_mut();
-        }
-    };
-
-    // Build the device path on the stack (safe), then write to allocated memory
-    let device_path = FullUsbDevicePath {
+    let dp = FullUsbDevicePath {
         acpi: AcpiDevicePathNode::new(0),
         pci: PciDevicePathNode::new(pci_device, pci_function),
         usb: UsbDevicePathNode::new(usb_port, 0),
         end: create_end_node(),
     };
-
-    // Safety: dest points to valid, properly aligned memory of sufficient size
-    unsafe { ptr::write(dest, device_path) };
-
     log::debug!(
         "Created USB device path: ACPI/PCI({:02x},{:x})/USB({},0)",
         pci_device,
         pci_function,
         usb_port
     );
-
-    dest as *mut Protocol
+    allocate_device_path(dp)
 }
 
 /// Full USB partition device path: ACPI + PCI + USB + HardDrive + End
@@ -297,6 +291,7 @@ pub fn create_usb_device_path(pci_device: u8, pci_function: u8, usb_port: u8) ->
 /// This is the proper device path for a partition on a USB disk.
 /// GRUB uses device path prefixes to match partitions to their parent disk.
 #[repr(C, packed)]
+#[derive(Clone, Copy)]
 pub struct FullUsbPartitionDevicePath {
     pub acpi: AcpiDevicePathNode,
     pub pci: PciDevicePathNode,
@@ -332,18 +327,7 @@ pub fn create_usb_partition_device_path(
     partition_size: u64,
     partition_guid: &[u8; 16],
 ) -> *mut Protocol {
-    let size = core::mem::size_of::<FullUsbPartitionDevicePath>();
-
-    let dest = match allocate_pool(MemoryType::BootServicesData, size) {
-        Ok(p) => p as *mut FullUsbPartitionDevicePath,
-        Err(_) => {
-            log::error!("Failed to allocate USB partition device path");
-            return core::ptr::null_mut();
-        }
-    };
-
-    // Build the device path on the stack (safe), then write to allocated memory
-    let device_path = FullUsbPartitionDevicePath {
+    let dp = FullUsbPartitionDevicePath {
         acpi: AcpiDevicePathNode::new(0),
         pci: PciDevicePathNode::new(pci_device, pci_function),
         usb: UsbDevicePathNode::new(usb_port, 0),
@@ -355,10 +339,6 @@ pub fn create_usb_partition_device_path(
         ),
         end: create_end_node(),
     };
-
-    // Safety: dest points to valid, properly aligned memory of sufficient size
-    unsafe { ptr::write(dest, device_path) };
-
     log::debug!(
         "Created USB partition device path: ACPI/PCI({:02x},{:x})/USB({},0)/HD({},{},{})",
         pci_device,
@@ -368,8 +348,7 @@ pub fn create_usb_partition_device_path(
         partition_start,
         partition_size
     );
-
-    dest as *mut Protocol
+    allocate_device_path(dp)
 }
 
 /// Create a minimal "end-only" device path
@@ -377,22 +356,8 @@ pub fn create_usb_partition_device_path(
 /// This is the simplest possible device path, just an end node.
 /// Some bootloaders accept this when they don't need detailed device info.
 pub fn create_end_device_path() -> *mut Protocol {
-    let size = core::mem::size_of::<End>();
-
-    let dest = match allocate_pool(MemoryType::BootServicesData, size) {
-        Ok(p) => p as *mut End,
-        Err(_) => {
-            log::error!("Failed to allocate end device path");
-            return core::ptr::null_mut();
-        }
-    };
-
-    // Safety: dest points to valid, properly aligned memory of sufficient size
-    unsafe { ptr::write(dest, create_end_node()) };
-
     log::debug!("Created minimal end-only device path");
-
-    dest as *mut Protocol
+    allocate_device_path(create_end_node())
 }
 
 /// File path device path node for describing file locations
@@ -408,6 +373,7 @@ pub struct FilePathDevicePath {
 
 /// NVMe Namespace Device Path Node (UEFI Spec 10.3.4.17)
 #[repr(C, packed)]
+#[derive(Clone, Copy)]
 pub struct NvmeDevicePathNode {
     pub r#type: u8,
     pub sub_type: u8,
@@ -437,6 +403,7 @@ impl NvmeDevicePathNode {
 
 /// Full NVMe device path: ACPI + PCI + NVMe + End
 #[repr(C, packed)]
+#[derive(Clone, Copy)]
 pub struct FullNvmeDevicePath {
     pub acpi: AcpiDevicePathNode,
     pub pci: PciDevicePathNode,
@@ -446,6 +413,7 @@ pub struct FullNvmeDevicePath {
 
 /// Full NVMe partition device path: ACPI + PCI + NVMe + HardDrive + End
 #[repr(C, packed)]
+#[derive(Clone, Copy)]
 pub struct FullNvmePartitionDevicePath {
     pub acpi: AcpiDevicePathNode,
     pub pci: PciDevicePathNode,
@@ -470,35 +438,19 @@ pub fn create_nvme_device_path(
     pci_function: u8,
     namespace_id: u32,
 ) -> *mut Protocol {
-    let size = core::mem::size_of::<FullNvmeDevicePath>();
-
-    let dest = match allocate_pool(MemoryType::BootServicesData, size) {
-        Ok(p) => p as *mut FullNvmeDevicePath,
-        Err(_) => {
-            log::error!("Failed to allocate NVMe device path");
-            return core::ptr::null_mut();
-        }
-    };
-
-    // Build the device path on the stack (safe), then write to allocated memory
-    let device_path = FullNvmeDevicePath {
+    let dp = FullNvmeDevicePath {
         acpi: AcpiDevicePathNode::new(0),
         pci: PciDevicePathNode::new(pci_device, pci_function),
         nvme: NvmeDevicePathNode::new(namespace_id),
         end: create_end_node(),
     };
-
-    // Safety: dest points to valid, properly aligned memory of sufficient size
-    unsafe { ptr::write(dest, device_path) };
-
     log::debug!(
         "Created NVMe device path: ACPI/PCI({:02x},{:x})/NVMe({})",
         pci_device,
         pci_function,
         namespace_id
     );
-
-    dest as *mut Protocol
+    allocate_device_path(dp)
 }
 
 /// Create a device path for a partition on an NVMe namespace
@@ -528,18 +480,7 @@ pub fn create_nvme_partition_device_path(
     partition_size: u64,
     partition_guid: &[u8; 16],
 ) -> *mut Protocol {
-    let size = core::mem::size_of::<FullNvmePartitionDevicePath>();
-
-    let dest = match allocate_pool(MemoryType::BootServicesData, size) {
-        Ok(p) => p as *mut FullNvmePartitionDevicePath,
-        Err(_) => {
-            log::error!("Failed to allocate NVMe partition device path");
-            return core::ptr::null_mut();
-        }
-    };
-
-    // Build the device path on the stack (safe), then write to allocated memory
-    let device_path = FullNvmePartitionDevicePath {
+    let dp = FullNvmePartitionDevicePath {
         acpi: AcpiDevicePathNode::new(0),
         pci: PciDevicePathNode::new(pci_device, pci_function),
         nvme: NvmeDevicePathNode::new(namespace_id),
@@ -551,10 +492,6 @@ pub fn create_nvme_partition_device_path(
         ),
         end: create_end_node(),
     };
-
-    // Safety: dest points to valid, properly aligned memory of sufficient size
-    unsafe { ptr::write(dest, device_path) };
-
     log::debug!(
         "Created NVMe partition device path: ACPI/PCI({:02x},{:x})/NVMe({})/HD({},{},{})",
         pci_device,
@@ -564,8 +501,7 @@ pub fn create_nvme_partition_device_path(
         partition_start,
         partition_size
     );
-
-    dest as *mut Protocol
+    allocate_device_path(dp)
 }
 
 // ============================================================================
@@ -574,6 +510,7 @@ pub fn create_nvme_partition_device_path(
 
 /// SATA Device Path Node (UEFI Spec 10.3.4.6)
 #[repr(C, packed)]
+#[derive(Clone, Copy)]
 pub struct SataDevicePathNode {
     pub r#type: u8,
     pub sub_type: u8,
@@ -606,6 +543,7 @@ impl SataDevicePathNode {
 
 /// Full SATA device path: ACPI + PCI + SATA + End
 #[repr(C, packed)]
+#[derive(Clone, Copy)]
 pub struct FullSataDevicePath {
     pub acpi: AcpiDevicePathNode,
     pub pci: PciDevicePathNode,
@@ -615,6 +553,7 @@ pub struct FullSataDevicePath {
 
 /// Full SATA partition device path: ACPI + PCI + SATA + HardDrive + End
 #[repr(C, packed)]
+#[derive(Clone, Copy)]
 pub struct FullSataPartitionDevicePath {
     pub acpi: AcpiDevicePathNode,
     pub pci: PciDevicePathNode,
@@ -635,35 +574,19 @@ pub struct FullSataPartitionDevicePath {
 /// # Returns
 /// A pointer to the device path protocol, or null on failure
 pub fn create_sata_device_path(pci_device: u8, pci_function: u8, port: u16) -> *mut Protocol {
-    let size = core::mem::size_of::<FullSataDevicePath>();
-
-    let dest = match allocate_pool(MemoryType::BootServicesData, size) {
-        Ok(p) => p as *mut FullSataDevicePath,
-        Err(_) => {
-            log::error!("Failed to allocate SATA device path");
-            return core::ptr::null_mut();
-        }
-    };
-
-    // Build the device path on the stack (safe), then write to allocated memory
-    let device_path = FullSataDevicePath {
+    let dp = FullSataDevicePath {
         acpi: AcpiDevicePathNode::new(0),
         pci: PciDevicePathNode::new(pci_device, pci_function),
         sata: SataDevicePathNode::new(port),
         end: create_end_node(),
     };
-
-    // Safety: dest points to valid, properly aligned memory of sufficient size
-    unsafe { ptr::write(dest, device_path) };
-
     log::debug!(
         "Created SATA device path: ACPI/PCI({:02x},{:x})/SATA({})",
         pci_device,
         pci_function,
         port
     );
-
-    dest as *mut Protocol
+    allocate_device_path(dp)
 }
 
 /// Create a device path for a partition on a SATA device
@@ -690,18 +613,7 @@ pub fn create_sata_partition_device_path(
     partition_size: u64,
     partition_guid: &[u8; 16],
 ) -> *mut Protocol {
-    let size = core::mem::size_of::<FullSataPartitionDevicePath>();
-
-    let dest = match allocate_pool(MemoryType::BootServicesData, size) {
-        Ok(p) => p as *mut FullSataPartitionDevicePath,
-        Err(_) => {
-            log::error!("Failed to allocate SATA partition device path");
-            return core::ptr::null_mut();
-        }
-    };
-
-    // Build the device path on the stack (safe), then write to allocated memory
-    let device_path = FullSataPartitionDevicePath {
+    let dp = FullSataPartitionDevicePath {
         acpi: AcpiDevicePathNode::new(0),
         pci: PciDevicePathNode::new(pci_device, pci_function),
         sata: SataDevicePathNode::new(port),
@@ -713,10 +625,6 @@ pub fn create_sata_partition_device_path(
         ),
         end: create_end_node(),
     };
-
-    // Safety: dest points to valid, properly aligned memory of sufficient size
-    unsafe { ptr::write(dest, device_path) };
-
     log::debug!(
         "Created SATA partition device path: ACPI/PCI({:02x},{:x})/SATA({})/HD({},{},{})",
         pci_device,
@@ -726,8 +634,7 @@ pub fn create_sata_partition_device_path(
         partition_start,
         partition_size
     );
-
-    dest as *mut Protocol
+    allocate_device_path(dp)
 }
 
 // ============================================================================
@@ -736,6 +643,7 @@ pub fn create_sata_partition_device_path(
 
 /// CD-ROM Device Path Node (UEFI Spec 10.3.5.2)
 #[repr(C, packed)]
+#[derive(Clone, Copy)]
 pub struct CdromDevicePathNode {
     pub r#type: u8,
     pub sub_type: u8,
@@ -768,6 +676,7 @@ impl CdromDevicePathNode {
 
 /// Full SATA CD-ROM device path: ACPI + PCI + SATA + CDROM + End
 #[repr(C, packed)]
+#[derive(Clone, Copy)]
 pub struct FullSataCdromDevicePath {
     pub acpi: AcpiDevicePathNode,
     pub pci: PciDevicePathNode,
@@ -800,28 +709,13 @@ pub fn create_sata_cdrom_device_path(
     partition_start: u64,
     partition_size: u64,
 ) -> *mut Protocol {
-    let size = core::mem::size_of::<FullSataCdromDevicePath>();
-
-    let dest = match allocate_pool(MemoryType::BootServicesData, size) {
-        Ok(p) => p as *mut FullSataCdromDevicePath,
-        Err(_) => {
-            log::error!("Failed to allocate SATA CDROM device path");
-            return core::ptr::null_mut();
-        }
-    };
-
-    // Build the device path on the stack (safe), then write to allocated memory
-    let device_path = FullSataCdromDevicePath {
+    let dp = FullSataCdromDevicePath {
         acpi: AcpiDevicePathNode::new(0),
         pci: PciDevicePathNode::new(pci_device, pci_function),
         sata: SataDevicePathNode::new(port),
         cdrom: CdromDevicePathNode::new(boot_entry, partition_start, partition_size),
         end: create_end_node(),
     };
-
-    // Safety: dest points to valid, properly aligned memory of sufficient size
-    unsafe { ptr::write(dest, device_path) };
-
     log::debug!(
         "Created SATA CDROM device path: ACPI/PCI({:02x},{:x})/SATA({})/CDROM({},{},{})",
         pci_device,
@@ -831,8 +725,7 @@ pub fn create_sata_cdrom_device_path(
         partition_start,
         partition_size
     );
-
-    dest as *mut Protocol
+    allocate_device_path(dp)
 }
 
 // ============================================================================
@@ -992,6 +885,7 @@ pub fn create_loaded_image_device_path(
 /// Contains just an ACPI node followed by End node.
 /// This is used for the GOP handle to indicate it's a display device.
 #[repr(C, packed)]
+#[derive(Clone, Copy)]
 pub struct AcpiVideoDevicePath {
     pub acpi: AcpiDevicePathNode,
     pub end: End,
@@ -1006,28 +900,12 @@ pub struct AcpiVideoDevicePath {
 /// # Returns
 /// A pointer to the device path protocol, or null on failure
 pub fn create_video_device_path() -> *mut Protocol {
-    let size = core::mem::size_of::<AcpiVideoDevicePath>();
-
-    let dest = match allocate_pool(MemoryType::BootServicesData, size) {
-        Ok(p) => p as *mut AcpiVideoDevicePath,
-        Err(_) => {
-            log::error!("Failed to allocate video device path");
-            return core::ptr::null_mut();
-        }
-    };
-
-    // Build the device path on the stack (safe), then write to allocated memory
-    let device_path = AcpiVideoDevicePath {
+    let dp = AcpiVideoDevicePath {
         acpi: AcpiDevicePathNode::new(0),
         end: create_end_node(),
     };
-
-    // Safety: dest points to valid, properly aligned memory of sufficient size
-    unsafe { ptr::write(dest, device_path) };
-
     log::debug!("Created video device path: ACPI(PNP0A03,0)");
-
-    dest as *mut Protocol
+    allocate_device_path(dp)
 }
 
 // ============================================================================
