@@ -16,7 +16,7 @@
 //! - Configurable auto-boot timeout with countdown
 
 use crate::coreboot;
-use crate::drivers::block::{AhciDisk, BlockDevice, NvmeDisk, SdhciDisk, UsbDisk};
+use crate::drivers::block::BlockDevice;
 use crate::drivers::serial as serial_driver;
 use crate::framebuffer_console::{
     Color, DEFAULT_BG, DEFAULT_FG, FramebufferConsole, HIGHLIGHT_BG, HIGHLIGHT_FG, TITLE_COLOR,
@@ -363,427 +363,329 @@ pub fn discover_boot_entries() -> BootMenu {
     menu
 }
 
+/// Discover boot entries on a disk that has already been stored globally.
+///
+/// Reads the GPT partition table, then for each ESP (or potential ESP) partition,
+/// mounts the FAT filesystem, checks for `EFI\BOOT\BOOTX64.EFI`, and scans for
+/// additional BLS/GRUB/payload entries.
+///
+/// # Arguments
+///
+/// * `device_type` - Device type for the boot entries
+/// * `pci_device` - PCI device number
+/// * `pci_function` - PCI function number
+/// * `name_prefix` - Display name prefix (e.g. "NVMe ns1", "SATA port 0")
+/// * `menu` - Boot menu to add entries to
+fn discover_entries_on_disk(
+    device_type: DeviceType,
+    pci_device: u8,
+    pci_function: u8,
+    name_prefix: &str,
+    menu: &mut BootMenu,
+) {
+    // Phase 1: Read GPT and clone partitions out (releases the disk borrow)
+    let partitions = crate::with_disk(&device_type, |disk| {
+        if let Ok(header) = gpt::read_gpt_header(disk)
+            && let Ok(parts) = gpt::read_partitions(disk, &header)
+        {
+            Some(parts)
+        } else {
+            None
+        }
+    })
+    .flatten();
+
+    let partitions = match partitions {
+        Some(p) => p,
+        None => return,
+    };
+
+    // Phase 2: For each ESP partition, mount FAT and scan for entries
+    for (i, partition) in partitions.iter().enumerate() {
+        let partition_num = (i + 1) as u32;
+
+        if !partition.is_esp && !is_potential_esp(partition) {
+            continue;
+        }
+
+        // Create a fresh disk for FAT mounting
+        crate::with_disk(&device_type, |disk| {
+            let mut fat = match FatFilesystem::new(disk, partition.first_lba) {
+                Ok(f) => f,
+                Err(_) => return,
+            };
+
+            // Check for UEFI bootloader
+            if fat.file_size("EFI\\BOOT\\BOOTX64.EFI").is_ok() {
+                let mut name: String<64> = String::new();
+                let _ = write!(name, "Boot Entry ({})", name_prefix);
+
+                let entry = BootEntry::new(
+                    &name,
+                    "EFI\\BOOT\\BOOTX64.EFI",
+                    device_type,
+                    partition_num,
+                    partition.clone(),
+                    pci_device,
+                    pci_function,
+                );
+
+                if !menu.add_entry(entry) {
+                    return; // Menu full
+                }
+            }
+
+            // Scan for additional entries (BLS, GRUB, payloads)
+            scan_partition_for_entries(
+                &mut fat,
+                device_type,
+                partition_num,
+                partition,
+                pci_device,
+                pci_function,
+                menu,
+            );
+        });
+    }
+}
+
 /// Discover boot entries from NVMe devices
 fn discover_nvme_entries(menu: &mut BootMenu) {
     use crate::drivers::nvme;
-    use crate::fs::fat::FatFilesystem;
 
-    if let Some(controller_ptr) = nvme::get_controller(0) {
-        // Safety: pointer valid for firmware lifetime; no overlapping &mut created
-        let controller = unsafe { &mut *controller_ptr };
-        if let Some(ns) = controller.default_namespace() {
-            let nsid = ns.nsid;
-            let pci_addr = controller.pci_address();
+    let Some(controller_ptr) = nvme::get_controller(0) else {
+        return;
+    };
+    // Safety: pointer valid for firmware lifetime; no overlapping &mut created
+    let controller = unsafe { &mut *controller_ptr };
+    let Some(ns) = controller.default_namespace() else {
+        return;
+    };
+    let nsid = ns.nsid;
+    let pci_addr = controller.pci_address();
 
-            // Store device globally for reading
-            if !nvme::store_global_device(0, nsid) {
-                return;
-            }
-
-            // Create disk for GPT reading
-            let mut disk = NvmeDisk::new(controller, nsid);
-
-            // Read GPT and find partitions
-            if let Ok(header) = gpt::read_gpt_header(&mut disk)
-                && let Ok(partitions) = gpt::read_partitions(&mut disk, &header)
-            {
-                for (i, partition) in partitions.iter().enumerate() {
-                    let partition_num = (i + 1) as u32;
-
-                    // Check if this is an ESP or potential boot partition
-                    if partition.is_esp || is_potential_esp(partition) {
-                        // Try to mount FAT filesystem on this partition
-                        if let Some(controller_ptr) = nvme::get_controller(0) {
-                            // Safety: pointer valid for firmware lifetime; no overlapping &mut created
-                            let controller = unsafe { &mut *controller_ptr };
-                            let mut disk = NvmeDisk::new(controller, nsid);
-                            if let Ok(mut fat) = FatFilesystem::new(&mut disk, partition.first_lba)
-                            {
-                                let device_type = DeviceType::Nvme {
-                                    controller_id: 0,
-                                    nsid,
-                                };
-
-                                // Check for UEFI bootloader
-                                if fat.file_size("EFI\\BOOT\\BOOTX64.EFI").is_ok() {
-                                    let mut name: String<64> = String::new();
-                                    let _ = write!(name, "Boot Entry (NVMe ns{})", nsid);
-
-                                    let entry = BootEntry::new(
-                                        &name,
-                                        "EFI\\BOOT\\BOOTX64.EFI",
-                                        device_type,
-                                        partition_num,
-                                        partition.clone(),
-                                        pci_addr.device,
-                                        pci_addr.function,
-                                    );
-
-                                    if !menu.add_entry(entry) {
-                                        return; // Menu full
-                                    }
-                                }
-
-                                // Scan for additional entries (BLS, GRUB, payloads)
-                                scan_partition_for_entries(
-                                    &mut fat,
-                                    device_type,
-                                    partition_num,
-                                    partition,
-                                    pci_addr.device,
-                                    pci_addr.function,
-                                    menu,
-                                );
-                            }
-                        }
-                    }
-                }
-            }
-        }
+    if !nvme::store_global_device(0, nsid) {
+        return;
     }
+
+    let mut name_prefix: String<32> = String::new();
+    let _ = write!(name_prefix, "NVMe ns{}", nsid);
+    discover_entries_on_disk(
+        DeviceType::Nvme {
+            controller_id: 0,
+            nsid,
+        },
+        pci_addr.device,
+        pci_addr.function,
+        &name_prefix,
+        menu,
+    );
 }
 
 /// Discover boot entries from AHCI devices
 fn discover_ahci_entries(menu: &mut BootMenu) {
     use crate::drivers::ahci;
-    use crate::fs::fat::FatFilesystem;
 
-    if let Some(controller_ptr) = ahci::get_controller(0) {
-        // Safety: pointer valid for firmware lifetime; no overlapping &mut created
-        let controller = unsafe { &mut *controller_ptr };
-        let pci_addr = controller.pci_address();
-        let num_ports = controller.num_active_ports();
+    let Some(controller_ptr) = ahci::get_controller(0) else {
+        return;
+    };
+    // Safety: pointer valid for firmware lifetime; no overlapping &mut created
+    let controller = unsafe { &mut *controller_ptr };
+    let pci_addr = controller.pci_address();
+    let num_ports = controller.num_active_ports();
 
-        for port_index in 0..num_ports {
-            // Store device globally for reading
-            if !ahci::store_global_device(0, port_index) {
-                continue;
-            }
+    for port_index in 0..num_ports {
+        if !ahci::store_global_device(0, port_index) {
+            continue;
+        }
 
-            if let Some(controller_ptr) = ahci::get_controller(0) {
-                // Safety: pointer valid for firmware lifetime; no overlapping &mut created
-                let controller = unsafe { &mut *controller_ptr };
-                let mut disk = AhciDisk::new(controller, port_index);
+        let device_type = DeviceType::Ahci {
+            controller_id: 0,
+            port: port_index,
+        };
 
-                // Try GPT first
-                if let Ok(header) = gpt::read_gpt_header(&mut disk)
-                    && let Ok(partitions) = gpt::read_partitions(&mut disk, &header)
-                {
-                    for (i, partition) in partitions.iter().enumerate() {
-                        let partition_num = (i + 1) as u32;
+        let mut name_prefix: String<32> = String::new();
+        let _ = write!(name_prefix, "SATA port {}", port_index);
 
-                        // Check if this is an ESP or potential boot partition
-                        if partition.is_esp || is_potential_esp(partition) {
-                            // Try to mount FAT filesystem on this partition
-                            if let Some(controller_ptr) = ahci::get_controller(0) {
-                                // Safety: pointer valid for firmware lifetime; no overlapping &mut created
-                                let controller = unsafe { &mut *controller_ptr };
-                                let mut disk = AhciDisk::new(controller, port_index);
-                                if let Ok(mut fat) =
-                                    FatFilesystem::new(&mut disk, partition.first_lba)
-                                {
-                                    let device_type = DeviceType::Ahci {
-                                        controller_id: 0,
-                                        port: port_index,
-                                    };
+        // Try GPT-based discovery first
+        let had_gpt = crate::with_disk(&device_type, |disk| gpt::read_gpt_header(disk).is_ok())
+            .unwrap_or(false);
 
-                                    // Check for UEFI bootloader
-                                    if fat.file_size("EFI\\BOOT\\BOOTX64.EFI").is_ok() {
-                                        let mut name: String<64> = String::new();
-                                        let _ =
-                                            write!(name, "Boot Entry (SATA port {})", port_index);
-
-                                        let entry = BootEntry::new(
-                                            &name,
-                                            "EFI\\BOOT\\BOOTX64.EFI",
-                                            device_type,
-                                            partition_num,
-                                            partition.clone(),
-                                            pci_addr.device,
-                                            pci_addr.function,
-                                        );
-
-                                        if !menu.add_entry(entry) {
-                                            return; // Menu full
-                                        }
-                                    }
-
-                                    // Scan for additional entries (BLS, GRUB, payloads)
-                                    scan_partition_for_entries(
-                                        &mut fat,
-                                        device_type,
-                                        partition_num,
-                                        partition,
-                                        pci_addr.device,
-                                        pci_addr.function,
-                                        menu,
-                                    );
-                                }
-                            }
-                        }
-                    }
-                } else {
-                    // GPT failed - try El Torito (ISO9660) as fallback
-                    if let Some(controller_ptr) = ahci::get_controller(0) {
-                        // Safety: pointer valid for firmware lifetime; no overlapping &mut created
-                        let controller = unsafe { &mut *controller_ptr };
-                        let mut disk = AhciDisk::new(controller, port_index);
-                        if let Ok(efi_image) = iso9660::find_efi_boot_image(&mut disk) {
-                            if efi_image.sector_count == 0 {
-                                log::warn!("El Torito: EFI image has unknown size, skipping");
-                            } else {
-                                // Create a synthetic partition for the El Torito boot image
-                                let block_size = disk.info().block_size;
-                                let partition = gpt::Partition {
-                                    type_guid: [0u8; 16], // Not a real GUID
-                                    partition_guid: [0u8; 16],
-                                    first_lba: efi_image.start_sector,
-                                    last_lba: efi_image.start_sector
-                                        + efi_image.sector_count as u64
-                                        - 1,
-                                    attributes: 0,
-                                    is_esp: true, // Treat it as ESP
-                                    block_size,
-                                };
-
-                                // Check if the boot image contains BOOTX64.EFI
-                                if let Some(controller_ptr) = ahci::get_controller(0) {
-                                    // Safety: pointer valid for firmware lifetime; no overlapping &mut created
-                                    let controller = unsafe { &mut *controller_ptr };
-                                    let mut disk = AhciDisk::new(controller, port_index);
-                                    if check_bootloader_exists(&mut disk, efi_image.start_sector) {
-                                        let mut name: String<64> = String::new();
-                                        let _ = write!(name, "ISO Boot (SATA port {})", port_index);
-
-                                        let entry = BootEntry::new(
-                                            &name,
-                                            "EFI\\BOOT\\BOOTX64.EFI",
-                                            DeviceType::Ahci {
-                                                controller_id: 0,
-                                                port: port_index,
-                                            },
-                                            0, // No partition number for El Torito
-                                            partition,
-                                            pci_addr.device,
-                                            pci_addr.function,
-                                        );
-
-                                        if !menu.add_entry(entry) {
-                                            return; // Menu full
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
+        if had_gpt {
+            discover_entries_on_disk(
+                device_type,
+                pci_addr.device,
+                pci_addr.function,
+                &name_prefix,
+                menu,
+            );
+        } else {
+            // GPT failed — try El Torito (ISO9660) as fallback
+            try_el_torito_fallback(device_type, pci_addr.device, pci_addr.function, menu);
         }
     }
+}
+
+/// Try El Torito (ISO9660) boot as a fallback for AHCI devices without GPT
+fn try_el_torito_fallback(
+    device_type: DeviceType,
+    pci_device: u8,
+    pci_function: u8,
+    menu: &mut BootMenu,
+) {
+    crate::with_disk(&device_type, |disk| {
+        let efi_image = match iso9660::find_efi_boot_image(disk) {
+            Ok(img) => img,
+            Err(_) => return,
+        };
+
+        if efi_image.sector_count == 0 {
+            log::warn!("El Torito: EFI image has unknown size, skipping");
+            return;
+        }
+
+        // Create a synthetic partition for the El Torito boot image
+        let block_size = disk.info().block_size;
+        let partition = gpt::Partition {
+            type_guid: [0u8; 16],
+            partition_guid: [0u8; 16],
+            first_lba: efi_image.start_sector,
+            last_lba: efi_image.start_sector + efi_image.sector_count as u64 - 1,
+            attributes: 0,
+            is_esp: true,
+            block_size,
+        };
+
+        if !check_bootloader_exists(disk, efi_image.start_sector) {
+            return;
+        }
+
+        let name_suffix = match device_type {
+            DeviceType::Ahci { port, .. } => {
+                let mut s: String<32> = String::new();
+                let _ = write!(s, "SATA port {}", port);
+                s
+            }
+            _ => {
+                let mut s: String<32> = String::new();
+                let _ = s.push_str(device_type.description());
+                s
+            }
+        };
+        let mut name: String<64> = String::new();
+        let _ = write!(name, "ISO Boot ({})", name_suffix);
+
+        let entry = BootEntry::new(
+            &name,
+            "EFI\\BOOT\\BOOTX64.EFI",
+            device_type,
+            0, // No partition number for El Torito
+            partition,
+            pci_device,
+            pci_function,
+        );
+
+        menu.add_entry(entry);
+    });
 }
 
 /// Discover boot entries from USB devices (all controller types)
 fn discover_usb_entries(menu: &mut BootMenu) {
     use crate::drivers::usb::{self, UsbMassStorage, mass_storage};
-    use crate::fs::fat::FatFilesystem;
 
-    // Check if we have any mass storage on any controller
-    if let Some((controller_id, device_addr)) = usb::find_mass_storage() {
-        log::info!(
-            "Found USB mass storage on controller {}, device {}",
-            controller_id,
-            device_addr
-        );
+    let Some((controller_id, device_addr)) = usb::find_mass_storage() else {
+        return;
+    };
 
-        // Get the controller pointer for storing globally
-        let controller_ptr = match usb::get_controller_ptr(controller_id) {
-            Some(ptr) => ptr,
-            None => {
-                log::error!("Failed to get controller {} pointer", controller_id);
-                return;
-            }
-        };
+    log::info!(
+        "Found USB mass storage on controller {}, device {}",
+        controller_id,
+        device_addr
+    );
 
-        // Use with_controller to create the mass storage device
-        let device_created = usb::with_controller(controller_id, |controller| {
-            match UsbMassStorage::new(controller, device_addr) {
-                Ok(usb_device) => {
-                    // Skip devices with no media (e.g., card reader without card)
-                    if usb_device.num_blocks == 0 {
-                        log::info!("USB Mass Storage: no media present, skipping");
-                        return false;
-                    }
+    let Some(controller_ptr) = usb::get_controller_ptr(controller_id) else {
+        log::error!("Failed to get controller {} pointer", controller_id);
+        return;
+    };
 
-                    // Store device globally WITH controller pointer so global_read_sectors can use it directly
-                    // This avoids lock contention since we store the pointer, not just the ID
-                    // SAFETY: controller_ptr is obtained from get_controller_ptr and is valid
-                    unsafe {
-                        mass_storage::store_global_device_with_controller_ptr(
-                            usb_device,
-                            controller_ptr,
-                        )
-                    }
+    // Create and store the mass storage device
+    let device_created = usb::with_controller(controller_id, |controller| {
+        match UsbMassStorage::new(controller, device_addr) {
+            Ok(usb_device) => {
+                if usb_device.num_blocks == 0 {
+                    log::info!("USB Mass Storage: no media present, skipping");
+                    return false;
                 }
-                Err(e) => {
-                    log::debug!("Failed to create USB mass storage: {:?}", e);
-                    false
+                // SAFETY: controller_ptr is obtained from get_controller_ptr and is valid
+                unsafe {
+                    mass_storage::store_global_device_with_controller_ptr(
+                        usb_device,
+                        controller_ptr,
+                    )
                 }
             }
-        });
-
-        if device_created != Some(true) {
-            return;
+            Err(e) => {
+                log::debug!("Failed to create USB mass storage: {:?}", e);
+                false
+            }
         }
+    });
 
-        // Now read partitions using the stored device
-        usb::with_controller(controller_id, |controller| {
-            // Get controller type early (before any mutable borrows)
-            let controller_type = controller.controller_type();
-
-            if let Some(usb_device) = mass_storage::get_global_device() {
-                let mut disk = UsbDisk::new(usb_device, controller);
-
-                // Read GPT and find partitions
-                if let Ok(header) = gpt::read_gpt_header(&mut disk)
-                    && let Ok(partitions) = gpt::read_partitions(&mut disk, &header)
-                {
-                    for (i, partition) in partitions.iter().enumerate() {
-                        let partition_num = (i + 1) as u32;
-
-                        // Check if this is an ESP or potential boot partition
-                        if partition.is_esp || is_potential_esp(partition) {
-                            // Try to mount FAT filesystem on this partition
-                            if let Some(usb_device2) = mass_storage::get_global_device() {
-                                let mut disk2 = UsbDisk::new(usb_device2, controller);
-                                if let Ok(mut fat) =
-                                    FatFilesystem::new(&mut disk2, partition.first_lba)
-                                {
-                                    let device_type = DeviceType::Usb {
-                                        controller_id,
-                                        device_addr,
-                                    };
-
-                                    // Check for UEFI bootloader
-                                    if fat.file_size("EFI\\BOOT\\BOOTX64.EFI").is_ok() {
-                                        let mut name: String<64> = String::new();
-                                        let _ =
-                                            write!(name, "Boot Entry ({} USB)", controller_type);
-
-                                        let entry = BootEntry::new(
-                                            &name,
-                                            "EFI\\BOOT\\BOOTX64.EFI",
-                                            device_type,
-                                            partition_num,
-                                            partition.clone(),
-                                            0, // PCI device - TODO: get from controller
-                                            0, // PCI function - TODO: get from controller
-                                        );
-
-                                        menu.add_entry(entry);
-                                    }
-
-                                    // Scan for additional entries (BLS, GRUB, payloads)
-                                    scan_partition_for_entries(
-                                        &mut fat,
-                                        device_type,
-                                        partition_num,
-                                        partition,
-                                        0, // PCI device - TODO: get from controller
-                                        0, // PCI function
-                                        menu,
-                                    );
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        });
+    if device_created != Some(true) {
+        return;
     }
+
+    // Get controller type for the display name
+    let controller_type = usb::with_controller(controller_id, |c| c.controller_type());
+    let mut name_prefix: String<32> = String::new();
+    if let Some(ct) = controller_type {
+        let _ = write!(name_prefix, "{} USB", ct);
+    } else {
+        let _ = name_prefix.push_str("USB");
+    }
+
+    let device_type = DeviceType::Usb {
+        controller_id,
+        device_addr,
+    };
+
+    // USB uses the same shared discovery path — with_disk handles USB via
+    // mass_storage::get_global_device() + get_controller_ptr()
+    discover_entries_on_disk(
+        device_type,
+        0, // PCI device - TODO: get from controller
+        0, // PCI function - TODO: get from controller
+        &name_prefix,
+        menu,
+    );
 }
 
 /// Discover boot entries from SDHCI devices (SD cards)
 fn discover_sdhci_entries(menu: &mut BootMenu) {
     use crate::drivers::sdhci;
-    use crate::fs::fat::FatFilesystem;
 
     for controller_id in 0..sdhci::controller_count() {
-        if let Some(controller_ptr) = sdhci::get_controller(controller_id) {
-            // Safety: pointer valid for firmware lifetime
-            let controller = unsafe { &mut *controller_ptr };
-            if !controller.is_ready() {
-                continue;
-            }
-
-            let pci_addr = controller.pci_address();
-
-            // Store device globally for reading
-            if !sdhci::store_global_device(controller_id) {
-                continue;
-            }
-
-            // Create disk for GPT reading
-            if let Some(controller_ptr) = sdhci::get_controller(controller_id) {
-                // Safety: pointer valid for firmware lifetime
-                let controller = unsafe { &mut *controller_ptr };
-                let mut disk = SdhciDisk::new(controller);
-
-                // Read GPT and find partitions
-                if let Ok(header) = gpt::read_gpt_header(&mut disk)
-                    && let Ok(partitions) = gpt::read_partitions(&mut disk, &header)
-                {
-                    for (i, partition) in partitions.iter().enumerate() {
-                        let partition_num = (i + 1) as u32;
-
-                        // Check if this is an ESP or potential boot partition
-                        if partition.is_esp || is_potential_esp(partition) {
-                            // Try to mount FAT filesystem on this partition
-                            if let Some(controller_ptr) = sdhci::get_controller(controller_id) {
-                                // Safety: pointer valid for firmware lifetime
-                                let controller = unsafe { &mut *controller_ptr };
-                                let mut disk = SdhciDisk::new(controller);
-                                if let Ok(mut fat) =
-                                    FatFilesystem::new(&mut disk, partition.first_lba)
-                                {
-                                    let device_type = DeviceType::Sdhci { controller_id };
-
-                                    // Check for UEFI bootloader
-                                    if fat.file_size("EFI\\BOOT\\BOOTX64.EFI").is_ok() {
-                                        let mut name: String<64> = String::new();
-                                        let _ = write!(name, "Boot Entry (SD card)");
-
-                                        let entry = BootEntry::new(
-                                            &name,
-                                            "EFI\\BOOT\\BOOTX64.EFI",
-                                            device_type,
-                                            partition_num,
-                                            partition.clone(),
-                                            pci_addr.device,
-                                            pci_addr.function,
-                                        );
-
-                                        if !menu.add_entry(entry) {
-                                            return; // Menu full
-                                        }
-                                    }
-
-                                    // Scan for additional entries (BLS, GRUB, payloads)
-                                    scan_partition_for_entries(
-                                        &mut fat,
-                                        device_type,
-                                        partition_num,
-                                        partition,
-                                        pci_addr.device,
-                                        pci_addr.function,
-                                        menu,
-                                    );
-                                }
-                            }
-                        }
-                    }
-                }
-            }
+        let Some(controller_ptr) = sdhci::get_controller(controller_id) else {
+            continue;
+        };
+        // Safety: pointer valid for firmware lifetime
+        let controller = unsafe { &mut *controller_ptr };
+        if !controller.is_ready() {
+            continue;
         }
+        let pci_addr = controller.pci_address();
+
+        if !sdhci::store_global_device(controller_id) {
+            continue;
+        }
+
+        discover_entries_on_disk(
+            DeviceType::Sdhci { controller_id },
+            pci_addr.device,
+            pci_addr.function,
+            "SD card",
+            menu,
+        );
     }
 }
 
@@ -809,7 +711,7 @@ fn linux_path_to_fat(path: &str) -> String<128> {
 }
 
 /// Check if a bootloader exists on the given partition
-fn check_bootloader_exists<D: BlockDevice>(disk: &mut D, partition_start: u64) -> bool {
+fn check_bootloader_exists(disk: &mut dyn BlockDevice, partition_start: u64) -> bool {
     match FatFilesystem::new(disk, partition_start) {
         Ok(mut fat) => match fat.file_size("EFI\\BOOT\\BOOTX64.EFI") {
             Ok(size) => size > 0,

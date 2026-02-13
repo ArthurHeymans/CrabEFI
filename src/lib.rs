@@ -473,7 +473,7 @@ fn boot_selected_entry(entry: &menu::BootEntry) {
 ///
 /// Each device type has its own `store_global_device()` with different parameters.
 /// This dispatches to the right one based on the device type.
-fn store_device_globally(device_type: &menu::DeviceType) -> bool {
+pub(crate) fn store_device_globally(device_type: &menu::DeviceType) -> bool {
     match *device_type {
         menu::DeviceType::Nvme {
             controller_id,
@@ -522,7 +522,7 @@ fn storage_type_from(device_type: &menu::DeviceType) -> drivers::storage::Storag
 /// # Returns
 /// `Some(R)` if the device was created and the closure returned a value,
 /// `None` if the device could not be created.
-fn with_disk<R>(
+pub(crate) fn with_disk<R>(
     device_type: &menu::DeviceType,
     f: impl FnOnce(&mut dyn drivers::block::BlockDevice) -> R,
 ) -> Option<R> {
