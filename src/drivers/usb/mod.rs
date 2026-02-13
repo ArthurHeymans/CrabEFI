@@ -116,8 +116,44 @@ static ALL_CONTROLLERS: Mutex<heapless::Vec<UsbControllerHandle, 8>> =
 // Initialization
 // ============================================================================
 
-/// Initialize all USB host controllers
+/// Allocate, write, and register a USB controller instance.
 ///
+/// Handles the common pattern of allocating pages for a controller struct,
+/// writing it into the allocation, and pushing it into the controller list.
+///
+/// # Arguments
+/// * `controllers` - Locked controller list
+/// * `controller` - The initialized controller to store
+/// * `wrap` - Closure to wrap the raw pointer into the appropriate `UsbControllerHandle` variant
+/// * `name` - Controller type name for logging
+/// * `address` - PCI address for logging
+fn register_controller<T>(
+    controllers: &mut heapless::Vec<UsbControllerHandle, 8>,
+    controller: T,
+    wrap: fn(*mut T) -> UsbControllerHandle,
+    name: &str,
+    address: pci::PciAddress,
+) -> Result<(), ()> {
+    let pages = mem::size_of::<T>().div_ceil(4096);
+    let Some(alloc) = efi::allocate_pages(pages as u64) else {
+        log::error!("  Failed to allocate memory for {} controller", name);
+        return Err(());
+    };
+    let controller_ptr = alloc.as_mut_ptr() as *mut T;
+    unsafe { ptr::write(controller_ptr, controller) };
+    if controllers.push(wrap(controller_ptr)).is_err() {
+        log::warn!(
+            "USB: Failed to register {} controller at {} - controller list full",
+            name,
+            address
+        );
+        efi::free_pages(alloc, pages as u64);
+        return Err(());
+    }
+    log::info!("  {} controller initialized", name);
+    Ok(())
+}
+
 /// Initialize a single USB controller from a PCI device
 ///
 /// Called by the PCI driver model when a USB host controller is discovered.
@@ -128,175 +164,38 @@ static ALL_CONTROLLERS: Mutex<heapless::Vec<UsbControllerHandle, 8>> =
 pub fn init_device(dev: &pci::PciDevice) -> Result<(), ()> {
     let mut controllers = ALL_CONTROLLERS.lock();
 
+    /// Helper macro to reduce per-controller-type boilerplate.
+    /// Logs init, calls the constructor, and registers the result.
+    macro_rules! init_usb_controller {
+        ($name:expr, $ty:ty, $variant:ident) => {{
+            log::info!(
+                "Initializing {} controller at {}: {:04x}:{:04x}",
+                $name,
+                dev.address,
+                dev.vendor_id,
+                dev.device_id
+            );
+            match <$ty>::new(dev) {
+                Ok(c) => register_controller(
+                    &mut controllers,
+                    c,
+                    UsbControllerHandle::$variant,
+                    $name,
+                    dev.address,
+                ),
+                Err(e) => {
+                    log::error!("  Failed to init {}: {:?}", $name, e);
+                    Err(())
+                }
+            }
+        }};
+    }
+
     match dev.prog_if {
-        // xHCI (USB 3.0)
-        0x30 => {
-            log::info!(
-                "Initializing xHCI controller at {}: {:04x}:{:04x}",
-                dev.address,
-                dev.vendor_id,
-                dev.device_id
-            );
-
-            match XhciController::new(dev) {
-                Ok(controller) => {
-                    let size = mem::size_of::<XhciController>();
-                    let pages = size.div_ceil(4096);
-                    if let Some(mem) = efi::allocate_pages(pages as u64) {
-                        let controller_ptr = mem.as_mut_ptr() as *mut XhciController;
-                        unsafe { ptr::write(controller_ptr, controller) };
-                        if controllers
-                            .push(UsbControllerHandle::Xhci(controller_ptr))
-                            .is_err()
-                        {
-                            log::warn!(
-                                "USB: Failed to register xHCI controller at {} - controller list full",
-                                dev.address
-                            );
-                            // Free the allocated pages to avoid a leak
-                            efi::free_pages(mem, pages as u64);
-                            return Err(());
-                        }
-                        log::info!("  xHCI controller initialized");
-                        Ok(())
-                    } else {
-                        log::error!("  Failed to allocate memory for xHCI controller");
-                        Err(())
-                    }
-                }
-                Err(e) => {
-                    log::error!("  Failed to init xHCI: {:?}", e);
-                    Err(())
-                }
-            }
-        }
-
-        // EHCI (USB 2.0)
-        0x20 => {
-            log::info!(
-                "Initializing EHCI controller at {}: {:04x}:{:04x}",
-                dev.address,
-                dev.vendor_id,
-                dev.device_id
-            );
-
-            match ehci::EhciController::new(dev) {
-                Ok(controller) => {
-                    let size = mem::size_of::<ehci::EhciController>();
-                    let pages = size.div_ceil(4096);
-                    if let Some(mem) = efi::allocate_pages(pages as u64) {
-                        let controller_ptr = mem.as_mut_ptr() as *mut ehci::EhciController;
-                        unsafe { ptr::write(controller_ptr, controller) };
-                        if controllers
-                            .push(UsbControllerHandle::Ehci(controller_ptr))
-                            .is_err()
-                        {
-                            log::warn!(
-                                "USB: Failed to register EHCI controller at {} - controller list full",
-                                dev.address
-                            );
-                            // Free the allocated pages to avoid a leak
-                            efi::free_pages(mem, pages as u64);
-                            return Err(());
-                        }
-                        log::info!("  EHCI controller initialized");
-                        Ok(())
-                    } else {
-                        log::error!("  Failed to allocate memory for EHCI controller");
-                        Err(())
-                    }
-                }
-                Err(e) => {
-                    log::error!("  Failed to init EHCI: {:?}", e);
-                    Err(())
-                }
-            }
-        }
-
-        // OHCI (USB 1.1)
-        0x10 => {
-            log::info!(
-                "Initializing OHCI controller at {}: {:04x}:{:04x}",
-                dev.address,
-                dev.vendor_id,
-                dev.device_id
-            );
-
-            match ohci::OhciController::new(dev) {
-                Ok(controller) => {
-                    let size = mem::size_of::<ohci::OhciController>();
-                    let pages = size.div_ceil(4096);
-                    if let Some(mem) = efi::allocate_pages(pages as u64) {
-                        let controller_ptr = mem.as_mut_ptr() as *mut ohci::OhciController;
-                        unsafe { ptr::write(controller_ptr, controller) };
-                        if controllers
-                            .push(UsbControllerHandle::Ohci(controller_ptr))
-                            .is_err()
-                        {
-                            log::warn!(
-                                "USB: Failed to register OHCI controller at {} - controller list full",
-                                dev.address
-                            );
-                            // Free the allocated pages to avoid a leak
-                            efi::free_pages(mem, pages as u64);
-                            return Err(());
-                        }
-                        log::info!("  OHCI controller initialized");
-                        Ok(())
-                    } else {
-                        log::error!("  Failed to allocate memory for OHCI controller");
-                        Err(())
-                    }
-                }
-                Err(e) => {
-                    log::error!("  Failed to init OHCI: {:?}", e);
-                    Err(())
-                }
-            }
-        }
-
-        // UHCI (USB 1.1)
-        0x00 => {
-            log::info!(
-                "Initializing UHCI controller at {}: {:04x}:{:04x}",
-                dev.address,
-                dev.vendor_id,
-                dev.device_id
-            );
-
-            match uhci::UhciController::new(dev) {
-                Ok(controller) => {
-                    let size = mem::size_of::<uhci::UhciController>();
-                    let pages = size.div_ceil(4096);
-                    if let Some(mem) = efi::allocate_pages(pages as u64) {
-                        let controller_ptr = mem.as_mut_ptr() as *mut uhci::UhciController;
-                        unsafe { ptr::write(controller_ptr, controller) };
-                        if controllers
-                            .push(UsbControllerHandle::Uhci(controller_ptr))
-                            .is_err()
-                        {
-                            log::warn!(
-                                "USB: Failed to register UHCI controller at {} - controller list full",
-                                dev.address
-                            );
-                            // Free the allocated pages to avoid a leak
-                            efi::free_pages(mem, pages as u64);
-                            return Err(());
-                        }
-                        log::info!("  UHCI controller initialized");
-                        Ok(())
-                    } else {
-                        log::error!("  Failed to allocate memory for UHCI controller");
-                        Err(())
-                    }
-                }
-                Err(e) => {
-                    log::error!("  Failed to init UHCI: {:?}", e);
-                    Err(())
-                }
-            }
-        }
-
+        0x30 => init_usb_controller!("xHCI", XhciController, Xhci),
+        0x20 => init_usb_controller!("EHCI", ehci::EhciController, Ehci),
+        0x10 => init_usb_controller!("OHCI", ohci::OhciController, Ohci),
+        0x00 => init_usb_controller!("UHCI", uhci::UhciController, Uhci),
         _ => {
             log::debug!(
                 "Unknown USB controller prog_if {:#x} at {}",
