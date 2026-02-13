@@ -176,8 +176,8 @@ extern "efiapi" fn get_time(time: *mut Time, capabilities: *mut TimeCapabilities
         return Status::INVALID_PARAMETER;
     }
 
-    // Read time from CMOS RTC
-    let (year, month, day, hour, minute, second) = read_rtc_time();
+    // Read time from CMOS RTC (shared implementation in auth::time)
+    let (year, month, day, hour, minute, second) = crate::efi::auth::time::read_rtc_time();
 
     unsafe {
         (*time).year = year;
@@ -1402,59 +1402,7 @@ extern "efiapi" fn query_capsule_capabilities(
 // Helper Functions
 // ============================================================================
 
-/// Read time from CMOS RTC
-fn read_rtc_time() -> (u16, u8, u8, u8, u8, u8) {
-    // Wait for RTC update to complete (timeout after ~10ms)
-    unsafe {
-        for _ in 0..10_000 {
-            x86_out8(0x70, 0x0A);
-            if x86_in8(0x71) & 0x80 == 0 {
-                break;
-            }
-        }
-    }
-
-    // Read RTC registers
-    let second = read_cmos(0x00);
-    let minute = read_cmos(0x02);
-    let hour = read_cmos(0x04);
-    let day = read_cmos(0x07);
-    let month = read_cmos(0x08);
-    let year = read_cmos(0x09);
-    let century = read_cmos(0x32); // May not be available
-
-    // Check if BCD mode
-    let status_b = read_cmos(0x0B);
-    let is_bcd = (status_b & 0x04) == 0;
-
-    let convert = |val: u8| -> u8 {
-        if is_bcd {
-            (val & 0x0F) + ((val >> 4) * 10)
-        } else {
-            val
-        }
-    };
-
-    let second = convert(second);
-    let minute = convert(minute);
-    let hour = convert(hour);
-    let day = convert(day);
-    let month = convert(month);
-    let year = convert(year);
-    let century = if century > 0 { convert(century) } else { 20 };
-
-    let full_year = (century as u16) * 100 + (year as u16);
-
-    (full_year, month, day, hour, minute, second)
-}
-
-/// Read a CMOS register
-fn read_cmos(reg: u8) -> u8 {
-    unsafe {
-        x86_out8(0x70, reg);
-        x86_in8(0x71)
-    }
-}
+// read_rtc_time is now shared via crate::efi::auth::time::read_rtc_time()
 
 /// Port I/O functions - wrapper for arch module
 #[inline]

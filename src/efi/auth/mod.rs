@@ -104,6 +104,95 @@ pub(crate) fn parse_der_length(data: &[u8]) -> Result<(usize, usize), AuthError>
 }
 
 // ============================================================================
+// Disk Search Helpers
+// ============================================================================
+
+/// Iterate over all available block devices (NVMe, AHCI, SDHCI) and call a
+/// function on each. Returns `Some(T)` as soon as the callback returns `Some`.
+///
+/// This avoids duplicating the controller-enumeration boilerplate in
+/// `key_files.rs` and `dbx_update.rs`.
+pub(crate) fn search_all_disks<T>(
+    mut f: impl FnMut(&mut dyn crate::drivers::block::BlockDevice, &'static str) -> Option<T>,
+) -> Option<T> {
+    // NVMe
+    if let Some(result) = search_nvme_disks(&mut f) {
+        return Some(result);
+    }
+
+    // AHCI
+    if let Some(result) = search_ahci_disks(&mut f) {
+        return Some(result);
+    }
+
+    // SDHCI
+    search_sdhci_disks(&mut f)
+}
+
+fn search_nvme_disks<T>(
+    f: &mut impl FnMut(&mut dyn crate::drivers::block::BlockDevice, &'static str) -> Option<T>,
+) -> Option<T> {
+    use crate::drivers::{block::NvmeDisk, nvme};
+
+    // First borrow: get namespace info, then drop the reference
+    let nsid = {
+        let controller_ptr = nvme::get_controller(0)?;
+        let controller = unsafe { &*controller_ptr };
+        controller.default_namespace().map(|ns| ns.nsid)?
+    };
+
+    // Second borrow: create disk for I/O
+    let controller_ptr = nvme::get_controller(0)?;
+    let controller = unsafe { &mut *controller_ptr };
+    let mut disk = NvmeDisk::new(controller, nsid);
+    f(&mut disk, "NVMe")
+}
+
+fn search_ahci_disks<T>(
+    f: &mut impl FnMut(&mut dyn crate::drivers::block::BlockDevice, &'static str) -> Option<T>,
+) -> Option<T> {
+    use crate::drivers::{ahci, block::AhciDisk};
+
+    let controller_ptr = ahci::get_controller(0)?;
+    let num_ports = unsafe { &*controller_ptr }.num_active_ports();
+
+    for port_index in 0..num_ports {
+        if let Some(controller_ptr) = ahci::get_controller(0) {
+            let controller = unsafe { &mut *controller_ptr };
+            let mut disk = AhciDisk::new(controller, port_index);
+            if let Some(result) = f(&mut disk, "SATA") {
+                return Some(result);
+            }
+        }
+    }
+
+    None
+}
+
+fn search_sdhci_disks<T>(
+    f: &mut impl FnMut(&mut dyn crate::drivers::block::BlockDevice, &'static str) -> Option<T>,
+) -> Option<T> {
+    use crate::drivers::{block::SdhciDisk, sdhci};
+
+    for controller_id in 0..sdhci::controller_count() {
+        let controller_ptr = sdhci::get_controller(controller_id)?;
+        let controller = unsafe { &mut *controller_ptr };
+        if !controller.is_ready() {
+            continue;
+        }
+
+        let controller_ptr = sdhci::get_controller(controller_id)?;
+        let controller = unsafe { &mut *controller_ptr };
+        let mut disk = SdhciDisk::new(controller);
+        if let Some(result) = f(&mut disk, "SD") {
+            return Some(result);
+        }
+    }
+
+    None
+}
+
+// ============================================================================
 // Variable Attributes
 // ============================================================================
 

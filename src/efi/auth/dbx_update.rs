@@ -45,7 +45,7 @@ use super::variables::{KeyDatabaseEntry, dbx_database, kek_database, pk_database
 use super::{
     AuthError, EFI_CERT_SHA256_GUID, EFI_CERT_TYPE_PKCS7_GUID, EFI_CERT_X509_GUID, is_setup_mode,
 };
-use crate::drivers::block::{AhciDisk, BlockDevice, NvmeDisk, SdhciDisk};
+use crate::drivers::block::BlockDevice;
 use crate::fs::fat::FatFilesystem;
 use crate::fs::gpt;
 use alloc::vec::Vec;
@@ -134,99 +134,7 @@ fn search_all_disks_for_dbx(
     paths: &[&str],
     _authenticated: bool,
 ) -> Option<(Vec<u8>, &'static str)> {
-    // Try NVMe devices
-    if let Some(result) = search_nvme_for_dbx(paths) {
-        return Some(result);
-    }
-
-    // Try AHCI devices
-    if let Some(result) = search_ahci_for_dbx(paths) {
-        return Some(result);
-    }
-
-    // Try SDHCI devices
-    if let Some(result) = search_sdhci_for_dbx(paths) {
-        return Some(result);
-    }
-
-    None
-}
-
-/// Search NVMe devices for dbx files
-fn search_nvme_for_dbx(paths: &[&str]) -> Option<(Vec<u8>, &'static str)> {
-    use crate::drivers::nvme;
-
-    if let Some(controller_ptr) = nvme::get_controller(0) {
-        // Safety: pointer valid for firmware lifetime; no overlapping &mut created
-        let controller = unsafe { &mut *controller_ptr };
-        if let Some(ns) = controller.default_namespace() {
-            let nsid = ns.nsid;
-
-            if let Some(controller_ptr) = nvme::get_controller(0) {
-                // Safety: pointer valid for firmware lifetime; no overlapping &mut created
-                let controller = unsafe { &mut *controller_ptr };
-                let mut disk = NvmeDisk::new(controller, nsid);
-
-                if let Some(result) = search_disk_for_dbx(&mut disk, "NVMe", paths) {
-                    return Some(result);
-                }
-            }
-        }
-    }
-
-    None
-}
-
-/// Search AHCI devices for dbx files
-fn search_ahci_for_dbx(paths: &[&str]) -> Option<(Vec<u8>, &'static str)> {
-    use crate::drivers::ahci;
-
-    if let Some(controller_ptr) = ahci::get_controller(0) {
-        // Safety: pointer valid for firmware lifetime; no overlapping &mut created
-        let controller = unsafe { &mut *controller_ptr };
-        let num_ports = controller.num_active_ports();
-
-        for port_index in 0..num_ports {
-            if let Some(controller_ptr) = ahci::get_controller(0) {
-                // Safety: pointer valid for firmware lifetime; no overlapping &mut created
-                let controller = unsafe { &mut *controller_ptr };
-                let mut disk = AhciDisk::new(controller, port_index);
-
-                if let Some(result) = search_disk_for_dbx(&mut disk, "SATA", paths) {
-                    return Some(result);
-                }
-            }
-        }
-    }
-
-    None
-}
-
-/// Search SDHCI devices for dbx files
-fn search_sdhci_for_dbx(paths: &[&str]) -> Option<(Vec<u8>, &'static str)> {
-    use crate::drivers::sdhci;
-
-    for controller_id in 0..sdhci::controller_count() {
-        if let Some(controller_ptr) = sdhci::get_controller(controller_id) {
-            // Safety: pointer valid for firmware lifetime
-            let controller = unsafe { &mut *controller_ptr };
-            if !controller.is_ready() {
-                continue;
-            }
-
-            if let Some(controller_ptr) = sdhci::get_controller(controller_id) {
-                // Safety: pointer valid for firmware lifetime
-                let controller = unsafe { &mut *controller_ptr };
-                let mut disk = SdhciDisk::new(controller);
-
-                if let Some(result) = search_disk_for_dbx(&mut disk, "SD", paths) {
-                    return Some(result);
-                }
-            }
-        }
-    }
-
-    None
+    super::search_all_disks(|disk, label| search_disk_for_dbx(disk, label, paths))
 }
 
 /// Search a disk for ESP partitions with dbx files

@@ -254,26 +254,15 @@ fn get_variable_data(guid: &r_efi::efi::Guid, name: &[u16]) -> Option<Vec<u8>> {
     let mut result: Option<Vec<u8>> = None;
 
     state::with_efi_mut(|efi| {
-        for var in &efi.variables {
-            if !var.in_use {
-                continue;
-            }
-
-            // Compare GUID
-            if var.vendor_guid != *guid {
-                continue;
-            }
-
-            // Compare name
-            if !crate::efi::utils::ucs2_eq(&var.name, name) {
-                continue;
-            }
-
-            // Found the variable - copy data
-            let data = var.data[..var.data_size].to_vec();
-            result = Some(data);
-            break;
-        }
+        result = efi
+            .variables
+            .iter()
+            .find(|var| {
+                var.in_use
+                    && var.vendor_guid == *guid
+                    && crate::efi::utils::ucs2_eq(&var.name, name)
+            })
+            .map(|var| var.data[..var.data_size].to_vec());
     });
 
     result

@@ -17,7 +17,7 @@
 
 use super::enrollment::{self, CRABEFI_OWNER_GUID};
 use super::{AuthError, enter_user_mode};
-use crate::drivers::block::{AhciDisk, BlockDevice, NvmeDisk, SdhciDisk};
+use crate::drivers::block::BlockDevice;
 use crate::fs::fat::FatFilesystem;
 use crate::fs::gpt;
 use alloc::vec::Vec;
@@ -68,93 +68,7 @@ pub struct KeyFileSearchResult {
 
 /// Search all available ESPs for key files
 pub fn find_key_files() -> Option<KeyFileSearchResult> {
-    // Try NVMe devices
-    if let Some(result) = search_nvme_devices() {
-        return Some(result);
-    }
-
-    // Try AHCI devices
-    if let Some(result) = search_ahci_devices() {
-        return Some(result);
-    }
-
-    // Try SDHCI devices
-    if let Some(result) = search_sdhci_devices() {
-        return Some(result);
-    }
-
-    None
-}
-
-/// Search NVMe devices for key files
-fn search_nvme_devices() -> Option<KeyFileSearchResult> {
-    use crate::drivers::nvme;
-
-    // First borrow: get namespace info, then drop the reference
-    let nsid = {
-        let controller_ptr = nvme::get_controller(0)?;
-        let controller = unsafe { &*controller_ptr };
-        controller.default_namespace().map(|ns| ns.nsid)?
-    };
-
-    // Second borrow: use the controller for disk I/O (no aliased &mut)
-    let controller_ptr = nvme::get_controller(0)?;
-    let controller = unsafe { &mut *controller_ptr };
-    let mut disk = NvmeDisk::new(controller, nsid);
-
-    search_disk_for_keys(&mut disk, "NVMe")
-}
-
-/// Search AHCI devices for key files
-fn search_ahci_devices() -> Option<KeyFileSearchResult> {
-    use crate::drivers::ahci;
-
-    if let Some(controller_ptr) = ahci::get_controller(0) {
-        // Safety: pointer valid for firmware lifetime; no overlapping &mut created
-        let controller = unsafe { &mut *controller_ptr };
-        let num_ports = controller.num_active_ports();
-
-        for port_index in 0..num_ports {
-            if let Some(controller_ptr) = ahci::get_controller(0) {
-                // Safety: pointer valid for firmware lifetime; no overlapping &mut created
-                let controller = unsafe { &mut *controller_ptr };
-                let mut disk = AhciDisk::new(controller, port_index);
-
-                if let Some(result) = search_disk_for_keys(&mut disk, "SATA") {
-                    return Some(result);
-                }
-            }
-        }
-    }
-
-    None
-}
-
-/// Search SDHCI devices for key files
-fn search_sdhci_devices() -> Option<KeyFileSearchResult> {
-    use crate::drivers::sdhci;
-
-    for controller_id in 0..sdhci::controller_count() {
-        if let Some(controller_ptr) = sdhci::get_controller(controller_id) {
-            // Safety: pointer valid for firmware lifetime
-            let controller = unsafe { &mut *controller_ptr };
-            if !controller.is_ready() {
-                continue;
-            }
-
-            if let Some(controller_ptr) = sdhci::get_controller(controller_id) {
-                // Safety: pointer valid for firmware lifetime
-                let controller = unsafe { &mut *controller_ptr };
-                let mut disk = SdhciDisk::new(controller);
-
-                if let Some(result) = search_disk_for_keys(&mut disk, "SD") {
-                    return Some(result);
-                }
-            }
-        }
-    }
-
-    None
+    super::search_all_disks(|disk, label| search_disk_for_keys(disk, label))
 }
 
 /// Search a disk for ESP partitions with key files

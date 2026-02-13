@@ -83,8 +83,8 @@ pub(crate) fn x509_time_to_unix(time: &x509_cert::time::Time) -> Result<i64, Aut
 pub(crate) fn read_rtc_time() -> (u16, u8, u8, u8, u8, u8) {
     use crate::arch::x86_64::io;
 
-    // Wait for RTC update to complete
-    loop {
+    // Wait for RTC update to complete (bounded to avoid infinite loop)
+    for _ in 0..10_000 {
         unsafe {
             io::outb(0x70, 0x0A);
             if io::inb(0x71) & 0x80 == 0 {
