@@ -230,33 +230,7 @@ impl PciAccess for AnyPciAccess {
         }
     }
 
-    fn read16(&self, addr: PciAddress, offset: u16) -> u16 {
-        match self {
-            Self::IoCam(a) => a.read16(addr, offset),
-            Self::Ecam(a) => a.read16(addr, offset),
-        }
-    }
-
-    fn write16(&self, addr: PciAddress, offset: u16, value: u16) {
-        match self {
-            Self::IoCam(a) => a.write16(addr, offset, value),
-            Self::Ecam(a) => a.write16(addr, offset, value),
-        }
-    }
-
-    fn read8(&self, addr: PciAddress, offset: u16) -> u8 {
-        match self {
-            Self::IoCam(a) => a.read8(addr, offset),
-            Self::Ecam(a) => a.read8(addr, offset),
-        }
-    }
-
-    fn write8(&self, addr: PciAddress, offset: u16, value: u8) {
-        match self {
-            Self::IoCam(a) => a.write8(addr, offset, value),
-            Self::Ecam(a) => a.write8(addr, offset, value),
-        }
-    }
+    // read16, write16, read8, write8 use trait defaults (implemented via read32/write32)
 
     fn name(&self) -> &'static str {
         match self {

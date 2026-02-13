@@ -124,6 +124,16 @@ pub fn init() {
         (*idt)[19].set_handler(exception_19 as *const () as u64);
         (*idt)[20].set_handler(exception_20 as *const () as u64);
         (*idt)[21].set_handler(exception_21_ec as *const () as u64);
+        (*idt)[22].set_handler(exception_22 as *const () as u64);
+        (*idt)[23].set_handler(exception_23 as *const () as u64);
+        (*idt)[24].set_handler(exception_24 as *const () as u64);
+        (*idt)[25].set_handler(exception_25 as *const () as u64);
+        (*idt)[26].set_handler(exception_26 as *const () as u64);
+        (*idt)[27].set_handler(exception_27 as *const () as u64);
+        (*idt)[28].set_handler(exception_28 as *const () as u64);
+        (*idt)[29].set_handler(exception_29_ec as *const () as u64);
+        (*idt)[30].set_handler(exception_30_ec as *const () as u64);
+        (*idt)[31].set_handler(exception_31 as *const () as u64);
 
         // Load the IDT
         let idt_ptr = IdtPointer {
@@ -301,3 +311,13 @@ exception_no_error!(exception_18, 18);
 exception_no_error!(exception_19, 19);
 exception_no_error!(exception_20, 20);
 exception_with_error!(exception_21_ec, 21);
+exception_no_error!(exception_22, 22);
+exception_no_error!(exception_23, 23);
+exception_no_error!(exception_24, 24);
+exception_no_error!(exception_25, 25);
+exception_no_error!(exception_26, 26);
+exception_no_error!(exception_27, 27);
+exception_no_error!(exception_28, 28);
+exception_with_error!(exception_29_ec, 29);
+exception_with_error!(exception_30_ec, 30);
+exception_no_error!(exception_31, 31);

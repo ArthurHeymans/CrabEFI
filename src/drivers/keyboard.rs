@@ -243,18 +243,27 @@ impl KeyboardState {
     }
 
     /// Send a command to the keyboard (port 0x60) and wait for ACK
+    ///
+    /// Retries up to 3 times if the keyboard responds with RESEND (0xFE).
     fn send_keyboard_cmd(&self, command: u8) -> bool {
-        if !self.wait_input_ready() {
-            return false;
-        }
-        self.ports.data.set(command);
+        for _ in 0..3 {
+            if !self.wait_input_ready() {
+                return false;
+            }
+            self.ports.data.set(command);
 
-        // Wait for response
-        if !self.wait_output_ready() {
-            return false;
-        }
+            // Wait for response
+            if !self.wait_output_ready() {
+                return false;
+            }
 
-        self.ports.data.get() == response::ACK
+            match self.ports.data.get() {
+                response::ACK => return true,
+                response::RESEND => continue,
+                _ => return false,
+            }
+        }
+        false
     }
 
     /// Flush any pending data from the controller
