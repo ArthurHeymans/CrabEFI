@@ -469,257 +469,159 @@ fn boot_selected_entry(entry: &menu::BootEntry) {
     }
 }
 
-/// Boot a UEFI entry (EFI application or UKI)
+/// Store a device globally for SimpleFileSystem reads.
 ///
-/// Uses the unified boot module to handle all storage types generically.
-/// The per-device-type code is limited to:
-/// 1. Storing the device globally (for SimpleFileSystem reads)
-/// 2. Getting disk info (num_blocks, block_size)
-/// 3. Creating a disk to pass to the generic functions
-fn boot_uefi_entry(entry: &menu::BootEntry) {
-    use drivers::storage::{self, StorageType};
+/// Each device type has its own `store_global_device()` with different parameters.
+/// This dispatches to the right one based on the device type.
+fn store_device_globally(device_type: &menu::DeviceType) -> bool {
+    match *device_type {
+        menu::DeviceType::Nvme {
+            controller_id,
+            nsid,
+        } => drivers::nvme::store_global_device(controller_id, nsid),
+        menu::DeviceType::Ahci {
+            controller_id,
+            port,
+        } => drivers::ahci::store_global_device(controller_id, port),
+        // USB devices are stored globally during enumeration, not here
+        menu::DeviceType::Usb { .. } => true,
+        menu::DeviceType::Sdhci { controller_id } => {
+            drivers::sdhci::store_global_device(controller_id)
+        }
+    }
+}
 
-    let path_info = boot::device_path_info_from_entry(entry);
+/// Convert a menu device type to a storage type for BlockIO registration.
+fn storage_type_from(device_type: &menu::DeviceType) -> drivers::storage::StorageType {
+    use drivers::storage::StorageType;
+    match *device_type {
+        menu::DeviceType::Nvme {
+            controller_id,
+            nsid,
+        } => StorageType::Nvme {
+            controller_id,
+            nsid,
+        },
+        menu::DeviceType::Ahci {
+            controller_id,
+            port,
+        } => StorageType::Ahci {
+            controller_id,
+            port,
+        },
+        menu::DeviceType::Usb { .. } => StorageType::Usb { slot_id: 0 },
+        menu::DeviceType::Sdhci { controller_id } => StorageType::Sdhci { controller_id },
+    }
+}
 
-    // Per-device-type: store globally, get info, register, install BlockIO, then boot
-    match entry.device_type {
+/// Create a block device from a device type and call the provided closure with it.
+///
+/// This centralizes the per-device-type controller acquisition and disk creation
+/// so that callers only need the generic `&mut dyn BlockDevice` interface.
+///
+/// # Returns
+/// `Some(R)` if the device was created and the closure returned a value,
+/// `None` if the device could not be created.
+fn with_disk<R>(
+    device_type: &menu::DeviceType,
+    f: impl FnOnce(&mut dyn drivers::block::BlockDevice) -> R,
+) -> Option<R> {
+    match *device_type {
         menu::DeviceType::Nvme {
             controller_id,
             nsid,
         } => {
-            if !drivers::nvme::store_global_device(controller_id, nsid) {
-                log::error!("Failed to store NVMe device globally");
-                return;
-            }
-
-            if let Some(controller_ptr) = drivers::nvme::get_controller(controller_id) {
-                // Safety: pointer valid for firmware lifetime; no overlapping &mut created
-                let controller = unsafe { &mut *controller_ptr };
-                let (num_blocks, block_size) = match controller.default_namespace() {
-                    Some(ns) => (ns.num_blocks, ns.block_size),
-                    None => {
-                        log::error!("Failed to get NVMe namespace info");
-                        return;
-                    }
-                };
-
-                let storage_id = match storage::register_device(
-                    StorageType::Nvme {
-                        controller_id,
-                        nsid,
-                    },
-                    num_blocks,
-                    block_size,
-                ) {
-                    Some(id) => id,
-                    None => {
-                        log::error!("Failed to register device");
-                        return;
-                    }
-                };
-
-                let mut disk = NvmeDisk::new(controller, nsid);
-                let _ = boot::install_block_io_protocols(
-                    &mut disk, storage_id, block_size, num_blocks, &path_info,
-                );
-            }
-
-            // Re-create disk for ESP boot (previous borrows ended)
-            if let Some(controller_ptr) = drivers::nvme::get_controller(controller_id) {
-                // Safety: pointer valid for firmware lifetime; no overlapping &mut created
-                let controller = unsafe { &mut *controller_ptr };
-                let info = match controller.default_namespace() {
-                    Some(ns) => (ns.num_blocks, ns.block_size),
-                    None => {
-                        log::error!("Failed to get NVMe namespace for ESP boot");
-                        return;
-                    }
-                };
-                let mut disk = NvmeDisk::new(controller, nsid);
-                if boot::try_boot_from_esp(
-                    &mut disk,
-                    &entry.partition,
-                    entry.partition_num,
-                    &path_info,
-                    &entry.device_type,
-                    info.0,
-                    info.1,
-                ) {
-                    return;
-                }
-            }
-            log::error!("Failed to boot NVMe entry");
+            let controller = unsafe { &mut *drivers::nvme::get_controller(controller_id)? };
+            let mut disk = NvmeDisk::new(controller, nsid);
+            Some(f(&mut disk))
         }
         menu::DeviceType::Ahci {
             controller_id,
             port,
         } => {
-            if !drivers::ahci::store_global_device(controller_id, port) {
-                log::error!("Failed to store AHCI device globally");
-                return;
-            }
-
-            if let Some(controller_ptr) = drivers::ahci::get_controller(controller_id) {
-                // Safety: pointer valid for firmware lifetime; no overlapping &mut created
-                let controller = unsafe { &mut *controller_ptr };
-                let (num_blocks, block_size) = match controller.get_port(port) {
-                    Some(port_info) => (port_info.sector_count, port_info.sector_size),
-                    None => {
-                        log::error!("Failed to get AHCI port info");
-                        return;
-                    }
-                };
-
-                let storage_id = match storage::register_device(
-                    StorageType::Ahci {
-                        controller_id,
-                        port,
-                    },
-                    num_blocks,
-                    block_size,
-                ) {
-                    Some(id) => id,
-                    None => {
-                        log::error!("Failed to register device");
-                        return;
-                    }
-                };
-
-                let mut disk = AhciDisk::new(controller, port);
-                let _ = boot::install_block_io_protocols(
-                    &mut disk, storage_id, block_size, num_blocks, &path_info,
-                );
-            }
-
-            if let Some(controller_ptr) = drivers::ahci::get_controller(controller_id) {
-                // Safety: pointer valid for firmware lifetime; no overlapping &mut created
-                let controller = unsafe { &mut *controller_ptr };
-                let info = match controller.get_port(port) {
-                    Some(p) => (p.sector_count, p.sector_size),
-                    None => return,
-                };
-                let mut disk = AhciDisk::new(controller, port);
-                if boot::try_boot_from_esp(
-                    &mut disk,
-                    &entry.partition,
-                    entry.partition_num,
-                    &path_info,
-                    &entry.device_type,
-                    info.0,
-                    info.1,
-                ) {
-                    return;
-                }
-            }
-            log::error!("Failed to boot AHCI entry");
+            let controller = unsafe { &mut *drivers::ahci::get_controller(controller_id)? };
+            let mut disk = AhciDisk::new(controller, port);
+            Some(f(&mut disk))
         }
         menu::DeviceType::Usb {
             controller_id,
             device_addr: _,
         } => {
-            let controller_ptr = match drivers::usb::get_controller_ptr(controller_id) {
-                Some(ptr) => ptr,
-                None => {
-                    log::error!("Failed to get USB controller {}", controller_id);
-                    return;
-                }
-            };
-
-            if let Some(usb_device) = drivers::usb::mass_storage::get_global_device() {
-                let num_blocks = usb_device.num_blocks;
-                let block_size = usb_device.block_size;
-
-                let storage_id = match storage::register_device(
-                    StorageType::Usb { slot_id: 0 },
-                    num_blocks,
-                    block_size,
-                ) {
-                    Some(id) => id,
-                    None => {
-                        log::error!("Failed to register device");
-                        return;
-                    }
-                };
-
-                // Safety: controller_ptr is valid for the entire boot process
-                let controller = unsafe { &mut *controller_ptr };
-                if let Some(usb_device) = drivers::usb::mass_storage::get_global_device() {
-                    let mut disk = UsbDisk::new(usb_device, controller);
-                    let _ = boot::install_block_io_protocols(
-                        &mut disk, storage_id, block_size, num_blocks, &path_info,
-                    );
-                }
-
-                // Re-borrow for ESP boot
-                let controller = unsafe { &mut *controller_ptr };
-                if let Some(usb_device) = drivers::usb::mass_storage::get_global_device() {
-                    let mut disk = UsbDisk::new(usb_device, controller);
-                    if boot::try_boot_from_esp(
-                        &mut disk,
-                        &entry.partition,
-                        entry.partition_num,
-                        &path_info,
-                        &entry.device_type,
-                        num_blocks,
-                        block_size,
-                    ) {
-                        return;
-                    }
-                }
-            }
-            log::error!("Failed to boot USB entry");
+            let controller_ptr = drivers::usb::get_controller_ptr(controller_id)?;
+            let controller = unsafe { &mut *controller_ptr };
+            let usb_device = drivers::usb::mass_storage::get_global_device()?;
+            let mut disk = UsbDisk::new(usb_device, controller);
+            Some(f(&mut disk))
         }
         menu::DeviceType::Sdhci { controller_id } => {
-            if !drivers::sdhci::store_global_device(controller_id) {
-                log::error!("Failed to store SDHCI device globally");
-                return;
-            }
-
-            if let Some(controller_ptr) = drivers::sdhci::get_controller(controller_id) {
-                // Safety: pointer valid for firmware lifetime
-                let controller = unsafe { &mut *controller_ptr };
-                let num_blocks = controller.num_blocks();
-                let block_size = controller.block_size();
-
-                let storage_id = match storage::register_device(
-                    StorageType::Sdhci { controller_id },
-                    num_blocks,
-                    block_size,
-                ) {
-                    Some(id) => id,
-                    None => {
-                        log::error!("Failed to register device");
-                        return;
-                    }
-                };
-
-                let mut disk = SdhciDisk::new(controller);
-                let _ = boot::install_block_io_protocols(
-                    &mut disk, storage_id, block_size, num_blocks, &path_info,
-                );
-            }
-
-            if let Some(controller_ptr) = drivers::sdhci::get_controller(controller_id) {
-                // Safety: pointer valid for firmware lifetime
-                let controller = unsafe { &mut *controller_ptr };
-                let num_blocks = controller.num_blocks();
-                let block_size = controller.block_size();
-                let mut disk = SdhciDisk::new(controller);
-                if boot::try_boot_from_esp(
-                    &mut disk,
-                    &entry.partition,
-                    entry.partition_num,
-                    &path_info,
-                    &entry.device_type,
-                    num_blocks,
-                    block_size,
-                ) {
-                    return;
-                }
-            }
-            log::error!("Failed to boot SDHCI entry");
+            let controller = unsafe { &mut *drivers::sdhci::get_controller(controller_id)? };
+            let mut disk = SdhciDisk::new(controller);
+            Some(f(&mut disk))
         }
     }
+}
+
+/// Boot a UEFI entry (EFI application or UKI)
+///
+/// Uses the unified boot module to handle all storage types generically.
+/// Device-specific logic is encapsulated in `store_device_globally()` and
+/// `with_disk()`, keeping this function device-agnostic.
+fn boot_uefi_entry(entry: &menu::BootEntry) {
+    use drivers::storage;
+
+    let path_info = boot::device_path_info_from_entry(entry);
+
+    // Phase 1: Store device globally and install BlockIO protocols
+    if !store_device_globally(&entry.device_type) {
+        log::error!("Failed to store device globally");
+        return;
+    }
+
+    if with_disk(&entry.device_type, |disk| {
+        let info = disk.info();
+        let storage_id = match storage::register_device(
+            storage_type_from(&entry.device_type),
+            info.num_blocks,
+            info.block_size,
+        ) {
+            Some(id) => id,
+            None => {
+                log::error!("Failed to register device");
+                return;
+            }
+        };
+        let _ = boot::install_block_io_protocols(
+            disk,
+            storage_id,
+            info.block_size,
+            info.num_blocks,
+            &path_info,
+        );
+    })
+    .is_none()
+    {
+        log::error!("Failed to create disk for BlockIO installation");
+        return;
+    }
+
+    // Phase 2: Re-create disk for ESP boot (previous borrows ended)
+    let booted = with_disk(&entry.device_type, |disk| {
+        let info = disk.info();
+        boot::try_boot_from_esp(
+            disk,
+            &entry.partition,
+            entry.partition_num,
+            &path_info,
+            &entry.device_type,
+            info.num_blocks,
+            info.block_size,
+        )
+    });
+
+    if booted == Some(true) {
+        return;
+    }
+    log::error!("Failed to boot UEFI entry");
 }
 
 /// Boot Linux from a block device (shared logic for all device types)
@@ -853,124 +755,28 @@ fn boot_linux_entry(
         if framebuffer.is_some() { "yes" } else { "no" }
     );
 
-    // Dispatch based on device type - each arm does device-specific setup,
-    // then delegates to boot_linux_from_device for the shared load+boot logic.
-    match entry.device_type {
-        menu::DeviceType::Nvme {
-            controller_id,
-            nsid,
-        } => {
-            if !drivers::nvme::store_global_device(controller_id, nsid) {
-                log::error!("Failed to store NVMe device globally");
-                return;
-            }
+    // Store device globally for SimpleFileSystem reads, then create a disk
+    // and delegate to boot_linux_from_device for the shared load+boot logic.
+    if !store_device_globally(&entry.device_type) {
+        log::error!("Failed to store device globally");
+        return;
+    }
 
-            if let Some(controller_ptr) = drivers::nvme::get_controller(controller_id) {
-                // Safety: pointer valid for firmware lifetime; no overlapping &mut created
-                let controller = unsafe { &mut *controller_ptr };
-                log::info!("Got NVMe controller {}", controller_id);
-                let mut disk = NvmeDisk::new(controller, nsid);
-                boot_linux_from_device(
-                    &mut disk,
-                    entry.partition.first_lba,
-                    &kernel_path,
-                    initrd_fat_path.as_deref(),
-                    cmdline,
-                    &memory_regions,
-                    acpi_rsdp,
-                    framebuffer.as_ref(),
-                );
-            } else {
-                log::error!("Failed to get NVMe controller {}", controller_id);
-            }
-        }
-
-        menu::DeviceType::Ahci {
-            controller_id,
-            port,
-        } => {
-            if !drivers::ahci::store_global_device(controller_id, port) {
-                log::error!("Failed to store AHCI device globally");
-                return;
-            }
-
-            if let Some(controller_ptr) = drivers::ahci::get_controller(controller_id) {
-                // Safety: pointer valid for firmware lifetime; no overlapping &mut created
-                let controller = unsafe { &mut *controller_ptr };
-                log::info!("Got AHCI controller {}", controller_id);
-                let mut disk = AhciDisk::new(controller, port);
-                boot_linux_from_device(
-                    &mut disk,
-                    entry.partition.first_lba,
-                    &kernel_path,
-                    initrd_fat_path.as_deref(),
-                    cmdline,
-                    &memory_regions,
-                    acpi_rsdp,
-                    framebuffer.as_ref(),
-                );
-            } else {
-                log::error!("Failed to get AHCI controller {}", controller_id);
-            }
-        }
-
-        menu::DeviceType::Usb {
-            controller_id,
-            device_addr: _,
-        } => {
-            let controller_ptr = match drivers::usb::get_controller_ptr(controller_id) {
-                Some(ptr) => ptr,
-                None => {
-                    log::error!("Failed to get USB controller {}", controller_id);
-                    return;
-                }
-            };
-
-            if let Some(usb_device) = drivers::usb::mass_storage::get_global_device() {
-                log::info!("Got USB mass storage device");
-                // Safety: controller_ptr is valid for the entire boot process
-                let controller = unsafe { &mut *controller_ptr };
-                let mut disk = UsbDisk::new(usb_device, controller);
-                boot_linux_from_device(
-                    &mut disk,
-                    entry.partition.first_lba,
-                    &kernel_path,
-                    initrd_fat_path.as_deref(),
-                    cmdline,
-                    &memory_regions,
-                    acpi_rsdp,
-                    framebuffer.as_ref(),
-                );
-            } else {
-                log::error!("USB mass storage device not available");
-            }
-        }
-
-        menu::DeviceType::Sdhci { controller_id } => {
-            if !drivers::sdhci::store_global_device(controller_id) {
-                log::error!("Failed to store SDHCI device globally");
-                return;
-            }
-
-            if let Some(controller_ptr) = drivers::sdhci::get_controller(controller_id) {
-                // Safety: pointer valid for firmware lifetime
-                let controller = unsafe { &mut *controller_ptr };
-                log::info!("Got SDHCI controller {}", controller_id);
-                let mut disk = SdhciDisk::new(controller);
-                boot_linux_from_device(
-                    &mut disk,
-                    entry.partition.first_lba,
-                    &kernel_path,
-                    initrd_fat_path.as_deref(),
-                    cmdline,
-                    &memory_regions,
-                    acpi_rsdp,
-                    framebuffer.as_ref(),
-                );
-            } else {
-                log::error!("Failed to get SDHCI controller {}", controller_id);
-            }
-        }
+    if with_disk(&entry.device_type, |disk| {
+        boot_linux_from_device(
+            disk,
+            entry.partition.first_lba,
+            &kernel_path,
+            initrd_fat_path.as_deref(),
+            cmdline,
+            &memory_regions,
+            acpi_rsdp,
+            framebuffer.as_ref(),
+        );
+    })
+    .is_none()
+    {
+        log::error!("Failed to create disk for Linux boot");
     }
 
     // Note: We intentionally don't fall back to UEFI boot here.

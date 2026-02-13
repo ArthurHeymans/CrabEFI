@@ -38,8 +38,8 @@ use r_efi::efi::Status;
 ///
 /// # Returns
 /// The ESP partition and its 1-based partition number, if found
-pub fn install_block_io_protocols<D: BlockDevice>(
-    disk: &mut D,
+pub fn install_block_io_protocols(
+    disk: &mut dyn BlockDevice,
     storage_id: u32,
     block_size: u32,
     num_blocks: u64,
@@ -281,8 +281,8 @@ fn create_storage_type(device_type: &menu::DeviceType) -> StorageType {
 /// * `device_type` - Device type for creating block device and storage registration
 /// * `num_blocks` - Total number of blocks on the device
 /// * `block_size` - Block size in bytes
-pub fn try_boot_from_esp<D: BlockDevice>(
-    disk: &mut D,
+pub fn try_boot_from_esp(
+    disk: &mut dyn BlockDevice,
     esp: &fs::gpt::Partition,
     partition_num: u32,
     path_info: &DevicePathInfo,
