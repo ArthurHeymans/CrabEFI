@@ -217,16 +217,14 @@ fn create_block_device_for_sfs(
             controller_id,
             nsid,
         } => {
-            let block_dev =
-                NvmeBlockDevice::new(controller_id, nsid, num_blocks, block_size, 0);
+            let block_dev = NvmeBlockDevice::new(controller_id, nsid, num_blocks, block_size, 0);
             Some(AnyBlockDevice::Nvme(block_dev))
         }
         menu::DeviceType::Ahci {
             controller_id,
             port,
         } => {
-            let block_dev =
-                AhciBlockDevice::new(controller_id, port, num_blocks, block_size, 0);
+            let block_dev = AhciBlockDevice::new(controller_id, port, num_blocks, block_size, 0);
             Some(AnyBlockDevice::Ahci(block_dev))
         }
         menu::DeviceType::Usb {
@@ -238,8 +236,7 @@ fn create_block_device_for_sfs(
             Some(AnyBlockDevice::Usb(block_dev))
         }
         menu::DeviceType::Sdhci { controller_id } => {
-            let block_dev =
-                SdhciBlockDevice::new(controller_id, num_blocks, block_size, 0);
+            let block_dev = SdhciBlockDevice::new(controller_id, num_blocks, block_size, 0);
             Some(AnyBlockDevice::Sdhci(block_dev))
         }
     }

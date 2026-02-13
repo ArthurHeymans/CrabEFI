@@ -519,7 +519,9 @@ impl<'a> FatFilesystem<'a> {
         let data_start = root_dir_start + root_dir_sectors;
 
         // Calculate total data clusters (with underflow protection for malformed BPBs)
-        let data_sectors = total_sectors.checked_sub(data_start).ok_or(FatError::InvalidBpb)?;
+        let data_sectors = total_sectors
+            .checked_sub(data_start)
+            .ok_or(FatError::InvalidBpb)?;
         let data_clusters = data_sectors / sectors_per_cluster as u32;
 
         // Determine FAT type

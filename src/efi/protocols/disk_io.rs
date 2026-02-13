@@ -8,7 +8,7 @@
 use core::ffi::c_void;
 use r_efi::efi::{Handle, Status};
 
-use super::block_io::{BlockIoProtocol, BLOCK_IO_PROTOCOL_GUID};
+use super::block_io::{BLOCK_IO_PROTOCOL_GUID, BlockIoProtocol};
 use crate::efi::boot_services;
 use crate::efi::utils::allocate_protocol_with_log;
 

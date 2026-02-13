@@ -558,10 +558,7 @@ fn find_initrd_address(boot_params: &BootParams, size: u64) -> Result<u64, Linux
     }
 
     let addr = best_addr.ok_or_else(|| {
-        log::error!(
-            "No suitable RAM region found for initrd ({} bytes)",
-            size
-        );
+        log::error!("No suitable RAM region found for initrd ({} bytes)", size);
         LinuxBootError::MemoryError
     })?;
 

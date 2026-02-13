@@ -4,8 +4,8 @@
 //! authenticated variables.
 
 use super::structures::{EfiTime, EfiVariableAuthentication2};
-use super::variables::{db_database, dbx_database, kek_database, pk_database, SecureBootVariable};
-use super::{is_setup_mode, AuthError, WIN_CERT_TYPE_EFI_GUID};
+use super::variables::{SecureBootVariable, db_database, dbx_database, kek_database, pk_database};
+use super::{AuthError, WIN_CERT_TYPE_EFI_GUID, is_setup_mode};
 use alloc::vec::Vec;
 use r_efi::efi::Guid;
 

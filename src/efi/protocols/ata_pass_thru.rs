@@ -314,9 +314,11 @@ extern "efiapi" fn ata_pass_thru(
     };
 
     // Find the port index that matches the requested port number
-    let port_index = match (0..controller.num_active_ports())
-        .find(|&i| controller.get_port(i).is_some_and(|p| p.port_num as u16 == port))
-    {
+    let port_index = match (0..controller.num_active_ports()).find(|&i| {
+        controller
+            .get_port(i)
+            .is_some_and(|p| p.port_num as u16 == port)
+    }) {
         Some(idx) => idx,
         None => {
             log::error!("AtaPassThru.PassThru: port {} not found", port);

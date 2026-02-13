@@ -729,14 +729,12 @@ fn name_eq_slice(a: &[u16], b: &[u16]) -> bool {
 /// to avoid unbounded reads from the name pointer.
 fn name_eq_const(name: *const u16, expected: &[u16]) -> bool {
     let expected_len = crate::efi::utils::ucs2_len(expected);
-    for i in 0..expected_len {
+    let matches = (0..expected_len).all(|i| {
         let a = unsafe { *name.add(i) };
-        if a != expected[i] {
-            return false;
-        }
-    }
+        a == expected[i]
+    });
     // Check that the name pointer is also null-terminated at this position
-    unsafe { *name.add(expected_len) == 0 }
+    matches && unsafe { *name.add(expected_len) == 0 }
 }
 
 extern "efiapi" fn get_next_variable_name(

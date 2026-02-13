@@ -7,7 +7,7 @@
 use r_efi::efi::{Guid, Status};
 
 use crate::coreboot::FramebufferInfo;
-use crate::efi::allocator::{allocate_pool, MemoryType};
+use crate::efi::allocator::{MemoryType, allocate_pool};
 use crate::efi::utils::allocate_protocol_with_log;
 use crate::state;
 

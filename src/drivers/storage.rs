@@ -110,7 +110,7 @@ pub fn read_sectors(device_id: u32, lba: u64, buffer: &mut [u8]) -> Result<(), (
             if let Some(controller_ptr) = crate::drivers::nvme::get_controller(controller_id) {
                 // Safety: pointer valid for firmware lifetime; no overlapping &mut created
                 let controller = unsafe { &mut *controller_ptr };
-                let num_sectors = (buffer.len() as u32 + device.block_size - 1) / device.block_size;
+                let num_sectors = (buffer.len() as u32).div_ceil(device.block_size);
                 controller
                     .read_sectors(nsid, lba, num_sectors, buffer.as_mut_ptr())
                     .map_err(|e| {
@@ -127,7 +127,7 @@ pub fn read_sectors(device_id: u32, lba: u64, buffer: &mut [u8]) -> Result<(), (
         } => {
             if let Some(controller_ptr) = crate::drivers::ahci::get_controller(controller_id) {
                 let controller = unsafe { &mut *controller_ptr };
-                let num_sectors = (buffer.len() as u32 + device.block_size - 1) / device.block_size;
+                let num_sectors = (buffer.len() as u32).div_ceil(device.block_size);
                 unsafe {
                     controller
                         .read_sectors(port, lba, num_sectors, buffer.as_mut_ptr())

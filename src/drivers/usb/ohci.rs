@@ -550,9 +550,7 @@ impl OhciController {
         // FSLargestDataPacket = ((FrameInterval - 210) * 6 / 7) per OHCI spec
         let frame_interval = fminterval & 0x3FFF;
         let fslpd = ((frame_interval.saturating_sub(210)) * 6) / 7;
-        let new_fminterval = frame_interval
-            | (fslpd << 16)
-            | (!fminterval_toggle & (1 << 31));
+        let new_fminterval = frame_interval | (fslpd << 16) | (!fminterval_toggle & (1 << 31));
         self.write_reg(regs::HCFMINTERVAL, new_fminterval);
 
         // Set periodic start (90% of frame interval)
