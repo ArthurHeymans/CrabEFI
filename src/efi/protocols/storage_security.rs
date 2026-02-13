@@ -72,6 +72,7 @@ pub struct StorageSecurityCommandProtocol {
 }
 
 /// Internal context for Storage Security protocol instance
+#[derive(Clone, Copy)]
 struct StorageSecurityContext {
     /// Media ID (for validation)
     media_id: u32,
@@ -79,36 +80,21 @@ struct StorageSecurityContext {
     storage_type: StorageType,
 }
 
+use super::context_map::ProtocolContextMap;
+
 /// Maximum number of Storage Security protocol instances
 const MAX_INSTANCES: usize = 16;
 
-/// Global storage for contexts
-static mut CONTEXTS: [Option<StorageSecurityContext>; MAX_INSTANCES] =
-    [const { None }; MAX_INSTANCES];
-
-/// Protocol instance to context mapping
-static mut PROTOCOL_TO_CONTEXT: [Option<*mut StorageSecurityCommandProtocol>; MAX_INSTANCES] =
-    [const { None }; MAX_INSTANCES];
-
-/// Find context index for a protocol instance
-fn find_context_index(protocol: *mut StorageSecurityCommandProtocol) -> Option<usize> {
-    unsafe {
-        let proto_map = core::ptr::addr_of!(PROTOCOL_TO_CONTEXT);
-        (*proto_map)
-            .iter()
-            .position(|p| p.is_some_and(|ptr| ptr == protocol))
-    }
-}
+/// Protocol-to-context map
+static CTX_MAP: ProtocolContextMap<
+    StorageSecurityContext,
+    StorageSecurityCommandProtocol,
+    MAX_INSTANCES,
+> = ProtocolContextMap::new();
 
 /// Get context for a protocol instance
-fn get_context(
-    protocol: *mut StorageSecurityCommandProtocol,
-) -> Option<&'static StorageSecurityContext> {
-    let idx = find_context_index(protocol)?;
-    unsafe {
-        let contexts = core::ptr::addr_of!(CONTEXTS);
-        (*contexts)[idx].as_ref()
-    }
+fn get_context(protocol: *mut StorageSecurityCommandProtocol) -> Option<StorageSecurityContext> {
+    CTX_MAP.get(protocol)
 }
 
 /// Receive data from security subsystem
@@ -456,14 +442,11 @@ pub fn create_storage_security_protocol(
     storage_type: StorageType,
 ) -> *mut StorageSecurityCommandProtocol {
     // Find a free context slot
-    let ctx_idx = unsafe {
-        let contexts = core::ptr::addr_of!(CONTEXTS);
-        match (*contexts).iter().position(|slot| slot.is_none()) {
-            Some(i) => i,
-            None => {
-                log::error!("StorageSecurity: no free context slots");
-                return core::ptr::null_mut();
-            }
+    let ctx_idx = match CTX_MAP.find_free_slot() {
+        Some(i) => i,
+        None => {
+            log::error!("StorageSecurity: no free context slots");
+            return core::ptr::null_mut();
         }
     };
 
@@ -481,15 +464,14 @@ pub fn create_storage_security_protocol(
     }
 
     // Store context
-    unsafe {
-        let contexts = core::ptr::addr_of_mut!(CONTEXTS);
-        (*contexts)[ctx_idx] = Some(StorageSecurityContext {
+    CTX_MAP.store(
+        ctx_idx,
+        StorageSecurityContext {
             media_id,
             storage_type,
-        });
-        let proto_map = core::ptr::addr_of_mut!(PROTOCOL_TO_CONTEXT);
-        (*proto_map)[ctx_idx] = Some(protocol_ptr);
-    }
+        },
+        protocol_ptr,
+    );
 
     log::info!(
         "StorageSecurity: created protocol (media={}, type={:?})",

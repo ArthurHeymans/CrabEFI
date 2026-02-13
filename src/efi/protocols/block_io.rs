@@ -76,6 +76,7 @@ pub struct BlockIoProtocol {
 }
 
 /// Internal context for BlockIO protocol instance
+#[derive(Clone, Copy)]
 struct BlockIoContext {
     /// Media ID (matches BlockIoMedia.media_id)
     media_id: u32,
@@ -89,26 +90,14 @@ struct BlockIoContext {
     block_size: u32,
 }
 
+use super::context_map::ProtocolContextMap;
+
 /// Maximum number of BlockIO instances
 const MAX_BLOCK_IO_INSTANCES: usize = 16;
 
-/// Global storage for BlockIO contexts
-static mut BLOCK_IO_CONTEXTS: [Option<BlockIoContext>; MAX_BLOCK_IO_INSTANCES] =
-    [const { None }; MAX_BLOCK_IO_INSTANCES];
-
-/// Protocol instance to context mapping
-static mut PROTOCOL_TO_CONTEXT: [Option<*mut BlockIoProtocol>; MAX_BLOCK_IO_INSTANCES] =
-    [const { None }; MAX_BLOCK_IO_INSTANCES];
-
-/// Find context index for a protocol instance
-fn find_context_index(protocol: *mut BlockIoProtocol) -> Option<usize> {
-    unsafe {
-        let contexts = core::ptr::addr_of!(PROTOCOL_TO_CONTEXT);
-        (*contexts)
-            .iter()
-            .position(|p| p.is_some_and(|ptr| ptr == protocol))
-    }
-}
+/// Protocol-to-context map
+static CTX_MAP: ProtocolContextMap<BlockIoContext, BlockIoProtocol, MAX_BLOCK_IO_INSTANCES> =
+    ProtocolContextMap::new();
 
 /// Reset the block device
 extern "efiapi" fn block_io_reset(
@@ -133,19 +122,11 @@ extern "efiapi" fn block_io_read_blocks(
         return Status::INVALID_PARAMETER;
     }
 
-    let ctx_idx = match find_context_index(this) {
-        Some(idx) => idx,
+    let ctx = match CTX_MAP.get(this) {
+        Some(c) => c,
         None => {
             log::error!("BlockIO.ReadBlocks: unknown protocol instance");
             return Status::INVALID_PARAMETER;
-        }
-    };
-
-    let ctx = unsafe {
-        let contexts = core::ptr::addr_of!(BLOCK_IO_CONTEXTS);
-        match &(*contexts)[ctx_idx] {
-            Some(c) => c,
-            None => return Status::INVALID_PARAMETER,
         }
     };
 
@@ -283,14 +264,11 @@ fn create_block_io_internal(
     is_partition: bool,
 ) -> *mut BlockIoProtocol {
     // Find a free context slot
-    let ctx_idx = unsafe {
-        let contexts = core::ptr::addr_of!(BLOCK_IO_CONTEXTS);
-        match (*contexts).iter().position(|slot| slot.is_none()) {
-            Some(i) => i,
-            None => {
-                log::error!("BlockIO: no free context slots");
-                return core::ptr::null_mut();
-            }
+    let ctx_idx = match CTX_MAP.find_free_slot() {
+        Some(i) => i,
+        None => {
+            log::error!("BlockIO: no free context slots");
+            return core::ptr::null_mut();
         }
     };
 
@@ -326,18 +304,17 @@ fn create_block_io_internal(
     }
 
     // Store context
-    unsafe {
-        let contexts = core::ptr::addr_of_mut!(BLOCK_IO_CONTEXTS);
-        (*contexts)[ctx_idx] = Some(BlockIoContext {
+    CTX_MAP.store(
+        ctx_idx,
+        BlockIoContext {
             media_id,
             storage_device_id,
             start_lba,
             num_blocks,
             block_size,
-        });
-        let proto_map = core::ptr::addr_of_mut!(PROTOCOL_TO_CONTEXT);
-        (*proto_map)[ctx_idx] = Some(protocol_ptr);
-    }
+        },
+        protocol_ptr,
+    );
 
     let kind = if is_partition { "partition" } else { "disk" };
     log::info!(

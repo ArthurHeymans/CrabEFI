@@ -48,29 +48,18 @@ pub struct DiskIoProtocol {
 /// Maximum number of DiskIO instances (must match MAX_BLOCK_IO_INSTANCES)
 const MAX_DISK_IO_INSTANCES: usize = 16;
 
+use super::context_map::ProtocolContextMap;
+
 /// DiskIO context: stores the handle so we can find BlockIO at read time
+#[derive(Clone, Copy)]
 struct DiskIoContext {
     /// Handle on which both DiskIO and BlockIO are installed
     handle: Handle,
 }
 
-/// Global storage for DiskIO contexts
-static mut DISK_IO_CONTEXTS: [Option<DiskIoContext>; MAX_DISK_IO_INSTANCES] =
-    [const { None }; MAX_DISK_IO_INSTANCES];
-
-/// Protocol instance to context mapping
-static mut PROTOCOL_TO_CONTEXT: [Option<*mut DiskIoProtocol>; MAX_DISK_IO_INSTANCES] =
-    [const { None }; MAX_DISK_IO_INSTANCES];
-
-/// Find context index for a protocol instance
-fn find_context_index(protocol: *mut DiskIoProtocol) -> Option<usize> {
-    unsafe {
-        let map = core::ptr::addr_of!(PROTOCOL_TO_CONTEXT);
-        (*map)
-            .iter()
-            .position(|p| p.is_some_and(|ptr| ptr == protocol))
-    }
-}
+/// Protocol-to-context map
+static CTX_MAP: ProtocolContextMap<DiskIoContext, DiskIoProtocol, MAX_DISK_IO_INSTANCES> =
+    ProtocolContextMap::new();
 
 /// Read from the disk at a byte offset
 ///
@@ -94,19 +83,11 @@ extern "efiapi" fn disk_io_read_disk(
         buffer_size
     );
 
-    let ctx_idx = match find_context_index(this) {
-        Some(idx) => idx,
+    let handle = match CTX_MAP.get(this) {
+        Some(c) => c.handle,
         None => {
             log::error!("DiskIO.ReadDisk: unknown protocol instance");
             return Status::INVALID_PARAMETER;
-        }
-    };
-
-    let handle = unsafe {
-        let contexts = core::ptr::addr_of!(DISK_IO_CONTEXTS);
-        match &(*contexts)[ctx_idx] {
-            Some(c) => c.handle,
-            None => return Status::INVALID_PARAMETER,
         }
     };
 
@@ -218,14 +199,11 @@ pub fn install_disk_io_on_handle(handle: Handle) {
     }
 
     // Find a free context slot
-    let ctx_idx = unsafe {
-        let contexts = core::ptr::addr_of!(DISK_IO_CONTEXTS);
-        match (*contexts).iter().position(|slot| slot.is_none()) {
-            Some(i) => i,
-            None => {
-                log::error!("DiskIO: no free context slots");
-                return;
-            }
+    let ctx_idx = match CTX_MAP.find_free_slot() {
+        Some(i) => i,
+        None => {
+            log::error!("DiskIO: no free context slots");
+            return;
         }
     };
 
@@ -241,12 +219,7 @@ pub fn install_disk_io_on_handle(handle: Handle) {
     }
 
     // Store context
-    unsafe {
-        let contexts = core::ptr::addr_of_mut!(DISK_IO_CONTEXTS);
-        (*contexts)[ctx_idx] = Some(DiskIoContext { handle });
-        let proto_map = core::ptr::addr_of_mut!(PROTOCOL_TO_CONTEXT);
-        (*proto_map)[ctx_idx] = Some(protocol_ptr);
-    }
+    CTX_MAP.store(ctx_idx, DiskIoContext { handle }, protocol_ptr);
 
     // Install on the handle
     let status = boot_services::install_protocol(

@@ -6,6 +6,7 @@ pub mod ata_pass_thru;
 pub mod block_io;
 pub mod console;
 pub mod console_control;
+pub mod context_map;
 pub mod device_path;
 pub mod disk_io;
 pub mod graphics_output;

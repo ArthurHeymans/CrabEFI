@@ -225,6 +225,7 @@ pub struct AtaPassThruProtocol {
 }
 
 /// Internal context for ATA Pass Thru protocol instance
+#[derive(Clone, Copy)]
 struct AtaPassThruContext {
     /// Controller index in the global controller list
     controller_index: usize,
@@ -234,33 +235,18 @@ struct AtaPassThruContext {
     pci_function: u8,
 }
 
+use super::context_map::ProtocolContextMap;
+
 /// Maximum number of ATA Pass Thru protocol instances
 const MAX_INSTANCES: usize = 8;
 
-/// Global storage for contexts
-static mut CONTEXTS: [Option<AtaPassThruContext>; MAX_INSTANCES] = [const { None }; MAX_INSTANCES];
-
-/// Protocol instance to context mapping
-static mut PROTOCOL_TO_CONTEXT: [Option<*mut AtaPassThruProtocol>; MAX_INSTANCES] =
-    [const { None }; MAX_INSTANCES];
-
-/// Find context index for a protocol instance
-fn find_context_index(protocol: *mut AtaPassThruProtocol) -> Option<usize> {
-    unsafe {
-        let proto_map = core::ptr::addr_of!(PROTOCOL_TO_CONTEXT);
-        (*proto_map)
-            .iter()
-            .position(|p| p.is_some_and(|ptr| ptr == protocol))
-    }
-}
+/// Protocol-to-context map
+static CTX_MAP: ProtocolContextMap<AtaPassThruContext, AtaPassThruProtocol, MAX_INSTANCES> =
+    ProtocolContextMap::new();
 
 /// Get context for a protocol instance
-fn get_context(protocol: *mut AtaPassThruProtocol) -> Option<&'static AtaPassThruContext> {
-    let idx = find_context_index(protocol)?;
-    unsafe {
-        let contexts = core::ptr::addr_of!(CONTEXTS);
-        (*contexts)[idx].as_ref()
-    }
+fn get_context(protocol: *mut AtaPassThruProtocol) -> Option<AtaPassThruContext> {
+    CTX_MAP.get(protocol)
 }
 
 // ============================================================================
@@ -676,14 +662,11 @@ pub fn create_ata_pass_thru_protocol(
     pci_function: u8,
 ) -> *mut AtaPassThruProtocol {
     // Find a free context slot
-    let ctx_idx = unsafe {
-        let contexts = core::ptr::addr_of!(CONTEXTS);
-        match (*contexts).iter().position(|slot| slot.is_none()) {
-            Some(i) => i,
-            None => {
-                log::error!("AtaPassThru: no free context slots");
-                return core::ptr::null_mut();
-            }
+    let ctx_idx = match CTX_MAP.find_free_slot() {
+        Some(i) => i,
+        None => {
+            log::error!("AtaPassThru: no free context slots");
+            return core::ptr::null_mut();
         }
     };
 
@@ -722,16 +705,15 @@ pub fn create_ata_pass_thru_protocol(
     }
 
     // Store context
-    unsafe {
-        let contexts = core::ptr::addr_of_mut!(CONTEXTS);
-        (*contexts)[ctx_idx] = Some(AtaPassThruContext {
+    CTX_MAP.store(
+        ctx_idx,
+        AtaPassThruContext {
             controller_index,
             pci_device,
             pci_function,
-        });
-        let proto_map = core::ptr::addr_of_mut!(PROTOCOL_TO_CONTEXT);
-        (*proto_map)[ctx_idx] = Some(protocol_ptr);
-    }
+        },
+        protocol_ptr,
+    );
 
     log::info!(
         "AtaPassThru: created protocol for controller {} (PCI {:02x}:{:x})",

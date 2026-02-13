@@ -177,6 +177,7 @@ pub struct ExtScsiPassThruProtocol {
 }
 
 /// Internal context for SCSI Pass Thru protocol instance
+#[derive(Clone, Copy)]
 struct ScsiPassThruContext {
     /// USB controller index
     controller_index: usize,
@@ -190,37 +191,22 @@ struct ScsiPassThruContext {
     usb_port: u8,
 }
 
+use super::context_map::ProtocolContextMap;
+
 /// Maximum number of SCSI Pass Thru protocol instances
 const MAX_INSTANCES: usize = 8;
 
-/// Global storage for contexts
-static mut CONTEXTS: [Option<ScsiPassThruContext>; MAX_INSTANCES] = [const { None }; MAX_INSTANCES];
-
-/// Protocol instance to context mapping
-static mut PROTOCOL_TO_CONTEXT: [Option<*mut ExtScsiPassThruProtocol>; MAX_INSTANCES] =
-    [const { None }; MAX_INSTANCES];
+/// Protocol-to-context map
+static CTX_MAP: ProtocolContextMap<ScsiPassThruContext, ExtScsiPassThruProtocol, MAX_INSTANCES> =
+    ProtocolContextMap::new();
 
 /// Target ID storage for each instance
 static mut TARGET_IDS: [[u8; TARGET_MAX_BYTES]; MAX_INSTANCES] =
     [[0; TARGET_MAX_BYTES]; MAX_INSTANCES];
 
-/// Find context index for a protocol instance
-fn find_context_index(protocol: *mut ExtScsiPassThruProtocol) -> Option<usize> {
-    unsafe {
-        let proto_map = core::ptr::addr_of!(PROTOCOL_TO_CONTEXT);
-        (*proto_map)
-            .iter()
-            .position(|p| p.is_some_and(|ptr| ptr == protocol))
-    }
-}
-
 /// Get context for a protocol instance
-fn get_context(protocol: *mut ExtScsiPassThruProtocol) -> Option<&'static ScsiPassThruContext> {
-    let idx = find_context_index(protocol)?;
-    unsafe {
-        let contexts = core::ptr::addr_of!(CONTEXTS);
-        (*contexts)[idx].as_ref()
-    }
+fn get_context(protocol: *mut ExtScsiPassThruProtocol) -> Option<ScsiPassThruContext> {
+    CTX_MAP.get(protocol)
 }
 
 // ============================================================================
@@ -426,7 +412,7 @@ extern "efiapi" fn scsi_get_next_target_lun(
         return Status::INVALID_PARAMETER;
     }
 
-    let ctx_idx = match find_context_index(this) {
+    let ctx_idx = match CTX_MAP.find_index(this) {
         Some(i) => i,
         None => {
             log::error!("ScsiPassThru.GetNextTargetLun: unknown protocol instance");
@@ -513,7 +499,7 @@ extern "efiapi" fn scsi_get_target_lun(
         return Status::INVALID_PARAMETER;
     }
 
-    let ctx_idx = match find_context_index(this) {
+    let ctx_idx = match CTX_MAP.find_index(this) {
         Some(i) => i,
         None => {
             log::error!("ScsiPassThru.GetTargetLun: unknown protocol instance");
@@ -603,7 +589,7 @@ extern "efiapi" fn scsi_get_next_target(
         return Status::INVALID_PARAMETER;
     }
 
-    let ctx_idx = match find_context_index(this) {
+    let ctx_idx = match CTX_MAP.find_index(this) {
         Some(i) => i,
         None => {
             log::error!("ScsiPassThru.GetNextTarget: unknown protocol instance");
@@ -664,14 +650,11 @@ pub fn create_scsi_pass_thru_protocol(
     usb_port: u8,
 ) -> *mut ExtScsiPassThruProtocol {
     // Find a free context slot
-    let ctx_idx = unsafe {
-        let contexts = core::ptr::addr_of!(CONTEXTS);
-        match (*contexts).iter().position(|slot| slot.is_none()) {
-            Some(i) => i,
-            None => {
-                log::error!("ScsiPassThru: no free context slots");
-                return core::ptr::null_mut();
-            }
+    let ctx_idx = match CTX_MAP.find_free_slot() {
+        Some(i) => i,
+        None => {
+            log::error!("ScsiPassThru: no free context slots");
+            return core::ptr::null_mut();
         }
     };
 
@@ -705,18 +688,17 @@ pub fn create_scsi_pass_thru_protocol(
     }
 
     // Store context
-    unsafe {
-        let contexts = core::ptr::addr_of_mut!(CONTEXTS);
-        (*contexts)[ctx_idx] = Some(ScsiPassThruContext {
+    CTX_MAP.store(
+        ctx_idx,
+        ScsiPassThruContext {
             controller_index,
             device_addr,
             pci_device,
             pci_function,
             usb_port,
-        });
-        let proto_map = core::ptr::addr_of_mut!(PROTOCOL_TO_CONTEXT);
-        (*proto_map)[ctx_idx] = Some(protocol_ptr);
-    }
+        },
+        protocol_ptr,
+    );
 
     log::info!(
         "ScsiPassThru: created protocol for USB device {} on controller {} (PCI {:02x}:{:x}, port {})",
