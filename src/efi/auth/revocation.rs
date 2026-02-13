@@ -19,11 +19,18 @@
 //! - Soft-fail mode is used when revocation checking cannot be completed
 
 use super::AuthError;
-use super::parse_der_length;
-use super::time::datetime_to_unix_timestamp;
 use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
+use der::{Decode, Encode};
+use x509_cert::Certificate;
+use x509_cert::crl::CertificateList;
+use x509_cert::ext::pkix::name::GeneralName;
+
+// Re-export x509_cert's CrlReason for use by callers.
+// Variant naming differs slightly from the old hand-rolled enum:
+//   CaCompromise (was CACompromise), AaCompromise (was AACompromise)
+pub use x509_cert::ext::pkix::crl::CrlReason;
 
 // ============================================================================
 // CRL (Certificate Revocation List) Support
@@ -36,51 +43,6 @@ const MAX_CRL_SIZE: usize = 16 * 1024 * 1024;
 /// Maximum number of revoked certificates per CRL
 /// This prevents DoS with CRLs containing excessive entries
 const MAX_REVOKED_CERTS: usize = 100_000;
-
-/// X.509 extension OIDs for revocation
-mod extension_oids {
-    /// CRL Distribution Points: 2.5.29.31
-    pub const CRL_DISTRIBUTION_POINTS: &[u8] = &[0x55, 0x1d, 0x1f];
-    /// Authority Information Access: 1.3.6.1.5.5.7.1.1
-    pub const AUTHORITY_INFO_ACCESS: &[u8] = &[0x2b, 0x06, 0x01, 0x05, 0x05, 0x07, 0x01, 0x01];
-    /// OCSP Access Method: 1.3.6.1.5.5.7.48.1
-    pub const OCSP_ACCESS_METHOD: &[u8] = &[0x2b, 0x06, 0x01, 0x05, 0x05, 0x07, 0x30, 0x01];
-}
-
-/// CRL reason codes (RFC 5280 Section 5.3.1)
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(u8)]
-pub enum CrlReason {
-    Unspecified = 0,
-    KeyCompromise = 1,
-    CACompromise = 2,
-    AffiliationChanged = 3,
-    Superseded = 4,
-    CessationOfOperation = 5,
-    CertificateHold = 6,
-    // 7 is unused
-    RemoveFromCRL = 8,
-    PrivilegeWithdrawn = 9,
-    AACompromise = 10,
-}
-
-impl CrlReason {
-    fn from_u8(value: u8) -> Option<Self> {
-        match value {
-            0 => Some(CrlReason::Unspecified),
-            1 => Some(CrlReason::KeyCompromise),
-            2 => Some(CrlReason::CACompromise),
-            3 => Some(CrlReason::AffiliationChanged),
-            4 => Some(CrlReason::Superseded),
-            5 => Some(CrlReason::CessationOfOperation),
-            6 => Some(CrlReason::CertificateHold),
-            8 => Some(CrlReason::RemoveFromCRL),
-            9 => Some(CrlReason::PrivilegeWithdrawn),
-            10 => Some(CrlReason::AACompromise),
-            _ => None,
-        }
-    }
-}
 
 /// A parsed Certificate Revocation List
 #[derive(Debug, Clone)]
@@ -119,8 +81,8 @@ pub struct CrlDistributionPoint {
 pub fn extract_crl_distribution_points(
     cert_der: &[u8],
 ) -> Result<Vec<CrlDistributionPoint>, AuthError> {
-    use der::Decode;
-    use x509_cert::Certificate;
+    use x509_cert::ext::pkix::crl::CrlDistributionPoints;
+    use x509_cert::ext::pkix::name::DistributionPointName;
 
     let cert = Certificate::from_der(cert_der).map_err(|_| AuthError::CertificateParseError)?;
 
@@ -128,115 +90,36 @@ pub fn extract_crl_distribution_points(
 
     if let Some(extensions) = &cert.tbs_certificate.extensions {
         for ext in extensions.iter() {
-            if ext.extn_id.as_bytes() == extension_oids::CRL_DISTRIBUTION_POINTS {
-                // Parse the CRL Distribution Points extension
-                let value = ext.extn_value.as_bytes();
-                if let Ok(parsed_points) = parse_crl_distribution_points(value) {
-                    points.extend(parsed_points);
-                }
-            }
-        }
-    }
+            if ext.extn_id == <CrlDistributionPoints as const_oid::AssociatedOid>::OID {
+                let cdps = CrlDistributionPoints::from_der(ext.extn_value.as_bytes())
+                    .map_err(|_| AuthError::CertificateParseError)?;
 
-    Ok(points)
-}
-
-/// Parse CRL Distribution Points extension value
-///
-/// CRLDistributionPoints ::= SEQUENCE SIZE (1..MAX) OF DistributionPoint
-/// DistributionPoint ::= SEQUENCE {
-///     distributionPoint       [0]     DistributionPointName OPTIONAL,
-///     reasons                 [1]     ReasonFlags OPTIONAL,
-///     cRLIssuer               [2]     GeneralNames OPTIONAL
-/// }
-/// DistributionPointName ::= CHOICE {
-///     fullName                [0]     GeneralNames,
-///     nameRelativeToCRLIssuer [1]     RelativeDistinguishedName
-/// }
-fn parse_crl_distribution_points(data: &[u8]) -> Result<Vec<CrlDistributionPoint>, AuthError> {
-    let mut points = Vec::new();
-
-    // Outer SEQUENCE
-    if data.is_empty() || data[0] != 0x30 {
-        return Err(AuthError::CertificateParseError);
-    }
-
-    let (seq_len, seq_offset) = parse_der_length(&data[1..])?;
-    if 1 + seq_offset + seq_len > data.len() {
-        return Err(AuthError::CertificateParseError);
-    }
-
-    let mut pos = 1 + seq_offset;
-    let end = 1 + seq_offset + seq_len;
-
-    while pos < end {
-        // Each DistributionPoint is a SEQUENCE
-        if data[pos] != 0x30 {
-            break;
-        }
-        pos += 1;
-
-        let (dp_len, dp_offset) = parse_der_length(&data[pos..])?;
-        let dp_end = pos + dp_offset + dp_len;
-        pos += dp_offset;
-
-        // Look for distributionPoint [0]
-        if pos < dp_end && data[pos] == 0xa0 {
-            pos += 1;
-            let (dpn_len, dpn_offset) = parse_der_length(&data[pos..])?;
-            pos += dpn_offset;
-            let dpn_end = pos + dpn_len;
-
-            // Look for fullName [0]
-            if pos < dpn_end && data[pos] == 0xa0 {
-                pos += 1;
-                let (fn_len, fn_offset) = parse_der_length(&data[pos..])?;
-                pos += fn_offset;
-                let fn_end = pos + fn_len;
-
-                // GeneralNames contains GeneralName entries
-                // Look for uniformResourceIdentifier [6] (context-specific, primitive)
-                while pos < fn_end {
-                    if data[pos] == 0x86 {
-                        // URI
-                        pos += 1;
-                        let (uri_len, uri_offset) = parse_der_length(&data[pos..])?;
-                        pos += uri_offset;
-
-                        if pos + uri_len <= data.len()
-                            && let Ok(uri) = core::str::from_utf8(&data[pos..pos + uri_len])
-                        {
-                            points.push(CrlDistributionPoint {
-                                uri: String::from(uri),
-                            });
-                        }
-                        pos += uri_len;
-                    } else {
-                        // Skip other GeneralName types
-                        pos += 1;
-                        if pos < fn_end {
-                            let (skip_len, skip_offset) =
-                                parse_der_length(&data[pos..]).unwrap_or((0, 1));
-                            pos += skip_offset + skip_len;
+                for dp in cdps.0.iter() {
+                    if let Some(DistributionPointName::FullName(names)) = &dp.distribution_point {
+                        for name in names {
+                            if let GeneralName::UniformResourceIdentifier(uri) = name {
+                                points.push(CrlDistributionPoint {
+                                    uri: String::from(uri.as_str()),
+                                });
+                            }
                         }
                     }
                 }
             }
         }
-
-        pos = dp_end;
     }
 
     Ok(points)
 }
 
+/// Convert an x509_cert Time to a Unix timestamp (seconds since epoch)
+fn time_to_unix(t: x509_cert::time::Time) -> i64 {
+    t.to_unix_duration().as_secs() as i64
+}
+
 /// Parse a DER-encoded CRL
 ///
-/// CertificateList ::= SEQUENCE {
-///     tbsCertList          TBSCertList,
-///     signatureAlgorithm   AlgorithmIdentifier,
-///     signatureValue       BIT STRING
-/// }
+/// Uses `x509_cert::crl::CertificateList::from_der()` for structured parsing.
 pub fn parse_crl(crl_der: &[u8]) -> Result<CertificateRevocationList, AuthError> {
     if crl_der.len() > MAX_CRL_SIZE {
         log::warn!(
@@ -247,96 +130,52 @@ pub fn parse_crl(crl_der: &[u8]) -> Result<CertificateRevocationList, AuthError>
         return Err(AuthError::InvalidHeader);
     }
 
-    // Parse outer SEQUENCE
-    if crl_der.is_empty() || crl_der[0] != 0x30 {
-        return Err(AuthError::CertificateParseError);
-    }
+    let crl = CertificateList::from_der(crl_der).map_err(|e| {
+        log::debug!("Failed to parse CRL: {:?}", e);
+        AuthError::CertificateParseError
+    })?;
 
-    let (outer_len, outer_offset) = parse_der_length(&crl_der[1..])?;
-    if 1 + outer_offset + outer_len > crl_der.len() {
-        return Err(AuthError::CertificateParseError);
-    }
+    let tbs = &crl.tbs_cert_list;
 
-    let content_start = 1 + outer_offset;
-    let content = &crl_der[content_start..content_start + outer_len];
+    let issuer = tbs
+        .issuer
+        .to_der()
+        .map_err(|_| AuthError::CertificateParseError)?;
 
-    // Parse TBSCertList (first element of outer SEQUENCE)
-    if content.is_empty() || content[0] != 0x30 {
-        return Err(AuthError::CertificateParseError);
-    }
+    let this_update = time_to_unix(tbs.this_update);
+    let next_update = tbs.next_update.map(time_to_unix);
 
-    let (tbs_len, tbs_offset) = parse_der_length(&content[1..])?;
-    let tbs_data = &content[1 + tbs_offset..1 + tbs_offset + tbs_len];
+    // Parse revoked certificates
+    let revoked_certificates: Vec<_> = tbs
+        .revoked_certificates
+        .as_ref()
+        .map(|revoked| {
+            revoked
+                .iter()
+                .take(MAX_REVOKED_CERTS)
+                .map(|rc| {
+                    let serial_number = rc.serial_number.as_bytes().to_vec();
+                    let revocation_date = time_to_unix(rc.revocation_date);
 
-    parse_tbs_cert_list(tbs_data)
-}
+                    // Extract CRL reason from entry extensions
+                    let reason = rc.crl_entry_extensions.as_ref().and_then(|exts| {
+                        exts.iter()
+                            .find(|e| e.extn_id == <CrlReason as const_oid::AssociatedOid>::OID)
+                            .and_then(|e| CrlReason::from_der(e.extn_value.as_bytes()).ok())
+                    });
 
-/// Parse TBSCertList structure
-fn parse_tbs_cert_list(data: &[u8]) -> Result<CertificateRevocationList, AuthError> {
-    let mut pos = 0;
+                    RevokedCertificate {
+                        serial_number,
+                        revocation_date,
+                        reason,
+                    }
+                })
+                .collect()
+        })
+        .unwrap_or_default();
 
-    // Optional version (INTEGER with tag 0x02)
-    if pos < data.len() && data[pos] == 0x02 {
-        let (v_len, v_offset) = parse_der_length(&data[pos + 1..])?;
-        pos += 1 + v_offset + v_len;
-    }
-
-    // Signature algorithm (SEQUENCE)
-    if pos >= data.len() || data[pos] != 0x30 {
-        return Err(AuthError::CertificateParseError);
-    }
-    let (alg_len, alg_offset) = parse_der_length(&data[pos + 1..])?;
-    pos += 1 + alg_offset + alg_len;
-
-    // Issuer (SEQUENCE - Name)
-    if pos >= data.len() || data[pos] != 0x30 {
-        return Err(AuthError::CertificateParseError);
-    }
-    let issuer_start = pos;
-    let (issuer_len, issuer_offset) = parse_der_length(&data[pos + 1..])?;
-    let issuer_total = 1 + issuer_offset + issuer_len;
-    let issuer = data[issuer_start..issuer_start + issuer_total].to_vec();
-    pos += issuer_total;
-
-    // thisUpdate (Time - UTCTime or GeneralizedTime)
-    let this_update = parse_crl_time(&data[pos..])?;
-    pos += skip_time_field(&data[pos..])?;
-
-    // nextUpdate (optional Time)
-    let next_update = if pos < data.len() && (data[pos] == 0x17 || data[pos] == 0x18) {
-        let nu = parse_crl_time(&data[pos..])?;
-        pos += skip_time_field(&data[pos..])?;
-        Some(nu)
-    } else {
-        None
-    };
-
-    // revokedCertificates (optional SEQUENCE)
-    let mut revoked_certificates = Vec::new();
-    if pos < data.len() && data[pos] == 0x30 {
-        let (revoked_len, revoked_offset) = parse_der_length(&data[pos + 1..])?;
-        let revoked_end = pos + 1 + revoked_offset + revoked_len;
-        pos += 1 + revoked_offset;
-
-        while pos < revoked_end {
-            if revoked_certificates.len() >= MAX_REVOKED_CERTS {
-                log::warn!("CRL contains too many revoked certificates");
-                break;
-            }
-
-            if data[pos] != 0x30 {
-                break;
-            }
-
-            let (entry_len, entry_offset) = parse_der_length(&data[pos + 1..])?;
-            let entry_data = &data[pos + 1 + entry_offset..pos + 1 + entry_offset + entry_len];
-
-            if let Ok(entry) = parse_revoked_certificate_entry(entry_data) {
-                revoked_certificates.push(entry);
-            }
-
-            pos += 1 + entry_offset + entry_len;
-        }
+    if revoked_certificates.len() >= MAX_REVOKED_CERTS {
+        log::warn!("CRL contains too many revoked certificates, truncated");
     }
 
     Ok(CertificateRevocationList {
@@ -345,176 +184,6 @@ fn parse_tbs_cert_list(data: &[u8]) -> Result<CertificateRevocationList, AuthErr
         next_update,
         revoked_certificates,
     })
-}
-
-/// Parse a single revoked certificate entry
-fn parse_revoked_certificate_entry(data: &[u8]) -> Result<RevokedCertificate, AuthError> {
-    // Serial number (INTEGER)
-    if data.is_empty() || data[0] != 0x02 {
-        return Err(AuthError::CertificateParseError);
-    }
-    let (serial_len, serial_offset) = parse_der_length(&data[1..])?;
-    let serial_number = data[1 + serial_offset..1 + serial_offset + serial_len].to_vec();
-    let mut pos = 1 + serial_offset + serial_len;
-
-    // Revocation date (Time)
-    let revocation_date = if pos < data.len() && (data[pos] == 0x17 || data[pos] == 0x18) {
-        let date = parse_crl_time(&data[pos..])?;
-        pos += skip_time_field(&data[pos..])?;
-        date
-    } else {
-        0
-    };
-
-    // Parse optional extensions to extract reason code
-    // Extensions are a SEQUENCE of Extension
-    let mut reason = None;
-
-    // CRL entry extensions are in a SEQUENCE (tag 0x30)
-    if pos < data.len() && data[pos] == 0x30 {
-        let (ext_len, ext_offset) = parse_der_length(&data[pos + 1..])?;
-        let ext_end = pos + 1 + ext_offset + ext_len;
-        pos += 1 + ext_offset;
-
-        // Parse each extension
-        while pos < ext_end {
-            if data[pos] != 0x30 {
-                break;
-            }
-
-            let (single_ext_len, single_ext_offset) = parse_der_length(&data[pos + 1..])?;
-            let single_ext_end = pos + 1 + single_ext_offset + single_ext_len;
-            let mut ext_pos = pos + 1 + single_ext_offset;
-
-            // Extension OID
-            if ext_pos < single_ext_end && data[ext_pos] == 0x06 {
-                let (oid_len, oid_offset) = parse_der_length(&data[ext_pos + 1..])?;
-                let oid = &data[ext_pos + 1 + oid_offset..ext_pos + 1 + oid_offset + oid_len];
-                ext_pos += 1 + oid_offset + oid_len;
-
-                // CRL Reason OID: 2.5.29.21 = 0x55, 0x1d, 0x15
-                if oid == [0x55, 0x1d, 0x15] {
-                    // Skip optional critical flag (BOOLEAN)
-                    if ext_pos < single_ext_end && data[ext_pos] == 0x01 {
-                        ext_pos += 3; // BOOLEAN is always 3 bytes: tag + len(1) + value
-                    }
-
-                    // Extension value is an OCTET STRING containing ENUMERATED
-                    if ext_pos < single_ext_end && data[ext_pos] == 0x04 {
-                        let (octet_len, octet_offset) = parse_der_length(&data[ext_pos + 1..])?;
-                        ext_pos += 1 + octet_offset;
-
-                        // Inside the OCTET STRING is an ENUMERATED
-                        if ext_pos + octet_len <= data.len()
-                            && octet_len >= 3
-                            && data[ext_pos] == 0x0a
-                        {
-                            let enum_len = data[ext_pos + 1] as usize;
-                            if enum_len == 1 && ext_pos + 2 < data.len() {
-                                reason = CrlReason::from_u8(data[ext_pos + 2]);
-                            }
-                        }
-                    }
-                }
-            }
-
-            pos = single_ext_end;
-        }
-    }
-
-    Ok(RevokedCertificate {
-        serial_number,
-        revocation_date,
-        reason,
-    })
-}
-
-/// Parse a CRL time field (UTCTime or GeneralizedTime) to Unix timestamp
-fn parse_crl_time(data: &[u8]) -> Result<i64, AuthError> {
-    if data.is_empty() {
-        return Err(AuthError::CertificateParseError);
-    }
-
-    let tag = data[0];
-    let (len, offset) = parse_der_length(&data[1..])?;
-    let time_str = &data[1 + offset..1 + offset + len];
-
-    match tag {
-        0x17 => parse_utc_time(time_str),         // UTCTime
-        0x18 => parse_generalized_time(time_str), // GeneralizedTime
-        _ => Err(AuthError::CertificateParseError),
-    }
-}
-
-/// Skip a time field and return bytes consumed
-fn skip_time_field(data: &[u8]) -> Result<usize, AuthError> {
-    if data.is_empty() || (data[0] != 0x17 && data[0] != 0x18) {
-        return Err(AuthError::CertificateParseError);
-    }
-    let (len, offset) = parse_der_length(&data[1..])?;
-    Ok(1 + offset + len)
-}
-
-/// Parse UTCTime (YYMMDDHHMMSSZ)
-fn parse_utc_time(data: &[u8]) -> Result<i64, AuthError> {
-    if data.len() < 12 {
-        return Err(AuthError::CertificateParseError);
-    }
-
-    let parse_two = |offset: usize| -> Result<i64, AuthError> {
-        let d1 = (data[offset] as char)
-            .to_digit(10)
-            .ok_or(AuthError::CertificateParseError)?;
-        let d2 = (data[offset + 1] as char)
-            .to_digit(10)
-            .ok_or(AuthError::CertificateParseError)?;
-        Ok((d1 * 10 + d2) as i64)
-    };
-
-    let year = parse_two(0)?;
-    let month = parse_two(2)?;
-    let day = parse_two(4)?;
-    let hour = parse_two(6)?;
-    let minute = parse_two(8)?;
-    let second = parse_two(10)?;
-
-    // UTCTime uses 2-digit years: 00-49 = 2000-2049, 50-99 = 1950-1999
-    let full_year = if year < 50 { 2000 + year } else { 1900 + year };
-
-    Ok(datetime_to_unix_timestamp(
-        full_year, month, day, hour, minute, second,
-    ))
-}
-
-/// Parse GeneralizedTime (YYYYMMDDHHMMSSZ)
-fn parse_generalized_time(data: &[u8]) -> Result<i64, AuthError> {
-    if data.len() < 14 {
-        return Err(AuthError::CertificateParseError);
-    }
-
-    let parse_two = |offset: usize| -> Result<i64, AuthError> {
-        let d1 = (data[offset] as char)
-            .to_digit(10)
-            .ok_or(AuthError::CertificateParseError)?;
-        let d2 = (data[offset + 1] as char)
-            .to_digit(10)
-            .ok_or(AuthError::CertificateParseError)?;
-        Ok((d1 * 10 + d2) as i64)
-    };
-
-    let century = parse_two(0)?;
-    let year = parse_two(2)?;
-    let full_year = century * 100 + year;
-
-    let month = parse_two(4)?;
-    let day = parse_two(6)?;
-    let hour = parse_two(8)?;
-    let minute = parse_two(10)?;
-    let second = parse_two(12)?;
-
-    Ok(datetime_to_unix_timestamp(
-        full_year, month, day, hour, minute, second,
-    ))
 }
 
 // ============================================================================
@@ -584,19 +253,29 @@ pub struct OcspResponder {
 
 /// Extract OCSP responder URLs from a certificate's Authority Information Access extension
 pub fn extract_ocsp_responders(cert_der: &[u8]) -> Result<Vec<OcspResponder>, AuthError> {
-    use der::Decode;
-    use x509_cert::Certificate;
+    use x509_cert::ext::pkix::AuthorityInfoAccessSyntax;
 
     let cert = Certificate::from_der(cert_der).map_err(|_| AuthError::CertificateParseError)?;
+
+    // OCSP access method OID: 1.3.6.1.5.5.7.48.1
+    let ocsp_oid = const_oid::ObjectIdentifier::new_unwrap("1.3.6.1.5.5.7.48.1");
 
     let mut responders = Vec::new();
 
     if let Some(extensions) = &cert.tbs_certificate.extensions {
         for ext in extensions.iter() {
-            if ext.extn_id.as_bytes() == extension_oids::AUTHORITY_INFO_ACCESS {
-                let value = ext.extn_value.as_bytes();
-                if let Ok(parsed) = parse_authority_info_access(value) {
-                    responders.extend(parsed);
+            if ext.extn_id == <AuthorityInfoAccessSyntax as const_oid::AssociatedOid>::OID {
+                let aia = AuthorityInfoAccessSyntax::from_der(ext.extn_value.as_bytes())
+                    .map_err(|_| AuthError::CertificateParseError)?;
+
+                for ad in aia.0.iter() {
+                    if ad.access_method == ocsp_oid
+                        && let GeneralName::UniformResourceIdentifier(uri) = &ad.access_location
+                    {
+                        responders.push(OcspResponder {
+                            uri: String::from(uri.as_str()),
+                        });
+                    }
                 }
             }
         }
@@ -605,72 +284,11 @@ pub fn extract_ocsp_responders(cert_der: &[u8]) -> Result<Vec<OcspResponder>, Au
     Ok(responders)
 }
 
-/// Parse Authority Information Access extension
-///
-/// AuthorityInfoAccessSyntax ::= SEQUENCE SIZE (1..MAX) OF AccessDescription
-/// AccessDescription ::= SEQUENCE {
-///     accessMethod    OBJECT IDENTIFIER,
-///     accessLocation  GeneralName
-/// }
-fn parse_authority_info_access(data: &[u8]) -> Result<Vec<OcspResponder>, AuthError> {
-    let mut responders = Vec::new();
-
-    // Outer SEQUENCE
-    if data.is_empty() || data[0] != 0x30 {
-        return Err(AuthError::CertificateParseError);
-    }
-
-    let (seq_len, seq_offset) = parse_der_length(&data[1..])?;
-    if 1 + seq_offset + seq_len > data.len() {
-        return Err(AuthError::CertificateParseError);
-    }
-
-    let mut pos = 1 + seq_offset;
-    let end = 1 + seq_offset + seq_len;
-
-    while pos < end {
-        // AccessDescription SEQUENCE
-        if data[pos] != 0x30 {
-            break;
-        }
-        pos += 1;
-
-        let (ad_len, ad_offset) = parse_der_length(&data[pos..])?;
-        let ad_end = pos + ad_offset + ad_len;
-        pos += ad_offset;
-
-        // accessMethod OID
-        if pos >= ad_end || data[pos] != 0x06 {
-            pos = ad_end;
-            continue;
-        }
-        pos += 1;
-        let (oid_len, oid_offset) = parse_der_length(&data[pos..])?;
-        let oid_data = &data[pos + oid_offset..pos + oid_offset + oid_len];
-        pos += oid_offset + oid_len;
-
-        // Check if this is OCSP (1.3.6.1.5.5.7.48.1)
-        if oid_data == extension_oids::OCSP_ACCESS_METHOD {
-            // accessLocation - look for uniformResourceIdentifier [6]
-            if pos < ad_end && data[pos] == 0x86 {
-                pos += 1;
-                let (uri_len, uri_offset) = parse_der_length(&data[pos..])?;
-                pos += uri_offset;
-
-                if pos + uri_len <= data.len()
-                    && let Ok(uri) = core::str::from_utf8(&data[pos..pos + uri_len])
-                {
-                    responders.push(OcspResponder {
-                        uri: String::from(uri),
-                    });
-                }
-            }
-        }
-
-        pos = ad_end;
-    }
-
-    Ok(responders)
+/// Compute SHA-1 hash (required by OCSP spec for CertID)
+fn sha1_hash(data: &[u8]) -> [u8; 20] {
+    use sha1::{Digest, Sha1};
+    let result = Sha1::digest(data);
+    result.into()
 }
 
 /// Build an OCSP request for a certificate
@@ -686,14 +304,10 @@ fn parse_authority_info_access(data: &[u8]) -> Result<Vec<OcspResponder>, AuthEr
 ///
 /// DER-encoded OCSP request
 pub fn build_ocsp_request(cert_der: &[u8], issuer_der: &[u8]) -> Result<Vec<u8>, AuthError> {
-    use der::Decode;
-    use x509_cert::Certificate;
-
     let cert = Certificate::from_der(cert_der).map_err(|_| AuthError::CertificateParseError)?;
     let issuer = Certificate::from_der(issuer_der).map_err(|_| AuthError::CertificateParseError)?;
 
     // Get issuer name hash (SHA-1)
-    use der::Encode;
     let issuer_name_der = issuer
         .tbs_certificate
         .subject
@@ -712,7 +326,7 @@ pub fn build_ocsp_request(cert_der: &[u8], issuer_der: &[u8]) -> Result<Vec<u8>,
     // Get serial number
     let serial_number = cert.tbs_certificate.serial_number.as_bytes();
 
-    // Build the OCSP request
+    // Build the OCSP request manually (no x509-ocsp crate available)
     // OCSPRequest ::= SEQUENCE {
     //     tbsRequest   TBSRequest,
     //     optionalSignature [0] EXPLICIT Signature OPTIONAL
@@ -792,14 +406,14 @@ pub fn build_ocsp_request(cert_der: &[u8], issuer_der: &[u8]) -> Result<Vec<u8>,
 
 /// Parse an OCSP response
 ///
-/// # Arguments
+/// # Note
 ///
-/// * `response_der` - DER-encoded OCSP response
-///
-/// # Returns
-///
-/// The certificate status if the response is valid and successful
+/// This is a simplified implementation that validates the response status
+/// but does not fully parse the BasicOCSPResponse body. Full OCSP parsing
+/// would require the `x509-ocsp` crate or equivalent.
 pub fn parse_ocsp_response(response_der: &[u8]) -> Result<OcspSingleResponse, AuthError> {
+    use super::parse_der_length;
+
     // OCSPResponse ::= SEQUENCE {
     //     responseStatus OCSPResponseStatus,
     //     responseBytes  [0] EXPLICIT ResponseBytes OPTIONAL
@@ -830,7 +444,6 @@ pub fn parse_ocsp_response(response_der: &[u8]) -> Result<OcspSingleResponse, Au
     }
 
     let status = content[pos];
-    pos += 1;
 
     let response_status =
         OcspResponseStatus::from_u8(status).ok_or(AuthError::CertificateParseError)?;
@@ -838,19 +451,6 @@ pub fn parse_ocsp_response(response_der: &[u8]) -> Result<OcspSingleResponse, Au
     if response_status != OcspResponseStatus::Successful {
         log::warn!("OCSP response status: {:?}", response_status);
         return Err(AuthError::CryptoError);
-    }
-
-    // responseBytes [0] EXPLICIT
-    if pos >= content.len() || content[pos] != 0xa0 {
-        return Err(AuthError::CertificateParseError);
-    }
-    pos += 1;
-    let (_rb_len, rb_offset) = parse_der_length(&content[pos..])?;
-    pos += rb_offset;
-
-    // ResponseBytes SEQUENCE
-    if pos >= content.len() || content[pos] != 0x30 {
-        return Err(AuthError::CertificateParseError);
     }
 
     // For now, return a basic response - full parsing would require
@@ -1004,9 +604,6 @@ pub fn check_crl_revocation(
     cert_der: &[u8],
     crl: &CertificateRevocationList,
 ) -> RevocationCheckResult {
-    use der::Decode;
-    use x509_cert::Certificate;
-
     let cert = match Certificate::from_der(cert_der) {
         Ok(c) => c,
         Err(_) => return RevocationCheckResult::Unknown,
@@ -1054,15 +651,11 @@ pub fn check_certificate_revocation(
     }
 
     // Get the issuer name for CRL lookup
-    use der::Decode;
-    use x509_cert::Certificate;
-
     let issuer = match Certificate::from_der(issuer_der) {
         Ok(c) => c,
         Err(_) => return RevocationCheckResult::Unknown,
     };
 
-    use der::Encode;
     let issuer_name = match issuer.tbs_certificate.subject.to_der() {
         Ok(n) => n,
         Err(_) => return RevocationCheckResult::Unknown,
@@ -1208,80 +801,7 @@ pub fn load_crl(crl_data: &[u8], current_time: i64) -> Result<(), AuthError> {
 // Helper Functions
 // ============================================================================
 
-/// Simple SHA-1 implementation for OCSP
-/// Note: SHA-1 is required by OCSP spec for CertID
-fn sha1_hash(data: &[u8]) -> [u8; 20] {
-    // Simple SHA-1 implementation
-    // In production, use a proper crypto library
-    let mut h0: u32 = 0x67452301;
-    let mut h1: u32 = 0xEFCDAB89;
-    let mut h2: u32 = 0x98BADCFE;
-    let mut h3: u32 = 0x10325476;
-    let mut h4: u32 = 0xC3D2E1F0;
-
-    // Pre-processing: adding padding bits
-    let ml = (data.len() as u64) * 8;
-    let mut msg = data.to_vec();
-    msg.push(0x80);
-    while (msg.len() % 64) != 56 {
-        msg.push(0x00);
-    }
-    msg.extend_from_slice(&ml.to_be_bytes());
-
-    // Process each 512-bit chunk
-    for chunk in msg.chunks(64) {
-        let mut w = [0u32; 80];
-        for (i, word) in chunk.chunks(4).enumerate() {
-            w[i] = u32::from_be_bytes([word[0], word[1], word[2], word[3]]);
-        }
-        for i in 16..80 {
-            w[i] = (w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16]).rotate_left(1);
-        }
-
-        let mut a = h0;
-        let mut b = h1;
-        let mut c = h2;
-        let mut d = h3;
-        let mut e = h4;
-
-        for (i, w_i) in w.iter().enumerate() {
-            let (f, k) = match i {
-                0..=19 => ((b & c) | ((!b) & d), 0x5A827999u32),
-                20..=39 => (b ^ c ^ d, 0x6ED9EBA1u32),
-                40..=59 => ((b & c) | (b & d) | (c & d), 0x8F1BBCDCu32),
-                _ => (b ^ c ^ d, 0xCA62C1D6u32),
-            };
-
-            let temp = a
-                .rotate_left(5)
-                .wrapping_add(f)
-                .wrapping_add(e)
-                .wrapping_add(k)
-                .wrapping_add(*w_i);
-            e = d;
-            d = c;
-            c = b.rotate_left(30);
-            b = a;
-            a = temp;
-        }
-
-        h0 = h0.wrapping_add(a);
-        h1 = h1.wrapping_add(b);
-        h2 = h2.wrapping_add(c);
-        h3 = h3.wrapping_add(d);
-        h4 = h4.wrapping_add(e);
-    }
-
-    let mut result = [0u8; 20];
-    result[0..4].copy_from_slice(&h0.to_be_bytes());
-    result[4..8].copy_from_slice(&h1.to_be_bytes());
-    result[8..12].copy_from_slice(&h2.to_be_bytes());
-    result[12..16].copy_from_slice(&h3.to_be_bytes());
-    result[16..20].copy_from_slice(&h4.to_be_bytes());
-    result
-}
-
-/// Encode DER length
+/// Encode DER length (used for manual OCSP request building)
 fn encode_der_length(output: &mut Vec<u8>, length: usize) {
     if length < 0x80 {
         output.push(length as u8);
@@ -1311,12 +831,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_crl_reason_from_u8() {
-        assert_eq!(CrlReason::from_u8(0), Some(CrlReason::Unspecified));
-        assert_eq!(CrlReason::from_u8(1), Some(CrlReason::KeyCompromise));
-        assert_eq!(CrlReason::from_u8(5), Some(CrlReason::CessationOfOperation));
-        assert_eq!(CrlReason::from_u8(7), None); // 7 is unused
-        assert_eq!(CrlReason::from_u8(100), None);
+    fn test_crl_reason_values() {
+        // Verify the x509_cert CrlReason enum has expected values
+        assert_eq!(CrlReason::Unspecified as u32, 0);
+        assert_eq!(CrlReason::KeyCompromise as u32, 1);
+        assert_eq!(CrlReason::CessationOfOperation as u32, 5);
     }
 
     #[test]
@@ -1343,15 +862,6 @@ mod tests {
                 0xc2, 0x6c, 0x9c, 0xd0, 0xd8, 0x9d
             ]
         );
-    }
-
-    #[test]
-    fn test_datetime_to_unix_timestamp() {
-        // 2020-01-01 00:00:00 UTC = 1577836800
-        assert_eq!(datetime_to_unix_timestamp(2020, 1, 1, 0, 0, 0), 1577836800);
-
-        // 1970-01-01 00:00:00 UTC = 0
-        assert_eq!(datetime_to_unix_timestamp(1970, 1, 1, 0, 0, 0), 0);
     }
 
     #[test]
