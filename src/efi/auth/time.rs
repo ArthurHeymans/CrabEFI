@@ -8,7 +8,9 @@ use super::structures::EfiTime;
 
 /// Convert a date/time to Unix timestamp (seconds since 1970-01-01 00:00:00 UTC)
 ///
-/// Delegates to [`der::DateTime`] which handles leap years correctly.
+/// Uses [`der::DateTime`] for years >= 1970 (handles leap years correctly).
+/// Falls back to manual arithmetic for pre-1970 dates (needed for some CRL/cert
+/// parsing where UTCTime maps 50-99 to 1950-1999).
 pub(crate) fn datetime_to_unix_timestamp(
     year: i64,
     month: i64,
@@ -17,17 +19,49 @@ pub(crate) fn datetime_to_unix_timestamp(
     minute: i64,
     second: i64,
 ) -> i64 {
-    // der::DateTime::new validates ranges; on invalid input fall back to 0
-    der::DateTime::new(
-        year as u16,
-        month as u8,
-        day as u8,
-        hour as u8,
-        minute as u8,
-        second as u8,
-    )
-    .map(|dt| dt.unix_duration().as_secs() as i64)
-    .unwrap_or(0)
+    // Try der::DateTime for post-1970 dates (it validates and computes correctly)
+    if year >= 1970
+        && let Ok(dt) = der::DateTime::new(
+            year as u16,
+            month as u8,
+            day as u8,
+            hour as u8,
+            minute as u8,
+            second as u8,
+        )
+    {
+        return dt.unix_duration().as_secs() as i64;
+    }
+
+    // Fallback for pre-1970 or invalid dates: manual arithmetic preserving the
+    // original behavior (returns negative for pre-1970, garbage for truly invalid
+    // inputs -- callers should treat extreme values as suspect).
+    let years_since_1970 = year - 1970;
+    let leap_years = (year - 1969) / 4 - (year - 1901) / 100 + (year - 1601) / 400;
+
+    let days_before_month = match month {
+        1 => 0,
+        2 => 31,
+        3 => 59,
+        4 => 90,
+        5 => 120,
+        6 => 151,
+        7 => 181,
+        8 => 212,
+        9 => 243,
+        10 => 273,
+        11 => 304,
+        12 => 334,
+        _ => 0,
+    };
+
+    let is_leap = (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0);
+    let leap_day_adjustment = if is_leap && month > 2 { 1 } else { 0 };
+
+    let total_days =
+        years_since_1970 * 365 + leap_years + days_before_month + day - 1 + leap_day_adjustment;
+
+    total_days * 86400 + hour * 3600 + minute * 60 + second
 }
 
 /// Convert an x509 `Time` to a Unix timestamp

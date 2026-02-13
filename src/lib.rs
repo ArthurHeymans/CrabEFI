@@ -30,7 +30,7 @@ pub mod heap;
 pub mod linux_boot;
 pub mod logger;
 pub mod menu;
-pub mod menu_common;
+pub(crate) mod menu_common;
 pub mod payload;
 pub mod pe;
 pub mod secure_boot_menu;
