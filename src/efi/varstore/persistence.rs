@@ -29,7 +29,7 @@ use crate::drivers::spi::{self, SpiController};
 use crate::state::{self, MAX_VARIABLE_DATA_SIZE, MAX_VARIABLE_NAME_LEN};
 
 use super::storage::{SpiStorageBackend, StorageBackend};
-use super::{StoreHeader, VarStoreError, VariableRecord, STORE_HEADER_SIZE};
+use super::{STORE_HEADER_SIZE, StoreHeader, VarStoreError, VariableRecord};
 
 /// Default variable store base address in SPI flash
 /// This is typically at the end of the flash region
@@ -546,6 +546,53 @@ pub fn delete_variable(guid: &r_efi::efi::Guid, name: &[u16]) -> Result<(), VarS
 
 /// Write a variable record to storage
 ///
+/// Write a serialized variable record to storage, handling compaction if needed.
+fn write_record_to_storage(record: &VariableRecord, label: &str) -> Result<(), VarStoreError> {
+    let record_bytes = record.serialize()?;
+    let record_len = record_bytes.len() as u32;
+
+    let vs = state::varstore();
+    let storage_size =
+        state::with_storage_mut(|s| s.size()).ok_or(VarStoreError::NotInitialized)?;
+
+    if vs.initialized && vs.write_offset + record_len > storage_size {
+        log::info!("{}: store full, triggering compaction", label);
+        compact_varstore()?;
+    }
+
+    let vs = state::varstore();
+    if !vs.initialized {
+        return Err(VarStoreError::NotInitialized);
+    }
+
+    if vs.write_offset + record_len > storage_size {
+        log::error!("{}: still full after compaction", label);
+        return Err(VarStoreError::StoreFull);
+    }
+
+    let write_offset = vs.write_offset;
+
+    state::with_storage_mut(|storage| {
+        if let Err(e) = storage.enable_writes() {
+            log::warn!("Could not enable storage writes: {:?}", e);
+        }
+        storage
+            .write(write_offset, &record_bytes)
+            .map_err(|_| VarStoreError::SpiError)?;
+        Ok::<(), VarStoreError>(())
+    })
+    .ok_or(VarStoreError::NotInitialized)??;
+
+    state::with_varstore_mut(|vs| {
+        vs.write_offset += record_len;
+    });
+
+    log::debug!("{} persisted at offset {:#x}", label, write_offset);
+    Ok(())
+}
+
+/// Write a variable record to storage
+///
 /// This is the internal function that actually writes to storage.
 /// It's exposed to the deferred module for applying queued changes.
 ///
@@ -556,59 +603,8 @@ pub(super) fn write_variable_to_storage_internal(
     attributes: u32,
     data: &[u8],
 ) -> Result<(), VarStoreError> {
-    // Create the variable record first
     let record = VariableRecord::new(guid, name, attributes, data)?;
-    let record_bytes = record.serialize()?;
-    let record_len = record_bytes.len() as u32;
-
-    // Check if we need compaction
-    let vs = state::varstore();
-    let storage_size =
-        state::with_storage_mut(|s| s.size()).ok_or(VarStoreError::NotInitialized)?;
-
-    if vs.initialized && vs.write_offset + record_len > storage_size {
-        log::info!("Variable store full, triggering compaction");
-        compact_varstore()?;
-    }
-
-    // Get current state again after potential compaction
-    let vs = state::varstore();
-    if !vs.initialized {
-        return Err(VarStoreError::NotInitialized);
-    }
-
-    // Check again after compaction
-    if vs.write_offset + record_len > storage_size {
-        log::error!("Variable store still full after compaction");
-        return Err(VarStoreError::StoreFull);
-    }
-
-    let write_offset = vs.write_offset;
-
-    // Do the actual write
-    state::with_storage_mut(|storage| {
-        // Try to enable writes
-        if let Err(e) = storage.enable_writes() {
-            log::warn!("Could not enable storage writes: {:?}", e);
-        }
-
-        // Write the record
-        storage
-            .write(write_offset, &record_bytes)
-            .map_err(|_| VarStoreError::SpiError)?;
-
-        Ok::<(), VarStoreError>(())
-    })
-    .ok_or(VarStoreError::NotInitialized)??;
-
-    // Update write offset
-    state::with_varstore_mut(|vs| {
-        vs.write_offset += record_len;
-    });
-
-    log::debug!("Variable persisted at offset {:#x}", write_offset);
-
-    Ok(())
+    write_record_to_storage(&record, "Variable")
 }
 
 /// Write a variable record to storage with a specific timestamp
@@ -622,62 +618,8 @@ pub(super) fn write_variable_with_timestamp_internal(
     data: &[u8],
     timestamp: super::SerializedTime,
 ) -> Result<(), VarStoreError> {
-    // Create the variable record with timestamp first
     let record = VariableRecord::new_with_timestamp(guid, name, attributes, data, timestamp)?;
-    let record_bytes = record.serialize()?;
-    let record_len = record_bytes.len() as u32;
-
-    // Check if we need compaction
-    let vs = state::varstore();
-    let storage_size =
-        state::with_storage_mut(|s| s.size()).ok_or(VarStoreError::NotInitialized)?;
-
-    if vs.initialized && vs.write_offset + record_len > storage_size {
-        log::info!("Variable store full, triggering compaction");
-        compact_varstore()?;
-    }
-
-    // Get current state again after potential compaction
-    let vs = state::varstore();
-    if !vs.initialized {
-        return Err(VarStoreError::NotInitialized);
-    }
-
-    // Check again after compaction
-    if vs.write_offset + record_len > storage_size {
-        log::error!("Variable store still full after compaction");
-        return Err(VarStoreError::StoreFull);
-    }
-
-    let write_offset = vs.write_offset;
-
-    // Do the actual write
-    state::with_storage_mut(|storage| {
-        // Try to enable writes
-        if let Err(e) = storage.enable_writes() {
-            log::warn!("Could not enable storage writes: {:?}", e);
-        }
-
-        // Write the record
-        storage
-            .write(write_offset, &record_bytes)
-            .map_err(|_| VarStoreError::SpiError)?;
-
-        Ok::<(), VarStoreError>(())
-    })
-    .ok_or(VarStoreError::NotInitialized)??;
-
-    // Update write offset
-    state::with_varstore_mut(|vs| {
-        vs.write_offset += record_len;
-    });
-
-    log::debug!(
-        "Variable (with timestamp) persisted at offset {:#x}",
-        write_offset
-    );
-
-    Ok(())
+    write_record_to_storage(&record, "Variable (with timestamp)")
 }
 
 /// Write a deletion record to storage
@@ -690,59 +632,8 @@ pub(super) fn write_variable_deletion_internal(
     guid: &r_efi::efi::Guid,
     name: &[u16],
 ) -> Result<(), VarStoreError> {
-    // Create a deletion record first
     let record = VariableRecord::new_deleted(guid, name)?;
-    let record_bytes = record.serialize()?;
-    let record_len = record_bytes.len() as u32;
-
-    // Check if we need compaction
-    let vs = state::varstore();
-    let storage_size =
-        state::with_storage_mut(|s| s.size()).ok_or(VarStoreError::NotInitialized)?;
-
-    if vs.initialized && vs.write_offset + record_len > storage_size {
-        log::info!("Variable store full, triggering compaction for deletion");
-        compact_varstore()?;
-    }
-
-    // Get current state again after potential compaction
-    let vs = state::varstore();
-    if !vs.initialized {
-        return Err(VarStoreError::NotInitialized);
-    }
-
-    // Check again after compaction
-    if vs.write_offset + record_len > storage_size {
-        log::error!("Variable store still full after compaction");
-        return Err(VarStoreError::StoreFull);
-    }
-
-    let write_offset = vs.write_offset;
-
-    // Do the actual write
-    state::with_storage_mut(|storage| {
-        // Try to enable writes
-        if let Err(e) = storage.enable_writes() {
-            log::warn!("Could not enable storage writes: {:?}", e);
-        }
-
-        // Write the record
-        storage
-            .write(write_offset, &record_bytes)
-            .map_err(|_| VarStoreError::SpiError)?;
-
-        Ok::<(), VarStoreError>(())
-    })
-    .ok_or(VarStoreError::NotInitialized)??;
-
-    // Update write offset
-    state::with_varstore_mut(|vs| {
-        vs.write_offset += record_len;
-    });
-
-    log::debug!("Variable deletion persisted");
-
-    Ok(())
+    write_record_to_storage(&record, "Variable deletion")
 }
 
 /// Queue a variable write for deferred processing (after ExitBootServices)

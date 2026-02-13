@@ -56,6 +56,30 @@ impl CommandHeader {
         self.ctba = addr as u32;
         self.ctbau = (addr >> 32) as u32;
     }
+
+    /// Initialise a command header for an ATAPI command
+    fn init_atapi(&mut self) {
+        self.dw0 = 0;
+        self.set_cfl(5);
+        self.set_write(false);
+        self.set_prdtl(1);
+        self.dw0 |= 1 << 5; // ATAPI bit
+        self.prdbc = 0;
+    }
+}
+
+/// Extract the ATA model string from an IDENTIFY buffer (words 27-46).
+///
+/// ATA strings are stored with bytes swapped within each 16-bit word.
+/// Returns a 40-byte buffer containing the model string.
+fn extract_ata_model(identify: &[u16]) -> [u8; 40] {
+    let mut model = [0u8; 40];
+    for i in 0..20 {
+        let word = identify[27 + i];
+        model[i * 2] = (word >> 8) as u8;
+        model[i * 2 + 1] = (word & 0xFF) as u8;
+    }
+    model
 }
 
 /// FIS Register - Host to Device (20 bytes)
@@ -662,13 +686,7 @@ impl AhciController {
             port.sector_size = 512;
         }
 
-        // Get model number (words 27-46)
-        let mut model = [0u8; 40];
-        for i in 0..20 {
-            let word = identify[27 + i];
-            model[i * 2] = (word >> 8) as u8;
-            model[i * 2 + 1] = (word & 0xFF) as u8;
-        }
+        let model = extract_ata_model(identify);
         let model_str = core::str::from_utf8(&model).unwrap_or("Unknown").trim();
 
         log::info!(
@@ -696,12 +714,7 @@ impl AhciController {
 
         // Setup command header (set ATAPI bit)
         let header = unsafe { &mut *port.cmd_list.add(slot as usize) };
-        header.dw0 = 0;
-        header.set_cfl(5);
-        header.set_write(false);
-        header.set_prdtl(1);
-        header.dw0 |= 1 << 5; // ATAPI bit
-        header.prdbc = 0;
+        header.init_atapi();
 
         // Setup command table
         let table = unsafe { &mut *port.cmd_tables[slot as usize] };
@@ -723,13 +736,7 @@ impl AhciController {
         // Parse identify packet data
         let identify = unsafe { core::slice::from_raw_parts(buffer.as_ptr() as *const u16, 256) };
 
-        // Get model number (words 27-46)
-        let mut model = [0u8; 40];
-        for i in 0..20 {
-            let word = identify[27 + i];
-            model[i * 2] = (word >> 8) as u8;
-            model[i * 2 + 1] = (word & 0xFF) as u8;
-        }
+        let model = extract_ata_model(identify);
         let model_str = core::str::from_utf8(&model).unwrap_or("Unknown").trim();
 
         log::info!("AHCI Port {}: ATAPI device: {}", port.port_num, model_str);
@@ -755,12 +762,7 @@ impl AhciController {
 
         // Setup command header (set ATAPI bit)
         let header = unsafe { &mut *port.cmd_list.add(slot as usize) };
-        header.dw0 = 0;
-        header.set_cfl(5);
-        header.set_write(false);
-        header.set_prdtl(1);
-        header.dw0 |= 1 << 5; // ATAPI bit
-        header.prdbc = 0;
+        header.init_atapi();
 
         // Setup command table
         let table = unsafe { &mut *port.cmd_tables[slot as usize] };
@@ -972,12 +974,7 @@ impl AhciController {
 
         // Setup command header (set ATAPI bit)
         let header = unsafe { &mut *cmd_list.add(slot as usize) };
-        header.dw0 = 0;
-        header.set_cfl(5);
-        header.set_write(false);
-        header.set_prdtl(1);
-        header.dw0 |= 1 << 5; // ATAPI bit
-        header.prdbc = 0;
+        header.init_atapi();
 
         // Setup command table
         let table = unsafe { &mut *cmd_tables[slot as usize] };

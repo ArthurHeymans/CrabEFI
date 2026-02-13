@@ -4,12 +4,12 @@
 //! including viewing status, enabling/disabling Secure Boot, and managing keys.
 
 use crate::coreboot;
-use crate::drivers::keyboard;
 use crate::drivers::serial as serial_driver;
 use crate::efi::auth::{self, boot as secure_boot};
 use crate::framebuffer_console::{
-    Color, DEFAULT_BG, DEFAULT_FG, FramebufferConsole, HIGHLIGHT_BG, HIGHLIGHT_FG, TITLE_COLOR,
+    Color, DEFAULT_BG, DEFAULT_FG, FramebufferConsole, HIGHLIGHT_BG, HIGHLIGHT_FG,
 };
+use crate::menu_common::{self, KeyPress, SerialWriter};
 use crate::time::delay_ms;
 use core::fmt::Write;
 use heapless::String;
@@ -418,42 +418,8 @@ fn draw_menu(
     }
 }
 
-/// Draw the menu header
 fn draw_header(fb_console: &mut Option<FramebufferConsole>, cols: usize) {
-    // Build horizontal line
-    let mut line = [0u8; 128];
-    let line_len = cols.min(line.len());
-    line[..line_len].fill(b'=');
-    let line_str = core::str::from_utf8(&line[..line_len]).unwrap_or("");
-
-    // Serial output
-    serial_driver::write_str("\x1b[H"); // Home cursor
-    serial_driver::write_str("\x1b[1;33m"); // Yellow, bold
-    serial_driver::write_str(line_str);
-    serial_driver::write_str("\r\n");
-
-    // Center title
-    let title_pad = (cols.saturating_sub(MENU_TITLE.len())) / 2;
-    for _ in 0..title_pad {
-        serial_driver::write_str(" ");
-    }
-    serial_driver::write_str(MENU_TITLE);
-    serial_driver::write_str("\r\n");
-
-    serial_driver::write_str(line_str);
-    serial_driver::write_str("\r\n\x1b[0m");
-
-    // Framebuffer output
-    if let Some(console) = fb_console {
-        console.set_position(0, 0);
-        console.set_fg_color(TITLE_COLOR);
-        let _ = console.write_str(line_str);
-        console.set_position(0, 1);
-        console.write_centered(1, MENU_TITLE);
-        console.set_position(0, 2);
-        let _ = console.write_str(line_str);
-        console.reset_colors();
-    }
+    menu_common::draw_header(MENU_TITLE, fb_console, cols);
 }
 
 /// Draw the status section
@@ -662,79 +628,10 @@ fn draw_status_message(
     }
 }
 
-/// Clear screen
 fn clear_screen(fb_console: &mut Option<FramebufferConsole>) {
-    serial_driver::write_str("\x1b[2J\x1b[H");
-    if let Some(console) = fb_console {
-        console.clear();
-    }
+    menu_common::clear_screen(fb_console);
 }
 
-/// Key press types
-#[derive(Debug, Clone, Copy)]
-enum KeyPress {
-    Up,
-    Down,
-    Enter,
-    Escape,
-    Char(char),
-}
-
-/// Read a key from keyboard (PS/2, USB, or serial)
 fn read_key() -> Option<KeyPress> {
-    // Try PS/2 keyboard first
-    if let Some((scan_code, unicode_char)) = keyboard::try_read_key() {
-        return match scan_code {
-            0x01 => Some(KeyPress::Up),
-            0x02 => Some(KeyPress::Down),
-            0x17 => Some(KeyPress::Escape),
-            0 if unicode_char == 0x0D => Some(KeyPress::Enter),
-            0 if unicode_char > 0 => Some(KeyPress::Char(unicode_char as u8 as char)),
-            _ => None,
-        };
-    }
-
-    // Try USB keyboard
-    if let Some((scan_code, unicode_char)) = crate::drivers::usb::keyboard_get_key() {
-        return match scan_code {
-            0x01 => Some(KeyPress::Up),
-            0x02 => Some(KeyPress::Down),
-            0x17 => Some(KeyPress::Escape),
-            0 if unicode_char == 0x0D => Some(KeyPress::Enter),
-            0 if unicode_char > 0 => Some(KeyPress::Char(unicode_char as u8 as char)),
-            _ => None,
-        };
-    }
-
-    // Try serial input
-    if let Some(byte) = serial_driver::try_read() {
-        return match byte {
-            0x1B => {
-                delay_ms(10);
-                if let Some(b'[') = serial_driver::try_read() {
-                    match serial_driver::try_read() {
-                        Some(b'A') => Some(KeyPress::Up),
-                        Some(b'B') => Some(KeyPress::Down),
-                        _ => Some(KeyPress::Escape),
-                    }
-                } else {
-                    Some(KeyPress::Escape)
-                }
-            }
-            b'\r' | b'\n' => Some(KeyPress::Enter),
-            c => Some(KeyPress::Char(c as char)),
-        };
-    }
-
-    None
-}
-
-/// Helper for serial formatted output
-struct SerialWriter;
-
-impl core::fmt::Write for SerialWriter {
-    fn write_str(&mut self, s: &str) -> core::fmt::Result {
-        serial_driver::write_str(s);
-        Ok(())
-    }
+    menu_common::read_key()
 }

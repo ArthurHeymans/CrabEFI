@@ -19,6 +19,8 @@
 //! - Soft-fail mode is used when revocation checking cannot be completed
 
 use super::AuthError;
+use super::parse_der_length;
+use super::time::datetime_to_unix_timestamp;
 use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
@@ -1279,35 +1281,6 @@ fn sha1_hash(data: &[u8]) -> [u8; 20] {
     result
 }
 
-/// Parse DER length encoding
-fn parse_der_length(data: &[u8]) -> Result<(usize, usize), AuthError> {
-    if data.is_empty() {
-        return Err(AuthError::CertificateParseError);
-    }
-
-    let first = data[0];
-    if first < 0x80 {
-        // Short form
-        Ok((first as usize, 1))
-    } else if first == 0x80 {
-        // Indefinite length - not supported
-        Err(AuthError::CertificateParseError)
-    } else {
-        // Long form
-        let num_bytes = (first & 0x7F) as usize;
-        if num_bytes > 4 || num_bytes + 1 > data.len() {
-            return Err(AuthError::CertificateParseError);
-        }
-
-        let mut length = 0usize;
-        for i in 0..num_bytes {
-            length = (length << 8) | (data[1 + i] as usize);
-        }
-
-        Ok((length, 1 + num_bytes))
-    }
-}
-
 /// Encode DER length
 fn encode_der_length(output: &mut Vec<u8>, length: usize) {
     if length < 0x80 {
@@ -1331,43 +1304,6 @@ fn encode_der_length(output: &mut Vec<u8>, length: usize) {
         output.push((length >> 8) as u8);
         output.push(length as u8);
     }
-}
-
-/// Convert date/time to Unix timestamp
-fn datetime_to_unix_timestamp(
-    year: i64,
-    month: i64,
-    day: i64,
-    hour: i64,
-    minute: i64,
-    second: i64,
-) -> i64 {
-    let years_since_1970 = year - 1970;
-    let leap_years = (year - 1969) / 4 - (year - 1901) / 100 + (year - 1601) / 400;
-
-    let days_before_month = match month {
-        1 => 0,
-        2 => 31,
-        3 => 59,
-        4 => 90,
-        5 => 120,
-        6 => 151,
-        7 => 181,
-        8 => 212,
-        9 => 243,
-        10 => 273,
-        11 => 304,
-        12 => 334,
-        _ => 0,
-    };
-
-    let is_leap = (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0);
-    let leap_day_adjustment = if is_leap && month > 2 { 1 } else { 0 };
-
-    let total_days =
-        years_since_1970 * 365 + leap_years + days_before_month + day - 1 + leap_day_adjustment;
-
-    total_days * 86400 + hour * 3600 + minute * 60 + second
 }
 
 #[cfg(test)]

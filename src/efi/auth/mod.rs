@@ -35,6 +35,7 @@ pub mod key_files;
 pub mod revocation;
 mod signature;
 mod structures;
+pub(crate) mod time;
 mod variables;
 
 pub use authenticode::verify_pe_image_secure_boot;
@@ -55,6 +56,51 @@ pub(crate) fn guid_to_bytes(guid: &Guid) -> [u8; 16] {
     let mut result = [0u8; 16];
     result.copy_from_slice(bytes);
     result
+}
+
+// ============================================================================
+// DER Encoding Helpers
+// ============================================================================
+
+/// Maximum DER length we'll accept (64 MB)
+/// This prevents DoS attacks with maliciously crafted length fields
+const MAX_DER_LENGTH: usize = 64 * 1024 * 1024;
+
+/// Parse DER length encoding
+///
+/// Returns `(length, bytes_consumed)` on success.
+pub(crate) fn parse_der_length(data: &[u8]) -> Result<(usize, usize), AuthError> {
+    if data.is_empty() {
+        return Err(AuthError::CertificateParseError);
+    }
+
+    let first = data[0];
+    if first < 0x80 {
+        // Short form: length is in the first byte
+        Ok((first as usize, 1))
+    } else if first == 0x80 {
+        // Indefinite length - not supported
+        Err(AuthError::CertificateParseError)
+    } else {
+        // Long form: first byte indicates number of length bytes
+        let num_bytes = (first & 0x7F) as usize;
+        if num_bytes > 4 || num_bytes + 1 > data.len() {
+            return Err(AuthError::CertificateParseError);
+        }
+
+        let mut length = 0usize;
+        for i in 0..num_bytes {
+            length = (length << 8) | (data[1 + i] as usize);
+        }
+
+        // Reject unreasonably large lengths to prevent DoS
+        if length > MAX_DER_LENGTH {
+            log::warn!("DER length {} exceeds maximum {}", length, MAX_DER_LENGTH);
+            return Err(AuthError::CertificateParseError);
+        }
+
+        Ok((length, 1 + num_bytes))
+    }
 }
 
 // ============================================================================

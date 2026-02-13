@@ -388,54 +388,9 @@ pub unsafe fn parse(ptr: *const u8) -> CorebootInfo {
         }
 
         let table_bytes = (*header).table_bytes;
-        let header_bytes = (*header).header_bytes;
-
         log::debug!("Found coreboot header: {} bytes of tables", table_bytes);
 
-        // Parse table entries
-        let table_start = (header as *const u8).add(header_bytes as usize);
-        let mut offset = 0u32;
-
-        while offset < table_bytes {
-            let remaining = table_bytes - offset;
-
-            // Need at least 8 bytes for the record header
-            if remaining < 8 {
-                log::warn!("Truncated record header at offset {}", offset);
-                break;
-            }
-
-            let record_ptr = table_start.add(offset as usize);
-
-            // Read record header to get size
-            let record_header_bytes = core::slice::from_raw_parts(record_ptr, 8);
-            let Ok((record_header, _)) = CbRecord::read_from_prefix(record_header_bytes) else {
-                log::warn!("Failed to parse record header");
-                break;
-            };
-            let record_size = record_header.size;
-
-            if record_size < 8 {
-                log::warn!("Invalid record size: {}", record_size);
-                break;
-            }
-
-            if record_size > remaining {
-                log::warn!(
-                    "Record size {} exceeds remaining table bytes {} at offset {}",
-                    record_size,
-                    remaining,
-                    offset
-                );
-                break;
-            }
-
-            // Create slice for the full record and call safe parse_record
-            let record_bytes = core::slice::from_raw_parts(record_ptr, record_size as usize);
-            parse_record(record_bytes, &mut info);
-
-            offset += record_size;
-        }
+        iterate_table_records(header, &mut info);
     }
 
     // If we still have no memory map, create a fallback
@@ -765,47 +720,14 @@ fn parse_framebuffer(record_bytes: &[u8], info: &mut CorebootInfo) {
     );
 }
 
-/// Parse forward pointer and follow it
+/// Iterate over coreboot table records from a validated header and dispatch each
+/// to [`parse_record`].
 ///
 /// # Safety
-/// This function must follow a memory pointer from the coreboot tables,
-/// which requires trusting that the pointer is valid.
-unsafe fn parse_forward(record_bytes: &[u8], info: &mut CorebootInfo) {
-    // Safely parse the forward record using zerocopy
-    let Ok((forward, _)) = CbForward::read_from_prefix(record_bytes) else {
-        log::warn!("Failed to parse forward record");
-        return;
-    };
-    let forward_addr = forward.forward;
-    let new_ptr = forward_addr as *const u8;
-
-    log::debug!("Following forward pointer to {:#x}", forward_addr);
-
-    // Parse the forwarded table directly into info (no recursion)
-    // Safety: We trust the forward pointer from coreboot tables
-    let header = match find_header(new_ptr) {
-        Some(h) => h,
-        None => {
-            log::warn!("Could not find coreboot header at forwarded location");
-            return;
-        }
-    };
-
-    // Verify signature "LBIO"
-    if &(*header).signature != b"LBIO" {
-        log::warn!("Invalid coreboot header signature at forwarded location");
-        return;
-    }
-
+/// `header` must point to a valid `CbHeader` with a verified `"LBIO"` signature.
+unsafe fn iterate_table_records(header: *const CbHeader, info: &mut CorebootInfo) {
     let table_bytes = (*header).table_bytes;
     let header_bytes = (*header).header_bytes;
-
-    log::debug!(
-        "Found forwarded coreboot header: {} bytes of tables",
-        table_bytes
-    );
-
-    // Parse table entries
     let table_start = (header as *const u8).add(header_bytes as usize);
     let mut offset = 0u32;
 
@@ -842,12 +764,52 @@ unsafe fn parse_forward(record_bytes: &[u8], info: &mut CorebootInfo) {
             break;
         }
 
-        // Create slice for the full record and call safe parse_record
         let record_bytes = core::slice::from_raw_parts(record_ptr, record_size as usize);
         parse_record(record_bytes, info);
 
         offset += record_size;
     }
+}
+
+/// Parse forward pointer and follow it
+///
+/// # Safety
+/// This function must follow a memory pointer from the coreboot tables,
+/// which requires trusting that the pointer is valid.
+unsafe fn parse_forward(record_bytes: &[u8], info: &mut CorebootInfo) {
+    // Safely parse the forward record using zerocopy
+    let Ok((forward, _)) = CbForward::read_from_prefix(record_bytes) else {
+        log::warn!("Failed to parse forward record");
+        return;
+    };
+    let forward_addr = forward.forward;
+    let new_ptr = forward_addr as *const u8;
+
+    log::debug!("Following forward pointer to {:#x}", forward_addr);
+
+    // Parse the forwarded table directly into info (no recursion)
+    // Safety: We trust the forward pointer from coreboot tables
+    let header = match find_header(new_ptr) {
+        Some(h) => h,
+        None => {
+            log::warn!("Could not find coreboot header at forwarded location");
+            return;
+        }
+    };
+
+    // Verify signature "LBIO"
+    if &(*header).signature != b"LBIO" {
+        log::warn!("Invalid coreboot header signature at forwarded location");
+        return;
+    }
+
+    let table_bytes = (*header).table_bytes;
+    log::debug!(
+        "Found forwarded coreboot header: {} bytes of tables",
+        table_bytes
+    );
+
+    iterate_table_records(header, info);
 }
 
 /// Parse ACPI RSDP pointer

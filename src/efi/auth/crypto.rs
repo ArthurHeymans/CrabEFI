@@ -9,7 +9,9 @@
 //! - Certificate revocation checking (CRL/OCSP)
 
 use super::AuthError;
+use super::parse_der_length;
 use super::revocation::{RevocationCheckResult, RevocationConfig, check_certificate_revocation};
+use super::time;
 use alloc::vec;
 use alloc::vec::Vec;
 use sha2::{Digest, Sha256};
@@ -1121,139 +1123,16 @@ fn parse_key_usage(data: &[u8]) -> Result<KeyUsage, AuthError> {
     Ok(KeyUsage { bits })
 }
 
-/// Convert a date/time to approximate Unix timestamp (seconds since 1970-01-01 00:00:00 UTC)
-///
-/// This is a simplified implementation that doesn't handle leap seconds,
-/// but is sufficient for certificate validity period checks.
-fn datetime_to_unix_timestamp(
-    year: i64,
-    month: i64,
-    day: i64,
-    hour: i64,
-    minute: i64,
-    second: i64,
-) -> i64 {
-    // Calculate days since epoch (1970-01-01)
-    let years_since_1970 = year - 1970;
-    let leap_years = (year - 1969) / 4 - (year - 1901) / 100 + (year - 1601) / 400;
-
-    // Days before the start of each month (non-leap year)
-    let days_before_month = match month {
-        1 => 0,
-        2 => 31,
-        3 => 59,
-        4 => 90,
-        5 => 120,
-        6 => 151,
-        7 => 181,
-        8 => 212,
-        9 => 243,
-        10 => 273,
-        11 => 304,
-        12 => 334,
-        _ => 0,
-    };
-
-    // Add leap day if we're past February in a leap year
-    let is_leap = (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0);
-    let leap_day_adjustment = if is_leap && month > 2 { 1 } else { 0 };
-
-    let total_days =
-        years_since_1970 * 365 + leap_years + days_before_month + day - 1 + leap_day_adjustment;
-
-    total_days * 86400 + hour * 3600 + minute * 60 + second
-}
-
 /// Parse X.509 Time (UTCTime or GeneralizedTime) to Unix timestamp
-fn parse_x509_time(time: &x509_cert::time::Time) -> Result<i64, AuthError> {
-    use x509_cert::time::Time;
-
-    let datetime = match time {
-        Time::UtcTime(t) => t.to_date_time(),
-        Time::GeneralTime(t) => t.to_date_time(),
-    };
-
-    Ok(datetime_to_unix_timestamp(
-        datetime.year() as i64,
-        datetime.month() as i64,
-        datetime.day() as i64,
-        datetime.hour() as i64,
-        datetime.minutes() as i64,
-        datetime.seconds() as i64,
-    ))
+fn parse_x509_time(t: &x509_cert::time::Time) -> Result<i64, AuthError> {
+    time::x509_time_to_unix(t)
 }
 
 /// Get current time for certificate validation
 ///
 /// Returns Unix timestamp (seconds since 1970-01-01 00:00:00 UTC)
 fn get_current_time_for_cert_validation() -> i64 {
-    // Read time from CMOS RTC
-    // This is a simplified implementation - production code should use
-    // a more reliable time source
-    let (year, month, day, hour, minute, second) = read_rtc_time_for_crypto();
-
-    datetime_to_unix_timestamp(
-        year as i64,
-        month as i64,
-        day as i64,
-        hour as i64,
-        minute as i64,
-        second as i64,
-    )
-}
-
-/// Read time from CMOS RTC (simplified version for crypto module)
-fn read_rtc_time_for_crypto() -> (u16, u8, u8, u8, u8, u8) {
-    use crate::arch::x86_64::io;
-
-    // Wait for RTC update to complete
-    loop {
-        unsafe {
-            io::outb(0x70, 0x0A);
-            if io::inb(0x71) & 0x80 == 0 {
-                break;
-            }
-        }
-    }
-
-    let read_cmos = |reg: u8| -> u8 {
-        unsafe {
-            io::outb(0x70, reg);
-            io::inb(0x71)
-        }
-    };
-
-    let second = read_cmos(0x00);
-    let minute = read_cmos(0x02);
-    let hour = read_cmos(0x04);
-    let day = read_cmos(0x07);
-    let month = read_cmos(0x08);
-    let year = read_cmos(0x09);
-    let century = read_cmos(0x32);
-
-    // Check if BCD mode
-    let status_b = read_cmos(0x0B);
-    let is_bcd = (status_b & 0x04) == 0;
-
-    let convert = |val: u8| -> u8 {
-        if is_bcd {
-            (val & 0x0F) + ((val >> 4) * 10)
-        } else {
-            val
-        }
-    };
-
-    let second = convert(second);
-    let minute = convert(minute);
-    let hour = convert(hour);
-    let day = convert(day);
-    let month = convert(month);
-    let year = convert(year);
-    let century = if century > 0 { convert(century) } else { 20 };
-
-    let full_year = (century as u16) * 100 + (year as u16);
-
-    (full_year, month, day, hour, minute, second)
+    time::current_unix_timestamp()
 }
 
 /// Extract the original TBS (To Be Signed) certificate bytes from raw DER
@@ -1424,45 +1303,6 @@ fn parse_rsa_public_key_der(data: &[u8]) -> Result<RsaPublicKey, AuthError> {
     };
 
     Ok(RsaPublicKey { modulus, exponent })
-}
-
-/// Maximum DER length we'll accept (64 MB)
-/// This prevents DoS attacks with maliciously crafted length fields
-const MAX_DER_LENGTH: usize = 64 * 1024 * 1024;
-
-/// Parse DER length encoding
-fn parse_der_length(data: &[u8]) -> Result<(usize, usize), AuthError> {
-    if data.is_empty() {
-        return Err(AuthError::CertificateParseError);
-    }
-
-    let first = data[0];
-    if first < 0x80 {
-        // Short form: length is in the first byte
-        Ok((first as usize, 1))
-    } else if first == 0x80 {
-        // Indefinite length - not supported
-        Err(AuthError::CertificateParseError)
-    } else {
-        // Long form: first byte indicates number of length bytes
-        let num_bytes = (first & 0x7F) as usize;
-        if num_bytes > 4 || num_bytes + 1 > data.len() {
-            return Err(AuthError::CertificateParseError);
-        }
-
-        let mut length = 0usize;
-        for i in 0..num_bytes {
-            length = (length << 8) | (data[1 + i] as usize);
-        }
-
-        // Reject unreasonably large lengths to prevent DoS
-        if length > MAX_DER_LENGTH {
-            log::warn!("DER length {} exceeds maximum {}", length, MAX_DER_LENGTH);
-            return Err(AuthError::CertificateParseError);
-        }
-
-        Ok((length, 1 + num_bytes))
-    }
 }
 
 /// Trim trailing bytes from a DER-encoded structure

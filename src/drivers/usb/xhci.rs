@@ -10,7 +10,9 @@ use core::ptr;
 use core::sync::atomic::{Ordering, fence};
 use zerocopy::FromBytes;
 
-use super::controller::{DeviceDescriptor, desc_type, parse_configuration, req_type, request};
+use super::controller::{
+    ConfigurationInfo, DeviceDescriptor, desc_type, parse_configuration, req_type, request,
+};
 
 // Import all constants from xhci_regs
 use super::xhci_regs::{
@@ -1778,14 +1780,11 @@ impl XhciController {
         Ok(())
     }
 
-    /// Configure a mass storage device
-    ///
-    /// Uses the shared parse_configuration() infrastructure from controller.rs
-    fn configure_mass_storage(&mut self, slot_id: u8) -> Result<(), XhciError> {
-        // Get configuration descriptor
+    /// Fetch and parse the full configuration descriptor for a device
+    fn get_config_descriptor(&mut self, slot_id: u8) -> Result<ConfigurationInfo, XhciError> {
         let mut config_buf = [0u8; 256];
 
-        // First get just the header
+        // First get just the header to learn total length
         let mut header = [0u8; 9];
         self.control_transfer(
             slot_id,
@@ -1809,8 +1808,14 @@ impl XhciController {
             Some(&mut config_buf[..total_len]),
         )?;
 
-        // Parse configuration using shared infrastructure
-        let config_info = parse_configuration(&config_buf[..total_len]);
+        Ok(parse_configuration(&config_buf[..total_len]))
+    }
+
+    /// Configure a mass storage device
+    ///
+    /// Uses the shared parse_configuration() infrastructure from controller.rs
+    fn configure_mass_storage(&mut self, slot_id: u8) -> Result<(), XhciError> {
+        let config_info = self.get_config_descriptor(slot_id)?;
 
         // Find mass storage interface
         let mut bulk_in = 0u8;
@@ -1880,35 +1885,7 @@ impl XhciController {
     ///
     /// Uses the shared parse_configuration() infrastructure from controller.rs
     fn configure_hid_keyboard(&mut self, slot_id: u8) -> Result<(), XhciError> {
-        // Get configuration descriptor
-        let mut config_buf = [0u8; 256];
-
-        // First get just the header
-        let mut header = [0u8; 9];
-        self.control_transfer(
-            slot_id,
-            req_type::DIR_IN | req_type::TYPE_STANDARD | req_type::RCPT_DEVICE,
-            request::GET_DESCRIPTOR,
-            (desc_type::CONFIGURATION as u16) << 8,
-            0,
-            Some(&mut header),
-        )?;
-
-        let total_len = u16::from_le_bytes([header[2], header[3]]) as usize;
-        let total_len = total_len.min(config_buf.len());
-
-        // Get full configuration
-        self.control_transfer(
-            slot_id,
-            req_type::DIR_IN | req_type::TYPE_STANDARD | req_type::RCPT_DEVICE,
-            request::GET_DESCRIPTOR,
-            (desc_type::CONFIGURATION as u16) << 8,
-            0,
-            Some(&mut config_buf[..total_len]),
-        )?;
-
-        // Parse configuration using shared infrastructure
-        let config_info = parse_configuration(&config_buf[..total_len]);
+        let config_info = self.get_config_descriptor(slot_id)?;
 
         // Find HID keyboard interface
         let mut interrupt_in = 0u8;

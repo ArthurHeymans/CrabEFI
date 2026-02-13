@@ -215,27 +215,14 @@ impl<'a> FramebufferConsole<'a> {
 
     /// Draw a character at the current cursor position (without advancing)
     fn draw_char(&self, c: char) {
-        let x_base = self.cursor_col * CHAR_WIDTH;
-        let y_base = self.cursor_row * CHAR_HEIGHT;
-
-        // Get glyph data for this character
-        let glyph = get_glyph(c);
-
-        for row in 0..CHAR_HEIGHT {
-            let bits = glyph[row as usize];
-            for col in 0..CHAR_WIDTH {
-                let pixel_set = (bits >> (7 - col)) & 1 != 0;
-                let (r, g, b) = if pixel_set {
-                    (self.fg_color.r, self.fg_color.g, self.fg_color.b)
-                } else {
-                    (self.bg_color.r, self.bg_color.g, self.bg_color.b)
-                };
-
-                unsafe {
-                    self.fb.write_pixel(x_base + col, y_base + row, r, g, b);
-                }
-            }
-        }
+        render_glyph(
+            self.fb,
+            c,
+            self.cursor_col * CHAR_WIDTH,
+            self.cursor_row * CHAR_HEIGHT,
+            self.fg_color,
+            self.bg_color,
+        );
     }
 
     /// Draw a character at a specific position (without affecting cursor)
@@ -243,28 +230,7 @@ impl<'a> FramebufferConsole<'a> {
         if col >= self.cols || row >= self.rows {
             return;
         }
-
-        let x_base = col * CHAR_WIDTH;
-        let y_base = row * CHAR_HEIGHT;
-
-        let glyph = get_glyph(c);
-
-        for glyph_row in 0..CHAR_HEIGHT {
-            let bits = glyph[glyph_row as usize];
-            for glyph_col in 0..CHAR_WIDTH {
-                let pixel_set = (bits >> (7 - glyph_col)) & 1 != 0;
-                let (r, g, b) = if pixel_set {
-                    (fg.r, fg.g, fg.b)
-                } else {
-                    (bg.r, bg.g, bg.b)
-                };
-
-                unsafe {
-                    self.fb
-                        .write_pixel(x_base + glyph_col, y_base + glyph_row, r, g, b);
-                }
-            }
-        }
+        render_glyph(self.fb, c, col * CHAR_WIDTH, row * CHAR_HEIGHT, fg, bg);
     }
 
     /// Scroll the screen up by one line
@@ -335,6 +301,25 @@ impl<'a> Write for FramebufferConsole<'a> {
     fn write_str(&mut self, s: &str) -> fmt::Result {
         s.chars().for_each(|c| self.put_char(c));
         Ok(())
+    }
+}
+
+/// Render a character glyph to a framebuffer at the given pixel coordinates.
+pub fn render_glyph(fb: &FramebufferInfo, c: char, x: u32, y: u32, fg: Color, bg: Color) {
+    let glyph = get_glyph(c);
+    for row in 0..CHAR_HEIGHT {
+        let bits = glyph[row as usize];
+        for col in 0..CHAR_WIDTH {
+            let pixel_set = (bits >> (7 - col)) & 1 != 0;
+            let (r, g, b) = if pixel_set {
+                (fg.r, fg.g, fg.b)
+            } else {
+                (bg.r, bg.g, bg.b)
+            };
+            unsafe {
+                fb.write_pixel(x + col, y + row, r, g, b);
+            }
+        }
     }
 }
 

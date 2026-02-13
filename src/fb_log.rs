@@ -8,7 +8,7 @@ use log::Level;
 use spin::Mutex;
 
 use crate::coreboot::FramebufferInfo;
-use crate::framebuffer_console::{CHAR_HEIGHT, CHAR_WIDTH, Color, VGA_FONT_8X16};
+use crate::framebuffer_console::{CHAR_HEIGHT, CHAR_WIDTH, Color, render_glyph};
 
 /// Global framebuffer info for logging
 static FB_INFO: Mutex<Option<FramebufferInfo>> = Mutex::new(None);
@@ -121,38 +121,9 @@ fn clear_line(fb: &FramebufferInfo, row: u32, cols: u32, bg: Color) {
     }
 }
 
-/// Draw a character at a specific position on the framebuffer
+/// Draw a character at a specific character-grid position on the framebuffer
 fn draw_char_at(fb: &FramebufferInfo, c: char, col: u32, row: u32, fg: Color, bg: Color) {
-    let x_base = col * CHAR_WIDTH;
-    let y_base = row * CHAR_HEIGHT;
-
-    let glyph = get_glyph(c);
-
-    for glyph_row in 0..CHAR_HEIGHT {
-        let bits = glyph[glyph_row as usize];
-        for glyph_col in 0..CHAR_WIDTH {
-            let pixel_set = (bits >> (7 - glyph_col)) & 1 != 0;
-            let (r, g, b) = if pixel_set {
-                (fg.r, fg.g, fg.b)
-            } else {
-                (bg.r, bg.g, bg.b)
-            };
-
-            unsafe {
-                fb.write_pixel(x_base + glyph_col, y_base + glyph_row, r, g, b);
-            }
-        }
-    }
-}
-
-/// Get glyph data for a character (simplified - just use '?' for non-ASCII)
-fn get_glyph(c: char) -> &'static [u8; 16] {
-    let index = c as usize;
-    if index < 256 {
-        &VGA_FONT_8X16[index]
-    } else {
-        &VGA_FONT_8X16[b'?' as usize]
-    }
+    render_glyph(fb, c, col * CHAR_WIDTH, row * CHAR_HEIGHT, fg, bg);
 }
 
 /// Small formatting buffer for log messages

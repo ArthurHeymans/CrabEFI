@@ -30,6 +30,7 @@ pub mod heap;
 pub mod linux_boot;
 pub mod logger;
 pub mod menu;
+pub mod menu_common;
 pub mod payload;
 pub mod pe;
 pub mod secure_boot_menu;
@@ -271,7 +272,9 @@ pub fn init(coreboot_table_ptr: u64) {
 
     // Initialize heap allocator (needed for crypto operations and alloc-dependent features)
     if !heap::init() {
-        log::error!("Failed to initialize heap allocator! Secure Boot and other alloc-dependent features will be unavailable.");
+        log::error!(
+            "Failed to initialize heap allocator! Secure Boot and other alloc-dependent features will be unavailable."
+        );
         // Continue boot -- features requiring alloc will fail gracefully
     }
 

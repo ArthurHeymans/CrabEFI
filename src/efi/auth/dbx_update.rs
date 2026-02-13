@@ -422,7 +422,7 @@ fn apply_raw_dbx_update(
     // Update timestamp to current time
     {
         let mut dbx = dbx_database();
-        let current_time = get_current_time();
+        let current_time = super::time::read_rtc_efi_time();
         dbx.set_timestamp(current_time);
     }
 
@@ -608,70 +608,4 @@ fn entry_exists_in_dbx(
     }
 
     false
-}
-
-/// Get current time for timestamp updates
-fn get_current_time() -> EfiTime {
-    use crate::arch::x86_64::io;
-
-    // Wait for RTC update to complete
-    loop {
-        unsafe {
-            io::outb(0x70, 0x0A);
-            if io::inb(0x71) & 0x80 == 0 {
-                break;
-            }
-        }
-    }
-
-    let read_cmos = |reg: u8| -> u8 {
-        unsafe {
-            io::outb(0x70, reg);
-            io::inb(0x71)
-        }
-    };
-
-    let second = read_cmos(0x00);
-    let minute = read_cmos(0x02);
-    let hour = read_cmos(0x04);
-    let day = read_cmos(0x07);
-    let month = read_cmos(0x08);
-    let year = read_cmos(0x09);
-    let century = read_cmos(0x32);
-
-    // Check if BCD mode
-    let status_b = read_cmos(0x0B);
-    let is_bcd = (status_b & 0x04) == 0;
-
-    let convert = |val: u8| -> u8 {
-        if is_bcd {
-            (val & 0x0F) + ((val >> 4) * 10)
-        } else {
-            val
-        }
-    };
-
-    let second = convert(second);
-    let minute = convert(minute);
-    let hour = convert(hour);
-    let day = convert(day);
-    let month = convert(month);
-    let year = convert(year);
-    let century = if century > 0 { convert(century) } else { 20 };
-
-    let full_year = (century as u16) * 100 + (year as u16);
-
-    EfiTime {
-        year: full_year,
-        month,
-        day,
-        hour,
-        minute,
-        second,
-        pad1: 0,
-        nanosecond: 0,
-        timezone: 0x7FF, // EFI_UNSPECIFIED_TIMEZONE
-        daylight: 0,
-        pad2: 0,
-    }
 }
