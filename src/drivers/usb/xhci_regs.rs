@@ -3,6 +3,7 @@
 //! This module defines xHCI (USB 3.0) Host Controller Interface registers
 //! using type-safe tock-registers.
 
+use tock_registers::interfaces::{Readable, Writeable};
 use tock_registers::register_bitfields;
 use tock_registers::registers::{ReadOnly, ReadWrite};
 
@@ -242,26 +243,32 @@ register_bitfields! [
     ]
 ];
 
+// ============================================================================
+// Interrupter Register Bitfield Definitions
+// ============================================================================
+
 register_bitfields! [
-    u64,
-    /// Command Ring Control (CRCR) - op offset 0x18
-    pub CRCR [
-        /// Ring Cycle State
-        RCS OFFSET(0) NUMBITS(1) [],
-        /// Command Stop
-        CS OFFSET(1) NUMBITS(1) [],
-        /// Command Abort
-        CA OFFSET(2) NUMBITS(1) [],
-        /// Command Ring Running
-        CRR OFFSET(3) NUMBITS(1) [],
-        /// Command Ring Pointer
-        CRP OFFSET(6) NUMBITS(58) []
+    u32,
+    /// Interrupter Management Register (IMAN)
+    pub IMAN [
+        /// Interrupt Pending (RW1C — write 1 to clear)
+        IP OFFSET(0) NUMBITS(1) [],
+        /// Interrupt Enable
+        IE OFFSET(1) NUMBITS(1) []
     ],
 
-    /// Device Context Base Address Array Pointer (DCBAAP) - op offset 0x30
-    pub DCBAAP [
-        /// Device Context Base Address Array Pointer
-        DCBAA_PTR OFFSET(6) NUMBITS(58) []
+    /// Interrupter Moderation Register (IMOD)
+    pub IMOD [
+        /// Interrupt Moderation Interval (in 250ns units)
+        IMODI OFFSET(0) NUMBITS(16) [],
+        /// Interrupt Moderation Counter
+        IMODC OFFSET(16) NUMBITS(16) []
+    ],
+
+    /// Event Ring Segment Table Size Register (ERSTSZ)
+    pub ERSTSZ [
+        /// Event Ring Segment Table Size
+        SEGMENT_COUNT OFFSET(0) NUMBITS(16) []
     ]
 ];
 
@@ -291,6 +298,9 @@ pub struct XhciCapRegs {
 }
 
 /// xHCI Operational Registers
+///
+/// 64-bit registers (CRCR, DCBAAP) are split into lo/hi halves because many
+/// xHCI controllers on PCIe do NOT support atomic 64-bit MMIO writes.
 #[repr(C)]
 pub struct XhciOpRegs {
     /// USB Command
@@ -303,12 +313,16 @@ pub struct XhciOpRegs {
     _reserved0: [u32; 2],
     /// Device Notification Control
     pub dnctrl: ReadWrite<u32, DNCTRL::Register>,
-    /// Command Ring Control (64-bit)
-    pub crcr: ReadWrite<u64, CRCR::Register>,
+    /// Command Ring Control — low 32 bits (offset 0x18)
+    pub crcr_lo: ReadWrite<u32>,
+    /// Command Ring Control — high 32 bits (offset 0x1C)
+    pub crcr_hi: ReadWrite<u32>,
     /// Reserved
     _reserved1: [u32; 4],
-    /// Device Context Base Address Array Pointer (64-bit)
-    pub dcbaap: ReadWrite<u64, DCBAAP::Register>,
+    /// Device Context Base Address Array Pointer — low 32 bits (offset 0x30)
+    pub dcbaap_lo: ReadWrite<u32>,
+    /// Device Context Base Address Array Pointer — high 32 bits (offset 0x34)
+    pub dcbaap_hi: ReadWrite<u32>,
     /// Configure
     pub config: ReadWrite<u32, CONFIG::Register>,
 }
@@ -324,6 +338,84 @@ pub struct XhciPortRegs {
     pub portli: ReadOnly<u32>,
     /// Port Hardware LPM Control
     pub porthlpmc: ReadWrite<u32>,
+}
+
+/// xHCI Interrupter Register Set (0x20 bytes per interrupter)
+///
+/// 64-bit registers (ERSTBA, ERDP) are split into lo/hi halves because many
+/// xHCI controllers on PCIe do NOT support atomic 64-bit MMIO writes.
+#[repr(C)]
+pub struct XhciInterrupterRegs {
+    /// Interrupter Management
+    pub iman: ReadWrite<u32, IMAN::Register>,
+    /// Interrupter Moderation
+    pub imod: ReadWrite<u32, IMOD::Register>,
+    /// Event Ring Segment Table Size
+    pub erstsz: ReadWrite<u32, ERSTSZ::Register>,
+    /// Reserved
+    _reserved: u32,
+    /// Event Ring Segment Table Base Address — low 32 bits
+    pub erstba_lo: ReadWrite<u32>,
+    /// Event Ring Segment Table Base Address — high 32 bits
+    pub erstba_hi: ReadWrite<u32>,
+    /// Event Ring Dequeue Pointer — low 32 bits
+    pub erdp_lo: ReadWrite<u32>,
+    /// Event Ring Dequeue Pointer — high 32 bits
+    pub erdp_hi: ReadWrite<u32>,
+}
+
+/// xHCI Runtime Registers
+///
+/// The runtime register space starts with MFINDEX at offset 0x00,
+/// followed by interrupter register sets starting at offset 0x20.
+#[repr(C)]
+pub struct XhciRuntimeRegs {
+    /// Microframe Index
+    pub mfindex: ReadOnly<u32>,
+    /// Reserved padding (0x04..0x20)
+    _reserved: [u32; 7],
+    /// Interrupter 0 register set (at offset 0x20)
+    pub ir0: XhciInterrupterRegs,
+}
+
+impl XhciOpRegs {
+    /// Write 64-bit CRCR as two 32-bit halves (lo first, then hi).
+    #[inline]
+    pub fn write_crcr(&self, value: u64) {
+        self.crcr_lo.set(value as u32);
+        self.crcr_hi.set((value >> 32) as u32);
+    }
+
+    /// Read 64-bit CRCR as two 32-bit halves (lo first, then hi).
+    #[inline]
+    pub fn read_crcr(&self) -> u64 {
+        let lo = self.crcr_lo.get() as u64;
+        let hi = self.crcr_hi.get() as u64;
+        lo | (hi << 32)
+    }
+
+    /// Write 64-bit DCBAAP as two 32-bit halves (lo first, then hi).
+    #[inline]
+    pub fn write_dcbaap(&self, value: u64) {
+        self.dcbaap_lo.set(value as u32);
+        self.dcbaap_hi.set((value >> 32) as u32);
+    }
+}
+
+impl XhciInterrupterRegs {
+    /// Write 64-bit ERSTBA as two 32-bit halves (lo first, then hi).
+    #[inline]
+    pub fn write_erstba(&self, value: u64) {
+        self.erstba_lo.set(value as u32);
+        self.erstba_hi.set((value >> 32) as u32);
+    }
+
+    /// Write 64-bit ERDP as two 32-bit halves (lo first, then hi).
+    #[inline]
+    pub fn write_erdp(&self, value: u64) {
+        self.erdp_lo.set(value as u32);
+        self.erdp_hi.set((value >> 32) as u32);
+    }
 }
 
 // ============================================================================
@@ -470,30 +562,6 @@ pub fn trb_cc_name(cc: u32) -> &'static str {
 }
 
 // ============================================================================
-// Extended Capability IDs
-// ============================================================================
-
-/// USB Legacy Support Capability
-pub const XHCI_EXT_CAP_LEGACY: u8 = 0x01;
-/// Supported Protocol Capability
-pub const XHCI_EXT_CAP_PROTOCOL: u8 = 0x02;
-/// Extended Power Management Capability
-pub const XHCI_EXT_CAP_POWER: u8 = 0x03;
-/// I/O Virtualization Capability
-pub const XHCI_EXT_CAP_IOVIRT: u8 = 0x04;
-/// USB Debug Capability
-pub const XHCI_EXT_CAP_DEBUG: u8 = 0x0A;
-
-// ============================================================================
-// USB Legacy Support
-// ============================================================================
-
-/// BIOS Owned Semaphore bit
-pub const USBLEGSUP_BIOS_OWNED: u32 = 1 << 16;
-/// OS Owned Semaphore bit
-pub const USBLEGSUP_OS_OWNED: u32 = 1 << 24;
-
-// ============================================================================
 // Port Status Change Bits (for clearing)
 // ============================================================================
 
@@ -509,109 +577,3 @@ pub const PORTSC_CHANGE_MASK: u32 =
 /// write strobe which would cause unintended link state changes. Only set LWS
 /// when deliberately changing the Port Link State (PLS) field.
 pub const PORTSC_RW_MASK: u32 = (1 << 9) | (3 << 14) | (1 << 25) | (1 << 26) | (1 << 27);
-
-// ============================================================================
-// Capability Register Offsets
-// ============================================================================
-
-/// CAPLENGTH and HCIVERSION register offset
-pub const CAP_CAPLENGTH: u32 = 0x00;
-/// HCSPARAMS1 register offset
-pub const CAP_HCSPARAMS1: u32 = 0x04;
-/// HCSPARAMS2 register offset
-pub const CAP_HCSPARAMS2: u32 = 0x08;
-/// HCSPARAMS3 register offset
-pub const CAP_HCSPARAMS3: u32 = 0x0C;
-/// HCCPARAMS1 register offset
-pub const CAP_HCCPARAMS1: u32 = 0x10;
-/// DBOFF register offset
-pub const CAP_DBOFF: u32 = 0x14;
-/// RTSOFF register offset
-pub const CAP_RTSOFF: u32 = 0x18;
-
-// ============================================================================
-// Operational Register Offsets
-// ============================================================================
-
-/// USBCMD register offset
-pub const OP_USBCMD: u32 = 0x00;
-/// USBSTS register offset
-pub const OP_USBSTS: u32 = 0x04;
-/// PAGESIZE register offset
-pub const OP_PAGESIZE: u32 = 0x08;
-/// DNCTRL register offset
-pub const OP_DNCTRL: u32 = 0x14;
-/// CRCR register offset (64-bit)
-pub const OP_CRCR: u32 = 0x18;
-/// DCBAAP register offset (64-bit)
-pub const OP_DCBAAP: u32 = 0x30;
-/// CONFIG register offset
-pub const OP_CONFIG: u32 = 0x38;
-
-// ============================================================================
-// Port Register Offsets (relative to port base)
-// ============================================================================
-
-/// PORTSC register offset
-pub const PORT_PORTSC: u32 = 0x00;
-
-// ============================================================================
-// USBCMD Register Bits
-// ============================================================================
-
-/// Run/Stop
-pub const USBCMD_RS: u32 = 1 << 0;
-/// Host Controller Reset
-pub const USBCMD_HCRST: u32 = 1 << 1;
-/// Interrupter Enable
-pub const USBCMD_INTE: u32 = 1 << 2;
-/// Host System Error Enable
-pub const USBCMD_HSEE: u32 = 1 << 3;
-
-// ============================================================================
-// USBSTS Register Bits
-// ============================================================================
-
-/// Host Controller Halted
-pub const USBSTS_HCH: u32 = 1 << 0;
-/// Host System Error
-pub const USBSTS_HSE: u32 = 1 << 2;
-/// Event Interrupt
-pub const USBSTS_EINT: u32 = 1 << 3;
-/// Port Change Detect
-pub const USBSTS_PCD: u32 = 1 << 4;
-/// Controller Not Ready
-pub const USBSTS_CNR: u32 = 1 << 11;
-/// Host Controller Error
-pub const USBSTS_HCE: u32 = 1 << 12;
-
-// ============================================================================
-// PORTSC Register Bits
-// ============================================================================
-
-/// Current Connect Status
-pub const PORTSC_CCS: u32 = 1 << 0;
-/// Port Enabled/Disabled
-pub const PORTSC_PED: u32 = 1 << 1;
-/// Over-current Active
-pub const PORTSC_OCA: u32 = 1 << 3;
-/// Port Reset
-pub const PORTSC_PR: u32 = 1 << 4;
-/// Port Power
-pub const PORTSC_PP: u32 = 1 << 9;
-/// Port Speed Mask (bits 10-13)
-pub const PORTSC_SPEED_MASK: u32 = 0xF << 10;
-/// Port Link State Mask (bits 5-8)
-pub const PORTSC_PLS_MASK: u32 = 0xF << 5;
-/// Port Link State: U0 (link is up and operational)
-pub const PORTSC_PLS_U0: u32 = 0 << 5;
-/// Port Link State: RxDetect (looking for device, not connected)
-pub const PORTSC_PLS_RXDETECT: u32 = 5 << 5;
-/// Port Link State: Polling (link training in progress)
-pub const PORTSC_PLS_POLLING: u32 = 7 << 5;
-/// Port Reset Change
-pub const PORTSC_PRC: u32 = 1 << 21;
-/// Warm Port Reset Change (USB3 only)
-pub const PORTSC_WRC: u32 = 1 << 19;
-/// Warm Port Reset (USB3 only)
-pub const PORTSC_WPR: u32 = 1 << 31;

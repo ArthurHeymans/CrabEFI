@@ -8,74 +8,28 @@ use crate::efi;
 use crate::time::{Timeout, wait_for};
 use core::ptr;
 use core::sync::atomic::{Ordering, fence};
+use tock_registers::interfaces::{ReadWriteable, Readable, Writeable};
 use zerocopy::FromBytes;
 
 use super::controller::{
     ConfigurationInfo, DeviceDescriptor, desc_type, parse_configuration, req_type, request,
 };
 
-// Import all constants from xhci_regs
+// Import typed register structs and bitfield modules
 use super::xhci_regs::{
-    // Capability register offsets
-    CAP_CAPLENGTH,
-    CAP_DBOFF,
-    CAP_HCCPARAMS1,
-    CAP_HCSPARAMS1,
-    CAP_HCSPARAMS2,
-    CAP_RTSOFF,
-    // Operational register offsets
-    OP_CONFIG,
-    OP_CRCR,
-    OP_DCBAAP,
-    OP_PAGESIZE,
-    OP_USBCMD,
-    OP_USBSTS,
-    // Port register offsets
-    PORT_PORTSC,
-    // PORTSC register bits
-    PORTSC_CCS,
-    PORTSC_CHANGE_MASK,
-    PORTSC_PED,
-    PORTSC_PLS_MASK,
-    PORTSC_PLS_POLLING,
-    PORTSC_PLS_RXDETECT,
-    PORTSC_PLS_U0,
-    PORTSC_PP,
-    PORTSC_PR,
-    PORTSC_PRC,
-    PORTSC_RW_MASK,
-    PORTSC_SPEED_MASK,
-    PORTSC_WPR,
-    PORTSC_WRC,
-    TRB_CC_BABBLE_DETECTED,
-    TRB_CC_SHORT_PACKET,
-    TRB_CC_STALL_ERROR,
-    TRB_CC_SUCCESS,
-    TRB_CC_USB_TRANSACTION_ERROR,
-    // TRB types
-    TRB_TYPE_ADDRESS_DEVICE,
-    TRB_TYPE_COMMAND_COMPLETION,
-    TRB_TYPE_CONFIGURE_ENDPOINT,
-    TRB_TYPE_DATA,
-    TRB_TYPE_ENABLE_SLOT,
-    TRB_TYPE_HOST_CONTROLLER,
-    TRB_TYPE_LINK,
-    TRB_TYPE_NORMAL,
-    TRB_TYPE_PORT_STATUS_CHANGE,
-    TRB_TYPE_RESET_ENDPOINT,
-    TRB_TYPE_SET_TR_DEQUEUE,
-    TRB_TYPE_SETUP,
-    TRB_TYPE_STATUS,
-    TRB_TYPE_TRANSFER_EVENT,
-    // USBCMD register bits
-    USBCMD_HCRST,
-    USBCMD_INTE,
-    USBCMD_RS,
-    // USBSTS register bits
-    USBSTS_CNR,
-    USBSTS_HCH,
-    // TRB completion codes
-    trb_cc_name,
+    CAPLENGTH_HCIVERSION, CONFIG, ERSTSZ, HCCPARAMS1, HCSPARAMS1, HCSPARAMS2, PAGESIZE,
+    PORTSC, USBCMD, USBSTS, XhciCapRegs, XhciOpRegs, XhciPortRegs, XhciRuntimeRegs,
+};
+
+// Import constants that don't have typed equivalents (TRB types, completion codes,
+// PORTSC change/RW masks, extended capability IDs)
+use super::xhci_regs::{
+    PORTSC_CHANGE_MASK, PORTSC_RW_MASK, TRB_CC_BABBLE_DETECTED, TRB_CC_SHORT_PACKET,
+    TRB_CC_STALL_ERROR, TRB_CC_SUCCESS, TRB_CC_USB_TRANSACTION_ERROR, TRB_TYPE_ADDRESS_DEVICE,
+    TRB_TYPE_COMMAND_COMPLETION, TRB_TYPE_CONFIGURE_ENDPOINT, TRB_TYPE_DATA, TRB_TYPE_ENABLE_SLOT,
+    TRB_TYPE_HOST_CONTROLLER, TRB_TYPE_LINK, TRB_TYPE_NORMAL, TRB_TYPE_PORT_STATUS_CHANGE,
+    TRB_TYPE_RESET_ENDPOINT, TRB_TYPE_SET_TR_DEQUEUE, TRB_TYPE_SETUP, TRB_TYPE_STATUS,
+    TRB_TYPE_TRANSFER_EVENT, trb_cc_name,
 };
 
 // NOTE: USB descriptor types (DeviceDescriptor, ConfigurationDescriptor, etc.)
@@ -424,17 +378,20 @@ pub const MAX_SLOTS: usize = 16;
 pub struct XhciController {
     /// PCI address (bus:device.function)
     pci_address: PciAddress,
-    /// Capability registers MMIO region (hardware state — must remain allocated)
+    /// MMIO region (kept alive so the mapping is not dropped)
     #[allow(dead_code)]
-    cap_regs: MmioRegion,
-    /// Operational registers MMIO region
-    op_regs: MmioRegion,
-    /// Runtime registers MMIO region
-    rt_regs: MmioRegion,
-    /// Doorbell registers MMIO region
-    db_regs: MmioRegion,
-    /// Port registers MMIO region
-    port_regs: MmioRegion,
+    mmio: MmioRegion,
+    /// Typed pointer to capability registers (kept for potential future use)
+    #[allow(dead_code)]
+    cap_regs: *const XhciCapRegs,
+    /// Typed pointer to operational registers
+    op_regs: *const XhciOpRegs,
+    /// Typed pointer to runtime registers
+    rt_regs: *const XhciRuntimeRegs,
+    /// Doorbell register base address
+    db_base: u64,
+    /// Port registers base address
+    port_regs_base: u64,
     /// Number of ports
     num_ports: u8,
     /// Page size used by controller
@@ -580,21 +537,26 @@ impl XhciController {
         // Enable the device (bus master + memory space)
         pci::enable_device(pci_dev);
 
-        // Read capability registers using MmioRegion
-        // First DWORD contains CAPLENGTH and HCIVERSION
-        let cap_dword0 = mmio.read32(CAP_CAPLENGTH as u64);
-        let caplength = (cap_dword0 & 0xFF) as u8;
-        let hciversion = ((cap_dword0 >> 16) & 0xFFFF) as u16;
+        // Cast MMIO base to typed capability registers
+        let cap_regs = mmio_base as *const XhciCapRegs;
+        let cap = unsafe { &*cap_regs };
 
-        let hcsparams1 = mmio.read32(CAP_HCSPARAMS1 as u64);
-        let hcsparams2 = mmio.read32(CAP_HCSPARAMS2 as u64);
-        let hccparams1 = mmio.read32(CAP_HCCPARAMS1 as u64);
-        let dboff = mmio.read32(CAP_DBOFF as u64);
-        let rtsoff = mmio.read32(CAP_RTSOFF as u64);
+        let caplength = cap
+            .caplength_hciversion
+            .read(CAPLENGTH_HCIVERSION::CAPLENGTH) as u8;
+        let hciversion = cap
+            .caplength_hciversion
+            .read(CAPLENGTH_HCIVERSION::HCIVERSION) as u16;
+        let hccparams1_val = cap.hccparams1.get();
+        let dboff = cap.dboff.get();
+        let rtsoff = cap.rtsoff.get();
 
-        // Determine context size from HCCPARAMS1.CSZ (bit 2)
-        // 0 = 32 bytes, 1 = 64 bytes
-        let context_size: u8 = if (hccparams1 & (1 << 2)) != 0 { 64 } else { 32 };
+        // Determine context size from HCCPARAMS1.CSZ
+        let context_size: u8 = if cap.hccparams1.is_set(HCCPARAMS1::CSZ) {
+            64
+        } else {
+            32
+        };
 
         // Reject controllers that require 64-byte contexts.
         // Our SlotContext, EndpointContext, InputContext, and DeviceContext structs
@@ -609,14 +571,12 @@ impl XhciController {
         }
 
         // Get max scratchpad buffers from HCSPARAMS2
-        // Bits 21-25: Max Scratchpad Buffers Hi
-        // Bits 27-31: Max Scratchpad Buffers Lo
-        let max_sp_hi = ((hcsparams2 >> 21) & 0x1F) as u16;
-        let max_sp_lo = ((hcsparams2 >> 27) & 0x1F) as u16;
+        let max_sp_hi = cap.hcsparams2.read(HCSPARAMS2::MAX_SCRATCHPAD_HI) as u16;
+        let max_sp_lo = cap.hcsparams2.read(HCSPARAMS2::MAX_SCRATCHPAD_LO) as u16;
         let num_scratchpad_bufs = (max_sp_hi << 5) | max_sp_lo;
 
         // Take ownership from BIOS/SMM before doing anything else
-        Self::take_bios_ownership(mmio_base, hccparams1);
+        Self::take_bios_ownership(mmio_base, hccparams1_val);
 
         // Calculate register region offsets
         let op_offset = caplength as u64;
@@ -624,8 +584,8 @@ impl XhciController {
         let db_offset = (dboff & !0x3) as u64;
         let port_offset = op_offset + 0x400;
 
-        let num_ports = ((hcsparams1 >> 24) & 0xFF) as u8;
-        let hw_max_slots = (hcsparams1 & 0xFF) as u8;
+        let num_ports = cap.hcsparams1.read(HCSPARAMS1::MAX_PORTS) as u8;
+        let hw_max_slots = cap.hcsparams1.read(HCSPARAMS1::MAX_SLOTS) as u8;
         // Cap to our Vec capacity
         let max_slots = (hw_max_slots as usize).min(MAX_SLOTS);
 
@@ -639,18 +599,14 @@ impl XhciController {
             hw_max_slots,
         );
 
-        // Create MMIO subregions for each register area
-        let cap_regs_region = mmio;
-        let op_regs_region =
-            MmioRegion::new(mmio_base + op_offset, XHCI_MMIO_SIZE - op_offset as usize);
-        let rt_regs_region = MmioRegion::new(mmio_base + rt_offset, 0x1000);
-        let db_regs_region = MmioRegion::new(mmio_base + db_offset, 0x1000);
-        let port_regs_region =
-            MmioRegion::new(mmio_base + port_offset, (num_ports as usize) * 0x10);
+        // Set up typed register pointers
+        let op_regs = (mmio_base + op_offset) as *const XhciOpRegs;
+        let rt_regs = (mmio_base + rt_offset) as *const XhciRuntimeRegs;
+        let db_base = mmio_base + db_offset;
+        let port_regs_base = mmio_base + port_offset;
 
         // Read page size from operational registers
-        let page_size_reg = op_regs_region.read32(OP_PAGESIZE as u64);
-        let page_size = (page_size_reg & 0xFFFF) << 12;
+        let page_size = (unsafe { &*op_regs }.pagesize.read(PAGESIZE::PAGE_SIZE)) << 12;
 
         log::debug!(
             "xHCI: context_size={}, scratchpad_bufs={}",
@@ -667,11 +623,12 @@ impl XhciController {
 
         let mut controller = Self {
             pci_address: pci_dev.address,
-            cap_regs: cap_regs_region,
-            op_regs: op_regs_region,
-            rt_regs: rt_regs_region,
-            db_regs: db_regs_region,
-            port_regs: port_regs_region,
+            mmio,
+            cap_regs,
+            op_regs,
+            rt_regs,
+            db_base,
+            port_regs_base,
             num_ports,
             page_size,
             context_size,
@@ -694,45 +651,23 @@ impl XhciController {
         Ok(controller)
     }
 
-    /// Read operational register
+    /// Get operational registers reference
     #[inline]
-    fn read_op_reg(&self, offset: u32) -> u32 {
-        self.op_regs.read32(offset as u64)
+    fn op(&self) -> &XhciOpRegs {
+        unsafe { &*self.op_regs }
     }
 
-    /// Write operational register
+    /// Get runtime registers reference
     #[inline]
-    fn write_op_reg(&self, offset: u32, value: u32) {
-        self.op_regs.write32(offset as u64, value)
+    fn rt(&self) -> &XhciRuntimeRegs {
+        unsafe { &*self.rt_regs }
     }
 
-    /// Read 64-bit operational register
+    /// Get port registers reference for a given port
     #[inline]
-    fn read_op_reg64(&self, offset: u32) -> u64 {
-        self.op_regs.read64(offset as u64)
-    }
-
-    /// Write 64-bit operational register (split into two 32-bit writes, lo first)
-    ///
-    /// The xHCI spec mandates that 64-bit registers (CRCR, DCBAAP) be written
-    /// as two 32-bit writes. Many controllers don't support atomic 64-bit MMIO
-    /// writes across the PCIe bus.
-    #[inline]
-    fn write_op_reg64(&self, offset: u32, value: u64) {
-        self.op_regs.write64_lo_hi(offset as u64, value)
-    }
-
-    /// Read port register
-    #[inline]
-    fn read_port_reg(&self, port: u8, offset: u32) -> u32 {
-        self.port_regs.read32((port as u64 * 0x10) + offset as u64)
-    }
-
-    /// Write port register
-    #[inline]
-    fn write_port_reg(&self, port: u8, offset: u32, value: u32) {
-        self.port_regs
-            .write32((port as u64 * 0x10) + offset as u64, value)
+    fn port(&self, port: u8) -> &XhciPortRegs {
+        let addr = self.port_regs_base + (port as u64) * 0x10;
+        unsafe { &*(addr as *const XhciPortRegs) }
     }
 
     /// Ring a doorbell
@@ -746,53 +681,27 @@ impl XhciController {
     /// This follows the Linux kernel's pattern in xhci-ring.c.
     #[inline]
     fn ring_doorbell(&self, slot: u8, target: u8) {
-        // The memory barrier should be done by caller before this point
-        // to ensure TRBs are written to memory before the doorbell signals
-        // the controller to read them.
-        let offset = slot as u64 * 4;
-        self.db_regs.write32(offset, target as u32);
-        // Readback to flush PCI posted write
-        let _ = self.db_regs.read32(offset);
-    }
-
-    /// Read interrupter register
-    #[inline]
-    fn read_interrupter_reg(&self, offset: u32) -> u32 {
-        // Interrupter 0 is at offset 0x20 within runtime registers
-        self.rt_regs.read32(0x20 + offset as u64)
-    }
-
-    /// Write interrupter register
-    #[inline]
-    fn write_interrupter_reg(&self, offset: u32, value: u32) {
-        // Interrupter 0 is at offset 0x20 within runtime registers
-        self.rt_regs.write32(0x20 + offset as u64, value)
-    }
-
-    /// Write 64-bit interrupter register (split into two 32-bit writes, lo first)
-    ///
-    /// The xHCI spec mandates that 64-bit registers (ERSTBA, ERDP) be written
-    /// as two 32-bit writes. Many controllers don't support atomic 64-bit MMIO
-    /// writes across the PCIe bus.
-    #[inline]
-    fn write_interrupter_reg64(&self, offset: u32, value: u64) {
-        self.rt_regs.write64_lo_hi(0x20 + offset as u64, value)
+        let addr = (self.db_base + slot as u64 * 4) as *mut u32;
+        unsafe {
+            ptr::write_volatile(addr, target as u32);
+            // Readback to flush PCI posted write
+            let _ = ptr::read_volatile(addr as *const u32);
+        }
     }
 
     /// Initialize the controller
     fn init(&mut self) -> Result<(), XhciError> {
         // Wait for controller to be ready (up to 100ms)
-        wait_for(100, || self.read_op_reg(OP_USBSTS) & USBSTS_CNR == 0);
+        wait_for(100, || !self.op().usbsts.is_set(USBSTS::CNR));
 
         // Stop the controller
-        let cmd = self.read_op_reg(OP_USBCMD);
-        self.write_op_reg(OP_USBCMD, cmd & !USBCMD_RS);
+        self.op().usbcmd.modify(USBCMD::RS::CLEAR);
 
         // Wait for halt (up to 100ms)
-        wait_for(100, || self.read_op_reg(OP_USBSTS) & USBSTS_HCH != 0);
+        wait_for(100, || self.op().usbsts.is_set(USBSTS::HCH));
 
         // Reset the controller
-        self.write_op_reg(OP_USBCMD, USBCMD_HCRST);
+        self.op().usbcmd.write(USBCMD::HCRST::SET);
 
         // Intel xHCI controllers require a 1ms delay after setting HCRST
         // before accessing any HC registers (prevents rare system hangs)
@@ -800,17 +709,16 @@ impl XhciController {
 
         // Wait for reset to complete (up to 500ms per USB spec)
         wait_for(500, || {
-            let cmd = self.read_op_reg(OP_USBCMD);
-            let sts = self.read_op_reg(OP_USBSTS);
-            cmd & USBCMD_HCRST == 0 && sts & USBSTS_CNR == 0
+            !self.op().usbcmd.is_set(USBCMD::HCRST) && !self.op().usbsts.is_set(USBSTS::CNR)
         });
 
         // Make sure interrupts are disabled
-        let cmd = self.read_op_reg(OP_USBCMD);
-        self.write_op_reg(OP_USBCMD, cmd & !USBCMD_INTE);
+        self.op().usbcmd.modify(USBCMD::INTE::CLEAR);
 
         // Set max device slots to our Vec capacity
-        self.write_op_reg(OP_CONFIG, self.slots.capacity() as u32);
+        self.op()
+            .config
+            .write(CONFIG::MAX_SLOTS_EN.val(self.slots.capacity() as u32));
 
         // Allocate and set up DCBAA (Device Context Base Address Array)
         // DCBAA[0] is reserved for scratchpad buffer array pointer
@@ -870,7 +778,7 @@ impl XhciController {
         // Memory barrier to ensure all DCBAA/scratchpad writes are visible
         fence(Ordering::SeqCst);
 
-        self.write_op_reg64(OP_DCBAAP, self.dcbaa);
+        self.op().write_dcbaap(self.dcbaa);
 
         // Allocate command ring (256 TRBs)
         let cmd_ring_mem = efi::allocate_pages(1).ok_or(XhciError::AllocationFailed)?;
@@ -878,7 +786,7 @@ impl XhciController {
         self.cmd_ring = TrbRing::new(cmd_ring_base, 256);
 
         // Set command ring pointer
-        self.write_op_reg64(OP_CRCR, self.cmd_ring.physical_addr());
+        self.op().write_crcr(self.cmd_ring.physical_addr());
 
         // Allocate event ring (256 TRBs) - no link TRB for event rings
         let event_ring_mem = efi::allocate_pages(1).ok_or(XhciError::AllocationFailed)?;
@@ -900,28 +808,28 @@ impl XhciController {
         }
 
         // Set ERSTSZ (Event Ring Segment Table Size)
-        self.write_interrupter_reg(0x08, 1);
+        self.rt().ir0.erstsz.write(ERSTSZ::SEGMENT_COUNT.val(1));
 
         // Set ERDP (Event Ring Dequeue Pointer)
-        self.write_interrupter_reg64(0x18, event_ring_base);
+        self.rt().ir0.write_erdp(event_ring_base);
 
         // Set ERSTBA (Event Ring Segment Table Base Address)
-        self.write_interrupter_reg64(0x10, self.erst);
+        self.rt().ir0.write_erstba(self.erst);
 
         // Enable interrupter 0 (IMAN.IE = 1)
         // Some controllers won't generate events at all unless the interrupter
-        // is enabled, even when using polling mode. Preserve IP (bit 0 is W1C,
-        // so writing 0 leaves it unchanged) and set IE (bit 1).
+        // is enabled, even when using polling mode. IP (bit 0) is RW1C, so we
+        // must NOT use modify() which would read-modify-write and accidentally
+        // clear a pending interrupt. Instead, mask IP to 0 and set IE explicitly.
         // This follows Linux's xhci_run_finished() pattern.
-        let iman = self.read_interrupter_reg(0x00);
-        self.write_interrupter_reg(0x00, (iman & !0x1) | 0x2);
+        let iman = self.rt().ir0.iman.get();
+        self.rt().ir0.iman.set((iman & !0x1) | 0x2);
 
         // Start the controller with event interrupt enable
-        let cmd = self.read_op_reg(OP_USBCMD);
-        self.write_op_reg(OP_USBCMD, cmd | USBCMD_RS | USBCMD_INTE);
+        self.op().usbcmd.modify(USBCMD::RS::SET + USBCMD::INTE::SET);
 
         // Wait for running (up to 100ms)
-        wait_for(100, || self.read_op_reg(OP_USBSTS) & USBSTS_HCH == 0);
+        wait_for(100, || !self.op().usbsts.is_set(USBSTS::HCH));
 
         // Power on all ports - many real hardware controllers require explicit port power
         self.power_on_ports();
@@ -935,19 +843,19 @@ impl XhciController {
     /// Many xHCI controllers (especially on real hardware) require explicit
     /// port power enable. Without this, devices won't be detected.
     fn power_on_ports(&self) {
-        for port in 0..self.num_ports {
-            let portsc = self.read_port_reg(port, PORT_PORTSC);
+        for port_num in 0..self.num_ports {
+            let port_reg = self.port(port_num);
 
             // Check if port power is already on
-            if portsc & PORTSC_PP != 0 {
+            if port_reg.portsc.is_set(PORTSC::PP) {
                 continue;
             }
 
             // Enable port power, preserving RW bits
-            let new_portsc = (portsc & PORTSC_RW_MASK) | PORTSC_PP;
-            self.write_port_reg(port, PORT_PORTSC, new_portsc);
+            let portsc = port_reg.portsc.get();
+            port_reg.portsc.set((portsc & PORTSC_RW_MASK) | (1 << 9));
 
-            log::debug!("xHCI: Powered on port {}", port);
+            log::debug!("xHCI: Powered on port {}", port_num);
         }
 
         // Wait for power to stabilize (2ms per USB spec, but give more time for real hardware)
@@ -1014,7 +922,7 @@ impl XhciController {
 
         // Timeout — still update ERDP for any events we consumed
         self.update_erdp();
-        let usbsts = self.read_op_reg(OP_USBSTS);
+        let usbsts = self.op().usbsts.get();
         log::warn!(
             "xHCI: Command timeout, USBSTS={:#x}, event_ring[0].control={:#x}",
             usbsts,
@@ -1179,7 +1087,7 @@ impl XhciController {
     fn update_erdp(&self) {
         let new_erdp = self.event_ring.base + (self.event_ring.dequeue_idx * 16) as u64;
         let erdp_with_ehb = (new_erdp & !0xF) | (1 << 3);
-        self.write_interrupter_reg64(0x18, erdp_with_ehb);
+        self.rt().ir0.write_erdp(erdp_with_ehb);
     }
 
     /// Reset an endpoint after a stall or other error
@@ -1279,14 +1187,14 @@ impl XhciController {
             "xHCI: Enable Slot TRB at {:#x}, cycle={}, CRCR={:#x}",
             cmd_addr,
             self.cmd_ring.cycle,
-            self.read_op_reg64(OP_CRCR)
+            self.op().read_crcr()
         );
 
         fence(Ordering::SeqCst); // Memory barrier before doorbell
         self.ring_doorbell(0, 0); // Ring host controller doorbell
 
         // Check USBSTS after ringing doorbell
-        let usbsts = self.read_op_reg(OP_USBSTS);
+        let usbsts = self.op().usbsts.get();
         log::debug!("xHCI: USBSTS after doorbell: {:#x}", usbsts);
 
         let completion = self.wait_command_completion()?;
@@ -1544,10 +1452,11 @@ impl XhciController {
     /// Enumerate ports and attach devices
     fn enumerate_ports(&mut self) -> Result<(), XhciError> {
         for port in 0..self.num_ports {
+            let port_reg = self.port(port);
+
             // Quick check — skip immediately if nothing connected.
             // This avoids the 100ms debounce cost for every empty port.
-            let portsc = self.read_port_reg(port, PORT_PORTSC);
-            if portsc & PORTSC_CCS == 0 {
+            if !port_reg.portsc.is_set(PORTSC::CCS) {
                 continue;
             }
 
@@ -1556,10 +1465,7 @@ impl XhciController {
             let mut stable_count = 0;
 
             for _ in 0..5 {
-                let portsc = self.read_port_reg(port, PORT_PORTSC);
-                let connected = portsc & PORTSC_CCS != 0;
-
-                if connected {
+                if self.port(port).portsc.is_set(PORTSC::CCS) {
                     stable_count += 1;
                 } else {
                     stable_count = 0;
@@ -1572,11 +1478,11 @@ impl XhciController {
                 continue;
             }
 
-            let portsc = self.read_port_reg(port, PORT_PORTSC);
+            let port_reg = self.port(port);
 
             // Get speed and link state
-            let speed = ((portsc & PORTSC_SPEED_MASK) >> 10) as u8;
-            let pls = portsc & PORTSC_PLS_MASK;
+            let speed = port_reg.portsc.read(PORTSC::SPEED) as u8;
+            let pls = port_reg.portsc.read(PORTSC::PLS);
             let speed_name = match speed {
                 1 => "Full",
                 2 => "Low",
@@ -1584,7 +1490,7 @@ impl XhciController {
                 4 => "Super",
                 _ => "Unknown",
             };
-            let pls_name = match pls >> 5 {
+            let pls_name = match pls {
                 0 => "U0",
                 5 => "RxDetect",
                 7 => "Polling",
@@ -1601,36 +1507,37 @@ impl XhciController {
             // If port is in RxDetect state, it's a phantom device (e.g., Thunderbolt
             // controller internal port that reports CCS=1 but has no real device).
             // Skip these immediately - they'll never come up.
-            if pls == PORTSC_PLS_RXDETECT {
+            if pls == 5 {
+                // RxDetect
                 log::debug!("Port {}: RxDetect state (phantom device), skipping", port);
                 continue;
             }
 
             // Clear status change bits using proper RW mask to avoid side effects
             // PORTSC has RW1C bits (write-1-to-clear) like PED, so we must be careful
-            let portsc = self.read_port_reg(port, PORT_PORTSC);
-            self.write_port_reg(
-                port,
-                PORT_PORTSC,
-                (portsc & PORTSC_RW_MASK) | PORTSC_CHANGE_MASK,
-            );
+            let portsc = self.port(port).portsc.get();
+            self.port(port)
+                .portsc
+                .set((portsc & PORTSC_RW_MASK) | PORTSC_CHANGE_MASK);
 
             // For USB3 SuperSpeed devices already in U0 state with port enabled,
             // skip the reset - the device is ready to use
             let is_usb3 = speed == 4; // SuperSpeed
-            let is_enabled = (portsc & PORTSC_PED) != 0;
-            let is_u0 = (portsc & PORTSC_PLS_MASK) == PORTSC_PLS_U0;
+            let is_enabled = self.port(port).portsc.is_set(PORTSC::PED);
+            let is_u0 = self.port(port).portsc.read(PORTSC::PLS) == 0;
 
             if is_usb3 && is_enabled && is_u0 {
                 log::debug!("Port {}: USB3 device already in U0, skipping reset", port);
-            } else if is_usb3 && (portsc & PORTSC_PLS_MASK) == PORTSC_PLS_POLLING {
+            } else if is_usb3 && self.port(port).portsc.read(PORTSC::PLS) == 7
+            // Polling
+            {
                 // USB3 device in Polling state - wait for link training to complete
                 log::debug!("Port {}: USB3 device in Polling, waiting for link", port);
                 let timeout = Timeout::from_ms(200);
                 let mut link_up = false;
                 while !timeout.is_expired() {
-                    let portsc = self.read_port_reg(port, PORT_PORTSC);
-                    if (portsc & PORTSC_PLS_MASK) == PORTSC_PLS_U0 && (portsc & PORTSC_PED) != 0 {
+                    let pr = self.port(port);
+                    if pr.portsc.read(PORTSC::PLS) == 0 && pr.portsc.is_set(PORTSC::PED) {
                         link_up = true;
                         break;
                     }
@@ -1640,74 +1547,68 @@ impl XhciController {
                     log::debug!(
                         "Port {}: USB3 link training failed (PLS={}), skipping",
                         port,
-                        (self.read_port_reg(port, PORT_PORTSC) & PORTSC_PLS_MASK) >> 5
+                        self.port(port).portsc.read(PORTSC::PLS)
                     );
                     continue;
                 }
-            } else if (portsc & PORTSC_PED) == 0 {
+            } else if !self.port(port).portsc.is_set(PORTSC::PED) {
                 // USB2 device or USB3 device that needs reset
-                let portsc = self.read_port_reg(port, PORT_PORTSC);
+                let portsc = self.port(port).portsc.get();
                 // Trigger port reset - preserve RW bits, set PR
-                self.write_port_reg(port, PORT_PORTSC, (portsc & PORTSC_RW_MASK) | PORTSC_PR);
+                self.port(port)
+                    .portsc
+                    .set((portsc & PORTSC_RW_MASK) | (1 << 4)); // PR bit
 
                 // Wait for reset to complete (up to 150ms per USB spec)
                 let timeout = Timeout::from_ms(150);
                 while !timeout.is_expired() {
-                    let portsc = self.read_port_reg(port, PORT_PORTSC);
-                    if portsc & PORTSC_PRC != 0 {
+                    if self.port(port).portsc.is_set(PORTSC::PRC) {
                         // Clear PRC by writing 1 to it (RW1C)
-                        self.write_port_reg(
-                            port,
-                            PORT_PORTSC,
-                            (portsc & PORTSC_RW_MASK) | PORTSC_PRC,
-                        );
+                        let portsc = self.port(port).portsc.get();
+                        self.port(port)
+                            .portsc
+                            .set((portsc & PORTSC_RW_MASK) | (1 << 21)); // PRC bit
                         break;
                     }
                     crate::time::delay_ms(1);
                 }
 
                 // After reset, verify link is actually up
-                let portsc = self.read_port_reg(port, PORT_PORTSC);
-                if portsc & PORTSC_PLS_MASK != PORTSC_PLS_U0 {
+                if self.port(port).portsc.read(PORTSC::PLS) != 0 {
                     // For USB3 devices, try warm reset if normal reset failed
                     if is_usb3 {
                         log::debug!(
                             "Port {}: USB3 normal reset failed (PLS={}), trying warm reset",
                             port,
-                            (portsc & PORTSC_PLS_MASK) >> 5
+                            self.port(port).portsc.read(PORTSC::PLS)
                         );
 
                         // Issue warm reset
-                        let portsc = self.read_port_reg(port, PORT_PORTSC);
-                        self.write_port_reg(
-                            port,
-                            PORT_PORTSC,
-                            (portsc & PORTSC_RW_MASK) | PORTSC_WPR,
-                        );
+                        let portsc = self.port(port).portsc.get();
+                        self.port(port)
+                            .portsc
+                            .set((portsc & PORTSC_RW_MASK) | (1 << 31)); // WPR bit
 
                         // Wait for warm reset to complete
                         let timeout = Timeout::from_ms(200);
                         while !timeout.is_expired() {
-                            let portsc = self.read_port_reg(port, PORT_PORTSC);
-                            if portsc & PORTSC_WRC != 0 {
+                            if self.port(port).portsc.is_set(PORTSC::WRC) {
                                 // Clear WRC by writing 1 to it (RW1C)
-                                self.write_port_reg(
-                                    port,
-                                    PORT_PORTSC,
-                                    (portsc & PORTSC_RW_MASK) | PORTSC_WRC,
-                                );
+                                let portsc = self.port(port).portsc.get();
+                                self.port(port)
+                                    .portsc
+                                    .set((portsc & PORTSC_RW_MASK) | (1 << 19)); // WRC bit
                                 break;
                             }
                             crate::time::delay_ms(1);
                         }
 
                         // Check if link came up after warm reset
-                        let portsc = self.read_port_reg(port, PORT_PORTSC);
-                        if portsc & PORTSC_PLS_MASK != PORTSC_PLS_U0 {
+                        if self.port(port).portsc.read(PORTSC::PLS) != 0 {
                             log::debug!(
                                 "Port {}: link not up after warm reset (PLS={}), skipping",
                                 port,
-                                (portsc & PORTSC_PLS_MASK) >> 5
+                                self.port(port).portsc.read(PORTSC::PLS)
                             );
                             continue;
                         }
@@ -1716,7 +1617,7 @@ impl XhciController {
                         log::debug!(
                             "Port {}: link not up after reset (PLS={}), skipping",
                             port,
-                            (portsc & PORTSC_PLS_MASK) >> 5
+                            self.port(port).portsc.read(PORTSC::PLS)
                         );
                         continue;
                     }
@@ -2204,20 +2105,17 @@ impl XhciController {
         log::debug!("xHCI cleanup: stopping controller");
 
         // 1. Stop the controller (clear RS bit)
-        let cmd = self.read_op_reg(OP_USBCMD);
-        self.write_op_reg(OP_USBCMD, cmd & !USBCMD_RS);
+        self.op().usbcmd.modify(USBCMD::RS::CLEAR);
 
         // Wait for halt (HCH bit set)
-        wait_for(100, || self.read_op_reg(OP_USBSTS) & USBSTS_HCH != 0);
+        wait_for(100, || self.op().usbsts.is_set(USBSTS::HCH));
 
         // 2. Reset the controller (optional but helps ensure clean state)
-        self.write_op_reg(OP_USBCMD, USBCMD_HCRST);
+        self.op().usbcmd.write(USBCMD::HCRST::SET);
 
         // Wait for reset to complete (HCRST clears and CNR clears)
         wait_for(500, || {
-            let cmd = self.read_op_reg(OP_USBCMD);
-            let sts = self.read_op_reg(OP_USBSTS);
-            (cmd & USBCMD_HCRST) == 0 && (sts & USBSTS_CNR) == 0
+            !self.op().usbcmd.is_set(USBCMD::HCRST) && !self.op().usbsts.is_set(USBSTS::CNR)
         });
 
         log::debug!("xHCI cleanup complete");

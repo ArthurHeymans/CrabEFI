@@ -29,7 +29,7 @@ use crate::drivers::spi::{self, SpiController};
 use crate::state::{self, MAX_VARIABLE_DATA_SIZE, MAX_VARIABLE_NAME_LEN};
 
 use super::storage::{SpiStorageBackend, StorageBackend};
-use super::{StoreHeader, VarStoreError, VariableRecord, STORE_HEADER_SIZE};
+use super::{STORE_HEADER_SIZE, StoreHeader, VarStoreError, VariableRecord};
 
 /// Default variable store base address in SPI flash
 /// This is typically at the end of the flash region
