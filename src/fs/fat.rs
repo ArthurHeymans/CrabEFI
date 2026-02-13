@@ -197,7 +197,7 @@ const MAX_LFN_LENGTH: usize = 255;
 ///
 /// LFN entries store up to 13 UTF-16 characters each and precede the 8.3 entry.
 /// They are stored in reverse order (last part first).
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, FromBytes, Immutable, KnownLayout, Unaligned)]
 #[repr(C, packed)]
 struct LfnEntry {
     /// Sequence number (0x40 | n for last, n for others)
@@ -959,8 +959,9 @@ impl<'a> FatFilesystem<'a> {
                         continue;
                     }
                     if entry.is_lfn() {
-                        let lfn_entry = unsafe { &*(&buffer[pos] as *const u8 as *const LfnEntry) };
-                        lfn_buffer.process_lfn(lfn_entry);
+                        if let Ok((lfn_entry, _)) = LfnEntry::read_from_prefix(&buffer[pos..]) {
+                            lfn_buffer.process_lfn(&lfn_entry);
+                        }
                         pos += 32;
                         bytes_processed += 32;
                         continue;
@@ -1009,9 +1010,9 @@ impl<'a> FatFilesystem<'a> {
                         continue;
                     }
                     if entry.is_lfn() {
-                        let lfn_entry =
-                            unsafe { &*(&buffer[offset] as *const u8 as *const LfnEntry) };
-                        lfn_buffer.process_lfn(lfn_entry);
+                        if let Ok((lfn_entry, _)) = LfnEntry::read_from_prefix(&buffer[offset..]) {
+                            lfn_buffer.process_lfn(&lfn_entry);
+                        }
                         continue;
                     }
                     if entry.is_volume_id() {

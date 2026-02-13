@@ -22,19 +22,19 @@ impl PageTable {
 // 64GB requires 64 Page Directories (64 * 512 * 2MB = 64GB)
 #[unsafe(no_mangle)]
 #[unsafe(link_section = ".page_tables")]
-pub static mut PML4: PageTable = PageTable::empty();
+static mut PML4: PageTable = PageTable::empty();
 
 #[unsafe(no_mangle)]
 #[unsafe(link_section = ".page_tables")]
-pub static mut PDPT: PageTable = PageTable::empty();
+static mut PDPT: PageTable = PageTable::empty();
 
 /// Number of Page Directories for identity mapping
 /// 64 PDs * 512 entries * 2MB per entry = 64GB
-pub const NUM_PAGE_DIRECTORIES: usize = 64;
+const NUM_PAGE_DIRECTORIES: usize = 64;
 
 #[unsafe(no_mangle)]
 #[unsafe(link_section = ".page_tables")]
-pub static mut PD: [PageTable; NUM_PAGE_DIRECTORIES] =
+static mut PD: [PageTable; NUM_PAGE_DIRECTORIES] =
     [const { PageTable::empty() }; NUM_PAGE_DIRECTORIES];
 
 // Assembly entry point - Intel syntax

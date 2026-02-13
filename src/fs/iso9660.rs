@@ -10,6 +10,8 @@
 //! - Boot Catalog at a sector specified in the BRVD
 //! - EFI boot image referenced in the boot catalog (platform ID 0xEF)
 
+use zerocopy::{FromBytes, Immutable, KnownLayout, Unaligned};
+
 use crate::drivers::block::{BlockDevice, BlockError};
 
 /// ISO9660 sector size (always 2048 bytes)
@@ -29,7 +31,7 @@ const PLATFORM_EFI: u8 = 0xEF;
 
 /// El Torito boot catalog entry - Validation Entry
 #[repr(C, packed)]
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, FromBytes, Immutable, KnownLayout, Unaligned)]
 struct ValidationEntry {
     header_id: u8,   // Must be 0x01
     platform_id: u8, // 0 = x86, 1 = PowerPC, 2 = Mac, 0xEF = EFI
@@ -42,7 +44,7 @@ struct ValidationEntry {
 
 /// El Torito boot catalog entry - Initial/Default or Section Entry
 #[repr(C, packed)]
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, FromBytes, Immutable, KnownLayout, Unaligned)]
 struct BootEntry {
     boot_indicator: u8,  // 0x88 = bootable, 0x00 = not bootable
     boot_media_type: u8, // 0 = no emulation, 1 = 1.2M floppy, etc.
@@ -56,7 +58,7 @@ struct BootEntry {
 
 /// El Torito section header
 #[repr(C, packed)]
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, FromBytes, Immutable, KnownLayout, Unaligned)]
 struct SectionHeader {
     header_indicator: u8, // 0x90 = more sections, 0x91 = final section
     platform_id: u8,
@@ -236,7 +238,8 @@ pub fn find_efi_boot_image(device: &mut dyn BlockDevice) -> Result<EfiBootImage,
     }
 
     // Parse validation entry (first 32 bytes)
-    let validation = unsafe { &*(buffer.as_ptr() as *const ValidationEntry) };
+    let (validation, _) =
+        ValidationEntry::read_from_prefix(&buffer[..]).map_err(|_| IsoError::InvalidCatalog)?;
 
     if validation.header_id != 0x01 || validation.key55 != 0x55 || validation.keyaa != 0xAA {
         log::debug!("El Torito: Invalid validation entry");
@@ -249,7 +252,8 @@ pub fn find_efi_boot_image(device: &mut dyn BlockDevice) -> Result<EfiBootImage,
     );
 
     // Check if the initial/default entry is EFI
-    let default_entry = unsafe { &*(buffer.as_ptr().add(32) as *const BootEntry) };
+    let (default_entry, _) =
+        BootEntry::read_from_prefix(&buffer[32..]).map_err(|_| IsoError::InvalidCatalog)?;
 
     if validation.platform_id == PLATFORM_EFI && default_entry.boot_indicator == 0x88 {
         let load_rba = default_entry.load_rba;
@@ -274,7 +278,10 @@ pub fn find_efi_boot_image(device: &mut dyn BlockDevice) -> Result<EfiBootImage,
     let mut offset = 64usize; // Start after validation + default entry
 
     while offset + 32 <= ISO_SECTOR_SIZE {
-        let header = unsafe { &*(buffer.as_ptr().add(offset) as *const SectionHeader) };
+        let (header, _) = match SectionHeader::read_from_prefix(&buffer[offset..]) {
+            Ok(h) => h,
+            Err(_) => break,
+        };
 
         // Check if this is a section header
         let indicator = header.header_indicator;
@@ -301,7 +308,10 @@ pub fn find_efi_boot_image(device: &mut dyn BlockDevice) -> Result<EfiBootImage,
                 break;
             }
 
-            let entry = unsafe { &*(buffer.as_ptr().add(offset) as *const BootEntry) };
+            let (entry, _) = match BootEntry::read_from_prefix(&buffer[offset..]) {
+                Ok(e) => e,
+                Err(_) => break,
+            };
 
             if platform == PLATFORM_EFI && entry.boot_indicator == 0x88 {
                 let load_rba = entry.load_rba;

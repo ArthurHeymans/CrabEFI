@@ -97,7 +97,9 @@ impl IntelSpiController {
         log::debug!("SPI BAR at physical address: {:#x}", spibar_addr);
 
         // Map the SPI registers (512 bytes should be enough for all generations)
-        let spibar = MmioRegion::new(spibar_addr, 0x200);
+        // SAFETY: spibar_addr is decoded from the chipset's SPI BAR register,
+        // a valid MMIO region for SPI controller registers.
+        let spibar = unsafe { MmioRegion::new(spibar_addr, 0x200) };
 
         // Determine address mask based on generation
         let hwseq_addr_mask = if generation.is_pch100_compatible() {

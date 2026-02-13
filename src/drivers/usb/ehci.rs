@@ -25,6 +25,7 @@ use crate::time::{Timeout, wait_for};
 use core::ptr;
 use core::sync::atomic::{Ordering, fence};
 use tock_registers::interfaces::{ReadWriteable, Readable, Writeable};
+use zerocopy::FromBytes;
 
 use super::controller::{
     DeviceInfo, EndpointInfo, HUB_DESCRIPTOR_TYPE, HubDescriptor, SetupPacket, UsbController,
@@ -812,8 +813,8 @@ impl EhciController {
             Some(&mut hub_desc_buf),
         )?;
 
-        let hub_desc =
-            unsafe { ptr::read_unaligned(hub_desc_buf.as_ptr() as *const HubDescriptor) };
+        let (hub_desc, _) = HubDescriptor::read_from_prefix(&hub_desc_buf)
+            .map_err(|_| UsbError::TransferFailed(0))?;
         let num_ports = hub_desc.num_ports;
         let power_on_delay = (hub_desc.power_on_to_power_good as u32) * 2; // Convert to ms
 

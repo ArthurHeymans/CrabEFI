@@ -223,14 +223,7 @@ fn build_signed_data(
     result.extend_from_slice(&attributes.to_le_bytes());
 
     // TimeStamp (EFI_TIME, 16 bytes)
-    // We need to serialize the timestamp as raw bytes
-    let timestamp_bytes: &[u8] = unsafe {
-        core::slice::from_raw_parts(
-            timestamp as *const EfiTime as *const u8,
-            core::mem::size_of::<EfiTime>(),
-        )
-    };
-    result.extend_from_slice(timestamp_bytes);
+    result.extend_from_slice(zerocopy::IntoBytes::as_bytes(timestamp));
 
     // DataNew (the actual variable data)
     result.extend_from_slice(data);

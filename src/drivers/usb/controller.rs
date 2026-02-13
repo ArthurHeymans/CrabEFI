@@ -12,7 +12,7 @@
 
 use crate::efi;
 use core::ptr;
-use zerocopy::{FromBytes, Immutable, KnownLayout, Unaligned};
+use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned};
 
 // ============================================================================
 // USB Speed
@@ -126,7 +126,7 @@ pub enum Direction {
 /// Used for control transfers to send commands to USB devices.
 /// All multi-byte fields are little-endian.
 #[repr(C, packed)]
-#[derive(FromBytes, Immutable, KnownLayout, Unaligned, Clone, Copy, Debug)]
+#[derive(FromBytes, IntoBytes, Immutable, KnownLayout, Unaligned, Clone, Copy, Debug)]
 pub struct SetupPacket {
     /// Request type (direction, type, recipient)
     pub request_type: u8,
@@ -154,7 +154,7 @@ impl SetupPacket {
 
     /// Get the packet as a byte slice for DMA transfers
     pub fn as_bytes(&self) -> &[u8] {
-        unsafe { core::slice::from_raw_parts(self as *const Self as *const u8, 8) }
+        <Self as IntoBytes>::as_bytes(self)
     }
 }
 
@@ -1167,8 +1167,10 @@ where
         Some(&mut desc_buf),
     )?;
 
-    device.device_desc =
-        unsafe { ptr::read_unaligned(desc_buf.as_ptr() as *const DeviceDescriptor) };
+    device.device_desc = match DeviceDescriptor::read_from_prefix(&desc_buf) {
+        Ok((d, _)) => d,
+        Err(_) => return Err(UsbError::TransferFailed(0)),
+    };
 
     let vid = device.device_desc.vendor_id;
     let pid = device.device_desc.product_id;

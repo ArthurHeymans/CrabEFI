@@ -412,7 +412,9 @@ impl OhciController {
     /// Create a new OHCI controller from a PCI device
     pub fn new(pci_dev: &PciDevice) -> Result<Self, UsbError> {
         let mmio_base = pci_dev.mmio_base().ok_or(UsbError::NotReady)?;
-        let mmio = MmioRegion::new(mmio_base, OHCI_MMIO_SIZE);
+        // SAFETY: mmio_base is a PCI BAR address for this OHCI controller,
+        // mapped by the platform and valid for the device's lifetime.
+        let mmio = unsafe { MmioRegion::new(mmio_base, OHCI_MMIO_SIZE) };
 
         // Enable the device (bus master + memory space)
         pci::enable_device(pci_dev);

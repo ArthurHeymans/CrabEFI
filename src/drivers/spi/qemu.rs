@@ -129,7 +129,9 @@ impl QemuPflashController {
 
     /// Initialize with specific configuration from coreboot
     fn init_with_config(host_base: u64, flash_size: u32) -> Result<Self> {
-        let pflash = MmioRegion::new(host_base, flash_size as usize);
+        // SAFETY: host_base is the pflash MMIO base address from coreboot tables
+        // or a known QEMU configuration address, valid for the flash region.
+        let pflash = unsafe { MmioRegion::new(host_base, flash_size as usize) };
 
         let mut controller = Self {
             pflash,
@@ -173,7 +175,9 @@ impl QemuPflashController {
 
     /// Try to initialize pflash at a specific address
     fn try_init_at(host_base: u64, flash_size: u32) -> Result<Self> {
-        let pflash = MmioRegion::new(host_base, flash_size as usize);
+        // SAFETY: host_base is a candidate pflash MMIO address from a known
+        // QEMU configuration, validated by subsequent read probes below.
+        let pflash = unsafe { MmioRegion::new(host_base, flash_size as usize) };
 
         // Use coreboot-style detection to verify this is pflash
         // Try to find a suitable test byte (not 0xFF, not ending in 0)

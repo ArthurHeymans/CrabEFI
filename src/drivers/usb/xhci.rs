@@ -532,7 +532,9 @@ impl XhciController {
     /// Create a new xHCI controller from a PCI device
     pub fn new(pci_dev: &PciDevice) -> Result<Self, XhciError> {
         let mmio_base = pci_dev.mmio_base().ok_or(XhciError::NotReady)?;
-        let mmio = MmioRegion::new(mmio_base, XHCI_MMIO_SIZE);
+        // SAFETY: mmio_base is a PCI BAR address for this xHCI controller,
+        // mapped by the platform and valid for the device's lifetime.
+        let mmio = unsafe { MmioRegion::new(mmio_base, XHCI_MMIO_SIZE) };
 
         // Enable the device (bus master + memory space)
         pci::enable_device(pci_dev);

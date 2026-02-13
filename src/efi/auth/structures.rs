@@ -6,7 +6,7 @@
 //! Note: We use raw byte arrays instead of r_efi::Guid because Guid has alignment
 //! requirements that conflict with packed structures.
 
-use zerocopy::{FromBytes, Immutable, KnownLayout, Unaligned};
+use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned};
 
 // ============================================================================
 // EFI_TIME Structure
@@ -17,7 +17,7 @@ use zerocopy::{FromBytes, Immutable, KnownLayout, Unaligned};
 /// Used in EFI_VARIABLE_AUTHENTICATION_2 to record when a variable was last updated.
 /// The OS/firmware should reject updates with timestamps <= the stored timestamp.
 #[repr(C, packed)]
-#[derive(Debug, Clone, Copy, FromBytes, Immutable, KnownLayout, Unaligned)]
+#[derive(Debug, Clone, Copy, FromBytes, IntoBytes, Immutable, KnownLayout, Unaligned)]
 pub struct EfiTime {
     /// Year (1900 - 9999)
     pub year: u16,

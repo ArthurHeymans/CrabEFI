@@ -8,7 +8,7 @@
 
 use super::controller::{UsbController, UsbError};
 use crate::time;
-use zerocopy::{FromBytes, Immutable, KnownLayout, Unaligned};
+use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned};
 
 /// SCSI Commands
 #[allow(dead_code)]
@@ -24,7 +24,7 @@ mod scsi_cmd {
 
 /// Command Block Wrapper (CBW) - 31 bytes
 #[repr(C, packed)]
-#[derive(FromBytes, Immutable, KnownLayout, Unaligned, Clone, Copy, Default)]
+#[derive(FromBytes, IntoBytes, Immutable, KnownLayout, Unaligned, Clone, Copy, Default)]
 pub struct CommandBlockWrapper {
     /// Signature (0x43425355 = "USBC")
     pub signature: u32,
@@ -402,9 +402,8 @@ impl UsbMassStorage {
         );
 
         // Phase 1: Send CBW (OUT)
-        let cbw_bytes = unsafe { core::slice::from_raw_parts(&cbw as *const _ as *const u8, 31) };
         let mut cbw_buf = [0u8; 31];
-        cbw_buf.copy_from_slice(cbw_bytes);
+        cbw_buf.copy_from_slice(IntoBytes::as_bytes(&cbw));
 
         if let Err(e) =
             controller.bulk_transfer(self.device_addr, self.bulk_out, false, &mut cbw_buf)

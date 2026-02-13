@@ -57,7 +57,7 @@ impl MmioRegion {
     /// # Panics
     ///
     /// Panics if `base` is null.
-    pub fn new(base: u64, #[allow(unused_variables)] size: usize) -> Self {
+    pub unsafe fn new(base: u64, #[allow(unused_variables)] size: usize) -> Self {
         let ptr = NonNull::new(base as *mut u8).expect("MMIO base address cannot be null");
         Self {
             base: ptr,
@@ -94,7 +94,9 @@ impl MmioRegion {
                 self.size
             );
         }
-        Self::new(self.base() + offset, size)
+        // SAFETY: If `self` is a valid MMIO region and the offset+size is within
+        // bounds (checked above in debug), the sub-region is also valid MMIO space.
+        unsafe { Self::new(self.base() + offset, size) }
     }
 
     /// Check if an access at the given offset and size is within bounds.
@@ -136,6 +138,11 @@ impl MmioRegion {
     pub fn read16(&self, offset: u64) -> u16 {
         #[cfg(debug_assertions)]
         self.check_bounds(offset, 2);
+        debug_assert!(
+            offset.is_multiple_of(2),
+            "MMIO read16 misaligned: offset={:#x}",
+            offset
+        );
 
         let reg = unsafe { &*(self.base.as_ptr().add(offset as usize) as *const ReadOnly<u16>) };
         reg.get()
@@ -146,6 +153,11 @@ impl MmioRegion {
     pub fn write16(&self, offset: u64, value: u16) {
         #[cfg(debug_assertions)]
         self.check_bounds(offset, 2);
+        debug_assert!(
+            offset.is_multiple_of(2),
+            "MMIO write16 misaligned: offset={:#x}",
+            offset
+        );
 
         let reg = unsafe { &*(self.base.as_ptr().add(offset as usize) as *const WriteOnly<u16>) };
         reg.set(value);
@@ -156,6 +168,11 @@ impl MmioRegion {
     pub fn read32(&self, offset: u64) -> u32 {
         #[cfg(debug_assertions)]
         self.check_bounds(offset, 4);
+        debug_assert!(
+            offset.is_multiple_of(4),
+            "MMIO read32 misaligned: offset={:#x}",
+            offset
+        );
 
         let reg = unsafe { &*(self.base.as_ptr().add(offset as usize) as *const ReadOnly<u32>) };
         reg.get()
@@ -166,6 +183,11 @@ impl MmioRegion {
     pub fn write32(&self, offset: u64, value: u32) {
         #[cfg(debug_assertions)]
         self.check_bounds(offset, 4);
+        debug_assert!(
+            offset.is_multiple_of(4),
+            "MMIO write32 misaligned: offset={:#x}",
+            offset
+        );
 
         let reg = unsafe { &*(self.base.as_ptr().add(offset as usize) as *const WriteOnly<u32>) };
         reg.set(value);
@@ -182,6 +204,11 @@ impl MmioRegion {
     {
         #[cfg(debug_assertions)]
         self.check_bounds(offset, 4);
+        debug_assert!(
+            offset.is_multiple_of(4),
+            "MMIO modify32 misaligned: offset={:#x}",
+            offset
+        );
 
         let reg = unsafe { &*(self.base.as_ptr().add(offset as usize) as *const ReadWrite<u32>) };
         let old = reg.get();
@@ -193,6 +220,11 @@ impl MmioRegion {
     pub fn read64(&self, offset: u64) -> u64 {
         #[cfg(debug_assertions)]
         self.check_bounds(offset, 8);
+        debug_assert!(
+            offset.is_multiple_of(8),
+            "MMIO read64 misaligned: offset={:#x}",
+            offset
+        );
 
         let reg = unsafe { &*(self.base.as_ptr().add(offset as usize) as *const ReadOnly<u64>) };
         reg.get()
@@ -203,6 +235,11 @@ impl MmioRegion {
     pub fn write64(&self, offset: u64, value: u64) {
         #[cfg(debug_assertions)]
         self.check_bounds(offset, 8);
+        debug_assert!(
+            offset.is_multiple_of(8),
+            "MMIO write64 misaligned: offset={:#x}",
+            offset
+        );
 
         let reg = unsafe { &*(self.base.as_ptr().add(offset as usize) as *const WriteOnly<u64>) };
         reg.set(value);
@@ -221,6 +258,11 @@ impl MmioRegion {
     pub fn write64_lo_hi(&self, offset: u64, value: u64) {
         #[cfg(debug_assertions)]
         self.check_bounds(offset, 8);
+        debug_assert!(
+            offset.is_multiple_of(4),
+            "MMIO write64_lo_hi misaligned: offset={:#x}",
+            offset
+        );
 
         let lo = value as u32;
         let hi = (value >> 32) as u32;
@@ -240,6 +282,11 @@ impl MmioRegion {
     {
         #[cfg(debug_assertions)]
         self.check_bounds(offset, 8);
+        debug_assert!(
+            offset.is_multiple_of(8),
+            "MMIO modify64 misaligned: offset={:#x}",
+            offset
+        );
 
         let reg = unsafe { &*(self.base.as_ptr().add(offset as usize) as *const ReadWrite<u64>) };
         let old = reg.get();

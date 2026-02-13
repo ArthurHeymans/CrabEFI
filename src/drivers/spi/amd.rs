@@ -145,7 +145,9 @@ impl AmdSpi100Controller {
         log::info!("AMD SPI100 BAR at {:#010x}", phys_spibar);
 
         // Map the SPI registers (256 bytes)
-        let spibar_region = MmioRegion::new(phys_spibar, 256);
+        // SAFETY: phys_spibar is decoded from the LPC ISA bridge SPIROM BAR,
+        // a valid MMIO region for SPI controller registers.
+        let spibar_region = unsafe { MmioRegion::new(phys_spibar, 256) };
 
         // Read current speed config for restoration later
         let speed_cfg = spibar_region.read16(regs::SPEED_CFG);
