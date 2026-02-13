@@ -298,8 +298,8 @@ fn validate_certificate(data: &[u8]) -> Result<(), AuthError> {
     }
 
     // Try to parse with the crypto module
-    match super::crypto::parse_x509_certificate(data) {
-        Ok(_cert) => {
+    match super::crypto::validate_x509_certificate(data) {
+        Ok(()) => {
             log::debug!("Certificate validated successfully");
             Ok(())
         }

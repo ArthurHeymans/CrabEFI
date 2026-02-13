@@ -9,12 +9,15 @@
 //! - Certificate revocation checking (CRL/OCSP)
 
 use super::AuthError;
-use super::parse_der_length;
 use super::revocation::{RevocationCheckResult, RevocationConfig, check_certificate_revocation};
 use super::time;
 use alloc::vec;
 use alloc::vec::Vec;
+use der::{Decode, Encode, referenced::OwnedToRef};
 use sha2::{Digest, Sha256};
+use x509_cert::Certificate;
+use x509_cert::ext::pkix::KeyUsage as X509KeyUsage;
+use x509_cert::ext::pkix::constraints::BasicConstraints as X509BasicConstraints;
 
 // ============================================================================
 // Certificate Chain Building Configuration
@@ -129,7 +132,6 @@ pub fn verify_pkcs7_signature(
 ) -> Result<bool, AuthError> {
     use cms::content_info::ContentInfo;
     use cms::signed_data::SignedData;
-    use der::{Decode, Encode};
 
     // WIN_CERTIFICATE is 8-byte aligned, so there may be trailing padding bytes
     // after the actual PKCS#7 content. We need to calculate the real DER length
@@ -152,8 +154,8 @@ pub fn verify_pkcs7_signature(
         AuthError::InvalidHeader
     })?;
 
-    // Parse the trusted certificate from db
-    let _trusted = parse_x509_certificate(trusted_cert)?;
+    // Validate the trusted certificate from db can be parsed
+    parse_cert(trusted_cert)?;
 
     // Extract embedded certificates from the PKCS#7
     let embedded_certs: Vec<Vec<u8>> = if let Some(ref certs) = cms_signed_data.certificates {
@@ -215,13 +217,14 @@ pub fn verify_pkcs7_signature(
             find_signer_certificate(&cms_signed_data, signer_info, &embedded_certs)?;
 
         if let Some(signer_der) = signer_cert_der {
-            let signer_cert = parse_x509_certificate(&signer_der)?;
+            let signer_cert = parse_cert(&signer_der)?;
+            let signer_rsa_key = extract_rsa_key(&signer_cert)?;
 
             // Build the data that was signed (signed attributes or content)
             let data_to_verify = build_signed_attrs_digest(signer_info, &computed_hash)?;
 
             // CRITICAL: Verify the RSA signature cryptographically
-            match verify_rsa_signature_raw(&signer_cert.public_key, signature, &data_to_verify) {
+            match verify_rsa_signature_raw(&signer_rsa_key, signature, &data_to_verify) {
                 Ok(true) => {
                     log::debug!("RSA signature verification succeeded");
 
@@ -269,26 +272,20 @@ fn extract_message_digest(
     signer_info: &cms::signed_data::SignerInfo,
 ) -> Result<Option<Vec<u8>>, AuthError> {
     use der::Encode;
+    use der::asn1::OctetStringRef;
 
-    // The messageDigest is in the signed attributes
+    // messageDigest OID: 1.2.840.113549.1.9.4
+    let md_oid = const_oid::ObjectIdentifier::new_unwrap("1.2.840.113549.1.9.4");
+
     if let Some(ref attrs) = signer_info.signed_attrs {
         for attr in attrs.iter() {
-            // messageDigest OID: 1.2.840.113549.1.9.4
-            const MESSAGE_DIGEST_OID: &[u8] =
-                &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x09, 0x04];
-            let attr_oid = attr.oid.as_bytes();
-            if attr_oid == MESSAGE_DIGEST_OID {
-                // Extract the OCTET STRING value
-                if let Some(value) = attr.values.get(0) {
-                    let value_bytes = value.to_der().map_err(|_| AuthError::InvalidHeader)?;
-                    // Parse the OCTET STRING to get the hash
-                    if value_bytes.len() > 2 && value_bytes[0] == 0x04 {
-                        let (len, offset) = parse_der_length(&value_bytes[1..])?;
-                        if offset + len < value_bytes.len() {
-                            return Ok(Some(value_bytes[1 + offset..1 + offset + len].to_vec()));
-                        }
-                    }
-                }
+            if attr.oid == md_oid
+                && let Some(value) = attr.values.get(0)
+            {
+                let value_bytes = value.to_der().map_err(|_| AuthError::InvalidHeader)?;
+                let oct =
+                    OctetStringRef::from_der(&value_bytes).map_err(|_| AuthError::InvalidHeader)?;
+                return Ok(Some(oct.as_bytes().to_vec()));
             }
         }
     }
@@ -307,12 +304,14 @@ fn find_signer_certificate(
         SignerIdentifier::IssuerAndSerialNumber(issuer_and_serial) => {
             // Find cert matching issuer and serial number
             for cert_der in embedded_certs {
-                if let Ok(cert) = parse_x509_certificate(cert_der) {
-                    // Compare issuer (DER encoded) and serial number
-                    use der::Encode;
-                    if let Ok(issuer_bytes) = issuer_and_serial.issuer.to_der()
-                        && cert.issuer == issuer_bytes
-                        && cert.serial_number == issuer_and_serial.serial_number.as_bytes()
+                if let Ok(cert) = parse_cert(cert_der) {
+                    let tbs = &cert.tbs_certificate;
+                    // Compare issuer (DER-encoded) and serial number
+                    if let Ok(cert_issuer_der) = tbs.issuer.to_der()
+                        && let Ok(signer_issuer_der) = issuer_and_serial.issuer.to_der()
+                        && cert_issuer_der == signer_issuer_der
+                        && tbs.serial_number.as_bytes()
+                            == issuer_and_serial.serial_number.as_bytes()
                     {
                         return Ok(Some(cert_der.clone()));
                     }
@@ -337,15 +336,11 @@ fn find_signer_certificate(
 
 /// Extract Subject Key Identifier from a certificate
 fn extract_subject_key_identifier(cert_der: &[u8]) -> Result<Vec<u8>, AuthError> {
-    use der::Decode;
-    use x509_cert::Certificate;
-
     let cert = Certificate::from_der(cert_der).map_err(|_| AuthError::CertificateParseError)?;
 
     if let Some(extensions) = &cert.tbs_certificate.extensions {
         for ext in extensions.iter() {
-            // Subject Key Identifier OID: 2.5.29.14
-            if ext.extn_id.as_bytes() == [0x55, 0x1d, 0x0e] {
+            if ext.extn_id == const_oid::db::rfc5280::ID_CE_SUBJECT_KEY_IDENTIFIER {
                 return Ok(ext.extn_value.as_bytes().to_vec());
             }
         }
@@ -431,12 +426,13 @@ pub fn build_and_verify_chain(
     );
 
     // Parse the end-entity and trust anchor certificates
-    let end_entity = parse_x509_certificate(end_entity_der)?;
-    let trust_anchor = parse_x509_certificate(trust_anchor_der)?;
+    let end_entity = parse_cert(end_entity_der)?;
+    let trust_anchor = parse_cert(trust_anchor_der)?;
 
     // Quick check: is the end-entity directly the trust anchor?
-    if end_entity.subject == trust_anchor.subject
-        && end_entity.serial_number == trust_anchor.serial_number
+    if end_entity.tbs_certificate.subject == trust_anchor.tbs_certificate.subject
+        && end_entity.tbs_certificate.serial_number.as_bytes()
+            == trust_anchor.tbs_certificate.serial_number.as_bytes()
     {
         // Self-signed or directly trusted - verify the chain
         if verify_single_cert(end_entity_der, trust_anchor_der, config)? {
@@ -447,7 +443,7 @@ pub fn build_and_verify_chain(
     }
 
     // Quick check: is the end-entity directly issued by the trust anchor?
-    if end_entity.issuer == trust_anchor.subject
+    if end_entity.tbs_certificate.issuer == trust_anchor.tbs_certificate.subject
         && verify_single_cert(end_entity_der, trust_anchor_der, config)?
     {
         return Ok(CertificateChain {
@@ -458,8 +454,14 @@ pub fn build_and_verify_chain(
     // Need to build a chain through intermediates
     let mut chain = vec![end_entity_der.to_vec()];
 
-    // Use recursive chain building with cycle detection
-    let mut visited: Vec<Vec<u8>> = vec![end_entity.subject.clone()];
+    // Use recursive chain building with cycle detection (DER-encoded subjects)
+    let mut visited: Vec<Vec<u8>> = vec![
+        end_entity
+            .tbs_certificate
+            .subject
+            .to_der()
+            .map_err(|_| AuthError::CertificateParseError)?,
+    ];
 
     match build_chain_recursive(
         &end_entity,
@@ -491,9 +493,9 @@ pub fn build_and_verify_chain(
 
 /// Recursively build the certificate chain
 fn build_chain_recursive(
-    current_cert: &X509Certificate,
+    current_cert: &Certificate,
     current_cert_der: &[u8],
-    trust_anchor: &X509Certificate,
+    trust_anchor: &Certificate,
     trust_anchor_der: &[u8],
     intermediates: &[Vec<u8>],
     chain: &mut Vec<Vec<u8>>,
@@ -512,7 +514,7 @@ fn build_chain_recursive(
     }
 
     // Check if current cert is issued by trust anchor
-    if current_cert.issuer == trust_anchor.subject {
+    if current_cert.tbs_certificate.issuer == trust_anchor.tbs_certificate.subject {
         // Verify this link
         if verify_chain_link(current_cert_der, trust_anchor_der, config)? {
             chain.push(trust_anchor_der.to_vec());
@@ -522,14 +524,19 @@ fn build_chain_recursive(
 
     // Search for an intermediate that issued the current certificate
     for intermediate_der in intermediates {
-        if let Ok(intermediate) = parse_x509_certificate(intermediate_der) {
+        if let Ok(intermediate) = parse_cert(intermediate_der) {
             // Check if this intermediate issued the current certificate
-            if current_cert.issuer != intermediate.subject {
+            if current_cert.tbs_certificate.issuer != intermediate.tbs_certificate.subject {
                 continue;
             }
 
-            // Check for cycles (prevent infinite loops)
-            if visited.contains(&intermediate.subject) {
+            // Check for cycles (prevent infinite loops) using DER-encoded subjects
+            let intermediate_subject_der = intermediate
+                .tbs_certificate
+                .subject
+                .to_der()
+                .map_err(|_| AuthError::CertificateParseError)?;
+            if visited.contains(&intermediate_subject_der) {
                 log::debug!("Cycle detected in certificate chain");
                 continue;
             }
@@ -542,14 +549,18 @@ fn build_chain_recursive(
             // Check revocation status of intermediate if enabled
             if config.check_revocation {
                 // Find the issuer of this intermediate for revocation checking
-                let issuer_der = if intermediate.issuer == trust_anchor.subject {
+                let issuer_der = if intermediate.tbs_certificate.issuer
+                    == trust_anchor.tbs_certificate.subject
+                {
                     Some(trust_anchor_der)
                 } else {
                     intermediates
                         .iter()
                         .find(|c| {
-                            parse_x509_certificate(c)
-                                .map(|p| p.subject == intermediate.issuer)
+                            parse_cert(c)
+                                .map(|p| {
+                                    p.tbs_certificate.subject == intermediate.tbs_certificate.issuer
+                                })
                                 .unwrap_or(false)
                         })
                         .map(|v| v.as_slice())
@@ -584,7 +595,7 @@ fn build_chain_recursive(
 
             // Add intermediate to chain and continue building
             chain.push(intermediate_der.clone());
-            visited.push(intermediate.subject.clone());
+            visited.push(intermediate_subject_der);
 
             // Recursively continue building the chain
             match build_chain_recursive(
@@ -619,11 +630,11 @@ fn verify_chain_link(
     issuer_der: &[u8],
     config: &ChainBuildingConfig,
 ) -> Result<bool, AuthError> {
-    let cert = parse_x509_certificate(cert_der)?;
-    let issuer = parse_x509_certificate(issuer_der)?;
+    let cert = parse_cert(cert_der)?;
+    let issuer = parse_cert(issuer_der)?;
 
     // Check issuer/subject match
-    if cert.issuer != issuer.subject {
+    if cert.tbs_certificate.issuer != issuer.tbs_certificate.subject {
         return Ok(false);
     }
 
@@ -649,16 +660,12 @@ fn verify_chain_link(
     }
 
     // Verify the signature
-    use der::Decode;
-    use x509_cert::Certificate;
-
-    let full_cert =
-        Certificate::from_der(cert_der).map_err(|_| AuthError::CertificateParseError)?;
-    let cert_signature = full_cert.signature.raw_bytes();
+    let cert_signature = cert.signature.raw_bytes();
     let tbs_bytes = extract_tbs_bytes(cert_der)?;
     let tbs_hash = sha256(tbs_bytes);
+    let issuer_rsa_key = extract_rsa_key(&issuer)?;
 
-    verify_rsa_signature_raw(&issuer.public_key, cert_signature, &tbs_hash)
+    verify_rsa_signature_raw(&issuer_rsa_key, cert_signature, &tbs_hash)
 }
 
 /// Verify a single certificate against a trust anchor (for direct trust)
@@ -667,13 +674,14 @@ fn verify_single_cert(
     trust_anchor_der: &[u8],
     config: &ChainBuildingConfig,
 ) -> Result<bool, AuthError> {
-    let cert = parse_x509_certificate(cert_der)?;
-    let trust_anchor = parse_x509_certificate(trust_anchor_der)?;
+    let cert = parse_cert(cert_der)?;
+    let trust_anchor = parse_cert(trust_anchor_der)?;
 
+    let tbs = &cert.tbs_certificate;
     // For self-signed certs, verify signature against self
-    let issuer_der = if cert.issuer == cert.subject {
+    let issuer_der = if tbs.issuer == tbs.subject {
         cert_der
-    } else if cert.issuer == trust_anchor.subject {
+    } else if tbs.issuer == trust_anchor.tbs_certificate.subject {
         trust_anchor_der
     } else {
         return Ok(false);
@@ -774,10 +782,7 @@ pub fn verify_certificate_chain(
 /// Checks that the current time is within the certificate's validity period.
 /// This prevents use of expired or not-yet-valid certificates.
 fn validate_certificate_time(cert_der: &[u8]) -> Result<(), AuthError> {
-    use der::Decode;
-    use x509_cert::Certificate;
-
-    let cert = Certificate::from_der(cert_der).map_err(|_| AuthError::CertificateParseError)?;
+    let cert = parse_cert(cert_der)?;
     let validity = &cert.tbs_certificate.validity;
 
     // Get current time from the system
@@ -817,64 +822,6 @@ fn validate_certificate_time(cert_der: &[u8]) -> Result<(), AuthError> {
 // ============================================================================
 // Certificate Extension Validation (basicConstraints, keyUsage)
 // ============================================================================
-
-/// X.509 extension OIDs
-mod extension_oids {
-    /// basicConstraints: 2.5.29.19
-    pub const BASIC_CONSTRAINTS: &[u8] = &[0x55, 0x1d, 0x13];
-    /// keyUsage: 2.5.29.15
-    pub const KEY_USAGE: &[u8] = &[0x55, 0x1d, 0x0f];
-}
-
-/// Key usage bits (as defined in RFC 5280)
-#[allow(dead_code)]
-pub mod key_usage_bits {
-    pub const DIGITAL_SIGNATURE: u8 = 0; // Bit 0
-    pub const NON_REPUDIATION: u8 = 1; // Bit 1 (contentCommitment)
-    pub const KEY_ENCIPHERMENT: u8 = 2; // Bit 2
-    pub const DATA_ENCIPHERMENT: u8 = 3; // Bit 3
-    pub const KEY_AGREEMENT: u8 = 4; // Bit 4
-    pub const KEY_CERT_SIGN: u8 = 5; // Bit 5 - required for CA certificates
-    pub const CRL_SIGN: u8 = 6; // Bit 6
-    pub const ENCIPHER_ONLY: u8 = 7; // Bit 7
-    pub const DECIPHER_ONLY: u8 = 8; // Bit 8 (in second byte)
-}
-
-/// Parsed basicConstraints extension
-#[derive(Debug, Clone, Copy)]
-pub struct BasicConstraints {
-    /// Whether this certificate is a CA
-    pub ca: bool,
-    /// Path length constraint (if present)
-    pub path_len_constraint: Option<u32>,
-}
-
-/// Parsed keyUsage extension
-#[derive(Debug, Clone, Copy)]
-pub struct KeyUsage {
-    /// Raw key usage bits (up to 9 bits)
-    bits: u16,
-}
-
-impl KeyUsage {
-    /// Check if a specific key usage bit is set
-    pub fn has_bit(&self, bit: u8) -> bool {
-        if bit > 8 {
-            return false;
-        }
-        (self.bits & (1 << bit)) != 0
-    }
-
-    /// Check if digitalSignature is set
-    pub fn digital_signature(&self) -> bool {
-        self.has_bit(key_usage_bits::DIGITAL_SIGNATURE)
-    }
-
-    /// Check if keyCertSign is set
-    pub fn key_cert_sign(&self) -> bool {
-        self.has_bit(key_usage_bits::KEY_CERT_SIGN)
-    }
-}
 
 /// Validate that a certificate can be used as a CA (issuer)
 ///
@@ -920,7 +867,7 @@ pub fn validate_key_usage_for_ca(cert_der: &[u8]) -> Result<(), AuthError> {
             } else {
                 log::warn!(
                     "Certificate has keyUsage but keyCertSign not set (bits: {:04x})",
-                    ku.bits
+                    ku.0.bits()
                 );
                 Err(AuthError::InvalidKeyUsage)
             }
@@ -952,7 +899,7 @@ pub fn validate_key_usage_for_code_signing(cert_der: &[u8]) -> Result<(), AuthEr
             } else {
                 log::warn!(
                     "Certificate has keyUsage but digitalSignature not set (bits: {:04x})",
-                    ku.bits
+                    ku.0.bits()
                 );
                 Err(AuthError::InvalidKeyUsage)
             }
@@ -967,160 +914,37 @@ pub fn validate_key_usage_for_code_signing(cert_der: &[u8]) -> Result<(), AuthEr
 }
 
 /// Extract the basicConstraints extension from a certificate
-fn extract_basic_constraints(cert_der: &[u8]) -> Result<Option<BasicConstraints>, AuthError> {
-    use der::Decode;
-    use x509_cert::Certificate;
-
+fn extract_basic_constraints(cert_der: &[u8]) -> Result<Option<X509BasicConstraints>, AuthError> {
     let cert = Certificate::from_der(cert_der).map_err(|_| AuthError::CertificateParseError)?;
 
     if let Some(extensions) = &cert.tbs_certificate.extensions {
         for ext in extensions.iter() {
-            if ext.extn_id.as_bytes() == extension_oids::BASIC_CONSTRAINTS {
-                // Parse the basicConstraints value
-                // BasicConstraints ::= SEQUENCE {
-                //     cA                      BOOLEAN DEFAULT FALSE,
-                //     pathLenConstraint       INTEGER (0..MAX) OPTIONAL
-                // }
-                let value = ext.extn_value.as_bytes();
-                return parse_basic_constraints(value).map(Some);
+            if ext.extn_id == const_oid::db::rfc5280::ID_CE_BASIC_CONSTRAINTS {
+                let bc = X509BasicConstraints::from_der(ext.extn_value.as_bytes())
+                    .map_err(|_| AuthError::CertificateParseError)?;
+                return Ok(Some(bc));
             }
         }
     }
 
     Ok(None)
-}
-
-/// Parse the basicConstraints extension value
-fn parse_basic_constraints(data: &[u8]) -> Result<BasicConstraints, AuthError> {
-    // BasicConstraints is a SEQUENCE
-    if data.is_empty() || data[0] != 0x30 {
-        return Err(AuthError::CertificateParseError);
-    }
-
-    let (seq_len, seq_offset) = parse_der_length(&data[1..])?;
-    if 1 + seq_offset + seq_len > data.len() {
-        return Err(AuthError::CertificateParseError);
-    }
-
-    let seq_data = &data[1 + seq_offset..1 + seq_offset + seq_len];
-
-    // Empty sequence means cA=FALSE (the default)
-    if seq_data.is_empty() {
-        return Ok(BasicConstraints {
-            ca: false,
-            path_len_constraint: None,
-        });
-    }
-
-    // First element should be BOOLEAN cA (tag 0x01)
-    let mut offset = 0;
-    let mut ca = false;
-    let mut path_len_constraint = None;
-
-    if seq_data[offset] == 0x01 {
-        // BOOLEAN
-        if offset + 3 > seq_data.len() {
-            return Err(AuthError::CertificateParseError);
-        }
-        let len = seq_data[offset + 1] as usize;
-        if len != 1 || offset + 2 + len > seq_data.len() {
-            return Err(AuthError::CertificateParseError);
-        }
-        ca = seq_data[offset + 2] != 0;
-        offset += 2 + len;
-    }
-
-    // Optional pathLenConstraint (INTEGER, tag 0x02)
-    if offset < seq_data.len() && seq_data[offset] == 0x02 {
-        let (int_len, int_offset) = parse_der_length(&seq_data[offset + 1..])?;
-        if offset + 1 + int_offset + int_len > seq_data.len() {
-            return Err(AuthError::CertificateParseError);
-        }
-        let int_data = &seq_data[offset + 1 + int_offset..offset + 1 + int_offset + int_len];
-
-        // Parse the integer (simple case for small values)
-        let mut val = 0u32;
-        for &b in int_data {
-            val = val.saturating_mul(256).saturating_add(b as u32);
-        }
-        path_len_constraint = Some(val);
-    }
-
-    Ok(BasicConstraints {
-        ca,
-        path_len_constraint,
-    })
 }
 
 /// Extract the keyUsage extension from a certificate
-fn extract_key_usage(cert_der: &[u8]) -> Result<Option<KeyUsage>, AuthError> {
-    use der::Decode;
-    use x509_cert::Certificate;
-
+fn extract_key_usage(cert_der: &[u8]) -> Result<Option<X509KeyUsage>, AuthError> {
     let cert = Certificate::from_der(cert_der).map_err(|_| AuthError::CertificateParseError)?;
 
     if let Some(extensions) = &cert.tbs_certificate.extensions {
         for ext in extensions.iter() {
-            if ext.extn_id.as_bytes() == extension_oids::KEY_USAGE {
-                // Parse the keyUsage value
-                // KeyUsage ::= BIT STRING
-                let value = ext.extn_value.as_bytes();
-                return parse_key_usage(value).map(Some);
+            if ext.extn_id == const_oid::db::rfc5280::ID_CE_KEY_USAGE {
+                let ku = X509KeyUsage::from_der(ext.extn_value.as_bytes())
+                    .map_err(|_| AuthError::CertificateParseError)?;
+                return Ok(Some(ku));
             }
         }
     }
 
     Ok(None)
-}
-
-/// Parse the keyUsage extension value
-fn parse_key_usage(data: &[u8]) -> Result<KeyUsage, AuthError> {
-    // keyUsage is a BIT STRING (tag 0x03)
-    if data.is_empty() || data[0] != 0x03 {
-        return Err(AuthError::CertificateParseError);
-    }
-
-    let (len, offset) = parse_der_length(&data[1..])?;
-    if 1 + offset + len > data.len() || len < 2 {
-        return Err(AuthError::CertificateParseError);
-    }
-
-    let bit_string = &data[1 + offset..1 + offset + len];
-
-    // First byte is the number of unused bits in the last byte
-    let unused_bits = bit_string[0];
-    if unused_bits > 7 {
-        return Err(AuthError::CertificateParseError);
-    }
-
-    // Parse the key usage bits
-    // The bits are in network order (MSB first), but we want bit 0 to be digitalSignature
-    // In the encoding, digitalSignature is the MSB of the first byte
-    let mut bits: u16 = 0;
-
-    if bit_string.len() > 1 {
-        // First byte of the bit string (after unused bits count)
-        // Bit 7 = digitalSignature (bit 0 in our numbering)
-        // Bit 6 = nonRepudiation (bit 1)
-        // etc.
-        let byte1 = bit_string[1];
-        bits |= ((byte1 >> 7) & 1) as u16; // digitalSignature
-        bits |= (((byte1 >> 6) & 1) as u16) << 1; // nonRepudiation
-        bits |= (((byte1 >> 5) & 1) as u16) << 2; // keyEncipherment
-        bits |= (((byte1 >> 4) & 1) as u16) << 3; // dataEncipherment
-        bits |= (((byte1 >> 3) & 1) as u16) << 4; // keyAgreement
-        bits |= (((byte1 >> 2) & 1) as u16) << 5; // keyCertSign
-        bits |= (((byte1 >> 1) & 1) as u16) << 6; // cRLSign
-        bits |= ((byte1 & 1) as u16) << 7; // encipherOnly
-    }
-
-    if bit_string.len() > 2 {
-        // Second byte for decipherOnly
-        let byte2 = bit_string[2];
-        bits |= (((byte2 >> 7) & 1) as u16) << 8; // decipherOnly
-    }
-
-    Ok(KeyUsage { bits })
 }
 
 /// Parse X.509 Time (UTCTime or GeneralizedTime) to Unix timestamp
@@ -1146,163 +970,42 @@ fn get_current_time_for_cert_validation() -> i64 {
 /// We need to extract the first element of the outer SEQUENCE, preserving
 /// the original DER encoding exactly as it was signed.
 fn extract_tbs_bytes(cert_der: &[u8]) -> Result<&[u8], AuthError> {
-    // Certificate is a SEQUENCE
-    if cert_der.is_empty() || cert_der[0] != 0x30 {
-        return Err(AuthError::CertificateParseError);
-    }
+    use der::{Reader, SliceReader};
 
-    // Parse the outer SEQUENCE length
-    let (outer_len, outer_len_bytes) = parse_der_length(&cert_der[1..])?;
-    let content_start = 1 + outer_len_bytes;
-
-    if content_start + outer_len > cert_der.len() {
-        return Err(AuthError::CertificateParseError);
-    }
-
-    let content = &cert_der[content_start..content_start + outer_len];
-
-    // The first element is the TBSCertificate (also a SEQUENCE)
-    if content.is_empty() || content[0] != 0x30 {
-        return Err(AuthError::CertificateParseError);
-    }
-
-    // Parse the TBS SEQUENCE length
-    let (tbs_len, tbs_len_bytes) = parse_der_length(&content[1..])?;
-    let tbs_total_len = 1 + tbs_len_bytes + tbs_len;
-
-    if tbs_total_len > content.len() {
-        return Err(AuthError::CertificateParseError);
-    }
-
-    // Return the complete TBS including tag and length
-    Ok(&content[..tbs_total_len])
+    let mut reader = SliceReader::new(cert_der).map_err(|_| AuthError::CertificateParseError)?;
+    // Enter the outer SEQUENCE (Certificate), then read the first TLV (TBSCertificate)
+    reader
+        .sequence(|seq| seq.tlv_bytes())
+        .map_err(|_| AuthError::CertificateParseError)
 }
 
 // ============================================================================
-// X.509 Certificate Parsing
+// Certificate Helpers
 // ============================================================================
 
-/// Parsed X.509 certificate
-pub struct X509Certificate {
-    /// Subject name (DER encoded)
-    pub subject: Vec<u8>,
-    /// Issuer name (DER encoded)
-    pub issuer: Vec<u8>,
-    /// Serial number
-    pub serial_number: Vec<u8>,
-    /// Public key (RSA modulus and exponent)
-    pub public_key: RsaPublicKey,
-}
-
-/// RSA public key components
-pub struct RsaPublicKey {
-    /// Modulus (n)
-    pub modulus: Vec<u8>,
-    /// Public exponent (e)
-    pub exponent: Vec<u8>,
-}
-
-/// Parse an X.509 certificate
-pub fn parse_x509_certificate(cert_der: &[u8]) -> Result<X509Certificate, AuthError> {
-    use der::{Decode, Encode};
-    use x509_cert::Certificate;
-
-    let cert = Certificate::from_der(cert_der).map_err(|e| {
+/// Parse a DER-encoded X.509 certificate
+fn parse_cert(cert_der: &[u8]) -> Result<Certificate, AuthError> {
+    Certificate::from_der(cert_der).map_err(|e| {
         log::debug!("Failed to parse X.509 certificate: {:?}", e);
         AuthError::CertificateParseError
-    })?;
-
-    let tbs = &cert.tbs_certificate;
-
-    // Extract subject and issuer names
-    let subject = tbs
-        .subject
-        .to_der()
-        .map_err(|_| AuthError::CertificateParseError)?;
-    let issuer = tbs
-        .issuer
-        .to_der()
-        .map_err(|_| AuthError::CertificateParseError)?;
-
-    // Extract serial number
-    let serial_number = tbs.serial_number.as_bytes().to_vec();
-
-    // Extract public key
-    let public_key = extract_rsa_public_key(&tbs.subject_public_key_info)?;
-
-    Ok(X509Certificate {
-        subject,
-        issuer,
-        serial_number,
-        public_key,
     })
 }
 
-/// Extract RSA public key from SubjectPublicKeyInfo
-fn extract_rsa_public_key(
-    spki: &spki::SubjectPublicKeyInfoOwned,
-) -> Result<RsaPublicKey, AuthError> {
-    // The public key is in the subjectPublicKey field as a BIT STRING
-    let pk_bytes = spki.subject_public_key.raw_bytes();
-
-    // Parse as RSAPublicKey (SEQUENCE { modulus INTEGER, exponent INTEGER })
-    // We need to parse this manually since pkcs1 crate may not be available
-    parse_rsa_public_key_der(pk_bytes)
+/// Extract the RSA public key from a parsed certificate's SPKI
+fn extract_rsa_key(cert: &Certificate) -> Result<rsa::RsaPublicKey, AuthError> {
+    let spki_ref = cert.tbs_certificate.subject_public_key_info.owned_to_ref();
+    rsa::RsaPublicKey::try_from(spki_ref).map_err(|e| {
+        log::debug!("Failed to extract RSA public key from SPKI: {:?}", e);
+        AuthError::CertificateParseError
+    })
 }
 
-/// Parse RSA public key from DER-encoded RSAPublicKey structure
-fn parse_rsa_public_key_der(data: &[u8]) -> Result<RsaPublicKey, AuthError> {
-    // RSAPublicKey ::= SEQUENCE {
-    //     modulus           INTEGER,  -- n
-    //     publicExponent    INTEGER   -- e
-    // }
-
-    // Simple DER parser for RSA public key
-    if data.len() < 4 {
-        return Err(AuthError::CertificateParseError);
-    }
-
-    // Check for SEQUENCE tag (0x30)
-    if data[0] != 0x30 {
-        return Err(AuthError::CertificateParseError);
-    }
-
-    // Get sequence length
-    let (seq_len, seq_offset) = parse_der_length(&data[1..])?;
-    let seq_data = &data[1 + seq_offset..1 + seq_offset + seq_len];
-
-    // Parse modulus (first INTEGER)
-    if seq_data.is_empty() || seq_data[0] != 0x02 {
-        return Err(AuthError::CertificateParseError);
-    }
-
-    let (mod_len, mod_offset) = parse_der_length(&seq_data[1..])?;
-    let mod_data = &seq_data[1 + mod_offset..1 + mod_offset + mod_len];
-
-    // Skip leading zero if present (used for positive numbers)
-    let modulus = if !mod_data.is_empty() && mod_data[0] == 0x00 {
-        mod_data[1..].to_vec()
-    } else {
-        mod_data.to_vec()
-    };
-
-    // Parse exponent (second INTEGER)
-    let exp_start = 1 + mod_offset + mod_len;
-    if exp_start >= seq_data.len() || seq_data[exp_start] != 0x02 {
-        return Err(AuthError::CertificateParseError);
-    }
-
-    let (exp_len, exp_offset) = parse_der_length(&seq_data[exp_start + 1..])?;
-    let exp_data = &seq_data[exp_start + 1 + exp_offset..exp_start + 1 + exp_offset + exp_len];
-
-    // Skip leading zero if present
-    let exponent = if !exp_data.is_empty() && exp_data[0] == 0x00 {
-        exp_data[1..].to_vec()
-    } else {
-        exp_data.to_vec()
-    };
-
-    Ok(RsaPublicKey { modulus, exponent })
+/// Validate that DER data is a parseable X.509 certificate
+///
+/// Used by external modules (e.g. key_files) to validate certificate data.
+pub fn validate_x509_certificate(cert_der: &[u8]) -> Result<(), AuthError> {
+    parse_cert(cert_der)?;
+    Ok(())
 }
 
 /// Trim trailing bytes from a DER-encoded structure
@@ -1311,73 +1014,46 @@ fn parse_rsa_public_key_der(data: &[u8]) -> Result<RsaPublicKey, AuthError> {
 /// data may have padding bytes after the actual DER content. This function
 /// reads the DER length and returns a slice containing only the valid data.
 fn trim_der_trailing_bytes(data: &[u8]) -> Result<&[u8], AuthError> {
-    if data.is_empty() {
-        return Err(AuthError::InvalidHeader);
-    }
+    use der::{Reader, SliceReader};
 
-    // DER structures start with a tag byte, then length, then content
-    // For PKCS#7, it's a SEQUENCE (0x30)
-    if data[0] != 0x30 {
-        // Not a SEQUENCE - return as-is and let the parser handle it
-        return Ok(data);
-    }
-
-    // Parse the length to find actual content size
-    if data.len() < 2 {
-        return Ok(data);
-    }
-
-    let (content_len, len_bytes) = parse_der_length(&data[1..])?;
-    let total_len = 1 + len_bytes + content_len;
-
-    if total_len > data.len() {
-        // Content extends beyond buffer - invalid, but let parser handle it
-        return Ok(data);
-    }
-
-    // Return only the valid DER portion
-    Ok(&data[..total_len])
+    let mut reader = SliceReader::new(data).map_err(|_| AuthError::InvalidHeader)?;
+    // Read exactly one TLV, ignoring any trailing padding bytes
+    reader.tlv_bytes().map_err(|_| AuthError::InvalidHeader)
 }
 
 // ============================================================================
 // RSA Signature Verification
 // ============================================================================
 
-/// Verify an RSA signature using raw operations
+/// Verify an RSA PKCS#1 v1.5 signature against a pre-computed SHA-256 hash
 ///
-/// CRITICAL: Uses the standard PKCS#1 v1.5 verification with proper algorithm
-/// identifier prefix to prevent algorithm substitution attacks. The signature
-/// must contain the correct DigestInfo structure including the SHA-256 OID.
+/// Uses `PrehashVerifier::verify_prehash` because callers pass an already-computed
+/// SHA-256 digest. The `VerifyingKey::new()` constructor ensures the DigestInfo
+/// prefix includes the SHA-256 OID, preventing algorithm substitution attacks.
+///
+/// # Arguments
+///
+/// * `public_key` - The RSA public key to verify against
+/// * `signature` - The raw signature bytes
+/// * `message_hash` - Pre-computed SHA-256 hash of the signed data
 fn verify_rsa_signature_raw(
-    public_key: &RsaPublicKey,
+    public_key: &rsa::RsaPublicKey,
     signature: &[u8],
     message_hash: &[u8; 32],
 ) -> Result<bool, AuthError> {
-    use rsa::{BigUint, RsaPublicKey as RsaPubKey};
+    use rsa::signature::hazmat::PrehashVerifier;
 
-    // Construct the RSA public key
-    let n = BigUint::from_bytes_be(&public_key.modulus);
-    let e = BigUint::from_bytes_be(&public_key.exponent);
+    let verifying_key = rsa::pkcs1v15::VerifyingKey::<Sha256>::new(public_key.clone());
 
-    let rsa_key = RsaPubKey::new(n, e).map_err(|e| {
-        log::debug!("Failed to construct RSA key: {:?}", e);
-        AuthError::CryptoError
-    })?;
-
-    // CRITICAL FIX: Use `new()` instead of `new_unprefixed()` to require proper
-    // DigestInfo structure with SHA-256 OID. This prevents algorithm substitution
-    // attacks where an attacker could use a different hash algorithm.
-    let verifying_key = rsa::pkcs1v15::VerifyingKey::<Sha256>::new(rsa_key);
-
-    // Parse the signature
     let sig = rsa::pkcs1v15::Signature::try_from(signature).map_err(|e| {
         log::debug!("Failed to parse signature: {:?}", e);
         AuthError::CryptoError
     })?;
 
-    // Verify the signature
-    use rsa::signature::Verifier;
-    match verifying_key.verify(message_hash, &sig) {
+    // CRITICAL: Use verify_prehash since message_hash is already a SHA-256 digest.
+    // The previous code used Verifier::verify which internally calls D::digest(msg),
+    // resulting in SHA-256(SHA-256(TBS)) — a double-hash bug.
+    match verifying_key.verify_prehash(message_hash, &sig) {
         Ok(()) => Ok(true),
         Err(e) => {
             log::debug!("RSA signature verification failed: {:?}", e);
