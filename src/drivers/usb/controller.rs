@@ -677,26 +677,60 @@ pub trait UsbController {
     /// Destroy an interrupt queue
     fn destroy_interrupt_queue(&mut self, queue: u32);
 
+    /// Return the device table (legacy controllers only).
+    ///
+    /// EHCI/OHCI/UHCI override this to return their `devices` array.
+    /// xHCI uses a separate slot model and overrides the five query
+    /// methods below directly.
+    ///
+    /// The default returns an empty slice, which causes the default
+    /// implementations of the query methods to also return `None`.
+    fn devices(&self) -> &[Option<UsbDevice>] {
+        &[]
+    }
+
+    /// Look up a device by address
+    fn get_device(&self, address: u8) -> Option<&UsbDevice> {
+        self.devices()
+            .iter()
+            .find_map(|d| d.as_ref().filter(|d| d.address == address))
+    }
+
     /// Find a mass storage device
     ///
     /// # Returns
     /// Device address/slot ID if found
-    fn find_mass_storage(&self) -> Option<u8>;
+    fn find_mass_storage(&self) -> Option<u8> {
+        self.devices()
+            .iter()
+            .find_map(|d| d.as_ref().filter(|d| d.is_mass_storage).map(|d| d.address))
+    }
 
     /// Find a HID keyboard device
     ///
     /// # Returns
     /// Device address/slot ID if found
-    fn find_hid_keyboard(&self) -> Option<u8>;
+    fn find_hid_keyboard(&self) -> Option<u8> {
+        self.devices()
+            .iter()
+            .find_map(|d| d.as_ref().filter(|d| d.is_hid_keyboard).map(|d| d.address))
+    }
 
     /// Get device info
-    fn get_device_info(&self, device: u8) -> Option<DeviceInfo>;
+    fn get_device_info(&self, device: u8) -> Option<DeviceInfo> {
+        self.get_device(device).map(UsbDevice::device_info)
+    }
 
     /// Get bulk endpoint info for a device
-    fn get_bulk_endpoints(&self, device: u8) -> Option<(EndpointInfo, EndpointInfo)>;
+    fn get_bulk_endpoints(&self, device: u8) -> Option<(EndpointInfo, EndpointInfo)> {
+        self.get_device(device)
+            .and_then(|d| Some((*d.bulk_in.as_ref()?, *d.bulk_out.as_ref()?)))
+    }
 
     /// Get interrupt endpoint info for a device
-    fn get_interrupt_endpoint(&self, device: u8) -> Option<EndpointInfo>;
+    fn get_interrupt_endpoint(&self, device: u8) -> Option<EndpointInfo> {
+        self.get_device(device).and_then(|d| d.interrupt_in)
+    }
 }
 
 /// Device information

@@ -15,8 +15,7 @@ use core::ptr;
 use core::sync::atomic::{Ordering, fence};
 
 use super::controller::{
-    DeviceInfo, EndpointInfo, SetupPacket, UsbController, UsbDevice, UsbError, UsbSpeed,
-    enumerate_device,
+    SetupPacket, UsbController, UsbDevice, UsbError, UsbSpeed, enumerate_device,
 };
 
 // ============================================================================
@@ -759,12 +758,6 @@ impl UhciController {
             .find_map(|d| d.as_mut().filter(|d| d.address == address))
     }
 
-    fn get_device(&self, address: u8) -> Option<&UsbDevice> {
-        self.devices
-            .iter()
-            .find_map(|d| d.as_ref().filter(|d| d.address == address))
-    }
-
     /// Get PCI address
     pub fn pci_address(&self) -> PciAddress {
         self.pci_address
@@ -939,43 +932,8 @@ impl UsbController for UhciController {
 
     fn destroy_interrupt_queue(&mut self, _queue: u32) {}
 
-    fn find_mass_storage(&self) -> Option<u8> {
-        self.devices
-            .iter()
-            .find_map(|d| d.as_ref().filter(|d| d.is_mass_storage).map(|d| d.address))
-    }
-
-    fn find_hid_keyboard(&self) -> Option<u8> {
-        self.devices
-            .iter()
-            .find_map(|d| d.as_ref().filter(|d| d.is_hid_keyboard).map(|d| d.address))
-    }
-
-    fn get_device_info(&self, device: u8) -> Option<DeviceInfo> {
-        self.get_device(device).map(|d| DeviceInfo {
-            address: d.address,
-            speed: d.speed,
-            vendor_id: d.device_desc.vendor_id,
-            product_id: d.device_desc.product_id,
-            device_class: d.device_desc.device_class,
-            is_mass_storage: d.is_mass_storage,
-            mass_storage_interface: d.mass_storage_interface,
-            is_hid: d.is_hid_keyboard,
-            is_keyboard: d.is_hid_keyboard,
-            is_hub: d.is_hub,
-        })
-    }
-
-    fn get_bulk_endpoints(&self, device: u8) -> Option<(EndpointInfo, EndpointInfo)> {
-        self.get_device(device)
-            .and_then(|d| match (&d.bulk_in, &d.bulk_out) {
-                (Some(in_ep), Some(out_ep)) => Some((*in_ep, *out_ep)),
-                _ => None,
-            })
-    }
-
-    fn get_interrupt_endpoint(&self, device: u8) -> Option<EndpointInfo> {
-        self.get_device(device).and_then(|d| d.interrupt_in)
+    fn devices(&self) -> &[Option<UsbDevice>] {
+        &self.devices
     }
 }
 
