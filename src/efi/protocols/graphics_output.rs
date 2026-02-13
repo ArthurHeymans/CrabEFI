@@ -550,7 +550,7 @@ pub fn create_gop(framebuffer: &FramebufferInfo) -> *mut GraphicsOutputProtocol 
 
     // Store global state for Blt operations
     state::with_console_mut(|console| {
-        console.gop_framebuffer = Some(framebuffer.clone());
+        console.gop_framebuffer = Some(*framebuffer);
     });
 
     log::info!(

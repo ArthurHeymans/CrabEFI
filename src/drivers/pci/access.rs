@@ -164,6 +164,11 @@ impl EcamAccess {
     ///
     /// ECAM address = base + (bus << 20) | (device << 15) | (function << 12) | offset
     fn ecam_address(&self, addr: PciAddress, offset: u16) -> u64 {
+        debug_assert!(
+            offset <= 4095,
+            "ECAM offset {:#x} exceeds config space",
+            offset
+        );
         self.base
             | ((addr.bus as u64) << 20)
             | ((addr.device as u64) << 15)

@@ -12,13 +12,5 @@
 /// * `coreboot_table_ptr` - Pointer to the coreboot tables (passed in RDI)
 #[unsafe(no_mangle)]
 pub extern "C" fn rust_main(coreboot_table_ptr: u64) -> ! {
-    crabefi::init(coreboot_table_ptr);
-
-    // Should never reach here
-    loop {
-        #[cfg(target_arch = "x86_64")]
-        unsafe {
-            core::arch::asm!("hlt");
-        }
-    }
+    crabefi::init(coreboot_table_ptr)
 }

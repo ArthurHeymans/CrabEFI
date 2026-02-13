@@ -148,7 +148,7 @@ fn read_cr2() -> u64 {
 
 /// Common exception handler - logs and halts
 #[unsafe(no_mangle)]
-extern "C" fn exception_handler(vector: u64, error_code: u64, rip: u64, cs: u64, rflags: u64) {
+extern "C" fn exception_handler(vector: u64, error_code: u64, rip: u64, cs: u64, rflags: u64) -> ! {
     let name = if vector < 32 {
         EXCEPTION_NAMES[vector as usize]
     } else {

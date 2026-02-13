@@ -67,12 +67,12 @@ pub fn init(cb_info: &CorebootInfo) {
 
     // Install Graphics Output protocol on the SAME handle as console
     // This is important - GRUB expects GOP and ConOut on the same handle
-    if let Some(ref fb) = cb_info.framebuffer {
+    if let Some(fb) = cb_info.framebuffer {
         if let Some(handle) = console_handle {
-            init_graphics_output_on_handle(fb, handle);
+            init_graphics_output_on_handle(&fb, handle);
         }
         // Initialize EFI console framebuffer output (bootloader text goes here too)
-        protocols::console::init_framebuffer(fb.clone());
+        protocols::console::init_framebuffer(fb);
     }
 
     // Install Unicode Collation protocol

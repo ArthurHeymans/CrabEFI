@@ -182,11 +182,8 @@ long_mode_start:
     or rax, 0x400                 // OSXMMEXCPT (bit 10)
     mov cr4, rax
 
-    // Pass coreboot table pointer
+    // Pass coreboot table pointer (mov edi, ebx zero-extends into RDI)
     mov edi, ebx
-    xor rax, rax
-    mov eax, edi
-    mov rdi, rax
 
     // Call Rust
     call rust_main

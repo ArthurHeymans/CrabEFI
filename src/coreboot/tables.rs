@@ -258,7 +258,7 @@ pub struct SerialInfo {
 ///
 /// This provides information for accessing UEFI variable storage
 /// through coreboot's SMMSTORE v2 interface.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 pub struct Smmstorev2Info {
     /// Number of writable blocks in SMM
     pub num_blocks: u32,
@@ -295,7 +295,7 @@ pub struct SpiFlashInfo {
 /// Boot media parameters
 ///
 /// Contains information about the boot media layout from coreboot tables.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 pub struct BootMediaInfo {
     /// Offset of FMAP in boot media (relative to start of flash)
     pub fmap_offset: u64,

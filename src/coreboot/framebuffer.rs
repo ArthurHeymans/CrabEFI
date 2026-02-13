@@ -3,7 +3,7 @@
 //! This module handles framebuffer information extracted from coreboot tables.
 
 /// Framebuffer information
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 pub struct FramebufferInfo {
     /// Physical address of the framebuffer
     pub physical_address: u64,
@@ -194,13 +194,36 @@ impl FramebufferInfo {
 
     /// Clear the framebuffer with a solid color
     ///
+    /// For 32bpp modes (the common case), this fills entire scanlines at once
+    /// instead of per-pixel to avoid repeated bounds-checks and encoding.
+    ///
     /// # Safety
     ///
     /// The framebuffer must be accessible.
     pub unsafe fn clear(&self, r: u8, g: u8, b: u8) {
-        for y in 0..self.y_resolution {
-            for x in 0..self.x_resolution {
-                self.write_pixel(x, y, r, g, b);
+        let fb = self.as_ptr();
+        let bpp = self.bits_per_pixel;
+        let stride = self.bytes_per_line as usize;
+
+        match bpp {
+            32 => {
+                let pixel = self.encode_pixel_32(r, g, b);
+                // Fill each scanline without per-pixel bounds checks or bpp dispatch
+                for y in 0..self.y_resolution as usize {
+                    let row = fb.add(y * stride);
+                    for x in 0..self.x_resolution as usize {
+                        let ptr = row.add(x * 4) as *mut u32;
+                        ptr.write_volatile(pixel);
+                    }
+                }
+            }
+            _ => {
+                // Fallback for 16bpp and 24bpp: per-pixel
+                for y in 0..self.y_resolution {
+                    for x in 0..self.x_resolution {
+                        self.write_pixel(x, y, r, g, b);
+                    }
+                }
             }
         }
     }

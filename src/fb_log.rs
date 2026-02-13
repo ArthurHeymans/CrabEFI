@@ -32,9 +32,9 @@ pub fn set_framebuffer(fb: FramebufferInfo) {
 
 /// Log a message to the framebuffer
 pub fn log_to_framebuffer(level: Level, ts: u64, args: &core::fmt::Arguments) {
-    // Clone fb_info out of the lock to avoid holding FB_INFO while acquiring
+    // Copy fb_info out of the lock to avoid holding FB_INFO while acquiring
     // FB_CURSOR, which would risk deadlock if the lock order were ever reversed.
-    let fb_info = match FB_INFO.lock().clone() {
+    let fb_info = match *FB_INFO.lock() {
         Some(fb) => fb,
         None => return,
     };

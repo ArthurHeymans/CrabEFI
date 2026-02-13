@@ -302,7 +302,9 @@ impl UsbHidKeyboard {
     ///
     /// Returns packed (scan_code << 8) | unicode_char
     fn translate_keycode(&self, keycode: u8, report: &KeyboardReport) -> Option<u16> {
-        let shift = report.shift_pressed() ^ self.caps_lock;
+        let raw_shift = report.shift_pressed();
+        // Caps Lock only affects letter keys (a-z), not numbers/symbols
+        let alpha_shift = raw_shift ^ self.caps_lock;
         let ctrl = report.ctrl_pressed();
 
         // EFI scan codes
@@ -369,7 +371,7 @@ impl UsbHidKeyboard {
                 let base = b'a' + (keycode - 0x04);
                 if ctrl {
                     base - b'a' + 1 // Ctrl+A = 1, Ctrl+Z = 26
-                } else if shift {
+                } else if alpha_shift {
                     base.to_ascii_uppercase()
                 } else {
                     base
@@ -378,70 +380,70 @@ impl UsbHidKeyboard {
 
             // Numbers (1-9, 0: 0x1E-0x27)
             0x1E => {
-                if shift {
+                if raw_shift {
                     b'!'
                 } else {
                     b'1'
                 }
             }
             0x1F => {
-                if shift {
+                if raw_shift {
                     b'@'
                 } else {
                     b'2'
                 }
             }
             0x20 => {
-                if shift {
+                if raw_shift {
                     b'#'
                 } else {
                     b'3'
                 }
             }
             0x21 => {
-                if shift {
+                if raw_shift {
                     b'$'
                 } else {
                     b'4'
                 }
             }
             0x22 => {
-                if shift {
+                if raw_shift {
                     b'%'
                 } else {
                     b'5'
                 }
             }
             0x23 => {
-                if shift {
+                if raw_shift {
                     b'^'
                 } else {
                     b'6'
                 }
             }
             0x24 => {
-                if shift {
+                if raw_shift {
                     b'&'
                 } else {
                     b'7'
                 }
             }
             0x25 => {
-                if shift {
+                if raw_shift {
                     b'*'
                 } else {
                     b'8'
                 }
             }
             0x26 => {
-                if shift {
+                if raw_shift {
                     b'('
                 } else {
                     b'9'
                 }
             }
             0x27 => {
-                if shift {
+                if raw_shift {
                     b')'
                 } else {
                     b'0'
@@ -454,77 +456,77 @@ impl UsbHidKeyboard {
             0x2B => 0x09, // Tab
             0x2C => b' ', // Space
             0x2D => {
-                if shift {
+                if raw_shift {
                     b'_'
                 } else {
                     b'-'
                 }
             }
             0x2E => {
-                if shift {
+                if raw_shift {
                     b'+'
                 } else {
                     b'='
                 }
             }
             0x2F => {
-                if shift {
+                if raw_shift {
                     b'{'
                 } else {
                     b'['
                 }
             }
             0x30 => {
-                if shift {
+                if raw_shift {
                     b'}'
                 } else {
                     b']'
                 }
             }
             0x31 => {
-                if shift {
+                if raw_shift {
                     b'|'
                 } else {
                     b'\\'
                 }
             }
             0x33 => {
-                if shift {
+                if raw_shift {
                     b':'
                 } else {
                     b';'
                 }
             }
             0x34 => {
-                if shift {
+                if raw_shift {
                     b'"'
                 } else {
                     b'\''
                 }
             }
             0x35 => {
-                if shift {
+                if raw_shift {
                     b'~'
                 } else {
                     b'`'
                 }
             }
             0x36 => {
-                if shift {
+                if raw_shift {
                     b'<'
                 } else {
                     b','
                 }
             }
             0x37 => {
-                if shift {
+                if raw_shift {
                     b'>'
                 } else {
                     b'.'
                 }
             }
             0x38 => {
-                if shift {
+                if raw_shift {
                     b'?'
                 } else {
                     b'/'

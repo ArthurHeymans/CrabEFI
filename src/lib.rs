@@ -122,7 +122,7 @@ pub fn display_secure_boot_error() {
 /// # Arguments
 ///
 /// * `coreboot_table_ptr` - Pointer to the coreboot tables
-pub fn init(coreboot_table_ptr: u64) {
+pub fn init(coreboot_table_ptr: u64) -> ! {
     // Allocate firmware state on the stack
     // This is THE primary state for the entire firmware
     let mut firmware_state = state::FirmwareState::new();
@@ -144,8 +144,8 @@ pub fn init(coreboot_table_ptr: u64) {
     }
 
     // Store framebuffer in global state for menu rendering
-    if let Some(ref fb) = cb_info.framebuffer {
-        coreboot::store_framebuffer(fb.clone());
+    if let Some(fb) = cb_info.framebuffer {
+        coreboot::store_framebuffer(fb);
     }
 
     // Store the coreboot framebuffer record address so we can invalidate it
@@ -155,8 +155,8 @@ pub fn init(coreboot_table_ptr: u64) {
     }
 
     // Store SMMSTORE v2 info globally for variable persistence
-    if let Some(ref smmstore) = cb_info.smmstorev2 {
-        coreboot::store_smmstorev2(smmstore.clone());
+    if let Some(smmstore) = cb_info.smmstorev2 {
+        coreboot::store_smmstorev2(smmstore);
     }
 
     // Store SPI flash info globally (used for FMAP parsing)
@@ -165,8 +165,8 @@ pub fn init(coreboot_table_ptr: u64) {
     }
 
     // Store boot media info globally (contains FMAP offset)
-    if let Some(ref boot_media) = cb_info.boot_media {
-        coreboot::store_boot_media(boot_media.clone());
+    if let Some(boot_media) = cb_info.boot_media {
+        coreboot::store_boot_media(boot_media);
     }
 
     // Store memory regions and ACPI RSDP for direct Linux boot
@@ -188,8 +188,8 @@ pub fn init(coreboot_table_ptr: u64) {
     logger::init();
 
     // Set framebuffer for logging output (so we can see logs on screen)
-    if let Some(ref fb) = cb_info.framebuffer {
-        logger::set_framebuffer(fb.clone());
+    if let Some(fb) = cb_info.framebuffer {
+        logger::set_framebuffer(fb);
     }
 
     // Initialize PS/2 keyboard (if available)

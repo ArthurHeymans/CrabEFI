@@ -36,9 +36,9 @@ pub fn store_framebuffer_record_addr(addr: u64) {
 
 /// Get access to the global framebuffer info
 ///
-/// Returns a clone of the framebuffer info if available.
+/// Returns the framebuffer info if available.
 pub fn get_framebuffer() -> Option<FramebufferInfo> {
-    crate::state::try_get().and_then(|state| state.drivers.framebuffer.clone())
+    crate::state::try_get().and_then(|state| state.drivers.framebuffer)
 }
 
 /// Store SMMSTORE v2 info in global state
@@ -50,9 +50,9 @@ pub fn store_smmstorev2(smmstore: Smmstorev2Info) {
 
 /// Get access to the global SMMSTORE v2 info
 ///
-/// Returns a clone of the SMMSTORE v2 info if available.
+/// Returns the SMMSTORE v2 info if available.
 pub fn get_smmstorev2() -> Option<Smmstorev2Info> {
-    crate::state::try_get().and_then(|state| state.drivers.smmstorev2.clone())
+    crate::state::try_get().and_then(|state| state.drivers.smmstorev2)
 }
 
 /// Store SPI flash info in global state
@@ -78,10 +78,10 @@ pub fn store_boot_media(boot_media: BootMediaInfo) {
 
 /// Get access to the global boot media params
 ///
-/// Returns a clone of the boot media info if available.
+/// Returns the boot media info if available.
 /// This includes the FMAP offset which can be used to locate flash regions.
 pub fn get_boot_media() -> Option<BootMediaInfo> {
-    crate::state::try_get().and_then(|state| state.drivers.boot_media.clone())
+    crate::state::try_get().and_then(|state| state.drivers.boot_media)
 }
 
 /// Invalidate the coreboot framebuffer record in the coreboot tables.

@@ -325,13 +325,10 @@ fn parse_menuentry_class(line: &str) -> Option<&str> {
 /// Parse a line inside a menuentry block
 fn parse_menuentry_line(line: &str, entry: &mut GrubEntry) {
     // Parse linux/linuxefi directive
-    if line.starts_with("linux ") || line.starts_with("linuxefi ") {
-        let rest = if let Some(stripped) = line.strip_prefix("linux ") {
-            stripped
-        } else {
-            &line[9..]
-        };
-
+    if let Some(rest) = line
+        .strip_prefix("linux ")
+        .or_else(|| line.strip_prefix("linuxefi "))
+    {
         let parts: Vec<&str, 2> = rest.splitn(2, char::is_whitespace).collect();
         if let Some(path) = parts.first() {
             entry.linux.clear();
@@ -344,13 +341,10 @@ fn parse_menuentry_line(line: &str, entry: &mut GrubEntry) {
         }
     }
     // Parse initrd/initrdefi directive
-    else if line.starts_with("initrd ") || line.starts_with("initrdefi ") {
-        let rest = if let Some(stripped) = line.strip_prefix("initrd ") {
-            stripped
-        } else {
-            &line[10..]
-        };
-
+    else if let Some(rest) = line
+        .strip_prefix("initrd ")
+        .or_else(|| line.strip_prefix("initrdefi "))
+    {
         entry.initrd.clear();
         let normalized = normalize_grub_path(rest.trim());
         let _ = entry.initrd.push_str(&normalized);

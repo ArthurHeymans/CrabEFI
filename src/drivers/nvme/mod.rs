@@ -1297,32 +1297,33 @@ static GLOBAL_NVME_DEVICE: Mutex<Option<GlobalNvmeDevicePtr>> = Mutex::new(None)
 /// # Returns
 /// `true` if the device was stored successfully
 pub fn store_global_device(controller_index: usize, nsid: u32) -> bool {
-    // Allocate memory for the device info
     let size = core::mem::size_of::<GlobalNvmeDevice>();
-    let pages = size.div_ceil(4096);
 
-    if let Some(mem) = efi::allocate_pages(pages as u64) {
-        let device_ptr = mem.as_mut_ptr() as *mut GlobalNvmeDevice;
-        unsafe {
-            core::ptr::write(
-                device_ptr,
-                GlobalNvmeDevice {
-                    controller_index,
-                    nsid,
-                },
+    match efi::allocator::allocate_pool(efi::allocator::MemoryType::BootServicesData, size) {
+        Ok(ptr) => {
+            let device_ptr = ptr as *mut GlobalNvmeDevice;
+            unsafe {
+                core::ptr::write(
+                    device_ptr,
+                    GlobalNvmeDevice {
+                        controller_index,
+                        nsid,
+                    },
+                );
+            }
+
+            *GLOBAL_NVME_DEVICE.lock() = Some(GlobalNvmeDevicePtr(device_ptr));
+            log::info!(
+                "NVMe device stored globally (controller={}, nsid={})",
+                controller_index,
+                nsid
             );
+            true
         }
-
-        *GLOBAL_NVME_DEVICE.lock() = Some(GlobalNvmeDevicePtr(device_ptr));
-        log::info!(
-            "NVMe device stored globally (controller={}, nsid={})",
-            controller_index,
-            nsid
-        );
-        true
-    } else {
-        log::error!("Failed to allocate memory for global NVMe device");
-        false
+        Err(_) => {
+            log::error!("Failed to allocate memory for global NVMe device");
+            false
+        }
     }
 }
 
