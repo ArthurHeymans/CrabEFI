@@ -907,25 +907,30 @@ impl<'a> FatFilesystem<'a> {
         }
     }
 
-    /// Find an entry in a directory
-    fn find_in_directory(&mut self, cluster: u32, name: &str) -> Result<DirectoryEntry, FatError> {
-        // FAT cluster sizes can be up to 128 sectors * 512 bytes = 65536 bytes
-        let mut buffer = [0u8; 65536]; // Max cluster size (128 sectors * 512 bytes)
+    /// Iterate over all directory entries in a directory, calling `visitor` for each
+    /// non-free, non-LFN, non-volume-label entry.
+    ///
+    /// The visitor receives `(&DirectoryEntry, &LfnBuffer)` and returns
+    /// `ControlFlow::Continue(())` to keep iterating or `ControlFlow::Break(value)`
+    /// to stop early with a result.
+    ///
+    /// Handles both FAT12/16 fixed root directories and cluster-chain directories.
+    fn for_each_dir_entry<T>(
+        &mut self,
+        cluster: u32,
+        mut visitor: impl FnMut(&DirectoryEntry, &LfnBuffer) -> core::ops::ControlFlow<T>,
+    ) -> Result<core::ops::ControlFlow<T>, FatError> {
+        let mut buffer = [0u8; 65536]; // Max cluster size
+        let mut lfn_buffer = LfnBuffer::new();
 
         if cluster == 0 && self.fat_type != FatType::Fat32 {
             // FAT12/16 root directory (fixed location)
-            // Calculate total bytes needed for root directory
             let root_dir_bytes = self.root_dir_sectors as usize * self.bytes_per_sector as usize;
             let device_block_size = self.device_block_size as usize;
             let root_dir_byte_start = self.root_dir_start as usize * self.bytes_per_sector as usize;
-
-            // Read the root directory, handling device block boundaries
             let mut bytes_processed = 0usize;
 
-            let mut lfn_buffer = LfnBuffer::new();
-
             while bytes_processed < root_dir_bytes {
-                // Calculate which device block to read
                 let current_byte_pos = root_dir_byte_start + bytes_processed;
                 let device_block = current_byte_pos / device_block_size;
                 let offset_in_block = current_byte_pos % device_block_size;
@@ -937,36 +942,29 @@ impl<'a> FatFilesystem<'a> {
                     )
                     .map_err(|_| FatError::ReadError)?;
 
-                // Process entries from this device block
                 let mut pos = offset_in_block;
                 while pos + 32 <= device_block_size && bytes_processed < root_dir_bytes {
-                    // Parse directory entry using zerocopy
                     let entry = match DirectoryEntry::read_from_prefix(&buffer[pos..]) {
                         Ok((e, _)) => e,
                         Err(_) => break,
                     };
 
                     if entry.is_end() {
-                        log::debug!("FAT: end of directory, '{}' not found", name);
-                        return Err(FatError::NotFound);
+                        return Ok(core::ops::ControlFlow::Continue(()));
                     }
-
                     if entry.is_free() {
                         lfn_buffer.reset();
                         pos += 32;
                         bytes_processed += 32;
                         continue;
                     }
-
                     if entry.is_lfn() {
-                        // Process LFN entry
                         let lfn_entry = unsafe { &*(&buffer[pos] as *const u8 as *const LfnEntry) };
                         lfn_buffer.process_lfn(lfn_entry);
                         pos += 32;
                         bytes_processed += 32;
                         continue;
                     }
-
                     if entry.is_volume_id() {
                         lfn_buffer.reset();
                         pos += 32;
@@ -974,15 +972,8 @@ impl<'a> FatFilesystem<'a> {
                         continue;
                     }
 
-                    log::debug!(
-                        "FAT: found entry '{}' (looking for '{}')",
-                        entry.short_name(),
-                        name
-                    );
-
-                    // Check LFN first, then fall back to short name
-                    if lfn_buffer.matches(name) || entry.matches_name(name) {
-                        return Ok(entry);
+                    if let core::ops::ControlFlow::Break(val) = visitor(&entry, &lfn_buffer) {
+                        return Ok(core::ops::ControlFlow::Break(val));
                     }
 
                     lfn_buffer.reset();
@@ -990,84 +981,95 @@ impl<'a> FatFilesystem<'a> {
                     bytes_processed += 32;
                 }
 
-                // If we didn't process any entries (shouldn't happen), move to next block
                 if pos == offset_in_block {
                     bytes_processed = (device_block + 1) * device_block_size - root_dir_byte_start;
                 }
             }
         } else {
-            // Cluster chain directory
+            // Cluster-chain directory
             let mut current_cluster = cluster;
             let cluster_size = self.sectors_per_cluster as usize * self.bytes_per_sector as usize;
             let entries_per_cluster = cluster_size / 32;
-            let mut lfn_buffer = LfnBuffer::new();
 
             loop {
                 self.read_cluster(current_cluster, &mut buffer[..cluster_size])?;
 
                 for i in 0..entries_per_cluster {
                     let offset = i * 32;
-                    // Parse directory entry using zerocopy
                     let entry = match DirectoryEntry::read_from_prefix(&buffer[offset..]) {
                         Ok((e, _)) => e,
                         Err(_) => break,
                     };
 
                     if entry.is_end() {
-                        log::debug!(
-                            "FAT: end of directory in cluster {}, '{}' not found",
-                            current_cluster,
-                            name
-                        );
-                        return Err(FatError::NotFound);
+                        return Ok(core::ops::ControlFlow::Continue(()));
                     }
-
                     if entry.is_free() {
                         lfn_buffer.reset();
                         continue;
                     }
-
                     if entry.is_lfn() {
-                        // Process LFN entry - reinterpret the bytes as LfnEntry
-                        // Safety: LfnEntry has the same size (32 bytes) as DirectoryEntry
                         let lfn_entry =
                             unsafe { &*(&buffer[offset] as *const u8 as *const LfnEntry) };
                         lfn_buffer.process_lfn(lfn_entry);
                         continue;
                     }
-
                     if entry.is_volume_id() {
                         lfn_buffer.reset();
                         continue;
                     }
 
-                    log::debug!(
-                        "FAT: found entry '{}' in cluster {} (looking for '{}')",
-                        entry.short_name(),
-                        current_cluster,
-                        name
-                    );
-
-                    // Check LFN first, then fall back to short name
-                    if lfn_buffer.matches(name) || entry.matches_name(name) {
-                        return Ok(entry);
+                    if let core::ops::ControlFlow::Break(val) = visitor(&entry, &lfn_buffer) {
+                        return Ok(core::ops::ControlFlow::Break(val));
                     }
 
-                    // Reset LFN buffer for next entry
                     lfn_buffer.reset();
                 }
 
                 match self.next_cluster(current_cluster)? {
                     Some(next) => current_cluster = next,
-                    None => {
-                        log::debug!("FAT: end of cluster chain, '{}' not found", name);
-                        return Err(FatError::NotFound);
-                    }
+                    None => break,
                 }
             }
         }
 
-        Err(FatError::NotFound)
+        Ok(core::ops::ControlFlow::Continue(()))
+    }
+
+    /// Resolve a directory path to its starting cluster number.
+    ///
+    /// Returns 0 for FAT12/16 root directories, `root_cluster` for FAT32 root,
+    /// or the first cluster of the named directory.
+    fn resolve_dir_cluster(&mut self, dir_path: &str) -> Result<u32, FatError> {
+        if dir_path.is_empty() || dir_path == "\\" || dir_path == "/" {
+            if self.fat_type == FatType::Fat32 {
+                Ok(self.root_cluster)
+            } else {
+                Ok(0)
+            }
+        } else {
+            let dir_entry = self.find_file(dir_path)?;
+            if !dir_entry.is_directory() {
+                return Err(FatError::NotADirectory);
+            }
+            Ok(dir_entry.first_cluster())
+        }
+    }
+
+    /// Find an entry in a directory
+    fn find_in_directory(&mut self, cluster: u32, name: &str) -> Result<DirectoryEntry, FatError> {
+        use core::ops::ControlFlow;
+
+        match self.for_each_dir_entry(cluster, |entry, lfn_buf| {
+            if lfn_buf.matches(name) || entry.matches_name(name) {
+                ControlFlow::Break(*entry)
+            } else {
+                ControlFlow::Continue(())
+            }
+        })? {
+            ControlFlow::Break(entry) => Ok(entry),
+            ControlFlow::Continue(()) => Err(FatError::NotFound),
+        }
     }
 
     /// Read a file into a buffer
@@ -1215,140 +1217,21 @@ impl<'a> FatFilesystem<'a> {
         dir_path: &str,
         suffix: &str,
     ) -> Result<heapless::Vec<heapless::String<64>, 32>, FatError> {
-        // Find the directory entry to get its cluster
-        let dir_cluster = if dir_path.is_empty() || dir_path == "\\" || dir_path == "/" {
-            // Root directory
-            if self.fat_type == FatType::Fat32 {
-                self.root_cluster
-            } else {
-                0
-            }
-        } else {
-            let dir_entry = self.find_file(dir_path)?;
-            if !dir_entry.is_directory() {
-                return Err(FatError::NotADirectory);
-            }
-            dir_entry.first_cluster()
-        };
+        use core::ops::ControlFlow;
 
+        let dir_cluster = self.resolve_dir_cluster(dir_path)?;
         let mut results: heapless::Vec<heapless::String<64>, 32> = heapless::Vec::new();
-        let mut buffer = [0u8; 65536]; // Max cluster size
-        let cluster_size = self.sectors_per_cluster as usize * self.bytes_per_sector as usize;
-        let mut lfn_buffer = LfnBuffer::new();
 
-        if dir_cluster == 0 && self.fat_type != FatType::Fat32 {
-            // FAT12/16 root directory
-            let device_block_size = self.device_block_size as usize;
-            let root_dir_bytes = self.root_dir_sectors as usize * self.bytes_per_sector as usize;
-            let mut bytes_processed = 0usize;
-
-            while bytes_processed < root_dir_bytes {
-                let current_byte_pos =
-                    self.root_dir_start as usize * self.bytes_per_sector as usize + bytes_processed;
-                let device_block = current_byte_pos / device_block_size;
-                let offset_in_block = current_byte_pos % device_block_size;
-
-                self.device
-                    .read_block(
-                        self.partition_start + device_block as u64,
-                        &mut buffer[..device_block_size],
-                    )
-                    .map_err(|_| FatError::ReadError)?;
-
-                let mut pos = offset_in_block;
-                while pos + 32 <= device_block_size && bytes_processed < root_dir_bytes {
-                    let entry = match DirectoryEntry::read_from_prefix(&buffer[pos..]) {
-                        Ok((e, _)) => e,
-                        Err(_) => break,
-                    };
-
-                    if entry.is_end() {
-                        return Ok(results);
-                    }
-                    if entry.is_free() {
-                        lfn_buffer.reset();
-                        pos += 32;
-                        bytes_processed += 32;
-                        continue;
-                    }
-                    if entry.is_lfn() {
-                        let lfn_entry = unsafe { &*(&buffer[pos] as *const u8 as *const LfnEntry) };
-                        lfn_buffer.process_lfn(lfn_entry);
-                        pos += 32;
-                        bytes_processed += 32;
-                        continue;
-                    }
-                    if entry.is_volume_id() || entry.is_directory() {
-                        lfn_buffer.reset();
-                        pos += 32;
-                        bytes_processed += 32;
-                        continue;
-                    }
-
-                    // Got a file entry - get its name
-                    let name = Self::entry_display_name(&entry, &lfn_buffer);
-                    lfn_buffer.reset();
-
-                    if suffix_matches(&name, suffix) && results.push(name).is_err() {
-                        return Ok(results); // Full
-                    }
-
-                    pos += 32;
-                    bytes_processed += 32;
-                }
-                if pos == offset_in_block {
-                    bytes_processed = (device_block + 1) * device_block_size
-                        - (self.root_dir_start as usize * self.bytes_per_sector as usize);
-                }
+        let _ = self.for_each_dir_entry(dir_cluster, |entry, lfn_buf| {
+            if entry.is_directory() {
+                return ControlFlow::Continue(());
             }
-        } else {
-            // Cluster chain directory
-            let mut current_cluster = dir_cluster;
-            let entries_per_cluster = cluster_size / 32;
-
-            loop {
-                self.read_cluster(current_cluster, &mut buffer[..cluster_size])?;
-
-                for i in 0..entries_per_cluster {
-                    let offset = i * 32;
-                    let entry = match DirectoryEntry::read_from_prefix(&buffer[offset..]) {
-                        Ok((e, _)) => e,
-                        Err(_) => break,
-                    };
-
-                    if entry.is_end() {
-                        return Ok(results);
-                    }
-                    if entry.is_free() {
-                        lfn_buffer.reset();
-                        continue;
-                    }
-                    if entry.is_lfn() {
-                        let lfn_entry =
-                            unsafe { &*(&buffer[offset] as *const u8 as *const LfnEntry) };
-                        lfn_buffer.process_lfn(lfn_entry);
-                        continue;
-                    }
-                    if entry.is_volume_id() || entry.is_directory() {
-                        lfn_buffer.reset();
-                        continue;
-                    }
-
-                    // Got a file entry - get its name
-                    let name = Self::entry_display_name(&entry, &lfn_buffer);
-                    lfn_buffer.reset();
-
-                    if suffix_matches(&name, suffix) && results.push(name).is_err() {
-                        return Ok(results); // Full
-                    }
-                }
-
-                match self.next_cluster(current_cluster)? {
-                    Some(next) => current_cluster = next,
-                    None => break,
-                }
+            let name = Self::entry_display_name(entry, lfn_buf);
+            if suffix_matches(&name, suffix) && results.push(name).is_err() {
+                return ControlFlow::Break(()); // Full
             }
-        }
+            ControlFlow::Continue(())
+        })?;
 
         Ok(results)
     }
@@ -1396,252 +1279,57 @@ impl<'a> FatFilesystem<'a> {
         &mut self,
         dir_path: &str,
     ) -> Result<heapless::Vec<heapless::String<64>, 16>, FatError> {
-        // Find the directory entry to get its cluster
-        let dir_cluster = if dir_path.is_empty() || dir_path == "\\" || dir_path == "/" {
-            if self.fat_type == FatType::Fat32 {
-                self.root_cluster
-            } else {
-                0
-            }
-        } else {
-            let dir_entry = self.find_file(dir_path)?;
-            if !dir_entry.is_directory() {
-                return Err(FatError::NotADirectory);
-            }
-            dir_entry.first_cluster()
-        };
+        use core::ops::ControlFlow;
 
+        let dir_cluster = self.resolve_dir_cluster(dir_path)?;
         let mut results: heapless::Vec<heapless::String<64>, 16> = heapless::Vec::new();
-        let mut buffer = [0u8; 65536];
-        let cluster_size = self.sectors_per_cluster as usize * self.bytes_per_sector as usize;
-        let mut lfn_buffer = LfnBuffer::new();
 
-        if dir_cluster == 0 && self.fat_type != FatType::Fat32 {
-            // FAT12/16 root directory
-            let device_block_size = self.device_block_size as usize;
-            let root_dir_bytes = self.root_dir_sectors as usize * self.bytes_per_sector as usize;
-            let mut bytes_processed = 0usize;
-
-            while bytes_processed < root_dir_bytes {
-                let current_byte_pos =
-                    self.root_dir_start as usize * self.bytes_per_sector as usize + bytes_processed;
-                let device_block = current_byte_pos / device_block_size;
-                let offset_in_block = current_byte_pos % device_block_size;
-
-                self.device
-                    .read_block(
-                        self.partition_start + device_block as u64,
-                        &mut buffer[..device_block_size],
-                    )
-                    .map_err(|_| FatError::ReadError)?;
-
-                let mut pos = offset_in_block;
-                while pos + 32 <= device_block_size && bytes_processed < root_dir_bytes {
-                    let entry = match DirectoryEntry::read_from_prefix(&buffer[pos..]) {
-                        Ok((e, _)) => e,
-                        Err(_) => break,
-                    };
-
-                    if entry.is_end() {
-                        return Ok(results);
-                    }
-                    if entry.is_free() {
-                        lfn_buffer.reset();
-                        pos += 32;
-                        bytes_processed += 32;
-                        continue;
-                    }
-                    if entry.is_lfn() {
-                        let lfn_entry = unsafe { &*(&buffer[pos] as *const u8 as *const LfnEntry) };
-                        lfn_buffer.process_lfn(lfn_entry);
-                        pos += 32;
-                        bytes_processed += 32;
-                        continue;
-                    }
-                    if entry.is_volume_id() || !entry.is_directory() {
-                        lfn_buffer.reset();
-                        pos += 32;
-                        bytes_processed += 32;
-                        continue;
-                    }
-
-                    // Got a directory entry - get its name
-                    let name = Self::entry_display_name(&entry, &lfn_buffer);
-                    lfn_buffer.reset();
-
-                    // Skip . and ..
-                    if name != "." && name != ".." && results.push(name).is_err() {
-                        return Ok(results);
-                    }
-
-                    pos += 32;
-                    bytes_processed += 32;
-                }
-                if pos == offset_in_block {
-                    bytes_processed = (device_block + 1) * device_block_size
-                        - (self.root_dir_start as usize * self.bytes_per_sector as usize);
-                }
+        let _ = self.for_each_dir_entry(dir_cluster, |entry, lfn_buf| {
+            if !entry.is_directory() {
+                return ControlFlow::Continue(());
             }
-        } else {
-            // Cluster chain directory
-            let mut current_cluster = dir_cluster;
-            let entries_per_cluster = cluster_size / 32;
-
-            loop {
-                self.read_cluster(current_cluster, &mut buffer[..cluster_size])?;
-
-                for i in 0..entries_per_cluster {
-                    let offset = i * 32;
-                    let entry = match DirectoryEntry::read_from_prefix(&buffer[offset..]) {
-                        Ok((e, _)) => e,
-                        Err(_) => break,
-                    };
-
-                    if entry.is_end() {
-                        return Ok(results);
-                    }
-                    if entry.is_free() {
-                        lfn_buffer.reset();
-                        continue;
-                    }
-                    if entry.is_lfn() {
-                        let lfn_entry =
-                            unsafe { &*(&buffer[offset] as *const u8 as *const LfnEntry) };
-                        lfn_buffer.process_lfn(lfn_entry);
-                        continue;
-                    }
-                    if entry.is_volume_id() || !entry.is_directory() {
-                        lfn_buffer.reset();
-                        continue;
-                    }
-
-                    // Got a directory entry - get its name
-                    let name = Self::entry_display_name(&entry, &lfn_buffer);
-                    lfn_buffer.reset();
-
-                    // Skip . and ..
-                    if name != "." && name != ".." && results.push(name).is_err() {
-                        return Ok(results);
-                    }
-                }
-
-                match self.next_cluster(current_cluster)? {
-                    Some(next) => current_cluster = next,
-                    None => break,
-                }
+            let name = Self::entry_display_name(entry, lfn_buf);
+            if name != "." && name != ".." && results.push(name).is_err() {
+                return ControlFlow::Break(()); // Full
             }
-        }
+            ControlFlow::Continue(())
+        })?;
 
         Ok(results)
     }
 
     /// Get a directory entry at a specific position (for directory enumeration)
     ///
+    /// Returns both the entry and its display name (preferring LFN over 8.3).
+    ///
     /// # Arguments
     /// * `cluster` - First cluster of directory (0 for FAT12/16 root directory)
     /// * `position` - Entry index (skipping deleted/LFN/volume entries)
     ///
     /// # Returns
-    /// * `Ok(Some(entry))` - The entry at the given position
+    /// * `Ok(Some((entry, name)))` - The entry and display name at the given position
     /// * `Ok(None)` - End of directory reached
     /// * `Err(e)` - Read error
     pub fn get_directory_entry_at_position(
         &mut self,
         cluster: u32,
         position: usize,
-    ) -> Result<Option<DirectoryEntry>, FatError> {
-        let mut buffer = [0u8; 65536]; // Max cluster size
-        let cluster_size = self.sectors_per_cluster as usize * self.bytes_per_sector as usize;
-        let entries_per_cluster = cluster_size / 32;
+    ) -> Result<Option<(DirectoryEntry, heapless::String<64>)>, FatError> {
+        use core::ops::ControlFlow;
+
         let mut current_position = 0usize;
 
-        if cluster == 0 && self.fat_type != FatType::Fat32 {
-            // FAT12/16 root directory (fixed location)
-            let device_block_size = self.device_block_size as usize;
-            let root_dir_bytes = self.root_dir_sectors as usize * self.bytes_per_sector as usize;
-
-            let mut bytes_read = 0usize;
-
-            while bytes_read < root_dir_bytes {
-                // Calculate which device block to read
-                let current_byte_pos =
-                    (self.root_dir_start as usize * self.bytes_per_sector as usize) + bytes_read;
-                let device_block = current_byte_pos / device_block_size;
-                let offset_in_block = current_byte_pos % device_block_size;
-
-                self.device
-                    .read_block(
-                        self.partition_start + device_block as u64,
-                        &mut buffer[..device_block_size],
-                    )
-                    .map_err(|_| FatError::ReadError)?;
-
-                // Process entries from this device block
-                let mut pos = offset_in_block;
-                while pos + 32 <= device_block_size && bytes_read < root_dir_bytes {
-                    // Parse directory entry using zerocopy
-                    let entry = match DirectoryEntry::read_from_prefix(&buffer[pos..]) {
-                        Ok((e, _)) => e,
-                        Err(_) => break,
-                    };
-
-                    if entry.is_end() {
-                        return Ok(None);
-                    }
-
-                    if !entry.is_free() && !entry.is_lfn() && !entry.is_volume_id() {
-                        if current_position == position {
-                            return Ok(Some(entry));
-                        }
-                        current_position += 1;
-                    }
-
-                    pos += 32;
-                    bytes_read += 32;
-                }
-
-                // Move to next device block boundary
-                if pos == offset_in_block {
-                    bytes_read = (device_block + 1) * device_block_size
-                        - (self.root_dir_start as usize * self.bytes_per_sector as usize);
-                }
-            }
-            return Ok(None);
-        }
-
-        // Cluster chain directory
-        let mut current_cluster = cluster;
-
-        loop {
-            self.read_cluster(current_cluster, &mut buffer[..cluster_size])?;
-
-            // Search entries
-            for i in 0..entries_per_cluster {
-                let offset = i * 32;
-                // Parse directory entry using zerocopy
-                let entry = match DirectoryEntry::read_from_prefix(&buffer[offset..]) {
-                    Ok((e, _)) => e,
-                    Err(_) => break,
-                };
-
-                if entry.is_end() {
-                    return Ok(None);
-                }
-                if entry.is_free() || entry.is_lfn() || entry.is_volume_id() {
-                    continue;
-                }
-
-                if current_position == position {
-                    return Ok(Some(entry));
-                }
+        match self.for_each_dir_entry(cluster, |entry, lfn_buf| {
+            if current_position == position {
+                let name = Self::entry_display_name(entry, lfn_buf);
+                ControlFlow::Break((*entry, name))
+            } else {
                 current_position += 1;
+                ControlFlow::Continue(())
             }
-
-            // Get next cluster
-            current_cluster = match self.next_cluster(current_cluster)? {
-                Some(c) => c,
-                None => return Ok(None),
-            };
+        })? {
+            ControlFlow::Break(result) => Ok(Some(result)),
+            ControlFlow::Continue(()) => Ok(None),
         }
     }
 }

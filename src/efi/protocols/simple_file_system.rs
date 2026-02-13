@@ -834,10 +834,7 @@ fn read_directory(buffer_size: *mut usize, buffer: *mut c_void, handle_idx: usiz
     });
 
     match entry_result {
-        Some(Ok(Some(entry))) => {
-            // Build filename from entry
-            let filename = entry.short_name();
-
+        Some(Ok(Some((entry, filename)))) => {
             let filename_u16_len = filename.len() + 1;
             let required_size = core::mem::size_of::<efi_file::Info>() + filename_u16_len * 2;
             let requested_size = unsafe { *buffer_size };
