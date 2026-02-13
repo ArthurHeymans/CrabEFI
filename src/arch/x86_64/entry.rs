@@ -37,28 +37,8 @@ pub const NUM_PAGE_DIRECTORIES: usize = 64;
 pub static mut PD: [PageTable; NUM_PAGE_DIRECTORIES] =
     [const { PageTable::empty() }; NUM_PAGE_DIRECTORIES];
 
-// GDT for 64-bit mode
-#[repr(C, align(16))]
-pub struct Gdt64 {
-    null: u64,
-    code: u64,
-    data: u64,
-}
-
-#[repr(C, packed)]
-pub struct GdtPtr {
-    limit: u16,
-    base: u64,
-}
-
-#[unsafe(no_mangle)]
-pub static GDT64: Gdt64 = Gdt64 {
-    null: 0,
-    code: 0x00af9a000000ffff, // 64-bit code segment
-    data: 0x00cf92000000ffff, // 64-bit data segment
-};
-
 // Assembly entry point - Intel syntax
+// Note: The GDT is defined in assembly below (gdt64/gdt64_ptr)
 global_asm!(
     r#"
 .section .entry32, "ax"

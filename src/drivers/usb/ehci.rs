@@ -1197,16 +1197,6 @@ impl EhciController {
             self.op().asynclistaddr.get(),
             self.op().usbcmd.get()
         );
-        log::trace!(
-            "EHCI: QH.ep_chars={:#x}, QH.overlay.next_qtd={:#x}",
-            qh_ep_chars,
-            qh_overlay_next
-        );
-        log::trace!(
-            "EHCI: ASYNCLISTADDR={:#x}, USBCMD={:#x}",
-            self.op().asynclistaddr.get(),
-            self.op().usbcmd.get()
-        );
 
         // Enable async schedule if not already
         if !self.op().usbcmd.is_set(USBCMD::ASE) {

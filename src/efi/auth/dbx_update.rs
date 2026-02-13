@@ -112,13 +112,13 @@ pub struct DbxEnrollmentResult {
 /// Raw files are only accepted in Setup Mode.
 pub fn find_dbx_file() -> Option<(Vec<u8>, DbxSource)> {
     // Try authenticated files first
-    if let Some((data, source)) = search_all_disks_for_dbx(DBX_AUTH_PATHS, true) {
+    if let Some((data, source)) = search_all_disks_for_dbx(DBX_AUTH_PATHS) {
         return Some((data, DbxSource::Authenticated(source)));
     }
 
     // Try raw files only in Setup Mode
     if is_setup_mode() {
-        if let Some((data, source)) = search_all_disks_for_dbx(DBX_RAW_PATHS, false) {
+        if let Some((data, source)) = search_all_disks_for_dbx(DBX_RAW_PATHS) {
             log::warn!("Using raw dbx file in Setup Mode - this is less secure");
             return Some((data, DbxSource::Raw(source)));
         }
@@ -130,10 +130,7 @@ pub fn find_dbx_file() -> Option<(Vec<u8>, DbxSource)> {
 }
 
 /// Search all disks for dbx files with the given paths
-fn search_all_disks_for_dbx(
-    paths: &[&str],
-    _authenticated: bool,
-) -> Option<(Vec<u8>, &'static str)> {
+fn search_all_disks_for_dbx(paths: &[&str]) -> Option<(Vec<u8>, &'static str)> {
     super::search_all_disks(|disk, label| search_disk_for_dbx(disk, label, paths))
 }
 

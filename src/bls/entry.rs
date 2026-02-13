@@ -186,23 +186,6 @@ fn normalize_path(path: &str) -> &str {
     path.trim_start_matches('/')
 }
 
-/// Convert a normalized BLS path to FAT path format
-///
-/// # Arguments
-///
-/// * `bls_path` - Path from BLS entry (e.g., "vmlinuz-6.8.0")
-/// * `output` - Buffer to write the FAT path
-pub fn to_fat_path(bls_path: &str, output: &mut String<MAX_PATH_LEN>) {
-    output.clear();
-    for c in bls_path.chars() {
-        if c == '/' {
-            let _ = output.push('\\');
-        } else {
-            let _ = output.push(c);
-        }
-    }
-}
-
 /// BLS loader.conf settings
 #[derive(Debug, Clone)]
 pub struct LoaderConf {

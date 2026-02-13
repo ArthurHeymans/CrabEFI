@@ -23,11 +23,8 @@ use x509_cert::ext::pkix::constraints::BasicConstraints as X509BasicConstraints;
 // Certificate Chain Building Configuration
 // ============================================================================
 
-/// Maximum certificate chain depth allowed
-/// This prevents infinite loops and excessive resource consumption
-pub const MAX_CHAIN_DEPTH: usize = 10;
-
-/// Default maximum chain depth for normal operations
+/// Maximum certificate chain depth for normal operations.
+/// Prevents infinite loops and excessive resource consumption.
 const DEFAULT_MAX_CHAIN_DEPTH: usize = 5;
 
 /// Configuration for certificate chain building and validation

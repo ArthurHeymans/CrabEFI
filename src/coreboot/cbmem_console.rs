@@ -149,12 +149,6 @@ pub fn write_bytes(data: &[u8]) {
     }
 }
 
-/// Write a single byte to the CBMEM console
-#[inline]
-pub fn write_byte(byte: u8) {
-    write_bytes(&[byte]);
-}
-
 /// Writer struct that implements `core::fmt::Write`
 pub struct CbmemConsoleWriter;
 
@@ -169,19 +163,4 @@ impl Write for CbmemConsoleWriter {
 pub fn write_fmt(args: fmt::Arguments) {
     let mut writer = CbmemConsoleWriter;
     let _ = writer.write_fmt(args);
-}
-
-/// Macro for printing to CBMEM console
-#[macro_export]
-macro_rules! cbmem_print {
-    ($($arg:tt)*) => {
-        $crate::coreboot::cbmem_console::write_fmt(format_args!($($arg)*))
-    };
-}
-
-/// Macro for printing to CBMEM console with newline
-#[macro_export]
-macro_rules! cbmem_println {
-    () => ($crate::cbmem_print!("\n"));
-    ($($arg:tt)*) => ($crate::cbmem_print!("{}\n", format_args!($($arg)*)));
 }
