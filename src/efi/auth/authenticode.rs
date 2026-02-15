@@ -108,9 +108,11 @@ pub fn compute_authenticode_hash(pe_data: &[u8]) -> Result<[u8; 32], AuthError> 
         }
     }
 
-    // Region 4: Hash sections in order of file offset
-    // Sections are already sorted by file_offset
-    let mut current_pos = info.size_of_headers;
+    // Region 4: Hash each section in order of PointerToRawData.
+    // Per the Authenticode spec, only each section's raw data is hashed here
+    // (no inter-section gaps). SUM_OF_BYTES_HASHED tracks the total byte count
+    // for the extra-data calculation in the next step.
+    let mut sum_of_bytes_hashed = info.size_of_headers;
 
     for section in &info.sections {
         let section_start = section.file_offset as usize;
@@ -123,29 +125,25 @@ pub fn compute_authenticode_hash(pe_data: &[u8]) -> Result<[u8; 32], AuthError> 
             continue;
         }
 
-        // Handle gap between current position and section start
-        if section_start > current_pos && section_start <= pe_data.len() {
-            // There's a gap - hash it (could be alignment padding)
-            hasher.update(&pe_data[current_pos..section_start]);
-        }
-
         // Hash the section data
         if section_end <= pe_data.len() {
             hasher.update(&pe_data[section_start..section_end]);
-            current_pos = section_end;
+            sum_of_bytes_hashed += section.size_of_raw_data as usize;
         }
     }
 
-    // Hash any remaining data BEFORE the certificate table
-    let file_end = if info.cert_table_rva > 0 && info.cert_table_size > 0 {
-        // Certificate table is at the end - don't hash it
-        info.cert_table_rva as usize
+    // Region 5: Hash any extra data between SUM_OF_BYTES_HASHED and the
+    // certificate table (or end of file). Per Authenticode spec step 14:
+    //   extra_start = SUM_OF_BYTES_HASHED (as file offset)
+    //   extra_end   = FILE_SIZE - Size_of_CertificateTable
+    let file_end = if info.cert_table_size > 0 {
+        pe_data.len().saturating_sub(info.cert_table_size as usize)
     } else {
         pe_data.len()
     };
 
-    if current_pos < file_end && file_end <= pe_data.len() {
-        hasher.update(&pe_data[current_pos..file_end]);
+    if sum_of_bytes_hashed < file_end && file_end <= pe_data.len() {
+        hasher.update(&pe_data[sum_of_bytes_hashed..file_end]);
     }
 
     Ok(hasher.finalize().into())
@@ -311,11 +309,105 @@ pub fn verify_pe_image_secure_boot(pe_data: &[u8]) -> Result<bool, AuthError> {
     }
 }
 
+/// Extract the Authenticode hash from the SpcIndirectDataContent in a PKCS#7 signature.
+///
+/// The SpcIndirectDataContent structure (Microsoft Authenticode) contains:
+/// ```text
+/// SpcIndirectDataContent ::= SEQUENCE {
+///     data            SpcAttributeTypeAndOptionalValue,
+///     messageDigest   DigestInfo ::= SEQUENCE {
+///         digestAlgorithm  AlgorithmIdentifier,
+///         digest           OCTET STRING
+///     }
+/// }
+/// ```
+///
+/// This function parses the eContent from the PKCS#7 SignedData and extracts
+/// the hash from the DigestInfo, which should match our computed Authenticode hash.
+fn extract_spc_authenticode_hash(pkcs7_data: &[u8]) -> Result<Option<Vec<u8>>, AuthError> {
+    use cms::content_info::ContentInfo;
+    use cms::signed_data::SignedData;
+    use der::asn1::OctetStringRef;
+    use der::{Decode, Encode, Reader, SliceReader, Tagged};
+
+    let actual_pkcs7 = super::crypto::trim_der_trailing_bytes(pkcs7_data)?;
+    let content_info = ContentInfo::from_der(actual_pkcs7).map_err(|_| AuthError::InvalidHeader)?;
+    let signed_data_bytes = content_info
+        .content
+        .to_der()
+        .map_err(|_| AuthError::InvalidHeader)?;
+    let cms_signed_data =
+        SignedData::from_der(&signed_data_bytes).map_err(|_| AuthError::InvalidHeader)?;
+
+    let econtent = match cms_signed_data.encap_content_info.econtent {
+        Some(ref ec) => ec,
+        None => return Ok(None),
+    };
+
+    // Get SpcIndirectDataContent bytes for parsing.
+    // If eContent is OCTET STRING, the value is the DER of SpcIndirectDataContent.
+    // If eContent is a SEQUENCE (direct encoding), we need the full DER.
+    let spc_owned: Vec<u8>;
+    let spc_data: &[u8] = if econtent.tag() == der::Tag::OctetString {
+        econtent.value()
+    } else {
+        spc_owned = econtent.to_der().map_err(|_| AuthError::InvalidHeader)?;
+        &spc_owned
+    };
+
+    // Parse SpcIndirectDataContent SEQUENCE to extract the digest
+    let mut reader = SliceReader::new(spc_data).map_err(|_| AuthError::InvalidHeader)?;
+    let hash = reader
+        .sequence(|seq| {
+            // Skip SpcAttributeTypeAndOptionalValue (first element)
+            let _ = seq.tlv_bytes()?;
+            // Parse DigestInfo SEQUENCE (second element)
+            seq.sequence(|digest_seq| {
+                // Skip AlgorithmIdentifier
+                let _ = digest_seq.tlv_bytes()?;
+                // Read digest OCTET STRING
+                let digest: OctetStringRef = digest_seq.decode()?;
+                Ok(digest.as_bytes().to_vec())
+            })
+        })
+        .map_err(|_: der::Error| AuthError::InvalidHeader)?;
+
+    Ok(Some(hash))
+}
+
 /// Verify an Authenticode signature against the db database
 fn verify_authenticode_signature(
     image_hash: &[u8],
     sig: &AuthenticodeSignature,
 ) -> Result<bool, AuthError> {
+    // Verify the Authenticode hash matches what's embedded in the PKCS#7's
+    // SpcIndirectDataContent. This prevents signature transplant attacks where
+    // a valid signature from one PE image is attached to a different image.
+    match extract_spc_authenticode_hash(sig.pkcs7_data) {
+        Ok(Some(ref spc_hash)) => {
+            if !super::crypto::constant_time_eq(spc_hash, image_hash) {
+                log::warn!(
+                    "Authenticode hash in SpcIndirectDataContent does not match computed image hash"
+                );
+                log::debug!(
+                    "SPC hash: {:02x?}, image hash: {:02x?}",
+                    &spc_hash[..core::cmp::min(8, spc_hash.len())],
+                    &image_hash[..core::cmp::min(8, image_hash.len())]
+                );
+                return Ok(false);
+            }
+            log::debug!("Authenticode hash matches SpcIndirectDataContent");
+        }
+        Ok(None) => {
+            log::warn!("No SpcIndirectDataContent found in PKCS#7 signature");
+            return Ok(false);
+        }
+        Err(e) => {
+            log::debug!("Failed to extract SPC authenticode hash: {:?}", e);
+            return Ok(false);
+        }
+    }
+
     // Get all X.509 certificates from db
     let db = db_database();
     let certificates: Vec<&[u8]> = db.x509_certificates().collect();
