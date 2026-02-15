@@ -335,9 +335,13 @@ fn cmd_test(
     // Find the EFI file
     let efi_path = find_test_app_efi(app)?;
 
-    // Create test disk
+    // Create test disk (directory-test needs LFN files on disk)
     let disk_path = temp_dir.path().join("test.img");
-    disk::create_test_disk(disk_path.to_string_lossy().as_ref(), Some(&efi_path))?;
+    if app == "directory-test" {
+        disk::create_directory_test_disk(disk_path.to_string_lossy().as_ref(), &efi_path)?;
+    } else {
+        disk::create_test_disk(disk_path.to_string_lossy().as_ref(), Some(&efi_path))?;
+    }
 
     // Run tests
     qemu::run_tests(&config, &disk_path, app)

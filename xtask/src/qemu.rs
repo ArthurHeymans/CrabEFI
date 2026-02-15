@@ -313,6 +313,63 @@ pub fn run_tests(config: &QemuConfig, disk_path: &Path, app_name: &str) -> Resul
                 failed += 1;
             }
         }
+        "directory-test" => {
+            // Check that the test app started
+            if result.output.contains("Directory Enumeration Test") {
+                println!("[PASS] test_started: Directory enumeration test started");
+                passed += 1;
+            } else {
+                println!("[FAIL] test_started: Test did not start");
+                failed += 1;
+            }
+
+            // Check OpenVolume succeeded
+            if result.output.contains("[PASS] OpenVolume succeeded") {
+                println!("[PASS] open_volume: OpenVolume succeeded");
+                passed += 1;
+            } else {
+                println!("[FAIL] open_volume: OpenVolume failed");
+                failed += 1;
+            }
+
+            // Check that the long filename (>64 chars) was found intact
+            if result.output.contains("[PASS] long_filename:") {
+                println!("[PASS] long_filename: Filename >64 chars returned intact");
+                passed += 1;
+            } else {
+                println!(
+                    "[FAIL] long_filename: Filename >64 chars NOT found (LFN truncation bug?)"
+                );
+                failed += 1;
+            }
+
+            // Check that the long filename's .efi suffix was preserved
+            if result.output.contains("[PASS] long_filename_suffix:") {
+                println!("[PASS] long_filename_suffix: .efi suffix preserved on long name");
+                passed += 1;
+            } else {
+                println!("[FAIL] long_filename_suffix: .efi suffix lost on long filename");
+                failed += 1;
+            }
+
+            // Check that the short filename was also found
+            if result.output.contains("[PASS] short_filename:") {
+                println!("[PASS] short_filename: Short filename found");
+                passed += 1;
+            } else {
+                println!("[FAIL] short_filename: Short filename not found");
+                failed += 1;
+            }
+
+            // Check overall result
+            if result.output.contains("test PASSED!") {
+                println!("[PASS] overall: Directory enumeration test passed");
+                passed += 1;
+            } else {
+                println!("[FAIL] overall: Directory enumeration test failed");
+                failed += 1;
+            }
+        }
         _ => {
             // Generic test: just check if CrabEFI booted
             if result.output.contains("CrabEFI") {

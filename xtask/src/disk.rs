@@ -338,6 +338,67 @@ fn install_efi_app(disk_path: &str, app_path: &str) -> Result<()> {
     Ok(())
 }
 
+/// Install EFI application and populate \EFI\Linux with LFN test files.
+///
+/// Creates a disk image with:
+///   - \EFI\BOOT\BOOTX64.EFI  (the test app)
+///   - \EFI\Linux\nixos-kernel-6.12.9-linux-x86_64-5kg0k0b55f3mz75b7bl2fvkl0cqkzmam.efi  (71 chars)
+///   - \EFI\Linux\nixos-6.6.0.efi  (short name)
+///
+/// The long filename is specifically chosen to exceed 64 characters, which
+/// previously triggered a truncation bug in the FAT LFN → heapless::String<64>
+/// conversion.
+pub fn create_directory_test_disk(output: &str, efi_app: &str) -> Result<()> {
+    // Start with a normal test disk that has the EFI app as BOOTX64.EFI
+    create_test_disk(output, Some(efi_app))?;
+
+    let disk_with_offset = format!("{}@@{}", output, ESP_START_SECTOR * SECTOR_SIZE);
+
+    // Create \EFI\Linux directory
+    let _ = Command::new("mmd")
+        .args(["-i", &disk_with_offset, "::/EFI/Linux"])
+        .status();
+
+    // Create a small fake PE file to use as UKI stubs.
+    // A valid PE needs at least a DOS header with the magic 'MZ'.
+    let fake_efi = tempfile::NamedTempFile::new()?;
+    {
+        let mut f = std::io::BufWriter::new(fake_efi.as_file());
+        let mut pe = vec![0u8; 4096];
+        pe[0] = b'M';
+        pe[1] = b'Z';
+        f.write_all(&pe)?;
+        f.flush()?;
+    }
+    let fake_path = fake_efi.path().to_string_lossy().to_string();
+
+    // Long filename: 71 characters – exceeds old 64-byte heapless::String limit
+    let long_name = "nixos-kernel-6.12.9-linux-x86_64-5kg0k0b55f3mz75b7bl2fvkl0cqkzmam.efi";
+    let long_dest = format!("::/EFI/Linux/{}", long_name);
+    let status = Command::new("mcopy")
+        .args(["-i", &disk_with_offset, &fake_path, &long_dest])
+        .status()
+        .context("Failed to copy long-name file")?;
+    if !status.success() {
+        bail!("Failed to install long-name file");
+    }
+    println!("Installed {} (len={})", long_name, long_name.len());
+
+    // Short filename (< 64 chars)
+    let short_name = "nixos-6.6.0.efi";
+    let short_dest = format!("::/EFI/Linux/{}", short_name);
+    let status = Command::new("mcopy")
+        .args(["-i", &disk_with_offset, &fake_path, &short_dest])
+        .status()
+        .context("Failed to copy short-name file")?;
+    if !status.success() {
+        bail!("Failed to install short-name file");
+    }
+    println!("Installed {}", short_name);
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
