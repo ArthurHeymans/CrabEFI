@@ -577,7 +577,7 @@ fn boot_uefi_entry(entry: &menu::BootEntry) {
         return;
     }
 
-    if with_disk(&entry.device_type, |disk| {
+    let phase1_ok = with_disk(&entry.device_type, |disk| {
         let info = disk.info();
         let storage_id = match storage::register_device(
             storage_type_from(&entry.device_type),
@@ -587,7 +587,7 @@ fn boot_uefi_entry(entry: &menu::BootEntry) {
             Some(id) => id,
             None => {
                 log::error!("Failed to register device");
-                return;
+                return false;
             }
         };
         let _ = boot::install_block_io_protocols(
@@ -597,9 +597,10 @@ fn boot_uefi_entry(entry: &menu::BootEntry) {
             info.num_blocks,
             &path_info,
         );
-    })
-    .is_none()
-    {
+        true
+    });
+
+    if phase1_ok != Some(true) {
         log::error!("Failed to create disk for BlockIO installation");
         return;
     }

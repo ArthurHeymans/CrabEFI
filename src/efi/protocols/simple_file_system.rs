@@ -835,7 +835,8 @@ fn read_directory(buffer_size: *mut usize, buffer: *mut c_void, handle_idx: usiz
 
     match entry_result {
         Some(Ok(Some((entry, filename)))) => {
-            let filename_u16_len = filename.len() + 1;
+            let filename_char_count = filename.chars().count();
+            let filename_u16_len = filename_char_count + 1;
             let required_size = core::mem::size_of::<efi_file::Info>() + filename_u16_len * 2;
             let requested_size = unsafe { *buffer_size };
 
@@ -866,7 +867,7 @@ fn read_directory(buffer_size: *mut usize, buffer: *mut c_void, handle_idx: usiz
                 for (i, c) in filename.chars().enumerate() {
                     *filename_ptr.add(i) = c as u16;
                 }
-                *filename_ptr.add(filename.len()) = 0;
+                *filename_ptr.add(filename_char_count) = 0;
             }
 
             // Increment position

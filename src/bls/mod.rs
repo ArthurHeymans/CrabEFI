@@ -150,7 +150,7 @@ pub fn discover_entries(fs: &mut FatFilesystem<'_>) -> Result<BlsDiscovery, BlsE
     if let Ok(conf_files) = fs.list_directory_files(ENTRIES_DIR, ".conf") {
         log::debug!("Found {} .conf files in {}", conf_files.len(), ENTRIES_DIR);
         for filename in conf_files.iter() {
-            let mut path: String<64> = String::new();
+            let mut path: String<280> = String::new();
             let _ = core::fmt::write(&mut path, format_args!("{}\\{}", ENTRIES_DIR, filename));
             if let Some(entry) = try_load_entry(fs, path.as_str()) {
                 let _ = discovery.entries.push(entry);

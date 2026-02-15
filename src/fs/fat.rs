@@ -1217,11 +1217,11 @@ impl<'a> FatFilesystem<'a> {
         &mut self,
         dir_path: &str,
         suffix: &str,
-    ) -> Result<heapless::Vec<heapless::String<64>, 32>, FatError> {
+    ) -> Result<heapless::Vec<heapless::String<256>, 32>, FatError> {
         use core::ops::ControlFlow;
 
         let dir_cluster = self.resolve_dir_cluster(dir_path)?;
-        let mut results: heapless::Vec<heapless::String<64>, 32> = heapless::Vec::new();
+        let mut results: heapless::Vec<heapless::String<256>, 32> = heapless::Vec::new();
 
         let _ = self.for_each_dir_entry(dir_cluster, |entry, lfn_buf| {
             if entry.is_directory() {
@@ -1238,8 +1238,8 @@ impl<'a> FatFilesystem<'a> {
     }
 
     /// Extract the display name from a directory entry, preferring LFN over short name
-    fn entry_display_name(entry: &DirectoryEntry, lfn: &LfnBuffer) -> heapless::String<64> {
-        let mut name = heapless::String::<64>::new();
+    fn entry_display_name(entry: &DirectoryEntry, lfn: &LfnBuffer) -> heapless::String<256> {
+        let mut name = heapless::String::<256>::new();
 
         if lfn.active && lfn.len > 0 {
             // Use LFN - convert UTF-16 to UTF-8
@@ -1279,11 +1279,11 @@ impl<'a> FatFilesystem<'a> {
     pub fn list_subdirectories(
         &mut self,
         dir_path: &str,
-    ) -> Result<heapless::Vec<heapless::String<64>, 16>, FatError> {
+    ) -> Result<heapless::Vec<heapless::String<256>, 16>, FatError> {
         use core::ops::ControlFlow;
 
         let dir_cluster = self.resolve_dir_cluster(dir_path)?;
-        let mut results: heapless::Vec<heapless::String<64>, 16> = heapless::Vec::new();
+        let mut results: heapless::Vec<heapless::String<256>, 16> = heapless::Vec::new();
 
         let _ = self.for_each_dir_entry(dir_cluster, |entry, lfn_buf| {
             if !entry.is_directory() {
@@ -1315,7 +1315,7 @@ impl<'a> FatFilesystem<'a> {
         &mut self,
         cluster: u32,
         position: usize,
-    ) -> Result<Option<(DirectoryEntry, heapless::String<64>)>, FatError> {
+    ) -> Result<Option<(DirectoryEntry, heapless::String<256>)>, FatError> {
         use core::ops::ControlFlow;
 
         let mut current_position = 0usize;
