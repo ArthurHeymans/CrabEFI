@@ -65,11 +65,14 @@ pub use deferred::{
     init_buffer as init_deferred_buffer, process_pending as process_deferred_pending,
 };
 
-/// Default SMMSTORE region size (256KB, typical for coreboot)
-pub const DEFAULT_STORE_SIZE: u32 = 256 * 1024;
-
-/// SPI flash erase block size (4KB is typical)
-pub const ERASE_BLOCK_SIZE: u32 = 4096;
+// ============================================================================
+// Deferred buffer internal format (postcard-serialized VariableRecord)
+//
+// These types and constants are used ONLY by the deferred write buffer
+// (deferred.rs) which queues variable changes in RAM across warm reboots.
+// This is an internal in-memory format that never touches SPI flash.
+// The on-disk format is EDK2 FV (see edk2.rs).
+// ============================================================================
 
 /// Maximum variable name length (in UTF-16 code units)
 pub const MAX_NAME_LEN: usize = 64;
@@ -77,14 +80,14 @@ pub const MAX_NAME_LEN: usize = 64;
 /// Maximum variable data size
 pub const MAX_DATA_SIZE: usize = 4096;
 
-/// Variable record header magic: 0xAA55 (same as UEFI)
-pub const RECORD_MAGIC: u16 = 0xAA55;
+/// Variable record header magic: 0xAA55
+const RECORD_MAGIC: u16 = 0xAA55;
 
 /// Record state: valid and active
-pub const STATE_VALID: u8 = 0x7F;
+const STATE_VALID: u8 = 0x7F;
 
 /// Record state: deleted (superseded by newer record)
-pub const STATE_DELETED: u8 = 0x00;
+const STATE_DELETED: u8 = 0x00;
 
 /// Error types for variable store operations
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -158,11 +161,11 @@ impl SerializedGuid {
     }
 }
 
-/// A variable record stored in flash
+/// A variable record for the deferred write buffer.
 ///
-/// Each record contains a complete variable (name, GUID, attributes, data).
-/// Records are immutable once written. To update a variable, write a new record
-/// and mark the old one as deleted.
+/// This is a postcard-serialized in-memory format used by the deferred module
+/// to queue variable changes across warm reboots. It is NOT the on-disk format
+/// (see edk2.rs for the EDK2 FV format written to SPI flash).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VariableRecord {
     /// Record magic (RECORD_MAGIC)
@@ -450,10 +453,6 @@ impl VariableRecord {
     }
 }
 
-// Note: The legacy `VariableStore` struct has been removed. Variable
-// persistence is now handled by the `persistence` submodule which
-// uses the deferred/SMMSTORE-based approach.
-
 /// Simple CRC32 implementation (IEEE 802.3 polynomial)
 fn crc32(data: &[u8]) -> u32 {
     const CRC32_TABLE: [u32; 256] = crc32_table();
@@ -485,96 +484,4 @@ const fn crc32_table() -> [u32; 256] {
         i += 1;
     }
     table
-}
-
-/// Pending variable write for ESP file
-///
-/// When SPI is locked after ExitBootServices, variable writes are queued
-/// to be written to a file on the ESP. On next boot, this file is read,
-/// variables are authenticated, and applied to SPI flash.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PendingVariableWrite {
-    /// The variable record to write
-    pub record: VariableRecord,
-    /// Authentication signature (if authenticated variable)
-    pub auth_signature: Option<Vec<u8>>,
-}
-
-/// ESP variable file format
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct EspVariableFile {
-    /// Magic value for the file
-    pub magic: u32,
-    /// Version
-    pub version: u8,
-    /// Pending variable writes
-    pub pending: Vec<PendingVariableWrite>,
-    /// CRC32 of the file contents
-    pub crc: u32,
-}
-
-/// ESP variable file magic: "CVAR"
-pub const ESP_FILE_MAGIC: u32 = 0x52415643;
-
-impl EspVariableFile {
-    /// Create a new ESP variable file
-    pub fn new() -> Self {
-        Self {
-            magic: ESP_FILE_MAGIC,
-            version: 1,
-            pending: Vec::new(),
-            crc: 0,
-        }
-    }
-
-    /// Add a pending variable write
-    pub fn add(&mut self, record: VariableRecord, auth_signature: Option<Vec<u8>>) {
-        // Remove any existing pending write for this variable
-        let guid = record.guid;
-        let name = record.name.clone();
-        self.pending
-            .retain(|p| !(p.record.guid == guid && p.record.name == name));
-
-        self.pending.push(PendingVariableWrite {
-            record,
-            auth_signature,
-        });
-    }
-
-    /// Serialize to bytes
-    pub fn serialize(&mut self) -> Result<Vec<u8>> {
-        // Compute CRC of everything except the CRC field
-        self.crc = 0;
-        let temp_bytes = postcard::to_allocvec(&self).map_err(|_| VarStoreError::SerdeError)?;
-        self.crc = crc32(&temp_bytes);
-
-        postcard::to_allocvec(&self).map_err(|_| VarStoreError::SerdeError)
-    }
-
-    /// Deserialize from bytes
-    pub fn deserialize(bytes: &[u8]) -> Result<Self> {
-        let file: Self = postcard::from_bytes(bytes).map_err(|_| VarStoreError::SerdeError)?;
-
-        if file.magic != ESP_FILE_MAGIC {
-            return Err(VarStoreError::InvalidHeader);
-        }
-
-        // Verify CRC
-        let mut temp = file.clone();
-        temp.crc = 0;
-        let temp_bytes = postcard::to_allocvec(&temp).map_err(|_| VarStoreError::SerdeError)?;
-        let computed_crc = crc32(&temp_bytes);
-
-        if file.crc != computed_crc {
-            return Err(VarStoreError::CrcMismatch);
-        }
-
-        Ok(file)
-    }
-}
-
-impl Default for EspVariableFile {
-    fn default() -> Self {
-        Self::new()
-    }
 }
