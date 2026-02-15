@@ -418,13 +418,19 @@ pub struct VarStoreState {
     pub initialized: bool,
     /// Next free location for appending records (relative to store start)
     pub write_offset: u32,
+    /// Whether the EDK2 FV uses authenticated variable headers (60 bytes vs 32)
+    pub auth_format: bool,
+    /// Size of the variable data area (after FV + VS headers)
+    pub data_size: u32,
 }
 
 impl VarStoreState {
     pub const fn new() -> Self {
         Self {
             initialized: false,
-            write_offset: 16, // STORE_HEADER_SIZE
+            write_offset: 0,
+            auth_format: false,
+            data_size: 0,
         }
     }
 }

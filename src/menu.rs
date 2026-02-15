@@ -37,7 +37,7 @@ const DEFAULT_TIMEOUT_SECONDS: u32 = 5;
 const MENU_TITLE: &str = "CrabEFI Boot Menu";
 
 /// Help text
-const HELP_TEXT: &str = "Arrows: Select | Enter: Boot | C: Cmdline | S: Secure Boot | R: Reset";
+const HELP_TEXT: &str = "Arrows: Select | Enter: Boot | F: Firmware | C: Cmdline | S: Secure Boot | R: Reset";
 
 /// Storage device type
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -990,6 +990,13 @@ pub fn show_menu(menu: &mut BootMenu) -> Option<usize> {
                 KeyPress::Char('s') | KeyPress::Char('S') => {
                     // Open Secure Boot settings menu
                     crate::secure_boot_menu::show_secure_boot_menu();
+                    // Redraw boot menu after returning
+                    clear_screen(&mut fb_console);
+                    draw_menu(menu, &mut fb_console);
+                }
+                KeyPress::Char('f') | KeyPress::Char('F') => {
+                    // Open Firmware Settings menu (CFR)
+                    crate::cfr_menu::show_cfr_menu();
                     // Redraw boot menu after returning
                     clear_screen(&mut fb_console);
                     draw_menu(menu, &mut fb_console);

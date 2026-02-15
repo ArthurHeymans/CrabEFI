@@ -18,6 +18,7 @@ extern crate alloc;
 pub mod arch;
 pub mod bls;
 pub mod boot;
+pub mod cfr_menu;
 pub mod coreboot;
 pub mod drivers;
 pub mod efi;
@@ -169,6 +170,10 @@ pub fn init(coreboot_table_ptr: u64) -> ! {
         coreboot::store_boot_media(boot_media);
     }
 
+    // NOTE: CFR parsing is deferred until after heap::init() because it
+    // requires heap allocation (alloc::String, alloc::Vec). The raw data
+    // pointer is saved in cb_info.cfr_raw during table parsing.
+
     // Store memory regions and ACPI RSDP for direct Linux boot
     state::with_drivers_mut(|drivers| {
         // Copy memory regions
@@ -230,6 +235,9 @@ pub fn init(coreboot_table_ptr: u64) -> ! {
             smmstore.mmap_addr
         );
     }
+    if cb_info.cfr_raw.is_some() {
+        log::info!("  CFR: raw data found (parsed after heap init)");
+    }
     log::info!("  Memory regions: {}", cb_info.memory_map.len());
 
     // Initialize timing subsystem (calibrate TSC using ACPI PM timer)
@@ -277,6 +285,18 @@ pub fn init(coreboot_table_ptr: u64) -> ! {
         );
         // Continue boot -- features requiring alloc will fail gracefully
     }
+
+    // Parse and store CFR data now that the heap is available.
+    // The raw data pointer was saved during coreboot table parsing.
+    if let Some(cfr_raw) = cb_info.cfr_raw
+        && let Some(cfr) = coreboot::cfr::parse_cfr(cfr_raw) {
+            log::info!(
+                "CFR: {} forms, {} options",
+                cfr.forms.len(),
+                cfr.total_options()
+            );
+            coreboot::store_cfr(cfr);
+        }
 
     log::info!("CrabEFI initialized successfully!");
     log::info!("EFI System Table at: {:p}", efi::get_system_table());

@@ -7,13 +7,18 @@
 //! It also provides FMAP (Flash Map) parsing for locating flash regions
 //! like SMMSTORE. The FMAP location is obtained from coreboot's
 //! LB_TAG_BOOT_MEDIA_PARAMS table entry.
+//!
+//! CFR (Coreboot Form Representation) parsing is also supported for
+//! exposing firmware configuration options to the user.
 
 pub mod cbmem_console;
+pub mod cfr;
 pub mod fmap;
 pub mod framebuffer;
 pub mod memory;
 pub mod tables;
 
+pub use cfr::{CfrForm, CfrInfo, CfrOption, CfrOptionType, CfrValue};
 pub use framebuffer::FramebufferInfo;
 pub use memory::{MemoryRegion, MemoryType};
 pub use tables::{
@@ -82,6 +87,46 @@ pub fn store_boot_media(boot_media: BootMediaInfo) {
 /// This includes the FMAP offset which can be used to locate flash regions.
 pub fn get_boot_media() -> Option<BootMediaInfo> {
     crate::state::try_get().and_then(|state| state.drivers.boot_media)
+}
+
+// CFR info is stored separately because it can be very large with nested heapless::Vec.
+// We use a heap-allocated Box stored via AtomicPtr to avoid stack overflow.
+use alloc::boxed::Box;
+use core::sync::atomic::{AtomicPtr, Ordering};
+
+static CFR_PTR: AtomicPtr<CfrInfo> = AtomicPtr::new(core::ptr::null_mut());
+
+/// Store CFR info in global state (heap-allocated).
+///
+/// # Panics
+///
+/// Panics if called more than once. The single-call invariant ensures that
+/// `&'static` references handed out by [`get_cfr`] remain valid.
+pub(crate) fn store_cfr(cfr: CfrInfo) {
+    let boxed = Box::new(cfr);
+    let ptr = Box::into_raw(boxed);
+    let old = CFR_PTR.swap(ptr, Ordering::SeqCst);
+    assert!(
+        old.is_null(),
+        "store_cfr must only be called once (existing CfrInfo would be freed while &'static refs may exist)"
+    );
+}
+
+/// Get access to the global CFR info
+///
+/// Returns a reference to the CFR info if available. The data lives on the
+/// heap and is never freed, so the reference is valid for the lifetime of
+/// the program.
+pub fn get_cfr() -> Option<&'static CfrInfo> {
+    let ptr = CFR_PTR.load(Ordering::SeqCst);
+    if ptr.is_null() {
+        None
+    } else {
+        // SAFETY: ptr was created from Box::into_raw in store_cfr() and remains
+        // valid because store_cfr() is only called once during single-threaded init.
+        // The data is never freed, so the 'static lifetime is sound.
+        Some(unsafe { &*ptr })
+    }
 }
 
 /// Invalidate the coreboot framebuffer record in the coreboot tables.

@@ -40,6 +40,7 @@ pub mod tags {
     pub const CB_TAG_SMMSTOREV2: u32 = 0x0039;
     pub const CB_TAG_FMAP: u32 = 0x0037;
     pub const CB_TAG_ACPI_RSDP: u32 = 0x0043;
+    pub const CB_TAG_CFR_ROOT: u32 = 0x0047;
 }
 
 /// CBMEM IDs (used with CB_TAG_CBMEM_ENTRY)
@@ -333,6 +334,10 @@ pub struct CorebootInfo {
     pub spi_flash: Option<SpiFlashInfo>,
     /// Boot media parameters (includes FMAP location)
     pub boot_media: Option<BootMediaInfo>,
+    /// Raw CFR data slice from coreboot tables (parsed later after heap init).
+    /// The coreboot tables persist in firmware memory for the entire boot,
+    /// so this 'static reference is sound.
+    pub cfr_raw: Option<&'static [u8]>,
 }
 
 impl CorebootInfo {
@@ -349,6 +354,7 @@ impl CorebootInfo {
             smmstorev2: None,
             spi_flash: None,
             boot_media: None,
+            cfr_raw: None,
         }
     }
 }
@@ -563,6 +569,9 @@ fn parse_record(record_bytes: &[u8], info: &mut CorebootInfo) {
         }
         tags::CB_TAG_BOOT_MEDIA_PARAMS => {
             parse_boot_media_params(record_bytes, info);
+        }
+        tags::CB_TAG_CFR_ROOT => {
+            save_cfr_raw(record_bytes, info);
         }
         tags::CB_TAG_VERSION => {
             // Version string follows the 8-byte record header
@@ -998,6 +1007,18 @@ fn parse_spi_flash(record_bytes: &[u8], info: &mut CorebootInfo) {
         erase_cmd,
         mmap_windows,
     });
+}
+
+/// Save raw CFR data for deferred parsing (after heap init).
+///
+/// CFR parsing requires heap allocation (alloc::String, alloc::Vec), but
+/// table parsing runs before the heap is initialized. We save the raw data
+/// pointer here and parse it later in lib::init().
+fn save_cfr_raw(record_bytes: &[u8], info: &mut CorebootInfo) {
+    // Safety: coreboot tables persist in firmware memory for the entire boot.
+    let static_bytes: &'static [u8] =
+        unsafe { core::slice::from_raw_parts(record_bytes.as_ptr(), record_bytes.len()) };
+    info.cfr_raw = Some(static_bytes);
 }
 
 /// Parse boot media parameters

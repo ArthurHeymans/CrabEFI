@@ -1,37 +1,47 @@
 //! UEFI Variable Store
 //!
 //! This module provides persistent storage for UEFI variables using SPI flash.
-//! Variables are serialized using postcard (a compact, serde-based format).
+//! Variables are stored in EDK2-compatible Firmware Volume (FV) format, matching
+//! what coreboot's `get_uint_option()` / `set_uint_option()` expect.
 //!
-//! # Storage Architecture
-//!
-//! The variable store uses a simple append-only log format in SPI flash:
+//! # On-Disk Format (EDK2 FV)
 //!
 //! ```text
-//! +------------------+
-//! | Store Header     |  <- Magic, version, flags
-//! +------------------+
-//! | Variable 1       |  <- Serialized VariableRecord
-//! +------------------+
-//! | Variable 2       |
-//! +------------------+
-//! | ...              |
-//! +------------------+
-//! | Free Space (0xFF)|
-//! +------------------+
+//! +--------------------------------------------+ offset 0x0000
+//! |  EFI_FIRMWARE_VOLUME_HEADER  (72 bytes)    |
+//! +--------------------------------------------+ offset 0x0048
+//! |  VARIABLE_STORE_HEADER       (28 bytes)    |
+//! +--------------------------------------------+ offset 0x0064
+//! |  Variable Record #1 (header + name + data) |
+//! |  (padded to 4-byte alignment)              |
+//! +--------------------------------------------+
+//! |  Variable Record #2                        |
+//! +--------------------------------------------+
+//! |  ...                                       |
+//! +--------------------------------------------+
+//! |  Free space (0xFF)                         |
+//! +--------------------------------------------+
 //! ```
 //!
-//! When a variable is updated, a new record is appended. When reading, we scan
-//! from the beginning and keep only the latest version of each variable.
-//! When the store is full, we compact it by erasing and rewriting only active variables.
+//! The persistence layer (persistence.rs) reads and writes this format using
+//! helpers in the edk2 submodule. When a variable is updated, the old record
+//! is marked as deleted and a new record is appended. When the store is full,
+//! compaction erases the region and rewrites only active variables.
 //!
 //! # Dual-Storage Mode
 //!
-//! - **Before ExitBootServices**: Write directly to SPI flash
-//! - **After ExitBootServices**: SPI is locked; write to ESP file instead
-//! - **On Reset**: Read ESP file, authenticate, apply to SPI, delete ESP file
+//! - **Before ExitBootServices**: Write directly to SPI flash (EDK2 FV format)
+//! - **After ExitBootServices**: SPI is locked; queue to deferred buffer in RAM
+//! - **On Reset**: Deferred buffer is read, changes applied to SPI flash
+//!
+//! # Deferred Buffer (in-memory, transient)
+//!
+//! The deferred module uses postcard-serialized `VariableRecord`s in a RAM
+//! buffer. This is an internal format that never touches flash — it bridges
+//! variable writes across warm reboots when SPI is locked.
 
 pub mod deferred;
+pub mod edk2;
 pub mod persistence;
 pub mod storage;
 
@@ -54,15 +64,6 @@ pub use deferred::{
     deferred_buffer_base, deferred_buffer_size, get_stats as get_deferred_stats,
     init_buffer as init_deferred_buffer, process_pending as process_deferred_pending,
 };
-
-/// Store header magic value: "CRAB" in little-endian
-pub const STORE_MAGIC: u32 = 0x42415243; // "CRAB"
-
-/// Current store format version
-pub const STORE_VERSION: u8 = 1;
-
-/// Size of the store header
-pub const STORE_HEADER_SIZE: usize = 16;
 
 /// Default SMMSTORE region size (256KB, typical for coreboot)
 pub const DEFAULT_STORE_SIZE: u32 = 256 * 1024;
@@ -114,70 +115,6 @@ pub enum VarStoreError {
 
 /// Result type for variable store operations
 pub type Result<T> = core::result::Result<T, VarStoreError>;
-
-/// Store header at the beginning of the variable region
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
-pub struct StoreHeader {
-    /// Magic value (STORE_MAGIC)
-    pub magic: u32,
-    /// Format version
-    pub version: u8,
-    /// Flags (reserved)
-    pub flags: u8,
-    /// Reserved padding
-    pub reserved: u16,
-    /// Total store size in bytes
-    pub store_size: u32,
-    /// CRC32 of header (excluding this field)
-    pub header_crc: u32,
-}
-
-impl StoreHeader {
-    /// Create a new store header
-    pub fn new(store_size: u32) -> Self {
-        let mut header = Self {
-            magic: STORE_MAGIC,
-            version: STORE_VERSION,
-            flags: 0,
-            reserved: 0,
-            store_size,
-            header_crc: 0,
-        };
-        header.header_crc = header.compute_crc();
-        header
-    }
-
-    /// Compute CRC32 of the header (excluding the CRC field itself)
-    pub fn compute_crc(&self) -> u32 {
-        // CRC32 of the first 12 bytes (before header_crc)
-        let magic_bytes = self.magic.to_le_bytes();
-        let reserved_bytes = self.reserved.to_le_bytes();
-        let store_size_bytes = self.store_size.to_le_bytes();
-
-        let bytes = [
-            magic_bytes[0],
-            magic_bytes[1],
-            magic_bytes[2],
-            magic_bytes[3],
-            self.version,
-            self.flags,
-            reserved_bytes[0],
-            reserved_bytes[1],
-            store_size_bytes[0],
-            store_size_bytes[1],
-            store_size_bytes[2],
-            store_size_bytes[3],
-        ];
-        crc32(&bytes)
-    }
-
-    /// Validate the header
-    pub fn is_valid(&self) -> bool {
-        self.magic == STORE_MAGIC
-            && self.version == STORE_VERSION
-            && self.header_crc == self.compute_crc()
-    }
-}
 
 /// A serialized GUID (16 bytes)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
