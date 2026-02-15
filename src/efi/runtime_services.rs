@@ -995,8 +995,25 @@ extern "efiapi" fn set_variable(
         return Status::INVALID_PARAMETER;
     }
 
-    // Check data size
-    if data_size > MAX_VARIABLE_DATA_SIZE {
+    // Check data size.
+    //
+    // For authenticated writes the caller passes the EFI_VARIABLE_AUTHENTICATION_2
+    // header (timestamp + WIN_CERTIFICATE with a PKCS#7 signature, typically
+    // 1-3 KB) prepended to the actual payload.  The signature is verified and
+    // discarded; only the payload is stored.  We therefore allow a generous raw
+    // input limit here and re-check the *stored* size after auth processing
+    // (see the `final_data_size > MAX_VARIABLE_DATA_SIZE` guard below).
+    //
+    // For non-authenticated writes the raw size IS the stored size, so
+    // MAX_VARIABLE_DATA_SIZE is the correct limit.
+    let is_auth_write = (attributes & auth::attributes::TIME_BASED_AUTHENTICATED_WRITE_ACCESS) != 0;
+    let raw_limit = if is_auth_write {
+        // Auth header (PKCS#7 signature) can add 1-3 KB on top of payload
+        MAX_VARIABLE_DATA_SIZE * 3
+    } else {
+        MAX_VARIABLE_DATA_SIZE
+    };
+    if data_size > raw_limit {
         return Status::OUT_OF_RESOURCES;
     }
 

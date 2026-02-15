@@ -77,8 +77,11 @@ pub use deferred::{
 /// Maximum variable name length (in UTF-16 code units)
 pub const MAX_NAME_LEN: usize = 64;
 
-/// Maximum variable data size
-pub const MAX_DATA_SIZE: usize = 4096;
+/// Maximum variable data size for persistence
+///
+/// Must match `state::MAX_VARIABLE_DATA_SIZE` so that any variable held in
+/// memory can be persisted to SPI flash.
+pub const MAX_DATA_SIZE: usize = 8192;
 
 /// Variable record header magic: 0xAA55
 const RECORD_MAGIC: u16 = 0xAA55;
