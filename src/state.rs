@@ -236,8 +236,15 @@ pub const MAX_VARIABLES: usize = 64;
 /// Maximum variable name length (in characters)
 pub const MAX_VARIABLE_NAME_LEN: usize = 64;
 
-/// Maximum variable data size
-pub const MAX_VARIABLE_DATA_SIZE: usize = 1024;
+/// Maximum variable data size (stored payload, after auth header stripping)
+///
+/// This must be large enough for Secure Boot key databases (PK, KEK, db, dbx).
+/// A single X.509 certificate in an EFI_SIGNATURE_LIST is typically 1-2 KB,
+/// and databases with multiple certificates (e.g. Microsoft CA chain + custom
+/// keys from sbctl) can reach 4-8 KB.  16 KB covers all realistic Secure Boot
+/// configurations while keeping FirmwareState within the 2 MB stack budget
+/// (64 entries * ~8.3 KB ≈ 530 KB).
+pub const MAX_VARIABLE_DATA_SIZE: usize = 16 * 1024;
 
 /// Protocol interface entry
 #[derive(Clone, Copy)]
