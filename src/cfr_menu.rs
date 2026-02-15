@@ -9,18 +9,18 @@
 //! Dependency evaluation is supported: options whose dependencies are not
 //! met are hidden or shown as inactive according to their flags.
 
-use alloc::string::String;
-use alloc::vec::Vec;
 use crate::coreboot::{
     self,
     cfr::{self, CfrInfo, CfrOption, CfrOptionType, CfrValue},
 };
 use crate::drivers::serial as serial_driver;
 use crate::framebuffer_console::{
-    Color, FramebufferConsole, DEFAULT_BG, DEFAULT_FG, HIGHLIGHT_BG, HIGHLIGHT_FG,
+    Color, DEFAULT_BG, DEFAULT_FG, FramebufferConsole, HIGHLIGHT_BG, HIGHLIGHT_FG,
 };
 use crate::menu_common::{self, KeyPress, SerialWriter};
 use crate::time::delay_ms;
+use alloc::string::String;
+use alloc::vec::Vec;
 use core::fmt::Write;
 
 /// Menu title
@@ -127,8 +127,13 @@ pub fn show_cfr_menu() {
                     }
                     KeyPress::Enter | KeyPress::Char(' ') => {
                         // Check visibility/editability before taking a mutable borrow
-                        let can_edit = if let Some(item @ MenuItem::Option { form_idx, option_idx, .. }) =
-                            items.get(selected)
+                        let can_edit = if let Some(
+                            item @ MenuItem::Option {
+                                form_idx,
+                                option_idx,
+                                ..
+                            },
+                        ) = items.get(selected)
                         {
                             is_item_visible(cfr_info, &items, item)
                                 && get_option(cfr_info, *form_idx, *option_idx)
@@ -175,9 +180,10 @@ pub fn show_cfr_menu() {
                             option_idx,
                             ..
                         }) = items.get(selected)
-                            && let Some(option) = get_option(cfr_info, *form_idx, *option_idx) {
-                                show_help(option, &mut fb_console);
-                            }
+                            && let Some(option) = get_option(cfr_info, *form_idx, *option_idx)
+                        {
+                            show_help(option, &mut fb_console);
+                        }
                         break;
                     }
                     _ => {}
@@ -313,16 +319,11 @@ fn is_item_visible(cfr: &CfrInfo, items: &[MenuItem], item: &MenuItem) -> bool {
             option_idx,
             ..
         } => {
-            let form_ok = cfr
-                .forms
-                .get(*form_idx)
-                .is_none_or(|form| {
-                    is_dep_met_live(cfr, items, form.dependency_id, &form.dep_values)
-                });
+            let form_ok = cfr.forms.get(*form_idx).is_none_or(|form| {
+                is_dep_met_live(cfr, items, form.dependency_id, &form.dep_values)
+            });
             let opt_ok = get_option(cfr, *form_idx, *option_idx)
-                .is_none_or(|opt| {
-                    is_dep_met_live(cfr, items, opt.dependency_id, &opt.dep_values)
-                });
+                .is_none_or(|opt| is_dep_met_live(cfr, items, opt.dependency_id, &opt.dep_values));
             form_ok && opt_ok
         }
         // Comments and subform headers don't carry their own indices, so
@@ -377,7 +378,14 @@ fn is_selectable(item: &MenuItem) -> bool {
 
 /// Check if the item at `index` is an editable, visible option (immutable borrow).
 fn can_edit_item(cfr: &CfrInfo, items: &[MenuItem], index: usize) -> bool {
-    if let Some(item @ MenuItem::Option { form_idx, option_idx, .. }) = items.get(index) {
+    if let Some(
+        item @ MenuItem::Option {
+            form_idx,
+            option_idx,
+            ..
+        },
+    ) = items.get(index)
+    {
         is_item_visible(cfr, items, item)
             && get_option(cfr, *form_idx, *option_idx).is_some_and(|o| o.is_editable())
     } else {
@@ -599,7 +607,11 @@ fn confirm_save(fb_console: &mut Option<FramebufferConsole>) -> bool {
 /// Show a brief save result message (displayed on the confirm screen)
 fn show_save_result(saved: usize, failed: usize, fb_console: &mut Option<FramebufferConsole>) {
     if failed == 0 {
-        let _ = write!(SerialWriter, "\r\n\x1b[1;32m  Saved {} option(s).\x1b[0m\r\n", saved);
+        let _ = write!(
+            SerialWriter,
+            "\r\n\x1b[1;32m  Saved {} option(s).\x1b[0m\r\n",
+            saved
+        );
         if let Some(console) = fb_console {
             let rows = console.rows();
             console.set_fg_color(Color::new(0, 255, 0));
@@ -644,7 +656,10 @@ fn fmt_save_msg(buf: &mut [u8; 64], saved: usize, failed: usize) -> &str {
             Ok(())
         }
     }
-    let mut w = BufWriter { buf: buf.as_mut_slice(), pos: 0 };
+    let mut w = BufWriter {
+        buf: buf.as_mut_slice(),
+        pos: 0,
+    };
     if failed == 0 {
         let _ = write!(w, "Saved {} option(s).", saved);
     } else {
@@ -799,7 +814,12 @@ fn draw_menu(
     let visible_rows = rows.saturating_sub(8);
 
     // Draw items — only the visible ones, respecting scroll_offset
-    for (screen_idx, &item_idx) in vis.iter().enumerate().skip(scroll_offset).take(visible_rows) {
+    for (screen_idx, &item_idx) in vis
+        .iter()
+        .enumerate()
+        .skip(scroll_offset)
+        .take(visible_rows)
+    {
         let row = start_row + (screen_idx - scroll_offset);
         let is_selected = item_idx == selected;
         draw_item(cfr, &items[item_idx], is_selected, row, fb_console, cols);

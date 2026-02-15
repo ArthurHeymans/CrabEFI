@@ -706,17 +706,19 @@ fn parse_option_children(data: &[u8], option: &mut CfrOption) {
             }
             CFR_TAG_VARCHAR_DEF_VALUE => {
                 if let CfrOptionType::Varchar { ref mut default } = option.option_type
-                    && let Some(def) = parse_varbinary_string(record_bytes) {
-                        *default = def;
-                    }
+                    && let Some(def) = parse_varbinary_string(record_bytes)
+                {
+                    *default = def;
+                }
             }
             CFR_TAG_ENUM_VALUE => {
                 if let CfrOptionType::Enum {
                     ref mut choices, ..
                 } = option.option_type
-                    && let Some(choice) = parse_enum_value(record_bytes) {
-                        choices.push(choice);
-                    }
+                    && let Some(choice) = parse_enum_value(record_bytes)
+                {
+                    choices.push(choice);
+                }
             }
             CFR_TAG_DEP_VALUES => {
                 parse_dep_values_into(record_bytes, &mut option.dep_values);
@@ -749,7 +751,10 @@ fn parse_varbinary_string(data: &[u8]) -> Option<String> {
 
     let string_data = &data[header_size..header_size + data_length];
 
-    let nul_pos = string_data.iter().position(|&b| b == 0).unwrap_or(string_data.len());
+    let nul_pos = string_data
+        .iter()
+        .position(|&b| b == 0)
+        .unwrap_or(string_data.len());
     let result = String::from_utf8_lossy(&string_data[..nul_pos]).into_owned();
 
     Some(result)
@@ -829,9 +834,9 @@ fn parse_enum_value(data: &[u8]) -> Option<CfrEnumChoice> {
             if child_tag == CFR_TAG_VARCHAR_UI_NAME
                 && let Some(name) =
                     parse_varbinary_string(&children_data[offset..offset + child_size])
-                {
-                    choice.ui_name = name;
-                }
+            {
+                choice.ui_name = name;
+            }
 
             offset += child_size;
         }

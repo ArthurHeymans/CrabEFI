@@ -37,7 +37,8 @@ const DEFAULT_TIMEOUT_SECONDS: u32 = 5;
 const MENU_TITLE: &str = "CrabEFI Boot Menu";
 
 /// Help text
-const HELP_TEXT: &str = "Arrows: Select | Enter: Boot | F: Firmware | C: Cmdline | S: Secure Boot | R: Reset";
+const HELP_TEXT: &str =
+    "Arrows: Select | Enter: Boot | F: Firmware | C: Cmdline | S: Secure Boot | R: Reset";
 
 /// Storage device type
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

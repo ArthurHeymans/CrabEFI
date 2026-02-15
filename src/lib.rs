@@ -289,14 +289,15 @@ pub fn init(coreboot_table_ptr: u64) -> ! {
     // Parse and store CFR data now that the heap is available.
     // The raw data pointer was saved during coreboot table parsing.
     if let Some(cfr_raw) = cb_info.cfr_raw
-        && let Some(cfr) = coreboot::cfr::parse_cfr(cfr_raw) {
-            log::info!(
-                "CFR: {} forms, {} options",
-                cfr.forms.len(),
-                cfr.total_options()
-            );
-            coreboot::store_cfr(cfr);
-        }
+        && let Some(cfr) = coreboot::cfr::parse_cfr(cfr_raw)
+    {
+        log::info!(
+            "CFR: {} forms, {} options",
+            cfr.forms.len(),
+            cfr.total_options()
+        );
+        coreboot::store_cfr(cfr);
+    }
 
     log::info!("CrabEFI initialized successfully!");
     log::info!("EFI System Table at: {:p}", efi::get_system_table());
