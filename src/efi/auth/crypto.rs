@@ -42,6 +42,10 @@ pub struct ChainBuildingConfig {
     pub require_basic_constraints: bool,
     /// Whether to require CA certificates to have keyCertSign keyUsage
     pub require_key_usage: bool,
+    /// Whether to check certificate validity periods (notBefore/notAfter)
+    /// Set to false for Secure Boot image verification, matching edk2/u-boot behavior
+    /// which do not enforce certificate expiry for firmware signing certificates.
+    pub check_validity_period: bool,
 }
 
 impl Default for ChainBuildingConfig {
@@ -53,6 +57,7 @@ impl Default for ChainBuildingConfig {
             current_time: get_current_time_for_cert_validation(),
             require_basic_constraints: true,
             require_key_usage: true,
+            check_validity_period: true,
         }
     }
 }
@@ -176,8 +181,25 @@ pub fn verify_pkcs7_signature(
         embedded_certs.len()
     );
 
-    // Compute the hash of the actual signed data
-    let computed_hash = sha256(signed_data);
+    // Compute the content digest for messageDigest verification.
+    // Per RFC 5652 Section 5.4, the messageDigest attribute value must match
+    // the digest of the encapContentInfo eContent value.
+    //
+    // Both edk2 and u-boot hash the VALUE (V) portion of the ASN.1 element
+    // inside the [0] EXPLICIT tag -- i.e., the bytes after stripping the outer
+    // tag and length. For Authenticode (SEQUENCE), this is the inner content
+    // of the SpcIndirectDataContent. For standard CMS (OCTET STRING), this is
+    // the raw content bytes. In both cases, Any::value() returns exactly these
+    // V bytes.
+    //
+    // - For attached content (e.g., Authenticode): hash econtent.value()
+    // - For detached signatures (e.g., authenticated variables): hash the external data
+    let computed_hash = if let Some(ref econtent) = cms_signed_data.encap_content_info.econtent {
+        sha256(econtent.value())
+    } else {
+        // Detached signature: hash the externally-provided signed data
+        sha256(signed_data)
+    };
 
     // Get SignerInfos and verify the signature
     if cms_signed_data.signer_infos.0.is_empty() {
@@ -226,7 +248,12 @@ pub fn verify_pkcs7_signature(
                     log::debug!("RSA signature verification succeeded");
 
                     // Build and verify the certificate chain using the full chain building algorithm
-                    let config = ChainBuildingConfig::default();
+                    // Disable validity period checking: UEFI Secure Boot does not enforce
+                    // certificate expiry for image verification, matching edk2 and u-boot behavior.
+                    let config = ChainBuildingConfig {
+                        check_validity_period: false,
+                        ..ChainBuildingConfig::default()
+                    };
 
                     // Try to build a chain from the signer certificate to the trusted certificate
                     match build_and_verify_chain(
@@ -641,8 +668,10 @@ fn verify_chain_link(
         return Ok(false);
     }
 
-    // Validate certificate time
-    if let Err(e) = validate_certificate_time(cert_der) {
+    // Validate certificate time (skipped for Secure Boot image verification)
+    if config.check_validity_period
+        && let Err(e) = validate_certificate_time(cert_der)
+    {
         log::debug!("Certificate validity check failed: {:?}", e);
         return Ok(false);
     }
@@ -664,9 +693,25 @@ fn verify_chain_link(
 
     // Verify the signature
     let cert_signature = cert.signature.raw_bytes();
-    let tbs_bytes = extract_tbs_bytes(cert_der)?;
+    let tbs_bytes = match extract_tbs_bytes(cert_der) {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            log::debug!(
+                "extract_tbs_bytes failed for cert (len={}): {:?}",
+                cert_der.len(),
+                e
+            );
+            return Err(e);
+        }
+    };
     let tbs_hash = sha256(tbs_bytes);
-    let issuer_rsa_key = extract_rsa_key(&issuer)?;
+    let issuer_rsa_key = match extract_rsa_key(&issuer) {
+        Ok(key) => key,
+        Err(e) => {
+            log::debug!("extract_rsa_key failed for issuer: {:?}", e);
+            return Err(e);
+        }
+    };
 
     verify_rsa_signature_raw(&issuer_rsa_key, cert_signature, &tbs_hash)
 }
@@ -973,12 +1018,29 @@ fn get_current_time_for_cert_validation() -> i64 {
 /// We need to extract the first element of the outer SEQUENCE, preserving
 /// the original DER encoding exactly as it was signed.
 fn extract_tbs_bytes(cert_der: &[u8]) -> Result<&[u8], AuthError> {
-    use der::{Reader, SliceReader};
+    use der::{Decode, Header, Reader, SliceReader, Tag};
+
+    // Note: we cannot use reader.sequence(|seq| seq.tlv_bytes()) here because
+    // sequence() calls read_nested() → finish(), which requires ALL bytes inside
+    // the SEQUENCE to be consumed. We only want the first element (TBSCertificate),
+    // not the signatureAlgorithm and signatureValue that follow it.
+    //
+    // Instead, decode the outer SEQUENCE header to skip past it, then use
+    // tlv_bytes() to read just the first inner TLV. Neither operation calls
+    // finish(), so trailing bytes (from PKCS#7 certificate extraction) and
+    // unconsumed sibling elements are both tolerated.
 
     let mut reader = SliceReader::new(cert_der).map_err(|_| AuthError::CertificateParseError)?;
-    // Enter the outer SEQUENCE (Certificate), then read the first TLV (TBSCertificate)
+
+    // Skip the outer Certificate SEQUENCE header
+    let outer = Header::decode(&mut reader).map_err(|_| AuthError::CertificateParseError)?;
+    if outer.tag != Tag::Sequence {
+        return Err(AuthError::CertificateParseError);
+    }
+
+    // Read just the first TLV within the SEQUENCE (TBSCertificate)
     reader
-        .sequence(|seq| seq.tlv_bytes())
+        .tlv_bytes()
         .map_err(|_| AuthError::CertificateParseError)
 }
 
@@ -1016,7 +1078,7 @@ pub fn validate_x509_certificate(cert_der: &[u8]) -> Result<(), AuthError> {
 /// WIN_CERTIFICATE structures are 8-byte aligned, which means the PKCS#7
 /// data may have padding bytes after the actual DER content. This function
 /// reads the DER length and returns a slice containing only the valid data.
-fn trim_der_trailing_bytes(data: &[u8]) -> Result<&[u8], AuthError> {
+pub(super) fn trim_der_trailing_bytes(data: &[u8]) -> Result<&[u8], AuthError> {
     use der::{Reader, SliceReader};
 
     let mut reader = SliceReader::new(data).map_err(|_| AuthError::InvalidHeader)?;
