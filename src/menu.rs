@@ -1699,35 +1699,15 @@ fn draw_cmdline_editor_line(
 /// 1. Keyboard controller reset (port 0x64, command 0xFE)
 /// 2. Triple fault (if keyboard controller fails)
 fn perform_system_reset() -> ! {
-    use crate::arch::x86_64::io;
+    use crate::arch::reset;
 
     log::info!("System reset requested");
 
-    // Method 1: Keyboard controller reset
-    unsafe {
-        // Wait for keyboard controller to be ready
-        for _ in 0..1000 {
-            let status = io::inb(0x64);
-            if status & 0x02 == 0 {
-                break;
-            }
-        }
-        // Send reset command
-        io::outb(0x64, 0xFE);
-    }
+    reset::keyboard_controller_reset();
 
     // Wait a bit for reset to take effect
     delay_ms(100);
 
-    // Method 2: Triple fault (if keyboard reset failed)
-    unsafe {
-        // Load a null IDT and trigger an interrupt
-        let null_idt: [u8; 6] = [0; 6];
-        core::arch::asm!(
-            "lidt [{}]",
-            "int3",
-            in(reg) null_idt.as_ptr(),
-            options(noreturn)
-        );
-    }
+    // Triple fault if keyboard reset failed
+    reset::triple_fault();
 }

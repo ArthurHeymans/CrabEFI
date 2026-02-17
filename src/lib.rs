@@ -58,10 +58,7 @@ fn panic(info: &PanicInfo) -> ! {
 
     // Halt the CPU
     loop {
-        #[cfg(target_arch = "x86_64")]
-        unsafe {
-            core::arch::asm!("hlt");
-        }
+        arch::halt();
     }
 }
 
@@ -393,10 +390,7 @@ pub fn init(coreboot_table_ptr: u64) -> ! {
 
     // Halt and wait
     loop {
-        #[cfg(target_arch = "x86_64")]
-        unsafe {
-            core::arch::asm!("hlt");
-        }
+        arch::halt();
     }
 }
 
