@@ -313,6 +313,61 @@ pub fn run_tests(config: &QemuConfig, disk_path: &Path, app_name: &str) -> Resul
                 failed += 1;
             }
         }
+        "rng-test" => {
+            // Check that the test app started
+            if result.output.contains("RNG Protocol Test") {
+                println!("[PASS] test_started: RNG protocol test started");
+                passed += 1;
+            } else {
+                println!("[FAIL] test_started: RNG protocol test did not start");
+                failed += 1;
+            }
+
+            // Check protocol was located
+            if result.output.contains("[PASS] locate_protocol") {
+                println!("[PASS] locate_protocol: RNG protocol found");
+                passed += 1;
+            } else {
+                println!("[FAIL] locate_protocol: RNG protocol not found");
+                failed += 1;
+            }
+
+            // Check GetInfo works
+            if result.output.contains("[PASS] get_info") {
+                println!("[PASS] get_info: Algorithm enumeration succeeded");
+                passed += 1;
+            } else {
+                println!("[FAIL] get_info: Algorithm enumeration failed");
+                failed += 1;
+            }
+
+            // Check random byte generation
+            if result.output.contains("[PASS] get_rng_default") {
+                println!("[PASS] get_rng_default: Default algorithm produced random bytes");
+                passed += 1;
+            } else {
+                println!("[FAIL] get_rng_default: Default algorithm failed");
+                failed += 1;
+            }
+
+            // Check uniqueness
+            if result.output.contains("[PASS] uniqueness") {
+                println!("[PASS] uniqueness: Multiple calls return different data");
+                passed += 1;
+            } else {
+                println!("[FAIL] uniqueness: Multiple calls returned identical data");
+                failed += 1;
+            }
+
+            // Check all tests passed
+            if result.output.contains("All RNG tests passed!") {
+                println!("[PASS] all_passed: All RNG tests passed");
+                passed += 1;
+            } else {
+                println!("[FAIL] all_passed: Not all RNG tests passed");
+                failed += 1;
+            }
+        }
         "directory-test" => {
             // Check that the test app started
             if result.output.contains("Directory Enumeration Test") {

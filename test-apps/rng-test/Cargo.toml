@@ -1,0 +1,16 @@
+[package]
+name = "rng-test"
+version = "0.1.0"
+edition = "2021"
+description = "Test EFI application for the RNG protocol"
+
+[dependencies]
+r-efi = "5.3"
+
+[profile.release]
+panic = "abort"
+lto = true
+opt-level = "z"
+
+[profile.dev]
+panic = "abort"
