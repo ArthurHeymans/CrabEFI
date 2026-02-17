@@ -14,6 +14,7 @@ pub mod loaded_image;
 pub mod memory_attribute;
 pub mod nvme_pass_thru;
 pub mod pass_thru_init;
+pub mod rng;
 pub mod scsi_pass_thru;
 pub mod serial_io;
 pub mod simple_file_system;

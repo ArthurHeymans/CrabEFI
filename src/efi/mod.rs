@@ -84,6 +84,9 @@ pub fn init(cb_info: &CorebootInfo) {
     // Install Serial IO protocol
     init_serial_io();
 
+    // Install RNG protocol (if RDRAND is available)
+    init_rng();
+
     // Install Console Control protocol (legacy, but some bootloaders need it)
     init_console_control();
 
@@ -290,6 +293,46 @@ fn init_serial_io() {
     }
 
     log::debug!("Serial IO protocol installed on handle {:?}", handle);
+}
+
+/// Initialize RNG protocol
+fn init_rng() {
+    use protocols::rng::{RNG_PROTOCOL_GUID, create_protocol, init, is_supported};
+
+    // Initialize RDRAND support (CPUID check + broken RDRAND test)
+    init();
+
+    if !is_supported() {
+        return;
+    }
+
+    // Create a handle for RNG protocol
+    let handle = match boot_services::create_handle() {
+        Some(h) => h,
+        None => {
+            log::error!("Failed to create RNG handle");
+            return;
+        }
+    };
+
+    // Create and install the protocol
+    let protocol = create_protocol();
+    if protocol.is_null() {
+        log::error!("Failed to create RNG protocol");
+        return;
+    }
+
+    let status = boot_services::install_protocol(
+        handle,
+        &RNG_PROTOCOL_GUID,
+        protocol as *mut core::ffi::c_void,
+    );
+    if status != Status::SUCCESS {
+        log::error!("Failed to install RNG protocol: {:?}", status);
+        return;
+    }
+
+    log::debug!("RNG protocol installed on handle {:?}", handle);
 }
 
 /// Initialize Console Control protocol (legacy Intel EFI protocol)
