@@ -3,6 +3,7 @@
 //! This module implements the EFI Runtime Services table, which provides
 //! time, variable, and system reset services that persist after ExitBootServices.
 
+#[cfg(feature = "rt-debug")]
 use crate::arch::x86_64::io;
 use crate::efi::auth;
 use crate::state::{self, MAX_VARIABLE_DATA_SIZE, MAX_VARIABLE_NAME_LEN, MAX_VARIABLES};
@@ -1336,30 +1337,8 @@ extern "efiapi" fn reset_system(
     // Try different reset methods
     match reset_type {
         efi::RESET_COLD | efi::RESET_WARM => {
-            // Try keyboard controller reset
-            unsafe {
-                // Wait for keyboard controller to be ready
-                for _ in 0..1000 {
-                    let status = x86_in8(0x64);
-                    if status & 0x02 == 0 {
-                        break;
-                    }
-                }
-                // Send reset command
-                x86_out8(0x64, 0xFE);
-            }
-
-            // If that didn't work, try triple fault
-            unsafe {
-                // Load a null IDT and trigger an interrupt
-                let null_idt: [u8; 6] = [0; 6];
-                core::arch::asm!(
-                    "lidt [{}]",
-                    "int3",
-                    in(reg) null_idt.as_ptr(),
-                    options(noreturn)
-                );
-            }
+            crate::arch::reset::keyboard_controller_reset();
+            crate::arch::reset::triple_fault();
         }
         efi::RESET_SHUTDOWN => {
             rt_serial_print!("Shutdown not implemented, halting");
@@ -1369,7 +1348,7 @@ extern "efiapi" fn reset_system(
 
     // If all else fails, halt
     loop {
-        unsafe { core::arch::asm!("hlt") };
+        crate::arch::halt();
     }
 }
 
@@ -1403,17 +1382,6 @@ extern "efiapi" fn query_capsule_capabilities(
 // ============================================================================
 
 // read_rtc_time is now shared via crate::efi::auth::time::read_rtc_time()
-
-/// Port I/O functions - wrapper for arch module
-#[inline]
-unsafe fn x86_out8(port: u16, value: u8) {
-    io::outb(port, value);
-}
-
-#[inline]
-unsafe fn x86_in8(port: u16) -> u8 {
-    io::inb(port)
-}
 
 /// Compare a UCS-2 string in array with a pointer
 fn name_eq(stored: &[u16], name: *const u16) -> bool {

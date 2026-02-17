@@ -8,6 +8,8 @@ pub mod entry;
 pub mod idt;
 pub mod io;
 pub mod port_regs;
+pub mod reset;
+pub mod rng;
 
 /// Read the CR3 register (page table base)
 #[inline]
@@ -47,4 +49,12 @@ pub fn rdtsc() -> u64 {
         );
     }
     ((hi as u64) << 32) | (lo as u64)
+}
+
+/// Halt the CPU until the next interrupt
+#[inline]
+pub fn halt() {
+    unsafe {
+        core::arch::asm!("hlt");
+    }
 }
