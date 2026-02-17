@@ -37,6 +37,7 @@ pub mod pe;
 pub mod secure_boot_menu;
 pub mod state;
 pub mod time;
+pub mod tui;
 
 use crate::drivers::block::{AhciDisk, NvmeDisk, SdhciDisk, UsbDisk};
 use core::panic::PanicInfo;
@@ -71,46 +72,56 @@ fn panic(info: &PanicInfo) -> ! {
 /// when Secure Boot verification fails. It also outputs to the serial console.
 /// The display persists for a few seconds so the user can see it.
 pub fn display_secure_boot_error() {
-    use framebuffer_console::{Color, DEFAULT_BG, FramebufferConsole};
+    use ratatui::Terminal;
+    use ratatui::layout::{Alignment, Constraint, Layout};
+    use ratatui::style::{Color, Modifier, Style};
+    use ratatui::text::Line;
+    use ratatui::widgets::{Block, Borders, Paragraph};
 
     const ERROR_MESSAGE: &str = "SECURE BOOT VIOLATION: Image not authorized";
 
-    // Output to serial console with red color (ANSI escape codes)
-    drivers::serial::write_str("\r\n\x1b[1;31m"); // Bold red
-    drivers::serial::write_str(
-        "================================================================================\r\n",
-    );
-    drivers::serial::write_str(
-        "                    SECURE BOOT VIOLATION: Image not authorized                 \r\n",
-    );
-    drivers::serial::write_str(
-        "================================================================================\r\n",
-    );
-    drivers::serial::write_str("\x1b[0m\r\n"); // Reset color
+    let fb_info = coreboot::get_framebuffer();
+    let backend = tui::DualBackend::new(fb_info.as_ref());
+    let mut terminal = match Terminal::new(backend) {
+        Ok(t) => t,
+        Err(_) => {
+            // Fallback: at least print to serial
+            drivers::serial::write_str("\r\n*** SECURE BOOT VIOLATION ***\r\n");
+            time::delay_ms(3000);
+            return;
+        }
+    };
+    let _ = terminal.clear();
+    let _ = terminal.hide_cursor();
 
-    // Output to framebuffer if available
-    if let Some(fb_info) = coreboot::get_framebuffer() {
-        let mut console = FramebufferConsole::new(&fb_info);
+    let error_style = Style::default()
+        .fg(Color::Red)
+        .add_modifier(Modifier::BOLD);
 
-        // Calculate center position
-        let rows = console.rows();
-        let center_row = rows / 2;
+    let _ = terminal.draw(|frame| {
+        let area = frame.area();
 
-        // Set red foreground color
-        let error_color = Color::new(255, 0, 0); // Bright red
+        // Center the error box vertically
+        let vertical = Layout::vertical([
+            Constraint::Fill(1),
+            Constraint::Length(5),
+            Constraint::Fill(1),
+        ])
+        .split(area);
 
-        // Draw a border above the message
-        console.set_colors(error_color, DEFAULT_BG);
-        console.write_centered(center_row - 2, "========================================");
+        let border = Block::default()
+            .borders(Borders::ALL)
+            .border_style(error_style)
+            .title(" Secure Boot Error ")
+            .title_alignment(Alignment::Center);
 
-        // Draw the error message
-        console.write_centered(center_row, ERROR_MESSAGE);
+        let paragraph = Paragraph::new(Line::from(ERROR_MESSAGE))
+            .style(error_style)
+            .alignment(Alignment::Center)
+            .block(border);
 
-        // Draw a border below the message
-        console.write_centered(center_row + 2, "========================================");
-
-        console.reset_colors();
-    }
+        frame.render_widget(paragraph, vertical[1]);
+    });
 
     // Wait 3 seconds so the user can see the message
     time::delay_ms(3000);

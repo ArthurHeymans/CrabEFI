@@ -13,15 +13,16 @@ use crate::coreboot::{
     self,
     cfr::{self, CfrInfo, CfrOption, CfrOptionType, CfrValue},
 };
-use crate::drivers::serial as serial_driver;
-use crate::framebuffer_console::{
-    Color, DEFAULT_BG, DEFAULT_FG, FramebufferConsole, HIGHLIGHT_BG, HIGHLIGHT_FG,
-};
-use crate::menu_common::{self, KeyPress, SerialWriter};
+use crate::menu_common::{self, KeyPress};
 use crate::time::delay_ms;
+use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
-use core::fmt::Write;
+use ratatui::Terminal;
+use ratatui::layout::{Alignment, Constraint, Layout};
+use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{Block, Borders, HighlightSpacing, List, ListItem, ListState, Paragraph};
 
 /// Menu title
 const MENU_TITLE: &str = "Firmware Settings";
@@ -71,45 +72,44 @@ pub fn show_cfr_menu() {
     let cfr_info = match coreboot::get_cfr() {
         Some(cfr) => cfr,
         None => {
-            show_no_cfr_message();
+            show_message_screen("Firmware settings not available",
+                "This firmware does not expose CFR configuration options.");
             return;
         }
     };
 
     let fb_info = coreboot::get_framebuffer();
-    let mut fb_console = fb_info.as_ref().map(FramebufferConsole::new);
+    let backend = crate::tui::DualBackend::new(fb_info.as_ref());
+    let mut terminal = match Terminal::new(backend) {
+        Ok(t) => t,
+        Err(_) => {
+            log::error!("Failed to create ratatui terminal");
+            return;
+        }
+    };
+    let _ = terminal.clear();
+    let _ = terminal.hide_cursor();
 
     let mut items = build_menu_items(cfr_info);
 
     if items.is_empty() {
-        show_no_options_message(&mut fb_console);
+        show_message_screen("No configurable options found", "");
         return;
     }
 
     let mut selected = find_first_selectable(cfr_info, &items, 0);
-    let mut status_message: Option<(&str, bool)> = None;
-    let mut scroll_offset = 0usize;
+    let mut status_message: Option<(String, bool)> = None;
 
     loop {
-        menu_common::clear_screen(&mut fb_console);
         let modified = has_changes(&items);
-        // Ensure scroll keeps selected item visible
-        let vis = visible_indices(cfr_info, &items);
-        let sel_vis_pos = vis.iter().position(|&i| i == selected).unwrap_or(0);
-        let screen_rows = get_visible_rows(&fb_console);
-        if sel_vis_pos < scroll_offset {
-            scroll_offset = sel_vis_pos;
-        } else if sel_vis_pos >= scroll_offset + screen_rows {
-            scroll_offset = sel_vis_pos - screen_rows + 1;
-        }
-        draw_menu(
+
+        render_menu(
+            &mut terminal,
             cfr_info,
             &items,
             selected,
-            scroll_offset,
             modified,
-            status_message,
-            &mut fb_console,
+            &status_message,
         );
 
         status_message = None;
@@ -126,7 +126,6 @@ pub fn show_cfr_menu() {
                         break;
                     }
                     KeyPress::Enter | KeyPress::Char(' ') => {
-                        // Check visibility/editability before taking a mutable borrow
                         let can_edit = if let Some(
                             item @ MenuItem::Option {
                                 form_idx,
@@ -155,7 +154,7 @@ pub fn show_cfr_menu() {
                                 }
                             }
                         } else if matches!(items.get(selected), Some(MenuItem::Option { .. })) {
-                            status_message = Some(("Option is read-only", false));
+                            status_message = Some(("Option is read-only".into(), false));
                         }
                         break;
                     }
@@ -168,9 +167,30 @@ pub fn show_cfr_menu() {
                         break;
                     }
                     KeyPress::Escape | KeyPress::Char('q') | KeyPress::Char('Q') => {
-                        if has_changes(&items) && confirm_save(&mut fb_console) {
+                        if has_changes(&items)
+                            && confirm_dialog(
+                                &mut terminal,
+                                "Save changes? (takes effect after reset)",
+                                "Press Y to save, N to discard",
+                            )
+                        {
                             let (saved, failed) = save_all_changes(cfr_info, &items);
-                            show_save_result(saved, failed, &mut fb_console);
+                            let msg = if failed == 0 {
+                                format!("Saved {} option(s).", saved)
+                            } else {
+                                format!("Saved {}, {} failed to write.", saved, failed)
+                            };
+                            let is_ok = failed == 0;
+                            status_message = Some((msg, is_ok));
+                            render_menu(
+                                &mut terminal,
+                                cfr_info,
+                                &items,
+                                selected,
+                                false,
+                                &status_message,
+                            );
+                            delay_ms(1500);
                         }
                         return;
                     }
@@ -182,7 +202,7 @@ pub fn show_cfr_menu() {
                         }) = items.get(selected)
                             && let Some(option) = get_option(cfr_info, *form_idx, *option_idx)
                         {
-                            show_help(option, &mut fb_console);
+                            show_help_screen(&mut terminal, option);
                         }
                         break;
                     }
@@ -193,6 +213,355 @@ pub fn show_cfr_menu() {
         }
     }
 }
+
+// ============================================================================
+// Rendering
+// ============================================================================
+
+/// Render the complete menu with ratatui
+fn render_menu(
+    terminal: &mut Terminal<crate::tui::DualBackend>,
+    cfr: &CfrInfo,
+    items: &[MenuItem],
+    selected: usize,
+    modified: bool,
+    status_message: &Option<(String, bool)>,
+) {
+    let _ = terminal.draw(|frame| {
+        let area = frame.area();
+
+        let chunks = Layout::vertical([
+            Constraint::Length(3), // header
+            Constraint::Min(4),   // item list
+            Constraint::Length(3), // status + help
+        ])
+        .split(area);
+
+        // --- Header ---
+        let title = if modified {
+            "Firmware Settings (modified)"
+        } else {
+            MENU_TITLE
+        };
+        let header = Paragraph::new(Line::from(title).alignment(Alignment::Center))
+            .style(Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD))
+            .block(
+                Block::new()
+                    .borders(Borders::TOP | Borders::BOTTOM)
+                    .border_style(Style::new().fg(Color::Yellow)),
+            );
+        frame.render_widget(header, chunks[0]);
+
+        // --- Build visible item list ---
+        let vis = visible_indices(cfr, items);
+        let mut list_items: Vec<ListItem> = Vec::new();
+        let mut selected_list_pos: Option<usize> = None;
+
+        for &item_idx in &vis {
+            let item = &items[item_idx];
+            let list_pos = list_items.len();
+
+            match item {
+                MenuItem::FormHeader { name } => {
+                    let text = format!("--- {} ---", name);
+                    list_items.push(
+                        ListItem::new(Line::raw(text))
+                            .style(Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+                    );
+                }
+                MenuItem::SubformHeader { name } => {
+                    let text = format!("  {}", name);
+                    list_items.push(
+                        ListItem::new(Line::raw(text))
+                            .style(Style::new().fg(Color::Magenta).add_modifier(Modifier::BOLD)),
+                    );
+                }
+                MenuItem::Comment { text } => {
+                    list_items.push(
+                        ListItem::new(Line::raw(text.as_str()))
+                            .style(Style::new().fg(Color::DarkGray)),
+                    );
+                }
+                MenuItem::Option {
+                    form_idx,
+                    option_idx,
+                    current_value,
+                    ..
+                } => {
+                    if let Some(option) = get_option(cfr, *form_idx, *option_idx) {
+                        let value_str = format_value(option, current_value);
+                        let is_editable = option.is_editable();
+
+                        // Pad name to align values
+                        let name = &option.ui_name;
+                        let cols = area.width as usize;
+                        let pad_to = 40.min(cols.saturating_sub(value_str.len() + 8));
+                        let name_display_len = name.len();
+                        let padding = if pad_to > name_display_len {
+                            pad_to - name_display_len
+                        } else {
+                            1
+                        };
+                        let pad: String = core::iter::repeat(' ').take(padding).collect();
+                        let text = format!("{}{}{}", name, pad, value_str);
+
+                        let style = if !is_editable {
+                            Style::new().fg(Color::DarkGray)
+                        } else {
+                            Style::new().fg(Color::Gray)
+                        };
+
+                        list_items.push(ListItem::new(Line::raw(text)).style(style));
+                    }
+
+                    if item_idx == selected {
+                        selected_list_pos = Some(list_pos);
+                    }
+                }
+            }
+        }
+
+        let list = List::new(list_items)
+            .highlight_style(
+                Style::new()
+                    .fg(Color::Black)
+                    .bg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            )
+            .highlight_symbol(">> ")
+            .highlight_spacing(HighlightSpacing::Always)
+            .scroll_padding(2);
+
+        let mut list_state = ListState::default().with_selected(selected_list_pos);
+        frame.render_stateful_widget(list, chunks[1], &mut list_state);
+
+        // --- Footer ---
+        let footer_chunks = Layout::vertical([
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
+        ])
+        .split(chunks[2]);
+
+        if let Some((msg, is_success)) = status_message {
+            let color = if *is_success { Color::Green } else { Color::Red };
+            let line = Line::from(Span::styled(msg.as_str(), Style::new().fg(color)))
+                .alignment(Alignment::Center);
+            frame.render_widget(Paragraph::new(line), footer_chunks[0]);
+        }
+
+        let help = Paragraph::new(
+            Line::from(HELP_TEXT)
+                .style(Style::new().fg(Color::Cyan))
+                .alignment(Alignment::Center),
+        );
+        frame.render_widget(help, footer_chunks[2]);
+    });
+}
+
+/// Format an option value for display
+fn format_value(option: &CfrOption, value: &CfrValue) -> String {
+    match (&option.option_type, value) {
+        (CfrOptionType::Bool { .. }, CfrValue::Bool(b)) => {
+            if *b {
+                "[Enabled]".into()
+            } else {
+                "[Disabled]".into()
+            }
+        }
+        (CfrOptionType::Enum { choices, .. }, CfrValue::Number(n)) => {
+            if let Some(choice) = choices.iter().find(|c| c.value == *n) {
+                format!("[{}]", choice.ui_name)
+            } else {
+                format!("[{}]", n)
+            }
+        }
+        (CfrOptionType::Number { hex_display, .. }, CfrValue::Number(n)) => {
+            if *hex_display {
+                format!("[0x{:X}]", n)
+            } else {
+                format!("[{}]", n)
+            }
+        }
+        (CfrOptionType::Varchar { .. }, CfrValue::Varchar(s)) => {
+            if s.len() > 20 {
+                format!("[{}...]", &s[..20])
+            } else {
+                format!("[{}]", s)
+            }
+        }
+        _ => "[-]".into(),
+    }
+}
+
+/// Show a help screen for an option
+fn show_help_screen(
+    terminal: &mut Terminal<crate::tui::DualBackend>,
+    option: &CfrOption,
+) {
+    let name = option.ui_name.clone();
+    let helptext = if !option.ui_helptext.is_empty() {
+        option.ui_helptext.clone()
+    } else {
+        "No help available for this option.".into()
+    };
+
+    let _ = terminal.draw(|frame| {
+        let area = frame.area();
+        let chunks = Layout::vertical([
+            Constraint::Length(3),
+            Constraint::Length(2),
+            Constraint::Min(3),
+            Constraint::Length(2),
+        ])
+        .split(area);
+
+        let header = Paragraph::new(
+            Line::from(Span::styled(
+                name.as_str(),
+                Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            ))
+            .alignment(Alignment::Center),
+        )
+        .block(
+            Block::new()
+                .borders(Borders::TOP | Borders::BOTTOM)
+                .border_style(Style::new().fg(Color::Cyan)),
+        );
+        frame.render_widget(header, chunks[0]);
+
+        let body = Paragraph::new(format!("    {}", helptext));
+        frame.render_widget(body, chunks[2]);
+
+        let footer = Paragraph::new(
+            Line::from("Press any key to continue...")
+                .alignment(Alignment::Center)
+                .style(Style::new().fg(Color::DarkGray)),
+        );
+        frame.render_widget(footer, chunks[3]);
+    });
+
+    loop {
+        if menu_common::read_key().is_some() {
+            break;
+        }
+        delay_ms(10);
+    }
+}
+
+/// Show a simple confirmation dialog. Returns true if user pressed Y.
+fn confirm_dialog(
+    terminal: &mut Terminal<crate::tui::DualBackend>,
+    message: &str,
+    help: &str,
+) -> bool {
+    let msg = String::from(message);
+    let hlp = String::from(help);
+    let _ = terminal.draw(|frame| {
+        let area = frame.area();
+        let chunks = Layout::vertical([
+            Constraint::Percentage(40),
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Min(0),
+        ])
+        .split(area);
+
+        let prompt = Paragraph::new(
+            Line::from(Span::styled(
+                msg.as_str(),
+                Style::new()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ))
+            .alignment(Alignment::Center),
+        );
+        frame.render_widget(prompt, chunks[1]);
+
+        let hint = Paragraph::new(
+            Line::from(hlp.as_str())
+                .alignment(Alignment::Center)
+                .style(Style::new().fg(Color::Gray)),
+        );
+        frame.render_widget(hint, chunks[3]);
+    });
+
+    loop {
+        if let Some(key) = menu_common::read_key() {
+            match key {
+                KeyPress::Char('y') | KeyPress::Char('Y') => return true,
+                KeyPress::Char('n') | KeyPress::Char('N') | KeyPress::Escape => return false,
+                _ => {}
+            }
+        }
+        delay_ms(10);
+    }
+}
+
+/// Show a simple message screen (for errors / "not available" messages)
+fn show_message_screen(title: &str, body: &str) {
+    let fb_info = coreboot::get_framebuffer();
+    let backend = crate::tui::DualBackend::new(fb_info.as_ref());
+    let mut terminal = match Terminal::new(backend) {
+        Ok(t) => t,
+        Err(_) => return,
+    };
+    let _ = terminal.clear();
+
+    let title_s = String::from(title);
+    let body_s = String::from(body);
+    let _ = terminal.draw(|frame| {
+        let area = frame.area();
+        let chunks = Layout::vertical([
+            Constraint::Percentage(40),
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Min(0),
+        ])
+        .split(area);
+
+        let t = Paragraph::new(
+            Line::from(Span::styled(
+                title_s.as_str(),
+                Style::new()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ))
+            .alignment(Alignment::Center),
+        );
+        frame.render_widget(t, chunks[1]);
+
+        if !body_s.is_empty() {
+            let b = Paragraph::new(
+                Line::from(body_s.as_str())
+                    .alignment(Alignment::Center)
+                    .style(Style::new().fg(Color::Gray)),
+            );
+            frame.render_widget(b, chunks[3]);
+        }
+
+        let footer = Paragraph::new(
+            Line::from("Press any key to continue...")
+                .alignment(Alignment::Center)
+                .style(Style::new().fg(Color::DarkGray)),
+        );
+        frame.render_widget(footer, chunks[4]);
+    });
+
+    loop {
+        if menu_common::read_key().is_some() {
+            break;
+        }
+        delay_ms(10);
+    }
+}
+
+// ============================================================================
+// Business logic (unchanged)
+// ============================================================================
 
 /// Build menu items from CFR info.
 ///
@@ -218,7 +587,6 @@ fn build_menu_items(cfr: &CfrInfo) -> Vec<MenuItem> {
 
             match &option.option_type {
                 CfrOptionType::Comment => {
-                    // Check if this is a flattened subform header (has object_id, no opt_name)
                     let is_subform = option.opt_name.is_empty() && option.object_id != 0;
                     if is_subform {
                         items.push(MenuItem::SubformHeader {
@@ -248,13 +616,11 @@ fn build_menu_items(cfr: &CfrInfo) -> Vec<MenuItem> {
 
 /// Look up the current in-flight numeric value for an option identified by
 /// `object_id`, checking the menu items first (which reflect the user's
-/// uncommitted edits) and falling back to persistent storage via
-/// `CfrInfo::find_numeric_value`.
+/// uncommitted edits) and falling back to persistent storage.
 fn find_live_numeric_value(cfr: &CfrInfo, items: &[MenuItem], object_id: u64) -> Option<u32> {
     if object_id == 0 {
         return None;
     }
-    // Search menu items for an option whose CfrOption::object_id matches
     for item in items {
         if let MenuItem::Option {
             form_idx,
@@ -272,7 +638,6 @@ fn find_live_numeric_value(cfr: &CfrInfo, items: &[MenuItem], object_id: u64) ->
             };
         }
     }
-    // Fallback to stored value
     cfr.find_numeric_value(object_id)
 }
 
@@ -299,21 +664,15 @@ fn is_dep_met_live(
 }
 
 /// Check if a menu item is currently visible based on live dependency state.
-///
-/// Form headers are visible if the form's dependency is met. Options, comments,
-/// and subform headers are visible if the owning form's dependency AND the
-/// item's own dependency are both met.
 fn is_item_visible(cfr: &CfrInfo, items: &[MenuItem], item: &MenuItem) -> bool {
     match item {
-        MenuItem::FormHeader { name } => {
-            // Find the form by name and check its dependency
-            cfr.forms
-                .iter()
-                .find(|f| f.ui_name == *name)
-                .is_none_or(|form| {
-                    is_dep_met_live(cfr, items, form.dependency_id, &form.dep_values)
-                })
-        }
+        MenuItem::FormHeader { name } => cfr
+            .forms
+            .iter()
+            .find(|f| f.ui_name == *name)
+            .is_none_or(|form| {
+                is_dep_met_live(cfr, items, form.dependency_id, &form.dep_values)
+            }),
         MenuItem::Option {
             form_idx,
             option_idx,
@@ -326,20 +685,16 @@ fn is_item_visible(cfr: &CfrInfo, items: &[MenuItem], item: &MenuItem) -> bool {
                 .is_none_or(|opt| is_dep_met_live(cfr, items, opt.dependency_id, &opt.dep_values));
             form_ok && opt_ok
         }
-        // Comments and subform headers don't carry their own indices, so
-        // they stay visible (their parent form header hides the section).
         MenuItem::Comment { .. } | MenuItem::SubformHeader { .. } => true,
     }
 }
 
-/// Get an option by form and option index
 fn get_option(cfr: &CfrInfo, form_idx: usize, option_idx: usize) -> Option<&CfrOption> {
     cfr.forms
         .get(form_idx)
         .and_then(|f| f.options.get(option_idx))
 }
 
-/// Find the first selectable and visible item starting from index
 fn find_first_selectable(cfr: &CfrInfo, items: &[MenuItem], start: usize) -> usize {
     for (i, item) in items.iter().enumerate().skip(start) {
         if is_selectable(item) && is_item_visible(cfr, items, item) {
@@ -376,7 +731,6 @@ fn is_selectable(item: &MenuItem) -> bool {
     matches!(item, MenuItem::Option { .. })
 }
 
-/// Check if the item at `index` is an editable, visible option (immutable borrow).
 fn can_edit_item(cfr: &CfrInfo, items: &[MenuItem], index: usize) -> bool {
     if let Some(
         item @ MenuItem::Option {
@@ -393,15 +747,16 @@ fn can_edit_item(cfr: &CfrInfo, items: &[MenuItem], index: usize) -> bool {
     }
 }
 
-fn get_visible_rows(fb_console: &Option<FramebufferConsole>) -> usize {
-    fb_console
-        .as_ref()
-        .map(|c| c.rows() as usize)
-        .unwrap_or(20)
-        .saturating_sub(10)
+/// Collect the indices of items that are currently visible (dependency-aware).
+fn visible_indices(cfr: &CfrInfo, items: &[MenuItem]) -> Vec<usize> {
+    items
+        .iter()
+        .enumerate()
+        .filter(|(_, item)| is_item_visible(cfr, items, item))
+        .map(|(i, _)| i)
+        .collect()
 }
 
-/// Toggle/cycle a value (Enter/Space)
 fn toggle_value(option: &CfrOption, value: &mut CfrValue) -> bool {
     match (&option.option_type, value) {
         (CfrOptionType::Bool { .. }, CfrValue::Bool(b)) => {
@@ -425,7 +780,7 @@ fn toggle_value(option: &CfrOption, value: &mut CfrValue) -> bool {
             if new_val <= *max {
                 *n = new_val;
             } else {
-                *n = *min; // Wrap around
+                *n = *min;
             }
             true
         }
@@ -433,9 +788,7 @@ fn toggle_value(option: &CfrOption, value: &mut CfrValue) -> bool {
     }
 }
 
-/// Increment a numeric/enum option in-place
 fn increment_option(cfr: &CfrInfo, items: &mut [MenuItem], index: usize) -> bool {
-    // Check editability with live dependencies before taking a mutable borrow
     if !can_edit_item(cfr, items, index) {
         return false;
     }
@@ -476,7 +829,6 @@ fn increment_option(cfr: &CfrInfo, items: &mut [MenuItem], index: usize) -> bool
                 *n = new_val;
                 true
             } else if *n < *max {
-                // Unaligned: clamp to max
                 *n = *max;
                 true
             } else {
@@ -487,9 +839,7 @@ fn increment_option(cfr: &CfrInfo, items: &mut [MenuItem], index: usize) -> bool
     }
 }
 
-/// Decrement a numeric/enum option in-place
 fn decrement_option(cfr: &CfrInfo, items: &mut [MenuItem], index: usize) -> bool {
-    // Check editability with live dependencies before taking a mutable borrow
     if !can_edit_item(cfr, items, index) {
         return false;
     }
@@ -533,7 +883,6 @@ fn decrement_option(cfr: &CfrInfo, items: &mut [MenuItem], index: usize) -> bool
                 *n -= *step;
                 true
             } else if *n > *min {
-                // Unaligned: clamp to min
                 *n = *min;
                 true
             } else {
@@ -544,10 +893,6 @@ fn decrement_option(cfr: &CfrInfo, items: &mut [MenuItem], index: usize) -> bool
     }
 }
 
-/// Save modified option values to persistent storage.
-///
-/// Only writes options that were actually changed by the user, reducing
-/// unnecessary SPI flash wear. Returns `(saved, failed)` counts.
 fn save_all_changes(cfr: &CfrInfo, items: &[MenuItem]) -> (usize, usize) {
     let mut saved = 0usize;
     let mut failed = 0usize;
@@ -571,537 +916,4 @@ fn save_all_changes(cfr: &CfrInfo, items: &[MenuItem]) -> (usize, usize) {
         }
     }
     (saved, failed)
-}
-
-/// Show confirmation dialog for saving on exit
-fn confirm_save(fb_console: &mut Option<FramebufferConsole>) -> bool {
-    serial_driver::write_str("\x1b[2J\x1b[H");
-    serial_driver::write_str("\r\n\r\n");
-    serial_driver::write_str("\x1b[1;33m");
-    serial_driver::write_str("  Save changes? (takes effect after reset)\r\n");
-    serial_driver::write_str("\x1b[0m\r\n");
-    serial_driver::write_str("  Press Y to save, N to discard\r\n");
-
-    if let Some(console) = fb_console {
-        console.clear();
-        let rows = console.rows();
-        let confirm_row = rows / 2;
-        console.set_fg_color(Color::new(255, 255, 0));
-        console.write_centered(confirm_row, "Save changes? (takes effect after reset)");
-        console.reset_colors();
-        console.write_centered(confirm_row + 2, "Press Y to save, N to discard");
-    }
-
-    loop {
-        if let Some(key) = menu_common::read_key() {
-            match key {
-                KeyPress::Char('y') | KeyPress::Char('Y') => return true,
-                KeyPress::Char('n') | KeyPress::Char('N') | KeyPress::Escape => return false,
-                _ => {}
-            }
-        }
-        delay_ms(10);
-    }
-}
-
-/// Show a brief save result message (displayed on the confirm screen)
-fn show_save_result(saved: usize, failed: usize, fb_console: &mut Option<FramebufferConsole>) {
-    if failed == 0 {
-        let _ = write!(
-            SerialWriter,
-            "\r\n\x1b[1;32m  Saved {} option(s).\x1b[0m\r\n",
-            saved
-        );
-        if let Some(console) = fb_console {
-            let rows = console.rows();
-            console.set_fg_color(Color::new(0, 255, 0));
-            let mut buf = [0u8; 64];
-            let msg = fmt_save_msg(&mut buf, saved, 0);
-            console.write_centered(rows / 2 + 4, msg);
-            console.reset_colors();
-        }
-    } else {
-        let _ = write!(
-            SerialWriter,
-            "\r\n\x1b[1;31m  Saved {} option(s), {} failed to write.\x1b[0m\r\n",
-            saved, failed
-        );
-        if let Some(console) = fb_console {
-            let rows = console.rows();
-            console.set_fg_color(Color::new(255, 64, 64));
-            let mut buf = [0u8; 64];
-            let msg = fmt_save_msg(&mut buf, saved, failed);
-            console.write_centered(rows / 2 + 4, msg);
-            console.reset_colors();
-        }
-    }
-    // Brief pause so the user can read the message
-    delay_ms(1500);
-}
-
-/// Format save result into a stack buffer (no alloc needed for a short message)
-fn fmt_save_msg(buf: &mut [u8; 64], saved: usize, failed: usize) -> &str {
-    use core::fmt::Write;
-    struct BufWriter<'a> {
-        buf: &'a mut [u8],
-        pos: usize,
-    }
-    impl<'a> core::fmt::Write for BufWriter<'a> {
-        fn write_str(&mut self, s: &str) -> core::fmt::Result {
-            let bytes = s.as_bytes();
-            let end = (self.pos + bytes.len()).min(self.buf.len());
-            let count = end - self.pos;
-            self.buf[self.pos..end].copy_from_slice(&bytes[..count]);
-            self.pos = end;
-            Ok(())
-        }
-    }
-    let mut w = BufWriter {
-        buf: buf.as_mut_slice(),
-        pos: 0,
-    };
-    if failed == 0 {
-        let _ = write!(w, "Saved {} option(s).", saved);
-    } else {
-        let _ = write!(w, "Saved {}, {} failed to write.", saved, failed);
-    }
-    let len = w.pos;
-    core::str::from_utf8(&buf[..len]).unwrap_or("Save complete.")
-}
-
-/// Show help for an option
-fn show_help(option: &CfrOption, fb_console: &mut Option<FramebufferConsole>) {
-    serial_driver::write_str("\x1b[2J\x1b[H");
-    serial_driver::write_str("\r\n");
-    serial_driver::write_str("\x1b[1;36m");
-    serial_driver::write_str("  ");
-    serial_driver::write_str(&option.ui_name);
-    serial_driver::write_str("\x1b[0m\r\n\r\n");
-
-    if !option.ui_helptext.is_empty() {
-        serial_driver::write_str("  ");
-        serial_driver::write_str(&option.ui_helptext);
-        serial_driver::write_str("\r\n");
-    } else {
-        serial_driver::write_str("  No help available for this option.\r\n");
-    }
-
-    serial_driver::write_str("\r\n  Press any key to continue...\r\n");
-
-    if let Some(console) = fb_console {
-        console.clear();
-        let rows = console.rows();
-        console.set_fg_color(Color::new(0, 192, 192));
-        console.write_centered(4, &option.ui_name);
-        console.reset_colors();
-
-        if !option.ui_helptext.is_empty() {
-            console.set_position(4, 7);
-            let _ = console.write_str(&option.ui_helptext);
-        } else {
-            console.write_centered(7, "No help available for this option.");
-        }
-
-        console.write_centered(rows - 3, "Press any key to continue...");
-    }
-
-    loop {
-        if menu_common::read_key().is_some() {
-            break;
-        }
-        delay_ms(10);
-    }
-}
-
-/// Show message that CFR is not available
-fn show_no_cfr_message() {
-    let fb_info = coreboot::get_framebuffer();
-    let mut fb_console = fb_info.as_ref().map(FramebufferConsole::new);
-
-    serial_driver::write_str("\r\n");
-    serial_driver::write_str("\x1b[1;33m");
-    serial_driver::write_str("  Firmware settings not available\r\n");
-    serial_driver::write_str("\x1b[0m");
-    serial_driver::write_str("  This firmware does not expose CFR configuration options.\r\n");
-    serial_driver::write_str("\r\n  Press any key to continue...\r\n");
-
-    if let Some(console) = &mut fb_console {
-        console.clear();
-        let rows = console.rows();
-        console.set_fg_color(Color::new(255, 255, 0));
-        console.write_centered(rows / 2 - 1, "Firmware settings not available");
-        console.reset_colors();
-        console.write_centered(
-            rows / 2 + 1,
-            "This firmware does not expose CFR configuration options.",
-        );
-        console.write_centered(rows / 2 + 3, "Press any key to continue...");
-    }
-
-    loop {
-        if menu_common::read_key().is_some() {
-            break;
-        }
-        delay_ms(10);
-    }
-}
-
-/// Show message that no options are available
-fn show_no_options_message(fb_console: &mut Option<FramebufferConsole>) {
-    serial_driver::write_str("\r\n");
-    serial_driver::write_str("\x1b[1;33m");
-    serial_driver::write_str("  No configurable options found\r\n");
-    serial_driver::write_str("\x1b[0m");
-    serial_driver::write_str("\r\n  Press any key to continue...\r\n");
-
-    if let Some(console) = fb_console {
-        console.clear();
-        let rows = console.rows();
-        console.set_fg_color(Color::new(255, 255, 0));
-        console.write_centered(rows / 2, "No configurable options found");
-        console.reset_colors();
-        console.write_centered(rows / 2 + 2, "Press any key to continue...");
-    }
-
-    loop {
-        if menu_common::read_key().is_some() {
-            break;
-        }
-        delay_ms(10);
-    }
-}
-
-// ============================================================================
-// Drawing
-// ============================================================================
-
-/// Collect the indices of items that are currently visible (dependency-aware).
-fn visible_indices(cfr: &CfrInfo, items: &[MenuItem]) -> Vec<usize> {
-    items
-        .iter()
-        .enumerate()
-        .filter(|(_, item)| is_item_visible(cfr, items, item))
-        .map(|(i, _)| i)
-        .collect()
-}
-
-/// Draw the complete menu
-fn draw_menu(
-    cfr: &CfrInfo,
-    items: &[MenuItem],
-    selected: usize,
-    scroll_offset: usize,
-    modified: bool,
-    status_message: Option<(&str, bool)>,
-    fb_console: &mut Option<FramebufferConsole>,
-) {
-    let cols = fb_console.as_ref().map(|c| c.cols()).unwrap_or(80) as usize;
-    let rows = fb_console.as_ref().map(|c| c.rows()).unwrap_or(25) as usize;
-
-    // Draw header
-    let title = if modified {
-        "Firmware Settings (modified)"
-    } else {
-        MENU_TITLE
-    };
-    menu_common::draw_header(title, fb_console, cols);
-
-    // Build list of visible item indices (dependency-aware)
-    let vis = visible_indices(cfr, items);
-
-    // Calculate visible area
-    let start_row = 4;
-    let visible_rows = rows.saturating_sub(8);
-
-    // Draw items — only the visible ones, respecting scroll_offset
-    for (screen_idx, &item_idx) in vis
-        .iter()
-        .enumerate()
-        .skip(scroll_offset)
-        .take(visible_rows)
-    {
-        let row = start_row + (screen_idx - scroll_offset);
-        let is_selected = item_idx == selected;
-        draw_item(cfr, &items[item_idx], is_selected, row, fb_console, cols);
-    }
-
-    // Draw scroll indicators
-    if scroll_offset > 0 {
-        draw_scroll_indicator(start_row - 1, "^", fb_console);
-    }
-    if scroll_offset + visible_rows < vis.len() {
-        draw_scroll_indicator(start_row + visible_rows, "v", fb_console);
-    }
-
-    // Draw help text
-    let help_row = rows.saturating_sub(3);
-    draw_help(help_row, fb_console, cols);
-
-    // Draw status message if any
-    if let Some((msg, is_success)) = status_message {
-        draw_status_message(rows.saturating_sub(2), msg, is_success, fb_console);
-    }
-}
-
-/// Draw a single menu item
-fn draw_item(
-    cfr: &CfrInfo,
-    item: &MenuItem,
-    is_selected: bool,
-    row: usize,
-    fb_console: &mut Option<FramebufferConsole>,
-    cols: usize,
-) {
-    match item {
-        MenuItem::FormHeader { name } => {
-            draw_form_header(name, row, fb_console);
-        }
-        MenuItem::SubformHeader { name } => {
-            draw_subform_header(name, row, fb_console);
-        }
-        MenuItem::Option {
-            form_idx,
-            option_idx,
-            current_value,
-            ..
-        } => {
-            if let Some(option) = get_option(cfr, *form_idx, *option_idx) {
-                draw_option_item(option, current_value, is_selected, row, fb_console, cols);
-            }
-        }
-        MenuItem::Comment { text } => {
-            draw_comment(text, row, fb_console);
-        }
-    }
-}
-
-/// Draw a form header (category separator)
-fn draw_form_header(name: &str, row: usize, fb_console: &mut Option<FramebufferConsole>) {
-    let ansi_row = row + 1;
-    let _ = write!(SerialWriter, "\x1b[{};1H", ansi_row);
-    serial_driver::write_str("\x1b[1;36m");
-    serial_driver::write_str("--- ");
-    serial_driver::write_str(name);
-    serial_driver::write_str(" ---");
-    serial_driver::write_str("\x1b[0m\x1b[K\r\n");
-
-    if let Some(console) = fb_console {
-        console.set_position(0, row as u32);
-        console.set_fg_color(Color::new(0, 192, 192));
-        let _ = console.write_str("--- ");
-        let _ = console.write_str(name);
-        let _ = console.write_str(" ---");
-        clear_line_remainder(console);
-        console.reset_colors();
-    }
-}
-
-/// Draw a subform header (indented section within a form)
-fn draw_subform_header(name: &str, row: usize, fb_console: &mut Option<FramebufferConsole>) {
-    let ansi_row = row + 1;
-    let _ = write!(SerialWriter, "\x1b[{};1H", ansi_row);
-    serial_driver::write_str("\x1b[1;35m"); // Magenta bold
-    serial_driver::write_str("     ");
-    serial_driver::write_str(name);
-    serial_driver::write_str("\x1b[0m\x1b[K\r\n");
-
-    if let Some(console) = fb_console {
-        console.set_position(0, row as u32);
-        console.set_fg_color(Color::new(192, 0, 192)); // Magenta
-        let _ = console.write_str("     ");
-        let _ = console.write_str(name);
-        clear_line_remainder(console);
-        console.reset_colors();
-    }
-}
-
-/// Draw an option item
-fn draw_option_item(
-    option: &CfrOption,
-    value: &CfrValue,
-    is_selected: bool,
-    row: usize,
-    fb_console: &mut Option<FramebufferConsole>,
-    cols: usize,
-) {
-    let is_editable = option.is_editable();
-
-    // Format the value for display
-    let mut value_str = String::new();
-    match (&option.option_type, value) {
-        (CfrOptionType::Bool { .. }, CfrValue::Bool(b)) => {
-            value_str.push_str(if *b { "[Enabled]" } else { "[Disabled]" });
-        }
-        (CfrOptionType::Enum { choices, .. }, CfrValue::Number(n)) => {
-            if let Some(choice) = choices.iter().find(|c| c.value == *n) {
-                value_str.push('[');
-                value_str.push_str(&choice.ui_name);
-                value_str.push(']');
-            } else {
-                let _ = write!(value_str, "[{}]", n);
-            }
-        }
-        (CfrOptionType::Number { hex_display, .. }, CfrValue::Number(n)) => {
-            if *hex_display {
-                let _ = write!(value_str, "[0x{:X}]", n);
-            } else {
-                let _ = write!(value_str, "[{}]", n);
-            }
-        }
-        (CfrOptionType::Varchar { .. }, CfrValue::Varchar(s)) => {
-            value_str.push('[');
-            let max_len = 20;
-            if s.len() > max_len {
-                value_str.push_str(&s[..max_len]);
-                value_str.push_str("...");
-            } else {
-                value_str.push_str(s);
-            }
-            value_str.push(']');
-        }
-        _ => {
-            value_str.push_str("[-]");
-        }
-    }
-
-    // Serial output
-    let ansi_row = row + 1;
-    let _ = write!(SerialWriter, "\x1b[{};1H", ansi_row);
-
-    if is_selected {
-        serial_driver::write_str("\x1b[7m");
-    }
-    if !is_editable {
-        serial_driver::write_str("\x1b[90m");
-    }
-
-    serial_driver::write_str("   ");
-    serial_driver::write_str(&option.ui_name);
-
-    let name_len = option.ui_name.len();
-    let pad_to = 40.min(cols.saturating_sub(value_str.len() + 5));
-    for _ in name_len + 3..pad_to {
-        serial_driver::write_str(" ");
-    }
-    serial_driver::write_str(&value_str);
-
-    serial_driver::write_str("\x1b[0m\x1b[K\r\n");
-
-    // Framebuffer output
-    if let Some(console) = fb_console {
-        console.set_position(0, row as u32);
-
-        if is_selected {
-            console.set_colors(HIGHLIGHT_FG, HIGHLIGHT_BG);
-        } else if !is_editable {
-            console.set_fg_color(Color::new(128, 128, 128));
-        } else {
-            console.set_colors(DEFAULT_FG, DEFAULT_BG);
-        }
-
-        let _ = console.write_str("   ");
-        let _ = console.write_str(&option.ui_name);
-
-        let name_len = option.ui_name.len();
-        let term_cols = console.cols() as usize;
-        let pad_to = 40.min(term_cols.saturating_sub(value_str.len() + 5));
-        for _ in name_len + 3..pad_to {
-            let _ = console.write_str(" ");
-        }
-        let _ = console.write_str(&value_str);
-
-        clear_line_remainder(console);
-        console.reset_colors();
-    }
-}
-
-/// Draw a comment item
-fn draw_comment(text: &str, row: usize, fb_console: &mut Option<FramebufferConsole>) {
-    let ansi_row = row + 1;
-    let _ = write!(SerialWriter, "\x1b[{};1H", ansi_row);
-    serial_driver::write_str("\x1b[90m");
-    serial_driver::write_str("   ");
-    serial_driver::write_str(text);
-    serial_driver::write_str("\x1b[0m\x1b[K\r\n");
-
-    if let Some(console) = fb_console {
-        console.set_position(0, row as u32);
-        console.set_fg_color(Color::new(128, 128, 128));
-        let _ = console.write_str("   ");
-        let _ = console.write_str(text);
-        clear_line_remainder(console);
-        console.reset_colors();
-    }
-}
-
-/// Draw scroll indicator
-fn draw_scroll_indicator(row: usize, indicator: &str, fb_console: &mut Option<FramebufferConsole>) {
-    let ansi_row = row + 1;
-    let _ = write!(SerialWriter, "\x1b[{};40H{}", ansi_row, indicator);
-
-    if let Some(console) = fb_console {
-        let cols = console.cols();
-        console.set_position(cols / 2, row as u32);
-        console.set_fg_color(Color::new(128, 128, 128));
-        let _ = console.write_str(indicator);
-        console.reset_colors();
-    }
-}
-
-/// Draw help text
-fn draw_help(row: usize, fb_console: &mut Option<FramebufferConsole>, cols: usize) {
-    let ansi_row = row + 1;
-    let _ = write!(SerialWriter, "\x1b[{};1H", ansi_row);
-    serial_driver::write_str("\x1b[36m");
-    let help_pad = (cols.saturating_sub(HELP_TEXT.len())) / 2;
-    for _ in 0..help_pad {
-        serial_driver::write_str(" ");
-    }
-    serial_driver::write_str(HELP_TEXT);
-    serial_driver::write_str("\x1b[0m");
-
-    if let Some(console) = fb_console {
-        console.set_fg_color(Color::new(0, 192, 192));
-        console.write_centered(row as u32, HELP_TEXT);
-        console.reset_colors();
-    }
-}
-
-/// Draw a status message
-fn draw_status_message(
-    row: usize,
-    message: &str,
-    is_success: bool,
-    fb_console: &mut Option<FramebufferConsole>,
-) {
-    let color = if is_success {
-        Color::new(0, 255, 0)
-    } else {
-        Color::new(255, 0, 0)
-    };
-
-    let ansi_row = row + 1;
-    let _ = write!(SerialWriter, "\x1b[{};1H", ansi_row);
-    if is_success {
-        serial_driver::write_str("\x1b[32m");
-    } else {
-        serial_driver::write_str("\x1b[31m");
-    }
-    serial_driver::write_str("  ");
-    serial_driver::write_str(message);
-    serial_driver::write_str("\x1b[0m");
-
-    if let Some(console) = fb_console {
-        console.set_fg_color(color);
-        console.write_centered(row as u32, message);
-        console.reset_colors();
-    }
-}
-
-/// Clear remaining characters on the current line of a framebuffer console
-fn clear_line_remainder(console: &mut FramebufferConsole) {
-    let (col, _) = console.position();
-    for _ in col..console.cols() {
-        let _ = console.write_str(" ");
-    }
 }

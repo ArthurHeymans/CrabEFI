@@ -17,10 +17,6 @@
 
 use crate::coreboot;
 use crate::drivers::block::BlockDevice;
-use crate::drivers::serial as serial_driver;
-use crate::framebuffer_console::{
-    Color, DEFAULT_BG, DEFAULT_FG, FramebufferConsole, HIGHLIGHT_BG, HIGHLIGHT_FG, TITLE_COLOR,
-};
 use crate::fs::{fat::FatFilesystem, gpt, iso9660};
 use crate::time::{Timeout, delay_ms};
 use core::fmt::Write;
@@ -912,41 +908,165 @@ fn scan_partition_for_entries(
 ///
 /// The index of the selected boot entry, or `None` if no selection was made.
 pub fn show_menu(menu: &mut BootMenu) -> Option<usize> {
+    use alloc::format;
+    use alloc::string::ToString;
+    use ratatui::Terminal;
+    use ratatui::layout::{Alignment, Constraint, Layout};
+    use ratatui::style::{Color as TuiColor, Modifier, Style};
+    use ratatui::text::{Line, Span};
+    use ratatui::widgets::{
+        Block, Borders, HighlightSpacing, List, ListItem, ListState, Paragraph,
+    };
+
     if menu.entry_count() == 0 {
         log::error!("No boot entries to display");
         return None;
     }
 
-    // Get framebuffer for rendering
+    // Create the dual backend (serial + framebuffer)
     let fb_info = coreboot::get_framebuffer();
+    let backend = crate::tui::DualBackend::new(fb_info.as_ref());
+    let mut terminal = match Terminal::new(backend) {
+        Ok(t) => t,
+        Err(_) => {
+            log::error!("Failed to create ratatui terminal");
+            return None;
+        }
+    };
+    let _ = terminal.clear();
+    let _ = terminal.hide_cursor();
 
-    // Create framebuffer console if available
-    let mut fb_console = fb_info.as_ref().map(FramebufferConsole::new);
-
-    // Clear screen
-    clear_screen(&mut fb_console);
-
-    // Initial display
-    draw_menu(menu, &mut fb_console);
+    // Status message shown at the bottom (cleared on next redraw)
+    let mut status_msg: Option<alloc::string::String> = None;
 
     // Handle input with timeout
     let mut remaining_seconds = menu.timeout_seconds;
     let mut last_second_check = Timeout::from_ms(1000);
 
-    // Show initial countdown
-    draw_countdown(remaining_seconds, &mut fb_console);
+    // Render helper closure -- builds the ratatui frame
+    let render = |terminal: &mut Terminal<crate::tui::DualBackend>,
+                  menu: &BootMenu,
+                  remaining_seconds: u32,
+                  status_msg: &Option<alloc::string::String>| {
+        let _ = terminal.draw(|frame| {
+            let area = frame.area();
+
+            // Vertical layout: header(3) | entries(fill) | footer(3)
+            let chunks = Layout::vertical([
+                Constraint::Length(3),  // header
+                Constraint::Min(4),    // entry list
+                Constraint::Length(3), // countdown + help + status
+            ])
+            .split(area);
+
+            // --- Header ---
+            let header = Paragraph::new(Line::from(MENU_TITLE).alignment(Alignment::Center))
+                .style(Style::new().fg(TuiColor::Yellow).add_modifier(Modifier::BOLD))
+                .block(
+                    Block::new()
+                        .borders(Borders::TOP | Borders::BOTTOM)
+                        .border_style(Style::new().fg(TuiColor::Yellow)),
+                );
+            frame.render_widget(header, chunks[0]);
+
+            // --- Build list items with category separators ---
+            let mut items: alloc::vec::Vec<ListItem> = alloc::vec::Vec::new();
+            let mut entry_index_map: alloc::vec::Vec<Option<usize>> = alloc::vec::Vec::new();
+            let mut current_category: Option<BootCategory> = None;
+
+            for (i, entry) in menu.entries.iter().enumerate() {
+                // Category separator
+                if current_category != Some(entry.category) {
+                    if current_category.is_some() {
+                        items.push(ListItem::new(Line::raw("")));
+                        entry_index_map.push(None);
+                    }
+                    let label = entry.category.display_name();
+                    let sep = format!("--- {label} ---");
+                    items.push(
+                        ListItem::new(Line::from(sep).alignment(Alignment::Center))
+                            .style(Style::new().fg(TuiColor::DarkGray)),
+                    );
+                    entry_index_map.push(None);
+                    current_category = Some(entry.category);
+                }
+
+                let mut desc: String<128> = String::new();
+                entry.format_description(&mut desc);
+                let line_text = format!("  {}. {}", i + 1, desc);
+
+                items.push(
+                    ListItem::new(Line::raw(line_text)).style(Style::new().fg(TuiColor::Gray)),
+                );
+                entry_index_map.push(Some(i));
+            }
+
+            // Find which list position corresponds to menu.selected
+            let selected_list_idx = entry_index_map
+                .iter()
+                .position(|e| *e == Some(menu.selected));
+
+            let list = List::new(items)
+                .highlight_style(
+                    Style::new()
+                        .fg(TuiColor::Black)
+                        .bg(TuiColor::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                )
+                .highlight_symbol(">> ")
+                .highlight_spacing(HighlightSpacing::Always)
+                .scroll_padding(1);
+
+            let mut list_state = ListState::default().with_selected(selected_list_idx);
+            frame.render_stateful_widget(list, chunks[1], &mut list_state);
+
+            // --- Footer: countdown, status, help ---
+            let footer_chunks = Layout::vertical([
+                Constraint::Length(1), // countdown or status
+                Constraint::Length(1), // blank
+                Constraint::Length(1), // help
+            ])
+            .split(chunks[2]);
+
+            // Countdown or status message
+            let footer_line = if let Some(msg) = status_msg {
+                Line::from(Span::styled(
+                    msg.as_str().to_string(),
+                    Style::new().fg(TuiColor::Red),
+                ))
+                .alignment(Alignment::Center)
+            } else if remaining_seconds > 0 {
+                let msg = format!("Booting in {} seconds...", remaining_seconds);
+                Line::from(Span::styled(msg, Style::new().fg(TuiColor::Yellow)))
+                    .alignment(Alignment::Center)
+            } else {
+                Line::raw("")
+            };
+            frame.render_widget(Paragraph::new(footer_line), footer_chunks[0]);
+
+            // Help text
+            let help = Paragraph::new(
+                Line::from(HELP_TEXT)
+                    .style(Style::new().fg(TuiColor::Cyan))
+                    .alignment(Alignment::Center),
+            );
+            frame.render_widget(help, footer_chunks[2]);
+        });
+    };
+
+    // Initial render
+    render(&mut terminal, menu, remaining_seconds, &status_msg);
 
     loop {
         // Check for timeout (first tick fires after 1 real second)
         if remaining_seconds > 0 && last_second_check.is_expired() {
             remaining_seconds -= 1;
             last_second_check = Timeout::from_ms(1000);
+            status_msg = None;
 
-            // Update countdown display
-            draw_countdown(remaining_seconds, &mut fb_console);
+            render(&mut terminal, menu, remaining_seconds, &status_msg);
 
             if remaining_seconds == 0 {
-                // Timeout - boot selected entry
                 return Some(menu.selected);
             }
         }
@@ -955,56 +1075,54 @@ pub fn show_menu(menu: &mut BootMenu) -> Option<usize> {
         if let Some(key) = read_key() {
             // Any key resets the timeout
             remaining_seconds = menu.timeout_seconds;
+            status_msg = None;
 
             match key {
                 KeyPress::Up | KeyPress::Char('k') => {
                     menu.select_previous();
-                    draw_menu(menu, &mut fb_console);
+                    render(&mut terminal, menu, remaining_seconds, &status_msg);
                 }
                 KeyPress::Down | KeyPress::Char('j') => {
                     menu.select_next();
-                    draw_menu(menu, &mut fb_console);
+                    render(&mut terminal, menu, remaining_seconds, &status_msg);
                 }
                 KeyPress::Enter => {
-                    // Show booting message before returning
                     if let Some(entry) = menu.entries.get(menu.selected) {
                         log::info!(
                             "Selected entry: name='{}', path='{}'",
                             entry.name,
                             entry.path
                         );
-                        let mut msg: String<64> = String::new();
-                        let _ = msg.push_str("Booting ");
-                        let _ = msg.push_str(&entry.name);
-                        let _ = msg.push_str("...");
-                        draw_status(&msg, &mut fb_console);
+                        status_msg = Some(format!("Booting {}...", entry.name));
                     } else {
                         log::error!("No entry at selected index {}", menu.selected);
-                        draw_status("Error: No entry selected", &mut fb_console);
+                        status_msg = Some("Error: No entry selected".into());
                     }
+                    render(&mut terminal, menu, remaining_seconds, &status_msg);
                     return Some(menu.selected);
                 }
                 KeyPress::Escape => {
-                    // Future: file browser
-                    draw_status("File browser not yet implemented", &mut fb_console);
+                    status_msg = Some("File browser not yet implemented".into());
+                    render(&mut terminal, menu, remaining_seconds, &status_msg);
                 }
                 KeyPress::Char('s') | KeyPress::Char('S') => {
                     // Open Secure Boot settings menu
+                    let _ = terminal.clear();
                     crate::secure_boot_menu::show_secure_boot_menu();
                     // Redraw boot menu after returning
-                    clear_screen(&mut fb_console);
-                    draw_menu(menu, &mut fb_console);
+                    let _ = terminal.clear();
+                    render(&mut terminal, menu, remaining_seconds, &status_msg);
                 }
                 KeyPress::Char('f') | KeyPress::Char('F') => {
-                    // Open Firmware Settings menu (CFR)
+                    // Open Firmware Settings menu
+                    let _ = terminal.clear();
                     crate::cfr_menu::show_cfr_menu();
-                    // Redraw boot menu after returning
-                    clear_screen(&mut fb_console);
-                    draw_menu(menu, &mut fb_console);
+                    let _ = terminal.clear();
+                    render(&mut terminal, menu, remaining_seconds, &status_msg);
                 }
                 KeyPress::Char('r') | KeyPress::Char('R') => {
-                    // Reset the system
-                    draw_status("Resetting system...", &mut fb_console);
+                    status_msg = Some("Resetting system...".into());
+                    render(&mut terminal, menu, remaining_seconds, &status_msg);
                     delay_ms(500);
                     perform_system_reset();
                 }
@@ -1012,39 +1130,34 @@ pub fn show_menu(menu: &mut BootMenu) -> Option<usize> {
                     // Edit kernel command line
                     if let Some(entry) = menu.entries.get_mut(menu.selected) {
                         if entry.has_cmdline() {
-                            match edit_cmdline(entry, &mut fb_console) {
+                            match edit_cmdline(entry, &mut terminal) {
                                 EditResult::Boot => {
-                                    // Boot immediately with the edited command line
-                                    let mut msg: String<64> = String::new();
-                                    let _ = msg.push_str("Booting ");
-                                    let _ = msg.push_str(&entry.name);
-                                    let _ = msg.push_str("...");
-                                    clear_screen(&mut fb_console);
-                                    draw_status(&msg, &mut fb_console);
+                                    status_msg = Some(format!("Booting {}...", entry.name));
+                                    let _ = terminal.clear();
+                                    render(&mut terminal, menu, remaining_seconds, &status_msg);
                                     return Some(menu.selected);
                                 }
                                 EditResult::Confirmed => {
-                                    draw_status("Command line updated", &mut fb_console);
+                                    status_msg = Some("Command line updated".into());
                                 }
                                 EditResult::Cancelled => {
-                                    draw_status("Edit cancelled", &mut fb_console);
+                                    status_msg = Some("Edit cancelled".into());
                                 }
                             }
                         } else {
-                            draw_status("This entry has no editable command line", &mut fb_console);
+                            status_msg =
+                                Some("This entry has no editable command line".into());
                         }
                     }
-                    // Redraw menu after editing (unless we're booting)
                     delay_ms(500);
-                    clear_screen(&mut fb_console);
-                    draw_menu(menu, &mut fb_console);
+                    let _ = terminal.clear();
+                    render(&mut terminal, menu, remaining_seconds, &status_msg);
                 }
                 KeyPress::Char(c) if c.is_ascii_digit() => {
-                    // Direct selection by number
                     let num = (c as u8 - b'0') as usize;
                     if num > 0 && num <= menu.entry_count() {
                         menu.selected = num - 1;
-                        draw_menu(menu, &mut fb_console);
+                        render(&mut terminal, menu, remaining_seconds, &status_msg);
                     }
                 }
                 _ => {}
@@ -1056,230 +1169,10 @@ pub fn show_menu(menu: &mut BootMenu) -> Option<usize> {
     }
 }
 
-use crate::menu_common::{self, KeyPress, SerialWriter};
+use crate::menu_common::{self, KeyPress};
 
 fn read_key() -> Option<KeyPress> {
     menu_common::read_key()
-}
-
-fn clear_screen(fb_console: &mut Option<FramebufferConsole>) {
-    menu_common::clear_screen(fb_console);
-}
-
-/// Draw the menu on both outputs
-fn draw_menu(menu: &BootMenu, fb_console: &mut Option<FramebufferConsole>) {
-    let cols = fb_console.as_ref().map(|c| c.cols()).unwrap_or(80) as usize;
-
-    // Draw header
-    draw_header(fb_console, cols);
-
-    // Draw entries with category separators
-    let start_row = 4;
-    let mut current_row = start_row;
-    let mut current_category: Option<BootCategory> = None;
-
-    for (i, entry) in menu.entries.iter().enumerate() {
-        // Check if we need a category separator
-        if current_category != Some(entry.category) {
-            // Add blank line before separator (except for first category)
-            if current_category.is_some() {
-                current_row += 1;
-            }
-            draw_category_separator(entry.category, current_row, fb_console, cols);
-            current_row += 1;
-            current_category = Some(entry.category);
-        }
-
-        let is_selected = i == menu.selected;
-        draw_entry(i, entry, is_selected, current_row, fb_console, cols);
-        current_row += 1;
-    }
-
-    // Draw help text
-    let help_row = current_row + 2;
-    draw_help(help_row, fb_console, cols);
-}
-
-/// Draw a category separator line
-fn draw_category_separator(
-    category: BootCategory,
-    row: usize,
-    fb_console: &mut Option<FramebufferConsole>,
-    cols: usize,
-) {
-    let label = category.display_name();
-
-    // Build separator: "--- Category Name ---" style
-    let dashes_total = cols.saturating_sub(label.len() + 2); // 2 for spaces around label
-    let dashes_left = dashes_total / 2;
-    let dashes_right = dashes_total - dashes_left;
-
-    // Serial output
-    let ansi_row = row + 1; // ANSI is 1-based
-    let _ = write!(SerialWriter, "\x1b[{};1H", ansi_row);
-    serial_driver::write_str("\x1b[90m"); // Dark gray
-
-    for _ in 0..dashes_left.min(40) {
-        serial_driver::write_str("-");
-    }
-    serial_driver::write_str(" ");
-    serial_driver::write_str(label);
-    serial_driver::write_str(" ");
-    for _ in 0..dashes_right.min(40) {
-        serial_driver::write_str("-");
-    }
-
-    serial_driver::write_str("\x1b[0m\x1b[K\r\n");
-
-    // Framebuffer output
-    if let Some(console) = fb_console {
-        console.set_position(0, row as u32);
-        console.set_fg_color(Color::new(128, 128, 128)); // Gray
-
-        for _ in 0..dashes_left.min(40) {
-            let _ = console.write_str("-");
-        }
-        let _ = console.write_str(" ");
-        let _ = console.write_str(label);
-        let _ = console.write_str(" ");
-        for _ in 0..dashes_right.min(40) {
-            let _ = console.write_str("-");
-        }
-
-        // Clear rest of line
-        let (col, _) = console.position();
-        let term_cols = console.cols();
-        for _ in col..term_cols {
-            let _ = console.write_str(" ");
-        }
-
-        console.reset_colors();
-    }
-}
-
-fn draw_header(fb_console: &mut Option<FramebufferConsole>, cols: usize) {
-    menu_common::draw_header(MENU_TITLE, fb_console, cols);
-}
-
-/// Draw a single boot entry
-fn draw_entry(
-    index: usize,
-    entry: &BootEntry,
-    is_selected: bool,
-    row: usize,
-    fb_console: &mut Option<FramebufferConsole>,
-    _cols: usize,
-) {
-    let mut desc: String<128> = String::new();
-    entry.format_description(&mut desc);
-
-    // Build the line
-    let marker = if is_selected { "[*]" } else { "[ ]" };
-
-    // Serial output
-    let ansi_row = row + 1; // ANSI is 1-based
-    let _ = write!(SerialWriter, "\x1b[{};1H", ansi_row); // Position cursor
-
-    if is_selected {
-        serial_driver::write_str("\x1b[7m"); // Inverse video
-    }
-
-    let _ = write!(SerialWriter, "   {}. {} {}", index + 1, marker, desc);
-
-    if is_selected {
-        serial_driver::write_str("\x1b[0m"); // Reset
-    }
-
-    // Clear rest of line
-    serial_driver::write_str("\x1b[K\r\n");
-
-    // Framebuffer output
-    if let Some(console) = fb_console {
-        console.set_position(3, row as u32);
-
-        if is_selected {
-            console.set_colors(HIGHLIGHT_FG, HIGHLIGHT_BG);
-        } else {
-            console.set_colors(DEFAULT_FG, DEFAULT_BG);
-        }
-
-        let _ = write!(console, "{}. {} {}", index + 1, marker, desc);
-
-        // Clear rest of line with spaces
-        let (col, _) = console.position();
-        let cols = console.cols();
-        for _ in col..cols {
-            let _ = console.write_str(" ");
-        }
-
-        console.reset_colors();
-    }
-}
-
-/// Draw the help text
-fn draw_help(row: usize, fb_console: &mut Option<FramebufferConsole>, cols: usize) {
-    // Serial output
-    let ansi_row = row + 1;
-    let _ = write!(SerialWriter, "\x1b[{};1H", ansi_row);
-    serial_driver::write_str("\x1b[36m"); // Cyan
-
-    // Center help text
-    let help_pad = (cols.saturating_sub(HELP_TEXT.len())) / 2;
-    for _ in 0..help_pad {
-        serial_driver::write_str(" ");
-    }
-    serial_driver::write_str(HELP_TEXT);
-    serial_driver::write_str("\x1b[0m\r\n");
-
-    // Framebuffer output
-    if let Some(console) = fb_console {
-        console.set_fg_color(Color::new(0, 192, 192)); // Cyan
-        console.write_centered(row as u32, HELP_TEXT);
-        console.reset_colors();
-    }
-}
-
-/// Draw the countdown timer
-fn draw_countdown(seconds: u32, fb_console: &mut Option<FramebufferConsole>) {
-    let mut msg: String<64> = String::new();
-    if seconds > 0 {
-        let _ = write!(msg, "Booting in {} seconds...", seconds);
-    } else {
-        let _ = write!(msg, "Booting now...");
-    }
-
-    // Serial output - position at bottom area
-    serial_driver::write_str("\x1b[20;1H"); // Row 20
-    serial_driver::write_str("\x1b[33m"); // Yellow
-    serial_driver::write_str(&msg);
-    serial_driver::write_str("\x1b[K"); // Clear rest of line
-    serial_driver::write_str("\x1b[0m");
-
-    // Framebuffer output
-    if let Some(console) = fb_console {
-        let row = console.rows().saturating_sub(3);
-        console.set_fg_color(Color::new(255, 255, 0)); // Yellow
-        console.write_centered(row, &msg);
-        console.reset_colors();
-    }
-}
-
-/// Draw a status message
-fn draw_status(message: &str, fb_console: &mut Option<FramebufferConsole>) {
-    // Serial output
-    serial_driver::write_str("\x1b[22;1H"); // Row 22
-    serial_driver::write_str("\x1b[31m"); // Red
-    serial_driver::write_str(message);
-    serial_driver::write_str("\x1b[K"); // Clear rest of line
-    serial_driver::write_str("\x1b[0m");
-
-    // Framebuffer output
-    if let Some(console) = fb_console {
-        let row = console.rows().saturating_sub(1);
-        console.set_fg_color(Color::new(255, 0, 0)); // Red
-        console.write_centered(row, message);
-        console.reset_colors();
-    }
 }
 
 /// Result of command line editing
@@ -1293,72 +1186,184 @@ enum EditResult {
     Boot,
 }
 
-/// Edit the command line of a boot entry
+/// Edit the command line of a boot entry using ratatui
 ///
 /// Displays a full-screen editor for the kernel command line.
 ///
 /// # Arguments
 ///
 /// * `entry` - The boot entry to edit
-/// * `fb_console` - Optional framebuffer console for display
+/// * `terminal` - The ratatui terminal for rendering
 ///
 /// # Returns
 ///
 /// `EditResult::Cancelled` if the user pressed Escape (cmdline unchanged)
 /// `EditResult::Confirmed` if the user pressed Enter (cmdline updated, return to menu)
 /// `EditResult::Boot` if the user pressed Ctrl+X (cmdline updated, boot immediately)
-fn edit_cmdline(entry: &mut BootEntry, fb_console: &mut Option<FramebufferConsole>) -> EditResult {
+fn edit_cmdline(
+    entry: &mut BootEntry,
+    terminal: &mut ratatui::Terminal<crate::tui::DualBackend>,
+) -> EditResult {
+    use alloc::format;
+    use alloc::string::ToString;
+    use alloc::vec;
+    use ratatui::layout::{Alignment, Constraint, Layout};
+    use ratatui::style::{Color as TuiColor, Modifier, Style};
+    use ratatui::text::{Line, Span};
+    use ratatui::widgets::{Block, Borders, Paragraph};
+
     // Check if entry has cmdline and extract initial value
     let initial_cmdline = match entry.get_cmdline() {
         Some(c) => c.clone(),
-        None => {
-            draw_status("This entry has no command line to edit", fb_console);
-            delay_ms(1500);
-            return EditResult::Cancelled;
-        }
+        None => return EditResult::Cancelled,
     };
 
-    // Copy entry name for display (to avoid borrow issues)
-    let entry_name: String<64> = entry.name.clone();
-
-    // Create a working buffer for editing
+    let entry_name: alloc::string::String = entry.name.to_string();
     let mut buffer: String<512> = initial_cmdline;
     let mut cursor_pos = buffer.len();
 
-    // Calculate scroll offset for long command lines
-    let cols = fb_console.as_ref().map(|c| c.cols()).unwrap_or(80) as usize;
-    let edit_width = cols.saturating_sub(4); // Leave margin for decoration
+    let help1 = "Enter: Confirm | Esc: Cancel | Ctrl+X: Boot | Left/Right: Move cursor";
+    let help2 = "Ctrl+A: Start | Ctrl+E: End | Ctrl+K: Delete to end | Ctrl+U: Delete to start";
 
-    // Draw static parts once
-    draw_cmdline_editor_static(&entry_name, fb_console, cols);
+    let _ = terminal.clear();
 
-    // Track if display needs updating
-    let mut needs_redraw = true;
+    let render = |terminal: &mut ratatui::Terminal<crate::tui::DualBackend>,
+                  buffer: &str,
+                  cursor_pos: usize| {
+        let _ = terminal.draw(|frame| {
+            let area = frame.area();
+            let width = area.width.saturating_sub(4) as usize;
+
+            // Calculate visible window for long command lines
+            let buf_len = buffer.len();
+            let (vis_start, vis_end, disp_cursor) = if buf_len <= width {
+                (0, buf_len, cursor_pos)
+            } else if cursor_pos < width / 2 {
+                (0, width, cursor_pos)
+            } else if cursor_pos > buf_len.saturating_sub(width / 2) {
+                let start = buf_len.saturating_sub(width);
+                (start, buf_len, cursor_pos - start)
+            } else {
+                let start = cursor_pos - width / 2;
+                (start, (start + width).min(buf_len), width / 2)
+            };
+            let visible = &buffer[vis_start..vis_end];
+
+            // Build the edit line with cursor highlighting
+            let left_indicator = if vis_start > 0 { "<" } else { " " };
+            let right_indicator = if vis_end < buf_len { ">" } else { " " };
+
+            let before = &visible[..disp_cursor];
+            let cursor_ch = if disp_cursor < visible.len() {
+                &visible[disp_cursor..disp_cursor + 1]
+            } else {
+                " "
+            };
+            let after = if disp_cursor < visible.len() {
+                &visible[disp_cursor + 1..]
+            } else {
+                ""
+            };
+
+            // Pad to fill the edit area width
+            let content_len = before.len() + 1 + after.len();
+            let padding = width.saturating_sub(content_len);
+            let pad_str: alloc::string::String =
+                core::iter::repeat(' ').take(padding).collect();
+
+            let edit_line = Line::from(vec![
+                Span::raw(left_indicator),
+                Span::styled(
+                    before.to_string(),
+                    Style::new().bg(TuiColor::Blue),
+                ),
+                Span::styled(
+                    cursor_ch.to_string(),
+                    Style::new()
+                        .fg(TuiColor::Black)
+                        .bg(TuiColor::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    format!("{}{}", after, pad_str),
+                    Style::new().bg(TuiColor::Blue),
+                ),
+                Span::raw(right_indicator),
+            ]);
+
+            let length_line = Line::from(Span::styled(
+                format!("Length: {}/512", buf_len),
+                Style::new().fg(TuiColor::Yellow),
+            ));
+
+            // Layout: header(3), entry(2), label(1), edit(1), gap(1), length(1), gap(1), help(2), fill
+            let chunks = Layout::vertical([
+                Constraint::Length(3),  // header
+                Constraint::Length(2),  // entry name
+                Constraint::Length(1),  // "Command line:" label
+                Constraint::Length(1),  // edit line
+                Constraint::Length(1),  // gap
+                Constraint::Length(1),  // length indicator
+                Constraint::Length(1),  // gap
+                Constraint::Length(2),  // help text
+                Constraint::Min(0),    // fill
+            ])
+            .split(area);
+
+            // Header
+            let header =
+                Paragraph::new(Line::from("Edit Kernel Command Line").alignment(Alignment::Center))
+                    .style(
+                        Style::new()
+                            .fg(TuiColor::Yellow)
+                            .add_modifier(Modifier::BOLD),
+                    )
+                    .block(
+                        Block::new()
+                            .borders(Borders::TOP | Borders::BOTTOM)
+                            .border_style(Style::new().fg(TuiColor::Yellow)),
+                    );
+            frame.render_widget(header, chunks[0]);
+
+            // Entry name
+            let entry_line = Line::from(vec![
+                Span::styled("Entry: ", Style::new().fg(TuiColor::Cyan)),
+                Span::raw(entry_name.as_str()),
+            ]);
+            frame.render_widget(Paragraph::new(entry_line), chunks[1]);
+
+            // Label
+            frame.render_widget(Paragraph::new("Command line:"), chunks[2]);
+
+            // Edit line
+            frame.render_widget(Paragraph::new(edit_line), chunks[3]);
+
+            // Length
+            frame.render_widget(Paragraph::new(length_line), chunks[5]);
+
+            // Help
+            let help = Paragraph::new(vec![
+                Line::from(Span::styled(help1, Style::new().fg(TuiColor::Cyan))),
+                Line::from(Span::styled(help2, Style::new().fg(TuiColor::Cyan))),
+            ]);
+            frame.render_widget(help, chunks[7]);
+        });
+    };
+
+    render(terminal, &buffer, cursor_pos);
 
     loop {
-        // Only redraw if something changed
-        if needs_redraw {
-            draw_cmdline_editor_line(&buffer, cursor_pos, edit_width, fb_console);
-            needs_redraw = false;
-        }
-
-        // Wait for input
         if let Some(key) = read_key() {
             match key {
                 KeyPress::Enter => {
-                    // Confirm - update the cmdline
                     if let Some(cmdline) = entry.get_cmdline_mut() {
                         cmdline.clear();
                         let _ = cmdline.push_str(&buffer);
                     }
                     return EditResult::Confirmed;
                 }
-                KeyPress::Escape => {
-                    // Cancel - don't modify
-                    return EditResult::Cancelled;
-                }
+                KeyPress::Escape => return EditResult::Cancelled,
                 KeyPress::Char(c) => {
-                    // Handle special characters
                     match c {
                         '\x18' => {
                             // Ctrl+X - boot immediately
@@ -1371,7 +1376,6 @@ fn edit_cmdline(entry: &mut BootEntry, fb_console: &mut Option<FramebufferConsol
                         '\x08' | '\x7f' => {
                             // Backspace
                             if cursor_pos > 0 {
-                                // Remove character before cursor
                                 let mut new_buffer: String<512> = String::new();
                                 for (i, ch) in buffer.chars().enumerate() {
                                     if i != cursor_pos - 1 {
@@ -1380,25 +1384,12 @@ fn edit_cmdline(entry: &mut BootEntry, fb_console: &mut Option<FramebufferConsol
                                 }
                                 buffer = new_buffer;
                                 cursor_pos -= 1;
-                                needs_redraw = true;
                             }
                         }
-                        '\x01' => {
-                            // Ctrl+A - move to beginning
-                            if cursor_pos != 0 {
-                                cursor_pos = 0;
-                                needs_redraw = true;
-                            }
-                        }
-                        '\x05' => {
-                            // Ctrl+E - move to end
-                            if cursor_pos != buffer.len() {
-                                cursor_pos = buffer.len();
-                                needs_redraw = true;
-                            }
-                        }
+                        '\x01' => cursor_pos = 0,       // Ctrl+A
+                        '\x05' => cursor_pos = buffer.len(), // Ctrl+E
                         '\x0b' => {
-                            // Ctrl+K - delete to end of line
+                            // Ctrl+K - delete to end
                             if cursor_pos < buffer.len() {
                                 let mut new_buffer: String<512> = String::new();
                                 for (i, ch) in buffer.chars().enumerate() {
@@ -1407,11 +1398,10 @@ fn edit_cmdline(entry: &mut BootEntry, fb_console: &mut Option<FramebufferConsol
                                     }
                                 }
                                 buffer = new_buffer;
-                                needs_redraw = true;
                             }
                         }
                         '\x15' => {
-                            // Ctrl+U - delete to beginning of line
+                            // Ctrl+U - delete to start
                             if cursor_pos > 0 {
                                 let mut new_buffer: String<512> = String::new();
                                 for (i, ch) in buffer.chars().enumerate() {
@@ -1421,11 +1411,9 @@ fn edit_cmdline(entry: &mut BootEntry, fb_console: &mut Option<FramebufferConsol
                                 }
                                 buffer = new_buffer;
                                 cursor_pos = 0;
-                                needs_redraw = true;
                             }
                         }
                         _ if c.is_ascii_graphic() || c == ' ' => {
-                            // Regular printable character - insert at cursor (ASCII only)
                             if buffer.len() < 511 {
                                 let mut new_buffer: String<512> = String::new();
                                 for (i, ch) in buffer.chars().enumerate() {
@@ -1439,257 +1427,24 @@ fn edit_cmdline(entry: &mut BootEntry, fb_console: &mut Option<FramebufferConsol
                                 }
                                 buffer = new_buffer;
                                 cursor_pos += 1;
-                                needs_redraw = true;
                             }
                         }
-                        _ => {}
+                        _ => continue,
                     }
+                    render(terminal, &buffer, cursor_pos);
                 }
-                KeyPress::Left => {
-                    // Move cursor left
-                    if cursor_pos > 0 {
-                        cursor_pos -= 1;
-                        needs_redraw = true;
-                    }
+                KeyPress::Left if cursor_pos > 0 => {
+                    cursor_pos -= 1;
+                    render(terminal, &buffer, cursor_pos);
                 }
-                KeyPress::Right => {
-                    // Move cursor right
-                    if cursor_pos < buffer.len() {
-                        cursor_pos += 1;
-                        needs_redraw = true;
-                    }
+                KeyPress::Right if cursor_pos < buffer.len() => {
+                    cursor_pos += 1;
+                    render(terminal, &buffer, cursor_pos);
                 }
-                // Ignore Up/Down in editor
-                KeyPress::Up | KeyPress::Down => {}
+                _ => {}
             }
         }
-
         delay_ms(10);
-    }
-}
-
-/// Draw the static parts of the command line editor UI (header, title, help)
-/// This is called once when entering the editor.
-fn draw_cmdline_editor_static(
-    entry_name: &str,
-    fb_console: &mut Option<FramebufferConsole>,
-    cols: usize,
-) {
-    let title = "Edit Kernel Command Line";
-
-    // Serial output - clear and draw static content
-    serial_driver::write_str("\x1b[2J\x1b[H"); // Clear and home
-    serial_driver::write_str("\x1b[1;33m"); // Yellow, bold
-
-    // Draw header
-    let header_line = [b'='; 128];
-    let header_len = cols.min(128);
-    serial_driver::write_str(core::str::from_utf8(&header_line[..header_len]).unwrap_or(""));
-    serial_driver::write_str("\r\n");
-
-    // Title
-    let title_pad = (cols.saturating_sub(title.len())) / 2;
-    for _ in 0..title_pad {
-        serial_driver::write_str(" ");
-    }
-    serial_driver::write_str(title);
-    serial_driver::write_str("\r\n");
-
-    serial_driver::write_str(core::str::from_utf8(&header_line[..header_len]).unwrap_or(""));
-    serial_driver::write_str("\r\n\x1b[0m");
-
-    // Entry name
-    serial_driver::write_str("\x1b[36m"); // Cyan
-    serial_driver::write_str("Entry: ");
-    serial_driver::write_str(entry_name);
-    serial_driver::write_str("\x1b[0m\r\n\r\n");
-
-    // Command line label
-    serial_driver::write_str("Command line:\r\n");
-
-    // Leave space for edit line (row 7)
-    serial_driver::write_str("\r\n\r\n");
-
-    // Help text (row 9-10)
-    serial_driver::write_str("\x1b[36m"); // Cyan
-    serial_driver::write_str(
-        "Enter: Confirm | Esc: Cancel | Ctrl+X: Boot | Left/Right: Move cursor\r\n",
-    );
-    serial_driver::write_str(
-        "Ctrl+A: Start | Ctrl+E: End | Ctrl+K: Delete to end | Ctrl+U: Delete to start",
-    );
-    serial_driver::write_str("\x1b[0m\r\n");
-
-    // Framebuffer output
-    if let Some(console) = fb_console {
-        console.clear();
-
-        // Header
-        console.set_fg_color(TITLE_COLOR);
-        let mut header: String<128> = String::new();
-        for _ in 0..cols {
-            let _ = header.push('=');
-        }
-        console.set_position(0, 0);
-        let _ = console.write_str(&header);
-        console.write_centered(1, title);
-        console.set_position(0, 2);
-        let _ = console.write_str(&header);
-        console.reset_colors();
-
-        // Entry name
-        console.set_position(0, 4);
-        console.set_fg_color(Color::new(0, 192, 192)); // Cyan
-        let _ = console.write_str("Entry: ");
-        console.reset_colors();
-        let _ = console.write_str(entry_name);
-
-        // Command line label
-        console.set_position(0, 6);
-        let _ = console.write_str("Command line:");
-
-        // Help text
-        console.set_position(0, 9);
-        console.set_fg_color(Color::new(0, 192, 192));
-        let _ = console
-            .write_str("Enter: Confirm | Esc: Cancel | Ctrl+X: Boot | Left/Right: Move cursor");
-        console.set_position(0, 10);
-        let _ = console.write_str(
-            "Ctrl+A: Start | Ctrl+E: End | Ctrl+K: Delete to end | Ctrl+U: Delete to start",
-        );
-        console.reset_colors();
-    }
-}
-
-/// Draw just the edit line and length indicator (called on each change)
-fn draw_cmdline_editor_line(
-    buffer: &str,
-    cursor_pos: usize,
-    edit_width: usize,
-    fb_console: &mut Option<FramebufferConsole>,
-) {
-    // Calculate visible portion of the buffer (scroll if needed)
-    let buffer_len = buffer.len();
-    let (visible_start, visible_end, display_cursor) = if buffer_len <= edit_width {
-        (0, buffer_len, cursor_pos)
-    } else if cursor_pos < edit_width / 2 {
-        // Cursor near start - show from beginning
-        (0, edit_width, cursor_pos)
-    } else if cursor_pos > buffer_len.saturating_sub(edit_width / 2) {
-        // Cursor near end - show end portion
-        let start = buffer_len.saturating_sub(edit_width);
-        (start, buffer_len, cursor_pos - start)
-    } else {
-        // Cursor in middle - center the view
-        let start = cursor_pos - edit_width / 2;
-        let end = start + edit_width;
-        (start, end.min(buffer_len), edit_width / 2)
-    };
-
-    let visible_text = &buffer[visible_start..visible_end];
-
-    // Serial output - position cursor at edit line (row 7)
-    serial_driver::write_str("\x1b[7;1H"); // Row 7, column 1
-    serial_driver::write_str("\x1b[K"); // Clear line
-    serial_driver::write_str("\x1b[44m"); // Blue background
-
-    // Show scroll indicators
-    if visible_start > 0 {
-        serial_driver::write_str("<");
-    } else {
-        serial_driver::write_str(" ");
-    }
-
-    // Draw text before cursor
-    if display_cursor > 0 {
-        serial_driver::write_str(&visible_text[..display_cursor]);
-    }
-
-    // Draw cursor position with inverse video
-    serial_driver::write_str("\x1b[7m"); // Inverse
-    if display_cursor < visible_text.len() {
-        let cursor_char = &visible_text[display_cursor..display_cursor + 1];
-        serial_driver::write_str(cursor_char);
-    } else {
-        serial_driver::write_str(" ");
-    }
-    serial_driver::write_str("\x1b[27m"); // Normal (but still blue bg)
-
-    // Draw text after cursor
-    if display_cursor < visible_text.len() {
-        serial_driver::write_str(&visible_text[display_cursor + 1..]);
-    }
-
-    // Pad to width and show scroll indicator
-    let displayed_len = visible_text.len() + 2; // +2 for scroll indicators
-    for _ in displayed_len..edit_width {
-        serial_driver::write_str(" ");
-    }
-
-    if visible_end < buffer_len {
-        serial_driver::write_str(">");
-    } else {
-        serial_driver::write_str(" ");
-    }
-
-    serial_driver::write_str("\x1b[0m"); // Reset colors
-
-    // Length indicator (row 12)
-    serial_driver::write_str("\x1b[12;1H"); // Row 12
-    serial_driver::write_str("\x1b[K"); // Clear line
-    let _ = write!(SerialWriter, "\x1b[33mLength: {}/512\x1b[0m", buffer_len);
-
-    // Framebuffer output - only update edit line and length
-    if let Some(console) = fb_console {
-        // Edit area with blue background (row 7)
-        console.set_position(0, 7);
-        console.set_colors(DEFAULT_FG, Color::new(0, 0, 128)); // Blue bg
-
-        // Scroll indicator left
-        if visible_start > 0 {
-            let _ = console.write_str("<");
-        } else {
-            let _ = console.write_str(" ");
-        }
-
-        // Text before cursor
-        if display_cursor > 0 {
-            let _ = console.write_str(&visible_text[..display_cursor]);
-        }
-
-        // Cursor with highlight
-        console.set_colors(HIGHLIGHT_FG, HIGHLIGHT_BG);
-        if display_cursor < visible_text.len() {
-            let _ = console.write_str(&visible_text[display_cursor..display_cursor + 1]);
-        } else {
-            let _ = console.write_str(" ");
-        }
-        console.set_colors(DEFAULT_FG, Color::new(0, 0, 128));
-
-        // Text after cursor
-        if display_cursor < visible_text.len() {
-            let _ = console.write_str(&visible_text[display_cursor + 1..]);
-        }
-
-        // Pad and right scroll indicator
-        let displayed_len = visible_text.len() + 2;
-        for _ in displayed_len..edit_width {
-            let _ = console.write_str(" ");
-        }
-        if visible_end < buffer_len {
-            let _ = console.write_str(">");
-        } else {
-            let _ = console.write_str(" ");
-        }
-        console.reset_colors();
-
-        // Length indicator (row 12)
-        console.set_position(0, 12);
-        console.set_fg_color(Color::new(255, 255, 0)); // Yellow
-        let mut len_str: String<32> = String::new();
-        let _ = write!(len_str, "Length: {}/512    ", buffer_len); // Extra spaces to clear old longer values
-        let _ = console.write_str(&len_str);
-        console.reset_colors();
     }
 }
 

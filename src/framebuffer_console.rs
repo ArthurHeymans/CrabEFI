@@ -326,13 +326,89 @@ pub fn render_glyph(fb: &FramebufferInfo, c: char, x: u32, y: u32, fg: Color, bg
 /// Get the glyph data for a character
 ///
 /// Returns a reference to 16 bytes representing the 8x16 bitmap for the character.
+/// Handles Unicode box-drawing and block-element characters by mapping them to
+/// their CP437 equivalents in the VGA font.
 fn get_glyph(c: char) -> &'static [u8; 16] {
-    let index = c as usize;
-    if index < 256 {
-        &VGA_FONT_8X16[index]
+    let index = if (c as usize) < 256 {
+        c as usize
+    } else if let Some(cp437) = unicode_to_cp437(c) {
+        cp437 as usize
     } else {
-        // Return '?' for non-ASCII characters
-        &VGA_FONT_8X16[b'?' as usize]
+        b'?' as usize
+    };
+    &VGA_FONT_8X16[index]
+}
+
+/// Map Unicode characters to their CP437 font indices
+///
+/// The VGA font uses CP437 encoding where box-drawing characters live at
+/// 0xB3-0xDA and block elements at 0xB0-0xDF. Unicode places these same
+/// glyphs at U+2500-U+257F (box drawing) and U+2580-U+2593 (block elements).
+fn unicode_to_cp437(c: char) -> Option<u8> {
+    match c {
+        // Box drawing — single line
+        '─' => Some(0xC4),
+        '│' => Some(0xB3),
+        '┌' => Some(0xDA),
+        '┐' => Some(0xBF),
+        '└' => Some(0xC0),
+        '┘' => Some(0xD9),
+        '├' => Some(0xC3),
+        '┤' => Some(0xB4),
+        '┬' => Some(0xC2),
+        '┴' => Some(0xC1),
+        '┼' => Some(0xC5),
+
+        // Box drawing — double line
+        '═' => Some(0xCD),
+        '║' => Some(0xBA),
+        '╔' => Some(0xC9),
+        '╗' => Some(0xBB),
+        '╚' => Some(0xC8),
+        '╝' => Some(0xBC),
+        '╠' => Some(0xCC),
+        '╣' => Some(0xB9),
+        '╦' => Some(0xCB),
+        '╩' => Some(0xCA),
+        '╬' => Some(0xCE),
+
+        // Box drawing — mixed single/double
+        '╒' => Some(0xD5),
+        '╓' => Some(0xD6),
+        '╕' => Some(0xB8),
+        '╖' => Some(0xB7),
+        '╘' => Some(0xD4),
+        '╙' => Some(0xD3),
+        '╛' => Some(0xBE),
+        '╜' => Some(0xBD),
+        '╞' => Some(0xC6),
+        '╟' => Some(0xC7),
+        '╡' => Some(0xB5),
+        '╢' => Some(0xB6),
+        '╤' => Some(0xD1),
+        '╥' => Some(0xD2),
+        '╧' => Some(0xCF),
+        '╨' => Some(0xD0),
+        '╪' => Some(0xD8),
+        '╫' => Some(0xD7),
+
+        // Rounded corners → regular corners (no rounded glyphs in CP437)
+        '╭' => Some(0xDA),
+        '╮' => Some(0xBF),
+        '╯' => Some(0xD9),
+        '╰' => Some(0xC0),
+
+        // Block elements
+        '▀' => Some(0xDF),
+        '▄' => Some(0xDC),
+        '█' => Some(0xDB),
+        '▌' => Some(0xDD),
+        '▐' => Some(0xDE),
+        '░' => Some(0xB0),
+        '▒' => Some(0xB1),
+        '▓' => Some(0xB2),
+
+        _ => None,
     }
 }
 
