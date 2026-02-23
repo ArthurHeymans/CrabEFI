@@ -120,6 +120,9 @@ fn build_qemu_command(config: &QemuConfig, disk_path: &Path) -> Result<Command> 
     // KVM acceleration
     if !config.disable_kvm && is_kvm_available() {
         cmd.args(["-enable-kvm", "-cpu", "host"]);
+    } else {
+        // Use `-cpu max` so TCG emulates all available features (e.g. RDRAND)
+        cmd.args(["-cpu", "max"]);
     }
 
     // Debug options
@@ -520,6 +523,9 @@ fn run_qemu_with_capture(config: &QemuConfig, disk_path: &Path) -> Result<TestRe
     // KVM acceleration
     if !config.disable_kvm && is_kvm_available() {
         cmd.args(["-enable-kvm", "-cpu", "host"]);
+    } else {
+        // Use `-cpu max` so TCG emulates all available features (e.g. RDRAND)
+        cmd.args(["-cpu", "max"]);
     }
 
     cmd.args(["-d", "guest_errors"]);
