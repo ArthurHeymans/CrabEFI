@@ -481,8 +481,8 @@ fn discover_nvme_entries(menu: &mut BootMenu) {
     };
 
     // Try GPT-based discovery first
-    let had_gpt = crate::with_disk(&device_type, |disk| gpt::read_gpt_header(disk).is_ok())
-        .unwrap_or(false);
+    let had_gpt =
+        crate::with_disk(&device_type, |disk| gpt::read_gpt_header(disk).is_ok()).unwrap_or(false);
 
     if had_gpt {
         let mut name_prefix: String<32> = String::new();
@@ -564,7 +564,9 @@ fn try_el_torito_fallback(
 
         log::info!(
             "El Torito: boot image start_sector={}, sector_count={}, size_bytes={}",
-            efi_image.start_sector, efi_image.sector_count, efi_image.size_bytes
+            efi_image.start_sector,
+            efi_image.sector_count,
+            efi_image.size_bytes
         );
 
         // Create a synthetic partition for the El Torito boot image
@@ -738,7 +740,12 @@ fn check_bootloader_exists(disk: &mut dyn BlockDevice, partition_start: u64) -> 
     match FatFilesystem::new(disk, partition_start) {
         Ok(mut fat) => match fat.file_size(EFI_BOOT_PATH) {
             Ok(size) => {
-                log::info!("Found {} ({} bytes) at LBA {}", EFI_BOOT_PATH, size, partition_start);
+                log::info!(
+                    "Found {} ({} bytes) at LBA {}",
+                    EFI_BOOT_PATH,
+                    size,
+                    partition_start
+                );
                 size > 0
             }
             Err(e) => {
@@ -1399,79 +1406,66 @@ fn edit_cmdline(entry: &mut BootEntry, fb_console: &mut Option<FramebufferConsol
                             }
                             return EditResult::Boot;
                         }
-                        '\x08' | '\x7f' => {
-                            // Backspace
-                            if cursor_pos > 0 {
-                                // Remove character before cursor
-                                let mut new_buffer: String<512> = String::new();
-                                for (i, ch) in buffer.chars().enumerate() {
-                                    if i != cursor_pos - 1 {
-                                        let _ = new_buffer.push(ch);
-                                    }
-                                }
-                                buffer = new_buffer;
-                                cursor_pos -= 1;
-                                needs_redraw = true;
-                            }
-                        }
-                        '\x01' => {
-                            // Ctrl+A - move to beginning
-                            if cursor_pos != 0 {
-                                cursor_pos = 0;
-                                needs_redraw = true;
-                            }
-                        }
-                        '\x05' => {
-                            // Ctrl+E - move to end
-                            if cursor_pos != buffer.len() {
-                                cursor_pos = buffer.len();
-                                needs_redraw = true;
-                            }
-                        }
-                        '\x0b' => {
-                            // Ctrl+K - delete to end of line
-                            if cursor_pos < buffer.len() {
-                                let mut new_buffer: String<512> = String::new();
-                                for (i, ch) in buffer.chars().enumerate() {
-                                    if i < cursor_pos {
-                                        let _ = new_buffer.push(ch);
-                                    }
-                                }
-                                buffer = new_buffer;
-                                needs_redraw = true;
-                            }
-                        }
-                        '\x15' => {
-                            // Ctrl+U - delete to beginning of line
-                            if cursor_pos > 0 {
-                                let mut new_buffer: String<512> = String::new();
-                                for (i, ch) in buffer.chars().enumerate() {
-                                    if i >= cursor_pos {
-                                        let _ = new_buffer.push(ch);
-                                    }
-                                }
-                                buffer = new_buffer;
-                                cursor_pos = 0;
-                                needs_redraw = true;
-                            }
-                        }
-                        _ if c.is_ascii_graphic() || c == ' ' => {
-                            // Regular printable character - insert at cursor (ASCII only)
-                            if buffer.len() < 511 {
-                                let mut new_buffer: String<512> = String::new();
-                                for (i, ch) in buffer.chars().enumerate() {
-                                    if i == cursor_pos {
-                                        let _ = new_buffer.push(c);
-                                    }
+                        '\x08' | '\x7f' if cursor_pos > 0 => {
+                            // Backspace - remove character before cursor
+                            let mut new_buffer: String<512> = String::new();
+                            for (i, ch) in buffer.chars().enumerate() {
+                                if i != cursor_pos - 1 {
                                     let _ = new_buffer.push(ch);
                                 }
-                                if cursor_pos == buffer.len() {
+                            }
+                            buffer = new_buffer;
+                            cursor_pos -= 1;
+                            needs_redraw = true;
+                        }
+                        '\x01' if cursor_pos != 0 => {
+                            // Ctrl+A - move to beginning
+                            cursor_pos = 0;
+                            needs_redraw = true;
+                        }
+                        '\x05' if cursor_pos != buffer.len() => {
+                            // Ctrl+E - move to end
+                            cursor_pos = buffer.len();
+                            needs_redraw = true;
+                        }
+                        '\x0b' if cursor_pos < buffer.len() => {
+                            // Ctrl+K - delete to end of line
+                            let mut new_buffer: String<512> = String::new();
+                            for (i, ch) in buffer.chars().enumerate() {
+                                if i < cursor_pos {
+                                    let _ = new_buffer.push(ch);
+                                }
+                            }
+                            buffer = new_buffer;
+                            needs_redraw = true;
+                        }
+                        '\x15' if cursor_pos > 0 => {
+                            // Ctrl+U - delete to beginning of line
+                            let mut new_buffer: String<512> = String::new();
+                            for (i, ch) in buffer.chars().enumerate() {
+                                if i >= cursor_pos {
+                                    let _ = new_buffer.push(ch);
+                                }
+                            }
+                            buffer = new_buffer;
+                            cursor_pos = 0;
+                            needs_redraw = true;
+                        }
+                        _ if (c.is_ascii_graphic() || c == ' ') && buffer.len() < 511 => {
+                            // Regular printable character - insert at cursor (ASCII only)
+                            let mut new_buffer: String<512> = String::new();
+                            for (i, ch) in buffer.chars().enumerate() {
+                                if i == cursor_pos {
                                     let _ = new_buffer.push(c);
                                 }
-                                buffer = new_buffer;
-                                cursor_pos += 1;
-                                needs_redraw = true;
+                                let _ = new_buffer.push(ch);
                             }
+                            if cursor_pos == buffer.len() {
+                                let _ = new_buffer.push(c);
+                            }
+                            buffer = new_buffer;
+                            cursor_pos += 1;
+                            needs_redraw = true;
                         }
                         _ => {}
                     }

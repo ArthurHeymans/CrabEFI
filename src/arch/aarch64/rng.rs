@@ -104,11 +104,7 @@ fn smccc_trng_rnd64() -> Option<u64> {
         );
     }
     // SUCCESS = 0
-    if ret as i64 == 0 {
-        Some(val)
-    } else {
-        None
-    }
+    if ret as i64 == 0 { Some(val) } else { None }
 }
 
 /// Initialize RNG support

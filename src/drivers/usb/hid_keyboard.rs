@@ -562,13 +562,8 @@ impl UsbHidKeyboard {
                     return Some(SCAN_LEFT << 8);
                 }
             }
-            0x5D => {
-                if self.num_lock {
-                    b'5'
-                } else {
-                    return None;
-                }
-            }
+            0x5D if self.num_lock => b'5',
+            0x5D => return None,
             0x5E => {
                 if self.num_lock {
                     b'6'

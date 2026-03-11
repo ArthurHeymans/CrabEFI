@@ -71,7 +71,9 @@ pub trait PciAccess {
 // ============================================================================
 
 /// PCI configuration space ports (legacy CAM)
+#[cfg(target_arch = "x86_64")]
 const PCI_CONFIG_ADDRESS: u16 = 0xCF8;
+#[cfg(target_arch = "x86_64")]
 const PCI_CONFIG_DATA: u16 = 0xCFC;
 
 /// Legacy I/O port-based PCI Configuration Access Mechanism

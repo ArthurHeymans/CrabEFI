@@ -9,6 +9,8 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
 use std::process::Command;
 
+use crate::Arch;
+
 /// Disk geometry constants for a 64MB disk
 const DISK_SIZE: u64 = 64 * 1024 * 1024;
 const SECTOR_SIZE: u64 = 512;
@@ -36,8 +38,9 @@ const ESP_TYPE_GUID: [u8; 16] = [
 ///
 /// # Arguments
 /// * `output` - Path for the output disk image
-/// * `efi_app` - Optional path to an EFI application to install as BOOTX64.EFI
-pub fn create_test_disk(output: &str, efi_app: Option<&str>) -> Result<()> {
+/// * `efi_app` - Optional path to an EFI application to install as boot application
+/// * `arch` - Target architecture (determines EFI boot path name)
+pub fn create_test_disk(output: &str, efi_app: Option<&str>, arch: Arch) -> Result<()> {
     println!("Creating test disk: {}", output);
 
     // Create empty disk image
@@ -63,7 +66,7 @@ pub fn create_test_disk(output: &str, efi_app: Option<&str>) -> Result<()> {
 
     // If we have an EFI app, copy it
     if let Some(app_path) = efi_app {
-        install_efi_app(output, app_path)?;
+        install_efi_app(output, app_path, arch)?;
     }
 
     println!("Created: {}", output);
@@ -305,8 +308,16 @@ fn create_fat32_in_partition(disk_path: &str, start_sector: u64, end_sector: u64
     Ok(())
 }
 
+/// Get the EFI boot filename for the given architecture
+fn efi_boot_filename(arch: Arch) -> &'static str {
+    match arch {
+        Arch::X86_64 => "BOOTX64.EFI",
+        Arch::Aarch64 => "BOOTAA64.EFI",
+    }
+}
+
 /// Install EFI application to the disk
-fn install_efi_app(disk_path: &str, app_path: &str) -> Result<()> {
+fn install_efi_app(disk_path: &str, app_path: &str, arch: Arch) -> Result<()> {
     if !Path::new(app_path).exists() {
         bail!("EFI application not found: {}", app_path);
     }
@@ -324,13 +335,15 @@ fn install_efi_app(disk_path: &str, app_path: &str) -> Result<()> {
         .status();
 
     // Copy EFI application
+    let boot_filename = efi_boot_filename(arch);
+    let dest = format!("::/EFI/BOOT/{}", boot_filename);
     let status = Command::new("mcopy")
-        .args(["-i", &disk_with_offset, app_path, "::/EFI/BOOT/BOOTX64.EFI"])
+        .args(["-i", &disk_with_offset, app_path, &dest])
         .status()
         .context("Failed to run mcopy")?;
 
     if status.success() {
-        println!("Installed {} as BOOTX64.EFI", app_path);
+        println!("Installed {} as {}", app_path, boot_filename);
     } else {
         bail!("Failed to install EFI application");
     }
@@ -341,16 +354,16 @@ fn install_efi_app(disk_path: &str, app_path: &str) -> Result<()> {
 /// Install EFI application and populate \EFI\Linux with LFN test files.
 ///
 /// Creates a disk image with:
-///   - \EFI\BOOT\BOOTX64.EFI  (the test app)
+///   - \EFI\BOOT\<BOOT_EFI>  (the test app, arch-dependent name)
 ///   - \EFI\Linux\nixos-kernel-6.12.9-linux-x86_64-5kg0k0b55f3mz75b7bl2fvkl0cqkzmam.efi  (71 chars)
 ///   - \EFI\Linux\nixos-6.6.0.efi  (short name)
 ///
 /// The long filename is specifically chosen to exceed 64 characters, which
-/// previously triggered a truncation bug in the FAT LFN → heapless::String<64>
+/// previously triggered a truncation bug in the FAT LFN -> heapless::String<64>
 /// conversion.
-pub fn create_directory_test_disk(output: &str, efi_app: &str) -> Result<()> {
-    // Start with a normal test disk that has the EFI app as BOOTX64.EFI
-    create_test_disk(output, Some(efi_app))?;
+pub fn create_directory_test_disk(output: &str, efi_app: &str, arch: Arch) -> Result<()> {
+    // Start with a normal test disk that has the EFI app
+    create_test_disk(output, Some(efi_app), arch)?;
 
     let disk_with_offset = format!("{}@@{}", output, ESP_START_SECTOR * SECTOR_SIZE);
 
@@ -372,7 +385,7 @@ pub fn create_directory_test_disk(output: &str, efi_app: &str) -> Result<()> {
     }
     let fake_path = fake_efi.path().to_string_lossy().to_string();
 
-    // Long filename: 71 characters – exceeds old 64-byte heapless::String limit
+    // Long filename: 71 characters - exceeds old 64-byte heapless::String limit
     let long_name = "nixos-kernel-6.12.9-linux-x86_64-5kg0k0b55f3mz75b7bl2fvkl0cqkzmam.efi";
     let long_dest = format!("::/EFI/Linux/{}", long_name);
     let status = Command::new("mcopy")

@@ -4,7 +4,7 @@
 //! On AArch64, cache maintenance is done via system instructions
 //! operating on virtual addresses.
 
-use core::sync::atomic::{fence, Ordering};
+use core::sync::atomic::{Ordering, fence};
 
 /// Cache line size (typically 64 bytes on most AArch64 implementations)
 pub const CACHE_LINE_SIZE: usize = 64;

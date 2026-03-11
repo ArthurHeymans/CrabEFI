@@ -49,55 +49,52 @@ pub fn cleanup() {
 }
 
 /// Check if any keyboard has a key available
+#[cfg(target_arch = "x86_64")]
 pub fn has_key() -> bool {
-    #[cfg(target_arch = "x86_64")]
-    {
-        // The PS/2 has_key() already polls USB internally
-        return crate::drivers::keyboard::has_key();
-    }
+    // The PS/2 has_key() already polls USB internally
+    crate::drivers::keyboard::has_key()
+}
 
-    #[cfg(not(target_arch = "x86_64"))]
-    {
-        crate::drivers::usb::poll_keyboards();
-        crate::drivers::usb::keyboard_has_key()
-    }
+/// Check if any keyboard has a key available
+#[cfg(not(target_arch = "x86_64"))]
+pub fn has_key() -> bool {
+    crate::drivers::usb::poll_keyboards();
+    crate::drivers::usb::keyboard_has_key()
 }
 
 /// Try to read a key from any keyboard
+#[cfg(target_arch = "x86_64")]
 pub fn try_read_key() -> Option<(u16, u16)> {
-    #[cfg(target_arch = "x86_64")]
-    {
-        // The PS/2 try_read_key() already tries USB first
-        return crate::drivers::keyboard::try_read_key();
-    }
+    // The PS/2 try_read_key() already tries USB first
+    crate::drivers::keyboard::try_read_key()
+}
 
-    #[cfg(not(target_arch = "x86_64"))]
-    {
-        crate::drivers::usb::poll_keyboards();
-        crate::drivers::usb::keyboard_get_key()
-    }
+/// Try to read a key from any keyboard
+#[cfg(not(target_arch = "x86_64"))]
+pub fn try_read_key() -> Option<(u16, u16)> {
+    crate::drivers::usb::poll_keyboards();
+    crate::drivers::usb::keyboard_get_key()
 }
 
 /// Get EFI key state from all keyboards
+#[cfg(target_arch = "x86_64")]
 pub fn get_efi_key_state() -> (u32, u8) {
-    #[cfg(target_arch = "x86_64")]
-    {
-        // The PS/2 get_efi_key_state() already combines USB state
-        return crate::drivers::keyboard::get_efi_key_state();
-    }
+    // The PS/2 get_efi_key_state() already combines USB state
+    crate::drivers::keyboard::get_efi_key_state()
+}
 
-    #[cfg(not(target_arch = "x86_64"))]
-    {
-        use efi_shift_state::SHIFT_STATE_VALID;
-        use efi_toggle_state::TOGGLE_STATE_VALID;
+/// Get EFI key state from all keyboards
+#[cfg(not(target_arch = "x86_64"))]
+pub fn get_efi_key_state() -> (u32, u8) {
+    use efi_shift_state::SHIFT_STATE_VALID;
+    use efi_toggle_state::TOGGLE_STATE_VALID;
 
-        let mut shift_state = SHIFT_STATE_VALID;
-        let mut toggle_state = TOGGLE_STATE_VALID;
+    let mut shift_state = SHIFT_STATE_VALID;
+    let mut toggle_state = TOGGLE_STATE_VALID;
 
-        let usb_state = crate::drivers::usb::keyboard_get_efi_state();
-        shift_state |= usb_state.0;
-        toggle_state |= usb_state.1;
+    let usb_state = crate::drivers::usb::keyboard_get_efi_state();
+    shift_state |= usb_state.0;
+    toggle_state |= usb_state.1;
 
-        (shift_state, toggle_state)
-    }
+    (shift_state, toggle_state)
 }
