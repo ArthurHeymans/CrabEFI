@@ -101,7 +101,8 @@ impl PciAddress {
         }
     }
 
-    /// Calculate legacy CAM address for a register
+    /// Calculate legacy CAM address for a register (x86 I/O port config access)
+    #[cfg(target_arch = "x86_64")]
     pub(crate) fn cam_address(&self, offset: u8) -> u32 {
         let mut addr = 1u32 << 31; // Enable bit
         addr |= (self.bus as u32) << 16;

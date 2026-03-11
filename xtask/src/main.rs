@@ -33,6 +33,13 @@ fn project_root() -> &'static Path {
     PROJECT_DIR.get().expect("PROJECT_DIR not initialized")
 }
 
+/// Target architecture for CrabEFI
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum Arch {
+    X86_64,
+    Aarch64,
+}
+
 #[derive(Parser)]
 #[command(name = "crabefi", bin_name = "crabefi")]
 #[command(about = "CrabEFI build and test automation")]
@@ -40,6 +47,10 @@ struct Cli {
     /// Path to the CrabEFI project directory (set automatically by ./crabefi wrapper)
     #[arg(long, global = true, hide = true)]
     project_dir: Option<PathBuf>,
+
+    /// Target architecture
+    #[arg(long, global = true, value_enum, default_value_t = Arch::X86_64)]
+    arch: Arch,
 
     #[command(subcommand)]
     command: Commands,
@@ -156,8 +167,10 @@ fn main() -> Result<()> {
         .set(project_dir)
         .expect("PROJECT_DIR already initialized");
 
+    let arch = cli.arch;
+
     match cli.command {
-        Commands::Build { release } => cmd_build(release),
+        Commands::Build { release } => cmd_build(release, arch),
         Commands::Run {
             coreboot_rom,
             ahci,
@@ -176,6 +189,7 @@ fn main() -> Result<()> {
             disable_kvm,
             app,
             disk,
+            arch,
         ),
         Commands::Test {
             coreboot_rom,
@@ -185,15 +199,26 @@ fn main() -> Result<()> {
             sdhci,
             disable_kvm,
             timeout,
-        } => cmd_test(coreboot_rom, &app, ahci, nvme, sdhci, disable_kvm, timeout),
-        Commands::BuildTestApp { name } => cmd_build_test_app(&name),
+        } => cmd_test(
+            coreboot_rom,
+            &app,
+            ahci,
+            nvme,
+            sdhci,
+            disable_kvm,
+            timeout,
+            arch,
+        ),
+        Commands::BuildTestApp { name } => cmd_build_test_app(&name, arch),
         Commands::ListTestApps => cmd_list_test_apps(),
-        Commands::CreateDisk { output, efi_app } => cmd_create_disk(&output, efi_app.as_deref()),
+        Commands::CreateDisk { output, efi_app } => {
+            cmd_create_disk(&output, efi_app.as_deref(), arch)
+        }
     }
 }
 
-fn cmd_build(release: bool) -> Result<()> {
-    println!("Building CrabEFI...");
+fn cmd_build(release: bool, arch: Arch) -> Result<()> {
+    println!("Building CrabEFI ({:?})...", arch);
 
     let project_root = project_root();
 
@@ -202,6 +227,15 @@ fn cmd_build(release: bool) -> Result<()> {
     if release {
         cmd.arg("--release");
     }
+
+    match arch {
+        Arch::X86_64 => {}
+        Arch::Aarch64 => {
+            cmd.arg("--target").arg("aarch64-unknown-none");
+            cmd.arg("--config").arg(".cargo/config-aarch64.toml");
+        }
+    }
+
     cmd.current_dir(project_root);
     // Remove RUSTUP_TOOLCHAIN to let CrabEFI use its own rust-toolchain.toml
     cmd.env_remove("RUSTUP_TOOLCHAIN");
@@ -212,7 +246,11 @@ fn cmd_build(release: bool) -> Result<()> {
     }
 
     let mode = if release { "release" } else { "debug" };
-    println!("Built: target/x86_64-unknown-none/{}/crabefi", mode);
+    let target_triple = match arch {
+        Arch::X86_64 => "x86_64-unknown-none",
+        Arch::Aarch64 => "aarch64-unknown-none",
+    };
+    println!("Built: target/{}/{}/crabefi", target_triple, mode);
     Ok(())
 }
 
@@ -225,6 +263,7 @@ fn cmd_run(
     disable_kvm: bool,
     app: Option<String>,
     disk: Option<String>,
+    arch: Arch,
 ) -> Result<()> {
     let storage = if ahci {
         qemu::StorageType::Ahci
@@ -240,24 +279,28 @@ fn cmd_run(
     let temp_dir = tempfile::tempdir()?;
 
     // Prepare the ROM
-    let rom_path = if let Some(rom) = coreboot_rom {
-        rom
+    let firmware = if let Some(rom) = coreboot_rom {
+        rom::PreparedFirmware {
+            coreboot_rom: PathBuf::from(rom),
+            tfa_flash: None,
+        }
     } else {
         // Build CrabEFI first
-        cmd_build(true)?;
+        cmd_build(true, arch)?;
 
         // Prepare ROM with CrabEFI payload
-        let crabefi_elf = rom::get_crabefi_elf();
-        let prepared_rom = rom::prepare_rom(&crabefi_elf, temp_dir.path())?;
-        prepared_rom.to_string_lossy().to_string()
+        let crabefi_elf = rom::get_crabefi_elf(arch);
+        rom::prepare_rom(&crabefi_elf, temp_dir.path(), arch)?
     };
 
     let config = qemu::QemuConfig {
-        coreboot_rom: rom_path,
+        coreboot_rom: firmware.coreboot_rom.to_string_lossy().to_string(),
+        tfa_flash: firmware.tfa_flash.map(|p| p.to_string_lossy().to_string()),
         storage,
         headless,
         disable_kvm,
         timeout_secs: None,
+        arch,
     };
 
     // If a disk is specified, use it directly
@@ -269,14 +312,14 @@ fn cmd_run(
     if let Some(app_name) = app {
         // Build the app
         println!("Building test app: {}", app_name);
-        cmd_build_test_app(&app_name)?;
+        cmd_build_test_app(&app_name, arch)?;
 
         // Find the EFI file
-        let efi_path = find_test_app_efi(&app_name)?;
+        let efi_path = find_test_app_efi(&app_name, arch)?;
 
         // Create a temporary disk with this app
         let disk_path = temp_dir.path().join("test.img");
-        disk::create_test_disk(disk_path.to_string_lossy().as_ref(), Some(&efi_path))?;
+        disk::create_test_disk(disk_path.to_string_lossy().as_ref(), Some(&efi_path), arch)?;
 
         return qemu::run_qemu(&config, Some(&disk_path));
     }
@@ -293,6 +336,7 @@ fn cmd_test(
     sdhci: bool,
     disable_kvm: bool,
     timeout: u64,
+    arch: Arch,
 ) -> Result<()> {
     let storage = if ahci {
         qemu::StorageType::Ahci
@@ -308,46 +352,50 @@ fn cmd_test(
     let temp_dir = tempfile::tempdir()?;
 
     // Prepare the ROM
-    let rom_path = if let Some(rom) = coreboot_rom {
-        rom
+    let firmware = if let Some(rom) = coreboot_rom {
+        rom::PreparedFirmware {
+            coreboot_rom: PathBuf::from(rom),
+            tfa_flash: None,
+        }
     } else {
         // Build CrabEFI first
-        cmd_build(true)?;
+        cmd_build(true, arch)?;
 
         // Prepare ROM with CrabEFI payload
-        let crabefi_elf = rom::get_crabefi_elf();
-        let prepared_rom = rom::prepare_rom(&crabefi_elf, temp_dir.path())?;
-        prepared_rom.to_string_lossy().to_string()
+        let crabefi_elf = rom::get_crabefi_elf(arch);
+        rom::prepare_rom(&crabefi_elf, temp_dir.path(), arch)?
     };
 
     let config = qemu::QemuConfig {
-        coreboot_rom: rom_path,
+        coreboot_rom: firmware.coreboot_rom.to_string_lossy().to_string(),
+        tfa_flash: firmware.tfa_flash.map(|p| p.to_string_lossy().to_string()),
         storage,
         headless: true,
         disable_kvm,
         timeout_secs: Some(timeout),
+        arch,
     };
 
     // Build the test app
     println!("Building test app: {}", app);
-    cmd_build_test_app(app)?;
+    cmd_build_test_app(app, arch)?;
 
     // Find the EFI file
-    let efi_path = find_test_app_efi(app)?;
+    let efi_path = find_test_app_efi(app, arch)?;
 
     // Create test disk (directory-test needs LFN files on disk)
     let disk_path = temp_dir.path().join("test.img");
     if app == "directory-test" {
-        disk::create_directory_test_disk(disk_path.to_string_lossy().as_ref(), &efi_path)?;
+        disk::create_directory_test_disk(disk_path.to_string_lossy().as_ref(), &efi_path, arch)?;
     } else {
-        disk::create_test_disk(disk_path.to_string_lossy().as_ref(), Some(&efi_path))?;
+        disk::create_test_disk(disk_path.to_string_lossy().as_ref(), Some(&efi_path), arch)?;
     }
 
     // Run tests
     qemu::run_tests(&config, &disk_path, app)
 }
 
-fn cmd_build_test_app(name: &str) -> Result<()> {
+fn cmd_build_test_app(name: &str, arch: Arch) -> Result<()> {
     let app_dir = project_root().join("test-apps").join(name);
 
     if !app_dir.exists() {
@@ -357,21 +405,29 @@ fn cmd_build_test_app(name: &str) -> Result<()> {
         );
     }
 
-    println!("Building test app: {}", name);
+    println!("Building test app: {} ({:?})", name, arch);
 
-    let status = std::process::Command::new("cargo")
-        .arg("build")
-        .arg("--release")
-        .current_dir(&app_dir)
+    let mut cmd = std::process::Command::new("cargo");
+    cmd.arg("build").arg("--release");
+
+    match arch {
+        Arch::X86_64 => {}
+        Arch::Aarch64 => {
+            cmd.arg("--target").arg("aarch64-unknown-uefi");
+        }
+    }
+
+    cmd.current_dir(&app_dir)
         // Remove RUSTUP_TOOLCHAIN to let the test app use its own rust-toolchain.toml
-        .env_remove("RUSTUP_TOOLCHAIN")
-        .status()?;
+        .env_remove("RUSTUP_TOOLCHAIN");
+
+    let status = cmd.status()?;
 
     if !status.success() {
         anyhow::bail!("Build failed");
     }
 
-    let efi_path = find_test_app_efi(name)?;
+    let efi_path = find_test_app_efi(name, arch)?;
     println!("Built: {}", efi_path);
     Ok(())
 }
@@ -402,14 +458,18 @@ fn cmd_list_test_apps() -> Result<()> {
     Ok(())
 }
 
-fn cmd_create_disk(output: &str, efi_app: Option<&str>) -> Result<()> {
-    disk::create_test_disk(output, efi_app)
+fn cmd_create_disk(output: &str, efi_app: Option<&str>, arch: Arch) -> Result<()> {
+    disk::create_test_disk(output, efi_app, arch)
 }
 
 /// Find the .efi file for a test app
-fn find_test_app_efi(name: &str) -> Result<String> {
+fn find_test_app_efi(name: &str, arch: Arch) -> Result<String> {
     let app_dir = project_root().join("test-apps").join(name);
-    let target_dir = app_dir.join("target/x86_64-unknown-uefi/release");
+    let target_triple = match arch {
+        Arch::X86_64 => "x86_64-unknown-uefi",
+        Arch::Aarch64 => "aarch64-unknown-uefi",
+    };
+    let target_dir = app_dir.join(format!("target/{}/release", target_triple));
 
     if !target_dir.exists() {
         anyhow::bail!("Test app not built. Run: ./x build-test-app {}", name);

@@ -27,8 +27,10 @@ pub const PE32_PLUS_MAGIC: u16 = 0x020B;
 pub const PE32_MAGIC: u16 = 0x010B;
 
 /// Machine type: AMD64
+#[cfg(target_arch = "x86_64")]
 const IMAGE_FILE_MACHINE_AMD64: u16 = 0x8664;
 /// Machine type: AArch64
+#[cfg(target_arch = "aarch64")]
 const IMAGE_FILE_MACHINE_AA64: u16 = 0xAA64;
 
 /// Machine type for the current target architecture

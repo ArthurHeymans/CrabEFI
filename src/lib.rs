@@ -4,7 +4,6 @@
 //! that can boot Linux via shim+GRUB2 or systemd-boot on real laptop hardware.
 
 #![no_std]
-#![cfg_attr(target_arch = "x86_64", feature(abi_x86_interrupt))]
 #![feature(never_type)] // Used for -> ! return type in payload chainloading
 #![allow(unsafe_op_in_unsafe_fn)]
 // Allow common firmware code patterns

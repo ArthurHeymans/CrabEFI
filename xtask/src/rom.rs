@@ -6,15 +6,41 @@ use anyhow::{bail, Context, Result};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use crate::project_root;
+use crate::{project_root, Arch};
+
+/// Prepared firmware files ready for QEMU
+pub struct PreparedFirmware {
+    /// Path to the main coreboot ROM (with CrabEFI payload)
+    pub coreboot_rom: PathBuf,
+    /// Path to TF-A flash image (aarch64 only, used as pflash0)
+    pub tfa_flash: Option<PathBuf>,
+}
 
 /// Prepare a coreboot ROM with CrabEFI as the payload
 ///
 /// This function:
-/// 1. Decompresses the base ROM from firmware/coreboot-qemu-q35.rom.zst
+/// 1. Decompresses the base ROM from firmware/
 /// 2. Uses cbfstool to add the CrabEFI payload
-/// 3. Returns the path to the prepared ROM
-pub fn prepare_rom(crabefi_elf: &Path, output_dir: &Path) -> Result<PathBuf> {
+/// 3. Returns the prepared firmware paths
+///
+/// For aarch64 (SBSA), also decompresses the TF-A flash image.
+pub fn prepare_rom(crabefi_elf: &Path, output_dir: &Path, arch: Arch) -> Result<PreparedFirmware> {
+    if !crabefi_elf.exists() {
+        bail!(
+            "CrabEFI ELF not found: {}\n\
+            Build with: ./x build",
+            crabefi_elf.display()
+        );
+    }
+
+    match arch {
+        Arch::X86_64 => prepare_rom_x86_64(crabefi_elf, output_dir),
+        Arch::Aarch64 => prepare_rom_aarch64(crabefi_elf, output_dir),
+    }
+}
+
+/// Prepare x86_64 (Q35) firmware
+fn prepare_rom_x86_64(crabefi_elf: &Path, output_dir: &Path) -> Result<PreparedFirmware> {
     let compressed_rom = project_root().join("firmware/coreboot-qemu-q35.rom.zst");
 
     if !compressed_rom.exists() {
@@ -22,14 +48,6 @@ pub fn prepare_rom(crabefi_elf: &Path, output_dir: &Path) -> Result<PathBuf> {
             "Base coreboot ROM not found: {}\n\
             Please ensure firmware/coreboot-qemu-q35.rom.zst exists",
             compressed_rom.display()
-        );
-    }
-
-    if !crabefi_elf.exists() {
-        bail!(
-            "CrabEFI ELF not found: {}\n\
-            Build with: ./x build",
-            crabefi_elf.display()
         );
     }
 
@@ -49,16 +67,91 @@ pub fn prepare_rom(crabefi_elf: &Path, output_dir: &Path) -> Result<PathBuf> {
         bail!("Failed to decompress ROM");
     }
 
+    inject_crabefi_payload(&output_rom, crabefi_elf)?;
+
+    println!("ROM prepared: {}", output_rom.display());
+    Ok(PreparedFirmware {
+        coreboot_rom: output_rom,
+        tfa_flash: None,
+    })
+}
+
+/// Prepare aarch64 (SBSA) firmware — coreboot ROM + TF-A flash
+fn prepare_rom_aarch64(crabefi_elf: &Path, output_dir: &Path) -> Result<PreparedFirmware> {
+    let compressed_tfa = project_root().join("firmware/tfa-sbsa.fd.zst");
+    let compressed_rom = project_root().join("firmware/coreboot-qemu-sbsa.rom.zst");
+
+    if !compressed_tfa.exists() {
+        bail!(
+            "TF-A flash not found: {}\n\
+            Please ensure firmware/tfa-sbsa.fd.zst exists",
+            compressed_tfa.display()
+        );
+    }
+
+    if !compressed_rom.exists() {
+        bail!(
+            "Base coreboot SBSA ROM not found: {}\n\
+            Please ensure firmware/coreboot-qemu-sbsa.rom.zst exists",
+            compressed_rom.display()
+        );
+    }
+
+    let output_tfa = output_dir.join("tfa-sbsa.fd");
+    let output_rom = output_dir.join("coreboot-sbsa.rom");
+
+    // Decompress TF-A flash
+    println!("Decompressing TF-A flash...");
+    let status = Command::new("zstd")
+        .args(["-d", "-f"])
+        .arg(&compressed_tfa)
+        .arg("-o")
+        .arg(&output_tfa)
+        .status()
+        .context("Failed to run zstd. Is it installed? (nix develop or nix-shell -p zstd)")?;
+
+    if !status.success() {
+        bail!("Failed to decompress TF-A flash");
+    }
+
+    // Decompress coreboot SBSA ROM
+    println!("Decompressing coreboot SBSA ROM...");
+    let status = Command::new("zstd")
+        .args(["-d", "-f"])
+        .arg(&compressed_rom)
+        .arg("-o")
+        .arg(&output_rom)
+        .status()
+        .context("Failed to run zstd")?;
+
+    if !status.success() {
+        bail!("Failed to decompress coreboot SBSA ROM");
+    }
+
+    inject_crabefi_payload(&output_rom, crabefi_elf)?;
+
+    println!("Firmware prepared:");
+    println!("  TF-A flash: {}", output_tfa.display());
+    println!("  coreboot ROM: {}", output_rom.display());
+
+    Ok(PreparedFirmware {
+        coreboot_rom: output_rom,
+        tfa_flash: Some(output_tfa),
+    })
+}
+
+/// Inject CrabEFI as the coreboot payload using cbfstool
+fn inject_crabefi_payload(rom_path: &Path, crabefi_elf: &Path) -> Result<()> {
     // Remove existing payload if any
     println!("Preparing ROM with CrabEFI payload...");
     let _ = Command::new("cbfstool")
-        .arg(&output_rom)
+        .arg(rom_path)
         .args(["remove", "-n", "fallback/payload"])
         .status();
 
     // Add CrabEFI as payload
     let status = Command::new("cbfstool")
-        .arg(&output_rom)
+        .arg(rom_path)
         .args(["add-payload", "-f"])
         .arg(crabefi_elf)
         .args(["-n", "fallback/payload", "-c", "lzma"])
@@ -71,11 +164,14 @@ pub fn prepare_rom(crabefi_elf: &Path, output_dir: &Path) -> Result<PathBuf> {
         bail!("Failed to add CrabEFI payload to ROM");
     }
 
-    println!("ROM prepared: {}", output_rom.display());
-    Ok(output_rom)
+    Ok(())
 }
 
 /// Get the path to the CrabEFI ELF
-pub fn get_crabefi_elf() -> PathBuf {
-    project_root().join("target/x86_64-unknown-none/release/crabefi")
+pub fn get_crabefi_elf(arch: Arch) -> PathBuf {
+    let target_triple = match arch {
+        Arch::X86_64 => "x86_64-unknown-none",
+        Arch::Aarch64 => "aarch64-unknown-none",
+    };
+    project_root().join(format!("target/{}/release/crabefi", target_triple))
 }

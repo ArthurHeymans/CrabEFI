@@ -253,8 +253,7 @@ static mut VIRTUAL_MAP_ENTRY_COUNT: usize = 0;
 /// Uses `AtomicBool` instead of `static mut` because this flag is read from
 /// runtime service calls after ExitBootServices, potentially from OS context.
 /// The actual write is a one-shot during SetVirtualAddressMap.
-static VIRTUAL_MODE: core::sync::atomic::AtomicBool =
-    core::sync::atomic::AtomicBool::new(false);
+static VIRTUAL_MODE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
 extern "efiapi" fn set_virtual_address_map(
     memory_map_size: usize,
@@ -1203,15 +1202,13 @@ extern "efiapi" fn set_variable(
 /// Handle Secure Boot state changes when a key database variable is updated
 fn handle_secure_boot_variable_update(var_type: auth::SecureBootVariable) {
     match var_type {
-        auth::SecureBootVariable::PK => {
+        auth::SecureBootVariable::PK if auth::is_setup_mode() => {
             // PK enrollment transitions from Setup Mode to User Mode
-            if auth::is_setup_mode() {
-                auth::enter_user_mode();
-                auth::enable_secure_boot();
-            }
+            auth::enter_user_mode();
+            auth::enable_secure_boot();
         }
         _ => {
-            // Other variables don't change Secure Boot state
+            // Other variables (or PK when not in setup mode) don't change state
         }
     }
 }

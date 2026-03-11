@@ -498,7 +498,12 @@ fn add_platform_mmio_regions() {
     let add_mmio = |base: u64, size: u64, name: &str| {
         let pages = size.div_ceil(PAGE_SIZE);
         match allocator::force_add_region(base, pages, MemoryType::MemoryMappedIo) {
-            Ok(()) => log::info!("MMIO region added: {} at {:#x} ({} pages)", name, base, pages),
+            Ok(()) => log::info!(
+                "MMIO region added: {} at {:#x} ({} pages)",
+                name,
+                base,
+                pages
+            ),
             Err(e) => log::error!("Failed to add MMIO region {}: {:?}", name, e),
         }
     };
@@ -509,7 +514,11 @@ fn add_platform_mmio_regions() {
 
     // Peripherals block: UART, RTC, GPIO, secure UART, SMMU, AHCI, EHCI
     // (0x60000000 - 0x60200000)
-    add_mmio(0x6000_0000, 0x20_0000, "Peripherals (UART/RTC/GPIO/AHCI/EHCI)");
+    add_mmio(
+        0x6000_0000,
+        0x20_0000,
+        "Peripherals (UART/RTC/GPIO/AHCI/EHCI)",
+    );
 
     // PCIe PIO window (0x7FFF0000 - 0x80000000)
     add_mmio(0x7FFF_0000, 0x1_0000, "PCIe PIO");
