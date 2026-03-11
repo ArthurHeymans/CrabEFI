@@ -156,6 +156,10 @@ fn build_qemu_command_aarch64(config: &QemuConfig, disk_path: &Path) -> Result<C
     // Display and serial settings
     // SBSA uses PL011 UART — -nographic sends serial to stdio
     cmd.arg("-nographic");
+    // SBSA machine includes bochs-display which needs a VGA BIOS ROM.
+    // Suppress loading it — we're headless and the ROM may not be installed
+    // (qemu-system-arm on Ubuntu doesn't ship x86 VGA ROMs).
+    cmd.args(["-global", "bochs-display.romfile="]);
 
     // Storage configuration
     add_storage_args_aarch64(&mut cmd, config, disk_path);
@@ -680,6 +684,8 @@ fn run_qemu_with_capture_aarch64(
 
     // Serial: -nographic for PL011 to stdio
     cmd.arg("-nographic");
+    // Suppress bochs-display VGA BIOS ROM (not shipped with qemu-system-arm)
+    cmd.args(["-global", "bochs-display.romfile="]);
 
     // Storage configuration
     add_storage_args_aarch64(&mut cmd, config, disk_path);
