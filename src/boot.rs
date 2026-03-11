@@ -397,7 +397,7 @@ pub fn try_boot_from_esp(
             );
 
             // Look for EFI bootloader
-            let boot_path = "EFI\\BOOT\\BOOTX64.EFI";
+            let boot_path = crate::menu::EFI_BOOT_PATH;
             match fat.file_size(boot_path) {
                 Ok(size) => {
                     log::info!("Found bootloader: {} ({} bytes)", boot_path, size);

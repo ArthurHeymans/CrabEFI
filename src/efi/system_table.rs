@@ -434,7 +434,7 @@ struct AcpiRegion {
 
 /// Collect all ACPI table regions, merge overlapping ones, then mark them
 fn mark_acpi_tables_memory(rsdp_addr: u64) {
-    use super::allocator::{PAGE_SIZE, mark_as_acpi_reclaim};
+    use super::allocator::{mark_as_acpi_reclaim, PAGE_SIZE};
 
     log::info!("Marking ACPI table memory regions as AcpiReclaimMemory...");
 
@@ -521,9 +521,9 @@ fn mark_acpi_tables_memory(rsdp_addr: u64) {
     let entries_base = root_table_addr + header_size as u64;
     for i in 0..num_entries {
         let table_addr = if is_xsdt {
-            unsafe { *((entries_base + (i * 8) as u64) as *const u64) }
+            unsafe { ((entries_base + (i * 8) as u64) as *const u64).read_unaligned() }
         } else {
-            unsafe { *((entries_base + (i * 4) as u64) as *const u32) as u64 }
+            unsafe { ((entries_base + (i * 4) as u64) as *const u32).read_unaligned() as u64 }
         };
 
         if table_addr == 0 {
@@ -549,16 +549,16 @@ fn mark_acpi_tables_memory(rsdp_addr: u64) {
         if table_sig == b"FACP" {
             let fadt_ptr = table_addr as *const u8;
 
-            // Get DSDT address
+            // Get DSDT address (use read_unaligned: FADT field offsets are not naturally aligned)
             let dsdt_addr = if table_length >= 148 {
-                let x_dsdt = unsafe { *(fadt_ptr.add(140) as *const u64) };
+                let x_dsdt = unsafe { (fadt_ptr.add(140) as *const u64).read_unaligned() };
                 if x_dsdt != 0 {
                     x_dsdt
                 } else {
-                    unsafe { *(fadt_ptr.add(40) as *const u32) as u64 }
+                    unsafe { (fadt_ptr.add(40) as *const u32).read_unaligned() as u64 }
                 }
             } else {
-                unsafe { *(fadt_ptr.add(40) as *const u32) as u64 }
+                unsafe { (fadt_ptr.add(40) as *const u32).read_unaligned() as u64 }
             };
 
             if dsdt_addr != 0 {
@@ -569,21 +569,21 @@ fn mark_acpi_tables_memory(rsdp_addr: u64) {
                 add_region(dsdt_addr, dsdt_length as u64);
             }
 
-            // Get FACS address
+            // Get FACS address (use read_unaligned: FADT field offsets are not naturally aligned)
             let facs_addr = if table_length >= 140 {
-                let x_facs = unsafe { *(fadt_ptr.add(132) as *const u64) };
+                let x_facs = unsafe { (fadt_ptr.add(132) as *const u64).read_unaligned() };
                 if x_facs != 0 {
                     x_facs
                 } else {
-                    unsafe { *(fadt_ptr.add(36) as *const u32) as u64 }
+                    unsafe { (fadt_ptr.add(36) as *const u32).read_unaligned() as u64 }
                 }
             } else {
-                unsafe { *(fadt_ptr.add(36) as *const u32) as u64 }
+                unsafe { (fadt_ptr.add(36) as *const u32).read_unaligned() as u64 }
             };
 
             if facs_addr != 0 {
                 // FACS has length at offset 4
-                let facs_len = unsafe { *((facs_addr + 4) as *const u32) };
+                let facs_len = unsafe { ((facs_addr + 4) as *const u32).read_unaligned() };
                 log::debug!("    FACS at {:#x}, length {} bytes", facs_addr, facs_len);
                 add_region(facs_addr, facs_len as u64);
             }
@@ -654,7 +654,7 @@ fn mark_acpi_tables_memory(rsdp_addr: u64) {
 
 /// Install ACPI tables from coreboot
 pub fn install_acpi_tables(rsdp: u64) {
-    use super::allocator::{MemoryType, get_memory_type_at};
+    use super::allocator::{get_memory_type_at, MemoryType};
 
     if rsdp == 0 {
         log::warn!("ACPI RSDP address is null, skipping ACPI table installation");
@@ -1153,7 +1153,7 @@ pub fn rebuild_memory_attributes_table_in_place() {
 ///
 /// Returns `None` if the memory map cannot be queried.
 fn count_runtime_entries() -> Option<u32> {
-    use super::allocator::{self, MemoryDescriptor, MemoryType, attributes};
+    use super::allocator::{self, attributes, MemoryDescriptor, MemoryType};
 
     let mut map_size: usize = 0;
     let mut map_key: usize = 0;
@@ -1196,7 +1196,7 @@ fn count_runtime_entries() -> Option<u32> {
 /// Writes the header and runtime descriptors with appropriate RO/XP protection
 /// attributes. Returns `(runtime_count, table_size_bytes)` on success.
 fn fill_memory_attributes_table(table_addr: u64) -> Option<(u32, usize)> {
-    use super::allocator::{self, MemoryDescriptor, MemoryType, attributes};
+    use super::allocator::{self, attributes, MemoryDescriptor, MemoryType};
 
     // Query the memory map onto a stack buffer
     let mut map_size: usize = 0;

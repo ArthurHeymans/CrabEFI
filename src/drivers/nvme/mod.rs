@@ -5,9 +5,9 @@
 
 use crate::drivers::pci::{self, PciAddress, PciDevice};
 use crate::efi;
-use crate::time::{Timeout, wait_for};
+use crate::time::{wait_for, Timeout};
 use core::ptr;
-use core::sync::atomic::{Ordering, fence};
+use core::sync::atomic::{fence, Ordering};
 use spin::Mutex;
 use tock_registers::interfaces::{ReadWriteable, Readable, Writeable};
 use tock_registers::register_bitfields;
@@ -869,10 +869,10 @@ impl NvmeController {
 
     /// Wait for I/O command completion
     fn wait_io_completion(&mut self, cid: u16) -> Result<CompletionQueueEntry, NvmeError> {
-        let timeout = Timeout::from_ms(1000); // 1 second timeout for I/O
-
+        let timeout = Timeout::from_ms(5000); // 5 second timeout for I/O
         while !timeout.is_expired() {
             fence(Ordering::SeqCst);
+
             let head = self.io_cq_head as usize;
             let entry = unsafe { ptr::read_volatile(self.io_cq.add(head)) };
 
@@ -892,8 +892,21 @@ impl NvmeController {
                 }
                 return Ok(entry);
             }
+
             core::hint::spin_loop();
         }
+
+        let head = self.io_cq_head as usize;
+        let entry = unsafe { ptr::read_volatile(self.io_cq.add(head)) };
+        log::error!(
+            "NVMe I/O timeout! cid={}, cq_head={}, cq_phase={}, entry_phase={}, entry_cid={}, sq_tail={}",
+            cid,
+            head,
+            self.io_cq_phase as u8,
+            entry.phase() as u8,
+            entry.cid(),
+            self.io_sq_tail,
+        );
         Err(NvmeError::Timeout)
     }
 

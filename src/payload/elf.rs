@@ -19,6 +19,14 @@ const ET_EXEC: u16 = 2;
 
 /// ELF machine: x86-64
 const EM_X86_64: u16 = 62;
+/// ELF machine: AArch64
+const EM_AARCH64: u16 = 183;
+
+/// ELF machine type for the current target architecture
+#[cfg(target_arch = "x86_64")]
+const EM_NATIVE: u16 = EM_X86_64;
+#[cfg(target_arch = "aarch64")]
+const EM_NATIVE: u16 = EM_AARCH64;
 
 /// Program header type: loadable segment
 const PT_LOAD: u32 = 1;
@@ -161,8 +169,8 @@ impl Elf64 {
             return Err(ElfError::NotExecutable);
         }
 
-        // Check machine (x86-64)
-        if header.e_machine != EM_X86_64 {
+        // Check machine matches current architecture
+        if header.e_machine != EM_NATIVE {
             return Err(ElfError::WrongMachine);
         }
 

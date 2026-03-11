@@ -1816,7 +1816,7 @@ extern "efiapi" fn exit_boot_services(image_handle: Handle, map_key: usize) -> S
 
         // Clean up hardware state for OS handoff
         // Re-enable keyboard interrupts so Linux's i8042 driver works
-        crate::drivers::keyboard::cleanup();
+        crate::drivers::keyboard_common::cleanup();
 
         // Shutdown all PCI drivers (USB, NVMe, AHCI, SDHCI) for OS handoff
         crate::drivers::pci::shutdown_drivers();

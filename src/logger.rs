@@ -6,19 +6,19 @@
 //! Framebuffer logging is disabled by default as it is very slow.
 //! Enable with the `fb-log` feature flag.
 
-use crate::arch::x86_64::rdtsc;
 use crate::coreboot::cbmem_console;
+use crate::time::read_counter;
 use core::fmt::Write;
 use core::sync::atomic::{AtomicU64, Ordering};
 use log::{Level, LevelFilter, Metadata, Record};
 
-/// Initial TSC value at boot (set during init)
-static BOOT_TSC: AtomicU64 = AtomicU64::new(0);
+/// Initial counter value at boot (set during init)
+static BOOT_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-/// Get relative TSC ticks since boot (in thousands for readability)
+/// Get relative counter ticks since boot (in thousands for readability)
 pub fn get_timestamp_k() -> u64 {
-    let current = rdtsc();
-    let boot = BOOT_TSC.load(Ordering::Relaxed);
+    let current = read_counter();
+    let boot = BOOT_COUNTER.load(Ordering::Relaxed);
     // Return delta in thousands (k-ticks) to keep numbers manageable
     current.saturating_sub(boot) / 1000
 }
@@ -82,8 +82,8 @@ static LOGGER: CombinedLogger = CombinedLogger;
 
 /// Initialize the logging subsystem
 pub fn init() {
-    // Record the boot TSC for relative timestamps
-    BOOT_TSC.store(rdtsc(), Ordering::Relaxed);
+    // Record the boot counter for relative timestamps
+    BOOT_COUNTER.store(read_counter(), Ordering::Relaxed);
 
     log::set_logger(&LOGGER)
         .map(|()| log::set_max_level(LevelFilter::Debug))

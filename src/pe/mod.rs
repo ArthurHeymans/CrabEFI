@@ -28,6 +28,14 @@ pub const PE32_MAGIC: u16 = 0x010B;
 
 /// Machine type: AMD64
 const IMAGE_FILE_MACHINE_AMD64: u16 = 0x8664;
+/// Machine type: AArch64
+const IMAGE_FILE_MACHINE_AA64: u16 = 0xAA64;
+
+/// Machine type for the current target architecture
+#[cfg(target_arch = "x86_64")]
+const IMAGE_FILE_MACHINE_NATIVE: u16 = IMAGE_FILE_MACHINE_AMD64;
+#[cfg(target_arch = "aarch64")]
+const IMAGE_FILE_MACHINE_NATIVE: u16 = IMAGE_FILE_MACHINE_AA64;
 
 /// Relocation types
 const IMAGE_REL_BASED_ABSOLUTE: u16 = 0;
@@ -425,8 +433,12 @@ pub fn load_image(data: &[u8]) -> Result<LoadedImage, Status> {
     let num_sections = coff_header.number_of_sections;
     let opt_header_size = coff_header.size_of_optional_header;
 
-    if machine != IMAGE_FILE_MACHINE_AMD64 {
-        log::error!("PE: Unsupported machine type: {:#x}", machine);
+    if machine != IMAGE_FILE_MACHINE_NATIVE {
+        log::error!(
+            "PE: Unsupported machine type: {:#x} (expected {:#x})",
+            machine,
+            IMAGE_FILE_MACHINE_NATIVE
+        );
         return Err(Status::UNSUPPORTED);
     }
 

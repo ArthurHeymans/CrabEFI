@@ -18,7 +18,10 @@
 //! - U-Boot drivers/usb/host/ehci-hcd.c
 //! - libpayload ehci.c
 
+#[cfg(target_arch = "x86_64")]
 use crate::arch::x86_64::cache::{flush_cache_range, invalidate_cache_range};
+#[cfg(target_arch = "aarch64")]
+use crate::arch::aarch64::cache::{flush_cache_range, invalidate_cache_range};
 use crate::drivers::pci::{self, PciAddress, PciDevice};
 use crate::efi;
 use crate::time::{Timeout, wait_for};

@@ -3,7 +3,7 @@
 //! Contains keyboard input handling, screen control, and serial output helpers
 //! shared by both the boot menu and the Secure Boot settings menu.
 
-use crate::drivers::keyboard;
+use crate::drivers::keyboard_common as keyboard;
 use crate::drivers::serial as serial_driver;
 use crate::framebuffer_console::{FramebufferConsole, TITLE_COLOR};
 use crate::time::delay_ms;

@@ -1,0 +1,17 @@
+# Cargo configuration for aarch64 (QEMU SBSA) target
+# Usage: CARGO_HOME=.cargo-aarch64 cargo build --config .cargo/config-aarch64.toml
+# Or:    cargo build --target aarch64-unknown-none --config .cargo/config-aarch64.toml
+
+[build]
+target = "aarch64-unknown-none"
+
+[target.aarch64-unknown-none]
+rustflags = [
+    "-C", "link-arg=-Taarch64-coreboot.ld",
+    "-C", "link-arg=-no-pie",
+    "-C", "relocation-model=static",
+]
+
+[unstable]
+build-std = ["core", "compiler_builtins", "alloc"]
+build-std-features = ["compiler-builtins-mem"]

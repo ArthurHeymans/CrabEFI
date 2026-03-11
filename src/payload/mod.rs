@@ -257,25 +257,43 @@ pub unsafe fn chainload_payload(
 ///
 /// The payload must be loaded at the entry address and be valid.
 unsafe fn jump_to_payload(entry: u64, cbtable: *const u8) -> ! {
-    // Disable interrupts
-    core::arch::asm!("cli");
+    #[cfg(target_arch = "x86_64")]
+    {
+        // Disable interrupts
+        core::arch::asm!("cli");
 
-    // Clear registers and jump to payload
-    // Pass coreboot table pointer in RDI (x86-64 calling convention)
-    core::arch::asm!(
-        "mov rdi, {cbtable}",   // Coreboot table pointer
-        "xor rsi, rsi",         // Clear RSI
-        "xor rdx, rdx",         // Clear RDX
-        "xor rcx, rcx",         // Clear RCX
-        "xor r8, r8",           // Clear R8
-        "xor r9, r9",           // Clear R9
-        "xor r10, r10",         // Clear R10
-        "xor r11, r11",         // Clear R11
-        "jmp {entry}",
-        cbtable = in(reg) cbtable as u64,
-        entry = in(reg) entry,
-        options(noreturn)
-    );
+        // Clear registers and jump to payload
+        // Pass coreboot table pointer in RDI (x86-64 calling convention)
+        core::arch::asm!(
+            "mov rdi, {cbtable}",   // Coreboot table pointer
+            "xor rsi, rsi",         // Clear RSI
+            "xor rdx, rdx",         // Clear RDX
+            "xor rcx, rcx",         // Clear RCX
+            "xor r8, r8",           // Clear R8
+            "xor r9, r9",           // Clear R9
+            "xor r10, r10",         // Clear R10
+            "xor r11, r11",         // Clear R11
+            "jmp {entry}",
+            cbtable = in(reg) cbtable as u64,
+            entry = in(reg) entry,
+            options(noreturn)
+        );
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    {
+        // Pass coreboot table pointer in x0 (AArch64 calling convention)
+        core::arch::asm!(
+            "mov x0, {cbtable}",
+            "mov x1, xzr",
+            "mov x2, xzr",
+            "mov x3, xzr",
+            "br {entry}",
+            cbtable = in(reg) cbtable as u64,
+            entry = in(reg) entry,
+            options(noreturn)
+        );
+    }
 }
 
 /// Determine payload format from file extension
