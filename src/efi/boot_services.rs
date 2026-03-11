@@ -1692,6 +1692,21 @@ extern "efiapi" fn start_image(
     status
 }
 
+/// EFI Boot Service: Exit
+///
+/// UEFI Spec Compliance Note: A fully conformant `Exit()` implementation must
+/// perform a non-local return (longjmp) back to the corresponding `StartImage()`
+/// call, unwinding the call stack. This requires saving the execution context
+/// (registers, stack pointer) in `StartImage()` via setjmp, and restoring it here.
+///
+/// Current limitation: This implementation simply returns `exit_status` to the
+/// caller, which means `Exit()` only works correctly when called directly from
+/// the image's entry point (the common case for UEFI bootloaders like shim and
+/// GRUB). It will NOT correctly unwind nested image calls or calls from deep
+/// within a loaded image's call stack.
+///
+/// This is acceptable for our boot use case (shim → GRUB → Linux), but would
+/// need a proper setjmp/longjmp implementation for full UEFI application support.
 extern "efiapi" fn exit(
     image_handle: Handle,
     exit_status: Status,
@@ -1704,10 +1719,6 @@ extern "efiapi" fn exit(
         exit_status,
         exit_data_size
     );
-    // Note: A proper Exit implementation would use longjmp to return
-    // from the corresponding StartImage call. For now, we just return
-    // the status - this works for simple cases but won't properly unwind
-    // nested image calls.
     exit_status
 }
 

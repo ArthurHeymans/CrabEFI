@@ -22,26 +22,33 @@ pub const BLOCK_IO_PROTOCOL_GUID: Guid = Guid::from_fields(
 pub const BLOCK_IO_REVISION: u64 = 0x00010000; // EFI_BLOCK_IO_PROTOCOL_REVISION
 
 /// Block I/O Media structure
+///
+/// Note: UEFI `BOOLEAN` is defined as `UINT8`, not C `_Bool`. Using `u8` here
+/// instead of Rust `bool` ensures correct ABI layout matching the UEFI spec's
+/// `EFI_BLOCK_IO_MEDIA` structure. Three bytes of padding after `write_caching`
+/// align `block_size` to its natural 4-byte boundary.
 #[repr(C)]
 pub struct BlockIoMedia {
     /// Media ID - changes when media is changed
     pub media_id: u32,
-    /// True if media is removable
-    pub removable_media: bool,
-    /// True if media is present
-    pub media_present: bool,
-    /// True if this is a logical partition
-    pub logical_partition: bool,
-    /// True if media is read-only
-    pub read_only: bool,
-    /// True if WriteBlocks() must be called with entire blocks
-    pub write_caching: bool,
+    /// True (1) if media is removable
+    pub removable_media: u8,
+    /// True (1) if media is present
+    pub media_present: u8,
+    /// True (1) if this is a logical partition
+    pub logical_partition: u8,
+    /// True (1) if media is read-only
+    pub read_only: u8,
+    /// True (1) if WriteBlocks() must be called with entire blocks
+    pub write_caching: u8,
+    /// Padding to align block_size to 4-byte boundary
+    _pad1: [u8; 3],
     /// Block size in bytes
     pub block_size: u32,
     /// IO alignment requirement (0 or power of 2)
     pub io_align: u32,
     /// Padding for alignment
-    _pad: u32,
+    _pad2: u32,
     /// Last logical block address
     pub last_block: u64,
 }
@@ -275,14 +282,15 @@ fn create_block_io_internal(
     // Allocate media structure
     let media_ptr = allocate_protocol_with_log::<BlockIoMedia>("BlockIoMedia", |m| {
         m.media_id = media_id;
-        m.removable_media = true; // Assume removable for now
-        m.media_present = true;
-        m.logical_partition = is_partition;
-        m.read_only = true; // We only support read for booting
-        m.write_caching = false;
+        m.removable_media = 1; // Assume removable for now
+        m.media_present = 1;
+        m.logical_partition = if is_partition { 1 } else { 0 };
+        m.read_only = 1; // We only support read for booting
+        m.write_caching = 0;
+        m._pad1 = [0; 3];
         m.block_size = block_size;
         m.io_align = 0;
-        m._pad = 0;
+        m._pad2 = 0;
         m.last_block = num_blocks.saturating_sub(1);
     });
     if media_ptr.is_null() {

@@ -419,8 +419,8 @@ pub struct NvmeNamespace {
 pub struct NvmeController {
     /// PCI address (bus:device.function)
     pci_address: PciAddress,
-    /// Pointer to memory-mapped registers
-    regs: *const NvmeRegisters,
+    /// Pointer to memory-mapped registers (mutable — we write CC, AQA, ASQ, ACQ, etc.)
+    regs: *mut NvmeRegisters,
     /// MMIO base address (for doorbell access)
     mmio_base: u64,
     /// Doorbell stride (in bytes)
@@ -476,7 +476,7 @@ impl NvmeController {
     /// Create a new NVMe controller from a PCI device
     pub fn new(pci_dev: &PciDevice) -> Result<Self, NvmeError> {
         let mmio_base = pci_dev.mmio_base().ok_or(NvmeError::NotReady)?;
-        let regs = mmio_base as *const NvmeRegisters;
+        let regs = mmio_base as *mut NvmeRegisters;
 
         // Enable the device (bus master + memory space)
         pci::enable_device(pci_dev);
@@ -565,7 +565,9 @@ impl NvmeController {
 
     /// Initialize the controller
     fn init(&mut self) -> Result<(), NvmeError> {
-        let regs = unsafe { &*(self.regs as *mut NvmeRegisters) };
+        // SAFETY: `self.regs` points to MMIO registers mapped by PCI BAR.
+        // The pointer is valid for the lifetime of the NvmeController.
+        let regs = unsafe { &*self.regs };
 
         // Disable the controller
         regs.cc.modify(CC::EN::CLEAR);
@@ -910,10 +912,16 @@ impl NvmeController {
         Err(NvmeError::Timeout)
     }
 
-    /// Read sectors from a namespace
+    /// Read sectors from a namespace.
     ///
     /// Uses an internal page-aligned DMA buffer to avoid corruption when
     /// callers pass misaligned buffers (e.g., stack buffers).
+    ///
+    /// # Safety contract
+    ///
+    /// The caller must ensure that `buffer` points to a valid, writable memory
+    /// region of at least `num_sectors * block_size` bytes. Passing an
+    /// insufficiently sized buffer will result in memory corruption.
     pub fn read_sectors(
         &mut self,
         nsid: u32,
@@ -926,11 +934,13 @@ impl NvmeController {
             .ok_or(NvmeError::InvalidNamespace)?;
         let block_size = ns.block_size;
 
-        if num_sectors == 0 {
+        if num_sectors == 0 || buffer.is_null() {
             return Err(NvmeError::InvalidParameter);
         }
 
-        let transfer_size = num_sectors as u64 * block_size as u64;
+        let transfer_size = (num_sectors as u64)
+            .checked_mul(block_size as u64)
+            .ok_or(NvmeError::InvalidParameter)?;
 
         // Our DMA buffer is one page (4096 bytes), so we can only transfer up to 4KB at a time
         // For larger transfers, we need to loop
@@ -940,9 +950,9 @@ impl NvmeController {
             let mut remaining_sectors = num_sectors;
             let mut current_lba = start_lba;
             let mut current_buffer = buffer;
-
             while remaining_sectors > 0 {
                 let sectors_this_read = core::cmp::min(remaining_sectors, sectors_per_page);
+
                 self.read_sectors_internal(nsid, current_lba, sectors_this_read, current_buffer)?;
                 remaining_sectors -= sectors_this_read;
                 current_lba += sectors_this_read as u64;
@@ -955,7 +965,10 @@ impl NvmeController {
         self.read_sectors_internal(nsid, start_lba, num_sectors, buffer)
     }
 
-    /// Internal read function that uses the page-aligned DMA buffer
+    /// Internal read function that uses the page-aligned DMA buffer.
+    ///
+    /// The caller MUST ensure that `num_sectors * block_size <= 4096` (one page),
+    /// as the DMA buffer is exactly one page. This is enforced by an assertion.
     fn read_sectors_internal(
         &mut self,
         nsid: u32,
@@ -967,13 +980,21 @@ impl NvmeController {
             .get_namespace(nsid)
             .ok_or(NvmeError::InvalidNamespace)?;
         let block_size = ns.block_size;
-        let transfer_size = (num_sectors * block_size) as usize;
+        let transfer_size = (num_sectors as usize)
+            .checked_mul(block_size as usize)
+            .ok_or(NvmeError::InvalidParameter)?;
+
+        // Guard against DMA buffer overflow — the DMA buffer is exactly one page (4096 bytes)
+        if transfer_size > 4096 {
+            return Err(NvmeError::InvalidParameter);
+        }
 
         // Use our page-aligned DMA buffer to avoid corruption from misaligned caller buffers
         // The DMA buffer is guaranteed to be 4KB aligned by allocate_pages()
         let mut cmd = SubmissionQueueEntry::new();
         cmd.set_opcode(io_cmd::READ);
-        cmd.set_cid(self.next_command_id());
+        let cid_val = self.next_command_id();
+        cmd.set_cid(cid_val);
         cmd.nsid = nsid;
         cmd.prp1 = self.dma_buffer as u64; // Use aligned DMA buffer
 
