@@ -32,9 +32,6 @@ const LSR_DATA_READY: u8 = 0x01;
 /// LCR bit: DLAB (Divisor Latch Access Bit)
 const LCR_DLAB: u8 = 0x80;
 
-/// Global serial port instance
-static SERIAL: Mutex<Option<SerialPort>> = Mutex::new(None);
-
 /// Maximum iterations to wait for TX ready (prevents infinite loop on missing hardware)
 const TX_TIMEOUT_ITERATIONS: u32 = 100_000;
 
@@ -229,15 +226,17 @@ impl Write for SerialPort {
 // PL011 UART support (aarch64)
 // ============================================================================
 
+#[cfg(target_arch = "aarch64")]
 /// PL011 UART register offsets
 mod pl011 {
     pub const UARTDR: usize = 0x000; // Data Register
     pub const UARTFR: usize = 0x018; // Flag Register
-                                     // Flag register bits
+    // Flag register bits
     pub const FR_TXFF: u16 = 1 << 5; // Transmit FIFO Full
     pub const FR_RXFE: u16 = 1 << 4; // Receive FIFO Empty
 }
 
+#[cfg(target_arch = "aarch64")]
 /// PL011 serial port backend
 ///
 /// Separate from the 16550 backend because register layout differs significantly.
@@ -246,6 +245,7 @@ struct Pl011Port {
     functional: bool,
 }
 
+#[cfg(target_arch = "aarch64")]
 impl Pl011Port {
     fn new(base: u64) -> Self {
         Self {
@@ -301,12 +301,9 @@ impl Pl011Port {
     fn can_receive(&self) -> bool {
         self.functional && self.read16(pl011::UARTFR) & pl011::FR_RXFE == 0
     }
-
-    fn can_send(&self) -> bool {
-        self.functional && self.read16(pl011::UARTFR) & pl011::FR_TXFF == 0
-    }
 }
 
+#[cfg(target_arch = "aarch64")]
 impl Write for Pl011Port {
     fn write_str(&mut self, s: &str) -> fmt::Result {
         for byte in s.bytes() {
@@ -326,6 +323,7 @@ impl Write for Pl011Port {
 /// Runtime-selected serial port type
 enum AnySerial {
     Uart16550(SerialPort),
+    #[cfg(target_arch = "aarch64")]
     Pl011(Pl011Port),
 }
 
@@ -355,7 +353,6 @@ pub fn init_from_coreboot(base_addr: u32, baud: u32, is_mmio: bool) {
             if port.functional {
                 let _ = port.write_str("\r\n[CrabEFI] PL011 serial initialized from coreboot\r\n");
                 *ANY_SERIAL.lock() = Some(AnySerial::Pl011(port));
-                // Also set up the legacy SERIAL for code that uses it directly
                 return;
             }
         }
@@ -401,6 +398,7 @@ pub fn write_str(s: &str) {
             AnySerial::Uart16550(uart) => {
                 let _ = uart.write_str(s);
             }
+            #[cfg(target_arch = "aarch64")]
             AnySerial::Pl011(pl011) => {
                 let _ = pl011.write_str(s);
             }
@@ -415,6 +413,7 @@ pub fn write_fmt(args: fmt::Arguments) {
             AnySerial::Uart16550(uart) => {
                 let _ = uart.write_fmt(args);
             }
+            #[cfg(target_arch = "aarch64")]
             AnySerial::Pl011(pl011) => {
                 let _ = pl011.write_fmt(args);
             }
@@ -427,6 +426,7 @@ pub fn write_byte(byte: u8) {
     if let Some(serial) = &mut *ANY_SERIAL.lock() {
         match serial {
             AnySerial::Uart16550(uart) => uart.write_byte(byte),
+            #[cfg(target_arch = "aarch64")]
             AnySerial::Pl011(pl011) => pl011.write_byte(byte),
         }
     }
@@ -437,6 +437,7 @@ pub fn has_input() -> bool {
     if let Some(serial) = &*ANY_SERIAL.lock() {
         match serial {
             AnySerial::Uart16550(uart) => uart.can_receive(),
+            #[cfg(target_arch = "aarch64")]
             AnySerial::Pl011(pl011) => pl011.can_receive(),
         }
     } else {
@@ -449,6 +450,7 @@ pub fn try_read() -> Option<u8> {
     if let Some(serial) = &mut *ANY_SERIAL.lock() {
         match serial {
             AnySerial::Uart16550(uart) => uart.try_read_byte(),
+            #[cfg(target_arch = "aarch64")]
             AnySerial::Pl011(pl011) => pl011.try_read_byte(),
         }
     } else {

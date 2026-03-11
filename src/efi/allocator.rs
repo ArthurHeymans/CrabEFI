@@ -419,12 +419,8 @@ impl MemoryAllocator {
                     return Err(efi::Status::INVALID_PARAMETER);
                 }
                 // No containing entry — add as a new entry
-                let desc = MemoryDescriptor::new(
-                    target_type,
-                    addr,
-                    num_pages,
-                    attributes::EFI_MEMORY_WB,
-                );
+                let desc =
+                    MemoryDescriptor::new(target_type, addr, num_pages, attributes::EFI_MEMORY_WB);
                 if self.entries.push(desc).is_err() {
                     return Err(efi::Status::OUT_OF_RESOURCES);
                 }
@@ -776,9 +772,11 @@ impl MemoryAllocator {
         // Check for overflow in size calculation
         let size = num_pages.checked_mul(PAGE_SIZE)?;
 
-        // Limit max_addr to the identity-mapped region
-        // Our page tables only cover the first 4GB, so allocating above that
-        // would cause page faults when the memory is accessed
+        // Limit max_addr to the identity-mapped region.
+        // On x86_64, our page tables only cover the first 64GB, so allocating
+        // above that would cause page faults. On aarch64, the full address
+        // space is mapped and this is a no-op.
+        #[allow(clippy::unnecessary_min_or_max)]
         let max_addr = max_addr.min(MAX_IDENTITY_MAPPED_ADDRESS);
 
         // Search from high to low addresses (prefer high memory within mapped region)

@@ -8,6 +8,8 @@ use regex::Regex;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
 
+use crate::Arch;
+
 /// Storage type for QEMU
 #[derive(Debug, Clone, Copy)]
 pub enum StorageType {
@@ -25,6 +27,8 @@ pub enum StorageType {
 pub struct QemuConfig {
     /// Path to coreboot ROM with CrabEFI payload
     pub coreboot_rom: String,
+    /// Path to TF-A flash image (aarch64 only, used as pflash0)
+    pub tfa_flash: Option<String>,
     /// Storage type to use
     pub storage: StorageType,
     /// Run without graphical display
@@ -33,6 +37,8 @@ pub struct QemuConfig {
     pub disable_kvm: bool,
     /// Timeout in seconds (None = no timeout)
     pub timeout_secs: Option<u64>,
+    /// Target architecture
+    pub arch: Arch,
 }
 
 /// Test result from QEMU run
@@ -57,12 +63,19 @@ fn build_qemu_command(config: &QemuConfig, disk_path: &Path) -> Result<Command> 
             "coreboot ROM not found: {}\n\n\
             Build coreboot with CrabEFI payload:\n\
             1. cargo build --release\n\
-            2. cp target/x86_64-unknown-none/release/crabefi.elf ~/src/coreboot/payloads/external/crabefi/\n\
-            3. cd ~/src/coreboot && make -j$(nproc)",
+            2. Use ./x build to prepare the ROM",
             config.coreboot_rom
         );
     }
 
+    match config.arch {
+        Arch::X86_64 => build_qemu_command_x86_64(config, disk_path),
+        Arch::Aarch64 => build_qemu_command_aarch64(config, disk_path),
+    }
+}
+
+/// Build QEMU command for x86_64 (Q35)
+fn build_qemu_command_x86_64(config: &QemuConfig, disk_path: &Path) -> Result<Command> {
     let mut cmd = Command::new("qemu-system-x86_64");
 
     // Basic machine setup
@@ -83,6 +96,85 @@ fn build_qemu_command(config: &QemuConfig, disk_path: &Path) -> Result<Command> 
     }
 
     // Storage configuration
+    add_storage_args_x86_64(&mut cmd, config, disk_path);
+
+    // KVM acceleration
+    if !config.disable_kvm && is_kvm_available() {
+        cmd.args(["-enable-kvm", "-cpu", "host"]);
+    } else {
+        // Use `-cpu max` so TCG emulates all available features (e.g. RDRAND)
+        cmd.args(["-cpu", "max"]);
+    }
+
+    // Debug options
+    cmd.args(["-d", "guest_errors"]);
+
+    // Capture stderr for QEMU errors
+    cmd.stderr(Stdio::piped());
+    cmd.stdout(Stdio::piped());
+
+    Ok(cmd)
+}
+
+/// Build QEMU command for aarch64 (SBSA)
+fn build_qemu_command_aarch64(config: &QemuConfig, disk_path: &Path) -> Result<Command> {
+    // Validate: no SDHCI on SBSA
+    if matches!(config.storage, StorageType::Sdhci) {
+        bail!("SDHCI storage is not supported on SBSA (aarch64)");
+    }
+
+    let tfa_flash = config
+        .tfa_flash
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("TF-A flash path is required for aarch64 SBSA"))?;
+
+    if !Path::new(tfa_flash).exists() {
+        bail!("TF-A flash not found: {}", tfa_flash);
+    }
+
+    let mut cmd = Command::new("qemu-system-aarch64");
+
+    // Basic machine setup
+    cmd.args(["-machine", "sbsa-ref"]);
+    cmd.args(["-m", "1G"]);
+    cmd.arg("-no-reboot");
+
+    // pflash drives: pflash0 = TF-A, pflash1 = coreboot ROM
+    // Use snapshot=on to avoid corrupting the images
+    cmd.args([
+        "-drive",
+        &format!("if=pflash,format=raw,file={},snapshot=on", tfa_flash),
+    ]);
+    cmd.args([
+        "-drive",
+        &format!(
+            "if=pflash,format=raw,file={},snapshot=on",
+            config.coreboot_rom
+        ),
+    ]);
+
+    // Display and serial settings
+    // SBSA uses PL011 UART — -nographic sends serial to stdio
+    cmd.arg("-nographic");
+
+    // Storage configuration
+    add_storage_args_aarch64(&mut cmd, config, disk_path);
+
+    // CPU: always use TCG for cross-arch (no KVM on non-native)
+    cmd.args(["-cpu", "max"]);
+
+    // Debug options
+    cmd.args(["-d", "guest_errors"]);
+
+    // Capture stderr for QEMU errors
+    cmd.stderr(Stdio::piped());
+    cmd.stdout(Stdio::piped());
+
+    Ok(cmd)
+}
+
+/// Add storage arguments for x86_64
+fn add_storage_args_x86_64(cmd: &mut Command, config: &QemuConfig, disk_path: &Path) {
     let disk_path_str = disk_path.to_string_lossy();
     match config.storage {
         StorageType::Usb => {
@@ -116,23 +208,43 @@ fn build_qemu_command(config: &QemuConfig, disk_path: &Path) -> Result<Command> 
             cmd.args(["-device", "sd-card,drive=sddrive0"]);
         }
     }
+}
 
-    // KVM acceleration
-    if !config.disable_kvm && is_kvm_available() {
-        cmd.args(["-enable-kvm", "-cpu", "host"]);
-    } else {
-        // Use `-cpu max` so TCG emulates all available features (e.g. RDRAND)
-        cmd.args(["-cpu", "max"]);
+/// Add storage arguments for aarch64 (SBSA)
+fn add_storage_args_aarch64(cmd: &mut Command, config: &QemuConfig, disk_path: &Path) {
+    let disk_path_str = disk_path.to_string_lossy();
+    match config.storage {
+        StorageType::Usb => {
+            cmd.args(["-device", "qemu-xhci,id=xhci"]);
+            cmd.args([
+                "-drive",
+                &format!("file={},if=none,id=usbdisk,format=raw", disk_path_str),
+            ]);
+            cmd.args(["-device", "usb-storage,drive=usbdisk,bus=xhci.0"]);
+        }
+        StorageType::Ahci => {
+            cmd.args([
+                "-drive",
+                &format!("file={},if=none,id=disk0,format=raw", disk_path_str),
+            ]);
+            cmd.args(["-device", "ide-hd,drive=disk0,bus=ide.0"]);
+        }
+        StorageType::Nvme => {
+            cmd.args([
+                "-drive",
+                &format!(
+                    "file={},if=none,id=nvme0,format=raw,media=disk",
+                    disk_path_str
+                ),
+            ]);
+            cmd.args(["-device", "nvme,serial=deadbeef,drive=nvme0"]);
+        }
+        StorageType::Sdhci => {
+            // This shouldn't be reached due to validation in build_qemu_command_aarch64,
+            // but handle gracefully
+            unreachable!("SDHCI is not supported on SBSA");
+        }
     }
-
-    // Debug options
-    cmd.args(["-d", "guest_errors"]);
-
-    // Capture stderr for QEMU errors
-    cmd.stderr(Stdio::piped());
-    cmd.stdout(Stdio::piped());
-
-    Ok(cmd)
 }
 
 /// Check if KVM is available
@@ -163,7 +275,11 @@ pub fn run_qemu(config: &QemuConfig, disk_path: Option<&Path>) -> Result<()> {
     } else {
         temp_disk = tempfile::NamedTempFile::new()?;
         // Create a minimal test disk
-        crate::disk::create_test_disk(temp_disk.path().to_string_lossy().as_ref(), None)?;
+        crate::disk::create_test_disk(
+            temp_disk.path().to_string_lossy().as_ref(),
+            None,
+            config.arch,
+        )?;
         temp_disk.path().to_path_buf()
     };
 
@@ -174,8 +290,14 @@ pub fn run_qemu(config: &QemuConfig, disk_path: Option<&Path>) -> Result<()> {
     cmd.stdout(Stdio::inherit());
     cmd.stderr(Stdio::inherit());
 
-    println!("=== CrabEFI QEMU ({:?}) ===", config.storage);
+    println!(
+        "=== CrabEFI QEMU ({:?}, {:?}) ===",
+        config.arch, config.storage
+    );
     println!("coreboot ROM: {}", config.coreboot_rom);
+    if let Some(ref tfa) = config.tfa_flash {
+        println!("TF-A flash: {}", tfa);
+    }
     println!("Press Ctrl+A X to exit QEMU");
     println!("==========================================\n");
 
@@ -190,7 +312,10 @@ pub fn run_qemu(config: &QemuConfig, disk_path: Option<&Path>) -> Result<()> {
 
 /// Run integration tests in QEMU
 pub fn run_tests(config: &QemuConfig, disk_path: &Path, app_name: &str) -> Result<()> {
-    println!("=== CrabEFI Integration Tests ({}) ===\n", app_name);
+    println!(
+        "=== CrabEFI Integration Tests ({}, {:?}) ===\n",
+        app_name, config.arch
+    );
 
     // Run QEMU and capture output
     println!("Running tests in QEMU...\n");
@@ -466,8 +591,19 @@ pub fn run_tests(config: &QemuConfig, disk_path: &Path, app_name: &str) -> Resul
 fn run_qemu_with_capture(config: &QemuConfig, disk_path: &Path) -> Result<TestResult> {
     let timeout = config.timeout_secs.unwrap_or(60);
 
+    match config.arch {
+        Arch::X86_64 => run_qemu_with_capture_x86_64(config, disk_path, timeout),
+        Arch::Aarch64 => run_qemu_with_capture_aarch64(config, disk_path, timeout),
+    }
+}
+
+/// Run QEMU with capture for x86_64
+fn run_qemu_with_capture_x86_64(
+    config: &QemuConfig,
+    disk_path: &Path,
+    timeout: u64,
+) -> Result<TestResult> {
     // Use the `timeout` command to enforce the timeout at the process level
-    // This is more reliable than trying to do it in Rust
     let mut cmd = Command::new("timeout");
     cmd.arg("--signal=KILL");
     cmd.arg(format!("{}s", timeout));
@@ -486,45 +622,12 @@ fn run_qemu_with_capture(config: &QemuConfig, disk_path: &Path) -> Result<TestRe
     cmd.args(["-mon", "chardev=char0,mode=readline"]);
 
     // Storage configuration
-    let disk_path_str = disk_path.to_string_lossy();
-    match config.storage {
-        StorageType::Usb => {
-            cmd.args(["-device", "qemu-xhci,id=xhci"]);
-            cmd.args([
-                "-drive",
-                &format!("file={},if=none,id=usbdisk,format=raw", disk_path_str),
-            ]);
-            cmd.args(["-device", "usb-storage,drive=usbdisk,bus=xhci.0"]);
-        }
-        StorageType::Ahci => {
-            cmd.args([
-                "-drive",
-                &format!("file={},if=none,id=disk0,format=raw", disk_path_str),
-            ]);
-            cmd.args(["-device", "ide-hd,drive=disk0,bus=ide.0"]);
-        }
-        StorageType::Nvme => {
-            cmd.args([
-                "-drive",
-                &format!("file={},if=none,id=nvme0,format=raw", disk_path_str),
-            ]);
-            cmd.args(["-device", "nvme,serial=deadbeef,drive=nvme0"]);
-        }
-        StorageType::Sdhci => {
-            cmd.args(["-device", "sdhci-pci"]);
-            cmd.args([
-                "-drive",
-                &format!("file={},if=none,id=sddrive0,format=raw", disk_path_str),
-            ]);
-            cmd.args(["-device", "sd-card,drive=sddrive0"]);
-        }
-    }
+    add_storage_args_x86_64(&mut cmd, config, disk_path);
 
     // KVM acceleration
     if !config.disable_kvm && is_kvm_available() {
         cmd.args(["-enable-kvm", "-cpu", "host"]);
     } else {
-        // Use `-cpu max` so TCG emulates all available features (e.g. RDRAND)
         cmd.args(["-cpu", "max"]);
     }
 
@@ -533,6 +636,69 @@ fn run_qemu_with_capture(config: &QemuConfig, disk_path: &Path) -> Result<TestRe
     // Execute and capture output
     let output = cmd.output().context("failed to execute QEMU via timeout")?;
 
+    parse_qemu_output(&output)
+}
+
+/// Run QEMU with capture for aarch64 (SBSA)
+fn run_qemu_with_capture_aarch64(
+    config: &QemuConfig,
+    disk_path: &Path,
+    timeout: u64,
+) -> Result<TestResult> {
+    // Validate: no SDHCI on SBSA
+    if matches!(config.storage, StorageType::Sdhci) {
+        bail!("SDHCI storage is not supported on SBSA (aarch64)");
+    }
+
+    let tfa_flash = config
+        .tfa_flash
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("TF-A flash path is required for aarch64 SBSA"))?;
+
+    let mut cmd = Command::new("timeout");
+    cmd.arg("--signal=KILL");
+    cmd.arg(format!("{}s", timeout));
+    cmd.arg("qemu-system-aarch64");
+
+    // Machine setup
+    cmd.args(["-machine", "sbsa-ref"]);
+    cmd.args(["-m", "1G"]);
+    cmd.arg("-no-reboot");
+
+    // pflash drives
+    cmd.args([
+        "-drive",
+        &format!("if=pflash,format=raw,file={},snapshot=on", tfa_flash),
+    ]);
+    cmd.args([
+        "-drive",
+        &format!(
+            "if=pflash,format=raw,file={},snapshot=on",
+            config.coreboot_rom
+        ),
+    ]);
+
+    // Serial: -nographic for PL011 to stdio
+    cmd.arg("-nographic");
+
+    // Storage configuration
+    add_storage_args_aarch64(&mut cmd, config, disk_path);
+
+    // CPU: always TCG for cross-arch
+    cmd.args(["-cpu", "max"]);
+
+    cmd.args(["-d", "guest_errors"]);
+
+    // Execute and capture output
+    let output = cmd
+        .output()
+        .context("failed to execute QEMU (aarch64) via timeout")?;
+
+    parse_qemu_output(&output)
+}
+
+/// Parse QEMU output into a TestResult
+fn parse_qemu_output(output: &std::process::Output) -> Result<TestResult> {
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
 
