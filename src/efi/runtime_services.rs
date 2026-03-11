@@ -170,7 +170,7 @@ pub fn get_runtime_code_address() -> u64 {
 
 extern "efiapi" fn get_time(time: *mut Time, capabilities: *mut TimeCapabilities) -> Status {
     #[cfg(feature = "rt-debug")]
-    if unsafe { VIRTUAL_MODE } {
+    if VIRTUAL_MODE.load(core::sync::atomic::Ordering::Relaxed) {
         rt_serial_print!("GetTime");
     }
     if time.is_null() {
@@ -207,7 +207,7 @@ extern "efiapi" fn get_time(time: *mut Time, capabilities: *mut TimeCapabilities
 
 extern "efiapi" fn set_time(_time: *mut Time) -> Status {
     #[cfg(feature = "rt-debug")]
-    if unsafe { VIRTUAL_MODE } {
+    if VIRTUAL_MODE.load(core::sync::atomic::Ordering::Relaxed) {
         rt_serial_print!("SetTime -> UNSUPPORTED");
     }
     Status::UNSUPPORTED
@@ -219,7 +219,7 @@ extern "efiapi" fn get_wakeup_time(
     _time: *mut Time,
 ) -> Status {
     #[cfg(feature = "rt-debug")]
-    if unsafe { VIRTUAL_MODE } {
+    if VIRTUAL_MODE.load(core::sync::atomic::Ordering::Relaxed) {
         rt_serial_print!("GetWakeupTime -> UNSUPPORTED");
     }
     Status::UNSUPPORTED
@@ -227,7 +227,7 @@ extern "efiapi" fn get_wakeup_time(
 
 extern "efiapi" fn set_wakeup_time(_enable: efi::Boolean, _time: *mut Time) -> Status {
     #[cfg(feature = "rt-debug")]
-    if unsafe { VIRTUAL_MODE } {
+    if VIRTUAL_MODE.load(core::sync::atomic::Ordering::Relaxed) {
         rt_serial_print!("SetWakeupTime -> UNSUPPORTED");
     }
     Status::UNSUPPORTED
@@ -248,8 +248,13 @@ const EFI_PAGE_SIZE: u64 = 4096;
 static mut VIRTUAL_MAP_PTR: *const u8 = core::ptr::null();
 static mut VIRTUAL_MAP_DESCRIPTOR_SIZE: usize = 0;
 static mut VIRTUAL_MAP_ENTRY_COUNT: usize = 0;
-/// Whether SetVirtualAddressMap has been called (one-shot operation)
-static mut VIRTUAL_MODE: bool = false;
+/// Whether SetVirtualAddressMap has been called (one-shot operation).
+///
+/// Uses `AtomicBool` instead of `static mut` because this flag is read from
+/// runtime service calls after ExitBootServices, potentially from OS context.
+/// The actual write is a one-shot during SetVirtualAddressMap.
+static VIRTUAL_MODE: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
 
 extern "efiapi" fn set_virtual_address_map(
     memory_map_size: usize,
@@ -265,10 +270,8 @@ extern "efiapi" fn set_virtual_address_map(
         virtual_map
     );
 
-    unsafe {
-        if VIRTUAL_MODE {
-            return Status::UNSUPPORTED;
-        }
+    if VIRTUAL_MODE.load(core::sync::atomic::Ordering::Relaxed) {
+        return Status::UNSUPPORTED;
     }
 
     if virtual_map.is_null() || descriptor_size == 0 {
@@ -300,9 +303,7 @@ extern "efiapi" fn set_virtual_address_map(
     crate::coreboot::cbmem_console::disable();
 
     // Step 1: Commit to virtual mode
-    unsafe {
-        VIRTUAL_MODE = true;
-    }
+    VIRTUAL_MODE.store(true, core::sync::atomic::Ordering::Release);
 
     // Step 2: Set up globals so ConvertPointer can access the virtual map
     unsafe {
@@ -356,7 +357,10 @@ extern "efiapi" fn set_virtual_address_map(
         }
 
         let phys_start = desc.physical_start;
-        let phys_end = phys_start + desc.number_of_pages * EFI_PAGE_SIZE;
+        let phys_end = desc
+            .number_of_pages
+            .saturating_mul(EFI_PAGE_SIZE)
+            .saturating_add(phys_start);
         let virt_start = desc.virtual_start;
 
         // Relocate STATE_PTR
@@ -415,7 +419,12 @@ extern "efiapi" fn set_virtual_address_map(
         }
         let got_start = &raw const _got_start as *mut u64;
         let got_end = &raw const _got_end;
-        let got_count = (got_end as usize - got_start as usize) / core::mem::size_of::<u64>();
+        let got_count = if (got_end as usize) >= (got_start as usize) {
+            (got_end as usize - got_start as usize) / core::mem::size_of::<u64>()
+        } else {
+            log::error!("SetVirtualAddressMap: GOT range is invalid (_got_end < _got_start)");
+            0
+        };
 
         for slot in 0..got_count {
             let entry_ptr = unsafe { got_start.add(slot) };
@@ -431,7 +440,10 @@ extern "efiapi" fn set_virtual_address_map(
                     continue;
                 }
                 let p_start = desc.physical_start;
-                let p_end = p_start + desc.number_of_pages * EFI_PAGE_SIZE;
+                let p_end = desc
+                    .number_of_pages
+                    .saturating_mul(EFI_PAGE_SIZE)
+                    .saturating_add(p_start);
                 if phys_val >= p_start && phys_val < p_end {
                     let offset = desc.virtual_start as i64 - p_start as i64;
                     let new_val = (phys_val as i64 + offset) as u64;
@@ -569,7 +581,10 @@ fn convert_pointer_internal(debug_disposition: usize, address: &mut *mut c_void)
                 continue;
             }
 
-            let phys_end = desc.physical_start + desc.number_of_pages * EFI_PAGE_SIZE;
+            let phys_end = desc
+                .number_of_pages
+                .saturating_mul(EFI_PAGE_SIZE)
+                .saturating_add(desc.physical_start);
             if phys_addr >= desc.physical_start && phys_addr < phys_end {
                 *address = (phys_addr - desc.physical_start + desc.virtual_start) as *mut c_void;
                 return Status::SUCCESS;
@@ -599,7 +614,7 @@ extern "efiapi" fn get_variable(
     data: *mut c_void,
 ) -> Status {
     #[cfg(feature = "rt-debug")]
-    if unsafe { VIRTUAL_MODE } {
+    if VIRTUAL_MODE.load(core::sync::atomic::Ordering::Relaxed) {
         rt_serial::str("[RT] GetVariable name=");
         if !variable_name.is_null() {
             for i in 0..32 {
@@ -744,7 +759,7 @@ extern "efiapi" fn get_next_variable_name(
     vendor_guid: *mut Guid,
 ) -> Status {
     #[cfg(feature = "rt-debug")]
-    if unsafe { VIRTUAL_MODE } {
+    if VIRTUAL_MODE.load(core::sync::atomic::Ordering::Relaxed) {
         rt_serial::str("[RT] GetNextVariableName name=");
         if !variable_name.is_null() {
             for i in 0..32 {
@@ -951,7 +966,7 @@ extern "efiapi" fn set_variable(
     data: *mut c_void,
 ) -> Status {
     #[cfg(feature = "rt-debug")]
-    if unsafe { VIRTUAL_MODE } {
+    if VIRTUAL_MODE.load(core::sync::atomic::Ordering::Relaxed) {
         rt_serial::str("[RT] SetVariable name=");
         if !variable_name.is_null() {
             for i in 0..32 {
@@ -1280,7 +1295,7 @@ extern "efiapi" fn query_variable_info(
     maximum_variable_size: *mut u64,
 ) -> Status {
     #[cfg(feature = "rt-debug")]
-    if unsafe { VIRTUAL_MODE } {
+    if VIRTUAL_MODE.load(core::sync::atomic::Ordering::Relaxed) {
         rt_serial_print!("QueryVariableInfo attr=", attributes);
     }
     if maximum_variable_storage_size.is_null()
@@ -1318,7 +1333,7 @@ extern "efiapi" fn query_variable_info(
 
 extern "efiapi" fn get_next_high_mono_count(_high_count: *mut u32) -> Status {
     #[cfg(feature = "rt-debug")]
-    if unsafe { VIRTUAL_MODE } {
+    if VIRTUAL_MODE.load(core::sync::atomic::Ordering::Relaxed) {
         rt_serial_print!("GetNextHighMonoCount -> UNSUPPORTED");
     }
     Status::UNSUPPORTED
@@ -1358,7 +1373,7 @@ extern "efiapi" fn update_capsule(
     _scatter_gather_list: efi::PhysicalAddress,
 ) -> Status {
     #[cfg(feature = "rt-debug")]
-    if unsafe { VIRTUAL_MODE } {
+    if VIRTUAL_MODE.load(core::sync::atomic::Ordering::Relaxed) {
         rt_serial_print!("UpdateCapsule -> UNSUPPORTED");
     }
     Status::UNSUPPORTED
@@ -1371,7 +1386,7 @@ extern "efiapi" fn query_capsule_capabilities(
     _reset_type: *mut ResetType,
 ) -> Status {
     #[cfg(feature = "rt-debug")]
-    if unsafe { VIRTUAL_MODE } {
+    if VIRTUAL_MODE.load(core::sync::atomic::Ordering::Relaxed) {
         rt_serial_print!("QueryCapsuleCapabilities -> UNSUPPORTED");
     }
     Status::UNSUPPORTED

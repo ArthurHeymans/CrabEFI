@@ -261,6 +261,7 @@ impl MemoryAllocator {
                 );
                 continue;
             }
+
             // Safely calculate number of pages, skip regions that overflow
             let num_pages = match region.size.checked_add(PAGE_SIZE - 1) {
                 Some(size_rounded) => size_rounded / PAGE_SIZE,
@@ -373,7 +374,23 @@ impl MemoryAllocator {
     /// This function finds the region containing the address (any memory type),
     /// splits it if necessary, and marks the specified range as AcpiReclaimMemory.
     /// Unlike carve_out, this works on any memory type, not just ConventionalMemory.
-    pub fn mark_as_acpi_reclaim(&mut self, addr: u64, num_pages: u64) -> Result<(), efi::Status> {
+    /// Re-type a memory region, splitting the containing entry as needed.
+    ///
+    /// Finds the entry containing `[addr, addr + num_pages * PAGE_SIZE)`,
+    /// splits it into up to 3 parts (before, target, after), and changes the
+    /// target portion to `target_type`. If the region is not found inside an
+    /// existing entry, it is added as a new entry with the target type.
+    ///
+    /// `skip_types` lists memory types that should NOT be re-typed (the
+    /// function returns `Ok(())` immediately if the region already has one
+    /// of these types).
+    fn mark_region_as(
+        &mut self,
+        addr: u64,
+        num_pages: u64,
+        target_type: MemoryType,
+        skip_types: &[MemoryType],
+    ) -> Result<(), efi::Status> {
         // Check for overflow in size calculation
         let size = num_pages
             .checked_mul(PAGE_SIZE)
@@ -391,18 +408,19 @@ impl MemoryAllocator {
         let idx = match found_idx {
             Some(i) => i,
             None => {
-                // Region not found - check if it overlaps with any existing region
-                if self
-                    .entries
-                    .iter()
-                    .any(|entry| addr < entry.end() && end > entry.physical_start)
+                // Region not found — check for overlaps (only for ACPI reclaim
+                // which has stricter validation)
+                if target_type == MemoryType::AcpiReclaimMemory
+                    && self
+                        .entries
+                        .iter()
+                        .any(|entry| addr < entry.end() && end > entry.physical_start)
                 {
-                    // Overlaps - this is complex, skip for now
                     return Err(efi::Status::INVALID_PARAMETER);
                 }
-                // No overlap, we can add it as a new region
+                // No containing entry — add as a new entry
                 let desc = MemoryDescriptor::new(
-                    MemoryType::AcpiReclaimMemory,
+                    target_type,
                     addr,
                     num_pages,
                     attributes::EFI_MEMORY_WB,
@@ -421,13 +439,8 @@ impl MemoryAllocator {
             .get_memory_type()
             .unwrap_or(MemoryType::ReservedMemoryType);
 
-        // If already ACPI reclaim, nothing to do
-        if original_type == MemoryType::AcpiReclaimMemory {
-            return Ok(());
-        }
-
-        // If already ACPI NVS, don't change it
-        if original_type == MemoryType::AcpiMemoryNvs {
+        // If already the target type or a type we should skip, nothing to do
+        if original_type == target_type || skip_types.contains(&original_type) {
             return Ok(());
         }
 
@@ -436,8 +449,8 @@ impl MemoryAllocator {
         // Remove the old entry
         self.entries.remove(idx);
 
-        // Add up to 3 new entries: before, acpi, after
-        // Region before the ACPI portion (keep original type)
+        // Add up to 3 new entries: before, target, after
+        // Region before the target portion (keep original type)
         if entry.physical_start < addr {
             let before_pages = (addr - entry.physical_start) / PAGE_SIZE;
             let before =
@@ -447,13 +460,13 @@ impl MemoryAllocator {
             }
         }
 
-        // The ACPI reclaim region
-        let acpi = MemoryDescriptor::new(MemoryType::AcpiReclaimMemory, addr, num_pages, attribute);
-        if self.entries.push(acpi).is_err() {
+        // The target region
+        let target = MemoryDescriptor::new(target_type, addr, num_pages, attribute);
+        if self.entries.push(target).is_err() {
             return Err(efi::Status::OUT_OF_RESOURCES);
         }
 
-        // Region after the ACPI portion (keep original type)
+        // Region after the target portion (keep original type)
         if entry.end() > end {
             let after_pages = (entry.end() - end) / PAGE_SIZE;
             let after = MemoryDescriptor::new(original_type, end, after_pages, attribute);
@@ -468,92 +481,31 @@ impl MemoryAllocator {
         Ok(())
     }
 
+    /// Mark a memory region as ACPI Reclaim Memory.
+    ///
+    /// Splits the containing entry as needed. Skips regions already typed as
+    /// `AcpiReclaimMemory` or `AcpiMemoryNvs`.
+    pub fn mark_as_acpi_reclaim(&mut self, addr: u64, num_pages: u64) -> Result<(), efi::Status> {
+        self.mark_region_as(
+            addr,
+            num_pages,
+            MemoryType::AcpiReclaimMemory,
+            &[MemoryType::AcpiReclaimMemory, MemoryType::AcpiMemoryNvs],
+        )
+    }
+
     /// Mark a memory region as Reserved Memory.
     ///
     /// This is the correct way to reserve pages that are already part of a
     /// ConventionalMemory region (e.g. EL2 page tables that coreboot set up
-    /// inside a RAM region). Unlike force_add_region(), this properly finds
-    /// the containing entry, splits it, and changes the type so the allocator
-    /// will never hand out those pages.
+    /// inside a RAM region). Splits the containing entry as needed.
     pub fn mark_as_reserved(&mut self, addr: u64, num_pages: u64) -> Result<(), efi::Status> {
-        // Check for overflow in size calculation
-        let size = num_pages
-            .checked_mul(PAGE_SIZE)
-            .ok_or(efi::Status::INVALID_PARAMETER)?;
-        let end = addr
-            .checked_add(size)
-            .ok_or(efi::Status::INVALID_PARAMETER)?;
-
-        // Find the entry containing this region (any memory type)
-        let found_idx = self
-            .entries
-            .iter()
-            .position(|entry| entry.physical_start <= addr && entry.end() >= end);
-
-        let idx = match found_idx {
-            Some(i) => i,
-            None => {
-                // No containing entry — add as a new entry
-                let desc = MemoryDescriptor::new(
-                    MemoryType::ReservedMemoryType,
-                    addr,
-                    num_pages,
-                    attributes::EFI_MEMORY_WB,
-                );
-                if self.entries.push(desc).is_err() {
-                    return Err(efi::Status::OUT_OF_RESOURCES);
-                }
-                self.map_key += 1;
-                self.sort_entries();
-                return Ok(());
-            }
-        };
-
-        let entry = self.entries[idx];
-        let original_type = entry
-            .get_memory_type()
-            .unwrap_or(MemoryType::ReservedMemoryType);
-
-        // If already reserved, nothing to do
-        if original_type == MemoryType::ReservedMemoryType {
-            return Ok(());
-        }
-
-        let attribute = entry.attribute;
-
-        // Remove the old entry
-        self.entries.remove(idx);
-
-        // Add up to 3 new entries: before, reserved, after
-        if entry.physical_start < addr {
-            let before_pages = (addr - entry.physical_start) / PAGE_SIZE;
-            let before =
-                MemoryDescriptor::new(original_type, entry.physical_start, before_pages, attribute);
-            if self.entries.push(before).is_err() {
-                return Err(efi::Status::OUT_OF_RESOURCES);
-            }
-        }
-
-        // The reserved region
-        let reserved =
-            MemoryDescriptor::new(MemoryType::ReservedMemoryType, addr, num_pages, attribute);
-        if self.entries.push(reserved).is_err() {
-            return Err(efi::Status::OUT_OF_RESOURCES);
-        }
-
-        // Region after the reserved portion (keep original type)
-        if entry.end() > end {
-            let after_pages = (entry.end() - end) / PAGE_SIZE;
-            let after = MemoryDescriptor::new(original_type, end, after_pages, attribute);
-            if self.entries.push(after).is_err() {
-                return Err(efi::Status::OUT_OF_RESOURCES);
-            }
-        }
-
-        self.map_key += 1;
-        self.sort_entries();
-
-        Ok(())
+        self.mark_region_as(
+            addr,
+            num_pages,
+            MemoryType::ReservedMemoryType,
+            &[MemoryType::ReservedMemoryType],
+        )
     }
 
     /// Allocate pages of memory
