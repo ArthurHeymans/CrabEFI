@@ -21,7 +21,7 @@
         devShells.default = pkgs.mkShell {
           buildInputs = with pkgs; [
             # QEMU for testing
-            qemu
+            qemu_full
 
             # Disk image tools
             parted

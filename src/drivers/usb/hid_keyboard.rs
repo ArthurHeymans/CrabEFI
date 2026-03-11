@@ -789,8 +789,8 @@ pub fn poll<C: UsbController>(controller: &mut C) {
 ///
 /// Returns (shift_state_bits, toggle_state_bits) without the VALID flags.
 pub fn get_efi_state() -> (u32, u8) {
-    use crate::drivers::keyboard::efi_shift_state::*;
-    use crate::drivers::keyboard::efi_toggle_state::*;
+    use crate::drivers::keyboard_common::efi_shift_state::*;
+    use crate::drivers::keyboard_common::efi_toggle_state::*;
 
     let guard = USB_KEYBOARD.lock();
     let keyboard = match guard.as_ref() {

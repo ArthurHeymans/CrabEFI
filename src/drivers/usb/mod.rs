@@ -23,6 +23,7 @@ pub mod ehci_regs;
 pub mod hid_keyboard;
 pub mod mass_storage;
 pub mod ohci;
+#[cfg(target_arch = "x86_64")]
 pub mod uhci;
 pub mod xhci;
 pub mod xhci_regs;
@@ -47,6 +48,7 @@ pub enum UsbControllerHandle {
     Xhci(*mut XhciController),
     Ehci(*mut ehci::EhciController),
     Ohci(*mut ohci::OhciController),
+    #[cfg(target_arch = "x86_64")]
     Uhci(*mut uhci::UhciController),
 }
 
@@ -79,6 +81,7 @@ macro_rules! with_usb_controller {
                 let $controller = unsafe { &mut **ptr };
                 $body
             }
+            #[cfg(target_arch = "x86_64")]
             UsbControllerHandle::Uhci(ptr) => {
                 let $controller = unsafe { &mut **ptr };
                 $body
@@ -100,6 +103,7 @@ macro_rules! with_usb_controller {
                 let $controller = unsafe { &**ptr };
                 $body
             }
+            #[cfg(target_arch = "x86_64")]
             UsbControllerHandle::Uhci(ptr) => {
                 let $controller = unsafe { &**ptr };
                 $body
@@ -195,6 +199,7 @@ pub fn init_device(dev: &pci::PciDevice) -> Result<(), ()> {
         0x30 => init_usb_controller!("xHCI", XhciController, Xhci),
         0x20 => init_usb_controller!("EHCI", ehci::EhciController, Ehci),
         0x10 => init_usb_controller!("OHCI", ohci::OhciController, Ohci),
+        #[cfg(target_arch = "x86_64")]
         0x00 => init_usb_controller!("UHCI", uhci::UhciController, Uhci),
         _ => {
             log::debug!(
@@ -387,6 +392,7 @@ pub fn get_controller_ptr(index: usize) -> Option<*mut dyn UsbController> {
         UsbControllerHandle::Xhci(p) => *p as *mut dyn UsbController,
         UsbControllerHandle::Ehci(p) => *p as *mut dyn UsbController,
         UsbControllerHandle::Ohci(p) => *p as *mut dyn UsbController,
+        #[cfg(target_arch = "x86_64")]
         UsbControllerHandle::Uhci(p) => *p as *mut dyn UsbController,
     };
 

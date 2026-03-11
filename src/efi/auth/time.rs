@@ -76,11 +76,29 @@ pub(crate) fn x509_time_to_unix(time: &x509_cert::time::Time) -> Result<i64, Aut
     Ok(dt.unix_duration().as_secs() as i64)
 }
 
-/// Read the current date/time from the CMOS RTC
+/// Read the current date/time from the hardware RTC
 ///
 /// Returns `(year, month, day, hour, minute, second)`.
-/// Handles both BCD and binary RTC modes, and reads the century register.
+///
+/// - **x86_64**: Reads the CMOS RTC via I/O ports 0x70/0x71
+/// - **aarch64**: Returns a fallback value (PL031 RTC support TODO)
 pub(crate) fn read_rtc_time() -> (u16, u8, u8, u8, u8, u8) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        read_rtc_time_x86()
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        // TODO: Implement PL031 RTC reading for aarch64 SBSA
+        // For now, return a safe fallback time
+        log::debug!("RTC: aarch64 PL031 not yet implemented, using fallback time");
+        (2025, 1, 1, 0, 0, 0)
+    }
+}
+
+/// x86 CMOS RTC implementation
+#[cfg(target_arch = "x86_64")]
+fn read_rtc_time_x86() -> (u16, u8, u8, u8, u8, u8) {
     use crate::arch::x86_64::io;
 
     // Wait for RTC update to complete (bounded to avoid infinite loop)
@@ -131,8 +149,6 @@ pub(crate) fn read_rtc_time() -> (u16, u8, u8, u8, u8, u8) {
     let full_year = (century as u16) * 100 + (year as u16);
 
     // Validate RTC values to guard against corrupted CMOS or garbage BCD data.
-    // Invalid values could cause incorrect certificate validity checks.
-    // Fall back to a safe default (2025-01-01 00:00:00) on failure.
     if !(1..=12).contains(&month)
         || !(1..=31).contains(&day)
         || hour > 23

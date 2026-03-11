@@ -1,294 +1,365 @@
 //! Time and delay functions
 //!
-//! This module provides timing primitives using the x86 TSC (Time Stamp Counter),
-//! calibrated against the ACPI PM timer for accurate real-time measurements.
+//! This module provides timing primitives using a high-resolution monotonic counter:
+//! - **x86_64**: TSC (Time Stamp Counter) calibrated against the ACPI PM timer
+//! - **aarch64**: ARM Generic Timer (`CNTPCT_EL0` / `CNTFRQ_EL0`)
 
-use crate::arch::x86_64::io;
 use core::sync::atomic::{AtomicU64, Ordering};
+
+#[cfg(target_arch = "x86_64")]
+use crate::arch::x86_64::io;
+#[cfg(target_arch = "x86_64")]
 use zerocopy::{FromBytes, Immutable, KnownLayout, Unaligned};
 
-// Re-export rdtsc from arch module for public API
+// ============================================================================
+// Architecture-agnostic counter interface
+// ============================================================================
+
+/// Counter frequency in Hz (cycles per second)
+/// Default to 2 GHz as a conservative fallback for x86, or set by init for aarch64
+static COUNTER_FREQ_HZ: AtomicU64 = AtomicU64::new(2_000_000_000);
+
+/// Counter cycles per microsecond (cached for fast access)
+static COUNTER_CYCLES_PER_US: AtomicU64 = AtomicU64::new(2000);
+
+/// Read the monotonic counter value
+///
+/// Returns a raw counter value whose frequency is reported by `counter_frequency()`.
+#[inline]
+pub fn read_counter() -> u64 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        crate::arch::x86_64::rdtsc()
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        crate::arch::aarch64::read_counter()
+    }
+}
+
+/// Get the counter frequency in Hz
+pub fn counter_frequency() -> u64 {
+    COUNTER_FREQ_HZ.load(Ordering::Relaxed)
+}
+
+// Re-export read_counter as rdtsc on x86 for backwards compat with existing callers
+#[cfg(target_arch = "x86_64")]
 pub use crate::arch::x86_64::rdtsc;
 
-/// TSC frequency in Hz (cycles per second)
-/// Default to 2 GHz as a conservative fallback
-static TSC_FREQ_HZ: AtomicU64 = AtomicU64::new(2_000_000_000);
-
-/// TSC cycles per microsecond (cached for fast access)
-static TSC_CYCLES_PER_US: AtomicU64 = AtomicU64::new(2000);
-
-/// ACPI PM timer frequency: 3.579545 MHz
-const PM_TIMER_FREQ: u64 = 3_579_545;
-
-/// PM timer I/O port (set during calibration)
-static PM_TIMER_PORT: AtomicU64 = AtomicU64::new(0);
-
-/// PM timer is 32-bit (vs 24-bit)
-static PM_TIMER_32BIT: AtomicU64 = AtomicU64::new(0);
-
-/// Read the ACPI PM timer value
+// On aarch64, provide rdtsc as an alias for read_counter for source compat
+#[cfg(target_arch = "aarch64")]
 #[inline]
-fn read_pm_timer() -> u32 {
-    let port = PM_TIMER_PORT.load(Ordering::Relaxed) as u16;
-    if port == 0 {
-        return 0;
-    }
-    unsafe { io::inl(port) }
+pub fn rdtsc() -> u64 {
+    read_counter()
 }
 
-/// ACPI RSDP structure (Root System Description Pointer)
-#[repr(C, packed)]
-#[derive(FromBytes, Immutable, KnownLayout, Unaligned)]
-struct AcpiRsdp {
-    signature: [u8; 8], // "RSD PTR "
-    checksum: u8,
-    oem_id: [u8; 6],
-    revision: u8,
-    rsdt_address: u32,
-    // ACPI 2.0+ fields
-    length: u32,
-    xsdt_address: u64,
-    extended_checksum: u8,
-    reserved: [u8; 3],
+// Re-export counter_frequency as tsc_frequency for backwards compat
+pub fn tsc_frequency() -> u64 {
+    COUNTER_FREQ_HZ.load(Ordering::Relaxed)
 }
 
-/// ACPI SDT header (common to all tables)
-#[repr(C, packed)]
-#[derive(FromBytes, Immutable, KnownLayout, Unaligned)]
-struct AcpiSdtHeader {
-    signature: [u8; 4],
-    length: u32,
-    revision: u8,
-    checksum: u8,
-    oem_id: [u8; 6],
-    oem_table_id: [u8; 8],
-    oem_revision: u32,
-    creator_id: u32,
-    creator_revision: u32,
-}
+// ============================================================================
+// x86_64: ACPI PM Timer calibration
+// ============================================================================
 
-/// ACPI FADT (Fixed ACPI Description Table)
-#[repr(C, packed)]
-#[derive(FromBytes, Immutable, KnownLayout, Unaligned)]
-struct AcpiFadt {
-    header: AcpiSdtHeader,
-    firmware_ctrl: u32,
-    dsdt: u32,
-    reserved1: u8,
-    preferred_pm_profile: u8,
-    sci_int: u16,
-    smi_cmd: u32,
-    acpi_enable: u8,
-    acpi_disable: u8,
-    s4bios_req: u8,
-    pstate_cnt: u8,
-    pm1a_evt_blk: u32,
-    pm1b_evt_blk: u32,
-    pm1a_cnt_blk: u32,
-    pm1b_cnt_blk: u32,
-    pm2_cnt_blk: u32,
-    pm_tmr_blk: u32, // PM Timer I/O port address
-    gpe0_blk: u32,
-    gpe1_blk: u32,
-    pm1_evt_len: u8,
-    pm1_cnt_len: u8,
-    pm2_cnt_len: u8,
-    pm_tmr_len: u8, // PM Timer length (4 bytes)
-    gpe0_blk_len: u8,
-    gpe1_blk_len: u8,
-    gpe1_base: u8,
-    cst_cnt: u8,
-    p_lvl2_lat: u16,
-    p_lvl3_lat: u16,
-    flush_size: u16,
-    flush_stride: u16,
-    duty_offset: u8,
-    duty_width: u8,
-    day_alrm: u8,
-    mon_alrm: u8,
-    century: u8,
-    iapc_boot_arch: u16,
-    reserved2: u8,
-    flags: u32, // Bit 8: TMR_VAL_EXT (1 = 32-bit timer)
-}
+#[cfg(target_arch = "x86_64")]
+mod x86_calibration {
+    use super::*;
 
-/// Find FADT in ACPI tables and extract PM timer port
-unsafe fn find_pm_timer_port(rsdp_addr: u64) -> Option<(u16, bool)> {
-    let rsdp = &*(rsdp_addr as *const AcpiRsdp);
+    /// ACPI PM timer frequency: 3.579545 MHz
+    const PM_TIMER_FREQ: u64 = 3_579_545;
 
-    // Verify RSDP signature
-    if &rsdp.signature != b"RSD PTR " {
-        log::warn!("Invalid RSDP signature");
-        return None;
+    /// PM timer I/O port (set during calibration)
+    static PM_TIMER_PORT: AtomicU64 = AtomicU64::new(0);
+
+    /// PM timer is 32-bit (vs 24-bit)
+    static PM_TIMER_32BIT: AtomicU64 = AtomicU64::new(0);
+
+    /// Read the ACPI PM timer value
+    #[inline]
+    fn read_pm_timer() -> u32 {
+        let port = PM_TIMER_PORT.load(Ordering::Relaxed) as u16;
+        if port == 0 {
+            return 0;
+        }
+        unsafe { io::inl(port) }
     }
 
-    // Get RSDT or XSDT address
-    // With zerocopy's Unaligned derive, we can safely access packed fields
-    let (table_addr, is_xsdt) = if rsdp.revision >= 2 && rsdp.xsdt_address != 0 {
-        (rsdp.xsdt_address, true)
-    } else {
-        (rsdp.rsdt_address as u64, false)
-    };
-
-    if table_addr == 0 {
-        log::warn!("No RSDT/XSDT address in RSDP");
-        return None;
+    /// ACPI RSDP structure (Root System Description Pointer)
+    #[repr(C, packed)]
+    #[derive(FromBytes, Immutable, KnownLayout, Unaligned)]
+    struct AcpiRsdp {
+        signature: [u8; 8], // "RSD PTR "
+        checksum: u8,
+        oem_id: [u8; 6],
+        revision: u8,
+        rsdt_address: u32,
+        // ACPI 2.0+ fields
+        length: u32,
+        xsdt_address: u64,
+        extended_checksum: u8,
+        reserved: [u8; 3],
     }
 
-    let header = &*(table_addr as *const AcpiSdtHeader);
-    // With zerocopy's Unaligned derive, we can safely access packed fields
-    let table_len = header.length as usize;
-    let header_size = core::mem::size_of::<AcpiSdtHeader>();
+    /// ACPI SDT header (common to all tables)
+    #[repr(C, packed)]
+    #[derive(FromBytes, Immutable, KnownLayout, Unaligned)]
+    struct AcpiSdtHeader {
+        signature: [u8; 4],
+        length: u32,
+        revision: u8,
+        checksum: u8,
+        oem_id: [u8; 6],
+        oem_table_id: [u8; 8],
+        oem_revision: u32,
+        creator_id: u32,
+        creator_revision: u32,
+    }
 
-    // Calculate number of entries
-    let entry_size = if is_xsdt { 8 } else { 4 };
-    let num_entries = (table_len - header_size) / entry_size;
+    /// ACPI FADT (Fixed ACPI Description Table)
+    #[repr(C, packed)]
+    #[derive(FromBytes, Immutable, KnownLayout, Unaligned)]
+    struct AcpiFadt {
+        header: AcpiSdtHeader,
+        firmware_ctrl: u32,
+        dsdt: u32,
+        reserved1: u8,
+        preferred_pm_profile: u8,
+        sci_int: u16,
+        smi_cmd: u32,
+        acpi_enable: u8,
+        acpi_disable: u8,
+        s4bios_req: u8,
+        pstate_cnt: u8,
+        pm1a_evt_blk: u32,
+        pm1b_evt_blk: u32,
+        pm1a_cnt_blk: u32,
+        pm1b_cnt_blk: u32,
+        pm2_cnt_blk: u32,
+        pm_tmr_blk: u32, // PM Timer I/O port address
+        gpe0_blk: u32,
+        gpe1_blk: u32,
+        pm1_evt_len: u8,
+        pm1_cnt_len: u8,
+        pm2_cnt_len: u8,
+        pm_tmr_len: u8, // PM Timer length (4 bytes)
+        gpe0_blk_len: u8,
+        gpe1_blk_len: u8,
+        gpe1_base: u8,
+        cst_cnt: u8,
+        p_lvl2_lat: u16,
+        p_lvl3_lat: u16,
+        flush_size: u16,
+        flush_stride: u16,
+        duty_offset: u8,
+        duty_width: u8,
+        day_alrm: u8,
+        mon_alrm: u8,
+        century: u8,
+        iapc_boot_arch: u16,
+        reserved2: u8,
+        flags: u32, // Bit 8: TMR_VAL_EXT (1 = 32-bit timer)
+    }
 
-    log::debug!(
-        "ACPI: {} at {:#x}, {} entries",
-        if is_xsdt { "XSDT" } else { "RSDT" },
-        table_addr,
-        num_entries
-    );
+    /// Find FADT in ACPI tables and extract PM timer port
+    unsafe fn find_pm_timer_port(rsdp_addr: u64) -> Option<(u16, bool)> {
+        let rsdp = &*(rsdp_addr as *const AcpiRsdp);
 
-    // Search for FADT (signature "FACP")
-    let entries_base = table_addr + header_size as u64;
-    for i in 0..num_entries {
-        let entry_addr = if is_xsdt {
-            *((entries_base + (i * 8) as u64) as *const u64)
+        // Verify RSDP signature
+        if &rsdp.signature != b"RSD PTR " {
+            log::warn!("Invalid RSDP signature");
+            return None;
+        }
+
+        // Get RSDT or XSDT address
+        let (table_addr, is_xsdt) = if rsdp.revision >= 2 && rsdp.xsdt_address != 0 {
+            (rsdp.xsdt_address, true)
         } else {
-            *((entries_base + (i * 4) as u64) as *const u32) as u64
+            (rsdp.rsdt_address as u64, false)
         };
 
-        if entry_addr == 0 {
-            continue;
+        if table_addr == 0 {
+            log::warn!("No RSDT/XSDT address in RSDP");
+            return None;
         }
 
-        let entry_header = &*(entry_addr as *const AcpiSdtHeader);
-        if &entry_header.signature == b"FACP" {
-            let fadt = &*(entry_addr as *const AcpiFadt);
-            // With zerocopy's Unaligned derive, we can safely access packed fields
-            let pm_tmr_blk = fadt.pm_tmr_blk;
-            let flags = fadt.flags;
-            let is_32bit = (flags & (1 << 8)) != 0; // TMR_VAL_EXT bit
+        let header = &*(table_addr as *const AcpiSdtHeader);
+        let table_len = header.length as usize;
+        let header_size = core::mem::size_of::<AcpiSdtHeader>();
 
-            if pm_tmr_blk != 0 {
-                log::debug!(
-                    "ACPI FADT: PM timer at I/O port {:#x} ({})",
-                    pm_tmr_blk,
-                    if is_32bit { "32-bit" } else { "24-bit" }
-                );
-                return Some((pm_tmr_blk as u16, is_32bit));
+        // Calculate number of entries
+        let entry_size = if is_xsdt { 8 } else { 4 };
+        let num_entries = (table_len - header_size) / entry_size;
+
+        log::debug!(
+            "ACPI: {} at {:#x}, {} entries",
+            if is_xsdt { "XSDT" } else { "RSDT" },
+            table_addr,
+            num_entries
+        );
+
+        // Search for FADT (signature "FACP")
+        let entries_base = table_addr + header_size as u64;
+        for i in 0..num_entries {
+            let entry_addr = if is_xsdt {
+                ((entries_base + (i * 8) as u64) as *const u64).read_unaligned()
+            } else {
+                ((entries_base + (i * 4) as u64) as *const u32).read_unaligned() as u64
+            };
+
+            if entry_addr == 0 {
+                continue;
+            }
+
+            let entry_header = &*(entry_addr as *const AcpiSdtHeader);
+            if &entry_header.signature == b"FACP" {
+                let fadt = &*(entry_addr as *const AcpiFadt);
+                let pm_tmr_blk = fadt.pm_tmr_blk;
+                let flags = fadt.flags;
+                let is_32bit = (flags & (1 << 8)) != 0; // TMR_VAL_EXT bit
+
+                if pm_tmr_blk != 0 {
+                    log::debug!(
+                        "ACPI FADT: PM timer at I/O port {:#x} ({})",
+                        pm_tmr_blk,
+                        if is_32bit { "32-bit" } else { "24-bit" }
+                    );
+                    return Some((pm_tmr_blk as u16, is_32bit));
+                }
             }
         }
+
+        log::warn!("FADT not found or PM timer not available");
+        None
     }
 
-    log::warn!("FADT not found or PM timer not available");
-    None
+    /// Calibrate TSC using ACPI PM timer
+    fn calibrate_tsc_with_pm_timer() -> Option<u64> {
+        let port = PM_TIMER_PORT.load(Ordering::Relaxed) as u16;
+        if port == 0 {
+            return None;
+        }
+
+        let is_32bit = PM_TIMER_32BIT.load(Ordering::Relaxed) != 0;
+        let timer_mask: u32 = if is_32bit { 0xFFFFFFFF } else { 0x00FFFFFF };
+
+        // Wait for PM timer to tick (synchronize)
+        let mut last = read_pm_timer() & timer_mask;
+        loop {
+            let current = read_pm_timer() & timer_mask;
+            if current != last {
+                break;
+            }
+            last = current;
+        }
+
+        // Measure TSC ticks over ~50ms worth of PM timer ticks
+        const CALIBRATION_TICKS: u32 = 178_977;
+
+        let pm_start = read_pm_timer() & timer_mask;
+        let tsc_start = rdtsc();
+
+        loop {
+            let pm_current = read_pm_timer() & timer_mask;
+            let pm_elapsed = pm_current.wrapping_sub(pm_start) & timer_mask;
+            if pm_elapsed >= CALIBRATION_TICKS {
+                break;
+            }
+            core::hint::spin_loop();
+        }
+
+        let tsc_end = rdtsc();
+        let pm_end = read_pm_timer() & timer_mask;
+
+        let pm_elapsed = pm_end.wrapping_sub(pm_start) & timer_mask;
+        let tsc_elapsed = tsc_end.wrapping_sub(tsc_start);
+        let tsc_freq = (tsc_elapsed as u128 * PM_TIMER_FREQ as u128 / pm_elapsed as u128) as u64;
+
+        Some(tsc_freq)
+    }
+
+    /// Initialize x86 timing (calibrate TSC via ACPI PM timer)
+    pub fn init(acpi_rsdp: Option<u64>) {
+        log::debug!("Initializing timing subsystem (x86_64 TSC)...");
+
+        if let Some(rsdp_addr) = acpi_rsdp
+            && let Some((port, is_32bit)) = unsafe { find_pm_timer_port(rsdp_addr) }
+        {
+            PM_TIMER_PORT.store(port as u64, Ordering::Relaxed);
+            PM_TIMER_32BIT.store(if is_32bit { 1 } else { 0 }, Ordering::Relaxed);
+
+            if let Some(freq) = calibrate_tsc_with_pm_timer() {
+                let cycles_per_us = freq / 1_000_000;
+                COUNTER_FREQ_HZ.store(freq, Ordering::Relaxed);
+                COUNTER_CYCLES_PER_US.store(cycles_per_us, Ordering::Relaxed);
+
+                log::info!(
+                    "TSC calibrated: {} MHz ({} cycles/us)",
+                    freq / 1_000_000,
+                    cycles_per_us
+                );
+                return;
+            }
+        }
+
+        log::warn!("TSC calibration failed, using default 2 GHz estimate");
+    }
 }
 
-/// Calibrate TSC using ACPI PM timer
-///
-/// Measures TSC ticks over a known PM timer interval to determine TSC frequency.
-fn calibrate_tsc_with_pm_timer() -> Option<u64> {
-    let port = PM_TIMER_PORT.load(Ordering::Relaxed) as u16;
-    if port == 0 {
-        return None;
-    }
+// ============================================================================
+// aarch64: ARM Generic Timer
+// ============================================================================
 
-    let is_32bit = PM_TIMER_32BIT.load(Ordering::Relaxed) != 0;
-    let timer_mask: u32 = if is_32bit { 0xFFFFFFFF } else { 0x00FFFFFF };
+#[cfg(target_arch = "aarch64")]
+mod aarch64_timer {
+    use super::*;
 
-    // Wait for PM timer to tick (synchronize)
-    let mut last = read_pm_timer() & timer_mask;
-    loop {
-        let current = read_pm_timer() & timer_mask;
-        if current != last {
-            break;
+    /// Initialize aarch64 timing from the Generic Timer frequency register
+    pub fn init(_acpi_rsdp: Option<u64>) {
+        let freq = crate::arch::aarch64::read_counter_freq();
+
+        if freq == 0 {
+            log::warn!("ARM Generic Timer frequency is 0, using 62.5 MHz fallback");
+            let fallback = 62_500_000u64;
+            COUNTER_FREQ_HZ.store(fallback, Ordering::Relaxed);
+            COUNTER_CYCLES_PER_US.store(fallback / 1_000_000, Ordering::Relaxed);
+            return;
         }
-        last = current;
+
+        let cycles_per_us = freq / 1_000_000;
+        COUNTER_FREQ_HZ.store(freq, Ordering::Relaxed);
+        COUNTER_CYCLES_PER_US.store(cycles_per_us.max(1), Ordering::Relaxed);
+
+        log::info!(
+            "ARM Generic Timer: {} MHz ({} cycles/us)",
+            freq / 1_000_000,
+            cycles_per_us
+        );
     }
-
-    // Measure TSC ticks over ~50ms worth of PM timer ticks
-    // 50ms = 178,977 PM timer ticks (at 3.579545 MHz)
-    const CALIBRATION_TICKS: u32 = 178_977;
-
-    let pm_start = read_pm_timer() & timer_mask;
-    let tsc_start = rdtsc();
-
-    // Wait for CALIBRATION_TICKS PM timer ticks
-    loop {
-        let pm_current = read_pm_timer() & timer_mask;
-        let pm_elapsed = pm_current.wrapping_sub(pm_start) & timer_mask;
-        if pm_elapsed >= CALIBRATION_TICKS {
-            break;
-        }
-        core::hint::spin_loop();
-    }
-
-    let tsc_end = rdtsc();
-    let pm_end = read_pm_timer() & timer_mask;
-
-    // Calculate actual PM timer ticks elapsed
-    let pm_elapsed = pm_end.wrapping_sub(pm_start) & timer_mask;
-
-    // Calculate TSC ticks elapsed
-    let tsc_elapsed = tsc_end.wrapping_sub(tsc_start);
-
-    // Calculate TSC frequency: tsc_freq = tsc_elapsed * PM_TIMER_FREQ / pm_elapsed
-    let tsc_freq = (tsc_elapsed as u128 * PM_TIMER_FREQ as u128 / pm_elapsed as u128) as u64;
-
-    Some(tsc_freq)
 }
+
+// ============================================================================
+// Public API (arch-agnostic)
+// ============================================================================
 
 /// Initialize timing subsystem
-///
-/// Attempts to calibrate TSC using ACPI PM timer. Falls back to default
-/// frequency if calibration fails.
 ///
 /// # Arguments
 ///
 /// * `acpi_rsdp` - Optional ACPI RSDP physical address from coreboot
 pub fn init(acpi_rsdp: Option<u64>) {
-    log::debug!("Initializing timing subsystem...");
-
-    // Try to find PM timer port from ACPI tables
-    if let Some(rsdp_addr) = acpi_rsdp
-        && let Some((port, is_32bit)) = unsafe { find_pm_timer_port(rsdp_addr) }
-    {
-        PM_TIMER_PORT.store(port as u64, Ordering::Relaxed);
-        PM_TIMER_32BIT.store(if is_32bit { 1 } else { 0 }, Ordering::Relaxed);
-
-        // Calibrate TSC using PM timer
-        if let Some(freq) = calibrate_tsc_with_pm_timer() {
-            let cycles_per_us = freq / 1_000_000;
-            TSC_FREQ_HZ.store(freq, Ordering::Relaxed);
-            TSC_CYCLES_PER_US.store(cycles_per_us, Ordering::Relaxed);
-
-            log::info!(
-                "TSC calibrated: {} MHz ({} cycles/us)",
-                freq / 1_000_000,
-                cycles_per_us
-            );
-            return;
-        }
-    }
-
-    // Fallback: use default 2 GHz estimate
-    log::warn!("TSC calibration failed, using default 2 GHz estimate");
-}
-
-/// Get TSC frequency in Hz
-pub fn tsc_frequency() -> u64 {
-    TSC_FREQ_HZ.load(Ordering::Relaxed)
+    #[cfg(target_arch = "x86_64")]
+    x86_calibration::init(acpi_rsdp);
+    #[cfg(target_arch = "aarch64")]
+    aarch64_timer::init(acpi_rsdp);
 }
 
 /// Spin-wait for approximately `us` microseconds
 #[inline]
 pub fn delay_us(us: u64) {
-    let cycles = us * TSC_CYCLES_PER_US.load(Ordering::Relaxed);
-    let start = rdtsc();
-    while rdtsc().wrapping_sub(start) < cycles {
+    let cycles = us * COUNTER_CYCLES_PER_US.load(Ordering::Relaxed);
+    let start = read_counter();
+    while read_counter().wrapping_sub(start) < cycles {
         core::hint::spin_loop();
     }
 }
@@ -322,9 +393,9 @@ impl Timeout {
     /// Create a timeout that expires after `us` microseconds
     #[inline]
     pub fn from_us(us: u64) -> Self {
-        let cycles = us * TSC_CYCLES_PER_US.load(Ordering::Relaxed);
+        let cycles = us * COUNTER_CYCLES_PER_US.load(Ordering::Relaxed);
         Self {
-            deadline: rdtsc().wrapping_add(cycles),
+            deadline: read_counter().wrapping_add(cycles),
         }
     }
 
@@ -337,8 +408,7 @@ impl Timeout {
     /// Check if the timeout has expired
     #[inline]
     pub fn is_expired(&self) -> bool {
-        // Handle wraparound by using signed comparison
-        let now = rdtsc();
+        let now = read_counter();
         let diff = self.deadline.wrapping_sub(now) as i64;
         diff <= 0
     }
@@ -348,20 +418,6 @@ impl Timeout {
 ///
 /// Spins until `condition()` returns `true` or the timeout expires.
 /// Returns `true` if the condition was met, `false` if timeout expired.
-///
-/// # Arguments
-///
-/// * `timeout_ms` - Maximum time to wait in milliseconds
-/// * `condition` - Closure that returns `true` when the wait should end
-///
-/// # Example
-///
-/// ```ignore
-/// // Wait up to 100ms for device to become ready
-/// if !wait_for(100, || device.is_ready()) {
-///     return Err(TimeoutError);
-/// }
-/// ```
 #[inline]
 pub fn wait_for<F>(timeout_ms: u64, condition: F) -> bool
 where
@@ -378,25 +434,6 @@ where
 }
 
 /// Wait for a condition with a custom action on each iteration
-///
-/// Similar to `wait_for`, but calls `action()` on each loop iteration
-/// before checking the condition. Useful when polling requires side effects.
-///
-/// # Arguments
-///
-/// * `timeout_ms` - Maximum time to wait in milliseconds
-/// * `mut action` - Mutable closure called each iteration (e.g., to read a register)
-/// * `condition` - Closure that checks if the wait should end
-///
-/// # Example
-///
-/// ```ignore
-/// // Poll a register until a bit is set
-/// let mut status = 0u32;
-/// if !wait_for_with(100, || status = read_status(), || status & READY_BIT != 0) {
-///     return Err(TimeoutError);
-/// }
-/// ```
 #[inline]
 pub fn wait_for_with<A, C>(timeout_ms: u64, mut action: A, condition: C) -> bool
 where

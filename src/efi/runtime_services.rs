@@ -3,7 +3,7 @@
 //! This module implements the EFI Runtime Services table, which provides
 //! time, variable, and system reset services that persist after ExitBootServices.
 
-#[cfg(feature = "rt-debug")]
+#[cfg(all(feature = "rt-debug", target_arch = "x86_64"))]
 use crate::arch::x86_64::io;
 use crate::efi::auth;
 use crate::state::{self, MAX_VARIABLE_DATA_SIZE, MAX_VARIABLE_NAME_LEN, MAX_VARIABLES};
@@ -19,7 +19,7 @@ use crate::state::{self, MAX_VARIABLE_DATA_SIZE, MAX_VARIABLE_NAME_LEN, MAX_VARI
 //
 // Gated behind the `rt-debug` feature flag (default off) to avoid overhead.
 
-#[cfg(feature = "rt-debug")]
+#[cfg(all(feature = "rt-debug", target_arch = "x86_64"))]
 mod rt_serial {
     use super::*;
 

@@ -7,7 +7,7 @@
 //!
 //! - Discovers boot entries from NVMe, AHCI, USB, and SD card storage devices
 //! - Supports multiple boot entry types:
-//!   - UEFI bootloaders (EFI\\BOOT\\BOOTX64.EFI)
+//!   - UEFI bootloaders (EFI\\BOOT\\BOOTX64.EFI or BOOTAA64.EFI)
 //!   - BLS (Boot Loader Specification) entries in /loader/entries/
 //!   - GRUB configuration entries from grub.cfg
 //!   - Coreboot payload chainloading
@@ -32,6 +32,12 @@ const MAX_BOOT_ENTRIES: usize = 16;
 
 /// Default timeout in seconds for auto-boot
 const DEFAULT_TIMEOUT_SECONDS: u32 = 5;
+
+/// Architecture-specific EFI boot path
+#[cfg(target_arch = "x86_64")]
+pub const EFI_BOOT_PATH: &str = "EFI\\BOOT\\BOOTX64.EFI";
+#[cfg(target_arch = "aarch64")]
+pub const EFI_BOOT_PATH: &str = "EFI\\BOOT\\BOOTAA64.EFI";
 
 /// Menu title
 const MENU_TITLE: &str = "CrabEFI Boot Menu";
@@ -59,7 +65,7 @@ pub enum DeviceType {
 /// Boot entry kind - how this entry should be booted
 #[derive(Debug, Clone, Default)]
 pub enum BootEntryKind {
-    /// UEFI executable (EFI\BOOT\BOOTX64.EFI)
+    /// UEFI executable (EFI\BOOT\BOOTxx.EFI)
     #[default]
     Uefi,
 
@@ -98,7 +104,7 @@ pub enum BootEntryKind {
 /// Category for menu grouping
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BootCategory {
-    /// UEFI boot entries (BOOTX64.EFI)
+    /// UEFI boot entries
     Uefi,
     /// Boot Loader Specification entries
     Bls,
@@ -337,7 +343,7 @@ impl BootMenu {
 
 /// Discover boot entries from all storage devices
 ///
-/// Scans NVMe, AHCI, and USB devices for ESPs containing `EFI\BOOT\BOOTX64.EFI`.
+/// Scans NVMe, AHCI, and USB devices for ESPs containing the arch-specific EFI bootloader.
 ///
 /// # Returns
 ///
@@ -367,7 +373,7 @@ pub fn discover_boot_entries() -> BootMenu {
 /// Discover boot entries on a disk that has already been stored globally.
 ///
 /// Reads the GPT partition table, then for each ESP (or potential ESP) partition,
-/// mounts the FAT filesystem, checks for `EFI\BOOT\BOOTX64.EFI`, and scans for
+/// mounts the FAT filesystem, checks for the arch-specific EFI bootloader, and scans for
 /// additional BLS/GRUB/payload entries.
 ///
 /// # Arguments
@@ -417,13 +423,13 @@ fn discover_entries_on_disk(
             };
 
             // Check for UEFI bootloader
-            if fat.file_size("EFI\\BOOT\\BOOTX64.EFI").is_ok() {
+            if fat.file_size(EFI_BOOT_PATH).is_ok() {
                 let mut name: String<64> = String::new();
                 let _ = write!(name, "Boot Entry ({})", name_prefix);
 
                 let entry = BootEntry::new(
                     &name,
-                    "EFI\\BOOT\\BOOTX64.EFI",
+                    EFI_BOOT_PATH,
                     device_type,
                     partition_num,
                     partition.clone(),
@@ -469,18 +475,29 @@ fn discover_nvme_entries(menu: &mut BootMenu) {
         return;
     }
 
-    let mut name_prefix: String<32> = String::new();
-    let _ = write!(name_prefix, "NVMe ns{}", nsid);
-    discover_entries_on_disk(
-        DeviceType::Nvme {
-            controller_id: 0,
-            nsid,
-        },
-        pci_addr.device,
-        pci_addr.function,
-        &name_prefix,
-        menu,
-    );
+    let device_type = DeviceType::Nvme {
+        controller_id: 0,
+        nsid,
+    };
+
+    // Try GPT-based discovery first
+    let had_gpt = crate::with_disk(&device_type, |disk| gpt::read_gpt_header(disk).is_ok())
+        .unwrap_or(false);
+
+    if had_gpt {
+        let mut name_prefix: String<32> = String::new();
+        let _ = write!(name_prefix, "NVMe ns{}", nsid);
+        discover_entries_on_disk(
+            device_type,
+            pci_addr.device,
+            pci_addr.function,
+            &name_prefix,
+            menu,
+        );
+    } else {
+        // GPT failed — try El Torito (ISO9660) as fallback
+        try_el_torito_fallback(device_type, pci_addr.device, pci_addr.function, menu);
+    }
 }
 
 /// Discover boot entries from AHCI devices
@@ -545,6 +562,11 @@ fn try_el_torito_fallback(
             return;
         }
 
+        log::info!(
+            "El Torito: boot image start_sector={}, sector_count={}, size_bytes={}",
+            efi_image.start_sector, efi_image.sector_count, efi_image.size_bytes
+        );
+
         // Create a synthetic partition for the El Torito boot image
         let block_size = disk.info().block_size;
         let partition = gpt::Partition {
@@ -578,7 +600,7 @@ fn try_el_torito_fallback(
 
         let entry = BootEntry::new(
             &name,
-            "EFI\\BOOT\\BOOTX64.EFI",
+            EFI_BOOT_PATH,
             device_type,
             0, // No partition number for El Torito
             partition,
@@ -714,11 +736,20 @@ fn linux_path_to_fat(path: &str) -> String<128> {
 /// Check if a bootloader exists on the given partition
 fn check_bootloader_exists(disk: &mut dyn BlockDevice, partition_start: u64) -> bool {
     match FatFilesystem::new(disk, partition_start) {
-        Ok(mut fat) => match fat.file_size("EFI\\BOOT\\BOOTX64.EFI") {
-            Ok(size) => size > 0,
-            Err(_) => false,
+        Ok(mut fat) => match fat.file_size(EFI_BOOT_PATH) {
+            Ok(size) => {
+                log::info!("Found {} ({} bytes) at LBA {}", EFI_BOOT_PATH, size, partition_start);
+                size > 0
+            }
+            Err(e) => {
+                log::debug!("Bootloader not found at LBA {}: {:?}", partition_start, e);
+                false
+            }
         },
-        Err(_) => false,
+        Err(e) => {
+            log::debug!("FAT mount failed at LBA {}: {:?}", partition_start, e);
+            false
+        }
     }
 }
 

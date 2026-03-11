@@ -4,7 +4,7 @@
 //! that can boot Linux via shim+GRUB2 or systemd-boot on real laptop hardware.
 
 #![no_std]
-#![feature(abi_x86_interrupt)]
+#![cfg_attr(target_arch = "x86_64", feature(abi_x86_interrupt))]
 #![feature(never_type)] // Used for -> ! return type in payload chainloading
 #![allow(unsafe_op_in_unsafe_fn)]
 // Allow common firmware code patterns
@@ -28,6 +28,7 @@ pub mod framebuffer_console;
 pub mod fs;
 pub mod grub;
 pub mod heap;
+#[cfg(target_arch = "x86_64")]
 pub mod linux_boot;
 pub mod logger;
 pub mod menu;
@@ -113,6 +114,81 @@ pub fn display_secure_boot_error() {
     time::delay_ms(3000);
 }
 
+/// Discover PCI ECAM base address from the ACPI MCFG table.
+///
+/// Walks the XSDT/RSDT to find the MCFG table and extracts the first
+/// ECAM base address allocation entry.
+fn discover_ecam_from_acpi() -> Option<u64> {
+    let rsdp_addr = state::drivers().acpi_rsdp?;
+
+    // RSDP, SDT header structs are packed — safe to reference at any alignment
+    #[repr(C, packed)]
+    struct Rsdp {
+        signature: [u8; 8],
+        _checksum: u8,
+        _oem_id: [u8; 6],
+        revision: u8,
+        rsdt_address: u32,
+        _length: u32,
+        xsdt_address: u64,
+    }
+
+    #[repr(C, packed)]
+    struct SdtHeader {
+        signature: [u8; 4],
+        length: u32,
+    }
+
+    let rsdp = unsafe { &*(rsdp_addr as *const Rsdp) };
+    if &rsdp.signature != b"RSD PTR " {
+        return None;
+    }
+
+    let (root_addr, is_xsdt) = if rsdp.revision >= 2 && rsdp.xsdt_address != 0 {
+        (rsdp.xsdt_address, true)
+    } else {
+        (rsdp.rsdt_address as u64, false)
+    };
+    if root_addr == 0 {
+        return None;
+    }
+
+    let root_header = unsafe { &*(root_addr as *const SdtHeader) };
+    // Full ACPI SDT header is 36 bytes (signature, length, revision, checksum, oem fields, etc.)
+    // Our SdtHeader only has the first 8 bytes we need, but entries start after the full 36.
+    const ACPI_SDT_HEADER_SIZE: usize = 36;
+    let entry_size = if is_xsdt { 8 } else { 4 };
+    let num_entries = (root_header.length as usize - ACPI_SDT_HEADER_SIZE) / entry_size;
+    let entries_base = root_addr + ACPI_SDT_HEADER_SIZE as u64;
+
+    for i in 0..num_entries {
+        let table_addr = if is_xsdt {
+            unsafe { ((entries_base + (i * 8) as u64) as *const u64).read_unaligned() }
+        } else {
+            unsafe { ((entries_base + (i * 4) as u64) as *const u32).read_unaligned() as u64 }
+        };
+        if table_addr == 0 {
+            continue;
+        }
+
+        let header = unsafe { &*(table_addr as *const SdtHeader) };
+        if &header.signature == b"MCFG" {
+            // MCFG layout: 36-byte ACPI header + 8 bytes reserved + allocation entries (16 bytes each)
+            // Each entry: base_address(u64), segment(u16), start_bus(u8), end_bus(u8), reserved(u32)
+            let mcfg_len = header.length as usize;
+            if mcfg_len >= 44 + 16 {
+                // First allocation entry base address is at offset 44
+                let base = unsafe { ((table_addr + 44) as *const u64).read_unaligned() };
+                if base != 0 {
+                    return Some(base);
+                }
+            }
+        }
+    }
+
+    None
+}
+
 /// Initialize the CrabEFI firmware
 ///
 /// This is called from the entry point after switching to 64-bit mode.
@@ -183,7 +259,7 @@ pub fn init(coreboot_table_ptr: u64) -> ! {
 
     // Initialize serial port from coreboot info (if available)
     if let Some(ref serial) = cb_info.serial {
-        drivers::serial::init_from_coreboot(serial.baseaddr, serial.baud);
+        drivers::serial::init_from_coreboot(serial.baseaddr, serial.baud, serial.mmio());
     }
 
     // Initialize logging (now that serial is set up)
@@ -194,8 +270,8 @@ pub fn init(coreboot_table_ptr: u64) -> ! {
         logger::set_framebuffer(fb);
     }
 
-    // Initialize PS/2 keyboard (if available)
-    drivers::keyboard::init();
+    // Initialize keyboard subsystem (PS/2 on x86, USB-only on aarch64)
+    drivers::keyboard_common::init();
 
     log::info!("CrabEFI v{} starting...", env!("CARGO_PKG_VERSION"));
     log::info!("Coreboot table pointer: {:#x}", coreboot_table_ptr);
@@ -298,6 +374,12 @@ pub fn init(coreboot_table_ptr: u64) -> ! {
 
     log::info!("CrabEFI initialized successfully!");
     log::info!("EFI System Table at: {:p}", efi::get_system_table());
+
+    // Discover PCI ECAM base from ACPI MCFG table before PCI init
+    if let Some(ecam_base) = discover_ecam_from_acpi() {
+        log::info!("PCI ECAM base from ACPI MCFG: {:#x}", ecam_base);
+        drivers::pci::set_ecam_base(ecam_base);
+    }
 
     // Initialize PCI early so we can detect SPI controller
     drivers::pci::init();
@@ -472,8 +554,16 @@ fn boot_selected_entry(entry: &menu::BootEntry) {
             initrd_path,
             cmdline,
         } => {
-            log::info!("Dispatching to direct Linux boot");
-            boot_linux_entry(entry, linux_path, initrd_path, cmdline);
+            #[cfg(target_arch = "x86_64")]
+            {
+                log::info!("Dispatching to direct Linux boot");
+                boot_linux_entry(entry, linux_path, initrd_path, cmdline);
+            }
+            #[cfg(not(target_arch = "x86_64"))]
+            {
+                let _ = (linux_path, initrd_path, cmdline);
+                log::warn!("Direct Linux boot not supported on this architecture");
+            }
         }
 
         // Coreboot payload chainloading
@@ -645,18 +735,9 @@ fn boot_uefi_entry(entry: &menu::BootEntry) {
 /// Loads the kernel, optional initrd, and command line from a FAT partition
 /// on the given block device, then boots Linux directly.
 ///
-/// # Arguments
-/// * `disk` - Any block device implementing BlockDevice
-/// * `partition_first_lba` - First LBA of the boot partition
-/// * `kernel_path` - FAT-style path to the kernel
-/// * `initrd_fat_path` - Optional FAT-style path to the initrd
-/// * `cmdline` - Kernel command line
-/// * `memory_regions` - Memory map from coreboot
-/// * `acpi_rsdp` - Optional ACPI RSDP address
-/// * `framebuffer` - Optional framebuffer info for Linux console
-///
-/// # Returns
-/// `true` if boot was initiated (unreachable in practice), `false` on failure
+/// This is x86-only as it uses the bzImage/x86 boot protocol.
+/// On aarch64, Linux boot uses a different protocol (not yet implemented).
+#[cfg(target_arch = "x86_64")]
 fn boot_linux_from_device(
     disk: &mut dyn crate::drivers::block::BlockDevice,
     partition_first_lba: u64,
@@ -695,6 +776,9 @@ fn boot_linux_from_device(
 ///
 /// This uses the linux_boot module to load and boot the kernel directly,
 /// bypassing UEFI bootloaders like GRUB or systemd-boot.
+///
+/// x86-only: uses bzImage boot protocol.
+#[cfg(target_arch = "x86_64")]
 fn boot_linux_entry(
     entry: &menu::BootEntry,
     linux_path: &heapless::String<128>,

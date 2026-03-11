@@ -10,7 +10,7 @@
 //! - PS/2 keyboard: Scancodes are translated to EFI keys via the i8042 keyboard controller.
 
 use crate::coreboot::FramebufferInfo;
-use crate::drivers::keyboard;
+use crate::drivers::keyboard_common as keyboard;
 use crate::drivers::serial;
 use crate::efi::boot_services::KEYBOARD_EVENT_ID;
 use crate::framebuffer_console::{CHAR_HEIGHT, CHAR_WIDTH, VGA_FONT_8X16};

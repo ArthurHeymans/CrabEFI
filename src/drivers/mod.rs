@@ -23,7 +23,9 @@
 
 pub mod ahci;
 pub mod block;
+#[cfg(target_arch = "x86_64")]
 pub mod keyboard;
+pub mod keyboard_common;
 pub mod mmio;
 pub mod nvme;
 pub mod pci;

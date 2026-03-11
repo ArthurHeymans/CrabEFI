@@ -25,6 +25,21 @@ pub fn init(cb_info: &CorebootInfo) {
     // Initialize the memory allocator from coreboot memory map
     allocator::init(&cb_info.memory_map);
 
+    // On aarch64, coreboot's memory map only describes RAM and firmware-reserved
+    // regions. Device MMIO regions are absent, which means the UEFI memory map
+    // returned to the OS has gaps where MMIO lives. After ExitBootServices, the
+    // Linux kernel builds its page tables from the UEFI memory map — if the UART,
+    // GIC, or PCI MMIO regions are missing, earlycon and interrupts won't work.
+    // Add them explicitly as EfiMemoryMappedIO so the kernel can map them.
+    #[cfg(target_arch = "aarch64")]
+    add_platform_mmio_regions();
+
+    // Reserve the EL2 MMU page table memory so the allocator doesn't hand it
+    // out. Coreboot set up page tables starting at TTBR0_EL2 and we're still
+    // using them — if they get overwritten, the MMU faults and we crash.
+    #[cfg(target_arch = "aarch64")]
+    reserve_el2_page_tables();
+
     // Reserve the runtime services memory regions using linker-provided boundaries.
     // This marks CrabEFI's code and data sections as EfiRuntimeServicesCode/Data
     // with EFI_MEMORY_RUNTIME attribute, which tells the OS to keep these regions
@@ -462,4 +477,153 @@ pub fn allocate_pages_below_4g(num_pages: u64) -> Option<&'static mut [u8]> {
 pub fn free_pages(memory: &mut [u8], num_pages: u64) {
     let addr = memory.as_ptr() as u64;
     let _ = allocator::free_pages(addr, num_pages);
+}
+
+/// Add platform MMIO regions to the EFI memory map (aarch64 only)
+///
+/// QEMU SBSA has device MMIO at addresses not covered by coreboot's memory map.
+/// The Linux kernel uses the UEFI memory map to build page tables after
+/// ExitBootServices — any MMIO not in the map is unmapped and inaccessible.
+///
+/// Critical regions:
+/// - GIC distributor/redistributor (for interrupts)
+/// - UART PL011 (for earlycon/console)  
+/// - Peripherals (RTC, GPIO, etc.)
+/// - PCIe MMIO windows (for PCI device access)
+#[cfg(target_arch = "aarch64")]
+fn add_platform_mmio_regions() {
+    use allocator::{MemoryType, PAGE_SIZE};
+
+    // Helper: add an MMIO region, logging success/failure
+    let add_mmio = |base: u64, size: u64, name: &str| {
+        let pages = size.div_ceil(PAGE_SIZE);
+        match allocator::force_add_region(base, pages, MemoryType::MemoryMappedIo) {
+            Ok(()) => log::info!("MMIO region added: {} at {:#x} ({} pages)", name, base, pages),
+            Err(e) => log::error!("Failed to add MMIO region {}: {:?}", name, e),
+        }
+    };
+
+    // GIC distributor + redistributor (0x40060000 - 0x40100000)
+    // The GIC is essential — without it the kernel can't handle interrupts.
+    add_mmio(0x4006_0000, 0xA_0000, "GIC");
+
+    // Peripherals block: UART, RTC, GPIO, secure UART, SMMU, AHCI, EHCI
+    // (0x60000000 - 0x60200000)
+    add_mmio(0x6000_0000, 0x20_0000, "Peripherals (UART/RTC/GPIO/AHCI/EHCI)");
+
+    // PCIe PIO window (0x7FFF0000 - 0x80000000)
+    add_mmio(0x7FFF_0000, 0x1_0000, "PCIe PIO");
+
+    // PCIe 32-bit MMIO window (0x80000000 - 0xF0000000)
+    // Covers PCI BAR assignments for all devices.
+    add_mmio(0x8000_0000, 0x7000_0000, "PCIe MMIO");
+
+    // PCIe ECAM (0xF0000000 - 0x100000000)
+    // Already in coreboot map as Reserved, but the kernel needs it as MMIO
+    // for proper cache attributes. Skip if it overlaps an existing region.
+    // (coreboot marks 0xF0000000-0x100000000 as Reserved, so we don't re-add it)
+}
+
+/// Reserve the EL2 MMU page table memory (aarch64 only)
+///
+/// Coreboot sets up page tables (L0/L1/L2/L3) at TTBR0_EL2 and CrabEFI
+/// continues using them at EL2. The coreboot memory map reports the
+/// containing RAM region as ConventionalMemory, which means our allocator
+/// can hand out pages that overlap the active page tables. Once those
+/// pages are overwritten, the MMU faults with a level 0/1 translation
+/// error and the system crashes.
+///
+/// We read TTBR0_EL2 to find the L0 table base, then walk the tables
+/// to determine the extent of all page table pages, and reserve them.
+#[cfg(target_arch = "aarch64")]
+fn reserve_el2_page_tables() {
+    use allocator::PAGE_SIZE;
+
+    let ttbr0: u64;
+    unsafe {
+        core::arch::asm!(
+            "mrs {}, TTBR0_EL2",
+            out(reg) ttbr0,
+            options(nomem, nostack, preserves_flags)
+        );
+    }
+
+    let base = ttbr0 & !0xFFF; // Page-align (clear ASID/CnP bits)
+    if base == 0 {
+        log::warn!("TTBR0_EL2 is 0 — MMU may not be enabled, skipping page table reservation");
+        return;
+    }
+
+    // Walk the page tables to find all used pages.
+    // On aarch64, a 4KB granule with 48-bit VA space has:
+    //   L0: 1 page, 512 entries, each covering 512GB
+    //   L1: up to 512 pages, each covering 1GB
+    //   L2: each covering 2MB
+    //   L3: each covering 4KB
+    //
+    // We only need to find L0+L1+L2 tables (L3 is rare in coreboot's setup
+    // which prefers block mappings). Walk L0 and L1 to find table references.
+    //
+    // A table descriptor has bits [1:0] = 0b11, and bits [47:12] point to
+    // the next-level table.
+
+    let mut min_addr = base;
+    let mut max_addr = base + PAGE_SIZE; // At least the L0 page
+
+    // Read L0 entries
+    for i in 0..512u64 {
+        let entry_addr = base + i * 8;
+        let entry: u64 = unsafe { core::ptr::read_volatile(entry_addr as *const u64) };
+
+        // Check if it's a table descriptor (bits [1:0] == 0b11)
+        if entry & 0x3 == 0x3 {
+            let l1_table = entry & 0x0000_FFFF_FFFF_F000;
+            if l1_table < min_addr {
+                min_addr = l1_table;
+            }
+            if l1_table + PAGE_SIZE > max_addr {
+                max_addr = l1_table + PAGE_SIZE;
+            }
+
+            // Walk L1 entries to find L2 tables
+            for j in 0..512u64 {
+                let l1_entry_addr = l1_table + j * 8;
+                let l1_entry: u64 =
+                    unsafe { core::ptr::read_volatile(l1_entry_addr as *const u64) };
+
+                // L1 table descriptor -> L2 table
+                if l1_entry & 0x3 == 0x3 {
+                    let l2_table = l1_entry & 0x0000_FFFF_FFFF_F000;
+                    if l2_table < min_addr {
+                        min_addr = l2_table;
+                    }
+                    if l2_table + PAGE_SIZE > max_addr {
+                        max_addr = l2_table + PAGE_SIZE;
+                    }
+                }
+            }
+        }
+    }
+
+    let pages = (max_addr - min_addr).div_ceil(PAGE_SIZE);
+    log::info!(
+        "EL2 page tables: TTBR0={:#x}, range {:#x}-{:#x} ({} pages)",
+        ttbr0,
+        min_addr,
+        max_addr,
+        pages
+    );
+
+    // Reserve these pages by carving them out of the existing ConventionalMemory
+    // region. Using mark_as_reserved() (not force_add_region()) ensures the
+    // ConventionalMemory entry is properly split so the allocator will never
+    // hand out pages that overlap the active EL2 page tables.
+    match allocator::mark_as_reserved(min_addr, pages) {
+        Ok(()) => log::info!(
+            "Reserved EL2 page table memory: {:#x}-{:#x}",
+            min_addr,
+            max_addr
+        ),
+        Err(e) => log::error!("Failed to reserve EL2 page tables: {:?}", e),
+    }
 }

@@ -30,8 +30,8 @@ tock-registers = "0.10"
 zerocopy = { version = "0.8", default-features = false, features = ["derive"] }
 
 # RustCrypto crates for UEFI Secure Boot authentication (all no_std compatible)
-sha1 = { version = "0.10", default-features = false }
-sha2 = { version = "0.10", default-features = false, features = ["oid"] }
+sha1 = { version = "0.10", default-features = false, features = ["force-soft"] }
+sha2 = { version = "0.10", default-features = false, features = ["oid", "force-soft"] }
 rsa = { version = "0.9", default-features = false }
 x509-cert = { version = "0.2", default-features = false }
 der = { version = "0.7", default-features = false }
@@ -46,6 +46,9 @@ postcard = { version = "1.0", default-features = false, features = ["alloc"] }
 
 [target.'cfg(target_arch = "x86_64")'.dependencies]
 x86_64 = "0.15"
+
+[target.'cfg(target_arch = "aarch64")'.dependencies]
+# No arch-specific crate dependencies for aarch64 yet
 
 [build-dependencies]
 cc = "1"

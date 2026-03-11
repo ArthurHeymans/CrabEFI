@@ -4,7 +4,7 @@
 //! These are essential when the CPU and hardware devices (like USB controllers)
 //! share memory regions.
 
-use core::sync::atomic::{Ordering, fence};
+use core::sync::atomic::{fence, Ordering};
 
 /// Cache line size (typically 64 bytes on modern x86)
 pub const CACHE_LINE_SIZE: usize = 64;

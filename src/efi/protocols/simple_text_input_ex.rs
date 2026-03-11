@@ -9,7 +9,7 @@
 //! The protocol shares the keyboard event (KEYBOARD_EVENT_ID) with the
 //! basic Simple Text Input protocol, and is installed on the same console handle.
 
-use crate::drivers::keyboard;
+use crate::drivers::keyboard_common as keyboard;
 use crate::efi::boot_services::KEYBOARD_EVENT_ID;
 use crate::efi::protocols::console;
 use crate::efi::utils::allocate_protocol_with_log;

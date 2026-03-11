@@ -24,10 +24,15 @@ pub const PAGE_SIZE: u64 = 4096;
 /// Page size as usize for convenience
 pub const PAGE_SIZE_USIZE: usize = 4096;
 
-/// Maximum address that is identity-mapped in page tables
-/// Our assembly code sets up identity mapping for the first 64GB (64 PDPTs * 512 PDs * 2MB each)
-/// Allocations above this address will cause page faults!
+/// Maximum address that is identity-mapped in page tables.
+/// On x86_64: Our assembly code sets up identity mapping for the first 64GB
+/// (64 PDPTs * 512 PDs * 2MB each). Allocations above this will cause page faults.
+/// On aarch64: coreboot/TF-A sets up the MMU covering the full address space,
+/// including DRAM at 1TB+ on QEMU SBSA. No artificial cap needed.
+#[cfg(target_arch = "x86_64")]
 const MAX_IDENTITY_MAPPED_ADDRESS: u64 = 0x10_0000_0000; // 64GB
+#[cfg(target_arch = "aarch64")]
+const MAX_IDENTITY_MAPPED_ADDRESS: u64 = u64::MAX;
 
 /// EFI memory allocation types
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -223,9 +228,39 @@ impl MemoryAllocator {
         self.entries.clear();
         self.map_key = 1;
 
+        // On aarch64, determine the DRAM base from the first RAM entry.
+        // Coreboot "Reserved" entries below the DRAM base are device/MMIO
+        // space (flash, ECAM, etc.), NOT actual RAM. Including them as
+        // EFI ReservedMemoryType confuses the Linux kernel:
+        //  - It adds phantom memory to the DMA zone → swiotlb failures
+        //  - It creates iomem "reserved" entries that block ECAM mapping
+        //    → PCI enumeration fails → no NVMe/network in the kernel
+        #[cfg(target_arch = "aarch64")]
+        let dram_base: u64 = regions
+            .iter()
+            .filter(|r| r.region_type == CbMemoryType::Ram)
+            .map(|r| r.start)
+            .min()
+            .unwrap_or(0);
+
         log::info!("Importing coreboot memory map ({} regions):", regions.len());
         for region in regions {
             let memory_type = cb_to_efi_memory_type(region.region_type);
+
+            // On aarch64, skip coreboot Reserved entries below DRAM.
+            // These are device regions (flash at 0-1GB, ECAM at 0xf0-1GB)
+            // already covered by add_platform_mmio_regions().
+            #[cfg(target_arch = "aarch64")]
+            if region.region_type == CbMemoryType::Reserved && region.start < dram_base {
+                log::info!(
+                    "  {:#010x}-{:#010x} {:?} -> SKIPPED (non-RAM, below DRAM at {:#x})",
+                    region.start,
+                    region.start + region.size,
+                    region.region_type,
+                    dram_base
+                );
+                continue;
+            }
             // Safely calculate number of pages, skip regions that overflow
             let num_pages = match region.size.checked_add(PAGE_SIZE - 1) {
                 Some(size_rounded) => size_rounded / PAGE_SIZE,
@@ -295,13 +330,22 @@ impl MemoryAllocator {
     ///
     /// This is used when the region isn't in the coreboot map at all.
     /// It adds the region directly without trying to carve from existing memory.
+    /// Memory attributes are set automatically based on type:
+    /// - `MemoryMappedIo` / `MemoryMappedIoPortSpace` → `EFI_MEMORY_UC` (uncacheable)
+    /// - `RuntimeServicesCode/Data` → `EFI_MEMORY_WB | EFI_MEMORY_RUNTIME`
+    /// - Everything else → `EFI_MEMORY_WB`
     pub fn force_add_region(
         &mut self,
         physical_start: u64,
         num_pages: u64,
         memory_type: MemoryType,
     ) -> Result<(), efi::Status> {
-        let mut attribute = attributes::EFI_MEMORY_WB;
+        let mut attribute = match memory_type {
+            MemoryType::MemoryMappedIo | MemoryType::MemoryMappedIoPortSpace => {
+                attributes::EFI_MEMORY_UC
+            }
+            _ => attributes::EFI_MEMORY_WB,
+        };
 
         // RuntimeServicesCode/Data must have EFI_MEMORY_RUNTIME attribute
         if memory_type == MemoryType::RuntimeServicesCode {
@@ -410,6 +454,94 @@ impl MemoryAllocator {
         }
 
         // Region after the ACPI portion (keep original type)
+        if entry.end() > end {
+            let after_pages = (entry.end() - end) / PAGE_SIZE;
+            let after = MemoryDescriptor::new(original_type, end, after_pages, attribute);
+            if self.entries.push(after).is_err() {
+                return Err(efi::Status::OUT_OF_RESOURCES);
+            }
+        }
+
+        self.map_key += 1;
+        self.sort_entries();
+
+        Ok(())
+    }
+
+    /// Mark a memory region as Reserved Memory.
+    ///
+    /// This is the correct way to reserve pages that are already part of a
+    /// ConventionalMemory region (e.g. EL2 page tables that coreboot set up
+    /// inside a RAM region). Unlike force_add_region(), this properly finds
+    /// the containing entry, splits it, and changes the type so the allocator
+    /// will never hand out those pages.
+    pub fn mark_as_reserved(&mut self, addr: u64, num_pages: u64) -> Result<(), efi::Status> {
+        // Check for overflow in size calculation
+        let size = num_pages
+            .checked_mul(PAGE_SIZE)
+            .ok_or(efi::Status::INVALID_PARAMETER)?;
+        let end = addr
+            .checked_add(size)
+            .ok_or(efi::Status::INVALID_PARAMETER)?;
+
+        // Find the entry containing this region (any memory type)
+        let found_idx = self
+            .entries
+            .iter()
+            .position(|entry| entry.physical_start <= addr && entry.end() >= end);
+
+        let idx = match found_idx {
+            Some(i) => i,
+            None => {
+                // No containing entry — add as a new entry
+                let desc = MemoryDescriptor::new(
+                    MemoryType::ReservedMemoryType,
+                    addr,
+                    num_pages,
+                    attributes::EFI_MEMORY_WB,
+                );
+                if self.entries.push(desc).is_err() {
+                    return Err(efi::Status::OUT_OF_RESOURCES);
+                }
+                self.map_key += 1;
+                self.sort_entries();
+                return Ok(());
+            }
+        };
+
+        let entry = self.entries[idx];
+        let original_type = entry
+            .get_memory_type()
+            .unwrap_or(MemoryType::ReservedMemoryType);
+
+        // If already reserved, nothing to do
+        if original_type == MemoryType::ReservedMemoryType {
+            return Ok(());
+        }
+
+        let attribute = entry.attribute;
+
+        // Remove the old entry
+        self.entries.remove(idx);
+
+        // Add up to 3 new entries: before, reserved, after
+        if entry.physical_start < addr {
+            let before_pages = (addr - entry.physical_start) / PAGE_SIZE;
+            let before =
+                MemoryDescriptor::new(original_type, entry.physical_start, before_pages, attribute);
+            if self.entries.push(before).is_err() {
+                return Err(efi::Status::OUT_OF_RESOURCES);
+            }
+        }
+
+        // The reserved region
+        let reserved =
+            MemoryDescriptor::new(MemoryType::ReservedMemoryType, addr, num_pages, attribute);
+        if self.entries.push(reserved).is_err() {
+            return Err(efi::Status::OUT_OF_RESOURCES);
+        }
+
+        // Region after the reserved portion (keep original type)
         if entry.end() > end {
             let after_pages = (entry.end() - end) / PAGE_SIZE;
             let after = MemoryDescriptor::new(original_type, end, after_pages, attribute);
@@ -1119,6 +1251,13 @@ pub fn force_add_region(
 /// This properly splits existing regions and marks the specified range as AcpiReclaimMemory.
 pub fn mark_as_acpi_reclaim(addr: u64, num_pages: u64) -> Result<(), efi::Status> {
     state::with_allocator_mut(|alloc| alloc.mark_as_acpi_reclaim(addr, num_pages))
+}
+
+/// Mark a memory region as Reserved Memory
+///
+/// This properly splits existing regions and marks the specified range as ReservedMemoryType.
+pub fn mark_as_reserved(addr: u64, num_pages: u64) -> Result<(), efi::Status> {
+    state::with_allocator_mut(|alloc| alloc.mark_as_reserved(addr, num_pages))
 }
 
 /// Allocate pages of memory

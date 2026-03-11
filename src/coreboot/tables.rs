@@ -245,6 +245,11 @@ struct CbBootMediaParams {
     boot_media_size: u64,
 }
 
+/// Coreboot serial type: I/O port mapped
+pub const LB_SERIAL_TYPE_IO_MAPPED: u32 = 1;
+/// Coreboot serial type: Memory mapped
+pub const LB_SERIAL_TYPE_MEMORY_MAPPED: u32 = 2;
+
 /// Serial port information
 #[derive(Debug, Clone)]
 pub struct SerialInfo {
@@ -253,6 +258,13 @@ pub struct SerialInfo {
     pub baud: u32,
     pub regwidth: u32,
     pub input_hertz: u32,
+}
+
+impl SerialInfo {
+    /// Returns true if the serial port is MMIO-mapped (vs I/O port mapped)
+    pub fn mmio(&self) -> bool {
+        self.serial_type == LB_SERIAL_TYPE_MEMORY_MAPPED
+    }
 }
 
 /// SMMSTORE v2 information
