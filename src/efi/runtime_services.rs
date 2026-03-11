@@ -1383,11 +1383,15 @@ extern "efiapi" fn query_capsule_capabilities(
 
 // read_rtc_time is now shared via crate::efi::auth::time::read_rtc_time()
 
-/// Compare a UCS-2 string in array with a pointer
+/// Compare a UCS-2 string in stored array with a pointer-based string.
+///
+/// The read from `name` is bounded by `stored.len()` to prevent unbounded
+/// memory reads from potentially malformed (non-null-terminated) buffers.
 fn name_eq(stored: &[u16], name: *const u16) -> bool {
-    let mut i = 0;
-    loop {
-        let a = stored.get(i).copied().unwrap_or(0);
+    for (i, &a) in stored.iter().enumerate() {
+        // SAFETY: `i` is bounded by `stored.len()`, so we read at most
+        // `stored.len()` elements from `name`. The caller must ensure
+        // `name` points to at least `stored.len()` valid u16 values.
         let b = unsafe { *name.add(i) };
         if a != b {
             return false;
@@ -1395,8 +1399,11 @@ fn name_eq(stored: &[u16], name: *const u16) -> bool {
         if a == 0 {
             return true;
         }
-        i += 1;
     }
+    // stored exhausted without null terminator — check if name also ends here
+    // SAFETY: reading one element past the stored length to check for null
+    // terminator. Callers of EFI variable services must provide valid buffers.
+    unsafe { *name.add(stored.len()) == 0 }
 }
 
 // ucs2_strlen consolidated into crate::efi::utils::ucs2_len

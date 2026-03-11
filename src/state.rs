@@ -46,6 +46,11 @@ use core::sync::atomic::{AtomicPtr, Ordering};
 /// allocated on the stack in `init()`.
 static STATE_PTR: AtomicPtr<FirmwareState> = AtomicPtr::new(core::ptr::null_mut());
 
+/// Re-entrancy guard for `with_mut`. In debug builds, detects nested calls
+/// that would create aliasing `&mut` references (undefined behavior).
+#[cfg(debug_assertions)]
+static IN_WITH_MUT: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
 /// Initialize the global state pointer.
 ///
 /// # Safety
@@ -126,10 +131,23 @@ pub fn with_mut<F, R>(f: F) -> R
 where
     F: FnOnce(&mut FirmwareState) -> R,
 {
+    #[cfg(debug_assertions)]
+    assert!(
+        !IN_WITH_MUT.swap(true, Ordering::Acquire),
+        "Nested with_mut call detected — this creates aliasing &mut references (UB). \
+         Refactor to avoid re-entrant state access."
+    );
+
     let ptr = STATE_PTR.load(Ordering::Acquire);
     assert!(!ptr.is_null(), "FirmwareState not initialized");
-    // Safety: Single-threaded firmware, closure scope limits aliasing
-    unsafe { f(&mut *ptr) }
+    // SAFETY: Single-threaded firmware, closure scope limits aliasing.
+    // The debug_assertions guard above detects re-entrant calls at runtime.
+    let result = unsafe { f(&mut *ptr) };
+
+    #[cfg(debug_assertions)]
+    IN_WITH_MUT.store(false, Ordering::Release);
+
+    result
 }
 
 /// Try to get a reference to the global firmware state.
