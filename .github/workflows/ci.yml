@@ -39,7 +39,7 @@ jobs:
           targets: x86_64-unknown-none
 
       - name: Run clippy
-        run: cargo clippy --release -- -D warnings
+        run: cargo clippy --release --target x86_64-unknown-none -- -D warnings
 
   build:
     name: Build (x86_64)
@@ -54,7 +54,7 @@ jobs:
           targets: x86_64-unknown-none
 
       - name: Build release
-        run: cargo build --release
+        run: cargo build --release --target x86_64-unknown-none
 
       - name: Upload CrabEFI ELF
         uses: actions/upload-artifact@v4
@@ -229,7 +229,7 @@ jobs:
           targets: aarch64-unknown-none
 
       - name: Run clippy
-        run: cargo clippy --target aarch64-unknown-none --config .cargo/config-aarch64.toml -- -D warnings
+        run: cargo clippy --release --target aarch64-unknown-none -- -D warnings
 
   build-aarch64:
     name: Build (aarch64)
@@ -244,7 +244,7 @@ jobs:
           targets: aarch64-unknown-none
 
       - name: Build release
-        run: cargo build --release --target aarch64-unknown-none --config .cargo/config-aarch64.toml
+        run: cargo build --release --target aarch64-unknown-none
 
       - name: Upload CrabEFI ELF (aarch64)
         uses: actions/upload-artifact@v4
