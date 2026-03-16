@@ -432,8 +432,12 @@ impl MemoryAllocator {
                     return Err(efi::Status::INVALID_PARAMETER);
                 }
                 // No containing entry — add as a new entry
-                let desc =
-                    MemoryDescriptor::new(target_type, addr, num_pages, attributes::EFI_MEMORY_RAM_CAPS);
+                let desc = MemoryDescriptor::new(
+                    target_type,
+                    addr,
+                    num_pages,
+                    attributes::EFI_MEMORY_RAM_CAPS,
+                );
                 if self.entries.push(desc).is_err() {
                     return Err(efi::Status::OUT_OF_RESOURCES);
                 }
