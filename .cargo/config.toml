@@ -1,14 +1,18 @@
 # NOTE: Use ./xtask script to run xtask (it needs different build settings)
 
-[build]
-target = "x86_64-unknown-none"
-
 [target.x86_64-unknown-none]
 rustflags = [
     "-C", "link-arg=-Tx86_64-coreboot.ld",
     "-C", "link-arg=-no-pie",
     "-C", "relocation-model=pic",
     "-C", "code-model=kernel",
+]
+
+[target.aarch64-unknown-none]
+rustflags = [
+    "-C", "link-arg=-Taarch64-coreboot.ld",
+    "-C", "link-arg=-no-pie",
+    "-C", "relocation-model=static",
 ]
 
 [unstable]
