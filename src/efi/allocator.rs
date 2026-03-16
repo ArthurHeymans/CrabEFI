@@ -127,6 +127,10 @@ fn cb_to_efi_memory_type(cb_type: CbMemoryType) -> MemoryType {
 }
 
 /// Memory attributes (as defined in UEFI spec)
+///
+/// The Attribute field in EFI_MEMORY_DESCRIPTOR describes the **capabilities**
+/// of the memory region — i.e. which caching modes the hardware supports —
+/// not the current setting. See UEFI Spec 2.10 §7.2.
 pub mod attributes {
     pub const EFI_MEMORY_UC: u64 = 0x0000000000000001; // Uncacheable
     pub const EFI_MEMORY_WC: u64 = 0x0000000000000002; // Write-Combining
@@ -142,6 +146,14 @@ pub mod attributes {
     pub const EFI_MEMORY_SP: u64 = 0x0000000000040000; // Specific Purpose
     pub const EFI_MEMORY_CPU_CRYPTO: u64 = 0x0000000000080000;
     pub const EFI_MEMORY_RUNTIME: u64 = 0x8000000000000000; // Runtime accessible
+
+    /// Cache capability set for normal DRAM.
+    ///
+    /// DRAM supports write-combining, write-through, and write-back caching.
+    /// This matches what EDK2 reports via GCD capabilities (0xE).
+    /// The OS uses these bits to know which caching modes it may select
+    /// for any given page (e.g. WC for GPU buffers, WT for DMA).
+    pub const EFI_MEMORY_RAM_CAPS: u64 = EFI_MEMORY_WC | EFI_MEMORY_WT | EFI_MEMORY_WB;
 }
 
 /// EFI Memory Descriptor
@@ -282,7 +294,8 @@ impl MemoryAllocator {
                 memory_type
             );
 
-            // Default attributes: Write-Back for RAM, uncacheable for others
+            // Attributes describe cache capabilities, not current mode.
+            // DRAM supports WC|WT|WB (0xE); MMIO is UC only (0x1).
             let attribute = match memory_type {
                 MemoryType::ConventionalMemory
                 | MemoryType::BootServicesCode
@@ -291,11 +304,11 @@ impl MemoryAllocator {
                 | MemoryType::RuntimeServicesData
                 | MemoryType::LoaderCode
                 | MemoryType::LoaderData
-                | MemoryType::AcpiReclaimMemory => attributes::EFI_MEMORY_WB,
+                | MemoryType::AcpiReclaimMemory => attributes::EFI_MEMORY_RAM_CAPS,
                 MemoryType::MemoryMappedIo | MemoryType::MemoryMappedIoPortSpace => {
                     attributes::EFI_MEMORY_UC
                 }
-                _ => attributes::EFI_MEMORY_WB,
+                _ => attributes::EFI_MEMORY_RAM_CAPS,
             };
 
             let desc = MemoryDescriptor::new(memory_type, region.start, num_pages, attribute);
@@ -333,8 +346,8 @@ impl MemoryAllocator {
     /// It adds the region directly without trying to carve from existing memory.
     /// Memory attributes are set automatically based on type:
     /// - `MemoryMappedIo` / `MemoryMappedIoPortSpace` → `EFI_MEMORY_UC` (uncacheable)
-    /// - `RuntimeServicesCode/Data` → `EFI_MEMORY_WB | EFI_MEMORY_RUNTIME`
-    /// - Everything else → `EFI_MEMORY_WB`
+    /// - `RuntimeServicesCode/Data` → `EFI_MEMORY_RAM_CAPS | EFI_MEMORY_RUNTIME`
+    /// - Everything else → `EFI_MEMORY_RAM_CAPS`
     pub fn force_add_region(
         &mut self,
         physical_start: u64,
@@ -345,7 +358,7 @@ impl MemoryAllocator {
             MemoryType::MemoryMappedIo | MemoryType::MemoryMappedIoPortSpace => {
                 attributes::EFI_MEMORY_UC
             }
-            _ => attributes::EFI_MEMORY_WB,
+            _ => attributes::EFI_MEMORY_RAM_CAPS,
         };
 
         // RuntimeServicesCode/Data must have EFI_MEMORY_RUNTIME attribute
@@ -420,7 +433,7 @@ impl MemoryAllocator {
                 }
                 // No containing entry — add as a new entry
                 let desc =
-                    MemoryDescriptor::new(target_type, addr, num_pages, attributes::EFI_MEMORY_WB);
+                    MemoryDescriptor::new(target_type, addr, num_pages, attributes::EFI_MEMORY_RAM_CAPS);
                 if self.entries.push(desc).is_err() {
                     return Err(efi::Status::OUT_OF_RESOURCES);
                 }
