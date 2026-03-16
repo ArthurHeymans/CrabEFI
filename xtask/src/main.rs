@@ -228,13 +228,11 @@ fn cmd_build(release: bool, arch: Arch) -> Result<()> {
         cmd.arg("--release");
     }
 
-    match arch {
-        Arch::X86_64 => {}
-        Arch::Aarch64 => {
-            cmd.arg("--target").arg("aarch64-unknown-none");
-            cmd.arg("--config").arg(".cargo/config-aarch64.toml");
-        }
-    }
+    let target_triple = match arch {
+        Arch::X86_64 => "x86_64-unknown-none",
+        Arch::Aarch64 => "aarch64-unknown-none",
+    };
+    cmd.arg("--target").arg(target_triple);
 
     cmd.current_dir(project_root);
     // Remove RUSTUP_TOOLCHAIN to let CrabEFI use its own rust-toolchain.toml
@@ -246,10 +244,6 @@ fn cmd_build(release: bool, arch: Arch) -> Result<()> {
     }
 
     let mode = if release { "release" } else { "debug" };
-    let target_triple = match arch {
-        Arch::X86_64 => "x86_64-unknown-none",
-        Arch::Aarch64 => "aarch64-unknown-none",
-    };
     println!("Built: target/{}/{}/crabefi", target_triple, mode);
     Ok(())
 }
