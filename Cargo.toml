@@ -18,6 +18,10 @@ default = []
 fb-log = []
 # Enable runtime services serial debug logging (post-SetVirtualAddressMap)
 rt-debug = []
+# Enable runtime services log buffer (records SetVariable calls after
+# ExitBootServices into a warm-reboot-persistent ring buffer; requires
+# _rt_log_start/_rt_log_end linker symbols)
+rt-log = []
 
 [dependencies]
 r-efi = "5.3"
