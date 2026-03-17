@@ -3,38 +3,27 @@
 //! This module provides logging output to the framebuffer. It is disabled by
 //! default as it is very slow. Enable with the `fb-log` feature flag.
 
-use core::fmt::Write;
-use log::Level;
-use spin::Mutex;
-
 use crate::coreboot::FramebufferInfo;
 use crate::framebuffer_console::{CHAR_HEIGHT, CHAR_WIDTH, Color, render_glyph};
-
-/// Global framebuffer info for logging
-static FB_INFO: Mutex<Option<FramebufferInfo>> = Mutex::new(None);
-
-/// Cursor position for framebuffer logging (row, col)
-static FB_CURSOR: Mutex<(u32, u32)> = Mutex::new((0, 0));
+use core::fmt::Write;
+use log::Level;
 
 /// Set the framebuffer for logging output
 ///
 /// Call this after parsing coreboot tables to enable framebuffer logging.
 /// Clears the screen to remove any stale content from bootloader.
 pub fn set_framebuffer(fb: FramebufferInfo) {
-    // Clear the entire screen first
     unsafe {
-        fb.clear(0, 0, 0); // Black background
+        fb.clear(0, 0, 0);
     }
-    *FB_INFO.lock() = Some(fb);
-    // Reset cursor to top-left
-    *FB_CURSOR.lock() = (0, 0);
+    let console = unsafe { &mut (*crate::state::console_mut_ptr()) };
+    console.logger_framebuffer = Some(fb);
+    console.logger_cursor = (0, 0);
 }
 
 /// Log a message to the framebuffer
 pub fn log_to_framebuffer(level: Level, ts: u64, args: &core::fmt::Arguments) {
-    // Copy fb_info out of the lock to avoid holding FB_INFO while acquiring
-    // FB_CURSOR, which would risk deadlock if the lock order were ever reversed.
-    let fb_info = match *FB_INFO.lock() {
+    let fb_info = match unsafe { (*crate::state::console_mut_ptr()).logger_framebuffer } {
         Some(fb) => fb,
         None => return,
     };
@@ -48,8 +37,7 @@ pub fn log_to_framebuffer(level: Level, ts: u64, args: &core::fmt::Arguments) {
         Level::Trace => ("TRACE", Color::new(192, 64, 192)), // Purple
     };
 
-    // Get cursor position (FB_INFO lock is already released)
-    let (mut row, mut col) = *FB_CURSOR.lock();
+    let (mut row, mut col) = unsafe { (*crate::state::console_mut_ptr()).logger_cursor };
     let cols = fb_info.x_resolution / CHAR_WIDTH;
     let rows = fb_info.y_resolution / CHAR_HEIGHT;
 
@@ -109,7 +97,9 @@ pub fn log_to_framebuffer(level: Level, ts: u64, args: &core::fmt::Arguments) {
     }
 
     // Update cursor
-    *FB_CURSOR.lock() = (row, col);
+    unsafe {
+        (*crate::state::console_mut_ptr()).logger_cursor = (row, col);
+    }
 }
 
 /// Clear a line on the framebuffer

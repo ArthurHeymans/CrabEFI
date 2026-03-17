@@ -20,16 +20,19 @@
 //!   |
 //!   +-- efi: EfiState
 //!   |     +-- handles, events, loaded_images
-//!   |     +-- config_tables, variables
-//!   |     +-- allocator
+//!   |     +-- config_tables, variables, varstore
+//!   |     +-- allocator, secure boot flags
 //!   |
 //!   +-- drivers: DriverState
-//!   |     +-- pci, serial, keyboard
-//!   |     +-- storage controllers (nvme, ahci, usb)
+//!   |     +-- pci: PciState (devices, ecam, access method)
+//!   |     +-- serial: SerialState (driver, port, EFI mode)
+//!   |     +-- timing: TimingState (counter freq, boot timestamp)
+//!   |     +-- platform: PlatformInfo (framebuffer, SPI, coreboot info)
+//!   |     +-- keyboard, usb_keyboard, storage_registry, rng
 //!   |
 //!   +-- console: ConsoleState
-//!         +-- framebuffer, cursor, dimensions
-//!         +-- input state
+//!         +-- framebuffer, cursor, dimensions, colors
+//!         +-- input state, screen_mode, output_mode
 //! ```
 //!
 //! # Thread Safety
@@ -515,6 +518,12 @@ pub struct EfiState {
 
     /// Block device for filesystem access
     pub block_device: Option<crate::drivers::block::AnyBlockDevice>,
+
+    /// Secure Boot: whether in Setup Mode (PK not enrolled)
+    pub setup_mode: bool,
+
+    /// Secure Boot: whether Secure Boot is enabled
+    pub secure_boot_enabled: bool,
 }
 
 impl EfiState {
@@ -536,6 +545,8 @@ impl EfiState {
             exit_boot_services_called: false,
             filesystem: None,
             block_device: None,
+            setup_mode: true,
+            secure_boot_enabled: false,
         }
     }
 }
@@ -552,7 +563,15 @@ impl Default for EfiState {
 
 use crate::coreboot::FramebufferInfo;
 use crate::drivers::pci::PciDevice;
+use crate::drivers::pci::access::AnyPciAccess;
+use crate::drivers::serial::AnySerial;
+use crate::drivers::storage::StorageRegistry;
+use crate::drivers::usb::hid_keyboard::UsbHidKeyboard;
+use crate::efi::protocols::serial_io::SerialIoMode;
+use crate::time::Timeout;
 use heapless::Vec as HeaplessVec;
+use r_efi::efi::Boolean;
+use r_efi::protocols::simple_text_output::Mode as SimpleTextOutputMode;
 
 /// Maximum number of PCI devices
 pub const MAX_PCI_DEVICES: usize = 64;
@@ -566,72 +585,48 @@ pub const MAX_STORAGE_DEVICES: usize = 16;
 /// Maximum number of memory regions we can store
 pub const MAX_MEMORY_REGIONS: usize = 64;
 
-/// Hardware driver state
+/// Hardware driver state, organized into logical subsystems.
 pub struct DriverState {
-    /// PCI device list
-    pub pci_devices: HeaplessVec<PciDevice, MAX_PCI_DEVICES>,
-    /// PCIe ECAM base address
-    pub ecam_base: Option<u64>,
+    /// PCI bus subsystem
+    pub pci: PciState,
 
-    /// Serial port I/O base address
-    pub serial_port: Option<u16>,
+    /// Serial port (hardware driver + EFI protocol mode)
+    pub serial: SerialState,
 
-    /// PS/2 keyboard state
+    /// Timing calibration (TSC/ARM generic timer)
+    pub timing: TimingState,
+
+    /// Platform hardware info (from coreboot tables)
+    pub platform: PlatformInfo,
+
+    /// PS/2 keyboard state (x86 only, but always present for layout stability)
     pub keyboard: KeyboardState,
 
-    /// Global framebuffer info (from coreboot)
-    pub framebuffer: Option<FramebufferInfo>,
+    /// USB HID keyboard state
+    pub usb_keyboard: Option<UsbHidKeyboard>,
 
-    /// Address of the coreboot framebuffer record in the coreboot tables.
-    /// This is stored so we can invalidate it at ExitBootServices to prevent
-    /// Linux from trying to use both the coreboot framebuffer and the EFI GOP.
-    pub coreboot_fb_record_addr: Option<u64>,
+    /// USB keyboard next poll timeout
+    pub usb_keyboard_poll_timeout: Option<Timeout>,
 
-    /// SMMSTORE v2 info (from coreboot tables)
-    ///
-    /// Contains information for accessing UEFI variable storage through
-    /// coreboot's SMMSTORE v2 interface.
-    pub smmstorev2: Option<crate::coreboot::Smmstorev2Info>,
+    /// Storage device registry (tracks all block devices)
+    pub(crate) storage_registry: StorageRegistry,
 
-    /// SPI flash info (from coreboot tables)
-    ///
-    /// Contains information about the system's SPI flash chip.
-    pub spi_flash: Option<crate::coreboot::SpiFlashInfo>,
-
-    /// Boot media params (from coreboot tables)
-    ///
-    /// Contains information about the boot media layout including FMAP location.
-    pub boot_media: Option<crate::coreboot::BootMediaInfo>,
-
-    /// Storage backend for variable persistence (SPI flash, etc.)
-    ///
-    /// This is initialized during boot from detected SPI controller.
-    /// The storage handles offset translation so reads/writes are
-    /// relative to the variable store region.
-    pub storage: Option<crate::efi::varstore::SpiStorageBackend>,
-
-    /// Coreboot memory regions (for direct Linux boot)
-    pub memory_regions: HeaplessVec<crate::coreboot::memory::MemoryRegion, MAX_MEMORY_REGIONS>,
-
-    /// ACPI RSDP address (from coreboot)
-    pub acpi_rsdp: Option<u64>,
+    /// Hardware RNG available and functional
+    pub rng_available: bool,
 }
 
 impl DriverState {
     pub const fn new() -> Self {
         Self {
-            pci_devices: HeaplessVec::new(),
-            ecam_base: None,
-            serial_port: None,
+            pci: PciState::new(),
+            serial: SerialState::new(),
+            timing: TimingState::new(),
+            platform: PlatformInfo::new(),
             keyboard: KeyboardState::new(),
-            framebuffer: None,
-            coreboot_fb_record_addr: None,
-            smmstorev2: None,
-            spi_flash: None,
-            boot_media: None,
-            storage: None,
-            memory_regions: HeaplessVec::new(),
-            acpi_rsdp: None,
+            usb_keyboard: None,
+            usb_keyboard_poll_timeout: None,
+            storage_registry: StorageRegistry::new(),
+            rng_available: false,
         }
     }
 }
@@ -641,6 +636,192 @@ impl Default for DriverState {
         Self::new()
     }
 }
+
+// ----------------------------------------------------------------------------
+// PCI State
+// ----------------------------------------------------------------------------
+
+/// PCI bus subsystem state
+pub struct PciState {
+    /// Enumerated PCI device list
+    pub devices: HeaplessVec<PciDevice, MAX_PCI_DEVICES>,
+    /// PCIe ECAM base address (from ACPI MCFG or coreboot)
+    pub ecam_base: Option<u64>,
+    /// Config space access method (legacy I/O CAM or PCIe ECAM)
+    pub access: AnyPciAccess,
+}
+
+impl PciState {
+    pub const fn new() -> Self {
+        use crate::drivers::pci::access::IoCamAccess;
+        Self {
+            devices: HeaplessVec::new(),
+            ecam_base: None,
+            access: AnyPciAccess::IoCam(IoCamAccess),
+        }
+    }
+}
+
+impl Default for PciState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ----------------------------------------------------------------------------
+// Serial State
+// ----------------------------------------------------------------------------
+
+/// Serial port state: hardware driver and EFI protocol mode.
+pub struct SerialState {
+    /// I/O base address (from coreboot serial info)
+    pub port: Option<u16>,
+    /// Active serial port driver (16550 UART or PL011)
+    pub(crate) driver: Option<AnySerial>,
+    /// EFI Serial IO protocol mode (current port settings).
+    ///
+    /// The Protocol.mode pointer is set to point here during init.
+    pub io_mode: SerialIoMode,
+}
+
+impl SerialState {
+    pub const fn new() -> Self {
+        use crate::efi::protocols::serial_io::{
+            EFI_SERIAL_CARRIER_DETECT, EFI_SERIAL_CLEAR_TO_SEND, EFI_SERIAL_DATA_SET_READY,
+            EFI_SERIAL_DATA_TERMINAL_READY, EFI_SERIAL_INPUT_BUFFER_EMPTY,
+            EFI_SERIAL_OUTPUT_BUFFER_EMPTY, EFI_SERIAL_REQUEST_TO_SEND, EFI_SERIAL_RING_INDICATE,
+        };
+
+        Self {
+            port: None,
+            driver: None,
+            io_mode: SerialIoMode {
+                control_mask: EFI_SERIAL_CLEAR_TO_SEND
+                    | EFI_SERIAL_DATA_SET_READY
+                    | EFI_SERIAL_RING_INDICATE
+                    | EFI_SERIAL_CARRIER_DETECT
+                    | EFI_SERIAL_INPUT_BUFFER_EMPTY
+                    | EFI_SERIAL_OUTPUT_BUFFER_EMPTY
+                    | EFI_SERIAL_REQUEST_TO_SEND
+                    | EFI_SERIAL_DATA_TERMINAL_READY,
+                timeout: 1000000,
+                baud_rate: 115200,
+                receive_fifo_depth: 16,
+                data_bits: 8,
+                parity: 1,    // NoParity
+                stop_bits: 1, // OneStopBit
+            },
+        }
+    }
+}
+
+impl Default for SerialState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ----------------------------------------------------------------------------
+// Timing State
+// ----------------------------------------------------------------------------
+
+/// Timing calibration state.
+///
+/// On x86, the TSC is calibrated against the ACPI PM timer.
+/// On aarch64, the ARM Generic Timer frequency register is read directly.
+pub struct TimingState {
+    /// Counter frequency in Hz (set during calibration)
+    pub counter_freq_hz: u64,
+    /// Counter cycles per microsecond (cached for fast delay loops)
+    pub counter_cycles_per_us: u64,
+    /// Initial counter value at boot (for relative timestamps in log output)
+    pub boot_counter: u64,
+}
+
+impl TimingState {
+    pub const fn new() -> Self {
+        Self {
+            counter_freq_hz: 2_000_000_000, // Conservative 2 GHz fallback
+            counter_cycles_per_us: 2000,
+            boot_counter: 0,
+        }
+    }
+}
+
+impl Default for TimingState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ----------------------------------------------------------------------------
+// Platform Info
+// ----------------------------------------------------------------------------
+
+/// Platform hardware info sourced from coreboot tables.
+///
+/// This groups all the hardware discovery data that comes from parsing
+/// coreboot's lb_record table entries during early boot.
+pub struct PlatformInfo {
+    /// Global framebuffer info
+    pub framebuffer: Option<FramebufferInfo>,
+
+    /// Address of the coreboot framebuffer record in the coreboot tables.
+    /// Stored so we can invalidate it at ExitBootServices to prevent
+    /// Linux from trying to use both the coreboot framebuffer and the EFI GOP.
+    pub coreboot_fb_record_addr: Option<u64>,
+
+    /// SMMSTORE v2 info for UEFI variable storage
+    pub smmstorev2: Option<crate::coreboot::Smmstorev2Info>,
+
+    /// SPI flash info
+    pub spi_flash: Option<crate::coreboot::SpiFlashInfo>,
+
+    /// Boot media params (FMAP location, etc.)
+    pub boot_media: Option<crate::coreboot::BootMediaInfo>,
+
+    /// Storage backend for variable persistence (SPI flash).
+    ///
+    /// Initialized during boot from detected SPI controller.
+    /// Handles offset translation so reads/writes are relative to
+    /// the variable store region.
+    pub storage: Option<crate::efi::varstore::SpiStorageBackend>,
+
+    /// Memory regions (for direct Linux boot)
+    pub memory_regions: HeaplessVec<crate::coreboot::memory::MemoryRegion, MAX_MEMORY_REGIONS>,
+
+    /// ACPI RSDP address
+    pub acpi_rsdp: Option<u64>,
+
+    /// CBMEM console address (0 = not initialized/disabled)
+    pub cbmem_console_addr: u64,
+}
+
+impl PlatformInfo {
+    pub const fn new() -> Self {
+        Self {
+            framebuffer: None,
+            coreboot_fb_record_addr: None,
+            smmstorev2: None,
+            spi_flash: None,
+            boot_media: None,
+            storage: None,
+            memory_regions: HeaplessVec::new(),
+            acpi_rsdp: None,
+            cbmem_console_addr: 0,
+        }
+    }
+}
+
+impl Default for PlatformInfo {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ----------------------------------------------------------------------------
+// Keyboard State
+// ----------------------------------------------------------------------------
 
 /// PS/2 keyboard state
 pub struct KeyboardState {
@@ -687,6 +868,20 @@ impl KeyboardState {
 // Console State
 // ============================================================================
 
+/// Console screen mode (Text or Graphics)
+///
+/// Used by the ConsoleControl protocol to track the current display mode.
+#[repr(u32)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScreenMode {
+    /// Text mode
+    Text = 0,
+    /// Graphics mode
+    Graphics = 1,
+    /// Maximum mode value (for bounds checking)
+    MaxValue = 2,
+}
+
 /// Console and display state
 pub struct ConsoleState {
     /// EFI console framebuffer info
@@ -711,13 +906,22 @@ pub struct ConsoleState {
     /// Input state for escape sequence parsing
     pub input: InputState,
 
-    /// Logger framebuffer info
+    /// Logger framebuffer info (used by fb_log for debug output)
     pub logger_framebuffer: Option<FramebufferInfo>,
-    /// Logger cursor position
+    /// Logger cursor position (row, col)
     pub logger_cursor: (u32, u32),
 
     /// GOP framebuffer for graphics output protocol Blt operations
     pub gop_framebuffer: Option<FramebufferInfo>,
+
+    /// Screen mode (Text or Graphics) for ConsoleControl protocol
+    pub screen_mode: ScreenMode,
+
+    /// EFI SimpleTextOutput mode structure
+    ///
+    /// The Protocol.mode pointer is set to point here during init.
+    /// This tracks cursor position, attribute, and mode for the EFI text console.
+    pub output_mode: SimpleTextOutputMode,
 }
 
 impl ConsoleState {
@@ -735,6 +939,15 @@ impl ConsoleState {
             logger_framebuffer: None,
             logger_cursor: (0, 0),
             gop_framebuffer: None,
+            screen_mode: ScreenMode::Graphics,
+            output_mode: SimpleTextOutputMode {
+                max_mode: 1,
+                mode: 0,
+                attribute: 0x07, // Light gray on black
+                cursor_column: 0,
+                cursor_row: 0,
+                cursor_visible: Boolean::TRUE,
+            },
         }
     }
 }
@@ -959,7 +1172,7 @@ pub fn with_storage_mut<F, R>(f: F) -> Option<R>
 where
     F: FnOnce(&mut crate::efi::varstore::SpiStorageBackend) -> R,
 {
-    with_mut(|state| state.drivers.storage.as_mut().map(f))
+    with_mut(|state| state.drivers.platform.storage.as_mut().map(f))
 }
 
 /// Get a reference to the varstore state.

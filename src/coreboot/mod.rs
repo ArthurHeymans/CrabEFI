@@ -28,14 +28,14 @@ pub use tables::{
 /// Store framebuffer info in global state
 pub fn store_framebuffer(fb: FramebufferInfo) {
     crate::state::with_drivers_mut(|drivers| {
-        drivers.framebuffer = Some(fb);
+        drivers.platform.framebuffer = Some(fb);
     });
 }
 
 /// Store the coreboot framebuffer record address for later invalidation
 pub fn store_framebuffer_record_addr(addr: u64) {
     crate::state::with_drivers_mut(|drivers| {
-        drivers.coreboot_fb_record_addr = Some(addr);
+        drivers.platform.coreboot_fb_record_addr = Some(addr);
     });
 }
 
@@ -43,13 +43,13 @@ pub fn store_framebuffer_record_addr(addr: u64) {
 ///
 /// Returns the framebuffer info if available.
 pub fn get_framebuffer() -> Option<FramebufferInfo> {
-    crate::state::try_get().and_then(|state| state.drivers.framebuffer)
+    crate::state::try_get().and_then(|state| state.drivers.platform.framebuffer)
 }
 
 /// Store SMMSTORE v2 info in global state
 pub fn store_smmstorev2(smmstore: Smmstorev2Info) {
     crate::state::with_drivers_mut(|drivers| {
-        drivers.smmstorev2 = Some(smmstore);
+        drivers.platform.smmstorev2 = Some(smmstore);
     });
 }
 
@@ -57,13 +57,13 @@ pub fn store_smmstorev2(smmstore: Smmstorev2Info) {
 ///
 /// Returns the SMMSTORE v2 info if available.
 pub fn get_smmstorev2() -> Option<Smmstorev2Info> {
-    crate::state::try_get().and_then(|state| state.drivers.smmstorev2)
+    crate::state::try_get().and_then(|state| state.drivers.platform.smmstorev2)
 }
 
 /// Store SPI flash info in global state
 pub fn store_spi_flash(spi_flash: SpiFlashInfo) {
     crate::state::with_drivers_mut(|drivers| {
-        drivers.spi_flash = Some(spi_flash);
+        drivers.platform.spi_flash = Some(spi_flash);
     });
 }
 
@@ -71,13 +71,13 @@ pub fn store_spi_flash(spi_flash: SpiFlashInfo) {
 ///
 /// Returns a clone of the SPI flash info if available.
 pub fn get_spi_flash() -> Option<SpiFlashInfo> {
-    crate::state::try_get().and_then(|state| state.drivers.spi_flash.clone())
+    crate::state::try_get().and_then(|state| state.drivers.platform.spi_flash.clone())
 }
 
 /// Store boot media params in global state
 pub fn store_boot_media(boot_media: BootMediaInfo) {
     crate::state::with_drivers_mut(|drivers| {
-        drivers.boot_media = Some(boot_media);
+        drivers.platform.boot_media = Some(boot_media);
     });
 }
 
@@ -86,7 +86,7 @@ pub fn store_boot_media(boot_media: BootMediaInfo) {
 /// Returns the boot media info if available.
 /// This includes the FMAP offset which can be used to locate flash regions.
 pub fn get_boot_media() -> Option<BootMediaInfo> {
-    crate::state::try_get().and_then(|state| state.drivers.boot_media)
+    crate::state::try_get().and_then(|state| state.drivers.platform.boot_media)
 }
 
 // CFR info is stored separately because it can be very large with nested heapless::Vec.
@@ -142,7 +142,8 @@ pub fn get_cfr() -> Option<&'static CfrInfo> {
 /// This function modifies memory in the coreboot tables area. It must only
 /// be called when it's safe to modify that memory (at ExitBootServices).
 pub unsafe fn invalidate_framebuffer_record() {
-    let addr = crate::state::try_get().and_then(|state| state.drivers.coreboot_fb_record_addr);
+    let addr =
+        crate::state::try_get().and_then(|state| state.drivers.platform.coreboot_fb_record_addr);
 
     if let Some(record_addr) = addr {
         // The tag is the first 4 bytes of the record (u32)

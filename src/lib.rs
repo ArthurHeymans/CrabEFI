@@ -119,7 +119,7 @@ pub fn display_secure_boot_error() {
 /// Walks the XSDT/RSDT to find the MCFG table and extracts the first
 /// ECAM base address allocation entry.
 fn discover_ecam_from_acpi() -> Option<u64> {
-    let rsdp_addr = state::drivers().acpi_rsdp?;
+    let rsdp_addr = state::drivers().platform.acpi_rsdp?;
 
     // RSDP, SDT header structs are packed — safe to reference at any alignment
     #[repr(C, packed)]
@@ -251,10 +251,10 @@ pub fn init(coreboot_table_ptr: u64) -> ! {
     state::with_drivers_mut(|drivers| {
         // Copy memory regions
         for region in cb_info.memory_map.iter() {
-            let _ = drivers.memory_regions.push(*region);
+            let _ = drivers.platform.memory_regions.push(*region);
         }
         // Store ACPI RSDP
-        drivers.acpi_rsdp = cb_info.acpi_rsdp;
+        drivers.platform.acpi_rsdp = cb_info.acpi_rsdp;
     });
 
     // Initialize serial port from coreboot info (if available)
@@ -1233,10 +1233,10 @@ fn boot_linux_entry(
         let state = state::get();
         // Copy memory regions to a local buffer (we can't borrow across the disk operations)
         let mut regions = heapless::Vec::<crate::coreboot::memory::MemoryRegion, 64>::new();
-        for region in state.drivers.memory_regions.iter() {
+        for region in state.drivers.platform.memory_regions.iter() {
             let _ = regions.push(*region);
         }
-        (regions, state.drivers.acpi_rsdp)
+        (regions, state.drivers.platform.acpi_rsdp)
     };
 
     // Get framebuffer info for Linux console

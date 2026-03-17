@@ -87,7 +87,7 @@ pub fn init() -> Result<(), VarStoreError> {
 
     // Store the backend in global state
     state::with_mut(|s| {
-        s.drivers.storage = Some(backend);
+        s.drivers.platform.storage = Some(backend);
     });
 
     // Initialize the variable store region

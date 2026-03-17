@@ -18,9 +18,7 @@ use crate::state::{self, InputState};
 use core::ffi::c_void;
 use r_efi::efi::{Boolean, Event, Guid, Status};
 use r_efi::protocols::simple_text_input::{InputKey, Protocol as SimpleTextInputProtocol};
-use r_efi::protocols::simple_text_output::{
-    Mode as SimpleTextOutputMode, Protocol as SimpleTextOutputProtocol,
-};
+use r_efi::protocols::simple_text_output::Protocol as SimpleTextOutputProtocol;
 
 // ============================================================================
 // EFI Framebuffer Console State (stored in state::ConsoleState)
@@ -242,16 +240,6 @@ mod scan_codes {
 // Input Buffer for Escape Sequence Parsing (stored in state::ConsoleState.input)
 // ============================================================================
 
-/// Console output mode
-static mut CONSOLE_MODE: SimpleTextOutputMode = SimpleTextOutputMode {
-    max_mode: 1,
-    mode: 0,
-    attribute: 0x07, // Light gray on black
-    cursor_column: 0,
-    cursor_row: 0,
-    cursor_visible: Boolean::TRUE,
-};
-
 /// Static text input protocol
 /// Note: wait_for_key is set to KEYBOARD_EVENT_ID which is the special event
 /// used for keyboard input polling
@@ -282,8 +270,11 @@ pub fn get_text_input_protocol() -> *mut SimpleTextInputProtocol {
 
 /// Get the text output protocol
 pub fn get_text_output_protocol() -> *mut SimpleTextOutputProtocol {
+    // SAFETY: Single-threaded firmware. We point the protocol's mode field
+    // at the centralized console state so EFI callers can read it directly.
     unsafe {
-        TEXT_OUTPUT_PROTOCOL.mode = &raw mut CONSOLE_MODE;
+        TEXT_OUTPUT_PROTOCOL.mode =
+            core::ptr::addr_of_mut!((*crate::state::console_mut_ptr()).output_mode);
         &raw mut TEXT_OUTPUT_PROTOCOL
     }
 }
@@ -560,10 +551,12 @@ extern "efiapi" fn text_output_reset(
     _extended_verification: Boolean,
 ) -> Status {
     // Reset console state
+    // SAFETY: Single-threaded firmware; raw pointer to centralized console state.
     unsafe {
-        CONSOLE_MODE.cursor_column = 0;
-        CONSOLE_MODE.cursor_row = 0;
-        CONSOLE_MODE.attribute = 0x07;
+        let mode = &mut (*crate::state::console_mut_ptr()).output_mode;
+        mode.cursor_column = 0;
+        mode.cursor_row = 0;
+        mode.attribute = 0x07;
     }
 
     // Send reset sequence to serial
@@ -580,7 +573,15 @@ extern "efiapi" fn text_output_string(
         return Status::INVALID_PARAMETER;
     }
 
-    // Convert UCS-2 to ASCII and output to both serial and framebuffer
+    // Convert UCS-2 to ASCII and output to both serial and framebuffer.
+    //
+    // We use a raw *mut pointer (not &mut) to update `output_mode` fields
+    // because `fb_put_char()` internally calls `state::with_console_mut()`.
+    // Holding an `&mut ConsoleState.output_mode` across those calls would
+    // create aliasing &mut references (UB).  Raw pointer writes are fine
+    // in single-threaded firmware.
+    let mode_ptr =
+        unsafe { core::ptr::addr_of_mut!((*crate::state::console_mut_ptr()).output_mode) };
     let mut ptr = string;
     unsafe {
         while *ptr != 0 {
@@ -596,25 +597,25 @@ extern "efiapi" fn text_output_string(
                         serial::write_byte(b'\r');
                         serial::write_byte(b'\n');
                         fb_put_char('\n');
-                        CONSOLE_MODE.cursor_column = 0;
-                        CONSOLE_MODE.cursor_row += 1;
+                        (*mode_ptr).cursor_column = 0;
+                        (*mode_ptr).cursor_row += 1;
                     }
                     b'\r' => {
                         serial::write_byte(b'\r');
                         fb_put_char('\r');
-                        CONSOLE_MODE.cursor_column = 0;
+                        (*mode_ptr).cursor_column = 0;
                     }
                     _ => {
                         serial::write_byte(byte);
                         fb_put_char(c);
-                        CONSOLE_MODE.cursor_column += 1;
+                        (*mode_ptr).cursor_column += 1;
                     }
                 }
             } else {
                 // Non-ASCII: output '?'
                 serial::write_byte(b'?');
                 fb_put_char('?');
-                CONSOLE_MODE.cursor_column += 1;
+                (*mode_ptr).cursor_column += 1;
             }
 
             ptr = ptr.add(1);
@@ -683,8 +684,9 @@ extern "efiapi" fn text_output_set_mode(
         return Status::UNSUPPORTED;
     }
 
+    // SAFETY: Single-threaded firmware; raw pointer to centralized console state.
     unsafe {
-        CONSOLE_MODE.mode = mode_number as i32;
+        (*crate::state::console_mut_ptr()).output_mode.mode = mode_number as i32;
     }
 
     Status::SUCCESS
@@ -728,8 +730,9 @@ extern "efiapi" fn text_output_set_attribute(
     _this: *mut SimpleTextOutputProtocol,
     attribute: usize,
 ) -> Status {
+    // SAFETY: Single-threaded firmware; raw pointer to centralized console state.
     unsafe {
-        CONSOLE_MODE.attribute = attribute as i32;
+        (*crate::state::console_mut_ptr()).output_mode.attribute = attribute as i32;
     }
 
     let fg = attribute & 0x0F;
@@ -789,9 +792,11 @@ extern "efiapi" fn text_output_set_attribute(
 extern "efiapi" fn text_output_clear_screen(_this: *mut SimpleTextOutputProtocol) -> Status {
     serial::write_str("\x1b[2J\x1b[H");
 
+    // SAFETY: Single-threaded firmware; raw pointer to centralized console state.
     unsafe {
-        CONSOLE_MODE.cursor_column = 0;
-        CONSOLE_MODE.cursor_row = 0;
+        let mode = &mut (*crate::state::console_mut_ptr()).output_mode;
+        mode.cursor_column = 0;
+        mode.cursor_row = 0;
     }
 
     // Clear the ENTIRE framebuffer (bootloader expects full screen)
@@ -832,9 +837,11 @@ extern "efiapi" fn text_output_set_cursor_position(
         serial::write_byte(byte);
     }
 
+    // SAFETY: Single-threaded firmware; raw pointer to centralized console state.
     unsafe {
-        CONSOLE_MODE.cursor_column = column as i32;
-        CONSOLE_MODE.cursor_row = row as i32;
+        let mode = &mut (*crate::state::console_mut_ptr()).output_mode;
+        mode.cursor_column = column as i32;
+        mode.cursor_row = row as i32;
     }
 
     // Update framebuffer cursor position
@@ -852,8 +859,11 @@ extern "efiapi" fn text_output_enable_cursor(
     visible: Boolean,
 ) -> Status {
     let is_visible: bool = visible.into();
+    // SAFETY: Single-threaded firmware; raw pointer to centralized console state.
     unsafe {
-        CONSOLE_MODE.cursor_visible = visible;
+        (*crate::state::console_mut_ptr())
+            .output_mode
+            .cursor_visible = visible;
     }
 
     if is_visible {

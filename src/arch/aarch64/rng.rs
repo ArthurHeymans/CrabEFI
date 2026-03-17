@@ -7,19 +7,32 @@
 //! Falls back to SMCCC TRNG (ARM True Random Number Generator)
 //! interface via HVC/SMC if RNDR is not available.
 
+use core::sync::atomic::{AtomicU8, Ordering};
+
 /// SMCCC TRNG function IDs
 const SMCCC_TRNG_VERSION: u32 = 0xC400_0050;
 const SMCCC_TRNG_RND64: u32 = 0xC400_0053;
 
-/// Static flag indicating RNG is supported and functional
-static mut RNG_AVAILABLE: bool = false;
-static mut RNG_METHOD: RngMethod = RngMethod::None;
+/// RNG method selector (written once during init, read many times).
+/// Stored as AtomicU8 to avoid `static mut` unsoundness.
+static RNG_METHOD: AtomicU8 = AtomicU8::new(RngMethod::None as u8);
 
 #[derive(Clone, Copy, PartialEq)]
+#[repr(u8)]
 enum RngMethod {
-    None,
-    Rndr,
-    SmcccTrng,
+    None = 0,
+    Rndr = 1,
+    SmcccTrng = 2,
+}
+
+impl RngMethod {
+    fn from_u8(v: u8) -> Self {
+        match v {
+            1 => Self::Rndr,
+            2 => Self::SmcccTrng,
+            _ => Self::None,
+        }
+    }
 }
 
 /// Check if RNDR instruction is available via ID_AA64ISAR0_EL1
@@ -111,31 +124,33 @@ fn smccc_trng_rnd64() -> Option<u64> {
 ///
 /// Checks for RNDR instruction support and SMCCC TRNG availability.
 pub fn init() {
-    unsafe {
-        if has_rndr() {
-            // Verify RNDR actually works
-            if rndr64().is_some() {
-                RNG_AVAILABLE = true;
-                RNG_METHOD = RngMethod::Rndr;
-                log::info!("RNG: RNDR instruction available (FEAT_RNG)");
-                return;
+    if has_rndr() {
+        // Verify RNDR actually works
+        if rndr64().is_some() {
+            unsafe {
+                (*crate::state::drivers_mut_ptr()).rng_available = true;
             }
-        }
-
-        if check_smccc_trng() {
-            RNG_AVAILABLE = true;
-            RNG_METHOD = RngMethod::SmcccTrng;
-            log::info!("RNG: SMCCC TRNG available");
+            RNG_METHOD.store(RngMethod::Rndr as u8, Ordering::Release);
+            log::info!("RNG: RNDR instruction available (FEAT_RNG)");
             return;
         }
-
-        log::warn!("RNG: No hardware RNG available");
     }
+
+    if check_smccc_trng() {
+        unsafe {
+            (*crate::state::drivers_mut_ptr()).rng_available = true;
+        }
+        RNG_METHOD.store(RngMethod::SmcccTrng as u8, Ordering::Release);
+        log::info!("RNG: SMCCC TRNG available");
+        return;
+    }
+
+    log::warn!("RNG: No hardware RNG available");
 }
 
 /// Check if hardware RNG is available and functional
 pub fn is_supported() -> bool {
-    unsafe { RNG_AVAILABLE }
+    crate::state::drivers().rng_available
 }
 
 /// Fill a byte buffer with random data
@@ -143,7 +158,7 @@ pub fn is_supported() -> bool {
 /// # Returns
 /// `true` if the buffer was filled, `false` if RNG is not available
 pub fn fill_random(buffer: &mut [u8]) -> bool {
-    let method = unsafe { RNG_METHOD };
+    let method = RngMethod::from_u8(RNG_METHOD.load(Ordering::Acquire));
     let get_random = match method {
         RngMethod::Rndr => rndr64,
         RngMethod::SmcccTrng => smccc_trng_rnd64,

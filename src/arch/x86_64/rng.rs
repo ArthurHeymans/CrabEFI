@@ -12,9 +12,6 @@ const RDRAND_TEST_SAMPLES: usize = 8;
 /// Minimum number of different values required to pass broken RDRAND test
 const RDRAND_MIN_CHANGE: usize = 5;
 
-/// Static flag indicating RDRAND is supported and functional
-static mut RDRAND_AVAILABLE: bool = false;
-
 /// Check if RDRAND is supported via CPUID
 ///
 /// Returns true if CPUID reports RDRAND support (ECX bit 30, leaf 1)
@@ -92,7 +89,7 @@ fn test_rdrand() -> bool {
 /// Must be called before `is_supported()` or `rdrand64()`.
 pub fn init() {
     unsafe {
-        RDRAND_AVAILABLE = cpuid_has_rdrand() && test_rdrand();
+        (*crate::state::drivers_mut_ptr()).rng_available = cpuid_has_rdrand() && test_rdrand();
     }
 
     if is_supported() {
@@ -104,7 +101,7 @@ pub fn init() {
 
 /// Check if RDRAND is available and functional
 pub fn is_supported() -> bool {
-    unsafe { RDRAND_AVAILABLE }
+    crate::state::drivers().rng_available
 }
 
 /// Fill a byte buffer with random data from RDRAND

@@ -9,8 +9,6 @@
 
 use core::fmt::{self, Write};
 
-use spin::Mutex;
-
 // ============================================================================
 // Register offsets (16550-compatible)
 // ============================================================================
@@ -240,7 +238,7 @@ mod pl011 {
 /// PL011 serial port backend
 ///
 /// Separate from the 16550 backend because register layout differs significantly.
-struct Pl011Port {
+pub(crate) struct Pl011Port {
     base: u64,
     functional: bool,
 }
@@ -321,13 +319,11 @@ impl Write for Pl011Port {
 // ============================================================================
 
 /// Runtime-selected serial port type
-enum AnySerial {
+pub(crate) enum AnySerial {
     Uart16550(SerialPort),
     #[cfg(target_arch = "aarch64")]
     Pl011(Pl011Port),
 }
-
-static ANY_SERIAL: Mutex<Option<AnySerial>> = Mutex::new(None);
 
 // ============================================================================
 // Global API
@@ -352,7 +348,11 @@ pub fn init_from_coreboot(base_addr: u32, baud: u32, is_mmio: bool) {
             let mut port = Pl011Port::new(base_addr as u64);
             if port.functional {
                 let _ = port.write_str("\r\n[CrabEFI] PL011 serial initialized from coreboot\r\n");
-                *ANY_SERIAL.lock() = Some(AnySerial::Pl011(port));
+                // SAFETY: Single-threaded firmware; raw pointer avoids re-entrancy
+                // issues since serial is called from log macros inside other state closures.
+                unsafe {
+                    (*crate::state::drivers_mut_ptr()).serial.driver = Some(AnySerial::Pl011(port));
+                }
                 return;
             }
         }
@@ -366,7 +366,12 @@ pub fn init_from_coreboot(base_addr: u32, baud: u32, is_mmio: bool) {
         };
         if serial.init_16550(baud) {
             let _ = serial.write_str("\r\n[CrabEFI] MMIO serial initialized from coreboot\r\n");
-            *ANY_SERIAL.lock() = Some(AnySerial::Uart16550(serial));
+            // SAFETY: Single-threaded firmware; raw pointer avoids re-entrancy
+            // issues since serial is called from log macros inside other state closures.
+            unsafe {
+                (*crate::state::drivers_mut_ptr()).serial.driver =
+                    Some(AnySerial::Uart16550(serial));
+            }
         }
     } else {
         // I/O port UART (x86 only)
@@ -380,7 +385,12 @@ pub fn init_from_coreboot(base_addr: u32, baud: u32, is_mmio: bool) {
             };
             if serial.init_16550(baud) {
                 let _ = serial.write_str("\r\n[CrabEFI] Serial initialized from coreboot\r\n");
-                *ANY_SERIAL.lock() = Some(AnySerial::Uart16550(serial));
+                // SAFETY: Single-threaded firmware; raw pointer avoids re-entrancy
+                // issues since serial is called from log macros inside other state closures.
+                unsafe {
+                    (*crate::state::drivers_mut_ptr()).serial.driver =
+                        Some(AnySerial::Uart16550(serial));
+                }
             }
         }
         #[cfg(not(target_arch = "x86_64"))]
@@ -393,7 +403,10 @@ pub fn init_from_coreboot(base_addr: u32, baud: u32, is_mmio: bool) {
 
 /// Write a string to the serial port
 pub fn write_str(s: &str) {
-    if let Some(serial) = &mut *ANY_SERIAL.lock() {
+    // SAFETY: Single-threaded firmware; raw pointer avoids re-entrancy
+    // issues since serial is called from log macros inside other state closures.
+    let driver = unsafe { &mut (*crate::state::drivers_mut_ptr()).serial.driver };
+    if let Some(serial) = driver {
         match serial {
             AnySerial::Uart16550(uart) => {
                 let _ = uart.write_str(s);
@@ -408,7 +421,10 @@ pub fn write_str(s: &str) {
 
 /// Write formatted output to the serial port
 pub fn write_fmt(args: fmt::Arguments) {
-    if let Some(serial) = &mut *ANY_SERIAL.lock() {
+    // SAFETY: Single-threaded firmware; raw pointer avoids re-entrancy
+    // issues since serial is called from log macros inside other state closures.
+    let driver = unsafe { &mut (*crate::state::drivers_mut_ptr()).serial.driver };
+    if let Some(serial) = driver {
         match serial {
             AnySerial::Uart16550(uart) => {
                 let _ = uart.write_fmt(args);
@@ -423,7 +439,10 @@ pub fn write_fmt(args: fmt::Arguments) {
 
 /// Write a single byte to the serial port
 pub fn write_byte(byte: u8) {
-    if let Some(serial) = &mut *ANY_SERIAL.lock() {
+    // SAFETY: Single-threaded firmware; raw pointer avoids re-entrancy
+    // issues since serial is called from log macros inside other state closures.
+    let driver = unsafe { &mut (*crate::state::drivers_mut_ptr()).serial.driver };
+    if let Some(serial) = driver {
         match serial {
             AnySerial::Uart16550(uart) => uart.write_byte(byte),
             #[cfg(target_arch = "aarch64")]
@@ -434,7 +453,8 @@ pub fn write_byte(byte: u8) {
 
 /// Check if there is input available on the serial port
 pub fn has_input() -> bool {
-    if let Some(serial) = &*ANY_SERIAL.lock() {
+    // Read-only check -- use immutable access (no raw pointer needed).
+    if let Some(serial) = &crate::state::drivers().serial.driver {
         match serial {
             AnySerial::Uart16550(uart) => uart.can_receive(),
             #[cfg(target_arch = "aarch64")]
@@ -447,7 +467,10 @@ pub fn has_input() -> bool {
 
 /// Try to read a byte from the serial port (non-blocking)
 pub fn try_read() -> Option<u8> {
-    if let Some(serial) = &mut *ANY_SERIAL.lock() {
+    // SAFETY: Single-threaded firmware; raw pointer avoids re-entrancy
+    // issues since serial is called from log macros inside other state closures.
+    let driver = unsafe { &mut (*crate::state::drivers_mut_ptr()).serial.driver };
+    if let Some(serial) = driver {
         match serial {
             AnySerial::Uart16550(uart) => uart.try_read_byte(),
             #[cfg(target_arch = "aarch64")]

@@ -7,7 +7,6 @@
 //! Reference: coreboot/payloads/libpayload/drivers/cbmem_console.c
 
 use core::fmt::{self, Write};
-use core::sync::atomic::{AtomicU64, Ordering};
 use zerocopy::{FromBytes, Immutable, KnownLayout, Unaligned};
 
 /// CBMEM console structure header
@@ -29,9 +28,6 @@ const CURSOR_MASK: u32 = (1 << 28) - 1;
 /// Overflow flag (bit 31) - set when buffer has wrapped around
 const OVERFLOW: u32 = 1 << 31;
 
-/// Global CBMEM console address (0 = not initialized)
-static CBMEM_CONSOLE_ADDR: AtomicU64 = AtomicU64::new(0);
-
 /// Initialize the CBMEM console with the given physical address
 ///
 /// # Arguments
@@ -52,7 +48,9 @@ pub fn init(addr: u64) {
         let size = header.size;
         // Sanity check: size should be reasonable (at least 1KB, at most 1MB)
         if (1024..=1024 * 1024).contains(&size) {
-            CBMEM_CONSOLE_ADDR.store(addr, Ordering::Release);
+            (*crate::state::drivers_mut_ptr())
+                .platform
+                .cbmem_console_addr = addr;
             log::debug!(
                 "CBMEM console initialized: addr={:#x}, size={} bytes",
                 addr,
@@ -70,7 +68,7 @@ pub fn init(addr: u64) {
 
 /// Check if CBMEM console is available
 pub fn is_available() -> bool {
-    CBMEM_CONSOLE_ADDR.load(Ordering::Acquire) != 0
+    crate::state::try_get().is_some_and(|s| s.drivers.platform.cbmem_console_addr != 0)
 }
 
 /// Disable the CBMEM console
@@ -79,7 +77,11 @@ pub fn is_available() -> bool {
 /// cbmem buffer, which lives in a coreboot Reserved region that the OS
 /// does not map for EFI runtime use.
 pub fn disable() {
-    CBMEM_CONSOLE_ADDR.store(0, Ordering::Release);
+    unsafe {
+        (*crate::state::drivers_mut_ptr())
+            .platform
+            .cbmem_console_addr = 0;
+    }
 }
 
 /// Write bytes to the CBMEM console (ring buffer)
@@ -92,7 +94,7 @@ pub fn disable() {
 /// - Bits 0-27: Current write position (CURSOR_MASK)
 /// - Bit 31: Overflow flag (set when buffer has wrapped at least once)
 pub fn write_bytes(data: &[u8]) {
-    let addr = CBMEM_CONSOLE_ADDR.load(Ordering::Acquire);
+    let addr = crate::state::drivers().platform.cbmem_console_addr;
     if addr == 0 {
         return;
     }

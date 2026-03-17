@@ -115,7 +115,9 @@ pub fn init_secure_boot(config: &SecureBootConfig) -> Result<EnrollmentStatus, A
         let enable_from_storage = load_secure_boot_enable_preference();
         if enable_from_storage || config.enable_secure_boot {
             // Use internal function to avoid re-persisting what we just loaded
-            super::SECURE_BOOT_ENABLED.store(true, core::sync::atomic::Ordering::Release);
+            unsafe {
+                (*crate::state::efi_mut_ptr()).secure_boot_enabled = true;
+            }
             log::info!("Secure Boot: Enabled (from persisted preference)");
             // Update status variables to reflect the enabled state
             let _ = update_status_variables();
