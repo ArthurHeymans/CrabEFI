@@ -17,7 +17,7 @@ use tock_registers::interfaces::{ReadWriteable, Readable, Writeable};
 use super::controller::{
     SetupPacket, UsbController, UsbDevice, UsbError, UsbSpeed, enumerate_device,
 };
-use super::uhci_regs::{UhciRegs, PORTSC, USBCMD, USBSTS};
+use super::uhci_regs::{PORTSC, USBCMD, USBSTS, UhciRegs};
 
 // ============================================================================
 // UHCI Data Structures

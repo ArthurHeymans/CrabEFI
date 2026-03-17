@@ -96,7 +96,6 @@ impl MemoryType {
                 | MemoryType::LoaderData
         )
     }
-
 }
 
 impl TryFrom<u32> for MemoryType {

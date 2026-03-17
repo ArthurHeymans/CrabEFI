@@ -242,8 +242,6 @@ fn create_block_device_for_sfs(
     }
 }
 
-
-
 /// Try to boot from an ESP partition
 ///
 /// This replaces the four `try_boot_from_esp_{usb,nvme,ahci,sdhci}` functions.

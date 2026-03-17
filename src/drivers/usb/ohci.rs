@@ -18,7 +18,7 @@ use super::controller::{
     Direction, SetupPacket, UsbController, UsbDevice, UsbError, UsbSpeed, enumerate_device,
 };
 use super::ohci_regs::{
-    self, HCCOMMANDSTATUS, HCCONTROL, HCRHDESCRIPTORA, HCRHPORTSTATUS, HCRHSTATUS, HCREVISION,
+    self, HCCOMMANDSTATUS, HCCONTROL, HCREVISION, HCRHDESCRIPTORA, HCRHPORTSTATUS, HCRHSTATUS,
 };
 
 // ============================================================================
@@ -423,9 +423,9 @@ impl OhciController {
         self.regs().hcinterruptstatus.set(0xFFFFFFFF);
 
         // Enable control and bulk lists, go operational
-        self.regs().hccontrol.write(
-            HCCONTROL::CLE::SET + HCCONTROL::BLE::SET + HCCONTROL::HCFS::Operational,
-        );
+        self.regs()
+            .hccontrol
+            .write(HCCONTROL::CLE::SET + HCCONTROL::BLE::SET + HCCONTROL::HCFS::Operational);
 
         // Power on all ports (LPSC - Local Power Status Change)
         self.regs().hcrhstatus.write(HCRHSTATUS::LPSC::SET);
@@ -468,9 +468,7 @@ impl OhciController {
             );
 
             // Reset the port
-            self.port(port_num)
-                .portsc
-                .write(HCRHPORTSTATUS::PRS::SET);
+            self.port(port_num).portsc.write(HCRHPORTSTATUS::PRS::SET);
 
             // Wait for reset complete
             wait_for(100, || {
@@ -480,9 +478,7 @@ impl OhciController {
             crate::time::delay_ms(10); // Recovery time
 
             // Clear status change
-            self.port(port_num)
-                .portsc
-                .write(HCRHPORTSTATUS::PRSC::SET);
+            self.port(port_num).portsc.write(HCRHPORTSTATUS::PRSC::SET);
 
             // Check if enabled
             if !self.port(port_num).portsc.is_set(HCRHPORTSTATUS::PES) {

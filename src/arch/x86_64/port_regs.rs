@@ -24,8 +24,8 @@
 
 use core::marker::PhantomData;
 
-use tock_registers::interfaces::{Readable, Writeable};
 use tock_registers::RegisterLongName;
+use tock_registers::interfaces::{Readable, Writeable};
 
 use super::io;
 
