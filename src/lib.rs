@@ -387,8 +387,11 @@ pub fn init(coreboot_table_ptr: u64) -> ! {
     // Register the runtime services log region and dump any log from the
     // previous boot before we do anything else (so the data is visible even
     // if init fails).  init() is called after deferred writes are processed.
-    efi::rtlog::register_region();
-    efi::rtlog::dump();
+    #[cfg(feature = "rt-log")]
+    {
+        efi::rtlog::register_region();
+        efi::rtlog::dump();
+    }
 
     // Reserve the deferred variable buffer region as RuntimeServicesData.
     // The buffer is at a fixed address (0x80000) below the payload, placed
@@ -473,6 +476,7 @@ pub fn init(coreboot_table_ptr: u64) -> ! {
 
     // Initialize the runtime log for this boot session (clears previous boot's
     // data now that it has been dumped above).
+    #[cfg(feature = "rt-log")]
     efi::rtlog::init();
 
     // Cache boot manager variables EARLY, before platform hooks or driver
