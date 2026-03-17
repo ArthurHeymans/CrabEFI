@@ -26,6 +26,8 @@ pub mod ohci;
 pub mod ohci_regs;
 #[cfg(target_arch = "x86_64")]
 pub mod uhci;
+#[cfg(target_arch = "x86_64")]
+pub mod uhci_regs;
 pub mod xhci;
 pub mod xhci_regs;
 

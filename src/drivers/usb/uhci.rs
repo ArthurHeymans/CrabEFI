@@ -7,108 +7,17 @@
 //! - UHCI Design Guide Revision 1.1
 //! - libpayload uhci.c
 
-use crate::arch::x86_64::io;
 use crate::drivers::pci::{self, PciAddress, PciDevice};
 use crate::efi;
 use crate::time::{Timeout, wait_for};
 use core::ptr;
 use core::sync::atomic::{Ordering, fence};
+use tock_registers::interfaces::{ReadWriteable, Readable, Writeable};
 
 use super::controller::{
     SetupPacket, UsbController, UsbDevice, UsbError, UsbSpeed, enumerate_device,
 };
-
-// ============================================================================
-// UHCI Register Definitions (I/O port based)
-// ============================================================================
-
-/// UHCI I/O Registers
-#[allow(dead_code)]
-mod regs {
-    /// USB Command
-    pub const USBCMD: u16 = 0x00;
-    /// USB Status
-    pub const USBSTS: u16 = 0x02;
-    /// USB Interrupt Enable
-    pub const USBINTR: u16 = 0x04;
-    /// Frame Number
-    pub const FRNUM: u16 = 0x06;
-    /// Frame List Base Address
-    pub const FLBASEADD: u16 = 0x08;
-    /// Start of Frame Modify
-    pub const SOFMOD: u16 = 0x0C;
-    /// Port 1 Status/Control
-    pub const PORTSC1: u16 = 0x10;
-    /// Port 2 Status/Control
-    pub const PORTSC2: u16 = 0x12;
-}
-
-/// USB Command Register bits
-#[allow(dead_code)]
-mod usbcmd {
-    /// Run/Stop
-    pub const RS: u16 = 1 << 0;
-    /// Host Controller Reset
-    pub const HCRESET: u16 = 1 << 1;
-    /// Global Reset
-    pub const GRESET: u16 = 1 << 2;
-    /// Enter Global Suspend Mode
-    pub const EGSM: u16 = 1 << 3;
-    /// Force Global Resume
-    pub const FGR: u16 = 1 << 4;
-    /// Software Debug
-    pub const SWDBG: u16 = 1 << 5;
-    /// Configure Flag
-    pub const CF: u16 = 1 << 6;
-    /// Max Packet (1 = 64 bytes)
-    pub const MAXP: u16 = 1 << 7;
-}
-
-/// USB Status Register bits
-#[allow(dead_code)]
-mod usbsts {
-    /// USB Interrupt
-    pub const USBINT: u16 = 1 << 0;
-    /// USB Error Interrupt
-    pub const USBERRINT: u16 = 1 << 1;
-    /// Resume Detect
-    pub const RESDET: u16 = 1 << 2;
-    /// Host System Error
-    pub const HSERR: u16 = 1 << 3;
-    /// Host Controller Process Error
-    pub const HCPE: u16 = 1 << 4;
-    /// Host Controller Halted
-    pub const HCHALTED: u16 = 1 << 5;
-}
-
-/// Port Status/Control bits
-#[allow(dead_code)]
-mod portsc {
-    /// Current Connect Status
-    pub const CCS: u16 = 1 << 0;
-    /// Connect Status Change
-    pub const CSC: u16 = 1 << 1;
-    /// Port Enabled
-    pub const PE: u16 = 1 << 2;
-    /// Port Enable Change
-    pub const PEC: u16 = 1 << 3;
-    /// Line Status D+ (bit 4)
-    pub const LS_DPLUS: u16 = 1 << 4;
-    /// Line Status D- (bit 5)
-    pub const LS_DMINUS: u16 = 1 << 5;
-    /// Resume Detect
-    pub const RD: u16 = 1 << 6;
-    /// Reserved (always 1)
-    pub const RESERVED: u16 = 1 << 7;
-    /// Low Speed Device Attached
-    pub const LSDA: u16 = 1 << 8;
-    /// Port Reset
-    pub const PR: u16 = 1 << 9;
-    /// Suspend
-    pub const SUSPEND: u16 = 1 << 12;
-    /// Write-clear bits
-    pub const WC_BITS: u16 = CSC | PEC;
-}
+use super::uhci_regs::{UhciRegs, PORTSC, USBCMD, USBSTS};
 
 // ============================================================================
 // UHCI Data Structures
@@ -411,19 +320,10 @@ impl UhciController {
         Ok(controller)
     }
 
-    /// Read from I/O port
-    fn inw(&self, offset: u16) -> u16 {
-        unsafe { io::inw(self.io_base + offset) }
-    }
-
-    /// Write to I/O port
-    fn outw(&mut self, offset: u16, value: u16) {
-        unsafe { io::outw(self.io_base + offset, value) }
-    }
-
-    /// Write dword to I/O port
-    fn outl(&mut self, offset: u16, value: u32) {
-        unsafe { io::outl(self.io_base + offset, value) }
+    /// Get typed register accessors for this controller's I/O port range
+    #[inline]
+    fn regs(&self) -> UhciRegs {
+        UhciRegs::new(self.io_base)
     }
 
     /// Disable UHCI legacy support (BIOS keyboard/mouse emulation)
@@ -463,22 +363,24 @@ impl UhciController {
         // First disable legacy support (BIOS keyboard emulation via SMM)
         self.disable_legacy_support();
 
+        let regs = self.regs();
+
         // Stop the controller
-        self.outw(regs::USBCMD, 0);
+        regs.usbcmd().set(0);
 
         // Wait for halt
-        wait_for(100, || (self.inw(regs::USBSTS) & usbsts::HCHALTED) != 0);
+        wait_for(100, || regs.usbsts().is_set(USBSTS::HCHALTED));
 
         // Global reset
-        self.outw(regs::USBCMD, usbcmd::GRESET);
+        regs.usbcmd().write(USBCMD::GRESET::SET);
         crate::time::delay_ms(50);
-        self.outw(regs::USBCMD, 0);
+        regs.usbcmd().set(0);
         crate::time::delay_ms(10);
 
         // Host controller reset
-        self.outw(regs::USBCMD, usbcmd::HCRESET);
+        regs.usbcmd().write(USBCMD::HCRESET::SET);
 
-        if !wait_for(100, || (self.inw(regs::USBCMD) & usbcmd::HCRESET) == 0) {
+        if !wait_for(100, || !regs.usbcmd().is_set(USBCMD::HCRESET)) {
             return Err(UsbError::Timeout);
         }
 
@@ -496,22 +398,23 @@ impl UhciController {
         }
 
         // Set frame list base
-        self.outl(regs::FLBASEADD, self.frame_list as u32);
+        regs.flbaseadd().set(self.frame_list as u32);
 
         // Set frame number to 0
-        self.outw(regs::FRNUM, 0);
+        regs.frnum().set(0);
 
         // Clear status
-        self.outw(regs::USBSTS, 0xFFFF);
+        regs.usbsts().set(0xFFFF);
 
         // Disable interrupts
-        self.outw(regs::USBINTR, 0);
+        regs.usbintr().set(0);
 
         // Start the controller
-        self.outw(regs::USBCMD, usbcmd::RS | usbcmd::CF | usbcmd::MAXP);
+        regs.usbcmd()
+            .write(USBCMD::RS::SET + USBCMD::CF::SET + USBCMD::MAXP::SET);
 
         // Wait for running
-        wait_for(100, || (self.inw(regs::USBSTS) & usbsts::HCHALTED) == 0);
+        wait_for(100, || !regs.usbsts().is_set(USBSTS::HCHALTED));
 
         crate::time::delay_ms(100);
 
@@ -521,23 +424,19 @@ impl UhciController {
 
     /// Enumerate ports
     fn enumerate_ports(&mut self) -> Result<(), UsbError> {
+        let regs = self.regs();
+
         for port in 0..self.num_ports {
-            let reg = if port == 0 {
-                regs::PORTSC1
-            } else {
-                regs::PORTSC2
-            };
+            let portsc = regs.portsc(port);
 
-            let portsc = self.inw(reg);
+            // Clear status change bits (write-1-to-clear CSC and PEC)
+            portsc.modify(PORTSC::CSC::SET + PORTSC::PEC::SET);
 
-            // Clear status change bits
-            self.outw(reg, portsc | portsc::WC_BITS);
-
-            if (portsc & portsc::CCS) == 0 {
+            if !portsc.is_set(PORTSC::CCS) {
                 continue;
             }
 
-            let is_low_speed = (portsc & portsc::LSDA) != 0;
+            let is_low_speed = portsc.is_set(PORTSC::LSDA);
             log::info!(
                 "UHCI: Device on port {} ({})",
                 port,
@@ -549,32 +448,30 @@ impl UhciController {
             );
 
             // Reset port
-            self.outw(reg, portsc::PR);
+            portsc.write(PORTSC::PR::SET);
             crate::time::delay_ms(50);
-            self.outw(reg, 0);
+            portsc.set(0);
             crate::time::delay_ms(10);
 
             // Enable port
             for _ in 0..10 {
-                let portsc = self.inw(reg);
-                if (portsc & portsc::CCS) == 0 {
+                if !portsc.is_set(PORTSC::CCS) {
                     break;
                 }
-                if (portsc & portsc::PE) != 0 {
+                if portsc.is_set(PORTSC::PE) {
                     break;
                 }
-                self.outw(reg, portsc | portsc::PE);
+                portsc.modify(PORTSC::PE::SET);
                 crate::time::delay_ms(10);
             }
 
-            let portsc = self.inw(reg);
-            if (portsc & portsc::PE) == 0 {
+            if !portsc.is_set(PORTSC::PE) {
                 log::warn!("UHCI: Port {} not enabled", port);
                 continue;
             }
 
             // Clear status changes again
-            self.outw(reg, portsc | portsc::WC_BITS);
+            portsc.modify(PORTSC::CSC::SET + PORTSC::PEC::SET);
 
             let speed = if is_low_speed {
                 UsbSpeed::Low
@@ -946,23 +843,25 @@ impl UhciController {
     pub fn cleanup(&mut self) {
         log::debug!("UHCI cleanup: stopping and resetting controller");
 
+        let regs = self.regs();
+
         // 1. Stop the controller
-        self.outw(regs::USBCMD, 0);
+        regs.usbcmd().set(0);
 
         // 2. Global Reset (hold for at least 10ms per UHCI spec 2.1.1)
-        self.outw(regs::USBCMD, usbcmd::GRESET);
+        regs.usbcmd().write(USBCMD::GRESET::SET);
         crate::time::delay_ms(50);
-        self.outw(regs::USBCMD, 0);
+        regs.usbcmd().set(0);
         crate::time::delay_ms(10);
 
         // 3. Host Controller Reset
-        self.outw(regs::USBCMD, usbcmd::HCRESET);
+        regs.usbcmd().write(USBCMD::HCRESET::SET);
 
         // Wait for reset to complete (should be quick, timeout after 100ms)
-        wait_for(100, || self.inw(regs::USBCMD) & usbcmd::HCRESET == 0);
+        wait_for(100, || !regs.usbcmd().is_set(USBCMD::HCRESET));
 
         // 4. Clear status register
-        self.outw(regs::USBSTS, 0x3F);
+        regs.usbsts().set(0x3F);
 
         log::debug!("UHCI cleanup complete");
     }
