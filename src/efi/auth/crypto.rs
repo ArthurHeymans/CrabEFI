@@ -717,6 +717,13 @@ fn verify_chain_link(
 }
 
 /// Verify a single certificate against a trust anchor (for direct trust)
+///
+/// Per the UEFI specification, certificates in the db are explicit trust
+/// anchors for image verification.  When the signer certificate IS the db
+/// certificate (direct trust), we must NOT enforce CA-only extensions
+/// (basicConstraints, keyUsage) because tools like `sbctl` generate plain
+/// end-entity certificates without CA:TRUE.  edk2 and u-boot behave the
+/// same way — the db is a flat allow-list, not a CA trust store.
 fn verify_single_cert(
     cert_der: &[u8],
     trust_anchor_der: &[u8],
@@ -735,7 +742,19 @@ fn verify_single_cert(
         return Ok(false);
     };
 
-    verify_chain_link(cert_der, issuer_der, config)
+    // For direct trust (cert is directly in db), relax CA-only checks.
+    // The db entry is an explicit trust anchor — its extensions are irrelevant.
+    let relaxed_config = ChainBuildingConfig {
+        max_depth: config.max_depth,
+        check_revocation: config.check_revocation,
+        revocation_config: Default::default(),
+        current_time: config.current_time,
+        require_basic_constraints: false,
+        require_key_usage: false,
+        check_validity_period: config.check_validity_period,
+    };
+
+    verify_chain_link(cert_der, issuer_der, &relaxed_config)
 }
 
 /// Verify a certificate chain with full revocation checking
