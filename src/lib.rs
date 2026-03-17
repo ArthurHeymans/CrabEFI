@@ -384,34 +384,42 @@ pub fn init(coreboot_table_ptr: u64) -> ! {
     // Initialize PCI early so we can detect SPI controller
     drivers::pci::init();
 
-    // Reserve and initialize the deferred variable buffer (for runtime variable persistence)
-    // This buffer survives warm reboot and allows variable changes after ExitBootServices
-    // to be applied on the next boot.
+    // Register the runtime services log region and dump any log from the
+    // previous boot before we do anything else (so the data is visible even
+    // if init fails).  init() is called after deferred writes are processed.
+    efi::rtlog::register_region();
+    efi::rtlog::dump();
+
+    // Reserve the deferred variable buffer region as RuntimeServicesData.
+    // The buffer is at a fixed address (0x80000) below the payload, placed
+    // there by the linker script so coreboot/cbfstool never overwrites it.
+    // Registering it as RuntimeServicesData ensures the OS preserves the
+    // mapping and SetVirtualAddressMap adjusts the GOT-based pointer.
     {
         use efi::allocator::{MemoryType, PAGE_SIZE};
-        use efi::varstore::{deferred_buffer_base, deferred_buffer_size};
+        use efi::varstore::deferred;
 
-        let buffer_base = deferred_buffer_base();
-        let buffer_pages = (deferred_buffer_size() as u64).div_ceil(PAGE_SIZE);
+        let buf_base = deferred::deferred_buffer_base();
+        let buf_pages = (deferred::deferred_buffer_size() as u64).div_ceil(PAGE_SIZE);
 
-        // Reserve the memory region as ReservedMemoryType so the OS won't overwrite it
-        state::with_allocator_mut(|alloc| {
-            if let Err(e) =
-                alloc.reserve_region(buffer_base, buffer_pages, MemoryType::ReservedMemoryType)
-            {
-                log::warn!(
-                    "Could not reserve deferred buffer region at {:#x}: {:?}",
-                    buffer_base,
-                    e
-                );
-            } else {
-                log::debug!(
-                    "Reserved {} pages for deferred buffer at {:#x}",
-                    buffer_pages,
-                    buffer_base
-                );
-            }
-        });
+        // The buffer is outside the payload load region so it might not be in
+        // the coreboot-derived memory map at all.  force_add_region creates
+        // the entry unconditionally.
+        if let Err(e) =
+            efi::allocator::force_add_region(buf_base, buf_pages, MemoryType::RuntimeServicesData)
+        {
+            log::warn!(
+                "Could not register deferred buffer at {:#x}: {:?}",
+                buf_base,
+                e
+            );
+        } else {
+            log::info!(
+                "Deferred buffer at {:#x} ({} pages) registered as RuntimeServicesData",
+                buf_base,
+                buf_pages
+            );
+        }
     }
 
     // Initialize variable store persistence (loads variables from SPI flash)
@@ -419,16 +427,13 @@ pub fn init(coreboot_table_ptr: u64) -> ! {
         Ok(()) => {
             log::info!("Variable store persistence initialized");
 
-            // Check for pending deferred writes from previous boot BEFORE clearing the buffer
-            // This must be done after SPI init so we can write to SMMSTORE
+            // Check for pending deferred writes from previous warm boot
             let pending_count = efi::varstore::check_deferred_pending();
             if pending_count > 0 {
                 log::info!(
                     "Found {} pending deferred writes from previous boot",
                     pending_count
                 );
-
-                // Apply the deferred writes to SPI
                 match efi::varstore::process_deferred_pending() {
                     Ok(n) => log::info!("Applied {} deferred variable writes", n),
                     Err(e) => log::warn!("Failed to process deferred writes: {:?}", e),
@@ -461,9 +466,14 @@ pub fn init(coreboot_table_ptr: u64) -> ! {
         Err(e) => log::warn!("Variable store persistence not available: {:?}", e),
     }
 
-    // Now initialize the deferred buffer for this boot session
-    // This clears the buffer so new runtime writes can be accumulated
+    // Initialize the deferred buffer for this boot session.
+    // Any pending writes from a previous warm boot were already processed
+    // above; now clear the buffer so new runtime writes can be accumulated.
     efi::varstore::init_deferred_buffer();
+
+    // Initialize the runtime log for this boot session (clears previous boot's
+    // data now that it has been dumped above).
+    efi::rtlog::init();
 
     // Cache boot manager variables EARLY, before platform hooks or driver
     // binding can modify them (matches edk2 BdsEntry behavior).

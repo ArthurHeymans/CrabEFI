@@ -989,6 +989,27 @@ extern "efiapi" fn set_variable(
     let name = variable_name;
     let guid = unsafe { *vendor_guid };
 
+    // ── Runtime log: record every SetVariable call after ExitBootServices ──
+    if state::is_exit_boot_services_called() {
+        use crate::efi::rtlog;
+        rtlog::append("SetVariable name=");
+        if !variable_name.is_null() {
+            // Print up to 64 UCS-2 chars as ASCII (names are always ASCII)
+            for i in 0..64usize {
+                let c = unsafe { *variable_name.add(i) };
+                if c == 0 {
+                    break;
+                }
+                rtlog::append(core::str::from_utf8(&[(c & 0x7f) as u8]).unwrap_or("?"));
+            }
+        }
+        rtlog::append(" attr=");
+        rtlog::append_hex(attributes as u64);
+        rtlog::append(" size=");
+        rtlog::append_u64(data_size as u64);
+        rtlog::appendln("");
+    }
+
     // Check name length
     let name_len = ucs2_strlen_ptr(name);
     if name_len == 0 || name_len >= MAX_VARIABLE_NAME_LEN {
@@ -1072,6 +1093,11 @@ extern "efiapi" fn set_variable(
             }
             Err(e) => {
                 log::warn!("Authenticated variable verification failed: {:?}", e);
+                if state::is_exit_boot_services_called() {
+                    use crate::efi::rtlog;
+                    rtlog::append("  -> auth verify FAILED: ");
+                    rtlog::appendln(alloc::format!("{:?}", e).as_str());
+                }
                 return e.into();
             }
         }
@@ -1146,10 +1172,34 @@ extern "efiapi" fn set_variable(
                     // Persist the updated variable
                     if (attributes & crate::efi::auth::attributes::NON_VOLATILE) != 0 {
                         let name_slice = unsafe { core::slice::from_raw_parts(name, name_len + 1) };
-                        if let Err(e) = crate::efi::varstore::persist_variable(
-                            &guid, name_slice, attributes, &combined,
+                        // The combined data is the fully-resolved merge of existing +
+                        // new signature lists (auth header already stripped, append
+                        // already applied).  When writing to the deferred buffer at
+                        // runtime, clear the auth/append flags so the buffer stores
+                        // it as a plain non-auth full write — the verification was
+                        // already performed above.
+                        let persist_attrs = attributes
+                            & !(crate::efi::auth::attributes::TIME_BASED_AUTHENTICATED_WRITE_ACCESS
+                                | crate::efi::auth::attributes::APPEND_WRITE);
+                        match crate::efi::varstore::persist_variable(
+                            &guid,
+                            name_slice,
+                            persist_attrs,
+                            &combined,
                         ) {
-                            log::debug!("Variable not persisted: {:?}", e);
+                            Ok(()) => {
+                                if state::is_exit_boot_services_called() {
+                                    crate::efi::rtlog::appendln("  -> persisted OK (append)");
+                                }
+                            }
+                            Err(e) => {
+                                log::debug!("Variable not persisted: {:?}", e);
+                                if state::is_exit_boot_services_called() {
+                                    use crate::efi::rtlog;
+                                    rtlog::append("  -> persist FAILED (append): ");
+                                    rtlog::appendln(alloc::format!("{:?}", e).as_str());
+                                }
+                            }
                         }
                     }
 
@@ -1203,12 +1253,42 @@ extern "efiapi" fn set_variable(
         // Only persist non-volatile variables
         if (attributes & crate::efi::auth::attributes::NON_VOLATILE) != 0 {
             let name_slice = unsafe { core::slice::from_raw_parts(name, name_len + 1) };
-            let data_slice = unsafe { core::slice::from_raw_parts(data_ptr, final_data_size) };
-            if let Err(e) =
-                crate::efi::varstore::persist_variable(&guid, name_slice, attributes, data_slice)
-            {
-                log::debug!("Variable not persisted: {:?}", e);
-                // Don't fail the operation - in-memory storage succeeded
+
+            // For authenticated variables at runtime (after ExitBootServices), we
+            // must pass the ORIGINAL signed data (with auth header) to the deferred
+            // buffer so it can re-verify the signature on next boot and extract the
+            // timestamp.  Before ExitBootServices, we write the stripped payload
+            // directly to SPI flash (no auth header needed in storage).
+            let persist_data: &[u8] =
+                if is_authenticated && state::is_exit_boot_services_called() && data_size > 0 {
+                    // SAFETY: `data` and `data_size` are the original caller-provided
+                    // values validated at function entry; the pointer is valid for
+                    // `data_size` bytes and has not been freed.
+                    unsafe { core::slice::from_raw_parts(data as *const u8, data_size) }
+                } else {
+                    unsafe { core::slice::from_raw_parts(data_ptr, final_data_size) }
+                };
+
+            match crate::efi::varstore::persist_variable(
+                &guid,
+                name_slice,
+                attributes,
+                persist_data,
+            ) {
+                Ok(()) => {
+                    if state::is_exit_boot_services_called() {
+                        use crate::efi::rtlog;
+                        rtlog::appendln("  -> persisted OK");
+                    }
+                }
+                Err(e) => {
+                    log::debug!("Variable not persisted: {:?}", e);
+                    if state::is_exit_boot_services_called() {
+                        use crate::efi::rtlog;
+                        rtlog::append("  -> persist FAILED: ");
+                        rtlog::appendln(alloc::format!("{:?}", e).as_str());
+                    }
+                }
             }
         }
 
@@ -1222,7 +1302,17 @@ fn handle_secure_boot_variable_update(var_type: auth::SecureBootVariable) {
         auth::SecureBootVariable::PK if auth::is_setup_mode() => {
             // PK enrollment transitions from Setup Mode to User Mode
             auth::enter_user_mode();
-            auth::enable_secure_boot();
+
+            // Per UEFI spec, PK enrollment transitions to User Mode but does NOT
+            // automatically enable Secure Boot enforcement.  The SecureBoot variable
+            // is set based on the persisted SecureBootEnable preference.
+            if auth::boot::load_secure_boot_enable_preference() {
+                auth::enable_secure_boot();
+            }
+
+            // Sync the in-memory SetupMode/SecureBoot status variables so that
+            // GetNextVariableName enumeration and any internal readers stay consistent.
+            let _ = auth::boot::update_status_variables();
         }
         _ => {
             // Other variables (or PK when not in setup mode) don't change state
@@ -1238,6 +1328,9 @@ fn handle_secure_boot_variable_delete(var_type: auth::SecureBootVariable) {
             auth::enter_setup_mode();
             // Clear the PK database
             auth::pk_database().clear();
+
+            // Sync the in-memory status variables after mode transition
+            let _ = auth::boot::update_status_variables();
         }
         auth::SecureBootVariable::KEK => {
             auth::kek_database().clear();
