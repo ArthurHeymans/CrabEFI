@@ -9,69 +9,56 @@
 
 use core::fmt::{self, Write};
 
-// ============================================================================
-// Register offsets (16550-compatible)
-// ============================================================================
+use spin::Mutex;
+use tock_registers::interfaces::{Readable, Writeable};
 
-mod offsets {
-    pub const DATA: usize = 0; // Data register (read/write), also DLL when DLAB=1
-    pub const IER: usize = 1; // Interrupt Enable Register, also DLH when DLAB=1
-    pub const FCR: usize = 2; // FIFO Control Register (write)
-    pub const LCR: usize = 3; // Line Control Register
-    pub const MCR: usize = 4; // Modem Control Register
-    pub const LSR: usize = 5; // Line Status Register
-    pub const SCRATCH: usize = 7; // Scratch register
-}
-
-/// LSR bit: Transmitter Holding Register Empty
-const LSR_TX_EMPTY: u8 = 0x20;
-/// LSR bit: Data Ready
-const LSR_DATA_READY: u8 = 0x01;
-/// LCR bit: DLAB (Divisor Latch Access Bit)
-const LCR_DLAB: u8 = 0x80;
+#[cfg(target_arch = "aarch64")]
+use super::serial_regs::pl011::{self, FR};
+#[cfg(target_arch = "x86_64")]
+use super::serial_regs::uart16550::{self, Uart16550Regs, FCR, LCR, MCR};
 
 /// Maximum iterations to wait for TX ready (prevents infinite loop on missing hardware)
 const TX_TIMEOUT_ITERATIONS: u32 = 100_000;
 
 // ============================================================================
-// Register access abstraction
+// 16550 UART Backend (x86 port I/O + MMIO fallback)
 // ============================================================================
 
-/// Backend for accessing serial port registers
+/// Backend for accessing 16550 UART registers
 #[derive(Clone, Copy)]
-enum SerialBackend {
-    /// x86 I/O port-based access (16550 UART at I/O port address)
+enum Uart16550Backend {
+    /// x86 I/O port-based access
     #[cfg(target_arch = "x86_64")]
     PortIo { base: u16 },
-    /// Memory-mapped register access (16550 or PL011)
+    /// Memory-mapped register access (16550-compatible)
     Mmio { base: u64 },
 }
 
-impl SerialBackend {
-    /// Read an 8-bit register
+impl Uart16550Backend {
+    /// Read an 8-bit register at the given offset
     #[inline]
     fn read(&self, offset: usize) -> u8 {
         match self {
             #[cfg(target_arch = "x86_64")]
-            SerialBackend::PortIo { base } => unsafe {
+            Uart16550Backend::PortIo { base } => unsafe {
                 crate::arch::x86_64::io::inb(*base + offset as u16)
             },
-            SerialBackend::Mmio { base } => unsafe {
+            Uart16550Backend::Mmio { base } => unsafe {
                 let addr = (*base + offset as u64) as *const u8;
                 core::ptr::read_volatile(addr)
             },
         }
     }
 
-    /// Write an 8-bit register
+    /// Write an 8-bit register at the given offset
     #[inline]
     fn write(&self, offset: usize, value: u8) {
         match self {
             #[cfg(target_arch = "x86_64")]
-            SerialBackend::PortIo { base } => unsafe {
+            Uart16550Backend::PortIo { base } => unsafe {
                 crate::arch::x86_64::io::outb(*base + offset as u16, value);
             },
-            SerialBackend::Mmio { base } => unsafe {
+            Uart16550Backend::Mmio { base } => unsafe {
                 let addr = (*base + offset as u64) as *mut u8;
                 core::ptr::write_volatile(addr, value);
             },
@@ -79,14 +66,27 @@ impl SerialBackend {
     }
 }
 
-// ============================================================================
-// Serial Port Driver
-// ============================================================================
+// Register offsets for the MMIO fallback path (no tock-registers for MMIO 16550)
+mod offsets {
+    pub const DATA: usize = 0;
+    pub const IER: usize = 1;
+    pub const FCR: usize = 2;
+    pub const LCR: usize = 3;
+    pub const MCR: usize = 4;
+    pub const LSR: usize = 5;
+    pub const SCRATCH: usize = 7;
+}
 
-/// A serial port (16550 or PL011 compatible)
+/// LSR bit: Transmitter Holding Register Empty (MMIO fallback)
+const LSR_TX_EMPTY: u8 = 0x20;
+/// LSR bit: Data Ready (MMIO fallback)
+const LSR_DATA_READY: u8 = 0x01;
+/// LCR bit: DLAB (MMIO fallback)
+const LCR_DLAB: u8 = 0x80;
+
+/// A 16550-compatible serial port
 pub struct SerialPort {
-    /// Register access backend
-    backend: SerialBackend,
+    backend: Uart16550Backend,
     /// Whether this port has been detected as functional
     functional: bool,
 }
@@ -94,62 +94,95 @@ pub struct SerialPort {
 impl SerialPort {
     /// Check if a serial port exists at this address
     ///
-    /// Uses the scratch register test for 16550: write a value, read it back.
+    /// Uses the scratch register test: write a value, read it back.
     fn detect(&self) -> bool {
-        // Try writing and reading back a test pattern
-        self.backend.write(offsets::SCRATCH, 0x55);
-        if self.backend.read(offsets::SCRATCH) != 0x55 {
-            return false;
+        match self.backend {
+            #[cfg(target_arch = "x86_64")]
+            Uart16550Backend::PortIo { base } => {
+                let regs = Uart16550Regs::new(base);
+                // Write and read back test patterns via scratch register
+                regs.scratch().set(0x55);
+                if regs.scratch().get() != 0x55 {
+                    return false;
+                }
+                regs.scratch().set(0xAA);
+                if regs.scratch().get() != 0xAA {
+                    return false;
+                }
+                // Check that LSR doesn't return 0xFF (unpopulated port)
+                regs.lsr().get() != 0xFF
+            }
+            Uart16550Backend::Mmio { .. } => {
+                // MMIO fallback: raw offset access
+                self.backend.write(offsets::SCRATCH, 0x55);
+                if self.backend.read(offsets::SCRATCH) != 0x55 {
+                    return false;
+                }
+                self.backend.write(offsets::SCRATCH, 0xAA);
+                if self.backend.read(offsets::SCRATCH) != 0xAA {
+                    return false;
+                }
+                self.backend.read(offsets::LSR) != 0xFF
+            }
         }
-
-        self.backend.write(offsets::SCRATCH, 0xAA);
-        if self.backend.read(offsets::SCRATCH) != 0xAA {
-            return false;
-        }
-
-        // Also check that LSR doesn't return 0xFF (unpopulated port)
-        if self.backend.read(offsets::LSR) == 0xFF {
-            return false;
-        }
-
-        true
     }
 
     /// Initialize the serial port with the given baud rate (16550 mode)
     ///
     /// Returns true if initialization succeeded, false if no serial port detected.
     pub fn init_16550(&mut self, baud: u32) -> bool {
-        // First check if a serial port exists
         if !self.detect() {
             self.functional = false;
             return false;
         }
-
         if baud == 0 {
             self.functional = false;
             return false;
         }
         let divisor = 115200 / baud;
 
-        // Disable interrupts
-        self.backend.write(offsets::IER, 0x00);
+        match self.backend {
+            #[cfg(target_arch = "x86_64")]
+            Uart16550Backend::PortIo { base } => {
+                let regs = Uart16550Regs::new(base);
 
-        // Enable DLAB to set baud rate divisor
-        self.backend.write(offsets::LCR, LCR_DLAB);
+                // Disable interrupts
+                regs.ier().set(0);
 
-        // Set divisor
-        self.backend.write(offsets::DATA, (divisor & 0xFF) as u8);
-        self.backend
-            .write(offsets::IER, ((divisor >> 8) & 0xFF) as u8);
+                // Enable DLAB to set baud rate divisor
+                regs.lcr().write(LCR::DLAB::SET);
 
-        // 8 bits, no parity, one stop bit (clear DLAB at the same time)
-        self.backend.write(offsets::LCR, 0x03);
+                // Set divisor low/high bytes
+                regs.data().set((divisor & 0xFF) as u8);
+                regs.dlm().set(((divisor >> 8) & 0xFF) as u8);
 
-        // Enable FIFO, clear them, with 14-byte threshold
-        self.backend.write(offsets::FCR, 0xC7);
+                // 8 bits, no parity, one stop bit (clears DLAB)
+                regs.lcr().write(LCR::WLS::Bits8);
 
-        // IRQs enabled, RTS/DSR set
-        self.backend.write(offsets::MCR, 0x0B);
+                // Enable FIFO, clear them, 14-byte trigger level
+                regs.iir_fcr().write(
+                    FCR::FIFOE::SET
+                        + FCR::RFIFOR::SET
+                        + FCR::XFIFOR::SET
+                        + FCR::RCVR_TRIGGER::Bytes14,
+                );
+
+                // DTR + RTS + OUT2 (enables IRQs)
+                regs.mcr()
+                    .write(MCR::DTR::SET + MCR::RTS::SET + MCR::OUT2::SET);
+            }
+            Uart16550Backend::Mmio { .. } => {
+                // MMIO fallback: raw register writes
+                self.backend.write(offsets::IER, 0x00);
+                self.backend.write(offsets::LCR, LCR_DLAB);
+                self.backend.write(offsets::DATA, (divisor & 0xFF) as u8);
+                self.backend
+                    .write(offsets::IER, ((divisor >> 8) & 0xFF) as u8);
+                self.backend.write(offsets::LCR, 0x03);
+                self.backend.write(offsets::FCR, 0xC7);
+                self.backend.write(offsets::MCR, 0x0B);
+            }
+        }
 
         self.functional = true;
         true
@@ -160,10 +193,6 @@ impl SerialPort {
     /// On SBSA platforms, the PL011 UART is already initialized by TF-A.
     /// We just need to verify it's there and start using it.
     pub fn init_pl011(&mut self) -> bool {
-        // PL011 doesn't have a scratch register, so we can't do the 16550
-        // detection. Instead, just check the UART Flag Register (UARTFR at
-        // offset 0x18) for a sane value.
-        // For simplicity and because TF-A already set it up, just mark as functional.
         self.functional = true;
         true
     }
@@ -174,37 +203,87 @@ impl SerialPort {
             return;
         }
 
-        // Wait for transmit buffer to be empty, with timeout
-        let mut timeout = TX_TIMEOUT_ITERATIONS;
-        while self.backend.read(offsets::LSR) & LSR_TX_EMPTY == 0 {
-            timeout -= 1;
-            if timeout == 0 {
-                self.functional = false;
-                return;
+        match self.backend {
+            #[cfg(target_arch = "x86_64")]
+            Uart16550Backend::PortIo { base } => {
+                let regs = Uart16550Regs::new(base);
+                // Wait for transmit buffer to be empty, with timeout
+                let mut timeout = TX_TIMEOUT_ITERATIONS;
+                while !regs.lsr().is_set(uart16550::LSR::THRE) {
+                    timeout -= 1;
+                    if timeout == 0 {
+                        self.functional = false;
+                        return;
+                    }
+                    core::hint::spin_loop();
+                }
+                regs.data().set(byte);
             }
-            core::hint::spin_loop();
+            Uart16550Backend::Mmio { .. } => {
+                let mut timeout = TX_TIMEOUT_ITERATIONS;
+                while self.backend.read(offsets::LSR) & LSR_TX_EMPTY == 0 {
+                    timeout -= 1;
+                    if timeout == 0 {
+                        self.functional = false;
+                        return;
+                    }
+                    core::hint::spin_loop();
+                }
+                self.backend.write(offsets::DATA, byte);
+            }
         }
-
-        self.backend.write(offsets::DATA, byte);
     }
 
     /// Try to read a byte from the serial port (non-blocking)
     pub fn try_read_byte(&mut self) -> Option<u8> {
-        if self.backend.read(offsets::LSR) & LSR_DATA_READY != 0 {
-            Some(self.backend.read(offsets::DATA))
-        } else {
-            None
+        match self.backend {
+            #[cfg(target_arch = "x86_64")]
+            Uart16550Backend::PortIo { base } => {
+                let regs = Uart16550Regs::new(base);
+                if regs.lsr().is_set(uart16550::LSR::DR) {
+                    Some(regs.data().get())
+                } else {
+                    None
+                }
+            }
+            Uart16550Backend::Mmio { .. } => {
+                if self.backend.read(offsets::LSR) & LSR_DATA_READY != 0 {
+                    Some(self.backend.read(offsets::DATA))
+                } else {
+                    None
+                }
+            }
         }
     }
 
     /// Check if the serial port is ready to receive data
     pub fn can_receive(&self) -> bool {
-        self.functional && self.backend.read(offsets::LSR) & LSR_DATA_READY != 0
+        if !self.functional {
+            return false;
+        }
+        match self.backend {
+            #[cfg(target_arch = "x86_64")]
+            Uart16550Backend::PortIo { base } => {
+                let regs = Uart16550Regs::new(base);
+                regs.lsr().is_set(uart16550::LSR::DR)
+            }
+            Uart16550Backend::Mmio { .. } => self.backend.read(offsets::LSR) & LSR_DATA_READY != 0,
+        }
     }
 
     /// Check if the serial port is ready to send data
     pub fn can_send(&self) -> bool {
-        self.functional && self.backend.read(offsets::LSR) & LSR_TX_EMPTY != 0
+        if !self.functional {
+            return false;
+        }
+        match self.backend {
+            #[cfg(target_arch = "x86_64")]
+            Uart16550Backend::PortIo { base } => {
+                let regs = Uart16550Regs::new(base);
+                regs.lsr().is_set(uart16550::LSR::THRE)
+            }
+            Uart16550Backend::Mmio { .. } => self.backend.read(offsets::LSR) & LSR_TX_EMPTY != 0,
+        }
     }
 }
 
@@ -225,46 +304,23 @@ impl Write for SerialPort {
 // ============================================================================
 
 #[cfg(target_arch = "aarch64")]
-/// PL011 UART register offsets
-mod pl011 {
-    pub const UARTDR: usize = 0x000; // Data Register
-    pub const UARTFR: usize = 0x018; // Flag Register
-    // Flag register bits
-    pub const FR_TXFF: u16 = 1 << 5; // Transmit FIFO Full
-    pub const FR_RXFE: u16 = 1 << 4; // Receive FIFO Empty
-}
-
-#[cfg(target_arch = "aarch64")]
-/// PL011 serial port backend
+/// PL011 serial port backend using tock-registers MMIO struct
 ///
 /// Separate from the 16550 backend because register layout differs significantly.
 pub(crate) struct Pl011Port {
-    base: u64,
+    regs: &'static pl011::Pl011Registers,
     functional: bool,
 }
 
 #[cfg(target_arch = "aarch64")]
 impl Pl011Port {
     fn new(base: u64) -> Self {
+        // Safety: The PL011 base address is provided by coreboot tables and
+        // is valid MMIO for the UART's lifetime (the entire firmware run).
+        let regs = unsafe { &*(base as *const pl011::Pl011Registers) };
         Self {
-            base,
+            regs,
             functional: true, // TF-A already initialized it
-        }
-    }
-
-    #[inline]
-    fn read16(&self, offset: usize) -> u16 {
-        unsafe {
-            let addr = (self.base + offset as u64) as *const u16;
-            core::ptr::read_volatile(addr)
-        }
-    }
-
-    #[inline]
-    fn write32(&self, offset: usize, value: u32) {
-        unsafe {
-            let addr = (self.base + offset as u64) as *mut u32;
-            core::ptr::write_volatile(addr, value);
         }
     }
 
@@ -274,7 +330,7 @@ impl Pl011Port {
         }
         // Wait for TX FIFO not full
         let mut timeout = TX_TIMEOUT_ITERATIONS;
-        while self.read16(pl011::UARTFR) & pl011::FR_TXFF != 0 {
+        while self.regs.fr.is_set(FR::TXFF) {
             timeout -= 1;
             if timeout == 0 {
                 self.functional = false;
@@ -282,22 +338,19 @@ impl Pl011Port {
             }
             core::hint::spin_loop();
         }
-        self.write32(pl011::UARTDR, byte as u32);
+        self.regs.dr.set(byte as u32);
     }
 
     fn try_read_byte(&mut self) -> Option<u8> {
-        if self.read16(pl011::UARTFR) & pl011::FR_RXFE == 0 {
-            Some(unsafe {
-                let addr = (self.base + pl011::UARTDR as u64) as *const u32;
-                core::ptr::read_volatile(addr) as u8
-            })
+        if !self.regs.fr.is_set(FR::RXFE) {
+            Some(self.regs.dr.get() as u8)
         } else {
             None
         }
     }
 
     fn can_receive(&self) -> bool {
-        self.functional && self.read16(pl011::UARTFR) & pl011::FR_RXFE == 0
+        self.functional && !self.regs.fr.is_set(FR::RXFE)
     }
 }
 
@@ -359,7 +412,7 @@ pub fn init_from_coreboot(base_addr: u32, baud: u32, is_mmio: bool) {
 
         // Fall back to MMIO 16550
         let mut serial = SerialPort {
-            backend: SerialBackend::Mmio {
+            backend: Uart16550Backend::Mmio {
                 base: base_addr as u64,
             },
             functional: false,
@@ -378,7 +431,7 @@ pub fn init_from_coreboot(base_addr: u32, baud: u32, is_mmio: bool) {
         #[cfg(target_arch = "x86_64")]
         {
             let mut serial = SerialPort {
-                backend: SerialBackend::PortIo {
+                backend: Uart16550Backend::PortIo {
                     base: base_addr as u16,
                 },
                 functional: false,
