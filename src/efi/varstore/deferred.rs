@@ -94,7 +94,13 @@ fn linker_buffer_base() -> *mut u8 {
 const HEADER_SIZE: usize = 32;
 
 /// Maximum size of a single entry (including length prefix)
-const MAX_ENTRY_SIZE: usize = 8 * 1024;
+///
+/// Must be large enough for authenticated Secure Boot key variables.
+/// `sbctl enroll-keys --microsoft` writes db/KEK entries containing
+/// multiple X.509 certificates (~1.5 KB each) inside an
+/// EFI_VARIABLE_AUTHENTICATION_2 header with a PKCS#7 signature
+/// (~1-2 KB).  16 KB covers all realistic enrollment payloads.
+const MAX_ENTRY_SIZE: usize = 16 * 1024;
 
 /// Entry flags
 mod entry_flags {
