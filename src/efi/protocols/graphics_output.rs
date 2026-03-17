@@ -7,7 +7,7 @@
 use r_efi::efi::{Guid, Status};
 
 use crate::coreboot::FramebufferInfo;
-use crate::efi::allocator::{MemoryType, allocate_pool};
+use crate::efi::allocator::{allocate_pool, MemoryType};
 use crate::efi::utils::allocate_protocol_with_log;
 use crate::state;
 
@@ -370,40 +370,42 @@ unsafe fn write_pixel_to_fb(
     y: usize,
     pixel: &BltPixel,
 ) {
-    let bytes_per_pixel = (fb.bits_per_pixel / 8) as usize;
-    let offset = y * fb.bytes_per_line as usize + x * bytes_per_pixel;
-    let ptr = fb_ptr.add(offset);
+    unsafe {
+        let bytes_per_pixel = (fb.bits_per_pixel / 8) as usize;
+        let offset = y * fb.bytes_per_line as usize + x * bytes_per_pixel;
+        let ptr = fb_ptr.add(offset);
 
-    match fb.bits_per_pixel {
-        32 => {
-            // Encode based on mask positions
-            let value = ((pixel.red as u32) << fb.red_mask_pos)
-                | ((pixel.green as u32) << fb.green_mask_pos)
-                | ((pixel.blue as u32) << fb.blue_mask_pos);
-            (ptr as *mut u32).write_volatile(value);
-        }
-        24 => {
-            if fb.blue_mask_pos < fb.red_mask_pos {
-                // BGR
-                ptr.write_volatile(pixel.blue);
-                ptr.add(1).write_volatile(pixel.green);
-                ptr.add(2).write_volatile(pixel.red);
-            } else {
-                // RGB
-                ptr.write_volatile(pixel.red);
-                ptr.add(1).write_volatile(pixel.green);
-                ptr.add(2).write_volatile(pixel.blue);
+        match fb.bits_per_pixel {
+            32 => {
+                // Encode based on mask positions
+                let value = ((pixel.red as u32) << fb.red_mask_pos)
+                    | ((pixel.green as u32) << fb.green_mask_pos)
+                    | ((pixel.blue as u32) << fb.blue_mask_pos);
+                (ptr as *mut u32).write_volatile(value);
             }
+            24 => {
+                if fb.blue_mask_pos < fb.red_mask_pos {
+                    // BGR
+                    ptr.write_volatile(pixel.blue);
+                    ptr.add(1).write_volatile(pixel.green);
+                    ptr.add(2).write_volatile(pixel.red);
+                } else {
+                    // RGB
+                    ptr.write_volatile(pixel.red);
+                    ptr.add(1).write_volatile(pixel.green);
+                    ptr.add(2).write_volatile(pixel.blue);
+                }
+            }
+            16 => {
+                // RGB565 typically
+                let r = (pixel.red >> 3) as u16;
+                let g = (pixel.green >> 2) as u16;
+                let b = (pixel.blue >> 3) as u16;
+                let value = (r << 11) | (g << 5) | b;
+                (ptr as *mut u16).write_volatile(value);
+            }
+            _ => {}
         }
-        16 => {
-            // RGB565 typically
-            let r = (pixel.red >> 3) as u16;
-            let g = (pixel.green >> 2) as u16;
-            let b = (pixel.blue >> 3) as u16;
-            let value = (r << 11) | (g << 5) | b;
-            (ptr as *mut u16).write_volatile(value);
-        }
-        _ => {}
     }
 }
 
@@ -414,49 +416,51 @@ unsafe fn read_pixel_from_fb(
     x: usize,
     y: usize,
 ) -> BltPixel {
-    let bytes_per_pixel = (fb.bits_per_pixel / 8) as usize;
-    let offset = y * fb.bytes_per_line as usize + x * bytes_per_pixel;
-    let ptr = fb_ptr.add(offset);
+    unsafe {
+        let bytes_per_pixel = (fb.bits_per_pixel / 8) as usize;
+        let offset = y * fb.bytes_per_line as usize + x * bytes_per_pixel;
+        let ptr = fb_ptr.add(offset);
 
-    match fb.bits_per_pixel {
-        32 => {
-            let value = (ptr as *const u32).read_volatile();
-            BltPixel {
-                red: ((value >> fb.red_mask_pos) & 0xFF) as u8,
-                green: ((value >> fb.green_mask_pos) & 0xFF) as u8,
-                blue: ((value >> fb.blue_mask_pos) & 0xFF) as u8,
-                reserved: 0,
-            }
-        }
-        24 => {
-            if fb.blue_mask_pos < fb.red_mask_pos {
-                // BGR
+        match fb.bits_per_pixel {
+            32 => {
+                let value = (ptr as *const u32).read_volatile();
                 BltPixel {
-                    blue: ptr.read_volatile(),
-                    green: ptr.add(1).read_volatile(),
-                    red: ptr.add(2).read_volatile(),
-                    reserved: 0,
-                }
-            } else {
-                // RGB
-                BltPixel {
-                    red: ptr.read_volatile(),
-                    green: ptr.add(1).read_volatile(),
-                    blue: ptr.add(2).read_volatile(),
+                    red: ((value >> fb.red_mask_pos) & 0xFF) as u8,
+                    green: ((value >> fb.green_mask_pos) & 0xFF) as u8,
+                    blue: ((value >> fb.blue_mask_pos) & 0xFF) as u8,
                     reserved: 0,
                 }
             }
-        }
-        16 => {
-            let value = (ptr as *const u16).read_volatile();
-            BltPixel {
-                red: ((value >> 11) << 3) as u8,
-                green: (((value >> 5) & 0x3F) << 2) as u8,
-                blue: ((value & 0x1F) << 3) as u8,
-                reserved: 0,
+            24 => {
+                if fb.blue_mask_pos < fb.red_mask_pos {
+                    // BGR
+                    BltPixel {
+                        blue: ptr.read_volatile(),
+                        green: ptr.add(1).read_volatile(),
+                        red: ptr.add(2).read_volatile(),
+                        reserved: 0,
+                    }
+                } else {
+                    // RGB
+                    BltPixel {
+                        red: ptr.read_volatile(),
+                        green: ptr.add(1).read_volatile(),
+                        blue: ptr.add(2).read_volatile(),
+                        reserved: 0,
+                    }
+                }
             }
+            16 => {
+                let value = (ptr as *const u16).read_volatile();
+                BltPixel {
+                    red: ((value >> 11) << 3) as u8,
+                    green: (((value >> 5) & 0x3F) << 2) as u8,
+                    blue: ((value & 0x1F) << 3) as u8,
+                    reserved: 0,
+                }
+            }
+            _ => BltPixel::default(),
         }
-        _ => BltPixel::default(),
     }
 }
 

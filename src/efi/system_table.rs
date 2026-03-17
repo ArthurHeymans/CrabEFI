@@ -287,16 +287,18 @@ pub unsafe fn init(
     boot_services: *mut efi::BootServices,
     runtime_services: *mut efi::RuntimeServices,
 ) {
-    SYSTEM_TABLE.firmware_vendor = FIRMWARE_VENDOR.as_ptr();
-    SYSTEM_TABLE.firmware_revision = CRABEFI_REVISION;
-    SYSTEM_TABLE.boot_services = boot_services;
-    SYSTEM_TABLE.runtime_services = runtime_services;
+    unsafe {
+        SYSTEM_TABLE.firmware_vendor = FIRMWARE_VENDOR.as_ptr();
+        SYSTEM_TABLE.firmware_revision = CRABEFI_REVISION;
+        SYSTEM_TABLE.boot_services = boot_services;
+        SYSTEM_TABLE.runtime_services = runtime_services;
 
-    // Set up configuration table pointer
-    let efi = state::efi();
-    SYSTEM_TABLE.configuration_table = efi.config_tables.as_ptr() as *mut ConfigurationTable;
+        // Set up configuration table pointer
+        let efi = state::efi();
+        SYSTEM_TABLE.configuration_table = efi.config_tables.as_ptr() as *mut ConfigurationTable;
 
-    log::debug!("EFI System Table initialized");
+        log::debug!("EFI System Table initialized");
+    }
 }
 
 /// Get a pointer to the system table
@@ -316,8 +318,10 @@ pub fn get_system_table_efi() -> *mut efi::SystemTable {
 ///
 /// The protocol pointer must remain valid for the lifetime of boot services.
 pub unsafe fn set_console_in(handle: Handle, protocol: *mut SimpleTextInputProtocol) {
-    SYSTEM_TABLE.console_in_handle = handle;
-    SYSTEM_TABLE.con_in = protocol;
+    unsafe {
+        SYSTEM_TABLE.console_in_handle = handle;
+        SYSTEM_TABLE.con_in = protocol;
+    }
 }
 
 /// Set the console output protocol
@@ -326,8 +330,10 @@ pub unsafe fn set_console_in(handle: Handle, protocol: *mut SimpleTextInputProto
 ///
 /// The protocol pointer must remain valid for the lifetime of boot services.
 pub unsafe fn set_console_out(handle: Handle, protocol: *mut SimpleTextOutputProtocol) {
-    SYSTEM_TABLE.console_out_handle = handle;
-    SYSTEM_TABLE.con_out = protocol;
+    unsafe {
+        SYSTEM_TABLE.console_out_handle = handle;
+        SYSTEM_TABLE.con_out = protocol;
+    }
 }
 
 /// Set the standard error protocol
@@ -336,8 +342,10 @@ pub unsafe fn set_console_out(handle: Handle, protocol: *mut SimpleTextOutputPro
 ///
 /// The protocol pointer must remain valid for the lifetime of boot services.
 pub unsafe fn set_std_err(handle: Handle, protocol: *mut SimpleTextOutputProtocol) {
-    SYSTEM_TABLE.standard_error_handle = handle;
-    SYSTEM_TABLE.std_err = protocol;
+    unsafe {
+        SYSTEM_TABLE.standard_error_handle = handle;
+        SYSTEM_TABLE.std_err = protocol;
+    }
 }
 
 /// Install a configuration table
@@ -434,7 +442,7 @@ struct AcpiRegion {
 
 /// Collect all ACPI table regions, merge overlapping ones, then mark them
 fn mark_acpi_tables_memory(rsdp_addr: u64) {
-    use super::allocator::{PAGE_SIZE, mark_as_acpi_reclaim};
+    use super::allocator::{mark_as_acpi_reclaim, PAGE_SIZE};
 
     log::info!("Marking ACPI table memory regions as AcpiReclaimMemory...");
 
@@ -654,7 +662,7 @@ fn mark_acpi_tables_memory(rsdp_addr: u64) {
 
 /// Install ACPI tables from coreboot
 pub fn install_acpi_tables(rsdp: u64) {
-    use super::allocator::{MemoryType, get_memory_type_at};
+    use super::allocator::{get_memory_type_at, MemoryType};
 
     if rsdp == 0 {
         log::warn!("ACPI RSDP address is null, skipping ACPI table installation");
@@ -904,11 +912,13 @@ pub fn install_smbios_tables(smbios_addr: u64) {
 /// Per the UEFI spec, the CRC is computed over `header_size` bytes with the
 /// `crc32` field itself zeroed during computation.
 unsafe fn update_table_header_crc32(header: *mut TableHeader) {
-    let hdr = &mut *header;
-    hdr.crc32 = 0;
-    let size = hdr.header_size as usize;
-    let bytes = core::slice::from_raw_parts(header as *const u8, size);
-    hdr.crc32 = super::boot_services::compute_crc32(bytes);
+    unsafe {
+        let hdr = &mut *header;
+        hdr.crc32 = 0;
+        let size = hdr.header_size as usize;
+        let bytes = core::slice::from_raw_parts(header as *const u8, size);
+        hdr.crc32 = super::boot_services::compute_crc32(bytes);
+    }
 }
 
 /// Recompute CRC32 checksums for the System Table, Boot Services, and Runtime Services.
@@ -1153,7 +1163,7 @@ pub fn rebuild_memory_attributes_table_in_place() {
 ///
 /// Returns `None` if the memory map cannot be queried.
 fn count_runtime_entries() -> Option<u32> {
-    use super::allocator::{self, MemoryDescriptor, MemoryType, attributes};
+    use super::allocator::{self, attributes, MemoryDescriptor, MemoryType};
 
     let mut map_size: usize = 0;
     let mut map_key: usize = 0;
@@ -1196,7 +1206,7 @@ fn count_runtime_entries() -> Option<u32> {
 /// Writes the header and runtime descriptors with appropriate RO/XP protection
 /// attributes. Returns `(runtime_count, table_size_bytes)` on success.
 fn fill_memory_attributes_table(table_addr: u64) -> Option<(u32, usize)> {
-    use super::allocator::{self, MemoryDescriptor, MemoryType, attributes};
+    use super::allocator::{self, attributes, MemoryDescriptor, MemoryType};
 
     // Query the memory map onto a stack buffer
     let mut map_size: usize = 0;
@@ -1331,6 +1341,8 @@ pub fn dump_configuration_tables() {
 ///
 /// This must only be called after ExitBootServices succeeds.
 pub unsafe fn clear_boot_services() {
-    SYSTEM_TABLE.boot_services = core::ptr::null_mut();
+    unsafe {
+        SYSTEM_TABLE.boot_services = core::ptr::null_mut();
+    }
     log::debug!("SystemTable.boot_services set to NULL");
 }

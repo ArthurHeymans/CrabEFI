@@ -306,7 +306,9 @@ impl MmioRegion {
         #[cfg(debug_assertions)]
         self.check_bounds(offset, core::mem::size_of::<T>());
 
-        self.base.as_ptr().add(offset as usize) as *mut T
+        // SAFETY: Caller ensures proper volatile access semantics.
+        // Bounds are checked in debug builds above.
+        unsafe { self.base.as_ptr().add(offset as usize) as *mut T }
     }
 }
 

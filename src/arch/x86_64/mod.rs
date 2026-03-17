@@ -29,7 +29,10 @@ pub fn read_cr3() -> u64 {
 /// Invalid values can cause undefined behavior or system crashes.
 #[inline]
 pub unsafe fn write_cr3(value: u64) {
-    core::arch::asm!("mov cr3, {}", in(reg) value);
+    // SAFETY: Caller ensures value is a valid page table base address.
+    unsafe {
+        core::arch::asm!("mov cr3, {}", in(reg) value);
+    }
 }
 
 /// Read the Time Stamp Counter (TSC)

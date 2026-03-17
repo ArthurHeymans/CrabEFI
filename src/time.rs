@@ -155,74 +155,78 @@ mod x86_calibration {
 
     /// Find FADT in ACPI tables and extract PM timer port
     unsafe fn find_pm_timer_port(rsdp_addr: u64) -> Option<(u16, bool)> {
-        let rsdp = &*(rsdp_addr as *const AcpiRsdp);
+        // Safety: caller guarantees rsdp_addr points to a valid ACPI RSDP structure
+        // and all ACPI table pointers within are valid mapped memory.
+        unsafe {
+            let rsdp = &*(rsdp_addr as *const AcpiRsdp);
 
-        // Verify RSDP signature
-        if &rsdp.signature != b"RSD PTR " {
-            log::warn!("Invalid RSDP signature");
-            return None;
-        }
+            // Verify RSDP signature
+            if &rsdp.signature != b"RSD PTR " {
+                log::warn!("Invalid RSDP signature");
+                return None;
+            }
 
-        // Get RSDT or XSDT address
-        let (table_addr, is_xsdt) = if rsdp.revision >= 2 && rsdp.xsdt_address != 0 {
-            (rsdp.xsdt_address, true)
-        } else {
-            (rsdp.rsdt_address as u64, false)
-        };
-
-        if table_addr == 0 {
-            log::warn!("No RSDT/XSDT address in RSDP");
-            return None;
-        }
-
-        let header = &*(table_addr as *const AcpiSdtHeader);
-        let table_len = header.length as usize;
-        let header_size = core::mem::size_of::<AcpiSdtHeader>();
-
-        // Calculate number of entries
-        let entry_size = if is_xsdt { 8 } else { 4 };
-        let num_entries = (table_len - header_size) / entry_size;
-
-        log::debug!(
-            "ACPI: {} at {:#x}, {} entries",
-            if is_xsdt { "XSDT" } else { "RSDT" },
-            table_addr,
-            num_entries
-        );
-
-        // Search for FADT (signature "FACP")
-        let entries_base = table_addr + header_size as u64;
-        for i in 0..num_entries {
-            let entry_addr = if is_xsdt {
-                ((entries_base + (i * 8) as u64) as *const u64).read_unaligned()
+            // Get RSDT or XSDT address
+            let (table_addr, is_xsdt) = if rsdp.revision >= 2 && rsdp.xsdt_address != 0 {
+                (rsdp.xsdt_address, true)
             } else {
-                ((entries_base + (i * 4) as u64) as *const u32).read_unaligned() as u64
+                (rsdp.rsdt_address as u64, false)
             };
 
-            if entry_addr == 0 {
-                continue;
+            if table_addr == 0 {
+                log::warn!("No RSDT/XSDT address in RSDP");
+                return None;
             }
 
-            let entry_header = &*(entry_addr as *const AcpiSdtHeader);
-            if &entry_header.signature == b"FACP" {
-                let fadt = &*(entry_addr as *const AcpiFadt);
-                let pm_tmr_blk = fadt.pm_tmr_blk;
-                let flags = fadt.flags;
-                let is_32bit = (flags & (1 << 8)) != 0; // TMR_VAL_EXT bit
+            let header = &*(table_addr as *const AcpiSdtHeader);
+            let table_len = header.length as usize;
+            let header_size = core::mem::size_of::<AcpiSdtHeader>();
 
-                if pm_tmr_blk != 0 {
-                    log::debug!(
-                        "ACPI FADT: PM timer at I/O port {:#x} ({})",
-                        pm_tmr_blk,
-                        if is_32bit { "32-bit" } else { "24-bit" }
-                    );
-                    return Some((pm_tmr_blk as u16, is_32bit));
+            // Calculate number of entries
+            let entry_size = if is_xsdt { 8 } else { 4 };
+            let num_entries = (table_len - header_size) / entry_size;
+
+            log::debug!(
+                "ACPI: {} at {:#x}, {} entries",
+                if is_xsdt { "XSDT" } else { "RSDT" },
+                table_addr,
+                num_entries
+            );
+
+            // Search for FADT (signature "FACP")
+            let entries_base = table_addr + header_size as u64;
+            for i in 0..num_entries {
+                let entry_addr = if is_xsdt {
+                    ((entries_base + (i * 8) as u64) as *const u64).read_unaligned()
+                } else {
+                    ((entries_base + (i * 4) as u64) as *const u32).read_unaligned() as u64
+                };
+
+                if entry_addr == 0 {
+                    continue;
+                }
+
+                let entry_header = &*(entry_addr as *const AcpiSdtHeader);
+                if &entry_header.signature == b"FACP" {
+                    let fadt = &*(entry_addr as *const AcpiFadt);
+                    let pm_tmr_blk = fadt.pm_tmr_blk;
+                    let flags = fadt.flags;
+                    let is_32bit = (flags & (1 << 8)) != 0; // TMR_VAL_EXT bit
+
+                    if pm_tmr_blk != 0 {
+                        log::debug!(
+                            "ACPI FADT: PM timer at I/O port {:#x} ({})",
+                            pm_tmr_blk,
+                            if is_32bit { "32-bit" } else { "24-bit" }
+                        );
+                        return Some((pm_tmr_blk as u16, is_32bit));
+                    }
                 }
             }
-        }
 
-        log::warn!("FADT not found or PM timer not available");
-        None
+            log::warn!("FADT not found or PM timer not available");
+            None
+        }
     }
 
     /// Calibrate TSC using ACPI PM timer

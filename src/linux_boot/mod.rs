@@ -141,28 +141,40 @@ impl LoadedLinux {
         // Copy boot_params to fixed address (0x10000) so it survives the jump
         // The stack-allocated boot_params would be corrupted when Linux sets up its own stack
         let boot_params_ptr = BOOT_PARAMS_ADDR as *mut BootParams;
-        core::ptr::copy_nonoverlapping(&self.boot_params as *const BootParams, boot_params_ptr, 1);
+        // SAFETY: Caller guarantees kernel and boot parameters are properly set up.
+        // BOOT_PARAMS_ADDR was validated above to be in usable RAM.
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                &self.boot_params as *const BootParams,
+                boot_params_ptr,
+                1,
+            );
+        }
 
         log::info!("Boot params copied to {:#x}", BOOT_PARAMS_ADDR);
 
-        // Disable interrupts
-        core::arch::asm!("cli");
+        // SAFETY: Disabling interrupts and jumping to kernel entry point.
+        // The caller guarantees the kernel is properly loaded and boot params are valid.
+        unsafe {
+            // Disable interrupts
+            core::arch::asm!("cli");
 
-        // Jump to kernel entry point
-        // The x86-64 calling convention puts first argument in RDI, second in RSI
-        // Linux expects boot_params in RSI and a dummy value in RDI
-        core::arch::asm!(
-            "xor rdi, rdi",           // Clear RDI (dummy value)
-            "mov rsi, {boot_params}", // boot_params pointer in RSI
-            "xor rdx, rdx",           // Clear other registers
-            "xor rcx, rcx",
-            "xor r8, r8",
-            "xor r9, r9",
-            "jmp {entry}",
-            boot_params = in(reg) BOOT_PARAMS_ADDR,
-            entry = in(reg) self.entry_point,
-            options(noreturn)
-        );
+            // Jump to kernel entry point
+            // The x86-64 calling convention puts first argument in RDI, second in RSI
+            // Linux expects boot_params in RSI and a dummy value in RDI
+            core::arch::asm!(
+                "xor rdi, rdi",           // Clear RDI (dummy value)
+                "mov rsi, {boot_params}", // boot_params pointer in RSI
+                "xor rdx, rdx",           // Clear other registers
+                "xor rcx, rcx",
+                "xor r8, r8",
+                "xor r9, r9",
+                "jmp {entry}",
+                boot_params = in(reg) BOOT_PARAMS_ADDR,
+                entry = in(reg) self.entry_point,
+                options(noreturn)
+            );
+        }
     }
 
     /// Boot the loaded Linux kernel using EFI handover protocol
@@ -191,26 +203,29 @@ impl LoadedLinux {
 
         let boot_params_ptr = self.boot_params.as_mut_ptr();
 
-        // EFI handover protocol:
-        // - RDI: EFI image handle
-        // - RSI: EFI system table
-        // - RDX: boot_params pointer
-        core::arch::asm!("cli");
+        // SAFETY: Caller guarantees the kernel, boot parameters, and EFI structures are valid.
+        unsafe {
+            // EFI handover protocol:
+            // - RDI: EFI image handle
+            // - RSI: EFI system table
+            // - RDX: boot_params pointer
+            core::arch::asm!("cli");
 
-        core::arch::asm!(
-            "mov rdi, {handle}",
-            "mov rsi, {systab}",
-            "mov rdx, {boot_params}",
-            "xor rcx, rcx",
-            "xor r8, r8",
-            "xor r9, r9",
-            "jmp {entry}",
-            handle = in(reg) image_handle as u64,
-            systab = in(reg) system_table as u64,
-            boot_params = in(reg) boot_params_ptr as u64,
-            entry = in(reg) entry,
-            options(noreturn)
-        );
+            core::arch::asm!(
+                "mov rdi, {handle}",
+                "mov rsi, {systab}",
+                "mov rdx, {boot_params}",
+                "xor rcx, rcx",
+                "xor r8, r8",
+                "xor r9, r9",
+                "jmp {entry}",
+                handle = in(reg) image_handle as u64,
+                systab = in(reg) system_table as u64,
+                boot_params = in(reg) boot_params_ptr as u64,
+                entry = in(reg) entry,
+                options(noreturn)
+            );
+        }
     }
 }
 
