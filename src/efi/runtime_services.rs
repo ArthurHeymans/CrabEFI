@@ -990,6 +990,7 @@ extern "efiapi" fn set_variable(
     let guid = unsafe { *vendor_guid };
 
     // ── Runtime log: record every SetVariable call after ExitBootServices ──
+    #[cfg(feature = "rt-log")]
     if state::is_exit_boot_services_called() {
         use crate::efi::rtlog;
         rtlog::append("SetVariable name=");
@@ -1093,6 +1094,7 @@ extern "efiapi" fn set_variable(
             }
             Err(e) => {
                 log::warn!("Authenticated variable verification failed: {:?}", e);
+                #[cfg(feature = "rt-log")]
                 if state::is_exit_boot_services_called() {
                     use crate::efi::rtlog;
                     rtlog::append("  -> auth verify FAILED: ");
@@ -1187,13 +1189,16 @@ extern "efiapi" fn set_variable(
                             persist_attrs,
                             &combined,
                         ) {
-                            Ok(()) => {
+                            Ok(()) =>
+                            {
+                                #[cfg(feature = "rt-log")]
                                 if state::is_exit_boot_services_called() {
                                     crate::efi::rtlog::appendln("  -> persisted OK (append)");
                                 }
                             }
                             Err(e) => {
                                 log::debug!("Variable not persisted: {:?}", e);
+                                #[cfg(feature = "rt-log")]
                                 if state::is_exit_boot_services_called() {
                                     use crate::efi::rtlog;
                                     rtlog::append("  -> persist FAILED (append): ");
@@ -1275,7 +1280,9 @@ extern "efiapi" fn set_variable(
                 attributes,
                 persist_data,
             ) {
-                Ok(()) => {
+                Ok(()) =>
+                {
+                    #[cfg(feature = "rt-log")]
                     if state::is_exit_boot_services_called() {
                         use crate::efi::rtlog;
                         rtlog::appendln("  -> persisted OK");
@@ -1283,6 +1290,7 @@ extern "efiapi" fn set_variable(
                 }
                 Err(e) => {
                     log::debug!("Variable not persisted: {:?}", e);
+                    #[cfg(feature = "rt-log")]
                     if state::is_exit_boot_services_called() {
                         use crate::efi::rtlog;
                         rtlog::append("  -> persist FAILED: ");
