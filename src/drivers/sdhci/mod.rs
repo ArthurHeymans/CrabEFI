@@ -8,9 +8,9 @@ pub mod regs;
 
 use crate::drivers::pci::{self, PciAddress, PciDevice};
 use crate::efi;
-use crate::time::{Timeout, wait_for};
+use crate::time::{wait_for, Timeout};
 use core::ptr;
-use core::sync::atomic::{Ordering, fence};
+use core::sync::atomic::{fence, Ordering};
 use spin::Mutex;
 use tock_registers::interfaces::{ReadWriteable, Readable, Writeable};
 
@@ -1179,18 +1179,9 @@ impl SdhciController {
 // Global Controller Management
 // ============================================================================
 
-/// Wrapper for SDHCI controller pointer to implement Send
-struct SdhciControllerPtr(*mut SdhciController);
-
-// SAFETY: SdhciControllerPtr wraps a pointer to an SdhciController allocated via the EFI
-// page allocator. The pointer remains valid for the firmware's lifetime and all access
-// is protected by the SDHCI_CONTROLLERS mutex. The firmware runs single-threaded with
-// no concurrent SD card operations.
-unsafe impl Send for SdhciControllerPtr {}
-
-/// Global list of SDHCI controllers
-static SDHCI_CONTROLLERS: Mutex<heapless::Vec<SdhciControllerPtr, MAX_SDHCI_CONTROLLERS>> =
-    Mutex::new(heapless::Vec::new());
+/// Registry of initialized SDHCI controllers
+static SDHCI_CONTROLLERS: super::ControllerRegistry<SdhciController, MAX_SDHCI_CONTROLLERS> =
+    super::ControllerRegistry::new("SDHCI");
 
 /// Initialize a single SDHCI controller from a PCI device
 ///
@@ -1206,45 +1197,17 @@ pub fn init_device(dev: &pci::PciDevice) -> Result<(), ()> {
         dev.device_id
     );
 
-    match SdhciController::new(dev) {
-        Ok(controller) => {
-            let size = core::mem::size_of::<SdhciController>();
-            let pages = size.div_ceil(4096);
+    let controller = SdhciController::new(dev).map_err(|e| {
+        log::error!(
+            "Failed to initialize SDHCI controller at {}: {:?}",
+            dev.address,
+            e
+        );
+    })?;
 
-            if let Some(mem) = efi::allocate_pages(pages as u64) {
-                let controller_ptr = mem.as_mut_ptr() as *mut SdhciController;
-                unsafe {
-                    ptr::write(controller_ptr, controller);
-                }
-                let mut controllers = SDHCI_CONTROLLERS.lock();
-                if controllers
-                    .push(SdhciControllerPtr(controller_ptr))
-                    .is_err()
-                {
-                    log::warn!(
-                        "SDHCI: Failed to register controller at {} - controller list full",
-                        dev.address
-                    );
-                    // Free the allocated pages to avoid a leak
-                    efi::free_pages(mem, pages as u64);
-                    return Err(());
-                }
-                log::info!("SDHCI controller at {} initialized", dev.address);
-                Ok(())
-            } else {
-                log::error!("SDHCI: Failed to allocate memory for controller");
-                Err(())
-            }
-        }
-        Err(e) => {
-            log::error!(
-                "Failed to initialize SDHCI controller at {}: {:?}",
-                dev.address,
-                e
-            );
-            Err(())
-        }
-    }
+    SDHCI_CONTROLLERS.register(controller)?;
+    log::info!("SDHCI controller at {} initialized", dev.address);
+    Ok(())
 }
 
 /// Shutdown all SDHCI controllers
@@ -1252,14 +1215,7 @@ pub fn init_device(dev: &pci::PciDevice) -> Result<(), ()> {
 /// Called during ExitBootServices to prepare for OS handoff.
 /// Currently a placeholder — the OS will reset controllers during its own init.
 pub fn shutdown() {
-    let controllers = SDHCI_CONTROLLERS.lock();
-    if controllers.is_empty() {
-        return;
-    }
-    log::info!(
-        "SDHCI: {} controllers ready for OS handoff",
-        controllers.len()
-    );
+    SDHCI_CONTROLLERS.shutdown_log();
 }
 
 /// Initialize SDHCI controllers (legacy entry point)
@@ -1280,10 +1236,9 @@ pub fn init() {
         let _ = init_device(dev);
     }
 
-    let controllers = SDHCI_CONTROLLERS.lock();
     log::info!(
         "SDHCI initialization complete: {} controllers",
-        controllers.len()
+        SDHCI_CONTROLLERS.count()
     );
 }
 
@@ -1292,13 +1247,12 @@ pub fn init() {
 /// Returns a raw pointer to avoid `&'static mut` aliasing UB.
 /// The caller must ensure no overlapping mutable references are created.
 pub fn get_controller(index: usize) -> Option<*mut SdhciController> {
-    let controllers = SDHCI_CONTROLLERS.lock();
-    controllers.get(index).map(|ptr| ptr.0)
+    SDHCI_CONTROLLERS.get(index)
 }
 
 /// Get the number of initialized SDHCI controllers
 pub fn controller_count() -> usize {
-    SDHCI_CONTROLLERS.lock().len()
+    SDHCI_CONTROLLERS.count()
 }
 
 // ============================================================================

@@ -49,6 +49,18 @@ pub enum BlockError {
     MediaChanged,
 }
 
+impl core::fmt::Display for BlockError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            BlockError::DeviceError => write!(f, "device error"),
+            BlockError::InvalidParameter => write!(f, "invalid parameter"),
+            BlockError::OutOfRange => write!(f, "LBA out of range"),
+            BlockError::NoMedia => write!(f, "no media present"),
+            BlockError::MediaChanged => write!(f, "media changed"),
+        }
+    }
+}
+
 // Error conversions from driver-specific errors
 
 impl From<nvme::NvmeError> for BlockError {

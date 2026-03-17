@@ -783,9 +783,9 @@ pub fn verify_certificate_chain(
     }
 
     // Verify each link in the chain
-    for i in 0..chain.certificates.len() - 1 {
-        let cert_der = &chain.certificates[i];
-        let issuer_der = &chain.certificates[i + 1];
+    for (i, pair) in chain.certificates.windows(2).enumerate() {
+        let cert_der = &pair[0];
+        let issuer_der = &pair[1];
 
         // Verify the chain link
         if !verify_chain_link(cert_der, issuer_der, config)? {

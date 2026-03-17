@@ -50,3 +50,12 @@ pub enum PathConversionError {
     /// Path is too long (exceeds 128 characters)
     PathTooLong,
 }
+
+impl core::fmt::Display for PathConversionError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            PathConversionError::DirectoryTraversal => write!(f, "directory traversal rejected"),
+            PathConversionError::PathTooLong => write!(f, "path too long"),
+        }
+    }
+}

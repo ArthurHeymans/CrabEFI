@@ -13,6 +13,7 @@ use core::ffi::c_void;
 
 use r_efi::efi::{Guid, Status};
 
+use crate::drivers::storage::StorageType;
 use crate::drivers::{ahci, nvme, usb};
 use crate::efi::utils::allocate_protocol_with_log;
 
@@ -26,20 +27,6 @@ pub const STORAGE_SECURITY_COMMAND_GUID: Guid = Guid::from_fields(
     0xB4,
     &[0x49, 0x07, 0x4B, 0x4C, 0x3A, 0x78],
 );
-
-/// Storage type enumeration for internal dispatch
-#[derive(Clone, Copy, Debug)]
-pub enum StorageType {
-    /// NVMe storage with controller index and namespace ID
-    Nvme { controller_index: usize, nsid: u32 },
-    /// AHCI/SATA storage with controller index and port number
-    Ahci {
-        controller_index: usize,
-        port: usize,
-    },
-    /// USB Mass Storage with device index
-    UsbScsi { device_index: usize },
-}
 
 /// Storage Security Command Protocol
 ///
@@ -154,31 +141,35 @@ extern "efiapi" fn storage_security_receive_data(
     // Dispatch based on storage type
     let result = match ctx.storage_type {
         StorageType::Nvme {
-            controller_index,
+            controller_id,
             nsid,
         } => nvme_security_receive(
-            controller_index,
+            controller_id,
             nsid,
             security_protocol_id,
             security_protocol_specific,
             buffer,
         ),
         StorageType::Ahci {
-            controller_index,
+            controller_id,
             port,
         } => ahci_security_receive(
-            controller_index,
+            controller_id,
             port,
             security_protocol_id,
             security_protocol_specific,
             buffer,
         ),
-        StorageType::UsbScsi { device_index } => usb_security_receive(
-            device_index,
+        StorageType::Usb { controller_id, .. } => usb_security_receive(
+            controller_id,
             security_protocol_id,
             security_protocol_specific,
             buffer,
         ),
+        StorageType::Sdhci { .. } => {
+            log::warn!("StorageSecurity: SDHCI security commands not supported");
+            return Status::UNSUPPORTED;
+        }
     };
 
     match result {
@@ -252,31 +243,35 @@ extern "efiapi" fn storage_security_send_data(
     // Dispatch based on storage type
     let result = match ctx.storage_type {
         StorageType::Nvme {
-            controller_index,
+            controller_id,
             nsid,
         } => nvme_security_send(
-            controller_index,
+            controller_id,
             nsid,
             security_protocol_id,
             security_protocol_specific,
             buffer,
         ),
         StorageType::Ahci {
-            controller_index,
+            controller_id,
             port,
         } => ahci_security_send(
-            controller_index,
+            controller_id,
             port,
             security_protocol_id,
             security_protocol_specific,
             buffer,
         ),
-        StorageType::UsbScsi { device_index } => usb_security_send(
-            device_index,
+        StorageType::Usb { controller_id, .. } => usb_security_send(
+            controller_id,
             security_protocol_id,
             security_protocol_specific,
             buffer,
         ),
+        StorageType::Sdhci { .. } => {
+            log::warn!("StorageSecurity: SDHCI security commands not supported");
+            return Status::UNSUPPORTED;
+        }
     };
 
     match result {

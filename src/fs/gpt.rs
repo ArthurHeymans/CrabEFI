@@ -188,6 +188,18 @@ pub enum GptError {
     BufferTooSmall,
 }
 
+impl core::fmt::Display for GptError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            GptError::ReadError => write!(f, "read error"),
+            GptError::InvalidHeader => write!(f, "invalid GPT header"),
+            GptError::NoPartitions => write!(f, "no partitions found"),
+            GptError::NoEsp => write!(f, "no EFI System Partition found"),
+            GptError::BufferTooSmall => write!(f, "buffer too small"),
+        }
+    }
+}
+
 impl From<BlockError> for GptError {
     fn from(e: BlockError) -> Self {
         match e {

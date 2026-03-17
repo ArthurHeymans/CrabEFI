@@ -46,6 +46,19 @@ pub enum AllocateType {
     AllocateAddress = 2,
 }
 
+impl TryFrom<u32> for AllocateType {
+    type Error = u32;
+
+    fn try_from(value: u32) -> Result<Self, Self::Error> {
+        match value {
+            0 => Ok(AllocateType::AllocateAnyPages),
+            1 => Ok(AllocateType::AllocateMaxAddress),
+            2 => Ok(AllocateType::AllocateAddress),
+            other => Err(other),
+        }
+    }
+}
+
 /// EFI memory types
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u32)]
@@ -84,45 +97,50 @@ impl MemoryType {
         )
     }
 
-    /// Convert from u32 (for FFI)
-    pub fn from_u32(value: u32) -> Option<Self> {
+}
+
+impl TryFrom<u32> for MemoryType {
+    type Error = u32;
+
+    fn try_from(value: u32) -> Result<Self, Self::Error> {
         match value {
-            0 => Some(MemoryType::ReservedMemoryType),
-            1 => Some(MemoryType::LoaderCode),
-            2 => Some(MemoryType::LoaderData),
-            3 => Some(MemoryType::BootServicesCode),
-            4 => Some(MemoryType::BootServicesData),
-            5 => Some(MemoryType::RuntimeServicesCode),
-            6 => Some(MemoryType::RuntimeServicesData),
-            7 => Some(MemoryType::ConventionalMemory),
-            8 => Some(MemoryType::UnusableMemory),
-            9 => Some(MemoryType::AcpiReclaimMemory),
-            10 => Some(MemoryType::AcpiMemoryNvs),
-            11 => Some(MemoryType::MemoryMappedIo),
-            12 => Some(MemoryType::MemoryMappedIoPortSpace),
-            13 => Some(MemoryType::PalCode),
-            14 => Some(MemoryType::PersistentMemory),
-            _ => None,
+            0 => Ok(MemoryType::ReservedMemoryType),
+            1 => Ok(MemoryType::LoaderCode),
+            2 => Ok(MemoryType::LoaderData),
+            3 => Ok(MemoryType::BootServicesCode),
+            4 => Ok(MemoryType::BootServicesData),
+            5 => Ok(MemoryType::RuntimeServicesCode),
+            6 => Ok(MemoryType::RuntimeServicesData),
+            7 => Ok(MemoryType::ConventionalMemory),
+            8 => Ok(MemoryType::UnusableMemory),
+            9 => Ok(MemoryType::AcpiReclaimMemory),
+            10 => Ok(MemoryType::AcpiMemoryNvs),
+            11 => Ok(MemoryType::MemoryMappedIo),
+            12 => Ok(MemoryType::MemoryMappedIoPortSpace),
+            13 => Ok(MemoryType::PalCode),
+            14 => Ok(MemoryType::PersistentMemory),
+            other => Err(other),
         }
     }
 }
 
-/// Convert coreboot memory type to EFI memory type
-fn cb_to_efi_memory_type(cb_type: CbMemoryType) -> MemoryType {
-    match cb_type {
-        CbMemoryType::Ram => MemoryType::ConventionalMemory,
-        CbMemoryType::Reserved => MemoryType::ReservedMemoryType,
-        CbMemoryType::AcpiReclaimable => MemoryType::AcpiReclaimMemory,
-        CbMemoryType::AcpiNvs => MemoryType::AcpiMemoryNvs,
-        CbMemoryType::Unusable => MemoryType::UnusableMemory,
-        // Coreboot's Table type covers cbmem regions (console, SMBIOS,
-        // timestamps, ACPI tables, etc.). Using ReservedMemoryType ensures
-        // the OS preserves them without bloating ACPI NVS.
-        // Linux accesses cbmem regions via the coreboot_table driver which
-        // uses memremap() — it works with Reserved or NVS.
-        // ACPI tables within these regions are later marked as
-        // AcpiReclaimMemory by mark_acpi_tables_memory().
-        CbMemoryType::Table => MemoryType::ReservedMemoryType,
+impl From<CbMemoryType> for MemoryType {
+    fn from(cb_type: CbMemoryType) -> Self {
+        match cb_type {
+            CbMemoryType::Ram => MemoryType::ConventionalMemory,
+            CbMemoryType::Reserved => MemoryType::ReservedMemoryType,
+            CbMemoryType::AcpiReclaimable => MemoryType::AcpiReclaimMemory,
+            CbMemoryType::AcpiNvs => MemoryType::AcpiMemoryNvs,
+            CbMemoryType::Unusable => MemoryType::UnusableMemory,
+            // Coreboot's Table type covers cbmem regions (console, SMBIOS,
+            // timestamps, ACPI tables, etc.). Using ReservedMemoryType ensures
+            // the OS preserves them without bloating ACPI NVS.
+            // Linux accesses cbmem regions via the coreboot_table driver which
+            // uses memremap() — it works with Reserved or NVS.
+            // ACPI tables within these regions are later marked as
+            // AcpiReclaimMemory by mark_acpi_tables_memory().
+            CbMemoryType::Table => MemoryType::ReservedMemoryType,
+        }
     }
 }
 
@@ -205,7 +223,7 @@ impl MemoryDescriptor {
 
     /// Get the memory type as enum
     pub fn get_memory_type(&self) -> Option<MemoryType> {
-        MemoryType::from_u32(self.memory_type)
+        MemoryType::try_from(self.memory_type).ok()
     }
 }
 
@@ -257,7 +275,7 @@ impl MemoryAllocator {
 
         log::info!("Importing coreboot memory map ({} regions):", regions.len());
         for region in regions {
-            let memory_type = cb_to_efi_memory_type(region.region_type);
+            let memory_type = MemoryType::from(region.region_type);
 
             // On aarch64, skip coreboot Reserved entries below DRAM.
             // These are device regions (flash at 0-1GB, ECAM at 0xf0-1GB)
@@ -1266,7 +1284,7 @@ pub fn get_memory_type_at(address: u64) -> Option<MemoryType> {
         .entries
         .iter()
         .find(|entry| address >= entry.physical_start && address < entry.end())
-        .and_then(|entry| MemoryType::from_u32(entry.memory_type))
+        .and_then(|entry| MemoryType::try_from(entry.memory_type).ok())
 }
 
 /// Get the memory map

@@ -298,6 +298,19 @@ pub enum AhciError {
     InvalidParameter,
 }
 
+impl core::fmt::Display for AhciError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            AhciError::NoDevice => write!(f, "no device on port"),
+            AhciError::PortNotReady => write!(f, "port not ready"),
+            AhciError::CommandFailed => write!(f, "command failed"),
+            AhciError::Timeout => write!(f, "timeout"),
+            AhciError::AllocationFailed => write!(f, "allocation failed"),
+            AhciError::InvalidParameter => write!(f, "invalid parameter"),
+        }
+    }
+}
+
 impl AhciController {
     /// Get reference to port registers
     #[inline]
@@ -1369,17 +1382,9 @@ impl AhciController {
     }
 }
 
-/// Wrapper for AHCI controller pointer to implement Send
-struct AhciControllerPtr(*mut AhciController);
-
-// SAFETY: AhciControllerPtr wraps a pointer to an AhciController allocated via the EFI
-// page allocator. The pointer remains valid for the firmware's lifetime and all access
-// is protected by the AHCI_CONTROLLERS mutex. The firmware runs single-threaded.
-unsafe impl Send for AhciControllerPtr {}
-
-/// Global list of AHCI controllers
-static AHCI_CONTROLLERS: Mutex<heapless::Vec<AhciControllerPtr, 4>> =
-    Mutex::new(heapless::Vec::new());
+/// Registry of initialized AHCI controllers
+static AHCI_CONTROLLERS: super::ControllerRegistry<AhciController, 4> =
+    super::ControllerRegistry::new("AHCI");
 
 /// Initialize a single AHCI controller from a PCI device
 ///
@@ -1395,47 +1400,17 @@ pub fn init_device(dev: &pci::PciDevice) -> Result<(), ()> {
         dev.device_id
     );
 
-    match AhciController::new(dev) {
-        Ok(controller) => {
-            let size = core::mem::size_of::<AhciController>();
-            let pages = size.div_ceil(4096);
-            log::debug!(
-                "AHCI: Allocating {} pages ({} bytes) for AhciController",
-                pages,
-                size
-            );
-            let controller_mem = efi::allocate_pages(pages as u64);
-            if let Some(mem) = controller_mem {
-                let controller_box = mem.as_mut_ptr() as *mut AhciController;
-                unsafe {
-                    ptr::write(controller_box, controller);
-                }
-                let mut controllers = AHCI_CONTROLLERS.lock();
-                if controllers.push(AhciControllerPtr(controller_box)).is_err() {
-                    log::warn!(
-                        "AHCI: Failed to register controller at {} - controller list full",
-                        dev.address
-                    );
-                    // Free the allocated pages to avoid a leak
-                    efi::free_pages(mem, pages as u64);
-                    return Err(());
-                }
-                log::info!("AHCI controller at {} initialized", dev.address);
-                Ok(())
-            } else {
-                log::error!("AHCI: Failed to allocate memory for controller");
-                Err(())
-            }
-        }
-        Err(e) => {
-            log::error!(
-                "Failed to initialize AHCI controller at {}: {:?}",
-                dev.address,
-                e
-            );
-            Err(())
-        }
-    }
+    let controller = AhciController::new(dev).map_err(|e| {
+        log::error!(
+            "Failed to initialize AHCI controller at {}: {:?}",
+            dev.address,
+            e
+        );
+    })?;
+
+    AHCI_CONTROLLERS.register(controller)?;
+    log::info!("AHCI controller at {} initialized", dev.address);
+    Ok(())
 }
 
 /// Shutdown all AHCI controllers
@@ -1443,14 +1418,7 @@ pub fn init_device(dev: &pci::PciDevice) -> Result<(), ()> {
 /// Called during ExitBootServices to prepare for OS handoff.
 /// Currently a placeholder — the OS will reset controllers during its own init.
 pub fn shutdown() {
-    let controllers = AHCI_CONTROLLERS.lock();
-    if controllers.is_empty() {
-        return;
-    }
-    log::info!(
-        "AHCI: {} controllers ready for OS handoff",
-        controllers.len()
-    );
+    AHCI_CONTROLLERS.shutdown_log();
 }
 
 /// Initialize AHCI controllers (legacy entry point)
@@ -1471,10 +1439,9 @@ pub fn init() {
         let _ = init_device(dev);
     }
 
-    let controllers = AHCI_CONTROLLERS.lock();
     log::info!(
         "AHCI initialization complete: {} controllers",
-        controllers.len()
+        AHCI_CONTROLLERS.count()
     );
 }
 
@@ -1490,8 +1457,7 @@ pub fn init() {
 /// and must not hold the reference across calls that may also access
 /// the same controller.
 pub fn get_controller(index: usize) -> Option<*mut AhciController> {
-    let controllers = AHCI_CONTROLLERS.lock();
-    controllers.get(index).map(|ptr| ptr.0)
+    AHCI_CONTROLLERS.get(index)
 }
 
 // SAFETY: AhciController contains raw pointers to MMIO registers and DMA buffers.

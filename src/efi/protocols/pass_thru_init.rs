@@ -5,13 +5,14 @@
 
 use core::ffi::c_void;
 
+use crate::drivers::storage::StorageType;
 use crate::drivers::{ahci, nvme, usb};
 use crate::efi::boot_services;
 use crate::efi::protocols::ata_pass_thru::{self, ATA_PASS_THRU_GUID};
 use crate::efi::protocols::device_path;
 use crate::efi::protocols::nvme_pass_thru::{self, NVM_EXPRESS_PASS_THRU_GUID};
 use crate::efi::protocols::scsi_pass_thru::{self, EXT_SCSI_PASS_THRU_GUID};
-use crate::efi::protocols::storage_security::{self, STORAGE_SECURITY_COMMAND_GUID, StorageType};
+use crate::efi::protocols::storage_security::{self, STORAGE_SECURITY_COMMAND_GUID};
 
 /// Initialize all pass-through protocols for detected storage devices
 ///
@@ -121,7 +122,7 @@ fn init_nvme_pass_thru() {
             let storage_security = storage_security::create_storage_security_protocol(
                 ns.nsid, // Use nsid as media_id
                 StorageType::Nvme {
-                    controller_index,
+                    controller_id: controller_index,
                     nsid: ns.nsid,
                 },
             );
@@ -247,7 +248,7 @@ fn init_ahci_pass_thru() {
             let storage_security = storage_security::create_storage_security_protocol(
                 port.port_num as u32, // Use port number as media_id
                 StorageType::Ahci {
-                    controller_index,
+                    controller_id: controller_index,
                     port: port_index,
                 },
             );
@@ -330,8 +331,9 @@ fn init_usb_pass_thru() {
     // Install Storage Security Command Protocol for USB device
     let storage_security = storage_security::create_storage_security_protocol(
         device_addr as u32, // Use device address as media_id
-        StorageType::UsbScsi {
-            device_index: controller_index,
+        StorageType::Usb {
+            controller_id: controller_index,
+            device_addr,
         },
     );
     if !storage_security.is_null() {

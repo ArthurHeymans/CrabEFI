@@ -1543,11 +1543,8 @@ fn name_eq(stored: &[u16], name: *const u16) -> bool {
 /// Bounded to MAX_VARIABLE_NAME_LEN to prevent unbounded reads from
 /// potentially malformed (non-null-terminated) buffers.
 fn ucs2_strlen_ptr(s: *const u16) -> usize {
-    let mut len = 0;
-    unsafe {
-        while len < MAX_VARIABLE_NAME_LEN && *s.add(len) != 0 {
-            len += 1;
-        }
-    }
-    len
+    // Safety: s is a UEFI-provided variable name pointer; we bound the
+    // read to MAX_VARIABLE_NAME_LEN to avoid unbounded access.
+    let slice = unsafe { core::slice::from_raw_parts(s, MAX_VARIABLE_NAME_LEN) };
+    slice.iter().position(|&c| c == 0).unwrap_or(MAX_VARIABLE_NAME_LEN)
 }

@@ -632,15 +632,7 @@ fn parse_memory(record_bytes: &[u8], info: &mut CorebootInfo) {
         let range_size = range.size;
         let mem_type = range.mem_type;
 
-        let region_type = match mem_type {
-            1 => MemoryType::Ram,
-            2 => MemoryType::Reserved,
-            3 => MemoryType::AcpiReclaimable,
-            4 => MemoryType::AcpiNvs,
-            5 => MemoryType::Unusable,
-            16 => MemoryType::Table,
-            _ => MemoryType::Reserved,
-        };
+        let region_type = MemoryType::try_from(mem_type).unwrap_or(MemoryType::Reserved);
 
         let region = MemoryRegion {
             start,

@@ -14,7 +14,7 @@
 use crate::drivers::block::{
     AhciBlockDevice, AnyBlockDevice, BlockDevice, NvmeBlockDevice, SdhciBlockDevice, UsbBlockDevice,
 };
-use crate::drivers::storage::{self, StorageType};
+use crate::drivers::storage;
 use crate::efi;
 use crate::efi::boot_services;
 use crate::efi::protocols::block_io::{self, BLOCK_IO_PROTOCOL_GUID};
@@ -242,30 +242,7 @@ fn create_block_device_for_sfs(
     }
 }
 
-/// Create a StorageType for registering with the storage registry
-fn create_storage_type(device_type: &menu::DeviceType) -> StorageType {
-    match *device_type {
-        menu::DeviceType::Nvme {
-            controller_id,
-            nsid,
-        } => StorageType::Nvme {
-            controller_id,
-            nsid,
-        },
-        menu::DeviceType::Ahci {
-            controller_id,
-            port,
-        } => StorageType::Ahci {
-            controller_id,
-            port,
-        },
-        menu::DeviceType::Usb {
-            controller_id: _,
-            device_addr: _,
-        } => StorageType::Usb { slot_id: 0 },
-        menu::DeviceType::Sdhci { controller_id } => StorageType::Sdhci { controller_id },
-    }
-}
+
 
 /// Try to boot from an ESP partition
 ///
@@ -347,7 +324,7 @@ pub fn try_boot_from_esp(
             }
 
             // Install BlockIO protocol on the device handle
-            let storage_type = create_storage_type(device_type);
+            let storage_type = *device_type;
             let storage_id = storage::register_device(storage_type, num_blocks, block_size);
 
             if let Some(storage_id) = storage_id {
