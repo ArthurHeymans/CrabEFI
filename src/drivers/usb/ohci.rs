@@ -7,139 +7,19 @@
 //! - OHCI Specification 1.0a
 //! - libpayload ohci.c
 
-use crate::drivers::mmio::MmioRegion;
 use crate::drivers::pci::{self, PciAddress, PciDevice};
 use crate::efi;
 use crate::time::{Timeout, wait_for};
 use core::ptr;
 use core::sync::atomic::{Ordering, fence};
+use tock_registers::interfaces::{ReadWriteable, Readable, Writeable};
 
 use super::controller::{
     Direction, SetupPacket, UsbController, UsbDevice, UsbError, UsbSpeed, enumerate_device,
 };
-
-// ============================================================================
-// OHCI Register Definitions
-// ============================================================================
-
-/// OHCI Operational Registers
-#[allow(dead_code)]
-mod regs {
-    /// Revision
-    pub const HCREVISION: u32 = 0x00;
-    /// Control
-    pub const HCCONTROL: u32 = 0x04;
-    /// Command Status
-    pub const HCCOMMANDSTATUS: u32 = 0x08;
-    /// Interrupt Status
-    pub const HCINTERRUPTSTATUS: u32 = 0x0C;
-    /// Interrupt Enable
-    pub const HCINTERRUPTENABLE: u32 = 0x10;
-    /// Interrupt Disable
-    pub const HCINTERRUPTDISABLE: u32 = 0x14;
-    /// HCCA
-    pub const HCHCCA: u32 = 0x18;
-    /// Period Current ED
-    pub const HCPERIODCURRENTED: u32 = 0x1C;
-    /// Control Head ED
-    pub const HCCONTROLHEADED: u32 = 0x20;
-    /// Control Current ED
-    pub const HCCONTROLCURRENTED: u32 = 0x24;
-    /// Bulk Head ED
-    pub const HCBULKHEADED: u32 = 0x28;
-    /// Bulk Current ED
-    pub const HCBULKCURRENTED: u32 = 0x2C;
-    /// Done Head
-    pub const HCDONEHEAD: u32 = 0x30;
-    /// Frame Interval
-    pub const HCFMINTERVAL: u32 = 0x34;
-    /// Frame Remaining
-    pub const HCFMREMAINING: u32 = 0x38;
-    /// Frame Number
-    pub const HCFMNUMBER: u32 = 0x3C;
-    /// Periodic Start
-    pub const HCPERIODICSTART: u32 = 0x40;
-    /// LS Threshold
-    pub const HCLSTHRESHOLD: u32 = 0x44;
-    /// Root Hub Descriptor A
-    pub const HCRHDESCRIPTORA: u32 = 0x48;
-    /// Root Hub Descriptor B
-    pub const HCRHDESCRIPTORB: u32 = 0x4C;
-    /// Root Hub Status
-    pub const HCRHSTATUS: u32 = 0x50;
-    /// Root Hub Port Status (base)
-    pub const HCRHPORTSTATUS: u32 = 0x54;
-}
-
-/// HcControl register bits
-#[allow(dead_code)]
-mod hccontrol {
-    /// Control/Bulk Service Ratio
-    pub const CBSR_MASK: u32 = 3;
-    /// Periodic List Enable
-    pub const PLE: u32 = 1 << 2;
-    /// Isochronous Enable
-    pub const IE: u32 = 1 << 3;
-    /// Control List Enable
-    pub const CLE: u32 = 1 << 4;
-    /// Bulk List Enable
-    pub const BLE: u32 = 1 << 5;
-    /// Host Controller Functional State
-    pub const HCFS_MASK: u32 = 3 << 6;
-    pub const HCFS_RESET: u32 = 0 << 6;
-    pub const HCFS_RESUME: u32 = 1 << 6;
-    pub const HCFS_OPERATIONAL: u32 = 2 << 6;
-    pub const HCFS_SUSPEND: u32 = 3 << 6;
-    /// Interrupt Routing
-    pub const IR: u32 = 1 << 8;
-    /// Remote Wakeup Connected
-    pub const RWC: u32 = 1 << 9;
-    /// Remote Wakeup Enable
-    pub const RWE: u32 = 1 << 10;
-}
-
-/// HcCommandStatus register bits
-mod hccommandstatus {
-    /// Host Controller Reset
-    pub const HCR: u32 = 1 << 0;
-    /// Control List Filled
-    pub const CLF: u32 = 1 << 1;
-    /// Bulk List Filled
-    pub const BLF: u32 = 1 << 2;
-    /// Ownership Change Request
-    pub const OCR: u32 = 1 << 3;
-}
-
-/// Root Hub Port Status bits
-#[allow(dead_code)]
-mod rhportstatus {
-    /// Current Connect Status
-    pub const CCS: u32 = 1 << 0;
-    /// Port Enable Status
-    pub const PES: u32 = 1 << 1;
-    /// Port Suspend Status
-    pub const PSS: u32 = 1 << 2;
-    /// Port Over Current Indicator
-    pub const POCI: u32 = 1 << 3;
-    /// Port Reset Status
-    pub const PRS: u32 = 1 << 4;
-    /// Port Power Status
-    pub const PPS: u32 = 1 << 8;
-    /// Low Speed Device Attached
-    pub const LSDA: u32 = 1 << 9;
-    /// Connect Status Change
-    pub const CSC: u32 = 1 << 16;
-    /// Port Enable Status Change
-    pub const PESC: u32 = 1 << 17;
-    /// Port Suspend Status Change
-    pub const PSSC: u32 = 1 << 18;
-    /// Port Over Current Indicator Change
-    pub const OCIC: u32 = 1 << 19;
-    /// Port Reset Status Change
-    pub const PRSC: u32 = 1 << 20;
-    /// Clear bits mask
-    pub const CLEAR_MASK: u32 = CSC | PESC | PSSC | OCIC | PRSC;
-}
+use super::ohci_regs::{
+    self, HCCOMMANDSTATUS, HCCONTROL, HCRHDESCRIPTORA, HCRHPORTSTATUS, HCRHSTATUS, HCREVISION,
+};
 
 // ============================================================================
 // OHCI Data Structures
@@ -379,15 +259,14 @@ const MAX_DEVICES: usize = 8;
 /// Maximum number of ports
 const MAX_PORTS: usize = 8;
 
-/// OHCI MMIO region size
-const OHCI_MMIO_SIZE: usize = 0x1000;
-
 /// OHCI Host Controller
 pub struct OhciController {
     /// PCI address
     pci_address: PciAddress,
-    /// MMIO region for register access
-    mmio: MmioRegion,
+    /// Pointer to OHCI operational registers (hardware MMIO region)
+    regs: *const ohci_regs::OhciRegs,
+    /// Base address for port registers (first port at offset 0x54 from MMIO base)
+    port_regs_base: u64,
     /// Number of ports
     num_ports: u8,
     /// Devices
@@ -411,23 +290,21 @@ impl OhciController {
     /// Create a new OHCI controller from a PCI device
     pub fn new(pci_dev: &PciDevice) -> Result<Self, UsbError> {
         let mmio_base = pci_dev.mmio_base().ok_or(UsbError::NotReady)?;
-        // SAFETY: mmio_base is a PCI BAR address for this OHCI controller,
-        // mapped by the platform and valid for the device's lifetime.
-        let mmio = unsafe { MmioRegion::new(mmio_base, OHCI_MMIO_SIZE) };
 
         // Enable the device (bus master + memory space)
         pci::enable_device(pci_dev);
 
-        // Read revision
-        let revision = mmio.read32(regs::HCREVISION as u64);
-        let version = revision & 0xFF;
+        // Set up typed register pointers
+        let regs = mmio_base as *const ohci_regs::OhciRegs;
+        let port_regs_base = mmio_base + ohci_regs::HCRHPORTSTATUS_BASE;
 
+        // Read revision using typed registers
+        let regs_ref = unsafe { &*regs };
+        let version = regs_ref.hcrevision.read(HCREVISION::REV);
         log::info!("OHCI version: {}.{}", (version >> 4) & 0xF, version & 0xF);
 
         // Get number of ports from RhDescriptorA
-        let rh_desc_a = mmio.read32(regs::HCRHDESCRIPTORA as u64);
-        let num_ports = (rh_desc_a & 0xFF) as u8;
-
+        let num_ports = regs_ref.hcrhdescriptora.read(HCRHDESCRIPTORA::NDP) as u8;
         log::info!("OHCI: {} ports", num_ports);
 
         // Allocate HCCA (256-byte aligned)
@@ -453,7 +330,8 @@ impl OhciController {
 
         let mut controller = Self {
             pci_address: pci_dev.address,
-            mmio,
+            regs,
+            port_regs_base,
             num_ports: num_ports.min(MAX_PORTS as u8),
             devices: core::array::from_fn(|_| None),
             next_address: 1,
@@ -469,62 +347,45 @@ impl OhciController {
         Ok(controller)
     }
 
-    /// Read OHCI register
+    /// Get operational registers reference
     #[inline]
-    fn read_reg(&self, offset: u32) -> u32 {
-        self.mmio.read32(offset as u64)
+    fn regs(&self) -> &ohci_regs::OhciRegs {
+        unsafe { &*self.regs }
     }
 
-    /// Write OHCI register
+    /// Get port registers reference for a specific port
     #[inline]
-    fn write_reg(&self, offset: u32, value: u32) {
-        self.mmio.write32(offset as u64, value)
-    }
-
-    /// Read port status register
-    #[inline]
-    fn read_port_reg(&self, port: u8) -> u32 {
-        self.mmio
-            .read32(regs::HCRHPORTSTATUS as u64 + (port as u64 * 4))
-    }
-
-    /// Write port status register
-    #[inline]
-    fn write_port_reg(&self, port: u8, value: u32) {
-        self.mmio
-            .write32(regs::HCRHPORTSTATUS as u64 + (port as u64 * 4), value)
+    fn port(&self, port: u8) -> &ohci_regs::OhciPortRegs {
+        unsafe { &*((self.port_regs_base + port as u64 * 4) as *const ohci_regs::OhciPortRegs) }
     }
 
     /// Initialize the controller
     fn init(&mut self) -> Result<(), UsbError> {
-        // Save frame interval
-        let fminterval = self.read_reg(regs::HCFMINTERVAL);
+        // Save frame interval (raw access for complex bit manipulation)
+        let fminterval = self.regs().hcfminterval.get();
         let fminterval_toggle = fminterval & (1 << 31);
 
         // Check if BIOS owns the controller (SMM)
-        let control = self.read_reg(regs::HCCONTROL);
-        if (control & hccontrol::IR) != 0 {
+        if self.regs().hccontrol.is_set(HCCONTROL::IR) {
             // Request ownership
-            self.write_reg(regs::HCCOMMANDSTATUS, hccommandstatus::OCR);
-            wait_for(500, || {
-                (self.read_reg(regs::HCCONTROL) & hccontrol::IR) == 0
-            });
+            self.regs().hccommandstatus.write(HCCOMMANDSTATUS::OCR::SET);
+            wait_for(500, || !self.regs().hccontrol.is_set(HCCONTROL::IR));
         }
 
         // Determine current state
-        let current_state = control & hccontrol::HCFS_MASK;
+        let current_state = self.regs().hccontrol.read(HCCONTROL::HCFS);
 
-        if current_state != hccontrol::HCFS_RESET {
-            // If not in reset, put into reset
-            self.write_reg(regs::HCCONTROL, hccontrol::HCFS_RESET);
+        if current_state != 0 {
+            // HCFS::Reset == 0; if not in reset, put into reset
+            self.regs().hccontrol.write(HCCONTROL::HCFS::Reset);
             crate::time::delay_ms(50);
         }
 
         // Reset the controller
-        self.write_reg(regs::HCCOMMANDSTATUS, hccommandstatus::HCR);
+        self.regs().hccommandstatus.write(HCCOMMANDSTATUS::HCR::SET);
 
         if !wait_for(100, || {
-            (self.read_reg(regs::HCCOMMANDSTATUS) & hccommandstatus::HCR) == 0
+            !self.regs().hccommandstatus.is_set(HCCOMMANDSTATUS::HCR)
         }) {
             return Err(UsbError::Timeout);
         }
@@ -532,7 +393,7 @@ impl OhciController {
         // Now in USB Suspend state, we have 2ms to complete setup
 
         // Set HCCA
-        self.write_reg(regs::HCHCCA, self.hcca as u32);
+        self.regs().hchcca.set(self.hcca as u32);
 
         // Set up dummy EDs for control and bulk lists
         let control_ed = unsafe { &mut *(self.control_ed as *mut EndpointDescriptor) };
@@ -544,29 +405,30 @@ impl OhciController {
         bulk_ed.next_ed = 0;
 
         // Set ED list heads
-        self.write_reg(regs::HCCONTROLHEADED, self.control_ed as u32);
-        self.write_reg(regs::HCBULKHEADED, self.bulk_ed as u32);
+        self.regs().hccontrolheaded.set(self.control_ed as u32);
+        self.regs().hcbulkheaded.set(self.bulk_ed as u32);
 
         // Restore frame interval with toggle inverted
         // FSLargestDataPacket = ((FrameInterval - 210) * 6 / 7) per OHCI spec
         let frame_interval = fminterval & 0x3FFF;
         let fslpd = ((frame_interval.saturating_sub(210)) * 6) / 7;
         let new_fminterval = frame_interval | (fslpd << 16) | (!fminterval_toggle & (1 << 31));
-        self.write_reg(regs::HCFMINTERVAL, new_fminterval);
+        self.regs().hcfminterval.set(new_fminterval);
 
         // Set periodic start (90% of frame interval)
         let periodic_start = ((fminterval & 0x3FFF) * 9) / 10;
-        self.write_reg(regs::HCPERIODICSTART, periodic_start);
+        self.regs().hcperiodicstart.set(periodic_start);
 
-        // Clear interrupt status
-        self.write_reg(regs::HCINTERRUPTSTATUS, 0xFFFFFFFF);
+        // Clear interrupt status (W1C - write all 1s to clear)
+        self.regs().hcinterruptstatus.set(0xFFFFFFFF);
 
         // Enable control and bulk lists, go operational
-        let control = hccontrol::CLE | hccontrol::BLE | hccontrol::HCFS_OPERATIONAL;
-        self.write_reg(regs::HCCONTROL, control);
+        self.regs().hccontrol.write(
+            HCCONTROL::CLE::SET + HCCONTROL::BLE::SET + HCCONTROL::HCFS::Operational,
+        );
 
-        // Power on all ports
-        self.write_reg(regs::HCRHSTATUS, 1 << 16); // LPSC - Local Power Status Change
+        // Power on all ports (LPSC - Local Power Status Change)
+        self.regs().hcrhstatus.write(HCRHSTATUS::LPSC::SET);
 
         crate::time::delay_ms(100); // Wait for power to stabilize
 
@@ -576,21 +438,28 @@ impl OhciController {
 
     /// Enumerate ports and attach devices
     fn enumerate_ports(&mut self) -> Result<(), UsbError> {
-        for port in 0..self.num_ports {
-            let portsc = self.read_port_reg(port);
+        for port_num in 0..self.num_ports {
+            let port = self.port(port_num);
+            let portsc = port.portsc.get();
 
-            // Clear status change bits
-            self.write_port_reg(port, rhportstatus::CLEAR_MASK);
+            // Clear status change bits (W1C)
+            port.portsc.write(
+                HCRHPORTSTATUS::CSC::SET
+                    + HCRHPORTSTATUS::PESC::SET
+                    + HCRHPORTSTATUS::PSSC::SET
+                    + HCRHPORTSTATUS::OCIC::SET
+                    + HCRHPORTSTATUS::PRSC::SET,
+            );
 
             // Check if device connected
-            if (portsc & rhportstatus::CCS) == 0 {
+            if (portsc & HCRHPORTSTATUS::CCS.mask) == 0 {
                 continue;
             }
 
-            let is_low_speed = (portsc & rhportstatus::LSDA) != 0;
+            let is_low_speed = (portsc & HCRHPORTSTATUS::LSDA.mask) != 0;
             log::info!(
                 "OHCI: Device on port {} ({})",
-                port,
+                port_num,
                 if is_low_speed {
                     "low-speed"
                 } else {
@@ -599,20 +468,25 @@ impl OhciController {
             );
 
             // Reset the port
-            self.write_port_reg(port, rhportstatus::PRS);
+            self.port(port_num)
+                .portsc
+                .write(HCRHPORTSTATUS::PRS::SET);
 
             // Wait for reset complete
-            wait_for(100, || (self.read_port_reg(port) & rhportstatus::PRS) == 0);
+            wait_for(100, || {
+                !self.port(port_num).portsc.is_set(HCRHPORTSTATUS::PRS)
+            });
 
             crate::time::delay_ms(10); // Recovery time
 
             // Clear status change
-            self.write_port_reg(port, rhportstatus::PRSC);
+            self.port(port_num)
+                .portsc
+                .write(HCRHPORTSTATUS::PRSC::SET);
 
             // Check if enabled
-            let portsc = self.read_port_reg(port);
-            if (portsc & rhportstatus::PES) == 0 {
-                log::warn!("OHCI: Port {} not enabled after reset", port);
+            if !self.port(port_num).portsc.is_set(HCRHPORTSTATUS::PES) {
+                log::warn!("OHCI: Port {} not enabled after reset", port_num);
                 continue;
             }
 
@@ -623,8 +497,8 @@ impl OhciController {
                 UsbSpeed::Full
             };
 
-            if let Err(e) = self.attach_device(port, speed) {
-                log::error!("Failed to attach device on port {}: {:?}", port, e);
+            if let Err(e) = self.attach_device(port_num, speed) {
+                log::error!("Failed to attach device on port {}: {:?}", port_num, e);
             }
         }
 
@@ -746,7 +620,7 @@ impl OhciController {
         fence(Ordering::SeqCst);
 
         // Tell controller list is filled
-        self.write_reg(regs::HCCOMMANDSTATUS, hccommandstatus::CLF);
+        self.regs().hccommandstatus.write(HCCOMMANDSTATUS::CLF::SET);
 
         // Wait for completion
         let status_td = unsafe { &*(status_td_addr as *const TransferDescriptor) };
@@ -919,7 +793,7 @@ impl UsbController for OhciController {
             fence(Ordering::SeqCst);
 
             // Trigger bulk list
-            self.write_reg(regs::HCCOMMANDSTATUS, hccommandstatus::BLF);
+            self.regs().hccommandstatus.write(HCCOMMANDSTATUS::BLF::SET);
 
             // Wait for completion
             let timeout = Timeout::from_ms(5000);
@@ -1023,20 +897,21 @@ impl OhciController {
         log::debug!("OHCI cleanup: stopping and resetting controller");
 
         // 1. Stop the controller (disable all list processing)
-        let control = self.read_reg(regs::HCCONTROL);
-        self.write_reg(
-            regs::HCCONTROL,
-            control & !(hccontrol::PLE | hccontrol::CLE | hccontrol::BLE | hccontrol::IE),
+        self.regs().hccontrol.modify(
+            HCCONTROL::PLE::CLEAR
+                + HCCONTROL::CLE::CLEAR
+                + HCCONTROL::BLE::CLEAR
+                + HCCONTROL::IE::CLEAR,
         );
 
         // 2. Reset the controller
-        self.write_reg(regs::HCCOMMANDSTATUS, hccommandstatus::HCR);
+        self.regs().hccommandstatus.write(HCCOMMANDSTATUS::HCR::SET);
 
         // Wait for reset to complete (should take at most 10us per spec)
         crate::time::delay_ms(2);
 
         // 3. Put controller in reset state
-        self.write_reg(regs::HCCONTROL, 0);
+        self.regs().hccontrol.set(0);
 
         // Wait a bit more to ensure clean state
         crate::time::delay_ms(10);
