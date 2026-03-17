@@ -307,14 +307,6 @@ pub const WIN_CERT_TYPE_EFI_GUID: u16 = 0x0EF1;
 // Secure Boot State
 // ============================================================================
 
-use core::sync::atomic::{AtomicBool, Ordering};
-
-/// Whether Secure Boot is in Setup Mode (PK not enrolled)
-static SETUP_MODE: AtomicBool = AtomicBool::new(true);
-
-/// Whether Secure Boot is enabled
-static SECURE_BOOT_ENABLED: AtomicBool = AtomicBool::new(false);
-
 /// Variable attributes for the SecureBootEnable user preference variable
 /// This is non-volatile so it persists across resets
 const SECURE_BOOT_ENABLE_ATTRS: u32 =
@@ -322,31 +314,33 @@ const SECURE_BOOT_ENABLE_ATTRS: u32 =
 
 /// Check if we're in Setup Mode
 pub fn is_setup_mode() -> bool {
-    SETUP_MODE.load(Ordering::Acquire)
+    crate::state::efi().setup_mode
 }
 
 /// Check if Secure Boot is enabled
 pub fn is_secure_boot_enabled() -> bool {
-    SECURE_BOOT_ENABLED.load(Ordering::Acquire)
+    crate::state::efi().secure_boot_enabled
 }
 
 /// Enter User Mode (called when PK is enrolled)
 pub fn enter_user_mode() {
-    SETUP_MODE.store(false, Ordering::Release);
+    crate::state::with_efi_mut(|efi| efi.setup_mode = false);
     log::info!("Secure Boot: Entering User Mode");
 }
 
 /// Enter Setup Mode (called when PK is deleted)
 pub fn enter_setup_mode() {
-    SETUP_MODE.store(true, Ordering::Release);
-    SECURE_BOOT_ENABLED.store(false, Ordering::Release);
+    crate::state::with_efi_mut(|efi| {
+        efi.setup_mode = true;
+        efi.secure_boot_enabled = false;
+    });
     log::info!("Secure Boot: Entering Setup Mode");
 }
 
 /// Enable Secure Boot (only valid in User Mode)
 pub fn enable_secure_boot() {
     if !is_setup_mode() {
-        SECURE_BOOT_ENABLED.store(true, Ordering::Release);
+        crate::state::with_efi_mut(|efi| efi.secure_boot_enabled = true);
         log::info!("Secure Boot: Enabled");
         // Persist the user preference to SPI flash
         persist_secure_boot_enable_preference(true);
@@ -355,7 +349,7 @@ pub fn enable_secure_boot() {
 
 /// Disable Secure Boot
 pub fn disable_secure_boot() {
-    SECURE_BOOT_ENABLED.store(false, Ordering::Release);
+    crate::state::with_efi_mut(|efi| efi.secure_boot_enabled = false);
     log::info!("Secure Boot: Disabled");
     // Persist the user preference to SPI flash
     persist_secure_boot_enable_preference(false);

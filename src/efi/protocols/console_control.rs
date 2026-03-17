@@ -8,6 +8,7 @@ use core::ffi::c_void;
 use r_efi::efi::{Boolean, Guid, Status};
 
 use crate::efi::utils::allocate_protocol_with_log;
+use crate::state::ScreenMode;
 
 /// Console Control Protocol GUID
 /// {F42F7782-012E-4C12-9956-49F94304F721}
@@ -19,18 +20,6 @@ pub const CONSOLE_CONTROL_PROTOCOL_GUID: Guid = Guid::from_fields(
     0x56,
     &[0x49, 0xf9, 0x43, 0x04, 0xf7, 0x21],
 );
-
-/// Console screen mode
-#[repr(u32)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ScreenMode {
-    /// Text mode
-    Text = 0,
-    /// Graphics mode
-    Graphics = 1,
-    /// Maximum mode value (for bounds checking)
-    MaxValue = 2,
-}
 
 /// Console Control Protocol structure
 #[repr(C)]
@@ -46,9 +35,6 @@ pub struct ConsoleControlProtocol {
         extern "efiapi" fn(this: *mut ConsoleControlProtocol, password: *mut u16) -> Status,
 }
 
-/// Current screen mode (we start in graphics mode since we have a framebuffer)
-static mut CURRENT_MODE: ScreenMode = ScreenMode::Graphics;
-
 /// Get the current console mode
 extern "efiapi" fn console_get_mode(
     _this: *mut ConsoleControlProtocol,
@@ -57,8 +43,9 @@ extern "efiapi" fn console_get_mode(
     std_in_locked: *mut Boolean,
 ) -> Status {
     if !mode.is_null() {
+        // SAFETY: mode is a non-null pointer from the caller; single-threaded firmware.
         unsafe {
-            *mode = CURRENT_MODE;
+            *mode = crate::state::console().screen_mode;
         }
     }
 
@@ -92,9 +79,10 @@ extern "efiapi" fn console_set_mode(
         return Status::INVALID_PARAMETER;
     }
 
-    let prev_mode = unsafe { CURRENT_MODE };
+    let prev_mode = crate::state::console().screen_mode;
+    // SAFETY: Single-threaded firmware; no aliasing &mut exists at this point.
     unsafe {
-        CURRENT_MODE = mode;
+        (*crate::state::console_mut_ptr()).screen_mode = mode;
     }
 
     log::debug!("ConsoleControl.SetMode({:?} -> {:?})", prev_mode, mode);

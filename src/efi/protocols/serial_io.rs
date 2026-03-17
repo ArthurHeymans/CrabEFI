@@ -273,24 +273,6 @@ extern "efiapi" fn serial_read(
     Status::SUCCESS
 }
 
-/// Static mode structure for the serial port
-static mut SERIAL_MODE: SerialIoMode = SerialIoMode {
-    control_mask: EFI_SERIAL_CLEAR_TO_SEND
-        | EFI_SERIAL_DATA_SET_READY
-        | EFI_SERIAL_RING_INDICATE
-        | EFI_SERIAL_CARRIER_DETECT
-        | EFI_SERIAL_INPUT_BUFFER_EMPTY
-        | EFI_SERIAL_OUTPUT_BUFFER_EMPTY
-        | EFI_SERIAL_REQUEST_TO_SEND
-        | EFI_SERIAL_DATA_TERMINAL_READY,
-    timeout: 1000000, // 1 second in microseconds
-    baud_rate: 115200,
-    receive_fifo_depth: 16,
-    data_bits: 8,
-    parity: 1,    // NoParity
-    stop_bits: 1, // OneStopBit
-};
-
 /// Create and initialize the Serial IO Protocol
 ///
 /// # Returns
@@ -305,7 +287,8 @@ pub fn create_protocol() -> *mut Protocol {
         p.get_control = serial_get_control;
         p.write = serial_write;
         p.read = serial_read;
-        p.mode = &raw mut SERIAL_MODE;
+        p.mode =
+            unsafe { core::ptr::addr_of_mut!((*crate::state::drivers_mut_ptr()).serial.io_mode) };
         p.device_type_guid = core::ptr::null();
     });
     if ptr.is_null() {

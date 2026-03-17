@@ -4,8 +4,6 @@
 //! - **x86_64**: TSC (Time Stamp Counter) calibrated against the ACPI PM timer
 //! - **aarch64**: ARM Generic Timer (`CNTPCT_EL0` / `CNTFRQ_EL0`)
 
-use core::sync::atomic::{AtomicU64, Ordering};
-
 #[cfg(target_arch = "x86_64")]
 use crate::arch::x86_64::io;
 #[cfg(target_arch = "x86_64")]
@@ -14,13 +12,6 @@ use zerocopy::{FromBytes, Immutable, KnownLayout, Unaligned};
 // ============================================================================
 // Architecture-agnostic counter interface
 // ============================================================================
-
-/// Counter frequency in Hz (cycles per second)
-/// Default to 2 GHz as a conservative fallback for x86, or set by init for aarch64
-static COUNTER_FREQ_HZ: AtomicU64 = AtomicU64::new(2_000_000_000);
-
-/// Counter cycles per microsecond (cached for fast access)
-static COUNTER_CYCLES_PER_US: AtomicU64 = AtomicU64::new(2000);
 
 /// Read the monotonic counter value
 ///
@@ -39,7 +30,7 @@ pub fn read_counter() -> u64 {
 
 /// Get the counter frequency in Hz
 pub fn counter_frequency() -> u64 {
-    COUNTER_FREQ_HZ.load(Ordering::Relaxed)
+    crate::state::drivers().timing.counter_freq_hz
 }
 
 // Re-export read_counter as rdtsc on x86 for backwards compat with existing callers
@@ -55,7 +46,7 @@ pub fn rdtsc() -> u64 {
 
 // Re-export counter_frequency as tsc_frequency for backwards compat
 pub fn tsc_frequency() -> u64 {
-    COUNTER_FREQ_HZ.load(Ordering::Relaxed)
+    crate::state::drivers().timing.counter_freq_hz
 }
 
 // ============================================================================
@@ -65,6 +56,7 @@ pub fn tsc_frequency() -> u64 {
 #[cfg(target_arch = "x86_64")]
 mod x86_calibration {
     use super::*;
+    use core::sync::atomic::{AtomicU64, Ordering};
 
     /// ACPI PM timer frequency: 3.579545 MHz
     const PM_TIMER_FREQ: u64 = 3_579_545;
@@ -290,8 +282,13 @@ mod x86_calibration {
 
             if let Some(freq) = calibrate_tsc_with_pm_timer() {
                 let cycles_per_us = freq / 1_000_000;
-                COUNTER_FREQ_HZ.store(freq, Ordering::Relaxed);
-                COUNTER_CYCLES_PER_US.store(cycles_per_us, Ordering::Relaxed);
+                // SAFETY: single-threaded init; raw pointer avoids re-entrancy
+                // issues with the state lock.
+                unsafe {
+                    let t = &mut (*crate::state::drivers_mut_ptr()).timing;
+                    t.counter_freq_hz = freq;
+                    t.counter_cycles_per_us = cycles_per_us;
+                }
 
                 log::info!(
                     "TSC calibrated: {} MHz ({} cycles/us)",
@@ -312,8 +309,6 @@ mod x86_calibration {
 
 #[cfg(target_arch = "aarch64")]
 mod aarch64_timer {
-    use super::*;
-
     /// Initialize aarch64 timing from the Generic Timer frequency register
     pub fn init(_acpi_rsdp: Option<u64>) {
         let freq = crate::arch::aarch64::read_counter_freq();
@@ -321,14 +316,24 @@ mod aarch64_timer {
         if freq == 0 {
             log::warn!("ARM Generic Timer frequency is 0, using 62.5 MHz fallback");
             let fallback = 62_500_000u64;
-            COUNTER_FREQ_HZ.store(fallback, Ordering::Relaxed);
-            COUNTER_CYCLES_PER_US.store(fallback / 1_000_000, Ordering::Relaxed);
+            // SAFETY: single-threaded init; raw pointer avoids re-entrancy
+            // issues with the state lock.
+            unsafe {
+                let t = &mut (*crate::state::drivers_mut_ptr()).timing;
+                t.counter_freq_hz = fallback;
+                t.counter_cycles_per_us = fallback / 1_000_000;
+            }
             return;
         }
 
         let cycles_per_us = freq / 1_000_000;
-        COUNTER_FREQ_HZ.store(freq, Ordering::Relaxed);
-        COUNTER_CYCLES_PER_US.store(cycles_per_us.max(1), Ordering::Relaxed);
+        // SAFETY: single-threaded init; raw pointer avoids re-entrancy
+        // issues with the state lock.
+        unsafe {
+            let t = &mut (*crate::state::drivers_mut_ptr()).timing;
+            t.counter_freq_hz = freq;
+            t.counter_cycles_per_us = cycles_per_us.max(1);
+        }
 
         log::info!(
             "ARM Generic Timer: {} MHz ({} cycles/us)",
@@ -357,7 +362,7 @@ pub fn init(acpi_rsdp: Option<u64>) {
 /// Spin-wait for approximately `us` microseconds
 #[inline]
 pub fn delay_us(us: u64) {
-    let cycles = us * COUNTER_CYCLES_PER_US.load(Ordering::Relaxed);
+    let cycles = us * crate::state::drivers().timing.counter_cycles_per_us;
     let start = read_counter();
     while read_counter().wrapping_sub(start) < cycles {
         core::hint::spin_loop();
@@ -393,7 +398,7 @@ impl Timeout {
     /// Create a timeout that expires after `us` microseconds
     #[inline]
     pub fn from_us(us: u64) -> Self {
-        let cycles = us * COUNTER_CYCLES_PER_US.load(Ordering::Relaxed);
+        let cycles = us * crate::state::drivers().timing.counter_cycles_per_us;
         Self {
             deadline: read_counter().wrapping_add(cycles),
         }

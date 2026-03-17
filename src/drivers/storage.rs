@@ -3,8 +3,6 @@
 //! This module provides a common interface for all storage devices (USB, NVMe, AHCI)
 //! that can be used by the BlockIO protocol and filesystem code.
 
-use spin::Mutex;
-
 /// Maximum number of storage devices we can track
 const MAX_STORAGE_DEVICES: usize = 8;
 
@@ -35,13 +33,13 @@ pub struct StorageDevice {
 }
 
 /// Internal storage for registered devices
-struct StorageRegistry {
+pub(crate) struct StorageRegistry {
     devices: [Option<StorageDevice>; MAX_STORAGE_DEVICES],
     next_id: u32,
 }
 
 impl StorageRegistry {
-    const fn new() -> Self {
+    pub(crate) const fn new() -> Self {
         Self {
             devices: [const { None }; MAX_STORAGE_DEVICES],
             next_id: 0,
@@ -49,11 +47,11 @@ impl StorageRegistry {
     }
 }
 
-static STORAGE_REGISTRY: Mutex<StorageRegistry> = Mutex::new(StorageRegistry::new());
-
 /// Register a storage device and get its device ID
 pub fn register_device(device_type: StorageType, num_blocks: u64, block_size: u32) -> Option<u32> {
-    let mut registry = STORAGE_REGISTRY.lock();
+    // SAFETY: Single-threaded firmware; raw pointer avoids re-entrancy issues
+    // since storage registration may be called from contexts that already hold state.
+    let registry = unsafe { &mut (*crate::state::drivers_mut_ptr()).storage_registry };
 
     // Find a free slot index first
     let slot_idx = registry.devices.iter().position(|slot| slot.is_none())?;
@@ -81,7 +79,7 @@ pub fn register_device(device_type: StorageType, num_blocks: u64, block_size: u3
 
 /// Get a storage device by ID
 pub fn get_device(device_id: u32) -> Option<StorageDevice> {
-    let registry = STORAGE_REGISTRY.lock();
+    let registry = &crate::state::drivers().storage_registry;
     registry
         .devices
         .iter()

@@ -9,16 +9,12 @@
 use crate::coreboot::cbmem_console;
 use crate::time::read_counter;
 use core::fmt::Write;
-use core::sync::atomic::{AtomicU64, Ordering};
 use log::{Level, LevelFilter, Metadata, Record};
-
-/// Initial counter value at boot (set during init)
-static BOOT_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Get relative counter ticks since boot (in thousands for readability)
 pub fn get_timestamp_k() -> u64 {
     let current = read_counter();
-    let boot = BOOT_COUNTER.load(Ordering::Relaxed);
+    let boot = crate::state::drivers().timing.boot_counter;
     // Return delta in thousands (k-ticks) to keep numbers manageable
     current.saturating_sub(boot) / 1000
 }
@@ -83,7 +79,11 @@ static LOGGER: CombinedLogger = CombinedLogger;
 /// Initialize the logging subsystem
 pub fn init() {
     // Record the boot counter for relative timestamps
-    BOOT_COUNTER.store(read_counter(), Ordering::Relaxed);
+    // SAFETY: single-threaded init; raw pointer avoids re-entrancy
+    // issues with the state lock.
+    unsafe {
+        (*crate::state::drivers_mut_ptr()).timing.boot_counter = read_counter();
+    }
 
     log::set_logger(&LOGGER)
         .map(|()| log::set_max_level(LevelFilter::Debug))

@@ -25,8 +25,7 @@
 pub mod access;
 pub mod driver;
 
-use access::{AnyPciAccess, IoCamAccess, PciAccess};
-use spin::Mutex;
+use access::{AnyPciAccess, PciAccess};
 
 use crate::state;
 
@@ -65,19 +64,13 @@ const HEADER_TYPE_MULTI_FUNCTION: u8 = 0x80;
 // Global PCI Access
 // ============================================================================
 
-/// Global PCI config space access method
-///
-/// Initialized during `init()` and used by all subsequent PCI operations.
-/// Defaults to legacy I/O CAM; upgraded to ECAM if available.
-static PCI_ACCESS: Mutex<AnyPciAccess> = Mutex::new(AnyPciAccess::IoCam(IoCamAccess));
-
 /// Helper: run a closure with the global PCI access method
 fn with_access<F, R>(f: F) -> R
 where
     F: FnOnce(&AnyPciAccess) -> R,
 {
-    let access = PCI_ACCESS.lock();
-    f(&access)
+    let access = &state::drivers().pci.access;
+    f(access)
 }
 
 // ============================================================================
@@ -381,19 +374,16 @@ pub fn init() {
     log::info!("Initializing PCI subsystem...");
 
     // Select access method based on ECAM availability
-    let ecam_base = state::drivers().ecam_base;
-    {
-        let new_access = access::create_access(ecam_base);
-        let mut access = PCI_ACCESS.lock();
-        *access = new_access;
-    }
+    let ecam_base = state::drivers().pci.ecam_base;
+    let new_access = access::create_access(ecam_base);
 
-    // Enumerate devices
-    let access = PCI_ACCESS.lock();
+    // Set access method and enumerate devices in one closure so we can
+    // borrow both `pci.access` and `pci.devices` without aliasing issues.
     state::with_drivers_mut(|drivers| {
-        let devices = &mut drivers.pci_devices;
-        devices.clear();
-        enumerate_devices(&access, devices);
+        drivers.pci.access = new_access;
+        let pci = &mut drivers.pci;
+        pci.devices.clear();
+        enumerate_devices(&pci.access, &mut pci.devices);
     });
 }
 
@@ -459,7 +449,7 @@ fn enumerate_devices(
 pub fn bind_drivers() {
     log::info!("Binding PCI drivers to devices...");
 
-    let devices = state::drivers().pci_devices.clone();
+    let devices = state::drivers().pci.devices.clone();
 
     let mut bound_count = 0;
     for device in devices.iter() {
@@ -486,7 +476,7 @@ pub fn shutdown_drivers() {
 /// Find all NVMe controllers
 pub fn find_nvme_controllers() -> heapless::Vec<PciDevice, 8> {
     let drivers = state::drivers();
-    let devices = &drivers.pci_devices;
+    let devices = &drivers.pci.devices;
     let mut result = heapless::Vec::new();
     for dev in devices.iter() {
         if dev.is_nvme() {
@@ -505,7 +495,7 @@ pub fn find_nvme_controllers() -> heapless::Vec<PciDevice, 8> {
 /// Find all AHCI controllers
 pub fn find_ahci_controllers() -> heapless::Vec<PciDevice, 8> {
     let drivers = state::drivers();
-    let devices = &drivers.pci_devices;
+    let devices = &drivers.pci.devices;
     let mut result = heapless::Vec::new();
     for dev in devices.iter() {
         if dev.is_ahci() {
@@ -524,7 +514,7 @@ pub fn find_ahci_controllers() -> heapless::Vec<PciDevice, 8> {
 /// Find all SDHCI controllers
 pub fn find_sdhci_controllers() -> heapless::Vec<PciDevice, 8> {
     let drivers = state::drivers();
-    let devices = &drivers.pci_devices;
+    let devices = &drivers.pci.devices;
     let mut result = heapless::Vec::new();
     for dev in devices.iter() {
         if dev.is_sdhci() {
@@ -542,13 +532,13 @@ pub fn find_sdhci_controllers() -> heapless::Vec<PciDevice, 8> {
 
 /// Get all enumerated PCI devices
 pub fn get_all_devices() -> heapless::Vec<PciDevice, { state::MAX_PCI_DEVICES }> {
-    state::drivers().pci_devices.clone()
+    state::drivers().pci.devices.clone()
 }
 
 /// Print information about all PCI devices
 pub fn print_devices() {
     let drivers = state::drivers();
-    let devices = &drivers.pci_devices;
+    let devices = &drivers.pci.devices;
 
     log::info!("PCI Devices:");
     for dev in devices.iter() {
@@ -580,7 +570,7 @@ pub fn print_devices() {
 /// Set ECAM base address (from ACPI MCFG table)
 pub fn set_ecam_base(base: u64) {
     state::with_drivers_mut(|drivers| {
-        drivers.ecam_base = Some(base);
+        drivers.pci.ecam_base = Some(base);
     });
     log::debug!("ECAM base set to {:#x}", base);
 }
