@@ -145,6 +145,7 @@ pub mod nvme;
 pub mod pci;
 pub mod sdhci;
 pub mod serial;
+pub mod serial_regs;
 pub mod spi;
 pub mod storage;
 pub mod usb;
