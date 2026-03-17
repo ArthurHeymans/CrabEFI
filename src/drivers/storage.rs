@@ -49,32 +49,32 @@ impl StorageRegistry {
 
 /// Register a storage device and get its device ID
 pub fn register_device(device_type: StorageType, num_blocks: u64, block_size: u32) -> Option<u32> {
-    // SAFETY: Single-threaded firmware; raw pointer avoids re-entrancy issues
-    // since storage registration may be called from contexts that already hold state.
-    let registry = unsafe { &mut (*crate::state::drivers_mut_ptr()).storage_registry };
+    crate::state::with_drivers_mut(|drivers| {
+        let registry = &mut drivers.storage_registry;
 
-    // Find a free slot index first
-    let slot_idx = registry.devices.iter().position(|slot| slot.is_none())?;
+        // Find a free slot index first
+        let slot_idx = registry.devices.iter().position(|slot| slot.is_none())?;
 
-    let device_id = registry.next_id;
-    registry.next_id += 1;
+        let device_id = registry.next_id;
+        registry.next_id += 1;
 
-    registry.devices[slot_idx] = Some(StorageDevice {
-        device_type,
-        num_blocks,
-        block_size,
-        device_id,
-    });
+        registry.devices[slot_idx] = Some(StorageDevice {
+            device_type,
+            num_blocks,
+            block_size,
+            device_id,
+        });
 
-    log::info!(
-        "Storage: registered {:?} as device {} ({} blocks x {} bytes)",
-        device_type,
-        device_id,
-        num_blocks,
-        block_size
-    );
+        log::info!(
+            "Storage: registered {:?} as device {} ({} blocks x {} bytes)",
+            device_type,
+            device_id,
+            num_blocks,
+            block_size
+        );
 
-    Some(device_id)
+        Some(device_id)
+    })
 }
 
 /// Get a storage device by ID

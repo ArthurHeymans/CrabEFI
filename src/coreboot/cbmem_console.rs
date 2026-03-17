@@ -67,8 +67,13 @@ pub fn init(addr: u64) {
 }
 
 /// Check if CBMEM console is available
+///
+/// Uses raw-pointer read (see *Log-Path Contract* in [`crate::state`]) to
+/// avoid creating a shared reference that would alias with a live `&mut`
+/// from `with_*_mut()` closures.
 pub fn is_available() -> bool {
-    crate::state::try_get().is_some_and(|s| s.drivers.platform.cbmem_console_addr != 0)
+    crate::state::try_get_mut_ptr()
+        .is_some_and(|ptr| unsafe { (*ptr).drivers.platform.cbmem_console_addr != 0 })
 }
 
 /// Disable the CBMEM console
@@ -94,7 +99,14 @@ pub fn disable() {
 /// - Bits 0-27: Current write position (CURSOR_MASK)
 /// - Bit 31: Overflow flag (set when buffer has wrapped at least once)
 pub fn write_bytes(data: &[u8]) {
-    let addr = crate::state::drivers().platform.cbmem_console_addr;
+    // SAFETY: single-threaded firmware; raw-pointer read avoids aliasing
+    // with a live &mut from with_*_mut() closures (see Log-Path Contract
+    // in crate::state).
+    let addr = unsafe {
+        (*crate::state::drivers_mut_ptr())
+            .platform
+            .cbmem_console_addr
+    };
     if addr == 0 {
         return;
     }

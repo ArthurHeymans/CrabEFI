@@ -127,9 +127,7 @@ pub fn init() {
     if has_rndr() {
         // Verify RNDR actually works
         if rndr64().is_some() {
-            unsafe {
-                (*crate::state::drivers_mut_ptr()).rng_available = true;
-            }
+            crate::state::with_drivers_mut(|d| d.rng_available = true);
             RNG_METHOD.store(RngMethod::Rndr as u8, Ordering::Release);
             log::info!("RNG: RNDR instruction available (FEAT_RNG)");
             return;
@@ -137,9 +135,7 @@ pub fn init() {
     }
 
     if check_smccc_trng() {
-        unsafe {
-            (*crate::state::drivers_mut_ptr()).rng_available = true;
-        }
+        crate::state::with_drivers_mut(|d| d.rng_available = true);
         RNG_METHOD.store(RngMethod::SmcccTrng as u8, Ordering::Release);
         log::info!("RNG: SMCCC TRNG available");
         return;
