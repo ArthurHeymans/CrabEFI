@@ -369,11 +369,13 @@ pub unsafe fn install_exception_vectors() {
     unsafe extern "C" {
         static exception_vectors: u8;
     }
-    let vbar = &exception_vectors as *const u8 as u64;
-    core::arch::asm!(
-        "msr VBAR_EL2, {}",
-        "isb",
-        in(reg) vbar,
-        options(nomem, nostack, preserves_flags)
-    );
+    unsafe {
+        let vbar = &exception_vectors as *const u8 as u64;
+        core::arch::asm!(
+            "msr VBAR_EL2, {}",
+            "isb",
+            in(reg) vbar,
+            options(nomem, nostack, preserves_flags)
+        );
+    }
 }
