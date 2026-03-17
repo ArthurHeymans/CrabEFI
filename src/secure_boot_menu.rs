@@ -7,7 +7,7 @@ use crate::coreboot;
 use crate::drivers::serial as serial_driver;
 use crate::efi::auth::{self, boot as secure_boot};
 use crate::framebuffer_console::{
-    Color, DEFAULT_BG, DEFAULT_FG, FramebufferConsole, HIGHLIGHT_BG, HIGHLIGHT_FG,
+    Color, FramebufferConsole, DEFAULT_BG, DEFAULT_FG, HIGHLIGHT_BG, HIGHLIGHT_FG,
 };
 use crate::menu_common::{self, KeyPress, SerialWriter};
 use crate::time::delay_ms;
@@ -99,7 +99,7 @@ pub fn show_secure_boot_menu() {
         let (pk_count, kek_count, db_count, dbx_count) = secure_boot::get_enrollment_summary();
 
         // Clear and draw
-        clear_screen(&mut fb_console);
+        menu_common::clear_screen(&mut fb_console);
         draw_menu(
             &mut fb_console,
             selected,
@@ -117,7 +117,7 @@ pub fn show_secure_boot_menu() {
 
         // Wait for input
         loop {
-            if let Some(key) = read_key() {
+            if let Some(key) = menu_common::read_key() {
                 match key {
                     KeyPress::Up | KeyPress::Char('k') => {
                         selected = selected.saturating_sub(1);
@@ -157,7 +157,7 @@ pub fn show_secure_boot_menu() {
                             MenuOption::EnrollDefaultKeys => {
                                 status_message = Some(("Enrolling keys...", true));
                                 // Redraw to show "enrolling" message
-                                clear_screen(&mut fb_console);
+                                menu_common::clear_screen(&mut fb_console);
                                 draw_menu(
                                     &mut fb_console,
                                     selected,
@@ -183,7 +183,7 @@ pub fn show_secure_boot_menu() {
                             MenuOption::EnrollCustomPK => {
                                 status_message = Some(("Searching for PK on ESP...", true));
                                 // Redraw to show "searching" message
-                                clear_screen(&mut fb_console);
+                                menu_common::clear_screen(&mut fb_console);
                                 draw_menu(
                                     &mut fb_console,
                                     selected,
@@ -208,7 +208,7 @@ pub fn show_secure_boot_menu() {
                             MenuOption::ImportDbxUpdate => {
                                 status_message = Some(("Searching for dbx on ESP...", true));
                                 // Redraw to show "searching" message
-                                clear_screen(&mut fb_console);
+                                menu_common::clear_screen(&mut fb_console);
                                 draw_menu(
                                     &mut fb_console,
                                     selected,
@@ -333,39 +333,7 @@ fn import_dbx_update() -> Result<&'static str, &'static str> {
 
 /// Show a confirmation dialog
 fn confirm_action(fb_console: &mut Option<FramebufferConsole>, message: &str) -> bool {
-    // Draw confirmation
-    let rows = fb_console.as_ref().map(|c| c.rows()).unwrap_or(25);
-    let confirm_row = rows / 2;
-
-    // Serial
-    serial_driver::write_str("\x1b[2J\x1b[H"); // Clear
-    serial_driver::write_str("\r\n\r\n");
-    serial_driver::write_str("\x1b[1;33m"); // Yellow bold
-    serial_driver::write_str("  ");
-    serial_driver::write_str(message);
-    serial_driver::write_str("\x1b[0m\r\n\r\n");
-    serial_driver::write_str("  Press Y to confirm, N to cancel\r\n");
-
-    // Framebuffer
-    if let Some(console) = fb_console {
-        console.clear();
-        console.set_fg_color(Color::new(255, 255, 0)); // Yellow
-        console.write_centered(confirm_row, message);
-        console.reset_colors();
-        console.write_centered(confirm_row + 2, "Press Y to confirm, N to cancel");
-    }
-
-    // Wait for response
-    loop {
-        if let Some(key) = read_key() {
-            match key {
-                KeyPress::Char('y') | KeyPress::Char('Y') => return true,
-                KeyPress::Char('n') | KeyPress::Char('N') | KeyPress::Escape => return false,
-                _ => {}
-            }
-        }
-        delay_ms(10);
-    }
+    menu_common::confirm_dialog(fb_console, message, "Press Y to confirm, N to cancel")
 }
 
 /// Draw the complete menu
@@ -576,24 +544,12 @@ fn draw_options(
 
 /// Draw help text
 fn draw_help(fb_console: &mut Option<FramebufferConsole>, row: usize, cols: usize) {
-    let help_text = "Up/Down: Navigate | Enter: Select | Esc/Q: Back";
-
-    // Serial
-    let _ = write!(SerialWriter, "\x1b[{};1H", row + 1);
-    serial_driver::write_str("\x1b[36m"); // Cyan
-    let help_pad = (cols.saturating_sub(help_text.len())) / 2;
-    for _ in 0..help_pad {
-        serial_driver::write_str(" ");
-    }
-    serial_driver::write_str(help_text);
-    serial_driver::write_str("\x1b[0m");
-
-    // Framebuffer
-    if let Some(console) = fb_console {
-        console.set_fg_color(Color::new(0, 192, 192)); // Cyan
-        console.write_centered(row as u32, help_text);
-        console.reset_colors();
-    }
+    menu_common::draw_help(
+        row,
+        "Up/Down: Navigate | Enter: Select | Esc/Q: Back",
+        fb_console,
+        cols,
+    );
 }
 
 /// Draw a status message
@@ -603,35 +559,5 @@ fn draw_status_message(
     message: &str,
     is_success: bool,
 ) {
-    let color = if is_success {
-        Color::new(0, 255, 0) // Green
-    } else {
-        Color::new(255, 0, 0) // Red
-    };
-
-    // Serial
-    let _ = write!(SerialWriter, "\x1b[{};1H", row + 1);
-    if is_success {
-        serial_driver::write_str("\x1b[32m"); // Green
-    } else {
-        serial_driver::write_str("\x1b[31m"); // Red
-    }
-    serial_driver::write_str("  ");
-    serial_driver::write_str(message);
-    serial_driver::write_str("\x1b[0m");
-
-    // Framebuffer
-    if let Some(console) = fb_console {
-        console.set_fg_color(color);
-        console.write_centered(row as u32, message);
-        console.reset_colors();
-    }
-}
-
-fn clear_screen(fb_console: &mut Option<FramebufferConsole>) {
-    menu_common::clear_screen(fb_console);
-}
-
-fn read_key() -> Option<KeyPress> {
-    menu_common::read_key()
+    menu_common::draw_status_message(row, message, is_success, fb_console);
 }

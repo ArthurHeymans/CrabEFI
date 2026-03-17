@@ -575,33 +575,11 @@ fn save_all_changes(cfr: &CfrInfo, items: &[MenuItem]) -> (usize, usize) {
 
 /// Show confirmation dialog for saving on exit
 fn confirm_save(fb_console: &mut Option<FramebufferConsole>) -> bool {
-    serial_driver::write_str("\x1b[2J\x1b[H");
-    serial_driver::write_str("\r\n\r\n");
-    serial_driver::write_str("\x1b[1;33m");
-    serial_driver::write_str("  Save changes? (takes effect after reset)\r\n");
-    serial_driver::write_str("\x1b[0m\r\n");
-    serial_driver::write_str("  Press Y to save, N to discard\r\n");
-
-    if let Some(console) = fb_console {
-        console.clear();
-        let rows = console.rows();
-        let confirm_row = rows / 2;
-        console.set_fg_color(Color::new(255, 255, 0));
-        console.write_centered(confirm_row, "Save changes? (takes effect after reset)");
-        console.reset_colors();
-        console.write_centered(confirm_row + 2, "Press Y to save, N to discard");
-    }
-
-    loop {
-        if let Some(key) = menu_common::read_key() {
-            match key {
-                KeyPress::Char('y') | KeyPress::Char('Y') => return true,
-                KeyPress::Char('n') | KeyPress::Char('N') | KeyPress::Escape => return false,
-                _ => {}
-            }
-        }
-        delay_ms(10);
-    }
+    menu_common::confirm_dialog(
+        fb_console,
+        "Save changes? (takes effect after reset)",
+        "Press Y to save, N to discard",
+    )
 }
 
 /// Show a brief save result message (displayed on the confirm screen)
@@ -1050,21 +1028,7 @@ fn draw_scroll_indicator(row: usize, indicator: &str, fb_console: &mut Option<Fr
 
 /// Draw help text
 fn draw_help(row: usize, fb_console: &mut Option<FramebufferConsole>, cols: usize) {
-    let ansi_row = row + 1;
-    let _ = write!(SerialWriter, "\x1b[{};1H", ansi_row);
-    serial_driver::write_str("\x1b[36m");
-    let help_pad = (cols.saturating_sub(HELP_TEXT.len())) / 2;
-    for _ in 0..help_pad {
-        serial_driver::write_str(" ");
-    }
-    serial_driver::write_str(HELP_TEXT);
-    serial_driver::write_str("\x1b[0m");
-
-    if let Some(console) = fb_console {
-        console.set_fg_color(Color::new(0, 192, 192));
-        console.write_centered(row as u32, HELP_TEXT);
-        console.reset_colors();
-    }
+    menu_common::draw_help(row, HELP_TEXT, fb_console, cols);
 }
 
 /// Draw a status message
@@ -1074,34 +1038,10 @@ fn draw_status_message(
     is_success: bool,
     fb_console: &mut Option<FramebufferConsole>,
 ) {
-    let color = if is_success {
-        Color::new(0, 255, 0)
-    } else {
-        Color::new(255, 0, 0)
-    };
-
-    let ansi_row = row + 1;
-    let _ = write!(SerialWriter, "\x1b[{};1H", ansi_row);
-    if is_success {
-        serial_driver::write_str("\x1b[32m");
-    } else {
-        serial_driver::write_str("\x1b[31m");
-    }
-    serial_driver::write_str("  ");
-    serial_driver::write_str(message);
-    serial_driver::write_str("\x1b[0m");
-
-    if let Some(console) = fb_console {
-        console.set_fg_color(color);
-        console.write_centered(row as u32, message);
-        console.reset_colors();
-    }
+    menu_common::draw_status_message(row, message, is_success, fb_console);
 }
 
 /// Clear remaining characters on the current line of a framebuffer console
 fn clear_line_remainder(console: &mut FramebufferConsole) {
-    let (col, _) = console.position();
-    for _ in col..console.cols() {
-        let _ = console.write_str(" ");
-    }
+    menu_common::clear_line_remainder(console);
 }

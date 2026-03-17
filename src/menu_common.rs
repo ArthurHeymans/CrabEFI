@@ -5,7 +5,7 @@
 
 use crate::drivers::keyboard_common as keyboard;
 use crate::drivers::serial as serial_driver;
-use crate::framebuffer_console::{FramebufferConsole, TITLE_COLOR};
+use crate::framebuffer_console::{Color, FramebufferConsole, TITLE_COLOR};
 use crate::time::delay_ms;
 use core::fmt::Write;
 
@@ -130,5 +130,113 @@ impl core::fmt::Write for SerialWriter {
     fn write_str(&mut self, s: &str) -> core::fmt::Result {
         serial_driver::write_str(s);
         Ok(())
+    }
+}
+
+/// Draw centered help text in cyan on both serial and framebuffer
+pub fn draw_help(
+    row: usize,
+    help_text: &str,
+    fb_console: &mut Option<FramebufferConsole>,
+    cols: usize,
+) {
+    // Serial output
+    let _ = write!(SerialWriter, "\x1b[{};1H", row + 1);
+    serial_driver::write_str("\x1b[36m"); // Cyan
+    let help_pad = (cols.saturating_sub(help_text.len())) / 2;
+    for _ in 0..help_pad {
+        serial_driver::write_str(" ");
+    }
+    serial_driver::write_str(help_text);
+    serial_driver::write_str("\x1b[0m");
+
+    // Framebuffer output
+    if let Some(console) = fb_console {
+        console.set_fg_color(Color::new(0, 192, 192)); // Cyan
+        console.write_centered(row as u32, help_text);
+        console.reset_colors();
+    }
+}
+
+/// Draw a status message in green (success) or red (failure) on both outputs
+pub fn draw_status_message(
+    row: usize,
+    message: &str,
+    is_success: bool,
+    fb_console: &mut Option<FramebufferConsole>,
+) {
+    let color = if is_success {
+        Color::new(0, 255, 0)
+    } else {
+        Color::new(255, 0, 0)
+    };
+
+    let _ = write!(SerialWriter, "\x1b[{};1H", row + 1);
+    if is_success {
+        serial_driver::write_str("\x1b[32m");
+    } else {
+        serial_driver::write_str("\x1b[31m");
+    }
+    serial_driver::write_str("  ");
+    serial_driver::write_str(message);
+    serial_driver::write_str("\x1b[0m");
+
+    if let Some(console) = fb_console {
+        console.set_fg_color(color);
+        console.write_centered(row as u32, message);
+        console.reset_colors();
+    }
+}
+
+/// Show a yes/no confirmation dialog on both serial and framebuffer
+///
+/// Clears the screen, displays the `prompt` in yellow and the
+/// `instruction` below it, then waits for Y (true) or N/Escape (false).
+pub fn confirm_dialog(
+    fb_console: &mut Option<FramebufferConsole>,
+    prompt: &str,
+    instruction: &str,
+) -> bool {
+    let rows = fb_console.as_ref().map(|c| c.rows()).unwrap_or(25);
+    let confirm_row = rows / 2;
+
+    // Serial
+    serial_driver::write_str("\x1b[2J\x1b[H");
+    serial_driver::write_str("\r\n\r\n");
+    serial_driver::write_str("\x1b[1;33m"); // Yellow bold
+    serial_driver::write_str("  ");
+    serial_driver::write_str(prompt);
+    serial_driver::write_str("\x1b[0m\r\n\r\n");
+    serial_driver::write_str("  ");
+    serial_driver::write_str(instruction);
+    serial_driver::write_str("\r\n");
+
+    // Framebuffer
+    if let Some(console) = fb_console {
+        console.clear();
+        console.set_fg_color(Color::new(255, 255, 0)); // Yellow
+        console.write_centered(confirm_row, prompt);
+        console.reset_colors();
+        console.write_centered(confirm_row + 2, instruction);
+    }
+
+    // Wait for response
+    loop {
+        if let Some(key) = read_key() {
+            match key {
+                KeyPress::Char('y') | KeyPress::Char('Y') => return true,
+                KeyPress::Char('n') | KeyPress::Char('N') | KeyPress::Escape => return false,
+                _ => {}
+            }
+        }
+        delay_ms(10);
+    }
+}
+
+/// Clear remaining characters on the current framebuffer line with spaces
+pub fn clear_line_remainder(console: &mut FramebufferConsole) {
+    let (col, _) = console.position();
+    for _ in col..console.cols() {
+        let _ = console.write_str(" ");
     }
 }
