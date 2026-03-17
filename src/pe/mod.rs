@@ -571,9 +571,12 @@ pub fn load_image(data: &[u8]) -> Result<LoadedImage, Status> {
     let section_data = &data[sections_offset..sections_end];
 
     // Copy sections with full bounds validation
-    for i in 0..num_sections as usize {
-        let section_offset = i * core::mem::size_of::<SectionHeader>();
-        let section = match SectionHeader::ref_from_prefix(&section_data[section_offset..]) {
+    for (i, chunk) in section_data
+        .chunks_exact(core::mem::size_of::<SectionHeader>())
+        .take(num_sections as usize)
+        .enumerate()
+    {
+        let section = match SectionHeader::ref_from_prefix(chunk) {
             Ok((s, _)) => s,
             Err(_) => break,
         };

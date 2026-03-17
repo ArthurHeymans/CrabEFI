@@ -180,16 +180,14 @@ extern "efiapi" fn allocate_pages(
         return Status::INVALID_PARAMETER;
     }
 
-    let alloc_type = match alloc_type {
-        0 => AllocateType::AllocateAnyPages,
-        1 => AllocateType::AllocateMaxAddress,
-        2 => AllocateType::AllocateAddress,
-        _ => return Status::INVALID_PARAMETER,
+    let alloc_type = match AllocateType::try_from(alloc_type) {
+        Ok(t) => t,
+        Err(_) => return Status::INVALID_PARAMETER,
     };
 
-    let mem_type = match MemoryType::from_u32(memory_type) {
-        Some(t) => t,
-        None => return Status::INVALID_PARAMETER,
+    let mem_type = match MemoryType::try_from(memory_type) {
+        Ok(t) => t,
+        Err(_) => return Status::INVALID_PARAMETER,
     };
 
     let mut addr = unsafe { *memory };
@@ -279,9 +277,9 @@ extern "efiapi" fn allocate_pool(
         return Status::INVALID_PARAMETER;
     }
 
-    let mem_type = match MemoryType::from_u32(pool_type) {
-        Some(t) => t,
-        None => return Status::INVALID_PARAMETER,
+    let mem_type = match MemoryType::try_from(pool_type) {
+        Ok(t) => t,
+        Err(_) => return Status::INVALID_PARAMETER,
     };
 
     match allocator::allocate_pool(mem_type, size) {
@@ -375,13 +373,9 @@ extern "efiapi" fn set_timer(
         return Status::INVALID_PARAMETER;
     }
 
-    // Convert UEFI timer type to our enum
-    // TimerCancel=0, TimerPeriodic=1, TimerRelative=2
-    let timer = match timer_type {
-        0 => state::TimerType::Cancel,
-        1 => state::TimerType::Periodic,
-        2 => state::TimerType::Relative,
-        _ => return Status::INVALID_PARAMETER,
+    let timer = match state::TimerType::try_from(timer_type) {
+        Ok(t) => t,
+        Err(_) => return Status::INVALID_PARAMETER,
     };
 
     state::with_efi_mut(|efi_state| {
@@ -604,8 +598,7 @@ fn signal_event_group(group_guid: &Guid) {
     > = heapless::Vec::new();
 
     state::with_efi_mut(|efi_state| {
-        for i in 0..MAX_EVENTS {
-            let entry = &mut efi_state.events[i];
+        for (i, entry) in efi_state.events.iter_mut().enumerate() {
             if let Some(ref group) = entry.event_group
                 && *group == *group_guid
             {
@@ -1403,20 +1396,33 @@ extern "efiapi" fn load_image(
         return Status::INVALID_PARAMETER;
     }
 
-    // Determine the source: either from buffer or from device path
-    // Also track the device handle if loading from device path
-    let (data_ptr, data_size, allocated_buffer, loaded_from_device): (
-        *mut c_void,
-        usize,
-        bool,
-        Option<Handle>,
-    ) = if !source_buffer.is_null() && source_size > 0 {
-        // Load from provided buffer
-        (source_buffer, source_size, false, None)
+    // Determine the image source: either a caller-provided buffer or loaded from device path.
+    enum ImageSource {
+        /// Caller-provided buffer — not owned by us, must not be freed
+        Buffer {
+            data_ptr: *mut c_void,
+            data_size: usize,
+        },
+        /// Loaded from device path — we allocated this buffer and must free it
+        DevicePath {
+            data_ptr: *mut c_void,
+            data_size: usize,
+            device_handle: Handle,
+        },
+    }
+
+    let source = if !source_buffer.is_null() && source_size > 0 {
+        ImageSource::Buffer {
+            data_ptr: source_buffer,
+            data_size: source_size,
+        }
     } else if !device_path.is_null() {
-        // Load from device path
         match load_image_from_device_path(device_path) {
-            Ok((ptr, size, dev_handle)) => (ptr, size, true, Some(dev_handle)),
+            Ok((ptr, size, dev_handle)) => ImageSource::DevicePath {
+                data_ptr: ptr,
+                data_size: size,
+                device_handle: dev_handle,
+            },
             Err(status) => {
                 log::error!(
                     "BS.LoadImage: Failed to load from device path: {:?}",
@@ -1430,8 +1436,27 @@ extern "efiapi" fn load_image(
         return Status::INVALID_PARAMETER;
     };
 
+    let (data_ptr, data_size) = match &source {
+        ImageSource::Buffer {
+            data_ptr,
+            data_size,
+        } => (*data_ptr, *data_size),
+        ImageSource::DevicePath {
+            data_ptr,
+            data_size,
+            ..
+        } => (*data_ptr, *data_size),
+    };
+
     // Create a slice from the source buffer
     let data = unsafe { core::slice::from_raw_parts(data_ptr as *const u8, data_size) };
+
+    // Helper to free the buffer only if we own it (loaded from device path)
+    let free_if_owned = |source: &ImageSource| {
+        if let ImageSource::DevicePath { data_ptr, .. } = source {
+            let _ = allocator::free_pool(*data_ptr as *mut u8);
+        }
+    };
 
     // Secure Boot verification (if enabled)
     if super::auth::is_secure_boot_enabled() {
@@ -1443,17 +1468,13 @@ extern "efiapi" fn load_image(
             Ok(false) => {
                 log::error!("BS.LoadImage: Secure Boot verification FAILED - image not authorized");
                 crate::display_secure_boot_error();
-                if allocated_buffer {
-                    let _ = allocator::free_pool(data_ptr as *mut u8);
-                }
+                free_if_owned(&source);
                 return Status::SECURITY_VIOLATION;
             }
             Err(e) => {
                 log::error!("BS.LoadImage: Secure Boot verification error: {:?}", e);
                 crate::display_secure_boot_error();
-                if allocated_buffer {
-                    let _ = allocator::free_pool(data_ptr as *mut u8);
-                }
+                free_if_owned(&source);
                 return Status::SECURITY_VIOLATION;
             }
         }
@@ -1464,18 +1485,13 @@ extern "efiapi" fn load_image(
         Ok(img) => img,
         Err(status) => {
             log::error!("BS.LoadImage: Failed to load PE image: {:?}", status);
-            // Free the temporary buffer if we allocated it
-            if allocated_buffer {
-                let _ = allocator::free_pool(data_ptr as *mut u8);
-            }
+            free_if_owned(&source);
             return status;
         }
     };
 
-    // Free the temporary buffer now that PE is loaded (it makes its own copy)
-    if allocated_buffer {
-        let _ = allocator::free_pool(data_ptr as *mut u8);
-    }
+    // Free the buffer now that PE is loaded (it makes its own copy)
+    free_if_owned(&source);
 
     log::debug!(
         "BS.LoadImage: PE loaded at {:#x}, entry={:#x}, size={:#x}",
@@ -1497,8 +1513,12 @@ extern "efiapi" fn load_image(
     // Create LoadedImageProtocol for this image
     // Use the device handle from loading if we loaded from device path,
     // otherwise try to get it from the parent
-    let device_handle =
-        loaded_from_device.unwrap_or_else(|| get_device_handle_from_parent(parent_image_handle));
+    let device_handle = match &source {
+        ImageSource::DevicePath {
+            device_handle, ..
+        } => *device_handle,
+        _ => get_device_handle_from_parent(parent_image_handle),
+    };
 
     let system_table = super::get_system_table();
     let loaded_image_protocol = create_loaded_image_protocol(
@@ -1789,9 +1809,9 @@ extern "efiapi" fn exit_boot_services(image_handle: Handle, map_key: usize) -> S
     {
         let mut legacy_events: heapless::Vec<usize, MAX_EVENTS> = heapless::Vec::new();
         state::with_efi_mut(|efi_state| {
-            for i in 0..MAX_EVENTS {
-                if efi_state.events[i].event_type == EVT_SIGNAL_EXIT_BOOT_SERVICES {
-                    efi_state.events[i].signaled = true;
+            for (i, event) in efi_state.events.iter_mut().enumerate() {
+                if event.event_type == EVT_SIGNAL_EXIT_BOOT_SERVICES {
+                    event.signaled = true;
                     let _ = legacy_events.push(i);
                 }
             }

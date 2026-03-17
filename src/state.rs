@@ -72,6 +72,8 @@
 
 use core::sync::atomic::{AtomicPtr, Ordering};
 
+use crate::fs::fat::FatType;
+
 /// Global pointer to the firmware state.
 ///
 /// This is the ONLY global mutable state. It points to a `FirmwareState`
@@ -325,13 +327,27 @@ impl HandleEntry {
 
 /// Timer delay type matching UEFI TimerDelay enum
 #[derive(Clone, Copy, PartialEq, Eq)]
+#[repr(u32)]
 pub enum TimerType {
     /// Timer is cancelled
-    Cancel,
+    Cancel = 0,
     /// Timer fires repeatedly every trigger_time
-    Periodic,
+    Periodic = 1,
     /// Timer fires once after trigger_time
-    Relative,
+    Relative = 2,
+}
+
+impl TryFrom<u32> for TimerType {
+    type Error = u32;
+
+    fn try_from(value: u32) -> Result<Self, Self::Error> {
+        match value {
+            0 => Ok(TimerType::Cancel),
+            1 => Ok(TimerType::Periodic),
+            2 => Ok(TimerType::Relative),
+            other => Err(other),
+        }
+    }
 }
 
 /// Event entry for tracking created events
@@ -975,8 +991,8 @@ impl InputState {
 pub struct FilesystemState {
     /// First LBA of the partition (in device blocks)
     pub partition_start: u64,
-    /// FAT type (12, 16, or 32)
-    pub fat_type: u8,
+    /// FAT type
+    pub fat_type: FatType,
     /// Bytes per sector (FAT's logical sector size)
     pub bytes_per_sector: u16,
     /// Device block size (physical block size, may differ from bytes_per_sector)
@@ -1001,7 +1017,7 @@ impl FilesystemState {
     pub const fn empty() -> Self {
         Self {
             partition_start: 0,
-            fat_type: 0,
+            fat_type: FatType::Fat12,
             bytes_per_sector: 0,
             device_block_size: 0,
             sectors_per_cluster: 0,

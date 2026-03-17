@@ -1010,28 +1010,7 @@ pub(crate) fn store_device_globally(device_type: &menu::DeviceType) -> bool {
     }
 }
 
-/// Convert a menu device type to a storage type for BlockIO registration.
-fn storage_type_from(device_type: &menu::DeviceType) -> drivers::storage::StorageType {
-    use drivers::storage::StorageType;
-    match *device_type {
-        menu::DeviceType::Nvme {
-            controller_id,
-            nsid,
-        } => StorageType::Nvme {
-            controller_id,
-            nsid,
-        },
-        menu::DeviceType::Ahci {
-            controller_id,
-            port,
-        } => StorageType::Ahci {
-            controller_id,
-            port,
-        },
-        menu::DeviceType::Usb { .. } => StorageType::Usb { slot_id: 0 },
-        menu::DeviceType::Sdhci { controller_id } => StorageType::Sdhci { controller_id },
-    }
-}
+
 
 /// Create a block device from a device type and call the provided closure with it.
 ///
@@ -1099,7 +1078,7 @@ fn boot_uefi_entry(entry: &menu::BootEntry) {
     let phase1_ok = with_disk(&entry.device_type, |disk| {
         let info = disk.info();
         let storage_id = match storage::register_device(
-            storage_type_from(&entry.device_type),
+            entry.device_type,
             info.num_blocks,
             info.block_size,
         ) {

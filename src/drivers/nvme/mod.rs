@@ -5,9 +5,9 @@
 
 use crate::drivers::pci::{self, PciAddress, PciDevice};
 use crate::efi;
-use crate::time::{Timeout, wait_for};
+use crate::time::{wait_for, Timeout};
 use core::ptr;
-use core::sync::atomic::{Ordering, fence};
+use core::sync::atomic::{fence, Ordering};
 use spin::Mutex;
 use tock_registers::interfaces::{ReadWriteable, Readable, Writeable};
 use tock_registers::register_bitfields;
@@ -1166,18 +1166,9 @@ impl NvmeController {
     }
 }
 
-/// Wrapper for NVMe controller pointer to implement Send
-struct NvmeControllerPtr(*mut NvmeController);
-
-// SAFETY: NvmeControllerPtr wraps a pointer to an NvmeController allocated via the EFI
-// page allocator. The pointer remains valid for the firmware's lifetime and all access
-// is protected by the NVME_CONTROLLERS mutex. The firmware runs single-threaded with
-// interrupts disabled during NVMe operations.
-unsafe impl Send for NvmeControllerPtr {}
-
-/// Global list of NVMe controllers
-static NVME_CONTROLLERS: Mutex<heapless::Vec<NvmeControllerPtr, 4>> =
-    Mutex::new(heapless::Vec::new());
+/// Registry of initialized NVMe controllers
+static NVME_CONTROLLERS: super::ControllerRegistry<NvmeController, 4> =
+    super::ControllerRegistry::new("NVMe");
 
 /// Initialize a single NVMe controller from a PCI device
 ///
@@ -1193,47 +1184,17 @@ pub fn init_device(dev: &pci::PciDevice) -> Result<(), ()> {
         dev.device_id
     );
 
-    match NvmeController::new(dev) {
-        Ok(controller) => {
-            let size = core::mem::size_of::<NvmeController>();
-            let pages = size.div_ceil(4096);
-            log::debug!(
-                "NVMe: Allocating {} pages ({} bytes) for NvmeController",
-                pages,
-                size
-            );
-            let controller_mem = efi::allocate_pages(pages as u64);
-            if let Some(mem) = controller_mem {
-                let controller_box = mem.as_mut_ptr() as *mut NvmeController;
-                unsafe {
-                    ptr::write(controller_box, controller);
-                }
-                let mut controllers = NVME_CONTROLLERS.lock();
-                if controllers.push(NvmeControllerPtr(controller_box)).is_err() {
-                    log::warn!(
-                        "NVMe: Failed to register controller at {} - controller list full",
-                        dev.address
-                    );
-                    // Free the allocated pages to avoid a leak
-                    efi::free_pages(mem, pages as u64);
-                    return Err(());
-                }
-                log::info!("NVMe controller at {} initialized", dev.address);
-                Ok(())
-            } else {
-                log::error!("NVMe: Failed to allocate memory for controller");
-                Err(())
-            }
-        }
-        Err(e) => {
-            log::error!(
-                "Failed to initialize NVMe controller at {}: {:?}",
-                dev.address,
-                e
-            );
-            Err(())
-        }
-    }
+    let controller = NvmeController::new(dev).map_err(|e| {
+        log::error!(
+            "Failed to initialize NVMe controller at {}: {:?}",
+            dev.address,
+            e
+        );
+    })?;
+
+    NVME_CONTROLLERS.register(controller)?;
+    log::info!("NVMe controller at {} initialized", dev.address);
+    Ok(())
 }
 
 /// Shutdown all NVMe controllers
@@ -1241,14 +1202,7 @@ pub fn init_device(dev: &pci::PciDevice) -> Result<(), ()> {
 /// Called during ExitBootServices to prepare for OS handoff.
 /// Currently a placeholder — the OS will reset controllers during its own init.
 pub fn shutdown() {
-    let controllers = NVME_CONTROLLERS.lock();
-    if controllers.is_empty() {
-        return;
-    }
-    log::info!(
-        "NVMe: {} controllers ready for OS handoff",
-        controllers.len()
-    );
+    NVME_CONTROLLERS.shutdown_log();
 }
 
 /// Initialize NVMe controllers (legacy entry point)
@@ -1269,10 +1223,9 @@ pub fn init() {
         let _ = init_device(dev);
     }
 
-    let controllers = NVME_CONTROLLERS.lock();
     log::info!(
         "NVMe initialization complete: {} controllers",
-        controllers.len()
+        NVME_CONTROLLERS.count()
     );
 }
 
@@ -1288,8 +1241,7 @@ pub fn init() {
 /// and must not hold the reference across calls that may also access
 /// the same controller.
 pub fn get_controller(index: usize) -> Option<*mut NvmeController> {
-    let controllers = NVME_CONTROLLERS.lock();
-    controllers.get(index).map(|ptr| ptr.0)
+    NVME_CONTROLLERS.get(index)
 }
 
 // SAFETY: NvmeController contains raw pointers to MMIO registers and DMA buffers.

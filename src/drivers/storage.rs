@@ -6,17 +6,35 @@
 /// Maximum number of storage devices we can track
 const MAX_STORAGE_DEVICES: usize = 8;
 
-/// Storage device type
-#[derive(Clone, Copy, Debug, PartialEq)]
+/// Storage device type and instance identifier
+///
+/// This is the canonical enum for identifying a specific storage device across
+/// the entire codebase: menu, boot, storage registry, and EFI protocols.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StorageType {
-    /// USB Mass Storage
-    Usb { slot_id: u8 },
-    /// NVMe
+    /// NVMe SSD
     Nvme { controller_id: usize, nsid: u32 },
-    /// AHCI/SATA
+    /// AHCI/SATA disk
     Ahci { controller_id: usize, port: usize },
+    /// USB mass storage
+    Usb {
+        controller_id: usize,
+        device_addr: u8,
+    },
     /// SDHCI (SD Card)
     Sdhci { controller_id: usize },
+}
+
+impl StorageType {
+    /// Get a short description of the device type
+    pub fn description(&self) -> &'static str {
+        match self {
+            StorageType::Nvme { .. } => "NVMe",
+            StorageType::Ahci { .. } => "SATA",
+            StorageType::Usb { .. } => "USB",
+            StorageType::Sdhci { .. } => "SD",
+        }
+    }
 }
 
 /// Storage device information
@@ -95,7 +113,7 @@ pub fn read_sectors(device_id: u32, lba: u64, buffer: &mut [u8]) -> Result<(), (
     let device = get_device(device_id).ok_or(())?;
 
     match device.device_type {
-        StorageType::Usb { slot_id: _ } => {
+        StorageType::Usb { .. } => {
             // TODO: USB mass storage currently only supports a single global device.
             // A per-device registry (similar to NVMe/AHCI) is needed to support
             // multiple USB storage devices simultaneously.

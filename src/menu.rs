@@ -18,6 +18,7 @@
 use crate::coreboot;
 use crate::drivers::block::BlockDevice;
 use crate::drivers::serial as serial_driver;
+use crate::drivers::storage::StorageType;
 use crate::framebuffer_console::{
     Color, DEFAULT_BG, DEFAULT_FG, FramebufferConsole, HIGHLIGHT_BG, HIGHLIGHT_FG, TITLE_COLOR,
 };
@@ -46,21 +47,8 @@ const MENU_TITLE: &str = "CrabEFI Boot Menu";
 const HELP_TEXT: &str =
     "Arrows: Select | Enter: Boot | F: Firmware | C: Cmdline | S: Secure Boot | R: Reset";
 
-/// Storage device type
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DeviceType {
-    /// NVMe SSD
-    Nvme { controller_id: usize, nsid: u32 },
-    /// AHCI/SATA disk
-    Ahci { controller_id: usize, port: usize },
-    /// USB mass storage (any controller type)
-    Usb {
-        controller_id: usize,
-        device_addr: u8,
-    },
-    /// SDHCI (SD card)
-    Sdhci { controller_id: usize },
-}
+/// Re-export storage device type for backward compatibility
+pub type DeviceType = StorageType;
 
 /// Boot entry kind - how this entry should be booted
 #[derive(Debug, Clone, Default)]
@@ -126,17 +114,7 @@ impl BootCategory {
     }
 }
 
-impl DeviceType {
-    /// Get a short description of the device type
-    pub fn description(&self) -> &'static str {
-        match self {
-            DeviceType::Nvme { .. } => "NVMe",
-            DeviceType::Ahci { .. } => "SATA",
-            DeviceType::Usb { .. } => "USB",
-            DeviceType::Sdhci { .. } => "SD",
-        }
-    }
-}
+
 
 /// A boot entry discovered on storage media
 #[derive(Debug, Clone)]

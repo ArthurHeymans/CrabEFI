@@ -14,7 +14,7 @@ use spin::Mutex;
 use zerocopy::FromBytes;
 
 use crate::drivers::block::{AnyBlockDevice, BlockDevice};
-use crate::fs::fat::{DirectoryEntry, FatFilesystem, FatType};
+use crate::fs::fat::{DirectoryEntry, FatFilesystem};
 use crate::state;
 
 // Re-export FilesystemState for backward compatibility with lib.rs
@@ -122,11 +122,7 @@ pub fn init(block_device: AnyBlockDevice, partition_start: u64) -> *mut efi_sfs:
             let root_cluster = fat.root_cluster();
             FilesystemState {
                 partition_start,
-                fat_type: match fat_type {
-                    FatType::Fat12 => 12,
-                    FatType::Fat16 => 16,
-                    FatType::Fat32 => 32,
-                },
+                fat_type,
                 bytes_per_sector: 512, // Standard FAT sector size
                 device_block_size,
                 sectors_per_cluster: 0, // Not needed anymore
@@ -767,9 +763,7 @@ fn normalize_path(path: &mut [u8; MAX_PATH_LEN], len: usize) -> usize {
     // Simple normalization - just remove leading slash for FAT lookup
     let start = if len > 0 && path[0] == b'/' { 1 } else { 0 };
     if start > 0 {
-        for i in start..=len {
-            path[i - start] = path[i];
-        }
+        path.copy_within(start..=len, 0);
         len - start
     } else {
         len

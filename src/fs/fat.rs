@@ -232,39 +232,15 @@ impl LfnEntry {
     /// Extract the 13 UTF-16 characters from this entry into a buffer
     /// Returns the number of valid characters (may be less than 13 if null-terminated)
     fn extract_chars(&self, out: &mut [u16; 13]) -> usize {
-        let mut count = 0;
-
-        // Characters 1-5 from name1
-        for i in 0..5 {
-            let ch = u16::from_le_bytes([self.name1[i * 2], self.name1[i * 2 + 1]]);
-            if ch == 0x0000 || ch == 0xFFFF {
-                return count;
-            }
-            out[count] = ch;
-            count += 1;
-        }
-
-        // Characters 6-11 from name2
-        for i in 0..6 {
-            let ch = u16::from_le_bytes([self.name2[i * 2], self.name2[i * 2 + 1]]);
-            if ch == 0x0000 || ch == 0xFFFF {
-                return count;
-            }
-            out[count] = ch;
-            count += 1;
-        }
-
-        // Characters 12-13 from name3
-        for i in 0..2 {
-            let ch = u16::from_le_bytes([self.name3[i * 2], self.name3[i * 2 + 1]]);
-            if ch == 0x0000 || ch == 0xFFFF {
-                return count;
-            }
-            out[count] = ch;
-            count += 1;
-        }
-
-        count
+        self.name1
+            .chunks_exact(2)
+            .chain(self.name2.chunks_exact(2))
+            .chain(self.name3.chunks_exact(2))
+            .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+            .take_while(|&ch| ch != 0x0000 && ch != 0xFFFF)
+            .zip(out.iter_mut())
+            .map(|(ch, slot)| *slot = ch)
+            .count()
     }
 }
 
@@ -392,6 +368,22 @@ pub enum FatError {
     InvalidCluster,
     /// Buffer too small
     BufferTooSmall,
+}
+
+impl core::fmt::Display for FatError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            FatError::InvalidBpb => write!(f, "invalid BPB"),
+            FatError::ReadError => write!(f, "read error"),
+            FatError::NotFat => write!(f, "not a FAT filesystem"),
+            FatError::NotFound => write!(f, "file not found"),
+            FatError::NotAFile => write!(f, "not a file"),
+            FatError::NotADirectory => write!(f, "not a directory"),
+            FatError::EndOfFile => write!(f, "end of file"),
+            FatError::InvalidCluster => write!(f, "invalid cluster"),
+            FatError::BufferTooSmall => write!(f, "buffer too small"),
+        }
+    }
 }
 
 /// FAT filesystem instance

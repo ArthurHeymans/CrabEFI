@@ -21,6 +21,22 @@ pub enum MemoryType {
     Table = 16,
 }
 
+impl TryFrom<u32> for MemoryType {
+    type Error = u32;
+
+    fn try_from(value: u32) -> Result<Self, Self::Error> {
+        match value {
+            1 => Ok(MemoryType::Ram),
+            2 => Ok(MemoryType::Reserved),
+            3 => Ok(MemoryType::AcpiReclaimable),
+            4 => Ok(MemoryType::AcpiNvs),
+            5 => Ok(MemoryType::Unusable),
+            16 => Ok(MemoryType::Table),
+            other => Err(other),
+        }
+    }
+}
+
 /// A memory region descriptor
 #[derive(Debug, Clone, Copy)]
 pub struct MemoryRegion {
