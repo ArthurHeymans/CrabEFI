@@ -940,7 +940,7 @@ pub fn show_menu(menu: &mut BootMenu) -> Option<usize> {
     let mut fb_console = fb_info.as_ref().map(FramebufferConsole::new);
 
     // Clear screen
-    clear_screen(&mut fb_console);
+    menu_common::clear_screen(&mut fb_console);
 
     // Initial display
     draw_menu(menu, &mut fb_console);
@@ -968,7 +968,7 @@ pub fn show_menu(menu: &mut BootMenu) -> Option<usize> {
         }
 
         // Check for keypress
-        if let Some(key) = read_key() {
+        if let Some(key) = menu_common::read_key() {
             // Any key resets the timeout
             remaining_seconds = menu.timeout_seconds;
 
@@ -1008,14 +1008,14 @@ pub fn show_menu(menu: &mut BootMenu) -> Option<usize> {
                     // Open Secure Boot settings menu
                     crate::secure_boot_menu::show_secure_boot_menu();
                     // Redraw boot menu after returning
-                    clear_screen(&mut fb_console);
+                    menu_common::clear_screen(&mut fb_console);
                     draw_menu(menu, &mut fb_console);
                 }
                 KeyPress::Char('f') | KeyPress::Char('F') => {
                     // Open Firmware Settings menu (CFR)
                     crate::cfr_menu::show_cfr_menu();
                     // Redraw boot menu after returning
-                    clear_screen(&mut fb_console);
+                    menu_common::clear_screen(&mut fb_console);
                     draw_menu(menu, &mut fb_console);
                 }
                 KeyPress::Char('r') | KeyPress::Char('R') => {
@@ -1035,7 +1035,7 @@ pub fn show_menu(menu: &mut BootMenu) -> Option<usize> {
                                     let _ = msg.push_str("Booting ");
                                     let _ = msg.push_str(&entry.name);
                                     let _ = msg.push_str("...");
-                                    clear_screen(&mut fb_console);
+                                    menu_common::clear_screen(&mut fb_console);
                                     draw_status(&msg, &mut fb_console);
                                     return Some(menu.selected);
                                 }
@@ -1052,7 +1052,7 @@ pub fn show_menu(menu: &mut BootMenu) -> Option<usize> {
                     }
                     // Redraw menu after editing (unless we're booting)
                     delay_ms(500);
-                    clear_screen(&mut fb_console);
+                    menu_common::clear_screen(&mut fb_console);
                     draw_menu(menu, &mut fb_console);
                 }
                 KeyPress::Char(c) if c.is_ascii_digit() => {
@@ -1073,14 +1073,6 @@ pub fn show_menu(menu: &mut BootMenu) -> Option<usize> {
 }
 
 use crate::menu_common::{self, KeyPress, SerialWriter};
-
-fn read_key() -> Option<KeyPress> {
-    menu_common::read_key()
-}
-
-fn clear_screen(fb_console: &mut Option<FramebufferConsole>) {
-    menu_common::clear_screen(fb_console);
-}
 
 /// Draw the menu on both outputs
 fn draw_menu(menu: &BootMenu, fb_console: &mut Option<FramebufferConsole>) {
@@ -1234,25 +1226,7 @@ fn draw_entry(
 
 /// Draw the help text
 fn draw_help(row: usize, fb_console: &mut Option<FramebufferConsole>, cols: usize) {
-    // Serial output
-    let ansi_row = row + 1;
-    let _ = write!(SerialWriter, "\x1b[{};1H", ansi_row);
-    serial_driver::write_str("\x1b[36m"); // Cyan
-
-    // Center help text
-    let help_pad = (cols.saturating_sub(HELP_TEXT.len())) / 2;
-    for _ in 0..help_pad {
-        serial_driver::write_str(" ");
-    }
-    serial_driver::write_str(HELP_TEXT);
-    serial_driver::write_str("\x1b[0m\r\n");
-
-    // Framebuffer output
-    if let Some(console) = fb_console {
-        console.set_fg_color(Color::new(0, 192, 192)); // Cyan
-        console.write_centered(row as u32, HELP_TEXT);
-        console.reset_colors();
-    }
+    menu_common::draw_help(row, HELP_TEXT, fb_console, cols);
 }
 
 /// Draw the countdown timer
@@ -1280,22 +1254,14 @@ fn draw_countdown(seconds: u32, fb_console: &mut Option<FramebufferConsole>) {
     }
 }
 
-/// Draw a status message
+/// Draw a status message (always red — used for errors)
 fn draw_status(message: &str, fb_console: &mut Option<FramebufferConsole>) {
-    // Serial output
-    serial_driver::write_str("\x1b[22;1H"); // Row 22
-    serial_driver::write_str("\x1b[31m"); // Red
-    serial_driver::write_str(message);
-    serial_driver::write_str("\x1b[K"); // Clear rest of line
-    serial_driver::write_str("\x1b[0m");
-
-    // Framebuffer output
-    if let Some(console) = fb_console {
-        let row = console.rows().saturating_sub(1);
-        console.set_fg_color(Color::new(255, 0, 0)); // Red
-        console.write_centered(row, message);
-        console.reset_colors();
-    }
+    let row = fb_console
+        .as_ref()
+        .map(|c| c.rows() as usize)
+        .unwrap_or(25)
+        .saturating_sub(1);
+    menu_common::draw_status_message(row, message, false, fb_console);
 }
 
 /// Result of command line editing
@@ -1359,7 +1325,7 @@ fn edit_cmdline(entry: &mut BootEntry, fb_console: &mut Option<FramebufferConsol
         }
 
         // Wait for input
-        if let Some(key) = read_key() {
+        if let Some(key) = menu_common::read_key() {
             match key {
                 KeyPress::Enter => {
                     // Confirm - update the cmdline
