@@ -23,6 +23,7 @@ pub mod ehci_regs;
 pub mod hid_keyboard;
 pub mod mass_storage;
 pub mod ohci;
+pub mod ohci_regs;
 #[cfg(target_arch = "x86_64")]
 pub mod uhci;
 pub mod xhci;
