@@ -1126,9 +1126,7 @@ extern "efiapi" fn load_image(
     // Use the device handle from loading if we loaded from device path,
     // otherwise try to get it from the parent
     let device_handle = match &source {
-        ImageSource::DevicePath {
-            device_handle, ..
-        } => *device_handle,
+        ImageSource::DevicePath { device_handle, .. } => *device_handle,
         _ => image_loader::get_device_handle_from_parent(parent_image_handle),
     };
 

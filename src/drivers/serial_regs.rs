@@ -349,4 +349,9 @@ pub mod pl011 {
         /// Interrupt Clear Register (0x44)
         pub icr: WriteOnly<u32>,
     }
+
+    // Safety: Pl011Registers is only accessed through a static reference obtained
+    // from a fixed MMIO address. The hardware registers are inherently shared and
+    // volatile access is handled by tock-registers internally.
+    unsafe impl Sync for Pl011Registers {}
 }

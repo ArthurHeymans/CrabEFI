@@ -532,8 +532,6 @@ pub(crate) fn store_device_globally(device_type: &menu::DeviceType) -> bool {
     }
 }
 
-
-
 /// Create a block device from a device type and call the provided closure with it.
 ///
 /// This centralizes the per-device-type controller acquisition and disk creation

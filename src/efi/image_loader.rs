@@ -342,8 +342,7 @@ unsafe fn count_device_path_prefix_nodes(dp: *const DevicePathProtocol) -> usize
                 break;
             }
             // Stop at File Path node (that's the file-specific part, not device identity)
-            if node_type == DEVICE_PATH_TYPE_MEDIA
-                && node_subtype == DEVICE_PATH_SUBTYPE_FILE_PATH
+            if node_type == DEVICE_PATH_TYPE_MEDIA && node_subtype == DEVICE_PATH_SUBTYPE_FILE_PATH
             {
                 break;
             }

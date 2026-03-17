@@ -114,8 +114,6 @@ impl BootCategory {
     }
 }
 
-
-
 /// A boot entry discovered on storage media
 #[derive(Debug, Clone)]
 pub struct BootEntry {

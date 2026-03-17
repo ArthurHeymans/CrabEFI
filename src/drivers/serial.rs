@@ -15,7 +15,7 @@ use tock_registers::interfaces::{Readable, Writeable};
 #[cfg(target_arch = "aarch64")]
 use super::serial_regs::pl011::{self, FR};
 #[cfg(target_arch = "x86_64")]
-use super::serial_regs::uart16550::{self, Uart16550Regs, FCR, LCR, MCR};
+use super::serial_regs::uart16550::{self, FCR, LCR, MCR, Uart16550Regs};
 
 /// Maximum iterations to wait for TX ready (prevents infinite loop on missing hardware)
 const TX_TIMEOUT_ITERATIONS: u32 = 100_000;

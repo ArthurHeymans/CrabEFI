@@ -513,17 +513,14 @@ fn boot_uefi_entry(entry: &menu::BootEntry) {
 
     let phase1_ok = crate::with_disk(&entry.device_type, |disk| {
         let info = disk.info();
-        let storage_id = match storage::register_device(
-            entry.device_type,
-            info.num_blocks,
-            info.block_size,
-        ) {
-            Some(id) => id,
-            None => {
-                log::error!("Failed to register device");
-                return false;
-            }
-        };
+        let storage_id =
+            match storage::register_device(entry.device_type, info.num_blocks, info.block_size) {
+                Some(id) => id,
+                None => {
+                    log::error!("Failed to register device");
+                    return false;
+                }
+            };
         let _ = boot::install_block_io_protocols(
             disk,
             storage_id,

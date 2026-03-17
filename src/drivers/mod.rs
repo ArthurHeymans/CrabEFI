@@ -93,14 +93,8 @@ impl<T, const N: usize> ControllerRegistry<T, N> {
         }
 
         let mut controllers = self.controllers.lock();
-        if controllers
-            .push(ControllerPtr(controller_box))
-            .is_err()
-        {
-            log::warn!(
-                "{}: controller list full — freeing allocation",
-                self.name
-            );
+        if controllers.push(ControllerPtr(controller_box)).is_err() {
+            log::warn!("{}: controller list full — freeing allocation", self.name);
             crate::efi::free_pages(mem, pages as u64);
             return Err(());
         }

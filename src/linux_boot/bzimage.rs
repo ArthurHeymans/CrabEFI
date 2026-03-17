@@ -6,7 +6,7 @@
 //!
 //! Reference: https://www.kernel.org/doc/html/latest/arch/x86/boot.html
 
-use super::params::{BootParams, SetupHeader, HEADER_OFFSET};
+use super::params::{BootParams, HEADER_OFFSET, SetupHeader};
 
 /// Errors that can occur during bzImage loading
 #[derive(Debug)]

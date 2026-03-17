@@ -5,9 +5,9 @@
 
 use crate::drivers::pci::{self, PciAddress, PciDevice};
 use crate::efi;
-use crate::time::{wait_for, Timeout};
+use crate::time::{Timeout, wait_for};
 use core::ptr;
-use core::sync::atomic::{fence, Ordering};
+use core::sync::atomic::{Ordering, fence};
 use spin::Mutex;
 use tock_registers::interfaces::{ReadWriteable, Readable, Writeable};
 use tock_registers::register_bitfields;
