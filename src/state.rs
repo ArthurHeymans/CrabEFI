@@ -40,6 +40,35 @@
 //! CrabEFI is single-threaded firmware. We use `UnsafeCell` for interior
 //! mutability without the overhead of `Mutex`. The UEFI spec guarantees
 //! that Boot Services are not reentrant.
+//!
+//! # Log-Path Contract
+//!
+//! Functions called from the `log` crate macros — serial output
+//! ([`crate::drivers::serial`]), cbmem console ([`crate::coreboot::cbmem_console`]),
+//! framebuffer logging ([`crate::fb_log`]), and the timestamp helper
+//! ([`crate::logger::get_timestamp_k`]) — must **never** create Rust
+//! references (`&` or `&mut`) into `FirmwareState`.
+//!
+//! This is necessary because `log::info!()` and friends may fire *inside*
+//! a `with_mut()` / `with_drivers_mut()` closure, which holds a live
+//! `&mut FirmwareState`.  Creating any `&FirmwareState` (e.g. via
+//! [`drivers()`] or [`try_get()`]) would alias with that `&mut` — UB
+//! under Rust's reference rules.
+//!
+//! Instead, log-path code uses **raw-pointer field access**:
+//!
+//! - **Writes**: `(*drivers_mut_ptr()).serial.driver` (serial, fb_log)
+//! - **Reads**: `(*drivers_mut_ptr()).timing.boot_counter` (timestamps),
+//!   `(*drivers_mut_ptr()).platform.cbmem_console_addr` (CBMEM console)
+//!
+//! Raw-pointer access is sound here because:
+//!
+//! 1. The firmware is single-threaded — no data races.
+//! 2. The log-path functions only touch their own disjoint fields
+//!    (e.g. `serial.driver`, `platform.cbmem_console_addr`,
+//!    `console.logger_*`, `timing.boot_counter`).
+//! 3. They never read or write fields that the enclosing `with_mut()`
+//!    closure is currently modifying.
 
 use core::sync::atomic::{AtomicPtr, Ordering};
 
@@ -566,9 +595,7 @@ use crate::drivers::pci::PciDevice;
 use crate::drivers::pci::access::AnyPciAccess;
 use crate::drivers::serial::AnySerial;
 use crate::drivers::storage::StorageRegistry;
-use crate::drivers::usb::hid_keyboard::UsbHidKeyboard;
 use crate::efi::protocols::serial_io::SerialIoMode;
-use crate::time::Timeout;
 use heapless::Vec as HeaplessVec;
 use r_efi::efi::Boolean;
 use r_efi::protocols::simple_text_output::Mode as SimpleTextOutputMode;
@@ -599,15 +626,6 @@ pub struct DriverState {
     /// Platform hardware info (from coreboot tables)
     pub platform: PlatformInfo,
 
-    /// PS/2 keyboard state (x86 only, but always present for layout stability)
-    pub keyboard: KeyboardState,
-
-    /// USB HID keyboard state
-    pub usb_keyboard: Option<UsbHidKeyboard>,
-
-    /// USB keyboard next poll timeout
-    pub usb_keyboard_poll_timeout: Option<Timeout>,
-
     /// Storage device registry (tracks all block devices)
     pub(crate) storage_registry: StorageRegistry,
 
@@ -622,9 +640,6 @@ impl DriverState {
             serial: SerialState::new(),
             timing: TimingState::new(),
             platform: PlatformInfo::new(),
-            keyboard: KeyboardState::new(),
-            usb_keyboard: None,
-            usb_keyboard_poll_timeout: None,
             storage_registry: StorageRegistry::new(),
             rng_available: false,
         }
@@ -674,8 +689,6 @@ impl Default for PciState {
 
 /// Serial port state: hardware driver and EFI protocol mode.
 pub struct SerialState {
-    /// I/O base address (from coreboot serial info)
-    pub port: Option<u16>,
     /// Active serial port driver (16550 UART or PL011)
     pub(crate) driver: Option<AnySerial>,
     /// EFI Serial IO protocol mode (current port settings).
@@ -693,7 +706,6 @@ impl SerialState {
         };
 
         Self {
-            port: None,
             driver: None,
             io_mode: SerialIoMode {
                 control_mask: EFI_SERIAL_CLEAR_TO_SEND
@@ -816,51 +828,6 @@ impl PlatformInfo {
 impl Default for PlatformInfo {
     fn default() -> Self {
         Self::new()
-    }
-}
-
-// ----------------------------------------------------------------------------
-// Keyboard State
-// ----------------------------------------------------------------------------
-
-/// PS/2 keyboard state
-pub struct KeyboardState {
-    /// Shift key pressed
-    pub shift_pressed: bool,
-    /// Control key pressed
-    pub ctrl_pressed: bool,
-    /// Alt key pressed
-    pub alt_pressed: bool,
-    /// Caps lock enabled
-    pub caps_lock: bool,
-    /// Key buffer for storing pending keys
-    pub key_buffer: [u8; 16],
-    /// Number of keys in buffer
-    pub key_count: usize,
-    /// Read position in buffer
-    pub read_pos: usize,
-    /// Write position in buffer
-    pub write_pos: usize,
-}
-
-impl Default for KeyboardState {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl KeyboardState {
-    pub const fn new() -> Self {
-        Self {
-            shift_pressed: false,
-            ctrl_pressed: false,
-            alt_pressed: false,
-            caps_lock: false,
-            key_buffer: [0; 16],
-            key_count: 0,
-            read_pos: 0,
-            write_pos: 0,
-        }
     }
 }
 

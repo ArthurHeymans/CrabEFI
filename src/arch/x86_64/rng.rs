@@ -88,9 +88,8 @@ fn test_rdrand() -> bool {
 /// Checks CPUID for RDRAND support and runs the broken RDRAND test.
 /// Must be called before `is_supported()` or `rdrand64()`.
 pub fn init() {
-    unsafe {
-        (*crate::state::drivers_mut_ptr()).rng_available = cpuid_has_rdrand() && test_rdrand();
-    }
+    let available = cpuid_has_rdrand() && test_rdrand();
+    crate::state::with_drivers_mut(|d| d.rng_available = available);
 
     if is_supported() {
         log::info!("RDRAND available (SP800-90 CTR-256)");
