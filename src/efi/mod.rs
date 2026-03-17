@@ -7,6 +7,7 @@ pub mod allocator;
 pub mod auth;
 pub mod boot_services;
 pub mod protocols;
+pub mod rtlog;
 pub mod runtime_services;
 pub mod system_table;
 pub mod utils;
