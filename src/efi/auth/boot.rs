@@ -126,10 +126,12 @@ pub fn init_secure_boot(config: &SecureBootConfig) -> Result<EnrollmentStatus, A
     Ok(enrollment::get_enrollment_status())
 }
 
-/// Load the SecureBootEnable preference from persistent storage
+/// Load the SecureBootEnable preference from persistent storage.
 ///
 /// Returns true if Secure Boot was previously enabled by the user.
-fn load_secure_boot_enable_preference() -> bool {
+/// Called during boot initialization and by
+/// `handle_secure_boot_variable_update()` when PK is enrolled at runtime.
+pub fn load_secure_boot_enable_preference() -> bool {
     use super::EFI_GLOBAL_VARIABLE_GUID;
     use super::variables::SECURE_BOOT_ENABLE_NAME;
 
