@@ -6,7 +6,7 @@
 //!
 //! Reference: https://www.kernel.org/doc/html/latest/arch/x86/boot.html
 
-use super::params::{BootParams, HEADER_OFFSET, SetupHeader};
+use super::params::{BootParams, SetupHeader, HEADER_OFFSET};
 
 /// Errors that can occur during bzImage loading
 #[derive(Debug)]
@@ -191,11 +191,15 @@ pub unsafe fn set_cmdline(cmdline: &str, addr: u32) -> Result<(), BzImageError> 
     let dst = addr as *mut u8;
     let bytes = cmdline.as_bytes();
 
-    // Copy command line
-    core::ptr::copy_nonoverlapping(bytes.as_ptr(), dst, bytes.len());
+    // SAFETY: Caller ensures the destination address is valid and writable,
+    // and that the address is in usable RAM.
+    unsafe {
+        // Copy command line
+        core::ptr::copy_nonoverlapping(bytes.as_ptr(), dst, bytes.len());
 
-    // Null terminate
-    *dst.add(bytes.len()) = 0;
+        // Null terminate
+        *dst.add(bytes.len()) = 0;
+    }
 
     log::debug!("Command line at {:#x}: {}", addr, cmdline);
 

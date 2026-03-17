@@ -480,13 +480,16 @@ fn create_fallback_memory_map(info: &mut CorebootInfo) {
 unsafe fn find_header(ptr: *const u8) -> Option<*const CbHeader> {
     let header = ptr as *const CbHeader;
 
-    // Check if this is a valid header
-    if (*header).signature == *b"LBIO" {
-        return Some(header);
-    }
+    // Safety: caller guarantees ptr points to valid coreboot tables.
+    unsafe {
+        // Check if this is a valid header
+        if (*header).signature == *b"LBIO" {
+            return Some(header);
+        }
 
-    // Try scanning from the given address
-    scan_for_header_at(ptr, 0x1000)
+        // Try scanning from the given address
+        scan_for_header_at(ptr, 0x1000)
+    }
 }
 
 /// Scan memory for coreboot header signature "LBIO"
@@ -497,30 +500,33 @@ unsafe fn scan_for_header() -> Option<*const CbHeader> {
     // 3. In the BIOS area (0xF0000 - 0xFFFFF)
     // 4. In high memory (where coreboot typically puts them)
 
-    // First, try low memory
-    // Use without_provenance instead of null to avoid UB with ptr::add on null
-    if let Some(header) = scan_for_header_at(core::ptr::without_provenance::<u8>(0), 0x1000) {
-        log::debug!("Found coreboot tables in low memory");
-        return Some(header);
-    }
-
-    // Try EBDA area (usually around 0x9F000)
-    if let Some(header) = scan_for_header_at(0x9F000 as *const u8, 0x1000) {
-        log::debug!("Found coreboot tables in EBDA area");
-        return Some(header);
-    }
-
-    // Try BIOS area
-    if let Some(header) = scan_for_header_at(0xF0000 as *const u8, 0x10000) {
-        log::debug!("Found coreboot tables in BIOS area");
-        return Some(header);
-    }
-
-    // Try common high memory locations
-    for base in &[0x7EE00000u64, 0x7FE00000u64, 0xCFF00000u64] {
-        if let Some(header) = scan_for_header_at(*base as *const u8, 0x100000) {
-            log::debug!("Found coreboot tables at {:#x}", *base);
+    // Safety: scanning known firmware memory regions for coreboot table signatures.
+    unsafe {
+        // First, try low memory
+        // Use without_provenance instead of null to avoid UB with ptr::add on null
+        if let Some(header) = scan_for_header_at(core::ptr::without_provenance::<u8>(0), 0x1000) {
+            log::debug!("Found coreboot tables in low memory");
             return Some(header);
+        }
+
+        // Try EBDA area (usually around 0x9F000)
+        if let Some(header) = scan_for_header_at(0x9F000 as *const u8, 0x1000) {
+            log::debug!("Found coreboot tables in EBDA area");
+            return Some(header);
+        }
+
+        // Try BIOS area
+        if let Some(header) = scan_for_header_at(0xF0000 as *const u8, 0x10000) {
+            log::debug!("Found coreboot tables in BIOS area");
+            return Some(header);
+        }
+
+        // Try common high memory locations
+        for base in &[0x7EE00000u64, 0x7FE00000u64, 0xCFF00000u64] {
+            if let Some(header) = scan_for_header_at(*base as *const u8, 0x100000) {
+                log::debug!("Found coreboot tables at {:#x}", *base);
+                return Some(header);
+            }
         }
     }
 
@@ -532,16 +538,19 @@ unsafe fn scan_for_header_at(base: *const u8, size: usize) -> Option<*const CbHe
     // Scan in 16-byte increments (coreboot header is aligned)
     let mut offset = 0;
     while offset < size {
-        let ptr = base.add(offset);
-        let header = ptr as *const CbHeader;
+        // Safety: caller guarantees the memory region [base, base+size) is readable.
+        unsafe {
+            let ptr = base.add(offset);
+            let header = ptr as *const CbHeader;
 
-        // Check for "LBIO" signature
-        // We need to be careful not to read from invalid memory
-        // Use a simple check that won't fault on most systems
-        let sig_ptr = ptr as *const [u8; 4];
-        if *sig_ptr == *b"LBIO" {
-            log::debug!("Found LBIO signature at {:p}", ptr);
-            return Some(header);
+            // Check for "LBIO" signature
+            // We need to be careful not to read from invalid memory
+            // Use a simple check that won't fault on most systems
+            let sig_ptr = ptr as *const [u8; 4];
+            if *sig_ptr == *b"LBIO" {
+                log::debug!("Found LBIO signature at {:p}", ptr);
+                return Some(header);
+            }
         }
 
         offset += 16;
@@ -756,48 +765,51 @@ fn parse_framebuffer(record_bytes: &[u8], info: &mut CorebootInfo) {
 /// # Safety
 /// `header` must point to a valid `CbHeader` with a verified `"LBIO"` signature.
 unsafe fn iterate_table_records(header: *const CbHeader, info: &mut CorebootInfo) {
-    let table_bytes = (*header).table_bytes;
-    let header_bytes = (*header).header_bytes;
-    let table_start = (header as *const u8).add(header_bytes as usize);
-    let mut offset = 0u32;
+    // Safety: caller guarantees header points to a valid CbHeader with verified "LBIO" signature.
+    unsafe {
+        let table_bytes = (*header).table_bytes;
+        let header_bytes = (*header).header_bytes;
+        let table_start = (header as *const u8).add(header_bytes as usize);
+        let mut offset = 0u32;
 
-    while offset < table_bytes {
-        let remaining = table_bytes - offset;
+        while offset < table_bytes {
+            let remaining = table_bytes - offset;
 
-        if remaining < 8 {
-            log::warn!("Truncated record header at offset {}", offset);
-            break;
+            if remaining < 8 {
+                log::warn!("Truncated record header at offset {}", offset);
+                break;
+            }
+
+            let record_ptr = table_start.add(offset as usize);
+
+            // Read record header to get size
+            let record_header_bytes = core::slice::from_raw_parts(record_ptr, 8);
+            let Ok((record_header, _)) = CbRecord::read_from_prefix(record_header_bytes) else {
+                log::warn!("Failed to parse record header");
+                break;
+            };
+            let record_size = record_header.size;
+
+            if record_size < 8 {
+                log::warn!("Invalid record size: {}", record_size);
+                break;
+            }
+
+            if record_size > remaining {
+                log::warn!(
+                    "Record size {} exceeds remaining table bytes {} at offset {}",
+                    record_size,
+                    remaining,
+                    offset
+                );
+                break;
+            }
+
+            let record_bytes = core::slice::from_raw_parts(record_ptr, record_size as usize);
+            parse_record(record_bytes, info);
+
+            offset += record_size;
         }
-
-        let record_ptr = table_start.add(offset as usize);
-
-        // Read record header to get size
-        let record_header_bytes = core::slice::from_raw_parts(record_ptr, 8);
-        let Ok((record_header, _)) = CbRecord::read_from_prefix(record_header_bytes) else {
-            log::warn!("Failed to parse record header");
-            break;
-        };
-        let record_size = record_header.size;
-
-        if record_size < 8 {
-            log::warn!("Invalid record size: {}", record_size);
-            break;
-        }
-
-        if record_size > remaining {
-            log::warn!(
-                "Record size {} exceeds remaining table bytes {} at offset {}",
-                record_size,
-                remaining,
-                offset
-            );
-            break;
-        }
-
-        let record_bytes = core::slice::from_raw_parts(record_ptr, record_size as usize);
-        parse_record(record_bytes, info);
-
-        offset += record_size;
     }
 }
 
@@ -817,29 +829,31 @@ unsafe fn parse_forward(record_bytes: &[u8], info: &mut CorebootInfo) {
 
     log::debug!("Following forward pointer to {:#x}", forward_addr);
 
-    // Parse the forwarded table directly into info (no recursion)
-    // Safety: We trust the forward pointer from coreboot tables
-    let header = match find_header(new_ptr) {
-        Some(h) => h,
-        None => {
-            log::warn!("Could not find coreboot header at forwarded location");
+    // Safety: We trust the forward pointer from coreboot tables.
+    unsafe {
+        // Parse the forwarded table directly into info (no recursion)
+        let header = match find_header(new_ptr) {
+            Some(h) => h,
+            None => {
+                log::warn!("Could not find coreboot header at forwarded location");
+                return;
+            }
+        };
+
+        // Verify signature "LBIO"
+        if &(*header).signature != b"LBIO" {
+            log::warn!("Invalid coreboot header signature at forwarded location");
             return;
         }
-    };
 
-    // Verify signature "LBIO"
-    if &(*header).signature != b"LBIO" {
-        log::warn!("Invalid coreboot header signature at forwarded location");
-        return;
+        let table_bytes = (*header).table_bytes;
+        log::debug!(
+            "Found forwarded coreboot header: {} bytes of tables",
+            table_bytes
+        );
+
+        iterate_table_records(header, info);
     }
-
-    let table_bytes = (*header).table_bytes;
-    log::debug!(
-        "Found forwarded coreboot header: {} bytes of tables",
-        table_bytes
-    );
-
-    iterate_table_records(header, info);
 }
 
 /// Parse ACPI RSDP pointer

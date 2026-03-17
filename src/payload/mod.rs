@@ -214,7 +214,9 @@ pub unsafe fn chainload_payload(
 
     static PAYLOAD_BUFFER: SyncBuffer = SyncBuffer(UnsafeCell::new([0; MAX_PAYLOAD_SIZE]));
 
-    let buffer = &mut (&mut *PAYLOAD_BUFFER.0.get())[..entry.size as usize];
+    // Safety: this function is only called once during chainloading and
+    // never returns, so no aliased references to the buffer exist.
+    let buffer = unsafe { &mut (&mut *PAYLOAD_BUFFER.0.get())[..entry.size as usize] };
 
     // Read payload file
     let bytes_read = fs
@@ -229,13 +231,15 @@ pub unsafe fn chainload_payload(
     let entry_point = match entry.format {
         PayloadFormat::Elf => {
             let elf = Elf64::parse(buffer)?;
-            elf.load(buffer)?;
+            // Safety: caller guarantees load addresses are valid writable memory.
+            unsafe { elf.load(buffer)? };
             elf.entry_point()
         }
         PayloadFormat::FlatBinary { load_addr } => {
             // Copy flat binary to load address
             let dst = load_addr as *mut u8;
-            core::ptr::copy_nonoverlapping(buffer.as_ptr(), dst, bytes_read);
+            // Safety: caller guarantees load_addr points to valid writable memory.
+            unsafe { core::ptr::copy_nonoverlapping(buffer.as_ptr(), dst, bytes_read) };
             load_addr
         }
     };
@@ -243,7 +247,8 @@ pub unsafe fn chainload_payload(
     log::info!("Jumping to payload at {:#x}", entry_point);
 
     // Jump to payload
-    jump_to_payload(entry_point, cbtable_ptr)
+    // Safety: payload has been loaded and entry_point is valid.
+    unsafe { jump_to_payload(entry_point, cbtable_ptr) }
 }
 
 /// Jump to a loaded payload
@@ -258,7 +263,8 @@ pub unsafe fn chainload_payload(
 /// The payload must be loaded at the entry address and be valid.
 unsafe fn jump_to_payload(entry: u64, cbtable: *const u8) -> ! {
     #[cfg(target_arch = "x86_64")]
-    {
+    // Safety: caller guarantees payload is loaded and entry is valid.
+    unsafe {
         // Disable interrupts
         core::arch::asm!("cli");
 
@@ -281,7 +287,8 @@ unsafe fn jump_to_payload(entry: u64, cbtable: *const u8) -> ! {
     }
 
     #[cfg(target_arch = "aarch64")]
-    {
+    // Safety: caller guarantees payload is loaded and entry is valid.
+    unsafe {
         // Pass coreboot table pointer in x0 (AArch64 calling convention)
         core::arch::asm!(
             "mov x0, {cbtable}",

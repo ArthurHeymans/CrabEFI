@@ -247,14 +247,21 @@ impl Elf64 {
                 if src_offset + src_size > data.len() {
                     return Err(ElfError::InvalidProgramHeader);
                 }
-                core::ptr::copy_nonoverlapping(data.as_ptr().add(src_offset), dst, src_size);
+                // Safety: caller guarantees dst points to valid writable memory
+                // and src_offset + src_size is within data bounds (checked above).
+                unsafe {
+                    core::ptr::copy_nonoverlapping(data.as_ptr().add(src_offset), dst, src_size);
+                }
             }
 
             // Zero BSS (mem_size > file_size)
             if mem_size > src_size {
-                let bss_start = dst.add(src_size);
-                let bss_size = mem_size - src_size;
-                core::ptr::write_bytes(bss_start, 0, bss_size);
+                // Safety: caller guarantees dst + mem_size is within valid writable memory.
+                unsafe {
+                    let bss_start = dst.add(src_size);
+                    let bss_size = mem_size - src_size;
+                    core::ptr::write_bytes(bss_start, 0, bss_size);
+                }
             }
 
             log::debug!(

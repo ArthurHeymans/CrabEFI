@@ -46,7 +46,7 @@ impl FramebufferInfo {
     ///
     /// The framebuffer must be identity-mapped and accessible.
     pub unsafe fn as_slice_mut(&mut self) -> &mut [u8] {
-        core::slice::from_raw_parts_mut(self.as_ptr(), self.size() as usize)
+        unsafe { core::slice::from_raw_parts_mut(self.as_ptr(), self.size() as usize) }
     }
 
     /// Calculate the byte offset for a pixel at (x, y)
@@ -67,36 +67,39 @@ impl FramebufferInfo {
         let offset = self.pixel_offset(x, y);
         let fb = self.as_ptr();
 
-        match self.bits_per_pixel {
-            32 => {
-                // BGRA or RGBA format
-                let pixel = self.encode_pixel_32(r, g, b);
-                let ptr = fb.add(offset) as *mut u32;
-                ptr.write_volatile(pixel);
-            }
-            24 => {
-                // BGR or RGB format
-                let ptr = fb.add(offset);
-                if self.blue_mask_pos < self.red_mask_pos {
-                    // BGR
-                    ptr.write_volatile(b);
-                    ptr.add(1).write_volatile(g);
-                    ptr.add(2).write_volatile(r);
-                } else {
-                    // RGB
-                    ptr.write_volatile(r);
-                    ptr.add(1).write_volatile(g);
-                    ptr.add(2).write_volatile(b);
+        // Safety: caller guarantees the framebuffer is accessible and (x, y) is in bounds.
+        unsafe {
+            match self.bits_per_pixel {
+                32 => {
+                    // BGRA or RGBA format
+                    let pixel = self.encode_pixel_32(r, g, b);
+                    let ptr = fb.add(offset) as *mut u32;
+                    ptr.write_volatile(pixel);
                 }
-            }
-            16 => {
-                // RGB565 or similar
-                let pixel = self.encode_pixel_16(r, g, b);
-                let ptr = fb.add(offset) as *mut u16;
-                ptr.write_volatile(pixel);
-            }
-            _ => {
-                // Unsupported format
+                24 => {
+                    // BGR or RGB format
+                    let ptr = fb.add(offset);
+                    if self.blue_mask_pos < self.red_mask_pos {
+                        // BGR
+                        ptr.write_volatile(b);
+                        ptr.add(1).write_volatile(g);
+                        ptr.add(2).write_volatile(r);
+                    } else {
+                        // RGB
+                        ptr.write_volatile(r);
+                        ptr.add(1).write_volatile(g);
+                        ptr.add(2).write_volatile(b);
+                    }
+                }
+                16 => {
+                    // RGB565 or similar
+                    let pixel = self.encode_pixel_16(r, g, b);
+                    let ptr = fb.add(offset) as *mut u16;
+                    ptr.write_volatile(pixel);
+                }
+                _ => {
+                    // Unsupported format
+                }
             }
         }
     }
@@ -125,28 +128,31 @@ impl FramebufferInfo {
     /// `dst` must point to `pixel_count * (bits_per_pixel/8)` writable bytes
     /// within the framebuffer.
     pub unsafe fn fill_pixels(&self, dst: *mut u8, pixel_count: usize, r: u8, g: u8, b: u8) {
-        match self.bits_per_pixel {
-            32 => {
-                let pixel = self.encode_pixel_32(r, g, b);
-                let ptr = dst as *mut u32;
-                for i in 0..pixel_count {
-                    ptr.add(i).write_volatile(pixel);
+        // Safety: caller guarantees dst points to writable framebuffer memory of sufficient size.
+        unsafe {
+            match self.bits_per_pixel {
+                32 => {
+                    let pixel = self.encode_pixel_32(r, g, b);
+                    let ptr = dst as *mut u32;
+                    for i in 0..pixel_count {
+                        ptr.add(i).write_volatile(pixel);
+                    }
                 }
-            }
-            16 => {
-                let pixel = self.encode_pixel_16(r, g, b);
-                let ptr = dst as *mut u16;
-                for i in 0..pixel_count {
-                    ptr.add(i).write_volatile(pixel);
+                16 => {
+                    let pixel = self.encode_pixel_16(r, g, b);
+                    let ptr = dst as *mut u16;
+                    for i in 0..pixel_count {
+                        ptr.add(i).write_volatile(pixel);
+                    }
                 }
-            }
-            _ => {
-                // Fallback: zero-fill
-                core::slice::from_raw_parts_mut(
-                    dst,
-                    pixel_count * (self.bits_per_pixel as usize / 8),
-                )
-                .fill(0);
+                _ => {
+                    // Fallback: zero-fill
+                    core::slice::from_raw_parts_mut(
+                        dst,
+                        pixel_count * (self.bits_per_pixel as usize / 8),
+                    )
+                    .fill(0);
+                }
             }
         }
     }
@@ -163,13 +169,15 @@ impl FramebufferInfo {
             == self.x_resolution as usize * (self.bits_per_pixel as usize / 8)
         {
             // Packed: fill entire buffer at once
-            self.fill_pixels(self.as_ptr(), total_pixels, r, g, b);
+            // Safety: caller guarantees the framebuffer is accessible.
+            unsafe { self.fill_pixels(self.as_ptr(), total_pixels, r, g, b) };
         } else {
             // Padded scanlines: fill each row
             for y in 0..self.y_resolution {
                 let offset = (y * self.bytes_per_line) as usize;
-                let dst = self.as_ptr().add(offset);
-                self.fill_pixels(dst, self.x_resolution as usize, r, g, b);
+                // Safety: caller guarantees the framebuffer is accessible.
+                let dst = unsafe { self.as_ptr().add(offset) };
+                unsafe { self.fill_pixels(dst, self.x_resolution as usize, r, g, b) };
             }
         }
     }
@@ -205,23 +213,26 @@ impl FramebufferInfo {
         let bpp = self.bits_per_pixel;
         let stride = self.bytes_per_line as usize;
 
-        match bpp {
-            32 => {
-                let pixel = self.encode_pixel_32(r, g, b);
-                // Fill each scanline without per-pixel bounds checks or bpp dispatch
-                for y in 0..self.y_resolution as usize {
-                    let row = fb.add(y * stride);
-                    for x in 0..self.x_resolution as usize {
-                        let ptr = row.add(x * 4) as *mut u32;
-                        ptr.write_volatile(pixel);
+        // Safety: caller guarantees the framebuffer is accessible.
+        unsafe {
+            match bpp {
+                32 => {
+                    let pixel = self.encode_pixel_32(r, g, b);
+                    // Fill each scanline without per-pixel bounds checks or bpp dispatch
+                    for y in 0..self.y_resolution as usize {
+                        let row = fb.add(y * stride);
+                        for x in 0..self.x_resolution as usize {
+                            let ptr = row.add(x * 4) as *mut u32;
+                            ptr.write_volatile(pixel);
+                        }
                     }
                 }
-            }
-            _ => {
-                // Fallback for 16bpp and 24bpp: per-pixel
-                for y in 0..self.y_resolution {
-                    for x in 0..self.x_resolution {
-                        self.write_pixel(x, y, r, g, b);
+                _ => {
+                    // Fallback for 16bpp and 24bpp: per-pixel
+                    for y in 0..self.y_resolution {
+                        for x in 0..self.x_resolution {
+                            self.write_pixel(x, y, r, g, b);
+                        }
                     }
                 }
             }

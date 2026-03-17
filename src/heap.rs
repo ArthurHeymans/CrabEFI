@@ -66,10 +66,14 @@ impl BumpAllocator {
     ///
     /// Must be called only once, before any allocations.
     unsafe fn init(&self, heap_start: usize, heap_size: usize) {
-        // Store the heap start address
-        *self.heap_start.get() = heap_start;
+        // SAFETY: Must be called only once, before any allocations.
+        // UnsafeCell access is safe because this is single-threaded initialization.
+        unsafe {
+            // Store the heap start address
+            *self.heap_start.get() = heap_start;
 
-        *self.heap_size.get() = heap_size;
+            *self.heap_size.get() = heap_size;
+        }
 
         // Reset the offset
         self.offset.store(0, Ordering::Release);
@@ -95,7 +99,8 @@ unsafe impl GlobalAlloc for BumpAllocator {
             return null_mut();
         }
 
-        let heap_start = *self.heap_start.get();
+        // SAFETY: heap_start is only written once during init, before any allocations.
+        let heap_start = unsafe { *self.heap_start.get() };
         let size = layout.size();
         let align = layout.align();
 
@@ -110,7 +115,7 @@ unsafe impl GlobalAlloc for BumpAllocator {
             let new_offset = current_offset + padding + size;
 
             // Check if we have enough space
-            // Safety: heap_size is only written once during init, before any allocations
+            // SAFETY: heap_size is only written once during init, before any allocations
             let heap_size = unsafe { *self.heap_size.get() };
             if new_offset > heap_size {
                 log::error!(
@@ -155,7 +160,7 @@ static ALLOCATOR: BumpAllocator = BumpAllocator::new();
 ///
 /// `true` if initialization succeeded, `false` otherwise.
 pub fn init() -> bool {
-    use crate::efi::allocator::{AllocateType, MemoryType, allocate_pages};
+    use crate::efi::allocator::{allocate_pages, AllocateType, MemoryType};
     use r_efi::efi::Status;
 
     // Allocate heap pages as RuntimeServicesData so the OS preserves them

@@ -156,10 +156,13 @@ pub unsafe fn invalidate_framebuffer_record() {
             record_addr
         );
         let tag_ptr = record_addr as *mut u32;
-        let old_tag = tag_ptr.read_volatile();
+        // Safety: caller guarantees it is safe to modify the coreboot tables at this point
+        // (called at ExitBootServices time).
+        let old_tag = unsafe { tag_ptr.read_volatile() };
 
         if old_tag == tables::tags::CB_TAG_FRAMEBUFFER {
-            tag_ptr.write_volatile(tables::tags::CB_TAG_UNUSED);
+            // Safety: same as above - modifying coreboot table record tag.
+            unsafe { tag_ptr.write_volatile(tables::tags::CB_TAG_UNUSED) };
             log::info!(
                 "Invalidated coreboot framebuffer record at {:#x} (tag: {:#x} -> {:#x})",
                 record_addr,

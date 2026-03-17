@@ -84,8 +84,12 @@ pub unsafe fn set_load_options(
     options_size: u32,
 ) {
     if !protocol.is_null() {
-        (*protocol).load_options = options;
-        (*protocol).load_options_size = options_size;
+        // SAFETY: Caller guarantees protocol pointer is valid and options buffer
+        // remains valid for the lifetime of the loaded image.
+        unsafe {
+            (*protocol).load_options = options;
+            (*protocol).load_options_size = options_size;
+        }
     }
 }
 
@@ -98,6 +102,9 @@ pub unsafe fn set_file_path(
     device_path: *mut DevicePathProtocol,
 ) {
     if !protocol.is_null() {
-        (*protocol).file_path = device_path;
+        // SAFETY: Caller guarantees protocol and device_path pointers are valid.
+        unsafe {
+            (*protocol).file_path = device_path;
+        }
     }
 }

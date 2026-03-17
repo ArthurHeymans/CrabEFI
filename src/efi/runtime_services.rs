@@ -549,9 +549,13 @@ extern "efiapi" fn set_virtual_address_map(
 ///
 /// The offset must produce a valid function address within the relocated region.
 unsafe fn relocate_fn_ptr<T>(ptr: &mut T, offset: i64) {
-    let old = core::ptr::read(ptr as *const T as *const u64);
-    let new = (old as i64 + offset) as u64;
-    core::ptr::write(ptr as *mut T as *mut u64, new);
+    // SAFETY: The offset must produce a valid function address within the relocated region.
+    // Caller guarantees the pointer refers to a function pointer field in RuntimeServices.
+    unsafe {
+        let old = core::ptr::read(ptr as *const T as *const u64);
+        let new = (old as i64 + offset) as u64;
+        core::ptr::write(ptr as *mut T as *mut u64, new);
+    }
 }
 
 /// Internal ConvertPointer implementation used by both the EFI callback and
