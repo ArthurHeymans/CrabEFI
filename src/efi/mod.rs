@@ -7,6 +7,7 @@ pub mod allocator;
 pub mod auth;
 pub mod boot_services;
 pub mod guid_fmt;
+pub mod image_loader;
 pub mod protocols;
 #[cfg(feature = "rt-log")]
 pub mod rtlog;
