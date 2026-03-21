@@ -9,7 +9,6 @@
 
 use core::fmt::{self, Write};
 
-use spin::Mutex;
 use tock_registers::interfaces::{Readable, Writeable};
 
 #[cfg(target_arch = "aarch64")]
