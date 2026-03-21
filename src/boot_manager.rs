@@ -664,10 +664,10 @@ fn boot_linux_entry(
         let state = state::get();
         // Copy memory regions to a local buffer (we can't borrow across the disk operations)
         let mut regions = heapless::Vec::<crate::coreboot::memory::MemoryRegion, 64>::new();
-        for region in state.drivers.memory_regions.iter() {
+        for region in state.drivers.platform.memory_regions.iter() {
             let _ = regions.push(*region);
         }
-        (regions, state.drivers.acpi_rsdp)
+        (regions, state.drivers.platform.acpi_rsdp)
     };
 
     // Get framebuffer info for Linux console
