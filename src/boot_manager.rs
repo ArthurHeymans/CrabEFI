@@ -254,49 +254,57 @@ fn try_boot_file_from_esps(file_path: &str) -> boot_vars::BootAttemptResult {
 fn try_boot_file_on_nvme(file_path: &str) -> bool {
     use crate::drivers::nvme;
 
-    let Some(controller_ptr) = nvme::get_controller(0) else {
-        return false;
-    };
-    let controller = unsafe { &mut *controller_ptr };
-    let Some(ns) = controller.default_namespace() else {
-        return false;
-    };
-    let nsid = ns.nsid;
-    let pci_addr = controller.pci_address();
+    for controller_id in 0.. {
+        let Some(controller_ptr) = nvme::get_controller(controller_id) else {
+            break;
+        };
+        let controller = unsafe { &mut *controller_ptr };
+        let Some(ns) = controller.default_namespace() else {
+            continue;
+        };
+        let nsid = ns.nsid;
+        let pci_addr = controller.pci_address();
 
-    if !nvme::store_global_device(0, nsid) {
-        return false;
+        if !nvme::store_global_device(controller_id, nsid) {
+            continue;
+        }
+
+        let device_type = menu::DeviceType::Nvme {
+            controller_id,
+            nsid,
+        };
+
+        if try_boot_file_on_device(&device_type, pci_addr.device, pci_addr.function, file_path) {
+            return true;
+        }
     }
-
-    let device_type = menu::DeviceType::Nvme {
-        controller_id: 0,
-        nsid,
-    };
-
-    try_boot_file_on_device(&device_type, pci_addr.device, pci_addr.function, file_path)
+    false
 }
 
 /// Try to boot a file from AHCI ESPs
 fn try_boot_file_on_ahci(file_path: &str) -> bool {
     use crate::drivers::ahci;
 
-    let Some(controller_ptr) = ahci::get_controller(0) else {
-        return false;
-    };
-    let controller = unsafe { &mut *controller_ptr };
-    let pci_addr = controller.pci_address();
-    let num_ports = controller.num_active_ports();
-
-    for port_index in 0..num_ports {
-        if !ahci::store_global_device(0, port_index) {
-            continue;
-        }
-        let device_type = menu::DeviceType::Ahci {
-            controller_id: 0,
-            port: port_index,
+    for controller_id in 0.. {
+        let Some(controller_ptr) = ahci::get_controller(controller_id) else {
+            break;
         };
-        if try_boot_file_on_device(&device_type, pci_addr.device, pci_addr.function, file_path) {
-            return true;
+        let controller = unsafe { &mut *controller_ptr };
+        let pci_addr = controller.pci_address();
+        let num_ports = controller.num_active_ports();
+
+        for port_index in 0..num_ports {
+            if !ahci::store_global_device(controller_id, port_index) {
+                continue;
+            }
+            let device_type = menu::DeviceType::Ahci {
+                controller_id,
+                port: port_index,
+            };
+            if try_boot_file_on_device(&device_type, pci_addr.device, pci_addr.function, file_path)
+            {
+                return true;
+            }
         }
     }
     false

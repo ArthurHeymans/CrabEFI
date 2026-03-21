@@ -91,6 +91,8 @@ pub mod uart16550 {
             PEN OFFSET(3) NUMBITS(1) [],
             /// Even Parity Select
             EPS OFFSET(4) NUMBITS(1) [],
+            /// Stick Parity Select
+            SP OFFSET(5) NUMBITS(1) [],
             /// Set Break
             SBRK OFFSET(6) NUMBITS(1) [],
             /// Divisor Latch Access Bit
@@ -304,9 +306,9 @@ pub mod pl011 {
             OUT1 OFFSET(12) NUMBITS(1) [],
             /// Out2
             OUT2 OFFSET(13) NUMBITS(1) [],
-            /// RTS Hardware Flow Control Enable
-            CTSE OFFSET(14) NUMBITS(1) [],
             /// CTS Hardware Flow Control Enable
+            CTSE OFFSET(14) NUMBITS(1) [],
+            /// RTS Hardware Flow Control Enable
             RTSE OFFSET(15) NUMBITS(1) [],
         ],
     ];

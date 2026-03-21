@@ -41,6 +41,11 @@ struct ControllerPtr<T>(*mut T);
 // SAFETY: CrabEFI is single-threaded firmware. Controller pointers are allocated
 // via the EFI page allocator and remain valid for the firmware's lifetime. All
 // access is serialized through the ControllerRegistry's Mutex.
+//
+// The blanket impl (not bounded on `T: Send`) is intentional: controller types
+// like NvmeController contain raw pointers (making them `!Send` by default),
+// but in this single-threaded firmware context sharing across "threads" cannot
+// occur. The ControllerPtr wrapper is module-private, limiting the scope.
 unsafe impl<T> Send for ControllerPtr<T> {}
 
 /// Generic registry for PCI-based hardware controllers.
@@ -95,6 +100,9 @@ impl<T, const N: usize> ControllerRegistry<T, N> {
         let mut controllers = self.controllers.lock();
         if controllers.push(ControllerPtr(controller_box)).is_err() {
             log::warn!("{}: controller list full — freeing allocation", self.name);
+            // Note: the `T` value written via ptr::write is not dropped here. This
+            // is acceptable because current controller types do not implement Drop.
+            // If T ever gains Drop glue, this path must call ptr::drop_in_place first.
             crate::efi::free_pages(mem, pages as u64);
             return Err(());
         }

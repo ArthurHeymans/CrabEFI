@@ -11,6 +11,7 @@ use r_efi::protocols::file::Protocol as FileProtocol;
 use r_efi::protocols::simple_file_system::Protocol as SimpleFileSystemProtocol;
 
 use super::allocator::{self, MemoryType};
+use super::boot_services;
 use super::protocols::loaded_image::LOADED_IMAGE_PROTOCOL_GUID;
 use super::protocols::simple_file_system::SIMPLE_FILE_SYSTEM_GUID;
 use crate::state;
@@ -79,18 +80,12 @@ fn extract_file_path_from_device_path(
 }
 
 /// Look up a protocol interface pointer on a handle by GUID.
+///
+/// Delegates to [`boot_services::get_protocol_on_handle`] and filters out
+/// null interface pointers.
 fn get_protocol_on_handle(handle: Handle, guid: &Guid) -> Option<*mut c_void> {
-    let efi_state = state::efi();
-    efi_state.handles[..efi_state.handle_count]
-        .iter()
-        .find(|e| e.handle == handle)
-        .and_then(|e| {
-            e.protocols[..e.protocol_count]
-                .iter()
-                .find(|p| p.guid == *guid)
-                .filter(|p| !p.interface.is_null())
-                .map(|p| p.interface)
-        })
+    let ptr = boot_services::get_protocol_on_handle(handle, guid);
+    if ptr.is_null() { None } else { Some(ptr) }
 }
 
 /// Load an image from a device path
