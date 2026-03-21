@@ -70,6 +70,11 @@ pub fn init(cb_info: &CorebootInfo) {
         log::debug!("No SMBIOS tables from coreboot");
     }
 
+    // Install device tree (FDT) if available
+    if let Some((fdt_addr, fdt_size)) = cb_info.devicetree {
+        system_table::install_devicetree(fdt_addr, fdt_size);
+    }
+
     // Install EFI Runtime Properties Table (UEFI 2.8+)
     // This tells Linux which runtime services are supported.
     // Required for efi_pstore, efivars, and other kernel modules.
@@ -510,29 +515,66 @@ fn add_platform_mmio_regions() {
         }
     };
 
-    // GIC distributor + redistributor (0x40060000 - 0x40100000)
-    // The GIC is essential — without it the kernel can't handle interrupts.
-    add_mmio(0x4006_0000, 0xA_0000, "GIC");
+    // Try to get platform info from FDT (if available)
+    let plat = crate::state::drivers().fdt_info;
 
-    // Peripherals block: UART, RTC, GPIO, secure UART, SMMU, AHCI, EHCI
-    // (0x60000000 - 0x60200000)
-    add_mmio(
-        0x6000_0000,
-        0x20_0000,
-        "Peripherals (UART/RTC/GPIO/AHCI/EHCI)",
-    );
+    // GIC — from FDT or SBSA default
+    if let Some((base, size)) = plat.gicd {
+        let total = if let Some((rb, rsize)) = plat.gicr {
+            // Cover GICD + GICR as one contiguous block if adjacent,
+            // otherwise add them separately
+            let gicd_end = base + size;
+            if rb == gicd_end {
+                size + rsize
+            } else {
+                add_mmio(rb, rsize, "GICR");
+                size
+            }
+        } else {
+            size
+        };
+        add_mmio(base, total, "GIC");
+    } else {
+        // SBSA default
+        add_mmio(0x4006_0000, 0xA_0000, "GIC");
+    }
 
-    // PCIe PIO window (0x7FFF0000 - 0x80000000)
-    add_mmio(0x7FFF_0000, 0x1_0000, "PCIe PIO");
+    // Peripherals — SBSA default only (FDT platforms get UART from coreboot serial)
+    if plat.gicd.is_none() {
+        // SBSA: Peripherals block (UART, RTC, GPIO, AHCI, EHCI) 0x60000000-0x60200000
+        add_mmio(
+            0x6000_0000,
+            0x20_0000,
+            "Peripherals (UART/RTC/GPIO/AHCI/EHCI)",
+        );
+    }
 
-    // PCIe 32-bit MMIO window (0x80000000 - 0xF0000000)
-    // Covers PCI BAR assignments for all devices.
-    add_mmio(0x8000_0000, 0x7000_0000, "PCIe MMIO");
+    // PCIe PIO — from FDT or SBSA default
+    if let Some((base, size)) = plat.pcie_pio {
+        add_mmio(base, size, "PCIe PIO");
+    } else if plat.gicd.is_none() {
+        add_mmio(0x7FFF_0000, 0x1_0000, "PCIe PIO");
+    }
 
-    // PCIe ECAM (0xF0000000 - 0x100000000)
-    // Already in coreboot map as Reserved, but the kernel needs it as MMIO
-    // for proper cache attributes. Skip if it overlaps an existing region.
-    // (coreboot marks 0xF0000000-0x100000000 as Reserved, so we don't re-add it)
+    // PCIe 32-bit MMIO — from FDT or SBSA default
+    if let Some((base, size)) = plat.pcie_mmio32 {
+        add_mmio(base, size, "PCIe MMIO32");
+    } else if plat.gicd.is_none() {
+        add_mmio(0x8000_0000, 0x7000_0000, "PCIe MMIO");
+    }
+
+    // PCIe 64-bit MMIO (if from FDT)
+    if let Some((base, size)) = plat.pcie_mmio64 {
+        add_mmio(base, size, "PCIe MMIO64");
+    }
+
+    // PCIe ECAM — from FDT
+    if let Some(base) = plat.ecam_base
+        && let Some(size) = plat.ecam_size
+    {
+        add_mmio(base, size, "PCIe ECAM");
+    }
+    // SBSA ECAM (0xF0000000-0x100000000) is already in coreboot map as Reserved
 }
 
 /// Reserve the EL2 MMU page table memory (aarch64 only)

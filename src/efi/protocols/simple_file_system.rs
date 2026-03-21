@@ -357,6 +357,7 @@ extern "efiapi" fn file_read(
     }
 
     let requested_size = unsafe { *buffer_size };
+    log::debug!("File.Read(this={:?}, size={})", this, requested_size);
 
     // Get handle info
     let (is_dir, file_size, position, first_cluster, handle_idx) = {

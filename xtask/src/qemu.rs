@@ -8,7 +8,7 @@ use regex::Regex;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
 
-use crate::Arch;
+use crate::{Arch, Machine};
 
 /// Storage type for QEMU
 #[derive(Debug, Clone, Copy)]
@@ -39,6 +39,8 @@ pub struct QemuConfig {
     pub timeout_secs: Option<u64>,
     /// Target architecture
     pub arch: Arch,
+    /// QEMU machine type (aarch64 only)
+    pub machine: Machine,
 }
 
 /// Test result from QEMU run
@@ -68,9 +70,10 @@ fn build_qemu_command(config: &QemuConfig, disk_path: &Path) -> Result<Command> 
         );
     }
 
-    match config.arch {
-        Arch::X86_64 => build_qemu_command_x86_64(config, disk_path),
-        Arch::Aarch64 => build_qemu_command_aarch64(config, disk_path),
+    match (config.arch, config.machine) {
+        (Arch::X86_64, _) => build_qemu_command_x86_64(config, disk_path),
+        (Arch::Aarch64, Machine::Sbsa) => build_qemu_command_aarch64_sbsa(config, disk_path),
+        (Arch::Aarch64, Machine::Virt) => build_qemu_command_aarch64_virt(config, disk_path),
     }
 }
 
@@ -117,7 +120,7 @@ fn build_qemu_command_x86_64(config: &QemuConfig, disk_path: &Path) -> Result<Co
 }
 
 /// Build QEMU command for aarch64 (SBSA)
-fn build_qemu_command_aarch64(config: &QemuConfig, disk_path: &Path) -> Result<Command> {
+fn build_qemu_command_aarch64_sbsa(config: &QemuConfig, disk_path: &Path) -> Result<Command> {
     // Validate: no SDHCI on SBSA
     if matches!(config.storage, StorageType::Sdhci) {
         bail!("SDHCI storage is not supported on SBSA (aarch64)");
@@ -166,6 +169,49 @@ fn build_qemu_command_aarch64(config: &QemuConfig, disk_path: &Path) -> Result<C
 
     // CPU: always use TCG for cross-arch (no KVM on non-native)
     cmd.args(["-cpu", "max"]);
+
+    // Debug options
+    cmd.args(["-d", "guest_errors"]);
+
+    // Capture stderr for QEMU errors
+    cmd.stderr(Stdio::piped());
+    cmd.stdout(Stdio::piped());
+
+    Ok(cmd)
+}
+
+/// Build QEMU command for aarch64 (virt — FDT-based, single ROM)
+fn build_qemu_command_aarch64_virt(config: &QemuConfig, disk_path: &Path) -> Result<Command> {
+    // Validate: no SDHCI on virt (no built-in SDHCI controller)
+    if matches!(config.storage, StorageType::Sdhci) {
+        bail!("SDHCI storage is not supported on aarch64 virt");
+    }
+
+    let mut cmd = Command::new("qemu-system-aarch64");
+
+    // Basic machine setup
+    // secure=on enables TrustZone so TF-A (BL31) can run at EL3.
+    // virtualization=on enables EL2 so coreboot's payload runs at EL2.
+    cmd.args(["-machine", "virt,secure=on,virtualization=on"]);
+    cmd.args(["-m", "1G"]);
+    cmd.arg("-no-reboot");
+    cmd.args(["-cpu", "cortex-a53"]);
+
+    // Flash: single coreboot ROM loaded as pflash (read-only).
+    // The virt machine ROM starts at address 0x0.
+    cmd.args([
+        "-drive",
+        &format!(
+            "if=pflash,format=raw,file={},readonly=on",
+            config.coreboot_rom
+        ),
+    ]);
+
+    // Display and serial: PL011 UART to stdio
+    cmd.arg("-nographic");
+
+    // Storage configuration (same as SBSA, minus SDHCI)
+    add_storage_args_aarch64(&mut cmd, config, disk_path);
 
     // Debug options
     cmd.args(["-d", "guest_errors"]);
@@ -595,9 +641,14 @@ pub fn run_tests(config: &QemuConfig, disk_path: &Path, app_name: &str) -> Resul
 fn run_qemu_with_capture(config: &QemuConfig, disk_path: &Path) -> Result<TestResult> {
     let timeout = config.timeout_secs.unwrap_or(60);
 
-    match config.arch {
-        Arch::X86_64 => run_qemu_with_capture_x86_64(config, disk_path, timeout),
-        Arch::Aarch64 => run_qemu_with_capture_aarch64(config, disk_path, timeout),
+    match (config.arch, config.machine) {
+        (Arch::X86_64, _) => run_qemu_with_capture_x86_64(config, disk_path, timeout),
+        (Arch::Aarch64, Machine::Sbsa) => {
+            run_qemu_with_capture_aarch64_sbsa(config, disk_path, timeout)
+        }
+        (Arch::Aarch64, Machine::Virt) => {
+            run_qemu_with_capture_aarch64_virt(config, disk_path, timeout)
+        }
     }
 }
 
@@ -644,7 +695,7 @@ fn run_qemu_with_capture_x86_64(
 }
 
 /// Run QEMU with capture for aarch64 (SBSA)
-fn run_qemu_with_capture_aarch64(
+fn run_qemu_with_capture_aarch64_sbsa(
     config: &QemuConfig,
     disk_path: &Path,
     timeout: u64,
@@ -699,6 +750,52 @@ fn run_qemu_with_capture_aarch64(
     let output = cmd
         .output()
         .context("failed to execute QEMU (aarch64) via timeout")?;
+
+    parse_qemu_output(&output)
+}
+
+/// Run QEMU with capture for aarch64 (virt — FDT-based, single ROM)
+fn run_qemu_with_capture_aarch64_virt(
+    config: &QemuConfig,
+    disk_path: &Path,
+    timeout: u64,
+) -> Result<TestResult> {
+    if matches!(config.storage, StorageType::Sdhci) {
+        bail!("SDHCI storage is not supported on aarch64 virt");
+    }
+
+    let mut cmd = Command::new("timeout");
+    cmd.arg("--signal=KILL");
+    cmd.arg(format!("{}s", timeout));
+    cmd.arg("qemu-system-aarch64");
+
+    // Machine setup
+    cmd.args(["-machine", "virt,secure=on,virtualization=on"]);
+    cmd.args(["-m", "1G"]);
+    cmd.arg("-no-reboot");
+    cmd.args(["-cpu", "cortex-a53"]);
+
+    // Flash: single coreboot ROM
+    cmd.args([
+        "-drive",
+        &format!(
+            "if=pflash,format=raw,file={},readonly=on",
+            config.coreboot_rom
+        ),
+    ]);
+
+    // Serial: -nographic for PL011 to stdio
+    cmd.arg("-nographic");
+
+    // Storage configuration
+    add_storage_args_aarch64(&mut cmd, config, disk_path);
+
+    cmd.args(["-d", "guest_errors"]);
+
+    // Execute and capture output
+    let output = cmd
+        .output()
+        .context("failed to execute QEMU (aarch64-virt) via timeout")?;
 
     parse_qemu_output(&output)
 }

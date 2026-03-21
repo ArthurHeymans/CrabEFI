@@ -1,4 +1,4 @@
-/* CrabEFI Linker Script for aarch64 coreboot payload (QEMU SBSA) */
+/* CrabEFI Linker Script for aarch64 coreboot payload */
 
 OUTPUT_FORMAT("elf64-littleaarch64")
 OUTPUT_ARCH(aarch64)
@@ -6,13 +6,12 @@ ENTRY(_start)
 
 /*
  * Coreboot loads payloads via selfload, which places ELF segments at their
- * specified load addresses. On QEMU SBSA, DRAM starts at 0x100_0000_0000.
- * We place the payload well above coreboot's own regions (ramstage ends
- * around 0x100_210B_0000) to avoid overlap.
+ * specified load addresses. PAYLOAD_BASE is provided at build time via
+ * --defsym from build.rs (set PAYLOAD_BASE env var, or uses default).
  *
- * Address chosen: 0x100_2200_0000 (in DRAM, above coreboot's reserved areas)
+ * QEMU SBSA:    0x100_2200_0000 (DRAM at 1TB, above coreboot ramstage)
+ * QEMU aarch64: 0x6200_0000     (DRAM at 1GB, above coreboot ramstage)
  */
-PAYLOAD_BASE = 0x10022000000;
 
 SECTIONS
 {
@@ -74,6 +73,17 @@ SECTIONS
         _stack_bottom = .;
         . += 0x300000;
         _stack_top = .;
+    }
+
+    /* EL2 page tables for MMU setup (when coreboot doesn't set up EL2 MMU).
+     * L0: 1 page (512 entries x 512GB = 256TB)
+     * L1: 4 pages (covering L0[0]-L0[3] = 0-2TB, using 1GB block descriptors)
+     */
+    .page_tables (NOLOAD) : ALIGN(4096) {
+        _el2_l0_table = .;
+        . += 4096;
+        _el2_l1_table = .;
+        . += 4096 * 4;
     }
 
     /* Exception handler stack - 16KB (separate to avoid corruption) */

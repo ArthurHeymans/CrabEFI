@@ -631,6 +631,9 @@ pub struct DriverState {
 
     /// Hardware RNG available and functional
     pub rng_available: bool,
+
+    /// Platform info from FDT (PCIe, GIC, etc.)
+    pub fdt_info: crate::fdt::PlatformInfo,
 }
 
 impl DriverState {
@@ -642,6 +645,7 @@ impl DriverState {
             platform: PlatformInfo::new(),
             storage_registry: StorageRegistry::new(),
             rng_available: false,
+            fdt_info: crate::fdt::PlatformInfo::new(),
         }
     }
 }

@@ -6,7 +6,7 @@ use anyhow::{bail, Context, Result};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use crate::{project_root, Arch};
+use crate::{project_root, Arch, Machine};
 
 /// Prepared firmware files ready for QEMU
 pub struct PreparedFirmware {
@@ -24,7 +24,12 @@ pub struct PreparedFirmware {
 /// 3. Returns the prepared firmware paths
 ///
 /// For aarch64 (SBSA), also decompresses the TF-A flash image.
-pub fn prepare_rom(crabefi_elf: &Path, output_dir: &Path, arch: Arch) -> Result<PreparedFirmware> {
+pub fn prepare_rom(
+    crabefi_elf: &Path,
+    output_dir: &Path,
+    arch: Arch,
+    machine: Machine,
+) -> Result<PreparedFirmware> {
     if !crabefi_elf.exists() {
         bail!(
             "CrabEFI ELF not found: {}\n\
@@ -33,9 +38,10 @@ pub fn prepare_rom(crabefi_elf: &Path, output_dir: &Path, arch: Arch) -> Result<
         );
     }
 
-    match arch {
-        Arch::X86_64 => prepare_rom_x86_64(crabefi_elf, output_dir),
-        Arch::Aarch64 => prepare_rom_aarch64(crabefi_elf, output_dir),
+    match (arch, machine) {
+        (Arch::X86_64, _) => prepare_rom_x86_64(crabefi_elf, output_dir),
+        (Arch::Aarch64, Machine::Sbsa) => prepare_rom_aarch64_sbsa(crabefi_elf, output_dir),
+        (Arch::Aarch64, Machine::Virt) => prepare_rom_aarch64_virt(crabefi_elf, output_dir),
     }
 }
 
@@ -77,7 +83,7 @@ fn prepare_rom_x86_64(crabefi_elf: &Path, output_dir: &Path) -> Result<PreparedF
 }
 
 /// Prepare aarch64 (SBSA) firmware — coreboot ROM + TF-A flash
-fn prepare_rom_aarch64(crabefi_elf: &Path, output_dir: &Path) -> Result<PreparedFirmware> {
+fn prepare_rom_aarch64_sbsa(crabefi_elf: &Path, output_dir: &Path) -> Result<PreparedFirmware> {
     let compressed_tfa = project_root().join("firmware/tfa-sbsa.fd.zst");
     let compressed_rom = project_root().join("firmware/coreboot-qemu-sbsa.rom.zst");
 
@@ -138,6 +144,68 @@ fn prepare_rom_aarch64(crabefi_elf: &Path, output_dir: &Path) -> Result<Prepared
         coreboot_rom: output_rom,
         tfa_flash: Some(output_tfa),
     })
+}
+
+/// Prepare aarch64 (virt) firmware — single coreboot ROM (BL31 embedded)
+fn prepare_rom_aarch64_virt(crabefi_elf: &Path, output_dir: &Path) -> Result<PreparedFirmware> {
+    let compressed_rom = project_root().join("firmware/coreboot-qemu-aarch64.rom.zst");
+
+    if !compressed_rom.exists() {
+        bail!(
+            "Base coreboot aarch64-virt ROM not found: {}\n\
+            Please ensure firmware/coreboot-qemu-aarch64.rom.zst exists",
+            compressed_rom.display()
+        );
+    }
+
+    let output_rom = output_dir.join("coreboot-aarch64.rom");
+
+    // Decompress the ROM
+    println!("Decompressing coreboot aarch64-virt ROM...");
+    let status = Command::new("zstd")
+        .args(["-d", "-f"])
+        .arg(&compressed_rom)
+        .arg("-o")
+        .arg(&output_rom)
+        .status()
+        .context("Failed to run zstd. Is it installed?")?;
+
+    if !status.success() {
+        bail!("Failed to decompress coreboot aarch64-virt ROM");
+    }
+
+    inject_crabefi_payload(&output_rom, crabefi_elf)?;
+
+    // QEMU virt pflash0 requires a 64MB image. The coreboot ROM is 16MB,
+    // so pad with zeros to 64MB.
+    pad_rom(&output_rom, 64 * 1024 * 1024)?;
+
+    println!("Firmware prepared:");
+    println!("  coreboot ROM: {} (padded to 64MB)", output_rom.display());
+
+    Ok(PreparedFirmware {
+        coreboot_rom: output_rom,
+        tfa_flash: None,
+    })
+}
+
+/// Pad a ROM file to the given size with zeros (if smaller).
+fn pad_rom(rom_path: &Path, target_size: u64) -> Result<()> {
+    let metadata = std::fs::metadata(rom_path)?;
+    let current_size = metadata.len();
+    if current_size < target_size {
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(rom_path)
+            .context("Failed to open ROM for padding")?;
+        file.set_len(target_size)
+            .context("Failed to pad ROM to target size")?;
+        println!(
+            "  Padded ROM from {} to {} bytes",
+            current_size, target_size
+        );
+    }
+    Ok(())
 }
 
 /// Inject CrabEFI as the coreboot payload using cbfstool

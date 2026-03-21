@@ -52,7 +52,7 @@ postcard = { version = "1.0", default-features = false, features = ["alloc"] }
 x86_64 = "0.15"
 
 [target.'cfg(target_arch = "aarch64")'.dependencies]
-# No arch-specific crate dependencies for aarch64 yet
+fdt = "0.1.5"
 
 [build-dependencies]
 cc = "1"

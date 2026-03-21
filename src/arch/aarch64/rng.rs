@@ -76,13 +76,13 @@ fn rndr64() -> Option<u64> {
     None
 }
 
-/// Check if SMCCC TRNG is available
+/// Check if SMCCC TRNG is available (via SMC to EL3 / TF-A)
 fn check_smccc_trng() -> bool {
     let ret: u64;
     unsafe {
         core::arch::asm!(
             "mov w0, {func_id:w}",
-            "hvc #0",
+            "smc #0",
             "mov {ret}, x0",
             func_id = in(reg) SMCCC_TRNG_VERSION,
             ret = out(reg) ret,
@@ -97,7 +97,7 @@ fn check_smccc_trng() -> bool {
     version >= 0x10000
 }
 
-/// Get random value via SMCCC TRNG
+/// Get random value via SMCCC TRNG (SMC to EL3 / TF-A)
 fn smccc_trng_rnd64() -> Option<u64> {
     let ret: u64;
     let val: u64;
@@ -105,7 +105,7 @@ fn smccc_trng_rnd64() -> Option<u64> {
         core::arch::asm!(
             "mov w0, {func_id:w}",
             "mov x1, #64",      // 64 bits requested
-            "hvc #0",
+            "smc #0",
             "mov {ret}, x0",
             "mov {val}, x3",    // Random value in x3
             func_id = in(reg) SMCCC_TRNG_RND64,

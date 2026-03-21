@@ -253,9 +253,9 @@ jobs:
           path: target/aarch64-unknown-none/release/crabefi
           retention-days: 7
 
-  # aarch64 Integration tests with QEMU SBSA
+  # aarch64 SBSA Integration tests with QEMU
   test-nvme-aarch64:
-    name: Test aarch64 (NVMe Storage)
+    name: Test aarch64/sbsa (NVMe Storage)
     runs-on: ubuntu-latest
     needs: build-aarch64
     steps:
@@ -281,11 +281,11 @@ jobs:
           name: crabefi-elf-aarch64
           path: target/aarch64-unknown-none/release/
 
-      - name: Run integration tests (NVMe, aarch64)
-        run: ./crabefi test --arch aarch64 --app hello --nvme --disable-kvm --timeout 120
+      - name: Run integration tests (NVMe, aarch64/sbsa)
+        run: ./crabefi test --arch aarch64 --machine sbsa --app hello --nvme --disable-kvm --timeout 120
 
   test-rng-aarch64:
-    name: Test aarch64 (RNG Protocol)
+    name: Test aarch64/sbsa (RNG Protocol)
     runs-on: ubuntu-latest
     needs: build-aarch64
     steps:
@@ -311,5 +311,59 @@ jobs:
           name: crabefi-elf-aarch64
           path: target/aarch64-unknown-none/release/
 
-      - name: Run RNG protocol tests (aarch64)
-        run: ./crabefi test --arch aarch64 --app rng-test --nvme --disable-kvm --timeout 120
+      - name: Run RNG protocol tests (aarch64/sbsa)
+        run: ./crabefi test --arch aarch64 --machine sbsa --app rng-test --nvme --disable-kvm --timeout 120
+
+  # ── aarch64 virt (FDT) ────────────────────────────────────────────────
+
+  build-aarch64-virt:
+    name: Build (aarch64/virt)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src, llvm-tools-preview
+          targets: aarch64-unknown-none
+
+      - name: Build release (virt PAYLOAD_BASE)
+        run: PAYLOAD_BASE=0x62000000 cargo build --release --target aarch64-unknown-none
+
+      - name: Upload CrabEFI ELF (aarch64-virt)
+        uses: actions/upload-artifact@v4
+        with:
+          name: crabefi-elf-aarch64-virt
+          path: target/aarch64-unknown-none/release/crabefi
+          retention-days: 7
+
+  test-nvme-aarch64-virt:
+    name: Test aarch64/virt (NVMe Storage)
+    runs-on: ubuntu-latest
+    needs: build-aarch64-virt
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchains
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src
+          targets: aarch64-unknown-none, aarch64-unknown-uefi
+
+      - name: Install stable toolchain for xtask
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qemu-system-arm mtools dosfstools zstd coreboot-utils
+
+      - name: Download CrabEFI ELF (aarch64-virt)
+        uses: actions/download-artifact@v4
+        with:
+          name: crabefi-elf-aarch64-virt
+          path: target/aarch64-unknown-none/release/
+
+      - name: Run integration tests (NVMe, aarch64/virt)
+        run: ./crabefi test --arch aarch64 --machine virt --app hello --nvme --disable-kvm --timeout 120

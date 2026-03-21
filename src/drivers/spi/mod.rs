@@ -314,6 +314,14 @@ pub fn detect_chipset() -> Option<DetectedChipset> {
 /// 2. Try Intel/AMD chipset detection for real hardware
 /// 3. Fall back to QEMU pflash if nothing else works
 pub fn detect_and_init() -> Option<AnySpiController> {
+    // SPI/pflash variable store is x86-only for now.
+    // On aarch64 platforms (QEMU virt, SBSA) we don't have a writable
+    // flash backend — variables are volatile only.
+    if cfg!(target_arch = "aarch64") {
+        log::debug!("SPI flash detection skipped on aarch64");
+        return None;
+    }
+
     // First check if we're running in QEMU - if so, prefer pflash
     // QEMU emulates chipsets like ICH9, but the SPI controller doesn't
     // actually work like real hardware. The pflash backend is more reliable.

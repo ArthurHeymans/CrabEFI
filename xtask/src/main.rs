@@ -40,6 +40,15 @@ pub enum Arch {
     Aarch64,
 }
 
+/// QEMU machine type for aarch64
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum Machine {
+    /// QEMU SBSA reference platform (requires TF-A pflash, DRAM at 1TB)
+    Sbsa,
+    /// QEMU virt machine (FDT-based, DRAM at 1GB)
+    Virt,
+}
+
 #[derive(Parser)]
 #[command(name = "crabefi", bin_name = "crabefi")]
 #[command(about = "CrabEFI build and test automation")]
@@ -51,6 +60,10 @@ struct Cli {
     /// Target architecture
     #[arg(long, global = true, value_enum, default_value_t = Arch::X86_64)]
     arch: Arch,
+
+    /// QEMU machine type (aarch64 only; ignored for x86_64)
+    #[arg(long, global = true, value_enum, default_value_t = Machine::Sbsa)]
+    machine: Machine,
 
     #[command(subcommand)]
     command: Commands,
@@ -168,9 +181,10 @@ fn main() -> Result<()> {
         .expect("PROJECT_DIR already initialized");
 
     let arch = cli.arch;
+    let machine = cli.machine;
 
     match cli.command {
-        Commands::Build { release } => cmd_build(release, arch),
+        Commands::Build { release } => cmd_build(release, arch, machine),
         Commands::Run {
             coreboot_rom,
             ahci,
@@ -190,6 +204,7 @@ fn main() -> Result<()> {
             app,
             disk,
             arch,
+            machine,
         ),
         Commands::Test {
             coreboot_rom,
@@ -208,6 +223,7 @@ fn main() -> Result<()> {
             disable_kvm,
             timeout,
             arch,
+            machine,
         ),
         Commands::BuildTestApp { name } => cmd_build_test_app(&name, arch),
         Commands::ListTestApps => cmd_list_test_apps(),
@@ -217,8 +233,13 @@ fn main() -> Result<()> {
     }
 }
 
-fn cmd_build(release: bool, arch: Arch) -> Result<()> {
-    println!("Building CrabEFI ({:?})...", arch);
+fn cmd_build(release: bool, arch: Arch, machine: Machine) -> Result<()> {
+    let label = match (arch, machine) {
+        (Arch::X86_64, _) => "x86_64".to_string(),
+        (Arch::Aarch64, Machine::Sbsa) => "aarch64/sbsa".to_string(),
+        (Arch::Aarch64, Machine::Virt) => "aarch64/virt".to_string(),
+    };
+    println!("Building CrabEFI ({})...", label);
 
     let project_root = project_root();
 
@@ -233,6 +254,17 @@ fn cmd_build(release: bool, arch: Arch) -> Result<()> {
         Arch::Aarch64 => "aarch64-unknown-none",
     };
     cmd.arg("--target").arg(target_triple);
+
+    // aarch64-specific: set PAYLOAD_BASE for the linker script.
+    // SBSA: DRAM at 1TB, payload above ramstage.
+    // Virt: DRAM at 1GB, payload above ramstage.
+    if matches!(arch, Arch::Aarch64) {
+        let payload_base = match machine {
+            Machine::Sbsa => "0x10022000000",
+            Machine::Virt => "0x62000000",
+        };
+        cmd.env("PAYLOAD_BASE", payload_base);
+    }
 
     cmd.current_dir(project_root);
     // Remove RUSTUP_TOOLCHAIN to let CrabEFI use its own rust-toolchain.toml
@@ -258,6 +290,7 @@ fn cmd_run(
     app: Option<String>,
     disk: Option<String>,
     arch: Arch,
+    machine: Machine,
 ) -> Result<()> {
     let storage = if ahci {
         qemu::StorageType::Ahci
@@ -280,11 +313,11 @@ fn cmd_run(
         }
     } else {
         // Build CrabEFI first
-        cmd_build(true, arch)?;
+        cmd_build(true, arch, machine)?;
 
         // Prepare ROM with CrabEFI payload
         let crabefi_elf = rom::get_crabefi_elf(arch);
-        rom::prepare_rom(&crabefi_elf, temp_dir.path(), arch)?
+        rom::prepare_rom(&crabefi_elf, temp_dir.path(), arch, machine)?
     };
 
     let config = qemu::QemuConfig {
@@ -295,6 +328,7 @@ fn cmd_run(
         disable_kvm,
         timeout_secs: None,
         arch,
+        machine,
     };
 
     // If a disk is specified, use it directly
@@ -331,6 +365,7 @@ fn cmd_test(
     disable_kvm: bool,
     timeout: u64,
     arch: Arch,
+    machine: Machine,
 ) -> Result<()> {
     let storage = if ahci {
         qemu::StorageType::Ahci
@@ -353,11 +388,11 @@ fn cmd_test(
         }
     } else {
         // Build CrabEFI first
-        cmd_build(true, arch)?;
+        cmd_build(true, arch, machine)?;
 
         // Prepare ROM with CrabEFI payload
         let crabefi_elf = rom::get_crabefi_elf(arch);
-        rom::prepare_rom(&crabefi_elf, temp_dir.path(), arch)?
+        rom::prepare_rom(&crabefi_elf, temp_dir.path(), arch, machine)?
     };
 
     let config = qemu::QemuConfig {
@@ -368,6 +403,7 @@ fn cmd_test(
         disable_kvm,
         timeout_secs: Some(timeout),
         arch,
+        machine,
     };
 
     // Build the test app
