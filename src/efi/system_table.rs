@@ -57,6 +57,18 @@ pub const SMBIOS3_TABLE_GUID: Guid = Guid::from_fields(
     &[0xe5, 0xbb, 0xcf, 0x20, 0xe3, 0x94],
 );
 
+/// EFI DTB Table GUID (Flattened Device Tree)
+///
+/// Used to pass a device tree blob to the OS via EFI configuration tables.
+pub const EFI_DTB_TABLE_GUID: Guid = Guid::from_fields(
+    0xb1b621d5,
+    0xf19c,
+    0x41a5,
+    0x83,
+    0x0b,
+    &[0xd9, 0x15, 0x2c, 0x69, 0xaa, 0xe0],
+);
+
 /// EFI Runtime Properties Table GUID (UEFI 2.8+)
 ///
 /// This configuration table tells the OS which runtime services are available.
@@ -735,6 +747,39 @@ pub fn install_acpi_tables(rsdp: u64) {
         count,
         unsafe { SYSTEM_TABLE.number_of_table_entries }
     );
+}
+
+/// Install a device tree blob (FDT) as an EFI configuration table
+///
+/// The FDT pointer must point to a valid flattened device tree blob in memory.
+/// The OS (e.g. Linux) will use this to discover hardware on platforms without ACPI.
+pub fn install_devicetree(fdt_addr: u64, fdt_size: u32) {
+    if fdt_addr == 0 || fdt_size == 0 {
+        log::warn!("Devicetree address/size is zero, skipping");
+        return;
+    }
+
+    // Validate FDT magic (0xd00dfeed in big-endian)
+    let magic = unsafe { *(fdt_addr as *const u32) };
+    if u32::from_be(magic) != 0xd00dfeed {
+        log::error!(
+            "Invalid FDT magic at {:#x}: {:#010x}",
+            fdt_addr,
+            u32::from_be(magic)
+        );
+        return;
+    }
+
+    let status = install_configuration_table(&EFI_DTB_TABLE_GUID, fdt_addr as *mut c_void);
+    if status == efi::Status::SUCCESS {
+        log::info!(
+            "Installed devicetree configuration table ({} bytes at {:#x})",
+            fdt_size,
+            fdt_addr
+        );
+    } else {
+        log::error!("Failed to install devicetree table: {:?}", status);
+    }
 }
 
 /// Install SMBIOS tables from coreboot

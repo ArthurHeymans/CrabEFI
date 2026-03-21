@@ -24,6 +24,7 @@ pub mod drivers;
 pub mod efi;
 #[cfg(feature = "fb-log")]
 pub mod fb_log;
+pub mod fdt;
 pub mod framebuffer_console;
 pub mod fs;
 pub mod grub;
@@ -312,6 +313,17 @@ pub fn init(coreboot_table_ptr: u64) -> ! {
         log::info!("  CFR: raw data found (parsed after heap init)");
     }
     log::info!("  Memory regions: {}", cb_info.memory_map.len());
+    if let Some((fdt_addr, fdt_size)) = cb_info.devicetree {
+        log::info!("  Devicetree: {:#x} ({} bytes)", fdt_addr, fdt_size);
+    }
+
+    // Parse FDT for platform hardware info (PCIe, GIC, etc.)
+    // Must happen before efi::init() which uses fdt_info for MMIO regions.
+    if let Some((fdt_addr, fdt_size)) = cb_info.devicetree
+        && let Some(plat) = unsafe { fdt::parse(fdt_addr, fdt_size) }
+    {
+        state::with_drivers_mut(|d| d.fdt_info = plat);
+    }
 
     // Initialize timing subsystem (calibrate TSC using ACPI PM timer)
     time::init(cb_info.acpi_rsdp);
@@ -375,9 +387,12 @@ pub fn init(coreboot_table_ptr: u64) -> ! {
     log::info!("CrabEFI initialized successfully!");
     log::info!("EFI System Table at: {:p}", efi::get_system_table());
 
-    // Discover PCI ECAM base from ACPI MCFG table before PCI init
+    // Discover PCI ECAM base from ACPI MCFG table or FDT before PCI init
     if let Some(ecam_base) = discover_ecam_from_acpi() {
         log::info!("PCI ECAM base from ACPI MCFG: {:#x}", ecam_base);
+        drivers::pci::set_ecam_base(ecam_base);
+    } else if let Some(ecam_base) = state::drivers().fdt_info.ecam_base {
+        log::info!("PCI ECAM base from FDT: {:#x}", ecam_base);
         drivers::pci::set_ecam_base(ecam_base);
     }
 

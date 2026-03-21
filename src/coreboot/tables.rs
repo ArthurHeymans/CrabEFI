@@ -41,6 +41,7 @@ pub mod tags {
     pub const CB_TAG_FMAP: u32 = 0x0037;
     pub const CB_TAG_ACPI_RSDP: u32 = 0x0043;
     pub const CB_TAG_CFR_ROOT: u32 = 0x0047;
+    pub const CB_TAG_DEVICETREE: u32 = 0x004a;
 }
 
 /// CBMEM IDs (used with CB_TAG_CBMEM_ENTRY)
@@ -136,6 +137,16 @@ struct CbAcpiRsdp {
     tag: u32,
     size: u32,
     rsdp_pointer: u64,
+}
+
+/// Devicetree (FDT) pointer
+#[repr(C, packed)]
+#[derive(FromBytes, Immutable, KnownLayout, Unaligned)]
+struct CbDevicetree {
+    tag: u32,
+    size: u32,
+    fdt_pointer: u64,
+    fdt_size: u32,
 }
 
 /// CBMEM reference (used for console, timestamps, etc.)
@@ -350,6 +361,8 @@ pub struct CorebootInfo {
     /// The coreboot tables persist in firmware memory for the entire boot,
     /// so this 'static reference is sound.
     pub cfr_raw: Option<&'static [u8]>,
+    /// Flattened device tree (FDT) pointer and size
+    pub devicetree: Option<(u64, u32)>,
 }
 
 impl CorebootInfo {
@@ -367,6 +380,7 @@ impl CorebootInfo {
             spi_flash: None,
             boot_media: None,
             cfr_raw: None,
+            devicetree: None,
         }
     }
 }
@@ -584,6 +598,9 @@ fn parse_record(record_bytes: &[u8], info: &mut CorebootInfo) {
         }
         tags::CB_TAG_CFR_ROOT => {
             save_cfr_raw(record_bytes, info);
+        }
+        tags::CB_TAG_DEVICETREE => {
+            parse_devicetree(record_bytes, info);
         }
         tags::CB_TAG_VERSION => {
             // Version string follows the 8-byte record header
@@ -845,6 +862,18 @@ fn parse_acpi_rsdp(record_bytes: &[u8], info: &mut CorebootInfo) {
     info.acpi_rsdp = Some(rsdp_pointer);
 
     log::debug!("ACPI RSDP: {:#x}", rsdp_pointer);
+}
+
+/// Parse devicetree (FDT) pointer
+fn parse_devicetree(record_bytes: &[u8], info: &mut CorebootInfo) {
+    let Ok((dt, _)) = CbDevicetree::read_from_prefix(record_bytes) else {
+        log::warn!("Failed to parse devicetree record");
+        return;
+    };
+    let fdt_pointer = dt.fdt_pointer;
+    let fdt_size = dt.fdt_size;
+    info.devicetree = Some((fdt_pointer, fdt_size));
+    log::debug!("Devicetree: {:#x} ({} bytes)", fdt_pointer, fdt_size);
 }
 
 /// Parse CBMEM console reference
