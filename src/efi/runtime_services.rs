@@ -170,7 +170,7 @@ pub fn get_runtime_code_address() -> u64 {
 
 extern "efiapi" fn get_time(time: *mut Time, capabilities: *mut TimeCapabilities) -> Status {
     #[cfg(feature = "rt-debug")]
-    if VIRTUAL_MODE.load(core::sync::atomic::Ordering::Relaxed) {
+    if VIRTUAL_MODE.load(core::sync::atomic::Ordering::Acquire) {
         rt_serial_print!("GetTime");
     }
     if time.is_null() {
@@ -207,7 +207,7 @@ extern "efiapi" fn get_time(time: *mut Time, capabilities: *mut TimeCapabilities
 
 extern "efiapi" fn set_time(_time: *mut Time) -> Status {
     #[cfg(feature = "rt-debug")]
-    if VIRTUAL_MODE.load(core::sync::atomic::Ordering::Relaxed) {
+    if VIRTUAL_MODE.load(core::sync::atomic::Ordering::Acquire) {
         rt_serial_print!("SetTime -> UNSUPPORTED");
     }
     Status::UNSUPPORTED
@@ -219,7 +219,7 @@ extern "efiapi" fn get_wakeup_time(
     _time: *mut Time,
 ) -> Status {
     #[cfg(feature = "rt-debug")]
-    if VIRTUAL_MODE.load(core::sync::atomic::Ordering::Relaxed) {
+    if VIRTUAL_MODE.load(core::sync::atomic::Ordering::Acquire) {
         rt_serial_print!("GetWakeupTime -> UNSUPPORTED");
     }
     Status::UNSUPPORTED
@@ -227,7 +227,7 @@ extern "efiapi" fn get_wakeup_time(
 
 extern "efiapi" fn set_wakeup_time(_enable: efi::Boolean, _time: *mut Time) -> Status {
     #[cfg(feature = "rt-debug")]
-    if VIRTUAL_MODE.load(core::sync::atomic::Ordering::Relaxed) {
+    if VIRTUAL_MODE.load(core::sync::atomic::Ordering::Acquire) {
         rt_serial_print!("SetWakeupTime -> UNSUPPORTED");
     }
     Status::UNSUPPORTED
@@ -269,7 +269,7 @@ extern "efiapi" fn set_virtual_address_map(
         virtual_map
     );
 
-    if VIRTUAL_MODE.load(core::sync::atomic::Ordering::Relaxed) {
+    if VIRTUAL_MODE.load(core::sync::atomic::Ordering::Acquire) {
         return Status::UNSUPPORTED;
     }
 
@@ -617,7 +617,7 @@ extern "efiapi" fn get_variable(
     data: *mut c_void,
 ) -> Status {
     #[cfg(feature = "rt-debug")]
-    if VIRTUAL_MODE.load(core::sync::atomic::Ordering::Relaxed) {
+    if VIRTUAL_MODE.load(core::sync::atomic::Ordering::Acquire) {
         rt_serial::str("[RT] GetVariable name=");
         if !variable_name.is_null() {
             for i in 0..32 {
@@ -762,7 +762,7 @@ extern "efiapi" fn get_next_variable_name(
     vendor_guid: *mut Guid,
 ) -> Status {
     #[cfg(feature = "rt-debug")]
-    if VIRTUAL_MODE.load(core::sync::atomic::Ordering::Relaxed) {
+    if VIRTUAL_MODE.load(core::sync::atomic::Ordering::Acquire) {
         rt_serial::str("[RT] GetNextVariableName name=");
         if !variable_name.is_null() {
             for i in 0..32 {
@@ -969,7 +969,7 @@ extern "efiapi" fn set_variable(
     data: *mut c_void,
 ) -> Status {
     #[cfg(feature = "rt-debug")]
-    if VIRTUAL_MODE.load(core::sync::atomic::Ordering::Relaxed) {
+    if VIRTUAL_MODE.load(core::sync::atomic::Ordering::Acquire) {
         rt_serial::str("[RT] SetVariable name=");
         if !variable_name.is_null() {
             for i in 0..32 {
@@ -1414,7 +1414,7 @@ extern "efiapi" fn query_variable_info(
     maximum_variable_size: *mut u64,
 ) -> Status {
     #[cfg(feature = "rt-debug")]
-    if VIRTUAL_MODE.load(core::sync::atomic::Ordering::Relaxed) {
+    if VIRTUAL_MODE.load(core::sync::atomic::Ordering::Acquire) {
         rt_serial_print!("QueryVariableInfo attr=", attributes);
     }
     if maximum_variable_storage_size.is_null()
@@ -1452,7 +1452,7 @@ extern "efiapi" fn query_variable_info(
 
 extern "efiapi" fn get_next_high_mono_count(_high_count: *mut u32) -> Status {
     #[cfg(feature = "rt-debug")]
-    if VIRTUAL_MODE.load(core::sync::atomic::Ordering::Relaxed) {
+    if VIRTUAL_MODE.load(core::sync::atomic::Ordering::Acquire) {
         rt_serial_print!("GetNextHighMonoCount -> UNSUPPORTED");
     }
     Status::UNSUPPORTED
@@ -1492,7 +1492,7 @@ extern "efiapi" fn update_capsule(
     _scatter_gather_list: efi::PhysicalAddress,
 ) -> Status {
     #[cfg(feature = "rt-debug")]
-    if VIRTUAL_MODE.load(core::sync::atomic::Ordering::Relaxed) {
+    if VIRTUAL_MODE.load(core::sync::atomic::Ordering::Acquire) {
         rt_serial_print!("UpdateCapsule -> UNSUPPORTED");
     }
     Status::UNSUPPORTED
@@ -1505,7 +1505,7 @@ extern "efiapi" fn query_capsule_capabilities(
     _reset_type: *mut ResetType,
 ) -> Status {
     #[cfg(feature = "rt-debug")]
-    if VIRTUAL_MODE.load(core::sync::atomic::Ordering::Relaxed) {
+    if VIRTUAL_MODE.load(core::sync::atomic::Ordering::Acquire) {
         rt_serial_print!("QueryCapsuleCapabilities -> UNSUPPORTED");
     }
     Status::UNSUPPORTED
