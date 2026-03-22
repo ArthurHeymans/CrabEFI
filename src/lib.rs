@@ -14,6 +14,7 @@
 // Enable alloc crate for heap allocations (needed for RustCrypto)
 extern crate alloc;
 
+pub mod acpi;
 pub mod arch;
 pub mod bls;
 pub mod boot;
@@ -114,81 +115,6 @@ pub fn display_secure_boot_error() {
 
     // Wait 3 seconds so the user can see the message
     time::delay_ms(3000);
-}
-
-/// Discover PCI ECAM base address from the ACPI MCFG table.
-///
-/// Walks the XSDT/RSDT to find the MCFG table and extracts the first
-/// ECAM base address allocation entry.
-fn discover_ecam_from_acpi() -> Option<u64> {
-    let rsdp_addr = state::drivers().platform.acpi_rsdp?;
-
-    // RSDP, SDT header structs are packed — safe to reference at any alignment
-    #[repr(C, packed)]
-    struct Rsdp {
-        signature: [u8; 8],
-        _checksum: u8,
-        _oem_id: [u8; 6],
-        revision: u8,
-        rsdt_address: u32,
-        _length: u32,
-        xsdt_address: u64,
-    }
-
-    #[repr(C, packed)]
-    struct SdtHeader {
-        signature: [u8; 4],
-        length: u32,
-    }
-
-    let rsdp = unsafe { &*(rsdp_addr as *const Rsdp) };
-    if &rsdp.signature != b"RSD PTR " {
-        return None;
-    }
-
-    let (root_addr, is_xsdt) = if rsdp.revision >= 2 && rsdp.xsdt_address != 0 {
-        (rsdp.xsdt_address, true)
-    } else {
-        (rsdp.rsdt_address as u64, false)
-    };
-    if root_addr == 0 {
-        return None;
-    }
-
-    let root_header = unsafe { &*(root_addr as *const SdtHeader) };
-    // Full ACPI SDT header is 36 bytes (signature, length, revision, checksum, oem fields, etc.)
-    // Our SdtHeader only has the first 8 bytes we need, but entries start after the full 36.
-    const ACPI_SDT_HEADER_SIZE: usize = 36;
-    let entry_size = if is_xsdt { 8 } else { 4 };
-    let num_entries = (root_header.length as usize - ACPI_SDT_HEADER_SIZE) / entry_size;
-    let entries_base = root_addr + ACPI_SDT_HEADER_SIZE as u64;
-
-    for i in 0..num_entries {
-        let table_addr = if is_xsdt {
-            unsafe { ((entries_base + (i * 8) as u64) as *const u64).read_unaligned() }
-        } else {
-            unsafe { ((entries_base + (i * 4) as u64) as *const u32).read_unaligned() as u64 }
-        };
-        if table_addr == 0 {
-            continue;
-        }
-
-        let header = unsafe { &*(table_addr as *const SdtHeader) };
-        if &header.signature == b"MCFG" {
-            // MCFG layout: 36-byte ACPI header + 8 bytes reserved + allocation entries (16 bytes each)
-            // Each entry: base_address(u64), segment(u16), start_bus(u8), end_bus(u8), reserved(u32)
-            let mcfg_len = header.length as usize;
-            if mcfg_len >= 44 + 16 {
-                // First allocation entry base address is at offset 44
-                let base = unsafe { ((table_addr + 44) as *const u64).read_unaligned() };
-                if base != 0 {
-                    return Some(base);
-                }
-            }
-        }
-    }
-
-    None
 }
 
 /// Initialize the CrabEFI firmware
@@ -319,11 +245,18 @@ pub fn init(coreboot_table_ptr: u64) -> ! {
     }
 
     // Parse FDT for platform hardware info (PCIe, GIC, etc.)
-    // Must happen before efi::init() which uses fdt_info for MMIO regions.
     if let Some((fdt_addr, fdt_size)) = cb_info.devicetree
         && let Some(plat) = unsafe { fdt::parse(fdt_addr, fdt_size) }
     {
         state::with_drivers_mut(|d| d.fdt_info = plat);
+    }
+
+    // Discover platform hardware from ACPI tables (MADT for GIC, MCFG for ECAM,
+    // SPCR for UART). This replaces hardcoded SBSA addresses with values from
+    // the firmware's own ACPI tables.
+    if let Some(rsdp_addr) = cb_info.acpi_rsdp {
+        let acpi_info = unsafe { acpi::discover_platform(rsdp_addr) };
+        state::with_drivers_mut(|d| d.acpi_info = acpi_info);
     }
 
     // Initialize timing subsystem (calibrate TSC using ACPI PM timer)
@@ -344,6 +277,13 @@ pub fn init(coreboot_table_ptr: u64) -> ! {
 
     // Initialize EFI environment
     efi::init(&cb_info);
+
+    // Now that the EFI memory allocator is up, add platform MMIO regions
+    // using addresses discovered from FDT and ACPI tables (instead of
+    // hardcoded values). This must happen after efi::init() (allocator)
+    // but before ExitBootServices.
+    #[cfg(target_arch = "aarch64")]
+    efi::add_platform_mmio_regions();
 
     // FirmwareState lives on the stack, which is inside the .stack section.
     // The .stack section is between __runtime_data_start and __runtime_data_end,
@@ -388,8 +328,8 @@ pub fn init(coreboot_table_ptr: u64) -> ! {
     log::info!("CrabEFI initialized successfully!");
     log::info!("EFI System Table at: {:p}", efi::get_system_table());
 
-    // Discover PCI ECAM base from ACPI MCFG table or FDT before PCI init
-    if let Some(ecam_base) = discover_ecam_from_acpi() {
+    // Discover PCI ECAM base — ACPI MCFG (via acpi module) takes priority, then FDT
+    if let Some(ecam_base) = state::drivers().acpi_info.ecam_base {
         log::info!("PCI ECAM base from ACPI MCFG: {:#x}", ecam_base);
         drivers::pci::set_ecam_base(ecam_base);
     } else if let Some(ecam_base) = state::drivers().fdt_info.ecam_base {

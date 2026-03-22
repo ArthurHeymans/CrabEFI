@@ -650,6 +650,9 @@ pub struct DriverState {
 
     /// Platform info from FDT (PCIe, GIC, etc.)
     pub fdt_info: crate::fdt::PlatformInfo,
+
+    /// Platform info from ACPI tables (GIC from MADT, UART from SPCR, ECAM from MCFG)
+    pub acpi_info: crate::fdt::PlatformInfo,
 }
 
 impl DriverState {
@@ -662,6 +665,7 @@ impl DriverState {
             storage_registry: StorageRegistry::new(),
             rng_available: false,
             fdt_info: crate::fdt::PlatformInfo::new(),
+            acpi_info: crate::fdt::PlatformInfo::new(),
         }
     }
 }
