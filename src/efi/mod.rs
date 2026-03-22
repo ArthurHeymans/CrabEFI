@@ -29,14 +29,10 @@ pub fn init(cb_info: &CorebootInfo) {
     // Initialize the memory allocator from coreboot memory map
     allocator::init(&cb_info.memory_map);
 
-    // On aarch64, coreboot's memory map only describes RAM and firmware-reserved
-    // regions. Device MMIO regions are absent, which means the UEFI memory map
-    // returned to the OS has gaps where MMIO lives. After ExitBootServices, the
-    // Linux kernel builds its page tables from the UEFI memory map — if the UART,
-    // GIC, or PCI MMIO regions are missing, earlycon and interrupts won't work.
-    // Add them explicitly as EfiMemoryMappedIO so the kernel can map them.
-    #[cfg(target_arch = "aarch64")]
-    add_platform_mmio_regions();
+    // NOTE: Platform MMIO regions (GIC, UART, PCIe) are NOT added here.
+    // They are added later by add_platform_mmio_regions() after ACPI table
+    // discovery has run, so the addresses come from ACPI/FDT instead of
+    // being hardcoded.
 
     // Reserve the EL2 MMU page table memory so the allocator doesn't hand it
     // out. Coreboot set up page tables starting at TTBR0_EL2 and we're still
@@ -500,7 +496,7 @@ pub fn free_pages(memory: &mut [u8], num_pages: u64) {
 /// - Peripherals (RTC, GPIO, etc.)
 /// - PCIe MMIO windows (for PCI device access)
 #[cfg(target_arch = "aarch64")]
-fn add_platform_mmio_regions() {
+pub fn add_platform_mmio_regions() {
     use allocator::{MemoryType, PAGE_SIZE};
 
     // Helper: add an MMIO region, logging success/failure
@@ -517,12 +513,17 @@ fn add_platform_mmio_regions() {
         }
     };
 
-    // Try to get platform info from FDT (if available)
-    let plat = crate::state::drivers().fdt_info;
+    // Platform info: FDT takes priority, ACPI fills gaps.
+    // No hardcoded fallbacks — all addresses come from firmware tables.
+    let fdt = crate::state::drivers().fdt_info;
+    let acpi = crate::state::drivers().acpi_info;
 
-    // GIC — from FDT or SBSA default
-    if let Some((base, size)) = plat.gicd {
-        let total = if let Some((rb, rsize)) = plat.gicr {
+    // GIC — from FDT, then ACPI MADT
+    let gicd = fdt.gicd.or(acpi.gicd);
+    let gicr = fdt.gicr.or(acpi.gicr);
+
+    if let Some((base, size)) = gicd {
+        let total = if let Some((rb, rsize)) = gicr {
             // Cover GICD + GICR as one contiguous block if adjacent,
             // otherwise add them separately
             let gicd_end = base + size;
@@ -536,47 +537,37 @@ fn add_platform_mmio_regions() {
             size
         };
         add_mmio(base, total, "GIC");
-    } else {
-        // SBSA default
-        add_mmio(0x4006_0000, 0xA_0000, "GIC");
     }
 
-    // Peripherals — SBSA default only (FDT platforms get UART from coreboot serial)
-    if plat.gicd.is_none() {
-        // SBSA: Peripherals block (UART, RTC, GPIO, AHCI, EHCI) 0x60000000-0x60200000
-        add_mmio(
-            0x6000_0000,
-            0x20_0000,
-            "Peripherals (UART/RTC/GPIO/AHCI/EHCI)",
-        );
+    // Peripherals — derive from UART base (ACPI SPCR or FDT)
+    // On SBSA, the peripherals (UART, RTC, GPIO, AHCI, EHCI) are in a 2MB
+    // block starting at the UART base address.
+    let uart_base = fdt.uart_base.or(acpi.uart_base);
+    if let Some(base) = uart_base {
+        add_mmio(base, 0x20_0000, "Peripherals (UART/RTC/GPIO/AHCI/EHCI)");
     }
 
-    // PCIe PIO — from FDT or SBSA default
-    if let Some((base, size)) = plat.pcie_pio {
+    // PCIe PIO
+    if let Some((base, size)) = fdt.pcie_pio.or(acpi.pcie_pio) {
         add_mmio(base, size, "PCIe PIO");
-    } else if plat.gicd.is_none() {
-        add_mmio(0x7FFF_0000, 0x1_0000, "PCIe PIO");
     }
 
-    // PCIe 32-bit MMIO — from FDT or SBSA default
-    if let Some((base, size)) = plat.pcie_mmio32 {
+    // PCIe 32-bit MMIO
+    if let Some((base, size)) = fdt.pcie_mmio32.or(acpi.pcie_mmio32) {
         add_mmio(base, size, "PCIe MMIO32");
-    } else if plat.gicd.is_none() {
-        add_mmio(0x8000_0000, 0x7000_0000, "PCIe MMIO");
     }
 
-    // PCIe 64-bit MMIO (if from FDT)
-    if let Some((base, size)) = plat.pcie_mmio64 {
+    // PCIe 64-bit MMIO
+    if let Some((base, size)) = fdt.pcie_mmio64.or(acpi.pcie_mmio64) {
         add_mmio(base, size, "PCIe MMIO64");
     }
 
-    // PCIe ECAM — from FDT
-    if let Some(base) = plat.ecam_base
-        && let Some(size) = plat.ecam_size
+    // PCIe ECAM — from FDT or ACPI MCFG
+    if let Some(base) = fdt.ecam_base.or(acpi.ecam_base)
+        && let Some(size) = fdt.ecam_size.or(acpi.ecam_size)
     {
         add_mmio(base, size, "PCIe ECAM");
     }
-    // SBSA ECAM (0xF0000000-0x100000000) is already in coreboot map as Reserved
 }
 
 /// Reserve the EL2 MMU page table memory (aarch64 only)
