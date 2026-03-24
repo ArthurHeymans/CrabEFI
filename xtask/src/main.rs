@@ -245,6 +245,9 @@ fn cmd_build(release: bool, arch: Arch, machine: Machine) -> Result<()> {
 
     let mut cmd = std::process::Command::new("cargo");
     cmd.arg("build");
+    // Build the coreboot payload binary (the binary target lives in the
+    // crabefi-coreboot workspace member, not in the root library crate).
+    cmd.arg("-p").arg("crabefi-coreboot");
     if release {
         cmd.arg("--release");
     }
