@@ -25,25 +25,11 @@ pub use tables::{
     BootMediaInfo, CorebootInfo, FlashMmapWindow, SerialInfo, Smmstorev2Info, SpiFlashInfo,
 };
 
-/// Store framebuffer info in global state
-pub fn store_framebuffer(fb: FramebufferInfo) {
-    crate::state::with_drivers_mut(|drivers| {
-        drivers.platform.framebuffer = Some(fb);
-    });
-}
-
 /// Store the coreboot framebuffer record address for later invalidation
 pub fn store_framebuffer_record_addr(addr: u64) {
     crate::state::with_drivers_mut(|drivers| {
         drivers.platform.coreboot_fb_record_addr = Some(addr);
     });
-}
-
-/// Get access to the global framebuffer info
-///
-/// Returns the framebuffer info if available.
-pub fn get_framebuffer() -> Option<FramebufferInfo> {
-    crate::state::try_get().and_then(|state| state.drivers.platform.framebuffer)
 }
 
 /// Store SMMSTORE v2 info in global state
@@ -102,7 +88,7 @@ static CFR_PTR: AtomicPtr<CfrInfo> = AtomicPtr::new(core::ptr::null_mut());
 ///
 /// Panics if called more than once. The single-call invariant ensures that
 /// `&'static` references handed out by [`get_cfr`] remain valid.
-pub(crate) fn store_cfr(cfr: CfrInfo) {
+pub fn store_cfr(cfr: CfrInfo) {
     let boxed = Box::new(cfr);
     let ptr = Box::into_raw(boxed);
     let old = CFR_PTR.swap(ptr, Ordering::SeqCst);

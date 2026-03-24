@@ -29,6 +29,48 @@ pub struct FramebufferInfo {
     pub blue_mask_size: u8,
 }
 
+impl From<crate::platform::FramebufferConfig> for FramebufferInfo {
+    fn from(fb: crate::platform::FramebufferConfig) -> Self {
+        Self {
+            physical_address: fb.physical_address,
+            x_resolution: fb.width,
+            y_resolution: fb.height,
+            bytes_per_line: fb.bytes_per_line(),
+            bits_per_pixel: fb.bits_per_pixel,
+            red_mask_pos: fb.red_mask_pos,
+            red_mask_size: fb.red_mask_size,
+            green_mask_pos: fb.green_mask_pos,
+            green_mask_size: fb.green_mask_size,
+            blue_mask_pos: fb.blue_mask_pos,
+            blue_mask_size: fb.blue_mask_size,
+        }
+    }
+}
+
+impl From<FramebufferInfo> for crate::platform::FramebufferConfig {
+    fn from(fb: FramebufferInfo) -> Self {
+        let bpp = fb.bits_per_pixel as u32;
+        Self {
+            physical_address: fb.physical_address,
+            width: fb.x_resolution,
+            height: fb.y_resolution,
+            // Convert bytes-per-line to pixels-per-scanline
+            stride: if bpp > 0 {
+                fb.bytes_per_line / (bpp / 8)
+            } else {
+                fb.x_resolution
+            },
+            bits_per_pixel: fb.bits_per_pixel,
+            red_mask_pos: fb.red_mask_pos,
+            red_mask_size: fb.red_mask_size,
+            green_mask_pos: fb.green_mask_pos,
+            green_mask_size: fb.green_mask_size,
+            blue_mask_pos: fb.blue_mask_pos,
+            blue_mask_size: fb.blue_mask_size,
+        }
+    }
+}
+
 impl FramebufferInfo {
     /// Get the size of the framebuffer in bytes
     pub fn size(&self) -> u64 {

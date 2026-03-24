@@ -8,10 +8,10 @@
 //! - **FADT → DSDT** — Full AML interpreter for platform device discovery
 //!   (`_HID`, `_CRS` resource templates with all memory descriptor types)
 
-use crate::fdt::{DsdtDevice, MAX_DSDT_DEVICES, PlatformInfo};
 use acpi::{AcpiTables, Handle, Handler, PciAddress, PhysicalMapping};
 use core::ptr::NonNull;
 use core::sync::atomic::{AtomicU64, Ordering};
+use crabefi::fdt::{DsdtDevice, MAX_DSDT_DEVICES, PlatformInfo};
 
 /// ECAM base for PCI config space access from the Handler.
 /// Set when we parse MCFG, before the AML interpreter runs.
@@ -78,7 +78,7 @@ impl Handler for CrabEfiHandler {
     fn read_io_u8(&self, port: u16) -> u8 {
         #[cfg(target_arch = "x86_64")]
         {
-            unsafe { crate::arch::x86_64::io::inb(port) }
+            unsafe { crabefi::arch::x86_64::io::inb(port) }
         }
         #[cfg(not(target_arch = "x86_64"))]
         {
@@ -89,7 +89,7 @@ impl Handler for CrabEfiHandler {
     fn read_io_u16(&self, port: u16) -> u16 {
         #[cfg(target_arch = "x86_64")]
         {
-            unsafe { crate::arch::x86_64::io::inw(port) }
+            unsafe { crabefi::arch::x86_64::io::inw(port) }
         }
         #[cfg(not(target_arch = "x86_64"))]
         {
@@ -100,7 +100,7 @@ impl Handler for CrabEfiHandler {
     fn read_io_u32(&self, port: u16) -> u32 {
         #[cfg(target_arch = "x86_64")]
         {
-            unsafe { crate::arch::x86_64::io::inl(port) }
+            unsafe { crabefi::arch::x86_64::io::inl(port) }
         }
         #[cfg(not(target_arch = "x86_64"))]
         {
@@ -111,7 +111,7 @@ impl Handler for CrabEfiHandler {
     fn write_io_u8(&self, port: u16, value: u8) {
         #[cfg(target_arch = "x86_64")]
         {
-            unsafe { crate::arch::x86_64::io::outb(port, value) }
+            unsafe { crabefi::arch::x86_64::io::outb(port, value) }
         }
         #[cfg(not(target_arch = "x86_64"))]
         {
@@ -121,7 +121,7 @@ impl Handler for CrabEfiHandler {
     fn write_io_u16(&self, port: u16, value: u16) {
         #[cfg(target_arch = "x86_64")]
         {
-            unsafe { crate::arch::x86_64::io::outw(port, value) }
+            unsafe { crabefi::arch::x86_64::io::outw(port, value) }
         }
         #[cfg(not(target_arch = "x86_64"))]
         {
@@ -131,7 +131,7 @@ impl Handler for CrabEfiHandler {
     fn write_io_u32(&self, port: u16, value: u32) {
         #[cfg(target_arch = "x86_64")]
         {
-            unsafe { crate::arch::x86_64::io::outl(port, value) }
+            unsafe { crabefi::arch::x86_64::io::outl(port, value) }
         }
         #[cfg(not(target_arch = "x86_64"))]
         {
@@ -163,8 +163,8 @@ impl Handler for CrabEfiHandler {
     // --- Timing ---
 
     fn nanos_since_boot(&self) -> u64 {
-        let cnt = crate::time::read_counter();
-        let freq = crate::time::counter_frequency();
+        let cnt = crabefi::time::read_counter();
+        let freq = crabefi::time::counter_frequency();
         if freq == 0 {
             return 0;
         }
@@ -173,13 +173,13 @@ impl Handler for CrabEfiHandler {
     }
 
     fn stall(&self, microseconds: u64) {
-        let freq = crate::time::counter_frequency();
+        let freq = crabefi::time::counter_frequency();
         if freq == 0 {
             return;
         }
         let ticks = microseconds * freq / 1_000_000;
-        let start = crate::time::read_counter();
-        while crate::time::read_counter().wrapping_sub(start) < ticks {
+        let start = crabefi::time::read_counter();
+        while crabefi::time::read_counter().wrapping_sub(start) < ticks {
             core::hint::spin_loop();
         }
     }
