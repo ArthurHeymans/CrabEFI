@@ -96,6 +96,18 @@ impl MemoryType {
                 | MemoryType::LoaderData
         )
     }
+
+    /// Default EFI memory attributes (cache capabilities) for this type.
+    ///
+    /// DRAM-backed types support WC|WT|WB caching. MMIO types are UC only.
+    pub fn default_attributes(&self) -> u64 {
+        match self {
+            MemoryType::MemoryMappedIo | MemoryType::MemoryMappedIoPortSpace => {
+                attributes::EFI_MEMORY_UC
+            }
+            _ => attributes::EFI_MEMORY_RAM_CAPS,
+        }
+    }
 }
 
 impl TryFrom<u32> for MemoryType {
@@ -311,22 +323,7 @@ impl MemoryAllocator {
                 memory_type
             );
 
-            // Attributes describe cache capabilities, not current mode.
-            // DRAM supports WC|WT|WB (0xE); MMIO is UC only (0x1).
-            let attribute = match memory_type {
-                MemoryType::ConventionalMemory
-                | MemoryType::BootServicesCode
-                | MemoryType::BootServicesData
-                | MemoryType::RuntimeServicesCode
-                | MemoryType::RuntimeServicesData
-                | MemoryType::LoaderCode
-                | MemoryType::LoaderData
-                | MemoryType::AcpiReclaimMemory => attributes::EFI_MEMORY_RAM_CAPS,
-                MemoryType::MemoryMappedIo | MemoryType::MemoryMappedIoPortSpace => {
-                    attributes::EFI_MEMORY_UC
-                }
-                _ => attributes::EFI_MEMORY_RAM_CAPS,
-            };
+            let attribute = memory_type.default_attributes();
 
             let desc = MemoryDescriptor::new(memory_type, region.start, num_pages, attribute);
 
@@ -338,6 +335,73 @@ impl MemoryAllocator {
         // Sort by physical address
         self.sort_entries();
         // Merge adjacent regions of the same type
+        self.merge_entries();
+
+        log::info!(
+            "Memory allocator initialized with {} entries",
+            self.entries.len()
+        );
+    }
+
+    /// Initialize the allocator from a platform-provided memory map.
+    ///
+    /// This is the `init_platform()` counterpart to `init_from_coreboot()`.
+    /// Converts `platform::MemoryRegion` entries into EFI memory descriptors.
+    pub fn init_from_platform(&mut self, regions: &[crate::platform::MemoryRegion]) {
+        use crate::platform::MemoryType as PlatMemType;
+
+        self.entries.clear();
+        self.map_key = 1;
+
+        log::info!("Importing platform memory map ({} regions):", regions.len());
+        for region in regions {
+            let memory_type = match region.region_type {
+                PlatMemType::Ram => MemoryType::ConventionalMemory,
+                PlatMemType::Reserved => MemoryType::ReservedMemoryType,
+                PlatMemType::AcpiReclaimable => MemoryType::AcpiReclaimMemory,
+                PlatMemType::AcpiNvs => MemoryType::AcpiMemoryNvs,
+                PlatMemType::Mmio => MemoryType::MemoryMappedIo,
+                PlatMemType::RuntimeServicesCode => MemoryType::RuntimeServicesCode,
+                PlatMemType::RuntimeServicesData => MemoryType::RuntimeServicesData,
+            };
+
+            let num_pages = match region.size.checked_add(PAGE_SIZE - 1) {
+                Some(size_rounded) => size_rounded / PAGE_SIZE,
+                None => {
+                    log::warn!(
+                        "Region at {:#x} has size that overflows, skipping",
+                        region.base
+                    );
+                    continue;
+                }
+            };
+
+            log::info!(
+                "  {:#010x}-{:#010x} {:?} -> {:?}",
+                region.base,
+                region.base + region.size,
+                region.region_type,
+                memory_type
+            );
+
+            let attribute = memory_type.default_attributes();
+
+            // RuntimeServices types get the RUNTIME attribute.
+            let attribute = match region.region_type {
+                PlatMemType::RuntimeServicesCode | PlatMemType::RuntimeServicesData => {
+                    attribute | attributes::EFI_MEMORY_RUNTIME
+                }
+                _ => attribute,
+            };
+
+            let desc = MemoryDescriptor::new(memory_type, region.base, num_pages, attribute);
+
+            if self.entries.push(desc).is_err() {
+                log::warn!("Memory map full, ignoring region at {:#x}", region.base);
+            }
+        }
+
+        self.sort_entries();
         self.merge_entries();
 
         log::info!(
@@ -739,6 +803,53 @@ impl MemoryAllocator {
     /// Get the number of entries
     pub fn entry_count(&self) -> usize {
         self.entries.len()
+    }
+
+    /// Dump all memory map entries to the log (for debugging).
+    ///
+    /// This prints every entry in the internal sorted list, which is the
+    /// pre-merge view. The EFI GetMemoryMap merges adjacent same-type
+    /// entries, so the actual EFI map may have fewer entries.
+    pub fn dump_entries(&self) {
+        let type_name = |t: u32| -> &'static str {
+            match t {
+                0 => "Reserved",
+                1 => "LoaderCode",
+                2 => "LoaderData",
+                3 => "BSCode",
+                4 => "BSData",
+                5 => "RTCode",
+                6 => "RTData",
+                7 => "Conventional",
+                8 => "Unusable",
+                9 => "ACPIReclaim",
+                10 => "ACPINvs",
+                11 => "MMIO",
+                12 => "MMIOPort",
+                13 => "PalCode",
+                14 => "Persistent",
+                _ => "Unknown",
+            }
+        };
+        log::info!(
+            "Memory map dump ({} entries, {} after merge):",
+            self.entries.len(),
+            self.count_merged_entries()
+        );
+        for (i, e) in self.entries.iter().enumerate() {
+            let end = e.end();
+            let size_mb = (e.number_of_pages * PAGE_SIZE) >> 20;
+            log::info!(
+                "  [{:2}] {:#012x}-{:#012x} {:>12} {:6} pages ({} MB) attr={:#x}",
+                i,
+                e.physical_start,
+                end,
+                type_name(e.memory_type),
+                e.number_of_pages,
+                size_mb,
+                e.attribute
+            );
+        }
     }
 
     /// Mark boot services as exited
@@ -1208,6 +1319,13 @@ pub fn init(regions: &[MemoryRegion]) {
     });
 }
 
+/// Initialize the global allocator from a platform-provided memory map.
+pub fn init_from_platform(regions: &[crate::platform::MemoryRegion]) {
+    state::with_allocator_mut(|alloc| {
+        alloc.init_from_platform(regions);
+    });
+}
+
 /// Reserve a region of memory
 pub fn reserve_region(
     physical_start: u64,
@@ -1259,6 +1377,12 @@ pub fn allocate_pages(
 /// Free previously allocated pages
 pub fn free_pages(memory: u64, num_pages: u64) -> efi::Status {
     state::with_allocator_mut(|alloc| alloc.free_pages(memory, num_pages))
+}
+
+/// Dump the full memory map to the log (for debugging).
+pub fn dump_memory_map() {
+    let alloc = state::allocator();
+    alloc.dump_entries();
 }
 
 /// Get the memory map size
@@ -1384,7 +1508,8 @@ pub fn free_pool(buffer: *mut u8) -> efi::Status {
     free_pages(addr, num_pages)
 }
 
-// Linker symbols for section boundaries
+// Linker symbols for section boundaries (only when CrabEFI owns the binary layout).
+#[cfg(feature = "platform-entry")]
 unsafe extern "C" {
     static __runtime_code_start: u8;
     static __runtime_code_end: u8;
@@ -1392,7 +1517,12 @@ unsafe extern "C" {
     static __runtime_data_end: u8;
 }
 
-/// Reserve the CrabEFI runtime regions using linker-provided section boundaries
+/// Reserve the CrabEFI runtime regions using linker-provided section boundaries.
+///
+/// Only available with the `platform-entry` feature (when CrabEFI owns
+/// the linker script). Library consumers use `PlatformConfig.runtime_region`
+/// instead — see `efi::init_from_platform()`.
+#[cfg(feature = "platform-entry")]
 ///
 /// This marks the memory containing our code and data sections so that the OS
 /// keeps them mapped after ExitBootServices. The boundaries come from the

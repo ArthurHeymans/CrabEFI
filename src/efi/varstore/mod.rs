@@ -42,11 +42,15 @@
 
 pub mod deferred;
 pub mod edk2;
+pub mod edk2_backend;
 pub mod persistence;
 pub mod storage;
 
 // Re-export storage types
 pub use storage::{SpiStorageBackend, StorageBackend, StorageError};
+
+// Re-export the EDK2 variable backend for use by platforms with raw flash
+pub use edk2_backend::Edk2VarStore;
 
 use alloc::vec::Vec;
 use serde::{Deserialize, Serialize};

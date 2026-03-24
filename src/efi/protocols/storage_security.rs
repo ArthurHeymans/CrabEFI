@@ -170,6 +170,10 @@ extern "efiapi" fn storage_security_receive_data(
             log::warn!("StorageSecurity: SDHCI security commands not supported");
             return Status::UNSUPPORTED;
         }
+        StorageType::Platform { .. } => {
+            log::warn!("StorageSecurity: Platform device security commands not supported");
+            return Status::UNSUPPORTED;
+        }
     };
 
     match result {
@@ -270,6 +274,10 @@ extern "efiapi" fn storage_security_send_data(
         ),
         StorageType::Sdhci { .. } => {
             log::warn!("StorageSecurity: SDHCI security commands not supported");
+            return Status::UNSUPPORTED;
+        }
+        StorageType::Platform { .. } => {
+            log::warn!("StorageSecurity: Platform device security commands not supported");
             return Status::UNSUPPORTED;
         }
     };

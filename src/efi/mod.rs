@@ -16,35 +16,70 @@ pub mod system_table;
 pub mod utils;
 pub mod varstore;
 
-use crate::coreboot::tables::CorebootInfo;
 use r_efi::efi::{self, Status};
 
-/// Initialize the EFI environment
-///
-/// This sets up the system table, boot services, runtime services, and
-/// installs the console protocols.
-pub fn init(cb_info: &CorebootInfo) {
-    log::info!("Initializing EFI environment...");
+/// Initialize the EFI environment from platform configuration.
+pub fn init_from_platform(config: &crate::platform::PlatformConfig) {
+    log::info!("Initializing EFI environment (platform path)...");
 
-    // Initialize the memory allocator from coreboot memory map
-    allocator::init(&cb_info.memory_map);
+    // Initialize the memory allocator from the platform memory map
+    allocator::init_from_platform(config.memory_map);
 
-    // NOTE: Platform MMIO regions (GIC, UART, PCIe) are NOT added here.
-    // They are added later by add_platform_mmio_regions() after ACPI table
-    // discovery has run, so the addresses come from ACPI/FDT instead of
-    // being hardcoded.
+    // NOTE: add_platform_mmio_regions() is NOT called here. In library mode
+    // the caller's memory_map is authoritative — it must include all MMIO
+    // regions (GIC, UART, PCIe windows, platform devices) as MemoryType::Mmio
+    // entries. This avoids duplicate memory map entries and removes the need
+    // for ACPI/FDT parsing inside the library for this purpose.
+    //
+    // For the coreboot payload specifically, the post_heap_init callback calls
+    // efi::add_platform_mmio_regions() after ACPI discovery.
 
-    // Reserve the EL2 MMU page table memory so the allocator doesn't hand it
-    // out. Coreboot set up page tables starting at TTBR0_EL2 and we're still
-    // using them — if they get overwritten, the MMU faults and we crash.
+    // On aarch64, reserve EL2 page tables if running at EL2.
+    // When called from fstart (which typically runs at EL1), this is a no-op.
     #[cfg(target_arch = "aarch64")]
-    reserve_el2_page_tables();
+    {
+        let current_el: u64;
+        unsafe {
+            core::arch::asm!(
+                "mrs {}, CurrentEL",
+                out(reg) current_el,
+                options(nomem, nostack, preserves_flags)
+            );
+        }
+        let el = (current_el >> 2) & 0x3;
+        if el >= 2 {
+            reserve_el2_page_tables();
+        } else {
+            log::info!("Running at EL{} — skipping EL2 page table reservation", el);
+        }
+    }
 
-    // Reserve the runtime services memory regions using linker-provided boundaries.
-    // This marks CrabEFI's code and data sections as EfiRuntimeServicesCode/Data
-    // with EFI_MEMORY_RUNTIME attribute, which tells the OS to keep these regions
-    // mapped after ExitBootServices.
-    allocator::reserve_runtime_region();
+    // Reserve runtime services memory regions if the platform provided them.
+    if let Some(rt) = config.runtime_region {
+        use allocator::MemoryType;
+
+        let code_pages = rt.code_size.div_ceil(allocator::PAGE_SIZE);
+        let data_pages = rt.data_size.div_ceil(allocator::PAGE_SIZE);
+        if let Err(e) =
+            allocator::reserve_region(rt.code_base, code_pages, MemoryType::RuntimeServicesCode)
+        {
+            log::warn!("Failed to reserve runtime code region: {:?}", e);
+        }
+        if let Err(e) =
+            allocator::reserve_region(rt.data_base, data_pages, MemoryType::RuntimeServicesData)
+        {
+            log::warn!("Failed to reserve runtime data region: {:?}", e);
+        }
+    } else {
+        // Fall back to linker-symbol-based reservation. Only available when
+        // CrabEFI owns the linker script (platform-entry feature).
+        #[cfg(feature = "platform-entry")]
+        allocator::reserve_runtime_region();
+        #[cfg(not(feature = "platform-entry"))]
+        log::info!(
+            "No runtime region provided and no linker symbols — runtime services may not survive ExitBootServices"
+        );
+    }
 
     // Initialize system table with boot and runtime services
     unsafe {
@@ -54,74 +89,61 @@ pub fn init(cb_info: &CorebootInfo) {
         );
     }
 
-    // Install ACPI tables if available
-    if let Some(rsdp) = cb_info.acpi_rsdp {
+    // Install platform tables
+    if let Some(rsdp) = config.acpi_rsdp {
         system_table::install_acpi_tables(rsdp);
     } else {
-        log::warn!("No ACPI RSDP from coreboot - Linux may not have ACPI support!");
+        log::info!("No ACPI RSDP from platform");
     }
-
-    // Install SMBIOS tables if available
-    if let Some(smbios) = cb_info.smbios {
+    if let Some(smbios) = config.smbios {
         system_table::install_smbios_tables(smbios);
-    } else {
-        log::debug!("No SMBIOS tables from coreboot");
     }
-
-    // Install device tree (FDT) if available
-    if let Some((fdt_addr, fdt_size)) = cb_info.devicetree {
+    if let Some(fdt_bytes) = config.fdt {
+        let fdt_addr = fdt_bytes.as_ptr() as u64;
+        let fdt_size = fdt_bytes.len() as u32;
         system_table::install_devicetree(fdt_addr, fdt_size);
     }
 
-    // Install EFI Runtime Properties Table (UEFI 2.8+)
-    // This tells Linux which runtime services are supported.
-    // Required for efi_pstore, efivars, and other kernel modules.
+    // Install standard EFI tables and protocols
     system_table::install_rt_properties_table();
-
-    // Install minimal TPM2 event log tables
-    // Prevents kernel errors about failing to map ACPI memory for TPM log
     system_table::install_tpm_event_log();
 
-    // Create console handle - this will also have GOP installed on it
     let console_handle = init_console();
 
-    // Install Graphics Output protocol on the SAME handle as console
-    // This is important - GRUB expects GOP and ConOut on the same handle
-    if let Some(fb) = cb_info.framebuffer {
+    if let Some(fb) = config.framebuffer {
+        // Store globally so menus and boot_manager can access it via
+        // state::get_framebuffer() — works for both coreboot and platform paths.
+        crate::state::store_framebuffer(fb);
         if let Some(handle) = console_handle {
             init_graphics_output_on_handle(&fb, handle);
         }
-        // Initialize EFI console framebuffer output (bootloader text goes here too)
         protocols::console::init_framebuffer(fb);
     }
 
-    // Install Unicode Collation protocol
+    // Install standard protocols and finalize tables (shared with init)
+    install_standard_protocols_and_finalize();
+
+    // Dump the full memory map for debugging (output goes directly to serial,
+    // bypassing EFI ConOut — safe even if ConOut has issues).
+    allocator::dump_memory_map();
+
+    log::info!("EFI environment initialized (platform path)");
+}
+
+/// Install standard EFI protocols and finalize table checksums.
+///
+/// Shared by both [`init()`] and [`init_from_platform()`] — contains the
+/// protocol installations and table finalization that are identical in both
+/// paths.
+fn install_standard_protocols_and_finalize() {
     init_unicode_collation();
-
-    // Install Memory Attribute protocol
     init_memory_attribute();
-
-    // Install Serial IO protocol
     init_serial_io();
-
-    // Install RNG protocol (if RDRAND is available)
     init_rng();
-
-    // Install Console Control protocol (legacy, but some bootloaders need it)
     init_console_control();
-
-    // Install EFI Memory Attributes Table
-    // Linux and Windows use this to set proper page permissions for runtime regions
     system_table::install_memory_attributes_table();
-
-    // Dump configuration tables for debugging
     system_table::dump_configuration_tables();
-
-    // Compute CRC32 checksums for all EFI table headers.
-    // Must be done after all configuration tables and protocols are installed.
     system_table::update_crc32();
-
-    log::info!("EFI environment initialized");
 }
 
 /// Initialize console I/O
@@ -387,7 +409,7 @@ fn init_console_control() {
 /// Initialize Graphics Output Protocol (GOP) on a specific handle
 /// Installing GOP on the same handle as ConOut is important for GRUB compatibility
 fn init_graphics_output_on_handle(
-    framebuffer: &crate::coreboot::FramebufferInfo,
+    framebuffer: &crate::platform::FramebufferConfig,
     handle: efi::Handle,
 ) {
     use protocols::graphics_output::{GRAPHICS_OUTPUT_GUID, create_gop};
@@ -513,17 +535,12 @@ pub fn add_platform_mmio_regions() {
         }
     };
 
-    // Platform info: FDT takes priority, ACPI fills gaps.
-    // No hardcoded fallbacks — all addresses come from firmware tables.
-    let fdt = crate::state::drivers().fdt_info;
-    let acpi = crate::state::drivers().acpi_info;
+    // Try to get platform info from FDT (if available)
+    let plat = crate::state::drivers().fdt_info;
 
-    // GIC — from FDT, then ACPI MADT
-    let gicd = fdt.gicd.or(acpi.gicd);
-    let gicr = fdt.gicr.or(acpi.gicr);
-
-    if let Some((base, size)) = gicd {
-        let total = if let Some((rb, rsize)) = gicr {
+    // GIC — from FDT or SBSA default
+    if let Some((base, size)) = plat.gicd {
+        let total = if let Some((rb, rsize)) = plat.gicr {
             // Cover GICD + GICR as one contiguous block if adjacent,
             // otherwise add them separately
             let gicd_end = base + size;
@@ -537,43 +554,47 @@ pub fn add_platform_mmio_regions() {
             size
         };
         add_mmio(base, total, "GIC");
+    } else {
+        // SBSA default
+        add_mmio(0x4006_0000, 0xA_0000, "GIC");
     }
 
-    // Platform device MMIO — from DSDT Device scopes (_HID + _CRS).
-    // This covers UART, RTC, GPIO, AHCI, xHCI, etc. as described in ACPI.
-    for i in 0..acpi.dsdt_device_count {
-        let dev = &acpi.dsdt_devices[i];
-        add_mmio(dev.mmio_base, dev.mmio_size, dev.hid_str());
+    // Peripherals — SBSA default only (FDT platforms get UART from coreboot serial)
+    if plat.gicd.is_none() {
+        // SBSA: Peripherals block (UART, RTC, GPIO, AHCI, EHCI) 0x60000000-0x60200000
+        add_mmio(
+            0x6000_0000,
+            0x20_0000,
+            "Peripherals (UART/RTC/GPIO/AHCI/EHCI)",
+        );
     }
 
-    // FDT UART fallback — on platforms without DSDT (e.g. QEMU virt with FDT).
-    if acpi.dsdt_device_count == 0
-        && let Some(base) = fdt.uart_base
-    {
-        add_mmio(base, 0x1000, "UART (FDT)");
-    }
-
-    // PCIe PIO
-    if let Some((base, size)) = fdt.pcie_pio.or(acpi.pcie_pio) {
+    // PCIe PIO — from FDT or SBSA default
+    if let Some((base, size)) = plat.pcie_pio {
         add_mmio(base, size, "PCIe PIO");
+    } else if plat.gicd.is_none() {
+        add_mmio(0x7FFF_0000, 0x1_0000, "PCIe PIO");
     }
 
-    // PCIe 32-bit MMIO
-    if let Some((base, size)) = fdt.pcie_mmio32.or(acpi.pcie_mmio32) {
+    // PCIe 32-bit MMIO — from FDT or SBSA default
+    if let Some((base, size)) = plat.pcie_mmio32 {
         add_mmio(base, size, "PCIe MMIO32");
+    } else if plat.gicd.is_none() {
+        add_mmio(0x8000_0000, 0x7000_0000, "PCIe MMIO");
     }
 
-    // PCIe 64-bit MMIO
-    if let Some((base, size)) = fdt.pcie_mmio64.or(acpi.pcie_mmio64) {
+    // PCIe 64-bit MMIO (if from FDT)
+    if let Some((base, size)) = plat.pcie_mmio64 {
         add_mmio(base, size, "PCIe MMIO64");
     }
 
-    // PCIe ECAM — from FDT or ACPI MCFG
-    if let Some(base) = fdt.ecam_base.or(acpi.ecam_base)
-        && let Some(size) = fdt.ecam_size.or(acpi.ecam_size)
+    // PCIe ECAM — from FDT
+    if let Some(base) = plat.ecam_base
+        && let Some(size) = plat.ecam_size
     {
         add_mmio(base, size, "PCIe ECAM");
     }
+    // SBSA ECAM (0xF0000000-0x100000000) is already in coreboot map as Reserved
 }
 
 /// Reserve the EL2 MMU page table memory (aarch64 only)

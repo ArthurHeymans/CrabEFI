@@ -951,6 +951,12 @@ pub enum DevicePathInfo {
     },
     /// SDHCI (SD card) - uses USB device path with port=0
     Sdhci { pci_device: u8, pci_function: u8 },
+    /// Platform-provided block device (non-PCI).
+    ///
+    /// Uses a vendor-defined device path node since these devices have no
+    /// PCI topology. The `index` identifies the device in the platform
+    /// block device array.
+    Platform { index: usize },
 }
 
 /// Create a whole-disk device path from a DevicePathInfo
@@ -987,6 +993,12 @@ pub fn create_disk_device_path(info: &DevicePathInfo) -> *mut Protocol {
             pci_device,
             pci_function,
         } => create_usb_device_path(pci_device, pci_function, 0),
+        DevicePathInfo::Platform { .. } => {
+            // A proper vendor-defined node can be added later.
+            // Returning null causes the caller to skip device path installation,
+            // which is safe — the device is still bootable via BlockIO.
+            core::ptr::null_mut()
+        }
     }
 }
 
@@ -1075,5 +1087,6 @@ pub fn create_partition_device_path(
             partition_size,
             partition_guid,
         ),
+        DevicePathInfo::Platform { .. } => core::ptr::null_mut(),
     }
 }

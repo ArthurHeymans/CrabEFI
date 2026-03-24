@@ -9,11 +9,11 @@
 //! - Serial console: ANSI escape sequences are parsed for arrow keys, function keys, etc.
 //! - PS/2 keyboard: Scancodes are translated to EFI keys via the i8042 keyboard controller.
 
-use crate::coreboot::FramebufferInfo;
 use crate::drivers::keyboard_common as keyboard;
 use crate::drivers::serial;
 use crate::efi::boot_services::KEYBOARD_EVENT_ID;
 use crate::framebuffer_console::{CHAR_HEIGHT, CHAR_WIDTH, VGA_FONT_8X16};
+use crate::platform::FramebufferConfig;
 use crate::state::{self, InputState};
 use core::ffi::c_void;
 use r_efi::efi::{Boolean, Event, Guid, Status};
@@ -25,9 +25,9 @@ use r_efi::protocols::simple_text_output::Protocol as SimpleTextOutputProtocol;
 // ============================================================================
 
 /// Initialize the EFI console with framebuffer support
-pub fn init_framebuffer(fb: FramebufferInfo) {
-    let cols = fb.x_resolution / CHAR_WIDTH;
-    let rows = fb.y_resolution / CHAR_HEIGHT;
+pub fn init_framebuffer(fb: FramebufferConfig) {
+    let cols = fb.width / CHAR_WIDTH;
+    let rows = fb.height / CHAR_HEIGHT;
 
     // Reserve top portion for debug log, use bottom portion for EFI console
     // Use bottom half of screen for EFI console output
@@ -99,7 +99,7 @@ fn fb_put_char(c: char) {
 ///
 /// Uses the current foreground/background colors from ConsoleState.
 fn fb_draw_char(
-    fb: &FramebufferInfo,
+    fb: &FramebufferConfig,
     c: char,
     col: u32,
     row: u32,
@@ -141,7 +141,7 @@ fn fb_draw_char(
 /// Only scrolls the centered text region (delta_x..delta_x + cols*CHAR_WIDTH)
 /// within the row range start_row..max_row.
 fn fb_scroll_up(
-    fb: &FramebufferInfo,
+    fb: &FramebufferConfig,
     start_row: u32,
     max_row: u32,
     delta_x: u32,
@@ -149,7 +149,7 @@ fn fb_scroll_up(
     cols: u32,
     bg_color: (u8, u8, u8),
 ) {
-    let row_stride = fb.bytes_per_line as usize;
+    let row_stride = fb.bytes_per_line() as usize;
     let bpp = (fb.bits_per_pixel / 8) as usize;
     let text_width_bytes = (cols * CHAR_WIDTH) as usize * bpp;
     let x_offset_bytes = delta_x as usize * bpp;
@@ -983,12 +983,12 @@ pub(crate) fn keyboard_check_ready() -> bool {
 /// grid dimensions and `delta_x`/`delta_y` are the pixel offsets to center
 /// the grid within the framebuffer (matching EDK2 GraphicsConsole behavior).
 pub(crate) fn compute_centered_text_layout(
-    fb: &crate::coreboot::FramebufferInfo,
+    fb: &crate::platform::FramebufferConfig,
 ) -> (u32, u32, u32, u32) {
-    let cols = fb.x_resolution / CHAR_WIDTH;
-    let rows = fb.y_resolution / CHAR_HEIGHT;
-    let delta_x = (fb.x_resolution - cols * CHAR_WIDTH) / 2;
-    let delta_y = (fb.y_resolution - rows * CHAR_HEIGHT) / 2;
+    let cols = fb.width / CHAR_WIDTH;
+    let rows = fb.height / CHAR_HEIGHT;
+    let delta_x = (fb.width - cols * CHAR_WIDTH) / 2;
+    let delta_y = (fb.height - rows * CHAR_HEIGHT) / 2;
     (cols, rows, delta_x, delta_y)
 }
 
