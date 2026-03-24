@@ -31,8 +31,8 @@ pub fn init_from_platform(config: &crate::platform::PlatformConfig) {
     // entries. This avoids duplicate memory map entries and removes the need
     // for ACPI/FDT parsing inside the library for this purpose.
     //
-    // For the coreboot payload specifically, the post_heap_init callback calls
-    // efi::add_platform_mmio_regions() after ACPI discovery.
+    // Platforms that discover MMIO regions via ACPI (e.g., coreboot) call
+    // efi::add_platform_mmio_regions() themselves before init_platform().
 
     // On aarch64, reserve EL2 page tables if running at EL2.
     // When called from fstart (which typically runs at EL1), this is a no-op.

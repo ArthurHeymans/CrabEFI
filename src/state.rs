@@ -653,10 +653,10 @@ pub struct DriverState {
 
     /// Platform info from ACPI tables (GIC from MADT, UART from SPCR, ECAM from MCFG).
     ///
-    /// Populated by the coreboot payload's `post_heap_init` callback, which
-    /// runs ACPI discovery after the heap is available. Library consumers
-    /// provide MMIO regions via `PlatformConfig.memory_map` and ECAM via
-    /// `PlatformConfig.ecam_base`, so this field is empty for them.
+    /// Populated by platforms that perform ACPI discovery before calling
+    /// [`crate::init_platform()`] (using `heap_pre_initialized`).  Library
+    /// consumers that provide MMIO regions via `PlatformConfig.memory_map`
+    /// and ECAM via `PlatformConfig.ecam_base` leave this empty.
     ///
     /// `init_platform()` checks `acpi_info.ecam_base` as a fallback for PCI
     /// ECAM discovery (after `config.ecam_base`, before `fdt_info.ecam_base`).

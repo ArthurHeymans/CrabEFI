@@ -320,26 +320,26 @@ fn init_platform_impl(mut config: PlatformConfig) -> ! {
     drivers::keyboard_common::init();
 
     // ---- 8. Initialize EFI environment ----
+    //
+    // Always runs — sets up the EFI memory map, system table, ACPI/SMBIOS
+    // configuration tables, and runtime region reservations.  The page
+    // allocator is idempotent: if the caller already bootstrapped it
+    // (to get a heap before entry), re-initialization is skipped.
     efi::init_from_platform(&config);
 
     log::info!("CrabEFI initialized successfully!");
     log::info!("EFI System Table at: {:p}", efi::get_system_table());
 
     // ---- 9. Initialize heap ----
-    if !heap::init() {
+    //
+    // Skipped when the platform already set up the heap before entry
+    // (heap_pre_initialized == true).  The rest of the init sequence is
+    // identical regardless of this flag.
+    if !config.heap_pre_initialized && !heap::init() {
         log::error!("Failed to initialize heap allocator!");
     }
 
-    // ---- 10. Post-heap initialization callback ----
-    //
-    // Allows the caller to perform heap-dependent work (e.g., ACPI AML
-    // parsing, CFR parsing, MMIO region discovery) before PCI enumeration
-    // and the boot manager.
-    if let Some(hook) = config.post_heap_init {
-        hook();
-    }
-
-    // ---- 10b. Runtime log support ----
+    // ---- 10. Runtime log support ----
     #[cfg(feature = "rt-log")]
     {
         efi::rtlog::register_region();
@@ -349,7 +349,9 @@ fn init_platform_impl(mut config: PlatformConfig) -> ! {
     // ---- 11. Discover PCI ECAM and initialize PCI ----
     //
     // Priority: config.ecam_base > acpi_info.ecam_base > fdt_info.ecam_base.
-    // acpi_info is populated by the post_heap_init callback (ACPI discovery).
+    // acpi_info is populated by the platform before entry (when
+    // heap_pre_initialized is true) or left empty for library consumers
+    // that provide ecam_base directly.
     if let Some(ecam) = config.ecam_base {
         log::info!("PCI ECAM base from platform: {:#x}", ecam);
         drivers::pci::set_ecam_base(ecam);
