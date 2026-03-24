@@ -216,8 +216,8 @@ jobs:
 
   # ── GRUB + Linux boot-chain ─────────────────────────────────────────
 
-  build-boot-assets:
-    name: Build Boot Assets (GRUB + Linux)
+  build-boot-assets-x86_64:
+    name: Build Boot Assets x86_64 (GRUB + Linux)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -226,8 +226,14 @@ jobs:
         id: cache
         uses: actions/cache@v4
         with:
-          path: boot-assets
-          key: boot-assets-${{ hashFiles('ci/build-boot-assets.sh') }}
+          path: boot-assets/x86_64
+          key: boot-assets-x86_64-${{ hashFiles('ci/build-boot-assets.sh') }}
+
+      - name: Set up Go (for u-root)
+        if: steps.cache.outputs.cache-hit != 'true'
+        uses: actions/setup-go@v5
+        with:
+          go-version: 'stable'
 
       - name: Install kernel build dependencies
         if: steps.cache.outputs.cache-hit != 'true'
@@ -238,19 +244,56 @@ jobs:
 
       - name: Build boot assets
         if: steps.cache.outputs.cache-hit != 'true'
-        run: ci/build-boot-assets.sh
+        run: ci/build-boot-assets.sh --arch x86_64
 
       - name: Upload boot assets
         uses: actions/upload-artifact@v4
         with:
-          name: boot-assets
-          path: boot-assets/
+          name: boot-assets-x86_64
+          path: boot-assets/x86_64/
+          retention-days: 7
+
+  build-boot-assets-aarch64:
+    name: Build Boot Assets aarch64 (GRUB + Linux)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Restore cached boot assets
+        id: cache
+        uses: actions/cache@v4
+        with:
+          path: boot-assets/aarch64
+          key: boot-assets-aarch64-${{ hashFiles('ci/build-boot-assets.sh') }}
+
+      - name: Set up Go (for u-root)
+        if: steps.cache.outputs.cache-hit != 'true'
+        uses: actions/setup-go@v5
+        with:
+          go-version: 'stable'
+
+      - name: Install kernel build dependencies
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential bc flex bison libelf-dev \
+              curl xz-utils grub-common grub-efi-arm64-bin gcc-aarch64-linux-gnu
+
+      - name: Build boot assets
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: ci/build-boot-assets.sh --arch aarch64
+
+      - name: Upload boot assets
+        uses: actions/upload-artifact@v4
+        with:
+          name: boot-assets-aarch64
+          path: boot-assets/aarch64/
           retention-days: 7
 
   test-grub-linux:
     name: Test x86_64 (GRUB + Linux)
     runs-on: ubuntu-latest
-    needs: [build, build-boot-assets]
+    needs: [build, build-boot-assets-x86_64]
     steps:
       - uses: actions/checkout@v4
 
@@ -277,11 +320,47 @@ jobs:
       - name: Download boot assets
         uses: actions/download-artifact@v4
         with:
-          name: boot-assets
-          path: boot-assets/
+          name: boot-assets-x86_64
+          path: boot-assets/x86_64/
 
       - name: Run GRUB + Linux boot-chain test
-        run: ./crabefi test --app grub-linux --boot-assets-dir boot-assets --disable-kvm --timeout 180
+        run: ./crabefi test --app grub-linux --boot-assets-dir boot-assets/x86_64 --disable-kvm --timeout 180
+
+  test-grub-linux-aarch64:
+    name: Test aarch64/sbsa (GRUB + Linux)
+    runs-on: ubuntu-latest
+    needs: [build-aarch64, build-boot-assets-aarch64]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchains
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src
+          targets: aarch64-unknown-none
+
+      - name: Install stable toolchain for xtask
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qemu-system-arm mtools dosfstools zstd coreboot-utils
+
+      - name: Download CrabEFI ELF (aarch64)
+        uses: actions/download-artifact@v4
+        with:
+          name: crabefi-elf-aarch64
+          path: target/aarch64-unknown-none/release/
+
+      - name: Download boot assets
+        uses: actions/download-artifact@v4
+        with:
+          name: boot-assets-aarch64
+          path: boot-assets/aarch64/
+
+      - name: Run GRUB + Linux boot-chain test (aarch64/sbsa)
+        run: ./crabefi test --arch aarch64 --machine sbsa --app grub-linux --boot-assets-dir boot-assets/aarch64 --nvme --disable-kvm --timeout 180
 
   # ── aarch64 ───────────────────────────────────────────────────────────
 

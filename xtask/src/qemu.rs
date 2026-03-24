@@ -554,10 +554,9 @@ pub fn run_tests(config: &QemuConfig, disk_path: &Path, app_name: &str) -> Resul
             }
         }
         "grub-linux" => {
-            // ── GRUB + Linux boot-chain test ─────────────────────────
-            // The boot path is: CrabEFI -> GRUB (UEFI app) -> Linux.
-            // Linux will panic because there is no rootfs, but we just
-            // need to see that the entire chain executed.
+            // ── GRUB + Linux + u-root boot-chain test ────────────────
+            // Full boot path: CrabEFI -> GRUB -> Linux -> u-root init.
+            // u-root prints UROOT_BOOT_SUCCESS from its -uinitcmd.
 
             // Check that Linux actually started
             if result.output.contains("Linux version") {
@@ -568,17 +567,13 @@ pub fn run_tests(config: &QemuConfig, disk_path: &Path, app_name: &str) -> Resul
                 failed += 1;
             }
 
-            // Kernel panic is *expected* (no rootfs) -- but if we see
-            // it, it means Linux ran to the point of trying to mount
-            // the root filesystem, which is a solid indicator of a
-            // working boot chain.
-            if result.output.contains("Kernel panic") {
-                println!("[PASS] kernel_ran: Kernel ran to rootfs mount (expected panic)");
+            // Check that u-root userspace reached its init
+            if result.output.contains("UROOT_BOOT_SUCCESS") {
+                println!("[PASS] userspace: u-root init reached userspace");
                 passed += 1;
             } else {
-                // Not a failure -- the kernel might not reach panic
-                // within the timeout, or panic output may be suppressed.
-                println!("[INFO] kernel_panic: 'Kernel panic' not seen (may still be OK)");
+                println!("[FAIL] userspace: 'UROOT_BOOT_SUCCESS' not found in output");
+                failed += 1;
             }
         }
         "directory-test" => {

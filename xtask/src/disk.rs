@@ -417,17 +417,18 @@ pub fn create_directory_test_disk(output: &str, efi_app: &str, arch: Arch) -> Re
 /// Disk layout:
 ///   /EFI/BOOT/BOOTX64.EFI          GRUB standalone EFI binary
 ///   /boot/grub/grub.cfg             GRUB configuration
-///   /vmlinuz                        Linux bzImage
+///   /vmlinuz                        Linux kernel
+///   /initramfs.cpio                 u-root initramfs
 ///
 /// CrabEFI discovers the ESP, loads GRUB as the default UEFI boot
-/// application, GRUB reads its config (embedded or on-disk), and
-/// boots the Linux kernel.  The kernel panics because there is no
-/// root filesystem, but it prints enough to serial for the test
-/// harness to confirm the entire chain executed.
+/// application, GRUB reads its embedded config, loads the kernel and
+/// initramfs, and boots Linux into a u-root userspace that prints a
+/// test marker to the serial console.
 pub fn create_grub_linux_disk(
     output: &str,
     grub_efi: &str,
     kernel: &str,
+    initramfs: &str,
     grub_cfg: &str,
     arch: Arch,
 ) -> Result<()> {
@@ -435,6 +436,7 @@ pub fn create_grub_linux_disk(
     for (label, path) in [
         ("GRUB EFI", grub_efi),
         ("kernel", kernel),
+        ("initramfs", initramfs),
         ("grub.cfg", grub_cfg),
     ] {
         if !Path::new(path).exists() {
@@ -494,6 +496,16 @@ pub fn create_grub_linux_disk(
         bail!("Failed to install vmlinuz");
     }
     println!("  Installed vmlinuz");
+
+    // ── Install the initramfs ────────────────────────────────────────
+    let status = Command::new("mcopy")
+        .args(["-i", &disk_with_offset, initramfs, "::/initramfs.cpio"])
+        .status()
+        .context("mcopy initramfs")?;
+    if !status.success() {
+        bail!("Failed to install initramfs");
+    }
+    println!("  Installed initramfs.cpio");
 
     println!("Created: {}", output);
     Ok(())
