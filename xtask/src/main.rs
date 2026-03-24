@@ -76,6 +76,10 @@ enum Commands {
         /// Build in release mode (default, required for firmware)
         #[arg(long, default_value_t = true)]
         release: bool,
+
+        /// Enable graphical UI with mouse support
+        #[arg(long)]
+        ui: bool,
     },
 
     /// Run CrabEFI in QEMU
@@ -111,6 +115,10 @@ enum Commands {
         /// Path to existing disk image to use
         #[arg(long)]
         disk: Option<String>,
+
+        /// Enable graphical UI with mouse support
+        #[arg(long)]
+        ui: bool,
     },
 
     /// Run integration tests in QEMU
@@ -142,6 +150,10 @@ enum Commands {
         /// Timeout in seconds (default: 60)
         #[arg(long, default_value_t = 60)]
         timeout: u64,
+
+        /// Enable graphical UI with mouse support
+        #[arg(long)]
+        ui: bool,
     },
 
     /// Build a test EFI application
@@ -184,7 +196,7 @@ fn main() -> Result<()> {
     let machine = cli.machine;
 
     match cli.command {
-        Commands::Build { release } => cmd_build(release, arch, machine),
+        Commands::Build { release, ui } => cmd_build(release, ui, arch, machine),
         Commands::Run {
             coreboot_rom,
             ahci,
@@ -194,6 +206,7 @@ fn main() -> Result<()> {
             disable_kvm,
             app,
             disk,
+            ui,
         } => cmd_run(
             coreboot_rom,
             ahci,
@@ -203,6 +216,7 @@ fn main() -> Result<()> {
             disable_kvm,
             app,
             disk,
+            ui,
             arch,
             machine,
         ),
@@ -214,6 +228,7 @@ fn main() -> Result<()> {
             sdhci,
             disable_kvm,
             timeout,
+            ui,
         } => cmd_test(
             coreboot_rom,
             &app,
@@ -222,6 +237,7 @@ fn main() -> Result<()> {
             sdhci,
             disable_kvm,
             timeout,
+            ui,
             arch,
             machine,
         ),
@@ -233,7 +249,7 @@ fn main() -> Result<()> {
     }
 }
 
-fn cmd_build(release: bool, arch: Arch, machine: Machine) -> Result<()> {
+fn cmd_build(release: bool, ui: bool, arch: Arch, machine: Machine) -> Result<()> {
     let label = match (arch, machine) {
         (Arch::X86_64, _) => "x86_64".to_string(),
         (Arch::Aarch64, Machine::Sbsa) => "aarch64/sbsa".to_string(),
@@ -250,6 +266,9 @@ fn cmd_build(release: bool, arch: Arch, machine: Machine) -> Result<()> {
     cmd.arg("-p").arg("crabefi-coreboot");
     if release {
         cmd.arg("--release");
+    }
+    if ui {
+        cmd.arg("--features").arg("ui");
     }
 
     let target_triple = match arch {
@@ -292,6 +311,7 @@ fn cmd_run(
     disable_kvm: bool,
     app: Option<String>,
     disk: Option<String>,
+    ui: bool,
     arch: Arch,
     machine: Machine,
 ) -> Result<()> {
@@ -316,14 +336,14 @@ fn cmd_run(
         }
     } else {
         // Build CrabEFI first
-        cmd_build(true, arch, machine)?;
+        cmd_build(true, ui, arch, machine)?;
 
         // Prepare ROM with CrabEFI payload
         let crabefi_elf = rom::get_crabefi_elf(arch);
         rom::prepare_rom(&crabefi_elf, temp_dir.path(), arch, machine)?
     };
 
-    let config = qemu::QemuConfig {
+    let mut config = qemu::QemuConfig {
         coreboot_rom: firmware.coreboot_rom.to_string_lossy().to_string(),
         tfa_flash: firmware.tfa_flash.map(|p| p.to_string_lossy().to_string()),
         storage,
@@ -332,7 +352,18 @@ fn cmd_run(
         timeout_secs: None,
         arch,
         machine,
+        extra_devices: Vec::new(),
     };
+
+    // Add USB keyboard for UI testing.
+    // NOTE: We do NOT add -device usb-mouse because QEMU routes ALL window
+    // mouse events to the USB mouse exclusively, starving the PS/2 mouse.
+    // The PS/2 mouse (built into Q35's i8042) receives window mouse events
+    // by default when no USB pointing device is present.
+    if ui {
+        config.extra_devices.push("-device".to_string());
+        config.extra_devices.push("usb-kbd,bus=xhci.0".to_string());
+    }
 
     // If a disk is specified, use it directly
     if let Some(disk_path) = disk {
@@ -367,6 +398,7 @@ fn cmd_test(
     sdhci: bool,
     disable_kvm: bool,
     timeout: u64,
+    ui: bool,
     arch: Arch,
     machine: Machine,
 ) -> Result<()> {
@@ -391,7 +423,7 @@ fn cmd_test(
         }
     } else {
         // Build CrabEFI first
-        cmd_build(true, arch, machine)?;
+        cmd_build(true, ui, arch, machine)?;
 
         // Prepare ROM with CrabEFI payload
         let crabefi_elf = rom::get_crabefi_elf(arch);
@@ -407,6 +439,7 @@ fn cmd_test(
         timeout_secs: Some(timeout),
         arch,
         machine,
+        extra_devices: Vec::new(),
     };
 
     // Build the test app
