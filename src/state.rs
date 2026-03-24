@@ -606,12 +606,12 @@ impl Default for EfiState {
 // Driver State
 // ============================================================================
 
-use crate::coreboot::FramebufferInfo;
 use crate::drivers::pci::PciDevice;
 use crate::drivers::pci::access::AnyPciAccess;
 use crate::drivers::serial::AnySerial;
 use crate::drivers::storage::StorageRegistry;
 use crate::efi::protocols::serial_io::SerialIoMode;
+use crate::platform::FramebufferConfig;
 use heapless::Vec as HeaplessVec;
 use r_efi::efi::Boolean;
 use r_efi::protocols::simple_text_output::Mode as SimpleTextOutputMode;
@@ -651,7 +651,15 @@ pub struct DriverState {
     /// Platform info from FDT (PCIe, GIC, etc.)
     pub fdt_info: crate::fdt::PlatformInfo,
 
-    /// Platform info from ACPI tables (GIC from MADT, UART from SPCR, ECAM from MCFG)
+    /// Platform info from ACPI tables (GIC from MADT, UART from SPCR, ECAM from MCFG).
+    ///
+    /// Populated by the coreboot payload's `post_heap_init` callback, which
+    /// runs ACPI discovery after the heap is available. Library consumers
+    /// provide MMIO regions via `PlatformConfig.memory_map` and ECAM via
+    /// `PlatformConfig.ecam_base`, so this field is empty for them.
+    ///
+    /// `init_platform()` checks `acpi_info.ecam_base` as a fallback for PCI
+    /// ECAM discovery (after `config.ecam_base`, before `fdt_info.ecam_base`).
     pub acpi_info: crate::fdt::PlatformInfo,
 }
 
@@ -692,11 +700,19 @@ pub struct PciState {
 
 impl PciState {
     pub const fn new() -> Self {
-        use crate::drivers::pci::access::IoCamAccess;
         Self {
             devices: HeaplessVec::new(),
             ecam_base: None,
-            access: AnyPciAccess::IoCam(IoCamAccess),
+            // x86 defaults to legacy I/O CAM (ports 0xCF8/0xCFC).
+            // Non-x86 defaults to ECAM at address 0 — PCI init will
+            // replace this once a real ECAM base is discovered from
+            // ACPI MCFG, FDT, or PlatformConfig.ecam_base. Reads to
+            // ECAM address 0 return bus errors / 0xFFFFFFFF (no device),
+            // which is the correct "nothing here" response.
+            #[cfg(target_arch = "x86_64")]
+            access: AnyPciAccess::IoCam(crate::drivers::pci::access::IoCamAccess),
+            #[cfg(not(target_arch = "x86_64"))]
+            access: AnyPciAccess::Ecam(crate::drivers::pci::access::EcamAccess::new(0)),
         }
     }
 }
@@ -794,13 +810,16 @@ impl Default for TimingState {
 // Platform Info
 // ----------------------------------------------------------------------------
 
-/// Platform hardware info sourced from coreboot tables.
+/// Platform hardware info sourced from coreboot tables or platform config.
 ///
-/// This groups all the hardware discovery data that comes from parsing
-/// coreboot's lb_record table entries during early boot.
+/// Shared fields (framebuffer, ACPI RSDP) are used by both integration paths.
+/// Coreboot-specific fields (SMMSTORE, SPI flash, FMAP, CBMEM) are only
+/// populated by the coreboot payload's `init()` path and remain `None`/zero
+/// in library mode. They should be gated behind a feature once the SPI
+/// variable persistence code is fully abstracted behind `VariableBackend`.
 pub struct PlatformInfo {
     /// Global framebuffer info
-    pub framebuffer: Option<FramebufferInfo>,
+    pub framebuffer: Option<FramebufferConfig>,
 
     /// Address of the coreboot framebuffer record in the coreboot tables.
     /// Stored so we can invalidate it at ExitBootServices to prevent
@@ -876,7 +895,7 @@ pub enum ScreenMode {
 /// Console and display state
 pub struct ConsoleState {
     /// EFI console framebuffer info
-    pub efi_framebuffer: Option<FramebufferInfo>,
+    pub efi_framebuffer: Option<FramebufferConfig>,
     /// EFI console cursor position (col, row)
     pub cursor_pos: (u32, u32),
     /// EFI console dimensions (cols, rows)
@@ -898,12 +917,12 @@ pub struct ConsoleState {
     pub input: InputState,
 
     /// Logger framebuffer info (used by fb_log for debug output)
-    pub logger_framebuffer: Option<FramebufferInfo>,
+    pub logger_framebuffer: Option<FramebufferConfig>,
     /// Logger cursor position (row, col)
     pub logger_cursor: (u32, u32),
 
     /// GOP framebuffer for graphics output protocol Blt operations
-    pub gop_framebuffer: Option<FramebufferInfo>,
+    pub gop_framebuffer: Option<FramebufferConfig>,
 
     /// Screen mode (Text or Graphics) for ConsoleControl protocol
     pub screen_mode: ScreenMode,
@@ -1094,6 +1113,31 @@ where
     F: FnOnce(&mut DriverState) -> R,
 {
     with_mut(|state| f(&mut state.drivers))
+}
+
+// ---------------------------------------------------------------------------
+// Framebuffer state — source-agnostic (coreboot tables or platform config)
+// ---------------------------------------------------------------------------
+
+/// Store framebuffer info in global state.
+///
+/// Called from both the coreboot path (after parsing `lb_framebuffer`) and the
+/// platform library path (after converting `FramebufferConfig`). The stored
+/// info is used by boot menus, the Linux boot path (`screen_info`), and error
+/// display — all of which call [`get_framebuffer()`].
+pub fn store_framebuffer(fb: crate::platform::FramebufferConfig) {
+    with_drivers_mut(|drivers| {
+        drivers.platform.framebuffer = Some(fb);
+    });
+}
+
+/// Get the global framebuffer info, if available.
+///
+/// Returns `Some` when a framebuffer was provided by either coreboot tables
+/// or the platform library's `FramebufferConfig`. Used by boot menus,
+/// `boot_linux()` (screen_info), and error display.
+pub fn get_framebuffer() -> Option<crate::platform::FramebufferConfig> {
+    try_get().and_then(|state| state.drivers.platform.framebuffer)
 }
 
 /// Get a reference to the console state.

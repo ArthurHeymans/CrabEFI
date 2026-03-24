@@ -363,6 +363,42 @@ pub fn init(acpi_rsdp: Option<u64>) {
     aarch64_timer::init(acpi_rsdp);
 }
 
+/// Initialize timing subsystem from a platform-provided [`Timer`] trait object.
+///
+/// Used by [`crate::init_platform()`]. The platform timer is the source of
+/// truth — no architecture-specific hardware detection is attempted.
+pub fn init_from_platform(timer: &dyn crate::platform::Timer) {
+    let freq = timer.ticks_per_second();
+    if freq == 0 {
+        log::warn!("Platform timer reports 0 Hz frequency, using 1 MHz fallback");
+        let fallback = 1_000_000u64;
+        // SAFETY: single-threaded init; raw pointer avoids re-entrancy
+        // issues with the state lock.
+        unsafe {
+            let t = &mut (*crate::state::drivers_mut_ptr()).timing;
+            t.counter_freq_hz = fallback;
+            t.counter_cycles_per_us = 1;
+        }
+        return;
+    }
+
+    let cycles_per_us = (freq / 1_000_000).max(1);
+    // SAFETY: single-threaded init; raw pointer avoids re-entrancy
+    // issues with the state lock.
+    unsafe {
+        let t = &mut (*crate::state::drivers_mut_ptr()).timing;
+        t.counter_freq_hz = freq;
+        t.counter_cycles_per_us = cycles_per_us;
+        t.boot_counter = timer.current_ticks();
+    }
+
+    log::info!(
+        "Platform timer: {} MHz ({} cycles/us)",
+        freq / 1_000_000,
+        cycles_per_us
+    );
+}
+
 /// Spin-wait for approximately `us` microseconds
 #[inline]
 pub fn delay_us(us: u64) {
