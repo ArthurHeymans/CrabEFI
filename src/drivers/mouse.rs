@@ -476,9 +476,9 @@ impl MouseState {
     ///
     /// 2. **Synaptics touchpad** (absolute position):
     ///    NEWABS format:
-    ///      X = ((buf[3]&0x10)<<8) | ((buf[1]&0x0f)<<8) | buf[4]
-    ///      Y = ((buf[3]&0x20)<<7) | ((buf[1]&0xf0)<<4) | buf[5]
-    ///      Z = buf[2]
+    ///    X = ((buf[3]&0x10)<<8) | ((buf[1]&0x0f)<<8) | buf[4]
+    ///    Y = ((buf[3]&0x20)<<7) | ((buf[1]&0xf0)<<4) | buf[5]
+    ///    Z = buf[2]
     ///    Converted to relative motion by differencing consecutive positions
     ///    while Z > threshold.
     ///
@@ -571,15 +571,13 @@ pub fn init() {
     // ── Ensure AUX clock is running ───────────────────────────────────────────
     // keyboard::init() may have left AUX_DISABLE (bit 5) set in the
     // controller config byte, preventing any AUX communication.
-    if mouse.send_controller_cmd(0x20) {
-        if mouse.wait_output_ready() {
-            let mut cfg = mouse.data_port.get();
-            if cfg & (1 << 5) != 0 {
-                cfg &= !(1 << 5);
-                if mouse.send_controller_cmd(0x60) {
-                    let _ = mouse.wait_input_ready();
-                    mouse.data_port.set(cfg);
-                }
+    if mouse.send_controller_cmd(0x20) && mouse.wait_output_ready() {
+        let mut cfg = mouse.data_port.get();
+        if cfg & (1 << 5) != 0 {
+            cfg &= !(1 << 5);
+            if mouse.send_controller_cmd(0x60) {
+                let _ = mouse.wait_input_ready();
+                mouse.data_port.set(cfg);
             }
         }
     }

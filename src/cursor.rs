@@ -8,7 +8,7 @@
 //! Windows/X11 cursor shape. It uses XOR-like compositing (black outline
 //! with white fill) so it is visible on any background.
 
-use crate::coreboot::FramebufferInfo;
+use crate::FramebufferConfig as FramebufferInfo;
 
 /// Cursor width in pixels
 pub const CURSOR_W: usize = 12;
@@ -62,6 +62,12 @@ pub struct CursorRenderer {
     save_valid: [[bool; CURSOR_W]; CURSOR_H],
 }
 
+impl Default for CursorRenderer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl CursorRenderer {
     /// Create a new cursor renderer.
     pub const fn new() -> Self {
@@ -105,9 +111,8 @@ impl CursorRenderer {
             row.fill(false);
         }
 
-        for row in 0..CURSOR_H {
-            for col in 0..CURSOR_W {
-                let pixel = CURSOR_BITMAP[row][col];
+        for (row, bitmap_row) in CURSOR_BITMAP.iter().enumerate() {
+            for (col, &pixel) in bitmap_row.iter().enumerate() {
                 if pixel == 0 {
                     continue; // Transparent
                 }
@@ -116,8 +121,7 @@ impl CursorRenderer {
                 let py = y + row as i32;
 
                 // Bounds check
-                if px < 0 || py < 0 || px >= fb.x_resolution as i32 || py >= fb.y_resolution as i32
-                {
+                if px < 0 || py < 0 || px >= fb.width as i32 || py >= fb.height as i32 {
                     continue;
                 }
 
@@ -177,30 +181,30 @@ impl CursorRenderer {
 /// This reads raw bytes from the framebuffer and converts to a canonical
 /// format for save-under buffering.
 fn read_pixel(fb: &FramebufferInfo, x: u32, y: u32) -> u32 {
-    let offset = (y * fb.bytes_per_line + x * (fb.bits_per_pixel as u32 / 8)) as usize;
-    let base = fb.physical_address as *const u8;
+    let offset = fb.pixel_offset(x, y);
 
-    // SAFETY: The framebuffer address and dimensions come from coreboot tables
-    // and have been validated. x,y are bounds-checked by the caller.
+    // SAFETY: The framebuffer address and dimensions have been validated.
+    // x,y are bounds-checked by the caller.
     unsafe {
+        let base = fb.as_ptr() as *const u8;
         match fb.bits_per_pixel {
             32 => {
                 let ptr = base.add(offset);
-                let b = *ptr;
-                let g = *ptr.add(1);
-                let r = *ptr.add(2);
+                let b = ptr.read_volatile();
+                let g = ptr.add(1).read_volatile();
+                let r = ptr.add(2).read_volatile();
                 ((r as u32) << 16) | ((g as u32) << 8) | b as u32
             }
             24 => {
                 let ptr = base.add(offset);
-                let b = *ptr;
-                let g = *ptr.add(1);
-                let r = *ptr.add(2);
+                let b = ptr.read_volatile();
+                let g = ptr.add(1).read_volatile();
+                let r = ptr.add(2).read_volatile();
                 ((r as u32) << 16) | ((g as u32) << 8) | b as u32
             }
             16 => {
                 let ptr = base.add(offset) as *const u16;
-                let pixel = *ptr;
+                let pixel = ptr.read_volatile();
                 // RGB565: RRRRRGGGGGGBBBBB
                 let r = ((pixel >> 11) & 0x1F) as u32;
                 let g = ((pixel >> 5) & 0x3F) as u32;
