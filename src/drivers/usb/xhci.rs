@@ -12,7 +12,8 @@ use tock_registers::interfaces::{ReadWriteable, Readable, Writeable};
 use zerocopy::FromBytes;
 
 use super::controller::{
-    ConfigurationInfo, DeviceDescriptor, desc_type, parse_configuration, req_type, request,
+    ConfigurationInfo, DeviceDescriptor, HUB_DESCRIPTOR_TYPE, desc_type, hub_feature,
+    hub_port_status, parse_configuration, req_type, request,
 };
 
 // Import typed register structs and bitfield modules
@@ -27,6 +28,7 @@ use super::xhci_regs::{
     PORTSC_CHANGE_MASK, PORTSC_RW_MASK, TRB_CC_BABBLE_DETECTED, TRB_CC_SHORT_PACKET,
     TRB_CC_STALL_ERROR, TRB_CC_SUCCESS, TRB_CC_USB_TRANSACTION_ERROR, TRB_TYPE_ADDRESS_DEVICE,
     TRB_TYPE_COMMAND_COMPLETION, TRB_TYPE_CONFIGURE_ENDPOINT, TRB_TYPE_DATA, TRB_TYPE_ENABLE_SLOT,
+    TRB_TYPE_EVALUATE_CONTEXT,
     TRB_TYPE_HOST_CONTROLLER, TRB_TYPE_LINK, TRB_TYPE_NORMAL, TRB_TYPE_PORT_STATUS_CHANGE,
     TRB_TYPE_RESET_ENDPOINT, TRB_TYPE_SET_TR_DEQUEUE, TRB_TYPE_SETUP, TRB_TYPE_STATUS,
     TRB_TYPE_TRANSFER_EVENT, trb_cc_name,
@@ -92,6 +94,30 @@ impl SlotContext {
 
     fn set_root_hub_port(&mut self, port: u8) {
         self.dw1 = (self.dw1 & !0x00FF0000) | ((port as u32) << 16);
+    }
+
+    fn set_route_string(&mut self, route: u32) {
+        self.dw0 = (self.dw0 & !0x000FFFFF) | (route & 0x000FFFFF);
+    }
+
+    fn set_hub(&mut self, is_hub: bool) {
+        if is_hub {
+            self.dw0 |= 1 << 26;
+        } else {
+            self.dw0 &= !(1 << 26);
+        }
+    }
+
+    fn set_num_ports(&mut self, n: u8) {
+        self.dw1 = (self.dw1 & !0xFF000000) | ((n as u32) << 24);
+    }
+
+    fn set_parent_hub_slot(&mut self, slot: u8) {
+        self.dw2 = (self.dw2 & !0x000000FF) | (slot as u32);
+    }
+
+    fn set_parent_port_num(&mut self, port: u8) {
+        self.dw2 = (self.dw2 & !0x0000FF00) | ((port as u32) << 8);
     }
 }
 
@@ -355,12 +381,28 @@ pub struct UsbSlot {
     pub bulk_max_packet: u16,
     /// Is this a HID keyboard device?
     pub is_hid_keyboard: bool,
-    /// Interrupt IN endpoint for HID
+    /// Is this a HID mouse device?
+    pub is_hid_mouse: bool,
+    /// Interrupt IN endpoint for HID keyboard
     pub interrupt_in_ep: u8,
+    /// Mouse interrupt IN endpoint
+    pub mouse_interrupt_in_ep: u8,
+    /// Max packet size for mouse interrupt endpoint
+    pub mouse_interrupt_max_packet: u16,
+    /// Polling interval for mouse interrupt endpoint (in ms)
+    pub mouse_interrupt_interval: u8,
     /// Max packet size for interrupt endpoint
     pub interrupt_max_packet: u16,
     /// Polling interval for interrupt endpoint (in ms)
     pub interrupt_interval: u8,
+    /// Is this a hub?
+    pub is_hub: bool,
+    /// Number of downstream ports (if hub)
+    pub hub_ports: u8,
+    /// Route string for this device (xHCI hub topology)
+    pub route_string: u32,
+    /// Root hub port this device chain starts from
+    pub root_port: u8,
 }
 
 /// xHCI MMIO region size (64KB should cover all controllers)
@@ -1290,9 +1332,17 @@ impl XhciController {
             bulk_out_ep: 0,
             bulk_max_packet: 0,
             is_hid_keyboard: false,
+            is_hid_mouse: false,
             interrupt_in_ep: 0,
+            mouse_interrupt_in_ep: 0,
+            mouse_interrupt_max_packet: 0,
+            mouse_interrupt_interval: 0,
             interrupt_max_packet: 0,
             interrupt_interval: 0,
+            is_hub: false,
+            hub_ports: 0,
+            route_string: 0,
+            root_port: port,
         });
 
         Ok(())
@@ -1448,6 +1498,406 @@ impl XhciController {
             0,
             None,
         )?;
+        Ok(())
+    }
+
+    /// Configure a hub device and enumerate its downstream ports.
+    ///
+    /// This mirrors the EHCI `enumerate_hub()` logic adapted for xHCI's
+    /// route-string-based addressing model.
+    fn configure_and_enumerate_hub(
+        &mut self,
+        hub_slot_id: u8,
+        root_port: u8,
+    ) -> Result<(), XhciError> {
+        // Get config descriptor to find hub interface and SET_CONFIGURATION
+        let config_info = self.get_config_descriptor(hub_slot_id)?;
+
+        // Verify this is actually a hub
+        let has_hub_iface = config_info.interfaces[..config_info.num_interfaces]
+            .iter()
+            .any(|i| i.interface_class == 0x09);
+        let is_hub_class = self
+            .slots
+            .get(hub_slot_id as usize)
+            .and_then(|s| s.as_ref())
+            .map(|s| s.device_desc.device_class == 0x09)
+            .unwrap_or(false);
+
+        if !is_hub_class && !has_hub_iface {
+            return Err(XhciError::DeviceNotFound);
+        }
+
+        // Set configuration (activates hub endpoints)
+        if config_info.configuration_value > 0 {
+            self.set_configuration(hub_slot_id, config_info.configuration_value)?;
+        }
+
+        // Get hub descriptor
+        let mut hub_desc_buf = [0u8; 12];
+        self.control_transfer(
+            hub_slot_id,
+            req_type::DIR_IN | req_type::TYPE_CLASS | req_type::RCPT_DEVICE,
+            request::GET_DESCRIPTOR,
+            (HUB_DESCRIPTOR_TYPE as u16) << 8,
+            0,
+            Some(&mut hub_desc_buf),
+        )?;
+
+        let num_ports = hub_desc_buf[2];
+        let power_delay = (hub_desc_buf[5] as u64) * 2; // PwrOn2PwrGood in 2ms units
+
+        if num_ports == 0 || num_ports > 15 {
+            log::debug!("Hub has {} ports, skipping", num_ports);
+            return Ok(());
+        }
+
+        log::info!(
+            "xHCI: Hub slot {} has {} ports, power delay {}ms",
+            hub_slot_id,
+            num_ports,
+            power_delay
+        );
+
+        // Mark slot as hub and store route info
+        if let Some(slot) = self
+            .slots
+            .get_mut(hub_slot_id as usize)
+            .and_then(|s| s.as_mut())
+        {
+            slot.is_hub = true;
+            slot.hub_ports = num_ports;
+        }
+
+        // Update the hub's slot context via Evaluate Context so xHC knows
+        // this device is a hub (required for proper downstream routing).
+        self.evaluate_hub_context(hub_slot_id, num_ports)?;
+
+        // Power on all hub ports
+        for p in 1..=num_ports {
+            let _ = self.control_transfer(
+                hub_slot_id,
+                req_type::DIR_OUT | req_type::TYPE_CLASS | req_type::RCPT_OTHER,
+                request::SET_FEATURE,
+                hub_feature::PORT_POWER,
+                p as u16,
+                None,
+            );
+        }
+
+        crate::time::delay_ms(power_delay.max(100));
+
+        // Check each port for connected devices
+        for p in 1..=num_ports {
+            let mut status_buf = [0u8; 4];
+            if self
+                .control_transfer(
+                    hub_slot_id,
+                    req_type::DIR_IN | req_type::TYPE_CLASS | req_type::RCPT_OTHER,
+                    request::GET_STATUS,
+                    0,
+                    p as u16,
+                    Some(&mut status_buf),
+                )
+                .is_err()
+            {
+                continue;
+            }
+
+            let port_status = u16::from_le_bytes([status_buf[0], status_buf[1]]);
+            if (port_status & hub_port_status::CONNECTION) == 0 {
+                continue;
+            }
+
+            log::info!("xHCI: Device on hub slot {} port {}", hub_slot_id, p);
+
+            // Clear connection change
+            let _ = self.control_transfer(
+                hub_slot_id,
+                req_type::DIR_OUT | req_type::TYPE_CLASS | req_type::RCPT_OTHER,
+                request::CLEAR_FEATURE,
+                hub_feature::C_PORT_CONNECTION,
+                p as u16,
+                None,
+            );
+
+            // Reset the port
+            let _ = self.control_transfer(
+                hub_slot_id,
+                req_type::DIR_OUT | req_type::TYPE_CLASS | req_type::RCPT_OTHER,
+                request::SET_FEATURE,
+                hub_feature::PORT_RESET,
+                p as u16,
+                None,
+            );
+
+            crate::time::delay_ms(60);
+
+            // Poll for reset completion
+            let timeout = crate::time::Timeout::from_ms(500);
+            let mut speed = 0u8;
+            let mut reset_ok = false;
+            while !timeout.is_expired() {
+                let mut sb = [0u8; 4];
+                if self
+                    .control_transfer(
+                        hub_slot_id,
+                        req_type::DIR_IN | req_type::TYPE_CLASS | req_type::RCPT_OTHER,
+                        request::GET_STATUS,
+                        0,
+                        p as u16,
+                        Some(&mut sb),
+                    )
+                    .is_err()
+                {
+                    break;
+                }
+                let ps = u16::from_le_bytes([sb[0], sb[1]]);
+                let pc = u16::from_le_bytes([sb[2], sb[3]]);
+
+                if pc & 0x10 != 0 {
+                    // C_PORT_RESET
+                    let _ = self.control_transfer(
+                        hub_slot_id,
+                        req_type::DIR_OUT | req_type::TYPE_CLASS | req_type::RCPT_OTHER,
+                        request::CLEAR_FEATURE,
+                        hub_feature::C_PORT_RESET,
+                        p as u16,
+                        None,
+                    );
+                    if ps & hub_port_status::ENABLE != 0 {
+                        speed = if ps & hub_port_status::HIGH_SPEED != 0 {
+                            3
+                        } else if ps & hub_port_status::LOW_SPEED != 0 {
+                            2
+                        } else {
+                            1
+                        };
+                        reset_ok = true;
+                    }
+                    break;
+                }
+                crate::time::delay_ms(10);
+            }
+
+            if !reset_ok {
+                log::debug!("Hub port {} reset failed", p);
+                continue;
+            }
+
+            crate::time::delay_ms(10);
+
+            // Build route string: parent's route | (port << (4 * tier))
+            let parent_route = self
+                .slots
+                .get(hub_slot_id as usize)
+                .and_then(|s| s.as_ref())
+                .map(|s| s.route_string)
+                .unwrap_or(0);
+            // Find which nibble is the first zero (that's our tier)
+            let mut route = parent_route;
+            for tier in 0..5u32 {
+                if (route >> (tier * 4)) & 0xF == 0 {
+                    route |= (p as u32 & 0xF) << (tier * 4);
+                    break;
+                }
+            }
+
+            // Enable slot and address the downstream device
+            if let Err(e) = self.attach_device_on_hub(
+                hub_slot_id,
+                p,
+                speed,
+                route,
+                root_port,
+            ) {
+                log::warn!("Failed to attach device on hub port {}: {:?}", p, e);
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Issue an Evaluate Context command to inform the xHC that a device
+    /// is a hub (sets Hub flag and NumberOfPorts in the slot context).
+    fn evaluate_hub_context(
+        &mut self,
+        slot_id: u8,
+        num_ports: u8,
+    ) -> Result<(), XhciError> {
+        let slot = self
+            .slots
+            .get(slot_id as usize)
+            .and_then(|s| s.as_ref())
+            .ok_or(XhciError::DeviceNotFound)?;
+
+        let input_ctx = unsafe { &mut *slot.input_context };
+        input_ctx.control.add_flags = 0x1; // Evaluate slot context only
+        input_ctx.control.drop_flags = 0;
+        input_ctx.slot.set_hub(true);
+        input_ctx.slot.set_num_ports(num_ports);
+        // Context entries must cover at least slot + EP0
+        input_ctx.slot.set_context_entries(1);
+
+        let mut trb = Trb::default();
+        trb.param = slot.input_context as u64;
+        trb.set_type(TRB_TYPE_EVALUATE_CONTEXT);
+        trb.control |= (slot_id as u32) << 24;
+
+        self.cmd_ring.enqueue(&trb, false);
+        core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+        self.ring_doorbell(0, 0);
+
+        self.wait_command_completion()?;
+        Ok(())
+    }
+
+    /// Attach a device that is behind a USB hub.
+    fn attach_device_on_hub(
+        &mut self,
+        hub_slot_id: u8,
+        hub_port: u8,
+        speed: u8,
+        route_string: u32,
+        root_port: u8,
+    ) -> Result<(), XhciError> {
+        let slot_id = self.enable_slot()?;
+
+        // Allocate device context
+        let device_context_mem = efi::allocate_pages(1).ok_or(XhciError::AllocationFailed)?;
+        device_context_mem.fill(0);
+        let device_context = device_context_mem.as_ptr() as u64;
+
+        // Allocate input context
+        let input_context_mem = efi::allocate_pages(1).ok_or(XhciError::AllocationFailed)?;
+        input_context_mem.fill(0);
+        let input_context = input_context_mem.as_ptr() as u64;
+
+        // Allocate transfer ring for control endpoint
+        let transfer_ring_mem = efi::allocate_pages(1).ok_or(XhciError::AllocationFailed)?;
+        let transfer_ring = transfer_ring_mem.as_ptr() as u64;
+
+        let input = unsafe { &mut *(input_context_mem.as_mut_ptr() as *mut InputContext) };
+        input.control.add_flags = 0x3; // Add slot + EP0
+
+        // Slot context with hub topology info
+        input.slot.set_context_entries(1);
+        input.slot.set_speed(speed);
+        input.slot.set_root_hub_port(root_port + 1);
+        input.slot.set_route_string(route_string);
+        input.slot.set_parent_hub_slot(hub_slot_id);
+        input.slot.set_parent_port_num(hub_port);
+
+        // Control endpoint
+        let max_packet = match speed {
+            1 => 8,
+            2 => 8,
+            3 => 64,
+            4 => 512,
+            _ => 8,
+        };
+
+        input.endpoints[0].set_ep_type(4);
+        input.endpoints[0].set_max_packet_size(max_packet);
+        input.endpoints[0].set_max_burst_size(0);
+        input.endpoints[0].set_cerr(3);
+        input.endpoints[0].set_tr_dequeue_ptr(transfer_ring, true);
+        input.endpoints[0].set_avg_trb_length(8);
+
+        let ring = TrbRing::new(transfer_ring, 256);
+
+        // DCBAA
+        let dcbaa_entry = unsafe { &mut *((self.dcbaa + (slot_id as u64 * 8)) as *mut u64) };
+        *dcbaa_entry = device_context;
+
+        // Address Device command
+        let mut trb = Trb::default();
+        trb.param = input_context;
+        trb.set_type(TRB_TYPE_ADDRESS_DEVICE);
+        trb.control |= (slot_id as u32) << 24;
+
+        self.cmd_ring.enqueue(&trb, false);
+        core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+        self.ring_doorbell(0, 0);
+        self.wait_command_completion()?;
+        crate::time::delay_ms(2);
+
+        // Store slot info
+        let mut transfer_rings: [Option<TrbRing>; 31] = core::array::from_fn(|_| None);
+        transfer_rings[0] = Some(ring);
+
+        let slot_entry = self
+            .slots
+            .get_mut(slot_id as usize)
+            .ok_or(XhciError::NoFreeSlots)?;
+        *slot_entry = Some(UsbSlot {
+            slot_id,
+            device_context: device_context as *mut DeviceContext,
+            input_context: input_context as *mut InputContext,
+            transfer_rings,
+            device_desc: DeviceDescriptor::default(),
+            port: hub_port,
+            speed,
+            is_mass_storage: false,
+            mass_storage_interface: 0,
+            bulk_in_ep: 0,
+            bulk_out_ep: 0,
+            bulk_max_packet: 0,
+            is_hid_keyboard: false,
+            is_hid_mouse: false,
+            interrupt_in_ep: 0,
+            mouse_interrupt_in_ep: 0,
+            mouse_interrupt_max_packet: 0,
+            mouse_interrupt_interval: 0,
+            interrupt_max_packet: 0,
+            interrupt_interval: 0,
+            is_hub: false,
+            hub_ports: 0,
+            route_string,
+            root_port,
+        });
+
+        // Now enumerate the device (get descriptor, configure, etc.)
+        match self.get_device_descriptor(slot_id) {
+            Ok(desc) => {
+                let vid = desc.vendor_id;
+                let pid = desc.product_id;
+                let class = desc.device_class;
+                let num_configs = desc.num_configurations;
+                log::info!(
+                    "  Hub port device: VID={:04x} PID={:04x} Class={:02x}",
+                    vid, pid, class
+                );
+
+                if let Some(slot) = self
+                    .slots
+                    .get_mut(slot_id as usize)
+                    .and_then(|s| s.as_mut())
+                {
+                    slot.device_desc = desc;
+                }
+
+                // Configure as storage / keyboard / mouse
+                if class == 0x08 || (class == 0x00 && num_configs > 0) {
+                    let _ = self.configure_mass_storage(slot_id);
+                }
+                if class == 0x03 || (class == 0x00 && num_configs > 0) {
+                    let _ = self.configure_hid_keyboard(slot_id);
+                    let _ = self.configure_hid_mouse(slot_id);
+                }
+
+                // Nested hub support (one level deep to keep it simple)
+                if class == 0x09 {
+                    if let Err(e) = self.configure_and_enumerate_hub(slot_id, root_port) {
+                        log::debug!("Nested hub enum failed: {:?}", e);
+                    }
+                }
+            }
+            Err(e) => {
+                log::warn!("Failed to get descriptor for hub device: {:?}", e);
+            }
+        }
+
         Ok(())
     }
 
@@ -1668,6 +2118,20 @@ impl XhciController {
                             {
                                 log::debug!("Not a HID keyboard: {:?}", e);
                             }
+
+                            // Try to configure as HID mouse (class 0x03 or class 0x00)
+                            if (class == 0x03 || (class == 0x00 && num_configs > 0))
+                                && let Err(e) = self.configure_hid_mouse(slot_id)
+                            {
+                                log::debug!("Not a HID mouse: {:?}", e);
+                            }
+
+                            // If it's a hub, enumerate its downstream ports
+                            if class == 0x09 || (class == 0x00 && num_configs > 0) {
+                                if let Err(e) = self.configure_and_enumerate_hub(slot_id, port) {
+                                    log::debug!("Not a hub or hub enum failed: {:?}", e);
+                                }
+                            }
                         }
                         Err(e) => {
                             log::error!("Failed to get device descriptor: {:?}", e);
@@ -1840,6 +2304,184 @@ impl XhciController {
 
         log::info!("USB HID Keyboard configured on slot {}", slot_id);
         Ok(())
+    }
+
+    /// Configure a HID mouse device.
+    ///
+    /// Unlike the keyboard (which may get away with GET_REPORT on some
+    /// hardware), USB mice almost universally require interrupt IN transfers.
+    /// We configure the interrupt endpoint with a transfer ring here so that
+    /// `interrupt_transfer()` can queue Normal TRBs on it later.
+    fn configure_hid_mouse(&mut self, slot_id: u8) -> Result<(), XhciError> {
+        let config_info = self.get_config_descriptor(slot_id)?;
+
+        let mut interrupt_in = 0u8;
+        let mut interrupt_max_packet = 0u16;
+        let mut interrupt_interval = 0u8;
+        let mut found = false;
+
+        for iface in &config_info.interfaces[..config_info.num_interfaces] {
+            if iface.is_hid_mouse() {
+                log::info!(
+                    "  Found USB HID Mouse interface {}",
+                    iface.interface_number
+                );
+
+                if let Some(ep) = iface.find_interrupt_in() {
+                    interrupt_in = ep.number;
+                    interrupt_max_packet = ep.max_packet_size;
+                    interrupt_interval = ep.interval;
+                }
+                found = true;
+                break;
+            }
+        }
+
+        if !found || interrupt_in == 0 {
+            return Err(XhciError::DeviceNotFound);
+        }
+
+        // Set configuration (only if not already set by keyboard config)
+        let already_configured = self
+            .slots
+            .get(slot_id as usize)
+            .and_then(|s| s.as_ref())
+            .map(|s| s.is_hid_keyboard || s.is_mass_storage)
+            .unwrap_or(false);
+
+        if !already_configured {
+            self.set_configuration(slot_id, config_info.configuration_value)?;
+        }
+
+        // ── Configure the interrupt IN endpoint on the xHC ──
+        //
+        // Allocate a transfer ring and tell the controller about the endpoint
+        // via Configure Endpoint.  This is required for interrupt IN transfers
+        // (many mice stall GET_REPORT so we must use the interrupt pipe).
+        let in_dci = (interrupt_in as usize * 2) + 1; // Interrupt IN → odd DCI
+
+        let ring_mem = efi::allocate_pages(1).ok_or(XhciError::AllocationFailed)?;
+        let ring_addr = ring_mem.as_ptr() as u64;
+        let ring = TrbRing::new(ring_addr, 256);
+
+        {
+            let slot = self
+                .slots
+                .get_mut(slot_id as usize)
+                .and_then(|s| s.as_mut())
+                .ok_or(XhciError::DeviceNotFound)?;
+
+            slot.is_hid_mouse = true;
+            slot.mouse_interrupt_in_ep = interrupt_in;
+            slot.mouse_interrupt_max_packet = interrupt_max_packet;
+            slot.mouse_interrupt_interval = interrupt_interval;
+            slot.transfer_rings[in_dci - 1] = Some(ring);
+
+            // Set up input context for Configure Endpoint
+            let input = unsafe { &mut *slot.input_context };
+            let device = unsafe { &*slot.device_context };
+            input.slot = device.slot;
+            input.slot.set_context_entries(in_dci as u8);
+            input.control.add_flags = 1 | (1 << in_dci); // Slot + this endpoint
+
+            // Interrupt IN endpoint context (EP Type 7)
+            // Convert bInterval to xHCI interval exponent:
+            //   For LS/FS: period = 2^(Interval) * 125µs, bInterval is in ms
+            //   Use Interval such that 2^Interval ≈ bInterval * 8
+            //   For HS: bInterval already is exponent+1
+            let speed = slot.speed;
+            let xhci_interval = if speed >= 3 {
+                // High/Super speed: bInterval is already exponent form
+                interrupt_interval.max(1)
+            } else {
+                // Low/Full speed: bInterval in ms, convert to 125µs exponent
+                // 2^N * 125µs ≈ bInterval * 1000µs → N ≈ log2(bInterval*8)
+                let frames = (interrupt_interval as u32).max(1) * 8;
+                let mut n = 0u8;
+                let mut v = 1u32;
+                while v < frames && n < 15 {
+                    n += 1;
+                    v <<= 1;
+                }
+                n.max(3) // At least 1ms (2^3 * 125µs)
+            };
+
+            input.endpoints[in_dci - 1].set_ep_type(7); // Interrupt IN
+            input.endpoints[in_dci - 1].set_max_packet_size(interrupt_max_packet);
+            input.endpoints[in_dci - 1].set_max_burst_size(0);
+            input.endpoints[in_dci - 1].set_cerr(3);
+            input.endpoints[in_dci - 1].set_tr_dequeue_ptr(ring_addr, true);
+            input.endpoints[in_dci - 1].set_avg_trb_length(interrupt_max_packet);
+            // Interval field in dw0 bits 23:16
+            input.endpoints[in_dci - 1].dw0 =
+                (input.endpoints[in_dci - 1].dw0 & !0x00FF0000)
+                | ((xhci_interval as u32) << 16);
+        }
+
+        // Issue Configure Endpoint command
+        let input_ctx_ptr = self
+            .slots
+            .get(slot_id as usize)
+            .and_then(|s| s.as_ref())
+            .ok_or(XhciError::DeviceNotFound)?
+            .input_context as u64;
+
+        let mut trb = Trb::default();
+        trb.param = input_ctx_ptr;
+        trb.set_type(TRB_TYPE_CONFIGURE_ENDPOINT);
+        trb.control |= (slot_id as u32) << 24;
+
+        self.cmd_ring.enqueue(&trb, false);
+        fence(Ordering::SeqCst);
+        self.ring_doorbell(0, 0);
+        self.wait_command_completion()?;
+
+        log::info!(
+            "USB HID Mouse configured on slot {}, interrupt EP {} (DCI {})",
+            slot_id, interrupt_in, in_dci
+        );
+        Ok(())
+    }
+
+    /// Perform a single synchronous interrupt IN transfer.
+    ///
+    /// Queues one Normal TRB on the interrupt endpoint's transfer ring,
+    /// rings the doorbell, and waits for the completion event.  Reuses the
+    /// existing `wait_transfer_completion` path.
+    fn interrupt_transfer_impl(
+        &mut self,
+        slot_id: u8,
+        endpoint: u8,
+        data: &mut [u8],
+    ) -> Result<usize, XhciError> {
+        let in_dci = (endpoint as usize * 2) + 1;
+
+        let slot = self
+            .slots
+            .get_mut(slot_id as usize)
+            .and_then(|s| s.as_mut())
+            .ok_or(XhciError::DeviceNotFound)?;
+
+        let ring = slot.transfer_rings[in_dci - 1]
+            .as_mut()
+            .ok_or(XhciError::DeviceNotFound)?;
+
+        // Queue a Normal TRB for the interrupt IN transfer
+        let mut trb = Trb::default();
+        trb.param = data.as_ptr() as u64;
+        trb.status = (data.len() as u32) & 0x1FFFF; // Transfer Length
+        trb.set_type(TRB_TYPE_NORMAL);
+        trb.control |= 1 << 5; // IOC (Interrupt On Completion)
+        trb.control |= 1 << 2; // ISP (Interrupt on Short Packet)
+
+        ring.enqueue(&trb, false);
+        fence(Ordering::SeqCst);
+        self.ring_doorbell(slot_id, in_dci as u8);
+
+        // Reuse the existing transfer completion path (expects 1 TRB event).
+        let residual = self.wait_transfer_completion(slot_id, endpoint, 1)?;
+        let transferred = data.len().saturating_sub(residual as usize);
+        Ok(transferred)
     }
 
     /// Configure bulk endpoints
@@ -2169,4 +2811,14 @@ pub fn do_bulk_transfer(
     data: &mut [u8],
 ) -> Result<usize, XhciError> {
     controller.bulk_transfer(slot_id, endpoint, is_in, data)
+}
+
+/// Perform an interrupt IN transfer on an xHCI controller
+pub fn do_interrupt_transfer(
+    controller: &mut XhciController,
+    slot_id: u8,
+    endpoint: u8,
+    data: &mut [u8],
+) -> Result<usize, XhciError> {
+    controller.interrupt_transfer_impl(slot_id, endpoint, data)
 }
