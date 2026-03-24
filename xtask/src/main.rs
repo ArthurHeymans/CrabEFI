@@ -40,6 +40,16 @@ pub enum Arch {
     Aarch64,
 }
 
+impl Arch {
+    /// Short directory/file-name component for this architecture.
+    pub fn dir_name(self) -> &'static str {
+        match self {
+            Arch::X86_64 => "x86_64",
+            Arch::Aarch64 => "aarch64",
+        }
+    }
+}
+
 /// QEMU machine type for aarch64
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub enum Machine {
@@ -470,24 +480,31 @@ fn cmd_test(
                     p.to_path_buf()
                 }
             })
-            .unwrap_or_else(|| project_root().join("boot-assets"));
+            .unwrap_or_else(|| project_root().join("boot-assets").join(arch.dir_name()));
 
-        let grub_efi = assets_dir.join("grubx64.efi");
+        let grub_efi_name = match arch {
+            Arch::X86_64 => "grubx64.efi",
+            Arch::Aarch64 => "grubaa64.efi",
+        };
+        let grub_efi = assets_dir.join(grub_efi_name);
         let kernel = assets_dir.join("vmlinuz");
+        let initramfs = assets_dir.join("initramfs.cpio");
         let grub_cfg = assets_dir.join("grub.cfg");
 
         for (label, path) in [
-            ("grubx64.efi", &grub_efi),
+            (grub_efi_name, &grub_efi),
             ("vmlinuz", &kernel),
+            ("initramfs.cpio", &initramfs),
             ("grub.cfg", &grub_cfg),
         ] {
             if !path.exists() {
                 anyhow::bail!(
                     "Boot asset not found: {} (looked in {})\n\
-                     Run ci/build-boot-assets.sh to build them, \
+                     Run ci/build-boot-assets.sh --arch {} to build them, \
                      or pass --boot-assets-dir",
                     label,
-                    assets_dir.display()
+                    assets_dir.display(),
+                    arch.dir_name(),
                 );
             }
         }
@@ -496,6 +513,7 @@ fn cmd_test(
             disk_path.to_string_lossy().as_ref(),
             grub_efi.to_string_lossy().as_ref(),
             kernel.to_string_lossy().as_ref(),
+            initramfs.to_string_lossy().as_ref(),
             grub_cfg.to_string_lossy().as_ref(),
             arch,
         )?;

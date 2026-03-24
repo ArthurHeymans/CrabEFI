@@ -1,80 +1,220 @@
 #!/bin/bash
-# Build boot-test assets: a minimal Linux kernel (bzImage) and a GRUB
-# standalone EFI binary.  Results are placed in OUTPUT_DIR (default:
-# boot-assets/ under the project root).
+# Build boot-test assets: a minimal Linux kernel, a GRUB EFI binary,
+# and a u-root initramfs for a given architecture.  Results are placed
+# in OUTPUT_DIR (default: boot-assets/<arch>/ under the project root).
+#
+# Usage:
+#   ci/build-boot-assets.sh [--arch x86_64|aarch64] [output-dir]
 #
 # The script is intentionally self-contained so that its content hash
 # can serve as the GitHub Actions cache key -- any change to the kernel
 # version, config tweaks, or GRUB module list automatically invalidates
 # the cache.
 #
-# Dependencies (Ubuntu):
+# Dependencies (Ubuntu, x86_64):
 #   apt-get install -y build-essential bc flex bison libelf-dev \
-#       curl xz-utils grub-common grub-efi-amd64-bin
+#       curl xz-utils grub-common grub-efi-amd64-bin golang-go
+#
+# Dependencies (Ubuntu, aarch64 cross):
+#   apt-get install -y build-essential bc flex bison libelf-dev \
+#       curl xz-utils grub-common grub-efi-arm64-bin gcc-aarch64-linux-gnu \
+#       golang-go
 
 set -euo pipefail
 
-# ── Configuration ─────────────────────────────────────────────────────
+# ── Parse arguments ───────────────────────────────────────────────────
+ARCH="x86_64"
+OUTPUT_DIR=""
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --arch)  ARCH="$2"; shift 2 ;;
+        *)       OUTPUT_DIR="$1"; shift ;;
+    esac
+done
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+OUTPUT_DIR="${OUTPUT_DIR:-${PROJECT_DIR}/boot-assets/${ARCH}}"
+
+mkdir -p "$OUTPUT_DIR"
+OUTPUT_DIR="$(cd "$OUTPUT_DIR" && pwd)"
+
+# ── Per-architecture settings ─────────────────────────────────────────
 KERNEL_VERSION="6.13.7"
 KERNEL_MAJOR="${KERNEL_VERSION%%.*}"
 KERNEL_URL="https://cdn.kernel.org/pub/linux/kernel/v${KERNEL_MAJOR}.x/linux-${KERNEL_VERSION}.tar.xz"
 
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
-OUTPUT_DIR="${1:-${PROJECT_DIR}/boot-assets}"
+case "$ARCH" in
+    x86_64)
+        KERN_ARCH="x86"
+        KERN_CROSS=""
+        KERN_IMAGE="arch/x86/boot/bzImage"
+        GRUB_FORMAT="x86_64-efi"
+        GRUB_OUTPUT="grubx64.efi"
+        GOARCH="amd64"
+        CONSOLE="ttyS0,115200"
+        # GRUB serial module for 8250 UART
+        GRUB_SERIAL_MODULES="serial"
+        GRUB_SERIAL_CFG=$(cat <<'EOF'
+serial --unit=0 --speed=115200
+terminal_input serial
+terminal_output serial
+EOF
+)
+        ;;
+    aarch64)
+        KERN_ARCH="arm64"
+        KERN_CROSS="aarch64-linux-gnu-"
+        KERN_IMAGE="arch/arm64/boot/Image.gz"
+        GRUB_FORMAT="arm64-efi"
+        GRUB_OUTPUT="grubaa64.efi"
+        GOARCH="arm64"
+        CONSOLE="ttyAMA0,115200"
+        # aarch64 QEMU uses PL011 UART which works through EFI console;
+        # no GRUB serial module needed.
+        GRUB_SERIAL_MODULES=""
+        GRUB_SERIAL_CFG=""
+        ;;
+    *)
+        echo "Error: unsupported architecture: $ARCH" >&2
+        echo "Supported: x86_64, aarch64" >&2
+        exit 1
+        ;;
+esac
 
-mkdir -p "$OUTPUT_DIR"
-OUTPUT_DIR="$(cd "$OUTPUT_DIR" && pwd)"
+echo "==> Architecture: $ARCH"
 
 # ── Build Linux kernel ────────────────────────────────────────────────
 if [ -f "$OUTPUT_DIR/vmlinuz" ]; then
     echo "==> vmlinuz already exists, skipping kernel build"
 else
-    echo "==> Building Linux ${KERNEL_VERSION} (minimal config)..."
+    echo "==> Building Linux ${KERNEL_VERSION} (${ARCH}, minimal config)..."
 
     WORK="$(mktemp -d)"
-    cleanup() { rm -rf "$WORK"; }
+    cleanup() { chmod -R u+w "$WORK" 2>/dev/null || true; rm -rf "$WORK"; }
     trap cleanup EXIT
 
     echo "    Downloading kernel source..."
     curl -sL "$KERNEL_URL" | tar xJ -C "$WORK"
 
     KSRC="$WORK/linux-${KERNEL_VERSION}"
+    KMAKE=(make -C "$KSRC" -s ARCH="$KERN_ARCH")
+    if [ -n "$KERN_CROSS" ]; then
+        KMAKE+=(CROSS_COMPILE="$KERN_CROSS")
+    fi
 
     # Start from tinyconfig (smallest possible base)
-    make -C "$KSRC" -s tinyconfig
+    "${KMAKE[@]}" tinyconfig
 
     # Layer on the options we need for EFI-stub serial boot in QEMU.
     # scripts/config handles Kconfig tristate/bool properly and
     # make olddefconfig resolves transitive dependencies.
-    "$KSRC/scripts/config" --file "$KSRC/.config" \
-        --enable  64BIT                 \
+    KCFG="$KSRC/scripts/config"
+    KCFG_ARGS=(--file "$KSRC/.config")
+
+    # Common options
+    "$KCFG" "${KCFG_ARGS[@]}" \
         --enable  PRINTK                \
         --enable  TTY                   \
-        --enable  SERIAL_8250           \
-        --enable  SERIAL_8250_CONSOLE   \
         --enable  EFI                   \
         --enable  EFI_STUB              \
-        --enable  EARLY_PRINTK          \
-        --enable  X86_X2APIC            \
-        --enable  RELOCATABLE           \
-        --enable  X86_64                \
-        --enable  ACPI
+        --enable  ACPI                  \
+        --enable  BLK_DEV_INITRD        \
+        --enable  TMPFS                 \
+        --enable  DEVTMPFS             \
+        --enable  DEVTMPFS_MOUNT       \
+        --enable  PROC_FS              \
+        --enable  SYSFS                \
+        --enable  BINFMT_ELF           \
+        --enable  FUTEX                \
+        --enable  EVENTFD              \
+        --enable  EPOLL                \
+        --enable  SIGNALFD             \
+        --enable  TIMERFD              \
+        --enable  VT                   \
+        --enable  VT_CONSOLE           \
+        --enable  UNIX98_PTYS          \
+        --enable  MULTIUSER
 
-    make -C "$KSRC" -s olddefconfig
+    # Architecture-specific options
+    case "$ARCH" in
+        x86_64)
+            "$KCFG" "${KCFG_ARGS[@]}" \
+                --enable  64BIT                 \
+                --enable  X86_64                \
+                --enable  SERIAL_8250           \
+                --enable  SERIAL_8250_CONSOLE   \
+                --enable  EARLY_PRINTK          \
+                --enable  X86_X2APIC            \
+                --enable  RELOCATABLE
+            ;;
+        aarch64)
+            "$KCFG" "${KCFG_ARGS[@]}" \
+                --enable  ARM64                 \
+                --enable  SERIAL_AMBA_PL011     \
+                --enable  SERIAL_AMBA_PL011_CONSOLE \
+                --enable  SERIAL_EARLYCON       \
+                --enable  EARLY_PRINTK
+            ;;
+    esac
+
+    "${KMAKE[@]}" olddefconfig
 
     echo "    Compiling (this takes 1-3 minutes)..."
-    make -C "$KSRC" -j"$(nproc)" -s bzImage
+    "${KMAKE[@]}" -j"$(nproc)" "${KERN_IMAGE##*/}"
 
-    cp "$KSRC/arch/x86/boot/bzImage" "$OUTPUT_DIR/vmlinuz"
+    cp "$KSRC/$KERN_IMAGE" "$OUTPUT_DIR/vmlinuz"
     echo "    Kernel: $OUTPUT_DIR/vmlinuz ($(stat -c%s "$OUTPUT_DIR/vmlinuz") bytes)"
 fi
 
-# ── Build GRUB EFI binary ────────────────────────────────────────────
-if [ -f "$OUTPUT_DIR/grubx64.efi" ]; then
-    echo "==> grubx64.efi already exists, skipping GRUB build"
+# ── Build u-root initramfs ────────────────────────────────────────────
+if [ -f "$OUTPUT_DIR/initramfs.cpio" ]; then
+    echo "==> initramfs.cpio already exists, skipping u-root build"
 else
-    echo "==> Building GRUB EFI binary (grub-mkimage)..."
+    echo "==> Building u-root initramfs (${GOARCH})..."
+
+    # Clone u-root and build from its workspace.  Newer u-root (v0.16+)
+    # uses Go workspaces for package resolution, so we must run the tool
+    # from within the repo.
+    UROOT_DIR="$(mktemp -d)"
+
+    echo "    Cloning u-root..."
+    git clone --depth 1 -q https://github.com/u-root/u-root.git "$UROOT_DIR/src"
+
+    echo "    Building u-root tool..."
+    (cd "$UROOT_DIR/src" && go build -o "$UROOT_DIR/bin/u-root" .)
+
+    # Build the initramfs for the target arch.
+    # We include u-root's core commands but use rdinit=/bbin/echo on
+    # the kernel command line (see GRUB config below) to bypass u-root's
+    # normal init, which blocks on /dev/tty0 OpenConsole in headless
+    # QEMU.  The kernel passes unrecognised command-line tokens as
+    # argv to the rdinit binary, so "UROOT_BOOT_SUCCESS" ends up as an
+    # argument to echo, printing the marker the test harness looks for.
+    echo "    Building initramfs (GOARCH=$GOARCH)..."
+    (cd "$UROOT_DIR/src" && \
+        GOARCH="$GOARCH" "$UROOT_DIR/bin/u-root"    \
+            -o "$OUTPUT_DIR/initramfs.cpio"          \
+            -format cpio                             \
+            -defaultsh ""                            \
+            -initcmd ""                              \
+            ./cmds/core/echo                         \
+            ./cmds/core/cat                          \
+            ./cmds/core/ls                           \
+    )
+
+    # Go module cache files are read-only; fix permissions before rm.
+    chmod -R u+w "$UROOT_DIR" 2>/dev/null || true
+    rm -rf "$UROOT_DIR"
+    echo "    Initrd: $OUTPUT_DIR/initramfs.cpio ($(stat -c%s "$OUTPUT_DIR/initramfs.cpio") bytes)"
+fi
+
+# ── Build GRUB EFI binary ────────────────────────────────────────────
+if [ -f "$OUTPUT_DIR/$GRUB_OUTPUT" ]; then
+    echo "==> $GRUB_OUTPUT already exists, skipping GRUB build"
+else
+    echo "==> Building GRUB EFI binary ($GRUB_FORMAT, grub-mkimage)..."
 
     # Write the early config that gets *embedded* inside the core image.
     # We deliberately skip the 'normal' module because its module-probing
@@ -82,43 +222,51 @@ else
     # 'normal' GRUB runs the embedded config as a flat command script,
     # which is exactly what we want for an automated boot test.
     GRUB_CFG="$(mktemp)"
-    cat > "$GRUB_CFG" <<'GRUBCFG'
-serial --unit=0 --speed=115200
-terminal_input serial
-terminal_output serial
+    {
+        if [ -n "$GRUB_SERIAL_CFG" ]; then
+            echo "$GRUB_SERIAL_CFG"
+        fi
+        cat <<GRUBCFG
 search --no-floppy --set=root --file /vmlinuz
-linux /vmlinuz console=ttyS0,115200 nokaslr panic=5
+linux /vmlinuz console=${CONSOLE} nokaslr panic=5 rdinit=/bbin/echo UROOT_BOOT_SUCCESS
+initrd /initramfs.cpio
 boot
 GRUBCFG
+    } > "$GRUB_CFG"
 
+    # shellcheck disable=SC2086
     grub-mkimage                                        \
-        --format=x86_64-efi                             \
-        --output="$OUTPUT_DIR/grubx64.efi"              \
+        --format="$GRUB_FORMAT"                         \
+        --output="$OUTPUT_DIR/$GRUB_OUTPUT"             \
         --prefix=''                                     \
         --config="$GRUB_CFG"                            \
         linux fat part_gpt                              \
         search search_fs_file                           \
-        serial terminal echo boot
+        terminal echo boot                              \
+        $GRUB_SERIAL_MODULES
 
     rm -f "$GRUB_CFG"
-    echo "    GRUB:   $OUTPUT_DIR/grubx64.efi ($(stat -c%s "$OUTPUT_DIR/grubx64.efi") bytes)"
+    echo "    GRUB:   $OUTPUT_DIR/$GRUB_OUTPUT ($(stat -c%s "$OUTPUT_DIR/$GRUB_OUTPUT") bytes)"
 fi
 
 # ── Write on-disk grub.cfg ────────────────────────────────────────────
 # This copy lives on the ESP at /boot/grub/grub.cfg so that CrabEFI's
 # own GRUB-config parser can discover the Linux entry in its boot menu.
-cat > "$OUTPUT_DIR/grub.cfg" <<'GRUBCFG'
-serial --unit=0 --speed=115200
-terminal_input serial
-terminal_output serial
+{
+    if [ -n "$GRUB_SERIAL_CFG" ]; then
+        echo "$GRUB_SERIAL_CFG"
+    fi
+    cat <<GRUBCFG
 
 set timeout=0
 set default=0
 
 menuentry "Linux" {
-    linux /vmlinuz console=ttyS0,115200 nokaslr panic=5
+    linux /vmlinuz console=${CONSOLE} nokaslr panic=5 rdinit=/bbin/echo UROOT_BOOT_SUCCESS
+    initrd /initramfs.cpio
 }
 GRUBCFG
+} > "$OUTPUT_DIR/grub.cfg"
 
 echo "==> Boot assets ready in $OUTPUT_DIR"
 ls -lh "$OUTPUT_DIR"
