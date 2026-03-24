@@ -21,6 +21,8 @@ pub mod controller;
 pub mod ehci;
 pub mod ehci_regs;
 pub mod hid_keyboard;
+#[cfg(feature = "ui")]
+pub mod hid_mouse;
 pub mod mass_storage;
 pub mod ohci;
 pub mod ohci_regs;
@@ -280,6 +282,37 @@ fn init_keyboards() {
     }
 }
 
+/// Initialize USB mice from all controllers
+#[cfg(feature = "ui")]
+pub fn init_mice() {
+    let controllers = ALL_CONTROLLERS.lock();
+
+    for (idx, handle) in controllers.iter().enumerate() {
+        with_usb_controller!(handle, mut |controller| {
+            if let Err(e) = hid_mouse::init_mouse(controller, idx) {
+                log::debug!(
+                    "No HID mouse on {} controller {}: {:?}",
+                    controller.controller_type(),
+                    idx,
+                    e
+                );
+            }
+        });
+    }
+}
+
+/// Poll USB mouse on a specific controller
+#[cfg(feature = "ui")]
+pub fn poll_mice_on_controller(controller_idx: usize) {
+    let controllers = ALL_CONTROLLERS.lock();
+
+    if let Some(handle) = controllers.get(controller_idx) {
+        with_usb_controller!(handle, mut |controller| {
+            hid_mouse::poll(controller);
+        });
+    }
+}
+
 /// Clean up all USB controllers before ExitBootServices
 ///
 /// This must be called before handing off to the OS to ensure Linux's
@@ -454,6 +487,21 @@ impl UsbController for XhciController {
         })
     }
 
+    fn interrupt_transfer(
+        &mut self,
+        device: u8,
+        endpoint: u8,
+        data: &mut [u8],
+    ) -> Result<usize, self::controller::UsbError> {
+        let result = xhci::do_interrupt_transfer(self, device, endpoint, data);
+        result.map_err(|e| match e {
+            XhciError::Timeout => self::controller::UsbError::Nak,
+            XhciError::StallError => self::controller::UsbError::Stall,
+            XhciError::DeviceNotFound => self::controller::UsbError::DeviceNotFound,
+            _ => self::controller::UsbError::TransactionError,
+        })
+    }
+
     fn create_interrupt_queue(
         &mut self,
         _device: u8,
@@ -485,6 +533,30 @@ impl UsbController for XhciController {
         })
     }
 
+    fn find_hid_mouse(&self) -> Option<u8> {
+        (0..xhci::MAX_SLOTS as u8).find(|&slot_id| {
+            self.get_slot(slot_id)
+                .map(|slot| slot.is_hid_mouse)
+                .unwrap_or(false)
+        })
+    }
+
+    fn get_mouse_interrupt_endpoint(&self, device: u8) -> Option<self::controller::EndpointInfo> {
+        let slot = self.get_slot(device)?;
+        if !slot.is_hid_mouse || slot.mouse_interrupt_in_ep == 0 {
+            return None;
+        }
+
+        Some(self::controller::EndpointInfo {
+            number: slot.mouse_interrupt_in_ep,
+            direction: self::controller::Direction::In,
+            transfer_type: self::controller::EndpointType::Interrupt,
+            max_packet_size: slot.mouse_interrupt_max_packet,
+            interval: slot.mouse_interrupt_interval,
+            toggle: false,
+        })
+    }
+
     fn get_device_info(&self, device: u8) -> Option<self::controller::DeviceInfo> {
         let slot = self.get_slot(device)?;
         Some(self::controller::DeviceInfo {
@@ -496,8 +568,9 @@ impl UsbController for XhciController {
             device_class: slot.device_desc.device_class,
             is_mass_storage: slot.is_mass_storage,
             mass_storage_interface: slot.mass_storage_interface,
-            is_hid: slot.is_hid_keyboard || slot.device_desc.device_class == 0x03,
+            is_hid: slot.is_hid_keyboard || slot.is_hid_mouse || slot.device_desc.device_class == 0x03,
             is_keyboard: slot.is_hid_keyboard,
+            is_mouse: slot.is_hid_mouse,
             is_hub: slot.device_desc.device_class == 0x09,
         })
     }

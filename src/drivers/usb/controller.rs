@@ -585,6 +585,8 @@ pub enum UsbError {
     Nak,
     /// Device disconnected
     Disconnected,
+    /// Operation not supported by this controller
+    NotSupported,
 }
 
 /// USB device handle - identifies a device on a controller
@@ -643,6 +645,23 @@ pub trait UsbController {
         is_in: bool,
         data: &mut [u8],
     ) -> Result<usize, UsbError>;
+
+    /// Perform a single synchronous interrupt IN transfer.
+    ///
+    /// This is the correct way to poll HID devices (mice, keyboards) since
+    /// many devices do not implement the GET_REPORT class request and will
+    /// stall control transfers instead.
+    ///
+    /// The default implementation returns `NotSupported`.  Controllers that
+    /// have configured the interrupt endpoint should override this.
+    fn interrupt_transfer(
+        &mut self,
+        _device: u8,
+        _endpoint: u8,
+        _data: &mut [u8],
+    ) -> Result<usize, UsbError> {
+        Err(UsbError::NotSupported)
+    }
 
     /// Create an interrupt transfer queue
     ///
@@ -716,6 +735,22 @@ pub trait UsbController {
             .find_map(|d| d.as_ref().filter(|d| d.is_hid_keyboard).map(|d| d.address))
     }
 
+    /// Find a HID mouse device
+    ///
+    /// # Returns
+    /// Device address/slot ID if found
+    fn find_hid_mouse(&self) -> Option<u8> {
+        self.devices()
+            .iter()
+            .find_map(|d| d.as_ref().filter(|d| d.is_hid_mouse).map(|d| d.address))
+    }
+
+    /// Get mouse interrupt endpoint info for a device
+    fn get_mouse_interrupt_endpoint(&self, device: u8) -> Option<EndpointInfo> {
+        self.get_device(device)
+            .and_then(|d| d.mouse_interrupt_in)
+    }
+
     /// Get device info
     fn get_device_info(&self, device: u8) -> Option<DeviceInfo> {
         self.get_device(device).map(UsbDevice::device_info)
@@ -754,6 +789,8 @@ pub struct DeviceInfo {
     pub is_hid: bool,
     /// Is this a keyboard?
     pub is_keyboard: bool,
+    /// Is this a mouse?
+    pub is_mouse: bool,
     /// Is this a hub?
     pub is_hub: bool,
 }
@@ -785,6 +822,8 @@ pub struct UsbDevice {
     pub mass_storage_interface: u8,
     /// Is HID keyboard
     pub is_hid_keyboard: bool,
+    /// Is HID mouse (boot protocol)
+    pub is_hid_mouse: bool,
     /// Is USB hub
     pub is_hub: bool,
     /// Number of hub ports (if is_hub)
@@ -793,8 +832,10 @@ pub struct UsbDevice {
     pub bulk_in: Option<EndpointInfo>,
     /// Bulk OUT endpoint
     pub bulk_out: Option<EndpointInfo>,
-    /// Interrupt IN endpoint
+    /// Interrupt IN endpoint (keyboard)
     pub interrupt_in: Option<EndpointInfo>,
+    /// Mouse interrupt IN endpoint
+    pub mouse_interrupt_in: Option<EndpointInfo>,
     /// Control endpoint max packet size
     pub ep0_max_packet: u16,
     /// Data toggle for bulk IN
@@ -819,11 +860,13 @@ impl UsbDevice {
             is_mass_storage: false,
             mass_storage_interface: 0,
             is_hid_keyboard: false,
+            is_hid_mouse: false,
             is_hub: false,
             num_hub_ports: 0,
             bulk_in: None,
             bulk_out: None,
             interrupt_in: None,
+            mouse_interrupt_in: None,
             ep0_max_packet: speed.default_max_packet_size(),
             bulk_in_toggle: false,
             bulk_out_toggle: false,
@@ -850,8 +893,9 @@ impl UsbDevice {
             device_class: self.device_desc.device_class,
             is_mass_storage: self.is_mass_storage,
             mass_storage_interface: self.mass_storage_interface,
-            is_hid: self.is_hid_keyboard,
+            is_hid: self.is_hid_keyboard || self.is_hid_mouse,
             is_keyboard: self.is_hid_keyboard,
+            is_mouse: self.is_hid_mouse,
             is_hub: self.is_hub,
         }
     }
@@ -1107,6 +1151,13 @@ impl InterfaceInfo {
             && self.interface_protocol == 0x01 // Keyboard
     }
 
+    /// Check if this is a HID mouse interface (boot protocol mouse)
+    pub fn is_hid_mouse(&self) -> bool {
+        self.interface_class == class::HID
+            && self.interface_subclass == 0x01 // Boot interface
+            && self.interface_protocol == 0x02 // Mouse
+    }
+
     /// Find bulk IN endpoint
     pub fn find_bulk_in(&self) -> Option<&EndpointInfo> {
         self.endpoints[..self.num_endpoints]
@@ -1256,6 +1307,10 @@ where
             device.is_hid_keyboard = true;
             device.interrupt_in = iface.find_interrupt_in().cloned();
             log::info!("    HID Keyboard interface");
+        } else if iface.is_hid_mouse() {
+            device.is_hid_mouse = true;
+            device.mouse_interrupt_in = iface.find_interrupt_in().cloned();
+            log::info!("    HID Mouse interface");
         } else if iface.interface_class == class::HUB {
             device.is_hub = true;
             log::info!("    USB Hub interface");
