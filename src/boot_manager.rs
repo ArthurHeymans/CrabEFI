@@ -15,6 +15,8 @@ use crate::drivers;
 use crate::efi;
 use crate::menu;
 
+
+
 /// Initialize storage subsystem (PCI drivers, USB keyboards, etc.)
 ///
 /// This is called once before the boot manager starts trying boot options.
@@ -30,6 +32,10 @@ fn init_storage_subsystem() {
 
     // Initialize USB keyboards (needs to happen after USB controllers are bound)
     drivers::usb::init_keyboards_public();
+
+    // Initialize USB mice (needs to happen after USB controllers are bound)
+    #[cfg(feature = "ui")]
+    drivers::usb::init_mice();
 
     // Initialize pass-through protocols for TCG Opal support
     efi::protocols::pass_thru_init::init();
@@ -148,6 +154,10 @@ pub(crate) fn run(boot_var_state: boot_vars::BootVarState) {
 
     if boot_menu.entry_count() == 0 {
         log::warn!("No bootable media found!");
+
+        #[cfg(feature = "ui")]
+        crate::ui::show_no_media_screen();
+
         return;
     }
 
@@ -155,6 +165,11 @@ pub(crate) fn run(boot_var_state: boot_vars::BootVarState) {
     boot_menu.set_timeout(timeout_seconds);
 
     log::debug!("Showing boot menu...");
+
+    // Use graphical UI when feature is enabled, text menu otherwise
+    #[cfg(feature = "ui")]
+    let selected = crate::ui::show_graphical_menu(&mut boot_menu);
+    #[cfg(not(feature = "ui"))]
     let selected = menu::show_menu(&mut boot_menu);
     log::info!("Menu returned: {:?}", selected);
 

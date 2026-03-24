@@ -26,6 +26,22 @@ use crate::time::{Timeout, delay_ms};
 use core::fmt::Write;
 use heapless::{String, Vec};
 
+/// Update the mouse cursor on the framebuffer.
+///
+/// Call this in the menu event loop to render the cursor at its current position.
+#[cfg(feature = "ui")]
+fn update_cursor(
+    cursor_renderer: &mut crate::cursor::CursorRenderer,
+    fb_info: &Option<crate::coreboot::FramebufferInfo>,
+) {
+    if let Some(fb) = fb_info {
+        if crate::drivers::mouse_cursor::is_initialized() {
+            let (x, y) = crate::drivers::mouse_cursor::position();
+            cursor_renderer.update(fb, x, y);
+        }
+    }
+}
+
 /// Maximum number of boot entries
 /// Increased to accommodate BLS, GRUB, and payload entries
 const MAX_BOOT_ENTRIES: usize = 16;
@@ -253,11 +269,11 @@ impl BootEntry {
 /// Boot menu state
 pub struct BootMenu {
     /// Discovered boot entries
-    entries: Vec<BootEntry, MAX_BOOT_ENTRIES>,
+    pub(crate) entries: Vec<BootEntry, MAX_BOOT_ENTRIES>,
     /// Currently selected entry index
-    selected: usize,
+    pub(crate) selected: usize,
     /// Timeout in seconds (0 = no timeout)
-    timeout_seconds: u32,
+    pub(crate) timeout_seconds: u32,
 }
 
 impl Default for BootMenu {
@@ -949,7 +965,14 @@ pub fn show_menu(menu: &mut BootMenu) -> Option<usize> {
     // Show initial countdown
     draw_countdown(remaining_seconds, &mut fb_console);
 
+    // Initialize cursor renderer for mouse support
+    #[cfg(feature = "ui")]
+    let mut cursor_renderer = crate::cursor::CursorRenderer::new();
+
     loop {
+        // Update mouse cursor on framebuffer
+        #[cfg(feature = "ui")]
+        update_cursor(&mut cursor_renderer, &fb_info);
         // Check for timeout (first tick fires after 1 real second)
         if remaining_seconds > 0 && last_second_check.is_expired() {
             remaining_seconds -= 1;
@@ -1060,6 +1083,25 @@ pub fn show_menu(menu: &mut BootMenu) -> Option<usize> {
                         draw_menu(menu, &mut fb_console);
                     }
                 }
+                // Handle mouse clicks - select entry under cursor
+                #[cfg(feature = "ui")]
+                KeyPress::MouseClick { y, .. } => {
+                    // Map screen Y pixel to menu entry index
+                    // Menu entries start at row ~5 (after header + category)
+                    if let Some(idx) = row_to_entry_index(menu, y) {
+                        menu.selected = idx;
+                        draw_menu(menu, &mut fb_console);
+                    }
+                }
+                #[cfg(feature = "ui")]
+                KeyPress::MouseScroll(dz) => {
+                    if dz > 0 {
+                        menu.select_next();
+                    } else {
+                        menu.select_previous();
+                    }
+                    draw_menu(menu, &mut fb_console);
+                }
                 _ => {}
             }
         }
@@ -1067,6 +1109,34 @@ pub fn show_menu(menu: &mut BootMenu) -> Option<usize> {
         // Small delay to avoid busy-waiting
         delay_ms(10);
     }
+}
+
+/// Map a screen row to a menu entry index.
+///
+/// Returns `Some(index)` if the row corresponds to a boot entry,
+/// `None` if it's a header, separator, or out of range.
+#[cfg(feature = "ui")]
+fn row_to_entry_index(menu: &BootMenu, row: u32) -> Option<usize> {
+    // Menu layout: row 0-2 = header, row 3 = blank, row 4+ = entries with separators
+    let start_row = 4u32;
+    let mut current_row = start_row;
+    let mut current_category: Option<BootCategory> = None;
+
+    for (i, entry) in menu.entries.iter().enumerate() {
+        if current_category != Some(entry.category) {
+            if current_category.is_some() {
+                current_row += 1; // blank line
+            }
+            current_row += 1; // category separator
+            current_category = Some(entry.category);
+        }
+
+        if row == current_row {
+            return Some(i);
+        }
+        current_row += 1;
+    }
+    None
 }
 
 use crate::menu_common::{self, KeyPress, SerialWriter};
@@ -1427,6 +1497,9 @@ fn edit_cmdline(entry: &mut BootEntry, fb_console: &mut Option<FramebufferConsol
                 }
                 // Ignore Up/Down in editor
                 KeyPress::Up | KeyPress::Down => {}
+                // Mouse events are ignored in the command line editor
+                #[cfg(feature = "ui")]
+                KeyPress::MouseClick { .. } | KeyPress::MouseScroll(_) => {}
             }
         }
 

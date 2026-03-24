@@ -19,6 +19,15 @@ pub enum KeyPress {
     Enter,
     Escape,
     Char(char),
+    /// Mouse click at pixel coordinates.
+    #[cfg(feature = "ui")]
+    MouseClick {
+        x: u32,
+        y: u32,
+    },
+    /// Mouse scroll (positive = down, negative = up)
+    #[cfg(feature = "ui")]
+    MouseScroll(i32),
 }
 
 /// Read a key from keyboard (PS/2, USB, or serial)
@@ -49,6 +58,25 @@ pub fn read_key() -> Option<KeyPress> {
             0 if unicode_char > 0 => Some(KeyPress::Char(unicode_char as u8 as char)),
             _ => None,
         };
+    }
+
+    // Check mouse state (if UI feature is enabled).
+    // Note: callers must call mouse_cursor::poll() before read_key() —
+    // we only inspect the current state here, we do NOT poll again.
+    #[cfg(feature = "ui")]
+    {
+        let scroll = crate::drivers::mouse_cursor::get_scroll();
+        if scroll != 0 {
+            return Some(KeyPress::MouseScroll(scroll));
+        }
+
+        if crate::drivers::mouse_cursor::left_clicked() {
+            let (px, py) = crate::drivers::mouse_cursor::position();
+            return Some(KeyPress::MouseClick {
+                x: px as u32,
+                y: py as u32,
+            });
+        }
     }
 
     // Try serial input
