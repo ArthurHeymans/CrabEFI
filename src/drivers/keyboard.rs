@@ -66,7 +66,7 @@ register_bitfields![u8,
 ];
 
 /// PS/2 controller port addresses
-mod ports {
+pub(crate) mod ports {
     /// Data port address (read/write)
     pub const DATA: u16 = 0x60;
     /// Status register (read) / Command register (write) address
@@ -132,7 +132,7 @@ mod response {
 ///
 /// Note: tock-registers Field::mask is unshifted, so we define these
 /// pre-shifted constants for use with raw byte operations.
-mod masks {
+pub(crate) mod masks {
     // Status register bits
     pub const OUTPUT_FULL: u8 = 1 << 0;
     pub const AUX_DATA: u8 = 1 << 5;
@@ -140,6 +140,7 @@ mod masks {
     // Config byte bits
     pub const KB_INT: u8 = 1 << 0;
     pub const AUX_INT: u8 = 1 << 1;
+    pub const AUX_DISABLE: u8 = 1 << 5;
     pub const TRANSLATION: u8 = 1 << 6;
 }
 
@@ -367,11 +368,15 @@ pub fn init() {
 
     let mut config_byte = kb.ports.data.get();
 
-    // Enable translation (scancode set 2 -> set 1) and disable interrupts
-    // We poll the keyboard instead of using interrupts
+    // Enable translation (scancode set 2 -> set 1) and disable interrupts.
+    // We poll the keyboard instead of using interrupts.
+    // Clear AUX_DISABLE so the mouse AUX port clock remains enabled —
+    // without this, the PS/2 mouse can't communicate after keyboard init
+    // (critical on Lenovo H8 EC where ENABLE_AUX alone may not suffice).
     config_byte |= masks::TRANSLATION;
     config_byte &= !masks::KB_INT;
     config_byte &= !masks::AUX_INT;
+    config_byte &= !masks::AUX_DISABLE;
 
     if !kb.send_controller_cmd(cmd::WRITE_CONFIG) {
         log::warn!("Failed to write PS/2 controller config");
@@ -547,8 +552,12 @@ pub fn try_read_key() -> Option<(u16, u16)> {
     }
 
     if (status & masks::AUX_DATA) != 0 {
-        // Mouse data, discard it
-        let _ = kb.ports.data.get();
+        // Mouse data — forward to PS/2 mouse driver instead of discarding
+        let byte = kb.ports.data.get();
+        #[cfg(feature = "ui")]
+        crate::drivers::mouse::push_aux_byte(byte);
+        #[cfg(not(feature = "ui"))]
+        let _ = byte;
         return None;
     }
 
