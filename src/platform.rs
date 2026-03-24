@@ -1,0 +1,1043 @@
+//! Platform Abstraction Traits
+//!
+//! This module defines the traits that platform firmware must implement to
+//! integrate CrabEFI. These traits decouple the UEFI implementation from
+//! specific hardware, allowing CrabEFI to run on any platform that provides
+//! the required services.
+//!
+//! # Architecture
+//!
+//! ```text
+//! ┌─────────────────────────────────────────────┐
+//! │           External Firmware                  │
+//! │  (coreboot, custom ARM SoC, TF-A, ...)      │
+//! │                                              │
+//! │  Implements: BlockDevice, VariableBackend,   │
+//! │  Timer, ResetHandler, DebugOutput, ...       │
+//! └───────────────┬─────────────────────────────┘
+//!                 │  PlatformConfig
+//!                 ▼
+//! ┌─────────────────────────────────────────────┐
+//! │           CrabEFI Library                    │
+//! │                                              │
+//! │  UEFI Boot/Runtime Services, Secure Boot,   │
+//! │  Boot Manager, Filesystem, PE Loader         │
+//! └─────────────────────────────────────────────┘
+//! ```
+//!
+//! # Quick Start
+//!
+//! External firmware builds a [`PlatformConfig`] by providing trait
+//! implementations for the platform's hardware, then calls
+//! [`crate::init_platform()`] to hand off to the UEFI boot manager.
+//! This function never returns (`-> !`).
+//!
+//! ```ignore
+//! let config = crabefi::PlatformConfig {
+//!     memory_map: &my_memory_map,
+//!     timer: &my_timer,
+//!     reset: &my_reset_handler,
+//!     block_devices: &mut [&mut my_emmc],
+//!     variable_backend: Some(&mut my_var_store),
+//!     // ...
+//! };
+//! crabefi::init_platform(config); // never returns
+//! ```
+
+use r_efi::efi::Guid;
+
+// ============================================================================
+// Memory Map
+// ============================================================================
+
+/// Physical memory region descriptor.
+///
+/// The platform provides a list of these to describe the system's physical
+/// address space. CrabEFI converts them into the EFI memory map.
+#[derive(Debug, Clone, Copy)]
+pub struct MemoryRegion {
+    /// Starting physical address (must be page-aligned, 4 KiB).
+    pub base: u64,
+    /// Size in bytes (must be page-aligned, 4 KiB).
+    pub size: u64,
+    /// Type of memory in this region.
+    pub region_type: MemoryType,
+}
+
+/// Memory region types.
+///
+/// These map directly to EFI memory types. The platform uses them to describe
+/// which physical address ranges are usable RAM, reserved, MMIO, etc.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum MemoryType {
+    /// Usable RAM (becomes `EfiConventionalMemory`).
+    Ram,
+    /// Reserved by firmware (becomes `EfiReservedMemoryType`).
+    Reserved,
+    /// ACPI tables, reclaimable after OS reads them (becomes `EfiACPIReclaimMemory`).
+    AcpiReclaimable,
+    /// ACPI Non-Volatile Storage (becomes `EfiACPINvsMemory`).
+    AcpiNvs,
+    /// Memory-mapped I/O registers (becomes `EfiMemoryMappedIO`).
+    Mmio,
+    /// Runtime services code (becomes `EfiRuntimeServicesCode` with `EFI_MEMORY_RUNTIME`).
+    RuntimeServicesCode,
+    /// Runtime services data (becomes `EfiRuntimeServicesData` with `EFI_MEMORY_RUNTIME`).
+    RuntimeServicesData,
+}
+
+// ============================================================================
+// Block Device
+// ============================================================================
+
+/// Information about a block device.
+///
+/// Maps closely to `EFI_BLOCK_IO_MEDIA` from the UEFI specification.
+#[derive(Clone, Copy, Debug)]
+pub struct BlockDeviceInfo {
+    /// Total number of logical blocks on the device.
+    pub num_blocks: u64,
+    /// Size of each logical block in bytes (typically 512).
+    pub block_size: u32,
+    /// Media identifier (changes if removable media is swapped).
+    pub media_id: u32,
+    /// Whether the device has removable media (e.g., USB stick, SD card).
+    pub removable: bool,
+    /// Whether the media is read-only.
+    pub read_only: bool,
+}
+
+/// Errors returned by block device operations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum BlockError {
+    /// Unspecified device error.
+    DeviceError,
+    /// Invalid parameter (bad LBA, buffer too small, etc.).
+    InvalidParameter,
+    /// LBA out of range for this device.
+    OutOfRange,
+    /// No media present (removable device with nothing inserted).
+    NoMedia,
+    /// Media changed since last access.
+    MediaChanged,
+}
+
+/// Block-level storage device interface.
+///
+/// All storage devices that CrabEFI should be able to boot from must implement
+/// this trait. The library installs `EFI_BLOCK_IO_PROTOCOL` handles for each
+/// provided block device.
+///
+/// # Implementor's Guide
+///
+/// - `read_blocks` must handle arbitrary LBA ranges within bounds.
+/// - `info()` should return consistent values for the device's lifetime.
+/// - `name()` is displayed in the boot menu; make it descriptive
+///   (e.g., `"NVMe: Samsung 980 Pro"`, `"eMMC: partition 0"`).
+///
+/// # Example
+///
+/// ```ignore
+/// struct MyEmmc { base: u64, num_sectors: u64 }
+///
+/// impl crabefi::BlockDevice for MyEmmc {
+///     fn info(&self) -> crabefi::BlockDeviceInfo {
+///         crabefi::BlockDeviceInfo {
+///             num_blocks: self.num_sectors,
+///             block_size: 512,
+///             media_id: 0,
+///             removable: false,
+///             read_only: false,
+///         }
+///     }
+///     fn read_blocks(&mut self, lba: u64, count: u32, buffer: &mut [u8])
+///         -> Result<(), crabefi::BlockError>
+///     {
+///         // ... hardware-specific read ...
+///         Ok(())
+///     }
+///     fn name(&self) -> &str { "eMMC" }
+/// }
+/// ```
+pub trait BlockDevice {
+    /// Get device information (block count, block size, media properties).
+    fn info(&self) -> BlockDeviceInfo;
+
+    /// Read contiguous blocks from the device.
+    ///
+    /// # Arguments
+    /// * `lba` - Starting logical block address.
+    /// * `count` - Number of blocks to read.
+    /// * `buffer` - Destination buffer (must be at least `count * block_size` bytes).
+    fn read_blocks(&mut self, lba: u64, count: u32, buffer: &mut [u8]) -> Result<(), BlockError>;
+
+    /// Human-readable device name for the boot menu.
+    fn name(&self) -> &str {
+        "Block Device"
+    }
+
+    /// Validate parameters for a read operation.
+    ///
+    /// Default implementation checks LBA range and buffer size. Implementations
+    /// should call this at the start of `read_blocks`.
+    fn validate_read(&self, lba: u64, count: u32, buffer: &[u8]) -> Result<(), BlockError> {
+        let info = self.info();
+        if count == 0 {
+            return Ok(());
+        }
+        let end_lba = lba
+            .checked_add(count as u64)
+            .ok_or(BlockError::OutOfRange)?;
+        if end_lba > info.num_blocks {
+            return Err(BlockError::OutOfRange);
+        }
+        let required = (count as usize)
+            .checked_mul(info.block_size as usize)
+            .ok_or(BlockError::InvalidParameter)?;
+        if buffer.len() < required {
+            return Err(BlockError::InvalidParameter);
+        }
+        Ok(())
+    }
+
+    /// Read a single block (convenience wrapper).
+    fn read_block(&mut self, lba: u64, buffer: &mut [u8]) -> Result<(), BlockError> {
+        self.read_blocks(lba, 1, buffer)
+    }
+}
+
+// ============================================================================
+// Variable Persistence
+// ============================================================================
+
+/// Errors returned by variable backend operations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum VarBackendError {
+    /// Backend not initialized or not available.
+    NotAvailable,
+    /// Storage is full; cannot write more variables.
+    StoreFull,
+    /// I/O or communication error.
+    IoError,
+    /// Backend is locked (e.g., flash locked after ExitBootServices).
+    Locked,
+    /// Variable not found (for load/delete operations).
+    NotFound,
+    /// Data too large for the backend's capacity.
+    DataTooLarge,
+    /// Name too long for the backend's capacity.
+    NameTooLong,
+    /// Backend-specific error.
+    Other,
+}
+
+/// Visitor interface for loading persisted variables.
+///
+/// The [`VariableBackend::load()`] method calls [`visit()`](Self::visit) once
+/// per stored variable. CrabEFI provides the visitor; the backend just calls it.
+pub trait VariableVisitor {
+    /// Called for each variable found in persistent storage.
+    ///
+    /// # Arguments
+    /// * `name` - Variable name as UTF-16LE code units (without null terminator).
+    /// * `vendor` - Variable vendor GUID.
+    /// * `attributes` - EFI variable attributes (`EFI_VARIABLE_*` flags).
+    /// * `data` - Variable data payload (after any auth header stripping).
+    fn visit(&mut self, name: &[u16], vendor: &Guid, attributes: u32, data: &[u8]);
+}
+
+/// EFI variable persistence backend.
+///
+/// This trait abstracts how EFI variables are stored across boots. Implementations
+/// range from direct flash storage to SMM/TF-A MM RPC-based approaches.
+///
+/// # Backend Categories
+///
+/// | Category | `runtime_capable()` | Deferred buffer needed? | Example |
+/// |----------|---------------------|------------------------|---------|
+/// | Direct flash | `false` | Yes | SPI flash via `Edk2VarStore` |
+/// | SMM | `true` | No | x86 SMI-based variable service |
+/// | TF-A MM | `true` | No | Arm StandaloneMM via FF-A/SPM |
+/// | RAM-only | `false` | Optional | Testing, volatile variables |
+///
+/// # Lifecycle
+///
+/// 1. [`load()`](Self::load) — Called once during early boot to populate the
+///    in-memory variable cache. The backend calls `visitor.visit()` for each
+///    stored variable.
+///
+/// 2. [`write()`](Self::write) / [`delete()`](Self::delete) — Called by
+///    `SetVariable` when variables change.
+///    - Before `ExitBootServices`: always called.
+///    - After `ExitBootServices`: called only if `runtime_capable()` returns `true`.
+///      Otherwise, CrabEFI buffers the write in the deferred buffer.
+///
+/// 3. [`notify_exit_boot_services()`](Self::notify_exit_boot_services) — Called
+///    when `ExitBootServices` succeeds. The backend can release resources or
+///    adjust its strategy (e.g., direct-flash backends note that flash is now locked).
+///
+/// 4. [`flush_deferred()`](Self::flush_deferred) — Called on the *next* boot
+///    (after `load()`) to commit any writes that were buffered during the
+///    previous boot's runtime phase. Only relevant for non-runtime-capable backends.
+///
+/// # Example: SMM Backend
+///
+/// ```ignore
+/// struct SmmVarStore { smi_port: u16, comm_buffer: *mut u8 }
+///
+/// impl crabefi::VariableBackend for SmmVarStore {
+///     fn load(&mut self, visitor: &mut dyn crabefi::VariableVisitor)
+///         -> Result<(), crabefi::VarBackendError>
+///     {
+///         // Trigger SMI to enumerate variables, call visitor.visit() for each
+///         Ok(())
+///     }
+///
+///     fn write(&mut self, name: &[u16], vendor: &Guid, attrs: u32, data: &[u8])
+///         -> Result<(), crabefi::VarBackendError>
+///     {
+///         // Trigger SMI with SetVariable command
+///         Ok(())
+///     }
+///
+///     fn delete(&mut self, name: &[u16], vendor: &Guid)
+///         -> Result<(), crabefi::VarBackendError>
+///     {
+///         // Trigger SMI with delete command
+///         Ok(())
+///     }
+///
+///     fn runtime_capable(&self) -> bool { true }
+/// }
+/// ```
+pub trait VariableBackend {
+    /// Load all persisted variables into the in-memory cache.
+    ///
+    /// Called once during early boot. The backend iterates its stored variables
+    /// and calls `visitor.visit()` for each one.
+    fn load(&mut self, visitor: &mut dyn VariableVisitor) -> Result<(), VarBackendError>;
+
+    /// Persist a variable write (create or update).
+    ///
+    /// Called when `SetVariable` is invoked with non-empty data.
+    ///
+    /// # Arguments
+    /// * `name` - Variable name as UTF-16LE code units.
+    /// * `vendor` - Variable vendor GUID.
+    /// * `attributes` - EFI variable attributes.
+    /// * `data` - Variable data payload.
+    fn write(
+        &mut self,
+        name: &[u16],
+        vendor: &Guid,
+        attributes: u32,
+        data: &[u8],
+    ) -> Result<(), VarBackendError>;
+
+    /// Persist a variable deletion.
+    ///
+    /// Called when `SetVariable` is invoked with empty data and
+    /// `EFI_VARIABLE_APPEND_WRITE` is not set.
+    fn delete(&mut self, name: &[u16], vendor: &Guid) -> Result<(), VarBackendError>;
+
+    /// Whether this backend supports writes after `ExitBootServices`.
+    ///
+    /// - `true`: CrabEFI calls `write()`/`delete()` directly at runtime.
+    ///   Suitable for SMM, TF-A MM, or any backend with a privileged agent.
+    /// - `false` (default): CrabEFI buffers runtime writes in the deferred
+    ///   buffer and calls `flush_deferred()` on the next boot.
+    fn runtime_capable(&self) -> bool {
+        false
+    }
+
+    /// Notification that `ExitBootServices` has been called.
+    ///
+    /// For direct-flash backends, this signals that flash may now be locked.
+    /// For SMM/MM backends, this is typically a no-op.
+    fn notify_exit_boot_services(&mut self) {}
+
+    /// Commit deferred writes from a previous boot.
+    ///
+    /// Called after `load()` on the next boot when the previous boot had
+    /// buffered runtime variable writes (because `runtime_capable()` was false).
+    ///
+    /// # Arguments
+    /// * `records` - Iterator of (name, vendor, attributes, data) for each
+    ///   deferred write. Empty data means delete.
+    ///
+    /// The default implementation calls `write()` or `delete()` for each record.
+    fn flush_deferred(
+        &mut self,
+        records: &mut dyn Iterator<Item = (&[u16], &Guid, u32, &[u8])>,
+    ) -> Result<usize, VarBackendError> {
+        let mut count = 0;
+        for (name, vendor, attrs, data) in records {
+            if data.is_empty() {
+                // Ignore NotFound for deletes — variable may not exist
+                match self.delete(name, vendor) {
+                    Ok(()) | Err(VarBackendError::NotFound) => {}
+                    Err(e) => return Err(e),
+                }
+            } else {
+                self.write(name, vendor, attrs, data)?;
+            }
+            count += 1;
+        }
+        Ok(count)
+    }
+}
+
+// ============================================================================
+// Raw Storage Backend
+// ============================================================================
+
+/// Errors returned by raw storage operations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum StorageError {
+    /// Storage device not initialized.
+    NotInitialized,
+    /// Storage is write-protected.
+    WriteProtected,
+    /// Access denied (locked region).
+    AccessDenied,
+    /// Operation timed out.
+    Timeout,
+    /// Invalid address or length.
+    InvalidArgument,
+    /// Generic I/O error.
+    IoError,
+    /// Operation not supported by this backend.
+    NotSupported,
+}
+
+/// Raw byte-level storage backend.
+///
+/// This trait provides low-level read/write/erase access to a storage device.
+/// It is used by [`crate::efi::varstore::Edk2VarStore`] to implement the
+/// EDK2 Firmware Volume format on top of raw flash.
+///
+/// Platform firmware that uses SMM or TF-A MM should implement
+/// [`VariableBackend`] directly instead of this trait.
+///
+/// # Flash Semantics
+///
+/// - `read` works on any valid offset.
+/// - `write` may require the region to be erased first (NOR flash: can only
+///   clear bits 1→0).
+/// - `erase` sets bytes to `0xFF` (NOR flash erased state).
+pub trait StorageBackend: Send {
+    /// Backend name for logging.
+    fn name(&self) -> &str;
+
+    /// Total storage size in bytes.
+    fn size(&self) -> u32;
+
+    /// Whether the storage is currently write-protected.
+    fn is_write_protected(&self) -> bool;
+
+    /// Enable writes (may clear hardware write-protection bits).
+    fn enable_writes(&mut self) -> Result<(), StorageError>;
+
+    /// Read data from storage.
+    fn read(&mut self, offset: u32, buffer: &mut [u8]) -> Result<(), StorageError>;
+
+    /// Write data to storage.
+    ///
+    /// For flash: the target region should be erased first.
+    fn write(&mut self, offset: u32, data: &[u8]) -> Result<(), StorageError>;
+
+    /// Erase a region (sets bytes to `0xFF`).
+    fn erase(&mut self, offset: u32, size: u32) -> Result<(), StorageError>;
+}
+
+// ============================================================================
+// Timer
+// ============================================================================
+
+/// Monotonic timer / clock source.
+///
+/// Provides time measurement for UEFI `Stall()` boot service, EFI timer
+/// events, and internal timeout handling.
+///
+/// # Implementation Notes
+///
+/// - The counter must be monotonically increasing and not wrap during a single
+///   boot (64-bit counters at GHz frequencies won't wrap for centuries).
+/// - `stall()` must busy-wait for at least the requested duration.
+/// - The timer does not need to survive `ExitBootServices` (UEFI timer events
+///   are boot-services-only).
+pub trait Timer {
+    /// Read the current monotonic counter value.
+    fn current_ticks(&self) -> u64;
+
+    /// Counter frequency in Hz.
+    ///
+    /// For x86 TSC at 2 GHz, return `2_000_000_000`.
+    /// For ARM Generic Timer at 62.5 MHz, return `62_500_000`.
+    fn ticks_per_second(&self) -> u64;
+
+    /// Busy-wait for at least the given number of microseconds.
+    ///
+    /// Works correctly for any timer frequency >= 1 Hz. For timers
+    /// below 1 MHz, the computation avoids integer truncation by
+    /// scaling in the opposite order.
+    fn stall(&self, microseconds: u64) {
+        let start = self.current_ticks();
+        let freq = self.ticks_per_second();
+        if freq == 0 {
+            return;
+        }
+        // Compute target ticks = microseconds * freq / 1_000_000.
+        // Use u128 intermediate to avoid overflow for large stall durations
+        // at high frequencies (e.g., 2 GHz * 10_000_000 us overflows u64).
+        let target = ((microseconds as u128 * freq as u128) / 1_000_000) as u64;
+        if target == 0 {
+            return;
+        }
+        while self.current_ticks().wrapping_sub(start) < target {
+            core::hint::spin_loop();
+        }
+    }
+}
+
+// ============================================================================
+// Reset
+// ============================================================================
+
+/// Reset type for `ResetSystem` runtime service.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ResetType {
+    /// Cold reset (full power cycle).
+    Cold,
+    /// Warm reset (CPU reset without full power cycle).
+    Warm,
+    /// System shutdown (power off).
+    Shutdown,
+}
+
+/// System reset and shutdown handler.
+///
+/// Used by the UEFI `ResetSystem` runtime service. The implementation must
+/// be in memory that remains mapped after `ExitBootServices` (runtime-safe).
+///
+/// # Safety Contract
+///
+/// Since `ResetSystem` is a runtime service, the platform must ensure that
+/// the `ResetHandler` implementation and its vtable reside in memory marked
+/// as `RuntimeServicesCode` or `RuntimeServicesData`.
+pub trait ResetHandler {
+    /// Perform a system reset or shutdown.
+    ///
+    /// This function must not return.
+    fn reset(&self, reset_type: ResetType) -> !;
+}
+
+// ============================================================================
+// Random Number Generation
+// ============================================================================
+
+/// Errors returned by the RNG.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RngError {
+    /// No hardware RNG available.
+    Unsupported,
+    /// Hardware RNG failure.
+    HardwareError,
+    /// RNG not ready (transient, caller should retry).
+    NotReady,
+}
+
+/// Hardware random number generator.
+///
+/// Used by the UEFI `EFI_RNG_PROTOCOL`. Implementations should use a
+/// hardware entropy source (e.g., x86 RDRAND/RDSEED, ARM RNDR).
+pub trait Rng {
+    /// Fill `buffer` with random bytes.
+    fn get_random(&self, buffer: &mut [u8]) -> Result<(), RngError>;
+}
+
+// ============================================================================
+// Debug Output
+// ============================================================================
+
+/// Debug/log output channel (serial port or equivalent).
+///
+/// CrabEFI uses this for `log` crate output and EFI `SerialIO` protocol.
+/// The implementation should be safe to call from any context (including
+/// panic handlers), so it must not allocate or take locks that could deadlock.
+///
+/// For the coreboot target, the implementation typically multiplexes output
+/// to a UART and the CBMEM console.
+pub trait DebugOutput: core::fmt::Write + Send {
+    /// Write a single byte. Must not block indefinitely.
+    fn write_byte(&mut self, byte: u8);
+
+    /// Try to read a byte (for serial console input on the debug channel).
+    /// Returns `None` if no data is available.
+    fn try_read_byte(&self) -> Option<u8> {
+        None
+    }
+
+    /// Check if input data is available on the debug channel.
+    fn has_input(&self) -> bool {
+        false
+    }
+}
+
+// ============================================================================
+// Console Input
+// ============================================================================
+
+/// Key event from a console input device.
+///
+/// Maps to `EFI_INPUT_KEY` from the UEFI specification.
+#[derive(Debug, Clone, Copy)]
+pub struct Key {
+    /// EFI scan code (0 = no scan code, use `unicode_char`).
+    /// Non-zero for special keys: Up=0x01, Down=0x02, Right=0x03, Left=0x04,
+    /// Home=0x05, End=0x06, Insert=0x07, Delete=0x08, PgUp=0x09, PgDn=0x0A,
+    /// F1..F10=0x0B..0x14, Esc=0x17.
+    pub scancode: u16,
+    /// Unicode character (0 = no character, use `scancode`).
+    pub unicode_char: u16,
+}
+
+/// Key state for extended keyboard protocols.
+///
+/// Maps to `EFI_KEY_STATE` from `EFI_SIMPLE_TEXT_INPUT_EX_PROTOCOL`.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct KeyState {
+    /// Shift key state flags (`EFI_SHIFT_STATE_VALID | LEFT_SHIFT_PRESSED | ...`).
+    pub shift_state: u32,
+    /// Toggle state flags (`TOGGLE_STATE_VALID | NUM_LOCK_ACTIVE | ...`).
+    pub toggle_state: u8,
+}
+
+/// Console input device (keyboard or equivalent).
+///
+/// The platform provides this to handle keyboard input for the UEFI console
+/// protocols (`SimpleTextInput`, `SimpleTextInputEx`) and the boot menu.
+///
+/// A typical implementation polls all available input sources (PS/2, USB HID,
+/// serial console) and returns the first available key.
+pub trait ConsoleInput {
+    /// Try to read a key press. Returns `None` if no key is available.
+    fn read_key(&mut self) -> Option<Key>;
+
+    /// Check if a key press is available without consuming it.
+    fn has_key(&self) -> bool;
+
+    /// Get the current key state (modifier keys, toggle state).
+    /// Returns default (all zeros) if not supported.
+    fn key_state(&self) -> KeyState {
+        KeyState::default()
+    }
+
+    /// Perform any necessary polling (e.g., USB controller polling).
+    /// Called periodically by the boot manager and console protocols.
+    fn poll(&mut self) {}
+}
+
+// ============================================================================
+// Framebuffer
+// ============================================================================
+
+/// Framebuffer configuration for the Graphics Output Protocol.
+///
+/// The platform provides this when a framebuffer is available. CrabEFI uses
+/// it for the EFI GOP protocol and the text-mode boot menu.
+#[derive(Debug, Clone, Copy)]
+pub struct FramebufferConfig {
+    /// Physical address of the framebuffer memory.
+    pub physical_address: u64,
+    /// Horizontal resolution in pixels.
+    pub width: u32,
+    /// Vertical resolution in pixels.
+    pub height: u32,
+    /// Pixels per scanline (may be wider than `width` due to alignment).
+    ///
+    /// To get bytes per scanline, multiply by `bits_per_pixel / 8`.
+    pub stride: u32,
+    /// Bits per pixel (typically 32).
+    pub bits_per_pixel: u8,
+    /// Bit position of the red channel.
+    pub red_mask_pos: u8,
+    /// Number of bits in the red channel.
+    pub red_mask_size: u8,
+    /// Bit position of the green channel.
+    pub green_mask_pos: u8,
+    /// Number of bits in the green channel.
+    pub green_mask_size: u8,
+    /// Bit position of the blue channel.
+    pub blue_mask_pos: u8,
+    /// Number of bits in the blue channel.
+    pub blue_mask_size: u8,
+}
+
+impl FramebufferConfig {
+    /// Framebuffer size in bytes.
+    pub fn size(&self) -> u64 {
+        self.bytes_per_line() as u64 * self.height as u64
+    }
+
+    /// Bytes per scanline (`stride * bytes_per_pixel`).
+    pub fn bytes_per_line(&self) -> u32 {
+        self.stride * (self.bits_per_pixel as u32 / 8)
+    }
+
+    /// Raw pointer to the framebuffer.
+    ///
+    /// # Safety
+    ///
+    /// The framebuffer must be identity-mapped at `physical_address`.
+    /// The caller is responsible for ensuring the pointer is not used
+    /// after the framebuffer is unmapped.
+    pub unsafe fn as_ptr(&self) -> *mut u8 {
+        core::ptr::with_exposed_provenance_mut(self.physical_address as usize)
+    }
+
+    /// Byte offset for a pixel at coordinates (x, y).
+    ///
+    /// Uses `u64` intermediates to avoid overflow on large framebuffers.
+    pub fn pixel_offset(&self, x: u32, y: u32) -> usize {
+        let bpp = self.bits_per_pixel as u64 / 8;
+        (y as u64 * self.stride as u64 * bpp + x as u64 * bpp) as usize
+    }
+
+    /// Encode a pixel value for the framebuffer's native format.
+    ///
+    /// For 32bpp, returns the native pixel encoding.
+    /// For 16bpp, returns the 16-bit pixel zero-extended to u32.
+    /// For other bpp, returns 0.
+    pub fn encode_pixel(&self, r: u8, g: u8, b: u8) -> u32 {
+        match self.bits_per_pixel {
+            32 => self.encode_pixel_32(r, g, b),
+            16 => self.encode_pixel_16(r, g, b) as u32,
+            _ => 0,
+        }
+    }
+
+    /// Write a pixel at (x, y) with the given RGB color.
+    ///
+    /// # Safety
+    ///
+    /// The framebuffer must be accessible and (x, y) must be in bounds.
+    pub unsafe fn write_pixel(&self, x: u32, y: u32, r: u8, g: u8, b: u8) {
+        if x >= self.width || y >= self.height {
+            return;
+        }
+        let offset = self.pixel_offset(x, y);
+        // SAFETY: caller guarantees the framebuffer is identity-mapped.
+        let fb = unsafe { self.as_ptr() };
+        unsafe {
+            match self.bits_per_pixel {
+                32 => {
+                    let pixel = self.encode_pixel_32(r, g, b);
+                    (fb.add(offset) as *mut u32).write_volatile(pixel);
+                }
+                24 => {
+                    let ptr = fb.add(offset);
+                    if self.blue_mask_pos < self.red_mask_pos {
+                        ptr.write_volatile(b);
+                        ptr.add(1).write_volatile(g);
+                        ptr.add(2).write_volatile(r);
+                    } else {
+                        ptr.write_volatile(r);
+                        ptr.add(1).write_volatile(g);
+                        ptr.add(2).write_volatile(b);
+                    }
+                }
+                16 => {
+                    let pixel = self.encode_pixel_16(r, g, b);
+                    (fb.add(offset) as *mut u16).write_volatile(pixel);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Fill a framebuffer region with a solid color.
+    ///
+    /// # Safety
+    ///
+    /// `dst` must point to `pixel_count * (bits_per_pixel/8)` writable bytes
+    /// within the framebuffer.
+    pub unsafe fn fill_pixels(&self, dst: *mut u8, pixel_count: usize, r: u8, g: u8, b: u8) {
+        unsafe {
+            match self.bits_per_pixel {
+                32 => {
+                    let pixel = self.encode_pixel_32(r, g, b);
+                    let ptr = dst as *mut u32;
+                    for i in 0..pixel_count {
+                        ptr.add(i).write_volatile(pixel);
+                    }
+                }
+                16 => {
+                    let pixel = self.encode_pixel_16(r, g, b);
+                    let ptr = dst as *mut u16;
+                    for i in 0..pixel_count {
+                        ptr.add(i).write_volatile(pixel);
+                    }
+                }
+                _ => {
+                    core::slice::from_raw_parts_mut(
+                        dst,
+                        pixel_count * (self.bits_per_pixel as usize / 8),
+                    )
+                    .fill(0);
+                }
+            }
+        }
+    }
+
+    /// Fill the entire framebuffer with a solid color.
+    ///
+    /// # Safety
+    ///
+    /// The framebuffer must be accessible.
+    pub unsafe fn fill_solid(&self, r: u8, g: u8, b: u8) {
+        let bpl = self.bytes_per_line() as usize;
+        let row_pixels = self.width as usize;
+        let packed = bpl == row_pixels * (self.bits_per_pixel as usize / 8);
+        // SAFETY: caller guarantees the framebuffer is identity-mapped.
+        unsafe {
+            let fb = self.as_ptr();
+            if packed {
+                let total = row_pixels * self.height as usize;
+                self.fill_pixels(fb, total, r, g, b);
+            } else {
+                for y in 0..self.height {
+                    let offset = (y as usize) * bpl;
+                    self.fill_pixels(fb.add(offset), row_pixels, r, g, b);
+                }
+            }
+        }
+    }
+
+    /// Clear the entire framebuffer.
+    ///
+    /// # Safety
+    ///
+    /// The framebuffer must be accessible.
+    pub unsafe fn clear(&self, r: u8, g: u8, b: u8) {
+        // SAFETY: caller guarantees the framebuffer is identity-mapped.
+        let fb = unsafe { self.as_ptr() };
+        let bpl = self.bytes_per_line() as usize;
+        unsafe {
+            match self.bits_per_pixel {
+                32 => {
+                    let pixel = self.encode_pixel_32(r, g, b);
+                    for y in 0..self.height as usize {
+                        let row = fb.add(y * bpl);
+                        for x in 0..self.width as usize {
+                            (row.add(x * 4) as *mut u32).write_volatile(pixel);
+                        }
+                    }
+                }
+                _ => {
+                    for y in 0..self.height {
+                        for x in 0..self.width {
+                            self.write_pixel(x, y, r, g, b);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn encode_pixel_32(&self, r: u8, g: u8, b: u8) -> u32 {
+        let r = ((r as u32) >> (8 - self.red_mask_size)) << self.red_mask_pos;
+        let g = ((g as u32) >> (8 - self.green_mask_size)) << self.green_mask_pos;
+        let b = ((b as u32) >> (8 - self.blue_mask_size)) << self.blue_mask_pos;
+        r | g | b
+    }
+
+    fn encode_pixel_16(&self, r: u8, g: u8, b: u8) -> u16 {
+        let r = ((r as u16) >> (8 - self.red_mask_size)) << self.red_mask_pos;
+        let g = ((g as u16) >> (8 - self.green_mask_size)) << self.green_mask_pos;
+        let b = ((b as u16) >> (8 - self.blue_mask_size)) << self.blue_mask_pos;
+        r | g | b
+    }
+}
+
+// ============================================================================
+// Platform Configuration
+// ============================================================================
+
+/// Warm-reboot persistent buffer for deferred variable writes.
+///
+/// When the [`VariableBackend`] is not [`runtime_capable()`](VariableBackend::runtime_capable),
+/// CrabEFI buffers `SetVariable` calls made after `ExitBootServices` into
+/// this memory region. The platform must ensure this memory:
+///
+/// 1. Survives warm reboots (not cleared on CPU reset).
+/// 2. Is in a memory region marked as `RuntimeServicesData` so the OS
+///    preserves the mapping after `ExitBootServices`.
+///
+/// On the next boot, CrabEFI reads the buffer and commits the writes via
+/// [`VariableBackend::flush_deferred()`].
+///
+/// Not needed if the variable backend is runtime-capable (SMM, TF-A MM).
+#[derive(Debug, Clone, Copy)]
+pub struct DeferredBufferConfig {
+    /// Physical base address of the buffer.
+    pub base: u64,
+    /// Size of the buffer in bytes (typically 64 KiB).
+    pub size: usize,
+}
+
+/// Memory region where CrabEFI's code and data are loaded.
+///
+/// The platform provides this so CrabEFI can mark these regions as
+/// `RuntimeServicesCode` / `RuntimeServicesData` in the EFI memory map,
+/// ensuring the OS preserves them after `ExitBootServices` and
+/// `SetVirtualAddressMap` adjusts pointers correctly.
+///
+/// For the coreboot target, these come from linker-provided symbols.
+/// External firmware must ensure CrabEFI's code lives in a region that
+/// the OS will keep mapped.
+#[derive(Debug, Clone, Copy)]
+pub struct RuntimeRegion {
+    /// Base address of the runtime code section.
+    pub code_base: u64,
+    /// Size of the runtime code section in bytes.
+    pub code_size: u64,
+    /// Base address of the runtime data section (includes stack, state, heap).
+    pub data_base: u64,
+    /// Size of the runtime data section in bytes.
+    pub data_size: u64,
+}
+
+/// Result of the UEFI boot manager.
+///
+/// Describes the outcome when the boot manager exhausts all boot attempts
+/// without successfully handing off to an OS. Currently informational;
+/// [`crate::init_platform()`] is `-> !` and halts the CPU on failure.
+///
+/// Note: when a UEFI application successfully calls `ExitBootServices`,
+/// [`crate::init_platform()`] never returns — the OS has taken control.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BootResult {
+    /// No bootable media found on any provided block device.
+    NoBootMedia,
+    /// Boot entries were found but all attempts failed.
+    AllFailed,
+    /// A UEFI application was loaded and ran, but returned control
+    /// (e.g., GRUB exited, or the application called `Exit()`).
+    ImageReturned,
+}
+
+/// Platform configuration for CrabEFI.
+///
+/// This is the main integration point. External firmware populates this
+/// struct with platform-specific trait implementations, then calls
+/// [`crate::init_platform()`] to start the UEFI boot manager.
+///
+/// # Lifetime
+///
+/// All references in this struct must remain valid for the duration of
+/// [`crate::init_platform()`]. Since `init_platform()` is `-> !` (never
+/// returns), drivers on the caller's stack naturally satisfy this — no
+/// `'static` bounds required.
+///
+/// # Minimal Configuration
+///
+/// At minimum, provide `memory_map`, `timer`, and `reset`. Everything else
+/// is optional (with reduced functionality).
+pub struct PlatformConfig<'a> {
+    // ---- Required ----
+    /// Physical memory map describing all RAM, MMIO, and reserved regions.
+    pub memory_map: &'a [MemoryRegion],
+
+    /// Monotonic timer for `Stall()` and EFI timer events.
+    pub timer: &'a dyn Timer,
+
+    /// System reset handler for `ResetSystem` runtime service.
+    pub reset: &'a dyn ResetHandler,
+
+    // ---- Storage ----
+    /// Block devices to expose via `EFI_BLOCK_IO_PROTOCOL`.
+    ///
+    /// Each device gets its own EFI handle. The boot manager searches
+    /// these for ESP partitions and boot entries.
+    pub block_devices: &'a mut [&'a mut dyn BlockDevice],
+
+    /// Variable persistence backend.
+    ///
+    /// `None` means variables are volatile (lost on reset). EFI applications
+    /// can still use `SetVariable`/`GetVariable`, but nothing persists.
+    pub variable_backend: Option<&'a mut dyn VariableBackend>,
+
+    // ---- Console ----
+    /// Debug/log output (serial port or equivalent).
+    ///
+    /// Also used for `EFI_SERIAL_IO_PROTOCOL` if no other serial is available.
+    pub debug_output: Option<&'a mut dyn DebugOutput>,
+
+    /// Keyboard/console input for `SimpleTextInput` and the boot menu.
+    pub console_input: Option<&'a mut dyn ConsoleInput>,
+
+    /// Framebuffer for `EFI_GRAPHICS_OUTPUT_PROTOCOL` and the boot menu.
+    pub framebuffer: Option<FramebufferConfig>,
+
+    // ---- Platform Tables ----
+    /// ACPI RSDP physical address. Required for ACPI-based OS boot (Linux, Windows).
+    pub acpi_rsdp: Option<u64>,
+
+    /// SMBIOS entry point physical address.
+    pub smbios: Option<u64>,
+
+    /// Flattened Device Tree blob (for DT-based platforms).
+    pub fdt: Option<&'a [u8]>,
+
+    // ---- Optional Hardware ----
+    /// Hardware random number generator for `EFI_RNG_PROTOCOL`.
+    pub rng: Option<&'a dyn Rng>,
+
+    /// PCI ECAM configuration space base address.
+    ///
+    /// If provided, CrabEFI uses this directly for PCI config space access.
+    /// Otherwise, it discovers the ECAM base from ACPI MCFG or FDT.
+    pub ecam_base: Option<u64>,
+
+    // ---- Runtime Support ----
+    /// Warm-reboot persistent buffer for deferred variable writes.
+    ///
+    /// Only needed when `variable_backend` is not runtime-capable.
+    /// See [`DeferredBufferConfig`] for requirements.
+    pub deferred_buffer: Option<DeferredBufferConfig>,
+
+    /// Memory region where CrabEFI's code and data reside.
+    ///
+    /// Needed for `SetVirtualAddressMap` support. If `None`, CrabEFI
+    /// cannot provide runtime services after `ExitBootServices`.
+    pub runtime_region: Option<RuntimeRegion>,
+
+    // ---- Hooks ----
+    /// Optional callback invoked after heap initialization but before the
+    /// boot manager.
+    ///
+    /// This allows the caller to perform heap-dependent initialization
+    /// (e.g., ACPI AML parsing, firmware configuration parsing) that cannot
+    /// happen before [`crate::init_platform()`] sets up the memory allocator.
+    ///
+    /// The callback runs after:
+    /// - EFI memory allocator is initialized (from `memory_map`)
+    /// - Heap allocator is ready (global `alloc` works)
+    /// - Timer is calibrated
+    /// - FDT is parsed (if provided)
+    ///
+    /// The callback runs before:
+    /// - PCI ECAM setup and enumeration
+    /// - Block device registration
+    /// - Variable persistence and boot manager
+    ///
+    /// Use this to populate `DriverState.acpi_info` (via ACPI table
+    /// discovery) so that PCI ECAM can be discovered from ACPI MCFG.
+    pub post_heap_init: Option<fn()>,
+}

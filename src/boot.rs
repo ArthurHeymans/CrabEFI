@@ -239,6 +239,11 @@ fn create_block_device_for_sfs(
             let block_dev = SdhciBlockDevice::new(controller_id, num_blocks, block_size, 0);
             Some(AnyBlockDevice::Sdhci(block_dev))
         }
+        menu::DeviceType::Platform { .. } => {
+            // Platform block devices are accessed through with_disk() → PlatformBlockShim
+            // rather than AnyBlockDevice, which only wraps PCI-discovered devices.
+            None
+        }
     }
 }
 
@@ -649,5 +654,6 @@ pub fn device_path_info_from_entry(entry: &menu::BootEntry) -> DevicePathInfo {
             pci_device: entry.pci_device,
             pci_function: entry.pci_function,
         },
+        menu::DeviceType::Platform { index } => DevicePathInfo::Platform { index },
     }
 }

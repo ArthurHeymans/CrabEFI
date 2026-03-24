@@ -32,8 +32,12 @@ const PAGE_SIZE: usize = 4096;
 /// Number of pages for the heap
 const HEAP_PAGES: u64 = (HEAP_SIZE / PAGE_SIZE) as u64;
 
-/// Global heap state
-struct BumpAllocator {
+/// Global heap state.
+///
+/// Binary crates must wire this up as `#[global_allocator]`. The library
+/// provides [`ALLOCATOR`] as the singleton instance; the binary just
+/// re-exports it with the attribute.
+pub struct BumpAllocator {
     /// Start of the heap
     heap_start: UnsafeCell<usize>,
     /// Current allocation pointer (offset from heap_start)
@@ -147,9 +151,13 @@ unsafe impl GlobalAlloc for BumpAllocator {
     }
 }
 
-/// Global allocator instance
-#[global_allocator]
-static ALLOCATOR: BumpAllocator = BumpAllocator::new();
+/// Global allocator instance.
+///
+/// When the `global-allocator` feature is enabled, this is registered as
+/// `#[global_allocator]`. External firmware that provides its own allocator
+/// should not enable this feature.
+#[cfg_attr(feature = "global-allocator", global_allocator)]
+pub static ALLOCATOR: BumpAllocator = BumpAllocator::new();
 
 /// Initialize the global allocator
 ///

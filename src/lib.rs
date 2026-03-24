@@ -14,7 +14,6 @@
 // Enable alloc crate for heap allocations (needed for RustCrypto)
 extern crate alloc;
 
-pub mod acpi;
 pub mod arch;
 pub mod bls;
 pub mod boot;
@@ -38,33 +37,20 @@ pub mod menu;
 pub(crate) mod menu_common;
 pub mod payload;
 pub mod pe;
+pub mod platform;
 pub mod secure_boot_menu;
 pub mod state;
 pub mod time;
 
 use crate::drivers::block::{AhciDisk, NvmeDisk, SdhciDisk, UsbDisk};
-use core::panic::PanicInfo;
 
-/// Global panic handler
-#[panic_handler]
-fn panic(info: &PanicInfo) -> ! {
-    // Try to print the panic message to serial
-    if let Some(location) = info.location() {
-        log::error!(
-            "PANIC at {}:{}: {}",
-            location.file(),
-            location.line(),
-            info.message()
-        );
-    } else {
-        log::error!("PANIC: {}", info.message());
-    }
-
-    // Halt the CPU
-    loop {
-        arch::halt();
-    }
-}
+// Re-export the public platform API at the crate root for ergonomic access.
+pub use platform::{
+    BlockDevice, BlockDeviceInfo, BlockError, BootResult, ConsoleInput, DebugOutput,
+    DeferredBufferConfig, FramebufferConfig, Key, KeyState, MemoryRegion, MemoryType,
+    PlatformConfig, ResetHandler, ResetType, Rng, RngError, RuntimeRegion, StorageBackend,
+    StorageError, Timer, VarBackendError, VariableBackend, VariableVisitor,
+};
 
 /// Display a Secure Boot violation error on screen
 ///
@@ -90,7 +76,7 @@ pub fn display_secure_boot_error() {
     drivers::serial::write_str("\x1b[0m\r\n"); // Reset color
 
     // Output to framebuffer if available
-    if let Some(fb_info) = coreboot::get_framebuffer() {
+    if let Some(fb_info) = state::get_framebuffer() {
         let mut console = FramebufferConsole::new(&fb_info);
 
         // Calculate center position
@@ -117,280 +103,22 @@ pub fn display_secure_boot_error() {
     time::delay_ms(3000);
 }
 
-/// Initialize the CrabEFI firmware
+/// Common boot tail: variable persistence, Secure Boot, and boot manager.
 ///
-/// This is called from the entry point after switching to 64-bit mode.
-///
-/// # Arguments
-///
-/// * `coreboot_table_ptr` - Pointer to the coreboot tables
-pub fn init(coreboot_table_ptr: u64) -> ! {
-    // Allocate firmware state on the stack
-    // This is THE primary state for the entire firmware
-    let mut firmware_state = state::FirmwareState::new();
-
-    // Initialize the global state pointer
-    // SAFETY: We're in the main entry point, single-threaded, and the state
-    // lives on this stack frame which persists for the entire firmware lifetime
-    unsafe {
-        state::init(&mut firmware_state);
-    }
-
-    // Parse coreboot tables first (before any I/O) to get hardware info
-    // SAFETY: coreboot_table_ptr is passed from coreboot and points to valid tables
-    let cb_info = unsafe { coreboot::tables::parse(coreboot_table_ptr as *const u8) };
-
-    // Initialize CBMEM console early (before logging) so all output goes there
-    if let Some(cbmem_addr) = cb_info.cbmem_console {
-        coreboot::cbmem_console::init(cbmem_addr);
-    }
-
-    // Store framebuffer in global state for menu rendering
-    if let Some(fb) = cb_info.framebuffer {
-        coreboot::store_framebuffer(fb);
-    }
-
-    // Store the coreboot framebuffer record address so we can invalidate it
-    // at ExitBootServices to prevent a race between Linux's simplefb and efifb
-    if let Some(addr) = cb_info.framebuffer_record_addr {
-        coreboot::store_framebuffer_record_addr(addr);
-    }
-
-    // Store SMMSTORE v2 info globally for variable persistence
-    if let Some(smmstore) = cb_info.smmstorev2 {
-        coreboot::store_smmstorev2(smmstore);
-    }
-
-    // Store SPI flash info globally (used for FMAP parsing)
-    if let Some(ref spi_flash) = cb_info.spi_flash {
-        coreboot::store_spi_flash(spi_flash.clone());
-    }
-
-    // Store boot media info globally (contains FMAP offset)
-    if let Some(boot_media) = cb_info.boot_media {
-        coreboot::store_boot_media(boot_media);
-    }
-
-    // NOTE: CFR parsing is deferred until after heap::init() because it
-    // requires heap allocation (alloc::String, alloc::Vec). The raw data
-    // pointer is saved in cb_info.cfr_raw during table parsing.
-
-    // Store memory regions and ACPI RSDP for direct Linux boot
-    state::with_drivers_mut(|drivers| {
-        // Copy memory regions
-        for region in cb_info.memory_map.iter() {
-            let _ = drivers.platform.memory_regions.push(*region);
-        }
-        // Store ACPI RSDP
-        drivers.platform.acpi_rsdp = cb_info.acpi_rsdp;
-    });
-
-    // Initialize serial port from coreboot info (if available)
-    if let Some(ref serial) = cb_info.serial {
-        drivers::serial::init_from_coreboot(serial.baseaddr, serial.baud, serial.mmio());
-    }
-
-    // Initialize logging (now that serial is set up)
-    logger::init();
-
-    // Set framebuffer for logging output (so we can see logs on screen)
-    if let Some(fb) = cb_info.framebuffer {
-        logger::set_framebuffer(fb);
-    }
-
-    // Initialize keyboard subsystem (PS/2 on x86, USB-only on aarch64)
-    drivers::keyboard_common::init();
-
-    log::info!("CrabEFI v{} starting...", env!("CARGO_PKG_VERSION"));
-    log::info!("Coreboot table pointer: {:#x}", coreboot_table_ptr);
-
-    log::info!("Parsed coreboot tables:");
-    if let Some(ref serial) = cb_info.serial {
-        log::info!(
-            "  Serial: port={:#x}, baud={}",
-            serial.baseaddr,
-            serial.baud
-        );
-    } else {
-        log::info!("  Serial: not available");
-    }
-    if let Some(ref fb) = cb_info.framebuffer {
-        log::info!(
-            "  Framebuffer: {}x{} @ {:#x}",
-            fb.x_resolution,
-            fb.y_resolution,
-            fb.physical_address
-        );
-    }
-    if let Some(rsdp) = cb_info.acpi_rsdp {
-        log::info!("  ACPI RSDP: {:#x}", rsdp);
-    }
-    if let Some(cbmem_console) = cb_info.cbmem_console {
-        log::info!("  CBMEM console: {:#x}", cbmem_console);
-    }
-    if let Some(ref smmstore) = cb_info.smmstorev2 {
-        log::info!(
-            "  SMMSTORE v2: {} blocks x {} KB at {:#x}",
-            smmstore.num_blocks,
-            smmstore.block_size / 1024,
-            smmstore.mmap_addr
-        );
-    }
-    if cb_info.cfr_raw.is_some() {
-        log::info!("  CFR: raw data found (parsed after heap init)");
-    }
-    log::info!("  Memory regions: {}", cb_info.memory_map.len());
-    if let Some((fdt_addr, fdt_size)) = cb_info.devicetree {
-        log::info!("  Devicetree: {:#x} ({} bytes)", fdt_addr, fdt_size);
-    }
-
-    // Parse FDT for platform hardware info (PCIe, GIC, etc.)
-    if let Some((fdt_addr, fdt_size)) = cb_info.devicetree
-        && let Some(plat) = unsafe { fdt::parse(fdt_addr, fdt_size) }
-    {
-        state::with_drivers_mut(|d| d.fdt_info = plat);
-    }
-
-    // Initialize timing subsystem (calibrate TSC using ACPI PM timer)
-    time::init(cb_info.acpi_rsdp);
-
-    // Print memory map summary
-    let total_ram: u64 = cb_info
-        .memory_map
-        .iter()
-        .filter(|r| r.region_type == coreboot::memory::MemoryType::Ram)
-        .map(|r| r.size)
-        .sum();
-    log::info!("  Total RAM: {} MB", total_ram / (1024 * 1024));
-
-    // Initialize IDT for exception handling
-    #[cfg(target_arch = "x86_64")]
-    arch::x86_64::idt::init();
-
-    // Initialize EFI environment
-    efi::init(&cb_info);
-
-    // FirmwareState lives on the stack, which is inside the .stack section.
-    // The .stack section is between __runtime_data_start and __runtime_data_end,
-    // so reserve_runtime_region() (called by efi::init) already marks the entire
-    // region — including FirmwareState — as RuntimeServicesData.
-    //
-    // DO NOT add a separate entry here; that would create overlapping memory map
-    // entries which violates the UEFI spec and causes Windows to BSOD during
-    // SetVirtualAddressMap processing.
-    {
-        let state_addr = &firmware_state as *const _ as u64;
-        let state_size = core::mem::size_of::<state::FirmwareState>() as u64;
-        log::info!(
-            "FirmwareState at {:#x}-{:#x} ({} bytes) — covered by runtime data region",
-            state_addr,
-            state_addr + state_size,
-            state_size
-        );
-    }
-
-    // Initialize heap allocator (needed for crypto operations and alloc-dependent features)
-    if !heap::init() {
-        log::error!(
-            "Failed to initialize heap allocator! Secure Boot and other alloc-dependent features will be unavailable."
-        );
-        // Continue boot -- features requiring alloc will fail gracefully
-    }
-
-    // Discover platform hardware from ACPI tables (MADT for GIC, MCFG for ECAM,
-    // SPCR for UART, plus AML interpreter for DSDT device discovery).
-    // This must run after heap::init() because the AML interpreter allocates.
-    if let Some(rsdp_addr) = cb_info.acpi_rsdp {
-        let acpi_info = unsafe { acpi::discover_platform(rsdp_addr) };
-        state::with_drivers_mut(|d| d.acpi_info = acpi_info);
-    }
-
-    // Now that the EFI memory allocator is up and ACPI tables are parsed,
-    // add platform MMIO regions using addresses discovered from FDT and ACPI
-    // tables (instead of hardcoded values). This must happen after efi::init()
-    // (allocator) and after discover_platform() but before ExitBootServices.
-    #[cfg(target_arch = "aarch64")]
-    efi::add_platform_mmio_regions();
-
-    // Parse and store CFR data now that the heap is available.
-    // The raw data pointer was saved during coreboot table parsing.
-    if let Some(cfr_raw) = cb_info.cfr_raw
-        && let Some(cfr) = coreboot::cfr::parse_cfr(cfr_raw)
-    {
-        log::info!(
-            "CFR: {} forms, {} options",
-            cfr.forms.len(),
-            cfr.total_options()
-        );
-        coreboot::store_cfr(cfr);
-    }
-
-    log::info!("CrabEFI initialized successfully!");
-    log::info!("EFI System Table at: {:p}", efi::get_system_table());
-
-    // Discover PCI ECAM base — ACPI MCFG (via acpi module) takes priority, then FDT
-    if let Some(ecam_base) = state::drivers().acpi_info.ecam_base {
-        log::info!("PCI ECAM base from ACPI MCFG: {:#x}", ecam_base);
-        drivers::pci::set_ecam_base(ecam_base);
-    } else if let Some(ecam_base) = state::drivers().fdt_info.ecam_base {
-        log::info!("PCI ECAM base from FDT: {:#x}", ecam_base);
-        drivers::pci::set_ecam_base(ecam_base);
-    }
-
-    // Initialize PCI early so we can detect SPI controller
-    drivers::pci::init();
-
-    // Register the runtime services log region and dump any log from the
-    // previous boot before we do anything else (so the data is visible even
-    // if init fails).  init() is called after deferred writes are processed.
-    #[cfg(feature = "rt-log")]
-    {
-        efi::rtlog::register_region();
-        efi::rtlog::dump();
-    }
-
-    // Reserve the deferred variable buffer region as RuntimeServicesData.
-    // The buffer is at a fixed address (0x80000) below the payload, placed
-    // there by the linker script so coreboot/cbfstool never overwrites it.
-    // Registering it as RuntimeServicesData ensures the OS preserves the
-    // mapping and SetVirtualAddressMap adjusts the GOT-based pointer.
-    {
-        use efi::allocator::{MemoryType, PAGE_SIZE};
-        use efi::varstore::deferred;
-
-        let buf_base = deferred::deferred_buffer_base();
-        let buf_pages = (deferred::deferred_buffer_size() as u64).div_ceil(PAGE_SIZE);
-
-        // The buffer is outside the payload load region so it might not be in
-        // the coreboot-derived memory map at all.  force_add_region creates
-        // the entry unconditionally.
-        if let Err(e) =
-            efi::allocator::force_add_region(buf_base, buf_pages, MemoryType::RuntimeServicesData)
-        {
-            log::warn!(
-                "Could not register deferred buffer at {:#x}: {:?}",
-                buf_base,
-                e
-            );
-        } else {
-            log::info!(
-                "Deferred buffer at {:#x} ({} pages) registered as RuntimeServicesData",
-                buf_base,
-                buf_pages
-            );
-        }
-    }
-
-    // Initialize variable store persistence (loads variables from SPI flash)
+/// This is the shared sequence executed by both [`init_platform()`] and
+/// [`init()`] after architecture/platform-specific initialization is done.
+/// Extracting it eliminates ~40 lines of near-identical code between the
+/// two entry points.
+fn init_persistence_and_boot() -> ! {
+    // ---- Variable persistence ----
     match efi::varstore::init_persistence() {
         Ok(()) => {
             log::info!("Variable store persistence initialized");
 
-            // Check for pending deferred writes from previous warm boot
             let pending_count = efi::varstore::check_deferred_pending();
             if pending_count > 0 {
                 log::info!(
-                    "Found {} pending deferred writes from previous boot",
+                    "{} pending deferred writes from previous boot",
                     pending_count
                 );
                 match efi::varstore::process_deferred_pending() {
@@ -399,55 +127,299 @@ pub fn init(coreboot_table_ptr: u64) -> ! {
                 }
             }
 
-            // Initialize Secure Boot state (load keys from variables, create status vars)
-            // This must be called after variables are loaded from SMMSTORE
             match efi::auth::boot::init_secure_boot_default() {
                 Ok(status) => {
-                    log::info!("Secure Boot initialized:");
                     log::info!(
-                        "  Mode: {}",
-                        if status.setup_mode { "Setup" } else { "User" }
+                        "Secure Boot: mode={}, enabled={}",
+                        if status.setup_mode { "Setup" } else { "User" },
+                        status.secure_boot_enabled
                     );
-                    log::info!(
-                        "  Keys: PK={}, KEK={}, db={}, dbx={}",
-                        status.pk_count,
-                        status.kek_count,
-                        status.db_count,
-                        status.dbx_count
-                    );
-                    if status.secure_boot_enabled {
-                        log::info!("  Secure Boot: ENABLED");
-                    }
                 }
-                Err(e) => log::warn!("Secure Boot initialization failed: {:?}", e),
+                Err(e) => log::warn!("Secure Boot init failed: {:?}", e),
             }
         }
-        Err(e) => log::warn!("Variable store persistence not available: {:?}", e),
+        Err(e) => log::info!("Variable persistence not available: {:?}", e),
     }
 
-    // Initialize the deferred buffer for this boot session.
-    // Any pending writes from a previous warm boot were already processed
-    // above; now clear the buffer so new runtime writes can be accumulated.
     efi::varstore::init_deferred_buffer();
 
-    // Initialize the runtime log for this boot session (clears previous boot's
-    // data now that it has been dumped above).
-    #[cfg(feature = "rt-log")]
-    efi::rtlog::init();
-
-    // Cache boot manager variables EARLY, before platform hooks or driver
-    // binding can modify them (matches edk2 BdsEntry behavior).
+    // ---- Boot manager ----
     let boot_var_state = boot_vars::read_boot_var_state();
-
-    // Initialize storage subsystem and run boot manager
     boot_manager::run(boot_var_state);
 
-    log::info!("Press Ctrl+A X to exit QEMU");
+    log::info!("Boot manager finished — halting");
 
-    // Halt and wait
     loop {
         arch::halt();
     }
+}
+
+/// Initialize CrabEFI with a platform configuration.
+///
+/// This is the primary entry point for the CrabEFI library. External firmware
+/// builds a [`PlatformConfig`] with platform-specific trait implementations
+/// and calls this function to start the UEFI boot manager.
+///
+/// # Pre-initialized state
+///
+/// If the caller has already called [`state::init()`] before this function
+/// (e.g., to store coreboot-specific data in [`state::DriverState`]), this
+/// function detects the pre-initialized state and skips creating a new
+/// [`state::FirmwareState`]. The caller's `FirmwareState` must live on a
+/// stack frame that never returns (e.g., `rust_main() -> !`).
+///
+/// # Never returns
+///
+/// This function never returns (`-> !`). When a UEFI application calls
+/// `ExitBootServices`, the OS takes control. If no boot device is found or
+/// all boot attempts fail, CrabEFI halts the CPU.
+///
+/// Because `init_platform` never returns, all references in [`PlatformConfig`]
+/// remain valid for the entire firmware lifetime. This allows CrabEFI to use
+/// platform-provided drivers (e.g., `debug_output`) directly — no `'static`
+/// bounds required at the call site.
+///
+/// # Example
+///
+/// ```ignore
+/// let config = crabefi::PlatformConfig {
+///     memory_map: &memory_regions,
+///     timer: &my_timer,
+///     reset: &my_reset,
+///     block_devices: &mut [],
+///     debug_output: Some(&mut my_uart),
+///     // ...remaining fields..
+/// };
+/// crabefi::init_platform(config); // never returns
+/// ```
+pub fn init_platform(config: PlatformConfig) -> ! {
+    if state::is_initialized() {
+        // Caller pre-initialized state (e.g., coreboot payload storing
+        // SMMSTORE/SPI/CBMEM info before calling us). Their FirmwareState
+        // lives on a -> ! frame so it outlives us.
+        init_platform_impl(config)
+    } else {
+        // Fresh start: allocate FirmwareState on this stack frame.
+        init_with_local_state(config)
+    }
+}
+
+/// Allocate a fresh [`state::FirmwareState`] on this stack frame and
+/// delegate to [`init_platform_impl`].
+///
+/// Separated from [`init_platform`] so the ~2 MB `FirmwareState` is only
+/// on the stack when the caller didn't pre-initialize.
+#[inline(never)]
+fn init_with_local_state(config: PlatformConfig) -> ! {
+    let mut firmware_state = state::FirmwareState::new();
+    // SAFETY: Single-threaded firmware entry point. The state lives on this
+    // stack frame which never returns (-> !).
+    unsafe {
+        state::init(&mut firmware_state);
+    }
+    init_platform_impl(config)
+}
+
+/// Core initialization logic shared by all callers of [`init_platform`].
+fn init_platform_impl(mut config: PlatformConfig) -> ! {
+    // ---- 1. Install exception / interrupt vectors ----
+    //
+    // On aarch64: without this, VBAR_ELx defaults to 0x0 and any exception
+    // during shim/GRUB execution would vector to address 0x0 (fstart's
+    // _start), causing silent infinite loops instead of a diagnostic halt.
+    //
+    // On x86_64: install the IDT for exception handling.
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        arch::aarch64::exceptions::install_exception_vectors_auto();
+    }
+    #[cfg(target_arch = "x86_64")]
+    arch::x86_64::idt::init();
+
+    // ---- 2. Initialize serial output from platform debug_output ----
+    //
+    // Store the platform's DebugOutput in CrabEFI's serial subsystem so the
+    // logger (a 'static global) can access it. This requires erasing the 'a
+    // lifetime on the trait object reference.
+    //
+    // SAFETY: init_platform() is -> ! (never returns). The caller's stack
+    // frame — where the DebugOutput lives — is never unwound, so the
+    // reference remains valid for the entire firmware lifetime.
+    //
+    // We need to convert &'a mut dyn DebugOutput → *mut dyn DebugOutput
+    // (erasing lifetime 'a). A plain `as` cast does not compile because
+    // the borrow checker requires 'a: 'static for the coercion. The
+    // transmute preserves the fat pointer (data + vtable) identically
+    // and is sound because 'a is effectively 'static (-> !).
+    if let Some(ref mut debug_out) = config.debug_output {
+        let raw: *mut dyn crate::platform::DebugOutput = unsafe {
+            core::mem::transmute::<
+                &mut dyn crate::platform::DebugOutput,
+                *mut dyn crate::platform::DebugOutput,
+            >(*debug_out)
+        };
+        unsafe {
+            drivers::serial::init_from_platform_raw(raw);
+        }
+    }
+
+    // ---- 3. Initialize logging ----
+    //
+    // Idempotent: safe even if the caller already called logger::init()
+    // for early debug output.
+    logger::init();
+
+    log::info!(
+        "CrabEFI v{} starting (platform path)...",
+        env!("CARGO_PKG_VERSION")
+    );
+
+    // ---- 4. Store ACPI RSDP in driver state ----
+    if let Some(rsdp) = config.acpi_rsdp {
+        state::with_drivers_mut(|d| d.platform.acpi_rsdp = Some(rsdp));
+        log::info!("ACPI RSDP: {:#x}", rsdp);
+    }
+
+    // ---- 5. Parse FDT if provided ----
+    //
+    // Must happen before efi::init_from_platform() which uses fdt_info for
+    // MMIO regions on aarch64 (GIC, PCIe windows, UART).
+    if let Some(fdt_bytes) = config.fdt {
+        let fdt_addr = fdt_bytes.as_ptr() as u64;
+        let fdt_size = fdt_bytes.len() as u32;
+        log::info!("FDT: {:#x} ({} bytes)", fdt_addr, fdt_size);
+
+        if let Some(plat) = unsafe { fdt::parse(fdt_addr, fdt_size) } {
+            log::info!(
+                "FDT parsed: ECAM={:?}, GIC={:?}, UART={:?}",
+                plat.ecam_base,
+                plat.gicd,
+                plat.uart_base
+            );
+            state::with_drivers_mut(|d| d.fdt_info = plat);
+        }
+    }
+
+    // ---- 6. Initialize timing subsystem from platform timer ----
+    //
+    // In library mode the platform-provided Timer is the source of truth.
+    // This works on any architecture (x86, aarch64, riscv64) without
+    // architecture-specific hardware detection inside the library.
+    time::init_from_platform(config.timer);
+
+    // Print memory summary
+    let total_ram: u64 = config
+        .memory_map
+        .iter()
+        .filter(|r| r.region_type == MemoryType::Ram)
+        .map(|r| r.size)
+        .sum();
+    log::info!("Total RAM: {} MB", total_ram / (1024 * 1024));
+
+    // ---- 7. Initialize keyboard subsystem ----
+    drivers::keyboard_common::init();
+
+    // ---- 8. Initialize EFI environment ----
+    efi::init_from_platform(&config);
+
+    log::info!("CrabEFI initialized successfully!");
+    log::info!("EFI System Table at: {:p}", efi::get_system_table());
+
+    // ---- 9. Initialize heap ----
+    if !heap::init() {
+        log::error!("Failed to initialize heap allocator!");
+    }
+
+    // ---- 10. Post-heap initialization callback ----
+    //
+    // Allows the caller to perform heap-dependent work (e.g., ACPI AML
+    // parsing, CFR parsing, MMIO region discovery) before PCI enumeration
+    // and the boot manager.
+    if let Some(hook) = config.post_heap_init {
+        hook();
+    }
+
+    // ---- 10b. Runtime log support ----
+    #[cfg(feature = "rt-log")]
+    {
+        efi::rtlog::register_region();
+        efi::rtlog::dump();
+    }
+
+    // ---- 11. Discover PCI ECAM and initialize PCI ----
+    //
+    // Priority: config.ecam_base > acpi_info.ecam_base > fdt_info.ecam_base.
+    // acpi_info is populated by the post_heap_init callback (ACPI discovery).
+    if let Some(ecam) = config.ecam_base {
+        log::info!("PCI ECAM base from platform: {:#x}", ecam);
+        drivers::pci::set_ecam_base(ecam);
+    } else if let Some(ecam) = state::drivers().acpi_info.ecam_base {
+        log::info!("PCI ECAM base from ACPI MCFG: {:#x}", ecam);
+        drivers::pci::set_ecam_base(ecam);
+    } else if let Some(ecam) = state::drivers().fdt_info.ecam_base {
+        log::info!("PCI ECAM base from FDT: {:#x}", ecam);
+        drivers::pci::set_ecam_base(ecam);
+    }
+
+    drivers::pci::init();
+
+    // ---- 12. Register deferred variable buffer if provided ----
+    if let Some(buf) = config.deferred_buffer {
+        use efi::allocator::{MemoryType as AllocMemType, PAGE_SIZE};
+        efi::varstore::deferred::configure_buffer_with_size(buf.base, buf.size);
+        let buf_pages = (buf.size as u64).div_ceil(PAGE_SIZE);
+        if let Err(e) =
+            efi::allocator::force_add_region(buf.base, buf_pages, AllocMemType::RuntimeServicesData)
+        {
+            log::warn!(
+                "Could not register deferred buffer at {:#x}: {:?}",
+                buf.base,
+                e
+            );
+        }
+    } else {
+        // No deferred buffer in config — use linker-symbol-based discovery.
+        use efi::allocator::{MemoryType as AllocMemType, PAGE_SIZE};
+        use efi::varstore::deferred;
+        let buf_base = deferred::deferred_buffer_base();
+        let buf_size = deferred::deferred_buffer_size();
+        if buf_size > 0 {
+            let buf_pages = (buf_size as u64).div_ceil(PAGE_SIZE);
+            if let Err(e) = efi::allocator::force_add_region(
+                buf_base,
+                buf_pages,
+                AllocMemType::RuntimeServicesData,
+            ) {
+                log::warn!(
+                    "Could not register deferred buffer at {:#x}: {:?}",
+                    buf_base,
+                    e
+                );
+            } else {
+                log::info!(
+                    "Deferred buffer at {:#x} ({} pages) registered as RuntimeServicesData",
+                    buf_base,
+                    buf_pages
+                );
+            }
+        }
+    }
+
+    // ---- 13. Register platform block devices ----
+    if !config.block_devices.is_empty() {
+        // SAFETY: init_platform() is -> !, so the block device references in
+        // config.block_devices live forever.
+        unsafe {
+            drivers::storage::register_platform_block_devices(config.block_devices);
+        }
+    }
+
+    // ---- 14. Runtime log init ----
+    #[cfg(feature = "rt-log")]
+    efi::rtlog::init();
+
+    // ---- 15. Variable persistence, Secure Boot, and boot manager ----
+    init_persistence_and_boot();
 }
 
 /// Store a device globally for SimpleFileSystem reads.
@@ -469,6 +441,7 @@ pub(crate) fn store_device_globally(device_type: &menu::DeviceType) -> bool {
         menu::DeviceType::Sdhci { controller_id } => {
             drivers::sdhci::store_global_device(controller_id)
         }
+        menu::DeviceType::Platform { .. } => true, // platform devices are always globally accessible
     }
 }
 
@@ -516,5 +489,46 @@ pub(crate) fn with_disk<R>(
             let mut disk = SdhciDisk::new(controller);
             Some(f(&mut disk))
         }
+        menu::DeviceType::Platform { index } => {
+            drivers::storage::with_platform_block_device(index, |dev| {
+                let mut shim = PlatformBlockShim(dev);
+                f(&mut shim)
+            })
+        }
+    }
+}
+
+/// Shim that adapts a [`platform::BlockDevice`] to the internal
+/// [`drivers::block::BlockDevice`] trait used by the boot path.
+struct PlatformBlockShim<'a>(&'a mut dyn platform::BlockDevice);
+
+impl drivers::block::BlockDevice for PlatformBlockShim<'_> {
+    fn info(&self) -> drivers::block::BlockDeviceInfo {
+        let i = self.0.info();
+        drivers::block::BlockDeviceInfo {
+            num_blocks: i.num_blocks,
+            block_size: i.block_size,
+            media_id: 0,
+            removable: false,
+            read_only: false,
+        }
+    }
+
+    fn read_blocks(
+        &mut self,
+        lba: u64,
+        count: u32,
+        buffer: &mut [u8],
+    ) -> Result<(), drivers::block::BlockError> {
+        // `BlockError` is #[non_exhaustive]; the `_` arm covers future variants.
+        #[allow(unreachable_patterns)]
+        self.0.read_blocks(lba, count, buffer).map_err(|e| match e {
+            platform::BlockError::DeviceError => drivers::block::BlockError::DeviceError,
+            platform::BlockError::InvalidParameter => drivers::block::BlockError::InvalidParameter,
+            platform::BlockError::OutOfRange => drivers::block::BlockError::OutOfRange,
+            platform::BlockError::NoMedia => drivers::block::BlockError::NoMedia,
+            platform::BlockError::MediaChanged => drivers::block::BlockError::MediaChanged,
+            _ => drivers::block::BlockError::DeviceError,
+        })
     }
 }
