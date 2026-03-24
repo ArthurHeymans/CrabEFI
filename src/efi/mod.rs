@@ -539,12 +539,18 @@ pub fn add_platform_mmio_regions() {
         add_mmio(base, total, "GIC");
     }
 
-    // Peripherals — derive from UART base (ACPI SPCR or FDT)
-    // On SBSA, the peripherals (UART, RTC, GPIO, AHCI, EHCI) are in a 2MB
-    // block starting at the UART base address.
-    let uart_base = fdt.uart_base.or(acpi.uart_base);
-    if let Some(base) = uart_base {
-        add_mmio(base, 0x20_0000, "Peripherals (UART/RTC/GPIO/AHCI/EHCI)");
+    // Platform device MMIO — from DSDT Device scopes (_HID + _CRS).
+    // This covers UART, RTC, GPIO, AHCI, xHCI, etc. as described in ACPI.
+    for i in 0..acpi.dsdt_device_count {
+        let dev = &acpi.dsdt_devices[i];
+        add_mmio(dev.mmio_base, dev.mmio_size, dev.hid_str());
+    }
+
+    // FDT UART fallback — on platforms without DSDT (e.g. QEMU virt with FDT).
+    if acpi.dsdt_device_count == 0
+        && let Some(base) = fdt.uart_base
+    {
+        add_mmio(base, 0x1000, "UART (FDT)");
     }
 
     // PCIe PIO

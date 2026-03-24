@@ -5,6 +5,75 @@
 //!
 //! Uses the `fdt` crate for parsing on aarch64; the module is a no-op on x86.
 
+/// Maximum number of devices discovered from DSDT.
+pub const MAX_DSDT_DEVICES: usize = 16;
+
+/// A device discovered from the ACPI DSDT namespace.
+///
+/// Contains the hardware ID (`_HID`), primary MMIO region and interrupt
+/// from the `_CRS` resource template (`Memory32Fixed` + `Extended Interrupt`).
+#[derive(Clone, Copy)]
+pub struct DsdtDevice {
+    /// Hardware ID string (e.g., `"ARMH0011"`, `"PNP0D10"`), null-padded.
+    pub hid: [u8; 16],
+    /// Length of the HID string (excluding padding).
+    pub hid_len: u8,
+    /// ACPI namespace name (4 chars, e.g., `COM0`).
+    pub name: [u8; 4],
+    /// Primary MMIO base address from `Memory32Fixed` in `_CRS`.
+    pub mmio_base: u64,
+    /// Primary MMIO size from `Memory32Fixed` in `_CRS`.
+    pub mmio_size: u64,
+    /// Primary interrupt number from `Extended Interrupt` in `_CRS`.
+    pub irq: Option<u32>,
+}
+
+impl DsdtDevice {
+    pub const fn empty() -> Self {
+        Self {
+            hid: [0; 16],
+            hid_len: 0,
+            name: [0; 4],
+            mmio_base: 0,
+            mmio_size: 0,
+            irq: None,
+        }
+    }
+
+    /// Return the HID as a `&str`.
+    pub fn hid_str(&self) -> &str {
+        core::str::from_utf8(&self.hid[..self.hid_len as usize]).unwrap_or("")
+    }
+
+    /// Return the 4-char ACPI name as a `&str`.
+    pub fn name_str(&self) -> &str {
+        // Trim trailing underscores (ACPI pads short names with `_`).
+        let end = self
+            .name
+            .iter()
+            .rposition(|&b| b != b'_' && b != 0)
+            .map_or(0, |i| i + 1);
+        core::str::from_utf8(&self.name[..end]).unwrap_or("????")
+    }
+}
+
+impl Default for DsdtDevice {
+    fn default() -> Self {
+        Self::empty()
+    }
+}
+
+impl core::fmt::Debug for DsdtDevice {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("DsdtDevice")
+            .field("name", &self.name_str())
+            .field("hid", &self.hid_str())
+            .field("mmio", &format_args!("{:#x}+{:#x}", self.mmio_base, self.mmio_size))
+            .field("irq", &self.irq)
+            .finish()
+    }
+}
+
 /// Platform information extracted from an FDT
 #[derive(Debug, Default, Clone, Copy)]
 pub struct PlatformInfo {
@@ -24,6 +93,10 @@ pub struct PlatformInfo {
     pub gicr: Option<(u64, u64)>,
     /// PL011 UART base address
     pub uart_base: Option<u64>,
+    /// Devices discovered from DSDT `Device` scopes.
+    pub dsdt_devices: [DsdtDevice; MAX_DSDT_DEVICES],
+    /// Number of valid entries in `dsdt_devices`.
+    pub dsdt_device_count: usize,
 }
 
 impl PlatformInfo {
@@ -37,7 +110,16 @@ impl PlatformInfo {
             gicd: None,
             gicr: None,
             uart_base: None,
+            dsdt_devices: [DsdtDevice::empty(); MAX_DSDT_DEVICES],
+            dsdt_device_count: 0,
         }
+    }
+
+    /// Find the first DSDT device whose `_HID` matches `hid`.
+    pub fn find_device(&self, hid: &str) -> Option<&DsdtDevice> {
+        self.dsdt_devices[..self.dsdt_device_count]
+            .iter()
+            .find(|d| d.hid_str() == hid)
     }
 }
 
