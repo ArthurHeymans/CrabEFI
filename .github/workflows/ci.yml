@@ -214,6 +214,75 @@ jobs:
       - name: Run RNG protocol tests
         run: ./crabefi test --app rng-test --disable-kvm --timeout 120
 
+  # ── GRUB + Linux boot-chain ─────────────────────────────────────────
+
+  build-boot-assets:
+    name: Build Boot Assets (GRUB + Linux)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Restore cached boot assets
+        id: cache
+        uses: actions/cache@v4
+        with:
+          path: boot-assets
+          key: boot-assets-${{ hashFiles('ci/build-boot-assets.sh') }}
+
+      - name: Install kernel build dependencies
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential bc flex bison libelf-dev \
+              curl xz-utils grub-common grub-efi-amd64-bin
+
+      - name: Build boot assets
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: ci/build-boot-assets.sh
+
+      - name: Upload boot assets
+        uses: actions/upload-artifact@v4
+        with:
+          name: boot-assets
+          path: boot-assets/
+          retention-days: 7
+
+  test-grub-linux:
+    name: Test x86_64 (GRUB + Linux)
+    runs-on: ubuntu-latest
+    needs: [build, build-boot-assets]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchains
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src
+          targets: x86_64-unknown-none
+
+      - name: Install stable toolchain for xtask
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qemu-system-x86 mtools dosfstools zstd coreboot-utils
+
+      - name: Download CrabEFI ELF
+        uses: actions/download-artifact@v4
+        with:
+          name: crabefi-elf
+          path: target/x86_64-unknown-none/release/
+
+      - name: Download boot assets
+        uses: actions/download-artifact@v4
+        with:
+          name: boot-assets
+          path: boot-assets/
+
+      - name: Run GRUB + Linux boot-chain test
+        run: ./crabefi test --app grub-linux --boot-assets-dir boot-assets --disable-kvm --timeout 180
+
   # ── aarch64 ───────────────────────────────────────────────────────────
 
   clippy-aarch64:

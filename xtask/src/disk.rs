@@ -412,6 +412,93 @@ pub fn create_directory_test_disk(output: &str, efi_app: &str, arch: Arch) -> Re
     Ok(())
 }
 
+/// Create a disk image for the GRUB + Linux boot-chain test.
+///
+/// Disk layout:
+///   /EFI/BOOT/BOOTX64.EFI          GRUB standalone EFI binary
+///   /boot/grub/grub.cfg             GRUB configuration
+///   /vmlinuz                        Linux bzImage
+///
+/// CrabEFI discovers the ESP, loads GRUB as the default UEFI boot
+/// application, GRUB reads its config (embedded or on-disk), and
+/// boots the Linux kernel.  The kernel panics because there is no
+/// root filesystem, but it prints enough to serial for the test
+/// harness to confirm the entire chain executed.
+pub fn create_grub_linux_disk(
+    output: &str,
+    grub_efi: &str,
+    kernel: &str,
+    grub_cfg: &str,
+    arch: Arch,
+) -> Result<()> {
+    // Sanity-check inputs
+    for (label, path) in [
+        ("GRUB EFI", grub_efi),
+        ("kernel", kernel),
+        ("grub.cfg", grub_cfg),
+    ] {
+        if !Path::new(path).exists() {
+            bail!("{} not found: {}", label, path);
+        }
+    }
+
+    println!("Creating GRUB+Linux test disk: {}", output);
+
+    // Start with a bare GPT + ESP disk
+    create_test_disk(output, None, arch)?;
+
+    let disk_with_offset = format!("{}@@{}", output, ESP_START_SECTOR * SECTOR_SIZE);
+
+    // ── Install GRUB as the default UEFI boot application ────────────
+    let _ = Command::new("mmd")
+        .args(["-i", &disk_with_offset, "::/EFI"])
+        .status();
+    let _ = Command::new("mmd")
+        .args(["-i", &disk_with_offset, "::/EFI/BOOT"])
+        .status();
+
+    let boot_filename = efi_boot_filename(arch);
+    let dest = format!("::/EFI/BOOT/{}", boot_filename);
+    let status = Command::new("mcopy")
+        .args(["-i", &disk_with_offset, grub_efi, &dest])
+        .status()
+        .context("mcopy GRUB EFI")?;
+    if !status.success() {
+        bail!("Failed to install GRUB EFI binary");
+    }
+    println!("  Installed GRUB as EFI/BOOT/{}", boot_filename);
+
+    // ── Install grub.cfg on disk ─────────────────────────────────────
+    let _ = Command::new("mmd")
+        .args(["-i", &disk_with_offset, "::/boot"])
+        .status();
+    let _ = Command::new("mmd")
+        .args(["-i", &disk_with_offset, "::/boot/grub"])
+        .status();
+
+    let status = Command::new("mcopy")
+        .args(["-i", &disk_with_offset, grub_cfg, "::/boot/grub/grub.cfg"])
+        .status()
+        .context("mcopy grub.cfg")?;
+    if !status.success() {
+        bail!("Failed to install grub.cfg");
+    }
+    println!("  Installed boot/grub/grub.cfg");
+
+    // ── Install the Linux kernel ─────────────────────────────────────
+    let status = Command::new("mcopy")
+        .args(["-i", &disk_with_offset, kernel, "::/vmlinuz"])
+        .status()
+        .context("mcopy vmlinuz")?;
+    if !status.success() {
+        bail!("Failed to install vmlinuz");
+    }
+    println!("  Installed vmlinuz");
+
+    println!("Created: {}", output);
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

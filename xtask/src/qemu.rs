@@ -553,6 +553,34 @@ pub fn run_tests(config: &QemuConfig, disk_path: &Path, app_name: &str) -> Resul
                 failed += 1;
             }
         }
+        "grub-linux" => {
+            // ── GRUB + Linux boot-chain test ─────────────────────────
+            // The boot path is: CrabEFI -> GRUB (UEFI app) -> Linux.
+            // Linux will panic because there is no rootfs, but we just
+            // need to see that the entire chain executed.
+
+            // Check that Linux actually started
+            if result.output.contains("Linux version") {
+                println!("[PASS] linux_started: Linux kernel started (saw 'Linux version')");
+                passed += 1;
+            } else {
+                println!("[FAIL] linux_started: 'Linux version' not found in output");
+                failed += 1;
+            }
+
+            // Kernel panic is *expected* (no rootfs) -- but if we see
+            // it, it means Linux ran to the point of trying to mount
+            // the root filesystem, which is a solid indicator of a
+            // working boot chain.
+            if result.output.contains("Kernel panic") {
+                println!("[PASS] kernel_ran: Kernel ran to rootfs mount (expected panic)");
+                passed += 1;
+            } else {
+                // Not a failure -- the kernel might not reach panic
+                // within the timeout, or panic output may be suppressed.
+                println!("[INFO] kernel_panic: 'Kernel panic' not seen (may still be OK)");
+            }
+        }
         "directory-test" => {
             // Check that the test app started
             if result.output.contains("Directory Enumeration Test") {
