@@ -68,7 +68,10 @@ impl core::fmt::Debug for DsdtDevice {
         f.debug_struct("DsdtDevice")
             .field("name", &self.name_str())
             .field("hid", &self.hid_str())
-            .field("mmio", &format_args!("{:#x}+{:#x}", self.mmio_base, self.mmio_size))
+            .field(
+                "mmio",
+                &format_args!("{:#x}+{:#x}", self.mmio_base, self.mmio_size),
+            )
             .field("irq", &self.irq)
             .finish()
     }

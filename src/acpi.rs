@@ -8,7 +8,7 @@
 //! - **FADT → DSDT** — Full AML interpreter for platform device discovery
 //!   (`_HID`, `_CRS` resource templates with all memory descriptor types)
 
-use crate::fdt::{DsdtDevice, PlatformInfo, MAX_DSDT_DEVICES};
+use crate::fdt::{DsdtDevice, MAX_DSDT_DEVICES, PlatformInfo};
 use acpi::{AcpiTables, Handle, Handler, PciAddress, PhysicalMapping};
 use core::ptr::NonNull;
 use core::sync::atomic::{AtomicU64, Ordering};
@@ -405,7 +405,7 @@ fn discover_namespace_devices(
     use acpi::aml::namespace::{AmlName, NamespaceLevelKind};
     use acpi::aml::object::Object;
     use acpi::aml::resource::{
-        resource_descriptor_list, AddressSpaceResourceType, MemoryRangeDescriptor, Resource,
+        AddressSpaceResourceType, MemoryRangeDescriptor, Resource, resource_descriptor_list,
     };
     use alloc::vec;
     use core::str::FromStr;
@@ -540,11 +540,7 @@ fn decode_eisaid_into(val: u64, buf: &mut [u8; 16]) -> usize {
     let c2 = ((id >> 16) & 0x1F) as u8 + 0x40;
 
     fn hex(v: u8) -> u8 {
-        if v < 10 {
-            b'0' + v
-        } else {
-            b'A' + v - 10
-        }
+        if v < 10 { b'0' + v } else { b'A' + v - 10 }
     }
 
     if c0.is_ascii_uppercase() && c1.is_ascii_uppercase() && c2.is_ascii_uppercase() {
