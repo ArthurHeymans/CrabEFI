@@ -128,6 +128,8 @@ enum Commands {
         coreboot_rom: Option<String>,
 
         /// Test app to run (default: hello)
+        ///
+        /// Use "grub-linux" for the GRUB + Linux boot-chain test.
         #[arg(long, default_value = "hello")]
         app: String,
 
@@ -154,6 +156,11 @@ enum Commands {
         /// Enable graphical UI with mouse support
         #[arg(long)]
         ui: bool,
+
+        /// Directory containing pre-built boot assets (vmlinuz, grubx64.efi, grub.cfg).
+        /// Required when --app grub-linux is used.
+        #[arg(long)]
+        boot_assets_dir: Option<PathBuf>,
     },
 
     /// Build a test EFI application
@@ -229,6 +236,7 @@ fn main() -> Result<()> {
             disable_kvm,
             timeout,
             ui,
+            boot_assets_dir,
         } => cmd_test(
             coreboot_rom,
             &app,
@@ -240,6 +248,7 @@ fn main() -> Result<()> {
             ui,
             arch,
             machine,
+            boot_assets_dir,
         ),
         Commands::BuildTestApp { name } => cmd_build_test_app(&name, arch),
         Commands::ListTestApps => cmd_list_test_apps(),
@@ -401,6 +410,7 @@ fn cmd_test(
     ui: bool,
     arch: Arch,
     machine: Machine,
+    boot_assets_dir: Option<PathBuf>,
 ) -> Result<()> {
     let storage = if ahci {
         qemu::StorageType::Ahci
@@ -442,19 +452,69 @@ fn cmd_test(
         extra_devices: Vec::new(),
     };
 
-    // Build the test app
-    println!("Building test app: {}", app);
-    cmd_build_test_app(app, arch)?;
-
-    // Find the EFI file
-    let efi_path = find_test_app_efi(app, arch)?;
-
-    // Create test disk (directory-test needs LFN files on disk)
     let disk_path = temp_dir.path().join("test.img");
-    if app == "directory-test" {
-        disk::create_directory_test_disk(disk_path.to_string_lossy().as_ref(), &efi_path, arch)?;
+
+    if app == "grub-linux" {
+        // ── GRUB + Linux boot-chain test ─────────────────────────────
+        // Instead of building a UEFI test app, we create a disk with
+        // GRUB as the boot application and a Linux kernel.
+        let assets_dir = boot_assets_dir
+            .as_deref()
+            .map(|p| {
+                if p.is_relative() {
+                    // Resolve relative paths against the project root,
+                    // since the crabefi wrapper cd's into xtask/ before
+                    // running us.
+                    project_root().join(p)
+                } else {
+                    p.to_path_buf()
+                }
+            })
+            .unwrap_or_else(|| project_root().join("boot-assets"));
+
+        let grub_efi = assets_dir.join("grubx64.efi");
+        let kernel = assets_dir.join("vmlinuz");
+        let grub_cfg = assets_dir.join("grub.cfg");
+
+        for (label, path) in [
+            ("grubx64.efi", &grub_efi),
+            ("vmlinuz", &kernel),
+            ("grub.cfg", &grub_cfg),
+        ] {
+            if !path.exists() {
+                anyhow::bail!(
+                    "Boot asset not found: {} (looked in {})\n\
+                     Run ci/build-boot-assets.sh to build them, \
+                     or pass --boot-assets-dir",
+                    label,
+                    assets_dir.display()
+                );
+            }
+        }
+
+        disk::create_grub_linux_disk(
+            disk_path.to_string_lossy().as_ref(),
+            grub_efi.to_string_lossy().as_ref(),
+            kernel.to_string_lossy().as_ref(),
+            grub_cfg.to_string_lossy().as_ref(),
+            arch,
+        )?;
     } else {
-        disk::create_test_disk(disk_path.to_string_lossy().as_ref(), Some(&efi_path), arch)?;
+        // ── Normal UEFI test app ─────────────────────────────────────
+        println!("Building test app: {}", app);
+        cmd_build_test_app(app, arch)?;
+
+        let efi_path = find_test_app_efi(app, arch)?;
+
+        if app == "directory-test" {
+            disk::create_directory_test_disk(
+                disk_path.to_string_lossy().as_ref(),
+                &efi_path,
+                arch,
+            )?;
+        } else {
+            disk::create_test_disk(disk_path.to_string_lossy().as_ref(), Some(&efi_path), arch)?;
+        }
     }
 
     // Run tests
