@@ -24,13 +24,6 @@ use core::panic::PanicInfo;
 const MAX_MEMORY_REGIONS: usize = 96;
 
 // ============================================================================
-// Statics for passing data into the post_heap_init callback
-// ============================================================================
-
-/// Raw CFR data pointer from coreboot tables (needs heap to parse).
-static mut CFR_RAW_PTR: Option<&'static [u8]> = None;
-
-// ============================================================================
 // Platform trait implementations
 // ============================================================================
 
@@ -73,52 +66,6 @@ impl crabefi::ResetHandler for CorebootReset {
                 _ => crabefi::arch::aarch64::reset::system_reset(),
             }
         }
-    }
-}
-
-// ============================================================================
-// Post-heap initialization callback
-// ============================================================================
-
-/// Runs after `init_platform()` has initialized the EFI memory allocator and
-/// heap. Performs heap-dependent discovery that the coreboot payload needs:
-///
-/// 1. ACPI table discovery (MADT, MCFG, SPCR, DSDT via AML interpreter)
-/// 2. Platform MMIO region registration (aarch64)
-/// 3. CFR (Coreboot Form Representation) parsing
-fn coreboot_post_heap_init() {
-    // ---- 1. ACPI platform discovery ----
-    //
-    // The AML interpreter allocates, so this must run after heap::init().
-    // Results go into state.drivers.acpi_info which init_platform() reads
-    // for ECAM base and add_platform_mmio_regions() reads for MMIO.
-    if let Some(rsdp) = crabefi::state::drivers().platform.acpi_rsdp {
-        let acpi_info = unsafe { acpi::discover_platform(rsdp) };
-        crabefi::state::with_drivers_mut(|d| d.acpi_info = acpi_info);
-    }
-
-    // ---- 2. Platform MMIO regions (aarch64) ----
-    //
-    // Coreboot's lb_memory table omits MMIO regions. Add them from the
-    // ACPI/FDT info we just discovered.
-    #[cfg(target_arch = "aarch64")]
-    crabefi::efi::add_platform_mmio_regions();
-
-    // ---- 3. CFR parsing ----
-    //
-    // Parse coreboot firmware configuration options now that the heap is
-    // available. The raw data pointer was saved during table parsing.
-    //
-    // SAFETY: single-threaded firmware; CFR_RAW_PTR set once in rust_main().
-    if let Some(cfr_raw) = unsafe { CFR_RAW_PTR }
-        && let Some(cfr) = crabefi::coreboot::cfr::parse_cfr(cfr_raw)
-    {
-        log::info!(
-            "CFR: {} forms, {} options",
-            cfr.forms.len(),
-            cfr.total_options()
-        );
-        crabefi::coreboot::store_cfr(cfr);
     }
 }
 
@@ -240,21 +187,13 @@ pub extern "C" fn rust_main(coreboot_table_ptr: u64) -> ! {
     }
 
     // Store memory regions and ACPI RSDP (used by direct Linux boot path
-    // and by the post_heap_init callback for ACPI discovery).
+    // and by ACPI discovery after heap init).
     crabefi::state::with_drivers_mut(|drivers| {
         for region in cb_info.memory_map.iter() {
             let _ = drivers.platform.memory_regions.push(*region);
         }
         drivers.platform.acpi_rsdp = cb_info.acpi_rsdp;
     });
-
-    // Save CFR raw data pointer for the post-heap callback.
-    // SAFETY: single-threaded firmware; pointer valid for firmware lifetime.
-    if let Some(cfr_raw) = cb_info.cfr_raw {
-        unsafe {
-            CFR_RAW_PTR = Some(cfr_raw);
-        }
-    }
 
     // ================================================================
     // Phase 4: Initialize serial and logging
@@ -282,7 +221,7 @@ pub extern "C" fn rust_main(coreboot_table_ptr: u64) -> ! {
     crabefi::time::init(cb_info.acpi_rsdp);
 
     // ================================================================
-    // Phase 6: Build PlatformConfig and hand off to the library
+    // Phase 6: Build PlatformConfig
     // ================================================================
 
     // Convert coreboot memory map to platform format.
@@ -306,7 +245,7 @@ pub extern "C" fn rust_main(coreboot_table_ptr: u64) -> ! {
         unsafe { core::slice::from_raw_parts(addr as *const u8, size as usize) }
     });
 
-    let config = crabefi::PlatformConfig {
+    let mut config = crabefi::PlatformConfig {
         memory_map: &memory_regions[..region_count],
         timer: &timer,
         reset: &reset,
@@ -319,13 +258,69 @@ pub extern "C" fn rust_main(coreboot_table_ptr: u64) -> ! {
         smbios: cb_info.smbios,
         fdt: fdt_slice,
         rng: None,
-        ecam_base: None,       // Discovered by post_heap_init callback via ACPI MCFG
-        deferred_buffer: None, // Uses linker-symbol fallback in init_platform()
-        runtime_region: None,  // Uses linker-symbol fallback (platform-entry feature)
-        post_heap_init: Some(coreboot_post_heap_init),
+        ecam_base: None,             // May be filled from ACPI MCFG below
+        deferred_buffer: None,       // Uses linker-symbol fallback in init_platform()
+        runtime_region: None,        // Uses linker-symbol fallback (platform-entry feature)
+        heap_pre_initialized: false, // Set to true after Phase 7
     };
 
-    // This never returns — the boot manager takes over.
+    // ================================================================
+    // Phase 7: Bootstrap page allocator and heap early
+    //
+    // We only need the page allocator (for heap::init) and the heap
+    // (for ACPI AML / CFR parsing).  The full EFI environment (system
+    // table, config tables, runtime reservations) is set up later by
+    // init_platform() — its allocator init is idempotent so the second
+    // call is a no-op.
+    // ================================================================
+    crabefi::efi::allocator::init_from_platform(config.memory_map);
+    if !crabefi::heap::init() {
+        log::error!("Failed to initialize heap allocator!");
+    }
+    config.heap_pre_initialized = true;
+
+    // ================================================================
+    // Phase 8: Post-heap platform discovery
+    //
+    // Now that the heap is available we can run ACPI AML interpretation,
+    // register MMIO regions, and parse CFR options.
+    // ================================================================
+
+    // ---- ACPI platform discovery ----
+    //
+    // The AML interpreter allocates, so this must run after heap::init().
+    // Results go into state.drivers.acpi_info which init_platform() reads
+    // for ECAM base and add_platform_mmio_regions() reads for MMIO.
+    if let Some(rsdp) = crabefi::state::drivers().platform.acpi_rsdp {
+        let acpi_info = unsafe { acpi::discover_platform(rsdp) };
+        crabefi::state::with_drivers_mut(|d| d.acpi_info = acpi_info);
+    }
+
+    // ---- Platform MMIO regions (aarch64) ----
+    //
+    // Coreboot's lb_memory table omits MMIO regions. Add them from the
+    // ACPI/FDT info we just discovered.
+    #[cfg(target_arch = "aarch64")]
+    crabefi::efi::add_platform_mmio_regions();
+
+    // ---- CFR parsing ----
+    //
+    // Parse coreboot firmware configuration options now that the heap is
+    // available. cb_info.cfr_raw is still in scope — no static needed.
+    if let Some(cfr_raw) = cb_info.cfr_raw
+        && let Some(cfr) = crabefi::coreboot::cfr::parse_cfr(cfr_raw)
+    {
+        log::info!(
+            "CFR: {} forms, {} options",
+            cfr.forms.len(),
+            cfr.total_options()
+        );
+        crabefi::coreboot::store_cfr(cfr);
+    }
+
+    // ================================================================
+    // Phase 9: Hand off to the library (never returns)
+    // ================================================================
     crabefi::init_platform(config)
 }
 

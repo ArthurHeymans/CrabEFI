@@ -347,7 +347,16 @@ impl MemoryAllocator {
     ///
     /// This is the `init_platform()` counterpart to `init_from_coreboot()`.
     /// Converts `platform::MemoryRegion` entries into EFI memory descriptors.
+    ///
+    /// Idempotent: if the allocator already has entries (e.g., the caller
+    /// bootstrapped the page allocator before [`crate::init_platform()`] to
+    /// get a heap), this is a no-op.
     pub fn init_from_platform(&mut self, regions: &[crate::platform::MemoryRegion]) {
+        if !self.entries.is_empty() {
+            log::info!("Page allocator already initialized, skipping re-init");
+            return;
+        }
+
         use crate::platform::MemoryType as PlatMemType;
 
         self.entries.clear();

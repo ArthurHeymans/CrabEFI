@@ -16,8 +16,8 @@ r-efi = "5.3"
 heapless = "0.8"
 
 # ACPI table parsing and AML interpreter for platform device discovery.
-# Used by the coreboot payload's post_heap_init callback to discover
-# ECAM, GIC, UART, and DSDT devices from ACPI tables.
+# Used by the coreboot payload to discover ECAM, GIC, UART, and DSDT
+# devices from ACPI tables before handing off to init_platform().
 acpi = { version = "6.1", default-features = false, features = ["alloc", "aml"] }
 
 [target.'cfg(target_arch = "x86_64")'.dependencies]

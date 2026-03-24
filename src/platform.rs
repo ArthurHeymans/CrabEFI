@@ -1018,26 +1018,17 @@ pub struct PlatformConfig<'a> {
     /// cannot provide runtime services after `ExitBootServices`.
     pub runtime_region: Option<RuntimeRegion>,
 
-    // ---- Hooks ----
-    /// Optional callback invoked after heap initialization but before the
-    /// boot manager.
+    // ---- Pre-initialization ----
+    /// Whether the EFI environment and heap allocator were already set up
+    /// before calling [`crate::init_platform()`].
     ///
-    /// This allows the caller to perform heap-dependent initialization
-    /// (e.g., ACPI AML parsing, firmware configuration parsing) that cannot
-    /// happen before [`crate::init_platform()`] sets up the memory allocator.
+    /// When `true`, `init_platform()` skips [`efi::init_from_platform()`]
+    /// and [`heap::init()`]. The caller is responsible for having called
+    /// both before entry, so that `alloc` works and the EFI memory map /
+    /// system table are ready.
     ///
-    /// The callback runs after:
-    /// - EFI memory allocator is initialized (from `memory_map`)
-    /// - Heap allocator is ready (global `alloc` works)
-    /// - Timer is calibrated
-    /// - FDT is parsed (if provided)
-    ///
-    /// The callback runs before:
-    /// - PCI ECAM setup and enumeration
-    /// - Block device registration
-    /// - Variable persistence and boot manager
-    ///
-    /// Use this to populate `DriverState.acpi_info` (via ACPI table
-    /// discovery) so that PCI ECAM can be discovered from ACPI MCFG.
-    pub post_heap_init: Option<fn()>,
+    /// This allows platforms to perform heap-dependent initialization
+    /// (e.g., ACPI AML parsing, firmware configuration parsing) *before*
+    /// handing off to the library, removing the need for a callback.
+    pub heap_pre_initialized: bool,
 }
