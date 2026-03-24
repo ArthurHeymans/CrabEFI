@@ -1,249 +1,197 @@
 # Building CrabEFI
 
-This document describes how to build CrabEFI and run tests.
-
 ## Prerequisites
 
 ### Using Nix (Recommended)
 
-The easiest way to get all dependencies is using Nix:
-
 ```bash
-# Enter the development shell
 nix develop
 ```
 
-This provides:
-- Rust nightly toolchain with `x86_64-unknown-none` target
-- QEMU for testing
-- mtools and dosfstools for disk image creation
-- cbfstool for coreboot ROM manipulation
-- zstd for ROM decompression
+This provides the Rust nightly toolchain, QEMU, mtools, dosfstools, cbfstool, and zstd.
 
 ### Manual Setup
 
-If not using Nix, install the following:
-
 **Rust Toolchain:**
 ```bash
-# Install Rust nightly
 rustup toolchain install nightly
 rustup default nightly
-
-# Add the bare-metal target
-rustup target add x86_64-unknown-none
+rustup target add x86_64-unknown-none aarch64-unknown-none
+rustup component add rust-src llvm-tools-preview
 ```
 
 **System Packages (Debian/Ubuntu):**
 ```bash
-sudo apt install \
-    qemu-system-x86 \
-    mtools \
-    dosfstools \
-    zstd
+sudo apt install qemu-system-x86 qemu-system-arm mtools dosfstools zstd coreboot-utils
 ```
-
-**cbfstool:** Build from coreboot source or install `coreboot-utils` if available.
 
 ## Building
 
-### Basic Build
+### Using the Build Tool (Recommended)
+
+The `./crabefi` wrapper invokes the xtask build system:
 
 ```bash
-# Build CrabEFI (release mode, required for firmware)
-cargo build --release
-```
-
-The output ELF is at: `target/x86_64-unknown-none/release/crabefi.elf`
-
-### Using the Build Tool
-
-The `./crabefi` tool (implemented in `xtask/`) provides convenient build commands:
-
-```bash
-# Build CrabEFI
+# Build for x86_64 (default)
 ./crabefi build
 
-# Clean build
-cargo clean && ./crabefi build
+# Build for aarch64 (QEMU SBSA)
+./crabefi build --arch aarch64
 
-# Check without building
-cargo check
+# Build for aarch64 (QEMU virt)
+./crabefi build --arch aarch64 --machine virt
+```
+
+The output ELF is at `target/<triple>/release/crabefi`.
+
+### Using Cargo Directly
+
+```bash
+# Build the coreboot payload binary
+cargo build -p crabefi-coreboot --release --target x86_64-unknown-none
+
+# Build only the library (for external integration)
+cargo build -p crabefi --release --target x86_64-unknown-none
+
+# Build the drivers crate
+cargo build -p crabefi-drivers --release --target x86_64-unknown-none
+
+# aarch64
+cargo build -p crabefi-coreboot --release --target aarch64-unknown-none
+
+# aarch64 with custom payload base (QEMU virt)
+PAYLOAD_BASE=0x62000000 cargo build -p crabefi-coreboot --release --target aarch64-unknown-none
 ```
 
 ### Build Configuration
 
-Key files:
+| File | Purpose |
+|------|---------|
+| `Cargo.toml` | Workspace root + core library manifest |
+| `crabefi-coreboot/Cargo.toml` | Coreboot binary manifest |
+| `crabefi-drivers/Cargo.toml` | Drivers library manifest |
+| `.cargo/config.toml` | `build-std` settings, target-specific rustflags |
+| `crabefi-coreboot/build.rs` | Linker script selection, `PAYLOAD_BASE` |
+| `x86_64-coreboot.ld` | x86_64 linker script |
+| `aarch64-coreboot.ld` | aarch64 linker script |
+| `rust-toolchain.toml` | Nightly toolchain with `rust-src` |
 
-- **`Cargo.toml`**: Crate manifest with dependencies
-- **`.cargo/config.toml`**: Build configuration (target, linker)
-- **`x86_64-coreboot.ld`**: Linker script for memory layout
+### Cargo Features
+
+| Feature | Default | Description |
+|---------|---------|-------------|
+| `platform-entry` | off | Include CrabEFI's own `_start` entry point, EL2 page table setup, and exception vectors. Disable when integrating CrabEFI as a library into firmware that provides its own entry point. |
+| `global-allocator` | off | Register the built-in bump allocator as `#[global_allocator]` |
+| `fb-log` | off | Log to framebuffer (very slow, debugging only) |
+| `rt-debug` | off | Serial debug after `SetVirtualAddressMap` |
+| `rt-log` | off | Warm-reboot-persistent ring buffer for runtime service logging |
+
+The `crabefi-coreboot` binary enables both `platform-entry` and `global-allocator` automatically. External firmware that provides its own entry point and allocator should not enable these features.
 
 ## Testing
 
-### Available Test Applications
+### Integration Tests
 
 ```bash
-# List available test apps
-./crabefi list-test-apps
-```
-
-Test applications are in `test-apps/`:
-
-| Application | Description |
-|-------------|-------------|
-| `hello` | Simple hello world, tests basic EFI services |
-| `storage-security-test` | Tests BlockIO and storage protocols |
-| `secure-boot-test` | Tests Secure Boot verification |
-
-### Running Tests
-
-```bash
-# Build a test application
-./crabefi build-test-app hello
-
-# Run integration test (builds app, creates disk, runs QEMU, checks output)
+# Run with USB storage (default)
 ./crabefi test --app hello
+
+# Run with different storage backends
+./crabefi test --app hello --nvme
+./crabefi test --app hello --ahci
+./crabefi test --app hello --sdhci
+
+# Run RNG protocol test
+./crabefi test --app rng-test
+
+# Run directory enumeration test
+./crabefi test --app directory-test
+
+# Disable KVM (when running inside a VM)
+./crabefi test --app hello --disable-kvm
+
+# aarch64 tests
+./crabefi test --arch aarch64 --machine sbsa --app hello --nvme --disable-kvm
+./crabefi test --arch aarch64 --machine virt --app hello --nvme --disable-kvm
 ```
 
 ### Interactive QEMU
 
 ```bash
-# Run with USB storage (default)
 ./crabefi run --app hello
-
-# Run with AHCI/SATA storage
-./crabefi run --app hello --ahci
-
-# Run with NVMe storage
 ./crabefi run --app hello --nvme
-
-# Disable KVM (for running inside VMs)
-./crabefi run --app hello --disable-kvm
+./crabefi run --app hello --ahci --headless
 ```
 
-### Creating Disk Images
+### Test Applications
+
+Test apps live in `test-apps/` and target `x86_64-unknown-uefi` / `aarch64-unknown-uefi`:
+
+| Application | Description |
+|-------------|-------------|
+| `hello` | Basic EFI services smoke test |
+| `rng-test` | `EFI_RNG_PROTOCOL` validation |
+| `directory-test` | Filesystem and long filename tests |
+| `storage-security-test` | Storage security command tests |
+| `secure-boot-test` | Secure Boot verification tests |
+| `fw-dump` | Firmware info dump utility |
 
 ```bash
-# Create a disk image with an EFI application
+# List available test apps
+./crabefi list-test-apps
+
+# Build a single test app
+./crabefi build-test-app hello
+
+# Create a disk image with a custom EFI app
 ./crabefi create-disk --output test.img --efi-app path/to/app.efi
 ```
 
-## QEMU Testing Environment
+### CI Checks
 
-The test environment uses a pre-built coreboot ROM (`firmware/coreboot-qemu-q35.rom.zst`) configured for the Q35 chipset. CrabEFI is added as the payload automatically.
-
-### QEMU Arguments
-
-When running with `./crabefi run`, QEMU is launched with:
-
-- Q35 machine type with appropriate storage controllers
-- Serial console on stdio
-- 1GB RAM
-- KVM acceleration (if available and not disabled)
-
-### Debugging
-
-Serial output goes to the console. For more detailed debugging:
+The CI pipeline runs (replicate locally before pushing):
 
 ```bash
-# Enable verbose logging (in the code)
-# Logs go to serial port and CBMEM console
+# Formatting
+cargo fmt --all --check
 
-# View QEMU monitor
-# Press Ctrl+A, C to enter monitor
-# Type 'quit' to exit
-```
+# Clippy (both architectures)
+cargo clippy --workspace --release --target x86_64-unknown-none -- -D warnings
+cargo clippy --workspace --release --target aarch64-unknown-none -- -D warnings
 
-## Building Test Applications
-
-Test applications are separate crates targeting `x86_64-unknown-uefi`:
-
-```bash
-cd test-apps/hello
-cargo build --release
-```
-
-Output: `test-apps/hello/target/x86_64-unknown-uefi/release/hello.efi`
-
-### Creating New Test Applications
-
-1. Create a new directory in `test-apps/`
-2. Add `Cargo.toml` with target `x86_64-unknown-uefi`
-3. Implement the EFI entry point
-
-Example `Cargo.toml`:
-```toml
-[package]
-name = "my-test"
-version = "0.1.0"
-edition = "2021"
-
-[dependencies]
-r-efi = "5.3"
-
-[profile.release]
-panic = "abort"
+# Build
+cargo build -p crabefi-coreboot --release --target x86_64-unknown-none
+cargo build -p crabefi-coreboot --release --target aarch64-unknown-none
+PAYLOAD_BASE=0x62000000 cargo build -p crabefi-coreboot --release --target aarch64-unknown-none
 ```
 
 ## Deployment
 
 ### Using with Coreboot
 
-To use CrabEFI as a coreboot payload:
-
-1. Build CrabEFI: `cargo build --release`
-2. Add to coreboot ROM using cbfstool:
+1. Build: `./crabefi build`
+2. Add to a coreboot ROM:
    ```bash
+   cbfstool coreboot.rom remove -n fallback/payload
    cbfstool coreboot.rom add-payload \
-       -f target/x86_64-unknown-none/release/crabefi.elf \
+       -f target/x86_64-unknown-none/release/crabefi \
        -n fallback/payload \
        -c lzma
    ```
 
 ### Real Hardware
 
-When flashing to real hardware:
-
-1. Ensure coreboot is working on your board first
-2. Keep a backup of working firmware
-3. Test in QEMU with similar configuration first
-4. Have a recovery method (external flash programmer)
+- Ensure coreboot works on your board first.
+- Keep a backup of working firmware.
+- Test in QEMU with a similar configuration first.
+- Have a recovery method (external flash programmer).
 
 ## Troubleshooting
 
-### Common Issues
+**QEMU fails to start** -- Check KVM: `ls /dev/kvm`. Use `--disable-kvm` inside VMs.
 
-**"can't find crate for test"**
+**Disk image creation fails** -- Ensure `mtools` and `dosfstools` are installed.
 
-This LSP error is expected. CrabEFI targets bare-metal (`#![no_std]`) and doesn't have the test harness. The code compiles correctly.
+**Build fails with linker errors** -- Check the nightly toolchain and `rust-src` component.
 
-**QEMU fails to start**
-
-- Check KVM availability: `ls /dev/kvm`
-- Try `--disable-kvm` if running inside a VM
-
-**Disk image creation fails**
-
-- Ensure `mtools` and `dosfstools` are installed
-- Check disk space for temporary files
-
-**Build fails with linker errors**
-
-- Ensure you're using the correct Rust nightly version
-- Check that `x86_64-unknown-none` target is installed
-
-### Debug Output
-
-CrabEFI logs to:
-1. Serial port (COM1, 0x3F8)
-2. CBMEM console (viewable in coreboot)
-3. Framebuffer (if `fb-log` feature is enabled)
-
-Enable the framebuffer logging feature for visual debugging:
-
-```bash
-cargo build --release --features fb-log
-```
-
-Note: Framebuffer logging is very slow and should only be used for debugging.
+**Debug output** -- CrabEFI logs to serial (COM1 / PL011), CBMEM console, and optionally the framebuffer (`--features fb-log`).

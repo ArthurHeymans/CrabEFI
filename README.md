@@ -1,42 +1,25 @@
 # CrabEFI
 
-A minimal UEFI implementation written in Rust, designed to run as a coreboot payload.
+A UEFI implementation written in Rust, designed as a reusable library with dependency injection for platform-specific hardware.
+
+CrabEFI implements enough UEFI to boot Linux via shim/GRUB2 or systemd-boot on real hardware. It ships as a coreboot payload but its core is a platform-agnostic library that any firmware can link against.
 
 ## Documentation
 
-For detailed documentation, see the [docs/](docs/README.md) directory:
+See the [docs/](docs/README.md) directory:
 
 - [Building](docs/BUILDING.md) - How to build CrabEFI and run tests
-- [Architecture](docs/ARCHITECTURE.md) - Repository layout and code organization
+- [Architecture](docs/ARCHITECTURE.md) - Workspace layout and code organization
+- [Integration](docs/INTEGRATION.md) - Using CrabEFI as a library in external firmware
 - [Memory Management](docs/MEMORY.md) - Memory layout, allocators, and EFI memory map
 
-## Goals
-
-CrabEFI implements just enough UEFI to boot Linux via shim/GRUB2 or systemd-boot on real hardware. It is not intended to be a full UEFI implementation. 
-Maybe booting windows is also a possibility.
-
-### Planned Features
-
-- **Secure Boot** - Signature verification for bootloaders and kernels
-- **Variable Store** - Persistent EFI variables for saving boot menu entries and configuration
-
-## Building
-
-```bash
-cargo build --release
-```
-
-The output ELF is at `target/x86_64-unknown-none/release/crabefi.elf`, ready to be used as a coreboot payload.
-
-## Testing
-
-Use the `./crabefi` tool for building, testing, and running in QEMU:
+## Quick Start
 
 ```bash
 # Enter nix development environment (provides QEMU, mtools, etc.)
 nix develop
 
-# Build CrabEFI
+# Build the coreboot payload
 ./crabefi build
 
 # Run integration tests
@@ -45,9 +28,19 @@ nix develop
 # Run interactively in QEMU
 ./crabefi run --app hello
 
-# See all commands
-./crabefi --help
+# Build for aarch64
+./crabefi build --arch aarch64
 ```
+
+## Workspace Structure
+
+| Crate | Description |
+|-------|-------------|
+| `crabefi` (root) | Core library -- platform-agnostic UEFI implementation |
+| `crabefi-coreboot` | Coreboot payload binary (arch entry points, table parsing) |
+| `crabefi-drivers` | Standard hardware drivers (NVMe, AHCI, USB, SDHCI, SPI, serial) |
+
+External firmware implements a set of platform traits (`BlockDevice`, `VariableBackend`, `Timer`, etc.), builds a `PlatformConfig`, and calls `crabefi::init_platform()`. See [docs/INTEGRATION.md](docs/INTEGRATION.md) for details.
 
 ## License
 

@@ -2,7 +2,9 @@
 
 This document describes the memory layout, page tables, allocators, and memory map management in CrabEFI.
 
-## Physical Memory Layout
+This focuses on the coreboot target. External firmware using CrabEFI as a library provides its own memory map via `PlatformConfig::memory_map` (see [Integration](INTEGRATION.md)).
+
+## Physical Memory Layout (x86_64 Coreboot)
 
 CrabEFI is loaded by coreboot at `0x100000` (1 MB). The linker script (`x86_64-coreboot.ld`) defines the following layout:
 
@@ -227,7 +229,7 @@ struct PoolHeader {
 For the `alloc` crate (used by crypto libraries), CrabEFI provides a bump allocator (`heap.rs`):
 
 ```rust
-struct BumpAllocator {
+pub struct BumpAllocator {
     heap_start: usize,      // Start of heap region
     offset: AtomicUsize,    // Current allocation offset
     heap_size: usize,       // Total heap size (2 MB)
@@ -235,12 +237,16 @@ struct BumpAllocator {
 ```
 
 **Characteristics:**
-- 2 MB heap allocated at startup
+- 2 MB heap allocated at startup from the EFI page allocator
 - Fast bump-pointer allocation
 - No deallocation (memory freed when boot services exit)
 - Suitable for temporary firmware allocations
 
+The bump allocator is registered as `#[global_allocator]` when the `global-allocator` feature is enabled (the `crabefi-coreboot` binary enables it). External firmware that provides its own allocator should not enable this feature.
+
 ## Memory Map Initialization
+
+### Coreboot Target
 
 At startup, CrabEFI:
 
@@ -276,9 +282,13 @@ After this:
 - OS can use all other memory
 - No more boot services calls allowed
 
+### Library Target
+
+When CrabEFI is used as a library, the platform provides a `&[MemoryRegion]` in `PlatformConfig::memory_map` using `crabefi::MemoryType` values that map directly to EFI types. No coreboot table parsing is involved.
+
 ## Deferred Variable Buffer
 
-Variables written after `ExitBootServices()` can't be written to SPI flash (it's locked). Instead, they're stored in the deferred buffer:
+Variables written after `ExitBootServices()` can't be written to SPI flash (it's locked). Instead, they're stored in the deferred buffer (only needed when the `VariableBackend` is not `runtime_capable()`):
 
 ```
 .deferred_buffer (64 KB):

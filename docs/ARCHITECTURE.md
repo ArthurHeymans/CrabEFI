@@ -1,96 +1,200 @@
 # CrabEFI Architecture
 
-This document describes the repository layout, code organization, and key architectural decisions in CrabEFI.
+## Workspace Layout
 
-## Repository Layout
+CrabEFI is structured as a Cargo workspace with three crates:
 
 ```
 CrabEFI/
-├── src/                    # Main firmware source code
-│   ├── arch/               # Architecture-specific (x86_64 entry, paging, IDT)
-│   ├── coreboot/           # Coreboot table parsing, memory map, FMAP
-│   ├── drivers/            # Hardware drivers (PCI, NVMe, AHCI, USB, SDHCI, SPI)
-│   ├── efi/                # UEFI implementation
-│   │   ├── protocols/      # Protocol implementations (console, GOP, filesystem, etc.)
-│   │   ├── auth/           # Secure Boot (signature verification, key management)
-│   │   └── varstore/       # Variable storage and SPI persistence
-│   ├── fs/                 # Filesystem support (GPT, FAT, ISO9660)
-│   ├── pe/                 # PE/COFF image loader
-│   ├── linux_boot/         # Direct Linux kernel boot
-│   ├── bls/                # Boot Loader Specification entry parsing
-│   └── payload/            # Coreboot payload chainloading
-├── test-apps/              # EFI test applications (hello, storage-test, etc.)
-├── xtask/                  # Build automation tool (./crabefi command)
-├── firmware/               # Prebuilt coreboot ROM for QEMU testing
-├── docs/                   # Documentation
-├── x86_64-coreboot.ld      # Linker script defining memory layout
-├── Cargo.toml              # Crate manifest
-└── AGENTS.md               # Development guidelines
+├── Cargo.toml                  # Workspace root + core library manifest
+├── src/                        # Core library source
+│   ├── platform.rs             # Platform abstraction traits (public API)
+│   ├── lib.rs                  # Library entry points (init, init_platform)
+│   ├── state.rs                # Centralized FirmwareState
+│   ├── heap.rs                 # Bump allocator (opt-in #[global_allocator])
+│   ├── efi/                    # UEFI implementation
+│   │   ├── boot_services.rs    # EFI_BOOT_SERVICES
+│   │   ├── runtime_services.rs # EFI_RUNTIME_SERVICES
+│   │   ├── system_table.rs     # EFI_SYSTEM_TABLE
+│   │   ├── allocator.rs        # Page-granular memory allocator
+│   │   ├── protocols/          # Protocol implementations (20 files)
+│   │   ├── auth/               # Secure Boot (authenticode, x509, key mgmt)
+│   │   └── varstore/           # Variable persistence
+│   │       ├── edk2.rs         # EDK2 Firmware Volume format parser
+│   │       ├── edk2_backend.rs # Edk2VarStore (VariableBackend for raw flash)
+│   │       ├── persistence.rs  # Legacy SPI persistence layer
+│   │       ├── deferred.rs     # Warm-reboot deferred write buffer
+│   │       └── storage.rs      # SpiStorageBackend
+│   ├── drivers/                # Hardware drivers (will move to crabefi-drivers)
+│   │   ├── block.rs            # BlockDevice trait + implementations
+│   │   ├── storage.rs          # StorageRegistry
+│   │   ├── pci/                # PCI enumeration + driver model
+│   │   ├── nvme/               # NVMe controller driver
+│   │   ├── ahci/               # AHCI/SATA driver
+│   │   ├── usb/                # USB host controllers + device classes
+│   │   ├── sdhci/              # SD Host Controller driver
+│   │   ├── spi/                # SPI flash (Intel, AMD, QEMU)
+│   │   ├── serial.rs           # 16550 UART + PL011
+│   │   └── keyboard.rs         # PS/2 keyboard
+│   ├── arch/                   # Architecture-specific code
+│   │   ├── x86_64/             # Entry, IDT, port I/O, cache, reset, RNG
+│   │   └── aarch64/            # Entry, exceptions, cache, reset, RNG
+│   ├── coreboot/               # Coreboot table parsing
+│   ├── fs/                     # FAT, GPT, ISO9660
+│   ├── pe/                     # PE/COFF image loader
+│   ├── boot.rs                 # Boot manager
+│   ├── menu.rs                 # Interactive boot menu
+│   └── ...
+│
+├── crabefi-coreboot/           # Coreboot payload binary
+│   ├── Cargo.toml
+│   ├── build.rs                # Linker script selection, PAYLOAD_BASE
+│   └── src/main.rs             # rust_main, #[panic_handler]
+│
+├── crabefi-drivers/            # Standard hardware drivers (placeholder)
+│   ├── Cargo.toml
+│   └── src/lib.rs
+│
+├── test-apps/                  # EFI test applications (separate workspaces)
+│   ├── hello/
+│   ├── rng-test/
+│   ├── directory-test/
+│   ├── secure-boot-test/
+│   ├── storage-security-test/
+│   └── fw-dump/
+│
+├── xtask/                      # Build automation (separate workspace)
+├── firmware/                   # Pre-built coreboot ROMs for QEMU
+├── x86_64-coreboot.ld          # x86_64 linker script
+├── aarch64-coreboot.ld         # aarch64 linker script
+└── docs/                       # Documentation
 ```
 
-## Key Components
+## Platform Abstraction Layer
 
-### Firmware State (`state.rs`)
+The core library defines platform traits in `src/platform.rs`. External firmware implements these traits and passes them to CrabEFI via `PlatformConfig`:
 
-CrabEFI uses a centralized state management approach. Instead of scattered `static Mutex<T>` variables, all mutable firmware state is consolidated into a single `FirmwareState` struct allocated on the stack in the entry point.
+```
+┌─────────────────────────────────────────────┐
+│           External Firmware                  │
+│  (coreboot, custom SoC firmware, ...)        │
+│                                              │
+│  Implements: BlockDevice, VariableBackend,   │
+│  Timer, ResetHandler, DebugOutput, ...       │
+└───────────────┬─────────────────────────────┘
+                │  PlatformConfig
+                ▼
+┌─────────────────────────────────────────────┐
+│           CrabEFI Library                    │
+│                                              │
+│  UEFI Boot/Runtime Services, Secure Boot,   │
+│  Boot Manager, Filesystem, PE Loader         │
+└─────────────────────────────────────────────┘
+```
+
+### Platform Traits
+
+| Trait | Purpose | Required |
+|-------|---------|----------|
+| `BlockDevice` | Block-level storage I/O | At least one for booting |
+| `VariableBackend` | Persistent EFI variables | No (volatile fallback) |
+| `StorageBackend` | Raw byte-level flash | No (used by `Edk2VarStore`) |
+| `Timer` | Monotonic clock | Yes |
+| `ResetHandler` | System reset/shutdown | Yes |
+| `Rng` | Hardware RNG | No |
+| `DebugOutput` | Serial/log output | No |
+| `ConsoleInput` | Keyboard input | No |
+
+See [Integration](INTEGRATION.md) for how to implement these traits.
+
+## Firmware State (`state.rs`)
+
+All mutable firmware state lives in a single `FirmwareState` struct allocated on the stack in the entry point:
 
 ```
 FirmwareState
 ├── efi: EfiState
-│   ├── handles[]           # Handle database
-│   ├── events[]            # Event tracking
-│   ├── loaded_images[]     # Loaded PE images
-│   ├── config_tables[]     # Configuration tables (ACPI, SMBIOS)
-│   ├── variables[]         # EFI variables
-│   └── allocator           # Memory allocator state
+│   ├── handles[]           # Handle database (max 64)
+│   ├── events[]            # Event tracking (max 32)
+│   ├── loaded_images[]     # Loaded PE images (max 16)
+│   ├── config_tables[]     # ACPI, SMBIOS, FDT, etc. (max 24)
+│   ├── variables[]         # In-memory variable cache (max 64)
+│   └── allocator           # Page-granular memory allocator
 ├── drivers: DriverState
-│   ├── pci_devices[]       # Discovered PCI devices
-│   ├── keyboard            # Keyboard state
-│   ├── framebuffer         # Display info
-│   └── storage             # SPI flash backend
+│   ├── pci                 # PCI device list + access method
+│   ├── serial              # Serial port driver + EFI mode
+│   ├── timing              # Counter frequency + boot timestamp
+│   ├── platform            # Framebuffer, SPI, SMMSTORE info
+│   └── storage_registry    # Block device registry
 └── console: ConsoleState
     ├── cursor_pos          # Text cursor position
-    └── input               # Input state/escape sequences
+    └── input               # Escape sequence parser
 ```
 
-### Entry Flow
+## Boot Flow
 
-1. **32-bit Entry** (`entry.rs`): Coreboot calls the payload in 32-bit protected mode
-2. **64-bit Transition**: Set up page tables, enable long mode, switch to 64-bit
-3. **Rust Entry** (`main.rs`): Call `rust_main()` which calls `lib::init()`
-4. **Initialization** (`lib.rs::init()`):
-   - Parse coreboot tables
-   - Initialize serial logging
-   - Set up paging and IDT
-   - Initialize EFI environment
-   - Initialize storage drivers
-5. **Boot Menu**: Discover boot entries, display menu, boot selected entry
+### Coreboot Target
 
-### UEFI Implementation
+1. **Architecture entry** (assembly): 32-to-64 mode switch (x86) or MMU setup (aarch64)
+2. **`rust_main()`** (`crabefi-coreboot/src/main.rs`): calls `crabefi::init()`
+3. **`init()`** (`src/lib.rs`):
+   - Parse coreboot tables (memory map, serial, framebuffer, SMMSTORE)
+   - Initialize serial, logging, keyboard, timing
+   - Initialize EFI (allocator, system table, services, protocols)
+   - Initialize heap, PCI, variable persistence, Secure Boot
+   - Run boot manager (BootNext -> BootOrder -> fallback -> interactive menu)
 
-CrabEFI implements the following UEFI services:
+### Library Target (External Firmware)
 
-**Boot Services:**
-- Memory allocation (`AllocatePages`, `FreePages`, `AllocatePool`, `FreePool`)
-- Handle/Protocol management (`InstallProtocol`, `OpenProtocol`, `LocateHandle`)
-- Image loading (`LoadImage`, `StartImage`, `UnloadImage`)
-- Event services (`CreateEvent`, `SetTimer`, `WaitForEvent`)
-- Memory map (`GetMemoryMap`, `ExitBootServices`)
+1. External firmware initializes hardware, discovers devices
+2. Builds `PlatformConfig` with trait object references
+3. Calls `crabefi::init_platform(config)` — never returns (`-> !`)
+4. CrabEFI runs the UEFI boot manager using the provided services
+5. On successful OS handoff, `ExitBootServices` is called and CrabEFI halts
+6. If no bootable media is found or all boot attempts fail, CrabEFI halts the CPU
 
-**Runtime Services:**
-- Variable access (`GetVariable`, `SetVariable`, `GetNextVariableName`)
-- Time services (`GetTime`, `SetTime`)
-- Reset (`ResetSystem`)
+## Variable Persistence
 
-**Protocols:**
-- `SimpleTextInput` / `SimpleTextOutput` - Console I/O
-- `GraphicsOutput` - GOP for framebuffer access
-- `SimpleFileSystem` / `FileProtocol` - FAT filesystem access
-- `BlockIO` - Raw block device access
-- `LoadedImage` - Image information
-- `DevicePath` - Device identification
+CrabEFI supports three variable backend strategies:
 
-### Storage Stack
+| Strategy | Trait | `runtime_capable()` | Post-EBS Writes |
+|----------|-------|---------------------|-----------------|
+| Direct flash | `Edk2VarStore` wrapping `StorageBackend` | `false` | Deferred buffer, committed next boot |
+| SMM | Custom `VariableBackend` | `true` | Direct via SMI |
+| TF-A MM | Custom `VariableBackend` | `true` | Direct via FF-A/SPM |
+
+The `VariableBackend` trait operates at variable level (`load`/`write`/`delete`), not raw bytes, so SMM and TF-A MM backends can issue RPCs to the privileged agent without CrabEFI knowing the storage format.
+
+## UEFI Implementation
+
+### Boot Services
+
+Memory allocation, handle/protocol management, image loading, event services, memory map, `ExitBootServices`.
+
+### Runtime Services
+
+Variable access (`GetVariable`, `SetVariable`, `GetNextVariableName`), time services, `ResetSystem`, `SetVirtualAddressMap`.
+
+### Protocols
+
+| Protocol | Description |
+|----------|-------------|
+| `SimpleTextInput` / `SimpleTextOutput` | Console I/O |
+| `SimpleTextInputEx` | Extended keyboard (modifier keys) |
+| `GraphicsOutput` | GOP framebuffer |
+| `SimpleFileSystem` / `FileProtocol` | FAT filesystem access |
+| `BlockIO` / `DiskIO` | Block and byte-level disk I/O |
+| `LoadedImage` | Image information |
+| `DevicePath` | Device identification |
+| `RNG` | Random number generation |
+| `SerialIO` | Serial port access |
+| `UnicodeCollation` | String comparison |
+| `ConsoleControl` | Console mode switching |
+| `MemoryAttribute` | Page permission control |
+| `NvmePassThru` / `AtaPassThru` / `ScsiPassThru` | Storage passthrough |
+| `StorageSecurity` | TCG Opal |
+
+## Storage Stack
 
 ```
 Application (GRUB, systemd-boot, etc.)
@@ -99,105 +203,28 @@ Application (GRUB, systemd-boot, etc.)
    BlockIO Protocol
         │
         ▼
-  Storage Abstraction (storage.rs)
+  dyn BlockDevice (platform-provided)
         │
-        ├──► NVMe Driver
-        ├──► AHCI Driver
-        ├──► USB Mass Storage
-        └──► SDHCI Driver
-        │
-        ▼
-   PCI Enumeration
+        ├── NVMe Driver
+        ├── AHCI Driver
+        ├── USB Mass Storage
+        ├── SDHCI Driver
+        └── Custom (external firmware)
 ```
-
-### Secure Boot
-
-The Secure Boot implementation follows the UEFI specification:
-
-```
-Image Load Request
-        │
-        ▼
-  Is Secure Boot Enabled?
-        │
-    No ─┴─ Yes
-    │      │
-    │      ▼
-    │  Verify Authenticode Signature
-    │      │
-    │      ▼
-    │  Check against db (allowed)
-    │      │
-    │      ▼
-    │  Check against dbx (revoked)
-    │      │
-    │      ▼
-    │  Valid? ─── No ──► Reject
-    │      │
-    │     Yes
-    │      │
-    └──────┴──► Load Image
-```
-
-Key variables:
-- **PK** (Platform Key): Controls KEK modifications
-- **KEK** (Key Exchange Key): Controls db/dbx modifications
-- **db** (Signature Database): Allowed signatures
-- **dbx** (Forbidden Signatures): Revoked hashes/certificates
-
-### Variable Storage
-
-Variables are stored in SPI flash using coreboot's SMMSTORE region:
-
-```
-SPI Flash
-├── SMMSTORE Region (from FMAP)
-│   ├── Header (magic, version)
-│   └── Variable Records[]
-│       ├── GUID
-│       ├── Name (UTF-16)
-│       ├── Attributes
-│       ├── Data Size
-│       └── Data
-└── Other Regions (BIOS, ME, etc.)
-```
-
-Runtime variable writes (after `ExitBootServices`) are deferred to a reserved memory buffer and applied on the next boot.
-
-## Build System
-
-CrabEFI uses a custom build tool (`./crabefi`) implemented in `xtask/`:
-
-- `./crabefi build` - Build the firmware
-- `./crabefi test --app <name>` - Run integration tests
-- `./crabefi run --app <name>` - Interactive QEMU session
-- `./crabefi create-disk` - Create bootable disk images
-
-The tool handles:
-- Decompressing the base coreboot ROM
-- Adding CrabEFI as a CBFS payload
-- Creating FAT disk images with test applications
-- Launching QEMU with appropriate arguments
 
 ## Dependencies
-
-Key Rust crates used:
 
 | Crate | Purpose |
 |-------|---------|
 | `r-efi` | UEFI type definitions and GUIDs |
-| `heapless` | Stack-allocated collections |
-| `spin` | Spinlock for synchronization |
+| `heapless` | Stack-allocated collections (`no_std`) |
+| `spin` | Spinlock for global controller arrays |
 | `log` | Logging facade |
-| `sha2`, `rsa`, `x509-cert` | Cryptography for Secure Boot |
+| `tock-registers` | Type-safe MMIO register access |
 | `zerocopy` | Safe transmutation for hardware structures |
+| `sha2`, `rsa`, `x509-cert`, `cms` | Secure Boot cryptography |
+| `serde`, `postcard` | Deferred variable serialization |
 
 ## Coding Conventions
 
-See [AGENTS.md](../AGENTS.md) for detailed coding guidelines including:
-
-- Import organization
-- Documentation requirements
-- Error handling patterns
-- UEFI protocol implementation patterns
-- Naming conventions
+See [AGENTS.md](../AGENTS.md) for coding guidelines.
