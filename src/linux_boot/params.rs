@@ -452,23 +452,23 @@ impl BootParams {
     ///
     /// # Arguments
     ///
-    /// * `fb` - Framebuffer info from coreboot
-    pub fn set_framebuffer(&mut self, fb: &crate::coreboot::FramebufferInfo) {
+    /// * `fb` - Framebuffer configuration
+    pub fn set_framebuffer(&mut self, fb: &crate::platform::FramebufferConfig) {
         // Set video type to EFI framebuffer
         self.screen_info.orig_video_isVGA = ScreenInfo::VIDEO_TYPE_EFI;
 
         // Set framebuffer dimensions
-        self.screen_info.lfb_width = fb.x_resolution as u16;
-        self.screen_info.lfb_height = fb.y_resolution as u16;
+        self.screen_info.lfb_width = fb.width as u16;
+        self.screen_info.lfb_height = fb.height as u16;
         self.screen_info.lfb_depth = fb.bits_per_pixel as u16;
-        self.screen_info.lfb_linelength = fb.bytes_per_line as u16;
+        self.screen_info.lfb_linelength = fb.bytes_per_line() as u16;
 
         // Set framebuffer address (split into lower and upper 32 bits)
         self.screen_info.lfb_base = fb.physical_address as u32;
         self.screen_info.ext_lfb_base = (fb.physical_address >> 32) as u32;
 
         // Calculate framebuffer size in 64KB units
-        let fb_size = fb.bytes_per_line as u64 * fb.y_resolution as u64;
+        let fb_size = fb.bytes_per_line() as u64 * fb.height as u64;
         self.screen_info.lfb_size = fb_size.div_ceil(0x10000) as u32;
 
         // Set color mask information
@@ -487,11 +487,11 @@ impl BootParams {
 
         log::debug!(
             "Framebuffer: {}x{}x{} @ {:#x}, {} bytes/line",
-            fb.x_resolution,
-            fb.y_resolution,
+            fb.width,
+            fb.height,
             fb.bits_per_pixel,
             fb.physical_address,
-            fb.bytes_per_line
+            fb.bytes_per_line()
         );
     }
 

@@ -3,7 +3,6 @@
 //! This module provides a user interface for managing Secure Boot settings,
 //! including viewing status, enabling/disabling Secure Boot, and managing keys.
 
-use crate::coreboot;
 use crate::drivers::serial as serial_driver;
 use crate::efi::auth::{self, boot as secure_boot};
 use crate::framebuffer_console::{
@@ -86,7 +85,7 @@ const MENU_OPTIONS: [MenuOption; 6] = [
 /// This displays Secure Boot status and allows the user to manage settings.
 pub fn show_secure_boot_menu() {
     // Get framebuffer for rendering
-    let fb_info = coreboot::get_framebuffer();
+    let fb_info = crate::state::get_framebuffer();
     let mut fb_console = fb_info.as_ref().map(FramebufferConsole::new);
 
     let mut selected = 0usize;

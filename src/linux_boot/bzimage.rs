@@ -224,7 +224,7 @@ pub fn prepare_boot_params(
     bzimage: &BzImage,
     memory_regions: &[crate::coreboot::memory::MemoryRegion],
     acpi_rsdp: Option<u64>,
-    framebuffer: Option<&crate::coreboot::FramebufferInfo>,
+    framebuffer: Option<&crate::platform::FramebufferConfig>,
     kernel_addr: u32,
     cmdline_addr: u32,
 ) -> BootParams {

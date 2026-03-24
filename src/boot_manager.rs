@@ -580,7 +580,7 @@ fn boot_linux_from_device(
     cmdline: &str,
     memory_regions: &[crate::coreboot::memory::MemoryRegion],
     acpi_rsdp: Option<u64>,
-    framebuffer: Option<&crate::coreboot::FramebufferInfo>,
+    framebuffer: Option<&crate::platform::FramebufferConfig>,
 ) -> bool {
     match crate::linux_boot::load_linux_from_disk(
         disk,
@@ -619,7 +619,6 @@ fn boot_linux_entry(
     initrd_path: &heapless::String<128>,
     cmdline: &heapless::String<512>,
 ) {
-    use crate::coreboot;
     use crate::fs;
     use crate::state;
 
@@ -679,7 +678,7 @@ fn boot_linux_entry(
     };
 
     // Get framebuffer info for Linux console
-    let framebuffer = coreboot::get_framebuffer();
+    let framebuffer = crate::state::get_framebuffer();
 
     if memory_regions.is_empty() {
         log::error!("No memory regions available for Linux boot");

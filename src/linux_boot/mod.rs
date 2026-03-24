@@ -257,7 +257,7 @@ pub fn load_linux_from_disk(
     cmdline: &str,
     memory_regions: &[MemoryRegion],
     acpi_rsdp: Option<u64>,
-    framebuffer: Option<&crate::coreboot::FramebufferInfo>,
+    framebuffer: Option<&crate::platform::FramebufferConfig>,
     use_efi_handover: bool,
 ) -> Result<LoadedLinux, LinuxBootError> {
     use crate::fs::fat::FatFilesystem;

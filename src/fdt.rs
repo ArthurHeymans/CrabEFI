@@ -77,7 +77,7 @@ impl core::fmt::Debug for DsdtDevice {
     }
 }
 
-/// Platform information extracted from an FDT
+/// Platform information extracted from an FDT or ACPI tables.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct PlatformInfo {
     /// PCIe ECAM configuration space base address
