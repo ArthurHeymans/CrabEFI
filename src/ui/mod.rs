@@ -10,12 +10,12 @@ pub mod render;
 pub mod secure_boot;
 pub mod theme;
 
-use crate::coreboot::{self, FramebufferInfo};
+use crate::coreboot::FramebufferInfo;
 use crate::cursor::CursorRenderer;
 use crate::drivers::mouse_cursor;
 use crate::menu::{BootCategory, BootMenu};
 use crate::menu_common::{self, KeyPress};
-use crate::time::{delay_ms, Timeout};
+use crate::time::{Timeout, delay_ms};
 use render::{FontSize, Rgb};
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -251,7 +251,7 @@ fn sidebar_hit() -> Option<NavItem> {
 // ═══════════════════════════════════════════════════════════════════════
 
 pub fn show_graphical_menu(menu: &mut BootMenu) -> Option<usize> {
-    let fb = coreboot::get_framebuffer()?;
+    let fb: FramebufferInfo = crate::state::get_framebuffer()?.into();
     let mut screen = NavItem::Boot;
 
     loop {
@@ -273,8 +273,8 @@ pub fn show_graphical_menu(menu: &mut BootMenu) -> Option<usize> {
 }
 
 pub fn show_no_media_screen() {
-    let fb = match coreboot::get_framebuffer() {
-        Some(f) => f,
+    let fb: FramebufferInfo = match crate::state::get_framebuffer() {
+        Some(f) => f.into(),
         None => return,
     };
     let mut screen = NavItem::Boot;

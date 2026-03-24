@@ -32,7 +32,7 @@ use heapless::{String, Vec};
 #[cfg(feature = "ui")]
 fn update_cursor(
     cursor_renderer: &mut crate::cursor::CursorRenderer,
-    fb_info: &Option<crate::coreboot::FramebufferInfo>,
+    fb_info: &Option<crate::coreboot::FramebufferInfo>, // FramebufferInfo is the rendering type
 ) {
     if let Some(fb) = fb_info {
         if crate::drivers::mouse_cursor::is_initialized() {
@@ -946,11 +946,16 @@ pub fn show_menu(menu: &mut BootMenu) -> Option<usize> {
         return None;
     }
 
-    // Get framebuffer for rendering
-    let fb_info = crate::state::get_framebuffer();
+    // Get framebuffer.  FramebufferConsole uses platform::FramebufferConfig
+    // directly; the ui cursor renderer uses coreboot::FramebufferInfo.
+    let fb_config = crate::state::get_framebuffer();
+    #[cfg(feature = "ui")]
+    let fb_info: Option<crate::coreboot::FramebufferInfo> = fb_config.map(Into::into);
+    #[cfg(not(feature = "ui"))]
+    let _ = (); // fb_info unused without ui
 
     // Create framebuffer console if available
-    let mut fb_console = fb_info.as_ref().map(FramebufferConsole::new);
+    let mut fb_console = fb_config.as_ref().map(FramebufferConsole::new);
 
     // Clear screen
     menu_common::clear_screen(&mut fb_console);

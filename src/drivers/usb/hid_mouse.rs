@@ -95,10 +95,7 @@ impl UsbHidMouse {
     }
 
     /// Set boot protocol mode
-    fn set_boot_protocol<C: UsbController>(
-        &self,
-        controller: &mut C,
-    ) -> Result<(), UsbError> {
+    fn set_boot_protocol<C: UsbController>(&self, controller: &mut C) -> Result<(), UsbError> {
         controller.control_transfer(
             self.device_address,
             req_type::DIR_OUT | req_type::TYPE_CLASS | req_type::RCPT_INTERFACE,
@@ -111,11 +108,7 @@ impl UsbHidMouse {
     }
 
     /// Set idle rate
-    fn set_idle<C: UsbController>(
-        &self,
-        controller: &mut C,
-        rate_ms: u8,
-    ) -> Result<(), UsbError> {
+    fn set_idle<C: UsbController>(&self, controller: &mut C, rate_ms: u8) -> Result<(), UsbError> {
         let duration = rate_ms / 4;
         controller.control_transfer(
             self.device_address,
@@ -329,11 +322,7 @@ pub fn get_relative_motion() -> (i32, i32) {
 
 /// Get current button state.
 pub fn get_buttons() -> u32 {
-    USB_MOUSE
-        .lock()
-        .as_ref()
-        .map(|m| m.buttons)
-        .unwrap_or(0)
+    USB_MOUSE.lock().as_ref().map(|m| m.buttons).unwrap_or(0)
 }
 
 /// Check if USB mouse is available.

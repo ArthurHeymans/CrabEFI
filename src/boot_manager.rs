@@ -15,8 +15,6 @@ use crate::drivers;
 use crate::efi;
 use crate::menu;
 
-
-
 /// Initialize storage subsystem (PCI drivers, USB keyboards, etc.)
 ///
 /// This is called once before the boot manager starts trying boot options.

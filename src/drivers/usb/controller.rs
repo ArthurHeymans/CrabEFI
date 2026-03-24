@@ -747,8 +747,7 @@ pub trait UsbController {
 
     /// Get mouse interrupt endpoint info for a device
     fn get_mouse_interrupt_endpoint(&self, device: u8) -> Option<EndpointInfo> {
-        self.get_device(device)
-            .and_then(|d| d.mouse_interrupt_in)
+        self.get_device(device).and_then(|d| d.mouse_interrupt_in)
     }
 
     /// Get device info

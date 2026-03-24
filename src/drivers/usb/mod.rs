@@ -568,7 +568,9 @@ impl UsbController for XhciController {
             device_class: slot.device_desc.device_class,
             is_mass_storage: slot.is_mass_storage,
             mass_storage_interface: slot.mass_storage_interface,
-            is_hid: slot.is_hid_keyboard || slot.is_hid_mouse || slot.device_desc.device_class == 0x03,
+            is_hid: slot.is_hid_keyboard
+                || slot.is_hid_mouse
+                || slot.device_desc.device_class == 0x03,
             is_keyboard: slot.is_hid_keyboard,
             is_mouse: slot.is_hid_mouse,
             is_hub: slot.device_desc.device_class == 0x09,
