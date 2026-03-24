@@ -4,7 +4,7 @@
 //! embedded 8x16 VGA bitmap font. It supports basic text output with colors,
 //! cursor positioning, and scrolling.
 
-use crate::coreboot::framebuffer::FramebufferInfo;
+use crate::platform::FramebufferConfig as FramebufferInfo;
 use core::fmt::{self, Write};
 
 /// Character width in pixels
@@ -78,8 +78,8 @@ impl<'a> FramebufferConsole<'a> {
     ///
     /// * `fb` - Reference to the framebuffer info from coreboot
     pub fn new(fb: &'a FramebufferInfo) -> Self {
-        let cols = fb.x_resolution / CHAR_WIDTH;
-        let rows = fb.y_resolution / CHAR_HEIGHT;
+        let cols = fb.width / CHAR_WIDTH;
+        let rows = fb.height / CHAR_HEIGHT;
 
         FramebufferConsole {
             fb,
@@ -153,7 +153,7 @@ impl<'a> FramebufferConsole<'a> {
 
         let y_start = row * CHAR_HEIGHT;
         for y in y_start..(y_start + CHAR_HEIGHT) {
-            for x in 0..self.fb.x_resolution {
+            for x in 0..self.fb.width {
                 unsafe {
                     self.fb
                         .write_pixel(x, y, self.bg_color.r, self.bg_color.g, self.bg_color.b);
@@ -239,7 +239,7 @@ impl<'a> FramebufferConsole<'a> {
         // A faster version would use memcpy on scanlines
         let bytes_per_pixel = (self.fb.bits_per_pixel / 8) as usize;
         let line_height = CHAR_HEIGHT as usize;
-        let scanline_bytes = self.fb.bytes_per_line as usize;
+        let scanline_bytes = self.fb.bytes_per_line() as usize;
         let copy_height = ((self.rows - 1) * CHAR_HEIGHT) as usize;
 
         unsafe {
@@ -249,7 +249,7 @@ impl<'a> FramebufferConsole<'a> {
             for y in 0..copy_height {
                 let src_offset = (y + line_height) * scanline_bytes;
                 let dst_offset = y * scanline_bytes;
-                let line_bytes = self.fb.x_resolution as usize * bytes_per_pixel;
+                let line_bytes = self.fb.width as usize * bytes_per_pixel;
 
                 core::ptr::copy(fb_ptr.add(src_offset), fb_ptr.add(dst_offset), line_bytes);
             }

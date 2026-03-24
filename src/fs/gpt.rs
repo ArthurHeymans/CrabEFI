@@ -300,7 +300,6 @@ pub fn read_partitions(
     let total_bytes_needed = total_entries * entry_size;
 
     let mut entry_index = 0u32;
-    let mut consecutive_empty = 0u32;
     let mut bytes_read = 0usize;
 
     'outer: while bytes_read < total_bytes_needed {
@@ -333,8 +332,6 @@ pub fn read_partitions(
             };
 
             if !entry.is_empty() {
-                consecutive_empty = 0;
-
                 // For hybrid ISOs, translate GPT LBAs (512-byte terms) to device LBAs
                 let (first_lba, last_lba) = if is_hybrid {
                     // GPT LBA * 512 / block_size = device LBA
@@ -368,17 +365,6 @@ pub fn read_partitions(
 
                 if partitions.push(partition).is_err() {
                     log::warn!("Too many partitions, ignoring remaining");
-                    break 'outer;
-                }
-            } else {
-                consecutive_empty += 1;
-                // Stop scanning after 8 consecutive empty entries (2 blocks worth)
-                // This handles truncated partition tables in ISOs
-                if consecutive_empty >= 8 && !partitions.is_empty() {
-                    log::debug!(
-                        "Stopping partition scan after {} consecutive empty entries",
-                        consecutive_empty
-                    );
                     break 'outer;
                 }
             }

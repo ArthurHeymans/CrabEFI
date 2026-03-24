@@ -15,7 +15,6 @@
 //! - Arrow key navigation and Enter to select
 //! - Configurable auto-boot timeout with countdown
 
-use crate::coreboot;
 use crate::drivers::block::BlockDevice;
 use crate::drivers::serial as serial_driver;
 use crate::drivers::storage::StorageType;
@@ -932,7 +931,7 @@ pub fn show_menu(menu: &mut BootMenu) -> Option<usize> {
     }
 
     // Get framebuffer for rendering
-    let fb_info = coreboot::get_framebuffer();
+    let fb_info = crate::state::get_framebuffer();
 
     // Create framebuffer console if available
     let mut fb_console = fb_info.as_ref().map(FramebufferConsole::new);

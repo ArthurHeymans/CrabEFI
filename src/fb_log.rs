@@ -3,8 +3,8 @@
 //! This module provides logging output to the framebuffer. It is disabled by
 //! default as it is very slow. Enable with the `fb-log` feature flag.
 
-use crate::coreboot::FramebufferInfo;
 use crate::framebuffer_console::{CHAR_HEIGHT, CHAR_WIDTH, Color, render_glyph};
+use crate::platform::FramebufferConfig;
 use core::fmt::Write;
 use log::Level;
 
@@ -12,7 +12,7 @@ use log::Level;
 ///
 /// Call this after parsing coreboot tables to enable framebuffer logging.
 /// Clears the screen to remove any stale content from bootloader.
-pub fn set_framebuffer(fb: FramebufferInfo) {
+pub fn set_framebuffer(fb: FramebufferConfig) {
     unsafe {
         fb.clear(0, 0, 0);
     }
@@ -38,8 +38,8 @@ pub fn log_to_framebuffer(level: Level, ts: u64, args: &core::fmt::Arguments) {
     };
 
     let (mut row, mut col) = unsafe { (*crate::state::console_mut_ptr()).logger_cursor };
-    let cols = fb_info.x_resolution / CHAR_WIDTH;
-    let rows = fb_info.y_resolution / CHAR_HEIGHT;
+    let cols = fb_info.width / CHAR_WIDTH;
+    let rows = fb_info.height / CHAR_HEIGHT;
 
     // Format the message with timestamp
     let mut buf = FormattingBuffer::new();
@@ -103,7 +103,7 @@ pub fn log_to_framebuffer(level: Level, ts: u64, args: &core::fmt::Arguments) {
 }
 
 /// Clear a line on the framebuffer
-fn clear_line(fb: &FramebufferInfo, row: u32, cols: u32, bg: Color) {
+fn clear_line(fb: &FramebufferConfig, row: u32, cols: u32, bg: Color) {
     let y_start = row * CHAR_HEIGHT;
     for y in y_start..(y_start + CHAR_HEIGHT) {
         for x in 0..(cols * CHAR_WIDTH) {
@@ -115,7 +115,7 @@ fn clear_line(fb: &FramebufferInfo, row: u32, cols: u32, bg: Color) {
 }
 
 /// Draw a character at a specific character-grid position on the framebuffer
-fn draw_char_at(fb: &FramebufferInfo, c: char, col: u32, row: u32, fg: Color, bg: Color) {
+fn draw_char_at(fb: &FramebufferConfig, c: char, col: u32, row: u32, fg: Color, bg: Color) {
     render_glyph(fb, c, col * CHAR_WIDTH, row * CHAR_HEIGHT, fg, bg);
 }
 

@@ -83,18 +83,24 @@ impl log::Log for CombinedLogger {
 
 static LOGGER: CombinedLogger = CombinedLogger;
 
-/// Initialize the logging subsystem
+/// Initialize the logging subsystem.
+///
+/// Safe to call multiple times — the second call is a no-op. This allows
+/// the coreboot payload to initialize logging early (for debug output
+/// during coreboot table parsing) and then call [`crate::init_platform()`]
+/// which calls `init()` again internally.
 pub fn init() {
-    // Record the boot counter for relative timestamps
-    // SAFETY: single-threaded init; raw pointer avoids re-entrancy
-    // issues with the state lock.
-    unsafe {
-        (*crate::state::drivers_mut_ptr()).timing.boot_counter = read_counter();
+    // Only set the boot counter and register the logger on the first call.
+    // log::set_logger() returns Err if a logger is already registered.
+    if log::set_logger(&LOGGER).is_ok() {
+        // Record the boot counter for relative timestamps.
+        // SAFETY: single-threaded init; raw pointer avoids re-entrancy
+        // issues with the state lock.
+        unsafe {
+            (*crate::state::drivers_mut_ptr()).timing.boot_counter = read_counter();
+        }
+        log::set_max_level(LevelFilter::Debug);
     }
-
-    log::set_logger(&LOGGER)
-        .map(|()| log::set_max_level(LevelFilter::Debug))
-        .expect("Failed to set logger");
 }
 
 /// Set the framebuffer for logging output
@@ -104,13 +110,13 @@ pub fn init() {
 ///
 /// This function is only effective with the `fb-log` feature.
 #[cfg(feature = "fb-log")]
-pub fn set_framebuffer(fb: crate::coreboot::FramebufferInfo) {
+pub fn set_framebuffer(fb: crate::platform::FramebufferConfig) {
     crate::fb_log::set_framebuffer(fb);
 }
 
 /// Stub for when fb-log feature is disabled
 #[cfg(not(feature = "fb-log"))]
-pub fn set_framebuffer(_fb: crate::coreboot::FramebufferInfo) {
+pub fn set_framebuffer(_fb: crate::platform::FramebufferConfig) {
     // Framebuffer logging disabled at compile time
 }
 

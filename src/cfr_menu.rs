@@ -76,7 +76,7 @@ pub fn show_cfr_menu() {
         }
     };
 
-    let fb_info = coreboot::get_framebuffer();
+    let fb_info = crate::state::get_framebuffer();
     let mut fb_console = fb_info.as_ref().map(FramebufferConsole::new);
 
     let mut items = build_menu_items(cfr_info);
@@ -693,7 +693,7 @@ fn show_help(option: &CfrOption, fb_console: &mut Option<FramebufferConsole>) {
 
 /// Show message that CFR is not available
 fn show_no_cfr_message() {
-    let fb_info = coreboot::get_framebuffer();
+    let fb_info = crate::state::get_framebuffer();
     let mut fb_console = fb_info.as_ref().map(FramebufferConsole::new);
 
     serial_driver::write_str("\r\n");
