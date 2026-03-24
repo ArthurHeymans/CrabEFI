@@ -28,10 +28,9 @@ use super::xhci_regs::{
     PORTSC_CHANGE_MASK, PORTSC_RW_MASK, TRB_CC_BABBLE_DETECTED, TRB_CC_SHORT_PACKET,
     TRB_CC_STALL_ERROR, TRB_CC_SUCCESS, TRB_CC_USB_TRANSACTION_ERROR, TRB_TYPE_ADDRESS_DEVICE,
     TRB_TYPE_COMMAND_COMPLETION, TRB_TYPE_CONFIGURE_ENDPOINT, TRB_TYPE_DATA, TRB_TYPE_ENABLE_SLOT,
-    TRB_TYPE_EVALUATE_CONTEXT,
-    TRB_TYPE_HOST_CONTROLLER, TRB_TYPE_LINK, TRB_TYPE_NORMAL, TRB_TYPE_PORT_STATUS_CHANGE,
-    TRB_TYPE_RESET_ENDPOINT, TRB_TYPE_SET_TR_DEQUEUE, TRB_TYPE_SETUP, TRB_TYPE_STATUS,
-    TRB_TYPE_TRANSFER_EVENT, trb_cc_name,
+    TRB_TYPE_EVALUATE_CONTEXT, TRB_TYPE_HOST_CONTROLLER, TRB_TYPE_LINK, TRB_TYPE_NORMAL,
+    TRB_TYPE_PORT_STATUS_CHANGE, TRB_TYPE_RESET_ENDPOINT, TRB_TYPE_SET_TR_DEQUEUE, TRB_TYPE_SETUP,
+    TRB_TYPE_STATUS, TRB_TYPE_TRANSFER_EVENT, trb_cc_name,
 };
 
 // NOTE: USB descriptor types (DeviceDescriptor, ConfigurationDescriptor, etc.)
@@ -1704,13 +1703,7 @@ impl XhciController {
             }
 
             // Enable slot and address the downstream device
-            if let Err(e) = self.attach_device_on_hub(
-                hub_slot_id,
-                p,
-                speed,
-                route,
-                root_port,
-            ) {
+            if let Err(e) = self.attach_device_on_hub(hub_slot_id, p, speed, route, root_port) {
                 log::warn!("Failed to attach device on hub port {}: {:?}", p, e);
             }
         }
@@ -1720,11 +1713,7 @@ impl XhciController {
 
     /// Issue an Evaluate Context command to inform the xHC that a device
     /// is a hub (sets Hub flag and NumberOfPorts in the slot context).
-    fn evaluate_hub_context(
-        &mut self,
-        slot_id: u8,
-        num_ports: u8,
-    ) -> Result<(), XhciError> {
+    fn evaluate_hub_context(&mut self, slot_id: u8, num_ports: u8) -> Result<(), XhciError> {
         let slot = self
             .slots
             .get(slot_id as usize)
@@ -1866,7 +1855,9 @@ impl XhciController {
                 let num_configs = desc.num_configurations;
                 log::info!(
                     "  Hub port device: VID={:04x} PID={:04x} Class={:02x}",
-                    vid, pid, class
+                    vid,
+                    pid,
+                    class
                 );
 
                 if let Some(slot) = self
@@ -1887,10 +1878,10 @@ impl XhciController {
                 }
 
                 // Nested hub support (one level deep to keep it simple)
-                if class == 0x09 {
-                    if let Err(e) = self.configure_and_enumerate_hub(slot_id, root_port) {
-                        log::debug!("Nested hub enum failed: {:?}", e);
-                    }
+                if class == 0x09
+                    && let Err(e) = self.configure_and_enumerate_hub(slot_id, root_port)
+                {
+                    log::debug!("Nested hub enum failed: {:?}", e);
                 }
             }
             Err(e) => {
@@ -2127,10 +2118,10 @@ impl XhciController {
                             }
 
                             // If it's a hub, enumerate its downstream ports
-                            if class == 0x09 || (class == 0x00 && num_configs > 0) {
-                                if let Err(e) = self.configure_and_enumerate_hub(slot_id, port) {
-                                    log::debug!("Not a hub or hub enum failed: {:?}", e);
-                                }
+                            if (class == 0x09 || (class == 0x00 && num_configs > 0))
+                                && let Err(e) = self.configure_and_enumerate_hub(slot_id, port)
+                            {
+                                log::debug!("Not a hub or hub enum failed: {:?}", e);
                             }
                         }
                         Err(e) => {
@@ -2322,10 +2313,7 @@ impl XhciController {
 
         for iface in &config_info.interfaces[..config_info.num_interfaces] {
             if iface.is_hid_mouse() {
-                log::info!(
-                    "  Found USB HID Mouse interface {}",
-                    iface.interface_number
-                );
+                log::info!("  Found USB HID Mouse interface {}", iface.interface_number);
 
                 if let Some(ep) = iface.find_interrupt_in() {
                     interrupt_in = ep.number;
@@ -2414,8 +2402,7 @@ impl XhciController {
             input.endpoints[in_dci - 1].set_avg_trb_length(interrupt_max_packet);
             // Interval field in dw0 bits 23:16
             input.endpoints[in_dci - 1].dw0 =
-                (input.endpoints[in_dci - 1].dw0 & !0x00FF0000)
-                | ((xhci_interval as u32) << 16);
+                (input.endpoints[in_dci - 1].dw0 & !0x00FF0000) | ((xhci_interval as u32) << 16);
         }
 
         // Issue Configure Endpoint command
@@ -2438,7 +2425,9 @@ impl XhciController {
 
         log::info!(
             "USB HID Mouse configured on slot {}, interrupt EP {} (DCI {})",
-            slot_id, interrupt_in, in_dci
+            slot_id,
+            interrupt_in,
+            in_dci
         );
         Ok(())
     }

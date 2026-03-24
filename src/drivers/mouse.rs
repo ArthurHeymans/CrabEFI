@@ -33,7 +33,7 @@ use spin::Mutex;
 use tock_registers::interfaces::{Readable, Writeable};
 
 use crate::arch::x86_64::port_regs::{PortAliased8, PortReadWrite8};
-use crate::drivers::keyboard::{masks, ports, Status};
+use crate::drivers::keyboard::{Status, masks, ports};
 
 // ============================================================================
 // PS/2 Mouse Constants

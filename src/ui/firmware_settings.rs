@@ -1,8 +1,8 @@
 //! Graphical Firmware Settings (CFR) screen — Kinetic Command design.
 
 use super::{
-    canvas, clear, draw_footer, draw_header, draw_sidebar, poll_and_render_cursor, render, theme,
-    update_sidebar_hover, NavItem, ScreenNav,
+    NavItem, ScreenNav, canvas, clear, draw_footer, draw_header, draw_sidebar,
+    poll_and_render_cursor, render, theme, update_sidebar_hover,
 };
 use crate::coreboot::FramebufferInfo;
 use crate::cursor::CursorRenderer;

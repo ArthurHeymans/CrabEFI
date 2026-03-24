@@ -21,6 +21,8 @@ mod boot_manager;
 pub mod boot_vars;
 pub mod cfr_menu;
 pub mod coreboot;
+#[cfg(feature = "ui")]
+pub mod cursor;
 pub mod drivers;
 pub mod efi;
 #[cfg(feature = "fb-log")]
@@ -41,6 +43,8 @@ pub mod platform;
 pub mod secure_boot_menu;
 pub mod state;
 pub mod time;
+#[cfg(feature = "ui")]
+pub mod ui;
 
 use crate::drivers::block::{AhciDisk, NvmeDisk, SdhciDisk, UsbDisk};
 
