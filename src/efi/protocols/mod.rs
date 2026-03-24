@@ -18,6 +18,8 @@ pub mod rng;
 pub mod scsi_pass_thru;
 pub mod serial_io;
 pub mod simple_file_system;
+#[cfg(feature = "ui")]
+pub mod simple_pointer;
 pub mod simple_text_input_ex;
 pub mod storage_security;
 pub mod unicode_collation;

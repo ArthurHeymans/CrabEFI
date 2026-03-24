@@ -322,6 +322,14 @@ fn init_platform_impl(mut config: PlatformConfig) -> ! {
     // ---- 8. Initialize EFI environment ----
     efi::init_from_platform(&config);
 
+    // Initialize mouse cursor system (ui feature only).
+    // Must come after efi::init_from_platform(), which stores the framebuffer
+    // in global state via state::store_framebuffer().
+    #[cfg(feature = "ui")]
+    if let Some(fb) = crate::state::get_framebuffer() {
+        drivers::mouse_cursor::init(fb.width, fb.height);
+    }
+
     log::info!("CrabEFI initialized successfully!");
     log::info!("EFI System Table at: {:p}", efi::get_system_table());
 
