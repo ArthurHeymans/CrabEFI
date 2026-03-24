@@ -251,14 +251,6 @@ pub fn init(coreboot_table_ptr: u64) -> ! {
         state::with_drivers_mut(|d| d.fdt_info = plat);
     }
 
-    // Discover platform hardware from ACPI tables (MADT for GIC, MCFG for ECAM,
-    // SPCR for UART). This replaces hardcoded SBSA addresses with values from
-    // the firmware's own ACPI tables.
-    if let Some(rsdp_addr) = cb_info.acpi_rsdp {
-        let acpi_info = unsafe { acpi::discover_platform(rsdp_addr) };
-        state::with_drivers_mut(|d| d.acpi_info = acpi_info);
-    }
-
     // Initialize timing subsystem (calibrate TSC using ACPI PM timer)
     time::init(cb_info.acpi_rsdp);
 
@@ -277,13 +269,6 @@ pub fn init(coreboot_table_ptr: u64) -> ! {
 
     // Initialize EFI environment
     efi::init(&cb_info);
-
-    // Now that the EFI memory allocator is up, add platform MMIO regions
-    // using addresses discovered from FDT and ACPI tables (instead of
-    // hardcoded values). This must happen after efi::init() (allocator)
-    // but before ExitBootServices.
-    #[cfg(target_arch = "aarch64")]
-    efi::add_platform_mmio_regions();
 
     // FirmwareState lives on the stack, which is inside the .stack section.
     // The .stack section is between __runtime_data_start and __runtime_data_end,
@@ -311,6 +296,21 @@ pub fn init(coreboot_table_ptr: u64) -> ! {
         );
         // Continue boot -- features requiring alloc will fail gracefully
     }
+
+    // Discover platform hardware from ACPI tables (MADT for GIC, MCFG for ECAM,
+    // SPCR for UART, plus AML interpreter for DSDT device discovery).
+    // This must run after heap::init() because the AML interpreter allocates.
+    if let Some(rsdp_addr) = cb_info.acpi_rsdp {
+        let acpi_info = unsafe { acpi::discover_platform(rsdp_addr) };
+        state::with_drivers_mut(|d| d.acpi_info = acpi_info);
+    }
+
+    // Now that the EFI memory allocator is up and ACPI tables are parsed,
+    // add platform MMIO regions using addresses discovered from FDT and ACPI
+    // tables (instead of hardcoded values). This must happen after efi::init()
+    // (allocator) and after discover_platform() but before ExitBootServices.
+    #[cfg(target_arch = "aarch64")]
+    efi::add_platform_mmio_regions();
 
     // Parse and store CFR data now that the heap is available.
     // The raw data pointer was saved during coreboot table parsing.
