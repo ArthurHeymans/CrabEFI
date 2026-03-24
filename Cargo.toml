@@ -1,19 +1,38 @@
-# Note: xtask is NOT a workspace member because it needs different build settings
-# Use `cargo xtask` to run it (alias defined in .cargo/config.toml)
-# test-apps are also separate because they target x86_64-unknown-uefi
+# Workspace: core library lives here, coreboot binary and drivers are separate crates.
+# xtask and test-apps are NOT workspace members (different build targets).
+
+[workspace]
+members = [".", "crabefi-coreboot", "crabefi-drivers"]
+exclude = ["xtask", "test-apps/hello", "test-apps/rng-test", "test-apps/secure-boot-test", "test-apps/storage-security-test", "test-apps/directory-test", "test-apps/fw-dump"]
+resolver = "3"
+
+[workspace.package]
+edition = "2024"
+license = "Apache-2.0 OR MIT"
+repository = "https://github.com/user/CrabEFI"
 
 [package]
 name = "crabefi"
 version = "0.1.0"
-edition = "2024"
+edition.workspace = true
 authors = ["CrabEFI Contributors"]
-description = "A minimal UEFI implementation as a coreboot payload"
-license = "Apache-2.0 OR MIT"
-repository = "https://github.com/user/CrabEFI"
+description = "A platform-agnostic UEFI implementation library"
+license.workspace = true
+repository.workspace = true
 readme = "README.md"
+# The binary target is in crabefi-coreboot/; don't auto-discover src/main.rs
+autobins = false
 
 [features]
 default = []
+# Include CrabEFI's own _start entry point, EL2 page table setup,
+# and exception vector table. Disable when linking CrabEFI as a
+# library into an external firmware (e.g., fstart) that provides
+# its own entry point and exception handling.
+platform-entry = []
+# Register the built-in BumpAllocator as #[global_allocator].
+# Disable this if the linking binary provides its own allocator.
+global-allocator = []
 # Enable logging output to framebuffer (very slow, for debugging only)
 fb-log = []
 # Enable runtime services serial debug logging (post-SetVirtualAddressMap)
@@ -33,9 +52,6 @@ spin = "0.9"
 tock-registers = "0.10"
 zerocopy = { version = "0.8", default-features = false, features = ["derive"] }
 
-# ACPI table parsing and AML interpreter for platform device discovery
-acpi = { version = "6.1", default-features = false, features = ["alloc", "aml"] }
-
 # RustCrypto crates for UEFI Secure Boot authentication (all no_std compatible)
 sha1 = { version = "0.10", default-features = false, features = ["force-soft"] }
 sha2 = { version = "0.10", default-features = false, features = ["oid", "force-soft"] }
@@ -54,11 +70,15 @@ postcard = { version = "1.0", default-features = false, features = ["alloc"] }
 [target.'cfg(target_arch = "x86_64")'.dependencies]
 x86_64 = "0.15"
 
-[target.'cfg(target_arch = "aarch64")'.dependencies]
+# FDT parsing is needed on aarch64 (QEMU virt, SBSA) and riscv64 (OpenSBI
+# passes FDT in a1).  Not needed on x86_64 (ACPI-only).
+[target.'cfg(any(target_arch = "aarch64", target_arch = "riscv64"))'.dependencies]
 fdt = "0.1.5"
 
-[build-dependencies]
-cc = "1"
+[workspace.dependencies]
+r-efi = "5.3"
+log = "0.4"
+heapless = "0.8"
 
 [profile.dev]
 panic = "abort"
@@ -72,7 +92,3 @@ codegen-units = 1
 [lib]
 name = "crabefi"
 path = "src/lib.rs"
-
-[[bin]]
-name = "crabefi"
-path = "src/main.rs"

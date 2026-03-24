@@ -4,6 +4,10 @@ version = "0.1.0"
 edition = "2024"
 description = "Build and test automation for CrabEFI"
 
+# xtask is its own workspace root — it builds with the host stable toolchain,
+# not the nightly bare-metal toolchain used by the main workspace.
+[workspace]
+
 [[bin]]
 name = "crabefi-xtask"
 path = "src/main.rs"

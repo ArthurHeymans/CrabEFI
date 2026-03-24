@@ -4,6 +4,8 @@ version = "0.1.0"
 edition = "2021"
 description = "Test EFI application for the RNG protocol"
 
+[workspace]
+
 [dependencies]
 r-efi = "5.3"
 

@@ -4,6 +4,8 @@ version = "0.1.0"
 edition = "2021"
 description = "Test EFI application for Storage Security and Pass-Through protocols"
 
+[workspace]
+
 [dependencies]
 r-efi = "5.3"
 

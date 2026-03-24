@@ -1,0 +1,19 @@
+[package]
+name = "crabefi-drivers"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Standard hardware drivers for CrabEFI (PCI, NVMe, AHCI, USB, SDHCI, SPI, serial)"
+
+[dependencies]
+crabefi = { path = ".." }
+log = "0.4"
+bitflags = "2"
+heapless = "0.8"
+spin = "0.9"
+tock-registers = "0.10"
+zerocopy = { version = "0.8", default-features = false, features = ["derive"] }
+
+[target.'cfg(target_arch = "x86_64")'.dependencies]
+x86_64 = "0.15"

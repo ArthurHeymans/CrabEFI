@@ -123,10 +123,8 @@ dependencies = [
 name = "crabefi"
 version = "0.1.0"
 dependencies = [
- "acpi",
  "atomic_refcell",
  "bitflags",
- "cc",
  "cms",
  "const-oid",
  "der",
@@ -144,6 +142,35 @@ dependencies = [
  "spki",
  "tock-registers",
  "x509-cert",
+ "x86_64",
+ "zerocopy",
+]
+
+[[package]]
+name = "crabefi-coreboot"
+version = "0.1.0"
+dependencies = [
+ "acpi",
+ "cc",
+ "crabefi",
+ "crabefi-drivers",
+ "fdt",
+ "heapless",
+ "log",
+ "r-efi",
+ "x86_64",
+]
+
+[[package]]
+name = "crabefi-drivers"
+version = "0.1.0"
+dependencies = [
+ "bitflags",
+ "crabefi",
+ "heapless",
+ "log",
+ "spin",
+ "tock-registers",
  "x86_64",
  "zerocopy",
 ]
