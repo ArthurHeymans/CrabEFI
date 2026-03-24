@@ -340,11 +340,10 @@ extern "efiapi" fn set_virtual_address_map(
         });
     }
 
-    // Step 4: Relocate our own internal pointers
+    // Step 4a: Relocate STATE_PTR — find the runtime region containing
+    // FirmwareState (on the stack, inside RuntimeServicesData).
     let state_phys = state::get() as *const _ as u64;
     let rt_ptr = get_runtime_services();
-    let rt_phys = rt_ptr as u64;
-    let mut state_relocated = false;
 
     for i in 0..num_entries {
         let desc = unsafe {
@@ -360,49 +359,52 @@ extern "efiapi" fn set_virtual_address_map(
             .number_of_pages
             .saturating_mul(EFI_PAGE_SIZE)
             .saturating_add(phys_start);
-        let virt_start = desc.virtual_start;
 
-        // Relocate STATE_PTR
-        if !state_relocated && state_phys >= phys_start && state_phys < phys_end {
-            let offset = virt_start as i64 - phys_start as i64;
+        if state_phys >= phys_start && state_phys < phys_end {
+            let offset = desc.virtual_start as i64 - phys_start as i64;
             let new_state = (state_phys as i64 + offset) as u64;
             unsafe {
                 state::relocate_state_ptr(new_state as *mut state::FirmwareState);
             }
-            state_relocated = true;
             log::debug!(
                 "SetVirtualAddressMap: relocated state ptr {:#x} -> {:#x}",
                 state_phys,
                 new_state
             );
-        }
-
-        // Relocate RuntimeServices function pointers
-        if rt_phys >= phys_start && rt_phys < phys_end {
-            let offset = virt_start as i64 - phys_start as i64;
-            // NOTE: set_virtual_address_map and convert_pointer are NOT relocated
-            // per EDK2 convention -- they are never called again after this point.
-            unsafe {
-                let rt = &mut *rt_ptr;
-                relocate_fn_ptr(&mut rt.get_time, offset);
-                relocate_fn_ptr(&mut rt.set_time, offset);
-                relocate_fn_ptr(&mut rt.get_wakeup_time, offset);
-                relocate_fn_ptr(&mut rt.set_wakeup_time, offset);
-                relocate_fn_ptr(&mut rt.get_variable, offset);
-                relocate_fn_ptr(&mut rt.get_next_variable_name, offset);
-                relocate_fn_ptr(&mut rt.set_variable, offset);
-                relocate_fn_ptr(&mut rt.get_next_high_mono_count, offset);
-                relocate_fn_ptr(&mut rt.reset_system, offset);
-                relocate_fn_ptr(&mut rt.update_capsule, offset);
-                relocate_fn_ptr(&mut rt.query_capsule_capabilities, offset);
-                relocate_fn_ptr(&mut rt.query_variable_info, offset);
-            }
-            log::debug!(
-                "SetVirtualAddressMap: relocated RT function pointers (offset {:#x})",
-                virt_start as i64 - phys_start as i64
-            );
+            break;
         }
     }
+
+    // Step 4b: Relocate RuntimeServices function pointers via ConvertPointer.
+    //
+    // Each function pointer targets code that may be in a DIFFERENT runtime
+    // region than the RT table itself. For example, when CrabEFI is linked as
+    // a library into fstart: the RT table (static) lives in BSS/RuntimeServicesData
+    // while the function pointer targets live in ROM/RuntimeServicesCode. These
+    // two regions have different physical→virtual offsets.
+    //
+    // We use convert_pointer_internal() which searches the virtual map for the
+    // region containing each pointer's target address, rather than assuming a
+    // single fixed offset.
+    //
+    // NOTE: set_virtual_address_map and convert_pointer are NOT relocated per
+    // EDK2 convention — they are never called again after this point.
+    unsafe {
+        let rt = &mut *rt_ptr;
+        convert_rt_fn_ptr(&mut rt.get_time);
+        convert_rt_fn_ptr(&mut rt.set_time);
+        convert_rt_fn_ptr(&mut rt.get_wakeup_time);
+        convert_rt_fn_ptr(&mut rt.set_wakeup_time);
+        convert_rt_fn_ptr(&mut rt.get_variable);
+        convert_rt_fn_ptr(&mut rt.get_next_variable_name);
+        convert_rt_fn_ptr(&mut rt.set_variable);
+        convert_rt_fn_ptr(&mut rt.get_next_high_mono_count);
+        convert_rt_fn_ptr(&mut rt.reset_system);
+        convert_rt_fn_ptr(&mut rt.update_capsule);
+        convert_rt_fn_ptr(&mut rt.query_capsule_capabilities);
+        convert_rt_fn_ptr(&mut rt.query_variable_info);
+    }
+    log::debug!("SetVirtualAddressMap: relocated RT function pointers via ConvertPointer");
 
     // Step 4b: Relocate GOT (Global Offset Table) entries.
     //
@@ -411,6 +413,11 @@ extern "efiapi" fn set_virtual_address_map(
     // The linker fills these GOT entries with absolute physical addresses.
     // After SVAM, the physical addresses are unmapped, so we must adjust
     // each GOT entry by the appropriate virtual offset.
+    //
+    // Only available when CrabEFI owns the linker script (platform-entry).
+    // When linked as a library, the host firmware's linker script controls
+    // the GOT and must provide its own SVAM relocation if needed.
+    #[cfg(feature = "platform-entry")]
     {
         unsafe extern "C" {
             static _got_start: u8;
@@ -548,6 +555,7 @@ extern "efiapi" fn set_virtual_address_map(
 /// # Safety
 ///
 /// The offset must produce a valid function address within the relocated region.
+#[allow(dead_code)]
 unsafe fn relocate_fn_ptr<T>(ptr: &mut T, offset: i64) {
     // SAFETY: The offset must produce a valid function address within the relocated region.
     // Caller guarantees the pointer refers to a function pointer field in RuntimeServices.
@@ -555,6 +563,33 @@ unsafe fn relocate_fn_ptr<T>(ptr: &mut T, offset: i64) {
         let old = core::ptr::read(ptr as *const T as *const u64);
         let new = (old as i64 + offset) as u64;
         core::ptr::write(ptr as *mut T as *mut u64, new);
+    }
+}
+
+/// Convert a RuntimeServices function pointer using the virtual memory map.
+///
+/// Reads the physical address stored in `ptr`, searches the virtual map for
+/// the runtime region containing that address, and writes back the virtual
+/// address. Unlike [`relocate_fn_ptr`] which applies a fixed offset, this
+/// handles the case where the function pointer target (code) is in a different
+/// runtime region than the RuntimeServices table (data) — e.g. when CrabEFI
+/// is linked as a library with code in ROM and data in RAM.
+///
+/// No-op if the address isn't found in any runtime region.
+///
+/// # Safety
+///
+/// - The VIRTUAL_MAP globals must be set up (step 2 of SetVirtualAddressMap).
+/// - `ptr` must point to a valid function pointer field in RuntimeServices.
+unsafe fn convert_rt_fn_ptr<T>(ptr: &mut T) {
+    // SAFETY: We read the raw u64 value of the function pointer, convert it
+    // via the virtual map, and write back the converted virtual address.
+    unsafe {
+        let phys_val = core::ptr::read(ptr as *const T as *const u64);
+        let mut addr = phys_val as *mut c_void;
+        if convert_pointer_internal(0, &mut addr) == Status::SUCCESS {
+            core::ptr::write(ptr as *mut T as *mut u64, addr as u64);
+        }
     }
 }
 

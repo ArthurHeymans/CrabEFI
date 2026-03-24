@@ -239,6 +239,9 @@ extern "efiapi" fn file_open(
     let name_len = utf16_to_utf8(file_name, &mut utf8_name);
     let name_str = core::str::from_utf8(&utf8_name[..name_len]).unwrap_or("");
 
+    // Strip device path text prefix if present (shim/GRUB prepend these)
+    let name_str = strip_device_path_prefix(name_str);
+
     log::info!("File.Open({:?})", name_str);
 
     // Get parent handle info
@@ -699,6 +702,41 @@ fn utf16_to_utf8(src: *mut Char16, dst: &mut [u8]) -> usize {
 
     dst[len] = 0;
     len
+}
+
+/// Strip a device path text prefix from a file path.
+///
+/// UEFI shim/GRUB sometimes prepend the textual device path representation
+/// to file paths passed to `File.Open`, e.g.:
+///
+///   `PciRoot(0)\Pci(0x4,0x0)\HD(2,GPT,...)\EFI\ubuntu\grubaa64.efi`
+///
+/// The actual file path is just `EFI\ubuntu\grubaa64.efi`. Device path
+/// components always contain parentheses (`PciRoot(0)`, `HD(...)`) which
+/// are not valid in FAT file/directory names, so we detect the prefix by
+/// checking if the first path component contains `(`, then strip everything
+/// up to and including the last `)\` or `)/`.
+fn strip_device_path_prefix(path: &str) -> &str {
+    // Quick check: if the first path component contains '(', it's a device path
+    let first_sep = path.find(['\\', '/']).unwrap_or(path.len());
+    if !path[..first_sep].contains('(') {
+        return path;
+    }
+
+    // Find the last ")\" or ")/" which ends the device path portion
+    let bytes = path.as_bytes();
+    let mut last_dp_end = 0;
+    for i in 0..bytes.len().saturating_sub(1) {
+        if bytes[i] == b')' && (bytes[i + 1] == b'\\' || bytes[i + 1] == b'/') {
+            last_dp_end = i + 2;
+        }
+    }
+
+    if last_dp_end > 0 && last_dp_end < path.len() {
+        &path[last_dp_end..]
+    } else {
+        path
+    }
 }
 
 /// Build a full path from parent path and relative name

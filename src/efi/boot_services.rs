@@ -442,8 +442,16 @@ extern "efiapi" fn wait_for_event(
             if event_id > 0 && event_id < MAX_EVENTS {
                 check_timer_event(event_id);
 
-                let efi_state = state::efi();
-                if efi_state.events[event_id].signaled {
+                // Per UEFI spec: WaitForEvent clears the signaled state
+                // of the event that triggered the return.
+                let signaled = state::with_efi_mut(|efi_state| {
+                    let was_signaled = efi_state.events[event_id].signaled;
+                    if was_signaled {
+                        efi_state.events[event_id].signaled = false;
+                    }
+                    was_signaled
+                });
+                if signaled {
                     unsafe { *index = i };
                     log::debug!("  -> SUCCESS (event signaled, index={})", i);
                     return Status::SUCCESS;
@@ -515,8 +523,17 @@ extern "efiapi" fn check_event(event: efi::Event) -> Status {
         // Check timer expiration
         check_timer_event(event_id);
 
-        let efi_state = state::efi();
-        if efi_state.events[event_id].signaled {
+        // Per UEFI spec: CheckEvent clears the signaled state when
+        // returning SUCCESS (for EVT_NOTIFY_WAIT events, the notify
+        // function is called first, then the event is cleared).
+        let signaled = state::with_efi_mut(|efi_state| {
+            let was_signaled = efi_state.events[event_id].signaled;
+            if was_signaled {
+                efi_state.events[event_id].signaled = false;
+            }
+            was_signaled
+        });
+        if signaled {
             return Status::SUCCESS;
         }
     }
@@ -1451,6 +1468,30 @@ extern "efiapi" fn exit_boot_services(image_handle: Handle, map_key: usize) -> S
         unsafe {
             system_table::clear_boot_services();
         }
+
+        // CRITICAL: Disable logging. After ExitBootServices returns, the OS
+        // only maps EFI_MEMORY_RUNTIME regions. The serial MMIO (PL011, COM1,
+        // or CBMEM console buffer) is typically NOT in a runtime region, so
+        // any log! call during a runtime service (especially SetVirtualAddressMap)
+        // would page-fault writing to unmapped memory.
+        log::set_max_level(log::LevelFilter::Off);
+
+        // Switch from Secure EL1 to Non-Secure EL1 via a RAM trampoline.
+        //
+        // At Secure EL1, GICv3 routes Non-Secure Group 1 interrupts (LPIs /
+        // MSI-X) as FIQ. The Linux kernel only handles IRQ, so NVMe and other
+        // MSI-X devices hang forever waiting for completion interrupts.
+        //
+        // We can't issue the SMC directly from flash because the ERET returns
+        // to the instruction after the SMC — which is in Secure flash, not
+        // accessible from NS-EL1 on QEMU virt. Instead, we write a small
+        // trampoline to RAM that does SMC + RET. The RET returns to the EFI
+        // stub (also in RAM), now at NS-EL1 with proper interrupt routing.
+        //
+        // Uses vendor-specific SMCCC function ID 0xC2000000 handled by
+        // fstart's EL3 exception vector. No-op if no EL3 exists.
+        #[cfg(target_arch = "aarch64")]
+        crate::arch::aarch64::ns_switch::install_ns_trampoline();
     } else {
         log::warn!("ExitBootServices FAILED: {:?}", status);
     }

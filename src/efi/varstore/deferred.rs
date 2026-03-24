@@ -61,33 +61,67 @@ const DEFERRED_MAGIC: u32 = 0x46425643;
 /// Current buffer format version
 const DEFERRED_VERSION: u8 = 1;
 
-// Linker symbols for deferred buffer section (defined in x86_64-coreboot.ld)
-// The .deferred_buffer section is a NOLOAD region allocated by the linker.
+// Linker symbols for deferred buffer section (defined in x86_64-coreboot.ld).
+// Only available when CrabEFI owns the linker script (platform-entry).
+#[cfg(feature = "platform-entry")]
 unsafe extern "C" {
     static _deferred_buffer_start: u8;
     static _deferred_buffer_end: u8;
 }
 
-/// Get the deferred buffer base address from linker script
+/// Get the deferred buffer base address from linker script.
+///
+/// When `platform-entry` is disabled (library mode), returns the
+/// platform-configured base or 0 if no deferred buffer is configured.
 #[inline]
 pub fn deferred_buffer_base() -> u64 {
-    unsafe { &_deferred_buffer_start as *const u8 as u64 }
-}
-
-/// Get the deferred buffer size from linker script
-#[inline]
-pub fn deferred_buffer_size() -> usize {
-    unsafe {
-        let start = &_deferred_buffer_start as *const u8 as usize;
-        let end = &_deferred_buffer_end as *const u8 as usize;
-        end - start
+    #[cfg(feature = "platform-entry")]
+    {
+        unsafe { &_deferred_buffer_start as *const u8 as u64 }
+    }
+    #[cfg(not(feature = "platform-entry"))]
+    {
+        // In library mode, use the override if configured, otherwise 0.
+        let ovr = BUFFER_BASE_OVERRIDE.load(core::sync::atomic::Ordering::Relaxed);
+        if ovr != 0 { ovr } else { 0 }
     }
 }
 
-/// Get the deferred buffer base as a mutable pointer
+/// Get the deferred buffer size.
+///
+/// When `platform-entry` is disabled, returns the configured size or 0.
+#[inline]
+pub fn deferred_buffer_size() -> usize {
+    #[cfg(feature = "platform-entry")]
+    {
+        unsafe {
+            let start = &_deferred_buffer_start as *const u8 as usize;
+            let end = &_deferred_buffer_end as *const u8 as usize;
+            end - start
+        }
+    }
+    #[cfg(not(feature = "platform-entry"))]
+    {
+        BUFFER_SIZE_OVERRIDE.load(core::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+/// Get the deferred buffer base as a mutable pointer.
 #[inline]
 fn linker_buffer_base() -> *mut u8 {
-    unsafe { &_deferred_buffer_start as *const u8 as *mut u8 }
+    #[cfg(feature = "platform-entry")]
+    {
+        unsafe { &_deferred_buffer_start as *const u8 as *mut u8 }
+    }
+    #[cfg(not(feature = "platform-entry"))]
+    {
+        let ovr = BUFFER_BASE_OVERRIDE.load(core::sync::atomic::Ordering::Relaxed);
+        if ovr != 0 {
+            ovr as *mut u8
+        } else {
+            core::ptr::null_mut()
+        }
+    }
 }
 
 /// Header size
@@ -193,10 +227,15 @@ impl DeferredHeader {
 /// Configured buffer base address override (0 = use linker default)
 static BUFFER_BASE_OVERRIDE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
+/// Configured buffer size override (0 = use linker default).
+/// Used in library mode where linker symbols are not available.
+static BUFFER_SIZE_OVERRIDE: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+
 /// Whether the deferred buffer has been initialized
 static INITIALIZED: AtomicBool = AtomicBool::new(false);
 
-/// Configure an alternate deferred buffer base address
+/// Configure an alternate deferred buffer base address and size.
 ///
 /// This can be called early in boot to override the linker-allocated buffer.
 /// The address should point to reserved memory that survives warm reset.
@@ -204,6 +243,19 @@ static INITIALIZED: AtomicBool = AtomicBool::new(false);
 pub fn configure_buffer(base_addr: u64) {
     BUFFER_BASE_OVERRIDE.store(base_addr, Ordering::SeqCst);
     log::info!("Deferred variable buffer configured at {:#x}", base_addr);
+}
+
+/// Configure an alternate deferred buffer with both base and size.
+///
+/// Used by `init_platform()` when no linker symbols are available.
+pub fn configure_buffer_with_size(base_addr: u64, size: usize) {
+    BUFFER_BASE_OVERRIDE.store(base_addr, Ordering::SeqCst);
+    BUFFER_SIZE_OVERRIDE.store(size, Ordering::SeqCst);
+    log::info!(
+        "Deferred variable buffer configured at {:#x} ({} bytes)",
+        base_addr,
+        size
+    );
 }
 
 /// Get the buffer base address

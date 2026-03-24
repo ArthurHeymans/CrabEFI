@@ -6,9 +6,9 @@
 
 use r_efi::efi::{Guid, Status};
 
-use crate::coreboot::FramebufferInfo;
 use crate::efi::allocator::{MemoryType, allocate_pool};
 use crate::efi::utils::allocate_protocol_with_log;
+use crate::platform::FramebufferConfig;
 use crate::state;
 
 /// EFI_GRAPHICS_OUTPUT_PROTOCOL GUID
@@ -229,8 +229,8 @@ extern "efiapi" fn gop_blt(
         Some(fb) => fb,
         None => return Status::DEVICE_ERROR,
     };
-    let fb_width = fb.x_resolution as usize;
-    let fb_height = fb.y_resolution as usize;
+    let fb_width = fb.width as usize;
+    let fb_height = fb.height as usize;
     let fb_ptr = fb.physical_address as *mut u8;
 
     // Calculate buffer line length
@@ -364,7 +364,7 @@ extern "efiapi" fn gop_blt(
 
 /// Write a BltPixel to framebuffer at (x, y)
 unsafe fn write_pixel_to_fb(
-    fb: &FramebufferInfo,
+    fb: &FramebufferConfig,
     fb_ptr: *mut u8,
     x: usize,
     y: usize,
@@ -372,7 +372,7 @@ unsafe fn write_pixel_to_fb(
 ) {
     unsafe {
         let bytes_per_pixel = (fb.bits_per_pixel / 8) as usize;
-        let offset = y * fb.bytes_per_line as usize + x * bytes_per_pixel;
+        let offset = y * fb.bytes_per_line() as usize + x * bytes_per_pixel;
         let ptr = fb_ptr.add(offset);
 
         match fb.bits_per_pixel {
@@ -411,14 +411,14 @@ unsafe fn write_pixel_to_fb(
 
 /// Read a BltPixel from framebuffer at (x, y)
 unsafe fn read_pixel_from_fb(
-    fb: &FramebufferInfo,
+    fb: &FramebufferConfig,
     fb_ptr: *mut u8,
     x: usize,
     y: usize,
 ) -> BltPixel {
     unsafe {
         let bytes_per_pixel = (fb.bits_per_pixel / 8) as usize;
-        let offset = y * fb.bytes_per_line as usize + x * bytes_per_pixel;
+        let offset = y * fb.bytes_per_line() as usize + x * bytes_per_pixel;
         let ptr = fb_ptr.add(offset);
 
         match fb.bits_per_pixel {
@@ -464,11 +464,11 @@ unsafe fn read_pixel_from_fb(
     }
 }
 
-/// Create the Graphics Output Protocol from coreboot framebuffer info
+/// Create the Graphics Output Protocol from framebuffer configuration
 ///
 /// # Returns
 /// A pointer to the GraphicsOutputProtocol, or null on failure
-pub fn create_gop(framebuffer: &FramebufferInfo) -> *mut GraphicsOutputProtocol {
+pub fn create_gop(framebuffer: &FramebufferConfig) -> *mut GraphicsOutputProtocol {
     // Determine pixel format based on mask positions
     let (pixel_format, pixel_bitmask) = if framebuffer.bits_per_pixel == 32 {
         if framebuffer.red_mask_pos == 16
@@ -513,12 +513,11 @@ pub fn create_gop(framebuffer: &FramebufferInfo) -> *mut GraphicsOutputProtocol 
     // Allocate mode info
     let mode_info_ptr = allocate_protocol_with_log::<GopModeInfo>("GopModeInfo", |m| {
         m.version = 0;
-        m.horizontal_resolution = framebuffer.x_resolution;
-        m.vertical_resolution = framebuffer.y_resolution;
+        m.horizontal_resolution = framebuffer.width;
+        m.vertical_resolution = framebuffer.height;
         m.pixel_format = pixel_format;
         m.pixel_information = pixel_bitmask;
-        m.pixels_per_scan_line =
-            framebuffer.bytes_per_line / (framebuffer.bits_per_pixel as u32 / 8);
+        m.pixels_per_scan_line = framebuffer.stride;
     });
     if mode_info_ptr.is_null() {
         return core::ptr::null_mut();
@@ -559,8 +558,8 @@ pub fn create_gop(framebuffer: &FramebufferInfo) -> *mut GraphicsOutputProtocol 
 
     log::info!(
         "GraphicsOutputProtocol created: {}x{} @ {:#x}, {:?}",
-        framebuffer.x_resolution,
-        framebuffer.y_resolution,
+        framebuffer.width,
+        framebuffer.height,
         framebuffer.physical_address,
         pixel_format
     );
