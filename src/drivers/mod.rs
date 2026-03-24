@@ -143,6 +143,10 @@ pub mod block;
 pub mod keyboard;
 pub mod keyboard_common;
 pub mod mmio;
+#[cfg(all(feature = "ui", target_arch = "x86_64"))]
+pub mod mouse;
+#[cfg(feature = "ui")]
+pub mod mouse_cursor;
 pub mod nvme;
 pub mod pci;
 pub mod sdhci;
