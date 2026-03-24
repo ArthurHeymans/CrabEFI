@@ -41,6 +41,9 @@ rt-debug = []
 # ExitBootServices into a warm-reboot-persistent ring buffer; requires
 # _rt_log_start/_rt_log_end linker symbols)
 rt-log = []
+# Enable graphical UI with mouse support (PS/2 and USB HID mouse drivers,
+# cursor rendering, SimplePointerProtocol, and rlvgl-based setup utility)
+ui = []
 
 [dependencies]
 r-efi = "5.3"
@@ -49,6 +52,9 @@ bitflags = "2"
 heapless = "0.8"
 atomic_refcell = "0.1"
 spin = "0.9"
+noto-sans-mono-bitmap = { version = "0.3", default-features = false, features = [
+    "regular", "size_16", "size_20", "size_24", "size_32", "unicode-basic-latin",
+] }
 tock-registers = "0.10"
 zerocopy = { version = "0.8", default-features = false, features = ["derive"] }
 

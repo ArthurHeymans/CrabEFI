@@ -41,6 +41,8 @@ pub struct QemuConfig {
     pub arch: Arch,
     /// QEMU machine type (aarch64 only)
     pub machine: Machine,
+    /// Extra QEMU device arguments (e.g., USB mouse for UI testing)
+    pub extra_devices: Vec<String>,
 }
 
 /// Test result from QEMU run
@@ -111,6 +113,11 @@ fn build_qemu_command_x86_64(config: &QemuConfig, disk_path: &Path) -> Result<Co
 
     // Debug options
     cmd.args(["-d", "guest_errors"]);
+
+    // Extra devices (e.g., USB mouse for UI testing)
+    for arg in &config.extra_devices {
+        cmd.arg(arg);
+    }
 
     // Capture stderr for QEMU errors
     cmd.stderr(Stdio::piped());
