@@ -4,7 +4,7 @@ use super::{
     NavItem, ScreenNav, canvas, clear, draw_footer, draw_header, draw_sidebar,
     poll_and_render_cursor, render, theme, update_sidebar_hover,
 };
-use crate::coreboot::FramebufferInfo;
+use crate::FramebufferConfig as FramebufferInfo;
 use crate::cursor::CursorRenderer;
 use crate::menu_common::{self, KeyPress};
 use crate::time::delay_ms;
@@ -46,9 +46,7 @@ pub fn show(fb: &FramebufferInfo) -> ScreenNav {
             status = None;
             match key {
                 KeyPress::Up | KeyPress::Char('k') => {
-                    if selected > 0 {
-                        selected -= 1;
-                    }
+                    selected = selected.saturating_sub(1);
                     draw_screen(fb, selected, hovered, status);
                 }
                 KeyPress::Down | KeyPress::Char('j') => {
@@ -70,11 +68,11 @@ pub fn show(fb: &FramebufferInfo) -> ScreenNav {
                 #[cfg(feature = "ui")]
                 KeyPress::MouseClick { .. } => {
                     // Sidebar click
-                    if let Some(nav) = sidebar_hov {
-                        if nav != NavItem::Security {
-                            cursor.hide(fb);
-                            return ScreenNav::Nav(nav);
-                        }
+                    if let Some(nav) = sidebar_hov
+                        && nav != NavItem::Security
+                    {
+                        cursor.hide(fb);
+                        return ScreenNav::Nav(nav);
                     }
                     // Card click
                     if let Some(idx) = hovered {
@@ -357,18 +355,9 @@ fn draw_screen(
 
     // Status toast
     if let Some((msg, ok)) = status {
-        let msg_y = fb.y_resolution as i32 - theme::FOOTER_H as i32 - 24;
+        let msg_y = fb.height as i32 - theme::FOOTER_H as i32 - 24;
         let color = if ok { theme::SECONDARY } else { theme::ERROR };
-        render::draw_text_centered(
-            fb,
-            0,
-            msg_y,
-            fb.x_resolution,
-            msg,
-            FontSize::Normal,
-            color,
-            None,
-        );
+        render::draw_text_centered(fb, 0, msg_y, fb.width, msg, FontSize::Normal, color, None);
     }
 }
 

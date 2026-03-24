@@ -4,7 +4,7 @@
 //! progress bars, pill badges, toggle switches, and multi-size anti-aliased
 //! text rendering using the Noto Sans Mono bitmap font.
 
-use crate::coreboot::FramebufferInfo;
+use crate::FramebufferConfig as FramebufferInfo;
 use noto_sans_mono_bitmap::{FontWeight, RasterHeight, get_raster, get_raster_width};
 
 /// RGB color triple.
@@ -103,8 +103,8 @@ pub fn text_width(s: &str, size: FontSize) -> u32 {
 pub fn fill_rect(fb: &FramebufferInfo, x: i32, y: i32, w: u32, h: u32, c: Rgb) {
     let x0 = x.max(0) as u32;
     let y0 = y.max(0) as u32;
-    let x1 = ((x as i64 + w as i64) as u32).min(fb.x_resolution);
-    let y1 = ((y as i64 + h as i64) as u32).min(fb.y_resolution);
+    let x1 = ((x as i64 + w as i64) as u32).min(fb.width);
+    let y1 = ((y as i64 + h as i64) as u32).min(fb.height);
     if x0 >= x1 || y0 >= y1 {
         return;
     }
@@ -122,7 +122,7 @@ pub fn fill_gradient_v(fb: &FramebufferInfo, x: i32, y: i32, w: u32, h: u32, top
         return;
     }
     for r in 0..h {
-        let t = ((r as u32 * 255) / (h - 1).max(1)) as u8;
+        let t = ((r * 255) / (h - 1).max(1)) as u8;
         fill_rect(fb, x, y + r as i32, w, 1, top.lerp(bot, t));
     }
 }
@@ -141,7 +141,7 @@ pub fn fill_gradient_h(
         return;
     }
     for c in 0..w {
-        let t = ((c as u32 * 255) / (w - 1).max(1)) as u8;
+        let t = ((c * 255) / (w - 1).max(1)) as u8;
         fill_rect(fb, x + c as i32, y, 1, h, left.lerp(right, t));
     }
 }
@@ -172,7 +172,7 @@ fn isqrt(n: u32) -> u32 {
         return 0;
     }
     let mut x = n;
-    let mut y = (x + 1) / 2;
+    let mut y = x.div_ceil(2);
     while y < x {
         x = y;
         y = (x + n / x) / 2;
@@ -326,8 +326,7 @@ pub fn draw_dot(fb: &FramebufferInfo, cx: i32, cy: i32, r: u32, c: Rgb) {
             if dx * dx + dy * dy <= r2 {
                 let px = cx + dx;
                 let py = cy + dy;
-                if px >= 0 && py >= 0 && px < fb.x_resolution as i32 && py < fb.y_resolution as i32
-                {
+                if px >= 0 && py >= 0 && px < fb.width as i32 && py < fb.height as i32 {
                     // SAFETY: bounds checked
                     unsafe { fb.write_pixel(px as u32, py as u32, c.r, c.g, c.b) };
                 }
@@ -410,15 +409,13 @@ pub fn draw_char(
     let w = raster.width();
     let h = raster.height();
 
-    for row in 0..h {
-        for col in 0..w {
+    for (row, raster_row) in rows.iter().enumerate().take(h) {
+        for (col, &alpha) in raster_row.iter().enumerate().take(w) {
             let sx = px + col as i32;
             let sy = py + row as i32;
-            if sx < 0 || sy < 0 || sx >= fb.x_resolution as i32 || sy >= fb.y_resolution as i32 {
+            if sx < 0 || sy < 0 || sx >= fb.width as i32 || sy >= fb.height as i32 {
                 continue;
             }
-
-            let alpha = rows[row][col];
             if alpha == 0 {
                 // Fully transparent — write bg if given, skip otherwise.
                 if let Some(b) = bg {

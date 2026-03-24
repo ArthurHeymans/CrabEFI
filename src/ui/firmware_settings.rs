@@ -4,7 +4,7 @@ use super::{
     NavItem, ScreenNav, canvas, clear, draw_footer, draw_header, draw_sidebar,
     poll_and_render_cursor, render, theme, update_sidebar_hover,
 };
-use crate::coreboot::FramebufferInfo;
+use crate::FramebufferConfig as FramebufferInfo;
 use crate::cursor::CursorRenderer;
 use crate::menu_common::{self, KeyPress};
 use crate::time::delay_ms;
@@ -47,9 +47,7 @@ pub fn show(fb: &FramebufferInfo) -> ScreenNav {
         if let Some(key) = menu_common::read_key() {
             match key {
                 KeyPress::Up | KeyPress::Char('k') => {
-                    if selected > 0 {
-                        selected -= 1;
-                    }
+                    selected = selected.saturating_sub(1);
                     if selected < scroll {
                         scroll = selected;
                     }
@@ -76,11 +74,11 @@ pub fn show(fb: &FramebufferInfo) -> ScreenNav {
                 #[cfg(feature = "ui")]
                 KeyPress::MouseClick { .. } => {
                     // Sidebar click
-                    if let Some(nav) = sidebar_hov {
-                        if nav != NavItem::Firmware {
-                            cursor.hide(fb);
-                            return ScreenNav::Nav(nav);
-                        }
+                    if let Some(nav) = sidebar_hov
+                        && nav != NavItem::Firmware
+                    {
+                        cursor.hide(fb);
+                        return ScreenNav::Nav(nav);
                     }
                     // Card click
                     if let Some(idx) = hovered {
@@ -315,7 +313,7 @@ fn draw_settings(
         );
     }
     if scroll + mv < cfr.forms.len() {
-        let ay = fb.y_resolution as i32 - theme::FOOTER_H as i32 - 20;
+        let ay = fb.height as i32 - theme::FOOTER_H as i32 - 20;
         render::draw_text_centered(fb, cx, ay, cw, "v", FontSize::Small, theme::PRIMARY, None);
     }
 }
@@ -364,11 +362,11 @@ fn show_no_cfr(fb: &FramebufferInfo) -> ScreenNav {
                 KeyPress::Escape | KeyPress::Char('q') => return ScreenNav::Back,
                 #[cfg(feature = "ui")]
                 KeyPress::MouseClick { .. } => {
-                    if let Some(nav) = sidebar_hov {
-                        if nav != NavItem::Firmware {
-                            cursor.hide(fb);
-                            return ScreenNav::Nav(nav);
-                        }
+                    if let Some(nav) = sidebar_hov
+                        && nav != NavItem::Firmware
+                    {
+                        cursor.hide(fb);
+                        return ScreenNav::Nav(nav);
                     }
                 }
                 _ => {}
@@ -378,7 +376,7 @@ fn show_no_cfr(fb: &FramebufferInfo) -> ScreenNav {
     }
 }
 
-fn fmt_opts<'a>(n: u32, buf: &'a mut [u8; 16]) -> &'a str {
+fn fmt_opts(n: u32, buf: &mut [u8; 16]) -> &str {
     let mut p = 0;
     p += super::fmt_u32(n, &mut buf[p..]);
     for &b in b" opts" {

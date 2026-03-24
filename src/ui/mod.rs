@@ -10,7 +10,7 @@ pub mod render;
 pub mod secure_boot;
 pub mod theme;
 
-use crate::coreboot::FramebufferInfo;
+use crate::FramebufferConfig as FramebufferInfo;
 use crate::cursor::CursorRenderer;
 use crate::drivers::mouse_cursor;
 use crate::menu::{BootCategory, BootMenu};
@@ -70,7 +70,7 @@ pub fn clear(fb: &FramebufferInfo) {
 
 /// Draw the top header bar (branding + version).
 pub fn draw_header(fb: &FramebufferInfo) {
-    let w = fb.x_resolution;
+    let w = fb.width;
     render::fill_gradient_v(
         fb,
         0,
@@ -100,7 +100,7 @@ pub fn draw_header(fb: &FramebufferInfo) {
 pub fn draw_sidebar(fb: &FramebufferInfo, active: NavItem, hovered: Option<NavItem>) {
     let sw = theme::SIDEBAR_W;
     let sy = theme::HEADER_H;
-    let sh = fb.y_resolution - theme::HEADER_H - theme::FOOTER_H;
+    let sh = fb.height - theme::HEADER_H - theme::FOOTER_H;
 
     render::fill_rect(fb, 0, sy as i32, sw, sh, theme::SIDE);
 
@@ -169,8 +169,8 @@ fn paint_sidebar_item(
 
 /// Draw the bottom footer bar.
 pub fn draw_footer(fb: &FramebufferInfo, hint: &str) {
-    let w = fb.x_resolution;
-    let fy = fb.y_resolution - theme::FOOTER_H;
+    let w = fb.width;
+    let fy = fb.height - theme::FOOTER_H;
     render::fill_rect(fb, 0, fy as i32, w, theme::FOOTER_H, theme::BG);
     let text_y =
         (fy as i32) + ((theme::FOOTER_H as i32 - render::font_height(FontSize::Small) as i32) / 2);
@@ -196,8 +196,8 @@ pub fn poll_and_render_cursor(fb: &FramebufferInfo, cursor: &mut CursorRenderer)
 fn canvas(fb: &FramebufferInfo) -> (i32, i32, u32, u32) {
     let x = theme::SIDEBAR_W as i32 + theme::PAD as i32;
     let y = (theme::HEADER_H + theme::PAD) as i32;
-    let w = fb.x_resolution - theme::SIDEBAR_W - theme::PAD * 2;
-    let h = fb.y_resolution - theme::HEADER_H - theme::FOOTER_H - theme::PAD * 2;
+    let w = fb.width - theme::SIDEBAR_W - theme::PAD * 2;
+    let h = fb.height - theme::HEADER_H - theme::FOOTER_H - theme::PAD * 2;
     (x, y, w, h)
 }
 
@@ -251,7 +251,7 @@ fn sidebar_hit() -> Option<NavItem> {
 // ═══════════════════════════════════════════════════════════════════════
 
 pub fn show_graphical_menu(menu: &mut BootMenu) -> Option<usize> {
-    let fb: FramebufferInfo = crate::state::get_framebuffer()?.into();
+    let fb = crate::state::get_framebuffer()?;
     let mut screen = NavItem::Boot;
 
     loop {
@@ -273,8 +273,8 @@ pub fn show_graphical_menu(menu: &mut BootMenu) -> Option<usize> {
 }
 
 pub fn show_no_media_screen() {
-    let fb: FramebufferInfo = match crate::state::get_framebuffer() {
-        Some(f) => f.into(),
+    let fb = match crate::state::get_framebuffer() {
+        Some(f) => f,
         None => return,
     };
     let mut screen = NavItem::Boot;
@@ -398,11 +398,11 @@ fn run_boot(fb: &FramebufferInfo, menu: &mut BootMenu) -> BootResult {
                 #[cfg(feature = "ui")]
                 KeyPress::MouseClick { .. } => {
                     // Check sidebar clicks first
-                    if let Some(nav) = st.sidebar_hov {
-                        if nav != NavItem::Boot {
-                            cursor.hide(fb);
-                            return BootResult::Nav(nav);
-                        }
+                    if let Some(nav) = st.sidebar_hov
+                        && nav != NavItem::Boot
+                    {
+                        cursor.hide(fb);
+                        return BootResult::Nav(nav);
                     }
                     // Then card clicks
                     if let Some(idx) = st.hovered {
@@ -536,11 +536,11 @@ fn run_no_media(fb: &FramebufferInfo) -> ScreenNav {
                 KeyPress::Escape => return ScreenNav::Back,
                 #[cfg(feature = "ui")]
                 KeyPress::MouseClick { .. } => {
-                    if let Some(nav) = sidebar_hov {
-                        if nav != NavItem::Boot {
-                            cursor.hide(fb);
-                            return ScreenNav::Nav(nav);
-                        }
+                    if let Some(nav) = sidebar_hov
+                        && nav != NavItem::Boot
+                    {
+                        cursor.hide(fb);
+                        return ScreenNav::Nav(nav);
                     }
                 }
                 _ => {}
@@ -721,8 +721,8 @@ fn paint_boot_card(fb: &FramebufferInfo, menu: &BootMenu, st: &BState, idx: usiz
 }
 
 fn paint_boot_footer(fb: &FramebufferInfo, st: &BState) {
-    let w = fb.x_resolution;
-    let fy = fb.y_resolution - theme::FOOTER_H;
+    let w = fb.width;
+    let fy = fb.height - theme::FOOTER_H;
     render::fill_rect(fb, 0, fy as i32, w, theme::FOOTER_H, theme::BG);
 
     if st.countdown > 0 && st.init_timeout > 0 {
