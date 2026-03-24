@@ -367,6 +367,48 @@ impl Write for Pl011Port {
 }
 
 // ============================================================================
+// Platform-provided serial backend (for init_platform() path)
+// ============================================================================
+
+/// Adapter that wraps a platform-provided `DebugOutput` trait object.
+///
+/// Stores a raw pointer because the serial subsystem is accessed via
+/// `drivers_mut_ptr()` (raw pointers) throughout CrabEFI to avoid
+/// aliasing with active `&mut FirmwareState` references in closures.
+pub(crate) struct PlatformSerial {
+    /// Raw pointer to the platform's debug output trait object.
+    /// Valid for the entire firmware lifetime (caller guarantees this).
+    inner: *mut dyn crate::platform::DebugOutput,
+}
+
+impl PlatformSerial {
+    /// Write a single byte to the platform debug output.
+    fn write_byte(&mut self, byte: u8) {
+        // SAFETY: Single-threaded firmware. Pointer is valid for firmware lifetime.
+        unsafe { &mut *self.inner }.write_byte(byte);
+    }
+
+    /// Try to read a byte (non-blocking).
+    fn try_read_byte(&mut self) -> Option<u8> {
+        // SAFETY: Single-threaded firmware.
+        unsafe { &mut *self.inner }.try_read_byte()
+    }
+
+    /// Check if input is available.
+    fn has_input(&self) -> bool {
+        // SAFETY: Single-threaded firmware.
+        unsafe { &*self.inner }.has_input()
+    }
+}
+
+impl Write for PlatformSerial {
+    fn write_str(&mut self, s: &str) -> fmt::Result {
+        // SAFETY: Single-threaded firmware.
+        unsafe { &mut *self.inner }.write_str(s)
+    }
+}
+
+// ============================================================================
 // Unified serial port wrapper
 // ============================================================================
 
@@ -375,6 +417,8 @@ pub(crate) enum AnySerial {
     Uart16550(SerialPort),
     #[cfg(target_arch = "aarch64")]
     Pl011(Pl011Port),
+    /// Platform-provided debug output (used by `init_platform()` path).
+    Platform(PlatformSerial),
 }
 
 // ============================================================================
@@ -453,6 +497,24 @@ pub fn init_from_coreboot(base_addr: u32, baud: u32, is_mmio: bool) {
     }
 }
 
+/// Initialize serial output from a raw pointer to a platform `DebugOutput`.
+///
+/// Used by `init_platform()` to inject an external serial driver (e.g., from
+/// fstart's PL011 or NS16550 driver) without going through coreboot tables.
+///
+/// # Safety
+///
+/// `raw` must point to a valid `DebugOutput` that lives for the entire
+/// firmware lifetime (i.e., at least until `init_platform()` returns).
+pub unsafe fn init_from_platform_raw(raw: *mut dyn crate::platform::DebugOutput) {
+    let plat = PlatformSerial { inner: raw };
+    // SAFETY: Single-threaded firmware; raw pointer avoids re-entrancy
+    // issues since serial is called from log macros inside other state closures.
+    unsafe {
+        (*crate::state::drivers_mut_ptr()).serial.driver = Some(AnySerial::Platform(plat));
+    }
+}
+
 /// Write a string to the serial port
 pub fn write_str(s: &str) {
     // SAFETY: Single-threaded firmware; raw pointer avoids re-entrancy
@@ -466,6 +528,9 @@ pub fn write_str(s: &str) {
             #[cfg(target_arch = "aarch64")]
             AnySerial::Pl011(pl011) => {
                 let _ = pl011.write_str(s);
+            }
+            AnySerial::Platform(plat) => {
+                let _ = plat.write_str(s);
             }
         }
     }
@@ -485,6 +550,9 @@ pub fn write_fmt(args: fmt::Arguments) {
             AnySerial::Pl011(pl011) => {
                 let _ = pl011.write_fmt(args);
             }
+            AnySerial::Platform(plat) => {
+                let _ = plat.write_fmt(args);
+            }
         }
     }
 }
@@ -499,6 +567,7 @@ pub fn write_byte(byte: u8) {
             AnySerial::Uart16550(uart) => uart.write_byte(byte),
             #[cfg(target_arch = "aarch64")]
             AnySerial::Pl011(pl011) => pl011.write_byte(byte),
+            AnySerial::Platform(plat) => plat.write_byte(byte),
         }
     }
 }
@@ -511,6 +580,7 @@ pub fn has_input() -> bool {
             AnySerial::Uart16550(uart) => uart.can_receive(),
             #[cfg(target_arch = "aarch64")]
             AnySerial::Pl011(pl011) => pl011.can_receive(),
+            AnySerial::Platform(plat) => plat.has_input(),
         }
     } else {
         false
@@ -527,6 +597,7 @@ pub fn try_read() -> Option<u8> {
             AnySerial::Uart16550(uart) => uart.try_read_byte(),
             #[cfg(target_arch = "aarch64")]
             AnySerial::Pl011(pl011) => pl011.try_read_byte(),
+            AnySerial::Platform(plat) => plat.try_read_byte(),
         }
     } else {
         None

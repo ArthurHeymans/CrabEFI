@@ -1202,6 +1202,26 @@ pub fn init_device(dev: &pci::PciDevice) -> Result<(), ()> {
 /// Called during ExitBootServices to prepare for OS handoff.
 /// Currently a placeholder — the OS will reset controllers during its own init.
 pub fn shutdown() {
+    // Disable all NVMe controllers before OS handoff.
+    // The Linux NVMe driver resets the controller (CC.EN=0 → wait CSTS.RDY=0)
+    // during probe. If CrabEFI leaves the controller enabled with active queues,
+    // the kernel's reset may hang. Explicitly disable here so the kernel finds
+    // a clean controller state.
+    let controllers = NVME_CONTROLLERS.controllers.lock();
+    for ctrl_ptr in controllers.iter() {
+        // SAFETY: controller pointer is valid for firmware lifetime
+        let ctrl = unsafe { &*ctrl_ptr.0 };
+        let regs = unsafe { &*ctrl.regs };
+        // Issue shutdown notification (CC.SHN = Normal)
+        regs.cc.modify(CC::SHN.val(1));
+        // Wait for SHST to indicate completion (up to 500ms)
+        let _ = wait_for(500, || regs.csts.read(CSTS::SHST) == 2);
+        // Disable the controller (CC.EN = 0)
+        regs.cc.modify(CC::EN::CLEAR + CC::SHN.val(0));
+        // Wait for RDY=0 (up to 500ms)
+        let _ = wait_for(500, || regs.csts.read(CSTS::RDY) == 0);
+    }
+    drop(controllers);
     NVME_CONTROLLERS.shutdown_log();
 }
 
