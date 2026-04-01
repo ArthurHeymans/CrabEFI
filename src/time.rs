@@ -450,6 +450,24 @@ impl Timeout {
         Self::from_us(ms * 1000)
     }
 
+    /// Reconstruct a `Timeout` from a raw deadline value previously
+    /// obtained via [`raw_deadline()`](Self::raw_deadline).
+    ///
+    /// This is useful for storing a deadline in a state machine that
+    /// cannot hold a `Timeout` directly (e.g. inside an enum stored
+    /// in a `Mutex`).
+    #[inline]
+    pub fn from_raw(deadline: u64) -> Self {
+        Self { deadline }
+    }
+
+    /// Return the raw counter deadline for later reconstruction via
+    /// [`from_raw()`](Self::from_raw).
+    #[inline]
+    pub fn raw_deadline(&self) -> u64 {
+        self.deadline
+    }
+
     /// Check if the timeout has expired
     #[inline]
     pub fn is_expired(&self) -> bool {
