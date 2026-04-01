@@ -13,9 +13,11 @@ use crate::time::{Timeout, wait_for};
 use core::ptr;
 use core::sync::atomic::{Ordering, fence};
 use tock_registers::interfaces::{ReadWriteable, Readable, Writeable};
+use zerocopy::FromBytes;
 
 use super::controller::{
-    SetupPacket, UsbController, UsbDevice, UsbError, UsbSpeed, enumerate_device,
+    HUB_DESCRIPTOR_TYPE, HubDescriptor, SetupPacket, UsbController, UsbDevice, UsbError, UsbSpeed,
+    enumerate_device, hub_feature, hub_port_change, hub_port_status, req_type, request,
 };
 use super::uhci_regs::{PORTSC, USBCMD, USBSTS, UhciRegs};
 
@@ -315,7 +317,13 @@ impl UhciController {
         };
 
         controller.init()?;
-        controller.enumerate_ports()?;
+
+        // Port enumeration is deferred to rescan_ports(), called after all
+        // USB controllers are initialized. On ICH8/9/10 chipsets, UHCI
+        // companion controllers appear at lower PCI BDFs than their EHCI
+        // companion, so they are initialized first.  EHCI must set
+        // CONFIGFLAG and release companion ports before UHCI can see
+        // the correct devices and speeds on its ports.
 
         Ok(controller)
     }
@@ -487,7 +495,7 @@ impl UhciController {
         Ok(())
     }
 
-    /// Attach a device
+    /// Attach a device on a root hub port
     fn attach_device(&mut self, port: u8, speed: UsbSpeed) -> Result<(), UsbError> {
         let address = self.next_address;
         if address >= 128 {
@@ -503,20 +511,269 @@ impl UhciController {
         let initial_device = UsbDevice::new(0, port, speed);
 
         // Use the common enumeration helper with a closure for control transfers
-        let device = enumerate_device(
-            initial_device,
-            address,
-            |dev, req_type, req, value, index, data| {
-                self.control_transfer_internal(dev, req_type, req, value, index, data)
-            },
-        )?;
+        let device = enumerate_device(initial_device, address, |dev, rt, req, val, idx, data| {
+            self.control_transfer_internal(dev, rt, req, val, idx, data)
+        })?;
 
         self.next_address += 1;
+
+        // Store the device and check if it's a hub
+        let is_hub = device.is_hub;
+        let hub_address = device.address;
         self.devices[slot] = Some(device);
+
+        // If this is a hub, enumerate its downstream ports
+        if is_hub && let Err(e) = self.enumerate_hub(slot, hub_address) {
+            log::warn!("Failed to enumerate hub ports: {:?}", e);
+            // Don't fail the device attachment, hub is still registered
+        }
+
         Ok(())
     }
 
+    /// Attach a device connected through an external hub
+    ///
+    /// # Arguments
+    /// * `hub_port` - Hub port number (1-based)
+    /// * `speed` - Detected device speed
+    /// * `hub_addr` - USB address of the parent hub
+    /// * `hub_port_num` - Hub port number for tracking
+    fn attach_device_on_hub(
+        &mut self,
+        hub_port: u8,
+        speed: UsbSpeed,
+        hub_addr: u8,
+        hub_port_num: u8,
+    ) -> Result<(), UsbError> {
+        let address = self.next_address;
+        if address >= 128 {
+            return Err(UsbError::NoFreeSlots);
+        }
+
+        let slot = self
+            .devices
+            .iter()
+            .position(|d| d.is_none())
+            .ok_or(UsbError::NoFreeSlots)?;
+
+        let initial_device = UsbDevice::new_on_hub(0, hub_port, speed, hub_addr, hub_port_num);
+        let device = enumerate_device(initial_device, address, |dev, rt, req, val, idx, data| {
+            self.control_transfer_internal(dev, rt, req, val, idx, data)
+        })?;
+
+        self.next_address += 1;
+
+        // Store the device and check for nested hubs
+        let is_hub = device.is_hub;
+        let new_hub_address = device.address;
+        self.devices[slot] = Some(device);
+
+        if is_hub && let Err(e) = self.enumerate_hub(slot, new_hub_address) {
+            log::warn!("Failed to enumerate nested hub ports: {:?}", e);
+        }
+
+        Ok(())
+    }
+
+    /// Enumerate devices connected to an external USB hub
+    ///
+    /// Gets the hub descriptor, powers on all ports, resets ports with
+    /// connected devices, and enumerates them. UHCI is USB 1.1 only, so
+    /// devices behind hubs are always low-speed or full-speed.
+    fn enumerate_hub(&mut self, hub_slot: usize, hub_addr: u8) -> Result<(), UsbError> {
+        log::info!("UHCI: Enumerating hub at address {}", hub_addr);
+
+        let hub_device = self.devices[hub_slot]
+            .as_ref()
+            .ok_or(UsbError::DeviceNotFound)?
+            .clone();
+
+        // Get hub descriptor (class-specific request)
+        let mut hub_desc_buf = [0u8; 9];
+        self.control_transfer_internal(
+            &hub_device,
+            req_type::DIR_IN | req_type::TYPE_CLASS | req_type::RCPT_DEVICE,
+            request::GET_DESCRIPTOR,
+            (HUB_DESCRIPTOR_TYPE as u16) << 8,
+            0,
+            Some(&mut hub_desc_buf),
+        )?;
+
+        let (hub_desc, _) = HubDescriptor::read_from_prefix(&hub_desc_buf)
+            .map_err(|_| UsbError::TransferFailed(0))?;
+        let num_ports = hub_desc.num_ports;
+        let power_on_delay = (hub_desc.power_on_to_power_good as u32) * 2;
+
+        log::info!(
+            "  Hub has {} ports, power-on delay: {}ms",
+            num_ports,
+            power_on_delay
+        );
+
+        // Update the device's hub port count
+        if let Some(ref mut dev) = self.devices[hub_slot] {
+            dev.num_hub_ports = num_ports;
+        }
+
+        // Power on all hub ports
+        for port in 1..=num_ports {
+            log::debug!("  Powering on hub port {}", port);
+            let result = self.control_transfer_internal(
+                &hub_device,
+                req_type::DIR_OUT | req_type::TYPE_CLASS | req_type::RCPT_OTHER,
+                request::SET_FEATURE,
+                hub_feature::PORT_POWER,
+                port as u16,
+                None,
+            );
+            if let Err(e) = result {
+                log::warn!("  Failed to power on hub port {}: {:?}", port, e);
+            }
+        }
+
+        // Wait for power to stabilize
+        let delay = power_on_delay.max(100) as u64;
+        crate::time::delay_ms(delay);
+
+        // Check each port for connected devices
+        for port in 1..=num_ports {
+            // Get port status
+            let mut status_buf = [0u8; 4];
+            let result = self.control_transfer_internal(
+                &hub_device,
+                req_type::DIR_IN | req_type::TYPE_CLASS | req_type::RCPT_OTHER,
+                request::GET_STATUS,
+                0,
+                port as u16,
+                Some(&mut status_buf),
+            );
+
+            if let Err(e) = result {
+                log::debug!("  Failed to get status for hub port {}: {:?}", port, e);
+                continue;
+            }
+
+            let port_status = u16::from_le_bytes([status_buf[0], status_buf[1]]);
+            let port_change = u16::from_le_bytes([status_buf[2], status_buf[3]]);
+
+            log::debug!(
+                "  Hub port {} status: {:#06x}, change: {:#06x}",
+                port,
+                port_status,
+                port_change
+            );
+
+            if (port_status & hub_port_status::CONNECTION) == 0 {
+                continue;
+            }
+
+            log::info!("  Device detected on hub port {}", port);
+
+            // Clear connection change bit if set
+            if port_change & hub_port_change::C_CONNECTION != 0 {
+                let _ = self.control_transfer_internal(
+                    &hub_device,
+                    req_type::DIR_OUT | req_type::TYPE_CLASS | req_type::RCPT_OTHER,
+                    request::CLEAR_FEATURE,
+                    hub_feature::C_PORT_CONNECTION,
+                    port as u16,
+                    None,
+                );
+            }
+
+            // Reset the port
+            log::debug!("  Resetting hub port {}", port);
+            self.control_transfer_internal(
+                &hub_device,
+                req_type::DIR_OUT | req_type::TYPE_CLASS | req_type::RCPT_OTHER,
+                request::SET_FEATURE,
+                hub_feature::PORT_RESET,
+                port as u16,
+                None,
+            )?;
+
+            // Wait for reset (USB spec requires at least 10ms, use 50ms for margin)
+            crate::time::delay_ms(50);
+
+            // Poll for reset completion
+            let mut reset_complete = false;
+            let timeout = Timeout::from_ms(500);
+            while !timeout.is_expired() {
+                let mut status_buf = [0u8; 4];
+                if self
+                    .control_transfer_internal(
+                        &hub_device,
+                        req_type::DIR_IN | req_type::TYPE_CLASS | req_type::RCPT_OTHER,
+                        request::GET_STATUS,
+                        0,
+                        port as u16,
+                        Some(&mut status_buf),
+                    )
+                    .is_err()
+                {
+                    break;
+                }
+
+                let port_status = u16::from_le_bytes([status_buf[0], status_buf[1]]);
+                let port_change = u16::from_le_bytes([status_buf[2], status_buf[3]]);
+
+                // Check if reset is complete (C_PORT_RESET bit in change)
+                if port_change & hub_port_change::C_RESET != 0 {
+                    // Clear the reset change bit
+                    let _ = self.control_transfer_internal(
+                        &hub_device,
+                        req_type::DIR_OUT | req_type::TYPE_CLASS | req_type::RCPT_OTHER,
+                        request::CLEAR_FEATURE,
+                        hub_feature::C_PORT_RESET,
+                        port as u16,
+                        None,
+                    );
+
+                    // Check if port is enabled
+                    if (port_status & hub_port_status::ENABLE) != 0 {
+                        reset_complete = true;
+
+                        // UHCI is USB 1.1 only: low-speed or full-speed
+                        let speed = if (port_status & hub_port_status::LOW_SPEED) != 0 {
+                            UsbSpeed::Low
+                        } else {
+                            UsbSpeed::Full
+                        };
+
+                        log::info!("  Hub port {} reset complete, speed: {:?}", port, speed);
+
+                        // Recovery time after reset
+                        crate::time::delay_ms(10);
+
+                        // Enumerate the device
+                        if let Err(e) = self.attach_device_on_hub(port, speed, hub_addr, port) {
+                            log::warn!("  Failed to attach device on hub port {}: {:?}", port, e);
+                        }
+                    }
+                    break;
+                }
+
+                crate::time::delay_ms(10);
+            }
+
+            if !reset_complete {
+                log::warn!("  Hub port {} reset timed out", port);
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Maximum number of data TDs per control transfer
+    ///
+    /// Supports up to 256-byte transfers with 8-byte packets (low-speed worst case).
+    const MAX_DATA_TDS: usize = 32;
+
     /// Internal control transfer
+    ///
+    /// In UHCI, each TD handles exactly one USB packet. Control transfers with
+    /// data larger than max_packet_size require multiple data TDs, each carrying
+    /// up to max_packet_size bytes with alternating DATA0/DATA1 toggles.
     fn control_transfer_internal(
         &mut self,
         device: &UsbDevice,
@@ -529,19 +786,27 @@ impl UhciController {
         let is_in = (request_type & 0x80) != 0;
         let data_len = data.as_ref().map(|d| d.len()).unwrap_or(0);
         let is_low_speed = device.speed == UsbSpeed::Low;
+        let max_packet = device.ep0_max_packet.max(8) as usize;
 
-        // Build setup packet
+        // Build setup packet at start of DMA buffer
         let setup_addr = self.dma_buffer;
         let setup_packet = SetupPacket::new(request_type, request, value, index, data_len as u16);
         unsafe {
             ptr::copy_nonoverlapping(setup_packet.as_bytes().as_ptr(), setup_addr as *mut u8, 8);
         }
 
-        // Allocate TDs
+        // DMA buffer layout:
+        //   [0..8)       setup packet
+        //   [64..)       TDs: setup(1) + data(N) + status(1), each 32 bytes
+        //   [2048..)     data buffer
+        debug_assert!(
+            data_len <= Self::DMA_BUFFER_SIZE - 2048,
+            "control transfer data ({data_len} bytes) exceeds DMA buffer"
+        );
         let td_base = self.dma_buffer + 64;
-        let data_buffer = td_base + 256;
+        let data_buffer = self.dma_buffer + 2048;
 
-        // Copy data for OUT
+        // Copy data for OUT transfers
         if let Some(ref d) = data
             && !is_in
         {
@@ -550,49 +815,64 @@ impl UhciController {
             }
         }
 
-        // Create TDs
+        // Calculate number of data TDs (one per packet)
+        let num_data_tds = if data_len > 0 {
+            data_len.div_ceil(max_packet).min(Self::MAX_DATA_TDS)
+        } else {
+            0
+        };
+
+        // TD addresses
         let setup_td_addr = td_base;
-        let status_td_addr;
+        let first_data_td_addr = td_base + 32;
+        let status_td_addr = td_base + 32 * (1 + num_data_tds) as u64;
 
-        if data_len > 0 {
-            let data_td_addr = td_base + 32;
-            status_td_addr = td_base + 64;
+        // Build setup TD
+        let next_after_setup = if num_data_tds > 0 {
+            first_data_td_addr as u32
+        } else {
+            status_td_addr as u32
+        };
+        let setup_td = unsafe { &mut *(setup_td_addr as *mut TransferDescriptor) };
+        *setup_td = TransferDescriptor::setup(
+            device.address,
+            setup_addr as u32,
+            next_after_setup,
+            is_low_speed,
+        );
 
-            let setup_td = unsafe { &mut *(setup_td_addr as *mut TransferDescriptor) };
-            let data_td = unsafe { &mut *(data_td_addr as *mut TransferDescriptor) };
-            let status_td = unsafe { &mut *(status_td_addr as *mut TransferDescriptor) };
+        // Build data TDs (one per packet, alternating DATA1/DATA0)
+        let mut toggle = true; // First data packet after SETUP is DATA1
+        let mut remaining = data_len;
+        for i in 0..num_data_tds {
+            let chunk = remaining.min(max_packet);
+            let td_addr = first_data_td_addr + (i as u64) * 32;
+            let next_td = if i + 1 < num_data_tds {
+                (td_addr + 32) as u32
+            } else {
+                status_td_addr as u32
+            };
+            let buf_offset = i * max_packet;
 
-            *setup_td = TransferDescriptor::setup(
-                device.address,
-                setup_addr as u32,
-                data_td_addr as u32,
-                is_low_speed,
-            );
-            *data_td = TransferDescriptor::data(
+            let td = unsafe { &mut *(td_addr as *mut TransferDescriptor) };
+            *td = TransferDescriptor::data(
                 device.address,
                 0,
-                data_buffer as u32,
-                data_len,
+                (data_buffer + buf_offset as u64) as u32,
+                chunk,
                 is_in,
-                true,
-                status_td_addr as u32,
+                toggle,
+                next_td,
                 is_low_speed,
             );
-            *status_td = TransferDescriptor::status(device.address, !is_in, 0, is_low_speed);
-        } else {
-            status_td_addr = td_base + 32;
-
-            let setup_td = unsafe { &mut *(setup_td_addr as *mut TransferDescriptor) };
-            let status_td = unsafe { &mut *(status_td_addr as *mut TransferDescriptor) };
-
-            *setup_td = TransferDescriptor::setup(
-                device.address,
-                setup_addr as u32,
-                status_td_addr as u32,
-                is_low_speed,
-            );
-            *status_td = TransferDescriptor::status(device.address, true, 0, is_low_speed);
+            toggle = !toggle;
+            remaining -= chunk;
         }
+
+        // Build status TD (opposite direction from data, DATA1 toggle)
+        let status_td = unsafe { &mut *(status_td_addr as *mut TransferDescriptor) };
+        let status_dir_in = if data_len > 0 { !is_in } else { true };
+        *status_td = TransferDescriptor::status(device.address, status_dir_in, 0, is_low_speed);
 
         fence(Ordering::SeqCst);
 
@@ -601,14 +881,19 @@ impl UhciController {
         qh.element_link = setup_td_addr as u32;
         fence(Ordering::SeqCst);
 
-        // Wait for completion
-        let status_td = unsafe { &*(status_td_addr as *const TransferDescriptor) };
+        // Wait for status TD completion
         let timeout = Timeout::from_ms(5000);
-
-        while !timeout.is_expired() {
+        loop {
             fence(Ordering::SeqCst);
-            if !status_td.is_active() {
+            let sts = unsafe { ptr::read_volatile(&status_td.ctrl_sts) };
+            if sts & TransferDescriptor::CS_ACTIVE == 0 {
                 break;
+            }
+            if timeout.is_expired() {
+                // Clear QH before returning
+                qh.element_link = QueueHead::TERMINATE;
+                fence(Ordering::SeqCst);
+                return Err(UsbError::Timeout);
             }
             core::hint::spin_loop();
         }
@@ -617,33 +902,62 @@ impl UhciController {
         qh.element_link = QueueHead::TERMINATE;
         fence(Ordering::SeqCst);
 
-        // Check result
-        if status_td.is_active() {
-            return Err(UsbError::Timeout);
-        }
-
+        // Check setup TD and all data TDs for errors
         let setup_td = unsafe { &*(setup_td_addr as *const TransferDescriptor) };
-        if setup_td.has_error() || status_td.has_error() {
-            if setup_td.is_stalled() || status_td.is_stalled() {
-                return Err(UsbError::Stall);
+        if setup_td.has_error() {
+            return Err(if setup_td.is_stalled() {
+                UsbError::Stall
+            } else {
+                UsbError::TransactionError
+            });
+        }
+        for i in 0..num_data_tds {
+            let td_addr = first_data_td_addr + (i as u64) * 32;
+            let td = unsafe { &*(td_addr as *const TransferDescriptor) };
+            if td.has_error() {
+                return Err(if td.is_stalled() {
+                    UsbError::Stall
+                } else {
+                    UsbError::TransactionError
+                });
             }
-            return Err(UsbError::TransactionError);
+        }
+        let status_sts = unsafe { ptr::read_volatile(&status_td.ctrl_sts) };
+        if status_sts & TransferDescriptor::CS_ERROR_MASK != 0 {
+            return Err(if status_sts & TransferDescriptor::CS_STALLED != 0 {
+                UsbError::Stall
+            } else {
+                UsbError::TransactionError
+            });
         }
 
-        // Copy data for IN
+        // Copy received data for IN transfers
         if let Some(d) = data
             && is_in
         {
-            let data_td = unsafe { &*((td_base + 32) as *const TransferDescriptor) };
-            let transferred = data_td.actual_length();
-            unsafe {
-                ptr::copy_nonoverlapping(
-                    data_buffer as *const u8,
-                    d.as_mut_ptr(),
-                    transferred.min(d.len()),
-                );
+            let mut total = 0usize;
+            for i in 0..num_data_tds {
+                let td_addr = first_data_td_addr + (i as u64) * 32;
+                let td = unsafe { &*(td_addr as *const TransferDescriptor) };
+                let chunk_transferred = td.actual_length();
+                let buf_offset = i * max_packet;
+                let copy_len = chunk_transferred.min(d.len() - total);
+                if copy_len > 0 {
+                    unsafe {
+                        ptr::copy_nonoverlapping(
+                            (data_buffer + buf_offset as u64) as *const u8,
+                            d.as_mut_ptr().add(total),
+                            copy_len,
+                        );
+                    }
+                }
+                total += chunk_transferred;
+                // Short packet means device has no more data
+                if chunk_transferred < max_packet {
+                    break;
+                }
             }
-            return Ok(transferred);
+            return Ok(total);
         }
 
         Ok(data_len)
@@ -835,6 +1149,21 @@ impl UsbController for UhciController {
 }
 
 impl UhciController {
+    /// Enumerate ports (deferred initialization)
+    ///
+    /// On ICH8/9/10 chipsets, UHCI companion controllers are initialized before
+    /// their EHCI companion due to PCI BDF ordering (UHCI at functions 0-2,
+    /// EHCI at function 7). EHCI must set CONFIGFLAG and release companion ports
+    /// before UHCI can see correct devices and speeds on its ports.
+    ///
+    /// This is called from `rescan_companion_ports()` after all USB controllers
+    /// have been initialized, ensuring EHCI has already released its companions.
+    pub fn rescan_ports(&mut self) {
+        if let Err(e) = self.enumerate_ports() {
+            log::error!("UHCI: Port enumeration failed: {:?}", e);
+        }
+    }
+
     /// Clean up the controller before handing off to the OS
     ///
     /// This must be called before ExitBootServices to ensure Linux's UHCI

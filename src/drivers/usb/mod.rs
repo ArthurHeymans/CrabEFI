@@ -256,6 +256,34 @@ pub fn init_all() {
     init_keyboards();
 }
 
+/// Enumerate UHCI companion controller ports (deferred phase)
+///
+/// On ICH8/9/10 chipsets, UHCI companion controllers appear at lower PCI BDFs
+/// than their EHCI companion (UHCI at functions 0-2, EHCI at function 7).
+/// Since PCI drivers bind in ascending BDF order, UHCI hardware is initialized
+/// before EHCI. EHCI must set CONFIGFLAG and release companion ports before
+/// UHCI can see the correct devices and speeds.
+///
+/// UHCI port enumeration is therefore deferred to this function, which must be
+/// called after all USB controllers are initialized (i.e., after
+/// `bind_drivers()`) but before keyboard/device discovery.
+pub fn rescan_companion_ports() {
+    let controllers = ALL_CONTROLLERS.lock();
+
+    for handle in controllers.iter() {
+        match handle {
+            #[cfg(target_arch = "x86_64")]
+            UsbControllerHandle::Uhci(ptr) => {
+                // SAFETY: pointer is valid for the firmware's lifetime and we hold
+                // the ALL_CONTROLLERS lock, serializing access.
+                let controller = unsafe { &mut **ptr };
+                controller.rescan_ports();
+            }
+            _ => {}
+        }
+    }
+}
+
 /// Initialize USB keyboards from all controllers
 ///
 /// Can be called separately after controller initialization via the PCI

@@ -28,6 +28,11 @@ fn init_storage_subsystem() {
     // This uses the table-driven driver model instead of hardcoded init calls
     drivers::pci::bind_drivers();
 
+    // Rescan UHCI/OHCI companion controller ports for devices that EHCI
+    // released after the initial scan (ICH8/9/10 chipsets initialize UHCI
+    // before EHCI due to PCI BDF ordering)
+    drivers::usb::rescan_companion_ports();
+
     // Initialize USB keyboards (needs to happen after USB controllers are bound)
     drivers::usb::init_keyboards_public();
 
