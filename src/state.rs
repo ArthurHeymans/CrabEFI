@@ -398,13 +398,15 @@ impl EventEntry {
 pub struct LoadedImageEntry {
     /// Handle for this loaded image
     pub handle: Handle,
-    /// Base address where image was loaded
+    /// Base address where image was loaded (section-aligned)
     pub image_base: u64,
     /// Size of the loaded image in bytes
     pub image_size: u64,
     /// Entry point address
     pub entry_point: u64,
-    /// Number of pages allocated
+    /// Base address of the underlying page allocation (for free_pages)
+    pub alloc_base: u64,
+    /// Number of pages allocated (covers alignment padding + image)
     pub num_pages: u64,
     /// Parent image handle that loaded this image
     pub parent_handle: Handle,
@@ -424,6 +426,7 @@ impl LoadedImageEntry {
             image_base: 0,
             image_size: 0,
             entry_point: 0,
+            alloc_base: 0,
             num_pages: 0,
             parent_handle: core::ptr::null_mut(),
         }
@@ -606,8 +609,8 @@ impl Default for EfiState {
 // Driver State
 // ============================================================================
 
-use crate::drivers::pci::PciDevice;
 use crate::drivers::pci::access::AnyPciAccess;
+use crate::drivers::pci::PciDevice;
 use crate::drivers::serial::AnySerial;
 use crate::drivers::storage::StorageRegistry;
 use crate::efi::protocols::serial_io::SerialIoMode;
