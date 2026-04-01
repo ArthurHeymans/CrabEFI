@@ -6,6 +6,9 @@ license.workspace = true
 repository.workspace = true
 description = "CrabEFI as a coreboot payload binary"
 
+[features]
+ui = ["crabefi/ui"]
+
 [dependencies]
 crabefi = { path = "..", features = ["global-allocator", "platform-entry"] }
 crabefi-drivers = { path = "../crabefi-drivers" }
