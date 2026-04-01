@@ -235,10 +235,12 @@ else
 
         # Look up the .deb path from the Packages index (try noble-updates
         # first, then fall back to the noble release pocket).
+        # Note: awk must NOT use 'exit' here -- under set -o pipefail an
+        # early exit causes zcat to receive SIGPIPE and fail the pipeline.
         for SUITE in noble-updates noble; do
             PACKAGES_URL="http://ports.ubuntu.com/ubuntu-ports/dists/${SUITE}/main/binary-arm64/Packages.gz"
             DEB_PATH=$(curl -sL "$PACKAGES_URL" | zcat | \
-                awk '/^Package: grub-efi-arm64-bin$/{found=1} found && /^Filename:/{print $2; exit}')
+                awk '/^Package: grub-efi-arm64-bin$/{found=1} found && /^Filename:/ && !done{print $2; done=1}')
             [ -n "$DEB_PATH" ] && break
         done
 
