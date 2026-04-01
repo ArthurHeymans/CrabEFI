@@ -70,7 +70,7 @@ EOF
     aarch64)
         KERN_ARCH="arm64"
         KERN_CROSS="aarch64-linux-gnu-"
-        KERN_IMAGE="arch/arm64/boot/Image.gz"
+        KERN_IMAGE="arch/arm64/boot/Image"
         GRUB_FORMAT="arm64-efi"
         GRUB_OUTPUT="grubaa64.efi"
         GOARCH="arm64"
