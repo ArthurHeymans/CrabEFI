@@ -174,8 +174,11 @@ fn build_qemu_command_aarch64_sbsa(config: &QemuConfig, disk_path: &Path) -> Res
     // Storage configuration
     add_storage_args_aarch64(&mut cmd, config, disk_path);
 
-    // CPU: always use TCG for cross-arch (no KVM on non-native)
-    cmd.args(["-cpu", "max"]);
+    // CPU: use Neoverse V1 (ARMv8.4-A with RNDR).  The "max" model
+    // advertises features (e.g. FEAT_GCS) whose system registers QEMU
+    // doesn't fully implement, causing undefined-instruction faults in
+    // early Linux boot code that probes ID registers.
+    cmd.args(["-cpu", "neoverse-v1"]);
 
     // Debug options
     cmd.args(["-d", "guest_errors"]);
@@ -771,8 +774,8 @@ fn run_qemu_with_capture_aarch64_sbsa(
     // Storage configuration
     add_storage_args_aarch64(&mut cmd, config, disk_path);
 
-    // CPU: always TCG for cross-arch
-    cmd.args(["-cpu", "max"]);
+    // CPU: use Neoverse V1 (see above)
+    cmd.args(["-cpu", "neoverse-v1"]);
 
     cmd.args(["-d", "guest_errors"]);
 

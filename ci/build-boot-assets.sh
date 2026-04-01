@@ -58,6 +58,7 @@ case "$ARCH" in
         GRUB_OUTPUT="grubx64.efi"
         GOARCH="amd64"
         CONSOLE="ttyS0,115200"
+        EARLYCON=""
         # GRUB serial module for 8250 UART
         GRUB_SERIAL_MODULES="serial"
         GRUB_SERIAL_CFG=$(cat <<'EOF'
@@ -69,12 +70,24 @@ EOF
         ;;
     aarch64)
         KERN_ARCH="arm64"
-        KERN_CROSS="aarch64-linux-gnu-"
+        # Detect cross-compiler: Debian/Ubuntu use "aarch64-linux-gnu-",
+        # NixOS and some distros use "aarch64-unknown-linux-gnu-".
+        if command -v aarch64-linux-gnu-gcc >/dev/null 2>&1; then
+            KERN_CROSS="aarch64-linux-gnu-"
+        elif command -v aarch64-unknown-linux-gnu-gcc >/dev/null 2>&1; then
+            KERN_CROSS="aarch64-unknown-linux-gnu-"
+        else
+            echo "Error: no aarch64 cross-compiler found" >&2
+            exit 1
+        fi
         KERN_IMAGE="arch/arm64/boot/Image"
         GRUB_FORMAT="arm64-efi"
         GRUB_OUTPUT="grubaa64.efi"
         GOARCH="arm64"
         CONSOLE="ttyAMA0,115200"
+        # earlycon provides serial output before ACPI/DTB device
+        # discovery; QEMU sbsa-ref has PL011 at 0x60000000.
+        EARLYCON="earlycon=pl011,mmio32,0x60000000"
         # aarch64 QEMU uses PL011 UART which works through EFI console;
         # no GRUB serial module needed.
         GRUB_SERIAL_MODULES=""
@@ -162,7 +175,8 @@ else
                 --enable  EARLY_PRINTK          \
                 --enable  IRQCHIP               \
                 --enable  ARM_GIC_V3            \
-                --enable  ARM_ARCH_TIMER
+                --enable  ARM_ARCH_TIMER        \
+                --disable ARM64_GCS
             ;;
     esac
 
@@ -277,7 +291,7 @@ else
         fi
         cat <<GRUBCFG
 search --no-floppy --set=root --file /vmlinuz
-linux /vmlinuz console=${CONSOLE} nokaslr panic=5 rdinit=/bbin/echo UROOT_BOOT_SUCCESS
+linux /vmlinuz console=${CONSOLE} ${EARLYCON} nokaslr panic=5 rdinit=/bbin/echo UROOT_BOOT_SUCCESS
 initrd /initramfs.cpio
 boot
 GRUBCFG
@@ -312,7 +326,7 @@ set timeout=0
 set default=0
 
 menuentry "Linux" {
-    linux /vmlinuz console=${CONSOLE} nokaslr panic=5 rdinit=/bbin/echo UROOT_BOOT_SUCCESS
+    linux /vmlinuz console=${CONSOLE} ${EARLYCON} nokaslr panic=5 rdinit=/bbin/echo UROOT_BOOT_SUCCESS
     initrd /initramfs.cpio
 }
 GRUBCFG

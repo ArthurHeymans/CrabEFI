@@ -1198,6 +1198,7 @@ extern "efiapi" fn load_image(
                 entry.image_base = loaded_image.image_base;
                 entry.image_size = loaded_image.image_size;
                 entry.entry_point = loaded_image.entry_point;
+                entry.alloc_base = loaded_image.alloc_base;
                 entry.num_pages = loaded_image.num_pages;
                 entry.parent_handle = parent_image_handle;
                 true
@@ -1356,7 +1357,7 @@ extern "efiapi" fn unload_image(image_handle: Handle) -> Status {
             .iter_mut()
             .find(|entry| entry.handle == image_handle)
             .map(|entry| {
-                let result = (entry.image_base, entry.num_pages);
+                let result = (entry.alloc_base, entry.num_pages);
                 // Clear the entry
                 *entry = LoadedImageEntry::empty();
                 result
@@ -1364,13 +1365,14 @@ extern "efiapi" fn unload_image(image_handle: Handle) -> Status {
     });
 
     match image_info {
-        Some((image_base, num_pages)) => {
-            // Free the image memory
-            let status = allocator::free_pages(image_base, num_pages);
+        Some((alloc_base, num_pages)) => {
+            // Free the image memory (using alloc_base, not image_base,
+            // since the image may have been aligned within the allocation)
+            let status = allocator::free_pages(alloc_base, num_pages);
             if status != Status::SUCCESS {
                 log::warn!(
                     "BS.UnloadImage: Failed to free pages at {:#x}: {:?}",
-                    image_base,
+                    alloc_base,
                     status
                 );
             }

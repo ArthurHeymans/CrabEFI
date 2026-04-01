@@ -353,13 +353,15 @@ pub fn parse_headers(data: &[u8]) -> Result<PeHeaders<'_>, Status> {
 
 /// Loaded PE image information
 pub struct LoadedImage {
-    /// Base address where image was loaded
+    /// Base address where image was loaded (aligned to section_alignment)
     pub image_base: u64,
     /// Size of the loaded image in bytes
     pub image_size: u64,
     /// Entry point address
     pub entry_point: u64,
-    /// Number of pages allocated
+    /// Base address of the underlying page allocation (for free_pages)
+    pub alloc_base: u64,
+    /// Number of pages allocated (covers alignment padding + image)
     pub num_pages: u64,
 }
 
@@ -533,15 +535,24 @@ pub fn load_image(data: &[u8]) -> Result<LoadedImage, Status> {
         return Err(Status::INVALID_PARAMETER);
     }
 
-    // Allocate memory for the image
-    let num_pages = (image_size as u64).div_ceil(PAGE_SIZE);
-    let mut load_addr = 0u64;
+    // Allocate memory for the image, respecting section alignment.
+    // ARM64 PE images (e.g. Linux) typically require 64k alignment
+    // (section_alignment = 0x10000).  Over-allocate so we can align
+    // the load address upward within the allocation.
+    let section_alignment = opt_header.section_alignment as u64;
+    let extra_align = if section_alignment > PAGE_SIZE {
+        section_alignment
+    } else {
+        0
+    };
+    let num_pages = (image_size as u64 + extra_align).div_ceil(PAGE_SIZE);
+    let mut alloc_base = 0u64;
 
     let status = allocator::allocate_pages(
         AllocateType::AllocateAnyPages,
         MemoryType::LoaderCode,
         num_pages,
-        &mut load_addr,
+        &mut alloc_base,
     );
 
     if status != Status::SUCCESS {
@@ -549,12 +560,26 @@ pub fn load_image(data: &[u8]) -> Result<LoadedImage, Status> {
         return Err(status);
     }
 
-    log::debug!("PE: Allocated {} pages at {:#x}", num_pages, load_addr);
+    // Align the load address up to section_alignment within the allocation
+    let load_addr = if section_alignment > PAGE_SIZE {
+        (alloc_base + section_alignment - 1) & !(section_alignment - 1)
+    } else {
+        alloc_base
+    };
 
-    // Zero the full allocation (including any tail bytes from page rounding)
-    let alloc_size = num_pages as usize * 4096;
-    // Safety: load_addr is valid and we allocated num_pages * PAGE_SIZE bytes
-    unsafe { core::slice::from_raw_parts_mut(load_addr as *mut u8, alloc_size).fill(0) };
+    log::debug!(
+        "PE: Allocated {} pages at {:#x}, load_addr={:#x} (section_align={:#x})",
+        num_pages,
+        alloc_base,
+        load_addr,
+        section_alignment
+    );
+
+    // Zero the image region (load_addr may be offset from alloc_base due to
+    // section alignment, so we must not zero more than image_size bytes here).
+    // Safety: load_addr..load_addr+image_size is within the allocated region
+    // [alloc_base..alloc_base + num_pages * PAGE_SIZE].
+    unsafe { core::slice::from_raw_parts_mut(load_addr as *mut u8, image_size as usize).fill(0) };
 
     // Copy headers (already validated size_of_headers fits in both source and dest)
     // Safety: We validated size_of_headers <= data.len() and <= image_size
@@ -697,6 +722,7 @@ pub fn load_image(data: &[u8]) -> Result<LoadedImage, Status> {
         image_base: load_addr,
         image_size: image_size as u64,
         entry_point,
+        alloc_base,
         num_pages,
     })
 }
@@ -868,7 +894,7 @@ pub fn execute_image(
 
 /// Unload a PE image and free its memory
 pub fn unload_image(image: &LoadedImage) -> Status {
-    allocator::free_pages(image.image_base, image.num_pages)
+    allocator::free_pages(image.alloc_base, image.num_pages)
 }
 
 #[cfg(test)]
