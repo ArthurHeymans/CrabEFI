@@ -159,7 +159,10 @@ else
                 --enable  SERIAL_AMBA_PL011     \
                 --enable  SERIAL_AMBA_PL011_CONSOLE \
                 --enable  SERIAL_EARLYCON       \
-                --enable  EARLY_PRINTK
+                --enable  EARLY_PRINTK          \
+                --enable  IRQCHIP               \
+                --enable  ARM_GIC_V3            \
+                --enable  ARM_ARCH_TIMER
             ;;
     esac
 
