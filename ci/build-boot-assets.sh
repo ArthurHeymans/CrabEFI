@@ -17,8 +17,12 @@
 #
 # Dependencies (Ubuntu, aarch64 cross):
 #   apt-get install -y build-essential bc flex bison libelf-dev \
-#       curl xz-utils grub-common grub-efi-arm64-bin gcc-aarch64-linux-gnu \
-#       golang-go
+#       curl xz-utils grub-common gcc-aarch64-linux-gnu golang-go
+#
+# Note: grub-efi-arm64-bin is an arm64-only package on Ubuntu and is
+# not installable on amd64 hosts without multi-arch setup.  This script
+# automatically downloads and extracts the arm64 GRUB modules from
+# Ubuntu ports when cross-compiling.
 
 set -euo pipefail
 
@@ -216,6 +220,46 @@ if [ -f "$OUTPUT_DIR/$GRUB_OUTPUT" ]; then
 else
     echo "==> Building GRUB EFI binary ($GRUB_FORMAT, grub-mkimage)..."
 
+    # ── Ensure GRUB modules for the target arch are available ─────────
+    # On amd64 hosts the arm64-efi modules aren't in the default repos
+    # (grub-efi-arm64-bin is an arm64 package).  When the system module
+    # directory is absent we fetch the .deb from Ubuntu ports and extract
+    # the modules to a temporary directory.
+    GRUB_MODULE_DIR="/usr/lib/grub/${GRUB_FORMAT}"
+    GRUB_DIR_ARG=""
+
+    if [ ! -d "$GRUB_MODULE_DIR" ]; then
+        echo "    GRUB modules for ${GRUB_FORMAT} not found at ${GRUB_MODULE_DIR}"
+        echo "    Downloading from Ubuntu ports..."
+        GRUB_TMP="$(mktemp -d)"
+
+        # Look up the .deb path from the Packages index (try noble-updates
+        # first, then fall back to the noble release pocket).
+        for SUITE in noble-updates noble; do
+            PACKAGES_URL="http://ports.ubuntu.com/ubuntu-ports/dists/${SUITE}/main/binary-arm64/Packages.gz"
+            DEB_PATH=$(curl -sL "$PACKAGES_URL" | zcat | \
+                awk '/^Package: grub-efi-arm64-bin$/{found=1} found && /^Filename:/{print $2; exit}')
+            [ -n "$DEB_PATH" ] && break
+        done
+
+        if [ -z "$DEB_PATH" ]; then
+            echo "Error: could not find grub-efi-arm64-bin in Ubuntu ports" >&2
+            exit 1
+        fi
+
+        curl -sL "http://ports.ubuntu.com/ubuntu-ports/${DEB_PATH}" \
+            -o "$GRUB_TMP/grub-arm64.deb"
+        dpkg-deb -x "$GRUB_TMP/grub-arm64.deb" "$GRUB_TMP/root"
+        GRUB_MODULE_DIR="$GRUB_TMP/root/usr/lib/grub/arm64-efi"
+
+        if [ ! -d "$GRUB_MODULE_DIR" ]; then
+            echo "Error: GRUB modules not found in extracted package" >&2
+            exit 1
+        fi
+        echo "    Extracted GRUB modules to ${GRUB_MODULE_DIR}"
+        GRUB_DIR_ARG="-d ${GRUB_MODULE_DIR}"
+    fi
+
     # Write the early config that gets *embedded* inside the core image.
     # We deliberately skip the 'normal' module because its module-probing
     # behaviour tries to load .mod files from disk/memdisk.  Without
@@ -240,6 +284,7 @@ GRUBCFG
         --output="$OUTPUT_DIR/$GRUB_OUTPUT"             \
         --prefix=''                                     \
         --config="$GRUB_CFG"                            \
+        $GRUB_DIR_ARG                                   \
         linux fat part_gpt                              \
         search search_fs_file                           \
         terminal echo boot                              \
