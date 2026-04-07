@@ -10,8 +10,6 @@ use core::ffi::c_void;
 use r_efi::efi::{Guid, Status};
 
 use crate::drivers::serial;
-#[cfg(target_arch = "x86_64")]
-use crate::drivers::serial::COM1;
 use crate::efi::utils::allocate_protocol_with_log;
 
 /// Serial IO Protocol GUID
@@ -295,9 +293,6 @@ pub fn create_protocol() -> *mut Protocol {
         return ptr;
     }
 
-    #[cfg(target_arch = "x86_64")]
-    log::info!("SerialIoProtocol created (COM1 @ {:#x})", COM1);
-    #[cfg(not(target_arch = "x86_64"))]
-    log::info!("SerialIoProtocol created (MMIO serial)");
+    log::info!("SerialIoProtocol created");
     ptr
 }

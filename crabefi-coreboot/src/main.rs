@@ -199,7 +199,7 @@ pub extern "C" fn rust_main(coreboot_table_ptr: u64) -> ! {
     // Phase 4: Initialize serial and logging
     // ================================================================
     if let Some(ref serial) = cb_info.serial {
-        crabefi::drivers::serial::init_from_coreboot(serial.baseaddr, serial.baud, serial.mmio());
+        crabefi::drivers::serial::init_from_coreboot(serial);
     }
 
     // Initialize logging (idempotent — init_platform() will call it again).
@@ -331,10 +331,13 @@ pub extern "C" fn rust_main(coreboot_table_ptr: u64) -> ! {
 fn log_coreboot_info(cb_info: &crabefi::coreboot::CorebootInfo) {
     log::info!("Parsed coreboot tables:");
     if let Some(ref serial) = cb_info.serial {
+        let type_str = if serial.mmio() { "MMIO" } else { "I/O" };
         log::info!(
-            "  Serial: port={:#x}, baud={}",
+            "  Serial: type={}, base={:#x}, baud={}, regwidth={}",
+            type_str,
             serial.baseaddr,
-            serial.baud
+            serial.baud,
+            serial.regwidth
         );
     } else {
         log::info!("  Serial: not available");
