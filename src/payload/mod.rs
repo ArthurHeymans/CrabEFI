@@ -301,6 +301,20 @@ unsafe fn jump_to_payload(entry: u64, cbtable: *const u8) -> ! {
             options(noreturn)
         );
     }
+
+    #[cfg(target_arch = "riscv64")]
+    // Safety: caller guarantees payload is loaded and entry is valid.
+    unsafe {
+        // RISC-V: pass hart_id in a0, FDT/cbtable pointer in a1
+        core::arch::asm!(
+            "mv a0, zero",          // hart_id = 0
+            "mv a1, {cbtable}",     // coreboot table pointer
+            "jr {entry}",
+            cbtable = in(reg) cbtable as u64,
+            entry = in(reg) entry,
+            options(noreturn)
+        );
+    }
 }
 
 /// Determine payload format from file extension

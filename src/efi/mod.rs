@@ -16,6 +16,8 @@ pub mod system_table;
 pub mod utils;
 pub mod varstore;
 
+#[cfg(target_arch = "riscv64")]
+use r_efi::efi::Guid;
 use r_efi::efi::{self, Status};
 
 /// Initialize the EFI environment from platform configuration.
@@ -141,6 +143,8 @@ fn install_standard_protocols_and_finalize() {
     init_serial_io();
     init_rng();
     init_console_control();
+    #[cfg(target_arch = "riscv64")]
+    init_riscv_boot_protocol();
     system_table::install_memory_attributes_table();
     system_table::dump_configuration_tables();
     system_table::update_crc32();
@@ -434,6 +438,104 @@ fn init_graphics_output_on_handle(
     log::debug!("GOP protocol installed on console handle {:?}", handle);
 }
 
+// ============================================================================
+// RISC-V EFI Boot Protocol
+// ============================================================================
+
+/// Boot hart ID saved by the platform entry point before calling the library.
+///
+/// Stored as an `AtomicU64` so `riscv_get_boot_hartid` can read it without
+/// `unsafe`.  Written once at entry (before any UEFI code runs) and then
+/// only ever read.
+#[cfg(target_arch = "riscv64")]
+static RISCV_BOOT_HARTID: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Set the boot hart ID from the platform entry point.
+///
+/// Must be called before `init_platform()` installs the RISC-V EFI Boot
+/// Protocol so the correct value is visible to `riscv_get_boot_hartid`.
+#[cfg(target_arch = "riscv64")]
+pub fn set_boot_hartid(hartid: u64) {
+    RISCV_BOOT_HARTID.store(hartid, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// RISCV_EFI_BOOT_PROTOCOL GUID
+/// {ccd15fec-6f73-4eec-8395-3e69e4b940bf}
+#[cfg(target_arch = "riscv64")]
+const RISCV_EFI_BOOT_PROTOCOL_GUID: Guid = Guid::from_fields(
+    0xccd15fec,
+    0x6f73,
+    0x4eec,
+    0x83,
+    0x95,
+    &[0x3e, 0x69, 0xe4, 0xb9, 0x40, 0xbf],
+);
+
+/// RISC-V EFI Boot Protocol structure.
+///
+/// This protocol provides the boot hart ID to the Linux EFI stub.
+/// The struct layout must match what Linux expects:
+///   `{ u64 revision; efi_status_t (*get_boot_hartid)(this, *hartid); }`
+#[cfg(target_arch = "riscv64")]
+#[repr(C)]
+struct RiscvEfiBootProtocol {
+    revision: u64,
+    get_boot_hartid:
+        extern "efiapi" fn(this: *const RiscvEfiBootProtocol, boot_hartid: *mut u64) -> Status,
+}
+
+#[cfg(target_arch = "riscv64")]
+extern "efiapi" fn riscv_get_boot_hartid(
+    _this: *const RiscvEfiBootProtocol,
+    boot_hartid: *mut u64,
+) -> Status {
+    if boot_hartid.is_null() {
+        return Status::INVALID_PARAMETER;
+    }
+    // Read the hart ID that was saved at firmware entry from OpenSBI's a0.
+    // SAFETY: caller guarantees boot_hartid is a valid pointer.
+    unsafe {
+        *boot_hartid = RISCV_BOOT_HARTID.load(core::sync::atomic::Ordering::Relaxed);
+    }
+    Status::SUCCESS
+}
+
+/// Static instance of the RISC-V boot protocol.
+#[cfg(target_arch = "riscv64")]
+static RISCV_BOOT_PROTOCOL: RiscvEfiBootProtocol = RiscvEfiBootProtocol {
+    revision: 1,
+    get_boot_hartid: riscv_get_boot_hartid,
+};
+
+/// Install the RISC-V EFI Boot Protocol.
+///
+/// Linux's EFI stub uses this to discover the boot hart ID.
+#[cfg(target_arch = "riscv64")]
+fn init_riscv_boot_protocol() {
+    let handle = match boot_services::create_handle() {
+        Some(h) => h,
+        None => {
+            log::error!("Failed to create RISC-V boot protocol handle");
+            return;
+        }
+    };
+
+    let protocol_ptr = &RISCV_BOOT_PROTOCOL as *const RiscvEfiBootProtocol;
+    let status = boot_services::install_protocol(
+        handle,
+        &RISCV_EFI_BOOT_PROTOCOL_GUID,
+        protocol_ptr as *mut core::ffi::c_void,
+    );
+    if status != Status::SUCCESS {
+        log::error!("Failed to install RISC-V boot protocol: {:?}", status);
+        return;
+    }
+    log::info!(
+        "RISC-V EFI Boot Protocol installed (hart_id={})",
+        RISCV_BOOT_HARTID.load(core::sync::atomic::Ordering::Relaxed)
+    );
+}
+
 /// Get the EFI system table pointer
 pub fn get_system_table() -> *mut efi::SystemTable {
     system_table::get_system_table_efi()
@@ -513,11 +615,11 @@ pub fn free_pages(memory: &mut [u8], num_pages: u64) {
 /// ExitBootServices — any MMIO not in the map is unmapped and inaccessible.
 ///
 /// Critical regions:
-/// - GIC distributor/redistributor (for interrupts)
-/// - UART PL011 (for earlycon/console)  
+/// - GIC distributor/redistributor (for interrupts) / PLIC (RISC-V)
+/// - UART PL011/16550 (for earlycon/console)
 /// - Peripherals (RTC, GPIO, etc.)
 /// - PCIe MMIO windows (for PCI device access)
-#[cfg(target_arch = "aarch64")]
+#[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
 pub fn add_platform_mmio_regions() {
     use allocator::{MemoryType, PAGE_SIZE};
 
@@ -538,7 +640,9 @@ pub fn add_platform_mmio_regions() {
     // Try to get platform info from FDT (if available)
     let plat = crate::state::drivers().fdt_info;
 
-    // GIC — from FDT or SBSA default
+    // Interrupt controller — from FDT only (GIC on aarch64, PLIC on riscv64).
+    // The `gicd` field is reused for PLIC on RISC-V (see fdt.rs:extract_gic).
+    // No fallback: a wrong hardcoded address is worse than a missing entry.
     if let Some((base, size)) = plat.gicd {
         let total = if let Some((rb, rsize)) = plat.gicr {
             // Cover GICD + GICR as one contiguous block if adjacent,
@@ -553,42 +657,40 @@ pub fn add_platform_mmio_regions() {
         } else {
             size
         };
-        add_mmio(base, total, "GIC");
+        add_mmio(base, total, "GIC/PLIC");
     } else {
-        // SBSA default
-        add_mmio(0x4006_0000, 0xA_0000, "GIC");
+        log::warn!("add_platform_mmio_regions: no interrupt controller found in FDT");
     }
 
-    // Peripherals — SBSA default only (FDT platforms get UART from coreboot serial)
-    if plat.gicd.is_none() {
-        // SBSA: Peripherals block (UART, RTC, GPIO, AHCI, EHCI) 0x60000000-0x60200000
-        add_mmio(
-            0x6000_0000,
-            0x20_0000,
-            "Peripherals (UART/RTC/GPIO/AHCI/EHCI)",
-        );
-    }
-
-    // PCIe PIO — from FDT or SBSA default
+    // PCIe PIO — from FDT only.
     if let Some((base, size)) = plat.pcie_pio {
         add_mmio(base, size, "PCIe PIO");
-    } else if plat.gicd.is_none() {
-        add_mmio(0x7FFF_0000, 0x1_0000, "PCIe PIO");
     }
 
-    // PCIe 32-bit MMIO — from FDT or SBSA default
+    // PCIe 32-bit MMIO — from FDT only.
     if let Some((base, size)) = plat.pcie_mmio32 {
         add_mmio(base, size, "PCIe MMIO32");
-    } else if plat.gicd.is_none() {
-        add_mmio(0x8000_0000, 0x7000_0000, "PCIe MMIO");
     }
 
     // PCIe 64-bit MMIO (if from FDT)
+    //
+    // Skip on RISC-V: OpenSBI 1.1's PMP configuration does not cover the
+    // 64-bit MMIO range (e.g. 0x3_0000_0000+), so S-mode accesses there
+    // fault.  All PCI BARs are placed in the 32-bit window instead.
+    // Adding the (often 16 GB) region also bloats the EFI memory map.
+    #[cfg(not(target_arch = "riscv64"))]
     if let Some((base, size)) = plat.pcie_mmio64 {
         add_mmio(base, size, "PCIe MMIO64");
     }
 
     // PCIe ECAM — from FDT
+    //
+    // On RISC-V QEMU virt the ECAM range (0x3000_0000-0x4000_0000) is
+    // already in coreboot's memory map as Reserved.  Adding a duplicate
+    // MMIO entry for the same address creates an overlap that confuses
+    // the Linux kernel's early memory-map processing.  Only add ECAM
+    // when the coreboot map does not already cover it (aarch64 SBSA).
+    #[cfg(not(target_arch = "riscv64"))]
     if let Some(base) = plat.ecam_base
         && let Some(size) = plat.ecam_size
     {

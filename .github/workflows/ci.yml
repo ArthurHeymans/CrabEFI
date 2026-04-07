@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main, master, SBSA]
+    branches: [main, master, SBSA, RISCV64]
   pull_request:
     branches: [main, master]
 
@@ -515,3 +515,180 @@ jobs:
 
       - name: Run integration tests (NVMe, aarch64/virt)
         run: ./crabefi test --arch aarch64 --machine virt --app hello --nvme --disable-kvm --timeout 120
+
+  # ── riscv64 ──────────────────────────────────────────────────────────
+
+  clippy-riscv64:
+    name: Clippy (riscv64)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: clippy, rust-src
+          targets: riscv64gc-unknown-none-elf
+
+      - name: Run clippy
+        run: cargo clippy --workspace --release --target riscv64gc-unknown-none-elf -- -D warnings
+
+  build-riscv64:
+    name: Build (riscv64)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src, llvm-tools-preview
+          targets: riscv64gc-unknown-none-elf
+
+      - name: Build release
+        run: cargo build -p crabefi-coreboot --release --target riscv64gc-unknown-none-elf
+
+      - name: Show ELF info
+        run: |
+          ELF=target/riscv64gc-unknown-none-elf/release/crabefi
+          file "$ELF"
+          size "$ELF"
+
+      - name: ELF to PE/COFF conversion (experimental)
+        continue-on-error: true
+        run: |
+          # Rust has no riscv64gc-unknown-uefi target, so UEFI binaries
+          # must be produced by converting the ELF to PE/COFF.  This uses
+          # llvm-objcopy from the Rust toolchain (LLVM 18+, which added
+          # pei-riscv64-little support).
+          LLVM_OBJCOPY=$(rustc --print sysroot)/lib/rustlib/x86_64-unknown-linux-gnu/bin/llvm-objcopy
+          if [ ! -x "$LLVM_OBJCOPY" ]; then
+            LLVM_OBJCOPY=$(which llvm-objcopy 2>/dev/null || true)
+          fi
+          ELF=target/riscv64gc-unknown-none-elf/release/crabefi
+          PE="${ELF}.efi"
+          if [ -n "$LLVM_OBJCOPY" ] && [ -x "$LLVM_OBJCOPY" ]; then
+            echo "Using: $($LLVM_OBJCOPY --version | head -1)"
+            "$LLVM_OBJCOPY" \
+              --output-target=pei-riscv64-little \
+              --subsystem=efi-application \
+              "$ELF" "$PE" && \
+            echo "PE/COFF created: $(stat -c%s "$PE") bytes" && \
+            file "$PE" || \
+            echo "::warning::llvm-objcopy pei-riscv64-little failed (LLVM may be too old)"
+          else
+            echo "::warning::llvm-objcopy not found, skipping PE/COFF conversion"
+          fi
+
+      - name: Upload CrabEFI ELF (riscv64)
+        uses: actions/upload-artifact@v4
+        with:
+          name: crabefi-elf-riscv64
+          path: target/riscv64gc-unknown-none-elf/release/crabefi
+          retention-days: 7
+
+  # riscv64 boot test with QEMU
+  # No UEFI test apps (no riscv64gc-unknown-uefi target) — verifies CrabEFI
+  # boots and initializes on coreboot + OpenSBI + QEMU virt.
+  test-boot-riscv64:
+    name: Test riscv64 (Boot)
+    runs-on: ubuntu-latest
+    needs: build-riscv64
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchains
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src
+          targets: riscv64gc-unknown-none-elf
+
+      - name: Install stable toolchain for xtask
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qemu-system-misc mtools dosfstools zstd coreboot-utils binutils-riscv64-linux-gnu
+
+      - name: Download CrabEFI ELF (riscv64)
+        uses: actions/download-artifact@v4
+        with:
+          name: crabefi-elf-riscv64
+          path: target/riscv64gc-unknown-none-elf/release/
+
+      - name: Run integration test (riscv64/virt)
+        run: ./crabefi test --arch riscv64 --app hello --disable-kvm --timeout 120
+
+  build-boot-assets-riscv64:
+    name: Build Boot Assets riscv64 (GRUB + Linux)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Restore cached boot assets
+        id: cache
+        uses: actions/cache@v4
+        with:
+          path: boot-assets/riscv64
+          key: boot-assets-riscv64-${{ hashFiles('ci/build-boot-assets.sh') }}
+
+      - name: Set up Go (for u-root)
+        if: steps.cache.outputs.cache-hit != 'true'
+        uses: actions/setup-go@v5
+        with:
+          go-version: 'stable'
+
+      - name: Install kernel build dependencies
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential bc flex bison libelf-dev \
+              curl xz-utils grub-common gcc-riscv64-linux-gnu
+
+      - name: Build boot assets
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: ci/build-boot-assets.sh --arch riscv64
+
+      - name: Upload boot assets
+        uses: actions/upload-artifact@v4
+        with:
+          name: boot-assets-riscv64
+          path: boot-assets/riscv64/
+          retention-days: 7
+
+  test-grub-linux-riscv64:
+    name: Test riscv64 (GRUB + Linux)
+    runs-on: ubuntu-latest
+    needs: [build-riscv64, build-boot-assets-riscv64]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchains
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src
+          targets: riscv64gc-unknown-none-elf
+
+      - name: Install stable toolchain for xtask
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qemu-system-misc mtools dosfstools zstd coreboot-utils binutils-riscv64-linux-gnu
+
+      - name: Download CrabEFI ELF (riscv64)
+        uses: actions/download-artifact@v4
+        with:
+          name: crabefi-elf-riscv64
+          path: target/riscv64gc-unknown-none-elf/release/
+
+      - name: Download boot assets
+        uses: actions/download-artifact@v4
+        with:
+          name: boot-assets-riscv64
+          path: boot-assets/riscv64/
+
+      - name: Run GRUB + Linux boot-chain test (riscv64/virt)
+        run: ./crabefi test --arch riscv64 --app grub-linux --boot-assets-dir boot-assets/riscv64 --disable-kvm --timeout 180

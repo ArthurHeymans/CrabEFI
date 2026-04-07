@@ -94,6 +94,13 @@ pub(crate) fn read_rtc_time() -> (u16, u8, u8, u8, u8, u8) {
         log::debug!("RTC: aarch64 PL031 not yet implemented, using fallback time");
         (2025, 1, 1, 0, 0, 0)
     }
+    #[cfg(target_arch = "riscv64")]
+    {
+        // RISC-V has no standard RTC interface accessible from S-mode.
+        // The goldfish-rtc or similar would require FDT parsing.
+        log::debug!("RTC: RISC-V RTC not yet implemented, using fallback time");
+        (2025, 1, 1, 0, 0, 0)
+    }
 }
 
 /// x86 CMOS RTC implementation

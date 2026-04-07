@@ -23,12 +23,17 @@ const EM_X86_64: u16 = 62;
 /// ELF machine: AArch64
 #[cfg(target_arch = "aarch64")]
 const EM_AARCH64: u16 = 183;
+/// ELF machine: RISC-V
+#[cfg(target_arch = "riscv64")]
+const EM_RISCV: u16 = 243;
 
 /// ELF machine type for the current target architecture
 #[cfg(target_arch = "x86_64")]
 const EM_NATIVE: u16 = EM_X86_64;
 #[cfg(target_arch = "aarch64")]
 const EM_NATIVE: u16 = EM_AARCH64;
+#[cfg(target_arch = "riscv64")]
+const EM_NATIVE: u16 = EM_RISCV;
 
 /// Program header type: loadable segment
 const PT_LOAD: u32 = 1;

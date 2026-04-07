@@ -313,6 +313,7 @@ fn efi_boot_filename(arch: Arch) -> &'static str {
     match arch {
         Arch::X86_64 => "BOOTX64.EFI",
         Arch::Aarch64 => "BOOTAA64.EFI",
+        Arch::Riscv64 => "BOOTRISCV64.EFI",
     }
 }
 

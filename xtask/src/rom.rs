@@ -42,6 +42,7 @@ pub fn prepare_rom(
         (Arch::X86_64, _) => prepare_rom_x86_64(crabefi_elf, output_dir),
         (Arch::Aarch64, Machine::Sbsa) => prepare_rom_aarch64_sbsa(crabefi_elf, output_dir),
         (Arch::Aarch64, Machine::Virt) => prepare_rom_aarch64_virt(crabefi_elf, output_dir),
+        (Arch::Riscv64, _) => prepare_rom_riscv64(crabefi_elf, output_dir),
     }
 }
 
@@ -235,11 +236,51 @@ fn inject_crabefi_payload(rom_path: &Path, crabefi_elf: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Prepare riscv64 (QEMU virt) firmware — single coreboot ROM (OpenSBI embedded)
+fn prepare_rom_riscv64(crabefi_elf: &Path, output_dir: &Path) -> Result<PreparedFirmware> {
+    let compressed_rom = project_root().join("firmware/coreboot-qemu-riscv64.rom.zst");
+
+    if !compressed_rom.exists() {
+        bail!(
+            "Base coreboot riscv64 ROM not found: {}\n\
+            Please ensure firmware/coreboot-qemu-riscv64.rom.zst exists",
+            compressed_rom.display()
+        );
+    }
+
+    let output_rom = output_dir.join("coreboot-riscv64.rom");
+
+    // Decompress the ROM
+    println!("Decompressing coreboot riscv64 ROM...");
+    let status = Command::new("zstd")
+        .args(["-d", "-f"])
+        .arg(&compressed_rom)
+        .arg("-o")
+        .arg(&output_rom)
+        .status()
+        .context("Failed to run zstd. Is it installed?")?;
+
+    if !status.success() {
+        bail!("Failed to decompress coreboot riscv64 ROM");
+    }
+
+    inject_crabefi_payload(&output_rom, crabefi_elf)?;
+
+    println!("Firmware prepared:");
+    println!("  coreboot ROM: {}", output_rom.display());
+
+    Ok(PreparedFirmware {
+        coreboot_rom: output_rom,
+        tfa_flash: None,
+    })
+}
+
 /// Get the path to the CrabEFI ELF
 pub fn get_crabefi_elf(arch: Arch) -> PathBuf {
     let target_triple = match arch {
         Arch::X86_64 => "x86_64-unknown-none",
         Arch::Aarch64 => "aarch64-unknown-none",
+        Arch::Riscv64 => "riscv64gc-unknown-none-elf",
     };
     project_root().join(format!("target/{}/release/crabefi", target_triple))
 }

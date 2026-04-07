@@ -33,6 +33,9 @@ pub const PAGE_SIZE_USIZE: usize = 4096;
 const MAX_IDENTITY_MAPPED_ADDRESS: u64 = 0x10_0000_0000; // 64GB
 #[cfg(target_arch = "aarch64")]
 const MAX_IDENTITY_MAPPED_ADDRESS: u64 = u64::MAX;
+/// On riscv64: No MMU (satp=0), identity mapped — no limit needed.
+#[cfg(target_arch = "riscv64")]
+const MAX_IDENTITY_MAPPED_ADDRESS: u64 = u64::MAX;
 
 /// EFI memory allocation types
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

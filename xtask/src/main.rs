@@ -20,7 +20,7 @@ mod disk;
 mod qemu;
 mod rom;
 
-use anyhow::Result;
+use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
@@ -38,6 +38,7 @@ fn project_root() -> &'static Path {
 pub enum Arch {
     X86_64,
     Aarch64,
+    Riscv64,
 }
 
 impl Arch {
@@ -46,6 +47,7 @@ impl Arch {
         match self {
             Arch::X86_64 => "x86_64",
             Arch::Aarch64 => "aarch64",
+            Arch::Riscv64 => "riscv64",
         }
     }
 }
@@ -273,6 +275,7 @@ fn cmd_build(release: bool, ui: bool, arch: Arch, machine: Machine) -> Result<()
         (Arch::X86_64, _) => "x86_64".to_string(),
         (Arch::Aarch64, Machine::Sbsa) => "aarch64/sbsa".to_string(),
         (Arch::Aarch64, Machine::Virt) => "aarch64/virt".to_string(),
+        (Arch::Riscv64, _) => "riscv64".to_string(),
     };
     println!("Building CrabEFI ({})...", label);
 
@@ -293,18 +296,24 @@ fn cmd_build(release: bool, ui: bool, arch: Arch, machine: Machine) -> Result<()
     let target_triple = match arch {
         Arch::X86_64 => "x86_64-unknown-none",
         Arch::Aarch64 => "aarch64-unknown-none",
+        Arch::Riscv64 => "riscv64gc-unknown-none-elf",
     };
     cmd.arg("--target").arg(target_triple);
 
-    // aarch64-specific: set PAYLOAD_BASE for the linker script.
-    // SBSA: DRAM at 1TB, payload above ramstage.
-    // Virt: DRAM at 1GB, payload above ramstage.
-    if matches!(arch, Arch::Aarch64) {
-        let payload_base = match machine {
-            Machine::Sbsa => "0x10022000000",
-            Machine::Virt => "0x62000000",
-        };
-        cmd.env("PAYLOAD_BASE", payload_base);
+    // Architecture-specific: set PAYLOAD_BASE for the linker script.
+    match arch {
+        Arch::Aarch64 => {
+            let payload_base = match machine {
+                Machine::Sbsa => "0x10022000000",
+                Machine::Virt => "0x62000000",
+            };
+            cmd.env("PAYLOAD_BASE", payload_base);
+        }
+        Arch::Riscv64 => {
+            // QEMU virt: DRAM at 0x80000000, payload at 0x81000000 (16MB in)
+            cmd.env("PAYLOAD_BASE", "0x81000000");
+        }
+        _ => {}
     }
 
     cmd.current_dir(project_root);
@@ -485,6 +494,7 @@ fn cmd_test(
         let grub_efi_name = match arch {
             Arch::X86_64 => "grubx64.efi",
             Arch::Aarch64 => "grubaa64.efi",
+            Arch::Riscv64 => "grubriscv64.efi",
         };
         let grub_efi = assets_dir.join(grub_efi_name);
         let kernel = assets_dir.join("vmlinuz");
@@ -559,6 +569,14 @@ fn cmd_build_test_app(name: &str, arch: Arch) -> Result<()> {
         Arch::Aarch64 => {
             cmd.arg("--target").arg("aarch64-unknown-uefi");
         }
+        Arch::Riscv64 => {
+            // No riscv64gc-unknown-uefi target in Rust — build as ELF, convert later.
+            cmd.arg("--target").arg("riscv64gc-unknown-none-elf");
+            // Use a linker script that sets ENTRY(efi_main) so the PE entry
+            // point survives the ELF-to-PE/COFF objcopy conversion.
+            let lds = project_root().join("test-apps/riscv64-uefi.lds");
+            cmd.env("RUSTFLAGS", format!("-C link-arg=-T{}", lds.display()));
+        }
     }
 
     cmd.current_dir(&app_dir)
@@ -569,6 +587,14 @@ fn cmd_build_test_app(name: &str, arch: Arch) -> Result<()> {
 
     if !status.success() {
         anyhow::bail!("Build failed");
+    }
+
+    // RISC-V: convert ELF to PE/COFF since there is no riscv64gc-unknown-uefi target.
+    // Uses riscv64 cross-binutils objcopy (riscv64-unknown-linux-gnu-objcopy or
+    // riscv64-linux-gnu-objcopy from binutils-riscv64-linux-gnu on Ubuntu).
+    if matches!(arch, Arch::Riscv64) {
+        let elf_dir = app_dir.join("target/riscv64gc-unknown-none-elf/release");
+        convert_elf_to_pe(&elf_dir)?;
     }
 
     let efi_path = find_test_app_efi(name, arch)?;
@@ -607,11 +633,102 @@ fn cmd_create_disk(output: &str, efi_app: Option<&str>, arch: Arch) -> Result<()
 }
 
 /// Find the .efi file for a test app
+/// Convert RISC-V ELF binaries to PE/COFF (.efi) using cross-binutils objcopy.
+///
+/// Rust has no `riscv64gc-unknown-uefi` target, so test apps are built as ELF
+/// and post-processed into PE/COFF.  The objcopy binary is found by searching
+/// for common names: `riscv64-unknown-linux-gnu-objcopy` (Nix) and
+/// `riscv64-linux-gnu-objcopy` (Ubuntu binutils-riscv64-linux-gnu).
+/// Convert all RISC-V ELF binaries in a release directory to PE/COFF (.efi).
+///
+/// Rust has no `riscv64gc-unknown-uefi` target, so test apps are built as ELF
+/// and post-processed into PE/COFF.  The objcopy binary is found by searching
+/// for common names: `riscv64-unknown-linux-gnu-objcopy` (Nix) and
+/// `riscv64-linux-gnu-objcopy` (Ubuntu binutils-riscv64-linux-gnu).
+fn convert_elf_to_pe(elf_dir: &Path) -> Result<()> {
+    // Find the riscv64 objcopy
+    let objcopy = [
+        "riscv64-unknown-linux-gnu-objcopy",
+        "riscv64-linux-gnu-objcopy",
+    ]
+    .iter()
+    .find_map(|name| {
+        std::process::Command::new("which")
+            .arg(name)
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|_| name.to_string())
+    })
+    .ok_or_else(|| {
+        anyhow::anyhow!(
+            "riscv64 objcopy not found. Install:\n  \
+                 NixOS: nix-shell -p pkgsCross.riscv64.buildPackages.binutils\n  \
+                 Ubuntu: sudo apt-get install binutils-riscv64-linux-gnu"
+        )
+    })?;
+
+    // Find ELF executables (no extension, executable, not .d/.efi/directories)
+    for entry in std::fs::read_dir(elf_dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        // Skip files with extensions (.d, .efi, etc.)
+        if path.extension().is_some() {
+            continue;
+        }
+        // Skip directories and dep-info
+        let name = path.file_name().unwrap().to_string_lossy();
+        if name.starts_with('.')
+            || name == "build"
+            || name == "deps"
+            || name == "examples"
+            || name == "incremental"
+        {
+            continue;
+        }
+
+        // Check it's actually an ELF
+        let mut magic = [0u8; 4];
+        if let Ok(mut f) = std::fs::File::open(&path) {
+            use std::io::Read;
+            if f.read_exact(&mut magic).is_err() || &magic != b"\x7fELF" {
+                continue;
+            }
+        }
+
+        let efi_path = path.with_extension("efi");
+        println!(
+            "Converting ELF to PE/COFF: {} -> {}",
+            path.display(),
+            efi_path.display()
+        );
+        let status = std::process::Command::new(&objcopy)
+            .arg("--output-target=pei-riscv64-little")
+            .arg("--subsystem=10") // IMAGE_SUBSYSTEM_EFI_APPLICATION
+            .arg(&path)
+            .arg(&efi_path)
+            .status()
+            .with_context(|| format!("Failed to run {}", objcopy))?;
+
+        if !status.success() {
+            bail!("ELF to PE/COFF conversion failed for {}", path.display());
+        }
+        println!("Created PE/COFF: {}", efi_path.display());
+    }
+
+    Ok(())
+}
+
 fn find_test_app_efi(name: &str, arch: Arch) -> Result<String> {
     let app_dir = project_root().join("test-apps").join(name);
     let target_triple = match arch {
         Arch::X86_64 => "x86_64-unknown-uefi",
         Arch::Aarch64 => "aarch64-unknown-uefi",
+        // riscv64: ELF built to this target, then converted to .efi
+        Arch::Riscv64 => "riscv64gc-unknown-none-elf",
     };
     let target_dir = app_dir.join(format!("target/{}/release", target_triple));
 

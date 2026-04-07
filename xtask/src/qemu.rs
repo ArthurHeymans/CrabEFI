@@ -76,6 +76,7 @@ fn build_qemu_command(config: &QemuConfig, disk_path: &Path) -> Result<Command> 
         (Arch::X86_64, _) => build_qemu_command_x86_64(config, disk_path),
         (Arch::Aarch64, Machine::Sbsa) => build_qemu_command_aarch64_sbsa(config, disk_path),
         (Arch::Aarch64, Machine::Virt) => build_qemu_command_aarch64_virt(config, disk_path),
+        (Arch::Riscv64, _) => build_qemu_command_riscv64(config, disk_path),
     }
 }
 
@@ -682,6 +683,7 @@ fn run_qemu_with_capture(config: &QemuConfig, disk_path: &Path) -> Result<TestRe
         (Arch::Aarch64, Machine::Virt) => {
             run_qemu_with_capture_aarch64_virt(config, disk_path, timeout)
         }
+        (Arch::Riscv64, _) => run_qemu_with_capture_riscv64(config, disk_path, timeout),
     }
 }
 
@@ -829,6 +831,129 @@ fn run_qemu_with_capture_aarch64_virt(
     let output = cmd
         .output()
         .context("failed to execute QEMU (aarch64-virt) via timeout")?;
+
+    parse_qemu_output(&output)
+}
+
+/// Build QEMU command for riscv64 (QEMU virt)
+fn build_qemu_command_riscv64(config: &QemuConfig, disk_path: &Path) -> Result<Command> {
+    if matches!(config.storage, StorageType::Sdhci) {
+        bail!("SDHCI storage is not supported on riscv64 virt");
+    }
+
+    let mut cmd = Command::new("qemu-system-riscv64");
+
+    // Basic machine setup
+    cmd.args(["-machine", "virt"]);
+    cmd.args(["-m", "1024M"]);
+    cmd.arg("-no-reboot");
+
+    // coreboot ROM: -bios loads bootblock into DRAM at reset vector,
+    // -drive if=pflash maps the ROM as SPI flash for CBFS access.
+    cmd.args(["-bios", &config.coreboot_rom]);
+    cmd.args([
+        "-drive",
+        &format!(
+            "if=pflash,file={},format=raw,readonly=on",
+            config.coreboot_rom
+        ),
+    ]);
+
+    // Serial: 16550 UART to stdio via -nographic
+    cmd.arg("-nographic");
+
+    // Storage configuration
+    add_storage_args_riscv64(&mut cmd, config, disk_path);
+
+    // Debug options
+    cmd.args(["-d", "guest_errors"]);
+
+    // Capture output
+    cmd.stderr(Stdio::piped());
+    cmd.stdout(Stdio::piped());
+
+    Ok(cmd)
+}
+
+/// Add storage arguments for riscv64 (virtio-based)
+fn add_storage_args_riscv64(cmd: &mut Command, config: &QemuConfig, disk_path: &Path) {
+    let disk_path_str = disk_path.to_string_lossy();
+    match config.storage {
+        StorageType::Usb => {
+            cmd.args(["-device", "qemu-xhci,id=xhci"]);
+            cmd.args([
+                "-drive",
+                &format!("file={},if=none,id=usbdisk,format=raw", disk_path_str),
+            ]);
+            cmd.args(["-device", "usb-storage,drive=usbdisk,bus=xhci.0"]);
+        }
+        StorageType::Nvme => {
+            cmd.args([
+                "-drive",
+                &format!(
+                    "file={},if=none,id=nvme0,format=raw,media=disk",
+                    disk_path_str
+                ),
+            ]);
+            cmd.args(["-device", "nvme,serial=deadbeef,drive=nvme0"]);
+        }
+        StorageType::Ahci => {
+            // QEMU virt has no native AHCI; attach via PCI
+            cmd.args(["-device", "ahci,id=ahci0"]);
+            cmd.args([
+                "-drive",
+                &format!("file={},if=none,id=disk0,format=raw", disk_path_str),
+            ]);
+            cmd.args(["-device", "ide-hd,drive=disk0,bus=ahci0.0"]);
+        }
+        StorageType::Sdhci => {
+            unreachable!("SDHCI is not supported on riscv64 virt");
+        }
+    }
+}
+
+/// Run QEMU with capture for riscv64 (QEMU virt)
+fn run_qemu_with_capture_riscv64(
+    config: &QemuConfig,
+    disk_path: &Path,
+    timeout: u64,
+) -> Result<TestResult> {
+    if matches!(config.storage, StorageType::Sdhci) {
+        bail!("SDHCI storage is not supported on riscv64 virt");
+    }
+
+    let mut cmd = Command::new("timeout");
+    cmd.arg("--signal=KILL");
+    cmd.arg(format!("{}s", timeout));
+    cmd.arg("qemu-system-riscv64");
+
+    // Machine setup
+    cmd.args(["-machine", "virt"]);
+    cmd.args(["-m", "1024M"]);
+    cmd.arg("-no-reboot");
+
+    // coreboot ROM: -bios + pflash
+    cmd.args(["-bios", &config.coreboot_rom]);
+    cmd.args([
+        "-drive",
+        &format!(
+            "if=pflash,file={},format=raw,readonly=on",
+            config.coreboot_rom
+        ),
+    ]);
+
+    // Serial: -nographic for 16550 UART to stdio
+    cmd.arg("-nographic");
+
+    // Storage configuration
+    add_storage_args_riscv64(&mut cmd, config, disk_path);
+
+    cmd.args(["-d", "guest_errors"]);
+
+    // Execute and capture output
+    let output = cmd
+        .output()
+        .context("failed to execute QEMU (riscv64) via timeout")?;
 
     parse_qemu_output(&output)
 }
