@@ -54,6 +54,8 @@ const DEFAULT_TIMEOUT_SECONDS: u32 = 5;
 pub const EFI_BOOT_PATH: &str = "EFI\\BOOT\\BOOTX64.EFI";
 #[cfg(target_arch = "aarch64")]
 pub const EFI_BOOT_PATH: &str = "EFI\\BOOT\\BOOTAA64.EFI";
+#[cfg(target_arch = "riscv64")]
+pub const EFI_BOOT_PATH: &str = "EFI\\BOOT\\BOOTRISCV64.EFI";
 
 /// Menu title
 const MENU_TITLE: &str = "CrabEFI Boot Menu";

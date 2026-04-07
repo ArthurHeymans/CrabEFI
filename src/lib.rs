@@ -233,6 +233,9 @@ fn init_platform_impl(mut config: PlatformConfig) -> ! {
     // _start), causing silent infinite loops instead of a diagnostic halt.
     //
     // On x86_64: install the IDT for exception handling.
+    //
+    // On riscv64: the stvec is set by the entry assembly. Nothing extra
+    // needed here since the trap vector was already installed at entry.
     #[cfg(target_arch = "aarch64")]
     unsafe {
         arch::aarch64::exceptions::install_exception_vectors_auto();
@@ -393,27 +396,49 @@ fn init_platform_impl(mut config: PlatformConfig) -> ! {
         }
     } else {
         // No deferred buffer in config — use linker-symbol-based discovery.
-        use efi::allocator::{MemoryType as AllocMemType, PAGE_SIZE};
+        // The deferred module automatically uses the linker symbols for the
+        // buffer location, so no explicit configure_buffer_with_size() needed.
         use efi::varstore::deferred;
         let buf_base = deferred::deferred_buffer_base();
         let buf_size = deferred::deferred_buffer_size();
         if buf_size > 0 {
-            let buf_pages = (buf_size as u64).div_ceil(PAGE_SIZE);
-            if let Err(e) = efi::allocator::force_add_region(
-                buf_base,
-                buf_pages,
-                AllocMemType::RuntimeServicesData,
-            ) {
-                log::warn!(
-                    "Could not register deferred buffer at {:#x}: {:?}",
+            // When platform-entry is active, the deferred buffer lives inside
+            // the linker's __runtime_data_start..__runtime_data_end range which
+            // reserve_runtime_region() already carved as RuntimeServicesData.
+            // Adding it again via force_add_region creates a duplicate,
+            // overlapping memory map entry that confuses the Linux kernel's
+            // efi_memattr_apply_permissions / efi_create_mapping and can leave
+            // parts of the RuntimeServicesData region unmapped in efi_mm.
+            #[cfg(not(feature = "platform-entry"))]
+            {
+                use efi::allocator::{MemoryType as AllocMemType, PAGE_SIZE};
+                let buf_pages = (buf_size as u64).div_ceil(PAGE_SIZE);
+                if let Err(e) = efi::allocator::force_add_region(
                     buf_base,
-                    e
-                );
-            } else {
+                    buf_pages,
+                    AllocMemType::RuntimeServicesData,
+                ) {
+                    log::warn!(
+                        "Could not register deferred buffer at {:#x}: {:?}",
+                        buf_base,
+                        e
+                    );
+                } else {
+                    log::info!(
+                        "Deferred buffer at {:#x} ({} pages) registered as RuntimeServicesData",
+                        buf_base,
+                        buf_pages
+                    );
+                }
+            }
+
+            #[cfg(feature = "platform-entry")]
+            {
+                use efi::allocator::PAGE_SIZE;
                 log::info!(
-                    "Deferred buffer at {:#x} ({} pages) registered as RuntimeServicesData",
+                    "Deferred buffer at {:#x} ({} pages) already in runtime data region",
                     buf_base,
-                    buf_pages
+                    (buf_size as u64).div_ceil(PAGE_SIZE)
                 );
             }
         }

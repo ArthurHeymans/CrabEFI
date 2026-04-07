@@ -11,6 +11,7 @@
 
 use core::fmt::{self, Write};
 
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 use tock_registers::interfaces::{Readable, Writeable};
 
 #[cfg(target_arch = "aarch64")]

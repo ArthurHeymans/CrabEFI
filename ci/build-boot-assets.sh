@@ -93,9 +93,30 @@ EOF
         GRUB_SERIAL_MODULES=""
         GRUB_SERIAL_CFG=""
         ;;
+    riscv64)
+        KERN_ARCH="riscv"
+        if command -v riscv64-linux-gnu-gcc >/dev/null 2>&1; then
+            KERN_CROSS="riscv64-linux-gnu-"
+        elif command -v riscv64-unknown-linux-gnu-gcc >/dev/null 2>&1; then
+            KERN_CROSS="riscv64-unknown-linux-gnu-"
+        else
+            echo "Error: no riscv64 cross-compiler found" >&2
+            exit 1
+        fi
+        KERN_IMAGE="arch/riscv/boot/Image"
+        GRUB_FORMAT="riscv64-efi"
+        GRUB_OUTPUT="grubriscv64.efi"
+        GOARCH="riscv64"
+        CONSOLE="ttyS0,115200"
+        EARLYCON="earlycon=sbi"
+        # QEMU virt uses MMIO 16550 UART; GRUB's serial module uses
+        # x86 I/O ports, so skip it — output goes through EFI console.
+        GRUB_SERIAL_MODULES=""
+        GRUB_SERIAL_CFG=""
+        ;;
     *)
         echo "Error: unsupported architecture: $ARCH" >&2
-        echo "Supported: x86_64, aarch64" >&2
+        echo "Supported: x86_64, aarch64, riscv64" >&2
         exit 1
         ;;
 esac
@@ -178,6 +199,23 @@ else
                 --enable  ARM_ARCH_TIMER        \
                 --disable ARM64_GCS
             ;;
+        riscv64)
+            "$KCFG" "${KCFG_ARGS[@]}" \
+                --enable  ARCH_VIRT                 \
+                --enable  SOC_VIRT                  \
+                --enable  SERIAL_8250               \
+                --enable  SERIAL_8250_CONSOLE       \
+                --enable  SERIAL_OF_PLATFORM        \
+                --enable  SERIAL_EARLYCON            \
+                --enable  SERIAL_EARLYCON_RISCV_SBI \
+                --enable  HVC_RISCV_SBI             \
+                --enable  EARLY_PRINTK              \
+                --enable  IRQCHIP                   \
+                --enable  RISCV_INTC                \
+                --enable  RISCV_SBI                 \
+                --enable  RISCV_TIMER               \
+                --enable  RISCV_SBI_V01
+            ;;
     esac
 
     "${KMAKE[@]}" olddefconfig
@@ -238,10 +276,9 @@ else
     echo "==> Building GRUB EFI binary ($GRUB_FORMAT, grub-mkimage)..."
 
     # ── Ensure GRUB modules for the target arch are available ─────────
-    # On amd64 hosts the arm64-efi modules aren't in the default repos
-    # (grub-efi-arm64-bin is an arm64 package).  When the system module
-    # directory is absent we fetch the .deb from Ubuntu ports and extract
-    # the modules to a temporary directory.
+    # On amd64 hosts the non-native EFI modules aren't in the default
+    # repos.  When the system module directory is absent we fetch the
+    # .deb from Ubuntu ports and extract the modules.
     GRUB_MODULE_DIR="/usr/lib/grub/${GRUB_FORMAT}"
     GRUB_DIR_ARG=""
 
@@ -250,26 +287,34 @@ else
         echo "    Downloading from Ubuntu ports..."
         GRUB_TMP="$(mktemp -d)"
 
+        # Map GRUB format to Ubuntu package name and binary arch
+        case "$GRUB_FORMAT" in
+            arm64-efi)    GRUB_PKG="grub-efi-arm64-bin";   DEB_ARCH="arm64"   ;;
+            riscv64-efi)  GRUB_PKG="grub-efi-riscv64-bin"; DEB_ARCH="riscv64" ;;
+            *)            echo "Error: no cross-download for $GRUB_FORMAT" >&2; exit 1 ;;
+        esac
+
         # Look up the .deb path from the Packages index (try noble-updates
         # first, then fall back to the noble release pocket).
         # Note: awk must NOT use 'exit' here -- under set -o pipefail an
         # early exit causes zcat to receive SIGPIPE and fail the pipeline.
+        DEB_PATH=""
         for SUITE in noble-updates noble; do
-            PACKAGES_URL="http://ports.ubuntu.com/ubuntu-ports/dists/${SUITE}/main/binary-arm64/Packages.gz"
+            PACKAGES_URL="http://ports.ubuntu.com/ubuntu-ports/dists/${SUITE}/main/binary-${DEB_ARCH}/Packages.gz"
             DEB_PATH=$(curl -sL "$PACKAGES_URL" | zcat | \
-                awk '/^Package: grub-efi-arm64-bin$/{found=1} found && /^Filename:/ && !done{print $2; done=1}')
+                awk "/^Package: ${GRUB_PKG}\$/{found=1} found && /^Filename:/ && !done{print \$2; done=1}")
             [ -n "$DEB_PATH" ] && break
         done
 
         if [ -z "$DEB_PATH" ]; then
-            echo "Error: could not find grub-efi-arm64-bin in Ubuntu ports" >&2
+            echo "Error: could not find ${GRUB_PKG} in Ubuntu ports" >&2
             exit 1
         fi
 
         curl -sL "http://ports.ubuntu.com/ubuntu-ports/${DEB_PATH}" \
-            -o "$GRUB_TMP/grub-arm64.deb"
-        dpkg-deb -x "$GRUB_TMP/grub-arm64.deb" "$GRUB_TMP/root"
-        GRUB_MODULE_DIR="$GRUB_TMP/root/usr/lib/grub/arm64-efi"
+            -o "$GRUB_TMP/grub-cross.deb"
+        dpkg-deb -x "$GRUB_TMP/grub-cross.deb" "$GRUB_TMP/root"
+        GRUB_MODULE_DIR="$GRUB_TMP/root/usr/lib/grub/${GRUB_FORMAT}"
 
         if [ ! -d "$GRUB_MODULE_DIR" ]; then
             echo "Error: GRUB modules not found in extracted package" >&2

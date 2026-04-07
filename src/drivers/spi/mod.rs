@@ -314,11 +314,13 @@ pub fn detect_chipset() -> Option<DetectedChipset> {
 /// 2. Try Intel/AMD chipset detection for real hardware
 /// 3. Fall back to QEMU pflash if nothing else works
 pub fn detect_and_init() -> Option<AnySpiController> {
-    // SPI/pflash variable store is x86-only for now.
-    // On aarch64 platforms (QEMU virt, SBSA) we don't have a writable
-    // flash backend — variables are volatile only.
-    if cfg!(target_arch = "aarch64") {
-        log::debug!("SPI flash detection skipped on aarch64");
+    // SPI/pflash variable store requires memory-mapped flash.
+    // On aarch64/riscv64 platforms (QEMU virt, SBSA) the SPI flash is not
+    // memory-mapped at x86 addresses — skip the blind probe.
+    // If coreboot provides LB_TAG_SPI_FLASH with mmap windows, the QEMU
+    // pflash backend will use those addresses instead.
+    if cfg!(target_arch = "aarch64") || cfg!(target_arch = "riscv64") {
+        log::debug!("SPI flash detection skipped on non-x86 (no memory-mapped SPI flash)");
         return None;
     }
 

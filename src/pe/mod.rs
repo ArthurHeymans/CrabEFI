@@ -32,12 +32,17 @@ const IMAGE_FILE_MACHINE_AMD64: u16 = 0x8664;
 /// Machine type: AArch64
 #[cfg(target_arch = "aarch64")]
 const IMAGE_FILE_MACHINE_AA64: u16 = 0xAA64;
+/// Machine type: RISC-V 64
+#[cfg(target_arch = "riscv64")]
+const IMAGE_FILE_MACHINE_RISCV64: u16 = 0x5064;
 
 /// Machine type for the current target architecture
 #[cfg(target_arch = "x86_64")]
 const IMAGE_FILE_MACHINE_NATIVE: u16 = IMAGE_FILE_MACHINE_AMD64;
 #[cfg(target_arch = "aarch64")]
 const IMAGE_FILE_MACHINE_NATIVE: u16 = IMAGE_FILE_MACHINE_AA64;
+#[cfg(target_arch = "riscv64")]
+const IMAGE_FILE_MACHINE_NATIVE: u16 = IMAGE_FILE_MACHINE_RISCV64;
 
 /// Relocation types
 const IMAGE_REL_BASED_ABSOLUTE: u16 = 0;

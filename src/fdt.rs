@@ -131,7 +131,7 @@ impl PlatformInfo {
 /// # Safety
 ///
 /// `fdt_addr` must point to a valid FDT blob of at least `fdt_size` bytes.
-#[cfg(target_arch = "aarch64")]
+#[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
 pub unsafe fn parse(fdt_addr: u64, fdt_size: u32) -> Option<PlatformInfo> {
     if fdt_addr == 0 || fdt_size < 40 {
         return None;
@@ -183,14 +183,14 @@ pub unsafe fn parse(fdt_addr: u64, fdt_size: u32) -> Option<PlatformInfo> {
     Some(info)
 }
 
-/// No-op on non-aarch64 targets.
+/// No-op on targets that don't use FDT (x86_64).
 ///
 /// # Safety
 ///
-/// Same contract as the aarch64 variant — `fdt_addr` must point to a valid
-/// FDT blob.  On non-aarch64, this is a no-op and never dereferences the
+/// Same contract as the real variant — `fdt_addr` must point to a valid
+/// FDT blob.  On x86_64, this is a no-op and never dereferences the
 /// pointer.
-#[cfg(not(target_arch = "aarch64"))]
+#[cfg(not(any(target_arch = "aarch64", target_arch = "riscv64")))]
 pub unsafe fn parse(_fdt_addr: u64, _fdt_size: u32) -> Option<PlatformInfo> {
     None
 }
@@ -204,7 +204,7 @@ pub unsafe fn parse(_fdt_addr: u64, _fdt_size: u32) -> Option<PlatformInfo> {
 /// Looks for nodes whose `compatible` contains `"pci-host-ecam-generic"` or
 /// starts with `"pci"`.  The `reg` property gives the ECAM window and the
 /// `ranges` property maps PCI child addresses to CPU addresses.
-#[cfg(target_arch = "aarch64")]
+#[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
 fn extract_pcie(dt: &fdt::Fdt, info: &mut PlatformInfo) {
     // Find the PCI host bridge node
     let pci_node = dt.all_nodes().find(|n| {
@@ -276,13 +276,20 @@ fn extract_pcie(dt: &fdt::Fdt, info: &mut PlatformInfo) {
     }
 }
 
-/// Extract GIC distributor/redistributor addresses from the `intc` node.
-#[cfg(target_arch = "aarch64")]
+/// Extract interrupt controller addresses.
+///
+/// On aarch64: extracts GIC distributor/redistributor addresses.
+/// On riscv64: extracts PLIC address (stored in `gicd` field for reuse).
+#[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
 fn extract_gic(dt: &fdt::Fdt, info: &mut PlatformInfo) {
     let gic_node = dt.all_nodes().find(|n| {
         n.compatible().is_some_and(|c| {
-            c.all()
-                .any(|s| s.contains("arm,gic") || s.contains("arm,cortex"))
+            c.all().any(|s| {
+                s.contains("arm,gic")
+                    || s.contains("arm,cortex")
+                    || s.contains("riscv,plic")
+                    || s.contains("sifive,plic")
+            })
         })
     });
 
@@ -303,12 +310,21 @@ fn extract_gic(dt: &fdt::Fdt, info: &mut PlatformInfo) {
     }
 }
 
-/// Extract the first PL011 UART base address.
-#[cfg(target_arch = "aarch64")]
+/// Extract the first UART base address.
+///
+/// Matches only known, specific compatible strings to avoid selecting
+/// unrelated nodes that happen to contain "uart" as a substring.
+///
+/// - aarch64: ARM PL011 (`arm,pl011`)
+/// - riscv64: 16550-compatible (`ns16550`, `ns16550a`) and `uart8250`
+#[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
 fn extract_uart(dt: &fdt::Fdt, info: &mut PlatformInfo) {
     let uart_node = dt.all_nodes().find(|n| {
-        n.compatible()
-            .is_some_and(|c| c.all().any(|s| s.contains("pl011")))
+        n.compatible().is_some_and(|c| {
+            c.all().any(|s| {
+                s.contains("pl011") || s.contains("ns16550") || s == "uart8250" || s == "8250"
+            })
+        })
     });
 
     if let Some(node) = uart_node
@@ -320,7 +336,7 @@ fn extract_uart(dt: &fdt::Fdt, info: &mut PlatformInfo) {
 }
 
 /// Read a big-endian cell value (1 or 2 cells) from a byte slice.
-#[cfg(target_arch = "aarch64")]
+#[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
 fn read_cells(data: &[u8], off: usize, cells: usize) -> u64 {
     match cells {
         1 => u32::from_be_bytes(data[off..off + 4].try_into().unwrap_or_default()) as u64,

@@ -26,6 +26,10 @@ pub fn read_counter() -> u64 {
     {
         crate::arch::aarch64::read_counter()
     }
+    #[cfg(target_arch = "riscv64")]
+    {
+        crate::arch::riscv64::read_counter()
+    }
 }
 
 /// Get the counter frequency in Hz
@@ -39,6 +43,13 @@ pub use crate::arch::x86_64::rdtsc;
 
 // On aarch64, provide rdtsc as an alias for read_counter for source compat
 #[cfg(target_arch = "aarch64")]
+#[inline]
+pub fn rdtsc() -> u64 {
+    read_counter()
+}
+
+// On riscv64, provide rdtsc as an alias for read_counter for source compat
+#[cfg(target_arch = "riscv64")]
 #[inline]
 pub fn rdtsc() -> u64 {
     read_counter()
@@ -351,6 +362,43 @@ mod aarch64_timer {
 // Public API (arch-agnostic)
 // ============================================================================
 
+// ============================================================================
+// riscv64: RISC-V rdtime counter
+// ============================================================================
+
+#[cfg(target_arch = "riscv64")]
+mod riscv64_timer {
+    /// Initialize riscv64 timing.
+    ///
+    /// The timer frequency comes from the FDT (`/cpus/timebase-frequency`).
+    /// If not set yet (e.g., no FDT parsed before timer init), we use
+    /// 10 MHz which is the QEMU virt default.
+    pub fn init(_acpi_rsdp: Option<u64>) {
+        let freq = crate::state::drivers().timing.counter_freq_hz;
+
+        if freq == 0 {
+            log::error!(
+                "RISC-V timer: counter_freq_hz not set — \
+                 must be initialized from FDT/coreboot tables before timer init"
+            );
+            return;
+        }
+
+        let cycles_per_us = (freq / 1_000_000).max(1);
+        // SAFETY: single-threaded init
+        unsafe {
+            let t = &mut (*crate::state::drivers_mut_ptr()).timing;
+            t.counter_cycles_per_us = cycles_per_us;
+        }
+
+        log::info!(
+            "RISC-V timer: {} MHz ({} cycles/us)",
+            freq / 1_000_000,
+            cycles_per_us
+        );
+    }
+}
+
 /// Initialize timing subsystem
 ///
 /// # Arguments
@@ -361,6 +409,8 @@ pub fn init(acpi_rsdp: Option<u64>) {
     x86_calibration::init(acpi_rsdp);
     #[cfg(target_arch = "aarch64")]
     aarch64_timer::init(acpi_rsdp);
+    #[cfg(target_arch = "riscv64")]
+    riscv64_timer::init(acpi_rsdp);
 }
 
 /// Initialize timing subsystem from a platform-provided [`Timer`] trait object.

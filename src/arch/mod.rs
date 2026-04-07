@@ -11,6 +11,9 @@ pub mod x86_64;
 #[cfg(target_arch = "aarch64")]
 pub mod aarch64;
 
+#[cfg(target_arch = "riscv64")]
+pub mod riscv64;
+
 // Arch-agnostic re-exports
 #[cfg(target_arch = "x86_64")]
 pub use x86_64::halt;
@@ -25,3 +28,10 @@ pub use aarch64::halt;
 pub use aarch64::reset;
 #[cfg(target_arch = "aarch64")]
 pub use aarch64::rng;
+
+#[cfg(target_arch = "riscv64")]
+pub use riscv64::halt;
+#[cfg(target_arch = "riscv64")]
+pub use riscv64::reset;
+#[cfg(target_arch = "riscv64")]
+pub use riscv64::rng;

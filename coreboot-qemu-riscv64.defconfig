@@ -1,0 +1,22 @@
+# CrabEFI coreboot configuration for QEMU RISC-V 64-bit (virt machine)
+#
+# Build:
+#   1. cargo build -p crabefi-coreboot --release --target riscv64gc-unknown-none-elf
+#   2. cd ~/src/coreboot
+#   3. sed 's|@@CRABEFI_ELF@@|/path/to/CrabEFI_RISCV64/target/riscv64gc-unknown-none-elf/release/crabefi|' \
+#        /path/to/CrabEFI_RISCV64/coreboot-qemu-riscv64.defconfig > .config
+#   4. make olddefconfig && make -j$(nproc)
+#
+# Run:
+#   qemu-system-riscv64 -M virt -m 1024M -nographic \
+#     -bios build/coreboot.rom \
+#     -drive if=pflash,file=build/coreboot.rom,format=raw,readonly=on \
+#     [-drive if=virtio,file=disk.img,format=raw]
+
+CONFIG_VENDOR_EMULATION=y
+CONFIG_BOARD_EMULATION_QEMU_RISCV_RV64=y
+CONFIG_RISCV_OPENSBI=y
+# CONFIG_PAYLOAD_NONE is not set
+CONFIG_PAYLOAD_ELF=y
+CONFIG_PAYLOAD_FILE="@@CRABEFI_ELF@@"
+CONFIG_COMPRESSED_PAYLOAD_NONE=y

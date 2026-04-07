@@ -28,5 +28,18 @@ fn main() {
             std::env::var("PAYLOAD_BASE").unwrap_or_else(|_| "0x10022000000".to_string());
         println!("cargo:rustc-link-arg=--defsym");
         println!("cargo:rustc-link-arg=PAYLOAD_BASE={payload_base}");
+    } else if target.starts_with("riscv64") {
+        let ld = workspace_root.join("riscv64-coreboot.ld");
+        println!("cargo:rerun-if-changed={}", ld.display());
+        println!("cargo:rustc-link-arg=-T{}", ld.display());
+        println!("cargo:rustc-link-arg=-no-pie");
+
+        // Allow overriding the riscv64 payload base address at build time.
+        // Default is for QEMU virt (DRAM at 0x80000000, payload at +16MB).
+        println!("cargo:rerun-if-env-changed=PAYLOAD_BASE");
+        let payload_base =
+            std::env::var("PAYLOAD_BASE").unwrap_or_else(|_| "0x81000000".to_string());
+        println!("cargo:rustc-link-arg=--defsym");
+        println!("cargo:rustc-link-arg=PAYLOAD_BASE={payload_base}");
     }
 }

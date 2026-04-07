@@ -12,9 +12,12 @@
 
 extern crate alloc;
 
+#[cfg(not(target_arch = "riscv64"))]
 mod acpi;
 
 use core::panic::PanicInfo;
+#[cfg(target_arch = "riscv64")]
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 // ============================================================================
 // Memory map size limit (matches state::MAX_MEMORY_REGIONS + MMIO headroom)
@@ -31,7 +34,7 @@ const MAX_MEMORY_REGIONS: usize = 96;
 ///
 /// On x86_64 this wraps the TSC (calibrated via ACPI PM timer before
 /// `init_platform()` is called). On aarch64 this reads the ARM Generic
-/// Timer directly.
+/// Timer directly. On riscv64 this reads the `rdtime` counter.
 struct CorebootTimer {
     freq_hz: u64,
 }
@@ -64,6 +67,13 @@ impl crabefi::ResetHandler for CorebootReset {
             match reset_type {
                 crabefi::ResetType::Shutdown => crabefi::arch::aarch64::reset::system_off(),
                 _ => crabefi::arch::aarch64::reset::system_reset(),
+            }
+        }
+        #[cfg(target_arch = "riscv64")]
+        {
+            match reset_type {
+                crabefi::ResetType::Shutdown => crabefi::arch::riscv64::reset::system_off(),
+                _ => crabefi::arch::riscv64::reset::system_reset(),
             }
         }
     }
@@ -125,6 +135,270 @@ fn panic(info: &PanicInfo) -> ! {
 }
 
 // ============================================================================
+// RISC-V entry point
+// ============================================================================
+
+/// RISC-V entry point called from assembly after BSS zeroing / stack setup.
+///
+/// On RISC-V, coreboot + OpenSBI passes:
+///   - a0 = hart ID
+///   - a1 = pointer to FDT (Flattened Device Tree)
+///
+/// The FDT contains a `/chosen/coreboot-table` property with the physical
+/// address of the coreboot information tables. We extract that, then
+/// call the architecture-independent `rust_main()`.
+#[cfg(target_arch = "riscv64")]
+#[unsafe(no_mangle)]
+pub extern "C" fn riscv_main(hart_id: u64, fdt_ptr: u64) -> ! {
+    // Early console: write directly to the QEMU virt 16550 UART so we
+    // get output even before logging is initialized.
+    crabefi::arch::riscv64::uart_direct_write(b"CrabEFI: RISC-V entry (S-mode)\r\n");
+
+    // Parse the FDT header to get total size, then extract the coreboot
+    // table pointer from /chosen/coreboot-table.
+    let (coreboot_table_ptr, fdt_size) = extract_coreboot_table_from_fdt(fdt_ptr);
+
+    // Save hart ID and FDT pointer for later use by protocol/timer code.
+    RISCV_BOOT_HARTID.store(hart_id, Ordering::Relaxed);
+    // Also publish to the library so riscv_get_boot_hartid returns the real value.
+    crabefi::efi::set_boot_hartid(hart_id);
+
+    if coreboot_table_ptr != 0 {
+        // We have coreboot tables — use the standard path.
+        // Store FDT pointer so rust_main can use it for timer freq later.
+        RISCV_FDT_PTR.store(fdt_ptr, Ordering::Relaxed);
+        RISCV_FDT_SIZE.store(fdt_size, Ordering::Relaxed);
+        rust_main(coreboot_table_ptr)
+    } else {
+        // No coreboot table pointer in FDT — run in FDT-only mode.
+        riscv_fdt_only_boot(fdt_ptr, fdt_size)
+    }
+}
+
+/// Boot hart ID saved at entry (from OpenSBI a0 register).
+#[cfg(target_arch = "riscv64")]
+static RISCV_BOOT_HARTID: AtomicU64 = AtomicU64::new(0);
+/// Saved FDT pointer from RISC-V entry (used after state init).
+#[cfg(target_arch = "riscv64")]
+static RISCV_FDT_PTR: AtomicU64 = AtomicU64::new(0);
+/// Saved FDT size from RISC-V entry.
+#[cfg(target_arch = "riscv64")]
+static RISCV_FDT_SIZE: AtomicU32 = AtomicU32::new(0);
+
+/// Extract the coreboot table pointer and FDT size from an FDT blob.
+#[cfg(target_arch = "riscv64")]
+fn extract_coreboot_table_from_fdt(fdt_ptr: u64) -> (u64, u32) {
+    if fdt_ptr == 0 {
+        return (0, 0);
+    }
+
+    // Read the FDT total size from the header (offset 4, big-endian u32).
+    // SAFETY: The FDT pointer comes from OpenSBI/coreboot and is valid.
+    let fdt_size = unsafe {
+        let header = fdt_ptr as *const u8;
+        u32::from_be_bytes([
+            *header.add(4),
+            *header.add(5),
+            *header.add(6),
+            *header.add(7),
+        ])
+    };
+
+    if fdt_size < 40 {
+        return (0, fdt_size);
+    }
+
+    let fdt_blob = unsafe { core::slice::from_raw_parts(fdt_ptr as *const u8, fdt_size as usize) };
+
+    let coreboot_table_ptr = if let Ok(dt) = fdt::Fdt::new(fdt_blob) {
+        dt.find_node("/chosen")
+            .and_then(|n| n.property("coreboot-table"))
+            .and_then(|p| {
+                let v = p.value;
+                if v.len() >= 8 {
+                    Some(u64::from_be_bytes([
+                        v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7],
+                    ]))
+                } else if v.len() >= 4 {
+                    // 32-bit property value
+                    Some(u32::from_be_bytes([v[0], v[1], v[2], v[3]]) as u64)
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(0)
+    } else {
+        0
+    };
+
+    (coreboot_table_ptr, fdt_size)
+}
+
+/// Extract the timer frequency from the FDT and store it in driver state.
+///
+/// The RISC-V timer frequency is in `/cpus/timebase-frequency`.
+#[cfg(target_arch = "riscv64")]
+fn extract_timer_freq_from_fdt(fdt_ptr: u64, fdt_size: u32) {
+    if fdt_ptr == 0 || fdt_size < 40 {
+        return;
+    }
+
+    let fdt_blob = unsafe { core::slice::from_raw_parts(fdt_ptr as *const u8, fdt_size as usize) };
+
+    if let Ok(dt) = fdt::Fdt::new(fdt_blob)
+        && let Some(cpus) = dt.find_node("/cpus")
+        && let Some(prop) = cpus.property("timebase-frequency")
+    {
+        let v = prop.value;
+        let freq = if v.len() >= 8 {
+            u64::from_be_bytes([v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7]])
+        } else if v.len() >= 4 {
+            u32::from_be_bytes([v[0], v[1], v[2], v[3]]) as u64
+        } else {
+            0
+        };
+
+        if freq > 0 {
+            // SAFETY: single-threaded init, state already initialized
+            unsafe {
+                let t = &mut (*crabefi::state::drivers_mut_ptr()).timing;
+                t.counter_freq_hz = freq;
+                t.counter_cycles_per_us = (freq / 1_000_000).max(1);
+            }
+        }
+    }
+}
+
+/// FDT-only boot path for RISC-V when coreboot tables are not available.
+///
+/// This builds a minimal `PlatformConfig` from FDT data and boots.
+#[cfg(target_arch = "riscv64")]
+fn riscv_fdt_only_boot(fdt_ptr: u64, fdt_size: u32) -> ! {
+    // Initialize firmware state
+    let mut firmware_state = crabefi::state::FirmwareState::new();
+    unsafe {
+        crabefi::state::init(&mut firmware_state);
+    }
+
+    // Initialize serial from MMIO (QEMU virt 16550 at 0x10000000)
+    crabefi::drivers::serial::init_from_coreboot(&crabefi::coreboot::tables::SerialInfo {
+        serial_type: 2, // LB_SERIAL_TYPE_MEMORY_MAPPED
+        baseaddr: 0x1000_0000,
+        baud: 115200,
+        regwidth: 1,
+        input_hertz: 0,
+    });
+    crabefi::logger::init();
+
+    log::info!(
+        "CrabEFI v{} starting (RISC-V FDT-only mode)...",
+        env!("CARGO_PKG_VERSION")
+    );
+    log::info!(
+        "FDT at {:#x} ({} bytes), no coreboot tables found",
+        fdt_ptr,
+        fdt_size
+    );
+
+    // Initialize timing — use 10 MHz default first, then override with the
+    // actual frequency from the FDT /cpus/timebase-frequency property.
+    crabefi::time::init(None);
+    extract_timer_freq_from_fdt(fdt_ptr, fdt_size);
+
+    // Build a minimal memory map from FDT
+    // QEMU virt: DRAM at 0x80000000, size from FDT /memory node
+    let mut memory_regions = [crabefi::MemoryRegion {
+        base: 0,
+        size: 0,
+        region_type: crabefi::MemoryType::Reserved,
+    }; MAX_MEMORY_REGIONS];
+
+    let region_count = build_memory_map_from_fdt(fdt_ptr, fdt_size, &mut memory_regions);
+
+    let timer = CorebootTimer {
+        freq_hz: crabefi::state::drivers().timing.counter_freq_hz,
+    };
+    let reset = CorebootReset;
+
+    let fdt_slice = unsafe { core::slice::from_raw_parts(fdt_ptr as *const u8, fdt_size as usize) };
+
+    let config = crabefi::PlatformConfig {
+        memory_map: &memory_regions[..region_count],
+        timer: &timer,
+        reset: &reset,
+        block_devices: &mut [],
+        variable_backend: None,
+        debug_output: None,
+        console_input: None,
+        framebuffer: None,
+        acpi_rsdp: None,
+        smbios: None,
+        fdt: Some(fdt_slice),
+        rng: None,
+        ecam_base: None,
+        deferred_buffer: None,
+        runtime_region: None,
+        heap_pre_initialized: false,
+    };
+
+    crabefi::init_platform(config)
+}
+
+/// Build a memory map from FDT /memory nodes.
+#[cfg(target_arch = "riscv64")]
+fn build_memory_map_from_fdt(
+    fdt_ptr: u64,
+    fdt_size: u32,
+    out: &mut [crabefi::MemoryRegion; MAX_MEMORY_REGIONS],
+) -> usize {
+    let mut count = 0;
+    if fdt_ptr == 0 || fdt_size < 40 {
+        return count;
+    }
+
+    let fdt_blob = unsafe { core::slice::from_raw_parts(fdt_ptr as *const u8, fdt_size as usize) };
+    if let Ok(dt) = fdt::Fdt::new(fdt_blob) {
+        // Find /memory nodes
+        for node in dt.all_nodes() {
+            let is_memory = node
+                .compatible()
+                .is_some_and(|c| c.all().any(|s| s == "memory"))
+                || node.name.starts_with("memory");
+
+            if is_memory && let Some(regs) = node.reg() {
+                for reg in regs {
+                    if count >= MAX_MEMORY_REGIONS {
+                        break;
+                    }
+                    let base = reg.starting_address as u64;
+                    let size = reg.size.unwrap_or(0) as u64;
+                    if size > 0 {
+                        out[count] = crabefi::MemoryRegion {
+                            base,
+                            size,
+                            region_type: crabefi::MemoryType::Ram,
+                        };
+                        count += 1;
+                    }
+                }
+            }
+        }
+    }
+
+    // If no memory found, use QEMU virt default: 128MB at 0x80000000
+    if count == 0 {
+        out[0] = crabefi::MemoryRegion {
+            base: 0x8000_0000,
+            size: 128 * 1024 * 1024,
+            region_type: crabefi::MemoryType::Ram,
+        };
+        count = 1;
+    }
+
+    count
+}
+
+// ============================================================================
 // Entry point
 // ============================================================================
 
@@ -145,6 +419,16 @@ pub extern "C" fn rust_main(coreboot_table_ptr: u64) -> ! {
     // this stack frame which never returns (-> !).
     unsafe {
         crabefi::state::init(&mut firmware_state);
+    }
+
+    // On RISC-V, extract timer frequency from FDT now that state is initialized.
+    #[cfg(target_arch = "riscv64")]
+    {
+        let fdt_ptr = RISCV_FDT_PTR.load(Ordering::Relaxed);
+        let fdt_size = RISCV_FDT_SIZE.load(Ordering::Relaxed);
+        if fdt_ptr != 0 && fdt_size >= 40 {
+            extract_timer_freq_from_fdt(fdt_ptr, fdt_size);
+        }
     }
 
     // ================================================================
@@ -239,7 +523,25 @@ pub extern "C" fn rust_main(coreboot_table_ptr: u64) -> ! {
 
     let reset = CorebootReset;
 
-    // Extract FDT bytes slice (if coreboot provided a devicetree).
+    // Extract FDT bytes slice.
+    //
+    // On RISC-V, use the FDT passed by OpenSBI (a1 register) rather than
+    // the one from coreboot tables — the OpenSBI FDT contains the full
+    // QEMU virt hardware description (UART, PLIC, PCI, memory, etc.)
+    // which Linux needs to boot.
+    #[cfg(target_arch = "riscv64")]
+    let fdt_slice: Option<&[u8]> = {
+        let fdt_ptr = RISCV_FDT_PTR.load(Ordering::Relaxed);
+        let fdt_size = RISCV_FDT_SIZE.load(Ordering::Relaxed);
+        if fdt_ptr != 0 && fdt_size >= 40 {
+            Some(unsafe { core::slice::from_raw_parts(fdt_ptr as *const u8, fdt_size as usize) })
+        } else {
+            cb_info.devicetree.map(|(addr, size)| unsafe {
+                core::slice::from_raw_parts(addr as *const u8, size as usize)
+            })
+        }
+    };
+    #[cfg(not(target_arch = "riscv64"))]
     let fdt_slice: Option<&[u8]> = cb_info.devicetree.map(|(addr, size)| {
         // SAFETY: coreboot's devicetree pointer and size are valid.
         unsafe { core::slice::from_raw_parts(addr as *const u8, size as usize) }
@@ -291,17 +593,51 @@ pub extern "C" fn rust_main(coreboot_table_ptr: u64) -> ! {
     // The AML interpreter allocates, so this must run after heap::init().
     // Results go into state.drivers.acpi_info which init_platform() reads
     // for ECAM base and add_platform_mmio_regions() reads for MMIO.
+    // RISC-V platforms use FDT rather than ACPI, so skip this.
+    #[cfg(not(target_arch = "riscv64"))]
     if let Some(rsdp) = crabefi::state::drivers().platform.acpi_rsdp {
         let acpi_info = unsafe { acpi::discover_platform(rsdp) };
         crabefi::state::with_drivers_mut(|d| d.acpi_info = acpi_info);
     }
 
-    // ---- Platform MMIO regions (aarch64) ----
+    // ---- Platform MMIO regions (aarch64 / riscv64) ----
     //
     // Coreboot's lb_memory table omits MMIO regions. Add them from the
     // ACPI/FDT info we just discovered.
     #[cfg(target_arch = "aarch64")]
     crabefi::efi::add_platform_mmio_regions();
+
+    // ---- RISC-V: parse FDT for ECAM + MMIO info, then register MMIO ----
+    //
+    // FDT parsing MUST happen before add_platform_mmio_regions() so the
+    // FDT-derived PCIe MMIO windows are used instead of the SBSA defaults.
+    // Without this, the SBSA fallback adds a bogus 1.75 GB MMIO region at
+    // 0x80000000 that overlaps with DRAM and the CrabEFI runtime regions,
+    // causing the Linux kernel to fail mapping RuntimeServicesData in efi_mm.
+    #[cfg(target_arch = "riscv64")]
+    {
+        let mut ecam_found = false;
+        if let Some(fdt_data) = fdt_slice
+            && let Some(info) =
+                unsafe { crabefi::fdt::parse(fdt_data.as_ptr() as u64, fdt_data.len() as u32) }
+        {
+            if let Some(ecam) = info.ecam_base {
+                config.ecam_base = Some(ecam);
+                log::info!("ECAM base from FDT: {:#x}", ecam);
+                ecam_found = true;
+            }
+            // Store FDT info so add_platform_mmio_regions() can read it
+            crabefi::state::with_drivers_mut(|d| d.fdt_info = info);
+        }
+        // Fallback: use coreboot's configured ECAM base for QEMU virt (0x30000000)
+        if !ecam_found {
+            config.ecam_base = Some(0x3000_0000);
+            log::info!("ECAM base from coreboot config: 0x30000000");
+        }
+
+        // Now that fdt_info is populated, register MMIO regions from FDT
+        crabefi::efi::add_platform_mmio_regions();
+    }
 
     // ---- CFR parsing ----
     //

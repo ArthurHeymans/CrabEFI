@@ -24,6 +24,8 @@ use super::controller::{
 };
 #[cfg(target_arch = "aarch64")]
 use crate::arch::aarch64::cache::{flush_cache_range, invalidate_cache_range};
+#[cfg(target_arch = "riscv64")]
+use crate::arch::riscv64::cache::{flush_cache_range, invalidate_cache_range};
 #[cfg(target_arch = "x86_64")]
 use crate::arch::x86_64::cache::{flush_cache_range, invalidate_cache_range};
 use crate::drivers::pci::{self, PciAddress, PciDevice};

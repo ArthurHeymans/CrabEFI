@@ -31,6 +31,10 @@
             # coreboot tools for adding payload
             coreboot-utils
 
+            # RISC-V cross-binutils for ELF-to-PE/COFF conversion
+            # (Rust has no riscv64gc-unknown-uefi target)
+            pkgsCross.riscv64.buildPackages.binutils
+
             # Compression for firmware
             zstd
           ];
