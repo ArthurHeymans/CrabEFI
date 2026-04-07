@@ -7,19 +7,17 @@
 //! - UHCI Design Guide Revision 1.1
 //! - libpayload uhci.c
 
+use super::controller::{
+    SetupPacket, UsbController, UsbDevice, UsbError, UsbSpeed, enumerate_device,
+    enumerate_hub_ports,
+};
+use super::uhci_regs::{PORTSC, USBCMD, USBSTS, UhciRegs};
 use crate::drivers::pci::{self, PciAddress, PciDevice};
 use crate::efi;
 use crate::time::{Timeout, wait_for};
 use core::ptr;
 use core::sync::atomic::{Ordering, fence};
 use tock_registers::interfaces::{ReadWriteable, Readable, Writeable};
-use zerocopy::FromBytes;
-
-use super::controller::{
-    HUB_DESCRIPTOR_TYPE, HubDescriptor, SetupPacket, UsbController, UsbDevice, UsbError, UsbSpeed,
-    enumerate_device, hub_feature, hub_port_change, hub_port_status, req_type, request,
-};
-use super::uhci_regs::{PORTSC, USBCMD, USBSTS, UhciRegs};
 
 // ============================================================================
 // UHCI Data Structures
@@ -575,11 +573,10 @@ impl UhciController {
         Ok(())
     }
 
-    /// Enumerate devices connected to an external USB hub
+    /// Enumerate devices connected to an external USB hub.
     ///
-    /// Gets the hub descriptor, powers on all ports, resets ports with
-    /// connected devices, and enumerates them. UHCI is USB 1.1 only, so
-    /// devices behind hubs are always low-speed or full-speed.
+    /// UHCI is USB 1.1 only so devices behind hubs are low-speed or
+    /// full-speed. Delegates to the shared [`enumerate_hub_ports`] helper.
     fn enumerate_hub(&mut self, hub_slot: usize, hub_addr: u8) -> Result<(), UsbError> {
         log::info!("UHCI: Enumerating hub at address {}", hub_addr);
 
@@ -588,176 +585,21 @@ impl UhciController {
             .ok_or(UsbError::DeviceNotFound)?
             .clone();
 
-        // Get hub descriptor (class-specific request)
-        let mut hub_desc_buf = [0u8; 9];
-        self.control_transfer_internal(
+        let (num_ports, ready_ports) = enumerate_hub_ports(
             &hub_device,
-            req_type::DIR_IN | req_type::TYPE_CLASS | req_type::RCPT_DEVICE,
-            request::GET_DESCRIPTOR,
-            (HUB_DESCRIPTOR_TYPE as u16) << 8,
-            0,
-            Some(&mut hub_desc_buf),
+            |dev, rt, req, val, idx, data| {
+                self.control_transfer_internal(dev, rt, req, val, idx, data)
+            },
+            false, // UHCI is USB 1.1: low-speed or full-speed only
         )?;
 
-        let (hub_desc, _) = HubDescriptor::read_from_prefix(&hub_desc_buf)
-            .map_err(|_| UsbError::TransferFailed(0))?;
-        let num_ports = hub_desc.num_ports;
-        let power_on_delay = (hub_desc.power_on_to_power_good as u32) * 2;
-
-        log::info!(
-            "  Hub has {} ports, power-on delay: {}ms",
-            num_ports,
-            power_on_delay
-        );
-
-        // Update the device's hub port count
         if let Some(ref mut dev) = self.devices[hub_slot] {
             dev.num_hub_ports = num_ports;
         }
 
-        // Power on all hub ports
-        for port in 1..=num_ports {
-            log::debug!("  Powering on hub port {}", port);
-            let result = self.control_transfer_internal(
-                &hub_device,
-                req_type::DIR_OUT | req_type::TYPE_CLASS | req_type::RCPT_OTHER,
-                request::SET_FEATURE,
-                hub_feature::PORT_POWER,
-                port as u16,
-                None,
-            );
-            if let Err(e) = result {
-                log::warn!("  Failed to power on hub port {}: {:?}", port, e);
-            }
-        }
-
-        // Wait for power to stabilize
-        let delay = power_on_delay.max(100) as u64;
-        crate::time::delay_ms(delay);
-
-        // Check each port for connected devices
-        for port in 1..=num_ports {
-            // Get port status
-            let mut status_buf = [0u8; 4];
-            let result = self.control_transfer_internal(
-                &hub_device,
-                req_type::DIR_IN | req_type::TYPE_CLASS | req_type::RCPT_OTHER,
-                request::GET_STATUS,
-                0,
-                port as u16,
-                Some(&mut status_buf),
-            );
-
-            if let Err(e) = result {
-                log::debug!("  Failed to get status for hub port {}: {:?}", port, e);
-                continue;
-            }
-
-            let port_status = u16::from_le_bytes([status_buf[0], status_buf[1]]);
-            let port_change = u16::from_le_bytes([status_buf[2], status_buf[3]]);
-
-            log::debug!(
-                "  Hub port {} status: {:#06x}, change: {:#06x}",
-                port,
-                port_status,
-                port_change
-            );
-
-            if (port_status & hub_port_status::CONNECTION) == 0 {
-                continue;
-            }
-
-            log::info!("  Device detected on hub port {}", port);
-
-            // Clear connection change bit if set
-            if port_change & hub_port_change::C_CONNECTION != 0 {
-                let _ = self.control_transfer_internal(
-                    &hub_device,
-                    req_type::DIR_OUT | req_type::TYPE_CLASS | req_type::RCPT_OTHER,
-                    request::CLEAR_FEATURE,
-                    hub_feature::C_PORT_CONNECTION,
-                    port as u16,
-                    None,
-                );
-            }
-
-            // Reset the port
-            log::debug!("  Resetting hub port {}", port);
-            self.control_transfer_internal(
-                &hub_device,
-                req_type::DIR_OUT | req_type::TYPE_CLASS | req_type::RCPT_OTHER,
-                request::SET_FEATURE,
-                hub_feature::PORT_RESET,
-                port as u16,
-                None,
-            )?;
-
-            // Wait for reset (USB spec requires at least 10ms, use 50ms for margin)
-            crate::time::delay_ms(50);
-
-            // Poll for reset completion
-            let mut reset_complete = false;
-            let timeout = Timeout::from_ms(500);
-            while !timeout.is_expired() {
-                let mut status_buf = [0u8; 4];
-                if self
-                    .control_transfer_internal(
-                        &hub_device,
-                        req_type::DIR_IN | req_type::TYPE_CLASS | req_type::RCPT_OTHER,
-                        request::GET_STATUS,
-                        0,
-                        port as u16,
-                        Some(&mut status_buf),
-                    )
-                    .is_err()
-                {
-                    break;
-                }
-
-                let port_status = u16::from_le_bytes([status_buf[0], status_buf[1]]);
-                let port_change = u16::from_le_bytes([status_buf[2], status_buf[3]]);
-
-                // Check if reset is complete (C_PORT_RESET bit in change)
-                if port_change & hub_port_change::C_RESET != 0 {
-                    // Clear the reset change bit
-                    let _ = self.control_transfer_internal(
-                        &hub_device,
-                        req_type::DIR_OUT | req_type::TYPE_CLASS | req_type::RCPT_OTHER,
-                        request::CLEAR_FEATURE,
-                        hub_feature::C_PORT_RESET,
-                        port as u16,
-                        None,
-                    );
-
-                    // Check if port is enabled
-                    if (port_status & hub_port_status::ENABLE) != 0 {
-                        reset_complete = true;
-
-                        // UHCI is USB 1.1 only: low-speed or full-speed
-                        let speed = if (port_status & hub_port_status::LOW_SPEED) != 0 {
-                            UsbSpeed::Low
-                        } else {
-                            UsbSpeed::Full
-                        };
-
-                        log::info!("  Hub port {} reset complete, speed: {:?}", port, speed);
-
-                        // Recovery time after reset
-                        crate::time::delay_ms(10);
-
-                        // Enumerate the device
-                        if let Err(e) = self.attach_device_on_hub(port, speed, hub_addr, port) {
-                            log::warn!("  Failed to attach device on hub port {}: {:?}", port, e);
-                        }
-                    }
-                    break;
-                }
-
-                crate::time::delay_ms(10);
-            }
-
-            if !reset_complete {
-                log::warn!("  Hub port {} reset timed out", port);
+        for (port, speed) in ready_ports {
+            if let Err(e) = self.attach_device_on_hub(port, speed, hub_addr, port) {
+                log::warn!("  Failed to attach device on hub port {}: {:?}", port, e);
             }
         }
 
@@ -798,13 +640,19 @@ impl UhciController {
         // DMA buffer layout:
         //   [0..8)       setup packet
         //   [64..)       TDs: setup(1) + data(N) + status(1), each 32 bytes
-        //   [2048..)     data buffer
-        debug_assert!(
-            data_len <= Self::DMA_BUFFER_SIZE - 2048,
-            "control transfer data ({data_len} bytes) exceeds DMA buffer"
-        );
+        //   [2048..)     data buffer  (DMA_BUFFER_SIZE - 2048 bytes available)
+        const DATA_BUF_OFFSET: usize = 2048;
+        let data_buf_capacity = Self::DMA_BUFFER_SIZE - DATA_BUF_OFFSET;
+        if data_len > data_buf_capacity {
+            log::warn!(
+                "UHCI: control transfer data ({} bytes) exceeds DMA buffer ({})",
+                data_len,
+                data_buf_capacity,
+            );
+            return Err(UsbError::InvalidParameter);
+        }
         let td_base = self.dma_buffer + 64;
-        let data_buffer = self.dma_buffer + 2048;
+        let data_buffer = self.dma_buffer + DATA_BUF_OFFSET as u64;
 
         // Copy data for OUT transfers
         if let Some(ref d) = data
@@ -815,9 +663,20 @@ impl UhciController {
             }
         }
 
-        // Calculate number of data TDs (one per packet)
+        // Calculate number of data TDs (one per packet).
+        // Reject transfers that would require more TDs than we support rather
+        // than silently truncating the data.
         let num_data_tds = if data_len > 0 {
-            data_len.div_ceil(max_packet).min(Self::MAX_DATA_TDS)
+            let n = data_len.div_ceil(max_packet);
+            if n > Self::MAX_DATA_TDS {
+                log::warn!(
+                    "UHCI: control transfer needs {} TDs, max is {}",
+                    n,
+                    Self::MAX_DATA_TDS,
+                );
+                return Err(UsbError::InvalidParameter);
+            }
+            n
         } else {
             0
         };

@@ -172,17 +172,14 @@ impl PS2Ports {
 // ============================================================================
 
 /// Maximum time (ms) to wait for the keyboard BAT (Basic Assurance Test)
-/// response after sending the RESET command. Some keyboards (especially
-/// laptop EC-emulated ones) need several seconds to respond.
+/// response after sending the RESET command.
 ///
-/// Modelled after SeaBIOS's `etc/ps2-keyboard-spinup` mechanism: we send
-/// the reset during `init()` and check for the BAT result lazily on every
-/// `has_key()` / `try_read_key()` poll, so boot is never blocked.
-const BAT_SPINUP_TIMEOUT_MS: u64 = 4000;
-
-/// Maximum number of RESET retries within the spinup window.
-/// Each retry re-sends 0xFF if the previous attempt got no response.
-const BAT_MAX_RETRIES: u8 = 10;
+/// Laptop EC-emulated keyboards (ThinkPad H8 etc.) may need up to a second
+/// to respond. We use a 5 s window matching SeaBIOS's BAT read timeout.
+/// If the deadline expires we enable scanning anyway — GRUB on coreboot
+/// targets does the same ("just configure and go") because the EC may not
+/// be ready to respond at all when we run as a coreboot payload.
+const BAT_SPINUP_TIMEOUT_MS: u64 = 5000;
 
 /// Two-phase initialization state for the PS/2 keyboard.
 ///
@@ -199,8 +196,8 @@ enum InitState {
     /// No controller detected or init not yet called.
     NotStarted,
     /// Controller self-test passed. RESET (0xFF) has been sent; waiting
-    /// for ACK + BAT result. Fields: (spinup deadline, retries remaining).
-    WaitingForBat { deadline: u64, retries_left: u8 },
+    /// for ACK + BAT result (0xAA). Deadline is an absolute TSC value.
+    WaitingForBat { deadline: u64 },
     /// Keyboard fully initialized and ready for scancodes.
     Ready,
     /// Initialization failed (controller absent, self-test failed, or
@@ -473,104 +470,95 @@ pub fn init() {
     let deadline = Timeout::from_ms(BAT_SPINUP_TIMEOUT_MS);
     kb.init_state = InitState::WaitingForBat {
         deadline: deadline.raw_deadline(),
-        retries_left: BAT_MAX_RETRIES,
     };
     log::debug!("PS/2 keyboard RESET sent, waiting for BAT (deferred)");
 }
 
 /// Drive the deferred keyboard BAT state machine forward.
 ///
-/// Called from `has_key()` and `try_read_key()` on every poll. Checks
-/// whether the keyboard has responded to the RESET command. If not yet
-/// ready, returns without blocking. Once the BAT completes (or times
-/// out), transitions to `Ready` or `Failed`.
+/// Called from `has_key()`, `try_read_key()`, and `cleanup()` on every poll.
+/// Does not block. Transitions to `Ready` or `Failed` when the BAT completes,
+/// fails, or times out.
+///
+/// # AUX byte routing
+/// AUX (mouse/touchpad) bytes that arrive while we wait for BAT are forwarded
+/// to the mouse driver rather than discarded. On ThinkPads and other laptops
+/// the EC may start sending touchpad data before the keyboard BAT completes —
+/// SeaBIOS `ps2_recvbyte` shows the same pattern: check `I8042_STR_AUXDATA`
+/// before deciding what to do with a byte.
+///
+/// # Timeout behaviour
+/// On deadline expiry we enable scanning without a successful BAT. This mirrors
+/// GRUB's coreboot target behaviour: "just configure and go" — if the controller
+/// passed self-test the keyboard is most likely functional regardless of whether
+/// the EC responded to RESET in time.
 fn poll_bat_completion(kb: &mut KeyboardState) {
-    let (raw_deadline, retries_left) = match kb.init_state {
-        InitState::WaitingForBat {
-            deadline,
-            retries_left,
-        } => (deadline, retries_left),
+    let raw_deadline = match kb.init_state {
+        InitState::WaitingForBat { deadline } => deadline,
         _ => return,
     };
 
     let deadline = Timeout::from_raw(raw_deadline);
 
-    // Check if data is available from the keyboard
-    if kb.ports.status_cmd.is_set(Status::OUTPUT_FULL) {
+    // Read status once so OUTPUT_FULL and AUX_DATA are checked atomically.
+    let status = kb.ports.status_cmd.get();
+
+    if (status & masks::OUTPUT_FULL) != 0 {
+        if (status & masks::AUX_DATA) != 0 {
+            // A mouse/touchpad byte arrived while we were waiting for BAT.
+            // Route it to the AUX FIFO so the mouse driver can process it;
+            // do NOT treat it as a keyboard BAT response.
+            let byte = kb.ports.data.get();
+            #[cfg(feature = "ui")]
+            crate::drivers::mouse::push_aux_byte(byte);
+            #[cfg(not(feature = "ui"))]
+            let _ = byte;
+            return; // keep waiting for BAT
+        }
+
         let byte = kb.ports.data.get();
         match byte {
             response::ACK => {
-                // ACK for the RESET command — still waiting for BAT result.
-                // Stay in WaitingForBat.
-                return;
+                // ACK for the RESET command — still waiting for 0xAA.
             }
             response::SELF_TEST_PASS => {
-                // BAT passed (0xAA). Finish initialization.
+                // BAT passed (0xAA) — keyboard is ready.
                 finish_init(kb);
-                return;
             }
             response::RESEND => {
-                // Keyboard wants us to resend. Retry the RESET if we
-                // have retries left.
-                if retries_left > 0 && !deadline.is_expired() {
-                    if kb.wait_input_ready() {
-                        kb.ports.data.set(kb_cmd::RESET);
-                        kb.init_state = InitState::WaitingForBat {
-                            deadline: raw_deadline,
-                            retries_left: retries_left - 1,
-                        };
-                    }
+                // Keyboard requests retransmission of RESET.
+                if !deadline.is_expired() && kb.wait_input_ready() {
+                    kb.ports.data.set(kb_cmd::RESET);
+                    log::debug!("PS/2 keyboard BAT: RESEND, retrying RESET");
                 } else {
-                    log::warn!("PS/2 keyboard BAT: too many RESENDs");
-                    kb.init_state = InitState::Failed;
+                    // Deadline expired or controller busy — proceed without BAT.
+                    log::debug!("PS/2 keyboard BAT: RESEND past deadline, enabling anyway");
+                    finish_init(kb);
                 }
-                return;
             }
             0xFC | 0xFD => {
-                // BAT failed
+                // BAT self-test failed.
                 log::warn!("PS/2 keyboard BAT failed: {:#x}", byte);
                 kb.init_state = InitState::Failed;
-                return;
             }
             _ => {
-                // Spurious byte (e.g. leftover scancode). Discard and
-                // keep waiting.
-                log::debug!("PS/2 BAT: discarding spurious byte {:#x}", byte);
-                return;
+                // Spurious byte (e.g. leftover scancode from before RESET).
+                log::debug!("PS/2 BAT: ignoring spurious byte {:#x}", byte);
             }
         }
+        return;
     }
 
-    // No data yet — check if we timed out
+    // No data yet — check deadline.
     if deadline.is_expired() {
-        if retries_left > 0 {
-            // Retry: re-send RESET
-            if kb.wait_input_ready() {
-                kb.ports.data.set(kb_cmd::RESET);
-                let new_deadline = Timeout::from_ms(BAT_SPINUP_TIMEOUT_MS);
-                kb.init_state = InitState::WaitingForBat {
-                    deadline: new_deadline.raw_deadline(),
-                    retries_left: retries_left - 1,
-                };
-                log::debug!(
-                    "PS/2 keyboard BAT timeout, retrying ({} left)",
-                    retries_left - 1
-                );
-            } else {
-                log::warn!("PS/2 keyboard not ready for RESET retry");
-                kb.init_state = InitState::Failed;
-            }
-        } else {
-            // Some keyboards (QEMU, many real ones) don't need RESET to
-            // work — they were already scanning before we sent 0xFF. If
-            // the controller passed self-test and port-test, the keyboard
-            // is likely fine; just enable scanning and proceed.
-            log::debug!(
-                "PS/2 keyboard BAT timeout after all retries, \
-                 enabling scanning without BAT"
-            );
-            finish_init(kb);
-        }
+        // The keyboard did not respond in time. Proceed without BAT like
+        // GRUB does on coreboot: controller passed self-test so the keyboard
+        // is most likely functional (EC may simply not have been ready yet).
+        log::debug!(
+            "PS/2 keyboard BAT timeout ({}ms), enabling scanning without BAT",
+            BAT_SPINUP_TIMEOUT_MS,
+        );
+        finish_init(kb);
     }
 }
 
@@ -619,10 +607,14 @@ pub fn has_key() -> bool {
 pub fn cleanup() {
     let mut kb = KEYBOARD.lock();
 
-    // If BAT is still in progress, finalize now before OS handoff
+    // Drive the BAT state machine one last time before handoff.
     poll_bat_completion(&mut kb);
 
-    if !kb.is_ready() {
+    // Skip only if init() was never called (no hardware was probed).
+    // Even if BAT never completed we must write KB_INT so the OS keyboard
+    // driver can receive IRQ1 — both SeaBIOS and GRUB restore the config
+    // byte unconditionally before handing off to the OS.
+    if matches!(kb.init_state, InitState::NotStarted) {
         return;
     }
 
