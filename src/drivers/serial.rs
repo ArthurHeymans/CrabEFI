@@ -6,6 +6,8 @@
 //!
 //! The backend is selected at runtime based on coreboot's serial info.
 //! On aarch64 platforms (e.g., QEMU SBSA with PL011), only MMIO is available.
+//! On AMD systems the UART is memory-mapped with a 4-byte register stride
+//! (`regwidth = 4` in the coreboot serial table).
 
 use core::fmt::{self, Write};
 
@@ -29,37 +31,65 @@ enum Uart16550Backend {
     /// x86 I/O port-based access
     #[cfg(target_arch = "x86_64")]
     PortIo { base: u16 },
-    /// Memory-mapped register access (16550-compatible)
-    Mmio { base: u64 },
+    /// Memory-mapped register access (16550-compatible).
+    ///
+    /// `reg_stride` is the spacing between consecutive 8-bit registers in
+    /// bytes, taken from coreboot's `regwidth` field.  Traditional 8250/16550
+    /// devices use stride 1; many AMD SoC UARTs use stride 4 (each 8-bit
+    /// register occupies a 32-bit slot and must be accessed with 32-bit
+    /// reads/writes).
+    Mmio { base: u64, reg_stride: u32 },
 }
 
 impl Uart16550Backend {
-    /// Read an 8-bit register at the given offset
+    /// Read an 8-bit UART register by index (0-7).
+    ///
+    /// For I/O ports, issues `inb(base + reg)`.
+    /// For MMIO, reads at `base + reg * reg_stride` using the access width
+    /// implied by the stride: 32-bit for stride >= 4, 16-bit for stride 2,
+    /// 8-bit otherwise.
     #[inline]
-    fn read(&self, offset: usize) -> u8 {
+    fn read(&self, reg: usize) -> u8 {
         match self {
             #[cfg(target_arch = "x86_64")]
             Uart16550Backend::PortIo { base } => unsafe {
-                crate::arch::x86_64::io::inb(*base + offset as u16)
+                crate::arch::x86_64::io::inb(*base + reg as u16)
             },
-            Uart16550Backend::Mmio { base } => unsafe {
-                let addr = (*base + offset as u64) as *const u8;
-                core::ptr::read_volatile(addr)
+            Uart16550Backend::Mmio { base, reg_stride } => unsafe {
+                let addr = base + reg as u64 * *reg_stride as u64;
+                if *reg_stride >= 4 {
+                    (core::ptr::read_volatile(addr as *const u32) & 0xFF) as u8
+                } else if *reg_stride == 2 {
+                    (core::ptr::read_volatile(addr as *const u16) & 0xFF) as u8
+                } else {
+                    core::ptr::read_volatile(addr as *const u8)
+                }
             },
         }
     }
 
-    /// Write an 8-bit register at the given offset
+    /// Write an 8-bit UART register by index (0-7).
+    ///
+    /// For I/O ports, issues `outb(base + reg, value)`.
+    /// For MMIO, writes at `base + reg * reg_stride` using the appropriate
+    /// access width (32-bit for stride >= 4, 16-bit for stride 2, 8-bit
+    /// otherwise).
     #[inline]
-    fn write(&self, offset: usize, value: u8) {
+    fn write(&self, reg: usize, value: u8) {
         match self {
             #[cfg(target_arch = "x86_64")]
             Uart16550Backend::PortIo { base } => unsafe {
-                crate::arch::x86_64::io::outb(*base + offset as u16, value);
+                crate::arch::x86_64::io::outb(*base + reg as u16, value);
             },
-            Uart16550Backend::Mmio { base } => unsafe {
-                let addr = (*base + offset as u64) as *mut u8;
-                core::ptr::write_volatile(addr, value);
+            Uart16550Backend::Mmio { base, reg_stride } => unsafe {
+                let addr = base + reg as u64 * *reg_stride as u64;
+                if *reg_stride >= 4 {
+                    core::ptr::write_volatile(addr as *mut u32, value as u32);
+                } else if *reg_stride == 2 {
+                    core::ptr::write_volatile(addr as *mut u16, value as u16);
+                } else {
+                    core::ptr::write_volatile(addr as *mut u8, value);
+                }
             },
         }
     }
@@ -128,8 +158,16 @@ impl SerialPort {
 
     /// Initialize the serial port with the given baud rate (16550 mode)
     ///
+    /// # Arguments
+    /// * `baud` - Baud rate (e.g. 115200)
+    /// * `input_hertz` - UART input clock frequency.  When non-zero the divisor
+    ///   is computed as `input_hertz / (16 * baud)` (handles non-standard
+    ///   clocks such as the 48 MHz oscillator on many AMD SoCs).  When zero the
+    ///   legacy formula `115200 / baud` is used (assumes the standard 1.8432 MHz
+    ///   crystal where 1 843 200 / 16 = 115 200).
+    ///
     /// Returns true if initialization succeeded, false if no serial port detected.
-    pub fn init_16550(&mut self, baud: u32) -> bool {
+    pub fn init_16550(&mut self, baud: u32, input_hertz: u32) -> bool {
         if !self.detect() {
             self.functional = false;
             return false;
@@ -138,7 +176,15 @@ impl SerialPort {
             self.functional = false;
             return false;
         }
-        let divisor = 115200 / baud;
+        // Calculate baud rate divisor.
+        let divisor = if input_hertz > 0 {
+            // General formula: clock / (16 * baud).
+            // Ensures at least 1 to avoid a divide-by-zero or zero divisor.
+            (input_hertz / (16 * baud)).max(1)
+        } else {
+            // Legacy formula for the standard 1.8432 MHz crystal.
+            115200 / baud
+        };
 
         match self.backend {
             #[cfg(target_arch = "x86_64")]
@@ -431,17 +477,18 @@ pub const COM1: u16 = 0x3F8;
 
 /// Initialize serial port from coreboot table information
 ///
+/// Uses `serial_type` to choose I/O port vs MMIO access, `regwidth` for the
+/// MMIO register stride, and `input_hertz` for an accurate baud divisor.
+///
 /// # Arguments
-/// * `base_addr` - I/O port or MMIO base address from coreboot serial info
-/// * `baud` - Baud rate (typically 115200)
-/// * `is_mmio` - Whether the address is MMIO (true) or I/O port (false)
-pub fn init_from_coreboot(base_addr: u32, baud: u32, is_mmio: bool) {
-    if is_mmio {
+/// * `info` - Serial port configuration parsed from coreboot tables
+pub fn init_from_coreboot(info: &crate::coreboot::tables::SerialInfo) {
+    if info.mmio() {
         // MMIO UART - could be 16550 or PL011
         // On aarch64 SBSA platforms, it's typically PL011
         #[cfg(target_arch = "aarch64")]
         {
-            let mut port = Pl011Port::new(base_addr as u64);
+            let mut port = Pl011Port::new(info.baseaddr as u64);
             if port.functional {
                 let _ = port.write_str("\r\n[CrabEFI] PL011 serial initialized from coreboot\r\n");
                 // SAFETY: Single-threaded firmware; raw pointer avoids re-entrancy
@@ -453,14 +500,18 @@ pub fn init_from_coreboot(base_addr: u32, baud: u32, is_mmio: bool) {
             }
         }
 
-        // Fall back to MMIO 16550
+        // MMIO 16550 (or 16550-compatible).
+        // `regwidth` from coreboot tells us how far apart registers are; default
+        // to 1-byte stride when coreboot doesn't specify (regwidth == 0).
+        let reg_stride = if info.regwidth > 0 { info.regwidth } else { 1 };
         let mut serial = SerialPort {
             backend: Uart16550Backend::Mmio {
-                base: base_addr as u64,
+                base: info.baseaddr as u64,
+                reg_stride,
             },
             functional: false,
         };
-        if serial.init_16550(baud) {
+        if serial.init_16550(info.baud, info.input_hertz) {
             let _ = serial.write_str("\r\n[CrabEFI] MMIO serial initialized from coreboot\r\n");
             // SAFETY: Single-threaded firmware; raw pointer avoids re-entrancy
             // issues since serial is called from log macros inside other state closures.
@@ -475,11 +526,11 @@ pub fn init_from_coreboot(base_addr: u32, baud: u32, is_mmio: bool) {
         {
             let mut serial = SerialPort {
                 backend: Uart16550Backend::PortIo {
-                    base: base_addr as u16,
+                    base: info.baseaddr as u16,
                 },
                 functional: false,
             };
-            if serial.init_16550(baud) {
+            if serial.init_16550(info.baud, info.input_hertz) {
                 let _ = serial.write_str("\r\n[CrabEFI] Serial initialized from coreboot\r\n");
                 // SAFETY: Single-threaded firmware; raw pointer avoids re-entrancy
                 // issues since serial is called from log macros inside other state closures.
@@ -492,7 +543,7 @@ pub fn init_from_coreboot(base_addr: u32, baud: u32, is_mmio: bool) {
         #[cfg(not(target_arch = "x86_64"))]
         {
             // I/O port serial not supported on non-x86
-            let _ = (base_addr, baud);
+            let _ = info;
         }
     }
 }
