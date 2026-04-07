@@ -11,6 +11,7 @@
 //! - The core layer handles enumeration and device management
 
 use crate::efi;
+use crate::time::Timeout;
 use core::ptr;
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned};
 
@@ -1329,4 +1330,208 @@ where
     }
 
     Ok(device)
+}
+
+// ============================================================================
+// Hub Enumeration Helper
+// ============================================================================
+
+/// Maximum number of downstream hub ports tracked per hub.
+///
+/// USB 2.0 compound devices may have up to 7 ports; USB 3.x hubs up to 15.
+/// 16 covers all realistic cases without heap allocation.
+const MAX_HUB_PORTS: usize = 16;
+
+/// Enumerate devices connected to an external USB hub.
+///
+/// Encapsulates the protocol sequence shared by EHCI and UHCI: fetch the hub
+/// descriptor, power all downstream ports, wait for power stabilisation, then
+/// for each port that has a device connected — clear the connection-change bit,
+/// issue a port reset, and record the result.
+///
+/// The second closure problem (two `&mut self` borrows at once) is avoided by
+/// returning the list of ready ports rather than calling a second closure
+/// inline. The caller iterates the returned list and enumerates each device
+/// separately, after `enumerate_hub_ports` has returned and released the
+/// `do_control` borrow.
+///
+/// # Arguments
+/// * `hub_device` - The hub's [`UsbDevice`] (used as the transfer target)
+/// * `do_control` - Performs a control transfer on behalf of the caller
+/// * `supports_high_speed` - `true` for EHCI; `false` for UHCI (USB 1.1 only)
+///
+/// # Returns
+/// `Ok((num_ports, ready_ports))` where `ready_ports` is the list of
+/// `(port, speed)` pairs for ports whose reset completed successfully.
+pub fn enumerate_hub_ports<C>(
+    hub_device: &UsbDevice,
+    mut do_control: C,
+    supports_high_speed: bool,
+) -> Result<(u8, heapless::Vec<(u8, UsbSpeed), MAX_HUB_PORTS>), UsbError>
+where
+    C: FnMut(&UsbDevice, u8, u8, u16, u16, Option<&mut [u8]>) -> Result<usize, UsbError>,
+{
+    // Fetch hub class descriptor (bmRequestType = 0xA0: D→H, Class, Device).
+    let mut hub_desc_buf = [0u8; 9];
+    do_control(
+        hub_device,
+        req_type::DIR_IN | req_type::TYPE_CLASS | req_type::RCPT_DEVICE,
+        request::GET_DESCRIPTOR,
+        (HUB_DESCRIPTOR_TYPE as u16) << 8,
+        0,
+        Some(&mut hub_desc_buf),
+    )?;
+
+    let (hub_desc, _) =
+        HubDescriptor::read_from_prefix(&hub_desc_buf).map_err(|_| UsbError::TransferFailed(0))?;
+    let num_ports = hub_desc.num_ports;
+    let power_on_delay = (hub_desc.power_on_to_power_good as u64) * 2; // 2 ms units
+
+    log::info!(
+        "  Hub has {} ports, power-on delay: {}ms",
+        num_ports,
+        power_on_delay
+    );
+
+    let mut ready_ports: heapless::Vec<(u8, UsbSpeed), MAX_HUB_PORTS> = heapless::Vec::new();
+
+    // Power on all downstream ports (SET_FEATURE PORT_POWER).
+    for port in 1..=num_ports {
+        let _ = do_control(
+            hub_device,
+            req_type::DIR_OUT | req_type::TYPE_CLASS | req_type::RCPT_OTHER,
+            request::SET_FEATURE,
+            hub_feature::PORT_POWER,
+            port as u16,
+            None,
+        );
+    }
+
+    // Wait for power to stabilise (spec minimum 100 ms).
+    crate::time::delay_ms(power_on_delay.max(100));
+
+    // Check each port for a connected device and enumerate it.
+    for port in 1..=num_ports {
+        let mut status_buf = [0u8; 4];
+        if do_control(
+            hub_device,
+            req_type::DIR_IN | req_type::TYPE_CLASS | req_type::RCPT_OTHER,
+            request::GET_STATUS,
+            0,
+            port as u16,
+            Some(&mut status_buf),
+        )
+        .is_err()
+        {
+            continue;
+        }
+
+        let port_status = u16::from_le_bytes([status_buf[0], status_buf[1]]);
+        let port_change = u16::from_le_bytes([status_buf[2], status_buf[3]]);
+
+        log::debug!(
+            "  Hub port {} status: {:#06x}, change: {:#06x}",
+            port,
+            port_status,
+            port_change
+        );
+
+        if (port_status & hub_port_status::CONNECTION) == 0 {
+            continue;
+        }
+
+        log::info!("  Device detected on hub port {}", port);
+
+        // Clear the connection-change bit if set.
+        if port_change & hub_port_change::C_CONNECTION != 0 {
+            let _ = do_control(
+                hub_device,
+                req_type::DIR_OUT | req_type::TYPE_CLASS | req_type::RCPT_OTHER,
+                request::CLEAR_FEATURE,
+                hub_feature::C_PORT_CONNECTION,
+                port as u16,
+                None,
+            );
+        }
+
+        // Issue a port reset (SET_FEATURE PORT_RESET).
+        if do_control(
+            hub_device,
+            req_type::DIR_OUT | req_type::TYPE_CLASS | req_type::RCPT_OTHER,
+            request::SET_FEATURE,
+            hub_feature::PORT_RESET,
+            port as u16,
+            None,
+        )
+        .is_err()
+        {
+            continue;
+        }
+
+        // Wait at least 50 ms then poll for C_PORT_RESET.
+        crate::time::delay_ms(50);
+
+        let mut reset_complete = false;
+        let timeout = Timeout::from_ms(500);
+        while !timeout.is_expired() {
+            let mut status_buf = [0u8; 4];
+            if do_control(
+                hub_device,
+                req_type::DIR_IN | req_type::TYPE_CLASS | req_type::RCPT_OTHER,
+                request::GET_STATUS,
+                0,
+                port as u16,
+                Some(&mut status_buf),
+            )
+            .is_err()
+            {
+                break;
+            }
+
+            let port_status = u16::from_le_bytes([status_buf[0], status_buf[1]]);
+            let port_change = u16::from_le_bytes([status_buf[2], status_buf[3]]);
+
+            if port_change & hub_port_change::C_RESET != 0 {
+                // Acknowledge the reset-complete change bit.
+                let _ = do_control(
+                    hub_device,
+                    req_type::DIR_OUT | req_type::TYPE_CLASS | req_type::RCPT_OTHER,
+                    request::CLEAR_FEATURE,
+                    hub_feature::C_PORT_RESET,
+                    port as u16,
+                    None,
+                );
+
+                if (port_status & hub_port_status::ENABLE) != 0 {
+                    // Determine device speed from port status bits.
+                    let speed = if supports_high_speed
+                        && (port_status & hub_port_status::HIGH_SPEED) != 0
+                    {
+                        UsbSpeed::High
+                    } else if (port_status & hub_port_status::LOW_SPEED) != 0 {
+                        UsbSpeed::Low
+                    } else {
+                        UsbSpeed::Full
+                    };
+
+                    log::info!("  Hub port {} reset complete, speed: {:?}", port, speed);
+
+                    crate::time::delay_ms(10); // USB spec reset-recovery time
+                    // Overflow is silently ignored: more than MAX_HUB_PORTS
+                    // ready devices on a single hub is not realistic.
+                    let _ = ready_ports.push((port, speed));
+                    reset_complete = true;
+                }
+                break;
+            }
+
+            crate::time::delay_ms(10);
+        }
+
+        if !reset_complete {
+            log::warn!("  Hub port {} reset timed out", port);
+        }
+    }
+
+    Ok((num_ports, ready_ports))
 }
