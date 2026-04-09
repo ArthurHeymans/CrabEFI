@@ -2,7 +2,7 @@
 #
 # Usage:
 #   cd ~/src/coreboot
-#   make defconfig KBUILD_DEFCONFIG=$HOME/src/CrabEFI/coreboot-qemu-q35.defconfig
+#   make defconfig KBUILD_DEFCONFIG=$HOME/src/CrabEFI_RISCV64/crabefi-coreboot/coreboot-qemu-q35.defconfig
 #   make -j$(nproc)
 
 # Mainboard: QEMU x86 Q35
