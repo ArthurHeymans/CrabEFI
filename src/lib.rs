@@ -234,14 +234,19 @@ fn init_platform_impl(mut config: PlatformConfig) -> ! {
     //
     // On x86_64: install the IDT for exception handling.
     //
-    // On riscv64: the stvec is set by the entry assembly. Nothing extra
-    // needed here since the trap vector was already installed at entry.
+    // On riscv64 with platform-entry: stvec is set by entry assembly.
+    // On riscv64 without platform-entry (library mode): the calling
+    // firmware may have installed its own stvec, but we install
+    // CrabEFI's handler here to ensure proper interrupt masking and
+    // exception diagnostics during UEFI app execution.
     #[cfg(target_arch = "aarch64")]
     unsafe {
         arch::aarch64::exceptions::install_exception_vectors_auto();
     }
     #[cfg(target_arch = "x86_64")]
     arch::x86_64::idt::init();
+    #[cfg(target_arch = "riscv64")]
+    arch::riscv64::trap::install_trap_vectors();
 
     // ---- 2. Initialize serial output from platform debug_output ----
     //

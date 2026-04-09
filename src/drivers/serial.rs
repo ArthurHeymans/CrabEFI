@@ -28,7 +28,7 @@ const TX_TIMEOUT_ITERATIONS: u32 = 100_000;
 
 /// Backend for accessing 16550 UART registers
 #[derive(Clone, Copy)]
-enum Uart16550Backend {
+pub(crate) enum Uart16550Backend {
     /// x86 I/O port-based access
     #[cfg(target_arch = "x86_64")]
     PortIo { base: u16 },
@@ -116,9 +116,9 @@ const LCR_DLAB: u8 = 0x80;
 
 /// A 16550-compatible serial port
 pub struct SerialPort {
-    backend: Uart16550Backend,
+    pub(crate) backend: Uart16550Backend,
     /// Whether this port has been detected as functional
-    functional: bool,
+    pub(crate) functional: bool,
 }
 
 impl SerialPort {

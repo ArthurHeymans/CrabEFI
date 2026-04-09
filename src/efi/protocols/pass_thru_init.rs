@@ -35,6 +35,17 @@ fn init_nvme_pass_thru() {
         let Some(controller_ptr) = nvme::get_controller(controller_index) else {
             break;
         };
+        // Guard against null or obviously-invalid pointers (can happen if the
+        // controller registry's internal Vec is corrupted, e.g. by a stray DMA
+        // write or memory overlap).
+        if controller_ptr.is_null() || (controller_ptr as usize) < 0x1000 {
+            log::warn!(
+                "NVMe controller {} has invalid pointer {:p}, skipping",
+                controller_index,
+                controller_ptr,
+            );
+            continue;
+        }
         // Safety: pointer valid for firmware lifetime; no overlapping &mut created
         let controller = unsafe { &mut *controller_ptr };
 

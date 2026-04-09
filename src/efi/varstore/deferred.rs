@@ -280,10 +280,18 @@ fn buffer_size() -> usize {
 /// This clears any existing data and writes a fresh header.
 pub fn init_buffer() {
     let base = buffer_base();
+    let size = buffer_size();
+
+    // No deferred buffer configured (library mode without platform-entry
+    // and no explicit deferred_buffer in PlatformConfig).
+    if base.is_null() || size == 0 {
+        log::debug!("No deferred variable buffer — skipping init");
+        return;
+    }
 
     // Zero out the entire buffer
     unsafe {
-        core::ptr::write_bytes(base, 0, buffer_size());
+        core::ptr::write_bytes(base, 0, size);
     }
 
     // Write fresh header

@@ -14,6 +14,7 @@ pub mod entry;
 pub mod reset;
 pub mod rng;
 pub mod sbi;
+pub mod trap;
 
 /// Read the monotonic time counter (`rdtime` / `time` CSR).
 ///
