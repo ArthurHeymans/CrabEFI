@@ -379,6 +379,8 @@ pub fn init() {
 
     // Set access method and enumerate devices in one closure so we can
     // borrow both `pci.access` and `pci.devices` without aliasing issues.
+    // Set access method and enumerate devices in one closure so we can
+    // borrow both `pci.access` and `pci.devices` without aliasing issues.
     state::with_drivers_mut(|drivers| {
         drivers.pci.access = new_access;
         let pci = &mut drivers.pci;
