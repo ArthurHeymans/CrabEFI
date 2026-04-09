@@ -2,7 +2,7 @@
 #
 # Usage:
 #   cd ~/src/coreboot
-#   make defconfig KBUILD_DEFCONFIG=$HOME/src/CrabEFI/coreboot-qemu.defconfig
+#   make defconfig KBUILD_DEFCONFIG=$HOME/src/CrabEFI_RISCV64/crabefi-coreboot/coreboot-qemu.defconfig
 #   make menuconfig  # Optional: adjust payload path
 #   make -j$(nproc)
 

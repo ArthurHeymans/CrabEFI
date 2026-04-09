@@ -4,7 +4,7 @@
 #   1. cargo build -p crabefi-coreboot --release --target riscv64gc-unknown-none-elf
 #   2. cd ~/src/coreboot
 #   3. sed 's|@@CRABEFI_ELF@@|/path/to/CrabEFI_RISCV64/target/riscv64gc-unknown-none-elf/release/crabefi|' \
-#        /path/to/CrabEFI_RISCV64/coreboot-qemu-riscv64.defconfig > .config
+#        /path/to/CrabEFI_RISCV64/crabefi-coreboot/coreboot-qemu-riscv64.defconfig > .config
 #   4. make olddefconfig && make -j$(nproc)
 #
 # Run:
