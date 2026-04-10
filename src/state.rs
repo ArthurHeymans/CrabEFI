@@ -609,8 +609,8 @@ impl Default for EfiState {
 // Driver State
 // ============================================================================
 
-use crate::drivers::pci::PciDevice;
 use crate::drivers::pci::access::AnyPciAccess;
+use crate::drivers::pci::PciDevice;
 use crate::drivers::serial::AnySerial;
 use crate::drivers::storage::StorageRegistry;
 use crate::efi::protocols::serial_io::SerialIoMode;
@@ -853,6 +853,13 @@ pub struct PlatformInfo {
 
     /// CBMEM console address (0 = not initialized/disabled)
     pub cbmem_console_addr: u64,
+
+    /// EFI firmware info (GUID, version, LSV) from coreboot's LB_TAG_EFI_FW_INFO
+    pub efi_fw_info: Option<crate::coreboot::EfiFwInfo>,
+
+    /// Capsule regions from coreboot's LB_TAG_CAPSULE entries
+    pub capsule_regions:
+        HeaplessVec<crate::coreboot::CapsuleRegion, { crate::coreboot::tables::MAX_CAPSULES }>,
 }
 
 impl PlatformInfo {
@@ -867,6 +874,8 @@ impl PlatformInfo {
             memory_regions: HeaplessVec::new(),
             acpi_rsdp: None,
             cbmem_console_addr: 0,
+            efi_fw_info: None,
+            capsule_regions: HeaplessVec::new(),
         }
     }
 }

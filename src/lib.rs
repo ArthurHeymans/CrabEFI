@@ -50,10 +50,11 @@ use crate::drivers::block::{AhciDisk, NvmeDisk, SdhciDisk, UsbDisk};
 
 // Re-export the public platform API at the crate root for ergonomic access.
 pub use platform::{
-    BlockDevice, BlockDeviceInfo, BlockError, BootResult, ConsoleInput, DebugOutput,
-    DeferredBufferConfig, FramebufferConfig, Key, KeyState, MemoryRegion, MemoryType,
-    PlatformConfig, ResetHandler, ResetType, Rng, RngError, RuntimeRegion, StorageBackend,
-    StorageError, Timer, VarBackendError, VariableBackend, VariableVisitor,
+    BlockDevice, BlockDeviceInfo, BlockError, BootResult, CapsuleBackend, CapsuleRegion,
+    ConsoleInput, DebugOutput, DeferredBufferConfig, FirmwareInfo, FmapRegion, FramebufferConfig,
+    Key, KeyState, MemoryRegion, MemoryType, PlatformConfig, ResetHandler, ResetType, Rng,
+    RngError, RuntimeRegion, StorageBackend, StorageError, Timer, VarBackendError,
+    VariableBackend, VariableVisitor,
 };
 
 /// Display a Secure Boot violation error on screen

@@ -40,6 +40,8 @@ pub mod tags {
     pub const CB_TAG_SMMSTOREV2: u32 = 0x0039;
     pub const CB_TAG_FMAP: u32 = 0x0037;
     pub const CB_TAG_ACPI_RSDP: u32 = 0x0043;
+    pub const CB_TAG_EFI_FW_INFO: u32 = 0x0045;
+    pub const CB_TAG_CAPSULE: u32 = 0x0046;
     pub const CB_TAG_CFR_ROOT: u32 = 0x0047;
     pub const CB_TAG_DEVICETREE: u32 = 0x004a;
 }
@@ -256,6 +258,34 @@ struct CbBootMediaParams {
     boot_media_size: u64,
 }
 
+/// EFI firmware info record from coreboot tables
+///
+/// Matches coreboot's `struct lb_efi_fw_info`:
+///   tag, size, guid[16], version, lowest_supported_version, fw_size
+#[repr(C, packed)]
+#[derive(FromBytes, Immutable, KnownLayout, Unaligned)]
+struct CbEfiFwInfo {
+    tag: u32,
+    size: u32,
+    guid: [u8; 16],
+    version: u32,
+    lowest_supported_version: u32,
+    fw_size: u32,
+}
+
+/// Capsule region record from coreboot tables
+///
+/// Matches coreboot's `struct lb_range` used for LB_TAG_CAPSULE:
+///   tag, size, range_start, range_size
+#[repr(C, packed)]
+#[derive(FromBytes, Immutable, KnownLayout, Unaligned)]
+struct CbCapsule {
+    tag: u32,
+    size: u32,
+    range_start: u64,
+    range_size: u32,
+}
+
 /// Coreboot serial type: I/O port mapped
 pub const LB_SERIAL_TYPE_IO_MAPPED: u32 = 1;
 /// Coreboot serial type: Memory mapped
@@ -331,6 +361,39 @@ pub struct BootMediaInfo {
     pub boot_media_size: u64,
 }
 
+/// Maximum number of capsules we track from coreboot tables
+pub const MAX_CAPSULES: usize = 32;
+
+/// EFI firmware information from coreboot's LB_TAG_EFI_FW_INFO
+///
+/// Contains the firmware identity and version information used for
+/// ESRT (EFI System Resource Table) and capsule update validation.
+/// Reference: coreboot/src/commonlib/include/commonlib/coreboot_tables.h
+#[derive(Debug, Clone, Copy)]
+pub struct EfiFwInfo {
+    /// Firmware class GUID (identifies the firmware component for updates)
+    pub guid: [u8; 16],
+    /// Current firmware version (higher = more recent)
+    pub version: u32,
+    /// Lowest supported version (for rollback prevention)
+    pub lowest_supported_version: u32,
+    /// Size of the firmware image in bytes
+    pub fw_size: u32,
+}
+
+/// A capsule region from coreboot's LB_TAG_CAPSULE
+///
+/// Points to a coalesced capsule in memory that coreboot prepared from
+/// CapsuleUpdateData* EFI variables after a warm reboot.
+/// Reference: coreboot/src/commonlib/include/commonlib/coreboot_tables.h
+#[derive(Debug, Clone, Copy)]
+pub struct CapsuleRegion {
+    /// Physical base address of the capsule data
+    pub base: u64,
+    /// Size of the capsule data in bytes
+    pub size: u32,
+}
+
 /// Information extracted from coreboot tables
 pub struct CorebootInfo {
     /// Memory map
@@ -363,6 +426,10 @@ pub struct CorebootInfo {
     pub cfr_raw: Option<&'static [u8]>,
     /// Flattened device tree (FDT) pointer and size
     pub devicetree: Option<(u64, u32)>,
+    /// EFI firmware info (GUID, version, LSV) for ESRT and capsule updates
+    pub efi_fw_info: Option<EfiFwInfo>,
+    /// Capsule regions from coreboot (coalesced capsules ready for processing)
+    pub capsules: heapless::Vec<CapsuleRegion, MAX_CAPSULES>,
 }
 
 impl CorebootInfo {
@@ -381,6 +448,8 @@ impl CorebootInfo {
             boot_media: None,
             cfr_raw: None,
             devicetree: None,
+            efi_fw_info: None,
+            capsules: heapless::Vec::new(),
         }
     }
 }
@@ -610,6 +679,12 @@ fn parse_record(record_bytes: &[u8], info: &mut CorebootInfo) {
         }
         tags::CB_TAG_DEVICETREE => {
             parse_devicetree(record_bytes, info);
+        }
+        tags::CB_TAG_EFI_FW_INFO => {
+            parse_efi_fw_info(record_bytes, info);
+        }
+        tags::CB_TAG_CAPSULE => {
+            parse_capsule(record_bytes, info);
         }
         tags::CB_TAG_VERSION => {
             // Version string follows the 8-byte record header
@@ -880,6 +955,56 @@ fn parse_devicetree(record_bytes: &[u8], info: &mut CorebootInfo) {
     let fdt_size = dt.fdt_size;
     info.devicetree = Some((fdt_pointer, fdt_size));
     log::debug!("Devicetree: {:#x} ({} bytes)", fdt_pointer, fdt_size);
+}
+
+/// Parse EFI firmware info record (LB_TAG_EFI_FW_INFO)
+///
+/// Contains firmware GUID, version, and lowest supported version used for
+/// ESRT and capsule update validation.
+fn parse_efi_fw_info(record_bytes: &[u8], info: &mut CorebootInfo) {
+    let Ok((fw_info, _)) = CbEfiFwInfo::read_from_prefix(record_bytes) else {
+        log::warn!("Failed to parse EFI firmware info record");
+        return;
+    };
+
+    let version = fw_info.version;
+    let lsv = fw_info.lowest_supported_version;
+    let fw_size = fw_info.fw_size;
+
+    info.efi_fw_info = Some(EfiFwInfo {
+        guid: fw_info.guid,
+        version,
+        lowest_supported_version: lsv,
+        fw_size,
+    });
+
+    log::info!(
+        "EFI FW info: version={:#x}, LSV={:#x}, size={} KB",
+        version,
+        lsv,
+        fw_size / 1024
+    );
+}
+
+/// Parse capsule region record (LB_TAG_CAPSULE)
+///
+/// Each record describes a coalesced capsule in memory that coreboot
+/// prepared from CapsuleUpdateData* EFI variables.
+fn parse_capsule(record_bytes: &[u8], info: &mut CorebootInfo) {
+    let Ok((capsule, _)) = CbCapsule::read_from_prefix(record_bytes) else {
+        log::warn!("Failed to parse capsule record");
+        return;
+    };
+
+    let base = capsule.range_start;
+    let size = capsule.range_size;
+
+    if info.capsules.push(CapsuleRegion { base, size }).is_err() {
+        log::warn!("Too many capsule records (max {})", MAX_CAPSULES);
+        return;
+    }
+
+    log::info!("Capsule region: base={:#x}, size={} bytes", base, size);
 }
 
 /// Parse CBMEM console reference

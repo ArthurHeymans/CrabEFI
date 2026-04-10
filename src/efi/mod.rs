@@ -6,6 +6,8 @@
 pub mod allocator;
 pub mod auth;
 pub mod boot_services;
+pub mod capsule;
+pub mod esrt;
 pub mod guid_fmt;
 pub mod image_loader;
 pub mod protocols;
