@@ -205,3 +205,104 @@ pub fn validate_capsule(header: &CapsuleHeader, data_len: usize) -> Result<(), C
 fn guids_equal(a: &Guid, b: &Guid) -> bool {
     a.as_bytes() == b.as_bytes()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build a minimal capsule header byte buffer.
+    fn make_capsule_bytes(guid: &Guid, header_size: u32, flags: u32, image_size: u32) -> [u8; 28] {
+        let mut buf = [0u8; 28];
+        buf[0..16].copy_from_slice(guid.as_bytes());
+        buf[16..20].copy_from_slice(&header_size.to_le_bytes());
+        buf[20..24].copy_from_slice(&flags.to_le_bytes());
+        buf[24..28].copy_from_slice(&image_size.to_le_bytes());
+        buf
+    }
+
+    #[test]
+    fn parse_valid_fmp_header() {
+        let data = make_capsule_bytes(
+            &EFI_FIRMWARE_MANAGEMENT_CAPSULE_ID_GUID,
+            28,
+            CAPSULE_FLAGS_PERSIST_ACROSS_RESET,
+            1024,
+        );
+        let hdr = parse_capsule_header(&data).unwrap();
+        assert_eq!(hdr.header_size, 28);
+        assert_eq!(hdr.flags, CAPSULE_FLAGS_PERSIST_ACROSS_RESET);
+        assert_eq!(hdr.capsule_image_size, 1024);
+        assert_eq!(identify_capsule_type(&hdr.capsule_guid), CapsuleType::Fmp);
+    }
+
+    #[test]
+    fn parse_windows_ux_capsule() {
+        let data = make_capsule_bytes(&WINDOWS_UX_CAPSULE_GUID, 28, 0, 512);
+        let hdr = parse_capsule_header(&data).unwrap();
+        assert_eq!(
+            identify_capsule_type(&hdr.capsule_guid),
+            CapsuleType::WindowsUx
+        );
+    }
+
+    #[test]
+    fn parse_unknown_guid() {
+        let unknown = Guid::from_fields(0x12345678, 0xABCD, 0xEF01, 0x23, 0x45, &[0; 6]);
+        let data = make_capsule_bytes(&unknown, 28, 0, 256);
+        let hdr = parse_capsule_header(&data).unwrap();
+        assert_eq!(
+            identify_capsule_type(&hdr.capsule_guid),
+            CapsuleType::Unknown
+        );
+    }
+
+    #[test]
+    fn reject_too_small_buffer() {
+        let data = [0u8; 16]; // less than 28 bytes
+        assert_eq!(
+            parse_capsule_header(&data),
+            Err(CapsuleError::BufferTooSmall)
+        );
+    }
+
+    #[test]
+    fn reject_invalid_header_size() {
+        let data = make_capsule_bytes(
+            &EFI_FIRMWARE_MANAGEMENT_CAPSULE_ID_GUID,
+            10, // less than MIN_CAPSULE_HEADER_SIZE
+            0,
+            1024,
+        );
+        assert_eq!(
+            parse_capsule_header(&data),
+            Err(CapsuleError::InvalidHeaderSize)
+        );
+    }
+
+    #[test]
+    fn reject_image_size_less_than_header() {
+        let data = make_capsule_bytes(
+            &EFI_FIRMWARE_MANAGEMENT_CAPSULE_ID_GUID,
+            28,
+            0,
+            20, // less than header_size
+        );
+        assert_eq!(
+            parse_capsule_header(&data),
+            Err(CapsuleError::InvalidImageSize)
+        );
+    }
+
+    #[test]
+    fn validate_capsule_checks_buffer_length() {
+        let data = make_capsule_bytes(&EFI_FIRMWARE_MANAGEMENT_CAPSULE_ID_GUID, 28, 0, 1024);
+        let hdr = parse_capsule_header(&data).unwrap();
+        // Buffer only 28 bytes, but capsule claims 1024
+        assert_eq!(
+            validate_capsule(&hdr, 28),
+            Err(CapsuleError::ImageSizeExceedsBuffer)
+        );
+        // Buffer large enough
+        assert!(validate_capsule(&hdr, 1024).is_ok());
+    }
+}

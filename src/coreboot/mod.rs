@@ -112,7 +112,8 @@ pub fn capsule_count() -> usize {
 
 /// Get a capsule region by index
 pub fn get_capsule(index: usize) -> Option<CapsuleRegion> {
-    crate::state::try_get().and_then(|state| state.drivers.platform.capsule_regions.get(index).copied())
+    crate::state::try_get()
+        .and_then(|state| state.drivers.platform.capsule_regions.get(index).copied())
 }
 
 // CFR info is stored separately because it can be very large with nested heapless::Vec.

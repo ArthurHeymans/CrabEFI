@@ -53,8 +53,8 @@ pub use platform::{
     BlockDevice, BlockDeviceInfo, BlockError, BootResult, CapsuleBackend, CapsuleRegion,
     ConsoleInput, DebugOutput, DeferredBufferConfig, FirmwareInfo, FmapRegion, FramebufferConfig,
     Key, KeyState, MemoryRegion, MemoryType, PlatformConfig, ResetHandler, ResetType, Rng,
-    RngError, RuntimeRegion, StorageBackend, StorageError, Timer, VarBackendError,
-    VariableBackend, VariableVisitor,
+    RngError, RuntimeRegion, StorageBackend, StorageError, Timer, VarBackendError, VariableBackend,
+    VariableVisitor,
 };
 
 /// Display a Secure Boot violation error on screen
@@ -349,6 +349,24 @@ fn init_platform_impl(mut config: PlatformConfig) -> ! {
     if let Some(fb) = crate::state::get_framebuffer() {
         drivers::mouse_cursor::init(fb.width, fb.height);
     }
+
+    // ---- 8b. Install ESRT and advertise capsule update support ----
+    //
+    // The ESRT is built from firmware info (LB_TAG_EFI_FW_INFO) and
+    // installed as an EFI Configuration Table for fwupd/LVFS discovery.
+    // OsIndicationsSupported tells the OS what capsule delivery mechanisms
+    // are available.
+    if let Some(fw_info) = crate::coreboot::get_efi_fw_info() {
+        let platform_fw_info = crate::platform::FirmwareInfo {
+            guid: fw_info.guid,
+            version: fw_info.version,
+            lowest_supported_version: fw_info.lowest_supported_version,
+            fw_size: fw_info.fw_size,
+        };
+        efi::esrt::install_esrt(&platform_fw_info);
+        log::info!("ESRT installed for firmware updates");
+    }
+    efi::capsule::disk::install_os_indications_supported();
 
     log::info!("CrabEFI initialized successfully!");
     log::info!("EFI System Table at: {:p}", efi::get_system_table());

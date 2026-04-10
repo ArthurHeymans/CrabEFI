@@ -69,12 +69,6 @@ pub struct EfiSystemResourceEntry {
     pub last_attempt_status: u32,
 }
 
-/// Size of the ESRT header (without entries).
-const ESRT_HEADER_SIZE: usize = core::mem::size_of::<EfiSystemResourceTable>();
-
-/// Size of a single ESRT entry.
-const ESRT_ENTRY_SIZE: usize = core::mem::size_of::<EfiSystemResourceEntry>();
-
 // ============================================================================
 // Static ESRT Storage
 // ============================================================================

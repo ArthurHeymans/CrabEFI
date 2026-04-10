@@ -609,8 +609,8 @@ impl Default for EfiState {
 // Driver State
 // ============================================================================
 
-use crate::drivers::pci::access::AnyPciAccess;
 use crate::drivers::pci::PciDevice;
+use crate::drivers::pci::access::AnyPciAccess;
 use crate::drivers::serial::AnySerial;
 use crate::drivers::storage::StorageRegistry;
 use crate::efi::protocols::serial_io::SerialIoMode;

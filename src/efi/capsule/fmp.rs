@@ -355,3 +355,100 @@ pub fn parse_firmware_image_auth(data: &[u8]) -> Result<(FirmwareImageAuth, usiz
         auth_total_size,
     ))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build a minimal FMP capsule header (version 1, 0 drivers, 1 payload).
+    fn make_fmp_header(payload_offset: u64) -> alloc::vec::Vec<u8> {
+        let mut buf = alloc::vec![0u8; 16]; // 8 header + 8 offset
+        // version = 1
+        buf[0..4].copy_from_slice(&1u32.to_le_bytes());
+        // embedded_driver_count = 0
+        buf[4..6].copy_from_slice(&0u16.to_le_bytes());
+        // payload_item_count = 1
+        buf[6..8].copy_from_slice(&1u16.to_le_bytes());
+        // item_offsets[0]
+        buf[8..16].copy_from_slice(&payload_offset.to_le_bytes());
+        buf
+    }
+
+    #[test]
+    fn parse_fmp_capsule_header_valid() {
+        let data = make_fmp_header(64);
+        let hdr = parse_fmp_capsule_header(&data).unwrap();
+        assert_eq!(hdr.version, 1);
+        assert_eq!(hdr.embedded_driver_count, 0);
+        assert_eq!(hdr.payload_item_count, 1);
+        assert_eq!(hdr.item_offsets.len(), 1);
+        assert_eq!(hdr.item_offsets[0], 64);
+    }
+
+    #[test]
+    fn reject_wrong_fmp_version() {
+        let mut data = make_fmp_header(64);
+        // Set version to 2
+        data[0..4].copy_from_slice(&2u32.to_le_bytes());
+        assert_eq!(
+            parse_fmp_capsule_header(&data),
+            Err(CapsuleError::InvalidFmpHeader)
+        );
+    }
+
+    #[test]
+    fn reject_truncated_fmp_header() {
+        let data = [0u8; 4]; // too short
+        assert_eq!(
+            parse_fmp_capsule_header(&data),
+            Err(CapsuleError::InvalidFmpHeader)
+        );
+    }
+
+    /// Build a minimal FMP image header (v1).
+    fn make_fmp_image_header_v1(guid: &Guid, index: u8, image_size: u32) -> [u8; 32] {
+        let mut buf = [0u8; 32];
+        // version = 1
+        buf[0..4].copy_from_slice(&1u32.to_le_bytes());
+        // update_image_type_id
+        buf[4..20].copy_from_slice(guid.as_bytes());
+        // update_image_index
+        buf[20] = index;
+        // reserved[3] = 0
+        // update_image_size
+        buf[24..28].copy_from_slice(&image_size.to_le_bytes());
+        // update_vendor_code_size = 0
+        buf
+    }
+
+    #[test]
+    fn parse_fmp_image_header_v1() {
+        let guid = Guid::from_fields(0xAABBCCDD, 0x1122, 0x3344, 0x55, 0x66, &[1, 2, 3, 4, 5, 6]);
+        let data = make_fmp_image_header_v1(&guid, 1, 4096);
+        let hdr = parse_fmp_image_header(&data).unwrap();
+        assert_eq!(hdr.version, 1);
+        assert_eq!(hdr.update_image_index, 1);
+        assert_eq!(hdr.update_image_size, 4096);
+        assert_eq!(hdr.update_vendor_code_size, 0);
+        assert_eq!(hdr.update_hardware_instance, 0);
+        assert_eq!(hdr.update_image_type_id.as_bytes(), guid.as_bytes());
+    }
+
+    #[test]
+    fn reject_fmp_image_header_version_zero() {
+        let mut data = [0u8; 32];
+        // version = 0 (invalid)
+        assert_eq!(
+            parse_fmp_image_header(&data),
+            Err(CapsuleError::InvalidFmpImageHeader)
+        );
+    }
+
+    #[test]
+    fn fmp_header_size_by_version() {
+        assert_eq!(fmp_image_header_size(1), 32);
+        assert_eq!(fmp_image_header_size(2), 40);
+        assert_eq!(fmp_image_header_size(3), 48);
+        assert_eq!(fmp_image_header_size(99), 48); // 3+ uses v3 size
+    }
+}
