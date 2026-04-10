@@ -461,6 +461,116 @@ pub trait StorageBackend: Send {
 }
 
 // ============================================================================
+// Capsule Update
+// ============================================================================
+
+/// Firmware identity and version information.
+///
+/// Used by the ESRT (EFI System Resource Table) to advertise firmware
+/// components to the OS, and by the capsule update logic to validate
+/// incoming update images (GUID match, version >= LSV).
+///
+/// Platform firmware populates this from:
+/// - Coreboot's `LB_TAG_EFI_FW_INFO` table entry
+/// - Build-time configuration
+/// - Device tree / ACPI tables
+#[derive(Debug, Clone, Copy)]
+pub struct FirmwareInfo {
+    /// Firmware class GUID (identifies this firmware component for updates).
+    ///
+    /// This GUID must match between the installed firmware, the ESRT entry,
+    /// and the capsule's `UpdateImageTypeId` for an update to be accepted.
+    pub guid: [u8; 16],
+
+    /// Current firmware version.
+    ///
+    /// Higher values represent more recent versions. Encoding is
+    /// platform-defined; coreboot uses `(major << 16) | minor`.
+    pub version: u32,
+
+    /// Lowest supported firmware version (rollback prevention).
+    ///
+    /// Capsule updates with a version below this value are rejected.
+    /// Typically set equal to the current version or to a known-good
+    /// minimum.
+    pub lowest_supported_version: u32,
+
+    /// Size of the firmware image in bytes.
+    pub fw_size: u32,
+}
+
+/// A region of memory containing a single coalesced capsule.
+///
+/// These are produced by coreboot's capsule parsing code (from
+/// `CapsuleUpdateData*` EFI variables) and published as
+/// `LB_TAG_CAPSULE` entries in the coreboot table.
+#[derive(Debug, Clone, Copy)]
+pub struct CapsuleRegion {
+    /// Physical base address of the capsule data in memory.
+    pub base: u64,
+    /// Size of the capsule data in bytes.
+    pub size: u32,
+}
+
+/// An FMAP region descriptor.
+///
+/// Represents a named region within the SPI flash layout. Used by the
+/// capsule update logic to validate RMAP manifests and determine where
+/// firmware images should be written.
+#[derive(Debug, Clone)]
+pub struct FmapRegion {
+    /// Region name (e.g., "COREBOOT", "SMMSTORE", "FMAP")
+    pub name: heapless::String<32>,
+    /// Offset within the flash device
+    pub offset: u32,
+    /// Size in bytes
+    pub size: u32,
+}
+
+/// Capsule update backend.
+///
+/// Implemented by platform firmware to provide the low-level operations
+/// needed for capsule update support. The capsule processing library
+/// (`efi::capsule`) calls these methods during capsule application.
+///
+/// # Trust Model
+///
+/// The `capsule_trust_store()` method provides the root certificates
+/// used to verify capsule PKCS#7 signatures. These are separate from
+/// Secure Boot's `db`/`dbx` — a capsule can be signed by a different
+/// key than the boot images.
+pub trait CapsuleBackend {
+    /// Firmware identity and version information.
+    ///
+    /// Returns `None` if the platform doesn't support capsule updates.
+    fn firmware_info(&self) -> Option<&FirmwareInfo>;
+
+    /// DER-encoded X.509 certificates trusted for capsule signature verification.
+    ///
+    /// Returns an empty slice if capsule authentication is not configured
+    /// (which means all capsules will be rejected when auth is enforced).
+    fn capsule_trust_store(&self) -> &[&[u8]];
+
+    /// Write a firmware image to a named FMAP region.
+    ///
+    /// The implementation should:
+    /// 1. Enable writes on the storage backend
+    /// 2. Erase the target region
+    /// 3. Write the image data
+    ///
+    /// `offset` is relative to the start of the named region.
+    fn write_firmware_region(
+        &mut self,
+        region_name: &str,
+        offset: u32,
+        data: &[u8],
+    ) -> Result<(), StorageError>;
+
+    /// Get all FMAP regions for RMAP manifest validation.
+    fn fmap_regions(&self) -> &[FmapRegion];
+}
+
+// ============================================================================
 // Timer
 // ============================================================================
 

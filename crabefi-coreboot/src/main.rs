@@ -470,6 +470,16 @@ pub extern "C" fn rust_main(coreboot_table_ptr: u64) -> ! {
         crabefi::coreboot::store_boot_media(boot_media);
     }
 
+    // Store EFI firmware info (GUID, version, LSV) for ESRT and capsule updates
+    if let Some(fw_info) = cb_info.efi_fw_info {
+        crabefi::coreboot::store_efi_fw_info(fw_info);
+    }
+
+    // Store capsule regions from coreboot (coalesced capsules for processing)
+    if !cb_info.capsules.is_empty() {
+        crabefi::coreboot::store_capsules(&cb_info.capsules);
+    }
+
     // Store memory regions and ACPI RSDP (used by direct Linux boot path
     // and by ACPI discovery after heap init).
     crabefi::state::with_drivers_mut(|drivers| {

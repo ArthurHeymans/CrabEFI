@@ -148,7 +148,6 @@ pub struct EfiRtPropertiesTable {
 /// - GetWakeupTime/SetWakeupTime (not implemented)
 /// - ConvertPointer (not implemented)
 /// - GetNextHighMonotonicCount (not implemented)
-/// - UpdateCapsule/QueryCapsuleCapabilities (not implemented)
 static RT_PROPERTIES_TABLE: EfiRtPropertiesTable = EfiRtPropertiesTable {
     version: EFI_RT_PROPERTIES_TABLE_VERSION,
     length: core::mem::size_of::<EfiRtPropertiesTable>() as u16,
@@ -158,6 +157,8 @@ static RT_PROPERTIES_TABLE: EfiRtPropertiesTable = EfiRtPropertiesTable {
         | EFI_RT_SUPPORTED_SET_VARIABLE
         | EFI_RT_SUPPORTED_SET_VIRTUAL_ADDRESS_MAP
         | EFI_RT_SUPPORTED_RESET_SYSTEM
+        | EFI_RT_SUPPORTED_UPDATE_CAPSULE
+        | EFI_RT_SUPPORTED_QUERY_CAPSULE_CAPABILITIES
         | EFI_RT_SUPPORTED_QUERY_VARIABLE_INFO,
 };
 
@@ -454,7 +455,7 @@ struct AcpiRegion {
 
 /// Collect all ACPI table regions, merge overlapping ones, then mark them
 fn mark_acpi_tables_memory(rsdp_addr: u64) {
-    use super::allocator::{PAGE_SIZE, mark_as_acpi_reclaim};
+    use super::allocator::{mark_as_acpi_reclaim, PAGE_SIZE};
 
     log::info!("Marking ACPI table memory regions as AcpiReclaimMemory...");
 
@@ -674,7 +675,7 @@ fn mark_acpi_tables_memory(rsdp_addr: u64) {
 
 /// Install ACPI tables from coreboot
 pub fn install_acpi_tables(rsdp: u64) {
-    use super::allocator::{MemoryType, get_memory_type_at};
+    use super::allocator::{get_memory_type_at, MemoryType};
 
     if rsdp == 0 {
         log::warn!("ACPI RSDP address is null, skipping ACPI table installation");
@@ -1208,7 +1209,7 @@ pub fn rebuild_memory_attributes_table_in_place() {
 ///
 /// Returns `None` if the memory map cannot be queried.
 fn count_runtime_entries() -> Option<u32> {
-    use super::allocator::{self, MemoryDescriptor, MemoryType, attributes};
+    use super::allocator::{self, attributes, MemoryDescriptor, MemoryType};
 
     let mut map_size: usize = 0;
     let mut map_key: usize = 0;
@@ -1251,7 +1252,7 @@ fn count_runtime_entries() -> Option<u32> {
 /// Writes the header and runtime descriptors with appropriate RO/XP protection
 /// attributes. Returns `(runtime_count, table_size_bytes)` on success.
 fn fill_memory_attributes_table(table_addr: u64) -> Option<(u32, usize)> {
-    use super::allocator::{self, MemoryDescriptor, MemoryType, attributes};
+    use super::allocator::{self, attributes, MemoryDescriptor, MemoryType};
 
     // Query the memory map onto a stack buffer
     let mut map_size: usize = 0;
