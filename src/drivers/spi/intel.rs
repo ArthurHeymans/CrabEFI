@@ -49,7 +49,7 @@
 
 use super::intel_chipsets::IchChipset;
 use super::regs::*;
-use super::{Result, SpiController, SpiError, SpiMode, delay_us};
+use super::{delay_us, Result, SpiController, SpiError, SpiMode};
 use crate::drivers::mmio::MmioRegion;
 use crate::drivers::pci::{self, PciAddress, PciDevice};
 
@@ -183,11 +183,12 @@ impl IntelSpiController {
         // RCBA is 32-bit aligned, mask off lower bits
         let rcba_base = (rcba & !0x3FFF) as u64;
 
-        // SPI offset depends on chipset generation
-        let spi_offset = if generation == IchChipset::Ich7 {
-            RCBA_SPI_OFFSET_ICH7
-        } else {
-            RCBA_SPI_OFFSET_ICH9
+        // SPI offset within RCBA depends on chipset generation.
+        // ICH7 and ICH8 both use RCBA+0x3020; ICH9 moved the SPI BAR to RCBA+0x3800.
+        // (TunnelCreek and Centerton also use 0x3020 when they are added.)
+        let spi_offset = match generation {
+            IchChipset::Ich7 | IchChipset::Ich8 => RCBA_SPI_OFFSET_ICH7,
+            _ => RCBA_SPI_OFFSET_ICH9,
         };
 
         Ok(rcba_base + spi_offset)

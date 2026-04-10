@@ -308,9 +308,9 @@ pub const fn freg_limit(freg: u32) -> u32 {
 /// PCI config offset for RCBA (Root Complex Base Address) - ICH7-ICH10
 pub const PCI_REG_RCBA: u8 = 0xF0;
 
-/// Offset to SPI registers within RCBA (ICH7)
+/// Offset to SPI registers within RCBA (ICH7 and ICH8)
 pub const RCBA_SPI_OFFSET_ICH7: u64 = 0x3020;
-/// Offset to SPI registers within RCBA (ICH8+)
+/// Offset to SPI registers within RCBA (ICH9+)
 pub const RCBA_SPI_OFFSET_ICH9: u64 = 0x3800;
 
 /// SPIBAR register in LPC/eSPI controller config space (PCH100+)
