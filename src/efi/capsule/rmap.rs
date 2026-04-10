@@ -154,3 +154,95 @@ pub fn strip_rmap_manifest(image_data: &[u8]) -> &[u8] {
 
     &image_data[..len_offset - manifest_len]
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build an image with an RMAP manifest appended.
+    fn make_image_with_rmap(firmware: &[u8], region_names: &[&str]) -> Vec<u8> {
+        let manifest = region_names.join("\n");
+        let manifest_bytes = manifest.as_bytes();
+        let manifest_len = manifest_bytes.len() as u32;
+
+        let mut image = Vec::new();
+        image.extend_from_slice(firmware);
+        image.extend_from_slice(manifest_bytes);
+        image.extend_from_slice(&manifest_len.to_le_bytes());
+        image
+    }
+
+    fn make_fmap_regions(names: &[(&str, u32, u32)]) -> Vec<FmapRegion> {
+        names
+            .iter()
+            .map(|(name, offset, size)| {
+                let mut n = heapless::String::new();
+                for c in name.chars() {
+                    let _ = n.push(c);
+                }
+                FmapRegion {
+                    name: n,
+                    offset: *offset,
+                    size: *size,
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn parse_valid_rmap() {
+        let firmware = [0xFFu8; 1024];
+        let image = make_image_with_rmap(&firmware, &["COREBOOT", "FW_MAIN_A"]);
+        let fmap = make_fmap_regions(&[
+            ("COREBOOT", 0x0000, 0x1000),
+            ("FW_MAIN_A", 0x1000, 0x2000),
+            ("SMMSTORE", 0x3000, 0x1000),
+        ]);
+
+        let approved = parse_and_validate_rmap(&image, &fmap).unwrap();
+        assert_eq!(approved.len(), 2);
+        assert_eq!(approved[0].name.as_str(), "COREBOOT");
+        assert_eq!(approved[0].offset, 0x0000);
+        assert_eq!(approved[0].size, 0x1000);
+        assert_eq!(approved[1].name.as_str(), "FW_MAIN_A");
+        assert_eq!(approved[1].offset, 0x1000);
+        assert_eq!(approved[1].size, 0x2000);
+    }
+
+    #[test]
+    fn rmap_skips_unknown_regions() {
+        let firmware = [0xFFu8; 64];
+        let image = make_image_with_rmap(&firmware, &["COREBOOT", "DOES_NOT_EXIST"]);
+        let fmap = make_fmap_regions(&[("COREBOOT", 0, 0x1000)]);
+
+        let approved = parse_and_validate_rmap(&image, &fmap).unwrap();
+        assert_eq!(approved.len(), 1);
+        assert_eq!(approved[0].name.as_str(), "COREBOOT");
+    }
+
+    #[test]
+    fn rmap_rejects_no_matching_regions() {
+        let firmware = [0xFFu8; 64];
+        let image = make_image_with_rmap(&firmware, &["NONEXISTENT"]);
+        let fmap = make_fmap_regions(&[("COREBOOT", 0, 0x1000)]);
+
+        assert_eq!(
+            parse_and_validate_rmap(&image, &fmap),
+            Err(CapsuleError::InvalidRmap)
+        );
+    }
+
+    #[test]
+    fn strip_rmap_manifest_correct() {
+        let firmware = b"FIRMWARE_DATA";
+        let image = make_image_with_rmap(firmware, &["COREBOOT"]);
+        let stripped = strip_rmap_manifest(&image);
+        assert_eq!(stripped, firmware);
+    }
+
+    #[test]
+    fn strip_rmap_no_manifest() {
+        let data = [0u8; 10];
+        assert_eq!(strip_rmap_manifest(&data).len(), 10);
+    }
+}

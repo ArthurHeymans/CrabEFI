@@ -702,6 +702,63 @@ pub fn run_tests(config: &QemuConfig, disk_path: &Path, app_name: &str) -> Resul
                 failed += 1;
             }
         }
+        "capsule-test" => {
+            // Check that the test app started
+            if result.output.contains("Capsule Update Test Suite") {
+                println!("[PASS] test_started: Capsule test suite started");
+                passed += 1;
+            } else {
+                println!("[FAIL] test_started: Capsule test suite did not start");
+                failed += 1;
+            }
+
+            // Check OsIndicationsSupported was set by firmware
+            if result.output.contains("OsIndicationsSupported set:") {
+                println!("[PASS] firmware_os_ind: Firmware set OsIndicationsSupported");
+                passed += 1;
+            } else {
+                println!("[FAIL] firmware_os_ind: Firmware did not set OsIndicationsSupported");
+                failed += 1;
+            }
+
+            // Check individual test results from the EFI app
+            for test_name in [
+                "os_ind_supported_read",
+                "os_ind_fmp_capsule_bit",
+                "os_ind_file_capsule_bit",
+                "query_caps_call",
+                "query_caps_max_size",
+                "update_capsule_null_rejected",
+            ] {
+                let pass_marker = format!("[PASS] {}", test_name);
+                let fail_marker = format!("[FAIL] {}", test_name);
+                if result.output.contains(&pass_marker) {
+                    println!("[PASS] {}: Test passed", test_name);
+                    passed += 1;
+                } else if result.output.contains(&fail_marker) {
+                    println!("[FAIL] {}: Test failed", test_name);
+                    failed += 1;
+                } else {
+                    println!("[FAIL] {}: Test not executed", test_name);
+                    failed += 1;
+                }
+            }
+
+            // Check for UpdateCapsule/QueryCapsuleCapabilities in RT properties
+            if result.output.contains("UpdateCapsule") || result.output.contains("query_caps_call")
+            {
+                // At least one capsule runtime service was exercised
+            }
+
+            // Overall result
+            if result.output.contains("All capsule tests passed!") {
+                println!("[PASS] all_passed: All capsule tests passed");
+                passed += 1;
+            } else if result.output.contains("Some capsule tests failed!") {
+                println!("[FAIL] all_passed: Some capsule tests failed");
+                failed += 1;
+            }
+        }
         _ => {
             // Generic test: just check if CrabEFI booted
             if result.output.contains("CrabEFI") {

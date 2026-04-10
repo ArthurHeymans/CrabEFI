@@ -192,6 +192,42 @@ fn scan_device_for_capsules(
     None
 }
 
+/// Install the `OsIndicationsSupported` EFI variable.
+///
+/// This tells the OS which capsule delivery mechanisms are available.
+/// Called during boot initialization.
+pub fn install_os_indications_supported() {
+    use crate::efi::auth::EFI_GLOBAL_VARIABLE_GUID;
+
+    let supported = EFI_OS_INDICATIONS_FMP_CAPSULE_SUPPORTED
+        | EFI_OS_INDICATIONS_FILE_CAPSULE_DELIVERY_SUPPORTED;
+
+    let name: &[u16] = &[
+        'O' as u16, 's' as u16, 'I' as u16, 'n' as u16, 'd' as u16, 'i' as u16, 'c' as u16,
+        'a' as u16, 't' as u16, 'i' as u16, 'o' as u16, 'n' as u16, 's' as u16, 'S' as u16,
+        'u' as u16, 'p' as u16, 'p' as u16, 'o' as u16, 'r' as u16, 't' as u16, 'e' as u16,
+        'd' as u16, 0,
+    ];
+
+    let data = supported.to_le_bytes();
+
+    // BS + RT (read-only, not NV — the firmware always sets it)
+    let attributes = 0x06u32; // BS | RT
+
+    crate::efi::varstore::update_variable_in_memory(
+        &EFI_GLOBAL_VARIABLE_GUID,
+        name,
+        attributes,
+        &data,
+    );
+
+    log::info!(
+        "OsIndicationsSupported set: FMP={}, FileCapsule={}",
+        (supported & EFI_OS_INDICATIONS_FMP_CAPSULE_SUPPORTED) != 0,
+        (supported & EFI_OS_INDICATIONS_FILE_CAPSULE_DELIVERY_SUPPORTED) != 0
+    );
+}
+
 /// Clear the capsule-related bits in `OsIndications` after processing.
 ///
 /// This prevents re-processing on subsequent boots.
