@@ -214,6 +214,36 @@ jobs:
       - name: Run RNG protocol tests
         run: ./crabefi test --app rng-test --disable-kvm --timeout 120
 
+  test-capsule:
+    name: Test x86_64 (Capsule Update)
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchains
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src
+          targets: x86_64-unknown-none, x86_64-unknown-uefi
+
+      - name: Install stable toolchain for xtask
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qemu-system-x86 mtools dosfstools zstd coreboot-utils
+
+      - name: Download CrabEFI ELF
+        uses: actions/download-artifact@v4
+        with:
+          name: crabefi-elf
+          path: target/x86_64-unknown-none/release/
+
+      - name: Run capsule update tests
+        run: ./crabefi test --app capsule-test --disable-kvm --timeout 120
+
   # ── GRUB + Linux boot-chain ─────────────────────────────────────────
 
   build-boot-assets-x86_64:
