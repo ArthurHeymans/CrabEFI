@@ -1631,7 +1631,7 @@ extern "efiapi" fn update_capsule(
 
         // Stage CapsuleUpdateData* variables via the deferred write buffer
         for i in 0..capsule_count {
-            if let Err(_) = super::capsule::stage_capsule_for_reboot(scatter_gather_list, i) {
+            if super::capsule::stage_capsule_for_reboot(scatter_gather_list, i).is_err() {
                 return Status::DEVICE_ERROR;
             }
         }
