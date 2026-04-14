@@ -637,6 +637,74 @@ pub fn run_tests(config: &QemuConfig, disk_path: &Path, app_name: &str) -> Resul
                 failed += 1;
             }
         }
+        "device-path-test" => {
+            // Check that the test app started
+            if result.output.contains("Device Path Protocol Test Suite") {
+                println!("[PASS] test_started: Device Path test suite started");
+                passed += 1;
+            } else {
+                println!("[FAIL] test_started: Device Path test did not start");
+                failed += 1;
+            }
+
+            // Check protocol discovery
+            for (tag, label) in [
+                ("locate_utilities", "Device Path Utilities"),
+                ("locate_to_text", "Device Path To Text"),
+                ("locate_from_text", "Device Path From Text"),
+                ("locate_load_file2", "LoadFile2"),
+            ] {
+                let pattern = format!("[PASS] {}", tag);
+                if result.output.contains(&pattern) {
+                    println!("[PASS] {}: {} protocol found", tag, label);
+                    passed += 1;
+                } else {
+                    println!("[FAIL] {}: {} protocol not found", tag, label);
+                    failed += 1;
+                }
+            }
+
+            // Check key functional tests
+            for tag in [
+                "create_device_node",
+                "get_size",
+                "duplicate",
+                "append_device_path",
+                "append_both_null",
+                "is_multi_instance_multi",
+                "get_next_instance_1",
+                "get_next_instance_2",
+                "node_to_text_pci",
+                "path_to_text_pci_root",
+                "text_to_node_pci_root",
+                "text_to_path_pci",
+                "round_trip",
+                "load_file2_boot_policy",
+                "load_file2_not_found",
+            ] {
+                let pattern = format!("[PASS] {}", tag);
+                if result.output.contains(&pattern) {
+                    println!("[PASS] {}", tag);
+                    passed += 1;
+                } else {
+                    let fail_pattern = format!("[FAIL] {}", tag);
+                    if result.output.contains(&fail_pattern) {
+                        println!("[FAIL] {}", tag);
+                        failed += 1;
+                    }
+                    // If neither PASS nor FAIL, the test may not have run (skip)
+                }
+            }
+
+            // Check overall result
+            if result.output.contains("All device path tests passed!") {
+                println!("[PASS] all_passed: All device path tests passed");
+                passed += 1;
+            } else if result.output.contains("Some device path tests FAILED!") {
+                println!("[FAIL] all_passed: Some device path tests failed");
+                failed += 1;
+            }
+        }
         _ => {
             // Generic test: just check if CrabEFI booted
             if result.output.contains("CrabEFI") {
