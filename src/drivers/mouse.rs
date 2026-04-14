@@ -682,6 +682,12 @@ pub fn get_buttons() -> u32 {
     MOUSE.lock().buttons
 }
 
+/// Check if PS/2 mouse has pending relative motion.
+pub fn has_motion() -> bool {
+    let mouse = MOUSE.lock();
+    mouse.rel_x != 0 || mouse.rel_y != 0 || mouse.rel_z != 0
+}
+
 /// Returns `true` if the PS/2 mouse (or Synaptics+TrackPoint) is ready.
 pub fn is_available() -> bool {
     MOUSE.lock().initialized

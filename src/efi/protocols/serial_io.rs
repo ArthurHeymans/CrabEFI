@@ -192,14 +192,15 @@ extern "efiapi" fn serial_get_control(_this: *mut Protocol, control: *mut u32) -
     }
 
     // Return status bits
-    // We always report CTS, DSR active and buffers ready
     let mut bits: u32 = 0;
 
     // Check if we can send (output buffer empty)
     bits |= EFI_SERIAL_OUTPUT_BUFFER_EMPTY;
 
-    // Check if there's no data waiting (input buffer empty)
-    bits |= EFI_SERIAL_INPUT_BUFFER_EMPTY;
+    // Check if there's data waiting in the receive buffer
+    if !serial::has_input() {
+        bits |= EFI_SERIAL_INPUT_BUFFER_EMPTY;
+    }
 
     // Pretend modem signals are active
     bits |= EFI_SERIAL_CLEAR_TO_SEND;
@@ -260,14 +261,27 @@ extern "efiapi" fn serial_read(
 
     log::debug!("SerialIO.Read(size={})", requested_size);
 
-    // For now, we don't implement reading from serial
-    // A full implementation would check for available data and read it
-    // Return 0 bytes read (no data available)
-    unsafe {
-        *buffer_size = 0;
+    let data = unsafe { core::slice::from_raw_parts_mut(buffer as *mut u8, requested_size) };
+
+    // Read as many bytes as are immediately available, up to the
+    // requested size.  This is a non-blocking read: if no data is
+    // available we return 0 bytes.
+    let mut bytes_read = 0usize;
+    while bytes_read < requested_size {
+        match serial::try_read() {
+            Some(byte) => {
+                data[bytes_read] = byte;
+                bytes_read += 1;
+            }
+            None => break,
+        }
     }
 
-    log::debug!("  -> SUCCESS (read 0 bytes, no data available)");
+    unsafe {
+        *buffer_size = bytes_read;
+    }
+
+    log::debug!("  -> SUCCESS (read {} bytes)", bytes_read);
     Status::SUCCESS
 }
 
