@@ -786,11 +786,29 @@ pub fn create_file_path_device_path(path: &str) -> *mut Protocol {
     ptr as *mut Protocol
 }
 
-/// Return the total byte length of a device path (including the End node).
+// ============================================================================
+// Shared device path walking helpers (used by device_path_utilities,
+// device_path_to_text, device_path_from_text, and this module).
+// ============================================================================
+
+/// End-entire-device-path subtype.
+pub(crate) const SUBTYPE_END_ENTIRE: u8 = 0xFF;
+
+/// End-this-instance subtype (multi-instance separator).
+pub(crate) const SUBTYPE_END_INSTANCE: u8 = 0x01;
+
+/// Minimum device path node length (4-byte header).
+pub(crate) const MIN_NODE_LENGTH: u16 = 4;
+
+/// Return the total byte length of a device path (including the End-Entire
+/// node).
 ///
-/// Walks the node chain until the End-Entire node is found.
-/// Returns 0 if the pointer is null or invalid.
-fn device_path_size(dp: *const Protocol) -> usize {
+/// Walks the node chain, skipping past End-Instance separators, until the
+/// End-Entire node is found. Returns 0 if the pointer is null or invalid.
+///
+/// # Safety
+/// `dp` must be null or point to a valid device path in readable memory.
+pub(crate) unsafe fn device_path_size(dp: *const Protocol) -> usize {
     if dp.is_null() {
         return 0;
     }
@@ -798,15 +816,40 @@ fn device_path_size(dp: *const Protocol) -> usize {
         let mut p = dp as *const u8;
         loop {
             let node_type = *p;
+            let node_sub = *p.add(1);
             let node_len = u16::from_le_bytes([*p.add(2), *p.add(3)]) as usize;
-            if node_len < 4 {
+            if node_len < MIN_NODE_LENGTH as usize {
                 break 0;
             }
-            if node_type == TYPE_END {
+            if node_type == TYPE_END && node_sub == SUBTYPE_END_ENTIRE {
                 return (p as usize - dp as usize) + node_len;
             }
             p = p.add(node_len);
         }
+    }
+}
+
+/// Write an End-Entire device path node at the given pointer.
+///
+/// # Safety
+/// `p` must point to at least 4 bytes of writable memory.
+pub(crate) unsafe fn write_end_node(p: *mut u8) {
+    unsafe {
+        *p = TYPE_END;
+        *p.add(1) = SUBTYPE_END_ENTIRE;
+        let len_bytes = MIN_NODE_LENGTH.to_le_bytes();
+        *p.add(2) = len_bytes[0];
+        *p.add(3) = len_bytes[1];
+    }
+}
+
+/// Allocate `size` bytes of BootServicesData memory.
+///
+/// Returns null on failure.
+pub(crate) fn alloc_pool(size: usize) -> *mut u8 {
+    match allocate_pool(MemoryType::BootServicesData, size) {
+        Ok(p) => p,
+        Err(_) => core::ptr::null_mut(),
     }
 }
 
@@ -829,7 +872,7 @@ pub fn create_loaded_image_device_path(
         return create_file_path_device_path(file_path);
     }
 
-    let dp_size = device_path_size(device_dp);
+    let dp_size = unsafe { device_path_size(device_dp) };
     if dp_size == 0 {
         return create_file_path_device_path(file_path);
     }

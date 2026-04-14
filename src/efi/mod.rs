@@ -143,6 +143,8 @@ fn install_standard_protocols_and_finalize() {
     init_serial_io();
     init_rng();
     init_console_control();
+    init_device_path_protocols();
+    init_load_file2();
     #[cfg(target_arch = "riscv64")]
     init_riscv_boot_protocol();
     system_table::install_memory_attributes_table();
@@ -408,6 +410,111 @@ fn init_console_control() {
     }
 
     log::debug!("Console Control protocol installed on handle {:?}", handle);
+}
+
+/// Initialize Device Path utility protocols (Utilities, ToText, FromText)
+///
+/// All three are installed on a single shared handle, matching EDK2 behavior.
+fn init_device_path_protocols() {
+    use protocols::device_path_from_text::{
+        DEVICE_PATH_FROM_TEXT_GUID, create_protocol as create_from_text,
+    };
+    use protocols::device_path_to_text::{
+        DEVICE_PATH_TO_TEXT_GUID, create_protocol as create_to_text,
+    };
+    use protocols::device_path_utilities::{
+        DEVICE_PATH_UTILITIES_GUID, create_protocol as create_utilities,
+    };
+
+    let handle = match boot_services::create_handle() {
+        Some(h) => h,
+        None => {
+            log::error!("Failed to create Device Path Utilities handle");
+            return;
+        }
+    };
+
+    // Device Path Utilities
+    let proto = create_utilities();
+    if proto.is_null() {
+        log::error!("Failed to create Device Path Utilities protocol");
+        return;
+    }
+    let status = boot_services::install_protocol(handle, &DEVICE_PATH_UTILITIES_GUID, proto);
+    if status != Status::SUCCESS {
+        log::error!("Failed to install Device Path Utilities: {:?}", status);
+        return;
+    }
+
+    // Device Path To Text
+    let proto = create_to_text();
+    if proto.is_null() {
+        log::error!("Failed to create Device Path To Text protocol");
+        return;
+    }
+    let status = boot_services::install_protocol(handle, &DEVICE_PATH_TO_TEXT_GUID, proto);
+    if status != Status::SUCCESS {
+        log::error!("Failed to install Device Path To Text: {:?}", status);
+        return;
+    }
+
+    // Device Path From Text
+    let proto = create_from_text();
+    if proto.is_null() {
+        log::error!("Failed to create Device Path From Text protocol");
+        return;
+    }
+    let status = boot_services::install_protocol(handle, &DEVICE_PATH_FROM_TEXT_GUID, proto);
+    if status != Status::SUCCESS {
+        log::error!("Failed to install Device Path From Text: {:?}", status);
+        return;
+    }
+
+    log::info!("Device Path protocols installed on handle {:?}", handle);
+}
+
+/// Initialize Load File 2 protocol with Linux initrd vendor media device path
+fn init_load_file2() {
+    use protocols::device_path::DEVICE_PATH_PROTOCOL_GUID;
+    use protocols::load_file2::{LOAD_FILE2_GUID, create_device_path, create_protocol};
+
+    let handle = match boot_services::create_handle() {
+        Some(h) => h,
+        None => {
+            log::error!("Failed to create LoadFile2 handle");
+            return;
+        }
+    };
+
+    // Install the initrd vendor media device path on the handle
+    let dp = create_device_path();
+    if dp.is_null() {
+        log::error!("Failed to create LoadFile2 device path");
+        return;
+    }
+    let status = boot_services::install_protocol(
+        handle,
+        &DEVICE_PATH_PROTOCOL_GUID,
+        dp as *mut core::ffi::c_void,
+    );
+    if status != Status::SUCCESS {
+        log::error!("Failed to install LoadFile2 device path: {:?}", status);
+        return;
+    }
+
+    // Install the protocol itself
+    let proto = create_protocol();
+    if proto.is_null() {
+        log::error!("Failed to create LoadFile2 protocol");
+        return;
+    }
+    let status = boot_services::install_protocol(handle, &LOAD_FILE2_GUID, proto);
+    if status != Status::SUCCESS {
+        log::error!("Failed to install LoadFile2 protocol: {:?}", status);
+        return;
+    }
+
+    log::info!("LoadFile2 protocol installed on handle {:?}", handle);
 }
 
 /// Initialize Graphics Output Protocol (GOP) on a specific handle

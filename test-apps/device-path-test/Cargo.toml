@@ -1,0 +1,17 @@
+[package]
+name = "device-path-test"
+version = "0.1.0"
+edition = "2021"
+
+[workspace]
+
+[dependencies]
+r-efi = "5.3"
+
+[profile.release]
+panic = "abort"
+lto = true
+opt-level = "z"
+
+[profile.dev]
+panic = "abort"
