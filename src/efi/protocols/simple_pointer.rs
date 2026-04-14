@@ -4,11 +4,21 @@
 //! This protocol provides relative pointer movement and button state,
 //! compatible with the UEFI 2.x specification.
 //!
+//! # Data Flow
+//!
+//! This module polls the raw PS/2 and USB mouse drivers directly rather than
+//! going through `mouse_cursor`, which is the internal UI abstraction.
+//! `mouse_cursor::poll()` consumes relative motion from the raw drivers to
+//! update its absolute cursor position, so using it here would drain the
+//! deltas before `GetState` can read them.
+//!
 //! # References
 //!
 //! - UEFI Specification 2.10, Section 12.5
 
-use crate::drivers::mouse_cursor;
+use crate::efi::boot_services::POINTER_EVENT_ID;
+use core::ffi::c_void;
+use r_efi::efi::{Boolean, Event, Status};
 
 // ============================================================================
 // Protocol GUIDs and Types
@@ -48,9 +58,9 @@ pub struct SimplePointerState {
     /// Relative Z movement (scroll wheel)
     pub relative_movement_z: i32,
     /// Left button pressed
-    pub left_button: r_efi::efi::Boolean,
+    pub left_button: Boolean,
     /// Right button pressed
-    pub right_button: r_efi::efi::Boolean,
+    pub right_button: Boolean,
 }
 
 /// EFI_SIMPLE_POINTER_MODE
@@ -64,9 +74,9 @@ pub struct SimplePointerMode {
     /// Resolution of Z axis (counts per mm)
     pub resolution_z: u64,
     /// Whether left button is supported
-    pub left_button: r_efi::efi::Boolean,
+    pub left_button: Boolean,
     /// Whether right button is supported
-    pub right_button: r_efi::efi::Boolean,
+    pub right_button: Boolean,
 }
 
 /// EFI_SIMPLE_POINTER_PROTOCOL
@@ -75,15 +85,15 @@ pub struct SimplePointerProtocol {
     /// Reset the pointer device
     pub reset: unsafe extern "efiapi" fn(
         this: *mut SimplePointerProtocol,
-        extended_verification: r_efi::efi::Boolean,
-    ) -> r_efi::efi::Status,
+        extended_verification: Boolean,
+    ) -> Status,
     /// Get the current state of the pointer
     pub get_state: unsafe extern "efiapi" fn(
         this: *mut SimplePointerProtocol,
         state: *mut SimplePointerState,
-    ) -> r_efi::efi::Status,
+    ) -> Status,
     /// Event to wait for input
-    pub wait_for_input: r_efi::efi::Event,
+    pub wait_for_input: Event,
     /// Pointer to mode information
     pub mode: *mut SimplePointerMode,
 }
@@ -95,38 +105,26 @@ unsafe impl Send for SimplePointerProtocol {}
 unsafe impl Sync for SimplePointerProtocol {}
 
 // ============================================================================
-// Protocol Implementation
+// Raw Driver Polling
 // ============================================================================
 
-/// Reset the pointer device
-unsafe extern "efiapi" fn pointer_reset(
-    _this: *mut SimplePointerProtocol,
-    _extended_verification: r_efi::efi::Boolean,
-) -> r_efi::efi::Status {
-    // Poll to drain any stale data
-    mouse_cursor::poll();
-    r_efi::efi::Status::SUCCESS
+/// Poll the raw mouse hardware without going through mouse_cursor.
+///
+/// This triggers actual USB/PS2 communication so that the driver
+/// accumulators are updated with fresh data.
+fn poll_raw_hardware() {
+    #[cfg(target_arch = "x86_64")]
+    crate::drivers::mouse::poll();
+
+    if let Some(ctrl_idx) = crate::drivers::usb::hid_mouse::controller_idx() {
+        crate::drivers::usb::poll_mice_on_controller(ctrl_idx);
+    }
 }
 
-/// Get the current state of the pointer
-unsafe extern "efiapi" fn pointer_get_state(
-    _this: *mut SimplePointerProtocol,
-    state: *mut SimplePointerState,
-) -> r_efi::efi::Status {
-    if state.is_null() {
-        return r_efi::efi::Status::INVALID_PARAMETER;
-    }
-
-    // Poll for new data
-    mouse_cursor::poll();
-
-    let (x, y) = mouse_cursor::position();
-    let _ = (x, y); // absolute position not used for SimplePointer
-
-    // SimplePointer uses relative movement
-    // We need the raw deltas, not the absolute position
-    // Poll the underlying drivers directly for relative data
-
+/// Read and reset accumulated relative motion from all raw mouse drivers.
+///
+/// Returns `(dx, dy, dz, buttons)`.
+fn consume_raw_motion() -> (i32, i32, i32, u32) {
     #[cfg(target_arch = "x86_64")]
     let (ps2_dx, ps2_dy, ps2_dz) = crate::drivers::mouse::get_relative_motion();
     #[cfg(not(target_arch = "x86_64"))]
@@ -134,33 +132,75 @@ unsafe extern "efiapi" fn pointer_get_state(
 
     let (usb_dx, usb_dy) = crate::drivers::usb::hid_mouse::get_relative_motion();
 
-    let dx = ps2_dx + usb_dx;
-    let dy = ps2_dy + usb_dy;
-    let dz = ps2_dz;
+    #[cfg(target_arch = "x86_64")]
+    let buttons =
+        crate::drivers::mouse::get_buttons() | crate::drivers::usb::hid_mouse::get_buttons();
+    #[cfg(not(target_arch = "x86_64"))]
+    let buttons = crate::drivers::usb::hid_mouse::get_buttons();
 
-    if dx == 0 && dy == 0 && dz == 0 {
-        return r_efi::efi::Status::NOT_READY;
+    (ps2_dx + usb_dx, ps2_dy + usb_dy, ps2_dz, buttons)
+}
+
+/// Check whether any raw mouse driver has pending motion data without
+/// consuming it.
+fn has_pending_motion() -> bool {
+    #[cfg(target_arch = "x86_64")]
+    if crate::drivers::mouse::has_motion() {
+        return true;
     }
 
-    let buttons = mouse_cursor::buttons();
+    crate::drivers::usb::hid_mouse::has_motion()
+}
+
+// ============================================================================
+// Protocol Implementation
+// ============================================================================
+
+/// Reset the pointer device
+unsafe extern "efiapi" fn pointer_reset(
+    _this: *mut SimplePointerProtocol,
+    _extended_verification: Boolean,
+) -> Status {
+    // Poll to drain any stale data from the hardware and accumulators
+    poll_raw_hardware();
+    let _ = consume_raw_motion();
+    Status::SUCCESS
+}
+
+/// Get the current state of the pointer
+unsafe extern "efiapi" fn pointer_get_state(
+    _this: *mut SimplePointerProtocol,
+    state: *mut SimplePointerState,
+) -> Status {
+    if state.is_null() {
+        return Status::INVALID_PARAMETER;
+    }
+
+    // Poll hardware and consume accumulated deltas
+    poll_raw_hardware();
+    let (dx, dy, dz, buttons) = consume_raw_motion();
+
+    if dx == 0 && dy == 0 && dz == 0 {
+        return Status::NOT_READY;
+    }
 
     unsafe {
         (*state).relative_movement_x = dx;
         (*state).relative_movement_y = dy;
         (*state).relative_movement_z = dz;
         (*state).left_button = if (buttons & 1) != 0 {
-            r_efi::efi::Boolean::TRUE
+            Boolean::TRUE
         } else {
-            r_efi::efi::Boolean::FALSE
+            Boolean::FALSE
         };
         (*state).right_button = if (buttons & 2) != 0 {
-            r_efi::efi::Boolean::TRUE
+            Boolean::TRUE
         } else {
-            r_efi::efi::Boolean::FALSE
+            Boolean::FALSE
         };
     }
 
-    r_efi::efi::Status::SUCCESS
+    Status::SUCCESS
 }
 
 // ============================================================================
@@ -172,15 +212,15 @@ static mut POINTER_MODE: SimplePointerMode = SimplePointerMode {
     resolution_x: RESOLUTION_X,
     resolution_y: RESOLUTION_Y,
     resolution_z: RESOLUTION_Z,
-    left_button: r_efi::efi::Boolean::TRUE,
-    right_button: r_efi::efi::Boolean::TRUE,
+    left_button: Boolean::TRUE,
+    right_button: Boolean::TRUE,
 };
 
 /// Global protocol instance
 static mut POINTER_PROTOCOL: SimplePointerProtocol = SimplePointerProtocol {
     reset: pointer_reset,
     get_state: pointer_get_state,
-    wait_for_input: core::ptr::null_mut(),
+    wait_for_input: POINTER_EVENT_ID as *mut c_void as Event,
     mode: core::ptr::addr_of_mut!(POINTER_MODE),
 };
 
@@ -194,4 +234,13 @@ pub fn get_protocol() -> *mut SimplePointerProtocol {
 /// Get the protocol GUID.
 pub fn guid() -> r_efi::efi::Guid {
     SIMPLE_POINTER_PROTOCOL_GUID
+}
+
+/// Check if pointer input is available.
+///
+/// Polls the raw mouse hardware, then peeks at the driver accumulators
+/// without consuming them.  Used by `BS.WaitForEvent` / `BS.CheckEvent`.
+pub(crate) fn pointer_check_ready() -> bool {
+    poll_raw_hardware();
+    has_pending_motion()
 }

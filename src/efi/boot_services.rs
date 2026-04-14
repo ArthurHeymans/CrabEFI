@@ -38,6 +38,10 @@ pub const EVT_SIGNAL_VIRTUAL_ADDRESS_CHANGE: u32 = 0x60000202;
 /// Special event ID for keyboard input
 pub const KEYBOARD_EVENT_ID: usize = 1;
 
+/// Special event ID for pointer (mouse) input
+#[cfg(feature = "ui")]
+pub const POINTER_EVENT_ID: usize = 2;
+
 /// Static boot services table
 static mut BOOT_SERVICES: efi::BootServices = efi::BootServices {
     hdr: TableHeader {
@@ -457,6 +461,16 @@ extern "efiapi" fn wait_for_event(
                 return Status::SUCCESS;
             }
 
+            // Check if it's the pointer event and there's mouse input.
+            #[cfg(feature = "ui")]
+            if event_id == POINTER_EVENT_ID
+                && crate::efi::protocols::simple_pointer::pointer_check_ready()
+            {
+                unsafe { *index = i };
+                log::debug!("  -> SUCCESS (pointer input ready, index={})", i);
+                return Status::SUCCESS;
+            }
+
             // Check if a regular event is signaled (including timer check)
             if event_id > 0 && event_id < MAX_EVENTS {
                 notify_wait_event(event_id, evt);
@@ -532,6 +546,16 @@ extern "efiapi" fn check_event(event: efi::Event) -> Status {
     // Special case for keyboard event — do a real read-ahead check
     if event_id == KEYBOARD_EVENT_ID {
         if crate::efi::protocols::console::keyboard_check_ready() {
+            return Status::SUCCESS;
+        } else {
+            return Status::NOT_READY;
+        }
+    }
+
+    // Special case for pointer event — poll hardware and peek
+    #[cfg(feature = "ui")]
+    if event_id == POINTER_EVENT_ID {
+        if crate::efi::protocols::simple_pointer::pointer_check_ready() {
             return Status::SUCCESS;
         } else {
             return Status::NOT_READY;
