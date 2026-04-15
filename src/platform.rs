@@ -85,6 +85,12 @@ pub enum MemoryType {
     RuntimeServicesCode,
     /// Runtime services data (becomes `EfiRuntimeServicesData` with `EFI_MEMORY_RUNTIME`).
     RuntimeServicesData,
+    /// Boot services data (becomes `EfiBootServicesData`).
+    ///
+    /// Reclaimed as ConventionalMemory after `ExitBootServices`. Use for
+    /// firmware regions that are not needed at runtime (e.g., firmware
+    /// BSS/stack when CrabEFI is called as a library).
+    BootServicesData,
 }
 
 // ============================================================================
