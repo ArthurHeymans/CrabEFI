@@ -375,6 +375,7 @@ impl MemoryAllocator {
                 PlatMemType::Mmio => MemoryType::MemoryMappedIo,
                 PlatMemType::RuntimeServicesCode => MemoryType::RuntimeServicesCode,
                 PlatMemType::RuntimeServicesData => MemoryType::RuntimeServicesData,
+                PlatMemType::BootServicesData => MemoryType::BootServicesData,
             };
 
             let num_pages = match region.size.checked_add(PAGE_SIZE - 1) {
