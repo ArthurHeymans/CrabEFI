@@ -43,7 +43,10 @@ impl IdtEntry {
         self.offset_low = handler as u16;
         self.offset_mid = (handler >> 16) as u16;
         self.offset_high = (handler >> 32) as u32;
-        self.selector = 0x08; // Code segment selector (from coreboot GDT)
+        // Use the current code segment selector rather than hardcoding 0x08.
+        // coreboot GDT has 64-bit code at 0x08; other firmware (e.g. fstart)
+        // may place it at 0x10.  Reading CS gives the right value regardless.
+        self.selector = read_cs();
         self.ist = 0;
         // Present, DPL=0, Interrupt Gate (0x8E)
         self.type_attr = 0x8E;
@@ -55,6 +58,16 @@ impl IdtEntry {
 struct IdtPointer {
     limit: u16,
     base: u64,
+}
+
+/// Read the current code-segment selector (CS register).
+#[inline]
+fn read_cs() -> u16 {
+    let cs: u16;
+    unsafe {
+        asm!("mov {0:x}, cs", out(reg) cs, options(nomem, nostack, preserves_flags));
+    }
+    cs
 }
 
 /// The IDT - 256 entries for all possible interrupts
