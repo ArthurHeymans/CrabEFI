@@ -825,16 +825,38 @@ impl<'a> FatFilesystem<'a> {
             return Ok(());
         }
 
-        // Calculate total device blocks for the entire run
-        let total_device_blocks = (total_bytes.div_ceil(device_block_size)) as u32;
+        // Read the device-block-aligned portion in a single multi-block read.
+        // When cluster_size < device_block_size, the total bytes may not fill
+        // a whole number of device blocks. We can only pass a buffer that is
+        // at least `device_blocks * device_block_size` bytes to read_blocks,
+        // so read the aligned prefix in bulk and the trailing clusters one by
+        // one (read_cluster handles sub-block reads via a temp buffer).
+        let aligned_bytes = (total_bytes / device_block_size) * device_block_size;
+        let aligned_device_blocks = (aligned_bytes / device_block_size) as u32;
 
-        self.device
-            .read_blocks(
-                start_device_block,
-                total_device_blocks,
-                &mut buffer[..total_bytes],
-            )
-            .map_err(|_| FatError::ReadError)
+        if aligned_device_blocks > 0 {
+            self.device
+                .read_blocks(
+                    start_device_block,
+                    aligned_device_blocks,
+                    &mut buffer[..aligned_bytes],
+                )
+                .map_err(|_| FatError::ReadError)?;
+        }
+
+        // Read remaining clusters that don't fill a complete device block
+        if aligned_bytes < total_bytes {
+            let first_tail_cluster = (aligned_bytes / cluster_size) as u32;
+            for i in first_tail_cluster..count {
+                let offset = i as usize * cluster_size;
+                self.read_cluster(
+                    start_cluster + i,
+                    &mut buffer[offset..offset + cluster_size],
+                )?;
+            }
+        }
+
+        Ok(())
     }
 
     /// Find a file by path
