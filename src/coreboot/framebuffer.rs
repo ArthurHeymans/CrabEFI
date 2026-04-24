@@ -55,7 +55,7 @@ impl From<FramebufferInfo> for crate::platform::FramebufferConfig {
             width: fb.x_resolution,
             height: fb.y_resolution,
             // Convert bytes-per-line to pixels-per-scanline
-            stride: if bpp > 0 {
+            stride: if bpp >= 8 {
                 fb.bytes_per_line / (bpp / 8)
             } else {
                 fb.x_resolution
@@ -226,19 +226,25 @@ impl FramebufferInfo {
 
     /// Encode a 32-bit pixel value
     fn encode_pixel_32(&self, r: u8, g: u8, b: u8) -> u32 {
-        // Scale down to mask size, like encode_pixel_16 does
-        let r = ((r as u32) >> (8 - self.red_mask_size)) << self.red_mask_pos;
-        let g = ((g as u32) >> (8 - self.green_mask_size)) << self.green_mask_pos;
-        let b = ((b as u32) >> (8 - self.blue_mask_size)) << self.blue_mask_pos;
+        // Scale down to mask size, like encode_pixel_16 does.
+        // Malformed coreboot records can report mask sizes > 8; saturating the
+        // shift keeps debug builds from panicking and release builds from wrapping.
+        let r = ((r as u32) >> 8u32.saturating_sub(self.red_mask_size as u32)) << self.red_mask_pos;
+        let g =
+            ((g as u32) >> 8u32.saturating_sub(self.green_mask_size as u32)) << self.green_mask_pos;
+        let b =
+            ((b as u32) >> 8u32.saturating_sub(self.blue_mask_size as u32)) << self.blue_mask_pos;
         r | g | b
     }
 
     /// Encode a 16-bit pixel value
     fn encode_pixel_16(&self, r: u8, g: u8, b: u8) -> u16 {
-        // Scale down to the mask size
-        let r = ((r as u16) >> (8 - self.red_mask_size)) << self.red_mask_pos;
-        let g = ((g as u16) >> (8 - self.green_mask_size)) << self.green_mask_pos;
-        let b = ((b as u16) >> (8 - self.blue_mask_size)) << self.blue_mask_pos;
+        // Scale down to the mask size.
+        let r = ((r as u16) >> 8u16.saturating_sub(self.red_mask_size as u16)) << self.red_mask_pos;
+        let g =
+            ((g as u16) >> 8u16.saturating_sub(self.green_mask_size as u16)) << self.green_mask_pos;
+        let b =
+            ((b as u16) >> 8u16.saturating_sub(self.blue_mask_size as u16)) << self.blue_mask_pos;
         r | g | b
     }
 

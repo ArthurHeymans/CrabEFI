@@ -98,6 +98,48 @@ impl From<BlockError> for IsoError {
     }
 }
 
+/// Read one 2048-byte ISO sector from a block device.
+fn read_iso_sector(
+    device: &mut dyn BlockDevice,
+    iso_sector: u64,
+    block_size: usize,
+    buffer: &mut [u8; ISO_SECTOR_SIZE],
+) -> Result<(), IsoError> {
+    if block_size == 0 || block_size > 4096 {
+        return Err(IsoError::NotIso9660);
+    }
+
+    if block_size <= ISO_SECTOR_SIZE {
+        if !ISO_SECTOR_SIZE.is_multiple_of(block_size) {
+            return Err(IsoError::NotIso9660);
+        }
+        let blocks_per_iso_sector = ISO_SECTOR_SIZE / block_size;
+        let first_block = iso_sector
+            .checked_mul(blocks_per_iso_sector as u64)
+            .ok_or(IsoError::ReadError)?;
+        for i in 0..blocks_per_iso_sector {
+            let offset = i * block_size;
+            device.read_block(
+                first_block + i as u64,
+                &mut buffer[offset..offset + block_size],
+            )?;
+        }
+        return Ok(());
+    }
+
+    if !block_size.is_multiple_of(ISO_SECTOR_SIZE) {
+        return Err(IsoError::NotIso9660);
+    }
+
+    let iso_per_block = block_size / ISO_SECTOR_SIZE;
+    let device_block = iso_sector / iso_per_block as u64;
+    let offset = (iso_sector as usize % iso_per_block) * ISO_SECTOR_SIZE;
+    let mut block = [0u8; 4096];
+    device.read_block(device_block, &mut block[..block_size])?;
+    buffer.copy_from_slice(&block[offset..offset + ISO_SECTOR_SIZE]);
+    Ok(())
+}
+
 /// Read the FAT BPB from the start of a boot image to determine its actual size.
 ///
 /// El Torito `sector_count` is often 0 or 1 for EFI images (meaning "entire image").
@@ -114,10 +156,16 @@ fn probe_fat_image_size(
     image_start_device_block: u64,
 ) -> Option<u64> {
     let block_size = device.info().block_size as usize;
+    if block_size == 0 || block_size > 4096 {
+        return None;
+    }
     let mut buf = [0u8; ISO_SECTOR_SIZE];
 
     // Read enough to cover the BPB (first 512 bytes minimum)
     if block_size <= ISO_SECTOR_SIZE {
+        if !ISO_SECTOR_SIZE.is_multiple_of(block_size) {
+            return None;
+        }
         let blocks_needed = ISO_SECTOR_SIZE / block_size;
         for i in 0..blocks_needed {
             let offset = i * block_size;
@@ -162,7 +210,7 @@ fn probe_fat_image_size(
         return None;
     }
 
-    let size = total_sectors * bytes_per_sector;
+    let size = total_sectors.checked_mul(bytes_per_sector)?;
     log::debug!(
         "El Torito: FAT BPB probe: {} sectors x {} bytes = {} bytes",
         total_sectors,
@@ -179,26 +227,10 @@ pub fn find_efi_boot_image(device: &mut dyn BlockDevice) -> Result<EfiBootImage,
     let info = device.info();
     let block_size = info.block_size as usize;
 
-    // For non-2048 byte devices, we need to calculate the right sector
-    let sectors_per_iso_sector = ISO_SECTOR_SIZE / block_size;
-
-    // Read the Boot Record Volume Descriptor (sector 17 in ISO terms)
-    let brvd_device_sector = BOOT_RECORD_SECTOR * sectors_per_iso_sector as u64;
-
     let mut buffer = [0u8; ISO_SECTOR_SIZE];
 
-    // Read the BRVD - may need multiple device sectors for 512-byte devices
-    if block_size < ISO_SECTOR_SIZE {
-        for i in 0..sectors_per_iso_sector {
-            let offset = i * block_size;
-            device.read_block(
-                brvd_device_sector + i as u64,
-                &mut buffer[offset..offset + block_size],
-            )?;
-        }
-    } else {
-        device.read_block(brvd_device_sector, &mut buffer[..block_size])?;
-    }
+    // Read the Boot Record Volume Descriptor (sector 17 in ISO terms)
+    read_iso_sector(device, BOOT_RECORD_SECTOR, block_size, &mut buffer)?;
 
     // Check for CD001 signature at offset 1
     if &buffer[1..6] != CD001_SIGNATURE {
@@ -223,19 +255,7 @@ pub fn find_efi_boot_image(device: &mut dyn BlockDevice) -> Result<EfiBootImage,
     log::debug!("El Torito: Boot catalog at ISO sector {}", catalog_sector);
 
     // Read the boot catalog
-    let catalog_device_sector = catalog_sector as u64 * sectors_per_iso_sector as u64;
-
-    if block_size < ISO_SECTOR_SIZE {
-        for i in 0..sectors_per_iso_sector {
-            let offset = i * block_size;
-            device.read_block(
-                catalog_device_sector + i as u64,
-                &mut buffer[offset..offset + block_size],
-            )?;
-        }
-    } else {
-        device.read_block(catalog_device_sector, &mut buffer[..block_size])?;
-    }
+    read_iso_sector(device, catalog_sector as u64, block_size, &mut buffer)?;
 
     // Parse validation entry (first 32 bytes)
     let (validation, _) =
@@ -269,7 +289,6 @@ pub fn find_efi_boot_image(device: &mut dyn BlockDevice) -> Result<EfiBootImage,
             device,
             load_rba,
             sector_count,
-            sectors_per_iso_sector,
             block_size,
         ));
     }
@@ -327,7 +346,6 @@ pub fn find_efi_boot_image(device: &mut dyn BlockDevice) -> Result<EfiBootImage,
                     device,
                     load_rba,
                     sector_count,
-                    sectors_per_iso_sector,
                     block_size,
                 ));
             }
@@ -354,17 +372,18 @@ fn build_efi_boot_image(
     device: &mut dyn BlockDevice,
     load_rba: u32,
     sector_count: u32,
-    sectors_per_iso_sector: usize,
     block_size: usize,
 ) -> EfiBootImage {
-    let start_device_block = load_rba as u64 * sectors_per_iso_sector as u64;
+    let start_byte = load_rba as u64 * ISO_SECTOR_SIZE as u64;
+    let start_device_block = start_byte / block_size as u64;
 
     if sector_count > 1 {
+        let size_bytes = sector_count as u64 * ISO_SECTOR_SIZE as u64;
         // Catalog gives a trustworthy size
         return EfiBootImage {
             start_sector: start_device_block,
-            sector_count: sector_count * sectors_per_iso_sector as u32,
-            size_bytes: sector_count as u64 * ISO_SECTOR_SIZE as u64,
+            sector_count: size_bytes.div_ceil(block_size as u64) as u32,
+            size_bytes,
         };
     }
 
@@ -389,14 +408,15 @@ fn build_efi_boot_image(
         "El Torito: could not probe FAT image size, using catalog sector_count={}",
         sector_count
     );
+    let size_bytes = sector_count as u64 * ISO_SECTOR_SIZE as u64;
     EfiBootImage {
         start_sector: start_device_block,
         sector_count: if sector_count > 0 {
-            sector_count * sectors_per_iso_sector as u32
+            size_bytes.div_ceil(block_size as u64) as u32
         } else {
             0
         },
-        size_bytes: sector_count as u64 * ISO_SECTOR_SIZE as u64,
+        size_bytes,
     }
 }
 
@@ -404,22 +424,13 @@ fn build_efi_boot_image(
 pub fn is_iso9660(device: &mut dyn BlockDevice) -> bool {
     let info = device.info();
     let block_size = info.block_size as usize;
-    let sectors_per_iso_sector = ISO_SECTOR_SIZE / block_size;
 
     // Check for Primary Volume Descriptor at sector 16
-    let pvd_sector = 16 * sectors_per_iso_sector as u64;
-
-    // Buffer must be at least block_size to avoid buffer overflow from read_block
-    let mut buffer = [0u8; 4096]; // MAX_BLOCK_SIZE
-    let read_size = block_size.min(buffer.len());
-
-    if device
-        .read_block(pvd_sector, &mut buffer[..read_size])
-        .is_err()
-    {
+    let mut buffer = [0u8; ISO_SECTOR_SIZE];
+    if read_iso_sector(device, 16, block_size, &mut buffer).is_err() {
         return false;
     }
 
     // Check for CD001 signature at offset 1
-    read_size >= 6 && &buffer[1..6] == CD001_SIGNATURE
+    &buffer[1..6] == CD001_SIGNATURE
 }

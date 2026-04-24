@@ -100,9 +100,10 @@ impl<T, const N: usize> ControllerRegistry<T, N> {
         let mut controllers = self.controllers.lock();
         if controllers.push(ControllerPtr(controller_box)).is_err() {
             log::warn!("{}: controller list full — freeing allocation", self.name);
-            // Note: the `T` value written via ptr::write is not dropped here. This
-            // is acceptable because current controller types do not implement Drop.
-            // If T ever gains Drop glue, this path must call ptr::drop_in_place first.
+            // Safety: `controller_box` was initialized with `ptr::write` above and
+            // has not been moved into the registry. Drop it before freeing pages so
+            // future controller types with Drop glue are handled correctly.
+            unsafe { core::ptr::drop_in_place(controller_box) };
             crate::efi::free_pages(mem, pages as u64);
             return Err(());
         }

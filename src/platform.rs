@@ -857,16 +857,20 @@ impl FramebufferConfig {
     }
 
     fn encode_pixel_32(&self, r: u8, g: u8, b: u8) -> u32 {
-        let r = ((r as u32) >> (8 - self.red_mask_size)) << self.red_mask_pos;
-        let g = ((g as u32) >> (8 - self.green_mask_size)) << self.green_mask_pos;
-        let b = ((b as u32) >> (8 - self.blue_mask_size)) << self.blue_mask_pos;
+        let r = ((r as u32) >> 8u32.saturating_sub(self.red_mask_size as u32)) << self.red_mask_pos;
+        let g =
+            ((g as u32) >> 8u32.saturating_sub(self.green_mask_size as u32)) << self.green_mask_pos;
+        let b =
+            ((b as u32) >> 8u32.saturating_sub(self.blue_mask_size as u32)) << self.blue_mask_pos;
         r | g | b
     }
 
     fn encode_pixel_16(&self, r: u8, g: u8, b: u8) -> u16 {
-        let r = ((r as u16) >> (8 - self.red_mask_size)) << self.red_mask_pos;
-        let g = ((g as u16) >> (8 - self.green_mask_size)) << self.green_mask_pos;
-        let b = ((b as u16) >> (8 - self.blue_mask_size)) << self.blue_mask_pos;
+        let r = ((r as u16) >> 8u16.saturating_sub(self.red_mask_size as u16)) << self.red_mask_pos;
+        let g =
+            ((g as u16) >> 8u16.saturating_sub(self.green_mask_size as u16)) << self.green_mask_pos;
+        let b =
+            ((b as u16) >> 8u16.saturating_sub(self.blue_mask_size as u16)) << self.blue_mask_pos;
         r | g | b
     }
 }
