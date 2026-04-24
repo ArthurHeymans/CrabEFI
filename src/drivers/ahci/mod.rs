@@ -7,6 +7,7 @@ pub mod regs;
 
 use crate::drivers::pci::{self, PciDevice};
 use crate::efi;
+use crate::efi::allocator::PAGE_SIZE_USIZE;
 use crate::time::{Timeout, wait_for};
 use core::ptr;
 use core::sync::atomic::{Ordering, fence};
@@ -171,8 +172,44 @@ impl PrdtEntry {
         self.dbau = (addr >> 32) as u32;
     }
 
-    fn set_byte_count(&mut self, count: u32, interrupt: bool) {
+    fn set_byte_count(&mut self, count: u32, interrupt: bool) -> Result<(), AhciError> {
+        if count == 0 {
+            return Err(AhciError::InvalidParameter);
+        }
         self.dbc = (count - 1) | if interrupt { 1u32 << 31 } else { 0 };
+        Ok(())
+    }
+}
+
+/// Page-backed DMA buffer that frees its pages on scope exit.
+struct DmaBuffer {
+    memory: &'static mut [u8],
+    pages: u64,
+}
+
+impl DmaBuffer {
+    fn new(len: usize) -> Result<Self, AhciError> {
+        let pages = len.div_ceil(PAGE_SIZE_USIZE).max(1) as u64;
+        let memory = efi::allocate_pages(pages).ok_or(AhciError::AllocationFailed)?;
+        Ok(Self { memory, pages })
+    }
+
+    fn as_ptr(&self) -> *const u8 {
+        self.memory.as_ptr()
+    }
+
+    fn as_mut_ptr(&mut self) -> *mut u8 {
+        self.memory.as_mut_ptr()
+    }
+
+    fn addr(&self) -> u64 {
+        self.memory.as_ptr() as u64
+    }
+}
+
+impl Drop for DmaBuffer {
+    fn drop(&mut self) {
+        efi::free_pages(self.memory, self.pages);
     }
 }
 
@@ -672,7 +709,7 @@ impl AhciController {
 
         // Setup PRDT
         table.prdt[0].set_address(buffer_addr);
-        table.prdt[0].set_byte_count(512, true);
+        table.prdt[0].set_byte_count(512, true)?;
 
         // Issue command
         self.issue_command(port, slot)?;
@@ -745,7 +782,7 @@ impl AhciController {
         // Setup PRDT
         let buffer_addr = buffer.as_ptr() as u64;
         table.prdt[0].set_address(buffer_addr);
-        table.prdt[0].set_byte_count(512, true);
+        table.prdt[0].set_byte_count(512, true)?;
 
         // Issue command
         self.issue_command(port, slot)?;
@@ -798,7 +835,7 @@ impl AhciController {
 
         // Setup PRDT
         table.prdt[0].set_address(buffer_addr);
-        table.prdt[0].set_byte_count(8, true);
+        table.prdt[0].set_byte_count(8, true)?;
 
         // Issue command
         if let Err(e) = self.issue_command(port, slot) {
@@ -964,7 +1001,7 @@ impl AhciController {
         // Setup PRDT - use actual sector size instead of assuming 512
         let byte_count = num_sectors * sector_size;
         table.prdt[0].set_address(buffer as u64);
-        table.prdt[0].set_byte_count(byte_count, true);
+        table.prdt[0].set_byte_count(byte_count, true)?;
 
         // Issue command
         self.issue_command_on_port(port_num, slot)?;
@@ -1026,7 +1063,7 @@ impl AhciController {
 
         // Setup PRDT
         table.prdt[0].set_address(buffer as u64);
-        table.prdt[0].set_byte_count(byte_count, true);
+        table.prdt[0].set_byte_count(byte_count, true)?;
 
         log::trace!(
             "read_sectors_atapi: LBA={}, count={}, byte_count={}, buffer={:p}",
@@ -1215,9 +1252,12 @@ impl AhciController {
             .find_free_slot(port_num)
             .ok_or(AhciError::PortNotReady)?;
 
-        // Allocate aligned buffer for DMA
-        let dma_buffer = efi::allocate_pages(1).ok_or(AhciError::AllocationFailed)?;
-        let dma_addr = dma_buffer.as_ptr() as u64;
+        // Allocate an aligned DMA buffer large enough for the protocol's
+        // 512-byte-block rounded transfer length.
+        let transfer_blocks = (buffer.len() as u32).div_ceil(512);
+        let transfer_len = (transfer_blocks as usize) * 512;
+        let dma_buffer = DmaBuffer::new(transfer_len)?;
+        let dma_addr = dma_buffer.addr();
 
         // Setup command header
         let header = unsafe { &mut *cmd_list.add(slot as usize) };
@@ -1244,7 +1284,6 @@ impl AhciController {
         fis.feature_l = protocol_id;
 
         // Transfer length in 512-byte blocks
-        let transfer_blocks = (buffer.len() as u32).div_ceil(512);
         fis.lba0 = (transfer_blocks & 0xFF) as u8;
         fis.lba1 = ((transfer_blocks >> 8) & 0xFF) as u8;
         fis.lba2 = 0;
@@ -1253,7 +1292,7 @@ impl AhciController {
 
         // Setup PRDT
         table.prdt[0].set_address(dma_addr);
-        table.prdt[0].set_byte_count(transfer_blocks * 512, true);
+        table.prdt[0].set_byte_count(transfer_blocks * 512, true)?;
 
         // Issue command
         let result = self.issue_command_on_port(port_num, slot);
@@ -1271,8 +1310,6 @@ impl AhciController {
         } else {
             0
         };
-
-        efi::free_pages(dma_buffer, 1);
 
         result.map(|_| {
             log::debug!(
@@ -1306,7 +1343,7 @@ impl AhciController {
             return Err(AhciError::InvalidParameter);
         }
 
-        if buffer.len() > 65536 {
+        if buffer.is_empty() || buffer.len() > 65536 {
             return Err(AhciError::InvalidParameter);
         }
 
@@ -1326,9 +1363,12 @@ impl AhciController {
             .find_free_slot(port_num)
             .ok_or(AhciError::PortNotReady)?;
 
-        // Allocate aligned buffer for DMA
-        let dma_buffer = efi::allocate_pages(1).ok_or(AhciError::AllocationFailed)?;
-        let dma_addr = dma_buffer.as_ptr() as u64;
+        // Allocate an aligned DMA buffer large enough for the protocol's
+        // 512-byte-block rounded transfer length.
+        let transfer_blocks = (buffer.len() as u32).div_ceil(512);
+        let transfer_len = (transfer_blocks as usize) * 512;
+        let mut dma_buffer = DmaBuffer::new(transfer_len)?;
+        let dma_addr = dma_buffer.addr();
 
         // Copy data to DMA buffer
         unsafe {
@@ -1360,7 +1400,6 @@ impl AhciController {
         fis.feature_l = protocol_id;
 
         // Transfer length in 512-byte blocks
-        let transfer_blocks = (buffer.len() as u32).div_ceil(512);
         fis.lba0 = (transfer_blocks & 0xFF) as u8;
         fis.lba1 = ((transfer_blocks >> 8) & 0xFF) as u8;
         fis.lba2 = 0;
@@ -1369,12 +1408,10 @@ impl AhciController {
 
         // Setup PRDT
         table.prdt[0].set_address(dma_addr);
-        table.prdt[0].set_byte_count(transfer_blocks * 512, true);
+        table.prdt[0].set_byte_count(transfer_blocks * 512, true)?;
 
         // Issue command
         let result = self.issue_command_on_port(port_num, slot);
-
-        efi::free_pages(dma_buffer, 1);
 
         result.map(|_| {
             log::debug!("AHCI Trusted Send: success");
@@ -1565,12 +1602,13 @@ pub fn global_read_sectors(lba: u64, buffer: &mut [u8]) -> Result<(), ()> {
 
 /// Get the sector size of the global AHCI device
 pub fn global_sector_size() -> Option<u32> {
-    let (controller_index, port_index) = match GLOBAL_AHCI_DEVICE.lock().as_ref() {
-        Some(ptr) => unsafe {
+    let (controller_index, port_index) = {
+        let guard = GLOBAL_AHCI_DEVICE.lock();
+        let ptr = guard.as_ref()?;
+        unsafe {
             let device = &*ptr.0;
             (device.controller_index, device.port_index)
-        },
-        None => return None,
+        }
     };
 
     // Safety: pointer valid for firmware lifetime; no overlapping &mut created

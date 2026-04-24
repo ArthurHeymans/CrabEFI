@@ -407,6 +407,25 @@ extern "efiapi" fn set_timer(
     })
 }
 
+fn notify_wait_event(event_id: usize, event: efi::Event) {
+    let notify_fn = state::with_efi_mut(|efi_state| {
+        let entry = &efi_state.events[event_id];
+        if !entry.signaled && entry.event_type & EVT_NOTIFY_WAIT != 0 {
+            entry.notify_function.map(|f| (f, entry.notify_context))
+        } else {
+            None
+        }
+    });
+
+    if let Some((func, context)) = notify_fn {
+        log::trace!(
+            "  -> Calling EVT_NOTIFY_WAIT function for event {}",
+            event_id
+        );
+        func(event, context);
+    }
+}
+
 extern "efiapi" fn wait_for_event(
     number_of_events: usize,
     event: *mut efi::Event,
@@ -440,6 +459,7 @@ extern "efiapi" fn wait_for_event(
 
             // Check if a regular event is signaled (including timer check)
             if event_id > 0 && event_id < MAX_EVENTS {
+                notify_wait_event(event_id, evt);
                 check_timer_event(event_id);
 
                 // Per UEFI spec: WaitForEvent clears the signaled state
@@ -520,6 +540,8 @@ extern "efiapi" fn check_event(event: efi::Event) -> Status {
 
     // Check regular events
     if event_id > 0 && event_id < MAX_EVENTS {
+        notify_wait_event(event_id, event);
+
         // Check timer expiration
         check_timer_event(event_id);
 
@@ -910,6 +932,53 @@ extern "efiapi" fn locate_handle(
     Status::SUCCESS
 }
 
+unsafe fn device_path_node_len(dp: *mut DevicePathProtocol) -> Option<usize> {
+    let len = unsafe { u16::from_le_bytes([(*dp).length[0], (*dp).length[1]]) as usize };
+    (len >= 4).then_some(len)
+}
+
+unsafe fn is_device_path_end(dp: *mut DevicePathProtocol) -> bool {
+    unsafe { (*dp).r#type == 0x7f }
+}
+
+unsafe fn device_path_prefix_match(
+    handle_dp: *mut DevicePathProtocol,
+    input_dp: *mut DevicePathProtocol,
+) -> Option<*mut DevicePathProtocol> {
+    let mut handle_node = handle_dp;
+    let mut input_node = input_dp;
+
+    // Device paths are small. Bound the walk so malformed paths cannot loop forever.
+    for _ in 0..128 {
+        if unsafe { is_device_path_end(handle_node) } {
+            return Some(input_node);
+        }
+        if unsafe { is_device_path_end(input_node) } {
+            return None;
+        }
+
+        let handle_len = unsafe { device_path_node_len(handle_node)? };
+        let input_len = unsafe { device_path_node_len(input_node)? };
+        if handle_len != input_len {
+            return None;
+        }
+
+        let handle_bytes =
+            unsafe { core::slice::from_raw_parts(handle_node as *const u8, handle_len) };
+        let input_bytes =
+            unsafe { core::slice::from_raw_parts(input_node as *const u8, input_len) };
+        if handle_bytes != input_bytes {
+            return None;
+        }
+
+        handle_node =
+            unsafe { (handle_node as *const u8).add(handle_len) as *mut DevicePathProtocol };
+        input_node = unsafe { (input_node as *const u8).add(input_len) as *mut DevicePathProtocol };
+    }
+
+    None
+}
+
 extern "efiapi" fn locate_device_path(
     protocol: *mut Guid,
     device_path: *mut *mut DevicePathProtocol,
@@ -933,53 +1002,35 @@ extern "efiapi" fn locate_device_path(
 
     let found = efi_state.handles[..efi_state.handle_count]
         .iter()
-        .filter_map(|entry| {
+        .find_map(|entry| {
             let protocols = &entry.protocols[..entry.protocol_count];
 
             let has_protocol = protocols.iter().any(|p| p.guid == guid);
+            if !has_protocol {
+                return None;
+            }
 
             let handle_dp = protocols
                 .iter()
                 .find(|p| p.guid == r_efi::protocols::device_path::PROTOCOL_GUID)
-                .map(|p| p.interface as *mut DevicePathProtocol);
-
-            match (has_protocol, handle_dp) {
-                (true, Some(dp)) if !dp.is_null() => Some((entry.handle, dp)),
-                _ => None,
+                .map(|p| p.interface as *mut DevicePathProtocol)?;
+            if handle_dp.is_null() {
+                return None;
             }
-        })
-        .next();
 
-    if let Some((handle, handle_dp)) = found {
-        // For the initrd case, GRUB installs a handle with LOAD_FILE2 and a vendor media
-        // device path. The kernel passes in that same device path to find it.
+            let remaining = unsafe { device_path_prefix_match(handle_dp, input_dp) }?;
+            Some((entry.handle, remaining))
+        });
 
+    if let Some((handle, remaining)) = found {
         log::debug!(
-            "  -> SUCCESS (handle={:?}, device_path={:?})",
+            "  -> SUCCESS (handle={:?}, remaining_device_path={:?})",
             handle,
-            handle_dp
+            remaining
         );
         unsafe {
             *device = handle;
-            // Update device_path to point to the End node of the handle's device path.
-            // The LoadFile2 protocol expects the remaining path after the match.
-            // Walk to the end of the device path and point to the End node.
-            let mut dp = handle_dp;
-            loop {
-                let dp_type = (*dp).r#type;
-                let dp_subtype = (*dp).sub_type;
-                // End of device path: type 0x7F, subtype 0xFF
-                if dp_type == 0x7f && dp_subtype == 0xff {
-                    break;
-                }
-                // Get length and move to next node
-                let len = u16::from_le_bytes([(*dp).length[0], (*dp).length[1]]) as usize;
-                if len < 4 {
-                    break; // Invalid length, stop
-                }
-                dp = (dp as *const u8).add(len) as *mut DevicePathProtocol;
-            }
-            *device_path = dp;
+            *device_path = remaining;
         }
         return Status::SUCCESS;
     }

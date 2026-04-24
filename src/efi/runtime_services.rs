@@ -996,6 +996,27 @@ fn copy_stored_variable_name(
     Status::SUCCESS
 }
 
+enum VariablePersistAction {
+    None,
+    Write {
+        guid: Guid,
+        name: Vec<u16>,
+        attributes: u32,
+        data: Vec<u8>,
+        is_append: bool,
+    },
+    Delete {
+        guid: Guid,
+        name: Vec<u16>,
+    },
+}
+
+enum SecureBootDbAction {
+    None,
+    Update(auth::SecureBootVariable, Vec<u8>),
+    Delete(auth::SecureBootVariable),
+}
+
 extern "efiapi" fn set_variable(
     variable_name: *mut u16,
     vendor_guid: *mut Guid,
@@ -1033,15 +1054,12 @@ extern "efiapi" fn set_variable(
     if state::is_exit_boot_services_called() {
         use crate::efi::rtlog;
         rtlog::append("SetVariable name=");
-        if !variable_name.is_null() {
-            // Print up to 64 UCS-2 chars as ASCII (names are always ASCII)
-            for i in 0..64usize {
-                let c = unsafe { *variable_name.add(i) };
-                if c == 0 {
-                    break;
-                }
-                rtlog::append(core::str::from_utf8(&[(c & 0x7f) as u8]).unwrap_or("?"));
+        for i in 0..64usize {
+            let c = unsafe { *variable_name.add(i) };
+            if c == 0 {
+                break;
             }
+            rtlog::append(core::str::from_utf8(&[(c & 0x7f) as u8]).unwrap_or("?"));
         }
         rtlog::append(" attr=");
         rtlog::append_hex(attributes as u64);
@@ -1055,21 +1073,12 @@ extern "efiapi" fn set_variable(
     if name_len == 0 || name_len >= MAX_VARIABLE_NAME_LEN {
         return Status::INVALID_PARAMETER;
     }
+    let name_slice = unsafe { core::slice::from_raw_parts(name, name_len + 1) };
+    let name_vec: Vec<u16> = name_slice.to_vec();
 
     // Check data size.
-    //
-    // For authenticated writes the caller passes the EFI_VARIABLE_AUTHENTICATION_2
-    // header (timestamp + WIN_CERTIFICATE with a PKCS#7 signature, typically
-    // 1-3 KB) prepended to the actual payload.  The signature is verified and
-    // discarded; only the payload is stored.  We therefore allow a generous raw
-    // input limit here and re-check the *stored* size after auth processing
-    // (see the `final_data_size > MAX_VARIABLE_DATA_SIZE` guard below).
-    //
-    // For non-authenticated writes the raw size IS the stored size, so
-    // MAX_VARIABLE_DATA_SIZE is the correct limit.
     let is_auth_write = (attributes & auth::attributes::TIME_BASED_AUTHENTICATED_WRITE_ACCESS) != 0;
     let raw_limit = if is_auth_write {
-        // Auth header (PKCS#7 signature) can add 1-3 KB on top of payload
         MAX_VARIABLE_DATA_SIZE * 3
     } else {
         MAX_VARIABLE_DATA_SIZE
@@ -1082,8 +1091,7 @@ extern "efiapi" fn set_variable(
         return Status::INVALID_PARAMETER;
     }
 
-    // Check if we're at runtime and trying to modify a boot-services-only variable
-    // Per UEFI spec, BS-only variables cannot be modified at runtime
+    // Check if we're at runtime and trying to modify a boot-services-only variable.
     if state::is_exit_boot_services_called() {
         let has_runtime_access = (attributes & auth::attributes::RUNTIME_ACCESS) != 0;
         if !has_runtime_access {
@@ -1094,9 +1102,7 @@ extern "efiapi" fn set_variable(
         }
     }
 
-    // Check if this is a read-only variable that cannot be written via SetVariable
-    // SecureBoot and SetupMode are computed status variables, not writable
-    let name_slice = unsafe { core::slice::from_raw_parts(name, name_len + 1) };
+    // SecureBoot and SetupMode are computed status variables, not writable.
     if guid == auth::EFI_GLOBAL_VARIABLE_GUID
         && (name_slice == auth::SECURE_BOOT_NAME || name_slice == auth::SETUP_MODE_NAME)
     {
@@ -1111,26 +1117,15 @@ extern "efiapi" fn set_variable(
         return Status::WRITE_PROTECTED;
     }
 
-    // Check if this is an authenticated variable write
     let is_authenticated =
         (attributes & auth::attributes::TIME_BASED_AUTHENTICATED_WRITE_ACCESS) != 0;
     let is_append = (attributes & auth::attributes::APPEND_WRITE) != 0;
 
-    // Process the data - for authenticated writes, we need to verify and extract
-    let (actual_data, actual_data_size) = if is_authenticated && data_size > 0 {
-        // Convert the data to a slice for the auth module
+    let final_data_vec: Vec<u8> = if is_authenticated && data_size > 0 {
         let raw_data = unsafe { core::slice::from_raw_parts(data as *const u8, data_size) };
-
-        // Convert name to slice for the auth module
-        let name_slice = unsafe { core::slice::from_raw_parts(name, name_len + 1) };
-
-        // Verify the authenticated variable and extract the actual data
-        match auth::verify_authenticated_variable(name_slice, &guid, attributes, raw_data) {
-            Ok(verified_data) => {
-                // Store the verified data temporarily
-                // Note: This will be copied into the variable store
-                (Some(verified_data), 0usize) // size will be taken from Vec
-            }
+        match auth::verify_authenticated_variable(name_vec.as_slice(), &guid, attributes, raw_data)
+        {
+            Ok(verified_data) => verified_data,
             Err(e) => {
                 log::warn!("Authenticated variable verification failed: {:?}", e);
                 #[cfg(feature = "rt-log")]
@@ -1142,189 +1137,198 @@ extern "efiapi" fn set_variable(
                 return e.into();
             }
         }
+    } else if data_size > 0 {
+        unsafe { core::slice::from_raw_parts(data as *const u8, data_size) }.to_vec()
     } else {
-        (None, data_size)
+        Vec::new()
     };
 
-    // Get the actual data slice to store
-    let (data_ptr, final_data_size): (*const u8, usize) = match &actual_data {
-        Some(vec) => (vec.as_ptr(), vec.len()),
-        None => (data as *const u8, actual_data_size),
-    };
+    let final_data_size = final_data_vec.len();
+    let secure_boot_var = auth::identify_key_database(name_vec.as_slice(), &guid);
+    let exit_boot_services_called = state::is_exit_boot_services_called();
 
-    // Check if this is a Secure Boot key database variable
-    let secure_boot_var = auth::identify_key_database(
-        unsafe { core::slice::from_raw_parts(name, name_len + 1) },
-        &guid,
-    );
-
-    state::with_efi_mut(|efi| {
+    let (status, persist_action, secure_boot_action) = state::with_efi_mut(|efi| {
         let variables = &mut efi.variables;
 
-        // Find existing variable using position()
-        let existing_idx = variables
-            .iter()
-            .position(|var| var.in_use && var.vendor_guid == guid && name_eq(&var.name, name));
-
-        // Find first free slot using position()
+        let existing_idx = variables.iter().position(|var| {
+            var.in_use
+                && var.vendor_guid == guid
+                && crate::efi::utils::ucs2_eq(&var.name, name_vec.as_slice())
+        });
         let free_idx = variables.iter().position(|var| !var.in_use);
 
-        // Delete variable if data_size is 0 (for authenticated vars, this means empty after header)
+        // Delete variable if data_size is 0 (for authenticated vars, this means empty after header).
         if final_data_size == 0 {
             if let Some(idx) = existing_idx {
                 variables[idx].in_use = false;
-
-                // Handle Secure Boot state changes
-                if let Some(var_type) = secure_boot_var {
-                    handle_secure_boot_variable_delete(var_type);
-                }
-
-                // Persist the deletion to storage
-                let name_slice = unsafe { core::slice::from_raw_parts(name, name_len + 1) };
-                if let Err(e) = crate::efi::varstore::delete_variable(&guid, name_slice) {
-                    log::debug!("Variable deletion not persisted: {:?}", e);
-                }
-
-                return Status::SUCCESS;
+                let secure_action = secure_boot_var
+                    .map(SecureBootDbAction::Delete)
+                    .unwrap_or(SecureBootDbAction::None);
+                let persist_action = VariablePersistAction::Delete {
+                    guid,
+                    name: name_vec.clone(),
+                };
+                return (Status::SUCCESS, persist_action, secure_action);
             }
-            return Status::NOT_FOUND;
+            return (
+                Status::NOT_FOUND,
+                VariablePersistAction::None,
+                SecureBootDbAction::None,
+            );
         }
 
-        // Handle APPEND_WRITE for signature databases
+        // Handle APPEND_WRITE for signature databases.
         if is_append
             && let Some(idx) = existing_idx
             && let Some(var_type) = secure_boot_var
         {
             let existing_data = &variables[idx].data[..variables[idx].data_size];
-
-            // Append the new signature lists to existing data
-            match append_signature_data(existing_data, data_ptr, final_data_size, var_type) {
+            match append_signature_data(
+                existing_data,
+                final_data_vec.as_ptr(),
+                final_data_size,
+                var_type,
+            ) {
                 Ok(combined) => {
                     if combined.len() > MAX_VARIABLE_DATA_SIZE {
-                        return Status::OUT_OF_RESOURCES;
+                        return (
+                            Status::OUT_OF_RESOURCES,
+                            VariablePersistAction::None,
+                            SecureBootDbAction::None,
+                        );
                     }
 
                     variables[idx].data[..combined.len()].copy_from_slice(&combined);
                     variables[idx].data_size = combined.len();
 
-                    // Update the key database
-                    update_key_database(var_type, &combined);
-
-                    // Persist the updated variable
-                    if (attributes & crate::efi::auth::attributes::NON_VOLATILE) != 0 {
-                        let name_slice = unsafe { core::slice::from_raw_parts(name, name_len + 1) };
-                        // The combined data is the fully-resolved merge of existing +
-                        // new signature lists (auth header already stripped, append
-                        // already applied).  When writing to the deferred buffer at
-                        // runtime, clear the auth/append flags so the buffer stores
-                        // it as a plain non-auth full write — the verification was
-                        // already performed above.
+                    let persist_action = if attributes & auth::attributes::NON_VOLATILE != 0 {
                         let persist_attrs = attributes
-                            & !(crate::efi::auth::attributes::TIME_BASED_AUTHENTICATED_WRITE_ACCESS
-                                | crate::efi::auth::attributes::APPEND_WRITE);
-                        match crate::efi::varstore::persist_variable(
-                            &guid,
-                            name_slice,
-                            persist_attrs,
-                            &combined,
-                        ) {
-                            Ok(()) =>
-                            {
-                                #[cfg(feature = "rt-log")]
-                                if state::is_exit_boot_services_called() {
-                                    crate::efi::rtlog::appendln("  -> persisted OK (append)");
-                                }
-                            }
-                            Err(e) => {
-                                log::debug!("Variable not persisted: {:?}", e);
-                                #[cfg(feature = "rt-log")]
-                                if state::is_exit_boot_services_called() {
-                                    use crate::efi::rtlog;
-                                    rtlog::append("  -> persist FAILED (append): ");
-                                    rtlog::appendln(alloc::format!("{:?}", e).as_str());
-                                }
-                            }
+                            & !(auth::attributes::TIME_BASED_AUTHENTICATED_WRITE_ACCESS
+                                | auth::attributes::APPEND_WRITE);
+                        VariablePersistAction::Write {
+                            guid,
+                            name: name_vec.clone(),
+                            attributes: persist_attrs,
+                            data: combined.clone(),
+                            is_append: true,
                         }
-                    }
+                    } else {
+                        VariablePersistAction::None
+                    };
 
-                    return Status::SUCCESS;
+                    return (
+                        Status::SUCCESS,
+                        persist_action,
+                        SecureBootDbAction::Update(var_type, combined),
+                    );
                 }
-                Err(e) => return e.into(),
+                Err(e) => {
+                    return (
+                        e.into(),
+                        VariablePersistAction::None,
+                        SecureBootDbAction::None,
+                    );
+                }
             }
         }
 
-        // Update or create variable
         let idx = match existing_idx {
             Some(i) => i,
             None => match free_idx {
                 Some(i) => i,
-                None => return Status::OUT_OF_RESOURCES,
+                None => {
+                    return (
+                        Status::OUT_OF_RESOURCES,
+                        VariablePersistAction::None,
+                        SecureBootDbAction::None,
+                    );
+                }
             },
         };
 
-        // Check final data size fits
         if final_data_size > MAX_VARIABLE_DATA_SIZE {
-            return Status::OUT_OF_RESOURCES;
-        }
-
-        // Copy name using slice operations
-        let src = unsafe { core::slice::from_raw_parts(name, name_len + 1) };
-        variables[idx].name[..name_len + 1].copy_from_slice(src);
-        variables[idx].name[name_len + 1..].fill(0);
-
-        // Copy data
-        unsafe {
-            core::ptr::copy_nonoverlapping(
-                data_ptr,
-                variables[idx].data.as_mut_ptr(),
-                final_data_size,
+            return (
+                Status::OUT_OF_RESOURCES,
+                VariablePersistAction::None,
+                SecureBootDbAction::None,
             );
         }
 
+        variables[idx].name[..name_vec.len()].copy_from_slice(&name_vec);
+        variables[idx].name[name_vec.len()..].fill(0);
+        variables[idx].data[..final_data_size].copy_from_slice(&final_data_vec);
         variables[idx].vendor_guid = guid;
         variables[idx].attributes = attributes;
         variables[idx].data_size = final_data_size;
         variables[idx].in_use = true;
 
-        // Update Secure Boot key databases and state
-        if let Some(var_type) = secure_boot_var {
-            let var_data = &variables[idx].data[..final_data_size];
-            update_key_database(var_type, var_data);
+        let secure_action = secure_boot_var
+            .map(|var_type| SecureBootDbAction::Update(var_type, final_data_vec.clone()))
+            .unwrap_or(SecureBootDbAction::None);
+
+        let persist_action = if attributes & auth::attributes::NON_VOLATILE != 0 {
+            let persist_data = if is_authenticated && exit_boot_services_called && data_size > 0 {
+                unsafe { core::slice::from_raw_parts(data as *const u8, data_size) }.to_vec()
+            } else {
+                final_data_vec.clone()
+            };
+            VariablePersistAction::Write {
+                guid,
+                name: name_vec.clone(),
+                attributes,
+                data: persist_data,
+                is_append: false,
+            }
+        } else {
+            VariablePersistAction::None
+        };
+
+        (Status::SUCCESS, persist_action, secure_action)
+    });
+
+    if status != Status::SUCCESS {
+        return status;
+    }
+
+    match secure_boot_action {
+        SecureBootDbAction::None => {}
+        SecureBootDbAction::Update(var_type, data) => {
+            update_key_database(var_type, data.as_slice());
             handle_secure_boot_variable_update(var_type);
         }
+        SecureBootDbAction::Delete(var_type) => handle_secure_boot_variable_delete(var_type),
+    }
 
-        // Persist variable to storage (SPI flash or ESP file)
-        // Only persist non-volatile variables
-        if (attributes & crate::efi::auth::attributes::NON_VOLATILE) != 0 {
-            let name_slice = unsafe { core::slice::from_raw_parts(name, name_len + 1) };
-
-            // For authenticated variables at runtime (after ExitBootServices), we
-            // must pass the ORIGINAL signed data (with auth header) to the deferred
-            // buffer so it can re-verify the signature on next boot and extract the
-            // timestamp.  Before ExitBootServices, we write the stripped payload
-            // directly to SPI flash (no auth header needed in storage).
-            let persist_data: &[u8] =
-                if is_authenticated && state::is_exit_boot_services_called() && data_size > 0 {
-                    // SAFETY: `data` and `data_size` are the original caller-provided
-                    // values validated at function entry; the pointer is valid for
-                    // `data_size` bytes and has not been freed.
-                    unsafe { core::slice::from_raw_parts(data as *const u8, data_size) }
-                } else {
-                    unsafe { core::slice::from_raw_parts(data_ptr, final_data_size) }
-                };
-
+    match persist_action {
+        VariablePersistAction::None => {}
+        VariablePersistAction::Delete { guid, name } => {
+            if let Err(e) = crate::efi::varstore::delete_variable(&guid, name.as_slice()) {
+                log::debug!("Variable deletion not persisted: {:?}", e);
+            }
+        }
+        VariablePersistAction::Write {
+            guid,
+            name,
+            attributes,
+            data,
+            is_append,
+        } => {
+            let _ = is_append;
             match crate::efi::varstore::persist_variable(
                 &guid,
-                name_slice,
+                name.as_slice(),
                 attributes,
-                persist_data,
+                data.as_slice(),
             ) {
                 Ok(()) =>
                 {
                     #[cfg(feature = "rt-log")]
                     if state::is_exit_boot_services_called() {
-                        use crate::efi::rtlog;
-                        rtlog::appendln("  -> persisted OK");
+                        if is_append {
+                            crate::efi::rtlog::appendln("  -> persisted OK (append)");
+                        } else {
+                            crate::efi::rtlog::appendln("  -> persisted OK");
+                        }
                     }
                 }
                 Err(e) => {
@@ -1332,15 +1336,19 @@ extern "efiapi" fn set_variable(
                     #[cfg(feature = "rt-log")]
                     if state::is_exit_boot_services_called() {
                         use crate::efi::rtlog;
-                        rtlog::append("  -> persist FAILED: ");
+                        if is_append {
+                            rtlog::append("  -> persist FAILED (append): ");
+                        } else {
+                            rtlog::append("  -> persist FAILED: ");
+                        }
                         rtlog::appendln(alloc::format!("{:?}", e).as_str());
                     }
                 }
             }
         }
+    }
 
-        Status::SUCCESS
-    })
+    Status::SUCCESS
 }
 
 /// Handle Secure Boot state changes when a key database variable is updated

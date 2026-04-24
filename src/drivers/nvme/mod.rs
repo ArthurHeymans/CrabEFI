@@ -1371,12 +1371,13 @@ pub fn global_read_sectors(lba: u64, buffer: &mut [u8]) -> Result<(), ()> {
 
 /// Get the sector size of the global NVMe device
 pub fn global_sector_size() -> Option<u32> {
-    let (controller_index, nsid) = match GLOBAL_NVME_DEVICE.lock().as_ref() {
-        Some(ptr) => unsafe {
+    let (controller_index, nsid) = {
+        let guard = GLOBAL_NVME_DEVICE.lock();
+        let ptr = guard.as_ref()?;
+        unsafe {
             let device = &*ptr.0;
             (device.controller_index, device.nsid)
-        },
-        None => return None,
+        }
     };
 
     // Safety: pointer valid for firmware lifetime; no overlapping &mut created

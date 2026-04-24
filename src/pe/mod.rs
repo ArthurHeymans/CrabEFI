@@ -653,7 +653,7 @@ pub fn load_image(data: &[u8]) -> Result<LoadedImage, Status> {
                 image_size
             );
             // Free allocated memory and return error
-            let _ = allocator::free_pages(load_addr, num_pages);
+            let _ = allocator::free_pages(alloc_base, num_pages);
             return Err(Status::INVALID_PARAMETER);
         }
 
@@ -681,7 +681,7 @@ pub fn load_image(data: &[u8]) -> Result<LoadedImage, Status> {
 
         if data_dirs_end > data.len() {
             log::error!("PE: Data directories extend beyond file");
-            let _ = allocator::free_pages(load_addr, num_pages);
+            let _ = allocator::free_pages(alloc_base, num_pages);
             return Err(Status::INVALID_PARAMETER);
         }
 
@@ -696,7 +696,7 @@ pub fn load_image(data: &[u8]) -> Result<LoadedImage, Status> {
                 match DataDirectory::ref_from_prefix(&data_dirs_data[reloc_dir_offset..]) {
                     Ok((d, _)) => d,
                     Err(_) => {
-                        let _ = allocator::free_pages(load_addr, num_pages);
+                        let _ = allocator::free_pages(alloc_base, num_pages);
                         return Err(Status::INVALID_PARAMETER);
                     }
                 };
@@ -709,7 +709,7 @@ pub fn load_image(data: &[u8]) -> Result<LoadedImage, Status> {
                     apply_relocations(load_addr, image_size, reloc_rva, reloc_size, delta)
             {
                 log::error!("PE: Failed to apply relocations");
-                let _ = allocator::free_pages(load_addr, num_pages);
+                let _ = allocator::free_pages(alloc_base, num_pages);
                 return Err(e);
             }
         }

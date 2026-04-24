@@ -191,10 +191,19 @@ impl Elf64 {
         let mut segments = heapless::Vec::new();
         let phdr_offset = header.e_phoff as usize;
         let phdr_size = header.e_phentsize as usize;
+        if phdr_size < core::mem::size_of::<Elf64Phdr>() {
+            return Err(ElfError::InvalidProgramHeader);
+        }
 
         for i in 0..header.e_phnum as usize {
-            let offset = phdr_offset + i * phdr_size;
-            if offset + phdr_size > data.len() {
+            let offset = i
+                .checked_mul(phdr_size)
+                .and_then(|rel| phdr_offset.checked_add(rel))
+                .ok_or(ElfError::InvalidProgramHeader)?;
+            let end = offset
+                .checked_add(core::mem::size_of::<Elf64Phdr>())
+                .ok_or(ElfError::InvalidProgramHeader)?;
+            if end > data.len() {
                 return Err(ElfError::InvalidProgramHeader);
             }
 
@@ -249,7 +258,10 @@ impl Elf64 {
 
             // Copy file data
             if src_size > 0 {
-                if src_offset + src_size > data.len() {
+                let src_end = src_offset
+                    .checked_add(src_size)
+                    .ok_or(ElfError::InvalidProgramHeader)?;
+                if src_end > data.len() {
                     return Err(ElfError::InvalidProgramHeader);
                 }
                 // Safety: caller guarantees dst points to valid writable memory

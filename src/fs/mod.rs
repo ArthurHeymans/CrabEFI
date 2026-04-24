@@ -21,8 +21,9 @@ pub mod iso9660;
 ///
 /// FAT-style path (e.g., "boot\\vmlinuz-linux") or an error if the path is invalid
 pub fn linux_path_to_fat(path: &str) -> Result<heapless::String<128>, PathConversionError> {
-    // Reject directory traversal attempts (check each path component, not substring)
-    if path.split('/').any(|component| component == "..") {
+    // Reject directory traversal attempts (check each path component, accepting
+    // both Linux and FAT separators because callers may pass mixed paths).
+    if path.split(['/', '\\']).any(|component| component == "..") {
         return Err(PathConversionError::DirectoryTraversal);
     }
 

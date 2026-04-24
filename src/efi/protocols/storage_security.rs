@@ -383,15 +383,12 @@ fn usb_security_receive(
 ) -> Result<usize, &'static str> {
     // Execute with the USB controller
     let result = usb::with_controller(controller_index, |controller| {
-        // Get the device address from the global mass storage
-        let Some(device) = usb::mass_storage::get_global_device() else {
-            return Err("No USB mass storage device configured");
-        };
-
-        // Call security_protocol_in on the device
-        device
-            .security_protocol_in(controller, protocol_id, sp_specific, buffer)
-            .map_err(|_| "USB security protocol in failed")
+        usb::mass_storage::with_global_device(|device| {
+            device
+                .security_protocol_in(controller, protocol_id, sp_specific, buffer)
+                .map_err(|_| "USB security protocol in failed")
+        })
+        .unwrap_or(Err("No USB mass storage device configured"))
     });
 
     match result {
@@ -410,15 +407,12 @@ fn usb_security_send(
 ) -> Result<(), &'static str> {
     // Execute with the USB controller
     let result = usb::with_controller(controller_index, |controller| {
-        // Get the device address from the global mass storage
-        let Some(device) = usb::mass_storage::get_global_device() else {
-            return Err("No USB mass storage device configured");
-        };
-
-        // Call security_protocol_out on the device
-        device
-            .security_protocol_out(controller, protocol_id, sp_specific, buffer)
-            .map_err(|_| "USB security protocol out failed")
+        usb::mass_storage::with_global_device(|device| {
+            device
+                .security_protocol_out(controller, protocol_id, sp_specific, buffer)
+                .map_err(|_| "USB security protocol out failed")
+        })
+        .unwrap_or(Err("No USB mass storage device configured"))
     });
 
     match result {

@@ -1042,12 +1042,24 @@ pub unsafe fn store_global_device_with_controller_ptr(
     }
 }
 
-/// Get a reference to the global USB mass storage device
-pub fn get_global_device() -> Option<&'static mut UsbMassStorage> {
+/// Get a raw pointer to the global USB mass storage device.
+///
+/// The pointer remains valid for the firmware lifetime. Callers must only
+/// create a temporary `&mut UsbMassStorage` for the immediate operation and
+/// must not retain it across calls that may access the same global device.
+pub fn get_global_device_ptr() -> Option<*mut UsbMassStorage> {
     GLOBAL_USB_STATE
         .lock()
         .as_ref()
-        .map(|state| unsafe { &mut *state.device_ptr })
+        .map(|state| state.device_ptr)
+}
+
+/// Access the global USB mass storage device through a scoped mutable borrow.
+pub fn with_global_device<R>(f: impl FnOnce(&mut UsbMassStorage) -> R) -> Option<R> {
+    let device_ptr = get_global_device_ptr()?;
+    // Safety: The device pointer was allocated with EFI pages and remains valid
+    // for the firmware lifetime. The borrow is scoped to this closure.
+    Some(f(unsafe { &mut *device_ptr }))
 }
 
 /// Read sectors from the global USB device

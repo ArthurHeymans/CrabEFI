@@ -296,8 +296,19 @@ pub fn read_partitions(
     };
 
     let entry_size = header.partition_entry_size as usize;
+    if entry_size < core::mem::size_of::<GptPartitionEntry>() {
+        log::warn!(
+            "GPT partition entry size too small: {} bytes (need at least {})",
+            entry_size,
+            core::mem::size_of::<GptPartitionEntry>()
+        );
+        return Err(GptError::InvalidHeader);
+    }
+
     let total_entries = header.num_partition_entries as usize;
-    let total_bytes_needed = total_entries * entry_size;
+    let total_bytes_needed = total_entries
+        .checked_mul(entry_size)
+        .ok_or(GptError::InvalidHeader)?;
 
     let mut entry_index = 0u32;
     let mut bytes_read = 0usize;

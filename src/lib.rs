@@ -208,18 +208,20 @@ pub fn init_platform(config: PlatformConfig) -> ! {
     }
 }
 
-/// Allocate a fresh [`state::FirmwareState`] on this stack frame and
+/// Use a statically allocated [`state::FirmwareState`] for fresh starts and
 /// delegate to [`init_platform_impl`].
 ///
-/// Separated from [`init_platform`] so the ~2 MB `FirmwareState` is only
-/// on the stack when the caller didn't pre-initialize.
+/// Keeping this in static storage avoids putting the ~1 MiB state object on the
+/// firmware stack.
+static mut LOCAL_FIRMWARE_STATE: state::FirmwareState = state::FirmwareState::new();
+
 #[inline(never)]
 fn init_with_local_state(config: PlatformConfig) -> ! {
-    let mut firmware_state = state::FirmwareState::new();
-    // SAFETY: Single-threaded firmware entry point. The state lives on this
-    // stack frame which never returns (-> !).
+    // SAFETY: Single-threaded firmware entry point. This static lives for the
+    // full firmware lifetime and is only used on the fresh-start path.
     unsafe {
-        state::init(&mut firmware_state);
+        let firmware_state = core::ptr::addr_of_mut!(LOCAL_FIRMWARE_STATE);
+        state::init(&mut *firmware_state);
     }
     init_platform_impl(config)
 }
@@ -523,8 +525,9 @@ pub(crate) fn with_disk<R>(
             device_addr: _,
         } => {
             let controller_ptr = drivers::usb::get_controller_ptr(controller_id)?;
+            let device_ptr = drivers::usb::mass_storage::get_global_device_ptr()?;
             let controller = unsafe { &mut *controller_ptr };
-            let usb_device = drivers::usb::mass_storage::get_global_device()?;
+            let usb_device = unsafe { &mut *device_ptr };
             let mut disk = UsbDisk::new(usb_device, controller);
             Some(f(&mut disk))
         }

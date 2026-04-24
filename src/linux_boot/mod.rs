@@ -511,6 +511,10 @@ pub fn load_linux_from_disk(
 /// Searches the memory map for a RAM region that can hold the initrd,
 /// preferring high addresses (below initrd_addr_max).
 fn find_initrd_address(boot_params: &BootParams, size: u64) -> Result<u64, LinuxBootError> {
+    if size == 0 {
+        return Err(LinuxBootError::MemoryError);
+    }
+
     // Get maximum initrd address from header, default to 0x37FFFFFF
     let initrd_addr_max = match boot_params.hdr.initrd_addr_max {
         0 => 0x37FF_FFFF,
@@ -519,57 +523,62 @@ fn find_initrd_address(boot_params: &BootParams, size: u64) -> Result<u64, Linux
 
     // Limit to 4GB identity-mapped area
     let initrd_addr_max = initrd_addr_max.min((4u64 << 30) - 1);
+    let max_exclusive = initrd_addr_max
+        .checked_add(1)
+        .ok_or(LinuxBootError::MemoryError)?;
+    let max_start = max_exclusive
+        .checked_sub(size)
+        .ok_or(LinuxBootError::MemoryError)?;
 
     // Find highest suitable RAM region
     let mut best_addr: Option<u64> = None;
 
     for i in 0..boot_params.num_e820_entries() {
-        if let Some(entry) = boot_params.e820_entry(i) {
-            // Only consider RAM regions
-            if entry.entry_type != E820Entry::RAM_TYPE {
-                continue;
-            }
+        let Some(entry) = boot_params.e820_entry(i) else {
+            continue;
+        };
 
-            // Skip regions that start beyond max
-            if entry.addr > initrd_addr_max {
-                continue;
-            }
-
-            // Skip regions that are too small
-            if entry.size < size {
-                continue;
-            }
-
-            // Skip low memory (need to be above kernel)
-            if entry.addr < 0x1000000 {
-                // 16 MB
-                continue;
-            }
-
-            // Calculate highest address in this region that fits
-            let region_end = entry.addr + entry.size;
-            let potential_addr = region_end.saturating_sub(size);
-
-            // Align to 2MB boundary
-            let potential_addr = potential_addr & !((2u64 << 20) - 1);
-
-            // Clamp to max
-            let potential_addr = potential_addr.min(initrd_addr_max + 1 - size);
-
-            // Must still be within the region
-            if potential_addr < entry.addr {
-                continue;
-            }
-
-            // Use the highest address we can find
-            if let Some(current) = best_addr {
-                if potential_addr > current {
-                    best_addr = Some(potential_addr);
-                }
-            } else {
-                best_addr = Some(potential_addr);
-            }
+        // Only consider RAM regions
+        if entry.entry_type != E820Entry::RAM_TYPE {
+            continue;
         }
+
+        // Skip regions that start beyond max
+        if entry.addr > initrd_addr_max {
+            continue;
+        }
+
+        // Skip regions that are too small
+        if entry.size < size {
+            continue;
+        }
+
+        // Skip low memory (need to be above kernel)
+        if entry.addr < 0x1000000 {
+            // 16 MB
+            continue;
+        }
+
+        // Calculate highest address in this region that fits.
+        // Treat malformed wrapping E820 regions as unusable.
+        let Some(region_end) = entry.addr.checked_add(entry.size) else {
+            continue;
+        };
+        let Some(mut potential_addr) = region_end.checked_sub(size) else {
+            continue;
+        };
+
+        // Clamp to max, then align downward to 2MB boundary
+        potential_addr = potential_addr.min(max_start);
+        potential_addr &= !((2u64 << 20) - 1);
+
+        // Must still be within the region
+        if potential_addr < entry.addr {
+            continue;
+        }
+
+        // Use the highest address we can find
+        best_addr = Some(best_addr.map_or(potential_addr, |current| current.max(potential_addr)));
     }
 
     let addr = best_addr.ok_or_else(|| {

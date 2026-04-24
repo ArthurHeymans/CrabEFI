@@ -288,10 +288,7 @@ fn boot_option_name(option_number: u16) -> [u16; MAX_VARIABLE_NAME_LEN] {
     name[3] = b't' as u16;
 
     // 4-digit hex number
-    let hex_chars = [
-        b'0', b'1', b'2', b'3', b'4', b'5', b'6', b'7', b'8', b'9', b'A', b'B', b'C', b'D', b'E',
-        b'F',
-    ];
+    let hex_chars = *b"0123456789ABCDEF";
     name[4] = hex_chars[((option_number >> 12) & 0xF) as usize] as u16;
     name[5] = hex_chars[((option_number >> 8) & 0xF) as usize] as u16;
     name[6] = hex_chars[((option_number >> 4) & 0xF) as usize] as u16;
