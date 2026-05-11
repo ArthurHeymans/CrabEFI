@@ -114,7 +114,7 @@ fn is_variable_accessible_at_runtime(attributes: u32) -> bool {
     // At runtime, only variables with RUNTIME_ACCESS are accessible
     (attributes & auth::attributes::RUNTIME_ACCESS) != 0
 }
-use alloc::vec::Vec;
+use alloc::vec::Vec as AllocVec;
 use core::ffi::c_void;
 use r_efi::efi::{
     self, CapsuleHeader, Guid, ResetType, Status, TableHeader, Time, TimeCapabilities,
@@ -996,24 +996,41 @@ fn copy_stored_variable_name(
     Status::SUCCESS
 }
 
+type VariableNameBuf = heapless::Vec<u16, MAX_VARIABLE_NAME_LEN>;
+type VariableDataBuf = heapless::Vec<u8, MAX_VARIABLE_DATA_SIZE>;
+
+enum PersistData {
+    Fixed(VariableDataBuf),
+    Alloc(AllocVec<u8>),
+}
+
+impl PersistData {
+    fn as_slice(&self) -> &[u8] {
+        match self {
+            Self::Fixed(data) => data.as_slice(),
+            Self::Alloc(data) => data.as_slice(),
+        }
+    }
+}
+
 enum VariablePersistAction {
     None,
     Write {
         guid: Guid,
-        name: Vec<u16>,
+        name: VariableNameBuf,
         attributes: u32,
-        data: Vec<u8>,
+        data: PersistData,
         is_append: bool,
     },
     Delete {
         guid: Guid,
-        name: Vec<u16>,
+        name: VariableNameBuf,
     },
 }
 
 enum SecureBootDbAction {
     None,
-    Update(auth::SecureBootVariable, Vec<u8>),
+    Update(auth::SecureBootVariable, VariableDataBuf),
     Delete(auth::SecureBootVariable),
 }
 
@@ -1074,7 +1091,10 @@ extern "efiapi" fn set_variable(
         return Status::INVALID_PARAMETER;
     }
     let name_slice = unsafe { core::slice::from_raw_parts(name, name_len + 1) };
-    let name_vec: Vec<u16> = name_slice.to_vec();
+    let mut name_vec = VariableNameBuf::new();
+    if name_vec.extend_from_slice(name_slice).is_err() {
+        return Status::OUT_OF_RESOURCES;
+    }
 
     // Check data size.
     let is_auth_write = (attributes & auth::attributes::TIME_BASED_AUTHENTICATED_WRITE_ACCESS) != 0;
@@ -1121,10 +1141,15 @@ extern "efiapi" fn set_variable(
         (attributes & auth::attributes::TIME_BASED_AUTHENTICATED_WRITE_ACCESS) != 0;
     let is_append = (attributes & auth::attributes::APPEND_WRITE) != 0;
 
-    let final_data_vec: Vec<u8> = if is_authenticated && data_size > 0 {
+    let mut final_data_vec = VariableDataBuf::new();
+    if is_authenticated && data_size > 0 {
         let raw_data = unsafe { core::slice::from_raw_parts(data as *const u8, data_size) };
-        match auth::verify_authenticated_variable(name_vec.as_slice(), &guid, attributes, raw_data)
-        {
+        let verified_data: AllocVec<u8> = match auth::verify_authenticated_variable(
+            name_vec.as_slice(),
+            &guid,
+            attributes,
+            raw_data,
+        ) {
             Ok(verified_data) => verified_data,
             Err(e) => {
                 log::warn!("Authenticated variable verification failed: {:?}", e);
@@ -1136,16 +1161,23 @@ extern "efiapi" fn set_variable(
                 }
                 return e.into();
             }
+        };
+        if final_data_vec
+            .extend_from_slice(verified_data.as_slice())
+            .is_err()
+        {
+            return Status::OUT_OF_RESOURCES;
         }
-    } else if data_size > 0 {
-        unsafe { core::slice::from_raw_parts(data as *const u8, data_size) }.to_vec()
-    } else {
-        Vec::new()
-    };
+    } else if data_size > 0
+        && final_data_vec
+            .extend_from_slice(unsafe { core::slice::from_raw_parts(data as *const u8, data_size) })
+            .is_err()
+    {
+        return Status::OUT_OF_RESOURCES;
+    }
 
     let final_data_size = final_data_vec.len();
     let secure_boot_var = auth::identify_key_database(name_vec.as_slice(), &guid);
-    let exit_boot_services_called = state::is_exit_boot_services_called();
 
     let (status, persist_action, secure_boot_action) = state::with_efi_mut(|efi| {
         let variables = &mut efi.variables;
@@ -1198,18 +1230,45 @@ extern "efiapi" fn set_variable(
                         );
                     }
 
-                    variables[idx].data[..combined.len()].copy_from_slice(&combined);
+                    variables[idx].data[..combined.len()].copy_from_slice(combined.as_slice());
                     variables[idx].data_size = combined.len();
 
+                    let mut combined_buf = VariableDataBuf::new();
+                    if combined_buf.extend_from_slice(combined.as_slice()).is_err() {
+                        return (
+                            Status::OUT_OF_RESOURCES,
+                            VariablePersistAction::None,
+                            SecureBootDbAction::None,
+                        );
+                    }
+
                     let persist_action = if attributes & auth::attributes::NON_VOLATILE != 0 {
-                        let persist_attrs = attributes
-                            & !(auth::attributes::TIME_BASED_AUTHENTICATED_WRITE_ACCESS
-                                | auth::attributes::APPEND_WRITE);
+                        let (persist_attrs, persist_data) = if is_authenticated
+                            && state::is_exit_boot_services_called()
+                            && data_size > 0
+                        {
+                            (
+                                attributes,
+                                PersistData::Alloc(
+                                    unsafe {
+                                        core::slice::from_raw_parts(data as *const u8, data_size)
+                                    }
+                                    .to_vec(),
+                                ),
+                            )
+                        } else {
+                            (
+                                attributes
+                                    & !(auth::attributes::TIME_BASED_AUTHENTICATED_WRITE_ACCESS
+                                        | auth::attributes::APPEND_WRITE),
+                                PersistData::Fixed(combined_buf.clone()),
+                            )
+                        };
                         VariablePersistAction::Write {
                             guid,
                             name: name_vec.clone(),
                             attributes: persist_attrs,
-                            data: combined.clone(),
+                            data: persist_data,
                             is_append: true,
                         }
                     } else {
@@ -1219,7 +1278,7 @@ extern "efiapi" fn set_variable(
                     return (
                         Status::SUCCESS,
                         persist_action,
-                        SecureBootDbAction::Update(var_type, combined),
+                        SecureBootDbAction::Update(var_type, combined_buf),
                     );
                 }
                 Err(e) => {
@@ -1267,11 +1326,15 @@ extern "efiapi" fn set_variable(
             .unwrap_or(SecureBootDbAction::None);
 
         let persist_action = if attributes & auth::attributes::NON_VOLATILE != 0 {
-            let persist_data = if is_authenticated && exit_boot_services_called && data_size > 0 {
-                unsafe { core::slice::from_raw_parts(data as *const u8, data_size) }.to_vec()
-            } else {
-                final_data_vec.clone()
-            };
+            let persist_data =
+                if is_authenticated && state::is_exit_boot_services_called() && data_size > 0 {
+                    PersistData::Alloc(
+                        unsafe { core::slice::from_raw_parts(data as *const u8, data_size) }
+                            .to_vec(),
+                    )
+                } else {
+                    PersistData::Fixed(final_data_vec.clone())
+                };
             VariablePersistAction::Write {
                 guid,
                 name: name_vec.clone(),
@@ -1439,9 +1502,9 @@ fn append_signature_data(
     new_data: *const u8,
     new_size: usize,
     _var_type: auth::SecureBootVariable,
-) -> Result<Vec<u8>, auth::AuthError> {
+) -> Result<AllocVec<u8>, auth::AuthError> {
     // For signature databases, we concatenate the signature lists
-    let mut combined = Vec::with_capacity(existing.len() + new_size);
+    let mut combined = AllocVec::with_capacity(existing.len() + new_size);
     combined.extend_from_slice(existing);
 
     let new_slice = unsafe { core::slice::from_raw_parts(new_data, new_size) };

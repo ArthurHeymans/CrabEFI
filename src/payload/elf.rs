@@ -224,6 +224,10 @@ impl Elf64 {
                 phdr.p_memsz
             );
 
+            if phdr.p_filesz > phdr.p_memsz {
+                return Err(ElfError::InvalidProgramHeader);
+            }
+
             let segment = LoadSegment {
                 file_offset: phdr.p_offset,
                 load_addr: phdr.p_vaddr,

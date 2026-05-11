@@ -938,7 +938,7 @@ unsafe fn device_path_node_len(dp: *mut DevicePathProtocol) -> Option<usize> {
 }
 
 unsafe fn is_device_path_end(dp: *mut DevicePathProtocol) -> bool {
-    unsafe { (*dp).r#type == 0x7f }
+    unsafe { (*dp).r#type == 0x7f && (*dp).sub_type == 0xff }
 }
 
 unsafe fn device_path_prefix_match(
