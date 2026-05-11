@@ -1370,7 +1370,9 @@ impl AhciController {
         let mut dma_buffer = DmaBuffer::new(transfer_len)?;
         let dma_addr = dma_buffer.addr();
 
-        // Copy data to DMA buffer
+        // Copy data to DMA buffer. Zero-fill the rounded padding so the device
+        // never receives stale firmware memory for non-512-byte-aligned payloads.
+        dma_buffer.memory.fill(0);
         unsafe {
             core::ptr::copy_nonoverlapping(buffer.as_ptr(), dma_buffer.as_mut_ptr(), buffer.len());
         }

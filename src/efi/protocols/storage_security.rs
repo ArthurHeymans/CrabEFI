@@ -218,7 +218,7 @@ extern "efiapi" fn storage_security_send_data(
         payload_buffer_size
     );
 
-    if this.is_null() || (payload_buffer_size > 0 && payload_buffer.is_null()) {
+    if this.is_null() || payload_buffer.is_null() {
         return Status::INVALID_PARAMETER;
     }
 

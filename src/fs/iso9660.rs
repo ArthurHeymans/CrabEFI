@@ -375,7 +375,20 @@ fn build_efi_boot_image(
     block_size: usize,
 ) -> EfiBootImage {
     let start_byte = load_rba as u64 * ISO_SECTOR_SIZE as u64;
-    let start_device_block = start_byte / block_size as u64;
+    let block_size_u64 = block_size as u64;
+    let start_device_block = start_byte / block_size_u64;
+    if !start_byte.is_multiple_of(block_size_u64) {
+        log::warn!(
+            "El Torito: EFI image at byte offset {} is not aligned to {}-byte device blocks",
+            start_byte,
+            block_size
+        );
+        return EfiBootImage {
+            start_sector: start_device_block,
+            sector_count: 0,
+            size_bytes: 0,
+        };
+    }
 
     if sector_count > 1 {
         let size_bytes = sector_count as u64 * ISO_SECTOR_SIZE as u64;
