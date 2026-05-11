@@ -883,7 +883,7 @@ pub fn install_smbios_tables(smbios_addr: u64) {
             } else {
                 log::warn!(
                     "SMBIOS 2.1 entry has invalid intermediate anchor: {:?}",
-                    &entry.intermediate_anchor
+                    entry.intermediate_anchor
                 );
             }
         }
