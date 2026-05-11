@@ -999,6 +999,7 @@ fn copy_stored_variable_name(
 type VariableNameBuf = heapless::Vec<u16, MAX_VARIABLE_NAME_LEN>;
 type VariableDataBuf = heapless::Vec<u8, MAX_VARIABLE_DATA_SIZE>;
 
+#[allow(clippy::large_enum_variant)]
 enum PersistData {
     Fixed(VariableDataBuf),
     Alloc(AllocVec<u8>),
@@ -1013,6 +1014,7 @@ impl PersistData {
     }
 }
 
+#[allow(clippy::large_enum_variant)]
 enum VariablePersistAction {
     None,
     Write {
@@ -1028,6 +1030,7 @@ enum VariablePersistAction {
     },
 }
 
+#[allow(clippy::large_enum_variant)]
 enum SecureBootDbAction {
     None,
     Update(auth::SecureBootVariable, VariableDataBuf),
