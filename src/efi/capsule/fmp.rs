@@ -299,7 +299,7 @@ pub fn parse_firmware_image_auth(data: &[u8]) -> Result<(FirmwareImageAuth, usiz
     ]);
 
     // WIN_CERTIFICATE.dwLength (total size of WIN_CERTIFICATE including header)
-    let dw_length = u32::from_le_bytes([data[8], data[9], data[10], data[11]]);
+    let dw_length_u32 = u32::from_le_bytes([data[8], data[9], data[10], data[11]]);
 
     // WIN_CERTIFICATE.wRevision
     let _revision = u16::from_le_bytes([data[12], data[13]]);
@@ -326,30 +326,52 @@ pub fn parse_firmware_image_auth(data: &[u8]) -> Result<(FirmwareImageAuth, usiz
         return Err(CapsuleError::AuthenticationFailed);
     }
 
+    let dw_length = dw_length_u32 as usize;
+    if dw_length < WIN_CERT_UEFI_GUID_HEADER_SIZE {
+        log::warn!(
+            "WIN_CERTIFICATE length too small: {} bytes (need at least {})",
+            dw_length,
+            WIN_CERT_UEFI_GUID_HEADER_SIZE
+        );
+        return Err(CapsuleError::AuthenticationFailed);
+    }
+
+    // Total auth header size = monotonic_count(8) + WIN_CERTIFICATE(dwLength)
+    let auth_total_size = 8usize
+        .checked_add(dw_length)
+        .ok_or(CapsuleError::AuthenticationFailed)?;
+    if auth_total_size > data.len() {
+        log::warn!(
+            "Auth header extends beyond buffer: size={}, buf_len={}",
+            auth_total_size,
+            data.len()
+        );
+        return Err(CapsuleError::AuthenticationFailed);
+    }
+
     // PKCS#7 data follows the WIN_CERTIFICATE_UEFI_GUID header
     let pkcs7_offset = 8 + WIN_CERT_UEFI_GUID_HEADER_SIZE; // monotonic_count + cert header
-    let pkcs7_size = dw_length as usize - WIN_CERT_UEFI_GUID_HEADER_SIZE;
-    let pkcs7_end = pkcs7_offset + pkcs7_size;
+    let pkcs7_size = dw_length - WIN_CERT_UEFI_GUID_HEADER_SIZE;
+    let pkcs7_end = pkcs7_offset
+        .checked_add(pkcs7_size)
+        .ok_or(CapsuleError::AuthenticationFailed)?;
 
-    if pkcs7_end > data.len() {
+    if pkcs7_end > auth_total_size {
         log::warn!(
-            "PKCS#7 data extends beyond buffer: offset={}, size={}, buf_len={}",
+            "PKCS#7 data extends beyond auth header: offset={}, size={}, auth_size={}",
             pkcs7_offset,
             pkcs7_size,
-            data.len()
+            auth_total_size
         );
         return Err(CapsuleError::AuthenticationFailed);
     }
 
     let pkcs7_data = data[pkcs7_offset..pkcs7_end].to_vec();
 
-    // Total auth header size = monotonic_count(8) + WIN_CERTIFICATE(dwLength)
-    let auth_total_size = 8 + dw_length as usize;
-
     Ok((
         FirmwareImageAuth {
             monotonic_count,
-            auth_info_size: dw_length,
+            auth_info_size: dw_length_u32,
             pkcs7_data,
         },
         auth_total_size,

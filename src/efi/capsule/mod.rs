@@ -100,10 +100,13 @@ pub fn process_pending_capsules(backend: &mut dyn CapsuleBackend) -> usize {
     }
 
     // Source 2: ESP capsule files (capsule-on-disk)
-    if disk::is_file_capsule_delivery_requested() {
+    let mut disk_capsule_count = 0;
+    let file_capsule_delivery_requested = disk::is_file_capsule_delivery_requested();
+    if file_capsule_delivery_requested {
         log::info!("File-based capsule delivery requested via OsIndications");
 
         let disk_capsules = disk::scan_esp_for_capsules();
+        disk_capsule_count = disk_capsules.len();
         for (i, capsule) in disk_capsules.iter().enumerate() {
             log::info!(
                 "Processing ESP capsule '{}' ({} bytes)",
@@ -128,12 +131,7 @@ pub fn process_pending_capsules(backend: &mut dyn CapsuleBackend) -> usize {
         log::info!(
             "Capsule processing complete: {}/{} capsule(s) applied successfully",
             applied_count,
-            cb_capsule_count
-                + if disk::is_file_capsule_delivery_requested() {
-                    1
-                } else {
-                    0
-                }
+            cb_capsule_count + disk_capsule_count
         );
     }
 
@@ -185,7 +183,7 @@ pub fn stage_capsule_for_reboot(
         | auth::attributes::RUNTIME_ACCESS;
 
     // Write via the deferred path (we're after ExitBootServices)
-    varstore::persist_variable(&capsule_vendor_guid, &name_u16, attributes, &data)
+    varstore::persist_variable(&capsule_vendor_guid, name_u16.as_slice(), attributes, &data)
         .map_err(|_| CapsuleError::FlashWriteFailed)?;
 
     log::info!(

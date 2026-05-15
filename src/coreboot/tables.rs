@@ -999,6 +999,15 @@ fn parse_capsule(record_bytes: &[u8], info: &mut CorebootInfo) {
     let base = capsule.range_start;
     let size = capsule.range_size;
 
+    if base == 0 || size == 0 {
+        log::warn!(
+            "Ignoring invalid capsule region: base={:#x}, size={}",
+            base,
+            size
+        );
+        return;
+    }
+
     if info.capsules.push(CapsuleRegion { base, size }).is_err() {
         log::warn!("Too many capsule records (max {})", MAX_CAPSULES);
         return;
