@@ -383,17 +383,9 @@ fn discover_entries_on_disk(
     name_prefix: &str,
     menu: &mut BootMenu,
 ) {
-    // Phase 1: Read GPT and clone partitions out (releases the disk borrow)
-    let partitions = crate::with_disk(&device_type, |disk| {
-        if let Ok(header) = gpt::read_gpt_header(disk)
-            && let Ok(parts) = gpt::read_partitions(disk, &header)
-        {
-            Some(parts)
-        } else {
-            None
-        }
-    })
-    .flatten();
+    // Phase 1: Read GPT/MBR partitions and clone them out (releases the disk borrow)
+    let partitions =
+        crate::with_disk(&device_type, |disk| gpt::read_partitions_auto(disk).ok()).flatten();
 
     let partitions = match partitions {
         Some(p) => p,
@@ -473,11 +465,12 @@ fn discover_nvme_entries(menu: &mut BootMenu) {
         nsid,
     };
 
-    // Try GPT-based discovery first
-    let had_gpt =
-        crate::with_disk(&device_type, |disk| gpt::read_gpt_header(disk).is_ok()).unwrap_or(false);
+    // Try partition-table based discovery first (GPT, then MBR).
+    let has_partitions =
+        crate::with_disk(&device_type, |disk| gpt::read_partitions_auto(disk).is_ok())
+            .unwrap_or(false);
 
-    if had_gpt {
+    if has_partitions {
         let mut name_prefix: String<32> = String::new();
         let _ = write!(name_prefix, "NVMe ns{}", nsid);
         discover_entries_on_disk(
@@ -518,11 +511,12 @@ fn discover_ahci_entries(menu: &mut BootMenu) {
         let mut name_prefix: String<32> = String::new();
         let _ = write!(name_prefix, "SATA port {}", port_index);
 
-        // Try GPT-based discovery first
-        let had_gpt = crate::with_disk(&device_type, |disk| gpt::read_gpt_header(disk).is_ok())
-            .unwrap_or(false);
+        // Try partition-table based discovery first (GPT, then MBR).
+        let has_partitions =
+            crate::with_disk(&device_type, |disk| gpt::read_partitions_auto(disk).is_ok())
+                .unwrap_or(false);
 
-        if had_gpt {
+        if has_partitions {
             discover_entries_on_disk(
                 device_type,
                 pci_addr.device,

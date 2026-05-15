@@ -17,7 +17,7 @@ const GPT_SIGNATURE: u64 = 0x5452415020494645;
 
 /// EFI System Partition type GUID (C12A7328-F81F-11D2-BA4B-00A0C93EC93B)
 /// Stored in mixed-endian format
-const ESP_TYPE_GUID: [u8; 16] = [
+pub const ESP_TYPE_GUID: [u8; 16] = [
     0x28, 0x73, 0x2a, 0xc1, // LE: C12A7328
     0x1f, 0xf8, // LE: F81F
     0xd2, 0x11, // LE: 11D2
@@ -173,13 +173,50 @@ impl Partition {
     }
 }
 
-/// Error type for GPT operations
+/// MBR partition entry structure
+#[repr(C, packed)]
+#[derive(FromBytes, Immutable, KnownLayout, Unaligned, Clone, Copy, Debug)]
+struct MbrPartitionEntry {
+    /// Boot indicator (0x80 = active)
+    boot_indicator: u8,
+    /// Starting CHS address (ignored; legacy field)
+    starting_chs: [u8; 3],
+    /// Partition type byte
+    partition_type: u8,
+    /// Ending CHS address (ignored; legacy field)
+    ending_chs: [u8; 3],
+    /// First LBA, little-endian
+    first_lba: u32,
+    /// Number of sectors, little-endian
+    sector_count: u32,
+}
+
+impl MbrPartitionEntry {
+    /// Check whether this entry describes an allocated partition.
+    fn is_used(&self) -> bool {
+        self.partition_type != 0 && self.sector_count != 0
+    }
+
+    /// Check whether this entry is the UEFI MBR ESP partition type.
+    fn is_esp(&self) -> bool {
+        self.partition_type == 0xef
+    }
+
+    /// Check whether this entry is a legacy FAT partition type.
+    fn is_fat(&self) -> bool {
+        matches!(self.partition_type, 0x01 | 0x04 | 0x06 | 0x0b | 0x0c | 0x0e)
+    }
+}
+
+/// Error type for GPT/MBR partition table operations
 #[derive(Debug)]
 pub enum GptError {
     /// Read error from storage device
     ReadError,
     /// Invalid GPT header
     InvalidHeader,
+    /// Invalid MBR sector
+    InvalidMbr,
     /// No partitions found
     NoPartitions,
     /// No EFI System Partition found
@@ -193,6 +230,7 @@ impl core::fmt::Display for GptError {
         match self {
             GptError::ReadError => write!(f, "read error"),
             GptError::InvalidHeader => write!(f, "invalid GPT header"),
+            GptError::InvalidMbr => write!(f, "invalid MBR sector"),
             GptError::NoPartitions => write!(f, "no partitions found"),
             GptError::NoEsp => write!(f, "no EFI System Partition found"),
             GptError::BufferTooSmall => write!(f, "buffer too small"),
@@ -253,7 +291,7 @@ pub fn read_gpt_header(device: &mut dyn BlockDevice) -> Result<GptHeader, GptErr
     let partition_entry_size = header.partition_entry_size;
 
     if !header.is_valid() {
-        log::error!("Invalid GPT signature: {:#018x}", signature);
+        log::debug!("Invalid GPT signature: {:#018x}", signature);
         return Err(GptError::InvalidHeader);
     }
 
@@ -398,10 +436,111 @@ pub fn read_partitions(
     Ok(partitions)
 }
 
+/// Read partitions from a legacy MBR partition table.
+///
+/// This supports removable media formatted with an MBR ESP (partition type
+/// 0xEF), which is common for USB flash drives created by firmware update and
+/// OS installer tools.
+pub fn read_mbr_partitions(
+    device: &mut dyn BlockDevice,
+) -> Result<heapless::Vec<Partition, 4>, GptError> {
+    let info = device.info();
+    let block_size = (info.block_size as usize).clamp(MIN_BLOCK_SIZE, MAX_BLOCK_SIZE);
+    let mut buffer = [0u8; MAX_BLOCK_SIZE];
+
+    device.read_block(0, &mut buffer[..block_size])?;
+
+    if buffer[510] != 0x55 || buffer[511] != 0xaa {
+        log::debug!(
+            "Invalid MBR signature: {:#04x}{:02x}",
+            buffer[511],
+            buffer[510]
+        );
+        return Err(GptError::InvalidMbr);
+    }
+
+    let mut partitions = heapless::Vec::new();
+    for index in 0..4 {
+        let offset = 446 + index * core::mem::size_of::<MbrPartitionEntry>();
+        let entry = MbrPartitionEntry::read_from_prefix(&buffer[offset..])
+            .map_err(|_| GptError::InvalidMbr)?
+            .0;
+
+        if !entry.is_used() || entry.partition_type == 0xee {
+            continue;
+        }
+
+        let first_lba = u32::from_le(entry.first_lba) as u64;
+        let sector_count = u32::from_le(entry.sector_count) as u64;
+        let Some(last_lba) = first_lba.checked_add(sector_count.saturating_sub(1)) else {
+            return Err(GptError::InvalidMbr);
+        };
+
+        let partition_type = entry.partition_type;
+        let is_boot_candidate = entry.is_esp() || entry.is_fat();
+        let partition = Partition {
+            type_guid: if entry.is_esp() {
+                ESP_TYPE_GUID
+            } else {
+                [0u8; 16]
+            },
+            partition_guid: [0u8; 16],
+            first_lba,
+            last_lba,
+            attributes: 0,
+            // Removable-media USB sticks often use normal FAT MBR partition
+            // types instead of the UEFI-specific 0xEF type. Treat them as
+            // boot candidates and verify by mounting FAT and checking paths.
+            is_esp: is_boot_candidate,
+            block_size: block_size as u32,
+        };
+
+        log::debug!(
+            "MBR partition {}: type={:#04x} LBA {}-{} ({} MB) boot_candidate={}",
+            index + 1,
+            partition_type,
+            partition.first_lba,
+            partition.last_lba,
+            partition.size_bytes() / (1024 * 1024),
+            partition.is_esp
+        );
+
+        if partitions.push(partition).is_err() {
+            log::warn!("Too many MBR partitions, ignoring remaining");
+            break;
+        }
+    }
+
+    if partitions.is_empty() {
+        return Err(GptError::NoPartitions);
+    }
+
+    Ok(partitions)
+}
+
+/// Read partitions from GPT, falling back to MBR when no GPT is present.
+pub fn read_partitions_auto(
+    device: &mut dyn BlockDevice,
+) -> Result<heapless::Vec<Partition, 16>, GptError> {
+    match read_gpt_header(device).and_then(|header| read_partitions(device, &header)) {
+        Ok(partitions) => Ok(partitions),
+        Err(gpt_error) => {
+            log::debug!("GPT partition scan failed: {:?}; trying MBR", gpt_error);
+            let mbr_partitions = read_mbr_partitions(device)?;
+            let mut partitions = heapless::Vec::new();
+            for partition in mbr_partitions {
+                partitions
+                    .push(partition)
+                    .map_err(|_| GptError::NoPartitions)?;
+            }
+            Ok(partitions)
+        }
+    }
+}
+
 /// Find the EFI System Partition
 pub fn find_esp(device: &mut dyn BlockDevice) -> Result<Partition, GptError> {
-    let header = read_gpt_header(device)?;
-    let partitions = read_partitions(device, &header)?;
+    let partitions = read_partitions_auto(device)?;
 
     partitions
         .into_iter()
