@@ -19,7 +19,8 @@ use crate::efi::utils::allocate_protocol_with_log;
 
 // Re-use shared helpers from device_path.rs
 use super::device_path::{
-    MIN_NODE_LENGTH, SUBTYPE_END_INSTANCE, alloc_pool, device_path_size, write_end_node,
+    MAX_DEVICE_PATH_SIZE, MIN_NODE_LENGTH, SUBTYPE_END_INSTANCE, alloc_pool, device_path_size,
+    write_end_node,
 };
 
 pub const DEVICE_PATH_UTILITIES_GUID: Guid = device_path_utilities::PROTOCOL_GUID;
@@ -154,6 +155,9 @@ extern "efiapi" fn append_device_node(
 
     unsafe {
         let nlen = node_length(device_node) as usize;
+        if !(MIN_NODE_LENGTH as usize..=MAX_DEVICE_PATH_SIZE).contains(&nlen) {
+            return ptr::null_mut();
+        }
         let end_size = MIN_NODE_LENGTH as usize;
         let temp_size = nlen + end_size;
 
@@ -237,10 +241,28 @@ extern "efiapi" fn get_next_device_path_instance(
             return ptr::null_mut();
         }
 
-        // Walk to the end of this instance (either end-entire or end-instance)
+        let path_size = device_path_size(dp);
+        if path_size == 0 {
+            *size = 0;
+            return ptr::null_mut();
+        }
+
+        // Walk to the end of this instance (either end-entire or end-instance),
+        // but never beyond the validated path size.
         let mut node = dp as *const device_path::Protocol;
-        while !is_end_type(node) {
+        let mut consumed = 0usize;
+        while consumed < path_size && !is_end_type(node) {
+            let nlen = node_length(node) as usize;
+            if nlen < MIN_NODE_LENGTH as usize || consumed + nlen > path_size {
+                *size = 0;
+                return ptr::null_mut();
+            }
+            consumed += nlen;
             node = next_node(node);
+        }
+        if consumed >= path_size {
+            *size = 0;
+            return ptr::null_mut();
         }
 
         let end_size = MIN_NODE_LENGTH as usize;
@@ -278,12 +300,18 @@ extern "efiapi" fn is_device_path_multi_instance(
         return Boolean::FALSE;
     }
     unsafe {
+        let path_size = device_path_size(device_path);
+        if path_size == 0 {
+            return Boolean::FALSE;
+        }
+
         let mut node = device_path;
-        loop {
+        let mut consumed = 0usize;
+        while consumed < path_size {
             let p = node as *const u8;
             let ntype = *p;
             let nlen = u16::from_le_bytes([*p.add(2), *p.add(3)]) as usize;
-            if nlen < MIN_NODE_LENGTH as usize {
+            if nlen < MIN_NODE_LENGTH as usize || consumed + nlen > path_size {
                 return Boolean::FALSE;
             }
             if ntype == TYPE_END {
@@ -292,8 +320,10 @@ extern "efiapi" fn is_device_path_multi_instance(
                 }
                 return Boolean::FALSE;
             }
+            consumed += nlen;
             node = next_node(node);
         }
+        Boolean::FALSE
     }
 }
 

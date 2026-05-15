@@ -800,30 +800,85 @@ pub(crate) const SUBTYPE_END_INSTANCE: u8 = 0x01;
 /// Minimum device path node length (4-byte header).
 pub(crate) const MIN_NODE_LENGTH: u16 = 4;
 
+/// Maximum accepted device path size when a protocol call does not provide a
+/// caller-supplied bound.
+///
+/// EDK2 validates device paths with a maximum byte count before walking them.
+/// UEFI callers normally pass trusted firmware-allocated paths, but a fixed
+/// upper bound prevents malformed paths from making protocol helpers scan
+/// unbounded memory while searching for an End-Entire node.
+pub(crate) const MAX_DEVICE_PATH_SIZE: usize = 64 * 1024;
+
 /// Return the total byte length of a device path (including the End-Entire
 /// node).
 ///
 /// Walks the node chain, skipping past End-Instance separators, until the
-/// End-Entire node is found. Returns 0 if the pointer is null or invalid.
+/// End-Entire node is found. Returns 0 if the pointer is null, malformed, or
+/// exceeds [`MAX_DEVICE_PATH_SIZE`].
 ///
 /// # Safety
-/// `dp` must be null or point to a valid device path in readable memory.
+/// `dp` must be null or point to readable memory containing at least a device
+/// path header. This routine bounds the amount of memory it scans, but it
+/// cannot make an arbitrary invalid pointer safe to dereference.
 pub(crate) unsafe fn device_path_size(dp: *const Protocol) -> usize {
+    unsafe { device_path_size_bounded(dp, MAX_DEVICE_PATH_SIZE) }
+}
+
+/// Return the total byte length of a bounded device path.
+///
+/// A return value of 0 means the path is null, malformed, or does not contain
+/// an End-Entire node within `max_size` bytes.
+///
+/// # Safety
+/// `dp` must be null or point to readable memory containing at least a device
+/// path header. This routine bounds the amount of memory it scans, but it
+/// cannot make an arbitrary invalid pointer safe to dereference.
+pub(crate) unsafe fn device_path_size_bounded(dp: *const Protocol, max_size: usize) -> usize {
     if dp.is_null() {
         return 0;
     }
+
+    let limit = if max_size == 0 {
+        MAX_DEVICE_PATH_SIZE
+    } else {
+        max_size.min(MAX_DEVICE_PATH_SIZE)
+    };
+    let mut consumed = 0usize;
+    let mut p = dp as *const u8;
+
     unsafe {
-        let mut p = dp as *const u8;
         loop {
+            if consumed
+                .checked_add(MIN_NODE_LENGTH as usize)
+                .is_none_or(|v| v > limit)
+            {
+                return 0;
+            }
+
             let node_type = *p;
             let node_sub = *p.add(1);
             let node_len = u16::from_le_bytes([*p.add(2), *p.add(3)]) as usize;
             if node_len < MIN_NODE_LENGTH as usize {
-                break 0;
+                return 0;
             }
-            if node_type == TYPE_END && node_sub == SUBTYPE_END_ENTIRE {
-                return (p as usize - dp as usize) + node_len;
+
+            let next_consumed = match consumed.checked_add(node_len) {
+                Some(v) if v <= limit => v,
+                _ => return 0,
+            };
+
+            if node_type == TYPE_END {
+                if node_len != MIN_NODE_LENGTH as usize {
+                    return 0;
+                }
+                match node_sub {
+                    SUBTYPE_END_ENTIRE => return next_consumed,
+                    SUBTYPE_END_INSTANCE => {}
+                    _ => return 0,
+                }
             }
+
+            consumed = next_consumed;
             p = p.add(node_len);
         }
     }
