@@ -51,6 +51,8 @@ const MEDIA_SUBTYPE_FILEPATH: u8 = 0x04;
 const EISA_PNP_ID_PCI_ROOT: u32 = 0x0a0341d0;
 // PNP ID for PCIe root bridge (EISA encoded PNP0A08)
 const EISA_PNP_ID_PCIE_ROOT: u32 = 0x0a0841d0;
+// EISA PNP IDs are encoded as (numeric_id << 16) | "PNP".
+const EISA_PNP_VENDOR: u32 = 0x41d0;
 
 /// Signature type constants for HD() nodes
 const SIGNATURE_TYPE_MBR: u8 = 0x01;
@@ -192,8 +194,11 @@ unsafe fn fmt_acpi(node: *const u8, buf: &mut AsciiBuffer) {
         EISA_PNP_ID_PCIE_ROOT => {
             let _ = write!(buf, "PcieRoot(0x{:X})", uid);
         }
+        _ if (hid & 0xffff) == EISA_PNP_VENDOR => {
+            let _ = write!(buf, "Acpi(PNP{:04X},0x{:X})", hid >> 16, uid);
+        }
         _ => {
-            let _ = write!(buf, "Acpi(0x{:X},0x{:X})", hid, uid);
+            let _ = write!(buf, "Acpi(0x{:08X},0x{:X})", hid, uid);
         }
     }
 }

@@ -675,7 +675,9 @@ pub fn run_tests(config: &QemuConfig, disk_path: &Path, app_name: &str) -> Resul
                 "get_next_instance_2",
                 "node_to_text_pci",
                 "path_to_text_pci_root",
+                "node_to_text_acpi_pnp",
                 "text_to_node_pci_root",
+                "text_to_node_acpi_pnp",
                 "text_to_path_pci",
                 "round_trip",
             ] {

@@ -11,7 +11,9 @@
 use core::ffi::c_void;
 use core::panic::PanicInfo;
 use r_efi::efi::{self, Boolean, Char16, Guid, Handle, Status, SystemTable};
-use r_efi::protocols::{device_path, device_path_from_text, device_path_to_text, device_path_utilities};
+use r_efi::protocols::{
+    device_path, device_path_from_text, device_path_to_text, device_path_utilities,
+};
 
 static mut BOOT_SERVICES: *mut efi::BootServices = core::ptr::null_mut();
 static mut CON_OUT: *mut r_efi::protocols::simple_text_output::Protocol = core::ptr::null_mut();
@@ -109,7 +111,7 @@ fn ucs2_to_ascii_print(text: *const Char16) {
         if ch == 0 {
             break;
         }
-        if ch >= 0x20 && ch < 0x7F {
+        if (0x20..0x7F).contains(&ch) {
             let byte = [ch as u8];
             let s = unsafe { core::str::from_utf8_unchecked(&byte) };
             print(s);
@@ -139,6 +141,20 @@ fn ucs2_strlen(text: *const Char16) -> usize {
             return i;
         }
     }
+}
+
+fn ucs2_equals_ascii(text: *const Char16, expected: &str) -> bool {
+    if text.is_null() {
+        return false;
+    }
+    let expected = expected.as_bytes();
+    for (i, &byte) in expected.iter().enumerate() {
+        let ch = unsafe { *(text as *const u16).add(i) };
+        if ch != byte as u16 {
+            return false;
+        }
+    }
+    unsafe { *(text as *const u16).add(expected.len()) == 0 }
 }
 
 /// Free a pool allocation
@@ -527,7 +543,37 @@ fn test_device_path_to_text(
         }
     }
 
-    // Test 3: Convert NULL should return NULL
+    // Test 3: Convert a generic EISA ACPI node using EDK2-compatible PNPxxxx text
+    {
+        let acpi = (dpu.create_device_node)(0x02, 0x01, 12);
+        if !acpi.is_null() {
+            unsafe {
+                let hid_bytes = 0xb0c041d0u32.to_le_bytes(); // PNPB0C0
+                core::ptr::copy_nonoverlapping(hid_bytes.as_ptr(), (acpi as *mut u8).add(4), 4);
+                let uid_bytes = 1u32.to_le_bytes();
+                core::ptr::copy_nonoverlapping(uid_bytes.as_ptr(), (acpi as *mut u8).add(8), 4);
+            }
+            let text = (dpt.convert_device_node_to_text)(acpi, Boolean::FALSE, Boolean::FALSE);
+            if !text.is_null() {
+                if ucs2_equals_ascii(text, "Acpi(PNPB0C0,0x1)") {
+                    println("[PASS] node_to_text_acpi_pnp: ACPI PNP node converted to text");
+                    passed += 1;
+                } else {
+                    print("[FAIL] node_to_text_acpi_pnp: Got \"");
+                    ucs2_to_ascii_print(text);
+                    println("\"");
+                    failed += 1;
+                }
+                free_pool(text as *mut c_void);
+            } else {
+                println("[FAIL] node_to_text_acpi_pnp: Returned NULL");
+                failed += 1;
+            }
+            free_pool(acpi as *mut c_void);
+        }
+    }
+
+    // Test 4: Convert NULL should return NULL
     {
         let text = (dpt.convert_device_path_to_text)(
             core::ptr::null_mut(),
@@ -601,7 +647,53 @@ fn test_device_path_from_text(
         }
     }
 
-    // Test 2: ConvertTextToDevicePath for "PciRoot(0x0)/Pci(0x1,0x0)"
+    // Test 2: ConvertTextToDeviceNode for EDK2-style Acpi(PNPxxxx,UID)
+    {
+        let text: [u16; 18] = [
+            b'A' as u16,
+            b'c' as u16,
+            b'p' as u16,
+            b'i' as u16,
+            b'(' as u16,
+            b'P' as u16,
+            b'N' as u16,
+            b'P' as u16,
+            b'B' as u16,
+            b'0' as u16,
+            b'C' as u16,
+            b'0' as u16,
+            b',' as u16,
+            b'0' as u16,
+            b'x' as u16,
+            b'1' as u16,
+            b')' as u16,
+            0,
+        ];
+        let node = (dpft.convert_text_to_device_node)(text.as_ptr() as *const Char16);
+        if !node.is_null() {
+            let hid = unsafe {
+                u32::from_le_bytes([
+                    *(node as *const u8).add(4),
+                    *(node as *const u8).add(5),
+                    *(node as *const u8).add(6),
+                    *(node as *const u8).add(7),
+                ])
+            };
+            if hid == 0xb0c041d0 {
+                println("[PASS] text_to_node_acpi_pnp: Acpi(PNPB0C0,0x1) parsed correctly");
+                passed += 1;
+            } else {
+                println("[FAIL] text_to_node_acpi_pnp: Wrong HID");
+                failed += 1;
+            }
+            free_pool(node as *mut c_void);
+        } else {
+            println("[FAIL] text_to_node_acpi_pnp: Returned NULL");
+            failed += 1;
+        }
+    }
+
+    // Test 3: ConvertTextToDevicePath for "PciRoot(0x0)/Pci(0x1,0x0)"
     {
         let text: [u16; 27] = [
             b'P' as u16,
