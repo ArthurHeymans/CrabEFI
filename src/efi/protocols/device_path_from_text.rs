@@ -43,6 +43,8 @@ const MEDIA_SUBTYPE_VENDOR: u8 = 0x03;
 // PNP IDs
 const EISA_PNP_ID_PCI_ROOT: u32 = 0x0a0341d0;
 const EISA_PNP_ID_PCIE_ROOT: u32 = 0x0a0841d0;
+// EISA PNP IDs are encoded as (numeric_id << 16) | "PNP".
+const EISA_PNP_VENDOR: u32 = 0x41d0;
 
 /// Signature types for HD() nodes
 const SIGNATURE_TYPE_MBR: u8 = 0x01;
@@ -142,6 +144,16 @@ fn skip_separator(s: &[u8], pos: usize) -> usize {
 // GUID parsing
 // ============================================================================
 
+/// Return the numeric value of an ASCII hex digit.
+fn hex_digit(c: u8) -> Option<u8> {
+    match c {
+        b'0'..=b'9' => Some(c - b'0'),
+        b'a'..=b'f' => Some(c - b'a' + 10),
+        b'A'..=b'F' => Some(c - b'A' + 10),
+        _ => None,
+    }
+}
+
 /// Parse a hex byte from 2 ASCII chars.
 fn parse_hex_byte(s: &[u8], off: usize) -> u8 {
     let hi = match s.get(off) {
@@ -165,6 +177,19 @@ fn parse_hex_byte(s: &[u8], off: usize) -> u8 {
     (hi << 4) | lo
 }
 
+/// Parse a PNP EISA ID from text like `PNP0A03`.
+fn parse_eisa_pnp_id(s: &[u8]) -> Option<u32> {
+    if s.len() < 7 || !ascii_prefix_eq(s, b"PNP") {
+        return None;
+    }
+
+    let mut id = 0u32;
+    for &ch in &s[3..7] {
+        id = (id << 4) | hex_digit(ch)? as u32;
+    }
+    Some((id << 16) | EISA_PNP_VENDOR)
+}
+
 /// Parse a GUID from text like `XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX`.
 ///
 /// Returns the GUID bytes in mixed-endian format (matching UEFI layout).
@@ -173,6 +198,16 @@ fn parse_guid(s: &[u8]) -> Option<[u8; 16]> {
     if s.len() < 36 {
         return None;
     }
+    if s[8] != b'-' || s[13] != b'-' || s[18] != b'-' || s[23] != b'-' {
+        return None;
+    }
+    for &idx in &[
+        0usize, 2, 4, 6, 9, 11, 14, 16, 19, 21, 24, 26, 28, 30, 32, 34,
+    ] {
+        hex_digit(s[idx])?;
+        hex_digit(s[idx + 1])?;
+    }
+
     let mut guid = [0u8; 16];
 
     // Data1: 8 hex chars, little-endian u32
@@ -463,7 +498,11 @@ fn parse_vendor_media(args: &[u8]) -> *mut device_path::Protocol {
 
 /// Parse an ACPI node: `Acpi(HID,UID)` -> ACPI node
 fn parse_acpi(args: &[u8]) -> *mut device_path::Protocol {
-    let (hid, consumed) = parse_number(args);
+    let (hid, consumed) = if let Some(hid) = parse_eisa_pnp_id(args) {
+        (hid as u64, 7)
+    } else {
+        parse_number(args)
+    };
     let rest = skip_separator(args, consumed);
     let (uid, _) = parse_number(&args[rest..]);
     let node = alloc_node(TYPE_ACPI, ACPI_SUBTYPE_ACPI, 12);
