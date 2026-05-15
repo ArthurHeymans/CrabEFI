@@ -18,8 +18,8 @@ use r_efi::protocols::device_path_to_text;
 use crate::efi::allocator::{self, MemoryType};
 use crate::efi::utils::allocate_protocol_with_log;
 
-// Re-use shared constants from device_path.rs
-use super::device_path::SUBTYPE_END_INSTANCE;
+// Re-use shared helpers from device_path.rs
+use super::device_path::{MAX_DEVICE_PATH_SIZE, SUBTYPE_END_INSTANCE, device_path_size};
 
 pub const DEVICE_PATH_TO_TEXT_GUID: Guid = device_path_to_text::PROTOCOL_GUID;
 
@@ -380,11 +380,30 @@ unsafe fn fmt_unknown(node: *const u8, len: u16, buf: &mut AsciiBuffer) {
     buf.push_str(")");
 }
 
+/// Return the minimum byte length for a node type we decode specially.
+fn known_node_min_len(ntype: u8, nsub: u8) -> usize {
+    match (ntype, nsub) {
+        (TYPE_HARDWARE, HW_SUBTYPE_PCI) | (TYPE_MESSAGING, MSG_SUBTYPE_USB) => 6,
+        (TYPE_ACPI, ACPI_SUBTYPE_ACPI) => 12,
+        (TYPE_MESSAGING, MSG_SUBTYPE_SATA) => 10,
+        (TYPE_MESSAGING, MSG_SUBTYPE_NVME) => 16,
+        (TYPE_MEDIA, MEDIA_SUBTYPE_HARDDRIVE) => 42,
+        (TYPE_MEDIA, MEDIA_SUBTYPE_CDROM) => 24,
+        (TYPE_MEDIA, MEDIA_SUBTYPE_VENDOR) => 20,
+        _ => 4,
+    }
+}
+
 /// Format a single device path node into the ASCII buffer.
 unsafe fn format_node(node: *const u8, display_only: bool, buf: &mut AsciiBuffer) {
     let ntype = unsafe { node_type(node) };
     let nsub = unsafe { node_subtype(node) };
     let nlen = unsafe { node_len(node) };
+
+    if nlen as usize > MAX_DEVICE_PATH_SIZE || (nlen as usize) < known_node_min_len(ntype, nsub) {
+        unsafe { fmt_unknown(node, nlen, buf) };
+        return;
+    }
 
     match (ntype, nsub) {
         (TYPE_HARDWARE, HW_SUBTYPE_PCI) => unsafe { fmt_pci(node, buf) },
@@ -416,6 +435,10 @@ extern "efiapi" fn convert_device_node_to_text(
     let mut buf = AsciiBuffer::new();
     let is_display_only = display_only != Boolean::FALSE;
     unsafe {
+        let nlen = node_len(device_node as *const u8) as usize;
+        if !(4..=MAX_DEVICE_PATH_SIZE).contains(&nlen) {
+            return ptr::null_mut();
+        }
         format_node(device_node as *const u8, is_display_only, &mut buf);
     }
     ascii_to_ucs2_alloc(buf.as_str())
@@ -438,12 +461,18 @@ extern "efiapi" fn convert_device_path_to_text(
     let mut first = true;
 
     unsafe {
+        let path_size = device_path_size(device_path);
+        if path_size == 0 {
+            return ptr::null_mut();
+        }
+
         let mut node = device_path as *const u8;
-        loop {
+        let mut consumed = 0usize;
+        while consumed < path_size {
             let ntype = node_type(node);
             let nlen = node_len(node) as usize;
-            if nlen < 4 {
-                break; // invalid
+            if nlen < 4 || consumed + nlen > path_size {
+                return ptr::null_mut();
             }
 
             if ntype == TYPE_END {
@@ -452,6 +481,7 @@ extern "efiapi" fn convert_device_path_to_text(
                     // Multi-instance separator
                     buf.push_str(",");
                     first = true;
+                    consumed += nlen;
                     node = node.add(nlen);
                     continue;
                 }
@@ -465,6 +495,7 @@ extern "efiapi" fn convert_device_path_to_text(
             first = false;
 
             format_node(node, is_display_only, &mut buf);
+            consumed += nlen;
             node = node.add(nlen);
         }
     }
