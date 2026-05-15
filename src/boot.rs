@@ -84,19 +84,11 @@ pub fn install_block_io_protocols(
         }
     }
 
-    // Read GPT header and all partitions
-    let header = match fs::gpt::read_gpt_header(disk) {
-        Ok(h) => h,
-        Err(e) => {
-            log::debug!("Failed to read GPT header: {:?}", e);
-            return None;
-        }
-    };
-
-    let partitions = match fs::gpt::read_partitions(disk, &header) {
+    // Read GPT partitions, falling back to MBR for removable media.
+    let partitions = match fs::gpt::read_partitions_auto(disk) {
         Ok(p) => p,
         Err(e) => {
-            log::debug!("Failed to read partitions: {:?}", e);
+            log::debug!("Failed to read partition table: {:?}", e);
             return None;
         }
     };

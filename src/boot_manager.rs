@@ -396,7 +396,7 @@ fn try_boot_file_on_sdhci(file_path: &str) -> bool {
 
 /// Try to boot a specific file from ESPs on a given device.
 ///
-/// Reads GPT, finds ESP partitions, mounts FAT, checks if the file exists,
+/// Reads GPT/MBR partitions, finds ESP partitions, mounts FAT, checks if the file exists,
 /// and if so, boots it through the standard UEFI boot path.
 fn try_boot_file_on_device(
     device_type: &menu::DeviceType,
@@ -406,17 +406,9 @@ fn try_boot_file_on_device(
 ) -> bool {
     use crate::fs::{fat::FatFilesystem, gpt};
 
-    // Read GPT partitions
-    let partitions = crate::with_disk(device_type, |disk| {
-        if let Ok(header) = gpt::read_gpt_header(disk)
-            && let Ok(parts) = gpt::read_partitions(disk, &header)
-        {
-            Some(parts)
-        } else {
-            None
-        }
-    })
-    .flatten();
+    // Read GPT/MBR partitions
+    let partitions =
+        crate::with_disk(device_type, |disk| gpt::read_partitions_auto(disk).ok()).flatten();
 
     let partitions = match partitions {
         Some(p) => p,

@@ -640,17 +640,16 @@ impl UsbMassStorage {
     /// want to stall too long.
     const MAX_READ_RETRIES: u32 = 3;
 
-    /// Maximum number of sectors per SCSI READ command.
+    /// Maximum bytes per SCSI READ command.
     ///
-    /// USB mass storage devices vary in how many sectors they can handle per
-    /// command. 128 sectors (64KB) is a safe maximum that works reliably
-    /// across all devices while still being a large enough chunk to amortize
-    /// the BOT protocol overhead (CBW + CSW per command).
-    const MAX_SECTORS_PER_CMD: u32 = 128;
+    /// EHCI qTDs can describe at most five 4KiB pages. Keep transfers below
+    /// that hardware limit so high-speed USB reads do not silently truncate or
+    /// corrupt data while boot files are being loaded.
+    const MAX_BYTES_PER_CMD: usize = 16 * 1024;
 
     /// Read sectors from the device with chunking and retry logic.
     ///
-    /// Large reads are split into chunks of MAX_SECTORS_PER_CMD to ensure
+    /// Large reads are split into chunks of MAX_BYTES_PER_CMD to ensure
     /// compatibility with all USB mass storage devices. Each chunk is retried
     /// up to MAX_READ_RETRIES times on failure.
     ///
@@ -670,12 +669,13 @@ impl UsbMassStorage {
             return Err(MassStorageError::InvalidParameter);
         }
 
+        let sectors_per_cmd = (Self::MAX_BYTES_PER_CMD / block_size).max(1) as u32;
         let mut lba = start_lba;
         let mut remaining = num_sectors;
         let mut offset = 0usize;
 
         while remaining > 0 {
-            let chunk = remaining.min(Self::MAX_SECTORS_PER_CMD);
+            let chunk = remaining.min(sectors_per_cmd);
             self.read_sectors_with_retry(
                 controller,
                 lba,
