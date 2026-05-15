@@ -636,6 +636,94 @@ impl EhciController {
         Ok(())
     }
 
+    /// Unlink the persistent bulk QH from the async schedule.
+    fn unlink_bulk_qh(&mut self) {
+        if !self.bulk_qh_linked {
+            return;
+        }
+
+        let target_addr = (self.bulk_qh as u32) & !0x1f;
+        let mut current_addr = self.async_qh;
+        let mut unlinked = false;
+
+        for _ in 0..16 {
+            invalidate_cache_range(current_addr, 64);
+            // SAFETY: current_addr walks the EHCI async QH list, which is made
+            // only from controller-owned QHs allocated below 4 GiB.
+            let current = unsafe { &mut *(current_addr as *mut Qh) };
+            let next_link = current.qh_link;
+            if (next_link & Qh::TERMINATE) != 0 {
+                break;
+            }
+
+            let next_addr = (next_link & !0x1f) as u64;
+            if next_addr == target_addr as u64 {
+                invalidate_cache_range(self.bulk_qh, 64);
+                // SAFETY: self.bulk_qh is the persistent bulk QH allocated by
+                // this controller and linked into the async schedule.
+                let bulk_qh = unsafe { &*(self.bulk_qh as *const Qh) };
+                current.qh_link = bulk_qh.qh_link;
+                fence(Ordering::SeqCst);
+                flush_cache_range(current_addr, 4);
+                unlinked = true;
+                break;
+            }
+
+            if next_addr == self.async_qh {
+                break;
+            }
+            current_addr = next_addr;
+        }
+
+        self.bulk_qh_linked = false;
+
+        if unlinked {
+            self.op().usbsts.modify(USBSTS::IAA::SET);
+            self.op().usbcmd.modify(USBCMD::IAAD::SET);
+            let timeout = Timeout::from_ms(100);
+            while !timeout.is_expired() {
+                if self.op().usbsts.is_set(USBSTS::IAA) {
+                    self.op().usbsts.modify(USBSTS::IAA::SET);
+                    break;
+                }
+                crate::time::delay_us(10);
+            }
+        } else {
+            log::debug!("EHCI: persistent bulk QH was not found in async schedule");
+        }
+    }
+
+    /// Reset a root-hub port before retrying enumeration.
+    fn reset_port_for_retry(&mut self, port: u8) -> Result<(), UsbError> {
+        let port_reg = self.port(port);
+
+        if !port_reg.portsc.is_set(PORTSC::CCS) {
+            return Err(UsbError::Disconnected);
+        }
+
+        port_reg.portsc.modify(PORTSC::PR::SET + PORTSC::PE::CLEAR);
+        crate::time::delay_ms(50);
+        port_reg.portsc.modify(PORTSC::PR::CLEAR);
+        crate::time::delay_ms(100);
+
+        let timeout = Timeout::from_ms(250);
+        while !timeout.is_expired() {
+            if !port_reg.portsc.is_set(PORTSC::CCS) {
+                return Err(UsbError::Disconnected);
+            }
+            if port_reg.portsc.is_set(PORTSC::PE) {
+                port_reg
+                    .portsc
+                    .modify(PORTSC::CSC::SET + PORTSC::PEC::SET + PORTSC::OCC::SET);
+                crate::time::delay_ms(10);
+                return Ok(());
+            }
+            crate::time::delay_ms(1);
+        }
+
+        Err(UsbError::Timeout)
+    }
+
     /// Enumerate ports
     fn enumerate_ports(&mut self) -> Result<(), UsbError> {
         log::trace!("EHCI: Enumerating {} ports", self.num_ports);
@@ -669,13 +757,13 @@ impl EhciController {
 
             crate::time::delay_ms(50); // USB spec: 10-20ms reset, we use 50ms
 
-            // Clear reset
+            // Clear reset and let endpoint zero settle before the first setup packet.
             port_reg.portsc.modify(PORTSC::PR::CLEAR);
 
-            crate::time::delay_ms(10);
+            crate::time::delay_ms(100);
 
             // Wait for enable
-            let timeout = Timeout::from_ms(100);
+            let timeout = Timeout::from_ms(250);
             let mut enabled = false;
             while !timeout.is_expired() {
                 if port_reg.portsc.is_set(PORTSC::PE) {
@@ -706,6 +794,8 @@ impl EhciController {
                 .portsc
                 .modify(PORTSC::CSC::SET + PORTSC::PEC::SET + PORTSC::OCC::SET);
 
+            crate::time::delay_ms(50);
+
             // Device is high-speed if enabled on EHCI
             if let Err(e) = self.attach_device(port, UsbSpeed::High) {
                 log::error!("Failed to attach device on port {}: {:?}", port, e);
@@ -728,11 +818,33 @@ impl EhciController {
             .position(|d| d.is_none())
             .ok_or(UsbError::NoFreeSlots)?;
 
-        // Use the shared enumeration helper
-        let initial_device = UsbDevice::new(0, port, speed);
-        let device = enumerate_device(initial_device, address, |dev, rt, req, val, idx, data| {
-            self.control_transfer_internal(dev, rt, req, val, idx, data)
-        })?;
+        // Use the shared enumeration helper. Some USB flash drives need an
+        // extra settle/reset cycle before endpoint zero responds reliably.
+        let mut last_error = UsbError::Timeout;
+        let device = 'enumerate: {
+            for attempt in 0..3 {
+                let initial_device = UsbDevice::new(0, port, speed);
+                match enumerate_device(initial_device, address, |dev, rt, req, val, idx, data| {
+                    self.control_transfer_internal(dev, rt, req, val, idx, data)
+                }) {
+                    Ok(device) => break 'enumerate device,
+                    Err(e) => {
+                        last_error = e;
+                        if attempt == 2 {
+                            break;
+                        }
+                        log::warn!(
+                            "EHCI: device enumeration on port {} failed (attempt {}/3): {:?}; resetting port",
+                            port,
+                            attempt + 1,
+                            last_error
+                        );
+                        self.reset_port_for_retry(port)?;
+                    }
+                }
+            }
+            return Err(last_error);
+        };
 
         self.next_address += 1;
 
@@ -967,7 +1079,9 @@ impl EhciController {
         let qh = unsafe { &mut *(qh_addr as *mut Qh) };
         qh.ep_chars = ep_chars;
         qh.ep_caps = ep_caps;
-        qh.current_qtd = Qtd::TERMINATE; // T-bit=1 so HC uses overlay.next_qtd
+        // Match libpayload/U-Boot: leave Current qTD clear for a freshly
+        // linked QH. The controller owns this field once the QH is scheduled.
+        qh.current_qtd = 0;
         qh.overlay.next_qtd = qtd_setup_addr as u32;
         qh.overlay.alt_next_qtd = Qtd::TERMINATE;
         qh.overlay.token = 0; // ACTIVE=0, HALTED=0 -> fetch qTD
@@ -991,6 +1105,17 @@ impl EhciController {
 
         // Flush QH to main memory
         flush_cache_range(qh_addr, 96);
+
+        // Run one-shot control transfers on a quiet async schedule, matching
+        // libpayload/U-Boot. ICH7-era EHCI can otherwise keep stale async-list
+        // state around transient QHs.
+        if self.op().usbcmd.is_set(USBCMD::ASE) {
+            self.op().usbcmd.modify(USBCMD::ASE::CLEAR);
+            if !wait_for(100, || !self.op().usbsts.is_set(USBSTS::ASS)) {
+                log::warn!("EHCI: Async schedule failed to stop before control transfer");
+            }
+            self.async_schedule_enabled = false;
+        }
 
         // Link QH into async schedule (insert after async head)
         let async_qh = unsafe { &mut *(self.async_qh as *mut Qh) };
@@ -1039,23 +1164,20 @@ impl EhciController {
             self.op().usbcmd.get()
         );
 
-        // Enable async schedule if not already
-        if !self.op().usbcmd.is_set(USBCMD::ASE) {
-            self.op().usbcmd.modify(USBCMD::ASE::SET);
-
-            // Wait for async schedule to become active
-            if !wait_for(100, || self.op().usbsts.is_set(USBSTS::ASS)) {
-                log::error!("EHCI: Async schedule failed to start");
-                // Unlink and return error
-                async_qh.qh_link = old_link;
-                fence(Ordering::SeqCst);
-                return Err(UsbError::Timeout);
-            }
-            log::debug!(
-                "EHCI: Async schedule enabled, ASS={}",
-                self.op().usbsts.is_set(USBSTS::ASS)
-            );
+        // Enable async schedule for this transfer.
+        self.op().usbcmd.modify(USBCMD::ASE::SET);
+        if !wait_for(100, || self.op().usbsts.is_set(USBSTS::ASS)) {
+            log::error!("EHCI: Async schedule failed to start");
+            async_qh.qh_link = old_link;
+            fence(Ordering::SeqCst);
+            flush_cache_range(self.async_qh, 4);
+            return Err(UsbError::Timeout);
         }
+        self.async_schedule_enabled = true;
+        log::debug!(
+            "EHCI: Async schedule enabled, ASS={}",
+            self.op().usbsts.is_set(USBSTS::ASS)
+        );
 
         // Wait for transfer completion
         let timeout = Timeout::from_ms(5000);
@@ -1078,10 +1200,18 @@ impl EhciController {
                 // Setup done, check if we need to wait for data/status
                 if data_len > 0 {
                     let qtd_data = unsafe { &*(qtd_data_addr as *const Qtd) };
-                    if (qtd_data.token & Qtd::TOKEN_STATUS_ACTIVE) != 0 {
+                    let data_token = qtd_data.token;
+                    const ERROR_MASK: u32 = Qtd::TOKEN_STATUS_HALTED
+                        | Qtd::TOKEN_STATUS_BUFFER_ERR
+                        | Qtd::TOKEN_STATUS_BABBLE
+                        | Qtd::TOKEN_STATUS_XACT_ERR;
+                    if (data_token & ERROR_MASK) != 0 {
+                        break;
+                    }
+                    if (data_token & Qtd::TOKEN_STATUS_ACTIVE) != 0 {
                         poll_count += 1;
                         if poll_count.is_multiple_of(100000) {
-                            log::trace!("EHCI: waiting for data qTD, token={:#x}", qtd_data.token);
+                            log::trace!("EHCI: waiting for data qTD, token={:#x}", data_token);
                         }
                         crate::time::delay_us(1);
                         continue;
@@ -1108,18 +1238,13 @@ impl EhciController {
         async_qh.qh_link = old_link;
         fence(Ordering::SeqCst);
 
-        // Ring doorbell and wait for async advance
-        self.op().usbsts.modify(USBSTS::IAA::SET); // Clear any pending IAA (write 1 to clear)
-        self.op().usbcmd.modify(USBCMD::IAAD::SET);
-
-        let timeout2 = Timeout::from_ms(100);
-        while !timeout2.is_expired() {
-            if self.op().usbsts.is_set(USBSTS::IAA) {
-                self.op().usbsts.modify(USBSTS::IAA::SET); // Clear (write 1 to clear)
-                break;
-            }
-            crate::time::delay_us(10);
+        // Stop the async schedule after the one-shot transfer. This avoids
+        // relying on IAAD for transient QHs and matches libpayload's model.
+        self.op().usbcmd.modify(USBCMD::ASE::CLEAR);
+        if !wait_for(100, || !self.op().usbsts.is_set(USBSTS::ASS)) {
+            log::warn!("EHCI: Async schedule failed to stop after control transfer");
         }
+        self.async_schedule_enabled = false;
 
         // Invalidate caches one more time to get final state
         invalidate_cache_range(qtd_setup_addr, 64);
@@ -1135,15 +1260,12 @@ impl EhciController {
         // Check results (caches already invalidated above)
         let final_setup_token = qtd_setup.token;
         let final_status_token = qtd_status.token;
-
-        if (final_status_token & Qtd::TOKEN_STATUS_ACTIVE) != 0 {
-            log::error!(
-                "EHCI: transfer timeout, setup={:#x} status={:#x}",
-                final_setup_token,
-                final_status_token
-            );
-            return Err(UsbError::Timeout);
-        }
+        let final_data_token = if data_len > 0 {
+            let qtd_data = unsafe { &*(qtd_data_addr as *const Qtd) };
+            qtd_data.token
+        } else {
+            0
+        };
 
         // Check for errors (HALTED, BABBLE, BUFFER_ERR, XACT_ERR)
         const ERROR_MASK: u32 = Qtd::TOKEN_STATUS_HALTED
@@ -1151,7 +1273,19 @@ impl EhciController {
             | Qtd::TOKEN_STATUS_BABBLE
             | Qtd::TOKEN_STATUS_XACT_ERR;
 
-        if (final_setup_token & ERROR_MASK) != 0 || (final_status_token & ERROR_MASK) != 0 {
+        if (final_setup_token & ERROR_MASK) != 0
+            || (final_data_token & ERROR_MASK) != 0
+            || (final_status_token & ERROR_MASK) != 0
+        {
+            log::debug!(
+                "EHCI: transfer error, setup={:#x} data={:#x} status={:#x}",
+                final_setup_token,
+                final_data_token,
+                final_status_token
+            );
+            if (final_data_token & Qtd::TOKEN_STATUS_HALTED) != 0 {
+                return Err(UsbError::Stall);
+            }
             if (final_setup_token & Qtd::TOKEN_STATUS_HALTED) != 0
                 || (final_status_token & Qtd::TOKEN_STATUS_HALTED) != 0
             {
@@ -1160,17 +1294,17 @@ impl EhciController {
             return Err(UsbError::TransactionError);
         }
 
+        if (final_status_token & Qtd::TOKEN_STATUS_ACTIVE) != 0 {
+            log::error!(
+                "EHCI: transfer timeout, setup={:#x} data={:#x} status={:#x}",
+                final_setup_token,
+                final_data_token,
+                final_status_token
+            );
+            return Err(UsbError::Timeout);
+        }
+
         if data_len > 0 {
-            let qtd_data = unsafe { &*(qtd_data_addr as *const Qtd) };
-            let final_data_token = qtd_data.token;
-
-            if (final_data_token & ERROR_MASK) != 0 {
-                if (final_data_token & Qtd::TOKEN_STATUS_HALTED) != 0 {
-                    return Err(UsbError::Stall);
-                }
-                return Err(UsbError::TransactionError);
-            }
-
             // Copy IN data
             if let Some(d) = data
                 && is_in
@@ -1310,6 +1444,7 @@ impl EhciController {
         let token = qtd.token;
 
         if (token & Qtd::TOKEN_STATUS_ACTIVE) != 0 {
+            self.unlink_bulk_qh();
             return Err(UsbError::Timeout);
         }
 
@@ -1320,9 +1455,8 @@ impl EhciController {
                 | Qtd::TOKEN_STATUS_XACT_ERR))
             != 0
         {
+            self.unlink_bulk_qh();
             if (token & Qtd::TOKEN_STATUS_HALTED) != 0 {
-                // Clear halt by unlinking and relinking QH
-                self.bulk_qh_linked = false;
                 return Err(UsbError::Stall);
             }
             return Err(UsbError::TransactionError);

@@ -642,10 +642,10 @@ impl UsbMassStorage {
 
     /// Maximum bytes per SCSI READ command.
     ///
-    /// EHCI qTDs can describe at most five 4KiB pages. Keep transfers below
-    /// that hardware limit so high-speed USB reads do not silently truncate or
-    /// corrupt data while boot files are being loaded.
-    const MAX_BYTES_PER_CMD: usize = 16 * 1024;
+    /// EHCI qTDs can describe at most five 4KiB pages. Keep transfers well
+    /// below that hardware limit so high-speed USB reads do not silently
+    /// truncate or corrupt data while boot files are being loaded.
+    const MAX_BYTES_PER_CMD: usize = 8 * 1024;
 
     /// Read sectors from the device with chunking and retry logic.
     ///
