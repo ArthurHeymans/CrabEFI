@@ -45,9 +45,11 @@ const EISA_PNP_ID_PCI_ROOT: u32 = 0x0a0341d0;
 const EISA_PNP_ID_PCIE_ROOT: u32 = 0x0a0841d0;
 
 /// Signature types for HD() nodes
+const SIGNATURE_TYPE_MBR: u8 = 0x01;
 const SIGNATURE_TYPE_GUID: u8 = 0x02;
 
-/// Partition format GPT
+/// Partition formats for HD() nodes
+const PARTITION_FORMAT_MBR: u8 = 0x01;
 const PARTITION_FORMAT_GPT: u8 = 0x02;
 
 // ============================================================================
@@ -66,7 +68,7 @@ fn ucs2_to_ascii(text: *const Char16, out: &mut [u8; MAX_TEXT_LEN]) -> usize {
     let mut len = 0;
     unsafe {
         loop {
-            let ch = ptr::read_unaligned(text.add(len) as *const u16);
+            let ch = ptr::read_unaligned(text.add(len));
             if ch == 0 || len >= MAX_TEXT_LEN - 1 {
                 break;
             }
@@ -258,7 +260,7 @@ fn ascii_prefix_eq(text: &[u8], prefix: &[u8]) -> bool {
         return false;
     }
     for i in 0..prefix.len() {
-        if text[i].to_ascii_lowercase() != prefix[i].to_ascii_lowercase() {
+        if !text[i].eq_ignore_ascii_case(&prefix[i]) {
             return false;
         }
     }
@@ -268,13 +270,13 @@ fn ascii_prefix_eq(text: &[u8], prefix: &[u8]) -> bool {
 /// Extract the arguments inside parentheses: `Keyword(args)` -> `args` portion.
 ///
 /// Returns the byte slice of the args and the keyword length.
-fn extract_args<'a>(text: &'a [u8]) -> Option<(&'a [u8], usize)> {
+fn extract_args(text: &[u8]) -> Option<(&[u8], usize)> {
     let paren_open = text.iter().position(|&c| c == b'(')?;
     // Find matching close paren (handle nesting, though unlikely)
     let mut depth = 0;
     let mut close = None;
-    for i in paren_open..text.len() {
-        match text[i] {
+    for (i, &ch) in text.iter().enumerate().skip(paren_open) {
+        match ch {
             b'(' => depth += 1,
             b')' => {
                 depth -= 1;
@@ -368,7 +370,7 @@ fn parse_nvme(args: &[u8]) -> *mut device_path::Protocol {
         let rest = skip_separator(args, consumed);
         let eui_data = &args[rest..];
         let mut off = 0;
-        for i in 0..8 {
+        for i in (0..8).rev() {
             if off + 1 < eui_data.len() {
                 *node.add(8 + i) = parse_hex_byte(eui_data, off);
                 off += 2;
@@ -382,23 +384,32 @@ fn parse_nvme(args: &[u8]) -> *mut device_path::Protocol {
     node as *mut device_path::Protocol
 }
 
-/// Parse `HD(PartNo,GPT,GUID[,Start,Size])` -> Hard Drive media node
+/// Parse `HD(PartNo,Type,Signature[,Start,Size])` -> Hard Drive media node
 fn parse_hd(args: &[u8]) -> *mut device_path::Protocol {
-    // HD(1,GPT,GUID,0x800,0x100000) or HD(1,GPT,GUID)
     let (part_num, c1) = parse_number(args);
     let r1 = skip_separator(args, c1);
 
-    // Check partition type: GPT, MBR, or numeric
     let remaining = &args[r1..];
     let is_gpt = ascii_prefix_eq(remaining, b"GPT");
+    let is_mbr = ascii_prefix_eq(remaining, b"MBR");
 
-    // Skip past the type keyword
-    let r2 = if is_gpt {
-        skip_separator(args, r1 + 3)
+    let (partition_format, signature_type, r2) = if is_gpt {
+        (
+            PARTITION_FORMAT_GPT,
+            SIGNATURE_TYPE_GUID,
+            skip_separator(args, r1 + 3),
+        )
+    } else if is_mbr {
+        (
+            PARTITION_FORMAT_MBR,
+            SIGNATURE_TYPE_MBR,
+            skip_separator(args, r1 + 3),
+        )
     } else {
-        // Skip past the type field (could be MBR or number)
-        let (_, c) = parse_number(remaining);
-        skip_separator(args, r1 + c.max(3))
+        let (format, c) = parse_number(remaining);
+        let r2 = skip_separator(args, r1 + c);
+        let (sig_type, c2) = parse_number(&args[r2..]);
+        (format as u8, sig_type as u8, skip_separator(args, r2 + c2))
     };
 
     // Node: header(4) + part_num(4) + start(8) + size(8) + sig(16) + format(1) + sig_type(1) = 42
@@ -409,25 +420,27 @@ fn parse_hd(args: &[u8]) -> *mut device_path::Protocol {
 
     unsafe {
         write_u32(node, 4, part_num as u32);
+        *node.add(40) = partition_format;
+        *node.add(41) = signature_type;
 
-        if is_gpt {
-            // Parse GUID
-            let guid_data = &args[r2..];
-            if let Some(guid_bytes) = parse_guid(guid_data) {
+        let after_sig = if signature_type == SIGNATURE_TYPE_GUID {
+            if let Some(guid_bytes) = parse_guid(&args[r2..]) {
                 ptr::copy_nonoverlapping(guid_bytes.as_ptr(), node.add(24), 16);
             }
-            *node.add(40) = PARTITION_FORMAT_GPT;
-            *node.add(41) = SIGNATURE_TYPE_GUID;
+            r2 + 36
+        } else {
+            let (sig, consumed) = parse_number(&args[r2..]);
+            write_u32(node, 24, sig as u32);
+            r2 + consumed
+        };
 
-            // Optional start and size after GUID (36 chars)
-            let after_guid = skip_separator(args, r2 + 36);
-            if after_guid < args.len() {
-                let (start, c3) = parse_number(&args[after_guid..]);
-                write_u64(node, 8, start);
-                let r3 = skip_separator(args, after_guid + c3);
-                let (size, _) = parse_number(&args[r3..]);
-                write_u64(node, 16, size);
-            }
+        let after_sig = skip_separator(args, after_sig);
+        if after_sig < args.len() {
+            let (start, c3) = parse_number(&args[after_sig..]);
+            write_u64(node, 8, start);
+            let r3 = skip_separator(args, after_sig + c3);
+            let (size, _) = parse_number(&args[r3..]);
+            write_u64(node, 16, size);
         }
     }
 
