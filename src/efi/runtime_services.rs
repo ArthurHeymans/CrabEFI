@@ -1608,6 +1608,9 @@ extern "efiapi" fn update_capsule(
     if capsule_header_array.is_null() || capsule_count == 0 {
         return Status::INVALID_PARAMETER;
     }
+    if capsule_count > 1 {
+        return Status::UNSUPPORTED;
+    }
 
     // After ExitBootServices: stage capsules for next boot via deferred
     // variable buffer. The OS must call ResetSystem() afterwards.
@@ -1639,11 +1642,10 @@ extern "efiapi" fn update_capsule(
         return Status::SUCCESS;
     }
 
-    // Before ExitBootServices: we could process capsules immediately, but
-    // this path is uncommon. For now, return SUCCESS to indicate the
-    // capsules were accepted; they'll be processed by the boot-time
-    // capsule processing path on the next boot.
-    Status::SUCCESS
+    // Before ExitBootServices this implementation has no safe staging path:
+    // returning SUCCESS would make callers believe a capsule was accepted even
+    // though it would be dropped. Require the runtime/reset delivery path.
+    Status::UNSUPPORTED
 }
 
 extern "efiapi" fn query_capsule_capabilities(
@@ -1663,12 +1665,24 @@ extern "efiapi" fn query_capsule_capabilities(
     if maximum_capsule_size.is_null() || reset_type.is_null() {
         return Status::INVALID_PARAMETER;
     }
+    if capsule_count > 1 {
+        return Status::UNSUPPORTED;
+    }
 
-    // Check all capsules have PERSIST_ACROSS_RESET flag
+    const MAX_CAPSULE_SIZE: u64 = 16 * 1024 * 1024;
+
+    // Check all capsules have PERSIST_ACROSS_RESET and fit the advertised limit.
     for i in 0..capsule_count {
         let hdr_ptr = unsafe { *capsule_header_array.add(i) };
         if hdr_ptr.is_null() {
             return Status::INVALID_PARAMETER;
+        }
+        let hdr = unsafe { &*hdr_ptr };
+        if hdr.flags & super::capsule::header::CAPSULE_FLAGS_PERSIST_ACROSS_RESET == 0 {
+            return Status::UNSUPPORTED;
+        }
+        if hdr.capsule_image_size as u64 > MAX_CAPSULE_SIZE {
+            return Status::UNSUPPORTED;
         }
     }
 
@@ -1676,7 +1690,7 @@ extern "efiapi" fn query_capsule_capabilities(
     // - Maximum capsule size: 16 MB (conservative limit for SPI flash)
     // - Reset type: warm reset (coreboot processes capsules after warm reboot)
     unsafe {
-        *maximum_capsule_size = 16 * 1024 * 1024; // 16 MB
+        *maximum_capsule_size = MAX_CAPSULE_SIZE;
         *reset_type = efi::RESET_WARM;
     }
 

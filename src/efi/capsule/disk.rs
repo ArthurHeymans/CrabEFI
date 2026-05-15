@@ -240,6 +240,9 @@ pub fn clear_os_indications_capsule_bits() {
         'a' as u16, 't' as u16, 'i' as u16, 'o' as u16, 'n' as u16, 's' as u16, 0,
     ];
 
+    let mut cleared_value = None;
+    let mut attributes = 0;
+
     state::with_efi_mut(|efi| {
         for var in &mut efi.variables {
             if !var.in_use {
@@ -266,10 +269,23 @@ pub fn clear_os_indications_capsule_bits() {
 
                 let bytes = value.to_le_bytes();
                 var.data[..8].copy_from_slice(&bytes);
-
-                log::info!("Cleared capsule bits in OsIndications");
+                cleared_value = Some(bytes);
+                attributes = var.attributes;
                 return;
             }
         }
     });
+
+    if let Some(bytes) = cleared_value {
+        if let Err(e) = crate::efi::varstore::persist_variable(
+            &EFI_GLOBAL_VARIABLE_GUID,
+            os_ind_name,
+            attributes,
+            &bytes,
+        ) {
+            log::warn!("Failed to persist cleared OsIndications: {:?}", e);
+        } else {
+            log::info!("Cleared capsule bits in OsIndications");
+        }
+    }
 }

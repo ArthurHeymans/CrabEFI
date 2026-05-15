@@ -213,30 +213,43 @@ fn apply_fmp_payload_item(
     // Strip the RMAP manifest to get the pure firmware image data
     let clean_image = rmap::strip_rmap_manifest(firmware_image);
 
-    // Write firmware image to approved flash regions
-    let mut total_written = 0u32;
+    let required_size = match approved_regions.iter().try_fold(0usize, |total, region| {
+        total.checked_add(region.size as usize)
+    }) {
+        Some(size) => size,
+        None => {
+            log::error!("Approved RMAP regions exceed addressable image size");
+            return CapsuleResult::failure(CapsuleResultStatus::ErrorInvalidImage, 0);
+        }
+    };
+
+    if clean_image.len() < required_size {
+        log::error!(
+            "Image data too small for approved regions: need {} bytes, have {}",
+            required_size,
+            clean_image.len()
+        );
+        return CapsuleResult::failure(CapsuleResultStatus::ErrorInvalidImage, 0);
+    }
+
+    // Write firmware image to approved flash regions.
+    // The signed image is laid out as the concatenation of the approved regions
+    // in manifest order; never truncate a region silently.
+    let mut total_written = 0usize;
     for region in &approved_regions {
-        let region_end = region.offset + region.size;
-        let _image_region_start = region.offset as usize;
-
-        // The clean_image should cover all approved regions.
-        // Each region maps to a corresponding slice of the firmware image.
-        // For now, we write the appropriate portion of the image to each region.
-        let write_size = region.size.min(clean_image.len() as u32 - total_written);
-        let write_start = total_written as usize;
-        let write_end = write_start + write_size as usize;
-
-        if write_end > clean_image.len() {
+        if region.offset.checked_add(region.size).is_none() {
             log::error!(
-                "Image data too small for region '{}': need {} bytes at offset {}, have {}",
+                "RMAP region '{}' overflows flash address space: offset={:#x}, size={:#x}",
                 region.name,
-                write_size,
-                write_start,
-                clean_image.len()
+                region.offset,
+                region.size
             );
-            return CapsuleResult::failure(CapsuleResultStatus::ErrorFlashWriteFailed, 0);
+            return CapsuleResult::failure(CapsuleResultStatus::ErrorInvalidImage, 0);
         }
 
+        let write_size = region.size as usize;
+        let write_start = total_written;
+        let write_end = write_start + write_size;
         let region_data = &clean_image[write_start..write_end];
 
         log::info!(
@@ -252,7 +265,6 @@ fn apply_fmp_payload_item(
         }
 
         total_written += write_size;
-        let _ = region_end; // suppress unused warning
     }
 
     log::info!(
