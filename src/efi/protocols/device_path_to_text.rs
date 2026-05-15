@@ -223,8 +223,8 @@ unsafe fn fmt_sata(node: *const u8, buf: &mut AsciiBuffer) {
 unsafe fn fmt_nvme(node: *const u8, buf: &mut AsciiBuffer) {
     let nsid = unsafe { read_u32(node, 4) };
     let _ = write!(buf, "NVMe(0x{:X},", nsid);
-    for i in 0..8 {
-        if i > 0 {
+    for i in (0..8).rev() {
+        if i < 7 {
             buf.push_str("-");
         }
         let _ = write!(buf, "{:02X}", unsafe { read_u8(node, 8 + i) });
@@ -338,7 +338,7 @@ unsafe fn fmt_file_path(node: *const u8, len: u16, buf: &mut AsciiBuffer) {
             break;
         }
         // Printable ASCII range — pass through. Non-ASCII becomes '?'.
-        if ch >= 0x20 && ch < 0x7F {
+        if (0x20..0x7F).contains(&ch) {
             let byte = [ch as u8];
             // Safety: single ASCII byte is valid UTF-8
             buf.push_str(unsafe { core::str::from_utf8_unchecked(&byte) });

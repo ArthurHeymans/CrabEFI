@@ -847,10 +847,7 @@ pub(crate) unsafe fn write_end_node(p: *mut u8) {
 ///
 /// Returns null on failure.
 pub(crate) fn alloc_pool(size: usize) -> *mut u8 {
-    match allocate_pool(MemoryType::BootServicesData, size) {
-        Ok(p) => p,
-        Err(_) => core::ptr::null_mut(),
-    }
+    allocate_pool(MemoryType::BootServicesData, size).unwrap_or_default()
 }
 
 /// Create a loaded image device path by appending a file path node to a device path.
@@ -864,7 +861,7 @@ pub(crate) fn alloc_pool(size: usize) -> *mut u8 {
 ///
 /// # Returns
 /// A new device path, or null on failure
-pub fn create_loaded_image_device_path(
+pub(crate) fn create_loaded_image_device_path(
     device_dp: *const Protocol,
     file_path: &str,
 ) -> *mut Protocol {

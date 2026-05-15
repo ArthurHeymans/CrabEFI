@@ -1,7 +1,7 @@
 //! Device Path Protocol Test Application
 //!
 //! Tests CrabEFI's Device Path Utilities, Device Path To Text, Device Path
-//! From Text, and Load File 2 protocol implementations.
+//! From Text protocol implementations.
 //!
 //! Each test prints [PASS] or [FAIL] markers that the xtask test runner checks.
 
@@ -11,9 +11,7 @@
 use core::ffi::c_void;
 use core::panic::PanicInfo;
 use r_efi::efi::{self, Boolean, Char16, Guid, Handle, Status, SystemTable};
-use r_efi::protocols::{
-    device_path, device_path_from_text, device_path_to_text, device_path_utilities, load_file2,
-};
+use r_efi::protocols::{device_path, device_path_from_text, device_path_to_text, device_path_utilities};
 
 static mut BOOT_SERVICES: *mut efi::BootServices = core::ptr::null_mut();
 static mut CON_OUT: *mut r_efi::protocols::simple_text_output::Protocol = core::ptr::null_mut();
@@ -733,102 +731,6 @@ fn test_device_path_from_text(
 }
 
 // ============================================================================
-// Load File 2 Tests
-// ============================================================================
-
-fn test_load_file2() -> (usize, usize) {
-    let mut passed = 0usize;
-    let mut failed = 0usize;
-
-    println("");
-    println("--- Load File 2 Protocol ---");
-
-    // Try to locate LoadFile2 by searching handles
-    let bs = unsafe { BOOT_SERVICES };
-    let mut guid = load_file2::PROTOCOL_GUID;
-    let mut handles: [Handle; 16] = [core::ptr::null_mut(); 16];
-    let mut buf_size = core::mem::size_of_val(&handles);
-
-    let status = unsafe {
-        ((*bs).locate_handle)(
-            efi::BY_PROTOCOL,
-            &mut guid,
-            core::ptr::null_mut(),
-            &mut buf_size,
-            handles.as_mut_ptr(),
-        )
-    };
-
-    if status == Status::SUCCESS && buf_size >= core::mem::size_of::<Handle>() {
-        println("[PASS] locate_load_file2: LoadFile2 protocol found");
-        passed += 1;
-
-        // Open the protocol
-        let mut interface: *mut c_void = core::ptr::null_mut();
-        let handle = handles[0];
-        let status = unsafe {
-            ((*bs).open_protocol)(
-                handle,
-                &mut guid,
-                &mut interface,
-                core::ptr::null_mut(),
-                core::ptr::null_mut(),
-                0x00000002, // GET_PROTOCOL
-            )
-        };
-
-        if status == Status::SUCCESS && !interface.is_null() {
-            let lf2 = interface as *mut load_file2::Protocol;
-
-            // Test: LoadFile with BootPolicy=TRUE should return UNSUPPORTED
-            let mut buf_sz: usize = 0;
-            let status = unsafe {
-                ((*lf2).load_file)(
-                    lf2,
-                    core::ptr::null_mut(),
-                    Boolean::TRUE,
-                    &mut buf_sz,
-                    core::ptr::null_mut(),
-                )
-            };
-            if status == Status::UNSUPPORTED {
-                println("[PASS] load_file2_boot_policy: BootPolicy=TRUE returns UNSUPPORTED");
-                passed += 1;
-            } else {
-                println("[FAIL] load_file2_boot_policy: Expected UNSUPPORTED for BootPolicy=TRUE");
-                failed += 1;
-            }
-
-            // Test: LoadFile with BootPolicy=FALSE should return NOT_FOUND (stub)
-            let status = unsafe {
-                ((*lf2).load_file)(
-                    lf2,
-                    core::ptr::null_mut(),
-                    Boolean::FALSE,
-                    &mut buf_sz,
-                    core::ptr::null_mut(),
-                )
-            };
-            if status == Status::NOT_FOUND {
-                println("[PASS] load_file2_not_found: BootPolicy=FALSE returns NOT_FOUND (stub)");
-                passed += 1;
-            } else {
-                println("[FAIL] load_file2_not_found: Expected NOT_FOUND for stub implementation");
-                failed += 1;
-            }
-        } else {
-            println("[FAIL] open_load_file2: Failed to open LoadFile2 protocol");
-            failed += 1;
-        }
-    } else {
-        println("[FAIL] locate_load_file2: LoadFile2 protocol not found");
-        failed += 1;
-    }
-
-    (passed, failed)
-}
-
-// ============================================================================
 // Entry point
 // ============================================================================
 
@@ -895,11 +797,6 @@ pub extern "efiapi" fn efi_main(image_handle: Handle, system_table: *mut SystemT
             }
         }
     }
-
-    // LoadFile2 tests (independent of device path protocols)
-    let (p, f) = test_load_file2();
-    total_passed += p;
-    total_failed += f;
 
     // Summary
     println("");

@@ -652,7 +652,6 @@ pub fn run_tests(config: &QemuConfig, disk_path: &Path, app_name: &str) -> Resul
                 ("locate_utilities", "Device Path Utilities"),
                 ("locate_to_text", "Device Path To Text"),
                 ("locate_from_text", "Device Path From Text"),
-                ("locate_load_file2", "LoadFile2"),
             ] {
                 let pattern = format!("[PASS] {}", tag);
                 if result.output.contains(&pattern) {
@@ -679,8 +678,6 @@ pub fn run_tests(config: &QemuConfig, disk_path: &Path, app_name: &str) -> Resul
                 "text_to_node_pci_root",
                 "text_to_path_pci",
                 "round_trip",
-                "load_file2_boot_policy",
-                "load_file2_not_found",
             ] {
                 let pattern = format!("[PASS] {}", tag);
                 if result.output.contains(&pattern) {

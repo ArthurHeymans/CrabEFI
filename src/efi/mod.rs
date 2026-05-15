@@ -144,7 +144,6 @@ fn install_standard_protocols_and_finalize() {
     init_rng();
     init_console_control();
     init_device_path_protocols();
-    init_load_file2();
     #[cfg(target_arch = "riscv64")]
     init_riscv_boot_protocol();
     system_table::install_memory_attributes_table();
@@ -471,50 +470,6 @@ fn init_device_path_protocols() {
     }
 
     log::info!("Device Path protocols installed on handle {:?}", handle);
-}
-
-/// Initialize Load File 2 protocol with Linux initrd vendor media device path
-fn init_load_file2() {
-    use protocols::device_path::DEVICE_PATH_PROTOCOL_GUID;
-    use protocols::load_file2::{LOAD_FILE2_GUID, create_device_path, create_protocol};
-
-    let handle = match boot_services::create_handle() {
-        Some(h) => h,
-        None => {
-            log::error!("Failed to create LoadFile2 handle");
-            return;
-        }
-    };
-
-    // Install the initrd vendor media device path on the handle
-    let dp = create_device_path();
-    if dp.is_null() {
-        log::error!("Failed to create LoadFile2 device path");
-        return;
-    }
-    let status = boot_services::install_protocol(
-        handle,
-        &DEVICE_PATH_PROTOCOL_GUID,
-        dp as *mut core::ffi::c_void,
-    );
-    if status != Status::SUCCESS {
-        log::error!("Failed to install LoadFile2 device path: {:?}", status);
-        return;
-    }
-
-    // Install the protocol itself
-    let proto = create_protocol();
-    if proto.is_null() {
-        log::error!("Failed to create LoadFile2 protocol");
-        return;
-    }
-    let status = boot_services::install_protocol(handle, &LOAD_FILE2_GUID, proto);
-    if status != Status::SUCCESS {
-        log::error!("Failed to install LoadFile2 protocol: {:?}", status);
-        return;
-    }
-
-    log::info!("LoadFile2 protocol installed on handle {:?}", handle);
 }
 
 /// Initialize Graphics Output Protocol (GOP) on a specific handle
