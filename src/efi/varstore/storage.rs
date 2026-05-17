@@ -286,6 +286,60 @@ impl StorageBackend for SpiStorageBackend {
     }
 }
 
+fn map_storage_error(error: StorageError) -> crate::platform::StorageError {
+    match error {
+        StorageError::NotInitialized => crate::platform::StorageError::NotInitialized,
+        StorageError::WriteProtected => crate::platform::StorageError::WriteProtected,
+        StorageError::AccessDenied => crate::platform::StorageError::AccessDenied,
+        StorageError::Timeout => crate::platform::StorageError::Timeout,
+        StorageError::InvalidArgument => crate::platform::StorageError::InvalidArgument,
+        StorageError::IoError => crate::platform::StorageError::IoError,
+        StorageError::NotSupported => crate::platform::StorageError::NotSupported,
+    }
+}
+
+impl crate::platform::StorageBackend for SpiStorageBackend {
+    fn name(&self) -> &str {
+        <Self as StorageBackend>::name(self)
+    }
+
+    fn size(&self) -> u32 {
+        <Self as StorageBackend>::size(self)
+    }
+
+    fn is_write_protected(&self) -> bool {
+        <Self as StorageBackend>::is_write_protected(self)
+    }
+
+    fn enable_writes(&mut self) -> core::result::Result<(), crate::platform::StorageError> {
+        <Self as StorageBackend>::enable_writes(self).map_err(map_storage_error)
+    }
+
+    fn read(
+        &mut self,
+        offset: u32,
+        buffer: &mut [u8],
+    ) -> core::result::Result<(), crate::platform::StorageError> {
+        <Self as StorageBackend>::read(self, offset, buffer).map_err(map_storage_error)
+    }
+
+    fn write(
+        &mut self,
+        offset: u32,
+        data: &[u8],
+    ) -> core::result::Result<(), crate::platform::StorageError> {
+        <Self as StorageBackend>::write(self, offset, data).map_err(map_storage_error)
+    }
+
+    fn erase(
+        &mut self,
+        offset: u32,
+        size: u32,
+    ) -> core::result::Result<(), crate::platform::StorageError> {
+        <Self as StorageBackend>::erase(self, offset, size).map_err(map_storage_error)
+    }
+}
+
 /// Memory-backed storage backend for testing
 ///
 /// This backend stores data in memory, simulating flash behavior:
@@ -330,19 +384,19 @@ impl MemoryBackend {
 
     /// Get a reference to the underlying data
     pub fn data(&self) -> &[u8] {
-        &self.data
+        self.data.as_slice()
     }
 
     /// Get a mutable reference to the underlying data (bypasses flash semantics)
     pub fn data_mut(&mut self) -> &mut [u8] {
-        &mut self.data
+        self.data.as_mut_slice()
     }
 }
 
 #[cfg(test)]
 impl StorageBackend for MemoryBackend {
     fn name(&self) -> &str {
-        &self.name
+        self.name.as_str()
     }
 
     fn size(&self) -> u32 {

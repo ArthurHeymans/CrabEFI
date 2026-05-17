@@ -198,8 +198,8 @@ fn init_persistence_and_boot() -> ! {
 /// ```
 pub fn init_platform(config: PlatformConfig) -> ! {
     if state::is_initialized() {
-        // Caller pre-initialized state (e.g., coreboot payload storing
-        // SMMSTORE/SPI/CBMEM info before calling us). Their FirmwareState
+        // Caller pre-initialized state (e.g., an integration crate storing
+        // platform metadata before calling us). Their FirmwareState
         // lives on a -> ! frame so it outlives us.
         init_platform_impl(config)
     } else {
@@ -288,13 +288,36 @@ fn init_platform_impl(mut config: PlatformConfig) -> ! {
         env!("CARGO_PKG_VERSION")
     );
 
-    // ---- 4. Store ACPI RSDP in driver state ----
+    // ---- 4. Store platform variable backend in driver state ----
+    //
+    // The backend is supplied by the integration layer (coreboot payload,
+    // fstart, TF-A/MM, tests, ...).  Keep it in state before the shared boot
+    // tail so init_persistence_and_boot() can load variables without probing
+    // platform-specific hardware from the library core.
+    if let Some(ref mut var_backend) = config.variable_backend {
+        let runtime_capable = var_backend.runtime_capable();
+        // SAFETY: init_platform() is -> ! (never returns). The caller's stack
+        // frame — where the VariableBackend lives — is never unwound, so the
+        // erased-lifetime trait object pointer remains valid for the firmware
+        // lifetime.
+        let raw: *mut dyn crate::platform::VariableBackend = unsafe {
+            core::mem::transmute::<
+                &mut dyn crate::platform::VariableBackend,
+                *mut dyn crate::platform::VariableBackend,
+            >(*var_backend)
+        };
+        unsafe {
+            state::set_variable_backend_raw(raw, runtime_capable);
+        }
+    }
+
+    // ---- 5. Store ACPI RSDP in driver state ----
     if let Some(rsdp) = config.acpi_rsdp {
         state::with_drivers_mut(|d| d.platform.acpi_rsdp = Some(rsdp));
         log::info!("ACPI RSDP: {:#x}", rsdp);
     }
 
-    // ---- 5. Parse FDT if provided ----
+    // ---- 6. Parse FDT if provided ----
     //
     // Must happen before efi::init_from_platform() which uses fdt_info for
     // MMIO regions on aarch64 (GIC, PCIe windows, UART).
@@ -314,7 +337,7 @@ fn init_platform_impl(mut config: PlatformConfig) -> ! {
         }
     }
 
-    // ---- 6. Initialize timing subsystem from platform timer ----
+    // ---- 7. Initialize timing subsystem from platform timer ----
     //
     // In library mode the platform-provided Timer is the source of truth.
     // This works on any architecture (x86, aarch64, riscv64) without
@@ -330,10 +353,10 @@ fn init_platform_impl(mut config: PlatformConfig) -> ! {
         .sum();
     log::info!("Total RAM: {} MB", total_ram / (1024 * 1024));
 
-    // ---- 7. Initialize keyboard subsystem ----
+    // ---- 8. Initialize keyboard subsystem ----
     drivers::keyboard_common::init();
 
-    // ---- 8. Initialize EFI environment ----
+    // ---- 9. Initialize EFI environment ----
     //
     // Always runs — sets up the EFI memory map, system table, ACPI/SMBIOS
     // configuration tables, and runtime region reservations.  The page
@@ -352,7 +375,7 @@ fn init_platform_impl(mut config: PlatformConfig) -> ! {
     log::info!("CrabEFI initialized successfully!");
     log::info!("EFI System Table at: {:p}", efi::get_system_table());
 
-    // ---- 9. Initialize heap ----
+    // ---- 10. Initialize heap ----
     //
     // Skipped when the platform already set up the heap before entry
     // (heap_pre_initialized == true).  The rest of the init sequence is
@@ -361,14 +384,14 @@ fn init_platform_impl(mut config: PlatformConfig) -> ! {
         log::error!("Failed to initialize heap allocator!");
     }
 
-    // ---- 10. Runtime log support ----
+    // ---- 11. Runtime log support ----
     #[cfg(feature = "rt-log")]
     {
         efi::rtlog::register_region();
         efi::rtlog::dump();
     }
 
-    // ---- 11. Discover PCI ECAM and initialize PCI ----
+    // ---- 12. Discover PCI ECAM and initialize PCI ----
     //
     // Priority: config.ecam_base > acpi_info.ecam_base > fdt_info.ecam_base.
     // acpi_info is populated by the platform before entry (when
@@ -387,7 +410,7 @@ fn init_platform_impl(mut config: PlatformConfig) -> ! {
 
     drivers::pci::init();
 
-    // ---- 12. Register deferred variable buffer if provided ----
+    // ---- 13. Register deferred variable buffer if provided ----
     if let Some(buf) = config.deferred_buffer {
         use efi::allocator::{MemoryType as AllocMemType, PAGE_SIZE};
         efi::varstore::deferred::configure_buffer_with_size(buf.base, buf.size);
@@ -451,7 +474,7 @@ fn init_platform_impl(mut config: PlatformConfig) -> ! {
         }
     }
 
-    // ---- 13. Register platform block devices ----
+    // ---- 14. Register platform block devices ----
     if !config.block_devices.is_empty() {
         // SAFETY: init_platform() is -> !, so the block device references in
         // config.block_devices live forever.
@@ -460,11 +483,11 @@ fn init_platform_impl(mut config: PlatformConfig) -> ! {
         }
     }
 
-    // ---- 14. Runtime log init ----
+    // ---- 15. Runtime log init ----
     #[cfg(feature = "rt-log")]
     efi::rtlog::init();
 
-    // ---- 15. Variable persistence, Secure Boot, and boot manager ----
+    // ---- 16. Variable persistence, Secure Boot, and boot manager ----
     init_persistence_and_boot();
 }
 

@@ -1,8 +1,9 @@
 //! UEFI Variable Store
 //!
-//! This module provides persistent storage for UEFI variables using SPI flash.
-//! Variables are stored in EDK2-compatible Firmware Volume (FV) format, matching
-//! what coreboot's `get_uint_option()` / `set_uint_option()` expect.
+//! This module provides UEFI variable persistence through the platform-provided
+//! [`crate::platform::VariableBackend`] trait. Platforms may store variables in
+//! EDK2-compatible Firmware Volume (FV) format, SMM/TF-A services, RAM-only test
+//! stores, or any other backend-specific representation.
 //!
 //! # On-Disk Format (EDK2 FV)
 //!
@@ -23,22 +24,24 @@
 //! +--------------------------------------------+
 //! ```
 //!
-//! The persistence layer (persistence.rs) reads and writes this format using
-//! helpers in the edk2 submodule. When a variable is updated, the old record
+//! The optional [`Edk2VarStore`] backend reads and writes this format using
+//! helpers in the `edk2` submodule. When a variable is updated, the old record
 //! is marked as deleted and a new record is appended. When the store is full,
 //! compaction erases the region and rewrites only active variables.
 //!
-//! # Dual-Storage Mode
+//! # Runtime writes
 //!
-//! - **Before ExitBootServices**: Write directly to SPI flash (EDK2 FV format)
-//! - **After ExitBootServices**: SPI is locked; queue to deferred buffer in RAM
-//! - **On Reset**: Deferred buffer is read, changes applied to SPI flash
+//! - **Before ExitBootServices**: Write directly through the configured backend.
+//! - **After ExitBootServices**: Runtime-capable backends are called directly;
+//!   other backends queue changes to the deferred buffer.
+//! - **On Reset**: Deferred records are replayed through the configured backend.
 //!
 //! # Deferred Buffer (in-memory, transient)
 //!
 //! The deferred module uses postcard-serialized `VariableRecord`s in a RAM
-//! buffer. This is an internal format that never touches flash — it bridges
-//! variable writes across warm reboots when SPI is locked.
+//! buffer. This is an internal format that never touches persistent storage —
+//! it bridges variable writes across warm reboots when the backend is not
+//! runtime-capable.
 
 pub mod deferred;
 pub mod edk2;

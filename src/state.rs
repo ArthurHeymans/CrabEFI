@@ -483,11 +483,10 @@ impl VariableEntry {
     }
 }
 
-/// Variable store persistence state
+/// Variable store persistence state.
 ///
-/// Tracks the runtime state of the persistent variable store region.
-/// The actual storage location is determined at runtime from coreboot
-/// tables (SMMSTORE v2) or FMAP (SMMSTORE region).
+/// Tracks runtime metadata for backends that use CrabEFI's EDK2 FV helper.
+/// Generic platform backends may keep their own metadata internally.
 #[derive(Clone, Copy)]
 pub struct VarStoreState {
     /// Whether the store header has been validated/written
@@ -542,7 +541,7 @@ pub struct EfiState {
     /// EFI variables
     pub variables: [VariableEntry; MAX_VARIABLES],
 
-    /// Variable store persistence state (SMMSTORE tracking)
+    /// Variable store persistence state
     pub varstore: VarStoreState,
 
     /// Memory allocator
@@ -609,8 +608,8 @@ impl Default for EfiState {
 // Driver State
 // ============================================================================
 
-use crate::drivers::pci::PciDevice;
 use crate::drivers::pci::access::AnyPciAccess;
+use crate::drivers::pci::PciDevice;
 use crate::drivers::serial::AnySerial;
 use crate::drivers::storage::StorageRegistry;
 use crate::efi::protocols::serial_io::SerialIoMode;
@@ -816,10 +815,10 @@ impl Default for TimingState {
 /// Platform hardware info sourced from coreboot tables or platform config.
 ///
 /// Shared fields (framebuffer, ACPI RSDP) are used by both integration paths.
-/// Coreboot-specific fields (SMMSTORE, SPI flash, FMAP, CBMEM) are only
-/// populated by the coreboot payload's `init()` path and remain `None`/zero
-/// in library mode. They should be gated behind a feature once the SPI
-/// variable persistence code is fully abstracted behind `VariableBackend`.
+/// Coreboot-specific metadata (SMMSTORE, SPI flash, FMAP, CBMEM) is only
+/// populated by the coreboot payload and remains `None`/zero in library mode.
+/// Generic services consume the platform-provided trait objects rather than
+/// probing those coreboot fields directly.
 pub struct PlatformInfo {
     /// Global framebuffer info
     pub framebuffer: Option<FramebufferConfig>,
@@ -838,12 +837,19 @@ pub struct PlatformInfo {
     /// Boot media params (FMAP location, etc.)
     pub boot_media: Option<crate::coreboot::BootMediaInfo>,
 
-    /// Storage backend for variable persistence (SPI flash).
+    /// Platform-provided EFI variable persistence backend.
     ///
-    /// Initialized during boot from detected SPI controller.
-    /// Handles offset translation so reads/writes are relative to
-    /// the variable store region.
-    pub storage: Option<crate::efi::varstore::SpiStorageBackend>,
+    /// Stored as a raw pointer because [`crate::init_platform()`] never
+    /// returns, so the platform-owned backend remains live for the full
+    /// firmware lifetime. Access it through [`with_variable_backend_mut`].
+    pub(crate) variable_backend: Option<*mut dyn crate::platform::VariableBackend>,
+
+    /// Whether the platform variable backend can be called after ExitBootServices.
+    ///
+    /// Cached in runtime-safe firmware state before ExitBootServices so
+    /// non-runtime backends do not need to be dereferenced from runtime
+    /// `SetVariable` calls merely to decide whether to defer writes.
+    pub(crate) variable_backend_runtime_capable: bool,
 
     /// Memory regions (for direct Linux boot)
     pub memory_regions: HeaplessVec<crate::coreboot::memory::MemoryRegion, MAX_MEMORY_REGIONS>,
@@ -863,7 +869,8 @@ impl PlatformInfo {
             smmstorev2: None,
             spi_flash: None,
             boot_media: None,
-            storage: None,
+            variable_backend: None,
+            variable_backend_runtime_capable: false,
             memory_regions: HeaplessVec::new(),
             acpi_rsdp: None,
             cbmem_console_addr: 0,
@@ -1202,15 +1209,52 @@ where
     with_mut(|state| state.efi.block_device.as_mut().map(f))
 }
 
-/// Access the storage backend mutably through a closure.
+/// Store the platform-provided variable backend raw pointer.
 ///
-/// Returns `None` if no storage backend is configured.
+/// # Safety
+///
+/// The pointer must remain valid for the entire firmware lifetime. This is
+/// satisfied by [`crate::init_platform()`], which never returns, when the
+/// backend is borrowed from the caller's non-returning stack frame.
 #[inline]
-pub fn with_storage_mut<F, R>(f: F) -> Option<R>
+pub unsafe fn set_variable_backend_raw(
+    raw: *mut dyn crate::platform::VariableBackend,
+    runtime_capable: bool,
+) {
+    with_mut(|state| {
+        state.drivers.platform.variable_backend = Some(raw);
+        state.drivers.platform.variable_backend_runtime_capable = runtime_capable;
+    });
+}
+
+/// Check whether the platform-provided variable backend is runtime-capable.
+#[inline]
+pub fn variable_backend_runtime_capable() -> bool {
+    try_get().is_some_and(|state| state.drivers.platform.variable_backend_runtime_capable)
+}
+
+/// Check whether a platform-provided variable backend is configured.
+#[inline]
+pub fn has_variable_backend() -> bool {
+    try_get().is_some_and(|state| state.drivers.platform.variable_backend.is_some())
+}
+
+/// Access the platform-provided variable backend mutably through a closure.
+///
+/// Returns `None` if no platform backend is configured. This intentionally
+/// fetches the raw pointer first and calls the closure after the immutable
+/// state borrow ends, so backend methods may update [`FirmwareState`] through
+/// the normal state helpers without tripping the re-entrancy guard.
+#[inline]
+pub fn with_variable_backend_mut<F, R>(f: F) -> Option<R>
 where
-    F: FnOnce(&mut crate::efi::varstore::SpiStorageBackend) -> R,
+    F: FnOnce(&mut dyn crate::platform::VariableBackend) -> R,
 {
-    with_mut(|state| state.drivers.platform.storage.as_mut().map(f))
+    let raw = try_get().and_then(|state| state.drivers.platform.variable_backend)?;
+    // SAFETY: `set_variable_backend_raw` documents the lifetime requirement.
+    // Firmware execution is single-threaded, so this mutable borrow is unique
+    // for the duration of the closure.
+    Some(unsafe { f(&mut *raw) })
 }
 
 /// Get a reference to the varstore state.

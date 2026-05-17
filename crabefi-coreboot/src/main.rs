@@ -79,6 +79,172 @@ impl crabefi::ResetHandler for CorebootReset {
     }
 }
 
+/// Coreboot variable backend backed by the SPI flash SMMSTORE region.
+///
+/// This keeps coreboot-specific discovery (SMMSTORE v2 records, FMAP probing,
+/// and chipset SPI controller detection) in the coreboot integration crate.
+/// The CrabEFI library only sees the generic [`crabefi::VariableBackend`]
+/// trait object.
+struct CorebootVariableBackend {
+    storage: Option<crabefi::efi::varstore::SpiStorageBackend>,
+    unavailable: bool,
+}
+
+impl CorebootVariableBackend {
+    const fn new() -> Self {
+        Self {
+            storage: None,
+            unavailable: false,
+        }
+    }
+
+    fn ensure_storage(
+        &mut self,
+    ) -> Result<&mut crabefi::efi::varstore::SpiStorageBackend, crabefi::VarBackendError> {
+        if self.storage.is_none() && !self.unavailable {
+            self.storage = self.detect_storage();
+            self.unavailable = self.storage.is_none();
+        }
+
+        self.storage
+            .as_mut()
+            .ok_or(crabefi::VarBackendError::NotAvailable)
+    }
+
+    fn detect_storage(&mut self) -> Option<crabefi::efi::varstore::SpiStorageBackend> {
+        use crabefi::drivers::spi::SpiController;
+
+        let controller = crabefi::drivers::spi::detect_and_init()?;
+        log::info!("Storage backend: {}", controller.name());
+
+        let mut storage = crabefi::efi::varstore::SpiStorageBackend::new(controller, 0, 0);
+        if self.configure_from_smmstorev2(&mut storage) || self.configure_from_fmap(&mut storage) {
+            Some(storage)
+        } else {
+            log::warn!(
+                "No SMMSTORE region found in coreboot tables or FMAP - variable persistence disabled"
+            );
+            None
+        }
+    }
+
+    fn configure_from_smmstorev2(
+        &self,
+        storage: &mut crabefi::efi::varstore::SpiStorageBackend,
+    ) -> bool {
+        let Some(smmstore_info) = crabefi::coreboot::get_smmstorev2() else {
+            log::debug!("No SMMSTORE v2 record in coreboot tables");
+            return false;
+        };
+
+        log::info!(
+            "Found SMMSTORE v2 in coreboot tables: {} blocks x {} KB at {:#x}",
+            smmstore_info.num_blocks,
+            smmstore_info.block_size / 1024,
+            smmstore_info.mmap_addr
+        );
+
+        let base = calculate_spi_offset(smmstore_info.mmap_addr, storage.get_bios_region());
+        let size = smmstore_info.num_blocks * smmstore_info.block_size;
+        storage.set_base_offset(base);
+        storage.set_storage_size(size);
+
+        log::info!(
+            "Variable store configured: base={:#x}, size={} KB",
+            base,
+            size / 1024
+        );
+        true
+    }
+
+    fn configure_from_fmap(&self, storage: &mut crabefi::efi::varstore::SpiStorageBackend) -> bool {
+        log::info!("Looking for variable store region in FMAP...");
+        let Some(region) =
+            crabefi::coreboot::fmap::get_smmstore_from_fmap(storage.controller_mut())
+        else {
+            log::debug!("Variable store region not found in FMAP");
+            return false;
+        };
+
+        storage.set_base_offset(region.offset);
+        storage.set_storage_size(region.size);
+        log::info!(
+            "Found '{}' in FMAP: offset={:#x}, size={} KB",
+            region.name.as_str(),
+            region.offset,
+            region.size / 1024
+        );
+        true
+    }
+
+    fn with_edk2_store<R>(
+        &mut self,
+        f: impl FnOnce(
+            &mut crabefi::efi::varstore::Edk2VarStore<'_>,
+        ) -> Result<R, crabefi::VarBackendError>,
+    ) -> Result<R, crabefi::VarBackendError> {
+        let storage = self.ensure_storage()?;
+        let mut store = crabefi::efi::varstore::Edk2VarStore::new(storage);
+        f(&mut store)
+    }
+}
+
+impl crabefi::VariableBackend for CorebootVariableBackend {
+    fn load(
+        &mut self,
+        visitor: &mut dyn crabefi::VariableVisitor,
+    ) -> Result<(), crabefi::VarBackendError> {
+        self.with_edk2_store(|store| store.load(visitor))
+    }
+
+    fn write(
+        &mut self,
+        name: &[u16],
+        vendor: &r_efi::efi::Guid,
+        attributes: u32,
+        data: &[u8],
+    ) -> Result<(), crabefi::VarBackendError> {
+        self.with_edk2_store(|store| store.write(name, vendor, attributes, data))
+    }
+
+    fn delete(
+        &mut self,
+        name: &[u16],
+        vendor: &r_efi::efi::Guid,
+    ) -> Result<(), crabefi::VarBackendError> {
+        self.with_edk2_store(|store| store.delete(name, vendor))
+    }
+
+    fn runtime_capable(&self) -> bool {
+        false
+    }
+
+    fn notify_exit_boot_services(&mut self) {
+        log::debug!("CorebootVariableBackend: ExitBootServices");
+    }
+}
+
+fn calculate_spi_offset(mmap_addr: u64, bios_region: Option<(u32, u32)>) -> u32 {
+    if let Some((bios_base, bios_limit)) = bios_region {
+        let bios_size = (bios_limit - bios_base + 1) as u64;
+        let mmap_base = 0x1_0000_0000u64 - bios_size;
+
+        if mmap_addr >= mmap_base && mmap_addr < 0x1_0000_0000u64 {
+            return bios_base + (mmap_addr - mmap_base) as u32;
+        }
+    }
+
+    if mmap_addr >= 0xFF00_0000 {
+        (mmap_addr - 0xFF00_0000) as u32
+    } else if mmap_addr >= 0xFE00_0000 {
+        (mmap_addr - 0xFE00_0000) as u32
+    } else if mmap_addr >= 0xFC00_0000 {
+        (mmap_addr - 0xFC00_0000) as u32
+    } else {
+        mmap_addr as u32
+    }
+}
+
 // ============================================================================
 // Memory map conversion
 // ============================================================================
@@ -522,6 +688,7 @@ pub extern "C" fn rust_main(coreboot_table_ptr: u64) -> ! {
     };
 
     let reset = CorebootReset;
+    let mut coreboot_variable_backend = CorebootVariableBackend::new();
 
     // Extract FDT bytes slice.
     //
@@ -552,7 +719,7 @@ pub extern "C" fn rust_main(coreboot_table_ptr: u64) -> ! {
         timer: &timer,
         reset: &reset,
         block_devices: &mut [],
-        variable_backend: None,
+        variable_backend: Some(&mut coreboot_variable_backend),
         debug_output: None, // Already set up via init_from_coreboot()
         console_input: None,
         framebuffer: cb_info.framebuffer.map(crabefi::FramebufferConfig::from),

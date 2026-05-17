@@ -275,6 +275,11 @@ fn buffer_size() -> usize {
     deferred_buffer_size()
 }
 
+/// Check whether a deferred buffer is configured and large enough for a header.
+fn buffer_available(base: *mut u8, size: usize) -> bool {
+    !base.is_null() && size >= HEADER_SIZE
+}
+
 /// Initialize the deferred buffer
 ///
 /// This clears any existing data and writes a fresh header.
@@ -284,7 +289,7 @@ pub fn init_buffer() {
 
     // No deferred buffer configured (library mode without platform-entry
     // and no explicit deferred_buffer in PlatformConfig).
-    if base.is_null() || size == 0 {
+    if !buffer_available(base, size) {
         log::debug!("No deferred variable buffer — skipping init");
         return;
     }
@@ -311,6 +316,10 @@ pub fn init_buffer() {
 /// Returns the number of pending entries, or 0 if none/invalid.
 pub fn check_pending() -> usize {
     let base = buffer_base();
+    let size = buffer_size();
+    if !buffer_available(base, size) {
+        return 0;
+    }
 
     // Read header
     let header = unsafe { core::ptr::read(base as *const DeferredHeader) };
@@ -326,7 +335,7 @@ pub fn check_pending() -> usize {
 
     // Verify data size is within buffer bounds
     let total_size = header.total_size as usize;
-    if HEADER_SIZE.saturating_add(total_size) > buffer_size() {
+    if HEADER_SIZE.saturating_add(total_size) > size {
         log::warn!(
             "Deferred buffer header total_size ({}) exceeds buffer bounds",
             total_size
@@ -436,13 +445,16 @@ pub fn process_pending() -> Result<usize, VarStoreError> {
                 let guid = record.guid.to_guid();
 
                 if is_deletion {
-                    // Delete from storage
+                    // Delete from the configured variable backend.
                     if let Err(e) =
-                        super::persistence::write_variable_deletion_internal(&guid, &record.name)
+                        super::persistence::delete_variable(&guid, record.name.as_slice())
                     {
                         log::warn!("Failed to apply deferred variable deletion: {:?}", e);
                     } else {
-                        super::persistence::delete_variable_from_memory(&guid, &record.name);
+                        super::persistence::delete_variable_from_memory(
+                            &guid,
+                            record.name.as_slice(),
+                        );
                         processed += 1;
                     }
                 } else if record.is_active() {
@@ -452,10 +464,10 @@ pub fn process_pending() -> Result<usize, VarStoreError> {
                         // The timestamp was extracted and stored in record.timestamp when queued
                         // Verify it against current key databases before writing to NVS
                         match auth::verify_authenticated_variable(
-                            &record.name,
+                            record.name.as_slice(),
                             &guid,
                             record.attributes,
-                            &record.data,
+                            record.data.as_slice(),
                         ) {
                             Ok(verified_data) => {
                                 log::info!("Deferred authenticated variable verified successfully");
@@ -476,22 +488,22 @@ pub fn process_pending() -> Result<usize, VarStoreError> {
                         (record.data.clone(), None)
                     };
 
-                    // Write to storage (with timestamp for authenticated variables)
+                    // Write to the configured variable backend (with timestamp
+                    // preserved while the record is queued for authenticated variables).
                     let write_result = if let Some(ref timestamp) = timestamp_to_use {
-                        // Use persist_variable_with_timestamp to preserve the timestamp
                         super::persistence::persist_variable_with_timestamp(
                             &guid,
-                            &record.name,
+                            record.name.as_slice(),
                             record.attributes,
-                            &actual_data,
+                            actual_data.as_slice(),
                             *timestamp,
                         )
                     } else {
-                        super::persistence::write_variable_to_storage_internal(
+                        super::persistence::persist_variable(
                             &guid,
-                            &record.name,
+                            record.name.as_slice(),
                             record.attributes,
-                            &actual_data,
+                            actual_data.as_slice(),
                         )
                     };
 
@@ -501,9 +513,9 @@ pub fn process_pending() -> Result<usize, VarStoreError> {
                         // Also update in-memory (timestamp is handled by persist functions)
                         super::persistence::update_variable_in_memory(
                             &guid,
-                            &record.name,
+                            record.name.as_slice(),
                             record.attributes,
-                            &actual_data,
+                            actual_data.as_slice(),
                         );
                         processed += 1;
                     }
@@ -592,6 +604,11 @@ pub fn queue_deletion(guid: &r_efi::efi::Guid, name: &[u16]) -> Result<(), VarSt
 /// Queue a variable record with flags
 fn queue_record_with_flags(record: &VariableRecord, flags: u8) -> Result<(), VarStoreError> {
     let base = buffer_base();
+    let size = buffer_size();
+    if !buffer_available(base, size) {
+        log::debug!("No deferred variable buffer configured");
+        return Err(VarStoreError::NotInitialized);
+    }
 
     // Serialize the record
     let record_bytes = record.serialize()?;
@@ -633,7 +650,7 @@ fn queue_record_with_flags(record: &VariableRecord, flags: u8) -> Result<(), Var
         }
     };
 
-    if required_space > buffer_size() {
+    if required_space > size {
         log::warn!("Deferred buffer full");
         return Err(VarStoreError::StoreFull);
     }
@@ -697,14 +714,19 @@ pub fn is_initialized() -> bool {
 /// Get statistics about the deferred buffer
 pub fn get_stats() -> (usize, usize, usize) {
     let base = buffer_base();
+    let size = buffer_size();
+    if !buffer_available(base, size) {
+        return (0, 0, 0);
+    }
+
     let header = unsafe { core::ptr::read(base as *const DeferredHeader) };
 
     if !header.is_valid() {
-        return (0, 0, buffer_size() - HEADER_SIZE);
+        return (0, 0, size - HEADER_SIZE);
     }
 
     let used = header.total_size as usize;
-    let free = buffer_size() - HEADER_SIZE - used;
+    let free = size.saturating_sub(HEADER_SIZE).saturating_sub(used);
 
     (header.entry_count as usize, used, free)
 }

@@ -1517,9 +1517,12 @@ extern "efiapi" fn exit_boot_services(image_handle: Handle, map_key: usize) -> S
     if status == Status::SUCCESS {
         log::info!("ExitBootServices SUCCESS - transitioning to OS");
 
-        // Mark that ExitBootServices has been called
-        // After this, SPI flash is locked and variable writes go to ESP file
+        // Mark that ExitBootServices has been called. Non-runtime-capable
+        // variable backends will defer later writes to the warm-reboot buffer.
         crate::state::set_exit_boot_services_called();
+        let _ = crate::state::with_variable_backend_mut(|backend| {
+            backend.notify_exit_boot_services();
+        });
 
         // Clean up hardware state for OS handoff
         // Re-enable keyboard interrupts so Linux's i8042 driver works
