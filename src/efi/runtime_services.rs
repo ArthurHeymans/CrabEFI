@@ -255,6 +255,79 @@ static mut VIRTUAL_MAP_ENTRY_COUNT: usize = 0;
 /// The actual write is a one-shot during SetVirtualAddressMap.
 static VIRTUAL_MODE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
+fn clear_virtual_map_globals() {
+    unsafe {
+        VIRTUAL_MAP_PTR = core::ptr::null();
+        VIRTUAL_MAP_DESCRIPTOR_SIZE = 0;
+        VIRTUAL_MAP_ENTRY_COUNT = 0;
+    }
+}
+
+fn relocate_configured_deferred_buffer() -> Status {
+    let mut deferred_ptr = crate::efi::varstore::deferred::deferred_buffer_base() as *mut c_void;
+    if deferred_ptr.is_null() {
+        return Status::SUCCESS;
+    }
+
+    let status = convert_pointer_internal(0, &mut deferred_ptr);
+    if status != Status::SUCCESS {
+        log::error!(
+            "SetVirtualAddressMap: deferred buffer at {:p} is not in a runtime mapping",
+            deferred_ptr
+        );
+        return status;
+    }
+
+    crate::efi::varstore::deferred::relocate_buffer_base(deferred_ptr as u64);
+    Status::SUCCESS
+}
+
+fn relocate_runtime_variable_backend() -> Status {
+    if !state::variable_backend_runtime_capable() {
+        return Status::SUCCESS;
+    }
+
+    let Some(raw) = state::variable_backend_raw() else {
+        return Status::SUCCESS;
+    };
+
+    // SAFETY: A trait object raw pointer is represented as (data pointer,
+    // vtable pointer). We convert each component through the EFI virtual map
+    // and rebuild the same trait object with virtual addresses.
+    let (mut data, mut vtable): (*mut c_void, *mut c_void) = unsafe { core::mem::transmute(raw) };
+
+    let status = convert_pointer_internal(0, &mut data);
+    if status != Status::SUCCESS {
+        log::error!(
+            "SetVirtualAddressMap: variable backend object at {:p} is not in a runtime mapping",
+            data
+        );
+        return status;
+    }
+
+    let status = convert_pointer_internal(0, &mut vtable);
+    if status != Status::SUCCESS {
+        log::error!(
+            "SetVirtualAddressMap: variable backend vtable at {:p} is not in a runtime mapping",
+            vtable
+        );
+        return status;
+    }
+
+    // SAFETY: `data` and `vtable` are the converted components of the same
+    // trait object pointer obtained above.
+    let relocated = unsafe {
+        core::mem::transmute::<(*mut c_void, *mut c_void), *mut dyn crate::platform::VariableBackend>(
+            (data, vtable),
+        )
+    };
+    unsafe {
+        state::replace_variable_backend_raw(relocated);
+    }
+
+    Status::SUCCESS
+}
+
 extern "efiapi" fn set_virtual_address_map(
     memory_map_size: usize,
     descriptor_size: usize,
@@ -301,17 +374,32 @@ extern "efiapi" fn set_virtual_address_map(
     // and would page-fault after the OS switches to virtual addressing.
     crate::coreboot::cbmem_console::disable();
 
-    // Step 1: Commit to virtual mode
-    VIRTUAL_MODE.store(true, core::sync::atomic::Ordering::Release);
-
-    // Step 2: Set up globals so ConvertPointer can access the virtual map
+    // Step 1: Set up globals so ConvertPointer can access the virtual map.
     unsafe {
         VIRTUAL_MAP_PTR = virtual_map as *const u8;
         VIRTUAL_MAP_DESCRIPTOR_SIZE = descriptor_size;
         VIRTUAL_MAP_ENTRY_COUNT = num_entries;
     }
 
-    // Step 3: Signal EVT_SIGNAL_VIRTUAL_ADDRESS_CHANGE events
+    // Step 2: Relocate runtime-private raw pointers before committing to
+    // virtual mode. If a configured runtime pointer is not covered by an EFI
+    // runtime mapping, fail SVAM instead of leaving a stale physical pointer
+    // that a later runtime service could dereference.
+    let status = relocate_configured_deferred_buffer();
+    if status != Status::SUCCESS {
+        clear_virtual_map_globals();
+        return status;
+    }
+    let status = relocate_runtime_variable_backend();
+    if status != Status::SUCCESS {
+        clear_virtual_map_globals();
+        return status;
+    }
+
+    // Step 3: Commit to virtual mode.
+    VIRTUAL_MODE.store(true, core::sync::atomic::Ordering::Release);
+
+    // Step 4: Signal EVT_SIGNAL_VIRTUAL_ADDRESS_CHANGE events
     {
         use crate::efi::boot_services::{
             EVT_SIGNAL_VIRTUAL_ADDRESS_CHANGE, signal_event_group_for_runtime,
@@ -529,11 +617,7 @@ extern "efiapi" fn set_virtual_address_map(
     }
 
     // Step 7: Clear virtual map globals
-    unsafe {
-        VIRTUAL_MAP_PTR = core::ptr::null();
-        VIRTUAL_MAP_DESCRIPTOR_SIZE = 0;
-        VIRTUAL_MAP_ENTRY_COUNT = 0;
-    }
+    clear_virtual_map_globals();
 
     log::info!("SetVirtualAddressMap: complete, disabling log crate for virtual mode");
 

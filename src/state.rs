@@ -608,8 +608,8 @@ impl Default for EfiState {
 // Driver State
 // ============================================================================
 
-use crate::drivers::pci::access::AnyPciAccess;
 use crate::drivers::pci::PciDevice;
+use crate::drivers::pci::access::AnyPciAccess;
 use crate::drivers::serial::AnySerial;
 use crate::drivers::storage::StorageRegistry;
 use crate::efi::protocols::serial_io::SerialIoMode;
@@ -1237,6 +1237,25 @@ pub fn variable_backend_runtime_capable() -> bool {
 #[inline]
 pub fn has_variable_backend() -> bool {
     try_get().is_some_and(|state| state.drivers.platform.variable_backend.is_some())
+}
+
+/// Get the raw platform variable backend trait object pointer.
+#[inline]
+pub fn variable_backend_raw() -> Option<*mut dyn crate::platform::VariableBackend> {
+    try_get().and_then(|state| state.drivers.platform.variable_backend)
+}
+
+/// Replace the raw platform variable backend trait object pointer.
+///
+/// # Safety
+///
+/// `raw` must point to the same backend object as the pointer originally passed
+/// to [`set_variable_backend_raw`], adjusted for the current address mode.
+#[inline]
+pub unsafe fn replace_variable_backend_raw(raw: *mut dyn crate::platform::VariableBackend) {
+    with_mut(|state| {
+        state.drivers.platform.variable_backend = Some(raw);
+    });
 }
 
 /// Access the platform-provided variable backend mutably through a closure.
