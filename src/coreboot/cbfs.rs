@@ -183,6 +183,7 @@ fn discover_payloads_mmap(_out: &mut Vec<CbfsPayloadEntry, MAX_CBFS_FILES>) -> b
     false
 }
 
+#[cfg(target_arch = "x86_64")]
 fn discover_payloads_in_slice(
     cbfs: &[u8],
     base_flash_offset: u32,
