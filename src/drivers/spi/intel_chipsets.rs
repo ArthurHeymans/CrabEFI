@@ -123,12 +123,13 @@ impl IchChipset {
         self >= Self::SPI_ENGINE_PCH100
     }
 
-    /// Returns true if this chipset supports hardware sequencing (hwseq)
+    /// Returns true if this driver supports hardware sequencing (hwseq).
     ///
-    /// Hardware sequencing was introduced with ICH8. ICH7 only supports
-    /// software sequencing.
+    /// ICH8 has an ICH9-like hardware sequencing engine, but the flash
+    /// partition boundary register is undocumented, so this driver keeps ICH8
+    /// on software sequencing.
     pub fn supports_hwseq(self) -> bool {
-        self >= Self::SPI_ENGINE_ICH9
+        self >= Self::Ich9
     }
 }
 
