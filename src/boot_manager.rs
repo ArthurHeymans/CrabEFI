@@ -330,7 +330,7 @@ fn try_boot_file_on_ahci(file_path: &str) -> bool {
 
 /// Try to boot a file from USB ESPs
 fn try_boot_file_on_usb(file_path: &str) -> bool {
-    use crate::drivers::usb::{self, mass_storage, UsbMassStorage};
+    use crate::drivers::usb::{self, UsbMassStorage, mass_storage};
 
     let Some((controller_id, device_addr)) = usb::find_mass_storage() else {
         return false;
