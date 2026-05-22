@@ -178,7 +178,7 @@ impl PciDevice {
     /// Get the MMIO base address for the device (typically BAR0)
     pub fn mmio_base(&self) -> Option<u64> {
         for bar in &self.bars {
-            if matches!(bar.bar_type, BarType::Memory32 | BarType::Memory64) {
+            if matches!(bar.bar_type, BarType::Memory32 | BarType::Memory64) && bar.address != 0 {
                 return Some(bar.address);
             }
         }
@@ -190,7 +190,7 @@ impl PciDevice {
     /// This is used by controllers like UHCI that use I/O ports instead of MMIO.
     pub fn io_base(&self) -> Option<u64> {
         for bar in &self.bars {
-            if bar.bar_type == BarType::Io {
+            if bar.bar_type == BarType::Io && bar.address != 0 {
                 return Some(bar.address);
             }
         }
@@ -218,77 +218,46 @@ fn get_device_ids(access: &AnyPciAccess, addr: PciAddress) -> (u16, u16) {
     ((data & 0xFFFF) as u16, (data >> 16) as u16)
 }
 
-/// Probe a single BAR and return its type, address, and size
-fn probe_bar(access: &AnyPciAccess, addr: PciAddress, bar_index: usize) -> PciBar {
+/// Read a BAR without sizing it.
+///
+/// CrabEFI is commonly launched by firmware that has already enumerated PCI and
+/// programmed BARs.  Re-sizing with the classic all-ones write is not harmless
+/// on real chipsets: some integrated functions and bridges react badly to BAR
+/// probe writes after firmware setup.  Treat PCI resources as firmware-owned and
+/// just record the bases that are already programmed.
+fn read_bar(access: &AnyPciAccess, addr: PciAddress, bar_index: usize) -> PciBar {
     let bar_offset = (0x10 + bar_index * 4) as u16;
     let original = access.read32(addr, bar_offset);
 
-    // Empty BAR
-    if original == 0 {
+    if original == 0 || original == 0xFFFF_FFFF {
         return PciBar::default();
     }
 
-    // Check if it's I/O or memory
     if original & 1 == 1 {
-        // I/O BAR
-        access.write32(addr, bar_offset, 0xFFFFFFFF);
-        let sized = access.read32(addr, bar_offset);
-        access.write32(addr, bar_offset, original);
-
-        let io_mask = sized | 0x3;
-        let size = (!io_mask).wrapping_add(1) as u64;
-
         return PciBar {
             bar_type: BarType::Io,
             address: (original & 0xFFFFFFFC) as u64,
-            size,
+            size: 0,
             prefetchable: false,
         };
     }
 
-    // Memory BAR - check type (bits 2:1)
     let mem_type = (original >> 1) & 0x3;
     let prefetchable = (original & 0x8) != 0;
-
     match mem_type {
-        0 => {
-            // 32-bit memory
-            access.write32(addr, bar_offset, 0xFFFFFFFF);
-            let sized = access.read32(addr, bar_offset);
-            access.write32(addr, bar_offset, original);
-
-            let mem_mask = sized | 0xF;
-            let size = (!mem_mask).wrapping_add(1) as u64;
-
-            PciBar {
-                bar_type: BarType::Memory32,
-                address: (original & 0xFFFFFFF0) as u64,
-                size,
-                prefetchable,
-            }
-        }
+        0 => PciBar {
+            bar_type: BarType::Memory32,
+            address: (original & 0xFFFFFFF0) as u64,
+            size: 0,
+            prefetchable,
+        },
         2 => {
-            // 64-bit memory (consumes two BARs)
-            let bar_offset_hi = bar_offset + 4;
-            let original_hi = access.read32(addr, bar_offset_hi);
-
-            access.write32(addr, bar_offset, 0xFFFFFFFF);
-            access.write32(addr, bar_offset_hi, 0xFFFFFFFF);
-            let sized_lo = access.read32(addr, bar_offset);
-            let sized_hi = access.read32(addr, bar_offset_hi);
-            access.write32(addr, bar_offset, original);
-            access.write32(addr, bar_offset_hi, original_hi);
-
-            let sized = ((sized_hi as u64) << 32) | (sized_lo as u64);
-            let mem_mask = sized | 0xF;
-            let size = (!mem_mask).wrapping_add(1);
-
+            let original_hi = access.read32(addr, bar_offset + 4);
             let address = ((original_hi as u64) << 32) | ((original & 0xFFFFFFF0) as u64);
-
             PciBar {
                 bar_type: BarType::Memory64,
                 address,
-                size,
+                size: 0,
                 prefetchable,
             }
         }
@@ -329,7 +298,7 @@ fn scan_device(access: &AnyPciAccess, bus: u8, device: u8, function: u8) -> Opti
     if (dev.header_type & 0x7F) == HEADER_TYPE_NORMAL {
         let mut bar_index = 0;
         while bar_index < 6 {
-            let bar = probe_bar(access, addr, bar_index);
+            let bar = read_bar(access, addr, bar_index);
             dev.bars[bar_index] = bar;
 
             // 64-bit BARs consume two slots
@@ -555,7 +524,7 @@ pub fn print_devices() {
         );
 
         for (i, bar) in dev.bars.iter().enumerate() {
-            if bar.bar_type != BarType::Unused {
+            if bar.bar_type != BarType::Unused && bar.address != 0 {
                 log::info!(
                     "    BAR{}: {:?} addr={:#x} size={:#x} pf={}",
                     i,
