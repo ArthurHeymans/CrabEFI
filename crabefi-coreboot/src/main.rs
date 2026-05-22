@@ -144,8 +144,31 @@ impl CorebootVariableBackend {
             smmstore_info.mmap_addr
         );
 
+        if smmstore_info.mmap_addr == 0
+            || smmstore_info.num_blocks == 0
+            || smmstore_info.block_size == 0
+        {
+            log::warn!("Ignoring invalid SMMSTORE v2 record; falling back to FMAP");
+            return false;
+        }
+
+        let Some(size) = smmstore_info
+            .num_blocks
+            .checked_mul(smmstore_info.block_size)
+        else {
+            log::warn!("Ignoring overflowing SMMSTORE v2 size; falling back to FMAP");
+            return false;
+        };
         let base = calculate_spi_offset(smmstore_info.mmap_addr, storage.get_bios_region());
-        let size = smmstore_info.num_blocks * smmstore_info.block_size;
+        if base == 0 {
+            log::warn!("Ignoring SMMSTORE v2 record at flash offset 0; falling back to FMAP");
+            return false;
+        }
+        if base.checked_add(size).is_none() {
+            log::warn!("Ignoring overflowing SMMSTORE v2 flash range; falling back to FMAP");
+            return false;
+        }
+
         storage.set_base_offset(base);
         storage.set_storage_size(size);
 

@@ -115,6 +115,7 @@ pub fn display_secure_boot_error() {
 /// two entry points.
 fn init_persistence_and_boot() -> ! {
     // ---- Variable persistence ----
+    let mut clear_deferred_buffer = false;
     match efi::varstore::init_persistence() {
         Ok(()) => {
             log::info!("Variable store persistence initialized");
@@ -126,9 +127,14 @@ fn init_persistence_and_boot() -> ! {
                     pending_count
                 );
                 match efi::varstore::process_deferred_pending() {
-                    Ok(n) => log::info!("Applied {} deferred variable writes", n),
+                    Ok(n) => {
+                        log::info!("Applied {} deferred variable writes", n);
+                        clear_deferred_buffer = true;
+                    }
                     Err(e) => log::warn!("Failed to process deferred writes: {:?}", e),
                 }
+            } else {
+                clear_deferred_buffer = true;
             }
 
             match efi::auth::boot::init_secure_boot_default() {
@@ -142,10 +148,19 @@ fn init_persistence_and_boot() -> ! {
                 Err(e) => log::warn!("Secure Boot init failed: {:?}", e),
             }
         }
-        Err(e) => log::info!("Variable persistence not available: {:?}", e),
+        Err(e) => {
+            log::info!("Variable persistence not available: {:?}", e);
+            if efi::varstore::check_deferred_pending() == 0 {
+                clear_deferred_buffer = true;
+            } else {
+                log::warn!("Preserving pending deferred variable writes");
+            }
+        }
     }
 
-    efi::varstore::init_deferred_buffer();
+    if clear_deferred_buffer {
+        efi::varstore::init_deferred_buffer();
+    }
 
     // ---- Boot manager ----
     let boot_var_state = boot_vars::read_boot_var_state();
@@ -234,7 +249,11 @@ fn init_platform_impl(mut config: PlatformConfig) -> ! {
     // during shim/GRUB execution would vector to address 0x0 (fstart's
     // _start), causing silent infinite loops instead of a diagnostic halt.
     //
-    // On x86_64: install the IDT for exception handling.
+    // On x86_64 library integrations, the calling firmware owns the CPU
+    // descriptor tables.  fstart's ramstage entry already runs on the
+    // linker-defined stack and installs the stage IDT before calling CrabEFI;
+    // do not replace it here.  That keeps exception handling, GDT/segments,
+    // and any IST/TSS policy under the stage's control.
     //
     // On riscv64 with platform-entry: stvec is set by entry assembly.
     // On riscv64 without platform-entry (library mode): the calling
@@ -245,8 +264,6 @@ fn init_platform_impl(mut config: PlatformConfig) -> ! {
     unsafe {
         arch::aarch64::exceptions::install_exception_vectors_auto();
     }
-    #[cfg(target_arch = "x86_64")]
-    arch::x86_64::idt::init();
     #[cfg(target_arch = "riscv64")]
     arch::riscv64::trap::install_trap_vectors();
 

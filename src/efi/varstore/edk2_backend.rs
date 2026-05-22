@@ -40,6 +40,13 @@ fn guid_bytes_to_efi(bytes: &[u8; 16]) -> Guid {
     )
 }
 
+struct ActiveVar {
+    guid: [u8; 16],
+    name: Vec<u16>,
+    attributes: u32,
+    data: Vec<u8>,
+}
+
 /// EDK2 Firmware Volume format variable store.
 ///
 /// Wraps a [`StorageBackend`] (e.g., SPI flash) and implements the
@@ -133,19 +140,20 @@ impl<'a> Edk2VarStore<'a> {
         Ok(())
     }
 
-    /// Compact the store by rewriting the latest active copy of each variable.
-    fn compact(&mut self) -> Result<(), VarBackendError> {
-        struct ActiveVar {
-            guid: [u8; 16],
-            name: Vec<u16>,
-            attributes: u32,
-            data: Vec<u8>,
-        }
-
+    /// Return the latest active variables, optionally excluding one variable.
+    fn active_variables_excluding(
+        &mut self,
+        exclude: Option<(&[u8; 16], &[u16])>,
+    ) -> Vec<ActiveVar> {
         let vars = self.walk_variables();
         let mut active: Vec<ActiveVar> = Vec::new();
         for var in vars {
             if !edk2::is_var_added(var.state) {
+                continue;
+            }
+            if exclude.is_some_and(|(guid, name)| {
+                var.guid == *guid && edk2::name_matches(&var.name, name)
+            }) {
                 continue;
             }
             active.retain(|existing| {
@@ -158,8 +166,39 @@ impl<'a> Edk2VarStore<'a> {
                 data: var.data,
             });
         }
+        active
+    }
 
+    fn record_len(
+        guid: &[u8; 16],
+        name: &[u16],
+        attributes: u32,
+        data: &[u8],
+    ) -> Result<u32, VarBackendError> {
+        let len = edk2::build_variable_record(guid, name, attributes, data).len();
+        if len > u32::MAX as usize {
+            return Err(VarBackendError::DataTooLarge);
+        }
+        Ok(len as u32)
+    }
+
+    fn compacted_end(active: &[ActiveVar]) -> Result<u32, VarBackendError> {
+        let mut offset = edk2::VARIABLE_DATA_OFFSET;
+        for var in active {
+            let len = Self::record_len(&var.guid, &var.name, var.attributes, &var.data)?;
+            offset = offset.checked_add(len).ok_or(VarBackendError::StoreFull)?;
+        }
+        Ok(offset)
+    }
+
+    /// Compact the store by rewriting the provided active variables.
+    fn compact_active(&mut self, active: Vec<ActiveVar>) -> Result<(), VarBackendError> {
         let storage_size = self.storage.size();
+        let final_offset = Self::compacted_end(&active)?;
+        if final_offset > storage_size {
+            return Err(VarBackendError::StoreFull);
+        }
+
         let fv_headers = edk2::build_fv_headers(storage_size);
         let _ = self.storage.enable_writes();
         self.storage
@@ -171,7 +210,7 @@ impl<'a> Edk2VarStore<'a> {
 
         self.auth_format = false;
         self.data_size = storage_size - (edk2::FV_HEADER_LENGTH + edk2::VS_HEADER_LENGTH) as u32;
-        self.write_offset = (edk2::FV_HEADER_LENGTH + edk2::VS_HEADER_LENGTH) as u32;
+        self.write_offset = edk2::VARIABLE_DATA_OFFSET;
 
         for var in active {
             let storage = &mut self.storage;
@@ -202,16 +241,36 @@ impl<'a> Edk2VarStore<'a> {
         self.ensure_initialized()?;
 
         let guid_bytes = edk2::guid_to_bytes(vendor);
-        self.delete_existing_record(&guid_bytes, name)?;
-
-        let record_len =
-            edk2::build_variable_record(&guid_bytes, name, attributes, data).len() as u32;
-        if self.write_offset + record_len > self.storage.size() {
-            log::info!("Variable store full, compacting");
-            self.compact()?;
-        }
-        if self.write_offset + record_len > self.storage.size() {
+        let record_len = Self::record_len(&guid_bytes, name, attributes, data)?;
+        let storage_size = self.storage.size();
+        let data_capacity = storage_size
+            .checked_sub(edk2::VARIABLE_DATA_OFFSET)
+            .ok_or(VarBackendError::StoreFull)?;
+        if record_len > data_capacity {
             return Err(VarBackendError::StoreFull);
+        }
+
+        // Preflight the compacted layout before deleting the existing record or
+        // erasing flash. If the replacement cannot fit even after compaction,
+        // leave the current store untouched.
+        let compacted_active = self.active_variables_excluding(Some((&guid_bytes, name)));
+        let compacted_end = Self::compacted_end(&compacted_active)?;
+        if compacted_end
+            .checked_add(record_len)
+            .is_none_or(|end| end > storage_size)
+        {
+            return Err(VarBackendError::StoreFull);
+        }
+
+        if self
+            .write_offset
+            .checked_add(record_len)
+            .is_some_and(|end| end <= storage_size)
+        {
+            self.delete_existing_record(&guid_bytes, name)?;
+        } else {
+            log::info!("Variable store full, compacting");
+            self.compact_active(compacted_active)?;
         }
 
         let _ = self.storage.enable_writes();

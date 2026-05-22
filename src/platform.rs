@@ -285,9 +285,9 @@ pub trait VariableVisitor {
 ///    when `ExitBootServices` succeeds. The backend can release resources or
 ///    adjust its strategy (e.g., direct-flash backends note that flash is now locked).
 ///
-/// 4. [`flush_deferred()`](Self::flush_deferred) — Called on the *next* boot
-///    (after `load()`) to commit any writes that were buffered during the
-///    previous boot's runtime phase. Only relevant for non-runtime-capable backends.
+/// Deferred writes from a previous boot are replayed by CrabEFI's deferred
+/// buffer code after [`load()`](Self::load), using [`write()`](Self::write) and
+/// [`delete()`](Self::delete) for each authenticated and validated record.
 ///
 /// # Example: SMM Backend
 ///
@@ -353,8 +353,11 @@ pub trait VariableBackend {
     ///
     /// - `true`: CrabEFI calls `write()`/`delete()` directly at runtime.
     ///   Suitable for SMM, TF-A MM, or any backend with a privileged agent.
+    ///   The backend object, its vtable, and any code/data it needs after
+    ///   `SetVirtualAddressMap` must reside in EFI runtime-mapped regions so
+    ///   CrabEFI can convert the trait-object pointer to virtual addresses.
     /// - `false` (default): CrabEFI buffers runtime writes in the deferred
-    ///   buffer and calls `flush_deferred()` on the next boot.
+    ///   buffer and replays them through `write()`/`delete()` on the next boot.
     fn runtime_capable(&self) -> bool {
         false
     }
@@ -364,36 +367,6 @@ pub trait VariableBackend {
     /// For direct-flash backends, this signals that flash may now be locked.
     /// For SMM/MM backends, this is typically a no-op.
     fn notify_exit_boot_services(&mut self) {}
-
-    /// Commit deferred writes from a previous boot.
-    ///
-    /// Called after `load()` on the next boot when the previous boot had
-    /// buffered runtime variable writes (because `runtime_capable()` was false).
-    ///
-    /// # Arguments
-    /// * `records` - Iterator of (name, vendor, attributes, data) for each
-    ///   deferred write. Empty data means delete.
-    ///
-    /// The default implementation calls `write()` or `delete()` for each record.
-    fn flush_deferred(
-        &mut self,
-        records: &mut dyn Iterator<Item = (&[u16], &Guid, u32, &[u8])>,
-    ) -> Result<usize, VarBackendError> {
-        let mut count = 0;
-        for (name, vendor, attrs, data) in records {
-            if data.is_empty() {
-                // Ignore NotFound for deletes — variable may not exist
-                match self.delete(name, vendor) {
-                    Ok(()) | Err(VarBackendError::NotFound) => {}
-                    Err(e) => return Err(e),
-                }
-            } else {
-                self.write(name, vendor, attrs, data)?;
-            }
-            count += 1;
-        }
-        Ok(count)
-    }
 }
 
 // ============================================================================
@@ -889,10 +862,10 @@ impl FramebufferConfig {
 /// 2. Is in a memory region marked as `RuntimeServicesData` so the OS
 ///    preserves the mapping after `ExitBootServices`.
 ///
-/// On the next boot, CrabEFI reads the buffer and commits the writes via
-/// [`VariableBackend::flush_deferred()`].
-///
-/// Not needed if the variable backend is runtime-capable (SMM, TF-A MM).
+/// On the next boot, CrabEFI reads the buffer and commits authenticated,
+/// validated records through [`VariableBackend::write`] and
+/// [`VariableBackend::delete`]. Not needed if the variable backend is
+/// runtime-capable (SMM, TF-A MM).
 #[derive(Debug, Clone, Copy)]
 pub struct DeferredBufferConfig {
     /// Physical base address of the buffer.
