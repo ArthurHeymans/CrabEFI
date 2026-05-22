@@ -465,9 +465,11 @@ pub fn process_pending() -> Result<usize, VarStoreError> {
                 let guid = record.guid.to_guid();
 
                 if is_deletion {
-                    // Delete from the configured variable backend.
+                    // Delete from the configured variable backend. Treat NotFound as
+                    // success because the desired durable state is already achieved;
+                    // otherwise one stale deletion can block deferred replay forever.
                     match super::persistence::delete_variable(&guid, record.name.as_slice()) {
-                        Ok(()) => {
+                        Ok(()) | Err(VarStoreError::NotFound) => {
                             super::persistence::delete_variable_from_memory(
                                 &guid,
                                 record.name.as_slice(),
