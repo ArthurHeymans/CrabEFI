@@ -18,7 +18,8 @@ const RDRAND_MIN_CHANGE: usize = 5;
 fn cpuid_has_rdrand() -> bool {
     let ecx: u32;
 
-    // rbx is reserved by LLVM, so we must save/restore it around CPUID
+    // RBX is reserved by LLVM, so save/restore it around CPUID. Do not use
+    // `options(nostack)`: the assembly intentionally uses push/pop.
     unsafe {
         core::arch::asm!(
             "push rbx",
@@ -28,7 +29,6 @@ fn cpuid_has_rdrand() -> bool {
             out("ecx") ecx,
             out("eax") _,
             out("edx") _,
-            options(nostack),
         );
     }
 
