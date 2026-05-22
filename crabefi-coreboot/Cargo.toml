@@ -10,7 +10,7 @@ description = "CrabEFI as a coreboot payload binary"
 ui = ["crabefi/ui"]
 
 [dependencies]
-crabefi = { path = "..", features = ["global-allocator", "platform-entry"] }
+crabefi = { path = "..", features = ["global-allocator", "platform-entry", "coreboot-payload"] }
 crabefi-drivers = { path = "../crabefi-drivers" }
 
 # Needed for coreboot table parsing and early setup

@@ -330,7 +330,7 @@ fn try_boot_file_on_ahci(file_path: &str) -> bool {
 
 /// Try to boot a file from USB ESPs
 fn try_boot_file_on_usb(file_path: &str) -> bool {
-    use crate::drivers::usb::{self, UsbMassStorage, mass_storage};
+    use crate::drivers::usb::{self, mass_storage, UsbMassStorage};
 
     let Some((controller_id, device_addr)) = usb::find_mass_storage() else {
         return false;
@@ -508,6 +508,12 @@ fn boot_selected_entry(entry: &menu::BootEntry) {
         menu::BootEntryKind::Payload { path, format } => {
             log::info!("Dispatching to payload chainload");
             boot_payload_entry(entry, path, *format);
+        }
+
+        #[cfg(feature = "coreboot-payload")]
+        menu::BootEntryKind::CbfsPayload { name } => {
+            log::info!("Dispatching to CBFS payload chainload");
+            boot_cbfs_payload_entry(name);
         }
     }
 }
@@ -744,12 +750,24 @@ fn boot_payload_entry(
     log::info!("  Path: {}", path);
     log::info!("  Format: {:?}", format);
 
-    // TODO: Implement full payload chainloading
-    // This requires:
-    // 1. Mount FAT filesystem on the partition
-    // 2. Create PayloadEntry from the menu entry
-    // 3. Call payload::chainload_payload()
-    //
-    // For now, log the attempt and return
-    log::warn!("Payload chainloading not yet fully implemented");
+    // TODO: Implement disk payload chainloading.
+    log::warn!("Disk payload chainloading not yet fully implemented");
+}
+
+#[cfg(feature = "coreboot-payload")]
+fn boot_cbfs_payload_entry(name: &heapless::String<128>) {
+    let payload = crate::coreboot::cbfs::discover_payloads()
+        .into_iter()
+        .find(|entry| entry.name.as_str() == name.as_str());
+
+    let Some(payload) = payload else {
+        log::error!("CBFS payload '{}' disappeared", name);
+        return;
+    };
+
+    // SAFETY: this path never returns on success; the CBFS loader validates the
+    // selected entry before transferring control.
+    match unsafe { crate::coreboot::cbfs::chainload_payload(&payload) } {
+        Err(e) => log::error!("CBFS payload chainload failed: {:?}", e),
+    }
 }

@@ -637,6 +637,19 @@ pub fn run_tests(config: &QemuConfig, disk_path: &Path, app_name: &str) -> Resul
                 failed += 1;
             }
         }
+        "cbfs-payload-menu" => {
+            if result
+                .output
+                .contains("Found CBFS payload entry: CBFS: seabios")
+                || result.output.contains("CBFS: seabios")
+            {
+                println!("[PASS] cbfs_payload_entry: CBFS payload appeared in boot menu");
+                passed += 1;
+            } else {
+                println!("[FAIL] cbfs_payload_entry: CBFS payload did not appear in boot menu");
+                failed += 1;
+            }
+        }
         "device-path-test" => {
             // Check that the test app started
             if result.output.contains("Device Path Protocol Test Suite") {

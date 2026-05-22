@@ -236,6 +236,32 @@ fn inject_crabefi_payload(rom_path: &Path, crabefi_elf: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Add a small raw CBFS file used to verify CrabEFI discovers flash payload entries.
+pub fn add_test_cbfs_payload(rom_path: &Path, name: &str) -> Result<()> {
+    let payload = rom_path.with_extension("cbfs-test-payload.bin");
+    std::fs::write(&payload, b"CrabEFI CBFS payload discovery test\n")
+        .context("Failed to create CBFS test payload")?;
+
+    let _ = Command::new("cbfstool")
+        .arg(rom_path)
+        .args(["remove", "-n", name])
+        .status();
+
+    let status = Command::new("cbfstool")
+        .arg(rom_path)
+        .args(["add", "-f"])
+        .arg(&payload)
+        .args(["-n", name, "-t", "raw"])
+        .status()
+        .context("Failed to run cbfstool to add CBFS test payload")?;
+
+    if !status.success() {
+        bail!("Failed to add CBFS test payload to ROM");
+    }
+
+    Ok(())
+}
+
 /// Prepare riscv64 (QEMU virt) firmware — single coreboot ROM (OpenSBI embedded)
 fn prepare_rom_riscv64(crabefi_elf: &Path, output_dir: &Path) -> Result<PreparedFirmware> {
     let compressed_rom = project_root().join("firmware/coreboot-qemu-riscv64.rom.zst");

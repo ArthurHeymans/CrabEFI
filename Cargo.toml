@@ -44,6 +44,9 @@ rt-log = []
 # Enable graphical UI with mouse support (PS/2 and USB HID mouse drivers,
 # cursor rendering, SimplePointerProtocol, and rlvgl-based setup utility)
 ui = []
+# Enable coreboot-payload-only boot menu entries for CBFS payloads in SPI flash.
+# This is intentionally not a default/library feature.
+coreboot-payload = []
 
 [dependencies]
 r-efi = "5.3"
