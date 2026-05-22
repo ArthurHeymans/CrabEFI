@@ -248,6 +248,14 @@ fn discover_payloads_in_slice(
     }
 }
 
+/// Load and transfer control to a CBFS payload.
+///
+/// # Safety
+///
+/// On success this function does not return and transfers control to firmware
+/// code loaded from CBFS. The caller must ensure chainloading is appropriate for
+/// the current platform state and that no borrowed CrabEFI state will be used
+/// after the handoff.
 pub unsafe fn chainload_payload(
     entry: &CbfsPayloadEntry,
 ) -> Result<!, crate::payload::PayloadError> {

@@ -331,6 +331,7 @@ fn cmd_build(release: bool, ui: bool, arch: Arch, machine: Machine) -> Result<()
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn cmd_run(
     coreboot_rom: Option<String>,
     ahci: bool,
@@ -419,6 +420,7 @@ fn cmd_run(
     qemu::run_qemu(&config, None)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn cmd_test(
     coreboot_rom: Option<String>,
     app: &str,
@@ -759,7 +761,7 @@ fn find_test_app_efi(name: &str, arch: Arch) -> Result<String> {
     for entry in std::fs::read_dir(&target_dir)? {
         let entry = entry?;
         let path = entry.path();
-        if path.extension().map_or(false, |e| e == "efi") {
+        if path.extension().is_some_and(|e| e == "efi") {
             return Ok(path.to_string_lossy().to_string());
         }
     }

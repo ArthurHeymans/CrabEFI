@@ -312,7 +312,7 @@ fn add_storage_args_aarch64(cmd: &mut Command, config: &QemuConfig, disk_path: &
 fn is_kvm_available() -> bool {
     Path::new("/dev/kvm").exists()
         && std::fs::metadata("/dev/kvm")
-            .map(|m| m.permissions().readonly() == false)
+            .map(|m| !m.permissions().readonly())
             .unwrap_or(false)
 }
 
