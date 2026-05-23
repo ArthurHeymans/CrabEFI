@@ -8,16 +8,19 @@
 use heapless::String;
 
 /// Maximum length for various BLS entry fields
-const MAX_TITLE_LEN: usize = 64;
-const MAX_VERSION_LEN: usize = 32;
+const MAX_TITLE_LEN: usize = 96;
+const MAX_VERSION_LEN: usize = 128;
 const MAX_PATH_LEN: usize = 128;
 const MAX_OPTIONS_LEN: usize = 512;
 const MAX_MACHINE_ID_LEN: usize = 33; // 32 hex chars + null
-const MAX_SORT_KEY_LEN: usize = 32;
+const MAX_SORT_KEY_LEN: usize = 64;
+const MAX_ENTRY_ID_LEN: usize = 128;
 
 /// A parsed BLS Type #1 entry
 #[derive(Debug, Clone)]
 pub struct BlsEntry {
+    /// Entry identifier (usually the filename without .conf)
+    pub id: String<MAX_ENTRY_ID_LEN>,
     /// Display title for the menu
     pub title: String<MAX_TITLE_LEN>,
     /// Kernel version string
@@ -48,6 +51,7 @@ impl BlsEntry {
     /// Create a new empty BLS entry
     pub const fn new() -> Self {
         Self {
+            id: String::new(),
             title: String::new(),
             version: String::new(),
             linux: String::new(),
@@ -101,42 +105,34 @@ impl BlsEntry {
             if let Some((key, value)) = split_key_value(line) {
                 match key {
                     "title" => {
-                        entry.title.clear();
-                        let _ = entry.title.push_str(value);
+                        set_truncated(&mut entry.title, value);
                     }
                     "version" => {
-                        entry.version.clear();
-                        let _ = entry.version.push_str(value);
+                        set_truncated(&mut entry.version, value);
                     }
                     "linux" => {
-                        entry.linux.clear();
-                        let _ = entry.linux.push_str(normalize_path(value));
+                        set_truncated(&mut entry.linux, normalize_path(value));
                     }
                     "initrd" => {
                         // initrd can have multiple values, but we only take the first
                         if entry.initrd.is_empty() {
-                            let _ = entry.initrd.push_str(normalize_path(value));
+                            set_truncated(&mut entry.initrd, normalize_path(value));
                         }
                     }
                     "options" => {
-                        entry.options.clear();
-                        let _ = entry.options.push_str(value);
+                        set_truncated(&mut entry.options, value);
                     }
                     "machine-id" => {
-                        entry.machine_id.clear();
-                        let _ = entry.machine_id.push_str(value);
+                        set_truncated(&mut entry.machine_id, value);
                     }
                     "sort-key" => {
-                        entry.sort_key.clear();
-                        let _ = entry.sort_key.push_str(value);
+                        set_truncated(&mut entry.sort_key, value);
                     }
                     "devicetree" => {
-                        entry.devicetree.clear();
-                        let _ = entry.devicetree.push_str(normalize_path(value));
+                        set_truncated(&mut entry.devicetree, normalize_path(value));
                     }
                     "architecture" => {
-                        entry.architecture.clear();
-                        let _ = entry.architecture.push_str(value);
+                        set_truncated(&mut entry.architecture, value);
                     }
                     _ => {
                         // Unknown key - ignore
@@ -184,6 +180,21 @@ fn split_key_value(line: &str) -> Option<(&str, &str)> {
 fn normalize_path(path: &str) -> &str {
     // Remove leading slash if present
     path.trim_start_matches('/')
+}
+
+/// Replace a fixed-capacity string with as much of `value` as fits.
+///
+/// `heapless::String::push_str` is all-or-nothing when the value exceeds the
+/// capacity. Real systemd-boot entries, including NixOS generations, often have
+/// long `version` strings; preserving a truncated value is better than silently
+/// leaving the field empty.
+fn set_truncated<const N: usize>(out: &mut String<N>, value: &str) {
+    out.clear();
+    for ch in value.chars() {
+        if out.push(ch).is_err() {
+            break;
+        }
+    }
 }
 
 /// BLS loader.conf settings
