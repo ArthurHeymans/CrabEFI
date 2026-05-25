@@ -1521,12 +1521,20 @@ extern "efiapi" fn exit_boot_services(image_handle: Handle, map_key: usize) -> S
         // After this, SPI flash is locked and variable writes go to ESP file
         crate::state::set_exit_boot_services_called();
 
-        // Clean up hardware state for OS handoff
-        // Re-enable keyboard interrupts so Linux's i8042 driver works
+        // Clean up hardware state for OS handoff.
+        // Re-enable keyboard interrupts so Linux's i8042 driver works.
         crate::drivers::keyboard_common::cleanup();
 
-        // Shutdown all PCI drivers (USB, NVMe, AHCI, SDHCI) for OS handoff
+        // Stop firmware-owned PCI drivers before returning to the OS.  USB and
+        // storage controllers may have DMA rings/bounce buffers allocated from
+        // BootServices memory; after ExitBootServices Linux may immediately
+        // reuse those pages for early stacks or metadata.
         crate::drivers::pci::shutdown_drivers();
+
+        // Final DMA safety net: regardless of per-driver shutdown coverage,
+        // clear Bus Master Enable on every enumerated PCI function.  Linux will
+        // re-enable bus mastering for drivers it owns.
+        crate::drivers::pci::disable_all_bus_mastering_for_handoff();
 
         // Invalidate the coreboot framebuffer record to prevent a race condition
         // between Linux's simplefb (coreboot) and efifb (EFI GOP) drivers.

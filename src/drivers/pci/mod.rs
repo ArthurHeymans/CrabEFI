@@ -228,20 +228,16 @@ fn probe_bar(access: &AnyPciAccess, addr: PciAddress, bar_index: usize) -> PciBa
         return PciBar::default();
     }
 
-    // Check if it's I/O or memory
+    // Check if it's I/O or memory.  Do not size BARs here by writing
+    // 0xffffffff: fstart has already assigned and enabled resources, and
+    // probing live BARs can transiently break decode or bus mastering while
+    // storage/USB devices are active.  CrabEFI drivers only need the assigned
+    // base address, so keep enumeration read-only.
     if original & 1 == 1 {
-        // I/O BAR
-        access.write32(addr, bar_offset, 0xFFFFFFFF);
-        let sized = access.read32(addr, bar_offset);
-        access.write32(addr, bar_offset, original);
-
-        let io_mask = sized | 0x3;
-        let size = (!io_mask).wrapping_add(1) as u64;
-
         return PciBar {
             bar_type: BarType::Io,
             address: (original & 0xFFFFFFFC) as u64,
-            size,
+            size: 0,
             prefetchable: false,
         };
     }
@@ -251,44 +247,22 @@ fn probe_bar(access: &AnyPciAccess, addr: PciAddress, bar_index: usize) -> PciBa
     let prefetchable = (original & 0x8) != 0;
 
     match mem_type {
-        0 => {
-            // 32-bit memory
-            access.write32(addr, bar_offset, 0xFFFFFFFF);
-            let sized = access.read32(addr, bar_offset);
-            access.write32(addr, bar_offset, original);
-
-            let mem_mask = sized | 0xF;
-            let size = (!mem_mask).wrapping_add(1) as u64;
-
-            PciBar {
-                bar_type: BarType::Memory32,
-                address: (original & 0xFFFFFFF0) as u64,
-                size,
-                prefetchable,
-            }
-        }
+        0 => PciBar {
+            bar_type: BarType::Memory32,
+            address: (original & 0xFFFFFFF0) as u64,
+            size: 0,
+            prefetchable,
+        },
         2 => {
             // 64-bit memory (consumes two BARs)
             let bar_offset_hi = bar_offset + 4;
             let original_hi = access.read32(addr, bar_offset_hi);
-
-            access.write32(addr, bar_offset, 0xFFFFFFFF);
-            access.write32(addr, bar_offset_hi, 0xFFFFFFFF);
-            let sized_lo = access.read32(addr, bar_offset);
-            let sized_hi = access.read32(addr, bar_offset_hi);
-            access.write32(addr, bar_offset, original);
-            access.write32(addr, bar_offset_hi, original_hi);
-
-            let sized = ((sized_hi as u64) << 32) | (sized_lo as u64);
-            let mem_mask = sized | 0xF;
-            let size = (!mem_mask).wrapping_add(1);
-
             let address = ((original_hi as u64) << 32) | ((original & 0xFFFFFFF0) as u64);
 
             PciBar {
                 bar_type: BarType::Memory64,
                 address,
-                size,
+                size: 0,
                 prefetchable,
             }
         }
@@ -468,6 +442,43 @@ pub fn bind_drivers() {
 /// Called during ExitBootServices to cleanly quiesce hardware.
 pub fn shutdown_drivers() {
     driver::shutdown_all();
+}
+
+/// Clear PCI Bus Master Enable on all enumerated devices.
+///
+/// This is a conservative OS-handoff safety net: once ExitBootServices has
+/// succeeded, firmware-owned DMA rings and bounce buffers are no longer owned
+/// by firmware.  Any device left bus-mastering can scribble over pages Linux
+/// has already repurposed for early stacks or metadata.
+pub fn disable_all_bus_mastering_for_handoff() {
+    let devices = state::drivers().pci.devices.clone();
+    if devices.is_empty() {
+        return;
+    }
+
+    let mut changed = 0usize;
+    with_access(|access| {
+        for dev in devices.iter() {
+            let cmd = access.read16(dev.address, 0x04);
+            if cmd & 0x0004 == 0 {
+                continue;
+            }
+            let new_cmd = cmd & !0x0004;
+            access.write16(dev.address, 0x04, new_cmd);
+            changed += 1;
+            log::debug!(
+                "PCI {}: bus master disabled for OS handoff ({:#06x} -> {:#06x})",
+                dev.address,
+                cmd,
+                new_cmd
+            );
+        }
+    });
+
+    log::info!(
+        "PCI: disabled bus mastering on {} device(s) for OS handoff",
+        changed
+    );
 }
 
 // ============================================================================
