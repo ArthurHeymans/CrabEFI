@@ -1044,6 +1044,89 @@ extern "efiapi" fn set_variable(
     data_size: usize,
     data: *mut c_void,
 ) -> Status {
+    if variable_name.is_null() || vendor_guid.is_null() {
+        return Status::INVALID_PARAMETER;
+    }
+
+    // Linux calls SetVariable("DUMMY", ..., size=0) during EFI runtime setup
+    // from the initial task stack.  The full SetVariable path uses 16 KiB
+    // bounded variable buffers, which is fine on firmware stacks but too large
+    // for the OS runtime-call stack.  Keep the common runtime-delete path in a
+    // tiny helper so it cannot corrupt Linux's init_task stack canary.
+    if state::is_exit_boot_services_called() && data_size == 0 {
+        return set_variable_runtime_delete(variable_name, vendor_guid, attributes);
+    }
+
+    set_variable_full(variable_name, vendor_guid, attributes, data_size, data)
+}
+
+#[inline(never)]
+fn set_variable_runtime_delete(
+    variable_name: *mut u16,
+    vendor_guid: *mut Guid,
+    attributes: u32,
+) -> Status {
+    let name_len = ucs2_strlen_ptr(variable_name);
+    if name_len == 0 || name_len >= MAX_VARIABLE_NAME_LEN {
+        return Status::INVALID_PARAMETER;
+    }
+
+    let has_runtime_access = (attributes & auth::attributes::RUNTIME_ACCESS) != 0;
+    if !has_runtime_access {
+        return Status::INVALID_PARAMETER;
+    }
+
+    let guid = unsafe { *vendor_guid };
+    let name_slice = unsafe { core::slice::from_raw_parts(variable_name, name_len + 1) };
+
+    if guid == auth::EFI_GLOBAL_VARIABLE_GUID
+        && (name_slice == auth::SECURE_BOOT_NAME || name_slice == auth::SETUP_MODE_NAME)
+    {
+        return Status::WRITE_PROTECTED;
+    }
+
+    let mut name_vec = VariableNameBuf::new();
+    if name_vec.extend_from_slice(name_slice).is_err() {
+        return Status::OUT_OF_RESOURCES;
+    }
+
+    let secure_boot_var = auth::identify_key_database(name_vec.as_slice(), &guid);
+    let (status, deleted_secure_boot_var) = state::with_efi_mut(|efi| {
+        let Some(idx) = efi.variables.iter().position(|var| {
+            var.in_use
+                && var.vendor_guid == guid
+                && crate::efi::utils::ucs2_eq(&var.name, name_vec.as_slice())
+        }) else {
+            return (Status::NOT_FOUND, None);
+        };
+
+        efi.variables[idx].in_use = false;
+        (Status::SUCCESS, secure_boot_var)
+    });
+
+    if status != Status::SUCCESS {
+        return status;
+    }
+
+    if let Some(var_type) = deleted_secure_boot_var {
+        handle_secure_boot_variable_delete(var_type);
+    }
+
+    if let Err(e) = crate::efi::varstore::delete_variable(&guid, name_vec.as_slice()) {
+        log::debug!("Variable deletion not persisted: {:?}", e);
+    }
+
+    Status::SUCCESS
+}
+
+#[inline(never)]
+fn set_variable_full(
+    variable_name: *mut u16,
+    vendor_guid: *mut Guid,
+    attributes: u32,
+    data_size: usize,
+    data: *mut c_void,
+) -> Status {
     #[cfg(feature = "rt-debug")]
     if VIRTUAL_MODE.load(core::sync::atomic::Ordering::Acquire) {
         rt_serial::str("[RT] SetVariable name=");
