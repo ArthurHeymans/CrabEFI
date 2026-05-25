@@ -69,10 +69,12 @@ pub fn init_from_platform(config: &crate::platform::PlatformConfig) {
         {
             log::warn!("Failed to reserve runtime code region: {:?}", e);
         }
-        if let Err(e) =
-            allocator::reserve_region(rt.data_base, data_pages, MemoryType::RuntimeServicesData)
-        {
-            log::warn!("Failed to reserve runtime data region: {:?}", e);
+        if let Err(e) = allocator::reserve_region_fragments(
+            rt.data_base,
+            data_pages,
+            MemoryType::RuntimeServicesData,
+        ) {
+            log::warn!("Failed to reserve runtime data region fragments: {:?}", e);
         }
     } else {
         // Fall back to linker-symbol-based reservation. Only available when

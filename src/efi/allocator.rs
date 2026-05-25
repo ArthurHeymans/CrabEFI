@@ -399,10 +399,15 @@ impl MemoryAllocator {
 
             let attribute = memory_type.default_attributes();
 
-            // RuntimeServices types get the RUNTIME attribute.
+            // RuntimeServices types get the RUNTIME attribute.  Runtime data
+            // should also be execute-protected, matching carve_out() and the
+            // EFI memory attributes table expectations.
             let attribute = match region.region_type {
-                PlatMemType::RuntimeServicesCode | PlatMemType::RuntimeServicesData => {
-                    attribute | attributes::EFI_MEMORY_RUNTIME
+                PlatMemType::RuntimeServicesCode => {
+                    (attribute | attributes::EFI_MEMORY_RUNTIME) & !attributes::EFI_MEMORY_XP
+                }
+                PlatMemType::RuntimeServicesData => {
+                    attribute | attributes::EFI_MEMORY_RUNTIME | attributes::EFI_MEMORY_XP
                 }
                 _ => attribute,
             };
@@ -432,6 +437,51 @@ impl MemoryAllocator {
         memory_type: MemoryType,
     ) -> Result<(), efi::Status> {
         self.carve_out(physical_start, num_pages, memory_type)
+    }
+
+    /// Reserve all ConventionalMemory fragments within a range.
+    ///
+    /// Platform-provided ACPI/SMBIOS reservations may intentionally split the
+    /// firmware's linker-described runtime data range.  Runtime data still
+    /// has to be preserved for the OS, but those pre-typed holes should keep
+    /// their more specific memory types.  This helper carves every overlapping
+    /// ConventionalMemory fragment and skips existing non-conventional holes.
+    pub fn reserve_region_fragments(
+        &mut self,
+        physical_start: u64,
+        num_pages: u64,
+        memory_type: MemoryType,
+    ) -> Result<(), efi::Status> {
+        let size = num_pages
+            .checked_mul(PAGE_SIZE)
+            .ok_or(efi::Status::INVALID_PARAMETER)?;
+        let end = physical_start
+            .checked_add(size)
+            .ok_or(efi::Status::INVALID_PARAMETER)?;
+
+        let mut fragments: heapless::Vec<(u64, u64), MAX_MEMORY_ENTRIES> = heapless::Vec::new();
+        for entry in &self.entries {
+            let Some(entry_type) = entry.get_memory_type() else {
+                continue;
+            };
+            if entry.end() <= physical_start || entry.physical_start >= end {
+                continue;
+            }
+            if entry_type == MemoryType::ConventionalMemory {
+                let start = entry.physical_start.max(physical_start);
+                let stop = entry.end().min(end);
+                if start < stop && fragments.push((start, stop)).is_err() {
+                    return Err(efi::Status::OUT_OF_RESOURCES);
+                }
+            }
+        }
+
+        for (start, stop) in fragments {
+            let pages = (stop - start).div_ceil(PAGE_SIZE);
+            self.carve_out(start, pages, memory_type)?;
+        }
+
+        Ok(())
     }
 
     /// Force-add a memory region to the map
@@ -884,7 +934,9 @@ impl MemoryAllocator {
 
         self.boot_services_exited = true;
 
-        // Log runtime services regions (these must have EFI_MEMORY_RUNTIME attribute)
+        // Log handoff-critical regions: runtime services must keep the
+        // RUNTIME attribute, and loader regions must remain reserved for the
+        // OS loader / EFI stub across ExitBootServices.
         log::debug!(
             "Memory map at ExitBootServices ({} entries):",
             self.entries.len()
@@ -896,10 +948,13 @@ impl MemoryAllocator {
             let has_runtime = (entry.attribute & attributes::EFI_MEMORY_RUNTIME) != 0;
             if matches!(
                 mem_type,
-                MemoryType::RuntimeServicesCode | MemoryType::RuntimeServicesData
+                MemoryType::RuntimeServicesCode
+                    | MemoryType::RuntimeServicesData
+                    | MemoryType::LoaderCode
+                    | MemoryType::LoaderData
             ) {
                 log::info!(
-                    "  RuntimeServices: {:#x}-{:#x} type={:?} attr={:#x} RUNTIME={}",
+                    "  Handoff: {:#x}-{:#x} type={:?} attr={:#x} RUNTIME={}",
                     entry.physical_start,
                     entry.end(),
                     mem_type,
@@ -909,11 +964,17 @@ impl MemoryAllocator {
             }
         }
 
-        // Convert boot services memory to conventional memory
+        // Convert only firmware-owned BootServicesCode/Data to conventional
+        // memory. LoaderCode/Data belongs to the OS loader and may contain the
+        // loaded kernel, initrd, command line, PE memory-map buffers, or other
+        // handoff data. If firmware reclaims LoaderData here, Linux can reuse
+        // those ranges during early boot before it has consumed/reserved them,
+        // causing corruption (e.g. NODE_DATA over initrd/handoff memory).
         for entry in self.entries.iter_mut() {
-            if let Some(mem_type) = entry.get_memory_type()
-                && mem_type.is_boot_services()
-            {
+            if matches!(
+                entry.get_memory_type(),
+                Some(MemoryType::BootServicesCode | MemoryType::BootServicesData)
+            ) {
                 entry.memory_type = MemoryType::ConventionalMemory as u32;
             }
         }
@@ -1346,6 +1407,18 @@ pub fn reserve_region(
     memory_type: MemoryType,
 ) -> Result<(), efi::Status> {
     state::with_allocator_mut(|alloc| alloc.reserve_region(physical_start, num_pages, memory_type))
+}
+
+/// Reserve all ConventionalMemory fragments in a range while preserving
+/// pre-typed holes such as ACPI reclaim and SMBIOS reserved pages.
+pub fn reserve_region_fragments(
+    physical_start: u64,
+    num_pages: u64,
+    memory_type: MemoryType,
+) -> Result<(), efi::Status> {
+    state::with_allocator_mut(|alloc| {
+        alloc.reserve_region_fragments(physical_start, num_pages, memory_type)
+    })
 }
 
 /// Force-add a memory region to the map
