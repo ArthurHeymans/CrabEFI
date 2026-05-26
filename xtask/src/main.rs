@@ -141,7 +141,8 @@ enum Commands {
 
         /// Test app to run (default: hello)
         ///
-        /// Use "grub-linux" for the GRUB + Linux boot-chain test.
+        /// Use "grub-linux" for the GRUB + Linux boot-chain test, or
+        /// "cbfs-payload-menu" to verify coreboot-payload-only CBFS menu entries.
         #[arg(long, default_value = "hello")]
         app: String,
 
@@ -330,6 +331,7 @@ fn cmd_build(release: bool, ui: bool, arch: Arch, machine: Machine) -> Result<()
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn cmd_run(
     coreboot_rom: Option<String>,
     ahci: bool,
@@ -418,6 +420,7 @@ fn cmd_run(
     qemu::run_qemu(&config, None)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn cmd_test(
     coreboot_rom: Option<String>,
     app: &str,
@@ -446,8 +449,17 @@ fn cmd_test(
 
     // Prepare the ROM
     let firmware = if let Some(rom) = coreboot_rom {
+        let coreboot_rom = if app == "cbfs-payload-menu" {
+            let src = PathBuf::from(rom);
+            let dst = temp_dir.path().join("coreboot-cbfs-test.rom");
+            std::fs::copy(&src, &dst)?;
+            rom::add_test_cbfs_payload(&dst, "seabios")?;
+            dst
+        } else {
+            PathBuf::from(rom)
+        };
         rom::PreparedFirmware {
-            coreboot_rom: PathBuf::from(rom),
+            coreboot_rom,
             tfa_flash: None,
         }
     } else {
@@ -456,7 +468,11 @@ fn cmd_test(
 
         // Prepare ROM with CrabEFI payload
         let crabefi_elf = rom::get_crabefi_elf(arch);
-        rom::prepare_rom(&crabefi_elf, temp_dir.path(), arch, machine)?
+        let firmware = rom::prepare_rom(&crabefi_elf, temp_dir.path(), arch, machine)?;
+        if app == "cbfs-payload-menu" {
+            rom::add_test_cbfs_payload(&firmware.coreboot_rom, "seabios")?;
+        }
+        firmware
     };
 
     let config = qemu::QemuConfig {
@@ -529,12 +545,17 @@ fn cmd_test(
         )?;
     } else {
         // ── Normal UEFI test app ─────────────────────────────────────
-        println!("Building test app: {}", app);
-        cmd_build_test_app(app, arch)?;
+        let disk_app = if app == "cbfs-payload-menu" {
+            "hello"
+        } else {
+            app
+        };
+        println!("Building test app: {}", disk_app);
+        cmd_build_test_app(disk_app, arch)?;
 
-        let efi_path = find_test_app_efi(app, arch)?;
+        let efi_path = find_test_app_efi(disk_app, arch)?;
 
-        if app == "directory-test" {
+        if disk_app == "directory-test" {
             disk::create_directory_test_disk(
                 disk_path.to_string_lossy().as_ref(),
                 &efi_path,
@@ -740,7 +761,7 @@ fn find_test_app_efi(name: &str, arch: Arch) -> Result<String> {
     for entry in std::fs::read_dir(&target_dir)? {
         let entry = entry?;
         let path = entry.path();
-        if path.extension().map_or(false, |e| e == "efi") {
+        if path.extension().is_some_and(|e| e == "efi") {
             return Ok(path.to_string_lossy().to_string());
         }
     }

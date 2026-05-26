@@ -446,6 +446,8 @@ pub extern "C" fn rust_main(coreboot_table_ptr: u64) -> ! {
     // (efi::varstore::persistence.rs) and must be set before
     // init_platform() runs init_persistence_and_boot().
 
+    crabefi::coreboot::store_coreboot_table_ptr(coreboot_table_ptr);
+
     if let Some(cbmem_addr) = cb_info.cbmem_console {
         crabefi::coreboot::cbmem_console::init(cbmem_addr);
     }

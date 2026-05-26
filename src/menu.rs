@@ -97,12 +97,19 @@ pub enum BootEntryKind {
         cmdline: String<512>,
     },
 
-    /// Coreboot payload (ELF or flat binary)
+    /// Coreboot payload (ELF or flat binary) from a disk filesystem.
     Payload {
         /// Path to payload file
         path: String<128>,
         /// Payload format
         format: crate::payload::PayloadFormat,
+    },
+
+    /// Coreboot payload stored in CBFS flash.
+    #[cfg(feature = "coreboot-payload")]
+    CbfsPayload {
+        /// CBFS file name.
+        name: String<128>,
     },
 }
 
@@ -209,6 +216,34 @@ impl BootEntry {
         entry
     }
 
+    #[cfg(feature = "coreboot-payload")]
+    fn new_cbfs_payload(payload: &crate::coreboot::cbfs::CbfsPayloadEntry) -> Self {
+        let empty_partition = gpt::Partition {
+            type_guid: [0; 16],
+            partition_guid: [0; 16],
+            first_lba: 0,
+            last_lba: 0,
+            attributes: 0,
+            is_esp: false,
+            block_size: 0,
+        };
+        let mut name: String<64> = String::new();
+        let _ = write!(name, "CBFS: {}", payload.name.as_str());
+        Self::new_with_kind(
+            &name,
+            payload.name.as_str(),
+            DeviceType::Platform { index: 0 },
+            0,
+            empty_partition,
+            0,
+            0,
+            BootEntryKind::CbfsPayload {
+                name: payload.name.clone(),
+            },
+            BootCategory::Payload,
+        )
+    }
+
     /// Format a description for display
     pub fn format_description(&self, buf: &mut String<128>) {
         buf.clear();
@@ -236,7 +271,12 @@ impl BootEntry {
 
     /// Check if this is a payload entry
     pub fn is_payload(&self) -> bool {
-        matches!(self.kind, BootEntryKind::Payload { .. })
+        match self.kind {
+            BootEntryKind::Payload { .. } => true,
+            #[cfg(feature = "coreboot-payload")]
+            BootEntryKind::CbfsPayload { .. } => true,
+            _ => false,
+        }
     }
 
     /// Check if this entry has an editable command line
@@ -358,9 +398,29 @@ pub fn discover_boot_entries() -> BootMenu {
     // Scan SDHCI devices (SD cards)
     discover_sdhci_entries(&mut menu);
 
+    // Scan CBFS flash only when this library is built as the coreboot payload.
+    #[cfg(feature = "coreboot-payload")]
+    discover_cbfs_payload_entries(&mut menu);
+
     log::info!("Found {} boot entries", menu.entry_count());
 
     menu
+}
+
+#[cfg(feature = "coreboot-payload")]
+fn discover_cbfs_payload_entries(menu: &mut BootMenu) {
+    if crate::coreboot::get_coreboot_table_ptr().is_none() {
+        return;
+    }
+
+    for payload in crate::coreboot::cbfs::discover_payloads().iter() {
+        if menu.entry_count() >= MAX_BOOT_ENTRIES {
+            break;
+        }
+        let entry = BootEntry::new_cbfs_payload(payload);
+        log::info!("Found CBFS payload entry: {}", entry.name);
+        let _ = menu.add_entry(entry);
+    }
 }
 
 /// Discover boot entries on a disk that has already been stored globally.

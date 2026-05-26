@@ -11,6 +11,8 @@
 //! CFR (Coreboot Form Representation) parsing is also supported for
 //! exposing firmware configuration options to the user.
 
+#[cfg(feature = "coreboot-payload")]
+pub mod cbfs;
 pub mod cbmem_console;
 pub mod cfr;
 pub mod fmap;
@@ -25,6 +27,18 @@ pub use tables::{
     BootMediaInfo, CapsuleRegion, CorebootInfo, EfiFwInfo, FlashMmapWindow, SerialInfo,
     Smmstorev2Info, SpiFlashInfo,
 };
+
+/// Store the coreboot table pointer for payload chainloading.
+pub fn store_coreboot_table_ptr(addr: u64) {
+    crate::state::with_drivers_mut(|drivers| {
+        drivers.platform.coreboot_table_ptr = Some(addr);
+    });
+}
+
+/// Return the coreboot table pointer, if CrabEFI was started as a coreboot payload.
+pub fn get_coreboot_table_ptr() -> Option<u64> {
+    crate::state::try_get().and_then(|state| state.drivers.platform.coreboot_table_ptr)
+}
 
 /// Store the coreboot framebuffer record address for later invalidation
 pub fn store_framebuffer_record_addr(addr: u64) {

@@ -829,6 +829,10 @@ pub struct PlatformInfo {
     /// Linux from trying to use both the coreboot framebuffer and the EFI GOP.
     pub coreboot_fb_record_addr: Option<u64>,
 
+    /// Physical pointer to the coreboot table passed to this payload.
+    /// Used when chainloading another coreboot payload.
+    pub coreboot_table_ptr: Option<u64>,
+
     /// SMMSTORE v2 info for UEFI variable storage
     pub smmstorev2: Option<crate::coreboot::Smmstorev2Info>,
 
@@ -867,6 +871,7 @@ impl PlatformInfo {
         Self {
             framebuffer: None,
             coreboot_fb_record_addr: None,
+            coreboot_table_ptr: None,
             smmstorev2: None,
             spi_flash: None,
             boot_media: None,
