@@ -18,6 +18,8 @@
 //! - coreboot/src/commonlib/include/commonlib/cfr.h
 //! - coreboot/Documentation/drivers/cfr.md
 
+#![allow(dead_code)]
+
 use alloc::string::String;
 use alloc::vec::Vec;
 use zerocopy::{FromBytes, Immutable, KnownLayout, Unaligned};
@@ -316,7 +318,7 @@ impl Default for CfrInfo {
 /// This is the standard CRC-32 (ISO 3309, ITU-T V.42, Ethernet, PKZIP, etc.)
 fn compute_crc32(data: &[u8]) -> u32 {
     // Use the same CRC32 as the rest of CrabEFI
-    crate::efi::boot_services::compute_crc32(data)
+    crabefi::efi::boot_services::compute_crc32(data)
 }
 
 // ============================================================================
@@ -901,7 +903,7 @@ fn ascii_to_ucs2(s: &str) -> Vec<u16> {
 ///
 /// Returns the stored value or falls back to the CFR default.
 pub fn read_option_value(option: &CfrOption) -> CfrValue {
-    use crate::state;
+    use crabefi::state;
 
     let name = ascii_to_ucs2(&option.opt_name);
 
@@ -970,7 +972,7 @@ pub fn read_option_value(option: &CfrOption) -> CfrValue {
 /// All numeric types (Bool, Number, Enum) are stored as 4-byte LE u32
 /// for compatibility with coreboot's get_uint_option() which returns unsigned int.
 pub fn write_option_value(option: &CfrOption, value: &CfrValue) -> Result<(), &'static str> {
-    use crate::efi::varstore;
+    use crabefi::efi::varstore;
     use r_efi::efi;
 
     let name = ascii_to_ucs2(&option.opt_name);
@@ -1003,7 +1005,7 @@ pub fn write_option_value(option: &CfrOption, value: &CfrValue) -> Result<(), &'
 
 /// Delete a CFR option from storage (revert to default)
 pub fn delete_option_value(option: &CfrOption) -> Result<(), &'static str> {
-    use crate::efi::varstore;
+    use crabefi::efi::varstore;
 
     let name = ascii_to_ucs2(&option.opt_name);
 

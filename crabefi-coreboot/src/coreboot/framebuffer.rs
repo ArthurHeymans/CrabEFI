@@ -29,8 +29,8 @@ pub struct FramebufferInfo {
     pub blue_mask_size: u8,
 }
 
-impl From<crate::platform::FramebufferConfig> for FramebufferInfo {
-    fn from(fb: crate::platform::FramebufferConfig) -> Self {
+impl From<crabefi::platform::FramebufferConfig> for FramebufferInfo {
+    fn from(fb: crabefi::platform::FramebufferConfig) -> Self {
         Self {
             physical_address: fb.physical_address,
             x_resolution: fb.width,
@@ -47,7 +47,7 @@ impl From<crate::platform::FramebufferConfig> for FramebufferInfo {
     }
 }
 
-impl From<FramebufferInfo> for crate::platform::FramebufferConfig {
+impl From<FramebufferInfo> for crabefi::platform::FramebufferConfig {
     fn from(fb: FramebufferInfo) -> Self {
         let bpp = fb.bits_per_pixel as u32;
         Self {

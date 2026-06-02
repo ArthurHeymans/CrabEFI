@@ -19,8 +19,6 @@ pub mod bls;
 pub mod boot;
 mod boot_manager;
 pub mod boot_vars;
-pub mod cfr_menu;
-pub mod coreboot;
 #[cfg(feature = "ui")]
 pub mod cursor;
 pub mod drivers;
@@ -36,7 +34,7 @@ pub mod heap;
 pub mod linux_boot;
 pub mod logger;
 pub mod menu;
-pub(crate) mod menu_common;
+pub mod menu_common;
 pub mod payload;
 pub mod pe;
 pub mod platform;

@@ -773,6 +773,19 @@ pub trait PlatformHooks {
     /// Called at the start of `SetVirtualAddressMap()`, before CrabEFI commits
     /// to virtual mode.
     fn before_set_virtual_address_map(&self) {}
+
+    /// Return whether the platform exposes a firmware settings UI.
+    fn firmware_settings_available(&self) -> bool {
+        false
+    }
+
+    /// Show the platform-specific firmware settings UI.
+    ///
+    /// Returns `true` when a platform UI was shown and `false` when the
+    /// platform has no firmware settings provider.
+    fn show_firmware_settings(&self) -> bool {
+        false
+    }
 }
 
 // ============================================================================

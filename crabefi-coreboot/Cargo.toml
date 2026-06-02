@@ -20,6 +20,7 @@ crabefi-drivers = { path = "../crabefi-drivers" }
 log = "0.4"
 r-efi = "5.3"
 heapless = "0.8"
+zerocopy = { version = "0.8", default-features = false, features = ["derive"] }
 
 # ACPI table parsing and AML interpreter for platform device discovery.
 # Used by the coreboot payload to discover ECAM, GIC, UART, and DSDT

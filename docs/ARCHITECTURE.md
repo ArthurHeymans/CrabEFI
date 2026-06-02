@@ -23,7 +23,6 @@ CrabEFI/
 │       │   ├── auth/               # Secure Boot (authenticode, x509, key mgmt)
 │       │   └── varstore/           # Variable persistence
 │       ├── drivers/            # Temporary during migration; moving to crabefi-drivers
-│       ├── coreboot/           # Temporary during migration; moving to crabefi-coreboot
 │       ├── arch/               # Architecture-specific code
 │       ├── fs/                 # FAT, GPT, ISO9660
 │       ├── pe/                 # PE/COFF image loader
@@ -32,7 +31,10 @@ CrabEFI/
 ├── crabefi-coreboot/           # Coreboot payload binary
 │   ├── Cargo.toml
 │   ├── build.rs                # Linker script selection, PAYLOAD_BASE
-│   └── src/main.rs             # rust_main, #[panic_handler]
+│   └── src/
+│       ├── main.rs             # rust_main, #[panic_handler]
+│       ├── cfr_menu.rs         # Coreboot CFR firmware settings UI
+│       └── coreboot/           # Coreboot tables, FMAP/SMMSTORE, CFR parsing
 │
 ├── crabefi-drivers/            # Standard hardware drivers (placeholder)
 │   ├── Cargo.toml
