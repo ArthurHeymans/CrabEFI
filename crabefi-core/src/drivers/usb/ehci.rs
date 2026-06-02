@@ -1103,12 +1103,10 @@ impl EhciController {
         }
         flush_cache_range(qtd_status_addr, 64);
 
-        // Flush QH to main memory
-        flush_cache_range(qh_addr, 96);
-
         // Run one-shot control transfers on a quiet async schedule, matching
-        // libpayload/U-Boot. ICH7-era EHCI can otherwise keep stale async-list
-        // state around transient QHs.
+        // libpayload. Some ICH-era controllers do not reliably pick up a
+        // transient QH spliced into an already-programmed async ring; pointing
+        // ASYNCLISTADDR directly at the transfer QH avoids stale list state.
         if self.op().usbcmd.is_set(USBCMD::ASE) {
             self.op().usbcmd.modify(USBCMD::ASE::CLEAR);
             if !wait_for(100, || !self.op().usbsts.is_set(USBSTS::ASS)) {
@@ -1117,23 +1115,16 @@ impl EhciController {
             self.async_schedule_enabled = false;
         }
 
-        // Link QH into async schedule (insert after async head)
-        let async_qh = unsafe { &mut *(self.async_qh as *mut Qh) };
-        let old_link = async_qh.qh_link;
-        qh.qh_link = old_link;
+        // Use a single-QH circular async list for this transfer.
+        qh.qh_link = (qh_addr as u32) | Qh::TYPE_QH;
         fence(Ordering::SeqCst);
-        flush_cache_range(qh_addr, 4);
-
-        // Now link our QH into the schedule
-        async_qh.qh_link = (qh_addr as u32) | Qh::TYPE_QH;
-        fence(Ordering::SeqCst);
-        flush_cache_range(self.async_qh, 4);
+        flush_cache_range(qh_addr, 96);
+        self.op().asynclistaddr.set(qh_addr as u32);
 
         // Read back for debug
-        invalidate_cache_range(self.async_qh, 64);
         invalidate_cache_range(qh_addr, 64);
         invalidate_cache_range(qtd_setup_addr, 64);
-        let async_link = async_qh.qh_link;
+        let async_link = qh.qh_link;
         let qh_ep_chars = qh.ep_chars;
         let qh_current = qh.current_qtd;
         let qh_overlay_next = qh.overlay.next_qtd;
@@ -1168,9 +1159,7 @@ impl EhciController {
         self.op().usbcmd.modify(USBCMD::ASE::SET);
         if !wait_for(100, || self.op().usbsts.is_set(USBSTS::ASS)) {
             log::error!("EHCI: Async schedule failed to start");
-            async_qh.qh_link = old_link;
-            fence(Ordering::SeqCst);
-            flush_cache_range(self.async_qh, 4);
+            self.op().asynclistaddr.set(self.async_qh as u32);
             return Err(UsbError::Timeout);
         }
         self.async_schedule_enabled = true;
@@ -1234,17 +1223,13 @@ impl EhciController {
             crate::time::delay_us(1);
         }
 
-        // Unlink QH from schedule
-        async_qh.qh_link = old_link;
-        fence(Ordering::SeqCst);
-
-        // Stop the async schedule after the one-shot transfer. This avoids
-        // relying on IAAD for transient QHs and matches libpayload's model.
+        // Stop the one-shot async schedule before reusing transfer memory.
         self.op().usbcmd.modify(USBCMD::ASE::CLEAR);
         if !wait_for(100, || !self.op().usbsts.is_set(USBSTS::ASS)) {
             log::warn!("EHCI: Async schedule failed to stop after control transfer");
         }
         self.async_schedule_enabled = false;
+        self.op().asynclistaddr.set(self.async_qh as u32);
 
         // Invalidate caches one more time to get final state
         invalidate_cache_range(qtd_setup_addr, 64);
