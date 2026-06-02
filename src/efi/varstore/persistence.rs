@@ -27,7 +27,7 @@
 use alloc::vec::Vec;
 
 use crate::drivers::spi::{self, SpiController};
-use crate::platform::VariableStoreLocator;
+use crate::platform::{FirmwareStorage, FirmwareStorageRegion, VariableStoreLocator};
 use crate::state::{self, MAX_VARIABLE_DATA_SIZE, MAX_VARIABLE_NAME_LEN};
 
 use super::VarStoreError;
@@ -71,7 +71,7 @@ pub fn init(locator: Option<&dyn VariableStoreLocator>) -> Result<(), VarStoreEr
         }
     };
 
-    log::info!("Storage backend: {}", controller.name());
+    log::info!("Storage backend: {}", SpiController::name(&controller));
 
     // Create storage backend with default values (will be updated after config detection)
     let mut backend =
@@ -103,21 +103,83 @@ fn configure_from_locator(
     backend: &mut SpiStorageBackend,
     locator: &dyn VariableStoreLocator,
 ) -> Result<(), VarStoreError> {
-    let region = locator
+    let located = locator
         .locate_variable_store(backend.controller_mut())
         .ok_or(VarStoreError::NotInitialized)?;
+    let region = backend
+        .controller()
+        .resolve_location(located.location)
+        .ok_or(VarStoreError::NotInitialized)?;
+    let region = validate_variable_store_region(region, backend.controller().capacity())?;
 
-    backend.set_base_offset(region.offset);
-    backend.set_storage_size(region.size);
+    backend.set_base_offset(region.offset as u32);
+    backend.set_storage_size(region.size as u32);
 
     log::info!(
         "Variable store configured from platform locator: '{}' base={:#x}, size={} KB",
-        region.name.as_str(),
+        located.name.as_str(),
         region.offset,
         region.size / 1024
     );
 
     Ok(())
+}
+
+/// Validate and narrow a located variable-store region for the current storage backend.
+fn validate_variable_store_region(
+    region: FirmwareStorageRegion,
+    storage_capacity: Option<u64>,
+) -> Result<FirmwareStorageRegion, VarStoreError> {
+    let header_size = (edk2::FV_HEADER_LENGTH + edk2::VS_HEADER_LENGTH) as u64;
+    if region.size < header_size {
+        log::warn!(
+            "Ignoring variable-store region smaller than FV headers: offset={:#x}, size={:#x}",
+            region.offset,
+            region.size
+        );
+        return Err(VarStoreError::NotInitialized);
+    }
+
+    if region.offset > u32::MAX as u64 || region.size > u32::MAX as u64 {
+        log::warn!(
+            "Ignoring variable-store region outside 32-bit storage backend limits: offset={:#x}, size={:#x}",
+            region.offset,
+            region.size
+        );
+        return Err(VarStoreError::NotInitialized);
+    }
+
+    let Some(end) = region.offset.checked_add(region.size) else {
+        log::warn!(
+            "Ignoring overflowing variable-store region: offset={:#x}, size={:#x}",
+            region.offset,
+            region.size
+        );
+        return Err(VarStoreError::NotInitialized);
+    };
+
+    if end > u32::MAX as u64 + 1 {
+        log::warn!(
+            "Ignoring variable-store region past 32-bit storage backend limits: offset={:#x}, size={:#x}",
+            region.offset,
+            region.size
+        );
+        return Err(VarStoreError::NotInitialized);
+    }
+
+    if let Some(capacity) = storage_capacity
+        && end > capacity
+    {
+        log::warn!(
+            "Ignoring variable-store region outside firmware storage capacity: offset={:#x}, size={:#x}, capacity={:#x}",
+            region.offset,
+            region.size,
+            capacity
+        );
+        return Err(VarStoreError::NotInitialized);
+    }
+
+    Ok(region)
 }
 
 /// Initialize the variable store region

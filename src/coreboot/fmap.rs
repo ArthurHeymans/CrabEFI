@@ -135,7 +135,7 @@ fn bytes_to_string(bytes: &[u8]) -> String<FMAP_NAME_LEN> {
 /// # Returns
 ///
 /// The parsed FMAP info if found, or None if not available.
-pub fn read_fmap(storage: &mut dyn FirmwareStorage, known_offset: Option<u32>) -> Option<FmapInfo> {
+pub fn read_fmap(storage: &mut dyn FirmwareStorage, known_offset: Option<u64>) -> Option<FmapInfo> {
     if let Some(fmap_offset) = known_offset {
         log::debug!("Reading FMAP from platform offset {:#x}", fmap_offset);
         if let Some(fmap) = parse_fmap_at(storage, fmap_offset) {
@@ -144,7 +144,7 @@ pub fn read_fmap(storage: &mut dyn FirmwareStorage, known_offset: Option<u32>) -
     }
 
     // Fallback: probe at common FMAP locations.
-    const FMAP_PROBE_OFFSETS: &[u32] = &[
+    const FMAP_PROBE_OFFSETS: &[u64] = &[
         0x0,     // Most common: FMAP at start of flash
         0x20000, // Some layouts put FMAP after bootblock
         0x1000,  // Alternative location
@@ -165,7 +165,7 @@ pub fn read_fmap(storage: &mut dyn FirmwareStorage, known_offset: Option<u32>) -
 }
 
 /// Parse FMAP at a specific offset in flash
-fn parse_fmap_at(storage: &mut dyn FirmwareStorage, offset: u32) -> Option<FmapInfo> {
+fn parse_fmap_at(storage: &mut dyn FirmwareStorage, offset: u64) -> Option<FmapInfo> {
     // Read the header
     let mut header_bytes = [0u8; FMAP_HEADER_SIZE];
     if storage.read(offset, &mut header_bytes).is_err() {
@@ -210,7 +210,7 @@ fn parse_fmap_at(storage: &mut dyn FirmwareStorage, offset: u32) -> Option<FmapI
     };
     let mut areas_bytes = alloc::vec![0u8; areas_size];
 
-    let Some(areas_offset) = offset.checked_add(FMAP_HEADER_SIZE as u32) else {
+    let Some(areas_offset) = offset.checked_add(FMAP_HEADER_SIZE as u64) else {
         log::warn!("FMAP areas offset overflow");
         return None;
     };
@@ -327,7 +327,7 @@ pub fn find_smmstore_region(fmap: &FmapInfo) -> Option<&FmapAreaInfo> {
 #[derive(Debug, Clone)]
 pub struct FmapSmmstoreInfo {
     /// Offset in flash where SMMSTORE starts
-    pub offset: u32,
+    pub offset: u64,
     /// Size of the SMMSTORE region in bytes
     pub size: u32,
     /// Name of the region (for logging)
@@ -349,7 +349,7 @@ pub struct FmapSmmstoreInfo {
 /// SMMSTORE info if found, or None if FMAP not available or SMMSTORE region not present.
 pub fn get_smmstore_from_fmap(
     storage: &mut dyn FirmwareStorage,
-    known_offset: Option<u32>,
+    known_offset: Option<u64>,
 ) -> Option<FmapSmmstoreInfo> {
     let fmap = read_fmap(storage, known_offset)?;
 
@@ -357,7 +357,7 @@ pub fn get_smmstore_from_fmap(
     let region = find_smmstore_region(&fmap)?;
 
     Some(FmapSmmstoreInfo {
-        offset: region.offset,
+        offset: region.offset as u64,
         size: region.size,
         name: region.name.clone(),
     })

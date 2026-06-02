@@ -539,11 +539,6 @@ impl SpiController for AmdSpi100Controller {
         // AMD SPI100 uses software-controlled SPI commands
         SpiMode::SoftwareSequencing
     }
-
-    fn get_bios_region(&self) -> Option<(u32, u32)> {
-        // AMD doesn't have Intel Flash Descriptor
-        None
-    }
 }
 
 // ============================================================================

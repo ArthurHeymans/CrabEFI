@@ -421,23 +421,116 @@ pub enum StorageError {
     NotSupported,
 }
 
-/// Firmware storage access used while locating persistent variable storage.
-///
-/// This is intentionally read-only plus a small amount of address metadata:
-/// locating the variable store may require parsing a platform-specific flash
-/// layout structure, but it must not modify flash. The resulting region is
-/// then wrapped by a normal [`StorageBackend`] for EDK2 variable-store I/O.
-pub trait FirmwareStorage {
-    /// Read bytes from the firmware storage device at an absolute byte offset.
-    fn read(&mut self, offset: u32, buffer: &mut [u8]) -> Result<(), StorageError>;
+/// Byte range within a firmware storage device.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FirmwareStorageRegion {
+    /// Absolute byte offset from the start of the firmware storage device.
+    pub offset: u64,
+    /// Region size in bytes.
+    pub size: u64,
+}
 
-    /// BIOS region from an Intel Flash Descriptor, if available.
-    ///
-    /// Returns `(base, limit)` as absolute flash offsets. Platforms that do not
-    /// have an IFD can leave this as `None`.
-    fn bios_region(&self) -> Option<(u32, u32)> {
+/// CPU-visible mapping window for a firmware storage device.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FirmwareMmapWindow {
+    /// Physical address where this storage window is visible to the CPU.
+    pub phys_base: u64,
+    /// Firmware-storage offset corresponding to [`Self::phys_base`].
+    pub storage_offset: u64,
+    /// Window size in bytes.
+    pub size: u64,
+}
+
+/// Platform-described firmware storage location.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FirmwareStorageLocation {
+    /// The platform already described the region as a firmware-storage offset.
+    Offset(FirmwareStorageRegion),
+    /// The platform described the region by its CPU-visible physical mapping.
+    Mapped {
+        /// Physical base address of the mapped storage region.
+        phys_base: u64,
+        /// Region size in bytes.
+        size: u64,
+    },
+}
+
+/// Firmware storage access used for persistent variable storage.
+///
+/// All read/write/erase operations are addressed by absolute firmware-storage
+/// offsets. Platforms that describe regions by CPU-visible memory mappings can
+/// expose generic mmap windows or override [`resolve_mapped_region()`](Self::resolve_mapped_region)
+/// to translate those physical addresses into storage offsets.
+pub trait FirmwareStorage {
+    /// Backend name for logging.
+    fn name(&self) -> &str;
+
+    /// Total storage capacity in bytes, if known.
+    fn capacity(&self) -> Option<u64> {
         None
     }
+
+    /// CPU-visible mapping windows for this storage device, if known.
+    fn mmap_windows(&self) -> &[FirmwareMmapWindow] {
+        &[]
+    }
+
+    /// Resolve a platform-described location to an offset-addressed region.
+    fn resolve_location(&self, location: FirmwareStorageLocation) -> Option<FirmwareStorageRegion> {
+        match location {
+            FirmwareStorageLocation::Offset(region) => self.validate_region(region),
+            FirmwareStorageLocation::Mapped { phys_base, size } => {
+                self.resolve_mapped_region(phys_base, size)
+            }
+        }
+    }
+
+    /// Validate that an offset-addressed region is internally consistent and,
+    /// when capacity is known, contained within this storage device.
+    fn validate_region(&self, region: FirmwareStorageRegion) -> Option<FirmwareStorageRegion> {
+        if region.size == 0 {
+            return None;
+        }
+
+        let end = region.offset.checked_add(region.size)?;
+        if let Some(capacity) = self.capacity()
+            && end > capacity
+        {
+            return None;
+        }
+
+        Some(region)
+    }
+
+    /// Resolve a CPU-visible physical mapping to a firmware-storage offset.
+    fn resolve_mapped_region(&self, phys_base: u64, size: u64) -> Option<FirmwareStorageRegion> {
+        if size == 0 {
+            return None;
+        }
+
+        self.mmap_windows().iter().find_map(|window| {
+            let relative = phys_base.checked_sub(window.phys_base)?;
+            let mapped_end = relative.checked_add(size)?;
+            if mapped_end > window.size {
+                return None;
+            }
+
+            let offset = window.storage_offset.checked_add(relative)?;
+            self.validate_region(FirmwareStorageRegion { offset, size })
+        })
+    }
+
+    /// Enable writes to the storage backend.
+    fn enable_writes(&mut self) -> Result<(), StorageError>;
+
+    /// Read bytes from storage at an absolute storage offset.
+    fn read(&mut self, offset: u64, buffer: &mut [u8]) -> Result<(), StorageError>;
+
+    /// Write bytes to storage at an absolute storage offset.
+    fn write(&mut self, offset: u64, data: &[u8]) -> Result<(), StorageError>;
+
+    /// Erase bytes in storage at an absolute storage offset.
+    fn erase(&mut self, offset: u64, size: u64) -> Result<(), StorageError>;
 }
 
 /// A located variable-store region in firmware storage.
@@ -445,21 +538,37 @@ pub trait FirmwareStorage {
 pub struct VariableStoreRegion {
     /// Region name for logging, for example `SMMSTORE`.
     pub name: heapless::String<32>,
-    /// Absolute byte offset from the start of the firmware storage device.
-    pub offset: u32,
-    /// Region size in bytes.
-    pub size: u32,
+    /// Platform-described storage location.
+    pub location: FirmwareStorageLocation,
 }
 
 impl VariableStoreRegion {
-    /// Create a variable-store region descriptor.
+    /// Create an offset-addressed variable-store region descriptor.
     ///
     /// # Arguments
     /// * `name` - Human-readable region name. Names longer than 32 bytes are
     ///   truncated for logging.
     /// * `offset` - Absolute byte offset from the start of firmware storage.
     /// * `size` - Region size in bytes.
-    pub fn new(name: &str, offset: u32, size: u32) -> Self {
+    pub fn from_offset(name: &str, offset: u64, size: u64) -> Self {
+        Self::new(
+            name,
+            FirmwareStorageLocation::Offset(FirmwareStorageRegion { offset, size }),
+        )
+    }
+
+    /// Create a mapped variable-store region descriptor.
+    ///
+    /// # Arguments
+    /// * `name` - Human-readable region name. Names longer than 32 bytes are
+    ///   truncated for logging.
+    /// * `phys_base` - CPU-visible physical mapping address.
+    /// * `size` - Region size in bytes.
+    pub fn from_mapped(name: &str, phys_base: u64, size: u64) -> Self {
+        Self::new(name, FirmwareStorageLocation::Mapped { phys_base, size })
+    }
+
+    fn new(name: &str, location: FirmwareStorageLocation) -> Self {
         let mut region_name = heapless::String::new();
         for ch in name.chars() {
             if region_name.push(ch).is_err() {
@@ -469,8 +578,7 @@ impl VariableStoreRegion {
 
         Self {
             name: region_name,
-            offset,
-            size,
+            location,
         }
     }
 }
@@ -478,18 +586,19 @@ impl VariableStoreRegion {
 /// Platform-specific locator for the persistent EFI variable store.
 ///
 /// CrabEFI's library code knows how to read and write an EDK2 variable store
-/// once it has a raw region, but it does not know how a platform describes its
-/// flash layout. Coreboot can implement this by checking SMMSTORE table records
-/// and FMAP; other integrations can use device-tree properties, fixed board
-/// configuration, SMM, or any other platform-specific mechanism.
+/// once it has resolved a raw storage region, but it does not know how a
+/// platform describes its flash layout. Coreboot can implement this by checking
+/// SMMSTORE table records and FMAP; other integrations can use device-tree
+/// properties, fixed board configuration, SMM, or any other platform-specific
+/// mechanism.
 pub trait VariableStoreLocator {
     /// Locate the persistent EFI variable-store region.
     ///
     /// # Arguments
-    /// * `storage` - Absolute read access to the firmware storage device.
+    /// * `storage` - Firmware storage access for probing layout metadata.
     ///
     /// # Returns
-    /// The storage region to use, or `None` if this platform has no persistent
+    /// The storage location to use, or `None` if this platform has no persistent
     /// variable store available.
     fn locate_variable_store(
         &self,

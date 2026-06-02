@@ -33,20 +33,6 @@ pub fn store_framebuffer_record_addr(addr: u64) {
     });
 }
 
-/// Store SPI flash info in global state
-pub fn store_spi_flash(spi_flash: SpiFlashInfo) {
-    crate::state::with_drivers_mut(|drivers| {
-        drivers.platform.spi_flash = Some(spi_flash);
-    });
-}
-
-/// Get access to the global SPI flash info
-///
-/// Returns a clone of the SPI flash info if available.
-pub fn get_spi_flash() -> Option<SpiFlashInfo> {
-    crate::state::try_get().and_then(|state| state.drivers.platform.spi_flash.clone())
-}
-
 /// Store EFI firmware info in global state
 pub fn store_efi_fw_info(fw_info: EfiFwInfo) {
     crate::state::with_drivers_mut(|drivers| {

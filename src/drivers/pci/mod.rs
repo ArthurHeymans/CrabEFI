@@ -13,7 +13,7 @@
 //! # PCI Access
 //!
 //! The access method is selected at runtime:
-//! - If an ECAM base is available (from ACPI MCFG or coreboot) → ECAM
+//! - If an ECAM base is available (from ACPI MCFG or platform config) → ECAM
 //! - Otherwise → legacy I/O ports 0xCF8/0xCFC
 //!
 //! # Driver Model

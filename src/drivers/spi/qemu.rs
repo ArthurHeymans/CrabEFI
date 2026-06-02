@@ -7,8 +7,8 @@
 //! # Architecture
 //!
 //! QEMU's pflash is memory-mapped at the end of the 32-bit address space.
-//! The exact mapping is provided by coreboot's LB_TAG_SPI_FLASH table entry
-//! via mmap_windows, which describes how flash addresses map to host addresses.
+//! Platforms can provide the exact mapping before detection, or the driver can
+//! fall back to probing common QEMU pflash addresses.
 //!
 //! For example, a 16MB flash might be mapped as:
 //! - flash_base=0x000000, host_base=0xFF000000, size=0x1000000
@@ -19,14 +19,15 @@
 //! 1. Presence of QEMU-specific PCI devices (fw_cfg, bochs-display, etc.)
 //! 2. Direct probing of flash at expected addresses
 //!
-//! # Usage with coreboot
+//! # Platform configuration
 //!
-//! When running with coreboot, the flash configuration is obtained from
-//! coreboot tables (LB_TAG_SPI_FLASH). The SMMSTORE location within flash
-//! is obtained from FMAP (via LB_TAG_BOOT_MEDIA_PARAMS).
+//! Platform code that already knows the pflash host mapping can call
+//! [`configure_pflash()`] before SPI detection. Otherwise, detection probes
+//! common QEMU mappings.
+
+use spin::Mutex;
 
 use super::{Result, SpiController, SpiError, SpiMode};
-use crate::coreboot;
 use crate::drivers::mmio::MmioRegion;
 use crate::drivers::pci;
 
@@ -70,6 +71,25 @@ const CLEARED_ARRAY_STATUS: u8 = 0x00;
 /// Status register: Program error bit
 const STATUS_PROGRAM_ERROR: u8 = 0x10;
 
+/// Explicit QEMU pflash configuration provided by platform code.
+#[derive(Clone, Copy, Debug)]
+pub struct QemuPflashConfig {
+    /// Host physical base address where pflash is mapped.
+    pub host_base: u64,
+    /// Total flash size in bytes.
+    pub flash_size: u32,
+}
+
+static PFLASH_CONFIG: Mutex<Option<QemuPflashConfig>> = Mutex::new(None);
+
+/// Configure QEMU pflash mapping before SPI detection.
+pub fn configure_pflash(host_base: u64, flash_size: u32) {
+    *PFLASH_CONFIG.lock() = Some(QemuPflashConfig {
+        host_base,
+        flash_size,
+    });
+}
+
 /// QEMU pflash Controller
 ///
 /// This controller provides direct access to QEMU's pflash device.
@@ -91,8 +111,8 @@ pub struct QemuPflashController {
 impl QemuPflashController {
     /// Create a new QEMU pflash controller
     ///
-    /// This first tries to get flash configuration from coreboot tables,
-    /// then falls back to probing known addresses.
+    /// This first tries explicit platform configuration, then falls back to
+    /// probing known QEMU pflash mappings.
     pub fn new() -> Result<Self> {
         // First verify we're running on QEMU by checking for QEMU devices
         if !Self::is_qemu_environment() {
@@ -100,37 +120,24 @@ impl QemuPflashController {
             return Err(SpiError::NoChipset);
         }
 
-        // Try to get flash configuration from coreboot tables
-        if let Some(spi_flash) = coreboot::get_spi_flash() {
+        if let Some(config) = *PFLASH_CONFIG.lock() {
             log::info!(
-                "QEMU pflash: using coreboot SPI flash config: {} MB",
-                spi_flash.flash_size / (1024 * 1024)
+                "QEMU pflash: using platform config: host={:#x}, size={} MB",
+                config.host_base,
+                config.flash_size / (1024 * 1024)
             );
-
-            // Get the first mmap window for host address
-            if let Some(window) = spi_flash.mmap_windows.first() {
-                let host_base = window.host_base as u64;
-                let flash_size = spi_flash.flash_size;
-
-                log::info!(
-                    "QEMU pflash: flash mapped at host {:#x}, size {} MB",
-                    host_base,
-                    flash_size / (1024 * 1024)
-                );
-
-                return Self::init_with_config(host_base, flash_size);
-            }
+            return Self::init_with_config(config.host_base, config.flash_size);
         }
 
         // Fall back to probing known addresses
-        log::info!("QEMU pflash: no coreboot SPI flash config, probing...");
+        log::info!("QEMU pflash: no platform config, probing...");
         Self::probe_and_init()
     }
 
-    /// Initialize with specific configuration from coreboot
+    /// Initialize with a specific pflash mapping.
     fn init_with_config(host_base: u64, flash_size: u32) -> Result<Self> {
-        // SAFETY: host_base is the pflash MMIO base address from coreboot tables
-        // or a known QEMU configuration address, valid for the flash region.
+        // SAFETY: host_base is a platform-provided or known QEMU pflash MMIO
+        // base address, valid for the flash region.
         let pflash = unsafe { MmioRegion::new(host_base, flash_size as usize) };
 
         let mut controller = Self {
@@ -179,7 +186,7 @@ impl QemuPflashController {
         // QEMU configuration, validated by subsequent read probes below.
         let pflash = unsafe { MmioRegion::new(host_base, flash_size as usize) };
 
-        // Use coreboot-style detection to verify this is pflash
+        // Verify this is pflash by probing for plausible flash contents.
         // Try to find a suitable test byte (not 0xFF, not ending in 0)
         let mut test_offset = 0u64;
         let mut found_suitable = false;
@@ -467,26 +474,44 @@ impl QemuPflashController {
 
     /// Erase a region of pflash
     fn pflash_erase(&mut self, flash_offset: u32, len: u32) -> Result<()> {
-        // Bounds check - clamp to flash size
-        let actual_len = if flash_offset as u64 + len as u64 > self.flash_size as u64 {
-            log::debug!(
-                "pflash erase: clamping len from {:#x} to {:#x}",
+        let end = flash_offset
+            .checked_add(len)
+            .ok_or(SpiError::AddressOutOfRange)?;
+        if end > self.flash_size {
+            log::warn!(
+                "pflash erase out of bounds: offset={:#x}, len={:#x}, flash_size={:#x}",
+                flash_offset,
                 len,
-                self.flash_size - flash_offset
+                self.flash_size
             );
-            self.flash_size - flash_offset
-        } else {
-            len
-        };
+            return Err(SpiError::AddressOutOfRange);
+        }
 
         // Align to erase block boundaries
         let aligned_offset = flash_offset & !(ERASE_BLOCK_SIZE - 1);
-        let aligned_len = actual_len.div_ceil(ERASE_BLOCK_SIZE) * ERASE_BLOCK_SIZE;
+        let aligned_len = len
+            .div_ceil(ERASE_BLOCK_SIZE)
+            .checked_mul(ERASE_BLOCK_SIZE)
+            .ok_or(SpiError::AddressOutOfRange)?;
+        let aligned_end = aligned_offset
+            .checked_add(aligned_len)
+            .ok_or(SpiError::AddressOutOfRange)?;
+        if aligned_end > self.flash_size {
+            log::warn!(
+                "pflash erase alignment out of bounds: offset={:#x}, len={:#x}, aligned_offset={:#x}, aligned_len={:#x}, flash_size={:#x}",
+                flash_offset,
+                len,
+                aligned_offset,
+                aligned_len,
+                self.flash_size
+            );
+            return Err(SpiError::AddressOutOfRange);
+        }
 
         log::debug!(
             "pflash erase: offset={:#x}, len={:#x} (aligned: offset={:#x}, len={:#x})",
             flash_offset,
-            actual_len,
+            len,
             aligned_offset,
             aligned_len
         );
@@ -583,11 +608,6 @@ impl SpiController for QemuPflashController {
 
     fn mode(&self) -> SpiMode {
         SpiMode::HardwareSequencing
-    }
-
-    fn get_bios_region(&self) -> Option<(u32, u32)> {
-        // QEMU pflash doesn't have Intel Flash Descriptor
-        None
     }
 }
 

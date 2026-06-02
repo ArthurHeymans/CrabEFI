@@ -1327,35 +1327,4 @@ impl SpiController for IntelSpiController {
     fn mode(&self) -> SpiMode {
         self.mode
     }
-
-    fn get_bios_region(&self) -> Option<(u32, u32)> {
-        // Only return BIOS region if flash descriptor is valid
-        if !self.desc_valid {
-            return None;
-        }
-
-        // Read FREG1 (BIOS region) - offset 0x58 = FREG0 (0x54) + 4
-        let freg1 = self.spibar.read32(ICH9_REG_FREG0 + 4);
-        let base = freg_base(freg1);
-        let limit = freg_limit(freg1);
-
-        // Check if region is valid (base <= limit)
-        if base > limit {
-            log::debug!(
-                "BIOS region disabled (base {:#x} > limit {:#x})",
-                base,
-                limit
-            );
-            return None;
-        }
-
-        log::debug!(
-            "BIOS region (FREG1): base={:#x}, limit={:#x}, size={} KB",
-            base,
-            limit,
-            (limit - base + 1) / 1024
-        );
-
-        Some((base, limit))
-    }
 }

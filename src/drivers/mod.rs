@@ -9,7 +9,7 @@
 //! registry automatically binds matching drivers to discovered devices.
 //!
 //! Platform drivers (serial, keyboard, SPI) are initialized directly from
-//! hardware info provided by coreboot tables.
+//! platform-provided hardware information.
 //!
 //! # Storage Abstraction
 //!

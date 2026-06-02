@@ -88,6 +88,7 @@ impl crabefi::ResetHandler for CorebootReset {
 struct CorebootVariableStoreLocator {
     smmstorev2: Option<crabefi::coreboot::Smmstorev2Info>,
     boot_media: Option<crabefi::coreboot::BootMediaInfo>,
+    spi_flash: Option<crabefi::coreboot::SpiFlashInfo>,
 }
 
 impl CorebootVariableStoreLocator {
@@ -95,55 +96,36 @@ impl CorebootVariableStoreLocator {
         Self {
             smmstorev2: cb_info.smmstorev2,
             boot_media: cb_info.boot_media,
+            spi_flash: cb_info.spi_flash.clone(),
         }
     }
 
-    /// Convert coreboot's memory-mapped SMMSTORE address to a SPI flash offset.
-    fn calculate_spi_offset(mmap_addr: u64, bios_region: Option<(u32, u32)>) -> Option<u32> {
-        if mmap_addr == 0 {
+    fn resolve_mapped_region(
+        &self,
+        phys_base: u64,
+        size: u64,
+    ) -> Option<crabefi::FirmwareStorageRegion> {
+        if size == 0 {
             return None;
         }
 
-        if let Some((bios_base, bios_limit)) = bios_region {
-            if bios_limit >= bios_base {
-                let bios_size = (bios_limit - bios_base + 1) as u64;
-                let mmap_base = 0x1_0000_0000u64.checked_sub(bios_size)?;
-
-                if mmap_addr >= mmap_base && mmap_addr < 0x1_0000_0000u64 {
-                    let offset_in_bios = (mmap_addr - mmap_base) as u32;
-                    let flash_offset = bios_base.checked_add(offset_in_bios)?;
-                    log::debug!(
-                        "SMMSTORE SPI offset: mmap_addr={:#x}, bios_base={:#x}, bios_size={:#x}, flash_offset={:#x}",
-                        mmap_addr,
-                        bios_base,
-                        bios_size,
-                        flash_offset
-                    );
-                    return Some(flash_offset);
-                }
-            } else {
-                log::warn!(
-                    "Invalid BIOS region from flash descriptor: base={:#x}, limit={:#x}",
-                    bios_base,
-                    bios_limit
-                );
+        let spi_flash = self.spi_flash.as_ref()?;
+        spi_flash.mmap_windows.iter().find_map(|window| {
+            let window_phys = window.host_base as u64;
+            let relative = phys_base.checked_sub(window_phys)?;
+            let mapped_end = relative.checked_add(size)?;
+            if mapped_end > window.size as u64 {
+                return None;
             }
-        }
 
-        // Fallback heuristics for common top-of-4GiB firmware mappings.  Low
-        // addresses are not accepted: treating them as flash offsets can turn a
-        // missing SMMSTORE mapping into an unsafe write near flash offset zero.
-        if mmap_addr >= 0x1_0000_0000 {
-            None
-        } else if mmap_addr >= 0xFF00_0000 {
-            Some((mmap_addr - 0xFF00_0000) as u32)
-        } else if mmap_addr >= 0xFE00_0000 {
-            Some((mmap_addr - 0xFE00_0000) as u32)
-        } else if mmap_addr >= 0xFC00_0000 {
-            Some((mmap_addr - 0xFC00_0000) as u32)
-        } else {
-            None
-        }
+            let offset = (window.flash_base as u64).checked_add(relative)?;
+            let end = offset.checked_add(size)?;
+            if end > spi_flash.flash_size as u64 {
+                return None;
+            }
+
+            Some(crabefi::FirmwareStorageRegion { offset, size })
+        })
     }
 }
 
@@ -160,34 +142,30 @@ impl crabefi::VariableStoreLocator for CorebootVariableStoreLocator {
                 smmstore.mmap_addr
             );
 
-            let size = smmstore.num_blocks.checked_mul(smmstore.block_size);
-            let offset = Self::calculate_spi_offset(smmstore.mmap_addr, storage.bios_region());
-
-            if let (Some(offset), Some(size)) = (offset, size)
+            if let Some(size) = smmstore
+                .num_blocks
+                .checked_mul(smmstore.block_size)
+                .map(u64::from)
                 && size != 0
+                && smmstore.mmap_addr != 0
+                && let Some(region) = self.resolve_mapped_region(smmstore.mmap_addr, size)
             {
-                return Some(crabefi::VariableStoreRegion::new("SMMSTORE", offset, size));
+                return Some(crabefi::VariableStoreRegion::from_offset(
+                    "SMMSTORE",
+                    region.offset,
+                    region.size,
+                ));
             }
 
             log::warn!(
-                "Ignoring invalid SMMSTORE v2 mapping: mmap_addr={:#x}, num_blocks={}, block_size={}",
+                "Ignoring unresolvable SMMSTORE v2 mapping: mmap_addr={:#x}, num_blocks={}, block_size={}",
                 smmstore.mmap_addr,
                 smmstore.num_blocks,
                 smmstore.block_size
             );
         }
 
-        let fmap_offset = self.boot_media.and_then(|boot_media| {
-            if boot_media.fmap_offset <= u32::MAX as u64 {
-                Some(boot_media.fmap_offset as u32)
-            } else {
-                log::warn!(
-                    "Ignoring out-of-range coreboot FMAP offset {:#x}; probing instead",
-                    boot_media.fmap_offset
-                );
-                None
-            }
-        });
+        let fmap_offset = self.boot_media.map(|boot_media| boot_media.fmap_offset);
         let region = crabefi::coreboot::fmap::get_smmstore_from_fmap(storage, fmap_offset)?;
 
         log::info!(
@@ -197,11 +175,11 @@ impl crabefi::VariableStoreLocator for CorebootVariableStoreLocator {
             region.size / 1024
         );
 
-        Some(crabefi::VariableStoreRegion {
-            name: region.name,
-            offset: region.offset,
-            size: region.size,
-        })
+        Some(crabefi::VariableStoreRegion::from_offset(
+            region.name.as_str(),
+            region.offset,
+            region.size as u64,
+        ))
     }
 }
 
@@ -407,8 +385,8 @@ fn riscv_fdt_only_boot(fdt_ptr: u64, fdt_size: u32) -> ! {
     }
 
     // Initialize serial from MMIO (QEMU virt 16550 at 0x10000000)
-    crabefi::drivers::serial::init_from_coreboot(&crabefi::coreboot::tables::SerialInfo {
-        serial_type: 2, // LB_SERIAL_TYPE_MEMORY_MAPPED
+    crabefi::drivers::serial::init_from_config(&crabefi::drivers::serial::SerialConfig {
+        mmio: true,
         baseaddr: 0x1000_0000,
         baud: 115200,
         regwidth: 1,
@@ -585,8 +563,13 @@ pub extern "C" fn rust_main(coreboot_table_ptr: u64) -> ! {
         crabefi::coreboot::store_framebuffer_record_addr(addr);
     }
 
-    if let Some(ref spi_flash) = cb_info.spi_flash {
-        crabefi::coreboot::store_spi_flash(spi_flash.clone());
+    if let Some(ref spi_flash) = cb_info.spi_flash
+        && let Some(window) = spi_flash.mmap_windows.first()
+    {
+        crabefi::drivers::spi::qemu::configure_pflash(
+            window.host_base as u64,
+            spi_flash.flash_size,
+        );
     }
 
     // Store EFI firmware info (GUID, version, LSV) for ESRT and capsule updates
@@ -612,7 +595,13 @@ pub extern "C" fn rust_main(coreboot_table_ptr: u64) -> ! {
     // Phase 4: Initialize serial and logging
     // ================================================================
     if let Some(ref serial) = cb_info.serial {
-        crabefi::drivers::serial::init_from_coreboot(serial);
+        crabefi::drivers::serial::init_from_config(&crabefi::drivers::serial::SerialConfig {
+            mmio: serial.mmio(),
+            baseaddr: serial.baseaddr as u64,
+            baud: serial.baud,
+            regwidth: serial.regwidth,
+            input_hertz: serial.input_hertz,
+        });
     }
 
     // Initialize logging (idempotent — init_platform() will call it again).
@@ -684,7 +673,7 @@ pub extern "C" fn rust_main(coreboot_table_ptr: u64) -> ! {
         block_devices: &mut [],
         variable_backend: None,
         variable_store_locator: Some(&variable_store_locator),
-        debug_output: None, // Already set up via init_from_coreboot()
+        debug_output: None, // Already set up via serial::init_from_config()
         console_input: None,
         framebuffer: cb_info.framebuffer.map(crabefi::FramebufferConfig::from),
         acpi_rsdp: cb_info.acpi_rsdp,
