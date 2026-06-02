@@ -133,6 +133,8 @@ dependencies = [
  "noto-sans-mono-bitmap",
  "postcard",
  "r-efi",
+ "rflasher-core",
+ "rflasher-internal",
  "rsa",
  "serde",
  "sha1",
@@ -234,6 +236,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "edd0f118536f44f5ccd48bcb8b111bdc3de888b58c74639dfb034a357d0f206d"
 
 [[package]]
+name = "embedded-io-async"
+version = "0.6.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3ff09972d4073aa8c299395be75161d582e7629cd663171d62af73c8d50dba3f"
+dependencies = [
+ "embedded-io 0.6.1",
+]
+
+[[package]]
 name = "fdt"
 version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -277,6 +288,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0bfb9eb618601c89945a70e254898da93b13be0388091d42117462b265bb3fad"
 dependencies = [
  "hash32",
+ "serde",
  "stable_deref_trait",
 ]
 
@@ -315,6 +327,17 @@ name = "log"
 version = "0.4.29"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5e5032e24019045c762d3c0f28f5b6b8bbf38563a65908389bf7978758920897"
+
+[[package]]
+name = "maybe-async"
+version = "0.2.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "746873a384ad60adc5db74471dfaba74bd278afbdcfd81db93fafcdfc8b5ca0c"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
+]
 
 [[package]]
 name = "noto-sans-mono-bitmap"
@@ -367,6 +390,12 @@ dependencies = [
  "autocfg",
  "libm",
 ]
+
+[[package]]
+name = "once_cell"
+version = "1.21.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
 
 [[package]]
 name = "pci_types"
@@ -478,6 +507,30 @@ name = "rand_core"
 version = "0.6.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ec0be4795e2f6a28069bec0b5ff3e2ac9bafc99e6a9a7dc3547996c5c816922c"
+
+[[package]]
+name = "rflasher-core"
+version = "0.1.0"
+source = "git+https://github.com/ArthurHeymans/rflasher.git?rev=2f0b625865c0a530b3f151166be95319543e2aff#2f0b625865c0a530b3f151166be95319543e2aff"
+dependencies = [
+ "bitflags",
+ "embedded-io 0.6.1",
+ "embedded-io-async",
+ "heapless",
+ "log",
+ "maybe-async",
+ "once_cell",
+ "zerocopy",
+]
+
+[[package]]
+name = "rflasher-internal"
+version = "0.1.0"
+source = "git+https://github.com/ArthurHeymans/rflasher.git?rev=2f0b625865c0a530b3f151166be95319543e2aff#2f0b625865c0a530b3f151166be95319543e2aff"
+dependencies = [
+ "log",
+ "rflasher-core",
+]
 
 [[package]]
 name = "rsa"

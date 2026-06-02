@@ -1040,8 +1040,14 @@ pub fn write_option_value(option: &CfrOption, value: &CfrValue) -> Result<(), &'
         | efi::VARIABLE_BOOTSERVICE_ACCESS
         | efi::VARIABLE_RUNTIME_ACCESS;
 
-    varstore::persist_variable(&COREBOOT_CFR_GUID, &name, attrs, &data)
-        .map_err(|_| "Failed to persist CFR variable")
+    varstore::persist_variable(&COREBOOT_CFR_GUID, &name, attrs, &data).map_err(|e| {
+        log::warn!(
+            "Failed to persist CFR variable '{}': {:?}",
+            option.opt_name,
+            e
+        );
+        "Failed to persist CFR variable"
+    })
 }
 
 /// Delete a CFR option from storage (revert to default)
@@ -1050,6 +1056,12 @@ pub fn delete_option_value(option: &CfrOption) -> Result<(), &'static str> {
 
     let name = ascii_to_ucs2(&option.opt_name);
 
-    varstore::delete_variable(&COREBOOT_CFR_GUID, &name)
-        .map_err(|_| "Failed to delete CFR variable")
+    varstore::delete_variable(&COREBOOT_CFR_GUID, &name).map_err(|e| {
+        log::warn!(
+            "Failed to delete CFR variable '{}': {:?}",
+            option.opt_name,
+            e
+        );
+        "Failed to delete CFR variable"
+    })
 }

@@ -446,6 +446,14 @@ pub struct FirmwareMmapWindow {
 pub enum FirmwareStorageLocation {
     /// The platform already described the region as a firmware-storage offset.
     Offset(FirmwareStorageRegion),
+    /// The platform described the region as a firmware-storage offset, and also
+    /// provided a CPU-visible read mapping for the same bytes.
+    OffsetWithMappedRead {
+        /// Absolute byte range in firmware storage.
+        region: FirmwareStorageRegion,
+        /// Physical address where `region.offset` is readable by the CPU.
+        phys_base: u64,
+    },
     /// The platform described the region by its CPU-visible physical mapping.
     Mapped {
         /// Physical base address of the mapped storage region.
@@ -478,7 +486,10 @@ pub trait FirmwareStorage {
     /// Resolve a platform-described location to an offset-addressed region.
     fn resolve_location(&self, location: FirmwareStorageLocation) -> Option<FirmwareStorageRegion> {
         match location {
-            FirmwareStorageLocation::Offset(region) => self.validate_region(region),
+            FirmwareStorageLocation::Offset(region)
+            | FirmwareStorageLocation::OffsetWithMappedRead { region, .. } => {
+                self.validate_region(region)
+            }
             FirmwareStorageLocation::Mapped { phys_base, size } => {
                 self.resolve_mapped_region(phys_base, size)
             }
@@ -554,6 +565,30 @@ impl VariableStoreRegion {
         Self::new(
             name,
             FirmwareStorageLocation::Offset(FirmwareStorageRegion { offset, size }),
+        )
+    }
+
+    /// Create an offset-addressed variable-store region descriptor with a
+    /// CPU-visible read mapping for the same bytes.
+    ///
+    /// # Arguments
+    /// * `name` - Human-readable region name. Names longer than 32 bytes are
+    ///   truncated for logging.
+    /// * `offset` - Absolute byte offset from the start of firmware storage.
+    /// * `phys_base` - CPU-visible physical mapping address for `offset`.
+    /// * `size` - Region size in bytes.
+    pub fn from_offset_with_mapped_read(
+        name: &str,
+        offset: u64,
+        phys_base: u64,
+        size: u64,
+    ) -> Self {
+        Self::new(
+            name,
+            FirmwareStorageLocation::OffsetWithMappedRead {
+                region: FirmwareStorageRegion { offset, size },
+                phys_base,
+            },
         )
     }
 

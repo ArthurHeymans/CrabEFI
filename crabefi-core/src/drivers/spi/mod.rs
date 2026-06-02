@@ -1,66 +1,128 @@
 //! SPI Flash Controller Drivers
 //!
-//! This module provides drivers for Intel ICH/PCH and AMD SPI100 flash controllers,
-//! allowing direct access to the system SPI flash (SMMSTORE region).
-//!
-//! # Architecture
-//!
-//! The SPI flash on x86 systems is typically accessed through the chipset's SPI
-//! controller. The exact controller type depends on the platform:
-//!
-//! - **Intel ICH7**: Original SPI controller, software sequencing only
-//! - **Intel ICH8-ICH10**: Hardware sequencing introduced
-//! - **Intel PCH100+**: New register layout, often locked to hwseq only
-//! - **AMD SPI100**: Found in Ryzen and newer platforms
-//!
-//! # Usage
-//!
-//! ```rust,ignore
-//! use crate::drivers::spi;
-//!
-//! // Detect and initialize the SPI controller
-//! if let Some(mut controller) = spi::detect_and_init() {
-//!     // Read from flash
-//!     let mut buf = [0u8; 256];
-//!     controller.read(0x1000, &mut buf).ok();
-//!
-//!     // Write to flash (requires erase first)
-//!     controller.erase(0x1000, 0x1000).ok(); // Erase 4KB
-//!     controller.write(0x1000, &data).ok();
-//! }
-//! ```
-//!
-//! # References
-//!
-//! - flashprog/ichspi.c - Intel SPI controller implementation
-//! - flashprog/amd_spi100.c - AMD SPI100 controller implementation
+//! Intel ICH/PCH and AMD SPI100 internal programming is provided by the
+//! sibling `rflasher-internal` crate. CrabEFI keeps only the firmware-facing
+//! adapter and the QEMU pflash backend here.
 
-pub mod amd;
-pub mod amd_chipsets;
-pub mod intel;
-pub mod intel_chipsets;
 pub mod qemu;
-pub mod regs;
-pub mod sfdp;
 
-use crate::drivers::pci::{self, PciDevice};
+use rflasher_internal::{Bdf, HostAccess, MmioAccess, PciConfigAccess};
 
-/// Intel PCI Vendor ID
-pub const INTEL_VID: u16 = 0x8086;
+use crate::drivers::{mmio::MmioRegion, pci};
+use crate::platform::{FirmwareStorage, FirmwareStorageRegion, StorageError};
 
-/// AMD PCI Vendor ID
-pub const AMD_VID: u16 = 0x1022;
+/// PCI access adapter backed by CrabEFI's selected PCI config-space backend.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct CrabEfiPciAccess;
 
-/// Old ATI PCI Vendor ID (used for older AMD southbridges)
-pub const ATI_VID: u16 = 0x1002;
+impl CrabEfiPciAccess {
+    fn addr(bdf: Bdf) -> pci::PciAddress {
+        // CrabEFI currently enumerates PCI segment 0 only.
+        pci::PciAddress::new(bdf.bus, bdf.device, bdf.function)
+    }
 
-/// PCI class code for LPC/eSPI bridge (Intel)
-pub const CLASS_BRIDGE: u8 = 0x06;
-pub const SUBCLASS_ISA: u8 = 0x01;
+    fn offset_to_u8(bdf: Bdf, offset: u16, write: bool) -> rflasher_internal::Result<u8> {
+        if offset > u8::MAX as u16 {
+            let error = if write {
+                rflasher_internal::PciAccessError::ConfigWrite {
+                    bus: bdf.bus,
+                    device: bdf.device,
+                    function: bdf.function,
+                    register: offset,
+                }
+            } else {
+                rflasher_internal::PciAccessError::ConfigRead {
+                    bus: bdf.bus,
+                    device: bdf.device,
+                    function: bdf.function,
+                    register: offset,
+                }
+            };
+            return Err(rflasher_internal::InternalError::PciAccess(error));
+        }
 
-/// PCI class code for SMBus controller (AMD)
-pub const CLASS_SERIAL: u8 = 0x0C;
-pub const SUBCLASS_SMBUS: u8 = 0x05;
+        Ok(offset as u8)
+    }
+}
+
+impl PciConfigAccess for CrabEfiPciAccess {
+    fn read8(&self, bdf: Bdf, offset: u16) -> rflasher_internal::Result<u8> {
+        let offset = Self::offset_to_u8(bdf, offset, false)?;
+        Ok(pci::read_config_u8(Self::addr(bdf), offset))
+    }
+
+    fn read16(&self, bdf: Bdf, offset: u16) -> rflasher_internal::Result<u16> {
+        let offset = Self::offset_to_u8(bdf, offset, false)?;
+        Ok(pci::read_config_u16(Self::addr(bdf), offset))
+    }
+
+    fn read32(&self, bdf: Bdf, offset: u16) -> rflasher_internal::Result<u32> {
+        let offset = Self::offset_to_u8(bdf, offset, false)?;
+        Ok(pci::read_config_u32(Self::addr(bdf), offset))
+    }
+
+    fn write8(&self, bdf: Bdf, offset: u16, value: u8) -> rflasher_internal::Result<()> {
+        let offset = Self::offset_to_u8(bdf, offset, true)?;
+        pci::write_config_u8(Self::addr(bdf), offset, value);
+        Ok(())
+    }
+
+    fn write16(&self, bdf: Bdf, offset: u16, value: u16) -> rflasher_internal::Result<()> {
+        let offset = Self::offset_to_u8(bdf, offset, true)?;
+        pci::write_config_u16(Self::addr(bdf), offset, value);
+        Ok(())
+    }
+
+    fn write32(&self, bdf: Bdf, offset: u16, value: u32) -> rflasher_internal::Result<()> {
+        let offset = Self::offset_to_u8(bdf, offset, true)?;
+        pci::write_config_u32(Self::addr(bdf), offset, value);
+        Ok(())
+    }
+}
+
+impl MmioAccess for MmioRegion {
+    fn read8(&self, offset: usize) -> u8 {
+        MmioRegion::read8(self, offset as u64)
+    }
+
+    fn read16(&self, offset: usize) -> u16 {
+        MmioRegion::read16(self, offset as u64)
+    }
+
+    fn read32(&self, offset: usize) -> u32 {
+        MmioRegion::read32(self, offset as u64)
+    }
+
+    fn write8(&self, offset: usize, value: u8) {
+        MmioRegion::write8(self, offset as u64, value);
+    }
+
+    fn write16(&self, offset: usize, value: u16) {
+        MmioRegion::write16(self, offset as u64, value);
+    }
+
+    fn write32(&self, offset: usize, value: u32) {
+        MmioRegion::write32(self, offset as u64, value);
+    }
+}
+
+impl HostAccess for CrabEfiPciAccess {
+    type MmioRegion = MmioRegion;
+
+    unsafe fn map_mmio(
+        &self,
+        phys_addr: u64,
+        size: usize,
+    ) -> rflasher_internal::Result<Self::MmioRegion> {
+        // SAFETY: rflasher only requests controller register windows discovered
+        // from chipset PCI configuration. CrabEFI runs with identity-mapped MMIO.
+        Ok(unsafe { MmioRegion::new(phys_addr, size) })
+    }
+
+    fn delay_us(&self, us: u32) {
+        crate::time::delay_us(us as u64);
+    }
+}
 
 /// SPI flash error types
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -100,34 +162,11 @@ pub enum SpiMode {
     Auto,
     /// Force hardware sequencing
     HardwareSequencing,
-    /// Force software sequencing  
+    /// Force software sequencing
     SoftwareSequencing,
 }
 
-/// Detected chipset vendor
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ChipsetVendor {
-    Intel,
-    Amd,
-    Qemu,
-}
-
-/// Information about a detected chipset
-#[derive(Debug, Clone)]
-pub struct DetectedChipset {
-    /// PCI device information
-    pub pci_device: PciDevice,
-    /// Chipset vendor
-    pub vendor: ChipsetVendor,
-    /// Chipset name
-    pub name: &'static str,
-    /// Intel chipset type (for register layout selection)
-    pub intel_type: Option<intel_chipsets::IchChipset>,
-    /// AMD chipset type
-    pub amd_type: Option<amd_chipsets::AmdChipset>,
-}
-
-/// Unified SPI controller trait
+/// Unified SPI controller trait used by CrabEFI's variable-store backend.
 pub trait SpiController {
     /// Get the controller name
     fn name(&self) -> &'static str;
@@ -152,80 +191,95 @@ pub trait SpiController {
 
     /// Get the operating mode
     fn mode(&self) -> SpiMode;
+
+    /// Get the BIOS region from flash descriptor (Intel IFD)
+    ///
+    /// Returns (base, limit) in flash offsets, or None if not available.
+    fn get_bios_region(&self) -> Option<(u32, u32)>;
 }
 
-/// Enum containing Intel, AMD, or QEMU SPI controller
+/// Enum containing an rflasher Intel/AMD controller or CrabEFI QEMU pflash.
 pub enum AnySpiController {
-    Intel(intel::IntelSpiController),
-    Amd(amd::AmdSpi100Controller),
+    Intel(rflasher_internal::IchSpiController<CrabEfiPciAccess>),
+    Amd(rflasher_internal::Spi100Controller<CrabEfiPciAccess>),
     Qemu(qemu::QemuPflashController),
 }
 
-impl crate::platform::FirmwareStorage for AnySpiController {
+impl FirmwareStorage for AnySpiController {
     fn name(&self) -> &str {
         SpiController::name(self)
     }
 
-    fn enable_writes(&mut self) -> core::result::Result<(), crate::platform::StorageError> {
+    fn capacity(&self) -> Option<u64> {
+        match self {
+            Self::Qemu(c) => Some(c.flash_size() as u64),
+            Self::Intel(_) | Self::Amd(_) => None,
+        }
+    }
+
+    fn validate_region(&self, region: FirmwareStorageRegion) -> Option<FirmwareStorageRegion> {
+        if region.size == 0 {
+            return None;
+        }
+
+        let end = region.offset.checked_add(region.size)?;
+        if end > u32::MAX as u64 + 1 {
+            return None;
+        }
+
+        if let Some(capacity) = self.capacity()
+            && end > capacity
+        {
+            return None;
+        }
+
+        Some(region)
+    }
+
+    fn enable_writes(&mut self) -> core::result::Result<(), StorageError> {
         SpiController::enable_writes(self).map_err(spi_error_to_storage_error)
     }
 
-    fn read(
-        &mut self,
-        offset: u64,
-        buffer: &mut [u8],
-    ) -> core::result::Result<(), crate::platform::StorageError> {
-        let offset =
-            u32::try_from(offset).map_err(|_| crate::platform::StorageError::InvalidArgument)?;
+    fn read(&mut self, offset: u64, buffer: &mut [u8]) -> core::result::Result<(), StorageError> {
+        let offset = u32::try_from(offset).map_err(|_| StorageError::InvalidArgument)?;
         SpiController::read(self, offset, buffer).map_err(spi_error_to_storage_error)
     }
 
-    fn write(
-        &mut self,
-        offset: u64,
-        data: &[u8],
-    ) -> core::result::Result<(), crate::platform::StorageError> {
-        let offset =
-            u32::try_from(offset).map_err(|_| crate::platform::StorageError::InvalidArgument)?;
+    fn write(&mut self, offset: u64, data: &[u8]) -> core::result::Result<(), StorageError> {
+        let offset = u32::try_from(offset).map_err(|_| StorageError::InvalidArgument)?;
         SpiController::write(self, offset, data).map_err(spi_error_to_storage_error)
     }
 
-    fn erase(
-        &mut self,
-        offset: u64,
-        size: u64,
-    ) -> core::result::Result<(), crate::platform::StorageError> {
-        let offset =
-            u32::try_from(offset).map_err(|_| crate::platform::StorageError::InvalidArgument)?;
-        let size =
-            u32::try_from(size).map_err(|_| crate::platform::StorageError::InvalidArgument)?;
+    fn erase(&mut self, offset: u64, size: u64) -> core::result::Result<(), StorageError> {
+        let offset = u32::try_from(offset).map_err(|_| StorageError::InvalidArgument)?;
+        let size = u32::try_from(size).map_err(|_| StorageError::InvalidArgument)?;
         SpiController::erase(self, offset, size).map_err(spi_error_to_storage_error)
     }
 }
 
-fn spi_error_to_storage_error(e: SpiError) -> crate::platform::StorageError {
+fn spi_error_to_storage_error(e: SpiError) -> StorageError {
     match e {
-        SpiError::WriteProtected => crate::platform::StorageError::WriteProtected,
-        SpiError::AccessDenied => crate::platform::StorageError::AccessDenied,
-        SpiError::Timeout => crate::platform::StorageError::Timeout,
-        SpiError::InvalidArgument | SpiError::AddressOutOfRange => {
-            crate::platform::StorageError::InvalidArgument
-        }
-        SpiError::NotSupported => crate::platform::StorageError::NotSupported,
-        _ => crate::platform::StorageError::IoError,
+        SpiError::WriteProtected => StorageError::WriteProtected,
+        SpiError::AccessDenied => StorageError::AccessDenied,
+        SpiError::Timeout => StorageError::Timeout,
+        SpiError::InvalidArgument | SpiError::AddressOutOfRange => StorageError::InvalidArgument,
+        SpiError::NotSupported => StorageError::NotSupported,
+        _ => StorageError::IoError,
     }
 }
 
 impl SpiController for AnySpiController {
     fn name(&self) -> &'static str {
         match self {
-            Self::Intel(c) => c.name(),
-            Self::Amd(c) => c.name(),
+            Self::Intel(_) => "Intel ICH/PCH SPI",
+            Self::Amd(_) => "AMD SPI100",
             Self::Qemu(c) => c.name(),
         }
     }
 
     fn is_locked(&self) -> bool {
+        use rflasher_internal::controller::Controller;
+
         match self {
             Self::Intel(c) => c.is_locked(),
             Self::Amd(c) => c.is_locked(),
@@ -234,6 +288,8 @@ impl SpiController for AnySpiController {
     }
 
     fn writes_enabled(&self) -> bool {
+        use rflasher_internal::controller::Controller;
+
         match self {
             Self::Intel(c) => c.writes_enabled(),
             Self::Amd(c) => c.writes_enabled(),
@@ -242,131 +298,144 @@ impl SpiController for AnySpiController {
     }
 
     fn enable_writes(&mut self) -> Result<()> {
+        use rflasher_internal::controller::Controller;
+
         match self {
-            Self::Intel(c) => c.enable_writes(),
-            Self::Amd(c) => c.enable_writes(),
+            Self::Intel(c) => c.enable_bios_write().map_err(map_internal_error),
+            Self::Amd(c) => c.enable_bios_write().map_err(map_internal_error),
             Self::Qemu(c) => c.enable_writes(),
         }
     }
 
     fn read(&mut self, addr: u32, buf: &mut [u8]) -> Result<()> {
+        use rflasher_internal::controller::Controller;
+
         match self {
-            Self::Intel(c) => c.read(addr, buf),
-            Self::Amd(c) => c.read(addr, buf),
+            Self::Intel(c) => c.controller_read(addr, buf, 0).map_err(map_core_error),
+            Self::Amd(c) => c.controller_read(addr, buf, 0).map_err(map_core_error),
             Self::Qemu(c) => c.read(addr, buf),
         }
     }
 
     fn write(&mut self, addr: u32, data: &[u8]) -> Result<()> {
+        use rflasher_internal::controller::Controller;
+
         match self {
-            Self::Intel(c) => c.write(addr, data),
-            Self::Amd(c) => c.write(addr, data),
+            Self::Intel(c) => c.controller_write(addr, data).map_err(map_core_error),
+            Self::Amd(c) => c.controller_write(addr, data).map_err(map_core_error),
             Self::Qemu(c) => c.write(addr, data),
         }
     }
 
     fn erase(&mut self, addr: u32, len: u32) -> Result<()> {
+        use rflasher_internal::controller::Controller;
+
         match self {
-            Self::Intel(c) => c.erase(addr, len),
-            Self::Amd(c) => c.erase(addr, len),
+            Self::Intel(c) => c.controller_erase(addr, len).map_err(map_core_error),
+            Self::Amd(c) => c.controller_erase(addr, len).map_err(map_core_error),
             Self::Qemu(c) => c.erase(addr, len),
         }
     }
 
     fn mode(&self) -> SpiMode {
         match self {
-            Self::Intel(c) => c.mode(),
-            Self::Amd(c) => c.mode(),
+            Self::Intel(c) => match c.mode() {
+                rflasher_internal::SpiMode::Auto => SpiMode::Auto,
+                rflasher_internal::SpiMode::HardwareSequencing => SpiMode::HardwareSequencing,
+                rflasher_internal::SpiMode::SoftwareSequencing => SpiMode::SoftwareSequencing,
+            },
+            Self::Amd(_) => SpiMode::SoftwareSequencing,
             Self::Qemu(c) => c.mode(),
         }
     }
+
+    fn get_bios_region(&self) -> Option<(u32, u32)> {
+        match self {
+            Self::Intel(c) => c.get_bios_region(),
+            Self::Amd(_) => None,
+            Self::Qemu(c) => c.get_bios_region(),
+        }
+    }
 }
 
-/// Detect the system's SPI controller chipset
-///
-/// Scans the PCI bus for known Intel and AMD chipsets that contain
-/// SPI flash controllers.
-pub fn detect_chipset() -> Option<DetectedChipset> {
+fn map_internal_error(error: rflasher_internal::InternalError) -> SpiError {
+    match error {
+        rflasher_internal::InternalError::NoChipset => SpiError::NoChipset,
+        rflasher_internal::InternalError::UnsupportedChipset { .. } => SpiError::UnsupportedChipset,
+        rflasher_internal::InternalError::MultipleChipsets => SpiError::UnsupportedChipset,
+        rflasher_internal::InternalError::PciAccess(_) => SpiError::InitFailed,
+        rflasher_internal::InternalError::MemoryMap { .. } => SpiError::InitFailed,
+        rflasher_internal::InternalError::ChipsetEnable(_) => SpiError::InitFailed,
+        rflasher_internal::InternalError::SpiInit(_) => SpiError::InitFailed,
+        rflasher_internal::InternalError::AccessDenied { .. } => SpiError::AccessDenied,
+        rflasher_internal::InternalError::InvalidDescriptor => SpiError::InvalidDescriptor,
+        rflasher_internal::InternalError::NotSupported(_) => SpiError::NotSupported,
+        rflasher_internal::InternalError::Io(_) => SpiError::CycleError,
+    }
+}
+
+fn map_core_error(error: rflasher_core::error::Error) -> SpiError {
+    use rflasher_core::error::Error;
+
+    match error {
+        Error::SpiTimeout | Error::Timeout => SpiError::Timeout,
+        Error::AddressOutOfBounds => SpiError::AddressOutOfRange,
+        Error::InvalidAlignment | Error::BufferTooSmall => SpiError::InvalidArgument,
+        Error::WriteProtected => SpiError::WriteProtected,
+        Error::RegionProtected => SpiError::AccessDenied,
+        Error::OpcodeNotSupported | Error::IoModeNotSupported => SpiError::NotSupported,
+        Error::EraseError(_) | Error::WriteError { .. } | Error::ReadError { .. } => {
+            SpiError::CycleError
+        }
+        _ => SpiError::CycleError,
+    }
+}
+
+type RflasherPciDevices =
+    heapless::Vec<rflasher_internal::PciDevice, { crate::state::MAX_PCI_DEVICES }>;
+
+fn rflasher_pci_device(dev: &pci::PciDevice) -> rflasher_internal::PciDevice {
+    let class =
+        ((dev.class_code as u32) << 16) | ((dev.subclass as u32) << 8) | (dev.prog_if as u32);
+
+    rflasher_internal::PciDevice {
+        domain: 0,
+        bus: dev.address.bus,
+        device: dev.address.device,
+        function: dev.address.function,
+        vendor_id: dev.vendor_id,
+        device_id: dev.device_id,
+        revision_id: dev.revision,
+        class,
+    }
+}
+
+fn rflasher_pci_devices() -> RflasherPciDevices {
     let devices = pci::get_all_devices();
+    let mut result = heapless::Vec::new();
 
-    // First try Intel chipsets (look for LPC/eSPI bridge at 00:1f.0)
-    for dev in devices.iter() {
-        if dev.vendor_id == INTEL_VID {
-            // Check if this is a known Intel LPC bridge
-            if let Some(enable) = intel_chipsets::find_chipset(dev.vendor_id, dev.device_id) {
-                log::info!(
-                    "Found Intel chipset: {} ({:04x}:{:04x}) at {}",
-                    enable.device_name,
-                    dev.vendor_id,
-                    dev.device_id,
-                    dev.address
-                );
-
-                return Some(DetectedChipset {
-                    pci_device: dev.clone(),
-                    vendor: ChipsetVendor::Intel,
-                    name: enable.device_name,
-                    intel_type: Some(enable.chipset),
-                    amd_type: None,
-                });
-            }
+    for rdev in devices.iter().map(rflasher_pci_device) {
+        if result.push(rdev).is_err() {
+            log::warn!("rflasher PCI device list full");
+            break;
         }
     }
 
-    // Try AMD chipsets (look for SMBus controller)
-    for dev in devices.iter() {
-        if dev.vendor_id == AMD_VID || dev.vendor_id == ATI_VID {
-            // Check if this is a known AMD chipset
-            if let Some(enable) =
-                amd_chipsets::find_chipset(dev.vendor_id, dev.device_id, dev.revision)
-            {
-                log::info!(
-                    "Found AMD chipset: {} ({:04x}:{:04x} rev {:02x}) at {}",
-                    enable.device_name,
-                    dev.vendor_id,
-                    dev.device_id,
-                    dev.revision,
-                    dev.address
-                );
-
-                return Some(DetectedChipset {
-                    pci_device: dev.clone(),
-                    vendor: ChipsetVendor::Amd,
-                    name: enable.device_name,
-                    intel_type: None,
-                    amd_type: Some(enable.chipset),
-                });
-            }
-        }
-    }
-
-    log::warn!("No supported SPI controller chipset found");
-    None
+    result
 }
 
-/// Detect and initialize the SPI controller
-///
-/// This is the main entry point for using the SPI flash controller.
-/// It detects the chipset type and initializes the appropriate driver.
+/// Detect and initialize the SPI controller.
 ///
 /// Detection order:
-/// 1. Check if running in QEMU - if so, prefer pflash backend
-/// 2. Try Intel/AMD chipset detection for real hardware
-/// 3. Fall back to QEMU pflash if nothing else works
+/// 1. Check if running in QEMU - if so, prefer pflash backend.
+/// 2. Try rflasher's Intel/AMD internal programmer support for real hardware.
+/// 3. Fall back to QEMU pflash if nothing else works.
 pub fn detect_and_init() -> Option<AnySpiController> {
-    // SPI/pflash variable store requires memory-mapped flash.
-    // On aarch64/riscv64 platforms (QEMU virt, SBSA) the SPI flash is not
-    // memory-mapped at x86 addresses — skip the blind probe.
-    // If platform code configures the QEMU pflash mapping, the pflash backend
-    // will use those addresses instead.
     if cfg!(target_arch = "aarch64") || cfg!(target_arch = "riscv64") {
         log::debug!("SPI flash detection skipped on non-x86 (no memory-mapped SPI flash)");
         return None;
     }
 
-    // First check if we're running in QEMU - if so, prefer pflash
-    // QEMU emulates chipsets like ICH9, but the SPI controller doesn't
-    // actually work like real hardware. The pflash backend is more reliable.
     log::debug!("Checking for QEMU environment...");
     let is_qemu = qemu::detect_qemu_pflash();
     log::debug!("QEMU detection result: {}", is_qemu);
@@ -378,62 +447,65 @@ pub fn detect_and_init() -> Option<AnySpiController> {
                 log::info!("QEMU pflash controller initialized");
                 return Some(AnySpiController::Qemu(controller));
             }
-            Err(e) => {
-                log::warn!("QEMU pflash not available: {:?}", e);
-                // Fall through to try Intel/AMD
-            }
+            Err(e) => log::warn!("QEMU pflash not available: {:?}", e),
         }
     }
 
-    // Try to detect Intel/AMD chipsets (for real hardware)
-    if let Some(chipset) = detect_chipset() {
-        match chipset.vendor {
-            ChipsetVendor::Intel => {
-                let intel_type = chipset.intel_type?;
-                match intel::IntelSpiController::new(&chipset.pci_device, intel_type, SpiMode::Auto)
-                {
-                    Ok(controller) => {
-                        log::info!(
-                            "Intel SPI controller initialized in {:?} mode",
-                            controller.mode()
-                        );
-                        return Some(AnySpiController::Intel(controller));
-                    }
-                    Err(e) => {
-                        log::error!("Failed to initialize Intel SPI controller: {:?}", e);
-                    }
+    let devices = rflasher_pci_devices();
+
+    match rflasher_internal::find_intel_chipset_in_devices(&devices) {
+        Ok(Some(chipset)) => {
+            log::info!(
+                "Found Intel chipset: {} {}",
+                chipset.vendor(),
+                chipset.name()
+            );
+            chipset.log_warnings();
+            match rflasher_internal::IchSpiController::new_with_host(
+                CrabEfiPciAccess,
+                &chipset,
+                rflasher_internal::SpiMode::Auto,
+            ) {
+                Ok(controller) => {
+                    log::info!(
+                        "Intel SPI controller initialized in {} mode",
+                        controller.mode()
+                    );
+                    return Some(AnySpiController::Intel(controller));
                 }
-            }
-            ChipsetVendor::Amd => {
-                let amd_type = chipset.amd_type?;
-                match amd::AmdSpi100Controller::new(&chipset.pci_device, amd_type) {
-                    Ok(controller) => {
-                        log::info!("AMD SPI100 controller initialized");
-                        return Some(AnySpiController::Amd(controller));
-                    }
-                    Err(e) => {
-                        log::error!("Failed to initialize AMD SPI100 controller: {:?}", e);
-                    }
-                }
-            }
-            ChipsetVendor::Qemu => {
-                // Should not happen from detect_chipset, but handle it anyway
-                match qemu::QemuPflashController::new() {
-                    Ok(controller) => {
-                        log::info!("QEMU pflash controller initialized");
-                        return Some(AnySpiController::Qemu(controller));
-                    }
-                    Err(e) => {
-                        log::error!("Failed to initialize QEMU pflash controller: {:?}", e);
-                    }
-                }
+                Err(e) => log::error!("Failed to initialize Intel SPI controller: {}", e),
             }
         }
+        Ok(None) => {}
+        Err(e) => log::warn!("Intel SPI chipset detection failed: {}", e),
+    }
+
+    match rflasher_internal::find_amd_chipset_in_devices(&devices) {
+        Ok(Some(chipset)) => {
+            log::info!("Found AMD chipset: {} {}", chipset.vendor(), chipset.name());
+            chipset.log_warnings();
+            match rflasher_internal::enable_amd_spi100_with_host(
+                &CrabEfiPciAccess,
+                chipset.enable,
+                Bdf::with_segment(chipset.domain, chipset.bus, chipset.device, 0),
+                chipset.revision_id,
+            )
+            .and_then(|info| info.create_controller_with_host(CrabEfiPciAccess))
+            {
+                Ok(controller) => {
+                    log::info!("AMD SPI100 controller initialized");
+                    return Some(AnySpiController::Amd(controller));
+                }
+                Err(e) => log::error!("Failed to initialize AMD SPI100 controller: {}", e),
+            }
+        }
+        Ok(None) => {}
+        Err(e) => log::warn!("AMD SPI chipset detection failed: {}", e),
     }
 
     log::warn!("No SPI controller found");
     None
 }
 
-// Re-export delay functions from the calibrated time module
+// Re-export delay functions from the calibrated time module for the QEMU backend.
 pub use crate::time::{delay_ms, delay_us};
