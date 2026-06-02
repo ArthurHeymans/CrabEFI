@@ -51,10 +51,10 @@ use crate::drivers::block::{AhciDisk, NvmeDisk, SdhciDisk, UsbDisk};
 // Re-export the public platform API at the crate root for ergonomic access.
 pub use platform::{
     BlockDevice, BlockDeviceInfo, BlockError, BootResult, CapsuleBackend, CapsuleRegion,
-    ConsoleInput, DebugOutput, DeferredBufferConfig, FirmwareInfo, FmapRegion, FramebufferConfig,
-    Key, KeyState, MemoryRegion, MemoryType, PlatformConfig, ResetHandler, ResetType, Rng,
-    RngError, RuntimeRegion, StorageBackend, StorageError, Timer, VarBackendError, VariableBackend,
-    VariableVisitor,
+    ConsoleInput, DebugOutput, DeferredBufferConfig, FirmwareInfo, FirmwareStorage, FmapRegion,
+    FramebufferConfig, Key, KeyState, MemoryRegion, MemoryType, PlatformConfig, ResetHandler,
+    ResetType, Rng, RngError, RuntimeRegion, StorageBackend, StorageError, Timer, VarBackendError,
+    VariableBackend, VariableStoreLocator, VariableStoreRegion, VariableVisitor,
 };
 
 /// Display a Secure Boot violation error on screen
@@ -114,9 +114,11 @@ pub fn display_secure_boot_error() {
 /// [`init()`] after architecture/platform-specific initialization is done.
 /// Extracting it eliminates ~40 lines of near-identical code between the
 /// two entry points.
-fn init_persistence_and_boot() -> ! {
+fn init_persistence_and_boot(
+    variable_store_locator: Option<&dyn platform::VariableStoreLocator>,
+) -> ! {
     // ---- Variable persistence ----
-    match efi::varstore::init_persistence() {
+    match efi::varstore::init_persistence(variable_store_locator) {
         Ok(()) => {
             log::info!("Variable store persistence initialized");
 
@@ -484,7 +486,7 @@ fn init_platform_impl(mut config: PlatformConfig) -> ! {
     efi::rtlog::init();
 
     // ---- 15. Variable persistence, Secure Boot, and boot manager ----
-    init_persistence_and_boot();
+    init_persistence_and_boot(config.variable_store_locator);
 }
 
 /// Store a device globally for SimpleFileSystem reads.

@@ -5,8 +5,8 @@
 //! CBMEM console, and ACPI tables.
 //!
 //! It also provides FMAP (Flash Map) parsing for locating flash regions
-//! like SMMSTORE. The FMAP location is obtained from coreboot's
-//! LB_TAG_BOOT_MEDIA_PARAMS table entry.
+//! like SMMSTORE. The coreboot payload can pass the FMAP location from
+//! LB_TAG_BOOT_MEDIA_PARAMS to that parser when the table entry is present.
 //!
 //! CFR (Coreboot Form Representation) parsing is also supported for
 //! exposing firmware configuration options to the user.
@@ -33,20 +33,6 @@ pub fn store_framebuffer_record_addr(addr: u64) {
     });
 }
 
-/// Store SMMSTORE v2 info in global state
-pub fn store_smmstorev2(smmstore: Smmstorev2Info) {
-    crate::state::with_drivers_mut(|drivers| {
-        drivers.platform.smmstorev2 = Some(smmstore);
-    });
-}
-
-/// Get access to the global SMMSTORE v2 info
-///
-/// Returns the SMMSTORE v2 info if available.
-pub fn get_smmstorev2() -> Option<Smmstorev2Info> {
-    crate::state::try_get().and_then(|state| state.drivers.platform.smmstorev2)
-}
-
 /// Store SPI flash info in global state
 pub fn store_spi_flash(spi_flash: SpiFlashInfo) {
     crate::state::with_drivers_mut(|drivers| {
@@ -59,21 +45,6 @@ pub fn store_spi_flash(spi_flash: SpiFlashInfo) {
 /// Returns a clone of the SPI flash info if available.
 pub fn get_spi_flash() -> Option<SpiFlashInfo> {
     crate::state::try_get().and_then(|state| state.drivers.platform.spi_flash.clone())
-}
-
-/// Store boot media params in global state
-pub fn store_boot_media(boot_media: BootMediaInfo) {
-    crate::state::with_drivers_mut(|drivers| {
-        drivers.platform.boot_media = Some(boot_media);
-    });
-}
-
-/// Get access to the global boot media params
-///
-/// Returns the boot media info if available.
-/// This includes the FMAP offset which can be used to locate flash regions.
-pub fn get_boot_media() -> Option<BootMediaInfo> {
-    crate::state::try_get().and_then(|state| state.drivers.platform.boot_media)
 }
 
 /// Store EFI firmware info in global state

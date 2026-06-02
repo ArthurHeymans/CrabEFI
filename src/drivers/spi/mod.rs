@@ -168,6 +168,29 @@ pub enum AnySpiController {
     Qemu(qemu::QemuPflashController),
 }
 
+impl crate::platform::FirmwareStorage for AnySpiController {
+    fn read(
+        &mut self,
+        offset: u32,
+        buffer: &mut [u8],
+    ) -> core::result::Result<(), crate::platform::StorageError> {
+        SpiController::read(self, offset, buffer).map_err(|e| match e {
+            SpiError::WriteProtected => crate::platform::StorageError::WriteProtected,
+            SpiError::AccessDenied => crate::platform::StorageError::AccessDenied,
+            SpiError::Timeout => crate::platform::StorageError::Timeout,
+            SpiError::InvalidArgument | SpiError::AddressOutOfRange => {
+                crate::platform::StorageError::InvalidArgument
+            }
+            SpiError::NotSupported => crate::platform::StorageError::NotSupported,
+            _ => crate::platform::StorageError::IoError,
+        })
+    }
+
+    fn bios_region(&self) -> Option<(u32, u32)> {
+        self.get_bios_region()
+    }
+}
+
 impl SpiController for AnySpiController {
     fn name(&self) -> &'static str {
         match self {

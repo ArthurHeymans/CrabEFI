@@ -79,6 +79,132 @@ impl crabefi::ResetHandler for CorebootReset {
     }
 }
 
+/// Coreboot-backed locator for CrabEFI's persistent variable store.
+///
+/// Coreboot can describe the store either directly via SMMSTORE v2 tables, or
+/// indirectly via an FMAP region on the boot medium. Both mechanisms are
+/// coreboot-specific, so they live in the coreboot payload instead of the
+/// platform-agnostic CrabEFI persistence path.
+struct CorebootVariableStoreLocator {
+    smmstorev2: Option<crabefi::coreboot::Smmstorev2Info>,
+    boot_media: Option<crabefi::coreboot::BootMediaInfo>,
+}
+
+impl CorebootVariableStoreLocator {
+    fn new(cb_info: &crabefi::coreboot::CorebootInfo) -> Self {
+        Self {
+            smmstorev2: cb_info.smmstorev2,
+            boot_media: cb_info.boot_media,
+        }
+    }
+
+    /// Convert coreboot's memory-mapped SMMSTORE address to a SPI flash offset.
+    fn calculate_spi_offset(mmap_addr: u64, bios_region: Option<(u32, u32)>) -> Option<u32> {
+        if mmap_addr == 0 {
+            return None;
+        }
+
+        if let Some((bios_base, bios_limit)) = bios_region {
+            if bios_limit >= bios_base {
+                let bios_size = (bios_limit - bios_base + 1) as u64;
+                let mmap_base = 0x1_0000_0000u64.checked_sub(bios_size)?;
+
+                if mmap_addr >= mmap_base && mmap_addr < 0x1_0000_0000u64 {
+                    let offset_in_bios = (mmap_addr - mmap_base) as u32;
+                    let flash_offset = bios_base.checked_add(offset_in_bios)?;
+                    log::debug!(
+                        "SMMSTORE SPI offset: mmap_addr={:#x}, bios_base={:#x}, bios_size={:#x}, flash_offset={:#x}",
+                        mmap_addr,
+                        bios_base,
+                        bios_size,
+                        flash_offset
+                    );
+                    return Some(flash_offset);
+                }
+            } else {
+                log::warn!(
+                    "Invalid BIOS region from flash descriptor: base={:#x}, limit={:#x}",
+                    bios_base,
+                    bios_limit
+                );
+            }
+        }
+
+        // Fallback heuristics for common top-of-4GiB firmware mappings.  Low
+        // addresses are not accepted: treating them as flash offsets can turn a
+        // missing SMMSTORE mapping into an unsafe write near flash offset zero.
+        if mmap_addr >= 0x1_0000_0000 {
+            None
+        } else if mmap_addr >= 0xFF00_0000 {
+            Some((mmap_addr - 0xFF00_0000) as u32)
+        } else if mmap_addr >= 0xFE00_0000 {
+            Some((mmap_addr - 0xFE00_0000) as u32)
+        } else if mmap_addr >= 0xFC00_0000 {
+            Some((mmap_addr - 0xFC00_0000) as u32)
+        } else {
+            None
+        }
+    }
+}
+
+impl crabefi::VariableStoreLocator for CorebootVariableStoreLocator {
+    fn locate_variable_store(
+        &self,
+        storage: &mut dyn crabefi::FirmwareStorage,
+    ) -> Option<crabefi::VariableStoreRegion> {
+        if let Some(smmstore) = self.smmstorev2 {
+            log::info!(
+                "Found SMMSTORE v2 in coreboot tables: {} blocks x {} KB at {:#x}",
+                smmstore.num_blocks,
+                smmstore.block_size / 1024,
+                smmstore.mmap_addr
+            );
+
+            let size = smmstore.num_blocks.checked_mul(smmstore.block_size);
+            let offset = Self::calculate_spi_offset(smmstore.mmap_addr, storage.bios_region());
+
+            if let (Some(offset), Some(size)) = (offset, size)
+                && size != 0
+            {
+                return Some(crabefi::VariableStoreRegion::new("SMMSTORE", offset, size));
+            }
+
+            log::warn!(
+                "Ignoring invalid SMMSTORE v2 mapping: mmap_addr={:#x}, num_blocks={}, block_size={}",
+                smmstore.mmap_addr,
+                smmstore.num_blocks,
+                smmstore.block_size
+            );
+        }
+
+        let fmap_offset = self.boot_media.and_then(|boot_media| {
+            if boot_media.fmap_offset <= u32::MAX as u64 {
+                Some(boot_media.fmap_offset as u32)
+            } else {
+                log::warn!(
+                    "Ignoring out-of-range coreboot FMAP offset {:#x}; probing instead",
+                    boot_media.fmap_offset
+                );
+                None
+            }
+        });
+        let region = crabefi::coreboot::fmap::get_smmstore_from_fmap(storage, fmap_offset)?;
+
+        log::info!(
+            "Found '{}' in FMAP: offset={:#x}, size={} KB",
+            region.name.as_str(),
+            region.offset,
+            region.size / 1024
+        );
+
+        Some(crabefi::VariableStoreRegion {
+            name: region.name,
+            offset: region.offset,
+            size: region.size,
+        })
+    }
+}
+
 // ============================================================================
 // Memory map conversion
 // ============================================================================
@@ -328,6 +454,7 @@ fn riscv_fdt_only_boot(fdt_ptr: u64, fdt_size: u32) -> ! {
         reset: &reset,
         block_devices: &mut [],
         variable_backend: None,
+        variable_store_locator: None,
         debug_output: None,
         console_input: None,
         framebuffer: None,
@@ -458,16 +585,8 @@ pub extern "C" fn rust_main(coreboot_table_ptr: u64) -> ! {
         crabefi::coreboot::store_framebuffer_record_addr(addr);
     }
 
-    if let Some(smmstore) = cb_info.smmstorev2 {
-        crabefi::coreboot::store_smmstorev2(smmstore);
-    }
-
     if let Some(ref spi_flash) = cb_info.spi_flash {
         crabefi::coreboot::store_spi_flash(spi_flash.clone());
-    }
-
-    if let Some(boot_media) = cb_info.boot_media {
-        crabefi::coreboot::store_boot_media(boot_media);
     }
 
     // Store EFI firmware info (GUID, version, LSV) for ESRT and capsule updates
@@ -532,6 +651,7 @@ pub extern "C" fn rust_main(coreboot_table_ptr: u64) -> ! {
     };
 
     let reset = CorebootReset;
+    let variable_store_locator = CorebootVariableStoreLocator::new(&cb_info);
 
     // Extract FDT bytes slice.
     //
@@ -563,6 +683,7 @@ pub extern "C" fn rust_main(coreboot_table_ptr: u64) -> ! {
         reset: &reset,
         block_devices: &mut [],
         variable_backend: None,
+        variable_store_locator: Some(&variable_store_locator),
         debug_output: None, // Already set up via init_from_coreboot()
         console_input: None,
         framebuffer: cb_info.framebuffer.map(crabefi::FramebufferConfig::from),

@@ -816,10 +816,8 @@ impl Default for TimingState {
 /// Platform hardware info sourced from coreboot tables or platform config.
 ///
 /// Shared fields (framebuffer, ACPI RSDP) are used by both integration paths.
-/// Coreboot-specific fields (SMMSTORE, SPI flash, FMAP, CBMEM) are only
-/// populated by the coreboot payload's `init()` path and remain `None`/zero
-/// in library mode. They should be gated behind a feature once the SPI
-/// variable persistence code is fully abstracted behind `VariableBackend`.
+/// Coreboot-specific global fields are limited to data that must remain
+/// accessible after the coreboot payload hands off to the library path.
 pub struct PlatformInfo {
     /// Global framebuffer info
     pub framebuffer: Option<FramebufferConfig>,
@@ -829,14 +827,8 @@ pub struct PlatformInfo {
     /// Linux from trying to use both the coreboot framebuffer and the EFI GOP.
     pub coreboot_fb_record_addr: Option<u64>,
 
-    /// SMMSTORE v2 info for UEFI variable storage
-    pub smmstorev2: Option<crate::coreboot::Smmstorev2Info>,
-
     /// SPI flash info
     pub spi_flash: Option<crate::coreboot::SpiFlashInfo>,
-
-    /// Boot media params (FMAP location, etc.)
-    pub boot_media: Option<crate::coreboot::BootMediaInfo>,
 
     /// Storage backend for variable persistence (SPI flash).
     ///
@@ -867,9 +859,7 @@ impl PlatformInfo {
         Self {
             framebuffer: None,
             coreboot_fb_record_addr: None,
-            smmstorev2: None,
             spi_flash: None,
-            boot_media: None,
             storage: None,
             memory_regions: HeaplessVec::new(),
             acpi_rsdp: None,
