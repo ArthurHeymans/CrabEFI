@@ -1,20 +1,9 @@
-//! Storage Backend Abstraction
+//! Variable Store Storage Backends
 //!
-//! This module provides a trait for abstracting storage backends,
-//! allowing the variable store to work with different storage types:
-//! - SPI flash (Intel, AMD, QEMU pflash)
-//! - Memory-backed storage (for testing)
-//! - Future backends (NVMe namespaces, etc.)
-//!
-//! # Architecture
-//!
-//! The `StorageBackend` trait provides a minimal interface for block storage:
-//! - Read/write/erase operations
-//! - Write enable control
-//! - Basic device info
-//!
-//! This abstracts away the details of how storage is accessed, allowing
-//! the variable store persistence layer to be storage-agnostic.
+//! This module provides concrete implementations of the platform
+//! [`crate::platform::StorageBackend`] trait for CrabEFI-managed variable
+//! storage. The trait itself lives in `platform.rs` so direct-flash variable
+//! storage and platform integrations use the same abstraction.
 
 // Note: alloc imports are used by MemoryBackend in tests
 #[cfg(test)]
@@ -24,96 +13,9 @@ use alloc::vec;
 #[cfg(test)]
 use alloc::vec::Vec;
 
-/// Errors that can occur during storage operations
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum StorageError {
-    /// Storage device not initialized
-    NotInitialized,
-    /// Storage device is write-protected
-    WriteProtected,
-    /// Access denied (locked region)
-    AccessDenied,
-    /// Operation timed out
-    Timeout,
-    /// Invalid address or length
-    InvalidArgument,
-    /// Generic I/O error
-    IoError,
-    /// Operation not supported by this backend
-    NotSupported,
-}
+use crate::platform::{StorageBackend, StorageError};
 
-/// Result type for storage operations
-pub type Result<T> = core::result::Result<T, StorageError>;
-
-/// Storage backend trait
-///
-/// This trait abstracts storage operations, allowing different backends
-/// (SPI flash, memory, etc.) to be used interchangeably by the variable store.
-///
-/// # Implementation Notes
-///
-/// - `read` should work on any valid offset within the storage size
-/// - `write` may require the region to be erased first (flash semantics)
-/// - `erase` sets bytes to 0xFF (NOR flash erased state)
-/// - `enable_writes` may be a no-op for some backends (e.g., memory)
-pub trait StorageBackend: Send {
-    /// Get the backend name (for logging/debugging)
-    fn name(&self) -> &str;
-
-    /// Get the total storage size in bytes
-    fn size(&self) -> u32;
-
-    /// Check if the storage is write-protected
-    fn is_write_protected(&self) -> bool;
-
-    /// Enable writes to the storage
-    ///
-    /// This may need to clear write-protection bits on some hardware.
-    /// Returns Ok(()) if writes are enabled, or an error if they cannot be enabled.
-    fn enable_writes(&mut self) -> Result<()>;
-
-    /// Read data from storage
-    ///
-    /// # Arguments
-    /// - `offset`: Byte offset within the storage
-    /// - `buffer`: Buffer to read data into
-    ///
-    /// # Errors
-    /// - `InvalidArgument` if offset + buffer.len() exceeds storage size
-    /// - `IoError` if the read operation fails
-    fn read(&mut self, offset: u32, buffer: &mut [u8]) -> Result<()>;
-
-    /// Write data to storage
-    ///
-    /// # Arguments
-    /// - `offset`: Byte offset within the storage
-    /// - `data`: Data to write
-    ///
-    /// # Notes
-    /// For flash storage, the region should be erased first (bytes must be 0xFF).
-    /// Writing can only clear bits (1->0), not set them.
-    ///
-    /// # Errors
-    /// - `WriteProtected` if writes are not enabled
-    /// - `InvalidArgument` if offset + data.len() exceeds storage size
-    /// - `IoError` if the write operation fails
-    fn write(&mut self, offset: u32, data: &[u8]) -> Result<()>;
-
-    /// Erase a region of storage
-    ///
-    /// Sets all bytes in the region to 0xFF (NOR flash erased state).
-    ///
-    /// # Arguments
-    /// - `offset`: Starting byte offset (may be aligned to erase block size)
-    /// - `size`: Number of bytes to erase (may be rounded up to erase block size)
-    ///
-    /// # Errors
-    /// - `WriteProtected` if writes are not enabled
-    /// - `InvalidArgument` if offset + size exceeds storage size
-    /// - `IoError` if the erase operation fails
-    fn erase(&mut self, offset: u32, size: u32) -> Result<()>;
-}
+type Result<T> = core::result::Result<T, StorageError>;
 
 /// Wrapper to adapt SPI controllers to the StorageBackend trait
 ///
@@ -275,60 +177,6 @@ impl StorageBackend for SpiStorageBackend {
                 _ => StorageError::IoError,
             }
         })
-    }
-}
-
-fn map_storage_error(error: StorageError) -> crate::platform::StorageError {
-    match error {
-        StorageError::NotInitialized => crate::platform::StorageError::NotInitialized,
-        StorageError::WriteProtected => crate::platform::StorageError::WriteProtected,
-        StorageError::AccessDenied => crate::platform::StorageError::AccessDenied,
-        StorageError::Timeout => crate::platform::StorageError::Timeout,
-        StorageError::InvalidArgument => crate::platform::StorageError::InvalidArgument,
-        StorageError::IoError => crate::platform::StorageError::IoError,
-        StorageError::NotSupported => crate::platform::StorageError::NotSupported,
-    }
-}
-
-impl crate::platform::StorageBackend for SpiStorageBackend {
-    fn name(&self) -> &str {
-        <Self as StorageBackend>::name(self)
-    }
-
-    fn size(&self) -> u32 {
-        <Self as StorageBackend>::size(self)
-    }
-
-    fn is_write_protected(&self) -> bool {
-        <Self as StorageBackend>::is_write_protected(self)
-    }
-
-    fn enable_writes(&mut self) -> core::result::Result<(), crate::platform::StorageError> {
-        <Self as StorageBackend>::enable_writes(self).map_err(map_storage_error)
-    }
-
-    fn read(
-        &mut self,
-        offset: u32,
-        buffer: &mut [u8],
-    ) -> core::result::Result<(), crate::platform::StorageError> {
-        <Self as StorageBackend>::read(self, offset, buffer).map_err(map_storage_error)
-    }
-
-    fn write(
-        &mut self,
-        offset: u32,
-        data: &[u8],
-    ) -> core::result::Result<(), crate::platform::StorageError> {
-        <Self as StorageBackend>::write(self, offset, data).map_err(map_storage_error)
-    }
-
-    fn erase(
-        &mut self,
-        offset: u32,
-        size: u32,
-    ) -> core::result::Result<(), crate::platform::StorageError> {
-        <Self as StorageBackend>::erase(self, offset, size).map_err(map_storage_error)
     }
 }
 

@@ -51,7 +51,7 @@ pub use crate::platform::{StorageBackend, StorageError};
 pub use storage::SpiStorageBackend;
 
 // Re-export the EDK2 variable backend for use by platforms with raw flash
-pub use edk2_backend::Edk2VarStore;
+pub use edk2_backend::{Edk2Store, Edk2StoreState, Edk2VarStore};
 
 use alloc::vec::Vec;
 use serde::{Deserialize, Serialize};

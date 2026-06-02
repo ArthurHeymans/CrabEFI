@@ -27,12 +27,14 @@
 use alloc::vec::Vec;
 
 use crate::drivers::spi::{self, SpiController};
-use crate::platform::{FirmwareStorage, FirmwareStorageRegion, VariableStoreLocator};
+use crate::platform::{
+    FirmwareStorage, FirmwareStorageRegion, StorageBackend, VarBackendError, VariableStoreLocator,
+};
 use crate::state::{self, MAX_VARIABLE_DATA_SIZE, MAX_VARIABLE_NAME_LEN};
 
-use super::VarStoreError;
 use super::edk2;
-use super::storage::{SpiStorageBackend, StorageBackend};
+use super::storage::SpiStorageBackend;
+use super::{Edk2Store, VarStoreError};
 
 /// Default variable store base address in SPI flash
 /// This is typically at the end of the flash region
@@ -42,6 +44,35 @@ pub const DEFAULT_VARSTORE_BASE: u32 = 0x00F00000; // 15MB offset (for 16MB flas
 /// Default variable store size (256KB)
 /// Used only as fallback if coreboot tables don't provide config info
 pub const DEFAULT_VARSTORE_SIZE: u32 = 256 * 1024;
+
+fn map_backend_error(error: VarBackendError) -> VarStoreError {
+    match error {
+        VarBackendError::NotAvailable => VarStoreError::NotInitialized,
+        VarBackendError::StoreFull => VarStoreError::StoreFull,
+        VarBackendError::IoError => VarStoreError::SpiError,
+        VarBackendError::Locked => VarStoreError::Locked,
+        VarBackendError::NotFound => VarStoreError::NotFound,
+        VarBackendError::DataTooLarge => VarStoreError::DataTooLarge,
+        VarBackendError::NameTooLong => VarStoreError::NameTooLong,
+        VarBackendError::Other => VarStoreError::InvalidArgument,
+    }
+}
+
+fn with_edk2_store_mut<R>(
+    f: impl FnOnce(&mut Edk2Store<'_>) -> Result<R, VarBackendError>,
+) -> Result<R, VarStoreError> {
+    state::with_mut(|state| {
+        let storage = state
+            .drivers
+            .platform
+            .storage
+            .as_mut()
+            .ok_or(VarBackendError::NotAvailable)?;
+        let mut store = Edk2Store::new(storage, &mut state.efi.varstore);
+        f(&mut store)
+    })
+    .map_err(map_backend_error)
+}
 
 /// Initialize the variable store persistence layer
 ///
@@ -187,185 +218,67 @@ fn validate_variable_store_region(
 /// Reads the FV header to validate the region, or formats it if invalid.
 /// This uses EDK2 Firmware Volume format compatible with coreboot's SMMSTORE.
 fn init_varstore() -> Result<(), VarStoreError> {
-    // Read enough bytes for FV header + VS header
-    let header_size = edk2::FV_HEADER_LENGTH + edk2::VS_HEADER_LENGTH;
-    let mut header_bytes = [0u8; 128]; // Enough for FV + VS headers (100 bytes needed)
-    let storage_size = state::with_storage_mut(|storage| {
-        storage
-            .read(0, &mut header_bytes[..header_size])
-            .map_err(|_| VarStoreError::SpiError)?;
-        Ok::<u32, VarStoreError>(storage.size())
-    })
-    .ok_or(VarStoreError::NotInitialized)??;
-
-    // Log raw header bytes for debugging
-    log::debug!(
-        "Variable store header bytes: {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x}",
-        header_bytes[0],
-        header_bytes[1],
-        header_bytes[2],
-        header_bytes[3],
-        header_bytes[4],
-        header_bytes[5],
-        header_bytes[6],
-        header_bytes[7],
-        header_bytes[8],
-        header_bytes[9],
-        header_bytes[10],
-        header_bytes[11],
-        header_bytes[12],
-        header_bytes[13],
-        header_bytes[14],
-        header_bytes[15]
-    );
-
-    // Validate EDK2 FV header
-    let validation = edk2::validate_fv(&header_bytes[..header_size], storage_size);
-
-    if validation.valid {
-        log::info!(
-            "EDK2 FV found: auth_format={}, data_size={} KB",
-            validation.auth_format,
-            validation.data_size / 1024
-        );
-
-        // Store format info in varstore state
-        state::with_varstore_mut(|vs| {
-            vs.initialized = true;
-            vs.auth_format = validation.auth_format;
-            vs.data_size = validation.data_size;
-        });
-
-        // Find the write offset (first free byte)
-        let auth_format = validation.auth_format;
-        let data_size = validation.data_size;
-        let write_offset = state::with_storage_mut(|storage| {
-            let mut read_fn =
-                |offset: u32, buf: &mut [u8]| -> bool { storage.read(offset, buf).is_ok() };
-            edk2::find_write_offset(&mut read_fn, auth_format, data_size)
-        })
-        .ok_or(VarStoreError::NotInitialized)?;
-
-        state::with_varstore_mut(|vs| {
-            vs.write_offset = write_offset;
-        });
-
-        log::info!("Variable store write offset: {:#x}", write_offset);
-        return Ok(());
-    }
-
-    // FV header invalid or missing - format the store with EDK2 FV headers
-    log::info!(
-        "Formatting variable store as EDK2 FV (size {} KB)...",
-        storage_size / 1024
-    );
-
-    // Build EDK2 FV + VS headers
-    let fv_headers = edk2::build_fv_headers(storage_size);
-
-    // Try to enable writes, erase, and write headers
-    state::with_storage_mut(|storage| {
-        if let Err(e) = storage.enable_writes() {
-            log::warn!("Could not enable storage writes: {:?}", e);
-            // Continue anyway - the erase/write will fail if truly locked
-        }
-
-        // Erase the region
-        storage
-            .erase(0, storage_size)
-            .map_err(|_| VarStoreError::SpiError)?;
-
-        // Write new FV + VS headers
-        storage
-            .write(0, &fv_headers)
-            .map_err(|_| VarStoreError::SpiError)?;
-
-        Ok::<(), VarStoreError>(())
-    })
-    .ok_or(VarStoreError::NotInitialized)??;
-
-    // Non-auth format (we always create non-auth stores)
-    let data_size = storage_size - edk2::FV_HEADER_LENGTH as u32 - edk2::VS_HEADER_LENGTH as u32;
-
-    state::with_varstore_mut(|vs| {
-        vs.initialized = true;
-        vs.auth_format = false;
-        vs.data_size = data_size;
-        vs.write_offset = edk2::VARIABLE_DATA_OFFSET;
-    });
-
-    log::info!("Variable store formatted as EDK2 FV successfully");
-    Ok(())
+    with_edk2_store_mut(|store| store.ensure_initialized())
 }
 
 /// Load variables from storage into the in-memory cache
 fn load_variables_from_storage() -> Result<(), VarStoreError> {
-    let vs = state::varstore();
-    if !vs.initialized {
-        return Err(VarStoreError::NotInitialized);
-    }
-    let auth_format = vs.auth_format;
-    let data_size = vs.data_size;
-
-    // Walk all variable records in the FV
-    let vars = state::with_storage_mut(|storage| {
-        let mut read_fn =
-            |offset: u32, buf: &mut [u8]| -> bool { storage.read(offset, buf).is_ok() };
-        edk2::walk_variables(&mut read_fn, auth_format, data_size)
-    })
-    .ok_or(VarStoreError::NotInitialized)?;
-
-    // Filter to only VAR_ADDED records and deduplicate (keep latest)
-    // Build a list of active variables
-    let mut active_vars: Vec<&edk2::FvVariable> = Vec::new();
-    for var in &vars {
-        if !edk2::is_var_added(var.state) {
-            continue;
-        }
-        // Remove any existing entry with same GUID + name
-        active_vars.retain(|existing| {
-            !(existing.guid == var.guid && edk2::name_matches(&existing.name, &var.name))
-        });
-        active_vars.push(var);
+    struct CacheVisitor<'a> {
+        variables: &'a mut [crate::state::VariableEntry],
+        count: usize,
+        full: bool,
     }
 
-    // Load active variables into in-memory cache
-    state::with_efi_mut(|efi| {
-        for var in &active_vars {
-            // Find a free slot
-            if let Some(slot) = efi.variables.iter_mut().find(|v| !v.in_use) {
-                // Copy name (UTF-16, strip trailing null for the fixed-size buffer)
-                let name_len = var.name.len().min(MAX_VARIABLE_NAME_LEN);
-                slot.name[..name_len].copy_from_slice(&var.name[..name_len]);
-                if name_len < MAX_VARIABLE_NAME_LEN {
-                    slot.name[name_len..].fill(0);
-                }
+    impl crate::platform::VariableVisitor for CacheVisitor<'_> {
+        fn visit(&mut self, name: &[u16], vendor: &r_efi::efi::Guid, attributes: u32, data: &[u8]) {
+            let Some(slot) = self.variables.iter_mut().find(|v| !v.in_use) else {
+                self.full = true;
+                return;
+            };
 
-                // Convert GUID bytes to r_efi::efi::Guid
-                slot.vendor_guid = guid_bytes_to_efi(&var.guid);
-                slot.attributes = var.attributes;
-
-                let data_len = var.data.len().min(MAX_VARIABLE_DATA_SIZE);
-                slot.data[..data_len].copy_from_slice(&var.data[..data_len]);
-                slot.data_size = data_len;
-                slot.in_use = true;
-
-                // Log the loaded variable name
-                let name_str: Vec<u8> = var
-                    .name
-                    .iter()
-                    .take_while(|&&c| c != 0)
-                    .map(|&c| c as u8)
-                    .collect();
-                log::debug!("Loaded variable: {:?}", core::str::from_utf8(&name_str));
-            } else {
-                log::warn!("No free variable slots - some variables may be lost");
-                break;
+            let name_len = name.len().min(MAX_VARIABLE_NAME_LEN);
+            slot.name[..name_len].copy_from_slice(&name[..name_len]);
+            if name_len < MAX_VARIABLE_NAME_LEN {
+                slot.name[name_len..].fill(0);
             }
-        }
-    });
 
-    log::info!("Loaded {} variables from storage", active_vars.len());
+            slot.vendor_guid = *vendor;
+            slot.attributes = attributes;
+
+            let data_len = data.len().min(MAX_VARIABLE_DATA_SIZE);
+            slot.data[..data_len].copy_from_slice(&data[..data_len]);
+            slot.data_size = data_len;
+            slot.in_use = true;
+            self.count += 1;
+
+            let name_str: Vec<u8> = name.iter().map(|&c| c as u8).collect();
+            log::debug!("Loaded variable: {:?}", core::str::from_utf8(&name_str));
+        }
+    }
+
+    let (loaded, full) = state::with_mut(|state| {
+        let storage = state
+            .drivers
+            .platform
+            .storage
+            .as_mut()
+            .ok_or(VarBackendError::NotAvailable)?;
+        let efi = &mut state.efi;
+        let mut store = Edk2Store::new(storage, &mut efi.varstore);
+        let mut visitor = CacheVisitor {
+            variables: &mut efi.variables,
+            count: 0,
+            full: false,
+        };
+        store.load(&mut visitor)?;
+        Ok::<(usize, bool), VarBackendError>((visitor.count, visitor.full))
+    })
+    .map_err(map_backend_error)?;
+
+    if full {
+        log::warn!("No free variable slots - some variables may be lost");
+    }
+    log::info!("Loaded {} variables from storage", loaded);
     Ok(())
 }
 
@@ -445,72 +358,16 @@ pub fn delete_variable(guid: &r_efi::efi::Guid, name: &[u16]) -> Result<(), VarS
 /// This is the internal function that actually writes to storage.
 /// It's exposed to the deferred module for applying queued changes.
 ///
-/// Steps:
-/// 1. Walk existing records to find and delete any old version
-/// 2. Append new record at write_offset using multi-stage protocol
-/// 3. If store is full, compact and retry
+/// Delegates to the shared EDK2 store implementation, which preflights
+/// compaction before modifying flash and appends replacements before deleting
+/// old records.
 pub(super) fn write_variable_to_storage_internal(
     guid: &r_efi::efi::Guid,
     name: &[u16],
     attributes: u32,
     data: &[u8],
 ) -> Result<(), VarStoreError> {
-    let vs = state::varstore();
-    if !vs.initialized {
-        return Err(VarStoreError::NotInitialized);
-    }
-
-    let guid_bytes = edk2::guid_to_bytes(guid);
-
-    // First, mark any existing record with same GUID+name as deleted
-    delete_existing_record(&guid_bytes, name)?;
-
-    // Check if we have space for the new record
-    let record = edk2::build_variable_record(&guid_bytes, name, attributes, data);
-    let record_len = record.len() as u32;
-
-    let vs = state::varstore();
-    let storage_size =
-        state::with_storage_mut(|s| s.size()).ok_or(VarStoreError::NotInitialized)?;
-
-    if vs.write_offset + record_len > storage_size {
-        log::info!("Variable store full, triggering compaction");
-        compact_varstore()?;
-    }
-
-    let vs = state::varstore();
-    if vs.write_offset + record_len > storage_size {
-        log::error!("Variable store still full after compaction");
-        return Err(VarStoreError::StoreFull);
-    }
-
-    let write_offset = vs.write_offset;
-
-    // Write the new record using multi-stage protocol
-    let new_offset = state::with_storage_mut(|storage| {
-        if let Err(e) = storage.enable_writes() {
-            log::warn!("Could not enable storage writes: {:?}", e);
-        }
-        let mut write_fn =
-            |offset: u32, data: &[u8]| -> bool { storage.write(offset, data).is_ok() };
-        edk2::write_variable(
-            &mut write_fn,
-            write_offset,
-            &guid_bytes,
-            name,
-            attributes,
-            data,
-        )
-    })
-    .ok_or(VarStoreError::NotInitialized)?
-    .ok_or(VarStoreError::SpiError)?;
-
-    state::with_varstore_mut(|vs| {
-        vs.write_offset = new_offset;
-    });
-
-    log::debug!("Variable persisted at offset {:#x}", write_offset);
-    Ok(())
+    with_edk2_store_mut(|store| store.write(name, guid, attributes, data))
 }
 
 /// Delete a variable from storage by marking its record as deleted
@@ -521,62 +378,10 @@ pub(super) fn write_variable_deletion_internal(
     guid: &r_efi::efi::Guid,
     name: &[u16],
 ) -> Result<(), VarStoreError> {
-    let vs = state::varstore();
-    if !vs.initialized {
-        return Err(VarStoreError::NotInitialized);
+    match with_edk2_store_mut(|store| store.delete(name, guid)) {
+        Ok(()) | Err(VarStoreError::NotFound) => Ok(()),
+        Err(e) => Err(e),
     }
-
-    let guid_bytes = edk2::guid_to_bytes(guid);
-    delete_existing_record(&guid_bytes, name)
-}
-
-/// Find and mark as deleted any existing record with the given GUID+name
-fn delete_existing_record(guid_bytes: &[u8; 16], name: &[u16]) -> Result<(), VarStoreError> {
-    let vs = state::varstore();
-    let auth_format = vs.auth_format;
-    let data_size = vs.data_size;
-
-    // Walk all records to find matching ones
-    let vars = state::with_storage_mut(|storage| {
-        let mut read_fn =
-            |offset: u32, buf: &mut [u8]| -> bool { storage.read(offset, buf).is_ok() };
-        edk2::walk_variables(&mut read_fn, auth_format, data_size)
-    })
-    .ok_or(VarStoreError::NotInitialized)?;
-
-    // Find and delete matching VAR_ADDED records
-    for var in &vars {
-        if edk2::is_var_added(var.state)
-            && var.guid == *guid_bytes
-            && edk2::name_matches(&var.name, name)
-        {
-            // Mark as deleted by writing to the state byte
-            let deleted = state::with_storage_mut(|storage| {
-                if let Err(e) = storage.enable_writes() {
-                    log::warn!("Could not enable storage writes: {:?}", e);
-                }
-                let mut write_fn =
-                    |offset: u32, data: &[u8]| -> bool { storage.write(offset, data).is_ok() };
-                edk2::mark_deleted(&mut write_fn, var.state_offset)
-            })
-            .ok_or(VarStoreError::NotInitialized)?;
-
-            if !deleted {
-                log::warn!(
-                    "Failed to mark variable as deleted at state_offset {:#x}",
-                    var.state_offset
-                );
-                return Err(VarStoreError::SpiError);
-            }
-
-            log::debug!(
-                "Marked existing variable as deleted at state_offset {:#x}",
-                var.state_offset
-            );
-        }
-    }
-
-    Ok(())
 }
 
 /// Queue a variable write for deferred processing (after ExitBootServices)
@@ -635,115 +440,11 @@ pub fn get_varstore_stats() -> Option<(u32, u32, u32)> {
 /// Returns the number of bytes reclaimed.
 pub fn compact_varstore() -> Result<u32, VarStoreError> {
     log::info!("Compacting variable store...");
-
-    let vs = state::varstore();
-    if !vs.initialized {
-        return Err(VarStoreError::NotInitialized);
-    }
-
-    let old_write_offset = vs.write_offset;
-    let auth_format = vs.auth_format;
-    let data_size = vs.data_size;
-    let size = state::with_storage_mut(|s| s.size()).ok_or(VarStoreError::NotInitialized)?;
-
-    // Step 1: Collect all active variable records
-    let vars = state::with_storage_mut(|storage| {
-        let mut read_fn =
-            |offset: u32, buf: &mut [u8]| -> bool { storage.read(offset, buf).is_ok() };
-        edk2::walk_variables(&mut read_fn, auth_format, data_size)
-    })
-    .ok_or(VarStoreError::NotInitialized)?;
-
-    // Keep only VAR_ADDED records, deduplicated (latest wins)
-    let mut active_vars: Vec<edk2::FvVariable> = Vec::new();
-    for var in vars {
-        if !edk2::is_var_added(var.state) {
-            continue;
-        }
-        active_vars.retain(|existing| {
-            !(existing.guid == var.guid && edk2::name_matches(&existing.name, &var.name))
-        });
-        active_vars.push(var);
-    }
-
+    let reclaimed = with_edk2_store_mut(|store| store.compact())?;
     log::info!(
-        "Found {} active variables to preserve during compaction",
-        active_vars.len()
+        "Variable store compaction complete: reclaimed {} bytes",
+        reclaimed
     );
-
-    // Step 2: Enable writes and erase the region
-    // Step 3: Write fresh EDK2 FV + VS headers
-    let fv_headers = edk2::build_fv_headers(size);
-
-    state::with_storage_mut(|storage| {
-        if let Err(e) = storage.enable_writes() {
-            log::warn!("Could not enable storage writes for compaction: {:?}", e);
-        }
-
-        storage
-            .erase(0, size)
-            .map_err(|_| VarStoreError::SpiError)?;
-
-        storage
-            .write(0, &fv_headers)
-            .map_err(|_| VarStoreError::SpiError)?;
-
-        Ok::<(), VarStoreError>(())
-    })
-    .ok_or(VarStoreError::NotInitialized)??;
-
-    // Step 4: Rewrite all active variables
-    let mut new_offset = edk2::VARIABLE_DATA_OFFSET;
-
-    for var in &active_vars {
-        // Check if we have space
-        let record = edk2::build_variable_record(&var.guid, &var.name, var.attributes, &var.data);
-        if new_offset + record.len() as u32 > size {
-            log::error!("Variable store full even after compaction - data loss!");
-            state::with_varstore_mut(|vs| vs.write_offset = new_offset);
-            return Err(VarStoreError::StoreFull);
-        }
-
-        let result = state::with_storage_mut(|storage| {
-            let mut write_fn =
-                |offset: u32, data: &[u8]| -> bool { storage.write(offset, data).is_ok() };
-            edk2::write_variable(
-                &mut write_fn,
-                new_offset,
-                &var.guid,
-                &var.name,
-                var.attributes,
-                &var.data,
-            )
-        })
-        .ok_or(VarStoreError::NotInitialized)?;
-
-        match result {
-            Some(next_offset) => {
-                new_offset = next_offset;
-            }
-            None => {
-                log::error!("Failed to write variable during compaction");
-                return Err(VarStoreError::SpiError);
-            }
-        }
-    }
-
-    // Update varstore state (non-auth format since we wrote fresh headers)
-    let new_data_size = size - edk2::FV_HEADER_LENGTH as u32 - edk2::VS_HEADER_LENGTH as u32;
-    state::with_varstore_mut(|vs| {
-        vs.write_offset = new_offset;
-        vs.auth_format = false;
-        vs.data_size = new_data_size;
-    });
-
-    let reclaimed = old_write_offset - new_offset;
-    log::info!(
-        "Variable store compaction complete: reclaimed {} bytes, new write offset {:#x}",
-        reclaimed,
-        new_offset
-    );
-
     Ok(reclaimed)
 }
 
@@ -812,19 +513,5 @@ pub(super) fn delete_variable_from_memory(guid: &r_efi::efi::Guid, name: &[u16])
 // ============================================================================
 // Helper functions
 // ============================================================================
-
-/// Convert 16-byte on-disk GUID to r_efi::efi::Guid
-fn guid_bytes_to_efi(bytes: &[u8; 16]) -> r_efi::efi::Guid {
-    r_efi::efi::Guid::from_fields(
-        u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]),
-        u16::from_le_bytes([bytes[4], bytes[5]]),
-        u16::from_le_bytes([bytes[6], bytes[7]]),
-        bytes[8],
-        bytes[9],
-        &[
-            bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15],
-        ],
-    )
-}
 
 // name_eq_slice consolidated into crate::efi::utils::ucs2_eq
