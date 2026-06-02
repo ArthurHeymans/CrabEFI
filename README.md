@@ -36,7 +36,7 @@ nix develop
 
 | Crate | Description |
 |-------|-------------|
-| `crabefi` (root) | Core library -- platform-agnostic UEFI implementation |
+| `crabefi-core` | Core library -- platform-agnostic UEFI implementation |
 | `crabefi-coreboot` | Coreboot payload binary (arch entry points, table parsing) |
 | `crabefi-drivers` | Standard hardware drivers (NVMe, AHCI, USB, SDHCI, SPI, serial) |
 

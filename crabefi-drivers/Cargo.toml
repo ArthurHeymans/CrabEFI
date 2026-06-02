@@ -7,10 +7,10 @@ repository.workspace = true
 description = "Standard hardware drivers for CrabEFI (PCI, NVMe, AHCI, USB, SDHCI, SPI, serial)"
 
 [dependencies]
-crabefi = { path = ".." }
-log = "0.4"
+crabefi = { package = "crabefi-core", path = "../crabefi-core" }
+log = { workspace = true }
 bitflags = "2"
-heapless = "0.8"
+heapless = { workspace = true }
 spin = "0.9"
 tock-registers = "0.10"
 zerocopy = { version = "0.8", default-features = false, features = ["derive"] }
