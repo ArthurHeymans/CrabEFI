@@ -66,35 +66,31 @@ pub use result::{CapsuleResult, CapsuleResultStatus};
 pub fn process_pending_capsules(backend: &mut dyn CapsuleBackend) -> usize {
     let mut applied_count = 0;
 
-    // Source 1: Capsules from coreboot tables (LB_TAG_CAPSULE)
-    let cb_capsule_count = crate::coreboot::capsule_count();
-    if cb_capsule_count > 0 {
-        log::info!(
-            "Processing {} capsule(s) from coreboot tables",
-            cb_capsule_count
-        );
+    // Source 1: Capsules from platform-provided reserved memory regions.
+    let platform_capsules = &crate::state::drivers().platform.capsule_regions;
+    let platform_capsule_count = platform_capsules.len();
+    if platform_capsule_count > 0 {
+        log::info!("Processing {} platform capsule(s)", platform_capsule_count);
 
-        for i in 0..cb_capsule_count {
-            if let Some(region) = crate::coreboot::get_capsule(i) {
-                log::info!(
-                    "Processing coreboot capsule {}: base={:#x}, size={}",
-                    i,
-                    region.base,
-                    region.size
-                );
+        for (i, region) in platform_capsules.iter().enumerate() {
+            log::info!(
+                "Processing platform capsule {}: base={:#x}, size={}",
+                i,
+                region.base,
+                region.size
+            );
 
-                // Safety: coreboot has validated and coalesced this capsule data
-                // into a contiguous memory region that is reserved in bootmem.
-                let capsule_data = unsafe {
-                    core::slice::from_raw_parts(region.base as *const u8, region.size as usize)
-                };
+            // Safety: Platform code validated and coalesced this capsule data
+            // into a contiguous reserved memory region.
+            let capsule_data = unsafe {
+                core::slice::from_raw_parts(region.base as *const u8, region.size as usize)
+            };
 
-                let result = apply::apply_capsule(capsule_data, backend);
-                result::record_capsule_result(i, &result);
+            let result = apply::apply_capsule(capsule_data, backend);
+            result::record_capsule_result(i, &result);
 
-                if result.status == CapsuleResultStatus::Success {
-                    applied_count += 1;
-                }
+            if result.status == CapsuleResultStatus::Success {
+                applied_count += 1;
             }
         }
     }
@@ -114,7 +110,7 @@ pub fn process_pending_capsules(backend: &mut dyn CapsuleBackend) -> usize {
                 capsule.data.len()
             );
 
-            let result_index = cb_capsule_count + i;
+            let result_index = platform_capsule_count + i;
             let result = apply::apply_capsule(&capsule.data, backend);
             result::record_capsule_result(result_index, &result);
 
@@ -131,7 +127,7 @@ pub fn process_pending_capsules(backend: &mut dyn CapsuleBackend) -> usize {
         log::info!(
             "Capsule processing complete: {}/{} capsule(s) applied successfully",
             applied_count,
-            cb_capsule_count + disk_capsule_count
+            platform_capsule_count + disk_capsule_count
         );
     }
 

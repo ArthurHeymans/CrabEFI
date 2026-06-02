@@ -37,8 +37,8 @@ pub mod params;
 pub use bzimage::{BOOT_PARAMS_ADDR, BzImage, BzImageError, CMDLINE_ADDR, DEFAULT_KERNEL_ADDR};
 pub use params::{BootParams, E820Entry, SetupHeader};
 
-use crate::coreboot::memory::MemoryRegion;
 use crate::drivers::block::BlockDevice;
+use crate::platform::MemoryRegion;
 
 /// Maximum kernel size we support (64 MB)
 const MAX_KERNEL_SIZE: usize = 64 * 1024 * 1024;
@@ -241,7 +241,7 @@ impl LoadedLinux {
 /// * `kernel_path` - Path to the kernel file (FAT path format)
 /// * `initrd_path` - Optional path to initrd file
 /// * `cmdline` - Kernel command line
-/// * `memory_regions` - Coreboot memory map
+/// * `memory_regions` - Platform memory map
 /// * `acpi_rsdp` - ACPI RSDP address (optional)
 /// * `framebuffer` - Framebuffer info (optional)
 /// * `use_efi_handover` - Whether to use EFI handover if available

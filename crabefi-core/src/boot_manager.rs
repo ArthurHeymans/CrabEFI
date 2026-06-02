@@ -588,7 +588,7 @@ fn boot_linux_from_device(
     kernel_path: &str,
     initrd_fat_path: Option<&str>,
     cmdline: &str,
-    memory_regions: &[crate::coreboot::memory::MemoryRegion],
+    memory_regions: &[crate::platform::MemoryRegion],
     acpi_rsdp: Option<u64>,
     framebuffer: Option<&crate::platform::FramebufferConfig>,
 ) -> bool {
@@ -680,7 +680,7 @@ fn boot_linux_entry(
     let (memory_regions, acpi_rsdp) = {
         let state = state::get();
         // Copy memory regions to a local buffer (we can't borrow across the disk operations)
-        let mut regions = heapless::Vec::<crate::coreboot::memory::MemoryRegion, 64>::new();
+        let mut regions = heapless::Vec::<crate::platform::MemoryRegion, 64>::new();
         for region in state.drivers.platform.memory_regions.iter() {
             let _ = regions.push(*region);
         }
