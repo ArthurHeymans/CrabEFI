@@ -33,46 +33,6 @@ pub fn store_framebuffer_record_addr(addr: u64) {
     });
 }
 
-/// Store EFI firmware info in global state
-pub fn store_efi_fw_info(fw_info: EfiFwInfo) {
-    crate::state::with_drivers_mut(|drivers| {
-        drivers.platform.efi_fw_info = Some(fw_info);
-    });
-}
-
-/// Get access to the global EFI firmware info
-///
-/// Returns firmware identity and version info for ESRT and capsule updates.
-pub fn get_efi_fw_info() -> Option<EfiFwInfo> {
-    crate::state::try_get().and_then(|state| state.drivers.platform.efi_fw_info)
-}
-
-/// Store capsule regions in global state
-pub fn store_capsules(capsules: &[CapsuleRegion]) {
-    crate::state::with_drivers_mut(|drivers| {
-        drivers.platform.capsule_regions.clear();
-        for c in capsules {
-            if drivers.platform.capsule_regions.push(*c).is_err() {
-                log::warn!("Too many capsule regions for state storage");
-                break;
-            }
-        }
-    });
-}
-
-/// Get the number of pending capsule regions
-pub fn capsule_count() -> usize {
-    crate::state::try_get()
-        .map(|state| state.drivers.platform.capsule_regions.len())
-        .unwrap_or(0)
-}
-
-/// Get a capsule region by index
-pub fn get_capsule(index: usize) -> Option<CapsuleRegion> {
-    crate::state::try_get()
-        .and_then(|state| state.drivers.platform.capsule_regions.get(index).copied())
-}
-
 // CFR info is stored separately because it can be very large with nested heapless::Vec.
 // We use a heap-allocated Box stored via AtomicPtr to avoid stack overflow.
 use alloc::boxed::Box;

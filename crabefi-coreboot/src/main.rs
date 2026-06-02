@@ -187,6 +187,23 @@ impl crabefi::VariableStoreLocator for CorebootVariableStoreLocator {
 // Memory map conversion
 // ============================================================================
 
+/// Convert one coreboot memory region to platform format.
+fn convert_memory_region(region: &crabefi::coreboot::MemoryRegion) -> crabefi::MemoryRegion {
+    let region_type = match region.region_type {
+        crabefi::coreboot::MemoryType::Ram => crabefi::MemoryType::Ram,
+        crabefi::coreboot::MemoryType::Reserved => crabefi::MemoryType::Reserved,
+        crabefi::coreboot::MemoryType::AcpiReclaimable => crabefi::MemoryType::AcpiReclaimable,
+        crabefi::coreboot::MemoryType::AcpiNvs => crabefi::MemoryType::AcpiNvs,
+        // Unusable, Table, and any future variants map to Reserved.
+        _ => crabefi::MemoryType::Reserved,
+    };
+    crabefi::MemoryRegion {
+        base: region.start,
+        size: region.size,
+        region_type,
+    }
+}
+
 /// Convert coreboot memory regions to platform format.
 fn convert_memory_map(
     cb_map: &[crabefi::coreboot::MemoryRegion],
@@ -197,19 +214,7 @@ fn convert_memory_map(
         if count >= MAX_MEMORY_REGIONS {
             break;
         }
-        let region_type = match region.region_type {
-            crabefi::coreboot::MemoryType::Ram => crabefi::MemoryType::Ram,
-            crabefi::coreboot::MemoryType::Reserved => crabefi::MemoryType::Reserved,
-            crabefi::coreboot::MemoryType::AcpiReclaimable => crabefi::MemoryType::AcpiReclaimable,
-            crabefi::coreboot::MemoryType::AcpiNvs => crabefi::MemoryType::AcpiNvs,
-            // Unusable, Table, and any future variants map to Reserved
-            _ => crabefi::MemoryType::Reserved,
-        };
-        out[count] = crabefi::MemoryRegion {
-            base: region.start,
-            size: region.size,
-            region_type,
-        };
+        out[count] = convert_memory_region(region);
         count += 1;
     }
     count
@@ -439,6 +444,8 @@ fn riscv_fdt_only_boot(fdt_ptr: u64, fdt_size: u32) -> ! {
         acpi_rsdp: None,
         smbios: None,
         fdt: Some(fdt_slice),
+        firmware_info: None,
+        capsule_regions: &[],
         rng: None,
         ecam_base: None,
         deferred_buffer: None,
@@ -572,21 +579,14 @@ pub extern "C" fn rust_main(coreboot_table_ptr: u64) -> ! {
         );
     }
 
-    // Store EFI firmware info (GUID, version, LSV) for ESRT and capsule updates
-    if let Some(fw_info) = cb_info.efi_fw_info {
-        crabefi::coreboot::store_efi_fw_info(fw_info);
-    }
-
-    // Store capsule regions from coreboot (coalesced capsules for processing)
-    if !cb_info.capsules.is_empty() {
-        crabefi::coreboot::store_capsules(&cb_info.capsules);
-    }
-
     // Store memory regions and ACPI RSDP (used by direct Linux boot path
     // and by ACPI discovery after heap init).
     crabefi::state::with_drivers_mut(|drivers| {
         for region in cb_info.memory_map.iter() {
-            let _ = drivers.platform.memory_regions.push(*region);
+            let _ = drivers
+                .platform
+                .memory_regions
+                .push(convert_memory_region(region));
         }
         drivers.platform.acpi_rsdp = cb_info.acpi_rsdp;
     });
@@ -666,6 +666,27 @@ pub extern "C" fn rust_main(coreboot_table_ptr: u64) -> ! {
         unsafe { core::slice::from_raw_parts(addr as *const u8, size as usize) }
     });
 
+    let firmware_info = cb_info.efi_fw_info.map(|fw_info| crabefi::FirmwareInfo {
+        guid: fw_info.guid,
+        version: fw_info.version,
+        lowest_supported_version: fw_info.lowest_supported_version,
+        fw_size: fw_info.fw_size,
+    });
+
+    let mut capsule_regions =
+        [crabefi::CapsuleRegion { base: 0, size: 0 }; crabefi::state::MAX_CAPSULES];
+    let mut capsule_count = 0;
+    for capsule in cb_info.capsules.iter() {
+        if capsule_count >= capsule_regions.len() {
+            break;
+        }
+        capsule_regions[capsule_count] = crabefi::CapsuleRegion {
+            base: capsule.base,
+            size: capsule.size,
+        };
+        capsule_count += 1;
+    }
+
     let mut config = crabefi::PlatformConfig {
         memory_map: &memory_regions[..region_count],
         timer: &timer,
@@ -679,6 +700,8 @@ pub extern "C" fn rust_main(coreboot_table_ptr: u64) -> ! {
         acpi_rsdp: cb_info.acpi_rsdp,
         smbios: cb_info.smbios,
         fdt: fdt_slice,
+        firmware_info,
+        capsule_regions: &capsule_regions[..capsule_count],
         rng: None,
         ecam_base: None,             // May be filled from ACPI MCFG below
         deferred_buffer: None,       // Uses linker-symbol fallback in init_platform()

@@ -44,8 +44,8 @@
 //! # Log-Path Contract
 //!
 //! Functions called from the `log` crate macros — serial output
-//! ([`crate::drivers::serial`]), cbmem console ([`crate::coreboot::cbmem_console`]),
-//! framebuffer logging ([`crate::fb_log`]), and the timestamp helper
+//! ([`crate::drivers::serial`]), platform log sinks, framebuffer logging
+//! ([`crate::fb_log`]), and the timestamp helper
 //! ([`crate::logger::get_timestamp_k`]) — must **never** create Rust
 //! references (`&` or `&mut`) into `FirmwareState`.
 //!
@@ -631,6 +631,9 @@ pub const MAX_STORAGE_DEVICES: usize = 16;
 /// Maximum number of memory regions we can store
 pub const MAX_MEMORY_REGIONS: usize = 64;
 
+/// Maximum number of capsule regions we can store.
+pub const MAX_CAPSULES: usize = 32;
+
 /// Hardware driver state, organized into logical subsystems.
 pub struct DriverState {
     /// PCI bus subsystem
@@ -835,7 +838,7 @@ pub struct PlatformInfo {
     pub storage: Option<crate::efi::varstore::SpiStorageBackend>,
 
     /// Memory regions (for direct Linux boot)
-    pub memory_regions: HeaplessVec<crate::coreboot::memory::MemoryRegion, MAX_MEMORY_REGIONS>,
+    pub memory_regions: HeaplessVec<crate::platform::MemoryRegion, MAX_MEMORY_REGIONS>,
 
     /// ACPI RSDP address
     pub acpi_rsdp: Option<u64>,
@@ -843,12 +846,11 @@ pub struct PlatformInfo {
     /// CBMEM console address (0 = not initialized/disabled)
     pub cbmem_console_addr: u64,
 
-    /// EFI firmware info (GUID, version, LSV) from coreboot's LB_TAG_EFI_FW_INFO
-    pub efi_fw_info: Option<crate::coreboot::EfiFwInfo>,
+    /// EFI firmware info (GUID, version, LSV) provided by the platform.
+    pub efi_fw_info: Option<crate::platform::FirmwareInfo>,
 
-    /// Capsule regions from coreboot's LB_TAG_CAPSULE entries
-    pub capsule_regions:
-        HeaplessVec<crate::coreboot::CapsuleRegion, { crate::coreboot::tables::MAX_CAPSULES }>,
+    /// Capsule regions provided by the platform.
+    pub capsule_regions: HeaplessVec<crate::platform::CapsuleRegion, MAX_CAPSULES>,
 }
 
 impl PlatformInfo {

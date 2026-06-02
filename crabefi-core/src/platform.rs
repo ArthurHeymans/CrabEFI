@@ -1310,6 +1310,12 @@ pub struct PlatformConfig<'a> {
     /// Flattened Device Tree blob (for DT-based platforms).
     pub fdt: Option<&'a [u8]>,
 
+    /// Firmware identity and version information for ESRT/capsule updates.
+    pub firmware_info: Option<FirmwareInfo>,
+
+    /// Platform-provided in-memory capsules to process during boot.
+    pub capsule_regions: &'a [CapsuleRegion],
+
     // ---- Optional Hardware ----
     /// Hardware random number generator for `EFI_RNG_PROTOCOL`.
     pub rng: Option<&'a dyn Rng>,

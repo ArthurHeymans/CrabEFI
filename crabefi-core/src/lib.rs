@@ -318,7 +318,19 @@ fn init_platform_impl(mut config: PlatformConfig) -> ! {
         }
     }
 
-    // ---- 6. Initialize timing subsystem from platform timer ----
+    // ---- 6. Store platform-provided firmware metadata ----
+    state::with_drivers_mut(|d| {
+        d.platform.efi_fw_info = config.firmware_info;
+        d.platform.capsule_regions.clear();
+        for region in config.capsule_regions {
+            if d.platform.capsule_regions.push(*region).is_err() {
+                log::warn!("Too many platform capsule regions for state storage");
+                break;
+            }
+        }
+    });
+
+    // ---- 7. Initialize timing subsystem from platform timer ----
     //
     // In library mode the platform-provided Timer is the source of truth.
     // This works on any architecture (x86, aarch64, riscv64) without
@@ -334,10 +346,10 @@ fn init_platform_impl(mut config: PlatformConfig) -> ! {
         .sum();
     log::info!("Total RAM: {} MB", total_ram / (1024 * 1024));
 
-    // ---- 7. Initialize keyboard subsystem ----
+    // ---- 8. Initialize keyboard subsystem ----
     drivers::keyboard_common::init();
 
-    // ---- 8. Initialize EFI environment ----
+    // ---- 9. Initialize EFI environment ----
     //
     // Always runs — sets up the EFI memory map, system table, ACPI/SMBIOS
     // configuration tables, and runtime region reservations.  The page
@@ -353,20 +365,14 @@ fn init_platform_impl(mut config: PlatformConfig) -> ! {
         drivers::mouse_cursor::init(fb.width, fb.height);
     }
 
-    // ---- 8b. Install ESRT and advertise capsule update support ----
+    // ---- 9b. Install ESRT and advertise capsule update support ----
     //
-    // The ESRT is built from firmware info (LB_TAG_EFI_FW_INFO) and
-    // installed as an EFI Configuration Table for fwupd/LVFS discovery.
+    // The ESRT is built from platform-provided firmware info and installed as
+    // an EFI Configuration Table for fwupd/LVFS discovery.
     // OsIndicationsSupported tells the OS what capsule delivery mechanisms
     // are available.
-    if let Some(fw_info) = crate::coreboot::get_efi_fw_info() {
-        let platform_fw_info = crate::platform::FirmwareInfo {
-            guid: fw_info.guid,
-            version: fw_info.version,
-            lowest_supported_version: fw_info.lowest_supported_version,
-            fw_size: fw_info.fw_size,
-        };
-        efi::esrt::install_esrt(&platform_fw_info);
+    if let Some(fw_info) = state::drivers().platform.efi_fw_info {
+        efi::esrt::install_esrt(&fw_info);
         log::info!("ESRT installed for firmware updates");
     }
     efi::capsule::disk::install_os_indications_supported();
@@ -374,7 +380,7 @@ fn init_platform_impl(mut config: PlatformConfig) -> ! {
     log::info!("CrabEFI initialized successfully!");
     log::info!("EFI System Table at: {:p}", efi::get_system_table());
 
-    // ---- 9. Initialize heap ----
+    // ---- 10. Initialize heap ----
     //
     // Skipped when the platform already set up the heap before entry
     // (heap_pre_initialized == true).  The rest of the init sequence is
@@ -383,14 +389,14 @@ fn init_platform_impl(mut config: PlatformConfig) -> ! {
         log::error!("Failed to initialize heap allocator!");
     }
 
-    // ---- 10. Runtime log support ----
+    // ---- 11. Runtime log support ----
     #[cfg(feature = "rt-log")]
     {
         efi::rtlog::register_region();
         efi::rtlog::dump();
     }
 
-    // ---- 11. Discover PCI ECAM and initialize PCI ----
+    // ---- 12. Discover PCI ECAM and initialize PCI ----
     //
     // Priority: config.ecam_base > acpi_info.ecam_base > fdt_info.ecam_base.
     // acpi_info is populated by the platform before entry (when
@@ -409,7 +415,7 @@ fn init_platform_impl(mut config: PlatformConfig) -> ! {
 
     drivers::pci::init();
 
-    // ---- 12. Register deferred variable buffer if provided ----
+    // ---- 13. Register deferred variable buffer if provided ----
     if let Some(buf) = config.deferred_buffer {
         use efi::allocator::{MemoryType as AllocMemType, PAGE_SIZE};
         efi::varstore::deferred::configure_buffer_with_size(buf.base, buf.size);
@@ -473,7 +479,7 @@ fn init_platform_impl(mut config: PlatformConfig) -> ! {
         }
     }
 
-    // ---- 13. Register platform block devices ----
+    // ---- 14. Register platform block devices ----
     if !config.block_devices.is_empty() {
         // SAFETY: init_platform() is -> !, so the block device references in
         // config.block_devices live forever.
@@ -482,11 +488,11 @@ fn init_platform_impl(mut config: PlatformConfig) -> ! {
         }
     }
 
-    // ---- 14. Runtime log init ----
+    // ---- 15. Runtime log init ----
     #[cfg(feature = "rt-log")]
     efi::rtlog::init();
 
-    // ---- 15. Variable persistence, Secure Boot, and boot manager ----
+    // ---- 16. Variable persistence, Secure Boot, and boot manager ----
     init_persistence_and_boot(config.variable_store_locator);
 }
 

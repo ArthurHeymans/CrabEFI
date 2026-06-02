@@ -211,7 +211,7 @@ pub unsafe fn set_cmdline(cmdline: &str, addr: u32) -> Result<(), BzImageError> 
 /// # Arguments
 ///
 /// * `bzimage` - Parsed bzImage information
-/// * `memory_regions` - Coreboot memory map
+/// * `memory_regions` - Platform memory map
 /// * `acpi_rsdp` - ACPI RSDP address (optional)
 /// * `framebuffer` - Framebuffer info (optional)
 /// * `kernel_addr` - Address where kernel is loaded
@@ -222,7 +222,7 @@ pub unsafe fn set_cmdline(cmdline: &str, addr: u32) -> Result<(), BzImageError> 
 /// Initialized boot parameters structure
 pub fn prepare_boot_params(
     bzimage: &BzImage,
-    memory_regions: &[crate::coreboot::memory::MemoryRegion],
+    memory_regions: &[crate::platform::MemoryRegion],
     acpi_rsdp: Option<u64>,
     framebuffer: Option<&crate::platform::FramebufferConfig>,
     kernel_addr: u32,

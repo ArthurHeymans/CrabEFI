@@ -9,7 +9,6 @@
 //! The allocator state is stored in the centralized `FirmwareState` structure.
 //! Access it via `crate::state::allocator()` or `crate::state::allocator_mut()`.
 
-use crate::coreboot::memory::{MemoryRegion, MemoryType as CbMemoryType};
 use crate::state;
 use heapless::Vec;
 use r_efi::efi;
@@ -138,26 +137,6 @@ impl TryFrom<u32> for MemoryType {
     }
 }
 
-impl From<CbMemoryType> for MemoryType {
-    fn from(cb_type: CbMemoryType) -> Self {
-        match cb_type {
-            CbMemoryType::Ram => MemoryType::ConventionalMemory,
-            CbMemoryType::Reserved => MemoryType::ReservedMemoryType,
-            CbMemoryType::AcpiReclaimable => MemoryType::AcpiReclaimMemory,
-            CbMemoryType::AcpiNvs => MemoryType::AcpiMemoryNvs,
-            CbMemoryType::Unusable => MemoryType::UnusableMemory,
-            // Coreboot's Table type covers cbmem regions (console, SMBIOS,
-            // timestamps, ACPI tables, etc.). Using ReservedMemoryType ensures
-            // the OS preserves them without bloating ACPI NVS.
-            // Linux accesses cbmem regions via the coreboot_table driver which
-            // uses memremap() — it works with Reserved or NVS.
-            // ACPI tables within these regions are later marked as
-            // AcpiReclaimMemory by mark_acpi_tables_memory().
-            CbMemoryType::Table => MemoryType::ReservedMemoryType,
-        }
-    }
-}
-
 /// Memory attributes (as defined in UEFI spec)
 ///
 /// The Attribute field in EFI_MEMORY_DESCRIPTOR describes the **capabilities**
@@ -267,88 +246,8 @@ impl MemoryAllocator {
         }
     }
 
-    /// Initialize the allocator from a coreboot memory map
-    pub fn init_from_coreboot(&mut self, regions: &[MemoryRegion]) {
-        self.entries.clear();
-        self.map_key = 1;
-
-        // On aarch64, determine the DRAM base from the first RAM entry.
-        // Coreboot "Reserved" entries below the DRAM base are device/MMIO
-        // space (flash, ECAM, etc.), NOT actual RAM. Including them as
-        // EFI ReservedMemoryType confuses the Linux kernel:
-        //  - It adds phantom memory to the DMA zone → swiotlb failures
-        //  - It creates iomem "reserved" entries that block ECAM mapping
-        //    → PCI enumeration fails → no NVMe/network in the kernel
-        #[cfg(target_arch = "aarch64")]
-        let dram_base: u64 = regions
-            .iter()
-            .filter(|r| r.region_type == CbMemoryType::Ram)
-            .map(|r| r.start)
-            .min()
-            .unwrap_or(0);
-
-        log::info!("Importing coreboot memory map ({} regions):", regions.len());
-        for region in regions {
-            let memory_type = MemoryType::from(region.region_type);
-
-            // On aarch64, skip coreboot Reserved entries below DRAM.
-            // These are device regions (flash at 0-1GB, ECAM at 0xf0-1GB)
-            // already covered by add_platform_mmio_regions().
-            #[cfg(target_arch = "aarch64")]
-            if region.region_type == CbMemoryType::Reserved && region.start < dram_base {
-                log::info!(
-                    "  {:#010x}-{:#010x} {:?} -> SKIPPED (non-RAM, below DRAM at {:#x})",
-                    region.start,
-                    region.start + region.size,
-                    region.region_type,
-                    dram_base
-                );
-                continue;
-            }
-
-            // Safely calculate number of pages, skip regions that overflow
-            let num_pages = match region.size.checked_add(PAGE_SIZE - 1) {
-                Some(size_rounded) => size_rounded / PAGE_SIZE,
-                None => {
-                    log::warn!(
-                        "Region at {:#x} has size that overflows, skipping",
-                        region.start
-                    );
-                    continue;
-                }
-            };
-
-            log::info!(
-                "  {:#010x}-{:#010x} {:?} -> {:?}",
-                region.start,
-                region.start + region.size,
-                region.region_type,
-                memory_type
-            );
-
-            let attribute = memory_type.default_attributes();
-
-            let desc = MemoryDescriptor::new(memory_type, region.start, num_pages, attribute);
-
-            if self.entries.push(desc).is_err() {
-                log::warn!("Memory map full, ignoring region at {:#x}", region.start);
-            }
-        }
-
-        // Sort by physical address
-        self.sort_entries();
-        // Merge adjacent regions of the same type
-        self.merge_entries();
-
-        log::info!(
-            "Memory allocator initialized with {} entries",
-            self.entries.len()
-        );
-    }
-
     /// Initialize the allocator from a platform-provided memory map.
     ///
-    /// This is the `init_platform()` counterpart to `init_from_coreboot()`.
     /// Converts `platform::MemoryRegion` entries into EFI memory descriptors.
     ///
     /// Idempotent: if the allocator already has entries (e.g., the caller
@@ -1384,13 +1283,6 @@ impl MemoryAllocator {
             }
         }
     }
-}
-
-/// Initialize the global allocator from coreboot memory map
-pub fn init(regions: &[MemoryRegion]) {
-    state::with_allocator_mut(|alloc| {
-        alloc.init_from_coreboot(regions);
-    });
 }
 
 /// Initialize the global allocator from a platform-provided memory map.

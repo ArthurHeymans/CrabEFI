@@ -7,7 +7,7 @@
 
 use core::mem;
 
-use crate::coreboot::memory::{MemoryRegion, MemoryType};
+use crate::platform::{MemoryRegion, MemoryType};
 
 /// E820 memory map entry (20 bytes)
 ///
@@ -54,15 +54,17 @@ impl From<&MemoryRegion> for E820Entry {
     fn from(region: &MemoryRegion) -> Self {
         let entry_type = match region.region_type {
             MemoryType::Ram => E820Entry::RAM_TYPE,
-            MemoryType::Reserved => E820Entry::RESERVED_TYPE,
+            MemoryType::Reserved
+            | MemoryType::Mmio
+            | MemoryType::RuntimeServicesCode
+            | MemoryType::RuntimeServicesData
+            | MemoryType::BootServicesData => E820Entry::RESERVED_TYPE,
             MemoryType::AcpiReclaimable => E820Entry::ACPI_RECLAIMABLE_TYPE,
             MemoryType::AcpiNvs => E820Entry::ACPI_NVS_TYPE,
-            MemoryType::Unusable => E820Entry::BAD_TYPE,
-            MemoryType::Table => E820Entry::COREBOOT_TABLE_TYPE,
         };
 
         Self {
-            addr: region.start,
+            addr: region.base,
             size: region.size,
             entry_type,
         }
@@ -394,11 +396,11 @@ impl BootParams {
         Self::default()
     }
 
-    /// Set the E820 memory map from coreboot memory regions
+    /// Set the E820 memory map from platform memory regions
     ///
     /// # Arguments
     ///
-    /// * `regions` - Slice of coreboot memory regions
+    /// * `regions` - Slice of platform memory regions
     pub fn set_memory_map(&mut self, regions: &[MemoryRegion]) {
         let count = regions.len().min(128);
         self.e820_entries = count as u8;
