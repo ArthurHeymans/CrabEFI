@@ -851,6 +851,9 @@ pub struct PlatformInfo {
 
     /// Capsule regions provided by the platform.
     pub capsule_regions: HeaplessVec<crate::platform::CapsuleRegion, MAX_CAPSULES>,
+
+    /// Optional platform lifecycle callbacks.
+    pub hooks: Option<&'static dyn crate::platform::PlatformHooks>,
 }
 
 impl PlatformInfo {
@@ -864,6 +867,7 @@ impl PlatformInfo {
             cbmem_console_addr: 0,
             efi_fw_info: None,
             capsule_regions: HeaplessVec::new(),
+            hooks: None,
         }
     }
 }

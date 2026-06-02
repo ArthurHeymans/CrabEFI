@@ -757,6 +757,25 @@ pub trait CapsuleBackend {
 }
 
 // ============================================================================
+// Platform lifecycle hooks
+// ============================================================================
+
+/// Optional platform callbacks for UEFI lifecycle transitions.
+///
+/// Platforms use these hooks for integration-specific cleanup that the core
+/// library must not know about (for example invalidating platform handoff data
+/// or disabling non-runtime debug buffers before the OS takes over).
+pub trait PlatformHooks {
+    /// Called after `ExitBootServices()` succeeds, before the system table's
+    /// Boot Services pointer is cleared.
+    fn on_exit_boot_services(&self) {}
+
+    /// Called at the start of `SetVirtualAddressMap()`, before CrabEFI commits
+    /// to virtual mode.
+    fn before_set_virtual_address_map(&self) {}
+}
+
+// ============================================================================
 // Timer
 // ============================================================================
 
@@ -1315,6 +1334,9 @@ pub struct PlatformConfig<'a> {
 
     /// Platform-provided in-memory capsules to process during boot.
     pub capsule_regions: &'a [CapsuleRegion],
+
+    /// Optional platform lifecycle callbacks.
+    pub hooks: Option<&'a dyn PlatformHooks>,
 
     // ---- Optional Hardware ----
     /// Hardware random number generator for `EFI_RNG_PROTOCOL`.

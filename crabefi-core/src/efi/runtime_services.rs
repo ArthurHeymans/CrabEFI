@@ -297,9 +297,11 @@ extern "efiapi" fn set_virtual_address_map(
 
     log::info!("SetVirtualAddressMap: {} entries", num_entries);
 
-    // Step 0: Disable CBMEM console -- its buffer is not in a runtime region
-    // and would page-fault after the OS switches to virtual addressing.
-    crate::coreboot::cbmem_console::disable();
+    // Step 0: Let platform glue disable physical-only resources before the OS
+    // switches EFI runtime services to virtual addressing.
+    if let Some(hooks) = crate::state::drivers().platform.hooks {
+        hooks.before_set_virtual_address_map();
+    }
 
     // Step 1: Commit to virtual mode
     VIRTUAL_MODE.store(true, core::sync::atomic::Ordering::Release);

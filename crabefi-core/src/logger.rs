@@ -1,14 +1,12 @@
 //! Logging infrastructure for CrabEFI
 //!
 //! This module provides logging via the `log` crate, outputting to the
-//! serial port, the coreboot CBMEM console, and optionally the framebuffer.
+//! serial port and optionally the framebuffer.
 //!
 //! Framebuffer logging is disabled by default as it is very slow.
 //! Enable with the `fb-log` feature flag.
 
-use crate::coreboot::cbmem_console;
 use crate::time::read_counter;
-use core::fmt::Write;
 use log::{Level, LevelFilter, Metadata, Record};
 
 /// Get relative counter ticks since boot (in thousands for readability)
@@ -45,32 +43,11 @@ impl log::Log for CombinedLogger {
                 Level::Trace => "\x1b[35mTRACE\x1b[0m",
             };
 
-            // Level strings without ANSI colors (for CBMEM console)
-            let level_str_plain = match record.level() {
-                Level::Error => "ERROR",
-                Level::Warn => "WARN ",
-                Level::Info => "INFO ",
-                Level::Debug => "DEBUG",
-                Level::Trace => "TRACE",
-            };
-
             // Get timestamp (k-ticks since boot)
             let ts = get_timestamp_k();
 
             // Output to serial with timestamp
             crate::serial_println!("[{:>10}] [{}] {}", ts, level_str_serial, record.args());
-
-            // Output to CBMEM console (if available)
-            if cbmem_console::is_available() {
-                let mut writer = cbmem_console::CbmemConsoleWriter;
-                let _ = writeln!(
-                    writer,
-                    "[{:>10}] [{}] {}",
-                    ts,
-                    level_str_plain,
-                    record.args()
-                );
-            }
 
             // Output to framebuffer (if feature enabled)
             #[cfg(feature = "fb-log")]
