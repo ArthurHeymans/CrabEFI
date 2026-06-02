@@ -9,10 +9,7 @@
 //! Dependency evaluation is supported: options whose dependencies are not
 //! met are hidden or shown as inactive according to their flags.
 
-use crate::coreboot::{
-    self,
-    cfr::{self, CfrInfo, CfrOption, CfrOptionType, CfrValue},
-};
+use crate::cfr::{self, CfrInfo, CfrOption, CfrOptionType, CfrValue};
 use alloc::string::String;
 use alloc::vec::Vec;
 use core::fmt::Write;
@@ -68,7 +65,7 @@ fn has_changes(items: &[MenuItem]) -> bool {
 /// Displays the menu and handles user interaction.
 /// Returns when the user exits the menu.
 pub fn show_cfr_menu() {
-    let cfr_info = match coreboot::get_cfr() {
+    let cfr_info = match cfr::get_cfr() {
         Some(cfr) => cfr,
         None => {
             show_no_cfr_message();

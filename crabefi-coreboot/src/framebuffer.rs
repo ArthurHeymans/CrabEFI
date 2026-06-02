@@ -2,6 +2,64 @@
 //!
 //! This module handles framebuffer information extracted from coreboot tables.
 
+use core::sync::atomic::{AtomicU64, Ordering};
+
+static FRAMEBUFFER_RECORD_ADDR: AtomicU64 = AtomicU64::new(0);
+
+/// Store the coreboot framebuffer record address for later invalidation.
+pub fn store_framebuffer_record_addr(addr: u64) {
+    FRAMEBUFFER_RECORD_ADDR.store(addr, Ordering::Release);
+}
+
+/// Invalidate the coreboot framebuffer record in the coreboot tables.
+///
+/// This should be called at ExitBootServices to prevent a race condition
+/// where Linux tries to use both the coreboot framebuffer (via simplefb)
+/// and the EFI framebuffer (via efifb). By changing the record tag to
+/// CB_TAG_UNUSED (0x0000), Linux will ignore the coreboot framebuffer
+/// and only use the EFI GOP framebuffer.
+///
+/// # Safety
+///
+/// This function modifies memory in the coreboot tables area. It must only
+/// be called when it's safe to modify that memory (at ExitBootServices).
+pub unsafe fn invalidate_framebuffer_record() {
+    let record_addr = FRAMEBUFFER_RECORD_ADDR.load(Ordering::Acquire);
+
+    if record_addr != 0 {
+        // The tag is the first 4 bytes of the record (u32). Coreboot table
+        // records are aligned to LB_ENTRY_ALIGN (4 bytes), so this is safe.
+        debug_assert!(
+            record_addr.is_multiple_of(4),
+            "Coreboot framebuffer record address {:#x} not 4-byte aligned",
+            record_addr
+        );
+        let tag_ptr = record_addr as *mut u32;
+        // SAFETY: caller guarantees it is safe to modify the coreboot tables at
+        // ExitBootServices time.
+        let old_tag = unsafe { tag_ptr.read_volatile() };
+
+        if old_tag == crate::tables::tags::CB_TAG_FRAMEBUFFER {
+            // SAFETY: same as above - modifying coreboot table record tag.
+            unsafe { tag_ptr.write_volatile(crate::tables::tags::CB_TAG_UNUSED) };
+            log::info!(
+                "Invalidated coreboot framebuffer record at {:#x} (tag: {:#x} -> {:#x})",
+                record_addr,
+                old_tag,
+                crate::tables::tags::CB_TAG_UNUSED
+            );
+        } else {
+            log::warn!(
+                "Coreboot framebuffer record at {:#x} has unexpected tag {:#x}, not invalidating",
+                record_addr,
+                old_tag
+            );
+        }
+    } else {
+        log::debug!("No coreboot framebuffer record to invalidate");
+    }
+}
+
 /// Framebuffer information
 #[derive(Debug, Clone, Copy)]
 pub struct FramebufferInfo {

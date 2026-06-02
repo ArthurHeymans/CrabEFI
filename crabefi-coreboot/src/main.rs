@@ -14,8 +14,13 @@ extern crate alloc;
 
 #[cfg(not(target_arch = "riscv64"))]
 mod acpi;
+mod cbmem_console;
+mod cfr;
 mod cfr_menu;
-mod coreboot;
+mod fmap;
+mod framebuffer;
+mod memory;
+mod tables;
 
 use core::panic::PanicInfo;
 #[cfg(target_arch = "riscv64")]
@@ -62,25 +67,25 @@ impl crabefi::PlatformHooks for CorebootHooks {
         // Invalidate the coreboot framebuffer record to prevent a race between
         // Linux simplefb (coreboot) and efifb (EFI GOP).
         unsafe {
-            coreboot::invalidate_framebuffer_record();
+            framebuffer::invalidate_framebuffer_record();
         }
 
         // CBMEM console is not runtime mapped; disable it before runtime use.
-        coreboot::cbmem_console::disable();
+        cbmem_console::disable();
     }
 
     fn before_set_virtual_address_map(&self) {
         // SetVirtualAddressMap switches the OS to virtual addresses. The CBMEM
         // console buffer is physical-only, so it must be disabled first.
-        coreboot::cbmem_console::disable();
+        cbmem_console::disable();
     }
 
     fn firmware_settings_available(&self) -> bool {
-        coreboot::get_cfr().is_some()
+        cfr::get_cfr().is_some()
     }
 
     fn show_firmware_settings(&self) -> bool {
-        if coreboot::get_cfr().is_some() {
+        if cfr::get_cfr().is_some() {
             cfr_menu::show_cfr_menu();
             true
         } else {
@@ -123,13 +128,13 @@ impl crabefi::ResetHandler for CorebootReset {
 /// coreboot-specific, so they live in the coreboot payload instead of the
 /// platform-agnostic CrabEFI persistence path.
 struct CorebootVariableStoreLocator {
-    smmstorev2: Option<coreboot::Smmstorev2Info>,
-    boot_media: Option<coreboot::BootMediaInfo>,
-    spi_flash: Option<coreboot::SpiFlashInfo>,
+    smmstorev2: Option<tables::Smmstorev2Info>,
+    boot_media: Option<tables::BootMediaInfo>,
+    spi_flash: Option<tables::SpiFlashInfo>,
 }
 
 impl CorebootVariableStoreLocator {
-    fn new(cb_info: &coreboot::CorebootInfo) -> Self {
+    fn new(cb_info: &tables::CorebootInfo) -> Self {
         Self {
             smmstorev2: cb_info.smmstorev2,
             boot_media: cb_info.boot_media,
@@ -203,7 +208,7 @@ impl crabefi::VariableStoreLocator for CorebootVariableStoreLocator {
         }
 
         let fmap_offset = self.boot_media.map(|boot_media| boot_media.fmap_offset);
-        let region = coreboot::fmap::get_smmstore_from_fmap(storage, fmap_offset)?;
+        let region = fmap::get_smmstore_from_fmap(storage, fmap_offset)?;
 
         log::info!(
             "Found '{}' in FMAP: offset={:#x}, size={} KB",
@@ -225,12 +230,12 @@ impl crabefi::VariableStoreLocator for CorebootVariableStoreLocator {
 // ============================================================================
 
 /// Convert one coreboot memory region to platform format.
-fn convert_memory_region(region: &coreboot::MemoryRegion) -> crabefi::MemoryRegion {
+fn convert_memory_region(region: &memory::MemoryRegion) -> crabefi::MemoryRegion {
     let region_type = match region.region_type {
-        coreboot::MemoryType::Ram => crabefi::MemoryType::Ram,
-        coreboot::MemoryType::Reserved => crabefi::MemoryType::Reserved,
-        coreboot::MemoryType::AcpiReclaimable => crabefi::MemoryType::AcpiReclaimable,
-        coreboot::MemoryType::AcpiNvs => crabefi::MemoryType::AcpiNvs,
+        memory::MemoryType::Ram => crabefi::MemoryType::Ram,
+        memory::MemoryType::Reserved => crabefi::MemoryType::Reserved,
+        memory::MemoryType::AcpiReclaimable => crabefi::MemoryType::AcpiReclaimable,
+        memory::MemoryType::AcpiNvs => crabefi::MemoryType::AcpiNvs,
         // Unusable, Table, and any future variants map to Reserved.
         _ => crabefi::MemoryType::Reserved,
     };
@@ -243,7 +248,7 @@ fn convert_memory_region(region: &coreboot::MemoryRegion) -> crabefi::MemoryRegi
 
 /// Convert coreboot memory regions to platform format.
 fn convert_memory_map(
-    cb_map: &[coreboot::MemoryRegion],
+    cb_map: &[memory::MemoryRegion],
     out: &mut [crabefi::MemoryRegion; MAX_MEMORY_REGIONS],
 ) -> usize {
     let mut count = 0;
@@ -587,7 +592,7 @@ pub extern "C" fn rust_main(coreboot_table_ptr: u64) -> ! {
     // ================================================================
     // SAFETY: coreboot_table_ptr is passed from coreboot and points to
     // valid tables in identity-mapped physical memory.
-    let cb_info = unsafe { coreboot::tables::parse(coreboot_table_ptr as *const u8) };
+    let cb_info = unsafe { tables::parse(coreboot_table_ptr as *const u8) };
 
     // ================================================================
     // Phase 3: Store coreboot-specific info in global state
@@ -598,7 +603,7 @@ pub extern "C" fn rust_main(coreboot_table_ptr: u64) -> ! {
     // init_platform() runs init_persistence_and_boot().
 
     if let Some(cbmem_addr) = cb_info.cbmem_console {
-        coreboot::cbmem_console::init(cbmem_addr);
+        cbmem_console::init(cbmem_addr);
     }
 
     if let Some(fb) = cb_info.framebuffer {
@@ -606,7 +611,7 @@ pub extern "C" fn rust_main(coreboot_table_ptr: u64) -> ! {
     }
 
     if let Some(addr) = cb_info.framebuffer_record_addr {
-        coreboot::store_framebuffer_record_addr(addr);
+        framebuffer::store_framebuffer_record_addr(addr);
     }
 
     if let Some(ref spi_flash) = cb_info.spi_flash
@@ -828,14 +833,14 @@ pub extern "C" fn rust_main(coreboot_table_ptr: u64) -> ! {
     // Parse coreboot firmware configuration options now that the heap is
     // available. cb_info.cfr_raw is still in scope — no static needed.
     if let Some(cfr_raw) = cb_info.cfr_raw
-        && let Some(cfr) = coreboot::cfr::parse_cfr(cfr_raw)
+        && let Some(cfr) = cfr::parse_cfr(cfr_raw)
     {
         log::info!(
             "CFR: {} forms, {} options",
             cfr.forms.len(),
             cfr.total_options()
         );
-        coreboot::store_cfr(cfr);
+        cfr::store_cfr(cfr);
     }
 
     // ================================================================
@@ -848,7 +853,7 @@ pub extern "C" fn rust_main(coreboot_table_ptr: u64) -> ! {
 // Logging helpers
 // ============================================================================
 
-fn log_coreboot_info(cb_info: &coreboot::CorebootInfo) {
+fn log_coreboot_info(cb_info: &tables::CorebootInfo) {
     log::info!("Parsed coreboot tables:");
     if let Some(ref serial) = cb_info.serial {
         let type_str = if serial.mmio() { "MMIO" } else { "I/O" };
@@ -896,7 +901,7 @@ fn log_coreboot_info(cb_info: &coreboot::CorebootInfo) {
     let total_ram: u64 = cb_info
         .memory_map
         .iter()
-        .filter(|r| r.region_type == coreboot::MemoryType::Ram)
+        .filter(|r| r.region_type == memory::MemoryType::Ram)
         .map(|r| r.size)
         .sum();
     log::info!("  Total RAM: {} MB", total_ram / (1024 * 1024));

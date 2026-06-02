@@ -33,8 +33,10 @@ CrabEFI/
 │   ├── build.rs                # Linker script selection, PAYLOAD_BASE
 │   └── src/
 │       ├── main.rs             # rust_main, #[panic_handler]
-│       ├── cfr_menu.rs         # Coreboot CFR firmware settings UI
-│       └── coreboot/           # Coreboot tables, FMAP/SMMSTORE, CFR parsing
+│       ├── tables.rs           # Coreboot table parsing
+│       ├── fmap.rs             # FMAP/SMMSTORE lookup
+│       ├── cfr.rs              # CFR parser and variable access
+│       └── cfr_menu.rs         # Coreboot CFR firmware settings UI
 │
 ├── crabefi-drivers/            # Standard hardware drivers (placeholder)
 │   ├── Cargo.toml
