@@ -151,22 +151,57 @@ impl CorebootVariableStoreLocator {
             return None;
         }
 
-        let spi_flash = self.spi_flash.as_ref()?;
-        spi_flash.mmap_windows.iter().find_map(|window| {
-            let window_phys = window.host_base as u64;
-            let relative = phys_base.checked_sub(window_phys)?;
-            let mapped_end = relative.checked_add(size)?;
-            if mapped_end > window.size as u64 {
-                return None;
+        if let Some(spi_flash) = self.spi_flash.as_ref() {
+            if let Some(region) = spi_flash.mmap_windows.iter().find_map(|window| {
+                let window_phys = window.host_base as u64;
+                let relative = phys_base.checked_sub(window_phys)?;
+                let mapped_end = relative.checked_add(size)?;
+                if mapped_end > window.size as u64 {
+                    return None;
+                }
+
+                let offset = (window.flash_base as u64).checked_add(relative)?;
+                let end = offset.checked_add(size)?;
+                if end > spi_flash.flash_size as u64 {
+                    return None;
+                }
+
+                Some(crabefi::FirmwareStorageRegion { offset, size })
+            }) {
+                return Some(region);
             }
 
-            let offset = (window.flash_base as u64).checked_add(relative)?;
-            let end = offset.checked_add(size)?;
-            if end > spi_flash.flash_size as u64 {
-                return None;
+            if let Some(region) =
+                Self::resolve_top_of_4g_mapping(phys_base, size, spi_flash.flash_size as u64)
+            {
+                return Some(region);
             }
+        }
 
-            Some(crabefi::FirmwareStorageRegion { offset, size })
+        self.boot_media.and_then(|boot_media| {
+            Self::resolve_top_of_4g_mapping(phys_base, size, boot_media.boot_media_size)
+        })
+    }
+
+    fn resolve_top_of_4g_mapping(
+        phys_base: u64,
+        size: u64,
+        flash_size: u64,
+    ) -> Option<crabefi::FirmwareStorageRegion> {
+        if flash_size == 0 {
+            return None;
+        }
+
+        let mmap_base = 0x1_0000_0000u64.checked_sub(flash_size)?;
+        let relative = phys_base.checked_sub(mmap_base)?;
+        let end = relative.checked_add(size)?;
+        if end > flash_size {
+            return None;
+        }
+
+        Some(crabefi::FirmwareStorageRegion {
+            offset: relative,
+            size,
         })
     }
 }
@@ -192,9 +227,10 @@ impl crabefi::VariableStoreLocator for CorebootVariableStoreLocator {
                 && smmstore.mmap_addr != 0
                 && let Some(region) = self.resolve_mapped_region(smmstore.mmap_addr, size)
             {
-                return Some(crabefi::VariableStoreRegion::from_offset(
+                return Some(crabefi::VariableStoreRegion::from_offset_with_mapped_read(
                     "SMMSTORE",
                     region.offset,
+                    smmstore.mmap_addr,
                     region.size,
                 ));
             }

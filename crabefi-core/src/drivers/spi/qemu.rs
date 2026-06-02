@@ -135,6 +135,11 @@ impl QemuPflashController {
     }
 
     /// Initialize with a specific pflash mapping.
+    /// Return total flash size in bytes.
+    pub fn flash_size(&self) -> u32 {
+        self.flash_size
+    }
+
     fn init_with_config(host_base: u64, flash_size: u32) -> Result<Self> {
         // SAFETY: host_base is a platform-provided or known QEMU pflash MMIO
         // base address, valid for the flash region.
@@ -608,6 +613,10 @@ impl SpiController for QemuPflashController {
 
     fn mode(&self) -> SpiMode {
         SpiMode::HardwareSequencing
+    }
+
+    fn get_bios_region(&self) -> Option<(u32, u32)> {
+        self.flash_size.checked_sub(1).map(|limit| (0, limit))
     }
 }
 

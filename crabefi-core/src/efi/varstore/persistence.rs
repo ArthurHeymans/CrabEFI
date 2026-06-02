@@ -27,7 +27,9 @@
 use alloc::vec::Vec;
 
 use crate::drivers::spi::{self, SpiController};
-use crate::platform::{FirmwareStorage, FirmwareStorageRegion, VariableStoreLocator};
+use crate::platform::{
+    FirmwareStorage, FirmwareStorageLocation, FirmwareStorageRegion, VariableStoreLocator,
+};
 use crate::state::{self, MAX_VARIABLE_DATA_SIZE, MAX_VARIABLE_NAME_LEN};
 
 use super::VarStoreError;
@@ -114,6 +116,15 @@ fn configure_from_locator(
 
     backend.set_base_offset(region.offset as u32);
     backend.set_storage_size(region.size as u32);
+
+    if let FirmwareStorageLocation::OffsetWithMappedRead { phys_base, .. } = located.location {
+        backend.set_mapped_read_base(phys_base);
+        log::info!(
+            "Variable store reads mapped at {:#x} (writes use SPI offset {:#x})",
+            phys_base,
+            region.offset
+        );
+    }
 
     log::info!(
         "Variable store configured from platform locator: '{}' base={:#x}, size={} KB",

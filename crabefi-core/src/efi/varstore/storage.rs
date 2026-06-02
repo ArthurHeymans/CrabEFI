@@ -126,6 +126,8 @@ pub struct SpiStorageBackend {
     storage_size: u32,
     /// Base offset within the flash for this storage region
     base_offset: u32,
+    /// Optional CPU-visible read mapping for `base_offset..base_offset + storage_size`.
+    mapped_read_base: Option<u64>,
 }
 
 impl SpiStorageBackend {
@@ -144,6 +146,7 @@ impl SpiStorageBackend {
             controller,
             storage_size,
             base_offset,
+            mapped_read_base: None,
         }
     }
 
@@ -171,6 +174,29 @@ impl SpiStorageBackend {
     pub fn set_storage_size(&mut self, size: u32) {
         self.storage_size = size;
     }
+
+    /// Configure a CPU-visible read mapping for this storage region.
+    pub fn set_mapped_read_base(&mut self, phys_base: u64) {
+        self.mapped_read_base = Some(phys_base);
+    }
+}
+
+fn read_mapped_flash(phys_base: u64, offset: u32, buffer: &mut [u8]) -> Result<()> {
+    let start = phys_base
+        .checked_add(offset as u64)
+        .ok_or(StorageError::InvalidArgument)?;
+
+    for (i, byte) in buffer.iter_mut().enumerate() {
+        let addr = start
+            .checked_add(i as u64)
+            .ok_or(StorageError::InvalidArgument)?;
+        // SAFETY: `phys_base` is provided by the platform as a valid
+        // CPU-visible read mapping for this firmware-storage region. Reads are
+        // byte-wise volatile so NOR/MMIO mappings are not optimized away.
+        *byte = unsafe { core::ptr::read_volatile(addr as *const u8) };
+    }
+
+    Ok(())
 }
 
 impl StorageBackend for SpiStorageBackend {
@@ -207,6 +233,10 @@ impl StorageBackend for SpiStorageBackend {
         // Check bounds
         if offset as u64 + buffer.len() as u64 > self.storage_size as u64 {
             return Err(StorageError::InvalidArgument);
+        }
+
+        if let Some(mapped_read_base) = self.mapped_read_base {
+            return read_mapped_flash(mapped_read_base, offset, buffer);
         }
 
         // Read from flash at base_offset + offset
