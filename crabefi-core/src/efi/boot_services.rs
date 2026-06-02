@@ -1536,17 +1536,11 @@ extern "efiapi" fn exit_boot_services(image_handle: Handle, map_key: usize) -> S
         // re-enable bus mastering for drivers it owns.
         crate::drivers::pci::disable_all_bus_mastering_for_handoff();
 
-        // Invalidate the coreboot framebuffer record to prevent a race condition
-        // between Linux's simplefb (coreboot) and efifb (EFI GOP) drivers.
-        // By setting the tag to CB_TAG_UNUSED, Linux will only use the EFI GOP.
-        unsafe {
-            crate::coreboot::invalidate_framebuffer_record();
+        // Let platform glue clean up integration-specific handoff state before
+        // the OS takes over (for example, disabling non-runtime log buffers).
+        if let Some(hooks) = crate::state::drivers().platform.hooks {
+            hooks.on_exit_boot_services();
         }
-
-        // Disable CBMEM console - the buffer lives in a coreboot Reserved
-        // region that the OS does not map for EFI runtime use. Any log call
-        // from runtime services would page-fault trying to write there.
-        crate::coreboot::cbmem_console::disable();
 
         // CRITICAL: Set boot_services pointer to NULL in SystemTable
         // This is REQUIRED by UEFI spec and Linux checks for this!

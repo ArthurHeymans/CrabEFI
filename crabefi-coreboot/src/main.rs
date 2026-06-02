@@ -52,6 +52,28 @@ impl crabefi::Timer for CorebootTimer {
 /// Reset handler using architecture-specific reset mechanisms.
 struct CorebootReset;
 
+/// Coreboot-specific lifecycle callbacks injected into the generic core.
+struct CorebootHooks;
+
+impl crabefi::PlatformHooks for CorebootHooks {
+    fn on_exit_boot_services(&self) {
+        // Invalidate the coreboot framebuffer record to prevent a race between
+        // Linux simplefb (coreboot) and efifb (EFI GOP).
+        unsafe {
+            crabefi::coreboot::invalidate_framebuffer_record();
+        }
+
+        // CBMEM console is not runtime mapped; disable it before runtime use.
+        crabefi::coreboot::cbmem_console::disable();
+    }
+
+    fn before_set_virtual_address_map(&self) {
+        // SetVirtualAddressMap switches the OS to virtual addresses. The CBMEM
+        // console buffer is physical-only, so it must be disabled first.
+        crabefi::coreboot::cbmem_console::disable();
+    }
+}
+
 impl crabefi::ResetHandler for CorebootReset {
     fn reset(&self, reset_type: crabefi::ResetType) -> ! {
         #[cfg(target_arch = "x86_64")]
@@ -428,6 +450,7 @@ fn riscv_fdt_only_boot(fdt_ptr: u64, fdt_size: u32) -> ! {
         freq_hz: crabefi::state::drivers().timing.counter_freq_hz,
     };
     let reset = CorebootReset;
+    let hooks = CorebootHooks;
 
     let fdt_slice = unsafe { core::slice::from_raw_parts(fdt_ptr as *const u8, fdt_size as usize) };
 
@@ -446,6 +469,7 @@ fn riscv_fdt_only_boot(fdt_ptr: u64, fdt_size: u32) -> ! {
         fdt: Some(fdt_slice),
         firmware_info: None,
         capsule_regions: &[],
+        hooks: Some(&hooks),
         rng: None,
         ecam_base: None,
         deferred_buffer: None,
@@ -640,6 +664,7 @@ pub extern "C" fn rust_main(coreboot_table_ptr: u64) -> ! {
     };
 
     let reset = CorebootReset;
+    let hooks = CorebootHooks;
     let variable_store_locator = CorebootVariableStoreLocator::new(&cb_info);
 
     // Extract FDT bytes slice.
@@ -702,6 +727,7 @@ pub extern "C" fn rust_main(coreboot_table_ptr: u64) -> ! {
         fdt: fdt_slice,
         firmware_info,
         capsule_regions: &capsule_regions[..capsule_count],
+        hooks: Some(&hooks),
         rng: None,
         ecam_base: None,             // May be filled from ACPI MCFG below
         deferred_buffer: None,       // Uses linker-symbol fallback in init_platform()

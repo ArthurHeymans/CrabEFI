@@ -53,9 +53,9 @@ pub use platform::{
     BlockDevice, BlockDeviceInfo, BlockError, BootResult, CapsuleBackend, CapsuleRegion,
     ConsoleInput, DebugOutput, DeferredBufferConfig, FirmwareInfo, FirmwareMmapWindow,
     FirmwareStorage, FirmwareStorageLocation, FirmwareStorageRegion, FmapRegion, FramebufferConfig,
-    Key, KeyState, MemoryRegion, MemoryType, PlatformConfig, ResetHandler, ResetType, Rng,
-    RngError, RuntimeRegion, StorageBackend, StorageError, Timer, VarBackendError, VariableBackend,
-    VariableStoreLocator, VariableStoreRegion, VariableVisitor,
+    Key, KeyState, MemoryRegion, MemoryType, PlatformConfig, PlatformHooks, ResetHandler,
+    ResetType, Rng, RngError, RuntimeRegion, StorageBackend, StorageError, Timer, VarBackendError,
+    VariableBackend, VariableStoreLocator, VariableStoreRegion, VariableVisitor,
 };
 
 /// Display a Secure Boot violation error on screen
@@ -319,8 +319,19 @@ fn init_platform_impl(mut config: PlatformConfig) -> ! {
     }
 
     // ---- 6. Store platform-provided firmware metadata ----
+    let hooks: Option<&'static dyn crate::platform::PlatformHooks> = config.hooks.map(|hooks| {
+        // SAFETY: init_platform() is -> !, so platform hook references live for
+        // the entire firmware lifetime.
+        unsafe {
+            core::mem::transmute::<
+                &dyn crate::platform::PlatformHooks,
+                &'static dyn crate::platform::PlatformHooks,
+            >(hooks)
+        }
+    });
     state::with_drivers_mut(|d| {
         d.platform.efi_fw_info = config.firmware_info;
+        d.platform.hooks = hooks;
         d.platform.capsule_regions.clear();
         for region in config.capsule_regions {
             if d.platform.capsule_regions.push(*region).is_err() {
