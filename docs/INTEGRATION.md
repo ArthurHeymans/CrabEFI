@@ -11,7 +11,6 @@ CrabEFI's core is a platform-agnostic UEFI implementation. Your firmware provide
 fn firmware_main() -> ! {
     // 1. Initialize your hardware
     let mut emmc = MyEmmcDriver::new(EMMC_BASE);
-    let mut var_store = MyVarStore::new();
     let timer = MyTimer::new();
 
     // 2. Build PlatformConfig
@@ -20,7 +19,8 @@ fn firmware_main() -> ! {
         timer: &timer,
         reset: &MyReset,
         block_devices: &mut [&mut emmc as &mut dyn crabefi::BlockDevice],
-        variable_backend: Some(&mut var_store),
+        variable_backend: None,       // direct VariableBackend routing is not wired yet
+        variable_store_locator: None, // variables are volatile without a locator
         debug_output: None,
         console_input: None,
         framebuffer: None,
@@ -140,9 +140,12 @@ impl ResetHandler for PsciReset {
 
 The `ResetHandler` implementation must reside in memory marked as runtime-safe, since `ResetSystem` is a UEFI runtime service.
 
-### VariableBackend (Optional)
+### Variable Persistence (Optional)
 
-Without this, EFI variables work in-memory but are lost on reset.
+Without a platform-provided persistence path, EFI variables work in-memory but
+are lost on reset. The direct `VariableBackend` field is API scaffolding for
+future SMM/TF-A MM-style routing and is not currently connected by
+`init_platform()`.
 
 #### Option A: Raw Flash via Edk2VarStore
 
@@ -170,8 +173,11 @@ Then wrap it with `Edk2VarStore`:
 let mut flash = MyFlash::new();
 let mut var_store = crabefi::efi::varstore::Edk2VarStore::new(&mut flash);
 
+// NOTE: Edk2VarStore implements the future VariableBackend API, but
+// init_platform() does not route variable_backend yet.
 let config = crabefi::PlatformConfig {
-    variable_backend: Some(&mut var_store),
+    variable_backend: None,
+    variable_store_locator: None,
     // For post-ExitBootServices writes (flash locked), provide a deferred buffer:
     deferred_buffer: Some(crabefi::DeferredBufferConfig {
         base: 0x8_0000,    // Must survive warm reboot
@@ -213,11 +219,11 @@ impl VariableBackend for SmmVarStore {
 }
 ```
 
-No deferred buffer is needed since `runtime_capable()` returns `true`.
+When direct `VariableBackend` routing is implemented, no deferred buffer will be needed for runtime-capable SMM backends.
 
 #### Option C: TF-A MM (StandaloneMM)
 
-Same pattern as SMM, using FF-A or SVC calls to communicate with the secure partition:
+Future direct `VariableBackend` routing is expected to use the same pattern as SMM, with FF-A or SVC calls to communicate with the secure partition:
 
 ```rust
 struct MmVarStore { /* FF-A comm buffer */ }

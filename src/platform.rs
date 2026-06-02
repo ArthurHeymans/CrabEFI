@@ -38,7 +38,8 @@
 //!     timer: &my_timer,
 //!     reset: &my_reset_handler,
 //!     block_devices: &mut [&mut my_emmc],
-//!     variable_backend: Some(&mut my_var_store),
+//!     variable_backend: None, // direct VariableBackend routing is not wired yet
+//!     variable_store_locator: None,
 //!     // ...
 //! };
 //! crabefi::init_platform(config); // never returns
@@ -418,6 +419,82 @@ pub enum StorageError {
     IoError,
     /// Operation not supported by this backend.
     NotSupported,
+}
+
+/// Firmware storage access used while locating persistent variable storage.
+///
+/// This is intentionally read-only plus a small amount of address metadata:
+/// locating the variable store may require parsing a platform-specific flash
+/// layout structure, but it must not modify flash. The resulting region is
+/// then wrapped by a normal [`StorageBackend`] for EDK2 variable-store I/O.
+pub trait FirmwareStorage {
+    /// Read bytes from the firmware storage device at an absolute byte offset.
+    fn read(&mut self, offset: u32, buffer: &mut [u8]) -> Result<(), StorageError>;
+
+    /// BIOS region from an Intel Flash Descriptor, if available.
+    ///
+    /// Returns `(base, limit)` as absolute flash offsets. Platforms that do not
+    /// have an IFD can leave this as `None`.
+    fn bios_region(&self) -> Option<(u32, u32)> {
+        None
+    }
+}
+
+/// A located variable-store region in firmware storage.
+#[derive(Debug, Clone)]
+pub struct VariableStoreRegion {
+    /// Region name for logging, for example `SMMSTORE`.
+    pub name: heapless::String<32>,
+    /// Absolute byte offset from the start of the firmware storage device.
+    pub offset: u32,
+    /// Region size in bytes.
+    pub size: u32,
+}
+
+impl VariableStoreRegion {
+    /// Create a variable-store region descriptor.
+    ///
+    /// # Arguments
+    /// * `name` - Human-readable region name. Names longer than 32 bytes are
+    ///   truncated for logging.
+    /// * `offset` - Absolute byte offset from the start of firmware storage.
+    /// * `size` - Region size in bytes.
+    pub fn new(name: &str, offset: u32, size: u32) -> Self {
+        let mut region_name = heapless::String::new();
+        for ch in name.chars() {
+            if region_name.push(ch).is_err() {
+                break;
+            }
+        }
+
+        Self {
+            name: region_name,
+            offset,
+            size,
+        }
+    }
+}
+
+/// Platform-specific locator for the persistent EFI variable store.
+///
+/// CrabEFI's library code knows how to read and write an EDK2 variable store
+/// once it has a raw region, but it does not know how a platform describes its
+/// flash layout. Coreboot can implement this by checking SMMSTORE table records
+/// and FMAP; other integrations can use device-tree properties, fixed board
+/// configuration, SMM, or any other platform-specific mechanism.
+pub trait VariableStoreLocator {
+    /// Locate the persistent EFI variable-store region.
+    ///
+    /// # Arguments
+    /// * `storage` - Absolute read access to the firmware storage device.
+    ///
+    /// # Returns
+    /// The storage region to use, or `None` if this platform has no persistent
+    /// variable store available.
+    fn locate_variable_store(
+        &self,
+        storage: &mut dyn FirmwareStorage,
+    ) -> Option<VariableStoreRegion>;
 }
 
 /// Raw byte-level storage backend.
@@ -1089,9 +1166,18 @@ pub struct PlatformConfig<'a> {
 
     /// Variable persistence backend.
     ///
-    /// `None` means variables are volatile (lost on reset). EFI applications
-    /// can still use `SetVariable`/`GetVariable`, but nothing persists.
+    /// Reserved for future SMM/TF-A MM-style backends. The current
+    /// `init_platform()` path does not route this field into runtime variable
+    /// services yet, so leave it as `None` unless that routing is implemented.
     pub variable_backend: Option<&'a mut dyn VariableBackend>,
+
+    /// Platform-specific persistent variable-store locator.
+    ///
+    /// Direct-flash integrations provide this when CrabEFI should manage an
+    /// EDK2-compatible variable store itself. Coreboot implements this by
+    /// consulting its SMMSTORE records and FMAP. Library consumers that want
+    /// volatile variables can leave this as `None`.
+    pub variable_store_locator: Option<&'a dyn VariableStoreLocator>,
 
     // ---- Console ----
     /// Debug/log output (serial port or equivalent).

@@ -4,8 +4,9 @@
 //! like SMMSTORE. FMAP is used by coreboot and ChromeOS to describe the
 //! layout of the SPI flash.
 //!
-//! The FMAP location is obtained from coreboot's LB_TAG_BOOT_MEDIA_PARAMS
-//! table entry, which provides the exact offset in flash.
+//! Coreboot's payload path passes the FMAP location from
+//! LB_TAG_BOOT_MEDIA_PARAMS when available; callers without that platform
+//! record can still probe common FMAP offsets.
 //!
 //! # References
 //!
@@ -15,7 +16,7 @@
 use heapless::{String, Vec};
 use zerocopy::{FromBytes, Immutable, KnownLayout, Unaligned};
 
-use crate::drivers::spi::{AnySpiController, SpiController};
+use crate::platform::FirmwareStorage;
 
 /// FMAP signature: "__FMAP__"
 pub const FMAP_SIGNATURE: &[u8; 8] = b"__FMAP__";
@@ -121,41 +122,39 @@ fn bytes_to_string(bytes: &[u8]) -> String<FMAP_NAME_LEN> {
     s
 }
 
-/// Read and parse FMAP from SPI flash
+/// Read and parse FMAP from firmware storage.
 ///
-/// This function first tries to get the FMAP offset from LB_TAG_BOOT_MEDIA_PARAMS,
-/// then falls back to probing at common offsets (0x0 is most common for coreboot).
+/// If `known_offset` is provided it is tried first, then common coreboot FMAP
+/// offsets are probed as a fallback.
 ///
 /// # Arguments
 ///
-/// * `spi` - The SPI controller to use for reading flash
+/// * `storage` - Firmware storage to read.
+/// * `known_offset` - Platform-provided FMAP offset, if known.
 ///
 /// # Returns
 ///
 /// The parsed FMAP info if found, or None if not available.
-pub fn read_fmap(spi: &mut AnySpiController) -> Option<FmapInfo> {
-    // First try to get FMAP offset from coreboot's boot media params
-    if let Some(boot_media) = super::get_boot_media() {
-        let fmap_offset = boot_media.fmap_offset as u32;
-        log::debug!("Reading FMAP from boot_media offset {:#x}", fmap_offset);
-        if let Some(fmap) = parse_fmap_at(spi, fmap_offset) {
+pub fn read_fmap(storage: &mut dyn FirmwareStorage, known_offset: Option<u32>) -> Option<FmapInfo> {
+    if let Some(fmap_offset) = known_offset {
+        log::debug!("Reading FMAP from platform offset {:#x}", fmap_offset);
+        if let Some(fmap) = parse_fmap_at(storage, fmap_offset) {
             return Some(fmap);
         }
     }
 
-    // Fallback: probe at common FMAP locations
-    // FMAP is typically at offset 0 in coreboot flash images
+    // Fallback: probe at common FMAP locations.
     const FMAP_PROBE_OFFSETS: &[u32] = &[
         0x0,     // Most common: FMAP at start of flash
         0x20000, // Some layouts put FMAP after bootblock
         0x1000,  // Alternative location
     ];
 
-    log::debug!("No boot_media params, probing for FMAP at common offsets...");
+    log::debug!("No valid platform FMAP offset, probing common offsets...");
 
     for &offset in FMAP_PROBE_OFFSETS {
         log::trace!("Probing for FMAP at offset {:#x}", offset);
-        if let Some(fmap) = parse_fmap_at(spi, offset) {
+        if let Some(fmap) = parse_fmap_at(storage, offset) {
             log::info!("Found FMAP by probing at offset {:#x}", offset);
             return Some(fmap);
         }
@@ -166,10 +165,10 @@ pub fn read_fmap(spi: &mut AnySpiController) -> Option<FmapInfo> {
 }
 
 /// Parse FMAP at a specific offset in flash
-fn parse_fmap_at(spi: &mut AnySpiController, offset: u32) -> Option<FmapInfo> {
+fn parse_fmap_at(storage: &mut dyn FirmwareStorage, offset: u32) -> Option<FmapInfo> {
     // Read the header
     let mut header_bytes = [0u8; FMAP_HEADER_SIZE];
-    if spi.read(offset, &mut header_bytes).is_err() {
+    if storage.read(offset, &mut header_bytes).is_err() {
         log::warn!("Failed to read FMAP header at {:#x}", offset);
         return None;
     }
@@ -215,7 +214,7 @@ fn parse_fmap_at(spi: &mut AnySpiController, offset: u32) -> Option<FmapInfo> {
         log::warn!("FMAP areas offset overflow");
         return None;
     };
-    if spi.read(areas_offset, &mut areas_bytes).is_err() {
+    if storage.read(areas_offset, &mut areas_bytes).is_err() {
         log::warn!("Failed to read FMAP areas");
         return None;
     }
@@ -337,19 +336,22 @@ pub struct FmapSmmstoreInfo {
 
 /// Find and return SMMSTORE info from FMAP
 ///
-/// This function reads the FMAP from flash (using the offset from coreboot tables)
-/// and looks for the SMMSTORE region.
+/// This function reads the FMAP from firmware storage and looks for the
+/// SMMSTORE region.
 ///
 /// # Arguments
 ///
-/// * `spi` - The SPI controller to use for reading flash
+/// * `storage` - Firmware storage to use for reading flash.
+/// * `known_offset` - Platform-provided FMAP offset, if known.
 ///
 /// # Returns
 ///
 /// SMMSTORE info if found, or None if FMAP not available or SMMSTORE region not present.
-pub fn get_smmstore_from_fmap(spi: &mut AnySpiController) -> Option<FmapSmmstoreInfo> {
-    // Read and parse FMAP using offset from coreboot tables
-    let fmap = read_fmap(spi)?;
+pub fn get_smmstore_from_fmap(
+    storage: &mut dyn FirmwareStorage,
+    known_offset: Option<u32>,
+) -> Option<FmapSmmstoreInfo> {
+    let fmap = read_fmap(storage, known_offset)?;
 
     // Find SMMSTORE region
     let region = find_smmstore_region(&fmap)?;

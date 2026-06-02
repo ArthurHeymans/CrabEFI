@@ -5,12 +5,12 @@
 //! 1. Load Secure Boot keys from persisted UEFI variables (PK, KEK, db, dbx)
 //! 2. Check enrollment status and optionally enroll default keys
 //! 3. Create/update SecureBoot and SetupMode status variables
-//! 4. Persist newly enrolled keys to SMMSTORE
+//! 4. Persist newly enrolled keys to persistent variable storage
 //!
 //! # Boot Flow
 //!
 //! ```text
-//! init_persistence() loads variables from SMMSTORE
+//! variable persistence initialization loads variables from storage
 //!         |
 //!         v
 //! init_secure_boot() is called:
@@ -65,7 +65,7 @@ impl Default for SecureBootConfig {
 
 /// Initialize Secure Boot state at boot time
 ///
-/// This should be called after `init_persistence()` has loaded variables from SMMSTORE.
+/// This should be called after variable persistence has loaded variables from storage.
 ///
 /// # Returns
 ///

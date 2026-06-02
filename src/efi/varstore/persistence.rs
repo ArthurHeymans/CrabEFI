@@ -19,14 +19,15 @@
 //!
 //! # Persistent Config Region
 //!
-//! The location of the variable store region is determined at runtime from:
-//! 1. Coreboot tables (SMMSTORE v2 record)
-//! 2. FMAP (SMMSTORE region)
+//! The location of the variable store region is determined by a
+//! platform-provided [`crate::platform::VariableStoreLocator`]. This keeps
+//! coreboot-specific concepts such as SMMSTORE table records and FMAP out of
+//! the library persistence path.
 
 use alloc::vec::Vec;
 
-use crate::coreboot;
 use crate::drivers::spi::{self, SpiController};
+use crate::platform::VariableStoreLocator;
 use crate::state::{self, MAX_VARIABLE_DATA_SIZE, MAX_VARIABLE_NAME_LEN};
 
 use super::VarStoreError;
@@ -45,14 +46,23 @@ pub const DEFAULT_VARSTORE_SIZE: u32 = 256 * 1024;
 /// Initialize the variable store persistence layer
 ///
 /// This should be called early in boot to:
-/// 1. Detect and initialize the storage backend (SPI controller)
-/// 2. Check for persistent config region from coreboot tables or FMAP
-/// 3. Read existing variables from storage
-/// 4. Load them into the in-memory variable cache
-pub fn init() -> Result<(), VarStoreError> {
+/// 1. Return immediately if the platform did not provide a variable-store locator
+/// 2. Detect and initialize the storage backend (SPI controller)
+/// 3. Ask the platform locator for the persistent variable-store region
+/// 4. Read existing variables from storage
+/// 5. Load them into the in-memory variable cache
+pub fn init(locator: Option<&dyn VariableStoreLocator>) -> Result<(), VarStoreError> {
     log::info!("Initializing variable store persistence...");
 
-    // Detect SPI controller first (we need it for FMAP parsing)
+    let Some(locator) = locator else {
+        log::warn!("No variable-store locator provided - persistence DISABLED");
+        log::warn!("Variables will be lost on reboot");
+        return Err(VarStoreError::NotInitialized);
+    };
+
+    // Detect SPI controller after confirming the platform wants direct-flash
+    // variable persistence.  Library integrations without a locator should not
+    // probe platform-specific SPI hardware as a side effect.
     let controller = match spi::detect_and_init() {
         Some(c) => c,
         None => {
@@ -67,23 +77,11 @@ pub fn init() -> Result<(), VarStoreError> {
     let mut backend =
         SpiStorageBackend::new(controller, DEFAULT_VARSTORE_BASE, DEFAULT_VARSTORE_SIZE);
 
-    // Try to get persistent config region from multiple sources:
-    // 1. Coreboot tables (SMMSTORE v2 record)
-    // 2. FMAP in SPI flash
-    // 3. Fall back to defaults (DISABLED for safety)
-    let config_found =
-        configure_from_coreboot_tables(&mut backend) || configure_from_fmap(&mut backend);
-
-    if !config_found {
-        // DANGER: Using default base address without verification
-        // could overwrite boot code on small flash chips!
-        // For safety, we disable persistence if we can't find config info.
-        log::warn!(
-            "No persistent config region found in coreboot tables or FMAP - persistence DISABLED"
-        );
-        log::warn!("Variables will be lost on reboot. Add SMMSTORE region to your FMAP.");
-        return Err(VarStoreError::NotInitialized);
-    }
+    // Ask the platform to locate the persistent variable store.  We keep the
+    // default offset/size disabled unless the platform explicitly identifies a
+    // safe region; using a guessed address could overwrite boot code on small
+    // flash devices.
+    configure_from_locator(&mut backend, locator)?;
 
     // Store the backend in global state
     state::with_mut(|s| {
@@ -100,130 +98,26 @@ pub fn init() -> Result<(), VarStoreError> {
     Ok(())
 }
 
-/// Try to configure variable store from coreboot tables (SMMSTORE v2 record)
-///
-/// Returns true if configuration was found and applied.
-fn configure_from_coreboot_tables(backend: &mut SpiStorageBackend) -> bool {
-    if let Some(smmstore_info) = coreboot::get_smmstorev2() {
-        log::info!(
-            "Found SMMSTORE v2 in coreboot tables: {} blocks x {} KB at {:#x}",
-            smmstore_info.num_blocks,
-            smmstore_info.block_size / 1024,
-            smmstore_info.mmap_addr
-        );
+/// Configure the variable store from the platform-provided locator.
+fn configure_from_locator(
+    backend: &mut SpiStorageBackend,
+    locator: &dyn VariableStoreLocator,
+) -> Result<(), VarStoreError> {
+    let region = locator
+        .locate_variable_store(backend.controller_mut())
+        .ok_or(VarStoreError::NotInitialized)?;
 
-        // The mmap_addr is the memory-mapped address for read-only access
-        // For SPI flash writes, we need to convert to the flash offset
-        // Use the BIOS region from IFD to calculate the correct offset
-        let base_addr = calculate_spi_offset(smmstore_info.mmap_addr, backend.get_bios_region());
-        let size = smmstore_info.num_blocks * smmstore_info.block_size;
+    backend.set_base_offset(region.offset);
+    backend.set_storage_size(region.size);
 
-        // Update the storage backend with the region location
-        backend.set_base_offset(base_addr);
-        backend.set_storage_size(size);
+    log::info!(
+        "Variable store configured from platform locator: '{}' base={:#x}, size={} KB",
+        region.name.as_str(),
+        region.offset,
+        region.size / 1024
+    );
 
-        log::info!(
-            "Variable store configured: base={:#x}, size={} KB",
-            base_addr,
-            size / 1024
-        );
-        return true;
-    }
-
-    log::debug!("No SMMSTORE v2 record in coreboot tables");
-    false
-}
-
-/// Try to configure variable store from FMAP in SPI flash
-///
-/// This is a fallback when coreboot tables don't provide SMMSTORE v2 info.
-/// We read the FMAP structure from flash and look for the SMMSTORE region.
-///
-/// Returns true if configuration was found and applied.
-fn configure_from_fmap(backend: &mut SpiStorageBackend) -> bool {
-    use crate::coreboot::fmap;
-
-    log::info!("Looking for variable store region in FMAP...");
-
-    // Read FMAP from flash (uses boot_media_params if available, otherwise probes)
-    // Note: fmap::get_smmstore_from_fmap expects an AnySpiController, so we access
-    // the underlying controller directly
-    if let Some(region_info) = fmap::get_smmstore_from_fmap(backend.controller_mut()) {
-        log::info!(
-            "Found '{}' in FMAP: offset={:#x}, size={} KB",
-            region_info.name.as_str(),
-            region_info.offset,
-            region_info.size / 1024
-        );
-
-        // Update the storage backend with the region location
-        backend.set_base_offset(region_info.offset);
-        backend.set_storage_size(region_info.size);
-
-        log::info!(
-            "Variable store configured: base={:#x}, size={} KB",
-            region_info.offset,
-            region_info.size / 1024
-        );
-        return true;
-    }
-
-    log::debug!("Variable store region not found in FMAP");
-    false
-}
-
-/// Calculate SPI flash offset from memory-mapped address
-///
-/// Coreboot's SMMSTORE v2 provides a memory-mapped address for read-only access.
-/// We need to convert this to the SPI flash offset for write operations.
-///
-/// On x86 systems, the BIOS region of the flash is memory-mapped to end at 4GB
-/// (0x100000000). The `bios_region` parameter provides the base and limit of the
-/// BIOS region from the Intel Flash Descriptor (IFD), which allows us to calculate
-/// the correct offset.
-fn calculate_spi_offset(mmap_addr: u64, bios_region: Option<(u32, u32)>) -> u32 {
-    // If we have BIOS region info from IFD, use it for accurate calculation
-    if let Some((bios_base, bios_limit)) = bios_region {
-        let bios_size = (bios_limit - bios_base + 1) as u64;
-        // BIOS region is mapped to end at 4GB
-        let mmap_base = 0x1_0000_0000u64 - bios_size;
-
-        if mmap_addr >= mmap_base && mmap_addr < 0x1_0000_0000u64 {
-            // Calculate offset within BIOS region, then add BIOS base in flash
-            let offset_in_bios = (mmap_addr - mmap_base) as u32;
-            let flash_offset = bios_base + offset_in_bios;
-            log::debug!(
-                "SPI offset calculation: mmap_addr={:#x}, bios_base={:#x}, bios_size={:#x}, mmap_base={:#x}, flash_offset={:#x}",
-                mmap_addr,
-                bios_base,
-                bios_size,
-                mmap_base,
-                flash_offset
-            );
-            return flash_offset;
-        }
-    }
-
-    // Fallback: assume the address is in a standard memory-mapped range
-    // This is a heuristic based on common flash sizes
-    log::warn!("No BIOS region info available, using fallback address calculation");
-
-    if mmap_addr >= 0xFF000000 {
-        // Assume 16MB flash mapped at 0xFF000000
-        (mmap_addr - 0xFF000000) as u32
-    } else if mmap_addr >= 0xFE000000 {
-        // Assume 32MB flash mapped at 0xFE000000
-        (mmap_addr - 0xFE000000) as u32
-    } else if mmap_addr >= 0xFC000000 {
-        // Assume 64MB flash mapped at 0xFC000000
-        (mmap_addr - 0xFC000000) as u32
-    } else if mmap_addr == 0 {
-        // No address provided, use default
-        DEFAULT_VARSTORE_BASE
-    } else {
-        // Assume the address is already a flash offset
-        mmap_addr as u32
-    }
+    Ok(())
 }
 
 /// Initialize the variable store region
