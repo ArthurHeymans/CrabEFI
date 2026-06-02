@@ -10,7 +10,10 @@ description = "CrabEFI as a coreboot payload binary"
 ui = ["crabefi/ui"]
 
 [dependencies]
-crabefi = { path = "..", features = ["global-allocator", "platform-entry"] }
+crabefi = { package = "crabefi-core", path = "../crabefi-core", features = [
+  "global-allocator",
+  "platform-entry",
+] }
 crabefi-drivers = { path = "../crabefi-drivers" }
 
 # Needed for coreboot table parsing and early setup
@@ -21,7 +24,10 @@ heapless = "0.8"
 # ACPI table parsing and AML interpreter for platform device discovery.
 # Used by the coreboot payload to discover ECAM, GIC, UART, and DSDT
 # devices from ACPI tables before handing off to init_platform().
-acpi = { version = "6.1", default-features = false, features = ["alloc", "aml"] }
+acpi = { version = "6.1", default-features = false, features = [
+  "alloc",
+  "aml",
+] }
 
 [target.'cfg(target_arch = "x86_64")'.dependencies]
 x86_64 = "0.15"

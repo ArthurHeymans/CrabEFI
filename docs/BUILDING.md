@@ -50,8 +50,8 @@ The output ELF is at `target/<triple>/release/crabefi`.
 # Build the coreboot payload binary
 cargo build -p crabefi-coreboot --release --target x86_64-unknown-none
 
-# Build only the library (for external integration)
-cargo build -p crabefi --release --target x86_64-unknown-none
+# Build only the core library (for external integration)
+cargo build -p crabefi-core --release --target x86_64-unknown-none
 
 # Build the drivers crate
 cargo build -p crabefi-drivers --release --target x86_64-unknown-none
@@ -67,7 +67,8 @@ PAYLOAD_BASE=0x62000000 cargo build -p crabefi-coreboot --release --target aarch
 
 | File | Purpose |
 |------|---------|
-| `Cargo.toml` | Workspace root + core library manifest |
+| `Cargo.toml` | Virtual workspace root |
+| `crabefi-core/Cargo.toml` | Core library manifest |
 | `crabefi-coreboot/Cargo.toml` | Coreboot binary manifest |
 | `crabefi-drivers/Cargo.toml` | Drivers library manifest |
 | `.cargo/config.toml` | `build-std` settings, target-specific rustflags |

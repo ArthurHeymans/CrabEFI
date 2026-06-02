@@ -43,7 +43,7 @@ Add CrabEFI as a dependency in your firmware crate:
 
 ```toml
 [dependencies]
-crabefi = { git = "https://github.com/user/CrabEFI", features = ["global-allocator"] }
+crabefi = { package = "crabefi-core", git = "https://github.com/user/CrabEFI", features = ["global-allocator"] }
 ```
 
 Omit `global-allocator` if your firmware provides its own `#[global_allocator]`. CrabEFI requires the `alloc` crate for Secure Boot cryptography.
@@ -324,7 +324,7 @@ The `crabefi-drivers` crate provides standard hardware drivers that implement th
 
 ```toml
 [dependencies]
-crabefi = { git = "..." }
+crabefi = { package = "crabefi-core", git = "..." }
 crabefi-drivers = { git = "..." }
 ```
 

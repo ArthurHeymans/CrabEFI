@@ -6,45 +6,28 @@ CrabEFI is structured as a Cargo workspace with three crates:
 
 ```
 CrabEFI/
-├── Cargo.toml                  # Workspace root + core library manifest
-├── src/                        # Core library source
-│   ├── platform.rs             # Platform abstraction traits (public API)
-│   ├── lib.rs                  # Library entry points (init, init_platform)
-│   ├── state.rs                # Centralized FirmwareState
-│   ├── heap.rs                 # Bump allocator (opt-in #[global_allocator])
-│   ├── efi/                    # UEFI implementation
-│   │   ├── boot_services.rs    # EFI_BOOT_SERVICES
-│   │   ├── runtime_services.rs # EFI_RUNTIME_SERVICES
-│   │   ├── system_table.rs     # EFI_SYSTEM_TABLE
-│   │   ├── allocator.rs        # Page-granular memory allocator
-│   │   ├── protocols/          # Protocol implementations (20 files)
-│   │   ├── auth/               # Secure Boot (authenticode, x509, key mgmt)
-│   │   └── varstore/           # Variable persistence
-│   │       ├── edk2.rs         # EDK2 Firmware Volume format parser
-│   │       ├── edk2_backend.rs # Edk2VarStore (VariableBackend for raw flash)
-│   │       ├── persistence.rs  # Legacy SPI persistence layer
-│   │       ├── deferred.rs     # Warm-reboot deferred write buffer
-│   │       └── storage.rs      # SpiStorageBackend
-│   ├── drivers/                # Hardware drivers (will move to crabefi-drivers)
-│   │   ├── block.rs            # BlockDevice trait + implementations
-│   │   ├── storage.rs          # StorageRegistry
-│   │   ├── pci/                # PCI enumeration + driver model
-│   │   ├── nvme/               # NVMe controller driver
-│   │   ├── ahci/               # AHCI/SATA driver
-│   │   ├── usb/                # USB host controllers + device classes
-│   │   ├── sdhci/              # SD Host Controller driver
-│   │   ├── spi/                # SPI flash (Intel, AMD, QEMU)
-│   │   ├── serial.rs           # 16550 UART + PL011
-│   │   └── keyboard.rs         # PS/2 keyboard
-│   ├── arch/                   # Architecture-specific code
-│   │   ├── x86_64/             # Entry, IDT, port I/O, cache, reset, RNG
-│   │   └── aarch64/            # Entry, exceptions, cache, reset, RNG
-│   ├── coreboot/               # Coreboot table parsing
-│   ├── fs/                     # FAT, GPT, ISO9660
-│   ├── pe/                     # PE/COFF image loader
-│   ├── boot.rs                 # Boot manager
-│   ├── menu.rs                 # Interactive boot menu
-│   └── ...
+├── Cargo.toml                  # Virtual workspace root
+├── crabefi-core/               # Core library crate
+│   ├── Cargo.toml
+│   └── src/                    # Core library source
+│       ├── platform.rs         # Platform abstraction traits (public API)
+│       ├── lib.rs              # Library entry points (init, init_platform)
+│       ├── state.rs            # Centralized FirmwareState
+│       ├── heap.rs             # Bump allocator (opt-in #[global_allocator])
+│       ├── efi/                # UEFI implementation
+│       │   ├── boot_services.rs    # EFI_BOOT_SERVICES
+│       │   ├── runtime_services.rs # EFI_RUNTIME_SERVICES
+│       │   ├── system_table.rs     # EFI_SYSTEM_TABLE
+│       │   ├── allocator.rs        # Page-granular memory allocator
+│       │   ├── protocols/          # Protocol implementations
+│       │   ├── auth/               # Secure Boot (authenticode, x509, key mgmt)
+│       │   └── varstore/           # Variable persistence
+│       ├── drivers/            # Temporary during migration; moving to crabefi-drivers
+│       ├── coreboot/           # Temporary during migration; moving to crabefi-coreboot
+│       ├── arch/               # Architecture-specific code
+│       ├── fs/                 # FAT, GPT, ISO9660
+│       ├── pe/                 # PE/COFF image loader
+│       └── ...
 │
 ├── crabefi-coreboot/           # Coreboot payload binary
 │   ├── Cargo.toml
@@ -72,7 +55,7 @@ CrabEFI/
 
 ## Platform Abstraction Layer
 
-The core library defines platform traits in `src/platform.rs`. External firmware implements these traits and passes them to CrabEFI via `PlatformConfig`:
+The core library defines platform traits in `crabefi-core/src/platform.rs`. External firmware implements these traits and passes them to CrabEFI via `PlatformConfig`:
 
 ```
 ┌─────────────────────────────────────────────┐
@@ -136,13 +119,12 @@ FirmwareState
 ### Coreboot Target
 
 1. **Architecture entry** (assembly): 32-to-64 mode switch (x86) or MMU setup (aarch64)
-2. **`rust_main()`** (`crabefi-coreboot/src/main.rs`): calls `crabefi::init()`
-3. **`init()`** (`src/lib.rs`):
-   - Parse coreboot tables (memory map, serial, framebuffer, SMMSTORE)
-   - Initialize serial, logging, keyboard, timing
-   - Initialize EFI (allocator, system table, services, protocols)
-   - Initialize heap, PCI, variable persistence, Secure Boot
-   - Run boot manager (BootNext -> BootOrder -> fallback -> interactive menu)
+2. **`rust_main()`** (`crabefi-coreboot/src/main.rs`): parses coreboot tables, configures platform state, and calls `crabefi::init_platform()`.
+3. **`init_platform()`** (`crabefi-core/src/lib.rs`):
+   - Consumes platform-provided memory map, timer, reset, storage, and optional services
+   - Initializes EFI (allocator, system table, services, protocols)
+   - Initializes heap, PCI, variable persistence, Secure Boot
+   - Runs the boot manager (BootNext -> BootOrder -> fallback -> interactive menu)
 
 ### Library Target (External Firmware)
 
