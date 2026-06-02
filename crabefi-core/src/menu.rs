@@ -1032,8 +1032,16 @@ pub fn show_menu(menu: &mut BootMenu) -> Option<usize> {
                     draw_menu(menu, &mut fb_console);
                 }
                 KeyPress::Char('f') | KeyPress::Char('F') => {
-                    // Open Firmware Settings menu (CFR)
-                    crate::cfr_menu::show_cfr_menu();
+                    // Open platform-provided firmware settings menu.
+                    if let Some(hooks) = crate::state::drivers().platform.hooks {
+                        if !hooks.show_firmware_settings() {
+                            draw_status("Firmware settings not available", &mut fb_console);
+                            delay_ms(500);
+                        }
+                    } else {
+                        draw_status("Firmware settings not available", &mut fb_console);
+                        delay_ms(500);
+                    }
                     // Redraw boot menu after returning
                     menu_common::clear_screen(&mut fb_console);
                     draw_menu(menu, &mut fb_console);

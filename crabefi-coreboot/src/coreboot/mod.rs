@@ -18,25 +18,23 @@ pub mod framebuffer;
 pub mod memory;
 pub mod tables;
 
-pub use cfr::{CfrForm, CfrInfo, CfrOption, CfrOptionType, CfrValue};
-pub use framebuffer::FramebufferInfo;
+pub use cfr::CfrInfo;
 pub use memory::{MemoryRegion, MemoryType};
-pub use tables::{
-    BootMediaInfo, CapsuleRegion, CorebootInfo, EfiFwInfo, FlashMmapWindow, SerialInfo,
-    Smmstorev2Info, SpiFlashInfo,
-};
+pub use tables::{BootMediaInfo, CorebootInfo, Smmstorev2Info, SpiFlashInfo};
 
-/// Store the coreboot framebuffer record address for later invalidation
+use core::sync::atomic::{AtomicU64, Ordering};
+
+static FRAMEBUFFER_RECORD_ADDR: AtomicU64 = AtomicU64::new(0);
+
+/// Store the coreboot framebuffer record address for later invalidation.
 pub fn store_framebuffer_record_addr(addr: u64) {
-    crate::state::with_drivers_mut(|drivers| {
-        drivers.platform.coreboot_fb_record_addr = Some(addr);
-    });
+    FRAMEBUFFER_RECORD_ADDR.store(addr, Ordering::Release);
 }
 
 // CFR info is stored separately because it can be very large with nested heapless::Vec.
 // We use a heap-allocated Box stored via AtomicPtr to avoid stack overflow.
 use alloc::boxed::Box;
-use core::sync::atomic::{AtomicPtr, Ordering};
+use core::sync::atomic::AtomicPtr;
 
 static CFR_PTR: AtomicPtr<CfrInfo> = AtomicPtr::new(core::ptr::null_mut());
 
@@ -86,16 +84,15 @@ pub fn get_cfr() -> Option<&'static CfrInfo> {
 /// This function modifies memory in the coreboot tables area. It must only
 /// be called when it's safe to modify that memory (at ExitBootServices).
 pub unsafe fn invalidate_framebuffer_record() {
-    let addr =
-        crate::state::try_get().and_then(|state| state.drivers.platform.coreboot_fb_record_addr);
+    let record_addr = FRAMEBUFFER_RECORD_ADDR.load(Ordering::Acquire);
 
-    if let Some(record_addr) = addr {
+    if record_addr != 0 {
         // The tag is the first 4 bytes of the record (u32)
         // Change it from CB_TAG_FRAMEBUFFER (0x0012) to CB_TAG_UNUSED (0x0000)
         //
         // Coreboot table records are aligned to LB_ENTRY_ALIGN (4 bytes), so this is safe.
         debug_assert!(
-            record_addr % 4 == 0,
+            record_addr.is_multiple_of(4),
             "Coreboot framebuffer record address {:#x} not 4-byte aligned",
             record_addr
         );

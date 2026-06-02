@@ -3,6 +3,8 @@
 //! Parses the coreboot tables to extract system information.
 //! Reference: coreboot/src/commonlib/include/commonlib/coreboot_tables.h
 
+#![allow(dead_code)]
+
 use super::framebuffer::FramebufferInfo;
 use super::memory::{MemoryRegion, MemoryType};
 use heapless::Vec;

@@ -27,7 +27,7 @@
 //!   |     +-- pci: PciState (devices, ecam, access method)
 //!   |     +-- serial: SerialState (driver, port, EFI mode)
 //!   |     +-- timing: TimingState (counter freq, boot timestamp)
-//!   |     +-- platform: PlatformInfo (framebuffer, SPI, coreboot info)
+//!   |     +-- platform: PlatformInfo (framebuffer, SPI, handoff data)
 //!   |     +-- keyboard, usb_keyboard, storage_registry, rng
 //!   |
 //!   +-- console: ConsoleState
@@ -58,15 +58,13 @@
 //! Instead, log-path code uses **raw-pointer field access**:
 //!
 //! - **Writes**: `(*drivers_mut_ptr()).serial.driver` (serial, fb_log)
-//! - **Reads**: `(*drivers_mut_ptr()).timing.boot_counter` (timestamps),
-//!   `(*drivers_mut_ptr()).platform.cbmem_console_addr` (CBMEM console)
+//! - **Reads**: `(*drivers_mut_ptr()).timing.boot_counter` (timestamps)
 //!
 //! Raw-pointer access is sound here because:
 //!
 //! 1. The firmware is single-threaded — no data races.
 //! 2. The log-path functions only touch their own disjoint fields
-//!    (e.g. `serial.driver`, `platform.cbmem_console_addr`,
-//!    `console.logger_*`, `timing.boot_counter`).
+//!    (e.g. `serial.driver`, `console.logger_*`, `timing.boot_counter`).
 //! 3. They never read or write fields that the enclosing `with_mut()`
 //!    closure is currently modifying.
 
@@ -645,7 +643,7 @@ pub struct DriverState {
     /// Timing calibration (TSC/ARM generic timer)
     pub timing: TimingState,
 
-    /// Platform hardware info (from coreboot tables)
+    /// Platform hardware info from platform config.
     pub platform: PlatformInfo,
 
     /// Storage device registry (tracks all block devices)
@@ -816,19 +814,10 @@ impl Default for TimingState {
 // Platform Info
 // ----------------------------------------------------------------------------
 
-/// Platform hardware info sourced from coreboot tables or platform config.
-///
-/// Shared fields (framebuffer, ACPI RSDP) are used by both integration paths.
-/// Coreboot-specific global fields are limited to data that must remain
-/// accessible after the coreboot payload hands off to the library path.
+/// Platform hardware info sourced from platform config.
 pub struct PlatformInfo {
     /// Global framebuffer info
     pub framebuffer: Option<FramebufferConfig>,
-
-    /// Address of the coreboot framebuffer record in the coreboot tables.
-    /// Stored so we can invalidate it at ExitBootServices to prevent
-    /// Linux from trying to use both the coreboot framebuffer and the EFI GOP.
-    pub coreboot_fb_record_addr: Option<u64>,
 
     /// Storage backend for variable persistence (SPI flash).
     ///
@@ -842,9 +831,6 @@ pub struct PlatformInfo {
 
     /// ACPI RSDP address
     pub acpi_rsdp: Option<u64>,
-
-    /// CBMEM console address (0 = not initialized/disabled)
-    pub cbmem_console_addr: u64,
 
     /// EFI firmware info (GUID, version, LSV) provided by the platform.
     pub efi_fw_info: Option<crate::platform::FirmwareInfo>,
@@ -860,11 +846,9 @@ impl PlatformInfo {
     pub const fn new() -> Self {
         Self {
             framebuffer: None,
-            coreboot_fb_record_addr: None,
             storage: None,
             memory_regions: HeaplessVec::new(),
             acpi_rsdp: None,
-            cbmem_console_addr: 0,
             efi_fw_info: None,
             capsule_regions: HeaplessVec::new(),
             hooks: None,

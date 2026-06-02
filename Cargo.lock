@@ -160,6 +160,7 @@ dependencies = [
  "log",
  "r-efi",
  "x86_64",
+ "zerocopy",
 ]
 
 [[package]]

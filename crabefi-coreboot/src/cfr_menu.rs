@@ -13,15 +13,15 @@ use crate::coreboot::{
     self,
     cfr::{self, CfrInfo, CfrOption, CfrOptionType, CfrValue},
 };
-use crate::drivers::serial as serial_driver;
-use crate::framebuffer_console::{
-    Color, DEFAULT_BG, DEFAULT_FG, FramebufferConsole, HIGHLIGHT_BG, HIGHLIGHT_FG,
-};
-use crate::menu_common::{self, KeyPress, SerialWriter};
-use crate::time::delay_ms;
 use alloc::string::String;
 use alloc::vec::Vec;
 use core::fmt::Write;
+use crabefi::drivers::serial as serial_driver;
+use crabefi::framebuffer_console::{
+    Color, DEFAULT_BG, DEFAULT_FG, FramebufferConsole, HIGHLIGHT_BG, HIGHLIGHT_FG,
+};
+use crabefi::menu_common::{self, KeyPress, SerialWriter};
+use crabefi::time::delay_ms;
 
 /// Menu title
 const MENU_TITLE: &str = "Firmware Settings";
@@ -76,7 +76,7 @@ pub fn show_cfr_menu() {
         }
     };
 
-    let fb_info = crate::state::get_framebuffer();
+    let fb_info = crabefi::state::get_framebuffer();
     let mut fb_console = fb_info.as_ref().map(FramebufferConsole::new);
 
     let mut items = build_menu_items(cfr_info);
@@ -693,7 +693,7 @@ fn show_help(option: &CfrOption, fb_console: &mut Option<FramebufferConsole>) {
 
 /// Show message that CFR is not available
 fn show_no_cfr_message() {
-    let fb_info = crate::state::get_framebuffer();
+    let fb_info = crabefi::state::get_framebuffer();
     let mut fb_console = fb_info.as_ref().map(FramebufferConsole::new);
 
     serial_driver::write_str("\r\n");

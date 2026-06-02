@@ -13,10 +13,12 @@
 //! - https://chromium.googlesource.com/chromiumos/third_party/flashmap/
 //! - coreboot/src/commonlib/bsd/include/commonlib/bsd/fmap_serialized.h
 
+#![allow(dead_code)]
+
 use heapless::{String, Vec};
 use zerocopy::{FromBytes, Immutable, KnownLayout, Unaligned};
 
-use crate::platform::FirmwareStorage;
+use crabefi::platform::FirmwareStorage;
 
 /// FMAP signature: "__FMAP__"
 pub const FMAP_SIGNATURE: &[u8; 8] = b"__FMAP__";
