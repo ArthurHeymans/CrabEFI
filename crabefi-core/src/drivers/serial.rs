@@ -500,7 +500,7 @@ pub fn init_from_config(info: &SerialConfig) {
         // On aarch64 SBSA platforms, it's typically PL011
         #[cfg(target_arch = "aarch64")]
         {
-            let mut port = Pl011Port::new(info.baseaddr as u64);
+            let mut port = Pl011Port::new(info.baseaddr);
             if port.functional {
                 let _ = port.write_str("\r\n[CrabEFI] PL011 serial initialized\r\n");
                 // SAFETY: Single-threaded firmware; raw pointer avoids re-entrancy
