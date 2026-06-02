@@ -4,10 +4,9 @@
 //! - **x86 port I/O**: 16550 UART at traditional I/O port addresses (COM1 etc.)
 //! - **MMIO**: 16550-compatible or PL011 UART via memory-mapped registers
 //!
-//! The backend is selected at runtime based on coreboot's serial info.
-//! On aarch64 platforms (e.g., QEMU SBSA with PL011), only MMIO is available.
-//! On AMD systems the UART is memory-mapped with a 4-byte register stride
-//! (`regwidth = 4` in the coreboot serial table).
+//! The backend is selected at runtime from platform-provided serial
+//! configuration. On aarch64 platforms (e.g., QEMU SBSA with PL011), only MMIO
+//! is available. Some SoC UARTs are memory-mapped with a 4-byte register stride.
 
 use core::fmt::{self, Write};
 
@@ -35,10 +34,9 @@ pub(crate) enum Uart16550Backend {
     /// Memory-mapped register access (16550-compatible).
     ///
     /// `reg_stride` is the spacing between consecutive 8-bit registers in
-    /// bytes, taken from coreboot's `regwidth` field.  Traditional 8250/16550
-    /// devices use stride 1; many AMD SoC UARTs use stride 4 (each 8-bit
-    /// register occupies a 32-bit slot and must be accessed with 32-bit
-    /// reads/writes).
+    /// bytes, supplied by platform configuration. Traditional 8250/16550
+    /// devices use stride 1; many SoC UARTs use stride 4 (each 8-bit register
+    /// occupies a 32-bit slot and must be accessed with 32-bit reads/writes).
     Mmio { base: u64, reg_stride: u32 },
 }
 
@@ -361,8 +359,8 @@ pub(crate) struct Pl011Port {
 #[cfg(target_arch = "aarch64")]
 impl Pl011Port {
     fn new(base: u64) -> Self {
-        // Safety: The PL011 base address is provided by coreboot tables and
-        // is valid MMIO for the UART's lifetime (the entire firmware run).
+        // Safety: The PL011 base address is provided by platform configuration
+        // and is valid MMIO for the UART's lifetime (the entire firmware run).
         let regs = unsafe { &*(base as *const pl011::Pl011Registers) };
         Self {
             regs,
@@ -476,22 +474,35 @@ pub(crate) enum AnySerial {
 #[cfg(target_arch = "x86_64")]
 pub const COM1: u16 = 0x3F8;
 
-/// Initialize serial port from coreboot table information
+/// Serial port configuration supplied by platform code.
+#[derive(Clone, Copy, Debug)]
+pub struct SerialConfig {
+    /// Whether the UART registers are MMIO-mapped (`true`) or I/O port mapped (`false`).
+    pub mmio: bool,
+    /// MMIO physical base address or x86 I/O port base.
+    pub baseaddr: u64,
+    /// Configured baud rate.
+    pub baud: u32,
+    /// MMIO register stride in bytes. Zero means a 1-byte stride.
+    pub regwidth: u32,
+    /// UART input clock in Hz, or zero to use the driver default.
+    pub input_hertz: u32,
+}
+
+/// Initialize serial port from platform-provided configuration.
 ///
-/// Uses `serial_type` to choose I/O port vs MMIO access, `regwidth` for the
-/// MMIO register stride, and `input_hertz` for an accurate baud divisor.
-///
-/// # Arguments
-/// * `info` - Serial port configuration parsed from coreboot tables
-pub fn init_from_coreboot(info: &crate::coreboot::tables::SerialInfo) {
-    if info.mmio() {
+/// Uses [`SerialConfig::mmio`] to choose I/O port vs MMIO access,
+/// [`SerialConfig::regwidth`] for the MMIO register stride, and
+/// [`SerialConfig::input_hertz`] for an accurate baud divisor.
+pub fn init_from_config(info: &SerialConfig) {
+    if info.mmio {
         // MMIO UART - could be 16550 or PL011
         // On aarch64 SBSA platforms, it's typically PL011
         #[cfg(target_arch = "aarch64")]
         {
             let mut port = Pl011Port::new(info.baseaddr as u64);
             if port.functional {
-                let _ = port.write_str("\r\n[CrabEFI] PL011 serial initialized from coreboot\r\n");
+                let _ = port.write_str("\r\n[CrabEFI] PL011 serial initialized\r\n");
                 // SAFETY: Single-threaded firmware; raw pointer avoids re-entrancy
                 // issues since serial is called from log macros inside other state closures.
                 unsafe {
@@ -502,18 +513,18 @@ pub fn init_from_coreboot(info: &crate::coreboot::tables::SerialInfo) {
         }
 
         // MMIO 16550 (or 16550-compatible).
-        // `regwidth` from coreboot tells us how far apart registers are; default
-        // to 1-byte stride when coreboot doesn't specify (regwidth == 0).
+        // `regwidth` tells us how far apart registers are; default to 1-byte
+        // stride when the platform doesn't specify it (regwidth == 0).
         let reg_stride = if info.regwidth > 0 { info.regwidth } else { 1 };
         let mut serial = SerialPort {
             backend: Uart16550Backend::Mmio {
-                base: info.baseaddr as u64,
+                base: info.baseaddr,
                 reg_stride,
             },
             functional: false,
         };
         if serial.init_16550(info.baud, info.input_hertz) {
-            let _ = serial.write_str("\r\n[CrabEFI] MMIO serial initialized from coreboot\r\n");
+            let _ = serial.write_str("\r\n[CrabEFI] MMIO serial initialized\r\n");
             // SAFETY: Single-threaded firmware; raw pointer avoids re-entrancy
             // issues since serial is called from log macros inside other state closures.
             unsafe {
@@ -532,7 +543,7 @@ pub fn init_from_coreboot(info: &crate::coreboot::tables::SerialInfo) {
                 functional: false,
             };
             if serial.init_16550(info.baud, info.input_hertz) {
-                let _ = serial.write_str("\r\n[CrabEFI] Serial initialized from coreboot\r\n");
+                let _ = serial.write_str("\r\n[CrabEFI] Serial initialized\r\n");
                 // SAFETY: Single-threaded firmware; raw pointer avoids re-entrancy
                 // issues since serial is called from log macros inside other state closures.
                 unsafe {
@@ -552,7 +563,7 @@ pub fn init_from_coreboot(info: &crate::coreboot::tables::SerialInfo) {
 /// Initialize serial output from a raw pointer to a platform `DebugOutput`.
 ///
 /// Used by `init_platform()` to inject an external serial driver (e.g., from
-/// fstart's PL011 or NS16550 driver) without going through coreboot tables.
+/// fstart's PL011 or NS16550 driver) without using built-in UART probing.
 ///
 /// # Safety
 ///

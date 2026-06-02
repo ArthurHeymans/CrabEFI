@@ -152,13 +152,6 @@ pub trait SpiController {
 
     /// Get the operating mode
     fn mode(&self) -> SpiMode;
-
-    /// Get the BIOS region from flash descriptor (Intel IFD)
-    ///
-    /// Returns (base, limit) in flash offsets, or None if not available.
-    /// This is used to calculate the correct SPI offset from memory-mapped addresses.
-    /// The BIOS region is mapped to end at 4GB in the CPU address space.
-    fn get_bios_region(&self) -> Option<(u32, u32)>;
 }
 
 /// Enum containing Intel, AMD, or QEMU SPI controller
@@ -169,25 +162,57 @@ pub enum AnySpiController {
 }
 
 impl crate::platform::FirmwareStorage for AnySpiController {
-    fn read(
-        &mut self,
-        offset: u32,
-        buffer: &mut [u8],
-    ) -> core::result::Result<(), crate::platform::StorageError> {
-        SpiController::read(self, offset, buffer).map_err(|e| match e {
-            SpiError::WriteProtected => crate::platform::StorageError::WriteProtected,
-            SpiError::AccessDenied => crate::platform::StorageError::AccessDenied,
-            SpiError::Timeout => crate::platform::StorageError::Timeout,
-            SpiError::InvalidArgument | SpiError::AddressOutOfRange => {
-                crate::platform::StorageError::InvalidArgument
-            }
-            SpiError::NotSupported => crate::platform::StorageError::NotSupported,
-            _ => crate::platform::StorageError::IoError,
-        })
+    fn name(&self) -> &str {
+        SpiController::name(self)
     }
 
-    fn bios_region(&self) -> Option<(u32, u32)> {
-        self.get_bios_region()
+    fn enable_writes(&mut self) -> core::result::Result<(), crate::platform::StorageError> {
+        SpiController::enable_writes(self).map_err(spi_error_to_storage_error)
+    }
+
+    fn read(
+        &mut self,
+        offset: u64,
+        buffer: &mut [u8],
+    ) -> core::result::Result<(), crate::platform::StorageError> {
+        let offset =
+            u32::try_from(offset).map_err(|_| crate::platform::StorageError::InvalidArgument)?;
+        SpiController::read(self, offset, buffer).map_err(spi_error_to_storage_error)
+    }
+
+    fn write(
+        &mut self,
+        offset: u64,
+        data: &[u8],
+    ) -> core::result::Result<(), crate::platform::StorageError> {
+        let offset =
+            u32::try_from(offset).map_err(|_| crate::platform::StorageError::InvalidArgument)?;
+        SpiController::write(self, offset, data).map_err(spi_error_to_storage_error)
+    }
+
+    fn erase(
+        &mut self,
+        offset: u64,
+        size: u64,
+    ) -> core::result::Result<(), crate::platform::StorageError> {
+        let offset =
+            u32::try_from(offset).map_err(|_| crate::platform::StorageError::InvalidArgument)?;
+        let size =
+            u32::try_from(size).map_err(|_| crate::platform::StorageError::InvalidArgument)?;
+        SpiController::erase(self, offset, size).map_err(spi_error_to_storage_error)
+    }
+}
+
+fn spi_error_to_storage_error(e: SpiError) -> crate::platform::StorageError {
+    match e {
+        SpiError::WriteProtected => crate::platform::StorageError::WriteProtected,
+        SpiError::AccessDenied => crate::platform::StorageError::AccessDenied,
+        SpiError::Timeout => crate::platform::StorageError::Timeout,
+        SpiError::InvalidArgument | SpiError::AddressOutOfRange => {
+            crate::platform::StorageError::InvalidArgument
+        }
+        SpiError::NotSupported => crate::platform::StorageError::NotSupported,
+        _ => crate::platform::StorageError::IoError,
     }
 }
 
@@ -253,14 +278,6 @@ impl SpiController for AnySpiController {
             Self::Intel(c) => c.mode(),
             Self::Amd(c) => c.mode(),
             Self::Qemu(c) => c.mode(),
-        }
-    }
-
-    fn get_bios_region(&self) -> Option<(u32, u32)> {
-        match self {
-            Self::Intel(c) => c.get_bios_region(),
-            Self::Amd(c) => c.get_bios_region(),
-            Self::Qemu(c) => c.get_bios_region(),
         }
     }
 }
@@ -340,8 +357,8 @@ pub fn detect_and_init() -> Option<AnySpiController> {
     // SPI/pflash variable store requires memory-mapped flash.
     // On aarch64/riscv64 platforms (QEMU virt, SBSA) the SPI flash is not
     // memory-mapped at x86 addresses — skip the blind probe.
-    // If coreboot provides LB_TAG_SPI_FLASH with mmap windows, the QEMU
-    // pflash backend will use those addresses instead.
+    // If platform code configures the QEMU pflash mapping, the pflash backend
+    // will use those addresses instead.
     if cfg!(target_arch = "aarch64") || cfg!(target_arch = "riscv64") {
         log::debug!("SPI flash detection skipped on non-x86 (no memory-mapped SPI flash)");
         return None;

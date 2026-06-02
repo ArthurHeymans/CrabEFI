@@ -157,14 +157,6 @@ impl SpiStorageBackend {
         &mut self.controller
     }
 
-    /// Get the BIOS region from the flash descriptor (if available)
-    ///
-    /// This is used for calculating SPI offsets from memory-mapped addresses.
-    pub fn get_bios_region(&self) -> Option<(u32, u32)> {
-        use crate::drivers::spi::SpiController;
-        self.controller.get_bios_region()
-    }
-
     /// Get the base offset
     pub fn base_offset(&self) -> u32 {
         self.base_offset

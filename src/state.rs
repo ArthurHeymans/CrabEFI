@@ -827,9 +827,6 @@ pub struct PlatformInfo {
     /// Linux from trying to use both the coreboot framebuffer and the EFI GOP.
     pub coreboot_fb_record_addr: Option<u64>,
 
-    /// SPI flash info
-    pub spi_flash: Option<crate::coreboot::SpiFlashInfo>,
-
     /// Storage backend for variable persistence (SPI flash).
     ///
     /// Initialized during boot from detected SPI controller.
@@ -859,7 +856,6 @@ impl PlatformInfo {
         Self {
             framebuffer: None,
             coreboot_fb_record_addr: None,
-            spi_flash: None,
             storage: None,
             memory_regions: HeaplessVec::new(),
             acpi_rsdp: None,

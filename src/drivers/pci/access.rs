@@ -8,7 +8,7 @@
 //!   config space, supporting 4096 bytes per function.
 //!
 //! The access method is selected at runtime based on whether an ECAM base address
-//! is available (typically from ACPI MCFG table or coreboot tables).
+//! is available (typically from ACPI MCFG or platform configuration).
 
 use super::PciAddress;
 
@@ -146,8 +146,8 @@ impl PciAccess for IoCamAccess {
 /// PCIe Enhanced Configuration Access Mechanism
 ///
 /// Uses memory-mapped I/O to access the full 4096-byte PCIe extended
-/// configuration space. The base address comes from the ACPI MCFG table
-/// or coreboot tables.
+/// configuration space. The base address comes from ACPI MCFG or platform
+/// configuration.
 pub struct EcamAccess {
     /// ECAM base address in physical memory
     base: u64,

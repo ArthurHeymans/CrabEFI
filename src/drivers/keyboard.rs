@@ -176,9 +176,9 @@ impl PS2Ports {
 ///
 /// Laptop EC-emulated keyboards (ThinkPad H8 etc.) may need up to a second
 /// to respond. We use a 5 s window matching SeaBIOS's BAT read timeout.
-/// If the deadline expires we enable scanning anyway — GRUB on coreboot
-/// targets does the same ("just configure and go") because the EC may not
-/// be ready to respond at all when we run as a coreboot payload.
+/// If the deadline expires we enable scanning anyway — some firmware payload
+/// environments do the same ("just configure and go") because the EC may not
+/// be ready to respond at all when we start.
 const BAT_SPINUP_TIMEOUT_MS: u64 = 5000;
 
 /// Two-phase initialization state for the PS/2 keyboard.
@@ -489,7 +489,7 @@ pub fn init() {
 ///
 /// # Timeout behaviour
 /// On deadline expiry we enable scanning without a successful BAT. This mirrors
-/// GRUB's coreboot target behaviour: "just configure and go" — if the controller
+/// firmware-payload behaviour that "just configure and go" — if the controller
 /// passed self-test the keyboard is most likely functional regardless of whether
 /// the EC responded to RESET in time.
 fn poll_bat_completion(kb: &mut KeyboardState) {
@@ -551,9 +551,9 @@ fn poll_bat_completion(kb: &mut KeyboardState) {
 
     // No data yet — check deadline.
     if deadline.is_expired() {
-        // The keyboard did not respond in time. Proceed without BAT like
-        // GRUB does on coreboot: controller passed self-test so the keyboard
-        // is most likely functional (EC may simply not have been ready yet).
+        // The keyboard did not respond in time. Proceed without BAT: the
+        // controller passed self-test so the keyboard is most likely functional
+        // (EC may simply not have been ready yet).
         log::debug!(
             "PS/2 keyboard BAT timeout ({}ms), enabling scanning without BAT",
             BAT_SPINUP_TIMEOUT_MS,
