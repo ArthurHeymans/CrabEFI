@@ -5,8 +5,8 @@
 
 #![allow(dead_code)]
 
-use super::framebuffer::FramebufferInfo;
-use super::memory::{MemoryRegion, MemoryType};
+use crate::framebuffer::FramebufferInfo;
+use crate::memory::{MemoryRegion, MemoryType};
 use heapless::Vec;
 use zerocopy::{FromBytes, Immutable, KnownLayout, Unaligned};
 

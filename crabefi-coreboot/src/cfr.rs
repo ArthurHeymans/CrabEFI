@@ -20,8 +20,11 @@
 
 #![allow(dead_code)]
 
+use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicPtr, Ordering};
+
 use zerocopy::{FromBytes, Immutable, KnownLayout, Unaligned};
 
 /// CFR version (must match coreboot)
@@ -307,6 +310,44 @@ impl CfrInfo {
 impl Default for CfrInfo {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+// CFR info is stored separately because it can be very large with nested
+// heapless::Vec. We use a heap-allocated Box stored via AtomicPtr to avoid
+// stack overflow and keep handed-out references valid.
+static CFR_PTR: AtomicPtr<CfrInfo> = AtomicPtr::new(core::ptr::null_mut());
+
+/// Store CFR info in global state.
+///
+/// # Panics
+///
+/// Panics if called more than once. The single-call invariant ensures that
+/// `&'static` references handed out by [`get_cfr`] remain valid.
+pub fn store_cfr(cfr: CfrInfo) {
+    let boxed = Box::new(cfr);
+    let ptr = Box::into_raw(boxed);
+    let old = CFR_PTR.swap(ptr, Ordering::SeqCst);
+    assert!(
+        old.is_null(),
+        "store_cfr must only be called once (existing CfrInfo would be freed while &'static refs may exist)"
+    );
+}
+
+/// Get access to the global CFR info.
+///
+/// Returns a reference to the CFR info if available. The data lives on the
+/// heap and is never freed, so the reference is valid for the lifetime of
+/// the program.
+pub fn get_cfr() -> Option<&'static CfrInfo> {
+    let ptr = CFR_PTR.load(Ordering::SeqCst);
+    if ptr.is_null() {
+        None
+    } else {
+        // SAFETY: ptr was created from Box::into_raw in store_cfr() and remains
+        // valid because store_cfr() is only called once during single-threaded init.
+        // The data is never freed, so the 'static lifetime is sound.
+        Some(unsafe { &*ptr })
     }
 }
 
