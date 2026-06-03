@@ -11,6 +11,7 @@ exclude = [
   "test-apps/storage-security-test",
   "test-apps/directory-test",
   "test-apps/fw-dump",
+  "test-apps/tcg-test",
 ]
 resolver = "3"
 

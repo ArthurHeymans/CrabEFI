@@ -539,6 +539,7 @@ fn riscv_fdt_only_boot(fdt_ptr: u64, fdt_size: u32) -> ! {
         ecam_size: None,
         deferred_buffer: None,
         runtime_region: None,
+        tpm_event_log: None,
         heap_pre_initialized: false,
     };
 
@@ -834,6 +835,55 @@ pub extern "C" fn rust_main(coreboot_table_ptr: u64) -> ! {
         ecam_size: None,
         deferred_buffer: None, // Uses linker-symbol fallback in init_platform()
         runtime_region: None,  // Uses linker-symbol fallback (platform-entry feature)
+        // Enable measured boot.
+        // If coreboot provided a standard TPM event log in CBMEM, continue
+        // using that log's protocol family. Without an existing standard log,
+        // start fresh and install both TCG protocol families for compatibility.
+        tpm_event_log: Some({
+            let (existing_log, format) = match cb_info.tpm_log {
+                Some(ref tpm_log) => match tpm_log.cbmem_id {
+                    // TCG 2.0 crypto-agile log — continue with EFI_TCG2_PROTOCOL.
+                    0x54504d32 => {
+                        // SAFETY: coreboot's CBMEM region persists for the entire boot.
+                        let log_data = unsafe {
+                            core::slice::from_raw_parts(
+                                tpm_log.address as *const u8,
+                                tpm_log.size as usize,
+                            )
+                        };
+                        (Some(log_data), crabefi::TpmLogFormat::CryptoAgile)
+                    }
+                    // TCG 1.2 SHA1-only log — continue with EFI_TCG_PROTOCOL.
+                    0x54445041 => {
+                        // SAFETY: coreboot's CBMEM region persists for the entire boot.
+                        let log_data = unsafe {
+                            core::slice::from_raw_parts(
+                                tpm_log.address as *const u8,
+                                tpm_log.size as usize,
+                            )
+                        };
+                        (Some(log_data), crabefi::TpmLogFormat::Sha1Only)
+                    }
+                    // coreboot-specific format — start fresh (not directly
+                    // compatible with either TCG log format).
+                    _ => {
+                        log::info!("Coreboot TPM log is in CB-specific format, starting fresh");
+                        (None, crabefi::TpmLogFormat::Both)
+                    }
+                },
+                None => (None, crabefi::TpmLogFormat::Both),
+            };
+            crabefi::TpmEventLogConfig {
+                existing_log,
+                format,
+                // Probe for a hardware TPM at the standard x86 TIS address.
+                // On aarch64/riscv64, hardware TPM discovery is not yet supported.
+                #[cfg(target_arch = "x86_64")]
+                tpm2_device: crabefi::Tpm2DeviceConfig::TisMmio { base: 0xFED4_0000 },
+                #[cfg(not(target_arch = "x86_64"))]
+                tpm2_device: crabefi::Tpm2DeviceConfig::None,
+            }
+        }),
         heap_pre_initialized: false, // Set to true after Phase 7
     };
 

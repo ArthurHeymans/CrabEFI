@@ -25,4 +25,6 @@ pub mod simple_file_system;
 pub mod simple_pointer;
 pub mod simple_text_input_ex;
 pub mod storage_security;
+pub mod tcg;
+pub mod tcg2;
 pub mod unicode_collation;

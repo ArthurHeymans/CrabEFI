@@ -1248,6 +1248,209 @@ impl FramebufferConfig {
 }
 
 // ============================================================================
+// TPM Event Log
+// ============================================================================
+
+/// TPM event-log and TPM 2.0 backend configuration.
+///
+/// When the platform (e.g., coreboot) has already started measured boot and
+/// maintains a TPM event log, it can pass that log data to CrabEFI via this
+/// configuration. CrabEFI will copy the existing log. It appends new
+/// PCR-extending measurements only when an attestable hardware/platform TPM
+/// backend is configured and available.
+///
+/// # Coreboot Integration
+///
+/// Coreboot stores standard TPM event logs in CBMEM with IDs
+/// `CBMEM_ID_TCPA_TCG_LOG` (0x54445041, TPM 1.2) and
+/// `CBMEM_ID_TPM2_TCG_LOG` (0x54504d32, TPM 2.0). The coreboot payload can
+/// read these regions and pass them here. The log format depends on the TPM
+/// version:
+///
+/// - **TPM 2.0**: Crypto-agile log (`TCG_PCR_EVENT2`) with a `SpecIdEvent`
+///   header. Uses SHA-256 (and optionally SHA-1) digests.
+/// - **TPM 1.2**: SHA1-only log (`TCG_PCClientPCREvent`).
+///
+/// # Library Integration
+///
+/// When CrabEFI is used as a library, the caller can provide an event log
+/// from any source — a hardware TPM driver, a pre-boot firmware phase, or
+/// a hypervisor. The format must match the [`TpmLogFormat`] specified.
+pub struct TpmEventLogConfig<'a> {
+    /// Pre-existing event log data bytes.
+    ///
+    /// If `None`, CrabEFI starts a fresh log buffer. Without an available TPM
+    /// backend, that buffer is exposed only for log discovery and is not used
+    /// to create software-only attestable measurements.
+    pub existing_log: Option<&'a [u8]>,
+
+    /// Event log format of the existing data.
+    ///
+    /// This also determines which TCG protocol is installed:
+    /// - `CryptoAgile`: installs `EFI_TCG2_PROTOCOL` (TPM 2.0)
+    /// - `Sha1Only`: installs `EFI_TCG_PROTOCOL` (TPM 1.2)
+    /// - `Both`: installs both protocols
+    pub format: TpmLogFormat,
+
+    /// TPM 2.0 device used for attestable PCR extension and raw command passthrough.
+    ///
+    /// This is separate from the event log source: a platform may provide an
+    /// existing firmware log without exposing a TPM transport, or it may expose
+    /// a TPM device while asking CrabEFI to start a fresh event log. Without a
+    /// TPM device, `EFI_TCG2_PROTOCOL` is log-discovery/non-attestable: it
+    /// reports no TPM, rejects PCR-extending measurements, and returns
+    /// unsupported for raw TPM commands. Coreboot payloads commonly use
+    /// [`Tpm2DeviceConfig::TisMmio`], while library users can pass a `'static`
+    /// driver implementing [`Tpm2Device`].
+    pub tpm2_device: Tpm2DeviceConfig,
+}
+
+/// TPM event log format selection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TpmLogFormat {
+    /// Crypto-agile log for TPM 2.0 only (SHA-256 + optional SHA-1).
+    CryptoAgile,
+    /// SHA-1-only log for TPM 1.2 only.
+    Sha1Only,
+    /// Both TPM 2.0 (crypto-agile) and TPM 1.2 (SHA-1) logs.
+    Both,
+}
+
+/// TPM 2.0 hardware source for library and payload integrations.
+pub enum Tpm2DeviceConfig {
+    /// Do not use a hardware TPM.
+    ///
+    /// In this mode TCG2 is non-attestable and log-discovery only:
+    /// `GetCapability` reports no TPM, PCR-extending measurements fail with a
+    /// device error, and raw TPM command passthrough returns unsupported.
+    /// CrabEFI does not present software PCR state as hardware-backed measured
+    /// boot evidence.
+    None,
+    /// Probe a memory-mapped TPM TIS device at `base`.
+    ///
+    /// This is useful for coreboot/QEMU x86 payloads where firmware can safely
+    /// access the standard TIS MMIO window directly.
+    TisMmio { base: u64 },
+    /// Use a platform-provided TPM 2.0 driver.
+    ///
+    /// This is the preferred library abstraction for non-TIS hardware, firmware
+    /// that already owns the TPM transport, or tests/hypervisors that proxy TPM
+    /// commands without exposing MMIO to CrabEFI.
+    ///
+    /// The driver reference must be `'static` because the installed
+    /// `EFI_TCG2_PROTOCOL` is stored in global firmware state and can be used
+    /// until ExitBootServices. Shorter-lived platform drivers should be placed
+    /// in static storage by the embedding firmware before being passed here.
+    Driver(&'static mut dyn Tpm2Device),
+}
+
+impl Tpm2DeviceConfig {
+    /// Return true when a hardware TPM source is configured.
+    pub fn is_some(&self) -> bool {
+        !matches!(self, Self::None)
+    }
+}
+
+/// Fixed-capacity list of active TPM PCR bank algorithms.
+///
+/// CrabEFI's TCG2 measured-boot implementation supports SHA-1, SHA-256,
+/// SHA-384, and SHA-512 banks. If a hardware/platform TPM exposes additional
+/// active banks (for example SM3-256), CrabEFI logs that they are unsupported
+/// and exposes/extends only the supported SHA subset through its EFI TCG2
+/// implementation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TpmPcrBanks {
+    algorithms: [u16; 5],
+    count: usize,
+}
+
+impl TpmPcrBanks {
+    /// Create a PCR bank list from TPM algorithm IDs.
+    pub fn new(algorithms: &[u16]) -> Self {
+        let count = algorithms.len().min(5);
+        let mut out = [0u16; 5];
+        out[..count].copy_from_slice(&algorithms[..count]);
+        Self {
+            algorithms: out,
+            count,
+        }
+    }
+
+    /// Return the active TPM algorithm IDs.
+    pub fn algorithms(&self) -> &[u16] {
+        &self.algorithms[..self.count]
+    }
+
+    /// Return true when `algorithm` is active.
+    pub fn contains(&self, algorithm: u16) -> bool {
+        self.algorithms().contains(&algorithm)
+    }
+}
+
+/// Digest view passed to a platform TPM 2.0 driver for PCR extension.
+#[derive(Clone, Copy)]
+pub struct TpmDigest<'a> {
+    /// TPM algorithm ID, for example `0x000B` for SHA-256.
+    pub algorithm: u16,
+    /// Digest bytes for `algorithm`.
+    pub digest: &'a [u8],
+}
+
+/// Errors returned by platform TPM drivers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum TpmError {
+    /// The TPM or transport returned an unspecified device error.
+    DeviceError,
+    /// A caller supplied invalid parameters.
+    InvalidParameter,
+    /// The provided response buffer is too small.
+    BufferTooSmall,
+    /// The requested TPM operation or algorithm is unsupported.
+    Unsupported,
+}
+
+/// Platform-provided TPM 2.0 device abstraction.
+///
+/// Implement this when CrabEFI is used as a library and the embedding firmware
+/// owns TPM discovery/transport. The trait deliberately models the operations
+/// CrabEFI needs rather than a specific bus: PCR extension for measured boot,
+/// raw command passthrough for `EFI_TCG2_PROTOCOL.SubmitCommand`, and cached
+/// capability metadata for `GetCapability`.
+pub trait Tpm2Device {
+    /// Return active PCR bank algorithm IDs.
+    ///
+    /// CrabEFI accepts SHA-1 (`0x0004`), SHA-256 (`0x000B`), SHA-384
+    /// (`0x000C`), and SHA-512 (`0x000D`) for measured boot. If additional
+    /// algorithms are active, they are treated as unsupported by CrabEFI's EFI
+    /// TCG2 implementation and will not be requested in
+    /// [`pcr_extend`](Self::pcr_extend).
+    fn active_pcr_banks(&self) -> TpmPcrBanks;
+
+    /// Return the TPM manufacturer ID reported in `GetCapability`.
+    fn manufacturer_id(&self) -> u32 {
+        0
+    }
+
+    /// Return the TPM maximum command size, or zero if unknown.
+    fn max_command_size(&self) -> u16 {
+        0
+    }
+
+    /// Return the TPM maximum response size, or zero if unknown.
+    fn max_response_size(&self) -> u16 {
+        0
+    }
+
+    /// Extend `pcr_index` with one digest per CrabEFI-supported active bank
+    /// (SHA-256 and optional SHA-1).
+    fn pcr_extend(&mut self, pcr_index: u32, digests: &[TpmDigest<'_>]) -> Result<(), TpmError>;
+
+    /// Submit a raw TPM 2.0 command and write the response into `response`.
+    fn submit_command(&mut self, command: &[u8], response: &mut [u8]) -> Result<usize, TpmError>;
+}
+
+// ============================================================================
 // Platform Configuration
 // ============================================================================
 
@@ -1423,6 +1626,22 @@ pub struct PlatformConfig<'a> {
     /// Needed for `SetVirtualAddressMap` support. If `None`, CrabEFI
     /// cannot provide runtime services after `ExitBootServices`.
     pub runtime_region: Option<RuntimeRegion>,
+
+    // ---- Measured Boot ----
+    /// TPM event log configuration for measured boot.
+    ///
+    /// When provided, CrabEFI installs `EFI_TCG_PROTOCOL` and/or
+    /// `EFI_TCG2_PROTOCOL` and exposes the configured event log. TCG2
+    /// measurements are attestable only when `tpm2_device` provides an
+    /// available hardware/platform TPM backend; with [`Tpm2DeviceConfig::None`]
+    /// the protocol is log-discovery/non-attestable and rejects PCR-extending
+    /// measurements. If `existing_log` data is provided (e.g., from coreboot's
+    /// CBMEM), CrabEFI appends its own measurements only when backed by TPM
+    /// hardware.
+    ///
+    /// When `None`, no TCG protocols are installed (bootloaders will see
+    /// "protocol not found" and skip measured boot).
+    pub tpm_event_log: Option<TpmEventLogConfig<'a>>,
 
     // ---- Pre-initialization ----
     /// Whether the EFI environment and heap allocator were already set up

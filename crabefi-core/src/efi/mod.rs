@@ -15,6 +15,7 @@ pub mod protocols;
 pub mod rtlog;
 pub mod runtime_services;
 pub mod system_table;
+pub mod tcg;
 pub mod utils;
 pub mod varstore;
 
@@ -23,7 +24,7 @@ use r_efi::efi::Guid;
 use r_efi::efi::{self, Status};
 
 /// Initialize the EFI environment from platform configuration.
-pub fn init_from_platform(config: &crate::platform::PlatformConfig) {
+pub fn init_from_platform(config: &mut crate::platform::PlatformConfig) {
     log::info!("Initializing EFI environment (platform path)...");
 
     // Initialize the memory allocator from the platform memory map
@@ -129,6 +130,12 @@ pub fn init_from_platform(config: &crate::platform::PlatformConfig) {
     // Install standard protocols and finalize tables (shared with init)
     install_standard_protocols_and_finalize();
 
+    // Install TCG protocols for measured boot if the platform requested it.
+    if let Some(ref mut tpm_config) = config.tpm_event_log {
+        init_tcg_protocols(tpm_config);
+        system_table::update_crc32();
+    }
+
     // Dump the full memory map for debugging (output goes directly to serial,
     // bypassing EFI ConOut — safe even if ConOut has issues).
     allocator::dump_memory_map();
@@ -153,6 +160,222 @@ fn install_standard_protocols_and_finalize() {
     system_table::install_memory_attributes_table();
     system_table::dump_configuration_tables();
     system_table::update_crc32();
+}
+
+// ============================================================================
+// TCG Protocol Initialization
+// ============================================================================
+
+/// Initialize TCG (TPM 1.2) and/or TCG2 (TPM 2.0) protocols.
+///
+/// Called from `init_from_platform()` when the platform provides a
+/// [`TpmEventLogConfig`](crate::platform::TpmEventLogConfig). Allocates
+/// event log buffers, initializes TPM-backed measurement state when available,
+/// and installs the appropriate protocol(s) on a dedicated handle.
+///
+/// Each protocol is initialized independently so a failure in one does
+/// not prevent the other from being installed.
+fn init_tcg_protocols(config: &mut crate::platform::TpmEventLogConfig) {
+    use crate::platform::{Tpm2DeviceConfig, TpmLogFormat};
+
+    let install_tcg2 = matches!(
+        config.format,
+        TpmLogFormat::CryptoAgile | TpmLogFormat::Both
+    );
+    let install_tcg1 = matches!(config.format, TpmLogFormat::Sha1Only | TpmLogFormat::Both);
+
+    if install_tcg2 {
+        let enable_sha1 = matches!(config.format, TpmLogFormat::Both);
+        let tpm2_device = core::mem::replace(&mut config.tpm2_device, Tpm2DeviceConfig::None);
+        let has_hardware_tpm = tpm2_device.is_some();
+        let existing_log = config.existing_log;
+        let tcg2_result = match tpm2_device {
+            Tpm2DeviceConfig::None => init_tcg2_protocol(existing_log, enable_sha1),
+            Tpm2DeviceConfig::TisMmio { base } => {
+                init_tcg2_protocol_tis(existing_log, base, enable_sha1)
+            }
+            Tpm2DeviceConfig::Driver(driver) => {
+                init_tcg2_protocol_platform_tpm(existing_log, driver, enable_sha1)
+            }
+        };
+
+        if let Err(e) = tcg2_result {
+            // If a requested hardware TPM is unavailable, keep the event log
+            // discoverable but do not advertise an attestable TPM or accept
+            // PCR-extending operations.
+            if has_hardware_tpm {
+                log::warn!(
+                    "Hardware TPM not available: {}; installing TCG2 log-only protocol",
+                    e
+                );
+                if let Err(e2) = init_tcg2_protocol(existing_log, enable_sha1) {
+                    log::error!("TCG2 log-only fallback failed: {}", e2);
+                }
+            } else {
+                log::error!("TCG2 protocol init failed: {}", e);
+            }
+        }
+    }
+
+    if install_tcg1 {
+        // For the TPM 1.2 log, only pass existing data if the format is Sha1Only
+        // (if Both, the existing data is likely crypto-agile and not directly usable).
+        let existing = if config.format == TpmLogFormat::Sha1Only {
+            config.existing_log
+        } else {
+            None
+        };
+        if let Err(e) = init_tcg1_protocol(existing) {
+            log::error!("TCG protocol init failed: {}", e);
+        }
+    }
+}
+
+/// Initialize and install EFI_TCG2_PROTOCOL (TPM 2.0).
+fn init_tcg2_protocol(existing_log: Option<&[u8]>, enable_sha1: bool) -> Result<(), &'static str> {
+    use tcg::event_log::DEFAULT_EVENT_LOG_SIZE;
+
+    let log_pages = (DEFAULT_EVENT_LOG_SIZE as u64).div_ceil(allocator::PAGE_SIZE);
+    let tcg2_buffer = allocate_pages(log_pages)
+        .map(|buf| &mut buf[..DEFAULT_EVENT_LOG_SIZE])
+        .ok_or("failed to allocate TCG2 event log buffer")?;
+
+    protocols::tcg2::init_state(tcg2_buffer, existing_log, enable_sha1)
+        .map_err(|_| "failed to initialize TCG2 state")?;
+
+    let protocol = protocols::tcg2::create_protocol();
+    if protocol.is_null() {
+        return Err("failed to create TCG2 protocol");
+    }
+
+    let handle = boot_services::create_handle().ok_or("failed to create TCG2 handle")?;
+
+    let status = boot_services::install_protocol(handle, &tcg::types::TCG2_PROTOCOL_GUID, protocol);
+    if status != Status::SUCCESS {
+        return Err("failed to install TCG2 protocol");
+    }
+
+    system_table::install_tpm_event_log();
+    log::info!("EFI_TCG2_PROTOCOL installed on handle {:?}", handle);
+    Ok(())
+}
+
+/// Initialize and install EFI_TCG2_PROTOCOL with a TIS MMIO hardware TPM.
+fn init_tcg2_protocol_tis(
+    existing_log: Option<&[u8]>,
+    tpm_base: u64,
+    enable_sha1: bool,
+) -> Result<(), &'static str> {
+    use tcg::event_log::DEFAULT_EVENT_LOG_SIZE;
+
+    let log_pages = (DEFAULT_EVENT_LOG_SIZE as u64).div_ceil(allocator::PAGE_SIZE);
+    let tcg2_buffer = allocate_pages(log_pages)
+        .map(|buf| &mut buf[..DEFAULT_EVENT_LOG_SIZE])
+        .ok_or("failed to allocate TCG2 event log buffer")?;
+
+    unsafe {
+        protocols::tcg2::init_state_with_hardware(tcg2_buffer, existing_log, tpm_base, enable_sha1)
+            .map_err(|_| "failed to initialize TCG2 state with TIS hardware TPM")?;
+    }
+
+    let protocol = protocols::tcg2::create_protocol();
+    if protocol.is_null() {
+        return Err("failed to create TCG2 protocol");
+    }
+
+    let handle = boot_services::create_handle().ok_or("failed to create TCG2 handle")?;
+
+    let status = boot_services::install_protocol(handle, &tcg::types::TCG2_PROTOCOL_GUID, protocol);
+    if status != Status::SUCCESS {
+        return Err("failed to install TCG2 protocol");
+    }
+
+    system_table::install_tpm_event_log();
+    log::info!(
+        "EFI_TCG2_PROTOCOL installed on handle {:?} (TIS hardware TPM)",
+        handle
+    );
+    Ok(())
+}
+
+/// Initialize and install EFI_TCG2_PROTOCOL with a platform TPM driver.
+fn init_tcg2_protocol_platform_tpm(
+    existing_log: Option<&[u8]>,
+    tpm: &'static mut dyn crate::platform::Tpm2Device,
+    enable_sha1: bool,
+) -> Result<(), &'static str> {
+    use tcg::event_log::DEFAULT_EVENT_LOG_SIZE;
+
+    let log_pages = (DEFAULT_EVENT_LOG_SIZE as u64).div_ceil(allocator::PAGE_SIZE);
+    let tcg2_buffer = allocate_pages(log_pages)
+        .map(|buf| &mut buf[..DEFAULT_EVENT_LOG_SIZE])
+        .ok_or("failed to allocate TCG2 event log buffer")?;
+
+    protocols::tcg2::init_state_with_platform_tpm(tcg2_buffer, existing_log, tpm, enable_sha1)
+        .map_err(|_| "failed to initialize TCG2 state with platform TPM")?;
+
+    let protocol = protocols::tcg2::create_protocol();
+    if protocol.is_null() {
+        return Err("failed to create TCG2 protocol");
+    }
+
+    let handle = boot_services::create_handle().ok_or("failed to create TCG2 handle")?;
+
+    let status = boot_services::install_protocol(handle, &tcg::types::TCG2_PROTOCOL_GUID, protocol);
+    if status != Status::SUCCESS {
+        return Err("failed to install TCG2 protocol");
+    }
+
+    system_table::install_tpm_event_log();
+    log::info!(
+        "EFI_TCG2_PROTOCOL installed on handle {:?} (platform TPM)",
+        handle
+    );
+    Ok(())
+}
+
+/// Perform automatic firmware measurements.
+///
+/// This measures:
+/// - S-CRTM version into PCR 0
+/// - Secure Boot variables into PCR 7 (with separator)
+pub(crate) fn measure_initial_boot() {
+    // Measure S-CRTM version (firmware version string) into PCR 0.
+    tcg::measured_boot::measure_s_crtm_version_all("CrabEFI 0.1.0");
+
+    // Measure Secure Boot policy variables into PCR 7.
+    tcg::measured_boot::measure_secure_boot_variables_all();
+}
+
+/// Initialize and install EFI_TCG_PROTOCOL (TPM 1.2).
+fn init_tcg1_protocol(existing_log: Option<&[u8]>) -> Result<(), &'static str> {
+    use tcg::event_log::DEFAULT_EVENT_LOG_SIZE;
+
+    let log_pages = (DEFAULT_EVENT_LOG_SIZE as u64).div_ceil(allocator::PAGE_SIZE);
+    let tcg1_buffer = allocate_pages(log_pages)
+        .map(|buf| &mut buf[..DEFAULT_EVENT_LOG_SIZE])
+        .ok_or("failed to allocate TCG event log buffer")?;
+
+    // CrabEFI does not currently have a TPM 1.2 transport. Install the legacy
+    // protocol for log discovery/HashAll compatibility, but do not advertise a
+    // physical TPM or accept PCR extends that would not reach hardware.
+    protocols::tcg::init_state(tcg1_buffer, existing_log, false)
+        .map_err(|_| "failed to initialize TCG state")?;
+
+    let protocol = protocols::tcg::create_protocol();
+    if protocol.is_null() {
+        return Err("failed to create TCG protocol");
+    }
+
+    let handle = boot_services::create_handle().ok_or("failed to create TCG handle")?;
+
+    let status = boot_services::install_protocol(handle, &tcg::types::TCG_PROTOCOL_GUID, protocol);
+    if status != Status::SUCCESS {
+        return Err("failed to install TCG protocol");
+    }
+
+    log::info!("EFI_TCG_PROTOCOL installed on handle {:?}", handle);
+    Ok(())
 }
 
 /// Initialize console I/O

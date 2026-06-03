@@ -67,8 +67,9 @@ pub use platform::{
     FirmwareStorage, FirmwareStorageLocation, FirmwareStorageRegion, FmapRegion, FramebufferConfig,
     Key, KeyState, MemoryRegion, MemoryType, PlatformConfig, PlatformHooks, ResetHandler,
     ResetType, Rng, RngError, RuntimeRegion, StorageBackend, StorageError, Timer,
-    TimestampRecorder, VarBackendError, VariableBackend, VariableStoreLocator, VariableStoreRegion,
-    VariableVisitor,
+    TimestampRecorder, Tpm2Device, Tpm2DeviceConfig, TpmDigest, TpmError, TpmEventLogConfig,
+    TpmLogFormat, TpmPcrBanks, VarBackendError, VariableBackend, VariableStoreLocator,
+    VariableStoreRegion, VariableVisitor,
 };
 
 /// Display a Secure Boot violation error on screen
@@ -166,6 +167,11 @@ fn init_persistence_and_boot(
 
     efi::varstore::init_deferred_buffer();
     timestamp::record(timestamp::TS_CRABEFI_VARSTORE_INIT);
+
+    // TCG protocols are installed during EFI initialization, but initial
+    // measurements must wait until persistent variables and Secure Boot state
+    // have been loaded so PCR7 reflects the actual PK/KEK/db/dbx contents.
+    efi::measure_initial_boot();
 
     // ---- Boot manager ----
     let boot_var_state = boot_vars::read_boot_var_state();
@@ -402,7 +408,7 @@ fn init_platform_impl(mut config: PlatformConfig) -> ! {
     // configuration tables, and runtime region reservations.  The page
     // allocator is idempotent: if the caller already bootstrapped it
     // (to get a heap before entry), re-initialization is skipped.
-    efi::init_from_platform(&config);
+    efi::init_from_platform(&mut config);
     timestamp::record(timestamp::TS_CRABEFI_EFI_INIT);
 
     // Initialize mouse cursor system (ui feature only).

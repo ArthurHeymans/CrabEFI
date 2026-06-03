@@ -23,7 +23,29 @@ use crate::efi::protocols::simple_file_system::{self, SIMPLE_FILE_SYSTEM_GUID};
 use crate::fs;
 use crate::menu;
 use crate::pe;
+use alloc::vec::Vec;
 use r_efi::efi::Status;
+
+fn serialize_tcg_image_load_event(
+    loaded_image: &pe::LoadedImage,
+    image_link_time_address: u64,
+    device_path_ptr: *const r_efi::protocols::device_path::Protocol,
+) -> Option<Vec<u8>> {
+    let device_path_size = unsafe { device_path::device_path_size(device_path_ptr) };
+    if device_path_size == 0 {
+        return None;
+    }
+
+    let mut event = Vec::with_capacity(32 + device_path_size);
+    event.extend_from_slice(&loaded_image.image_base.to_le_bytes());
+    event.extend_from_slice(&loaded_image.image_size.to_le_bytes());
+    event.extend_from_slice(&image_link_time_address.to_le_bytes());
+    event.extend_from_slice(&(device_path_size as u64).to_le_bytes());
+    let device_path =
+        unsafe { core::slice::from_raw_parts(device_path_ptr as *const u8, device_path_size) };
+    event.extend_from_slice(device_path);
+    Some(event)
+}
 
 /// Install BlockIO and DevicePath protocols for a disk and all its GPT partitions
 ///
@@ -84,12 +106,55 @@ pub fn install_block_io_protocols(
         }
     }
 
-    // Read GPT partitions, falling back to MBR for removable media.
-    let partitions = match fs::gpt::read_partitions_auto(disk) {
-        Ok(p) => p,
-        Err(e) => {
-            log::debug!("Failed to read partition table: {:?}", e);
-            return None;
+    // Read GPT partitions, falling back to MBR for removable media. If a GPT is
+    // present, measure its header and non-empty partition entries into PCR 5 per
+    // the TCG PC Client PFP EFI_GPT_DATA event format.
+    let partitions = match fs::gpt::read_gpt_header(disk) {
+        Ok(header) => {
+            if let Ok(event_data) = fs::gpt::build_gpt_measurement_event(disk, &header) {
+                efi::tcg::measured_boot::measure_event_all(
+                    5,
+                    efi::tcg::types::EV_EFI_GPT_EVENT,
+                    &event_data,
+                    &event_data,
+                    "GPT partition table",
+                );
+            }
+            match fs::gpt::read_partitions(disk, &header) {
+                Ok(p) => p,
+                Err(e) => {
+                    log::debug!("Failed to read GPT partitions: {:?}; trying MBR", e);
+                    match fs::gpt::read_mbr_partitions(disk) {
+                        Ok(p) => {
+                            let mut partitions = heapless::Vec::new();
+                            for partition in p {
+                                let _ = partitions.push(partition);
+                            }
+                            partitions
+                        }
+                        Err(e) => {
+                            log::debug!("Failed to read partition table: {:?}", e);
+                            return None;
+                        }
+                    }
+                }
+            }
+        }
+        Err(gpt_error) => {
+            log::debug!("GPT partition scan failed: {:?}; trying MBR", gpt_error);
+            match fs::gpt::read_mbr_partitions(disk) {
+                Ok(p) => {
+                    let mut partitions = heapless::Vec::new();
+                    for partition in p {
+                        let _ = partitions.push(partition);
+                    }
+                    partitions
+                }
+                Err(e) => {
+                    log::debug!("Failed to read partition table: {:?}", e);
+                    return None;
+                }
+            }
         }
     };
 
@@ -470,6 +535,30 @@ fn load_and_execute_bootloader(
         let _ = free_pool(buffer_ptr);
     })?;
 
+    let image_link_time_address = pe::parse_headers(&buffer[..bytes_read])
+        .map(|headers| headers.preferred_image_base())
+        .unwrap_or(0);
+    let device_dp =
+        boot_services::get_protocol_on_handle(device_handle, &DEVICE_PATH_PROTOCOL_GUID);
+    let loaded_image_dp = device_path::create_loaded_image_device_path(
+        device_dp as *const r_efi::protocols::device_path::Protocol,
+        path,
+    );
+
+    // TCG measured boot: hash the PE image and log an EFI_IMAGE_LOAD_EVENT.
+    if let Some(event_data) = serialize_tcg_image_load_event(
+        &loaded_image,
+        image_link_time_address,
+        loaded_image_dp as *const r_efi::protocols::device_path::Protocol,
+    ) && let Err(e) = efi::tcg::measured_boot::measure_pe_image_all(
+        4,
+        efi::tcg::types::EV_EFI_BOOT_SERVICES_APPLICATION,
+        &buffer[..bytes_read],
+        &event_data,
+    ) {
+        log::warn!("Failed to measure bootloader PE image: {:?}", e);
+    }
+
     // Free the raw file buffer
     let _ = free_pool(buffer_ptr);
 
@@ -530,12 +619,6 @@ fn load_and_execute_bootloader(
     // Install EFI_LOADED_IMAGE_DEVICE_PATH_PROTOCOL
     // This is the full device path: <partition device path> / FilePath(bootloader)
     // Windows Boot Manager uses this to locate its boot device.
-    let device_dp =
-        boot_services::get_protocol_on_handle(device_handle, &DEVICE_PATH_PROTOCOL_GUID);
-    let loaded_image_dp = device_path::create_loaded_image_device_path(
-        device_dp as *const r_efi::protocols::device_path::Protocol,
-        path,
-    );
     if !loaded_image_dp.is_null() {
         let status = boot_services::install_protocol(
             image_handle,
@@ -582,11 +665,14 @@ fn load_and_execute_bootloader(
         }
     }
 
-    // Execute the bootloader
+    // Execute the bootloader. This path bypasses BS.StartImage, so perform the
+    // same ReadyToBoot / boot-attempt measurements around the PE entry call.
+    efi::boot_services::measure_efi_application_start();
     let exec_status = pe::execute_image(&loaded_image, image_handle, system_table);
 
-    // If the bootloader returns, log it
+    // If the bootloader returns, log and measure it.
     log::info!("Bootloader returned with status: {:?}", exec_status);
+    efi::boot_services::measure_efi_application_return();
 
     // Clean up
     pe::unload_image(&loaded_image);

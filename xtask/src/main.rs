@@ -381,6 +381,7 @@ fn cmd_run(
         arch,
         machine,
         extra_devices: Vec::new(),
+        enable_tpm: false,
     };
 
     // Add USB keyboard for UI testing.
@@ -469,6 +470,8 @@ fn cmd_test(
         arch,
         machine,
         extra_devices: Vec::new(),
+        // Enable TPM emulation for TCG test app.
+        enable_tpm: app == "tcg-test" && matches!(arch, Arch::X86_64),
     };
 
     let disk_path = temp_dir.path().join("test.img");
