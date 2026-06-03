@@ -43,6 +43,79 @@ pub struct QemuConfig {
     pub machine: Machine,
     /// Extra QEMU device arguments (e.g., USB mouse for UI testing)
     pub extra_devices: Vec<String>,
+    /// Enable TPM 2.0 emulation via swtpm (x86_64 only).
+    pub enable_tpm: bool,
+}
+
+/// Manages a swtpm process lifetime for TPM emulation.
+///
+/// The swtpm process is killed when this struct is dropped.
+pub struct SwtpmProcess {
+    child: Child,
+    _state_dir: tempfile::TempDir,
+}
+
+impl Drop for SwtpmProcess {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// Spawn a swtpm process and return the QEMU arguments to connect to it.
+fn spawn_swtpm() -> Result<(SwtpmProcess, Vec<String>)> {
+    let state_dir = tempfile::tempdir().context("failed to create swtpm state dir")?;
+    let sock_path = state_dir.path().join("swtpm-sock");
+
+    let mut child = Command::new("swtpm")
+        .args([
+            "socket",
+            "--tpmstate",
+            &format!("dir={}", state_dir.path().display()),
+            "--ctrl",
+            &format!("type=unixio,path={}", sock_path.display()),
+            "--tpm2",
+            "--log",
+            "level=0",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .context("failed to start swtpm (is it installed?)")?;
+
+    // Wait for the control socket. CI hosts can be slow immediately after
+    // process spawn, so poll instead of sleeping for a fixed short interval.
+    for _ in 0..40 {
+        if sock_path.exists() {
+            break;
+        }
+        if let Some(status) = child.try_wait().context("failed to poll swtpm")? {
+            bail!("swtpm exited before creating socket: {}", status);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+
+    if !sock_path.exists() {
+        bail!("swtpm socket not created at {}", sock_path.display());
+    }
+
+    let qemu_args = vec![
+        "-chardev".into(),
+        format!("socket,id=chrtpm,path={}", sock_path.display()),
+        "-tpmdev".into(),
+        "emulator,id=tpm0,chardev=chrtpm".into(),
+        "-device".into(),
+        "tpm-tis,tpmdev=tpm0".into(),
+    ];
+
+    Ok((
+        SwtpmProcess {
+            child,
+            _state_dir: state_dir,
+        },
+        qemu_args,
+    ))
 }
 
 /// Test result from QEMU run
@@ -346,6 +419,25 @@ pub fn run_qemu(config: &QemuConfig, disk_path: Option<&Path>) -> Result<()> {
 
     let mut cmd = build_qemu_command(config, &disk)?;
 
+    // Start swtpm for TPM emulation if requested.
+    let _swtpm = if config.enable_tpm {
+        match spawn_swtpm() {
+            Ok((swtpm, tpm_args)) => {
+                for arg in &tpm_args {
+                    cmd.arg(arg);
+                }
+                println!("TPM 2.0 emulation enabled via swtpm");
+                Some(swtpm)
+            }
+            Err(e) => {
+                eprintln!("Warning: failed to start swtpm: {}", e);
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     // For interactive mode, use inherited stdio
     cmd.stdin(Stdio::inherit());
     cmd.stdout(Stdio::inherit());
@@ -363,6 +455,7 @@ pub fn run_qemu(config: &QemuConfig, disk_path: Option<&Path>) -> Result<()> {
     println!("==========================================\n");
 
     let status = cmd.status().context("failed to run QEMU")?;
+    // _swtpm dropped here
 
     if !status.success() {
         bail!("QEMU exited with status: {:?}", status.code());
@@ -577,6 +670,109 @@ pub fn run_tests(config: &QemuConfig, disk_path: &Path, app_name: &str) -> Resul
                 passed += 1;
             } else {
                 println!("[FAIL] userspace: 'UROOT_BOOT_SUCCESS' not found in output");
+                failed += 1;
+            }
+        }
+        "tcg-test" => {
+            // TCG (TPM 1.2) and TCG2 (TPM 2.0) protocol tests
+            if result.output.contains("TCG Protocol Test") {
+                println!("[PASS] test_started: TCG protocol test started");
+                passed += 1;
+            } else {
+                println!("[FAIL] test_started: TCG protocol test did not start");
+                failed += 1;
+            }
+
+            if result.output.contains("[PASS] tcg2_locate") {
+                println!("[PASS] tcg2_locate: TCG2 protocol found");
+                passed += 1;
+            } else {
+                println!("[FAIL] tcg2_locate: TCG2 protocol not found");
+                failed += 1;
+            }
+
+            if result.output.contains("[PASS] tcg2_get_capability") {
+                println!("[PASS] tcg2_get_capability: GetCapability succeeded");
+                passed += 1;
+            } else {
+                println!("[FAIL] tcg2_get_capability: GetCapability failed");
+                failed += 1;
+            }
+
+            if result.output.contains("[PASS] tcg2_hardware_tpm") {
+                println!("[PASS] tcg2_hardware_tpm: Hardware TPM via swtpm is active");
+                passed += 1;
+            } else {
+                println!("[FAIL] tcg2_hardware_tpm: Hardware TPM via swtpm was not active");
+                failed += 1;
+            }
+
+            if result.output.contains("[PASS] tcg2_get_event_log") {
+                println!("[PASS] tcg2_get_event_log: Event log available");
+                passed += 1;
+            } else {
+                println!("[FAIL] tcg2_get_event_log: Event log unavailable");
+                failed += 1;
+            }
+
+            if result.output.contains("[PASS] tcg2_hash_log_extend") {
+                println!("[PASS] tcg2_hash_log_extend: HashLogExtendEvent succeeded");
+                passed += 1;
+            } else {
+                println!("[FAIL] tcg2_hash_log_extend: HashLogExtendEvent failed");
+                failed += 1;
+            }
+
+            if result.output.contains("[PASS] tcg2_get_active_pcr_banks") {
+                println!("[PASS] tcg2_get_active_pcr_banks: active banks reported correctly");
+                passed += 1;
+            } else {
+                println!("[FAIL] tcg2_get_active_pcr_banks: active banks not reported correctly");
+                failed += 1;
+            }
+
+            if result.output.contains("[PASS] tcg2_set_active_pcr_banks") {
+                println!("[PASS] tcg2_set_active_pcr_banks: current bank set accepted");
+                passed += 1;
+            } else {
+                println!("[FAIL] tcg2_set_active_pcr_banks: current bank set rejected");
+                failed += 1;
+            }
+
+            if result
+                .output
+                .contains("[PASS] tcg2_get_result_of_set_active_pcr_banks")
+            {
+                println!("[PASS] tcg2_get_result_of_set_active_pcr_banks: no pending operation");
+                passed += 1;
+            } else {
+                println!("[FAIL] tcg2_get_result_of_set_active_pcr_banks: unexpected result");
+                failed += 1;
+            }
+
+            if result.output.contains("[PASS] tcg2_submit_command") {
+                println!("[PASS] tcg2_submit_command: SubmitCommand returned an expected status");
+                passed += 1;
+            } else {
+                println!(
+                    "[FAIL] tcg2_submit_command: SubmitCommand did not return an expected status"
+                );
+                failed += 1;
+            }
+
+            if result.output.contains("[PASS] tcg1_locate") {
+                println!("[PASS] tcg1_locate: TCG (TPM 1.2) protocol found");
+                passed += 1;
+            } else {
+                println!("[FAIL] tcg1_locate: TCG (TPM 1.2) protocol not found");
+                failed += 1;
+            }
+
+            if result.output.contains("All TCG tests passed!") {
+                println!("[PASS] all_passed: All TCG tests passed");
+                passed += 1;
+            } else {
+                println!("[FAIL] all_passed: Not all TCG tests passed");
                 failed += 1;
             }
         }
@@ -847,9 +1043,28 @@ fn run_qemu_with_capture_x86_64(
 
     cmd.args(["-d", "guest_errors"]);
 
+    // Extra devices
+    for arg in &config.extra_devices {
+        cmd.arg(arg);
+    }
+
+    // TPM emulation via swtpm. Capture-mode tests that request TPM must fail
+    // early if swtpm cannot start; otherwise the TCG test could silently pass
+    // in software-only mode and never exercise the TIS/SubmitCommand path.
+    let _swtpm = if config.enable_tpm {
+        let (swtpm, tpm_args) = spawn_swtpm()?;
+        for arg in &tpm_args {
+            cmd.arg(arg);
+        }
+        Some(swtpm)
+    } else {
+        None
+    };
+
     // Execute and capture output
     let output = cmd.output().context("failed to execute QEMU via timeout")?;
 
+    // _swtpm is dropped here, killing the swtpm process
     parse_qemu_output(&output)
 }
 

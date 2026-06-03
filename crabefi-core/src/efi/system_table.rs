@@ -7,8 +7,10 @@ use core::ffi::c_void;
 use r_efi::efi::{self, Guid, Handle, TableHeader};
 use r_efi::protocols::simple_text_input::Protocol as SimpleTextInputProtocol;
 use r_efi::protocols::simple_text_output::Protocol as SimpleTextOutputProtocol;
+use spin::Mutex;
 use zerocopy::{FromBytes, Immutable, KnownLayout, Unaligned};
 
+use crate::efi::tcg::types::{CryptoAgileEvent, TaggedDigest, TcgError};
 use crate::state::{self, ConfigurationTable, MAX_CONFIG_TABLES};
 
 /// EFI System Table signature "IBI SYST"
@@ -1086,24 +1088,111 @@ pub struct Tcg2FinalEventsTable {
     pub number_of_events: u64,
 }
 
-/// Install minimal TPM2 event log configuration tables
-///
-/// These tables prevent the kernel from trying to read the TPM event log
-/// via ACPI (which fails with CrabEFI's memory layout). An empty log is
-/// valid and indicates no measured boot events occurred.
-pub fn install_tpm_event_log() {
-    static FINAL_EVENTS: Tcg2FinalEventsTable = Tcg2FinalEventsTable {
-        version: 1,
-        number_of_events: 0,
-    };
+const TCG2_FINAL_EVENTS_CAPACITY: usize = 64 * 1024;
 
-    let table_ptr = &FINAL_EVENTS as *const Tcg2FinalEventsTable as *mut c_void;
-    let status = install_configuration_table(&EFI_TCG2_FINAL_EVENTS_TABLE_GUID, table_ptr);
+struct Tcg2FinalEventsStorage {
+    table_addr: usize,
+    used: usize,
+}
+
+static TCG2_FINAL_EVENTS: Mutex<Option<Tcg2FinalEventsStorage>> = Mutex::new(None);
+
+/// Install the TCG2 Final Events Table configuration table.
+///
+/// The Final Events Table tracks events measured *after* `GetEventLog`
+/// is first called. This is separate from the main TCG2 event log
+/// (which is returned by `EFI_TCG2_PROTOCOL.GetEventLog`). The OS
+/// kernel concatenates both to get the complete measurement history.
+pub fn install_tpm_event_log() {
+    use super::allocator::{self, MemoryType};
+
+    let mut final_events = TCG2_FINAL_EVENTS.lock();
+    if final_events.is_none() {
+        let table_size = core::mem::size_of::<Tcg2FinalEventsTable>() + TCG2_FINAL_EVENTS_CAPACITY;
+        let table_pages = (table_size as u64).div_ceil(allocator::PAGE_SIZE);
+        let mut table_addr = 0u64;
+        let alloc_status = allocator::allocate_pages(
+            allocator::AllocateType::AllocateAnyPages,
+            MemoryType::AcpiMemoryNvs,
+            table_pages,
+            &mut table_addr,
+        );
+        if alloc_status != efi::Status::SUCCESS {
+            log::error!(
+                "Failed to allocate TCG2 Final Events Table: {:?}",
+                alloc_status
+            );
+            return;
+        }
+        *final_events = Some(Tcg2FinalEventsStorage {
+            table_addr: table_addr as usize,
+            used: 0,
+        });
+    }
+
+    let Some(storage) = final_events.as_mut() else {
+        return;
+    };
+    storage.used = 0;
+
+    let table_ptr = storage.table_addr as *mut Tcg2FinalEventsTable;
+    unsafe {
+        core::ptr::write_bytes(
+            table_ptr as *mut u8,
+            0,
+            core::mem::size_of::<Tcg2FinalEventsTable>() + TCG2_FINAL_EVENTS_CAPACITY,
+        );
+        (*table_ptr).version = 1;
+        (*table_ptr).number_of_events = 0;
+    }
+    drop(final_events);
+
+    let status =
+        install_configuration_table(&EFI_TCG2_FINAL_EVENTS_TABLE_GUID, table_ptr as *mut c_void);
     if status == efi::Status::SUCCESS {
-        log::info!("Installed TCG2 Final Events Table (empty)");
+        log::info!("Installed TCG2 Final Events Table");
     } else {
         log::error!("Failed to install TCG2 Final Events Table: {:?}", status);
     }
+}
+
+/// Append an event to the TCG2 Final Events Table.
+pub fn append_tpm_final_event(
+    pcr_index: u32,
+    event_type: u32,
+    digests: &[TaggedDigest],
+    event_data: &[u8],
+) -> Result<(), TcgError> {
+    let event = CryptoAgileEvent {
+        pcr_index,
+        event_type,
+        digests,
+        event_data,
+    };
+    let needed = event.serialized_size();
+
+    let mut final_events = TCG2_FINAL_EVENTS.lock();
+    let final_events = final_events.as_mut().ok_or(TcgError::InternalError)?;
+    if final_events.used + needed > TCG2_FINAL_EVENTS_CAPACITY {
+        return Err(TcgError::LogFull);
+    }
+
+    let table_ptr = final_events.table_addr as *mut Tcg2FinalEventsTable;
+    let events_ptr =
+        unsafe { (table_ptr as *mut u8).add(core::mem::size_of::<Tcg2FinalEventsTable>()) };
+    let used = final_events.used;
+    let written = unsafe {
+        let events = core::slice::from_raw_parts_mut(
+            events_ptr.add(used),
+            TCG2_FINAL_EVENTS_CAPACITY - used,
+        );
+        event.serialize(events).ok_or(TcgError::InternalError)?
+    };
+    final_events.used += written;
+    unsafe {
+        (*table_ptr).number_of_events += 1;
+    }
+    Ok(())
 }
 
 /// Install the EFI Memory Attributes Table

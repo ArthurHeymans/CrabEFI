@@ -4,6 +4,7 @@
 //! System Partition (ESP).
 
 use crate::drivers::block::{BlockDevice, BlockError};
+use alloc::vec::Vec;
 use zerocopy::{FromBytes, Immutable, KnownLayout, Unaligned};
 
 /// Maximum supported block size (4KB - handles most devices including CD-ROMs)
@@ -303,6 +304,89 @@ pub fn read_gpt_header(device: &mut dyn BlockDevice) -> Result<GptHeader, GptErr
     );
 
     Ok(header)
+}
+
+/// Build an `EFI_GPT_DATA` event payload for TCG measured boot.
+///
+/// The payload layout matches the TCG PC Client PFP `EFI_GPT_DATA` structure:
+/// fixed-size GPT header, `u64 NumberOfPartitions`, then all non-empty raw GPT
+/// partition entries in disk order. The event is measured into PCR 5 by the
+/// caller with event type `EV_EFI_GPT_EVENT`.
+pub fn build_gpt_measurement_event(
+    device: &mut dyn BlockDevice,
+    header: &GptHeader,
+) -> Result<Vec<u8>, GptError> {
+    let info = device.info();
+    let block_size = (info.block_size as usize).clamp(MIN_BLOCK_SIZE, MAX_BLOCK_SIZE);
+    let is_hybrid = block_size > MIN_BLOCK_SIZE;
+
+    let entry_size = header.partition_entry_size as usize;
+    if entry_size < core::mem::size_of::<GptPartitionEntry>() {
+        return Err(GptError::InvalidHeader);
+    }
+
+    let entries_byte_offset = if is_hybrid {
+        header.partition_entry_lba as usize * MIN_BLOCK_SIZE
+    } else {
+        header.partition_entry_lba as usize * block_size
+    };
+    let total_entries = header.num_partition_entries as usize;
+    let total_bytes_needed = total_entries
+        .checked_mul(entry_size)
+        .ok_or(GptError::InvalidHeader)?;
+
+    let mut raw_entries: Vec<u8> = Vec::new();
+    let mut buffer = [0u8; MAX_BLOCK_SIZE];
+    let mut entry_buf: Vec<u8> = Vec::new();
+    entry_buf.resize(entry_size, 0);
+
+    for entry_index in 0..total_entries {
+        let entry_offset = entries_byte_offset
+            .checked_add(
+                entry_index
+                    .checked_mul(entry_size)
+                    .ok_or(GptError::InvalidHeader)?,
+            )
+            .ok_or(GptError::InvalidHeader)?;
+        if entry_offset - entries_byte_offset >= total_bytes_needed {
+            break;
+        }
+
+        let mut copied = 0usize;
+        while copied < entry_size {
+            let current = entry_offset
+                .checked_add(copied)
+                .ok_or(GptError::InvalidHeader)?;
+            let lba = (current / block_size) as u64;
+            let offset_in_block = current % block_size;
+            device.read_block(lba, &mut buffer[..block_size])?;
+            let chunk = (entry_size - copied).min(block_size - offset_in_block);
+            entry_buf[copied..copied + chunk]
+                .copy_from_slice(&buffer[offset_in_block..offset_in_block + chunk]);
+            copied += chunk;
+        }
+
+        let entry = GptPartitionEntry::read_from_prefix(&entry_buf)
+            .map_err(|_| GptError::InvalidHeader)?
+            .0;
+        if !entry.is_empty() {
+            raw_entries.extend_from_slice(&entry_buf);
+        }
+    }
+
+    let valid_partition_count = raw_entries.len() / entry_size;
+    let header_size = core::mem::size_of::<GptHeader>();
+    let mut event = Vec::with_capacity(header_size + 8 + raw_entries.len());
+    // SAFETY: GptHeader is repr(C, packed), Copy, and contains only integer/byte
+    // fields. Taking a byte view copies its serialized little-endian layout.
+    let header_bytes = unsafe {
+        core::slice::from_raw_parts(header as *const GptHeader as *const u8, header_size)
+    };
+    event.extend_from_slice(header_bytes);
+    event.extend_from_slice(&(valid_partition_count as u64).to_le_bytes());
+    event.extend_from_slice(&raw_entries);
+
+    Ok(event)
 }
 
 /// Read partition entries from GPT

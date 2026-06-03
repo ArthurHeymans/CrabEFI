@@ -19,9 +19,14 @@ use super::AuthError;
 use super::crypto::verify_pkcs7_signature;
 use super::signature::{is_certificate_forbidden, is_hash_allowed, is_hash_forbidden};
 use super::variables::db_database;
+use crate::efi::tcg::types::{
+    SHA1_DIGEST_SIZE, SHA256_DIGEST_SIZE, SHA384_DIGEST_SIZE, SHA512_DIGEST_SIZE, TPM_ALG_SHA1,
+    TPM_ALG_SHA256, TPM_ALG_SHA384, TPM_ALG_SHA512, TaggedDigest, digest_size_for_algorithm,
+};
 use crate::pe::{DATA_DIRECTORY_ENTRY_SIZE, IMAGE_DIRECTORY_ENTRY_SECURITY, parse_headers};
 use alloc::vec::Vec;
-use sha2::{Digest, Sha256};
+use sha1::Sha1;
+use sha2::{Digest, Sha256, Sha384, Sha512};
 
 /// WIN_CERTIFICATE header type for PKCS#7
 const WIN_CERT_TYPE_PKCS_SIGNED_DATA: u16 = 0x0002;
@@ -55,6 +60,172 @@ struct SectionInfo {
 pub struct AuthenticodeSignature<'a> {
     /// The PKCS#7 SignedData blob
     pub pkcs7_data: &'a [u8],
+}
+
+/// Compute Authenticode digests for all requested hash algorithms.
+///
+/// This implements the PE/COFF hash algorithm (excluding the Checksum field,
+/// Certificate Table data directory entry, and the certificate data itself)
+/// for multiple hash algorithms simultaneously, as required by TCG measured
+/// boot. Each active PCR bank needs the authenticode hash in its algorithm.
+///
+/// # Arguments
+///
+/// * `pe_data` - The complete PE file data
+/// * `algorithms` - Slice of TPM algorithm IDs (e.g., `&[TPM_ALG_SHA256, TPM_ALG_SHA1]`)
+///
+/// # Returns
+///
+/// `(count, digests)` where `count` is the number of valid digests and
+/// `digests` is a fixed-size array of [`TaggedDigest`] values.
+pub fn compute_authenticode_digests(
+    pe_data: &[u8],
+    algorithms: &[u16],
+) -> Result<(usize, [TaggedDigest; 5]), AuthError> {
+    let info = parse_pe_for_hash(pe_data)?;
+    let mut digests = [TaggedDigest::zeroed(0); 5];
+    let mut count = 0;
+
+    for &alg in algorithms {
+        if count >= digests.len() {
+            break;
+        }
+        let digest_size = match digest_size_for_algorithm(alg) {
+            Some(s) => s,
+            None => continue,
+        };
+
+        let hash_bytes = compute_authenticode_hash_inner(pe_data, &info, alg)?;
+        digests[count].algorithm = alg;
+        digests[count].digest[..digest_size].copy_from_slice(&hash_bytes[..digest_size]);
+        count += 1;
+    }
+
+    if count == 0 {
+        return Err(AuthError::InvalidHeader);
+    }
+
+    Ok((count, digests))
+}
+
+/// Compute authenticode hash for a single algorithm. Returns up to 64 bytes.
+fn compute_authenticode_hash_inner(
+    pe_data: &[u8],
+    info: &PeInfo,
+    algorithm: u16,
+) -> Result<[u8; 64], AuthError> {
+    // Build the list of byte ranges to hash (shared logic for all algorithms).
+    let regions = authenticode_regions(pe_data, info)?;
+
+    let mut result = [0u8; 64];
+    match algorithm {
+        TPM_ALG_SHA256 => {
+            let mut hasher = Sha256::new();
+            for (start, end) in &regions {
+                hasher.update(&pe_data[*start..*end]);
+            }
+            let hash = hasher.finalize();
+            result[..SHA256_DIGEST_SIZE].copy_from_slice(&hash);
+        }
+        TPM_ALG_SHA1 => {
+            let mut hasher = Sha1::new();
+            for (start, end) in &regions {
+                hasher.update(&pe_data[*start..*end]);
+            }
+            let hash = hasher.finalize();
+            result[..SHA1_DIGEST_SIZE].copy_from_slice(&hash);
+        }
+        TPM_ALG_SHA384 => {
+            let mut hasher = Sha384::new();
+            for (start, end) in &regions {
+                hasher.update(&pe_data[*start..*end]);
+            }
+            let hash = hasher.finalize();
+            result[..SHA384_DIGEST_SIZE].copy_from_slice(&hash);
+        }
+        TPM_ALG_SHA512 => {
+            let mut hasher = Sha512::new();
+            for (start, end) in &regions {
+                hasher.update(&pe_data[*start..*end]);
+            }
+            let hash = hasher.finalize();
+            result[..SHA512_DIGEST_SIZE].copy_from_slice(&hash);
+        }
+        _ => return Err(AuthError::InvalidHeader),
+    }
+    Ok(result)
+}
+
+/// Build the list of (start, end) byte ranges for authenticode hashing.
+///
+/// The authenticode hash covers the entire file except:
+/// 1. The 4-byte CheckSum field
+/// 2. The 8-byte Certificate Table data directory entry
+/// 3. The certificate table data (signature blob at end of file)
+fn authenticode_regions(pe_data: &[u8], info: &PeInfo) -> Result<Vec<(usize, usize)>, AuthError> {
+    let mut regions = Vec::new();
+
+    // Region 1: From start to checksum field
+    if info.checksum_offset > pe_data.len() {
+        return Err(AuthError::InvalidHeader);
+    }
+    regions.push((0, info.checksum_offset));
+
+    // Skip checksum (4 bytes)
+    let after_checksum = info
+        .checksum_offset
+        .checked_add(4)
+        .ok_or(AuthError::InvalidHeader)?;
+
+    // Region 2: From after checksum to certificate table entry
+    if info.cert_table_entry_offset < after_checksum {
+        return Err(AuthError::InvalidHeader);
+    }
+    if info.cert_table_entry_offset > pe_data.len() {
+        // No certificate table entry - hash to end of headers
+        regions.push((after_checksum, info.size_of_headers.min(pe_data.len())));
+    } else {
+        regions.push((after_checksum, info.cert_table_entry_offset));
+
+        // Skip certificate table entry (8 bytes)
+        let after_cert_entry = info
+            .cert_table_entry_offset
+            .checked_add(DATA_DIRECTORY_ENTRY_SIZE)
+            .ok_or(AuthError::InvalidHeader)?;
+
+        // Region 3: From after cert table entry to end of headers
+        if after_cert_entry <= info.size_of_headers && info.size_of_headers <= pe_data.len() {
+            regions.push((after_cert_entry, info.size_of_headers));
+        }
+    }
+
+    // Region 4: Hash each section in order of PointerToRawData
+    let mut sum_of_bytes_hashed = info.size_of_headers;
+    for section in &info.sections {
+        if section.size_of_raw_data == 0 {
+            continue;
+        }
+        let section_start = section.file_offset as usize;
+        let section_end = section_start
+            .checked_add(section.size_of_raw_data as usize)
+            .ok_or(AuthError::InvalidHeader)?;
+        if section_end <= pe_data.len() {
+            regions.push((section_start, section_end));
+            sum_of_bytes_hashed += section.size_of_raw_data as usize;
+        }
+    }
+
+    // Region 5: Extra data between sections and certificate table
+    let file_end = if info.cert_table_size > 0 {
+        pe_data.len().saturating_sub(info.cert_table_size as usize)
+    } else {
+        pe_data.len()
+    };
+    if sum_of_bytes_hashed < file_end && file_end <= pe_data.len() {
+        regions.push((sum_of_bytes_hashed, file_end));
+    }
+
+    Ok(regions)
 }
 
 /// Compute the Authenticode PE hash

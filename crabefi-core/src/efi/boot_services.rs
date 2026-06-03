@@ -17,6 +17,7 @@ use crate::state::{
     self, EventEntry, LoadedImageEntry, MAX_EVENTS, MAX_HANDLES, MAX_PROTOCOLS_PER_HANDLE,
     ProtocolEntry,
 };
+use alloc::vec::Vec;
 use core::ffi::c_void;
 use r_efi::efi::{self, Boolean, Guid, Handle, Status, SystemTable, TableHeader, Tpl};
 use r_efi::protocols::device_path::Protocol as DevicePathProtocol;
@@ -693,6 +694,55 @@ pub fn signal_event_group_for_runtime(group_guid: &Guid) {
     signal_event_group(group_guid);
 }
 
+/// Measure the beginning of an EFI boot application attempt.
+///
+/// The first attempt performs the ReadyToBoot measured-boot sequence and
+/// signals the ReadyToBoot event group. Subsequent attempts only add the boot
+/// action event so separators are not duplicated.
+pub(crate) fn measure_efi_application_start() {
+    let should_signal = crate::state::with_efi_mut(|efi| {
+        if !efi.ready_to_boot_signaled {
+            efi.ready_to_boot_signaled = true;
+            true
+        } else {
+            false
+        }
+    });
+
+    if should_signal {
+        // TCG measured boot: measure pre-OS handoff state, boot variables,
+        // boot action, and separators before the first boot attempt, per TCG
+        // PFP / EDK2 ReadyToBoot ordering.
+        super::tcg::measured_boot::measure_handoff_tables_all();
+        super::tcg::measured_boot::measure_boot_variables_all();
+        super::tcg::measured_boot::measure_action_all(
+            4,
+            "Calling EFI Application from Boot Option",
+        );
+
+        // Measure separator events into PCR 0-6.
+        // PCR 7 already has its separator from measure_secure_boot_variables().
+        super::tcg::measured_boot::measure_all_separators_all();
+
+        signal_event_group(&EFI_EVENT_GROUP_READY_TO_BOOT);
+    } else {
+        super::tcg::measured_boot::measure_action_all(
+            4,
+            "Calling EFI Application from Boot Option",
+        );
+    }
+}
+
+/// Measure return from an EFI boot application attempt.
+pub(crate) fn measure_efi_application_return() {
+    if crate::state::efi().ready_to_boot_signaled {
+        super::tcg::measured_boot::measure_action_all(
+            4,
+            "Returning from EFI Application from Boot Option",
+        );
+    }
+}
+
 extern "efiapi" fn create_event_ex(
     event_type: u32,
     notify_tpl: Tpl,
@@ -1194,15 +1244,23 @@ extern "efiapi" fn load_image(
         }
     };
 
-    // Free the buffer now that PE is loaded (it makes its own copy)
-    free_if_owned(&source);
-
     log::debug!(
         "BS.LoadImage: PE loaded at {:#x}, entry={:#x}, size={:#x}",
         loaded_image.image_base,
         loaded_image.entry_point,
         loaded_image.image_size
     );
+
+    // TCG measured boot: measure the PE image using the full
+    // EFI_IMAGE_LOAD_EVENT payload before releasing the source buffer.
+    measure_pe_image_for_tcg(
+        data,
+        &loaded_image,
+        device_path as *const DevicePathProtocol,
+    );
+
+    // Free the buffer now that PE is loaded and measured (PE loading makes its own copy).
+    free_if_owned(&source);
 
     // Create a new handle for this image
     let new_handle = match create_handle() {
@@ -1341,20 +1399,9 @@ extern "efiapi" fn start_image(
         image_base
     );
 
-    // Signal EFI_EVENT_GROUP_READY_TO_BOOT before the first image is started.
-    // Per UEFI spec, this should only be signaled once (before the first boot
-    // option is attempted), not on every StartImage call.
-    let should_signal = crate::state::with_efi_mut(|efi| {
-        if !efi.ready_to_boot_signaled {
-            efi.ready_to_boot_signaled = true;
-            true
-        } else {
-            false
-        }
-    });
-    if should_signal {
-        signal_event_group(&EFI_EVENT_GROUP_READY_TO_BOOT);
-    }
+    // Signal EFI_EVENT_GROUP_READY_TO_BOOT before the first image is started
+    // and measure boot-attempt action events without duplicating separators.
+    measure_efi_application_start();
 
     // Update table CRC32s one final time before handing off to the image
     // (config tables may have changed since efi::init())
@@ -1371,6 +1418,7 @@ extern "efiapi" fn start_image(
     let status = entry(image_handle, system_table);
 
     log::info!("BS.StartImage: Image returned with status: {:?}", status);
+    measure_efi_application_return();
 
     // Set exit data if provided (we don't support exit data currently)
     if !exit_data_size.is_null() {
@@ -1476,6 +1524,9 @@ extern "efiapi" fn exit_boot_services(image_handle: Handle, map_key: usize) -> S
         map_key
     );
 
+    // TCG measured boot: measure ExitBootServices action into PCR 5.
+    super::tcg::measured_boot::measure_action_all(5, "Exit Boot Services Invocation");
+
     // Signal EXIT_BOOT_SERVICES event group BEFORE finalizing the memory map.
     // Windows Boot Manager registers callbacks that must run before we lock
     // the memory map.
@@ -1515,6 +1566,12 @@ extern "efiapi" fn exit_boot_services(image_handle: Handle, map_key: usize) -> S
     let status = allocator::exit_boot_services(map_key);
 
     if status == Status::SUCCESS {
+        // TCG measured boot: measure ExitBootServices success into PCR 5.
+        super::tcg::measured_boot::measure_action_all(
+            5,
+            "Exit Boot Services Returned with Success",
+        );
+
         log::info!("ExitBootServices SUCCESS - transitioning to OS");
         crate::timestamp::record(crate::timestamp::TS_CRABEFI_EXIT_BOOT_SERVICES);
 
@@ -1573,6 +1630,10 @@ extern "efiapi" fn exit_boot_services(image_handle: Handle, map_key: usize) -> S
         #[cfg(target_arch = "aarch64")]
         crate::arch::aarch64::ns_switch::install_ns_trampoline();
     } else {
+        super::tcg::measured_boot::measure_action_all(
+            5,
+            "Exit Boot Services Returned with Failure",
+        );
         log::warn!("ExitBootServices FAILED: {:?}", status);
     }
 
@@ -2262,4 +2323,70 @@ pub fn get_protocol_on_handle(handle: Handle, guid: &Guid) -> *mut c_void {
                 .find(|p| p.guid == *guid)
         })
         .map_or(core::ptr::null_mut(), |p| p.interface)
+}
+
+fn serialize_tcg_image_load_event(
+    loaded_image: &pe::LoadedImage,
+    image_link_time_address: u64,
+    device_path_ptr: *const DevicePathProtocol,
+) -> Vec<u8> {
+    let device_path_size = if device_path_ptr.is_null() {
+        0
+    } else {
+        unsafe { super::protocols::device_path::device_path_size(device_path_ptr) }
+    };
+
+    let mut event = Vec::with_capacity(32 + device_path_size);
+    event.extend_from_slice(&loaded_image.image_base.to_le_bytes());
+    event.extend_from_slice(&loaded_image.image_size.to_le_bytes());
+    event.extend_from_slice(&image_link_time_address.to_le_bytes());
+    event.extend_from_slice(&(device_path_size as u64).to_le_bytes());
+    if device_path_size != 0 {
+        let device_path =
+            unsafe { core::slice::from_raw_parts(device_path_ptr as *const u8, device_path_size) };
+        event.extend_from_slice(device_path);
+    }
+    event
+}
+
+/// Measure a PE/COFF image for TCG measured boot.
+///
+/// Determines the image subsystem (application vs driver) and measures
+/// into the appropriate PCR:
+/// - PCR 4: EFI applications (`EV_EFI_BOOT_SERVICES_APPLICATION`)
+/// - PCR 2: EFI drivers (`EV_EFI_BOOT_SERVICES_DRIVER` / `EV_EFI_RUNTIME_SERVICES_DRIVER`)
+fn measure_pe_image_for_tcg(
+    pe_data: &[u8],
+    loaded_image: &pe::LoadedImage,
+    device_path: *const DevicePathProtocol,
+) {
+    use super::tcg::measured_boot::measure_pe_image_all;
+    use super::tcg::types::*;
+
+    // Parse PE headers to determine subsystem.
+    let headers = match pe::parse_headers(pe_data) {
+        Ok(h) => h,
+        Err(_) => return, // Not a valid PE — skip measurement
+    };
+
+    let subsystem = headers.subsystem();
+    let (pcr_index, event_type) = match subsystem {
+        10 => (4, EV_EFI_BOOT_SERVICES_APPLICATION), // EFI_APPLICATION
+        11 => (2, EV_EFI_BOOT_SERVICES_DRIVER),      // EFI_BOOT_SERVICE_DRIVER
+        12 => (2, EV_EFI_RUNTIME_SERVICES_DRIVER),   // EFI_RUNTIME_SERVICES_DRIVER
+        _ => (4, EV_EFI_BOOT_SERVICES_APPLICATION),  // Default to application
+    };
+
+    let event_data =
+        serialize_tcg_image_load_event(loaded_image, headers.preferred_image_base(), device_path);
+
+    if let Err(e) = measure_pe_image_all(pcr_index, event_type, pe_data, &event_data) {
+        log::warn!("Failed to measure PE image: {:?}", e);
+    } else {
+        log::debug!(
+            "Measured PE image into PCR {} (subsystem={})",
+            pcr_index,
+            subsystem
+        );
+    }
 }

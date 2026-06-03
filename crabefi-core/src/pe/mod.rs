@@ -228,6 +228,53 @@ impl<'a> PeHeaders<'a> {
         Some((dir.virtual_address, dir.size))
     }
 
+    /// Get the PE subsystem value from the optional header.
+    ///
+    /// Common EFI values:
+    /// - 10: `EFI_APPLICATION`
+    /// - 11: `EFI_BOOT_SERVICE_DRIVER`
+    /// - 12: `EFI_RUNTIME_SERVICES_DRIVER`
+    pub fn subsystem(&self) -> u16 {
+        // The Subsystem field is at byte offset 68 in both PE32 and PE32+
+        // optional headers.
+        let offset = self.opt_header_offset + 68;
+        if offset + 2 > self.data.len() {
+            return 0;
+        }
+        u16::from_le_bytes([self.data[offset], self.data[offset + 1]])
+    }
+
+    /// Get the preferred image base recorded in the optional header.
+    pub fn preferred_image_base(&self) -> u64 {
+        if self.is_pe32_plus {
+            let offset = self.opt_header_offset + 24;
+            if offset + 8 > self.data.len() {
+                return 0;
+            }
+            u64::from_le_bytes([
+                self.data[offset],
+                self.data[offset + 1],
+                self.data[offset + 2],
+                self.data[offset + 3],
+                self.data[offset + 4],
+                self.data[offset + 5],
+                self.data[offset + 6],
+                self.data[offset + 7],
+            ])
+        } else {
+            let offset = self.opt_header_offset + 28;
+            if offset + 4 > self.data.len() {
+                return 0;
+            }
+            u32::from_le_bytes([
+                self.data[offset],
+                self.data[offset + 1],
+                self.data[offset + 2],
+                self.data[offset + 3],
+            ]) as u64
+        }
+    }
+
     /// Get section headers iterator
     pub fn sections(&self) -> impl Iterator<Item = &SectionHeader> {
         let section_size = core::mem::size_of::<SectionHeader>();

@@ -49,9 +49,20 @@ pub mod tags {
 }
 
 /// CBMEM IDs (used with CB_TAG_CBMEM_ENTRY)
-mod cbmem_ids {
+pub(crate) mod cbmem_ids {
     /// SMBIOS tables CBMEM ID (ASCII "SMBT")
     pub const CBMEM_ID_SMBIOS: u32 = 0x534d4254;
+    /// TPM log in coreboot-specific format (ASCII "TCPA")
+    pub const CBMEM_ID_TPM_CB_LOG: u32 = 0x54435041;
+    /// TPM log per TPM 1.2 specification (ASCII "TDPA")
+    pub const CBMEM_ID_TCPA_TCG_LOG: u32 = 0x54445041;
+    /// TPM log per TPM 2.0 specification (ASCII "TPM2")
+    pub const CBMEM_ID_TPM2_TCG_LOG: u32 = 0x54504d32;
+}
+
+/// LB_TAG for TPM CB log (only the coreboot-specific format is exported via CB tables)
+pub mod tpm_tags {
+    pub const CB_TAG_TPM_CB_LOG: u32 = 0x0036;
 }
 
 /// Coreboot header structure
@@ -434,6 +445,24 @@ pub struct CorebootInfo {
     pub efi_fw_info: Option<EfiFwInfo>,
     /// Capsule regions from coreboot (coalesced capsules ready for processing)
     pub capsules: heapless::Vec<CapsuleRegion, MAX_CAPSULES>,
+    /// TPM event log from CBMEM (address, size, format).
+    ///
+    /// Coreboot supports three log formats, each with its own CBMEM ID:
+    /// - `CBMEM_ID_TPM_CB_LOG` (0x54435041): coreboot-specific format
+    /// - `CBMEM_ID_TCPA_TCG_LOG` (0x54445041): TCG 1.2 SHA1-only format
+    /// - `CBMEM_ID_TPM2_TCG_LOG` (0x54504d32): TCG 2.0 crypto-agile format
+    pub tpm_log: Option<TpmLogInfo>,
+}
+
+/// Information about a TPM event log found in CBMEM.
+#[derive(Debug, Clone, Copy)]
+pub struct TpmLogInfo {
+    /// Physical address of the log data.
+    pub address: u64,
+    /// Size of the log data in bytes.
+    pub size: u32,
+    /// Which CBMEM ID was matched (determines the format).
+    pub cbmem_id: u32,
 }
 
 impl CorebootInfo {
@@ -455,6 +484,7 @@ impl CorebootInfo {
             devicetree: None,
             efi_fw_info: None,
             capsules: heapless::Vec::new(),
+            tpm_log: None,
         }
     }
 }
@@ -664,6 +694,9 @@ fn parse_record(record_bytes: &[u8], info: &mut CorebootInfo) {
         }
         tags::CB_TAG_CBMEM_ENTRY => {
             parse_cbmem_entry(record_bytes, info);
+        }
+        tpm_tags::CB_TAG_TPM_CB_LOG => {
+            parse_tpm_cb_log_ref(record_bytes, info);
         }
         tags::CB_TAG_SMMSTOREV2 => {
             parse_smmstorev2(record_bytes, info);
@@ -1045,6 +1078,124 @@ fn parse_timestamps(record_bytes: &[u8], info: &mut CorebootInfo) {
     log::debug!("Timestamp table: {:#x}", cbmem_addr);
 }
 
+/// Parse the legacy coreboot-specific TPM log reference.
+///
+/// The `LB_TAG_TPM_CB_LOG` record is a plain CBMEM reference without an entry
+/// size. The coreboot-specific log starts with max/used entry counts, so derive
+/// the occupied size from that header. This format is not appended to directly;
+/// detecting it lets the payload make an explicit fresh-log decision.
+fn parse_tpm_cb_log_ref(record_bytes: &[u8], info: &mut CorebootInfo) {
+    let Ok((cbmem_ref, _)) = CbCbmemRef::read_from_prefix(record_bytes) else {
+        log::warn!("Failed to parse TPM CB log reference");
+        return;
+    };
+
+    let address = cbmem_ref.cbmem_addr;
+    if address == 0 {
+        log::warn!("TPM CB log reference has a null address");
+        return;
+    }
+
+    // SAFETY: coreboot records point at CBMEM regions that remain valid for
+    // the payload lifetime. We only read the fixed 4-byte table header here.
+    let header = unsafe { core::slice::from_raw_parts(address as *const u8, 4) };
+    let max_entries = u16::from_le_bytes([header[0], header[1]]) as u32;
+    let num_entries = u16::from_le_bytes([header[2], header[3]]) as u32;
+    let entry_count = num_entries.min(max_entries);
+    let entry_size = 4 + 10 + 64 + 4 + 50;
+    let size = 4 + entry_count * entry_size;
+
+    log::info!(
+        "TPM event log found: coreboot-specific format at {:#x} ({} used entries)",
+        address,
+        entry_count,
+    );
+
+    if info.tpm_log.is_none() {
+        info.tpm_log = Some(TpmLogInfo {
+            address,
+            size,
+            cbmem_id: cbmem_ids::CBMEM_ID_TPM_CB_LOG,
+        });
+    }
+}
+
+fn read_le_u16(data: &[u8], offset: usize) -> Option<u16> {
+    let bytes = data.get(offset..offset + 2)?;
+    Some(u16::from_le_bytes([bytes[0], bytes[1]]))
+}
+
+fn read_le_u32(data: &[u8], offset: usize) -> Option<u32> {
+    let bytes = data.get(offset..offset + 4)?;
+    Some(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+}
+
+fn compute_cbmem_tpm_log_used_size(address: u64, allocation_size: u32, id: u32) -> Option<u32> {
+    if address == 0 || allocation_size == 0 {
+        return None;
+    }
+
+    let allocation_size = allocation_size as usize;
+    // SAFETY: coreboot's CBMEM entry describes a CBMEM allocation that remains
+    // valid for the payload lifetime. We only read within the advertised
+    // allocation and validate the embedded coreboot TPM log header before use.
+    let data = unsafe { core::slice::from_raw_parts(address as *const u8, allocation_size) };
+
+    let (header_end, vendor_offset, expected_magic) = match id {
+        cbmem_ids::CBMEM_ID_TCPA_TCG_LOG => {
+            // struct tpm_1_log_table begins with a TCG_PCClientPCREvent header:
+            // pcr(4), event_type(4), digest(20), event_data_size/spec_id_size(4).
+            // The event data is coreboot's spec_id_event_data (25 bytes), then
+            // the 15-byte coreboot vendor area carrying num_entries/entry_size.
+            let event_data_size = read_le_u32(data, 28)? as usize;
+            let header_end = 32usize.checked_add(event_data_size)?;
+            let vendor_info_size = *data.get(32 + 24)? as usize;
+            let vendor_offset = 32 + 25;
+            if vendor_info_size < 15 || header_end > allocation_size {
+                return None;
+            }
+            (header_end, vendor_offset, 0x3154_4243u32) // "CBT1"
+        }
+        cbmem_ids::CBMEM_ID_TPM2_TCG_LOG => {
+            // struct tpm_2_log_table begins with a TCG_PCR_EVENT wrapper. The
+            // event payload contains the Spec ID Event03 header, digest_sizes,
+            // a vendor_info_size byte, and the coreboot vendor area.
+            let event_data_size = read_le_u32(data, 28)? as usize;
+            let header_end = 32usize.checked_add(event_data_size)?;
+            let alg_count = read_le_u32(data, 56)? as usize;
+            let vendor_info_size_offset = 60usize.checked_add(alg_count.checked_mul(4)?)?;
+            let vendor_info_size = *data.get(vendor_info_size_offset)? as usize;
+            let vendor_offset = vendor_info_size_offset.checked_add(1)?;
+            if vendor_info_size < 15 || header_end > allocation_size {
+                return None;
+            }
+            (header_end, vendor_offset, 0x3254_4243u32) // "CBT2"
+        }
+        _ => return None,
+    };
+
+    if vendor_offset.checked_add(15)? > header_end {
+        return None;
+    }
+
+    let magic = read_le_u32(data, vendor_offset + 3)?;
+    let max_entries = read_le_u16(data, vendor_offset + 7)? as usize;
+    let num_entries = read_le_u16(data, vendor_offset + 9)? as usize;
+    let log_entry_size = read_le_u32(data, vendor_offset + 11)? as usize;
+
+    if magic != expected_magic || num_entries > max_entries || log_entry_size == 0 {
+        return None;
+    }
+
+    let entries_size = num_entries.checked_mul(log_entry_size)?;
+    let used = header_end.checked_add(entries_size)?;
+    if used > allocation_size || used > u32::MAX as usize {
+        return None;
+    }
+
+    Some(used as u32)
+}
+
 /// Parse CBMEM entry record
 ///
 /// CBMEM entries provide pointers to various firmware data regions by ID.
@@ -1069,6 +1220,61 @@ fn parse_cbmem_entry(record_bytes: &[u8], info: &mut CorebootInfo) {
                 address,
                 entry_size
             );
+        }
+        cbmem_ids::CBMEM_ID_TPM_CB_LOG
+        | cbmem_ids::CBMEM_ID_TCPA_TCG_LOG
+        | cbmem_ids::CBMEM_ID_TPM2_TCG_LOG => {
+            let format_name = match id {
+                cbmem_ids::CBMEM_ID_TPM_CB_LOG => "coreboot-specific",
+                cbmem_ids::CBMEM_ID_TCPA_TCG_LOG => "TCG 1.2 (SHA1)",
+                cbmem_ids::CBMEM_ID_TPM2_TCG_LOG => "TCG 2.0 (crypto-agile)",
+                _ => "unknown",
+            };
+            let used_size = match id {
+                cbmem_ids::CBMEM_ID_TCPA_TCG_LOG | cbmem_ids::CBMEM_ID_TPM2_TCG_LOG => {
+                    match compute_cbmem_tpm_log_used_size(address, entry_size, id) {
+                        Some(size) => size,
+                        None => {
+                            log::warn!(
+                                "Ignoring invalid {} TPM event log at {:#x} (allocation {} bytes)",
+                                format_name,
+                                address,
+                                entry_size
+                            );
+                            return;
+                        }
+                    }
+                }
+                _ => entry_size,
+            };
+
+            log::info!(
+                "TPM event log found: {} format at {:#x} ({} used of {} bytes)",
+                format_name,
+                address,
+                used_size,
+                entry_size,
+            );
+            // Prefer TCG 2.0 > TCG 1.2 > coreboot-specific.
+            // Only overwrite if no log found yet or if the new one is higher priority.
+            let should_replace = match info.tpm_log {
+                None => true,
+                Some(ref existing) => matches!(
+                    (existing.cbmem_id, id),
+                    (cbmem_ids::CBMEM_ID_TPM_CB_LOG, _)
+                        | (
+                            cbmem_ids::CBMEM_ID_TCPA_TCG_LOG,
+                            cbmem_ids::CBMEM_ID_TPM2_TCG_LOG,
+                        )
+                ),
+            };
+            if should_replace {
+                info.tpm_log = Some(TpmLogInfo {
+                    address,
+                    size: used_size,
+                    cbmem_id: id,
+                });
+            }
         }
         _ => {
             // Log other CBMEM entries at trace level for debugging
