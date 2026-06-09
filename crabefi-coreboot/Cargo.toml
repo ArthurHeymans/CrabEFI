@@ -25,7 +25,9 @@ zerocopy = { version = "0.8", default-features = false, features = ["derive"] }
 # ACPI table parsing and AML interpreter for platform device discovery.
 # Used by the coreboot payload to discover ECAM, GIC, UART, and DSDT
 # devices from ACPI tables before handing off to init_platform().
-acpi = { version = "6.1", default-features = false, features = [
+# Pin to upstream BankField/IndexField support; crates.io 6.1.1 has todo!()
+# paths that panic-abort while loading AML from real firmware.
+acpi = { git = "https://github.com/rust-osdev/acpi.git", rev = "6e0160255a2aeadd6bfb06743f6573cdf02dab5e", default-features = false, features = [
   "alloc",
   "aml",
 ] }
