@@ -5,8 +5,7 @@ version = 4
 [[package]]
 name = "acpi"
 version = "6.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b763acdc1d85c36d61acf97a59938f23202d0e8efe45e8759de10c02db242744"
+source = "git+https://github.com/rust-osdev/acpi.git?rev=6e0160255a2aeadd6bfb06743f6573cdf02dab5e#6e0160255a2aeadd6bfb06743f6573cdf02dab5e"
 dependencies = [
  "bit_field",
  "bitflags",
