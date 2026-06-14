@@ -46,6 +46,9 @@ const MAX_KERNEL_SIZE: usize = 64 * 1024 * 1024;
 /// Maximum initrd size we support (256 MB)
 const MAX_INITRD_SIZE: usize = 256 * 1024 * 1024;
 
+/// Linux initrd placement alignment.
+const INITRD_ALIGN: u64 = 2 * 1024 * 1024;
+
 /// Check if an address range is usable RAM according to the boot params memory map
 ///
 /// # Arguments
@@ -444,14 +447,13 @@ pub fn load_linux_from_disk(
             return Err(LinuxBootError::InitrdTooLarge);
         }
 
-        // Find a suitable address for the initrd
-        // Use a temporary buffer to read, then call load_initrd to find placement
-        // For simplicity, we'll place it at a fixed high address
-        // Real implementation would use boot_params memory map
-
-        // Place initrd at 0x10000000 (256 MB) - should be safe for most systems
-        // This is below the 4GB limit and should be identity-mapped
-        let initrd_load_addr = find_initrd_address(&boot_params, initrd_file_size as u64)?;
+        // Place the initrd in usable RAM above the loaded kernel, respecting
+        // the kernel-provided initrd_addr_max limit.
+        let min_initrd_addr = DEFAULT_KERNEL_ADDR
+            .checked_add(pm_kernel_size as u64)
+            .ok_or(LinuxBootError::MemoryError)?;
+        let initrd_load_addr =
+            find_initrd_address(&boot_params, initrd_file_size as u64, min_initrd_addr)?;
 
         log::info!("Loading initrd to {:#x}", initrd_load_addr);
 
@@ -510,7 +512,11 @@ pub fn load_linux_from_disk(
 ///
 /// Searches the memory map for a RAM region that can hold the initrd,
 /// preferring high addresses (below initrd_addr_max).
-fn find_initrd_address(boot_params: &BootParams, size: u64) -> Result<u64, LinuxBootError> {
+fn find_initrd_address(
+    boot_params: &BootParams,
+    size: u64,
+    min_addr: u64,
+) -> Result<u64, LinuxBootError> {
     if size == 0 {
         return Err(LinuxBootError::MemoryError);
     }
@@ -548,32 +554,33 @@ fn find_initrd_address(boot_params: &BootParams, size: u64) -> Result<u64, Linux
             continue;
         }
 
-        // Skip regions that are too small
-        if entry.size < size {
-            continue;
-        }
-
-        // Skip low memory (need to be above kernel)
-        if entry.addr < 0x1000000 {
-            // 16 MB
-            continue;
-        }
-
-        // Calculate highest address in this region that fits.
+        // Calculate the usable portion of this region. Coreboot commonly
+        // reports the main RAM range as starting at 1 MiB, so do not reject a
+        // whole region just because its base is below the kernel/initrd floor.
+        // Instead, clamp the start upward and use the high part of the range.
         // Treat malformed wrapping E820 regions as unusable.
         let Some(region_end) = entry.addr.checked_add(entry.size) else {
             continue;
         };
-        let Some(mut potential_addr) = region_end.checked_sub(size) else {
+
+        let usable_start = entry.addr.max(min_addr);
+        let usable_end = region_end.min(max_exclusive);
+
+        let Some(required_end) = usable_start.checked_add(size) else {
             continue;
         };
+        if required_end > usable_end {
+            continue;
+        }
 
-        // Clamp to max, then align downward to 2MB boundary
+        // Calculate the highest aligned address in this clipped region that
+        // can hold the whole initrd.
+        let mut potential_addr = usable_end - size;
         potential_addr = potential_addr.min(max_start);
-        potential_addr &= !((2u64 << 20) - 1);
+        potential_addr &= !(INITRD_ALIGN - 1);
 
         // Must still be within the region
-        if potential_addr < entry.addr {
+        if potential_addr < usable_start {
             continue;
         }
 
@@ -582,11 +589,62 @@ fn find_initrd_address(boot_params: &BootParams, size: u64) -> Result<u64, Linux
     }
 
     let addr = best_addr.ok_or_else(|| {
-        log::error!("No suitable RAM region found for initrd ({} bytes)", size);
+        log::error!(
+            "No suitable RAM region found for initrd ({} bytes, min_addr={:#x}, max_addr={:#x})",
+            size,
+            min_addr,
+            initrd_addr_max
+        );
         LinuxBootError::MemoryError
     })?;
 
     log::debug!("Selected initrd address: {:#x}", addr);
 
     Ok(addr)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::platform::MemoryType;
+
+    fn boot_params_with_regions(regions: &[MemoryRegion]) -> BootParams {
+        let mut boot_params = BootParams::new();
+        boot_params.set_memory_map(regions);
+        boot_params
+    }
+
+    #[test]
+    fn initrd_uses_high_part_of_ram_region_starting_below_kernel() {
+        let regions = [MemoryRegion {
+            base: 0x0010_0000,
+            size: 0x1ff0_0000,
+            region_type: MemoryType::Ram,
+        }];
+        let boot_params = boot_params_with_regions(&regions);
+        let initrd_size = 43_000_445;
+        let min_addr = DEFAULT_KERNEL_ADDR + 13_824_512;
+
+        let addr = find_initrd_address(&boot_params, initrd_size, min_addr)
+            .expect("main RAM region should fit initrd above kernel");
+
+        assert_eq!(addr & (INITRD_ALIGN - 1), 0);
+        assert!(addr >= min_addr);
+        assert!(addr + initrd_size <= regions[0].base + regions[0].size);
+    }
+
+    #[test]
+    fn initrd_does_not_overlap_loaded_kernel() {
+        let regions = [MemoryRegion {
+            base: 0x0010_0000,
+            size: 0x02f0_0000,
+            region_type: MemoryType::Ram,
+        }];
+        let boot_params = boot_params_with_regions(&regions);
+        let min_addr = 0x01e0_0000;
+
+        let result = find_initrd_address(&boot_params, 43_000_445, min_addr);
+
+        assert!(matches!(result, Err(LinuxBootError::MemoryError)));
+    }
 }
