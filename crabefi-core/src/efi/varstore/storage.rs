@@ -179,6 +179,38 @@ impl SpiStorageBackend {
     pub fn set_mapped_read_base(&mut self, phys_base: u64) {
         self.mapped_read_base = Some(phys_base);
     }
+
+    /// Return whether reads normally use a CPU-visible flash mapping.
+    pub fn has_mapped_read_base(&self) -> bool {
+        self.mapped_read_base.is_some()
+    }
+
+    /// Read from the underlying SPI controller, bypassing any mapped-read window.
+    ///
+    /// This is useful after programming flash: a CPU-visible mapping can be
+    /// stale, cached, or incorrectly resolved, while the controller path reads
+    /// the same address space used for writes.
+    pub fn read_controller(&mut self, offset: u32, buffer: &mut [u8]) -> Result<()> {
+        use crate::drivers::spi::SpiController;
+
+        if offset as u64 + buffer.len() as u64 > self.storage_size as u64 {
+            return Err(StorageError::InvalidArgument);
+        }
+
+        let flash_addr = self
+            .base_offset
+            .checked_add(offset)
+            .ok_or(StorageError::InvalidArgument)?;
+
+        self.controller.read(flash_addr, buffer).map_err(|e| {
+            log::warn!("SPI controller read failed at {:#x}: {:?}", flash_addr, e);
+            match e {
+                crate::drivers::spi::SpiError::InvalidArgument => StorageError::InvalidArgument,
+                crate::drivers::spi::SpiError::Timeout => StorageError::Timeout,
+                _ => StorageError::IoError,
+            }
+        })
+    }
 }
 
 fn read_mapped_flash(phys_base: u64, offset: u32, buffer: &mut [u8]) -> Result<()> {

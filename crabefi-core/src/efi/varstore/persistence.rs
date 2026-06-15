@@ -480,22 +480,42 @@ pub(super) fn write_variable_to_storage_internal(
     let record = edk2::build_variable_record(&guid_bytes, name, attributes, data);
     let record_len = record.len() as u32;
 
-    let vs = state::varstore();
     let storage_size =
         state::with_storage_mut(|s| s.size()).ok_or(VarStoreError::NotInitialized)?;
 
-    if vs.write_offset + record_len > storage_size {
+    let mut write_offset = state::varstore().write_offset;
+    if write_offset + record_len > storage_size {
         log::info!("Variable store full, triggering compaction");
         compact_varstore()?;
+        write_offset = state::varstore().write_offset;
     }
 
-    let vs = state::varstore();
-    if vs.write_offset + record_len > storage_size {
+    if write_offset + record_len > storage_size {
         log::error!("Variable store still full after compaction");
         return Err(VarStoreError::StoreFull);
     }
 
-    let write_offset = vs.write_offset;
+    if !is_erased_for_write(write_offset, record_len)? {
+        log::warn!(
+            "Variable store append area at {:#x} is not erased; compacting before write",
+            write_offset
+        );
+        compact_varstore()?;
+        write_offset = state::varstore().write_offset;
+    }
+
+    if write_offset + record_len > storage_size {
+        log::error!("Variable store full after compaction");
+        return Err(VarStoreError::StoreFull);
+    }
+
+    if !is_erased_for_write(write_offset, record_len)? {
+        log::error!(
+            "Variable store append area at {:#x} is still not erased after compaction",
+            write_offset
+        );
+        return Err(VarStoreError::SpiError);
+    }
 
     // Write the new record using multi-stage protocol
     let new_offset = state::with_storage_mut(|storage| {
@@ -516,12 +536,113 @@ pub(super) fn write_variable_to_storage_internal(
     .ok_or(VarStoreError::NotInitialized)?
     .ok_or(VarStoreError::SpiError)?;
 
+    let mut expected_record = record;
+    if let Some(state) = expected_record.get_mut(2) {
+        *state = edk2::VAR_ADDED;
+    }
+    verify_written_record(write_offset, &expected_record)?;
+
     state::with_varstore_mut(|vs| {
         vs.write_offset = new_offset;
     });
 
-    log::debug!("Variable persisted at offset {:#x}", write_offset);
+    log::debug!(
+        "Variable persisted at offset {:#x}: {}",
+        write_offset,
+        variable_name_for_log(name).as_str()
+    );
     Ok(())
+}
+
+/// Check that a flash range is erased before programming it.
+fn is_erased_for_write(offset: u32, len: u32) -> Result<bool, VarStoreError> {
+    const CHUNK_SIZE: usize = 256;
+
+    state::with_storage_mut(|storage| {
+        let mut remaining = len as usize;
+        let mut current = offset;
+        let mut buffer = [0u8; CHUNK_SIZE];
+
+        while remaining > 0 {
+            let chunk_len = remaining.min(CHUNK_SIZE);
+            storage
+                .read_controller(current, &mut buffer[..chunk_len])
+                .map_err(|_| VarStoreError::SpiError)?;
+
+            if buffer[..chunk_len].iter().any(|&byte| byte != 0xFF) {
+                return Ok(false);
+            }
+
+            remaining -= chunk_len;
+            current += chunk_len as u32;
+        }
+
+        Ok::<bool, VarStoreError>(true)
+    })
+    .ok_or(VarStoreError::NotInitialized)?
+}
+
+/// Verify that a just-written record is readable through the SPI controller.
+fn verify_written_record(offset: u32, expected: &[u8]) -> Result<(), VarStoreError> {
+    state::with_storage_mut(|storage| {
+        let mut controller_bytes = Vec::new();
+        controller_bytes.resize(expected.len(), 0);
+        storage
+            .read_controller(offset, &mut controller_bytes)
+            .map_err(|_| VarStoreError::SpiError)?;
+
+        if controller_bytes.as_slice() != expected {
+            log_record_mismatch("controller", offset, expected, &controller_bytes);
+            return Err(VarStoreError::SpiError);
+        }
+
+        if storage.has_mapped_read_base() {
+            let mut mapped_bytes = Vec::new();
+            mapped_bytes.resize(expected.len(), 0);
+            match storage.read(offset, &mut mapped_bytes) {
+                Ok(()) if mapped_bytes.as_slice() != expected => {
+                    log_record_mismatch("mapped", offset, expected, &mapped_bytes);
+                    log::warn!(
+                        "Variable store mapped readback differs from controller readback; \
+                         subsequent reads may use stale or incorrectly resolved mapped flash"
+                    );
+                }
+                Ok(()) => {}
+                Err(e) => log::warn!("Variable store mapped readback failed: {:?}", e),
+            }
+        }
+
+        Ok::<(), VarStoreError>(())
+    })
+    .ok_or(VarStoreError::NotInitialized)??;
+
+    Ok(())
+}
+
+fn log_record_mismatch(kind: &str, offset: u32, expected: &[u8], actual: &[u8]) {
+    let mismatch = expected
+        .iter()
+        .zip(actual.iter())
+        .position(|(expected, actual)| expected != actual)
+        .unwrap_or(0);
+    let expected_byte = expected.get(mismatch).copied().unwrap_or(0);
+    let actual_byte = actual.get(mismatch).copied().unwrap_or(0);
+
+    log::error!(
+        "Variable store {} readback mismatch at offset {:#x}+{:#x}: expected {:#04x}, got {:#04x}",
+        kind,
+        offset,
+        mismatch,
+        expected_byte,
+        actual_byte
+    );
+}
+
+fn variable_name_for_log(name: &[u16]) -> alloc::string::String {
+    name.iter()
+        .take_while(|&&ch| ch != 0)
+        .map(|&ch| char::from_u32(ch as u32).unwrap_or('?'))
+        .collect()
 }
 
 /// Delete a variable from storage by marking its record as deleted
