@@ -609,6 +609,8 @@ pub extern "C" fn rust_main(coreboot_table_ptr: u64) -> ! {
     #[cfg(target_arch = "x86_64")]
     let entry_counter = crabefi::time::read_counter();
 
+    let mut cbmem_output = cbmem_console::CbmemConsole::new();
+
     // ================================================================
     // Phase 1: Initialize firmware state (needed for all state access)
     // ================================================================
@@ -644,9 +646,7 @@ pub extern "C" fn rust_main(coreboot_table_ptr: u64) -> ! {
     // (efi::varstore::persistence.rs) and must be set before
     // init_platform() runs init_persistence_and_boot().
 
-    if let Some(cbmem_addr) = cb_info.cbmem_console {
-        cbmem_console::init(cbmem_addr);
-    }
+    let cbmem_console_available = cb_info.cbmem_console.is_some_and(cbmem_console::init);
 
     #[cfg(target_arch = "x86_64")]
     let timestamp_recorder = cb_info.timestamps.and_then(|table_addr| {
@@ -696,6 +696,23 @@ pub extern "C" fn rust_main(coreboot_table_ptr: u64) -> ! {
             regwidth: serial.regwidth,
             input_hertz: serial.input_hertz,
         });
+    }
+
+    if cbmem_console_available {
+        let debug_output: &mut dyn crabefi::DebugOutput = &mut cbmem_output;
+        // SAFETY: `rust_main()` never returns, so `cbmem_output` remains alive
+        // for the entire firmware lifetime. The CBMEM module disables itself
+        // before runtime when the physical-only buffer is no longer safe.
+        let raw = unsafe {
+            core::mem::transmute::<&mut dyn crabefi::DebugOutput, *mut dyn crabefi::DebugOutput>(
+                debug_output,
+            )
+        };
+        // SAFETY: `raw` points to `cbmem_output`, whose stack frame never
+        // unwinds because this entry point is `-> !`.
+        unsafe {
+            crabefi::drivers::serial::add_platform_debug_sink_raw(raw);
+        }
     }
 
     // Initialize logging (idempotent — init_platform() will call it again).

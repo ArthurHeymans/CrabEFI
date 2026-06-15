@@ -427,6 +427,16 @@ pub(crate) struct PlatformSerial {
 }
 
 impl PlatformSerial {
+    /// Create a platform serial adapter from a raw `DebugOutput` pointer.
+    ///
+    /// # Safety
+    ///
+    /// `inner` must point to a valid debug output object that lives for the
+    /// entire firmware lifetime.
+    unsafe fn new(inner: *mut dyn crate::platform::DebugOutput) -> Self {
+        Self { inner }
+    }
+
     /// Write a single byte to the platform debug output.
     fn write_byte(&mut self, byte: u8) {
         // SAFETY: Single-threaded firmware. Pointer is valid for firmware lifetime.
@@ -464,6 +474,57 @@ pub(crate) enum AnySerial {
     Pl011(Pl011Port),
     /// Platform-provided debug output (used by `init_platform()` path).
     Platform(PlatformSerial),
+}
+
+impl AnySerial {
+    /// Write a string to the active serial backend.
+    fn write_str(&mut self, s: &str) -> fmt::Result {
+        match self {
+            Self::Uart16550(serial) => serial.write_str(s),
+            #[cfg(target_arch = "aarch64")]
+            Self::Pl011(serial) => serial.write_str(s),
+            Self::Platform(serial) => serial.write_str(s),
+        }
+    }
+
+    /// Write one byte to the active serial backend.
+    fn write_byte(&mut self, byte: u8) {
+        match self {
+            Self::Uart16550(serial) => serial.write_byte(byte),
+            #[cfg(target_arch = "aarch64")]
+            Self::Pl011(serial) => serial.write_byte(byte),
+            Self::Platform(serial) => serial.write_byte(byte),
+        }
+    }
+
+    /// Check whether the active serial backend has pending input.
+    fn has_input(&self) -> bool {
+        match self {
+            Self::Uart16550(serial) => serial.can_receive(),
+            #[cfg(target_arch = "aarch64")]
+            Self::Pl011(serial) => serial.can_receive(),
+            Self::Platform(serial) => serial.has_input(),
+        }
+    }
+
+    /// Try to read one byte from the active serial backend.
+    fn try_read_byte(&mut self) -> Option<u8> {
+        match self {
+            Self::Uart16550(serial) => serial.try_read_byte(),
+            #[cfg(target_arch = "aarch64")]
+            Self::Pl011(serial) => serial.try_read_byte(),
+            Self::Platform(serial) => serial.try_read_byte(),
+        }
+    }
+}
+
+struct SerialFormatter;
+
+impl Write for SerialFormatter {
+    fn write_str(&mut self, s: &str) -> fmt::Result {
+        write_str(s);
+        Ok(())
+    }
 }
 
 // ============================================================================
@@ -570,7 +631,8 @@ pub fn init_from_config(info: &SerialConfig) {
 /// `raw` must point to a valid `DebugOutput` that lives for the entire
 /// firmware lifetime (i.e., at least until `init_platform()` returns).
 pub unsafe fn init_from_platform_raw(raw: *mut dyn crate::platform::DebugOutput) {
-    let plat = PlatformSerial { inner: raw };
+    // SAFETY: The caller guarantees `raw` lives for the firmware lifetime.
+    let plat = unsafe { PlatformSerial::new(raw) };
     // SAFETY: Single-threaded firmware; raw pointer avoids re-entrancy
     // issues since serial is called from log macros inside other state closures.
     unsafe {
@@ -578,93 +640,75 @@ pub unsafe fn init_from_platform_raw(raw: *mut dyn crate::platform::DebugOutput)
     }
 }
 
-/// Write a string to the serial port
+/// Add a platform-provided mirror for all serial/console output.
+///
+/// Unlike [`init_from_platform_raw()`], this does not replace the active UART.
+/// It tees every subsequent byte/string written through the serial subsystem to
+/// `raw` as well as to the primary serial driver. Platform payloads use this for
+/// firmware memory consoles such as coreboot's CBMEM console.
+///
+/// # Safety
+///
+/// `raw` must point to a valid `DebugOutput` that lives for the entire firmware
+/// lifetime (i.e., at least until `init_platform()` returns).
+pub unsafe fn add_platform_debug_sink_raw(raw: *mut dyn crate::platform::DebugOutput) {
+    // SAFETY: The caller guarantees `raw` lives for the firmware lifetime.
+    let sink = unsafe { PlatformSerial::new(raw) };
+    // SAFETY: Single-threaded firmware; raw pointer avoids re-entrancy
+    // issues since serial is called from log macros inside other state closures.
+    unsafe {
+        (*crate::state::drivers_mut_ptr()).serial.debug_sink = Some(sink);
+    }
+}
+
+/// Write a string to the serial port and optional debug mirror.
 pub fn write_str(s: &str) {
     // SAFETY: Single-threaded firmware; raw pointer avoids re-entrancy
     // issues since serial is called from log macros inside other state closures.
-    let driver = unsafe { &mut (*crate::state::drivers_mut_ptr()).serial.driver };
-    if let Some(serial) = driver {
-        match serial {
-            AnySerial::Uart16550(uart) => {
-                let _ = uart.write_str(s);
-            }
-            #[cfg(target_arch = "aarch64")]
-            AnySerial::Pl011(pl011) => {
-                let _ = pl011.write_str(s);
-            }
-            AnySerial::Platform(plat) => {
-                let _ = plat.write_str(s);
-            }
-        }
+    let serial_state = unsafe { &mut (*crate::state::drivers_mut_ptr()).serial };
+    if let Some(serial) = &mut serial_state.driver {
+        let _ = serial.write_str(s);
+    }
+    if let Some(sink) = &mut serial_state.debug_sink {
+        let _ = sink.write_str(s);
     }
 }
 
-/// Write formatted output to the serial port
+/// Write formatted output to the serial port and optional debug mirror.
 pub fn write_fmt(args: fmt::Arguments) {
-    // SAFETY: Single-threaded firmware; raw pointer avoids re-entrancy
-    // issues since serial is called from log macros inside other state closures.
-    let driver = unsafe { &mut (*crate::state::drivers_mut_ptr()).serial.driver };
-    if let Some(serial) = driver {
-        match serial {
-            AnySerial::Uart16550(uart) => {
-                let _ = uart.write_fmt(args);
-            }
-            #[cfg(target_arch = "aarch64")]
-            AnySerial::Pl011(pl011) => {
-                let _ = pl011.write_fmt(args);
-            }
-            AnySerial::Platform(plat) => {
-                let _ = plat.write_fmt(args);
-            }
-        }
-    }
+    let _ = SerialFormatter.write_fmt(args);
 }
 
-/// Write a single byte to the serial port
+/// Write a single byte to the serial port and optional debug mirror.
 pub fn write_byte(byte: u8) {
     // SAFETY: Single-threaded firmware; raw pointer avoids re-entrancy
     // issues since serial is called from log macros inside other state closures.
-    let driver = unsafe { &mut (*crate::state::drivers_mut_ptr()).serial.driver };
-    if let Some(serial) = driver {
-        match serial {
-            AnySerial::Uart16550(uart) => uart.write_byte(byte),
-            #[cfg(target_arch = "aarch64")]
-            AnySerial::Pl011(pl011) => pl011.write_byte(byte),
-            AnySerial::Platform(plat) => plat.write_byte(byte),
-        }
+    let serial_state = unsafe { &mut (*crate::state::drivers_mut_ptr()).serial };
+    if let Some(serial) = &mut serial_state.driver {
+        serial.write_byte(byte);
+    }
+    if let Some(sink) = &mut serial_state.debug_sink {
+        sink.write_byte(byte);
     }
 }
 
-/// Check if there is input available on the serial port
+/// Check if there is input available on the serial port.
 pub fn has_input() -> bool {
-    // Read-only check -- use immutable access (no raw pointer needed).
-    if let Some(serial) = &crate::state::drivers().serial.driver {
-        match serial {
-            AnySerial::Uart16550(uart) => uart.can_receive(),
-            #[cfg(target_arch = "aarch64")]
-            AnySerial::Pl011(pl011) => pl011.can_receive(),
-            AnySerial::Platform(plat) => plat.has_input(),
-        }
-    } else {
-        false
-    }
+    // Read-only check -- use immutable access (no raw pointer needed). The debug
+    // mirror is output-only, so it is intentionally ignored for input.
+    crate::state::drivers()
+        .serial
+        .driver
+        .as_ref()
+        .is_some_and(AnySerial::has_input)
 }
 
-/// Try to read a byte from the serial port (non-blocking)
+/// Try to read a byte from the serial port (non-blocking).
 pub fn try_read() -> Option<u8> {
     // SAFETY: Single-threaded firmware; raw pointer avoids re-entrancy
     // issues since serial is called from log macros inside other state closures.
     let driver = unsafe { &mut (*crate::state::drivers_mut_ptr()).serial.driver };
-    if let Some(serial) = driver {
-        match serial {
-            AnySerial::Uart16550(uart) => uart.try_read_byte(),
-            #[cfg(target_arch = "aarch64")]
-            AnySerial::Pl011(pl011) => pl011.try_read_byte(),
-            AnySerial::Platform(plat) => plat.try_read_byte(),
-        }
-    } else {
-        None
-    }
+    driver.as_mut().and_then(AnySerial::try_read_byte)
 }
 
 /// Macro for printing to serial
