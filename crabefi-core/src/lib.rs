@@ -135,6 +135,8 @@ fn init_persistence_and_boot(
                 }
             }
 
+            logger::apply_persisted_level();
+
             match efi::auth::boot::init_secure_boot_default() {
                 Ok(status) => {
                     log::info!(
