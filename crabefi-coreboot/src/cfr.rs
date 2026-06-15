@@ -355,11 +355,27 @@ pub fn get_cfr() -> Option<&'static CfrInfo> {
 // CRC32 computation (matching coreboot's CRC32 used in lb_cfr.checksum)
 // ============================================================================
 
-/// Compute CRC32 matching coreboot's crc_byte implementation.
-/// This is the standard CRC-32 (ISO 3309, ITU-T V.42, Ethernet, PKZIP, etc.)
+/// Compute CRC32 matching coreboot's `crc32_byte` implementation.
+///
+/// Coreboot's CFR checksum is not the UEFI/IEEE reflected CRC32 used for EFI
+/// table headers. It starts from zero, shifts MSB-first with polynomial
+/// `0x04c11db7`, and does not apply a final XOR.
 fn compute_crc32(data: &[u8]) -> u32 {
-    // Use the same CRC32 as the rest of CrabEFI
-    crabefi::efi::boot_services::compute_crc32(data)
+    let mut crc = 0u32;
+
+    for &byte in data {
+        crc ^= (byte as u32) << 24;
+
+        for _ in 0..8 {
+            if (crc & 0x8000_0000) != 0 {
+                crc = (crc << 1) ^ 0x04c1_1db7;
+            } else {
+                crc <<= 1;
+            }
+        }
+    }
+
+    crc
 }
 
 // ============================================================================
