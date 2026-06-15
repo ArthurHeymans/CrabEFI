@@ -1063,7 +1063,15 @@ pub fn write_option_value(option: &CfrOption, value: &CfrValue) -> Result<(), &'
             e
         );
         "Failed to persist CFR variable"
-    })
+    })?;
+
+    // `persist_variable()` writes the EDK2/SMMSTORE backend but does not update
+    // CrabEFI's in-memory variable cache. Keep the cache in sync so reopening
+    // the firmware-settings menu during this same payload run shows the saved
+    // values instead of the values loaded when the payload started.
+    varstore::update_variable_in_memory(&COREBOOT_CFR_GUID, &name, attrs, &data);
+
+    Ok(())
 }
 
 /// Delete a CFR option from storage (revert to default)
@@ -1079,5 +1087,23 @@ pub fn delete_option_value(option: &CfrOption) -> Result<(), &'static str> {
             e
         );
         "Failed to delete CFR variable"
-    })
+    })?;
+
+    delete_option_from_memory(&name);
+
+    Ok(())
+}
+
+fn delete_option_from_memory(name: &[u16]) {
+    use crabefi::state;
+
+    state::with_efi_mut(|efi| {
+        if let Some(var) = efi.variables.iter_mut().find(|var| {
+            var.in_use
+                && var.vendor_guid == COREBOOT_CFR_GUID
+                && crabefi::efi::utils::ucs2_eq(&var.name, name)
+        }) {
+            var.in_use = false;
+        }
+    });
 }
