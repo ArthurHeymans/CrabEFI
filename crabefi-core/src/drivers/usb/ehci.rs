@@ -1174,10 +1174,6 @@ impl EhciController {
             return Err(UsbError::Timeout);
         }
         self.async_schedule_enabled = true;
-        log::debug!(
-            "EHCI: Async schedule enabled, ASS={}",
-            self.op().usbsts.is_set(USBSTS::ASS)
-        );
 
         // Wait for transfer completion
         let timeout = Timeout::from_ms(5000);
