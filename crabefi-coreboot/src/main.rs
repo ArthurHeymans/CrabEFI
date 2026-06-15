@@ -713,6 +713,7 @@ pub extern "C" fn rust_main(coreboot_table_ptr: u64) -> ! {
 
     // Initialize logging (idempotent — init_platform() will call it again).
     crabefi::logger::init();
+    apply_early_log_level(&cb_info);
 
     if let Some(fb) = cb_info.framebuffer {
         crabefi::logger::set_framebuffer(crabefi::FramebufferConfig::from(fb));
@@ -922,6 +923,36 @@ pub extern "C" fn rust_main(coreboot_table_ptr: u64) -> ! {
 // ============================================================================
 // Logging helpers
 // ============================================================================
+
+/// Apply CrabEFI's persisted log level before normal platform initialization.
+///
+/// Keep this path read-only and silent: at this point the heap, SPI drivers, and
+/// full EFI variable services are not initialized yet. Coreboot-specific code is
+/// limited to discovering the memory-mapped SMMSTORE region; parsing the EDK2
+/// variable-store format is handled by the generic CrabEFI logger helper.
+fn apply_early_log_level(cb_info: &tables::CorebootInfo) {
+    let Some(smmstore) = cb_info.smmstorev2 else {
+        return;
+    };
+
+    let Some(size) = smmstore
+        .num_blocks
+        .checked_mul(smmstore.block_size)
+        .map(usize::try_from)
+        .and_then(Result::ok)
+    else {
+        return;
+    };
+
+    if size == 0 || smmstore.mmap_addr == 0 {
+        return;
+    }
+
+    // SAFETY: coreboot reports SMMSTORE as a memory-mapped region. We only read
+    // the bounded region while still in identity-mapped physical mode.
+    let region = unsafe { core::slice::from_raw_parts(smmstore.mmap_addr as *const u8, size) };
+    let _ = crabefi::logger::apply_from_edk2_varstore_region(region);
+}
 
 fn log_coreboot_info(cb_info: &tables::CorebootInfo) {
     log::info!("Parsed coreboot tables:");

@@ -318,6 +318,228 @@ pub struct FvVariable {
     pub state_offset: u32,
 }
 
+/// Read one variable's data from an EDK2-compatible variable-store region.
+///
+/// This helper is intentionally allocation-free and silent so platforms can use
+/// it during early boot before the heap and normal logging policy are ready.
+/// If multiple active records match, the last one wins.
+///
+/// # Arguments
+/// * `region` - Full EDK2 FV variable-store region bytes.
+/// * `guid_bytes` - EFI variable GUID in mixed-endian UEFI byte order.
+/// * `name` - UTF-16 variable name, with or without a trailing NUL.
+/// * `data_out` - Buffer that receives the variable data.
+///
+/// # Returns
+/// The number of bytes copied into `data_out`, or `None` if the store is
+/// invalid, the variable was not found, or the output buffer is too small.
+pub fn read_variable_data_from_region(
+    region: &[u8],
+    guid_bytes: &[u8; 16],
+    name: &[u16],
+    data_out: &mut [u8],
+) -> Option<usize> {
+    if region.len() > u32::MAX as usize {
+        return None;
+    }
+
+    let validation = validate_fv_silent(region, region.len() as u32)?;
+    let mut read_fn = |offset: u32, buf: &mut [u8]| -> bool {
+        let offset = offset as usize;
+        let Some(end) = offset.checked_add(buf.len()) else {
+            return false;
+        };
+        let Some(src) = region.get(offset..end) else {
+            return false;
+        };
+        buf.copy_from_slice(src);
+        true
+    };
+
+    read_variable_data(
+        &mut read_fn,
+        validation.auth_format,
+        validation.data_size,
+        guid_bytes,
+        name,
+        data_out,
+    )
+}
+
+fn validate_fv_silent(header_bytes: &[u8], region_size: u32) -> Option<FvValidation> {
+    if header_bytes.len() < FV_HEADER_LENGTH + VS_HEADER_LENGTH {
+        return None;
+    }
+
+    let sig = u32::from_le_bytes([
+        header_bytes[0x28],
+        header_bytes[0x29],
+        header_bytes[0x2A],
+        header_bytes[0x2B],
+    ]);
+    if sig != FV_SIGNATURE || header_bytes[0x37] != FV_REVISION {
+        return None;
+    }
+
+    if header_bytes[0x10..0x20] != EFI_SYSTEM_NV_DATA_FV_GUID {
+        return None;
+    }
+
+    let header_length = u16::from_le_bytes([header_bytes[0x30], header_bytes[0x31]]) as usize;
+    if header_length > header_bytes.len()
+        || header_length < 0x38
+        || !header_length.is_multiple_of(2)
+    {
+        return None;
+    }
+
+    let mut checksum: u16 = 0;
+    for i in (0..header_length).step_by(2) {
+        let lo = header_bytes[i] as u16;
+        let hi = header_bytes[i + 1] as u16;
+        checksum = checksum.wrapping_add(lo | (hi << 8));
+    }
+    if checksum != 0 {
+        return None;
+    }
+
+    let vs = &header_bytes[FV_HEADER_LENGTH..];
+    let auth_format = if vs[..16] == EFI_VARIABLE_GUID {
+        false
+    } else if vs[..16] == EFI_AUTH_VARIABLE_GUID {
+        true
+    } else {
+        return None;
+    };
+
+    if vs[0x14] != VARIABLE_STORE_FORMATTED || vs[0x15] != VARIABLE_STORE_HEALTHY {
+        return None;
+    }
+
+    let data_size = u32::from_le_bytes([vs[0x10], vs[0x11], vs[0x12], vs[0x13]]);
+    if data_size > region_size - FV_HEADER_LENGTH as u32 {
+        return None;
+    }
+
+    Some(FvValidation {
+        valid: true,
+        auth_format,
+        data_size,
+    })
+}
+
+fn read_variable_data<F>(
+    read_fn: &mut F,
+    auth_format: bool,
+    data_area_size: u32,
+    guid_bytes: &[u8; 16],
+    name: &[u16],
+    data_out: &mut [u8],
+) -> Option<usize>
+where
+    F: FnMut(u32, &mut [u8]) -> bool,
+{
+    let hdr_size = if auth_format {
+        AUTH_VAR_HEADER_SIZE
+    } else {
+        VAR_HEADER_SIZE
+    } as u32;
+
+    let target_name_len = name
+        .iter()
+        .position(|&ch| ch == 0)
+        .map(|len| len + 1)
+        .unwrap_or(name.len());
+    if target_name_len == 0 {
+        return None;
+    }
+
+    let mut found_len = None;
+    let mut offset = VARIABLE_DATA_OFFSET;
+    let end = VARIABLE_DATA_OFFSET + data_area_size;
+    let mut hdr_buf = [0u8; AUTH_VAR_HEADER_SIZE];
+
+    while offset + hdr_size <= end {
+        let hdr = &mut hdr_buf[..hdr_size as usize];
+        if !read_fn(offset, hdr) {
+            break;
+        }
+
+        let start_id = u16::from_le_bytes([hdr[0], hdr[1]]);
+        let state = hdr[2];
+        if start_id != VARIABLE_DATA || state == 0xFF {
+            break;
+        }
+
+        let (name_size, data_size, guid_offset) = if auth_format {
+            let attributes = u32::from_le_bytes([hdr[0x04], hdr[0x05], hdr[0x06], hdr[0x07]]);
+            let name_size = u32::from_le_bytes([hdr[0x24], hdr[0x25], hdr[0x26], hdr[0x27]]);
+            let data_size = u32::from_le_bytes([hdr[0x28], hdr[0x29], hdr[0x2A], hdr[0x2B]]);
+            if attributes == 0xFFFF_FFFF || name_size == 0xFFFF_FFFF || data_size == 0xFFFF_FFFF {
+                break;
+            }
+            (name_size, data_size, 0x2Cusize)
+        } else {
+            let attributes = u32::from_le_bytes([hdr[0x04], hdr[0x05], hdr[0x06], hdr[0x07]]);
+            let name_size = u32::from_le_bytes([hdr[0x08], hdr[0x09], hdr[0x0A], hdr[0x0B]]);
+            let data_size = u32::from_le_bytes([hdr[0x0C], hdr[0x0D], hdr[0x0E], hdr[0x0F]]);
+            if attributes == 0xFFFF_FFFF || name_size == 0xFFFF_FFFF || data_size == 0xFFFF_FFFF {
+                break;
+            }
+            (name_size, data_size, 0x10usize)
+        };
+
+        let name_offset = offset + hdr_size;
+        let data_offset = name_offset.checked_add(name_size)?;
+        let next_offset = offset.checked_add(align_up(
+            hdr_size.checked_add(name_size)?.checked_add(data_size)?,
+            HEADER_ALIGNMENT,
+        ))?;
+        if data_offset.checked_add(data_size)? > end || next_offset > end + hdr_size {
+            break;
+        }
+
+        if state == VAR_ADDED
+            && hdr[guid_offset..guid_offset + 16] == *guid_bytes
+            && name_size == (target_name_len * 2) as u32
+            && variable_name_matches(read_fn, name_offset, name, target_name_len)
+        {
+            if data_size as usize > data_out.len() {
+                return None;
+            }
+            if !read_fn(data_offset, &mut data_out[..data_size as usize]) {
+                return None;
+            }
+            found_len = Some(data_size as usize);
+        }
+
+        offset = next_offset;
+    }
+
+    found_len
+}
+
+fn variable_name_matches<F>(
+    read_fn: &mut F,
+    name_offset: u32,
+    name: &[u16],
+    target_name_len: usize,
+) -> bool
+where
+    F: FnMut(u32, &mut [u8]) -> bool,
+{
+    let mut buf = [0u8; 2];
+    for (idx, &expected) in name.iter().take(target_name_len).enumerate() {
+        if !read_fn(name_offset + (idx * 2) as u32, &mut buf) {
+            return false;
+        }
+        if u16::from_le_bytes(buf) != expected {
+            return false;
+        }
+    }
+    true
+}
+
 /// Walk all variable records in the FV data area.
 ///
 /// `read_fn` reads bytes from the storage region at the given offset.
