@@ -609,7 +609,7 @@ impl Default for EfiState {
 
 use crate::drivers::pci::PciDevice;
 use crate::drivers::pci::access::AnyPciAccess;
-use crate::drivers::serial::AnySerial;
+use crate::drivers::serial::{AnySerial, PlatformSerial};
 use crate::drivers::storage::StorageRegistry;
 use crate::efi::protocols::serial_io::SerialIoMode;
 use crate::platform::FramebufferConfig;
@@ -735,6 +735,8 @@ impl Default for PciState {
 pub struct SerialState {
     /// Active serial port driver (16550 UART, PL011, or platform-provided primary output).
     pub(crate) driver: Option<AnySerial>,
+    /// Optional mirror for debug output such as a firmware memory console.
+    pub(crate) debug_sink: Option<PlatformSerial>,
     /// EFI Serial IO protocol mode (current port settings).
     ///
     /// The Protocol.mode pointer is set to point here during init.
@@ -751,6 +753,7 @@ impl SerialState {
 
         Self {
             driver: None,
+            debug_sink: None,
             io_mode: SerialIoMode {
                 control_mask: EFI_SERIAL_CLEAR_TO_SEND
                     | EFI_SERIAL_DATA_SET_READY
