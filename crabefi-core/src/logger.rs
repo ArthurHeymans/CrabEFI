@@ -215,6 +215,32 @@ pub fn apply_persisted_level() {
     }
 }
 
+/// Apply the persisted log level from an EDK2-compatible variable-store region.
+///
+/// This is a read-only, allocation-free early-boot helper. Platforms that can
+/// already see an EDK2 variable store as a byte slice may use it before the
+/// full variable backend is initialized. Platform-specific discovery remains in
+/// the platform crate; this helper only understands the generic EDK2 variable
+/// store format.
+pub fn apply_from_edk2_varstore_region(region: &[u8]) -> bool {
+    let mut data = [0u8; 1];
+    let Some(data_len) = crate::efi::varstore::edk2::read_variable_data_from_region(
+        region,
+        CRABEFI_SETTINGS_GUID.as_bytes(),
+        LOG_LEVEL_VARIABLE_NAME,
+        &mut data,
+    ) else {
+        return false;
+    };
+
+    if let Some(level) = level_from_data(&data[..data_len]) {
+        set_level(level);
+        true
+    } else {
+        false
+    }
+}
+
 /// Apply a just-written log-level variable payload.
 pub fn apply_variable_write(data: &[u8]) {
     if crate::state::is_exit_boot_services_called() {
