@@ -1265,6 +1265,13 @@ fn set_variable_full(
     }
 
     let final_data_size = final_data_vec.len();
+    if final_data_size > 0
+        && crate::logger::is_log_level_variable(&guid, name_vec.as_slice())
+        && crate::logger::level_from_data(final_data_vec.as_slice()).is_none()
+    {
+        return Status::INVALID_PARAMETER;
+    }
+
     let secure_boot_var = auth::identify_key_database(name_vec.as_slice(), &guid);
 
     let (status, persist_action, secure_boot_action) = state::with_efi_mut(|efi| {
@@ -1496,6 +1503,14 @@ fn set_variable_full(
                     }
                 }
             }
+        }
+    }
+
+    if crate::logger::is_log_level_variable(&guid, name_vec.as_slice()) {
+        if final_data_size == 0 {
+            crate::logger::apply_variable_delete();
+        } else {
+            crate::logger::apply_variable_write(final_data_vec.as_slice());
         }
     }
 
