@@ -41,6 +41,7 @@ pub mod platform;
 pub mod secure_boot_menu;
 pub mod state;
 pub mod time;
+pub mod timestamp;
 #[cfg(feature = "ui")]
 pub mod ui;
 
@@ -52,8 +53,9 @@ pub use platform::{
     ConsoleInput, DebugOutput, DeferredBufferConfig, FirmwareInfo, FirmwareMmapWindow,
     FirmwareStorage, FirmwareStorageLocation, FirmwareStorageRegion, FmapRegion, FramebufferConfig,
     Key, KeyState, MemoryRegion, MemoryType, PlatformConfig, PlatformHooks, ResetHandler,
-    ResetType, Rng, RngError, RuntimeRegion, StorageBackend, StorageError, Timer, VarBackendError,
-    VariableBackend, VariableStoreLocator, VariableStoreRegion, VariableVisitor,
+    ResetType, Rng, RngError, RuntimeRegion, StorageBackend, StorageError, Timer,
+    TimestampRecorder, VarBackendError, VariableBackend, VariableStoreLocator, VariableStoreRegion,
+    VariableVisitor,
 };
 
 /// Display a Secure Boot violation error on screen
@@ -148,6 +150,7 @@ fn init_persistence_and_boot(
     }
 
     efi::varstore::init_deferred_buffer();
+    timestamp::record(timestamp::TS_CRABEFI_VARSTORE_INIT);
 
     // ---- Boot manager ----
     let boot_var_state = boot_vars::read_boot_var_state();
@@ -191,6 +194,7 @@ fn init_persistence_and_boot(
 /// let config = crabefi::PlatformConfig {
 ///     memory_map: &memory_regions,
 ///     timer: &my_timer,
+///     timestamp_recorder: None,
 ///     reset: &my_reset,
 ///     block_devices: &mut [],
 ///     debug_output: Some(&mut my_uart),
@@ -327,9 +331,21 @@ fn init_platform_impl(mut config: PlatformConfig) -> ! {
             >(hooks)
         }
     });
+    let timestamp_recorder: Option<&'static dyn crate::platform::TimestampRecorder> =
+        config.timestamp_recorder.map(|recorder| {
+            // SAFETY: init_platform() is -> !, so platform recorder references
+            // live for the entire firmware lifetime.
+            unsafe {
+                core::mem::transmute::<
+                    &dyn crate::platform::TimestampRecorder,
+                    &'static dyn crate::platform::TimestampRecorder,
+                >(recorder)
+            }
+        });
     state::with_drivers_mut(|d| {
         d.platform.efi_fw_info = config.firmware_info;
         d.platform.hooks = hooks;
+        d.platform.timestamp_recorder = timestamp_recorder;
         d.platform.capsule_regions.clear();
         for region in config.capsule_regions {
             if d.platform.capsule_regions.push(*region).is_err() {
@@ -345,6 +361,7 @@ fn init_platform_impl(mut config: PlatformConfig) -> ! {
     // This works on any architecture (x86, aarch64, riscv64) without
     // architecture-specific hardware detection inside the library.
     time::init_from_platform(config.timer);
+    timestamp::record(timestamp::TS_CRABEFI_COUNTER_CALIBRATED);
 
     // Print memory summary
     let total_ram: u64 = config
@@ -365,6 +382,7 @@ fn init_platform_impl(mut config: PlatformConfig) -> ! {
     // allocator is idempotent: if the caller already bootstrapped it
     // (to get a heap before entry), re-initialization is skipped.
     efi::init_from_platform(&config);
+    timestamp::record(timestamp::TS_CRABEFI_EFI_INIT);
 
     // Initialize mouse cursor system (ui feature only).
     // Must come after efi::init_from_platform(), which stores the framebuffer
@@ -423,6 +441,7 @@ fn init_platform_impl(mut config: PlatformConfig) -> ! {
     }
 
     drivers::pci::init();
+    timestamp::record(timestamp::TS_CRABEFI_PCI_INIT);
 
     // ---- 13. Register deferred variable buffer if provided ----
     if let Some(buf) = config.deferred_buffer {

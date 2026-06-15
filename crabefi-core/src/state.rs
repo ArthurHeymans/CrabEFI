@@ -46,7 +46,7 @@
 //! Functions called from the `log` crate macros — serial output
 //! ([`crate::drivers::serial`]), platform log sinks, framebuffer logging
 //! ([`crate::fb_log`]), and the timestamp helper
-//! ([`crate::logger::get_timestamp_k`]) — must **never** create Rust
+//! ([`crate::logger::get_us_since_boot`]) — must **never** create Rust
 //! references (`&` or `&mut`) into `FirmwareState`.
 //!
 //! This is necessary because `log::info!()` and friends may fire *inside*
@@ -733,7 +733,7 @@ impl Default for PciState {
 
 /// Serial port state: hardware driver and EFI protocol mode.
 pub struct SerialState {
-    /// Active serial port driver (16550 UART or PL011)
+    /// Active serial port driver (16550 UART, PL011, or platform-provided primary output).
     pub(crate) driver: Option<AnySerial>,
     /// EFI Serial IO protocol mode (current port settings).
     ///
@@ -840,6 +840,9 @@ pub struct PlatformInfo {
 
     /// Optional platform lifecycle callbacks.
     pub hooks: Option<&'static dyn crate::platform::PlatformHooks>,
+
+    /// Optional firmware-visible boot timestamp recorder.
+    pub timestamp_recorder: Option<&'static dyn crate::platform::TimestampRecorder>,
 }
 
 impl PlatformInfo {
@@ -852,6 +855,7 @@ impl PlatformInfo {
             efi_fw_info: None,
             capsule_regions: HeaplessVec::new(),
             hooks: None,
+            timestamp_recorder: None,
         }
     }
 }

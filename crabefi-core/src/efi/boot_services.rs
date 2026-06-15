@@ -1516,6 +1516,7 @@ extern "efiapi" fn exit_boot_services(image_handle: Handle, map_key: usize) -> S
 
     if status == Status::SUCCESS {
         log::info!("ExitBootServices SUCCESS - transitioning to OS");
+        crate::timestamp::record(crate::timestamp::TS_CRABEFI_EXIT_BOOT_SERVICES);
 
         // Mark that ExitBootServices has been called
         // After this, SPI flash is locked and variable writes go to ESP file
