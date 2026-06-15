@@ -3,25 +3,29 @@
 //! This module provides logging via the `log` crate, outputting to the
 //! serial port and optionally the framebuffer.
 //!
+//! Log lines are prefixed with microseconds since boot. Before timer
+//! calibration, the platform's initial frequency estimate is used.
+//!
 //! Framebuffer logging is disabled by default as it is very slow.
 //! Enable with the `fb-log` feature flag.
 
 use crate::time::read_counter;
 use log::{Level, LevelFilter, Metadata, Record};
 
-/// Get relative counter ticks since boot (in thousands for readability)
+/// Get microseconds elapsed since boot.
 ///
 /// Uses raw-pointer read (see *Log-Path Contract* in [`crate::state`]) to
 /// avoid creating a `&DriverState` reference that would alias with a live
 /// `&mut` from `with_*_mut()` closures.
-pub fn get_timestamp_k() -> u64 {
+pub fn get_us_since_boot() -> u64 {
     let current = read_counter();
     // SAFETY: single-threaded firmware; field is written once at init,
-    // only read afterwards.  Raw pointer avoids aliasing with &mut held
+    // only read afterwards. Raw pointer avoids aliasing with &mut held
     // by with_*_mut() closures that may log.
     let boot = unsafe { (*crate::state::drivers_mut_ptr()).timing.boot_counter };
-    // Return delta in thousands (k-ticks) to keep numbers manageable
-    current.saturating_sub(boot) / 1000
+    let delta = current.saturating_sub(boot);
+    let freq = crate::time::counter_frequency().max(1);
+    ((delta as u128 * 1_000_000) / freq as u128) as u64
 }
 
 /// Combined serial + framebuffer logger
@@ -43,8 +47,8 @@ impl log::Log for CombinedLogger {
                 Level::Trace => "\x1b[35mTRACE\x1b[0m",
             };
 
-            // Get timestamp (k-ticks since boot)
-            let ts = get_timestamp_k();
+            // Get timestamp (microseconds since boot)
+            let ts = get_us_since_boot();
 
             // Output to serial with timestamp
             crate::serial_println!("[{:>10}] [{}] {}", ts, level_str_serial, record.args());

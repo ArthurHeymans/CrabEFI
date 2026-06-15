@@ -414,6 +414,8 @@ pub struct CorebootInfo {
     pub version: Option<&'static str>,
     /// CBMEM console address
     pub cbmem_console: Option<u64>,
+    /// Timestamp table address (from CB_TAG_TIMESTAMPS)
+    pub timestamps: Option<u64>,
     /// SMBIOS tables address (from CBMEM entry)
     pub smbios: Option<u64>,
     /// SMMSTORE v2 information for UEFI variable storage
@@ -444,6 +446,7 @@ impl CorebootInfo {
             acpi_rsdp: None,
             version: None,
             cbmem_console: None,
+            timestamps: None,
             smbios: None,
             smmstorev2: None,
             spi_flash: None,
@@ -660,6 +663,9 @@ fn parse_record(record_bytes: &[u8], info: &mut CorebootInfo) {
         }
         tags::CB_TAG_ACPI_RSDP => {
             parse_acpi_rsdp(record_bytes, info);
+        }
+        tags::CB_TAG_TIMESTAMPS => {
+            parse_timestamps(record_bytes, info);
         }
         tags::CB_TAG_CBMEM_CONSOLE => {
             parse_cbmem_console(record_bytes, info);
@@ -1030,6 +1036,21 @@ fn parse_cbmem_console(record_bytes: &[u8], info: &mut CorebootInfo) {
     info.cbmem_console = Some(cbmem_addr);
 
     log::debug!("CBMEM console: {:#x}", cbmem_addr);
+}
+
+/// Parse timestamp table reference.
+///
+/// The CB_TAG_TIMESTAMPS record is an `lb_cbmem_ref` that points to the
+/// coreboot timestamp table in CBMEM.
+fn parse_timestamps(record_bytes: &[u8], info: &mut CorebootInfo) {
+    let Ok((cbmem_ref, _)) = CbCbmemRef::read_from_prefix(record_bytes) else {
+        log::warn!("Failed to parse timestamps record");
+        return;
+    };
+    let cbmem_addr = cbmem_ref.cbmem_addr;
+    info.timestamps = Some(cbmem_addr);
+
+    log::debug!("Timestamp table: {:#x}", cbmem_addr);
 }
 
 /// Parse CBMEM entry record

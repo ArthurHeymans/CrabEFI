@@ -14,12 +14,14 @@ use crate::boot_vars;
 use crate::drivers;
 use crate::efi;
 use crate::menu;
+use crate::timestamp;
 
 /// Initialize storage subsystem (PCI drivers, USB keyboards, etc.)
 ///
 /// This is called once before the boot manager starts trying boot options.
 fn init_storage_subsystem() {
     log::info!("Initializing storage subsystem...");
+    timestamp::record(timestamp::TS_CRABEFI_STORAGE_INIT_START);
 
     // Print PCI devices (already initialized earlier for SPI detection)
     drivers::pci::print_devices();
@@ -44,6 +46,7 @@ fn init_storage_subsystem() {
     efi::protocols::pass_thru_init::init();
 
     log::info!("Storage subsystem initialized");
+    timestamp::record(timestamp::TS_CRABEFI_STORAGE_INIT_DONE);
 }
 
 /// Run the UEFI boot manager.

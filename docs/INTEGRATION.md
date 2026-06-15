@@ -17,6 +17,7 @@ fn firmware_main() -> ! {
     let config = crabefi::PlatformConfig {
         memory_map: &MY_MEMORY_MAP,
         timer: &timer,
+        timestamp_recorder: None,
         reset: &MyReset,
         block_devices: &mut [&mut emmc as &mut dyn crabefi::BlockDevice],
         variable_backend: None,       // direct VariableBackend routing is not wired yet

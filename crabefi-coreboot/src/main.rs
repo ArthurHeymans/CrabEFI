@@ -21,6 +21,8 @@ mod fmap;
 mod framebuffer;
 mod memory;
 mod tables;
+#[cfg(target_arch = "x86_64")]
+mod timestamps;
 
 use core::panic::PanicInfo;
 #[cfg(target_arch = "riscv64")]
@@ -513,6 +515,7 @@ fn riscv_fdt_only_boot(fdt_ptr: u64, fdt_size: u32) -> ! {
     let config = crabefi::PlatformConfig {
         memory_map: &memory_regions[..region_count],
         timer: &timer,
+        timestamp_recorder: None,
         reset: &reset,
         block_devices: &mut [],
         variable_backend: None,
@@ -603,6 +606,9 @@ fn build_memory_map_from_fdt(
 ///   (passed in RDI on x86_64, X0 on aarch64).
 #[unsafe(no_mangle)]
 pub extern "C" fn rust_main(coreboot_table_ptr: u64) -> ! {
+    #[cfg(target_arch = "x86_64")]
+    let entry_counter = crabefi::time::read_counter();
+
     // ================================================================
     // Phase 1: Initialize firmware state (needed for all state access)
     // ================================================================
@@ -641,6 +647,14 @@ pub extern "C" fn rust_main(coreboot_table_ptr: u64) -> ! {
     if let Some(cbmem_addr) = cb_info.cbmem_console {
         cbmem_console::init(cbmem_addr);
     }
+
+    #[cfg(target_arch = "x86_64")]
+    let timestamp_recorder = cb_info.timestamps.and_then(|table_addr| {
+        let recorder = timestamps::CorebootTimestampRecorder::new(table_addr)?;
+        recorder.record_counter(crabefi::timestamp::TS_CRABEFI_START, entry_counter);
+        recorder.record_now(crabefi::timestamp::TS_CRABEFI_TABLES_PARSED);
+        Some(recorder)
+    });
 
     if let Some(fb) = cb_info.framebuffer {
         crabefi::state::store_framebuffer(crabefi::FramebufferConfig::from(fb));
@@ -722,6 +736,12 @@ pub extern "C" fn rust_main(coreboot_table_ptr: u64) -> ! {
     let reset = CorebootReset;
     let hooks = CorebootHooks;
     let variable_store_locator = CorebootVariableStoreLocator::new(&cb_info);
+    #[cfg(target_arch = "x86_64")]
+    let timestamp_recorder_ref = timestamp_recorder
+        .as_ref()
+        .map(|recorder| recorder as &dyn crabefi::TimestampRecorder);
+    #[cfg(not(target_arch = "x86_64"))]
+    let timestamp_recorder_ref: Option<&dyn crabefi::TimestampRecorder> = None;
 
     // Extract FDT bytes slice.
     //
@@ -771,6 +791,7 @@ pub extern "C" fn rust_main(coreboot_table_ptr: u64) -> ! {
     let mut config = crabefi::PlatformConfig {
         memory_map: &memory_regions[..region_count],
         timer: &timer,
+        timestamp_recorder: timestamp_recorder_ref,
         reset: &reset,
         block_devices: &mut [],
         variable_backend: None,
@@ -916,6 +937,9 @@ fn log_coreboot_info(cb_info: &tables::CorebootInfo) {
     }
     if let Some(cbmem_console) = cb_info.cbmem_console {
         log::info!("  CBMEM console: {:#x}", cbmem_console);
+    }
+    if let Some(timestamps) = cb_info.timestamps {
+        log::info!("  Timestamp table: {:#x}", timestamps);
     }
     if let Some(ref smmstore) = cb_info.smmstorev2 {
         log::info!(

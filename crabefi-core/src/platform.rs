@@ -36,6 +36,7 @@
 //! let config = crabefi::PlatformConfig {
 //!     memory_map: &my_memory_map,
 //!     timer: &my_timer,
+//!     timestamp_recorder: None,
 //!     reset: &my_reset_handler,
 //!     block_devices: &mut [&mut my_emmc],
 //!     variable_backend: None, // direct VariableBackend routing is not wired yet
@@ -874,6 +875,22 @@ pub trait Timer {
 }
 
 // ============================================================================
+// Boot Timestamp Recording
+// ============================================================================
+
+/// Platform boot timestamp sink.
+///
+/// CrabEFI records well-known boot milestones through this trait. Platforms
+/// that have a firmware-visible timestamp log (for example coreboot's CBMEM
+/// timestamp table) can implement this trait and pass it in
+/// [`PlatformConfig::timestamp_recorder`]. Platforms without such a facility
+/// can leave the field as `None`; timestamp recording then becomes a no-op.
+pub trait TimestampRecorder {
+    /// Record the current platform timestamp for `id`.
+    fn record(&self, id: u32);
+}
+
+// ============================================================================
 // Reset
 // ============================================================================
 
@@ -1329,6 +1346,9 @@ pub struct PlatformConfig<'a> {
 
     /// Monotonic timer for `Stall()` and EFI timer events.
     pub timer: &'a dyn Timer,
+
+    /// Optional firmware-visible boot timestamp recorder.
+    pub timestamp_recorder: Option<&'a dyn TimestampRecorder>,
 
     /// System reset handler for `ResetSystem` runtime service.
     pub reset: &'a dyn ResetHandler,
