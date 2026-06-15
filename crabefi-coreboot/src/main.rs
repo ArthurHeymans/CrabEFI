@@ -83,16 +83,12 @@ impl crabefi::PlatformHooks for CorebootHooks {
     }
 
     fn firmware_settings_available(&self) -> bool {
-        cfr::get_cfr().is_some()
+        true
     }
 
     fn show_firmware_settings(&self) -> bool {
-        if cfr::get_cfr().is_some() {
-            cfr_menu::show_cfr_menu();
-            true
-        } else {
-            false
-        }
+        cfr_menu::show_cfr_menu();
+        true
     }
 }
 
