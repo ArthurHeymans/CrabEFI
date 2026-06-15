@@ -89,7 +89,6 @@ fn check_smccc_trng() -> bool {
             out("x1") _,
             out("x2") _,
             out("x3") _,
-            options(nomem, nostack)
         );
     }
     // Version should be >= 1.0 (0x10000)
@@ -113,7 +112,6 @@ fn smccc_trng_rnd64() -> Option<u64> {
             val = out(reg) val,
             out("x1") _,
             out("x2") _,
-            options(nomem, nostack)
         );
     }
     // SUCCESS = 0

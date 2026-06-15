@@ -66,7 +66,6 @@ pub fn sbi_call(eid: u64, fid: u64, a0: u64, a1: u64, a2: u64) -> SbiRet {
             in("a2") a2,
             in("a6") fid,
             in("a7") eid,
-            options(nostack)
         );
     }
     SbiRet { error, value }

@@ -481,39 +481,11 @@ impl VariableEntry {
     }
 }
 
-/// Variable store persistence state
+/// Variable store persistence state.
 ///
-/// Tracks the runtime state of the persistent variable store region.
-/// The actual storage location is determined at runtime from coreboot
-/// tables (SMMSTORE v2) or FMAP (SMMSTORE region).
-#[derive(Clone, Copy)]
-pub struct VarStoreState {
-    /// Whether the store header has been validated/written
-    pub initialized: bool,
-    /// Next free location for appending records (relative to store start)
-    pub write_offset: u32,
-    /// Whether the EDK2 FV uses authenticated variable headers (60 bytes vs 32)
-    pub auth_format: bool,
-    /// Size of the variable data area (after FV + VS headers)
-    pub data_size: u32,
-}
-
-impl VarStoreState {
-    pub const fn new() -> Self {
-        Self {
-            initialized: false,
-            write_offset: 0,
-            auth_format: false,
-            data_size: 0,
-        }
-    }
-}
-
-impl Default for VarStoreState {
-    fn default() -> Self {
-        Self::new()
-    }
-}
+/// This is the shared EDK2 FV state used by both the global persistence path
+/// and the platform [`crate::platform::VariableBackend`] adapter path.
+pub type VarStoreState = crate::efi::varstore::Edk2StoreState;
 
 /// EFI subsystem state
 pub struct EfiState {

@@ -46,11 +46,12 @@ pub mod edk2_backend;
 pub mod persistence;
 pub mod storage;
 
-// Re-export storage types
-pub use storage::{SpiStorageBackend, StorageBackend, StorageError};
+// Re-export storage types used with Edk2VarStore.
+pub use crate::platform::{StorageBackend, StorageError};
+pub use storage::SpiStorageBackend;
 
 // Re-export the EDK2 variable backend for use by platforms with raw flash
-pub use edk2_backend::Edk2VarStore;
+pub use edk2_backend::{Edk2Store, Edk2StoreState, Edk2VarStore};
 
 use alloc::vec::Vec;
 use serde::{Deserialize, Serialize};

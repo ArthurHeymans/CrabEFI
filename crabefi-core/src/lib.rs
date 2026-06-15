@@ -117,6 +117,7 @@ fn init_persistence_and_boot(
     variable_store_locator: Option<&dyn platform::VariableStoreLocator>,
 ) -> ! {
     // ---- Variable persistence ----
+    let mut clear_deferred_buffer = false;
     match efi::varstore::init_persistence(variable_store_locator) {
         Ok(()) => {
             log::info!("Variable store persistence initialized");
@@ -128,9 +129,14 @@ fn init_persistence_and_boot(
                     pending_count
                 );
                 match efi::varstore::process_deferred_pending() {
-                    Ok(n) => log::info!("Applied {} deferred variable writes", n),
+                    Ok(n) => {
+                        log::info!("Applied {} deferred variable writes", n);
+                        clear_deferred_buffer = true;
+                    }
                     Err(e) => log::warn!("Failed to process deferred writes: {:?}", e),
                 }
+            } else {
+                clear_deferred_buffer = true;
             }
 
             match efi::auth::boot::init_secure_boot_default() {
@@ -144,10 +150,19 @@ fn init_persistence_and_boot(
                 Err(e) => log::warn!("Secure Boot init failed: {:?}", e),
             }
         }
-        Err(e) => log::info!("Variable persistence not available: {:?}", e),
+        Err(e) => {
+            log::info!("Variable persistence not available: {:?}", e);
+            if efi::varstore::check_deferred_pending() == 0 {
+                clear_deferred_buffer = true;
+            } else {
+                log::warn!("Preserving pending deferred variable writes");
+            }
+        }
     }
 
-    efi::varstore::init_deferred_buffer();
+    if clear_deferred_buffer {
+        efi::varstore::init_deferred_buffer();
+    }
 
     // ---- Boot manager ----
     let boot_var_state = boot_vars::read_boot_var_state();

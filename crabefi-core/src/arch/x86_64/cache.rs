@@ -39,17 +39,19 @@ pub fn flush_cache_range(addr: u64, size: usize) {
     fence(Ordering::SeqCst);
 }
 
-/// Invalidate a memory range in CPU cache
+/// Synchronize before reading a DMA-written memory range.
 ///
-/// This ensures the CPU sees data written by DMA-capable devices.
-/// On x86, CLFLUSH both writes back and invalidates, so we use the same
-/// instruction as flush_cache_range.
+/// x86 cache coherency makes device writes visible to CPU loads without an
+/// explicit invalidation instruction. Do not use `CLFLUSH` here: it is a
+/// write-back invalidate operation, so polling code can race a device DMA
+/// update and write an older CPU cache line back over the device's completion
+/// status. A full fence is sufficient to order subsequent descriptor reads.
 ///
 /// # Arguments
 ///
-/// * `addr` - Starting address of the memory range
-/// * `size` - Size of the memory range in bytes
+/// * `_addr` - Starting address of the memory range
+/// * `_size` - Size of the memory range in bytes
 #[inline]
-pub fn invalidate_cache_range(addr: u64, size: usize) {
-    flush_cache_range(addr, size);
+pub fn invalidate_cache_range(_addr: u64, _size: usize) {
+    fence(Ordering::SeqCst);
 }

@@ -178,7 +178,7 @@ impl PciDevice {
     /// Get the MMIO base address for the device (typically BAR0)
     pub fn mmio_base(&self) -> Option<u64> {
         for bar in &self.bars {
-            if matches!(bar.bar_type, BarType::Memory32 | BarType::Memory64) {
+            if matches!(bar.bar_type, BarType::Memory32 | BarType::Memory64) && bar.address != 0 {
                 return Some(bar.address);
             }
         }
@@ -190,7 +190,7 @@ impl PciDevice {
     /// This is used by controllers like UHCI that use I/O ports instead of MMIO.
     pub fn io_base(&self) -> Option<u64> {
         for bar in &self.bars {
-            if bar.bar_type == BarType::Io {
+            if bar.bar_type == BarType::Io && bar.address != 0 {
                 return Some(bar.address);
             }
         }
@@ -224,7 +224,7 @@ fn probe_bar(access: &AnyPciAccess, addr: PciAddress, bar_index: usize) -> PciBa
     let original = access.read32(addr, bar_offset);
 
     // Empty BAR
-    if original == 0 {
+    if original == 0 || original == 0xFFFF_FFFF {
         return PciBar::default();
     }
 
