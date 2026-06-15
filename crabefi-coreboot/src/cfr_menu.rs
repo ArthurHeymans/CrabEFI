@@ -32,6 +32,12 @@ const HELP_TEXT: &str =
 enum MenuItem {
     /// Form header (category separator)
     FormHeader { name: String },
+    /// CrabEFI-owned log-level setting.
+    CrabLogLevel {
+        current_level: log::LevelFilter,
+        /// Snapshot of the value when the menu was opened, used to detect changes.
+        original_level: log::LevelFilter,
+    },
     /// Editable option
     Option {
         form_idx: usize,
@@ -56,6 +62,12 @@ fn has_changes(items: &[MenuItem]) -> bool {
                 original_value,
                 ..
             } if current_value != original_value
+        ) || matches!(
+            item,
+            MenuItem::CrabLogLevel {
+                current_level,
+                original_level,
+            } if current_level != original_level
         )
     })
 }
@@ -65,11 +77,12 @@ fn has_changes(items: &[MenuItem]) -> bool {
 /// Displays the menu and handles user interaction.
 /// Returns when the user exits the menu.
 pub fn show_cfr_menu() {
+    let empty_cfr;
     let cfr_info = match cfr::get_cfr() {
         Some(cfr) => cfr,
         None => {
-            show_no_cfr_message();
-            return;
+            empty_cfr = CfrInfo::new();
+            &empty_cfr
         }
     };
 
@@ -123,22 +136,7 @@ pub fn show_cfr_menu() {
                         break;
                     }
                     KeyPress::Enter | KeyPress::Char(' ') => {
-                        // Check visibility/editability before taking a mutable borrow
-                        let can_edit = if let Some(
-                            item @ MenuItem::Option {
-                                form_idx,
-                                option_idx,
-                                ..
-                            },
-                        ) = items.get(selected)
-                        {
-                            is_item_visible(cfr_info, &items, item)
-                                && get_option(cfr_info, *form_idx, *option_idx)
-                                    .is_some_and(|o| o.is_editable())
-                        } else {
-                            false
-                        };
-                        if can_edit {
+                        if can_edit_item(cfr_info, &items, selected) {
                             if let Some(MenuItem::Option {
                                 form_idx,
                                 option_idx,
@@ -150,8 +148,10 @@ pub fn show_cfr_menu() {
                                 if let Some(option) = get_option(cfr_info, fi, oi) {
                                     toggle_value(option, current_value);
                                 }
+                            } else {
+                                increment_option(cfr_info, &mut items, selected);
                             }
-                        } else if matches!(items.get(selected), Some(MenuItem::Option { .. })) {
+                        } else if is_selectable_item(items.get(selected)) {
                             status_message = Some(("Option is read-only", false));
                         }
                         break;
@@ -180,6 +180,9 @@ pub fn show_cfr_menu() {
                             && let Some(option) = get_option(cfr_info, *form_idx, *option_idx)
                         {
                             show_help(option, &mut fb_console);
+                        } else if matches!(items.get(selected), Some(MenuItem::CrabLogLevel { .. }))
+                        {
+                            status_message = Some(("Controls CrabEFI serial log verbosity", true));
                         }
                         break;
                     }
@@ -198,6 +201,15 @@ pub fn show_cfr_menu() {
 /// toggling a "parent" option immediately shows or hides dependent items.
 fn build_menu_items(cfr: &CfrInfo) -> Vec<MenuItem> {
     let mut items = Vec::new();
+
+    let mut crabefi_name = String::new();
+    crabefi_name.push_str("CrabEFI");
+    items.push(MenuItem::FormHeader { name: crabefi_name });
+    let current_level = crabefi::logger::configured_level();
+    items.push(MenuItem::CrabLogLevel {
+        current_level,
+        original_level: current_level,
+    });
 
     for (form_idx, form) in cfr.forms.iter().enumerate() {
         if !form.is_visible() {
@@ -323,6 +335,7 @@ fn is_item_visible(cfr: &CfrInfo, items: &[MenuItem], item: &MenuItem) -> bool {
                 .is_none_or(|opt| is_dep_met_live(cfr, items, opt.dependency_id, &opt.dep_values));
             form_ok && opt_ok
         }
+        MenuItem::CrabLogLevel { .. } => true,
         // Comments and subform headers don't carry their own indices, so
         // they stay visible (their parent form header hides the section).
         MenuItem::Comment { .. } | MenuItem::SubformHeader { .. } => true,
@@ -370,11 +383,22 @@ fn find_next_selectable(cfr: &CfrInfo, items: &[MenuItem], current: usize) -> us
 }
 
 fn is_selectable(item: &MenuItem) -> bool {
-    matches!(item, MenuItem::Option { .. })
+    matches!(
+        item,
+        MenuItem::Option { .. } | MenuItem::CrabLogLevel { .. }
+    )
+}
+
+fn is_selectable_item(item: Option<&MenuItem>) -> bool {
+    item.is_some_and(is_selectable)
 }
 
 /// Check if the item at `index` is an editable, visible option (immutable borrow).
 fn can_edit_item(cfr: &CfrInfo, items: &[MenuItem], index: usize) -> bool {
+    if matches!(items.get(index), Some(MenuItem::CrabLogLevel { .. })) {
+        return true;
+    }
+
     if let Some(
         item @ MenuItem::Option {
             form_idx,
@@ -436,6 +460,14 @@ fn increment_option(cfr: &CfrInfo, items: &mut [MenuItem], index: usize) -> bool
     if !can_edit_item(cfr, items, index) {
         return false;
     }
+
+    if let Some(MenuItem::CrabLogLevel { current_level, .. }) = items.get_mut(index) {
+        let current_idx = crabefi::logger::level_index(*current_level);
+        let next_idx = (current_idx + 1) % crabefi::logger::LEVEL_CHOICES.len();
+        *current_level = crabefi::logger::LEVEL_CHOICES[next_idx];
+        return true;
+    }
+
     let Some(MenuItem::Option {
         form_idx,
         option_idx,
@@ -490,6 +522,18 @@ fn decrement_option(cfr: &CfrInfo, items: &mut [MenuItem], index: usize) -> bool
     if !can_edit_item(cfr, items, index) {
         return false;
     }
+
+    if let Some(MenuItem::CrabLogLevel { current_level, .. }) = items.get_mut(index) {
+        let current_idx = crabefi::logger::level_index(*current_level);
+        let prev_idx = if current_idx == 0 {
+            crabefi::logger::LEVEL_CHOICES.len().saturating_sub(1)
+        } else {
+            current_idx - 1
+        };
+        *current_level = crabefi::logger::LEVEL_CHOICES[prev_idx];
+        return true;
+    }
+
     let Some(MenuItem::Option {
         form_idx,
         option_idx,
@@ -549,22 +593,35 @@ fn save_all_changes(cfr: &CfrInfo, items: &[MenuItem]) -> (usize, usize) {
     let mut saved = 0usize;
     let mut failed = 0usize;
     for item in items {
-        if let MenuItem::Option {
-            form_idx,
-            option_idx,
-            current_value,
-            original_value,
-        } = item
-            && current_value != original_value
-            && let Some(option) = get_option(cfr, *form_idx, *option_idx)
-        {
-            match cfr::write_option_value(option, current_value) {
-                Ok(()) => saved += 1,
-                Err(e) => {
-                    log::warn!("Failed to save '{}': {}", option.opt_name, e);
+        match item {
+            MenuItem::CrabLogLevel {
+                current_level,
+                original_level,
+            } if current_level != original_level => {
+                if crabefi::logger::set_configured_level(*current_level).is_ok() {
+                    saved += 1;
+                } else {
+                    log::warn!("Failed to save CrabEFI log level");
                     failed += 1;
                 }
             }
+            MenuItem::Option {
+                form_idx,
+                option_idx,
+                current_value,
+                original_value,
+            } if current_value != original_value => {
+                if let Some(option) = get_option(cfr, *form_idx, *option_idx) {
+                    match cfr::write_option_value(option, current_value) {
+                        Ok(()) => saved += 1,
+                        Err(e) => {
+                            log::warn!("Failed to save '{}': {}", option.opt_name, e);
+                            failed += 1;
+                        }
+                    }
+                }
+            }
+            _ => {}
         }
     }
     (saved, failed)
@@ -678,39 +735,6 @@ fn show_help(option: &CfrOption, fb_console: &mut Option<FramebufferConsole>) {
         }
 
         console.write_centered(rows - 3, "Press any key to continue...");
-    }
-
-    loop {
-        if menu_common::read_key().is_some() {
-            break;
-        }
-        delay_ms(10);
-    }
-}
-
-/// Show message that CFR is not available
-fn show_no_cfr_message() {
-    let fb_info = crabefi::state::get_framebuffer();
-    let mut fb_console = fb_info.as_ref().map(FramebufferConsole::new);
-
-    serial_driver::write_str("\r\n");
-    serial_driver::write_str("\x1b[1;33m");
-    serial_driver::write_str("  Firmware settings not available\r\n");
-    serial_driver::write_str("\x1b[0m");
-    serial_driver::write_str("  This firmware does not expose CFR configuration options.\r\n");
-    serial_driver::write_str("\r\n  Press any key to continue...\r\n");
-
-    if let Some(console) = &mut fb_console {
-        console.clear();
-        let rows = console.rows();
-        console.set_fg_color(Color::new(255, 255, 0));
-        console.write_centered(rows / 2 - 1, "Firmware settings not available");
-        console.reset_colors();
-        console.write_centered(
-            rows / 2 + 1,
-            "This firmware does not expose CFR configuration options.",
-        );
-        console.write_centered(rows / 2 + 3, "Press any key to continue...");
     }
 
     loop {
@@ -844,6 +868,9 @@ fn draw_item(
                 draw_option_item(option, current_value, is_selected, row, fb_console, cols);
             }
         }
+        MenuItem::CrabLogLevel { current_level, .. } => {
+            draw_log_level_item(*current_level, is_selected, row, fb_console, cols);
+        }
         MenuItem::Comment { text } => {
             draw_comment(text, row, fb_console);
         }
@@ -885,6 +912,62 @@ fn draw_subform_header(name: &str, row: usize, fb_console: &mut Option<Framebuff
         console.set_fg_color(Color::new(192, 0, 192)); // Magenta
         let _ = console.write_str("     ");
         let _ = console.write_str(name);
+        clear_line_remainder(console);
+        console.reset_colors();
+    }
+}
+
+/// Draw the CrabEFI log-level item.
+fn draw_log_level_item(
+    level: log::LevelFilter,
+    is_selected: bool,
+    row: usize,
+    fb_console: &mut Option<FramebufferConsole>,
+    cols: usize,
+) {
+    let name = "CrabEFI log level";
+    let mut value_str = String::new();
+    value_str.push('[');
+    value_str.push_str(crabefi::logger::level_name(level));
+    value_str.push(']');
+
+    let ansi_row = row + 1;
+    let _ = write!(SerialWriter, "\x1b[{};1H", ansi_row);
+
+    if is_selected {
+        serial_driver::write_str("\x1b[7m");
+    }
+
+    serial_driver::write_str("   ");
+    serial_driver::write_str(name);
+
+    let name_len = name.len();
+    let pad_to = 40.min(cols.saturating_sub(value_str.len() + 5));
+    for _ in name_len + 3..pad_to {
+        serial_driver::write_str(" ");
+    }
+    serial_driver::write_str(&value_str);
+    serial_driver::write_str("\x1b[0m\x1b[K\r\n");
+
+    if let Some(console) = fb_console {
+        console.set_position(0, row as u32);
+
+        if is_selected {
+            console.set_colors(HIGHLIGHT_FG, HIGHLIGHT_BG);
+        } else {
+            console.set_colors(DEFAULT_FG, DEFAULT_BG);
+        }
+
+        let _ = console.write_str("   ");
+        let _ = console.write_str(name);
+
+        let term_cols = console.cols() as usize;
+        let pad_to = 40.min(term_cols.saturating_sub(value_str.len() + 5));
+        for _ in name_len + 3..pad_to {
+            let _ = console.write_str(" ");
+        }
+        let _ = console.write_str(&value_str);
+
         clear_line_remainder(console);
         console.reset_colors();
     }

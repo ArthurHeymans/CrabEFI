@@ -61,8 +61,7 @@ pub const EFI_BOOT_PATH: &str = "EFI\\BOOT\\BOOTRISCV64.EFI";
 const MENU_TITLE: &str = "CrabEFI Boot Menu";
 
 /// Help text
-const HELP_TEXT: &str =
-    "Arrows: Select | Enter: Boot | F: Firmware | C: Cmdline | S: Secure Boot | R: Reset";
+const HELP_TEXT: &str = "Enter: Boot | F: Firmware | C: Cmdline | S: Secure Boot | R: Reset";
 
 /// Re-export storage device type for backward compatibility
 pub type DeviceType = StorageType;
