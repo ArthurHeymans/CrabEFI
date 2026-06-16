@@ -585,8 +585,7 @@ fn is_erased_for_write(offset: u32, len: u32) -> Result<bool, VarStoreError> {
 /// Verify that a just-written record is readable through the SPI controller.
 fn verify_written_record(offset: u32, expected: &[u8]) -> Result<(), VarStoreError> {
     state::with_storage_mut(|storage| {
-        let mut controller_bytes = Vec::new();
-        controller_bytes.resize(expected.len(), 0);
+        let mut controller_bytes = alloc::vec![0; expected.len()];
         storage
             .read_controller(offset, &mut controller_bytes)
             .map_err(|_| VarStoreError::SpiError)?;
@@ -597,8 +596,7 @@ fn verify_written_record(offset: u32, expected: &[u8]) -> Result<(), VarStoreErr
         }
 
         if storage.has_mapped_read_base() {
-            let mut mapped_bytes = Vec::new();
-            mapped_bytes.resize(expected.len(), 0);
+            let mut mapped_bytes = alloc::vec![0; expected.len()];
             match storage.read(offset, &mut mapped_bytes) {
                 Ok(()) if mapped_bytes.as_slice() != expected => {
                     log_record_mismatch("mapped", offset, expected, &mapped_bytes);
