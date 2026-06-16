@@ -327,7 +327,8 @@ pub struct FvVariable {
 /// # Arguments
 /// * `region` - Full EDK2 FV variable-store region bytes.
 /// * `guid_bytes` - EFI variable GUID in mixed-endian UEFI byte order.
-/// * `name` - UTF-16 variable name, with or without a trailing NUL.
+/// * `name` - UTF-16 variable name, with or without a trailing NUL. Stored
+///   EDK2 names are matched with their required trailing NUL.
 /// * `data_out` - Buffer that receives the variable data.
 ///
 /// # Returns
@@ -445,21 +446,25 @@ where
         VAR_HEADER_SIZE
     } as u32;
 
-    let target_name_len = name
-        .iter()
-        .position(|&ch| ch == 0)
-        .map(|len| len + 1)
-        .unwrap_or(name.len());
-    if target_name_len == 0 {
+    let target_name_chars = name.iter().position(|&ch| ch == 0).unwrap_or(name.len());
+    if target_name_chars == 0 {
         return None;
     }
+    let stored_name_size = target_name_chars
+        .checked_add(1)?
+        .checked_mul(2)
+        .and_then(|len| u32::try_from(len).ok())?;
 
     let mut found_len = None;
     let mut offset = VARIABLE_DATA_OFFSET;
-    let end = VARIABLE_DATA_OFFSET + data_area_size;
+    let end = VARIABLE_DATA_OFFSET.checked_add(data_area_size)?;
+    let end_with_header = end.checked_add(hdr_size)?;
     let mut hdr_buf = [0u8; AUTH_VAR_HEADER_SIZE];
 
-    while offset + hdr_size <= end {
+    while offset
+        .checked_add(hdr_size)
+        .is_some_and(|header_end| header_end <= end)
+    {
         let hdr = &mut hdr_buf[..hdr_size as usize];
         if !read_fn(offset, hdr) {
             break;
@@ -489,20 +494,18 @@ where
             (name_size, data_size, 0x10usize)
         };
 
-        let name_offset = offset + hdr_size;
+        let name_offset = offset.checked_add(hdr_size)?;
         let data_offset = name_offset.checked_add(name_size)?;
-        let next_offset = offset.checked_add(align_up(
-            hdr_size.checked_add(name_size)?.checked_add(data_size)?,
-            HEADER_ALIGNMENT,
-        ))?;
-        if data_offset.checked_add(data_size)? > end || next_offset > end + hdr_size {
+        let record_size = hdr_size.checked_add(name_size)?.checked_add(data_size)?;
+        let next_offset = offset.checked_add(checked_align_up(record_size, HEADER_ALIGNMENT)?)?;
+        if data_offset.checked_add(data_size)? > end || next_offset > end_with_header {
             break;
         }
 
         if state == VAR_ADDED
             && hdr[guid_offset..guid_offset + 16] == *guid_bytes
-            && name_size == (target_name_len * 2) as u32
-            && variable_name_matches(read_fn, name_offset, name, target_name_len)
+            && name_size == stored_name_size
+            && variable_name_matches(read_fn, name_offset, name, target_name_chars)
         {
             if data_size as usize > data_out.len() {
                 return None;
@@ -523,21 +526,41 @@ fn variable_name_matches<F>(
     read_fn: &mut F,
     name_offset: u32,
     name: &[u16],
-    target_name_len: usize,
+    target_name_chars: usize,
 ) -> bool
 where
     F: FnMut(u32, &mut [u8]) -> bool,
 {
     let mut buf = [0u8; 2];
-    for (idx, &expected) in name.iter().take(target_name_len).enumerate() {
-        if !read_fn(name_offset + (idx * 2) as u32, &mut buf) {
+    for (idx, &expected) in name.iter().take(target_name_chars).enumerate() {
+        let Some(offset) = idx
+            .checked_mul(2)
+            .and_then(|offset| u32::try_from(offset).ok())
+            .and_then(|offset| name_offset.checked_add(offset))
+        else {
+            return false;
+        };
+
+        if !read_fn(offset, &mut buf) {
             return false;
         }
         if u16::from_le_bytes(buf) != expected {
             return false;
         }
     }
-    true
+
+    let Some(terminator_offset) = target_name_chars
+        .checked_mul(2)
+        .and_then(|offset| u32::try_from(offset).ok())
+        .and_then(|offset| name_offset.checked_add(offset))
+    else {
+        return false;
+    };
+
+    if !read_fn(terminator_offset, &mut buf) {
+        return false;
+    }
+    u16::from_le_bytes(buf) == 0
 }
 
 /// Walk all variable records in the FV data area.
@@ -855,6 +878,13 @@ pub fn is_var_added(state: u8) -> bool {
 /// Align a value up to the given alignment (must be a power of 2).
 fn align_up(value: u32, alignment: u32) -> u32 {
     (value + alignment - 1) & !(alignment - 1)
+}
+
+/// Checked variant of [`align_up`] for parsing untrusted variable records.
+fn checked_align_up(value: u32, alignment: u32) -> Option<u32> {
+    value
+        .checked_add(alignment.checked_sub(1)?)
+        .map(|value| value & !(alignment - 1))
 }
 
 /// Convert an `r_efi::efi::Guid` to the 16-byte mixed-endian representation
