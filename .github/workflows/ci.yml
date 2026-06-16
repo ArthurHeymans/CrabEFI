@@ -24,6 +24,18 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all --check
 
+  coreboot-feature-tests:
+    name: Coreboot feature regression tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Run coreboot feature regression tests
+        run: ci/run-coreboot-feature-tests.sh
+
   # ── x86_64 ────────────────────────────────────────────────────────────
 
   clippy:
