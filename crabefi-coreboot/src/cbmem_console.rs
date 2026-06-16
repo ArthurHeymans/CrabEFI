@@ -8,8 +8,6 @@
 use core::fmt::{self, Write};
 use core::sync::atomic::{AtomicU64, Ordering};
 
-use zerocopy::{FromBytes, Immutable, KnownLayout, Unaligned};
-
 /// Mask for the cursor offset bits in coreboot's CBMEM console header.
 const CURSOR_MASK: u32 = (1 << 28) - 1;
 /// Cursor flag indicating that the ring buffer has wrapped.
@@ -21,7 +19,6 @@ const MAX_CONSOLE_SIZE: u32 = CURSOR_MASK;
 ///
 /// The actual console buffer follows immediately after this header.
 #[repr(C, packed)]
-#[derive(FromBytes, Immutable, KnownLayout, Unaligned)]
 struct CbmemConsoleHeader {
     /// Size of the console buffer, not including this header.
     size: u32,
@@ -57,6 +54,7 @@ impl Write for CbmemConsole {
     }
 }
 
+#[cfg(not(test))]
 impl crabefi::DebugOutput for CbmemConsole {
     fn write_byte(&mut self, byte: u8) {
         self.write_raw_byte(byte);
@@ -78,6 +76,7 @@ pub fn init(addr: u64) -> bool {
     match read_size(addr) {
         Some(size) if (1024..=MAX_CONSOLE_SIZE).contains(&size) => {
             CBMEM_CONSOLE_ADDR.store(addr, Ordering::Release);
+            #[cfg(not(test))]
             log::debug!(
                 "CBMEM console initialized: addr={:#x}, size={} bytes",
                 addr,
@@ -86,11 +85,14 @@ pub fn init(addr: u64) -> bool {
             true
         }
         Some(size) => {
+            #[cfg(not(test))]
             log::warn!(
                 "CBMEM console has invalid size: {} bytes at {:#x}",
                 size,
                 addr
             );
+            #[cfg(test)]
+            let _ = size;
             false
         }
         None => false,
@@ -183,5 +185,83 @@ fn write_bytes(mut bytes: &[u8]) {
             write_cursor(addr, cursor.wrapping_add(bytes.len() as u32));
             break;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::vec::Vec;
+
+    const TEST_CONSOLE_SIZE: usize = 1024;
+
+    fn console_storage(size: usize) -> Vec<u8> {
+        let mut storage = std::vec![0; core::mem::size_of::<CbmemConsoleHeader>() + size];
+        let addr = storage.as_mut_ptr() as u64;
+        let header = addr as *mut CbmemConsoleHeader;
+        // SAFETY: `storage` is large enough for the packed header.
+        unsafe {
+            core::ptr::addr_of_mut!((*header).size).write_unaligned(size as u32);
+            core::ptr::addr_of_mut!((*header).cursor).write_unaligned(0);
+        }
+        storage
+    }
+
+    fn console_body(storage: &[u8]) -> &[u8] {
+        &storage[core::mem::size_of::<CbmemConsoleHeader>()..]
+    }
+
+    #[test]
+    fn rejects_zero_and_tiny_console_buffers() {
+        disable();
+        assert!(!init(0));
+
+        let mut storage = console_storage(512);
+        assert!(!init(storage.as_mut_ptr() as u64));
+        assert_eq!(console_addr(), None);
+    }
+
+    #[test]
+    fn mirrors_newlines_as_crlf_and_advances_cursor() {
+        disable();
+        let mut storage = console_storage(TEST_CONSOLE_SIZE);
+        let addr = storage.as_mut_ptr() as u64;
+        assert!(init(addr));
+
+        let mut console = CbmemConsole::new();
+        console.write_str("A\nB").unwrap();
+
+        assert_eq!(&console_body(&storage)[..4], b"A\r\nB");
+        assert_eq!(read_cursor(addr), 4);
+    }
+
+    #[test]
+    fn wraps_ring_buffer_and_sets_overflow_flag() {
+        disable();
+        let mut storage = console_storage(TEST_CONSOLE_SIZE);
+        let addr = storage.as_mut_ptr() as u64;
+        assert!(init(addr));
+        write_cursor(addr, (TEST_CONSOLE_SIZE - 2) as u32);
+
+        write_bytes(b"abcd");
+
+        let body = console_body(&storage);
+        assert_eq!(&body[TEST_CONSOLE_SIZE - 2..], b"ab");
+        assert_eq!(&body[..2], b"cd");
+        assert_eq!(read_cursor(addr), OVERFLOW | 2);
+    }
+
+    #[test]
+    fn disable_stops_later_writes() {
+        disable();
+        let mut storage = console_storage(TEST_CONSOLE_SIZE);
+        let addr = storage.as_mut_ptr() as u64;
+        assert!(init(addr));
+        disable();
+
+        write_bytes(b"ignored");
+
+        assert_eq!(read_cursor(addr), 0);
+        assert!(console_body(&storage).iter().all(|byte| *byte == 0));
     }
 }

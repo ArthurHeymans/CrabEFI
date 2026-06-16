@@ -56,12 +56,15 @@ impl CorebootTimestampRecorder {
         };
 
         if !(16..=1024).contains(&max_entries) || num_entries > max_entries as u32 {
+            #[cfg(not(test))]
             log::warn!(
                 "Ignoring suspicious coreboot timestamp table at {:#x}: entries={}/{}",
                 table_addr,
                 num_entries,
                 max_entries
             );
+            #[cfg(test)]
+            let _ = (num_entries, max_entries);
             return None;
         }
 
@@ -69,6 +72,7 @@ impl CorebootTimestampRecorder {
     }
 
     /// Append a milestone using the current architecture counter.
+    #[cfg(not(test))]
     pub(crate) fn record_now(&self, id: u32) {
         self.record_counter(id, crabefi::time::read_counter());
     }
@@ -86,12 +90,15 @@ impl CorebootTimestampRecorder {
             let num_entries = num_ptr.read_unaligned();
 
             if num_entries >= max_entries as u32 {
+                #[cfg(not(test))]
                 log::warn!(
                     "Coreboot timestamp table full ({}/{}), dropping id={}",
                     num_entries,
                     max_entries,
                     id
                 );
+                #[cfg(test)]
+                let _ = (num_entries, max_entries, id);
                 return;
             }
 
@@ -108,8 +115,97 @@ impl CorebootTimestampRecorder {
     }
 }
 
+#[cfg(not(test))]
 impl crabefi::TimestampRecorder for CorebootTimestampRecorder {
     fn record(&self, id: u32) {
         self.record_now(id);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::vec::Vec;
+
+    const ENTRIES: usize = 16;
+
+    fn timestamp_storage(base_time: u64, max_entries: u16, num_entries: u32) -> Vec<u8> {
+        let mut storage = std::vec![
+            0;
+            core::mem::size_of::<TimestampTable>()
+                + ENTRIES * core::mem::size_of::<TimestampEntry>()
+        ];
+        let table = storage.as_mut_ptr() as *mut TimestampTable;
+        // SAFETY: `storage` is large enough for the packed table header.
+        unsafe {
+            core::ptr::addr_of_mut!((*table).base_time).write_unaligned(base_time);
+            core::ptr::addr_of_mut!((*table).max_entries).write_unaligned(max_entries);
+            core::ptr::addr_of_mut!((*table).tick_freq_mhz).write_unaligned(1000);
+            core::ptr::addr_of_mut!((*table).num_entries).write_unaligned(num_entries);
+        }
+        storage
+    }
+
+    fn entry(storage: &[u8], index: usize) -> (u32, i64) {
+        let entries_base = unsafe {
+            storage.as_ptr().add(core::mem::size_of::<TimestampTable>()) as *const TimestampEntry
+        };
+        let entry = unsafe { entries_base.add(index) };
+        // SAFETY: Tests only read entries within the allocated storage.
+        unsafe {
+            (
+                core::ptr::addr_of!((*entry).entry_id).read_unaligned(),
+                core::ptr::addr_of!((*entry).entry_stamp).read_unaligned(),
+            )
+        }
+    }
+
+    fn num_entries(storage: &[u8]) -> u32 {
+        let table = storage.as_ptr() as *const TimestampTable;
+        // SAFETY: `storage` begins with a packed timestamp table header.
+        unsafe { core::ptr::addr_of!((*table).num_entries).read_unaligned() }
+    }
+
+    #[test]
+    fn rejects_null_and_suspicious_tables() {
+        assert!(CorebootTimestampRecorder::new(0).is_none());
+
+        let mut too_small = timestamp_storage(0, 15, 0);
+        assert!(CorebootTimestampRecorder::new(too_small.as_mut_ptr() as u64).is_none());
+
+        let mut inconsistent = timestamp_storage(0, 16, 17);
+        assert!(CorebootTimestampRecorder::new(inconsistent.as_mut_ptr() as u64).is_none());
+    }
+
+    #[test]
+    fn appends_entries_relative_to_base_time() {
+        let mut storage = timestamp_storage(1_000_000, ENTRIES as u16, 2);
+        let recorder = CorebootTimestampRecorder::new(storage.as_mut_ptr() as u64).unwrap();
+
+        recorder.record_counter(1500, 1_000_123);
+
+        assert_eq!(num_entries(&storage), 3);
+        assert_eq!(entry(&storage, 2), (1500, 123));
+    }
+
+    #[test]
+    fn full_table_drops_new_entries() {
+        let mut storage = timestamp_storage(42, ENTRIES as u16, ENTRIES as u32);
+        let recorder = CorebootTimestampRecorder::new(storage.as_mut_ptr() as u64).unwrap();
+
+        recorder.record_counter(1501, 1000);
+
+        assert_eq!(num_entries(&storage), ENTRIES as u32);
+        assert_eq!(entry(&storage, ENTRIES - 1), (0, 0));
+    }
+
+    #[test]
+    fn counter_before_base_wraps_like_coreboot_stamps() {
+        let mut storage = timestamp_storage(10, ENTRIES as u16, 0);
+        let recorder = CorebootTimestampRecorder::new(storage.as_mut_ptr() as u64).unwrap();
+
+        recorder.record_counter(1502, 8);
+
+        assert_eq!(entry(&storage, 0), (1502, -2));
     }
 }
