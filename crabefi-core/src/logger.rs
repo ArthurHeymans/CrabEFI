@@ -175,13 +175,13 @@ pub fn level_index(level: LevelFilter) -> usize {
 
 /// Parse a persisted log-level variable payload.
 pub fn level_from_data(data: &[u8]) -> Option<LevelFilter> {
-    match data.first().copied() {
-        Some(0) => Some(LevelFilter::Off),
-        Some(1) => Some(LevelFilter::Error),
-        Some(2) => Some(LevelFilter::Warn),
-        Some(3) => Some(LevelFilter::Info),
-        Some(4) => Some(LevelFilter::Debug),
-        Some(5) => Some(LevelFilter::Trace),
+    match data {
+        [0] => Some(LevelFilter::Off),
+        [1] => Some(LevelFilter::Error),
+        [2] => Some(LevelFilter::Warn),
+        [3] => Some(LevelFilter::Info),
+        [4] => Some(LevelFilter::Debug),
+        [5] => Some(LevelFilter::Trace),
         _ => None,
     }
 }

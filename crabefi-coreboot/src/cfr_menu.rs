@@ -631,7 +631,7 @@ fn save_all_changes(cfr: &CfrInfo, items: &[MenuItem]) -> (usize, usize) {
 fn confirm_save(fb_console: &mut Option<FramebufferConsole>) -> bool {
     menu_common::confirm_dialog(
         fb_console,
-        "Save changes? (takes effect after reset)",
+        "Save changes? (CFR changes may require reset)",
         "Press Y to save, N to discard",
     )
 }
