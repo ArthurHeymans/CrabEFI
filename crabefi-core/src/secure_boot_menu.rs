@@ -248,7 +248,21 @@ pub fn show_secure_boot_menu() {
                         }
                         break;
                     }
-                    KeyPress::Escape | KeyPress::Char('q') => {
+                    KeyPress::Char('s') | KeyPress::Char('S') => {
+                        break;
+                    }
+                    KeyPress::Char('f') | KeyPress::Char('F') => {
+                        if let Some(hooks) = crate::state::drivers().platform.hooks {
+                            hooks.show_firmware_settings();
+                        }
+                        break;
+                    }
+                    KeyPress::Char('r') | KeyPress::Char('R') => {
+                        crate::arch::reset::keyboard_controller_reset();
+                        delay_ms(100);
+                        crate::arch::reset::triple_fault();
+                    }
+                    KeyPress::Escape | KeyPress::Char('q') | KeyPress::Char('Q') => {
                         return;
                     }
                     _ => {}
@@ -545,7 +559,7 @@ fn draw_options(
 fn draw_help(fb_console: &mut Option<FramebufferConsole>, row: usize, cols: usize) {
     menu_common::draw_help(
         row,
-        "Up/Down: Navigate | Enter: Select | Esc/Q: Back",
+        "Up/Down: Navigate | Enter: Select | S: Secure | F: Firmware | R: Reset | Esc/Q: Back",
         fb_console,
         cols,
     );
