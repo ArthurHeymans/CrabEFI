@@ -1,8 +1,8 @@
 //! Graphical Secure Boot screen — Kinetic Command design.
 
 use super::{
-    NavItem, ScreenNav, canvas, clear, draw_footer, draw_header, draw_sidebar,
-    poll_and_render_cursor, render, theme, update_sidebar_hover,
+    NavItem, ScreenNav, canvas, clear, draw_footer, draw_header, draw_scrollbar, draw_sidebar,
+    poll_and_render_cursor, render, reset_system, theme, update_sidebar_hover,
 };
 use crate::FramebufferConfig as FramebufferInfo;
 use crate::cursor::CursorRenderer;
@@ -19,9 +19,10 @@ pub fn show(fb: &FramebufferInfo) -> ScreenNav {
     let mut selected: usize = 0;
     let mut hovered: Option<usize> = None;
     let mut sidebar_hov: Option<NavItem> = None;
+    let mut scroll_offset: usize = 0;
     let mut status: Option<(&str, bool)> = None;
 
-    draw_screen(fb, selected, hovered, status);
+    draw_screen(fb, selected, hovered, scroll_offset, status);
 
     loop {
         poll_and_render_cursor(fb, &mut cursor);
@@ -29,17 +30,10 @@ pub fn show(fb: &FramebufferInfo) -> ScreenNav {
         update_sidebar_hover(fb, &mut sidebar_hov, NavItem::Security);
 
         // ── Card hover ──
-        let new_hov = action_hit(fb);
+        let new_hov = action_hit(fb, scroll_offset);
         if new_hov != hovered {
-            let old = hovered;
             hovered = new_hov;
-            // Repaint only the changed cards (not the whole screen)
-            if let Some(i) = old {
-                paint_action_card(fb, i, selected, hovered);
-            }
-            if let Some(i) = new_hov {
-                paint_action_card(fb, i, selected, hovered);
-            }
+            draw_screen(fb, selected, hovered, scroll_offset, status);
         }
 
         if let Some(key) = menu_common::read_key() {
@@ -47,13 +41,23 @@ pub fn show(fb: &FramebufferInfo) -> ScreenNav {
             match key {
                 KeyPress::Up | KeyPress::Char('k') => {
                     selected = selected.saturating_sub(1);
-                    draw_screen(fb, selected, hovered, status);
+                    keep_action_visible(fb, selected, &mut scroll_offset);
+                    draw_screen(fb, selected, hovered, scroll_offset, status);
                 }
                 KeyPress::Down | KeyPress::Char('j') => {
                     if selected < ACTION_COUNT - 1 {
                         selected += 1;
                     }
-                    draw_screen(fb, selected, hovered, status);
+                    keep_action_visible(fb, selected, &mut scroll_offset);
+                    draw_screen(fb, selected, hovered, scroll_offset, status);
+                }
+                KeyPress::Char('s') | KeyPress::Char('S') => {}
+                KeyPress::Char('f') | KeyPress::Char('F') => {
+                    cursor.hide(fb);
+                    return ScreenNav::Nav(NavItem::Firmware);
+                }
+                KeyPress::Char('r') | KeyPress::Char('R') => {
+                    reset_system();
                 }
                 KeyPress::Escape | KeyPress::Char('q') | KeyPress::Char('Q') => {
                     return ScreenNav::Back;
@@ -63,7 +67,7 @@ pub fn show(fb: &FramebufferInfo) -> ScreenNav {
                     if selected == ACTION_BACK {
                         return ScreenNav::Back;
                     }
-                    draw_screen(fb, selected, hovered, status);
+                    draw_screen(fb, selected, hovered, scroll_offset, status);
                 }
                 #[cfg(feature = "ui")]
                 KeyPress::MouseClick { .. } => {
@@ -83,8 +87,9 @@ pub fn show(fb: &FramebufferInfo) -> ScreenNav {
                             }
                         } else {
                             selected = idx;
+                            keep_action_visible(fb, selected, &mut scroll_offset);
                         }
-                        draw_screen(fb, selected, hovered, status);
+                        draw_screen(fb, selected, hovered, scroll_offset, status);
                     }
                 }
                 #[cfg(feature = "ui")]
@@ -94,7 +99,8 @@ pub fn show(fb: &FramebufferInfo) -> ScreenNav {
                     } else if dz < 0 && selected > 0 {
                         selected -= 1;
                     }
-                    draw_screen(fb, selected, hovered, status);
+                    keep_action_visible(fb, selected, &mut scroll_offset);
+                    draw_screen(fb, selected, hovered, scroll_offset, status);
                 }
                 _ => {}
             }
@@ -133,10 +139,13 @@ fn handle_action(idx: usize) -> Option<(&'static str, bool)> {
 }
 
 /// Hit-test action cards.
-fn action_hit(fb: &FramebufferInfo) -> Option<usize> {
+fn action_hit(fb: &FramebufferInfo, scroll_offset: usize) -> Option<usize> {
     let (mx, my) = crate::drivers::mouse_cursor::position();
-    for i in 0..ACTION_COUNT {
-        let (ax, ay, aw, ah) = action_card_rect(fb, i);
+    let end = (scroll_offset + action_visible_slots(fb)).min(ACTION_COUNT);
+    for i in scroll_offset..end {
+        let Some((ax, ay, aw, ah)) = action_card_rect(fb, scroll_offset, i) else {
+            continue;
+        };
         if mx >= ax && mx < ax + aw as i32 && my >= ay && my < ay + ah as i32 {
             return Some(i);
         }
@@ -159,22 +168,63 @@ const ACTION_ITEMS: [(&str, &str); ACTION_COUNT] = [
     ("Back to Boot Menu", "Return to boot entry selection"),
 ];
 
-/// Rect for the i-th action card.
-fn action_card_rect(fb: &FramebufferInfo, i: usize) -> (i32, i32, u32, u32) {
-    let (cx, cy, cw, _) = canvas(fb);
-    let card_h = 44u32;
+fn action_list_area(fb: &FramebufferInfo) -> (i32, i32, u32, u32) {
+    let (cx, cy, cw, ch) = canvas(fb);
     // Section header + hero card + gap
     let hero_h = 56u32;
     let header_h =
         render::font_height(FontSize::Small) + 4 + render::font_height(FontSize::Display) + 16;
-    let base_y = cy + header_h as i32 + hero_h as i32 + 16;
-    let y = base_y + (i as i32 * (card_h as i32 + theme::GAP as i32));
-    (cx, y, cw, card_h)
+    let used_h = header_h + hero_h + 16;
+    let base_y = cy + used_h as i32;
+    (cx, base_y, cw, ch.saturating_sub(used_h))
+}
+
+fn action_visible_slots(fb: &FramebufferInfo) -> usize {
+    let (_, _, _, h) = action_list_area(fb);
+    let card_h = 44u32;
+    if h < card_h {
+        1
+    } else {
+        ((h + theme::GAP) / (card_h + theme::GAP)).max(1) as usize
+    }
+}
+
+fn keep_action_visible(fb: &FramebufferInfo, selected: usize, scroll_offset: &mut usize) {
+    let slots = action_visible_slots(fb);
+    if selected < *scroll_offset {
+        *scroll_offset = selected;
+    } else if selected >= *scroll_offset + slots {
+        *scroll_offset = selected - slots + 1;
+    }
+}
+
+/// Rect for the i-th action card.
+fn action_card_rect(
+    fb: &FramebufferInfo,
+    scroll_offset: usize,
+    i: usize,
+) -> Option<(i32, i32, u32, u32)> {
+    if i < scroll_offset || i >= scroll_offset + action_visible_slots(fb) {
+        return None;
+    }
+    let (cx, base_y, cw, _) = action_list_area(fb);
+    let card_h = 44u32;
+    let slot = i - scroll_offset;
+    let y = base_y + (slot as i32 * (card_h as i32 + theme::GAP as i32));
+    Some((cx, y, cw, card_h))
 }
 
 /// Repaint a single action card (avoids full-screen redraw on hover changes).
-fn paint_action_card(fb: &FramebufferInfo, i: usize, selected: usize, hovered: Option<usize>) {
-    let (cx, y, cw, card_h) = action_card_rect(fb, i);
+fn paint_action_card(
+    fb: &FramebufferInfo,
+    i: usize,
+    selected: usize,
+    hovered: Option<usize>,
+    scroll_offset: usize,
+) {
+    let Some((cx, y, cw, card_h)) = action_card_rect(fb, scroll_offset, i) else {
+        return;
+    };
     let (title, desc) = ACTION_ITEMS[i];
     let is_sel = i == selected;
     let is_hov = hovered == Some(i) && !is_sel;
@@ -235,12 +285,16 @@ fn draw_screen(
     fb: &FramebufferInfo,
     selected: usize,
     hovered: Option<usize>,
+    scroll_offset: usize,
     status: Option<(&str, bool)>,
 ) {
     clear(fb);
     draw_header(fb);
     draw_sidebar(fb, NavItem::Security, None);
-    draw_footer(fb, "Up/Down Navigate   Enter Select   Esc Back");
+    draw_footer(
+        fb,
+        "Up/Down Navigate  Enter Select  S Security  F Firmware  R Reset  Esc Back",
+    );
 
     let (cx, cy, cw, _ch) = canvas(fb);
     let mut y = cy;
@@ -349,9 +403,21 @@ fn draw_screen(
     let _ = y; // y was used to position hero card; action cards use action_card_rect()
 
     // ── Action cards ──
-    for i in 0..ACTION_COUNT {
-        paint_action_card(fb, i, selected, hovered);
+    let end = (scroll_offset + action_visible_slots(fb)).min(ACTION_COUNT);
+    for i in scroll_offset..end {
+        paint_action_card(fb, i, selected, hovered, scroll_offset);
     }
+
+    let (list_x, list_y, list_w, list_h) = action_list_area(fb);
+    draw_scrollbar(
+        fb,
+        list_x + list_w as i32 - 4,
+        list_y,
+        list_h,
+        ACTION_COUNT,
+        scroll_offset,
+        action_visible_slots(fb),
+    );
 
     // Status toast
     if let Some((msg, ok)) = status {
