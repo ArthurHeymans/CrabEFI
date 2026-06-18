@@ -13,12 +13,20 @@ use crate::cfr::{self, CfrInfo, CfrOption, CfrOptionType, CfrValue};
 use alloc::string::String;
 use alloc::vec::Vec;
 use core::fmt::Write;
+#[cfg(feature = "ui")]
+use crabefi::FramebufferConfig as FramebufferInfo;
 use crabefi::drivers::serial as serial_driver;
 use crabefi::framebuffer_console::{
     Color, DEFAULT_BG, DEFAULT_FG, FramebufferConsole, HIGHLIGHT_BG, HIGHLIGHT_FG,
 };
 use crabefi::menu_common::{self, KeyPress, SerialWriter};
 use crabefi::time::delay_ms;
+#[cfg(feature = "ui")]
+use crabefi::ui::{self, NavItem, render, theme};
+
+use heapless::String as StackString;
+#[cfg(feature = "ui")]
+use render::{FontSize, Rgb};
 
 /// Menu title
 const MENU_TITLE: &str = "Firmware Settings";
@@ -86,6 +94,12 @@ pub fn show_cfr_menu() {
         }
     };
 
+    #[cfg(feature = "ui")]
+    if let Some(fb) = crabefi::state::get_framebuffer() {
+        show_cfr_menu_graphical(cfr_info, &fb);
+        return;
+    }
+
     let fb_info = crabefi::state::get_framebuffer();
     let mut fb_console = fb_info.as_ref().map(FramebufferConsole::new);
 
@@ -103,9 +117,8 @@ pub fn show_cfr_menu() {
     loop {
         menu_common::clear_screen(&mut fb_console);
         let modified = has_changes(&items);
-        // Ensure scroll keeps selected item visible
-        let vis = visible_indices(cfr_info, &items);
-        let sel_vis_pos = vis.iter().position(|&i| i == selected).unwrap_or(0);
+        // Ensure scroll keeps selected item visible without allocating.
+        let sel_vis_pos = visible_position_of(cfr_info, &items, selected).unwrap_or(0);
         let screen_rows = get_visible_rows(&fb_console);
         if sel_vis_pos < scroll_offset {
             scroll_offset = sel_vis_pos;
@@ -771,17 +784,946 @@ fn show_no_options_message(fb_console: &mut Option<FramebufferConsole>) {
 }
 
 // ============================================================================
+// Graphical UI (feature = "ui")
+// ============================================================================
+
+#[cfg(feature = "ui")]
+const GFX_ITEM_H: u32 = 50;
+#[cfg(feature = "ui")]
+const GFX_ITEM_GAP: u32 = 6;
+#[cfg(feature = "ui")]
+const GFX_ITEM_STRIDE: u32 = GFX_ITEM_H + GFX_ITEM_GAP;
+#[cfg(feature = "ui")]
+const GFX_TITLE_H: u32 = 68;
+
+#[cfg(feature = "ui")]
+struct GraphicalState {
+    selected: usize,
+    hovered: Option<usize>,
+    scroll_offset: usize,
+    status_message: Option<(&'static str, bool)>,
+}
+
+#[cfg(feature = "ui")]
+impl GraphicalState {
+    fn new(selected: usize) -> Self {
+        Self {
+            selected,
+            hovered: None,
+            scroll_offset: 0,
+            status_message: None,
+        }
+    }
+}
+
+/// Show the CFR settings menu using the graphical CrabEFI UI.
+#[cfg(feature = "ui")]
+fn show_cfr_menu_graphical(cfr_info: &CfrInfo, fb: &FramebufferInfo) {
+    let mut items = build_menu_items(cfr_info);
+
+    if items.is_empty() {
+        show_no_options_graphical(fb);
+        return;
+    }
+
+    let mut cursor = crabefi::cursor::CursorRenderer::new();
+    let mut state = GraphicalState::new(find_first_selectable(cfr_info, &items, 0));
+
+    draw_graphical_menu(cfr_info, &items, &state, fb);
+
+    loop {
+        ui::poll_and_render_cursor(fb, &mut cursor);
+
+        let hovered = graphical_item_hit(cfr_info, &items, &state, fb);
+        if hovered != state.hovered {
+            state.hovered = hovered;
+            draw_graphical_menu(cfr_info, &items, &state, fb);
+        }
+
+        if let Some(key) = menu_common::read_key() {
+            state.status_message = None;
+            match key {
+                KeyPress::Up | KeyPress::Char('k') => {
+                    state.selected = find_prev_selectable(cfr_info, &items, state.selected);
+                }
+                KeyPress::Down | KeyPress::Char('j') => {
+                    state.selected = find_next_selectable(cfr_info, &items, state.selected);
+                }
+                KeyPress::Enter | KeyPress::Char(' ') => {
+                    if can_edit_item(cfr_info, &items, state.selected) {
+                        if let Some(MenuItem::Option {
+                            form_idx,
+                            option_idx,
+                            current_value,
+                            ..
+                        }) = items.get_mut(state.selected)
+                        {
+                            if let Some(option) = get_option(cfr_info, *form_idx, *option_idx) {
+                                toggle_value(option, current_value);
+                            }
+                        } else {
+                            increment_option(cfr_info, &mut items, state.selected);
+                        }
+                    } else if is_selectable_item(items.get(state.selected)) {
+                        state.status_message = Some(("Option is read-only", false));
+                    }
+                }
+                KeyPress::Char('+') | KeyPress::Char('=') => {
+                    if !increment_option(cfr_info, &mut items, state.selected) {
+                        state.status_message = Some(("Option cannot be increased", false));
+                    }
+                }
+                KeyPress::Char('-') => {
+                    if !decrement_option(cfr_info, &mut items, state.selected) {
+                        state.status_message = Some(("Option cannot be decreased", false));
+                    }
+                }
+                KeyPress::Escape | KeyPress::Char('q') | KeyPress::Char('Q') => {
+                    cursor.hide(fb);
+                    if has_changes(&items) && confirm_save_graphical(fb) {
+                        let (saved, failed) = save_all_changes(cfr_info, &items);
+                        show_save_result_graphical(fb, saved, failed);
+                    }
+                    return;
+                }
+                KeyPress::Char('?') => {
+                    if let Some(MenuItem::Option {
+                        form_idx,
+                        option_idx,
+                        ..
+                    }) = items.get(state.selected)
+                        && let Some(option) = get_option(cfr_info, *form_idx, *option_idx)
+                    {
+                        cursor.hide(fb);
+                        show_help_graphical(fb, option);
+                    } else if matches!(
+                        items.get(state.selected),
+                        Some(MenuItem::CrabLogLevel { .. })
+                    ) {
+                        state.status_message =
+                            Some(("Controls CrabEFI serial log verbosity", true));
+                    }
+                }
+                KeyPress::MouseClick { .. } => {
+                    if let Some(item_idx) = state.hovered {
+                        if is_selectable(&items[item_idx]) {
+                            state.selected = item_idx;
+                            if can_edit_item(cfr_info, &items, item_idx) {
+                                if let Some(MenuItem::Option {
+                                    form_idx,
+                                    option_idx,
+                                    current_value,
+                                    ..
+                                }) = items.get_mut(item_idx)
+                                {
+                                    if let Some(option) =
+                                        get_option(cfr_info, *form_idx, *option_idx)
+                                    {
+                                        toggle_value(option, current_value);
+                                    }
+                                } else {
+                                    increment_option(cfr_info, &mut items, item_idx);
+                                }
+                            }
+                        }
+                    }
+                }
+                KeyPress::MouseScroll(dz) => {
+                    if dz > 0 {
+                        state.selected = find_next_selectable(cfr_info, &items, state.selected);
+                    } else {
+                        state.selected = find_prev_selectable(cfr_info, &items, state.selected);
+                    }
+                }
+                _ => {}
+            }
+
+            keep_graphical_selection_visible(cfr_info, &items, &mut state, fb);
+            draw_graphical_menu(cfr_info, &items, &state, fb);
+        }
+
+        delay_ms(8);
+    }
+}
+
+#[cfg(feature = "ui")]
+fn graphical_canvas(fb: &FramebufferInfo) -> (i32, i32, u32, u32) {
+    let x = theme::SIDEBAR_W as i32 + theme::PAD as i32;
+    let y = (theme::HEADER_H + theme::PAD) as i32;
+    let w = fb.width - theme::SIDEBAR_W - theme::PAD * 2;
+    let h = fb.height - theme::HEADER_H - theme::FOOTER_H - theme::PAD * 2;
+    (x, y, w, h)
+}
+
+#[cfg(feature = "ui")]
+fn graphical_list_area(fb: &FramebufferInfo) -> (i32, i32, u32, u32) {
+    let (cx, cy, cw, ch) = graphical_canvas(fb);
+    let y = cy + GFX_TITLE_H as i32;
+    (cx, y, cw, ch.saturating_sub(GFX_TITLE_H))
+}
+
+#[cfg(feature = "ui")]
+fn graphical_visible_slots(fb: &FramebufferInfo) -> usize {
+    let (_, _, _, h) = graphical_list_area(fb);
+    (h / GFX_ITEM_STRIDE).max(1) as usize
+}
+
+#[cfg(feature = "ui")]
+fn keep_graphical_selection_visible(
+    cfr: &CfrInfo,
+    items: &[MenuItem],
+    state: &mut GraphicalState,
+    fb: &FramebufferInfo,
+) {
+    let Some(sel_vis_pos) = visible_position_of(cfr, items, state.selected) else {
+        state.selected = find_first_selectable(cfr, items, 0);
+        state.scroll_offset = 0;
+        return;
+    };
+    let slots = graphical_visible_slots(fb);
+    if sel_vis_pos < state.scroll_offset {
+        state.scroll_offset = sel_vis_pos;
+    } else if sel_vis_pos >= state.scroll_offset + slots {
+        state.scroll_offset = sel_vis_pos - slots + 1;
+    }
+}
+
+#[cfg(feature = "ui")]
+fn draw_graphical_menu(
+    cfr: &CfrInfo,
+    items: &[MenuItem],
+    state: &GraphicalState,
+    fb: &FramebufferInfo,
+) {
+    ui::clear(fb);
+    ui::draw_header(fb);
+    ui::draw_sidebar(fb, NavItem::Firmware, None);
+
+    let footer = if has_changes(items) {
+        "Up/Down Navigate  Enter Edit  +/- Adjust  ? Help  Esc Save/Exit"
+    } else {
+        "Up/Down Navigate  Enter Edit  +/- Adjust  ? Help  Esc Back"
+    };
+    ui::draw_footer(fb, footer);
+
+    let (cx, cy, cw, _) = graphical_canvas(fb);
+    draw_graphical_title(fb, cx, cy, cw, has_changes(items));
+
+    let slots = graphical_visible_slots(fb);
+    let visible_len = visible_count(cfr, items);
+    let (_, list_y, _, _) = graphical_list_area(fb);
+
+    for screen_idx in 0..slots {
+        let Some(item_idx) = visible_index_at(cfr, items, state.scroll_offset + screen_idx) else {
+            break;
+        };
+        let y = list_y + (screen_idx as u32 * GFX_ITEM_STRIDE) as i32;
+        draw_graphical_item(
+            cfr,
+            &items[item_idx],
+            item_idx == state.selected,
+            state.hovered == Some(item_idx),
+            fb,
+            cx,
+            y,
+            cw,
+        );
+    }
+
+    draw_graphical_scroll(fb, visible_len, state.scroll_offset, slots);
+
+    if let Some((msg, ok)) = state.status_message {
+        let color = if ok { theme::GREEN } else { theme::ERROR };
+        render::draw_text_centered(
+            fb,
+            cx,
+            (fb.height - theme::FOOTER_H - 24) as i32,
+            cw,
+            msg,
+            FontSize::Small,
+            color,
+            None,
+        );
+    }
+}
+
+#[cfg(feature = "ui")]
+fn draw_graphical_title(fb: &FramebufferInfo, cx: i32, cy: i32, cw: u32, modified: bool) {
+    render::draw_text_spaced(
+        fb,
+        cx,
+        cy,
+        "HARDWARE CONFIGURATION",
+        FontSize::Small,
+        2,
+        theme::PRIMARY.darken(80),
+        None,
+    );
+    let title_y = cy + render::font_height(FontSize::Small) as i32 + 4;
+    render::draw_text(
+        fb,
+        cx,
+        title_y,
+        if modified {
+            "Firmware Settings *"
+        } else {
+            "Firmware Settings"
+        },
+        FontSize::Display,
+        theme::TEXT,
+        None,
+    );
+    render::draw_text_right(
+        fb,
+        cx,
+        title_y + 10,
+        cw,
+        "COREBOOT CFR",
+        FontSize::Small,
+        theme::OUTLINE,
+        None,
+    );
+}
+
+#[cfg(feature = "ui")]
+fn draw_graphical_item(
+    cfr: &CfrInfo,
+    item: &MenuItem,
+    selected: bool,
+    hovered: bool,
+    fb: &FramebufferInfo,
+    x: i32,
+    y: i32,
+    w: u32,
+) {
+    match item {
+        MenuItem::FormHeader { name } => {
+            render::draw_text_spaced(
+                fb,
+                x,
+                y + 16,
+                &truncate_for_width(name, w.saturating_sub(24), FontSize::Small),
+                FontSize::Small,
+                2,
+                theme::PRIMARY,
+                None,
+            );
+            render::draw_separator(fb, x, y + GFX_ITEM_H as i32 - 8, w, theme::GHOST, theme::BG);
+        }
+        MenuItem::SubformHeader { name } => {
+            render::draw_text(
+                fb,
+                x + 12,
+                y + 15,
+                &truncate_for_width(name, w.saturating_sub(24), FontSize::Normal),
+                FontSize::Normal,
+                theme::TERTIARY,
+                None,
+            );
+        }
+        MenuItem::Comment { text } => {
+            render::draw_text(
+                fb,
+                x + 12,
+                y + 17,
+                &truncate_for_width(text, w.saturating_sub(24), FontSize::Small),
+                FontSize::Small,
+                theme::TEXT_DIM,
+                None,
+            );
+        }
+        MenuItem::Option {
+            form_idx,
+            option_idx,
+            current_value,
+            ..
+        } => {
+            if let Some(option) = get_option(cfr, *form_idx, *option_idx) {
+                draw_graphical_option(fb, option, current_value, selected, hovered, x, y, w);
+            }
+        }
+        MenuItem::CrabLogLevel { current_level, .. } => {
+            draw_graphical_log_level(fb, *current_level, selected, hovered, x, y, w);
+        }
+    }
+}
+
+#[cfg(feature = "ui")]
+fn draw_graphical_log_level(
+    fb: &FramebufferInfo,
+    level: log::LevelFilter,
+    selected: bool,
+    hovered: bool,
+    x: i32,
+    y: i32,
+    w: u32,
+) {
+    let bg = if selected {
+        theme::BRIGHT
+    } else if hovered {
+        theme::CONT_HIGH
+    } else {
+        theme::CONTAINER
+    };
+    render::fill_rounded_rect(fb, x, y, w, GFX_ITEM_H, theme::RADIUS, bg);
+    render::fill_rect(
+        fb,
+        x,
+        y + 3,
+        theme::ACCENT_BAR,
+        GFX_ITEM_H - 6,
+        theme::PRIMARY,
+    );
+
+    let label = crabefi::logger::level_name(level);
+    let value_w = value_width(label).min(w / 2);
+    let value_x = x + w as i32 - value_w as i32 - 14;
+    let name_max_w = (value_x - x - 34).max(32) as u32;
+
+    render::draw_text(
+        fb,
+        x + 18,
+        y + 8,
+        &truncate_for_width("CrabEFI log level", name_max_w, FontSize::Normal),
+        FontSize::Normal,
+        theme::TEXT,
+        Some(bg),
+    );
+    render::draw_text(
+        fb,
+        x + 18,
+        y + 31,
+        "serial verbosity",
+        FontSize::Small,
+        theme::OUTLINE,
+        Some(bg),
+    );
+    draw_value_pill(fb, value_x, y + 12, value_w, label, true);
+}
+
+#[cfg(feature = "ui")]
+fn draw_graphical_option(
+    fb: &FramebufferInfo,
+    option: &CfrOption,
+    value: &CfrValue,
+    selected: bool,
+    hovered: bool,
+    x: i32,
+    y: i32,
+    w: u32,
+) {
+    let editable = option.is_editable();
+    let bg = if selected {
+        theme::BRIGHT
+    } else if hovered {
+        theme::CONT_HIGH
+    } else {
+        theme::CONTAINER
+    };
+    render::fill_rounded_rect(fb, x, y, w, GFX_ITEM_H, theme::RADIUS, bg);
+
+    let accent = if selected {
+        theme::PRIMARY
+    } else if editable {
+        theme::GHOST
+    } else {
+        theme::CONT_LOW
+    };
+    render::fill_rect(fb, x, y + 3, theme::ACCENT_BAR, GFX_ITEM_H - 6, accent);
+
+    let value_label = format_value(option, value);
+    let value_w = value_width(&value_label).min(w / 2);
+    let value_x = x + w as i32 - value_w as i32 - 14;
+    let name_max_w = (value_x - x - 34).max(32) as u32;
+    let name_color = if editable {
+        theme::TEXT
+    } else {
+        theme::TEXT_DIM
+    };
+
+    render::draw_text(
+        fb,
+        x + 18,
+        y + 8,
+        &truncate_for_width(&option.ui_name, name_max_w, FontSize::Normal),
+        FontSize::Normal,
+        name_color,
+        Some(bg),
+    );
+
+    if !option.ui_helptext.is_empty() {
+        render::draw_text(
+            fb,
+            x + 18,
+            y + 31,
+            "? help available",
+            FontSize::Small,
+            theme::OUTLINE,
+            Some(bg),
+        );
+    }
+
+    match (&option.option_type, value) {
+        (CfrOptionType::Bool { .. }, CfrValue::Bool(on)) => {
+            render::draw_toggle(fb, value_x, y + 16, *on, theme::PRIMARY);
+        }
+        _ => draw_value_pill(fb, value_x, y + 12, value_w, &value_label, editable),
+    }
+}
+
+#[cfg(feature = "ui")]
+fn draw_graphical_scroll(
+    fb: &FramebufferInfo,
+    visible_len: usize,
+    scroll_offset: usize,
+    visible_slots: usize,
+) {
+    if visible_len <= visible_slots {
+        return;
+    }
+    let (cx, list_y, cw, list_h) = graphical_list_area(fb);
+    let track_x = cx + cw as i32 - 4;
+    render::fill_rounded_rect(fb, track_x, list_y, 4, list_h, 2, theme::SIDE);
+    let fraction = visible_slots as u32 * 255 / visible_len as u32;
+    let thumb_h = (list_h * fraction / 255).max(24).min(list_h);
+    let max_off = visible_len.saturating_sub(visible_slots).max(1);
+    let thumb_y = list_y + ((list_h - thumb_h) as usize * scroll_offset / max_off) as i32;
+    render::fill_rounded_rect(fb, track_x, thumb_y, 4, thumb_h, 2, theme::PRIMARY);
+}
+
+#[cfg(feature = "ui")]
+fn graphical_item_hit(
+    cfr: &CfrInfo,
+    items: &[MenuItem],
+    state: &GraphicalState,
+    fb: &FramebufferInfo,
+) -> Option<usize> {
+    let (mx, my) = crabefi::drivers::mouse_cursor::position();
+    let (x, y, w, _) = graphical_list_area(fb);
+    if mx < x || mx >= x + w as i32 || my < y {
+        return None;
+    }
+    let slot = ((my - y) as u32 / GFX_ITEM_STRIDE) as usize;
+    if slot >= graphical_visible_slots(fb) {
+        return None;
+    }
+    visible_index_at(cfr, items, state.scroll_offset + slot)
+}
+
+#[cfg(feature = "ui")]
+fn format_value(option: &CfrOption, value: &CfrValue) -> StackString<96> {
+    let mut out = StackString::new();
+    match (&option.option_type, value) {
+        (CfrOptionType::Bool { .. }, CfrValue::Bool(b)) => {
+            let _ = out.push_str(if *b { "Enabled" } else { "Disabled" });
+        }
+        (CfrOptionType::Enum { choices, .. }, CfrValue::Number(n)) => {
+            if let Some(choice) = choices.iter().find(|c| c.value == *n) {
+                let _ = out.push_str(&choice.ui_name);
+            } else {
+                let _ = write!(out, "{}", n);
+            }
+        }
+        (CfrOptionType::Number { hex_display, .. }, CfrValue::Number(n)) => {
+            if *hex_display {
+                let _ = write!(out, "0x{:X}", n);
+            } else {
+                let _ = write!(out, "{}", n);
+            }
+        }
+        (CfrOptionType::Varchar { .. }, CfrValue::Varchar(s)) => {
+            let _ = out.push_str(s);
+        }
+        _ => {
+            let _ = out.push('-');
+        }
+    }
+    out
+}
+
+#[cfg(feature = "ui")]
+fn value_width(label: &str) -> u32 {
+    render::text_width(label, FontSize::Small) + 18
+}
+
+#[cfg(feature = "ui")]
+fn draw_value_pill(fb: &FramebufferInfo, x: i32, y: i32, w: u32, label: &str, editable: bool) {
+    let bg = if editable {
+        theme::CONT_LOW
+    } else {
+        theme::SIDE
+    };
+    let fg = if editable {
+        theme::PRIMARY
+    } else {
+        theme::TEXT_DIM
+    };
+    render::fill_rounded_rect(fb, x, y, w, 26, 13, bg);
+    render::draw_text_centered(
+        fb,
+        x,
+        y + 5,
+        w,
+        &truncate_for_width(label, w.saturating_sub(16), FontSize::Small),
+        FontSize::Small,
+        fg,
+        Some(bg),
+    );
+}
+
+#[cfg(feature = "ui")]
+fn truncate_for_width(text: &str, max_width: u32, size: FontSize) -> StackString<128> {
+    let max_chars = (max_width / render::font_width(size)).max(1) as usize;
+    let char_count = text.chars().count();
+    if char_count <= max_chars {
+        let mut out = StackString::new();
+        let _ = out.push_str(text);
+        return out;
+    }
+
+    let mut out = StackString::new();
+    for (idx, ch) in text.chars().enumerate() {
+        if idx + 1 >= max_chars {
+            let _ = out.push('~');
+            break;
+        }
+        let _ = out.push(ch);
+    }
+    out
+}
+
+#[cfg(feature = "ui")]
+fn show_help_graphical(fb: &FramebufferInfo, option: &CfrOption) {
+    let mut cursor = crabefi::cursor::CursorRenderer::new();
+    draw_help_graphical(fb, option);
+    loop {
+        ui::poll_and_render_cursor(fb, &mut cursor);
+        if menu_common::read_key().is_some() {
+            cursor.hide(fb);
+            return;
+        }
+        delay_ms(8);
+    }
+}
+
+#[cfg(feature = "ui")]
+fn draw_help_graphical(fb: &FramebufferInfo, option: &CfrOption) {
+    ui::clear(fb);
+    ui::draw_header(fb);
+    ui::draw_sidebar(fb, NavItem::Firmware, None);
+    ui::draw_footer(fb, "Any key Back");
+
+    let (cx, cy, cw, _) = graphical_canvas(fb);
+    render::draw_text_spaced(
+        fb,
+        cx,
+        cy,
+        "SETTING HELP",
+        FontSize::Small,
+        2,
+        theme::PRIMARY.darken(80),
+        None,
+    );
+    render::draw_text(
+        fb,
+        cx,
+        cy + render::font_height(FontSize::Small) as i32 + 4,
+        &truncate_for_width(&option.ui_name, cw, FontSize::Display),
+        FontSize::Display,
+        theme::TEXT,
+        None,
+    );
+
+    let card_y = cy + GFX_TITLE_H as i32;
+    render::fill_rounded_rect(fb, cx, card_y, cw, 180, theme::RADIUS, theme::CONTAINER);
+    render::fill_rect(fb, cx, card_y + 3, theme::ACCENT_BAR, 174, theme::PRIMARY);
+
+    let text = if option.ui_helptext.is_empty() {
+        "No help available for this option."
+    } else {
+        &option.ui_helptext
+    };
+    draw_wrapped_text(
+        fb,
+        cx + 18,
+        card_y + 18,
+        cw.saturating_sub(36),
+        text,
+        FontSize::Normal,
+        theme::TEXT_DIM,
+        Some(theme::CONTAINER),
+        6,
+    );
+}
+
+#[cfg(feature = "ui")]
+fn draw_wrapped_text(
+    fb: &FramebufferInfo,
+    x: i32,
+    mut y: i32,
+    w: u32,
+    text: &str,
+    size: FontSize,
+    fg: Rgb,
+    bg: Option<Rgb>,
+    max_lines: usize,
+) {
+    let max_chars = (w / render::font_width(size)).max(1) as usize;
+    let mut line: StackString<160> = StackString::new();
+    let mut lines = 0usize;
+
+    for word in text.split(' ') {
+        if lines >= max_lines {
+            break;
+        }
+        let add_len = if line.is_empty() {
+            word.len()
+        } else {
+            word.len() + 1
+        };
+        if !line.is_empty() && line.len() + add_len > max_chars {
+            render::draw_text(fb, x, y, &line, size, fg, bg);
+            y += render::font_height(size) as i32 + 4;
+            line.clear();
+            lines += 1;
+        }
+        if !line.is_empty() {
+            let _ = line.push(' ');
+        }
+        let _ = line.push_str(word);
+    }
+
+    if !line.is_empty() && lines < max_lines {
+        render::draw_text(fb, x, y, &line, size, fg, bg);
+    }
+}
+
+#[cfg(feature = "ui")]
+fn confirm_save_graphical(fb: &FramebufferInfo) -> bool {
+    let mut cursor = crabefi::cursor::CursorRenderer::new();
+    draw_confirm_save_graphical(fb);
+    loop {
+        ui::poll_and_render_cursor(fb, &mut cursor);
+        if let Some(key) = menu_common::read_key() {
+            match key {
+                KeyPress::Char('y') | KeyPress::Char('Y') | KeyPress::Enter => {
+                    cursor.hide(fb);
+                    return true;
+                }
+                KeyPress::Char('n') | KeyPress::Char('N') | KeyPress::Escape => {
+                    cursor.hide(fb);
+                    return false;
+                }
+                KeyPress::MouseClick { x, y } => {
+                    let (yes, no) = confirm_button_rects(fb);
+                    if point_in_rect(x as i32, y as i32, yes) {
+                        cursor.hide(fb);
+                        return true;
+                    }
+                    if point_in_rect(x as i32, y as i32, no) {
+                        cursor.hide(fb);
+                        return false;
+                    }
+                }
+                _ => {}
+            }
+        }
+        delay_ms(8);
+    }
+}
+
+#[cfg(feature = "ui")]
+fn draw_confirm_save_graphical(fb: &FramebufferInfo) {
+    ui::clear(fb);
+    ui::draw_header(fb);
+    ui::draw_sidebar(fb, NavItem::Firmware, None);
+    ui::draw_footer(fb, "Y/Enter Save   N/Esc Discard");
+
+    let (cx, cy, cw, ch) = graphical_canvas(fb);
+    let modal_w = cw.min(520);
+    let modal_h = 180;
+    let x = cx + (cw - modal_w) as i32 / 2;
+    let y = cy + (ch - modal_h) as i32 / 2;
+
+    render::fill_rounded_rect(fb, x, y, modal_w, modal_h, theme::RADIUS, theme::CONTAINER);
+    render::draw_glow(
+        fb,
+        x,
+        y,
+        modal_w,
+        modal_h,
+        theme::RADIUS,
+        3,
+        theme::PRIMARY,
+        theme::BG,
+    );
+    render::draw_text_centered(
+        fb,
+        x,
+        y + 24,
+        modal_w,
+        "Save firmware setting changes?",
+        FontSize::Heading,
+        theme::TEXT,
+        Some(theme::CONTAINER),
+    );
+    render::draw_text_centered(
+        fb,
+        x,
+        y + 62,
+        modal_w,
+        "Changes take effect after reset.",
+        FontSize::Small,
+        theme::TEXT_DIM,
+        Some(theme::CONTAINER),
+    );
+
+    let (yes, no) = confirm_button_rects(fb);
+    draw_button(fb, yes, "SAVE", true);
+    draw_button(fb, no, "DISCARD", false);
+}
+
+#[cfg(feature = "ui")]
+fn confirm_button_rects(fb: &FramebufferInfo) -> ((i32, i32, u32, u32), (i32, i32, u32, u32)) {
+    let (cx, cy, cw, ch) = graphical_canvas(fb);
+    let modal_w = cw.min(520);
+    let modal_h = 180;
+    let x = cx + (cw - modal_w) as i32 / 2;
+    let y = cy + (ch - modal_h) as i32 / 2;
+    let bw = 132;
+    let bh = 38;
+    let gap = 16;
+    let by = y + 118;
+    let bx = x + (modal_w as i32 - (bw * 2 + gap)) / 2;
+    (
+        (bx, by, bw as u32, bh as u32),
+        (bx + bw + gap, by, bw as u32, bh as u32),
+    )
+}
+
+#[cfg(feature = "ui")]
+fn draw_button(fb: &FramebufferInfo, rect: (i32, i32, u32, u32), label: &str, primary: bool) {
+    let (x, y, w, h) = rect;
+    let bg = if primary {
+        theme::PRIMARY
+    } else {
+        theme::CONT_HIGH
+    };
+    let fg = if primary {
+        theme::ON_PRIMARY
+    } else {
+        theme::TEXT
+    };
+    render::fill_rounded_rect(fb, x, y, w, h, theme::RADIUS, bg);
+    render::draw_text_centered(fb, x, y + 9, w, label, FontSize::Small, fg, Some(bg));
+}
+
+#[cfg(feature = "ui")]
+fn point_in_rect(px: i32, py: i32, rect: (i32, i32, u32, u32)) -> bool {
+    let (x, y, w, h) = rect;
+    px >= x && px < x + w as i32 && py >= y && py < y + h as i32
+}
+
+#[cfg(feature = "ui")]
+fn show_save_result_graphical(fb: &FramebufferInfo, saved: usize, failed: usize) {
+    ui::clear(fb);
+    ui::draw_header(fb);
+    ui::draw_sidebar(fb, NavItem::Firmware, None);
+    ui::draw_footer(fb, "Returning to firmware menu");
+
+    let (cx, cy, cw, ch) = graphical_canvas(fb);
+    let mut msg: StackString<80> = StackString::new();
+    let ok = failed == 0;
+    if ok {
+        let _ = write!(msg, "Saved {} option(s).", saved);
+    } else {
+        let _ = write!(msg, "Saved {}, {} failed to write.", saved, failed);
+    }
+    render::draw_text_centered(
+        fb,
+        cx,
+        cy + ch as i32 / 2 - 18,
+        cw,
+        &msg,
+        FontSize::Heading,
+        if ok { theme::GREEN } else { theme::ERROR },
+        None,
+    );
+    delay_ms(1500);
+}
+
+#[cfg(feature = "ui")]
+fn show_no_options_graphical(fb: &FramebufferInfo) {
+    let mut cursor = crabefi::cursor::CursorRenderer::new();
+    ui::clear(fb);
+    ui::draw_header(fb);
+    ui::draw_sidebar(fb, NavItem::Firmware, None);
+    ui::draw_footer(fb, "Esc Back");
+
+    let (cx, cy, cw, ch) = graphical_canvas(fb);
+    render::draw_text_centered(
+        fb,
+        cx,
+        cy + ch as i32 / 2 - 12,
+        cw,
+        "No configurable options found",
+        FontSize::Normal,
+        theme::TEXT_DIM,
+        None,
+    );
+
+    loop {
+        ui::poll_and_render_cursor(fb, &mut cursor);
+        if let Some(key) = menu_common::read_key()
+            && matches!(key, KeyPress::Escape | KeyPress::Enter | KeyPress::Char(_))
+        {
+            cursor.hide(fb);
+            return;
+        }
+        delay_ms(8);
+    }
+}
+
+// ============================================================================
 // Drawing
 // ============================================================================
 
-/// Collect the indices of items that are currently visible (dependency-aware).
-fn visible_indices(cfr: &CfrInfo, items: &[MenuItem]) -> Vec<usize> {
+/// Count menu items that are currently visible (dependency-aware).
+fn visible_count(cfr: &CfrInfo, items: &[MenuItem]) -> usize {
     items
         .iter()
-        .enumerate()
-        .filter(|(_, item)| is_item_visible(cfr, items, item))
-        .map(|(i, _)| i)
-        .collect()
+        .filter(|item| is_item_visible(cfr, items, item))
+        .count()
+}
+
+/// Return the visible-list position of an item index without allocating.
+fn visible_position_of(cfr: &CfrInfo, items: &[MenuItem], target: usize) -> Option<usize> {
+    let mut pos = 0usize;
+    for (idx, item) in items.iter().enumerate() {
+        if !is_item_visible(cfr, items, item) {
+            continue;
+        }
+        if idx == target {
+            return Some(pos);
+        }
+        pos += 1;
+    }
+    None
+}
+
+/// Return the item index at a visible-list position without allocating.
+fn visible_index_at(cfr: &CfrInfo, items: &[MenuItem], target_pos: usize) -> Option<usize> {
+    let mut pos = 0usize;
+    for (idx, item) in items.iter().enumerate() {
+        if !is_item_visible(cfr, items, item) {
+            continue;
+        }
+        if pos == target_pos {
+            return Some(idx);
+        }
+        pos += 1;
+    }
+    None
 }
 
 /// Draw the complete menu
@@ -805,21 +1747,17 @@ fn draw_menu(
     };
     menu_common::draw_header(title, fb_console, cols);
 
-    // Build list of visible item indices (dependency-aware)
-    let vis = visible_indices(cfr, items);
-
     // Calculate visible area
     let start_row = 4;
     let visible_rows = rows.saturating_sub(8);
+    let vis_len = visible_count(cfr, items);
 
-    // Draw items — only the visible ones, respecting scroll_offset
-    for (screen_idx, &item_idx) in vis
-        .iter()
-        .enumerate()
-        .skip(scroll_offset)
-        .take(visible_rows)
-    {
-        let row = start_row + (screen_idx - scroll_offset);
+    // Draw items — only the visible ones, respecting scroll_offset.
+    for screen_idx in 0..visible_rows {
+        let Some(item_idx) = visible_index_at(cfr, items, scroll_offset + screen_idx) else {
+            break;
+        };
+        let row = start_row + screen_idx;
         let is_selected = item_idx == selected;
         draw_item(cfr, &items[item_idx], is_selected, row, fb_console, cols);
     }
@@ -828,7 +1766,7 @@ fn draw_menu(
     if scroll_offset > 0 {
         draw_scroll_indicator(start_row - 1, "^", fb_console);
     }
-    if scroll_offset + visible_rows < vis.len() {
+    if scroll_offset + visible_rows < vis_len {
         draw_scroll_indicator(start_row + visible_rows, "v", fb_console);
     }
 
@@ -985,16 +1923,16 @@ fn draw_option_item(
     let is_editable = option.is_editable();
 
     // Format the value for display
-    let mut value_str = String::new();
+    let mut value_str: StackString<128> = StackString::new();
     match (&option.option_type, value) {
         (CfrOptionType::Bool { .. }, CfrValue::Bool(b)) => {
-            value_str.push_str(if *b { "[Enabled]" } else { "[Disabled]" });
+            let _ = value_str.push_str(if *b { "[Enabled]" } else { "[Disabled]" });
         }
         (CfrOptionType::Enum { choices, .. }, CfrValue::Number(n)) => {
             if let Some(choice) = choices.iter().find(|c| c.value == *n) {
-                value_str.push('[');
-                value_str.push_str(&choice.ui_name);
-                value_str.push(']');
+                let _ = value_str.push('[');
+                let _ = value_str.push_str(&choice.ui_name);
+                let _ = value_str.push(']');
             } else {
                 let _ = write!(value_str, "[{}]", n);
             }
@@ -1007,18 +1945,18 @@ fn draw_option_item(
             }
         }
         (CfrOptionType::Varchar { .. }, CfrValue::Varchar(s)) => {
-            value_str.push('[');
+            let _ = value_str.push('[');
             let max_len = 20;
             if s.len() > max_len {
-                value_str.push_str(&s[..max_len]);
-                value_str.push_str("...");
+                let _ = value_str.push_str(&s[..max_len]);
+                let _ = value_str.push_str("...");
             } else {
-                value_str.push_str(s);
+                let _ = value_str.push_str(s);
             }
-            value_str.push(']');
+            let _ = value_str.push(']');
         }
         _ => {
-            value_str.push_str("[-]");
+            let _ = value_str.push_str("[-]");
         }
     }
 
