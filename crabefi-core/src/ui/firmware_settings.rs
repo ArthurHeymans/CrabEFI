@@ -2,7 +2,7 @@
 
 use super::{
     NavItem, ScreenNav, canvas, clear, draw_footer, draw_header, draw_sidebar,
-    poll_and_render_cursor, render, theme, update_sidebar_hover,
+    poll_and_render_cursor, render, reset_system, theme, update_sidebar_hover,
 };
 use crate::FramebufferConfig as FramebufferInfo;
 use crate::cursor::CursorRenderer;
@@ -37,10 +37,17 @@ pub fn show(fb: &FramebufferInfo) -> ScreenNav {
 
         if let Some(key) = menu_common::read_key() {
             match key {
-                KeyPress::Enter => {
+                KeyPress::Enter | KeyPress::Char('f') | KeyPress::Char('F') => {
                     cursor.hide(fb);
                     hooks.show_firmware_settings();
                     draw_settings(fb, hovered);
+                }
+                KeyPress::Char('s') | KeyPress::Char('S') => {
+                    cursor.hide(fb);
+                    return ScreenNav::Nav(NavItem::Security);
+                }
+                KeyPress::Char('r') | KeyPress::Char('R') => {
+                    reset_system();
                 }
                 KeyPress::Escape | KeyPress::Char('q') | KeyPress::Char('Q') => {
                     return ScreenNav::Back;
@@ -86,7 +93,7 @@ fn draw_settings(fb: &FramebufferInfo, hovered: bool) {
     clear(fb);
     draw_header(fb);
     draw_sidebar(fb, NavItem::Firmware, None);
-    draw_footer(fb, "Enter Open   Esc Back");
+    draw_footer(fb, "Enter/F Open  S Security  R Reset  Esc Back");
 
     let (cx, cy, cw, _) = canvas(fb);
     let mut y = cy;
@@ -178,7 +185,7 @@ fn show_no_settings(fb: &FramebufferInfo) -> ScreenNav {
         theme::TEXT_DIM,
         None,
     );
-    draw_footer(fb, "Esc Back");
+    draw_footer(fb, "S Security  F Firmware  R Reset  Esc Back");
 
     loop {
         poll_and_render_cursor(fb, &mut cursor);
@@ -186,6 +193,14 @@ fn show_no_settings(fb: &FramebufferInfo) -> ScreenNav {
 
         if let Some(key) = menu_common::read_key() {
             match key {
+                KeyPress::Char('s') | KeyPress::Char('S') => {
+                    cursor.hide(fb);
+                    return ScreenNav::Nav(NavItem::Security);
+                }
+                KeyPress::Char('f') | KeyPress::Char('F') => {}
+                KeyPress::Char('r') | KeyPress::Char('R') => {
+                    reset_system();
+                }
                 KeyPress::Escape | KeyPress::Char('q') | KeyPress::Char('Q') => {
                     return ScreenNav::Back;
                 }
