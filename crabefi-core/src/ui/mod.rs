@@ -305,6 +305,7 @@ struct BState {
     sel: usize,
     hovered: Option<usize>,
     sidebar_hov: Option<NavItem>,
+    scroll_offset: usize,
     countdown: u32,
     init_timeout: u32,
     tick: Timeout,
@@ -317,6 +318,7 @@ impl BState {
             sel,
             hovered: None,
             sidebar_hov: None,
+            scroll_offset: 0,
             countdown: timeout,
             init_timeout: timeout,
             tick: Timeout::from_ms(1000),
@@ -335,9 +337,40 @@ impl BState {
     }
 }
 
+fn reset_system() -> ! {
+    crate::arch::reset::keyboard_controller_reset();
+    delay_ms(100);
+    crate::arch::reset::triple_fault();
+}
+
+pub fn draw_scrollbar(
+    fb: &FramebufferInfo,
+    x: i32,
+    y: i32,
+    h: u32,
+    total_items: usize,
+    scroll_offset: usize,
+    visible_items: usize,
+) {
+    if total_items <= visible_items || visible_items == 0 || h == 0 {
+        return;
+    }
+
+    let track_w = 4;
+    render::fill_rounded_rect(fb, x, y, track_w, h, 2, theme::SIDE);
+
+    let thumb_h = ((h as usize * visible_items) / total_items)
+        .max(24)
+        .min(h as usize) as u32;
+    let max_offset = total_items.saturating_sub(visible_items).max(1);
+    let thumb_y = y + ((h - thumb_h) as usize * scroll_offset / max_offset) as i32;
+    render::fill_rounded_rect(fb, x, thumb_y, track_w, thumb_h, 2, theme::PRIMARY);
+}
+
 fn run_boot(fb: &FramebufferInfo, menu: &mut BootMenu) -> BootResult {
     let mut cursor = CursorRenderer::new();
     let mut st = BState::new(menu.entry_count(), menu.selected, menu.timeout_seconds);
+    keep_boot_selection_visible(fb, &mut st);
 
     paint_boot(fb, menu, &st);
 
@@ -347,7 +380,7 @@ fn run_boot(fb: &FramebufferInfo, menu: &mut BootMenu) -> BootResult {
         update_sidebar_hover(fb, &mut st.sidebar_hov, NavItem::Boot);
 
         // ── Card hover ──
-        let hov = boot_hit(fb, menu);
+        let hov = boot_hit(fb, menu, &st);
         if hov != st.hovered {
             let prev = st.hovered;
             st.hovered = hov;
@@ -367,16 +400,16 @@ fn run_boot(fb: &FramebufferInfo, menu: &mut BootMenu) -> BootResult {
 
             match key {
                 KeyPress::Up | KeyPress::Char('k') => {
-                    let p = st.sel;
                     st.sel_prev();
                     menu.selected = st.sel;
-                    repaint2(fb, menu, &st, p, st.sel);
+                    keep_boot_selection_visible(fb, &mut st);
+                    paint_boot(fb, menu, &st);
                 }
                 KeyPress::Down | KeyPress::Char('j') => {
-                    let p = st.sel;
                     st.sel_next();
                     menu.selected = st.sel;
-                    repaint2(fb, menu, &st, p, st.sel);
+                    keep_boot_selection_visible(fb, &mut st);
+                    paint_boot(fb, menu, &st);
                 }
                 KeyPress::Enter => {
                     cursor.hide(fb);
@@ -391,9 +424,7 @@ fn run_boot(fb: &FramebufferInfo, menu: &mut BootMenu) -> BootResult {
                     return BootResult::Nav(NavItem::Firmware);
                 }
                 KeyPress::Char('r') | KeyPress::Char('R') => {
-                    crate::arch::reset::keyboard_controller_reset();
-                    delay_ms(100);
-                    crate::arch::reset::triple_fault();
+                    reset_system();
                 }
                 #[cfg(feature = "ui")]
                 KeyPress::MouseClick { .. } => {
@@ -410,22 +441,22 @@ fn run_boot(fb: &FramebufferInfo, menu: &mut BootMenu) -> BootResult {
                             cursor.hide(fb);
                             return BootResult::Selected(idx);
                         }
-                        let p = st.sel;
                         st.sel = idx;
                         menu.selected = idx;
-                        repaint2(fb, menu, &st, p, idx);
+                        keep_boot_selection_visible(fb, &mut st);
+                        paint_boot(fb, menu, &st);
                     }
                 }
                 #[cfg(feature = "ui")]
                 KeyPress::MouseScroll(dz) => {
-                    let p = st.sel;
                     if dz > 0 {
                         st.sel_next();
                     } else {
                         st.sel_prev();
                     }
                     menu.selected = st.sel;
-                    repaint2(fb, menu, &st, p, st.sel);
+                    keep_boot_selection_visible(fb, &mut st);
+                    paint_boot(fb, menu, &st);
                 }
                 _ => {}
             }
@@ -521,9 +552,7 @@ fn run_no_media(fb: &FramebufferInfo) -> ScreenNav {
         if let Some(key) = menu_common::read_key() {
             match key {
                 KeyPress::Char('r') | KeyPress::Char('R') => {
-                    crate::arch::reset::keyboard_controller_reset();
-                    delay_ms(100);
-                    crate::arch::reset::triple_fault();
+                    reset_system();
                 }
                 KeyPress::Char('s') | KeyPress::Char('S') => {
                     cursor.hide(fb);
@@ -552,24 +581,49 @@ fn run_no_media(fb: &FramebufferInfo) -> ScreenNav {
 
 // ── Boot internals ──────────────────────────────────────────────────────
 
-/// Y for the i-th boot card.
-fn card_y(fb: &FramebufferInfo, i: usize) -> i32 {
-    let (_, cy, _, _) = canvas(fb);
-    // Section header: label(16px) + 4 + title(32px) + 12 = 64px
+fn boot_list_area(fb: &FramebufferInfo) -> (i32, i32, u32, u32) {
+    let (cx, cy, cw, ch) = canvas(fb);
     let header_h =
         render::font_height(FontSize::Small) + 4 + render::font_height(FontSize::Display) + 12;
-    cy + header_h as i32 + (i as i32) * (theme::CARD_H as i32 + theme::GAP as i32)
+    let y = cy + header_h as i32;
+    (cx, y, cw, ch.saturating_sub(header_h))
 }
 
-fn card_rect(fb: &FramebufferInfo, i: usize) -> (i32, i32, u32, u32) {
-    let (cx, _, cw, _) = canvas(fb);
-    (cx, card_y(fb, i), cw, theme::CARD_H)
+fn boot_visible_slots(fb: &FramebufferInfo) -> usize {
+    let (_, _, _, h) = boot_list_area(fb);
+    if h < theme::CARD_H {
+        1
+    } else {
+        ((h + theme::GAP) / (theme::CARD_H + theme::GAP)).max(1) as usize
+    }
 }
 
-fn boot_hit(fb: &FramebufferInfo, menu: &BootMenu) -> Option<usize> {
+fn keep_boot_selection_visible(fb: &FramebufferInfo, st: &mut BState) {
+    let slots = boot_visible_slots(fb);
+    if st.sel < st.scroll_offset {
+        st.scroll_offset = st.sel;
+    } else if st.sel >= st.scroll_offset + slots {
+        st.scroll_offset = st.sel - slots + 1;
+    }
+}
+
+fn card_rect(fb: &FramebufferInfo, st: &BState, idx: usize) -> Option<(i32, i32, u32, u32)> {
+    if idx < st.scroll_offset || idx >= st.scroll_offset + boot_visible_slots(fb) {
+        return None;
+    }
+    let (cx, list_y, cw, _) = boot_list_area(fb);
+    let slot = idx - st.scroll_offset;
+    let y = list_y + (slot as i32 * (theme::CARD_H + theme::GAP) as i32);
+    Some((cx, y, cw, theme::CARD_H))
+}
+
+fn boot_hit(fb: &FramebufferInfo, menu: &BootMenu, st: &BState) -> Option<usize> {
     let (mx, my) = mouse_cursor::position();
-    for i in 0..menu.entry_count() {
-        let (cx, cy, cw, ch) = card_rect(fb, i);
+    let end = (st.scroll_offset + boot_visible_slots(fb)).min(menu.entry_count());
+    for i in st.scroll_offset..end {
+        let Some((cx, cy, cw, ch)) = card_rect(fb, st, i) else {
+            continue;
+        };
         if mx >= cx && mx < cx + cw as i32 && my >= cy && my < cy + ch as i32 {
             return Some(i);
         }
@@ -607,15 +661,29 @@ fn paint_boot(fb: &FramebufferInfo, menu: &BootMenu, st: &BState) {
         None,
     );
 
-    for i in 0..menu.entry_count() {
+    let end = (st.scroll_offset + boot_visible_slots(fb)).min(menu.entry_count());
+    for i in st.scroll_offset..end {
         paint_boot_card(fb, menu, st, i);
     }
+
+    let (list_x, list_y, list_w, list_h) = boot_list_area(fb);
+    draw_scrollbar(
+        fb,
+        list_x + list_w as i32 - 4,
+        list_y,
+        list_h,
+        menu.entry_count(),
+        st.scroll_offset,
+        boot_visible_slots(fb),
+    );
 
     paint_boot_footer(fb, st);
 }
 
 fn paint_boot_card(fb: &FramebufferInfo, menu: &BootMenu, st: &BState, idx: usize) {
-    let (cx, cy, cw, ch) = card_rect(fb, idx);
+    let Some((cx, cy, cw, ch)) = card_rect(fb, st, idx) else {
+        return;
+    };
     let is_sel = idx == st.sel;
     let is_hov = st.hovered == Some(idx);
 
@@ -760,13 +828,6 @@ fn paint_boot_footer(fb: &FramebufferInfo, st: &BState) {
             fb,
             "Up/Down Navigate  Enter Boot  S Security  F Firmware  R Reset",
         );
-    }
-}
-
-fn repaint2(fb: &FramebufferInfo, menu: &BootMenu, st: &BState, a: usize, b: usize) {
-    paint_boot_card(fb, menu, st, a);
-    if a != b {
-        paint_boot_card(fb, menu, st, b);
     }
 }
 

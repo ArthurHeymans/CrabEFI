@@ -1095,7 +1095,9 @@ pub fn show_menu(menu: &mut BootMenu) -> Option<usize> {
                 KeyPress::MouseClick { y, .. } => {
                     // Map screen Y pixel to menu entry index
                     // Menu entries start at row ~5 (after header + category)
-                    if let Some(idx) = row_to_entry_index(menu, y) {
+                    if let Some(idx) =
+                        row_to_entry_index(menu, y, menu_scroll_offset(menu, &fb_console))
+                    {
                         menu.selected = idx;
                         draw_menu(menu, &mut fb_console);
                     }
@@ -1123,41 +1125,100 @@ pub fn show_menu(menu: &mut BootMenu) -> Option<usize> {
 /// Returns `Some(index)` if the row corresponds to a boot entry,
 /// `None` if it's a header, separator, or out of range.
 #[cfg(feature = "ui")]
-fn row_to_entry_index(menu: &BootMenu, row: u32) -> Option<usize> {
-    // Menu layout: row 0-2 = header, row 3 = blank, row 4+ = entries with separators
-    let start_row = 4u32;
-    let mut current_row = start_row;
+fn row_to_entry_index(menu: &BootMenu, row: u32, scroll_offset: usize) -> Option<usize> {
+    // Menu layout: row 0-2 = header, row 3 = blank, row 4+ = visible menu rows.
+    let start_row = 4usize;
+    let target_row = row as usize;
+    let mut logical_row = 0usize;
     let mut current_category: Option<BootCategory> = None;
 
     for (i, entry) in menu.entries.iter().enumerate() {
         if current_category != Some(entry.category) {
             if current_category.is_some() {
-                current_row += 1; // blank line
+                logical_row += 1; // blank line
             }
-            current_row += 1; // category separator
+            logical_row += 1; // category separator
             current_category = Some(entry.category);
         }
 
-        if row == current_row {
-            return Some(i);
+        if logical_row >= scroll_offset {
+            let screen_row = start_row + logical_row - scroll_offset;
+            if target_row == screen_row {
+                return Some(i);
+            }
         }
-        current_row += 1;
+        logical_row += 1;
     }
     None
 }
 
 use crate::menu_common::{self, KeyPress, SerialWriter};
 
+fn menu_visible_rows(fb_console: &Option<FramebufferConsole>) -> usize {
+    let rows = fb_console.as_ref().map(|c| c.rows()).unwrap_or(25) as usize;
+    rows.saturating_sub(10).max(1)
+}
+
+fn menu_item_count(menu: &BootMenu) -> usize {
+    let mut count = 0usize;
+    let mut current_category: Option<BootCategory> = None;
+    for entry in &menu.entries {
+        if current_category != Some(entry.category) {
+            if current_category.is_some() {
+                count += 1;
+            }
+            count += 1;
+            current_category = Some(entry.category);
+        }
+        count += 1;
+    }
+    count
+}
+
+fn selected_menu_position(menu: &BootMenu) -> usize {
+    let mut pos = 0usize;
+    let mut current_category: Option<BootCategory> = None;
+    for (i, entry) in menu.entries.iter().enumerate() {
+        if current_category != Some(entry.category) {
+            if current_category.is_some() {
+                pos += 1;
+            }
+            pos += 1;
+            current_category = Some(entry.category);
+        }
+        if i == menu.selected {
+            return pos;
+        }
+        pos += 1;
+    }
+    0
+}
+
+fn menu_scroll_offset(menu: &BootMenu, fb_console: &Option<FramebufferConsole>) -> usize {
+    let visible_rows = menu_visible_rows(fb_console);
+    let selected_pos = selected_menu_position(menu);
+    if selected_pos >= visible_rows {
+        selected_pos - visible_rows + 1
+    } else {
+        0
+    }
+}
+
 /// Draw the menu on both outputs
 fn draw_menu(menu: &BootMenu, fb_console: &mut Option<FramebufferConsole>) {
     let cols = fb_console.as_ref().map(|c| c.cols()).unwrap_or(80) as usize;
+    let rows = fb_console.as_ref().map(|c| c.rows()).unwrap_or(25) as usize;
+    let visible_rows = menu_visible_rows(fb_console);
+    let scroll_offset = menu_scroll_offset(menu, fb_console);
+    let total_rows = menu_item_count(menu);
 
     // Draw header
     draw_header(fb_console, cols);
 
     // Draw entries with category separators
     let start_row = 4;
-    let mut current_row = start_row;
+    let mut logical_row = 0usize;
+    let mut screen_row = start_row;
     let mut current_category: Option<BootCategory> = None;
 
     for (i, entry) in menu.entries.iter().enumerate() {
@@ -1165,20 +1226,33 @@ fn draw_menu(menu: &BootMenu, fb_console: &mut Option<FramebufferConsole>) {
         if current_category != Some(entry.category) {
             // Add blank line before separator (except for first category)
             if current_category.is_some() {
-                current_row += 1;
+                logical_row += 1;
             }
-            draw_category_separator(entry.category, current_row, fb_console, cols);
-            current_row += 1;
+            if logical_row >= scroll_offset && logical_row < scroll_offset + visible_rows {
+                draw_category_separator(entry.category, screen_row, fb_console, cols);
+                screen_row += 1;
+            }
+            logical_row += 1;
             current_category = Some(entry.category);
         }
 
         let is_selected = i == menu.selected;
-        draw_entry(i, entry, is_selected, current_row, fb_console, cols);
-        current_row += 1;
+        if logical_row >= scroll_offset && logical_row < scroll_offset + visible_rows {
+            draw_entry(i, entry, is_selected, screen_row, fb_console, cols);
+            screen_row += 1;
+        }
+        logical_row += 1;
+    }
+
+    if scroll_offset > 0 {
+        draw_scroll_indicator(start_row - 1, "^", fb_console);
+    }
+    if scroll_offset + visible_rows < total_rows {
+        draw_scroll_indicator(start_row + visible_rows, "v", fb_console);
     }
 
     // Draw help text
-    let help_row = current_row + 2;
+    let help_row = rows.saturating_sub(5);
     draw_help(help_row, fb_console, cols);
 }
 
@@ -1294,6 +1368,20 @@ fn draw_entry(
             let _ = console.write_str(" ");
         }
 
+        console.reset_colors();
+    }
+}
+
+/// Draw a simple scroll indicator when the menu does not fit on screen.
+fn draw_scroll_indicator(row: usize, indicator: &str, fb_console: &mut Option<FramebufferConsole>) {
+    let ansi_row = row + 1;
+    let _ = write!(SerialWriter, "\x1b[{};40H{}", ansi_row, indicator);
+
+    if let Some(console) = fb_console {
+        let cols = console.cols();
+        console.set_position(cols / 2, row as u32);
+        console.set_fg_color(Color::new(128, 128, 128));
+        let _ = console.write_str(indicator);
         console.reset_colors();
     }
 }
