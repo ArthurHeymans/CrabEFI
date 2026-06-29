@@ -164,7 +164,7 @@ impl EcamAccess {
 
     /// Calculate the ECAM address for a given BDF and register offset
     ///
-    /// ECAM address = base + (bus << 20) | (device << 15) | (function << 12) | offset
+    /// ECAM address = base | (bus << 20) | (device << 15) | (function << 12) | offset
     fn ecam_address(&self, addr: PciAddress, offset: u16) -> u64 {
         debug_assert!(
             offset <= 4095,
