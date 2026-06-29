@@ -335,6 +335,16 @@ pub fn enable_device(dev: &PciDevice) {
     });
 }
 
+/// Read a 16-bit PCI configuration-space register.
+pub fn read_config16(addr: PciAddress, offset: u16) -> u16 {
+    with_access(|access| access.read16(addr, offset))
+}
+
+/// Write a 16-bit PCI configuration-space register.
+pub fn write_config16(addr: PciAddress, offset: u16, value: u16) {
+    with_access(|access| access.write16(addr, offset, value));
+}
+
 // ============================================================================
 // Initialization
 // ============================================================================
