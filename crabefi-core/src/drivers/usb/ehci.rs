@@ -902,6 +902,25 @@ impl EhciController {
         Ok(())
     }
 
+    fn hub_port_class_request(
+        &mut self,
+        hub_device: &UsbDevice,
+        direction: u8,
+        request: u8,
+        value: u16,
+        port: u8,
+        data: Option<&mut [u8]>,
+    ) -> Result<usize, UsbError> {
+        self.control_transfer_internal(
+            hub_device,
+            direction | req_type::TYPE_CLASS | req_type::RCPT_OTHER,
+            request,
+            value,
+            port as u16,
+            data,
+        )
+    }
+
     /// Enumerate devices connected to a USB hub.
     fn enumerate_hub(&mut self, hub_slot: usize, hub_addr: u8) -> Result<(), UsbError> {
         log::info!("EHCI: Enumerating hub at address {}", hub_addr);
@@ -936,12 +955,12 @@ impl EhciController {
 
         // Power on all downstream ports (SET_FEATURE PORT_POWER).
         for port in 1..=num_ports {
-            let _ = self.control_transfer_internal(
+            let _ = self.hub_port_class_request(
                 &hub_device,
-                req_type::DIR_OUT | req_type::TYPE_CLASS | req_type::RCPT_OTHER,
+                req_type::DIR_OUT,
                 request::SET_FEATURE,
                 hub_feature::PORT_POWER,
-                port as u16,
+                port,
                 None,
             );
         }
@@ -956,12 +975,12 @@ impl EhciController {
         for port in 1..=num_ports {
             let mut status_buf = [0u8; 4];
             if self
-                .control_transfer_internal(
+                .hub_port_class_request(
                     &hub_device,
-                    req_type::DIR_IN | req_type::TYPE_CLASS | req_type::RCPT_OTHER,
+                    req_type::DIR_IN,
                     request::GET_STATUS,
                     0,
-                    port as u16,
+                    port,
                     Some(&mut status_buf),
                 )
                 .is_err()
@@ -1003,24 +1022,24 @@ impl EhciController {
     ) -> Option<UsbSpeed> {
         // Clear the connection-change bit if set.
         if initial_change & hub_port_change::C_CONNECTION != 0 {
-            let _ = self.control_transfer_internal(
+            let _ = self.hub_port_class_request(
                 hub_device,
-                req_type::DIR_OUT | req_type::TYPE_CLASS | req_type::RCPT_OTHER,
+                req_type::DIR_OUT,
                 request::CLEAR_FEATURE,
                 hub_feature::C_PORT_CONNECTION,
-                port as u16,
+                port,
                 None,
             );
         }
 
         // Issue a port reset (SET_FEATURE PORT_RESET).
         if self
-            .control_transfer_internal(
+            .hub_port_class_request(
                 hub_device,
-                req_type::DIR_OUT | req_type::TYPE_CLASS | req_type::RCPT_OTHER,
+                req_type::DIR_OUT,
                 request::SET_FEATURE,
                 hub_feature::PORT_RESET,
-                port as u16,
+                port,
                 None,
             )
             .is_err()
@@ -1035,12 +1054,12 @@ impl EhciController {
         while !timeout.is_expired() {
             let mut status_buf = [0u8; 4];
             if self
-                .control_transfer_internal(
+                .hub_port_class_request(
                     hub_device,
-                    req_type::DIR_IN | req_type::TYPE_CLASS | req_type::RCPT_OTHER,
+                    req_type::DIR_IN,
                     request::GET_STATUS,
                     0,
-                    port as u16,
+                    port,
                     Some(&mut status_buf),
                 )
                 .is_err()
@@ -1053,12 +1072,12 @@ impl EhciController {
 
             if port_change & hub_port_change::C_RESET != 0 {
                 // Acknowledge the reset-complete change bit.
-                let _ = self.control_transfer_internal(
+                let _ = self.hub_port_class_request(
                     hub_device,
-                    req_type::DIR_OUT | req_type::TYPE_CLASS | req_type::RCPT_OTHER,
+                    req_type::DIR_OUT,
                     request::CLEAR_FEATURE,
                     hub_feature::C_PORT_RESET,
-                    port as u16,
+                    port,
                     None,
                 );
 
