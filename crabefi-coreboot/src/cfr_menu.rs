@@ -80,6 +80,25 @@ fn has_changes(items: &[MenuItem]) -> bool {
     })
 }
 
+/// Treat the current in-menu values as saved after a successful explicit save.
+#[cfg(feature = "ui")]
+fn mark_changes_saved(items: &mut [MenuItem]) {
+    for item in items {
+        match item {
+            MenuItem::CrabLogLevel {
+                current_level,
+                original_level,
+            } => *original_level = *current_level,
+            MenuItem::Option {
+                current_value,
+                original_value,
+                ..
+            } => *original_value = current_value.clone(),
+            _ => {}
+        }
+    }
+}
+
 /// Show the CFR firmware settings menu
 ///
 /// Displays the menu and handles user interaction.
@@ -125,6 +144,8 @@ pub fn show_cfr_menu() {
         } else if sel_vis_pos >= scroll_offset + screen_rows {
             scroll_offset = sel_vis_pos - screen_rows + 1;
         }
+        scroll_offset =
+            scroll_offset.min(visible_count(cfr_info, &items).saturating_sub(screen_rows));
         draw_menu(
             cfr_info,
             &items,
@@ -611,11 +632,12 @@ fn save_all_changes(cfr: &CfrInfo, items: &[MenuItem]) -> (usize, usize) {
                 current_level,
                 original_level,
             } if current_level != original_level => {
-                if crabefi::logger::set_configured_level(*current_level).is_ok() {
-                    saved += 1;
-                } else {
-                    log::warn!("Failed to save CrabEFI log level");
-                    failed += 1;
+                match crabefi::logger::set_configured_level(*current_level) {
+                    Ok(()) => saved += 1,
+                    Err(e) => {
+                        log::warn!("Failed to save CrabEFI log level: {:?}", e);
+                        failed += 1;
+                    }
                 }
             }
             MenuItem::Option {
@@ -878,6 +900,24 @@ fn show_cfr_menu_graphical(cfr_info: &CfrInfo, fb: &FramebufferInfo) {
                         state.status_message = Some(("Option cannot be decreased", false));
                     }
                 }
+                KeyPress::Char('s') | KeyPress::Char('S') => {
+                    if has_changes(&items) {
+                        cursor.hide(fb);
+                        let (saved, failed) = save_all_changes(cfr_info, &items);
+                        show_save_result_graphical(fb, saved, failed);
+                        if failed == 0 {
+                            mark_changes_saved(&mut items);
+                        }
+                    } else {
+                        state.status_message = Some(("No changes to save", true));
+                    }
+                }
+                KeyPress::Char('f') | KeyPress::Char('F') => {
+                    state.status_message = Some(("Already in firmware settings", true));
+                }
+                KeyPress::Char('r') | KeyPress::Char('R') => {
+                    crabefi::reset_system();
+                }
                 KeyPress::Escape | KeyPress::Char('q') | KeyPress::Char('Q') => {
                     cursor.hide(fb);
                     if has_changes(&items) && confirm_save_graphical(fb) {
@@ -986,6 +1026,9 @@ fn keep_graphical_selection_visible(
     } else if sel_vis_pos >= state.scroll_offset + slots {
         state.scroll_offset = sel_vis_pos - slots + 1;
     }
+    state.scroll_offset = state
+        .scroll_offset
+        .min(visible_count(cfr, items).saturating_sub(slots));
 }
 
 #[cfg(feature = "ui")]
@@ -1000,9 +1043,9 @@ fn draw_graphical_menu(
     ui::draw_sidebar(fb, NavItem::Firmware, None);
 
     let footer = if has_changes(items) {
-        "Up/Down Navigate  Enter Edit  +/- Adjust  ? Help  Esc Save/Exit"
+        "Up/Down Navigate  Enter Edit  +/- Adjust  ? Help  S Save  F Firmware  R Reset  Esc Save/Exit"
     } else {
-        "Up/Down Navigate  Enter Edit  +/- Adjust  ? Help  Esc Back"
+        "Up/Down Navigate  Enter Edit  +/- Adjust  ? Help  S Save  F Firmware  R Reset  Esc Back"
     };
     ui::draw_footer(fb, footer);
 
@@ -1310,6 +1353,27 @@ fn graphical_item_hit(
     visible_index_at(cfr, items, state.scroll_offset + slot)
 }
 
+fn push_truncated<const N: usize>(out: &mut StackString<N>, text: &str, max_chars: usize) {
+    if max_chars == 0 {
+        return;
+    }
+
+    let mut chars = text.chars();
+    for idx in 0..max_chars {
+        let Some(ch) = chars.next() else {
+            return;
+        };
+        if idx + 1 == max_chars && chars.next().is_some() {
+            let _ = out.push('~');
+            return;
+        }
+        if out.push(ch).is_err() {
+            let _ = out.push('~');
+            return;
+        }
+    }
+}
+
 #[cfg(feature = "ui")]
 fn format_value(option: &CfrOption, value: &CfrValue) -> StackString<96> {
     let mut out = StackString::new();
@@ -1319,7 +1383,7 @@ fn format_value(option: &CfrOption, value: &CfrValue) -> StackString<96> {
         }
         (CfrOptionType::Enum { choices, .. }, CfrValue::Number(n)) => {
             if let Some(choice) = choices.iter().find(|c| c.value == *n) {
-                let _ = out.push_str(&choice.ui_name);
+                push_truncated(&mut out, &choice.ui_name, 95);
             } else {
                 let _ = write!(out, "{}", n);
             }
@@ -1332,7 +1396,7 @@ fn format_value(option: &CfrOption, value: &CfrValue) -> StackString<96> {
             }
         }
         (CfrOptionType::Varchar { .. }, CfrValue::Varchar(s)) => {
-            let _ = out.push_str(s);
+            push_truncated(&mut out, s, 95);
         }
         _ => {
             let _ = out.push('-');
@@ -1931,7 +1995,7 @@ fn draw_option_item(
         (CfrOptionType::Enum { choices, .. }, CfrValue::Number(n)) => {
             if let Some(choice) = choices.iter().find(|c| c.value == *n) {
                 let _ = value_str.push('[');
-                let _ = value_str.push_str(&choice.ui_name);
+                push_truncated(&mut value_str, &choice.ui_name, 120);
                 let _ = value_str.push(']');
             } else {
                 let _ = write!(value_str, "[{}]", n);
@@ -1946,13 +2010,7 @@ fn draw_option_item(
         }
         (CfrOptionType::Varchar { .. }, CfrValue::Varchar(s)) => {
             let _ = value_str.push('[');
-            let max_len = 20;
-            if s.len() > max_len {
-                let _ = value_str.push_str(&s[..max_len]);
-                let _ = value_str.push_str("...");
-            } else {
-                let _ = value_str.push_str(s);
-            }
+            push_truncated(&mut value_str, s, 20);
             let _ = value_str.push(']');
         }
         _ => {
