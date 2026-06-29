@@ -2,7 +2,7 @@
 
 use super::{
     NavItem, ScreenNav, canvas, clear, draw_footer, draw_header, draw_scrollbar, draw_sidebar,
-    poll_and_render_cursor, render, reset_system, theme, update_sidebar_hover,
+    poll_and_render_cursor, render, theme, update_sidebar_hover,
 };
 use crate::FramebufferConfig as FramebufferInfo;
 use crate::cursor::CursorRenderer;
@@ -22,7 +22,7 @@ pub fn show(fb: &FramebufferInfo) -> ScreenNav {
     let mut scroll_offset: usize = 0;
     let mut status: Option<(&str, bool)> = None;
 
-    draw_screen(fb, selected, hovered, scroll_offset, status);
+    draw_screen(fb, selected, hovered, sidebar_hov, scroll_offset, status);
 
     loop {
         poll_and_render_cursor(fb, &mut cursor);
@@ -33,7 +33,7 @@ pub fn show(fb: &FramebufferInfo) -> ScreenNav {
         let new_hov = action_hit(fb, scroll_offset);
         if new_hov != hovered {
             hovered = new_hov;
-            draw_screen(fb, selected, hovered, scroll_offset, status);
+            draw_screen(fb, selected, hovered, sidebar_hov, scroll_offset, status);
         }
 
         if let Some(key) = menu_common::read_key() {
@@ -42,14 +42,14 @@ pub fn show(fb: &FramebufferInfo) -> ScreenNav {
                 KeyPress::Up | KeyPress::Char('k') => {
                     selected = selected.saturating_sub(1);
                     keep_action_visible(fb, selected, &mut scroll_offset);
-                    draw_screen(fb, selected, hovered, scroll_offset, status);
+                    draw_screen(fb, selected, hovered, sidebar_hov, scroll_offset, status);
                 }
                 KeyPress::Down | KeyPress::Char('j') => {
                     if selected < ACTION_COUNT - 1 {
                         selected += 1;
                     }
                     keep_action_visible(fb, selected, &mut scroll_offset);
-                    draw_screen(fb, selected, hovered, scroll_offset, status);
+                    draw_screen(fb, selected, hovered, sidebar_hov, scroll_offset, status);
                 }
                 KeyPress::Char('s') | KeyPress::Char('S') => {}
                 KeyPress::Char('f') | KeyPress::Char('F') => {
@@ -57,7 +57,7 @@ pub fn show(fb: &FramebufferInfo) -> ScreenNav {
                     return ScreenNav::Nav(NavItem::Firmware);
                 }
                 KeyPress::Char('r') | KeyPress::Char('R') => {
-                    reset_system();
+                    crate::reset_system();
                 }
                 KeyPress::Escape | KeyPress::Char('q') | KeyPress::Char('Q') => {
                     return ScreenNav::Back;
@@ -67,7 +67,7 @@ pub fn show(fb: &FramebufferInfo) -> ScreenNav {
                     if selected == ACTION_BACK {
                         return ScreenNav::Back;
                     }
-                    draw_screen(fb, selected, hovered, scroll_offset, status);
+                    draw_screen(fb, selected, hovered, sidebar_hov, scroll_offset, status);
                 }
                 #[cfg(feature = "ui")]
                 KeyPress::MouseClick { .. } => {
@@ -89,7 +89,7 @@ pub fn show(fb: &FramebufferInfo) -> ScreenNav {
                             selected = idx;
                             keep_action_visible(fb, selected, &mut scroll_offset);
                         }
-                        draw_screen(fb, selected, hovered, scroll_offset, status);
+                        draw_screen(fb, selected, hovered, sidebar_hov, scroll_offset, status);
                     }
                 }
                 #[cfg(feature = "ui")]
@@ -100,7 +100,7 @@ pub fn show(fb: &FramebufferInfo) -> ScreenNav {
                         selected -= 1;
                     }
                     keep_action_visible(fb, selected, &mut scroll_offset);
-                    draw_screen(fb, selected, hovered, scroll_offset, status);
+                    draw_screen(fb, selected, hovered, sidebar_hov, scroll_offset, status);
                 }
                 _ => {}
             }
@@ -285,12 +285,13 @@ fn draw_screen(
     fb: &FramebufferInfo,
     selected: usize,
     hovered: Option<usize>,
+    sidebar_hov: Option<NavItem>,
     scroll_offset: usize,
     status: Option<(&str, bool)>,
 ) {
     clear(fb);
     draw_header(fb);
-    draw_sidebar(fb, NavItem::Security, None);
+    draw_sidebar(fb, NavItem::Security, sidebar_hov);
     draw_footer(
         fb,
         "Up/Down Navigate  Enter Select  S Security  F Firmware  R Reset  Esc Back",

@@ -253,14 +253,16 @@ pub fn show_secure_boot_menu() {
                     }
                     KeyPress::Char('f') | KeyPress::Char('F') => {
                         if let Some(hooks) = crate::state::drivers().platform.hooks {
-                            hooks.show_firmware_settings();
+                            if !hooks.show_firmware_settings() {
+                                status_message = Some(("Firmware settings not available", false));
+                            }
+                        } else {
+                            status_message = Some(("Firmware settings not available", false));
                         }
                         break;
                     }
                     KeyPress::Char('r') | KeyPress::Char('R') => {
-                        crate::arch::reset::keyboard_controller_reset();
-                        delay_ms(100);
-                        crate::arch::reset::triple_fault();
+                        crate::reset_system();
                     }
                     KeyPress::Escape | KeyPress::Char('q') | KeyPress::Char('Q') => {
                         return;
