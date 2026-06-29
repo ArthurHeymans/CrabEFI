@@ -304,6 +304,37 @@ pub enum DeviceType {
     PortMultiplier,
 }
 
+const PCI_VENDOR_ID_INTEL: u16 = 0x8086;
+const INTEL_PCS_6: u16 = 0x92;
+
+fn needs_intel_pcs_quirk(pci_dev: &PciDevice) -> bool {
+    if pci_dev.vendor_id != PCI_VENDOR_ID_INTEL {
+        return false;
+    }
+
+    // Linux marks Cougar Point/Patsburg/Panther Point AHCI and RAID IDs with
+    // AHCI_HFLAG_INTEL_PCS_QUIRK.  X220 is CPT-M AHCI (8086:1c03).
+    matches!(
+        pci_dev.device_id,
+        0x1c02
+            | 0x1c03
+            | 0x1c04
+            | 0x1c05
+            | 0x1c06
+            | 0x1c07
+            | 0x1d02
+            | 0x1d04
+            | 0x1d06
+            | 0x1e02
+            | 0x1e03
+            | 0x1e04
+            | 0x1e05
+            | 0x1e06
+            | 0x1e07
+            | 0x1e0e
+    )
+}
+
 /// AHCI Controller
 pub struct AhciController {
     /// PCI address (bus:device.function)
@@ -354,6 +385,28 @@ impl AhciController {
     fn port_regs(&self, port: u8) -> &AhciPortRegisters {
         let port_addr = self.mmio_base + PORT_BASE + (port as u64) * PORT_SIZE;
         unsafe { &*(port_addr as *const AhciPortRegisters) }
+    }
+
+    fn apply_intel_pcs_quirk(&self, pci_dev: &PciDevice) {
+        if !needs_intel_pcs_quirk(pci_dev) {
+            return;
+        }
+
+        // Intel PCH SATA exposes a PCI PCS register which gates physical ports.
+        // Linux's ahci_intel_pcs_quirk() enables every implemented AHCI port
+        // after controller reset; without this, the X220 dock/SATAPI port can
+        // be visible in PI but fail commands.
+        let port_map = (self.ports_implemented & 0x3f) as u16;
+        let pcs = pci::read_config16(pci_dev.address, INTEL_PCS_6);
+        if (pcs & port_map) != port_map {
+            let new_pcs = pcs | port_map;
+            pci::write_config16(pci_dev.address, INTEL_PCS_6, new_pcs);
+            log::debug!(
+                "AHCI: Intel PCS quirk enabled ports ({:#06x} -> {:#06x})",
+                pcs,
+                new_pcs
+            );
+        }
     }
 
     /// Create a new AHCI controller from a PCI device
@@ -417,6 +470,8 @@ impl AhciController {
             ports_implemented,
             ports: heapless::Vec::new(),
         };
+
+        controller.apply_intel_pcs_quirk(pci_dev);
 
         // Initialize ports (pass SSS capability)
         controller.init_ports_with_sss(supports_sss)?;
@@ -485,14 +540,24 @@ impl AhciController {
                             log::warn!("AHCI: Failed to add port {} - port list full", port_num);
                         }
                     } else if port.device_type == DeviceType::Satapi {
-                        log::info!(
-                            "AHCI Port {}: SATAPI device, {} sectors (sector_size={})",
-                            port_num,
-                            port.sector_count,
-                            port.sector_size
-                        );
-                        if self.ports.push(port).is_err() {
-                            log::warn!("AHCI: Failed to add port {} - port list full", port_num);
+                        if port.sector_count == 0 {
+                            log::info!(
+                                "AHCI Port {}: SATAPI device has no readable media; skipping boot scan",
+                                port_num
+                            );
+                        } else {
+                            log::info!(
+                                "AHCI Port {}: SATAPI device, {} sectors (sector_size={})",
+                                port_num,
+                                port.sector_count,
+                                port.sector_size
+                            );
+                            if self.ports.push(port).is_err() {
+                                log::warn!(
+                                    "AHCI: Failed to add port {} - port list full",
+                                    port_num
+                                );
+                            }
                         }
                     } else {
                         log::info!("AHCI Port {}: {:?} device", port_num, port.device_type);
@@ -766,9 +831,15 @@ impl AhciController {
         let buffer = efi::allocate_pages(1).ok_or(AhciError::AllocationFailed)?;
         buffer.fill(0);
 
-        // Setup command header (set ATAPI bit)
+        // IDENTIFY PACKET DEVICE is an ATA command, not an ATA PACKET command.
+        // Do not set the AHCI command-header ATAPI bit here; that bit is only
+        // for command 0xA0 with a CDB in CommandTable::acmd.
         let header = unsafe { &mut *port.cmd_list.add(slot as usize) };
-        header.init_atapi();
+        header.dw0 = 0;
+        header.set_cfl(5);
+        header.set_write(false);
+        header.set_prdtl(1);
+        header.prdbc = 0;
 
         // Setup command table
         let table = unsafe { &mut *port.cmd_tables[slot as usize] };
@@ -784,8 +855,13 @@ impl AhciController {
         table.prdt[0].set_address(buffer_addr);
         table.prdt[0].set_byte_count(512, true)?;
 
-        // Issue command
-        self.issue_command(port, slot)?;
+        // Issue command. Match Linux's first IDENTIFY/IDENTIFY PACKET timeout
+        // budget: long enough for real devices, but not a 30s boot stall when
+        // the dock bay is empty or confused.
+        if let Err(e) = self.issue_command_on_port_with_timeout(port.port_num, slot, 5000) {
+            efi::free_pages(buffer, 1);
+            return Err(e);
+        }
 
         // Parse identify packet data
         let identify = unsafe { core::slice::from_raw_parts(buffer.as_ptr() as *const u16, 256) };
@@ -837,8 +913,9 @@ impl AhciController {
         table.prdt[0].set_address(buffer_addr);
         table.prdt[0].set_byte_count(8, true)?;
 
-        // Issue command
-        if let Err(e) = self.issue_command(port, slot) {
+        // Issue command. Empty optical drives can fail this; keep discovery
+        // responsive and mark the device as no-media below.
+        if let Err(e) = self.issue_command_on_port_with_timeout(port.port_num, slot, 5000) {
             log::warn!("READ CAPACITY failed: {:?}, using defaults", e);
             port.sector_size = 2048;
             port.sector_count = 0;
@@ -1088,6 +1165,15 @@ impl AhciController {
     /// 2. Clear error bits (PxSERR, PxIS)
     /// 3. Restart the command engine (set PxCMD.ST)
     fn issue_command_on_port(&mut self, port_num: u8, slot: u8) -> Result<(), AhciError> {
+        self.issue_command_on_port_with_timeout(port_num, slot, 30000)
+    }
+
+    fn issue_command_on_port_with_timeout(
+        &mut self,
+        port_num: u8,
+        slot: u8,
+        timeout_ms: u64,
+    ) -> Result<(), AhciError> {
         fence(Ordering::SeqCst);
 
         let port_regs = self.port_regs(port_num);
@@ -1101,8 +1187,8 @@ impl AhciController {
         // Issue command
         port_regs.ci.set(1 << slot);
 
-        // Wait for completion (up to 30 seconds)
-        let timeout = Timeout::from_ms(30000);
+        // Wait for completion
+        let timeout = Timeout::from_ms(timeout_ms);
         let mut error = None;
         while !timeout.is_expired() {
             let ci = port_regs.ci.get();
