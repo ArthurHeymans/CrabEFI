@@ -191,9 +191,17 @@ fn write_bytes(mut bytes: &[u8]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Mutex, MutexGuard};
     use std::vec::Vec;
 
     const TEST_CONSOLE_SIZE: usize = 1024;
+    static TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    fn test_guard() -> MutexGuard<'static, ()> {
+        TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
 
     fn console_storage(size: usize) -> Vec<u8> {
         let mut storage = std::vec![0; core::mem::size_of::<CbmemConsoleHeader>() + size];
@@ -213,6 +221,7 @@ mod tests {
 
     #[test]
     fn rejects_zero_and_tiny_console_buffers() {
+        let _guard = test_guard();
         disable();
         assert!(!init(0));
 
@@ -223,6 +232,7 @@ mod tests {
 
     #[test]
     fn mirrors_newlines_as_crlf_and_advances_cursor() {
+        let _guard = test_guard();
         disable();
         let mut storage = console_storage(TEST_CONSOLE_SIZE);
         let addr = storage.as_mut_ptr() as u64;
@@ -237,6 +247,7 @@ mod tests {
 
     #[test]
     fn wraps_ring_buffer_and_sets_overflow_flag() {
+        let _guard = test_guard();
         disable();
         let mut storage = console_storage(TEST_CONSOLE_SIZE);
         let addr = storage.as_mut_ptr() as u64;
@@ -253,6 +264,7 @@ mod tests {
 
     #[test]
     fn disable_stops_later_writes() {
+        let _guard = test_guard();
         disable();
         let mut storage = console_storage(TEST_CONSOLE_SIZE);
         let addr = storage.as_mut_ptr() as u64;
