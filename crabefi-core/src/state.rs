@@ -698,6 +698,8 @@ pub struct PciState {
     pub devices: HeaplessVec<PciDevice, MAX_PCI_DEVICES>,
     /// PCIe ECAM base address (from ACPI MCFG or coreboot)
     pub ecam_base: Option<u64>,
+    /// PCIe ECAM window size in bytes, when known.
+    pub ecam_size: Option<u64>,
     /// Config space access method (legacy I/O CAM or PCIe ECAM)
     pub access: AnyPciAccess,
 }
@@ -707,6 +709,7 @@ impl PciState {
         Self {
             devices: HeaplessVec::new(),
             ecam_base: None,
+            ecam_size: None,
             // x86 defaults to legacy I/O CAM (ports 0xCF8/0xCFC).
             // Non-x86 defaults to ECAM at address 0 — PCI init will
             // replace this once a real ECAM base is discovered from

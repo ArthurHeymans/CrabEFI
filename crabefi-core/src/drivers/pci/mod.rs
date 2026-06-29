@@ -55,6 +55,7 @@ pub const SUBCLASS_SDHCI: u8 = 0x05; // SD Host Controller
 
 /// Invalid vendor ID (no device present)
 const INVALID_VENDOR_ID: u16 = 0xFFFF;
+const ECAM_BYTES_PER_BUS: u64 = 1 << 20;
 
 /// PCI header types
 const HEADER_TYPE_NORMAL: u8 = 0x00;
@@ -358,8 +359,11 @@ pub fn init() {
     log::info!("Initializing PCI subsystem...");
 
     // Select access method based on ECAM availability
-    let ecam_base = state::drivers().pci.ecam_base;
+    let pci_state = &state::drivers().pci;
+    let ecam_base = pci_state.ecam_base;
+    let ecam_size = pci_state.ecam_size;
     let new_access = access::create_access(ecam_base);
+    let max_bus = max_bus_for_access(ecam_base, ecam_size);
 
     // Set access method and enumerate devices in one closure so we can
     // borrow both `pci.access` and `pci.devices` without aliasing issues.
@@ -369,16 +373,37 @@ pub fn init() {
         drivers.pci.access = new_access;
         let pci = &mut drivers.pci;
         pci.devices.clear();
-        enumerate_devices(&pci.access, &mut pci.devices);
+        enumerate_devices(&pci.access, &mut pci.devices, max_bus);
     });
+}
+
+fn max_bus_for_access(ecam_base: Option<u64>, ecam_size: Option<u64>) -> u8 {
+    if ecam_base.is_none() {
+        return u8::MAX;
+    }
+
+    let Some(size) = ecam_size else {
+        log::warn!("PCI ECAM size unknown; scanning all 256 buses");
+        return u8::MAX;
+    };
+
+    let bus_count = (size / ECAM_BYTES_PER_BUS).clamp(1, 256);
+    let max_bus = (bus_count - 1) as u8;
+    log::debug!(
+        "PCI ECAM window size {:#x}: scanning buses 00-{:02x}",
+        size,
+        max_bus
+    );
+    max_bus
 }
 
 /// Enumerate all PCI devices
 fn enumerate_devices(
     access: &AnyPciAccess,
     devices: &mut heapless::Vec<PciDevice, { state::MAX_PCI_DEVICES }>,
+    max_bus: u8,
 ) {
-    for bus in 0..=255u8 {
+    for bus in 0..=max_bus {
         for device in 0..32u8 {
             // First check function 0
             if let Some(dev) = scan_device(access, bus, device, 0) {
@@ -592,10 +617,19 @@ pub fn print_devices() {
 
 /// Set ECAM base address (from ACPI MCFG table)
 pub fn set_ecam_base(base: u64) {
+    set_ecam_region(base, None);
+}
+
+pub fn set_ecam_region(base: u64, size: Option<u64>) {
     state::with_drivers_mut(|drivers| {
         drivers.pci.ecam_base = Some(base);
+        drivers.pci.ecam_size = size;
     });
-    log::debug!("ECAM base set to {:#x}", base);
+    if let Some(size) = size {
+        log::debug!("ECAM region set to {:#x}+{:#x}", base, size);
+    } else {
+        log::debug!("ECAM base set to {:#x} (size unknown)", base);
+    }
 }
 
 // ============================================================================

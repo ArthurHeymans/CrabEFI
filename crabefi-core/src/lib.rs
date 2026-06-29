@@ -47,6 +47,14 @@ pub mod ui;
 
 use crate::drivers::block::{AhciDisk, NvmeDisk, SdhciDisk, UsbDisk};
 
+/// Perform a system reset using the common firmware fallback sequence.
+pub fn reset_system() -> ! {
+    log::info!("System reset requested");
+    arch::reset::keyboard_controller_reset();
+    time::delay_ms(100);
+    arch::reset::triple_fault();
+}
+
 // Re-export the public platform API at the crate root for ergonomic access.
 pub use platform::{
     BlockDevice, BlockDeviceInfo, BlockError, BootResult, CapsuleBackend, CapsuleRegion,
@@ -448,10 +456,10 @@ fn init_platform_impl(mut config: PlatformConfig) -> ! {
         drivers::pci::set_ecam_base(ecam);
     } else if let Some(ecam) = state::drivers().acpi_info.ecam_base {
         log::info!("PCI ECAM base from ACPI MCFG: {:#x}", ecam);
-        drivers::pci::set_ecam_base(ecam);
+        drivers::pci::set_ecam_region(ecam, state::drivers().acpi_info.ecam_size);
     } else if let Some(ecam) = state::drivers().fdt_info.ecam_base {
         log::info!("PCI ECAM base from FDT: {:#x}", ecam);
-        drivers::pci::set_ecam_base(ecam);
+        drivers::pci::set_ecam_region(ecam, state::drivers().fdt_info.ecam_size);
     }
 
     drivers::pci::init();
