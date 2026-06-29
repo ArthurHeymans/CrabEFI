@@ -233,10 +233,12 @@ impl LfnEntry {
     /// Returns the number of valid characters (may be less than 13 if null-terminated)
     fn extract_chars(&self, out: &mut [u16; 13]) -> usize {
         self.name1
-            .chunks_exact(2)
-            .chain(self.name2.chunks_exact(2))
-            .chain(self.name3.chunks_exact(2))
-            .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .chain(self.name2.as_chunks::<2>().0.iter())
+            .chain(self.name3.as_chunks::<2>().0.iter())
+            .map(|pair| u16::from_le_bytes(*pair))
             .take_while(|&ch| ch != 0x0000 && ch != 0xFFFF)
             .zip(out.iter_mut())
             .map(|(ch, slot)| *slot = ch)
