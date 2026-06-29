@@ -1049,7 +1049,7 @@ pub fn show_menu(menu: &mut BootMenu) -> Option<usize> {
                     // Reset the system
                     draw_status("Resetting system...", &mut fb_console);
                     delay_ms(500);
-                    perform_system_reset();
+                    crate::reset_system();
                 }
                 KeyPress::Char('c') | KeyPress::Char('C') => {
                     // Edit kernel command line
@@ -1095,9 +1095,13 @@ pub fn show_menu(menu: &mut BootMenu) -> Option<usize> {
                 KeyPress::MouseClick { y, .. } => {
                     // Map screen Y pixel to menu entry index
                     // Menu entries start at row ~5 (after header + category)
-                    if let Some(idx) =
-                        row_to_entry_index(menu, y, menu_scroll_offset(menu, &fb_console))
-                    {
+                    let row = y / crate::framebuffer_console::CHAR_HEIGHT;
+                    if let Some(idx) = row_to_entry_index(
+                        menu,
+                        row,
+                        menu_scroll_offset(menu, &fb_console),
+                        menu_visible_rows(&fb_console),
+                    ) {
                         menu.selected = idx;
                         draw_menu(menu, &mut fb_console);
                     }
@@ -1125,10 +1129,18 @@ pub fn show_menu(menu: &mut BootMenu) -> Option<usize> {
 /// Returns `Some(index)` if the row corresponds to a boot entry,
 /// `None` if it's a header, separator, or out of range.
 #[cfg(feature = "ui")]
-fn row_to_entry_index(menu: &BootMenu, row: u32, scroll_offset: usize) -> Option<usize> {
+fn row_to_entry_index(
+    menu: &BootMenu,
+    row: u32,
+    scroll_offset: usize,
+    visible_rows: usize,
+) -> Option<usize> {
     // Menu layout: row 0-2 = header, row 3 = blank, row 4+ = visible menu rows.
     let start_row = 4usize;
     let target_row = row as usize;
+    if target_row < start_row || target_row >= start_row + visible_rows {
+        return None;
+    }
     let mut logical_row = 0usize;
     let mut current_category: Option<BootCategory> = None;
 
@@ -1244,6 +1256,8 @@ fn draw_menu(menu: &BootMenu, fb_console: &mut Option<FramebufferConsole>) {
         logical_row += 1;
     }
 
+    clear_scroll_indicator(start_row - 1, fb_console);
+    clear_scroll_indicator(start_row + visible_rows, fb_console);
     if scroll_offset > 0 {
         draw_scroll_indicator(start_row - 1, "^", fb_console);
     }
@@ -1369,6 +1383,18 @@ fn draw_entry(
         }
 
         console.reset_colors();
+    }
+}
+
+/// Clear a possible scroll indicator row.
+fn clear_scroll_indicator(row: usize, fb_console: &mut Option<FramebufferConsole>) {
+    let ansi_row = row + 1;
+    let _ = write!(SerialWriter, "\x1b[{};40H ", ansi_row);
+
+    if let Some(console) = fb_console {
+        let cols = console.cols();
+        console.set_position(cols / 2, row as u32);
+        let _ = console.write_str(" ");
     }
 }
 
@@ -1825,23 +1851,4 @@ fn draw_cmdline_editor_line(
         let _ = console.write_str(&len_str);
         console.reset_colors();
     }
-}
-
-/// Perform a system reset
-///
-/// This attempts to reset the system using various methods:
-/// 1. Keyboard controller reset (port 0x64, command 0xFE)
-/// 2. Triple fault (if keyboard controller fails)
-fn perform_system_reset() -> ! {
-    use crate::arch::reset;
-
-    log::info!("System reset requested");
-
-    reset::keyboard_controller_reset();
-
-    // Wait a bit for reset to take effect
-    delay_ms(100);
-
-    // Triple fault if keyboard reset failed
-    reset::triple_fault();
 }

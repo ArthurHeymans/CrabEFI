@@ -337,12 +337,6 @@ impl BState {
     }
 }
 
-fn reset_system() -> ! {
-    crate::arch::reset::keyboard_controller_reset();
-    delay_ms(100);
-    crate::arch::reset::triple_fault();
-}
-
 pub fn draw_scrollbar(
     fb: &FramebufferInfo,
     x: i32,
@@ -390,6 +384,7 @@ fn run_boot(fb: &FramebufferInfo, menu: &mut BootMenu) -> BootResult {
             if let Some(i) = hov {
                 paint_boot_card(fb, menu, &st, i);
             }
+            paint_boot_scrollbar(fb, menu, &st);
         }
 
         if let Some(key) = menu_common::read_key() {
@@ -424,7 +419,7 @@ fn run_boot(fb: &FramebufferInfo, menu: &mut BootMenu) -> BootResult {
                     return BootResult::Nav(NavItem::Firmware);
                 }
                 KeyPress::Char('r') | KeyPress::Char('R') => {
-                    reset_system();
+                    crate::reset_system();
                 }
                 #[cfg(feature = "ui")]
                 KeyPress::MouseClick { .. } => {
@@ -552,7 +547,7 @@ fn run_no_media(fb: &FramebufferInfo) -> ScreenNav {
         if let Some(key) = menu_common::read_key() {
             match key {
                 KeyPress::Char('r') | KeyPress::Char('R') => {
-                    reset_system();
+                    crate::reset_system();
                 }
                 KeyPress::Char('s') | KeyPress::Char('S') => {
                     cursor.hide(fb);
@@ -634,7 +629,7 @@ fn boot_hit(fb: &FramebufferInfo, menu: &BootMenu, st: &BState) -> Option<usize>
 fn paint_boot(fb: &FramebufferInfo, menu: &BootMenu, st: &BState) {
     clear(fb);
     draw_header(fb);
-    draw_sidebar(fb, NavItem::Boot, None);
+    draw_sidebar(fb, NavItem::Boot, st.sidebar_hov);
 
     let (cx, cy, _cw, _) = canvas(fb);
 
@@ -666,6 +661,12 @@ fn paint_boot(fb: &FramebufferInfo, menu: &BootMenu, st: &BState) {
         paint_boot_card(fb, menu, st, i);
     }
 
+    paint_boot_scrollbar(fb, menu, st);
+
+    paint_boot_footer(fb, st);
+}
+
+fn paint_boot_scrollbar(fb: &FramebufferInfo, menu: &BootMenu, st: &BState) {
     let (list_x, list_y, list_w, list_h) = boot_list_area(fb);
     draw_scrollbar(
         fb,
@@ -676,8 +677,6 @@ fn paint_boot(fb: &FramebufferInfo, menu: &BootMenu, st: &BState) {
         st.scroll_offset,
         boot_visible_slots(fb),
     );
-
-    paint_boot_footer(fb, st);
 }
 
 fn paint_boot_card(fb: &FramebufferInfo, menu: &BootMenu, st: &BState, idx: usize) {

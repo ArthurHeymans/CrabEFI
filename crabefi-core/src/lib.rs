@@ -58,6 +58,18 @@ pub use platform::{
     VariableVisitor,
 };
 
+/// Perform a system reset.
+///
+/// Attempts the architecture-specific soft reset path first, waits briefly,
+/// then falls back to the architecture's non-returning hard reset path.
+pub fn reset_system() -> ! {
+    log::info!("System reset requested");
+
+    arch::reset::keyboard_controller_reset();
+    time::delay_ms(100);
+    arch::reset::triple_fault();
+}
+
 /// Display a Secure Boot violation error on screen
 ///
 /// This function displays a prominent red error message in the center of the screen
