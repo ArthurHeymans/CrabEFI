@@ -310,16 +310,30 @@ pub fn find_smmstore_region(fmap: &FmapInfo) -> Option<&FmapAreaInfo> {
     // Note: RW_ELOG is the event log region and must NOT be used as variable storage
     const SMMSTORE_NAMES: &[&str] = &["SMMSTORE", "RW_NVRAM", "NVRAM"];
 
-    SMMSTORE_NAMES.iter().find_map(|name| {
-        find_region(fmap, name).inspect(|area| {
+    for name in SMMSTORE_NAMES {
+        if let Some(area) = find_region(fmap, name) {
             log::info!(
                 "Found SMMSTORE region '{}' at {:#x}, size {} KB",
                 area.name.as_str(),
                 area.offset,
                 area.size / 1024
             );
-        })
-    })
+            return Some(area);
+        }
+    }
+
+    log::warn!(
+        "No SMMSTORE/RW_NVRAM/NVRAM region in FMAP; UEFI/CFR variable persistence is unavailable"
+    );
+    for area in fmap.areas.iter() {
+        log::warn!(
+            "  FMAP area '{}' at {:#x}, size {} KB",
+            area.name.as_str(),
+            area.offset,
+            area.size / 1024
+        );
+    }
+    None
 }
 
 /// SMMSTORE information derived from FMAP
