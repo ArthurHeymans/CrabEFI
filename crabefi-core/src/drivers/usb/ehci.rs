@@ -19,8 +19,8 @@
 //! - libpayload ehci.c
 
 use super::controller::{
-    SetupPacket, UsbController, UsbDevice, UsbError, UsbSpeed, enumerate_device,
-    enumerate_hub_ports,
+    HUB_DESCRIPTOR_TYPE, SetupPacket, UsbController, UsbDevice, UsbError, UsbSpeed,
+    enumerate_device, hub_feature, hub_port_change, hub_port_status, req_type, request,
 };
 #[cfg(target_arch = "aarch64")]
 use crate::arch::aarch64::cache::{flush_cache_range, invalidate_cache_range};
@@ -903,9 +903,6 @@ impl EhciController {
     }
 
     /// Enumerate devices connected to a USB hub.
-    ///
-    /// Delegates to the shared [`enumerate_hub_ports`] helper in the
-    /// controller abstraction layer.
     fn enumerate_hub(&mut self, hub_slot: usize, hub_addr: u8) -> Result<(), UsbError> {
         log::info!("EHCI: Enumerating hub at address {}", hub_addr);
 
@@ -914,25 +911,179 @@ impl EhciController {
             .ok_or(UsbError::DeviceNotFound)?
             .clone();
 
-        let (num_ports, ready_ports) = enumerate_hub_ports(
+        // Fetch hub class descriptor (bmRequestType = 0xA0: D→H, Class, Device).
+        let mut hub_desc_buf = [0u8; 9];
+        self.control_transfer_internal(
             &hub_device,
-            |dev, rt, req, val, idx, data| {
-                self.control_transfer_internal(dev, rt, req, val, idx, data)
-            },
-            true, // EHCI supports high-speed devices
+            req_type::DIR_IN | req_type::TYPE_CLASS | req_type::RCPT_DEVICE,
+            request::GET_DESCRIPTOR,
+            (HUB_DESCRIPTOR_TYPE as u16) << 8,
+            0,
+            Some(&mut hub_desc_buf),
         )?;
+
+        let num_ports = hub_desc_buf[2];
+        let power_on_delay = (hub_desc_buf[5] as u64) * 2; // 2 ms units
+        log::info!(
+            "  Hub has {} ports, power-on delay: {}ms",
+            num_ports,
+            power_on_delay
+        );
 
         if let Some(ref mut dev) = self.devices[hub_slot] {
             dev.num_hub_ports = num_ports;
         }
 
-        for (port, speed) in ready_ports {
-            if let Err(e) = self.attach_device_on_hub(port, speed, hub_addr, port) {
+        // Power on all downstream ports (SET_FEATURE PORT_POWER).
+        for port in 1..=num_ports {
+            let _ = self.control_transfer_internal(
+                &hub_device,
+                req_type::DIR_OUT | req_type::TYPE_CLASS | req_type::RCPT_OTHER,
+                request::SET_FEATURE,
+                hub_feature::PORT_POWER,
+                port as u16,
+                None,
+            );
+        }
+
+        // Wait for power to stabilise (spec minimum 100 ms).
+        crate::time::delay_ms(power_on_delay.max(100));
+
+        // Reset and enumerate one port at a time.  Do not pre-reset every
+        // connected port: that leaves multiple devices simultaneously in the
+        // default address state behind the same hub, so address-0 control
+        // transfers collide.  This showed up on the X220 dock's EHCI hub chain.
+        for port in 1..=num_ports {
+            let mut status_buf = [0u8; 4];
+            if self
+                .control_transfer_internal(
+                    &hub_device,
+                    req_type::DIR_IN | req_type::TYPE_CLASS | req_type::RCPT_OTHER,
+                    request::GET_STATUS,
+                    0,
+                    port as u16,
+                    Some(&mut status_buf),
+                )
+                .is_err()
+            {
+                continue;
+            }
+
+            let port_status = u16::from_le_bytes([status_buf[0], status_buf[1]]);
+            let port_change = u16::from_le_bytes([status_buf[2], status_buf[3]]);
+
+            log::debug!(
+                "  Hub port {} status: {:#06x}, change: {:#06x}",
+                port,
+                port_status,
+                port_change
+            );
+
+            if (port_status & hub_port_status::CONNECTION) == 0 {
+                continue;
+            }
+
+            log::info!("  Device detected on hub port {}", port);
+
+            if let Some(speed) = self.reset_hub_port(&hub_device, port, port_change)
+                && let Err(e) = self.attach_device_on_hub(port, speed, hub_addr, port)
+            {
                 log::warn!("  Failed to attach device on hub port {}: {:?}", port, e);
             }
         }
 
         Ok(())
+    }
+
+    fn reset_hub_port(
+        &mut self,
+        hub_device: &UsbDevice,
+        port: u8,
+        initial_change: u16,
+    ) -> Option<UsbSpeed> {
+        // Clear the connection-change bit if set.
+        if initial_change & hub_port_change::C_CONNECTION != 0 {
+            let _ = self.control_transfer_internal(
+                hub_device,
+                req_type::DIR_OUT | req_type::TYPE_CLASS | req_type::RCPT_OTHER,
+                request::CLEAR_FEATURE,
+                hub_feature::C_PORT_CONNECTION,
+                port as u16,
+                None,
+            );
+        }
+
+        // Issue a port reset (SET_FEATURE PORT_RESET).
+        if self
+            .control_transfer_internal(
+                hub_device,
+                req_type::DIR_OUT | req_type::TYPE_CLASS | req_type::RCPT_OTHER,
+                request::SET_FEATURE,
+                hub_feature::PORT_RESET,
+                port as u16,
+                None,
+            )
+            .is_err()
+        {
+            return None;
+        }
+
+        // Wait at least 50 ms then poll for C_PORT_RESET.
+        crate::time::delay_ms(50);
+
+        let timeout = Timeout::from_ms(500);
+        while !timeout.is_expired() {
+            let mut status_buf = [0u8; 4];
+            if self
+                .control_transfer_internal(
+                    hub_device,
+                    req_type::DIR_IN | req_type::TYPE_CLASS | req_type::RCPT_OTHER,
+                    request::GET_STATUS,
+                    0,
+                    port as u16,
+                    Some(&mut status_buf),
+                )
+                .is_err()
+            {
+                return None;
+            }
+
+            let port_status = u16::from_le_bytes([status_buf[0], status_buf[1]]);
+            let port_change = u16::from_le_bytes([status_buf[2], status_buf[3]]);
+
+            if port_change & hub_port_change::C_RESET != 0 {
+                // Acknowledge the reset-complete change bit.
+                let _ = self.control_transfer_internal(
+                    hub_device,
+                    req_type::DIR_OUT | req_type::TYPE_CLASS | req_type::RCPT_OTHER,
+                    request::CLEAR_FEATURE,
+                    hub_feature::C_PORT_RESET,
+                    port as u16,
+                    None,
+                );
+
+                if (port_status & hub_port_status::ENABLE) == 0 {
+                    break;
+                }
+
+                let speed = if (port_status & hub_port_status::HIGH_SPEED) != 0 {
+                    UsbSpeed::High
+                } else if (port_status & hub_port_status::LOW_SPEED) != 0 {
+                    UsbSpeed::Low
+                } else {
+                    UsbSpeed::Full
+                };
+
+                log::info!("  Hub port {} reset complete, speed: {:?}", port, speed);
+                crate::time::delay_ms(10); // USB spec reset-recovery time
+                return Some(speed);
+            }
+
+            crate::time::delay_ms(10);
+        }
+
+        log::warn!("  Hub port {} reset timed out", port);
+        None
     }
 
     /// Perform a control transfer
