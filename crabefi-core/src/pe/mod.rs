@@ -598,15 +598,18 @@ pub fn load_image(data: &[u8]) -> Result<LoadedImage, Status> {
 
     // Parse section headers using zerocopy
     // We iterate and parse each section header individually
+    const SECTION_HEADER_SIZE: usize = core::mem::size_of::<SectionHeader>();
     let section_data = &data[sections_offset..sections_end];
 
     // Copy sections with full bounds validation
     for (i, chunk) in section_data
-        .chunks_exact(core::mem::size_of::<SectionHeader>())
+        .as_chunks::<SECTION_HEADER_SIZE>()
+        .0
+        .iter()
         .take(num_sections as usize)
         .enumerate()
     {
-        let section = match SectionHeader::ref_from_prefix(chunk) {
+        let section = match SectionHeader::ref_from_prefix(&chunk[..]) {
             Ok((s, _)) => s,
             Err(_) => break,
         };
