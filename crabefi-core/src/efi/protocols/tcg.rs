@@ -411,7 +411,10 @@ extern "efiapi" fn tcg_hash_log_extend_event(
     };
 
     // Hash the data with SHA-1.
-    let data_slice = if hash_data_len > 0 && hash_data != 0 {
+    let data_slice = if hash_data_len > 0 {
+        if hash_data == 0 {
+            return Status::INVALID_PARAMETER;
+        }
         unsafe { core::slice::from_raw_parts(hash_data as *const u8, hash_data_len as usize) }
     } else {
         &[]
@@ -443,7 +446,11 @@ extern "efiapi" fn tcg_hash_log_extend_event(
         .event_log
         .log_event(pcr_index, event_type, &[digest], event_data)
     {
-        log::warn!("Event log append failed: {:?}", e);
+        log::error!("Event log append failed: {:?}", e);
+        return match e {
+            TcgError::LogFull => Status::VOLUME_FULL,
+            _ => Status::DEVICE_ERROR,
+        };
     }
 
     log::debug!("  -> SUCCESS");

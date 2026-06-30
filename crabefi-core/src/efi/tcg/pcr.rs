@@ -144,6 +144,9 @@ impl Sha1PcrBank {
         if index >= PCR_COUNT {
             return Err(TcgError::InvalidPcrIndex);
         }
+        if digest.len() != SHA1_DIGEST_SIZE {
+            return Err(TcgError::UnsupportedAlgorithm);
+        }
         let mut hasher = Sha1::new();
         hasher.update(self.pcrs[index]);
         hasher.update(digest);
@@ -201,7 +204,7 @@ impl PcrBanks {
             count += 1;
         }
 
-        if count == 0 {
+        if count == 0 && algorithms.is_empty() {
             banks[0] = PcrBank::new(TPM_ALG_SHA256, SHA256_DIGEST_SIZE);
             count = 1;
         }

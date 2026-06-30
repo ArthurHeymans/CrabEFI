@@ -408,6 +408,8 @@ pub struct LoadedImageEntry {
     pub num_pages: u64,
     /// Parent image handle that loaded this image
     pub parent_handle: Handle,
+    /// PE subsystem value from the optional header.
+    pub subsystem: u16,
 }
 
 // SAFETY: LoadedImageEntry contains EFI Handle pointers for tracking loaded PE images.
@@ -427,6 +429,7 @@ impl LoadedImageEntry {
             alloc_base: 0,
             num_pages: 0,
             parent_handle: core::ptr::null_mut(),
+            subsystem: 0,
         }
     }
 }

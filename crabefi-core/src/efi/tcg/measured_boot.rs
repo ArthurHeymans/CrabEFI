@@ -64,8 +64,7 @@ fn serialize_uefi_variable_data(
     guid: &r_efi::efi::Guid,
     name_utf16: &[u16],
     variable_data: &[u8],
-    buf: &mut [u8],
-) -> Option<usize> {
+) -> Option<Vec<u8>> {
     // EDK2 uses StrLen(VariableName) for UnicodeNameLength and copies only
     // that many CHAR16s, excluding the terminating NUL if present.
     let name_len = name_utf16
@@ -73,11 +72,14 @@ fn serialize_uefi_variable_data(
         .position(|ch| *ch == 0)
         .unwrap_or(name_utf16.len());
     let name = &name_utf16[..name_len];
-    let name_bytes = name.len() * 2;
-    let total = 16 + 8 + 8 + name_bytes + variable_data.len();
-    if buf.len() < total {
-        return None;
-    }
+    let name_bytes = name.len().checked_mul(2)?;
+    let total = 16usize
+        .checked_add(8)?
+        .checked_add(8)?
+        .checked_add(name_bytes)?
+        .checked_add(variable_data.len())?;
+    let mut buf = Vec::new();
+    buf.resize(total, 0);
 
     let mut off = 0;
 
@@ -102,9 +104,8 @@ fn serialize_uefi_variable_data(
 
     // VariableData
     buf[off..off + variable_data.len()].copy_from_slice(variable_data);
-    off += variable_data.len();
 
-    Some(off)
+    Some(buf)
 }
 
 fn measure_variable_all(
@@ -115,23 +116,15 @@ fn measure_variable_all(
     variable_data: &[u8],
     context: &str,
 ) {
-    let mut event_buf = [0u8; 4096];
-    let event_len =
-        match serialize_uefi_variable_data(guid, name_utf16, variable_data, &mut event_buf) {
-            Some(len) => len,
-            None => {
-                log::warn!("Failed to serialize variable data for {}", context);
-                return;
-            }
-        };
+    let event_buf = match serialize_uefi_variable_data(guid, name_utf16, variable_data) {
+        Some(buf) => buf,
+        None => {
+            log::warn!("Failed to serialize variable data for {}", context);
+            return;
+        }
+    };
 
-    measure_event_all(
-        pcr_index,
-        event_type,
-        &event_buf[..event_len],
-        &event_buf[..event_len],
-        context,
-    );
+    measure_event_all(pcr_index, event_type, &event_buf, &event_buf, context);
 }
 
 fn efi_global_variable_guid() -> r_efi::efi::Guid {
@@ -222,9 +215,8 @@ pub fn measure_secure_boot_variables(pcr_banks: &mut PcrBanks, event_log: &mut d
         let data = var_data.as_deref().unwrap_or(&[]);
 
         // Build the UEFI_VARIABLE_DATA event data.
-        let mut event_buf = [0u8; 4096];
-        let event_len = match serialize_uefi_variable_data(guid, name_utf16, data, &mut event_buf) {
-            Some(len) => len,
+        let event_buf = match serialize_uefi_variable_data(guid, name_utf16, data) {
+            Some(buf) => buf,
             None => {
                 log::warn!("Failed to serialize variable data for {}", display_name);
                 continue;
@@ -232,7 +224,7 @@ pub fn measure_secure_boot_variables(pcr_banks: &mut PcrBanks, event_log: &mut d
         };
 
         // Hash the full UEFI_VARIABLE_DATA structure (not just the variable value).
-        let (count, digests) = pcr_banks.hash_data(&event_buf[..event_len]);
+        let (count, digests) = pcr_banks.hash_data(&event_buf);
 
         // Extend PCR 7.
         if let Err(e) = pcr_banks.extend(7, &digests[..count]) {
@@ -245,7 +237,7 @@ pub fn measure_secure_boot_variables(pcr_banks: &mut PcrBanks, event_log: &mut d
             7,
             EV_EFI_VARIABLE_DRIVER_CONFIG,
             &digests[..count],
-            &event_buf[..event_len],
+            &event_buf,
         ) {
             log::warn!("Failed to log {} measurement: {:?}", display_name, e);
         }
@@ -378,14 +370,10 @@ pub fn measure_pe_image(
 ) -> Result<(), TcgError> {
     use crate::efi::auth::authenticode::compute_authenticode_digests;
 
-    let algorithms: &[u16] = if pcr_banks.has_sha1() {
-        &[TPM_ALG_SHA256, TPM_ALG_SHA1]
-    } else {
-        &[TPM_ALG_SHA256]
-    };
+    let (algorithm_count, algorithms) = pcr_banks.algorithm_array();
 
-    let (count, digests) =
-        compute_authenticode_digests(pe_data, algorithms).map_err(|_| TcgError::InternalError)?;
+    let (count, digests) = compute_authenticode_digests(pe_data, &algorithms[..algorithm_count])
+        .map_err(|_| TcgError::InternalError)?;
 
     if let Err(e) = pcr_banks.extend(pcr_index as usize, &digests[..count]) {
         log::error!("PCR {} image extend failed: {:?}", pcr_index, e);
@@ -461,9 +449,8 @@ pub fn measure_secure_boot_variables_all() {
         let var_data = get_efi_variable(guid, name_utf16);
         let data = var_data.as_deref().unwrap_or(&[]);
 
-        let mut event_buf = [0u8; 4096];
-        let event_len = match serialize_uefi_variable_data(guid, name_utf16, data, &mut event_buf) {
-            Some(len) => len,
+        let event_buf = match serialize_uefi_variable_data(guid, name_utf16, data) {
+            Some(buf) => buf,
             None => {
                 log::warn!("Failed to serialize variable data for {}", display_name);
                 continue;
@@ -473,8 +460,8 @@ pub fn measure_secure_boot_variables_all() {
         measure_event_all(
             7,
             EV_EFI_VARIABLE_DRIVER_CONFIG,
-            &event_buf[..event_len],
-            &event_buf[..event_len],
+            &event_buf,
+            &event_buf,
             display_name,
         );
 

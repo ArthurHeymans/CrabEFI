@@ -31,6 +31,10 @@ fn serialize_tcg_image_load_event(
     image_link_time_address: u64,
     device_path_ptr: *const r_efi::protocols::device_path::Protocol,
 ) -> Option<Vec<u8>> {
+    if device_path_ptr.is_null() {
+        return None;
+    }
+
     let device_path_size = unsafe { device_path::device_path_size(device_path_ptr) };
     if device_path_size == 0 {
         return None;
@@ -110,36 +114,36 @@ pub fn install_block_io_protocols(
     // present, measure its header and non-empty partition entries into PCR 5 per
     // the TCG PC Client PFP EFI_GPT_DATA event format.
     let partitions = match fs::gpt::read_gpt_header(disk) {
-        Ok(header) => {
-            if let Ok(event_data) = fs::gpt::build_gpt_measurement_event(disk, &header) {
-                efi::tcg::measured_boot::measure_event_all(
-                    5,
-                    efi::tcg::types::EV_EFI_GPT_EVENT,
-                    &event_data,
-                    &event_data,
-                    "GPT partition table",
-                );
+        Ok(header) => match fs::gpt::read_partitions(disk, &header) {
+            Ok(p) => {
+                if let Ok(event_data) = fs::gpt::build_gpt_measurement_event(disk, &header) {
+                    efi::tcg::measured_boot::measure_event_all(
+                        5,
+                        efi::tcg::types::EV_EFI_GPT_EVENT,
+                        &event_data,
+                        &event_data,
+                        "GPT partition table",
+                    );
+                }
+                p
             }
-            match fs::gpt::read_partitions(disk, &header) {
-                Ok(p) => p,
-                Err(e) => {
-                    log::debug!("Failed to read GPT partitions: {:?}; trying MBR", e);
-                    match fs::gpt::read_mbr_partitions(disk) {
-                        Ok(p) => {
-                            let mut partitions = heapless::Vec::new();
-                            for partition in p {
-                                let _ = partitions.push(partition);
-                            }
-                            partitions
+            Err(e) => {
+                log::debug!("Failed to read GPT partitions: {:?}; trying MBR", e);
+                match fs::gpt::read_mbr_partitions(disk) {
+                    Ok(p) => {
+                        let mut partitions = heapless::Vec::new();
+                        for partition in p {
+                            let _ = partitions.push(partition);
                         }
-                        Err(e) => {
-                            log::debug!("Failed to read partition table: {:?}", e);
-                            return None;
-                        }
+                        partitions
+                    }
+                    Err(e) => {
+                        log::debug!("Failed to read partition table: {:?}", e);
+                        return None;
                     }
                 }
             }
-        }
+        },
         Err(gpt_error) => {
             log::debug!("GPT partition scan failed: {:?}; trying MBR", gpt_error);
             match fs::gpt::read_mbr_partitions(disk) {
@@ -667,12 +671,12 @@ fn load_and_execute_bootloader(
 
     // Execute the bootloader. This path bypasses BS.StartImage, so perform the
     // same ReadyToBoot / boot-attempt measurements around the PE entry call.
-    efi::boot_services::measure_efi_application_start();
+    efi::boot_services::measure_efi_application_start(true);
     let exec_status = pe::execute_image(&loaded_image, image_handle, system_table);
 
     // If the bootloader returns, log and measure it.
     log::info!("Bootloader returned with status: {:?}", exec_status);
-    efi::boot_services::measure_efi_application_return();
+    efi::boot_services::measure_efi_application_return(true);
 
     // Clean up
     pe::unload_image(&loaded_image);

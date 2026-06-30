@@ -1417,7 +1417,7 @@ pub enum TpmError {
 /// CrabEFI needs rather than a specific bus: PCR extension for measured boot,
 /// raw command passthrough for `EFI_TCG2_PROTOCOL.SubmitCommand`, and cached
 /// capability metadata for `GetCapability`.
-pub trait Tpm2Device {
+pub trait Tpm2Device: Send {
     /// Return active PCR bank algorithm IDs.
     ///
     /// CrabEFI accepts SHA-1 (`0x0004`), SHA-256 (`0x000B`), SHA-384
@@ -1443,7 +1443,7 @@ pub trait Tpm2Device {
     }
 
     /// Extend `pcr_index` with one digest per CrabEFI-supported active bank
-    /// (SHA-256 and optional SHA-1).
+    /// (SHA-1, SHA-256, SHA-384, and/or SHA-512).
     fn pcr_extend(&mut self, pcr_index: u32, digests: &[TpmDigest<'_>]) -> Result<(), TpmError>;
 
     /// Submit a raw TPM 2.0 command and write the response into `response`.

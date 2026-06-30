@@ -1174,7 +1174,12 @@ pub fn append_tpm_final_event(
     let mut final_events = TCG2_FINAL_EVENTS.lock();
     let final_events = final_events.as_mut().ok_or(TcgError::InternalError)?;
     if final_events.used + needed > TCG2_FINAL_EVENTS_CAPACITY {
-        return Err(TcgError::LogFull);
+        log::warn!(
+            "TCG2 Final Events Table full; truncating final event type={:#x} pcr={}",
+            event_type,
+            pcr_index
+        );
+        return Ok(());
     }
 
     let table_ptr = final_events.table_addr as *mut Tcg2FinalEventsTable;

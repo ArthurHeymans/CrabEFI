@@ -411,7 +411,11 @@ pub extern "efiapi" fn efi_main(_image_handle: Handle, system_table: *mut System
 
     unsafe { print(con_out, b"\r\n=== TCG Test Complete ===\r\n") };
 
-    Status::SUCCESS
+    if fail_count == 0 {
+        Status::SUCCESS
+    } else {
+        Status::ABORTED
+    }
 }
 
 #[panic_handler]

@@ -62,6 +62,11 @@ impl Drop for SwtpmProcess {
     }
 }
 
+fn cleanup_child(child: &mut Child) {
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
 /// Spawn a swtpm process and return the QEMU arguments to connect to it.
 fn spawn_swtpm() -> Result<(SwtpmProcess, Vec<String>)> {
     let state_dir = tempfile::tempdir().context("failed to create swtpm state dir")?;
@@ -90,13 +95,22 @@ fn spawn_swtpm() -> Result<(SwtpmProcess, Vec<String>)> {
         if sock_path.exists() {
             break;
         }
-        if let Some(status) = child.try_wait().context("failed to poll swtpm")? {
-            bail!("swtpm exited before creating socket: {}", status);
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let _ = child.wait();
+                bail!("swtpm exited before creating socket: {}", status);
+            }
+            Ok(None) => {}
+            Err(e) => {
+                cleanup_child(&mut child);
+                return Err(e).context("failed to poll swtpm");
+            }
         }
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
 
     if !sock_path.exists() {
+        cleanup_child(&mut child);
         bail!("swtpm socket not created at {}", sock_path.display());
     }
 
