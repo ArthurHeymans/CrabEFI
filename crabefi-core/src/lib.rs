@@ -47,9 +47,14 @@ pub mod ui;
 
 use crate::drivers::block::{AhciDisk, NvmeDisk, SdhciDisk, UsbDisk};
 
-/// Perform a system reset using the common firmware fallback sequence.
+/// Perform a system reset using the platform handler when available.
 pub fn reset_system() -> ! {
     log::info!("System reset requested");
+
+    if let Some(reset) = state::try_get().and_then(|state| state.drivers.platform.reset) {
+        reset.reset(ResetType::Cold);
+    }
+
     arch::reset::keyboard_controller_reset();
     time::delay_ms(100);
     arch::reset::triple_fault();
@@ -364,9 +369,18 @@ fn init_platform_impl(mut config: PlatformConfig) -> ! {
                 >(recorder)
             }
         });
+    let reset: &'static dyn crate::platform::ResetHandler = unsafe {
+        // SAFETY: init_platform() is -> !, so the platform reset handler
+        // reference lives for the entire firmware lifetime.
+        core::mem::transmute::<
+            &dyn crate::platform::ResetHandler,
+            &'static dyn crate::platform::ResetHandler,
+        >(config.reset)
+    };
     state::with_drivers_mut(|d| {
         d.platform.efi_fw_info = config.firmware_info;
         d.platform.hooks = hooks;
+        d.platform.reset = Some(reset);
         d.platform.timestamp_recorder = timestamp_recorder;
         d.platform.capsule_regions.clear();
         for region in config.capsule_regions {

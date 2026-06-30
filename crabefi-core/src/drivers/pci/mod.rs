@@ -367,34 +367,42 @@ pub fn init() {
 
     // Set access method and enumerate devices in one closure so we can
     // borrow both `pci.access` and `pci.devices` without aliasing issues.
-    // Set access method and enumerate devices in one closure so we can
-    // borrow both `pci.access` and `pci.devices` without aliasing issues.
     state::with_drivers_mut(|drivers| {
         drivers.pci.access = new_access;
         let pci = &mut drivers.pci;
         pci.devices.clear();
-        enumerate_devices(&pci.access, &mut pci.devices, max_bus);
+        if let Some(max_bus) = max_bus {
+            enumerate_devices(&pci.access, &mut pci.devices, max_bus);
+        }
     });
 }
 
-fn max_bus_for_access(ecam_base: Option<u64>, ecam_size: Option<u64>) -> u8 {
+fn max_bus_for_access(ecam_base: Option<u64>, ecam_size: Option<u64>) -> Option<u8> {
     if ecam_base.is_none() {
-        return u8::MAX;
+        return Some(u8::MAX);
     }
 
     let Some(size) = ecam_size else {
         log::warn!("PCI ECAM size unknown; scanning all 256 buses");
-        return u8::MAX;
+        return Some(u8::MAX);
     };
 
-    let bus_count = (size / ECAM_BYTES_PER_BUS).clamp(1, 256);
-    let max_bus = (bus_count - 1) as u8;
+    let bus_count = size / ECAM_BYTES_PER_BUS;
+    if bus_count == 0 {
+        log::warn!(
+            "PCI ECAM window size {:#x} is smaller than one bus; skipping enumeration",
+            size
+        );
+        return None;
+    }
+
+    let max_bus = (bus_count.min(256) - 1) as u8;
     log::debug!(
         "PCI ECAM window size {:#x}: scanning buses 00-{:02x}",
         size,
         max_bus
     );
-    max_bus
+    Some(max_bus)
 }
 
 /// Enumerate all PCI devices

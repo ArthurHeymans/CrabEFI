@@ -847,6 +847,9 @@ pub struct PlatformInfo {
     /// Optional platform lifecycle callbacks.
     pub hooks: Option<&'static dyn crate::platform::PlatformHooks>,
 
+    /// Platform reset handler.
+    pub reset: Option<&'static dyn crate::platform::ResetHandler>,
+
     /// Optional firmware-visible boot timestamp recorder.
     pub timestamp_recorder: Option<&'static dyn crate::platform::TimestampRecorder>,
 }
@@ -861,6 +864,7 @@ impl PlatformInfo {
             efi_fw_info: None,
             capsule_regions: HeaplessVec::new(),
             hooks: None,
+            reset: None,
             timestamp_recorder: None,
         }
     }
