@@ -341,7 +341,7 @@ fn init_tcg2_protocol_platform_tpm(
 /// - Secure Boot variables into PCR 7 (with separator)
 pub(crate) fn measure_initial_boot() {
     // Measure S-CRTM version (firmware version string) into PCR 0.
-    tcg::measured_boot::measure_s_crtm_version_all("CrabEFI 0.1.0");
+    tcg::measured_boot::measure_s_crtm_version_all(env!("CARGO_PKG_VERSION"));
 
     // Measure Secure Boot policy variables into PCR 7.
     tcg::measured_boot::measure_secure_boot_variables_all();

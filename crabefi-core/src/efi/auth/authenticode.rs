@@ -31,6 +31,13 @@ use sha2::{Digest, Sha256, Sha384, Sha512};
 /// WIN_CERTIFICATE header type for PKCS#7
 const WIN_CERT_TYPE_PKCS_SIGNED_DATA: u16 = 0x0002;
 
+fn is_supported_authenticode_algorithm(algorithm: u16) -> bool {
+    matches!(
+        algorithm,
+        TPM_ALG_SHA1 | TPM_ALG_SHA256 | TPM_ALG_SHA384 | TPM_ALG_SHA512
+    )
+}
+
 /// PE file information extracted during parsing
 struct PeInfo {
     /// Offset of checksum field from start of file
@@ -89,6 +96,9 @@ pub fn compute_authenticode_digests(
     for &alg in algorithms {
         if count >= digests.len() {
             break;
+        }
+        if !is_supported_authenticode_algorithm(alg) {
+            continue;
         }
         let digest_size = match digest_size_for_algorithm(alg) {
             Some(s) => s,
@@ -211,13 +221,22 @@ fn authenticode_regions(pe_data: &[u8], info: &PeInfo) -> Result<Vec<(usize, usi
             .ok_or(AuthError::InvalidHeader)?;
         if section_end <= pe_data.len() {
             regions.push((section_start, section_end));
-            sum_of_bytes_hashed += section.size_of_raw_data as usize;
+            sum_of_bytes_hashed = sum_of_bytes_hashed
+                .checked_add(section.size_of_raw_data as usize)
+                .ok_or(AuthError::InvalidHeader)?;
         }
     }
 
     // Region 5: Extra data between sections and certificate table
     let file_end = if info.cert_table_size > 0 {
-        pe_data.len().saturating_sub(info.cert_table_size as usize)
+        let cert_start = info.cert_table_rva as usize;
+        let cert_end = cert_start
+            .checked_add(info.cert_table_size as usize)
+            .ok_or(AuthError::InvalidHeader)?;
+        if cert_end > pe_data.len() {
+            return Err(AuthError::InvalidHeader);
+        }
+        cert_start
     } else {
         pe_data.len()
     };

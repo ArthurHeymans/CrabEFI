@@ -58,17 +58,13 @@ fn parse_sha1_last_entry_offset(data: &[u8]) -> Result<Option<usize>, ()> {
 
     let mut offset = 0usize;
     let mut last_entry = None;
-    let mut entry_count = 0usize;
     while offset < data.len() {
         let total = legacy_event_total_size(data, offset).ok_or(())?;
         last_entry = Some(offset);
-        entry_count += 1;
         offset = offset.checked_add(total).ok_or(())?;
     }
 
-    // TCG 1.2 logs usually start with a SpecID entry. Per EFI_TCG_PROTOCOL,
-    // EventLogLastEntry is useful once the log contains more than that header.
-    Ok(if entry_count > 1 { last_entry } else { None })
+    Ok(last_entry)
 }
 
 fn parse_crypto_agile_last_entry_offset(data: &[u8]) -> Result<Option<usize>, ()> {

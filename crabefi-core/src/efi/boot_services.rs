@@ -699,7 +699,11 @@ pub fn signal_event_group_for_runtime(group_guid: &Guid) {
 /// The first attempt performs the ReadyToBoot measured-boot sequence and
 /// signals the ReadyToBoot event group. Subsequent attempts only add the boot
 /// action event so separators are not duplicated.
-pub(crate) fn measure_efi_application_start() {
+pub(crate) fn measure_efi_application_start(is_application: bool) {
+    if !is_application {
+        return;
+    }
+
     let should_signal = crate::state::with_efi_mut(|efi| {
         if !efi.ready_to_boot_signaled {
             efi.ready_to_boot_signaled = true;
@@ -734,8 +738,8 @@ pub(crate) fn measure_efi_application_start() {
 }
 
 /// Measure return from an EFI boot application attempt.
-pub(crate) fn measure_efi_application_return() {
-    if crate::state::efi().ready_to_boot_signaled {
+pub(crate) fn measure_efi_application_return(is_application: bool) {
+    if is_application && crate::state::efi().ready_to_boot_signaled {
         super::tcg::measured_boot::measure_action_all(
             4,
             "Returning from EFI Application from Boot Option",
@@ -1319,6 +1323,9 @@ extern "efiapi" fn load_image(
     }
 
     // Store the loaded image info so StartImage can find it
+    let image_subsystem = pe::parse_headers(data)
+        .map(|headers| headers.subsystem())
+        .unwrap_or(0);
     let store_result = state::with_efi_mut(|efi_state| {
         let slot = efi_state
             .loaded_images
@@ -1334,6 +1341,7 @@ extern "efiapi" fn load_image(
                 entry.alloc_base = loaded_image.alloc_base;
                 entry.num_pages = loaded_image.num_pages;
                 entry.parent_handle = parent_image_handle;
+                entry.subsystem = image_subsystem;
                 true
             }
             None => false,
@@ -1374,13 +1382,13 @@ extern "efiapi" fn start_image(
     }
 
     // Find the loaded image entry
-    let (entry_point, image_base) = {
+    let (entry_point, image_base, image_subsystem) = {
         let efi_state = state::efi();
         match efi_state
             .loaded_images
             .iter()
             .find(|entry| entry.handle == image_handle)
-            .map(|entry| (entry.entry_point, entry.image_base))
+            .map(|entry| (entry.entry_point, entry.image_base, entry.subsystem))
         {
             Some(info) => info,
             None => {
@@ -1401,7 +1409,8 @@ extern "efiapi" fn start_image(
 
     // Signal EFI_EVENT_GROUP_READY_TO_BOOT before the first image is started
     // and measure boot-attempt action events without duplicating separators.
-    measure_efi_application_start();
+    let is_application = image_subsystem == 10;
+    measure_efi_application_start(is_application);
 
     // Update table CRC32s one final time before handing off to the image
     // (config tables may have changed since efi::init())
@@ -1418,7 +1427,7 @@ extern "efiapi" fn start_image(
     let status = entry(image_handle, system_table);
 
     log::info!("BS.StartImage: Image returned with status: {:?}", status);
-    measure_efi_application_return();
+    measure_efi_application_return(is_application);
 
     // Set exit data if provided (we don't support exit data currently)
     if !exit_data_size.is_null() {

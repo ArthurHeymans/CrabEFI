@@ -13,6 +13,11 @@ const MAX_BLOCK_SIZE: usize = 4096;
 /// Minimum block size for GPT calculations
 const MIN_BLOCK_SIZE: usize = 512;
 
+/// Sane upper bound for GPT entries to avoid unbounded allocation or I/O from
+/// malicious on-disk headers. 4096 entries is already much larger than normal
+/// firmware use and caps raw entry data to 512 KiB for 128-byte entries.
+const MAX_GPT_PARTITION_ENTRIES: usize = 4096;
+
 /// GPT header signature "EFI PART"
 const GPT_SIGNATURE: u64 = 0x5452415020494645;
 
@@ -65,6 +70,46 @@ impl GptHeader {
     pub fn is_valid(&self) -> bool {
         self.signature == GPT_SIGNATURE
     }
+}
+
+fn gpt_entry_array_bounds(
+    info: crate::drivers::block::BlockDeviceInfo,
+    header: &GptHeader,
+    block_size: usize,
+    is_hybrid: bool,
+) -> Result<(usize, usize, usize), GptError> {
+    let entry_size = header.partition_entry_size as usize;
+    if entry_size < core::mem::size_of::<GptPartitionEntry>() || entry_size > MAX_BLOCK_SIZE {
+        return Err(GptError::InvalidHeader);
+    }
+
+    let total_entries = header.num_partition_entries as usize;
+    if total_entries == 0 || total_entries > MAX_GPT_PARTITION_ENTRIES {
+        return Err(GptError::InvalidHeader);
+    }
+
+    let lba_size = if is_hybrid {
+        MIN_BLOCK_SIZE
+    } else {
+        block_size
+    };
+    let entries_byte_offset = (header.partition_entry_lba as usize)
+        .checked_mul(lba_size)
+        .ok_or(GptError::InvalidHeader)?;
+    let total_bytes_needed = total_entries
+        .checked_mul(entry_size)
+        .ok_or(GptError::InvalidHeader)?;
+    let entries_end = entries_byte_offset
+        .checked_add(total_bytes_needed)
+        .ok_or(GptError::InvalidHeader)?;
+    let device_size = (info.num_blocks as usize)
+        .checked_mul(block_size)
+        .ok_or(GptError::InvalidHeader)?;
+    if entries_end > device_size {
+        return Err(GptError::InvalidHeader);
+    }
+
+    Ok((entries_byte_offset, total_entries, total_bytes_needed))
 }
 
 /// GPT Partition Entry
@@ -321,19 +366,8 @@ pub fn build_gpt_measurement_event(
     let is_hybrid = block_size > MIN_BLOCK_SIZE;
 
     let entry_size = header.partition_entry_size as usize;
-    if entry_size < core::mem::size_of::<GptPartitionEntry>() {
-        return Err(GptError::InvalidHeader);
-    }
-
-    let entries_byte_offset = if is_hybrid {
-        header.partition_entry_lba as usize * MIN_BLOCK_SIZE
-    } else {
-        header.partition_entry_lba as usize * block_size
-    };
-    let total_entries = header.num_partition_entries as usize;
-    let total_bytes_needed = total_entries
-        .checked_mul(entry_size)
-        .ok_or(GptError::InvalidHeader)?;
+    let (entries_byte_offset, total_entries, total_bytes_needed) =
+        gpt_entry_array_bounds(info, header, block_size, is_hybrid)?;
 
     let mut raw_entries: Vec<u8> = Vec::new();
     let mut buffer = [0u8; MAX_BLOCK_SIZE];
@@ -409,35 +443,28 @@ pub fn read_partitions(
     // We need to translate to actual device blocks.
     let is_hybrid = block_size > MIN_BLOCK_SIZE;
 
-    // Calculate where partition entries start in byte terms
-    // For hybrid ISOs, partition_entry_lba is in 512-byte terms
-    let entries_byte_offset = if is_hybrid {
-        header.partition_entry_lba as usize * MIN_BLOCK_SIZE
-    } else {
-        header.partition_entry_lba as usize * block_size
-    };
-
     let entry_size = header.partition_entry_size as usize;
-    if entry_size < core::mem::size_of::<GptPartitionEntry>() {
+    if entry_size < core::mem::size_of::<GptPartitionEntry>() || entry_size > MAX_BLOCK_SIZE {
         log::warn!(
-            "GPT partition entry size too small: {} bytes (need at least {})",
+            "Invalid GPT partition entry size: {} bytes (need {}..={})",
             entry_size,
-            core::mem::size_of::<GptPartitionEntry>()
+            core::mem::size_of::<GptPartitionEntry>(),
+            MAX_BLOCK_SIZE
         );
         return Err(GptError::InvalidHeader);
     }
 
-    let total_entries = header.num_partition_entries as usize;
-    let total_bytes_needed = total_entries
-        .checked_mul(entry_size)
-        .ok_or(GptError::InvalidHeader)?;
+    let (entries_byte_offset, _total_entries, total_bytes_needed) =
+        gpt_entry_array_bounds(info, header, block_size, is_hybrid)?;
 
     let mut entry_index = 0u32;
     let mut bytes_read = 0usize;
 
     'outer: while bytes_read < total_bytes_needed {
         // Calculate which device block to read
-        let current_byte_offset = entries_byte_offset + bytes_read;
+        let current_byte_offset = entries_byte_offset
+            .checked_add(bytes_read)
+            .ok_or(GptError::InvalidHeader)?;
         let lba = (current_byte_offset / block_size) as u64;
         let offset_in_block = current_byte_offset % block_size;
 

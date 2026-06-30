@@ -74,8 +74,13 @@ const TPM2_PT_MAX_RESPONSE_SIZE: u32 = 0x0000_011F;
 // TPM2_Startup types
 const TPM2_SU_CLEAR: u16 = 0x0000;
 
-// Timeout in loop iterations (generous for real hardware)
-const TIMEOUT_LOOPS: u32 = 1_000_000;
+// TPM polling timeout in real time. TIS polling can run on widely different CPU
+// and MMIO speeds, so use elapsed firmware time rather than iteration counts.
+const TPM_TIMEOUT_US: u64 = 1_000_000;
+
+fn tpm_wait_expired(start_us: u64) -> bool {
+    crate::logger::get_us_since_boot().saturating_sub(start_us) >= TPM_TIMEOUT_US
+}
 
 // ============================================================================
 // TIS MMIO Register Access
@@ -218,11 +223,13 @@ impl TpmTis {
 
         unsafe { tis_write8(self.base, TPM_ACCESS, ACCESS_REQUEST_USE) };
 
-        for _ in 0..TIMEOUT_LOOPS {
+        let start_us = crate::logger::get_us_since_boot();
+        while !tpm_wait_expired(start_us) {
             let access = unsafe { tis_read8(self.base, TPM_ACCESS) };
             if access & ACCESS_ACTIVE_LOCALITY != 0 {
                 return Ok(());
             }
+            core::hint::spin_loop();
         }
 
         log::error!("TPM TIS: timeout requesting locality 0");
@@ -234,7 +241,8 @@ impl TpmTis {
         // Write commandReady to abort any previous command.
         unsafe { tis_write8(self.base, TPM_STS, STS_COMMAND_READY) };
 
-        for _ in 0..TIMEOUT_LOOPS {
+        let start_us = crate::logger::get_us_since_boot();
+        while !tpm_wait_expired(start_us) {
             let sts = unsafe { tis_read8(self.base, TPM_STS) };
             if sts & STS_COMMAND_READY != 0 {
                 return Ok(());
@@ -247,7 +255,8 @@ impl TpmTis {
     }
 
     fn wait_burst_count(&self) -> Result<usize, TcgError> {
-        for _ in 0..TIMEOUT_LOOPS {
+        let start_us = crate::logger::get_us_since_boot();
+        while !tpm_wait_expired(start_us) {
             let burst = unsafe { tis_read_burst_count(self.base) };
             if burst > 0 {
                 return Ok(burst);
@@ -268,7 +277,8 @@ impl TpmTis {
     }
 
     fn wait_command_accepted(&self) -> Result<(), TcgError> {
-        for _ in 0..TIMEOUT_LOOPS {
+        let start_us = crate::logger::get_us_since_boot();
+        while !tpm_wait_expired(start_us) {
             let sts = unsafe { tis_read8(self.base, TPM_STS) };
             if sts & STS_VALID != 0 && sts & STS_EXPECT == 0 {
                 return Ok(());
@@ -330,7 +340,8 @@ impl TpmTis {
 
         // 4. Wait for dataAvail
         let mut data_available = false;
-        for _ in 0..TIMEOUT_LOOPS {
+        let start_us = crate::logger::get_us_since_boot();
+        while !tpm_wait_expired(start_us) {
             let sts = unsafe { tis_read8(self.base, TPM_STS) };
             if sts & (STS_VALID | STS_DATA_AVAIL) == (STS_VALID | STS_DATA_AVAIL) {
                 data_available = true;
@@ -680,8 +691,12 @@ impl TpmTis {
         let auth_size = (offset - auth_start) as u32;
         cmd[auth_size_offset..auth_size_offset + 4].copy_from_slice(&auth_size.to_be_bytes());
 
-        // TPML_DIGEST_VALUES
-        let digest_count = digests.len().min(5) as u32;
+        // TPML_DIGEST_VALUES. Count only digests we actually encode.
+        let digest_count = digests
+            .iter()
+            .take(5)
+            .filter(|digest| digest_size_for_algorithm(digest.algorithm).is_some())
+            .count() as u32;
         cmd[offset..offset + 4].copy_from_slice(&digest_count.to_be_bytes());
         offset += 4;
 

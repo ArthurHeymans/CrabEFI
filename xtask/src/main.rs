@@ -381,7 +381,7 @@ fn cmd_run(
         arch,
         machine,
         extra_devices: Vec::new(),
-        enable_tpm: false,
+        enable_tpm: app.as_deref() == Some("tcg-test") && matches!(arch, Arch::X86_64),
     };
 
     // Add USB keyboard for UI testing.

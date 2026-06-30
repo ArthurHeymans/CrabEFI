@@ -50,12 +50,6 @@ enum Tpm2Backend {
     Driver(&'static mut dyn Tpm2Device),
 }
 
-// SAFETY: UEFI boot-service execution in CrabEFI is single-threaded. The
-// spin::Mutex requires its payload to be Send for static storage, but platform
-// TPM drivers are only accessed while holding TCG2_STATE and init_platform()
-// never returns, so the erased driver reference remains valid.
-unsafe impl Send for Tpm2Backend {}
-
 impl Tpm2Backend {
     fn manufacturer_id(&self) -> u32 {
         match self {
@@ -751,14 +745,10 @@ extern "efiapi" fn tcg2_hash_log_extend_event(
         Some(s) => s,
         None => return Status::DEVICE_ERROR,
     };
-    if state.hardware_tpm.is_none() {
-        log::debug!("TCG2.HashLogExtendEvent() -> DEVICE_ERROR (no physical TPM)");
-        return Status::DEVICE_ERROR;
-    }
 
-    // Calculate event data offset and size only after confirming an attestable
-    // TPM backend exists, so log-only/no-backend calls do not construct
-    // variable-length slices from caller-controlled pointers.
+    // Calculate event data offset and size after validating the caller-provided
+    // event header. EV_NO_ACTION is log-only and can be accepted without an
+    // attestable TPM backend.
     let event_data_size = (event_size - header_total_size as u32) as usize;
     let event_data = if event_data_size > 0 {
         // SAFETY: the event data follows the fixed-size header in the caller's
@@ -767,14 +757,6 @@ extern "efiapi" fn tcg2_hash_log_extend_event(
             let data_ptr = (event as *const u8).add(header_total_size);
             core::slice::from_raw_parts(data_ptr, event_data_size)
         }
-    } else {
-        &[]
-    };
-
-    // Hash the data to be measured.
-    let data_slice = if data_to_hash_len > 0 && data_to_hash != 0 {
-        // SAFETY: caller guarantees the physical address range is valid.
-        unsafe { core::slice::from_raw_parts(data_to_hash as *const u8, data_to_hash_len as usize) }
     } else {
         &[]
     };
@@ -817,6 +799,19 @@ extern "efiapi" fn tcg2_hash_log_extend_event(
         }
         return Status::SUCCESS;
     }
+
+    if state.hardware_tpm.is_none() {
+        log::debug!("TCG2.HashLogExtendEvent() -> DEVICE_ERROR (no physical TPM)");
+        return Status::DEVICE_ERROR;
+    }
+
+    // Hash the data to be measured.
+    let data_slice = if data_to_hash_len > 0 {
+        // SAFETY: caller guarantees the physical address range is valid.
+        unsafe { core::slice::from_raw_parts(data_to_hash as *const u8, data_to_hash_len as usize) }
+    } else {
+        &[]
+    };
 
     // Hash the data with all active algorithms.
     // When TCG2_PE_COFF_IMAGE is set, use Authenticode hash (excludes
