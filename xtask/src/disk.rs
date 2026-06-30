@@ -11,14 +11,14 @@ use std::process::Command;
 
 use crate::Arch;
 
-/// Disk geometry constants for a 64MB disk
-const DISK_SIZE: u64 = 64 * 1024 * 1024;
+/// Default disk size for small EFI app tests.
+const DEFAULT_DISK_SIZE: u64 = 64 * 1024 * 1024;
+/// Larger disk size for Windows/WinPE media. WinPE boot.wim is far larger than
+/// the default 64 MiB smoke-test disk.
+const WINDOWS_MEDIA_DISK_SIZE: u64 = 1024 * 1024 * 1024;
 const SECTOR_SIZE: u64 = 512;
-const TOTAL_SECTORS: u64 = DISK_SIZE / SECTOR_SIZE;
 /// ESP starts at 1MiB to leave room for GPT
 const ESP_START_SECTOR: u64 = 2048; // 1MiB / 512
-/// ESP ends at last usable sector (leaving 33 sectors for backup GPT)
-const ESP_END_SECTOR: u64 = TOTAL_SECTORS - 34;
 
 /// GPT signature "EFI PART"
 const GPT_SIGNATURE: u64 = 0x5452415020494645;
@@ -33,6 +33,25 @@ const GPT_NUM_ENTRIES: u32 = 128;
 const ESP_TYPE_GUID: [u8; 16] = [
     0x28, 0x73, 0x2A, 0xC1, 0x1F, 0xF8, 0xD2, 0x11, 0xBA, 0x4B, 0x00, 0xA0, 0xC9, 0x3E, 0xC9, 0x3B,
 ];
+
+#[derive(Clone, Copy, Debug)]
+struct DiskGeometry {
+    disk_size: u64,
+    total_sectors: u64,
+    esp_end_sector: u64,
+}
+
+impl DiskGeometry {
+    fn new(disk_size: u64) -> Self {
+        let total_sectors = disk_size / SECTOR_SIZE;
+        Self {
+            disk_size,
+            total_sectors,
+            // Last usable sector before the 33-sector backup GPT area.
+            esp_end_sector: total_sectors - 34,
+        }
+    }
+}
 
 /// Return an mtools image specifier for the ESP inside a generated disk image.
 ///
@@ -56,28 +75,38 @@ pub fn mtools_esp_image(disk_path: &Path) -> String {
 /// * `efi_app` - Optional path to an EFI application to install as boot application
 /// * `arch` - Target architecture (determines EFI boot path name)
 pub fn create_test_disk(output: &str, efi_app: Option<&str>, arch: Arch) -> Result<()> {
+    create_test_disk_with_size(output, efi_app, arch, DEFAULT_DISK_SIZE)
+}
+
+fn create_test_disk_with_size(
+    output: &str,
+    efi_app: Option<&str>,
+    arch: Arch,
+    disk_size: u64,
+) -> Result<()> {
     println!("Creating test disk: {}", output);
+    let geometry = DiskGeometry::new(disk_size);
 
     // Create empty disk image
     let mut file = File::create(output).context("failed to create disk image")?;
-    file.set_len(DISK_SIZE)?;
+    file.set_len(geometry.disk_size)?;
 
     // Write protective MBR
-    write_protective_mbr(&mut file)?;
+    write_protective_mbr(&mut file, geometry)?;
 
     // Write primary GPT header and partition entries
-    write_gpt_header(&mut file, true)?;
-    write_gpt_partition_entries(&mut file, true)?;
+    write_gpt_header(&mut file, true, geometry)?;
+    write_gpt_partition_entries(&mut file, true, geometry)?;
 
     // Write backup GPT header and partition entries
-    write_gpt_partition_entries(&mut file, false)?;
-    write_gpt_header(&mut file, false)?;
+    write_gpt_partition_entries(&mut file, false, geometry)?;
+    write_gpt_header(&mut file, false, geometry)?;
 
     file.flush()?;
     drop(file);
 
     // Create FAT32 filesystem in the ESP partition
-    create_fat32_in_partition(output, ESP_START_SECTOR, ESP_END_SECTOR)?;
+    create_fat32_in_partition(output, ESP_START_SECTOR, geometry.esp_end_sector)?;
 
     // If we have an EFI app, copy it
     if let Some(app_path) = efi_app {
@@ -89,7 +118,7 @@ pub fn create_test_disk(output: &str, efi_app: Option<&str>, arch: Arch) -> Resu
 }
 
 /// Write a protective MBR for GPT
-fn write_protective_mbr(file: &mut File) -> Result<()> {
+fn write_protective_mbr(file: &mut File, geometry: DiskGeometry) -> Result<()> {
     let mut mbr = [0u8; 512];
 
     // Boot signature
@@ -112,7 +141,7 @@ fn write_protective_mbr(file: &mut File) -> Result<()> {
     // LBA start: 1
     mbr[454..458].copy_from_slice(&1u32.to_le_bytes());
     // LBA count: total sectors - 1
-    let sectors = (TOTAL_SECTORS - 1).min(0xFFFFFFFF) as u32;
+    let sectors = (geometry.total_sectors - 1).min(0xFFFFFFFF) as u32;
     mbr[458..462].copy_from_slice(&sectors.to_le_bytes());
 
     file.seek(SeekFrom::Start(0))?;
@@ -121,7 +150,7 @@ fn write_protective_mbr(file: &mut File) -> Result<()> {
 }
 
 /// Write GPT header (primary or backup)
-fn write_gpt_header(file: &mut File, primary: bool) -> Result<()> {
+fn write_gpt_header(file: &mut File, primary: bool, geometry: DiskGeometry) -> Result<()> {
     let mut header = [0u8; 512];
 
     // Signature "EFI PART"
@@ -140,11 +169,19 @@ fn write_gpt_header(file: &mut File, primary: bool) -> Result<()> {
     header[20..24].copy_from_slice(&0u32.to_le_bytes());
 
     // Current LBA
-    let current_lba = if primary { 1 } else { TOTAL_SECTORS - 1 };
+    let current_lba = if primary {
+        1
+    } else {
+        geometry.total_sectors - 1
+    };
     header[24..32].copy_from_slice(&current_lba.to_le_bytes());
 
     // Backup LBA
-    let backup_lba = if primary { TOTAL_SECTORS - 1 } else { 1 };
+    let backup_lba = if primary {
+        geometry.total_sectors - 1
+    } else {
+        1
+    };
     header[32..40].copy_from_slice(&backup_lba.to_le_bytes());
 
     // First usable LBA (after primary GPT + partition entries)
@@ -152,7 +189,7 @@ fn write_gpt_header(file: &mut File, primary: bool) -> Result<()> {
     header[40..48].copy_from_slice(&first_usable.to_le_bytes());
 
     // Last usable LBA (before backup GPT)
-    let last_usable = TOTAL_SECTORS - 34;
+    let last_usable = geometry.total_sectors - 34;
     header[48..56].copy_from_slice(&last_usable.to_le_bytes());
 
     // Disk GUID (random but deterministic for testing)
@@ -163,7 +200,11 @@ fn write_gpt_header(file: &mut File, primary: bool) -> Result<()> {
     header[56..72].copy_from_slice(&disk_guid);
 
     // Partition entries starting LBA
-    let entries_lba = if primary { 2 } else { TOTAL_SECTORS - 33 };
+    let entries_lba = if primary {
+        2
+    } else {
+        geometry.total_sectors - 33
+    };
     header[72..80].copy_from_slice(&entries_lba.to_le_bytes());
 
     // Number of partition entries
@@ -173,7 +214,7 @@ fn write_gpt_header(file: &mut File, primary: bool) -> Result<()> {
     header[84..88].copy_from_slice(&GPT_ENTRY_SIZE.to_le_bytes());
 
     // CRC32 of partition entries (calculated separately)
-    let entries_crc = calculate_partition_entries_crc()?;
+    let entries_crc = calculate_partition_entries_crc(geometry)?;
     header[88..92].copy_from_slice(&entries_crc.to_le_bytes());
 
     // Calculate header CRC32
@@ -189,7 +230,11 @@ fn write_gpt_header(file: &mut File, primary: bool) -> Result<()> {
 }
 
 /// Write GPT partition entries
-fn write_gpt_partition_entries(file: &mut File, primary: bool) -> Result<()> {
+fn write_gpt_partition_entries(
+    file: &mut File,
+    primary: bool,
+    geometry: DiskGeometry,
+) -> Result<()> {
     // Each entry is 128 bytes, we have 128 entries = 16384 bytes = 32 sectors
     let entries_size = (GPT_NUM_ENTRIES * GPT_ENTRY_SIZE) as usize;
     let mut entries = vec![0u8; entries_size];
@@ -211,7 +256,7 @@ fn write_gpt_partition_entries(file: &mut File, primary: bool) -> Result<()> {
     entry[32..40].copy_from_slice(&ESP_START_SECTOR.to_le_bytes());
 
     // Ending LBA
-    entry[40..48].copy_from_slice(&ESP_END_SECTOR.to_le_bytes());
+    entry[40..48].copy_from_slice(&geometry.esp_end_sector.to_le_bytes());
 
     // Attributes (none)
     entry[48..56].copy_from_slice(&0u64.to_le_bytes());
@@ -224,7 +269,11 @@ fn write_gpt_partition_entries(file: &mut File, primary: bool) -> Result<()> {
     }
 
     // Write entries
-    let entries_lba = if primary { 2 } else { TOTAL_SECTORS - 33 };
+    let entries_lba = if primary {
+        2
+    } else {
+        geometry.total_sectors - 33
+    };
     let offset = entries_lba * SECTOR_SIZE;
     file.seek(SeekFrom::Start(offset))?;
     file.write_all(&entries)?;
@@ -233,7 +282,7 @@ fn write_gpt_partition_entries(file: &mut File, primary: bool) -> Result<()> {
 }
 
 /// Calculate CRC32 of partition entries (for GPT header)
-fn calculate_partition_entries_crc() -> Result<u32> {
+fn calculate_partition_entries_crc(geometry: DiskGeometry) -> Result<u32> {
     let entries_size = (GPT_NUM_ENTRIES * GPT_ENTRY_SIZE) as usize;
     let mut entries = vec![0u8; entries_size];
 
@@ -246,7 +295,7 @@ fn calculate_partition_entries_crc() -> Result<u32> {
     ];
     entry[16..32].copy_from_slice(&part_guid);
     entry[32..40].copy_from_slice(&ESP_START_SECTOR.to_le_bytes());
-    entry[40..48].copy_from_slice(&ESP_END_SECTOR.to_le_bytes());
+    entry[40..48].copy_from_slice(&geometry.esp_end_sector.to_le_bytes());
     let name = "EFI System";
     for (i, c) in name.chars().enumerate() {
         let offset = 56 + i * 2;
@@ -599,6 +648,40 @@ reset -s
     )?;
 
     println!("Installed UEFI Shell and SCT smoke sequence");
+    Ok(())
+}
+
+/// Create a disk image from a Windows/WinPE boot media directory.
+///
+/// The media directory is expected to be the contents of a FAT-formatted
+/// Windows or WinPE boot device, for example the `media` directory produced by
+/// Microsoft ADK `copype` after customizing `sources/boot.wim`.
+///
+/// # Arguments
+/// * `output` - Path for the output disk image
+/// * `media_dir` - Directory tree to copy to the ESP root
+/// * `arch` - Target architecture
+///
+/// # Returns
+/// `Ok(())` when the disk image is created and populated.
+pub fn create_windows_media_disk(output: &str, media_dir: &Path, arch: Arch) -> Result<()> {
+    if !media_dir.is_dir() {
+        bail!(
+            "Windows boot media directory not found: {}",
+            media_dir.display()
+        );
+    }
+
+    println!("Creating Windows boot media disk: {}", output);
+    create_test_disk_with_size(output, None, arch, WINDOWS_MEDIA_DISK_SIZE)?;
+
+    let disk_with_offset = mtools_esp_image(Path::new(output));
+    copy_tree_to_esp(&disk_with_offset, media_dir, "::")?;
+
+    println!(
+        "Installed Windows/WinPE boot media from {}",
+        media_dir.display()
+    );
     Ok(())
 }
 

@@ -324,6 +324,80 @@ jobs:
       - name: Run UEFI SCT smoke subset
         run: ./crabefi test --app uefi-sct-smoke --sct-assets-dir sct-assets/x86_64 --disable-kvm --timeout 180
 
+  # ── Optional Windows Boot Manager smoke test ─────────────────────────────
+  # Enable with repository variable ENABLE_WINDOWS_SMOKE=true. Skipped for PRs
+  # to avoid cache-restoring Microsoft WinPE bits from untrusted code.
+
+  build-winpe-smoke-assets-x86_64:
+    name: Build WinPE Smoke Assets x86_64
+    runs-on: windows-latest
+    if: github.event_name != 'pull_request' && vars.ENABLE_WINDOWS_SMOKE == 'true'
+    env:
+      WINDOWS_SMOKE_SUCCESS_MARKER: ${{ vars.WINDOWS_SMOKE_SUCCESS_MARKER || 'CRABEFI_WINDOWS_BOOT_SMOKE_SUCCESS' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Restore cached WinPE smoke assets
+        id: cache
+        uses: actions/cache@v4
+        with:
+          path: windows-assets/x86_64/media
+          key: winpe-smoke-x86_64-${{ hashFiles('ci/build-winpe-smoke-media.ps1') }}-${{ env.WINDOWS_SMOKE_SUCCESS_MARKER }}
+          enableCrossOsArchive: true
+
+      - name: Build WinPE smoke media from Microsoft ADK
+        if: steps.cache.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          ./ci/build-winpe-smoke-media.ps1 -Arch x86_64 -OutputDir windows-assets/x86_64/media -SuccessMarker "$env:WINDOWS_SMOKE_SUCCESS_MARKER"
+
+  test-windows-boot-smoke:
+    name: Test x86_64 (Windows boot smoke)
+    runs-on: ubuntu-latest
+    needs: [build, build-winpe-smoke-assets-x86_64]
+    if: github.event_name != 'pull_request' && vars.ENABLE_WINDOWS_SMOKE == 'true'
+    env:
+      WINDOWS_SMOKE_SUCCESS_MARKER: ${{ vars.WINDOWS_SMOKE_SUCCESS_MARKER || 'CRABEFI_WINDOWS_BOOT_SMOKE_SUCCESS' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchains
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src
+          targets: x86_64-unknown-none
+
+      - name: Install stable toolchain for xtask
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qemu-system-x86 mtools dosfstools zstd coreboot-utils
+
+      - name: Download CrabEFI ELF
+        uses: actions/download-artifact@v4
+        with:
+          name: crabefi-elf
+          path: target/x86_64-unknown-none/release/
+
+      - name: Restore cached WinPE smoke assets
+        uses: actions/cache/restore@v4
+        with:
+          path: windows-assets/x86_64/media/
+          key: winpe-smoke-x86_64-${{ hashFiles('ci/build-winpe-smoke-media.ps1') }}-${{ env.WINDOWS_SMOKE_SUCCESS_MARKER }}
+          enableCrossOsArchive: true
+          fail-on-cache-miss: true
+
+      - name: Run Windows Boot Manager smoke test
+        run: |
+          ./crabefi test --app windows-boot-smoke \
+            --windows-media-dir windows-assets/x86_64/media \
+            --windows-success-marker "$WINDOWS_SMOKE_SUCCESS_MARKER" \
+            --nvme \
+            --disable-kvm \
+            --timeout 900
+
   # ── GRUB + Linux boot-chain ─────────────────────────────────────────
 
   build-boot-assets-x86_64:

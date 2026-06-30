@@ -924,6 +924,104 @@ pub fn run_uefi_sct_smoke_tests(config: &QemuConfig, disk_path: &Path) -> Result
     Ok(())
 }
 
+/// Run a Windows Boot Manager smoke test and parse its serial output.
+///
+/// The disk image is supplied by the caller because Windows and WinPE binaries
+/// are not redistributable by CrabEFI. The image should be configured to print
+/// a deterministic marker to COM1 after Windows or WinPE reaches userspace.
+///
+/// # Arguments
+/// * `config` - QEMU configuration
+/// * `disk_path` - Raw Windows/WinPE disk image
+/// * `success_markers` - Serial markers; any one marker indicates success
+///
+/// # Returns
+/// `Ok(())` if Windows reaches one of the configured markers without obvious
+/// boot-manager or loader failures.
+pub fn run_windows_boot_smoke_test(
+    config: &QemuConfig,
+    disk_path: &Path,
+    success_markers: &[String],
+) -> Result<()> {
+    println!("=== Windows Boot Smoke Test ({:?}) ===\n", config.arch);
+    println!("Running Windows/WinPE disk image in QEMU...\n");
+
+    let result = run_qemu_with_capture(config, disk_path)?;
+
+    println!("\n=== Windows Boot Smoke Results ===");
+    println!("Serial output captured: {} bytes", result.output.len());
+
+    let mut passed = 0;
+    let mut failed = 0;
+
+    if result.output.contains("CrabEFI") {
+        println!("[PASS] crabefi_started: CrabEFI produced serial output");
+        passed += 1;
+    } else {
+        println!("[FAIL] crabefi_started: CrabEFI serial output was not observed");
+        failed += 1;
+    }
+
+    let matched_markers = success_markers
+        .iter()
+        .filter(|marker| result.output.contains(marker.as_str()))
+        .collect::<Vec<_>>();
+    if matched_markers.is_empty() {
+        println!(
+            "[FAIL] windows_success_marker: none of {:?} appeared on serial",
+            success_markers
+        );
+        failed += 1;
+    } else {
+        println!(
+            "[PASS] windows_success_marker: matched {:?}",
+            matched_markers
+        );
+        passed += 1;
+    }
+
+    let failure_markers = [
+        "No bootable device",
+        "BOOTMGR is missing",
+        "Windows failed to start",
+        "Recovery",
+        "Status: 0xc000",
+        "0xc000000f",
+        "0xc0000225",
+        "Access Denied",
+        "StartImage failed",
+        "Error loading image",
+        "CRABEFI: boot failed",
+    ];
+    let found_failures = failure_markers
+        .iter()
+        .filter(|marker| result.output.contains(**marker))
+        .copied()
+        .collect::<Vec<_>>();
+    if found_failures.is_empty() {
+        println!("[PASS] no_windows_failure_markers: no failure markers found");
+        passed += 1;
+    } else {
+        println!(
+            "[FAIL] no_windows_failure_markers: found markers {:?}",
+            found_failures
+        );
+        failed += 1;
+    }
+
+    println!("\n=== Summary ===");
+    println!("Passed: {}", passed);
+    println!("Failed: {}", failed);
+
+    if failed > 0 {
+        println!("\n--- Captured Output ---");
+        println!("{}", result.output);
+        bail!("{} Windows boot smoke check(s) failed", failed);
+    }
+
+    Ok(())
+}
+
 fn extract_sct_log(disk_path: &Path, src: &str) -> Result<Option<String>> {
     let temp_dir = tempfile::tempdir()?;
     let dest = temp_dir.path().join("sct.log");

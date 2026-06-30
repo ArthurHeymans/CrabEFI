@@ -8,6 +8,7 @@ test-security-disk.img
 test/*.efi
 /boot-assets/
 /sct-assets/
+/windows-assets/
 
 # IDE/Editor
 .idea/
