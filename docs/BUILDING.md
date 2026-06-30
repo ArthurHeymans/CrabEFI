@@ -8,7 +8,7 @@
 nix develop
 ```
 
-This provides the Rust nightly toolchain, QEMU, mtools, dosfstools, cbfstool, and zstd.
+This provides the Rust nightly toolchain, QEMU, mtools, dosfstools, cbfstool, zstd, and p7zip.
 
 ### Manual Setup
 
@@ -22,7 +22,7 @@ rustup component add rust-src llvm-tools-preview
 
 **System Packages (Debian/Ubuntu):**
 ```bash
-sudo apt install qemu-system-x86 qemu-system-arm mtools dosfstools zstd coreboot-utils
+sudo apt install qemu-system-x86 qemu-system-arm mtools dosfstools zstd coreboot-utils p7zip-full
 ```
 
 ## Building
@@ -123,6 +123,76 @@ The `crabefi-coreboot` binary enables both `platform-entry` and `global-allocato
 ./crabefi run --app hello --nvme
 ./crabefi run --app hello --ahci --headless
 ```
+
+### UEFI SCT smoke subset
+
+CrabEFI can run a small public UEFI Self-Certification Test subset in QEMU. The
+test uses prebuilt public artifacts from `tianocore/edk2-test` and an EDK2 UEFI
+Shell binary from `pbatard/UEFI-Shell`; hashes are pinned in
+`ci/build-sct-assets.sh`.
+
+```bash
+# Download and verify SCT + UEFI Shell assets
+ci/build-sct-assets.sh --arch x86_64
+
+# Run the SCT smoke sequence
+./crabefi test --app uefi-sct-smoke \
+    --sct-assets-dir sct-assets/x86_64 \
+    --disable-kvm \
+    --timeout 180
+```
+
+The initial sequence intentionally exercises only a few low-risk Boot Services
+cases (`Stall`, `CopyMem`, `SetMem`, `CalculateCrc32`, pool allocation/free).
+Add more cases to the generated `smoke.seq` in `xtask/src/disk.rs` as CrabEFI's
+UEFI surface grows.
+
+### Windows Boot Manager smoke test
+
+CrabEFI can also run a Windows/WinPE boot smoke test in QEMU. The preferred
+public-source path builds WinPE media from Microsoft's official Windows ADK and
+Windows PE add-on, then boots that media through CrabEFI and Windows Boot
+Manager. The generated WinPE image writes a deterministic marker to COM1 after
+`startnet.cmd` runs.
+
+The default marker is `CRABEFI_WINDOWS_BOOT_SMOKE_SUCCESS`.
+
+Build the WinPE media on Windows:
+
+```powershell
+ci/build-winpe-smoke-media.ps1 `
+    -Arch x86_64 `
+    -OutputDir windows-assets/x86_64/media `
+    -SuccessMarker CRABEFI_WINDOWS_BOOT_SMOKE_SUCCESS
+```
+
+Then run the smoke test from Linux:
+
+```bash
+./crabefi test --app windows-boot-smoke \
+    --windows-media-dir windows-assets/x86_64/media \
+    --windows-success-marker CRABEFI_WINDOWS_BOOT_SMOKE_SUCCESS \
+    --nvme \
+    --disable-kvm \
+    --timeout 900
+```
+
+For custom Windows or WinPE images, you can also pass a raw disk image instead:
+
+```bash
+./crabefi test --app windows-boot-smoke --windows-disk path/to/windows-smoke.img
+```
+
+If no explicit path is passed, the xtask looks for
+`windows-assets/x86_64/media` first, then `windows-assets/x86_64/windows-smoke.img`.
+Raw disk images are copied into a temporary directory before boot so the source
+artifact is not modified by QEMU.
+
+The GitHub Actions job is intentionally optional because it downloads and caches
+Microsoft WinPE artifacts and is relatively heavy. Enable it with the repository
+variable `ENABLE_WINDOWS_SMOKE=true`. The optional
+`WINDOWS_SMOKE_SUCCESS_MARKER` repository variable can override the default
+serial marker.
 
 ### Test Applications
 

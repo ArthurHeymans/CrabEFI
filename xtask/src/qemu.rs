@@ -3,8 +3,9 @@
 //! This module provides functionality to run CrabEFI in QEMU with various
 //! storage configurations and parse serial output for test results.
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use regex::Regex;
+use std::fs;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
 
@@ -793,6 +794,251 @@ pub fn run_tests(config: &QemuConfig, disk_path: &Path, app_name: &str) -> Resul
     }
 
     Ok(())
+}
+
+/// Run the UEFI SCT smoke subset and parse its serial/log output.
+///
+/// # Arguments
+/// * `config` - QEMU configuration
+/// * `disk_path` - Disk image containing the UEFI Shell and SCT package
+///
+/// # Returns
+/// `Ok(())` if the smoke sequence ran to completion without obvious failures.
+pub fn run_uefi_sct_smoke_tests(config: &QemuConfig, disk_path: &Path) -> Result<()> {
+    println!("=== UEFI SCT Smoke Tests ({:?}) ===\n", config.arch);
+    println!("Running SCT smoke sequence in QEMU...\n");
+
+    let result = run_qemu_with_capture(config, disk_path)?;
+    let summary_log = extract_sct_log(disk_path, "::/Sct/Overall/Summary.log")?;
+
+    println!("\n=== SCT Smoke Results ===");
+    println!("Serial output captured: {} bytes", result.output.len());
+    if let Some(ref summary) = summary_log {
+        println!("SCT Summary.log captured: {} bytes", summary.len());
+        println!("\n--- SCT Summary.log ---\n{}", summary);
+    } else {
+        println!("SCT Summary.log was not produced or could not be copied");
+    }
+
+    let mut passed = 0;
+    let mut failed = 0;
+
+    if result.output.contains("CRABEFI_SCT_SMOKE_START") {
+        println!("[PASS] sct_started: startup.nsh launched SCT smoke run");
+        passed += 1;
+    } else {
+        println!("[FAIL] sct_started: missing CRABEFI_SCT_SMOKE_START marker");
+        failed += 1;
+    }
+
+    if result.output.contains("CRABEFI_SCT_SMOKE_DONE") {
+        println!("[PASS] sct_completed: SCT command returned to startup.nsh");
+        passed += 1;
+    } else {
+        println!("[FAIL] sct_completed: missing CRABEFI_SCT_SMOKE_DONE marker");
+        failed += 1;
+    }
+
+    if result.output.contains("CRABEFI_SCT_SMOKE_NOT_FOUND") {
+        println!("[FAIL] sct_found: startup.nsh could not find \\Sct\\SCT.efi");
+        failed += 1;
+    } else {
+        println!("[PASS] sct_found: \\Sct\\SCT.efi was found");
+        passed += 1;
+    }
+
+    for test_name in [
+        "Stall_Func",
+        "CopyMem_Func",
+        "SetMem_Func",
+        "CalculateCrc32_Func",
+        "AllocatePool_Conf",
+        "FreePool_Conf",
+    ] {
+        if result.output.contains(test_name)
+            || summary_log
+                .as_ref()
+                .is_some_and(|summary| summary.contains(test_name))
+        {
+            println!("[PASS] {test_name}: SCT test appeared in output/logs");
+            passed += 1;
+        } else {
+            println!("[FAIL] {test_name}: SCT test did not appear in output/logs");
+            failed += 1;
+        }
+    }
+
+    let combined = match summary_log {
+        Some(summary) => format!("{}\n{}", result.output, summary),
+        None => result.output.clone(),
+    };
+    let failure_markers = [
+        "CRABEFI_SCT_SMOKE_NOT_FOUND",
+        "ERROR: Cannot",
+        "Invalid command line",
+        "FAILURE",
+        "Failures: 1",
+        "Failures: 2",
+        "Failures: 3",
+        "Failures: 4",
+        "Failures: 5",
+        "Failures: 6",
+        "Failures: 7",
+        "Failures: 8",
+        "Failures: 9",
+    ];
+    let found_failures = failure_markers
+        .iter()
+        .filter(|marker| combined.contains(**marker))
+        .copied()
+        .collect::<Vec<_>>();
+    if found_failures.is_empty() {
+        println!("[PASS] no_sct_failure_markers: no SCT failure markers found");
+        passed += 1;
+    } else {
+        println!(
+            "[FAIL] no_sct_failure_markers: found markers {:?}",
+            found_failures
+        );
+        failed += 1;
+    }
+
+    if combined.contains("Done!") || combined.contains("CRABEFI_SCT_SMOKE_DONE") {
+        println!("[PASS] sct_done: SCT reached a completion marker");
+        passed += 1;
+    } else {
+        println!("[FAIL] sct_done: SCT did not reach a completion marker");
+        failed += 1;
+    }
+
+    println!("\n=== Summary ===");
+    println!("Passed: {}", passed);
+    println!("Failed: {}", failed);
+
+    if failed > 0 {
+        println!("\n--- Captured Output ---");
+        println!("{}", result.output);
+        bail!("{} UEFI SCT smoke check(s) failed", failed);
+    }
+
+    Ok(())
+}
+
+/// Run a Windows Boot Manager smoke test and parse its serial output.
+///
+/// The disk image is supplied by the caller because Windows and WinPE binaries
+/// are not redistributable by CrabEFI. The image should be configured to print
+/// a deterministic marker to COM1 after Windows or WinPE reaches userspace.
+///
+/// # Arguments
+/// * `config` - QEMU configuration
+/// * `disk_path` - Raw Windows/WinPE disk image
+/// * `success_markers` - Serial markers; any one marker indicates success
+///
+/// # Returns
+/// `Ok(())` if Windows reaches one of the configured markers without obvious
+/// boot-manager or loader failures.
+pub fn run_windows_boot_smoke_test(
+    config: &QemuConfig,
+    disk_path: &Path,
+    success_markers: &[String],
+) -> Result<()> {
+    println!("=== Windows Boot Smoke Test ({:?}) ===\n", config.arch);
+    println!("Running Windows/WinPE disk image in QEMU...\n");
+
+    let result = run_qemu_with_capture(config, disk_path)?;
+
+    println!("\n=== Windows Boot Smoke Results ===");
+    println!("Serial output captured: {} bytes", result.output.len());
+
+    let mut passed = 0;
+    let mut failed = 0;
+
+    if result.output.contains("CrabEFI") {
+        println!("[PASS] crabefi_started: CrabEFI produced serial output");
+        passed += 1;
+    } else {
+        println!("[FAIL] crabefi_started: CrabEFI serial output was not observed");
+        failed += 1;
+    }
+
+    let matched_markers = success_markers
+        .iter()
+        .filter(|marker| result.output.contains(marker.as_str()))
+        .collect::<Vec<_>>();
+    if matched_markers.is_empty() {
+        println!(
+            "[FAIL] windows_success_marker: none of {:?} appeared on serial",
+            success_markers
+        );
+        failed += 1;
+    } else {
+        println!(
+            "[PASS] windows_success_marker: matched {:?}",
+            matched_markers
+        );
+        passed += 1;
+    }
+
+    let failure_markers = [
+        "No bootable device",
+        "BOOTMGR is missing",
+        "Windows failed to start",
+        "Recovery",
+        "Status: 0xc000",
+        "0xc000000f",
+        "0xc0000225",
+        "Access Denied",
+        "StartImage failed",
+        "Error loading image",
+        "CRABEFI: boot failed",
+    ];
+    let found_failures = failure_markers
+        .iter()
+        .filter(|marker| result.output.contains(**marker))
+        .copied()
+        .collect::<Vec<_>>();
+    if found_failures.is_empty() {
+        println!("[PASS] no_windows_failure_markers: no failure markers found");
+        passed += 1;
+    } else {
+        println!(
+            "[FAIL] no_windows_failure_markers: found markers {:?}",
+            found_failures
+        );
+        failed += 1;
+    }
+
+    println!("\n=== Summary ===");
+    println!("Passed: {}", passed);
+    println!("Failed: {}", failed);
+
+    if failed > 0 {
+        println!("\n--- Captured Output ---");
+        println!("{}", result.output);
+        bail!("{} Windows boot smoke check(s) failed", failed);
+    }
+
+    Ok(())
+}
+
+fn extract_sct_log(disk_path: &Path, src: &str) -> Result<Option<String>> {
+    let temp_dir = tempfile::tempdir()?;
+    let dest = temp_dir.path().join("sct.log");
+    let image = crate::disk::mtools_esp_image(disk_path);
+    let status = Command::new("mcopy")
+        .args(["-i", &image, src])
+        .arg(&dest)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .context("failed to run mcopy to extract SCT log")?;
+
+    if !status.success() || !dest.exists() {
+        return Ok(None);
+    }
+
+    Ok(Some(fs::read_to_string(dest)?))
 }
 
 /// Run QEMU and capture serial output
