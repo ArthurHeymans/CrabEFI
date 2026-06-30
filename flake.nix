@@ -35,8 +35,9 @@
             # (Rust has no riscv64gc-unknown-uefi target)
             pkgsCross.riscv64.buildPackages.binutils
 
-            # Compression for firmware
+            # Compression/archive tools for firmware and SCT assets
             zstd
+            p7zip
           ];
 
           # Rust is managed by rustup via rust-toolchain.toml files

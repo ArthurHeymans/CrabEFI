@@ -20,7 +20,7 @@ mod disk;
 mod qemu;
 mod rom;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
@@ -142,6 +142,7 @@ enum Commands {
         /// Test app to run (default: hello)
         ///
         /// Use "grub-linux" for the GRUB + Linux boot-chain test.
+        /// Use "uefi-sct-smoke" for the UEFI SCT smoke subset.
         #[arg(long, default_value = "hello")]
         app: String,
 
@@ -173,6 +174,11 @@ enum Commands {
         /// Required when --app grub-linux is used.
         #[arg(long)]
         boot_assets_dir: Option<PathBuf>,
+
+        /// Directory containing pre-built UEFI SCT assets.
+        /// Required when --app uefi-sct-smoke is used unless sct-assets/<arch> exists.
+        #[arg(long)]
+        sct_assets_dir: Option<PathBuf>,
     },
 
     /// Build a test EFI application
@@ -249,6 +255,7 @@ fn main() -> Result<()> {
             timeout,
             ui,
             boot_assets_dir,
+            sct_assets_dir,
         } => cmd_test(
             coreboot_rom,
             &app,
@@ -261,6 +268,7 @@ fn main() -> Result<()> {
             arch,
             machine,
             boot_assets_dir,
+            sct_assets_dir,
         ),
         Commands::BuildTestApp { name } => cmd_build_test_app(&name, arch),
         Commands::ListTestApps => cmd_list_test_apps(),
@@ -430,6 +438,7 @@ fn cmd_test(
     arch: Arch,
     machine: Machine,
     boot_assets_dir: Option<PathBuf>,
+    sct_assets_dir: Option<PathBuf>,
 ) -> Result<()> {
     let storage = if ahci {
         qemu::StorageType::Ahci
@@ -527,6 +536,39 @@ fn cmd_test(
             grub_cfg.to_string_lossy().as_ref(),
             arch,
         )?;
+    } else if app == "uefi-sct-smoke" {
+        if arch != Arch::X86_64 {
+            bail!("UEFI SCT smoke is currently wired for x86_64 only");
+        }
+
+        let assets_dir = sct_assets_dir
+            .as_deref()
+            .map(resolve_project_path)
+            .unwrap_or_else(|| project_root().join("sct-assets").join(arch.dir_name()));
+        let shell_efi = assets_dir.join("shellx64.efi");
+        let sct_dir = assets_dir.join("SctPackageX64").join("X64");
+
+        for (label, path) in [
+            ("shellx64.efi", &shell_efi),
+            ("SctPackageX64/X64", &sct_dir),
+        ] {
+            if !path.exists() {
+                bail!(
+                    "SCT asset not found: {} (looked in {})\n\
+                     Run ci/build-sct-assets.sh --arch x86_64 to build assets, \
+                     or pass --sct-assets-dir",
+                    label,
+                    assets_dir.display(),
+                );
+            }
+        }
+
+        disk::create_uefi_sct_smoke_disk(
+            disk_path.to_string_lossy().as_ref(),
+            shell_efi.to_string_lossy().as_ref(),
+            &sct_dir,
+            arch,
+        )?;
     } else {
         // ── Normal UEFI test app ─────────────────────────────────────
         println!("Building test app: {}", app);
@@ -546,7 +588,19 @@ fn cmd_test(
     }
 
     // Run tests
-    qemu::run_tests(&config, &disk_path, app)
+    if app == "uefi-sct-smoke" {
+        qemu::run_uefi_sct_smoke_tests(&config, &disk_path)
+    } else {
+        qemu::run_tests(&config, &disk_path, app)
+    }
+}
+
+fn resolve_project_path(path: &Path) -> PathBuf {
+    if path.is_relative() {
+        project_root().join(path)
+    } else {
+        path.to_path_buf()
+    }
 }
 
 fn cmd_build_test_app(name: &str, arch: Arch) -> Result<()> {
