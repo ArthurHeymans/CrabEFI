@@ -244,6 +244,15 @@ pub unsafe fn chainload_payload(
         }
     };
 
+    crate::efi::boot_services::measure_efi_application_start(true);
+    crate::efi::tcg::measured_boot::measure_event_all(
+        4,
+        crate::efi::tcg::types::EV_IPL,
+        buffer,
+        b"coreboot payload",
+        "coreboot payload",
+    );
+
     log::info!("Jumping to payload at {:#x}", entry_point);
 
     // Jump to payload

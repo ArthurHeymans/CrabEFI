@@ -56,7 +56,6 @@ pub mod tpm_tis;
 pub mod types;
 
 pub use event_log::{CryptoAgileEventLog, EventLog, EventLogFormat, Sha1EventLog};
-pub use measured_boot::measure_secure_boot_variables;
 pub use pcr::PcrBanks;
 pub use tpm_tis::TpmTis;
 pub use types::*;

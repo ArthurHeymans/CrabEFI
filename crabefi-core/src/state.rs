@@ -245,6 +245,7 @@ impl Default for FirmwareState {
 // ============================================================================
 
 use crate::efi::allocator::MemoryAllocator;
+use crate::efi::tcg::types::TaggedDigest;
 use r_efi::efi::{self, Guid, Handle};
 
 /// Maximum number of handles we can track
@@ -410,12 +411,23 @@ pub struct LoadedImageEntry {
     pub parent_handle: Handle,
     /// PE subsystem value from the optional header.
     pub subsystem: u16,
+    /// Pending PCR index for deferred application image measurement.
+    pub measurement_pcr: u32,
+    /// Pending TCG event type for deferred application image measurement.
+    pub measurement_event_type: u32,
+    /// Number of valid precomputed authenticode digests.
+    pub measurement_digest_count: usize,
+    /// Precomputed authenticode digests for deferred application measurement.
+    pub measurement_digests: [TaggedDigest; 5],
+    /// Serialized EFI_IMAGE_LOAD_EVENT data for deferred application measurement.
+    pub measurement_event_data: *mut u8,
+    /// Size of the deferred event data buffer.
+    pub measurement_event_data_size: usize,
 }
 
-// SAFETY: LoadedImageEntry contains EFI Handle pointers for tracking loaded PE images.
-// These handles are opaque identifiers pointing to allocated image memory that
-// remains valid until the image is unloaded via UnloadImage(). The firmware is
-// single-threaded and all access to loaded image entries is serialized.
+// SAFETY: LoadedImageEntry contains opaque EFI handles and an optional owned
+// measurement buffer pointer. They remain valid until StartImage/UnloadImage
+// frees them, and all access to loaded image entries is serialized.
 unsafe impl Send for LoadedImageEntry {}
 unsafe impl Sync for LoadedImageEntry {}
 
@@ -430,6 +442,12 @@ impl LoadedImageEntry {
             num_pages: 0,
             parent_handle: core::ptr::null_mut(),
             subsystem: 0,
+            measurement_pcr: 0,
+            measurement_event_type: 0,
+            measurement_digest_count: 0,
+            measurement_digests: [TaggedDigest::zeroed(0); 5],
+            measurement_event_data: core::ptr::null_mut(),
+            measurement_event_data_size: 0,
         }
     }
 }

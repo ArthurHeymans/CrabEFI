@@ -725,7 +725,7 @@ pub(crate) fn measure_efi_application_start(is_application: bool) {
         );
 
         // Measure separator events into PCR 0-6.
-        // PCR 7 already has its separator from measure_secure_boot_variables().
+        // PCR 7 already has its separator from Secure Boot variable measurement.
         super::tcg::measured_boot::measure_all_separators_all();
 
         signal_event_group(&EFI_EVENT_GROUP_READY_TO_BOOT);
@@ -1255,9 +1255,9 @@ extern "efiapi" fn load_image(
         loaded_image.image_size
     );
 
-    // TCG measured boot: measure the PE image using the full
-    // EFI_IMAGE_LOAD_EVENT payload before releasing the source buffer.
-    measure_pe_image_for_tcg(
+    // TCG measured boot: drivers are measured now; applications are deferred
+    // until StartImage after ReadyToBoot, with digests computed before freeing data.
+    let deferred_measurement = measure_pe_image_for_tcg(
         data,
         &loaded_image,
         device_path as *const DevicePathProtocol,
@@ -1295,6 +1295,9 @@ extern "efiapi" fn load_image(
 
     if loaded_image_protocol.is_null() {
         log::error!("BS.LoadImage: Failed to create LoadedImageProtocol");
+        if let Some(measurement) = deferred_measurement {
+            let _ = allocator::free_pool(measurement.event_data);
+        }
         pe::unload_image(&loaded_image);
         return Status::OUT_OF_RESOURCES;
     }
@@ -1318,6 +1321,9 @@ extern "efiapi" fn load_image(
             "BS.LoadImage: Failed to install LoadedImageProtocol: {:?}",
             status
         );
+        if let Some(measurement) = deferred_measurement {
+            let _ = allocator::free_pool(measurement.event_data);
+        }
         pe::unload_image(&loaded_image);
         return status;
     }
@@ -1342,6 +1348,14 @@ extern "efiapi" fn load_image(
                 entry.num_pages = loaded_image.num_pages;
                 entry.parent_handle = parent_image_handle;
                 entry.subsystem = image_subsystem;
+                if let Some(measurement) = deferred_measurement {
+                    entry.measurement_pcr = measurement.pcr_index;
+                    entry.measurement_event_type = measurement.event_type;
+                    entry.measurement_digest_count = measurement.digest_count;
+                    entry.measurement_digests = measurement.digests;
+                    entry.measurement_event_data = measurement.event_data;
+                    entry.measurement_event_data_size = measurement.event_data_size;
+                }
                 true
             }
             None => false,
@@ -1350,6 +1364,9 @@ extern "efiapi" fn load_image(
 
     if !store_result {
         log::error!("BS.LoadImage: No space in loaded images table");
+        if let Some(measurement) = deferred_measurement {
+            let _ = allocator::free_pool(measurement.event_data);
+        }
         pe::unload_image(&loaded_image);
         return Status::OUT_OF_RESOURCES;
     }
@@ -1411,6 +1428,47 @@ extern "efiapi" fn start_image(
     // and measure boot-attempt action events without duplicating separators.
     let is_application = image_subsystem == 10;
     measure_efi_application_start(is_application);
+
+    let deferred_measurement = state::with_efi_mut(|efi_state| {
+        efi_state
+            .loaded_images
+            .iter_mut()
+            .find(|entry| entry.handle == image_handle)
+            .and_then(|entry| {
+                if entry.measurement_event_data.is_null() {
+                    return None;
+                }
+                let measurement = DeferredImageMeasurement {
+                    pcr_index: entry.measurement_pcr,
+                    event_type: entry.measurement_event_type,
+                    digest_count: entry.measurement_digest_count,
+                    digests: entry.measurement_digests,
+                    event_data: entry.measurement_event_data,
+                    event_data_size: entry.measurement_event_data_size,
+                };
+                entry.measurement_event_data = core::ptr::null_mut();
+                entry.measurement_event_data_size = 0;
+                entry.measurement_digest_count = 0;
+                Some(measurement)
+            })
+    });
+
+    if let Some(measurement) = deferred_measurement {
+        let event_data = unsafe {
+            // SAFETY: deferred measurement event data was allocated and filled in
+            // LoadImage and remains owned by this loaded-image entry until now.
+            core::slice::from_raw_parts(measurement.event_data, measurement.event_data_size)
+        };
+        if let Err(e) = super::tcg::measured_boot::measure_pe_image_digests_all(
+            measurement.pcr_index,
+            measurement.event_type,
+            &measurement.digests[..measurement.digest_count],
+            event_data,
+        ) {
+            log::warn!("Failed to measure PE image: {:?}", e);
+        }
+        let _ = allocator::free_pool(measurement.event_data);
+    }
 
     // Update table CRC32s one final time before handing off to the image
     // (config tables may have changed since efi::init())
@@ -1489,7 +1547,11 @@ extern "efiapi" fn unload_image(image_handle: Handle) -> Status {
             .iter_mut()
             .find(|entry| entry.handle == image_handle)
             .map(|entry| {
-                let result = (entry.alloc_base, entry.num_pages);
+                let result = (
+                    entry.alloc_base,
+                    entry.num_pages,
+                    entry.measurement_event_data,
+                );
                 // Clear the entry
                 *entry = LoadedImageEntry::empty();
                 result
@@ -1497,7 +1559,7 @@ extern "efiapi" fn unload_image(image_handle: Handle) -> Status {
     });
 
     match image_info {
-        Some((alloc_base, num_pages)) => {
+        Some((alloc_base, num_pages, measurement_event_data)) => {
             // Free the image memory (using alloc_base, not image_base,
             // since the image may have been aligned within the allocation)
             let status = allocator::free_pages(alloc_base, num_pages);
@@ -1507,6 +1569,10 @@ extern "efiapi" fn unload_image(image_handle: Handle) -> Status {
                     alloc_base,
                     status
                 );
+            }
+
+            if !measurement_event_data.is_null() {
+                let _ = allocator::free_pool(measurement_event_data);
             }
 
             // Remove protocols from the handle
@@ -2334,7 +2400,17 @@ pub fn get_protocol_on_handle(handle: Handle, guid: &Guid) -> *mut c_void {
         .map_or(core::ptr::null_mut(), |p| p.interface)
 }
 
-fn serialize_tcg_image_load_event(
+#[derive(Clone, Copy)]
+struct DeferredImageMeasurement {
+    pcr_index: u32,
+    event_type: u32,
+    digest_count: usize,
+    digests: [super::tcg::types::TaggedDigest; 5],
+    event_data: *mut u8,
+    event_data_size: usize,
+}
+
+pub(crate) fn serialize_tcg_image_load_event(
     loaded_image: &pe::LoadedImage,
     image_link_time_address: u64,
     device_path_ptr: *const DevicePathProtocol,
@@ -2358,44 +2434,71 @@ fn serialize_tcg_image_load_event(
     event
 }
 
-/// Measure a PE/COFF image for TCG measured boot.
+/// Measure or defer a PE/COFF image for TCG measured boot.
 ///
-/// Determines the image subsystem (application vs driver) and measures
-/// into the appropriate PCR:
-/// - PCR 4: EFI applications (`EV_EFI_BOOT_SERVICES_APPLICATION`)
-/// - PCR 2: EFI drivers (`EV_EFI_BOOT_SERVICES_DRIVER` / `EV_EFI_RUNTIME_SERVICES_DRIVER`)
+/// Driver images are measured immediately. Application image digests and event
+/// data are precomputed here so `StartImage()` can log them after ReadyToBoot.
 fn measure_pe_image_for_tcg(
     pe_data: &[u8],
     loaded_image: &pe::LoadedImage,
     device_path: *const DevicePathProtocol,
-) {
-    use super::tcg::measured_boot::measure_pe_image_all;
+) -> Option<DeferredImageMeasurement> {
+    use super::tcg::measured_boot::{measure_pe_image_all, precompute_pe_image_digests_all};
     use super::tcg::types::*;
 
-    // Parse PE headers to determine subsystem.
-    let headers = match pe::parse_headers(pe_data) {
-        Ok(h) => h,
-        Err(_) => return, // Not a valid PE — skip measurement
-    };
-
+    let headers = pe::parse_headers(pe_data).ok()?;
     let subsystem = headers.subsystem();
     let (pcr_index, event_type) = match subsystem {
-        10 => (4, EV_EFI_BOOT_SERVICES_APPLICATION), // EFI_APPLICATION
-        11 => (2, EV_EFI_BOOT_SERVICES_DRIVER),      // EFI_BOOT_SERVICE_DRIVER
-        12 => (2, EV_EFI_RUNTIME_SERVICES_DRIVER),   // EFI_RUNTIME_SERVICES_DRIVER
-        _ => (4, EV_EFI_BOOT_SERVICES_APPLICATION),  // Default to application
+        10 => (4, EV_EFI_BOOT_SERVICES_APPLICATION),
+        11 => (2, EV_EFI_BOOT_SERVICES_DRIVER),
+        12 => (2, EV_EFI_RUNTIME_SERVICES_DRIVER),
+        _ => (4, EV_EFI_BOOT_SERVICES_APPLICATION),
     };
 
     let event_data =
         serialize_tcg_image_load_event(loaded_image, headers.preferred_image_base(), device_path);
 
-    if let Err(e) = measure_pe_image_all(pcr_index, event_type, pe_data, &event_data) {
-        log::warn!("Failed to measure PE image: {:?}", e);
-    } else {
-        log::debug!(
-            "Measured PE image into PCR {} (subsystem={})",
-            pcr_index,
-            subsystem
-        );
+    if subsystem != 10 {
+        if let Err(e) = measure_pe_image_all(pcr_index, event_type, pe_data, &event_data) {
+            log::warn!("Failed to measure PE image: {:?}", e);
+        }
+        return None;
     }
+
+    let Some((digest_count, digests)) = (match precompute_pe_image_digests_all(pe_data) {
+        Ok(result) => result,
+        Err(e) => {
+            log::warn!("Failed to precompute PE image measurement: {:?}", e);
+            None
+        }
+    }) else {
+        return None;
+    };
+
+    let event_data_size = event_data.len();
+    let event_data_ptr =
+        match allocator::allocate_pool(MemoryType::BootServicesData, event_data_size) {
+            Ok(ptr) => ptr,
+            Err(status) => {
+                log::warn!(
+                    "Failed to allocate deferred PE measurement event data: {:?}",
+                    status
+                );
+                return None;
+            }
+        };
+    unsafe {
+        // SAFETY: `event_data_ptr` points to `event_data_size` bytes just
+        // allocated above, and `event_data` has exactly that many initialized bytes.
+        core::ptr::copy_nonoverlapping(event_data.as_ptr(), event_data_ptr, event_data_size);
+    }
+
+    Some(DeferredImageMeasurement {
+        pcr_index,
+        event_type,
+        digest_count,
+        digests,
+        event_data: event_data_ptr,
+        event_data_size,
+    })
 }

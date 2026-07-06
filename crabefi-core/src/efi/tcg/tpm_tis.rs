@@ -161,7 +161,7 @@ impl TpmTis {
     /// 1. Check that a TPM device is present (DID/VID != 0xFFFFFFFF)
     /// 2. Request locality 0
     /// 3. Send TPM2_Startup(CLEAR)
-    /// 4. Send TPM2_SelfTest(full)
+    /// 4. Send TPM2_SelfTest(incremental) best-effort
     /// 5. Query capabilities (active PCR banks, manufacturer ID)
     ///
     /// # Safety
@@ -201,8 +201,12 @@ impl TpmTis {
         // TPM2_Startup(CLEAR).
         tpm.startup()?;
 
-        // TPM2_SelfTest(fullTest = YES).
-        tpm.self_test()?;
+        // TPM2_SelfTest(fullTest = NO). Some dTPMs can exceed the normal
+        // command timeout for a full self-test, so continue if this best-effort
+        // command times out or otherwise fails in transport.
+        if let Err(e) = tpm.self_test() {
+            log::warn!("TPM2_SelfTest transport error: {:?} (continuing)", e);
+        }
 
         // Query PCR banks and properties.
         tpm.query_capabilities()?;
@@ -452,13 +456,13 @@ impl TpmTis {
         Ok(())
     }
 
-    /// Send TPM2_SelfTest(fullTest = YES).
+    /// Send TPM2_SelfTest(fullTest = NO) to let self-test complete incrementally.
     fn self_test(&mut self) -> Result<(), TcgError> {
         let mut cmd = [0u8; 11];
         cmd[0..2].copy_from_slice(&TPM_ST_NO_SESSIONS.to_be_bytes());
         cmd[2..6].copy_from_slice(&11u32.to_be_bytes());
         cmd[6..10].copy_from_slice(&TPM2_CC_SELF_TEST.to_be_bytes());
-        cmd[10] = 1; // fullTest = YES
+        cmd[10] = 0; // fullTest = NO
 
         let mut resp = [0u8; 64];
         let n = self.send_command(&cmd, &mut resp)?;
@@ -474,7 +478,7 @@ impl TpmTis {
                 &resp[..n.min(16)]
             );
         } else {
-            log::debug!("TPM2_SelfTest(full) -> SUCCESS");
+            log::debug!("TPM2_SelfTest(incremental) -> SUCCESS");
         }
         Ok(())
     }

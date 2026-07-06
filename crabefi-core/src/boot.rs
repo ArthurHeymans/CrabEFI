@@ -11,6 +11,10 @@
 //! These replace the four `install_block_io_for_{usb,nvme,ahci,sdhci}_disk` functions
 //! and the four `try_boot_from_esp_{usb,nvme,ahci,sdhci}` functions.
 
+use core::sync::atomic::{AtomicBool, Ordering};
+
+use r_efi::efi::Status;
+
 use crate::drivers::block::{
     AhciBlockDevice, AnyBlockDevice, BlockDevice, NvmeBlockDevice, SdhciBlockDevice, UsbBlockDevice,
 };
@@ -23,33 +27,8 @@ use crate::efi::protocols::simple_file_system::{self, SIMPLE_FILE_SYSTEM_GUID};
 use crate::fs;
 use crate::menu;
 use crate::pe;
-use alloc::vec::Vec;
-use r_efi::efi::Status;
 
-fn serialize_tcg_image_load_event(
-    loaded_image: &pe::LoadedImage,
-    image_link_time_address: u64,
-    device_path_ptr: *const r_efi::protocols::device_path::Protocol,
-) -> Option<Vec<u8>> {
-    if device_path_ptr.is_null() {
-        return None;
-    }
-
-    let device_path_size = unsafe { device_path::device_path_size(device_path_ptr) };
-    if device_path_size == 0 {
-        return None;
-    }
-
-    let mut event = Vec::with_capacity(32 + device_path_size);
-    event.extend_from_slice(&loaded_image.image_base.to_le_bytes());
-    event.extend_from_slice(&loaded_image.image_size.to_le_bytes());
-    event.extend_from_slice(&image_link_time_address.to_le_bytes());
-    event.extend_from_slice(&(device_path_size as u64).to_le_bytes());
-    let device_path =
-        unsafe { core::slice::from_raw_parts(device_path_ptr as *const u8, device_path_size) };
-    event.extend_from_slice(device_path);
-    Some(event)
-}
+static GPT_MEASURED: AtomicBool = AtomicBool::new(false);
 
 /// Install BlockIO and DevicePath protocols for a disk and all its GPT partitions
 ///
@@ -116,7 +95,10 @@ pub fn install_block_io_protocols(
     let partitions = match fs::gpt::read_gpt_header(disk) {
         Ok(header) => match fs::gpt::read_partitions(disk, &header) {
             Ok(p) => {
-                if let Ok(event_data) = fs::gpt::build_gpt_measurement_event(disk, &header) {
+                if let Ok(event_data) = fs::gpt::build_gpt_measurement_event(disk, &header)
+                    && !GPT_MEASURED.swap(true, Ordering::Relaxed)
+                {
+                    // EDK2 measures EV_EFI_GPT_EVENT once per boot, not once per boot attempt.
                     efi::tcg::measured_boot::measure_event_all(
                         5,
                         efi::tcg::types::EV_EFI_GPT_EVENT,
@@ -549,18 +531,30 @@ fn load_and_execute_bootloader(
         path,
     );
 
+    // This path bypasses BS.StartImage, so perform the same ReadyToBoot /
+    // boot-attempt measurements before measuring and executing the application.
+    efi::boot_services::measure_efi_application_start(true);
+
     // TCG measured boot: hash the PE image and log an EFI_IMAGE_LOAD_EVENT.
-    if let Some(event_data) = serialize_tcg_image_load_event(
-        &loaded_image,
-        image_link_time_address,
-        loaded_image_dp as *const r_efi::protocols::device_path::Protocol,
-    ) && let Err(e) = efi::tcg::measured_boot::measure_pe_image_all(
-        4,
-        efi::tcg::types::EV_EFI_BOOT_SERVICES_APPLICATION,
-        &buffer[..bytes_read],
-        &event_data,
-    ) {
-        log::warn!("Failed to measure bootloader PE image: {:?}", e);
+    let loaded_image_dp = loaded_image_dp as *const r_efi::protocols::device_path::Protocol;
+    if !loaded_image_dp.is_null()
+        // Safety: `loaded_image_dp` was checked for null and points to a firmware-created
+        // device path whose size is read before passing it to the shared serializer.
+        && unsafe { device_path::device_path_size(loaded_image_dp) } != 0
+    {
+        let event_data = boot_services::serialize_tcg_image_load_event(
+            &loaded_image,
+            image_link_time_address,
+            loaded_image_dp,
+        );
+        if let Err(e) = efi::tcg::measured_boot::measure_pe_image_all(
+            4,
+            efi::tcg::types::EV_EFI_BOOT_SERVICES_APPLICATION,
+            &buffer[..bytes_read],
+            &event_data,
+        ) {
+            log::warn!("Failed to measure bootloader PE image: {:?}", e);
+        }
     }
 
     // Free the raw file buffer
@@ -669,9 +663,6 @@ fn load_and_execute_bootloader(
         }
     }
 
-    // Execute the bootloader. This path bypasses BS.StartImage, so perform the
-    // same ReadyToBoot / boot-attempt measurements around the PE entry call.
-    efi::boot_services::measure_efi_application_start(true);
     let exec_status = pe::execute_image(&loaded_image, image_handle, system_table);
 
     // If the bootloader returns, log and measure it.

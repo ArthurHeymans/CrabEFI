@@ -131,6 +131,55 @@ pub fn measure_event(
     ))
 }
 
+/// Precompute PE/COFF Authenticode digests for TCG (TPM 1.2).
+///
+/// Returns `None` if the TCG protocol is not installed.
+pub fn precompute_pe_image_digests(
+    pe_data: &[u8],
+) -> Option<Result<(usize, [TaggedDigest; 5]), TcgError>> {
+    let guard = TCG_STATE.lock();
+    let state = guard.as_ref()?;
+    if !state.tpm_present {
+        return None;
+    }
+    Some(
+        compute_authenticode_digests(pe_data, &[TPM_ALG_SHA1]).map_err(|_| TcgError::InternalError),
+    )
+}
+
+/// Measure a PE/COFF image through TCG (TPM 1.2) with precomputed digests.
+///
+/// Returns `None` if the TCG protocol is not installed.
+pub fn measure_pe_image_digests_event(
+    pcr_index: u32,
+    event_type: u32,
+    digests: &[TaggedDigest],
+    event_data: &[u8],
+) -> Option<Result<(), TcgError>> {
+    let mut guard = TCG_STATE.lock();
+    let state = guard.as_mut()?;
+    if !state.tpm_present {
+        return None;
+    }
+    Some((|| {
+        let tagged_digest = digests
+            .iter()
+            .find(|digest| digest.algorithm == TPM_ALG_SHA1)
+            .copied()
+            .ok_or(TcgError::UnsupportedAlgorithm)?;
+        let mut sha1_digest = [0u8; SHA1_DIGEST_SIZE];
+        sha1_digest.copy_from_slice(&tagged_digest.digest[..SHA1_DIGEST_SIZE]);
+        extend_and_log(
+            state,
+            pcr_index,
+            event_type,
+            &sha1_digest,
+            tagged_digest,
+            event_data,
+        )
+    })())
+}
+
 /// Measure a PE/COFF image through TCG (TPM 1.2) state using Authenticode hashing.
 ///
 /// Returns `None` if the TCG protocol is not installed.
@@ -140,33 +189,12 @@ pub fn measure_pe_image_event(
     pe_data: &[u8],
     event_data: &[u8],
 ) -> Option<Result<(), TcgError>> {
-    let mut guard = TCG_STATE.lock();
-    let state = guard.as_mut()?;
-    if !state.tpm_present {
-        return None;
+    match precompute_pe_image_digests(pe_data)? {
+        Ok((count, digests)) => {
+            measure_pe_image_digests_event(pcr_index, event_type, &digests[..count], event_data)
+        }
+        Err(e) => Some(Err(e)),
     }
-    Some(
-        compute_authenticode_digests(pe_data, &[TPM_ALG_SHA1])
-            .map_err(|_| TcgError::InternalError)
-            .and_then(|(digest_count, digests)| {
-                let tagged_digest = digests
-                    .iter()
-                    .take(digest_count)
-                    .find(|digest| digest.algorithm == TPM_ALG_SHA1)
-                    .copied()
-                    .ok_or(TcgError::UnsupportedAlgorithm)?;
-                let mut sha1_digest = [0u8; SHA1_DIGEST_SIZE];
-                sha1_digest.copy_from_slice(&tagged_digest.digest[..SHA1_DIGEST_SIZE]);
-                extend_and_log(
-                    state,
-                    pcr_index,
-                    event_type,
-                    &sha1_digest,
-                    tagged_digest,
-                    event_data,
-                )
-            }),
-    )
 }
 
 // ============================================================================
