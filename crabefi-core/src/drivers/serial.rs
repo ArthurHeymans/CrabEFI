@@ -102,7 +102,6 @@ mod offsets {
     pub const LCR: usize = 3;
     pub const MCR: usize = 4;
     pub const LSR: usize = 5;
-    pub const SCRATCH: usize = 7;
 }
 
 /// LSR bit: Transmitter Holding Register Empty (MMIO fallback)
@@ -140,18 +139,7 @@ impl SerialPort {
                 // Check that LSR doesn't return 0xFF (unpopulated port)
                 regs.lsr().get() != 0xFF
             }
-            Uart16550Backend::Mmio { .. } => {
-                // MMIO fallback: raw offset access
-                self.backend.write(offsets::SCRATCH, 0x55);
-                if self.backend.read(offsets::SCRATCH) != 0x55 {
-                    return false;
-                }
-                self.backend.write(offsets::SCRATCH, 0xAA);
-                if self.backend.read(offsets::SCRATCH) != 0xAA {
-                    return false;
-                }
-                self.backend.read(offsets::LSR) != 0xFF
-            }
+            Uart16550Backend::Mmio { .. } => true,
         }
     }
 
@@ -429,11 +417,7 @@ pub(crate) struct PlatformSerial {
 impl PlatformSerial {
     /// Create a platform serial adapter from a raw `DebugOutput` pointer.
     ///
-    /// # Safety
-    ///
-    /// `inner` must point to a valid debug output object that lives for the
-    /// entire firmware lifetime.
-    unsafe fn new(inner: *mut dyn crate::platform::DebugOutput) -> Self {
+    fn new(inner: *mut dyn crate::platform::DebugOutput) -> Self {
         Self { inner }
     }
 
@@ -631,8 +615,7 @@ pub fn init_from_config(info: &SerialConfig) {
 /// `raw` must point to a valid `DebugOutput` that lives for the entire
 /// firmware lifetime (i.e., at least until `init_platform()` returns).
 pub unsafe fn init_from_platform_raw(raw: *mut dyn crate::platform::DebugOutput) {
-    // SAFETY: The caller guarantees `raw` lives for the firmware lifetime.
-    let plat = unsafe { PlatformSerial::new(raw) };
+    let plat = PlatformSerial::new(raw);
     // SAFETY: Single-threaded firmware; raw pointer avoids re-entrancy
     // issues since serial is called from log macros inside other state closures.
     unsafe {
@@ -652,8 +635,7 @@ pub unsafe fn init_from_platform_raw(raw: *mut dyn crate::platform::DebugOutput)
 /// `raw` must point to a valid `DebugOutput` that lives for the entire firmware
 /// lifetime (i.e., at least until `init_platform()` returns).
 pub unsafe fn add_platform_debug_sink_raw(raw: *mut dyn crate::platform::DebugOutput) {
-    // SAFETY: The caller guarantees `raw` lives for the firmware lifetime.
-    let sink = unsafe { PlatformSerial::new(raw) };
+    let sink = PlatformSerial::new(raw);
     // SAFETY: Single-threaded firmware; raw pointer avoids re-entrancy
     // issues since serial is called from log macros inside other state closures.
     unsafe {
