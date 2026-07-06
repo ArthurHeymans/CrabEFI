@@ -485,6 +485,7 @@ fn init_console() -> Option<efi::Handle> {
 fn init_unicode_collation() {
     use protocols::unicode_collation::{
         UNICODE_COLLATION_PROTOCOL_GUID, UNICODE_COLLATION_PROTOCOL2_GUID, get_protocol_void,
+        get_protocol2_void,
     };
 
     // Create a handle for Unicode Collation
@@ -508,8 +509,11 @@ fn init_unicode_collation() {
     }
 
     // Install version 2 protocol
-    let status =
-        boot_services::install_protocol(handle, &UNICODE_COLLATION_PROTOCOL2_GUID, protocol);
+    let status = boot_services::install_protocol(
+        handle,
+        &UNICODE_COLLATION_PROTOCOL2_GUID,
+        get_protocol2_void(),
+    );
     if status != Status::SUCCESS {
         log::error!(
             "Failed to install Unicode Collation v2 protocol: {:?}",
