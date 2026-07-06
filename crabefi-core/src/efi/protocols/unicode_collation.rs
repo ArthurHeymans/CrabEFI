@@ -58,14 +58,18 @@ pub struct UnicodeCollationProtocol {
     pub supported_languages: *const Char8,
 }
 
-// Static storage for supported languages string
-// Note: Unicode Collation v1 uses ISO 639-2 three-letter codes (e.g., "eng")
-// Unicode Collation v2 uses RFC 4646 codes (e.g., "en")
-// We use "eng" which works for v1, and many v2 implementations accept it too
-static SUPPORTED_LANGUAGES: [u8; 4] = *b"eng\0";
+// Static storage for supported language strings.
+//
+// The legacy Unicode Collation Protocol uses packed ISO 639-2 three-letter
+// language codes, while Unicode Collation 2 uses semicolon-delimited RFC 4646
+// language codes. EDK2 Shell opens Unicode Collation 2 during startup and
+// parses this field before it produces console output, so installing a legacy
+// `eng` string under the v2 GUID can make shell startup fail very early.
+static SUPPORTED_LANGUAGES_V1: [u8; 4] = *b"eng\0";
+static SUPPORTED_LANGUAGES_V2: [u8; 6] = *b"en-US\0";
 
-/// Static protocol instance
-static UNICODE_COLLATION: StaticMut<UnicodeCollationProtocol> =
+/// Static legacy Unicode Collation Protocol instance.
+static UNICODE_COLLATION_V1: StaticMut<UnicodeCollationProtocol> =
     StaticMut::new(UnicodeCollationProtocol {
         stri_coll,
         metai_match,
@@ -73,17 +77,39 @@ static UNICODE_COLLATION: StaticMut<UnicodeCollationProtocol> =
         str_upr,
         fat_to_str,
         str_to_fat,
-        supported_languages: SUPPORTED_LANGUAGES.as_ptr() as *const Char8,
+        supported_languages: SUPPORTED_LANGUAGES_V1.as_ptr() as *const Char8,
     });
 
-/// Get the Unicode Collation Protocol
+/// Static Unicode Collation 2 Protocol instance.
+static UNICODE_COLLATION_V2: StaticMut<UnicodeCollationProtocol> =
+    StaticMut::new(UnicodeCollationProtocol {
+        stri_coll,
+        metai_match,
+        str_lwr,
+        str_upr,
+        fat_to_str,
+        str_to_fat,
+        supported_languages: SUPPORTED_LANGUAGES_V2.as_ptr() as *const Char8,
+    });
+
+/// Get the legacy Unicode Collation Protocol.
 pub fn get_protocol() -> *mut UnicodeCollationProtocol {
-    UNICODE_COLLATION.get()
+    UNICODE_COLLATION_V1.get()
 }
 
-/// Get the protocol as a void pointer
+/// Get the Unicode Collation 2 Protocol.
+pub fn get_protocol2() -> *mut UnicodeCollationProtocol {
+    UNICODE_COLLATION_V2.get()
+}
+
+/// Get the legacy Unicode Collation Protocol as a void pointer.
 pub fn get_protocol_void() -> *mut c_void {
     get_protocol() as *mut c_void
+}
+
+/// Get the Unicode Collation 2 Protocol as a void pointer.
+pub fn get_protocol2_void() -> *mut c_void {
+    get_protocol2() as *mut c_void
 }
 
 // Convert a UTF-16 character to uppercase (ASCII only for now)
