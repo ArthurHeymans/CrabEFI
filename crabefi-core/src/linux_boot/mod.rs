@@ -487,6 +487,34 @@ pub fn load_linux_from_disk(
         log::info!("Initrd loaded successfully");
     }
 
+    crate::efi::boot_services::measure_efi_application_start(true);
+    crate::efi::tcg::measured_boot::measure_event_all(
+        4,
+        crate::efi::tcg::types::EV_IPL,
+        kernel_dest,
+        b"linux kernel",
+        "linux kernel",
+    );
+    if let Some(addr) = initrd_addr {
+        // Safety: initrd_addr/initrd_size were set only after read_file_all filled this RAM range.
+        let initrd =
+            unsafe { core::slice::from_raw_parts(addr as *const u8, initrd_size as usize) };
+        crate::efi::tcg::measured_boot::measure_event_all(
+            4,
+            crate::efi::tcg::types::EV_IPL,
+            initrd,
+            b"linux initrd",
+            "linux initrd",
+        );
+    }
+    crate::efi::tcg::measured_boot::measure_event_all(
+        4,
+        crate::efi::tcg::types::EV_IPL,
+        cmdline.as_bytes(),
+        b"linux command line",
+        "linux command line",
+    );
+
     log::info!("Linux kernel loaded successfully");
     log::info!("  Kernel address: {:#x}", DEFAULT_KERNEL_ADDR);
     log::info!("  Entry point: {:#x}", entry_point);

@@ -20,8 +20,6 @@
 use alloc::vec::Vec;
 
 use super::types::*;
-use crate::efi::tcg::event_log::EventLog;
-use crate::efi::tcg::pcr::PcrBanks;
 
 /// Read an EFI variable's data from the in-memory variable cache.
 fn get_efi_variable(guid: &r_efi::efi::Guid, name: &[u16]) -> Option<Vec<u8>> {
@@ -156,236 +154,6 @@ fn boot_option_name(option_number: u16) -> [u16; 9] {
 // ============================================================================
 // Secure Boot Variable Measurement (PCR 7)
 // ============================================================================
-
-/// Measure Secure Boot policy variables into PCR 7.
-///
-/// Per the TCG PFP spec, the following variables are measured with event type
-/// `EV_EFI_VARIABLE_DRIVER_CONFIG` into PCR 7:
-///
-/// 1. `SecureBoot` (EFI_GLOBAL_VARIABLE)
-/// 2. `PK` (EFI_GLOBAL_VARIABLE)
-/// 3. `KEK` (EFI_GLOBAL_VARIABLE)
-/// 4. `db` (EFI_IMAGE_SECURITY_DATABASE)
-/// 5. `dbx` (EFI_IMAGE_SECURITY_DATABASE)
-///
-/// If a variable does not exist, it is still measured with empty data
-/// (ensuring the absence is recorded in the PCR value).
-///
-/// After all policy variables, a separator event (EV_SEPARATOR) is
-/// measured into PCR 7 to create a cryptographic boundary between
-/// configuration and authority measurements.
-pub fn measure_secure_boot_variables(pcr_banks: &mut PcrBanks, event_log: &mut dyn EventLog) {
-    // EFI_GLOBAL_VARIABLE GUID: {8BE4DF61-93CA-11D2-AA0D-00E098032B8C}
-    let global_guid = r_efi::efi::Guid::from_fields(
-        0x8BE4DF61,
-        0x93CA,
-        0x11D2,
-        0xAA,
-        0x0D,
-        &[0x00, 0xE0, 0x98, 0x03, 0x2B, 0x8C],
-    );
-    // EFI_IMAGE_SECURITY_DATABASE_GUID: {D719B2CB-3D3A-4596-A3BC-DAD00E67656F}
-    let security_guid = r_efi::efi::Guid::from_fields(
-        0xD719B2CB,
-        0x3D3A,
-        0x4596,
-        0xA3,
-        0xBC,
-        &[0xDA, 0xD0, 0x0E, 0x67, 0x65, 0x6F],
-    );
-
-    // Variable name/GUID pairs to measure.
-    let variables: &[(&r_efi::efi::Guid, &[u16], &str)] = &[
-        (
-            &global_guid,
-            &[
-                0x53, 0x65, 0x63, 0x75, 0x72, 0x65, 0x42, 0x6F, 0x6F, 0x74, 0x00,
-            ],
-            "SecureBoot",
-        ), // "SecureBoot\0"
-        (&global_guid, &[0x50, 0x4B, 0x00], "PK"), // "PK\0"
-        (&global_guid, &[0x4B, 0x45, 0x4B, 0x00], "KEK"), // "KEK\0"
-        (&security_guid, &[0x64, 0x62, 0x00], "db"), // "db\0"
-        (&security_guid, &[0x64, 0x62, 0x78, 0x00], "dbx"), // "dbx\0"
-    ];
-
-    for &(guid, name_utf16, display_name) in variables {
-        // Read the variable value. If it doesn't exist, measure empty data.
-        let var_data = get_efi_variable(guid, name_utf16);
-        let data = var_data.as_deref().unwrap_or(&[]);
-
-        // Build the UEFI_VARIABLE_DATA event data.
-        let event_buf = match serialize_uefi_variable_data(guid, name_utf16, data) {
-            Some(buf) => buf,
-            None => {
-                log::warn!("Failed to serialize variable data for {}", display_name);
-                continue;
-            }
-        };
-
-        // Hash the full UEFI_VARIABLE_DATA structure (not just the variable value).
-        let (count, digests) = pcr_banks.hash_data(&event_buf);
-
-        // Extend PCR 7.
-        if let Err(e) = pcr_banks.extend(7, &digests[..count]) {
-            log::error!("PCR 7 extend failed for {}: {:?}", display_name, e);
-            continue;
-        }
-
-        // Log the event.
-        if let Err(e) = event_log.log_event(
-            7,
-            EV_EFI_VARIABLE_DRIVER_CONFIG,
-            &digests[..count],
-            &event_buf,
-        ) {
-            log::warn!("Failed to log {} measurement: {:?}", display_name, e);
-        }
-
-        log::debug!(
-            "Measured {} into PCR 7 ({} bytes)",
-            display_name,
-            data.len()
-        );
-    }
-
-    // Measure separator event into PCR 7.
-    // This separator marks the boundary between Secure Boot policy
-    // (EV_EFI_VARIABLE_DRIVER_CONFIG) and authority (EV_EFI_VARIABLE_AUTHORITY)
-    // measurements.
-    measure_separator(pcr_banks, event_log, 7);
-}
-
-/// Measure a separator event (EV_SEPARATOR) into the specified PCR.
-///
-/// The separator data is 4 bytes of 0x00000000 for normal boot,
-/// or 0x00000001 for error conditions.
-pub fn measure_separator(pcr_banks: &mut PcrBanks, event_log: &mut dyn EventLog, pcr_index: u32) {
-    let separator_data = 0u32.to_le_bytes();
-    let (count, digests) = pcr_banks.hash_data(&separator_data);
-
-    if let Err(e) = pcr_banks.extend(pcr_index as usize, &digests[..count]) {
-        log::error!("PCR {} separator extend failed: {:?}", pcr_index, e);
-        return;
-    }
-
-    if let Err(e) = event_log.log_event(pcr_index, EV_SEPARATOR, &digests[..count], &separator_data)
-    {
-        log::warn!("Failed to log separator for PCR {}: {:?}", pcr_index, e);
-    }
-}
-
-/// Measure separator events into PCR 0 through 7.
-///
-/// Per the TCG PFP spec, separator events are measured at the first
-/// ReadyToBoot event, marking the transition from pre-OS to OS measurement.
-/// PCR 7 should already have its separator (from measure_secure_boot_variables),
-/// so this measures PCR 0-6.
-pub fn measure_all_separators(pcr_banks: &mut PcrBanks, event_log: &mut dyn EventLog) {
-    for pcr in 0..7 {
-        measure_separator(pcr_banks, event_log, pcr);
-    }
-}
-
-/// Measure an EFI action string.
-///
-/// Action strings (EV_EFI_ACTION) record firmware decisions in the event log.
-pub fn measure_action(
-    pcr_banks: &mut PcrBanks,
-    event_log: &mut dyn EventLog,
-    pcr_index: u32,
-    action: &str,
-) {
-    let action_bytes = action.as_bytes();
-    let (count, digests) = pcr_banks.hash_data(action_bytes);
-
-    if let Err(e) = pcr_banks.extend(pcr_index as usize, &digests[..count]) {
-        log::error!("PCR {} action extend failed: {:?}", pcr_index, e);
-        return;
-    }
-
-    if let Err(e) = event_log.log_event(pcr_index, EV_EFI_ACTION, &digests[..count], action_bytes) {
-        log::warn!("Failed to log action for PCR {}: {:?}", pcr_index, e);
-    }
-}
-
-/// Measure the S-CRTM version string into PCR 0.
-///
-/// The S-CRTM (Static Core Root of Trust for Measurement) version is
-/// typically the firmware version string.
-pub fn measure_s_crtm_version(
-    pcr_banks: &mut PcrBanks,
-    event_log: &mut dyn EventLog,
-    version: &str,
-) {
-    // Per EDK2, the version string is measured including null terminator
-    // as UTF-16LE.
-    let mut utf16_buf = [0u8; 512];
-    let mut off = 0;
-    for ch in version.encode_utf16() {
-        if off + 2 > utf16_buf.len() {
-            break;
-        }
-        utf16_buf[off..off + 2].copy_from_slice(&ch.to_le_bytes());
-        off += 2;
-    }
-    // Null terminator
-    if off + 2 <= utf16_buf.len() {
-        utf16_buf[off..off + 2].copy_from_slice(&0u16.to_le_bytes());
-        off += 2;
-    }
-
-    let data = &utf16_buf[..off];
-    let (count, digests) = pcr_banks.hash_data(data);
-
-    if let Err(e) = pcr_banks.extend(0, &digests[..count]) {
-        log::error!("PCR 0 S-CRTM extend failed: {:?}", e);
-        return;
-    }
-
-    if let Err(e) = event_log.log_event(0, EV_S_CRTM_VERSION, &digests[..count], data) {
-        log::warn!("Failed to log S-CRTM version: {:?}", e);
-    }
-
-    log::info!("Measured S-CRTM version into PCR 0: \"{}\"", version);
-}
-
-/// Measure a PE/COFF EFI image into the specified PCR.
-///
-/// Uses the Authenticode hash algorithm (excluding checksum, cert table
-/// entry, and certificate data) for all active PCR bank algorithms.
-///
-/// # Arguments
-/// * `pcr_index` - PCR to extend (2 for drivers, 4 for applications)
-/// * `event_type` - EV_EFI_BOOT_SERVICES_APPLICATION or EV_EFI_BOOT_SERVICES_DRIVER
-/// * `pe_data` - Raw PE/COFF image bytes
-/// * `event_data` - Event data (typically the device path string)
-pub fn measure_pe_image(
-    pcr_banks: &mut PcrBanks,
-    event_log: &mut dyn EventLog,
-    pcr_index: u32,
-    event_type: u32,
-    pe_data: &[u8],
-    event_data: &[u8],
-) -> Result<(), TcgError> {
-    use crate::efi::auth::authenticode::compute_authenticode_digests;
-
-    let (algorithm_count, algorithms) = pcr_banks.algorithm_array();
-
-    let (count, digests) = compute_authenticode_digests(pe_data, &algorithms[..algorithm_count])
-        .map_err(|_| TcgError::InternalError)?;
-
-    if let Err(e) = pcr_banks.extend(pcr_index as usize, &digests[..count]) {
-        log::error!("PCR {} image extend failed: {:?}", pcr_index, e);
-        return Err(e);
-    }
-
-    if let Err(e) = event_log.log_event(pcr_index, event_type, &digests[..count], event_data) {
-        log::warn!("Failed to log image measurement: {:?}", e);
-    }
-
-    Ok(())
-}
 
 fn log_protocol_result(protocol: &str, context: &str, result: Option<Result<(), TcgError>>) {
     if let Some(Err(e)) = result {
@@ -613,25 +381,78 @@ pub fn measure_s_crtm_version_all(version: &str) {
     log::info!("Measured S-CRTM version into PCR 0: \"{}\"", version);
 }
 
-/// Measure a PE/COFF EFI image through all installed TCG protocols.
-pub fn measure_pe_image_all(
+/// Precompute Authenticode digests for installed TCG protocols.
+pub fn precompute_pe_image_digests_all(
+    pe_data: &[u8],
+) -> Result<Option<(usize, [TaggedDigest; 5])>, TcgError> {
+    let mut first_error = None;
+    let mut out = [TaggedDigest::zeroed(0); 5];
+    let mut out_count = 0;
+
+    if let Some(result) = crate::efi::protocols::tcg2::precompute_pe_image_digests(pe_data) {
+        match result {
+            Ok((count, digests)) => merge_digests(&mut out, &mut out_count, &digests[..count]),
+            Err(e) => {
+                first_error.get_or_insert(e);
+                log::warn!("TCG2 PE image digest precompute failed: {:?}", e);
+            }
+        }
+    }
+
+    if let Some(result) = crate::efi::protocols::tcg::precompute_pe_image_digests(pe_data) {
+        match result {
+            Ok((count, digests)) => merge_digests(&mut out, &mut out_count, &digests[..count]),
+            Err(e) => {
+                first_error.get_or_insert(e);
+                log::warn!("TCG PE image digest precompute failed: {:?}", e);
+            }
+        }
+    }
+
+    if let Some(e) = first_error {
+        Err(e)
+    } else if out_count == 0 {
+        Ok(None)
+    } else {
+        Ok(Some((out_count, out)))
+    }
+}
+
+fn merge_digests(out: &mut [TaggedDigest; 5], out_count: &mut usize, digests: &[TaggedDigest]) {
+    for digest in digests {
+        if out[..*out_count]
+            .iter()
+            .any(|existing| existing.algorithm == digest.algorithm)
+        {
+            continue;
+        }
+        if *out_count >= out.len() {
+            break;
+        }
+        out[*out_count] = *digest;
+        *out_count += 1;
+    }
+}
+
+/// Extend and log a PE/COFF EFI image with precomputed Authenticode digests.
+pub fn measure_pe_image_digests_all(
     pcr_index: u32,
     event_type: u32,
-    pe_data: &[u8],
+    digests: &[TaggedDigest],
     event_data: &[u8],
 ) -> Result<(), TcgError> {
     let mut first_error = None;
 
-    if let Some(result) = crate::efi::protocols::tcg2::measure_pe_image_event(
-        pcr_index, event_type, pe_data, event_data,
+    if let Some(result) = crate::efi::protocols::tcg2::measure_pe_image_digests_event(
+        pcr_index, event_type, digests, event_data,
     ) && let Err(e) = result
     {
         first_error.get_or_insert(e);
         log::warn!("TCG2 PE image measurement failed: {:?}", e);
     }
 
-    if let Some(result) = crate::efi::protocols::tcg::measure_pe_image_event(
-        pcr_index, event_type, pe_data, event_data,
+    if let Some(result) = crate::efi::protocols::tcg::measure_pe_image_digests_event(
+        pcr_index, event_type, digests, event_data,
     ) && let Err(e) = result
     {
         first_error.get_or_insert(e);
@@ -640,6 +461,21 @@ pub fn measure_pe_image_all(
 
     match first_error {
         Some(e) => Err(e),
+        None => Ok(()),
+    }
+}
+
+/// Measure a PE/COFF EFI image through all installed TCG protocols.
+pub fn measure_pe_image_all(
+    pcr_index: u32,
+    event_type: u32,
+    pe_data: &[u8],
+    event_data: &[u8],
+) -> Result<(), TcgError> {
+    match precompute_pe_image_digests_all(pe_data)? {
+        Some((count, digests)) => {
+            measure_pe_image_digests_all(pcr_index, event_type, &digests[..count], event_data)
+        }
         None => Ok(()),
     }
 }

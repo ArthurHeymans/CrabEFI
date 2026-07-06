@@ -208,6 +208,7 @@ pub unsafe fn init_state_with_hardware(
     // pre-CrabEFI PCR history.
     let (alg_count, algorithms, existing_log) =
         hardware_log_selection(existing_log, tpm.active_algorithms());
+    warn_unselected_active_pcr_banks(tpm.active_algorithms(), &algorithms[..alg_count]);
     let algorithms = &algorithms[..alg_count];
 
     let event_log = if let Some(existing) = existing_log {
@@ -256,6 +257,7 @@ pub fn init_state_with_platform_tpm(
     // banks that were not measured by the earlier firmware phase.
     let (alg_count, algorithms, existing_log) =
         hardware_log_selection(existing_log, active_banks.algorithms());
+    warn_unselected_active_pcr_banks(active_banks.algorithms(), &algorithms[..alg_count]);
     let algorithms = &algorithms[..alg_count];
 
     let event_log = if let Some(existing) = existing_log {
@@ -278,19 +280,10 @@ pub fn init_state_with_platform_tpm(
     Ok(())
 }
 
-/// Access the TCG2 state for internal firmware measurements.
-///
-/// Prefer [`measure_event`] and [`measure_pe_image_event`] for measured-boot
-/// events so hardware TPMs are extended as well as the software mirror.
-pub fn with_state<F, R>(f: F) -> Option<R>
-where
-    F: FnOnce(&mut PcrBanks, &mut dyn EventLog) -> R,
-{
-    let mut guard = TCG2_STATE.lock();
-    guard
-        .as_mut()
-        .map(|state| f(&mut state.pcr_banks, &mut state.event_log))
-}
+const SUPPORTED_HASH_ALGORITHM_BITMAP: u32 = EFI_TCG2_BOOT_HASH_ALG_SHA1
+    | EFI_TCG2_BOOT_HASH_ALG_SHA256
+    | EFI_TCG2_BOOT_HASH_ALG_SHA384
+    | EFI_TCG2_BOOT_HASH_ALG_SHA512;
 
 fn algorithm_to_bitmap(algorithm: u16) -> u32 {
     match algorithm {
@@ -314,6 +307,29 @@ fn is_supported_hash_algorithm(algorithm: u16) -> bool {
         algorithm,
         TPM_ALG_SHA1 | TPM_ALG_SHA256 | TPM_ALG_SHA384 | TPM_ALG_SHA512
     )
+}
+
+fn hash_algorithm_name(algorithm: u16) -> &'static str {
+    match algorithm {
+        TPM_ALG_SHA1 => "SHA-1",
+        TPM_ALG_SHA256 => "SHA-256",
+        TPM_ALG_SHA384 => "SHA-384",
+        TPM_ALG_SHA512 => "SHA-512",
+        _ => "unknown",
+    }
+}
+
+fn warn_unselected_active_pcr_banks(active_algorithms: &[u16], selected_algorithms: &[u16]) {
+    for &algorithm in active_algorithms {
+        if is_supported_hash_algorithm(algorithm) && !selected_algorithms.contains(&algorithm) {
+            // TCG PFP's proper long-term fix is capping unused active banks.
+            log::warn!(
+                "TPM active PCR bank {} ({:#06x}) will NOT be extended by CrabEFI; its PCRs will not correspond to the event log and are unverifiable for attestation",
+                hash_algorithm_name(algorithm),
+                algorithm
+            );
+        }
+    }
 }
 
 fn supported_algorithm_count(algorithms: &[u16]) -> usize {
@@ -525,6 +541,55 @@ pub fn measure_event(
     ))
 }
 
+/// Precompute PE/COFF Authenticode digests for active TCG2 banks.
+///
+/// Returns `None` if the TCG2 protocol is not installed.
+pub fn precompute_pe_image_digests(
+    pe_data: &[u8],
+) -> Option<Result<(usize, [TaggedDigest; 5]), TcgError>> {
+    let guard = TCG2_STATE.lock();
+    let state = guard.as_ref()?;
+    state.hardware_tpm.as_ref()?;
+    let (alg_count, algorithms) = state.pcr_banks.algorithm_array();
+    Some(
+        compute_authenticode_digests(pe_data, &algorithms[..alg_count])
+            .map_err(|_| TcgError::InternalError),
+    )
+}
+
+/// Measure a PE/COFF image through TCG2 state with precomputed digests.
+///
+/// Returns `None` if the TCG2 protocol is not installed.
+pub fn measure_pe_image_digests_event(
+    pcr_index: u32,
+    event_type: u32,
+    digests: &[TaggedDigest],
+    event_data: &[u8],
+) -> Option<Result<(), TcgError>> {
+    let mut guard = TCG2_STATE.lock();
+    let state = guard.as_mut()?;
+    state.hardware_tpm.as_ref()?;
+    let (alg_count, algorithms) = state.pcr_banks.algorithm_array();
+    Some((|| {
+        let mut filtered = [TaggedDigest::zeroed(0); 5];
+        for (i, algorithm) in algorithms[..alg_count].iter().enumerate() {
+            filtered[i] = digests
+                .iter()
+                .find(|digest| digest.algorithm == *algorithm)
+                .copied()
+                .ok_or(TcgError::UnsupportedAlgorithm)?;
+        }
+        extend_and_maybe_log(
+            state,
+            pcr_index,
+            event_type,
+            &filtered[..alg_count],
+            event_data,
+            true,
+        )
+    })())
+}
+
 /// Measure a PE/COFF image through TCG2 state using Authenticode hashing.
 ///
 /// Returns `None` if the TCG2 protocol is not installed.
@@ -534,24 +599,12 @@ pub fn measure_pe_image_event(
     pe_data: &[u8],
     event_data: &[u8],
 ) -> Option<Result<(), TcgError>> {
-    let mut guard = TCG2_STATE.lock();
-    let state = guard.as_mut()?;
-    state.hardware_tpm.as_ref()?;
-    let (alg_count, algorithms) = state.pcr_banks.algorithm_array();
-    Some(
-        compute_authenticode_digests(pe_data, &algorithms[..alg_count])
-            .map_err(|_| TcgError::InternalError)
-            .and_then(|(digest_count, digests)| {
-                extend_and_maybe_log(
-                    state,
-                    pcr_index,
-                    event_type,
-                    &digests[..digest_count],
-                    event_data,
-                    true,
-                )
-            }),
-    )
+    match precompute_pe_image_digests(pe_data)? {
+        Ok((count, digests)) => {
+            measure_pe_image_digests_event(pcr_index, event_type, &digests[..count], event_data)
+        }
+        Err(e) => Some(Err(e)),
+    }
 }
 
 // ============================================================================
@@ -579,8 +632,11 @@ extern "efiapi" fn tcg2_get_capability(
     let (hash_bitmap, active_bitmap, num_banks) = if !tpm_present {
         (0, 0, 0)
     } else {
-        let bitmap = bitmap_from_algorithms(state.pcr_banks.algorithms());
-        (bitmap, bitmap, state.pcr_banks.algorithm_array().0 as u32)
+        (
+            SUPPORTED_HASH_ALGORITHM_BITMAP,
+            state.active_hash_bitmap(),
+            state.pcr_banks.algorithm_array().0 as u32,
+        )
     };
 
     // SAFETY: we checked null above, and the caller owns the buffer.
