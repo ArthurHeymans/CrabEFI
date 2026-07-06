@@ -12,6 +12,11 @@ fn main() {
         println!("cargo:rerun-if-changed={}", ld.display());
         println!("cargo:rustc-link-arg=-T{}", ld.display());
         println!("cargo:rustc-link-arg=-no-pie");
+
+        // Allow AMD boards to move CrabEFI away from coreboot's early DRAM windows.
+        println!("cargo:rerun-if-env-changed=PAYLOAD_BASE");
+        let payload_base = std::env::var("PAYLOAD_BASE").unwrap_or_else(|_| "0x100000".to_string());
+        println!("cargo:rustc-link-arg=--defsym=__payload_base={payload_base}");
     } else if target.starts_with("aarch64") {
         let ld = manifest_path.join("aarch64-coreboot.ld");
         println!("cargo:rerun-if-changed={}", ld.display());
@@ -24,8 +29,7 @@ fn main() {
         println!("cargo:rerun-if-env-changed=PAYLOAD_BASE");
         let payload_base =
             std::env::var("PAYLOAD_BASE").unwrap_or_else(|_| "0x10022000000".to_string());
-        println!("cargo:rustc-link-arg=--defsym");
-        println!("cargo:rustc-link-arg=PAYLOAD_BASE={payload_base}");
+        println!("cargo:rustc-link-arg=--defsym=PAYLOAD_BASE={payload_base}");
     } else if target.starts_with("riscv64") {
         let ld = manifest_path.join("riscv64-coreboot.ld");
         println!("cargo:rerun-if-changed={}", ld.display());
@@ -37,7 +41,6 @@ fn main() {
         println!("cargo:rerun-if-env-changed=PAYLOAD_BASE");
         let payload_base =
             std::env::var("PAYLOAD_BASE").unwrap_or_else(|_| "0x81000000".to_string());
-        println!("cargo:rustc-link-arg=--defsym");
-        println!("cargo:rustc-link-arg=PAYLOAD_BASE={payload_base}");
+        println!("cargo:rustc-link-arg=--defsym=PAYLOAD_BASE={payload_base}");
     }
 }

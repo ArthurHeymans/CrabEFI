@@ -4,8 +4,8 @@ OUTPUT_FORMAT("elf64-x86-64")
 OUTPUT_ARCH(i386:x86-64)
 ENTRY(_start)
 
-/* Coreboot loads payloads at a configurable address, typically 0x100000 (1MB) */
-PAYLOAD_BASE = 0x100000;
+/* Coreboot loads payloads at a configurable address, defaulting to 0x100000 (1MB). */
+PROVIDE(__payload_base = 0x100000);
 
 /*
  * Explicit program headers so the deferred variable buffer is NOT in any
@@ -61,7 +61,7 @@ SECTIONS
     } :defer
 
     /* ── Payload proper ───────────────────────────────────────────── */
-    . = PAYLOAD_BASE;
+    . = __payload_base;
     
     /* Runtime code starts here - everything executable */
     __runtime_code_start = .;
