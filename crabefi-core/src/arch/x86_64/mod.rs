@@ -1,11 +1,8 @@
 //! x86_64 architecture support
 //!
-//! This module contains code specific to the x86_64 architecture,
-//! including the 32-bit to 64-bit mode transition and page table setup.
+//! This module contains code specific to the x86_64 architecture.
 
 pub mod cache;
-#[cfg(feature = "platform-entry")]
-pub mod entry;
 pub mod idt;
 pub mod io;
 pub mod port_regs;

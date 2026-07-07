@@ -10,10 +10,8 @@ readme = "../README.md"
 
 [features]
 default = []
-# Include CrabEFI's own _start entry point, EL2 page table setup,
-# and exception vector table. Disable when linking CrabEFI as a
-# library into an external firmware (e.g., fstart) that provides
-# its own entry point and exception handling.
+# Enable linker-symbol-backed runtime regions used by CrabEFI-owned payloads.
+# Disable when linking CrabEFI as a library into external firmware.
 platform-entry = []
 # Register the built-in BumpAllocator as #[global_allocator].
 # Disable this if the linking binary provides its own allocator.

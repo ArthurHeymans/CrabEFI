@@ -1,23 +1,14 @@
-//! RISC-V S-mode trap handler (library-mode).
+//! RISC-V S-mode trap handler.
 //!
-//! When CrabEFI is linked as a library (without `platform-entry`), the
-//! calling firmware is responsible for setting up `stvec` before calling
-//! [`crate::init_platform()`].  This module provides
-//! [`install_trap_vectors()`] which installs a minimal S-mode trap entry
-//! that saves/restores registers and calls [`super::riscv_trap_handler`].
-//!
-//! When `platform-entry` IS enabled, the entry assembly in `entry.rs`
-//! sets up `stvec` with its own `_trap_entry` — this module's
-//! `_crabefi_lib_trap_entry` is still compiled but not installed.
+//! This module provides [`install_trap_vectors()`], which installs a minimal
+//! S-mode trap entry that saves/restores registers and calls
+//! [`super::riscv_trap_handler`].
 
 use core::arch::global_asm;
 
-// Minimal S-mode trap entry for library mode.  Uses the current `sp`
-// (no stack switch via sscratch) — this is safe because S-mode traps
-// during CrabEFI execution always have a valid stack.
-//
-// When platform-entry is active, entry.rs has its own `_trap_entry`
-// which IS installed by _start.  This symbol coexists harmlessly.
+// Minimal S-mode trap entry. Uses the current `sp` (no stack switch via
+// sscratch) — this is safe because S-mode traps during CrabEFI execution
+// always have a valid stack.
 global_asm!(
     r#"
     .section .text
@@ -69,8 +60,7 @@ _crabefi_lib_trap_entry:
 /// Install the library-mode S-mode trap vectors.
 ///
 /// Sets `stvec` to [`_crabefi_lib_trap_entry`] which dispatches to
-/// [`super::riscv_trap_handler`].  Called from [`crate::init_platform_impl`]
-/// on RISC-V when `platform-entry` is not active.
+/// [`super::riscv_trap_handler`]. Called from [`crate::init_platform_impl`].
 pub fn install_trap_vectors() {
     unsafe {
         core::arch::asm!(
