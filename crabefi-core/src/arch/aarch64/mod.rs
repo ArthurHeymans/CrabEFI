@@ -1,11 +1,9 @@
 //! AArch64 architecture support
 //!
 //! This module contains code specific to the AArch64 (ARM64) architecture,
-//! including the entry point, exception handling, and hardware primitives.
+//! including exception handling and hardware primitives.
 
 pub mod cache;
-#[cfg(feature = "platform-entry")]
-pub mod entry;
 // Exception vectors are always available — even when CrabEFI is a library,
 // it needs to install exception handlers before running UEFI applications.
 // Without VBAR_EL1 set, any exception during shim/GRUB execution would

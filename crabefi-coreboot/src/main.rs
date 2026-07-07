@@ -14,6 +14,15 @@ extern crate alloc;
 
 #[cfg(not(target_arch = "riscv64"))]
 mod acpi;
+#[cfg(target_arch = "aarch64")]
+#[path = "arch/aarch64/entry.rs"]
+mod arch_entry;
+#[cfg(target_arch = "riscv64")]
+#[path = "arch/riscv64/entry.rs"]
+mod arch_entry;
+#[cfg(target_arch = "x86_64")]
+#[path = "arch/x86_64/entry.rs"]
+mod arch_entry;
 mod cbmem_console;
 mod cfr;
 mod cfr_menu;

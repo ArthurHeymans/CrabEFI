@@ -1,16 +1,13 @@
 //! RISC-V 64-bit architecture support
 //!
 //! This module contains code specific to the RISC-V 64-bit (RV64GC)
-//! architecture, including SBI wrappers, the entry point, trap handling,
-//! and hardware primitives.
+//! architecture, including SBI wrappers, trap handling, and hardware primitives.
 //!
 //! CrabEFI runs in S-mode (Supervisor mode) under OpenSBI. All
 //! privileged operations (timer, IPI, reset, console) go through
 //! the SBI ecall interface to OpenSBI in M-mode.
 
 pub mod cache;
-#[cfg(feature = "platform-entry")]
-pub mod entry;
 pub mod reset;
 pub mod rng;
 pub mod sbi;
