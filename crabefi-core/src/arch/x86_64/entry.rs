@@ -48,8 +48,8 @@ global_asm!(
 _start:
     cli
 
-    // Save coreboot table pointer from stack
-    mov ebx, [esp + 4]
+    // Save coreboot table pointer from stack. CPUID clobbers EAX/EBX/ECX/EDX.
+    mov esi, [esp + 4]
 
     // Check for long mode support
     mov eax, 0x80000001
@@ -182,8 +182,8 @@ long_mode_start:
     or rax, 0x400                 // OSXMMEXCPT (bit 10)
     mov cr4, rax
 
-    // Pass coreboot table pointer (mov edi, ebx zero-extends into RDI)
-    mov edi, ebx
+    // Pass coreboot table pointer (mov edi, esi zero-extends into RDI)
+    mov edi, esi
 
     // Call Rust
     call rust_main
