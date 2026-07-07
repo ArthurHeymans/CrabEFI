@@ -594,14 +594,6 @@ unsafe fn scan_for_header() -> Option<*const CbHeader> {
             log::debug!("Found coreboot tables in BIOS area");
             return Some(header);
         }
-
-        // Try common high memory locations
-        for base in &[0x7EE00000u64, 0x7FE00000u64, 0xCFF00000u64] {
-            if let Some(header) = scan_for_header_at(*base as *const u8, 0x100000) {
-                log::debug!("Found coreboot tables at {:#x}", *base);
-                return Some(header);
-            }
-        }
     }
 
     None
