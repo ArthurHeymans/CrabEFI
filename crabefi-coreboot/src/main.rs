@@ -527,6 +527,7 @@ fn riscv_fdt_only_boot(fdt_ptr: u64, fdt_size: u32) -> ! {
         hooks: Some(&hooks),
         rng: None,
         ecam_base: None,
+        ecam_size: None,
         deferred_buffer: None,
         runtime_region: None,
         heap_pre_initialized: false,
@@ -820,9 +821,10 @@ pub extern "C" fn rust_main(coreboot_table_ptr: u64) -> ! {
         capsule_regions: &capsule_regions[..capsule_count],
         hooks: Some(&hooks),
         rng: None,
-        ecam_base: None,             // May be filled from ACPI MCFG below
-        deferred_buffer: None,       // Uses linker-symbol fallback in init_platform()
-        runtime_region: None,        // Uses linker-symbol fallback (platform-entry feature)
+        ecam_base: None, // May be filled from ACPI MCFG below
+        ecam_size: None,
+        deferred_buffer: None, // Uses linker-symbol fallback in init_platform()
+        runtime_region: None,  // Uses linker-symbol fallback (platform-entry feature)
         heap_pre_initialized: false, // Set to true after Phase 7
     };
 
@@ -883,6 +885,7 @@ pub extern "C" fn rust_main(coreboot_table_ptr: u64) -> ! {
         {
             if let Some(ecam) = info.ecam_base {
                 config.ecam_base = Some(ecam);
+                config.ecam_size = info.ecam_size;
                 log::info!("ECAM base from FDT: {:#x}", ecam);
                 ecam_found = true;
             }
@@ -892,6 +895,7 @@ pub extern "C" fn rust_main(coreboot_table_ptr: u64) -> ! {
         // Fallback: use coreboot's configured ECAM base for QEMU virt (0x30000000)
         if !ecam_found {
             config.ecam_base = Some(0x3000_0000);
+            config.ecam_size = Some(0x1000_0000);
             log::info!("ECAM base from coreboot config: 0x30000000");
         }
 

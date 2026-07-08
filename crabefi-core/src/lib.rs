@@ -467,7 +467,7 @@ fn init_platform_impl(mut config: PlatformConfig) -> ! {
     // that provide ecam_base directly.
     if let Some(ecam) = config.ecam_base {
         log::info!("PCI ECAM base from platform: {:#x}", ecam);
-        drivers::pci::set_ecam_base(ecam);
+        drivers::pci::set_ecam_region(ecam, config.ecam_size);
     } else if let Some(ecam) = state::drivers().acpi_info.ecam_base {
         log::info!("PCI ECAM base from ACPI MCFG: {:#x}", ecam);
         drivers::pci::set_ecam_region(ecam, state::drivers().acpi_info.ecam_size);

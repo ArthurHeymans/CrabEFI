@@ -1077,13 +1077,7 @@ impl FramebufferConfig {
     }
 
     /// Raw pointer to the framebuffer.
-    ///
-    /// # Safety
-    ///
-    /// The framebuffer must be identity-mapped at `physical_address`.
-    /// The caller is responsible for ensuring the pointer is not used
-    /// after the framebuffer is unmapped.
-    pub unsafe fn as_ptr(&self) -> *mut u8 {
+    pub fn as_ptr(&self) -> *mut u8 {
         core::ptr::with_exposed_provenance_mut(self.physical_address as usize)
     }
 
@@ -1118,8 +1112,7 @@ impl FramebufferConfig {
             return;
         }
         let offset = self.pixel_offset(x, y);
-        // SAFETY: caller guarantees the framebuffer is identity-mapped.
-        let fb = unsafe { self.as_ptr() };
+        let fb = self.as_ptr();
         unsafe {
             match self.bits_per_pixel {
                 32 => {
@@ -1211,8 +1204,7 @@ impl FramebufferConfig {
     ///
     /// The framebuffer must be accessible.
     pub unsafe fn clear(&self, r: u8, g: u8, b: u8) {
-        // SAFETY: caller guarantees the framebuffer is identity-mapped.
-        let fb = unsafe { self.as_ptr() };
+        let fb = self.as_ptr();
         let bpl = self.bytes_per_line() as usize;
         unsafe {
             match self.bits_per_pixel {
@@ -1415,6 +1407,9 @@ pub struct PlatformConfig<'a> {
     /// If provided, CrabEFI uses this directly for PCI config space access.
     /// Otherwise, it discovers the ECAM base from ACPI MCFG or FDT.
     pub ecam_base: Option<u64>,
+
+    /// Size of the PCI ECAM window in bytes, when `ecam_base` is provided.
+    pub ecam_size: Option<u64>,
 
     // ---- Runtime Support ----
     /// Warm-reboot persistent buffer for deferred variable writes.
