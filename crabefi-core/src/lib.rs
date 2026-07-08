@@ -489,13 +489,6 @@ fn init_platform_impl(mut config: PlatformConfig) -> ! {
         let buf_base = deferred::deferred_buffer_base();
         let buf_size = deferred::deferred_buffer_size();
         if buf_size > 0 {
-            // When platform-entry is active, the deferred buffer lives inside
-            // the linker's __runtime_data_start..__runtime_data_end range which
-            // reserve_runtime_region() already carved as RuntimeServicesData.
-            // Adding it again via force_add_region creates a duplicate,
-            // overlapping memory map entry that confuses the Linux kernel's
-            // efi_memattr_apply_permissions / efi_create_mapping and can leave
-            // parts of the RuntimeServicesData region unmapped in efi_mm.
             #[cfg(not(feature = "platform-entry"))]
             {
                 use efi::allocator::{MemoryType as AllocMemType, PAGE_SIZE};
@@ -521,12 +514,34 @@ fn init_platform_impl(mut config: PlatformConfig) -> ! {
 
             #[cfg(feature = "platform-entry")]
             {
-                use efi::allocator::PAGE_SIZE;
-                log::info!(
-                    "Deferred buffer at {:#x} ({} pages) already in runtime data region",
+                use efi::allocator::{MemoryType as AllocMemType, PAGE_SIZE};
+                // The linker script places .deferred_buffer BELOW PAYLOAD_BASE
+                // (0x80000 on x86_64), i.e. OUTSIDE the runtime data range that
+                // reserve_runtime_region() carves. Without marking it as
+                // RuntimeServicesData the OS treats it as free RAM and the
+                // first runtime SetVariable write corrupts kernel memory or
+                // faults on an unmapped efi_mm address (hard system lockup).
+                // carve_out_region splits the containing entry instead of
+                // pushing an overlapping duplicate, which the Linux EFI
+                // mapping code cannot handle.
+                let buf_pages = (buf_size as u64).div_ceil(PAGE_SIZE);
+                match efi::allocator::carve_out_region(
                     buf_base,
-                    (buf_size as u64).div_ceil(PAGE_SIZE)
-                );
+                    buf_pages,
+                    AllocMemType::RuntimeServicesData,
+                ) {
+                    Ok(()) => log::info!(
+                        "Deferred buffer at {:#x} ({} pages) carved as RuntimeServicesData",
+                        buf_base,
+                        buf_pages
+                    ),
+                    Err(e) => log::error!(
+                        "CRITICAL: could not reserve deferred buffer at {:#x}: {:?} — \
+                         runtime SetVariable would corrupt OS memory",
+                        buf_base,
+                        e
+                    ),
+                }
             }
         }
     }

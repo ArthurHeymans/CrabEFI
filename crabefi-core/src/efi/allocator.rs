@@ -1326,6 +1326,26 @@ pub fn force_add_region(
     })
 }
 
+/// Carve a physical range out of its containing map entry as `memory_type`.
+///
+/// Unlike `force_add_region`, this splits the containing Reserved/Conventional
+/// entry and never creates overlapping memory map entries (which confuse the
+/// Linux kernel's EFI mapping code).
+pub fn carve_out_region(
+    physical_start: u64,
+    num_pages: u64,
+    memory_type: MemoryType,
+) -> Result<(), efi::Status> {
+    let source_types = &[
+        MemoryType::ReservedMemoryType,
+        MemoryType::ConventionalMemory,
+        MemoryType::BootServicesData,
+    ];
+    state::with_allocator_mut(|alloc| {
+        alloc.carve_out_from(physical_start, num_pages, memory_type, source_types)
+    })
+}
+
 /// Mark a memory region as ACPI Reclaim Memory
 ///
 /// This properly splits existing regions and marks the specified range as AcpiReclaimMemory.
