@@ -259,7 +259,9 @@ pub fn register_region() {
     let buf_base = unsafe { &_rt_log_start as *const u8 as u64 };
     let buf_pages = (total_size() as u64).div_ceil(PAGE_SIZE);
 
-    if let Err(e) = crate::efi::allocator::force_add_region(
+    // carve_out_region splits the containing map entry; force_add_region
+    // would push an overlapping duplicate that breaks Linux's EFI mapping.
+    if let Err(e) = crate::efi::allocator::carve_out_region(
         buf_base,
         buf_pages,
         MemoryType::RuntimeServicesData,
