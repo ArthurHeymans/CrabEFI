@@ -11,17 +11,24 @@
 //! is available (typically from ACPI MCFG or platform configuration).
 
 use super::PciAddress;
+use pci_types::ConfigRegionAccess;
 
 /// Trait for PCI configuration space access
 ///
 /// Implementations provide read/write access to PCI configuration space
 /// registers using different hardware mechanisms.
-pub trait PciAccess {
-    /// Read a 32-bit value from PCI configuration space
-    fn read32(&self, addr: PciAddress, offset: u16) -> u32;
+pub trait PciAccess: ConfigRegionAccess {
+    /// Read a 32-bit value from PCI configuration space.
+    fn read32(&self, addr: PciAddress, offset: u16) -> u32 {
+        // Safety: callers only use valid PCI configuration offsets.
+        unsafe { self.read(addr, offset) }
+    }
 
-    /// Write a 32-bit value to PCI configuration space
-    fn write32(&self, addr: PciAddress, offset: u16, value: u32);
+    /// Write a 32-bit value to PCI configuration space.
+    fn write32(&self, addr: PciAddress, offset: u16, value: u32) {
+        // Safety: callers only write valid PCI configuration offsets.
+        unsafe { self.write(addr, offset, value) }
+    }
 
     /// Read a 16-bit value from PCI configuration space
     fn read16(&self, addr: PciAddress, offset: u16) -> u16 {
@@ -82,9 +89,9 @@ const PCI_CONFIG_DATA: u16 = 0xCFC;
 /// the first 256 bytes of PCI configuration space.
 pub struct IoCamAccess;
 
-impl PciAccess for IoCamAccess {
+impl ConfigRegionAccess for IoCamAccess {
     #[cfg(target_arch = "x86_64")]
-    fn read32(&self, addr: PciAddress, offset: u16) -> u32 {
+    unsafe fn read(&self, addr: PciAddress, offset: u16) -> u32 {
         use x86_64::instructions::port::{Port, PortWriteOnly};
 
         // Legacy CAM only supports 8-bit offsets (0-255)
@@ -98,18 +105,26 @@ impl PciAccess for IoCamAccess {
         let mut data_port: Port<u32> = Port::new(PCI_CONFIG_DATA);
 
         unsafe {
-            address_port.write(addr.cam_address(offset));
+            address_port.write(
+                (1 << 31)
+                    | ((addr.bus() as u32) << 16)
+                    | ((addr.device() as u32) << 11)
+                    | ((addr.function() as u32) << 8)
+                    | ((offset as u32) & 0xFC),
+            );
             data_port.read()
         }
     }
 
     #[cfg(not(target_arch = "x86_64"))]
-    fn read32(&self, _addr: PciAddress, _offset: u16) -> u32 {
-        0xFFFFFFFF
+    #[allow(unused_unsafe)]
+    unsafe fn read(&self, _addr: PciAddress, _offset: u16) -> u32 {
+        // Safety: non-x86 targets have no I/O CAM backend and make no hardware access.
+        unsafe { 0xFFFFFFFF }
     }
 
     #[cfg(target_arch = "x86_64")]
-    fn write32(&self, addr: PciAddress, offset: u16, value: u32) {
+    unsafe fn write(&self, addr: PciAddress, offset: u16, value: u32) {
         use x86_64::instructions::port::{Port, PortWriteOnly};
 
         debug_assert!(
@@ -122,14 +137,26 @@ impl PciAccess for IoCamAccess {
         let mut data_port: Port<u32> = Port::new(PCI_CONFIG_DATA);
 
         unsafe {
-            address_port.write(addr.cam_address(offset));
+            address_port.write(
+                (1 << 31)
+                    | ((addr.bus() as u32) << 16)
+                    | ((addr.device() as u32) << 11)
+                    | ((addr.function() as u32) << 8)
+                    | ((offset as u32) & 0xFC),
+            );
             data_port.write(value);
         }
     }
 
     #[cfg(not(target_arch = "x86_64"))]
-    fn write32(&self, _addr: PciAddress, _offset: u16, _value: u32) {}
+    #[allow(unused_unsafe)]
+    unsafe fn write(&self, _addr: PciAddress, _offset: u16, _value: u32) {
+        // Safety: non-x86 targets have no I/O CAM backend and make no hardware access.
+        unsafe {}
+    }
+}
 
+impl PciAccess for IoCamAccess {
     fn name(&self) -> &'static str {
         "Legacy I/O CAM"
     }
@@ -172,26 +199,28 @@ impl EcamAccess {
             offset
         );
         self.base
-            | ((addr.bus as u64) << 20)
-            | ((addr.device as u64) << 15)
-            | ((addr.function as u64) << 12)
+            | ((addr.bus() as u64) << 20)
+            | ((addr.device() as u64) << 15)
+            | ((addr.function() as u64) << 12)
             | ((offset as u64) & 0xFFC) // 4-byte aligned
     }
 }
 
-impl PciAccess for EcamAccess {
-    fn read32(&self, addr: PciAddress, offset: u16) -> u32 {
+impl ConfigRegionAccess for EcamAccess {
+    unsafe fn read(&self, addr: PciAddress, offset: u16) -> u32 {
         let mmio_addr = self.ecam_address(addr, offset) as *const u32;
         // Safety: ECAM region is mapped and valid, we only access aligned addresses
         unsafe { core::ptr::read_volatile(mmio_addr) }
     }
 
-    fn write32(&self, addr: PciAddress, offset: u16, value: u32) {
+    unsafe fn write(&self, addr: PciAddress, offset: u16, value: u32) {
         let mmio_addr = self.ecam_address(addr, offset) as *mut u32;
         // Safety: ECAM region is mapped and valid, we only access aligned addresses
         unsafe { core::ptr::write_volatile(mmio_addr, value) }
     }
+}
 
+impl PciAccess for EcamAccess {
     fn name(&self) -> &'static str {
         "PCIe ECAM"
     }
@@ -217,23 +246,23 @@ pub enum AnyPciAccess {
     Ecam(EcamAccess),
 }
 
+impl ConfigRegionAccess for AnyPciAccess {
+    unsafe fn read(&self, addr: PciAddress, offset: u16) -> u32 {
+        match self {
+            Self::IoCam(a) => unsafe { a.read(addr, offset) },
+            Self::Ecam(a) => unsafe { a.read(addr, offset) },
+        }
+    }
+
+    unsafe fn write(&self, addr: PciAddress, offset: u16, value: u32) {
+        match self {
+            Self::IoCam(a) => unsafe { a.write(addr, offset, value) },
+            Self::Ecam(a) => unsafe { a.write(addr, offset, value) },
+        }
+    }
+}
+
 impl PciAccess for AnyPciAccess {
-    fn read32(&self, addr: PciAddress, offset: u16) -> u32 {
-        match self {
-            Self::IoCam(a) => a.read32(addr, offset),
-            Self::Ecam(a) => a.read32(addr, offset),
-        }
-    }
-
-    fn write32(&self, addr: PciAddress, offset: u16, value: u32) {
-        match self {
-            Self::IoCam(a) => a.write32(addr, offset, value),
-            Self::Ecam(a) => a.write32(addr, offset, value),
-        }
-    }
-
-    // read16, write16, read8, write8 use trait defaults (implemented via read32/write32)
-
     fn name(&self) -> &'static str {
         match self {
             Self::IoCam(a) => a.name(),

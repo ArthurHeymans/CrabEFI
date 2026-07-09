@@ -25,6 +25,7 @@ r-efi = "5.3"
 log = "0.4"
 heapless = "0.8"
 mem-barrier = "0.1"
+pci_types = "0.10"
 
 [profile.dev]
 panic = "abort"

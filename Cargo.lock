@@ -132,6 +132,7 @@ dependencies = [
  "log",
  "mem-barrier",
  "noto-sans-mono-bitmap",
+ "pci_types",
  "postcard",
  "r-efi",
  "rflasher-core",

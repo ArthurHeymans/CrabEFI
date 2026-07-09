@@ -474,14 +474,14 @@ fn discover_nvme_entries(menu: &mut BootMenu) {
         let _ = write!(name_prefix, "NVMe ns{}", nsid);
         discover_entries_on_disk(
             device_type,
-            pci_addr.device,
-            pci_addr.function,
+            pci_addr.device(),
+            pci_addr.function(),
             &name_prefix,
             menu,
         );
     } else {
         // GPT failed — try El Torito (ISO9660) as fallback
-        try_el_torito_fallback(device_type, pci_addr.device, pci_addr.function, menu);
+        try_el_torito_fallback(device_type, pci_addr.device(), pci_addr.function(), menu);
     }
 }
 
@@ -518,14 +518,14 @@ fn discover_ahci_entries(menu: &mut BootMenu) {
         if has_partitions {
             discover_entries_on_disk(
                 device_type,
-                pci_addr.device,
-                pci_addr.function,
+                pci_addr.device(),
+                pci_addr.function(),
                 &name_prefix,
                 menu,
             );
         } else {
             // GPT failed — try El Torito (ISO9660) as fallback
-            try_el_torito_fallback(device_type, pci_addr.device, pci_addr.function, menu);
+            try_el_torito_fallback(device_type, pci_addr.device(), pci_addr.function(), menu);
         }
     }
 }
@@ -685,7 +685,7 @@ fn discover_sdhci_entries(menu: &mut BootMenu) {
             continue;
         }
         let (pci_device, pci_function, label) = match controller.pci_address() {
-            Some(addr) => (addr.device, addr.function, "SD card"),
+            Some(addr) => (addr.device(), addr.function(), "SD card"),
             None => (0, 0, "eMMC"),
         };
 

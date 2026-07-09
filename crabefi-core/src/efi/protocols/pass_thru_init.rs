@@ -59,8 +59,8 @@ fn init_nvme_pass_thru() {
         log::info!(
             "Installing NVMe pass-through protocols for controller {} (PCI {:02x}:{:x})",
             controller_index,
-            pci_addr.device,
-            pci_addr.function
+            pci_addr.device(),
+            pci_addr.function()
         );
 
         // Create a handle for the NVMe controller
@@ -77,8 +77,8 @@ fn init_nvme_pass_thru() {
 
         // Install device path on controller handle
         let controller_device_path = device_path::create_nvme_device_path(
-            pci_addr.device,
-            pci_addr.function,
+            pci_addr.device(),
+            pci_addr.function(),
             0, // Controller-level device path (no specific namespace)
         );
         if !controller_device_path.is_null() {
@@ -92,8 +92,8 @@ fn init_nvme_pass_thru() {
         // Install NVM Express Pass Through Protocol on controller handle
         let pass_thru = nvme_pass_thru::create_nvme_pass_thru_protocol(
             controller_index,
-            pci_addr.device,
-            pci_addr.function,
+            pci_addr.device(),
+            pci_addr.function(),
         );
         if !pass_thru.is_null() {
             boot_services::install_protocol(
@@ -119,8 +119,11 @@ fn init_nvme_pass_thru() {
             };
 
             // Install device path on namespace handle
-            let ns_device_path =
-                device_path::create_nvme_device_path(pci_addr.device, pci_addr.function, ns.nsid);
+            let ns_device_path = device_path::create_nvme_device_path(
+                pci_addr.device(),
+                pci_addr.function(),
+                ns.nsid,
+            );
             if !ns_device_path.is_null() {
                 boot_services::install_protocol(
                     ns_handle,
@@ -173,8 +176,8 @@ fn init_ahci_pass_thru() {
         log::info!(
             "Installing AHCI pass-through protocols for controller {} (PCI {:02x}:{:x})",
             controller_index,
-            pci_addr.device,
-            pci_addr.function
+            pci_addr.device(),
+            pci_addr.function()
         );
 
         // Create a handle for the AHCI controller
@@ -191,8 +194,8 @@ fn init_ahci_pass_thru() {
 
         // Install device path on controller handle
         let controller_device_path = device_path::create_sata_device_path(
-            pci_addr.device,
-            pci_addr.function,
+            pci_addr.device(),
+            pci_addr.function(),
             0xFFFF, // Controller-level device path (no specific port)
         );
         if !controller_device_path.is_null() {
@@ -206,8 +209,8 @@ fn init_ahci_pass_thru() {
         // Install ATA Pass Through Protocol on controller handle
         let ata_pass_thru = ata_pass_thru::create_ata_pass_thru_protocol(
             controller_index,
-            pci_addr.device,
-            pci_addr.function,
+            pci_addr.device(),
+            pci_addr.function(),
         );
         if !ata_pass_thru.is_null() {
             boot_services::install_protocol(
@@ -243,8 +246,8 @@ fn init_ahci_pass_thru() {
 
             // Install device path on device handle
             let device_path_ptr = device_path::create_sata_device_path(
-                pci_addr.device,
-                pci_addr.function,
+                pci_addr.device(),
+                pci_addr.function(),
                 port.port_num as u16,
             );
             if !device_path_ptr.is_null() {

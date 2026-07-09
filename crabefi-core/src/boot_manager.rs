@@ -295,7 +295,12 @@ fn try_boot_file_on_nvme(file_path: &str) -> bool {
             nsid,
         };
 
-        if try_boot_file_on_device(&device_type, pci_addr.device, pci_addr.function, file_path) {
+        if try_boot_file_on_device(
+            &device_type,
+            pci_addr.device(),
+            pci_addr.function(),
+            file_path,
+        ) {
             return true;
         }
     }
@@ -322,8 +327,12 @@ fn try_boot_file_on_ahci(file_path: &str) -> bool {
                 controller_id,
                 port: port_index,
             };
-            if try_boot_file_on_device(&device_type, pci_addr.device, pci_addr.function, file_path)
-            {
+            if try_boot_file_on_device(
+                &device_type,
+                pci_addr.device(),
+                pci_addr.function(),
+                file_path,
+            ) {
                 return true;
             }
         }
@@ -385,7 +394,7 @@ fn try_boot_file_on_sdhci(file_path: &str) -> bool {
         }
         let (pci_device, pci_function) = controller
             .pci_address()
-            .map(|addr| (addr.device, addr.function))
+            .map(|addr| (addr.device(), addr.function()))
             .unwrap_or((0, 0));
 
         if !sdhci::store_global_device(controller_id) {

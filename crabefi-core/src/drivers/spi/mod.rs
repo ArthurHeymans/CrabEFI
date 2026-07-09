@@ -18,7 +18,7 @@ pub struct CrabEfiPciAccess;
 impl CrabEfiPciAccess {
     fn addr(bdf: Bdf) -> pci::PciAddress {
         // CrabEFI currently enumerates PCI segment 0 only.
-        pci::PciAddress::new(bdf.bus, bdf.device, bdf.function)
+        pci::PciAddress::new(0, bdf.bus, bdf.device, bdf.function)
     }
 
     fn offset_to_u8(bdf: Bdf, offset: u16, write: bool) -> rflasher_internal::Result<u8> {
@@ -400,9 +400,9 @@ fn rflasher_pci_device(dev: &pci::PciDevice) -> rflasher_internal::PciDevice {
 
     rflasher_internal::PciDevice {
         domain: 0,
-        bus: dev.address.bus,
-        device: dev.address.device,
-        function: dev.address.function,
+        bus: dev.address.bus(),
+        device: dev.address.device(),
+        function: dev.address.function(),
         vendor_id: dev.vendor_id,
         device_id: dev.device_id,
         revision_id: dev.revision,
