@@ -28,6 +28,11 @@ pub mod driver;
 use access::{AnyPciAccess, PciAccess};
 
 use crate::state;
+pub use pci_types::{
+    BaseClass, CommandRegister, ConfigRegionAccess, DeviceId, DeviceRevision, HeaderType,
+    Interface, PciAddress, PciHeader, StatusRegister, SubClass, VendorId,
+    device_type::{DeviceType, UsbType},
+};
 
 /// PCI class codes for storage controllers
 pub const CLASS_STORAGE: u8 = 0x01;
@@ -57,10 +62,6 @@ pub const SUBCLASS_SDHCI: u8 = 0x05; // SD Host Controller
 const INVALID_VENDOR_ID: u16 = 0xFFFF;
 const ECAM_BYTES_PER_BUS: u64 = 1 << 20;
 
-/// PCI header types
-const HEADER_TYPE_NORMAL: u8 = 0x00;
-const HEADER_TYPE_MULTI_FUNCTION: u8 = 0x80;
-
 // ============================================================================
 // Global PCI Access
 // ============================================================================
@@ -77,41 +78,6 @@ where
 // ============================================================================
 // PCI Address and Device Types
 // ============================================================================
-
-/// PCI device location (Bus:Device.Function)
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct PciAddress {
-    pub bus: u8,
-    pub device: u8,
-    pub function: u8,
-}
-
-impl PciAddress {
-    pub const fn new(bus: u8, device: u8, function: u8) -> Self {
-        Self {
-            bus,
-            device,
-            function,
-        }
-    }
-
-    /// Calculate legacy CAM address for a register (x86 I/O port config access)
-    #[cfg(target_arch = "x86_64")]
-    pub(crate) fn cam_address(&self, offset: u8) -> u32 {
-        let mut addr = 1u32 << 31; // Enable bit
-        addr |= (self.bus as u32) << 16;
-        addr |= (self.device as u32) << 11;
-        addr |= (self.function as u32) << 8;
-        addr |= (offset as u32) & 0xFC; // Must be 4-byte aligned
-        addr
-    }
-}
-
-impl core::fmt::Display for PciAddress {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        write!(f, "{:02x}:{:02x}.{}", self.bus, self.device, self.function)
-    }
-}
 
 /// PCI BAR type
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -136,13 +102,14 @@ pub struct PciBar {
 #[derive(Debug, Clone)]
 pub struct PciDevice {
     pub address: PciAddress,
-    pub vendor_id: u16,
-    pub device_id: u16,
-    pub class_code: u8,
-    pub subclass: u8,
-    pub prog_if: u8,
-    pub revision: u8,
-    pub header_type: u8,
+    pub vendor_id: VendorId,
+    pub device_id: DeviceId,
+    pub class_code: BaseClass,
+    pub subclass: SubClass,
+    pub prog_if: Interface,
+    pub revision: DeviceRevision,
+    pub header_type: HeaderType,
+    multi_function: bool,
     pub bars: [PciBar; 6],
     pub interrupt_line: u8,
     pub interrupt_pin: u8,
@@ -159,21 +126,27 @@ impl PciDevice {
             subclass: 0,
             prog_if: 0,
             revision: 0,
-            header_type: 0,
+            header_type: HeaderType::Unknown(0),
+            multi_function: false,
             bars: [PciBar::default(); 6],
             interrupt_line: 0,
             interrupt_pin: 0,
         }
     }
 
+    /// Return the standard PCI class/subclass classification.
+    pub fn device_type(&self) -> DeviceType {
+        (self.class_code, self.subclass).into()
+    }
+
     /// Check if this is an NVMe controller
     pub fn is_nvme(&self) -> bool {
-        self.class_code == CLASS_STORAGE && self.subclass == SUBCLASS_NVME
+        self.device_type() == DeviceType::NvmeController
     }
 
     /// Check if this is an AHCI controller
     pub fn is_ahci(&self) -> bool {
-        self.class_code == CLASS_STORAGE && self.subclass == SUBCLASS_SATA
+        self.device_type() == DeviceType::SataController
     }
 
     /// Get the MMIO base address for the device (typically BAR0)
@@ -200,24 +173,18 @@ impl PciDevice {
 
     /// Check if this is a USB host controller
     pub fn is_usb_controller(&self) -> bool {
-        self.class_code == CLASS_SERIAL && self.subclass == 0x03
+        self.device_type() == DeviceType::UsbController
     }
 
     /// Check if this is an SDHCI (SD Host Controller Interface) device
     pub fn is_sdhci(&self) -> bool {
-        self.class_code == CLASS_SYSTEM && self.subclass == SUBCLASS_SDHCI
+        self.device_type() == DeviceType::SdHostController
     }
 }
 
 // ============================================================================
 // PCI Enumeration (using PciAccess trait)
 // ============================================================================
-
-/// Get vendor and device ID for a PCI address
-fn get_device_ids(access: &AnyPciAccess, addr: PciAddress) -> (u16, u16) {
-    let data = access.read32(addr, 0x00);
-    ((data & 0xFFFF) as u16, (data >> 16) as u16)
-}
 
 /// Probe a single BAR and return its type, address, and size
 fn probe_bar(access: &AnyPciAccess, addr: PciAddress, bar_index: usize) -> PciBar {
@@ -273,8 +240,9 @@ fn probe_bar(access: &AnyPciAccess, addr: PciAddress, bar_index: usize) -> PciBa
 
 /// Scan a single device/function and add to device list if valid
 fn scan_device(access: &AnyPciAccess, bus: u8, device: u8, function: u8) -> Option<PciDevice> {
-    let addr = PciAddress::new(bus, device, function);
-    let (vendor_id, device_id) = get_device_ids(access, addr);
+    let addr = PciAddress::new(0, bus, device, function);
+    let header = PciHeader::new(addr);
+    let (vendor_id, device_id) = header.id(access);
 
     if vendor_id == INVALID_VENDOR_ID {
         return None;
@@ -283,25 +251,17 @@ fn scan_device(access: &AnyPciAccess, bus: u8, device: u8, function: u8) -> Opti
     let mut dev = PciDevice::new(addr);
     dev.vendor_id = vendor_id;
     dev.device_id = device_id;
-
-    // Read class/subclass/prog_if/revision (offset 0x08)
-    let class_data = access.read32(addr, 0x08);
-    dev.revision = (class_data & 0xFF) as u8;
-    dev.prog_if = ((class_data >> 8) & 0xFF) as u8;
-    dev.subclass = ((class_data >> 16) & 0xFF) as u8;
-    dev.class_code = ((class_data >> 24) & 0xFF) as u8;
-
-    // Read header type (offset 0x0C, bits 16-23)
-    let header_data = access.read32(addr, 0x0C);
-    dev.header_type = ((header_data >> 16) & 0xFF) as u8;
+    (dev.revision, dev.class_code, dev.subclass, dev.prog_if) = header.revision_and_class(access);
+    dev.header_type = header.header_type(access);
+    dev.multi_function = header.has_multiple_functions(access);
 
     // Read interrupt info (offset 0x3C)
     let irq_data = access.read32(addr, 0x3C);
     dev.interrupt_line = (irq_data & 0xFF) as u8;
     dev.interrupt_pin = ((irq_data >> 8) & 0xFF) as u8;
 
-    // Only scan BARs for normal (type 0) headers
-    if (dev.header_type & 0x7F) == HEADER_TYPE_NORMAL {
+    // Only scan BARs for normal (type 0) headers.
+    if matches!(dev.header_type, HeaderType::Endpoint) {
         let mut bar_index = 0;
         while bar_index < 6 {
             let bar = probe_bar(access, addr, bar_index);
@@ -322,16 +282,19 @@ fn scan_device(access: &AnyPciAccess, bus: u8, device: u8, function: u8) -> Opti
 /// Enable bus mastering, memory space, and I/O space for a device
 pub fn enable_device(dev: &PciDevice) {
     with_access(|access| {
-        let cmd = access.read16(dev.address, 0x04);
-        // Set bit 0 (I/O space), bit 1 (memory space) and bit 2 (bus master)
-        let new_cmd = cmd | 0x07;
-        access.write16(dev.address, 0x04, new_cmd);
+        let mut header = PciHeader::new(dev.address);
+        let command = header.command(access);
+        let new_command = command
+            | CommandRegister::IO_ENABLE
+            | CommandRegister::MEMORY_ENABLE
+            | CommandRegister::BUS_MASTER_ENABLE;
+        header.update_command(access, |_| new_command);
 
         log::debug!(
             "Enabled device {}: cmd {:#06x} -> {:#06x}",
             dev.address,
-            cmd,
-            new_cmd
+            command.bits(),
+            new_command.bits()
         );
     });
 }
@@ -415,7 +378,7 @@ fn enumerate_devices(
         for device in 0..32u8 {
             // First check function 0
             if let Some(dev) = scan_device(access, bus, device, 0) {
-                let is_multi_function = (dev.header_type & HEADER_TYPE_MULTI_FUNCTION) != 0;
+                let is_multi_function = dev.multi_function;
 
                 log::debug!(
                     "PCI {}: {:04x}:{:04x} class={:02x}:{:02x}",
@@ -502,18 +465,19 @@ pub fn disable_all_bus_mastering_for_handoff() {
     let mut changed = 0usize;
     with_access(|access| {
         for dev in devices.iter() {
-            let cmd = access.read16(dev.address, 0x04);
-            if cmd & 0x0004 == 0 {
+            let mut header = PciHeader::new(dev.address);
+            let command = header.command(access);
+            if !command.contains(CommandRegister::BUS_MASTER_ENABLE) {
                 continue;
             }
-            let new_cmd = cmd & !0x0004;
-            access.write16(dev.address, 0x04, new_cmd);
+            let new_command = command - CommandRegister::BUS_MASTER_ENABLE;
+            header.update_command(access, |_| new_command);
             changed += 1;
             log::debug!(
                 "PCI {}: bus master disabled for OS handoff ({:#06x} -> {:#06x})",
                 dev.address,
-                cmd,
-                new_cmd
+                command.bits(),
+                new_command.bits()
             );
         }
     });
@@ -672,4 +636,62 @@ pub fn read_config_u8(addr: PciAddress, offset: u8) -> u8 {
 /// Write an 8-bit value to PCI configuration space
 pub fn write_config_u8(addr: PciAddress, offset: u8, value: u8) {
     with_access(|access| access.write8(addr, offset as u16, value))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[derive(Clone, Copy)]
+    struct TestConfig;
+
+    impl ConfigRegionAccess for TestConfig {
+        #[allow(unused_unsafe)]
+        unsafe fn read(&self, address: PciAddress, offset: u16) -> u32 {
+            unsafe {
+                assert_eq!(address, PciAddress::new(0x12, 0x34, 0x1a, 0x5));
+                match offset {
+                    0x00 => 0x5678_1234,
+                    0x04 => 0x0010_0007,
+                    0x08 => 0x0106_0802,
+                    0x0c => 0x0080_0000,
+                    _ => 0,
+                }
+            }
+        }
+
+        #[allow(unused_unsafe)]
+        unsafe fn write(&self, _address: PciAddress, _offset: u16, _value: u32) {
+            unsafe { panic!("header test must not write configuration space") }
+        }
+    }
+
+    #[test]
+    fn pci_types_address_and_header_parse_configuration() {
+        let address = PciAddress::new(0x12, 0x34, 0x1a, 0x5);
+        assert_eq!(address.segment(), 0x12);
+        assert_eq!(address.bus(), 0x34);
+        assert_eq!(address.device(), 0x1a);
+        assert_eq!(address.function(), 0x5);
+
+        let header = PciHeader::new(address);
+        assert_eq!(header.id(TestConfig), (0x1234, 0x5678));
+        assert_eq!(
+            header.revision_and_class(TestConfig),
+            (0x02, CLASS_STORAGE, SUBCLASS_NVME, 0x06)
+        );
+        assert_eq!(header.header_type(TestConfig), HeaderType::Endpoint);
+        assert_eq!(
+            DeviceType::from((CLASS_STORAGE, SUBCLASS_NVME)),
+            DeviceType::NvmeController
+        );
+        assert_eq!(UsbType::try_from(0x30), Ok(UsbType::Xhci));
+        assert!(header.has_multiple_functions(TestConfig));
+        assert!(header.status(TestConfig).has_capability_list());
+        assert!(
+            header
+                .command(TestConfig)
+                .contains(CommandRegister::BUS_MASTER_ENABLE)
+        );
+    }
 }
