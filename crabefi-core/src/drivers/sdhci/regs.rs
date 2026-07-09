@@ -448,8 +448,14 @@ pub const OCR_BUSY: u32 = 1 << 31;
 /// Card Capacity Status (HCS) - set for SDHC/SDXC
 pub const OCR_HCS: u32 = 1 << 30;
 
-/// Standard voltage range (2.7V - 3.6V)
-pub const OCR_VDD_RANGE: u32 = 0x00FF_8000;
+/// 1.65V - 1.95V voltage range.
+pub const OCR_VDD_1V8: u32 = 1 << 7;
+
+/// 2.9V - 3.1V voltage range.
+pub const OCR_VDD_3V0: u32 = (1 << 17) | (1 << 18);
+
+/// 3.2V - 3.4V voltage range.
+pub const OCR_VDD_3V3: u32 = (1 << 20) | (1 << 21);
 
 // ============================================================================
 // Response Types

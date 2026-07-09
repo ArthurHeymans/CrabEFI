@@ -123,6 +123,8 @@ pub struct SdhciController {
     capabilities: u32,
     /// Capabilities 1 register value (cached)
     capabilities_1: u32,
+    /// OCR voltage mask matching the selected bus voltage.
+    ocr_voltage: u32,
     /// Card is present
     card_present: bool,
     /// Card is initialized
@@ -198,6 +200,7 @@ impl SdhciController {
             max_clock: 0,
             capabilities: 0,
             capabilities_1: 0,
+            ocr_voltage: 0,
             card_present: false,
             card_initialized: false,
             rca: 0,
@@ -267,8 +270,8 @@ impl SdhciController {
         // Reset the controller
         self.reset_all()?;
 
-        // Set power to 3.3V
-        self.set_power_3v3()?;
+        // Select a bus voltage supported by the controller.
+        self.set_power()?;
 
         // Enable interrupts
         {
@@ -351,23 +354,31 @@ impl SdhciController {
         Ok(())
     }
 
-    /// Set bus power to 3.3V
-    fn set_power_3v3(&mut self) -> Result<(), SdhciError> {
+    /// Set bus power to a voltage supported by the controller.
+    fn set_power(&mut self) -> Result<(), SdhciError> {
+        let (voltage, ocr_voltage) = {
+            let regs = self.regs();
+            if regs.capabilities.is_set(CAPABILITIES::SUPPORT_3V3) {
+                (POWER_CONTROL::BUS_VOLTAGE::V3_3, OCR_VDD_3V3)
+            } else if regs.capabilities.is_set(CAPABILITIES::SUPPORT_3V0) {
+                (POWER_CONTROL::BUS_VOLTAGE::V3_0, OCR_VDD_3V0)
+            } else if regs.capabilities.is_set(CAPABILITIES::SUPPORT_1V8) {
+                (POWER_CONTROL::BUS_VOLTAGE::V1_8, OCR_VDD_1V8)
+            } else {
+                log::error!("SDHCI: controller advertises no supported bus voltage");
+                return Err(SdhciError::NotSupported);
+            }
+        };
+        self.ocr_voltage = ocr_voltage;
+
         let regs = self.regs();
-
-        // Turn off power first
         regs.power_control.set(0);
-
-        // Small delay
         for _ in 0..1000 {
             core::hint::spin_loop();
         }
-
-        // Turn on power with 3.3V
         regs.power_control
-            .write(POWER_CONTROL::BUS_POWER::SET + POWER_CONTROL::BUS_VOLTAGE::V3_3);
+            .write(POWER_CONTROL::BUS_POWER::SET + voltage);
 
-        // Wait for power to stabilize
         let timeout = Timeout::from_ms(50);
         while !timeout.is_expired() {
             core::hint::spin_loop();
@@ -677,9 +688,9 @@ impl SdhciController {
         // Try up to 1 second for card to become ready
         log::debug!("SDHCI: Starting ACMD41 loop");
         let ocr_arg = if sd_v2 {
-            OCR_HCS | OCR_VDD_RANGE
+            OCR_HCS | self.ocr_voltage
         } else {
-            OCR_VDD_RANGE
+            self.ocr_voltage
         };
 
         let timeout = Timeout::from_ms(1000);
@@ -806,7 +817,7 @@ impl SdhciController {
         log::debug!("SDHCI: eMMC CMD1 (SEND_OP_COND)");
         let timeout = Timeout::from_ms(1000);
         let mut ocr = 0u32;
-        let ocr_arg = OCR_HCS | OCR_VDD_RANGE;
+        let ocr_arg = OCR_HCS | self.ocr_voltage;
         while !timeout.is_expired() {
             if let Ok(resp) = self.send_command(MMC_CMD_SEND_OP_COND, ocr_arg, MMC_RSP_R3) {
                 ocr = resp[0];
@@ -855,18 +866,34 @@ impl SdhciController {
         log::debug!("SDHCI: eMMC CMD16 (SET_BLOCKLEN)");
         self.send_command(MMC_CMD_SET_BLOCKLEN, SD_BLOCK_SIZE, MMC_RSP_R1)?;
 
-        if self.read_data_command(MMC_CMD_SEND_EXT_CSD, 0, 512).is_ok() {
-            let ext_csd = unsafe { core::slice::from_raw_parts(self.dma_buffer, 512) };
-            let sec_count = u32::from_le_bytes([
-                ext_csd[EXT_CSD_SEC_COUNT],
-                ext_csd[EXT_CSD_SEC_COUNT + 1],
-                ext_csd[EXT_CSD_SEC_COUNT + 2],
-                ext_csd[EXT_CSD_SEC_COUNT + 3],
-            ]);
-            if sec_count != 0 {
-                self.num_blocks = sec_count as u64;
-                self.high_capacity = true;
+        match self.read_data_command(MMC_CMD_SEND_EXT_CSD, 0, 512) {
+            Ok(()) => {
+                fence(Ordering::SeqCst);
+                let ext_csd = unsafe { core::slice::from_raw_parts(self.dma_buffer, 512) };
+                let sec_count = u32::from_le_bytes([
+                    ext_csd[EXT_CSD_SEC_COUNT],
+                    ext_csd[EXT_CSD_SEC_COUNT + 1],
+                    ext_csd[EXT_CSD_SEC_COUNT + 2],
+                    ext_csd[EXT_CSD_SEC_COUNT + 3],
+                ]);
+                if sec_count != 0 {
+                    self.num_blocks = sec_count as u64;
+                    self.high_capacity = true;
+                } else if self.high_capacity {
+                    log::error!("SDHCI: high-capacity eMMC reported zero EXT_CSD sector count");
+                    return Err(SdhciError::CardInitFailed);
+                }
             }
+            Err(e) if self.high_capacity => {
+                log::error!("SDHCI: failed to read high-capacity eMMC EXT_CSD: {:?}", e);
+                return Err(e);
+            }
+            Err(e) => log::warn!("SDHCI: failed to read legacy eMMC EXT_CSD: {:?}", e),
+        }
+
+        if self.num_blocks == 0 {
+            log::error!("SDHCI: eMMC capacity is zero");
+            return Err(SdhciError::CardInitFailed);
         }
 
         self.set_clock(DEFAULT_CLOCK_HZ)?;

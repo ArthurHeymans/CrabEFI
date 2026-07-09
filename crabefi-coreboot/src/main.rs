@@ -870,7 +870,9 @@ pub extern "C" fn rust_main(coreboot_table_ptr: u64) -> ! {
         let acpi_info = unsafe { acpi::discover_platform(rsdp) };
         crabefi::state::with_drivers_mut(|d| d.acpi_info = acpi_info);
 
-        for hid in ["AMDI0040", "PNP0D40"] {
+        // PNP0D40 is generic SDHCI; only known AMD eMMC HIDs use this path.
+        #[cfg(target_arch = "x86_64")]
+        for hid in ["AMDI0040", "AMDI0041"] {
             let Some(dev) = acpi_info.find_device(hid) else {
                 continue;
             };

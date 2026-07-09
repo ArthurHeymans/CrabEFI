@@ -10,13 +10,13 @@ fn main() {
     if target.starts_with("x86_64") {
         let ld = manifest_path.join("x86_64-coreboot.ld");
         println!("cargo:rerun-if-changed={}", ld.display());
-        println!("cargo:rustc-link-arg=-T{}", ld.display());
-        println!("cargo:rustc-link-arg=-no-pie");
 
-        // Allow AMD boards to move CrabEFI away from coreboot's early DRAM windows.
+        // Define the symbol before the linker script evaluates its PROVIDE fallback.
         println!("cargo:rerun-if-env-changed=PAYLOAD_BASE");
         let payload_base = std::env::var("PAYLOAD_BASE").unwrap_or_else(|_| "0x100000".to_string());
         println!("cargo:rustc-link-arg=--defsym=__payload_base={payload_base}");
+        println!("cargo:rustc-link-arg=-T{}", ld.display());
+        println!("cargo:rustc-link-arg=-no-pie");
     } else if target.starts_with("aarch64") {
         let ld = manifest_path.join("aarch64-coreboot.ld");
         println!("cargo:rerun-if-changed={}", ld.display());
