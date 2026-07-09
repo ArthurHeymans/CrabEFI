@@ -110,6 +110,12 @@ fn platform_tpm_error_to_tcg(error: TpmError) -> TcgError {
     }
 }
 
+fn checked_slice_len(len: u64) -> Option<usize> {
+    usize::try_from(len)
+        .ok()
+        .filter(|len| *len <= isize::MAX as usize)
+}
+
 /// Internal state for the TCG2 protocol.
 struct Tcg2State {
     /// Software PCR banks (SHA-256 + optional SHA-1).
@@ -195,20 +201,18 @@ pub unsafe fn init_state_with_hardware(
     }
 
     if let Some(unsupported) = unsupported_active_algorithm(tpm.active_algorithms()) {
-        log::warn!(
-            "Hardware TPM active PCR bank {:#06x} is not supported by CrabEFI measured boot; using supported SHA subset",
+        log::error!(
+            "Hardware TPM active PCR bank {:#06x} is not supported by CrabEFI measured boot",
             unsupported
         );
+        return Err(TcgError::UnsupportedAlgorithm);
     }
 
-    // If a previous firmware phase supplied a valid TCG2 log, continue using
-    // the log's SpecID algorithm set. coreboot commonly logs only its single
-    // TPM_MEASURE_ALGO even when the TPM exposes additional active banks; adding
-    // extra algorithms here would make the event log unverifiable for the
-    // pre-CrabEFI PCR history.
+    // Continue a previous firmware log only when its SpecID algorithm set
+    // exactly matches the TPM's active banks. Otherwise no event log can replay
+    // every active PCR consistently, so hardware-backed measured boot is rejected.
     let (alg_count, algorithms, existing_log) =
-        hardware_log_selection(existing_log, tpm.active_algorithms());
-    warn_unselected_active_pcr_banks(tpm.active_algorithms(), &algorithms[..alg_count]);
+        hardware_log_selection(existing_log, tpm.active_algorithms())?;
     let algorithms = &algorithms[..alg_count];
 
     let event_log = if let Some(existing) = existing_log {
@@ -239,25 +243,28 @@ pub fn init_state_with_platform_tpm(
     _enable_sha1: bool,
 ) -> Result<(), TcgError> {
     let active_banks = tpm.active_pcr_banks();
+    if active_banks.is_truncated() {
+        log::error!("Platform TPM active PCR bank list exceeds CrabEFI capacity");
+        return Err(TcgError::UnsupportedAlgorithm);
+    }
     if supported_algorithm_count(active_banks.algorithms()) == 0 {
         log::error!("Platform TPM does not expose a supported active PCR bank");
         return Err(TcgError::UnsupportedAlgorithm);
     }
     if let Some(unsupported) = unsupported_active_algorithm(active_banks.algorithms()) {
-        log::warn!(
-            "Platform TPM active PCR bank {:#06x} is not supported by CrabEFI measured boot; using supported SHA subset",
+        log::error!(
+            "Platform TPM active PCR bank {:#06x} is not supported by CrabEFI measured boot",
             unsupported
         );
+        return Err(TcgError::UnsupportedAlgorithm);
     }
 
     let backend = Tpm2Backend::Driver(tpm);
 
-    // If a previous firmware phase supplied a valid TCG2 log, continue using
-    // the log's SpecID algorithm set. Platform TPMs can expose additional active
-    // banks that were not measured by the earlier firmware phase.
+    // Continue a previous firmware log only when its SpecID algorithm set
+    // exactly matches the platform TPM's active banks.
     let (alg_count, algorithms, existing_log) =
-        hardware_log_selection(existing_log, active_banks.algorithms());
-    warn_unselected_active_pcr_banks(active_banks.algorithms(), &algorithms[..alg_count]);
+        hardware_log_selection(existing_log, active_banks.algorithms())?;
     let algorithms = &algorithms[..alg_count];
 
     let event_log = if let Some(existing) = existing_log {
@@ -279,11 +286,6 @@ pub fn init_state_with_platform_tpm(
     log::info!("TCG2 state initialized with platform TPM");
     Ok(())
 }
-
-const SUPPORTED_HASH_ALGORITHM_BITMAP: u32 = EFI_TCG2_BOOT_HASH_ALG_SHA1
-    | EFI_TCG2_BOOT_HASH_ALG_SHA256
-    | EFI_TCG2_BOOT_HASH_ALG_SHA384
-    | EFI_TCG2_BOOT_HASH_ALG_SHA512;
 
 fn algorithm_to_bitmap(algorithm: u16) -> u32 {
     match algorithm {
@@ -309,29 +311,6 @@ fn is_supported_hash_algorithm(algorithm: u16) -> bool {
     )
 }
 
-fn hash_algorithm_name(algorithm: u16) -> &'static str {
-    match algorithm {
-        TPM_ALG_SHA1 => "SHA-1",
-        TPM_ALG_SHA256 => "SHA-256",
-        TPM_ALG_SHA384 => "SHA-384",
-        TPM_ALG_SHA512 => "SHA-512",
-        _ => "unknown",
-    }
-}
-
-fn warn_unselected_active_pcr_banks(active_algorithms: &[u16], selected_algorithms: &[u16]) {
-    for &algorithm in active_algorithms {
-        if is_supported_hash_algorithm(algorithm) && !selected_algorithms.contains(&algorithm) {
-            // TCG PFP's proper long-term fix is capping unused active banks.
-            log::warn!(
-                "TPM active PCR bank {} ({:#06x}) will NOT be extended by CrabEFI; its PCRs will not correspond to the event log and are unverifiable for attestation",
-                hash_algorithm_name(algorithm),
-                algorithm
-            );
-        }
-    }
-}
-
 fn supported_algorithm_count(algorithms: &[u16]) -> usize {
     algorithms
         .iter()
@@ -354,6 +333,8 @@ fn supported_algorithm_array(algorithms: &[u16]) -> (usize, [u16; 5]) {
     }
     (count, out)
 }
+
+type HardwareLogSelection<'a> = (usize, [u16; 5], Option<&'a [u8]>);
 
 fn software_log_selection(
     existing_log: Option<&[u8]>,
@@ -394,43 +375,43 @@ fn software_log_selection(
 fn hardware_log_selection<'a>(
     existing_log: Option<&'a [u8]>,
     tpm_algorithms: &[u16],
-) -> (usize, [u16; 5], Option<&'a [u8]>) {
+) -> Result<HardwareLogSelection<'a>, TcgError> {
     let tpm_supported = supported_algorithm_array(tpm_algorithms);
     let Some(existing) = existing_log else {
-        return (tpm_supported.0, tpm_supported.1, None);
+        return Ok((tpm_supported.0, tpm_supported.1, None));
     };
 
     let Some((count, existing_algorithms)) = parse_spec_id_algorithms(existing) else {
-        log::warn!("Ignoring existing TCG2 log without a valid SpecID event");
-        return (tpm_supported.0, tpm_supported.1, None);
+        log::error!("Existing TCG2 log does not contain a valid SpecID event");
+        return Err(TcgError::InternalError);
     };
     let existing_algorithms = &existing_algorithms[..count];
 
     if let Some(unsupported) = unsupported_active_algorithm(existing_algorithms) {
-        log::warn!(
-            "Ignoring existing TCG2 log with unsupported SpecID algorithm {:#06x}",
+        log::error!(
+            "Existing TCG2 log contains unsupported SpecID algorithm {:#06x}",
             unsupported
         );
-        return (tpm_supported.0, tpm_supported.1, None);
-    }
-    if !existing_algorithms
-        .iter()
-        .all(|algorithm| tpm_algorithms.contains(algorithm))
-    {
-        log::warn!(
-            "Ignoring existing TCG2 log with SpecID algorithms {:?}; TPM banks are {:?}",
-            existing_algorithms,
-            tpm_algorithms
-        );
-        return (tpm_supported.0, tpm_supported.1, None);
+        return Err(TcgError::UnsupportedAlgorithm);
     }
 
     let selected = supported_algorithm_array(existing_algorithms);
-    if selected.0 == 0 {
-        return (tpm_supported.0, tpm_supported.1, None);
+    let active = &tpm_supported.1[..tpm_supported.0];
+    let selected_slice = &selected.1[..selected.0];
+    if selected.0 != tpm_supported.0
+        || !selected_slice
+            .iter()
+            .all(|algorithm| active.contains(algorithm))
+    {
+        log::error!(
+            "Existing TCG2 log algorithms {:?} do not match active TPM banks {:?}",
+            existing_algorithms,
+            tpm_algorithms
+        );
+        return Err(TcgError::UnsupportedAlgorithm);
     }
 
-    (selected.0, selected.1, Some(existing))
+    Ok((selected.0, selected.1, Some(existing)))
 }
 
 fn unsupported_active_algorithm(algorithms: &[u16]) -> Option<u16> {
@@ -632,24 +613,16 @@ extern "efiapi" fn tcg2_get_capability(
     let (hash_bitmap, active_bitmap, num_banks) = if !tpm_present {
         (0, 0, 0)
     } else {
-        (
-            SUPPORTED_HASH_ALGORITHM_BITMAP,
-            state.active_hash_bitmap(),
-            state.pcr_banks.algorithm_array().0 as u32,
-        )
+        let active = state.active_hash_bitmap();
+        (active, active, state.pcr_banks.algorithm_array().0 as u32)
     };
 
     // SAFETY: we checked null above, and the caller owns the buffer.
     unsafe {
         let caller_size = (*protocol_capability).size;
         let full_size = core::mem::size_of::<Tcg2BootServiceCapability>() as u8;
-
-        // The caller passes the size of their buffer in .size.
-        // We must not write beyond that.
-        if caller_size < full_size {
-            (*protocol_capability).size = full_size;
-            return Status::BUFFER_TOO_SMALL;
-        }
+        let version_1_0_size =
+            core::mem::offset_of!(Tcg2BootServiceCapability, number_of_pcr_banks) as u8;
 
         // Use hardware TPM info when available.
         let (manufacturer_id, max_cmd, max_resp) = match &state.hardware_tpm {
@@ -661,7 +634,7 @@ extern "efiapi" fn tcg2_get_capability(
             None => (0, 0, 0),
         };
 
-        *protocol_capability = Tcg2BootServiceCapability {
+        let capability = Tcg2BootServiceCapability {
             size: full_size,
             structure_version: Tcg2Version { major: 1, minor: 1 },
             protocol_version: Tcg2Version { major: 1, minor: 1 },
@@ -674,6 +647,27 @@ extern "efiapi" fn tcg2_get_capability(
             number_of_pcr_banks: num_banks,
             active_pcr_banks: active_bitmap,
         };
+
+        // The caller passes the size of their buffer in .size.
+        // We must not write beyond that.
+        if caller_size < full_size {
+            if caller_size >= version_1_0_size {
+                let mut compatible = capability.clone();
+                compatible.size = version_1_0_size;
+                compatible.structure_version = Tcg2Version { major: 1, minor: 0 };
+                compatible.protocol_version = Tcg2Version { major: 1, minor: 0 };
+                core::ptr::copy_nonoverlapping(
+                    &compatible as *const Tcg2BootServiceCapability as *const u8,
+                    protocol_capability as *mut u8,
+                    version_1_0_size as usize,
+                );
+                return Status::SUCCESS;
+            }
+            (*protocol_capability).size = full_size;
+            return Status::BUFFER_TOO_SMALL;
+        }
+
+        *protocol_capability = capability;
     }
 
     log::debug!("  -> SUCCESS ({} bank(s))", num_banks);
@@ -777,7 +771,10 @@ extern "efiapi" fn tcg2_hash_log_extend_event(
         flags,
     );
 
-    if event_type != EV_NO_ACTION && pcr_index as usize >= PCR_COUNT {
+    // EDK2 treats EV_NO_ACTION indices above the PCR range as TPM NV indices.
+    // CrabEFI does not implement that optional path, so reject them rather than
+    // logging a zero-digest event that was never extended anywhere.
+    if pcr_index as usize >= PCR_COUNT {
         return Status::INVALID_PARAMETER;
     }
 
@@ -861,10 +858,14 @@ extern "efiapi" fn tcg2_hash_log_extend_event(
         return Status::DEVICE_ERROR;
     }
 
+    let Some(data_to_hash_len) = checked_slice_len(data_to_hash_len) else {
+        return Status::INVALID_PARAMETER;
+    };
+
     // Hash the data to be measured.
     let data_slice = if data_to_hash_len > 0 {
         // SAFETY: caller guarantees the physical address range is valid.
-        unsafe { core::slice::from_raw_parts(data_to_hash as *const u8, data_to_hash_len as usize) }
+        unsafe { core::slice::from_raw_parts(data_to_hash as *const u8, data_to_hash_len) }
     } else {
         &[]
     };
@@ -912,7 +913,7 @@ extern "efiapi" fn tcg2_hash_log_extend_event(
 /// `EFI_TCG2_PROTOCOL.SubmitCommand`
 ///
 /// Forwards raw TPM commands to hardware TPM if available.
-/// Returns UNSUPPORTED when no physical TPM backend is available.
+/// Returns DEVICE_ERROR when no physical TPM backend is available.
 extern "efiapi" fn tcg2_submit_command(
     this: *mut Tcg2ProtocolFfi,
     input_parameter_block_size: u32,
@@ -941,13 +942,17 @@ extern "efiapi" fn tcg2_submit_command(
     let tpm = match state.hardware_tpm.as_mut() {
         Some(t) => t,
         None => {
-            log::debug!("TCG2.SubmitCommand() -> UNSUPPORTED (no physical TPM)");
-            return Status::UNSUPPORTED;
+            log::debug!("TCG2.SubmitCommand() -> DEVICE_ERROR (no physical TPM)");
+            return Status::DEVICE_ERROR;
         }
     };
 
     let max_command_size = tpm.max_command_size();
     if max_command_size != 0 && input_parameter_block_size > max_command_size as u32 {
+        return Status::INVALID_PARAMETER;
+    }
+    let max_response_size = tpm.max_response_size();
+    if max_response_size != 0 && output_parameter_block_size > max_response_size as u32 {
         return Status::INVALID_PARAMETER;
     }
     let input = unsafe {

@@ -537,24 +537,18 @@ fn load_and_execute_bootloader(
 
     // TCG measured boot: hash the PE image and log an EFI_IMAGE_LOAD_EVENT.
     let loaded_image_dp = loaded_image_dp as *const r_efi::protocols::device_path::Protocol;
-    if !loaded_image_dp.is_null()
-        // Safety: `loaded_image_dp` was checked for null and points to a firmware-created
-        // device path whose size is read before passing it to the shared serializer.
-        && unsafe { device_path::device_path_size(loaded_image_dp) } != 0
-    {
-        let event_data = boot_services::serialize_tcg_image_load_event(
-            &loaded_image,
-            image_link_time_address,
-            loaded_image_dp,
-        );
-        if let Err(e) = efi::tcg::measured_boot::measure_pe_image_all(
-            4,
-            efi::tcg::types::EV_EFI_BOOT_SERVICES_APPLICATION,
-            &buffer[..bytes_read],
-            &event_data,
-        ) {
-            log::warn!("Failed to measure bootloader PE image: {:?}", e);
-        }
+    let event_data = boot_services::serialize_tcg_image_load_event(
+        &loaded_image,
+        image_link_time_address,
+        loaded_image_dp,
+    );
+    if let Err(e) = efi::tcg::measured_boot::measure_pe_image_all(
+        4,
+        efi::tcg::types::EV_EFI_BOOT_SERVICES_APPLICATION,
+        &buffer[..bytes_read],
+        &event_data,
+    ) {
+        log::warn!("Failed to measure bootloader PE image: {:?}", e);
     }
 
     // Free the raw file buffer

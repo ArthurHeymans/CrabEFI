@@ -17,6 +17,7 @@ const MIN_BLOCK_SIZE: usize = 512;
 /// malicious on-disk headers. 4096 entries is already much larger than normal
 /// firmware use and caps raw entry data to 512 KiB for 128-byte entries.
 const MAX_GPT_PARTITION_ENTRIES: usize = 4096;
+const MAX_GPT_ENTRY_ARRAY_BYTES: usize = 512 * 1024;
 
 /// GPT header signature "EFI PART"
 const GPT_SIGNATURE: u64 = 0x5452415020494645;
@@ -99,6 +100,9 @@ fn gpt_entry_array_bounds(
     let total_bytes_needed = total_entries
         .checked_mul(entry_size)
         .ok_or(GptError::InvalidHeader)?;
+    if total_bytes_needed > MAX_GPT_ENTRY_ARRAY_BYTES {
+        return Err(GptError::InvalidHeader);
+    }
     let entries_end = entries_byte_offset
         .checked_add(total_bytes_needed)
         .ok_or(GptError::InvalidHeader)?;
@@ -371,8 +375,7 @@ pub fn build_gpt_measurement_event(
 
     let mut raw_entries: Vec<u8> = Vec::new();
     let mut buffer = [0u8; MAX_BLOCK_SIZE];
-    let mut entry_buf: Vec<u8> = Vec::new();
-    entry_buf.resize(entry_size, 0);
+    let mut entry_buf = alloc::vec![0; entry_size];
 
     for entry_index in 0..total_entries {
         let entry_offset = entries_byte_offset

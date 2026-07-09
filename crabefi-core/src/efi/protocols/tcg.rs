@@ -87,6 +87,12 @@ fn make_sha1_digest(data: &[u8]) -> ([u8; SHA1_DIGEST_SIZE], TaggedDigest) {
     (sha1_array, digest)
 }
 
+fn checked_slice_len(len: u64) -> Option<usize> {
+    usize::try_from(len)
+        .ok()
+        .filter(|len| *len <= isize::MAX as usize)
+}
+
 fn extend_and_log(
     state: &mut TcgState,
     pcr_index: u32,
@@ -205,7 +211,7 @@ pub fn measure_pe_image_event(
 extern "efiapi" fn tcg_status_check(
     _this: *mut TcgProtocolFfi,
     protocol_capability: *mut TcgBootServiceCapability,
-    _feature_flags: *mut u32,
+    feature_flags: *mut u32,
     event_log_location: *mut u64,
     event_log_last_entry: *mut u64,
 ) -> Status {
@@ -241,6 +247,12 @@ extern "efiapi" fn tcg_status_check(
         }
     }
 
+    if !feature_flags.is_null() {
+        unsafe {
+            *feature_flags = 0;
+        }
+    }
+
     let log_data = state.event_log.log_data();
 
     if !event_log_location.is_null() {
@@ -251,9 +263,13 @@ extern "efiapi" fn tcg_status_check(
 
     if !event_log_last_entry.is_null() {
         unsafe {
-            *event_log_last_entry = match state.event_log.last_entry_offset() {
-                Some(off) => log_data.as_ptr() as u64 + off as u64,
-                None => 0,
+            *event_log_last_entry = if state.tpm_present {
+                state
+                    .event_log
+                    .last_entry_offset()
+                    .map_or(0, |off| log_data.as_ptr() as u64 + off as u64)
+            } else {
+                0
             };
         }
     }
@@ -284,8 +300,15 @@ extern "efiapi" fn tcg_hash_all(
     if algorithm_id != TPM_ALG_SHA1 as u32 {
         return Status::UNSUPPORTED;
     }
+    let Some(hash_data_len) = checked_slice_len(hash_data_len) else {
+        return Status::INVALID_PARAMETER;
+    };
 
     let result_buf = unsafe {
+        if *hashed_data_len != 0 && *hashed_data_len < SHA1_DIGEST_SIZE as u64 {
+            *hashed_data_len = SHA1_DIGEST_SIZE as u64;
+            return Status::BUFFER_TOO_SMALL;
+        }
         if (*hashed_data_result).is_null() {
             match crate::efi::allocator::allocate_pool(
                 crate::efi::allocator::MemoryType::BootServicesData,
@@ -311,7 +334,7 @@ extern "efiapi" fn tcg_hash_all(
     let data = if hash_data_len == 0 {
         &[]
     } else {
-        unsafe { core::slice::from_raw_parts(hash_data, hash_data_len as usize) }
+        unsafe { core::slice::from_raw_parts(hash_data, hash_data_len) }
     };
     let hash = Sha1::digest(data);
 
@@ -368,6 +391,10 @@ extern "efiapi" fn tcg_log_event(
         None => return Status::DEVICE_ERROR,
     };
 
+    if !state.tpm_present {
+        return Status::DEVICE_ERROR;
+    }
+
     if let Err(e) = state
         .event_log
         .log_event(pcr_index, event_type, &[digest], event_data)
@@ -403,14 +430,28 @@ extern "efiapi" fn tcg_hash_log_extend_event(
     algorithm_id: u32,
     event: *mut c_void,
     _event_number: *mut u32,
-    _event_log_last_entry: *mut u64,
+    event_log_last_entry: *mut u64,
 ) -> Status {
-    if event.is_null() {
+    if event.is_null() || event_log_last_entry.is_null() {
         return Status::INVALID_PARAMETER;
     }
+
+    let mut state = TCG_STATE.lock();
+    let state = match state.as_mut() {
+        Some(s) => s,
+        None => return Status::DEVICE_ERROR,
+    };
+    if !state.tpm_present {
+        log::debug!("TCG.HashLogExtendEvent() -> DEVICE_ERROR (no physical TPM 1.2)");
+        return Status::DEVICE_ERROR;
+    }
+
     if algorithm_id != TPM_ALG_SHA1 as u32 {
         return Status::UNSUPPORTED;
     }
+    let Some(hash_data_len) = checked_slice_len(hash_data_len) else {
+        return Status::INVALID_PARAMETER;
+    };
 
     // Parse the legacy event header.
     let hdr = unsafe { &*(event as *const TcgPcrEventHdr) };
@@ -439,46 +480,43 @@ extern "efiapi" fn tcg_hash_log_extend_event(
     };
 
     // Hash the data with SHA-1.
+    if hash_data == 0 && hash_data_len > 0 {
+        return Status::INVALID_PARAMETER;
+    }
     let data_slice = if hash_data_len > 0 {
-        if hash_data == 0 {
-            return Status::INVALID_PARAMETER;
-        }
-        unsafe { core::slice::from_raw_parts(hash_data as *const u8, hash_data_len as usize) }
+        unsafe { core::slice::from_raw_parts(hash_data as *const u8, hash_data_len) }
     } else {
         &[]
     };
 
     let sha1_hash = Sha1::digest(data_slice);
+    let mut sha1_digest = [0u8; SHA1_DIGEST_SIZE];
+    sha1_digest.copy_from_slice(&sha1_hash);
     let mut digest = TaggedDigest::zeroed(TPM_ALG_SHA1);
-    digest.digest[..SHA1_DIGEST_SIZE].copy_from_slice(&sha1_hash);
+    digest.digest[..SHA1_DIGEST_SIZE].copy_from_slice(&sha1_digest);
 
-    let mut state = TCG_STATE.lock();
-    let state = match state.as_mut() {
-        Some(s) => s,
-        None => return Status::DEVICE_ERROR,
-    };
-
-    if !state.tpm_present {
-        log::debug!("TCG.HashLogExtendEvent() -> DEVICE_ERROR (no physical TPM 1.2)");
-        return Status::DEVICE_ERROR;
-    }
-
-    // Extend PCR.
-    if let Err(e) = state.pcr_bank.extend(pcr_index as usize, &sha1_hash) {
-        log::error!("PCR extend failed: {:?}", e);
-        return Status::DEVICE_ERROR;
-    }
-
-    // Log the event.
-    if let Err(e) = state
-        .event_log
-        .log_event(pcr_index, event_type, &[digest], event_data)
-    {
-        log::error!("Event log append failed: {:?}", e);
+    if let Err(e) = extend_and_log(
+        state,
+        pcr_index,
+        event_type,
+        &sha1_digest,
+        digest,
+        event_data,
+    ) {
+        log::error!("TCG.HashLogExtendEvent failed: {:?}", e);
         return match e {
-            TcgError::LogFull => Status::VOLUME_FULL,
+            TcgError::InvalidPcrIndex => Status::INVALID_PARAMETER,
+            TcgError::LogFull => Status::OUT_OF_RESOURCES,
             _ => Status::DEVICE_ERROR,
         };
+    }
+
+    let log_data = state.event_log.log_data();
+    let Some(last_entry) = state.event_log.last_entry_offset() else {
+        return Status::DEVICE_ERROR;
+    };
+    unsafe {
+        *event_log_last_entry = log_data.as_ptr() as u64 + last_entry as u64;
     }
 
     log::debug!("  -> SUCCESS");
