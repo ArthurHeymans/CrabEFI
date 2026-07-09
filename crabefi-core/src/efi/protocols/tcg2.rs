@@ -165,7 +165,7 @@ pub fn init_state(
         CryptoAgileEventLog::new(buffer, algorithms)?
     };
 
-    let pcr_banks = PcrBanks::from_algorithms(algorithms);
+    let pcr_banks = PcrBanks::from_algorithms(algorithms)?;
 
     let state = Tcg2State {
         pcr_banks,
@@ -221,7 +221,7 @@ pub unsafe fn init_state_with_hardware(
         CryptoAgileEventLog::new(buffer, algorithms)?
     };
 
-    let pcr_banks = PcrBanks::from_algorithms(algorithms);
+    let pcr_banks = PcrBanks::from_algorithms(algorithms)?;
 
     let state = Tcg2State {
         pcr_banks,
@@ -273,7 +273,7 @@ pub fn init_state_with_platform_tpm(
         CryptoAgileEventLog::new(buffer, algorithms)?
     };
 
-    let pcr_banks = PcrBanks::from_algorithms(algorithms);
+    let pcr_banks = PcrBanks::from_algorithms(algorithms)?;
 
     let state = Tcg2State {
         pcr_banks,

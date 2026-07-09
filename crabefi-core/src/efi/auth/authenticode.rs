@@ -261,82 +261,10 @@ fn authenticode_regions(pe_data: &[u8], info: &PeInfo) -> Result<Vec<(usize, usi
 /// The SHA-256 hash of the image (excluding Authenticode-specific regions)
 pub fn compute_authenticode_hash(pe_data: &[u8]) -> Result<[u8; 32], AuthError> {
     let info = parse_pe_for_hash(pe_data)?;
-
-    let mut hasher = Sha256::new();
-
-    // Region 1: From start to checksum field (exclusive)
-    if info.checksum_offset > pe_data.len() {
-        return Err(AuthError::InvalidHeader);
-    }
-    hasher.update(&pe_data[..info.checksum_offset]);
-
-    // Skip checksum (4 bytes)
-    let after_checksum = info
-        .checksum_offset
-        .checked_add(4)
-        .ok_or(AuthError::InvalidHeader)?;
-
-    // Region 2: From after checksum to certificate table entry (exclusive)
-    if info.cert_table_entry_offset < after_checksum {
-        return Err(AuthError::InvalidHeader);
-    }
-    if info.cert_table_entry_offset > pe_data.len() {
-        // No certificate table entry - hash to end of data directories
-        hasher.update(&pe_data[after_checksum..]);
-    } else {
-        hasher.update(&pe_data[after_checksum..info.cert_table_entry_offset]);
-
-        // Skip certificate table entry (8 bytes)
-        let after_cert_entry = info
-            .cert_table_entry_offset
-            .checked_add(DATA_DIRECTORY_ENTRY_SIZE)
-            .ok_or(AuthError::InvalidHeader)?;
-
-        // Region 3: From after cert table entry to end of headers
-        if after_cert_entry <= info.size_of_headers && info.size_of_headers <= pe_data.len() {
-            hasher.update(&pe_data[after_cert_entry..info.size_of_headers]);
-        }
-    }
-
-    // Region 4: Hash each section in order of PointerToRawData.
-    // Per the Authenticode spec, only each section's raw data is hashed here
-    // (no inter-section gaps). SUM_OF_BYTES_HASHED tracks the total byte count
-    // for the extra-data calculation in the next step.
-    let mut sum_of_bytes_hashed = info.size_of_headers;
-
-    for section in &info.sections {
-        let section_start = section.file_offset as usize;
-        let section_end = section_start
-            .checked_add(section.size_of_raw_data as usize)
-            .ok_or(AuthError::InvalidHeader)?;
-
-        // Skip if section has no raw data
-        if section.size_of_raw_data == 0 {
-            continue;
-        }
-
-        // Hash the section data
-        if section_end <= pe_data.len() {
-            hasher.update(&pe_data[section_start..section_end]);
-            sum_of_bytes_hashed += section.size_of_raw_data as usize;
-        }
-    }
-
-    // Region 5: Hash any extra data between SUM_OF_BYTES_HASHED and the
-    // certificate table (or end of file). Per Authenticode spec step 14:
-    //   extra_start = SUM_OF_BYTES_HASHED (as file offset)
-    //   extra_end   = FILE_SIZE - Size_of_CertificateTable
-    let file_end = if info.cert_table_size > 0 {
-        pe_data.len().saturating_sub(info.cert_table_size as usize)
-    } else {
-        pe_data.len()
-    };
-
-    if sum_of_bytes_hashed < file_end && file_end <= pe_data.len() {
-        hasher.update(&pe_data[sum_of_bytes_hashed..file_end]);
-    }
-
-    Ok(hasher.finalize().into())
+    let digest = compute_authenticode_hash_inner(pe_data, &info, TPM_ALG_SHA256)?;
+    let mut sha256 = [0u8; SHA256_DIGEST_SIZE];
+    sha256.copy_from_slice(&digest[..SHA256_DIGEST_SIZE]);
+    Ok(sha256)
 }
 
 /// Parse PE file to extract information needed for hash calculation

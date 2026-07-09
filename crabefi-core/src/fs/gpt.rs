@@ -440,8 +440,6 @@ pub fn read_partitions(
     let info = device.info();
     let block_size = (info.block_size as usize).clamp(MIN_BLOCK_SIZE, MAX_BLOCK_SIZE);
 
-    let mut buffer = [0u8; MAX_BLOCK_SIZE];
-
     // For hybrid ISOs on large-block devices, the GPT's LBA values are in 512-byte terms.
     // We need to translate to actual device blocks.
     let is_hybrid = block_size > MIN_BLOCK_SIZE;
@@ -457,89 +455,87 @@ pub fn read_partitions(
         return Err(GptError::InvalidHeader);
     }
 
-    let (entries_byte_offset, _total_entries, total_bytes_needed) =
+    let (entries_byte_offset, total_entries, _total_bytes_needed) =
         gpt_entry_array_bounds(info, header, block_size, is_hybrid)?;
+    let mut block_buf = [0u8; MAX_BLOCK_SIZE];
+    let mut entry_buf = alloc::vec![0u8; entry_size];
 
-    let mut entry_index = 0u32;
-    let mut bytes_read = 0usize;
-
-    'outer: while bytes_read < total_bytes_needed {
-        // Calculate which device block to read
-        let current_byte_offset = entries_byte_offset
-            .checked_add(bytes_read)
+    'entries: for entry_index in 0..total_entries {
+        let entry_offset = entries_byte_offset
+            .checked_add(
+                entry_index
+                    .checked_mul(entry_size)
+                    .ok_or(GptError::InvalidHeader)?,
+            )
             .ok_or(GptError::InvalidHeader)?;
-        let lba = (current_byte_offset / block_size) as u64;
-        let offset_in_block = current_byte_offset % block_size;
 
-        // Try to read the block
-        if let Err(e) = device.read_block(lba, &mut buffer[..block_size]) {
-            if !partitions.is_empty() {
-                log::debug!(
-                    "Stopping partition scan at LBA {} (read error after finding {} partitions): {:?}",
-                    lba,
-                    partitions.len(),
-                    e
-                );
-                break;
+        // A GPT entry may straddle device blocks, or be larger than one block.
+        // Copy it into a contiguous buffer before parsing.
+        let mut copied = 0usize;
+        while copied < entry_size {
+            let current = entry_offset
+                .checked_add(copied)
+                .ok_or(GptError::InvalidHeader)?;
+            let lba = (current / block_size) as u64;
+            let offset_in_block = current % block_size;
+
+            if let Err(e) = device.read_block(lba, &mut block_buf[..block_size]) {
+                if !partitions.is_empty() {
+                    log::debug!(
+                        "Stopping partition scan at LBA {} (read error after finding {} partitions): {:?}",
+                        lba,
+                        partitions.len(),
+                        e
+                    );
+                    break 'entries;
+                }
+                return Err(e.into());
             }
-            return Err(e.into());
+
+            let chunk = (entry_size - copied).min(block_size - offset_in_block);
+            entry_buf[copied..copied + chunk]
+                .copy_from_slice(&block_buf[offset_in_block..offset_in_block + chunk]);
+            copied += chunk;
         }
 
-        // Process entries from this block
-        let mut pos = offset_in_block;
-        while pos + entry_size <= block_size && entry_index < header.num_partition_entries {
-            // Parse partition entry using zerocopy
-            let entry = match GptPartitionEntry::read_from_prefix(&buffer[pos..]) {
-                Ok((e, _)) => e,
-                Err(_) => break, // Malformed entry, stop processing
+        let entry = GptPartitionEntry::read_from_prefix(&entry_buf)
+            .map_err(|_| GptError::InvalidHeader)?
+            .0;
+
+        if !entry.is_empty() {
+            // For hybrid ISOs, translate GPT LBAs (512-byte terms) to device LBAs.
+            let (first_lba, last_lba) = if is_hybrid {
+                let first = entry.first_lba * MIN_BLOCK_SIZE as u64 / block_size as u64;
+                let last = entry.last_lba * MIN_BLOCK_SIZE as u64 / block_size as u64;
+                (first, last)
+            } else {
+                (entry.first_lba, entry.last_lba)
             };
 
-            if !entry.is_empty() {
-                // For hybrid ISOs, translate GPT LBAs (512-byte terms) to device LBAs
-                let (first_lba, last_lba) = if is_hybrid {
-                    // GPT LBA * 512 / block_size = device LBA
-                    // This works because hybrid ISO partitions are aligned to 2048 bytes
-                    let first = entry.first_lba * MIN_BLOCK_SIZE as u64 / block_size as u64;
-                    let last = entry.last_lba * MIN_BLOCK_SIZE as u64 / block_size as u64;
-                    (first, last)
-                } else {
-                    (entry.first_lba, entry.last_lba)
-                };
+            let partition = Partition {
+                type_guid: entry.type_guid,
+                partition_guid: entry.partition_guid,
+                first_lba,
+                last_lba,
+                attributes: entry.attributes,
+                is_esp: entry.is_esp(),
+                block_size: block_size as u32,
+            };
 
-                let partition = Partition {
-                    type_guid: entry.type_guid,
-                    partition_guid: entry.partition_guid,
-                    first_lba,
-                    last_lba,
-                    attributes: entry.attributes,
-                    is_esp: entry.is_esp(),
-                    block_size: block_size as u32,
-                };
+            log::debug!(
+                "Partition {}: LBA {}-{} ({} MB) ESP={}{}",
+                entry_index,
+                partition.first_lba,
+                partition.last_lba,
+                partition.size_bytes() / (1024 * 1024),
+                partition.is_esp,
+                if is_hybrid { " [hybrid]" } else { "" }
+            );
 
-                log::debug!(
-                    "Partition {}: LBA {}-{} ({} MB) ESP={}{}",
-                    entry_index,
-                    partition.first_lba,
-                    partition.last_lba,
-                    partition.size_bytes() / (1024 * 1024),
-                    partition.is_esp,
-                    if is_hybrid { " [hybrid]" } else { "" }
-                );
-
-                if partitions.push(partition).is_err() {
-                    log::warn!("Too many partitions, ignoring remaining");
-                    break 'outer;
-                }
+            if partitions.push(partition).is_err() {
+                log::warn!("Too many partitions, ignoring remaining");
+                break;
             }
-
-            pos += entry_size;
-            bytes_read += entry_size;
-            entry_index += 1;
-        }
-
-        // If we didn't process any entries, move to next block
-        if pos == offset_in_block {
-            bytes_read += block_size - offset_in_block;
         }
     }
 
