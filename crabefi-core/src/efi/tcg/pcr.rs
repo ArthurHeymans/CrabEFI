@@ -174,15 +174,21 @@ impl PcrBanks {
     /// Create PCR banks with SHA-256 only.
     pub fn sha256_only() -> Self {
         Self::from_algorithms(&[TPM_ALG_SHA256])
+            .expect("SHA-256 is always a supported PCR algorithm")
     }
 
     /// Create PCR banks with both SHA-1 and SHA-256.
     pub fn sha1_and_sha256() -> Self {
         Self::from_algorithms(&[TPM_ALG_SHA256, TPM_ALG_SHA1])
+            .expect("SHA-1 and SHA-256 are always supported PCR algorithms")
     }
 
     /// Create PCR banks for all supported algorithms in `algorithms`.
-    pub fn from_algorithms(algorithms: &[u16]) -> Self {
+    ///
+    /// An empty slice selects the default SHA-256 bank. A non-empty slice that
+    /// contains no supported algorithms is rejected rather than producing an
+    /// empty bank set that would silently skip measured-boot extensions.
+    pub fn from_algorithms(algorithms: &[u16]) -> Result<Self, TcgError> {
         let mut banks = [
             PcrBank::new(0, 0),
             PcrBank::new(0, 0),
@@ -209,7 +215,11 @@ impl PcrBanks {
             count = 1;
         }
 
-        Self { banks, count }
+        if count == 0 {
+            return Err(TcgError::UnsupportedAlgorithm);
+        }
+
+        Ok(Self { banks, count })
     }
 
     /// Return active software bank algorithms.
@@ -280,9 +290,8 @@ impl PcrBanks {
         self.bank(TPM_ALG_SHA1)
     }
 
-    /// Access the SHA-256 bank.
-    pub fn sha256(&self) -> &PcrBank {
+    /// Access the SHA-256 bank (if active).
+    pub fn sha256(&self) -> Option<&PcrBank> {
         self.bank(TPM_ALG_SHA256)
-            .expect("PcrBanks always includes SHA-256 fallback")
     }
 }
