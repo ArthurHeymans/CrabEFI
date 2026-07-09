@@ -65,6 +65,11 @@ jobs:
           components: rust-src, llvm-tools-preview
           targets: x86_64-unknown-none
 
+      - name: Verify configurable payload base
+        run: |
+          PAYLOAD_BASE=0x200000 cargo build -p crabefi-coreboot --release --target x86_64-unknown-none
+          test "$(readelf -h target/x86_64-unknown-none/release/crabefi | awk '/Entry point address/ { print $4 }')" = "0x200000"
+
       - name: Build release
         run: cargo build -p crabefi-coreboot --release --target x86_64-unknown-none
 

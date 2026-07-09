@@ -532,6 +532,20 @@ impl XhciController {
         unsafe { *(device as *const SlotContext) }
     }
 
+    #[inline]
+    fn device_ep_context(
+        device: *mut DeviceContext,
+        context_size: u8,
+        ep_index: usize,
+    ) -> EndpointContext {
+        // SAFETY: ep_index is a DCI-1 index in 0..31; endpoint contexts in a
+        // device context start after the slot context.
+        unsafe {
+            *((device as *const u8).add((ep_index + 1) * context_size as usize)
+                as *const EndpointContext)
+        }
+    }
+
     /// Take ownership of the controller from BIOS/SMM
     ///
     /// xHCI has an optional extended capability for BIOS ownership handoff.
@@ -1298,7 +1312,7 @@ impl XhciController {
 
         // Set up control endpoint context
         let max_packet = match speed {
-            1 => 64,  // Full speed: Linux guesses 64 until bMaxPacketSize0 is known
+            1 => 64,  // Full speed: updated from bMaxPacketSize0 before longer transfers
             2 => 8,   // Low speed
             3 => 64,  // High speed
             4 => 512, // Super speed
@@ -1483,11 +1497,52 @@ impl XhciController {
         }
     }
 
-    /// Get device descriptor
+    /// Update a full-speed device's EP0 max packet size.
+    fn update_full_speed_ep0_max_packet(
+        &mut self,
+        slot_id: u8,
+        max_packet: u16,
+    ) -> Result<(), XhciError> {
+        if !matches!(max_packet, 8 | 16 | 32 | 64) {
+            log::error!("xHCI: invalid full-speed EP0 max packet size {max_packet}");
+            return Err(XhciError::InvalidParameter);
+        }
+
+        let context_size = self.context_size;
+        let input_context = {
+            let slot = self
+                .slots
+                .get_mut(slot_id as usize)
+                .and_then(|slot| slot.as_mut())
+                .ok_or(XhciError::DeviceNotFound)?;
+            let input = slot.input_context;
+            unsafe {
+                core::ptr::write_bytes(input as *mut u8, 0, Self::input_context_len(context_size));
+            }
+            let ep0 = Self::input_ep_context(input, context_size, 0);
+            *ep0 = Self::device_ep_context(slot.device_context, context_size, 0);
+            ep0.set_max_packet_size(max_packet);
+            Self::input_control_context(input).add_flags = 1 << 1;
+            input as u64
+        };
+
+        let mut trb = Trb::default();
+        trb.param = input_context;
+        trb.set_type(TRB_TYPE_EVALUATE_CONTEXT);
+        trb.control |= (slot_id as u32) << 24;
+
+        self.cmd_ring.enqueue(&trb, false);
+        fence(Ordering::SeqCst);
+        self.ring_doorbell(0, 0);
+        self.wait_command_completion()?;
+        Ok(())
+    }
+
+    /// Get the device descriptor.
     fn get_device_descriptor(&mut self, slot_id: u8) -> Result<DeviceDescriptor, XhciError> {
         let mut desc = [0u8; 18];
 
-        // First, get just 8 bytes to determine max packet size
+        // First, get just 8 bytes to determine max packet size.
         let mut short_desc = [0u8; 8];
         self.control_transfer(
             slot_id,
@@ -1497,6 +1552,15 @@ impl XhciController {
             0,
             Some(&mut short_desc),
         )?;
+
+        let full_speed = self
+            .slots
+            .get(slot_id as usize)
+            .and_then(|slot| slot.as_ref())
+            .is_some_and(|slot| slot.speed == 1);
+        if full_speed {
+            self.update_full_speed_ep0_max_packet(slot_id, short_desc[7] as u16)?;
+        }
 
         // Now get full descriptor
         self.control_transfer(
@@ -1817,7 +1881,7 @@ impl XhciController {
 
         // Control endpoint
         let max_packet = match speed {
-            1 => 64, // Full speed: Linux guesses 64 until bMaxPacketSize0 is known
+            1 => 64, // Full speed: updated from bMaxPacketSize0 before longer transfers
             2 => 8,
             3 => 64,
             4 => 512,

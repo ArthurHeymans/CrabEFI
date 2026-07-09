@@ -27,7 +27,7 @@ zerocopy = { version = "0.8", default-features = false, features = ["derive"] }
 # devices from ACPI tables before handing off to init_platform().
 # Pin to upstream BankField/IndexField support; crates.io 6.1.1 has todo!()
 # paths that panic-abort while loading AML from real firmware.
-acpi = { git = "https://github.com/ArthurHeymans/acpi.git", branch = "all_my_patches", default-features = false, features = [
+acpi = { git = "https://github.com/ArthurHeymans/acpi.git", rev = "4f4adebf75234b52fe54c3e6e50c2cc13be41efe", default-features = false, features = [
   "alloc",
   "aml",
 ] }
