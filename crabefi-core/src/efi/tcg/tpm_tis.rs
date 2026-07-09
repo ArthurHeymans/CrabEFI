@@ -17,7 +17,8 @@
 //! - TCG PC Client Specific TIS, Family 1.3
 
 use super::types::{
-    TPM_ALG_SHA1, TPM_ALG_SHA256, TaggedDigest, TcgError, digest_size_for_algorithm,
+    TPM_ALG_SHA1, TPM_ALG_SHA256, TPM_ALG_SHA384, TPM_ALG_SHA512, TaggedDigest, TcgError,
+    digest_size_for_algorithm,
 };
 use crate::platform::{Tpm2Device, TpmDigest, TpmError, TpmPcrBanks};
 
@@ -41,6 +42,7 @@ const TPM_DID_VID: usize = 0xF00;
 const TPM_INTF_ID: usize = 0x030;
 
 // TPM_ACCESS bits
+const ACCESS_VALID: u8 = 1 << 7;
 const ACCESS_ACTIVE_LOCALITY: u8 = 1 << 5;
 const ACCESS_REQUEST_USE: u8 = 1 << 1;
 
@@ -53,6 +55,8 @@ const STS_DATA_AVAIL: u8 = 1 << 4;
 #[allow(dead_code)]
 const STS_EXPECT: u8 = 1 << 3;
 const STS_GO: u8 = 1 << 5;
+const STS_CANCEL_OFFSET: usize = TPM_STS + 3;
+const STS_CANCEL: u8 = 1;
 
 // TPM response codes
 const TPM_RC_SUCCESS: u32 = 0x000;
@@ -74,12 +78,17 @@ const TPM2_PT_MAX_RESPONSE_SIZE: u32 = 0x0000_011F;
 // TPM2_Startup types
 const TPM2_SU_CLEAR: u16 = 0x0000;
 
-// TPM polling timeout in real time. TIS polling can run on widely different CPU
-// and MMIO speeds, so use elapsed firmware time rather than iteration counts.
-const TPM_TIMEOUT_US: u64 = 1_000_000;
+// TIS timeout classes from the PC Client TPM Interface Specification.
+const TPM_TIMEOUT_A_US: u64 = 750_000;
+const TPM_TIMEOUT_B_US: u64 = 2_000_000;
+const TPM_TIMEOUT_C_US: u64 = 750_000;
+const TPM_TIMEOUT_D_US: u64 = 750_000;
+// Some TPM2 commands are legitimately long-running. EDK2 uses 90 seconds for
+// the command-execution/data-available wait.
+const TPM_TIMEOUT_MAX_US: u64 = 90_000_000;
 
-fn tpm_wait_expired(start_us: u64) -> bool {
-    crate::logger::get_us_since_boot().saturating_sub(start_us) >= TPM_TIMEOUT_US
+fn tpm_wait_expired(start_us: u64, timeout_us: u64) -> bool {
+    crate::logger::get_us_since_boot().saturating_sub(start_us) >= timeout_us
 }
 
 // ============================================================================
@@ -221,16 +230,19 @@ impl TpmTis {
     /// `self.base` must be a valid TIS MMIO region.
     unsafe fn request_locality(&mut self) -> Result<(), TcgError> {
         let access = unsafe { tis_read8(self.base, TPM_ACCESS) };
-        if access & ACCESS_ACTIVE_LOCALITY != 0 {
+        if access & (ACCESS_VALID | ACCESS_ACTIVE_LOCALITY) == ACCESS_VALID | ACCESS_ACTIVE_LOCALITY
+        {
             return Ok(()); // Already have it
         }
 
         unsafe { tis_write8(self.base, TPM_ACCESS, ACCESS_REQUEST_USE) };
 
         let start_us = crate::logger::get_us_since_boot();
-        while !tpm_wait_expired(start_us) {
+        while !tpm_wait_expired(start_us, TPM_TIMEOUT_A_US) {
             let access = unsafe { tis_read8(self.base, TPM_ACCESS) };
-            if access & ACCESS_ACTIVE_LOCALITY != 0 {
+            if access & (ACCESS_VALID | ACCESS_ACTIVE_LOCALITY)
+                == ACCESS_VALID | ACCESS_ACTIVE_LOCALITY
+            {
                 return Ok(());
             }
             core::hint::spin_loop();
@@ -246,7 +258,7 @@ impl TpmTis {
         unsafe { tis_write8(self.base, TPM_STS, STS_COMMAND_READY) };
 
         let start_us = crate::logger::get_us_since_boot();
-        while !tpm_wait_expired(start_us) {
+        while !tpm_wait_expired(start_us, TPM_TIMEOUT_B_US) {
             let sts = unsafe { tis_read8(self.base, TPM_STS) };
             if sts & STS_COMMAND_READY != 0 {
                 return Ok(());
@@ -260,7 +272,7 @@ impl TpmTis {
 
     fn wait_burst_count(&self) -> Result<usize, TcgError> {
         let start_us = crate::logger::get_us_since_boot();
-        while !tpm_wait_expired(start_us) {
+        while !tpm_wait_expired(start_us, TPM_TIMEOUT_D_US) {
             let burst = unsafe { tis_read_burst_count(self.base) };
             if burst > 0 {
                 return Ok(burst);
@@ -282,7 +294,7 @@ impl TpmTis {
 
     fn wait_command_accepted(&self) -> Result<(), TcgError> {
         let start_us = crate::logger::get_us_since_boot();
-        while !tpm_wait_expired(start_us) {
+        while !tpm_wait_expired(start_us, TPM_TIMEOUT_C_US) {
             let sts = unsafe { tis_read8(self.base, TPM_STS) };
             if sts & STS_VALID != 0 && sts & STS_EXPECT == 0 {
                 return Ok(());
@@ -345,7 +357,7 @@ impl TpmTis {
         // 4. Wait for dataAvail
         let mut data_available = false;
         let start_us = crate::logger::get_us_since_boot();
-        while !tpm_wait_expired(start_us) {
+        while !tpm_wait_expired(start_us, TPM_TIMEOUT_MAX_US) {
             let sts = unsafe { tis_read8(self.base, TPM_STS) };
             if sts & (STS_VALID | STS_DATA_AVAIL) == (STS_VALID | STS_DATA_AVAIL) {
                 data_available = true;
@@ -360,9 +372,24 @@ impl TpmTis {
             core::hint::spin_loop();
         }
         if !data_available {
-            log::error!("TPM TIS: timeout waiting for response data");
-            self.finish_command();
-            return Err(TcgError::InternalError);
+            log::warn!("TPM TIS: command timed out; requesting cancellation");
+            unsafe { tis_write8(self.base, STS_CANCEL_OFFSET, STS_CANCEL) };
+
+            let cancel_start_us = crate::logger::get_us_since_boot();
+            while !tpm_wait_expired(cancel_start_us, TPM_TIMEOUT_B_US) {
+                let sts = unsafe { tis_read8(self.base, TPM_STS) };
+                if sts & (STS_VALID | STS_DATA_AVAIL) == (STS_VALID | STS_DATA_AVAIL) {
+                    data_available = true;
+                    break;
+                }
+                core::hint::spin_loop();
+            }
+
+            if !data_available {
+                log::error!("TPM TIS: cancellation produced no response");
+                self.finish_command();
+                return Err(TcgError::InternalError);
+            }
         }
 
         // 5. Read response from FIFO. First read 10 bytes to get the
@@ -535,27 +562,38 @@ impl TpmTis {
         let mut offset = 19;
         let mut num_algs = 0usize;
 
-        for _ in 0..count.min(5) {
+        for _ in 0..count {
             if offset + 3 > n {
-                break;
+                return Err(TcgError::InternalError);
             }
             let alg_id = u16::from_be_bytes([resp[offset], resp[offset + 1]]);
             let select_size = resp[offset + 2] as usize;
             offset += 3;
 
-            // Check if any PCR is selected (at least one bit set)
-            let mut any_selected = false;
-            for i in 0..select_size.min(n - offset) {
-                if resp[offset + i] != 0 {
-                    any_selected = true;
-                    break;
-                }
-            }
-            offset += select_size;
+            let selection_end = offset
+                .checked_add(select_size)
+                .filter(|end| *end <= n)
+                .ok_or(TcgError::InternalError)?;
 
-            if any_selected && digest_size_for_algorithm(alg_id).is_some() {
-                self.active_algorithms[num_algs] = alg_id;
-                num_algs += 1;
+            // Check if any PCR is selected (at least one bit set)
+            let any_selected = resp[offset..selection_end].iter().any(|byte| *byte != 0);
+            offset = selection_end;
+
+            if any_selected {
+                if !matches!(
+                    alg_id,
+                    TPM_ALG_SHA1 | TPM_ALG_SHA256 | TPM_ALG_SHA384 | TPM_ALG_SHA512
+                ) {
+                    log::error!("TPM active PCR bank {:#06x} is unsupported", alg_id);
+                    return Err(TcgError::UnsupportedAlgorithm);
+                }
+                if !self.active_algorithms[..num_algs].contains(&alg_id) {
+                    if num_algs >= self.active_algorithms.len() {
+                        return Err(TcgError::UnsupportedAlgorithm);
+                    }
+                    self.active_algorithms[num_algs] = alg_id;
+                    num_algs += 1;
+                }
             }
         }
 

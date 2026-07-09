@@ -76,8 +76,7 @@ fn serialize_uefi_variable_data(
         .checked_add(8)?
         .checked_add(name_bytes)?
         .checked_add(variable_data.len())?;
-    let mut buf = Vec::new();
-    buf.resize(total, 0);
+    let mut buf = alloc::vec![0; total];
 
     let mut off = 0;
 
@@ -122,7 +121,12 @@ fn measure_variable_all(
         }
     };
 
-    measure_event_all(pcr_index, event_type, &event_buf, &event_buf, context);
+    let data_to_hash = if event_type == EV_EFI_VARIABLE_DRIVER_CONFIG {
+        event_buf.as_slice()
+    } else {
+        variable_data
+    };
+    measure_event_all(pcr_index, event_type, data_to_hash, &event_buf, context);
 }
 
 fn efi_global_variable_guid() -> r_efi::efi::Guid {
@@ -199,14 +203,20 @@ pub fn measure_secure_boot_variables_all() {
         &[0xDA, 0xD0, 0x0E, 0x67, 0x65, 0x6F],
     );
 
+    let secure_boot_name = [
+        0x53, 0x65, 0x63, 0x75, 0x72, 0x65, 0x42, 0x6F, 0x6F, 0x74, 0x00,
+    ];
+    let secure_boot = [u8::from(crate::efi::auth::is_secure_boot_enabled())];
+    measure_variable_all(
+        7,
+        EV_EFI_VARIABLE_DRIVER_CONFIG,
+        &global_guid,
+        &secure_boot_name,
+        &secure_boot,
+        "SecureBoot",
+    );
+
     let variables: &[(&r_efi::efi::Guid, &[u16], &str)] = &[
-        (
-            &global_guid,
-            &[
-                0x53, 0x65, 0x63, 0x75, 0x72, 0x65, 0x42, 0x6F, 0x6F, 0x74, 0x00,
-            ],
-            "SecureBoot",
-        ),
         (&global_guid, &[0x50, 0x4B, 0x00], "PK"),
         (&global_guid, &[0x4B, 0x45, 0x4B, 0x00], "KEK"),
         (&security_guid, &[0x64, 0x62, 0x00], "db"),
@@ -217,19 +227,12 @@ pub fn measure_secure_boot_variables_all() {
         let var_data = get_efi_variable(guid, name_utf16);
         let data = var_data.as_deref().unwrap_or(&[]);
 
-        let event_buf = match serialize_uefi_variable_data(guid, name_utf16, data) {
-            Some(buf) => buf,
-            None => {
-                log::warn!("Failed to serialize variable data for {}", display_name);
-                continue;
-            }
-        };
-
-        measure_event_all(
+        measure_variable_all(
             7,
             EV_EFI_VARIABLE_DRIVER_CONFIG,
-            &event_buf,
-            &event_buf,
+            guid,
+            name_utf16,
+            data,
             display_name,
         );
 
@@ -237,6 +240,18 @@ pub fn measure_secure_boot_variables_all() {
             "Measured {} into PCR 7 ({} bytes)",
             display_name,
             data.len()
+        );
+    }
+
+    let dbt_name = [0x64, 0x62, 0x74, 0x00];
+    if let Some(dbt) = get_efi_variable(&security_guid, &dbt_name) {
+        measure_variable_all(
+            7,
+            EV_EFI_VARIABLE_DRIVER_CONFIG,
+            &security_guid,
+            &dbt_name,
+            &dbt,
+            "dbt",
         );
     }
 
@@ -273,7 +288,7 @@ pub fn measure_boot_variables_all() {
         "BootOrder",
     );
 
-    for chunk in boot_order.chunks_exact(2) {
+    for chunk in boot_order.as_chunks::<2>().0 {
         let option_number = u16::from_le_bytes([chunk[0], chunk[1]]);
         let name = boot_option_name(option_number);
         if let Some(data) = get_efi_variable(&global_guid, &name) {

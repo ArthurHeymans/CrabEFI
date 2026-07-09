@@ -1354,25 +1354,27 @@ impl Tpm2DeviceConfig {
 /// Fixed-capacity list of active TPM PCR bank algorithms.
 ///
 /// CrabEFI's TCG2 measured-boot implementation supports SHA-1, SHA-256,
-/// SHA-384, and SHA-512 banks. If a hardware/platform TPM exposes additional
-/// active banks (for example SM3-256), CrabEFI logs that they are unsupported
-/// and exposes/extends only the supported SHA subset through its EFI TCG2
-/// implementation.
+/// SHA-384, and SHA-512 banks. A platform driver must report every active bank;
+/// CrabEFI rejects hardware-backed measured boot if any active bank is unsupported
+/// rather than leaving that bank unextended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TpmPcrBanks {
-    algorithms: [u16; 5],
+    algorithms: [u16; 16],
     count: usize,
+    truncated: bool,
 }
 
 impl TpmPcrBanks {
     /// Create a PCR bank list from TPM algorithm IDs.
     pub fn new(algorithms: &[u16]) -> Self {
-        let count = algorithms.len().min(5);
-        let mut out = [0u16; 5];
+        let count = algorithms.len().min(16);
+        let mut out = [0u16; 16];
         out[..count].copy_from_slice(&algorithms[..count]);
+        let truncated = algorithms.len() > out.len();
         Self {
             algorithms: out,
             count,
+            truncated,
         }
     }
 
@@ -1384,6 +1386,12 @@ impl TpmPcrBanks {
     /// Return true when `algorithm` is active.
     pub fn contains(&self, algorithm: u16) -> bool {
         self.algorithms().contains(&algorithm)
+    }
+
+    /// Return true if the supplied active-bank list exceeded this structure's
+    /// fixed capacity and therefore cannot be represented safely.
+    pub fn is_truncated(&self) -> bool {
+        self.truncated
     }
 }
 
@@ -1422,9 +1430,8 @@ pub trait Tpm2Device: Send {
     ///
     /// CrabEFI accepts SHA-1 (`0x0004`), SHA-256 (`0x000B`), SHA-384
     /// (`0x000C`), and SHA-512 (`0x000D`) for measured boot. If additional
-    /// algorithms are active, they are treated as unsupported by CrabEFI's EFI
-    /// TCG2 implementation and will not be requested in
-    /// [`pcr_extend`](Self::pcr_extend).
+    /// algorithms are active, CrabEFI rejects hardware-backed measured boot so
+    /// it never leaves an active TPM bank unextended.
     fn active_pcr_banks(&self) -> TpmPcrBanks;
 
     /// Return the TPM manufacturer ID reported in `GetCapability`.

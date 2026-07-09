@@ -113,7 +113,6 @@ pub fn init_from_platform(config: &mut crate::platform::PlatformConfig) {
 
     // Install standard EFI tables and protocols
     system_table::install_rt_properties_table();
-    system_table::install_tpm_event_log();
 
     let console_handle = init_console();
 

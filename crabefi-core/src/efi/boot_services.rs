@@ -1255,6 +1255,11 @@ extern "efiapi" fn load_image(
         loaded_image.image_size
     );
 
+    // Preserve metadata before releasing an owned source buffer.
+    let image_subsystem = pe::parse_headers(data)
+        .map(|headers| headers.subsystem())
+        .unwrap_or(0);
+
     // TCG measured boot: drivers are measured now; applications are deferred
     // until StartImage after ReadyToBoot, with digests computed before freeing data.
     let deferred_measurement = measure_pe_image_for_tcg(
@@ -1329,9 +1334,6 @@ extern "efiapi" fn load_image(
     }
 
     // Store the loaded image info so StartImage can find it
-    let image_subsystem = pe::parse_headers(data)
-        .map(|headers| headers.subsystem())
-        .unwrap_or(0);
     let store_result = state::with_efi_mut(|efi_state| {
         let slot = efi_state
             .loaded_images
@@ -2465,15 +2467,13 @@ fn measure_pe_image_for_tcg(
         return None;
     }
 
-    let Some((digest_count, digests)) = (match precompute_pe_image_digests_all(pe_data) {
+    let (digest_count, digests) = (match precompute_pe_image_digests_all(pe_data) {
         Ok(result) => result,
         Err(e) => {
             log::warn!("Failed to precompute PE image measurement: {:?}", e);
             None
         }
-    }) else {
-        return None;
-    };
+    })?;
 
     let event_data_size = event_data.len();
     let event_data_ptr =
