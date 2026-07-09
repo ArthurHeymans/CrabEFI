@@ -869,6 +869,20 @@ pub extern "C" fn rust_main(coreboot_table_ptr: u64) -> ! {
     if let Some(rsdp) = crabefi::state::drivers().platform.acpi_rsdp {
         let acpi_info = unsafe { acpi::discover_platform(rsdp) };
         crabefi::state::with_drivers_mut(|d| d.acpi_info = acpi_info);
+
+        for hid in ["AMDI0040", "PNP0D40"] {
+            let Some(dev) = acpi_info.find_device(hid) else {
+                continue;
+            };
+            if crabefi::drivers::sdhci::init_mmio_device(
+                dev,
+                crabefi::drivers::sdhci::SdhciMedia::Emmc,
+            )
+            .is_ok()
+            {
+                break;
+            }
+        }
     }
 
     // ---- Platform MMIO regions (aarch64 / riscv64) ----
