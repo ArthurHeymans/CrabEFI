@@ -15,6 +15,7 @@
 extern crate alloc;
 
 pub mod arch;
+pub(crate) mod barrier;
 pub mod bls;
 pub mod boot;
 mod boot_manager;

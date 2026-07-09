@@ -75,9 +75,7 @@ pub fn halt() {
 /// Full memory fence (all prior loads/stores complete before subsequent ones).
 #[inline]
 pub fn fence() {
-    unsafe {
-        core::arch::asm!("fence iorw, iorw", options(nostack, preserves_flags));
-    }
+    crate::barrier::mmio_general();
 }
 
 /// S-mode trap handler called from assembly.

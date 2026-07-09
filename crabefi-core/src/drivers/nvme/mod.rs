@@ -3,11 +3,11 @@
 //! This module provides a minimal NVMe driver for reading from NVMe SSDs.
 //! It implements the basic NVMe command set needed for booting.
 
+use crate::barrier;
 use crate::drivers::pci::{self, PciAddress, PciDevice};
 use crate::efi;
 use crate::time::{Timeout, wait_for};
 use core::ptr;
-use core::sync::atomic::{Ordering, fence};
 use spin::Mutex;
 use tock_registers::interfaces::{ReadWriteable, Readable, Writeable};
 use tock_registers::register_bitfields;
@@ -652,7 +652,7 @@ impl NvmeController {
         unsafe {
             ptr::write_volatile(self.admin_sq.add(tail), *cmd);
         }
-        fence(Ordering::SeqCst);
+        barrier::mmio_write();
 
         self.admin_sq_tail = ((tail + 1) % ADMIN_QUEUE_SIZE) as u16;
         self.ring_sq_doorbell(0, self.admin_sq_tail);
@@ -665,7 +665,7 @@ impl NvmeController {
         let timeout = Timeout::from_ms(5000); // 5 second timeout for admin commands
 
         while !timeout.is_expired() {
-            fence(Ordering::SeqCst);
+            barrier::dma_read();
             let head = self.admin_cq_head as usize;
             let entry = unsafe { ptr::read_volatile(self.admin_cq.add(head)) };
 
@@ -861,7 +861,7 @@ impl NvmeController {
         unsafe {
             ptr::write_volatile(self.io_sq.add(tail), *cmd);
         }
-        fence(Ordering::SeqCst);
+        barrier::mmio_write();
 
         self.io_sq_tail = ((tail + 1) % IO_QUEUE_SIZE) as u16;
         self.ring_sq_doorbell(1, self.io_sq_tail);
@@ -873,7 +873,7 @@ impl NvmeController {
     fn wait_io_completion(&mut self, cid: u16) -> Result<CompletionQueueEntry, NvmeError> {
         let timeout = Timeout::from_ms(5000); // 5 second timeout for I/O
         while !timeout.is_expired() {
-            fence(Ordering::SeqCst);
+            barrier::dma_read();
 
             let head = self.io_cq_head as usize;
             let entry = unsafe { ptr::read_volatile(self.io_cq.add(head)) };

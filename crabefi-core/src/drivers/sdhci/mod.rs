@@ -6,11 +6,11 @@
 
 pub mod regs;
 
+use crate::barrier;
 use crate::drivers::pci::{self, PciAddress, PciDevice};
 use crate::efi;
 use crate::time::{Timeout, wait_for};
 use core::ptr;
-use core::sync::atomic::{Ordering, fence};
 use spin::Mutex;
 use tock_registers::interfaces::{ReadWriteable, Readable, Writeable};
 
@@ -868,7 +868,7 @@ impl SdhciController {
 
         match self.read_data_command(MMC_CMD_SEND_EXT_CSD, 0, 512) {
             Ok(()) => {
-                fence(Ordering::SeqCst);
+                barrier::dma_read();
                 let ext_csd = unsafe { core::slice::from_raw_parts(self.dma_buffer, 512) };
                 let sec_count = u32::from_le_bytes([
                     ext_csd[EXT_CSD_SEC_COUNT],
@@ -1321,8 +1321,8 @@ impl SdhciController {
             }
         }
 
-        // Memory fence to ensure DMA is complete
-        fence(Ordering::SeqCst);
+        // Order CPU reads after the DMA engine has completed.
+        barrier::dma_read();
 
         // Copy data from DMA buffer to caller's buffer
         unsafe {
