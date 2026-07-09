@@ -68,10 +68,10 @@ impl Trb {
     }
 }
 
-/// Slot Context (32 bytes)
+/// Slot Context payload (first 32 bytes)
 ///
-/// Note: Some xHCI controllers use 64-byte contexts (HCCPARAMS1.CSZ=1).
-/// This structure assumes 32-byte contexts. Controllers with CSZ=1 may not work.
+/// Controllers with HCCPARAMS1.CSZ=1 use a 64-byte stride; the extra 32 bytes
+/// are controller-owned padding. Access contexts through the helpers below.
 #[repr(C, align(32))]
 #[derive(Clone, Copy, Default)]
 pub struct SlotContext {
@@ -120,7 +120,7 @@ impl SlotContext {
     }
 }
 
-/// Endpoint Context (32 bytes)
+/// Endpoint Context payload (first 32 bytes)
 #[repr(C, align(32))]
 #[derive(Clone, Copy, Default)]
 pub struct EndpointContext {
@@ -170,7 +170,7 @@ pub struct InputControlContext {
     pub reserved2: u8,
 }
 
-/// Device Context (consists of Slot + 31 Endpoint Contexts)
+/// 32-byte Device Context view. Use only when the controller context stride is 32.
 #[repr(C, align(64))]
 #[derive(Default)]
 pub struct DeviceContext {
@@ -178,7 +178,7 @@ pub struct DeviceContext {
     pub endpoints: [EndpointContext; 31],
 }
 
-/// Input Context (Input Control + Device Context)
+/// 32-byte Input Context view. Use only when the controller context stride is 32.
 #[repr(C, align(64))]
 #[derive(Default)]
 pub struct InputContext {
@@ -437,9 +437,7 @@ pub struct XhciController {
     num_ports: u8,
     /// Page size used by controller
     page_size: u32,
-    /// Context size (32 or 64 bytes based on HCCPARAMS1.CSZ)
-    /// Currently only 32-byte contexts are fully supported.
-    #[allow(dead_code)] // Hardware property needed for correct context layout
+    /// Context stride (32 or 64 bytes based on HCCPARAMS1.CSZ)
     context_size: u8,
     /// Device Context Base Address Array
     dcbaa: u64,
@@ -494,6 +492,45 @@ impl XhciController {
     /// USBLEGSUP register offsets (within the extended capability)
     const USBLEGSUP_BIOS_OWNED: u32 = 1 << 16;
     const USBLEGSUP_OS_OWNED: u32 = 1 << 24;
+
+    #[inline]
+    fn input_context_len(context_size: u8) -> usize {
+        context_size as usize * 33 // input control + slot + 31 endpoint contexts
+    }
+
+    #[inline]
+    fn input_control_context<'a>(input: *mut InputContext) -> &'a mut InputControlContext {
+        // SAFETY: input points at an allocated xHCI input context. The input
+        // control context is always at byte offset 0 for both 32- and 64-byte strides.
+        unsafe { &mut *(input as *mut InputControlContext) }
+    }
+
+    #[inline]
+    fn input_slot_context<'a>(input: *mut InputContext, context_size: u8) -> &'a mut SlotContext {
+        // SAFETY: caller passes an allocated input context; slot context starts
+        // after one context-sized input-control entry, like Linux xhci_get_slot_ctx().
+        unsafe { &mut *((input as *mut u8).add(context_size as usize) as *mut SlotContext) }
+    }
+
+    #[inline]
+    fn input_ep_context<'a>(
+        input: *mut InputContext,
+        context_size: u8,
+        ep_index: usize,
+    ) -> &'a mut EndpointContext {
+        // SAFETY: ep_index is a DCI-1 index in 0..31; endpoint contexts in an
+        // input context start after input-control + slot contexts.
+        unsafe {
+            &mut *((input as *mut u8).add((ep_index + 2) * context_size as usize)
+                as *mut EndpointContext)
+        }
+    }
+
+    #[inline]
+    fn device_slot_context(device: *mut DeviceContext) -> SlotContext {
+        // SAFETY: device points at an allocated device context; slot context is always first.
+        unsafe { *(device as *const SlotContext) }
+    }
 
     /// Take ownership of the controller from BIOS/SMM
     ///
@@ -600,18 +637,6 @@ impl XhciController {
         } else {
             32
         };
-
-        // Reject controllers that require 64-byte contexts.
-        // Our SlotContext, EndpointContext, InputContext, and DeviceContext structs
-        // are all defined with 32-byte contexts. Using them on a CSZ=1 controller
-        // would cause every offset calculation to be wrong, leading to silent
-        // corruption and controller misbehavior.
-        if context_size == 64 {
-            log::error!(
-                "xHCI: Controller requires 64-byte contexts (CSZ=1), which is not yet supported"
-            );
-            return Err(XhciError::NotReady);
-        }
 
         // Get max scratchpad buffers from HCSPARAMS2
         let max_sp_hi = cap.hcsparams2.read(HCSPARAMS2::MAX_SCRATCHPAD_HI) as u16;
@@ -1260,31 +1285,33 @@ impl XhciController {
         let transfer_ring_mem = efi::allocate_pages(1).ok_or(XhciError::AllocationFailed)?;
         let transfer_ring = transfer_ring_mem.as_ptr() as u64;
 
-        let input = unsafe { &mut *(input_context_mem.as_mut_ptr() as *mut InputContext) };
+        let input_ptr = input_context as *mut InputContext;
 
         // Set up input control context
-        input.control.add_flags = 0x3; // Add slot and EP0
+        Self::input_control_context(input_ptr).add_flags = 0x3; // Add slot and EP0
 
         // Set up slot context
-        input.slot.set_context_entries(1);
-        input.slot.set_speed(speed);
-        input.slot.set_root_hub_port(port + 1);
+        let slot_ctx = Self::input_slot_context(input_ptr, self.context_size);
+        slot_ctx.set_context_entries(1);
+        slot_ctx.set_speed(speed);
+        slot_ctx.set_root_hub_port(port + 1);
 
         // Set up control endpoint context
         let max_packet = match speed {
-            1 => 8,   // Full speed
+            1 => 64,  // Full speed: Linux guesses 64 until bMaxPacketSize0 is known
             2 => 8,   // Low speed
             3 => 64,  // High speed
             4 => 512, // Super speed
             _ => 8,
         };
 
-        input.endpoints[0].set_ep_type(4); // Control endpoint
-        input.endpoints[0].set_max_packet_size(max_packet);
-        input.endpoints[0].set_max_burst_size(0);
-        input.endpoints[0].set_cerr(3);
-        input.endpoints[0].set_tr_dequeue_ptr(transfer_ring, true);
-        input.endpoints[0].set_avg_trb_length(8);
+        let ep0_ctx = Self::input_ep_context(input_ptr, self.context_size, 0);
+        ep0_ctx.set_ep_type(4); // Control endpoint
+        ep0_ctx.set_max_packet_size(max_packet);
+        ep0_ctx.set_max_burst_size(0);
+        ep0_ctx.set_cerr(3);
+        ep0_ctx.set_tr_dequeue_ptr(transfer_ring, true);
+        ep0_ctx.set_avg_trb_length(8);
 
         // Set up transfer ring
         let ring = TrbRing::new(transfer_ring, 256);
@@ -1720,13 +1747,23 @@ impl XhciController {
             .and_then(|s| s.as_ref())
             .ok_or(XhciError::DeviceNotFound)?;
 
-        let input_ctx = unsafe { &mut *slot.input_context };
-        input_ctx.control.add_flags = 0x1; // Evaluate slot context only
-        input_ctx.control.drop_flags = 0;
-        input_ctx.slot.set_hub(true);
-        input_ctx.slot.set_num_ports(num_ports);
+        let input_ctx = slot.input_context;
+        unsafe {
+            core::ptr::write_bytes(
+                input_ctx as *mut u8,
+                0,
+                Self::input_context_len(self.context_size),
+            );
+        }
+        let control_ctx = Self::input_control_context(input_ctx);
+        control_ctx.add_flags = 0x1; // Evaluate slot context only
+        control_ctx.drop_flags = 0;
+        let slot_ctx = Self::input_slot_context(input_ctx, self.context_size);
+        *slot_ctx = Self::device_slot_context(slot.device_context);
+        slot_ctx.set_hub(true);
+        slot_ctx.set_num_ports(num_ports);
         // Context entries must cover at least slot + EP0
-        input_ctx.slot.set_context_entries(1);
+        slot_ctx.set_context_entries(1);
 
         let mut trb = Trb::default();
         trb.param = slot.input_context as u64;
@@ -1766,32 +1803,34 @@ impl XhciController {
         let transfer_ring_mem = efi::allocate_pages(1).ok_or(XhciError::AllocationFailed)?;
         let transfer_ring = transfer_ring_mem.as_ptr() as u64;
 
-        let input = unsafe { &mut *(input_context_mem.as_mut_ptr() as *mut InputContext) };
-        input.control.add_flags = 0x3; // Add slot + EP0
+        let input_ptr = input_context as *mut InputContext;
+        Self::input_control_context(input_ptr).add_flags = 0x3; // Add slot + EP0
 
         // Slot context with hub topology info
-        input.slot.set_context_entries(1);
-        input.slot.set_speed(speed);
-        input.slot.set_root_hub_port(root_port + 1);
-        input.slot.set_route_string(route_string);
-        input.slot.set_parent_hub_slot(hub_slot_id);
-        input.slot.set_parent_port_num(hub_port);
+        let slot_ctx = Self::input_slot_context(input_ptr, self.context_size);
+        slot_ctx.set_context_entries(1);
+        slot_ctx.set_speed(speed);
+        slot_ctx.set_root_hub_port(root_port + 1);
+        slot_ctx.set_route_string(route_string);
+        slot_ctx.set_parent_hub_slot(hub_slot_id);
+        slot_ctx.set_parent_port_num(hub_port);
 
         // Control endpoint
         let max_packet = match speed {
-            1 => 8,
+            1 => 64, // Full speed: Linux guesses 64 until bMaxPacketSize0 is known
             2 => 8,
             3 => 64,
             4 => 512,
             _ => 8,
         };
 
-        input.endpoints[0].set_ep_type(4);
-        input.endpoints[0].set_max_packet_size(max_packet);
-        input.endpoints[0].set_max_burst_size(0);
-        input.endpoints[0].set_cerr(3);
-        input.endpoints[0].set_tr_dequeue_ptr(transfer_ring, true);
-        input.endpoints[0].set_avg_trb_length(8);
+        let ep0_ctx = Self::input_ep_context(input_ptr, self.context_size, 0);
+        ep0_ctx.set_ep_type(4);
+        ep0_ctx.set_max_packet_size(max_packet);
+        ep0_ctx.set_max_burst_size(0);
+        ep0_ctx.set_cerr(3);
+        ep0_ctx.set_tr_dequeue_ptr(transfer_ring, true);
+        ep0_ctx.set_avg_trb_length(8);
 
         let ring = TrbRing::new(transfer_ring, 256);
 
@@ -2351,6 +2390,7 @@ impl XhciController {
         let ring_mem = efi::allocate_pages(1).ok_or(XhciError::AllocationFailed)?;
         let ring_addr = ring_mem.as_ptr() as u64;
         let ring = TrbRing::new(ring_addr, 256);
+        let context_size = self.context_size;
 
         {
             let slot = self
@@ -2366,11 +2406,14 @@ impl XhciController {
             slot.transfer_rings[in_dci - 1] = Some(ring);
 
             // Set up input context for Configure Endpoint
-            let input = unsafe { &mut *slot.input_context };
-            let device = unsafe { &*slot.device_context };
-            input.slot = device.slot;
-            input.slot.set_context_entries(in_dci as u8);
-            input.control.add_flags = 1 | (1 << in_dci); // Slot + this endpoint
+            let input = slot.input_context;
+            unsafe {
+                core::ptr::write_bytes(input as *mut u8, 0, Self::input_context_len(context_size));
+            }
+            let slot_ctx = Self::input_slot_context(input, context_size);
+            *slot_ctx = Self::device_slot_context(slot.device_context);
+            slot_ctx.set_context_entries(in_dci as u8);
+            Self::input_control_context(input).add_flags = 1 | (1 << in_dci); // Slot + this endpoint
 
             // Interrupt IN endpoint context (EP Type 7)
             // Convert bInterval to xHCI interval exponent:
@@ -2394,15 +2437,15 @@ impl XhciController {
                 n.max(3) // At least 1ms (2^3 * 125µs)
             };
 
-            input.endpoints[in_dci - 1].set_ep_type(7); // Interrupt IN
-            input.endpoints[in_dci - 1].set_max_packet_size(interrupt_max_packet);
-            input.endpoints[in_dci - 1].set_max_burst_size(0);
-            input.endpoints[in_dci - 1].set_cerr(3);
-            input.endpoints[in_dci - 1].set_tr_dequeue_ptr(ring_addr, true);
-            input.endpoints[in_dci - 1].set_avg_trb_length(interrupt_max_packet);
+            let ep_ctx = Self::input_ep_context(input, context_size, in_dci - 1);
+            ep_ctx.set_ep_type(7); // Interrupt IN
+            ep_ctx.set_max_packet_size(interrupt_max_packet);
+            ep_ctx.set_max_burst_size(0);
+            ep_ctx.set_cerr(3);
+            ep_ctx.set_tr_dequeue_ptr(ring_addr, true);
+            ep_ctx.set_avg_trb_length(interrupt_max_packet);
             // Interval field in dw0 bits 23:16
-            input.endpoints[in_dci - 1].dw0 =
-                (input.endpoints[in_dci - 1].dw0 & !0x00FF0000) | ((xhci_interval as u32) << 16);
+            ep_ctx.dw0 = (ep_ctx.dw0 & !0x00FF0000) | ((xhci_interval as u32) << 16);
         }
 
         // Issue Configure Endpoint command
@@ -2495,6 +2538,7 @@ impl XhciController {
 
         let in_ring = TrbRing::new(in_ring_addr, 256);
         let out_ring = TrbRing::new(out_ring_addr, 256);
+        let context_size = self.context_size;
 
         // Calculate DCI (Device Context Index) for endpoints
         // DCI = (Endpoint Number * 2) + Direction (0=OUT, 1=IN)
@@ -2502,32 +2546,36 @@ impl XhciController {
         let out_dci = bulk_out as usize * 2;
 
         // Set up input context
-        let input = unsafe { &mut *slot.input_context };
-        *input = InputContext::default();
+        let input = slot.input_context;
+        unsafe {
+            core::ptr::write_bytes(input as *mut u8, 0, Self::input_context_len(context_size));
+        }
 
         // Copy slot context from device context
-        let device = unsafe { &*slot.device_context };
-        input.slot = device.slot;
-        input.slot.set_context_entries(in_dci.max(out_dci) as u8);
+        let slot_ctx = Self::input_slot_context(input, context_size);
+        *slot_ctx = Self::device_slot_context(slot.device_context);
+        slot_ctx.set_context_entries(in_dci.max(out_dci) as u8);
 
         // Set up endpoint contexts
-        input.control.add_flags = 1 | (1 << in_dci) | (1 << out_dci);
+        Self::input_control_context(input).add_flags = 1 | (1 << in_dci) | (1 << out_dci);
 
         // Bulk IN endpoint
-        input.endpoints[in_dci - 1].set_ep_type(6); // Bulk IN
-        input.endpoints[in_dci - 1].set_max_packet_size(max_packet);
-        input.endpoints[in_dci - 1].set_max_burst_size(0);
-        input.endpoints[in_dci - 1].set_cerr(3);
-        input.endpoints[in_dci - 1].set_tr_dequeue_ptr(in_ring_addr, true);
-        input.endpoints[in_dci - 1].set_avg_trb_length(max_packet);
+        let in_ep_ctx = Self::input_ep_context(input, context_size, in_dci - 1);
+        in_ep_ctx.set_ep_type(6); // Bulk IN
+        in_ep_ctx.set_max_packet_size(max_packet);
+        in_ep_ctx.set_max_burst_size(0);
+        in_ep_ctx.set_cerr(3);
+        in_ep_ctx.set_tr_dequeue_ptr(in_ring_addr, true);
+        in_ep_ctx.set_avg_trb_length(max_packet);
 
         // Bulk OUT endpoint
-        input.endpoints[out_dci - 1].set_ep_type(2); // Bulk OUT
-        input.endpoints[out_dci - 1].set_max_packet_size(max_packet);
-        input.endpoints[out_dci - 1].set_max_burst_size(0);
-        input.endpoints[out_dci - 1].set_cerr(3);
-        input.endpoints[out_dci - 1].set_tr_dequeue_ptr(out_ring_addr, true);
-        input.endpoints[out_dci - 1].set_avg_trb_length(max_packet);
+        let out_ep_ctx = Self::input_ep_context(input, context_size, out_dci - 1);
+        out_ep_ctx.set_ep_type(2); // Bulk OUT
+        out_ep_ctx.set_max_packet_size(max_packet);
+        out_ep_ctx.set_max_burst_size(0);
+        out_ep_ctx.set_cerr(3);
+        out_ep_ctx.set_tr_dequeue_ptr(out_ring_addr, true);
+        out_ep_ctx.set_avg_trb_length(max_packet);
 
         // Store rings
         slot.transfer_rings[in_dci - 1] = Some(in_ring);
