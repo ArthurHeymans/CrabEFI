@@ -4,7 +4,7 @@
 //! These are essential when the CPU and hardware devices (like USB controllers)
 //! share memory regions.
 
-use core::sync::atomic::{Ordering, fence};
+use crate::barrier;
 
 /// Cache line size (typically 64 bytes on modern x86)
 pub const CACHE_LINE_SIZE: usize = 64;
@@ -23,8 +23,8 @@ pub fn flush_cache_range(addr: u64, size: usize) {
     let start = addr as usize & !(CACHE_LINE_SIZE - 1);
     let end = (addr as usize + size + CACHE_LINE_SIZE - 1) & !(CACHE_LINE_SIZE - 1);
 
-    // Memory fence before loop for proper CLFLUSH ordering on older AMD processors
-    fence(Ordering::SeqCst);
+    // A full-system barrier preserves CLFLUSH ordering on older AMD processors.
+    barrier::mmio_general();
 
     for line in (start..end).step_by(CACHE_LINE_SIZE) {
         unsafe {
@@ -35,8 +35,8 @@ pub fn flush_cache_range(addr: u64, size: usize) {
             );
         }
     }
-    // Memory fence to ensure flushes complete before continuing
-    fence(Ordering::SeqCst);
+    // Ensure cache maintenance completes before continuing.
+    barrier::mmio_general();
 }
 
 /// Invalidate a memory range in CPU cache

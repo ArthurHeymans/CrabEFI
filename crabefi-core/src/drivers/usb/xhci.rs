@@ -2,12 +2,12 @@
 //!
 //! This module provides a minimal xHCI driver for USB mass storage devices.
 
+use crate::barrier;
 use crate::drivers::mmio::MmioRegion;
 use crate::drivers::pci::{self, PciAddress, PciDevice};
 use crate::efi;
 use crate::time::{Timeout, wait_for};
 use core::ptr;
-use core::sync::atomic::{Ordering, fence};
 use tock_registers::interfaces::{ReadWriteable, Readable, Writeable};
 use zerocopy::FromBytes;
 
@@ -284,8 +284,8 @@ impl TrbRing {
             core::ptr::write_volatile(&mut entry.status as *mut u32, trb.status);
         }
 
-        // Write barrier: ensure param/status are visible before the cycle bit
-        fence(Ordering::Release);
+        // Hand descriptor fields to the controller before publishing ownership.
+        barrier::dma_write();
 
         // Write control LAST (contains the cycle bit that signals HC ownership)
         unsafe {
@@ -301,7 +301,7 @@ impl TrbRing {
         if self.enqueue_idx >= self.size - 1 {
             // Activate the link TRB's cycle bit to hand it to the HC
             let link = unsafe { &mut *((self.base + ((self.size - 1) * 16) as u64) as *mut Trb) };
-            fence(Ordering::Release);
+            barrier::dma_write();
             if self.cycle {
                 unsafe {
                     core::ptr::write_volatile(&mut link.control as *mut u32, link.control | 1)
@@ -311,7 +311,7 @@ impl TrbRing {
                     core::ptr::write_volatile(&mut link.control as *mut u32, link.control & !1)
                 };
             }
-            fence(Ordering::Release);
+            barrier::dma_write();
 
             self.enqueue_idx = 0;
             self.cycle = !self.cycle;
@@ -332,8 +332,8 @@ impl TrbRing {
     fn commit_deferred_trb(trb_addr: u64, cycle_at_enqueue: bool) {
         let entry = unsafe { &mut *(trb_addr as *mut Trb) };
 
-        // Write barrier: ensure all subsequent TRBs are visible first
-        fence(Ordering::Release);
+        // Ensure the whole TD is visible before publishing its first TRB.
+        barrier::dma_write();
 
         // Flip the cycle bit to the correct value
         let control = unsafe { core::ptr::read_volatile(&entry.control as *const u32) };
@@ -857,8 +857,8 @@ impl XhciController {
             );
         }
 
-        // Memory barrier to ensure all DCBAA/scratchpad writes are visible
-        fence(Ordering::SeqCst);
+        // Publish DMA structures before programming their MMIO base address.
+        barrier::mmio_write();
 
         self.op().write_dcbaap(self.dcbaa);
 
@@ -1197,7 +1197,7 @@ impl XhciController {
         trb.control |= (dci as u32) << 16;
 
         self.cmd_ring.enqueue(&trb, false);
-        fence(Ordering::SeqCst);
+        barrier::mmio_write();
         self.ring_doorbell(0, 0);
 
         // Wait for Reset Endpoint completion
@@ -1239,7 +1239,7 @@ impl XhciController {
         trb.control |= (dci as u32) << 16;
 
         self.cmd_ring.enqueue(&trb, false);
-        fence(Ordering::SeqCst);
+        barrier::mmio_write();
         self.ring_doorbell(0, 0);
 
         // Wait for Set TR Dequeue Pointer completion
@@ -1272,7 +1272,7 @@ impl XhciController {
             self.op().read_crcr()
         );
 
-        fence(Ordering::SeqCst); // Memory barrier before doorbell
+        barrier::mmio_write();
         self.ring_doorbell(0, 0); // Ring host controller doorbell
 
         // Check USBSTS after ringing doorbell
@@ -1341,7 +1341,7 @@ impl XhciController {
         trb.control |= (slot_id as u32) << 24;
 
         self.cmd_ring.enqueue(&trb, false);
-        fence(Ordering::SeqCst); // Memory barrier before doorbell
+        barrier::mmio_write();
         self.ring_doorbell(0, 0);
 
         self.wait_command_completion()?;
@@ -1469,8 +1469,8 @@ impl XhciController {
         // Commit the deferred first TRB — atomically makes the entire TD live
         TrbRing::commit_deferred_trb(first_trb_addr, first_trb_cycle);
 
-        // Memory barrier and ring doorbell
-        fence(Ordering::SeqCst);
+        // Publish the DMA transfer ring before its MMIO doorbell.
+        barrier::mmio_write();
         self.ring_doorbell(slot_id, DCI_EP0);
 
         // Wait for completion
@@ -1532,7 +1532,7 @@ impl XhciController {
         trb.control |= (slot_id as u32) << 24;
 
         self.cmd_ring.enqueue(&trb, false);
-        fence(Ordering::SeqCst);
+        barrier::mmio_write();
         self.ring_doorbell(0, 0);
         self.wait_command_completion()?;
         Ok(())
@@ -1835,7 +1835,7 @@ impl XhciController {
         trb.control |= (slot_id as u32) << 24;
 
         self.cmd_ring.enqueue(&trb, false);
-        core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+        barrier::mmio_write();
         self.ring_doorbell(0, 0);
 
         self.wait_command_completion()?;
@@ -1909,7 +1909,7 @@ impl XhciController {
         trb.control |= (slot_id as u32) << 24;
 
         self.cmd_ring.enqueue(&trb, false);
-        core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+        barrier::mmio_write();
         self.ring_doorbell(0, 0);
         self.wait_command_completion()?;
         crate::time::delay_ms(2);
@@ -2526,7 +2526,7 @@ impl XhciController {
         trb.control |= (slot_id as u32) << 24;
 
         self.cmd_ring.enqueue(&trb, false);
-        fence(Ordering::SeqCst);
+        barrier::mmio_write();
         self.ring_doorbell(0, 0);
         self.wait_command_completion()?;
 
@@ -2571,7 +2571,7 @@ impl XhciController {
         trb.control |= 1 << 2; // ISP (Interrupt on Short Packet)
 
         ring.enqueue(&trb, false);
-        fence(Ordering::SeqCst);
+        barrier::mmio_write();
         self.ring_doorbell(slot_id, in_dci as u8);
 
         // Reuse the existing transfer completion path (expects 1 TRB event).
@@ -2652,7 +2652,7 @@ impl XhciController {
         trb.control |= (slot_id as u32) << 24;
 
         self.cmd_ring.enqueue(&trb, false);
-        fence(Ordering::SeqCst); // Memory barrier before doorbell
+        barrier::mmio_write();
         self.ring_doorbell(0, 0);
 
         self.wait_command_completion()?;
@@ -2696,8 +2696,8 @@ impl XhciController {
         // Queue all TRBs for this transfer
         let trb_count = self.queue_bulk_trbs(slot_id, dci, is_in, data)?;
 
-        // Memory barrier and ring doorbell
-        fence(Ordering::SeqCst);
+        // Publish the DMA transfer ring before its MMIO doorbell.
+        barrier::mmio_write();
         self.ring_doorbell(slot_id, dci as u8);
 
         // Wait for all TRB completions

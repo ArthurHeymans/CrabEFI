@@ -7,11 +7,11 @@
 //! - OHCI Specification 1.0a
 //! - libpayload ohci.c
 
+use crate::barrier;
 use crate::drivers::pci::{self, PciAddress, PciDevice};
 use crate::efi;
 use crate::time::{Timeout, wait_for};
 use core::ptr;
-use core::sync::atomic::{Ordering, fence};
 use tock_registers::interfaces::{ReadWriteable, Readable, Writeable};
 
 use super::controller::{
@@ -606,14 +606,14 @@ impl OhciController {
             ed.tail_td = (td_base + 32) as u32;
         }
 
-        fence(Ordering::SeqCst);
+        barrier::dma_write();
 
         // Insert ED into control list
         let head_ed = unsafe { &mut *(self.control_ed as *mut EndpointDescriptor) };
         ed.next_ed = head_ed.next_ed;
-        fence(Ordering::SeqCst);
+        barrier::dma_write();
         head_ed.next_ed = ed_addr as u32;
-        fence(Ordering::SeqCst);
+        barrier::mmio_write();
 
         // Tell controller list is filled
         self.regs().hccommandstatus.write(HCCOMMANDSTATUS::CLF::SET);
@@ -623,7 +623,7 @@ impl OhciController {
         let timeout = Timeout::from_ms(5000);
 
         while !timeout.is_expired() {
-            fence(Ordering::SeqCst);
+            barrier::dma_read();
             if status_td.is_complete() {
                 break;
             }
@@ -632,7 +632,7 @@ impl OhciController {
 
         // Remove ED from list
         head_ed.next_ed = ed.next_ed;
-        fence(Ordering::SeqCst);
+        barrier::dma_write();
 
         // Check result
         if !status_td.is_complete() {
@@ -779,14 +779,14 @@ impl UsbController for OhciController {
             ed.head_td = td_addr as u32 | if toggle { 2 } else { 0 };
             ed.tail_td = (td_addr + 16) as u32;
 
-            fence(Ordering::SeqCst);
+            barrier::dma_write();
 
             // Insert into bulk list
             let head_ed = unsafe { &mut *(self.bulk_ed as *mut EndpointDescriptor) };
             ed.next_ed = head_ed.next_ed;
-            fence(Ordering::SeqCst);
+            barrier::dma_write();
             head_ed.next_ed = ed_addr as u32;
-            fence(Ordering::SeqCst);
+            barrier::mmio_write();
 
             // Trigger bulk list
             self.regs().hccommandstatus.write(HCCOMMANDSTATUS::BLF::SET);
@@ -794,7 +794,7 @@ impl UsbController for OhciController {
             // Wait for completion
             let timeout = Timeout::from_ms(5000);
             while !timeout.is_expired() {
-                fence(Ordering::SeqCst);
+                barrier::dma_read();
                 if td.is_complete() {
                     break;
                 }
@@ -803,7 +803,7 @@ impl UsbController for OhciController {
 
             // Remove from list
             head_ed.next_ed = ed.next_ed;
-            fence(Ordering::SeqCst);
+            barrier::dma_write();
 
             // Check result
             if !td.is_complete() {

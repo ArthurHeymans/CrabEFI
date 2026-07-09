@@ -12,11 +12,11 @@ use super::controller::{
     enumerate_hub_ports,
 };
 use super::uhci_regs::{PORTSC, USBCMD, USBSTS, UhciRegs};
+use crate::barrier;
 use crate::drivers::pci::{self, PciAddress, PciDevice};
 use crate::efi;
 use crate::time::{Timeout, wait_for};
 use core::ptr;
-use core::sync::atomic::{Ordering, fence};
 use tock_registers::interfaces::{ReadWriteable, Readable, Writeable};
 
 // ============================================================================
@@ -733,17 +733,17 @@ impl UhciController {
         let status_dir_in = if data_len > 0 { !is_in } else { true };
         *status_td = TransferDescriptor::status(device.address, status_dir_in, 0, is_low_speed);
 
-        fence(Ordering::SeqCst);
+        barrier::dma_write();
 
         // Point QH element to first TD
         let qh = unsafe { &mut *(self.qh as *mut QueueHead) };
         qh.element_link = setup_td_addr as u32;
-        fence(Ordering::SeqCst);
+        barrier::dma_write();
 
         // Wait for status TD completion
         let timeout = Timeout::from_ms(5000);
         loop {
-            fence(Ordering::SeqCst);
+            barrier::dma_read();
             let sts = unsafe { ptr::read_volatile(&status_td.ctrl_sts) };
             if sts & TransferDescriptor::CS_ACTIVE == 0 {
                 break;
@@ -751,7 +751,7 @@ impl UhciController {
             if timeout.is_expired() {
                 // Clear QH before returning
                 qh.element_link = QueueHead::TERMINATE;
-                fence(Ordering::SeqCst);
+                barrier::dma_write();
                 return Err(UsbError::Timeout);
             }
             core::hint::spin_loop();
@@ -759,7 +759,7 @@ impl UhciController {
 
         // Clear QH
         qh.element_link = QueueHead::TERMINATE;
-        fence(Ordering::SeqCst);
+        barrier::dma_write();
 
         // Check setup TD and all data TDs for errors
         let setup_td = unsafe { &*(setup_td_addr as *const TransferDescriptor) };
@@ -917,17 +917,17 @@ impl UsbController for UhciController {
             );
             td.ctrl_sts |= TransferDescriptor::CS_IOC;
 
-            fence(Ordering::SeqCst);
+            barrier::dma_write();
 
             // Point QH to TD
             let qh = unsafe { &mut *(self.qh as *mut QueueHead) };
             qh.element_link = td_addr as u32;
-            fence(Ordering::SeqCst);
+            barrier::dma_write();
 
             // Wait for completion
             let timeout = Timeout::from_ms(5000);
             while !timeout.is_expired() {
-                fence(Ordering::SeqCst);
+                barrier::dma_read();
                 if !td.is_active() {
                     break;
                 }
@@ -936,7 +936,7 @@ impl UsbController for UhciController {
 
             // Clear QH
             qh.element_link = QueueHead::TERMINATE;
-            fence(Ordering::SeqCst);
+            barrier::dma_write();
 
             // Check result
             if td.is_active() {

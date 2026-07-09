@@ -5,12 +5,12 @@
 
 pub mod regs;
 
+use crate::barrier;
 use crate::drivers::pci::{self, PciDevice};
 use crate::efi;
 use crate::efi::allocator::PAGE_SIZE_USIZE;
 use crate::time::{Timeout, wait_for};
 use core::ptr;
-use core::sync::atomic::{Ordering, fence};
 use spin::Mutex;
 use tock_registers::interfaces::{ReadWriteable, Readable, Writeable};
 
@@ -1174,7 +1174,7 @@ impl AhciController {
         slot: u8,
         timeout_ms: u64,
     ) -> Result<(), AhciError> {
-        fence(Ordering::SeqCst);
+        barrier::mmio_write();
 
         let port_regs = self.port_regs(port_num);
 

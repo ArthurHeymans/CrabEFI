@@ -28,11 +28,11 @@ use crate::arch::aarch64::cache::{flush_cache_range, invalidate_cache_range};
 use crate::arch::riscv64::cache::{flush_cache_range, invalidate_cache_range};
 #[cfg(target_arch = "x86_64")]
 use crate::arch::x86_64::cache::{flush_cache_range, invalidate_cache_range};
+use crate::barrier;
 use crate::drivers::pci::{self, PciAddress, PciDevice};
 use crate::efi;
 use crate::time::{Timeout, wait_for};
 use core::ptr;
-use core::sync::atomic::{Ordering, fence};
 use tock_registers::interfaces::{ReadWriteable, Readable, Writeable};
 
 // Import register definitions from ehci_regs module
@@ -589,7 +589,7 @@ impl EhciController {
         qh.overlay.alt_next_qtd = Qtd::TERMINATE;
         // Halted so HC won't try to process the head
         qh.overlay.token = Qtd::TOKEN_STATUS_HALTED;
-        fence(Ordering::SeqCst);
+        barrier::dma_write();
 
         // Flush async head to main memory for DMA
         flush_cache_range(self.async_qh, 96);
@@ -602,7 +602,7 @@ impl EhciController {
             core::slice::from_raw_parts_mut(self.periodic_list as *mut u32, Self::FRAME_LIST_SIZE)
         };
         frame_list.fill(Qh::TERMINATE);
-        fence(Ordering::SeqCst);
+        barrier::dma_write();
 
         // Flush periodic list to main memory
         flush_cache_range(self.periodic_list, Self::FRAME_LIST_SIZE * 4);
@@ -663,7 +663,7 @@ impl EhciController {
                 // this controller and linked into the async schedule.
                 let bulk_qh = unsafe { &*(self.bulk_qh as *const Qh) };
                 current.qh_link = bulk_qh.qh_link;
-                fence(Ordering::SeqCst);
+                barrier::dma_write();
                 flush_cache_range(current_addr, 4);
                 unlinked = true;
                 break;
@@ -1146,7 +1146,7 @@ impl EhciController {
             core::slice::from_raw_parts_mut(qtd_data_addr as *mut u8, 64).fill(0);
             core::slice::from_raw_parts_mut(qtd_status_addr as *mut u8, 64).fill(0);
         }
-        fence(Ordering::SeqCst);
+        barrier::dma_write();
 
         // Build setup packet (8 bytes)
         let setup_packet = SetupPacket::new(request_type, request, value, index, data_len as u16);
@@ -1258,7 +1258,7 @@ impl EhciController {
         qh.overlay.buffer.fill(0);
         qh.overlay.buffer_hi.fill(0);
 
-        fence(Ordering::SeqCst);
+        barrier::dma_write();
 
         // Flush setup packet data to main memory
         flush_cache_range(setup_addr, 8);
@@ -1291,12 +1291,12 @@ impl EhciController {
         let async_qh = unsafe { &mut *(self.async_qh as *mut Qh) };
         let old_link = async_qh.qh_link;
         qh.qh_link = old_link;
-        fence(Ordering::SeqCst);
+        barrier::dma_write();
         flush_cache_range(qh_addr, 4);
 
         // Now link our QH into the schedule
         async_qh.qh_link = (qh_addr as u32) | Qh::TYPE_QH;
-        fence(Ordering::SeqCst);
+        barrier::dma_write();
         flush_cache_range(self.async_qh, 4);
 
         // Read back for debug
@@ -1339,7 +1339,7 @@ impl EhciController {
         if !wait_for(100, || self.op().usbsts.is_set(USBSTS::ASS)) {
             log::error!("EHCI: Async schedule failed to start");
             async_qh.qh_link = old_link;
-            fence(Ordering::SeqCst);
+            barrier::dma_write();
             flush_cache_range(self.async_qh, 4);
             return Err(UsbError::Timeout);
         }
@@ -1355,7 +1355,7 @@ impl EhciController {
             if data_len > 0 {
                 invalidate_cache_range(qtd_data_addr, 64);
             }
-            fence(Ordering::SeqCst);
+            barrier::dma_read();
 
             // Read qTD tokens (cache invalidated, so direct access is safe)
             let setup_token = qtd_setup.token;
@@ -1400,9 +1400,9 @@ impl EhciController {
             crate::time::delay_us(1);
         }
 
-        // Unlink QH from schedule
+        // Unlink QH before stopping the schedule through MMIO.
         async_qh.qh_link = old_link;
-        fence(Ordering::SeqCst);
+        barrier::mmio_write();
 
         // Stop the async schedule after the one-shot transfer. This avoids
         // relying on IAAD for transient QHs and matches libpayload's model.
@@ -1421,7 +1421,7 @@ impl EhciController {
                 invalidate_cache_range(data_addr, data_len);
             }
         }
-        fence(Ordering::SeqCst);
+        barrier::dma_read();
 
         // Check results (caches already invalidated above)
         let final_setup_token = qtd_setup.token;
@@ -1547,7 +1547,7 @@ impl EhciController {
             | ((data.len() as u32) << Qtd::TOKEN_BYTES_SHIFT);
         qtd.set_buffers(data_addr, data.len());
 
-        fence(Ordering::SeqCst);
+        barrier::dma_write();
 
         // Configure QH - always update for correct device/endpoint
         let qh = unsafe { &mut *(qh_addr as *mut Qh) };
@@ -1562,7 +1562,7 @@ impl EhciController {
             async_qh.qh_link = (qh_addr as u32) | Qh::TYPE_QH;
             self.bulk_qh_linked = true;
 
-            fence(Ordering::SeqCst);
+            barrier::dma_write();
         }
 
         // Always reconfigure QH for current device/endpoint (ep_chars changes per transfer)
@@ -1582,7 +1582,7 @@ impl EhciController {
         qh.overlay.alt_next_qtd = Qtd::TERMINATE;
         qh.overlay.token = 0; // Clear ACTIVE to let HC fetch new qTD
 
-        fence(Ordering::SeqCst);
+        barrier::mmio_write();
 
         // Enable async schedule if not already enabled
         if !self.async_schedule_enabled {
@@ -1597,7 +1597,7 @@ impl EhciController {
         let qtd = unsafe { &*(qtd_addr as *const Qtd) };
         while !timeout.is_expired() {
             invalidate_cache_range(qtd_addr, 64);
-            fence(Ordering::SeqCst);
+            barrier::dma_read();
             if (qtd.token & Qtd::TOKEN_STATUS_ACTIVE) == 0 {
                 break;
             }
@@ -1606,7 +1606,7 @@ impl EhciController {
 
         // Check results
         invalidate_cache_range(qtd_addr, 64);
-        fence(Ordering::SeqCst);
+        barrier::dma_read();
         let token = qtd.token;
 
         if (token & Qtd::TOKEN_STATUS_ACTIVE) != 0 {

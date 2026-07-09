@@ -4,7 +4,7 @@
 //! On AArch64, cache maintenance is done via system instructions
 //! operating on virtual addresses.
 
-use core::sync::atomic::{Ordering, fence};
+use crate::barrier;
 
 /// Cache line size (typically 64 bytes on most AArch64 implementations)
 pub const CACHE_LINE_SIZE: usize = 64;
@@ -32,11 +32,8 @@ pub fn flush_cache_range(addr: u64, size: usize) {
             );
         }
     }
-    // Data synchronization barrier to ensure all cache operations complete
-    fence(Ordering::SeqCst);
-    unsafe {
-        core::arch::asm!("dsb sy", options(nostack, preserves_flags));
-    }
+    // Cache-maintenance completion requires the full-system MMIO-strength DSB.
+    barrier::mmio_general();
 }
 
 /// Invalidate a memory range in CPU cache
@@ -62,9 +59,6 @@ pub fn invalidate_cache_range(addr: u64, size: usize) {
             );
         }
     }
-    // Data synchronization barrier to ensure all cache operations complete
-    fence(Ordering::SeqCst);
-    unsafe {
-        core::arch::asm!("dsb sy", options(nostack, preserves_flags));
-    }
+    // Cache-maintenance completion requires the full-system MMIO-strength DSB.
+    barrier::mmio_general();
 }
