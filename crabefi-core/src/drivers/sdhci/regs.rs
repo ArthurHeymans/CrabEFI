@@ -388,8 +388,17 @@ pub const SDHCI_DEFAULT_BOUNDARY_ARG: u16 = 7;
 /// GO_IDLE_STATE - Resets all cards to idle state
 pub const MMC_CMD_GO_IDLE_STATE: u8 = 0;
 
+/// SEND_OP_COND - Sends eMMC operating condition request
+pub const MMC_CMD_SEND_OP_COND: u8 = 1;
+
 /// ALL_SEND_CID - Asks all cards to send their CID
 pub const MMC_CMD_ALL_SEND_CID: u8 = 2;
+
+/// SET_RELATIVE_ADDR - Assigns an RCA to an eMMC device
+pub const MMC_CMD_SET_RELATIVE_ADDR: u8 = 3;
+
+/// SEND_EXT_CSD - Reads the eMMC extended CSD register
+pub const MMC_CMD_SEND_EXT_CSD: u8 = 8;
 
 /// SELECT/DESELECT_CARD - Toggles card between stand-by and transfer states
 pub const MMC_CMD_SELECT_CARD: u8 = 7;

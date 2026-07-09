@@ -684,7 +684,10 @@ fn discover_sdhci_entries(menu: &mut BootMenu) {
         if !controller.is_ready() {
             continue;
         }
-        let pci_addr = controller.pci_address();
+        let (pci_device, pci_function, label) = match controller.pci_address() {
+            Some(addr) => (addr.device, addr.function, "SD card"),
+            None => (0, 0, "eMMC"),
+        };
 
         if !sdhci::store_global_device(controller_id) {
             continue;
@@ -692,9 +695,9 @@ fn discover_sdhci_entries(menu: &mut BootMenu) {
 
         discover_entries_on_disk(
             DeviceType::Sdhci { controller_id },
-            pci_addr.device,
-            pci_addr.function,
-            "SD card",
+            pci_device,
+            pci_function,
+            label,
             menu,
         );
     }

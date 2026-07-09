@@ -385,13 +385,24 @@ impl SdhciBlockDevice {
     /// * `block_size` - Block size in bytes
     /// * `media_id` - Media ID for BlockIO
     pub fn new(controller_id: usize, num_blocks: u64, block_size: u32, media_id: u32) -> Self {
+        Self::new_with_removable(controller_id, num_blocks, block_size, media_id, true)
+    }
+
+    /// Create a new SDHCI block device with explicit removability.
+    pub fn new_with_removable(
+        controller_id: usize,
+        num_blocks: u64,
+        block_size: u32,
+        media_id: u32,
+        removable: bool,
+    ) -> Self {
         Self {
             controller_id,
             info: BlockDeviceInfo {
                 num_blocks,
                 block_size,
                 media_id,
-                removable: true, // SD cards are removable
+                removable,
                 read_only: false,
             },
         }
@@ -577,7 +588,7 @@ impl<'a> BlockDevice for SdhciDisk<'a> {
             num_blocks: self.controller.num_blocks(),
             block_size: self.controller.block_size(),
             media_id: 0,
-            removable: true,
+            removable: self.controller.removable(),
             read_only: false,
         }
     }
@@ -680,10 +691,11 @@ pub fn create_sdhci_device(controller_id: usize, media_id: u32) -> Option<SdhciB
         return None;
     }
 
-    Some(SdhciBlockDevice::new(
+    Some(SdhciBlockDevice::new_with_removable(
         controller_id,
         controller.num_blocks(),
         controller.block_size(),
         media_id,
+        controller.removable(),
     ))
 }

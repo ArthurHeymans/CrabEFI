@@ -37,6 +37,33 @@ const DEFAULT_CLOCK_HZ: u32 = 25_000_000;
 /// High speed clock frequency (50 MHz)
 const HIGH_SPEED_CLOCK_HZ: u32 = 50_000_000;
 
+/// SDHCI controller origin.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SdhciIdentity {
+    /// PCI SDHCI controller.
+    Pci(PciAddress),
+    /// ACPI-described MMIO SDHCI controller.
+    Acpi {
+        /// ACPI namespace name.
+        name: [u8; 4],
+        /// ACPI hardware ID.
+        hid: [u8; 16],
+        /// Hardware ID length.
+        hid_len: u8,
+        /// MMIO base from `_CRS`.
+        mmio_base: u64,
+    },
+}
+
+/// Card protocol attached to an SDHCI controller.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SdhciMedia {
+    /// Removable SD card.
+    Sd,
+    /// Non-removable eMMC device.
+    Emmc,
+}
+
 /// SDHCI error type
 #[derive(Debug, Clone, Copy)]
 pub enum SdhciError {
@@ -78,8 +105,14 @@ pub enum SdhciError {
 
 /// SDHCI Controller
 pub struct SdhciController {
-    /// PCI address (bus:device.function)
-    pci_address: PciAddress,
+    /// Controller origin.
+    identity: SdhciIdentity,
+    /// Card protocol.
+    media: SdhciMedia,
+    /// Whether media should be reported as removable.
+    removable: bool,
+    /// Whether to trust SDHCI card-detect status.
+    use_card_detect: bool,
     /// Pointer to MMIO registers
     regs: *const SdhciRegisters,
     /// SDHCI specification version
@@ -124,17 +157,42 @@ impl SdhciController {
     /// Create a new SDHCI controller from a PCI device
     pub fn new(pci_dev: &PciDevice) -> Result<Self, SdhciError> {
         let mmio_base = pci_dev.mmio_base().ok_or(SdhciError::NotInitialized)?;
-        let regs = mmio_base as *const SdhciRegisters;
 
         // Enable the device (bus master + memory space)
         pci::enable_device(pci_dev);
 
-        // Allocate a page-aligned DMA buffer for data transfers
-        let dma_buffer_mem = efi::allocate_pages(1).ok_or(SdhciError::AllocationFailed)?;
+        Self::new_mmio(
+            mmio_base,
+            SdhciIdentity::Pci(pci_dev.address),
+            SdhciMedia::Sd,
+            true,
+            true,
+        )
+    }
+
+    /// Create a new SDHCI controller from an MMIO base address.
+    pub fn new_mmio(
+        mmio_base: u64,
+        identity: SdhciIdentity,
+        media: SdhciMedia,
+        removable: bool,
+        use_card_detect: bool,
+    ) -> Result<Self, SdhciError> {
+        if mmio_base == 0 {
+            return Err(SdhciError::NotInitialized);
+        }
+
+        let regs = mmio_base as *const SdhciRegisters;
+
+        // SDMA is 32-bit, so the bounce buffer must be below 4 GiB.
+        let dma_buffer_mem = efi::allocate_pages_below_4g(1).ok_or(SdhciError::AllocationFailed)?;
         let dma_buffer = dma_buffer_mem.as_mut_ptr();
 
         let mut controller = Self {
-            pci_address: pci_dev.address,
+            identity,
+            media,
+            removable,
+            use_card_detect,
             regs,
             version: 0,
             max_clock: 0,
@@ -234,11 +292,12 @@ impl SdhciController {
             regs.signal_enable.set(0); // Polling mode, no signal interrupts
         }
 
-        // Check for card presence
-        self.card_present = self.detect_card();
+        // Check for card presence. Non-removable eMMC often does not wire
+        // SDHCI card-detect, so ACPI-described eMMC skips it.
+        self.card_present = !self.use_card_detect || self.detect_card();
 
         if self.card_present {
-            log::info!("SDHCI: Card detected");
+            log::info!("SDHCI: Card detected ({:?})", self.media);
             // Initialize the card
             if let Err(e) = self.init_card() {
                 log::error!("SDHCI: Failed to initialize card: {:?}", e);
@@ -564,6 +623,14 @@ impl SdhciController {
 
     /// Initialize the SD card
     fn init_card(&mut self) -> Result<(), SdhciError> {
+        match self.media {
+            SdhciMedia::Sd => self.init_sd_card(),
+            SdhciMedia::Emmc => self.init_emmc(),
+        }
+    }
+
+    /// Initialize an SD card
+    fn init_sd_card(&mut self) -> Result<(), SdhciError> {
         // Set identification clock (400 kHz)
         self.set_clock(INIT_CLOCK_HZ)?;
 
@@ -720,6 +787,101 @@ impl SdhciController {
         Ok(())
     }
 
+    /// Initialize a non-removable eMMC device.
+    fn init_emmc(&mut self) -> Result<(), SdhciError> {
+        const EMMC_RCA: u16 = 1;
+        const EXT_CSD_SEC_COUNT: usize = 212;
+
+        self.set_clock(INIT_CLOCK_HZ)?;
+        self.set_bus_width(1);
+
+        let timeout = Timeout::from_ms(10);
+        while !timeout.is_expired() {
+            core::hint::spin_loop();
+        }
+
+        log::debug!("SDHCI: eMMC CMD0 (GO_IDLE_STATE)");
+        let _ = self.send_command(MMC_CMD_GO_IDLE_STATE, 0, MMC_RSP_NONE);
+
+        log::debug!("SDHCI: eMMC CMD1 (SEND_OP_COND)");
+        let timeout = Timeout::from_ms(1000);
+        let mut ocr = 0u32;
+        let ocr_arg = OCR_HCS | OCR_VDD_RANGE;
+        while !timeout.is_expired() {
+            if let Ok(resp) = self.send_command(MMC_CMD_SEND_OP_COND, ocr_arg, MMC_RSP_R3) {
+                ocr = resp[0];
+                if ocr & OCR_BUSY != 0 {
+                    break;
+                }
+            }
+            for _ in 0..10000 {
+                core::hint::spin_loop();
+            }
+        }
+
+        if ocr & OCR_BUSY == 0 {
+            log::error!("SDHCI: eMMC initialization timeout");
+            return Err(SdhciError::CardInitFailed);
+        }
+
+        self.high_capacity = (ocr & OCR_HCS) != 0;
+        log::debug!("SDHCI: eMMC OCR={:#010x}", ocr);
+
+        log::debug!("SDHCI: eMMC CMD2 (ALL_SEND_CID)");
+        let cid = self.send_command(MMC_CMD_ALL_SEND_CID, 0, MMC_RSP_R2)?;
+        log::debug!(
+            "SDHCI: eMMC CID: {:08x} {:08x} {:08x} {:08x}",
+            cid[3],
+            cid[2],
+            cid[1],
+            cid[0]
+        );
+
+        self.rca = EMMC_RCA;
+        log::debug!("SDHCI: eMMC CMD3 (SET_RELATIVE_ADDR)");
+        self.send_command(
+            MMC_CMD_SET_RELATIVE_ADDR,
+            (self.rca as u32) << 16,
+            MMC_RSP_R1,
+        )?;
+
+        log::debug!("SDHCI: eMMC CMD9 (SEND_CSD)");
+        let csd = self.send_command(MMC_CMD_SEND_CSD, (self.rca as u32) << 16, MMC_RSP_R2)?;
+        self.parse_csd(&csd);
+
+        log::debug!("SDHCI: eMMC CMD7 (SELECT_CARD)");
+        self.send_command(MMC_CMD_SELECT_CARD, (self.rca as u32) << 16, MMC_RSP_R1B)?;
+
+        log::debug!("SDHCI: eMMC CMD16 (SET_BLOCKLEN)");
+        self.send_command(MMC_CMD_SET_BLOCKLEN, SD_BLOCK_SIZE, MMC_RSP_R1)?;
+
+        if self.read_data_command(MMC_CMD_SEND_EXT_CSD, 0, 512).is_ok() {
+            let ext_csd = unsafe { core::slice::from_raw_parts(self.dma_buffer, 512) };
+            let sec_count = u32::from_le_bytes([
+                ext_csd[EXT_CSD_SEC_COUNT],
+                ext_csd[EXT_CSD_SEC_COUNT + 1],
+                ext_csd[EXT_CSD_SEC_COUNT + 2],
+                ext_csd[EXT_CSD_SEC_COUNT + 3],
+            ]);
+            if sec_count != 0 {
+                self.num_blocks = sec_count as u64;
+                self.high_capacity = true;
+            }
+        }
+
+        self.set_clock(DEFAULT_CLOCK_HZ)?;
+
+        self.card_initialized = true;
+        log::info!(
+            "SDHCI: eMMC initialized: {} blocks x {} bytes = {} MB",
+            self.num_blocks,
+            self.block_size,
+            (self.num_blocks * self.block_size as u64) / (1024 * 1024)
+        );
+
+        Ok(())
+    }
+
     /// Parse CSD register to get card capacity
     fn parse_csd(&mut self, csd: &[u32; 4]) {
         log::debug!(
@@ -822,6 +984,11 @@ impl SdhciController {
 
     /// Send CMD6 (SWITCH_FUNC) and receive 64 bytes of status data via SDMA
     fn cmd6_transfer(&mut self, arg: u32) -> Result<(), SdhciError> {
+        self.read_data_command(SD_CMD_SWITCH_FUNC, arg, 64)
+    }
+
+    /// Send a single-block read-data command into the DMA buffer.
+    fn read_data_command(&mut self, cmd: u8, arg: u32, block_size: u16) -> Result<(), SdhciError> {
         self.wait_inhibit(true)?;
 
         {
@@ -836,9 +1003,8 @@ impl SdhciController {
             }
             regs.sdma_addr.set(dma_addr as u32);
 
-            // CMD6 returns exactly 64 bytes (1 block of 64 bytes)
             regs.block_size
-                .write(BLOCK_SIZE::BLOCK_SIZE.val(64) + BLOCK_SIZE::SDMA_BOUNDARY.val(0));
+                .write(BLOCK_SIZE::BLOCK_SIZE.val(block_size) + BLOCK_SIZE::SDMA_BOUNDARY.val(0));
             regs.block_count.set(1);
 
             // Transfer mode: DMA, read, single block
@@ -850,8 +1016,7 @@ impl SdhciController {
 
             regs.argument.set(arg);
 
-            // CMD6 uses R1 response with data
-            let cmd_val = COMMAND::CMD_INDEX.val(SD_CMD_SWITCH_FUNC as u16)
+            let cmd_val = COMMAND::CMD_INDEX.val(cmd as u16)
                 + COMMAND::RESPONSE_TYPE::Short48
                 + COMMAND::CRC_CHECK::SET
                 + COMMAND::INDEX_CHECK::SET
@@ -1169,9 +1334,22 @@ impl SdhciController {
         self.card_present && self.card_initialized
     }
 
-    /// Get the PCI address of this controller
-    pub fn pci_address(&self) -> PciAddress {
-        self.pci_address
+    /// Get the PCI address of this controller, if it has one.
+    pub fn pci_address(&self) -> Option<PciAddress> {
+        match self.identity {
+            SdhciIdentity::Pci(address) => Some(address),
+            SdhciIdentity::Acpi { .. } => None,
+        }
+    }
+
+    /// Get this controller's origin.
+    pub fn identity(&self) -> SdhciIdentity {
+        self.identity
+    }
+
+    /// Return whether this controller's media is removable.
+    pub fn removable(&self) -> bool {
+        self.removable
     }
 }
 
@@ -1207,6 +1385,41 @@ pub fn init_device(dev: &pci::PciDevice) -> Result<(), ()> {
 
     SDHCI_CONTROLLERS.register(controller)?;
     log::info!("SDHCI controller at {} initialized", dev.address);
+    Ok(())
+}
+
+/// Initialize an ACPI-described MMIO SDHCI controller.
+pub fn init_mmio_device(dev: &crate::fdt::DsdtDevice, media: SdhciMedia) -> Result<(), ()> {
+    if dev.mmio_base == 0 || dev.mmio_size == 0 {
+        return Err(());
+    }
+
+    log::info!(
+        "Initializing MMIO SDHCI controller {} [{}] at {:#x}+{:#x}",
+        dev.name_str(),
+        dev.hid_str(),
+        dev.mmio_base,
+        dev.mmio_size,
+    );
+
+    let controller = SdhciController::new_mmio(
+        dev.mmio_base,
+        SdhciIdentity::Acpi {
+            name: dev.name,
+            hid: dev.hid,
+            hid_len: dev.hid_len,
+            mmio_base: dev.mmio_base,
+        },
+        media,
+        false,
+        false,
+    )
+    .map_err(|e| {
+        log::error!("Failed to initialize MMIO SDHCI controller: {:?}", e);
+    })?;
+
+    SDHCI_CONTROLLERS.register(controller)?;
+    log::info!("MMIO SDHCI controller initialized");
     Ok(())
 }
 
