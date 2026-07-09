@@ -450,6 +450,20 @@ fn discover_namespace_devices(
             _ => return Ok(true),
         };
 
+        // Honor _STA when present. If absent, ACPI treats the device as present.
+        let sta_path = AmlName::from_str("_STA")
+            .map_err(|e| {
+                log::trace!("ACPI: bad _STA name: {:?}", e);
+                e
+            })?
+            .resolve(path)?;
+        if let Ok(Some(sta_obj)) = interpreter.evaluate_if_present(sta_path, vec![])
+            && let Object::Integer(sta) = &*sta_obj
+            && (*sta & 0x0b) != 0x0b
+        {
+            return Ok(true);
+        }
+
         // --- _CRS ---
         let crs_path = AmlName::from_str("_CRS")
             .map_err(|e| {
