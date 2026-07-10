@@ -31,7 +31,6 @@ pub mod uhci;
 #[cfg(target_arch = "x86_64")]
 pub mod uhci_regs;
 pub mod xhci;
-pub mod xhci_regs;
 
 pub use self::controller::{DeviceInfo, UsbController, UsbError, UsbSpeed};
 pub use mass_storage::UsbMassStorage;
@@ -489,9 +488,9 @@ impl UsbController for XhciController {
             XhciError::Timeout => self::controller::UsbError::Timeout,
             XhciError::StallError => self::controller::UsbError::Stall,
             XhciError::DeviceNotFound => self::controller::UsbError::DeviceNotFound,
-            XhciError::TransferFailed(cc) if cc == xhci_regs::TRB_CC_BABBLE_DETECTED => {
-                self::controller::UsbError::Babble
-            }
+            XhciError::TransferFailed(Ok(
+                ::xhci::ring::trb::event::CompletionCode::BabbleDetectedError,
+            )) => self::controller::UsbError::Babble,
             _ => self::controller::UsbError::TransactionError,
         })
     }
@@ -508,9 +507,9 @@ impl UsbController for XhciController {
             XhciError::Timeout => self::controller::UsbError::Timeout,
             XhciError::StallError => self::controller::UsbError::Stall,
             XhciError::DeviceNotFound => self::controller::UsbError::DeviceNotFound,
-            XhciError::TransferFailed(cc) if cc == xhci_regs::TRB_CC_BABBLE_DETECTED => {
-                self::controller::UsbError::Babble
-            }
+            XhciError::TransferFailed(Ok(
+                ::xhci::ring::trb::event::CompletionCode::BabbleDetectedError,
+            )) => self::controller::UsbError::Babble,
             _ => self::controller::UsbError::TransactionError,
         })
     }
