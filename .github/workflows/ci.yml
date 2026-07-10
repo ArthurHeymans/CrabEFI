@@ -73,6 +73,11 @@ jobs:
       - name: Build release
         run: cargo build -p crabefi-coreboot --release --target x86_64-unknown-none
 
+      - name: Report reserved stack
+        run: |
+          stack_hex=$(readelf -SW target/x86_64-unknown-none/release/crabefi | awk '$2 == ".stack" { print $6 }')
+          printf '## x86_64 memory report\n\n- Reserved stack: %d KiB\n' "$((16#$stack_hex / 1024))" >> "$GITHUB_STEP_SUMMARY"
+
       - name: Upload CrabEFI ELF
         uses: actions/upload-artifact@v4
         with:
@@ -109,7 +114,13 @@ jobs:
           path: target/x86_64-unknown-none/release/
 
       - name: Run integration tests (USB)
-        run: ./crabefi test --app hello --disable-kvm --timeout 120
+        run: |
+          set -o pipefail
+          ./crabefi test --app hello --disable-kvm --timeout 120 | tee qemu.log
+          {
+            echo '## Q35 runtime memory report'
+            grep -F 'MEMORY_REPORT' qemu.log || true
+          } >> "$GITHUB_STEP_SUMMARY"
 
   test-ahci:
     name: Test x86_64 (AHCI Storage)

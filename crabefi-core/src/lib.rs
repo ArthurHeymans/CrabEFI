@@ -125,6 +125,36 @@ pub fn display_secure_boot_error() {
     time::delay_ms(3000);
 }
 
+#[cfg(all(feature = "platform-entry", target_arch = "x86_64"))]
+fn log_stack_usage(phase: &str) {
+    unsafe extern "C" {
+        static _stack_bottom: u8;
+        static _stack_top: u8;
+    }
+
+    // SAFETY: platform-entry's x86_64 linker script defines the contiguous
+    // stack range and assembly fills it with 0xA5 before calling Rust.
+    let (bottom, total) = unsafe {
+        let bottom = &raw const _stack_bottom;
+        let top = &raw const _stack_top;
+        (bottom, top.offset_from(bottom) as usize)
+    };
+    // SAFETY: `bottom..bottom + total` is the linker-defined stack range.
+    let stack = unsafe { core::slice::from_raw_parts(bottom, total) };
+    let used = stack
+        .iter()
+        .position(|&byte| byte != 0xA5)
+        .map_or(0, |first_used| total - first_used);
+
+    log::info!(
+        "MEMORY_REPORT stack_phase={} stack_used={} stack_total={} stack_free={}",
+        phase,
+        used,
+        total,
+        total - used,
+    );
+}
+
 /// Common boot tail: variable persistence, Secure Boot, and boot manager.
 ///
 /// This is the shared sequence executed by both [`init_platform()`] and
@@ -176,8 +206,14 @@ fn init_persistence_and_boot(
     efi::measure_initial_boot();
 
     // ---- Boot manager ----
+    #[cfg(all(feature = "platform-entry", target_arch = "x86_64"))]
+    log_stack_usage("before_boot_manager");
+
     let boot_var_state = boot_vars::read_boot_var_state();
     boot_manager::run(boot_var_state);
+
+    #[cfg(all(feature = "platform-entry", target_arch = "x86_64"))]
+    log_stack_usage("after_boot_manager");
 
     log::info!("Boot manager finished — halting");
 
@@ -436,16 +472,7 @@ fn init_platform_impl(mut config: PlatformConfig) -> ! {
     log::info!("CrabEFI initialized successfully!");
     log::info!("EFI System Table at: {:p}", efi::get_system_table());
 
-    // ---- 10. Initialize heap ----
-    //
-    // Skipped when the platform already set up the heap before entry
-    // (heap_pre_initialized == true).  The rest of the init sequence is
-    // identical regardless of this flag.
-    if !config.heap_pre_initialized && !heap::init() {
-        log::error!("Failed to initialize heap allocator!");
-    }
-
-    // ---- 11. Runtime log support ----
+    // ---- 10. Runtime log support ----
     #[cfg(feature = "rt-log")]
     {
         efi::rtlog::register_region();

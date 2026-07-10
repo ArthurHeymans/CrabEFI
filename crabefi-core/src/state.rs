@@ -68,6 +68,7 @@
 //! 3. They never read or write fields that the enclosing `with_mut()`
 //!    closure is currently modifying.
 
+use alloc::vec::Vec;
 use core::sync::atomic::{AtomicPtr, Ordering};
 
 use crate::fs::fat::FatType;
@@ -91,6 +92,9 @@ static IN_WITH_MUT: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicB
 /// - The `state` reference must remain valid for the entire firmware lifetime
 /// - The firmware must be single-threaded
 pub unsafe fn init(state: &mut FirmwareState) {
+    // SAFETY: The caller guarantees that `state` remains valid for the
+    // firmware lifetime and no other state has been installed.
+    let _ = unsafe { (state as *const FirmwareState).as_ref() };
     STATE_PTR.store(state as *mut FirmwareState, Ordering::Release);
 }
 
@@ -109,6 +113,11 @@ pub fn is_initialized() -> bool {
 /// The new pointer must point to valid `FirmwareState` memory that has been
 /// remapped by the OS.
 pub unsafe fn relocate_state_ptr(new_ptr: *mut FirmwareState) {
+    // SAFETY: The caller guarantees that `new_ptr` is the runtime-mapped
+    // address of the installed firmware state.
+    if unsafe { new_ptr.as_ref() }.is_none() {
+        panic!("FirmwareState pointer is null");
+    }
     STATE_PTR.store(new_ptr, Ordering::Release);
 }
 
@@ -201,6 +210,42 @@ pub fn try_get_mut_ptr() -> Option<*mut FirmwareState> {
     (!ptr.is_null()).then_some(ptr)
 }
 
+/// Allocate fixed-size EFI state tables after heap startup.
+///
+/// All tables keep their maximum length so their backing storage never moves.
+/// Variable payloads remain empty until a variable is loaded or written.
+///
+/// # Returns
+/// `true` when every table is ready.
+pub fn init_efi_caches() -> bool {
+    with_efi_mut(|efi| {
+        init_entries(&mut efi.handles, MAX_HANDLES, HandleEntry::empty)
+            && init_entries(&mut efi.events, MAX_EVENTS, EventEntry::empty)
+            && init_entries(
+                &mut efi.loaded_images,
+                MAX_LOADED_IMAGES,
+                LoadedImageEntry::empty,
+            )
+            && init_entries(
+                &mut efi.config_tables,
+                MAX_CONFIG_TABLES,
+                ConfigurationTable::empty,
+            )
+            && init_entries(&mut efi.variables, MAX_VARIABLES, VariableEntry::empty)
+    })
+}
+
+fn init_entries<T>(entries: &mut Vec<T>, len: usize, init: impl FnMut() -> T) -> bool {
+    if !entries.is_empty() {
+        return true;
+    }
+    if entries.try_reserve_exact(len).is_err() {
+        return false;
+    }
+    entries.resize_with(len, init);
+    true
+}
+
 // ============================================================================
 // Firmware State Structure
 // ============================================================================
@@ -269,14 +314,9 @@ pub const MAX_VARIABLES: usize = 64;
 /// Maximum variable name length (in characters)
 pub const MAX_VARIABLE_NAME_LEN: usize = 64;
 
-/// Maximum variable data size (stored payload, after auth header stripping)
+/// Maximum variable data size (stored payload, after auth header stripping).
 ///
-/// This must be large enough for Secure Boot key databases (PK, KEK, db, dbx).
-/// A single X.509 certificate in an EFI_SIGNATURE_LIST is typically 1-2 KB,
-/// and databases with multiple certificates (e.g. Microsoft CA chain + custom
-/// keys from sbctl) can reach 4-8 KB.  16 KB covers all realistic Secure Boot
-/// configurations while keeping FirmwareState within the 2 MB stack budget
-/// (64 entries * ~8.3 KB ≈ 530 KB).
+/// This covers Secure Boot key databases while bounding each heap allocation.
 pub const MAX_VARIABLE_DATA_SIZE: usize = 16 * 1024;
 
 /// Protocol interface entry
@@ -479,26 +519,62 @@ impl ConfigurationTable {
 }
 
 /// EFI variable entry
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct VariableEntry {
     pub name: [u16; MAX_VARIABLE_NAME_LEN],
     pub vendor_guid: Guid,
     pub attributes: u32,
-    pub data: [u8; MAX_VARIABLE_DATA_SIZE],
+    pub data: Vec<u8>,
     pub data_size: usize,
     pub in_use: bool,
 }
 
 impl VariableEntry {
-    pub const fn empty() -> Self {
+    /// Create an unused variable-cache entry without allocating its payload.
+    ///
+    /// # Returns
+    /// An empty cache entry.
+    pub fn empty() -> Self {
         Self {
             name: [0; MAX_VARIABLE_NAME_LEN],
             vendor_guid: Guid::from_fields(0, 0, 0, 0, 0, &[0, 0, 0, 0, 0, 0]),
             attributes: 0,
-            data: [0; MAX_VARIABLE_DATA_SIZE],
+            data: Vec::new(),
             data_size: 0,
             in_use: false,
         }
+    }
+
+    /// Replace the variable payload without exceeding its UEFI size limit.
+    ///
+    /// # Arguments
+    /// * `data` - New variable payload.
+    ///
+    /// # Returns
+    /// `Err(())` when the payload is too large or the heap is exhausted.
+    pub fn set_data(&mut self, data: &[u8]) -> Result<(), ()> {
+        if data.len() > MAX_VARIABLE_DATA_SIZE {
+            return Err(());
+        }
+        if self.data.capacity() < data.len()
+            && self
+                .data
+                .try_reserve_exact(data.len() - self.data.len())
+                .is_err()
+        {
+            return Err(());
+        }
+        self.data.clear();
+        self.data.extend_from_slice(data);
+        self.data_size = data.len();
+        Ok(())
+    }
+
+    /// Release a deleted variable's heap payload.
+    pub fn clear(&mut self) {
+        self.data = Vec::new();
+        self.data_size = 0;
+        self.in_use = false;
     }
 }
 
@@ -538,28 +614,28 @@ impl Default for VarStoreState {
 
 /// EFI subsystem state
 pub struct EfiState {
-    /// Handle database
-    pub handles: [HandleEntry; MAX_HANDLES],
+    /// Handle database, allocated after heap startup.
+    pub handles: Vec<HandleEntry>,
     /// Number of active handles
     pub handle_count: usize,
     /// Next handle value (unique identifier)
     pub next_handle: usize,
 
-    /// Event database
-    pub events: [EventEntry; MAX_EVENTS],
+    /// Event database, allocated after heap startup.
+    pub events: Vec<EventEntry>,
     /// Next event ID (starting at 2, 1 is reserved for keyboard)
     pub next_event_id: usize,
 
-    /// Loaded images database
-    pub loaded_images: [LoadedImageEntry; MAX_LOADED_IMAGES],
+    /// Loaded images database, allocated after heap startup.
+    pub loaded_images: Vec<LoadedImageEntry>,
 
-    /// Configuration tables
-    pub config_tables: [ConfigurationTable; MAX_CONFIG_TABLES],
+    /// Configuration tables, allocated after heap startup.
+    pub config_tables: Vec<ConfigurationTable>,
     /// Number of configuration tables
     pub config_table_count: usize,
 
-    /// EFI variables
-    pub variables: [VariableEntry; MAX_VARIABLES],
+    /// EFI variables. Entries and payloads are allocated after heap startup.
+    pub variables: Vec<VariableEntry>,
 
     /// Variable store persistence state (SMMSTORE tracking)
     pub varstore: VarStoreState,
@@ -596,15 +672,15 @@ pub struct EfiState {
 impl EfiState {
     pub const fn new() -> Self {
         Self {
-            handles: [const { HandleEntry::empty() }; MAX_HANDLES],
+            handles: Vec::new(),
             handle_count: 0,
             next_handle: 1,
-            events: [const { EventEntry::empty() }; MAX_EVENTS],
+            events: Vec::new(),
             next_event_id: 2, // Start at 2, reserve 1 for keyboard
-            loaded_images: [const { LoadedImageEntry::empty() }; MAX_LOADED_IMAGES],
-            config_tables: [ConfigurationTable::empty(); MAX_CONFIG_TABLES],
+            loaded_images: Vec::new(),
+            config_tables: Vec::new(),
             config_table_count: 0,
-            variables: [const { VariableEntry::empty() }; MAX_VARIABLES],
+            variables: Vec::new(),
             varstore: VarStoreState::new(),
             allocator: MemoryAllocator::new(),
             monotonic_count: 0,

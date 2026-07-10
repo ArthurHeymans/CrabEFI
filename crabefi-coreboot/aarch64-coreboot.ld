@@ -68,10 +68,10 @@ SECTIONS
         _bss_end = .;
     }
 
-    /* Stack - 3MB (increased from 2MB for large structs like FirmwareState) */
+    /* Stack - 1MB; variable payloads are heap-backed. */
     .stack (NOLOAD) : ALIGN(65536) {
         _stack_bottom = .;
-        . += 0x300000;
+        . += 0x100000;
         _stack_top = .;
     }
 
