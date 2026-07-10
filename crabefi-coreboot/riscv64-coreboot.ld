@@ -62,10 +62,10 @@ SECTIONS
         _bss_end = .;
     }
 
-    /* Stack — 3MB */
+    /* Stack — 1MB; variable payloads are heap-backed. */
     .stack (NOLOAD) : ALIGN(4096) {
         _stack_bottom = .;
-        . += 0x300000;
+        . += 0x100000;
         _stack_top = .;
     }
 

@@ -489,6 +489,15 @@ pub fn run_tests(config: &QemuConfig, disk_path: &Path, app_name: &str) -> Resul
     println!("Running tests in QEMU...\n");
     let result = run_qemu_with_capture(config, disk_path)?;
 
+    // Keep firmware memory metrics visible in successful CI runs.
+    for line in result
+        .output
+        .lines()
+        .filter(|line| line.contains("MEMORY_REPORT"))
+    {
+        println!("{line}");
+    }
+
     // Analyze results
     println!("\n=== Test Results ===");
     println!("Output captured: {} bytes", result.output.len());

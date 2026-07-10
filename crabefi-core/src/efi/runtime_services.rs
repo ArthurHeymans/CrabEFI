@@ -1102,7 +1102,7 @@ fn set_variable_runtime_delete(
             return (Status::NOT_FOUND, None);
         };
 
-        efi.variables[idx].in_use = false;
+        efi.variables[idx].clear();
         (Status::SUCCESS, secure_boot_var)
     });
 
@@ -1287,7 +1287,7 @@ fn set_variable_full(
         // Delete variable if data_size is 0 (for authenticated vars, this means empty after header).
         if final_data_size == 0 {
             if let Some(idx) = existing_idx {
-                variables[idx].in_use = false;
+                variables[idx].clear();
                 let secure_action = secure_boot_var
                     .map(SecureBootDbAction::Delete)
                     .unwrap_or(SecureBootDbAction::None);
@@ -1325,8 +1325,13 @@ fn set_variable_full(
                         );
                     }
 
-                    variables[idx].data[..combined.len()].copy_from_slice(combined.as_slice());
-                    variables[idx].data_size = combined.len();
+                    if variables[idx].set_data(combined.as_slice()).is_err() {
+                        return (
+                            Status::OUT_OF_RESOURCES,
+                            VariablePersistAction::None,
+                            SecureBootDbAction::None,
+                        );
+                    }
 
                     let mut combined_buf = VariableDataBuf::new();
                     if combined_buf.extend_from_slice(combined.as_slice()).is_err() {
@@ -1410,10 +1415,15 @@ fn set_variable_full(
 
         variables[idx].name[..name_vec.len()].copy_from_slice(&name_vec);
         variables[idx].name[name_vec.len()..].fill(0);
-        variables[idx].data[..final_data_size].copy_from_slice(&final_data_vec);
+        if variables[idx].set_data(final_data_vec.as_slice()).is_err() {
+            return (
+                Status::OUT_OF_RESOURCES,
+                VariablePersistAction::None,
+                SecureBootDbAction::None,
+            );
+        }
         variables[idx].vendor_guid = guid;
         variables[idx].attributes = attributes;
-        variables[idx].data_size = final_data_size;
         variables[idx].in_use = true;
 
         let secure_action = secure_boot_var

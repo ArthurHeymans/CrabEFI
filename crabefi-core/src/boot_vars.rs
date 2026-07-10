@@ -324,7 +324,7 @@ fn write_variable(name: &[u16], attrs: u32, data: &[u8]) -> bool {
         if data.is_empty() && attrs == 0 {
             for var in efi.variables.iter_mut() {
                 if var.in_use && var.vendor_guid == guid && ucs2_eq(&var.name, name) {
-                    var.in_use = false;
+                    var.clear();
                     return true;
                 }
             }
@@ -340,9 +340,7 @@ fn write_variable(name: &[u16], attrs: u32, data: &[u8]) -> bool {
         for var in efi.variables.iter_mut() {
             if var.in_use && var.vendor_guid == guid && ucs2_eq(&var.name, name) {
                 var.attributes = attrs;
-                var.data[..data.len()].copy_from_slice(data);
-                var.data_size = data.len();
-                return true;
+                return var.set_data(data).is_ok();
             }
         }
 
@@ -361,11 +359,7 @@ fn write_variable(name: &[u16], attrs: u32, data: &[u8]) -> bool {
                 for c in &mut var.name[copy_len + 1..] {
                     *c = 0;
                 }
-                // Copy data and zero the tail (defense-in-depth for variable isolation)
-                var.data[..data.len()].copy_from_slice(data);
-                var.data[data.len()..].fill(0);
-                var.data_size = data.len();
-                return true;
+                return var.set_data(data).is_ok();
             }
         }
 

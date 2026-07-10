@@ -171,6 +171,14 @@ long_mode_start:
     xor rax, rax
     rep stosq
 
+    // Fill the stack with a marker so Rust can report its high-water mark.
+    // No stack access occurs between this and the call to rust_main below.
+    lea rdi, [rip + _stack_bottom]
+    lea rcx, [rip + _stack_top]
+    sub rcx, rdi
+    mov al, 0xA5
+    rep stosb
+
     // Enable SSE
     mov rax, cr0
     and rax, 0xFFFFFFFFFFFFFFFB  // Clear EM (bit 2)

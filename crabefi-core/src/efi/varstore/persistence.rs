@@ -357,8 +357,10 @@ fn load_variables_from_storage() -> Result<(), VarStoreError> {
                 slot.attributes = var.attributes;
 
                 let data_len = var.data.len().min(MAX_VARIABLE_DATA_SIZE);
-                slot.data[..data_len].copy_from_slice(&var.data[..data_len]);
-                slot.data_size = data_len;
+                if slot.set_data(&var.data[..data_len]).is_err() {
+                    log::warn!("No heap space for variable payload");
+                    continue;
+                }
                 slot.in_use = true;
 
                 // Log the loaded variable name
@@ -913,13 +915,14 @@ pub fn update_variable_in_memory(
             efi.variables[idx].name[name_len..].fill(0);
         }
 
-        // Copy data
         let data_len = data.len().min(MAX_VARIABLE_DATA_SIZE);
-        efi.variables[idx].data[..data_len].copy_from_slice(&data[..data_len]);
+        if efi.variables[idx].set_data(&data[..data_len]).is_err() {
+            log::warn!("No heap space for variable payload");
+            return;
+        }
 
         efi.variables[idx].vendor_guid = *guid;
         efi.variables[idx].attributes = attributes;
-        efi.variables[idx].data_size = data_len;
         efi.variables[idx].in_use = true;
     });
 }
@@ -934,7 +937,7 @@ pub(super) fn delete_variable_from_memory(guid: &r_efi::efi::Guid, name: &[u16])
         if let Some(var) = efi.variables.iter_mut().find(|var| {
             var.in_use && var.vendor_guid == *guid && crate::efi::utils::ucs2_eq(&var.name, name)
         }) {
-            var.in_use = false;
+            var.clear();
         }
     });
 }

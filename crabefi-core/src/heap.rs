@@ -1,168 +1,37 @@
 //! Global Allocator for CrabEFI
 //!
-//! This module provides a global allocator implementation that enables the use of
-//! the `alloc` crate for heap allocations. This is required for cryptographic
-//! operations in the RustCrypto crates (RSA, X.509, etc.).
-//!
-//! # Design
-//!
-//! We use a simple bump allocator backed by a pre-allocated heap region. The heap
-//! is allocated from the EFI memory allocator during initialization.
-//!
-//! # Memory Management
-//!
-//! - Heap is allocated as `RuntimeServicesData` with EFI_MEMORY_RUNTIME attribute
-//! - This ensures the OS preserves the heap after ExitBootServices, so runtime
-//!   services (SetVariable, etc.) can continue to use heap allocations for
-//!   authenticated variable verification, varstore persistence, etc.
-//! - Allocations are bump-pointer style (fast allocation)
-//! - Deallocation is a no-op (bump allocator never frees)
+//! This module provides the global allocator used by `alloc`. Its backing pages
+//! are RuntimeServicesData, so allocations remain available to EFI runtime
+//! services after ExitBootServices.
 
-use core::alloc::{GlobalAlloc, Layout};
-use core::cell::UnsafeCell;
-use core::ptr::null_mut;
-use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, Ordering};
 
-/// Heap size (2 MB should be sufficient for crypto operations)
+use linked_list_allocator::LockedHeap;
+
+/// Heap size (2 MB should be sufficient for crypto operations and EFI state).
 const HEAP_SIZE: usize = 2 * 1024 * 1024;
 
-/// Page size (4KB)
+/// Page size (4KB).
 const PAGE_SIZE: usize = 4096;
 
-/// Number of pages for the heap
+/// Number of pages for the heap.
 const HEAP_PAGES: u64 = (HEAP_SIZE / PAGE_SIZE) as u64;
 
-/// Global heap state.
-///
-/// Binary crates must wire this up as `#[global_allocator]`. The library
-/// provides [`ALLOCATOR`] as the singleton instance; the binary just
-/// re-exports it with the attribute.
-pub struct BumpAllocator {
-    /// Start of the heap
-    heap_start: UnsafeCell<usize>,
-    /// Current allocation pointer (offset from heap_start)
-    offset: AtomicUsize,
-    /// Heap size (written once during init)
-    heap_size: UnsafeCell<usize>,
-    /// Whether the allocator has been initialized
-    initialized: AtomicBool,
-}
-
-// SAFETY: BumpAllocator is thread-safe because:
-// 1. CrabEFI is single-threaded firmware
-// 2. We use atomic operations for offset updates
-// 3. heap_start is only written once during initialization
-unsafe impl Sync for BumpAllocator {}
-
-impl BumpAllocator {
-    const fn new() -> Self {
-        Self {
-            heap_start: UnsafeCell::new(0),
-            offset: AtomicUsize::new(0),
-            heap_size: UnsafeCell::new(0),
-            initialized: AtomicBool::new(false),
-        }
-    }
-
-    /// Initialize the allocator with a heap region
-    ///
-    /// # Safety
-    ///
-    /// Must be called only once, before any allocations.
-    unsafe fn init(&self, heap_start: usize, heap_size: usize) {
-        // SAFETY: Must be called only once, before any allocations.
-        // UnsafeCell access is safe because this is single-threaded initialization.
-        unsafe {
-            // Store the heap start address
-            *self.heap_start.get() = heap_start;
-
-            *self.heap_size.get() = heap_size;
-        }
-
-        // Reset the offset
-        self.offset.store(0, Ordering::Release);
-        self.initialized.store(true, Ordering::Release);
-
-        log::info!(
-            "Global allocator initialized: heap at {:#x}, size {} KB",
-            heap_start,
-            heap_size / 1024
-        );
-    }
-
-    /// Check if the allocator is initialized
-    fn is_initialized(&self) -> bool {
-        self.initialized.load(Ordering::Acquire)
-    }
-}
-
-unsafe impl GlobalAlloc for BumpAllocator {
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        if !self.is_initialized() {
-            // Allocator not initialized yet - this shouldn't happen in normal operation
-            return null_mut();
-        }
-
-        // SAFETY: heap_start is only written once during init, before any allocations.
-        let heap_start = unsafe { *self.heap_start.get() };
-        let size = layout.size();
-        let align = layout.align();
-
-        // Use a CAS loop to atomically bump the offset
-        loop {
-            let current_offset = self.offset.load(Ordering::Acquire);
-
-            // Calculate aligned offset
-            let alloc_start = heap_start + current_offset;
-            let aligned_start = (alloc_start + align - 1) & !(align - 1);
-            let padding = aligned_start - alloc_start;
-            let new_offset = current_offset + padding + size;
-
-            // Check if we have enough space
-            // SAFETY: heap_size is only written once during init, before any allocations
-            let heap_size = unsafe { *self.heap_size.get() };
-            if new_offset > heap_size {
-                log::error!(
-                    "Heap exhausted: requested {} bytes, offset {}, heap_size {}",
-                    size,
-                    current_offset,
-                    heap_size
-                );
-                return null_mut();
-            }
-
-            // Try to update the offset atomically
-            match self.offset.compare_exchange_weak(
-                current_offset,
-                new_offset,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => return aligned_start as *mut u8,
-                Err(_) => continue, // Another allocation happened, retry
-            }
-        }
-    }
-
-    unsafe fn dealloc(&self, _ptr: *mut u8, _layout: Layout) {
-        // Bump allocator doesn't deallocate individual allocations.
-        // The heap is RuntimeServicesData, so it persists after ExitBootServices
-        // and remains available for runtime service calls.
-    }
-}
+/// Whether [`ALLOCATOR`] has been initialized.
+static HEAP_INITIALIZED: AtomicBool = AtomicBool::new(false);
 
 /// Global allocator instance.
 ///
-/// When the `global-allocator` feature is enabled, this is registered as
-/// `#[global_allocator]`. External firmware that provides its own allocator
-/// should not enable this feature.
+/// When the `global-allocator` feature is enabled, this is registered as the
+/// allocator. External firmware that provides its own allocator should not
+/// enable that feature.
 #[cfg_attr(feature = "global-allocator", global_allocator)]
-pub static ALLOCATOR: BumpAllocator = BumpAllocator::new();
+pub static ALLOCATOR: LockedHeap = LockedHeap::empty();
 
-/// Initialize the global allocator
+/// Initialize the global allocator.
 ///
-/// This must be called early in the boot process, after the EFI memory allocator
-/// is initialized but before any code that uses `alloc`.
+/// This must be called early in the boot process, after the EFI page allocator
+/// is initialized and before code that uses `alloc`.
 ///
 /// # Returns
 ///
@@ -171,41 +40,47 @@ pub fn init() -> bool {
     use crate::efi::allocator::{AllocateType, MemoryType, allocate_pages};
     use r_efi::efi::Status;
 
-    // Allocate heap pages as RuntimeServicesData so the OS preserves them
-    // after ExitBootServices. Runtime services (SetVariable, etc.) need
-    // heap allocations for authenticated variable verification, varstore
-    // persistence, and crypto operations.
-    let mut heap_addr: u64 = 0;
+    if HEAP_INITIALIZED.swap(true, Ordering::AcqRel) {
+        log::error!("Global allocator is already initialized");
+        return false;
+    }
+
+    // RuntimeServicesData remains mapped after ExitBootServices, including the
+    // linked-list allocator's in-band free-list metadata.
+    let mut heap_addr = 0;
     let status = allocate_pages(
         AllocateType::AllocateAnyPages,
         MemoryType::RuntimeServicesData,
         HEAP_PAGES,
         &mut heap_addr,
     );
-
     if status != Status::SUCCESS {
+        HEAP_INITIALIZED.store(false, Ordering::Release);
         log::error!("Failed to allocate heap memory: {:?}", status);
         return false;
     }
 
-    // Initialize the bump allocator
-    // SAFETY: Called once before any allocations
+    // SAFETY: `heap_addr` is a newly allocated, page-aligned RuntimeServicesData
+    // range, and this is the sole initialization guarded by HEAP_INITIALIZED.
     unsafe {
-        ALLOCATOR.init(heap_addr as usize, HEAP_SIZE);
+        ALLOCATOR.lock().init(heap_addr as *mut u8, HEAP_SIZE);
     }
 
+    log::info!(
+        "Global allocator initialized: heap at {:#x}, size {} KB",
+        heap_addr,
+        HEAP_SIZE / 1024
+    );
     true
 }
 
-/// Check if the allocator is initialized
+/// Check if the allocator is initialized.
 pub fn is_initialized() -> bool {
-    ALLOCATOR.is_initialized()
+    HEAP_INITIALIZED.load(Ordering::Acquire)
 }
 
-/// Get heap usage statistics
+/// Get heap usage statistics.
 pub fn stats() -> (usize, usize) {
-    let used = ALLOCATOR.offset.load(Ordering::Acquire);
-    // Safety: heap_size is only written once during init
-    let total = unsafe { *ALLOCATOR.heap_size.get() };
-    (used, total)
+    let heap = ALLOCATOR.lock();
+    (heap.used(), heap.size())
 }
