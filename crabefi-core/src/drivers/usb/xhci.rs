@@ -8,7 +8,6 @@ use crate::drivers::pci::{self, PciAddress, PciDevice};
 use crate::efi;
 use crate::time::{Timeout, wait_for};
 use core::ptr;
-use tock_registers::interfaces::{ReadWriteable, Readable, Writeable};
 use zerocopy::FromBytes;
 
 use super::controller::{
@@ -16,175 +15,70 @@ use super::controller::{
     hub_port_status, parse_configuration, req_type, request,
 };
 
-// Import typed register structs and bitfield modules
-use super::xhci_regs::{
-    CAPLENGTH_HCIVERSION, CONFIG, ERSTSZ, HCCPARAMS1, HCSPARAMS1, HCSPARAMS2, PAGESIZE, PORTSC,
-    USBCMD, USBSTS, XhciCapRegs, XhciOpRegs, XhciPortRegs, XhciRuntimeRegs,
+use xhci::accessor::Mapper;
+use xhci::context::{
+    self, EndpointHandler, EndpointType, InputControlHandler, InputHandler, SlotHandler,
 };
+use xhci::extended_capabilities::{self, ExtendedCapability};
+use xhci::registers::capability::CapabilityParameters1;
+use xhci::registers::operational::PortStatusAndControlRegister;
+use xhci::registers::{Access64, Doorbell, Registers};
+use xhci::ring::trb::{self, Link, command, event, transfer};
 
-// Import constants that don't have typed equivalents (TRB types, completion codes,
-// PORTSC change/RW masks, extended capability IDs)
-use super::xhci_regs::{
-    PORTSC_CHANGE_MASK, PORTSC_RW_MASK, TRB_CC_BABBLE_DETECTED, TRB_CC_SHORT_PACKET,
-    TRB_CC_STALL_ERROR, TRB_CC_SUCCESS, TRB_CC_USB_TRANSACTION_ERROR, TRB_TYPE_ADDRESS_DEVICE,
-    TRB_TYPE_COMMAND_COMPLETION, TRB_TYPE_CONFIGURE_ENDPOINT, TRB_TYPE_DATA, TRB_TYPE_ENABLE_SLOT,
-    TRB_TYPE_EVALUATE_CONTEXT, TRB_TYPE_HOST_CONTROLLER, TRB_TYPE_LINK, TRB_TYPE_NORMAL,
-    TRB_TYPE_PORT_STATUS_CHANGE, TRB_TYPE_RESET_ENDPOINT, TRB_TYPE_SET_TR_DEQUEUE, TRB_TYPE_SETUP,
-    TRB_TYPE_STATUS, TRB_TYPE_TRANSFER_EVENT, trb_cc_name,
-};
+/// Identity mapper for firmware environments where PCI MMIO is already mapped.
+#[derive(Clone, Copy, Debug)]
+struct IdentityMapper;
 
-// NOTE: USB descriptor types (DeviceDescriptor, ConfigurationDescriptor, etc.)
-// and USB constants (req_type, request, desc_type) are imported from
-// super::controller to avoid duplication with EHCI/OHCI/UHCI drivers.
-
-/// Transfer Request Block (16 bytes)
-#[repr(C, align(16))]
-#[derive(Clone, Copy, Default)]
-pub struct Trb {
-    pub param: u64,
-    pub status: u32,
-    pub control: u32,
-}
-
-impl Trb {
-    fn set_type(&mut self, trb_type: u32) {
-        self.control = (self.control & !0xFC00) | ((trb_type & 0x3F) << 10);
-    }
-
-    fn get_type(&self) -> u32 {
-        (self.control >> 10) & 0x3F
-    }
-
-    fn get_cycle(&self) -> bool {
-        self.control & 1 != 0
-    }
-
-    fn completion_code(&self) -> u32 {
-        (self.status >> 24) & 0xFF
-    }
-
-    fn slot_id(&self) -> u8 {
-        ((self.control >> 24) & 0xFF) as u8
-    }
-}
-
-/// Slot Context payload (first 32 bytes)
-///
-/// Controllers with HCCPARAMS1.CSZ=1 use a 64-byte stride; the extra 32 bytes
-/// are controller-owned padding. Access contexts through the helpers below.
-#[repr(C, align(32))]
-#[derive(Clone, Copy, Default)]
-pub struct SlotContext {
-    pub dw0: u32, // Route String, Speed, MTT, Hub, Context Entries
-    pub dw1: u32, // Max Exit Latency, Root Hub Port Number, Number of Ports
-    pub dw2: u32, // Parent Hub Slot ID, Parent Port Number, TT Think Time, Interrupter Target
-    pub dw3: u32, // USB Device Address, Slot State
-    pub reserved: [u32; 4],
-}
-
-impl SlotContext {
-    fn set_context_entries(&mut self, entries: u8) {
-        self.dw0 = (self.dw0 & !0xF8000000) | ((entries as u32) << 27);
-    }
-
-    fn set_speed(&mut self, speed: u8) {
-        self.dw0 = (self.dw0 & !0x00F00000) | ((speed as u32) << 20);
-    }
-
-    fn set_root_hub_port(&mut self, port: u8) {
-        self.dw1 = (self.dw1 & !0x00FF0000) | ((port as u32) << 16);
-    }
-
-    fn set_route_string(&mut self, route: u32) {
-        self.dw0 = (self.dw0 & !0x000FFFFF) | (route & 0x000FFFFF);
-    }
-
-    fn set_hub(&mut self, is_hub: bool) {
-        if is_hub {
-            self.dw0 |= 1 << 26;
-        } else {
-            self.dw0 &= !(1 << 26);
+impl Mapper for IdentityMapper {
+    #[allow(unused_unsafe)]
+    unsafe fn map(&mut self, phys_start: usize, _bytes: usize) -> core::num::NonZeroUsize {
+        unsafe {
+            core::num::NonZeroUsize::new(phys_start).expect("xHCI MMIO address must be non-zero")
         }
     }
 
-    fn set_num_ports(&mut self, n: u8) {
-        self.dw1 = (self.dw1 & !0xFF000000) | ((n as u32) << 24);
-    }
-
-    fn set_parent_hub_slot(&mut self, slot: u8) {
-        self.dw2 = (self.dw2 & !0x000000FF) | (slot as u32);
-    }
-
-    fn set_parent_port_num(&mut self, port: u8) {
-        self.dw2 = (self.dw2 & !0x0000FF00) | ((port as u32) << 8);
-    }
+    fn unmap(&mut self, _virt_start: usize, _bytes: usize) {}
 }
 
-/// Endpoint Context payload (first 32 bytes)
-#[repr(C, align(32))]
-#[derive(Clone, Copy, Default)]
-pub struct EndpointContext {
-    pub dw0: u32,            // EP State, Mult, MaxPStreams, LSA, Interval, MaxESITPayloadHi
-    pub dw1: u32,            // CErr, EP Type, HID, MaxBurstSize, MaxPacketSize
-    pub tr_dequeue_ptr: u64, // TR Dequeue Pointer
-    pub dw4: u32,            // Average TRB Length, MaxESITPayloadLo
-    pub reserved: [u32; 3],
+type RawTrb = [u32; 4];
+
+#[inline]
+fn raw_trb_type(raw: &RawTrb) -> u32 {
+    (raw[3] >> 10) & 0x3f
 }
 
-impl EndpointContext {
-    fn set_ep_type(&mut self, ep_type: u8) {
-        self.dw1 = (self.dw1 & !0x00000038) | ((ep_type as u32) << 3);
-    }
-
-    fn set_max_packet_size(&mut self, size: u16) {
-        self.dw1 = (self.dw1 & !0xFFFF0000) | ((size as u32) << 16);
-    }
-
-    fn set_max_burst_size(&mut self, size: u8) {
-        self.dw1 = (self.dw1 & !0x0000FF00) | ((size as u32) << 8);
-    }
-
-    fn set_cerr(&mut self, cerr: u8) {
-        self.dw1 = (self.dw1 & !0x00000006) | ((cerr as u32) << 1);
-    }
-
-    fn set_tr_dequeue_ptr(&mut self, ptr: u64, dcs: bool) {
-        self.tr_dequeue_ptr = (ptr & !0xF) | if dcs { 1 } else { 0 };
-    }
-
-    fn set_avg_trb_length(&mut self, len: u16) {
-        self.dw4 = (self.dw4 & !0x0000FFFF) | (len as u32);
-    }
+#[inline]
+fn raw_completion_code(raw: &RawTrb) -> u32 {
+    (raw[2] >> 24) & 0xff
 }
 
-/// Input Control Context (32 bytes)
-#[repr(C, align(32))]
-#[derive(Clone, Copy, Default)]
-pub struct InputControlContext {
-    pub drop_flags: u32,
-    pub add_flags: u32,
-    pub reserved: [u32; 5],
-    pub configuration_value: u8,
-    pub interface_number: u8,
-    pub alternate_setting: u8,
-    pub reserved2: u8,
+#[inline]
+fn read_event_trb(addr: u64, expected_cycle: bool) -> Option<RawTrb> {
+    let p = addr as *const u32;
+    // The controller publishes event ownership through control dword 3. Do not
+    // read the payload until that publication has been observed and ordered.
+    // SAFETY: callers pass an address within a page-backed xHCI event ring.
+    let control = unsafe { ptr::read_volatile(p.add(3)) };
+    if (control & 1 != 0) != expected_cycle {
+        return None;
+    }
+
+    barrier::dma_read();
+    // SAFETY: the matching cycle bit makes the complete event TRB available.
+    Some(unsafe {
+        [
+            ptr::read_volatile(p),
+            ptr::read_volatile(p.add(1)),
+            ptr::read_volatile(p.add(2)),
+            control,
+        ]
+    })
 }
 
-/// 32-byte Device Context view. Use only when the controller context stride is 32.
-#[repr(C, align(64))]
-#[derive(Default)]
-pub struct DeviceContext {
-    pub slot: SlotContext,
-    pub endpoints: [EndpointContext; 31],
-}
-
-/// 32-byte Input Context view. Use only when the controller context stride is 32.
-#[repr(C, align(64))]
-#[derive(Default)]
-pub struct InputContext {
-    pub control: InputControlContext,
-    pub slot: SlotContext,
-    pub endpoints: [EndpointContext; 31],
+#[inline]
+fn read_event_control(addr: u64) -> u32 {
+    // SAFETY: callers pass an address within a page-backed xHCI event ring.
+    unsafe { ptr::read_volatile((addr + 12) as *const u32) }
 }
 
 /// Ring buffer for TRBs
@@ -222,11 +116,12 @@ impl TrbRing {
         // Initialize all TRBs to 0
         unsafe { core::slice::from_raw_parts_mut(base as *mut u8, size * 16).fill(0) };
 
-        // Set up link TRB at the end to wrap around
-        let link_trb = unsafe { &mut *((base + ((size - 1) * 16) as u64) as *mut Trb) };
-        link_trb.param = base;
-        link_trb.set_type(TRB_TYPE_LINK);
-        link_trb.control |= 1 << 1; // Toggle Cycle bit
+        // Set up the upstream Link TRB at the end to wrap around.
+        let mut link = Link::new();
+        link.set_ring_segment_pointer(base).set_toggle_cycle();
+        let link_addr = (base + ((size - 1) * trb::BYTES) as u64) as *mut RawTrb;
+        // SAFETY: the ring allocation contains `size` TRBs.
+        unsafe { ptr::write(link_addr, link.into_raw()) };
 
         Self {
             base,
@@ -266,51 +161,41 @@ impl TrbRing {
     /// The caller must later call `commit_deferred_trb()` to flip it live. This
     /// implements the "deferred first TRB" technique to prevent the HC from
     /// processing a partially-built multi-TRB TD.
-    fn enqueue(&mut self, trb: &Trb, defer_cycle: bool) -> u64 {
-        let addr = self.base + (self.enqueue_idx * 16) as u64;
-        let entry = unsafe { &mut *(addr as *mut Trb) };
+    fn enqueue<T: Into<RawTrb>>(&mut self, trb: T, defer_cycle: bool) -> u64 {
+        let raw = trb.into();
+        let addr = self.base + (self.enqueue_idx * trb::BYTES) as u64;
+        let entry = addr as *mut u32;
 
-        // Determine the cycle bit for this TRB
-        let cycle_bit = if defer_cycle {
-            // Inverted cycle: HC will NOT process this TRB yet
-            if self.cycle { 0 } else { 1 }
-        } else {
-            if self.cycle { 1 } else { 0 }
-        };
+        let cycle_bit = u32::from(if defer_cycle { !self.cycle } else { self.cycle });
 
-        // Write param and status FIRST (these don't contain the ownership bit)
+        // Preserve CrabEFI's publication policy: parameter and status first.
         unsafe {
-            core::ptr::write_volatile(&mut entry.param as *mut u64, trb.param);
-            core::ptr::write_volatile(&mut entry.status as *mut u32, trb.status);
-        }
-
-        // Hand descriptor fields to the controller before publishing ownership.
-        barrier::dma_write();
-
-        // Write control LAST (contains the cycle bit that signals HC ownership)
-        unsafe {
-            core::ptr::write_volatile(
-                &mut entry.control as *mut u32,
-                (trb.control & !1) | cycle_bit,
+            ptr::write_volatile(
+                entry as *mut u64,
+                u64::from(raw[0]) | (u64::from(raw[1]) << 32),
             );
+            ptr::write_volatile(entry.add(2), raw[2]);
         }
+        barrier::dma_write();
+        // Publish ownership through the cycle-bearing control dword last.
+        unsafe { ptr::write_volatile(entry.add(3), (raw[3] & !1) | cycle_bit) };
 
         self.enqueue_idx += 1;
 
-        // Check if we need to wrap around via link TRB
         if self.enqueue_idx >= self.size - 1 {
-            // Activate the link TRB's cycle bit to hand it to the HC
-            let link = unsafe { &mut *((self.base + ((self.size - 1) * 16) as u64) as *mut Trb) };
+            let link_control = (self.base + ((self.size - 1) * trb::BYTES + 12) as u64) as *mut u32;
             barrier::dma_write();
-            if self.cycle {
-                unsafe {
-                    core::ptr::write_volatile(&mut link.control as *mut u32, link.control | 1)
-                };
-            } else {
-                unsafe {
-                    core::ptr::write_volatile(&mut link.control as *mut u32, link.control & !1)
-                };
-            }
+            let control = unsafe { ptr::read_volatile(link_control) };
+            unsafe {
+                ptr::write_volatile(
+                    link_control,
+                    if self.cycle {
+                        control | 1
+                    } else {
+                        control & !1
+                    },
+                )
+            };
             barrier::dma_write();
 
             self.enqueue_idx = 0;
@@ -330,25 +215,18 @@ impl TrbRing {
     /// The `cycle_at_enqueue` parameter is the ring's cycle state at the time
     /// the deferred TRB was enqueued.
     fn commit_deferred_trb(trb_addr: u64, cycle_at_enqueue: bool) {
-        let entry = unsafe { &mut *(trb_addr as *mut Trb) };
+        let control_ptr = (trb_addr + 12) as *mut u32;
 
         // Ensure the whole TD is visible before publishing its first TRB.
         barrier::dma_write();
 
-        // Flip the cycle bit to the correct value
-        let control = unsafe { core::ptr::read_volatile(&entry.control as *const u32) };
+        let control = unsafe { ptr::read_volatile(control_ptr) };
         let new_control = if cycle_at_enqueue {
             control | 1
         } else {
             control & !1
         };
-        unsafe {
-            core::ptr::write_volatile(&mut entry.control as *mut u32, new_control);
-        }
-    }
-
-    fn physical_addr(&self) -> u64 {
-        self.base | if self.cycle { 1 } else { 0 }
+        unsafe { ptr::write_volatile(control_ptr, new_control) };
     }
 }
 
@@ -357,9 +235,9 @@ pub struct UsbSlot {
     /// Slot ID
     pub slot_id: u8,
     /// Device context
-    pub device_context: *mut DeviceContext,
+    pub device_context: *mut u8,
     /// Input context
-    pub input_context: *mut InputContext,
+    pub input_context: *mut u8,
     /// Transfer rings for each endpoint (0 = control, 1-30 = other)
     pub transfer_rings: [Option<TrbRing>; 31],
     /// Device descriptor
@@ -422,17 +300,8 @@ pub struct XhciController {
     /// MMIO region (kept alive so the mapping is not dropped)
     #[allow(dead_code)]
     mmio: MmioRegion,
-    /// Typed pointer to capability registers (kept for potential future use)
-    #[allow(dead_code)]
-    cap_regs: *const XhciCapRegs,
-    /// Typed pointer to operational registers
-    op_regs: *const XhciOpRegs,
-    /// Typed pointer to runtime registers
-    rt_regs: *const XhciRuntimeRegs,
-    /// Doorbell register base address
-    db_base: u64,
-    /// Port registers base address
-    port_regs_base: u64,
+    /// xHCI register accessors.
+    registers: Registers<IdentityMapper>,
     /// Number of ports
     num_ports: u8,
     /// Page size used by controller
@@ -470,13 +339,13 @@ pub enum XhciError {
     /// No free slots
     NoFreeSlots,
     /// Command failed
-    CommandFailed(u32),
+    CommandFailed(Result<event::CompletionCode, u8>),
     /// Allocation failed
     AllocationFailed,
     /// Device not found
     DeviceNotFound,
     /// Transfer failed
-    TransferFailed(u32),
+    TransferFailed(Result<event::CompletionCode, u8>),
     /// Invalid parameter
     InvalidParameter,
     /// USB transaction error
@@ -486,64 +355,88 @@ pub enum XhciError {
 }
 
 impl XhciController {
-    /// xHCI Extended Capability: USB Legacy Support
-    const XHCI_CAP_LEGACY: u8 = 0x01;
-
-    /// USBLEGSUP register offsets (within the extended capability)
-    const USBLEGSUP_BIOS_OWNED: u32 = 1 << 16;
-    const USBLEGSUP_OS_OWNED: u32 = 1 << 24;
-
     #[inline]
     fn input_context_len(context_size: u8) -> usize {
         context_size as usize * 33 // input control + slot + 31 endpoint contexts
     }
 
     #[inline]
-    fn input_control_context<'a>(input: *mut InputContext) -> &'a mut InputControlContext {
-        // SAFETY: input points at an allocated xHCI input context. The input
-        // control context is always at byte offset 0 for both 32- and 64-byte strides.
-        unsafe { &mut *(input as *mut InputControlContext) }
+    fn input_control_context<'a>(
+        input: *mut u8,
+        context_size: u8,
+    ) -> &'a mut dyn InputControlHandler {
+        // SAFETY: input points to a page-aligned, zeroed context allocation of
+        // the controller-selected upstream 32- or 64-byte Input layout.
+        unsafe {
+            if context_size == 64 {
+                (&mut *(input as *mut context::Input64Byte)).control_mut()
+            } else {
+                (&mut *(input as *mut context::Input32Byte)).control_mut()
+            }
+        }
     }
 
     #[inline]
-    fn input_slot_context<'a>(input: *mut InputContext, context_size: u8) -> &'a mut SlotContext {
-        // SAFETY: caller passes an allocated input context; slot context starts
-        // after one context-sized input-control entry, like Linux xhci_get_slot_ctx().
-        unsafe { &mut *((input as *mut u8).add(context_size as usize) as *mut SlotContext) }
+    fn input_slot_context<'a>(input: *mut u8, context_size: u8) -> &'a mut dyn SlotHandler {
+        // SAFETY: same allocation and layout invariant as input_control_context.
+        unsafe {
+            if context_size == 64 {
+                (&mut *(input as *mut context::Input64Byte))
+                    .device_mut()
+                    .slot_mut()
+            } else {
+                (&mut *(input as *mut context::Input32Byte))
+                    .device_mut()
+                    .slot_mut()
+            }
+        }
     }
 
     #[inline]
     fn input_ep_context<'a>(
-        input: *mut InputContext,
+        input: *mut u8,
         context_size: u8,
         ep_index: usize,
-    ) -> &'a mut EndpointContext {
-        // SAFETY: ep_index is a DCI-1 index in 0..31; endpoint contexts in an
-        // input context start after input-control + slot contexts.
+    ) -> &'a mut dyn EndpointHandler {
+        let dci = ep_index + 1;
+        // SAFETY: callers use endpoint indices in 0..31 and the allocation is
+        // an upstream Input32Byte or Input64Byte selected by HCCPARAMS1.CSZ.
         unsafe {
-            &mut *((input as *mut u8).add((ep_index + 2) * context_size as usize)
-                as *mut EndpointContext)
+            if context_size == 64 {
+                (&mut *(input as *mut context::Input64Byte))
+                    .device_mut()
+                    .endpoint_mut(dci)
+            } else {
+                (&mut *(input as *mut context::Input32Byte))
+                    .device_mut()
+                    .endpoint_mut(dci)
+            }
         }
     }
 
     #[inline]
-    fn device_slot_context(device: *mut DeviceContext) -> SlotContext {
-        // SAFETY: device points at an allocated device context; slot context is always first.
-        unsafe { *(device as *const SlotContext) }
+    fn copy_context_payload(dst: *mut u8, src: *const u8) {
+        // Only the architected first 32 bytes contain fields. The destination
+        // was zeroed, so the reserved upper half of a 64-byte context stays 0.
+        unsafe { ptr::copy_nonoverlapping(src, dst, 32) };
     }
 
     #[inline]
-    fn device_ep_context(
-        device: *mut DeviceContext,
+    fn copy_device_slot_context(input: *mut u8, device: *const u8, context_size: u8) {
+        let dst = unsafe { input.add(context_size as usize) };
+        Self::copy_context_payload(dst, device);
+    }
+
+    #[inline]
+    fn copy_device_ep_context(
+        input: *mut u8,
+        device: *const u8,
         context_size: u8,
         ep_index: usize,
-    ) -> EndpointContext {
-        // SAFETY: ep_index is a DCI-1 index in 0..31; endpoint contexts in a
-        // device context start after the slot context.
-        unsafe {
-            *((device as *const u8).add((ep_index + 1) * context_size as usize)
-                as *const EndpointContext)
-        }
+    ) {
+        let dst = unsafe { input.add((ep_index + 2) * context_size as usize) };
+        let src = unsafe { device.add((ep_index + 1) * context_size as usize) };
+        Self::copy_context_payload(dst, src);
     }
 
     /// Take ownership of the controller from BIOS/SMM
@@ -551,73 +444,46 @@ impl XhciController {
     /// xHCI has an optional extended capability for BIOS ownership handoff.
     /// Unlike EHCI, xHCI extended capabilities are memory-mapped, not in PCI config space.
     /// The xECP (Extended Capabilities Pointer) is in HCCPARAMS1 bits 31:16.
-    fn take_bios_ownership(mmio_base: u64, hccparams1: u32) {
-        // xECP is in bits 31:16, gives offset in DWORDs from mmio_base
-        let xecp = ((hccparams1 >> 16) & 0xFFFF) as u64;
-
-        if xecp == 0 {
-            // No extended capabilities
+    fn take_bios_ownership(mmio_base: u64, hccparams1: CapabilityParameters1) {
+        let Some(mut capabilities) = (unsafe {
+            extended_capabilities::List::new(mmio_base as usize, hccparams1, IdentityMapper)
+        }) else {
             return;
-        }
+        };
 
-        let mut cap_addr = mmio_base + (xecp * 4);
+        for capability in &mut capabilities {
+            let Ok(ExtendedCapability::UsbLegacySupport(mut legacy)) = capability else {
+                continue;
+            };
 
-        // Walk the capability chain looking for USBLEGSUP (cap ID 0x01)
-        loop {
-            let cap = unsafe { ptr::read_volatile(cap_addr as *const u32) };
-            let cap_id = (cap & 0xFF) as u8;
-            let next_ptr = ((cap >> 8) & 0xFF) as u8;
+            if legacy.usblegsup.read_volatile().hc_bios_owned_semaphore() {
+                log::debug!("xHCI: Taking ownership from BIOS");
+                legacy.usblegsup.update_volatile(|register| {
+                    register.set_hc_os_owned_semaphore();
+                });
 
-            if cap_id == Self::XHCI_CAP_LEGACY {
-                // Found USBLEGSUP - check if BIOS owns it
-                if (cap & Self::USBLEGSUP_BIOS_OWNED) != 0 {
-                    log::debug!("xHCI: Taking ownership from BIOS (USBLEGSUP={:#010x})", cap);
-
-                    // Set OS owned semaphore
-                    unsafe {
-                        ptr::write_volatile(cap_addr as *mut u32, cap | Self::USBLEGSUP_OS_OWNED);
+                let timeout = Timeout::from_ms(1000);
+                while !timeout.is_expired() {
+                    if !legacy.usblegsup.read_volatile().hc_bios_owned_semaphore() {
+                        log::debug!("xHCI: BIOS released ownership");
+                        break;
                     }
-
-                    // Wait for BIOS to release (up to 1 second)
-                    let timeout = Timeout::from_ms(1000);
-                    while !timeout.is_expired() {
-                        let new_cap = unsafe { ptr::read_volatile(cap_addr as *const u32) };
-                        if (new_cap & Self::USBLEGSUP_BIOS_OWNED) == 0 {
-                            log::debug!("xHCI: BIOS released ownership");
-                            break;
-                        }
-                        crate::time::delay_ms(10);
-                    }
-
-                    // Clear any SMI enables and pending SMI status in USBLEGCTLSTS (offset +4)
-                    // Following Linux kernel's usb_disable_xhci_ports() pattern:
-                    //
-                    // USBLEGCTLSTS layout:
-                    //   Bits 0-4: SMI Enable bits (clear these to 0 to disable SMIs)
-                    //   Bits 13-15: Reserved/preserved bits
-                    //   Bits 16-20: SMI Event bits (preserved by read)
-                    //   Bits 29-31: SMI on OS/BIOS ownership change status (W1C, write 1 to clear)
-                    //
-                    // We disable all SMI enables (clear bits 0-4) AND clear any pending
-                    // SMI event status (write 1 to bits 29-31). The old code only cleared
-                    // enables but left stale status bits set.
-                    let ctlsts_addr = cap_addr + 4;
-                    let ctlsts = unsafe { ptr::read_volatile(ctlsts_addr as *const u32) };
-                    // Preserve reserved bits (13:15, 17:19), clear SMI enables (0:4),
-                    // clear SMI event status bits 29:31 by writing 1
-                    let new_ctlsts = (ctlsts & 0x0000_E000) | 0xE000_0000;
-                    unsafe {
-                        ptr::write_volatile(ctlsts_addr as *mut u32, new_ctlsts);
-                    }
+                    crate::time::delay_ms(10);
                 }
-                break;
             }
 
-            if next_ptr == 0 {
-                break;
-            }
-            // next_ptr is a RELATIVE offset from the current capability (in DWORDs)
-            cap_addr += next_ptr as u64 * 4;
+            legacy.usblegctlsts.update_volatile(|register| {
+                register
+                    .clear_usb_smi_enable()
+                    .clear_smi_on_host_system_error_enable()
+                    .clear_smi_on_os_ownership_enable()
+                    .clear_smi_on_pci_command_enable()
+                    .clear_smi_on_bar_enable()
+                    .clear_smi_on_os_ownership_change()
+                    .clear_smi_on_pci_command()
+                    .clear_smi_on_bar();
+            });
+            break;
         }
     }
 
@@ -631,43 +497,20 @@ impl XhciController {
         // Enable the device (bus master + memory space)
         pci::enable_device(pci_dev);
 
-        // Cast MMIO base to typed capability registers
-        let cap_regs = mmio_base as *const XhciCapRegs;
-        let cap = unsafe { &*cap_regs };
-
-        let caplength = cap
-            .caplength_hciversion
-            .read(CAPLENGTH_HCIVERSION::CAPLENGTH) as u8;
-        let hciversion = cap
-            .caplength_hciversion
-            .read(CAPLENGTH_HCIVERSION::HCIVERSION) as u16;
-        let hccparams1_val = cap.hccparams1.get();
-        let dboff = cap.dboff.get();
-        let rtsoff = cap.rtsoff.get();
-
-        // Determine context size from HCCPARAMS1.CSZ
-        let context_size: u8 = if cap.hccparams1.is_set(HCCPARAMS1::CSZ) {
-            64
-        } else {
-            32
+        let registers = unsafe {
+            Registers::new_with_64bit_access(mmio_base as usize, IdentityMapper, Access64::LowHigh)
         };
+        let hciversion = registers.capability.hciversion.read_volatile().get();
+        let hccparams1 = registers.capability.hccparams1.read_volatile();
+        let hcsparams1 = registers.capability.hcsparams1.read_volatile();
+        let hcsparams2 = registers.capability.hcsparams2.read_volatile();
 
-        // Get max scratchpad buffers from HCSPARAMS2
-        let max_sp_hi = cap.hcsparams2.read(HCSPARAMS2::MAX_SCRATCHPAD_HI) as u16;
-        let max_sp_lo = cap.hcsparams2.read(HCSPARAMS2::MAX_SCRATCHPAD_LO) as u16;
-        let num_scratchpad_bufs = (max_sp_hi << 5) | max_sp_lo;
+        let context_size = if hccparams1.context_size() { 64 } else { 32 };
+        let num_scratchpad_bufs = hcsparams2.max_scratchpad_buffers() as u16;
+        Self::take_bios_ownership(mmio_base, hccparams1);
 
-        // Take ownership from BIOS/SMM before doing anything else
-        Self::take_bios_ownership(mmio_base, hccparams1_val);
-
-        // Calculate register region offsets
-        let op_offset = caplength as u64;
-        let rt_offset = (rtsoff & !0x1F) as u64;
-        let db_offset = (dboff & !0x3) as u64;
-        let port_offset = op_offset + 0x400;
-
-        let num_ports = cap.hcsparams1.read(HCSPARAMS1::MAX_PORTS) as u8;
-        let hw_max_slots = cap.hcsparams1.read(HCSPARAMS1::MAX_SLOTS) as u8;
+        let num_ports = hcsparams1.number_of_ports();
+        let hw_max_slots = hcsparams1.number_of_device_slots();
         // Cap to our Vec capacity
         let max_slots = (hw_max_slots as usize).min(MAX_SLOTS);
 
@@ -681,14 +524,7 @@ impl XhciController {
             hw_max_slots,
         );
 
-        // Set up typed register pointers
-        let op_regs = (mmio_base + op_offset) as *const XhciOpRegs;
-        let rt_regs = (mmio_base + rt_offset) as *const XhciRuntimeRegs;
-        let db_base = mmio_base + db_offset;
-        let port_regs_base = mmio_base + port_offset;
-
-        // Read page size from operational registers
-        let page_size = (unsafe { &*op_regs }.pagesize.read(PAGESIZE::PAGE_SIZE)) << 12;
+        let page_size = u32::from(registers.operational.pagesize.read_volatile().get()) << 12;
 
         log::debug!(
             "xHCI: context_size={}, scratchpad_bufs={}",
@@ -706,11 +542,7 @@ impl XhciController {
         let mut controller = Self {
             pci_address: pci_dev.address,
             mmio,
-            cap_regs,
-            op_regs,
-            rt_regs,
-            db_base,
-            port_regs_base,
+            registers,
             num_ports,
             page_size,
             context_size,
@@ -733,23 +565,55 @@ impl XhciController {
         Ok(controller)
     }
 
-    /// Get operational registers reference
     #[inline]
-    fn op(&self) -> &XhciOpRegs {
-        unsafe { &*self.op_regs }
+    fn portsc(&self, port: u8) -> PortStatusAndControlRegister {
+        self.registers
+            .port_register_set
+            .port(port as usize)
+            .portsc
+            .read_volatile()
     }
 
-    /// Get runtime registers reference
-    #[inline]
-    fn rt(&self) -> &XhciRuntimeRegs {
-        unsafe { &*self.rt_regs }
+    fn prepare_portsc_write(register: &mut PortStatusAndControlRegister) {
+        register
+            .set_0_port_enabled_disabled()
+            .set_0_port_reset()
+            .clear_port_link_state_write_strobe()
+            .set_0_connect_status_change()
+            .set_0_port_enabled_disabled_change()
+            .set_0_warm_port_reset_change()
+            .set_0_over_current_change()
+            .set_0_port_reset_change()
+            .set_0_port_link_state_change()
+            .set_0_port_config_error_change()
+            .set_0_warm_port_reset();
     }
 
-    /// Get port registers reference for a given port
-    #[inline]
-    fn port(&self, port: u8) -> &XhciPortRegs {
-        let addr = self.port_regs_base + (port as u64) * 0x10;
-        unsafe { &*(addr as *const XhciPortRegs) }
+    fn update_portsc<F>(&mut self, port: u8, update: F)
+    where
+        F: FnOnce(&mut PortStatusAndControlRegister),
+    {
+        self.registers
+            .port_register_set
+            .port_mut(port as usize)
+            .portsc
+            .update_volatile(|register| {
+                Self::prepare_portsc_write(register);
+                update(register);
+            });
+    }
+
+    fn clear_port_changes(&mut self, port: u8) {
+        self.update_portsc(port, |register| {
+            register
+                .clear_connect_status_change()
+                .clear_port_enabled_disabled_change()
+                .clear_warm_port_reset_change()
+                .clear_over_current_change()
+                .clear_port_reset_change()
+                .clear_port_link_state_change()
+                .clear_port_config_error_change();
+        });
     }
 
     /// Ring a doorbell
@@ -762,45 +626,71 @@ impl XhciController {
     /// and not reach the controller immediately (causing timeouts on some HW).
     /// This follows the Linux kernel's pattern in xhci-ring.c.
     #[inline]
-    fn ring_doorbell(&self, slot: u8, target: u8) {
-        let addr = (self.db_base + slot as u64 * 4) as *mut u32;
-        unsafe {
-            ptr::write_volatile(addr, target as u32);
-            // Readback to flush PCI posted write
-            let _ = ptr::read_volatile(addr as *const u32);
-        }
+    fn ring_doorbell(&mut self, slot: u8, target: u8) {
+        let mut doorbell = Doorbell::default();
+        doorbell.set_doorbell_target(target);
+        self.registers
+            .doorbell
+            .write_volatile_at(slot as usize, doorbell);
+        let _ = self.registers.doorbell.read_volatile_at(slot as usize);
     }
 
     /// Initialize the controller
     fn init(&mut self) -> Result<(), XhciError> {
-        // Wait for controller to be ready (up to 100ms)
-        wait_for(100, || !self.op().usbsts.is_set(USBSTS::CNR));
-
-        // Stop the controller
-        self.op().usbcmd.modify(USBCMD::RS::CLEAR);
-
-        // Wait for halt (up to 100ms)
-        wait_for(100, || self.op().usbsts.is_set(USBSTS::HCH));
-
-        // Reset the controller
-        self.op().usbcmd.write(USBCMD::HCRST::SET);
-
-        // Intel xHCI controllers require a 1ms delay after setting HCRST
-        // before accessing any HC registers (prevents rare system hangs)
-        crate::time::delay_ms(1);
-
-        // Wait for reset to complete (up to 500ms per USB spec)
-        wait_for(500, || {
-            !self.op().usbcmd.is_set(USBCMD::HCRST) && !self.op().usbsts.is_set(USBSTS::CNR)
+        wait_for(100, || {
+            !self
+                .registers
+                .operational
+                .usbsts
+                .read_volatile()
+                .controller_not_ready()
         });
 
-        // Make sure interrupts are disabled
-        self.op().usbcmd.modify(USBCMD::INTE::CLEAR);
+        self.registers
+            .operational
+            .usbcmd
+            .update_volatile(|command| {
+                command.clear_run_stop();
+            });
+        wait_for(100, || {
+            self.registers
+                .operational
+                .usbsts
+                .read_volatile()
+                .hc_halted()
+        });
 
-        // Set max device slots to our Vec capacity
-        self.op()
-            .config
-            .write(CONFIG::MAX_SLOTS_EN.val(self.slots.capacity() as u32));
+        self.registers
+            .operational
+            .usbcmd
+            .update_volatile(|command| {
+                command.set_host_controller_reset();
+            });
+        crate::time::delay_ms(1);
+        wait_for(500, || {
+            !self
+                .registers
+                .operational
+                .usbcmd
+                .read_volatile()
+                .host_controller_reset()
+                && !self
+                    .registers
+                    .operational
+                    .usbsts
+                    .read_volatile()
+                    .controller_not_ready()
+        });
+
+        self.registers
+            .operational
+            .usbcmd
+            .update_volatile(|command| {
+                command.clear_interrupter_enable();
+            });
+        self.registers.operational.config.update_volatile(|config| {
+            config.set_max_device_slots_enabled(self.slots.capacity() as u8);
+        });
 
         // Allocate and set up DCBAA (Device Context Base Address Array)
         // DCBAA[0] is reserved for scratchpad buffer array pointer
@@ -860,7 +750,10 @@ impl XhciController {
         // Publish DMA structures before programming their MMIO base address.
         barrier::mmio_write();
 
-        self.op().write_dcbaap(self.dcbaa);
+        let mut dcbaap =
+            xhci::registers::operational::DeviceContextBaseAddressArrayPointerRegister::default();
+        dcbaap.set(self.dcbaa);
+        self.registers.operational.dcbaap.write_volatile(dcbaap);
 
         // Allocate command ring (256 TRBs)
         let cmd_ring_mem = efi::allocate_pages(1).ok_or(XhciError::AllocationFailed)?;
@@ -868,7 +761,15 @@ impl XhciController {
         self.cmd_ring = TrbRing::new(cmd_ring_base, 256);
 
         // Set command ring pointer
-        self.op().write_crcr(self.cmd_ring.physical_addr());
+        self.registers.operational.crcr.update_volatile(|crcr| {
+            crcr.set_0_command_stop().set_0_command_abort();
+            crcr.set_command_ring_pointer(self.cmd_ring.base);
+            if self.cmd_ring.cycle {
+                crcr.set_ring_cycle_state();
+            } else {
+                crcr.clear_ring_cycle_state();
+            }
+        });
 
         // Allocate event ring (256 TRBs) - no link TRB for event rings
         let event_ring_mem = efi::allocate_pages(1).ok_or(XhciError::AllocationFailed)?;
@@ -889,29 +790,37 @@ impl XhciController {
             ptr::write_volatile(erst_size, 256); // Ring Segment Size (32-bit, number of TRBs)
         }
 
-        // Set ERSTSZ (Event Ring Segment Table Size)
-        self.rt().ir0.erstsz.write(ERSTSZ::SEGMENT_COUNT.val(1));
+        {
+            let mut interrupter = self.registers.interrupter_register_set.interrupter_mut(0);
+            interrupter.erstsz.update_volatile(|erstsz| {
+                erstsz.set(1);
+            });
+            interrupter.erdp.update_volatile(|erdp| {
+                erdp.set_event_ring_dequeue_pointer(event_ring_base);
+                erdp.clear_event_handler_busy();
+            });
+            interrupter.erstba.update_volatile(|erstba| {
+                erstba.set(self.erst);
+            });
+            interrupter.iman.update_volatile(|iman| {
+                iman.set_0_interrupt_pending().set_interrupt_enable();
+            });
+        }
 
-        // Set ERDP (Event Ring Dequeue Pointer)
-        self.rt().ir0.write_erdp(event_ring_base);
-
-        // Set ERSTBA (Event Ring Segment Table Base Address)
-        self.rt().ir0.write_erstba(self.erst);
-
-        // Enable interrupter 0 (IMAN.IE = 1)
-        // Some controllers won't generate events at all unless the interrupter
-        // is enabled, even when using polling mode. IP (bit 0) is RW1C, so we
-        // must NOT use modify() which would read-modify-write and accidentally
-        // clear a pending interrupt. Instead, mask IP to 0 and set IE explicitly.
-        // This follows Linux's xhci_run_finished() pattern.
-        let iman = self.rt().ir0.iman.get();
-        self.rt().ir0.iman.set((iman & !0x1) | 0x2);
-
-        // Start the controller with event interrupt enable
-        self.op().usbcmd.modify(USBCMD::RS::SET + USBCMD::INTE::SET);
-
-        // Wait for running (up to 100ms)
-        wait_for(100, || !self.op().usbsts.is_set(USBSTS::HCH));
+        self.registers
+            .operational
+            .usbcmd
+            .update_volatile(|command| {
+                command.set_run_stop().set_interrupter_enable();
+            });
+        wait_for(100, || {
+            !self
+                .registers
+                .operational
+                .usbsts
+                .read_volatile()
+                .hc_halted()
+        });
 
         // Power on all ports - many real hardware controllers require explicit port power
         self.power_on_ports();
@@ -924,29 +833,22 @@ impl XhciController {
     ///
     /// Many xHCI controllers (especially on real hardware) require explicit
     /// port power enable. Without this, devices won't be detected.
-    fn power_on_ports(&self) {
-        for port_num in 0..self.num_ports {
-            let port_reg = self.port(port_num);
-
-            // Check if port power is already on
-            if port_reg.portsc.is_set(PORTSC::PP) {
+    fn power_on_ports(&mut self) {
+        for port in 0..self.num_ports {
+            if self.portsc(port).port_power() {
                 continue;
             }
-
-            // Enable port power, preserving RW bits
-            let portsc = port_reg.portsc.get();
-            port_reg.portsc.set((portsc & PORTSC_RW_MASK) | (1 << 9));
-
-            log::debug!("xHCI: Powered on port {}", port_num);
+            self.update_portsc(port, |portsc| {
+                portsc.set_port_power();
+            });
+            log::debug!("xHCI: Powered on port {}", port);
         }
-
-        // Wait for power to stabilize (2ms per USB spec, but give more time for real hardware)
         crate::time::delay_ms(20);
     }
 
     /// Wait for and process a command completion event
-    fn wait_command_completion(&mut self) -> Result<Trb, XhciError> {
-        let timeout = Timeout::from_ms(5000); // 5 second timeout for commands
+    fn wait_command_completion(&mut self) -> Result<event::CommandCompletion, XhciError> {
+        let timeout = Timeout::from_ms(5000);
 
         log::debug!(
             "xHCI: Waiting for command, dequeue_idx={}, expect_cycle={}",
@@ -955,60 +857,52 @@ impl XhciController {
         );
 
         while !timeout.is_expired() {
-            let erdp = self.event_ring.base + (self.event_ring.dequeue_idx * 16) as u64;
-            let event = unsafe { &*(erdp as *const Trb) };
+            let erdp = self.event_ring.base + (self.event_ring.dequeue_idx * trb::BYTES) as u64;
+            let raw = read_event_trb(erdp, self.event_ring.cycle);
 
-            if event.get_cycle() == self.event_ring.cycle {
-                let trb = *event;
-
+            if let Some(raw) = raw {
                 log::debug!(
                     "xHCI: Got event type={}, cc={}, param={:#x}",
-                    trb.get_type(),
-                    trb.completion_code(),
-                    trb.param
+                    raw_trb_type(&raw),
+                    raw_completion_code(&raw),
+                    u64::from(raw[0]) | (u64::from(raw[1]) << 32)
                 );
 
-                // Advance dequeue pointer (software only — defer MMIO write)
                 self.event_ring.dequeue_idx += 1;
                 if self.event_ring.dequeue_idx >= self.event_ring.size {
                     self.event_ring.dequeue_idx = 0;
                     self.event_ring.cycle = !self.event_ring.cycle;
                 }
-
-                // Update ERDP for every consumed event to prevent event ring overflow.
-                // Unhandled events (e.g., stale transfer events) would otherwise
-                // occupy ring slots indefinitely.
                 self.update_erdp();
 
-                if trb.get_type() == TRB_TYPE_COMMAND_COMPLETION {
-                    let cc = trb.completion_code();
-                    if cc == TRB_CC_SUCCESS {
-                        return Ok(trb);
-                    } else {
-                        return Err(XhciError::CommandFailed(cc));
+                match event::Allowed::try_from(raw) {
+                    Ok(event::Allowed::CommandCompletion(completion)) => {
+                        let completion_code = completion.completion_code();
+                        if completion_code == Ok(event::CompletionCode::Success) {
+                            return Ok(completion);
+                        }
+                        return Err(XhciError::CommandFailed(completion_code));
                     }
-                } else if trb.get_type() == TRB_TYPE_PORT_STATUS_CHANGE {
-                    // Ignore port status change events during command wait
-                    continue;
-                } else if trb.get_type() == TRB_TYPE_HOST_CONTROLLER {
-                    // Host Controller Event indicates a fatal error (HSE)
-                    log::error!(
-                        "xHCI: Host Controller Event (fatal HSE), cc={}",
-                        trb.completion_code()
-                    );
-                    return Err(XhciError::CommandFailed(trb.completion_code()));
+                    Ok(event::Allowed::PortStatusChange(_)) => continue,
+                    Ok(event::Allowed::HostController(host)) => {
+                        log::error!(
+                            "xHCI: Host Controller Event (fatal HSE), cc={:?}",
+                            host.completion_code()
+                        );
+                        return Err(XhciError::CommandFailed(host.completion_code()));
+                    }
+                    _ => {}
                 }
             }
             core::hint::spin_loop();
         }
 
-        // Timeout — still update ERDP for any events we consumed
         self.update_erdp();
-        let usbsts = self.op().usbsts.get();
+        let usbsts = self.registers.operational.usbsts.read_volatile();
         log::warn!(
-            "xHCI: Command timeout, USBSTS={:#x}, event_ring[0].control={:#x}",
+            "xHCI: Command timeout, USBSTS={:?}, event_ring[0].control={:#x}",
             usbsts,
-            unsafe { (*(self.event_ring.base as *const Trb)).control }
+            read_event_control(self.event_ring.base)
         );
 
         Err(XhciError::Timeout)
@@ -1016,93 +910,81 @@ impl XhciController {
 
     /// Wait for transfer completion events
     ///
-    /// Each TRB is its own independent TD with IOC=1, so the controller
-    /// generates one Transfer Event per TRB. We collect `expected_trbs`
-    /// successful events before returning. ERDP is updated after each event
-    /// to keep the event ring flowing (required since each TRB generates its
-    /// own event).
-    ///
-    /// Returns the cumulative residual across all TRBs (sum of each TRB's
-    /// individual residual). This is needed because each TRB is an independent
-    /// TD, so a short packet on any TRB only affects that TRB's residual.
+    /// Each TRB is its own independent TD with IOC=1. CrabEFI keeps its
+    /// polling, timeout, and ERDP policy while decoding events upstream.
     fn wait_transfer_completion(
         &mut self,
         _slot: u8,
         _ep: u8,
         expected_trbs: usize,
     ) -> Result<u32, XhciError> {
-        let timeout = Timeout::from_ms(5000); // 5 second timeout for transfers
+        let timeout = Timeout::from_ms(5000);
         let mut completed = 0usize;
-        let mut total_residual: u32 = 0;
+        let mut total_residual = 0u32;
 
         while !timeout.is_expired() {
-            let erdp = self.event_ring.base + (self.event_ring.dequeue_idx * 16) as u64;
-            let event = unsafe { &*(erdp as *const Trb) };
+            let erdp = self.event_ring.base + (self.event_ring.dequeue_idx * trb::BYTES) as u64;
+            let raw = read_event_trb(erdp, self.event_ring.cycle);
 
-            if event.get_cycle() == self.event_ring.cycle {
-                let trb = *event;
-
-                // Advance dequeue pointer
+            if let Some(raw) = raw {
                 self.event_ring.dequeue_idx += 1;
                 if self.event_ring.dequeue_idx >= self.event_ring.size {
                     self.event_ring.dequeue_idx = 0;
                     self.event_ring.cycle = !self.event_ring.cycle;
                 }
-
-                // Update ERDP after each event — required since every TRB
-                // generates its own completion event
                 self.update_erdp();
 
-                if trb.get_type() == TRB_TYPE_TRANSFER_EVENT {
-                    let cc = trb.completion_code();
-                    let residual = trb.status & 0xFFFFFF;
-                    log::trace!(
-                        "xHCI: Transfer event cc={} ({}) residue={} [{}/{}]",
-                        cc,
-                        trb_cc_name(cc),
-                        residual,
-                        completed + 1,
-                        expected_trbs
-                    );
+                match event::Allowed::try_from(raw) {
+                    Ok(event::Allowed::TransferEvent(transfer_event)) => {
+                        let residual = transfer_event.trb_transfer_length();
+                        let completion_code = transfer_event.completion_code();
+                        log::trace!(
+                            "xHCI: Transfer event cc={:?} residue={} [{}/{}]",
+                            completion_code,
+                            residual,
+                            completed + 1,
+                            expected_trbs
+                        );
 
-                    if cc == TRB_CC_SUCCESS || cc == TRB_CC_SHORT_PACKET {
-                        completed += 1;
-                        total_residual += residual;
-                        if completed >= expected_trbs {
-                            return Ok(total_residual);
+                        if matches!(
+                            completion_code,
+                            Ok(event::CompletionCode::Success | event::CompletionCode::ShortPacket)
+                        ) {
+                            completed += 1;
+                            total_residual += residual;
+                            if completed >= expected_trbs {
+                                return Ok(total_residual);
+                            }
+                        } else if completion_code == Ok(event::CompletionCode::StallError) {
+                            log::debug!(
+                                "xHCI: Transfer stalled [{}/{}]",
+                                completed + 1,
+                                expected_trbs
+                            );
+                            self.drain_remaining_transfer_events(expected_trbs - completed - 1);
+                            return Err(XhciError::StallError);
+                        } else {
+                            log::debug!(
+                                "xHCI: Transfer failed with cc={:?} [{}/{}]",
+                                completion_code,
+                                completed + 1,
+                                expected_trbs
+                            );
+                            self.drain_remaining_transfer_events(expected_trbs - completed - 1);
+                            return Err(XhciError::TransferFailed(completion_code));
                         }
-                        // More TRBs to collect — continue
-                    } else if cc == TRB_CC_STALL_ERROR {
-                        log::debug!(
-                            "xHCI: Transfer stalled [{}/{}]",
-                            completed + 1,
-                            expected_trbs
-                        );
-                        self.drain_remaining_transfer_events(expected_trbs - completed - 1);
-                        return Err(XhciError::StallError);
-                    } else {
-                        log::debug!(
-                            "xHCI: Transfer failed with cc={} ({}) [{}/{}]",
-                            cc,
-                            trb_cc_name(cc),
-                            completed + 1,
-                            expected_trbs
-                        );
-                        self.drain_remaining_transfer_events(expected_trbs - completed - 1);
-                        return Err(XhciError::TransferFailed(cc));
                     }
-                } else if trb.get_type() == TRB_TYPE_HOST_CONTROLLER {
-                    // Host Controller Event indicates a fatal error (HSE)
-                    log::error!(
-                        "xHCI: Host Controller Event (fatal HSE) during transfer, cc={}",
-                        trb.completion_code()
-                    );
-                    return Err(XhciError::TransferFailed(trb.completion_code()));
-                } else {
-                    log::trace!(
+                    Ok(event::Allowed::HostController(host)) => {
+                        log::error!(
+                            "xHCI: Host Controller Event (fatal HSE) during transfer, cc={:?}",
+                            host.completion_code()
+                        );
+                        return Err(XhciError::TransferFailed(host.completion_code()));
+                    }
+                    _ => log::trace!(
                         "xHCI: Got event type {} while waiting for transfer",
-                        trb.get_type()
-                    );
+                        raw_trb_type(&raw)
+                    ),
                 }
             }
             core::hint::spin_loop();
@@ -1129,10 +1011,10 @@ impl XhciController {
         let mut consumed = 0usize;
 
         while drained < max_events && !timeout.is_expired() {
-            let erdp = self.event_ring.base + (self.event_ring.dequeue_idx * 16) as u64;
-            let event = unsafe { &*(erdp as *const Trb) };
+            let erdp = self.event_ring.base + (self.event_ring.dequeue_idx * trb::BYTES) as u64;
+            let raw = read_event_trb(erdp, self.event_ring.cycle);
 
-            if event.get_cycle() == self.event_ring.cycle {
+            if let Some(raw) = raw {
                 self.event_ring.dequeue_idx += 1;
                 if self.event_ring.dequeue_idx >= self.event_ring.size {
                     self.event_ring.dequeue_idx = 0;
@@ -1140,7 +1022,7 @@ impl XhciController {
                 }
                 consumed += 1;
 
-                if event.get_type() == TRB_TYPE_TRANSFER_EVENT {
+                if event::TransferEvent::try_from(raw).is_ok() {
                     drained += 1;
                 }
             } else {
@@ -1166,10 +1048,16 @@ impl XhciController {
     /// This is a 64-bit split write (two PCIe MMIO writes), so it should be
     /// called as infrequently as possible.
     #[inline]
-    fn update_erdp(&self) {
+    fn update_erdp(&mut self) {
         let new_erdp = self.event_ring.base + (self.event_ring.dequeue_idx * 16) as u64;
-        let erdp_with_ehb = (new_erdp & !0xF) | (1 << 3);
-        self.rt().ir0.write_erdp(erdp_with_ehb);
+        self.registers
+            .interrupter_register_set
+            .interrupter_mut(0)
+            .erdp
+            .update_volatile(|erdp| {
+                erdp.set_event_ring_dequeue_pointer(new_erdp);
+                erdp.clear_event_handler_busy();
+            });
     }
 
     /// Reset an endpoint after a stall or other error
@@ -1188,15 +1076,11 @@ impl XhciController {
     fn reset_endpoint(&mut self, slot_id: u8, dci: u8) -> Result<(), XhciError> {
         log::debug!("xHCI: Resetting endpoint slot={} dci={}", slot_id, dci);
 
-        // Step 1: Send Reset Endpoint command
-        // The Reset Endpoint command transitions the endpoint from Halted to Stopped state
-        let mut trb = Trb::default();
-        trb.set_type(TRB_TYPE_RESET_ENDPOINT);
-        // Slot ID in bits 31:24, Endpoint ID in bits 20:16
-        trb.control |= (slot_id as u32) << 24;
-        trb.control |= (dci as u32) << 16;
+        // Step 1: Send Reset Endpoint command.
+        let mut command = command::ResetEndpoint::new();
+        command.set_slot_id(slot_id).set_endpoint_id(dci);
 
-        self.cmd_ring.enqueue(&trb, false);
+        self.cmd_ring.enqueue(command, false);
         barrier::mmio_write();
         self.ring_doorbell(0, 0);
 
@@ -1231,14 +1115,16 @@ impl XhciController {
         let dequeue_ptr = ring.base + (ring.enqueue_idx * 16) as u64;
         let dequeue_ptr_with_dcs = dequeue_ptr | if ring.cycle { 1 } else { 0 };
 
-        let mut trb = Trb::default();
-        trb.param = dequeue_ptr_with_dcs;
-        trb.set_type(TRB_TYPE_SET_TR_DEQUEUE);
-        // Slot ID in bits 31:24, Endpoint ID in bits 20:16
-        trb.control |= (slot_id as u32) << 24;
-        trb.control |= (dci as u32) << 16;
+        let mut command = command::SetTrDequeuePointer::new();
+        command
+            .set_new_tr_dequeue_pointer(dequeue_ptr)
+            .set_slot_id(slot_id)
+            .set_endpoint_id(dci);
+        if ring.cycle {
+            command.set_dequeue_cycle_state();
+        }
 
-        self.cmd_ring.enqueue(&trb, false);
+        self.cmd_ring.enqueue(command, false);
         barrier::mmio_write();
         self.ring_doorbell(0, 0);
 
@@ -1261,23 +1147,20 @@ impl XhciController {
 
     /// Enable a slot
     fn enable_slot(&mut self) -> Result<u8, XhciError> {
-        let mut trb = Trb::default();
-        trb.set_type(TRB_TYPE_ENABLE_SLOT);
-
-        let cmd_addr = self.cmd_ring.enqueue(&trb, false);
+        let cmd_addr = self.cmd_ring.enqueue(command::EnableSlot::new(), false);
         log::debug!(
-            "xHCI: Enable Slot TRB at {:#x}, cycle={}, CRCR={:#x}",
+            "xHCI: Enable Slot TRB at {:#x}, cycle={}, CRCR={:?}",
             cmd_addr,
             self.cmd_ring.cycle,
-            self.op().read_crcr()
+            self.registers.operational.crcr.read_volatile()
         );
 
         barrier::mmio_write();
         self.ring_doorbell(0, 0); // Ring host controller doorbell
 
         // Check USBSTS after ringing doorbell
-        let usbsts = self.op().usbsts.get();
-        log::debug!("xHCI: USBSTS after doorbell: {:#x}", usbsts);
+        let usbsts = self.registers.operational.usbsts.read_volatile();
+        log::debug!("xHCI: USBSTS after doorbell: {:?}", usbsts);
 
         let completion = self.wait_command_completion()?;
         Ok(completion.slot_id())
@@ -1299,16 +1182,18 @@ impl XhciController {
         let transfer_ring_mem = efi::allocate_pages(1).ok_or(XhciError::AllocationFailed)?;
         let transfer_ring = transfer_ring_mem.as_ptr() as u64;
 
-        let input_ptr = input_context as *mut InputContext;
+        let input_ptr = input_context as *mut u8;
 
-        // Set up input control context
-        Self::input_control_context(input_ptr).add_flags = 0x3; // Add slot and EP0
+        // Set up input control context: add slot and EP0.
+        let control = Self::input_control_context(input_ptr, self.context_size);
+        control.set_add_context_flag(0);
+        control.set_add_context_flag(1);
 
         // Set up slot context
         let slot_ctx = Self::input_slot_context(input_ptr, self.context_size);
         slot_ctx.set_context_entries(1);
         slot_ctx.set_speed(speed);
-        slot_ctx.set_root_hub_port(port + 1);
+        slot_ctx.set_root_hub_port_number(port + 1);
 
         // Set up control endpoint context
         let max_packet = match speed {
@@ -1320,12 +1205,13 @@ impl XhciController {
         };
 
         let ep0_ctx = Self::input_ep_context(input_ptr, self.context_size, 0);
-        ep0_ctx.set_ep_type(4); // Control endpoint
+        ep0_ctx.set_endpoint_type(EndpointType::Control);
         ep0_ctx.set_max_packet_size(max_packet);
         ep0_ctx.set_max_burst_size(0);
-        ep0_ctx.set_cerr(3);
-        ep0_ctx.set_tr_dequeue_ptr(transfer_ring, true);
-        ep0_ctx.set_avg_trb_length(8);
+        ep0_ctx.set_error_count(3);
+        ep0_ctx.set_tr_dequeue_pointer(transfer_ring);
+        ep0_ctx.set_dequeue_cycle_state();
+        ep0_ctx.set_average_trb_length(8);
 
         // Set up transfer ring
         let ring = TrbRing::new(transfer_ring, 256);
@@ -1335,12 +1221,12 @@ impl XhciController {
         *dcbaa_entry = device_context;
 
         // Build Address Device command
-        let mut trb = Trb::default();
-        trb.param = input_context;
-        trb.set_type(TRB_TYPE_ADDRESS_DEVICE);
-        trb.control |= (slot_id as u32) << 24;
+        let mut command = command::AddressDevice::new();
+        command
+            .set_input_context_pointer(input_context)
+            .set_slot_id(slot_id);
 
-        self.cmd_ring.enqueue(&trb, false);
+        self.cmd_ring.enqueue(command, false);
         barrier::mmio_write();
         self.ring_doorbell(0, 0);
 
@@ -1360,8 +1246,8 @@ impl XhciController {
             .ok_or(XhciError::NoFreeSlots)?;
         *slot_entry = Some(UsbSlot {
             slot_id,
-            device_context: device_context as *mut DeviceContext,
-            input_context: input_context as *mut InputContext,
+            device_context: device_context as *mut u8,
+            input_context: input_context as *mut u8,
             transfer_rings,
             device_desc: DeviceDescriptor::default(),
             port,
@@ -1423,20 +1309,22 @@ impl XhciController {
         let first_trb_cycle = ring.cycle;
 
         // Setup Stage TRB — enqueued with DEFERRED cycle bit
-        let mut setup = Trb::default();
-        setup.param = (request_type as u64)
-            | ((request as u64) << 8)
-            | ((value as u64) << 16)
-            | ((index as u64) << 32)
-            | ((data_len as u64) << 48);
-        setup.status = 8; // TRB transfer length = 8
-        setup.set_type(TRB_TYPE_SETUP);
-        setup.control |= 1 << 6; // IDT (Immediate Data)
-        if data_len > 0 {
-            setup.control |= if is_in { 3 << 16 } else { 2 << 16 }; // TRT
-        }
+        let mut setup = transfer::SetupStage::new();
+        setup
+            .set_request_type(request_type)
+            .set_request(request)
+            .set_value(value)
+            .set_index(index)
+            .set_length(data_len as u16)
+            .set_transfer_type(if data_len == 0 {
+                transfer::TransferType::No
+            } else if is_in {
+                transfer::TransferType::In
+            } else {
+                transfer::TransferType::Out
+            });
 
-        let first_trb_addr = ring.enqueue(&setup, true); // defer_cycle = true
+        let first_trb_addr = ring.enqueue(setup, true); // defer_cycle = true
 
         // Data Stage TRB (if needed)
         // Note: We intentionally do NOT set ISP (Interrupt on Short Packet) on the
@@ -1445,26 +1333,27 @@ impl XhciController {
         // expects 1 event. The orphaned Status event would corrupt later transfers.
         // EDK2 also relies solely on IOC on the Status Stage TRB.
         if let Some(data_buf) = data {
-            let mut data_trb = Trb::default();
-            data_trb.param = data_buf.as_ptr() as u64;
-            data_trb.status = data_buf.len() as u32;
-            data_trb.set_type(TRB_TYPE_DATA);
-            if is_in {
-                data_trb.control |= 1 << 16; // DIR = IN
-            }
+            let mut data_trb = transfer::DataStage::new();
+            data_trb
+                .set_data_buffer_pointer(data_buf.as_ptr() as u64)
+                .set_trb_transfer_length(data_buf.len() as u32)
+                .set_direction(if is_in {
+                    transfer::Direction::In
+                } else {
+                    transfer::Direction::Out
+                });
 
-            ring.enqueue(&data_trb, false);
+            ring.enqueue(data_trb, false);
         }
 
         // Status Stage TRB
-        let mut status = Trb::default();
-        status.set_type(TRB_TYPE_STATUS);
+        let mut status = transfer::StatusStage::new();
         if data_len == 0 || !is_in {
-            status.control |= 1 << 16; // DIR = IN for status
+            status.set_direction();
         }
-        status.control |= 1 << 5; // IOC (Interrupt on Completion)
+        status.set_interrupt_on_completion();
 
-        ring.enqueue(&status, false);
+        ring.enqueue(status, false);
 
         // Commit the deferred first TRB — atomically makes the entire TD live
         TrbRing::commit_deferred_trb(first_trb_addr, first_trb_cycle);
@@ -1517,21 +1406,21 @@ impl XhciController {
                 .ok_or(XhciError::DeviceNotFound)?;
             let input = slot.input_context;
             unsafe {
-                core::ptr::write_bytes(input as *mut u8, 0, Self::input_context_len(context_size));
+                core::ptr::write_bytes(input, 0, Self::input_context_len(context_size));
             }
+            Self::copy_device_ep_context(input, slot.device_context, context_size, 0);
             let ep0 = Self::input_ep_context(input, context_size, 0);
-            *ep0 = Self::device_ep_context(slot.device_context, context_size, 0);
             ep0.set_max_packet_size(max_packet);
-            Self::input_control_context(input).add_flags = 1 << 1;
+            Self::input_control_context(input, context_size).set_add_context_flag(1);
             input as u64
         };
 
-        let mut trb = Trb::default();
-        trb.param = input_context;
-        trb.set_type(TRB_TYPE_EVALUATE_CONTEXT);
-        trb.control |= (slot_id as u32) << 24;
+        let mut command = command::EvaluateContext::new();
+        command
+            .set_input_context_pointer(input_context)
+            .set_slot_id(slot_id);
 
-        self.cmd_ring.enqueue(&trb, false);
+        self.cmd_ring.enqueue(command, false);
         barrier::mmio_write();
         self.ring_doorbell(0, 0);
         self.wait_command_completion()?;
@@ -1575,7 +1464,7 @@ impl XhciController {
         // Parse device descriptor using zerocopy
         DeviceDescriptor::read_from_prefix(&desc)
             .map(|(d, _)| d)
-            .map_err(|_| XhciError::TransferFailed(0))
+            .map_err(|_| XhciError::InvalidParameter)
     }
 
     /// Set configuration
@@ -1813,28 +1702,23 @@ impl XhciController {
 
         let input_ctx = slot.input_context;
         unsafe {
-            core::ptr::write_bytes(
-                input_ctx as *mut u8,
-                0,
-                Self::input_context_len(self.context_size),
-            );
+            core::ptr::write_bytes(input_ctx, 0, Self::input_context_len(self.context_size));
         }
-        let control_ctx = Self::input_control_context(input_ctx);
-        control_ctx.add_flags = 0x1; // Evaluate slot context only
-        control_ctx.drop_flags = 0;
+        let control_ctx = Self::input_control_context(input_ctx, self.context_size);
+        control_ctx.set_add_context_flag(0);
+        Self::copy_device_slot_context(input_ctx, slot.device_context, self.context_size);
         let slot_ctx = Self::input_slot_context(input_ctx, self.context_size);
-        *slot_ctx = Self::device_slot_context(slot.device_context);
-        slot_ctx.set_hub(true);
-        slot_ctx.set_num_ports(num_ports);
+        slot_ctx.set_hub();
+        slot_ctx.set_number_of_ports(num_ports);
         // Context entries must cover at least slot + EP0
         slot_ctx.set_context_entries(1);
 
-        let mut trb = Trb::default();
-        trb.param = slot.input_context as u64;
-        trb.set_type(TRB_TYPE_EVALUATE_CONTEXT);
-        trb.control |= (slot_id as u32) << 24;
+        let mut command = command::EvaluateContext::new();
+        command
+            .set_input_context_pointer(slot.input_context as u64)
+            .set_slot_id(slot_id);
 
-        self.cmd_ring.enqueue(&trb, false);
+        self.cmd_ring.enqueue(command, false);
         barrier::mmio_write();
         self.ring_doorbell(0, 0);
 
@@ -1867,17 +1751,19 @@ impl XhciController {
         let transfer_ring_mem = efi::allocate_pages(1).ok_or(XhciError::AllocationFailed)?;
         let transfer_ring = transfer_ring_mem.as_ptr() as u64;
 
-        let input_ptr = input_context as *mut InputContext;
-        Self::input_control_context(input_ptr).add_flags = 0x3; // Add slot + EP0
+        let input_ptr = input_context as *mut u8;
+        let control = Self::input_control_context(input_ptr, self.context_size);
+        control.set_add_context_flag(0);
+        control.set_add_context_flag(1);
 
         // Slot context with hub topology info
         let slot_ctx = Self::input_slot_context(input_ptr, self.context_size);
         slot_ctx.set_context_entries(1);
         slot_ctx.set_speed(speed);
-        slot_ctx.set_root_hub_port(root_port + 1);
+        slot_ctx.set_root_hub_port_number(root_port + 1);
         slot_ctx.set_route_string(route_string);
-        slot_ctx.set_parent_hub_slot(hub_slot_id);
-        slot_ctx.set_parent_port_num(hub_port);
+        slot_ctx.set_parent_hub_slot_id(hub_slot_id);
+        slot_ctx.set_parent_port_number(hub_port);
 
         // Control endpoint
         let max_packet = match speed {
@@ -1889,12 +1775,13 @@ impl XhciController {
         };
 
         let ep0_ctx = Self::input_ep_context(input_ptr, self.context_size, 0);
-        ep0_ctx.set_ep_type(4);
+        ep0_ctx.set_endpoint_type(EndpointType::Control);
         ep0_ctx.set_max_packet_size(max_packet);
         ep0_ctx.set_max_burst_size(0);
-        ep0_ctx.set_cerr(3);
-        ep0_ctx.set_tr_dequeue_ptr(transfer_ring, true);
-        ep0_ctx.set_avg_trb_length(8);
+        ep0_ctx.set_error_count(3);
+        ep0_ctx.set_tr_dequeue_pointer(transfer_ring);
+        ep0_ctx.set_dequeue_cycle_state();
+        ep0_ctx.set_average_trb_length(8);
 
         let ring = TrbRing::new(transfer_ring, 256);
 
@@ -1903,12 +1790,12 @@ impl XhciController {
         *dcbaa_entry = device_context;
 
         // Address Device command
-        let mut trb = Trb::default();
-        trb.param = input_context;
-        trb.set_type(TRB_TYPE_ADDRESS_DEVICE);
-        trb.control |= (slot_id as u32) << 24;
+        let mut command = command::AddressDevice::new();
+        command
+            .set_input_context_pointer(input_context)
+            .set_slot_id(slot_id);
 
-        self.cmd_ring.enqueue(&trb, false);
+        self.cmd_ring.enqueue(command, false);
         barrier::mmio_write();
         self.ring_doorbell(0, 0);
         self.wait_command_completion()?;
@@ -1924,8 +1811,8 @@ impl XhciController {
             .ok_or(XhciError::NoFreeSlots)?;
         *slot_entry = Some(UsbSlot {
             slot_id,
-            device_context: device_context as *mut DeviceContext,
-            input_context: input_context as *mut InputContext,
+            device_context: device_context as *mut u8,
+            input_context: input_context as *mut u8,
             transfer_rings,
             device_desc: DeviceDescriptor::default(),
             port: hub_port,
@@ -1998,37 +1885,26 @@ impl XhciController {
     /// Enumerate ports and attach devices
     fn enumerate_ports(&mut self) -> Result<(), XhciError> {
         for port in 0..self.num_ports {
-            let port_reg = self.port(port);
-
-            // Quick check — skip immediately if nothing connected.
-            // This avoids the 100ms debounce cost for every empty port.
-            if !port_reg.portsc.is_set(PORTSC::CCS) {
+            if !self.portsc(port).current_connect_status() {
                 continue;
             }
 
-            // Debounce: check connection is stable for 50ms
-            // This prevents detecting phantom connections during cable settling
             let mut stable_count = 0;
-
             for _ in 0..5 {
-                if self.port(port).portsc.is_set(PORTSC::CCS) {
+                if self.portsc(port).current_connect_status() {
                     stable_count += 1;
                 } else {
                     stable_count = 0;
                 }
                 crate::time::delay_ms(10);
             }
-
-            // Need at least 3 stable reads to consider device connected
             if stable_count < 3 {
                 continue;
             }
 
-            let port_reg = self.port(port);
-
-            // Get speed and link state
-            let speed = port_reg.portsc.read(PORTSC::SPEED) as u8;
-            let pls = port_reg.portsc.read(PORTSC::PLS);
+            let status = self.portsc(port);
+            let speed = status.port_speed();
+            let link_state = status.port_link_state();
             let speed_name = match speed {
                 1 => "Full",
                 2 => "Low",
@@ -2036,54 +1912,37 @@ impl XhciController {
                 4 => "Super",
                 _ => "Unknown",
             };
-            let pls_name = match pls {
+            let link_name = match link_state {
                 0 => "U0",
                 5 => "RxDetect",
                 7 => "Polling",
                 _ => "Other",
             };
-
             log::info!(
                 "USB device on port {}: {} speed, PLS={}",
                 port,
                 speed_name,
-                pls_name
+                link_name
             );
 
-            // If port is in RxDetect state, it's a phantom device (e.g., Thunderbolt
-            // controller internal port that reports CCS=1 but has no real device).
-            // Skip these immediately - they'll never come up.
-            if pls == 5 {
-                // RxDetect
+            if link_state == 5 {
                 log::debug!("Port {}: RxDetect state (phantom device), skipping", port);
                 continue;
             }
 
-            // Clear status change bits using proper RW mask to avoid side effects
-            // PORTSC has RW1C bits (write-1-to-clear) like PED, so we must be careful
-            let portsc = self.port(port).portsc.get();
-            self.port(port)
-                .portsc
-                .set((portsc & PORTSC_RW_MASK) | PORTSC_CHANGE_MASK);
+            self.clear_port_changes(port);
 
-            // For USB3 SuperSpeed devices already in U0 state with port enabled,
-            // skip the reset - the device is ready to use
-            let is_usb3 = speed == 4; // SuperSpeed
-            let is_enabled = self.port(port).portsc.is_set(PORTSC::PED);
-            let is_u0 = self.port(port).portsc.read(PORTSC::PLS) == 0;
-
-            if is_usb3 && is_enabled && is_u0 {
+            let status = self.portsc(port);
+            let is_usb3 = speed == 4;
+            if is_usb3 && status.port_enabled_disabled() && status.port_link_state() == 0 {
                 log::debug!("Port {}: USB3 device already in U0, skipping reset", port);
-            } else if is_usb3 && self.port(port).portsc.read(PORTSC::PLS) == 7
-            // Polling
-            {
-                // USB3 device in Polling state - wait for link training to complete
+            } else if is_usb3 && status.port_link_state() == 7 {
                 log::debug!("Port {}: USB3 device in Polling, waiting for link", port);
                 let timeout = Timeout::from_ms(200);
                 let mut link_up = false;
                 while !timeout.is_expired() {
-                    let pr = self.port(port);
-                    if pr.portsc.read(PORTSC::PLS) == 0 && pr.portsc.is_set(PORTSC::PED) {
+                    let status = self.portsc(port);
+                    if status.port_link_state() == 0 && status.port_enabled_disabled() {
                         link_up = true;
                         break;
                     }
@@ -2093,68 +1952,53 @@ impl XhciController {
                     log::debug!(
                         "Port {}: USB3 link training failed (PLS={}), skipping",
                         port,
-                        self.port(port).portsc.read(PORTSC::PLS)
+                        self.portsc(port).port_link_state()
                     );
                     continue;
                 }
-            } else if !self.port(port).portsc.is_set(PORTSC::PED) {
-                // USB2 device or USB3 device that needs reset
-                let portsc = self.port(port).portsc.get();
-                // Trigger port reset - preserve RW bits, set PR
-                self.port(port)
-                    .portsc
-                    .set((portsc & PORTSC_RW_MASK) | (1 << 4)); // PR bit
+            } else if !status.port_enabled_disabled() {
+                self.update_portsc(port, |portsc| {
+                    portsc.set_port_reset();
+                });
 
-                // Wait for reset to complete (up to 150ms per USB spec)
                 let timeout = Timeout::from_ms(150);
                 while !timeout.is_expired() {
-                    if self.port(port).portsc.is_set(PORTSC::PRC) {
-                        // Clear PRC by writing 1 to it (RW1C)
-                        let portsc = self.port(port).portsc.get();
-                        self.port(port)
-                            .portsc
-                            .set((portsc & PORTSC_RW_MASK) | (1 << 21)); // PRC bit
+                    if self.portsc(port).port_reset_change() {
+                        self.update_portsc(port, |portsc| {
+                            portsc.clear_port_reset_change();
+                        });
                         break;
                     }
                     crate::time::delay_ms(1);
                 }
 
-                // After reset, verify link is actually up
-                if self.port(port).portsc.read(PORTSC::PLS) != 0 {
-                    // For USB3 devices, try warm reset if normal reset failed
+                if self.portsc(port).port_link_state() != 0 {
                     if is_usb3 {
                         log::debug!(
                             "Port {}: USB3 normal reset failed (PLS={}), trying warm reset",
                             port,
-                            self.port(port).portsc.read(PORTSC::PLS)
+                            self.portsc(port).port_link_state()
                         );
+                        self.update_portsc(port, |portsc| {
+                            portsc.set_warm_port_reset();
+                        });
 
-                        // Issue warm reset
-                        let portsc = self.port(port).portsc.get();
-                        self.port(port)
-                            .portsc
-                            .set((portsc & PORTSC_RW_MASK) | (1 << 31)); // WPR bit
-
-                        // Wait for warm reset to complete
                         let timeout = Timeout::from_ms(200);
                         while !timeout.is_expired() {
-                            if self.port(port).portsc.is_set(PORTSC::WRC) {
-                                // Clear WRC by writing 1 to it (RW1C)
-                                let portsc = self.port(port).portsc.get();
-                                self.port(port)
-                                    .portsc
-                                    .set((portsc & PORTSC_RW_MASK) | (1 << 19)); // WRC bit
+                            if self.portsc(port).warm_port_reset_change() {
+                                self.update_portsc(port, |portsc| {
+                                    portsc.clear_warm_port_reset_change();
+                                });
                                 break;
                             }
                             crate::time::delay_ms(1);
                         }
 
-                        // Check if link came up after warm reset
-                        if self.port(port).portsc.read(PORTSC::PLS) != 0 {
+                        if self.portsc(port).port_link_state() != 0 {
                             log::debug!(
                                 "Port {}: link not up after warm reset (PLS={}), skipping",
                                 port,
-                                self.port(port).portsc.read(PORTSC::PLS)
+                                self.portsc(port).port_link_state()
                             );
                             continue;
                         }
@@ -2163,7 +2007,7 @@ impl XhciController {
                         log::debug!(
                             "Port {}: link not up after reset (PLS={}), skipping",
                             port,
-                            self.port(port).portsc.read(PORTSC::PLS)
+                            self.portsc(port).port_link_state()
                         );
                         continue;
                     }
@@ -2472,12 +2316,14 @@ impl XhciController {
             // Set up input context for Configure Endpoint
             let input = slot.input_context;
             unsafe {
-                core::ptr::write_bytes(input as *mut u8, 0, Self::input_context_len(context_size));
+                core::ptr::write_bytes(input, 0, Self::input_context_len(context_size));
             }
+            Self::copy_device_slot_context(input, slot.device_context, context_size);
             let slot_ctx = Self::input_slot_context(input, context_size);
-            *slot_ctx = Self::device_slot_context(slot.device_context);
             slot_ctx.set_context_entries(in_dci as u8);
-            Self::input_control_context(input).add_flags = 1 | (1 << in_dci); // Slot + this endpoint
+            let control = Self::input_control_context(input, context_size);
+            control.set_add_context_flag(0);
+            control.set_add_context_flag(in_dci);
 
             // Interrupt IN endpoint context (EP Type 7)
             // Convert bInterval to xHCI interval exponent:
@@ -2502,14 +2348,14 @@ impl XhciController {
             };
 
             let ep_ctx = Self::input_ep_context(input, context_size, in_dci - 1);
-            ep_ctx.set_ep_type(7); // Interrupt IN
+            ep_ctx.set_endpoint_type(EndpointType::InterruptIn);
             ep_ctx.set_max_packet_size(interrupt_max_packet);
             ep_ctx.set_max_burst_size(0);
-            ep_ctx.set_cerr(3);
-            ep_ctx.set_tr_dequeue_ptr(ring_addr, true);
-            ep_ctx.set_avg_trb_length(interrupt_max_packet);
-            // Interval field in dw0 bits 23:16
-            ep_ctx.dw0 = (ep_ctx.dw0 & !0x00FF0000) | ((xhci_interval as u32) << 16);
+            ep_ctx.set_error_count(3);
+            ep_ctx.set_tr_dequeue_pointer(ring_addr);
+            ep_ctx.set_dequeue_cycle_state();
+            ep_ctx.set_average_trb_length(interrupt_max_packet);
+            ep_ctx.set_interval(xhci_interval);
         }
 
         // Issue Configure Endpoint command
@@ -2520,12 +2366,12 @@ impl XhciController {
             .ok_or(XhciError::DeviceNotFound)?
             .input_context as u64;
 
-        let mut trb = Trb::default();
-        trb.param = input_ctx_ptr;
-        trb.set_type(TRB_TYPE_CONFIGURE_ENDPOINT);
-        trb.control |= (slot_id as u32) << 24;
+        let mut command = command::ConfigureEndpoint::new();
+        command
+            .set_input_context_pointer(input_ctx_ptr)
+            .set_slot_id(slot_id);
 
-        self.cmd_ring.enqueue(&trb, false);
+        self.cmd_ring.enqueue(command, false);
         barrier::mmio_write();
         self.ring_doorbell(0, 0);
         self.wait_command_completion()?;
@@ -2563,14 +2409,13 @@ impl XhciController {
             .ok_or(XhciError::DeviceNotFound)?;
 
         // Queue a Normal TRB for the interrupt IN transfer
-        let mut trb = Trb::default();
-        trb.param = data.as_ptr() as u64;
-        trb.status = (data.len() as u32) & 0x1FFFF; // Transfer Length
-        trb.set_type(TRB_TYPE_NORMAL);
-        trb.control |= 1 << 5; // IOC (Interrupt On Completion)
-        trb.control |= 1 << 2; // ISP (Interrupt on Short Packet)
+        let mut trb = transfer::Normal::new();
+        trb.set_data_buffer_pointer(data.as_ptr() as u64)
+            .set_trb_transfer_length((data.len() as u32) & 0x1ffff)
+            .set_interrupt_on_completion()
+            .set_interrupt_on_short_packet();
 
-        ring.enqueue(&trb, false);
+        ring.enqueue(trb, false);
         barrier::mmio_write();
         self.ring_doorbell(slot_id, in_dci as u8);
 
@@ -2612,46 +2457,51 @@ impl XhciController {
         // Set up input context
         let input = slot.input_context;
         unsafe {
-            core::ptr::write_bytes(input as *mut u8, 0, Self::input_context_len(context_size));
+            core::ptr::write_bytes(input, 0, Self::input_context_len(context_size));
         }
 
         // Copy slot context from device context
+        Self::copy_device_slot_context(input, slot.device_context, context_size);
         let slot_ctx = Self::input_slot_context(input, context_size);
-        *slot_ctx = Self::device_slot_context(slot.device_context);
         slot_ctx.set_context_entries(in_dci.max(out_dci) as u8);
 
         // Set up endpoint contexts
-        Self::input_control_context(input).add_flags = 1 | (1 << in_dci) | (1 << out_dci);
+        let control = Self::input_control_context(input, context_size);
+        control.set_add_context_flag(0);
+        control.set_add_context_flag(in_dci);
+        control.set_add_context_flag(out_dci);
 
         // Bulk IN endpoint
         let in_ep_ctx = Self::input_ep_context(input, context_size, in_dci - 1);
-        in_ep_ctx.set_ep_type(6); // Bulk IN
+        in_ep_ctx.set_endpoint_type(EndpointType::BulkIn);
         in_ep_ctx.set_max_packet_size(max_packet);
         in_ep_ctx.set_max_burst_size(0);
-        in_ep_ctx.set_cerr(3);
-        in_ep_ctx.set_tr_dequeue_ptr(in_ring_addr, true);
-        in_ep_ctx.set_avg_trb_length(max_packet);
+        in_ep_ctx.set_error_count(3);
+        in_ep_ctx.set_tr_dequeue_pointer(in_ring_addr);
+        in_ep_ctx.set_dequeue_cycle_state();
+        in_ep_ctx.set_average_trb_length(max_packet);
 
         // Bulk OUT endpoint
         let out_ep_ctx = Self::input_ep_context(input, context_size, out_dci - 1);
-        out_ep_ctx.set_ep_type(2); // Bulk OUT
+        out_ep_ctx.set_endpoint_type(EndpointType::BulkOut);
         out_ep_ctx.set_max_packet_size(max_packet);
         out_ep_ctx.set_max_burst_size(0);
-        out_ep_ctx.set_cerr(3);
-        out_ep_ctx.set_tr_dequeue_ptr(out_ring_addr, true);
-        out_ep_ctx.set_avg_trb_length(max_packet);
+        out_ep_ctx.set_error_count(3);
+        out_ep_ctx.set_tr_dequeue_pointer(out_ring_addr);
+        out_ep_ctx.set_dequeue_cycle_state();
+        out_ep_ctx.set_average_trb_length(max_packet);
 
         // Store rings
         slot.transfer_rings[in_dci - 1] = Some(in_ring);
         slot.transfer_rings[out_dci - 1] = Some(out_ring);
 
         // Send Configure Endpoint command
-        let mut trb = Trb::default();
-        trb.param = slot.input_context as u64;
-        trb.set_type(TRB_TYPE_CONFIGURE_ENDPOINT);
-        trb.control |= (slot_id as u32) << 24;
+        let mut command = command::ConfigureEndpoint::new();
+        command
+            .set_input_context_pointer(slot.input_context as u64)
+            .set_slot_id(slot_id);
 
-        self.cmd_ring.enqueue(&trb, false);
+        self.cmd_ring.enqueue(command, false);
         barrier::mmio_write();
         self.ring_doorbell(0, 0);
 
@@ -2725,27 +2575,28 @@ impl XhciController {
                 }
                 Err(XhciError::StallError)
             }
-            Err(XhciError::TransferFailed(cc))
-                if cc == TRB_CC_BABBLE_DETECTED || cc == TRB_CC_USB_TRANSACTION_ERROR =>
-            {
+            Err(XhciError::TransferFailed(Ok(
+                cc @ (event::CompletionCode::BabbleDetectedError
+                | event::CompletionCode::UsbTransactionError),
+            ))) => {
                 // Babble and transaction errors halt bulk endpoints (xHCI spec 4.8.3).
                 // Recovery is the same as for stalls: Reset Endpoint + Set TR Dequeue Pointer.
                 // Both EDK2 (XhcRecoverHaltedEndpoint) and Linux (xhci_handle_halted_endpoint
                 // with EP_HARD_RESET) perform identical recovery for these errors.
                 log::debug!(
-                    "xHCI: Bulk transfer failed with {} on slot={} dci={}, resetting endpoint",
-                    trb_cc_name(cc),
+                    "xHCI: Bulk transfer failed with {:?} on slot={} dci={}, resetting endpoint",
+                    cc,
                     slot_id,
                     dci
                 );
                 if let Err(e) = self.reset_endpoint(slot_id, dci as u8) {
                     log::warn!(
-                        "xHCI: Failed to reset endpoint after {}: {:?}",
-                        trb_cc_name(cc),
+                        "xHCI: Failed to reset endpoint after completion code {:?}: {:?}",
+                        cc,
                         e
                     );
                 }
-                Err(XhciError::TransferFailed(cc))
+                Err(XhciError::TransferFailed(Ok(cc)))
             }
             Err(e) => Err(e),
         }
@@ -2770,8 +2621,6 @@ impl XhciController {
         data: &mut [u8],
     ) -> Result<usize, XhciError> {
         const TRB_MAX_TRANSFER_SIZE: usize = 0x10000; // 64KB per TRB (EDK2 convention)
-        const TRB_IOC: u32 = 1 << 5; // Interrupt on Completion
-        const TRB_ISP: u32 = 1 << 2; // Interrupt on Short Packet
 
         let slot = self
             .slots
@@ -2790,16 +2639,15 @@ impl XhciController {
         while remaining > 0 {
             let chunk_size = remaining.min(TRB_MAX_TRANSFER_SIZE);
 
-            let mut trb = Trb::default();
-            trb.param = buf_addr;
-            trb.status = chunk_size as u32; // TRB Transfer Length, TD_SIZE = 0
-            trb.set_type(TRB_TYPE_NORMAL);
-            trb.control |= TRB_IOC; // Every TRB gets its own completion event
+            let mut trb = transfer::Normal::new();
+            trb.set_data_buffer_pointer(buf_addr)
+                .set_trb_transfer_length(chunk_size as u32)
+                .set_interrupt_on_completion();
             if is_in {
-                trb.control |= TRB_ISP;
+                trb.set_interrupt_on_short_packet();
             }
 
-            ring.enqueue(&trb, false);
+            ring.enqueue(trb, false);
             trb_count += 1;
 
             buf_addr += chunk_size as u64;
@@ -2849,28 +2697,49 @@ impl XhciController {
     pub fn cleanup(&mut self) {
         log::debug!("xHCI cleanup: stopping controller");
 
-        // 1. Stop the controller (clear RS bit)
-        self.op().usbcmd.modify(USBCMD::RS::CLEAR);
+        self.registers
+            .operational
+            .usbcmd
+            .update_volatile(|command| {
+                command.clear_run_stop();
+            });
+        wait_for(100, || {
+            self.registers
+                .operational
+                .usbsts
+                .read_volatile()
+                .hc_halted()
+        });
 
-        // Wait for halt (HCH bit set)
-        wait_for(100, || self.op().usbsts.is_set(USBSTS::HCH));
-
-        // 2. Reset the controller (optional but helps ensure clean state)
-        self.op().usbcmd.write(USBCMD::HCRST::SET);
-
-        // Wait for reset to complete (HCRST clears and CNR clears)
+        self.registers
+            .operational
+            .usbcmd
+            .update_volatile(|command| {
+                command.set_host_controller_reset();
+            });
         wait_for(500, || {
-            !self.op().usbcmd.is_set(USBCMD::HCRST) && !self.op().usbsts.is_set(USBSTS::CNR)
+            !self
+                .registers
+                .operational
+                .usbcmd
+                .read_volatile()
+                .host_controller_reset()
+                && !self
+                    .registers
+                    .operational
+                    .usbsts
+                    .read_volatile()
+                    .controller_not_ready()
         });
 
         log::debug!("xHCI cleanup complete");
     }
 }
 
-// SAFETY: XhciController contains raw pointers to MMIO registers, DCBAA, event rings,
-// and command rings. These are:
-// 1. MMIO addresses from PCI BAR that remain valid for the device's lifetime
-// 2. DMA-accessible buffers allocated via EFI page allocator with proper alignment
+// SAFETY: XhciController contains DMA buffer pointers managed by the EFI page allocator.
+// The MMIO accessors and DMA buffers are:
+// 1. Backed by addresses that remain valid for the controller's lifetime
+// 2. Properly aligned and DMA-accessible
 // 3. Accessed only through the UsbControllerHandle abstraction which serializes access
 // The firmware is single-threaded and interrupts are disabled during USB operations.
 unsafe impl Send for XhciController {}
@@ -2922,4 +2791,70 @@ pub fn do_interrupt_transfer(
     data: &mut [u8],
 ) -> Result<usize, XhciError> {
     controller.interrupt_transfer_impl(slot_id, endpoint, data)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use core::mem::size_of;
+
+    #[test]
+    fn event_trb_read_requires_expected_cycle_and_returns_coherent_raw() {
+        let expected = [
+            0x11,
+            0x22,
+            0x33,
+            (trb::Type::TransferEvent as u32) << 10 | 1,
+        ];
+
+        assert_eq!(
+            read_event_trb(expected.as_ptr() as u64, true),
+            Some(expected)
+        );
+        assert_eq!(read_event_trb(expected.as_ptr() as u64, false), None);
+    }
+
+    #[test]
+    fn upstream_context_and_trb_layouts_match_xhci_dma_layouts() {
+        assert_eq!(size_of::<context::Slot32Byte>(), 32);
+        assert_eq!(size_of::<context::Slot64Byte>(), 64);
+        assert_eq!(size_of::<context::Endpoint32Byte>(), 32);
+        assert_eq!(size_of::<context::Endpoint64Byte>(), 64);
+        assert_eq!(size_of::<context::Device32Byte>(), 32 * 32);
+        assert_eq!(size_of::<context::Device64Byte>(), 64 * 32);
+        assert_eq!(size_of::<context::Input32Byte>(), 32 * 33);
+        assert_eq!(size_of::<context::Input64Byte>(), 64 * 33);
+        assert_eq!(size_of::<command::AddressDevice>(), trb::BYTES);
+        assert_eq!(size_of::<transfer::Normal>(), trb::BYTES);
+        assert_eq!(size_of::<event::TransferEvent>(), trb::BYTES);
+    }
+
+    #[test]
+    fn upstream_builders_encode_command_transfer_and_context_fields() {
+        let mut address = command::AddressDevice::new();
+        address.set_input_context_pointer(0x4000).set_slot_id(7);
+        let raw = address.into_raw();
+        assert_eq!(raw_trb_type(&raw), trb::Type::AddressDevice as u32);
+        assert_eq!(u64::from(raw[0]) | (u64::from(raw[1]) << 32), 0x4000);
+        assert_eq!(raw[3] >> 24, 7);
+
+        let mut normal = transfer::Normal::new();
+        normal
+            .set_data_buffer_pointer(0x1234_5678)
+            .set_trb_transfer_length(4096)
+            .set_interrupt_on_completion();
+        let raw = normal.into_raw();
+        assert_eq!(raw_trb_type(&raw), trb::Type::Normal as u32);
+        assert_eq!(raw[2] & 0x1ffff, 4096);
+        assert_ne!(raw[3] & (1 << 5), 0);
+
+        let mut input = context::Input64Byte::new_64byte();
+        input.control_mut().set_add_context_flag(1);
+        let slot = input.device_mut().slot_mut();
+        slot.set_speed(4);
+        slot.set_root_hub_port_number(2);
+        assert!(input.control().add_context_flag(1));
+        assert_eq!(input.device().slot().speed(), 4);
+        assert_eq!(input.device().slot().root_hub_port_number(), 2);
+    }
 }
