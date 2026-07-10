@@ -1,98 +1,29 @@
 //! ELF Loader
 //!
 //! Loads standard ELF executables for chainloading as coreboot payloads.
-//! Supports ELF64 executables for x86-64.
+//! Supports ELF64 executables for the current architecture.
 
-use core::mem;
+use object::read::elf::{FileHeader, ProgramHeader};
+use object::{LittleEndian, elf};
 
-/// ELF magic number
-const ELF_MAGIC: [u8; 4] = [0x7f, b'E', b'L', b'F'];
+type Header = elf::FileHeader64<LittleEndian>;
+#[cfg(test)]
+type ProgramHeader64 = elf::ProgramHeader64<LittleEndian>;
 
-/// ELF class: 64-bit
-const ELFCLASS64: u8 = 2;
+const ELF64_HEADER_SIZE: usize = core::mem::size_of::<Header>();
+const EI_CLASS: usize = 4;
+const EI_DATA: usize = 5;
+#[cfg(test)]
+const EI_VERSION: usize = 6;
+#[cfg(test)]
+const ELF64_PHDR_SIZE: usize = core::mem::size_of::<ProgramHeader64>();
 
-/// ELF data encoding: little endian
-const ELFDATA2LSB: u8 = 1;
-
-/// ELF type: executable
-const ET_EXEC: u16 = 2;
-
-/// ELF machine: x86-64
 #[cfg(target_arch = "x86_64")]
-const EM_X86_64: u16 = 62;
-/// ELF machine: AArch64
+const EM_NATIVE: u16 = elf::EM_X86_64;
 #[cfg(target_arch = "aarch64")]
-const EM_AARCH64: u16 = 183;
-/// ELF machine: RISC-V
+const EM_NATIVE: u16 = elf::EM_AARCH64;
 #[cfg(target_arch = "riscv64")]
-const EM_RISCV: u16 = 243;
-
-/// ELF machine type for the current target architecture
-#[cfg(target_arch = "x86_64")]
-const EM_NATIVE: u16 = EM_X86_64;
-#[cfg(target_arch = "aarch64")]
-const EM_NATIVE: u16 = EM_AARCH64;
-#[cfg(target_arch = "riscv64")]
-const EM_NATIVE: u16 = EM_RISCV;
-
-/// Program header type: loadable segment
-const PT_LOAD: u32 = 1;
-
-/// ELF64 header
-#[derive(Debug, Clone, Copy)]
-#[repr(C)]
-pub struct Elf64Header {
-    /// ELF identification
-    pub e_ident: [u8; 16],
-    /// Object file type
-    pub e_type: u16,
-    /// Machine type
-    pub e_machine: u16,
-    /// Object file version
-    pub e_version: u32,
-    /// Entry point address
-    pub e_entry: u64,
-    /// Program header offset
-    pub e_phoff: u64,
-    /// Section header offset
-    pub e_shoff: u64,
-    /// Processor-specific flags
-    pub e_flags: u32,
-    /// ELF header size
-    pub e_ehsize: u16,
-    /// Program header entry size
-    pub e_phentsize: u16,
-    /// Number of program header entries
-    pub e_phnum: u16,
-    /// Section header entry size
-    pub e_shentsize: u16,
-    /// Number of section header entries
-    pub e_shnum: u16,
-    /// Section name string table index
-    pub e_shstrndx: u16,
-}
-
-/// ELF64 program header
-#[derive(Debug, Clone, Copy)]
-#[repr(C)]
-pub struct Elf64Phdr {
-    /// Segment type
-    pub p_type: u32,
-    /// Segment flags
-    pub p_flags: u32,
-    /// Offset in file
-    pub p_offset: u64,
-    /// Virtual address
-    pub p_vaddr: u64,
-    /// Physical address
-    pub p_paddr: u64,
-    /// Size in file
-    pub p_filesz: u64,
-    /// Size in memory
-    pub p_memsz: u64,
-    /// Alignment
-    pub p_align: u64,
-}
+const EM_NATIVE: u16 = elf::EM_RISCV;
 
 /// Errors during ELF loading
 #[derive(Debug)]
@@ -113,8 +44,6 @@ pub enum ElfError {
     InvalidProgramHeader,
     /// Segment too large
     SegmentTooLarge,
-    /// Segments overlap
-    SegmentsOverlap,
 }
 
 /// Parsed ELF file ready for loading
@@ -146,104 +75,76 @@ impl Elf64 {
     ///
     /// * `data` - Complete ELF file data
     pub fn parse(data: &[u8]) -> Result<Self, ElfError> {
-        if data.len() < mem::size_of::<Elf64Header>() {
+        if data.len() < ELF64_HEADER_SIZE {
             return Err(ElfError::TooSmall);
         }
-
-        // Parse header
-        let header = unsafe {
-            let ptr = data.as_ptr() as *const Elf64Header;
-            ptr.read_unaligned()
-        };
-
-        // Validate magic
-        if header.e_ident[0..4] != ELF_MAGIC {
+        if data[..elf::ELFMAG.len()] != elf::ELFMAG {
             return Err(ElfError::InvalidMagic);
         }
-
-        // Check class (64-bit)
-        if header.e_ident[4] != ELFCLASS64 {
+        if data[EI_CLASS] != elf::ELFCLASS64 {
             return Err(ElfError::Not64Bit);
         }
-
-        // Check endianness (little endian)
-        if header.e_ident[5] != ELFDATA2LSB {
+        if data[EI_DATA] != elf::ELFDATA2LSB {
             return Err(ElfError::NotLittleEndian);
         }
 
-        // Check type (executable)
-        if header.e_type != ET_EXEC {
+        let header = Header::parse(data).map_err(|_| ElfError::InvalidProgramHeader)?;
+        let endian = header
+            .endian()
+            .map_err(|_| ElfError::InvalidProgramHeader)?;
+        if header.e_type(endian) != elf::ET_EXEC {
             return Err(ElfError::NotExecutable);
         }
-
-        // Check machine matches current architecture
-        if header.e_machine != EM_NATIVE {
+        if header.e_machine(endian) != EM_NATIVE {
             return Err(ElfError::WrongMachine);
         }
-
-        log::debug!(
-            "ELF64: entry={:#x}, {} program headers",
-            header.e_entry,
-            header.e_phnum
-        );
-
-        // Parse program headers
-        let mut segments = heapless::Vec::new();
-        let phdr_offset = header.e_phoff as usize;
-        let phdr_size = header.e_phentsize as usize;
-        if phdr_size < core::mem::size_of::<Elf64Phdr>() {
+        if header.e_version(endian) != u32::from(elf::EV_CURRENT)
+            || usize::from(header.e_ehsize(endian)) != ELF64_HEADER_SIZE
+            || (header.e_phnum(endian) != 0 && header.e_phoff(endian) == 0)
+        {
             return Err(ElfError::InvalidProgramHeader);
         }
 
-        for i in 0..header.e_phnum as usize {
-            let offset = i
-                .checked_mul(phdr_size)
-                .and_then(|rel| phdr_offset.checked_add(rel))
-                .ok_or(ElfError::InvalidProgramHeader)?;
-            let end = offset
-                .checked_add(core::mem::size_of::<Elf64Phdr>())
-                .ok_or(ElfError::InvalidProgramHeader)?;
-            if end > data.len() {
-                return Err(ElfError::InvalidProgramHeader);
+        let entry = header.e_entry(endian);
+        let program_headers = header
+            .program_headers(endian, data)
+            .map_err(|_| ElfError::InvalidProgramHeader)?;
+        log::debug!(
+            "ELF64: entry={:#x}, {} program headers",
+            entry,
+            program_headers.len()
+        );
+
+        let mut segments = heapless::Vec::new();
+        for program_header in program_headers {
+            if program_header.p_type(endian) != elf::PT_LOAD {
+                continue;
             }
 
-            let phdr = unsafe {
-                let ptr = data.as_ptr().add(offset) as *const Elf64Phdr;
-                ptr.read_unaligned()
-            };
-
-            // Only process PT_LOAD segments
-            if phdr.p_type != PT_LOAD {
-                continue;
+            let (file_offset, file_size) = program_header.file_range(endian);
+            let mem_size = program_header.p_memsz(endian);
+            let load_addr = program_header.p_vaddr(endian);
+            if file_size > mem_size || program_header.data(endian, data).is_err() {
+                return Err(ElfError::InvalidProgramHeader);
             }
 
             log::debug!(
                 "  LOAD: vaddr={:#x}, filesz={:#x}, memsz={:#x}",
-                phdr.p_vaddr,
-                phdr.p_filesz,
-                phdr.p_memsz
+                load_addr,
+                file_size,
+                mem_size
             );
-
-            if phdr.p_filesz > phdr.p_memsz {
-                return Err(ElfError::InvalidProgramHeader);
-            }
-
-            let segment = LoadSegment {
-                file_offset: phdr.p_offset,
-                load_addr: phdr.p_vaddr,
-                file_size: phdr.p_filesz,
-                mem_size: phdr.p_memsz,
-            };
-
             segments
-                .push(segment)
+                .push(LoadSegment {
+                    file_offset,
+                    load_addr,
+                    file_size,
+                    mem_size,
+                })
                 .map_err(|_| ElfError::SegmentTooLarge)?;
         }
 
-        Ok(Self {
-            entry: header.e_entry,
-            segments,
-        })
+        Ok(Self { entry, segments })
     }
 
     /// Load the ELF into memory
@@ -300,23 +201,301 @@ impl Elf64 {
     pub fn entry_point(&self) -> u64 {
         self.entry
     }
+}
 
-    /// Get the lowest load address (useful for memory allocation)
-    pub fn lowest_addr(&self) -> u64 {
-        self.segments.iter().map(|s| s.load_addr).min().unwrap_or(0)
+#[cfg(all(
+    test,
+    any(
+        target_arch = "x86_64",
+        target_arch = "aarch64",
+        target_arch = "riscv64"
+    )
+))]
+mod tests {
+    extern crate alloc;
+
+    use super::{
+        EI_CLASS, EI_DATA, EI_VERSION, ELF64_HEADER_SIZE, ELF64_PHDR_SIZE, EM_NATIVE, Elf64,
+        ElfError, elf,
+    };
+    use alloc::vec;
+    use alloc::vec::Vec;
+
+    #[derive(Clone, Copy)]
+    struct TestPhdr {
+        p_type: u32,
+        p_offset: u64,
+        p_vaddr: u64,
+        p_filesz: u64,
+        p_memsz: u64,
     }
 
-    /// Get the highest end address (useful for memory allocation)
-    pub fn highest_addr(&self) -> u64 {
-        self.segments
+    impl TestPhdr {
+        fn load(p_offset: u64, p_vaddr: u64, p_filesz: u64, p_memsz: u64) -> Self {
+            Self {
+                p_type: elf::PT_LOAD,
+                p_offset,
+                p_vaddr,
+                p_filesz,
+                p_memsz,
+            }
+        }
+
+        fn ignored() -> Self {
+            Self {
+                p_type: 2,
+                p_offset: 0,
+                p_vaddr: 0,
+                p_filesz: 0,
+                p_memsz: 0,
+            }
+        }
+    }
+
+    fn put_u16(data: &mut [u8], offset: usize, value: u16) {
+        data[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
+    }
+
+    fn put_u32(data: &mut [u8], offset: usize, value: u32) {
+        data[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+    }
+
+    fn put_u64(data: &mut [u8], offset: usize, value: u64) {
+        data[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+    }
+
+    fn elf_with_phdrs(entry: u64, phdrs: &[TestPhdr]) -> Vec<u8> {
+        elf_with_phdrs_layout(entry, ELF64_HEADER_SIZE, ELF64_PHDR_SIZE, phdrs)
+    }
+
+    fn elf_with_phdrs_layout(
+        entry: u64,
+        phoff: usize,
+        phentsize: usize,
+        phdrs: &[TestPhdr],
+    ) -> Vec<u8> {
+        let table_end = phoff + phentsize * phdrs.len();
+        let segment_end = phdrs
             .iter()
-            .map(|s| s.load_addr + s.mem_size)
+            .map(|phdr| (phdr.p_offset + phdr.p_filesz) as usize)
             .max()
-            .unwrap_or(0)
+            .unwrap_or(0);
+        let mut data = vec![0; ELF64_HEADER_SIZE.max(table_end).max(segment_end)];
+
+        data[..elf::ELFMAG.len()].copy_from_slice(&elf::ELFMAG);
+        data[EI_CLASS] = elf::ELFCLASS64;
+        data[EI_DATA] = elf::ELFDATA2LSB;
+        data[EI_VERSION] = elf::EV_CURRENT;
+        put_u16(&mut data, 16, elf::ET_EXEC);
+        put_u16(&mut data, 18, EM_NATIVE);
+        put_u32(&mut data, 20, 1);
+        put_u64(&mut data, 24, entry);
+        put_u64(&mut data, 32, phoff as u64);
+        put_u16(&mut data, 52, ELF64_HEADER_SIZE as u16);
+        put_u16(&mut data, 54, phentsize as u16);
+        put_u16(&mut data, 56, phdrs.len() as u16);
+
+        for (index, phdr) in phdrs.iter().enumerate() {
+            let offset = phoff + index * phentsize;
+            put_u32(&mut data, offset, phdr.p_type);
+            put_u64(&mut data, offset + 8, phdr.p_offset);
+            put_u64(&mut data, offset + 16, phdr.p_vaddr);
+            put_u64(&mut data, offset + 32, phdr.p_filesz);
+            put_u64(&mut data, offset + 40, phdr.p_memsz);
+        }
+
+        data
     }
 
-    /// Calculate total memory required
-    pub fn total_size(&self) -> u64 {
-        self.highest_addr().saturating_sub(self.lowest_addr())
+    fn one_load() -> Vec<u8> {
+        elf_with_phdrs(0x1234, &[TestPhdr::load(0x100, 0x2000, 4, 4)])
+    }
+
+    #[test]
+    fn parses_native_elf64_load_segments_and_bss() {
+        let data = elf_with_phdrs(
+            0x4000,
+            &[
+                TestPhdr::ignored(),
+                TestPhdr::load(0x100, 0x2000, 4, 8),
+                TestPhdr::load(0x200, 0x5000, 3, 3),
+            ],
+        );
+        let elf = Elf64::parse(&data).unwrap();
+
+        assert_eq!(elf.entry_point(), 0x4000);
+        assert_eq!(elf.segments.len(), 2);
+        assert_eq!(elf.segments[0].file_offset, 0x100);
+        assert_eq!(elf.segments[0].load_addr, 0x2000);
+        assert_eq!(elf.segments[0].file_size, 4);
+        assert_eq!(elf.segments[0].mem_size, 8);
+        assert_eq!(elf.segments[1].file_offset, 0x200);
+        assert_eq!(elf.segments[1].load_addr, 0x5000);
+        assert_eq!(elf.segments[1].file_size, 3);
+        assert_eq!(elf.segments[1].mem_size, 3);
+    }
+
+    #[test]
+    fn rejects_invalid_ident_version() {
+        let mut data = one_load();
+        data[EI_VERSION] = 0;
+        assert!(matches!(
+            Elf64::parse(&data),
+            Err(ElfError::InvalidProgramHeader)
+        ));
+    }
+
+    #[test]
+    fn rejects_oversized_program_header_stride() {
+        let data = elf_with_phdrs_layout(
+            0x4000,
+            ELF64_HEADER_SIZE,
+            ELF64_PHDR_SIZE + 8,
+            &[TestPhdr::ignored(), TestPhdr::load(0x200, 0x5000, 3, 3)],
+        );
+        assert!(matches!(
+            Elf64::parse(&data),
+            Err(ElfError::InvalidProgramHeader)
+        ));
+    }
+
+    #[test]
+    fn rejects_pn_xnum_without_section_zero() {
+        let mut data = one_load();
+        put_u16(&mut data, 56, u16::MAX);
+        assert!(matches!(
+            Elf64::parse(&data),
+            Err(ElfError::InvalidProgramHeader)
+        ));
+    }
+
+    #[test]
+    fn load_copies_file_data_and_zeros_bss() {
+        let mut destination = [0xa5; 8];
+        let data_offset: usize = 0x100;
+        let data = elf_with_phdrs(
+            destination.as_mut_ptr() as u64,
+            &[TestPhdr::load(
+                data_offset as u64,
+                destination.as_mut_ptr() as u64,
+                4,
+                8,
+            )],
+        );
+        let mut data = data;
+        data.resize(data_offset + 4, 0);
+        data[data_offset..data_offset + 4].copy_from_slice(b"data");
+        let elf = Elf64::parse(&data).unwrap();
+
+        unsafe { elf.load(&data).unwrap() };
+        assert_eq!(&destination, b"data\0\0\0\0");
+    }
+
+    #[test]
+    fn rejects_invalid_header_fields() {
+        let mut data = one_load();
+        data[0] = 0;
+        assert!(matches!(Elf64::parse(&data), Err(ElfError::InvalidMagic)));
+
+        let mut data = one_load();
+        data[EI_CLASS] = elf::ELFCLASS32;
+        assert!(matches!(Elf64::parse(&data), Err(ElfError::Not64Bit)));
+
+        let mut data = one_load();
+        data[EI_DATA] = elf::ELFDATA2MSB;
+        assert!(matches!(
+            Elf64::parse(&data),
+            Err(ElfError::NotLittleEndian)
+        ));
+
+        let mut data = one_load();
+        put_u16(&mut data, 16, elf::ET_REL);
+        assert!(matches!(Elf64::parse(&data), Err(ElfError::NotExecutable)));
+
+        let mut data = one_load();
+        put_u16(&mut data, 18, EM_NATIVE.wrapping_add(1));
+        assert!(matches!(Elf64::parse(&data), Err(ElfError::WrongMachine)));
+
+        let mut data = one_load();
+        put_u32(&mut data, 20, 0);
+        assert!(matches!(
+            Elf64::parse(&data),
+            Err(ElfError::InvalidProgramHeader)
+        ));
+
+        let mut data = one_load();
+        put_u16(&mut data, 52, 0);
+        assert!(matches!(
+            Elf64::parse(&data),
+            Err(ElfError::InvalidProgramHeader)
+        ));
+
+        let mut data = one_load();
+        put_u64(&mut data, 32, 0);
+        assert!(matches!(
+            Elf64::parse(&data),
+            Err(ElfError::InvalidProgramHeader)
+        ));
+    }
+
+    #[test]
+    fn rejects_truncated_header_and_program_header_table() {
+        assert!(matches!(
+            Elf64::parse(&[0x7f, b'E', b'L']),
+            Err(ElfError::TooSmall)
+        ));
+
+        let mut data = one_load();
+        data.truncate(ELF64_HEADER_SIZE + ELF64_PHDR_SIZE - 1);
+        assert!(matches!(
+            Elf64::parse(&data),
+            Err(ElfError::InvalidProgramHeader)
+        ));
+
+        let mut data = one_load();
+        put_u16(&mut data, 54, (ELF64_PHDR_SIZE - 1) as u16);
+        assert!(matches!(
+            Elf64::parse(&data),
+            Err(ElfError::InvalidProgramHeader)
+        ));
+    }
+
+    #[test]
+    fn rejects_filesz_larger_than_memsz() {
+        let data = elf_with_phdrs(0, &[TestPhdr::load(0, 0, 5, 4)]);
+        assert!(matches!(
+            Elf64::parse(&data),
+            Err(ElfError::InvalidProgramHeader)
+        ));
+    }
+
+    #[test]
+    fn rejects_seventeenth_load_segment() {
+        let phdrs = [TestPhdr::load(0, 0, 0, 0); 17];
+        let data = elf_with_phdrs(0, &phdrs);
+        assert!(matches!(
+            Elf64::parse(&data),
+            Err(ElfError::SegmentTooLarge)
+        ));
+    }
+
+    #[test]
+    fn rejects_out_of_file_segment_data_during_parse() {
+        let mut destination = [0u8; 4];
+        let mut data = elf_with_phdrs(
+            0,
+            &[TestPhdr::load(
+                0x1000,
+                destination.as_mut_ptr() as u64,
+                4,
+                4,
+            )],
+        );
+        data.truncate(ELF64_HEADER_SIZE + ELF64_PHDR_SIZE);
+
+        assert!(matches!(
+            Elf64::parse(&data),
+            Err(ElfError::InvalidProgramHeader)
+        ));
     }
 }
