@@ -4,6 +4,9 @@
 //! used by both EFI runtime services and the boot menu.
 
 use super::io;
+use x86_64::VirtAddr;
+use x86_64::instructions::tables::lidt;
+use x86_64::structures::DescriptorTablePointer;
 
 /// Attempt system reset via the keyboard controller
 ///
@@ -29,13 +32,14 @@ pub fn keyboard_controller_reset() {
 /// Loads a null IDT and triggers an interrupt, causing a triple fault
 /// which resets the CPU. This never returns.
 pub fn triple_fault() -> ! {
+    let null_idt = DescriptorTablePointer {
+        limit: 0,
+        base: VirtAddr::zero(),
+    };
+
+    // SAFETY: Installing an invalid IDT is deliberate here to force a reset.
     unsafe {
-        let null_idt: [u8; 6] = [0; 6];
-        core::arch::asm!(
-            "lidt [{}]",
-            "int3",
-            in(reg) null_idt.as_ptr(),
-            options(noreturn)
-        );
+        lidt(&null_idt);
+        core::arch::asm!("int3", options(noreturn));
     }
 }

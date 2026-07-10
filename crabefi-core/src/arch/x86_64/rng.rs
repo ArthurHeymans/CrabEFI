@@ -3,6 +3,8 @@
 //! Provides access to the RDRAND instruction, which implements a
 //! NIST SP800-90A AES-CTR-256 DRBG in hardware.
 
+use x86_64::instructions::random::RdRand;
+
 /// Maximum number of RDRAND retries per Intel SDM Section 7.3.17
 const RDRAND_RETRY_LIMIT: usize = 10;
 
@@ -12,83 +14,44 @@ const RDRAND_TEST_SAMPLES: usize = 8;
 /// Minimum number of different values required to pass broken RDRAND test
 const RDRAND_MIN_CHANGE: usize = 5;
 
-/// Check if RDRAND is supported via CPUID
-///
-/// Returns true if CPUID reports RDRAND support (ECX bit 30, leaf 1)
-fn cpuid_has_rdrand() -> bool {
-    let ecx: u32;
-
-    // rbx is reserved by LLVM, so we must save/restore it around CPUID
-    unsafe {
-        core::arch::asm!(
-            "push rbx",
-            "mov eax, 1",
-            "cpuid",
-            "pop rbx",
-            out("ecx") ecx,
-            out("eax") _,
-            out("edx") _,
-            options(nostack),
-        );
-    }
-
-    (ecx & (1 << 30)) != 0
-}
-
 /// Execute RDRAND instruction to get a 64-bit random value
 ///
-/// Returns `Some(value)` on success (CF=1), `None` on failure.
-/// Retries up to `RDRAND_RETRY_LIMIT` times per Intel SDM recommendation.
+/// Returns `Some(value)` on success (CF=1), `None` on failure or when RDRAND
+/// is unavailable. Retries up to `RDRAND_RETRY_LIMIT` times per Intel SDM
+/// recommendation.
 pub fn rdrand64() -> Option<u64> {
-    for _ in 0..RDRAND_RETRY_LIMIT {
-        let val: u64;
-        let ok: u8;
-        unsafe {
-            core::arch::asm!(
-                "rdrand {val}",
-                "setc {ok}",
-                val = out(reg) val,
-                ok = out(reg_byte) ok,
-            );
-        }
-        if ok != 0 {
-            return Some(val);
-        }
-    }
-    None
+    rdrand64_with(RdRand::new()?)
+}
+
+fn rdrand64_with(rng: RdRand) -> Option<u64> {
+    (0..RDRAND_RETRY_LIMIT).find_map(|_| rng.get_u64())
+}
+
+fn samples_vary(samples: &[u64; RDRAND_TEST_SAMPLES]) -> bool {
+    samples.windows(2).filter(|pair| pair[0] != pair[1]).count() >= RDRAND_MIN_CHANGE
 }
 
 /// Test for broken RDRAND implementations
 ///
 /// Samples RDRAND multiple times and checks that we get different values.
 /// This detects issues like AMD Zen 3 returning all-1s or suspend/resume bugs.
-///
-/// Returns true if RDRAND appears functional, false if it returns constant values.
-fn test_rdrand() -> bool {
-    let mut prev: u64 = 0;
-    let mut changed = 0;
-
-    for i in 0..RDRAND_TEST_SAMPLES {
-        let sample = match rdrand64() {
-            Some(v) => v,
-            None => return false,
+fn test_rdrand(rng: RdRand) -> bool {
+    let mut samples = [0; RDRAND_TEST_SAMPLES];
+    for sample in &mut samples {
+        let Some(value) = rdrand64_with(rng) else {
+            return false;
         };
-
-        if i > 0 && sample != prev {
-            changed += 1;
-        }
-        prev = sample;
+        *sample = value;
     }
-
-    changed >= RDRAND_MIN_CHANGE
+    samples_vary(&samples)
 }
 
 /// Initialize RDRAND support
 ///
 /// Checks CPUID for RDRAND support and runs the broken RDRAND test.
-/// Must be called before `is_supported()` or `rdrand64()`.
+/// Must be called before `is_supported()`.
 pub fn init() {
-    let available = cpuid_has_rdrand() && test_rdrand();
+    let available = RdRand::new().is_some_and(test_rdrand);
     crate::state::with_drivers_mut(|d| d.rng_available = available);
 
     if is_supported() {
@@ -108,9 +71,15 @@ pub fn is_supported() -> bool {
 /// # Returns
 /// `true` if the buffer was filled, `false` if RDRAND failed
 pub fn fill_random(buffer: &mut [u8]) -> bool {
+    if buffer.is_empty() {
+        return true;
+    }
+    let Some(rng) = RdRand::new() else {
+        return false;
+    };
     let mut i = 0;
     while i < buffer.len() {
-        match rdrand64() {
+        match rdrand64_with(rng) {
             Some(val) => {
                 let bytes = val.to_le_bytes();
                 let remaining = buffer.len() - i;
@@ -122,4 +91,21 @@ pub fn fill_random(buffer: &mut [u8]) -> bool {
         }
     }
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn broken_rdrand_sampling_threshold() {
+        assert!(!samples_vary(&[7; RDRAND_TEST_SAMPLES]));
+        assert!(!samples_vary(&[0, 1, 2, 3, 4, 4, 4, 4]));
+        assert!(samples_vary(&[0, 1, 2, 3, 4, 5, 5, 5]));
+    }
+
+    #[test]
+    fn empty_buffer_needs_no_rng() {
+        assert!(fill_random(&mut []));
+    }
 }

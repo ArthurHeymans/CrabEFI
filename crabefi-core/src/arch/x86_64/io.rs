@@ -1,8 +1,9 @@
 //! x86_64 I/O Port Access
 //!
-//! This module provides safe wrappers around x86 port I/O instructions.
-//! All port I/O in the codebase should use these functions rather than
-//! inline assembly directly.
+//! This module preserves CrabEFI's port-I/O interface while delegating the
+//! instructions to the rust-osdev `x86_64` crate.
+
+use x86_64::instructions::port::{PortReadOnly, PortWriteOnly};
 
 /// Read a byte from an I/O port
 ///
@@ -12,16 +13,8 @@
 /// the port address is valid and appropriate for the intended operation.
 #[inline]
 pub unsafe fn inb(port: u16) -> u8 {
-    unsafe {
-        let value: u8;
-        core::arch::asm!(
-            "in al, dx",
-            out("al") value,
-            in("dx") port,
-            options(nostack, preserves_flags)
-        );
-        value
-    }
+    // SAFETY: The caller guarantees that reading this port is valid.
+    unsafe { PortReadOnly::<u8>::new(port).read() }
 }
 
 /// Write a byte to an I/O port
@@ -32,14 +25,8 @@ pub unsafe fn inb(port: u16) -> u8 {
 /// the port address is valid and appropriate for the intended operation.
 #[inline]
 pub unsafe fn outb(port: u16, value: u8) {
-    unsafe {
-        core::arch::asm!(
-            "out dx, al",
-            in("dx") port,
-            in("al") value,
-            options(nostack, preserves_flags)
-        );
-    }
+    // SAFETY: The caller guarantees that writing this port is valid.
+    unsafe { PortWriteOnly::<u8>::new(port).write(value) }
 }
 
 /// Read a word (16-bit) from an I/O port
@@ -50,16 +37,8 @@ pub unsafe fn outb(port: u16, value: u8) {
 /// the port address is valid and appropriate for the intended operation.
 #[inline]
 pub unsafe fn inw(port: u16) -> u16 {
-    unsafe {
-        let value: u16;
-        core::arch::asm!(
-            "in ax, dx",
-            out("ax") value,
-            in("dx") port,
-            options(nostack, preserves_flags)
-        );
-        value
-    }
+    // SAFETY: The caller guarantees that reading this port is valid.
+    unsafe { PortReadOnly::<u16>::new(port).read() }
 }
 
 /// Write a word (16-bit) to an I/O port
@@ -70,14 +49,8 @@ pub unsafe fn inw(port: u16) -> u16 {
 /// the port address is valid and appropriate for the intended operation.
 #[inline]
 pub unsafe fn outw(port: u16, value: u16) {
-    unsafe {
-        core::arch::asm!(
-            "out dx, ax",
-            in("dx") port,
-            in("ax") value,
-            options(nostack, preserves_flags)
-        );
-    }
+    // SAFETY: The caller guarantees that writing this port is valid.
+    unsafe { PortWriteOnly::<u16>::new(port).write(value) }
 }
 
 /// Read a dword (32-bit) from an I/O port
@@ -88,16 +61,8 @@ pub unsafe fn outw(port: u16, value: u16) {
 /// the port address is valid and appropriate for the intended operation.
 #[inline]
 pub unsafe fn inl(port: u16) -> u32 {
-    unsafe {
-        let value: u32;
-        core::arch::asm!(
-            "in eax, dx",
-            out("eax") value,
-            in("dx") port,
-            options(nostack, preserves_flags)
-        );
-        value
-    }
+    // SAFETY: The caller guarantees that reading this port is valid.
+    unsafe { PortReadOnly::<u32>::new(port).read() }
 }
 
 /// Write a dword (32-bit) to an I/O port
@@ -108,12 +73,6 @@ pub unsafe fn inl(port: u16) -> u32 {
 /// the port address is valid and appropriate for the intended operation.
 #[inline]
 pub unsafe fn outl(port: u16, value: u32) {
-    unsafe {
-        core::arch::asm!(
-            "out dx, eax",
-            in("dx") port,
-            in("eax") value,
-            options(nostack, preserves_flags)
-        );
-    }
+    // SAFETY: The caller guarantees that writing this port is valid.
+    unsafe { PortWriteOnly::<u32>::new(port).write(value) }
 }
