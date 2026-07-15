@@ -73,6 +73,31 @@ pub fn create_loaded_image_protocol(
     ptr
 }
 
+/// Set the code/data memory types from the PE/COFF subsystem.
+///
+/// # Safety
+/// The protocol pointer must be valid.
+pub unsafe fn set_image_subsystem(protocol: *mut loaded_image::Protocol, subsystem: u16) {
+    if protocol.is_null() {
+        return;
+    }
+    let (code, data) = match subsystem {
+        11 => (
+            r_efi::efi::BOOT_SERVICES_CODE,
+            r_efi::efi::BOOT_SERVICES_DATA,
+        ),
+        12 => (
+            r_efi::efi::RUNTIME_SERVICES_CODE,
+            r_efi::efi::RUNTIME_SERVICES_DATA,
+        ),
+        _ => (r_efi::efi::LOADER_CODE, r_efi::efi::LOADER_DATA),
+    };
+    unsafe {
+        (*protocol).image_code_type = code;
+        (*protocol).image_data_type = data;
+    }
+}
+
 /// Set load options on a loaded image protocol
 ///
 /// # Safety
