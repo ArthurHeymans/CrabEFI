@@ -370,6 +370,18 @@ pub enum FatError {
     InvalidCluster,
     /// Buffer too small
     BufferTooSmall,
+    /// Mutation is only implemented for FAT32
+    ReadOnly,
+    /// Block-device write failed
+    WriteError,
+    /// Entry already exists
+    AlreadyExists,
+    /// Directory is not empty
+    DirectoryNotEmpty,
+    /// Invalid filename
+    InvalidName,
+    /// No free clusters or directory slots
+    NoSpace,
 }
 
 impl core::fmt::Display for FatError {
@@ -384,6 +396,12 @@ impl core::fmt::Display for FatError {
             FatError::EndOfFile => write!(f, "end of file"),
             FatError::InvalidCluster => write!(f, "invalid cluster"),
             FatError::BufferTooSmall => write!(f, "buffer too small"),
+            FatError::ReadOnly => write!(f, "read-only FAT filesystem"),
+            FatError::WriteError => write!(f, "write error"),
+            FatError::AlreadyExists => write!(f, "entry already exists"),
+            FatError::DirectoryNotEmpty => write!(f, "directory not empty"),
+            FatError::InvalidName => write!(f, "invalid filename"),
+            FatError::NoSpace => write!(f, "filesystem full"),
         }
     }
 }
@@ -404,6 +422,10 @@ pub struct FatFilesystem<'a> {
     sectors_per_cluster: u8,
     /// First FAT sector (relative to partition start)
     fat_start: u32,
+    /// Number of FAT copies
+    num_fats: u8,
+    /// Sectors occupied by one FAT copy
+    sectors_per_fat: u32,
     /// First data sector (relative to partition start)
     data_start: u32,
     /// Root directory first cluster (FAT32) or sector count (FAT12/16)
@@ -566,6 +588,8 @@ impl<'a> FatFilesystem<'a> {
             device_block_size: block_size as u32,
             sectors_per_cluster,
             fat_start,
+            num_fats: bpb_num_fats,
+            sectors_per_fat,
             data_start,
             root_cluster,
             root_dir_start,
@@ -752,9 +776,9 @@ impl<'a> FatFilesystem<'a> {
 
         let device_block_size = self.device_block_size as usize;
 
-        // Handle case where cluster is smaller than or equal to device block
-        if cluster_size <= device_block_size {
-            // Cluster fits within one or two device blocks
+        // Unaligned clusters need per-block copying so preceding bytes are skipped.
+        if cluster_size <= device_block_size || start_offset != 0 {
+            // Cluster fits within one or more device blocks
             let mut temp_buffer = [0u8; MAX_BLOCK_SIZE];
             let mut bytes_copied = 0usize;
             let mut current_block = start_device_block;
@@ -1190,6 +1214,554 @@ impl<'a> FatFilesystem<'a> {
         Ok(bytes_read)
     }
 
+    fn require_fat32(&self) -> Result<(), FatError> {
+        if self.fat_type == FatType::Fat32 {
+            Ok(())
+        } else {
+            Err(FatError::ReadOnly)
+        }
+    }
+
+    fn partition_read(&mut self, byte_offset: u64, output: &mut [u8]) -> Result<(), FatError> {
+        let block_size = self.device_block_size as usize;
+        let mut block = [0u8; MAX_BLOCK_SIZE];
+        let mut done = 0;
+        while done < output.len() {
+            let position = byte_offset + done as u64;
+            let lba = self.partition_start + position / block_size as u64;
+            let within = position as usize % block_size;
+            self.device
+                .read_block(lba, &mut block[..block_size])
+                .map_err(|_| FatError::ReadError)?;
+            let count = (block_size - within).min(output.len() - done);
+            output[done..done + count].copy_from_slice(&block[within..within + count]);
+            done += count;
+        }
+        Ok(())
+    }
+
+    fn partition_write(&mut self, byte_offset: u64, input: &[u8]) -> Result<(), FatError> {
+        self.require_fat32()?;
+        let block_size = self.device_block_size as usize;
+        let mut block = [0u8; MAX_BLOCK_SIZE];
+        let mut done = 0;
+        while done < input.len() {
+            let position = byte_offset + done as u64;
+            let lba = self.partition_start + position / block_size as u64;
+            let within = position as usize % block_size;
+            let count = (block_size - within).min(input.len() - done);
+            if within != 0 || count != block_size {
+                self.device
+                    .read_block(lba, &mut block[..block_size])
+                    .map_err(|_| FatError::ReadError)?;
+            }
+            block[within..within + count].copy_from_slice(&input[done..done + count]);
+            self.device
+                .write_block(lba, &block[..block_size])
+                .map_err(|_| FatError::WriteError)?;
+            done += count;
+        }
+        self.fat_block_cached = u64::MAX;
+        Ok(())
+    }
+
+    fn cluster_byte_offset(&self, cluster: u32) -> Result<u64, FatError> {
+        if cluster < 2 || cluster - 2 >= self.data_clusters {
+            return Err(FatError::InvalidCluster);
+        }
+        Ok(self.data_start as u64 * self.bytes_per_sector as u64
+            + (cluster - 2) as u64 * self.sectors_per_cluster as u64 * self.bytes_per_sector as u64)
+    }
+
+    fn write_cluster(&mut self, cluster: u32, data: &[u8]) -> Result<(), FatError> {
+        let cluster_size = self.sectors_per_cluster as usize * self.bytes_per_sector as usize;
+        if data.len() < cluster_size {
+            return Err(FatError::BufferTooSmall);
+        }
+        self.partition_write(self.cluster_byte_offset(cluster)?, &data[..cluster_size])
+    }
+
+    fn fat32_value(&mut self, cluster: u32) -> Result<u32, FatError> {
+        self.require_fat32()?;
+        let mut bytes = [0u8; 4];
+        let offset = self.fat_start as u64 * self.bytes_per_sector as u64 + cluster as u64 * 4;
+        self.partition_read(offset, &mut bytes)?;
+        Ok(u32::from_le_bytes(bytes) & 0x0fff_ffff)
+    }
+
+    fn set_fat32_value(&mut self, cluster: u32, value: u32) -> Result<(), FatError> {
+        self.require_fat32()?;
+        let copies = self.num_fats as usize;
+        let mut offsets = [0u64; 2];
+        let mut old_values = [0u32; 2];
+
+        for copy in 0..copies {
+            offsets[copy] = (self.fat_start + copy as u32 * self.sectors_per_fat) as u64
+                * self.bytes_per_sector as u64
+                + cluster as u64 * 4;
+            let mut bytes = [0u8; 4];
+            self.partition_read(offsets[copy], &mut bytes)?;
+            old_values[copy] = u32::from_le_bytes(bytes);
+        }
+
+        for copy in 0..copies {
+            let bytes = ((old_values[copy] & 0xf000_0000) | (value & 0x0fff_ffff)).to_le_bytes();
+            if let Err(error) = self.partition_write(offsets[copy], &bytes) {
+                for rollback in 0..copy {
+                    let _ = self
+                        .partition_write(offsets[rollback], &old_values[rollback].to_le_bytes());
+                }
+                return Err(error);
+            }
+        }
+        Ok(())
+    }
+
+    fn allocate_cluster(&mut self) -> Result<u32, FatError> {
+        for cluster in 2..self.data_clusters + 2 {
+            if self.fat32_value(cluster)? == 0 {
+                let zero = [0u8; 65536];
+                self.write_cluster(cluster, &zero)?;
+                self.set_fat32_value(cluster, 0x0fff_ffff)?;
+                return Ok(cluster);
+            }
+        }
+        Err(FatError::NoSpace)
+    }
+
+    fn free_chain(&mut self, first: u32) -> Result<(), FatError> {
+        let mut cluster = first;
+        while cluster >= 2 {
+            let next = self.fat32_value(cluster)?;
+            self.set_fat32_value(cluster, 0)?;
+            if !(2..0x0fff_fff8).contains(&next) {
+                break;
+            }
+            cluster = next;
+        }
+        Ok(())
+    }
+
+    fn append_cluster(&mut self, last: u32) -> Result<u32, FatError> {
+        let new = self.allocate_cluster()?;
+        if let Err(error) = self.set_fat32_value(last, new) {
+            let _ = self.set_fat32_value(new, 0);
+            return Err(error);
+        }
+        Ok(new)
+    }
+
+    fn find_record_in_directory(
+        &mut self,
+        directory: u32,
+        name: &str,
+    ) -> Result<(DirectoryEntry, u64, u64), FatError> {
+        let cluster_size = self.sectors_per_cluster as usize * self.bytes_per_sector as usize;
+        let mut data = [0u8; 65536];
+        let mut cluster = directory;
+        let mut lfn = LfnBuffer::new();
+        let mut lfn_start = 0;
+        loop {
+            self.read_cluster(cluster, &mut data[..cluster_size])?;
+            let base = self.cluster_byte_offset(cluster)?;
+            for offset in (0..cluster_size).step_by(32) {
+                let raw = &data[offset..offset + 32];
+                let entry =
+                    DirectoryEntry::read_from_bytes(raw).map_err(|_| FatError::ReadError)?;
+                if entry.is_end() {
+                    return Err(FatError::NotFound);
+                }
+                if entry.is_free() {
+                    lfn.reset();
+                    continue;
+                }
+                if entry.is_lfn() {
+                    if !lfn.active {
+                        lfn_start = base + offset as u64;
+                    }
+                    let part = LfnEntry::read_from_bytes(raw).map_err(|_| FatError::ReadError)?;
+                    lfn.process_lfn(&part);
+                    continue;
+                }
+                let start = if lfn.active {
+                    lfn_start
+                } else {
+                    base + offset as u64
+                };
+                if (lfn.matches(name) || entry.matches_name(name)) && !entry.is_volume_id() {
+                    return Ok((entry, base + offset as u64, start));
+                }
+                lfn.reset();
+            }
+            cluster = match self.next_cluster(cluster)? {
+                Some(next) => next,
+                None => return Err(FatError::NotFound),
+            };
+        }
+    }
+
+    fn split_parent<'p>(&mut self, path: &'p str) -> Result<(u32, &'p str), FatError> {
+        let path = path.trim_matches(['/', '\\']);
+        let (parent, name) = path
+            .rsplit_once(['/', '\\'])
+            .map_or(("", path), |(parent, name)| (parent, name));
+        if name.is_empty() || name == "." || name == ".." {
+            return Err(FatError::InvalidName);
+        }
+        Ok((self.resolve_dir_cluster(parent)?, name))
+    }
+
+    fn short_name_exists(&mut self, directory: u32, short: &[u8; 11]) -> Result<bool, FatError> {
+        let cluster_size = self.sectors_per_cluster as usize * self.bytes_per_sector as usize;
+        let mut data = [0u8; 65536];
+        let mut cluster = directory;
+        loop {
+            self.read_cluster(cluster, &mut data[..cluster_size])?;
+            for offset in (0..cluster_size).step_by(32) {
+                if data[offset] == 0 {
+                    return Ok(false);
+                }
+                if data[offset] != 0xe5
+                    && data[offset + 11] != ATTR_LFN
+                    && data[offset..offset + 11] == short[..]
+                {
+                    return Ok(true);
+                }
+            }
+            cluster = match self.next_cluster(cluster)? {
+                Some(next) => next,
+                None => return Ok(false),
+            };
+        }
+    }
+
+    fn make_short_name(
+        &mut self,
+        directory: u32,
+        name: &str,
+    ) -> Result<([u8; 11], bool), FatError> {
+        let (stem, extension) = name.rsplit_once('.').unwrap_or((name, ""));
+        let valid = !stem.is_empty()
+            && stem.len() <= 8
+            && extension.len() <= 3
+            && stem
+                .bytes()
+                .chain(extension.bytes())
+                .all(is_short_name_char);
+        if valid {
+            let mut short = [b' '; 11];
+            for (slot, byte) in short[..8].iter_mut().zip(stem.bytes()) {
+                *slot = byte.to_ascii_uppercase();
+            }
+            for (slot, byte) in short[8..].iter_mut().zip(extension.bytes()) {
+                *slot = byte.to_ascii_uppercase();
+            }
+            if !self.short_name_exists(directory, &short)? {
+                let rendered_upper = extension.is_empty()
+                    && name
+                        .bytes()
+                        .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit());
+                return Ok((short, !rendered_upper));
+            }
+        }
+
+        let cleaned: heapless::Vec<u8, 64> = stem
+            .bytes()
+            .filter(|byte| byte.is_ascii_alphanumeric())
+            .map(|byte| byte.to_ascii_uppercase())
+            .collect();
+        if cleaned.is_empty() {
+            return Err(FatError::InvalidName);
+        }
+        for number in 1u16..=9999 {
+            let mut digits = [0u8; 4];
+            let digit_count = decimal(number, &mut digits);
+            let prefix_len = (7usize.saturating_sub(digit_count)).min(cleaned.len());
+            let mut short = [b' '; 11];
+            short[..prefix_len].copy_from_slice(&cleaned[..prefix_len]);
+            short[prefix_len] = b'~';
+            short[prefix_len + 1..prefix_len + 1 + digit_count]
+                .copy_from_slice(&digits[..digit_count]);
+            for (slot, byte) in short[8..].iter_mut().zip(extension.bytes().take(3)) {
+                *slot = if is_short_name_char(byte) {
+                    byte.to_ascii_uppercase()
+                } else {
+                    b'_'
+                };
+            }
+            if !self.short_name_exists(directory, &short)? {
+                return Ok((short, true));
+            }
+        }
+        Err(FatError::NoSpace)
+    }
+
+    fn find_free_slots(&mut self, directory: u32, count: usize) -> Result<u64, FatError> {
+        let cluster_size = self.sectors_per_cluster as usize * self.bytes_per_sector as usize;
+        let mut data = [0u8; 65536];
+        let mut cluster = directory;
+        loop {
+            self.read_cluster(cluster, &mut data[..cluster_size])?;
+            let mut run = 0;
+            for offset in (0..cluster_size).step_by(32) {
+                if data[offset] == 0 || data[offset] == 0xe5 {
+                    run += 1;
+                    if run == count {
+                        return Ok(
+                            self.cluster_byte_offset(cluster)? + (offset + 32 - count * 32) as u64
+                        );
+                    }
+                } else {
+                    run = 0;
+                }
+            }
+            match self.next_cluster(cluster)? {
+                Some(next) => cluster = next,
+                None => {
+                    let new = self.append_cluster(cluster)?;
+                    return self.cluster_byte_offset(new);
+                }
+            }
+        }
+    }
+
+    fn insert_entry(
+        &mut self,
+        directory: u32,
+        name: &str,
+        attributes: u8,
+        first_cluster: u32,
+    ) -> Result<DirectoryEntry, FatError> {
+        if self.find_record_in_directory(directory, name).is_ok() {
+            return Err(FatError::AlreadyExists);
+        }
+        let (short, needs_lfn) = self.make_short_name(directory, name)?;
+        let utf16: heapless::Vec<u16, 255> = name.chars().map(|ch| ch as u16).collect();
+        let lfn_count = if needs_lfn {
+            utf16.len().div_ceil(13)
+        } else {
+            0
+        };
+        let start = self.find_free_slots(directory, lfn_count + 1)?;
+        let checksum = lfn_checksum(&short);
+        for disk_index in 0..lfn_count {
+            let sequence = lfn_count - disk_index;
+            let mut raw = [0xffu8; 32];
+            raw[0] = sequence as u8 | if sequence == lfn_count { 0x40 } else { 0 };
+            raw[11] = ATTR_LFN;
+            raw[12] = 0;
+            raw[13] = checksum;
+            raw[26] = 0;
+            raw[27] = 0;
+            let first = (sequence - 1) * 13;
+            let mut chars = [0xffffu16; 13];
+            for (index, slot) in chars.iter_mut().enumerate() {
+                if let Some(character) = utf16.get(first + index) {
+                    *slot = *character;
+                } else if first + index == utf16.len() {
+                    *slot = 0;
+                }
+            }
+            write_lfn_chars(&mut raw, &chars);
+            self.partition_write(start + disk_index as u64 * 32, &raw)?;
+        }
+        let mut raw = [0u8; 32];
+        raw[..11].copy_from_slice(&short);
+        raw[11] = attributes;
+        raw[20..22].copy_from_slice(&((first_cluster >> 16) as u16).to_le_bytes());
+        raw[26..28].copy_from_slice(&(first_cluster as u16).to_le_bytes());
+        self.partition_write(start + lfn_count as u64 * 32, &raw)?;
+        DirectoryEntry::read_from_bytes(&raw).map_err(|_| FatError::WriteError)
+    }
+
+    pub fn create(&mut self, path: &str, directory: bool) -> Result<DirectoryEntry, FatError> {
+        self.require_fat32()?;
+        let (parent, name) = self.split_parent(path)?;
+        if self.find_record_in_directory(parent, name).is_ok() {
+            return Err(FatError::AlreadyExists);
+        }
+        let cluster = self.allocate_cluster()?;
+        if directory {
+            let mut block = [0u8; 65536];
+            let mut dot = [0u8; 32];
+            dot[..11].fill(b' ');
+            dot[0] = b'.';
+            dot[11] = ATTR_DIRECTORY;
+            dot[20..22].copy_from_slice(&((cluster >> 16) as u16).to_le_bytes());
+            dot[26..28].copy_from_slice(&(cluster as u16).to_le_bytes());
+            block[..32].copy_from_slice(&dot);
+            let mut dotdot = [0u8; 32];
+            dotdot[..11].fill(b' ');
+            dotdot[0] = b'.';
+            dotdot[1] = b'.';
+            dotdot[11] = ATTR_DIRECTORY;
+            let parent_value = if parent == self.root_cluster {
+                self.root_cluster
+            } else {
+                parent
+            };
+            dotdot[20..22].copy_from_slice(&((parent_value >> 16) as u16).to_le_bytes());
+            dotdot[26..28].copy_from_slice(&(parent_value as u16).to_le_bytes());
+            block[32..64].copy_from_slice(&dotdot);
+            self.write_cluster(cluster, &block)?;
+        }
+        match self.insert_entry(
+            parent,
+            name,
+            if directory { ATTR_DIRECTORY } else { 0 },
+            cluster,
+        ) {
+            Ok(entry) => Ok(entry),
+            Err(error) => {
+                let _ = self.free_chain(cluster);
+                Err(error)
+            }
+        }
+    }
+
+    fn update_record(
+        &mut self,
+        offset: u64,
+        first_cluster: u32,
+        size: u32,
+    ) -> Result<(), FatError> {
+        let mut raw = [0u8; 32];
+        self.partition_read(offset, &mut raw)?;
+        raw[20..22].copy_from_slice(&((first_cluster >> 16) as u16).to_le_bytes());
+        raw[26..28].copy_from_slice(&(first_cluster as u16).to_le_bytes());
+        raw[28..32].copy_from_slice(&size.to_le_bytes());
+        self.partition_write(offset, &raw)
+    }
+
+    pub fn write_path(
+        &mut self,
+        path: &str,
+        offset: u32,
+        input: &[u8],
+    ) -> Result<(u32, u32), FatError> {
+        self.require_fat32()?;
+        let (entry, record_offset, _) = self.find_record(path)?;
+        if entry.is_directory() {
+            return Err(FatError::NotAFile);
+        }
+        if input.is_empty() {
+            return Ok((entry.file_size(), entry.first_cluster()));
+        }
+        let end = offset
+            .checked_add(input.len() as u32)
+            .ok_or(FatError::NoSpace)?;
+        let cluster_size = self.sectors_per_cluster as u32 * self.bytes_per_sector as u32;
+        let required = end.div_ceil(cluster_size);
+        let mut first = entry.first_cluster();
+        if first < 2 {
+            first = self.allocate_cluster()?;
+        }
+        let mut cluster = first;
+        let mut existing = 1;
+        while let Some(next) = self.next_cluster(cluster)? {
+            cluster = next;
+            existing += 1;
+        }
+        while existing < required {
+            cluster = self.append_cluster(cluster)?;
+            existing += 1;
+        }
+        cluster = first;
+        for _ in 0..offset / cluster_size {
+            cluster = self
+                .next_cluster(cluster)?
+                .ok_or(FatError::InvalidCluster)?;
+        }
+        let mut within = (offset % cluster_size) as usize;
+        let mut consumed = 0;
+        let mut block = [0u8; 65536];
+        while consumed < input.len() {
+            self.read_cluster(cluster, &mut block[..cluster_size as usize])?;
+            let count = (cluster_size as usize - within).min(input.len() - consumed);
+            block[within..within + count].copy_from_slice(&input[consumed..consumed + count]);
+            self.write_cluster(cluster, &block)?;
+            consumed += count;
+            within = 0;
+            if consumed < input.len() {
+                cluster = self
+                    .next_cluster(cluster)?
+                    .ok_or(FatError::InvalidCluster)?;
+            }
+        }
+        let size = entry.file_size().max(end);
+        self.update_record(record_offset, first, size)?;
+        Ok((size, first))
+    }
+
+    fn find_record(&mut self, path: &str) -> Result<(DirectoryEntry, u64, u64), FatError> {
+        let (parent, name) = self.split_parent(path)?;
+        self.find_record_in_directory(parent, name)
+    }
+
+    pub fn truncate_path(&mut self, path: &str, size: u32) -> Result<(), FatError> {
+        self.require_fat32()?;
+        let (entry, offset, _) = self.find_record(path)?;
+        if entry.is_directory() {
+            return Err(FatError::NotAFile);
+        }
+        if size >= entry.file_size() {
+            return Ok(());
+        }
+        let first = entry.first_cluster();
+        if size == 0 {
+            if first >= 2 {
+                self.free_chain(first)?;
+            }
+            return self.update_record(offset, 0, 0);
+        }
+        let cluster_size = self.sectors_per_cluster as u32 * self.bytes_per_sector as u32;
+        let keep = size.div_ceil(cluster_size);
+        let mut last = first;
+        for _ in 1..keep {
+            last = self.next_cluster(last)?.ok_or(FatError::InvalidCluster)?;
+        }
+        let tail = self.next_cluster(last)?;
+        self.set_fat32_value(last, 0x0fff_ffff)?;
+        if let Some(tail) = tail {
+            self.free_chain(tail)?;
+        }
+        self.update_record(offset, first, size)
+    }
+
+    pub fn delete_path(&mut self, path: &str) -> Result<(), FatError> {
+        self.require_fat32()?;
+        let (entry, short_offset, first_offset) = self.find_record(path)?;
+        if entry.is_directory() {
+            let cluster = entry.first_cluster();
+            let mut nonempty = false;
+            let _ = self.for_each_dir_entry(cluster, |child, _| {
+                let name = child.short_name();
+                if name != "." && name != ".." {
+                    nonempty = true;
+                    core::ops::ControlFlow::Break(())
+                } else {
+                    core::ops::ControlFlow::Continue(())
+                }
+            })?;
+            if nonempty {
+                return Err(FatError::DirectoryNotEmpty);
+            }
+        }
+        let mut position = first_offset;
+        while position <= short_offset {
+            self.partition_write(position, &[0xe5])?;
+            position += 32;
+        }
+        if entry.first_cluster() >= 2 {
+            self.free_chain(entry.first_cluster())?;
+        }
+        Ok(())
+    }
+
+    pub fn flush(&mut self) -> Result<(), FatError> {
+        self.device.flush().map_err(|_| FatError::WriteError)
+    }
+
     /// Read entire file into a buffer (convenience method)
     pub fn read_file_all(&mut self, path: &str, buffer: &mut [u8]) -> Result<usize, FatError> {
         let entry = self.find_file(path)?;
@@ -1348,6 +1920,55 @@ impl<'a> FatFilesystem<'a> {
             ControlFlow::Break(result) => Ok(Some(result)),
             ControlFlow::Continue(()) => Ok(None),
         }
+    }
+}
+
+fn is_short_name_char(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric()
+        || matches!(
+            byte,
+            b'$' | b'%'
+                | b'\''
+                | b'-'
+                | b'_'
+                | b'@'
+                | b'~'
+                | b'`'
+                | b'!'
+                | b'('
+                | b')'
+                | b'{'
+                | b'}'
+                | b'^'
+                | b'#'
+                | b'&'
+        )
+}
+
+fn decimal(mut value: u16, output: &mut [u8; 4]) -> usize {
+    let mut reversed = [0u8; 4];
+    let mut length = 0;
+    while value != 0 {
+        reversed[length] = b'0' + (value % 10) as u8;
+        value /= 10;
+        length += 1;
+    }
+    for index in 0..length {
+        output[index] = reversed[length - index - 1];
+    }
+    length
+}
+
+fn lfn_checksum(short: &[u8; 11]) -> u8 {
+    short
+        .iter()
+        .fold(0u8, |sum, byte| sum.rotate_right(1).wrapping_add(*byte))
+}
+
+fn write_lfn_chars(raw: &mut [u8; 32], chars: &[u16; 13]) {
+    const OFFSETS: [usize; 13] = [1, 3, 5, 7, 9, 14, 16, 18, 20, 22, 24, 28, 30];
+    for (offset, character) in OFFSETS.into_iter().zip(chars) {
+        raw[offset..offset + 2].copy_from_slice(&character.to_le_bytes());
     }
 }
 

@@ -30,6 +30,7 @@ const MAX_PATH_LEN: usize = 256;
 
 /// Maximum number of open file handles
 const MAX_FILE_HANDLES: usize = 32;
+const WRITE_CACHE_SIZE: usize = 4096;
 
 /// File open modes
 pub const FILE_MODE_READ: u64 = efi_file::MODE_READ;
@@ -55,6 +56,12 @@ struct FileHandle {
     first_cluster: u32,
     /// Is this a directory?
     is_directory: bool,
+    /// Mode used to open this handle
+    open_mode: u64,
+    /// Bounded sequential write-back cache, persisted by Flush/Close.
+    write_cache: [u8; WRITE_CACHE_SIZE],
+    write_cache_offset: u64,
+    write_cache_len: usize,
     /// The File Protocol struct for this handle
     protocol: efi_file::Protocol,
 }
@@ -69,6 +76,10 @@ impl FileHandle {
             file_size: 0,
             first_cluster: 0,
             is_directory: false,
+            open_mode: 0,
+            write_cache: [0; WRITE_CACHE_SIZE],
+            write_cache_offset: 0,
+            write_cache_len: 0,
             protocol: efi_file::Protocol {
                 revision: efi_file::REVISION,
                 open: file_open,
@@ -200,6 +211,8 @@ extern "efiapi" fn sfs_open_volume(
     handles[handle_idx].file_size = 0;
     handles[handle_idx].first_cluster = fs_state.root_cluster;
     handles[handle_idx].is_directory = true;
+    handles[handle_idx].open_mode = FILE_MODE_READ | FILE_MODE_WRITE;
+    handles[handle_idx].write_cache_len = 0;
 
     // Return pointer to the protocol in this handle
     unsafe {
@@ -222,16 +235,19 @@ extern "efiapi" fn file_open(
     new_handle: *mut *mut efi_file::Protocol,
     file_name: *mut Char16,
     open_mode: u64,
-    _attributes: u64,
+    attributes: u64,
 ) -> Status {
     if this.is_null() || new_handle.is_null() || file_name.is_null() {
         return Status::INVALID_PARAMETER;
     }
 
-    // Only read mode is supported
-    if open_mode != FILE_MODE_READ {
-        log::debug!("File.Open: only read mode supported, got {:#x}", open_mode);
-        return Status::UNSUPPORTED;
+    let base_mode = open_mode & !FILE_MODE_CREATE;
+    if (base_mode != FILE_MODE_READ && base_mode != FILE_MODE_READ | FILE_MODE_WRITE)
+        || open_mode & !(FILE_MODE_READ | FILE_MODE_WRITE | FILE_MODE_CREATE) != 0
+        || (open_mode & FILE_MODE_CREATE != 0 && base_mode != FILE_MODE_READ | FILE_MODE_WRITE)
+        || attributes & !efi_file::VALID_ATTR != 0
+    {
+        return Status::INVALID_PARAMETER;
     }
 
     // Convert UTF-16 filename to UTF-8
@@ -245,7 +261,7 @@ extern "efiapi" fn file_open(
     log::info!("File.Open({:?})", name_str);
 
     // Get parent handle info
-    let (parent_path, parent_path_len) = {
+    let (parent_path, parent_path_len, parent_mode) = {
         let handles = FILE_HANDLES.lock();
         let parent_idx = match find_handle_index_unlocked(&handles, this) {
             Some(idx) => idx,
@@ -254,7 +270,7 @@ extern "efiapi" fn file_open(
         let mut path = [0u8; MAX_PATH_LEN];
         let len = handles[parent_idx].path_len;
         path[..len].copy_from_slice(&handles[parent_idx].path[..len]);
-        (path, len)
+        (path, len, handles[parent_idx].open_mode)
     };
 
     // Build full path
@@ -270,21 +286,31 @@ extern "efiapi" fn file_open(
         None => return Status::NOT_READY,
     };
 
-    // Find the file using FatFilesystem
-    let result = state::with_block_device_mut(|device| {
-        let mut fat = match FatFilesystem::new(device, partition_start) {
-            Ok(f) => f,
-            Err(_) => return Err(()),
-        };
+    if open_mode & FILE_MODE_WRITE != 0 && media_is_read_only() {
+        return Status::WRITE_PROTECTED;
+    }
+    if open_mode & FILE_MODE_CREATE != 0 && parent_mode & FILE_MODE_WRITE == 0 {
+        return Status::ACCESS_DENIED;
+    }
 
-        match fat.find_file(full_path_str) {
-            Ok(entry) => Ok((
-                entry.first_cluster(),
-                entry.file_size(),
-                entry.is_directory(),
-            )),
-            Err(_) => Err(()),
+    let result = state::with_block_device_mut(|device| {
+        let mut fat =
+            FatFilesystem::new(device, partition_start).map_err(|_| Status::DEVICE_ERROR)?;
+        let entry = match fat.find_file(full_path_str) {
+            Ok(entry) => entry,
+            Err(crate::fs::fat::FatError::NotFound) if open_mode & FILE_MODE_CREATE != 0 => fat
+                .create(full_path_str, attributes & FILE_DIRECTORY != 0)
+                .map_err(fat_status)?,
+            Err(error) => return Err(fat_status(error)),
+        };
+        if open_mode & FILE_MODE_WRITE != 0 && fat.fat_type() != crate::fs::fat::FatType::Fat32 {
+            return Err(Status::WRITE_PROTECTED);
         }
+        Ok((
+            entry.first_cluster(),
+            entry.file_size(),
+            entry.is_directory(),
+        ))
     });
 
     match result {
@@ -303,6 +329,8 @@ extern "efiapi" fn file_open(
             handles[handle_idx].file_size = size as u64;
             handles[handle_idx].first_cluster = cluster;
             handles[handle_idx].is_directory = is_dir;
+            handles[handle_idx].open_mode = open_mode;
+            handles[handle_idx].write_cache_len = 0;
 
             unsafe {
                 *new_handle = &raw mut handles[handle_idx].protocol;
@@ -316,10 +344,7 @@ extern "efiapi" fn file_open(
             );
             Status::SUCCESS
         }
-        Some(Err(_)) => {
-            log::debug!("File.Open: not found");
-            Status::NOT_FOUND
-        }
+        Some(Err(status)) => status,
         None => {
             log::error!("File.Open: block device not available");
             Status::NOT_READY
@@ -330,20 +355,60 @@ extern "efiapi" fn file_open(
 extern "efiapi" fn file_close(this: *mut efi_file::Protocol) -> Status {
     log::debug!("File.Close()");
 
-    let mut handles = FILE_HANDLES.lock();
-    if let Some(idx) = find_handle_index_unlocked(&handles, this) {
-        handles[idx].in_use = false;
-        handles[idx].path_len = 0;
-        handles[idx].position = 0;
-        Status::SUCCESS
-    } else {
-        Status::INVALID_PARAMETER
+    let index = {
+        let handles = FILE_HANDLES.lock();
+        find_handle_index_unlocked(&handles, this)
+    };
+    let Some(index) = index else {
+        return Status::INVALID_PARAMETER;
+    };
+    let status = flush_write_cache(index);
+    if status != Status::SUCCESS {
+        return status;
     }
+
+    let mut handles = FILE_HANDLES.lock();
+    handles[index].in_use = false;
+    handles[index].path_len = 0;
+    handles[index].position = 0;
+    handles[index].open_mode = 0;
+    handles[index].write_cache_len = 0;
+    Status::SUCCESS
 }
 
-extern "efiapi" fn file_delete(_this: *mut efi_file::Protocol) -> Status {
-    log::debug!("File.Delete() -> UNSUPPORTED");
-    Status::UNSUPPORTED
+extern "efiapi" fn file_delete(this: *mut efi_file::Protocol) -> Status {
+    let (path, writable, index) = {
+        let handles = FILE_HANDLES.lock();
+        let Some(index) = find_handle_index_unlocked(&handles, this) else {
+            return Status::INVALID_PARAMETER;
+        };
+        let mut path = [0u8; MAX_PATH_LEN];
+        path[..handles[index].path_len]
+            .copy_from_slice(&handles[index].path[..handles[index].path_len]);
+        (path, handles[index].open_mode & FILE_MODE_WRITE != 0, index)
+    };
+    if !writable || media_is_read_only() {
+        return Status::WARN_DELETE_FAILURE;
+    }
+    if flush_write_cache(index) != Status::SUCCESS {
+        return Status::WARN_DELETE_FAILURE;
+    }
+    let path = core::str::from_utf8(&path)
+        .unwrap_or("")
+        .trim_end_matches('\0');
+    let partition_start = match state::efi().filesystem {
+        Some(state) => state.partition_start,
+        None => return Status::WARN_DELETE_FAILURE,
+    };
+    let deleted = state::with_block_device_mut(|device| {
+        FatFilesystem::new(device, partition_start).and_then(|mut fat| fat.delete_path(path))
+    });
+    if matches!(deleted, Some(Ok(()))) {
+        let _ = file_close(this);
+        Status::SUCCESS
+    } else {
+        Status::WARN_DELETE_FAILURE
+    }
 }
 
 extern "efiapi" fn file_read(
@@ -376,6 +441,10 @@ extern "efiapi" fn file_read(
 
     if is_dir {
         return read_directory(buffer_size, buffer, handle_idx);
+    }
+    let flush_status = flush_write_cache(handle_idx);
+    if flush_status != Status::SUCCESS {
+        return flush_status;
     }
 
     // File read
@@ -441,12 +510,92 @@ extern "efiapi" fn file_read(
 }
 
 extern "efiapi" fn file_write(
-    _this: *mut efi_file::Protocol,
-    _buffer_size: *mut usize,
-    _buffer: *mut c_void,
+    this: *mut efi_file::Protocol,
+    buffer_size: *mut usize,
+    buffer: *mut c_void,
 ) -> Status {
-    log::debug!("File.Write() -> UNSUPPORTED");
-    Status::UNSUPPORTED
+    if this.is_null() || buffer_size.is_null() {
+        return Status::INVALID_PARAMETER;
+    }
+    let requested = unsafe { *buffer_size };
+    if requested != 0 && buffer.is_null() {
+        return Status::INVALID_PARAMETER;
+    }
+    if requested == 0 {
+        return Status::SUCCESS;
+    }
+    let (position, mode, is_directory, index) = {
+        let handles = FILE_HANDLES.lock();
+        let Some(index) = find_handle_index_unlocked(&handles, this) else {
+            return Status::INVALID_PARAMETER;
+        };
+        (
+            handles[index].position,
+            handles[index].open_mode,
+            handles[index].is_directory,
+            index,
+        )
+    };
+    if mode & FILE_MODE_WRITE == 0 || is_directory {
+        return Status::ACCESS_DENIED;
+    }
+    if media_is_read_only() {
+        return Status::WRITE_PROTECTED;
+    }
+    if position > u32::MAX as u64 || requested > u32::MAX as usize {
+        return Status::UNSUPPORTED;
+    }
+    let data = unsafe { core::slice::from_raw_parts(buffer.cast::<u8>(), requested) };
+
+    if requested <= WRITE_CACHE_SIZE {
+        let can_append = {
+            let handles = FILE_HANDLES.lock();
+            let handle = &handles[index];
+            (handle.write_cache_len == 0
+                || handle.write_cache_offset + handle.write_cache_len as u64 == position)
+                && handle.write_cache_len + requested <= WRITE_CACHE_SIZE
+        };
+        if !can_append {
+            let status = flush_write_cache(index);
+            if status != Status::SUCCESS {
+                return status;
+            }
+        }
+
+        let mut handles = FILE_HANDLES.lock();
+        let handle = &mut handles[index];
+        if handle.write_cache_len == 0 {
+            handle.write_cache_offset = position;
+        }
+        let start = handle.write_cache_len;
+        handle.write_cache[start..start + requested].copy_from_slice(data);
+        handle.write_cache_len += requested;
+        handle.position += requested as u64;
+        handle.file_size = handle.file_size.max(handle.position);
+        return Status::SUCCESS;
+    }
+
+    let status = flush_write_cache(index);
+    if status != Status::SUCCESS {
+        return status;
+    }
+    let (path, path_len) = {
+        let handles = FILE_HANDLES.lock();
+        let mut path = [0u8; MAX_PATH_LEN];
+        path[..handles[index].path_len]
+            .copy_from_slice(&handles[index].path[..handles[index].path_len]);
+        (path, handles[index].path_len)
+    };
+    match write_path_to_disk(&path[..path_len], position, data) {
+        Ok((size, cluster)) => {
+            let mut handles = FILE_HANDLES.lock();
+            handles[index].position += requested as u64;
+            handles[index].file_size = size as u64;
+            handles[index].first_cluster = cluster;
+            Status::SUCCESS
+        }
+        Err(status) => status,
+    }
 }
 
 extern "efiapi" fn file_get_position(this: *mut efi_file::Protocol, position: *mut u64) -> Status {
@@ -471,27 +620,36 @@ extern "efiapi" fn file_set_position(this: *mut efi_file::Protocol, position: u6
         return Status::INVALID_PARAMETER;
     }
 
-    let mut handles = FILE_HANDLES.lock();
-    if let Some(idx) = find_handle_index_unlocked(&handles, this) {
-        if handles[idx].is_directory {
-            // For directories, only 0 is allowed (reset enumeration)
+    let index = {
+        let handles = FILE_HANDLES.lock();
+        find_handle_index_unlocked(&handles, this)
+    };
+    let Some(index) = index else {
+        return Status::INVALID_PARAMETER;
+    };
+
+    {
+        let mut handles = FILE_HANDLES.lock();
+        if handles[index].is_directory {
             if position != 0 {
                 return Status::UNSUPPORTED;
             }
-            handles[idx].position = 0;
+            handles[index].position = 0;
             return Status::SUCCESS;
         }
-
-        // 0xFFFF_FFFF_FFFF_FFFF means seek to end
-        if position == u64::MAX {
-            handles[idx].position = handles[idx].file_size;
-        } else {
-            handles[idx].position = position;
-        }
-        Status::SUCCESS
-    } else {
-        Status::INVALID_PARAMETER
     }
+    let status = flush_write_cache(index);
+    if status != Status::SUCCESS {
+        return status;
+    }
+
+    let mut handles = FILE_HANDLES.lock();
+    if position == u64::MAX {
+        handles[index].position = handles[index].file_size;
+    } else {
+        handles[index].position = position;
+    }
+    Status::SUCCESS
 }
 
 extern "efiapi" fn file_get_info(
@@ -585,11 +743,16 @@ extern "efiapi" fn file_get_info(
             Some(s) => s,
             None => return Status::NOT_READY,
         };
+        let read_only = media_is_read_only();
 
         let info = buffer as *mut efi_file::SystemInfo;
         unsafe {
             (*info).size = required_size as u64;
-            (*info).read_only = r_efi::efi::Boolean::TRUE; // Read-only
+            (*info).read_only = if read_only {
+                r_efi::efi::Boolean::TRUE
+            } else {
+                r_efi::efi::Boolean::FALSE
+            };
             (*info).volume_size = 0; // Unknown
             (*info).free_space = 0;
             (*info).block_size = fs_state.device_block_size;
@@ -613,18 +776,97 @@ extern "efiapi" fn file_get_info(
 }
 
 extern "efiapi" fn file_set_info(
-    _this: *mut efi_file::Protocol,
-    _info_type: *mut Guid,
-    _buffer_size: usize,
-    _buffer: *mut c_void,
+    this: *mut efi_file::Protocol,
+    info_type: *mut Guid,
+    buffer_size: usize,
+    buffer: *mut c_void,
 ) -> Status {
-    log::debug!("File.SetInfo() -> UNSUPPORTED");
-    Status::UNSUPPORTED
+    if this.is_null() || info_type.is_null() || buffer.is_null() {
+        return Status::INVALID_PARAMETER;
+    }
+    if unsafe { *info_type } != FILE_INFO_GUID
+        || buffer_size < core::mem::size_of::<efi_file::Info>()
+    {
+        return Status::UNSUPPORTED;
+    }
+    let (path, path_len, mode, current_size, index) = {
+        let handles = FILE_HANDLES.lock();
+        let Some(index) = find_handle_index_unlocked(&handles, this) else {
+            return Status::INVALID_PARAMETER;
+        };
+        let mut path = [0u8; MAX_PATH_LEN];
+        path[..handles[index].path_len]
+            .copy_from_slice(&handles[index].path[..handles[index].path_len]);
+        (
+            path,
+            handles[index].path_len,
+            handles[index].open_mode,
+            handles[index].file_size,
+            index,
+        )
+    };
+    if mode & FILE_MODE_WRITE == 0 {
+        return Status::ACCESS_DENIED;
+    }
+    if media_is_read_only() {
+        return Status::WRITE_PROTECTED;
+    }
+    let status = flush_write_cache(index);
+    if status != Status::SUCCESS {
+        return status;
+    }
+    let size = unsafe { (*(buffer as *const efi_file::Info)).file_size };
+    if size > u32::MAX as u64 || size > current_size {
+        return Status::UNSUPPORTED;
+    }
+    let path = core::str::from_utf8(&path[..path_len]).unwrap_or("");
+    let partition_start = match state::efi().filesystem {
+        Some(state) => state.partition_start,
+        None => return Status::NOT_READY,
+    };
+    let result = state::with_block_device_mut(|device| {
+        FatFilesystem::new(device, partition_start)
+            .and_then(|mut fat| fat.truncate_path(path, size as u32))
+    });
+    match result {
+        Some(Ok(())) => {
+            let mut handles = FILE_HANDLES.lock();
+            handles[index].file_size = size;
+            handles[index].position = handles[index].position.min(size);
+            Status::SUCCESS
+        }
+        Some(Err(error)) => fat_status(error),
+        None => Status::NOT_READY,
+    }
 }
 
-extern "efiapi" fn file_flush(_this: *mut efi_file::Protocol) -> Status {
-    // Read-only filesystem, nothing to flush
-    Status::SUCCESS
+extern "efiapi" fn file_flush(this: *mut efi_file::Protocol) -> Status {
+    if this.is_null() {
+        return Status::INVALID_PARAMETER;
+    }
+    let index = {
+        let handles = FILE_HANDLES.lock();
+        find_handle_index_unlocked(&handles, this)
+    };
+    let Some(index) = index else {
+        return Status::INVALID_PARAMETER;
+    };
+    let status = flush_write_cache(index);
+    if status != Status::SUCCESS {
+        return status;
+    }
+
+    let partition_start = match state::efi().filesystem {
+        Some(state) => state.partition_start,
+        None => return Status::NOT_READY,
+    };
+    match state::with_block_device_mut(|device| {
+        FatFilesystem::new(device, partition_start).and_then(|mut fat| fat.flush())
+    }) {
+        Some(Ok(())) => Status::SUCCESS,
+        Some(Err(error)) => fat_status(error),
+        None => Status::NOT_READY,
+    }
 }
 
 // Async operations - not supported
@@ -663,6 +905,84 @@ extern "efiapi" fn file_flush_ex(
 // ============================================================================
 // Helper Functions
 // ============================================================================
+
+fn media_is_read_only() -> bool {
+    state::with_block_device_mut(|device| device.info().read_only).unwrap_or(true)
+}
+
+fn write_path_to_disk(path: &[u8], offset: u64, data: &[u8]) -> Result<(u32, u32), Status> {
+    if offset > u32::MAX as u64 || data.len() > u32::MAX as usize {
+        return Err(Status::UNSUPPORTED);
+    }
+    let path = core::str::from_utf8(path).unwrap_or("");
+    let partition_start = state::efi()
+        .filesystem
+        .ok_or(Status::NOT_READY)?
+        .partition_start;
+    match state::with_block_device_mut(|device| {
+        let mut fat =
+            FatFilesystem::new(device, partition_start).map_err(|_| Status::DEVICE_ERROR)?;
+        fat.write_path(path, offset as u32, data)
+            .map_err(fat_status)
+    }) {
+        Some(result) => result,
+        None => Err(Status::NOT_READY),
+    }
+}
+
+fn flush_write_cache(index: usize) -> Status {
+    let (path, path_len, offset, len, data) = {
+        let handles = FILE_HANDLES.lock();
+        if !handles[index].in_use || handles[index].write_cache_len == 0 {
+            return Status::SUCCESS;
+        }
+        let mut path = [0u8; MAX_PATH_LEN];
+        path[..handles[index].path_len]
+            .copy_from_slice(&handles[index].path[..handles[index].path_len]);
+        let mut data = [0u8; WRITE_CACHE_SIZE];
+        let len = handles[index].write_cache_len;
+        data[..len].copy_from_slice(&handles[index].write_cache[..len]);
+        (
+            path,
+            handles[index].path_len,
+            handles[index].write_cache_offset,
+            len,
+            data,
+        )
+    };
+
+    match write_path_to_disk(&path[..path_len], offset, &data[..len]) {
+        Ok((size, cluster)) => {
+            let mut handles = FILE_HANDLES.lock();
+            handles[index].write_cache_len = 0;
+            handles[index].file_size = handles[index].file_size.max(size as u64);
+            handles[index].first_cluster = cluster;
+            Status::SUCCESS
+        }
+        Err(status) => status,
+    }
+}
+
+fn fat_status(error: crate::fs::fat::FatError) -> Status {
+    use crate::fs::fat::FatError;
+    match error {
+        FatError::NotFound => Status::NOT_FOUND,
+        FatError::AlreadyExists => Status::ACCESS_DENIED,
+        FatError::ReadOnly => Status::WRITE_PROTECTED,
+        FatError::InvalidName | FatError::NotADirectory | FatError::NotAFile => {
+            Status::INVALID_PARAMETER
+        }
+        FatError::NoSpace => Status::VOLUME_FULL,
+        FatError::DirectoryNotEmpty => Status::ACCESS_DENIED,
+        FatError::InvalidBpb
+        | FatError::ReadError
+        | FatError::WriteError
+        | FatError::NotFat
+        | FatError::EndOfFile
+        | FatError::InvalidCluster
+        | FatError::BufferTooSmall => Status::DEVICE_ERROR,
+    }
+}
 
 /// Find handle index without holding the lock (for use when we already have it)
 fn find_handle_index_unlocked(
