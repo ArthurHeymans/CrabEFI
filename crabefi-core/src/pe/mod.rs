@@ -11,6 +11,10 @@
 //! - Integer overflows in size calculations
 
 use crate::efi::allocator::{self, AllocateType, MemoryType, PAGE_SIZE};
+use object::read::pe::{
+    ImageNtHeaders, ImageOptionalHeader as _, PeFile, PeFile32, PeFile64, optional_header_magic,
+};
+use object::{LittleEndian, pe as object_pe};
 use r_efi::efi::{Handle, Status, SystemTable};
 use zerocopy::{FromBytes, Immutable, KnownLayout, Unaligned};
 
@@ -302,90 +306,33 @@ impl<'a> PeHeaders<'a> {
 /// * `Ok(PeHeaders)` - Parsed header information
 /// * `Err(Status)` - Error status
 pub fn parse_headers(data: &[u8]) -> Result<PeHeaders<'_>, Status> {
-    // Parse DOS header
-    let dos_header = DosHeader::ref_from_prefix(data)
-        .map_err(|_| Status::INVALID_PARAMETER)?
-        .0;
-
-    if dos_header.e_magic != DOS_MAGIC {
-        return Err(Status::INVALID_PARAMETER);
+    match optional_header_magic(data).map_err(|_| Status::INVALID_PARAMETER)? {
+        PE32_MAGIC => pe_headers(data, PeFile32::parse(data)),
+        PE32_PLUS_MAGIC => pe_headers(data, PeFile64::parse(data)),
+        _ => Err(Status::INVALID_PARAMETER),
     }
+}
 
-    let pe_offset = dos_header.e_lfanew as usize;
-
-    // Validate PE signature
-    let pe_sig_end = pe_offset.checked_add(4).ok_or(Status::INVALID_PARAMETER)?;
-    if pe_sig_end > data.len() {
-        return Err(Status::INVALID_PARAMETER);
-    }
-
-    let pe_sig = u32::from_le_bytes([
-        data[pe_offset],
-        data[pe_offset + 1],
-        data[pe_offset + 2],
-        data[pe_offset + 3],
-    ]);
-    if pe_sig != PE_SIGNATURE {
-        return Err(Status::INVALID_PARAMETER);
-    }
-
-    // Parse COFF header
-    let coff_offset = pe_offset.checked_add(4).ok_or(Status::INVALID_PARAMETER)?;
-    let coff_header = CoffHeader::ref_from_prefix(&data[coff_offset..])
-        .map_err(|_| Status::INVALID_PARAMETER)?
-        .0;
-
-    let num_sections = coff_header.number_of_sections;
-    let opt_header_size = coff_header.size_of_optional_header as usize;
-
-    // Parse optional header (just the magic to determine PE32 vs PE32+)
-    let opt_header_offset = coff_offset
-        .checked_add(core::mem::size_of::<CoffHeader>())
-        .ok_or(Status::INVALID_PARAMETER)?;
-
-    if opt_header_offset + 2 > data.len() {
-        return Err(Status::INVALID_PARAMETER);
-    }
-
-    let magic = u16::from_le_bytes([data[opt_header_offset], data[opt_header_offset + 1]]);
-    let is_pe32_plus = match magic {
-        PE32_PLUS_MAGIC => true,
-        PE32_MAGIC => false,
-        _ => return Err(Status::INVALID_PARAMETER),
-    };
-
-    // Get size_of_headers and number_of_rva_and_sizes from optional header
-    let (size_of_headers, num_data_dirs, data_dirs_offset) = if is_pe32_plus {
-        let opt_header = OptionalHeader64::ref_from_prefix(&data[opt_header_offset..])
-            .map_err(|_| Status::INVALID_PARAMETER)?
-            .0;
-        let dirs_offset = opt_header_offset + core::mem::size_of::<OptionalHeader64>();
-        (
-            opt_header.size_of_headers,
-            opt_header.number_of_rva_and_sizes,
-            dirs_offset,
+fn pe_headers<'a, Pe>(
+    data: &'a [u8],
+    file: object::read::Result<PeFile<'a, Pe>>,
+) -> Result<PeHeaders<'a>, Status>
+where
+    Pe: ImageNtHeaders,
+{
+    let file = file.map_err(|_| Status::INVALID_PARAMETER)?;
+    let nt_headers = file.nt_headers();
+    let file_header = nt_headers.file_header();
+    let optional_header = nt_headers.optional_header();
+    let opt_header_offset = (file.dos_header().nt_headers_offset() as usize)
+        .checked_add(
+            core::mem::size_of::<u32>() + core::mem::size_of::<object_pe::ImageFileHeader>(),
         )
-    } else {
-        // PE32: size_of_headers at offset 60, num_rva_and_sizes at offset 92
-        // For PE32, the optional header is smaller (no 64-bit image_base)
-        if opt_header_offset + 96 > data.len() {
-            return Err(Status::INVALID_PARAMETER);
-        }
-        let size_of_headers = u32::from_le_bytes([
-            data[opt_header_offset + 60],
-            data[opt_header_offset + 61],
-            data[opt_header_offset + 62],
-            data[opt_header_offset + 63],
-        ]);
-        let num_data_dirs = u32::from_le_bytes([
-            data[opt_header_offset + 92],
-            data[opt_header_offset + 93],
-            data[opt_header_offset + 94],
-            data[opt_header_offset + 95],
-        ]);
-        (size_of_headers, num_data_dirs, opt_header_offset + 96)
-    };
-
+        .ok_or(Status::INVALID_PARAMETER)?;
+    let opt_header_size = file_header.size_of_optional_header.get(LittleEndian) as usize;
+    let data_dirs_offset = opt_header_offset
+        .checked_add(core::mem::size_of::<Pe::ImageOptionalHeader>())
+        .ok_or(Status::INVALID_PARAMETER)?;
     let sections_offset = opt_header_offset
         .checked_add(opt_header_size)
         .ok_or(Status::INVALID_PARAMETER)?;
@@ -394,10 +341,10 @@ pub fn parse_headers(data: &[u8]) -> Result<PeHeaders<'_>, Status> {
         data,
         opt_header_offset,
         opt_header_size,
-        is_pe32_plus,
-        num_sections,
-        num_data_dirs,
-        size_of_headers,
+        is_pe32_plus: nt_headers.is_type_64(),
+        num_sections: file_header.number_of_sections.get(LittleEndian),
+        num_data_dirs: optional_header.number_of_rva_and_sizes(),
+        size_of_headers: optional_header.size_of_headers(),
         data_dirs_offset,
         sections_offset,
     })
@@ -954,5 +901,97 @@ pub fn unload_image(image: &LoadedImage) -> Status {
 
 #[cfg(test)]
 mod tests {
-    // Tests would go here
+    use super::*;
+
+    fn put_u16(data: &mut [u8], offset: usize, value: u16) {
+        data[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
+    }
+
+    fn put_u32(data: &mut [u8], offset: usize, value: u32) {
+        data[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+    }
+
+    fn minimal_pe(is_pe32_plus: bool) -> [u8; 512] {
+        let mut data = [0u8; 512];
+        let pe_offset = 0x80;
+        let coff_offset = pe_offset + 4;
+        let opt_header_offset = coff_offset + core::mem::size_of::<CoffHeader>();
+        let fixed_opt_size = if is_pe32_plus { 112 } else { 96 };
+        let opt_header_size = fixed_opt_size + 5 * DATA_DIRECTORY_ENTRY_SIZE;
+
+        put_u16(&mut data, 0, DOS_MAGIC);
+        put_u32(&mut data, 0x3c, pe_offset as u32);
+        put_u32(&mut data, pe_offset, PE_SIGNATURE);
+        put_u16(&mut data, coff_offset + 2, 1);
+        put_u16(&mut data, coff_offset + 16, opt_header_size as u16);
+        put_u16(
+            &mut data,
+            opt_header_offset,
+            if is_pe32_plus {
+                PE32_PLUS_MAGIC
+            } else {
+                PE32_MAGIC
+            },
+        );
+        if is_pe32_plus {
+            data[opt_header_offset + 24..opt_header_offset + 32]
+                .copy_from_slice(&0x1122_3344_5566_7788u64.to_le_bytes());
+            put_u32(&mut data, opt_header_offset + 108, 5);
+        } else {
+            put_u32(&mut data, opt_header_offset + 28, 0x5566_7788);
+            put_u32(&mut data, opt_header_offset + 92, 5);
+        }
+        put_u32(&mut data, opt_header_offset + 60, 0x200);
+        put_u16(&mut data, opt_header_offset + 68, 10);
+
+        let security_dir = opt_header_offset + fixed_opt_size + 4 * DATA_DIRECTORY_ENTRY_SIZE;
+        put_u32(&mut data, security_dir, 0x1e0);
+        put_u32(&mut data, security_dir + 4, 0x20);
+
+        let section = opt_header_offset + opt_header_size;
+        put_u32(&mut data, section + 16, 0x20);
+        put_u32(&mut data, section + 20, 0x180);
+        data
+    }
+
+    #[test]
+    fn parses_pe32_and_pe32_plus_with_raw_authenticode_ranges() {
+        for is_pe32_plus in [false, true] {
+            let mut data = minimal_pe(is_pe32_plus);
+            let Ok(headers) = parse_headers(&data) else {
+                panic!("valid PE headers rejected");
+            };
+            let Some(section) = headers.sections().next() else {
+                panic!("section table missing");
+            };
+            let pointer_to_raw_data = section.pointer_to_raw_data;
+            let size_of_raw_data = section.size_of_raw_data;
+
+            assert_eq!(headers.is_pe32_plus, is_pe32_plus);
+            assert_eq!(headers.subsystem(), 10);
+            assert_eq!(headers.size_of_headers, 0x200);
+            assert_eq!(
+                headers.data_directory(IMAGE_DIRECTORY_ENTRY_SECURITY),
+                Some((0x1e0, 0x20))
+            );
+            assert_eq!(pointer_to_raw_data, 0x180);
+            assert_eq!(size_of_raw_data, 0x20);
+            assert_eq!(
+                headers.preferred_image_base(),
+                if is_pe32_plus {
+                    0x1122_3344_5566_7788
+                } else {
+                    0x5566_7788
+                }
+            );
+
+            let truncated_len = headers.sections_offset + core::mem::size_of::<SectionHeader>() - 1;
+            assert!(parse_headers(&data[..truncated_len]).is_err());
+
+            let num_data_dirs_offset =
+                headers.opt_header_offset + if is_pe32_plus { 108 } else { 92 };
+            put_u32(&mut data, num_data_dirs_offset, 6);
+            assert!(parse_headers(&data).is_err());
+        }
+    }
 }
