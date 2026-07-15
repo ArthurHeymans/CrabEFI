@@ -47,6 +47,8 @@ pub enum BlockError {
     NoMedia,
     /// Media has changed since last access
     MediaChanged,
+    /// Device does not support writes
+    WriteProtected,
 }
 
 impl core::fmt::Display for BlockError {
@@ -57,6 +59,7 @@ impl core::fmt::Display for BlockError {
             BlockError::OutOfRange => write!(f, "LBA out of range"),
             BlockError::NoMedia => write!(f, "no media present"),
             BlockError::MediaChanged => write!(f, "media changed"),
+            BlockError::WriteProtected => write!(f, "write protected"),
         }
     }
 }
@@ -123,11 +126,21 @@ pub trait BlockDevice {
     /// Ok(()) on success, Err(BlockError) on failure
     fn read_blocks(&mut self, lba: u64, count: u32, buffer: &mut [u8]) -> Result<(), BlockError>;
 
-    /// Validate parameters for a read operation
+    /// Write blocks to the device.
+    fn write_blocks(&mut self, _lba: u64, _count: u32, _buffer: &[u8]) -> Result<(), BlockError> {
+        Err(BlockError::WriteProtected)
+    }
+
+    /// Flush pending writes to stable media.
+    fn flush(&mut self) -> Result<(), BlockError> {
+        Ok(())
+    }
+
+    /// Validate parameters for a read or write operation
     ///
     /// Checks that the LBA range is within bounds and the buffer is large enough.
     /// Implementations should call this at the start of `read_blocks`.
-    fn validate_read(&self, lba: u64, count: u32, buffer: &[u8]) -> Result<(), BlockError> {
+    fn validate_io(&self, lba: u64, count: u32, buffer: &[u8]) -> Result<(), BlockError> {
         let info = self.info();
         if count == 0 {
             return Ok(());
@@ -148,6 +161,11 @@ pub trait BlockDevice {
     /// Read a single block (convenience method)
     fn read_block(&mut self, lba: u64, buffer: &mut [u8]) -> Result<(), BlockError> {
         self.read_blocks(lba, 1, buffer)
+    }
+
+    /// Write a single block.
+    fn write_block(&mut self, lba: u64, buffer: &[u8]) -> Result<(), BlockError> {
+        self.write_blocks(lba, 1, buffer)
     }
 }
 
@@ -189,7 +207,7 @@ impl NvmeBlockDevice {
                 block_size,
                 media_id,
                 removable: false, // NVMe is not removable
-                read_only: false,
+                read_only: true,
             },
         }
     }
@@ -211,7 +229,7 @@ impl BlockDevice for NvmeBlockDevice {
     }
 
     fn read_blocks(&mut self, lba: u64, count: u32, buffer: &mut [u8]) -> Result<(), BlockError> {
-        self.validate_read(lba, count, buffer)?;
+        self.validate_io(lba, count, buffer)?;
         // Safety: pointer valid for firmware lifetime; no overlapping &mut created
         let controller = unsafe {
             &mut *nvme::get_controller(self.controller_id).ok_or(BlockError::DeviceError)?
@@ -261,7 +279,7 @@ impl AhciBlockDevice {
                 block_size,
                 media_id,
                 removable: false, // SATA drives are generally not removable
-                read_only: false,
+                read_only: true,
             },
         }
     }
@@ -283,7 +301,7 @@ impl BlockDevice for AhciBlockDevice {
     }
 
     fn read_blocks(&mut self, lba: u64, count: u32, buffer: &mut [u8]) -> Result<(), BlockError> {
-        self.validate_read(lba, count, buffer)?;
+        self.validate_io(lba, count, buffer)?;
         // Safety: pointer valid for firmware lifetime; no overlapping &mut created
         let controller = unsafe {
             &mut *ahci::get_controller(self.controller_id).ok_or(BlockError::DeviceError)?
@@ -355,12 +373,23 @@ impl BlockDevice for UsbBlockDevice {
     }
 
     fn read_blocks(&mut self, lba: u64, count: u32, buffer: &mut [u8]) -> Result<(), BlockError> {
-        self.validate_read(lba, count, buffer)?;
+        self.validate_io(lba, count, buffer)?;
         // Read all sectors in a single call — global_read_sectors supports
         // multi-sector reads by inferring sector count from buffer size.
         let total_bytes = count as usize * self.info.block_size as usize;
         usb::mass_storage::global_read_sectors(lba, &mut buffer[..total_bytes])
             .map_err(|()| BlockError::DeviceError)
+    }
+
+    fn write_blocks(&mut self, lba: u64, count: u32, buffer: &[u8]) -> Result<(), BlockError> {
+        self.validate_io(lba, count, buffer)?;
+        let total_bytes = count as usize * self.info.block_size as usize;
+        usb::mass_storage::global_write_sectors(lba, &buffer[..total_bytes])
+            .map_err(|()| BlockError::DeviceError)
+    }
+
+    fn flush(&mut self) -> Result<(), BlockError> {
+        usb::mass_storage::global_flush().map_err(|()| BlockError::DeviceError)
     }
 }
 
@@ -403,7 +432,7 @@ impl SdhciBlockDevice {
                 block_size,
                 media_id,
                 removable,
-                read_only: false,
+                read_only: true,
             },
         }
     }
@@ -420,7 +449,7 @@ impl BlockDevice for SdhciBlockDevice {
     }
 
     fn read_blocks(&mut self, lba: u64, count: u32, buffer: &mut [u8]) -> Result<(), BlockError> {
-        self.validate_read(lba, count, buffer)?;
+        self.validate_io(lba, count, buffer)?;
         // Safety: pointer valid for firmware lifetime; no overlapping &mut created
         let controller = unsafe {
             &mut *sdhci::get_controller(self.controller_id).ok_or(BlockError::DeviceError)?
@@ -460,7 +489,7 @@ impl<'a> BlockDevice for NvmeDisk<'a> {
                 block_size: ns.block_size,
                 media_id: 0,
                 removable: false,
-                read_only: false,
+                read_only: true,
             }
         } else {
             BlockDeviceInfo {
@@ -474,7 +503,7 @@ impl<'a> BlockDevice for NvmeDisk<'a> {
     }
 
     fn read_blocks(&mut self, lba: u64, count: u32, buffer: &mut [u8]) -> Result<(), BlockError> {
-        self.validate_read(lba, count, buffer)?;
+        self.validate_io(lba, count, buffer)?;
         self.controller
             .read_sectors(self.nsid, lba, count, buffer.as_mut_ptr())
             .map_err(BlockError::from)
@@ -505,7 +534,7 @@ impl<'a> BlockDevice for AhciDisk<'a> {
                 block_size: port_info.sector_size,
                 media_id: 0,
                 removable: false,
-                read_only: false,
+                read_only: true,
             }
         } else {
             BlockDeviceInfo {
@@ -519,7 +548,7 @@ impl<'a> BlockDevice for AhciDisk<'a> {
     }
 
     fn read_blocks(&mut self, lba: u64, count: u32, buffer: &mut [u8]) -> Result<(), BlockError> {
-        self.validate_read(lba, count, buffer)?;
+        self.validate_io(lba, count, buffer)?;
         // Safety: buffer.as_mut_ptr() is valid for buffer.len() bytes
         unsafe {
             self.controller
@@ -560,7 +589,7 @@ impl<'a> BlockDevice for UsbDisk<'a> {
     }
 
     fn read_blocks(&mut self, lba: u64, count: u32, buffer: &mut [u8]) -> Result<(), BlockError> {
-        self.validate_read(lba, count, buffer)?;
+        self.validate_io(lba, count, buffer)?;
         self.device
             .read_sectors_generic(self.controller, lba, count, buffer)
             .map_err(BlockError::from)
@@ -589,12 +618,12 @@ impl<'a> BlockDevice for SdhciDisk<'a> {
             block_size: self.controller.block_size(),
             media_id: 0,
             removable: self.controller.removable(),
-            read_only: false,
+            read_only: true,
         }
     }
 
     fn read_blocks(&mut self, lba: u64, count: u32, buffer: &mut [u8]) -> Result<(), BlockError> {
-        self.validate_read(lba, count, buffer)?;
+        self.validate_io(lba, count, buffer)?;
         self.controller
             .read_sectors(lba, count, buffer.as_mut_ptr())
             .map_err(BlockError::from)
@@ -636,6 +665,22 @@ impl BlockDevice for AnyBlockDevice {
             AnyBlockDevice::Ahci(dev) => dev.read_blocks(lba, count, buffer),
             AnyBlockDevice::Usb(dev) => dev.read_blocks(lba, count, buffer),
             AnyBlockDevice::Sdhci(dev) => dev.read_blocks(lba, count, buffer),
+        }
+    }
+
+    fn write_blocks(&mut self, lba: u64, count: u32, buffer: &[u8]) -> Result<(), BlockError> {
+        match self {
+            AnyBlockDevice::Nvme(dev) => dev.write_blocks(lba, count, buffer),
+            AnyBlockDevice::Ahci(dev) => dev.write_blocks(lba, count, buffer),
+            AnyBlockDevice::Usb(dev) => dev.write_blocks(lba, count, buffer),
+            AnyBlockDevice::Sdhci(dev) => dev.write_blocks(lba, count, buffer),
+        }
+    }
+
+    fn flush(&mut self) -> Result<(), BlockError> {
+        match self {
+            AnyBlockDevice::Usb(dev) => dev.flush(),
+            _ => Ok(()),
         }
     }
 }
