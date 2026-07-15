@@ -574,7 +574,7 @@ for %i in 0 1 2 3 4 5 6 7 8 9 A B C D E F
   if exist FS%i:\Sct\SCT.efi then
     FS%i:
     cd Sct
-    Sct -s smoke.seq
+    Sct -s smoke.seq -v
     echo CRABEFI_SCT_SMOKE_DONE
     reset -s
     goto Done

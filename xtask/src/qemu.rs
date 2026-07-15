@@ -1239,6 +1239,14 @@ pub fn run_uefi_sct_smoke_tests(config: &QemuConfig, disk_path: &Path) -> Result
     let mut passed = 0;
     let mut failed = 0;
 
+    if summary_log.as_ref().is_some_and(|summary| !summary.trim().is_empty()) {
+        println!("[PASS] summary_log: Overall/Summary.log is non-empty");
+        passed += 1;
+    } else {
+        println!("[FAIL] summary_log: Overall/Summary.log is missing or empty");
+        failed += 1;
+    }
+
     if result.output.contains("CRABEFI_SCT_SMOKE_START") {
         println!("[PASS] sct_started: startup.nsh launched SCT smoke run");
         passed += 1;
@@ -1319,11 +1327,11 @@ pub fn run_uefi_sct_smoke_tests(config: &QemuConfig, disk_path: &Path) -> Result
         failed += 1;
     }
 
-    if combined.contains("Done!") || combined.contains("CRABEFI_SCT_SMOKE_DONE") {
-        println!("[PASS] sct_done: SCT reached a completion marker");
+    if combined.contains("Done!") {
+        println!("[PASS] sct_done: SCT printed Done!");
         passed += 1;
     } else {
-        println!("[FAIL] sct_done: SCT did not reach a completion marker");
+        println!("[FAIL] sct_done: SCT did not print Done!");
         failed += 1;
     }
 
