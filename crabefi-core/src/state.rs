@@ -91,6 +91,7 @@ static IN_WITH_MUT: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicB
 /// - Must only be called once, at the start of `init()`
 /// - The `state` reference must remain valid for the entire firmware lifetime
 /// - The firmware must be single-threaded
+#[allow(unused_unsafe)]
 pub unsafe fn init(state: &mut FirmwareState) {
     // SAFETY: The caller guarantees that `state` remains valid for the
     // firmware lifetime and no other state has been installed.
@@ -112,6 +113,7 @@ pub fn is_initialized() -> bool {
 ///
 /// The new pointer must point to valid `FirmwareState` memory that has been
 /// remapped by the OS.
+#[allow(unused_unsafe)]
 pub unsafe fn relocate_state_ptr(new_ptr: *mut FirmwareState) {
     // SAFETY: The caller guarantees that `new_ptr` is the runtime-mapped
     // address of the installed firmware state.
@@ -294,7 +296,7 @@ use crate::efi::tcg::types::TaggedDigest;
 use r_efi::efi::{self, Guid, Handle};
 
 /// Maximum number of handles we can track
-pub const MAX_HANDLES: usize = 64;
+pub const MAX_HANDLES: usize = 128;
 
 /// Maximum number of protocols per handle
 pub const MAX_PROTOCOLS_PER_HANDLE: usize = 8;
@@ -303,7 +305,7 @@ pub const MAX_PROTOCOLS_PER_HANDLE: usize = 8;
 pub const MAX_EVENTS: usize = 32;
 
 /// Maximum number of loaded images we can track
-pub const MAX_LOADED_IMAGES: usize = 16;
+pub const MAX_LOADED_IMAGES: usize = 128;
 
 /// Maximum number of configuration tables
 pub const MAX_CONFIG_TABLES: usize = 24;
@@ -640,6 +642,9 @@ pub struct EfiState {
     /// Variable store persistence state (SMMSTORE tracking)
     pub varstore: VarStoreState,
 
+    /// Human Interface Infrastructure package database
+    pub hii: crate::efi::protocols::hii::State,
+
     /// Memory allocator
     pub allocator: MemoryAllocator,
 
@@ -682,6 +687,7 @@ impl EfiState {
             config_table_count: 0,
             variables: Vec::new(),
             varstore: VarStoreState::new(),
+            hii: crate::efi::protocols::hii::State::new(),
             allocator: MemoryAllocator::new(),
             monotonic_count: 0,
             ready_to_boot_signaled: false,

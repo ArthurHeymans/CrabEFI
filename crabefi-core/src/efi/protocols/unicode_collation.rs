@@ -56,31 +56,35 @@ pub struct UnicodeCollationProtocol {
     pub supported_languages: *const Char8,
 }
 
-// Static storage for supported languages string
-// Note: Unicode Collation v1 uses ISO 639-2 three-letter codes (e.g., "eng")
-// Unicode Collation v2 uses RFC 4646 codes (e.g., "en")
-// We use "eng" which works for v1, and many v2 implementations accept it too
-static SUPPORTED_LANGUAGES: [u8; 4] = *b"eng\0";
+static V1_SUPPORTED_LANGUAGES: [u8; 4] = *b"eng\0";
+static V2_SUPPORTED_LANGUAGES: [u8; 3] = *b"en\0";
 
-/// Static protocol instance
-static mut UNICODE_COLLATION: UnicodeCollationProtocol = UnicodeCollationProtocol {
+static mut UNICODE_COLLATION_V1: UnicodeCollationProtocol = UnicodeCollationProtocol {
     stri_coll,
     metai_match,
     str_lwr,
     str_upr,
     fat_to_str,
     str_to_fat,
-    supported_languages: SUPPORTED_LANGUAGES.as_ptr() as *const Char8,
+    supported_languages: V1_SUPPORTED_LANGUAGES.as_ptr() as *const Char8,
 };
 
-/// Get the Unicode Collation Protocol
-pub fn get_protocol() -> *mut UnicodeCollationProtocol {
-    &raw mut UNICODE_COLLATION
+static mut UNICODE_COLLATION_V2: UnicodeCollationProtocol = UnicodeCollationProtocol {
+    stri_coll,
+    metai_match,
+    str_lwr,
+    str_upr,
+    fat_to_str,
+    str_to_fat,
+    supported_languages: V2_SUPPORTED_LANGUAGES.as_ptr() as *const Char8,
+};
+
+pub fn get_v1_protocol_void() -> *mut c_void {
+    (&raw mut UNICODE_COLLATION_V1).cast()
 }
 
-/// Get the protocol as a void pointer
-pub fn get_protocol_void() -> *mut c_void {
-    get_protocol() as *mut c_void
+pub fn get_v2_protocol_void() -> *mut c_void {
+    (&raw mut UNICODE_COLLATION_V2).cast()
 }
 
 // Convert a UTF-16 character to uppercase (ASCII only for now)
