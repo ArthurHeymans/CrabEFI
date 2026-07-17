@@ -4,6 +4,10 @@ A UEFI implementation written in Rust, designed as a reusable library with depen
 
 CrabEFI implements enough UEFI to boot Linux via shim/GRUB2 or systemd-boot on real hardware. It ships as a coreboot payload but its core is a platform-agnostic library that any firmware can link against.
 
+![CrabEFI graphical boot menu](docs/screenshot.jpg)
+
+*Graphical boot menu (`--features ui`), captured headlessly in QEMU with `./crabefi screenshot`.*
+
 ## Documentation
 
 See the [docs/](docs/README.md) directory:
