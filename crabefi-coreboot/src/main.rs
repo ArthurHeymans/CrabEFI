@@ -876,11 +876,8 @@ pub extern "C" fn rust_main(coreboot_table_ptr: u64) -> ! {
             crabefi::TpmEventLogConfig {
                 existing_log,
                 format,
-                // Probe for a hardware TPM at the standard x86 TIS address.
-                // On aarch64/riscv64, hardware TPM discovery is not yet supported.
-                #[cfg(target_arch = "x86_64")]
-                tpm2_device: crabefi::Tpm2DeviceConfig::TisMmio { base: 0xFED4_0000 },
-                #[cfg(not(target_arch = "x86_64"))]
+                // Hardware TPM transport is selected after ACPI namespace discovery.
+                // Coreboot's TPM log record does not describe the transport.
                 tpm2_device: crabefi::Tpm2DeviceConfig::None,
             }
         }),
@@ -919,6 +916,21 @@ pub extern "C" fn rust_main(coreboot_table_ptr: u64) -> ! {
     if let Some(rsdp) = crabefi::state::drivers().platform.acpi_rsdp {
         let acpi_info = unsafe { acpi::discover_platform(rsdp) };
         crabefi::state::with_drivers_mut(|d| d.acpi_info = acpi_info);
+
+        #[cfg(target_arch = "x86_64")]
+        if let Some(device) = ["MSFT0101", "PNP0C31"]
+            .iter()
+            .find_map(|hid| acpi_info.find_device(hid))
+            && device.mmio_base <= 0xfed4_0000
+            && device.mmio_base.saturating_add(device.mmio_size) > 0xfed4_0000
+        {
+            if let Some(ref mut tpm) = config.tpm_event_log {
+                tpm.tpm2_device = crabefi::Tpm2DeviceConfig::TisMmio { base: 0xfed4_0000 };
+            }
+            log::info!("ACPI exposes an MMIO TIS TPM at 0xfed40000");
+        } else {
+            log::info!("No ACPI MMIO TIS TPM resource; skipping unsafe probe");
+        }
 
         // PNP0D40 is generic SDHCI; only known AMD eMMC HIDs use this path.
         #[cfg(target_arch = "x86_64")]
