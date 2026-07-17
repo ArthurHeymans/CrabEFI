@@ -9,7 +9,7 @@ use core::sync::atomic::{AtomicBool, Ordering};
 use linked_list_allocator::LockedHeap;
 
 /// Heap size (2 MB should be sufficient for crypto operations and EFI state).
-const HEAP_SIZE: usize = 2 * 1024 * 1024;
+const HEAP_SIZE: usize = 4 * 1024 * 1024;
 
 /// Page size (4KB).
 const PAGE_SIZE: usize = 4096;
