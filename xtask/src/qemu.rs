@@ -478,6 +478,151 @@ pub fn run_qemu(config: &QemuConfig, disk_path: Option<&Path>) -> Result<()> {
     Ok(())
 }
 
+/// Boot headless QEMU and capture the emulated display once the UI is up.
+///
+/// Uses the QEMU human monitor over a unix socket: `screendump` works with
+/// `-display none`, so no compositor or windowing system is needed.  The
+/// moment to capture is detected by watching the serial log for the boot
+/// manager's menu messages.
+pub fn run_screenshot(
+    config: &QemuConfig,
+    disk_path: Option<&Path>,
+    out: &Path,
+    timeout_secs: u64,
+) -> Result<()> {
+    use std::time::Duration;
+
+    if !matches!(config.arch, Arch::X86_64) {
+        bail!("screenshot is currently only supported on x86_64");
+    }
+
+    // Create a temporary disk if none provided (same default as run_qemu)
+    let temp_disk;
+    let disk = if let Some(path) = disk_path {
+        path.to_path_buf()
+    } else {
+        temp_disk = tempfile::NamedTempFile::new()?;
+        crate::disk::create_test_disk(
+            temp_disk.path().to_string_lossy().as_ref(),
+            None,
+            config.arch,
+        )?;
+        temp_disk.path().to_path_buf()
+    };
+
+    let temp_dir = tempfile::tempdir()?;
+    let serial_log = temp_dir.path().join("serial.log");
+    let mon_sock = temp_dir.path().join("monitor.sock");
+    let ppm = temp_dir.path().join("capture.ppm");
+
+    let mut cmd = Command::new("qemu-system-x86_64");
+    cmd.args(["-machine", "q35"]);
+    cmd.args(["-bios", &config.coreboot_rom]);
+    cmd.args(["-m", "512M"]);
+    cmd.arg("-no-reboot");
+    // No display backend at all — the emulated VGA still exists and the
+    // monitor can screendump it.
+    cmd.args(["-display", "none"]);
+    // Serial to a file so we can watch for the menu marker.
+    cmd.args(["-serial", &format!("file:{}", serial_log.display())]);
+    // Human monitor on a unix socket for screendump.
+    cmd.args([
+        "-monitor",
+        &format!("unix:{},server,nowait", mon_sock.display()),
+    ]);
+    add_storage_args_x86_64(&mut cmd, config, &disk);
+    if !config.disable_kvm && is_kvm_available() {
+        cmd.args(["-enable-kvm", "-cpu", "host"]);
+    } else {
+        cmd.args(["-cpu", "max"]);
+    }
+    for arg in &config.extra_devices {
+        cmd.arg(arg);
+    }
+    cmd.stdin(Stdio::null());
+    cmd.stdout(Stdio::null());
+    cmd.stderr(Stdio::null());
+
+    let mut child = cmd.spawn().context("failed to start QEMU")?;
+
+    let result = capture_when_ready(
+        &mut child,
+        &serial_log,
+        &mon_sock,
+        &ppm,
+        out,
+        Duration::from_secs(timeout_secs),
+    );
+    cleanup_child(&mut child);
+    result
+}
+
+/// Wait for the UI marker on serial, then trigger `screendump` via the
+/// monitor socket and move the result to `out`.
+fn capture_when_ready(
+    child: &mut Child,
+    serial_log: &Path,
+    mon_sock: &Path,
+    ppm: &Path,
+    out: &Path,
+    timeout: std::time::Duration,
+) -> Result<()> {
+    use std::io::Write;
+    use std::os::unix::net::UnixStream;
+    use std::time::Instant;
+
+    let deadline = Instant::now() + timeout;
+    loop {
+        if Instant::now() > deadline {
+            bail!("timed out waiting for the UI (no menu marker on serial)");
+        }
+        if let Some(status) = child.try_wait()? {
+            bail!("QEMU exited before the UI appeared: {}", status);
+        }
+        if let Ok(text) = std::fs::read_to_string(serial_log) {
+            // ponytail: these two markers cover the boot menu and the
+            // no-media screen; add more markers for other screens.
+            if text.contains("Showing boot menu...") || text.contains("No bootable media found!")
+            {
+                break;
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+
+    // Let the UI finish its first full paint (the boot menu has a 5s
+    // countdown by default, so don't dawdle).
+    std::thread::sleep(std::time::Duration::from_millis(700));
+
+    let mut mon = UnixStream::connect(mon_sock).context("failed to connect QEMU monitor socket")?;
+    writeln!(mon, "screendump {}", ppm.display())?;
+    mon.flush()?;
+
+    for _ in 0..50 {
+        if ppm.exists() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    if !ppm.exists() {
+        bail!("screendump produced no file");
+    }
+
+    if out.extension().is_some_and(|e| e == "png") {
+        match Command::new("magick").arg(ppm).arg(out).status() {
+            Ok(s) if s.success() => {}
+            _ => {
+                std::fs::copy(ppm, out.with_extension("ppm"))?;
+                bail!("ImageMagick 'magick' not found; wrote {} instead", out.with_extension("ppm").display());
+            }
+        }
+    } else {
+        std::fs::copy(ppm, out)?;
+    }
+    println!("Screenshot written to {}", out.display());
+    Ok(())
+}
+
 /// Run integration tests in QEMU
 pub fn run_tests(config: &QemuConfig, disk_path: &Path, app_name: &str) -> Result<()> {
     println!(
