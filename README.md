@@ -6,7 +6,10 @@ CrabEFI implements enough UEFI to boot Linux via shim/GRUB2 or systemd-boot on r
 
 ![CrabEFI graphical boot menu](docs/screenshot.jpg)
 
-*Graphical boot menu (`--features ui`), captured headlessly in QEMU with `./crabefi screenshot`.*
+*Graphical boot menu (`--features ui`), captured headlessly with
+`./crabefi screenshot --app hello --out screenshot.png`. The command writes PPM
+directly or converts to PNG with ImageMagick; the referenced JPG was produced
+from that PNG with ImageMagick.*
 
 ## Documentation
 

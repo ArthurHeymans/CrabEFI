@@ -186,16 +186,16 @@ enum Commands {
 
         /// Test app to place on the boot disk (gives the menu real entries,
         /// e.g. --app hello). Without it the no-media screen is captured.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "disk")]
         app: Option<String>,
 
         /// Path to an existing disk image to boot from
-        #[arg(long)]
+        #[arg(long, conflicts_with = "app")]
         disk: Option<String>,
 
         /// Seconds to wait for the UI before giving up
         #[arg(long, default_value_t = 90)]
-        timeout: u64,
+        timeout_s: u64,
 
         /// Disable KVM acceleration
         #[arg(long)]
@@ -293,9 +293,9 @@ fn main() -> Result<()> {
             out,
             app,
             disk,
-            timeout,
+            timeout_s,
             disable_kvm,
-        } => cmd_screenshot(&out, app, disk, timeout, disable_kvm, arch, machine),
+        } => cmd_screenshot(&out, app, disk, timeout_s, disable_kvm, arch, machine),
         Commands::BuildTestApp { name } => cmd_build_test_app(&name, arch),
         Commands::ListTestApps => cmd_list_test_apps(),
         Commands::CreateDisk { output, efi_app } => {
@@ -457,7 +457,7 @@ fn cmd_screenshot(
     out: &str,
     app: Option<String>,
     disk: Option<String>,
-    timeout: u64,
+    timeout_s: u64,
     disable_kvm: bool,
     arch: Arch,
     machine: Machine,
@@ -475,7 +475,7 @@ fn cmd_screenshot(
         storage: qemu::StorageType::Usb,
         headless: true,
         disable_kvm,
-        timeout_secs: Some(timeout),
+        timeout_secs: Some(timeout_s),
         arch,
         machine,
         extra_devices: vec!["-device".to_string(), "usb-kbd,bus=xhci.0".to_string()],
@@ -483,7 +483,12 @@ fn cmd_screenshot(
     };
 
     if let Some(disk_path) = disk {
-        return qemu::run_screenshot(&config, Some(Path::new(&disk_path)), Path::new(out), timeout);
+        return qemu::run_screenshot(
+            &config,
+            Some(Path::new(&disk_path)),
+            Path::new(out),
+            timeout_s,
+        );
     }
 
     if let Some(app_name) = app {
@@ -492,10 +497,10 @@ fn cmd_screenshot(
         let efi_path = find_test_app_efi(&app_name, arch)?;
         let disk_path = temp_dir.path().join("test.img");
         disk::create_test_disk(disk_path.to_string_lossy().as_ref(), Some(&efi_path), arch)?;
-        return qemu::run_screenshot(&config, Some(&disk_path), Path::new(out), timeout);
+        return qemu::run_screenshot(&config, Some(&disk_path), Path::new(out), timeout_s);
     }
 
-    qemu::run_screenshot(&config, None, Path::new(out), timeout)
+    qemu::run_screenshot(&config, None, Path::new(out), timeout_s)
 }
 
 fn cmd_test(

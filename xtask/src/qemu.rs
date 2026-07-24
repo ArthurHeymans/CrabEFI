@@ -189,7 +189,7 @@ fn build_qemu_command_x86_64(config: &QemuConfig, disk_path: &Path) -> Result<Co
     }
 
     // Storage configuration
-    add_storage_args_x86_64(&mut cmd, config, disk_path);
+    add_storage_args_x86_64(&mut cmd, config, disk_path, false);
 
     // KVM acceleration
     if !config.disable_kvm && is_kvm_available() {
@@ -322,28 +322,43 @@ fn build_qemu_command_aarch64_virt(config: &QemuConfig, disk_path: &Path) -> Res
 }
 
 /// Add storage arguments for x86_64
-fn add_storage_args_x86_64(cmd: &mut Command, config: &QemuConfig, disk_path: &Path) {
+fn add_storage_args_x86_64(
+    cmd: &mut Command,
+    config: &QemuConfig,
+    disk_path: &Path,
+    snapshot: bool,
+) {
     let disk_path_str = disk_path.to_string_lossy();
+    let snapshot_arg = if snapshot { ",snapshot=on" } else { "" };
     match config.storage {
         StorageType::Usb => {
             cmd.args(["-device", "qemu-xhci,id=xhci"]);
             cmd.args([
                 "-drive",
-                &format!("file={},if=none,id=usbdisk,format=raw", disk_path_str),
+                &format!(
+                    "file={},if=none,id=usbdisk,format=raw{}",
+                    disk_path_str, snapshot_arg
+                ),
             ]);
             cmd.args(["-device", "usb-storage,drive=usbdisk,bus=xhci.0"]);
         }
         StorageType::Ahci => {
             cmd.args([
                 "-drive",
-                &format!("file={},if=none,id=disk0,format=raw", disk_path_str),
+                &format!(
+                    "file={},if=none,id=disk0,format=raw{}",
+                    disk_path_str, snapshot_arg
+                ),
             ]);
             cmd.args(["-device", "ide-hd,drive=disk0,bus=ide.0"]);
         }
         StorageType::Nvme => {
             cmd.args([
                 "-drive",
-                &format!("file={},if=none,id=nvme0,format=raw", disk_path_str),
+                &format!(
+                    "file={},if=none,id=nvme0,format=raw{}",
+                    disk_path_str, snapshot_arg
+                ),
             ]);
             cmd.args(["-device", "nvme,serial=deadbeef,drive=nvme0"]);
         }
@@ -351,7 +366,10 @@ fn add_storage_args_x86_64(cmd: &mut Command, config: &QemuConfig, disk_path: &P
             cmd.args(["-device", "sdhci-pci"]);
             cmd.args([
                 "-drive",
-                &format!("file={},if=none,id=sddrive0,format=raw", disk_path_str),
+                &format!(
+                    "file={},if=none,id=sddrive0,format=raw{}",
+                    disk_path_str, snapshot_arg
+                ),
             ]);
             cmd.args(["-device", "sd-card,drive=sddrive0"]);
         }
@@ -496,6 +514,14 @@ pub fn run_screenshot(
         bail!("screenshot is currently only supported on x86_64");
     }
 
+    let extension = out
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(str::to_ascii_lowercase);
+    if !matches!(extension.as_deref(), Some("png" | "ppm")) {
+        bail!("screenshot output must have a .png or .ppm extension");
+    }
+
     // Create a temporary disk if none provided (same default as run_qemu)
     let temp_disk;
     let disk = if let Some(path) = disk_path {
@@ -530,7 +556,7 @@ pub fn run_screenshot(
         "-monitor",
         &format!("unix:{},server,nowait", mon_sock.display()),
     ]);
-    add_storage_args_x86_64(&mut cmd, config, &disk);
+    add_storage_args_x86_64(&mut cmd, config, &disk, disk_path.is_some());
     if !config.disable_kvm && is_kvm_available() {
         cmd.args(["-enable-kvm", "-cpu", "host"]);
     } else {
@@ -567,7 +593,7 @@ fn capture_when_ready(
     out: &Path,
     timeout: std::time::Duration,
 ) -> Result<()> {
-    use std::io::Write;
+    use std::io::{ErrorKind, Read, Write};
     use std::os::unix::net::UnixStream;
     use std::time::Instant;
 
@@ -595,20 +621,44 @@ fn capture_when_ready(
     std::thread::sleep(std::time::Duration::from_millis(700));
 
     let mut mon = UnixStream::connect(mon_sock).context("failed to connect QEMU monitor socket")?;
+    mon.set_read_timeout(Some(std::time::Duration::from_secs(5)))?;
+
+    let mut response = Vec::new();
+    let mut buffer = [0_u8; 1024];
+    while !response.ends_with(b"(qemu) ") {
+        match mon.read(&mut buffer) {
+            Ok(0) => bail!("QEMU monitor closed before becoming ready"),
+            Ok(count) => response.extend_from_slice(&buffer[..count]),
+            Err(error) if matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
+                bail!("timed out waiting for the QEMU monitor prompt")
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+
     writeln!(mon, "screendump {}", ppm.display())?;
     mon.flush()?;
 
-    for _ in 0..50 {
-        if ppm.exists() {
-            break;
+    response.clear();
+    while !response.ends_with(b"(qemu) ") {
+        match mon.read(&mut buffer) {
+            Ok(0) => bail!("QEMU monitor closed before screendump completed"),
+            Ok(count) => response.extend_from_slice(&buffer[..count]),
+            Err(error) if matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
+                bail!("timed out waiting for screendump to complete")
+            }
+            Err(error) => return Err(error.into()),
         }
-        std::thread::sleep(std::time::Duration::from_millis(100));
     }
-    if !ppm.exists() {
-        bail!("screendump produced no file");
+    if !ppm.is_file() || ppm.metadata()?.len() == 0 {
+        bail!("screendump produced no image data");
     }
 
-    if out.extension().is_some_and(|e| e == "png") {
+    let extension = out
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(str::to_ascii_lowercase);
+    if extension.as_deref() == Some("png") {
         match Command::new("magick").arg(ppm).arg(out).status() {
             Ok(s) if s.success() => {}
             _ => {
@@ -616,8 +666,10 @@ fn capture_when_ready(
                 bail!("ImageMagick 'magick' not found; wrote {} instead", out.with_extension("ppm").display());
             }
         }
-    } else {
+    } else if extension.as_deref() == Some("ppm") {
         std::fs::copy(ppm, out)?;
+    } else {
+        bail!("screenshot output must have a .png or .ppm extension");
     }
     println!("Screenshot written to {}", out.display());
     Ok(())
@@ -1191,7 +1243,7 @@ fn run_qemu_with_capture_x86_64(
     cmd.args(["-mon", "chardev=char0,mode=readline"]);
 
     // Storage configuration
-    add_storage_args_x86_64(&mut cmd, config, disk_path);
+    add_storage_args_x86_64(&mut cmd, config, disk_path, false);
 
     // KVM acceleration
     if !config.disable_kvm && is_kvm_available() {
