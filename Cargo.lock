@@ -11,7 +11,7 @@ checksum = "bd8b2abd55bf1f9cffbf00fd594566c51a9d31402553284920c1309ca8351086"
 [[package]]
 name = "acpi"
 version = "6.1.1"
-source = "git+https://github.com/ArthurHeymans/acpi.git?rev=4f4adebf75234b52fe54c3e6e50c2cc13be41efe#4f4adebf75234b52fe54c3e6e50c2cc13be41efe"
+source = "git+https://github.com/rust-osdev/acpi.git?branch=main#f6e5b14c2f2a5b42a570bf823695f5d635f91763"
 dependencies = [
  "bit_field",
  "bitflags",
