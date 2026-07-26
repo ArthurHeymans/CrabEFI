@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # CrabEFI build and test wrapper
 #
 # This script runs the xtask build system on the host (not the firmware target).
