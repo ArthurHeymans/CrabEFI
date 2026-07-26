@@ -20,8 +20,11 @@
       {
         devShells.default = pkgs.mkShell {
           buildInputs = with pkgs; [
+            # Rust
+            rustup
+
             # QEMU and TPM emulator for testing
-            qemu_full
+            qemu
             swtpm
 
             # Disk image tools
@@ -41,12 +44,10 @@
           ];
 
           # Rust is managed by rustup via rust-toolchain.toml files
-          # Install rustup separately: https://rustup.rs/
           shellHook = ''
             echo "CrabEFI development environment"
             echo ""
-            echo "Rust is managed by rustup via rust-toolchain.toml files."
-            echo "If you don't have rustup, install it from https://rustup.rs/"
+            echo "Rust is managed by rustup via the rust-toolchain.toml file."
             echo ""
             echo "Run './crabefi --help' for build commands"
           '';
