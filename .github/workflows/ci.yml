@@ -79,7 +79,7 @@ jobs:
           printf '## x86_64 memory report\n\n- Reserved stack: %d KiB\n' "$((16#$stack_hex / 1024))" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload CrabEFI ELF
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: crabefi-elf
           path: target/x86_64-unknown-none/release/crabefi
@@ -336,7 +336,7 @@ jobs:
         run: ci/build-boot-assets.sh --arch x86_64
 
       - name: Upload boot assets
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: boot-assets-x86_64
           path: boot-assets/x86_64/
@@ -373,7 +373,7 @@ jobs:
         run: ci/build-boot-assets.sh --arch aarch64
 
       - name: Upload boot assets
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: boot-assets-aarch64
           path: boot-assets/aarch64/
@@ -484,7 +484,7 @@ jobs:
         run: cargo build -p crabefi-coreboot --release --target aarch64-unknown-none
 
       - name: Upload CrabEFI ELF (aarch64)
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: crabefi-elf-aarch64
           path: target/aarch64-unknown-none/release/crabefi
@@ -569,7 +569,7 @@ jobs:
         run: PAYLOAD_BASE=0x62000000 cargo build -p crabefi-coreboot --release --target aarch64-unknown-none
 
       - name: Upload CrabEFI ELF (aarch64-virt)
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: crabefi-elf-aarch64-virt
           path: target/aarch64-unknown-none/release/crabefi
@@ -670,7 +670,7 @@ jobs:
           fi
 
       - name: Upload CrabEFI ELF (riscv64)
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: crabefi-elf-riscv64
           path: target/riscv64gc-unknown-none-elf/release/crabefi
@@ -740,7 +740,7 @@ jobs:
         run: ci/build-boot-assets.sh --arch riscv64
 
       - name: Upload boot assets
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: boot-assets-riscv64
           path: boot-assets/riscv64/
