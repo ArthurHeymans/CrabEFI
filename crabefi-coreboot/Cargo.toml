@@ -19,7 +19,7 @@ crabefi-drivers = { path = "../crabefi-drivers" }
 # Needed for coreboot table parsing and early setup
 log = "0.4"
 r-efi = "5.3"
-heapless = "0.8"
+heapless = "0.9"
 zerocopy = { version = "0.8", default-features = false, features = ["derive"] }
 
 # ACPI table parsing and AML interpreter for platform device discovery.

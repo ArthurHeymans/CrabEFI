@@ -23,7 +23,7 @@ repository = "https://github.com/user/CrabEFI"
 [workspace.dependencies]
 r-efi = "5.3"
 log = "0.4"
-heapless = "0.8"
+heapless = "0.9"
 mem-barrier = "0.1"
 pci_types = "0.10"
 xhci = { git = "https://github.com/ArthurHeymans/xhci", rev = "ee9fb6e2c0fddc44e7b693378ca0b952ee056008" }
