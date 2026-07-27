@@ -313,7 +313,7 @@ jobs:
 
       - name: Restore cached boot assets
         id: cache
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: boot-assets/x86_64
           key: boot-assets-x86_64-${{ hashFiles('ci/build-boot-assets.sh') }}
@@ -350,7 +350,7 @@ jobs:
 
       - name: Restore cached boot assets
         id: cache
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: boot-assets/aarch64
           key: boot-assets-aarch64-${{ hashFiles('ci/build-boot-assets.sh') }}
@@ -717,7 +717,7 @@ jobs:
 
       - name: Restore cached boot assets
         id: cache
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: boot-assets/riscv64
           key: boot-assets-riscv64-${{ hashFiles('ci/build-boot-assets.sh') }}
