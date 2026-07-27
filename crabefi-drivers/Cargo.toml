@@ -11,7 +11,7 @@ crabefi = { package = "crabefi-core", path = "../crabefi-core" }
 log = { workspace = true }
 bitflags = "2"
 heapless = { workspace = true }
-spin = "0.9"
+spin = "0.12"
 tock-registers = "0.10"
 zerocopy = { version = "0.8", default-features = false, features = ["derive"] }
 
