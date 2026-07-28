@@ -3,6 +3,14 @@
 # Linker scripts are handled by crabefi-coreboot/build.rs.
 # Build-std is passed by xtask so host-side Cargo commands remain unaffected.
 
+[build]
+# Every workspace member is firmware and cannot link for the host triple, so
+# default to the x86_64 payload target. This keeps plain `cargo build`,
+# `cargo check`, and `cargo clippy` working; pass --target for the other
+# architectures. Sub-projects that need a different default override this in
+# their own .cargo/config.toml (xtask -> host, test-apps -> *-unknown-uefi).
+target = "x86_64-unknown-none"
+
 [target.x86_64-unknown-none]
 rustflags = [
     "-C", "relocation-model=pic",
