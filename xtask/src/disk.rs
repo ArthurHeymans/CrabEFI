@@ -590,6 +590,7 @@ reset -s
 
     create_mtools_dir(&disk_with_offset, "::/Sct")?;
     copy_tree_to_esp(&disk_with_offset, sct_dir, "::/Sct")?;
+    write_text_file_to_esp(&disk_with_offset, "::/Sct/.passive.mode", "\n")?;
 
     create_mtools_dir(&disk_with_offset, "::/Sct/Sequence")?;
     write_text_file_to_esp(

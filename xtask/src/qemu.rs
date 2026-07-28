@@ -1364,7 +1364,27 @@ fn extract_sct_log(disk_path: &Path, src: &str) -> Result<Option<String>> {
         return Ok(None);
     }
 
-    Ok(Some(fs::read_to_string(dest)?))
+    let bytes = fs::read(dest)?;
+    let utf16_le = bytes.starts_with(&[0xff, 0xfe])
+        || bytes
+            .iter()
+            .skip(1)
+            .step_by(2)
+            .filter(|byte| **byte == 0)
+            .count()
+            > bytes.len() / 8;
+    let text = if utf16_le {
+        let start = if bytes.starts_with(&[0xff, 0xfe]) { 2 } else { 0 };
+        String::from_utf16_lossy(
+            &bytes[start..]
+                .chunks_exact(2)
+                .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+                .collect::<Vec<_>>(),
+        )
+    } else {
+        String::from_utf8_lossy(&bytes).into_owned()
+    };
+    Ok(Some(text))
 }
 
 /// Run QEMU and capture serial output
