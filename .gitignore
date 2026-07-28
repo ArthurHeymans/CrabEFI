@@ -7,6 +7,7 @@ test-disk.img
 test-security-disk.img
 test/*.efi
 /boot-assets/
+/sct-assets/
 
 # IDE/Editor
 .idea/

@@ -170,6 +170,7 @@ pub fn init_from_platform(config: &mut crate::platform::PlatformConfig) {
 /// protocol installations and table finalization that are identical in both
 /// paths.
 fn install_standard_protocols_and_finalize() {
+    init_hii();
     init_unicode_collation();
     init_memory_attribute();
     init_serial_io();
@@ -485,10 +486,46 @@ fn init_console() -> Option<efi::Handle> {
     Some(console_handle)
 }
 
+/// Initialize the HII Database and String protocols required by UEFI applications.
+fn init_hii() {
+    use r_efi::protocols::{hii_database, hii_string};
+
+    let handle = match boot_services::create_handle() {
+        Some(handle) => handle,
+        None => {
+            log::error!("Failed to create HII protocol handle");
+            return;
+        }
+    };
+
+    let status = boot_services::install_protocol(
+        handle,
+        &hii_database::PROTOCOL_GUID,
+        protocols::hii::database_protocol(),
+    );
+    if status != Status::SUCCESS {
+        log::error!("Failed to install HII Database protocol: {:?}", status);
+        return;
+    }
+
+    let status = boot_services::install_protocol(
+        handle,
+        &hii_string::PROTOCOL_GUID,
+        protocols::hii::string_protocol(),
+    );
+    if status != Status::SUCCESS {
+        log::error!("Failed to install HII String protocol: {:?}", status);
+        return;
+    }
+
+    log::info!("HII Database and String protocols installed");
+}
+
 /// Initialize Unicode Collation protocol
 fn init_unicode_collation() {
     use protocols::unicode_collation::{
-        UNICODE_COLLATION_PROTOCOL_GUID, UNICODE_COLLATION_PROTOCOL2_GUID, get_protocol_void,
+        UNICODE_COLLATION_PROTOCOL_GUID, UNICODE_COLLATION_PROTOCOL2_GUID, get_v1_protocol_void,
+        get_v2_protocol_void,
     };
 
     // Create a handle for Unicode Collation
@@ -501,9 +538,11 @@ fn init_unicode_collation() {
     };
 
     // Install version 1 (legacy) protocol
-    let protocol = get_protocol_void();
-    let status =
-        boot_services::install_protocol(handle, &UNICODE_COLLATION_PROTOCOL_GUID, protocol);
+    let status = boot_services::install_protocol(
+        handle,
+        &UNICODE_COLLATION_PROTOCOL_GUID,
+        get_v1_protocol_void(),
+    );
     if status != Status::SUCCESS {
         log::error!(
             "Failed to install Unicode Collation v1 protocol: {:?}",
@@ -512,8 +551,11 @@ fn init_unicode_collation() {
     }
 
     // Install version 2 protocol
-    let status =
-        boot_services::install_protocol(handle, &UNICODE_COLLATION_PROTOCOL2_GUID, protocol);
+    let status = boot_services::install_protocol(
+        handle,
+        &UNICODE_COLLATION_PROTOCOL2_GUID,
+        get_v2_protocol_void(),
+    );
     if status != Status::SUCCESS {
         log::error!(
             "Failed to install Unicode Collation v2 protocol: {:?}",

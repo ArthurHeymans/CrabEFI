@@ -14,8 +14,8 @@ use super::protocols::loaded_image::{LOADED_IMAGE_PROTOCOL_GUID, create_loaded_i
 use super::system_table;
 use crate::pe;
 use crate::state::{
-    self, EventEntry, LoadedImageEntry, MAX_EVENTS, MAX_HANDLES, MAX_PROTOCOLS_PER_HANDLE,
-    ProtocolEntry,
+    self, EventEntry, HandleEntry, LoadedImageEntry, MAX_EVENTS, MAX_HANDLES,
+    MAX_PROTOCOLS_PER_HANDLE, ProtocolEntry,
 };
 use alloc::vec::Vec;
 use core::ffi::c_void;
@@ -274,8 +274,8 @@ extern "efiapi" fn allocate_pool(
     }
 
     let mem_type = match MemoryType::try_from(pool_type) {
-        Ok(t) => t,
-        Err(_) => return Status::INVALID_PARAMETER,
+        Ok(MemoryType::PersistentMemory) | Err(_) => return Status::INVALID_PARAMETER,
+        Ok(memory_type) => memory_type,
     };
 
     match allocator::allocate_pool(mem_type, size) {
@@ -875,11 +875,45 @@ extern "efiapi" fn reinstall_protocol_interface(
 }
 
 extern "efiapi" fn uninstall_protocol_interface(
-    _handle: Handle,
-    _protocol: *mut Guid,
-    _interface: *mut c_void,
+    handle: Handle,
+    protocol: *mut Guid,
+    interface: *mut c_void,
 ) -> Status {
-    Status::NOT_FOUND
+    if handle.is_null() || protocol.is_null() {
+        return Status::INVALID_PARAMETER;
+    }
+
+    let guid = unsafe { *protocol };
+    state::with_efi_mut(|efi_state| {
+        let Some(handle_index) = efi_state.handles[..efi_state.handle_count]
+            .iter()
+            .position(|entry| entry.handle == handle)
+        else {
+            return Status::NOT_FOUND;
+        };
+        let entry = &mut efi_state.handles[handle_index];
+        let Some(protocol_index) = entry.protocols[..entry.protocol_count]
+            .iter()
+            .position(|entry| entry.guid == guid && entry.interface == interface)
+        else {
+            return Status::NOT_FOUND;
+        };
+
+        entry
+            .protocols
+            .copy_within(protocol_index + 1..entry.protocol_count, protocol_index);
+        entry.protocol_count -= 1;
+        entry.protocols[entry.protocol_count] = ProtocolEntry::empty();
+
+        if entry.protocol_count == 0 {
+            efi_state
+                .handles
+                .swap(handle_index, efi_state.handle_count - 1);
+            efi_state.handle_count -= 1;
+            efi_state.handles[efi_state.handle_count] = HandleEntry::empty();
+        }
+        Status::SUCCESS
+    })
 }
 
 extern "efiapi" fn handle_protocol(
@@ -1276,8 +1310,12 @@ extern "efiapi" fn load_image(
         Some(h) => h,
         None => {
             log::error!("BS.LoadImage: Failed to create handle");
-            pe::unload_image(&loaded_image);
-            return Status::OUT_OF_RESOURCES;
+            let cleanup_status = pe::unload_image(&loaded_image);
+            return if cleanup_status == Status::SUCCESS {
+                Status::OUT_OF_RESOURCES
+            } else {
+                cleanup_status
+            };
         }
     };
 
@@ -1303,8 +1341,17 @@ extern "efiapi" fn load_image(
         if let Some(measurement) = deferred_measurement {
             let _ = allocator::free_pool(measurement.event_data);
         }
-        pe::unload_image(&loaded_image);
-        return Status::OUT_OF_RESOURCES;
+        remove_handle_entry(new_handle);
+        let cleanup_status = pe::unload_image(&loaded_image);
+        return if cleanup_status == Status::SUCCESS {
+            Status::OUT_OF_RESOURCES
+        } else {
+            cleanup_status
+        };
+    }
+
+    unsafe {
+        super::protocols::loaded_image::set_image_subsystem(loaded_image_protocol, image_subsystem);
     }
 
     // Set the device path on the loaded image if provided
@@ -1329,8 +1376,15 @@ extern "efiapi" fn load_image(
         if let Some(measurement) = deferred_measurement {
             let _ = allocator::free_pool(measurement.event_data);
         }
-        pe::unload_image(&loaded_image);
-        return status;
+        unsafe { super::protocols::loaded_image::free_file_path(loaded_image_protocol) };
+        let _ = allocator::free_pool(loaded_image_protocol.cast::<u8>());
+        remove_handle_entry(new_handle);
+        let cleanup_status = pe::unload_image(&loaded_image);
+        return if cleanup_status == Status::SUCCESS {
+            status
+        } else {
+            cleanup_status
+        };
     }
 
     // Store the loaded image info so StartImage can find it
@@ -1369,8 +1423,19 @@ extern "efiapi" fn load_image(
         if let Some(measurement) = deferred_measurement {
             let _ = allocator::free_pool(measurement.event_data);
         }
-        pe::unload_image(&loaded_image);
-        return Status::OUT_OF_RESOURCES;
+        let _ = uninstall_protocol_interface(
+            new_handle,
+            &LOADED_IMAGE_PROTOCOL_GUID as *const Guid as *mut Guid,
+            loaded_image_protocol.cast(),
+        );
+        unsafe { super::protocols::loaded_image::free_file_path(loaded_image_protocol) };
+        let _ = allocator::free_pool(loaded_image_protocol.cast::<u8>());
+        let cleanup_status = pe::unload_image(&loaded_image);
+        return if cleanup_status == Status::SUCCESS {
+            Status::OUT_OF_RESOURCES
+        } else {
+            cleanup_status
+        };
     }
 
     // Return the new handle
@@ -1542,56 +1607,65 @@ extern "efiapi" fn unload_image(image_handle: Handle) -> Status {
         return Status::INVALID_PARAMETER;
     }
 
-    // Find and remove the loaded image entry
-    let image_info = state::with_efi_mut(|efi_state| {
-        efi_state
+    let loaded_image_protocol =
+        get_protocol_on_handle(image_handle, &LOADED_IMAGE_PROTOCOL_GUID).cast::<u8>();
+
+    let image_info = state::efi()
+        .loaded_images
+        .iter()
+        .find(|entry| entry.handle == image_handle)
+        .map(|entry| {
+            (
+                entry.alloc_base,
+                entry.num_pages,
+                entry.measurement_event_data,
+            )
+        });
+
+    let Some((alloc_base, num_pages, measurement_event_data)) = image_info else {
+        log::warn!(
+            "BS.UnloadImage: handle {:?} not found in loaded images",
+            image_handle
+        );
+        return Status::INVALID_PARAMETER;
+    };
+
+    // Do not discard lifecycle state until the image allocation is reclaimed.
+    let status = allocator::free_pages(alloc_base, num_pages);
+    if status != Status::SUCCESS {
+        log::warn!(
+            "BS.UnloadImage: Failed to free pages at {:#x}: {:?}",
+            alloc_base,
+            status
+        );
+        return status;
+    }
+
+    state::with_efi_mut(|efi_state| {
+        if let Some(entry) = efi_state
             .loaded_images
             .iter_mut()
             .find(|entry| entry.handle == image_handle)
-            .map(|entry| {
-                let result = (
-                    entry.alloc_base,
-                    entry.num_pages,
-                    entry.measurement_event_data,
-                );
-                // Clear the entry
-                *entry = LoadedImageEntry::empty();
-                result
-            })
+        {
+            *entry = LoadedImageEntry::empty();
+        }
     });
+    remove_handle_entry(image_handle);
 
-    match image_info {
-        Some((alloc_base, num_pages, measurement_event_data)) => {
-            // Free the image memory (using alloc_base, not image_base,
-            // since the image may have been aligned within the allocation)
-            let status = allocator::free_pages(alloc_base, num_pages);
-            if status != Status::SUCCESS {
-                log::warn!(
-                    "BS.UnloadImage: Failed to free pages at {:#x}: {:?}",
-                    alloc_base,
-                    status
-                );
-            }
-
-            if !measurement_event_data.is_null() {
-                let _ = allocator::free_pool(measurement_event_data);
-            }
-
-            // Remove protocols from the handle
-            // Note: In a full implementation, we should uninstall all protocols
-            // For now, we just log success
-            log::debug!("BS.UnloadImage: SUCCESS");
-            Status::SUCCESS
-        }
-        None => {
-            log::warn!(
-                "BS.UnloadImage: handle {:?} not found in loaded images",
-                image_handle
-            );
-            // Return success anyway - the handle might have been loaded differently
-            Status::SUCCESS
-        }
+    if !measurement_event_data.is_null() {
+        let _ = allocator::free_pool(measurement_event_data);
     }
+    if !loaded_image_protocol.is_null() {
+        unsafe {
+            super::protocols::loaded_image::free_file_path(
+                loaded_image_protocol.cast::<r_efi::protocols::loaded_image::Protocol>(),
+            )
+        };
+        let _ = allocator::free_pool(loaded_image_protocol);
+    }
+
+    log::debug!("BS.UnloadImage: SUCCESS");
+    Status::SUCCESS
 }
 
 extern "efiapi" fn exit_boot_services(image_handle: Handle, map_key: usize) -> Status {
@@ -2240,26 +2314,38 @@ extern "efiapi" fn uninstall_multiple_protocol_interfaces(
     }
 
     let args = [(arg1, arg2), (arg3, arg4), (arg5, arg6), (arg7, arg8)];
+    let pair_count = args.iter().take_while(|(guid, _)| !guid.is_null()).count();
 
-    // Uninstall each protocol
-    for (guid_ptr, _) in args.iter().take_while(|(g, _)| !g.is_null()) {
-        let guid = unsafe { *(*guid_ptr as *const Guid) };
-        log::debug!("  Uninstalling protocol: {}", GuidFmt(guid));
-
-        // Find and remove the protocol from the handle
-        state::with_efi_mut(|efi_state| {
-            if let Some(entry) = efi_state.handles[..efi_state.handle_count]
-                .iter_mut()
-                .find(|e| e.handle == handle)
-                && let Some(j) = entry.protocols[..entry.protocol_count]
-                    .iter()
-                    .position(|p| p.guid == guid)
-            {
-                // Remove by shifting remaining protocols down
-                entry.protocols.copy_within(j + 1..entry.protocol_count, j);
-                entry.protocol_count -= 1;
+    for (index, &(guid, interface)) in args[..pair_count].iter().enumerate() {
+        let status = uninstall_protocol_interface(handle, guid as *mut Guid, interface);
+        if status != Status::SUCCESS {
+            for &(rollback_guid, rollback_interface) in args[..index].iter().rev() {
+                // Uninstalling the last protocol auto-deletes the handle, so it
+                // has to be revived before earlier protocols can be restored.
+                if !restore_handle_entry(handle) {
+                    log::error!(
+                        "  Rollback failed: cannot restore handle {:?} (handle table full)",
+                        handle
+                    );
+                    break;
+                }
+                let mut rollback_handle = handle;
+                let rollback_status = install_protocol_interface(
+                    &mut rollback_handle,
+                    rollback_guid as *mut Guid,
+                    efi::NATIVE_INTERFACE,
+                    rollback_interface,
+                );
+                if rollback_status != Status::SUCCESS {
+                    log::error!(
+                        "  Rollback failed to reinstall protocol on {:?}: {:?}",
+                        handle,
+                        rollback_status
+                    );
+                }
             }
-        });
+            return status;
+        }
     }
 
     log::trace!("  -> SUCCESS");
@@ -2352,6 +2438,46 @@ pub fn create_handle() -> Option<Handle> {
 
         Some(handle)
     })
+}
+
+/// Re-create the bookkeeping entry for a handle that was auto-deleted when its
+/// last protocol went away.
+///
+/// Used by the `UninstallMultipleProtocolInterfaces` rollback path, which must
+/// be able to re-install protocols on the original handle value even though the
+/// handle was dropped in the middle of the batch.
+fn restore_handle_entry(handle: Handle) -> bool {
+    state::with_efi_mut(|efi_state| {
+        if efi_state.handles[..efi_state.handle_count]
+            .iter()
+            .any(|entry| entry.handle == handle)
+        {
+            return true;
+        }
+        if efi_state.handle_count >= MAX_HANDLES {
+            return false;
+        }
+        let idx = efi_state.handle_count;
+        efi_state.handles[idx] = HandleEntry::empty();
+        efi_state.handles[idx].handle = handle;
+        efi_state.handles[idx].protocol_count = 0;
+        efi_state.handle_count += 1;
+        true
+    })
+}
+
+fn remove_handle_entry(handle: Handle) {
+    state::with_efi_mut(|efi_state| {
+        let Some(index) = efi_state.handles[..efi_state.handle_count]
+            .iter()
+            .position(|entry| entry.handle == handle)
+        else {
+            return;
+        };
+        efi_state.handles.swap(index, efi_state.handle_count - 1);
+        efi_state.handle_count -= 1;
+        efi_state.handles[efi_state.handle_count] = HandleEntry::empty();
+    });
 }
 
 /// Install a protocol on an existing handle

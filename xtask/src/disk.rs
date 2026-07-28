@@ -3,7 +3,7 @@
 //! This module provides functionality to create GPT disk images with FAT32
 //! EFI System Partitions for testing CrabEFI.
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
@@ -33,6 +33,21 @@ const GPT_NUM_ENTRIES: u32 = 128;
 const ESP_TYPE_GUID: [u8; 16] = [
     0x28, 0x73, 0x2A, 0xC1, 0x1F, 0xF8, 0xD2, 0x11, 0xBA, 0x4B, 0x00, 0xA0, 0xC9, 0x3E, 0xC9, 0x3B,
 ];
+
+/// Return an mtools image specifier for the ESP inside a generated disk image.
+///
+/// # Arguments
+/// * `disk_path` - Path to the raw GPT disk image
+///
+/// # Returns
+/// An mtools `-i` argument that points at the ESP byte offset.
+pub fn mtools_esp_image(disk_path: &Path) -> String {
+    format!(
+        "{}@@{}",
+        disk_path.to_string_lossy(),
+        ESP_START_SECTOR * SECTOR_SIZE
+    )
+}
 
 /// Create a test disk image with GPT partition table and FAT32 ESP
 ///
@@ -510,6 +525,245 @@ pub fn create_grub_linux_disk(
 
     println!("Created: {}", output);
     Ok(())
+}
+
+/// Create a disk image for the UEFI SCT smoke test.
+///
+/// Disk layout:
+///   /EFI/BOOT/<BOOT_EFI>          EDK2 UEFI Shell
+///   /startup.nsh                  Shell script that launches SCT
+///   /Sct/...                      Contents of the SCT architecture directory
+///   /Sct/Sequence/smoke.seq       Minimal sequence file
+///
+/// # Arguments
+/// * `output` - Path for the output disk image
+/// * `shell_efi` - Path to a UEFI Shell binary for `arch`
+/// * `sct_dir` - Path to the SCT architecture directory, e.g. `SctPackageX64/X64`
+/// * `arch` - Target architecture
+///
+/// # Returns
+/// `Ok(())` when the disk image is created and populated.
+pub fn create_uefi_sct_smoke_disk(
+    output: &str,
+    shell_efi: &str,
+    sct_dir: &Path,
+    arch: Arch,
+) -> Result<()> {
+    if !Path::new(shell_efi).exists() {
+        bail!("UEFI Shell binary not found: {}", shell_efi);
+    }
+    if !sct_dir.join("SCT.efi").exists() {
+        bail!(
+            "SCT.efi not found in {}. Pass the architecture directory, e.g. SctPackageX64/X64",
+            sct_dir.display()
+        );
+    }
+
+    println!("Creating UEFI SCT smoke test disk: {}", output);
+    create_test_disk(output, Some(shell_efi), arch)?;
+
+    let disk_with_offset = mtools_esp_image(Path::new(output));
+
+    write_text_file_to_esp(
+        &disk_with_offset,
+        "::/startup.nsh",
+        r#"echo -off
+echo CRABEFI_SCT_SMOKE_START
+
+for %i in 0 1 2 3 4 5 6 7 8 9 A B C D E F
+  if exist FS%i:\Sct\SCT.efi then
+    FS%i:
+    cd Sct
+    Sct -s smoke.seq -v
+    echo CRABEFI_SCT_SMOKE_DONE
+    reset -s
+    goto Done
+  endif
+endfor
+
+echo CRABEFI_SCT_SMOKE_NOT_FOUND
+reset -s
+
+:Done
+"#,
+    )?;
+
+    create_mtools_dir(&disk_with_offset, "::/Sct")?;
+    copy_tree_to_esp(&disk_with_offset, sct_dir, "::/Sct")?;
+    write_text_file_to_esp(&disk_with_offset, "::/Sct/.passive.mode", "\n")?;
+
+    create_mtools_dir(&disk_with_offset, "::/Sct/Sequence")?;
+    write_text_file_to_esp(
+        &disk_with_offset,
+        "::/Sct/Sequence/smoke.seq",
+        UEFI_SCT_SMOKE_SEQUENCE,
+    )?;
+
+    println!("Installed UEFI Shell and SCT smoke sequence");
+    Ok(())
+}
+
+const UEFI_SCT_SMOKE_SEQUENCE: &str = r#"[Test Case]
+Revision   = 0x00010000
+Guid       = 539675B8-D9B3-4DC7-A8D0-FF19BBA13B86
+Name       = Stall_Func
+Order      = 0x00000000
+Iterations = 0x00000001
+
+[Test Case]
+Revision   = 0x00010000
+Guid       = 4397A610-8D5D-441B-8E7D-C23377F3EB67
+Name       = CopyMem_Func
+Order      = 0x00000001
+Iterations = 0x00000001
+
+[Test Case]
+Revision   = 0x00010000
+Guid       = 315BE343-A32D-461D-A3CC-5E6895CC2CBA
+Name       = SetMem_Func
+Order      = 0x00000002
+Iterations = 0x00000001
+
+[Test Case]
+Revision   = 0x00010000
+Guid       = B510F99F-FEE9-4AF6-BB0F-3C958EF7F166
+Name       = CalculateCrc32_Func
+Order      = 0x00000003
+Iterations = 0x00000001
+
+[Test Case]
+Revision   = 0x00010000
+Guid       = 90023546-6C92-430A-B253-70110D9EFDFF
+Name       = AllocatePool_Conf
+Order      = 0x00000004
+Iterations = 0x00000001
+
+[Test Case]
+Revision   = 0x00010000
+Guid       = 49709F9F-A4D8-42D6-A684-4975EE0099DB
+Name       = FreePool_Conf
+Order      = 0x00000005
+Iterations = 0x00000001
+"#;
+
+fn mtools_dir_exists(disk_with_offset: &str, path: &str) -> Result<bool> {
+    let output = Command::new("mdir")
+        .args(["-i", disk_with_offset, "-b", path])
+        .output()
+        .context("Failed to run mdir")?;
+    Ok(output.status.success())
+}
+
+fn create_mtools_dir(disk_with_offset: &str, path: &str) -> Result<()> {
+    // `mmd` fails when the directory already exists and offers no reliable way
+    // to tell that apart from a real failure, so probe first and only create
+    // when missing. Callers ensure parent directories repeatedly, so this needs
+    // to stay idempotent without swallowing genuine errors.
+    if mtools_dir_exists(disk_with_offset, path)? {
+        return Ok(());
+    }
+
+    let status = Command::new("mmd")
+        .args(["-i", disk_with_offset, path])
+        .status()
+        .context("Failed to run mmd")?;
+
+    if !status.success() {
+        // Tolerate a lost race / mtools quirk only when the directory is
+        // actually there afterwards.
+        if mtools_dir_exists(disk_with_offset, path)? {
+            return Ok(());
+        }
+        anyhow::bail!("mmd failed to create {path} ({status})");
+    }
+
+    Ok(())
+}
+
+fn copy_tree_to_esp(disk_with_offset: &str, source_dir: &Path, dest_dir: &str) -> Result<()> {
+    for entry in walkdir(source_dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        let rel = path.strip_prefix(source_dir)?;
+        if rel.as_os_str().is_empty() {
+            continue;
+        }
+
+        let rel_mtools = rel
+            .components()
+            .map(|component| component.as_os_str().to_string_lossy())
+            .collect::<Vec<_>>()
+            .join("/");
+        let dest = format!("{}/{}", dest_dir, rel_mtools);
+
+        if path.is_dir() {
+            create_mtools_dir(disk_with_offset, &dest)?;
+        } else if path.is_file() {
+            if let Some(parent) = dest.rsplit_once('/') {
+                create_mtools_dir(disk_with_offset, parent.0)?;
+            }
+            let status = Command::new("mcopy")
+                .args(["-o", "-i", disk_with_offset])
+                .arg(&path)
+                .arg(&dest)
+                .status()
+                .context("Failed to run mcopy")?;
+            if !status.success() {
+                bail!("Failed to copy {} to {}", path.display(), dest);
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn write_text_file_to_esp(disk_with_offset: &str, dest: &str, contents: &str) -> Result<()> {
+    let temp = tempfile::NamedTempFile::new()?;
+    {
+        let mut f = std::io::BufWriter::new(temp.as_file());
+        f.write_all(contents.as_bytes())?;
+        f.flush()?;
+    }
+
+    let status = Command::new("mcopy")
+        .args(["-o", "-i", disk_with_offset])
+        .arg(temp.path())
+        .arg(dest)
+        .status()
+        .context("Failed to run mcopy")?;
+    if !status.success() {
+        bail!("Failed to write {}", dest);
+    }
+
+    Ok(())
+}
+
+fn walkdir(root: &Path) -> Result<Vec<Result<std::fs::DirEntry, std::io::Error>>> {
+    let mut entries = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+
+    while let Some(dir) = stack.pop() {
+        let mut children = std::fs::read_dir(&dir)
+            .with_context(|| format!("Failed to read directory {}", dir.display()))?
+            .collect::<Vec<_>>();
+        children.sort_by_key(|entry| {
+            entry
+                .as_ref()
+                .map(|e| e.path())
+                .unwrap_or_else(|_| Path::new("").to_path_buf())
+        });
+
+        for child in children {
+            if let Ok(ref entry) = child {
+                if entry.path().is_dir() {
+                    stack.push(entry.path());
+                }
+            }
+            entries.push(child);
+        }
+    }
+
+    Ok(entries)
 }
 
 #[cfg(test)]

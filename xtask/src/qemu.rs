@@ -3,8 +3,9 @@
 //! This module provides functionality to run CrabEFI in QEMU with various
 //! storage configurations and parse serial output for test results.
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use regex::Regex;
+use std::fs;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
 
@@ -1209,6 +1210,181 @@ pub fn run_tests(config: &QemuConfig, disk_path: &Path, app_name: &str) -> Resul
     }
 
     Ok(())
+}
+
+/// Run the UEFI SCT smoke subset and parse its serial/log output.
+///
+/// # Arguments
+/// * `config` - QEMU configuration
+/// * `disk_path` - Disk image containing the UEFI Shell and SCT package
+///
+/// # Returns
+/// `Ok(())` if the smoke sequence ran to completion without obvious failures.
+pub fn run_uefi_sct_smoke_tests(config: &QemuConfig, disk_path: &Path) -> Result<()> {
+    println!("=== UEFI SCT Smoke Tests ({:?}) ===\n", config.arch);
+    println!("Running SCT smoke sequence in QEMU...\n");
+
+    let result = run_qemu_with_capture(config, disk_path)?;
+    let summary_log = extract_sct_log(disk_path, "::/Sct/Overall/Summary.log")?;
+
+    println!("\n=== SCT Smoke Results ===");
+    println!("Serial output captured: {} bytes", result.output.len());
+    if let Some(ref summary) = summary_log {
+        println!("SCT Summary.log captured: {} bytes", summary.len());
+        println!("\n--- SCT Summary.log ---\n{}", summary);
+    } else {
+        println!("SCT Summary.log was not produced or could not be copied");
+    }
+
+    let mut passed = 0;
+    let mut failed = 0;
+
+    if summary_log.as_ref().is_some_and(|summary| !summary.trim().is_empty()) {
+        println!("[PASS] summary_log: Overall/Summary.log is non-empty");
+        passed += 1;
+    } else {
+        println!("[FAIL] summary_log: Overall/Summary.log is missing or empty");
+        failed += 1;
+    }
+
+    if result.output.contains("CRABEFI_SCT_SMOKE_START") {
+        println!("[PASS] sct_started: startup.nsh launched SCT smoke run");
+        passed += 1;
+    } else {
+        println!("[FAIL] sct_started: missing CRABEFI_SCT_SMOKE_START marker");
+        failed += 1;
+    }
+
+    if result.output.contains("CRABEFI_SCT_SMOKE_DONE") {
+        println!("[PASS] sct_completed: SCT command returned to startup.nsh");
+        passed += 1;
+    } else {
+        println!("[FAIL] sct_completed: missing CRABEFI_SCT_SMOKE_DONE marker");
+        failed += 1;
+    }
+
+    if result.output.contains("CRABEFI_SCT_SMOKE_NOT_FOUND") {
+        println!("[FAIL] sct_found: startup.nsh could not find \\Sct\\SCT.efi");
+        failed += 1;
+    } else {
+        println!("[PASS] sct_found: \\Sct\\SCT.efi was found");
+        passed += 1;
+    }
+
+    for test_name in [
+        "Stall_Func",
+        "CopyMem_Func",
+        "SetMem_Func",
+        "CalculateCrc32_Func",
+        "AllocatePool_Conf",
+        "FreePool_Conf",
+    ] {
+        if result.output.contains(test_name)
+            || summary_log
+                .as_ref()
+                .is_some_and(|summary| summary.contains(test_name))
+        {
+            println!("[PASS] {test_name}: SCT test appeared in output/logs");
+            passed += 1;
+        } else {
+            println!("[FAIL] {test_name}: SCT test did not appear in output/logs");
+            failed += 1;
+        }
+    }
+
+    let combined = match summary_log {
+        Some(summary) => format!("{}\n{}", result.output, summary),
+        None => result.output.clone(),
+    };
+    let failure_markers = [
+        "CRABEFI_SCT_SMOKE_NOT_FOUND",
+        "ERROR: Cannot",
+        "Invalid command line",
+        "FAILURE",
+        "Failures: 1",
+        "Failures: 2",
+        "Failures: 3",
+        "Failures: 4",
+        "Failures: 5",
+        "Failures: 6",
+        "Failures: 7",
+        "Failures: 8",
+        "Failures: 9",
+    ];
+    let found_failures = failure_markers
+        .iter()
+        .filter(|marker| combined.contains(**marker))
+        .copied()
+        .collect::<Vec<_>>();
+    if found_failures.is_empty() {
+        println!("[PASS] no_sct_failure_markers: no SCT failure markers found");
+        passed += 1;
+    } else {
+        println!(
+            "[FAIL] no_sct_failure_markers: found markers {:?}",
+            found_failures
+        );
+        failed += 1;
+    }
+
+    if combined.contains("Done!") {
+        println!("[PASS] sct_done: SCT printed Done!");
+        passed += 1;
+    } else {
+        println!("[FAIL] sct_done: SCT did not print Done!");
+        failed += 1;
+    }
+
+    println!("\n=== Summary ===");
+    println!("Passed: {}", passed);
+    println!("Failed: {}", failed);
+
+    if failed > 0 {
+        println!("\n--- Captured Output ---");
+        println!("{}", result.output);
+        bail!("{} UEFI SCT smoke check(s) failed", failed);
+    }
+
+    Ok(())
+}
+
+fn extract_sct_log(disk_path: &Path, src: &str) -> Result<Option<String>> {
+    let temp_dir = tempfile::tempdir()?;
+    let dest = temp_dir.path().join("sct.log");
+    let image = crate::disk::mtools_esp_image(disk_path);
+    let status = Command::new("mcopy")
+        .args(["-i", &image, src])
+        .arg(&dest)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .context("failed to run mcopy to extract SCT log")?;
+
+    if !status.success() || !dest.exists() {
+        return Ok(None);
+    }
+
+    let bytes = fs::read(dest)?;
+    let utf16_le = bytes.starts_with(&[0xff, 0xfe])
+        || bytes
+            .iter()
+            .skip(1)
+            .step_by(2)
+            .filter(|byte| **byte == 0)
+            .count()
+            > bytes.len() / 8;
+    let text = if utf16_le {
+        let start = if bytes.starts_with(&[0xff, 0xfe]) { 2 } else { 0 };
+        String::from_utf16_lossy(
+            &bytes[start..]
+                .chunks_exact(2)
+                .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+                .collect::<Vec<_>>(),
+        )
+    } else {
+        String::from_utf8_lossy(&bytes).into_owned()
+    };
+    Ok(Some(text))
 }
 
 /// Run QEMU and capture serial output
