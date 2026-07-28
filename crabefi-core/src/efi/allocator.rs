@@ -1702,6 +1702,12 @@ pub fn allocate_pool(memory_type: MemoryType, size: usize) -> Result<*mut u8, ef
 }
 
 /// Return a pool block to the reusable free list.
+///
+/// `buffer` must be a pointer previously returned by [`allocate_pool`]; this
+/// mirrors the `EFI_BOOT_SERVICES.FreePool` contract, so the function stays
+/// safe to call from the protocol thunk. Bogus pointers are rejected by the
+/// header magic check below whenever the memory is readable.
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
 pub fn free_pool(buffer: *mut u8) -> efi::Status {
     if buffer.is_null() {
         return efi::Status::INVALID_PARAMETER;
@@ -1716,6 +1722,9 @@ pub fn free_pool(buffer: *mut u8) -> efi::Status {
     }
     let block_size = unsafe { (*header).block_size };
     let memory_type = unsafe { (*header).memory_type };
+    // Invalidate the magic before the block re-enters the free list so a double
+    // free is rejected above instead of corrupting the list into a cycle.
+    unsafe { (*header).magic = 0 };
     unsafe { insert_pool_block(header.cast::<u8>(), block_size, memory_type) };
     efi::Status::SUCCESS
 }

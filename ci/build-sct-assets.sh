@@ -68,10 +68,15 @@ need_tool curl
 need_tool sha256sum
 need_tool 7z
 
+# Set to 1 by download_if_needed when a fresh copy was fetched.
+DOWNLOADED=0
+
 download_if_needed() {
   local url="$1"
   local dest="$2"
   local sha="$3"
+
+  DOWNLOADED=0
 
   if [[ -f "$dest" ]] && echo "$sha  $dest" | sha256sum -c >/dev/null 2>&1; then
     echo "Using cached $(basename "$dest")"
@@ -82,12 +87,16 @@ download_if_needed() {
   curl -L --retry 3 --fail -o "$dest.tmp" "$url"
   echo "$sha  $dest.tmp" | sha256sum -c
   mv "$dest.tmp" "$dest"
+  DOWNLOADED=1
 }
 
 download_if_needed "$SHELL_URL" "$OUT_DIR/$SHELL_FILE" "$SHELL_SHA256"
 download_if_needed "$SCT_URL" "$OUT_DIR/$SCT_ARCHIVE" "$SCT_SHA256"
+SCT_DOWNLOADED="$DOWNLOADED"
 
-if [[ ! -f "$OUT_DIR/SctPackageX64/X64/SCT.efi" ]]; then
+# Re-extract whenever the archive was (re)downloaded, otherwise a stale
+# SctPackageX64/ tree from a previous SCT_RELEASE/SHA would silently survive.
+if [[ "$SCT_DOWNLOADED" == "1" || ! -f "$OUT_DIR/SctPackageX64/X64/SCT.efi" ]]; then
   echo "Extracting $SCT_ARCHIVE"
   rm -rf "$OUT_DIR/SctPackageX64"
   7z x -y -o"$OUT_DIR" "$OUT_DIR/$SCT_ARCHIVE" >/dev/null

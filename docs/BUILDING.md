@@ -22,7 +22,7 @@ rustup component add rust-src llvm-tools-preview
 
 **System Packages (Debian/Ubuntu):**
 ```bash
-sudo apt install qemu-system-x86 qemu-system-arm mtools dosfstools zstd coreboot-utils p7zip-full
+sudo apt install curl qemu-system-x86 qemu-system-arm mtools dosfstools zstd coreboot-utils p7zip-full
 ```
 
 ## Building

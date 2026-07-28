@@ -362,18 +362,26 @@ extern "efiapi" fn file_close(this: *mut efi_file::Protocol) -> Status {
     let Some(index) = index else {
         return Status::INVALID_PARAMETER;
     };
+    // Per the UEFI spec, Close() always succeeds and always releases the
+    // handle, even when pending data could not be written. Returning early on a
+    // flush failure would leak the slot forever.
     let status = flush_write_cache(index);
     if status != Status::SUCCESS {
-        return status;
+        log::error!("File.Close: flushing pending writes failed: {:?}", status);
     }
 
+    release_handle(index);
+    Status::SUCCESS
+}
+
+/// Release a file handle slot back to the pool.
+fn release_handle(index: usize) {
     let mut handles = FILE_HANDLES.lock();
     handles[index].in_use = false;
     handles[index].path_len = 0;
     handles[index].position = 0;
     handles[index].open_mode = 0;
     handles[index].write_cache_len = 0;
-    Status::SUCCESS
 }
 
 extern "efiapi" fn file_delete(this: *mut efi_file::Protocol) -> Status {
@@ -387,13 +395,21 @@ extern "efiapi" fn file_delete(this: *mut efi_file::Protocol) -> Status {
             .copy_from_slice(&handles[index].path[..handles[index].path_len]);
         (path, handles[index].open_mode & FILE_MODE_WRITE != 0, index)
     };
+    // Per the UEFI spec, Delete() closes the handle in all cases and only uses
+    // EFI_WARN_DELETE_FAILURE to report that the file itself survived.
+    let status = delete_file_contents(&path, writable, index);
+    release_handle(index);
+    status
+}
+
+fn delete_file_contents(path: &[u8; MAX_PATH_LEN], writable: bool, index: usize) -> Status {
     if !writable || media_is_read_only() {
         return Status::WARN_DELETE_FAILURE;
     }
     if flush_write_cache(index) != Status::SUCCESS {
         return Status::WARN_DELETE_FAILURE;
     }
-    let path = core::str::from_utf8(&path)
+    let path = core::str::from_utf8(path)
         .unwrap_or("")
         .trim_end_matches('\0');
     let partition_start = match state::efi().filesystem {
@@ -404,7 +420,6 @@ extern "efiapi" fn file_delete(this: *mut efi_file::Protocol) -> Status {
         FatFilesystem::new(device, partition_start).and_then(|mut fat| fat.delete_path(path))
     });
     if matches!(deleted, Some(Ok(()))) {
-        let _ = file_close(this);
         Status::SUCCESS
     } else {
         Status::WARN_DELETE_FAILURE
@@ -536,7 +551,12 @@ extern "efiapi" fn file_write(
             index,
         )
     };
-    if mode & FILE_MODE_WRITE == 0 || is_directory {
+    // The spec distinguishes the two cases: writes to an open directory are
+    // EFI_UNSUPPORTED, while a file opened read-only is EFI_ACCESS_DENIED.
+    if is_directory {
+        return Status::UNSUPPORTED;
+    }
+    if mode & FILE_MODE_WRITE == 0 {
         return Status::ACCESS_DENIED;
     }
     if media_is_read_only() {
@@ -775,6 +795,40 @@ extern "efiapi" fn file_get_info(
     }
 }
 
+/// Check whether the `FileName` trailing an `EFI_FILE_INFO` matches the file's
+/// current name (an empty name means "no rename requested").
+fn requested_name_matches(buffer: *mut c_void, buffer_size: usize, current_name: &str) -> bool {
+    let header_size = core::mem::size_of::<efi_file::Info>();
+    let Some(name_bytes) = buffer_size.checked_sub(header_size) else {
+        return true;
+    };
+    let max_chars = name_bytes / core::mem::size_of::<u16>();
+    if max_chars == 0 {
+        return true;
+    }
+
+    // SAFETY: the caller validated `buffer` is non-null and describes at least
+    // `buffer_size` bytes.
+    let name_ptr = unsafe { buffer.cast::<u8>().add(header_size) }.cast::<u16>();
+
+    let mut expected = current_name.chars();
+    for i in 0..max_chars {
+        let unit = unsafe { name_ptr.add(i).read_unaligned() };
+        if unit == 0 {
+            // Terminated: a match only if the current name is also exhausted,
+            // and an empty request means no rename was asked for.
+            return i == 0 || expected.next().is_none();
+        }
+        match expected.next() {
+            Some(c) if c as u32 == unit as u32 => {}
+            _ => return false,
+        }
+    }
+
+    // Unterminated name: treat as no rename request rather than a mismatch.
+    true
+}
+
 extern "efiapi" fn file_set_info(
     this: *mut efi_file::Protocol,
     info_type: *mut Guid,
@@ -789,7 +843,7 @@ extern "efiapi" fn file_set_info(
     {
         return Status::UNSUPPORTED;
     }
-    let (path, path_len, mode, current_size, index) = {
+    let (path, path_len, mode, current_size, is_directory, index) = {
         let handles = FILE_HANDLES.lock();
         let Some(index) = find_handle_index_unlocked(&handles, this) else {
             return Status::INVALID_PARAMETER;
@@ -802,6 +856,7 @@ extern "efiapi" fn file_set_info(
             handles[index].path_len,
             handles[index].open_mode,
             handles[index].file_size,
+            handles[index].is_directory,
             index,
         )
     };
@@ -811,15 +866,33 @@ extern "efiapi" fn file_set_info(
     if media_is_read_only() {
         return Status::WRITE_PROTECTED;
     }
+
+    let path_str = core::str::from_utf8(&path[..path_len]).unwrap_or("");
+    let current_name = path_str.rsplit(['/', '\\']).next().unwrap_or("");
+
+    // Only truncation is implemented. Report UNSUPPORTED instead of a bogus
+    // SUCCESS for the fields this driver cannot honour: rename via FileName and
+    // attribute changes.
+    let current_attribute = if is_directory { FILE_DIRECTORY } else { 0 };
+    let requested_attribute = unsafe { (*(buffer as *const efi_file::Info)).attribute };
+    if requested_attribute != current_attribute {
+        return Status::UNSUPPORTED;
+    }
+    if !requested_name_matches(buffer, buffer_size, current_name) {
+        return Status::UNSUPPORTED;
+    }
+
     let status = flush_write_cache(index);
     if status != Status::SUCCESS {
         return status;
     }
     let size = unsafe { (*(buffer as *const efi_file::Info)).file_size };
+    // NOTE: growing a file through SetInfo is legal per the spec but not yet
+    // implemented here.
     if size > u32::MAX as u64 || size > current_size {
         return Status::UNSUPPORTED;
     }
-    let path = core::str::from_utf8(&path[..path_len]).unwrap_or("");
+    let path = path_str;
     let partition_start = match state::efi().filesystem {
         Some(state) => state.partition_start,
         None => return Status::NOT_READY,

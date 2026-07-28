@@ -646,15 +646,37 @@ Order      = 0x00000005
 Iterations = 0x00000001
 "#;
 
+fn mtools_dir_exists(disk_with_offset: &str, path: &str) -> Result<bool> {
+    let output = Command::new("mdir")
+        .args(["-i", disk_with_offset, "-b", path])
+        .output()
+        .context("Failed to run mdir")?;
+    Ok(output.status.success())
+}
+
 fn create_mtools_dir(disk_with_offset: &str, path: &str) -> Result<()> {
+    // `mmd` fails when the directory already exists and offers no reliable way
+    // to tell that apart from a real failure, so probe first and only create
+    // when missing. Callers ensure parent directories repeatedly, so this needs
+    // to stay idempotent without swallowing genuine errors.
+    if mtools_dir_exists(disk_with_offset, path)? {
+        return Ok(());
+    }
+
     let status = Command::new("mmd")
         .args(["-i", disk_with_offset, path])
         .status()
         .context("Failed to run mmd")?;
 
-    // mmd returns an error if the directory already exists. That is harmless for
-    // our callers, which often ensure parent directories repeatedly.
-    let _ = status;
+    if !status.success() {
+        // Tolerate a lost race / mtools quirk only when the directory is
+        // actually there afterwards.
+        if mtools_dir_exists(disk_with_offset, path)? {
+            return Ok(());
+        }
+        anyhow::bail!("mmd failed to create {path} ({status})");
+    }
+
     Ok(())
 }
 

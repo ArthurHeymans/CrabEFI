@@ -378,6 +378,34 @@ impl UsbMassStorage {
         data: Option<&mut [u8]>,
         is_read: bool,
     ) -> Result<usize, MassStorageError> {
+        self.scsi_command_inner(controller, cdb, data, is_read, false)
+    }
+
+    /// Same as [`Self::scsi_command`], but treats a short transfer (or a
+    /// non-zero CSW residue) as a phase error.
+    ///
+    /// Only block transfer commands (READ/WRITE) may use this: commands that
+    /// carry a SCSI *allocation length* (INQUIRY, READ CAPACITY(16), SECURITY
+    /// PROTOCOL IN, ...) are allowed to return fewer bytes than requested with
+    /// a `PASSED` status.
+    fn scsi_command_exact(
+        &mut self,
+        controller: &mut dyn UsbController,
+        cdb: &[u8],
+        data: Option<&mut [u8]>,
+        is_read: bool,
+    ) -> Result<usize, MassStorageError> {
+        self.scsi_command_inner(controller, cdb, data, is_read, true)
+    }
+
+    fn scsi_command_inner(
+        &mut self,
+        controller: &mut dyn UsbController,
+        cdb: &[u8],
+        data: Option<&mut [u8]>,
+        is_read: bool,
+        require_full_transfer: bool,
+    ) -> Result<usize, MassStorageError> {
         let data_len = data.as_ref().map(|d| d.len()).unwrap_or(0);
 
         // Build CBW
@@ -539,7 +567,7 @@ impl UsbMassStorage {
 
         match csw_stat {
             csw_status::PASSED if transferred == data_len && csw_residue == 0 => Ok(transferred),
-            csw_status::PASSED => {
+            csw_status::PASSED if require_full_transfer => {
                 log::debug!(
                     "USB SCSI: Short data transfer: got {}, expected {}, residue {}",
                     transferred,
@@ -547,6 +575,20 @@ impl UsbMassStorage {
                     csw_residue
                 );
                 Err(MassStorageError::PhaseError)
+            }
+            csw_status::PASSED => {
+                // Allocation-length commands may legitimately return less data
+                // than requested; report what the device actually delivered.
+                let received = data_len
+                    .saturating_sub(csw_residue as usize)
+                    .min(transferred);
+                log::trace!(
+                    "USB SCSI: Short data transfer accepted: got {}, expected {}, residue {}",
+                    transferred,
+                    data_len,
+                    csw_residue
+                );
+                Ok(received)
             }
             csw_status::FAILED => {
                 log::debug!("USB SCSI: Command {:#04x} failed (CSW status=1)", cdb[0]);
@@ -788,7 +830,7 @@ impl UsbMassStorage {
         ];
 
         let transfer_len = count as usize * self.block_size as usize;
-        self.scsi_command(controller, &cdb, Some(&mut buffer[..transfer_len]), true)?;
+        self.scsi_command_exact(controller, &cdb, Some(&mut buffer[..transfer_len]), true)?;
 
         Ok(())
     }
@@ -824,7 +866,7 @@ impl UsbMassStorage {
         ];
 
         let transfer_len = count as usize * self.block_size as usize;
-        self.scsi_command(controller, &cdb, Some(&mut buffer[..transfer_len]), true)?;
+        self.scsi_command_exact(controller, &cdb, Some(&mut buffer[..transfer_len]), true)?;
 
         Ok(())
     }
@@ -838,8 +880,14 @@ impl UsbMassStorage {
         buffer: &[u8],
     ) -> Result<(), MassStorageError> {
         let block_size = self.block_size as usize;
+        // `scratch` below is a fixed MAX_BYTES_PER_CMD buffer and
+        // `sectors_per_cmd` is clamped to at least one sector, so a device
+        // reporting an oversized block size must be rejected up front.
+        if block_size == 0 || block_size > Self::MAX_BYTES_PER_CMD {
+            return Err(MassStorageError::InvalidParameter);
+        }
         let required = num_sectors as usize * block_size;
-        if buffer.len() < required || block_size == 0 {
+        if buffer.len() < required {
             return Err(MassStorageError::InvalidParameter);
         }
 
@@ -908,7 +956,7 @@ impl UsbMassStorage {
             count[1],
             0,
         ];
-        self.scsi_command(controller, &cdb, Some(buffer), false)?;
+        self.scsi_command_exact(controller, &cdb, Some(buffer), false)?;
         Ok(())
     }
 
@@ -925,7 +973,7 @@ impl UsbMassStorage {
             0x8a, 0, lba[0], lba[1], lba[2], lba[3], lba[4], lba[5], lba[6], lba[7], count[0],
             count[1], count[2], count[3], 0, 0,
         ];
-        self.scsi_command(controller, &cdb, Some(buffer), false)?;
+        self.scsi_command_exact(controller, &cdb, Some(buffer), false)?;
         Ok(())
     }
 

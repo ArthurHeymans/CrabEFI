@@ -57,7 +57,10 @@ fn database() -> &'static mut State {
     unsafe { &mut (*crate::state::efi_mut_ptr()).hii }
 }
 
-static HII_DATABASE_PROTOCOL: hii_database::Protocol = hii_database::Protocol {
+// `static mut` (rather than a shared reference cast to `*mut`) so the protocol
+// structures live in writable memory: consumers are allowed to patch vtable
+// entries through the pointers handed out below.
+static mut HII_DATABASE_PROTOCOL: hii_database::Protocol = hii_database::Protocol {
     new_package_list,
     remove_package_list,
     update_package_list,
@@ -71,7 +74,7 @@ static HII_DATABASE_PROTOCOL: hii_database::Protocol = hii_database::Protocol {
     get_package_list_handle,
 };
 
-static HII_STRING_PROTOCOL: hii_string::Protocol = hii_string::Protocol {
+static mut HII_STRING_PROTOCOL: hii_string::Protocol = hii_string::Protocol {
     new_string,
     get_string,
     set_string,
@@ -80,11 +83,11 @@ static HII_STRING_PROTOCOL: hii_string::Protocol = hii_string::Protocol {
 };
 
 pub fn database_protocol() -> *mut c_void {
-    &HII_DATABASE_PROTOCOL as *const _ as *mut c_void
+    (&raw mut HII_DATABASE_PROTOCOL).cast()
 }
 
 pub fn string_protocol() -> *mut c_void {
-    &HII_STRING_PROTOCOL as *const _ as *mut c_void
+    (&raw mut HII_STRING_PROTOCOL).cast()
 }
 
 fn hii_handle(value: usize) -> hii::Handle {
@@ -327,7 +330,11 @@ fn find_string_in_package_inner(
                 }
                 offset = offset.checked_add(length - 1)?;
             }
-            0x31 => {
+            // EFI_HII_SIBT_EXT2 and EFI_HII_SIBT_FONT (0x40) share the
+            // EFI_HII_SIBT_EXT2_BLOCK header layout. EFI_HII_SIBT_FONT carries
+            // font metadata rather than string IDs, so skip it by its length
+            // instead of failing the whole package.
+            0x31 | 0x40 => {
                 let length = read_u16(package, offset + 1)? as usize;
                 if length < 4 {
                     return None;
@@ -617,7 +624,11 @@ fn max_string_id_in_package(package: &[u8]) -> Option<hii::StringId> {
                 offset = offset.checked_add(length - 1)?;
                 0
             }
-            0x31 => {
+            // EFI_HII_SIBT_EXT2 and EFI_HII_SIBT_FONT (0x40) share the
+            // EFI_HII_SIBT_EXT2_BLOCK header layout. EFI_HII_SIBT_FONT carries
+            // font metadata rather than string IDs, so skip it by its length
+            // instead of failing the whole package.
+            0x31 | 0x40 => {
                 let length = read_u16(package, offset + 1)? as usize;
                 if length < 4 {
                     return None;
@@ -690,14 +701,13 @@ extern "efiapi" fn new_string(
     else {
         return Status::NOT_FOUND;
     };
-    let mut id = unsafe { *string_id };
-    if id == 0 {
-        let Some(next) = max_string_id(package).checked_add(1) else {
-            return Status::OUT_OF_RESOURCES;
-        };
-        id = next;
-        unsafe { *string_id = id };
-    }
+    // StringId is an OUT parameter: the incoming value is undefined and must
+    // never be reused as a hint, otherwise an uninitialized caller value can
+    // collide with a compiled-in string.
+    let Some(id) = max_string_id(package).checked_add(1) else {
+        return Status::OUT_OF_RESOURCES;
+    };
+    unsafe { *string_id = id };
     let added = language.len() + value.len() * core::mem::size_of::<Char16>();
     if package.strings.len() >= MAX_DYNAMIC_STRINGS
         || dynamic_string_storage(package)

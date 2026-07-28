@@ -2322,13 +2322,29 @@ extern "efiapi" fn uninstall_multiple_protocol_interfaces(
         if status != Status::SUCCESS {
             for rollback_index in (0..index).rev() {
                 let (rollback_guid, rollback_interface) = args[rollback_index];
+                // Uninstalling the last protocol auto-deletes the handle, so it
+                // has to be revived before earlier protocols can be restored.
+                if !restore_handle_entry(handle) {
+                    log::error!(
+                        "  Rollback failed: cannot restore handle {:?} (handle table full)",
+                        handle
+                    );
+                    break;
+                }
                 let mut rollback_handle = handle;
-                let _ = install_protocol_interface(
+                let rollback_status = install_protocol_interface(
                     &mut rollback_handle,
                     rollback_guid as *mut Guid,
                     efi::NATIVE_INTERFACE,
                     rollback_interface,
                 );
+                if rollback_status != Status::SUCCESS {
+                    log::error!(
+                        "  Rollback failed to reinstall protocol on {:?}: {:?}",
+                        handle,
+                        rollback_status
+                    );
+                }
             }
             return status;
         }
@@ -2423,6 +2439,32 @@ pub fn create_handle() -> Option<Handle> {
         efi_state.handle_count += 1;
 
         Some(handle)
+    })
+}
+
+/// Re-create the bookkeeping entry for a handle that was auto-deleted when its
+/// last protocol went away.
+///
+/// Used by the `UninstallMultipleProtocolInterfaces` rollback path, which must
+/// be able to re-install protocols on the original handle value even though the
+/// handle was dropped in the middle of the batch.
+fn restore_handle_entry(handle: Handle) -> bool {
+    state::with_efi_mut(|efi_state| {
+        if efi_state.handles[..efi_state.handle_count]
+            .iter()
+            .any(|entry| entry.handle == handle)
+        {
+            return true;
+        }
+        if efi_state.handle_count >= MAX_HANDLES {
+            return false;
+        }
+        let idx = efi_state.handle_count;
+        efi_state.handles[idx] = HandleEntry::empty();
+        efi_state.handles[idx].handle = handle;
+        efi_state.handles[idx].protocol_count = 0;
+        efi_state.handle_count += 1;
+        true
     })
 }
 
