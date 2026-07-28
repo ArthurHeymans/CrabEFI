@@ -1,32 +1,254 @@
-//! Page-allocation ownership range primitives.
+//! Page-allocation ownership primitives.
 //!
-//! This module is dependency-free so subrange ownership behavior can be tested
-//! directly with `rustc --test` in the host regression job.
+//! Addresses and sizes here are counted in *pages*, never in bytes. Byte values
+//! are converted at the boundary ([`PageAddr::from_bytes`], [`PageRange::from_bytes`])
+//! and the conversion is where overflow and misalignment are rejected, so the
+//! interior arithmetic needs no `checked_mul`/`checked_add` and no `/ PAGE_SIZE`.
+//!
+//! This module is dependency-free so ownership behavior can be tested directly
+//! with `rustc --test` in the host regression job.
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct MemoryRange {
-    pub start: u64,
-    pub end: u64,
+/// Page size (4KB)
+pub const PAGE_SIZE: u64 = 4096;
+
+/// Largest page index whose byte address still fits in a `u64`.
+const MAX_PAGE_INDEX: u64 = u64::MAX / PAGE_SIZE;
+
+/// A page-aligned physical address, stored as a page index.
+///
+/// Constructing one proves the address is page-aligned and that its byte form
+/// fits in a `u64`, so [`PageAddr::bytes`] is infallible.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct PageAddr(u64);
+
+impl PageAddr {
+    /// Convert a byte address, rejecting anything not page-aligned.
+    pub const fn from_bytes(address: u64) -> Option<Self> {
+        if address.is_multiple_of(PAGE_SIZE) {
+            Some(Self(address / PAGE_SIZE))
+        } else {
+            None
+        }
+    }
+
+    /// Byte address of the start of this page.
+    pub const fn bytes(self) -> u64 {
+        self.0 * PAGE_SIZE
+    }
+
+    /// Advance by `count` pages, rejecting addresses beyond the `u64` byte space.
+    pub const fn checked_add(self, count: PageCount) -> Option<Self> {
+        match self.0.checked_add(count.0) {
+            Some(index) if index <= MAX_PAGE_INDEX => Some(Self(index)),
+            _ => None,
+        }
+    }
+
+    /// Pages from `earlier` to `self`, or zero when `self` is not later.
+    pub const fn pages_since(self, earlier: Self) -> PageCount {
+        PageCount(self.0.saturating_sub(earlier.0))
+    }
 }
 
-impl MemoryRange {
-    pub fn from_pages(start: u64, number_of_pages: u64, page_size: u64) -> Option<Self> {
-        let size = number_of_pages.checked_mul(page_size)?;
-        let end = start.checked_add(size)?;
-        Some(Self { start, end })
+/// A number of pages.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct PageCount(u64);
+
+impl PageCount {
+    pub const fn new(pages: u64) -> Self {
+        Self(pages)
     }
 
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+
+    pub const fn is_zero(self) -> bool {
+        self.0 == 0
+    }
+
+    /// Size in bytes, or `None` when it does not fit in a `u64`.
+    pub const fn bytes(self) -> Option<u64> {
+        self.0.checked_mul(PAGE_SIZE)
+    }
+
+    /// Pages needed to cover `bytes`, rounding up.
+    pub const fn covering_bytes(bytes: u64) -> Self {
+        Self(bytes.div_ceil(PAGE_SIZE))
+    }
+}
+
+/// A half-open range of pages: `start` inclusive, `end` exclusive.
+///
+/// The `start <= end` invariant is established at construction, so `pages()`,
+/// `head_before()`, and `tail_after()` never underflow.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PageRange {
+    start: PageAddr,
+    end: PageAddr,
+}
+
+impl PageRange {
+    /// Build a range from a start page and a length.
+    pub const fn new(start: PageAddr, count: PageCount) -> Option<Self> {
+        match start.checked_add(count) {
+            Some(end) => Some(Self { start, end }),
+            None => None,
+        }
+    }
+
+    /// Build a range from its bounds, rejecting an inverted pair.
+    pub const fn spanning(start: PageAddr, end: PageAddr) -> Option<Self> {
+        if start.0 <= end.0 {
+            Some(Self { start, end })
+        } else {
+            None
+        }
+    }
+
+    /// Build a range from a byte address and a page count.
+    ///
+    /// Rejects misaligned addresses, zero-length ranges, and ranges whose end
+    /// would leave the `u64` byte space.
+    pub const fn from_bytes(address: u64, number_of_pages: u64) -> Option<Self> {
+        if number_of_pages == 0 {
+            return None;
+        }
+        match PageAddr::from_bytes(address) {
+            Some(start) => Self::new(start, PageCount::new(number_of_pages)),
+            None => None,
+        }
+    }
+
+    pub const fn start(self) -> PageAddr {
+        self.start
+    }
+
+    pub const fn end(self) -> PageAddr {
+        self.end
+    }
+
+    pub const fn pages(self) -> PageCount {
+        self.end.pages_since(self.start)
+    }
+
+    pub const fn start_bytes(self) -> u64 {
+        self.start.bytes()
+    }
+
+    pub const fn end_bytes(self) -> u64 {
+        self.end.bytes()
+    }
+
+    pub const fn is_empty(self) -> bool {
+        self.pages().is_zero()
+    }
+
+    /// Whether `other` lies entirely within `self`.
     pub const fn contains(self, other: Self) -> bool {
-        self.start <= other.start && self.end >= other.end
+        self.start.0 <= other.start.0 && self.end.0 >= other.end.0
     }
 
-    pub const fn number_of_pages(self, page_size: u64) -> u64 {
-        (self.end - self.start) / page_size
+    /// The pages shared by both ranges, or `None` when they are disjoint.
+    pub const fn intersection(self, other: Self) -> Option<Self> {
+        let start = if self.start.0 > other.start.0 {
+            self.start
+        } else {
+            other.start
+        };
+        let end = if self.end.0 < other.end.0 {
+            self.end
+        } else {
+            other.end
+        };
+        if start.0 < end.0 {
+            Some(Self { start, end })
+        } else {
+            None
+        }
     }
 
-    /// Whether the two ranges share at least one byte.
+    /// Whether the two ranges share at least one page.
     pub const fn overlaps(self, other: Self) -> bool {
-        self.start < other.end && other.start < self.end
+        self.intersection(other).is_some()
+    }
+
+    /// Whether `later` begins exactly where `self` ends.
+    pub const fn is_adjacent_to(self, later: Self) -> bool {
+        self.end.0 == later.start.0
+    }
+
+    /// Split `self` around the contained range `inner`.
+    ///
+    /// Returns `None` when `inner` is not contained, so callers cannot compute
+    /// a residual from ranges that do not nest.
+    pub const fn split_around(self, inner: Self) -> Option<RangeSplit> {
+        if !self.contains(inner) {
+            return None;
+        }
+        let head = if self.start.0 < inner.start.0 {
+            Some(Self {
+                start: self.start,
+                end: inner.start,
+            })
+        } else {
+            None
+        };
+        let tail = if self.end.0 > inner.end.0 {
+            Some(Self {
+                start: inner.end,
+                end: self.end,
+            })
+        } else {
+            None
+        };
+        Some(RangeSplit {
+            head,
+            middle: inner,
+            tail,
+        })
+    }
+}
+
+/// The ranges that replace a range when a contained subrange is carved out.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RangeSplit {
+    pub head: Option<PageRange>,
+    pub middle: PageRange,
+    pub tail: Option<PageRange>,
+}
+
+impl RangeSplit {
+    /// How many ranges replace the original one.
+    pub const fn replacement_count(self) -> usize {
+        1 + self.head.is_some() as usize + self.tail.is_some() as usize
+    }
+
+    /// The replacements in ascending address order.
+    pub fn parts(self) -> impl Iterator<Item = PageRange> {
+        self.head
+            .into_iter()
+            .chain(core::iter::once(self.middle))
+            .chain(self.tail)
+    }
+}
+
+/// Whether a fixed-capacity table still fits after a replacement.
+///
+/// Written as checked arithmetic so an inconsistent `removed` count can never
+/// wrap the subtraction into a spuriously successful capacity check.
+pub const fn fits_after_replacement(
+    len: usize,
+    removed: usize,
+    inserted: usize,
+    capacity: usize,
+) -> bool {
+    match len.checked_sub(removed) {
+        Some(remaining) => match remaining.checked_add(inserted) {
+            Some(total) => total <= capacity,
+            None => false,
+        },
+        None => false,
     }
 }
 
@@ -34,13 +256,13 @@ impl MemoryRange {
 /// independent of the allocator's EFI `MemoryType` definition.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PageAllocation<T: Copy> {
-    pub range: MemoryRange,
+    pub range: PageRange,
     pub memory_type: T,
     pub restore_attribute: u64,
 }
 
 impl<T: Copy> PageAllocation<T> {
-    pub const fn contains(self, range: MemoryRange) -> bool {
+    pub const fn contains(self, range: PageRange) -> bool {
         self.range.contains(range)
     }
 }
@@ -66,28 +288,25 @@ pub enum SplitError {
 /// overlap would retype pages that another record still claims.
 pub fn exact_cover<T: Copy + Eq>(
     allocations: &[PageAllocation<T>],
-    range: MemoryRange,
+    range: PageRange,
 ) -> Option<PageAllocation<T>> {
-    let mut cursor = range.start;
-    let first = allocations
-        .iter()
-        .find(|allocation| allocation.range.start == cursor && range.contains(allocation.range))?;
+    let mut cursor = range.start();
+    let first = allocations.iter().find(|allocation| {
+        allocation.range.start() == cursor && range.contains(allocation.range)
+    })?;
     let memory_type = first.memory_type;
     let restore_attribute = first.restore_attribute;
     let mut chain_len = 0usize;
 
-    while cursor < range.end {
+    while cursor < range.end() {
         let allocation = allocations.iter().find(|allocation| {
-            allocation.range.start == cursor
+            allocation.range.start() == cursor
+                && !allocation.range.is_empty()
                 && range.contains(allocation.range)
                 && allocation.memory_type == memory_type
                 && allocation.restore_attribute == restore_attribute
         })?;
-        // A zero-length record would leave the cursor in place and spin here.
-        if allocation.range.end <= cursor {
-            return None;
-        }
-        cursor = allocation.range.end;
+        cursor = allocation.range.end();
         chain_len += 1;
     }
 
@@ -98,7 +317,7 @@ pub fn exact_cover<T: Copy + Eq>(
         .filter(|allocation| allocation.range.overlaps(range))
         .count();
 
-    (cursor == range.end && touching == chain_len).then_some(PageAllocation {
+    (cursor == range.end() && touching == chain_len).then_some(PageAllocation {
         range,
         memory_type,
         restore_attribute,
@@ -111,42 +330,31 @@ pub fn exact_cover<T: Copy + Eq>(
 /// suffix. Empty slots are omitted from the returned array.
 pub fn split_allocation<T: Copy>(
     allocation: PageAllocation<T>,
-    range: MemoryRange,
+    range: PageRange,
     replacement: Option<PageAllocation<T>>,
 ) -> Result<[Option<PageAllocation<T>>; 3], SplitError> {
-    if !allocation.contains(range) {
-        return Err(SplitError::RangeNotContained);
-    }
     // The residuals are computed around `range`, so a replacement covering
     // anything else would leave a gap or an overlap in the ownership table.
     if replacement.is_some_and(|replacement| replacement.range != range) {
         return Err(SplitError::ReplacementRangeMismatch);
     }
+    let split = allocation
+        .range
+        .split_around(range)
+        .ok_or(SplitError::RangeNotContained)?;
 
+    let residual = |range| PageAllocation {
+        range,
+        ..allocation
+    };
     let mut output = [None; 3];
-    let mut index = 0;
-    if allocation.range.start < range.start {
-        output[index] = Some(PageAllocation {
-            range: MemoryRange {
-                start: allocation.range.start,
-                end: range.start,
-            },
-            ..allocation
-        });
-        index += 1;
-    }
-    if let Some(replacement) = replacement {
-        output[index] = Some(replacement);
-        index += 1;
-    }
-    if allocation.range.end > range.end {
-        output[index] = Some(PageAllocation {
-            range: MemoryRange {
-                start: range.end,
-                end: allocation.range.end,
-            },
-            ..allocation
-        });
+    let parts = [
+        split.head.map(residual),
+        replacement,
+        split.tail.map(residual),
+    ];
+    for (slot, part) in output.iter_mut().zip(parts.into_iter().flatten()) {
+        *slot = Some(part);
     }
     Ok(output)
 }
@@ -157,58 +365,111 @@ mod tests {
 
     use super::*;
 
-    const ORIGINAL: PageAllocation<u32> = PageAllocation {
-        range: MemoryRange {
-            start: 0x1000,
-            end: 0x9000,
-        },
-        memory_type: 2,
-        restore_attribute: 0x8008,
-    };
+    fn range(start: u64, end: u64) -> PageRange {
+        PageRange::from_bytes(start, (end - start) / PAGE_SIZE).unwrap()
+    }
+
+    fn original() -> PageAllocation<u32> {
+        PageAllocation {
+            range: range(0x1000, 0x9000),
+            memory_type: 2,
+            restore_attribute: 0x8008,
+        }
+    }
+
+    #[test]
+    fn byte_conversion_rejects_misaligned_and_overflowing_ranges() {
+        assert_eq!(PageAddr::from_bytes(0x1001), None);
+        assert_eq!(PageAddr::from_bytes(0x1000).unwrap().bytes(), 0x1000);
+        assert_eq!(PageRange::from_bytes(0x1000, 0), None);
+        assert_eq!(PageRange::from_bytes(PAGE_SIZE, u64::MAX), None);
+        assert_eq!(range(0x1000, 0x9000).pages(), PageCount::new(8));
+        assert_eq!(range(0x1000, 0x9000).end_bytes(), 0x9000);
+        assert_eq!(PageCount::covering_bytes(PAGE_SIZE + 1).get(), 2);
+    }
+
+    #[test]
+    fn split_around_yields_residual_ranges_without_page_arithmetic() {
+        let split = range(0x1000, 0x9000)
+            .split_around(range(0x3000, 0x6000))
+            .unwrap();
+        assert_eq!(split.head, Some(range(0x1000, 0x3000)));
+        assert_eq!(split.middle, range(0x3000, 0x6000));
+        assert_eq!(split.tail, Some(range(0x6000, 0x9000)));
+        assert_eq!(split.replacement_count(), 3);
+
+        let whole = range(0x1000, 0x9000)
+            .split_around(range(0x1000, 0x9000))
+            .unwrap();
+        assert_eq!((whole.head, whole.tail), (None, None));
+        assert_eq!(whole.replacement_count(), 1);
+
+        assert_eq!(range(0x1000, 0x9000).split_around(range(0, 0x2000)), None);
+    }
+
+    #[test]
+    fn split_parts_are_contiguous_and_cover_the_original() {
+        let split = range(0x1000, 0x9000)
+            .split_around(range(0x3000, 0x6000))
+            .unwrap();
+        let parts: std::vec::Vec<_> = split.parts().collect();
+        assert_eq!(parts.len(), 3);
+        assert!(parts.windows(2).all(|pair| pair[0].is_adjacent_to(pair[1])));
+        assert_eq!(parts[0].start(), range(0x1000, 0x9000).start());
+        assert_eq!(parts[2].end(), range(0x1000, 0x9000).end());
+    }
+
+    #[test]
+    fn intersection_clips_to_the_shared_pages() {
+        let region = range(0x2000, 0x8000);
+        assert_eq!(
+            region.intersection(range(0x1000, 0x4000)),
+            Some(range(0x2000, 0x4000))
+        );
+        assert_eq!(
+            region.intersection(range(0x4000, 0x9000)),
+            Some(range(0x4000, 0x8000))
+        );
+        assert_eq!(region.intersection(range(0x1000, 0x9000)), Some(region));
+        assert_eq!(region.intersection(range(0x8000, 0x9000)), None);
+        assert!(!region.overlaps(range(0x8000, 0x9000)));
+        assert!(region.overlaps(range(0x7000, 0x9000)));
+    }
+
+    #[test]
+    fn capacity_check_never_wraps() {
+        assert!(fits_after_replacement(10, 1, 3, 12));
+        assert!(!fits_after_replacement(10, 1, 4, 12));
+        assert!(!fits_after_replacement(0, 1, 1, 12));
+    }
 
     #[test]
     fn cover_rejects_records_that_overlap_the_chain() {
         // A parent plus a still-live subclaim of the same metadata: the chain
         // walk alone would accept the parent and drop both records.
         let records = [
-            ORIGINAL,
+            original(),
             PageAllocation {
-                range: MemoryRange {
-                    start: 0x3000,
-                    end: 0x5000,
-                },
-                ..ORIGINAL
+                range: range(0x3000, 0x5000),
+                ..original()
             },
         ];
-        assert_eq!(exact_cover(&records, ORIGINAL.range), None);
+        assert_eq!(exact_cover(&records, original().range), None);
 
         // Two records claiming the same start are equally untrustworthy.
-        let duplicates = [ORIGINAL, ORIGINAL];
-        assert_eq!(exact_cover(&duplicates, ORIGINAL.range), None);
+        let duplicates = [original(), original()];
+        assert_eq!(exact_cover(&duplicates, original().range), None);
     }
 
     #[test]
     fn split_rejects_a_replacement_that_does_not_cover_the_split_range() {
-        let range = MemoryRange {
-            start: 0x3000,
-            end: 0x6000,
-        };
-        for bad in [
-            MemoryRange {
-                start: 0x3000,
-                end: 0x5000,
-            },
-            MemoryRange {
-                start: 0x2000,
-                end: 0x6000,
-            },
-        ] {
+        for bad in [range(0x3000, 0x5000), range(0x2000, 0x6000)] {
             let replacement = PageAllocation {
                 range: bad,
-                ..ORIGINAL
+                ..original()
             };
             assert_eq!(
-                split_allocation(ORIGINAL, range, Some(replacement)),
+                split_allocation(original(), range(0x3000, 0x6000), Some(replacement)),
                 Err(SplitError::ReplacementRangeMismatch)
             );
         }
@@ -216,33 +477,13 @@ mod tests {
 
     #[test]
     fn partial_free_preserves_both_residual_records_and_metadata() {
-        let parts = split_allocation(
-            ORIGINAL,
-            MemoryRange {
-                start: 0x3000,
-                end: 0x6000,
-            },
-            None,
-        )
-        .unwrap();
-        assert_eq!(
-            parts[0].unwrap().range,
-            MemoryRange {
-                start: 0x1000,
-                end: 0x3000
-            }
-        );
-        assert_eq!(
-            parts[1].unwrap().range,
-            MemoryRange {
-                start: 0x6000,
-                end: 0x9000
-            }
-        );
-        assert_eq!(parts[0].unwrap().memory_type, ORIGINAL.memory_type);
+        let parts = split_allocation(original(), range(0x3000, 0x6000), None).unwrap();
+        assert_eq!(parts[0].unwrap().range, range(0x1000, 0x3000));
+        assert_eq!(parts[1].unwrap().range, range(0x6000, 0x9000));
+        assert_eq!(parts[0].unwrap().memory_type, original().memory_type);
         assert_eq!(
             parts[1].unwrap().restore_attribute,
-            ORIGINAL.restore_attribute
+            original().restore_attribute
         );
         assert!(parts[2].is_none());
     }
@@ -250,77 +491,71 @@ mod tests {
     #[test]
     fn whole_parent_is_freeable_after_loader_subclaim() {
         let replacement = PageAllocation {
-            range: MemoryRange {
-                start: 0x3000,
-                end: 0x5000,
-            },
-            memory_type: ORIGINAL.memory_type,
-            restore_attribute: ORIGINAL.restore_attribute,
+            range: range(0x3000, 0x5000),
+            ..original()
         };
-        let parts = split_allocation(ORIGINAL, replacement.range, Some(replacement)).unwrap();
-        assert_eq!(parts[0].unwrap().range.end, parts[1].unwrap().range.start);
-        assert_eq!(parts[1].unwrap().range.end, parts[2].unwrap().range.start);
+        let parts = split_allocation(original(), replacement.range, Some(replacement)).unwrap();
+        assert!(
+            parts[0]
+                .unwrap()
+                .range
+                .is_adjacent_to(parts[1].unwrap().range)
+        );
+        assert!(
+            parts[1]
+                .unwrap()
+                .range
+                .is_adjacent_to(parts[2].unwrap().range)
+        );
         assert_eq!(parts[1].unwrap(), replacement);
 
         let records = parts.into_iter().flatten().collect::<alloc::vec::Vec<_>>();
-        assert_eq!(exact_cover(&records, ORIGINAL.range), Some(ORIGINAL));
+        assert_eq!(exact_cover(&records, original().range), Some(original()));
     }
 
     #[test]
     fn whole_parent_cover_rejects_gaps_or_mismatched_metadata() {
         let mut records = [
             PageAllocation {
-                range: MemoryRange {
-                    start: 0x1000,
-                    end: 0x3000,
-                },
-                ..ORIGINAL
+                range: range(0x1000, 0x3000),
+                ..original()
             },
             PageAllocation {
-                range: MemoryRange {
-                    start: 0x3000,
-                    end: 0x9000,
-                },
-                ..ORIGINAL
+                range: range(0x3000, 0x9000),
+                ..original()
             },
         ];
-        assert_eq!(exact_cover(&records, ORIGINAL.range), Some(ORIGINAL));
+        assert_eq!(exact_cover(&records, original().range), Some(original()));
 
-        records[1].range.start = 0x4000;
-        assert_eq!(exact_cover(&records, ORIGINAL.range), None);
-        records[1].range.start = 0x3000;
+        records[1].range = range(0x4000, 0x9000);
+        assert_eq!(exact_cover(&records, original().range), None);
+        records[1].range = range(0x3000, 0x9000);
         records[1].memory_type = 4;
-        assert_eq!(exact_cover(&records, ORIGINAL.range), None);
-        records[1].memory_type = ORIGINAL.memory_type;
+        assert_eq!(exact_cover(&records, original().range), None);
+        records[1].memory_type = original().memory_type;
         records[1].restore_attribute = 0;
-        assert_eq!(exact_cover(&records, ORIGINAL.range), None);
+        assert_eq!(exact_cover(&records, original().range), None);
     }
 
     #[test]
     fn cover_ignores_records_that_leave_the_requested_range() {
         let records = [
             PageAllocation {
-                range: MemoryRange {
-                    start: 0x1000,
-                    end: 0x3000,
-                },
-                ..ORIGINAL
+                range: range(0x1000, 0x3000),
+                ..original()
             },
             PageAllocation {
-                range: MemoryRange {
-                    start: 0x3000,
-                    end: 0xA000,
-                },
-                ..ORIGINAL
+                range: range(0x3000, 0xA000),
+                ..original()
             },
         ];
-        assert_eq!(exact_cover(&records, ORIGINAL.range), None);
+        assert_eq!(exact_cover(&records, original().range), None);
     }
 
     #[test]
     fn whole_range_free_produces_no_residual_records() {
         assert_eq!(
-            split_allocation(ORIGINAL, ORIGINAL.range, None).unwrap(),
+            split_allocation(original(), original().range, None).unwrap(),
             [None; 3]
         );
     }
@@ -328,14 +563,7 @@ mod tests {
     #[test]
     fn rejects_ranges_outside_the_owned_allocation() {
         assert_eq!(
-            split_allocation(
-                ORIGINAL,
-                MemoryRange {
-                    start: 0,
-                    end: 0x2000,
-                },
-                None,
-            ),
+            split_allocation(original(), range(0, 0x2000), None),
             Err(SplitError::RangeNotContained)
         );
     }
