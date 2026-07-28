@@ -2,26 +2,50 @@
 //!
 //! This module implements page-granular memory allocation compatible with the
 //! EFI AllocatePages/FreePages API. Memory is tracked using a sorted list of
-//! memory descriptors.
+//! memory descriptors. Pool allocations are suballocated from page-backed
+//! chunks grouped by EFI memory type. Pool chunks are intentionally retained
+//! until `ExitBootServices`; individual pool frees never return pages to the
+//! page allocator.
 //!
 //! # State Management
 //!
 //! The allocator state is stored in the centralized `FirmwareState` structure.
 //! Access it via `crate::state::allocator()` or `crate::state::allocator_mut()`.
 
-use crate::state;
+use core::sync::atomic::{AtomicBool, Ordering};
+
 use heapless::Vec;
 use r_efi::efi;
 
-/// Maximum number of memory map entries we can track
-/// Windows bootloader can create many small allocations, so we need a large buffer
-// SCT loads dozens of PE/COFF images whose code/data sections legitimately
-// create more than 1024 live descriptors. The map is compacted after each
-// mutation, so this bound covers real live regions rather than stale splits.
+use crate::state;
+
+// Keep these dependency-free helpers in flat files so the CI regression job
+// can compile and execute them directly with `rustc --test`.
+#[path = "page_ownership.rs"]
+mod page_ownership;
+#[path = "pool_free_list.rs"]
+mod pool_free_list;
+use page_ownership::{MemoryRange, exact_cover, split_allocation};
+use pool_free_list::{
+    POOL_ALLOCATED_MAGIC, POOL_FREE_MAGIC, PoolHeader, PoolListError, PoolState, align_pool_size,
+};
+
+type PageAllocation = page_ownership::PageAllocation<MemoryType>;
+
+/// Maximum number of memory map entries we can track.
+///
+/// SCT exceeded the previous 512-entry table while loading dozens of PE/COFF
+/// images. The map is compacted after each mutation; 2048 entries provide
+/// headroom for genuinely live descriptors at a static cost of about 80 KiB.
 const MAX_MEMORY_ENTRIES: usize = 2048;
-// AllocatePool currently uses page-granular backing, and SCT keeps several
-// thousand small pool allocations live while registering its test catalog.
-const MAX_PAGE_ALLOCATIONS: usize = 8192;
+
+/// Maximum number of live page allocations.
+///
+/// Pool requests are suballocated from chunks, so they consume one record per
+/// chunk rather than one record per EFI pool allocation. Keeping this metadata
+/// inline avoids depending on the heap that the page allocator bootstraps.
+/// The table occupies about 64 KiB with the ownership metadata below.
+const MAX_PAGE_ALLOCATIONS: usize = 2048;
 
 /// Page size (4KB)
 pub const PAGE_SIZE: u64 = 4096;
@@ -89,19 +113,11 @@ pub enum MemoryType {
 }
 
 impl MemoryType {
-    /// Check if this memory type is available for allocation
-    pub fn is_allocatable(&self) -> bool {
-        matches!(self, MemoryType::ConventionalMemory)
-    }
-
-    /// Check if this memory type should be freed after ExitBootServices
-    pub fn is_boot_services(&self) -> bool {
-        matches!(
+    /// Check whether UEFI allocation services may allocate this memory type.
+    pub const fn is_valid_allocation_type(self) -> bool {
+        !matches!(
             self,
-            MemoryType::BootServicesCode
-                | MemoryType::BootServicesData
-                | MemoryType::LoaderCode
-                | MemoryType::LoaderData
+            MemoryType::ConventionalMemory | MemoryType::PersistentMemory
         )
     }
 
@@ -220,16 +236,42 @@ impl MemoryDescriptor {
             .unwrap_or(u64::MAX)
     }
 
+    fn range(&self) -> MemoryRange {
+        MemoryRange {
+            start: self.physical_start,
+            end: self.end(),
+        }
+    }
+
     /// Get the memory type as enum
     pub fn get_memory_type(&self) -> Option<MemoryType> {
         MemoryType::try_from(self.memory_type).ok()
     }
 }
 
+fn can_merge(left: &MemoryDescriptor, right: &MemoryDescriptor) -> bool {
+    left.end() == right.physical_start
+        && left.memory_type == right.memory_type
+        && left.attribute == right.attribute
+}
+
 #[derive(Clone, Copy)]
-struct PageAllocation {
-    physical_start: u64,
-    number_of_pages: u64,
+struct DescriptorSplit {
+    keep_before: bool,
+    keep_after: bool,
+}
+
+impl DescriptorSplit {
+    fn for_range(descriptor: &MemoryDescriptor, range: MemoryRange) -> Self {
+        Self {
+            keep_before: descriptor.physical_start < range.start,
+            keep_after: descriptor.end() > range.end,
+        }
+    }
+
+    const fn replacement_count(self) -> usize {
+        1 + self.keep_before as usize + self.keep_after as usize
+    }
 }
 
 /// Memory allocator state
@@ -259,6 +301,179 @@ impl MemoryAllocator {
             map_key: 1,
             boot_services_exited: false,
         }
+    }
+
+    fn find_allocation(&self, range: MemoryRange) -> Option<(usize, PageAllocation)> {
+        self.allocations
+            .iter()
+            .copied()
+            .enumerate()
+            .find(|(_, allocation)| allocation.contains(range))
+    }
+
+    fn find_descriptor(&self, range: MemoryRange, types: &[MemoryType]) -> Option<usize> {
+        self.entries.iter().position(|entry| {
+            entry
+                .get_memory_type()
+                .is_some_and(|memory_type| types.contains(&memory_type))
+                && entry.range().contains(range)
+        })
+    }
+
+    fn record_allocation(&mut self, allocation: PageAllocation) -> Result<(), efi::Status> {
+        self.allocations.push(allocation).map_err(|_| {
+            log::error!("Page allocation ownership table is full");
+            efi::Status::OUT_OF_RESOURCES
+        })
+    }
+
+    fn insert_descriptor_prechecked(&mut self, index: usize, descriptor: MemoryDescriptor) {
+        self.entries
+            .insert(index, descriptor)
+            .expect("memory map capacity was pre-checked");
+    }
+
+    fn allocation_replacement_fits(
+        &self,
+        allocation: PageAllocation,
+        range: MemoryRange,
+        replacement: Option<PageAllocation>,
+    ) -> bool {
+        split_allocation(allocation, range, replacement).is_ok_and(|parts| {
+            self.allocations.len() - 1 + parts.iter().flatten().count() <= MAX_PAGE_ALLOCATIONS
+        })
+    }
+
+    fn replace_allocation_range(
+        &mut self,
+        allocation_index: usize,
+        range: MemoryRange,
+        replacement: Option<PageAllocation>,
+    ) -> Result<(), efi::Status> {
+        let parts = split_allocation(self.allocations[allocation_index], range, replacement)
+            .map_err(|_| efi::Status::NOT_FOUND)?;
+        let replacement_count = parts.iter().flatten().count();
+        if self.allocations.len() - 1 + replacement_count > MAX_PAGE_ALLOCATIONS {
+            return Err(efi::Status::OUT_OF_RESOURCES);
+        }
+
+        self.allocations.swap_remove(allocation_index);
+        for allocation in parts.into_iter().flatten() {
+            self.record_allocation(allocation)?;
+        }
+        Ok(())
+    }
+
+    /// Compact the whole map so that splitting `range` fits again.
+    ///
+    /// The compacted outcome is evaluated before anything is mutated, so a
+    /// retry that still would not fit leaves the exported map untouched.
+    fn compact_for_split(
+        &mut self,
+        descriptor_index: usize,
+        range: MemoryRange,
+    ) -> Result<(), efi::Status> {
+        let mut merged_start = descriptor_index;
+        while merged_start > 0
+            && can_merge(&self.entries[merged_start - 1], &self.entries[merged_start])
+        {
+            merged_start -= 1;
+        }
+        let mut merged_end = descriptor_index;
+        while merged_end + 1 < self.entries.len()
+            && can_merge(&self.entries[merged_end], &self.entries[merged_end + 1])
+        {
+            merged_end += 1;
+        }
+        let compacted = MemoryDescriptor {
+            physical_start: self.entries[merged_start].physical_start,
+            number_of_pages: (self.entries[merged_end].end()
+                - self.entries[merged_start].physical_start)
+                / PAGE_SIZE,
+            ..self.entries[descriptor_index]
+        };
+
+        let split = DescriptorSplit::for_range(&compacted, range);
+        let compacted_len = self.count_merged_entries();
+        if compacted_len - 1 + split.replacement_count() > MAX_MEMORY_ENTRIES {
+            log::warn!(
+                "Memory map full ({} entries, {} after compaction), cannot split descriptor",
+                self.entries.len(),
+                compacted_len
+            );
+            return Err(efi::Status::OUT_OF_RESOURCES);
+        }
+        self.merge_entries();
+        Ok(())
+    }
+
+    /// Retype a range inside one descriptor while preserving its head and tail.
+    fn retype_range(
+        &mut self,
+        mut descriptor_index: usize,
+        range: MemoryRange,
+        memory_type: MemoryType,
+        attribute: u64,
+    ) -> Result<(), efi::Status> {
+        let mut descriptor = self.entries[descriptor_index];
+        if !descriptor.range().contains(range) {
+            return Err(efi::Status::NOT_FOUND);
+        }
+
+        let original_type = descriptor.get_memory_type().ok_or(efi::Status::NOT_FOUND)?;
+        let mut split = DescriptorSplit::for_range(&descriptor, range);
+        if self.entries.len() - 1 + split.replacement_count() > MAX_MEMORY_ENTRIES {
+            self.compact_for_split(descriptor_index, range)?;
+            descriptor_index = self
+                .find_descriptor(range, &[original_type])
+                .ok_or(efi::Status::NOT_FOUND)?;
+            descriptor = self.entries[descriptor_index];
+            split = DescriptorSplit::for_range(&descriptor, range);
+            debug_assert!(self.entries.len() - 1 + split.replacement_count() <= MAX_MEMORY_ENTRIES);
+        }
+
+        self.entries.remove(descriptor_index);
+        let mut insert_at = descriptor_index;
+
+        if split.keep_before {
+            self.insert_descriptor_prechecked(
+                insert_at,
+                MemoryDescriptor::new(
+                    original_type,
+                    descriptor.physical_start,
+                    (range.start - descriptor.physical_start) / PAGE_SIZE,
+                    descriptor.attribute,
+                ),
+            );
+            insert_at += 1;
+        }
+
+        let retyped_index = insert_at;
+        self.insert_descriptor_prechecked(
+            insert_at,
+            MemoryDescriptor::new(
+                memory_type,
+                range.start,
+                range.number_of_pages(PAGE_SIZE),
+                attribute,
+            ),
+        );
+        insert_at += 1;
+
+        if split.keep_after {
+            self.insert_descriptor_prechecked(
+                insert_at,
+                MemoryDescriptor::new(
+                    original_type,
+                    range.end,
+                    (descriptor.end() - range.end) / PAGE_SIZE,
+                    descriptor.attribute,
+                ),
+            );
+        }
+
+        self.merge_near(retyped_index);
+        Ok(())
     }
 
     /// Initialize the allocator from a platform-provided memory map.
@@ -580,7 +795,39 @@ impl MemoryAllocator {
         )
     }
 
-    /// Allocate pages of memory
+    fn allocation_attribute(memory_type: MemoryType, source_attribute: u64) -> u64 {
+        match memory_type {
+            MemoryType::RuntimeServicesCode => {
+                (source_attribute | attributes::EFI_MEMORY_RUNTIME) & !attributes::EFI_MEMORY_XP
+            }
+            MemoryType::RuntimeServicesData => {
+                source_attribute | attributes::EFI_MEMORY_RUNTIME | attributes::EFI_MEMORY_XP
+            }
+            _ => source_attribute,
+        }
+    }
+
+    fn allocate_conventional_range(
+        &mut self,
+        range: MemoryRange,
+        memory_type: MemoryType,
+    ) -> Result<(), efi::Status> {
+        let descriptor_index = self
+            .find_descriptor(range, &[MemoryType::ConventionalMemory])
+            .ok_or(efi::Status::NOT_FOUND)?;
+        let restore_attribute = self.entries[descriptor_index].attribute;
+        let attribute = Self::allocation_attribute(memory_type, restore_attribute);
+        self.retype_range(descriptor_index, range, memory_type, attribute)?;
+        self.record_allocation(PageAllocation {
+            range,
+            memory_type,
+            restore_attribute,
+        })?;
+        self.map_key += 1;
+        Ok(())
+    }
+
+    /// Allocate pages of memory.
     pub fn allocate_pages(
         &mut self,
         alloc_type: AllocateType,
@@ -588,184 +835,146 @@ impl MemoryAllocator {
         num_pages: u64,
         memory: &mut u64,
     ) -> efi::Status {
-        if num_pages == 0 {
+        if num_pages == 0 || !memory_type.is_valid_allocation_type() {
             return efi::Status::INVALID_PARAMETER;
         }
-
         if self.boot_services_exited {
             return efi::Status::UNSUPPORTED;
         }
-        if self.allocations.is_full() {
-            return efi::Status::OUT_OF_RESOURCES;
-        }
-
-        // Check for overflow in size calculation
-        let size = match num_pages.checked_mul(PAGE_SIZE) {
-            Some(s) => s,
-            None => return efi::Status::OUT_OF_RESOURCES,
-        };
-
-        match alloc_type {
-            AllocateType::AllocateAnyPages => {
-                // Find any free region that fits
-                if let Some(addr) = self.find_free_pages(num_pages, u64::MAX) {
-                    match self.carve_out(addr, num_pages, memory_type) {
-                        Ok(()) => {
-                            let _ = self.allocations.push(PageAllocation {
-                                physical_start: addr,
-                                number_of_pages: num_pages,
-                            });
-                            *memory = addr;
-                            efi::Status::SUCCESS
-                        }
-                        Err(status) => status,
-                    }
-                } else {
-                    efi::Status::OUT_OF_RESOURCES
-                }
-            }
-            AllocateType::AllocateMaxAddress => {
-                // Find free region below the specified address
-                let max_addr = *memory;
-                if let Some(addr) = self.find_free_pages(num_pages, max_addr) {
-                    match self.carve_out(addr, num_pages, memory_type) {
-                        Ok(()) => {
-                            let _ = self.allocations.push(PageAllocation {
-                                physical_start: addr,
-                                number_of_pages: num_pages,
-                            });
-                            *memory = addr;
-                            efi::Status::SUCCESS
-                        }
-                        Err(status) => status,
-                    }
-                } else {
-                    efi::Status::OUT_OF_RESOURCES
-                }
-            }
+        let address = match alloc_type {
+            AllocateType::AllocateAnyPages => self.find_free_pages(num_pages, u64::MAX),
+            AllocateType::AllocateMaxAddress => self.find_free_pages(num_pages, *memory),
             AllocateType::AllocateAddress => {
-                // Allocate at exact address
-                let addr = *memory;
-                if !addr.is_multiple_of(PAGE_SIZE) {
+                if !memory.is_multiple_of(PAGE_SIZE) {
                     return efi::Status::INVALID_PARAMETER;
                 }
-
-                // Check if the region is available (ConventionalMemory)
-                if self.is_region_free(addr, size) {
-                    match self.carve_out(addr, num_pages, memory_type) {
-                        Ok(()) => {
-                            let _ = self.allocations.push(PageAllocation {
-                                physical_start: addr,
-                                number_of_pages: num_pages,
-                            });
-                            efi::Status::SUCCESS
-                        }
-                        Err(status) => status,
-                    }
-                } else {
-                    // Check if requested region is within an existing LoaderCode/LoaderData region
-                    // The bootloader may be trying to "sub-allocate" within its own image space
-                    // This can happen when SizeOfImage is larger than actually used sections
-                    if self.try_reallocate_loader_region(addr, num_pages, memory_type) {
-                        efi::Status::SUCCESS
-                    } else {
-                        efi::Status::NOT_FOUND
-                    }
-                }
+                Some(*memory)
             }
+        };
+        let Some(address) = address else {
+            return efi::Status::OUT_OF_RESOURCES;
+        };
+        let Some(range) = MemoryRange::from_pages(address, num_pages, PAGE_SIZE) else {
+            return efi::Status::OUT_OF_RESOURCES;
+        };
+
+        let result = if self
+            .find_descriptor(range, &[MemoryType::ConventionalMemory])
+            .is_some()
+        {
+            if self.allocations.is_full() {
+                return efi::Status::OUT_OF_RESOURCES;
+            }
+            self.allocate_conventional_range(range, memory_type)
+        } else if alloc_type == AllocateType::AllocateAddress {
+            // Some loaders claim a subrange of their image allocation. Split
+            // both the descriptor and ownership record so the three ranges can
+            // subsequently be freed independently.
+            let loader_types = [MemoryType::LoaderCode, MemoryType::LoaderData];
+            let descriptor_index = match self.find_descriptor(range, &loader_types) {
+                Some(index) => index,
+                None => return efi::Status::NOT_FOUND,
+            };
+            let descriptor = self.entries[descriptor_index];
+            let containing_allocation = self.find_allocation(range);
+            log::debug!(
+                "AllocateAddress loader claim: range={:#x?}, type={:?}, parent={:?}",
+                range,
+                memory_type,
+                containing_allocation.map(|(_, allocation)| allocation.range)
+            );
+            let replacement = PageAllocation {
+                range,
+                memory_type,
+                restore_attribute: descriptor.attribute,
+            };
+            if let Some((_, allocation)) = containing_allocation {
+                if !self.allocation_replacement_fits(allocation, range, Some(replacement)) {
+                    return efi::Status::OUT_OF_RESOURCES;
+                }
+            } else if self.allocations.is_full() {
+                return efi::Status::OUT_OF_RESOURCES;
+            }
+
+            let attribute = Self::allocation_attribute(memory_type, descriptor.attribute);
+            self.retype_range(descriptor_index, range, memory_type, attribute)
+                .and_then(|()| {
+                    if let Some((allocation_index, _)) = containing_allocation {
+                        self.replace_allocation_range(allocation_index, range, Some(replacement))
+                    } else {
+                        self.record_allocation(replacement)
+                    }
+                })
+                .map(|()| self.map_key += 1)
+        } else {
+            Err(efi::Status::NOT_FOUND)
+        };
+
+        match result {
+            Ok(()) => {
+                *memory = address;
+                efi::Status::SUCCESS
+            }
+            Err(status) => status,
         }
     }
 
-    /// Free previously allocated pages
+    /// Free a page allocation or an allocated subrange.
+    ///
+    /// Subrange frees split the ownership record so the residual ranges remain
+    /// independently freeable, matching the behavior expected by common UEFI
+    /// loaders.
+    ///
+    /// A whole-range free may span multiple ownership records only when their
+    /// memory type and restore attributes match. A range crossing a differently
+    /// typed loader subclaim has no single memory descriptor to restore and
+    /// returns [`efi::Status::NOT_FOUND`].
     pub fn free_pages(&mut self, memory: u64, num_pages: u64) -> efi::Status {
-        if !memory.is_multiple_of(PAGE_SIZE) {
+        if !memory.is_multiple_of(PAGE_SIZE) || num_pages == 0 {
             return efi::Status::INVALID_PARAMETER;
         }
-
-        if num_pages == 0 {
-            return efi::Status::INVALID_PARAMETER;
-        }
-
         if self.boot_services_exited {
             return efi::Status::UNSUPPORTED;
         }
-        let Some(allocation_index) = self.allocations.iter().position(|allocation| {
-            allocation.physical_start == memory && allocation.number_of_pages == num_pages
-        }) else {
+        let Some(range) = MemoryRange::from_pages(memory, num_pages, PAGE_SIZE) else {
+            return efi::Status::INVALID_PARAMETER;
+        };
+        let allocation = self.find_allocation(range);
+        let cover = allocation
+            .map(|(_, allocation)| allocation)
+            .or_else(|| exact_cover(self.allocations.as_slice(), range));
+        let Some(cover) = cover else {
             return efi::Status::NOT_FOUND;
         };
-
-        let size = match num_pages.checked_mul(PAGE_SIZE) {
-            Some(size) => size,
-            None => return efi::Status::INVALID_PARAMETER,
-        };
-        let end = match memory.checked_add(size) {
-            Some(end) => end,
-            None => return efi::Status::INVALID_PARAMETER,
-        };
-
-        // Allocations of the same type may have been merged to keep the map
-        // compact, so accept an exact subrange of a boot-services descriptor.
-        let Some(idx) = self.entries.iter().position(|entry| {
-            entry
-                .get_memory_type()
-                .is_some_and(|memory_type| memory_type.is_boot_services())
-                && entry.physical_start <= memory
-                && entry.end() >= end
-        }) else {
+        let Some(descriptor_index) = self.find_descriptor(range, &[cover.memory_type]) else {
             return efi::Status::NOT_FOUND;
         };
-
-        let entry = self.entries[idx];
-        let need_before = entry.physical_start < memory;
-        let need_after = entry.end() > end;
-        let new_entries_needed = 1 + need_before as usize + need_after as usize;
-        if self.entries.len() + new_entries_needed - 1 > MAX_MEMORY_ENTRIES {
+        if let Some((_, allocation)) = allocation
+            && !self.allocation_replacement_fits(allocation, range, None)
+        {
             return efi::Status::OUT_OF_RESOURCES;
         }
 
-        self.entries.remove(idx);
-        let mut insert_at = idx;
-        if need_before {
-            let before_pages = (memory - entry.physical_start) / PAGE_SIZE;
-            let _ = self.entries.insert(
-                insert_at,
-                MemoryDescriptor::new(
-                    entry.get_memory_type().unwrap(),
-                    entry.physical_start,
-                    before_pages,
-                    entry.attribute,
-                ),
-            );
-            insert_at += 1;
+        if let Err(status) = self.retype_range(
+            descriptor_index,
+            range,
+            MemoryType::ConventionalMemory,
+            cover.restore_attribute,
+        ) {
+            return status;
         }
-        let conventional_index = insert_at;
-        let _ = self.entries.insert(
-            insert_at,
-            MemoryDescriptor::new(
-                MemoryType::ConventionalMemory,
-                memory,
-                num_pages,
-                entry.attribute,
-            ),
-        );
-        insert_at += 1;
-        if need_after {
-            let after_pages = (entry.end() - end) / PAGE_SIZE;
-            let _ = self.entries.insert(
-                insert_at,
-                MemoryDescriptor::new(
-                    entry.get_memory_type().unwrap(),
-                    end,
-                    after_pages,
-                    entry.attribute,
-                ),
-            );
+        if let Some((allocation_index, _)) = allocation {
+            if let Err(status) = self.replace_allocation_range(allocation_index, range, None) {
+                return status;
+            }
+        } else {
+            for index in (0..self.allocations.len()).rev() {
+                if range.contains(self.allocations[index].range) {
+                    self.allocations.swap_remove(index);
+                }
+            }
         }
-
-        self.allocations.swap_remove(allocation_index);
         self.map_key += 1;
-        self.merge_near(conventional_index);
         efi::Status::SUCCESS
     }
 
@@ -800,11 +1009,7 @@ impl MemoryAllocator {
 
             // Merge adjacent same-type/attribute entries into the output buffer
             let out_count = self.entries.iter().fold(0usize, |out_idx, entry| {
-                if out_idx > 0
-                    && map[out_idx - 1].memory_type == entry.memory_type
-                    && map[out_idx - 1].attribute == entry.attribute
-                    && map[out_idx - 1].end() == entry.physical_start
-                {
+                if out_idx > 0 && can_merge(&map[out_idx - 1], entry) {
                     map[out_idx - 1].number_of_pages += entry.number_of_pages;
                     out_idx
                 } else {
@@ -838,11 +1043,7 @@ impl MemoryAllocator {
     fn count_merged_entries(&self) -> usize {
         self.entries
             .windows(2)
-            .filter(|pair| {
-                pair[0].memory_type != pair[1].memory_type
-                    || pair[0].attribute != pair[1].attribute
-                    || pair[0].end() != pair[1].physical_start
-            })
+            .filter(|pair| !can_merge(&pair[0], &pair[1]))
             .count()
             + if self.entries.is_empty() { 0 } else { 1 }
     }
@@ -922,6 +1123,7 @@ impl MemoryAllocator {
         }
 
         self.boot_services_exited = true;
+        disable_pool_allocator();
 
         // Log handoff-critical regions: runtime services must keep the
         // RUNTIME attribute, and loader regions must remain reserved for the
@@ -968,6 +1170,9 @@ impl MemoryAllocator {
             }
         }
 
+        // Ownership records are a Boot Services implementation detail. They
+        // must not retain stale claims on memory handed to the OS.
+        self.allocations.clear();
         self.map_key += 1;
         self.merge_entries();
 
@@ -1020,186 +1225,6 @@ impl MemoryAllocator {
         None
     }
 
-    /// Check if a region is free (all pages are ConventionalMemory)
-    fn is_region_free(&self, start: u64, size: u64) -> bool {
-        // Check for overflow - if it overflows, the region can't be free
-        let end = match start.checked_add(size) {
-            Some(e) => e,
-            None => return false,
-        };
-
-        let found = self.entries.iter().any(|entry| {
-            entry.get_memory_type() == Some(MemoryType::ConventionalMemory)
-                && entry.physical_start <= start
-                && entry.end() >= end
-        });
-
-        if !found {
-            // Debug: find what's at this address
-            let containing = self
-                .entries
-                .iter()
-                .find(|entry| entry.physical_start <= start && entry.end() > start);
-            if let Some(entry) = containing {
-                log::debug!(
-                    "is_region_free({:#x}, {:#x}): found {:?} at {:#x}-{:#x} (need end >= {:#x})",
-                    start,
-                    size,
-                    entry.get_memory_type(),
-                    entry.physical_start,
-                    entry.end(),
-                    end
-                );
-            } else {
-                log::debug!(
-                    "is_region_free({:#x}, {:#x}): no entry contains this address",
-                    start,
-                    size
-                );
-                // Dump nearby entries to understand the gap
-                for entry in self.entries.iter() {
-                    if entry.end() >= start.saturating_sub(0x100000)
-                        && entry.physical_start <= start.saturating_add(0x100000)
-                    {
-                        log::debug!(
-                            "  nearby: {:#x}-{:#x} {:?}",
-                            entry.physical_start,
-                            entry.end(),
-                            entry.get_memory_type()
-                        );
-                    }
-                }
-            }
-        }
-
-        found
-    }
-
-    /// Try to reallocate within an existing LoaderCode/LoaderData region
-    ///
-    /// Some bootloaders (like Windows) allocate a large SizeOfImage but only use
-    /// part of it, then try to allocate more pages within that same region.
-    /// This function handles that case by splitting the existing region.
-    fn try_reallocate_loader_region(
-        &mut self,
-        addr: u64,
-        num_pages: u64,
-        memory_type: MemoryType,
-    ) -> bool {
-        let size = match num_pages.checked_mul(PAGE_SIZE) {
-            Some(s) => s,
-            None => return false,
-        };
-        let end = match addr.checked_add(size) {
-            Some(e) => e,
-            None => return false,
-        };
-
-        // Find entry containing this address that is LoaderCode or LoaderData
-        let found_idx = self.entries.iter().position(|entry| {
-            let is_loader = matches!(
-                entry.get_memory_type(),
-                Some(MemoryType::LoaderCode) | Some(MemoryType::LoaderData)
-            );
-            is_loader && entry.physical_start <= addr && entry.end() >= end
-        });
-
-        let idx = match found_idx {
-            Some(i) => i,
-            None => return false,
-        };
-
-        let entry = self.entries[idx];
-        // Safety: the position() search above already matched on get_memory_type()
-        // returning Some(LoaderCode | LoaderData), so this cannot be None.
-        let original_type = match entry.get_memory_type() {
-            Some(t) => t,
-            None => return false,
-        };
-
-        // If the requested type is the same as the existing type, this is effectively
-        // a no-op - the memory is already allocated as the requested type.
-        // Some bootloaders expect this to succeed.
-        if original_type == memory_type {
-            log::debug!(
-                "AllocateAddress: region {:#x}-{:#x} already {:?}, treating as success",
-                addr,
-                end,
-                memory_type
-            );
-            // Don't modify the memory map or map_key - nothing actually changed
-            return true;
-        }
-
-        // Different type requested - we need to split the region
-        log::debug!(
-            "AllocateAddress: splitting {:?} region at {:#x} for {:?}",
-            original_type,
-            addr,
-            memory_type
-        );
-
-        // Check whether a split might need more map capacity. If compaction is
-        // required, re-find and fully recompute the containing descriptor.
-        let initial_new_entries =
-            1 + (entry.physical_start < addr) as usize + (entry.end() > end) as usize;
-        let idx = if self.entries.len() + initial_new_entries - 1 > MAX_MEMORY_ENTRIES {
-            self.merge_entries();
-            match self.entries.iter().position(|entry| {
-                let is_loader = matches!(
-                    entry.get_memory_type(),
-                    Some(MemoryType::LoaderCode) | Some(MemoryType::LoaderData)
-                );
-                is_loader && entry.physical_start <= addr && entry.end() >= end
-            }) {
-                Some(i) => i,
-                None => return false,
-            }
-        } else {
-            idx
-        };
-
-        let entry = self.entries[idx];
-        let Some(original_type) = entry.get_memory_type() else {
-            return false;
-        };
-        let need_before = entry.physical_start < addr;
-        let need_after = entry.end() > end;
-        let new_entries_needed = 1 + need_before as usize + need_after as usize;
-        if self.entries.len() + new_entries_needed - 1 > MAX_MEMORY_ENTRIES {
-            log::warn!("Memory map full, cannot split loader region");
-            return false;
-        }
-        let attribute = entry.attribute;
-
-        // Remove the old entry
-        self.entries.remove(idx);
-
-        let mut insert_at = idx;
-        if need_before {
-            let before_pages = (addr - entry.physical_start) / PAGE_SIZE;
-            let before =
-                MemoryDescriptor::new(original_type, entry.physical_start, before_pages, attribute);
-            let _ = self.entries.insert(insert_at, before);
-            insert_at += 1;
-        }
-
-        let new_region_index = insert_at;
-        let new_region = MemoryDescriptor::new(memory_type, addr, num_pages, attribute);
-        let _ = self.entries.insert(insert_at, new_region);
-        insert_at += 1;
-
-        if need_after {
-            let after_pages = (entry.end() - end) / PAGE_SIZE;
-            let after = MemoryDescriptor::new(original_type, end, after_pages, attribute);
-            let _ = self.entries.insert(insert_at, after);
-        }
-
-        self.map_key += 1;
-        self.merge_near(new_region_index);
-        true
-    }
-
     /// Carve out a region from existing memory and mark it as a new type
     ///
     /// By default, carves from ConventionalMemory. Use `carve_out_from` to
@@ -1230,103 +1255,15 @@ impl MemoryAllocator {
         memory_type: MemoryType,
         source_types: &[MemoryType],
     ) -> Result<(), efi::Status> {
-        // Check for overflow in size calculation
-        let size = num_pages
-            .checked_mul(PAGE_SIZE)
+        let range = MemoryRange::from_pages(addr, num_pages, PAGE_SIZE)
             .ok_or(efi::Status::INVALID_PARAMETER)?;
-        let end = addr
-            .checked_add(size)
-            .ok_or(efi::Status::INVALID_PARAMETER)?;
-
-        // Find the entry containing this region (must be one of source_types)
-        let found_idx = self.entries.iter().position(|entry| {
-            entry
-                .get_memory_type()
-                .is_some_and(|mt| source_types.contains(&mt))
-                && entry.physical_start <= addr
-                && entry.end() >= end
-        });
-
-        let idx = found_idx.ok_or(efi::Status::NOT_FOUND)?;
-        let entry = self.entries[idx];
-        let initial_new_entries =
-            1 + (entry.physical_start < addr) as usize + (entry.end() > end) as usize;
-        let idx = if self.entries.len() + initial_new_entries - 1 > MAX_MEMORY_ENTRIES {
-            self.merge_entries();
-            self.entries
-                .iter()
-                .position(|entry| {
-                    entry
-                        .get_memory_type()
-                        .is_some_and(|mt| source_types.contains(&mt))
-                        && entry.physical_start <= addr
-                        && entry.end() >= end
-                })
-                .ok_or(efi::Status::NOT_FOUND)?
-        } else {
-            idx
-        };
-
-        let entry = self.entries[idx];
-        let original_type = entry
-            .get_memory_type()
-            .unwrap_or(MemoryType::ReservedMemoryType);
-        let need_before = entry.physical_start < addr;
-        let need_after = entry.end() > end;
-        let new_entries_needed = 1 + need_before as usize + need_after as usize;
-        if self.entries.len() + new_entries_needed - 1 > MAX_MEMORY_ENTRIES {
-            log::warn!(
-                "Memory map full ({} entries), cannot carve out region",
-                self.entries.len()
-            );
-            return Err(efi::Status::OUT_OF_RESOURCES);
-        }
-
-        // Now safe to remove the old entry
-        self.entries.remove(idx);
-
-        // Add up to 3 new entries: before, carved, after
-        let mut attribute = entry.attribute;
-
-        // RuntimeServicesCode/Data must have EFI_MEMORY_RUNTIME attribute
-        // so the OS knows to keep them mapped after ExitBootServices
-        if memory_type == MemoryType::RuntimeServicesCode {
-            // Code must be executable: clear EFI_MEMORY_XP (NX bit)
-            attribute |= attributes::EFI_MEMORY_RUNTIME;
-            attribute &= !attributes::EFI_MEMORY_XP;
-        } else if memory_type == MemoryType::RuntimeServicesData {
-            // Data should not be executable: set EFI_MEMORY_XP (NX bit)
-            attribute |= attributes::EFI_MEMORY_RUNTIME;
-            attribute |= attributes::EFI_MEMORY_XP;
-        }
-
-        let mut insert_at = idx;
-        if need_before {
-            let before_pages = (addr - entry.physical_start) / PAGE_SIZE;
-            let before = MemoryDescriptor::new(
-                original_type,
-                entry.physical_start,
-                before_pages,
-                entry.attribute,
-            );
-            let _ = self.entries.insert(insert_at, before);
-            insert_at += 1;
-        }
-
-        let carved_index = insert_at;
-        let carved = MemoryDescriptor::new(memory_type, addr, num_pages, attribute);
-        let _ = self.entries.insert(insert_at, carved);
-        insert_at += 1;
-
-        if need_after {
-            let after_pages = (entry.end() - end) / PAGE_SIZE;
-            let after = MemoryDescriptor::new(original_type, end, after_pages, entry.attribute);
-            let _ = self.entries.insert(insert_at, after);
-        }
-
+        let descriptor_index = self
+            .find_descriptor(range, source_types)
+            .ok_or(efi::Status::NOT_FOUND)?;
+        let attribute =
+            Self::allocation_attribute(memory_type, self.entries[descriptor_index].attribute);
+        self.retype_range(descriptor_index, range, memory_type, attribute)?;
         self.map_key += 1;
-        self.merge_near(carved_index);
-
         Ok(())
     }
 
@@ -1342,16 +1279,15 @@ impl MemoryAllocator {
         if self.entries.len() < 2 {
             return;
         }
-        let mut current = index.saturating_sub(2);
-        let mut limit = (index + 3).min(self.entries.len() - 1);
-        while current < self.entries.len() - 1 && current <= limit {
-            if self.entries[current].end() == self.entries[current + 1].physical_start
-                && self.entries[current].memory_type == self.entries[current + 1].memory_type
-                && self.entries[current].attribute == self.entries[current + 1].attribute
-            {
+        // A retype inserts at most three descriptors. Only the replacement's
+        // two internal boundaries and its immediate outer neighbours can merge.
+        let mut current = index.saturating_sub(1);
+        let mut end = (index + 3).min(self.entries.len());
+        while current + 1 < end {
+            if can_merge(&self.entries[current], &self.entries[current + 1]) {
                 self.entries[current].number_of_pages += self.entries[current + 1].number_of_pages;
                 self.entries.remove(current + 1);
-                limit = limit.saturating_sub(1).min(self.entries.len() - 1);
+                end -= 1;
             } else {
                 current += 1;
             }
@@ -1366,14 +1302,7 @@ impl MemoryAllocator {
 
         let mut i = 0;
         while i < self.entries.len() - 1 {
-            let current_end = self.entries[i].end();
-            let next_start = self.entries[i + 1].physical_start;
-
-            // Check if entries are adjacent and have same type/attributes
-            if current_end == next_start
-                && self.entries[i].memory_type == self.entries[i + 1].memory_type
-                && self.entries[i].attribute == self.entries[i + 1].attribute
-            {
+            if can_merge(&self.entries[i], &self.entries[i + 1]) {
                 // Merge: extend current entry and remove next
                 self.entries[i].number_of_pages += self.entries[i + 1].number_of_pages;
                 self.entries.remove(i + 1);
@@ -1531,130 +1460,61 @@ pub fn exit_boot_services(map_key: usize) -> efi::Status {
     state::with_allocator_mut(|alloc| alloc.exit_boot_services(map_key))
 }
 
-#[repr(C)]
-struct PoolHeader {
-    block_size: usize,
-    magic: u64,
-    memory_type: u32,
-    _reserved: u32,
-}
+// Lock ordering: never hold POOL_STATE while entering the page allocator. Pool
+// growth deliberately drops this lock before AllocatePages to avoid re-entry.
+static POOL_STATE: spin::Mutex<PoolState> = spin::Mutex::new(PoolState::new());
+static POOL_DISABLED: AtomicBool = AtomicBool::new(false);
 
-#[repr(C)]
-struct FreePoolBlock {
-    block_size: usize,
-    next: *mut FreePoolBlock,
-    memory_type: u32,
-    _reserved: u32,
-}
+const BOOT_POOL_CHUNK_PAGES: u64 = 64;
+const RUNTIME_POOL_CHUNK_PAGES: u64 = 4;
 
-struct PoolState {
-    free_head: *mut FreePoolBlock,
-}
-
-// SAFETY: firmware allocation is single-threaded and access is serialized.
-unsafe impl Send for PoolState {}
-
-static POOL_STATE: spin::Mutex<PoolState> = spin::Mutex::new(PoolState {
-    free_head: core::ptr::null_mut(),
-});
-
-const POOL_MAGIC: u64 = 0x504F4F4C_48445200; // "POOLHDR\0"
-const POOL_ALIGNMENT: usize = 8;
-const POOL_CHUNK_PAGES: u64 = 64;
-
-fn align_pool_size(size: usize) -> Option<usize> {
-    size.checked_add(POOL_ALIGNMENT - 1)
-        .map(|size| size & !(POOL_ALIGNMENT - 1))
-}
-
-unsafe fn take_pool_block(memory_type: MemoryType, size: usize) -> Option<(*mut u8, usize)> {
-    let mut state = POOL_STATE.lock();
-    let mut previous: *mut FreePoolBlock = core::ptr::null_mut();
-    let mut current = state.free_head;
-    while !current.is_null() {
-        // SAFETY: free-list nodes are created only from page-backed pool chunks.
-        let block = unsafe { &mut *current };
-        if block.memory_type == memory_type as u32 && block.block_size >= size {
-            let remaining = block.block_size - size;
-            let allocated_size = if remaining >= core::mem::size_of::<FreePoolBlock>() {
-                let replacement = unsafe { (current as *mut u8).add(size).cast::<FreePoolBlock>() };
-                unsafe {
-                    replacement.write(FreePoolBlock {
-                        block_size: remaining,
-                        next: block.next,
-                        memory_type: block.memory_type,
-                        _reserved: 0,
-                    });
-                }
-                if previous.is_null() {
-                    state.free_head = replacement;
-                } else {
-                    unsafe { (*previous).next = replacement };
-                }
-                size
-            } else {
-                if previous.is_null() {
-                    state.free_head = block.next;
-                } else {
-                    unsafe { (*previous).next = block.next };
-                }
-                block.block_size
-            };
-            return Some((current.cast::<u8>(), allocated_size));
-        }
-        previous = current;
-        current = block.next;
-    }
-    None
-}
-
-unsafe fn insert_pool_block(address: *mut u8, size: usize, memory_type: u32) {
-    let block = address.cast::<FreePoolBlock>();
-    let mut state = POOL_STATE.lock();
-    let mut previous: *mut FreePoolBlock = core::ptr::null_mut();
-    let mut current = state.free_head;
-    while !current.is_null() && (current as usize) < address as usize {
-        previous = current;
-        current = unsafe { (*current).next };
-    }
-    unsafe {
-        block.write(FreePoolBlock {
-            block_size: size,
-            next: current,
-            memory_type,
-            _reserved: 0,
-        });
-    }
-    if previous.is_null() {
-        state.free_head = block;
+fn pool_chunk_pages(memory_type: MemoryType) -> u64 {
+    if matches!(
+        memory_type,
+        MemoryType::RuntimeServicesCode | MemoryType::RuntimeServicesData
+    ) {
+        RUNTIME_POOL_CHUNK_PAGES
     } else {
-        unsafe { (*previous).next = block };
+        BOOT_POOL_CHUNK_PAGES
     }
+}
 
-    if !current.is_null()
-        && unsafe { (*block).memory_type == (*current).memory_type }
-        && address as usize + unsafe { (*block).block_size } == current as usize
-    {
-        unsafe {
-            (*block).block_size += (*current).block_size;
-            (*block).next = (*current).next;
+fn disable_pool_allocator() {
+    POOL_DISABLED.store(true, Ordering::Release);
+    POOL_STATE.lock().disable();
+}
+
+fn take_pool_block(memory_type: MemoryType, size: usize) -> Option<(*mut u8, usize)> {
+    match POOL_STATE.lock().take(memory_type as u32, size) {
+        Ok(block) => block,
+        Err(PoolListError::InvalidMagic) => {
+            log::error!("Pool free list contains a node with invalid magic; truncating list");
+            None
+        }
+        Err(PoolListError::BlockSizeOverflow) => {
+            log::error!("Pool free-list block size does not fit usize; truncating list");
+            None
         }
     }
-    if !previous.is_null()
-        && unsafe { (*previous).memory_type == (*block).memory_type }
-        && previous as usize + unsafe { (*previous).block_size } == block as usize
-    {
-        unsafe {
-            (*previous).block_size += (*block).block_size;
-            (*previous).next = (*block).next;
-        }
-    }
+}
+
+/// Insert an owned range into the pool free list.
+///
+/// # Safety
+///
+/// See [`PoolState::insert`]. POOL_STATE must not already be locked.
+unsafe fn insert_pool_block(address: *mut u8, size: usize, memory_type: u32) {
+    // Safety: forwarded from the caller under the documented contract.
+    unsafe { POOL_STATE.lock().insert(address, size, memory_type) };
 }
 
 /// Allocate pool memory from reusable page-backed chunks.
 pub fn allocate_pool(memory_type: MemoryType, size: usize) -> Result<*mut u8, efi::Status> {
-    if size == 0 {
+    if size == 0 || !memory_type.is_valid_allocation_type() {
         return Err(efi::Status::INVALID_PARAMETER);
+    }
+    if POOL_DISABLED.load(Ordering::Acquire) {
+        return Err(efi::Status::UNSUPPORTED);
     }
     let total_size = align_pool_size(
         size.checked_add(core::mem::size_of::<PoolHeader>())
@@ -1662,11 +1522,11 @@ pub fn allocate_pool(memory_type: MemoryType, size: usize) -> Result<*mut u8, ef
     )
     .ok_or(efi::Status::OUT_OF_RESOURCES)?;
 
-    let (address, block_size) = match unsafe { take_pool_block(memory_type, total_size) } {
+    let (address, block_size) = match take_pool_block(memory_type, total_size) {
         Some(block) => block,
         None => {
             let requested_pages = (total_size as u64).div_ceil(PAGE_SIZE);
-            let pages = requested_pages.max(POOL_CHUNK_PAGES);
+            let pages = requested_pages.max(pool_chunk_pages(memory_type));
             let mut address = 0;
             let status = allocate_pages(
                 AllocateType::AllocateAnyPages,
@@ -1677,6 +1537,7 @@ pub fn allocate_pool(memory_type: MemoryType, size: usize) -> Result<*mut u8, ef
             if status != efi::Status::SUCCESS {
                 return Err(status);
             }
+            // Safety: AllocatePages returned exclusive writable pages.
             unsafe {
                 insert_pool_block(
                     address as *mut u8,
@@ -1684,38 +1545,50 @@ pub fn allocate_pool(memory_type: MemoryType, size: usize) -> Result<*mut u8, ef
                     memory_type as u32,
                 )
             };
-            unsafe { take_pool_block(memory_type, total_size) }
-                .ok_or(efi::Status::OUT_OF_RESOURCES)?
+            take_pool_block(memory_type, total_size).ok_or(efi::Status::OUT_OF_RESOURCES)?
         }
     };
 
     let header = address.cast::<PoolHeader>();
+    // Safety: take_pool_block returned an exclusively owned aligned block.
     unsafe {
         header.write(PoolHeader {
-            block_size,
-            magic: POOL_MAGIC,
+            magic: POOL_ALLOCATED_MAGIC,
+            block_size: block_size as u64,
             memory_type: memory_type as u32,
-            _reserved: 0,
+            reserved: 0,
+            padding: 0,
         });
         Ok(address.add(core::mem::size_of::<PoolHeader>()))
     }
 }
 
 /// Return a pool block to the reusable free list.
+///
+/// `buffer` must be a pointer previously returned by [`allocate_pool`], as
+/// required by the UEFI `FreePool` contract.
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
 pub fn free_pool(buffer: *mut u8) -> efi::Status {
-    if buffer.is_null() {
+    if buffer.is_null() || POOL_DISABLED.load(Ordering::Acquire) {
         return efi::Status::INVALID_PARAMETER;
     }
+    // Safety: the UEFI contract requires buffer to be a live AllocatePool result.
     let header = unsafe {
         buffer
             .sub(core::mem::size_of::<PoolHeader>())
             .cast::<PoolHeader>()
     };
-    if unsafe { (*header).magic } != POOL_MAGIC {
+    // Safety: header is readable under the FreePool caller contract.
+    let header_ref = unsafe { &mut *header };
+    if header_ref.magic != POOL_ALLOCATED_MAGIC {
         return efi::Status::INVALID_PARAMETER;
     }
-    let block_size = unsafe { (*header).block_size };
-    let memory_type = unsafe { (*header).memory_type };
+    let Ok(block_size) = usize::try_from(header_ref.block_size) else {
+        return efi::Status::INVALID_PARAMETER;
+    };
+    let memory_type = header_ref.memory_type;
+    header_ref.magic = POOL_FREE_MAGIC;
+    // Safety: this allocation exclusively owns the complete recorded block.
     unsafe { insert_pool_block(header.cast::<u8>(), block_size, memory_type) };
     efi::Status::SUCCESS
 }
@@ -1839,11 +1712,4 @@ pub fn reserve_runtime_region() {
             }
         }
     }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    // Tests would go here
 }
