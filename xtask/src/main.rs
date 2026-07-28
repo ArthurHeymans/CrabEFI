@@ -635,19 +635,20 @@ fn cmd_test(
         let shell_efi = assets_dir.join("shellx64.efi");
         let sct_dir = assets_dir.join("SctPackageX64").join("X64");
 
-        for (label, path) in [
+        if let Some((label, _)) = [
             ("shellx64.efi", &shell_efi),
             ("SctPackageX64/X64", &sct_dir),
-        ] {
-            if !path.exists() {
-                bail!(
-                    "SCT asset not found: {} (looked in {})\n\
-                     Run ci/build-sct-assets.sh --arch x86_64 to build assets, \
-                     or pass --sct-assets-dir",
-                    label,
-                    assets_dir.display(),
-                );
-            }
+        ]
+        .into_iter()
+        .find(|(_, path)| !path.exists())
+        {
+            bail!(
+                "SCT asset not found: {} (looked in {})\n\
+                 Run ci/build-sct-assets.sh --arch x86_64 to build assets, \
+                 or pass --sct-assets-dir",
+                label,
+                assets_dir.display(),
+            );
         }
 
         disk::create_uefi_sct_smoke_disk(

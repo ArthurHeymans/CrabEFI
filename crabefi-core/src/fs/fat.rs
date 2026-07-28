@@ -1317,11 +1317,9 @@ impl<'a> FatFilesystem<'a> {
         let cluster_size = self.sectors_per_cluster as usize * self.bytes_per_sector as usize;
         let base = self.cluster_byte_offset(cluster)?;
         let zero = [0u8; MAX_BLOCK_SIZE];
-        let mut done = 0;
-        while done < cluster_size {
+        for done in (0..cluster_size).step_by(MAX_BLOCK_SIZE) {
             let count = MAX_BLOCK_SIZE.min(cluster_size - done);
             self.partition_write(base + done as u64, &zero[..count])?;
-            done += count;
         }
         Ok(())
     }
@@ -1397,9 +1395,8 @@ impl<'a> FatFilesystem<'a> {
             let base = self.cluster_byte_offset(cluster)?;
             for chunk_start in (0..cluster_size).step_by(chunk) {
                 self.partition_read(base + chunk_start as u64, &mut data[..chunk])?;
-                for local in (0..chunk).step_by(32) {
-                    let position = base + (chunk_start + local) as u64;
-                    let raw = &data[local..local + 32];
+                for (entry_index, raw) in data[..chunk].as_chunks::<32>().0.iter().enumerate() {
+                    let position = base + (chunk_start + entry_index * 32) as u64;
                     let entry =
                         DirectoryEntry::read_from_bytes(raw).map_err(|_| FatError::ReadError)?;
                     if entry.is_end() {
@@ -1452,14 +1449,11 @@ impl<'a> FatFilesystem<'a> {
             let base = self.cluster_byte_offset(cluster)?;
             for chunk_start in (0..cluster_size).step_by(chunk) {
                 self.partition_read(base + chunk_start as u64, &mut data[..chunk])?;
-                for offset in (0..chunk).step_by(32) {
-                    if data[offset] == 0 {
+                for raw in data[..chunk].as_chunks::<32>().0 {
+                    if raw[0] == 0 {
                         return Ok(false);
                     }
-                    if data[offset] != 0xe5
-                        && data[offset + 11] != ATTR_LFN
-                        && data[offset..offset + 11] == short[..]
-                    {
+                    if raw[0] != 0xe5 && raw[11] != ATTR_LFN && raw[..11] == short[..] {
                         return Ok(true);
                     }
                 }
@@ -1545,11 +1539,11 @@ impl<'a> FatFilesystem<'a> {
             let mut run = 0;
             for chunk_start in (0..cluster_size).step_by(chunk) {
                 self.partition_read(base + chunk_start as u64, &mut data[..chunk])?;
-                for local in (0..chunk).step_by(32) {
-                    if data[local] == 0 || data[local] == 0xe5 {
+                for (entry_index, raw) in data[..chunk].as_chunks::<32>().0.iter().enumerate() {
+                    if raw[0] == 0 || raw[0] == 0xe5 {
                         run += 1;
                         if run == count {
-                            let end = chunk_start + local + 32;
+                            let end = chunk_start + (entry_index + 1) * 32;
                             return Ok(base + (end - count * 32) as u64);
                         }
                     } else {
@@ -1565,9 +1559,14 @@ impl<'a> FatFilesystem<'a> {
                     // stop at the old marker and never follow the new FAT link.
                     for chunk_start in (0..cluster_size).step_by(chunk) {
                         self.partition_read(base + chunk_start as u64, &mut data[..chunk])?;
-                        for local in (0..chunk).step_by(32) {
-                            if data[local] == 0 {
-                                self.partition_write(base + (chunk_start + local) as u64, &[0xe5])?;
+                        for (entry_index, raw) in
+                            data[..chunk].as_chunks::<32>().0.iter().enumerate()
+                        {
+                            if raw[0] == 0 {
+                                self.partition_write(
+                                    base + (chunk_start + entry_index * 32) as u64,
+                                    &[0xe5],
+                                )?;
                             }
                         }
                     }

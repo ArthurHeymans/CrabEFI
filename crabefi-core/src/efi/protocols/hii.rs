@@ -11,6 +11,7 @@ use r_efi::{
     hii,
     protocols::{hii_database, hii_string},
 };
+use zerocopy::{FromBytes, Immutable, KnownLayout, Unaligned};
 
 const MAX_PACKAGE_LIST_SIZE: usize = 16 * 1024 * 1024;
 const MAX_PACKAGE_STORAGE: usize = 64 * 1024 * 1024;
@@ -98,6 +99,56 @@ fn handle_value(handle: hii::Handle) -> usize {
     handle as usize
 }
 
+#[repr(C)]
+#[derive(Clone, Copy, FromBytes, Immutable, KnownLayout, Unaligned)]
+struct PackageListPrefix {
+    package_list_guid: [u8; 16],
+    package_length: [u8; 4],
+}
+
+impl PackageListPrefix {
+    fn length(self) -> usize {
+        u32::from_le_bytes(self.package_length) as usize
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, FromBytes, Immutable, KnownLayout, Unaligned)]
+struct PackageHeader {
+    length: [u8; 3],
+    package_type: u8,
+}
+
+impl PackageHeader {
+    fn length(self) -> usize {
+        self.length[0] as usize
+            | ((self.length[1] as usize) << 8)
+            | ((self.length[2] as usize) << 16)
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, FromBytes, Immutable, KnownLayout, Unaligned)]
+struct StringPackagePrefix {
+    header: PackageHeader,
+    header_size: [u8; 4],
+    string_info_offset: [u8; 4],
+    language_window: [[u8; 2]; 16],
+    language_name: [u8; 2],
+}
+
+impl StringPackagePrefix {
+    fn string_info_offset(self) -> usize {
+        u32::from_le_bytes(self.string_info_offset) as usize
+    }
+}
+
+const _: () = {
+    assert!(core::mem::size_of::<PackageListPrefix>() == 20);
+    assert!(core::mem::size_of::<PackageHeader>() == 4);
+    assert!(core::mem::size_of::<StringPackagePrefix>() == 46);
+};
+
 fn read_u16(bytes: &[u8], offset: usize) -> Option<u16> {
     Some(u16::from_le_bytes(
         bytes.get(offset..offset + 2)?.try_into().ok()?,
@@ -110,13 +161,22 @@ fn read_u32(bytes: &[u8], offset: usize) -> Option<u32> {
     ))
 }
 
-fn package_length(bytes: &[u8], offset: usize) -> Option<usize> {
-    let header = bytes.get(offset..offset + 3)?;
-    Some(header[0] as usize | ((header[1] as usize) << 8) | ((header[2] as usize) << 16))
+fn package_list_prefix(bytes: &[u8]) -> Option<PackageListPrefix> {
+    PackageListPrefix::read_from_prefix(bytes)
+        .ok()
+        .map(|(prefix, _)| prefix)
 }
 
-fn package_type(bytes: &[u8], offset: usize) -> Option<u8> {
-    bytes.get(offset + 3).copied()
+fn package_header(bytes: &[u8], offset: usize) -> Option<PackageHeader> {
+    PackageHeader::read_from_prefix(bytes.get(offset..)?)
+        .ok()
+        .map(|(header, _)| header)
+}
+
+fn string_package_prefix(bytes: &[u8]) -> Option<StringPackagePrefix> {
+    StringPackagePrefix::read_from_prefix(bytes)
+        .ok()
+        .map(|(prefix, _)| prefix)
 }
 
 fn package_list_bytes(header: *const hii::PackageListHeader) -> Result<Vec<u8>, Status> {
@@ -124,8 +184,11 @@ fn package_list_bytes(header: *const hii::PackageListHeader) -> Result<Vec<u8>, 
         return Err(Status::INVALID_PARAMETER);
     }
 
-    let length = unsafe { ptr::read_unaligned(ptr::addr_of!((*header).package_length)) } as usize;
-    if !(core::mem::size_of::<hii::PackageListHeader>()..=MAX_PACKAGE_LIST_SIZE).contains(&length) {
+    // SAFETY: the HII protocol requires a non-null argument to reference a
+    // complete package-list header. The wire header may be unaligned.
+    let prefix = unsafe { ptr::read_unaligned(header.cast::<PackageListPrefix>()) };
+    let length = prefix.length();
+    if !(core::mem::size_of::<PackageListPrefix>()..=MAX_PACKAGE_LIST_SIZE).contains(&length) {
         return Err(Status::INVALID_PARAMETER);
     }
 
@@ -141,22 +204,23 @@ fn package_list_bytes(header: *const hii::PackageListHeader) -> Result<Vec<u8>, 
 }
 
 fn valid_package_list(bytes: &[u8]) -> bool {
-    if read_u32(bytes, 16).map(|length| length as usize) != Some(bytes.len()) {
+    if package_list_prefix(bytes).map(PackageListPrefix::length) != Some(bytes.len()) {
         return false;
     }
 
-    let mut offset = core::mem::size_of::<hii::PackageListHeader>();
+    let mut offset = core::mem::size_of::<PackageListPrefix>();
     while offset + 4 <= bytes.len() {
-        let Some(length) = package_length(bytes, offset) else {
+        let Some(header) = package_header(bytes, offset) else {
             return false;
         };
+        let length = header.length();
         let Some(end) = offset.checked_add(length) else {
             return false;
         };
         if length < 4 || end > bytes.len() {
             return false;
         }
-        if package_type(bytes, offset) == Some(hii::PACKAGE_END) {
+        if header.package_type == hii::PACKAGE_END {
             return length == 4 && end == bytes.len();
         }
         offset = end;
@@ -165,13 +229,13 @@ fn valid_package_list(bytes: &[u8]) -> bool {
 }
 
 fn language_of_package(package: &[u8]) -> Option<&[u8]> {
-    // Package header + HdrSize + StringInfoOffset + LanguageWindow + LanguageName.
-    const LANGUAGE_OFFSET: usize = 4 + 4 + 4 + 32 + 2;
+    string_package_prefix(package)?;
+    let language_offset = core::mem::size_of::<StringPackagePrefix>();
     let end = package
-        .get(LANGUAGE_OFFSET..)?
+        .get(language_offset..)?
         .iter()
         .position(|&c| c == 0)?;
-    package.get(LANGUAGE_OFFSET..LANGUAGE_OFFSET + end)
+    package.get(language_offset..language_offset + end)
 }
 
 fn language_eq(left: &[u8], right: &[u8]) -> bool {
@@ -238,7 +302,7 @@ fn find_string_in_package_inner(
         return None;
     }
 
-    let mut offset = read_u32(package, 8)? as usize;
+    let mut offset = string_package_prefix(package)?.string_info_offset();
     if offset >= package.len() {
         return None;
     }
@@ -354,20 +418,24 @@ fn find_string_in_package_inner(
 }
 
 fn string_packages(bytes: &[u8]) -> impl Iterator<Item = &[u8]> {
-    let total = read_u32(bytes, 16).unwrap_or(0) as usize;
+    let total = package_list_prefix(bytes)
+        .map(PackageListPrefix::length)
+        .unwrap_or(0);
     let end = total.min(bytes.len());
-    let mut offset = core::mem::size_of::<hii::PackageListHeader>();
+    let mut offset = core::mem::size_of::<PackageListPrefix>();
     core::iter::from_fn(move || {
-        while offset + 4 <= end {
-            let length = package_length(bytes, offset)?;
-            if length < 4 || offset + length > end {
+        while offset + core::mem::size_of::<PackageHeader>() <= end {
+            let header = package_header(bytes, offset)?;
+            let length = header.length();
+            let package_end = offset.checked_add(length)?;
+            if length < core::mem::size_of::<PackageHeader>() || package_end > end {
                 offset = end;
                 return None;
             }
             let start = offset;
-            offset += length;
-            if package_type(bytes, start) == Some(hii::PACKAGE_STRINGS) {
-                return bytes.get(start..start + length);
+            offset = package_end;
+            if header.package_type == hii::PACKAGE_STRINGS {
+                return bytes.get(start..package_end);
             }
         }
         None
@@ -553,7 +621,7 @@ fn utf16_bytes(string: *const Char16) -> Option<Vec<Char16>> {
 }
 
 fn max_string_id_in_package(package: &[u8]) -> Option<hii::StringId> {
-    let mut offset = read_u32(package, 8)? as usize;
+    let mut offset = string_package_prefix(package)?.string_info_offset();
     let mut id: hii::StringId = 1;
     let mut max = 0;
 
@@ -973,6 +1041,7 @@ extern "efiapi" fn get_secondary_languages(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloc::vec;
 
     #[test]
     fn decodes_shell_style_ucs2_blocks() {

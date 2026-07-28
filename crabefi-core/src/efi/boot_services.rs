@@ -2316,12 +2316,10 @@ extern "efiapi" fn uninstall_multiple_protocol_interfaces(
     let args = [(arg1, arg2), (arg3, arg4), (arg5, arg6), (arg7, arg8)];
     let pair_count = args.iter().take_while(|(guid, _)| !guid.is_null()).count();
 
-    for index in 0..pair_count {
-        let (guid, interface) = args[index];
+    for (index, &(guid, interface)) in args[..pair_count].iter().enumerate() {
         let status = uninstall_protocol_interface(handle, guid as *mut Guid, interface);
         if status != Status::SUCCESS {
-            for rollback_index in (0..index).rev() {
-                let (rollback_guid, rollback_interface) = args[rollback_index];
+            for &(rollback_guid, rollback_interface) in args[..index].iter().rev() {
                 // Uninstalling the last protocol auto-deletes the handle, so it
                 // has to be revived before earlier protocols can be restored.
                 if !restore_handle_entry(handle) {

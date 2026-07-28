@@ -892,18 +892,13 @@ impl UsbMassStorage {
         }
 
         let sectors_per_cmd = (Self::MAX_BYTES_PER_CMD / block_size).max(1) as u32;
+        let chunk_bytes = sectors_per_cmd as usize * block_size;
         let mut scratch = [0u8; Self::MAX_BYTES_PER_CMD];
-        let mut lba = start_lba;
-        let mut remaining = num_sectors;
-        let mut offset = 0;
-        while remaining > 0 {
-            let count = remaining.min(sectors_per_cmd);
-            let len = count as usize * block_size;
-            scratch[..len].copy_from_slice(&buffer[offset..offset + len]);
-            self.write_sectors_with_retry(controller, lba, count, &mut scratch[..len])?;
-            lba += count as u64;
-            remaining -= count;
-            offset += len;
+        for (index, chunk) in buffer[..required].chunks(chunk_bytes).enumerate() {
+            let count = (chunk.len() / block_size) as u32;
+            let lba = start_lba + index as u64 * sectors_per_cmd as u64;
+            scratch[..chunk.len()].copy_from_slice(chunk);
+            self.write_sectors_with_retry(controller, lba, count, &mut scratch[..chunk.len()])?;
         }
         Ok(())
     }
