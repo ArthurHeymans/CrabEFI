@@ -1318,12 +1318,35 @@ impl<'a> FatFilesystem<'a> {
     }
 
     fn allocate_cluster(&mut self) -> Result<u32, FatError> {
-        for cluster in 2..self.data_clusters + 2 {
-            if self.fat32_value(cluster)? == 0 {
-                let zero = [0u8; 65536];
-                self.write_cluster(cluster, &zero)?;
-                self.set_fat32_value(cluster, 0x0fff_ffff)?;
-                return Ok(cluster);
+        self.require_fat32()?;
+        let sector_size = self.bytes_per_sector as usize;
+        let entries_per_sector = sector_size / 4;
+        let mut sector = [0u8; MAX_BLOCK_SIZE];
+        let cluster_limit = self.data_clusters + 2;
+        let fat_offset = self.fat_start as u64 * self.bytes_per_sector as u64;
+
+        for first_cluster in (0..cluster_limit).step_by(entries_per_sector) {
+            self.partition_read(
+                fat_offset + first_cluster as u64 * 4,
+                &mut sector[..sector_size],
+            )?;
+            for index in 0..entries_per_sector {
+                let cluster = first_cluster + index as u32;
+                if cluster < 2 || cluster >= cluster_limit {
+                    continue;
+                }
+                let offset = index * 4;
+                let value = u32::from_le_bytes(
+                    sector[offset..offset + 4]
+                        .try_into()
+                        .map_err(|_| FatError::ReadError)?,
+                ) & 0x0fff_ffff;
+                if value == 0 {
+                    let zero = [0u8; 65536];
+                    self.write_cluster(cluster, &zero)?;
+                    self.set_fat32_value(cluster, 0x0fff_ffff)?;
+                    return Ok(cluster);
+                }
             }
         }
         Err(FatError::NoSpace)
@@ -1457,11 +1480,9 @@ impl<'a> FatFilesystem<'a> {
                 *slot = byte.to_ascii_uppercase();
             }
             if !self.short_name_exists(directory, &short)? {
-                let rendered_upper = extension.is_empty()
-                    && name
-                        .bytes()
-                        .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit());
-                return Ok((short, !rendered_upper));
+                // FAT short-name lookup is case-insensitive; mixed-case 8.3
+                // names do not require an LFN entry for correct resolution.
+                return Ok((short, false));
             }
         }
 
@@ -1518,6 +1539,15 @@ impl<'a> FatFilesystem<'a> {
             match self.next_cluster(cluster)? {
                 Some(next) => cluster = next,
                 None => {
+                    // Once a directory is extended, zero-valued end markers in
+                    // the old tail must become deleted entries. Otherwise readers
+                    // stop at the old marker and never follow the new FAT link.
+                    let base = self.cluster_byte_offset(cluster)?;
+                    for offset in (0..cluster_size).step_by(32) {
+                        if data[offset] == 0 {
+                            self.partition_write(base + offset as u64, &[0xe5])?;
+                        }
+                    }
                     let new = self.append_cluster(cluster)?;
                     return self.cluster_byte_offset(new);
                 }
