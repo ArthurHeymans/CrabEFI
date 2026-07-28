@@ -126,10 +126,31 @@ pub unsafe fn set_file_path(
     protocol: *mut loaded_image::Protocol,
     device_path: *mut DevicePathProtocol,
 ) {
-    if !protocol.is_null() {
-        // SAFETY: Caller guarantees protocol and device_path pointers are valid.
+    if protocol.is_null() || device_path.is_null() {
+        return;
+    }
+
+    // LoadImage callers retain ownership of DevicePath, so LoadedImage must
+    // keep its own copy for the lifetime of the image.
+    let copy = super::device_path_utilities::duplicate_device_path(device_path);
+    if !copy.is_null() {
         unsafe {
-            (*protocol).file_path = device_path;
+            (*protocol).file_path = copy;
         }
+    }
+}
+
+/// Release the FilePath copy owned by a loaded-image protocol.
+///
+/// # Safety
+/// The protocol pointer must be valid and no longer externally accessible.
+pub unsafe fn free_file_path(protocol: *mut loaded_image::Protocol) {
+    if protocol.is_null() {
+        return;
+    }
+    let file_path = unsafe { (*protocol).file_path };
+    if !file_path.is_null() {
+        let _ = super::super::allocator::free_pool(file_path.cast());
+        unsafe { (*protocol).file_path = core::ptr::null_mut() };
     }
 }

@@ -274,8 +274,8 @@ extern "efiapi" fn allocate_pool(
     }
 
     let mem_type = match MemoryType::try_from(pool_type) {
-        Ok(t) => t,
-        Err(_) => return Status::INVALID_PARAMETER,
+        Ok(MemoryType::PersistentMemory) | Err(_) => return Status::INVALID_PARAMETER,
+        Ok(memory_type) => memory_type,
     };
 
     match allocator::allocate_pool(mem_type, size) {
@@ -1376,6 +1376,7 @@ extern "efiapi" fn load_image(
         if let Some(measurement) = deferred_measurement {
             let _ = allocator::free_pool(measurement.event_data);
         }
+        unsafe { super::protocols::loaded_image::free_file_path(loaded_image_protocol) };
         let _ = allocator::free_pool(loaded_image_protocol.cast::<u8>());
         remove_handle_entry(new_handle);
         let cleanup_status = pe::unload_image(&loaded_image);
@@ -1427,6 +1428,7 @@ extern "efiapi" fn load_image(
             &LOADED_IMAGE_PROTOCOL_GUID as *const Guid as *mut Guid,
             loaded_image_protocol.cast(),
         );
+        unsafe { super::protocols::loaded_image::free_file_path(loaded_image_protocol) };
         let _ = allocator::free_pool(loaded_image_protocol.cast::<u8>());
         let cleanup_status = pe::unload_image(&loaded_image);
         return if cleanup_status == Status::SUCCESS {
@@ -1654,6 +1656,11 @@ extern "efiapi" fn unload_image(image_handle: Handle) -> Status {
         let _ = allocator::free_pool(measurement_event_data);
     }
     if !loaded_image_protocol.is_null() {
+        unsafe {
+            super::protocols::loaded_image::free_file_path(
+                loaded_image_protocol.cast::<r_efi::protocols::loaded_image::Protocol>(),
+            )
+        };
         let _ = allocator::free_pool(loaded_image_protocol);
     }
 

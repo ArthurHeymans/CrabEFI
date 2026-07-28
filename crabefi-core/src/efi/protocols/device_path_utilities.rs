@@ -69,7 +69,7 @@ extern "efiapi" fn get_device_path_size(device_path: *const device_path::Protoco
 }
 
 /// `DuplicateDevicePath` — allocate a copy of a device path.
-extern "efiapi" fn duplicate_device_path(
+pub(crate) extern "efiapi" fn duplicate_device_path(
     device_path: *const device_path::Protocol,
 ) -> *mut device_path::Protocol {
     let size = unsafe { device_path_size(device_path) };
