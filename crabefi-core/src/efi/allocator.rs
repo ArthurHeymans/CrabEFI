@@ -26,7 +26,10 @@ use crate::state;
 mod page_ownership;
 #[path = "pool_free_list.rs"]
 mod pool_free_list;
-use page_ownership::{MemoryRange, exact_cover, split_allocation};
+pub use page_ownership::PAGE_SIZE;
+use page_ownership::{
+    PageCount, PageRange, RangeSplit, exact_cover, fits_after_replacement, split_allocation,
+};
 use pool_free_list::{
     POOL_ALLOCATED_MAGIC, POOL_FREE_MAGIC, PoolHeader, PoolListError, PoolState, align_pool_size,
 };
@@ -48,11 +51,8 @@ const MAX_MEMORY_ENTRIES: usize = 2048;
 /// The table occupies about 64 KiB with the ownership metadata below.
 const MAX_PAGE_ALLOCATIONS: usize = 2048;
 
-/// Page size (4KB)
-pub const PAGE_SIZE: u64 = 4096;
-
 /// Page size as usize for convenience
-pub const PAGE_SIZE_USIZE: usize = 4096;
+pub const PAGE_SIZE_USIZE: usize = PAGE_SIZE as usize;
 
 /// Maximum address that is identity-mapped in page tables.
 /// On x86_64: Our assembly code sets up identity mapping for the first 64GB
@@ -191,16 +191,13 @@ pub mod attributes {
 }
 
 trait MemoryDescriptorExt {
-    fn range(&self) -> MemoryRange;
+    fn page_range(&self) -> Option<PageRange>;
     fn get_memory_type(&self) -> Option<MemoryType>;
 }
 
 impl MemoryDescriptorExt for MemoryDescriptor {
-    fn range(&self) -> MemoryRange {
-        MemoryRange {
-            start: self.physical_start,
-            end: self.end(),
-        }
+    fn page_range(&self) -> Option<PageRange> {
+        PageRange::from_bytes(self.physical_start, self.number_of_pages)
     }
 
     fn get_memory_type(&self) -> Option<MemoryType> {
@@ -222,29 +219,26 @@ fn memory_descriptor(
     )
 }
 
+fn descriptor_for_range(
+    memory_type: MemoryType,
+    range: PageRange,
+    attribute: u64,
+) -> MemoryDescriptor {
+    memory_descriptor(
+        memory_type,
+        range.start_bytes(),
+        range.pages().get(),
+        attribute,
+    )
+}
+
 fn can_merge(left: &MemoryDescriptor, right: &MemoryDescriptor) -> bool {
-    left.end() == right.physical_start
-        && left.memory_type == right.memory_type
+    left.memory_type == right.memory_type
         && left.attribute == right.attribute
-}
-
-#[derive(Clone, Copy)]
-struct DescriptorSplit {
-    keep_before: bool,
-    keep_after: bool,
-}
-
-impl DescriptorSplit {
-    fn for_range(descriptor: &MemoryDescriptor, range: MemoryRange) -> Self {
-        Self {
-            keep_before: descriptor.physical_start < range.start,
-            keep_after: descriptor.end() > range.end,
-        }
-    }
-
-    const fn replacement_count(self) -> usize {
-        1 + self.keep_before as usize + self.keep_after as usize
-    }
+        && left
+            .page_range()
+            .zip(right.page_range())
+            .is_some_and(|(left, right)| left.is_adjacent_to(right))
 }
 
 /// Memory allocator state
@@ -276,7 +270,7 @@ impl MemoryAllocator {
         }
     }
 
-    fn find_allocation(&self, range: MemoryRange) -> Option<(usize, PageAllocation)> {
+    fn find_allocation(&self, range: PageRange) -> Option<(usize, PageAllocation)> {
         self.allocations
             .iter()
             .copied()
@@ -284,13 +278,27 @@ impl MemoryAllocator {
             .find(|(_, allocation)| allocation.contains(range))
     }
 
-    fn find_descriptor(&self, range: MemoryRange, types: &[MemoryType]) -> Option<usize> {
+    fn find_descriptor(&self, range: PageRange, types: &[MemoryType]) -> Option<usize> {
         self.entries.iter().position(|entry| {
             entry
                 .get_memory_type()
                 .is_some_and(|memory_type| types.contains(&memory_type))
-                && entry.range().contains(range)
+                && entry
+                    .page_range()
+                    .is_some_and(|entry| entry.contains(range))
         })
+    }
+
+    /// How the descriptor at `descriptor_index` splits around `range`.
+    fn descriptor_split(
+        &self,
+        descriptor_index: usize,
+        range: PageRange,
+    ) -> Result<RangeSplit, efi::Status> {
+        self.entries[descriptor_index]
+            .page_range()
+            .and_then(|descriptor| descriptor.split_around(range))
+            .ok_or(efi::Status::NOT_FOUND)
     }
 
     fn record_allocation(&mut self, allocation: PageAllocation) -> Result<(), efi::Status> {
@@ -309,24 +317,33 @@ impl MemoryAllocator {
     fn allocation_replacement_fits(
         &self,
         allocation: PageAllocation,
-        range: MemoryRange,
+        range: PageRange,
         replacement: Option<PageAllocation>,
     ) -> bool {
         split_allocation(allocation, range, replacement).is_ok_and(|parts| {
-            self.allocations.len() - 1 + parts.iter().flatten().count() <= MAX_PAGE_ALLOCATIONS
+            fits_after_replacement(
+                self.allocations.len(),
+                1,
+                parts.iter().flatten().count(),
+                MAX_PAGE_ALLOCATIONS,
+            )
         })
     }
 
     fn replace_allocation_range(
         &mut self,
         allocation_index: usize,
-        range: MemoryRange,
+        range: PageRange,
         replacement: Option<PageAllocation>,
     ) -> Result<(), efi::Status> {
         let parts = split_allocation(self.allocations[allocation_index], range, replacement)
             .map_err(|_| efi::Status::NOT_FOUND)?;
-        let replacement_count = parts.iter().flatten().count();
-        if self.allocations.len() - 1 + replacement_count > MAX_PAGE_ALLOCATIONS {
+        if !fits_after_replacement(
+            self.allocations.len(),
+            1,
+            parts.iter().flatten().count(),
+            MAX_PAGE_ALLOCATIONS,
+        ) {
             return Err(efi::Status::OUT_OF_RESOURCES);
         }
 
@@ -344,7 +361,7 @@ impl MemoryAllocator {
     fn compact_for_split(
         &mut self,
         descriptor_index: usize,
-        range: MemoryRange,
+        range: PageRange,
     ) -> Result<(), efi::Status> {
         let mut merged_start = descriptor_index;
         while merged_start > 0
@@ -358,17 +375,21 @@ impl MemoryAllocator {
         {
             merged_end += 1;
         }
-        let compacted = MemoryDescriptor {
-            physical_start: self.entries[merged_start].physical_start,
-            number_of_pages: (self.entries[merged_end].end()
-                - self.entries[merged_start].physical_start)
-                / PAGE_SIZE,
-            ..self.entries[descriptor_index]
-        };
 
-        let split = DescriptorSplit::for_range(&compacted, range);
+        let merged = self.entries[merged_start]
+            .page_range()
+            .zip(self.entries[merged_end].page_range())
+            .and_then(|(first, last)| PageRange::spanning(first.start(), last.end()))
+            .ok_or(efi::Status::NOT_FOUND)?;
+        let split = merged.split_around(range).ok_or(efi::Status::NOT_FOUND)?;
+
         let compacted_len = self.count_merged_entries();
-        if compacted_len - 1 + split.replacement_count() > MAX_MEMORY_ENTRIES {
+        if !fits_after_replacement(
+            compacted_len,
+            1,
+            split.replacement_count(),
+            MAX_MEMORY_ENTRIES,
+        ) {
             log::warn!(
                 "Memory map full ({} entries, {} after compaction), cannot split descriptor",
                 self.entries.len(),
@@ -384,65 +405,44 @@ impl MemoryAllocator {
     fn retype_range(
         &mut self,
         mut descriptor_index: usize,
-        range: MemoryRange,
+        range: PageRange,
         memory_type: MemoryType,
         attribute: u64,
     ) -> Result<(), efi::Status> {
-        let mut descriptor = self.entries[descriptor_index];
-        if !descriptor.range().contains(range) {
-            return Err(efi::Status::NOT_FOUND);
-        }
+        let mut split = self.descriptor_split(descriptor_index, range)?;
+        let original = self.entries[descriptor_index];
+        let original_type = original.get_memory_type().ok_or(efi::Status::NOT_FOUND)?;
 
-        let original_type = descriptor.get_memory_type().ok_or(efi::Status::NOT_FOUND)?;
-        let mut split = DescriptorSplit::for_range(&descriptor, range);
-        if self.entries.len() - 1 + split.replacement_count() > MAX_MEMORY_ENTRIES {
+        if !fits_after_replacement(
+            self.entries.len(),
+            1,
+            split.replacement_count(),
+            MAX_MEMORY_ENTRIES,
+        ) {
             self.compact_for_split(descriptor_index, range)?;
             descriptor_index = self
                 .find_descriptor(range, &[original_type])
                 .ok_or(efi::Status::NOT_FOUND)?;
-            descriptor = self.entries[descriptor_index];
-            split = DescriptorSplit::for_range(&descriptor, range);
-            debug_assert!(self.entries.len() - 1 + split.replacement_count() <= MAX_MEMORY_ENTRIES);
+            split = self.descriptor_split(descriptor_index, range)?;
+            debug_assert!(fits_after_replacement(
+                self.entries.len(),
+                1,
+                split.replacement_count(),
+                MAX_MEMORY_ENTRIES
+            ));
         }
 
+        // The residual head and tail keep the original type and attributes;
+        // only the middle part takes the requested ones.
+        let retyped_index = descriptor_index + split.head.is_some() as usize;
         self.entries.remove(descriptor_index);
-        let mut insert_at = descriptor_index;
-
-        if split.keep_before {
-            self.insert_descriptor_prechecked(
-                insert_at,
-                memory_descriptor(
-                    original_type,
-                    descriptor.physical_start,
-                    (range.start - descriptor.physical_start) / PAGE_SIZE,
-                    descriptor.attribute,
-                ),
-            );
-            insert_at += 1;
-        }
-
-        let retyped_index = insert_at;
-        self.insert_descriptor_prechecked(
-            insert_at,
-            memory_descriptor(
-                memory_type,
-                range.start,
-                range.number_of_pages(PAGE_SIZE),
-                attribute,
-            ),
-        );
-        insert_at += 1;
-
-        if split.keep_after {
-            self.insert_descriptor_prechecked(
-                insert_at,
-                memory_descriptor(
-                    original_type,
-                    range.end,
-                    (descriptor.end() - range.end) / PAGE_SIZE,
-                    descriptor.attribute,
-                ),
-            );
+        for (offset, part) in split.parts().enumerate() {
+            let descriptor = if part == split.middle {
+                descriptor_for_range(memory_type, part, attribute)
+            } else {
+                descriptor_for_range(original_type, part, original.attribute)
+            };
+            self.insert_descriptor_prechecked(descriptor_index + offset, descriptor);
         }
 
         self.merge_near(retyped_index);
@@ -479,16 +479,7 @@ impl MemoryAllocator {
                 PlatMemType::BootServicesData => MemoryType::BootServicesData,
             };
 
-            let num_pages = match region.size.checked_add(PAGE_SIZE - 1) {
-                Some(size_rounded) => size_rounded / PAGE_SIZE,
-                None => {
-                    log::warn!(
-                        "Region at {:#x} has size that overflows, skipping",
-                        region.base
-                    );
-                    continue;
-                }
-            };
+            let num_pages = PageCount::covering_bytes(region.size);
 
             log::info!(
                 "  {:#010x}-{:#010x} {:?} -> {:?}",
@@ -498,14 +489,21 @@ impl MemoryAllocator {
                 memory_type
             );
 
-            let desc = memory_descriptor(
-                memory_type,
-                region.base,
-                num_pages,
-                memory_type.default_attributes(),
-            );
+            let attribute = memory_type.default_attributes();
 
-            if self.entries.push(desc).is_err() {
+            let Some(range) = PageRange::from_bytes(region.base, num_pages.get()) else {
+                log::warn!(
+                    "Region at {:#x} is misaligned or overflows, skipping",
+                    region.base
+                );
+                continue;
+            };
+
+            if self
+                .entries
+                .push(descriptor_for_range(memory_type, range, attribute))
+                .is_err()
+            {
                 log::warn!("Memory map full, ignoring region at {:#x}", region.base);
             }
         }
@@ -543,33 +541,27 @@ impl MemoryAllocator {
         num_pages: u64,
         memory_type: MemoryType,
     ) -> Result<(), efi::Status> {
-        let size = num_pages
-            .checked_mul(PAGE_SIZE)
-            .ok_or(efi::Status::INVALID_PARAMETER)?;
-        let end = physical_start
-            .checked_add(size)
+        let range = PageRange::from_bytes(physical_start, num_pages)
             .ok_or(efi::Status::INVALID_PARAMETER)?;
 
-        let mut fragments: heapless::Vec<(u64, u64), MAX_MEMORY_ENTRIES> = heapless::Vec::new();
+        let mut fragments: heapless::Vec<PageRange, MAX_MEMORY_ENTRIES> = heapless::Vec::new();
         for entry in &self.entries {
-            let Some(entry_type) = entry.get_memory_type() else {
+            if entry.get_memory_type() != Some(MemoryType::ConventionalMemory) {
+                continue;
+            }
+            let Some(fragment) = entry
+                .page_range()
+                .and_then(|entry| entry.intersection(range))
+            else {
                 continue;
             };
-            if entry.end() <= physical_start || entry.physical_start >= end {
-                continue;
-            }
-            if entry_type == MemoryType::ConventionalMemory {
-                let start = entry.physical_start.max(physical_start);
-                let stop = entry.end().min(end);
-                if start < stop && fragments.push((start, stop)).is_err() {
-                    return Err(efi::Status::OUT_OF_RESOURCES);
-                }
-            }
+            fragments
+                .push(fragment)
+                .map_err(|_| efi::Status::OUT_OF_RESOURCES)?;
         }
 
-        for (start, stop) in fragments {
-            let pages = (stop - start).div_ceil(PAGE_SIZE);
-            self.carve_out(start, pages, memory_type)?;
+        for fragment in fragments {
+            self.carve_out(fragment.start_bytes(), fragment.pages().get(), memory_type)?;
         }
 
         Ok(())
@@ -639,51 +631,42 @@ impl MemoryAllocator {
         target_type: MemoryType,
         skip_types: &[MemoryType],
     ) -> Result<(), efi::Status> {
-        // Check for overflow in size calculation
-        let size = num_pages
-            .checked_mul(PAGE_SIZE)
-            .ok_or(efi::Status::INVALID_PARAMETER)?;
-        let end = addr
-            .checked_add(size)
-            .ok_or(efi::Status::INVALID_PARAMETER)?;
+        let range = PageRange::from_bytes(addr, num_pages).ok_or(efi::Status::INVALID_PARAMETER)?;
 
-        // Find the entry containing this region (any memory type)
-        let found_idx = self
-            .entries
-            .iter()
-            .position(|entry| entry.physical_start <= addr && entry.end() >= end);
-
-        let idx = match found_idx {
-            Some(i) => i,
-            None => {
-                // Region not found — check for overlaps (only for ACPI reclaim
-                // which has stricter validation)
-                if target_type == MemoryType::AcpiReclaimMemory
-                    && self
-                        .entries
-                        .iter()
-                        .any(|entry| addr < entry.end() && end > entry.physical_start)
-                {
-                    return Err(efi::Status::INVALID_PARAMETER);
-                }
-                // No containing entry — add as a new entry
-                let desc = memory_descriptor(
-                    target_type,
-                    addr,
-                    num_pages,
-                    attributes::EFI_MEMORY_RAM_CAPS,
-                );
-                if self.entries.push(desc).is_err() {
-                    return Err(efi::Status::OUT_OF_RESOURCES);
-                }
-                self.map_key += 1;
-                self.sort_entries();
-                return Ok(());
+        // Unlike carve_out this accepts any source type, so it cannot reuse
+        // find_descriptor's type filter.
+        let containing = self.entries.iter().position(|entry| {
+            entry
+                .page_range()
+                .is_some_and(|entry| entry.contains(range))
+        });
+        let Some(descriptor_index) = containing else {
+            // Region not found — check for overlaps (only for ACPI reclaim
+            // which has stricter validation)
+            if target_type == MemoryType::AcpiReclaimMemory
+                && self.entries.iter().any(|entry| {
+                    entry
+                        .page_range()
+                        .is_some_and(|entry| entry.overlaps(range))
+                })
+            {
+                return Err(efi::Status::INVALID_PARAMETER);
             }
+            // No containing entry — add as a new entry
+            self.entries
+                .push(descriptor_for_range(
+                    target_type,
+                    range,
+                    attributes::EFI_MEMORY_RAM_CAPS,
+                ))
+                .map_err(|_| efi::Status::OUT_OF_RESOURCES)?;
+            self.map_key += 1;
+            self.sort_entries();
+            return Ok(());
         };
 
-        let entry = self.entries[idx];
-        let original_type = entry
+        let descriptor = self.entries[descriptor_index];
+        let original_type = descriptor
             .get_memory_type()
             .unwrap_or(MemoryType::ReservedMemoryType);
 
@@ -692,40 +675,9 @@ impl MemoryAllocator {
             return Ok(());
         }
 
-        let attribute = entry.attribute;
-
-        // Remove the old entry
-        self.entries.remove(idx);
-
-        // Add up to 3 new entries: before, target, after
-        // Region before the target portion (keep original type)
-        if entry.physical_start < addr {
-            let before_pages = (addr - entry.physical_start) / PAGE_SIZE;
-            let before =
-                memory_descriptor(original_type, entry.physical_start, before_pages, attribute);
-            if self.entries.push(before).is_err() {
-                return Err(efi::Status::OUT_OF_RESOURCES);
-            }
-        }
-
-        // The target region
-        let target = memory_descriptor(target_type, addr, num_pages, attribute);
-        if self.entries.push(target).is_err() {
-            return Err(efi::Status::OUT_OF_RESOURCES);
-        }
-
-        // Region after the target portion (keep original type)
-        if entry.end() > end {
-            let after_pages = (entry.end() - end) / PAGE_SIZE;
-            let after = memory_descriptor(original_type, end, after_pages, attribute);
-            if self.entries.push(after).is_err() {
-                return Err(efi::Status::OUT_OF_RESOURCES);
-            }
-        }
+        self.retype_range(descriptor_index, range, target_type, descriptor.attribute)?;
 
         self.map_key += 1;
-        self.sort_entries();
-
         Ok(())
     }
 
@@ -770,7 +722,7 @@ impl MemoryAllocator {
 
     fn allocate_conventional_range(
         &mut self,
-        range: MemoryRange,
+        range: PageRange,
         memory_type: MemoryType,
     ) -> Result<(), efi::Status> {
         let descriptor_index = self
@@ -792,10 +744,10 @@ impl MemoryAllocator {
     /// image. Public AllocateAddress deliberately cannot claim runtime data.
     fn retype_runtime_image_code(
         &mut self,
-        image_range: MemoryRange,
-        code_range: MemoryRange,
+        image_range: PageRange,
+        code_range: PageRange,
     ) -> Result<(), efi::Status> {
-        if code_range.start != image_range.start || !image_range.contains(code_range) {
+        if code_range.start() != image_range.start() || !image_range.contains(code_range) {
             return Err(efi::Status::INVALID_PARAMETER);
         }
         let (allocation_index, _) = self
@@ -849,10 +801,8 @@ impl MemoryAllocator {
                 Some(*memory)
             }
         };
-        let Some(address) = address else {
-            return efi::Status::OUT_OF_RESOURCES;
-        };
-        let Some(range) = MemoryRange::from_pages(address, num_pages, PAGE_SIZE) else {
+        let Some(range) = address.and_then(|address| PageRange::from_bytes(address, num_pages))
+        else {
             return efi::Status::OUT_OF_RESOURCES;
         };
 
@@ -910,7 +860,7 @@ impl MemoryAllocator {
 
         match result {
             Ok(()) => {
-                *memory = address;
+                *memory = range.start_bytes();
                 efi::Status::SUCCESS
             }
             Err(status) => status,
@@ -928,13 +878,12 @@ impl MemoryAllocator {
     /// typed loader subclaim has no single memory descriptor to restore and
     /// returns [`efi::Status::NOT_FOUND`].
     pub fn free_pages(&mut self, memory: u64, num_pages: u64) -> efi::Status {
-        if !memory.is_multiple_of(PAGE_SIZE) || num_pages == 0 {
-            return efi::Status::INVALID_PARAMETER;
-        }
         if self.boot_services_exited {
             return efi::Status::UNSUPPORTED;
         }
-        let Some(range) = MemoryRange::from_pages(memory, num_pages, PAGE_SIZE) else {
+        // Rejects misaligned addresses, zero page counts, and ranges that would
+        // leave the address space in one construction.
+        let Some(range) = PageRange::from_bytes(memory, num_pages) else {
             return efi::Status::INVALID_PARAMETER;
         };
         let allocation = self.find_allocation(range);
@@ -1088,13 +1037,13 @@ impl MemoryAllocator {
             self.count_merged_entries()
         );
         for (i, e) in self.entries.iter().enumerate() {
-            let end = e.end();
-            let size_mb = (e.number_of_pages * PAGE_SIZE) >> 20;
+            let pages = PageCount::new(e.number_of_pages);
+            let size_mb = pages.bytes().unwrap_or(u64::MAX) >> 20;
             log::info!(
                 "  [{:2}] {:#012x}-{:#012x} {:>12} {:6} pages ({} MB) attr={:#x}",
                 i,
                 e.physical_start,
-                end,
+                e.page_range().map_or(u64::MAX, PageRange::end_bytes),
                 type_name(e.memory_type),
                 e.number_of_pages,
                 size_mb,
@@ -1262,8 +1211,7 @@ impl MemoryAllocator {
         memory_type: MemoryType,
         source_types: &[MemoryType],
     ) -> Result<(), efi::Status> {
-        let range = MemoryRange::from_pages(addr, num_pages, PAGE_SIZE)
-            .ok_or(efi::Status::INVALID_PARAMETER)?;
+        let range = PageRange::from_bytes(addr, num_pages).ok_or(efi::Status::INVALID_PARAMETER)?;
         let descriptor_index = self
             .find_descriptor(range, source_types)
             .ok_or(efi::Status::NOT_FOUND)?;
@@ -1537,10 +1485,10 @@ pub fn allocate_runtime_image_layout(
         if status != efi::Status::SUCCESS {
             return Err(status);
         }
-        let image_range = MemoryRange::from_pages(base, image_pages, PAGE_SIZE)
-            .ok_or(efi::Status::OUT_OF_RESOURCES)?;
-        let code_range = MemoryRange::from_pages(base, code_pages, PAGE_SIZE)
-            .ok_or(efi::Status::OUT_OF_RESOURCES)?;
+        let image_range =
+            PageRange::from_bytes(base, image_pages).ok_or(efi::Status::OUT_OF_RESOURCES)?;
+        let code_range =
+            PageRange::from_bytes(base, code_pages).ok_or(efi::Status::OUT_OF_RESOURCES)?;
         if let Err(status) = allocator.retype_runtime_image_code(image_range, code_range) {
             let _ = allocator.free_pages(base, image_pages);
             return Err(status);
@@ -1853,8 +1801,8 @@ mod tests {
             ),
             efi::Status::SUCCESS
         );
-        let image = MemoryRange::from_pages(base, 4, PAGE_SIZE).unwrap();
-        let code = MemoryRange::from_pages(base, 1, PAGE_SIZE).unwrap();
+        let image = PageRange::from_bytes(base, 4).unwrap();
+        let code = PageRange::from_bytes(base, 1).unwrap();
         allocator.retype_runtime_image_code(image, code).unwrap();
         let code_descriptor = allocator
             .entries
