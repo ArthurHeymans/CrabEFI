@@ -285,8 +285,7 @@ fn init_with_local_state(config: PlatformConfig) -> ! {
     // SAFETY: Single-threaded firmware entry point. This static lives for the
     // full firmware lifetime and is only used on the fresh-start path.
     unsafe {
-        let firmware_state = core::ptr::addr_of_mut!(LOCAL_FIRMWARE_STATE);
-        state::init(&mut *firmware_state);
+        state::init(&raw mut LOCAL_FIRMWARE_STATE);
     }
     init_platform_impl(config)
 }

@@ -468,10 +468,13 @@ fn extract_timer_freq_from_fdt(fdt_ptr: u64, fdt_size: u32) {
 /// This builds a minimal `PlatformConfig` from FDT data and boots.
 #[cfg(target_arch = "riscv64")]
 fn riscv_fdt_only_boot(fdt_ptr: u64, fdt_size: u32) -> ! {
-    // Initialize firmware state
+    // Initialize firmware state. It lives in this never-returning frame, inside
+    // .stack, which reserve_runtime_region() covers -- so SetVirtualAddressMap
+    // relocates STATE_PTR and every inline table with it.
     let mut firmware_state = crabefi::state::FirmwareState::new();
+    // SAFETY: Single-threaded firmware entry point; this frame never returns.
     unsafe {
-        crabefi::state::init(&mut firmware_state);
+        crabefi::state::init(&raw mut firmware_state);
     }
 
     // Initialize serial from MMIO (QEMU virt 16550 at 0x10000000)
@@ -621,11 +624,13 @@ pub extern "C" fn rust_main(coreboot_table_ptr: u64) -> ! {
     // ================================================================
     // Phase 1: Initialize firmware state (needed for all state access)
     // ================================================================
+    // The state lives in this never-returning frame, inside .stack, which
+    // reserve_runtime_region() covers -- so SetVirtualAddressMap relocates
+    // STATE_PTR and every inline table with it.
     let mut firmware_state = crabefi::state::FirmwareState::new();
-    // SAFETY: Single-threaded firmware entry point. The state lives on
-    // this stack frame which never returns (-> !).
+    // SAFETY: Single-threaded firmware entry point; this frame never returns.
     unsafe {
-        crabefi::state::init(&mut firmware_state);
+        crabefi::state::init(&raw mut firmware_state);
     }
 
     // On RISC-V, extract timer frequency from FDT now that state is initialized.
