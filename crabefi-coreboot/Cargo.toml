@@ -8,6 +8,9 @@ description = "CrabEFI as a coreboot payload binary"
 
 [features]
 ui = ["crabefi/ui"]
+# Mirror crabefi-core's framebuffer logger. Needed to read the log on machines
+# with no serial port; very slow, so debugging only.
+fb-log = ["crabefi/fb-log"]
 
 [dependencies]
 crabefi = { package = "crabefi-core", path = "../crabefi-core", features = [
