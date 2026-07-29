@@ -497,12 +497,20 @@ impl CorebootInfo {
 pub unsafe fn parse(ptr: *const u8) -> CorebootInfo {
     let mut info = CorebootInfo::new();
 
-    // If pointer is null or invalid, scan for the tables in memory
+    // Prefer the table pointer supplied through the payload entry ABI. Some
+    // chainloaders do not preserve that argument, so fall back to scanning the
+    // standard coreboot table locations when it does not identify a table.
     let header = if ptr.is_null() {
         log::warn!("Coreboot table pointer is null, scanning memory...");
         unsafe { scan_for_header() }
+    } else if let Some(header) = unsafe { find_header(ptr) } {
+        Some(header)
     } else {
-        unsafe { find_header(ptr) }
+        log::warn!(
+            "No coreboot table at entry pointer {:p}, scanning memory...",
+            ptr
+        );
+        unsafe { scan_for_header() }
     };
 
     let header = match header {
