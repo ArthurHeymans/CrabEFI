@@ -122,10 +122,21 @@ SECTIONS
         _bss_end = .;
     } :data
 
-    /* Stack - 1MB; variable payloads are heap-backed. */
-    .stack : ALIGN(4096) {
+    /* Stack - 4MB.
+     *
+     * FirmwareState lives in the entry frame and carries the EFI tables inline
+     * (handles, events, config tables, and the 64 x 16KB variable cache), so
+     * SetVirtualAddressMap relocates all of it by relocating STATE_PTR alone.
+     * That costs ~1.2MB of stack and boot peaks around 2.5MB, so 4MB leaves
+     * roughly 1.5MB of headroom. NOLOAD means this costs RAM, not ROM.
+     *
+     * NOLOAD: the stack has no initial contents, and without this lld emits it
+     * as PROGBITS, padding the payload with 3MB of zeros. entry.rs fills the
+     * range with 0xA5 at runtime before Rust is entered.
+     */
+    .stack (NOLOAD) : ALIGN(4096) {
         _stack_bottom = .;
-        . += 0x100000;
+        . += 0x400000;
         _stack_top = .;
     } :data
 

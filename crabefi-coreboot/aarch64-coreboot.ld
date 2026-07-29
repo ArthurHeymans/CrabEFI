@@ -68,10 +68,10 @@ SECTIONS
         _bss_end = .;
     }
 
-    /* Stack - 1MB; variable payloads are heap-backed. */
+    /* Stack - 4MB; FirmwareState carries the EFI tables inline (see x86_64 script). */
     .stack (NOLOAD) : ALIGN(65536) {
         _stack_bottom = .;
-        . += 0x100000;
+        . += 0x400000;
         _stack_top = .;
     }
 
