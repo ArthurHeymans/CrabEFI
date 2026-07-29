@@ -641,8 +641,8 @@ pub extern "C" fn rust_main(coreboot_table_ptr: u64) -> ! {
     // ================================================================
     // Phase 2: Parse coreboot tables (reads raw memory, no heap needed)
     // ================================================================
-    // SAFETY: coreboot_table_ptr is passed from coreboot and points to
-    // valid tables in identity-mapped physical memory.
+    // SAFETY: The parser first tries the payload entry argument and falls back
+    // to scanning the standard coreboot table locations if it is not valid.
     let cb_info = unsafe { tables::parse(coreboot_table_ptr as *const u8) };
 
     // ================================================================
