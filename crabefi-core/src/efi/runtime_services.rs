@@ -1050,16 +1050,127 @@ extern "efiapi" fn set_variable(
         return Status::INVALID_PARAMETER;
     }
 
-    // Linux calls SetVariable("DUMMY", ..., size=0) during EFI runtime setup
-    // from the initial task stack.  The full SetVariable path uses 16 KiB
-    // bounded variable buffers, which is fine on firmware stacks but too large
-    // for the OS runtime-call stack.  Keep the common runtime-delete path in a
-    // tiny helper so it cannot corrupt Linux's init_task stack canary.
-    if state::is_exit_boot_services_called() && data_size == 0 {
-        return set_variable_runtime_delete(variable_name, vendor_guid, attributes);
+    // set_variable_full() reserves a ~113 KiB frame for its 16 KiB variable
+    // buffers. That is fine on the firmware stack, but an OS gives runtime
+    // services only a few KiB -- Linux runs them on a 16 KiB kernel stack -- so
+    // the frame's own stack probe walks off the end and panics the kernel.
+    // After ExitBootServices every write must therefore take a lean path.
+    if state::is_exit_boot_services_called() {
+        return if data_size == 0 {
+            set_variable_runtime_delete(variable_name, vendor_guid, attributes)
+        } else {
+            set_variable_runtime_write(variable_name, vendor_guid, attributes, data_size, data)
+        };
     }
 
     set_variable_full(variable_name, vendor_guid, attributes, data_size, data)
+}
+
+/// Write a variable after ExitBootServices, without a large stack frame.
+///
+/// The OS-provided runtime stack is far smaller than the firmware's, so this
+/// path keeps its locals to a variable name buffer and copies the payload
+/// straight into the inline cache. It must also stay allocation-free: the heap
+/// is `RuntimeServicesData`, but `SetVirtualAddressMap` does not relocate the
+/// allocator's base pointer, so any allocation here would touch an unmapped
+/// physical address.
+///
+/// Cases needing verification or a read-modify-write are refused rather than
+/// half-performed; they remain fully supported before ExitBootServices.
+#[inline(never)]
+fn set_variable_runtime_write(
+    variable_name: *mut u16,
+    vendor_guid: *mut Guid,
+    attributes: u32,
+    data_size: usize,
+    data: *mut c_void,
+) -> Status {
+    let name_len = ucs2_strlen_ptr(variable_name);
+    if name_len == 0 || name_len >= MAX_VARIABLE_NAME_LEN || data.is_null() {
+        return Status::INVALID_PARAMETER;
+    }
+    if data_size > MAX_VARIABLE_DATA_SIZE {
+        return Status::OUT_OF_RESOURCES;
+    }
+
+    // A runtime-visible variable must also be boot-services-visible (UEFI 8.2).
+    let has_runtime_access = (attributes & auth::attributes::RUNTIME_ACCESS) != 0;
+    let has_bootservice_access = (attributes & auth::attributes::BOOTSERVICE_ACCESS) != 0;
+    if !has_runtime_access || !has_bootservice_access {
+        return Status::INVALID_PARAMETER;
+    }
+
+    // Authenticated writes need signature verification, and that crypto
+    // allocates. Appends need the existing payload merged into a second 16 KiB
+    // buffer. Neither fits this path's stack or allocation budget.
+    if (attributes & auth::attributes::TIME_BASED_AUTHENTICATED_WRITE_ACCESS) != 0
+        || (attributes & auth::attributes::APPEND_WRITE) != 0
+    {
+        log::debug!("RT.SetVariable: authenticated/append write refused at runtime");
+        return Status::UNSUPPORTED;
+    }
+
+    let guid = unsafe { *vendor_guid };
+    let name_slice = unsafe { core::slice::from_raw_parts(variable_name, name_len + 1) };
+
+    // SecureBoot and SetupMode are synthesized from firmware state.
+    if guid == auth::EFI_GLOBAL_VARIABLE_GUID
+        && (name_slice == auth::SECURE_BOOT_NAME || name_slice == auth::SETUP_MODE_NAME)
+    {
+        return Status::WRITE_PROTECTED;
+    }
+
+    let mut name_vec = VariableNameBuf::new();
+    if name_vec.extend_from_slice(name_slice).is_err() {
+        return Status::OUT_OF_RESOURCES;
+    }
+
+    // PK/KEK/db/dbx are authenticated by definition; refuse instead of
+    // accepting an unverified update into a Secure Boot key database.
+    if auth::identify_key_database(name_vec.as_slice(), &guid).is_some() {
+        log::debug!("RT.SetVariable: key database update refused at runtime");
+        return Status::WRITE_PROTECTED;
+    }
+
+    // Borrowed, not copied -- the payload is written straight into the cache.
+    let payload = unsafe { core::slice::from_raw_parts(data as *const u8, data_size) };
+
+    let status = state::with_efi_mut(|efi| {
+        let existing = efi.variables.iter().position(|var| {
+            var.in_use
+                && var.vendor_guid == guid
+                && crate::efi::utils::ucs2_eq(&var.name, name_vec.as_slice())
+        });
+        let Some(idx) = existing.or_else(|| efi.variables.iter().position(|var| !var.in_use))
+        else {
+            return Status::OUT_OF_RESOURCES;
+        };
+
+        let entry = &mut efi.variables[idx];
+        entry.name[..name_vec.len()].copy_from_slice(name_vec.as_slice());
+        entry.name[name_vec.len()..].fill(0);
+        if entry.set_data(payload).is_err() {
+            return Status::OUT_OF_RESOURCES;
+        }
+        entry.vendor_guid = guid;
+        entry.attributes = attributes;
+        entry.in_use = true;
+        Status::SUCCESS
+    });
+
+    if status != Status::SUCCESS {
+        return status;
+    }
+
+    // Queued into the warm-reboot-persistent buffer; applied on the next boot.
+    if (attributes & auth::attributes::NON_VOLATILE) != 0
+        && let Err(e) =
+            crate::efi::varstore::persist_variable(&guid, name_vec.as_slice(), attributes, payload)
+    {
+        log::debug!("Variable write not persisted: {:?}", e);
+    }
+
+    Status::SUCCESS
 }
 
 #[inline(never)]
