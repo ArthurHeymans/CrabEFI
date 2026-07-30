@@ -1177,6 +1177,18 @@ pub fn run_tests(config: &QemuConfig, disk_path: &Path, app_name: &str) -> Resul
                 failed += 1;
             }
         }
+        "svam-test" => {
+            if result.output.contains("SVAM_TEST: PASS") {
+                println!("[PASS] svam_runtime: virtual-mode runtime services survived physical unmap");
+                passed += 1;
+            } else if result.output.contains("SVAM_TEST: FAIL") {
+                println!("[FAIL] svam_runtime: application reported a runtime-service failure");
+                failed += 1;
+            } else {
+                println!("[FAIL] svam_runtime: no result marker (likely stale-pointer fault)");
+                failed += 1;
+            }
+        }
         _ => {
             // Generic test: just check if CrabEFI booted
             if result.output.contains("CrabEFI") {
