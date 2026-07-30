@@ -49,9 +49,17 @@ pub mod ui;
 
 use crate::drivers::block::{AhciDisk, NvmeDisk, SdhciDisk, UsbDisk};
 
+/// Delay before any reset so the last log lines stay readable on the display.
+///
+/// The framebuffer log (`fb-log`) is the only output on machines without a
+/// serial port, and a reset wipes the screen instantly. Holding here gives the
+/// user time to read whatever triggered the reset.
+pub const RESET_DELAY_MS: u64 = 5000;
+
 /// Perform a system reset using the platform handler when available.
 pub fn reset_system() -> ! {
-    log::info!("System reset requested");
+    log::error!("RESET: crabefi::reset_system() — resetting in {RESET_DELAY_MS} ms");
+    time::delay_ms(RESET_DELAY_MS);
 
     if let Some(reset) = state::try_get().and_then(|state| state.drivers.platform.reset) {
         reset.reset(ResetType::Cold);

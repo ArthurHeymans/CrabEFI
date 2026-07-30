@@ -1687,6 +1687,19 @@ extern "efiapi" fn reset_system(
     // crate's vtable pointer is stale and would page-fault.
     rt_serial_print!("ResetSystem called");
 
+    // Before SetVirtualAddressMap the framebuffer logger and the timer are
+    // still usable, so announce the caller and hold for RESET_DELAY_MS. This
+    // makes a bootloader-requested reset visible on machines with no serial
+    // port. Afterwards the log vtable and timing state are stale, so skip it.
+    if !VIRTUAL_MODE.load(core::sync::atomic::Ordering::Acquire) {
+        log::error!(
+            "RESET: RT.ResetSystem(type={:#x}) requested by the running image — resetting in {} ms",
+            reset_type,
+            crate::RESET_DELAY_MS
+        );
+        crate::time::delay_ms(crate::RESET_DELAY_MS);
+    }
+
     // Try different reset methods
     match reset_type {
         efi::RESET_COLD | efi::RESET_WARM => {
