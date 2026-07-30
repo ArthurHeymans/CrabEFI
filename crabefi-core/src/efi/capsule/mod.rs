@@ -149,15 +149,32 @@ pub fn stage_capsule_for_reboot(
     use crate::efi::auth;
     use crate::efi::varstore;
 
-    // Variable name: "CapsuleUpdateData" or "CapsuleUpdateData1", etc.
-    let name_str = if capsule_index == 0 {
-        alloc::string::String::from("CapsuleUpdateData")
-    } else {
-        alloc::format!("CapsuleUpdateData{}", capsule_index)
-    };
-
-    let mut name_u16: alloc::vec::Vec<u16> = name_str.encode_utf16().collect();
-    name_u16.push(0); // null terminator
+    // UpdateCapsule currently accepts one capsule, so the only supported
+    // variable is CapsuleUpdateData. Keep the UTF-16 name inline to avoid
+    // allocating on the runtime path.
+    if capsule_index != 0 {
+        return Err(CapsuleError::FlashWriteFailed);
+    }
+    const CAPSULE_UPDATE_DATA_NAME: &[u16] = &[
+        b'C' as u16,
+        b'a' as u16,
+        b'p' as u16,
+        b's' as u16,
+        b'u' as u16,
+        b'l' as u16,
+        b'e' as u16,
+        b'U' as u16,
+        b'p' as u16,
+        b'd' as u16,
+        b'a' as u16,
+        b't' as u16,
+        b'e' as u16,
+        b'D' as u16,
+        b'a' as u16,
+        b't' as u16,
+        b'a' as u16,
+        0,
+    ];
 
     // Vendor GUID for CapsuleUpdateData* variables
     // {711C703F-C285-4B10-A3B0-36ECBD3C8BE2}
@@ -179,12 +196,16 @@ pub fn stage_capsule_for_reboot(
         | auth::attributes::RUNTIME_ACCESS;
 
     // Write via the deferred path (we're after ExitBootServices)
-    varstore::persist_variable(&capsule_vendor_guid, name_u16.as_slice(), attributes, &data)
-        .map_err(|_| CapsuleError::FlashWriteFailed)?;
+    varstore::persist_variable(
+        &capsule_vendor_guid,
+        CAPSULE_UPDATE_DATA_NAME,
+        attributes,
+        &data,
+    )
+    .map_err(|_| CapsuleError::FlashWriteFailed)?;
 
     log::info!(
-        "Staged {} at SG list {:#x} for next boot",
-        name_str,
+        "Staged CapsuleUpdateData at SG list {:#x} for next boot",
         scatter_gather_list
     );
 

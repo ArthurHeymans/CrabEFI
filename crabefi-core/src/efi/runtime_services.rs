@@ -303,7 +303,10 @@ extern "efiapi" fn set_virtual_address_map(
         hooks.before_set_virtual_address_map();
     }
 
-    // Step 1: Commit to virtual mode
+    // Step 1: Commit to virtual mode. The boot heap contains absolute
+    // free-list pointers and cannot cross this transition, so freeze it before
+    // any descriptor is converted.
+    crate::heap::freeze_for_virtual_address_map();
     VIRTUAL_MODE.store(true, core::sync::atomic::Ordering::Release);
 
     // Step 2: Set up globals so ConvertPointer can access the virtual map
@@ -1356,7 +1359,7 @@ fn set_variable_full(
                 if state::is_exit_boot_services_called() {
                     use crate::efi::rtlog;
                     rtlog::append("  -> auth verify FAILED: ");
-                    rtlog::appendln(alloc::format!("{:?}", e).as_str());
+                    rtlog::append_fmtln(format_args!("{:?}", e));
                 }
                 return e.into();
             }
@@ -1620,7 +1623,7 @@ fn set_variable_full(
                         } else {
                             rtlog::append("  -> persist FAILED: ");
                         }
-                        rtlog::appendln(alloc::format!("{:?}", e).as_str());
+                        rtlog::append_fmtln(format_args!("{:?}", e));
                     }
                 }
             }

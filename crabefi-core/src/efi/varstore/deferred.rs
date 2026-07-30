@@ -52,7 +52,7 @@
 
 use core::sync::atomic::{AtomicBool, Ordering};
 
-use super::{SerializedTime, VarStoreError, VariableRecord, crc32};
+use super::{SerializedTime, VarStoreError, VariableRecord, VariableRecordRef, crc32};
 use crate::efi::auth;
 
 /// Magic value for the deferred buffer header: "CVBF" (CrabVariable Buffer)
@@ -543,11 +543,12 @@ pub fn queue_write(
 
     let mut flags: u8 = 0;
 
-    let record = if is_authenticated {
+    let timestamp = if is_authenticated {
         flags |= entry_flags::IS_AUTHENTICATED;
 
-        // Extract the timestamp from the authentication header
-        // This is critical for maintaining timestamp monotonicity after reboot
+        // Extract the timestamp from the authentication header. The original
+        // signed payload remains borrowed and is streamed directly to the
+        // deferred buffer.
         let timestamp = extract_auth_timestamp(data)?;
 
         log::info!(
@@ -559,15 +560,13 @@ pub fn queue_write(
             timestamp.minute,
             timestamp.second
         );
-
-        // Store the data as-is (includes the auth header) along with the extracted timestamp
-        VariableRecord::new_with_timestamp(guid, name, attributes, data, timestamp)?
+        timestamp
     } else {
-        // Non-authenticated variable - no timestamp needed
-        VariableRecord::new(guid, name, attributes, data)?
+        SerializedTime::default()
     };
 
-    queue_record_with_flags(&record, flags)
+    let record = VariableRecordRef::new(guid, name, attributes, data, timestamp, false)?;
+    queue_record_ref_with_flags(record, flags)
 }
 
 /// Extract the timestamp from an EFI_VARIABLE_AUTHENTICATION_2 header
@@ -583,90 +582,82 @@ fn extract_auth_timestamp(data: &[u8]) -> Result<SerializedTime, VarStoreError> 
     Ok(auth.time_stamp.to_serialized())
 }
 
-/// Queue a variable deletion for deferred processing
+/// Queue a variable deletion for deferred processing.
 pub fn queue_deletion(guid: &r_efi::efi::Guid, name: &[u16]) -> Result<(), VarStoreError> {
-    let record = VariableRecord::new_deleted(guid, name)?;
-    queue_record_with_flags(&record, entry_flags::IS_DELETION)
+    let record = VariableRecordRef::new(guid, name, 0, &[], SerializedTime::default(), true)?;
+    queue_record_ref_with_flags(record, entry_flags::IS_DELETION)
 }
 
-/// Queue a variable record with flags
-fn queue_record_with_flags(record: &VariableRecord, flags: u8) -> Result<(), VarStoreError> {
+/// Queue a borrowed variable record without allocating.
+fn queue_record_ref_with_flags(
+    mut record: VariableRecordRef<'_>,
+    flags: u8,
+) -> Result<(), VarStoreError> {
     let base = buffer_base();
 
-    // Serialize the record
-    let record_bytes = record.serialize()?;
-    let record_len = record_bytes.len();
-
-    if record_len > MAX_ENTRY_SIZE {
-        return Err(VarStoreError::DataTooLarge);
-    }
-
-    // Read current header
     let mut header = unsafe { core::ptr::read(base as *const DeferredHeader) };
-
-    // If header is invalid, initialize it
     if !header.is_valid() {
         header = DeferredHeader::new();
         header.header_crc = header.compute_header_crc();
     }
 
-    // Calculate where to write
-    // Entry format: EntryHeader (8 bytes) + record data
+    // Reserve the entry header, then serialize twice directly into the
+    // deferred region. The zero-CRC pass supplies the record CRC; the second
+    // pass writes the final byte-compatible record.
     let data_offset = HEADER_SIZE + header.total_size as usize;
     let entry_header_size = core::mem::size_of::<EntryHeader>();
-
-    // Use checked_add to prevent integer overflow in bounds check
-    let new_entry_size = match entry_header_size.checked_add(record_len) {
-        Some(size) => size,
-        None => {
-            log::warn!("Entry size overflow");
-            return Err(VarStoreError::DataTooLarge);
-        }
-    };
-
-    // Use checked_add to prevent integer overflow when checking buffer space
-    let required_space = match data_offset.checked_add(new_entry_size) {
-        Some(space) => space,
-        None => {
-            log::warn!("Buffer space calculation overflow");
-            return Err(VarStoreError::StoreFull);
-        }
-    };
-
-    if required_space > buffer_size() {
-        log::warn!("Deferred buffer full");
+    let record_offset = data_offset
+        .checked_add(entry_header_size)
+        .ok_or(VarStoreError::StoreFull)?;
+    let available = buffer_size()
+        .checked_sub(record_offset)
+        .ok_or(VarStoreError::StoreFull)?;
+    let output_capacity = available.min(MAX_ENTRY_SIZE);
+    if output_capacity == 0 {
         return Err(VarStoreError::StoreFull);
     }
 
-    // Write entry header
+    let output =
+        unsafe { core::slice::from_raw_parts_mut(base.add(record_offset), output_capacity) };
+    let record_len = postcard::to_slice(&record, output)
+        .map_err(|_| VarStoreError::DataTooLarge)?
+        .len();
+    record.crc = crc32(&output[..record_len]);
+    let final_len = postcard::to_slice(&record, output)
+        .map_err(|_| VarStoreError::SerdeError)?
+        .len();
+    // postcard encodes the zero CRC in one byte and the computed u32 CRC in
+    // up to five bytes, so the final serialization may grow by four bytes.
+    debug_assert!(final_len >= record_len && final_len <= record_len + 4);
+
+    let new_entry_size = entry_header_size
+        .checked_add(final_len)
+        .ok_or(VarStoreError::DataTooLarge)?;
+    let required_space = data_offset
+        .checked_add(new_entry_size)
+        .ok_or(VarStoreError::StoreFull)?;
+    if required_space > buffer_size() {
+        return Err(VarStoreError::StoreFull);
+    }
+
     let entry_hdr = EntryHeader {
         flags,
         _reserved: [0; 3],
-        record_len: record_len as u32,
+        record_len: final_len as u32,
     };
     unsafe {
         let hdr_ptr = base.add(data_offset) as *mut EntryHeader;
         core::ptr::write_unaligned(hdr_ptr, entry_hdr);
     }
 
-    // Write record data
-    unsafe {
-        let data_ptr = base.add(data_offset + entry_header_size);
-        core::ptr::copy_nonoverlapping(record_bytes.as_ptr(), data_ptr, record_len);
-    }
-
-    // Update header
     header.entry_count += 1;
     header.total_size += new_entry_size as u32;
-
-    // Recompute CRCs
     header.header_crc = header.compute_header_crc();
 
     let data_start = unsafe { base.add(HEADER_SIZE) };
     let data_slice = unsafe { core::slice::from_raw_parts(data_start, header.total_size as usize) };
     header.data_crc = crc32(data_slice);
 
-    // Write updated header
     unsafe {
         core::ptr::write(base as *mut DeferredHeader, header);
     }
@@ -683,7 +674,7 @@ fn queue_record_with_flags(record: &VariableRecord, flags: u8) -> Result<(), Var
         "Queued deferred variable write{} (entry {}, {} bytes)",
         flag_desc,
         header.entry_count,
-        record_len
+        final_len
     );
 
     Ok(())

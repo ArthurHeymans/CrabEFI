@@ -26,6 +26,7 @@
 //! ExitBootServices.  No allocator, no `log` crate, no locks — only
 //! raw pointer writes and simple atomics.
 
+use core::fmt::{self, Write};
 use core::sync::atomic::{AtomicBool, Ordering};
 
 // Linker symbols
@@ -203,6 +204,47 @@ pub fn append(s: &str) {
 #[inline]
 pub fn appendln(s: &str) {
     append(s);
+    append("\n");
+}
+
+/// Append formatted text using a fixed-size stack buffer.
+///
+/// Runtime error paths must not use `alloc::format!` after ExitBootServices.
+/// Messages longer than the buffer are safely truncated.
+pub fn append_fmt(args: fmt::Arguments<'_>) {
+    struct StackBuffer {
+        bytes: [u8; 128],
+        len: usize,
+    }
+
+    impl Write for StackBuffer {
+        fn write_str(&mut self, s: &str) -> fmt::Result {
+            let remaining = self.bytes.len().saturating_sub(self.len);
+            let mut copy_len = remaining.min(s.len());
+            while copy_len > 0 && !s.is_char_boundary(copy_len) {
+                copy_len -= 1;
+            }
+            self.bytes[self.len..self.len + copy_len].copy_from_slice(&s.as_bytes()[..copy_len]);
+            self.len += copy_len;
+            Ok(())
+        }
+    }
+
+    let mut buffer = StackBuffer {
+        bytes: [0; 128],
+        len: 0,
+    };
+    let _ = buffer.write_fmt(args);
+    // SAFETY: `fmt::Write::write_str` only receives valid UTF-8 and copies
+    // complete byte prefixes from those strings.
+    let text = unsafe { core::str::from_utf8_unchecked(&buffer.bytes[..buffer.len]) };
+    append(text);
+}
+
+/// Append formatted text followed by a newline.
+#[inline]
+pub fn append_fmtln(args: fmt::Arguments<'_>) {
+    append_fmt(args);
     append("\n");
 }
 

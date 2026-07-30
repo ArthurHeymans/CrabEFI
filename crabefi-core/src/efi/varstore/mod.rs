@@ -199,6 +199,54 @@ pub struct VariableRecord {
     pub crc: u32,
 }
 
+/// Borrowed variable record used by allocation-free runtime serialization.
+///
+/// Its field order and Serde representation intentionally match [`VariableRecord`]
+/// byte-for-byte, while the name and payload remain borrowed from the caller.
+#[derive(Debug, Serialize)]
+pub struct VariableRecordRef<'a> {
+    pub magic: u16,
+    pub state: u8,
+    pub attributes: u32,
+    pub guid: SerializedGuid,
+    pub name: &'a [u16],
+    pub data: &'a [u8],
+    pub monotonic_count: u64,
+    pub timestamp: SerializedTime,
+    pub crc: u32,
+}
+
+impl<'a> VariableRecordRef<'a> {
+    /// Create a borrowed variable record without allocating.
+    pub fn new(
+        guid: &r_efi::efi::Guid,
+        name: &'a [u16],
+        attributes: u32,
+        data: &'a [u8],
+        timestamp: SerializedTime,
+        deleted: bool,
+    ) -> Result<Self> {
+        if name.len() > MAX_NAME_LEN {
+            return Err(VarStoreError::NameTooLong);
+        }
+        if data.len() > MAX_DATA_SIZE {
+            return Err(VarStoreError::DataTooLarge);
+        }
+
+        Ok(Self {
+            magic: RECORD_MAGIC,
+            state: if deleted { STATE_DELETED } else { STATE_VALID },
+            attributes,
+            guid: SerializedGuid::from_guid(guid),
+            name,
+            data,
+            monotonic_count: 0,
+            timestamp,
+            crc: 0,
+        })
+    }
+}
+
 /// Serialized EFI_TIME structure
 ///
 /// Implements `Ord` for lexicographic comparison of timestamp fields.
