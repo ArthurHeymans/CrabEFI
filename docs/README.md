@@ -8,3 +8,4 @@ CrabEFI is a UEFI implementation written in Rust. It is structured as a platform
 - [Architecture](ARCHITECTURE.md) - Workspace layout and code organization
 - [Integration](INTEGRATION.md) - Using CrabEFI as a library in external firmware
 - [Memory Management](MEMORY.md) - Memory layout, allocators, and EFI memory map
+- [SetVirtualAddressMap](SVAM.md) - Runtime relocation design and comparison with EDK2
