@@ -78,6 +78,11 @@ use crate::fs::fat::FatType;
 /// allocated on the stack in `init()`.
 static STATE_PTR: AtomicPtr<FirmwareState> = AtomicPtr::new(core::ptr::null_mut());
 
+/// Pointer-free phase flag used by runtime entry points after boot state is
+/// no longer reachable.
+static EXIT_BOOT_SERVICES_CALLED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
 /// Re-entrancy guard for `with_mut`. In debug builds, detects nested calls
 /// that would create aliasing `&mut` references (undefined behavior).
 #[cfg(debug_assertions)]
@@ -627,11 +632,6 @@ pub struct EfiState {
     /// boot option is attempted.
     pub ready_to_boot_signaled: bool,
 
-    /// Flag indicating ExitBootServices has been called
-    /// After this is set, SPI flash is locked and variable writes
-    /// must go to ESP file instead.
-    pub exit_boot_services_called: bool,
-
     /// Filesystem state for SimpleFileSystem protocol
     pub filesystem: Option<FilesystemState>,
 
@@ -661,7 +661,7 @@ impl EfiState {
             allocator: MemoryAllocator::new(),
             monotonic_count: 0,
             ready_to_boot_signaled: false,
-            exit_boot_services_called: false,
+
             filesystem: None,
             block_device: None,
             setup_mode: true,
@@ -1148,38 +1148,58 @@ pub fn efi() -> &'static EfiState {
     &get().efi
 }
 
-/// Verify that runtime-reachable tables are relocatable by `SetVirtualAddressMap`.
+/// Verify that the pointer-free runtime root is initialized and reserved.
 ///
-/// `SetVirtualAddressMap` relocates exactly one pointer, `STATE_PTR`, by finding
-/// the runtime region that contains [`FirmwareState`]. Everything a runtime
-/// service touches must therefore be stored *inside* that struct, so it is
-/// addressed as an offset from the relocated base.
-///
-/// A table moved to the heap keeps a physical pointer that nothing relocates,
-/// and the first `GetVariable` after the OS switches to virtual mode faults.
-/// That is not observable before ExitBootServices, so check it at init.
-///
-/// # Panics
-/// If any runtime-reachable table lies outside [`FirmwareState`].
+/// Recursive pointer exclusion is enforced by the [`crate::runtime_state::VamSafe`]
+/// const assertion. This runtime check verifies the root's linker placement and
+/// the EFI memory descriptor that the OS will receive.
 pub fn assert_runtime_relocatable() {
-    let base = get() as *const FirmwareState as usize;
-    let end = base + core::mem::size_of::<FirmwareState>();
-    let efi = efi();
+    use crate::efi::allocator::{self, MemoryType};
 
-    let check = |name: &str, ptr: usize| {
-        assert!(
-            ptr >= base && ptr < end,
-            "{name} at {ptr:#x} is outside FirmwareState ({base:#x}..{end:#x}); \
-             SetVirtualAddressMap cannot relocate it"
-        );
+    let physical = crate::runtime_state::physical_address();
+    let current = crate::runtime_state::get() as *const _ as u64;
+    assert_eq!(
+        current, physical,
+        "runtime state root was not initialized to its physical address"
+    );
+
+    let size = core::mem::size_of::<crate::runtime_state::RuntimeState>() as u64;
+    let Some(end) = physical.checked_add(size) else {
+        panic!("runtime state address range overflows");
     };
 
-    check("variables", efi.variables.as_ptr() as usize);
-    check("variable payload", efi.variables[0].data.as_ptr() as usize);
-    check("config_tables", efi.config_tables.as_ptr() as usize);
-    check("handles", efi.handles.as_ptr() as usize);
-    check("events", efi.events.as_ptr() as usize);
-    check("loaded_images", efi.loaded_images.as_ptr() as usize);
+    #[cfg(feature = "platform-entry")]
+    {
+        unsafe extern "C" {
+            static _runtime_state_start: u8;
+            static _runtime_state_end: u8;
+        }
+        let section_start = &raw const _runtime_state_start as u64;
+        let section_end = &raw const _runtime_state_end as u64;
+        assert!(
+            physical >= section_start && end <= section_end,
+            "runtime state root lies outside .runtime_state"
+        );
+    }
+
+    let mut address = physical;
+    while address < end {
+        if allocator::get_memory_type_at(address) != Some(MemoryType::RuntimeServicesData) {
+            log::error!(
+                "Runtime state page at {:#x} is not reserved as RuntimeServicesData",
+                address
+            );
+            panic!("runtime state root is not fully reserved as RuntimeServicesData");
+        }
+        address = address.saturating_add(allocator::PAGE_SIZE);
+    }
+    if allocator::get_memory_type_at(end - 1) != Some(MemoryType::RuntimeServicesData) {
+        log::error!(
+            "Runtime state final byte at {:#x} is not reserved as RuntimeServicesData",
+            end - 1
+        );
+        panic!("runtime state root crosses out of RuntimeServicesData");
+    }
 }
 
 /// Get a raw mutable pointer to the EFI state.
@@ -1344,7 +1364,7 @@ where
 /// must be stored to ESP file instead.
 #[inline]
 pub fn is_exit_boot_services_called() -> bool {
-    get().efi.exit_boot_services_called
+    EXIT_BOOT_SERVICES_CALLED.load(Ordering::Acquire)
 }
 
 /// Mark that ExitBootServices has been called.
@@ -1352,7 +1372,5 @@ pub fn is_exit_boot_services_called() -> bool {
 /// This should only be called from boot_services::exit_boot_services.
 #[inline]
 pub fn set_exit_boot_services_called() {
-    with_efi_mut(|efi| {
-        efi.exit_boot_services_called = true;
-    });
+    EXIT_BOOT_SERVICES_CALLED.store(true, Ordering::Release);
 }

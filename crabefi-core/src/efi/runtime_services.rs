@@ -297,6 +297,42 @@ extern "efiapi" fn set_virtual_address_map(
 
     log::info!("SetVirtualAddressMap: {} entries", num_entries);
 
+    // Validate the converted root before committing to virtual mode. If the
+    // caller omitted its EFI_MEMORY_RUNTIME descriptor, continuing would leave
+    // the physical pointer live after the OS removes the identity mapping.
+    let state_phys = crate::runtime_state::physical_address();
+    let state_size = core::mem::size_of::<crate::runtime_state::RuntimeState>() as u64;
+    let Some(state_end) = state_phys.checked_add(state_size) else {
+        log::error!("SetVirtualAddressMap: runtime state range overflows");
+        return Status::INVALID_PARAMETER;
+    };
+    let mut relocated_state = None;
+    for i in 0..num_entries {
+        let desc = unsafe {
+            &*((virtual_map as *const u8).add(i * descriptor_size) as *const efi::MemoryDescriptor)
+        };
+        if (desc.attribute & EFI_MEMORY_RUNTIME) == 0 {
+            continue;
+        }
+        let phys_end = desc
+            .number_of_pages
+            .saturating_mul(EFI_PAGE_SIZE)
+            .saturating_add(desc.physical_start);
+        if state_phys >= desc.physical_start && state_end <= phys_end {
+            let offset = desc.virtual_start as i64 - desc.physical_start as i64;
+            relocated_state = Some((state_phys as i64 + offset) as u64);
+            break;
+        }
+    }
+    let Some(new_state) = relocated_state else {
+        log::error!(
+            "SetVirtualAddressMap: runtime state {:#x}..{:#x} is absent from EFI_MEMORY_RUNTIME map",
+            state_phys,
+            state_end
+        );
+        return Status::INVALID_PARAMETER;
+    };
+
     // Step 0: Let platform glue disable physical-only resources before the OS
     // switches EFI runtime services to virtual addressing.
     if let Some(hooks) = crate::state::drivers().platform.hooks {
@@ -345,40 +381,14 @@ extern "efiapi" fn set_virtual_address_map(
         });
     }
 
-    // Step 4a: Relocate STATE_PTR — find the runtime region containing
-    // FirmwareState (on the stack, inside RuntimeServicesData).
-    let state_phys = state::get() as *const _ as u64;
+    // Step 4a: Relocate the single pointer-free runtime root.
     let rt_ptr = get_runtime_services();
-
-    for i in 0..num_entries {
-        let desc = unsafe {
-            &*((virtual_map as *const u8).add(i * descriptor_size) as *const efi::MemoryDescriptor)
-        };
-
-        if (desc.attribute & EFI_MEMORY_RUNTIME) == 0 {
-            continue;
-        }
-
-        let phys_start = desc.physical_start;
-        let phys_end = desc
-            .number_of_pages
-            .saturating_mul(EFI_PAGE_SIZE)
-            .saturating_add(phys_start);
-
-        if state_phys >= phys_start && state_phys < phys_end {
-            let offset = desc.virtual_start as i64 - phys_start as i64;
-            let new_state = (state_phys as i64 + offset) as u64;
-            unsafe {
-                state::relocate_state_ptr(new_state as *mut state::FirmwareState);
-            }
-            log::debug!(
-                "SetVirtualAddressMap: relocated state ptr {:#x} -> {:#x}",
-                state_phys,
-                new_state
-            );
-            break;
-        }
-    }
+    crate::runtime_state::relocate(new_state as *mut crate::runtime_state::RuntimeState);
+    log::debug!(
+        "SetVirtualAddressMap: relocated runtime state ptr {:#x} -> {:#x}",
+        state_phys,
+        new_state
+    );
 
     // Step 4b: Relocate RuntimeServices function pointers via ConvertPointer.
     //
@@ -682,7 +692,11 @@ extern "efiapi" fn get_variable(
         // Check for SetupMode variable
         if name_eq_const(name, auth::SETUP_MODE_NAME) {
             return get_secure_boot_status_variable(
-                auth::is_setup_mode() as u8,
+                if state::is_exit_boot_services_called() {
+                    crate::runtime_state::get().setup_mode as u8
+                } else {
+                    auth::is_setup_mode() as u8
+                },
                 attributes,
                 data_size,
                 data,
@@ -692,7 +706,11 @@ extern "efiapi" fn get_variable(
         // Check for SecureBoot variable
         if name_eq_const(name, auth::SECURE_BOOT_NAME) {
             return get_secure_boot_status_variable(
-                auth::is_secure_boot_enabled() as u8,
+                if state::is_exit_boot_services_called() {
+                    crate::runtime_state::get().secure_boot_enabled as u8
+                } else {
+                    auth::is_secure_boot_enabled() as u8
+                },
                 attributes,
                 data_size,
                 data,
@@ -700,10 +718,38 @@ extern "efiapi" fn get_variable(
         }
     }
 
-    let efi = state::efi();
-    let variables = &efi.variables;
+    if state::is_exit_boot_services_called() {
+        let runtime = crate::runtime_state::get();
+        let found = runtime
+            .variables
+            .iter()
+            .find(|var| var.in_use && var.vendor_guid == guid && name_eq(&var.name, name));
+        return match found {
+            Some(var) => {
+                let payload = runtime.data(var);
+                if data.is_null() || unsafe { *data_size } < payload.len() {
+                    unsafe { *data_size = payload.len() };
+                    Status::BUFFER_TOO_SMALL
+                } else {
+                    unsafe {
+                        core::ptr::copy_nonoverlapping(
+                            payload.as_ptr(),
+                            data as *mut u8,
+                            payload.len(),
+                        );
+                        *data_size = payload.len();
+                        if !attributes.is_null() {
+                            *attributes = var.attributes;
+                        }
+                    }
+                    Status::SUCCESS
+                }
+            }
+            None => Status::NOT_FOUND,
+        };
+    }
 
-    // Find the variable using iterator
+    let variables = &state::efi().variables;
     let found = variables
         .iter()
         .find(|var| var.in_use && var.vendor_guid == guid && name_eq(&var.name, name));
@@ -884,14 +930,24 @@ extern "efiapi" fn get_next_variable_name(
             // IMPORTANT: Skip any stored variables that shadow our synthesized
             // variables (SetupMode, SecureBoot with EFI_GLOBAL_VARIABLE_GUID)
             // to avoid infinite enumeration loops.
-            let efi = state::efi();
-            let variables = &efi.variables;
-
-            if let Some(var) = variables.iter().find(|var| {
-                var.in_use
-                    && is_variable_accessible_at_runtime(var.attributes)
-                    && !is_synthesized_variable(&var.name, &var.vendor_guid)
-            }) {
+            if state::is_exit_boot_services_called() {
+                if let Some(var) = crate::runtime_state::get()
+                    .variables
+                    .iter()
+                    .find(|var| var.in_use && !is_synthesized_variable(&var.name, &var.vendor_guid))
+                {
+                    return copy_runtime_variable_name(
+                        var,
+                        variable_name_size,
+                        variable_name,
+                        vendor_guid,
+                    );
+                }
+            } else if let Some(var) = state::efi()
+                .variables
+                .iter()
+                .find(|var| var.in_use && !is_synthesized_variable(&var.name, &var.vendor_guid))
+            {
                 log::trace!("GetNextVariableName: after SecureBoot, returning first stored var");
                 return copy_stored_variable_name(
                     var,
@@ -907,9 +963,25 @@ extern "efiapi" fn get_next_variable_name(
         }
     }
 
-    // Search in stored variables
-    let efi = state::efi();
-    let variables = &efi.variables;
+    if state::is_exit_boot_services_called() {
+        let next_var = crate::runtime_state::get()
+            .variables
+            .iter()
+            .filter(|var| var.in_use && !is_synthesized_variable(&var.name, &var.vendor_guid))
+            .skip_while(|var| {
+                !(var.vendor_guid == current_guid && name_eq(&var.name, current_name))
+            })
+            .nth(1);
+        return match next_var {
+            Some(var) => {
+                copy_runtime_variable_name(var, variable_name_size, variable_name, vendor_guid)
+            }
+            None => Status::NOT_FOUND,
+        };
+    }
+
+    // Search in boot-time stored variables.
+    let variables = &state::efi().variables;
 
     // Count how many variables are accessible (excluding synthesized ones)
     let accessible_count = variables
@@ -978,6 +1050,28 @@ fn copy_variable_name(
 }
 
 /// Copy a stored variable name to the output buffer
+fn copy_runtime_variable_name(
+    var: &crate::runtime_state::RuntimeVariable,
+    variable_name_size: *mut usize,
+    variable_name: *mut u16,
+    vendor_guid: *mut Guid,
+) -> Status {
+    let name_len = crate::efi::utils::ucs2_len(&var.name) + 1;
+    let required_size = name_len * 2;
+
+    if unsafe { *variable_name_size } < required_size {
+        unsafe { *variable_name_size = required_size };
+        return Status::BUFFER_TOO_SMALL;
+    }
+
+    unsafe {
+        core::ptr::copy_nonoverlapping(var.name.as_ptr(), variable_name, name_len);
+        *vendor_guid = var.vendor_guid;
+        *variable_name_size = required_size;
+    }
+    Status::SUCCESS
+}
+
 fn copy_stored_variable_name(
     var: &crate::state::VariableEntry,
     variable_name_size: *mut usize,
@@ -1138,27 +1232,15 @@ fn set_variable_runtime_write(
     // Borrowed, not copied -- the payload is written straight into the cache.
     let payload = unsafe { core::slice::from_raw_parts(data as *const u8, data_size) };
 
-    let status = state::with_efi_mut(|efi| {
-        let existing = efi.variables.iter().position(|var| {
-            var.in_use
-                && var.vendor_guid == guid
-                && crate::efi::utils::ucs2_eq(&var.name, name_vec.as_slice())
-        });
-        let Some(idx) = existing.or_else(|| efi.variables.iter().position(|var| !var.in_use))
-        else {
-            return Status::OUT_OF_RESOURCES;
-        };
-
-        let entry = &mut efi.variables[idx];
-        entry.name[..name_vec.len()].copy_from_slice(name_vec.as_slice());
-        entry.name[name_vec.len()..].fill(0);
-        if entry.set_data(payload).is_err() {
-            return Status::OUT_OF_RESOURCES;
+    let status = crate::runtime_state::with_mut(|runtime| {
+        if runtime
+            .set_variable(guid, name_vec.as_slice(), attributes, payload)
+            .is_err()
+        {
+            Status::OUT_OF_RESOURCES
+        } else {
+            Status::SUCCESS
         }
-        entry.vendor_guid = guid;
-        entry.attributes = attributes;
-        entry.in_use = true;
-        Status::SUCCESS
     });
 
     if status != Status::SUCCESS {
@@ -1206,26 +1288,15 @@ fn set_variable_runtime_delete(
         return Status::OUT_OF_RESOURCES;
     }
 
-    let secure_boot_var = auth::identify_key_database(name_vec.as_slice(), &guid);
-    let (status, deleted_secure_boot_var) = state::with_efi_mut(|efi| {
-        let Some(idx) = efi.variables.iter().position(|var| {
-            var.in_use
-                && var.vendor_guid == guid
-                && crate::efi::utils::ucs2_eq(&var.name, name_vec.as_slice())
-        }) else {
-            return (Status::NOT_FOUND, None);
-        };
-
-        efi.variables[idx].clear();
-        (Status::SUCCESS, secure_boot_var)
-    });
-
-    if status != Status::SUCCESS {
-        return status;
+    if auth::identify_key_database(name_vec.as_slice(), &guid).is_some() {
+        return Status::WRITE_PROTECTED;
     }
 
-    if let Some(var_type) = deleted_secure_boot_var {
-        handle_secure_boot_variable_delete(var_type);
+    let deleted = crate::runtime_state::with_mut(|runtime| {
+        runtime.delete_variable(&guid, name_vec.as_slice())
+    });
+    if !deleted {
+        return Status::NOT_FOUND;
     }
 
     if let Err(e) = crate::efi::varstore::delete_variable(&guid, name_vec.as_slice()) {
@@ -1760,15 +1831,20 @@ extern "efiapi" fn query_variable_info(
     // We don't really care about attributes for our in-memory store
     let _ = attributes;
 
-    let efi = state::efi();
-    let variables = &efi.variables;
-    let total_size = MAX_VARIABLES * MAX_VARIABLE_DATA_SIZE;
-
-    let used_size: usize = variables
-        .iter()
-        .filter(|var| var.in_use)
-        .map(|var| var.data_size)
-        .sum();
+    let (total_size, used_size) = if state::is_exit_boot_services_called() {
+        let runtime = crate::runtime_state::get();
+        (crate::runtime_state::BLOB_ARENA_SIZE, runtime.used_bytes())
+    } else {
+        let variables = &state::efi().variables;
+        (
+            MAX_VARIABLES * MAX_VARIABLE_DATA_SIZE,
+            variables
+                .iter()
+                .filter(|var| var.in_use)
+                .map(|var| var.data_size)
+                .sum(),
+        )
+    };
 
     unsafe {
         *maximum_variable_storage_size = total_size as u64;

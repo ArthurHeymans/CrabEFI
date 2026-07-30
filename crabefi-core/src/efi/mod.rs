@@ -97,6 +97,7 @@ pub fn init_from_platform(config: &mut crate::platform::PlatformConfig) {
     if !crate::heap::is_initialized() {
         panic!("Failed to initialize heap allocator");
     }
+    crate::runtime_state::init();
     // Guard the SetVirtualAddressMap invariant while it is still cheap to check.
     crate::state::assert_runtime_relocatable();
 

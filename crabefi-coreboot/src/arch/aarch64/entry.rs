@@ -169,6 +169,19 @@ _start:
     b.lt 1b
 2:
 
+    // .runtime_state is NOLOAD and therefore has no initialized image bytes.
+    adrp x1, _runtime_state_start
+    add x1, x1, :lo12:_runtime_state_start
+    adrp x2, _runtime_state_end
+    add x2, x2, :lo12:_runtime_state_end
+    cmp x1, x2
+    b.ge 4f
+3:
+    str xzr, [x1], #8
+    cmp x1, x2
+    b.lt 3b
+4:
+
     // Restore coreboot table pointer as first argument
     mov x0, x19
 
@@ -176,8 +189,8 @@ _start:
     bl rust_main
 
     // Should not return, but halt if it does
-3:
+5:
     wfe
-    b 3b
+    b 5b
 "#
 );

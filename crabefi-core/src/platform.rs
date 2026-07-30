@@ -1490,9 +1490,12 @@ pub struct DeferredBufferConfig {
 /// ensuring the OS preserves them after `ExitBootServices` and
 /// `SetVirtualAddressMap` adjusts pointers correctly.
 ///
-/// For the coreboot target, these come from linker-provided symbols.
-/// External firmware must ensure CrabEFI's code lives in a region that
-/// the OS will keep mapped.
+/// For the coreboot target, these come from linker-provided symbols. External
+/// firmware must ensure CrabEFI's code and the static runtime-state root both
+/// live in the supplied regions. In particular, `data_base..data_base +
+/// data_size` must cover CrabEFI's complete `RuntimeState`; initialization
+/// rejects configurations that would expose any page of that root as a type
+/// other than `RuntimeServicesData`.
 #[derive(Debug, Clone, Copy)]
 pub struct RuntimeRegion {
     /// Base address of the runtime code section.

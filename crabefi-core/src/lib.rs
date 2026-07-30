@@ -5,6 +5,7 @@
 
 #![no_std]
 #![cfg_attr(target_arch = "x86_64", feature(abi_x86_interrupt))]
+#![feature(auto_traits, negative_impls)]
 #![feature(never_type)] // Used for -> ! return type in payload chainloading
 #![deny(unsafe_op_in_unsafe_fn)]
 // Allow common firmware code patterns
@@ -40,6 +41,7 @@ pub mod menu_common;
 pub mod payload;
 pub mod pe;
 pub mod platform;
+pub mod runtime_state;
 pub mod secure_boot_menu;
 pub mod state;
 pub mod time;

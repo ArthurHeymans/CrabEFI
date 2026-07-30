@@ -1601,6 +1601,11 @@ extern "efiapi" fn exit_boot_services(image_handle: Handle, map_key: usize) -> S
         map_key
     );
 
+    // Freeze the pointer-free runtime cache before boot state becomes
+    // unreachable. This only copies inline data and does not change the memory
+    // map key, so callers may retry ExitBootServices normally.
+    crate::runtime_state::freeze_from_boot_state();
+
     // TCG measured boot: measure ExitBootServices action into PCR 5.
     super::tcg::measured_boot::measure_action_all(5, "Exit Boot Services Invocation");
 

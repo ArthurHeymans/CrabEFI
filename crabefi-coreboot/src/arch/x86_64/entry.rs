@@ -171,6 +171,14 @@ long_mode_start:
     xor rax, rax
     rep stosq
 
+    // .runtime_state is NOLOAD, so its Rust initializer is not present in the
+    // payload image. Zero it before any bool or future non-zero field is read.
+    lea rdi, [rip + _runtime_state_start]
+    lea rcx, [rip + _runtime_state_end]
+    sub rcx, rdi
+    shr rcx, 3
+    rep stosq
+
     // Fill the stack with a marker so Rust can report its high-water mark.
     // No stack access occurs between this and the call to rust_main below.
     lea rdi, [rip + _stack_bottom]

@@ -122,6 +122,14 @@ SECTIONS
         _bss_end = .;
     } :data
 
+    /* Pointer-free state reached through the single SVAM-converted root. */
+    .runtime_state (NOLOAD) : ALIGN(4096) {
+        _runtime_state_start = .;
+        KEEP(*(.runtime_state))
+        . = ALIGN(8);
+        _runtime_state_end = .;
+    } :data
+
     /* Stack - 4MB.
      *
      * FirmwareState lives in the entry frame and carries the EFI tables inline

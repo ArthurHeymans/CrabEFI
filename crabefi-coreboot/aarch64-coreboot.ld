@@ -68,7 +68,15 @@ SECTIONS
         _bss_end = .;
     }
 
-    /* Stack - 4MB; FirmwareState carries the EFI tables inline (see x86_64 script). */
+    /* Pointer-free state reached through the single SVAM-converted root. */
+    .runtime_state (NOLOAD) : ALIGN(4096) {
+        _runtime_state_start = .;
+        KEEP(*(.runtime_state))
+        . = ALIGN(8);
+        _runtime_state_end = .;
+    }
+
+    /* Stack - 4MB; boot-only FirmwareState lives here. */
     .stack (NOLOAD) : ALIGN(65536) {
         _stack_bottom = .;
         . += 0x400000;

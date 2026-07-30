@@ -45,15 +45,25 @@ _start:
     bltu t0, t1, 1b
 2:
 
+    # .runtime_state is NOLOAD and therefore has no initialized image bytes.
+    la t0, _runtime_state_start
+    la t1, _runtime_state_end
+    bgeu t0, t1, 4f
+3:
+    sd zero, 0(t0)
+    addi t0, t0, 8
+    bltu t0, t1, 3b
+4:
+
     # Call Rust entry point: riscv_main(hart_id, fdt_ptr)
     mv a0, s0
     mv a1, s1
     call riscv_main
 
     # Should not return, but halt if it does
-3:
+5:
     wfi
-    j 3b
+    j 5b
 
 # -------------------------------------------------------------------
 # S-mode trap entry — minimal handler that logs and halts.
