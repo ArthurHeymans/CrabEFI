@@ -138,6 +138,7 @@ dependencies = [
  "bitflags",
  "cms",
  "const-oid 0.9.6",
+ "crabefi-runtime",
  "der 0.7.10",
  "fdt",
  "heapless 0.9.3",
@@ -193,6 +194,13 @@ dependencies = [
  "tock-registers",
  "x86_64",
  "zerocopy",
+]
+
+[[package]]
+name = "crabefi-runtime"
+version = "0.1.0"
+dependencies = [
+ "r-efi",
 ]
 
 [[package]]

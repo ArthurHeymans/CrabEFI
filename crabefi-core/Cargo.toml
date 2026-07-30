@@ -29,6 +29,7 @@ rt-log = []
 ui = []
 
 [dependencies]
+crabefi-runtime = { path = "../crabefi-runtime" }
 r-efi = { workspace = true }
 log = { workspace = true }
 heapless = { workspace = true }

@@ -1157,7 +1157,7 @@ pub fn assert_runtime_relocatable() {
     use crate::efi::allocator::{self, MemoryType};
 
     let physical = crate::runtime_state::physical_address();
-    let current = crate::runtime_state::get() as *const _ as u64;
+    let current = crate::runtime_state::current_address();
     assert_eq!(
         current, physical,
         "runtime state root was not initialized to its physical address"

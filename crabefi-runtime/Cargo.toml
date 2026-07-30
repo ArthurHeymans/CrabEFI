@@ -1,0 +1,10 @@
+[package]
+name = "crabefi-runtime"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0 OR MIT"
+repository = "https://github.com/user/CrabEFI"
+description = "Allocation-free SetVirtualAddressMap-safe CrabEFI runtime state"
+
+[dependencies]
+r-efi = "5.3"

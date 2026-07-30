@@ -2,8 +2,13 @@
 # xtask and test-apps are NOT workspace members (different build targets).
 
 [workspace]
-members = ["crabefi-core", "crabefi-coreboot", "crabefi-drivers"]
+members = [
+  "crabefi-core",
+  "crabefi-coreboot",
+  "crabefi-drivers",
+]
 exclude = [
+  "crabefi-runtime",
   "xtask",
   "test-apps/hello",
   "test-apps/rng-test",

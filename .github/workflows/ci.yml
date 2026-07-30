@@ -36,6 +36,18 @@ jobs:
       - name: Run coreboot feature regression tests
         run: ci/run-coreboot-feature-tests.sh
 
+  runtime-tests:
+    name: Runtime state unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@nightly
+
+      - name: Run allocation-free runtime tests
+        run: ci/run-runtime-tests.sh
+
   # ── x86_64 ────────────────────────────────────────────────────────────
 
   clippy:
@@ -49,6 +61,18 @@ jobs:
         with:
           components: clippy, rust-src
           targets: x86_64-unknown-none
+
+      - name: Verify runtime leaf dependencies
+        run: |
+          python3 - <<'PY'
+          import json
+          import subprocess
+
+          metadata = json.loads(subprocess.check_output(["cargo", "metadata", "--no-deps", "--format-version", "1"]))
+          runtime = next(package for package in metadata["packages"] if package["name"] == "crabefi-runtime")
+          dependencies = {dependency["name"] for dependency in runtime["dependencies"]}
+          assert dependencies == {"r-efi"}, f"unexpected runtime dependencies: {sorted(dependencies)}"
+          PY
 
       - name: Run clippy
         run: cargo clippy --workspace --release --target x86_64-unknown-none -- -D warnings
