@@ -780,7 +780,7 @@ fn scan_partition_for_entries(
 ) {
     // Check if Secure Boot is active - if so, skip direct Linux boot entries
     // because they bypass signature verification
-    let secure_boot_active = crate::efi::auth::is_secure_boot_enabled();
+    let secure_boot_active = crate::efi::auth::boot_secure_boot_status().secure_boot_enabled();
     if secure_boot_active {
         log::debug!("Secure Boot active: skipping direct Linux boot entry discovery");
     }

@@ -16,7 +16,7 @@
 //! - `.cer` or `.der` - DER-encoded X.509 certificate
 
 use super::enrollment::{self, CRABEFI_OWNER_GUID};
-use super::{AuthError, enter_user_mode};
+use super::{AuthError, boot_enter_user_mode};
 use crate::drivers::block::BlockDevice;
 use crate::fs::fat::FatFilesystem;
 use crate::fs::gpt;
@@ -193,7 +193,7 @@ pub fn enroll_pk_from_file() -> Result<&'static str, AuthError> {
     enrollment::enroll_pk(&pk_data, &USER_OWNER_GUID)?;
 
     // Enter User Mode
-    enter_user_mode();
+    boot_enter_user_mode();
 
     // Persist all key databases
     super::boot::persist_key_databases()?;

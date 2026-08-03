@@ -27,7 +27,7 @@
 //! ```
 
 use super::variables::{KeyDatabase, KeyDatabaseEntry, db_database, kek_database, pk_database};
-use super::{AuthError, EFI_CERT_X509_GUID, enter_user_mode};
+use super::{AuthError, EFI_CERT_X509_GUID, boot_enter_user_mode};
 
 // ============================================================================
 // Microsoft Owner GUID (used for signature entries)
@@ -518,7 +518,7 @@ pub fn enroll_default_keys() -> Result<(), AuthError> {
     enroll_default_pk()?;
 
     // Enter User Mode now that PK is enrolled
-    enter_user_mode();
+    boot_enter_user_mode();
 
     log::info!("Microsoft default keys enrolled - system in User Mode");
     log::info!("  KEK: 1 certificate");
@@ -545,8 +545,8 @@ pub fn get_enrollment_status() -> EnrollmentStatus {
         kek_count,
         db_count,
         dbx_count,
-        setup_mode: super::is_setup_mode(),
-        secure_boot_enabled: super::is_secure_boot_enabled(),
+        setup_mode: super::boot_secure_boot_status().setup_mode(),
+        secure_boot_enabled: super::boot_secure_boot_status().secure_boot_enabled(),
     }
 }
 

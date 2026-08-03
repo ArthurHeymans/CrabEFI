@@ -19,6 +19,7 @@ use crate::state::{
 };
 use alloc::vec::Vec;
 use core::ffi::c_void;
+use core::sync::atomic::{AtomicBool, Ordering};
 use r_efi::efi::{self, Boolean, Guid, Handle, Status, SystemTable, TableHeader, Tpl};
 use r_efi::protocols::device_path::Protocol as DevicePathProtocol;
 
@@ -27,6 +28,9 @@ const EFI_BOOT_SERVICES_SIGNATURE: u64 = 0x56524553544F4F42;
 
 /// Boot Services revision (matches system table)
 const EFI_BOOT_SERVICES_REVISION: u32 = (2 << 16) | 100;
+
+/// ExitBootServices callbacks are one-way and must not run again on a map-key retry.
+static EXIT_BOOT_SERVICES_PREPARED: AtomicBool = AtomicBool::new(false);
 
 /// Event types
 pub const EVT_TIMER: u32 = 0x80000000;
@@ -1217,7 +1221,7 @@ extern "efiapi" fn load_image(
     };
 
     // Secure Boot verification (if enabled)
-    if super::auth::is_secure_boot_enabled() {
+    if super::auth::boot_secure_boot_status().secure_boot_enabled() {
         log::debug!("BS.LoadImage: Secure Boot verification required");
         match super::auth::verify_pe_image_secure_boot(data) {
             Ok(true) => {
@@ -1601,21 +1605,20 @@ extern "efiapi" fn exit_boot_services(image_handle: Handle, map_key: usize) -> S
         map_key
     );
 
-    // Freeze the pointer-free runtime cache before boot state becomes
-    // unreachable. This only copies inline data and does not change the memory
-    // map key, so callers may retry ExitBootServices normally.
-    crate::runtime_state::freeze_from_boot_state();
+    // Reject a stale key before signaling one-way handoff callbacks. A failed
+    // probe must not invalidate platform state or fire ExitBootServices events.
+    if allocator::validate_map_key(map_key) != Status::SUCCESS {
+        return Status::INVALID_PARAMETER;
+    }
 
-    // TCG measured boot: measure ExitBootServices action into PCR 5.
-    super::tcg::measured_boot::measure_action_all(5, "Exit Boot Services Invocation");
+    if !EXIT_BOOT_SERVICES_PREPARED.swap(true, Ordering::AcqRel) {
+        // TCG measured boot: measure ExitBootServices action into PCR 5.
+        super::tcg::measured_boot::measure_action_all(5, "Exit Boot Services Invocation");
 
-    // Signal EXIT_BOOT_SERVICES event group BEFORE finalizing the memory map.
-    // Windows Boot Manager registers callbacks that must run before we lock
-    // the memory map.
-    signal_event_group(&EFI_EVENT_GROUP_EXIT_BOOT_SERVICES);
-
-    // Also signal any legacy EVT_SIGNAL_EXIT_BOOT_SERVICES events
-    {
+        // Signal callbacks once. They may invalidate the caller's map key; in
+        // that case the caller retries with a fresh map without repeating
+        // irreversible platform cleanup.
+        signal_event_group(&EFI_EVENT_GROUP_EXIT_BOOT_SERVICES);
         let mut legacy_events: heapless::Vec<usize, MAX_EVENTS> = heapless::Vec::new();
         state::with_efi_mut(|efi_state| {
             for (i, event) in efi_state.events.iter_mut().enumerate() {
@@ -1625,16 +1628,40 @@ extern "efiapi" fn exit_boot_services(image_handle: Handle, map_key: usize) -> S
                 }
             }
         });
-        for event_id in &legacy_events {
+        for event_id in legacy_events {
             let notify_fn = {
-                let efi_state = state::efi();
-                let entry = &efi_state.events[*event_id];
+                let entry = &state::efi().events[event_id];
                 entry.notify_function.map(|f| (f, entry.notify_context))
             };
             if let Some((func, context)) = notify_fn {
-                func(*event_id as efi::Event, context);
+                func(event_id as efi::Event, context);
             }
         }
+
+        if let Some(hooks) = crate::state::drivers().platform.hooks {
+            hooks.on_exit_boot_services();
+        }
+    }
+
+    // Validate the final callback-visible variable cache before locking the
+    // allocator. If this fails, the map key is still valid and the caller can
+    // retry ExitBootServices after fixing the cache.
+    if let Err(error) = crate::runtime_state::validate_boot_state() {
+        log::error!(
+            "ExitBootServices: runtime variable snapshot is invalid: {:?}",
+            error
+        );
+        return Status::OUT_OF_RESOURCES;
+    }
+
+    // Commit the validated snapshot while map-key retry is still possible.
+    // RuntimeState has fixed capacity, so this cannot fail after validation.
+    if let Err(error) = crate::phase::assert_boot(crate::runtime_state::freeze_from_boot_state) {
+        log::error!(
+            "ExitBootServices: failed to freeze runtime state: {:?}",
+            error
+        );
+        return Status::OUT_OF_RESOURCES;
     }
 
     // Rebuild the Memory Attributes Table in-place BEFORE locking the allocator.
@@ -1645,9 +1672,24 @@ extern "efiapi" fn exit_boot_services(image_handle: Handle, map_key: usize) -> S
     // calling allocate_pages(), so the map_key stays valid for the caller.
     system_table::rebuild_memory_attributes_table_in_place();
 
+    // Callbacks may have changed the map. Preserve full retry semantics before
+    // retiring boot-only authentication caches.
+    if allocator::validate_map_key(map_key) != Status::SUCCESS {
+        return Status::INVALID_PARAMETER;
+    }
+
+    // Drop allocator-backed authentication caches before the final map-key
+    // commit. Runtime calls rebuild operation-local copies from RuntimeState.
+    crate::efi::auth::retire_boot_databases();
+
     let status = allocator::exit_boot_services(map_key);
 
     if status == Status::SUCCESS {
+        // Switch allocator domains before any success-side hook or logging can
+        // run. The boot heap is never touched after this point.
+        crate::heap::enable_runtime_allocations();
+        crate::state::set_exit_boot_services_called();
+
         // TCG measured boot: measure ExitBootServices success into PCR 5.
         super::tcg::measured_boot::measure_action_all(
             5,
@@ -1656,10 +1698,6 @@ extern "efiapi" fn exit_boot_services(image_handle: Handle, map_key: usize) -> S
 
         log::info!("ExitBootServices SUCCESS - transitioning to OS");
         crate::timestamp::record(crate::timestamp::TS_CRABEFI_EXIT_BOOT_SERVICES);
-
-        // Mark that ExitBootServices has been called
-        // After this, SPI flash is locked and variable writes go to ESP file
-        crate::state::set_exit_boot_services_called();
 
         // Clean up hardware state for OS handoff.
         // Re-enable keyboard interrupts so Linux's i8042 driver works.
@@ -1675,12 +1713,6 @@ extern "efiapi" fn exit_boot_services(image_handle: Handle, map_key: usize) -> S
         // clear Bus Master Enable on every enumerated PCI function.  Linux will
         // re-enable bus mastering for drivers it owns.
         crate::drivers::pci::disable_all_bus_mastering_for_handoff();
-
-        // Let platform glue clean up integration-specific handoff state before
-        // the OS takes over (for example, disabling non-runtime log buffers).
-        if let Some(hooks) = crate::state::drivers().platform.hooks {
-            hooks.on_exit_boot_services();
-        }
 
         // CRITICAL: Set boot_services pointer to NULL in SystemTable
         // This is REQUIRED by UEFI spec and Linux checks for this!

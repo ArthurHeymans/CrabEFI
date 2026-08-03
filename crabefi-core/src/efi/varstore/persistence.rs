@@ -343,27 +343,57 @@ fn load_variables_from_storage() -> Result<(), VarStoreError> {
     // Load active variables into in-memory cache
     state::with_efi_mut(|efi| {
         for var in &active_vars {
-            // Find a free slot
+            let guid = guid_bytes_to_efi(&var.guid);
+            let name_len = var.name.len().min(MAX_VARIABLE_NAME_LEN);
+            let is_authenticated = var.attributes
+                & crate::efi::auth::attributes::TIME_BASED_AUTHENTICATED_WRITE_ACCESS
+                != 0;
+            let (payload, auth_timestamp) = if is_authenticated {
+                crate::efi::auth::EfiVariableAuthentication2::from_bytes(&var.data)
+                    .and_then(|header| {
+                        header.get_variable_data(&var.data).map(|payload| {
+                            let mut bytes = [0; 16];
+                            bytes
+                                .copy_from_slice(zerocopy::IntoBytes::as_bytes(&header.time_stamp));
+                            (payload, bytes)
+                        })
+                    })
+                    // Compatibility with old stores that kept a stripped
+                    // payload while retaining the authenticated attribute.
+                    .unwrap_or((var.data.as_slice(), [0; 16]))
+            } else {
+                (var.data.as_slice(), [0; 16])
+            };
+
+            if auth_timestamp != [0; 16]
+                && let Some(replay) = efi.auth_replay.iter_mut().find(|entry| !entry.in_use)
+            {
+                replay.name[..name_len].copy_from_slice(&var.name[..name_len]);
+                replay.vendor_guid = guid;
+                replay.timestamp = auth_timestamp;
+                replay.in_use = true;
+            }
+            // A persisted authenticated empty payload is a replay tombstone,
+            // not an active zero-length variable.
+            if is_authenticated && payload.is_empty() {
+                continue;
+            }
+
+            // Find a free slot.
             if let Some(slot) = efi.variables.iter_mut().find(|v| !v.in_use) {
-                // Copy name (UTF-16, strip trailing null for the fixed-size buffer)
-                let name_len = var.name.len().min(MAX_VARIABLE_NAME_LEN);
                 slot.name[..name_len].copy_from_slice(&var.name[..name_len]);
                 if name_len < MAX_VARIABLE_NAME_LEN {
                     slot.name[name_len..].fill(0);
                 }
-
-                // Convert GUID bytes to r_efi::efi::Guid
-                slot.vendor_guid = guid_bytes_to_efi(&var.guid);
+                slot.vendor_guid = guid;
                 slot.attributes = var.attributes;
-
-                let data_len = var.data.len().min(MAX_VARIABLE_DATA_SIZE);
-                if slot.set_data(&var.data[..data_len]).is_err() {
-                    log::warn!("No heap space for variable payload");
+                if payload.len() > MAX_VARIABLE_DATA_SIZE || slot.set_data(payload).is_err() {
+                    log::warn!("Variable payload exceeds the in-memory limit");
                     continue;
                 }
+                slot.auth_timestamp = auth_timestamp;
                 slot.in_use = true;
 
-                // Log the loaded variable name
                 let name_str: Vec<u8> = var
                     .name
                     .iter()
@@ -475,8 +505,8 @@ pub(super) fn write_variable_to_storage_internal(
 
     let guid_bytes = edk2::guid_to_bytes(guid);
 
-    // First, mark any existing record with same GUID+name as deleted
-    delete_existing_record(&guid_bytes, name)?;
+    // Keep the previous record valid until the replacement has been written
+    // and verified. A failed append must not destroy the old variable.
 
     // Check if we have space for the new record
     let record = edk2::build_variable_record(&guid_bytes, name, attributes, data);
@@ -543,6 +573,15 @@ pub(super) fn write_variable_to_storage_internal(
         *state = edk2::VAR_ADDED;
     }
     verify_written_record(write_offset, &expected_record)?;
+
+    // Now retire older versions. If this final cleanup is interrupted, both
+    // records are valid and readers deterministically select the later one.
+    if let Err(error) = delete_existing_record_before(&guid_bytes, name, Some(write_offset)) {
+        // The replacement is already durable and wins by append order. Treat
+        // stale-record cleanup as best-effort rather than reporting a failed
+        // SetVariable after the new value committed.
+        log::warn!("Could not retire superseded variable record: {:?}", error);
+    }
 
     state::with_varstore_mut(|vs| {
         vs.write_offset = new_offset;
@@ -659,11 +698,15 @@ pub(super) fn write_variable_deletion_internal(
     }
 
     let guid_bytes = edk2::guid_to_bytes(guid);
-    delete_existing_record(&guid_bytes, name)
+    delete_existing_record_before(&guid_bytes, name, None)
 }
 
-/// Find and mark as deleted any existing record with the given GUID+name
-fn delete_existing_record(guid_bytes: &[u8; 16], name: &[u16]) -> Result<(), VarStoreError> {
+/// Find and mark as deleted existing records older than an optional offset.
+fn delete_existing_record_before(
+    guid_bytes: &[u8; 16],
+    name: &[u16],
+    before: Option<u32>,
+) -> Result<(), VarStoreError> {
     let vs = state::varstore();
     let auth_format = vs.auth_format;
     let data_size = vs.data_size;
@@ -679,6 +722,7 @@ fn delete_existing_record(guid_bytes: &[u8; 16], name: &[u16]) -> Result<(), Var
     // Find and delete matching VAR_ADDED records
     for var in &vars {
         if edk2::is_var_added(var.state)
+            && before.is_none_or(|limit| var.state_offset < limit)
             && var.guid == *guid_bytes
             && edk2::name_matches(&var.name, name)
         {
@@ -889,6 +933,17 @@ pub fn update_variable_in_memory(
     attributes: u32,
     data: &[u8],
 ) {
+    update_variable_in_memory_with_timestamp(guid, name, attributes, data, None);
+}
+
+/// Update the boot cache and explicitly preserve authenticated replay metadata.
+pub fn update_variable_in_memory_with_timestamp(
+    guid: &r_efi::efi::Guid,
+    name: &[u16],
+    attributes: u32,
+    data: &[u8],
+    timestamp: Option<super::SerializedTime>,
+) {
     use crate::state::{self, MAX_VARIABLE_DATA_SIZE, MAX_VARIABLE_NAME_LEN};
 
     state::with_efi_mut(|efi| {
@@ -923,7 +978,55 @@ pub fn update_variable_in_memory(
 
         efi.variables[idx].vendor_guid = *guid;
         efi.variables[idx].attributes = attributes;
+        let is_authenticated =
+            attributes & crate::efi::auth::attributes::TIME_BASED_AUTHENTICATED_WRITE_ACCESS != 0;
+        efi.variables[idx].auth_timestamp = timestamp
+            .filter(|_| is_authenticated)
+            .map(|timestamp| {
+                let mut bytes = [0; 16];
+                bytes[0..2].copy_from_slice(&timestamp.year.to_le_bytes());
+                bytes[2] = timestamp.month;
+                bytes[3] = timestamp.day;
+                bytes[4] = timestamp.hour;
+                bytes[5] = timestamp.minute;
+                bytes[6] = timestamp.second;
+                bytes[8..12].copy_from_slice(&timestamp.nanosecond.to_le_bytes());
+                bytes[12..14].copy_from_slice(&timestamp.timezone.to_le_bytes());
+                bytes[14] = timestamp.daylight;
+                bytes
+            })
+            .or_else(|| {
+                is_authenticated
+                    .then(|| crate::efi::auth::EfiVariableAuthentication2::from_bytes(data))
+                    .flatten()
+                    .map(|header| {
+                        let mut bytes = [0; 16];
+                        bytes.copy_from_slice(zerocopy::IntoBytes::as_bytes(&header.time_stamp));
+                        bytes
+                    })
+            })
+            .unwrap_or([0; 16]);
         efi.variables[idx].in_use = true;
+
+        let auth_timestamp = efi.variables[idx].auth_timestamp;
+        let replay_index = efi
+            .auth_replay
+            .iter()
+            .position(|entry| {
+                entry.in_use
+                    && entry.vendor_guid == *guid
+                    && crate::efi::utils::ucs2_eq(&entry.name, name)
+            })
+            .or_else(|| efi.auth_replay.iter().position(|entry| !entry.in_use));
+        if auth_timestamp != [0; 16]
+            && let Some(replay) = replay_index.map(|index| &mut efi.auth_replay[index])
+        {
+            replay.name.fill(0);
+            replay.name[..name_len].copy_from_slice(&name[..name_len]);
+            replay.vendor_guid = *guid;
+            replay.timestamp = auth_timestamp;
+            replay.in_use = true;
+        }
     });
 }
 

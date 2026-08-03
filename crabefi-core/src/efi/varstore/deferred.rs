@@ -52,7 +52,9 @@
 
 use core::sync::atomic::{AtomicBool, Ordering};
 
-use super::{SerializedTime, VarStoreError, VariableRecord, VariableRecordRef, crc32};
+use super::{
+    MAX_DATA_SIZE, SerializedTime, VarStoreError, VariableRecord, VariableRecordRef, crc32,
+};
 use crate::efi::auth;
 
 /// Magic value for the deferred buffer header: "CVBF" (CrabVariable Buffer)
@@ -133,8 +135,8 @@ const HEADER_SIZE: usize = 32;
 /// `sbctl enroll-keys --microsoft` writes db/KEK entries containing
 /// multiple X.509 certificates (~1.5 KB each) inside an
 /// EFI_VARIABLE_AUTHENTICATION_2 header with a PKCS#7 signature
-/// (~1-2 KB).  16 KB covers all realistic enrollment payloads.
-const MAX_ENTRY_SIZE: usize = 16 * 1024;
+/// (~1-2 KB). Include bounded serialization/name overhead above the raw-data limit.
+const MAX_ENTRY_SIZE: usize = MAX_DATA_SIZE + 1024;
 
 /// Entry flags
 mod entry_flags {
@@ -273,6 +275,18 @@ fn buffer_base() -> *mut u8 {
 /// Get the buffer size
 fn buffer_size() -> usize {
     deferred_buffer_size()
+}
+
+/// Physical deferred-buffer range that must survive virtual remapping.
+pub fn runtime_buffer_range() -> Option<(u64, u64)> {
+    let start = buffer_base() as u64;
+    let end = start.checked_add(buffer_size() as u64)?;
+    (start != 0 && end > start).then_some((start, end))
+}
+
+/// Replace the deferred-buffer root with its validated virtual alias.
+pub fn relocate_buffer(address: u64) {
+    BUFFER_BASE_OVERRIDE.store(address, Ordering::Release);
 }
 
 /// Initialize the deferred buffer
@@ -452,6 +466,7 @@ pub fn process_pending() -> Result<usize, VarStoreError> {
                         // The timestamp was extracted and stored in record.timestamp when queued
                         // Verify it against current key databases before writing to NVS
                         match auth::verify_authenticated_variable(
+                            auth::boot_secure_boot_status(),
                             &record.name,
                             &guid,
                             record.attributes,
@@ -476,35 +491,79 @@ pub fn process_pending() -> Result<usize, VarStoreError> {
                         (record.data.clone(), None)
                     };
 
-                    // Write to storage (with timestamp for authenticated variables)
-                    let write_result = if let Some(ref timestamp) = timestamp_to_use {
-                        // Use persist_variable_with_timestamp to preserve the timestamp
-                        super::persistence::persist_variable_with_timestamp(
-                            &guid,
-                            &record.name,
-                            record.attributes,
-                            &actual_data,
-                            *timestamp,
-                        )
+                    let is_append = record.attributes & auth::attributes::APPEND_WRITE != 0;
+                    let stored_attributes = record.attributes & !auth::attributes::APPEND_WRITE;
+                    let mut committed_data = actual_data;
+                    if is_append && !committed_data.is_empty() {
+                        let existing = crate::state::efi().variables.iter().find(|variable| {
+                            variable.in_use
+                                && variable.vendor_guid == guid
+                                && crate::efi::utils::ucs2_eq(&variable.name, &record.name)
+                        });
+                        if let Some(existing) = existing {
+                            let required = existing
+                                .data_size
+                                .checked_add(committed_data.len())
+                                .ok_or(VarStoreError::StoreFull)?;
+                            if required > crate::state::MAX_VARIABLE_DATA_SIZE {
+                                offset += record_len;
+                                continue;
+                            }
+                            let mut combined = alloc::vec::Vec::new();
+                            combined
+                                .try_reserve(required)
+                                .map_err(|_| VarStoreError::StoreFull)?;
+                            combined.extend_from_slice(&existing.data[..existing.data_size]);
+                            combined.extend_from_slice(&committed_data);
+                            committed_data = combined;
+                        }
+                    }
+
+                    // Preserve the authentication envelope in flash. An empty
+                    // authenticated payload is a replay tombstone: the loader
+                    // records its timestamp but does not expose a variable.
+                    // For APPEND_WRITE, retain the newest envelope and replace
+                    // only its payload with the atomically concatenated value.
+                    let mut authenticated_record = alloc::vec::Vec::new();
+                    let persisted = if is_authenticated && is_append {
+                        let header = auth::EfiVariableAuthentication2::from_bytes(&record.data)
+                            .ok_or(VarStoreError::InvalidHeader)?;
+                        let header_size = header.total_size();
+                        let required = header_size
+                            .checked_add(committed_data.len())
+                            .ok_or(VarStoreError::DataTooLarge)?;
+                        authenticated_record
+                            .try_reserve(required)
+                            .map_err(|_| VarStoreError::StoreFull)?;
+                        authenticated_record.extend_from_slice(&record.data[..header_size]);
+                        authenticated_record.extend_from_slice(&committed_data);
+                        authenticated_record.as_slice()
+                    } else if is_authenticated {
+                        record.data.as_slice()
                     } else {
-                        super::persistence::write_variable_to_storage_internal(
-                            &guid,
-                            &record.name,
-                            record.attributes,
-                            &actual_data,
-                        )
+                        committed_data.as_slice()
                     };
+                    let write_result = super::persistence::write_variable_to_storage_internal(
+                        &guid,
+                        &record.name,
+                        stored_attributes,
+                        persisted,
+                    );
 
                     if let Err(e) = write_result {
                         log::warn!("Failed to apply deferred variable write: {:?}", e);
                     } else {
-                        // Also update in-memory (timestamp is handled by persist functions)
-                        super::persistence::update_variable_in_memory(
-                            &guid,
-                            &record.name,
-                            record.attributes,
-                            &actual_data,
-                        );
+                        if is_authenticated && committed_data.is_empty() {
+                            super::persistence::delete_variable_from_memory(&guid, &record.name);
+                        } else {
+                            super::persistence::update_variable_in_memory_with_timestamp(
+                                &guid,
+                                &record.name,
+                                stored_attributes,
+                                &committed_data,
+                                timestamp_to_use,
+                            );
+                        }
                         processed += 1;
                     }
                 }
@@ -594,6 +653,9 @@ fn queue_record_ref_with_flags(
     flags: u8,
 ) -> Result<(), VarStoreError> {
     let base = buffer_base();
+    if base.is_null() || buffer_size() < HEADER_SIZE {
+        return Err(VarStoreError::NotInitialized);
+    }
 
     let mut header = unsafe { core::ptr::read(base as *const DeferredHeader) };
     if !header.is_valid() {

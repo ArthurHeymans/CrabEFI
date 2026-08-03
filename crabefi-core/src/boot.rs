@@ -494,7 +494,7 @@ fn load_and_execute_bootloader(
     log::info!("Read {} bytes from {}", bytes_read, path);
 
     // Secure Boot verification (if enabled)
-    if efi::auth::is_secure_boot_enabled() {
+    if efi::auth::boot_secure_boot_status().secure_boot_enabled() {
         log::debug!("Secure Boot: Verifying image...");
         match efi::auth::verify_pe_image_secure_boot(&buffer[..bytes_read]) {
             Ok(true) => {

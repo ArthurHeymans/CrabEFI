@@ -206,7 +206,9 @@ pub fn measure_secure_boot_variables_all() {
     let secure_boot_name = [
         0x53, 0x65, 0x63, 0x75, 0x72, 0x65, 0x42, 0x6F, 0x6F, 0x74, 0x00,
     ];
-    let secure_boot = [u8::from(crate::efi::auth::is_secure_boot_enabled())];
+    let secure_boot = [u8::from(
+        crate::efi::auth::boot_secure_boot_status().secure_boot_enabled(),
+    )];
     measure_variable_all(
         7,
         EV_EFI_VARIABLE_DRIVER_CONFIG,

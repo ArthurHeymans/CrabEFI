@@ -93,8 +93,9 @@ pub fn show_secure_boot_menu() {
 
     loop {
         // Get current state
-        let setup_mode = auth::is_setup_mode();
-        let secure_boot_enabled = auth::is_secure_boot_enabled();
+        let secure_boot = auth::boot_secure_boot_status();
+        let setup_mode = secure_boot.setup_mode();
+        let secure_boot_enabled = secure_boot.secure_boot_enabled();
         let (pk_count, kek_count, db_count, dbx_count) = secure_boot::get_enrollment_summary();
 
         // Clear and draw
@@ -144,10 +145,10 @@ pub fn show_secure_boot_menu() {
                         match option {
                             MenuOption::ToggleSecureBoot => {
                                 if secure_boot_enabled {
-                                    auth::disable_secure_boot();
+                                    auth::boot_disable_secure_boot();
                                     status_message = Some(("Secure Boot disabled", true));
                                 } else {
-                                    auth::enable_secure_boot();
+                                    auth::boot_enable_secure_boot();
                                     status_message = Some(("Secure Boot enabled", true));
                                 }
                                 // Update status variables
@@ -283,7 +284,7 @@ fn enroll_default_keys() -> Result<(), &'static str> {
     enrollment::enroll_default_keys().map_err(|_| "Failed to enroll keys")?;
 
     // Enter user mode
-    auth::enter_user_mode();
+    auth::boot_enter_user_mode();
 
     // Persist to storage
     secure_boot::persist_key_databases().map_err(|_| "Failed to persist keys")?;

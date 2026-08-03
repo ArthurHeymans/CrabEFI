@@ -88,8 +88,9 @@ pub const MAX_NAME_LEN: usize = 64;
 /// including the PKCS#7 signature header, which can add 1-3 KB on top of the
 /// stripped payload.  `sbctl enroll-keys --microsoft` produces a db blob
 /// with three X.509 certificates plus a PKCS#7 auth header: observed at
-/// ~10.9 KB.  32 KB gives ample headroom for future key databases.
-pub const MAX_DATA_SIZE: usize = 32 * 1024;
+/// ~10.9 KB. The runtime API accepts an authentication envelope up to three
+/// times the 16 KiB payload limit, so the deferred format must match that bound.
+pub const MAX_DATA_SIZE: usize = 48 * 1024;
 
 /// Variable record header magic: 0xAA55
 const RECORD_MAGIC: u16 = 0xAA55;

@@ -7,6 +7,7 @@
 use crate::arch::x86_64::io;
 use crate::efi::auth;
 use crate::state::{self, MAX_VARIABLE_DATA_SIZE, MAX_VARIABLE_NAME_LEN, MAX_VARIABLES};
+use zerocopy::FromBytes;
 
 // ============================================================================
 // Runtime Serial Logging (post-SetVirtualAddressMap)
@@ -119,6 +120,14 @@ use core::ffi::c_void;
 use r_efi::efi::{
     self, CapsuleHeader, Guid, ResetType, Status, TableHeader, Time, TimeCapabilities,
 };
+
+fn runtime_auth_status(error: auth::AuthError) -> Status {
+    if error == auth::AuthError::BufferTooSmall {
+        Status::OUT_OF_RESOURCES
+    } else {
+        error.into()
+    }
+}
 
 /// Runtime Services signature "RUNTSERV"
 const EFI_RUNTIME_SERVICES_SIGNATURE: u64 = 0x56524553544E5552;
@@ -255,6 +264,37 @@ static mut VIRTUAL_MAP_ENTRY_COUNT: usize = 0;
 /// The actual write is a one-shot during SetVirtualAddressMap.
 static VIRTUAL_MODE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
+fn virtual_address_for_range(
+    virtual_map: *const u8,
+    descriptor_size: usize,
+    num_entries: usize,
+    start: u64,
+    end: u64,
+) -> Option<u64> {
+    if start >= end {
+        return None;
+    }
+    (0..num_entries).find_map(|index| {
+        // SAFETY: SVAM validated the complete descriptor array before calling
+        // this helper, and descriptor_size is at least the descriptor ABI size.
+        let descriptor = unsafe {
+            &*(virtual_map.add(index.checked_mul(descriptor_size)?) as *const efi::MemoryDescriptor)
+        };
+        if descriptor.attribute & EFI_MEMORY_RUNTIME == 0 {
+            return None;
+        }
+        let descriptor_end = descriptor
+            .number_of_pages
+            .checked_mul(EFI_PAGE_SIZE)?
+            .checked_add(descriptor.physical_start)?;
+        (start >= descriptor.physical_start && end <= descriptor_end).then(|| {
+            descriptor
+                .virtual_start
+                .wrapping_add(start - descriptor.physical_start)
+        })
+    })
+}
+
 extern "efiapi" fn set_virtual_address_map(
     memory_map_size: usize,
     descriptor_size: usize,
@@ -281,6 +321,9 @@ extern "efiapi" fn set_virtual_address_map(
         return Status::INVALID_PARAMETER;
     }
 
+    if memory_map_size == 0 || !memory_map_size.is_multiple_of(descriptor_size) {
+        return Status::INVALID_PARAMETER;
+    }
     let num_entries = memory_map_size / descriptor_size;
 
     // Sanity check: a realistic memory map has at most a few hundred entries.
@@ -297,41 +340,137 @@ extern "efiapi" fn set_virtual_address_map(
 
     log::info!("SetVirtualAddressMap: {} entries", num_entries);
 
-    // Validate the converted root before committing to virtual mode. If the
-    // caller omitted its EFI_MEMORY_RUNTIME descriptor, continuing would leave
-    // the physical pointer live after the OS removes the identity mapping.
+    // Validate every firmware-owned runtime range before the one-way commit.
+    // In particular, RuntimeState and the resettable allocation workspace are
+    // separate objects in `.runtime_state`; validating only the root would let
+    // the OS omit the arena and fault the next authenticated write.
+    let map = virtual_map as *const u8;
     let state_phys = crate::runtime_state::physical_address();
-    let state_size = core::mem::size_of::<crate::runtime_state::RuntimeState>() as u64;
-    let Some(state_end) = state_phys.checked_add(state_size) else {
-        log::error!("SetVirtualAddressMap: runtime state range overflows");
+    let Some(state_end) =
+        state_phys.checked_add(core::mem::size_of::<crate::runtime_state::RuntimeState>() as u64)
+    else {
         return Status::INVALID_PARAMETER;
     };
-    let mut relocated_state = None;
-    for i in 0..num_entries {
-        let desc = unsafe {
-            &*((virtual_map as *const u8).add(i * descriptor_size) as *const efi::MemoryDescriptor)
-        };
-        if (desc.attribute & EFI_MEMORY_RUNTIME) == 0 {
-            continue;
-        }
-        let phys_end = desc
-            .number_of_pages
-            .saturating_mul(EFI_PAGE_SIZE)
-            .saturating_add(desc.physical_start);
-        if state_phys >= desc.physical_start && state_end <= phys_end {
-            let offset = desc.virtual_start as i64 - desc.physical_start as i64;
-            relocated_state = Some((state_phys as i64 + offset) as u64);
-            break;
+    let Some(new_state) =
+        virtual_address_for_range(map, descriptor_size, num_entries, state_phys, state_end)
+    else {
+        return Status::INVALID_PARAMETER;
+    };
+
+    for (start, end) in crate::heap::runtime_workspace_ranges() {
+        if virtual_address_for_range(map, descriptor_size, num_entries, start, end).is_none() {
+            return Status::INVALID_PARAMETER;
         }
     }
-    let Some(new_state) = relocated_state else {
-        log::error!(
-            "SetVirtualAddressMap: runtime state {:#x}..{:#x} is absent from EFI_MEMORY_RUNTIME map",
-            state_phys,
-            state_end
-        );
-        return Status::INVALID_PARAMETER;
+    let new_deferred_buffer = match crate::efi::varstore::deferred::runtime_buffer_range() {
+        Some((start, end)) => {
+            let Some(address) =
+                virtual_address_for_range(map, descriptor_size, num_entries, start, end)
+            else {
+                return Status::INVALID_PARAMETER;
+            };
+            Some(address)
+        }
+        None => None,
     };
+
+    #[cfg(feature = "platform-entry")]
+    {
+        unsafe extern "C" {
+            static __runtime_code_start: u8;
+            static __runtime_code_end: u8;
+            static __runtime_data_start: u8;
+            static __runtime_data_end: u8;
+        }
+        let required = [
+            (
+                &raw const __runtime_code_start as u64,
+                &raw const __runtime_code_end as u64,
+            ),
+            (
+                (&raw const __runtime_data_start as u64 + EFI_PAGE_SIZE - 1) & !(EFI_PAGE_SIZE - 1),
+                &raw const __runtime_data_end as u64,
+            ),
+        ];
+        if required.into_iter().any(|(start, end)| {
+            virtual_address_for_range(map, descriptor_size, num_entries, start, end).is_none()
+        }) {
+            return Status::INVALID_PARAMETER;
+        }
+    }
+
+    let rt_start = get_runtime_services() as u64;
+    let st_start = super::system_table::get_system_table() as u64;
+    let required_tables = [
+        (
+            rt_start,
+            rt_start + core::mem::size_of::<efi::RuntimeServices>() as u64,
+        ),
+        (
+            st_start,
+            st_start + core::mem::size_of::<efi::SystemTable>() as u64,
+        ),
+    ];
+    if required_tables.into_iter().any(|(start, end)| {
+        virtual_address_for_range(map, descriptor_size, num_entries, start, end).is_none()
+    }) {
+        return Status::INVALID_PARAMETER;
+    }
+
+    // The System Table's own runtime pointers are mandatory. VendorTable
+    // values may intentionally identify ACPI/SMBIOS physical memory and remain
+    // optional, but the configuration entry array itself must stay mapped.
+    let st = super::system_table::get_system_table();
+    let table_pointers_valid = unsafe {
+        let configuration_valid = if (*st).configuration_table.is_null() {
+            (*st).number_of_table_entries == 0
+        } else {
+            (*st)
+                .number_of_table_entries
+                .checked_mul(core::mem::size_of::<state::ConfigurationTable>())
+                .and_then(|size| {
+                    let start = (*st).configuration_table as u64;
+                    start.checked_add(size as u64).map(|end| (start, end))
+                })
+                .is_some_and(|(start, end)| {
+                    virtual_address_for_range(map, descriptor_size, num_entries, start, end)
+                        .is_some()
+                })
+        };
+        let vendor_valid = (*st).firmware_vendor.is_null()
+            || virtual_address_for_range(
+                map,
+                descriptor_size,
+                num_entries,
+                (*st).firmware_vendor as u64,
+                (*st).firmware_vendor as u64 + 2,
+            )
+            .is_some();
+        configuration_valid && vendor_valid
+    };
+    if !table_pointers_valid {
+        return Status::INVALID_PARAMETER;
+    }
+
+    let runtime_functions = [
+        get_time as *const () as u64,
+        set_time as *const () as u64,
+        get_wakeup_time as *const () as u64,
+        set_wakeup_time as *const () as u64,
+        get_variable as *const () as u64,
+        get_next_variable_name as *const () as u64,
+        set_variable as *const () as u64,
+        get_next_high_mono_count as *const () as u64,
+        reset_system as *const () as u64,
+        update_capsule as *const () as u64,
+        query_capsule_capabilities as *const () as u64,
+        query_variable_info as *const () as u64,
+    ];
+    if runtime_functions.into_iter().any(|address| {
+        virtual_address_for_range(map, descriptor_size, num_entries, address, address + 1).is_none()
+    }) {
+        return Status::INVALID_PARAMETER;
+    }
 
     // Step 0: Let platform glue disable physical-only resources before the OS
     // switches EFI runtime services to virtual addressing.
@@ -343,7 +482,6 @@ extern "efiapi" fn set_virtual_address_map(
     // free-list pointers and cannot cross this transition, so freeze it before
     // any descriptor is converted.
     crate::heap::freeze_for_virtual_address_map();
-    VIRTUAL_MODE.store(true, core::sync::atomic::Ordering::Release);
 
     // Step 2: Set up globals so ConvertPointer can access the virtual map
     unsafe {
@@ -368,17 +506,28 @@ extern "efiapi" fn set_virtual_address_map(
         );
         signal_event_group_for_runtime(&EFI_EVENT_GROUP_VIRTUAL_ADDRESS_CHANGE);
 
-        // Signal legacy EVT_SIGNAL_VIRTUAL_ADDRESS_CHANGE events
+        // Signal legacy events without invoking foreign callbacks while an
+        // exclusive FirmwareState borrow is live. A callback may re-enter EFI.
+        let mut legacy_events: heapless::Vec<usize, { state::MAX_EVENTS }> = heapless::Vec::new();
         state::with_efi_mut(|efi_state| {
-            for entry in efi_state.events.iter_mut() {
+            for (index, entry) in efi_state.events.iter_mut().enumerate() {
                 if entry.event_type == EVT_SIGNAL_VIRTUAL_ADDRESS_CHANGE {
                     entry.signaled = true;
-                    if let Some(func) = entry.notify_function {
-                        func(core::ptr::null_mut(), entry.notify_context);
-                    }
+                    let _ = legacy_events.push(index);
                 }
             }
         });
+        for event_id in legacy_events {
+            let notify = {
+                let entry = &state::efi().events[event_id];
+                entry
+                    .notify_function
+                    .map(|function| (function, entry.notify_context))
+            };
+            if let Some((function, context)) = notify {
+                function(event_id as efi::Event, context);
+            }
+        }
     }
 
     // Step 4a: Relocate the single pointer-free runtime root.
@@ -387,6 +536,9 @@ extern "efiapi" fn set_virtual_address_map(
     // supplies its live virtual alias.
     unsafe {
         crate::runtime_state::relocate(new_state as *mut crate::runtime_state::RuntimeState);
+    }
+    if let Some(address) = new_deferred_buffer {
+        crate::efi::varstore::deferred::relocate_buffer(address);
     }
     log::debug!(
         "SetVirtualAddressMap: relocated runtime state ptr {:#x} -> {:#x}",
@@ -563,34 +715,23 @@ extern "efiapi" fn set_virtual_address_map(
     // pointer dereference.
     log::set_max_level(log::LevelFilter::Off);
 
+    // No physical FirmwareState access is legal after this point. Commit the
+    // relocated runtime-root flag before returning to the OS, then retain the
+    // local flag for existing runtime-service diagnostics.
+    crate::runtime_state::commit_virtual_mode();
+    VIRTUAL_MODE.store(true, core::sync::atomic::Ordering::Release);
+
     #[cfg(feature = "rt-debug")]
     rt_serial::str("[RT] SetVirtualAddressMap returning SUCCESS\n");
 
     Status::SUCCESS
 }
 
-/// Relocate a function pointer by a signed offset.
-///
-/// # Safety
-///
-/// The offset must produce a valid function address within the relocated region.
-#[allow(dead_code)]
-unsafe fn relocate_fn_ptr<T>(ptr: &mut T, offset: i64) {
-    // SAFETY: The offset must produce a valid function address within the relocated region.
-    // Caller guarantees the pointer refers to a function pointer field in RuntimeServices.
-    unsafe {
-        let old = core::ptr::read(ptr as *const T as *const u64);
-        let new = (old as i64 + offset) as u64;
-        core::ptr::write(ptr as *mut T as *mut u64, new);
-    }
-}
-
 /// Convert a RuntimeServices function pointer using the virtual memory map.
 ///
 /// Reads the physical address stored in `ptr`, searches the virtual map for
 /// the runtime region containing that address, and writes back the virtual
-/// address. Unlike [`relocate_fn_ptr`] which applies a fixed offset, this
-/// handles the case where the function pointer target (code) is in a different
+/// address. This handles the case where the function pointer target (code) is in a different
 /// runtime region than the RuntimeServices table (data) — e.g. when CrabEFI
 /// is linked as a library with code in ROM and data in RAM.
 ///
@@ -670,6 +811,26 @@ extern "efiapi" fn get_variable(
     data_size: *mut usize,
     data: *mut c_void,
 ) -> Status {
+    crate::phase::dispatch(|phase| {
+        get_variable_for_phase(
+            phase,
+            variable_name,
+            vendor_guid,
+            attributes,
+            data_size,
+            data,
+        )
+    })
+}
+
+fn get_variable_for_phase(
+    phase: crate::phase::Phase<'_>,
+    variable_name: *mut u16,
+    vendor_guid: *mut Guid,
+    attributes: *mut u32,
+    data_size: *mut usize,
+    data: *mut c_void,
+) -> Status {
     #[cfg(feature = "rt-debug")]
     if VIRTUAL_MODE.load(core::sync::atomic::Ordering::Acquire) {
         rt_serial::str("[RT] GetVariable name=");
@@ -690,17 +851,14 @@ extern "efiapi" fn get_variable(
 
     let name = variable_name;
     let guid = unsafe { *vendor_guid };
+    let secure_boot = auth::secure_boot_status_for_phase(&phase);
 
     // Check for synthesized Secure Boot status variables
     if guid == auth::EFI_GLOBAL_VARIABLE_GUID {
         // Check for SetupMode variable
         if name_eq_const(name, auth::SETUP_MODE_NAME) {
             return get_secure_boot_status_variable(
-                if state::is_exit_boot_services_called() {
-                    crate::runtime_state::with(|runtime| runtime.setup_mode as u8)
-                } else {
-                    auth::is_setup_mode() as u8
-                },
+                secure_boot.setup_mode() as u8,
                 attributes,
                 data_size,
                 data,
@@ -710,11 +868,7 @@ extern "efiapi" fn get_variable(
         // Check for SecureBoot variable
         if name_eq_const(name, auth::SECURE_BOOT_NAME) {
             return get_secure_boot_status_variable(
-                if state::is_exit_boot_services_called() {
-                    crate::runtime_state::with(|runtime| runtime.secure_boot_enabled as u8)
-                } else {
-                    auth::is_secure_boot_enabled() as u8
-                },
+                secure_boot.secure_boot_enabled() as u8,
                 attributes,
                 data_size,
                 data,
@@ -722,7 +876,7 @@ extern "efiapi" fn get_variable(
         }
     }
 
-    if state::is_exit_boot_services_called() {
+    if let crate::phase::Phase::Runtime(_) = phase {
         return crate::runtime_state::with(|runtime| {
             let found = runtime
                 .iter()
@@ -1081,6 +1235,15 @@ enum PersistData {
 }
 
 impl PersistData {
+    fn try_alloc(data: &[u8]) -> Result<Self, Status> {
+        let mut copied = AllocVec::new();
+        copied
+            .try_reserve(data.len())
+            .map_err(|_| Status::OUT_OF_RESOURCES)?;
+        copied.extend_from_slice(data);
+        Ok(Self::Alloc(copied))
+    }
+
     fn as_slice(&self) -> &[u8] {
         match self {
             Self::Fixed(data) => data.as_slice(),
@@ -1109,7 +1272,7 @@ enum VariablePersistAction {
 enum SecureBootDbAction {
     None,
     Update(auth::SecureBootVariable, VariableDataBuf),
-    Delete(auth::SecureBootVariable),
+    Delete(auth::SecureBootVariable, Option<auth::EfiTime>),
 }
 
 extern "efiapi" fn set_variable(
@@ -1123,35 +1286,43 @@ extern "efiapi" fn set_variable(
         return Status::INVALID_PARAMETER;
     }
 
-    // set_variable_full() reserves a ~113 KiB frame for its 16 KiB variable
-    // buffers. That is fine on the firmware stack, but an OS gives runtime
-    // services only a few KiB -- Linux runs them on a 16 KiB kernel stack -- so
-    // the frame's own stack probe walks off the end and panics the kernel.
-    // After ExitBootServices every write must therefore take a lean path.
-    if state::is_exit_boot_services_called() {
-        return if data_size == 0 {
-            set_variable_runtime_delete(variable_name, vendor_guid, attributes)
-        } else {
-            set_variable_runtime_write(variable_name, vendor_guid, attributes, data_size, data)
-        };
-    }
-
-    set_variable_full(variable_name, vendor_guid, attributes, data_size, data)
+    // The phase-blind ABI is classified exactly once. Keeping the arms as
+    // calls to separate inline-never helpers prevents the large boot frame from
+    // being merged into an OS runtime stack frame.
+    crate::phase::dispatch(|phase| match phase {
+        crate::phase::Phase::Runtime(runtime) => {
+            if data_size == 0 {
+                set_variable_runtime_delete(&runtime, variable_name, vendor_guid, attributes)
+            } else {
+                set_variable_runtime_write(
+                    &runtime,
+                    variable_name,
+                    vendor_guid,
+                    attributes,
+                    data_size,
+                    data,
+                )
+            }
+        }
+        crate::phase::Phase::Boot(boot) => set_variable_full(
+            &boot,
+            variable_name,
+            vendor_guid,
+            attributes,
+            data_size,
+            data,
+        ),
+    })
 }
 
-/// Write a variable after ExitBootServices, without a large stack frame.
+/// Write a variable after ExitBootServices without a large OS-stack frame.
 ///
-/// The OS-provided runtime stack is far smaller than the firmware's, so this
-/// path keeps its locals to a variable name buffer and copies the payload
-/// straight into the inline cache. It must also stay allocation-free: the heap
-/// is `RuntimeServicesData`, but `SetVirtualAddressMap` does not relocate the
-/// allocator's base pointer, so any allocation here would touch an unmapped
-/// physical address.
-///
-/// Cases needing verification or a read-modify-write are refused rather than
-/// half-performed; they remain fully supported before ExitBootServices.
+/// Authentication and Secure Boot database parsing use the bounded runtime
+/// workspace in [`crate::heap`]. The workspace is reset for each serialized
+/// operation, so no post-SVAM allocation can follow a physical boot-heap link.
 #[inline(never)]
 fn set_variable_runtime_write(
+    runtime: &crate::phase::RuntimeCtx<'_>,
     variable_name: *mut u16,
     vendor_guid: *mut Guid,
     attributes: u32,
@@ -1159,34 +1330,35 @@ fn set_variable_runtime_write(
     data: *mut c_void,
 ) -> Status {
     let name_len = ucs2_strlen_ptr(variable_name);
-    if name_len == 0 || name_len >= MAX_VARIABLE_NAME_LEN || data.is_null() {
+    if name_len == 0 || name_len >= MAX_VARIABLE_NAME_LEN {
         return Status::INVALID_PARAMETER;
     }
-    if data_size > MAX_VARIABLE_DATA_SIZE {
-        return Status::OUT_OF_RESOURCES;
+
+    let is_authenticated =
+        (attributes & auth::attributes::TIME_BASED_AUTHENTICATED_WRITE_ACCESS) != 0;
+    let is_append = (attributes & auth::attributes::APPEND_WRITE) != 0;
+    let raw_limit = if is_authenticated {
+        MAX_VARIABLE_DATA_SIZE * 3
+    } else {
+        MAX_VARIABLE_DATA_SIZE
+    };
+    if data_size > raw_limit || (data_size != 0 && data.is_null()) {
+        return if data_size > raw_limit {
+            Status::OUT_OF_RESOURCES
+        } else {
+            Status::INVALID_PARAMETER
+        };
     }
 
     // A runtime-visible variable must also be boot-services-visible (UEFI 8.2).
-    let has_runtime_access = (attributes & auth::attributes::RUNTIME_ACCESS) != 0;
-    let has_bootservice_access = (attributes & auth::attributes::BOOTSERVICE_ACCESS) != 0;
-    if !has_runtime_access || !has_bootservice_access {
-        return Status::INVALID_PARAMETER;
-    }
-
-    // Authenticated writes need signature verification, and that crypto
-    // allocates. Appends need the existing payload merged into a second 16 KiB
-    // buffer. Neither fits this path's stack or allocation budget.
-    if (attributes & auth::attributes::TIME_BASED_AUTHENTICATED_WRITE_ACCESS) != 0
-        || (attributes & auth::attributes::APPEND_WRITE) != 0
+    if attributes & auth::attributes::RUNTIME_ACCESS == 0
+        || attributes & auth::attributes::BOOTSERVICE_ACCESS == 0
     {
-        log::debug!("RT.SetVariable: authenticated/append write refused at runtime");
-        return Status::UNSUPPORTED;
+        return Status::INVALID_PARAMETER;
     }
 
     let guid = unsafe { *vendor_guid };
     let name_slice = unsafe { core::slice::from_raw_parts(variable_name, name_len + 1) };
-
-    // SecureBoot and SetupMode are synthesized from firmware state.
     if guid == auth::EFI_GLOBAL_VARIABLE_GUID
         && (name_slice == auth::SECURE_BOOT_NAME || name_slice == auth::SETUP_MODE_NAME)
     {
@@ -1197,42 +1369,230 @@ fn set_variable_runtime_write(
     if name_vec.extend_from_slice(name_slice).is_err() {
         return Status::OUT_OF_RESOURCES;
     }
-
-    // PK/KEK/db/dbx are authenticated by definition; refuse instead of
-    // accepting an unverified update into a Secure Boot key database.
-    if auth::identify_key_database(name_vec.as_slice(), &guid).is_some() {
-        log::debug!("RT.SetVariable: key database update refused at runtime");
+    let key_database = auth::identify_key_database(name_vec.as_slice(), &guid);
+    if key_database.is_some() && !is_authenticated {
         return Status::WRITE_PROTECTED;
     }
 
-    // Borrowed, not copied -- the payload is written straight into the cache.
-    let payload = unsafe { core::slice::from_raw_parts(data as *const u8, data_size) };
-
-    let (status, dropped) = crate::runtime_state::with_mut(|runtime| {
-        match runtime.set_variable(guid, name_vec.as_slice(), attributes, payload) {
-            Ok(dropped) => (Status::SUCCESS, dropped),
-            Err(_) => (Status::OUT_OF_RESOURCES, 0),
+    let Some(_runtime_operation) = crate::heap::begin_runtime_operation() else {
+        return Status::NOT_READY;
+    };
+    let raw_data = unsafe { core::slice::from_raw_parts(data as *const u8, data_size) };
+    let authenticated_timestamp = is_authenticated
+        .then(|| auth::EfiVariableAuthentication2::from_bytes(raw_data))
+        .flatten()
+        .map(|header| header.time_stamp);
+    let databases = if is_authenticated {
+        match auth::prepare_runtime_databases() {
+            Ok(databases) => Some(databases),
+            Err(error) => return runtime_auth_status(error),
         }
-    });
+    } else {
+        None
+    };
+    let mut final_data = if let Some(databases) = databases.as_ref() {
+        let auth_target = key_database.unwrap_or(auth::SecureBootVariable::Db);
+        let Some(bound) = databases.runtime_preflight_size(auth_target, data_size, data_size)
+        else {
+            return Status::OUT_OF_RESOURCES;
+        };
+        if bound > crate::heap::runtime_bytes_remaining() {
+            return Status::OUT_OF_RESOURCES;
+        }
+        match auth::verify_authenticated_variable_with_databases(
+            crate::runtime_state::with(|state| state.secure_boot_status()),
+            name_vec.as_slice(),
+            &guid,
+            attributes,
+            raw_data,
+            databases,
+        ) {
+            Ok(data) => data,
+            Err(error) => return runtime_auth_status(error),
+        }
+    } else {
+        let mut copied = AllocVec::new();
+        if copied.try_reserve(raw_data.len()).is_err() {
+            return Status::OUT_OF_RESOURCES;
+        }
+        copied.extend_from_slice(raw_data);
+        copied
+    };
 
-    if dropped != 0 {
-        log::error!(
-            "RT.SetVariable: compaction dropped {} corrupt runtime variable entries",
-            dropped
-        );
-        #[cfg(feature = "rt-debug")]
-        rt_serial::str("[RT] SetVariable dropped corrupt cache entries\n");
-    }
-    if status != Status::SUCCESS {
-        return status;
+    let stored_attributes = attributes & !auth::attributes::APPEND_WRITE;
+    let mut existing_data = AllocVec::new();
+    let existing_attributes = match crate::runtime_state::with(|runtime| {
+        runtime
+            .get(&guid, name_vec.as_slice())
+            .map(|(variable, payload)| {
+                if existing_data.try_reserve(payload.len()).is_err() {
+                    return Err(Status::OUT_OF_RESOURCES);
+                }
+                existing_data.extend_from_slice(payload);
+                Ok(variable.attributes())
+            })
+    }) {
+        Some(Ok(attributes)) => Some(attributes),
+        Some(Err(status)) => return status,
+        None => None,
+    };
+    if existing_attributes.is_some_and(|value| value != stored_attributes) {
+        return Status::INVALID_PARAMETER;
     }
 
-    // Queued into the warm-reboot-persistent buffer; applied on the next boot.
-    if (attributes & auth::attributes::NON_VOLATILE) != 0
-        && let Err(e) =
-            crate::efi::varstore::persist_variable(&guid, name_vec.as_slice(), attributes, payload)
+    if is_append && existing_attributes.is_some() {
+        let combined_len = match existing_data.len().checked_add(final_data.len()) {
+            Some(length) if length <= MAX_VARIABLE_DATA_SIZE => length,
+            _ => return Status::OUT_OF_RESOURCES,
+        };
+        let mut combined = AllocVec::new();
+        if combined.try_reserve(combined_len).is_err() {
+            return Status::OUT_OF_RESOURCES;
+        }
+        combined.extend_from_slice(existing_data.as_slice());
+        combined.extend_from_slice(final_data.as_slice());
+        final_data = combined;
+    }
+
+    if final_data.len() > MAX_VARIABLE_DATA_SIZE {
+        return Status::OUT_OF_RESOURCES;
+    }
+    if key_database.is_some()
+        && !final_data.is_empty()
+        && let Err(error) = auth::validate_signature_database(final_data.as_slice())
     {
-        log::debug!("Variable write not persisted: {:?}", e);
+        return runtime_auth_status(error);
+    }
+
+    if final_data.is_empty() {
+        if is_append {
+            return Status::SUCCESS;
+        }
+        let exists =
+            crate::runtime_state::with(|runtime| runtime.get(&guid, name_vec.as_slice()).is_some());
+        if !exists {
+            return Status::NOT_FOUND;
+        }
+        if is_authenticated
+            && crate::runtime_state::with(|runtime| {
+                runtime.can_set_variable(&guid, name_vec.as_slice(), 0, true)
+            })
+            .is_err()
+        {
+            return Status::OUT_OF_RESOURCES;
+        }
+        let persist_result = if is_authenticated {
+            crate::efi::varstore::persist_variable(&guid, name_vec.as_slice(), attributes, raw_data)
+        } else {
+            crate::efi::varstore::delete_variable(&guid, name_vec.as_slice())
+        };
+        if let Err(error) = persist_result {
+            log::debug!("Variable deletion not persisted: {:?}", error);
+            return Status::DEVICE_ERROR;
+        }
+
+        let deleted = if let Some(timestamp) = authenticated_timestamp {
+            let mut bytes = [0; 16];
+            bytes.copy_from_slice(zerocopy::IntoBytes::as_bytes(&timestamp));
+            match crate::runtime_state::with_mut(|runtime| {
+                runtime.delete_authenticated_variable(&guid, name_vec.as_slice(), bytes)
+            }) {
+                Ok(deleted) => deleted,
+                Err(_) => return Status::OUT_OF_RESOURCES,
+            }
+        } else {
+            crate::runtime_state::with_mut(|runtime| {
+                runtime.delete_variable(&guid, name_vec.as_slice())
+            })
+        };
+        if !deleted {
+            return Status::NOT_FOUND;
+        }
+        if let Some(var_type) = key_database {
+            handle_secure_boot_variable_delete_runtime(runtime, var_type);
+        }
+        return Status::SUCCESS;
+    }
+
+    set_runtime_variable_value(
+        runtime,
+        &guid,
+        name_vec.as_slice(),
+        stored_attributes,
+        final_data.as_slice(),
+        if is_authenticated {
+            attributes
+        } else {
+            stored_attributes
+        },
+        authenticated_timestamp,
+        key_database,
+        raw_data,
+        is_authenticated,
+    )
+}
+
+fn set_runtime_variable_value(
+    runtime: &crate::phase::RuntimeCtx<'_>,
+    guid: &Guid,
+    name: &[u16],
+    attributes: u32,
+    data: &[u8],
+    persist_attributes: u32,
+    timestamp: Option<auth::EfiTime>,
+    key_database: Option<auth::SecureBootVariable>,
+    raw_data: &[u8],
+    is_authenticated: bool,
+) -> Status {
+    let mut timestamp = timestamp.map(|timestamp| {
+        let mut bytes = [0; 16];
+        bytes.copy_from_slice(zerocopy::IntoBytes::as_bytes(&timestamp));
+        bytes
+    });
+    if persist_attributes & auth::attributes::APPEND_WRITE != 0
+        && let (Some(candidate), Some(previous)) = (
+            timestamp,
+            crate::runtime_state::with(|runtime| runtime.auth_timestamp(guid, name)),
+        )
+        && let (Ok(candidate_time), Ok(previous_time)) = (
+            auth::EfiTime::read_from_bytes(&candidate),
+            auth::EfiTime::read_from_bytes(&previous),
+        )
+        && !candidate_time.is_after(&previous_time)
+    {
+        timestamp = Some(previous);
+    }
+
+    if crate::runtime_state::with(|runtime| {
+        runtime.can_set_variable(guid, name, data.len(), is_authenticated)
+    })
+    .is_err()
+    {
+        return Status::OUT_OF_RESOURCES;
+    }
+
+    if attributes & auth::attributes::NON_VOLATILE != 0 {
+        let persist_data = if is_authenticated { raw_data } else { data };
+        if let Err(error) =
+            crate::efi::varstore::persist_variable(guid, name, persist_attributes, persist_data)
+        {
+            log::debug!("Variable write not persisted: {:?}", error);
+            return Status::DEVICE_ERROR;
+        }
+    }
+
+    let dropped = match crate::runtime_state::with_mut(|runtime| {
+        runtime.set_variable(*guid, name, attributes, data, timestamp)
+    }) {
+        Ok(dropped) => dropped,
+        Err(_) => return Status::OUT_OF_RESOURCES,
+    };
+    if dropped != 0 {
+        return Status::DEVICE_ERROR;
+    }
+
+    if let Some(var_type) = key_database {
+        handle_secure_boot_variable_update_runtime(runtime, var_type);
     }
 
     Status::SUCCESS
@@ -1240,6 +1600,7 @@ fn set_variable_runtime_write(
 
 #[inline(never)]
 fn set_variable_runtime_delete(
+    _runtime: &crate::phase::RuntimeCtx<'_>,
     variable_name: *mut u16,
     vendor_guid: *mut Guid,
     attributes: u32,
@@ -1249,11 +1610,6 @@ fn set_variable_runtime_delete(
         return Status::INVALID_PARAMETER;
     }
 
-    let has_runtime_access = (attributes & auth::attributes::RUNTIME_ACCESS) != 0;
-    if !has_runtime_access {
-        return Status::INVALID_PARAMETER;
-    }
-
     let guid = unsafe { *vendor_guid };
     let name_slice = unsafe { core::slice::from_raw_parts(variable_name, name_len + 1) };
 
@@ -1272,71 +1628,55 @@ fn set_variable_runtime_delete(
         return Status::WRITE_PROTECTED;
     }
 
-    let deleted = crate::runtime_state::with_mut(|runtime| {
-        runtime.delete_variable(&guid, name_vec.as_slice())
-    });
-    if !deleted {
+    let Some(existing_attributes) = crate::runtime_state::with(|runtime| {
+        runtime
+            .get(&guid, name_vec.as_slice())
+            .map(|(variable, _)| variable.attributes())
+    }) else {
         return Status::NOT_FOUND;
+    };
+    if existing_attributes & auth::attributes::RUNTIME_ACCESS == 0
+        || existing_attributes & auth::attributes::TIME_BASED_AUTHENTICATED_WRITE_ACCESS != 0
+    {
+        return Status::WRITE_PROTECTED;
+    }
+    if attributes != 0 && attributes != existing_attributes {
+        return Status::INVALID_PARAMETER;
     }
 
-    if let Err(e) = crate::efi::varstore::delete_variable(&guid, name_vec.as_slice()) {
-        log::debug!("Variable deletion not persisted: {:?}", e);
+    let Some(_runtime_operation) = crate::heap::begin_runtime_operation() else {
+        return Status::NOT_READY;
+    };
+    if existing_attributes & auth::attributes::NON_VOLATILE != 0
+        && let Err(error) = crate::efi::varstore::delete_variable(&guid, name_vec.as_slice())
+    {
+        log::debug!("Variable deletion not persisted: {:?}", error);
+        return Status::DEVICE_ERROR;
     }
 
-    Status::SUCCESS
+    if crate::runtime_state::with_mut(|runtime| runtime.delete_variable(&guid, name_vec.as_slice()))
+    {
+        Status::SUCCESS
+    } else {
+        Status::NOT_FOUND
+    }
 }
 
 #[inline(never)]
 fn set_variable_full(
+    boot: &crate::phase::BootCtx<'_>,
     variable_name: *mut u16,
     vendor_guid: *mut Guid,
     attributes: u32,
     data_size: usize,
     data: *mut c_void,
 ) -> Status {
-    #[cfg(feature = "rt-debug")]
-    if VIRTUAL_MODE.load(core::sync::atomic::Ordering::Acquire) {
-        rt_serial::str("[RT] SetVariable name=");
-        if !variable_name.is_null() {
-            for i in 0..32 {
-                let c = unsafe { *variable_name.add(i) };
-                if c == 0 {
-                    break;
-                }
-                rt_serial::byte(c as u8);
-            }
-        }
-        rt_serial::str(" attr=");
-        rt_serial::hex(attributes as u64);
-        rt_serial::str(" size=");
-        rt_serial::hex(data_size as u64);
-        rt_serial::str("\n");
-    }
     if variable_name.is_null() || vendor_guid.is_null() {
         return Status::INVALID_PARAMETER;
     }
 
     let name = variable_name;
     let guid = unsafe { *vendor_guid };
-
-    // ── Runtime log: record every SetVariable call after ExitBootServices ──
-    #[cfg(feature = "rt-log")]
-    if state::is_exit_boot_services_called() {
-        use crate::efi::rtlog;
-        rtlog::append("SetVariable name=");
-        for i in 0..64usize {
-            let c = unsafe { *variable_name.add(i) };
-            if c == 0 {
-                break;
-            }
-            rtlog::append(core::str::from_utf8(&[(c & 0x7f) as u8]).unwrap_or("?"));
-        }
-        rtlog::append(" attr=");
-        rtlog::append_hex(attributes as u64);
-        rtlog::append(" size=");
-        rtlog::append_u64(data_size as u64);
-        rtlog::appendln("");
-    }
 
     // Check name length
     let name_len = ucs2_strlen_ptr(name);
@@ -1364,17 +1704,6 @@ fn set_variable_full(
         return Status::INVALID_PARAMETER;
     }
 
-    // Check if we're at runtime and trying to modify a boot-services-only variable.
-    if state::is_exit_boot_services_called() {
-        let has_runtime_access = (attributes & auth::attributes::RUNTIME_ACCESS) != 0;
-        if !has_runtime_access {
-            log::debug!(
-                "Rejecting SetVariable at runtime: variable lacks RUNTIME_ACCESS attribute"
-            );
-            return Status::INVALID_PARAMETER;
-        }
-    }
-
     // SecureBoot and SetupMode are computed status variables, not writable.
     if guid == auth::EFI_GLOBAL_VARIABLE_GUID
         && (name_slice == auth::SECURE_BOOT_NAME || name_slice == auth::SETUP_MODE_NAME)
@@ -1393,11 +1722,18 @@ fn set_variable_full(
     let is_authenticated =
         (attributes & auth::attributes::TIME_BASED_AUTHENTICATED_WRITE_ACCESS) != 0;
     let is_append = (attributes & auth::attributes::APPEND_WRITE) != 0;
+    let mut authenticated_timestamp = if is_authenticated && data_size > 0 {
+        let raw_data = unsafe { core::slice::from_raw_parts(data as *const u8, data_size) };
+        auth::EfiVariableAuthentication2::from_bytes(raw_data).map(|header| header.time_stamp)
+    } else {
+        None
+    };
 
     let mut final_data_vec = VariableDataBuf::new();
     if is_authenticated && data_size > 0 {
         let raw_data = unsafe { core::slice::from_raw_parts(data as *const u8, data_size) };
         let verified_data: AllocVec<u8> = match auth::verify_authenticated_variable(
+            crate::state::boot_secure_boot_status(boot),
             name_vec.as_slice(),
             &guid,
             attributes,
@@ -1406,12 +1742,6 @@ fn set_variable_full(
             Ok(verified_data) => verified_data,
             Err(e) => {
                 log::warn!("Authenticated variable verification failed: {:?}", e);
-                #[cfg(feature = "rt-log")]
-                if state::is_exit_boot_services_called() {
-                    use crate::efi::rtlog;
-                    rtlog::append("  -> auth verify FAILED: ");
-                    rtlog::append_fmtln(format_args!("{:?}", e));
-                }
                 return e.into();
             }
         };
@@ -1438,9 +1768,66 @@ fn set_variable_full(
     }
 
     let secure_boot_var = auth::identify_key_database(name_vec.as_slice(), &guid);
+    if secure_boot_var.is_some() && !is_authenticated {
+        return Status::WRITE_PROTECTED;
+    }
+    let stored_attributes = attributes & !auth::attributes::APPEND_WRITE;
+    if is_append
+        && let Some(candidate) = authenticated_timestamp
+        && let Some(previous_bytes) = state::efi()
+            .variables
+            .iter()
+            .find(|variable| {
+                variable.in_use
+                    && variable.vendor_guid == guid
+                    && crate::efi::utils::ucs2_eq(&variable.name, name_vec.as_slice())
+            })
+            .map(|variable| variable.auth_timestamp)
+        && let Ok(previous) = auth::EfiTime::read_from_bytes(&previous_bytes)
+        && !candidate.is_after(&previous)
+    {
+        authenticated_timestamp = Some(previous);
+    }
+    if secure_boot_var.is_some()
+        && !final_data_vec.is_empty()
+        && let Err(error) = auth::validate_signature_database(final_data_vec.as_slice())
+    {
+        return error.into();
+    }
+
+    // APPEND_WRITE is a general variable operation. Secure Boot databases use
+    // the same concatenation semantics, while their specialized branch below
+    // also rebuilds the authentication database.
+    if is_append
+        && secure_boot_var.is_none()
+        && let Some(existing) = state::efi().variables.iter().find(|variable| {
+            variable.in_use
+                && variable.vendor_guid == guid
+                && crate::efi::utils::ucs2_eq(&variable.name, name_vec.as_slice())
+        })
+    {
+        if existing.attributes != stored_attributes {
+            return Status::INVALID_PARAMETER;
+        }
+        let mut combined = VariableDataBuf::new();
+        if combined
+            .extend_from_slice(&existing.data[..existing.data_size])
+            .is_err()
+            || combined
+                .extend_from_slice(final_data_vec.as_slice())
+                .is_err()
+        {
+            return Status::OUT_OF_RESOURCES;
+        }
+        final_data_vec = combined;
+    }
+
+    if is_append && final_data_size == 0 {
+        return Status::SUCCESS;
+    }
 
     let (status, persist_action, secure_boot_action) = state::with_efi_mut(|efi| {
-        let variables = &mut efi.variables;
+        let (variables, replay_entries) = (&mut efi.variables, &mut efi.auth_replay);
 
         let existing_idx = variables.iter().position(|var| {
             var.in_use
@@ -1448,13 +1835,72 @@ fn set_variable_full(
                 && crate::efi::utils::ucs2_eq(&var.name, name_vec.as_slice())
         });
         let free_idx = variables.iter().position(|var| !var.in_use);
+        let replay_idx = if is_authenticated {
+            replay_entries
+                .iter()
+                .position(|entry| {
+                    entry.in_use
+                        && entry.vendor_guid == guid
+                        && crate::efi::utils::ucs2_eq(&entry.name, name_vec.as_slice())
+                })
+                .or_else(|| replay_entries.iter().position(|entry| !entry.in_use))
+        } else {
+            None
+        };
+        if is_authenticated && replay_idx.is_none() {
+            return (
+                Status::OUT_OF_RESOURCES,
+                VariablePersistAction::None,
+                SecureBootDbAction::None,
+            );
+        }
+        let timestamp_bytes = authenticated_timestamp.map(|timestamp| {
+            let mut bytes = [0; 16];
+            bytes.copy_from_slice(zerocopy::IntoBytes::as_bytes(&timestamp));
+            bytes
+        });
+        let mut record_replay = |timestamp: [u8; 16]| {
+            if let Some(index) = replay_idx {
+                let replay = &mut replay_entries[index];
+                replay.name.fill(0);
+                replay.name[..name_vec.len()].copy_from_slice(name_vec.as_slice());
+                replay.vendor_guid = guid;
+                replay.timestamp = timestamp;
+                replay.in_use = true;
+            }
+        };
+
+        if data_size != 0
+            && let Some(idx) = existing_idx
+            && variables[idx].attributes != stored_attributes
+        {
+            return (
+                Status::INVALID_PARAMETER,
+                VariablePersistAction::None,
+                SecureBootDbAction::None,
+            );
+        }
 
         // Delete variable if data_size is 0 (for authenticated vars, this means empty after header).
         if final_data_size == 0 {
             if let Some(idx) = existing_idx {
+                if variables[idx].attributes
+                    & auth::attributes::TIME_BASED_AUTHENTICATED_WRITE_ACCESS
+                    != 0
+                    && !is_authenticated
+                {
+                    return (
+                        Status::WRITE_PROTECTED,
+                        VariablePersistAction::None,
+                        SecureBootDbAction::None,
+                    );
+                }
+                if let Some(timestamp) = timestamp_bytes {
+                    record_replay(timestamp);
+                }
                 variables[idx].clear();
                 let secure_action = secure_boot_var
-                    .map(SecureBootDbAction::Delete)
+                    .map(|var_type| SecureBootDbAction::Delete(var_type, authenticated_timestamp))
                     .unwrap_or(SecureBootDbAction::None);
                 let persist_action = VariablePersistAction::Delete {
                     guid,
@@ -1497,6 +1943,10 @@ fn set_variable_full(
                             SecureBootDbAction::None,
                         );
                     }
+                    if let Some(timestamp) = timestamp_bytes {
+                        variables[idx].auth_timestamp = timestamp;
+                        record_replay(timestamp);
+                    }
 
                     let mut combined_buf = VariableDataBuf::new();
                     if combined_buf.extend_from_slice(combined.as_slice()).is_err() {
@@ -1508,10 +1958,7 @@ fn set_variable_full(
                     }
 
                     let persist_action = if attributes & auth::attributes::NON_VOLATILE != 0 {
-                        let (persist_attrs, persist_data) = if is_authenticated
-                            && state::is_exit_boot_services_called()
-                            && data_size > 0
-                        {
+                        let (persist_attrs, persist_data) = if is_authenticated && !is_append {
                             (
                                 attributes,
                                 PersistData::Alloc(
@@ -1522,12 +1969,7 @@ fn set_variable_full(
                                 ),
                             )
                         } else {
-                            (
-                                attributes
-                                    & !(auth::attributes::TIME_BASED_AUTHENTICATED_WRITE_ACCESS
-                                        | auth::attributes::APPEND_WRITE),
-                                PersistData::Fixed(combined_buf.clone()),
-                            )
+                            (stored_attributes, PersistData::Fixed(combined_buf.clone()))
                         };
                         VariablePersistAction::Write {
                             guid,
@@ -1588,7 +2030,11 @@ fn set_variable_full(
             );
         }
         variables[idx].vendor_guid = guid;
-        variables[idx].attributes = attributes;
+        variables[idx].attributes = stored_attributes;
+        variables[idx].auth_timestamp = timestamp_bytes.unwrap_or([0; 16]);
+        if let Some(timestamp) = timestamp_bytes {
+            record_replay(timestamp);
+        }
         variables[idx].in_use = true;
 
         let secure_action = secure_boot_var
@@ -1596,19 +2042,30 @@ fn set_variable_full(
             .unwrap_or(SecureBootDbAction::None);
 
         let persist_action = if attributes & auth::attributes::NON_VOLATILE != 0 {
-            let persist_data =
-                if is_authenticated && state::is_exit_boot_services_called() && data_size > 0 {
-                    PersistData::Alloc(
-                        unsafe { core::slice::from_raw_parts(data as *const u8, data_size) }
-                            .to_vec(),
-                    )
-                } else {
-                    PersistData::Fixed(final_data_vec.clone())
-                };
+            let persist_data = if is_authenticated && !is_append {
+                match PersistData::try_alloc(unsafe {
+                    core::slice::from_raw_parts(data as *const u8, data_size)
+                }) {
+                    Ok(data) => data,
+                    Err(status) => {
+                        return (
+                            status,
+                            VariablePersistAction::None,
+                            SecureBootDbAction::None,
+                        );
+                    }
+                }
+            } else {
+                PersistData::Fixed(final_data_vec.clone())
+            };
             VariablePersistAction::Write {
                 guid,
                 name: name_vec.clone(),
-                attributes,
+                attributes: if is_authenticated && !is_append {
+                    attributes
+                } else {
+                    stored_attributes
+                },
                 data: persist_data,
                 is_append: false,
             }
@@ -1626,10 +2083,12 @@ fn set_variable_full(
     match secure_boot_action {
         SecureBootDbAction::None => {}
         SecureBootDbAction::Update(var_type, data) => {
-            update_key_database(var_type, data.as_slice());
-            handle_secure_boot_variable_update(var_type);
+            update_key_database(var_type, data.as_slice(), authenticated_timestamp);
+            handle_secure_boot_variable_update_boot(boot, var_type);
         }
-        SecureBootDbAction::Delete(var_type) => handle_secure_boot_variable_delete(var_type),
+        SecureBootDbAction::Delete(var_type, timestamp) => {
+            handle_secure_boot_variable_delete_boot(boot, var_type, timestamp)
+        }
     }
 
     match persist_action {
@@ -1653,29 +2112,9 @@ fn set_variable_full(
                 attributes,
                 data.as_slice(),
             ) {
-                Ok(()) =>
-                {
-                    #[cfg(feature = "rt-log")]
-                    if state::is_exit_boot_services_called() {
-                        if is_append {
-                            crate::efi::rtlog::appendln("  -> persisted OK (append)");
-                        } else {
-                            crate::efi::rtlog::appendln("  -> persisted OK");
-                        }
-                    }
-                }
+                Ok(()) => {}
                 Err(e) => {
                     log::debug!("Variable not persisted: {:?}", e);
-                    #[cfg(feature = "rt-log")]
-                    if state::is_exit_boot_services_called() {
-                        use crate::efi::rtlog;
-                        if is_append {
-                            rtlog::append("  -> persist FAILED (append): ");
-                        } else {
-                            rtlog::append("  -> persist FAILED: ");
-                        }
-                        rtlog::append_fmtln(format_args!("{:?}", e));
-                    }
                 }
             }
         }
@@ -1692,56 +2131,95 @@ fn set_variable_full(
     Status::SUCCESS
 }
 
-/// Handle Secure Boot state changes when a key database variable is updated
-fn handle_secure_boot_variable_update(var_type: auth::SecureBootVariable) {
+/// Apply a Secure Boot database update while boot services are active.
+fn handle_secure_boot_variable_update_boot(
+    boot: &crate::phase::BootCtx<'_>,
+    var_type: auth::SecureBootVariable,
+) {
+    if var_type != auth::SecureBootVariable::PK
+        || !crate::state::boot_secure_boot_status(boot).setup_mode()
+    {
+        return;
+    }
+
+    auth::enter_user_mode_boot(boot);
+
+    // PK enrollment enters User Mode but does not itself enable policy. Apply
+    // the already-persisted preference without performing another SPI write.
+    if auth::boot::load_secure_boot_enable_preference() {
+        auth::apply_secure_boot_preference_boot(boot, true);
+    }
+    let _ = auth::boot::update_status_variables();
+}
+
+/// Apply a Secure Boot database update to pointer-free runtime state only.
+fn handle_secure_boot_variable_update_runtime(
+    runtime: &crate::phase::RuntimeCtx<'_>,
+    var_type: auth::SecureBootVariable,
+) {
+    let setup_mode = crate::runtime_state::with(|state| state.secure_boot_status().setup_mode());
+    if var_type == auth::SecureBootVariable::PK && setup_mode {
+        auth::enter_user_mode_runtime(runtime);
+    }
+}
+
+/// Apply a Secure Boot database deletion while boot services are active.
+fn handle_secure_boot_variable_delete_boot(
+    boot: &crate::phase::BootCtx<'_>,
+    var_type: auth::SecureBootVariable,
+    timestamp: Option<auth::EfiTime>,
+) {
     match var_type {
-        auth::SecureBootVariable::PK if auth::is_setup_mode() => {
-            // PK enrollment transitions from Setup Mode to User Mode
-            auth::enter_user_mode();
-
-            // Per UEFI spec, PK enrollment transitions to User Mode but does NOT
-            // automatically enable Secure Boot enforcement.  The SecureBoot variable
-            // is set based on the persisted SecureBootEnable preference.
-            if auth::boot::load_secure_boot_enable_preference() {
-                auth::enable_secure_boot();
+        auth::SecureBootVariable::PK => {
+            auth::enter_setup_mode_boot(boot);
+            let mut database = auth::pk_database();
+            database.clear();
+            if let Some(timestamp) = timestamp {
+                database.set_timestamp(timestamp);
             }
-
-            // Sync the in-memory SetupMode/SecureBoot status variables so that
-            // GetNextVariableName enumeration and any internal readers stay consistent.
+            drop(database);
             let _ = auth::boot::update_status_variables();
         }
-        _ => {
-            // Other variables (or PK when not in setup mode) don't change state
+        auth::SecureBootVariable::KEK => {
+            let mut database = auth::kek_database();
+            database.clear();
+            if let Some(timestamp) = timestamp {
+                database.set_timestamp(timestamp);
+            }
+        }
+        auth::SecureBootVariable::Db => {
+            let mut database = auth::db_database();
+            database.clear();
+            if let Some(timestamp) = timestamp {
+                database.set_timestamp(timestamp);
+            }
+        }
+        auth::SecureBootVariable::Dbx => {
+            let mut database = auth::dbx_database();
+            database.clear();
+            if let Some(timestamp) = timestamp {
+                database.set_timestamp(timestamp);
+            }
         }
     }
 }
 
-/// Handle Secure Boot state changes when a key database variable is deleted
-fn handle_secure_boot_variable_delete(var_type: auth::SecureBootVariable) {
-    match var_type {
-        auth::SecureBootVariable::PK => {
-            // PK deletion transitions from User Mode to Setup Mode
-            auth::enter_setup_mode();
-            // Clear the PK database
-            auth::pk_database().clear();
-
-            // Sync the in-memory status variables after mode transition
-            let _ = auth::boot::update_status_variables();
-        }
-        auth::SecureBootVariable::KEK => {
-            auth::kek_database().clear();
-        }
-        auth::SecureBootVariable::Db => {
-            auth::db_database().clear();
-        }
-        auth::SecureBootVariable::Dbx => {
-            auth::dbx_database().clear();
-        }
+/// Apply a Secure Boot database deletion to pointer-free runtime state only.
+fn handle_secure_boot_variable_delete_runtime(
+    runtime: &crate::phase::RuntimeCtx<'_>,
+    var_type: auth::SecureBootVariable,
+) {
+    if var_type == auth::SecureBootVariable::PK {
+        auth::enter_setup_mode_runtime(runtime);
     }
 }
 
 /// Update the in-memory key database from variable data
-fn update_key_database(var_type: auth::SecureBootVariable, data: &[u8]) {
+fn update_key_database(
+    var_type: auth::SecureBootVariable,
+    data: &[u8],
+    timestamp: Option<auth::EfiTime>,
+) {
     let result = match var_type {
         auth::SecureBootVariable::PK => {
             let mut db = auth::pk_database();
@@ -1771,6 +2249,16 @@ fn update_key_database(var_type: auth::SecureBootVariable, data: &[u8]) {
             var_type,
             e
         );
+        return;
+    }
+
+    if let Some(timestamp) = timestamp {
+        match var_type {
+            auth::SecureBootVariable::PK => auth::pk_database().set_timestamp(timestamp),
+            auth::SecureBootVariable::KEK => auth::kek_database().set_timestamp(timestamp),
+            auth::SecureBootVariable::Db => auth::db_database().set_timestamp(timestamp),
+            auth::SecureBootVariable::Dbx => auth::dbx_database().set_timestamp(timestamp),
+        }
     }
 }
 
@@ -1808,28 +2296,36 @@ extern "efiapi" fn query_variable_info(
         return Status::INVALID_PARAMETER;
     }
 
-    // We don't really care about attributes for our in-memory store
-    let _ = attributes;
+    const SUPPORTED_ATTRIBUTES: u32 = auth::attributes::NON_VOLATILE
+        | auth::attributes::BOOTSERVICE_ACCESS
+        | auth::attributes::RUNTIME_ACCESS
+        | auth::attributes::TIME_BASED_AUTHENTICATED_WRITE_ACCESS;
+    if attributes & !SUPPORTED_ATTRIBUTES != 0
+        || attributes & auth::attributes::BOOTSERVICE_ACCESS == 0
+        || (state::is_exit_boot_services_called()
+            && attributes & auth::attributes::RUNTIME_ACCESS == 0)
+    {
+        return Status::INVALID_PARAMETER;
+    }
 
-    let (total_size, used_size) = if state::is_exit_boot_services_called() {
-        crate::runtime_state::with(|runtime| {
-            (crate::runtime_state::BLOB_ARENA_SIZE, runtime.used_bytes())
-        })
+    // Volatile and non-volatile variables share this fixed payload arena. Count
+    // every entry that can consume it; filtering by the requested attributes
+    // would over-report writable space when the other class fills the arena.
+    let total_size = MAX_VARIABLES * MAX_VARIABLE_DATA_SIZE;
+    let used_size = if state::is_exit_boot_services_called() {
+        crate::runtime_state::with(|runtime| runtime.used_bytes())
     } else {
-        let variables = &state::efi().variables;
-        (
-            MAX_VARIABLES * MAX_VARIABLE_DATA_SIZE,
-            variables
-                .iter()
-                .filter(|var| var.in_use)
-                .map(|var| var.data_size)
-                .sum(),
-        )
+        state::efi()
+            .variables
+            .iter()
+            .filter(|var| var.in_use)
+            .map(|var| var.data_size)
+            .sum()
     };
 
     unsafe {
         *maximum_variable_storage_size = total_size as u64;
-        *remaining_variable_storage_size = (total_size - used_size) as u64;
+        *remaining_variable_storage_size = total_size.saturating_sub(used_size) as u64;
         *maximum_variable_size = MAX_VARIABLE_DATA_SIZE as u64;
     }
 

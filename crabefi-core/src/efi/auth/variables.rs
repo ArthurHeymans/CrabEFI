@@ -9,6 +9,7 @@ use super::structures::{EfiTime, SignatureIterator, SignatureListIterator};
 use super::{AuthError, EFI_CERT_SHA256_GUID, EFI_CERT_X509_GUID};
 use alloc::vec::Vec;
 use r_efi::efi::Guid;
+use zerocopy::FromBytes;
 
 // ============================================================================
 // Secure Boot Variable Names
@@ -97,36 +98,80 @@ impl KeyDatabase {
         self.timestamp = timestamp;
     }
 
-    /// Clear all entries
+    /// Clear all entries while retaining boot-time allocation capacity.
     pub fn clear(&mut self) {
         self.entries.clear();
     }
 
+    /// Retire all allocator-backed storage before the boot heap is unmapped.
+    pub fn retire(&mut self) {
+        self.entries = Vec::new();
+        self.timestamp = EfiTime::zero();
+    }
+
     /// Add an entry to the database
     pub fn add_entry(&mut self, entry: KeyDatabaseEntry) -> Result<(), AuthError> {
-        // Check size limit
+        // Check size and allocation limits before mutating the database. Runtime
+        // authentication uses this same path with the bounded runtime arena.
         let current_size: usize = self.entries.iter().map(|e| e.data.len()).sum();
-        if current_size + entry.data.len() > MAX_KEY_DB_SIZE {
+        let required = current_size
+            .checked_add(entry.data.len())
+            .ok_or(AuthError::BufferTooSmall)?;
+        if required > MAX_KEY_DB_SIZE {
             return Err(AuthError::BufferTooSmall);
         }
-
+        self.entries
+            .try_reserve(1)
+            .map_err(|_| AuthError::BufferTooSmall)?;
         self.entries.push(entry);
         Ok(())
     }
 
     /// Parse and load entries from a signature list blob
     pub fn load_from_signature_lists(&mut self, data: &[u8]) -> Result<(), AuthError> {
+        let mut consumed = 0usize;
+        let mut entry_count = 0usize;
         for (list, list_data) in SignatureListIterator::new(data) {
+            let first = list.first_signature_offset();
+            let signature_size = list.signature_size as usize;
+            let signature_bytes = list_data
+                .len()
+                .checked_sub(first)
+                .ok_or(AuthError::InvalidHeader)?;
+            if signature_size < super::structures::EfiSignatureData::HEADER_SIZE
+                || signature_bytes == 0
+                || !signature_bytes.is_multiple_of(signature_size)
+            {
+                return Err(AuthError::InvalidHeader);
+            }
+
             for (owner, sig_data) in SignatureIterator::new(list, list_data) {
+                let mut entry_data = Vec::new();
+                entry_data
+                    .try_reserve(sig_data.len())
+                    .map_err(|_| AuthError::BufferTooSmall)?;
+                entry_data.extend_from_slice(sig_data);
                 let entry = KeyDatabaseEntry {
                     cert_type: list.signature_type,
-                    data: sig_data.to_vec(),
+                    data: entry_data,
                     owner,
                 };
                 self.add_entry(entry)?;
+                entry_count += 1;
             }
+            consumed = consumed
+                .checked_add(list_data.len())
+                .ok_or(AuthError::InvalidHeader)?;
+        }
+        if consumed != data.len() || (!data.is_empty() && entry_count == 0) {
+            return Err(AuthError::InvalidHeader);
         }
         Ok(())
+    }
+
+    /// Total certificate bytes held by this database.
+    pub fn payload_bytes(&self) -> usize {
+        self.entries.iter().map(|entry| entry.data.len()).sum()
     }
 
     /// Serialize the database to signature list format
@@ -282,6 +327,132 @@ pub fn db_database() -> spin::MutexGuard<'static, KeyDatabase> {
 /// Get a reference to the dbx database
 pub fn dbx_database() -> spin::MutexGuard<'static, KeyDatabase> {
     DBX_DATABASE.lock()
+}
+
+/// Authentication databases owned only for the duration of one runtime call.
+///
+/// The entries are allocated from the bounded runtime workspace and are never
+/// stored in a static. In particular, dropping this value cannot replace a
+/// boot-heap `Vec` after ExitBootServices.
+pub struct RuntimeAuthDatabases {
+    pub pk: KeyDatabase,
+    pub kek: KeyDatabase,
+    pub db: KeyDatabase,
+    pub dbx: KeyDatabase,
+}
+
+impl RuntimeAuthDatabases {
+    fn new() -> Self {
+        Self {
+            pk: KeyDatabase::new(),
+            kek: KeyDatabase::new(),
+            db: KeyDatabase::new(),
+            dbx: KeyDatabase::new(),
+        }
+    }
+
+    fn load(
+        database: &mut KeyDatabase,
+        runtime: &crate::runtime_state::RuntimeState,
+        guid: &Guid,
+        name: &[u16],
+    ) -> Result<(), AuthError> {
+        if let Some((_, payload)) = runtime.get(guid, name) {
+            database.load_from_signature_lists(payload)?;
+        }
+        if let Some(timestamp) = runtime.auth_timestamp(guid, name)
+            && let Ok(timestamp) = EfiTime::read_from_bytes(&timestamp)
+        {
+            database.set_timestamp(timestamp);
+        }
+        Ok(())
+    }
+
+    /// Build all four databases from pointer-free runtime storage.
+    pub fn from_runtime_state(
+        runtime: &crate::runtime_state::RuntimeState,
+    ) -> Result<Self, AuthError> {
+        let mut databases = Self::new();
+        Self::load(
+            &mut databases.pk,
+            runtime,
+            &super::EFI_GLOBAL_VARIABLE_GUID,
+            PK_NAME,
+        )?;
+        Self::load(
+            &mut databases.kek,
+            runtime,
+            &super::EFI_GLOBAL_VARIABLE_GUID,
+            KEK_NAME,
+        )?;
+        Self::load(
+            &mut databases.db,
+            runtime,
+            &super::EFI_IMAGE_SECURITY_DATABASE_GUID,
+            DB_NAME,
+        )?;
+        Self::load(
+            &mut databases.dbx,
+            runtime,
+            &super::EFI_IMAGE_SECURITY_DATABASE_GUID,
+            DBX_NAME,
+        )?;
+        Ok(databases)
+    }
+
+    /// Conservative upper bound for crypto/parser scratch space. This is
+    /// checked before entering dependency APIs that do not expose fallible
+    /// allocation, so arena exhaustion becomes EFI_OUT_OF_RESOURCES.
+    pub fn runtime_preflight_size(
+        &self,
+        variable: SecureBootVariable,
+        raw_size: usize,
+        signed_size: usize,
+    ) -> Option<usize> {
+        let database_size = match variable {
+            SecureBootVariable::PK => self.pk.payload_bytes(),
+            SecureBootVariable::KEK | SecureBootVariable::Db | SecureBootVariable::Dbx => self
+                .kek
+                .payload_bytes()
+                .checked_add(self.pk.payload_bytes())?,
+        };
+        raw_size
+            .checked_mul(2)?
+            .checked_add(signed_size.checked_mul(2)?)?
+            .checked_add(database_size.checked_mul(2)?)?
+            .checked_add(64 * 1024)
+    }
+}
+
+/// Validate a complete EFI signature database without retaining allocations.
+pub fn validate_signature_database(data: &[u8]) -> Result<(), AuthError> {
+    let mut database = KeyDatabase::new();
+    database.load_from_signature_lists(data)
+}
+
+/// Rebuild operation-local authentication databases from runtime state.
+pub fn prepare_runtime_databases() -> Result<RuntimeAuthDatabases, AuthError> {
+    crate::runtime_state::with(RuntimeAuthDatabases::from_runtime_state)
+}
+
+/// Copy a boot-time replay timestamp before its allocator-backed database is
+/// retired for the runtime transition.
+pub fn database_timestamp(var_type: SecureBootVariable) -> EfiTime {
+    match var_type {
+        SecureBootVariable::PK => *PK_DATABASE.lock().timestamp(),
+        SecureBootVariable::KEK => *KEK_DATABASE.lock().timestamp(),
+        SecureBootVariable::Db => *DB_DATABASE.lock().timestamp(),
+        SecureBootVariable::Dbx => *DBX_DATABASE.lock().timestamp(),
+    }
+}
+
+/// Drop boot-heap database entries while physical boot memory is still mapped.
+/// The static databases remain empty and are never touched by runtime calls.
+pub fn retire_boot_databases() {
+    PK_DATABASE.lock().retire();
+    KEK_DATABASE.lock().retire();
+    DB_DATABASE.lock().retire();
+    DBX_DATABASE.lock().retire();
 }
 
 /// Identify which key database a variable belongs to

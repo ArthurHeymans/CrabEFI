@@ -26,8 +26,8 @@ use super::variables::{
     db_database, dbx_database, kek_database, pk_database,
 };
 use super::{
-    AuthError, EFI_GLOBAL_VARIABLE_GUID, EFI_IMAGE_SECURITY_DATABASE_GUID, enter_setup_mode,
-    enter_user_mode, is_setup_mode,
+    AuthError, EFI_GLOBAL_VARIABLE_GUID, EFI_IMAGE_SECURITY_DATABASE_GUID, boot_enter_setup_mode,
+    boot_enter_user_mode, boot_secure_boot_status,
 };
 use crate::efi::varstore::{
     VarStoreError, get_variable_timestamp, persist_variable_with_timestamp,
@@ -85,10 +85,10 @@ pub fn init_secure_boot(config: &SecureBootConfig) -> Result<EnrollmentStatus, A
 
     // Step 2: Determine mode based on PK enrollment
     if keys_loaded.pk_enrolled {
-        enter_user_mode();
+        boot_enter_user_mode();
         log::info!("Secure Boot: Entered User Mode (PK enrolled)");
     } else {
-        enter_setup_mode();
+        boot_enter_setup_mode();
         log::info!("Secure Boot: In Setup Mode (no PK enrolled)");
 
         // Step 3: Optionally enroll default keys
@@ -111,11 +111,13 @@ pub fn init_secure_boot(config: &SecureBootConfig) -> Result<EnrollmentStatus, A
 
     // Step 5: Load and apply SecureBootEnable preference from persistent storage
     // This is the user's saved preference from previous boot
-    if !is_setup_mode() {
+    if !boot_secure_boot_status().setup_mode() {
         let enable_from_storage = load_secure_boot_enable_preference();
         if enable_from_storage || config.enable_secure_boot {
-            // Use internal function to avoid re-persisting what we just loaded
-            crate::state::with_efi_mut(|efi| efi.secure_boot_enabled = true);
+            // Apply without re-persisting the preference we just loaded.
+            crate::phase::assert_boot(|boot| {
+                super::apply_secure_boot_preference_boot(boot, true);
+            });
             log::info!("Secure Boot: Enabled (from persisted preference)");
             // Update status variables to reflect the enabled state
             let _ = update_status_variables();
@@ -384,7 +386,11 @@ fn persist_key_variable(
 /// Create or update the SecureBoot and SetupMode status variables
 fn create_status_variables() -> Result<(), AuthError> {
     // SetupMode: 1 if in Setup Mode, 0 if in User Mode
-    let setup_mode_value: u8 = if is_setup_mode() { 1 } else { 0 };
+    let setup_mode_value: u8 = if boot_secure_boot_status().setup_mode() {
+        1
+    } else {
+        0
+    };
     crate::efi::varstore::update_variable_in_memory(
         &EFI_GLOBAL_VARIABLE_GUID,
         SETUP_MODE_NAME,
@@ -394,7 +400,7 @@ fn create_status_variables() -> Result<(), AuthError> {
     log::debug!("SetupMode variable set to {}", setup_mode_value);
 
     // SecureBoot: 1 if Secure Boot is enabled, 0 otherwise
-    let secure_boot_value: u8 = if super::is_secure_boot_enabled() {
+    let secure_boot_value: u8 = if boot_secure_boot_status().secure_boot_enabled() {
         1
     } else {
         0
@@ -461,7 +467,7 @@ pub fn clear_all_keys() -> Result<(), AuthError> {
     }
 
     // Enter Setup Mode
-    enter_setup_mode();
+    boot_enter_setup_mode();
 
     // Delete persisted variables from SMMSTORE
     // Note: We persist empty data which effectively deletes the variable

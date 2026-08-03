@@ -4,10 +4,14 @@
 //! authenticated variables.
 
 use super::structures::{EfiTime, EfiVariableAuthentication2};
-use super::variables::{SecureBootVariable, db_database, dbx_database, kek_database, pk_database};
-use super::{AuthError, WIN_CERT_TYPE_EFI_GUID, is_setup_mode};
+use super::variables::{
+    KeyDatabase, RuntimeAuthDatabases, SecureBootVariable, db_database, dbx_database, kek_database,
+    pk_database,
+};
+use super::{AuthError, WIN_CERT_TYPE_EFI_GUID};
 use alloc::vec::Vec;
 use r_efi::efi::Guid;
+use zerocopy::FromBytes;
 
 // ============================================================================
 // GUID Helper
@@ -39,13 +43,57 @@ const EFI_CERT_TYPE_PKCS7_GUID_BYTES: [u8; 16] = [
 /// On success, returns the actual variable data (without authentication header).
 /// On failure, returns an AuthError.
 pub fn verify_authenticated_variable(
+    secure_boot: crate::runtime_state::SecureBootStatus,
     variable_name: &[u16],
     vendor_guid: &Guid,
     attributes: u32,
     data: &[u8],
 ) -> Result<Vec<u8>, AuthError> {
+    verify_authenticated_variable_inner(
+        secure_boot,
+        variable_name,
+        vendor_guid,
+        attributes,
+        data,
+        None,
+    )
+}
+
+/// Verify using databases reconstructed from pointer-free runtime state.
+///
+/// The supplied databases are operation-local and must not be retained by the
+/// caller after the runtime allocation arena is reset.
+pub fn verify_authenticated_variable_with_databases(
+    secure_boot: crate::runtime_state::SecureBootStatus,
+    variable_name: &[u16],
+    vendor_guid: &Guid,
+    attributes: u32,
+    data: &[u8],
+    databases: &RuntimeAuthDatabases,
+) -> Result<Vec<u8>, AuthError> {
+    verify_authenticated_variable_inner(
+        secure_boot,
+        variable_name,
+        vendor_guid,
+        attributes,
+        data,
+        Some(databases),
+    )
+}
+
+fn verify_authenticated_variable_inner(
+    secure_boot: crate::runtime_state::SecureBootStatus,
+    variable_name: &[u16],
+    vendor_guid: &Guid,
+    attributes: u32,
+    data: &[u8],
+    databases: Option<&RuntimeAuthDatabases>,
+) -> Result<Vec<u8>, AuthError> {
     // Parse the authentication header
     let auth = EfiVariableAuthentication2::from_bytes(data).ok_or(AuthError::InvalidHeader)?;
+    if !auth.time_stamp.is_valid() {
+        return Err(AuthError::InvalidTimestamp);
+    }
 
     // Read certificate type from packed struct
     let cert_type_val = auth.auth_info.hdr.w_certificate_type;
@@ -81,54 +129,123 @@ pub fn verify_authenticated_variable(
         attributes,
         &auth.time_stamp,
         variable_data,
-    );
+    )?;
 
     // Determine which key database should authorize this variable
     if let Some(var_type) = super::variables::identify_key_database(variable_name, vendor_guid) {
         // This is a Secure Boot variable - requires special handling
-        verify_secure_boot_variable(var_type, &auth.time_stamp, pkcs7_data, &signed_data)?;
+        verify_secure_boot_variable(
+            secure_boot,
+            var_type,
+            &auth.time_stamp,
+            pkcs7_data,
+            &signed_data,
+            attributes & super::attributes::APPEND_WRITE != 0,
+            databases,
+        )?;
     } else {
-        // For non-Secure Boot authenticated variables, verify against db
-        verify_signature_against_database(pkcs7_data, &signed_data, SecureBootVariable::Db)?;
+        if let Some(previous) = previous_auth_timestamp(variable_name, vendor_guid, databases)
+            && let Ok(previous) = EfiTime::read_from_bytes(&previous)
+            && attributes & super::attributes::APPEND_WRITE == 0
+            && !auth.time_stamp.is_after(&previous)
+        {
+            return Err(AuthError::InvalidTimestamp);
+        }
+        // For non-Secure Boot authenticated variables, verify against db.
+        verify_signature_against_database(
+            pkcs7_data,
+            &signed_data,
+            SecureBootVariable::Db,
+            databases,
+        )?;
     }
 
-    Ok(variable_data.to_vec())
+    let mut result = Vec::new();
+    result
+        .try_reserve(variable_data.len())
+        .map_err(|_| AuthError::BufferTooSmall)?;
+    result.extend_from_slice(variable_data);
+    Ok(result)
+}
+
+fn previous_auth_timestamp(
+    variable_name: &[u16],
+    vendor_guid: &Guid,
+    databases: Option<&RuntimeAuthDatabases>,
+) -> Option<[u8; 16]> {
+    match databases {
+        Some(_) => {
+            crate::runtime_state::with(|runtime| runtime.auth_timestamp(vendor_guid, variable_name))
+        }
+        None => crate::state::efi()
+            .variables
+            .iter()
+            .find_map(|variable| {
+                (variable.in_use
+                    && variable.vendor_guid == *vendor_guid
+                    && crate::efi::utils::ucs2_eq(&variable.name, variable_name)
+                    && variable.auth_timestamp != [0; 16])
+                    .then_some(variable.auth_timestamp)
+            })
+            .or_else(|| {
+                crate::state::efi().auth_replay.iter().find_map(|entry| {
+                    (entry.in_use
+                        && entry.vendor_guid == *vendor_guid
+                        && crate::efi::utils::ucs2_eq(&entry.name, variable_name))
+                    .then_some(entry.timestamp)
+                })
+            }),
+    }
 }
 
 /// Verify a Secure Boot variable update
 fn verify_secure_boot_variable(
+    secure_boot: crate::runtime_state::SecureBootStatus,
     var_type: SecureBootVariable,
     timestamp: &EfiTime,
     pkcs7_data: &[u8],
     signed_data: &[u8],
+    is_append: bool,
+    databases: Option<&RuntimeAuthDatabases>,
 ) -> Result<(), AuthError> {
-    // In Setup Mode, we skip signature verification for initial enrollment
-    if is_setup_mode() {
-        log::info!(
-            "Setup Mode: Allowing unauthenticated write to {:?}",
-            var_type
-        );
-        return Ok(());
-    }
-
-    // Get the authorizing database for this variable
-    let auth_db = var_type.authorizing_database();
-
-    // Check timestamp monotonicity
-    let current_timestamp = match var_type {
-        SecureBootVariable::PK => *pk_database().timestamp(),
-        SecureBootVariable::KEK => *kek_database().timestamp(),
-        SecureBootVariable::Db => *db_database().timestamp(),
-        SecureBootVariable::Dbx => *dbx_database().timestamp(),
+    // Replay protection applies in Setup Mode too: deleting PK must not make an
+    // older signed enrollment usable again. Setup Mode only relaxes signature
+    // authorization for the initial enrollment.
+    let current_timestamp = match databases {
+        Some(databases) => match var_type {
+            SecureBootVariable::PK => *databases.pk.timestamp(),
+            SecureBootVariable::KEK => *databases.kek.timestamp(),
+            SecureBootVariable::Db => *databases.db.timestamp(),
+            SecureBootVariable::Dbx => *databases.dbx.timestamp(),
+        },
+        None => match var_type {
+            SecureBootVariable::PK => *pk_database().timestamp(),
+            SecureBootVariable::KEK => *kek_database().timestamp(),
+            SecureBootVariable::Db => *db_database().timestamp(),
+            SecureBootVariable::Dbx => *dbx_database().timestamp(),
+        },
     };
 
-    if !timestamp.is_after(&current_timestamp) {
+    if !is_append
+        && current_timestamp.compare(&EfiTime::zero()) != core::cmp::Ordering::Equal
+        && !timestamp.is_after(&current_timestamp)
+    {
         log::warn!("Authenticated variable: Timestamp not monotonically increasing");
         return Err(AuthError::InvalidTimestamp);
     }
 
-    // Verify the signature against the authorizing database
-    verify_signature_against_database(pkcs7_data, signed_data, auth_db)?;
+    if secure_boot.setup_mode() {
+        log::info!("Setup Mode: allowing initial write to {:?}", var_type);
+        return Ok(());
+    }
+
+    // Verify the signature against the authorizing database.
+    verify_signature_against_database(
+        pkcs7_data,
+        signed_data,
+        var_type.authorizing_database(),
+        databases,
+    )?;
 
     Ok(())
 }
@@ -138,61 +255,50 @@ fn verify_signature_against_database(
     pkcs7_data: &[u8],
     signed_data: &[u8],
     database: SecureBootVariable,
+    databases: Option<&RuntimeAuthDatabases>,
 ) -> Result<(), AuthError> {
-    // Get certificates from the appropriate database
-    let certificates: Vec<Vec<u8>> = match database {
-        SecureBootVariable::PK => pk_database()
-            .x509_certificates()
-            .map(|c| c.to_vec())
-            .collect(),
-        SecureBootVariable::KEK => {
-            // KEK or PK can authorize
-            let mut certs: Vec<Vec<u8>> = kek_database()
-                .x509_certificates()
-                .map(|c| c.to_vec())
-                .collect();
-            certs.extend(pk_database().x509_certificates().map(|c| c.to_vec()));
-            certs
+    let mut certificate_count = 0;
+    let mut verify_database = |key_database: &KeyDatabase| {
+        for cert_der in key_database.x509_certificates() {
+            certificate_count += 1;
+            if let Ok(true) =
+                super::crypto::verify_pkcs7_signature(pkcs7_data, signed_data, cert_der)
+            {
+                return true;
+            }
         }
-        SecureBootVariable::Db | SecureBootVariable::Dbx => {
-            // For db/dbx verification, we check KEK (and PK as fallback)
-            let mut certs: Vec<Vec<u8>> = kek_database()
-                .x509_certificates()
-                .map(|c| c.to_vec())
-                .collect();
-            certs.extend(pk_database().x509_certificates().map(|c| c.to_vec()));
-            certs
-        }
+        false
     };
 
-    if certificates.is_empty() {
+    let verified = match databases {
+        Some(databases) => match database {
+            SecureBootVariable::PK => verify_database(&databases.pk),
+            SecureBootVariable::KEK | SecureBootVariable::Db | SecureBootVariable::Dbx => {
+                verify_database(&databases.kek) || verify_database(&databases.pk)
+            }
+        },
+        None => match database {
+            SecureBootVariable::PK => verify_database(&pk_database()),
+            SecureBootVariable::KEK | SecureBootVariable::Db | SecureBootVariable::Dbx => {
+                verify_database(&kek_database()) || verify_database(&pk_database())
+            }
+        },
+    };
+
+    if certificate_count == 0 {
         log::warn!(
             "Authenticated variable: No certificates in {:?} database",
             database
         );
         return Err(AuthError::NoSuitableKey);
     }
-
-    // Try to verify against each certificate
-    for cert_der in &certificates {
-        match super::crypto::verify_pkcs7_signature(pkcs7_data, signed_data, cert_der) {
-            Ok(true) => {
-                log::info!("Authenticated variable: Signature verified successfully");
-                return Ok(());
-            }
-            Ok(false) => {
-                // Signature didn't match this certificate, try next
-                continue;
-            }
-            Err(e) => {
-                log::debug!("Signature verification error: {:?}", e);
-                continue;
-            }
-        }
+    if verified {
+        log::info!("Authenticated variable: Signature verified successfully");
+        Ok(())
+    } else {
+        log::warn!("Authenticated variable: No matching signature found");
+        Err(AuthError::SignatureVerificationFailed)
     }
-
-    log::warn!("Authenticated variable: No matching signature found");
-    Err(AuthError::SignatureVerificationFailed)
 }
 
 /// Build the data that is signed for authenticated variables
@@ -205,8 +311,18 @@ fn build_signed_data(
     attributes: u32,
     timestamp: &EfiTime,
     data: &[u8],
-) -> Vec<u8> {
+) -> Result<Vec<u8>, AuthError> {
+    let name_bytes = variable_name.iter().take_while(|&&ch| ch != 0).count() * 2;
+    let required = name_bytes
+        .checked_add(16)
+        .and_then(|size| size.checked_add(4))
+        .and_then(|size| size.checked_add(core::mem::size_of::<EfiTime>()))
+        .and_then(|size| size.checked_add(data.len()))
+        .ok_or(AuthError::BufferTooSmall)?;
     let mut result = Vec::new();
+    result
+        .try_reserve(required)
+        .map_err(|_| AuthError::BufferTooSmall)?;
 
     // VariableName (UCS-2, NOT including null terminator per UEFI spec Section 8.2.2)
     for &ch in variable_name {
@@ -228,7 +344,7 @@ fn build_signed_data(
     // DataNew (the actual variable data)
     result.extend_from_slice(data);
 
-    result
+    Ok(result)
 }
 
 /// Check if a binary image hash is in the forbidden database (dbx)

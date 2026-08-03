@@ -651,7 +651,7 @@ fn boot_linux_entry(
     // when Secure Boot is active (filtered in scan_partition_for_entries), but
     // check here as well in case an entry somehow makes it through.
     // Direct boot bypasses signature verification which violates Secure Boot.
-    if efi::auth::is_secure_boot_enabled() {
+    if efi::auth::boot_secure_boot_status().secure_boot_enabled() {
         log::warn!("Direct Linux boot disabled: Secure Boot is active");
         log::info!("Falling back to UEFI boot path for secure verification");
         // Fall back to UEFI boot which will verify the bootloader signature

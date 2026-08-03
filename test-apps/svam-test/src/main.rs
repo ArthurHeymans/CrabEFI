@@ -17,10 +17,12 @@ use r_efi::efi::{
     TimeCapabilities,
 };
 
-const VOFF: u64 = 0x80_0000_0000;
+const CODE_VOFF: u64 = 0x80_0000_0000;
+const DATA_VOFF: u64 = 0x100_0000_0000;
 const MAP_BUFFER_SIZE: usize = 128 * 1024;
 const EFI_MEMORY_RUNTIME: u64 = 0x8000_0000_0000_0000;
 const VARIABLE_ATTRIBUTES: u32 = 0x0000_0001 | 0x0000_0002 | 0x0000_0004;
+const APPEND_WRITE: u32 = 0x0000_0040;
 const CAPSULE_FLAGS_PERSIST_ACROSS_RESET: u32 = 0x0001_0000;
 
 #[repr(align(4096))]
@@ -102,7 +104,9 @@ pub extern "efiapi" fn efi_main(image_handle: Handle, system_table: *mut SystemT
     serial_line("SVAM_TEST: STAGE alias-map");
     unsafe {
         let pml4 = context.pml4_phys as *mut u64;
-        core::ptr::write_volatile(pml4.add(1), core::ptr::read_volatile(pml4));
+        let identity = core::ptr::read_volatile(pml4);
+        core::ptr::write_volatile(pml4.add(1), identity);
+        core::ptr::write_volatile(pml4.add(2), identity);
         reload_cr3(context.pml4_phys);
         serial_line("SVAM_TEST: STAGE alias-ready");
         svam_jump_to_alias(alias_main as *const () as usize);
@@ -127,14 +131,19 @@ fn get_memory_map(boot_services: *mut efi::BootServices, context: &mut Transitio
 extern "efiapi" fn alias_main() -> ! {
     serial_line("SVAM_TEST: STAGE alias-entry");
     let context = unsafe { &mut *(&raw mut CONTEXT as *mut TransitionContext) };
-    let map = (context.map_phys + VOFF) as *mut u8;
+    let map = (context.map_phys + CODE_VOFF) as *mut u8;
     let count = context.map_size / context.descriptor_size;
 
     for index in 0..count {
         let descriptor =
             unsafe { &mut *(map.add(index * context.descriptor_size) as *mut MemoryDescriptor) };
         if descriptor.attribute & EFI_MEMORY_RUNTIME != 0 {
-            descriptor.virtual_start = descriptor.physical_start + VOFF;
+            let offset = if descriptor.r#type == efi::RUNTIME_SERVICES_CODE {
+                CODE_VOFF
+            } else {
+                DATA_VOFF
+            };
+            descriptor.virtual_start = descriptor.physical_start + offset;
         } else {
             descriptor.virtual_start = 0;
         }
@@ -158,13 +167,13 @@ extern "efiapi" fn alias_main() -> ! {
     // Remove the identity map while executing and using the stack through the
     // virtual alias. Any stale physical pointer now faults immediately.
     unsafe {
-        let pml4_virtual = (context.pml4_phys + VOFF) as *mut u64;
+        let pml4_virtual = (context.pml4_phys + CODE_VOFF) as *mut u64;
         core::ptr::write_volatile(pml4_virtual, 0);
         reload_cr3(context.pml4_phys);
     }
 
     serial_line("SVAM_TEST: STAGE physical-unmapped");
-    let runtime = (context.runtime_services_phys + VOFF) as *mut efi::RuntimeServices;
+    let runtime = (context.runtime_services_phys + DATA_VOFF) as *mut efi::RuntimeServices;
     exercise_runtime_services(runtime);
     serial_line("SVAM_TEST: PASS");
 
@@ -206,6 +215,19 @@ fn exercise_runtime_services(runtime: *mut efi::RuntimeServices) {
         0x0d,
         &[0x00, 0xe0, 0x98, 0x03, 0x2b, 0x8c],
     );
+    const SECURE_BOOT: [u16; 11] = [
+        b'S' as u16,
+        b'e' as u16,
+        b'c' as u16,
+        b'u' as u16,
+        b'r' as u16,
+        b'e' as u16,
+        b'B' as u16,
+        b'o' as u16,
+        b'o' as u16,
+        b't' as u16,
+        0,
+    ];
     let mut setup_mode = 0u8;
     let mut setup_size = 1usize;
     require(
@@ -218,8 +240,27 @@ fn exercise_runtime_services(runtime: *mut efi::RuntimeServices) {
                 &mut setup_mode as *mut u8 as *mut c_void,
             )
         },
-        "get-variable",
+        "get-setup-mode",
     );
+    let mut secure_boot = 0u8;
+    let mut secure_boot_size = 1usize;
+    require(
+        unsafe {
+            ((*runtime).get_variable)(
+                SECURE_BOOT.as_ptr() as *mut u16,
+                &mut global_guid,
+                core::ptr::null_mut(),
+                &mut secure_boot_size,
+                &mut secure_boot as *mut u8 as *mut c_void,
+            )
+        },
+        "get-secure-boot",
+    );
+    if setup_mode > 1 || secure_boot > 1 {
+        fail("secure-boot-status-range");
+    }
+    let initial_setup_mode = setup_mode;
+    let initial_secure_boot = secure_boot;
 
     let mut name = [0u16; 128];
     let mut guid = Guid::from_fields(0, 0, 0, 0, 0, &[0; 6]);
@@ -313,6 +354,69 @@ fn exercise_runtime_services(runtime: *mut efi::RuntimeServices) {
     );
     if readback != payload {
         fail("set-variable-compare");
+    }
+
+    // A post-SVAM variable mutation must not switch Secure Boot status reads
+    // back to the retired FirmwareState copy.
+    setup_size = 1;
+    secure_boot_size = 1;
+    require(
+        unsafe {
+            ((*runtime).get_variable)(
+                SETUP_MODE.as_ptr() as *mut u16,
+                &mut global_guid,
+                core::ptr::null_mut(),
+                &mut setup_size,
+                &mut setup_mode as *mut u8 as *mut c_void,
+            )
+        },
+        "get-setup-mode-after-set",
+    );
+    require(
+        unsafe {
+            ((*runtime).get_variable)(
+                SECURE_BOOT.as_ptr() as *mut u16,
+                &mut global_guid,
+                core::ptr::null_mut(),
+                &mut secure_boot_size,
+                &mut secure_boot as *mut u8 as *mut c_void,
+            )
+        },
+        "get-secure-boot-after-set",
+    );
+    if setup_mode != initial_setup_mode || secure_boot != initial_secure_boot {
+        fail("secure-boot-status-changed");
+    }
+
+    let append_payload = [0x21u8];
+    require(
+        unsafe {
+            ((*runtime).set_variable)(
+                TEST_NAME.as_ptr() as *mut u16,
+                &mut test_guid,
+                VARIABLE_ATTRIBUTES | APPEND_WRITE,
+                append_payload.len(),
+                append_payload.as_ptr() as *mut c_void,
+            )
+        },
+        "append-variable",
+    );
+    let mut appended = [0u8; 5];
+    let mut appended_size = appended.len();
+    require(
+        unsafe {
+            ((*runtime).get_variable)(
+                TEST_NAME.as_ptr() as *mut u16,
+                &mut test_guid,
+                core::ptr::null_mut(),
+                &mut appended_size,
+                appended.as_mut_ptr() as *mut c_void,
+            )
+        },
+        "append-variable-readback",
+    );
+    if appended != [0x43, 0x72, 0x61, 0x62, 0x21] {
+        fail("append-variable-compare");
     }
 
     require(

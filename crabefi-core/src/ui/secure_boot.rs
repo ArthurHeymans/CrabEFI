@@ -113,12 +113,12 @@ fn handle_action(idx: usize) -> Option<(&'static str, bool)> {
     use crate::efi::auth;
     match idx {
         0 => {
-            if auth::is_secure_boot_enabled() {
-                auth::disable_secure_boot();
+            if auth::boot_secure_boot_status().secure_boot_enabled() {
+                auth::boot_disable_secure_boot();
                 Some(("Secure Boot disabled", true))
             } else {
-                auth::enable_secure_boot();
-                if auth::is_secure_boot_enabled() {
+                auth::boot_enable_secure_boot();
+                if auth::boot_secure_boot_status().secure_boot_enabled() {
                     Some(("Secure Boot enabled", true))
                 } else {
                     Some(("Cannot enable: no PK enrolled", false))
@@ -324,8 +324,9 @@ fn draw_screen(
     y += render::font_height(FontSize::Display) as i32 + 16;
 
     // ── Hero state card ──
-    let sb_on = crate::efi::auth::is_secure_boot_enabled();
-    let setup_mode = crate::efi::auth::is_setup_mode();
+    let secure_boot = crate::efi::auth::boot_secure_boot_status();
+    let sb_on = secure_boot.secure_boot_enabled();
+    let setup_mode = secure_boot.setup_mode();
     let enroll = crate::efi::auth::enrollment::get_enrollment_status();
 
     let state_h = 56u32;

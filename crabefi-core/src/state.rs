@@ -70,6 +70,8 @@
 
 use core::sync::atomic::{AtomicPtr, Ordering};
 
+use crabefi_runtime::SecureBootStatus;
+
 use crate::fs::fat::FatType;
 
 /// Global pointer to the firmware state.
@@ -77,11 +79,6 @@ use crate::fs::fat::FatType;
 /// This is the ONLY global mutable state. It points to a `FirmwareState`
 /// allocated on the stack in `init()`.
 static STATE_PTR: AtomicPtr<FirmwareState> = AtomicPtr::new(core::ptr::null_mut());
-
-/// Pointer-free phase flag used by runtime entry points after boot state is
-/// no longer reachable.
-static EXIT_BOOT_SERVICES_CALLED: core::sync::atomic::AtomicBool =
-    core::sync::atomic::AtomicBool::new(false);
 
 /// Re-entrancy guard for `with_mut`. In debug builds, detects nested calls
 /// that would create aliasing `&mut` references (undefined behavior).
@@ -109,24 +106,6 @@ pub fn is_initialized() -> bool {
     !STATE_PTR.load(Ordering::Acquire).is_null()
 }
 
-/// Relocate the global state pointer to a new virtual address.
-///
-/// Called by `SetVirtualAddressMap` when the OS remaps runtime services
-/// memory from physical to virtual addresses.
-///
-/// # Safety
-///
-/// The new pointer must point to valid `FirmwareState` memory that has been
-/// remapped by the OS.
-pub unsafe fn relocate_state_ptr(new_ptr: *mut FirmwareState) {
-    // SAFETY: The caller guarantees that `new_ptr` is the runtime-mapped
-    // address of the installed firmware state.
-    if unsafe { new_ptr.as_ref() }.is_none() {
-        panic!("FirmwareState pointer is null");
-    }
-    STATE_PTR.store(new_ptr, Ordering::Release);
-}
-
 /// Get a reference to the global firmware state.
 ///
 /// # Panics
@@ -134,6 +113,7 @@ pub unsafe fn relocate_state_ptr(new_ptr: *mut FirmwareState) {
 /// Panics if called before `init()`.
 #[inline]
 pub fn get() -> &'static FirmwareState {
+    assert_physical_state_accessible();
     let ptr = STATE_PTR.load(Ordering::Acquire);
     assert!(!ptr.is_null(), "FirmwareState not initialized");
     unsafe { &*ptr }
@@ -156,6 +136,7 @@ pub fn get() -> &'static FirmwareState {
 /// with nested function calls.
 #[inline]
 pub fn get_mut_ptr() -> *mut FirmwareState {
+    assert_physical_state_accessible();
     let ptr = STATE_PTR.load(Ordering::Acquire);
     assert!(!ptr.is_null(), "FirmwareState not initialized");
     ptr
@@ -178,6 +159,7 @@ pub fn with_mut<F, R>(f: F) -> R
 where
     F: FnOnce(&mut FirmwareState) -> R,
 {
+    assert_physical_state_accessible();
     #[cfg(debug_assertions)]
     assert!(
         !IN_WITH_MUT.swap(true, Ordering::Acquire),
@@ -202,6 +184,7 @@ where
 /// Returns `None` if state has not been initialized yet.
 #[inline]
 pub fn try_get() -> Option<&'static FirmwareState> {
+    assert_physical_state_accessible();
     let ptr = STATE_PTR.load(Ordering::Acquire);
     (!ptr.is_null()).then(|| unsafe { &*ptr })
 }
@@ -212,6 +195,7 @@ pub fn try_get() -> Option<&'static FirmwareState> {
 /// See `get_mut_ptr()` for safety considerations.
 #[inline]
 pub fn try_get_mut_ptr() -> Option<*mut FirmwareState> {
+    assert_physical_state_accessible();
     let ptr = STATE_PTR.load(Ordering::Acquire);
     (!ptr.is_null()).then_some(ptr)
 }
@@ -292,11 +276,9 @@ pub const MAX_VARIABLE_NAME_LEN: usize = 64;
 /// keys from sbctl) can reach 4-8 KB.
 ///
 /// This payload is stored inline inside [`FirmwareState`] rather than on the
-/// heap. Runtime services reach the variable cache through `STATE_PTR`, which
-/// `SetVirtualAddressMap` relocates as a single pointer; inline storage is
-/// therefore addressed as an offset from that base and stays valid in virtual
-/// mode. A heap-backed payload would keep a physical pointer that nothing
-/// relocates, and the first post-SVAM `GetVariable` would fault.
+/// heap. Before ExitBootServices it is copied into the pointer-free
+/// `RuntimeState`; post-SVAM services never retain a pointer into this boot-only
+/// cache.
 pub const MAX_VARIABLE_DATA_SIZE: usize = 16 * 1024;
 
 /// Protocol interface entry
@@ -509,6 +491,8 @@ pub struct VariableEntry {
     pub attributes: u32,
     pub data: [u8; MAX_VARIABLE_DATA_SIZE],
     pub data_size: usize,
+    /// EFI_TIME bytes for the last authenticated write, if known.
+    pub auth_timestamp: [u8; 16],
     pub in_use: bool,
 }
 
@@ -524,6 +508,7 @@ impl VariableEntry {
             attributes: 0,
             data: [0; MAX_VARIABLE_DATA_SIZE],
             data_size: 0,
+            auth_timestamp: [0; 16],
             in_use: false,
         }
     }
@@ -552,7 +537,28 @@ impl VariableEntry {
     pub fn clear(&mut self) {
         self.data.fill(0);
         self.data_size = 0;
+        self.auth_timestamp = [0; 16];
         self.in_use = false;
+    }
+}
+
+/// Replay floor retained after an authenticated variable is deleted.
+#[derive(Clone, Copy)]
+pub struct AuthReplayEntry {
+    pub name: [u16; MAX_VARIABLE_NAME_LEN],
+    pub vendor_guid: Guid,
+    pub timestamp: [u8; 16],
+    pub in_use: bool,
+}
+
+impl AuthReplayEntry {
+    pub const fn empty() -> Self {
+        Self {
+            name: [0; MAX_VARIABLE_NAME_LEN],
+            vendor_guid: Guid::from_fields(0, 0, 0, 0, 0, &[0; 6]),
+            timestamp: [0; 16],
+            in_use: false,
+        }
     }
 }
 
@@ -617,6 +623,8 @@ pub struct EfiState {
 
     /// EFI variables
     pub variables: [VariableEntry; MAX_VARIABLES],
+    /// Authenticated-write replay floors, including deleted variables.
+    pub auth_replay: [AuthReplayEntry; MAX_VARIABLES],
 
     /// Variable store persistence state (SMMSTORE tracking)
     pub varstore: VarStoreState,
@@ -638,11 +646,10 @@ pub struct EfiState {
     /// Block device for filesystem access
     pub block_device: Option<crate::drivers::block::AnyBlockDevice>,
 
-    /// Secure Boot: whether in Setup Mode (PK not enrolled)
-    pub setup_mode: bool,
-
-    /// Secure Boot: whether Secure Boot is enabled
-    pub secure_boot_enabled: bool,
+    /// Secure Boot mode and policy state.
+    ///
+    /// Kept private so transitions must pass through the phase-safe facade.
+    secure_boot: SecureBootStatus,
 }
 
 impl EfiState {
@@ -657,6 +664,7 @@ impl EfiState {
             config_tables: [const { ConfigurationTable::empty() }; MAX_CONFIG_TABLES],
             config_table_count: 0,
             variables: [const { VariableEntry::empty() }; MAX_VARIABLES],
+            auth_replay: [const { AuthReplayEntry::empty() }; MAX_VARIABLES],
             varstore: VarStoreState::new(),
             allocator: MemoryAllocator::new(),
             monotonic_count: 0,
@@ -664,8 +672,7 @@ impl EfiState {
 
             filesystem: None,
             block_device: None,
-            setup_mode: true,
-            secure_boot_enabled: false,
+            secure_boot: SecureBootStatus::SETUP,
         }
     }
 }
@@ -1142,10 +1149,31 @@ impl FilesystemState {
 // Helper functions for accessing state components
 // ============================================================================
 
+fn assert_physical_state_accessible() {
+    assert!(
+        !crate::runtime_state::is_virtual_mode(),
+        "physical FirmwareState accessed after SetVirtualAddressMap"
+    );
+}
+
 /// Get a reference to the EFI state.
 #[inline]
 pub fn efi() -> &'static EfiState {
+    assert_physical_state_accessible();
     &get().efi
+}
+
+/// Read boot-phase Secure Boot state with phase evidence.
+pub(crate) fn boot_secure_boot_status(_boot: &crate::phase::BootCtx<'_>) -> SecureBootStatus {
+    efi().secure_boot
+}
+
+/// Mutate boot-phase Secure Boot state with phase evidence.
+pub(crate) fn with_boot_secure_boot_status_mut<R>(
+    _boot: &crate::phase::BootCtx<'_>,
+    f: impl FnOnce(&mut SecureBootStatus) -> R,
+) -> R {
+    with_efi_mut(|efi| f(&mut efi.secure_boot))
 }
 
 /// Verify that the pointer-free runtime root is initialized and reserved.
@@ -1206,6 +1234,7 @@ pub fn assert_runtime_relocatable() {
 /// See `get_mut_ptr()` for safety considerations.
 #[inline]
 pub fn efi_mut_ptr() -> *mut EfiState {
+    assert_physical_state_accessible();
     let ptr = get_mut_ptr();
     // Safety: ptr is valid, we're just computing an offset
     unsafe { core::ptr::addr_of_mut!((*ptr).efi) }
@@ -1217,6 +1246,7 @@ pub fn with_efi_mut<F, R>(f: F) -> R
 where
     F: FnOnce(&mut EfiState) -> R,
 {
+    assert_physical_state_accessible();
     with_mut(|state| f(&mut state.efi))
 }
 
@@ -1363,14 +1393,14 @@ where
 /// After ExitBootServices, SPI flash is locked and variable writes
 /// must be stored to ESP file instead.
 #[inline]
-pub fn is_exit_boot_services_called() -> bool {
-    EXIT_BOOT_SERVICES_CALLED.load(Ordering::Acquire)
+pub(crate) fn is_exit_boot_services_called() -> bool {
+    crate::phase::is_runtime()
 }
 
 /// Mark that ExitBootServices has been called.
 ///
 /// This should only be called from boot_services::exit_boot_services.
 #[inline]
-pub fn set_exit_boot_services_called() {
-    EXIT_BOOT_SERVICES_CALLED.store(true, Ordering::Release);
+pub(crate) fn set_exit_boot_services_called() {
+    crate::phase::commit_exit_boot_services();
 }

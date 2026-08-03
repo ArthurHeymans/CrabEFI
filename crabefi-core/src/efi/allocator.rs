@@ -1106,6 +1106,14 @@ impl MemoryAllocator {
     }
 
     /// Mark boot services as exited
+    pub fn validate_map_key(&self, provided_map_key: usize) -> efi::Status {
+        if provided_map_key == self.map_key {
+            efi::Status::SUCCESS
+        } else {
+            efi::Status::INVALID_PARAMETER
+        }
+    }
+
     pub fn exit_boot_services(&mut self, provided_map_key: usize) -> efi::Status {
         log::debug!(
             "exit_boot_services: provided_key={:#x}, current_key={:#x}",
@@ -1453,6 +1461,11 @@ pub fn get_memory_map(
         descriptor_size,
         descriptor_version,
     )
+}
+
+/// Validate an ExitBootServices memory-map key without changing allocator state.
+pub fn validate_map_key(map_key: usize) -> efi::Status {
+    state::allocator().validate_map_key(map_key)
 }
 
 /// Exit boot services

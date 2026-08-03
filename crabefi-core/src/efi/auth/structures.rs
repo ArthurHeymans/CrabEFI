@@ -65,55 +65,56 @@ impl EfiTime {
     /// When timezone is unspecified, we treat it as UTC for comparison
     const UNSPECIFIED_TIMEZONE: i16 = 0x7FF;
 
-    /// Compare two timestamps
-    ///
-    /// Returns:
-    /// - `Ordering::Less` if self < other
-    /// - `Ordering::Equal` if self == other
-    /// - `Ordering::Greater` if self > other
-    ///
-    /// Note: Timestamps are normalized to UTC before comparison to ensure
-    /// correct ordering regardless of timezone differences.
-    pub fn compare(&self, other: &EfiTime) -> core::cmp::Ordering {
-        // Normalize both timestamps to UTC for comparison
-        let self_utc = self.to_utc_minutes();
-        let other_utc = other.to_utc_minutes();
-        self_utc.cmp(&other_utc)
+    /// Return whether all date/time fields form a valid EFI timestamp.
+    pub fn is_valid(&self) -> bool {
+        let year = self.year;
+        let month = self.month;
+        let day = self.day;
+        let timezone = self.timezone;
+        let leap =
+            year.is_multiple_of(4) && (!year.is_multiple_of(100) || year.is_multiple_of(400));
+        let days = match month {
+            1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+            4 | 6 | 9 | 11 => 30,
+            2 if leap => 29,
+            2 => 28,
+            _ => return false,
+        };
+        (1900..=9999).contains(&year)
+            && (1..=days).contains(&day)
+            && self.hour <= 23
+            && self.minute <= 59
+            && self.second <= 59
+            && self.nanosecond <= 999_999_999
+            && (timezone == Self::UNSPECIFIED_TIMEZONE || (-1440..=1440).contains(&timezone))
+            && self.pad1 == 0
+            && self.pad2 == 0
     }
 
-    /// Convert timestamp to total minutes since epoch (normalized to UTC)
-    /// This is used for comparison purposes only, not for actual time calculations
-    fn to_utc_minutes(self) -> i64 {
-        // Copy values out of packed struct to avoid alignment issues
-        let year = self.year as i64;
-        let month = self.month as i64;
-        let day = self.day as i64;
-        let hour = self.hour as i64;
-        let minute = self.minute as i64;
-        let second = self.second as i64;
-        let nanosecond = self.nanosecond as i64;
-        let timezone = self.timezone;
-
-        // Calculate approximate minutes since year 0 (good enough for ordering)
-        // Using simplified month lengths for comparison purposes
-        let days_from_years = year * 365 + year / 4 - year / 100 + year / 400;
-        let days_from_months = (month - 1) * 30; // Approximation
-        let total_days = days_from_years + days_from_months + day;
-
-        let total_minutes = total_days * 24 * 60 + hour * 60 + minute;
-
-        // Add fractional minute from seconds and nanoseconds
-        let fractional = (second * 1_000_000_000 + nanosecond) / 60_000_000_000;
-        let mut total = total_minutes * 1_000_000 + fractional;
-
-        // Apply timezone offset to normalize to UTC
-        // timezone is in minutes from UTC (e.g., -480 for PST)
-        // If unspecified (0x7FF), treat as UTC (offset 0)
-        if timezone != Self::UNSPECIFIED_TIMEZONE && (-1440..=1440).contains(&timezone) {
-            total -= (timezone as i64) * 1_000_000;
-        }
-
-        total
+    /// Compare two validated timestamps at nanosecond granularity.
+    ///
+    /// EFI authenticated-variable timestamps are compared field-by-field. The
+    /// timezone and daylight fields are metadata and do not reduce precision or
+    /// approximate calendar months.
+    pub fn compare(&self, other: &EfiTime) -> core::cmp::Ordering {
+        (
+            self.year,
+            self.month,
+            self.day,
+            self.hour,
+            self.minute,
+            self.second,
+            self.nanosecond,
+        )
+            .cmp(&(
+                other.year,
+                other.month,
+                other.day,
+                other.hour,
+                other.minute,
+                other.second,
+                other.nanosecond,
+            ))
     }
 
     /// Check if this timestamp is strictly after another

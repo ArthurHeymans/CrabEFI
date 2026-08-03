@@ -43,7 +43,8 @@ use super::guid_to_bytes;
 use super::structures::{EfiTime, EfiVariableAuthentication2};
 use super::variables::{KeyDatabaseEntry, dbx_database, kek_database, pk_database};
 use super::{
-    AuthError, EFI_CERT_SHA256_GUID, EFI_CERT_TYPE_PKCS7_GUID, EFI_CERT_X509_GUID, is_setup_mode,
+    AuthError, EFI_CERT_SHA256_GUID, EFI_CERT_TYPE_PKCS7_GUID, EFI_CERT_X509_GUID,
+    boot_secure_boot_status,
 };
 use crate::drivers::block::BlockDevice;
 use crate::fs::fat::FatFilesystem;
@@ -117,7 +118,7 @@ pub fn find_dbx_file() -> Option<(Vec<u8>, DbxSource)> {
     }
 
     // Try raw files only in Setup Mode
-    if is_setup_mode() {
+    if boot_secure_boot_status().setup_mode() {
         if let Some((data, source)) = search_all_disks_for_dbx(DBX_RAW_PATHS) {
             log::warn!("Using raw dbx file in Setup Mode - this is less secure");
             return Some((data, DbxSource::Raw(source)));
@@ -216,7 +217,7 @@ pub fn enroll_dbx_from_file() -> Result<DbxEnrollmentResult, AuthError> {
         DbxSource::Raw(src) => {
             // In Setup Mode, apply without signature verification
             // but still check timestamp
-            if !is_setup_mode() {
+            if !boot_secure_boot_status().setup_mode() {
                 log::error!("Raw dbx files require Setup Mode");
                 return Err(AuthError::SignatureVerificationFailed);
             }

@@ -312,47 +312,91 @@ pub const WIN_CERT_TYPE_EFI_GUID: u16 = 0x0EF1;
 const SECURE_BOOT_ENABLE_ATTRS: u32 =
     attributes::NON_VOLATILE | attributes::BOOTSERVICE_ACCESS | attributes::RUNTIME_ACCESS;
 
-/// Check if we're in Setup Mode
-pub fn is_setup_mode() -> bool {
-    crate::state::efi().setup_mode
+/// Read Secure Boot state in a boot-only caller.
+///
+/// Runtime-reachable code must use [`secure_boot_status_for_phase`] or an
+/// explicit runtime capability instead of dynamically selecting a backend.
+pub fn boot_secure_boot_status() -> crate::runtime_state::SecureBootStatus {
+    crate::phase::assert_boot(crate::state::boot_secure_boot_status)
 }
 
-/// Check if Secure Boot is enabled
-pub fn is_secure_boot_enabled() -> bool {
-    crate::state::efi().secure_boot_enabled
-}
-
-/// Enter User Mode (called when PK is enrolled)
-pub fn enter_user_mode() {
-    crate::state::with_efi_mut(|efi| efi.setup_mode = false);
-    log::info!("Secure Boot: Entering User Mode");
-}
-
-/// Enter Setup Mode (called when PK is deleted)
-pub fn enter_setup_mode() {
-    crate::state::with_efi_mut(|efi| {
-        efi.setup_mode = true;
-        efi.secure_boot_enabled = false;
-    });
-    log::info!("Secure Boot: Entering Setup Mode");
-}
-
-/// Enable Secure Boot (only valid in User Mode)
-pub fn enable_secure_boot() {
-    if !is_setup_mode() {
-        crate::state::with_efi_mut(|efi| efi.secure_boot_enabled = true);
-        log::info!("Secure Boot: Enabled");
-        // Persist the user preference to SPI flash
-        persist_secure_boot_enable_preference(true);
+/// Read Secure Boot state selected once at an ABI phase boundary.
+pub(crate) fn secure_boot_status_for_phase(
+    phase: &crate::phase::Phase<'_>,
+) -> crate::runtime_state::SecureBootStatus {
+    match phase {
+        crate::phase::Phase::Boot(boot) => crate::state::boot_secure_boot_status(boot),
+        crate::phase::Phase::Runtime(_) => {
+            crate::runtime_state::with(|runtime| runtime.secure_boot_status())
+        }
     }
 }
 
-/// Disable Secure Boot
-pub fn disable_secure_boot() {
-    crate::state::with_efi_mut(|efi| efi.secure_boot_enabled = false);
-    log::info!("Secure Boot: Disabled");
-    // Persist the user preference to SPI flash
+/// Enter User Mode from a boot-only caller.
+pub fn boot_enter_user_mode() {
+    crate::phase::assert_boot(enter_user_mode_boot);
+}
+
+pub(crate) fn enter_user_mode_boot(boot: &crate::phase::BootCtx<'_>) {
+    crate::state::with_boot_secure_boot_status_mut(boot, |status| status.enter_user_mode());
+    log::info!("Secure Boot: Entering User Mode");
+}
+
+pub(crate) fn enter_user_mode_runtime(runtime: &crate::phase::RuntimeCtx<'_>) {
+    crate::runtime_state::with_mut(|state| {
+        state.with_secure_boot_status_mut(runtime, |status| status.enter_user_mode());
+    });
+}
+
+/// Enter Setup Mode from a boot-only caller.
+pub fn boot_enter_setup_mode() {
+    crate::phase::assert_boot(enter_setup_mode_boot);
+}
+
+pub(crate) fn enter_setup_mode_boot(boot: &crate::phase::BootCtx<'_>) {
+    crate::state::with_boot_secure_boot_status_mut(boot, |status| status.enter_setup_mode());
+    log::info!("Secure Boot: Entering Setup Mode");
+}
+
+pub(crate) fn enter_setup_mode_runtime(runtime: &crate::phase::RuntimeCtx<'_>) {
+    crate::runtime_state::with_mut(|state| {
+        state.with_secure_boot_status_mut(runtime, |status| status.enter_setup_mode());
+    });
+}
+
+/// Apply an already-loaded preference without writing it back to storage.
+pub(crate) fn apply_secure_boot_preference_boot(boot: &crate::phase::BootCtx<'_>, enabled: bool) {
+    crate::state::with_boot_secure_boot_status_mut(boot, |status| {
+        if enabled {
+            status.enable();
+        } else {
+            status.disable();
+        }
+    });
+}
+
+/// Enable Secure Boot from a boot-only caller and persist the user preference.
+pub fn boot_enable_secure_boot() {
+    crate::phase::assert_boot(enable_secure_boot_boot);
+}
+
+pub(crate) fn enable_secure_boot_boot(boot: &crate::phase::BootCtx<'_>) {
+    let enabled = crate::state::with_boot_secure_boot_status_mut(boot, |status| status.enable());
+    if enabled {
+        persist_secure_boot_enable_preference(true);
+        log::info!("Secure Boot: Enabled");
+    }
+}
+
+/// Disable Secure Boot from a boot-only caller and persist the user preference.
+pub fn boot_disable_secure_boot() {
+    crate::phase::assert_boot(disable_secure_boot_boot);
+}
+
+pub(crate) fn disable_secure_boot_boot(boot: &crate::phase::BootCtx<'_>) {
+    crate::state::with_boot_secure_boot_status_mut(boot, |status| status.disable());
     persist_secure_boot_enable_preference(false);
+    log::info!("Secure Boot: Disabled");
 }
 
 /// Persist the SecureBootEnable preference to non-volatile storage

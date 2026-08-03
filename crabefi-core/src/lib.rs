@@ -39,6 +39,7 @@ pub mod menu;
 pub mod menu_common;
 pub mod payload;
 pub mod pe;
+pub(crate) mod phase;
 pub mod platform;
 pub mod runtime_state;
 pub mod secure_boot_menu;

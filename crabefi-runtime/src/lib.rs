@@ -8,6 +8,7 @@
 #![feature(auto_traits, negative_impls)]
 #![deny(unsafe_op_in_unsafe_fn)]
 
+use core::marker::PhantomData;
 use core::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 
 use r_efi::efi::Guid;
@@ -19,7 +20,11 @@ pub const MAX_VARIABLE_NAME_LEN: usize = 64;
 /// Maximum payload size for one variable.
 pub const MAX_VARIABLE_DATA_SIZE: usize = 16 * 1024;
 /// Total payload storage available to runtime variables.
-pub const BLOB_ARENA_SIZE: usize = 256 * 1024;
+///
+/// The boot cache permits one maximum-sized payload in every metadata slot.
+/// Keep the runtime arena at the same capacity so freezing cannot silently
+/// discard a valid boot-time runtime variable.
+pub const BLOB_ARENA_SIZE: usize = MAX_VARIABLES * MAX_VARIABLE_DATA_SIZE;
 
 /// Compare a stored, null-terminated UCS-2 name with another canonical name.
 ///
@@ -107,6 +112,26 @@ impl RtSlice {
     }
 }
 
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct ReplayEntry {
+    name: [u16; MAX_VARIABLE_NAME_LEN],
+    vendor_guid: Guid,
+    timestamp: [u8; 16],
+    in_use: bool,
+}
+
+impl ReplayEntry {
+    const fn empty() -> Self {
+        Self {
+            name: [0; MAX_VARIABLE_NAME_LEN],
+            vendor_guid: Guid::from_fields(0, 0, 0, 0, 0, &[0; 6]),
+            timestamp: [0; 16],
+            in_use: false,
+        }
+    }
+}
+
 /// Fixed metadata for one runtime variable.
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -115,6 +140,8 @@ pub struct RuntimeVariable {
     vendor_guid: Guid,
     attributes: u32,
     data: RtSlice,
+    /// EFI_TIME bytes for the last authenticated write, or zero for none.
+    auth_timestamp: [u8; 16],
     in_use: bool,
 }
 
@@ -125,6 +152,7 @@ impl RuntimeVariable {
             vendor_guid: Guid::from_fields(0, 0, 0, 0, 0, &[0; 6]),
             attributes: 0,
             data: RtSlice::empty(),
+            auth_timestamp: [0; 16],
             in_use: false,
         }
     }
@@ -153,17 +181,97 @@ impl RuntimeVariable {
     pub fn data_size(&self) -> usize {
         self.data.len as usize
     }
+
+    /// Timestamp of the last authenticated write, if one is recorded.
+    pub fn auth_timestamp(&self) -> Option<[u8; 16]> {
+        (self.auth_timestamp != [0; 16]).then_some(self.auth_timestamp)
+    }
+}
+
+/// Pointer-free Secure Boot mode and policy state.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SecureBootStatus {
+    setup_mode: bool,
+    secure_boot_enabled: bool,
+}
+
+impl SecureBootStatus {
+    /// Initial state before a platform key is enrolled.
+    pub const SETUP: Self = Self {
+        setup_mode: true,
+        secure_boot_enabled: false,
+    };
+
+    /// Whether the platform is in Secure Boot setup mode.
+    pub const fn setup_mode(self) -> bool {
+        self.setup_mode
+    }
+
+    /// Whether Secure Boot policy is enabled.
+    pub const fn secure_boot_enabled(self) -> bool {
+        self.secure_boot_enabled
+    }
+
+    /// Enter User Mode after enrolling the platform key.
+    pub fn enter_user_mode(&mut self) {
+        self.setup_mode = false;
+    }
+
+    /// Enter Setup Mode and disable Secure Boot policy.
+    pub fn enter_setup_mode(&mut self) {
+        self.setup_mode = true;
+        self.secure_boot_enabled = false;
+    }
+
+    /// Enable Secure Boot policy when the platform is in User Mode.
+    ///
+    /// Returns whether policy is enabled after the transition.
+    pub fn enable(&mut self) -> bool {
+        if !self.setup_mode {
+            self.secure_boot_enabled = true;
+        }
+        self.secure_boot_enabled
+    }
+
+    /// Disable Secure Boot policy.
+    pub fn disable(&mut self) {
+        self.secure_boot_enabled = false;
+    }
+}
+
+/// Evidence that an operation is executing before ExitBootServices.
+///
+/// The branded lifetime and invariant, non-Send marker prevent safe code from
+/// retaining this capability beyond the dispatch closure that minted it.
+pub struct BootCtx<'brand> {
+    _marker: PhantomData<*mut &'brand ()>,
+}
+
+/// Evidence that an operation is executing after ExitBootServices.
+///
+/// This covers both physical runtime and virtual runtime.
+pub struct RuntimeCtx<'brand> {
+    _marker: PhantomData<*mut &'brand ()>,
+}
+
+/// Dynamically determined firmware phase at a phase-blind UEFI ABI boundary.
+pub enum Phase<'brand> {
+    /// Boot-services phase.
+    Boot(BootCtx<'brand>),
+    /// Post-ExitBootServices phase.
+    Runtime(RuntimeCtx<'brand>),
 }
 
 /// Pointer-free runtime state reached through one converted root.
 #[repr(C)]
 pub struct RuntimeState {
     variables: [RuntimeVariable; MAX_VARIABLES],
+    replay: [ReplayEntry; MAX_VARIABLES],
     blobs_used: u32,
-    /// Whether the platform is in Secure Boot setup mode.
-    pub setup_mode: bool,
-    /// Whether Secure Boot policy is enabled.
-    pub secure_boot_enabled: bool,
+    secure_boot: SecureBootStatus,
+    exit_boot_services_called: AtomicBool,
+    virtual_mode: AtomicBool,
     blobs: [u8; BLOB_ARENA_SIZE],
 }
 
@@ -171,9 +279,11 @@ impl RuntimeState {
     const fn new() -> Self {
         Self {
             variables: [const { RuntimeVariable::empty() }; MAX_VARIABLES],
+            replay: [const { ReplayEntry::empty() }; MAX_VARIABLES],
             blobs_used: 0,
-            setup_mode: true,
-            secure_boot_enabled: false,
+            secure_boot: SecureBootStatus::SETUP,
+            exit_boot_services_called: AtomicBool::new(false),
+            virtual_mode: AtomicBool::new(false),
             blobs: [0; BLOB_ARENA_SIZE],
         }
     }
@@ -196,6 +306,24 @@ impl RuntimeState {
     pub fn get(&self, guid: &Guid, name: &[u16]) -> Option<(&RuntimeVariable, &[u8])> {
         self.iter()
             .find(|(variable, _)| variable.vendor_guid == *guid && ucs2_eq(&variable.name, name))
+    }
+
+    /// Return replay metadata for an active or deleted authenticated variable.
+    pub fn auth_timestamp(&self, guid: &Guid, name: &[u16]) -> Option<[u8; 16]> {
+        self.variables
+            .iter()
+            .find(|variable| {
+                variable.in_use && variable.vendor_guid == *guid && ucs2_eq(&variable.name, name)
+            })
+            .and_then(RuntimeVariable::auth_timestamp)
+            .or_else(|| {
+                self.replay
+                    .iter()
+                    .find(|entry| {
+                        entry.in_use && entry.vendor_guid == *guid && ucs2_eq(&entry.name, name)
+                    })
+                    .map(|entry| entry.timestamp)
+            })
     }
 
     fn allocate_blob(&mut self, data: &[u8]) -> Option<RtSlice> {
@@ -261,6 +389,42 @@ impl RuntimeState {
         dropped
     }
 
+    /// Check whether a replacement can commit without exhausting fixed state.
+    pub fn can_set_variable(
+        &self,
+        guid: &Guid,
+        name: &[u16],
+        data_len: usize,
+        authenticated: bool,
+    ) -> Result<(), RuntimeStateError> {
+        if !is_canonical_name(name) || data_len > MAX_VARIABLE_DATA_SIZE {
+            return Err(RuntimeStateError::InvalidSize);
+        }
+        let existing = self.variables.iter().position(|variable| {
+            variable.in_use && variable.vendor_guid == *guid && ucs2_eq(&variable.name, name)
+        });
+        if existing.is_none() && self.variables.iter().all(|variable| variable.in_use) {
+            return Err(RuntimeStateError::OutOfResources);
+        }
+        if authenticated
+            && self.replay.iter().all(|entry| {
+                entry.in_use && !(entry.vendor_guid == *guid && ucs2_eq(&entry.name, name))
+            })
+        {
+            return Err(RuntimeStateError::OutOfResources);
+        }
+        let old_len = existing.map_or(0, |index| self.variables[index].data_size());
+        if self
+            .used_bytes()
+            .saturating_sub(old_len)
+            .checked_add(data_len)
+            .is_none_or(|required| required > self.blobs.len())
+        {
+            return Err(RuntimeStateError::OutOfResources);
+        }
+        Ok(())
+    }
+
     /// Replace or insert a variable without allocation.
     pub fn set_variable(
         &mut self,
@@ -268,6 +432,7 @@ impl RuntimeState {
         name: &[u16],
         attributes: u32,
         data: &[u8],
+        auth_timestamp: Option<[u8; 16]>,
     ) -> Result<usize, RuntimeStateError> {
         if !is_canonical_name(name) || data.len() > MAX_VARIABLE_DATA_SIZE {
             return Err(RuntimeStateError::InvalidSize);
@@ -284,6 +449,19 @@ impl RuntimeState {
                 .iter()
                 .position(|var| !var.in_use)
                 .ok_or(RuntimeStateError::OutOfResources)?,
+        };
+        let replay_index = if auth_timestamp.is_some() {
+            Some(
+                self.replay
+                    .iter()
+                    .position(|entry| {
+                        entry.in_use && entry.vendor_guid == guid && ucs2_eq(&entry.name, name)
+                    })
+                    .or_else(|| self.replay.iter().position(|entry| !entry.in_use))
+                    .ok_or(RuntimeStateError::OutOfResources)?,
+            )
+        } else {
+            None
         };
 
         // Check capacity before changing metadata, so a failed replacement
@@ -320,8 +498,64 @@ impl RuntimeState {
         variable.vendor_guid = guid;
         variable.attributes = attributes;
         variable.data = blob;
+        variable.auth_timestamp = auth_timestamp.unwrap_or([0; 16]);
         variable.in_use = true;
+        if let Some(replay_index) = replay_index {
+            let replay = &mut self.replay[replay_index];
+            replay.name = variable.name;
+            replay.vendor_guid = guid;
+            replay.timestamp = variable.auth_timestamp;
+            replay.in_use = true;
+        }
         Ok(dropped)
+    }
+
+    /// Record an authenticated replay floor without changing variable data.
+    pub fn record_auth_timestamp(
+        &mut self,
+        guid: Guid,
+        name: &[u16],
+        timestamp: [u8; 16],
+    ) -> Result<(), RuntimeStateError> {
+        if !is_canonical_name(name) || timestamp == [0; 16] {
+            return Err(RuntimeStateError::InvalidSize);
+        }
+        let index = self
+            .replay
+            .iter()
+            .position(|entry| {
+                entry.in_use && entry.vendor_guid == guid && ucs2_eq(&entry.name, name)
+            })
+            .or_else(|| self.replay.iter().position(|entry| !entry.in_use))
+            .ok_or(RuntimeStateError::OutOfResources)?;
+        let entry = &mut self.replay[index];
+        entry.name.fill(0);
+        entry.name[..name.len()].copy_from_slice(name);
+        entry.vendor_guid = guid;
+        entry.timestamp = timestamp;
+        entry.in_use = true;
+        Ok(())
+    }
+
+    /// Delete an authenticated variable while retaining its replay floor.
+    pub fn delete_authenticated_variable(
+        &mut self,
+        guid: &Guid,
+        name: &[u16],
+        timestamp: [u8; 16],
+    ) -> Result<bool, RuntimeStateError> {
+        if !is_canonical_name(name) || timestamp == [0; 16] {
+            return Err(RuntimeStateError::InvalidSize);
+        }
+        let Some(variable_index) = self.variables.iter().position(|variable| {
+            variable.in_use && variable.vendor_guid == *guid && ucs2_eq(&variable.name, name)
+        }) else {
+            return Ok(false);
+        };
+
+        self.record_auth_timestamp(*guid, name, timestamp)?;
+        self.variables[variable_index] = RuntimeVariable::empty();
+        Ok(true)
     }
 
     /// Delete a variable from the runtime cache.
@@ -342,13 +576,27 @@ impl RuntimeState {
         self.iter().map(|(_, data)| data.len()).sum()
     }
 
+    /// Return a copy of the pointer-free Secure Boot status.
+    pub const fn secure_boot_status(&self) -> SecureBootStatus {
+        self.secure_boot
+    }
+
+    /// Mutate Secure Boot status using post-ExitBootServices evidence.
+    pub fn with_secure_boot_status_mut<R>(
+        &mut self,
+        _runtime: &RuntimeCtx<'_>,
+        f: impl FnOnce(&mut SecureBootStatus) -> R,
+    ) -> R {
+        f(&mut self.secure_boot)
+    }
+
     /// Reset the arena before boot state is frozen into it.
-    pub fn reset(&mut self, setup_mode: bool, secure_boot_enabled: bool) {
+    pub fn reset(&mut self, _boot: &BootCtx<'_>, secure_boot: SecureBootStatus) {
         self.variables.fill(RuntimeVariable::empty());
+        self.replay.fill(ReplayEntry::empty());
         self.blobs.fill(0);
         self.blobs_used = 0;
-        self.setup_mode = setup_mode;
-        self.secure_boot_enabled = secure_boot_enabled;
+        self.secure_boot = secure_boot;
     }
 }
 
@@ -396,6 +644,10 @@ pub fn with<R>(f: impl FnOnce(&RuntimeState) -> R) -> R {
 }
 
 /// Mutate the current runtime root without letting a borrow escape.
+///
+/// Phase-sensitive fields additionally require a capability token in their
+/// own APIs. This general accessor remains available for variable handoff and
+/// the pointer-free runtime variable store.
 pub fn with_mut<R>(f: impl FnOnce(&mut RuntimeState) -> R) -> R {
     let _guard = BorrowGuard::acquire();
     let ptr = RUNTIME_STATE_PTR.load(Ordering::Acquire);
@@ -403,6 +655,94 @@ pub fn with_mut<R>(f: impl FnOnce(&mut RuntimeState) -> R) -> R {
     // SAFETY: the borrow guard serializes both shared and mutable access, and
     // the closure cannot retain the reference after this call.
     unsafe { f(&mut *ptr) }
+}
+
+fn exit_boot_services_called() -> bool {
+    let ptr = RUNTIME_STATE_PTR.load(Ordering::Acquire);
+    assert!(!ptr.is_null(), "runtime state is not initialized");
+    // SAFETY: initialization installs the live runtime root. The atomic field
+    // is pointer-free and remains reachable through the converted root.
+    unsafe { (*ptr).exit_boot_services_called.load(Ordering::Acquire) }
+}
+
+/// Dispatch once at a phase-blind UEFI ABI boundary.
+pub fn dispatch<R>(f: impl for<'brand> FnOnce(Phase<'brand>) -> R) -> R {
+    if exit_boot_services_called() {
+        f(Phase::Runtime(RuntimeCtx {
+            _marker: PhantomData,
+        }))
+    } else {
+        f(Phase::Boot(BootCtx {
+            _marker: PhantomData,
+        }))
+    }
+}
+
+/// Run a boot-only operation, failing immediately if ExitBootServices passed.
+///
+/// Runtime-reachable modules must use [`dispatch`] instead. This helper exists
+/// for boot managers and setup UI entry points whose public APIs are not phase
+/// parameterized.
+pub fn assert_boot<R>(f: impl for<'brand> FnOnce(&BootCtx<'brand>) -> R) -> R {
+    assert!(
+        !exit_boot_services_called(),
+        "boot-only operation called after ExitBootServices"
+    );
+    f(&BootCtx {
+        _marker: PhantomData,
+    })
+}
+
+/// Whether ExitBootServices has completed.
+///
+/// Prefer [`dispatch`] for phase-sensitive code. This compatibility query is
+/// retained for unrelated runtime backends while their call graphs migrate.
+pub fn is_runtime() -> bool {
+    exit_boot_services_called()
+}
+
+/// Commit the successful ExitBootServices transition.
+///
+/// This is the sole phase source of truth and must be called only after the
+/// pointer-free boot snapshot and runtime allocator are ready.
+pub fn commit_exit_boot_services() {
+    let ptr = RUNTIME_STATE_PTR.load(Ordering::Acquire);
+    assert!(!ptr.is_null(), "runtime state is not initialized");
+    // SAFETY: initialization installs the live runtime root and this transition
+    // occurs before the OS can invoke runtime services concurrently.
+    let phase = unsafe { &(*ptr).exit_boot_services_called };
+    assert!(
+        phase
+            .compare_exchange(false, true, Ordering::Release, Ordering::Relaxed)
+            .is_ok(),
+        "ExitBootServices phase committed more than once"
+    );
+}
+
+/// Whether SetVirtualAddressMap completed successfully.
+pub fn is_virtual_mode() -> bool {
+    let ptr = RUNTIME_STATE_PTR.load(Ordering::Acquire);
+    if ptr.is_null() {
+        return false;
+    }
+    // SAFETY: initialization installs the live root and relocation updates this
+    // pointer before virtual mode is committed.
+    unsafe { (*ptr).virtual_mode.load(Ordering::Acquire) }
+}
+
+/// Commit virtual runtime mode after all physical FirmwareState access ends.
+pub fn commit_virtual_mode() {
+    let ptr = RUNTIME_STATE_PTR.load(Ordering::Acquire);
+    assert!(!ptr.is_null(), "runtime state is not initialized");
+    // SAFETY: initialization installs the live root and SVAM has already
+    // relocated the root before this one-way transition.
+    let virtual_mode = unsafe { &(*ptr).virtual_mode };
+    assert!(
+        virtual_mode
+            .compare_exchange(false, true, Ordering::Release, Ordering::Relaxed)
+            .is_ok(),
+        "virtual mode committed more than once"
+    );
 }
 
 /// Physical address of the runtime root.
@@ -439,8 +779,23 @@ const _: () = {
 };
 
 #[cfg(test)]
+extern crate std;
+
+#[cfg(test)]
 mod tests {
     use super::*;
+    use std::boxed::Box;
+
+    fn new_state() -> Box<RuntimeState> {
+        let mut state = Box::<RuntimeState>::new_uninit();
+        // A zeroed RuntimeState is valid (all flags are false and empty
+        // metadata has a null GUID). Build it in place so the 1 MiB runtime
+        // arena does not consume the test thread's stack.
+        unsafe {
+            state.as_mut_ptr().write_bytes(0, 1);
+            state.assume_init()
+        }
+    }
 
     fn guid(id: u32) -> Guid {
         Guid::from_fields(id, 0, 0, 0, 0, &[0; 6])
@@ -451,7 +806,10 @@ mod tests {
     }
 
     fn set(state: &mut RuntimeState, id: u32, name_id: u16, data: &[u8]) {
-        assert_eq!(state.set_variable(guid(id), &name(name_id), 7, data), Ok(0));
+        assert_eq!(
+            state.set_variable(guid(id), &name(name_id), 7, data, None),
+            Ok(0)
+        );
     }
 
     fn stored_payload(state: &RuntimeState, id: u32, name_id: u16) -> &[u8] {
@@ -462,15 +820,50 @@ mod tests {
     }
 
     #[test]
+    fn secure_boot_status_enforces_mode_transitions() {
+        let mut status = SecureBootStatus::SETUP;
+        assert!(!status.enable());
+        status.enter_user_mode();
+        assert!(status.enable());
+        status.enter_setup_mode();
+        assert_eq!(status, SecureBootStatus::SETUP);
+    }
+
+    #[test]
+    fn post_ebs_capability_mutates_the_authoritative_runtime_status() {
+        init();
+        let mut frozen = SecureBootStatus::SETUP;
+        frozen.enter_user_mode();
+        dispatch(|phase| match phase {
+            Phase::Boot(boot) => with_mut(|state| state.reset(&boot, frozen)),
+            Phase::Runtime(_) => panic!("runtime capability minted before ExitBootServices"),
+        });
+        commit_exit_boot_services();
+        assert!(std::panic::catch_unwind(|| assert_boot(|_| ())).is_err());
+        dispatch(|phase| match phase {
+            Phase::Runtime(runtime) => with_mut(|state| {
+                state.with_secure_boot_status_mut(&runtime, |status| {
+                    assert!(status.enable());
+                });
+            }),
+            Phase::Boot(_) => panic!("boot capability minted after ExitBootServices"),
+        });
+
+        assert!(with(|state| {
+            state.secure_boot_status().secure_boot_enabled()
+        }));
+    }
+
+    #[test]
     fn stores_and_resolves_payload_by_offset() {
-        let mut state = RuntimeState::new();
+        let mut state = new_state();
         set(&mut state, 1, 1, b"Crab");
         assert_eq!(stored_payload(&state, 1, 1), b"Crab");
     }
 
     #[test]
     fn replacement_compacts_a_full_arena() {
-        let mut state = RuntimeState::new();
+        let mut state = new_state();
         let payload = [0x5a; MAX_VARIABLE_DATA_SIZE];
         for id in 0..(BLOB_ARENA_SIZE / MAX_VARIABLE_DATA_SIZE) {
             set(&mut state, id as u32, id as u16 + 1, &payload);
@@ -484,27 +877,39 @@ mod tests {
     }
 
     #[test]
-    fn failed_replacement_preserves_previous_value() {
-        let mut state = RuntimeState::new();
-        set(&mut state, 0, 1, b"x");
+    fn stores_all_maximum_sized_boot_cache_variables() {
+        let mut state = new_state();
         let payload = [0x5a; MAX_VARIABLE_DATA_SIZE];
-        for id in 1..(BLOB_ARENA_SIZE / MAX_VARIABLE_DATA_SIZE) {
+
+        for id in 0..MAX_VARIABLES {
             set(&mut state, id as u32, id as u16 + 1, &payload);
         }
-        let tail = [0x33; MAX_VARIABLE_DATA_SIZE - 1];
-        set(&mut state, 63, 63, &tail);
+
+        assert_eq!(state.used_bytes(), MAX_VARIABLES * MAX_VARIABLE_DATA_SIZE);
+        for id in 0..MAX_VARIABLES {
+            assert_eq!(stored_payload(&state, id as u32, id as u16 + 1), payload);
+        }
+    }
+
+    #[test]
+    fn full_variable_table_rejects_a_new_variable() {
+        let mut state = new_state();
+        let payload = [0x5a; MAX_VARIABLE_DATA_SIZE];
+        for id in 0..MAX_VARIABLES {
+            set(&mut state, id as u32, id as u16 + 1, &payload);
+        }
         assert_eq!(state.used_bytes(), BLOB_ARENA_SIZE);
 
         assert_eq!(
-            state.set_variable(guid(0), &name(1), 7, b"xx"),
+            state.set_variable(guid(MAX_VARIABLES as u32), &name(65), 7, b"new", None),
             Err(RuntimeStateError::OutOfResources)
         );
-        assert_eq!(stored_payload(&state, 0, 1), b"x");
+        assert_eq!(stored_payload(&state, 0, 1), payload);
     }
 
     #[test]
     fn compaction_preserves_payloads_when_slot_and_arena_order_differ() {
-        let mut state = RuntimeState::new();
+        let mut state = new_state();
         set(&mut state, 1, 1, b"old");
         set(&mut state, 2, 2, b"second");
         set(&mut state, 1, 1, b"replacement");
@@ -516,7 +921,7 @@ mod tests {
 
     #[test]
     fn compaction_reports_corrupt_entries() {
-        let mut state = RuntimeState::new();
+        let mut state = new_state();
         set(&mut state, 1, 1, b"value");
         state.variables[0].data.off = BLOB_ARENA_SIZE as u32;
         assert_eq!(state.compact(), 1);
@@ -525,31 +930,62 @@ mod tests {
 
     #[test]
     fn accepts_maximum_name_and_rejects_malformed_names() {
-        let mut state = RuntimeState::new();
+        let mut state = new_state();
         assert_eq!(
-            state.set_variable(guid(1), &[1], 7, b"value"),
+            state.set_variable(guid(1), &[1], 7, b"value", None),
             Err(RuntimeStateError::InvalidSize)
         );
 
         let mut maximum = [1; MAX_VARIABLE_NAME_LEN];
         maximum[MAX_VARIABLE_NAME_LEN - 1] = 0;
-        assert_eq!(state.set_variable(guid(1), &maximum, 7, b"value"), Ok(0));
+        assert_eq!(
+            state.set_variable(guid(1), &maximum, 7, b"value", None),
+            Ok(0)
+        );
 
         let mut overlong = [1; MAX_VARIABLE_NAME_LEN + 1];
         overlong[MAX_VARIABLE_NAME_LEN] = 0;
         assert_eq!(
-            state.set_variable(guid(2), &overlong, 7, b"value"),
+            state.set_variable(guid(2), &overlong, 7, b"value", None),
             Err(RuntimeStateError::InvalidSize)
         );
     }
 
     #[test]
     fn deletion_releases_space_on_next_compaction() {
-        let mut state = RuntimeState::new();
+        let mut state = new_state();
         set(&mut state, 1, 1, b"one");
         set(&mut state, 2, 2, b"two");
         assert!(state.delete_variable(&guid(1), &name(1)));
         set(&mut state, 2, 2, b"updated");
         assert_eq!(state.used_bytes(), 7);
+    }
+
+    #[test]
+    fn authenticated_deletion_keeps_replay_timestamp() {
+        let mut state = new_state();
+        let timestamp = [0x5a; 16];
+        state
+            .set_variable(guid(1), &name(1), 7, b"value", Some(timestamp))
+            .unwrap();
+        for value in 1..8u8 {
+            let mut next_timestamp = timestamp;
+            next_timestamp[0] = value;
+            state
+                .set_variable(guid(1), &name(1), 7, b"value", Some(next_timestamp))
+                .unwrap();
+        }
+        let mut final_timestamp = timestamp;
+        final_timestamp[0] = 9;
+        assert!(
+            state
+                .delete_authenticated_variable(&guid(1), &name(1), final_timestamp)
+                .unwrap()
+        );
+        assert!(state.get(&guid(1), &name(1)).is_none());
+        assert_eq!(
+            state.auth_timestamp(&guid(1), &name(1)),
+            Some(final_timestamp)
+        );
     }
 }
