@@ -18,17 +18,12 @@ platform-entry = []
 global-allocator = []
 # Enable logging output to framebuffer (very slow, for debugging only)
 fb-log = []
-# Enable runtime services serial debug logging (post-SetVirtualAddressMap)
-rt-debug = []
-# Enable runtime services log buffer (records SetVariable calls after
-# ExitBootServices into a warm-reboot-persistent ring buffer; requires
-# _rt_log_start/_rt_log_end linker symbols)
-rt-log = []
 # Enable graphical UI with mouse support (PS/2 and USB HID mouse drivers,
 # cursor rendering, SimplePointerProtocol, and rlvgl-based setup utility)
 ui = []
 
 [dependencies]
+crabefi-runtime-abi = { path = "../crabefi-runtime-abi" }
 r-efi = { workspace = true }
 log = { workspace = true }
 heapless = { workspace = true }
@@ -70,13 +65,6 @@ const-oid = { version = "0.9", default-features = false }
 signature = { version = "2.2", default-features = false }
 cms = { version = "0.2", default-features = false }
 spki = { version = "0.8", default-features = false }
-
-# Serialization for variable store
-serde = { version = "1.0", default-features = false, features = [
-  "derive",
-  "alloc",
-] }
-postcard = { version = "1.0", default-features = false, features = ["alloc"] }
 
 [target.'cfg(target_arch = "x86_64")'.dependencies]
 x86_64 = "0.15"

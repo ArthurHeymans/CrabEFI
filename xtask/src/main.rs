@@ -19,8 +19,9 @@
 mod disk;
 mod qemu;
 mod rom;
+mod runtime;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
@@ -314,6 +315,8 @@ fn cmd_build(release: bool, ui: bool, arch: Arch, machine: Machine) -> Result<()
     println!("Building CrabEFI ({})...", label);
 
     let project_root = project_root();
+    println!("Building and auditing separate Runtime Services image...");
+    let runtime = runtime::build(arch)?;
 
     let mut cmd = std::process::Command::new("cargo");
     cmd.arg("build");
@@ -333,6 +336,11 @@ fn cmd_build(release: bool, ui: bool, arch: Arch, machine: Machine) -> Result<()
         Arch::Riscv64 => "riscv64gc-unknown-none-elf",
     };
     cmd.arg("--target").arg(target_triple);
+    cmd.env("RUNTIME_IMAGE_PATH", &runtime.image);
+    cmd.env(
+        "RUNTIME_IMAGE_SHA256",
+        runtime.digest.map(|byte| format!("{byte:02x}")).concat(),
+    );
 
     // Architecture-specific: set PAYLOAD_BASE for the linker script.
     match arch {
@@ -364,6 +372,7 @@ fn cmd_build(release: bool, ui: bool, arch: Arch, machine: Machine) -> Result<()
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn cmd_run(
     coreboot_rom: Option<String>,
     ahci: bool,
@@ -503,6 +512,7 @@ fn cmd_screenshot(
     qemu::run_screenshot(&config, None, Path::new(out), timeout_s)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn cmd_test(
     coreboot_rom: Option<String>,
     app: &str,
@@ -827,7 +837,7 @@ fn find_test_app_efi(name: &str, arch: Arch) -> Result<String> {
     for entry in std::fs::read_dir(&target_dir)? {
         let entry = entry?;
         let path = entry.path();
-        if path.extension().map_or(false, |e| e == "efi") {
+        if path.extension().is_some_and(|e| e == "efi") {
             return Ok(path.to_string_lossy().to_string());
         }
     }

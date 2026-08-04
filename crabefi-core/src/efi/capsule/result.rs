@@ -81,7 +81,7 @@ impl CapsuleResult {
 /// - `index`: The capsule index (0, 1, 2, ...).
 /// - `result`: The capsule application result.
 pub fn record_capsule_result(index: usize, result: &CapsuleResult) {
-    use crate::efi::varstore;
+    use crate::efi::runtime_image::client::variables;
 
     // Build variable name: "Capsule####" in UTF-16
     let name_str = alloc::format!("Capsule{:04X}", index);
@@ -110,23 +110,18 @@ pub fn record_capsule_result(index: usize, result: &CapsuleResult) {
     // Attributes: NV + BS + RT
     let attributes = 0x07u32; // NV | BS | RT
 
-    // Write the variable
-    if let Err(e) =
-        varstore::persist_variable(&EFI_CAPSULE_REPORT_GUID, &name_u16, attributes, &data)
-    {
-        log::warn!(
-            "Failed to record capsule result for index {}: {:?}",
-            index,
-            e
-        );
-    } else {
+    let status = variables::set(&EFI_CAPSULE_REPORT_GUID, &name_u16, attributes, &data);
+    if status == r_efi::efi::Status::SUCCESS {
         log::info!(
             "Recorded capsule result: {} -> {:?}",
             name_str,
             result.status
         );
+    } else {
+        log::warn!(
+            "Failed to record capsule result for index {}: {:?}",
+            index,
+            status
+        );
     }
-
-    // Also update in-memory cache
-    varstore::update_variable_in_memory(&EFI_CAPSULE_REPORT_GUID, &name_u16, attributes, &data);
 }

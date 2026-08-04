@@ -14,6 +14,7 @@
 
 use core::sync::atomic::{AtomicBool, Ordering};
 
+pub use crabefi_runtime_abi::MemoryDescriptor;
 use heapless::Vec;
 use r_efi::efi;
 
@@ -189,53 +190,12 @@ pub mod attributes {
     pub const EFI_MEMORY_RAM_CAPS: u64 = EFI_MEMORY_WC | EFI_MEMORY_WT | EFI_MEMORY_WB;
 }
 
-/// EFI Memory Descriptor
-#[derive(Debug, Clone, Copy)]
-#[repr(C)]
-pub struct MemoryDescriptor {
-    /// Type of memory region
-    pub memory_type: u32,
-    /// Reserved padding
-    pub padding: u32,
-    /// Physical start address (must be 4KB aligned)
-    pub physical_start: u64,
-    /// Virtual start address
-    pub virtual_start: u64,
-    /// Number of 4KB pages
-    pub number_of_pages: u64,
-    /// Memory attributes
-    pub attribute: u64,
+trait MemoryDescriptorExt {
+    fn range(&self) -> MemoryRange;
+    fn get_memory_type(&self) -> Option<MemoryType>;
 }
 
-impl MemoryDescriptor {
-    /// Create a new memory descriptor
-    pub fn new(
-        memory_type: MemoryType,
-        physical_start: u64,
-        number_of_pages: u64,
-        attribute: u64,
-    ) -> Self {
-        Self {
-            memory_type: memory_type as u32,
-            padding: 0,
-            physical_start,
-            virtual_start: 0,
-            number_of_pages,
-            attribute,
-        }
-    }
-
-    /// Get the end address (exclusive)
-    ///
-    /// Returns u64::MAX if the calculation would overflow, which ensures
-    /// the region comparison logic remains safe.
-    pub fn end(&self) -> u64 {
-        self.number_of_pages
-            .checked_mul(PAGE_SIZE)
-            .and_then(|size| self.physical_start.checked_add(size))
-            .unwrap_or(u64::MAX)
-    }
-
+impl MemoryDescriptorExt for MemoryDescriptor {
     fn range(&self) -> MemoryRange {
         MemoryRange {
             start: self.physical_start,
@@ -243,10 +203,23 @@ impl MemoryDescriptor {
         }
     }
 
-    /// Get the memory type as enum
-    pub fn get_memory_type(&self) -> Option<MemoryType> {
+    fn get_memory_type(&self) -> Option<MemoryType> {
         MemoryType::try_from(self.memory_type).ok()
     }
+}
+
+fn memory_descriptor(
+    memory_type: MemoryType,
+    physical_start: u64,
+    number_of_pages: u64,
+    attribute: u64,
+) -> MemoryDescriptor {
+    MemoryDescriptor::new(
+        memory_type as u32,
+        physical_start,
+        number_of_pages,
+        attribute,
+    )
 }
 
 fn can_merge(left: &MemoryDescriptor, right: &MemoryDescriptor) -> bool {
@@ -438,7 +411,7 @@ impl MemoryAllocator {
         if split.keep_before {
             self.insert_descriptor_prechecked(
                 insert_at,
-                MemoryDescriptor::new(
+                memory_descriptor(
                     original_type,
                     descriptor.physical_start,
                     (range.start - descriptor.physical_start) / PAGE_SIZE,
@@ -451,7 +424,7 @@ impl MemoryAllocator {
         let retyped_index = insert_at;
         self.insert_descriptor_prechecked(
             insert_at,
-            MemoryDescriptor::new(
+            memory_descriptor(
                 memory_type,
                 range.start,
                 range.number_of_pages(PAGE_SIZE),
@@ -463,7 +436,7 @@ impl MemoryAllocator {
         if split.keep_after {
             self.insert_descriptor_prechecked(
                 insert_at,
-                MemoryDescriptor::new(
+                memory_descriptor(
                     original_type,
                     range.end,
                     (descriptor.end() - range.end) / PAGE_SIZE,
@@ -503,8 +476,6 @@ impl MemoryAllocator {
                 PlatMemType::AcpiReclaimable => MemoryType::AcpiReclaimMemory,
                 PlatMemType::AcpiNvs => MemoryType::AcpiMemoryNvs,
                 PlatMemType::Mmio => MemoryType::MemoryMappedIo,
-                PlatMemType::RuntimeServicesCode => MemoryType::RuntimeServicesCode,
-                PlatMemType::RuntimeServicesData => MemoryType::RuntimeServicesData,
                 PlatMemType::BootServicesData => MemoryType::BootServicesData,
             };
 
@@ -527,22 +498,12 @@ impl MemoryAllocator {
                 memory_type
             );
 
-            let attribute = memory_type.default_attributes();
-
-            // RuntimeServices types get the RUNTIME attribute.  Runtime data
-            // should also be execute-protected, matching carve_out() and the
-            // EFI memory attributes table expectations.
-            let attribute = match region.region_type {
-                PlatMemType::RuntimeServicesCode => {
-                    (attribute | attributes::EFI_MEMORY_RUNTIME) & !attributes::EFI_MEMORY_XP
-                }
-                PlatMemType::RuntimeServicesData => {
-                    attribute | attributes::EFI_MEMORY_RUNTIME | attributes::EFI_MEMORY_XP
-                }
-                _ => attribute,
-            };
-
-            let desc = MemoryDescriptor::new(memory_type, region.base, num_pages, attribute);
+            let desc = memory_descriptor(
+                memory_type,
+                region.base,
+                num_pages,
+                memory_type.default_attributes(),
+            );
 
             if self.entries.push(desc).is_err() {
                 log::warn!("Memory map full, ignoring region at {:#x}", region.base);
@@ -644,7 +605,7 @@ impl MemoryAllocator {
             attribute |= attributes::EFI_MEMORY_XP;
         }
 
-        let desc = MemoryDescriptor::new(memory_type, physical_start, num_pages, attribute);
+        let desc = memory_descriptor(memory_type, physical_start, num_pages, attribute);
 
         if self.entries.push(desc).is_err() {
             return Err(efi::Status::OUT_OF_RESOURCES);
@@ -706,7 +667,7 @@ impl MemoryAllocator {
                     return Err(efi::Status::INVALID_PARAMETER);
                 }
                 // No containing entry — add as a new entry
-                let desc = MemoryDescriptor::new(
+                let desc = memory_descriptor(
                     target_type,
                     addr,
                     num_pages,
@@ -741,14 +702,14 @@ impl MemoryAllocator {
         if entry.physical_start < addr {
             let before_pages = (addr - entry.physical_start) / PAGE_SIZE;
             let before =
-                MemoryDescriptor::new(original_type, entry.physical_start, before_pages, attribute);
+                memory_descriptor(original_type, entry.physical_start, before_pages, attribute);
             if self.entries.push(before).is_err() {
                 return Err(efi::Status::OUT_OF_RESOURCES);
             }
         }
 
         // The target region
-        let target = MemoryDescriptor::new(target_type, addr, num_pages, attribute);
+        let target = memory_descriptor(target_type, addr, num_pages, attribute);
         if self.entries.push(target).is_err() {
             return Err(efi::Status::OUT_OF_RESOURCES);
         }
@@ -756,7 +717,7 @@ impl MemoryAllocator {
         // Region after the target portion (keep original type)
         if entry.end() > end {
             let after_pages = (entry.end() - end) / PAGE_SIZE;
-            let after = MemoryDescriptor::new(original_type, end, after_pages, attribute);
+            let after = memory_descriptor(original_type, end, after_pages, attribute);
             if self.entries.push(after).is_err() {
                 return Err(efi::Status::OUT_OF_RESOURCES);
             }
@@ -870,8 +831,12 @@ impl MemoryAllocator {
             // Some loaders claim a subrange of their image allocation. Split
             // both the descriptor and ownership record so the three ranges can
             // subsequently be freed independently.
-            let loader_types = [MemoryType::LoaderCode, MemoryType::LoaderData];
-            let descriptor_index = match self.find_descriptor(range, &loader_types) {
+            let claimable_types = [
+                MemoryType::LoaderCode,
+                MemoryType::LoaderData,
+                MemoryType::RuntimeServicesData,
+            ];
+            let descriptor_index = match self.find_descriptor(range, &claimable_types) {
                 Some(index) => index,
                 None => return efi::Status::NOT_FOUND,
             };
@@ -1428,6 +1393,24 @@ pub fn get_map_key() -> usize {
 ///
 /// Returns the memory type if the address is within a known memory region,
 /// or None if the address is not in any known region.
+pub fn copy_runtime_descriptors(output: &mut [MemoryDescriptor]) -> Result<usize, efi::Status> {
+    let allocator = state::allocator();
+    let runtime = allocator
+        .entries
+        .iter()
+        .filter(|entry| entry.attribute & attributes::EFI_MEMORY_RUNTIME != 0);
+    let mut count = 0usize;
+    for descriptor in runtime {
+        let Some(slot) = output.get_mut(count) else {
+            return Err(efi::Status::BUFFER_TOO_SMALL);
+        };
+        *slot = *descriptor;
+        count += 1;
+    }
+    Ok(count)
+}
+
+/// Find the memory type for a given physical address.
 pub fn get_memory_type_at(address: u64) -> Option<MemoryType> {
     let alloc = state::allocator();
     alloc
@@ -1435,6 +1418,33 @@ pub fn get_memory_type_at(address: u64) -> Option<MemoryType> {
         .iter()
         .find(|entry| address >= entry.physical_start && address < entry.end())
         .and_then(|entry| MemoryType::try_from(entry.memory_type).ok())
+}
+
+/// Verify complete, gap-free descriptor coverage of a physical interval.
+pub fn range_has_memory_type(base: u64, size: u64, memory_type: MemoryType) -> bool {
+    let Some(end) = base.checked_add(size) else {
+        return false;
+    };
+    if size == 0 {
+        return false;
+    }
+    let allocator = state::allocator();
+    let mut covered = base;
+    for descriptor in allocator.entries.iter() {
+        if descriptor.end() <= covered {
+            continue;
+        }
+        if descriptor.physical_start > covered
+            || MemoryType::try_from(descriptor.memory_type).ok() != Some(memory_type)
+        {
+            return false;
+        }
+        covered = descriptor.end().min(end);
+        if covered == end {
+            return true;
+        }
+    }
+    false
 }
 
 /// Get the memory map
@@ -1460,11 +1470,48 @@ pub fn exit_boot_services(map_key: usize) -> efi::Status {
     state::with_allocator_mut(|alloc| alloc.exit_boot_services(map_key))
 }
 
+/// Allocate one contiguous runtime image and split its leading code domain.
+///
+/// The normalized format covers the complete allocation with a leading code
+/// section followed by immutable and mutable data sections. The initial
+/// RuntimeServicesData allocation makes choosing a contiguous base atomic; the
+/// exact code subclaim then splits both the map
+/// descriptor and allocator ownership record.
+pub fn allocate_runtime_image_layout(
+    image_pages: u64,
+    code_pages: u64,
+) -> Result<u64, efi::Status> {
+    if image_pages == 0 || code_pages == 0 || code_pages > image_pages {
+        return Err(efi::Status::INVALID_PARAMETER);
+    }
+    let mut base = 0;
+    let status = allocate_pages(
+        AllocateType::AllocateAnyPages,
+        MemoryType::RuntimeServicesData,
+        image_pages,
+        &mut base,
+    );
+    if status != efi::Status::SUCCESS {
+        return Err(status);
+    }
+    let mut code = base;
+    let status = allocate_pages(
+        AllocateType::AllocateAddress,
+        MemoryType::RuntimeServicesCode,
+        code_pages,
+        &mut code,
+    );
+    if status != efi::Status::SUCCESS {
+        let _ = free_pages(base, image_pages);
+        return Err(status);
+    }
+    Ok(base)
+}
+
 // Lock ordering: never hold POOL_STATE while entering the page allocator. Pool
 // growth deliberately drops this lock before AllocatePages to avoid re-entry.
 static POOL_STATE: spin::Mutex<PoolState> = spin::Mutex::new(PoolState::new());
 static POOL_DISABLED: AtomicBool = AtomicBool::new(false);
-
 const BOOT_POOL_CHUNK_PAGES: u64 = 64;
 const RUNTIME_POOL_CHUNK_PAGES: u64 = 4;
 
@@ -1596,32 +1643,27 @@ pub fn free_pool(buffer: *mut u8) -> efi::Status {
 // Linker symbols for section boundaries (only when CrabEFI owns the binary layout).
 #[cfg(feature = "platform-entry")]
 unsafe extern "C" {
-    static __runtime_code_start: u8;
-    static __runtime_code_end: u8;
-    static __runtime_data_start: u8;
-    static __runtime_data_end: u8;
+    static __boot_code_start: u8;
+    static __boot_code_end: u8;
+    static __boot_data_start: u8;
+    static __boot_data_end: u8;
 }
 
-/// Reserve the CrabEFI runtime regions using linker-provided section boundaries.
+/// Reserve the CrabEFI boot image regions using linker-provided section boundaries.
 ///
 /// Only available with the `platform-entry` feature (when CrabEFI owns
-/// the linker script). Library consumers use `PlatformConfig.runtime_region`
-/// instead — see `efi::init_from_platform()`.
+/// the linker script). Library consumers describe the embedding image as
+/// BootServices memory in the platform memory map.
+///
+/// The complete payload, including stack and page tables, is reclaimed after
+/// ExitBootServices. Only the independent runtime image survives.
 #[cfg(feature = "platform-entry")]
-///
-/// This marks the memory containing our code and data sections so that the OS
-/// keeps them mapped after ExitBootServices. The boundaries come from the
-/// linker script symbols.
-///
-/// CrabEFI lives in a coreboot `Reserved` region. We carve RuntimeServicesCode
-/// and RuntimeServicesData from it (or from ConventionalMemory if the layout
-/// differs). The remaining portion stays as the original type.
-pub fn reserve_runtime_region() {
+pub fn reserve_boot_image_region() {
     // Get section boundaries from linker symbols
-    let code_start = unsafe { &__runtime_code_start as *const u8 as u64 };
-    let code_end = unsafe { &__runtime_code_end as *const u8 as u64 };
-    let data_start = unsafe { &__runtime_data_start as *const u8 as u64 };
-    let data_end = unsafe { &__runtime_data_end as *const u8 as u64 };
+    let code_start = unsafe { &__boot_code_start as *const u8 as u64 };
+    let code_end = unsafe { &__boot_code_end as *const u8 as u64 };
+    let data_start = unsafe { &__boot_data_start as *const u8 as u64 };
+    let data_end = unsafe { &__boot_data_end as *const u8 as u64 };
 
     // Align to page boundaries
     // Code region: round start down, round end up
@@ -1648,19 +1690,19 @@ pub fn reserve_runtime_region() {
     };
 
     log::info!(
-        "Runtime code region from linker: {:#x}-{:#x} ({} pages)",
+        "Boot code region from linker: {:#x}-{:#x} ({} pages)",
         code_start_aligned,
         code_end_aligned,
         code_pages
     );
     log::info!(
-        "Runtime data region from linker: {:#x}-{:#x} ({} pages)",
+        "Boot data region from linker: {:#x}-{:#x} ({} pages)",
         data_start_aligned,
         data_end_aligned,
         data_pages
     );
 
-    // Types we can carve runtime regions from: the payload sits in either
+    // Types we can carve boot image regions from: the payload sits in either
     // a Reserved region (coreboot marks the payload area as CB_MEM_RESERVED)
     // or ConventionalMemory (if the mapping differs).
     let source_types = &[
@@ -1673,19 +1715,19 @@ pub fn reserve_runtime_region() {
         alloc.carve_out_from(
             code_start_aligned,
             code_pages,
-            MemoryType::RuntimeServicesCode,
+            MemoryType::BootServicesCode,
             source_types,
         )
     }) {
         Ok(()) => {
             log::info!(
-                "Reserved runtime services code region: {:#x}-{:#x}",
+                "Reserved boot image code region: {:#x}-{:#x}",
                 code_start_aligned,
                 code_end_aligned
             );
         }
         Err(e) => {
-            log::error!("CRITICAL: Failed to reserve runtime code region: {:?}", e);
+            log::error!("CRITICAL: Failed to reserve boot code region: {:?}", e);
         }
     }
 
@@ -1696,19 +1738,19 @@ pub fn reserve_runtime_region() {
             alloc.carve_out_from(
                 data_start_aligned,
                 data_pages,
-                MemoryType::RuntimeServicesData,
+                MemoryType::BootServicesData,
                 source_types,
             )
         }) {
             Ok(()) => {
                 log::info!(
-                    "Reserved runtime services data region: {:#x}-{:#x}",
+                    "Reserved boot image data region: {:#x}-{:#x}",
                     data_start_aligned,
                     data_end_aligned
                 );
             }
             Err(e) => {
-                log::error!("CRITICAL: Failed to reserve runtime data region: {:?}", e);
+                log::error!("CRITICAL: Failed to reserve boot data region: {:?}", e);
             }
         }
     }

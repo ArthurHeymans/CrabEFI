@@ -38,11 +38,12 @@ mod structures;
 pub(crate) mod time;
 mod variables;
 
-pub use authenticode::verify_pe_image_secure_boot;
 pub use crypto::*;
 pub use signature::*;
 pub use structures::*;
 pub use variables::*;
+
+use core::sync::atomic::{AtomicBool, Ordering};
 
 use r_efi::efi::Guid;
 
@@ -312,74 +313,87 @@ pub const WIN_CERT_TYPE_EFI_GUID: u16 = 0x0EF1;
 const SECURE_BOOT_ENABLE_ATTRS: u32 =
     attributes::NON_VOLATILE | attributes::BOOTSERVICE_ACCESS | attributes::RUNTIME_ACCESS;
 
-/// Check if we're in Setup Mode
+static SETUP_MODE: AtomicBool = AtomicBool::new(true);
+static SECURE_BOOT_ENABLED: AtomicBool = AtomicBool::new(false);
+
+/// Read the image-owned standard SetupMode variable.
 pub fn is_setup_mode() -> bool {
-    crate::state::efi().setup_mode
+    crate::efi::runtime_image::client::variables::get(
+        &EFI_GLOBAL_VARIABLE_GUID,
+        variables::SETUP_MODE_NAME,
+    )
+    .and_then(|(_, data)| data.first().copied())
+        != Some(0)
 }
 
-/// Check if Secure Boot is enabled
+/// Read the image-owned standard SecureBoot variable.
 pub fn is_secure_boot_enabled() -> bool {
-    crate::state::efi().secure_boot_enabled
+    crate::efi::runtime_image::client::variables::get(
+        &EFI_GLOBAL_VARIABLE_GUID,
+        variables::SECURE_BOOT_NAME,
+    )
+    .and_then(|(_, data)| data.first().copied())
+        == Some(1)
 }
 
-/// Enter User Mode (called when PK is enrolled)
+/// Verify a PE image after refreshing disposable boot-only key caches through
+/// the standard Runtime Services GetVariable entry point.
+pub fn verify_pe_image_secure_boot(pe_data: &[u8]) -> Result<bool, AuthError> {
+    boot::refresh_key_databases();
+    authenticode::verify_pe_image_secure_boot(pe_data)
+}
+
+/// Enter User Mode (called when PK is enrolled).
 pub fn enter_user_mode() {
-    crate::state::with_efi_mut(|efi| efi.setup_mode = false);
+    SETUP_MODE.store(false, Ordering::Release);
     log::info!("Secure Boot: Entering User Mode");
 }
 
-/// Enter Setup Mode (called when PK is deleted)
+/// Enter Setup Mode (called when PK is deleted).
 pub fn enter_setup_mode() {
-    crate::state::with_efi_mut(|efi| {
-        efi.setup_mode = true;
-        efi.secure_boot_enabled = false;
-    });
+    SETUP_MODE.store(true, Ordering::Release);
+    SECURE_BOOT_ENABLED.store(false, Ordering::Release);
     log::info!("Secure Boot: Entering Setup Mode");
 }
 
-/// Enable Secure Boot (only valid in User Mode)
+/// Enable Secure Boot (only valid in User Mode).
 pub fn enable_secure_boot() {
     if !is_setup_mode() {
-        crate::state::with_efi_mut(|efi| efi.secure_boot_enabled = true);
+        SECURE_BOOT_ENABLED.store(true, Ordering::Release);
         log::info!("Secure Boot: Enabled");
-        // Persist the user preference to SPI flash
         persist_secure_boot_enable_preference(true);
     }
 }
 
-/// Disable Secure Boot
+pub(crate) fn set_secure_boot_derived(enabled: bool) {
+    SECURE_BOOT_ENABLED.store(enabled, Ordering::Release);
+}
+
+/// Disable Secure Boot.
 pub fn disable_secure_boot() {
-    crate::state::with_efi_mut(|efi| efi.secure_boot_enabled = false);
+    SECURE_BOOT_ENABLED.store(false, Ordering::Release);
     log::info!("Secure Boot: Disabled");
-    // Persist the user preference to SPI flash
     persist_secure_boot_enable_preference(false);
 }
 
 /// Persist the SecureBootEnable preference to non-volatile storage
 fn persist_secure_boot_enable_preference(enabled: bool) {
-    use crate::efi::varstore::{persist_variable, update_variable_in_memory};
     use variables::SECURE_BOOT_ENABLE_NAME;
 
     let value: u8 = if enabled { 1 } else { 0 };
-
-    // Update the in-memory cache
-    update_variable_in_memory(
+    let status = crate::efi::runtime_image::client::variables::set(
         &EFI_GLOBAL_VARIABLE_GUID,
         SECURE_BOOT_ENABLE_NAME,
         SECURE_BOOT_ENABLE_ATTRS,
         &[value],
     );
-
-    // Persist to SPI flash
-    if let Err(e) = persist_variable(
-        &EFI_GLOBAL_VARIABLE_GUID,
-        SECURE_BOOT_ENABLE_NAME,
-        SECURE_BOOT_ENABLE_ATTRS,
-        &[value],
-    ) {
-        log::warn!("Failed to persist SecureBootEnable preference: {:?}", e);
-    } else {
+    if status == r_efi::efi::Status::SUCCESS {
         log::debug!("SecureBootEnable preference persisted: {}", enabled);
+    } else {
+        log::warn!(
+            "Failed to persist SecureBootEnable preference: {:?}",
+            status
+        );
     }
 }
 

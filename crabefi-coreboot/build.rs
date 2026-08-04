@@ -1,9 +1,22 @@
 //! Build script for the coreboot payload binary.
 //!
-//! Handles linker script selection and architecture-specific PAYLOAD_BASE symbols.
+//! Handles linker script selection, runtime-image embedding, and payload symbols.
+
+use crabefi_runtime_abi::{ValidatedImage, architecture};
+use sha2::{Digest, Sha256};
 
 fn main() {
     let target = std::env::var("TARGET").unwrap_or_default();
+    let runtime_architecture = if target.starts_with("x86_64") {
+        architecture::X86_64
+    } else if target.starts_with("aarch64") {
+        architecture::AARCH64
+    } else if target.starts_with("riscv64") {
+        architecture::RISCV64
+    } else {
+        panic!("unsupported coreboot payload target: {target}");
+    };
+    embed_runtime_image(runtime_architecture);
     let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap();
     let manifest_path = std::path::Path::new(&manifest_dir);
 
@@ -43,4 +56,32 @@ fn main() {
             std::env::var("PAYLOAD_BASE").unwrap_or_else(|_| "0x81000000".to_string());
         println!("cargo:rustc-link-arg=--defsym=PAYLOAD_BASE={payload_base}");
     }
+}
+
+fn embed_runtime_image(expected_architecture: u16) {
+    println!("cargo:rerun-if-env-changed=RUNTIME_IMAGE_PATH");
+    println!("cargo:rerun-if-env-changed=RUNTIME_IMAGE_SHA256");
+    let source = std::env::var("RUNTIME_IMAGE_PATH")
+        .expect("RUNTIME_IMAGE_PATH is mandatory; build through ./crabefi build");
+    println!("cargo:rerun-if-changed={source}");
+    let bytes = std::fs::read(&source).expect("read normalized runtime image");
+    ValidatedImage::parse(&bytes, expected_architecture)
+        .expect("runtime image failed checked format/architecture validation");
+    let digest: [u8; 32] = Sha256::digest(&bytes).into();
+    let expected =
+        std::env::var("RUNTIME_IMAGE_SHA256").expect("RUNTIME_IMAGE_SHA256 is mandatory");
+    let actual = digest
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    assert_eq!(
+        expected, actual,
+        "runtime image digest does not match xtask output"
+    );
+
+    let out = std::path::PathBuf::from(std::env::var_os("OUT_DIR").expect("OUT_DIR"));
+    std::fs::write(out.join("runtime.img"), bytes).expect("copy runtime image to OUT_DIR");
+    let digest_source = format!("pub const RUNTIME_IMAGE_SHA256: [u8; 32] = {digest:?};\n");
+    std::fs::write(out.join("runtime_digest.rs"), digest_source)
+        .expect("write runtime image digest source");
 }

@@ -29,6 +29,7 @@ mod cfr_menu;
 mod fmap;
 mod framebuffer;
 mod memory;
+mod runtime_blob;
 mod tables;
 #[cfg(target_arch = "x86_64")]
 mod timestamps;
@@ -43,6 +44,75 @@ use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 /// Maximum number of platform memory regions we can pass to init_platform().
 const MAX_MEMORY_REGIONS: usize = 96;
+
+fn runtime_image_source() -> crabefi::RuntimeImageSource<'static> {
+    crabefi::RuntimeImageSource {
+        bytes: runtime_blob::RUNTIME_IMAGE,
+        expected_sha256: runtime_blob::RUNTIME_IMAGE_SHA256,
+    }
+}
+
+fn runtime_platform_config() -> crabefi::RuntimePlatformConfig<'static> {
+    unsafe extern "C" {
+        static _deferred_buffer_start: u8;
+        static _deferred_buffer_end: u8;
+    }
+
+    let deferred_buffer = unsafe {
+        let start = core::ptr::addr_of!(_deferred_buffer_start);
+        let end = core::ptr::addr_of!(_deferred_buffer_end);
+        crabefi::DeferredBufferConfig {
+            base: start as u64,
+            size: end.offset_from(start) as usize,
+        }
+    };
+
+    #[cfg(target_arch = "x86_64")]
+    let (time, reset) = (
+        crabefi::RuntimeTimeConfig {
+            mechanism: crabefi::time_mechanism::X86_CMOS,
+            reserved: 0,
+            io_or_mmio_base: 0,
+        },
+        crabefi::RuntimeResetConfig {
+            mechanism: crabefi::reset_mechanism::X86_LEGACY,
+            reserved: 0,
+            io_or_mmio_base: 0xcf9,
+        },
+    );
+    #[cfg(target_arch = "aarch64")]
+    let (time, reset) = (
+        crabefi::RuntimeTimeConfig {
+            mechanism: crabefi::time_mechanism::UNSUPPORTED,
+            reserved: 0,
+            io_or_mmio_base: 0,
+        },
+        crabefi::RuntimeResetConfig {
+            mechanism: crabefi::reset_mechanism::PSCI_SMC,
+            reserved: 0,
+            io_or_mmio_base: 0,
+        },
+    );
+    #[cfg(target_arch = "riscv64")]
+    let (time, reset) = (
+        crabefi::RuntimeTimeConfig {
+            mechanism: crabefi::time_mechanism::UNSUPPORTED,
+            reserved: 0,
+            io_or_mmio_base: 0,
+        },
+        crabefi::RuntimeResetConfig {
+            mechanism: crabefi::reset_mechanism::SBI_SRST,
+            reserved: 0,
+            io_or_mmio_base: 0,
+        },
+    );
+    crabefi::RuntimePlatformConfig {
+        time,
+        reset,
+        external_ranges: &[],
+        deferred_buffer,
+    }
+}
 
 // ============================================================================
 // Platform trait implementations
@@ -82,12 +152,6 @@ impl crabefi::PlatformHooks for CorebootHooks {
         }
 
         // CBMEM console is not runtime mapped; disable it before runtime use.
-        cbmem_console::disable();
-    }
-
-    fn before_set_virtual_address_map(&self) {
-        // SetVirtualAddressMap switches the OS to virtual addresses. The CBMEM
-        // console buffer is physical-only, so it must be disabled first.
         cbmem_console::disable();
     }
 
@@ -265,6 +329,97 @@ impl crabefi::VariableStoreLocator for CorebootVariableStoreLocator {
             region.offset,
             region.size as u64,
         ))
+    }
+}
+
+/// Coreboot SPI/FMAP implementation of the platform capsule backend.
+struct CorebootCapsuleBackend {
+    firmware_info: Option<crabefi::FirmwareInfo>,
+    fmap_offset: Option<u64>,
+    fmap_loaded: bool,
+    fmap_regions: alloc::vec::Vec<crabefi::FmapRegion>,
+}
+
+impl CorebootCapsuleBackend {
+    fn new(
+        firmware_info: Option<crabefi::FirmwareInfo>,
+        boot_media: Option<tables::BootMediaInfo>,
+    ) -> Self {
+        Self {
+            firmware_info,
+            fmap_offset: boot_media.map(|media| media.fmap_offset),
+            fmap_loaded: false,
+            fmap_regions: alloc::vec::Vec::new(),
+        }
+    }
+
+    fn load_fmap(&mut self) {
+        if self.fmap_loaded {
+            return;
+        }
+        self.fmap_loaded = true;
+        let parsed = crabefi::state::with_storage_mut(|storage| {
+            fmap::read_fmap(storage.controller_mut(), self.fmap_offset)
+        })
+        .flatten();
+        let Some(parsed) = parsed else {
+            log::warn!("Capsule backend could not load FMAP");
+            return;
+        };
+        for area in parsed.areas {
+            self.fmap_regions.push(crabefi::FmapRegion {
+                name: area.name,
+                offset: area.offset,
+                size: area.size,
+            });
+        }
+    }
+}
+
+impl crabefi::CapsuleBackend for CorebootCapsuleBackend {
+    fn firmware_info(&self) -> Option<&crabefi::FirmwareInfo> {
+        self.firmware_info.as_ref()
+    }
+
+    fn capsule_trust_store(&self) -> &[&[u8]] {
+        &[]
+    }
+
+    fn write_firmware_region(
+        &mut self,
+        region_name: &str,
+        offset: u32,
+        data: &[u8],
+    ) -> Result<(), crabefi::StorageError> {
+        self.load_fmap();
+        let region = self
+            .fmap_regions
+            .iter()
+            .find(|region| region.name.as_str() == region_name)
+            .ok_or(crabefi::StorageError::InvalidArgument)?;
+        let write_offset = region
+            .offset
+            .checked_add(offset)
+            .ok_or(crabefi::StorageError::InvalidArgument)?;
+        if offset as u64 + data.len() as u64 > u64::from(region.size) {
+            return Err(crabefi::StorageError::InvalidArgument);
+        }
+        crabefi::state::with_storage_mut(|storage| {
+            let controller = storage.controller_mut();
+            crabefi::FirmwareStorage::enable_writes(controller)?;
+            crabefi::FirmwareStorage::erase(
+                controller,
+                u64::from(region.offset),
+                u64::from(region.size),
+            )?;
+            crabefi::FirmwareStorage::write(controller, u64::from(write_offset), data)
+        })
+        .ok_or(crabefi::StorageError::NotInitialized)?
+    }
+
+    fn fmap_regions(&mut self) -> &[crabefi::FmapRegion] {
+        self.load_fmap();
+        &self.fmap_regions
     }
 }
 
@@ -523,7 +678,6 @@ fn riscv_fdt_only_boot(fdt_ptr: u64, fdt_size: u32) -> ! {
         timestamp_recorder: None,
         reset: &reset,
         block_devices: &mut [],
-        variable_backend: None,
         variable_store_locator: None,
         debug_output: None,
         console_input: None,
@@ -533,12 +687,13 @@ fn riscv_fdt_only_boot(fdt_ptr: u64, fdt_size: u32) -> ! {
         fdt: Some(fdt_slice),
         firmware_info: None,
         capsule_regions: &[],
+        capsule_backend: None,
         hooks: Some(&hooks),
         rng: None,
         ecam_base: None,
         ecam_size: None,
-        deferred_buffer: None,
-        runtime_region: None,
+        runtime_image: runtime_image_source(),
+        runtime: runtime_platform_config(),
         tpm_event_log: None,
         heap_pre_initialized: false,
     };
@@ -678,6 +833,11 @@ pub extern "C" fn rust_main(coreboot_table_ptr: u64) -> ! {
             window.host_base as u64,
             spi_flash.flash_size,
         );
+    } else if let Some(boot_media) = cb_info.boot_media
+        && let Ok(flash_size) = u32::try_from(boot_media.boot_media_size)
+        && let Some(host_base) = 0x1_0000_0000u64.checked_sub(boot_media.boot_media_size)
+    {
+        crabefi::drivers::spi::qemu::configure_pflash(host_base, flash_size);
     }
 
     // Store memory regions and ACPI RSDP (used by direct Linux boot path
@@ -813,13 +973,14 @@ pub extern "C" fn rust_main(coreboot_table_ptr: u64) -> ! {
         capsule_count += 1;
     }
 
+    let mut capsule_backend = CorebootCapsuleBackend::new(firmware_info, cb_info.boot_media);
+
     let mut config = crabefi::PlatformConfig {
         memory_map: &memory_regions[..region_count],
         timer: &timer,
         timestamp_recorder: timestamp_recorder_ref,
         reset: &reset,
         block_devices: &mut [],
-        variable_backend: None,
         variable_store_locator: Some(&variable_store_locator),
         debug_output: None, // Already set up via serial::init_from_config()
         console_input: None,
@@ -829,12 +990,13 @@ pub extern "C" fn rust_main(coreboot_table_ptr: u64) -> ! {
         fdt: fdt_slice,
         firmware_info,
         capsule_regions: &capsule_regions[..capsule_count],
+        capsule_backend: Some(&mut capsule_backend),
         hooks: Some(&hooks),
         rng: None,
         ecam_base: None, // May be filled from ACPI MCFG below
         ecam_size: None,
-        deferred_buffer: None, // Uses linker-symbol fallback in init_platform()
-        runtime_region: None,  // Uses linker-symbol fallback (platform-entry feature)
+        runtime_image: runtime_image_source(),
+        runtime: runtime_platform_config(),
         // Enable measured boot.
         // If coreboot provided a standard TPM event log in CBMEM, continue
         // using that log's protocol family. Without an existing standard log,

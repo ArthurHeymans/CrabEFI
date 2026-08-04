@@ -103,24 +103,6 @@ pub fn is_initialized() -> bool {
     !STATE_PTR.load(Ordering::Acquire).is_null()
 }
 
-/// Relocate the global state pointer to a new virtual address.
-///
-/// Called by `SetVirtualAddressMap` when the OS remaps runtime services
-/// memory from physical to virtual addresses.
-///
-/// # Safety
-///
-/// The new pointer must point to valid `FirmwareState` memory that has been
-/// remapped by the OS.
-pub unsafe fn relocate_state_ptr(new_ptr: *mut FirmwareState) {
-    // SAFETY: The caller guarantees that `new_ptr` is the runtime-mapped
-    // address of the installed firmware state.
-    if unsafe { new_ptr.as_ref() }.is_none() {
-        panic!("FirmwareState pointer is null");
-    }
-    STATE_PTR.store(new_ptr, Ordering::Release);
-}
-
 /// Get a reference to the global firmware state.
 ///
 /// # Panics
@@ -226,12 +208,6 @@ pub fn init_efi_caches() -> bool {
                 MAX_LOADED_IMAGES,
                 LoadedImageEntry::empty,
             )
-            && init_entries(
-                &mut efi.config_tables,
-                MAX_CONFIG_TABLES,
-                ConfigurationTable::empty,
-            )
-            && init_entries(&mut efi.variables, MAX_VARIABLES, VariableEntry::empty)
     })
 }
 
@@ -304,20 +280,6 @@ pub const MAX_EVENTS: usize = 32;
 
 /// Maximum number of loaded images we can track
 pub const MAX_LOADED_IMAGES: usize = 16;
-
-/// Maximum number of configuration tables
-pub const MAX_CONFIG_TABLES: usize = 24;
-
-/// Maximum number of EFI variables
-pub const MAX_VARIABLES: usize = 64;
-
-/// Maximum variable name length (in characters)
-pub const MAX_VARIABLE_NAME_LEN: usize = 64;
-
-/// Maximum variable data size (stored payload, after auth header stripping).
-///
-/// This covers Secure Boot key databases while bounding each heap allocation.
-pub const MAX_VARIABLE_DATA_SIZE: usize = 16 * 1024;
 
 /// Protocol interface entry
 #[derive(Clone, Copy)]
@@ -492,92 +454,6 @@ impl LoadedImageEntry {
     }
 }
 
-/// EFI Configuration Table entry
-#[derive(Clone, Copy)]
-#[repr(C)]
-pub struct ConfigurationTable {
-    pub vendor_guid: Guid,
-    pub vendor_table: *mut core::ffi::c_void,
-}
-
-// SAFETY: ConfigurationTable contains a raw pointer to vendor-specific data (e.g., ACPI tables).
-// These pointers reference memory that:
-// 1. Is allocated and initialized before being added to the configuration table
-// 2. Remains valid for the entire firmware lifetime (ACPI tables, SMBIOS, etc.)
-// 3. Is only read by the OS after ExitBootServices, at which point the firmware
-//    is no longer running and there are no concurrent accesses
-unsafe impl Send for ConfigurationTable {}
-unsafe impl Sync for ConfigurationTable {}
-
-impl ConfigurationTable {
-    pub const fn empty() -> Self {
-        Self {
-            vendor_guid: Guid::from_fields(0, 0, 0, 0, 0, &[0, 0, 0, 0, 0, 0]),
-            vendor_table: core::ptr::null_mut(),
-        }
-    }
-}
-
-/// EFI variable entry
-#[derive(Clone)]
-pub struct VariableEntry {
-    pub name: [u16; MAX_VARIABLE_NAME_LEN],
-    pub vendor_guid: Guid,
-    pub attributes: u32,
-    pub data: Vec<u8>,
-    pub data_size: usize,
-    pub in_use: bool,
-}
-
-impl VariableEntry {
-    /// Create an unused variable-cache entry without allocating its payload.
-    ///
-    /// # Returns
-    /// An empty cache entry.
-    pub fn empty() -> Self {
-        Self {
-            name: [0; MAX_VARIABLE_NAME_LEN],
-            vendor_guid: Guid::from_fields(0, 0, 0, 0, 0, &[0, 0, 0, 0, 0, 0]),
-            attributes: 0,
-            data: Vec::new(),
-            data_size: 0,
-            in_use: false,
-        }
-    }
-
-    /// Replace the variable payload without exceeding its UEFI size limit.
-    ///
-    /// # Arguments
-    /// * `data` - New variable payload.
-    ///
-    /// # Returns
-    /// `Err(())` when the payload is too large or the heap is exhausted.
-    pub fn set_data(&mut self, data: &[u8]) -> Result<(), ()> {
-        if data.len() > MAX_VARIABLE_DATA_SIZE {
-            return Err(());
-        }
-        if self.data.capacity() < data.len()
-            && self
-                .data
-                .try_reserve_exact(data.len() - self.data.len())
-                .is_err()
-        {
-            return Err(());
-        }
-        self.data.clear();
-        self.data.extend_from_slice(data);
-        self.data_size = data.len();
-        Ok(())
-    }
-
-    /// Release a deleted variable's heap payload.
-    pub fn clear(&mut self) {
-        self.data = Vec::new();
-        self.data_size = 0;
-        self.in_use = false;
-    }
-}
-
 /// Variable store persistence state
 ///
 /// Tracks the runtime state of the persistent variable store region.
@@ -614,6 +490,9 @@ impl Default for VarStoreState {
 
 /// EFI subsystem state
 pub struct EfiState {
+    /// Validated boot-side client for the separately allocated runtime image.
+    pub runtime_image: Option<crate::efi::runtime_image::RuntimeImageClient>,
+
     /// Handle database, allocated after heap startup.
     pub handles: Vec<HandleEntry>,
     /// Number of active handles
@@ -629,14 +508,6 @@ pub struct EfiState {
     /// Loaded images database, allocated after heap startup.
     pub loaded_images: Vec<LoadedImageEntry>,
 
-    /// Configuration tables, allocated after heap startup.
-    pub config_tables: Vec<ConfigurationTable>,
-    /// Number of configuration tables
-    pub config_table_count: usize,
-
-    /// EFI variables. Entries and payloads are allocated after heap startup.
-    pub variables: Vec<VariableEntry>,
-
     /// Variable store persistence state (SMMSTORE tracking)
     pub varstore: VarStoreState,
 
@@ -651,45 +522,29 @@ pub struct EfiState {
     /// boot option is attempted.
     pub ready_to_boot_signaled: bool,
 
-    /// Flag indicating ExitBootServices has been called
-    /// After this is set, SPI flash is locked and variable writes
-    /// must go to ESP file instead.
-    pub exit_boot_services_called: bool,
-
     /// Filesystem state for SimpleFileSystem protocol
     pub filesystem: Option<FilesystemState>,
 
     /// Block device for filesystem access
     pub block_device: Option<crate::drivers::block::AnyBlockDevice>,
-
-    /// Secure Boot: whether in Setup Mode (PK not enrolled)
-    pub setup_mode: bool,
-
-    /// Secure Boot: whether Secure Boot is enabled
-    pub secure_boot_enabled: bool,
 }
 
 impl EfiState {
     pub const fn new() -> Self {
         Self {
+            runtime_image: None,
             handles: Vec::new(),
             handle_count: 0,
             next_handle: 1,
             events: Vec::new(),
             next_event_id: 2, // Start at 2, reserve 1 for keyboard
             loaded_images: Vec::new(),
-            config_tables: Vec::new(),
-            config_table_count: 0,
-            variables: Vec::new(),
             varstore: VarStoreState::new(),
             allocator: MemoryAllocator::new(),
             monotonic_count: 0,
             ready_to_boot_signaled: false,
-            exit_boot_services_called: false,
             filesystem: None,
             block_device: None,
-            setup_mode: true,
-            secure_boot_enabled: false,
         }
     }
 }
@@ -1322,27 +1177,4 @@ where
     F: FnOnce(&mut VarStoreState) -> R,
 {
     with_mut(|state| f(&mut state.efi.varstore))
-}
-
-// ============================================================================
-// ExitBootServices State
-// ============================================================================
-
-/// Check if ExitBootServices has been called.
-///
-/// After ExitBootServices, SPI flash is locked and variable writes
-/// must be stored to ESP file instead.
-#[inline]
-pub fn is_exit_boot_services_called() -> bool {
-    get().efi.exit_boot_services_called
-}
-
-/// Mark that ExitBootServices has been called.
-///
-/// This should only be called from boot_services::exit_boot_services.
-#[inline]
-pub fn set_exit_boot_services_called() {
-    with_efi_mut(|efi| {
-        efi.exit_boot_services_called = true;
-    });
 }

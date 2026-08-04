@@ -21,21 +21,9 @@ use alloc::vec::Vec;
 
 use super::types::*;
 
-/// Read an EFI variable's data from the in-memory variable cache.
+/// Read an EFI variable's data from the authoritative runtime image store.
 fn get_efi_variable(guid: &r_efi::efi::Guid, name: &[u16]) -> Option<Vec<u8>> {
-    let mut result: Option<Vec<u8>> = None;
-    crate::state::with_efi_mut(|efi| {
-        result = efi
-            .variables
-            .iter()
-            .find(|var| {
-                var.in_use
-                    && var.vendor_guid == *guid
-                    && crate::efi::utils::ucs2_eq(&var.name, name)
-            })
-            .map(|var| var.data[..var.data_size].to_vec());
-    });
-    result
+    crate::efi::runtime_image::client::variables::get(guid, name).map(|(_, data)| data)
 }
 
 // ============================================================================
@@ -307,24 +295,34 @@ pub fn measure_boot_variables_all() {
 /// Measure EFI handoff/configuration table pointers into PCR 1.
 pub fn measure_handoff_tables_all() {
     const ENTRY_SIZE: usize = 16 + 8;
-    let mut event_buf = [0u8; 8 + crate::state::MAX_CONFIG_TABLES * ENTRY_SIZE];
+    let mut event_buf = [0u8; 8 + crabefi_runtime_abi::MAX_CONFIGURATION_TABLES * ENTRY_SIZE];
     let mut count = 0usize;
     let mut off = 8usize;
 
-    crate::state::with_efi_mut(|efi| {
-        for table in efi.config_tables.iter().take(efi.config_table_count) {
-            if table.vendor_table.is_null() || off + ENTRY_SIZE > event_buf.len() {
-                continue;
+    let system = crate::efi::get_system_table();
+    if !system.is_null() {
+        // SAFETY: the runtime image owns a bounded initialized configuration array.
+        let (tables, table_count) = unsafe {
+            (
+                (*system).configuration_table,
+                (*system).number_of_table_entries,
+            )
+        };
+        if !tables.is_null() {
+            for index in 0..table_count {
+                // SAFETY: index is bounded by the image-owned count.
+                let table = unsafe { &*tables.add(index) };
+                if table.vendor_table.is_null() || off + ENTRY_SIZE > event_buf.len() {
+                    continue;
+                }
+                event_buf[off..off + 16].copy_from_slice(table.vendor_guid.as_bytes());
+                off += 16;
+                event_buf[off..off + 8].copy_from_slice(&(table.vendor_table as u64).to_le_bytes());
+                off += 8;
+                count += 1;
             }
-            let guid_bytes: &[u8; 16] =
-                unsafe { &*(&table.vendor_guid as *const r_efi::efi::Guid as *const [u8; 16]) };
-            event_buf[off..off + 16].copy_from_slice(guid_bytes);
-            off += 16;
-            event_buf[off..off + 8].copy_from_slice(&(table.vendor_table as u64).to_le_bytes());
-            off += 8;
-            count += 1;
         }
-    });
+    }
 
     if count == 0 {
         return;

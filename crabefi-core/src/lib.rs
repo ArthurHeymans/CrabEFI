@@ -63,15 +63,17 @@ pub fn reset_system() -> ! {
 }
 
 // Re-export the public platform API at the crate root for ergonomic access.
+pub use crabefi_runtime_abi::{
+    RuntimeExternalRange, RuntimeResetConfig, RuntimeTimeConfig, reset_mechanism, time_mechanism,
+};
 pub use platform::{
     BlockDevice, BlockDeviceInfo, BlockError, BootResult, CapsuleBackend, CapsuleRegion,
     ConsoleInput, DebugOutput, DeferredBufferConfig, FirmwareInfo, FirmwareMmapWindow,
     FirmwareStorage, FirmwareStorageLocation, FirmwareStorageRegion, FmapRegion, FramebufferConfig,
     Key, KeyState, MemoryRegion, MemoryType, PlatformConfig, PlatformHooks, ResetHandler,
-    ResetType, Rng, RngError, RuntimeRegion, StorageBackend, StorageError, Timer,
-    TimestampRecorder, Tpm2Device, Tpm2DeviceConfig, TpmDigest, TpmError, TpmEventLogConfig,
-    TpmLogFormat, TpmPcrBanks, VarBackendError, VariableBackend, VariableStoreLocator,
-    VariableStoreRegion, VariableVisitor,
+    ResetType, Rng, RngError, RuntimeImageSource, RuntimePlatformConfig, StorageBackend,
+    StorageError, Timer, TimestampRecorder, Tpm2Device, Tpm2DeviceConfig, TpmDigest, TpmError,
+    TpmEventLogConfig, TpmLogFormat, TpmPcrBanks, VariableStoreLocator, VariableStoreRegion,
 };
 
 /// Display a Secure Boot violation error on screen
@@ -163,41 +165,54 @@ fn log_stack_usage(phase: &str) {
 /// two entry points.
 fn init_persistence_and_boot(
     variable_store_locator: Option<&dyn platform::VariableStoreLocator>,
+    capsule_backend: Option<&mut dyn platform::CapsuleBackend>,
 ) -> ! {
     // ---- Variable persistence ----
-    match efi::varstore::init_persistence(variable_store_locator) {
+    let persistence_available = match efi::varstore::init_persistence(variable_store_locator) {
         Ok(()) => {
             log::info!("Variable store persistence initialized");
-
-            let pending_count = efi::varstore::check_deferred_pending();
-            if pending_count > 0 {
-                log::info!(
-                    "{} pending deferred writes from previous boot",
-                    pending_count
-                );
-                match efi::varstore::process_deferred_pending() {
-                    Ok(n) => log::info!("Applied {} deferred variable writes", n),
-                    Err(e) => log::warn!("Failed to process deferred writes: {:?}", e),
-                }
-            }
-
-            logger::apply_persisted_level();
-
-            match efi::auth::boot::init_secure_boot_default() {
-                Ok(status) => {
-                    log::info!(
-                        "Secure Boot: mode={}, enabled={}",
-                        if status.setup_mode { "Setup" } else { "User" },
-                        status.secure_boot_enabled
-                    );
-                }
-                Err(e) => log::warn!("Secure Boot init failed: {:?}", e),
-            }
+            true
         }
-        Err(e) => log::info!("Variable persistence not available: {:?}", e),
+        Err(e) => {
+            log::info!("Variable persistence not available: {:?}", e);
+            false
+        }
+    };
+
+    let runtime = state::efi()
+        .runtime_image
+        .expect("runtime image missing before deferred replay");
+    if persistence_available {
+        if let Err(status) = runtime.prepare_retained_staging() {
+            log::warn!("Runtime image retained staging setup failed: {:?}", status);
+        }
+        if let Err(status) = runtime.replay_deferred() {
+            log::warn!("Runtime image deferred replay failed: {:?}", status);
+        }
+
+        logger::apply_persisted_level();
+        match efi::auth::boot::init_secure_boot_default() {
+            Ok(status) => log::info!(
+                "Secure Boot: mode={}, enabled={}",
+                if status.setup_mode { "Setup" } else { "User" },
+                status.secure_boot_enabled
+            ),
+            Err(e) => log::warn!("Secure Boot init failed: {:?}", e),
+        }
     }
 
-    efi::varstore::init_deferred_buffer();
+    if let Some(backend) = capsule_backend {
+        let applied = efi::capsule::process_pending_capsules(backend);
+        if applied != 0 {
+            log::info!("Applied {} pending firmware capsule(s)", applied);
+        }
+    }
+
+    // Persistent records and firmware-created status values have now been
+    // copied into the authoritative Runtime Services store.
+    runtime
+        .finish_import()
+        .expect("runtime image rejected variable import completion");
     timestamp::record(timestamp::TS_CRABEFI_VARSTORE_INIT);
 
     // TCG protocols are installed during EFI initialization, but initial
@@ -472,13 +487,6 @@ fn init_platform_impl(mut config: PlatformConfig) -> ! {
     log::info!("CrabEFI initialized successfully!");
     log::info!("EFI System Table at: {:p}", efi::get_system_table());
 
-    // ---- 10. Runtime log support ----
-    #[cfg(feature = "rt-log")]
-    {
-        efi::rtlog::register_region();
-        efi::rtlog::dump();
-    }
-
     // ---- 12. Discover PCI ECAM and initialize PCI ----
     //
     // Priority: config.ecam_base > acpi_info.ecam_base > fdt_info.ecam_base.
@@ -499,85 +507,6 @@ fn init_platform_impl(mut config: PlatformConfig) -> ! {
     drivers::pci::init();
     timestamp::record(timestamp::TS_CRABEFI_PCI_INIT);
 
-    // ---- 13. Register deferred variable buffer if provided ----
-    if let Some(buf) = config.deferred_buffer {
-        use efi::allocator::{MemoryType as AllocMemType, PAGE_SIZE};
-        efi::varstore::deferred::configure_buffer_with_size(buf.base, buf.size);
-        let buf_pages = (buf.size as u64).div_ceil(PAGE_SIZE);
-        if let Err(e) =
-            efi::allocator::force_add_region(buf.base, buf_pages, AllocMemType::RuntimeServicesData)
-        {
-            log::warn!(
-                "Could not register deferred buffer at {:#x}: {:?}",
-                buf.base,
-                e
-            );
-        }
-    } else {
-        // No deferred buffer in config — use linker-symbol-based discovery.
-        // The deferred module automatically uses the linker symbols for the
-        // buffer location, so no explicit configure_buffer_with_size() needed.
-        use efi::varstore::deferred;
-        let buf_base = deferred::deferred_buffer_base();
-        let buf_size = deferred::deferred_buffer_size();
-        if buf_size > 0 {
-            #[cfg(not(feature = "platform-entry"))]
-            {
-                use efi::allocator::{MemoryType as AllocMemType, PAGE_SIZE};
-                let buf_pages = (buf_size as u64).div_ceil(PAGE_SIZE);
-                if let Err(e) = efi::allocator::force_add_region(
-                    buf_base,
-                    buf_pages,
-                    AllocMemType::RuntimeServicesData,
-                ) {
-                    log::warn!(
-                        "Could not register deferred buffer at {:#x}: {:?}",
-                        buf_base,
-                        e
-                    );
-                } else {
-                    log::info!(
-                        "Deferred buffer at {:#x} ({} pages) registered as RuntimeServicesData",
-                        buf_base,
-                        buf_pages
-                    );
-                }
-            }
-
-            #[cfg(feature = "platform-entry")]
-            {
-                use efi::allocator::{MemoryType as AllocMemType, PAGE_SIZE};
-                // The linker script places .deferred_buffer BELOW PAYLOAD_BASE
-                // (0x80000 on x86_64), i.e. OUTSIDE the runtime data range that
-                // reserve_runtime_region() carves. Without marking it as
-                // RuntimeServicesData the OS treats it as free RAM and the
-                // first runtime SetVariable write corrupts kernel memory or
-                // faults on an unmapped efi_mm address (hard system lockup).
-                // carve_out_region splits the containing entry instead of
-                // pushing an overlapping duplicate, which the Linux EFI
-                // mapping code cannot handle.
-                let buf_pages = (buf_size as u64).div_ceil(PAGE_SIZE);
-                match efi::allocator::carve_out_region(
-                    buf_base,
-                    buf_pages,
-                    AllocMemType::RuntimeServicesData,
-                ) {
-                    Ok(()) => log::info!(
-                        "Deferred buffer at {:#x} ({} pages) carved as RuntimeServicesData",
-                        buf_base,
-                        buf_pages
-                    ),
-                    Err(e) => log::error!(
-                        "CRITICAL: could not reserve deferred buffer at {:#x}: {:?} — \
-                         runtime SetVariable would corrupt OS memory",
-                        buf_base,
-                        e
-                    ),
-                }
-            }
-        }
-    }
-
     // ---- 14. Register platform block devices ----
     if !config.block_devices.is_empty() {
         // SAFETY: init_platform() is -> !, so the block device references in
@@ -587,12 +516,8 @@ fn init_platform_impl(mut config: PlatformConfig) -> ! {
         }
     }
 
-    // ---- 15. Runtime log init ----
-    #[cfg(feature = "rt-log")]
-    efi::rtlog::init();
-
     // ---- 16. Variable persistence, Secure Boot, and boot manager ----
-    init_persistence_and_boot(config.variable_store_locator);
+    init_persistence_and_boot(config.variable_store_locator, config.capsule_backend);
 }
 
 /// Store a device globally for SimpleFileSystem reads.

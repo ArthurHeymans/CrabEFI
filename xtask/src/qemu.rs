@@ -3,12 +3,123 @@
 //! This module provides functionality to run CrabEFI in QEMU with various
 //! storage configurations and parse serial output for test results.
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use regex::Regex;
+use std::fs;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::{Arch, Machine};
+
+static RUNTIME_IMAGE_TWO_BOOT: AtomicBool = AtomicBool::new(false);
+static WRITABLE_TEST_FLASH: AtomicBool = AtomicBool::new(false);
+
+fn is_runtime_image_two_boot(disk_path: &Path) -> bool {
+    RUNTIME_IMAGE_TWO_BOOT.load(Ordering::Relaxed)
+        || disk_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.contains("runtime-image-test"))
+}
+
+fn add_x86_firmware_args(cmd: &mut Command, firmware: &str, writable_flash: bool) {
+    if writable_flash {
+        cmd.args([
+            "-drive",
+            &format!("if=pflash,format=raw,file={firmware},snapshot=on"),
+        ]);
+    } else {
+        cmd.args(["-bios", firmware]);
+    }
+}
+
+fn prepare_runtime_test_flash(source: &Path) -> Result<tempfile::NamedTempFile> {
+    const FMAP_SIGNATURE: &[u8; 8] = b"__FMAP__";
+    const FMAP_HEADER_SIZE: usize = 56;
+    const FMAP_AREA_SIZE: usize = 42;
+    const SMMSTORE_SIZE: usize = 64 * 1024;
+    const SMMSTORE_TRAILING_GUARD: usize = 64 * 1024;
+
+    let mut bytes = fs::read(source)
+        .with_context(|| format!("failed to read runtime test flash {}", source.display()))?;
+    let fmap = bytes
+        .windows(FMAP_SIGNATURE.len())
+        .position(|window| window == FMAP_SIGNATURE)
+        .context("runtime test flash has no FMAP")?;
+    let count_offset = fmap + 54;
+    let count = u16::from_le_bytes(
+        bytes
+            .get(count_offset..count_offset + 2)
+            .context("truncated FMAP header")?
+            .try_into()
+            .unwrap(),
+    );
+    let areas = fmap
+        .checked_add(FMAP_HEADER_SIZE)
+        .context("FMAP areas offset overflow")?;
+    let existing_smmstore = (0..usize::from(count)).find_map(|index| {
+        let entry = areas.checked_add(index.checked_mul(FMAP_AREA_SIZE)?)?;
+        let bytes = bytes.get(entry..entry + FMAP_AREA_SIZE)?;
+        let name = &bytes[8..40];
+        let name_len = name
+            .iter()
+            .position(|byte| *byte == 0)
+            .unwrap_or(name.len());
+        (name.get(..name_len)? == b"SMMSTORE").then(|| {
+            (
+                u32::from_le_bytes(bytes[..4].try_into().unwrap()) as usize,
+                u32::from_le_bytes(bytes[4..8].try_into().unwrap()) as usize,
+            )
+        })
+    });
+    if let Some((offset, size)) = existing_smmstore {
+        let end = offset
+            .checked_add(size)
+            .context("existing SMMSTORE range overflow")?;
+        bytes
+            .get_mut(offset..end)
+            .context("existing SMMSTORE lies outside flash")?
+            .fill(0xff);
+    } else {
+        let entry = areas
+            .checked_add(usize::from(count) * FMAP_AREA_SIZE)
+            .context("FMAP entry offset overflow")?;
+        if !bytes
+            .get(entry..entry + FMAP_AREA_SIZE)
+            .context("no room for runtime test SMMSTORE FMAP entry")?
+            .iter()
+            .all(|byte| *byte == 0xff)
+        {
+            bail!("runtime test flash FMAP has no empty area slot");
+        }
+
+        let smmstore_offset = bytes
+            .len()
+            .checked_sub(SMMSTORE_SIZE + SMMSTORE_TRAILING_GUARD)
+            .context("runtime test flash is too small for SMMSTORE")?;
+        let smmstore_end = smmstore_offset + SMMSTORE_SIZE;
+        if !bytes[smmstore_offset..smmstore_end]
+            .iter()
+            .all(|byte| *byte == 0xff)
+        {
+            bail!("runtime test flash has no erased SMMSTORE range");
+        }
+        let offset = u32::try_from(smmstore_offset).context("SMMSTORE offset exceeds FMAP")?;
+        let size = u32::try_from(SMMSTORE_SIZE).unwrap();
+        let entry_bytes = &mut bytes[entry..entry + FMAP_AREA_SIZE];
+        entry_bytes[..4].copy_from_slice(&offset.to_le_bytes());
+        entry_bytes[4..8].copy_from_slice(&size.to_le_bytes());
+        entry_bytes[8..40].fill(0);
+        entry_bytes[8..8 + b"SMMSTORE".len()].copy_from_slice(b"SMMSTORE");
+        entry_bytes[40..42].copy_from_slice(&0u16.to_le_bytes());
+        bytes[count_offset..count_offset + 2].copy_from_slice(&(count + 1).to_le_bytes());
+    }
+
+    let flash = tempfile::NamedTempFile::new().context("failed to create runtime test flash")?;
+    fs::write(flash.path(), bytes).context("failed to write runtime test flash")?;
+    Ok(flash)
+}
 
 /// Storage type for QEMU
 #[derive(Debug, Clone, Copy)]
@@ -173,9 +284,14 @@ fn build_qemu_command_x86_64(config: &QemuConfig, disk_path: &Path) -> Result<Co
 
     // Basic machine setup
     cmd.args(["-machine", "q35"]);
-    cmd.args(["-bios", &config.coreboot_rom]);
+    let two_boot = is_runtime_image_two_boot(disk_path);
+    add_x86_firmware_args(&mut cmd, &config.coreboot_rom, two_boot);
     cmd.args(["-m", "512M"]);
-    cmd.arg("-no-reboot");
+    if two_boot {
+        cmd.args(["-device", "isa-debug-exit,iobase=0xf4,iosize=0x04"]);
+    } else {
+        cmd.arg("-no-reboot");
+    }
 
     // Display and serial settings
     if config.headless {
@@ -417,7 +533,7 @@ fn add_storage_args_aarch64(cmd: &mut Command, config: &QemuConfig, disk_path: &
 fn is_kvm_available() -> bool {
     Path::new("/dev/kvm").exists()
         && std::fs::metadata("/dev/kvm")
-            .map(|m| m.permissions().readonly() == false)
+            .map(|m| !m.permissions().readonly())
             .unwrap_or(false)
 }
 
@@ -608,8 +724,7 @@ fn capture_when_ready(
         if let Ok(text) = std::fs::read_to_string(serial_log) {
             // ponytail: these two markers cover the boot menu and the
             // no-media screen; add more markers for other screens.
-            if text.contains("Showing boot menu...") || text.contains("No bootable media found!")
-            {
+            if text.contains("Showing boot menu...") || text.contains("No bootable media found!") {
                 break;
             }
         }
@@ -663,7 +778,10 @@ fn capture_when_ready(
             Ok(s) if s.success() => {}
             _ => {
                 std::fs::copy(ppm, out.with_extension("ppm"))?;
-                bail!("ImageMagick 'magick' not found; wrote {} instead", out.with_extension("ppm").display());
+                bail!(
+                    "ImageMagick 'magick' not found; wrote {} instead",
+                    out.with_extension("ppm").display()
+                );
             }
         }
     } else if extension.as_deref() == Some("ppm") {
@@ -677,6 +795,11 @@ fn capture_when_ready(
 
 /// Run integration tests in QEMU
 pub fn run_tests(config: &QemuConfig, disk_path: &Path, app_name: &str) -> Result<()> {
+    RUNTIME_IMAGE_TWO_BOOT.store(app_name == "runtime-image-test", Ordering::Relaxed);
+    WRITABLE_TEST_FLASH.store(
+        matches!(app_name, "runtime-image-test" | "secure-boot-test"),
+        Ordering::Relaxed,
+    );
     println!(
         "=== CrabEFI Integration Tests ({}, {:?}) ===\n",
         app_name, config.arch
@@ -1177,6 +1300,42 @@ pub fn run_tests(config: &QemuConfig, disk_path: &Path, app_name: &str) -> Resul
                 failed += 1;
             }
         }
+        "runtime-image-test" => {
+            if result.output.contains("RUNTIME IMAGE TEST PASSED") {
+                println!(
+                    "[PASS] runtime_image_boundary: all Runtime Services entries are image code"
+                );
+                passed += 1;
+            } else {
+                println!("[FAIL] runtime_image_boundary: runtime image marker missing");
+                failed += 1;
+            }
+            if !matches!(config.arch, Arch::X86_64)
+                || result.output.contains("RUNTIME POST SVAM PASSED")
+            {
+                println!(
+                    "[PASS] runtime_post_svam: variable, conversion, and reset paths survived SVAM"
+                );
+                passed += 1;
+            } else {
+                println!("[FAIL] runtime_post_svam: post-SVAM marker missing");
+                failed += 1;
+            }
+            if !matches!(config.arch, Arch::X86_64)
+                || (result
+                    .output
+                    .contains("RUNTIME DEFERRED VARIABLE REPLAY PASSED")
+                    && result.output.contains("RUNTIME CAPSULE CONSUMPTION PASSED"))
+            {
+                println!(
+                    "[PASS] runtime_two_boot_replay: deferred variable replayed and capsule consumed"
+                );
+                passed += 1;
+            } else {
+                println!("[FAIL] runtime_two_boot_replay: second-boot replay markers missing");
+                failed += 1;
+            }
+        }
         _ => {
             // Generic test: just check if CrabEFI booted
             if result.output.contains("CrabEFI") {
@@ -1241,9 +1400,28 @@ fn run_qemu_with_capture_x86_64(
 
     // Build the rest of QEMU args
     cmd.args(["-machine", "q35"]);
-    cmd.args(["-bios", &config.coreboot_rom]);
+    let two_boot = is_runtime_image_two_boot(disk_path);
+    let writable_flash = WRITABLE_TEST_FLASH.load(Ordering::Relaxed);
+    let runtime_flash = if writable_flash {
+        Some(prepare_runtime_test_flash(Path::new(&config.coreboot_rom))?)
+    } else {
+        None
+    };
+    let firmware = runtime_flash
+        .as_ref()
+        .map_or(config.coreboot_rom.as_str(), |flash| {
+            flash
+                .path()
+                .to_str()
+                .expect("temporary flash path is not UTF-8")
+        });
+    add_x86_firmware_args(&mut cmd, firmware, writable_flash);
     cmd.args(["-m", "2G"]);
-    cmd.arg("-no-reboot");
+    if two_boot {
+        cmd.args(["-device", "isa-debug-exit,iobase=0xf4,iosize=0x04"]);
+    } else {
+        cmd.arg("-no-reboot");
+    }
 
     // Serial settings for capture
     cmd.args(["-display", "none"]);

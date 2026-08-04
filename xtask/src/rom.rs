@@ -2,11 +2,11 @@
 //!
 //! This module handles preparing the coreboot ROM with CrabEFI payload.
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use crate::{project_root, Arch, Machine};
+use crate::{Arch, Machine, project_root};
 
 /// Prepared firmware files ready for QEMU
 pub struct PreparedFirmware {

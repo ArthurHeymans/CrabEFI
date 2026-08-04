@@ -3,7 +3,7 @@
 //! This module provides functionality to create GPT disk images with FAT32
 //! EFI System Partitions for testing CrabEFI.
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
