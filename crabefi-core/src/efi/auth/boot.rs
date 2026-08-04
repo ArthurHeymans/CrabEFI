@@ -14,7 +14,7 @@
 //!         |
 //!         v
 //! init_secure_boot() is called:
-//!   1. Load PK/KEK/db/dbx from in-memory variable cache
+//!   1. Load PK/KEK/db/dbx from the authoritative runtime image store
 //!   2. If PK exists -> enter User Mode
 //!   3. Create SecureBoot/SetupMode variables
 //!   4. Optionally enroll default keys if none exist
@@ -22,22 +22,15 @@
 
 use super::enrollment::{self, EnrollmentStatus};
 use super::variables::{
-    DB_NAME, DBX_NAME, KEK_NAME, PK_NAME, SECURE_BOOT_NAME, SETUP_MODE_NAME, SecureBootVariable,
-    db_database, dbx_database, kek_database, pk_database,
+    DB_NAME, DBX_NAME, KEK_NAME, PK_NAME, SecureBootVariable, db_database, dbx_database,
+    kek_database, pk_database,
 };
 use super::{
     AuthError, EFI_GLOBAL_VARIABLE_GUID, EFI_IMAGE_SECURITY_DATABASE_GUID, enter_setup_mode,
     enter_user_mode, is_setup_mode,
 };
-use crate::efi::varstore::{
-    VarStoreError, get_variable_timestamp, persist_variable_with_timestamp,
-};
-use crate::state;
+use crate::efi::varstore::get_variable_timestamp;
 use alloc::vec::Vec;
-
-/// Variable attributes for read-only status variables
-const STATUS_VAR_ATTRS: u32 =
-    super::attributes::BOOTSERVICE_ACCESS | super::attributes::RUNTIME_ACCESS;
 
 /// Variable attributes for Secure Boot key variables
 const SECURE_BOOT_KEY_ATTRS: u32 = super::attributes::NON_VOLATILE
@@ -115,7 +108,7 @@ pub fn init_secure_boot(config: &SecureBootConfig) -> Result<EnrollmentStatus, A
         let enable_from_storage = load_secure_boot_enable_preference();
         if enable_from_storage || config.enable_secure_boot {
             // Use internal function to avoid re-persisting what we just loaded
-            crate::state::with_efi_mut(|efi| efi.secure_boot_enabled = true);
+            super::set_secure_boot_derived(true);
             log::info!("Secure Boot: Enabled (from persisted preference)");
             // Update status variables to reflect the enabled state
             let _ = update_status_variables();
@@ -151,14 +144,19 @@ pub fn init_secure_boot_default() -> Result<EnrollmentStatus, AuthError> {
     init_secure_boot(&SecureBootConfig::default())
 }
 
-/// Load Secure Boot keys from in-memory UEFI variables
+/// Load Secure Boot keys from image-owned UEFI variables.
 ///
-/// This reads the PK, KEK, db, and dbx variables from the variable cache
-/// (which were loaded from SMMSTORE by init_persistence) and populates
-/// the in-memory key databases. Also restores timestamps for proper
+/// This reads the PK, KEK, db, and dbx values imported from SMMSTORE into the
+/// authoritative runtime image store and populates disposable boot-only key
+/// databases. It also restores timestamps for proper
 /// monotonic timestamp validation on future authenticated variable updates.
 fn load_keys_from_variables() -> EnrollmentStatus {
     use super::structures::EfiTime;
+
+    pk_database().clear();
+    kek_database().clear();
+    db_database().clear();
+    dbx_database().clear();
 
     // Load PK
     if let Some(data) = get_variable_data(&EFI_GLOBAL_VARIABLE_GUID, PK_NAME)
@@ -251,23 +249,14 @@ fn load_keys_from_variables() -> EnrollmentStatus {
     enrollment::get_enrollment_status()
 }
 
-/// Get variable data from the in-memory variable cache
+/// Refresh boot-only Authenticode key caches from standard GetVariable calls.
+pub(crate) fn refresh_key_databases() {
+    let _ = load_keys_from_variables();
+}
+
+/// Get variable data from the authoritative runtime image store.
 fn get_variable_data(guid: &r_efi::efi::Guid, name: &[u16]) -> Option<Vec<u8>> {
-    let mut result: Option<Vec<u8>> = None;
-
-    state::with_efi_mut(|efi| {
-        result = efi
-            .variables
-            .iter()
-            .find(|var| {
-                var.in_use
-                    && var.vendor_guid == *guid
-                    && crate::efi::utils::ucs2_eq(&var.name, name)
-            })
-            .map(|var| var.data[..var.data_size].to_vec());
-    });
-
-    result
+    crate::efi::runtime_image::client::variables::get(guid, name).map(|(_, data)| data)
 }
 
 // name_matches consolidated into crate::efi::utils::ucs2_eq
@@ -288,19 +277,9 @@ fn enroll_and_persist_default_keys() -> Result<(), AuthError> {
 /// This persists each key database along with its timestamp for proper
 /// monotonic timestamp validation on future authenticated variable updates.
 pub fn persist_key_databases() -> Result<(), AuthError> {
-    // Persist PK
-    {
-        let pk = pk_database();
-        if !pk.is_empty() {
-            let data = pk.to_signature_lists();
-            let timestamp = *pk.timestamp();
-            if !data.is_empty() {
-                persist_key_variable(SecureBootVariable::PK, &data, &timestamp)?;
-                log::debug!("Persisted PK ({} bytes)", data.len());
-            }
-        }
-    }
-
+    // Persist KEK, db, and dbx while the image remains in Setup Mode. PK is
+    // deliberately enrolled last because that standard SetVariable call
+    // transitions the image into User Mode.
     // Persist KEK
     {
         let kek = kek_database();
@@ -340,6 +319,19 @@ pub fn persist_key_databases() -> Result<(), AuthError> {
         }
     }
 
+    // Persist PK last: its commit enters User Mode.
+    {
+        let pk = pk_database();
+        if !pk.is_empty() {
+            let data = pk.to_signature_lists();
+            let timestamp = *pk.timestamp();
+            if !data.is_empty() {
+                persist_key_variable(SecureBootVariable::PK, &data, &timestamp)?;
+                log::debug!("Persisted PK ({} bytes)", data.len());
+            }
+        }
+    }
+
     log::info!("Secure Boot key databases persisted to SMMSTORE");
     Ok(())
 }
@@ -360,53 +352,47 @@ fn persist_key_variable(
         SecureBootVariable::Dbx => (EFI_IMAGE_SECURITY_DATABASE_GUID, DBX_NAME),
     };
 
-    // Convert EfiTime to SerializedTime for varstore
-    let serialized_ts = timestamp.to_serialized();
+    use zerocopy::IntoBytes;
 
-    // Persist to SMMSTORE with timestamp
-    persist_variable_with_timestamp(&guid, name, SECURE_BOOT_KEY_ATTRS, data, serialized_ts)
-        .map_err(|e| {
-            log::error!("Failed to persist {:?}: {:?}", var_type, e);
-            match e {
-                VarStoreError::StoreFull => AuthError::BufferTooSmall,
-                _ => AuthError::CryptoError,
-            }
-        })?;
+    let timestamp = if timestamp.year == 0 {
+        super::time::read_rtc_efi_time()
+    } else {
+        *timestamp
+    };
+    let mut envelope = Vec::new();
+    envelope
+        .try_reserve_exact(40usize.saturating_add(data.len()))
+        .map_err(|_| AuthError::BufferTooSmall)?;
+    envelope.extend_from_slice(timestamp.as_bytes());
+    envelope.extend_from_slice(&24u32.to_le_bytes());
+    envelope.extend_from_slice(&super::WIN_CERT_REVISION.to_le_bytes());
+    envelope.extend_from_slice(&super::WIN_CERT_TYPE_EFI_GUID.to_le_bytes());
+    envelope.extend_from_slice(super::EFI_CERT_TYPE_PKCS7_GUID.as_bytes());
+    envelope.extend_from_slice(data);
 
-    // Also update in-memory variable cache
-    crate::efi::varstore::update_variable_in_memory(&guid, name, SECURE_BOOT_KEY_ATTRS, data);
-
-    Ok(())
+    let status = crate::efi::runtime_image::client::variables::set(
+        &guid,
+        name,
+        SECURE_BOOT_KEY_ATTRS,
+        &envelope,
+    );
+    if status == r_efi::efi::Status::SUCCESS {
+        Ok(())
+    } else if status == r_efi::efi::Status::OUT_OF_RESOURCES {
+        Err(AuthError::BufferTooSmall)
+    } else {
+        log::error!(
+            "SetVariable rejected {:?} enrollment: {:?}",
+            var_type,
+            status
+        );
+        Err(AuthError::CryptoError)
+    }
 }
-
-// update_variable_in_memory consolidated into crate::efi::varstore::update_variable_in_memory
 
 /// Create or update the SecureBoot and SetupMode status variables
 fn create_status_variables() -> Result<(), AuthError> {
-    // SetupMode: 1 if in Setup Mode, 0 if in User Mode
-    let setup_mode_value: u8 = if is_setup_mode() { 1 } else { 0 };
-    crate::efi::varstore::update_variable_in_memory(
-        &EFI_GLOBAL_VARIABLE_GUID,
-        SETUP_MODE_NAME,
-        STATUS_VAR_ATTRS,
-        &[setup_mode_value],
-    );
-    log::debug!("SetupMode variable set to {}", setup_mode_value);
-
-    // SecureBoot: 1 if Secure Boot is enabled, 0 otherwise
-    let secure_boot_value: u8 = if super::is_secure_boot_enabled() {
-        1
-    } else {
-        0
-    };
-    crate::efi::varstore::update_variable_in_memory(
-        &EFI_GLOBAL_VARIABLE_GUID,
-        SECURE_BOOT_NAME,
-        STATUS_VAR_ATTRS,
-        &[secure_boot_value],
-    );
-    log::debug!("SecureBoot variable set to {}", secure_boot_value);
-
+    // SetupMode and SecureBoot are synthesized read-only by the runtime image.
     Ok(())
 }
 
@@ -442,39 +428,23 @@ pub fn get_enrollment_summary() -> (usize, usize, usize, usize) {
 pub fn clear_all_keys() -> Result<(), AuthError> {
     log::warn!("Clearing all Secure Boot keys!");
 
-    // Clear in-memory databases
-    {
-        let mut pk = pk_database();
-        pk.clear();
-    }
-    {
-        let mut kek = kek_database();
-        kek.clear();
-    }
-    {
-        let mut db = db_database();
-        db.clear();
-    }
-    {
-        let mut dbx = dbx_database();
-        dbx.clear();
+    let zero_timestamp = super::structures::EfiTime::zero();
+    for variable in [
+        SecureBootVariable::PK,
+        SecureBootVariable::KEK,
+        SecureBootVariable::Db,
+        SecureBootVariable::Dbx,
+    ] {
+        if let Err(error) = persist_key_variable(variable, &[], &zero_timestamp) {
+            // A preceding delete may already have changed live image policy.
+            // Always reconcile disposable boot caches before reporting failure.
+            refresh_key_databases();
+            return Err(error);
+        }
+        refresh_key_databases();
     }
 
-    // Enter Setup Mode
-    enter_setup_mode();
-
-    // Delete persisted variables from SMMSTORE
-    // Note: We persist empty data which effectively deletes the variable
-    // Use zero timestamp since we're clearing everything
-    let zero_ts = super::structures::EfiTime::zero();
-    let _ = persist_key_variable(SecureBootVariable::PK, &[], &zero_ts);
-    let _ = persist_key_variable(SecureBootVariable::KEK, &[], &zero_ts);
-    let _ = persist_key_variable(SecureBootVariable::Db, &[], &zero_ts);
-    let _ = persist_key_variable(SecureBootVariable::Dbx, &[], &zero_ts);
-
-    // Update status variables
     update_status_variables()?;
-
     log::info!("All Secure Boot keys cleared - system in Setup Mode");
     Ok(())
 }

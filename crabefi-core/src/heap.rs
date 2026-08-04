@@ -1,8 +1,9 @@
 //! Global Allocator for CrabEFI
 //!
 //! This module provides the global allocator used by `alloc`. Its backing pages
-//! are RuntimeServicesData, so allocations remain available to EFI runtime
-//! services after ExitBootServices.
+//! are BootServicesData and intentionally disappear after ExitBootServices.
+//! The separate runtime image uses its own bounded BSS scratch allocator and
+//! never reaches this boot allocator.
 
 use core::sync::atomic::{AtomicBool, Ordering};
 
@@ -45,12 +46,11 @@ pub fn init() -> bool {
         return false;
     }
 
-    // RuntimeServicesData remains mapped after ExitBootServices, including the
-    // linked-list allocator's in-band free-list metadata.
+    // The global heap and its in-band free-list metadata are boot-only.
     let mut heap_addr = 0;
     let status = allocate_pages(
         AllocateType::AllocateAnyPages,
-        MemoryType::RuntimeServicesData,
+        MemoryType::BootServicesData,
         HEAP_PAGES,
         &mut heap_addr,
     );
@@ -60,7 +60,7 @@ pub fn init() -> bool {
         return false;
     }
 
-    // SAFETY: `heap_addr` is a newly allocated, page-aligned RuntimeServicesData
+    // SAFETY: `heap_addr` is a newly allocated, page-aligned BootServicesData
     // range, and this is the sole initialization guarded by HEAP_INITIALIZED.
     unsafe {
         ALLOCATOR.lock().init(heap_addr as *mut u8, HEAP_SIZE);

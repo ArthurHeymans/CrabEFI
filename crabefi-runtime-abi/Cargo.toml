@@ -1,0 +1,11 @@
+[package]
+name = "crabefi-runtime-abi"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0 OR MIT"
+description = "Pointer-free file and handoff ABI for the CrabEFI runtime image"
+
+[workspace]
+
+[lib]
+path = "src/lib.rs"

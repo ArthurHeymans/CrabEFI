@@ -5,6 +5,8 @@
 members = ["crabefi-core", "crabefi-coreboot", "crabefi-drivers"]
 exclude = [
   "xtask",
+  "crabefi-runtime-abi",
+  "crabefi-runtime-image",
   "test-apps/hello",
   "test-apps/rng-test",
   "test-apps/secure-boot-test",
@@ -12,6 +14,7 @@ exclude = [
   "test-apps/directory-test",
   "test-apps/fw-dump",
   "test-apps/tcg-test",
+  "test-apps/runtime-image-test",
 ]
 resolver = "3"
 

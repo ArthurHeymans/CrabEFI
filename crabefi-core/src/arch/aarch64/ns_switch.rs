@@ -4,8 +4,9 @@
 //! as FIQ. The Linux kernel only handles IRQ, so NVMe and other MSI-X devices
 //! hang forever waiting for completion interrupts.
 //!
-//! The trampoline writes a small code sequence to a RAM buffer (in BSS, which
-//! is RuntimeServicesData and accessible from both S and NS):
+//! The trampoline writes a small code sequence to a transient boot-image BSS
+//! buffer. It executes and returns inside the successful ExitBootServices call,
+//! before the runtime image seals the boot-image boundary:
 //!
 //! ```text
 //!   STP  X30, XZR, [SP, #-16]!   // save return address
@@ -27,7 +28,7 @@ const TRAMPOLINE_CODE: [u32; 5] = [
     0xD65F_03C0, // ret
 ];
 
-/// Static buffer for the trampoline (in BSS = RuntimeServicesData = RAM).
+/// Transient BootServicesData buffer used only during ExitBootServices.
 static mut TRAMPOLINE_BUF: [u32; 5] = [0; 5];
 
 /// Transition from Secure EL1 to Non-Secure EL1.

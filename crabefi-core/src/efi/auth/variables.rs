@@ -8,7 +8,6 @@ use super::guid_to_bytes;
 use super::structures::{EfiTime, SignatureIterator, SignatureListIterator};
 use super::{AuthError, EFI_CERT_SHA256_GUID, EFI_CERT_X509_GUID};
 use alloc::vec::Vec;
-use r_efi::efi::Guid;
 
 // ============================================================================
 // Secure Boot Variable Names
@@ -284,30 +283,6 @@ pub fn dbx_database() -> spin::MutexGuard<'static, KeyDatabase> {
     DBX_DATABASE.lock()
 }
 
-/// Identify which key database a variable belongs to
-pub fn identify_key_database(name: &[u16], guid: &Guid) -> Option<SecureBootVariable> {
-    use super::{EFI_GLOBAL_VARIABLE_GUID, EFI_IMAGE_SECURITY_DATABASE_GUID};
-
-    use crate::efi::utils::ucs2_eq;
-
-    if *guid == EFI_GLOBAL_VARIABLE_GUID {
-        if ucs2_eq(name, PK_NAME) {
-            return Some(SecureBootVariable::PK);
-        }
-        if ucs2_eq(name, KEK_NAME) {
-            return Some(SecureBootVariable::KEK);
-        }
-    } else if *guid == EFI_IMAGE_SECURITY_DATABASE_GUID {
-        if ucs2_eq(name, DB_NAME) {
-            return Some(SecureBootVariable::Db);
-        }
-        if ucs2_eq(name, DBX_NAME) {
-            return Some(SecureBootVariable::Dbx);
-        }
-    }
-    None
-}
-
 /// Secure Boot variable type
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SecureBootVariable {
@@ -319,29 +294,6 @@ pub enum SecureBootVariable {
     Db,
     /// Forbidden signature database
     Dbx,
-}
-
-impl SecureBootVariable {
-    /// Get the GUID for this variable
-    pub fn guid(&self) -> Guid {
-        use super::{EFI_GLOBAL_VARIABLE_GUID, EFI_IMAGE_SECURITY_DATABASE_GUID};
-        match self {
-            SecureBootVariable::PK | SecureBootVariable::KEK => EFI_GLOBAL_VARIABLE_GUID,
-            SecureBootVariable::Db | SecureBootVariable::Dbx => EFI_IMAGE_SECURITY_DATABASE_GUID,
-        }
-    }
-
-    /// Get which key database should authorize modifications to this variable
-    pub fn authorizing_database(&self) -> SecureBootVariable {
-        match self {
-            // PK is self-signed (or authorized in setup mode)
-            SecureBootVariable::PK => SecureBootVariable::PK,
-            // KEK is authorized by PK
-            SecureBootVariable::KEK => SecureBootVariable::PK,
-            // db and dbx are authorized by KEK (or PK)
-            SecureBootVariable::Db | SecureBootVariable::Dbx => SecureBootVariable::KEK,
-        }
-    }
 }
 
 // name_matches consolidated into crate::efi::utils::ucs2_eq

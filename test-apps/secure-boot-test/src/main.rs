@@ -558,6 +558,9 @@ fn test_unauth_pk_write(console: &Console, st: *mut SystemTable, results: &mut T
     } else if status == Status::SUCCESS {
         console.println("[FAIL] Write succeeded (should have been blocked)");
         results.record_fail();
+    } else if status == Status::UNSUPPORTED {
+        console.println("[FAIL] Authenticated SetVariable is unsupported");
+        results.record_fail();
     } else {
         console.print("Rejected: ");
         console.print_status(status);
@@ -593,6 +596,9 @@ fn test_unauth_kek_write(console: &Console, st: *mut SystemTable, results: &mut 
         results.record_pass();
     } else if status == Status::SUCCESS {
         console.println("[FAIL] Write succeeded (should have been blocked)");
+        results.record_fail();
+    } else if status == Status::UNSUPPORTED {
+        console.println("[FAIL] Authenticated SetVariable is unsupported");
         results.record_fail();
     } else {
         console.print("Rejected: ");
@@ -630,6 +636,9 @@ fn test_unauth_db_write(console: &Console, st: *mut SystemTable, results: &mut T
     } else if status == Status::SUCCESS {
         console.println("[FAIL] Write succeeded (should have been blocked)");
         results.record_fail();
+    } else if status == Status::UNSUPPORTED {
+        console.println("[FAIL] Authenticated SetVariable is unsupported");
+        results.record_fail();
     } else {
         console.print("Rejected: ");
         console.print_status(status);
@@ -665,6 +674,9 @@ fn test_unauth_dbx_write(console: &Console, st: *mut SystemTable, results: &mut 
         results.record_pass();
     } else if status == Status::SUCCESS {
         console.println("[FAIL] Write succeeded (should have been blocked)");
+        results.record_fail();
+    } else if status == Status::UNSUPPORTED {
+        console.println("[FAIL] Authenticated SetVariable is unsupported");
         results.record_fail();
     } else {
         console.print("Rejected: ");

@@ -1,9 +1,13 @@
-//! EFI System Table
+//! Boot-time discovery and client calls for image-owned EFI tables.
 //!
-//! This module provides the EFI System Table structure that is passed to
-//! loaded UEFI applications and drivers.
+//! Runtime Services, System Table, vendor string, configuration entries,
+//! Runtime Properties, Memory Attributes, and ESRT storage all live in the
+//! separately allocated runtime image. This module retains only platform table
+//! validation and immediate boot-side registration.
 
 use core::ffi::c_void;
+
+use crabefi_runtime_abi::{ConfigurationRegistration, ConsoleRegistration, configuration_policy};
 use r_efi::efi::{self, Guid, Handle, TableHeader};
 use r_efi::protocols::simple_text_input::Protocol as SimpleTextInputProtocol;
 use r_efi::protocols::simple_text_output::Protocol as SimpleTextOutputProtocol;
@@ -11,15 +15,9 @@ use spin::Mutex;
 use zerocopy::{FromBytes, Immutable, KnownLayout, Unaligned};
 
 use crate::efi::tcg::types::{CryptoAgileEvent, TaggedDigest, TcgError};
-use crate::state::{self, ConfigurationTable, MAX_CONFIG_TABLES};
+use crate::state;
 
-/// EFI System Table signature "IBI SYST"
-const EFI_SYSTEM_TABLE_SIGNATURE: u64 = 0x5453595320494249;
-
-/// EFI System Table revision (2.100 = UEFI 2.10)
-const EFI_SYSTEM_TABLE_REVISION: u32 = (2 << 16) | 100;
-
-/// ACPI 2.0 RSDP GUID
+/// ACPI 2.0 RSDP GUID.
 pub const ACPI_20_TABLE_GUID: Guid = Guid::from_fields(
     0x8868e871,
     0xe4f1,
@@ -28,8 +26,7 @@ pub const ACPI_20_TABLE_GUID: Guid = Guid::from_fields(
     0x22,
     &[0x00, 0x80, 0xc7, 0x3c, 0x88, 0x81],
 );
-
-/// ACPI 1.0 RSDP GUID
+/// ACPI 1.0 RSDP GUID.
 pub const ACPI_TABLE_GUID: Guid = Guid::from_fields(
     0xeb9d2d30,
     0x2d88,
@@ -38,8 +35,7 @@ pub const ACPI_TABLE_GUID: Guid = Guid::from_fields(
     0x16,
     &[0x00, 0x90, 0x27, 0x3f, 0xc1, 0x4d],
 );
-
-/// SMBIOS Table GUID
+/// SMBIOS 2.x table GUID.
 pub const SMBIOS_TABLE_GUID: Guid = Guid::from_fields(
     0xeb9d2d31,
     0x2d88,
@@ -48,8 +44,7 @@ pub const SMBIOS_TABLE_GUID: Guid = Guid::from_fields(
     0x16,
     &[0x00, 0x90, 0x27, 0x3f, 0xc1, 0x4d],
 );
-
-/// SMBIOS 3.0 Table GUID
+/// SMBIOS 3.x table GUID.
 pub const SMBIOS3_TABLE_GUID: Guid = Guid::from_fields(
     0xf2fd1544,
     0x9794,
@@ -58,10 +53,7 @@ pub const SMBIOS3_TABLE_GUID: Guid = Guid::from_fields(
     0x2e,
     &[0xe5, 0xbb, 0xcf, 0x20, 0xe3, 0x94],
 );
-
-/// EFI DTB Table GUID (Flattened Device Tree)
-///
-/// Used to pass a device tree blob to the OS via EFI configuration tables.
+/// Flattened Device Tree configuration table GUID.
 pub const EFI_DTB_TABLE_GUID: Guid = Guid::from_fields(
     0xb1b621d5,
     0xf19c,
@@ -70,11 +62,7 @@ pub const EFI_DTB_TABLE_GUID: Guid = Guid::from_fields(
     0x0b,
     &[0xd9, 0x15, 0x2c, 0x69, 0xaa, 0xe0],
 );
-
-/// EFI Runtime Properties Table GUID (UEFI 2.8+)
-///
-/// This configuration table tells the OS which runtime services are available.
-/// Linux uses this to determine if SetVariable is supported (needed for efi_pstore).
+/// Runtime Properties table GUID, generated inside the runtime image.
 pub const EFI_RT_PROPERTIES_TABLE_GUID: Guid = Guid::from_fields(
     0xeb66918a,
     0x7eef,
@@ -84,333 +72,112 @@ pub const EFI_RT_PROPERTIES_TABLE_GUID: Guid = Guid::from_fields(
     &[0x93, 0x1d, 0x21, 0xc3, 0x8a, 0xe9],
 );
 
-// ============================================================================
-// EFI Runtime Services Supported Flags (from UEFI Specification)
-// ============================================================================
-
-/// GetTime() is supported
-pub const EFI_RT_SUPPORTED_GET_TIME: u32 = 0x0001;
-/// SetTime() is supported
-pub const EFI_RT_SUPPORTED_SET_TIME: u32 = 0x0002;
-/// GetWakeupTime() is supported
-pub const EFI_RT_SUPPORTED_GET_WAKEUP_TIME: u32 = 0x0004;
-/// SetWakeupTime() is supported
-pub const EFI_RT_SUPPORTED_SET_WAKEUP_TIME: u32 = 0x0008;
-/// GetVariable() is supported
-pub const EFI_RT_SUPPORTED_GET_VARIABLE: u32 = 0x0010;
-/// GetNextVariableName() is supported
-pub const EFI_RT_SUPPORTED_GET_NEXT_VARIABLE_NAME: u32 = 0x0020;
-/// SetVariable() is supported
-pub const EFI_RT_SUPPORTED_SET_VARIABLE: u32 = 0x0040;
-/// SetVirtualAddressMap() is supported
-pub const EFI_RT_SUPPORTED_SET_VIRTUAL_ADDRESS_MAP: u32 = 0x0080;
-/// ConvertPointer() is supported
-pub const EFI_RT_SUPPORTED_CONVERT_POINTER: u32 = 0x0100;
-/// GetNextHighMonotonicCount() is supported
-pub const EFI_RT_SUPPORTED_GET_NEXT_HIGH_MONOTONIC_COUNT: u32 = 0x0200;
-/// ResetSystem() is supported
-pub const EFI_RT_SUPPORTED_RESET_SYSTEM: u32 = 0x0400;
-/// UpdateCapsule() is supported
-pub const EFI_RT_SUPPORTED_UPDATE_CAPSULE: u32 = 0x0800;
-/// QueryCapsuleCapabilities() is supported
-pub const EFI_RT_SUPPORTED_QUERY_CAPSULE_CAPABILITIES: u32 = 0x1000;
-/// QueryVariableInfo() is supported
-pub const EFI_RT_SUPPORTED_QUERY_VARIABLE_INFO: u32 = 0x2000;
-
-/// All runtime services supported
-pub const EFI_RT_SUPPORTED_ALL: u32 = 0x3fff;
-
-/// EFI Runtime Properties Table version
-pub const EFI_RT_PROPERTIES_TABLE_VERSION: u16 = 0x1;
-
-/// EFI Runtime Properties Table
-///
-/// This table advertises which EFI Runtime Services are supported.
-/// Reference: UEFI Specification 2.8+, Section 4.6
-#[repr(C)]
-pub struct EfiRtPropertiesTable {
-    /// Version of the table (must be EFI_RT_PROPERTIES_TABLE_VERSION)
-    pub version: u16,
-    /// Length of the table in bytes
-    pub length: u16,
-    /// Bitmask of supported runtime services
-    pub runtime_services_supported: u32,
-}
-
-/// Static RT Properties Table
-///
-/// CrabEFI supports:
-/// - GetTime (reads from CMOS RTC)
-/// - GetVariable, GetNextVariableName, SetVariable, QueryVariableInfo (full variable services)
-/// - SetVirtualAddressMap (accepts but identity-maps)
-/// - ResetSystem (keyboard controller reset or triple fault)
-///
-/// CrabEFI does NOT support:
-/// - SetTime (not implemented)
-/// - GetWakeupTime/SetWakeupTime (not implemented)
-/// - ConvertPointer (not implemented)
-/// - GetNextHighMonotonicCount (not implemented)
-static RT_PROPERTIES_TABLE: EfiRtPropertiesTable = EfiRtPropertiesTable {
-    version: EFI_RT_PROPERTIES_TABLE_VERSION,
-    length: core::mem::size_of::<EfiRtPropertiesTable>() as u16,
-    runtime_services_supported: EFI_RT_SUPPORTED_GET_TIME
-        | EFI_RT_SUPPORTED_GET_VARIABLE
-        | EFI_RT_SUPPORTED_GET_NEXT_VARIABLE_NAME
-        | EFI_RT_SUPPORTED_SET_VARIABLE
-        | EFI_RT_SUPPORTED_SET_VIRTUAL_ADDRESS_MAP
-        | EFI_RT_SUPPORTED_RESET_SYSTEM
-        | EFI_RT_SUPPORTED_UPDATE_CAPSULE
-        | EFI_RT_SUPPORTED_QUERY_CAPSULE_CAPABILITIES
-        | EFI_RT_SUPPORTED_QUERY_VARIABLE_INFO,
-};
-
-/// SMBIOS 2.1 Entry Point structure (32-bit)
-///
-/// Reference: SMBIOS Reference Specification, Chapter 5.2.1
 #[repr(C, packed)]
 #[derive(FromBytes, Immutable, KnownLayout, Unaligned)]
 struct Smbios21Entry {
-    /// Anchor string "_SM_"
     anchor: [u8; 4],
-    /// Checksum of entry point structure
     checksum: u8,
-    /// Length of entry point structure (0x1F for 2.1)
     length: u8,
-    /// SMBIOS major version
     major_version: u8,
-    /// SMBIOS minor version
     minor_version: u8,
-    /// Maximum structure size
     max_struct_size: u16,
-    /// Entry point revision
     entry_point_rev: u8,
-    /// Formatted area (reserved)
     formatted_area: [u8; 5],
-    /// Intermediate anchor "_DMI_"
     intermediate_anchor: [u8; 5],
-    /// Intermediate checksum
     intermediate_checksum: u8,
-    /// Total length of structure table
     struct_table_length: u16,
-    /// 32-bit physical address of structure table
     struct_table_address: u32,
-    /// Number of SMBIOS structures
     struct_count: u16,
-    /// BCD revision
     bcd_revision: u8,
 }
 
-/// SMBIOS 3.0 Entry Point structure (64-bit)
-///
-/// Reference: SMBIOS Reference Specification, Chapter 5.2.2
 #[repr(C, packed)]
 #[derive(FromBytes, Immutable, KnownLayout, Unaligned)]
 struct Smbios30Entry {
-    /// Anchor string "_SM3_"
     anchor: [u8; 5],
-    /// Checksum of entry point structure
     checksum: u8,
-    /// Length of entry point structure (0x18 for 3.0)
     length: u8,
-    /// SMBIOS major version
     major_version: u8,
-    /// SMBIOS minor version
     minor_version: u8,
-    /// SMBIOS docrev
     docrev: u8,
-    /// Entry point revision
     entry_point_rev: u8,
-    /// Reserved
     reserved: u8,
-    /// Maximum size of structure table
     struct_table_max_size: u32,
-    /// 64-bit physical address of structure table
     struct_table_address: u64,
 }
 
-/// EFI System Table
+pub type SystemTable = efi::SystemTable;
+
+/// Verify that the mandatory image client has already published its tables.
 ///
-/// This is the main entry point structure passed to EFI applications.
-/// It provides access to boot services, runtime services, and configuration tables.
-#[repr(C)]
-pub struct SystemTable {
-    /// Table header
-    pub hdr: TableHeader,
-    /// Firmware vendor string (null-terminated UCS-2)
-    pub firmware_vendor: *const u16,
-    /// Firmware revision
-    pub firmware_revision: u32,
-    /// Console input handle
-    pub console_in_handle: Handle,
-    /// Console input protocol
-    pub con_in: *mut SimpleTextInputProtocol,
-    /// Console output handle
-    pub console_out_handle: Handle,
-    /// Console output protocol
-    pub con_out: *mut SimpleTextOutputProtocol,
-    /// Standard error handle
-    pub standard_error_handle: Handle,
-    /// Standard error protocol
-    pub std_err: *mut SimpleTextOutputProtocol,
-    /// Runtime services table
-    pub runtime_services: *mut efi::RuntimeServices,
-    /// Boot services table
-    pub boot_services: *mut efi::BootServices,
-    /// Number of configuration tables
-    pub number_of_table_entries: usize,
-    /// Array of configuration tables
-    pub configuration_table: *mut ConfigurationTable,
+/// Called once during single-threaded EFI initialization.
+pub fn init() {
+    assert!(
+        !get_system_table().is_null(),
+        "runtime image System Table is unavailable"
+    );
 }
 
-/// Static storage for the system table
-static mut SYSTEM_TABLE: SystemTable = SystemTable {
-    hdr: TableHeader {
-        signature: EFI_SYSTEM_TABLE_SIGNATURE,
-        revision: EFI_SYSTEM_TABLE_REVISION,
-        header_size: core::mem::size_of::<SystemTable>() as u32,
-        crc32: 0,
-        reserved: 0,
-    },
-    firmware_vendor: core::ptr::null(),
-    firmware_revision: 0,
-    console_in_handle: core::ptr::null_mut(),
-    con_in: core::ptr::null_mut(),
-    console_out_handle: core::ptr::null_mut(),
-    con_out: core::ptr::null_mut(),
-    standard_error_handle: core::ptr::null_mut(),
-    std_err: core::ptr::null_mut(),
-    runtime_services: core::ptr::null_mut(),
-    boot_services: core::ptr::null_mut(),
-    number_of_table_entries: 0,
-    configuration_table: core::ptr::null_mut(),
-};
-
-/// Firmware vendor string "CrabEFI" in UCS-2
-static FIRMWARE_VENDOR: [u16; 8] = [
-    'C' as u16, 'r' as u16, 'a' as u16, 'b' as u16, 'E' as u16, 'F' as u16, 'I' as u16, 0,
-];
-
-/// CrabEFI firmware revision (0.1.0 = 0x00010000)
-const CRABEFI_REVISION: u32 = 0x00010000;
-
-/// Initialize the system table
-///
-/// # Safety
-///
-/// This function must only be called once during initialization.
-pub unsafe fn init(
-    boot_services: *mut efi::BootServices,
-    runtime_services: *mut efi::RuntimeServices,
-) {
-    unsafe {
-        SYSTEM_TABLE.firmware_vendor = FIRMWARE_VENDOR.as_ptr();
-        SYSTEM_TABLE.firmware_revision = CRABEFI_REVISION;
-        SYSTEM_TABLE.boot_services = boot_services;
-        SYSTEM_TABLE.runtime_services = runtime_services;
-
-        // Set up configuration table pointer
-        let efi = state::efi();
-        SYSTEM_TABLE.configuration_table = efi.config_tables.as_ptr() as *mut ConfigurationTable;
-
-        log::debug!("EFI System Table initialized");
-    }
-}
-
-/// Get a pointer to the system table
 pub fn get_system_table() -> *mut SystemTable {
-    &raw mut SYSTEM_TABLE
+    super::runtime_image::client::get_system_table()
 }
 
-/// Get a pointer to the system table as EFI type
 pub fn get_system_table_efi() -> *mut efi::SystemTable {
-    // Safety: SystemTable has the same layout as efi::SystemTable
-    get_system_table() as *mut efi::SystemTable
+    get_system_table()
 }
 
-/// Set the console input protocol
-///
-/// # Safety
-///
-/// The protocol pointer must remain valid for the lifetime of boot services.
-pub unsafe fn set_console_in(handle: Handle, protocol: *mut SimpleTextInputProtocol) {
-    unsafe {
-        SYSTEM_TABLE.console_in_handle = handle;
-        SYSTEM_TABLE.con_in = protocol;
-    }
+/// Set the boot-only console input fields in image-owned storage.
+pub(crate) fn set_console_in(handle: Handle, protocol: *mut SimpleTextInputProtocol) {
+    set_console(0, handle, protocol.cast());
 }
 
-/// Set the console output protocol
-///
-/// # Safety
-///
-/// The protocol pointer must remain valid for the lifetime of boot services.
-pub unsafe fn set_console_out(handle: Handle, protocol: *mut SimpleTextOutputProtocol) {
-    unsafe {
-        SYSTEM_TABLE.console_out_handle = handle;
-        SYSTEM_TABLE.con_out = protocol;
-    }
+/// Set the boot-only console output fields in image-owned storage.
+pub(crate) fn set_console_out(handle: Handle, protocol: *mut SimpleTextOutputProtocol) {
+    set_console(1, handle, protocol.cast());
 }
 
-/// Set the standard error protocol
-///
-/// # Safety
-///
-/// The protocol pointer must remain valid for the lifetime of boot services.
-pub unsafe fn set_std_err(handle: Handle, protocol: *mut SimpleTextOutputProtocol) {
-    unsafe {
-        SYSTEM_TABLE.standard_error_handle = handle;
-        SYSTEM_TABLE.std_err = protocol;
-    }
+/// Set the boot-only standard-error fields in image-owned storage.
+pub(crate) fn set_std_err(handle: Handle, protocol: *mut SimpleTextOutputProtocol) {
+    set_console(2, handle, protocol.cast());
 }
 
-/// Install a configuration table
+fn set_console(kind: u32, handle: Handle, protocol: *mut c_void) {
+    let status = state::efi()
+        .runtime_image
+        .ok_or(efi::Status::NOT_READY)
+        .and_then(|client| {
+            client.set_console(&ConsoleRegistration {
+                kind,
+                reserved: 0,
+                handle: handle as u64,
+                protocol: protocol as u64,
+            })
+        });
+    assert!(
+        status.is_ok(),
+        "runtime image rejected console registration"
+    );
+}
+
+/// Install a boot-created physical handoff table in image-owned configuration storage.
 ///
-/// If a table with the same GUID already exists, it will be updated.
-/// If vendor_table is null, the table entry will be removed.
+/// UEFI applications such as the Linux EFI stub install their own configuration
+/// tables before EBS. Their payload storage remains at its physical address;
+/// only image-owned runtime tables are converted during SVAM.
 pub fn install_configuration_table(guid: &Guid, table: *mut c_void) -> efi::Status {
-    state::with_efi_mut(|efi| {
-        let tables = &mut efi.config_tables;
-        let count = &mut efi.config_table_count;
-
-        // First, check if this GUID already exists
-        if let Some(i) = tables[..*count].iter().position(|t| t.vendor_guid == *guid) {
-            if table.is_null() {
-                // Remove the entry by shifting others down
-                tables.copy_within(i + 1..*count, i);
-                *count -= 1;
-                update_table_count(*count);
-                return efi::Status::SUCCESS;
-            } else {
-                // Update existing entry
-                tables[i].vendor_table = table;
-                return efi::Status::SUCCESS;
-            }
-        }
-
-        // Adding a new entry
-        if table.is_null() {
-            return efi::Status::NOT_FOUND;
-        }
-
-        if *count >= MAX_CONFIG_TABLES {
-            return efi::Status::OUT_OF_RESOURCES;
-        }
-
-        tables[*count] = ConfigurationTable {
-            vendor_guid: *guid,
-            vendor_table: table,
-        };
-        *count += 1;
-        update_table_count(*count);
-
-        efi::Status::SUCCESS
-    })
-}
-
-/// Update the table count in the system table
-fn update_table_count(count: usize) {
-    unsafe {
-        SYSTEM_TABLE.number_of_table_entries = count;
+    let Some(client) = state::efi().runtime_image else {
+        return efi::Status::NOT_READY;
+    };
+    let mut guid_bytes = [0u8; 16];
+    guid_bytes.copy_from_slice(guid.as_bytes());
+    match client.register_configuration(&ConfigurationRegistration {
+        guid: guid_bytes,
+        table_address: table as u64,
+        policy: configuration_policy::PLATFORM_PHYSICAL,
+        reserved: 0,
+    }) {
+        Ok(()) => efi::Status::SUCCESS,
+        Err(status) => status,
     }
 }
 
@@ -751,13 +518,13 @@ pub fn install_acpi_tables(rsdp: u64) {
         log::error!("Failed to install ACPI 1.0 table: {:?}", status);
     }
 
-    // Log final configuration table state
-    let count = state::efi().config_table_count;
-    log::info!(
-        "Configuration table has {} entries, SystemTable.number_of_table_entries = {}",
-        count,
-        unsafe { SYSTEM_TABLE.number_of_table_entries }
-    );
+    let system_table = get_system_table();
+    if !system_table.is_null() {
+        // SAFETY: the validated runtime image owns an initialized System Table.
+        log::info!("Configuration table has {} entries", unsafe {
+            (*system_table).number_of_table_entries
+        });
+    }
 }
 
 /// Install a device tree blob (FDT) as an EFI configuration table
@@ -969,75 +736,19 @@ unsafe fn update_table_header_crc32(header: *mut TableHeader) {
     }
 }
 
-/// Recompute CRC32 checksums for the System Table, Boot Services, and Runtime Services.
+/// Recompute the boot-owned Boot Services CRC.
 ///
-/// Must be called after any modification to these tables (e.g., after installing
-/// configuration tables, setting console pointers, etc.) and before handing the
-/// system table to an EFI application.
+/// Runtime/System CRCs are maintained by image registration and seal exports.
 pub fn update_crc32() {
-    unsafe {
-        // Update Boot Services CRC32
-        if !SYSTEM_TABLE.boot_services.is_null() {
-            update_table_header_crc32(&raw mut (*SYSTEM_TABLE.boot_services).hdr);
-        }
-        // Update Runtime Services CRC32
-        if !SYSTEM_TABLE.runtime_services.is_null() {
-            update_table_header_crc32(&raw mut (*SYSTEM_TABLE.runtime_services).hdr);
-        }
-        // Update System Table CRC32 (must be last since it covers the whole table)
-        update_table_header_crc32(&raw mut SYSTEM_TABLE.hdr);
-    }
-    log::debug!("Updated CRC32 checksums for System/BS/RT tables");
-}
-
-/// Install the EFI Runtime Properties Table
-///
-/// This table (UEFI 2.8+) tells the OS which runtime services are available.
-/// Linux's efi_pstore module needs this to know SetVariable is supported.
-///
-/// The table is installed with the EFI_RT_PROPERTIES_TABLE_GUID and contains
-/// a bitmask of supported runtime services.
-pub fn install_rt_properties_table() {
-    let table_ptr = &RT_PROPERTIES_TABLE as *const EfiRtPropertiesTable as *mut c_void;
-
-    let status = install_configuration_table(&EFI_RT_PROPERTIES_TABLE_GUID, table_ptr);
-    if status == efi::Status::SUCCESS {
-        log::info!(
-            "Installed EFI RT Properties Table (supported services: {:#06x})",
-            RT_PROPERTIES_TABLE.runtime_services_supported
-        );
-
-        // Log which services are advertised
-        let supported = RT_PROPERTIES_TABLE.runtime_services_supported;
-        log::debug!("  Runtime services supported:");
-        if supported & EFI_RT_SUPPORTED_GET_TIME != 0 {
-            log::debug!("    - GetTime");
-        }
-        if supported & EFI_RT_SUPPORTED_SET_TIME != 0 {
-            log::debug!("    - SetTime");
-        }
-        if supported & EFI_RT_SUPPORTED_GET_VARIABLE != 0 {
-            log::debug!("    - GetVariable");
-        }
-        if supported & EFI_RT_SUPPORTED_GET_NEXT_VARIABLE_NAME != 0 {
-            log::debug!("    - GetNextVariableName");
-        }
-        if supported & EFI_RT_SUPPORTED_SET_VARIABLE != 0 {
-            log::debug!("    - SetVariable");
-        }
-        if supported & EFI_RT_SUPPORTED_SET_VIRTUAL_ADDRESS_MAP != 0 {
-            log::debug!("    - SetVirtualAddressMap");
-        }
-        if supported & EFI_RT_SUPPORTED_RESET_SYSTEM != 0 {
-            log::debug!("    - ResetSystem");
-        }
-        if supported & EFI_RT_SUPPORTED_QUERY_VARIABLE_INFO != 0 {
-            log::debug!("    - QueryVariableInfo");
-        }
-    } else {
-        log::error!("Failed to install RT Properties Table: {:?}", status);
+    let boot_services = super::boot_services::get_boot_services();
+    if !boot_services.is_null() {
+        // SAFETY: BOOT_SERVICES is boot-owned and initialized for this phase.
+        unsafe { update_table_header_crc32(core::ptr::addr_of_mut!((*boot_services).hdr)) };
     }
 }
+
+/// Runtime Properties is constructed and registered by image activation.
+pub fn install_rt_properties_table() {}
 
 /// EFI Memory Attributes Table GUID
 pub const EFI_MEMORY_ATTRIBUTES_TABLE_GUID: Guid = Guid::from_fields(
@@ -1200,289 +911,58 @@ pub fn append_tpm_final_event(
     Ok(())
 }
 
-/// Install the EFI Memory Attributes Table
-///
-/// This table describes memory protection attributes for runtime regions.
-/// Linux uses it to set proper page permissions (RO for code, XP for data).
-/// Windows uses it to validate runtime region mappings.
-///
-/// Reference: UEFI Specification 2.6+, Section 4.6
-pub fn install_memory_attributes_table() {
-    use super::allocator::{self, MemoryType};
+/// Runtime image activation already installs image-owned MAT storage.
+pub fn install_memory_attributes_table() {}
 
-    // Count runtime entries first to determine how much memory to allocate
-    let runtime_count = match count_runtime_entries() {
-        Some(n) if n > 0 => n,
-        _ => {
-            log::warn!("No runtime memory regions found, skipping MEMATTR table");
-            return;
+/// Refresh image-owned MAT storage from the final allocator map in place.
+pub fn rebuild_memory_attributes_table_in_place() -> efi::Status {
+    use super::allocator::{self, MemoryDescriptor, MemoryType};
+    let mut descriptors =
+        [MemoryDescriptor::new(MemoryType::ReservedMemoryType as u32, 0, 0, 0); 32];
+    let count = match allocator::copy_runtime_descriptors(&mut descriptors) {
+        Ok(count) => count,
+        Err(status) => {
+            log::error!("Runtime MAT capacity exceeded: {:?}", status);
+            return status;
         }
     };
-
-    // Allocate memory for the table: header + runtime_count descriptors
-    let descriptor_size = core::mem::size_of::<allocator::MemoryDescriptor>() as u32;
-    let table_size = core::mem::size_of::<EfiMemoryAttributesTable>()
-        + (runtime_count as usize) * (descriptor_size as usize);
-    let table_pages = (table_size as u64).div_ceil(4096);
-
-    let mut table_addr: u64 = 0;
-    let alloc_status = allocator::allocate_pages(
-        allocator::AllocateType::AllocateAnyPages,
-        MemoryType::BootServicesData,
-        table_pages,
-        &mut table_addr,
-    );
-
-    if alloc_status != efi::Status::SUCCESS {
-        log::error!(
-            "Failed to allocate memory for MEMATTR table: {:?}",
-            alloc_status
-        );
-        return;
-    }
-
-    // Fill the table (re-queries the memory map to capture the allocation above)
-    let Some((filled_count, filled_size)) = fill_memory_attributes_table(table_addr) else {
-        return;
+    let Some(client) = state::efi().runtime_image else {
+        return efi::Status::NOT_READY;
     };
-
-    // Install as configuration table
-    let status =
-        install_configuration_table(&EFI_MEMORY_ATTRIBUTES_TABLE_GUID, table_addr as *mut c_void);
-    if status == efi::Status::SUCCESS {
-        log::info!(
-            "Installed EFI Memory Attributes Table ({} runtime entries, {} bytes)",
-            filled_count,
-            filled_size
-        );
-    } else {
-        log::error!(
-            "Failed to install EFI Memory Attributes Table: {:?}",
+    match client.prepare_ebs(&descriptors[..count]) {
+        Ok(()) => efi::Status::SUCCESS,
+        Err(status) => {
+            log::error!("Runtime image rejected final MAT: {:?}", status);
             status
-        );
-    }
-}
-
-/// Rebuild the Memory Attributes Table in-place without allocating.
-///
-/// The initial `install_memory_attributes_table()` allocates a full page for the
-/// table. This function overwrites that page with the current runtime entries.
-/// It must be called just before ExitBootServices locks the allocator, because
-/// runtime regions may have been added since init time (e.g. the deferred
-/// variable buffer).
-///
-/// This function does NOT call allocate_pages and does NOT change the map_key.
-pub fn rebuild_memory_attributes_table_in_place() {
-    // Find the existing MEMATTR table pointer from the config table
-    let existing_addr = {
-        let efi = state::efi();
-        efi.config_tables[..efi.config_table_count]
-            .iter()
-            .find(|t| t.vendor_guid == EFI_MEMORY_ATTRIBUTES_TABLE_GUID)
-            .map(|t| t.vendor_table as u64)
-    };
-
-    let table_addr = match existing_addr {
-        Some(addr) if addr != 0 => addr,
-        _ => {
-            log::warn!("No existing MEMATTR table to rebuild");
-            return;
-        }
-    };
-
-    if let Some((runtime_count, table_size)) = fill_memory_attributes_table(table_addr) {
-        log::info!(
-            "Rebuilt Memory Attributes Table in-place ({} runtime entries, {} bytes)",
-            runtime_count,
-            table_size
-        );
-    }
-}
-
-/// Count the number of runtime memory entries in the current memory map.
-///
-/// Returns `None` if the memory map cannot be queried.
-fn count_runtime_entries() -> Option<u32> {
-    use super::allocator::{self, MemoryDescriptor, MemoryType, attributes};
-
-    let mut map_size: usize = 0;
-    let mut map_key: usize = 0;
-    let mut desc_size: usize = 0;
-    let mut desc_version: u32 = 0;
-
-    let _ = allocator::get_memory_map(
-        &mut map_size,
-        None,
-        &mut map_key,
-        &mut desc_size,
-        &mut desc_version,
-    );
-
-    let mut map_buf = [MemoryDescriptor::new(MemoryType::ReservedMemoryType, 0, 0, 0); 512];
-    let entries_to_use = (map_size / core::mem::size_of::<MemoryDescriptor>()).min(512);
-
-    let status = allocator::get_memory_map(
-        &mut map_size,
-        Some(&mut map_buf[..entries_to_use]),
-        &mut map_key,
-        &mut desc_size,
-        &mut desc_version,
-    );
-
-    if status != efi::Status::SUCCESS {
-        return None;
-    }
-
-    let actual_entries = map_size / core::mem::size_of::<MemoryDescriptor>();
-    let count = map_buf[..actual_entries]
-        .iter()
-        .filter(|e| e.attribute & attributes::EFI_MEMORY_RUNTIME != 0)
-        .count() as u32;
-    Some(count)
-}
-
-/// Query the memory map and fill the MEMATTR table at the given address.
-///
-/// Writes the header and runtime descriptors with appropriate RO/XP protection
-/// attributes. Returns `(runtime_count, table_size_bytes)` on success.
-fn fill_memory_attributes_table(table_addr: u64) -> Option<(u32, usize)> {
-    use super::allocator::{self, MemoryDescriptor, MemoryType, attributes};
-
-    // Query the memory map onto a stack buffer
-    let mut map_size: usize = 0;
-    let mut map_key: usize = 0;
-    let mut desc_size: usize = 0;
-    let mut desc_version: u32 = 0;
-
-    let _ = allocator::get_memory_map(
-        &mut map_size,
-        None,
-        &mut map_key,
-        &mut desc_size,
-        &mut desc_version,
-    );
-
-    let mut map_buf = [MemoryDescriptor::new(MemoryType::ReservedMemoryType, 0, 0, 0); 512];
-    let entries_to_use = (map_size / core::mem::size_of::<MemoryDescriptor>()).min(512);
-
-    let status = allocator::get_memory_map(
-        &mut map_size,
-        Some(&mut map_buf[..entries_to_use]),
-        &mut map_key,
-        &mut desc_size,
-        &mut desc_version,
-    );
-
-    if status != efi::Status::SUCCESS {
-        log::error!("Failed to get memory map for MEMATTR table: {:?}", status);
-        return None;
-    }
-
-    let actual_entries = map_size / core::mem::size_of::<MemoryDescriptor>();
-    let descriptor_size = core::mem::size_of::<MemoryDescriptor>() as u32;
-
-    // Count runtime entries
-    let runtime_count = map_buf[..actual_entries]
-        .iter()
-        .filter(|e| e.attribute & attributes::EFI_MEMORY_RUNTIME != 0)
-        .count() as u32;
-
-    if runtime_count == 0 {
-        log::warn!("No runtime memory regions for MEMATTR table");
-        return None;
-    }
-
-    let table_size = core::mem::size_of::<EfiMemoryAttributesTable>()
-        + (runtime_count as usize) * (descriptor_size as usize);
-
-    // Fill in the header
-    let header = unsafe { &mut *(table_addr as *mut EfiMemoryAttributesTable) };
-    header.version = 1;
-    header.number_of_entries = runtime_count;
-    header.descriptor_size = descriptor_size;
-    header.reserved = 0;
-
-    // Fill in runtime descriptors with protection attributes
-    // RuntimeServicesCode: RO + executable (no XP)
-    // RuntimeServicesData: XP + writable (no RO)
-    let descs_base = table_addr + core::mem::size_of::<EfiMemoryAttributesTable>() as u64;
-    let mut desc_idx: u32 = 0;
-    for entry in map_buf[..actual_entries].iter() {
-        if entry.attribute & attributes::EFI_MEMORY_RUNTIME != 0 {
-            let dest = unsafe {
-                &mut *((descs_base + (desc_idx as u64) * (descriptor_size as u64))
-                    as *mut MemoryDescriptor)
-            };
-            *dest = *entry;
-
-            if let Some(mem_type) = entry.get_memory_type() {
-                match mem_type {
-                    MemoryType::RuntimeServicesCode => {
-                        dest.attribute |= attributes::EFI_MEMORY_RO;
-                        dest.attribute &= !attributes::EFI_MEMORY_XP;
-                    }
-                    MemoryType::RuntimeServicesData => {
-                        dest.attribute |= attributes::EFI_MEMORY_XP;
-                        dest.attribute &= !attributes::EFI_MEMORY_RO;
-                    }
-                    _ => {
-                        dest.attribute |= attributes::EFI_MEMORY_XP;
-                    }
-                }
-            }
-
-            desc_idx += 1;
         }
     }
-
-    Some((runtime_count, table_size))
 }
 
-/// Dump configuration table entries for debugging
+/// Dump image-owned configuration table entries for debugging.
 pub fn dump_configuration_tables() {
-    let efi = state::efi();
-    let tables = &efi.config_tables;
-    let count = efi.config_table_count;
-
+    let system = get_system_table();
+    if system.is_null() {
+        return;
+    }
+    // SAFETY: image activation initialized the table and bounded count.
+    let (table, count) = unsafe {
+        (
+            (*system).configuration_table,
+            (*system).number_of_table_entries,
+        )
+    };
+    if table.is_null() {
+        return;
+    }
     log::debug!("EFI Configuration Table ({} entries):", count);
-    for (i, entry) in tables.iter().enumerate().take(count) {
-        let guid = &entry.vendor_guid;
-
-        // Try to identify known GUIDs
-        let name = if *guid == ACPI_20_TABLE_GUID {
-            "ACPI 2.0 RSDP"
-        } else if *guid == ACPI_TABLE_GUID {
-            "ACPI 1.0 RSDP"
-        } else if *guid == SMBIOS_TABLE_GUID {
-            "SMBIOS"
-        } else if *guid == SMBIOS3_TABLE_GUID {
-            "SMBIOS 3.0"
-        } else if *guid == EFI_RT_PROPERTIES_TABLE_GUID {
-            "RT Properties"
-        } else if *guid == EFI_MEMORY_ATTRIBUTES_TABLE_GUID {
-            "Memory Attributes"
-        } else if *guid == EFI_TCG2_FINAL_EVENTS_TABLE_GUID {
-            "TCG2 Final Events"
-        } else {
-            "Unknown"
-        };
-
-        log::debug!("  [{}] {} at {:p}", i, name, entry.vendor_table);
+    for index in 0..count {
+        // SAFETY: count and storage are owned and bounded by the runtime image.
+        let entry = unsafe { &*table.add(index) };
+        log::debug!(
+            "  [{}] GUID={:?} at {:p}",
+            index,
+            entry.vendor_guid,
+            entry.vendor_table
+        );
     }
-}
-
-/// Clear the boot services pointer
-///
-/// This MUST be called after ExitBootServices() succeeds, as per UEFI spec:
-/// "After ExitBootServices() has been called, the EFI Boot Services Table
-/// Header field BootServices is set to NULL."
-///
-/// # Safety
-///
-/// This must only be called after ExitBootServices succeeds.
-pub unsafe fn clear_boot_services() {
-    unsafe {
-        SYSTEM_TABLE.boot_services = core::ptr::null_mut();
-    }
-    log::debug!("SystemTable.boot_services set to NULL");
 }

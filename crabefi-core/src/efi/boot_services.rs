@@ -316,6 +316,9 @@ extern "efiapi" fn create_event(
     if event.is_null() {
         return Status::INVALID_PARAMETER;
     }
+    if event_type & EVT_RUNTIME != 0 || event_type == EVT_SIGNAL_VIRTUAL_ADDRESS_CHANGE {
+        return Status::UNSUPPORTED;
+    }
 
     // Allocate an event ID from centralized state
     state::with_efi_mut(|efi_state| {
@@ -686,12 +689,6 @@ fn signal_event_group(group_guid: &Guid) {
             events_to_signal.len()
         );
     }
-}
-
-/// Public wrapper for signal_event_group, used by SetVirtualAddressMap
-/// in runtime_services.rs to fire VIRTUAL_ADDRESS_CHANGE events.
-pub fn signal_event_group_for_runtime(group_guid: &Guid) {
-    signal_event_group(group_guid);
 }
 
 /// Measure the beginning of an EFI boot application attempt.
@@ -1633,12 +1630,15 @@ extern "efiapi" fn exit_boot_services(image_handle: Handle, map_key: usize) -> S
     }
 
     // Rebuild the Memory Attributes Table in-place BEFORE locking the allocator.
-    // At efi::init() time only 2 runtime regions existed; the third
-    // (deferred variable buffer at 0x7fb38000) is registered later.
+    // Runtime image and retained-buffer regions are registered after the
+    // initial table setup, so the final MAT must be rebuilt from the allocator.
     // A stale MEMATTR table with missing entries causes Windows to crash.
     // We use the in-place variant that overwrites the existing page without
     // calling allocate_pages(), so the map_key stays valid for the caller.
-    system_table::rebuild_memory_attributes_table_in_place();
+    let prepare_status = system_table::rebuild_memory_attributes_table_in_place();
+    if prepare_status != Status::SUCCESS {
+        return prepare_status;
+    }
 
     let status = allocator::exit_boot_services(map_key);
 
@@ -1650,11 +1650,10 @@ extern "efiapi" fn exit_boot_services(image_handle: Handle, map_key: usize) -> S
         );
 
         log::info!("ExitBootServices SUCCESS - transitioning to OS");
+        let runtime_image = crate::state::efi()
+            .runtime_image
+            .expect("runtime image client missing after successful EBS");
         crate::timestamp::record(crate::timestamp::TS_CRABEFI_EXIT_BOOT_SERVICES);
-
-        // Mark that ExitBootServices has been called
-        // After this, SPI flash is locked and variable writes go to ESP file
-        crate::state::set_exit_boot_services_called();
 
         // Clean up hardware state for OS handoff.
         // Re-enable keyboard interrupts so Linux's i8042 driver works.
@@ -1675,12 +1674,6 @@ extern "efiapi" fn exit_boot_services(image_handle: Handle, map_key: usize) -> S
         // the OS takes over (for example, disabling non-runtime log buffers).
         if let Some(hooks) = crate::state::drivers().platform.hooks {
             hooks.on_exit_boot_services();
-        }
-
-        // CRITICAL: Set boot_services pointer to NULL in SystemTable
-        // This is REQUIRED by UEFI spec and Linux checks for this!
-        unsafe {
-            system_table::clear_boot_services();
         }
 
         // CRITICAL: Disable logging. After ExitBootServices returns, the OS
@@ -1706,6 +1699,12 @@ extern "efiapi" fn exit_boot_services(image_handle: Handle, map_key: usize) -> S
         // fstart's EL3 exception vector. No-op if no EL3 exists.
         #[cfg(target_arch = "aarch64")]
         crate::arch::aarch64::ns_switch::install_ns_trampoline();
+
+        // Last firmware action: clear every boot pointer and consume the one
+        // BootActive persistence bridge inside the runtime image.
+        runtime_image
+            .seal()
+            .expect("runtime image seal failed after successful ExitBootServices");
     } else {
         super::tcg::measured_boot::measure_action_all(
             5,

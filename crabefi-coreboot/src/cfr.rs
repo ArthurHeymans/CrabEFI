@@ -960,68 +960,34 @@ fn ascii_to_ucs2(s: &str) -> Vec<u16> {
 ///
 /// Returns the stored value or falls back to the CFR default.
 pub fn read_option_value(option: &CfrOption) -> CfrValue {
-    use crabefi::state;
-
     let name = ascii_to_ucs2(&option.opt_name);
+    let data = crabefi::efi::runtime_image::client::variables::get(&COREBOOT_CFR_GUID, &name)
+        .map(|(_, data)| data);
+    data.map_or_else(
+        || CfrValue::from_option_type(&option.option_type),
+        |data| match &option.option_type {
+            CfrOptionType::Bool { .. } => CfrValue::Bool(read_cfr_number(&data) != 0),
+            CfrOptionType::Number { .. } | CfrOptionType::Enum { .. } => {
+                CfrValue::Number(read_cfr_number(&data))
+            }
+            CfrOptionType::Varchar { .. } => {
+                let end = data
+                    .iter()
+                    .position(|byte| *byte == 0)
+                    .unwrap_or(data.len());
+                CfrValue::Varchar(String::from_utf8_lossy(&data[..end]).into_owned())
+            }
+            CfrOptionType::Comment => CfrValue::Bool(false),
+        },
+    )
+}
 
-    let mut found_value = None;
-    state::with_efi_mut(|efi_state| {
-        for var in efi_state.variables.iter() {
-            if !var.in_use {
-                continue;
-            }
-            if var.vendor_guid != COREBOOT_CFR_GUID {
-                continue;
-            }
-            let var_name_len = var
-                .name
-                .iter()
-                .position(|&c| c == 0)
-                .unwrap_or(var.name.len());
-            let name_len = name.len().saturating_sub(1); // Exclude NULL terminator
-            if var_name_len != name_len {
-                continue;
-            }
-            if var.name[..var_name_len] != name[..name_len] {
-                continue;
-            }
-
-            // Found the variable - deserialize based on option type
-            // All numeric types (Bool, Number, Enum) are stored as 4-byte LE u32
-            // for compatibility with coreboot's get_uint_option()
-            found_value = Some(match &option.option_type {
-                CfrOptionType::Bool { .. } => {
-                    let val = if var.data_size >= 4 {
-                        u32::from_le_bytes([var.data[0], var.data[1], var.data[2], var.data[3]])
-                    } else if var.data_size >= 1 {
-                        var.data[0] as u32
-                    } else {
-                        0
-                    };
-                    CfrValue::Bool(val != 0)
-                }
-                CfrOptionType::Number { .. } | CfrOptionType::Enum { .. } => {
-                    let val = if var.data_size >= 4 {
-                        u32::from_le_bytes([var.data[0], var.data[1], var.data[2], var.data[3]])
-                    } else if var.data_size >= 1 {
-                        var.data[0] as u32
-                    } else {
-                        0
-                    };
-                    CfrValue::Number(val)
-                }
-                CfrOptionType::Varchar { .. } => {
-                    let raw = &var.data[..var.data_size];
-                    let nul_pos = raw.iter().position(|&b| b == 0).unwrap_or(raw.len());
-                    CfrValue::Varchar(String::from_utf8_lossy(&raw[..nul_pos]).into_owned())
-                }
-                CfrOptionType::Comment => CfrValue::Bool(false),
-            });
-            break;
-        }
-    });
-
-    found_value.unwrap_or_else(|| CfrValue::from_option_type(&option.option_type))
+fn read_cfr_number(data: &[u8]) -> u32 {
+    data.get(..4)
+        .and_then(|bytes| bytes.try_into().ok())
+        .map(u32::from_le_bytes)
+        .or_else(|| data.first().copied().map(u32::from))
+        .unwrap_or(0)
 }
 
 /// Write a CFR option value to storage
@@ -1029,7 +995,7 @@ pub fn read_option_value(option: &CfrOption) -> CfrValue {
 /// All numeric types (Bool, Number, Enum) are stored as 4-byte LE u32
 /// for compatibility with coreboot's get_uint_option() which returns unsigned int.
 pub fn write_option_value(option: &CfrOption, value: &CfrValue) -> Result<(), &'static str> {
-    use crabefi::efi::varstore;
+    use crabefi::efi::runtime_image::client::variables;
     use r_efi::efi;
 
     let name = ascii_to_ucs2(&option.opt_name);
@@ -1056,54 +1022,32 @@ pub fn write_option_value(option: &CfrOption, value: &CfrValue) -> Result<(), &'
         | efi::VARIABLE_BOOTSERVICE_ACCESS
         | efi::VARIABLE_RUNTIME_ACCESS;
 
-    varstore::persist_variable(&COREBOOT_CFR_GUID, &name, attrs, &data).map_err(|e| {
+    let status = variables::set(&COREBOOT_CFR_GUID, &name, attrs, &data);
+    if status != efi::Status::SUCCESS {
         log::warn!(
-            "Failed to persist CFR variable '{}': {:?}",
+            "Failed to set CFR variable '{}': {:?}",
             option.opt_name,
-            e
+            status
         );
-        "Failed to persist CFR variable"
-    })?;
-
-    // `persist_variable()` writes the EDK2/SMMSTORE backend but does not update
-    // CrabEFI's in-memory variable cache. Keep the cache in sync so reopening
-    // the firmware-settings menu during this same payload run shows the saved
-    // values instead of the values loaded when the payload started.
-    varstore::update_variable_in_memory(&COREBOOT_CFR_GUID, &name, attrs, &data);
-
+        return Err("Failed to set CFR variable");
+    }
     Ok(())
 }
 
 /// Delete a CFR option from storage (revert to default)
 pub fn delete_option_value(option: &CfrOption) -> Result<(), &'static str> {
-    use crabefi::efi::varstore;
+    use crabefi::efi::runtime_image::client::variables;
+    use r_efi::efi;
 
     let name = ascii_to_ucs2(&option.opt_name);
-
-    varstore::delete_variable(&COREBOOT_CFR_GUID, &name).map_err(|e| {
+    let status = variables::delete(&COREBOOT_CFR_GUID, &name);
+    if status != efi::Status::SUCCESS {
         log::warn!(
             "Failed to delete CFR variable '{}': {:?}",
             option.opt_name,
-            e
+            status
         );
-        "Failed to delete CFR variable"
-    })?;
-
-    delete_option_from_memory(&name);
-
+        return Err("Failed to delete CFR variable");
+    }
     Ok(())
-}
-
-fn delete_option_from_memory(name: &[u16]) {
-    use crabefi::state;
-
-    state::with_efi_mut(|efi| {
-        if let Some(var) = efi.variables.iter_mut().find(|var| {
-            var.in_use
-                && var.vendor_guid == COREBOOT_CFR_GUID
-                && crabefi::efi::utils::ucs2_eq(&var.name, name)
-        }) {
-            var.in_use = false;
-        }
-    });
 }

@@ -2,7 +2,7 @@
 
 A UEFI implementation written in Rust, designed as a reusable library with dependency injection for platform-specific hardware.
 
-CrabEFI implements enough UEFI to boot Linux via shim/GRUB2 or systemd-boot on real hardware. It ships as a coreboot payload but its core is a platform-agnostic library that any firmware can link against.
+CrabEFI implements enough UEFI to boot Linux via shim/GRUB2 or systemd-boot on real hardware. It ships as a coreboot payload, a platform-agnostic boot library, and a separately linked Runtime Services image with bounded scratch allocation.
 
 ![CrabEFI graphical boot menu](docs/screenshot.jpg)
 
@@ -46,8 +46,10 @@ nix develop
 | `crabefi-core` | Core library -- platform-agnostic UEFI implementation |
 | `crabefi-coreboot` | Coreboot payload binary (arch entry points, table parsing) |
 | `crabefi-drivers` | Standard hardware drivers (NVMe, AHCI, USB, SDHCI, SPI, serial) |
+| `crabefi-runtime-abi` | Pointer-free normalized image/handoff ABI |
+| `crabefi-runtime-image` | Separate EFI Runtime Services image with image-local bounded scratch allocation |
 
-External firmware implements a set of platform traits (`BlockDevice`, `VariableBackend`, `Timer`, etc.), builds a `PlatformConfig`, and calls `crabefi::init_platform()`. See [docs/INTEGRATION.md](docs/INTEGRATION.md) for details.
+External firmware implements boot-only platform traits, provides a normalized runtime image plus value-only runtime mechanisms in `PlatformConfig`, and calls `crabefi::init_platform()`. See [docs/INTEGRATION.md](docs/INTEGRATION.md) for details.
 
 ## License
 

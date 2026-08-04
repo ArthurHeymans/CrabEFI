@@ -1,6 +1,9 @@
 # Build artifacts
 /target/
 **/target/
+crabefi-coreboot/rust_out
+/firmware/coreboot.rom
+/sct-assets/
 
 # Test artifacts
 test-disk.img

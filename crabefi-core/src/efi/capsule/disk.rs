@@ -40,35 +40,14 @@ pub struct DiskCapsule {
 /// `FILE_CAPSULE_DELIVERY_SUPPORTED` bit is set.
 pub fn is_file_capsule_delivery_requested() -> bool {
     use crate::efi::auth::EFI_GLOBAL_VARIABLE_GUID;
-    use crate::state;
-
-    let efi = state::efi();
     let os_ind_name: &[u16] = &[
         'O' as u16, 's' as u16, 'I' as u16, 'n' as u16, 'd' as u16, 'i' as u16, 'c' as u16,
         'a' as u16, 't' as u16, 'i' as u16, 'o' as u16, 'n' as u16, 's' as u16, 0,
     ];
-    for var in &efi.variables {
-        if !var.in_use {
-            continue;
-        }
-        if var.vendor_guid != EFI_GLOBAL_VARIABLE_GUID {
-            continue;
-        }
-        if crate::efi::utils::ucs2_eq(&var.name, os_ind_name) && var.data_size >= 8 {
-            let value = u64::from_le_bytes([
-                var.data[0],
-                var.data[1],
-                var.data[2],
-                var.data[3],
-                var.data[4],
-                var.data[5],
-                var.data[6],
-                var.data[7],
-            ]);
-            return (value & EFI_OS_INDICATIONS_FILE_CAPSULE_DELIVERY_SUPPORTED) != 0;
-        }
-    }
-    false
+    crate::efi::runtime_image::client::variables::get(&EFI_GLOBAL_VARIABLE_GUID, os_ind_name)
+        .and_then(|(_, data)| data.get(..8).and_then(|bytes| bytes.try_into().ok()))
+        .map(u64::from_le_bytes)
+        .is_some_and(|value| value & EFI_OS_INDICATIONS_FILE_CAPSULE_DELIVERY_SUPPORTED != 0)
 }
 
 /// Scan the ESP for capsule files and return their contents.
@@ -214,7 +193,7 @@ pub fn install_os_indications_supported() {
     // BS + RT (read-only, not NV — the firmware always sets it)
     let attributes = 0x06u32; // BS | RT
 
-    crate::efi::varstore::update_variable_in_memory(
+    crate::efi::varstore::import_variable_into_runtime(
         &EFI_GLOBAL_VARIABLE_GUID,
         name,
         attributes,
@@ -233,59 +212,29 @@ pub fn install_os_indications_supported() {
 /// This prevents re-processing on subsequent boots.
 pub fn clear_os_indications_capsule_bits() {
     use crate::efi::auth::EFI_GLOBAL_VARIABLE_GUID;
-    use crate::state;
-
     let os_ind_name: &[u16] = &[
         'O' as u16, 's' as u16, 'I' as u16, 'n' as u16, 'd' as u16, 'i' as u16, 'c' as u16,
         'a' as u16, 't' as u16, 'i' as u16, 'o' as u16, 'n' as u16, 's' as u16, 0,
     ];
 
-    let mut cleared_value = None;
-    let mut attributes = 0;
-
-    state::with_efi_mut(|efi| {
-        for var in &mut efi.variables {
-            if !var.in_use {
-                continue;
-            }
-            if var.vendor_guid != EFI_GLOBAL_VARIABLE_GUID {
-                continue;
-            }
-            if crate::efi::utils::ucs2_eq(&var.name, os_ind_name) && var.data_size >= 8 {
-                let mut value = u64::from_le_bytes([
-                    var.data[0],
-                    var.data[1],
-                    var.data[2],
-                    var.data[3],
-                    var.data[4],
-                    var.data[5],
-                    var.data[6],
-                    var.data[7],
-                ]);
-
-                // Clear capsule-related bits
-                value &= !(EFI_OS_INDICATIONS_FMP_CAPSULE_SUPPORTED
-                    | EFI_OS_INDICATIONS_FILE_CAPSULE_DELIVERY_SUPPORTED);
-
-                let bytes = value.to_le_bytes();
-                var.data[..8].copy_from_slice(&bytes);
-                cleared_value = Some(bytes);
-                attributes = var.attributes;
-                return;
-            }
-        }
-    });
-
-    if let Some(bytes) = cleared_value {
-        if let Err(e) = crate::efi::varstore::persist_variable(
+    if let Some((attributes, data)) =
+        crate::efi::runtime_image::client::variables::get(&EFI_GLOBAL_VARIABLE_GUID, os_ind_name)
+        && let Some(raw) = data.get(..8).and_then(|bytes| bytes.try_into().ok())
+    {
+        let mut value = u64::from_le_bytes(raw);
+        value &= !(EFI_OS_INDICATIONS_FMP_CAPSULE_SUPPORTED
+            | EFI_OS_INDICATIONS_FILE_CAPSULE_DELIVERY_SUPPORTED);
+        let bytes = value.to_le_bytes();
+        let status = crate::efi::runtime_image::client::variables::set(
             &EFI_GLOBAL_VARIABLE_GUID,
             os_ind_name,
             attributes,
             &bytes,
-        ) {
-            log::warn!("Failed to persist cleared OsIndications: {:?}", e);
-        } else {
+        );
+        if status == r_efi::efi::Status::SUCCESS {
             log::info!("Cleared capsule bits in OsIndications");
+        } else {
+            log::warn!("Failed to clear OsIndications: {:?}", status);
         }
     }
 }

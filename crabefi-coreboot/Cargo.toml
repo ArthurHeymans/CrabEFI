@@ -40,6 +40,8 @@ fdt = "0.1.5"
 
 [build-dependencies]
 cc = "1"
+crabefi-runtime-abi = { path = "../crabefi-runtime-abi" }
+sha2 = "0.10"
 
 [[bin]]
 name = "crabefi"

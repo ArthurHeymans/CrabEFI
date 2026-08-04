@@ -12,7 +12,7 @@
 //! │           External Firmware                  │
 //! │  (coreboot, custom ARM SoC, TF-A, ...)      │
 //! │                                              │
-//! │  Implements: BlockDevice, VariableBackend,   │
+//! │  Implements: BlockDevice, FirmwareStorage,   │
 //! │  Timer, ResetHandler, DebugOutput, ...       │
 //! └───────────────┬─────────────────────────────┘
 //!                 │  PlatformConfig
@@ -39,14 +39,13 @@
 //!     timestamp_recorder: None,
 //!     reset: &my_reset_handler,
 //!     block_devices: &mut [&mut my_emmc],
-//!     variable_backend: None, // direct VariableBackend routing is not wired yet
+//!     runtime_image: runtime_image_source,
+//!     runtime: runtime_platform_config,
 //!     variable_store_locator: None,
 //!     // ...
 //! };
 //! crabefi::init_platform(config); // never returns
 //! ```
-
-use r_efi::efi::Guid;
 
 // ============================================================================
 // Memory Map
@@ -83,10 +82,6 @@ pub enum MemoryType {
     AcpiNvs,
     /// Memory-mapped I/O registers (becomes `EfiMemoryMappedIO`).
     Mmio,
-    /// Runtime services code (becomes `EfiRuntimeServicesCode` with `EFI_MEMORY_RUNTIME`).
-    RuntimeServicesCode,
-    /// Runtime services data (becomes `EfiRuntimeServicesData` with `EFI_MEMORY_RUNTIME`).
-    RuntimeServicesData,
     /// Boot services data (becomes `EfiBootServicesData`).
     ///
     /// Reclaimed as ConventionalMemory after `ExitBootServices`. Use for
@@ -213,188 +208,6 @@ pub trait BlockDevice {
     /// Read a single block (convenience wrapper).
     fn read_block(&mut self, lba: u64, buffer: &mut [u8]) -> Result<(), BlockError> {
         self.read_blocks(lba, 1, buffer)
-    }
-}
-
-// ============================================================================
-// Variable Persistence
-// ============================================================================
-
-/// Errors returned by variable backend operations.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum VarBackendError {
-    /// Backend not initialized or not available.
-    NotAvailable,
-    /// Storage is full; cannot write more variables.
-    StoreFull,
-    /// I/O or communication error.
-    IoError,
-    /// Backend is locked (e.g., flash locked after ExitBootServices).
-    Locked,
-    /// Variable not found (for load/delete operations).
-    NotFound,
-    /// Data too large for the backend's capacity.
-    DataTooLarge,
-    /// Name too long for the backend's capacity.
-    NameTooLong,
-    /// Backend-specific error.
-    Other,
-}
-
-/// Visitor interface for loading persisted variables.
-///
-/// The [`VariableBackend::load()`] method calls [`visit()`](Self::visit) once
-/// per stored variable. CrabEFI provides the visitor; the backend just calls it.
-pub trait VariableVisitor {
-    /// Called for each variable found in persistent storage.
-    ///
-    /// # Arguments
-    /// * `name` - Variable name as UTF-16LE code units (without null terminator).
-    /// * `vendor` - Variable vendor GUID.
-    /// * `attributes` - EFI variable attributes (`EFI_VARIABLE_*` flags).
-    /// * `data` - Variable data payload (after any auth header stripping).
-    fn visit(&mut self, name: &[u16], vendor: &Guid, attributes: u32, data: &[u8]);
-}
-
-/// EFI variable persistence backend.
-///
-/// This trait abstracts how EFI variables are stored across boots. Implementations
-/// range from direct flash storage to SMM/TF-A MM RPC-based approaches.
-///
-/// # Backend Categories
-///
-/// | Category | `runtime_capable()` | Deferred buffer needed? | Example |
-/// |----------|---------------------|------------------------|---------|
-/// | Direct flash | `false` | Yes | SPI flash via `Edk2VarStore` |
-/// | SMM | `true` | No | x86 SMI-based variable service |
-/// | TF-A MM | `true` | No | Arm StandaloneMM via FF-A/SPM |
-/// | RAM-only | `false` | Optional | Testing, volatile variables |
-///
-/// # Lifecycle
-///
-/// 1. [`load()`](Self::load) — Called once during early boot to populate the
-///    in-memory variable cache. The backend calls `visitor.visit()` for each
-///    stored variable.
-///
-/// 2. [`write()`](Self::write) / [`delete()`](Self::delete) — Called by
-///    `SetVariable` when variables change.
-///    - Before `ExitBootServices`: always called.
-///    - After `ExitBootServices`: called only if `runtime_capable()` returns `true`.
-///      Otherwise, CrabEFI buffers the write in the deferred buffer.
-///
-/// 3. [`notify_exit_boot_services()`](Self::notify_exit_boot_services) — Called
-///    when `ExitBootServices` succeeds. The backend can release resources or
-///    adjust its strategy (e.g., direct-flash backends note that flash is now locked).
-///
-/// 4. [`flush_deferred()`](Self::flush_deferred) — Called on the *next* boot
-///    (after `load()`) to commit any writes that were buffered during the
-///    previous boot's runtime phase. Only relevant for non-runtime-capable backends.
-///
-/// # Example: SMM Backend
-///
-/// ```ignore
-/// struct SmmVarStore { smi_port: u16, comm_buffer: *mut u8 }
-///
-/// impl crabefi::VariableBackend for SmmVarStore {
-///     fn load(&mut self, visitor: &mut dyn crabefi::VariableVisitor)
-///         -> Result<(), crabefi::VarBackendError>
-///     {
-///         // Trigger SMI to enumerate variables, call visitor.visit() for each
-///         Ok(())
-///     }
-///
-///     fn write(&mut self, name: &[u16], vendor: &Guid, attrs: u32, data: &[u8])
-///         -> Result<(), crabefi::VarBackendError>
-///     {
-///         // Trigger SMI with SetVariable command
-///         Ok(())
-///     }
-///
-///     fn delete(&mut self, name: &[u16], vendor: &Guid)
-///         -> Result<(), crabefi::VarBackendError>
-///     {
-///         // Trigger SMI with delete command
-///         Ok(())
-///     }
-///
-///     fn runtime_capable(&self) -> bool { true }
-/// }
-/// ```
-pub trait VariableBackend {
-    /// Load all persisted variables into the in-memory cache.
-    ///
-    /// Called once during early boot. The backend iterates its stored variables
-    /// and calls `visitor.visit()` for each one.
-    fn load(&mut self, visitor: &mut dyn VariableVisitor) -> Result<(), VarBackendError>;
-
-    /// Persist a variable write (create or update).
-    ///
-    /// Called when `SetVariable` is invoked with non-empty data.
-    ///
-    /// # Arguments
-    /// * `name` - Variable name as UTF-16LE code units.
-    /// * `vendor` - Variable vendor GUID.
-    /// * `attributes` - EFI variable attributes.
-    /// * `data` - Variable data payload.
-    fn write(
-        &mut self,
-        name: &[u16],
-        vendor: &Guid,
-        attributes: u32,
-        data: &[u8],
-    ) -> Result<(), VarBackendError>;
-
-    /// Persist a variable deletion.
-    ///
-    /// Called when `SetVariable` is invoked with empty data and
-    /// `EFI_VARIABLE_APPEND_WRITE` is not set.
-    fn delete(&mut self, name: &[u16], vendor: &Guid) -> Result<(), VarBackendError>;
-
-    /// Whether this backend supports writes after `ExitBootServices`.
-    ///
-    /// - `true`: CrabEFI calls `write()`/`delete()` directly at runtime.
-    ///   Suitable for SMM, TF-A MM, or any backend with a privileged agent.
-    /// - `false` (default): CrabEFI buffers runtime writes in the deferred
-    ///   buffer and calls `flush_deferred()` on the next boot.
-    fn runtime_capable(&self) -> bool {
-        false
-    }
-
-    /// Notification that `ExitBootServices` has been called.
-    ///
-    /// For direct-flash backends, this signals that flash may now be locked.
-    /// For SMM/MM backends, this is typically a no-op.
-    fn notify_exit_boot_services(&mut self) {}
-
-    /// Commit deferred writes from a previous boot.
-    ///
-    /// Called after `load()` on the next boot when the previous boot had
-    /// buffered runtime variable writes (because `runtime_capable()` was false).
-    ///
-    /// # Arguments
-    /// * `records` - Iterator of (name, vendor, attributes, data) for each
-    ///   deferred write. Empty data means delete.
-    ///
-    /// The default implementation calls `write()` or `delete()` for each record.
-    fn flush_deferred(
-        &mut self,
-        records: &mut dyn Iterator<Item = (&[u16], &Guid, u32, &[u8])>,
-    ) -> Result<usize, VarBackendError> {
-        let mut count = 0;
-        for (name, vendor, attrs, data) in records {
-            if data.is_empty() {
-                // Ignore NotFound for deletes — variable may not exist
-                match self.delete(name, vendor) {
-                    Ok(()) | Err(VarBackendError::NotFound) => {}
-                    Err(e) => return Err(e),
-                }
-            } else {
-                self.write(name, vendor, attrs, data)?;
-            }
-            count += 1;
-        }
-        Ok(count)
     }
 }
 
@@ -648,10 +461,7 @@ pub trait VariableStoreLocator {
 /// It is used by [`crate::efi::varstore::Edk2VarStore`] to implement the
 /// EDK2 Firmware Volume format on top of raw flash.
 ///
-/// Platform firmware that uses SMM or TF-A MM should implement
-/// [`VariableBackend`] directly instead of this trait.
-///
-/// # Flash Semantics
+/// /// # Flash Semantics
 ///
 /// - `read` works on any valid offset.
 /// - `write` may require the region to be erased first (NOR flash: can only
@@ -789,7 +599,7 @@ pub trait CapsuleBackend {
     ) -> Result<(), StorageError>;
 
     /// Get all FMAP regions for RMAP manifest validation.
-    fn fmap_regions(&self) -> &[FmapRegion];
+    fn fmap_regions(&mut self) -> &[FmapRegion];
 }
 
 // ============================================================================
@@ -805,10 +615,6 @@ pub trait PlatformHooks {
     /// Called after `ExitBootServices()` succeeds, before the system table's
     /// Boot Services pointer is cleared.
     fn on_exit_boot_services(&self) {}
-
-    /// Called at the start of `SetVirtualAddressMap()`, before CrabEFI commits
-    /// to virtual mode.
-    fn before_set_virtual_address_map(&self) {}
 
     /// Return whether the platform exposes a firmware settings UI.
     fn firmware_settings_available(&self) -> bool {
@@ -908,14 +714,8 @@ pub enum ResetType {
 
 /// System reset and shutdown handler.
 ///
-/// Used by the UEFI `ResetSystem` runtime service. The implementation must
-/// be in memory that remains mapped after `ExitBootServices` (runtime-safe).
-///
-/// # Safety Contract
-///
-/// Since `ResetSystem` is a runtime service, the platform must ensure that
-/// the `ResetHandler` implementation and its vtable reside in memory marked
-/// as `RuntimeServicesCode` or `RuntimeServicesData`.
+/// Used only by boot-time menus and fatal paths. Runtime `ResetSystem` uses
+/// the separate image's value-only [`RuntimePlatformConfig`] mechanism.
 pub trait ResetHandler {
     /// Perform a system reset or shutdown.
     ///
@@ -1461,48 +1261,35 @@ pub trait Tpm2Device: Send {
 // Platform Configuration
 // ============================================================================
 
-/// Warm-reboot persistent buffer for deferred variable writes.
-///
-/// When the [`VariableBackend`] is not [`runtime_capable()`](VariableBackend::runtime_capable),
-/// CrabEFI buffers `SetVariable` calls made after `ExitBootServices` into
-/// this memory region. The platform must ensure this memory:
-///
-/// 1. Survives warm reboots (not cleared on CPU reset).
-/// 2. Is in a memory region marked as `RuntimeServicesData` so the OS
-///    preserves the mapping after `ExitBootServices`.
-///
-/// On the next boot, CrabEFI reads the buffer and commits the writes via
-/// [`VariableBackend::flush_deferred()`].
-///
-/// Not needed if the variable backend is runtime-capable (SMM, TF-A MM).
+/// Normalized runtime image and payload-bound integrity digest.
+#[derive(Debug, Clone, Copy)]
+pub struct RuntimeImageSource<'a> {
+    /// Checked normalized image bytes.
+    pub bytes: &'a [u8],
+    /// SHA-256 committed by the containing boot image.
+    pub expected_sha256: [u8; 32],
+}
+
+/// Warm-reset-preserved storage owned by the separate runtime image.
 #[derive(Debug, Clone, Copy)]
 pub struct DeferredBufferConfig {
-    /// Physical base address of the buffer.
+    /// Physical base address of the page-aligned buffer.
     pub base: u64,
-    /// Size of the buffer in bytes (typically 64 KiB).
+    /// Page-aligned size of the buffer in bytes.
     pub size: usize,
 }
 
-/// Memory region where CrabEFI's code and data are loaded.
-///
-/// The platform provides this so CrabEFI can mark these regions as
-/// `RuntimeServicesCode` / `RuntimeServicesData` in the EFI memory map,
-/// ensuring the OS preserves them after `ExitBootServices` and
-/// `SetVirtualAddressMap` adjusts pointers correctly.
-///
-/// For the coreboot target, these come from linker-provided symbols.
-/// External firmware must ensure CrabEFI's code lives in a region that
-/// the OS will keep mapped.
+/// Value-only runtime platform mechanisms and retained external ranges.
 #[derive(Debug, Clone, Copy)]
-pub struct RuntimeRegion {
-    /// Base address of the runtime code section.
-    pub code_base: u64,
-    /// Size of the runtime code section in bytes.
-    pub code_size: u64,
-    /// Base address of the runtime data section (includes stack, state, heap).
-    pub data_base: u64,
-    /// Size of the runtime data section in bytes.
-    pub data_size: u64,
+pub struct RuntimePlatformConfig<'a> {
+    /// Runtime time mechanism.
+    pub time: crabefi_runtime_abi::RuntimeTimeConfig,
+    /// Runtime reset mechanism.
+    pub reset: crabefi_runtime_abi::RuntimeResetConfig,
+    /// Explicit MMIO ranges that remain reachable after EBS.
+    pub external_ranges: &'a [crabefi_runtime_abi::RuntimeExternalRange],
+    /// Warm-reset-preserved deferred variable storage.
+    pub deferred_buffer: DeferredBufferConfig,
 }
 
 /// Result of the UEFI boot manager.
@@ -1562,13 +1349,6 @@ pub struct PlatformConfig<'a> {
     /// these for ESP partitions and boot entries.
     pub block_devices: &'a mut [&'a mut dyn BlockDevice],
 
-    /// Variable persistence backend.
-    ///
-    /// Reserved for future SMM/TF-A MM-style backends. The current
-    /// `init_platform()` path does not route this field into runtime variable
-    /// services yet, so leave it as `None` unless that routing is implemented.
-    pub variable_backend: Option<&'a mut dyn VariableBackend>,
-
     /// Platform-specific persistent variable-store locator.
     ///
     /// Direct-flash integrations provide this when CrabEFI should manage an
@@ -1605,6 +1385,9 @@ pub struct PlatformConfig<'a> {
     /// Platform-provided in-memory capsules to process during boot.
     pub capsule_regions: &'a [CapsuleRegion],
 
+    /// Backend used to validate and apply pending firmware capsules.
+    pub capsule_backend: Option<&'a mut dyn CapsuleBackend>,
+
     /// Optional platform lifecycle callbacks.
     pub hooks: Option<&'a dyn PlatformHooks>,
 
@@ -1622,17 +1405,11 @@ pub struct PlatformConfig<'a> {
     pub ecam_size: Option<u64>,
 
     // ---- Runtime Support ----
-    /// Warm-reboot persistent buffer for deferred variable writes.
-    ///
-    /// Only needed when `variable_backend` is not runtime-capable.
-    /// See [`DeferredBufferConfig`] for requirements.
-    pub deferred_buffer: Option<DeferredBufferConfig>,
+    /// Mandatory normalized separate Runtime Services image.
+    pub runtime_image: RuntimeImageSource<'a>,
 
-    /// Memory region where CrabEFI's code and data reside.
-    ///
-    /// Needed for `SetVirtualAddressMap` support. If `None`, CrabEFI
-    /// cannot provide runtime services after `ExitBootServices`.
-    pub runtime_region: Option<RuntimeRegion>,
+    /// Value-only runtime mechanism and external-range configuration.
+    pub runtime: RuntimePlatformConfig<'a>,
 
     // ---- Measured Boot ----
     /// TPM event log configuration for measured boot.

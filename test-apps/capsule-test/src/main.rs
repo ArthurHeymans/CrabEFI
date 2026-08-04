@@ -366,50 +366,80 @@ fn test_query_capsule_capabilities(ctx: &mut TestCtx) {
         ctx.fail("query_caps: no runtime services");
         return;
     }
-
-    // Build a minimal FMP capsule header
-    let capsule_header = CapsuleHeader {
-        capsule_guid: EFI_FMP_CAPSULE_GUID,
-        header_size: 28,
-        flags: 0x0001_0000, // PERSIST_ACROSS_RESET
-        capsule_image_size: 1024,
-    };
-
-    let mut header_ptr: *mut CapsuleHeader =
-        &capsule_header as *const CapsuleHeader as *mut CapsuleHeader;
-    let mut max_capsule_size: u64 = 0;
-    let mut reset_type: efi::ResetType = efi::RESET_COLD;
-
     let query = unsafe { (*rt).query_capsule_capabilities };
-    let status = query(
-        &mut header_ptr as *mut *mut CapsuleHeader as *mut *mut efi::CapsuleHeader,
-        1,
+    let mut max_capsule_size = 0u64;
+    let mut reset_type = efi::RESET_COLD;
+    if query(
+        core::ptr::null_mut(),
+        0,
         &mut max_capsule_size,
         &mut reset_type,
-    );
-
-    if status == Status::SUCCESS {
-        ctx.pass("query_caps_call");
-
-        ctx.print_str("  max_capsule_size = ");
-        ctx.print_hex64(max_capsule_size);
-        ctx.print_str("\n");
-
-        if max_capsule_size > 0 {
-            ctx.pass("query_caps_max_size");
-        } else {
-            ctx.fail("query_caps_max_size: returned 0");
-        }
-
-        // Check reset type is warm
-        if reset_type == efi::RESET_WARM {
-            ctx.pass("query_caps_reset_type_warm");
-        } else {
-            ctx.print_str("  (reset type is not WARM, but that's OK)\n");
-            ctx.pass("query_caps_reset_type");
-        }
+    ) == Status::INVALID_PARAMETER
+    {
+        ctx.pass("query_caps_null_zero_rejected");
     } else {
-        ctx.fail("query_caps_call: QueryCapsuleCapabilities failed");
+        ctx.fail("query_caps_null_zero_rejected");
+    }
+
+    let mut capsule_header = CapsuleHeader {
+        capsule_guid: EFI_FMP_CAPSULE_GUID,
+        header_size: 28,
+        flags: 0x0001_0000,
+        capsule_image_size: 1024,
+    };
+    let header_ptr: *mut CapsuleHeader = &mut capsule_header;
+    let mut headers = [header_ptr, header_ptr];
+    let array = headers.as_mut_ptr().cast::<*mut efi::CapsuleHeader>();
+    if query(array, 0, &mut max_capsule_size, &mut reset_type) == Status::INVALID_PARAMETER {
+        ctx.pass("query_caps_zero_count_rejected");
+    } else {
+        ctx.fail("query_caps_zero_count_rejected");
+    }
+    if query(array, 2, &mut max_capsule_size, &mut reset_type) == Status::UNSUPPORTED {
+        ctx.pass("query_caps_multiple_rejected");
+    } else {
+        ctx.fail("query_caps_multiple_rejected");
+    }
+    if query(array, 1, core::ptr::null_mut(), &mut reset_type) == Status::INVALID_PARAMETER
+        && query(array, 1, &mut max_capsule_size, core::ptr::null_mut())
+            == Status::INVALID_PARAMETER
+    {
+        ctx.pass("query_caps_null_outputs_rejected");
+    } else {
+        ctx.fail("query_caps_null_outputs_rejected");
+    }
+
+    unsafe { core::ptr::write_volatile(&raw mut capsule_header.flags, 0) };
+    if query(array, 1, &mut max_capsule_size, &mut reset_type) == Status::UNSUPPORTED {
+        ctx.pass("query_caps_persist_flag_required");
+    } else {
+        ctx.fail("query_caps_persist_flag_required");
+    }
+    unsafe {
+        core::ptr::write_volatile(&raw mut capsule_header.flags, 0x0001_0000);
+        core::ptr::write_volatile(
+            &raw mut capsule_header.capsule_image_size,
+            16 * 1024 * 1024 + 1,
+        );
+    }
+    if query(array, 1, &mut max_capsule_size, &mut reset_type) == Status::UNSUPPORTED {
+        ctx.pass("query_caps_oversize_rejected");
+    } else {
+        ctx.fail("query_caps_oversize_rejected");
+    }
+
+    unsafe { core::ptr::write_volatile(&raw mut capsule_header.capsule_image_size, 1024) };
+    max_capsule_size = 0;
+    reset_type = efi::RESET_COLD;
+    if query(array, 1, &mut max_capsule_size, &mut reset_type) == Status::SUCCESS
+        && max_capsule_size == 16 * 1024 * 1024
+        && reset_type == efi::RESET_WARM
+    {
+        ctx.pass("query_caps_call");
+        ctx.pass("query_caps_max_size");
+        ctx.pass("query_caps_exact_max_and_warm_reset");
+    } else {
+        ctx.fail("query_caps_call: invalid maximum/reset result");
     }
 }
 
@@ -434,15 +464,42 @@ fn test_update_capsule_validation(ctx: &mut TestCtx) {
         ctx.fail("update_capsule_validation: no runtime services");
         return;
     }
-
     let update = unsafe { (*rt).update_capsule };
-
-    // Test 1: null header array should return INVALID_PARAMETER
-    let status = update(core::ptr::null_mut(), 0, 0);
-    if status == Status::INVALID_PARAMETER {
+    if update(core::ptr::null_mut(), 0, 0) == Status::INVALID_PARAMETER {
         ctx.pass("update_capsule_null_rejected");
     } else {
-        ctx.fail("update_capsule_null_rejected: expected INVALID_PARAMETER");
+        ctx.fail("update_capsule_null_rejected");
+    }
+
+    let mut capsule_header = CapsuleHeader {
+        capsule_guid: EFI_FMP_CAPSULE_GUID,
+        header_size: 28,
+        flags: 0x0001_0000,
+        capsule_image_size: 1024,
+    };
+    let header: *mut CapsuleHeader = &mut capsule_header;
+    let mut headers = [header, header];
+    let array = headers.as_mut_ptr().cast::<*mut efi::CapsuleHeader>();
+    if update(array, 0, 0) == Status::INVALID_PARAMETER {
+        ctx.pass("update_capsule_zero_count_rejected");
+    } else {
+        ctx.fail("update_capsule_zero_count_rejected");
+    }
+    if update(array, 2, 1) == Status::UNSUPPORTED {
+        ctx.pass("update_capsule_multiple_rejected");
+    } else {
+        ctx.fail("update_capsule_multiple_rejected");
+    }
+    let mut null_header = core::ptr::null_mut();
+    if update(&mut null_header, 1, 1) == Status::UNSUPPORTED {
+        ctx.pass("update_capsule_pre_ebs_short_circuits_header");
+    } else {
+        ctx.fail("update_capsule_pre_ebs_short_circuits_header");
+    }
+    if update(array, 1, 1) == Status::UNSUPPORTED {
+        ctx.pass("update_capsule_pre_ebs_unsupported");
+    } else {
+        ctx.fail("update_capsule_pre_ebs_unsupported");
     }
 }
 

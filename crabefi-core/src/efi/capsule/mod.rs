@@ -1,28 +1,11 @@
 //! EFI Capsule Update Support
 //!
-//! This module implements UEFI capsule update processing as a platform-agnostic
-//! library. It handles both runtime-delivered capsules (via `UpdateCapsule()`)
-//! and file-based capsules (from the EFI System Partition).
-//!
-//! # Architecture
-//!
-//! ```text
-//! ┌────────────────────────┐  ┌──────────────────────────┐
-//! │  Runtime UpdateCapsule │  │  ESP \EFI\UpdateCapsule\  │
-//! │  (deferred → SMMSTORE  │  │  (disk.rs scanner)        │
-//! │   → coreboot → LB_TAG) │  │                          │
-//! └───────────┬────────────┘  └────────────┬─────────────┘
-//!             │                             │
-//!             └──────────┬──────────────────┘
-//!                        ▼
-//!              ┌─────────────────────┐
-//!              │  process_capsules() │  (this module)
-//!              │                     │
-//!              │  header → fmp →     │
-//!              │  auth → rmap →      │
-//!              │  apply → result     │
-//!              └─────────────────────┘
-//! ```
+//! This module implements boot-time capsule processing as a platform-agnostic
+//! library. It handles capsules supplied in platform-reserved memory and files
+//! discovered on the EFI System Partition. The separate runtime image stages
+//! standard post-EBS `UpdateCapsule()` requests in its retained deferred
+//! variable journal; this module remains boot-only and consumes the resulting
+//! platform capsule handoff on a later boot.
 //!
 //! # Usage
 //!
@@ -86,6 +69,11 @@ pub fn process_pending_capsules(backend: &mut dyn CapsuleBackend) -> usize {
                 core::slice::from_raw_parts(region.base as *const u8, region.size as usize)
             };
 
+            if is_retained_reservation_capsule(capsule_data) {
+                log::debug!("Consumed retained-journal reservation capsule");
+                continue;
+            }
+
             let result = apply::apply_capsule(capsule_data, backend);
             result::record_capsule_result(i, &result);
 
@@ -134,59 +122,10 @@ pub fn process_pending_capsules(backend: &mut dyn CapsuleBackend) -> usize {
     applied_count
 }
 
-/// Stage capsules for processing on the next reboot (runtime path).
-///
-/// Called by `UpdateCapsule()` after `ExitBootServices`. Stores the
-/// scatter-gather list pointer as `CapsuleUpdateData*` variables in the
-/// deferred write buffer.
-///
-/// The variables will be applied to SMMSTORE on the next boot, where
-/// coreboot will discover and coalesce them.
-pub fn stage_capsule_for_reboot(
-    scatter_gather_list: u64,
-    capsule_index: usize,
-) -> Result<(), CapsuleError> {
-    use crate::efi::auth;
-    use crate::efi::varstore;
-
-    // Variable name: "CapsuleUpdateData" or "CapsuleUpdateData1", etc.
-    let name_str = if capsule_index == 0 {
-        alloc::string::String::from("CapsuleUpdateData")
-    } else {
-        alloc::format!("CapsuleUpdateData{}", capsule_index)
+fn is_retained_reservation_capsule(data: &[u8]) -> bool {
+    let Ok(header) = header::parse_capsule_header(data) else {
+        return false;
     };
-
-    let mut name_u16: alloc::vec::Vec<u16> = name_str.encode_utf16().collect();
-    name_u16.push(0); // null terminator
-
-    // Vendor GUID for CapsuleUpdateData* variables
-    // {711C703F-C285-4B10-A3B0-36ECBD3C8BE2}
-    let capsule_vendor_guid = r_efi::efi::Guid::from_fields(
-        0x711C703F,
-        0xC285,
-        0x4B10,
-        0xA3,
-        0xB0,
-        &[0x36, 0xEC, 0xBD, 0x3C, 0x8B, 0xE2],
-    );
-
-    // Data is the physical address of the scatter-gather list (u64)
-    let data = scatter_gather_list.to_le_bytes();
-
-    // Attributes: NV + BS + RT
-    let attributes = auth::attributes::NON_VOLATILE
-        | auth::attributes::BOOTSERVICE_ACCESS
-        | auth::attributes::RUNTIME_ACCESS;
-
-    // Write via the deferred path (we're after ExitBootServices)
-    varstore::persist_variable(&capsule_vendor_guid, name_u16.as_slice(), attributes, &data)
-        .map_err(|_| CapsuleError::FlashWriteFailed)?;
-
-    log::info!(
-        "Staged {} at SG list {:#x} for next boot",
-        name_str,
-        scatter_gather_list
-    );
-
-    Ok(())
+    header.capsule_guid.as_bytes() == header::WINDOWS_UX_CAPSULE_GUID.as_bytes()
+        && data.get(header.header_size as usize..header.header_size as usize + 4) == Some(b"CRDJ")
 }

@@ -69,8 +69,7 @@ const VAR_DELETED: u8 = 0xFD;
 /// Non-authenticated variable header size
 pub const VAR_HEADER_SIZE: usize = 32;
 
-/// Authenticated variable header size (not currently used for writing, but
-/// needed for reading stores created by EDK2 which uses auth format)
+/// Authenticated variable header size used for all newly written records.
 pub const AUTH_VAR_HEADER_SIZE: usize = 60;
 
 // ============================================================================
@@ -134,8 +133,8 @@ pub fn build_fv_headers(region_size: u32) -> [u8; FV_HEADER_LENGTH + VS_HEADER_L
 
     // --- VARIABLE_STORE_HEADER (28 bytes) at offset 0x48 ---
     let vs_off = FV_HEADER_LENGTH;
-    // Signature (GUID) — use non-authenticated format
-    buf[vs_off..vs_off + 16].copy_from_slice(&EFI_VARIABLE_GUID);
+    // Signature (GUID) — authenticated headers durably carry replay floors.
+    buf[vs_off..vs_off + 16].copy_from_slice(&EFI_AUTH_VARIABLE_GUID);
     // Size (u32 LE): size of the variable data area (after both FV and VS headers).
     //
     // Coreboot's efivars.c:199 does:
@@ -311,6 +310,8 @@ pub struct FvVariable {
     pub attributes: u32,
     /// Variable data
     pub data: Vec<u8>,
+    /// Timestamp from an authenticated-format record header, when present.
+    pub timestamp: Option<super::SerializedTime>,
     /// Variable state
     pub state: u8,
     /// Offset of this record's State byte in the storage region
@@ -605,7 +606,7 @@ where
         }
 
         // Parse fields based on format
-        let (attributes, name_size, data_size_field, guid_offset) = if auth_format {
+        let (attributes, name_size, data_size_field, guid_offset, timestamp) = if auth_format {
             // Authenticated: attributes at 0x04, name_size at 0x24, data_size at 0x28,
             // guid at 0x2C
             let attrs =
@@ -614,7 +615,23 @@ where
                 u32::from_le_bytes([hdr_buf[0x24], hdr_buf[0x25], hdr_buf[0x26], hdr_buf[0x27]]);
             let ds =
                 u32::from_le_bytes([hdr_buf[0x28], hdr_buf[0x29], hdr_buf[0x2A], hdr_buf[0x2B]]);
-            (attrs, ns, ds, 0x2Cu32)
+            let timestamp = super::SerializedTime {
+                year: u16::from_le_bytes([hdr_buf[0x10], hdr_buf[0x11]]),
+                month: hdr_buf[0x12],
+                day: hdr_buf[0x13],
+                hour: hdr_buf[0x14],
+                minute: hdr_buf[0x15],
+                second: hdr_buf[0x16],
+                nanosecond: u32::from_le_bytes([
+                    hdr_buf[0x18],
+                    hdr_buf[0x19],
+                    hdr_buf[0x1a],
+                    hdr_buf[0x1b],
+                ]),
+                timezone: i16::from_le_bytes([hdr_buf[0x1c], hdr_buf[0x1d]]),
+                daylight: hdr_buf[0x1e],
+            };
+            (attrs, ns, ds, 0x2Cu32, Some(timestamp))
         } else {
             // Non-auth: attributes at 0x04, name_size at 0x08, data_size at 0x0C,
             // guid at 0x10
@@ -624,7 +641,7 @@ where
                 u32::from_le_bytes([hdr_buf[0x08], hdr_buf[0x09], hdr_buf[0x0A], hdr_buf[0x0B]]);
             let ds =
                 u32::from_le_bytes([hdr_buf[0x0C], hdr_buf[0x0D], hdr_buf[0x0E], hdr_buf[0x0F]]);
-            (attrs, ns, ds, 0x10u32)
+            (attrs, ns, ds, 0x10u32, None)
         };
 
         // Sanity check sizes — 0xFFFFFFFF means uninitialized
@@ -674,6 +691,7 @@ where
             name,
             attributes,
             data,
+            timestamp,
             state,
             state_offset,
         });
@@ -752,54 +770,51 @@ where
 // Variable record writing
 // ============================================================================
 
-/// Build a non-authenticated variable record (header + name bytes + data).
+/// Build an authenticated-header variable record (header + name + data).
 ///
-/// `guid_bytes` is the 16-byte mixed-endian EFI_GUID.
-/// `name` is the UTF-16LE variable name including null terminator.
-/// `data` is the raw variable data.
-///
-/// The returned bytes include the full record, aligned to HEADER_ALIGNMENT.
-/// The State byte is initially 0xFF (will be written in stages).
+/// A zero timestamp is used for ordinary variables. Secure database writes
+/// carry the verified timestamp in the same staged record as their value.
 pub fn build_variable_record(
     guid_bytes: &[u8; 16],
     name: &[u16],
     attributes: u32,
     data: &[u8],
+    timestamp: Option<super::SerializedTime>,
 ) -> Vec<u8> {
-    let name_bytes_len = name.len() * 2; // UTF-16LE
-    let total_raw = VAR_HEADER_SIZE + name_bytes_len + data.len();
+    let name_bytes_len = name.len() * 2;
+    let total_raw = AUTH_VAR_HEADER_SIZE + name_bytes_len + data.len();
     let total_aligned = align_up(total_raw as u32, HEADER_ALIGNMENT) as usize;
+    let mut buf = vec![0xFF; total_aligned];
 
-    let mut buf = vec![0xFF; total_aligned]; // Start with 0xFF (erased flash pattern)
-
-    // VARIABLE_HEADER (32 bytes):
-    // StartId at 0x00
     buf[0..2].copy_from_slice(&VARIABLE_DATA.to_le_bytes());
-    // State at 0x02: leave as 0xFF (written separately in stages)
-    // Reserved at 0x03: leave as 0xFF (or 0x00 — doesn't matter)
-    buf[0x03] = 0x00;
-    // Attributes at 0x04
+    buf[0x03] = 0;
     buf[0x04..0x08].copy_from_slice(&attributes.to_le_bytes());
-    // NameSize at 0x08
-    buf[0x08..0x0C].copy_from_slice(&(name_bytes_len as u32).to_le_bytes());
-    // DataSize at 0x0C
-    buf[0x0C..0x10].copy_from_slice(&(data.len() as u32).to_le_bytes());
-    // VendorGuid at 0x10
-    buf[0x10..0x20].copy_from_slice(guid_bytes);
+    // MonotonicCount and PubKeyIndex are unused for time-based authentication.
+    buf[0x08..0x10].fill(0);
+    let timestamp = timestamp.unwrap_or_default();
+    buf[0x10..0x12].copy_from_slice(&timestamp.year.to_le_bytes());
+    buf[0x12] = timestamp.month;
+    buf[0x13] = timestamp.day;
+    buf[0x14] = timestamp.hour;
+    buf[0x15] = timestamp.minute;
+    buf[0x16] = timestamp.second;
+    buf[0x17] = 0;
+    buf[0x18..0x1c].copy_from_slice(&timestamp.nanosecond.to_le_bytes());
+    buf[0x1c..0x1e].copy_from_slice(&timestamp.timezone.to_le_bytes());
+    buf[0x1e] = timestamp.daylight;
+    buf[0x1f] = 0;
+    buf[0x20..0x24].fill(0);
+    buf[0x24..0x28].copy_from_slice(&(name_bytes_len as u32).to_le_bytes());
+    buf[0x28..0x2c].copy_from_slice(&(data.len() as u32).to_le_bytes());
+    buf[0x2c..0x3c].copy_from_slice(guid_bytes);
 
-    // Name (UTF-16LE) at offset VAR_HEADER_SIZE
-    let name_offset = VAR_HEADER_SIZE;
-    for (i, &ch) in name.iter().enumerate() {
-        let off = name_offset + i * 2;
-        buf[off..off + 2].copy_from_slice(&ch.to_le_bytes());
+    let name_offset = AUTH_VAR_HEADER_SIZE;
+    for (index, &unit) in name.iter().enumerate() {
+        let offset = name_offset + index * 2;
+        buf[offset..offset + 2].copy_from_slice(&unit.to_le_bytes());
     }
-
-    // Data at offset VAR_HEADER_SIZE + name_bytes_len
     let data_offset = name_offset + name_bytes_len;
     buf[data_offset..data_offset + data.len()].copy_from_slice(data);
-
-    // Padding bytes between end of data and total_aligned remain 0xFF
-
     buf
 }
 
@@ -822,11 +837,12 @@ pub fn write_variable<F>(
     name: &[u16],
     attributes: u32,
     data: &[u8],
+    timestamp: Option<super::SerializedTime>,
 ) -> Option<u32>
 where
     F: FnMut(u32, &[u8]) -> bool,
 {
-    let record = build_variable_record(guid_bytes, name, attributes, data);
+    let record = build_variable_record(guid_bytes, name, attributes, data, timestamp);
     let record_len = record.len() as u32;
 
     // Step 1: Write entire record (State = 0xFF from build)

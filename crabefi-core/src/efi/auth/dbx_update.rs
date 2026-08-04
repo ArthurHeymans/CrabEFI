@@ -41,7 +41,7 @@
 use super::crypto::verify_pkcs7_signature;
 use super::guid_to_bytes;
 use super::structures::{EfiTime, EfiVariableAuthentication2};
-use super::variables::{KeyDatabaseEntry, dbx_database, kek_database, pk_database};
+use super::variables::{DBX_NAME, dbx_database, kek_database, pk_database};
 use super::{
     AuthError, EFI_CERT_SHA256_GUID, EFI_CERT_TYPE_PKCS7_GUID, EFI_CERT_X509_GUID, is_setup_mode,
 };
@@ -208,24 +208,39 @@ pub fn enroll_dbx_from_file() -> Result<DbxEnrollmentResult, AuthError> {
     let source_str = source.as_str();
     log::info!("Found dbx update ({} bytes) on {}", data.len(), source_str);
 
-    let result = match source {
-        DbxSource::Authenticated(src) => {
-            // Verify signature and apply
-            apply_authenticated_dbx_update(&data, src)?
-        }
+    let (result, attributes) = match source {
+        DbxSource::Authenticated(src) => (
+            apply_authenticated_dbx_update(&data, src)?,
+            super::attributes::SECURE_BOOT_ATTRS,
+        ),
         DbxSource::Raw(src) => {
-            // In Setup Mode, apply without signature verification
-            // but still check timestamp
             if !is_setup_mode() {
                 log::error!("Raw dbx files require Setup Mode");
                 return Err(AuthError::SignatureVerificationFailed);
             }
-            apply_raw_dbx_update(&data, src)?
+            (
+                apply_raw_dbx_update(&data, src)?,
+                super::attributes::SECURE_BOOT_ATTRS
+                    & !super::attributes::TIME_BASED_AUTHENTICATED_WRITE_ACCESS,
+            )
         }
     };
 
-    // Persist the updated dbx
-    super::boot::persist_key_databases()?;
+    let status = crate::efi::runtime_image::client::variables::set(
+        &super::EFI_IMAGE_SECURITY_DATABASE_GUID,
+        DBX_NAME,
+        attributes,
+        &data,
+    );
+    if status != r_efi::efi::Status::SUCCESS {
+        log::error!("Runtime Services rejected dbx update: {:?}", status);
+        return Err(if status == r_efi::efi::Status::OUT_OF_RESOURCES {
+            AuthError::BufferTooSmall
+        } else {
+            AuthError::SignatureVerificationFailed
+        });
+    }
+    super::boot::refresh_key_databases();
 
     log::info!(
         "dbx updated: {} SHA-256 hashes, {} certificates from {}",
@@ -300,16 +315,7 @@ fn apply_authenticated_dbx_update(
 
     log::info!("dbx update signature verified successfully");
 
-    // Apply the entries
-    let result = apply_signature_list_entries(sig_list_data, source)?;
-
-    // Update the dbx timestamp
-    {
-        let mut dbx = dbx_database();
-        dbx.set_timestamp(update_timestamp);
-    }
-
-    Ok(result)
+    apply_signature_list_entries(sig_list_data, source)
 }
 
 /// Apply a raw dbx update (Setup Mode only)
@@ -320,18 +326,7 @@ fn apply_raw_dbx_update(
     data: &[u8],
     source: &'static str,
 ) -> Result<DbxEnrollmentResult, AuthError> {
-    // In Setup Mode, we allow raw signature list data
-    // Set the timestamp to now to prevent downgrades
-    let result = apply_signature_list_entries(data, source)?;
-
-    // Update timestamp to current time
-    {
-        let mut dbx = dbx_database();
-        let current_time = super::time::read_rtc_efi_time();
-        dbx.set_timestamp(current_time);
-    }
-
-    Ok(result)
+    apply_signature_list_entries(data, source)
 }
 
 /// Build the signed data blob for dbx variable authentication
@@ -433,48 +428,22 @@ fn apply_signature_list_entries(
     let sha256_guid = guid_to_bytes(&EFI_CERT_SHA256_GUID);
     let x509_guid = guid_to_bytes(&EFI_CERT_X509_GUID);
 
-    let mut dbx = dbx_database();
-
-    // Parse signature lists
+    // Parse signature lists without mutating the boot cache. The original
+    // operation is committed through Runtime Services below; caches are then
+    // refreshed from that authoritative result.
     for (list, list_data) in SignatureListIterator::new(data) {
-        let sig_type = list.signature_type;
-
-        for (owner, sig_data) in SignatureIterator::new(list, list_data) {
-            // Determine the signature type
-            let (entry_type, data_slice) = if sig_type == sha256_guid {
-                // SHA-256 hash entry (32 bytes)
-                if sig_data.len() >= 32 {
-                    sha256_count += 1;
-                    (sha256_guid, &sig_data[..32])
-                } else {
-                    log::warn!("Skipping short SHA-256 entry ({} bytes)", sig_data.len());
-                    continue;
+        let signature_type = list.signature_type;
+        for (_, signature_data) in SignatureIterator::new(list, list_data) {
+            if signature_type == sha256_guid {
+                if signature_data.len() != 32 {
+                    return Err(AuthError::InvalidHeader);
                 }
-            } else if sig_type == x509_guid {
-                // X.509 certificate
+                sha256_count += 1;
+            } else if signature_type == x509_guid {
+                if signature_data.is_empty() {
+                    return Err(AuthError::InvalidHeader);
+                }
                 x509_count += 1;
-                (x509_guid, sig_data)
-            } else {
-                // Unknown type - use as-is with the original type
-                log::debug!("Unknown dbx signature type: {:02x?}", sig_type);
-                (sig_type, sig_data)
-            };
-
-            // Check if this entry already exists
-            if entry_exists_in_dbx(&dbx, &entry_type, data_slice) {
-                log::debug!("Skipping duplicate dbx entry");
-                continue;
-            }
-
-            // Add the entry
-            let entry = KeyDatabaseEntry {
-                cert_type: entry_type,
-                data: data_slice.to_vec(),
-                owner,
-            };
-
-            if let Err(e) = dbx.add_entry(entry) {
-                log::warn!("Failed to add dbx entry: {:?}", e);
             }
         }
     }
@@ -489,28 +458,4 @@ fn apply_signature_list_entries(
         x509_count,
         source,
     })
-}
-
-/// Check if an entry already exists in the dbx database
-fn entry_exists_in_dbx(
-    dbx: &spin::MutexGuard<'_, super::variables::KeyDatabase>,
-    cert_type: &[u8; 16],
-    data: &[u8],
-) -> bool {
-    let sha256_guid = guid_to_bytes(&EFI_CERT_SHA256_GUID);
-    let x509_guid = guid_to_bytes(&EFI_CERT_X509_GUID);
-
-    if *cert_type == sha256_guid {
-        // Check for SHA-256 hash
-        if data.len() >= 32 {
-            let mut hash = [0u8; 32];
-            hash.copy_from_slice(&data[..32]);
-            return dbx.contains_sha256_hash(&hash);
-        }
-    } else if *cert_type == x509_guid {
-        // Check for X.509 certificate
-        return dbx.find_x509_certificate(data).is_some();
-    }
-
-    false
 }

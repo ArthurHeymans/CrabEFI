@@ -22,9 +22,8 @@
 //! ```
 
 use crate::efi::auth::{EFI_GLOBAL_VARIABLE_GUID, attributes};
-use crate::efi::utils::ucs2_eq;
-use crate::state::{self, MAX_VARIABLE_DATA_SIZE, MAX_VARIABLE_NAME_LEN};
 use core::fmt::Write;
+use crabefi_runtime_abi::MAX_VARIABLE_NAME_LEN;
 use heapless::Vec as HeaplessVec;
 
 // ============================================================================
@@ -301,71 +300,16 @@ fn boot_option_name(option_number: u16) -> [u16; MAX_VARIABLE_NAME_LEN] {
 /// Read a variable from the in-memory variable store.
 ///
 /// Returns `Some((attributes, data_slice))` if found, `None` otherwise.
-fn read_variable(name: &[u16]) -> Option<(u32, HeaplessVec<u8, MAX_VARIABLE_DATA_SIZE>)> {
-    let efi = state::efi();
-    for var in efi.variables.iter() {
-        if var.in_use && var.vendor_guid == EFI_GLOBAL_VARIABLE_GUID && ucs2_eq(&var.name, name) {
-            let mut data = HeaplessVec::new();
-            data.extend_from_slice(&var.data[..var.data_size]).ok();
-            return Some((var.attributes, data));
-        }
-    }
-    None
+fn read_variable(name: &[u16]) -> Option<(u32, alloc::vec::Vec<u8>)> {
+    crate::efi::runtime_image::client::variables::get(&EFI_GLOBAL_VARIABLE_GUID, name)
 }
 
 /// Write (or create) a variable in the in-memory variable store.
 ///
 /// If `data` is empty and `attrs` is 0, the variable is deleted.
 fn write_variable(name: &[u16], attrs: u32, data: &[u8]) -> bool {
-    state::with_efi_mut(|efi| {
-        let guid = EFI_GLOBAL_VARIABLE_GUID;
-
-        // If deleting (size=0, attrs=0), find and remove
-        if data.is_empty() && attrs == 0 {
-            for var in efi.variables.iter_mut() {
-                if var.in_use && var.vendor_guid == guid && ucs2_eq(&var.name, name) {
-                    var.clear();
-                    return true;
-                }
-            }
-            return true; // Not found is OK for delete
-        }
-
-        if data.len() > MAX_VARIABLE_DATA_SIZE {
-            log::error!("write_variable: data too large ({} bytes)", data.len());
-            return false;
-        }
-
-        // Try to find existing variable to update
-        for var in efi.variables.iter_mut() {
-            if var.in_use && var.vendor_guid == guid && ucs2_eq(&var.name, name) {
-                var.attributes = attrs;
-                return var.set_data(data).is_ok();
-            }
-        }
-
-        // Create new variable in first empty slot
-        for var in efi.variables.iter_mut() {
-            if !var.in_use {
-                var.in_use = true;
-                var.vendor_guid = guid;
-                var.attributes = attrs;
-                // Copy name
-                let name_len = name.iter().position(|&c| c == 0).unwrap_or(name.len());
-                let copy_len = name_len.min(MAX_VARIABLE_NAME_LEN - 1);
-                var.name[..copy_len].copy_from_slice(&name[..copy_len]);
-                var.name[copy_len] = 0;
-                // Zero remaining name bytes
-                for c in &mut var.name[copy_len + 1..] {
-                    *c = 0;
-                }
-                return var.set_data(data).is_ok();
-            }
-        }
-
-        log::error!("write_variable: no free variable slots");
-        false
-    })
+    crate::efi::runtime_image::client::variables::set(&EFI_GLOBAL_VARIABLE_GUID, name, attrs, data)
+        == r_efi::efi::Status::SUCCESS
 }
 
 /// Delete a variable from the in-memory store.

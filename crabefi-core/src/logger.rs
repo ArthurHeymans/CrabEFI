@@ -197,17 +197,12 @@ fn level_to_data(level: LevelFilter) -> [u8; 1] {
     }]
 }
 
-/// Check whether a variable name/GUID pair is the CrabEFI log-level variable.
-pub fn is_log_level_variable(guid: &Guid, name: &[u16]) -> bool {
-    *guid == CRABEFI_SETTINGS_GUID && crate::efi::utils::ucs2_eq(name, LOG_LEVEL_VARIABLE_NAME)
-}
-
-/// Read the configured log level from the in-memory EFI variable cache.
+/// Read the configured log level from the authoritative runtime image store.
 pub fn configured_level() -> LevelFilter {
     read_persisted_level().unwrap_or_else(log::max_level)
 }
 
-/// Apply the persisted log level from the in-memory EFI variable cache.
+/// Apply the persisted log level from the authoritative runtime image store.
 pub fn apply_persisted_level() {
     if let Some(level) = read_persisted_level() {
         set_level(level);
@@ -241,52 +236,26 @@ pub fn apply_from_edk2_varstore_region(region: &[u8]) -> bool {
     }
 }
 
-/// Apply a just-written log-level variable payload.
-pub fn apply_variable_write(data: &[u8]) {
-    if crate::state::is_exit_boot_services_called() {
-        return;
-    }
-
-    if let Some(level) = level_from_data(data) {
-        set_level(level);
-    }
-}
-
-/// Apply deletion of the log-level variable by reverting to the default level.
-pub fn apply_variable_delete() {
-    if crate::state::is_exit_boot_services_called() {
-        return;
-    }
-
-    set_level(DEFAULT_LEVEL);
-}
-
 /// Persist and apply a new CrabEFI log level.
-pub fn set_configured_level(level: LevelFilter) -> Result<(), crate::efi::varstore::VarStoreError> {
+pub fn set_configured_level(level: LevelFilter) -> Result<(), r_efi::efi::Status> {
     let data = level_to_data(level);
-
-    crate::efi::varstore::persist_variable(
-        &CRABEFI_SETTINGS_GUID,
-        LOG_LEVEL_VARIABLE_NAME,
-        LOG_LEVEL_VARIABLE_ATTRS,
-        &data,
-    )?;
-
-    crate::efi::varstore::update_variable_in_memory(
+    let status = crate::efi::runtime_image::client::variables::set(
         &CRABEFI_SETTINGS_GUID,
         LOG_LEVEL_VARIABLE_NAME,
         LOG_LEVEL_VARIABLE_ATTRS,
         &data,
     );
+    if status != r_efi::efi::Status::SUCCESS {
+        return Err(status);
+    }
     set_level(level);
-
     Ok(())
 }
 
 fn read_persisted_level() -> Option<LevelFilter> {
-    crate::state::efi()
-        .variables
-        .iter()
-        .find(|var| var.in_use && is_log_level_variable(&var.vendor_guid, &var.name))
-        .and_then(|var| level_from_data(&var.data[..var.data_size]))
+    crate::efi::runtime_image::client::variables::get(
+        &CRABEFI_SETTINGS_GUID,
+        LOG_LEVEL_VARIABLE_NAME,
+    )
+    .and_then(|(_, data)| level_from_data(&data))
 }

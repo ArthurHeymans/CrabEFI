@@ -54,11 +54,9 @@ impl From<&MemoryRegion> for E820Entry {
     fn from(region: &MemoryRegion) -> Self {
         let entry_type = match region.region_type {
             MemoryType::Ram => E820Entry::RAM_TYPE,
-            MemoryType::Reserved
-            | MemoryType::Mmio
-            | MemoryType::RuntimeServicesCode
-            | MemoryType::RuntimeServicesData
-            | MemoryType::BootServicesData => E820Entry::RESERVED_TYPE,
+            MemoryType::Reserved | MemoryType::Mmio | MemoryType::BootServicesData => {
+                E820Entry::RESERVED_TYPE
+            }
             MemoryType::AcpiReclaimable => E820Entry::ACPI_RECLAIMABLE_TYPE,
             MemoryType::AcpiNvs => E820Entry::ACPI_NVS_TYPE,
         };

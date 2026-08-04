@@ -11,9 +11,7 @@ pub mod esrt;
 pub mod guid_fmt;
 pub mod image_loader;
 pub mod protocols;
-#[cfg(feature = "rt-log")]
-pub mod rtlog;
-pub mod runtime_services;
+pub mod runtime_image;
 pub mod system_table;
 pub mod tcg;
 pub mod utils;
@@ -59,34 +57,10 @@ pub fn init_from_platform(config: &mut crate::platform::PlatformConfig) {
         }
     }
 
-    // Reserve runtime services memory regions if the platform provided them.
-    if let Some(rt) = config.runtime_region {
-        use allocator::MemoryType;
-
-        let code_pages = rt.code_size.div_ceil(allocator::PAGE_SIZE);
-        let data_pages = rt.data_size.div_ceil(allocator::PAGE_SIZE);
-        if let Err(e) =
-            allocator::reserve_region(rt.code_base, code_pages, MemoryType::RuntimeServicesCode)
-        {
-            log::warn!("Failed to reserve runtime code region: {:?}", e);
-        }
-        if let Err(e) = allocator::reserve_region_fragments(
-            rt.data_base,
-            data_pages,
-            MemoryType::RuntimeServicesData,
-        ) {
-            log::warn!("Failed to reserve runtime data region fragments: {:?}", e);
-        }
-    } else {
-        // Fall back to linker-symbol-based reservation. Only available when
-        // CrabEFI owns the linker script (platform-entry feature).
-        #[cfg(feature = "platform-entry")]
-        allocator::reserve_runtime_region();
-        #[cfg(not(feature = "platform-entry"))]
-        log::info!(
-            "No runtime region provided and no linker symbols — runtime services may not survive ExitBootServices"
-        );
-    }
+    // The payload itself is boot-lifetime memory. Only the separately loaded
+    // runtime image and explicit external ranges receive Runtime memory types.
+    #[cfg(feature = "platform-entry")]
+    allocator::reserve_boot_image_region();
 
     // The EFI state tables are heap-backed, so initialize the heap after the
     // page allocator and runtime regions are ready but before system-table and
@@ -110,13 +84,12 @@ pub fn init_from_platform(config: &mut crate::platform::PlatformConfig) {
         heap_total,
     );
 
-    // Initialize system table with boot and runtime services
-    unsafe {
-        system_table::init(
-            boot_services::get_boot_services(),
-            runtime_services::get_runtime_services(),
-        );
-    }
+    let runtime_client = runtime_image::load(config.runtime_image, config.runtime)
+        .unwrap_or_else(|error| panic!("mandatory runtime image failed to load: {:?}", error));
+    crate::state::with_efi_mut(|efi| efi.runtime_image = Some(runtime_client));
+
+    // The System and Runtime tables are image-owned.
+    system_table::init();
 
     // Install platform tables
     if let Some(rsdp) = config.acpi_rsdp {
@@ -474,12 +447,10 @@ fn init_console() -> Option<efi::Handle> {
         log::error!("Failed to install text output protocol: {:?}", status);
     }
 
-    // Set up console in system table
-    unsafe {
-        system_table::set_console_in(console_handle, input_protocol);
-        system_table::set_console_out(console_handle, output_protocol);
-        system_table::set_std_err(console_handle, output_protocol);
-    }
+    // Set up boot-only console fields in the image-owned System Table.
+    system_table::set_console_in(console_handle, input_protocol);
+    system_table::set_console_out(console_handle, output_protocol);
+    system_table::set_std_err(console_handle, output_protocol);
 
     log::debug!("Console protocols installed on handle {:?}", console_handle);
     Some(console_handle)
