@@ -70,7 +70,9 @@ jobs:
           ./crabefi build --arch x86-64
           RUNTIME_IMAGE_PATH="$PWD/target/runtime/x86_64/runtime.img" \
           RUNTIME_IMAGE_SHA256="$(tr -d '\n' < target/runtime/x86_64/sha256)" \
-          cargo clippy --workspace --release --target x86_64-unknown-none -- -D warnings
+          cargo +nightly -Z build-std=core,compiler_builtins,alloc \
+            -Z build-std-features=compiler-builtins-mem \
+            clippy --workspace --release --target x86_64-unknown-none -- -D warnings
           cd "$HOME"
           cargo +nightly clippy --manifest-path "$GITHUB_WORKSPACE/crabefi-runtime-abi/Cargo.toml" -- -D warnings
           cd "$GITHUB_WORKSPACE/crabefi-runtime-image"
@@ -523,7 +525,9 @@ jobs:
           ./crabefi build --arch aarch64 --machine sbsa
           RUNTIME_IMAGE_PATH="$PWD/target/runtime/aarch64/runtime.img" \
           RUNTIME_IMAGE_SHA256="$(tr -d '\n' < target/runtime/aarch64/sha256)" \
-          cargo clippy --workspace --release --target aarch64-unknown-none -- -D warnings
+          cargo +nightly -Z build-std=core,compiler_builtins,alloc \
+            -Z build-std-features=compiler-builtins-mem \
+            clippy --workspace --release --target aarch64-unknown-none -- -D warnings
           cd "$GITHUB_WORKSPACE/crabefi-runtime-image"
           cargo +nightly -Z build-std=core,compiler_builtins,alloc \
             -Z build-std-features=compiler-builtins-mem \
@@ -698,7 +702,9 @@ jobs:
           ./crabefi build --arch riscv64
           RUNTIME_IMAGE_PATH="$PWD/target/runtime/riscv64/runtime.img" \
           RUNTIME_IMAGE_SHA256="$(tr -d '\n' < target/runtime/riscv64/sha256)" \
-          cargo clippy --workspace --release --target riscv64gc-unknown-none-elf -- -D warnings
+          cargo +nightly -Z build-std=core,compiler_builtins,alloc \
+            -Z build-std-features=compiler-builtins-mem \
+            clippy --workspace --release --target riscv64gc-unknown-none-elf -- -D warnings
           cd "$GITHUB_WORKSPACE/crabefi-runtime-image"
           cargo +nightly -Z build-std=core,compiler_builtins,alloc \
             -Z build-std-features=compiler-builtins-mem \

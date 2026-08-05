@@ -4,7 +4,7 @@
 //! multiple auth submodules (crypto, revocation, dbx_update).
 
 use super::AuthError;
-use super::structures::EfiTime;
+use crabefi_efi_types::authentication::EfiTime;
 
 /// Convert a date/time to Unix timestamp (seconds since 1970-01-01 00:00:00 UTC)
 ///

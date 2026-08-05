@@ -167,7 +167,9 @@ cargo fmt --all --check
 # Direct workspace diagnostics use the image path and digest produced above.
 RUNTIME_IMAGE_PATH="$PWD/target/runtime/x86_64/runtime.img" \
 RUNTIME_IMAGE_SHA256="$(tr -d '\n' < target/runtime/x86_64/sha256)" \
-cargo clippy --workspace --release --target x86_64-unknown-none -- -D warnings
+cargo +nightly -Z build-std=core,compiler_builtins,alloc \
+  -Z build-std-features=compiler-builtins-mem \
+  clippy --workspace --release --target x86_64-unknown-none -- -D warnings
 ```
 
 ## Deployment

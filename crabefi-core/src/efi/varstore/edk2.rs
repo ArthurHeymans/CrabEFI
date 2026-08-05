@@ -25,6 +25,8 @@
 use alloc::vec;
 use alloc::vec::Vec;
 
+use crabefi_runtime_abi::VariableTimestamp;
+
 // ============================================================================
 // Constants
 // ============================================================================
@@ -311,7 +313,7 @@ pub struct FvVariable {
     /// Variable data
     pub data: Vec<u8>,
     /// Timestamp from an authenticated-format record header, when present.
-    pub timestamp: Option<super::SerializedTime>,
+    pub timestamp: Option<VariableTimestamp>,
     /// Variable state
     pub state: u8,
     /// Offset of this record's State byte in the storage region
@@ -615,13 +617,14 @@ where
                 u32::from_le_bytes([hdr_buf[0x24], hdr_buf[0x25], hdr_buf[0x26], hdr_buf[0x27]]);
             let ds =
                 u32::from_le_bytes([hdr_buf[0x28], hdr_buf[0x29], hdr_buf[0x2A], hdr_buf[0x2B]]);
-            let timestamp = super::SerializedTime {
+            let timestamp = VariableTimestamp {
                 year: u16::from_le_bytes([hdr_buf[0x10], hdr_buf[0x11]]),
                 month: hdr_buf[0x12],
                 day: hdr_buf[0x13],
                 hour: hdr_buf[0x14],
                 minute: hdr_buf[0x15],
                 second: hdr_buf[0x16],
+                pad1: hdr_buf[0x17],
                 nanosecond: u32::from_le_bytes([
                     hdr_buf[0x18],
                     hdr_buf[0x19],
@@ -630,6 +633,7 @@ where
                 ]),
                 timezone: i16::from_le_bytes([hdr_buf[0x1c], hdr_buf[0x1d]]),
                 daylight: hdr_buf[0x1e],
+                pad2: hdr_buf[0x1f],
             };
             (attrs, ns, ds, 0x2Cu32, Some(timestamp))
         } else {
@@ -779,7 +783,7 @@ pub fn build_variable_record(
     name: &[u16],
     attributes: u32,
     data: &[u8],
-    timestamp: Option<super::SerializedTime>,
+    timestamp: Option<VariableTimestamp>,
 ) -> Vec<u8> {
     let name_bytes_len = name.len() * 2;
     let total_raw = AUTH_VAR_HEADER_SIZE + name_bytes_len + data.len();
@@ -837,7 +841,7 @@ pub fn write_variable<F>(
     name: &[u16],
     attributes: u32,
     data: &[u8],
-    timestamp: Option<super::SerializedTime>,
+    timestamp: Option<VariableTimestamp>,
 ) -> Option<u32>
 where
     F: FnMut(u32, &[u8]) -> bool,
@@ -918,12 +922,7 @@ pub fn guid_matches(on_disk: &[u8; 16], guid: &r_efi::efi::Guid) -> bool {
     *on_disk == guid_to_bytes(guid)
 }
 
-/// Compare variable names (UTF-16, case-sensitive, including null terminator).
+/// Compare variable names case-sensitively with an optional UTF-16 NUL terminator.
 pub fn name_matches(on_disk: &[u16], name: &[u16]) -> bool {
-    // Strip trailing nulls for comparison
-    fn strip(n: &[u16]) -> &[u16] {
-        let len = n.iter().position(|&c| c == 0).unwrap_or(n.len());
-        &n[..len]
-    }
-    strip(on_disk) == strip(name)
+    crabefi_efi_types::secure_boot::name_matches(on_disk, name)
 }

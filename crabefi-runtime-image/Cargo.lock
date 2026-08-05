@@ -54,6 +54,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "crabefi-efi-types"
+version = "0.1.0"
+dependencies = [
+ "zerocopy",
+]
+
+[[package]]
 name = "crabefi-runtime-abi"
 version = "0.1.0"
 
@@ -61,6 +68,7 @@ version = "0.1.0"
 name = "crabefi-runtime-image"
 version = "0.1.0"
 dependencies = [
+ "crabefi-efi-types",
  "crabefi-runtime-abi",
  "postcard",
  "r-efi",

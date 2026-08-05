@@ -34,30 +34,19 @@ pub mod enrollment;
 pub mod key_files;
 pub mod revocation;
 mod signature;
-mod structures;
 pub(crate) mod time;
 mod variables;
 
 pub use crypto::*;
 pub use signature::*;
-pub use structures::*;
 pub use variables::*;
 
 use core::sync::atomic::{AtomicBool, Ordering};
 
+use crabefi_efi_types::secure_boot::{
+    EFI_GLOBAL_VARIABLE_GUID, SECURE_BOOT_ENABLE_NAME, SECURE_BOOT_NAME, SETUP_MODE_NAME,
+};
 use r_efi::efi::Guid;
-
-// ============================================================================
-// GUID Helper Functions
-// ============================================================================
-
-/// Convert a Guid to raw bytes (shared utility for auth submodules)
-pub(crate) fn guid_to_bytes(guid: &Guid) -> [u8; 16] {
-    let bytes = guid.as_bytes();
-    let mut result = [0u8; 16];
-    result.copy_from_slice(bytes);
-    result
-}
 
 // ============================================================================
 // DER Encoding Helpers
@@ -229,72 +218,6 @@ pub mod attributes {
         NON_VOLATILE | BOOTSERVICE_ACCESS | RUNTIME_ACCESS | TIME_BASED_AUTHENTICATED_WRITE_ACCESS;
 }
 
-// ============================================================================
-// Secure Boot GUIDs
-// ============================================================================
-
-/// EFI Global Variable GUID
-/// Used for: PK, KEK, SetupMode, SecureBoot, SignatureSupport, etc.
-pub const EFI_GLOBAL_VARIABLE_GUID: Guid = Guid::from_fields(
-    0x8BE4DF61,
-    0x93CA,
-    0x11D2,
-    0xAA,
-    0x0D,
-    &[0x00, 0xE0, 0x98, 0x03, 0x2B, 0x8C],
-);
-
-/// EFI Image Security Database GUID
-/// Used for: db, dbx, dbt, dbr
-pub const EFI_IMAGE_SECURITY_DATABASE_GUID: Guid = Guid::from_fields(
-    0xD719B2CB,
-    0x3D3A,
-    0x4596,
-    0xA3,
-    0xBC,
-    &[0xDA, 0xD0, 0x0E, 0x67, 0x65, 0x6F],
-);
-
-/// Certificate Type GUID for X.509 certificates
-pub const EFI_CERT_X509_GUID: Guid = Guid::from_fields(
-    0xA5C059A1,
-    0x94E4,
-    0x4AA7,
-    0x87,
-    0xB5,
-    &[0xAB, 0x15, 0x5C, 0x2B, 0xF0, 0x72],
-);
-
-/// Certificate Type GUID for RSA-2048 public keys
-pub const EFI_CERT_RSA2048_GUID: Guid = Guid::from_fields(
-    0x3C5766E8,
-    0x269C,
-    0x4E34,
-    0xAA,
-    0x14,
-    &[0xED, 0x77, 0x6E, 0x85, 0xB3, 0xB6],
-);
-
-/// Certificate Type GUID for SHA-256 hashes
-pub const EFI_CERT_SHA256_GUID: Guid = Guid::from_fields(
-    0xC1C41626,
-    0x504C,
-    0x4092,
-    0xAC,
-    0xA9,
-    &[0x41, 0xF9, 0x36, 0x93, 0x43, 0x28],
-);
-
-/// Certificate Type GUID for PKCS#7 signatures
-pub const EFI_CERT_TYPE_PKCS7_GUID: Guid = Guid::from_fields(
-    0x4AAFD29D,
-    0x68DF,
-    0x49EE,
-    0x8A,
-    0xA9,
-    &[0x34, 0x7D, 0x37, 0x56, 0x65, 0xA7],
-);
-
 /// WIN_CERTIFICATE revision
 pub const WIN_CERT_REVISION: u16 = 0x0200;
 
@@ -319,8 +242,8 @@ static SECURE_BOOT_ENABLED: AtomicBool = AtomicBool::new(false);
 /// Read the image-owned standard SetupMode variable.
 pub fn is_setup_mode() -> bool {
     crate::efi::runtime_image::client::variables::get(
-        &EFI_GLOBAL_VARIABLE_GUID,
-        variables::SETUP_MODE_NAME,
+        &Guid::from_bytes(&EFI_GLOBAL_VARIABLE_GUID),
+        SETUP_MODE_NAME,
     )
     .and_then(|(_, data)| data.first().copied())
         != Some(0)
@@ -329,8 +252,8 @@ pub fn is_setup_mode() -> bool {
 /// Read the image-owned standard SecureBoot variable.
 pub fn is_secure_boot_enabled() -> bool {
     crate::efi::runtime_image::client::variables::get(
-        &EFI_GLOBAL_VARIABLE_GUID,
-        variables::SECURE_BOOT_NAME,
+        &Guid::from_bytes(&EFI_GLOBAL_VARIABLE_GUID),
+        SECURE_BOOT_NAME,
     )
     .and_then(|(_, data)| data.first().copied())
         == Some(1)
@@ -378,11 +301,9 @@ pub fn disable_secure_boot() {
 
 /// Persist the SecureBootEnable preference to non-volatile storage
 fn persist_secure_boot_enable_preference(enabled: bool) {
-    use variables::SECURE_BOOT_ENABLE_NAME;
-
     let value: u8 = if enabled { 1 } else { 0 };
     let status = crate::efi::runtime_image::client::variables::set(
-        &EFI_GLOBAL_VARIABLE_GUID,
+        &Guid::from_bytes(&EFI_GLOBAL_VARIABLE_GUID),
         SECURE_BOOT_ENABLE_NAME,
         SECURE_BOOT_ENABLE_ATTRS,
         &[value],

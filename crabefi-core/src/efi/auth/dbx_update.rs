@@ -38,13 +38,19 @@
 //! }
 //! ```
 
-use super::crypto::verify_pkcs7_signature;
-use super::guid_to_bytes;
-use super::structures::{EfiTime, EfiVariableAuthentication2};
-use super::variables::{DBX_NAME, dbx_database, kek_database, pk_database};
-use super::{
-    AuthError, EFI_CERT_SHA256_GUID, EFI_CERT_TYPE_PKCS7_GUID, EFI_CERT_X509_GUID, is_setup_mode,
+use crabefi_efi_types::{
+    authentication::{
+        EfiTime, EfiVariableAuthentication2, SignatureIterator, SignatureListIterator,
+    },
+    secure_boot::{
+        DBX_NAME, EFI_CERT_SHA256_GUID, EFI_CERT_TYPE_PKCS7_GUID, EFI_CERT_X509_GUID,
+        EFI_IMAGE_SECURITY_DATABASE_GUID,
+    },
 };
+
+use super::crypto::verify_pkcs7_signature;
+use super::variables::{dbx_database, kek_database, pk_database};
+use super::{AuthError, is_setup_mode};
 use crate::drivers::block::BlockDevice;
 use crate::fs::fat::FatFilesystem;
 use crate::fs::gpt;
@@ -227,7 +233,7 @@ pub fn enroll_dbx_from_file() -> Result<DbxEnrollmentResult, AuthError> {
     };
 
     let status = crate::efi::runtime_image::client::variables::set(
-        &super::EFI_IMAGE_SECURITY_DATABASE_GUID,
+        &r_efi::efi::Guid::from_bytes(&EFI_IMAGE_SECURITY_DATABASE_GUID),
         DBX_NAME,
         attributes,
         &data,
@@ -270,14 +276,22 @@ fn apply_authenticated_dbx_update(
     })?;
 
     // Verify the certificate type is PKCS#7
-    let pkcs7_guid = guid_to_bytes(&EFI_CERT_TYPE_PKCS7_GUID);
-    if !auth_header.auth_info.cert_type_matches(&pkcs7_guid) {
+    if auth_header.auth_info.cert_type != EFI_CERT_TYPE_PKCS7_GUID {
         log::error!("dbx update certificate type is not PKCS#7");
         return Err(AuthError::InvalidHeader);
     }
 
     // Get the timestamp from the header
     let update_timestamp = auth_header.time_stamp;
+
+    // Reject malformed timestamps before comparing: the nanosecond-precision
+    // comparator would otherwise let out-of-range fields (seconds, nanoseconds,
+    // timezone) sort after the current timestamp and defeat the anti-downgrade
+    // check. Mirrors the runtime image's verify_authenticated_variable.
+    if !update_timestamp.is_valid() {
+        log::error!("dbx update timestamp is malformed");
+        return Err(AuthError::InvalidTimestamp);
+    }
 
     // Anti-downgrade check: verify timestamp is newer than current dbx
     {
@@ -292,13 +306,13 @@ fn apply_authenticated_dbx_update(
     }
 
     // Get the PKCS#7 signature data
-    let pkcs7_data = auth_header.get_cert_data(data).ok_or_else(|| {
+    let pkcs7_data = auth_header.cert_data(data).ok_or_else(|| {
         log::error!("Failed to extract PKCS#7 data from dbx update");
         AuthError::InvalidHeader
     })?;
 
     // Get the variable data (signature lists)
-    let sig_list_data = auth_header.get_variable_data(data).ok_or_else(|| {
+    let sig_list_data = auth_header.variable_data(data).ok_or_else(|| {
         log::error!("Failed to extract signature list data from dbx update");
         AuthError::InvalidHeader
     })?;
@@ -338,7 +352,7 @@ fn apply_raw_dbx_update(
 /// - Timestamp
 /// - Variable content
 fn build_dbx_signed_data(timestamp: &EfiTime, content: &[u8]) -> Vec<u8> {
-    use super::{EFI_IMAGE_SECURITY_DATABASE_GUID, attributes};
+    use super::attributes;
 
     let mut data = Vec::new();
 
@@ -346,7 +360,7 @@ fn build_dbx_signed_data(timestamp: &EfiTime, content: &[u8]) -> Vec<u8> {
     data.extend_from_slice(&[0x64, 0x00, 0x62, 0x00, 0x78, 0x00]); // "dbx"
 
     // Vendor GUID
-    data.extend_from_slice(&guid_to_bytes(&EFI_IMAGE_SECURITY_DATABASE_GUID));
+    data.extend_from_slice(&EFI_IMAGE_SECURITY_DATABASE_GUID);
 
     // Attributes (4 bytes, little-endian)
     let attrs = attributes::SECURE_BOOT_ATTRS;
@@ -419,14 +433,12 @@ fn apply_signature_list_entries(
     data: &[u8],
     source: &'static str,
 ) -> Result<DbxEnrollmentResult, AuthError> {
-    use super::structures::{SignatureIterator, SignatureListIterator};
-
     let mut sha256_count = 0usize;
     let mut x509_count = 0usize;
 
     // Convert GUIDs to bytes for comparison
-    let sha256_guid = guid_to_bytes(&EFI_CERT_SHA256_GUID);
-    let x509_guid = guid_to_bytes(&EFI_CERT_X509_GUID);
+    let sha256_guid = EFI_CERT_SHA256_GUID;
+    let x509_guid = EFI_CERT_X509_GUID;
 
     // Parse signature lists without mutating the boot cache. The original
     // operation is committed through Runtime Services below; caches are then

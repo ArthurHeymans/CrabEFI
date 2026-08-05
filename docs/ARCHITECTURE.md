@@ -5,13 +5,16 @@
 - `crabefi-core`: boot-time, platform-independent UEFI implementation
 - `crabefi-coreboot`: coreboot payload and platform discovery
 - `crabefi-drivers`: reusable boot-time drivers
+- `crabefi-efi-types`: shared, allocation-free EFI time, signature-list, and Secure Boot definitions
 - `crabefi-runtime-abi`: excluded, host-testable pointer-free format/handoff ABI
 - `crabefi-runtime-image`: excluded, separately linked `no_std` Runtime Services image
 - `xtask`: host build, normalization, audit, ROM, and QEMU automation
 
-The runtime image depends only on `core`, compiler builtins, and the ABI crate.
-It has no dependency on `crabefi-core`, `alloc`, `log`, drivers, platform traits,
-or a global allocator.
+The runtime image shares pointer-free handoff definitions through
+`crabefi-runtime-abi` and EFI authentication definitions through
+`crabefi-efi-types`. It has no dependency on `crabefi-core`, `log`, drivers, or
+platform traits. Cryptographic operations use only the bounded image-local BSS
+scratch arena, not an unbounded or post-seal general-purpose heap.
 
 ## Boot flow
 
@@ -35,7 +38,16 @@ variables and value-only platform mechanisms.
 
 Boot Secure Boot databases are disposable verification snapshots rebuilt from
 image variables. They are not a variable authority and are unreachable after
-EBS.
+EBS. EFI time comparison, signature-list structures, and Secure Boot variable
+names/GUIDs are single-sourced in `crabefi-efi-types` on both sides of the image
+boundary.
+
+Certificate verification remains intentionally split by execution domain. The
+runtime image's authenticated-variable path uses its bounded, allocation-free,
+hand-rolled PKCS#7/X.509 verifier; boot uses `cms`/`x509_cert` only for
+Authenticode. Neither path enforces certificate `notBefore`/`notAfter`,
+preserving the old `check_validity_period = false` policy and matching EDK2 and
+U-Boot.
 
 See [Separate Runtime Image Architecture](RUNTIME_IMAGE_PLAN.md) for detailed
 invariants and current mechanism limitations.

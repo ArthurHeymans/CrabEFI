@@ -1,8 +1,8 @@
 //! CrabEFI separately linked EFI runtime image with bounded scratch allocation.
 
-#![cfg_attr(not(test), no_std)]
-#![cfg_attr(not(test), no_main)]
-#![cfg_attr(not(test), feature(alloc_error_handler))]
+#![cfg_attr(all(not(test), target_os = "none"), no_std)]
+#![cfg_attr(all(not(test), target_os = "none"), no_main)]
+#![cfg_attr(all(not(test), target_os = "none"), feature(alloc_error_handler))]
 #![deny(unsafe_op_in_unsafe_fn)]
 // Exported C ABI entry points validate every pointer and copy all retained
 // fields immediately; keeping them safe matches firmware caller conventions.
@@ -12,7 +12,6 @@ extern crate alloc;
 
 mod arch;
 mod auth;
-mod crc32;
 mod deferred;
 mod efi;
 mod scratch;
@@ -22,7 +21,7 @@ mod store;
 mod svam;
 mod tables;
 
-#[cfg(not(test))]
+#[cfg(all(not(test), target_os = "none"))]
 use core::panic::PanicInfo;
 
 use crabefi_runtime_abi::{
@@ -30,7 +29,7 @@ use crabefi_runtime_abi::{
     RuntimeHandoff, VariableImport, phase,
 };
 
-#[cfg(not(test))]
+#[cfg(all(not(test), target_os = "none"))]
 #[panic_handler]
 fn panic(_info: &PanicInfo<'_>) -> ! {
     loop {
@@ -38,13 +37,16 @@ fn panic(_info: &PanicInfo<'_>) -> ! {
     }
 }
 
-#[cfg(not(test))]
+#[cfg(all(not(test), target_os = "none"))]
 #[alloc_error_handler]
 fn allocation_error(_layout: core::alloc::Layout) -> ! {
     loop {
         core::hint::spin_loop();
     }
 }
+
+#[cfg(all(not(test), not(target_os = "none")))]
+fn main() {}
 
 #[unsafe(no_mangle)]
 pub extern "C" fn runtime_image_init(handoff: *const RuntimeHandoff) -> usize {
@@ -134,8 +136,7 @@ pub extern "C" fn runtime_image_import_variable(import: *const VariableImport) -
     if import.timestamp_valid > 1 {
         return efi::Status::INVALID_PARAMETER.as_usize();
     }
-    let timestamp =
-        (import.timestamp_valid != 0).then(|| deferred::SerializedTime::from_abi(import.timestamp));
+    let timestamp = (import.timestamp_valid != 0).then_some(import.timestamp);
     let (store, transaction) = lease.variables_mut();
     match store.import(
         transaction,

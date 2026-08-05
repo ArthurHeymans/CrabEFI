@@ -39,18 +39,7 @@ pub extern "C" fn dispatch(request: *const BridgeRequest) -> usize {
     if request.timestamp_valid > 1 || request.reserved != 0 {
         return Status::INVALID_PARAMETER.as_usize();
     }
-    let timestamp =
-        (request.timestamp_valid != 0).then_some(crate::efi::varstore::SerializedTime {
-            year: request.timestamp.year,
-            month: request.timestamp.month,
-            day: request.timestamp.day,
-            hour: request.timestamp.hour,
-            minute: request.timestamp.minute,
-            second: request.timestamp.second,
-            nanosecond: request.timestamp.nanosecond,
-            timezone: request.timestamp.timezone,
-            daylight: request.timestamp.daylight,
-        });
+    let timestamp = (request.timestamp_valid != 0).then_some(request.timestamp);
     let guid = guid_from_bytes(request.guid);
     let result = match request.operation {
         bridge_operation::PERSIST_WRITE => {

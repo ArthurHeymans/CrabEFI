@@ -27,7 +27,9 @@
 //! ```
 
 use super::variables::{KeyDatabase, KeyDatabaseEntry, db_database, kek_database, pk_database};
-use super::{AuthError, EFI_CERT_X509_GUID, enter_user_mode};
+use crabefi_efi_types::secure_boot::EFI_CERT_X509_GUID;
+
+use super::{AuthError, enter_user_mode};
 
 // ============================================================================
 // Microsoft Owner GUID (used for signature entries)
@@ -366,11 +368,7 @@ const MICROSOFT_UEFI_CA_2011: &[u8] = &[
 
 /// Convert EFI_CERT_X509_GUID to raw bytes
 fn x509_cert_type() -> [u8; 16] {
-    let guid = &EFI_CERT_X509_GUID;
-    let bytes = guid.as_bytes();
-    let mut result = [0u8; 16];
-    result.copy_from_slice(bytes);
-    result
+    EFI_CERT_X509_GUID
 }
 
 /// Add a certificate entry to a key database

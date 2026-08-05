@@ -2,20 +2,22 @@
 
 use alloc::vec::Vec;
 
+use crabefi_efi_types::{
+    authentication::{
+        EfiTime, EfiVariableAuthentication2, SignatureIterator, SignatureListIterator,
+        WinCertificateUefiGuid,
+    },
+    secure_boot::{
+        EFI_CERT_TYPE_PKCS7_GUID, EFI_CERT_X509_GUID, SecureBootVariable, identify_key_database,
+    },
+};
 use zerocopy::IntoBytes;
 
-use super::structures::{
-    EfiTime, EfiVariableAuthentication2, SignatureIterator, SignatureListIterator,
-};
-use super::variables::{EFI_CERT_X509_GUID, SecureBootVariable, identify_key_database};
 use super::{
     AuthError, MAX_AUTHENTICATED_ENVELOPE_SIZE, WIN_CERT_REVISION, WIN_CERT_TYPE_EFI_GUID,
 };
 use crate::{efi, store::VariableStore};
 
-const EFI_CERT_TYPE_PKCS7_GUID_BYTES: [u8; 16] = [
-    0x9d, 0xd2, 0xaf, 0x4a, 0xdf, 0x68, 0xee, 0x49, 0x8a, 0xa9, 0x34, 0x7d, 0x37, 0x56, 0x65, 0xa7,
-];
 const MAX_DATABASE_CERTIFICATES: usize = 32;
 
 #[derive(Debug)]
@@ -37,11 +39,10 @@ pub fn verify_authenticated_variable<'a>(
     }
     let authentication =
         EfiVariableAuthentication2::from_bytes(data).ok_or(AuthError::InvalidHeader)?;
-    if (authentication.auth_info.hdr.dw_length as usize)
-        < super::structures::WinCertificateUefiGuid::HEADER_SIZE
+    if (authentication.auth_info.hdr.dw_length as usize) < WinCertificateUefiGuid::HEADER_SIZE
         || authentication.auth_info.hdr.w_revision != WIN_CERT_REVISION
         || authentication.auth_info.hdr.w_certificate_type != WIN_CERT_TYPE_EFI_GUID
-        || authentication.auth_info.cert_type != EFI_CERT_TYPE_PKCS7_GUID_BYTES
+        || authentication.auth_info.cert_type != EFI_CERT_TYPE_PKCS7_GUID
         || authentication
             .total_size()
             .is_none_or(|size| size > data.len())
@@ -58,7 +59,7 @@ pub fn verify_authenticated_variable<'a>(
     let secure_variable = identify_key_database(vendor_guid, variable_name);
 
     if let Some(variable) = secure_variable {
-        let previous = EfiTime::from_serialized(store.auth_timestamp(variable));
+        let previous = super::efi_time_from_timestamp(store.auth_timestamp(variable));
         if !authentication.time_stamp.is_after(&previous) {
             return Err(AuthError::InvalidTimestamp);
         }
@@ -104,7 +105,7 @@ fn verify_database(
     let Some(data) = store.key_database_data(database) else {
         return Ok(false);
     };
-    let x509 = *EFI_CERT_X509_GUID.as_bytes();
+    let x509 = EFI_CERT_X509_GUID;
     let mut count = 0usize;
     for (list, list_data) in SignatureListIterator::new(data) {
         if list.signature_type != x509 {
@@ -158,9 +159,9 @@ const _: () = assert!(core::mem::size_of::<efi::Time>() == core::mem::size_of::<
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
-        auth::variables::PK_NAME,
-        store::{VariableStore, VariableTransaction},
+    use crate::store::{VariableStore, VariableTransaction};
+    use crabefi_efi_types::secure_boot::{
+        DB_NAME, EFI_GLOBAL_VARIABLE_GUID, EFI_IMAGE_SECURITY_DATABASE_GUID, KEK_NAME, PK_NAME,
     };
 
     const ATTRIBUTES: u32 = efi::VARIABLE_NON_VOLATILE
@@ -187,7 +188,7 @@ mod tests {
         envelope.extend_from_slice(&24u32.to_le_bytes());
         envelope.extend_from_slice(&WIN_CERT_REVISION.to_le_bytes());
         envelope.extend_from_slice(&WIN_CERT_TYPE_EFI_GUID.to_le_bytes());
-        envelope.extend_from_slice(&EFI_CERT_TYPE_PKCS7_GUID_BYTES);
+        envelope.extend_from_slice(&EFI_CERT_TYPE_PKCS7_GUID);
         envelope.extend_from_slice(payload);
         envelope
     }
@@ -198,8 +199,8 @@ mod tests {
         crate::scratch::activate();
         let mut store = VariableStore::new();
         let mut transaction = VariableTransaction::new();
-        let global = *super::super::EFI_GLOBAL_VARIABLE_GUID.as_bytes();
-        let database = *super::super::variables::EFI_IMAGE_SECURITY_DATABASE_GUID.as_bytes();
+        let global = EFI_GLOBAL_VARIABLE_GUID;
+        let database = EFI_IMAGE_SECURITY_DATABASE_GUID;
         store
             .import(
                 &mut transaction,
@@ -214,7 +215,7 @@ mod tests {
         assert_eq!(
             verify_authenticated_variable(
                 &store,
-                super::super::variables::KEK_NAME,
+                KEK_NAME,
                 &global,
                 ATTRIBUTES,
                 include_bytes!("../../tests/fixtures/unauthorized-update.bin"),
@@ -225,7 +226,7 @@ mod tests {
 
         let kek = verify_authenticated_variable(
             &store,
-            super::super::variables::KEK_NAME,
+            KEK_NAME,
             &global,
             ATTRIBUTES,
             include_bytes!("../../tests/fixtures/kek-update.bin"),
@@ -235,16 +236,16 @@ mod tests {
             .import(
                 &mut transaction,
                 global,
-                super::super::variables::KEK_NAME,
+                KEK_NAME,
                 ATTRIBUTES,
                 kek.payload,
-                Some(kek.timestamp.to_serialized()),
+                Some(crate::auth::timestamp_from_efi_time(kek.timestamp)),
             )
             .unwrap();
         assert_eq!(
             verify_authenticated_variable(
                 &store,
-                super::super::variables::KEK_NAME,
+                KEK_NAME,
                 &global,
                 ATTRIBUTES,
                 include_bytes!("../../tests/fixtures/kek-update.bin"),
@@ -255,20 +256,14 @@ mod tests {
         let mut older = include_bytes!("../../tests/fixtures/kek-update.bin").to_vec();
         older[..2].copy_from_slice(&2024u16.to_le_bytes());
         assert_eq!(
-            verify_authenticated_variable(
-                &store,
-                super::super::variables::KEK_NAME,
-                &global,
-                ATTRIBUTES,
-                &older,
-            )
-            .unwrap_err(),
+            verify_authenticated_variable(&store, KEK_NAME, &global, ATTRIBUTES, &older,)
+                .unwrap_err(),
             AuthError::InvalidTimestamp
         );
 
         let db = verify_authenticated_variable(
             &store,
-            super::super::variables::DB_NAME,
+            DB_NAME,
             &database,
             ATTRIBUTES,
             include_bytes!("../../tests/fixtures/db-update.bin"),
@@ -278,17 +273,17 @@ mod tests {
             .import(
                 &mut transaction,
                 database,
-                super::super::variables::DB_NAME,
+                DB_NAME,
                 ATTRIBUTES,
                 db.payload,
-                Some(db.timestamp.to_serialized()),
+                Some(crate::auth::timestamp_from_efi_time(db.timestamp)),
             )
             .unwrap();
 
         let append_attributes = ATTRIBUTES | efi::VARIABLE_APPEND_WRITE;
         let append = verify_authenticated_variable(
             &store,
-            super::super::variables::DB_NAME,
+            DB_NAME,
             &database,
             append_attributes,
             include_bytes!("../../tests/fixtures/db-append.bin"),
@@ -297,18 +292,16 @@ mod tests {
         let mut expected_database = db.payload.to_vec();
         expected_database.extend_from_slice(append.payload);
         let mut prepared = store
-            .prepare(
-                database,
-                super::super::variables::DB_NAME,
-                append_attributes,
-                append.payload.len(),
-            )
+            .prepare(database, DB_NAME, append_attributes, append.payload.len())
             .unwrap();
         store
             .stage(&mut transaction, &mut prepared, append.payload, true)
             .unwrap();
-        store.commit(&transaction, prepared, super::super::variables::DB_NAME);
-        store.commit_auth_timestamp(SecureBootVariable::Db, append.timestamp.to_serialized());
+        store.commit(&transaction, prepared, DB_NAME);
+        store.commit_auth_timestamp(
+            SecureBootVariable::Db,
+            crate::auth::timestamp_from_efi_time(append.timestamp),
+        );
         assert_eq!(
             store.key_database_data(SecureBootVariable::Db).unwrap(),
             expected_database
@@ -316,21 +309,22 @@ mod tests {
 
         let deletion = verify_authenticated_variable(
             &store,
-            super::super::variables::DB_NAME,
+            DB_NAME,
             &database,
             ATTRIBUTES,
             include_bytes!("../../tests/fixtures/db-delete.bin"),
         )
         .unwrap();
         assert!(deletion.payload.is_empty());
-        let mut prepared = store
-            .prepare(database, super::super::variables::DB_NAME, ATTRIBUTES, 0)
-            .unwrap();
+        let mut prepared = store.prepare(database, DB_NAME, ATTRIBUTES, 0).unwrap();
         store
             .stage(&mut transaction, &mut prepared, &[], false)
             .unwrap();
-        store.commit(&transaction, prepared, super::super::variables::DB_NAME);
-        store.commit_auth_timestamp(SecureBootVariable::Db, deletion.timestamp.to_serialized());
+        store.commit(&transaction, prepared, DB_NAME);
+        store.commit_auth_timestamp(
+            SecureBootVariable::Db,
+            crate::auth::timestamp_from_efi_time(deletion.timestamp),
+        );
         assert!(store.key_database_data(SecureBootVariable::Db).is_none());
         assert!(crate::scratch::high_water_for_test() < crate::scratch::SCRATCH_SIZE);
         crate::scratch::reset();
@@ -342,7 +336,7 @@ mod tests {
         crate::scratch::activate();
         let mut store = VariableStore::new();
         let mut transaction = VariableTransaction::new();
-        let global = *super::super::EFI_GLOBAL_VARIABLE_GUID.as_bytes();
+        let global = EFI_GLOBAL_VARIABLE_GUID;
         store
             .import(
                 &mut transaction,
@@ -356,14 +350,8 @@ mod tests {
         let mut maximum = include_bytes!("../../tests/fixtures/kek-update.bin").to_vec();
         maximum.resize(super::super::MAX_AUTHENTICATED_ENVELOPE_SIZE, 0);
         assert_eq!(
-            verify_authenticated_variable(
-                &store,
-                super::super::variables::KEK_NAME,
-                &global,
-                ATTRIBUTES,
-                &maximum,
-            )
-            .unwrap_err(),
+            verify_authenticated_variable(&store, KEK_NAME, &global, ATTRIBUTES, &maximum,)
+                .unwrap_err(),
             AuthError::SignatureVerificationFailed
         );
         assert!(crate::scratch::high_water_for_test() < 384 * 1024);
@@ -374,13 +362,13 @@ mod tests {
     fn setup_enrollment_replay_rejection_and_pk_mode_transition() {
         let mut store = VariableStore::new();
         let mut transaction = VariableTransaction::new();
-        let guid = *super::super::EFI_GLOBAL_VARIABLE_GUID.as_bytes();
+        let guid = EFI_GLOBAL_VARIABLE_GUID;
         let pk = include_bytes!("../../tests/fixtures/pk.esl");
         let envelope = setup_envelope(2025, pk);
         let verified =
             verify_authenticated_variable(&store, PK_NAME, &guid, ATTRIBUTES, &envelope).unwrap();
         assert_eq!(verified.payload, pk);
-        let timestamp = verified.timestamp.to_serialized();
+        let timestamp = crate::auth::timestamp_from_efi_time(verified.timestamp);
         let mut prepared = store
             .prepare(guid, PK_NAME, ATTRIBUTES, verified.payload.len())
             .unwrap();

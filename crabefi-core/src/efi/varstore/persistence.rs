@@ -29,6 +29,8 @@
 
 use alloc::vec::Vec;
 
+use crabefi_runtime_abi::VariableTimestamp;
+
 use crate::drivers::spi::{self, SpiController};
 use crate::platform::{
     FirmwareStorage, FirmwareStorageLocation, FirmwareStorageRegion, VariableStoreLocator,
@@ -409,22 +411,7 @@ fn load_variables_from_storage() -> Result<(), VarStoreError> {
         {
             return Err(VarStoreError::DataTooLarge);
         }
-        let timestamp = variable.timestamp.map_or_else(
-            crabefi_runtime_abi::VariableTimestamp::default,
-            |timestamp| crabefi_runtime_abi::VariableTimestamp {
-                year: timestamp.year,
-                month: timestamp.month,
-                day: timestamp.day,
-                hour: timestamp.hour,
-                minute: timestamp.minute,
-                second: timestamp.second,
-                pad1: 0,
-                nanosecond: timestamp.nanosecond,
-                timezone: timestamp.timezone,
-                daylight: timestamp.daylight,
-                pad2: 0,
-            },
-        );
+        let timestamp = variable.timestamp.unwrap_or_default();
         client
             .import_variable(&crabefi_runtime_abi::VariableImport {
                 name_address: variable.name.as_ptr() as u64,
@@ -447,10 +434,7 @@ fn load_variables_from_storage() -> Result<(), VarStoreError> {
 }
 
 /// Get the latest durable authenticated timestamp, including deletion floors.
-pub fn get_variable_timestamp(
-    guid: &r_efi::efi::Guid,
-    name: &[u16],
-) -> Option<super::SerializedTime> {
+pub fn get_variable_timestamp(guid: &r_efi::efi::Guid, name: &[u16]) -> Option<VariableTimestamp> {
     let variable_store = state::varstore();
     if !variable_store.initialized || !variable_store.auth_format {
         return None;
@@ -476,7 +460,7 @@ pub(crate) fn write_variable_to_storage_internal(
     name: &[u16],
     attributes: u32,
     data: &[u8],
-    timestamp: Option<super::SerializedTime>,
+    timestamp: Option<VariableTimestamp>,
 ) -> Result<(), VarStoreError> {
     let vs = state::varstore();
     if !vs.initialized || !vs.auth_format {
@@ -718,7 +702,7 @@ pub(crate) fn write_variable_deletion_internal(
     guid: &r_efi::efi::Guid,
     name: &[u16],
     attributes: u32,
-    timestamp: Option<super::SerializedTime>,
+    timestamp: Option<VariableTimestamp>,
 ) -> Result<(), VarStoreError> {
     if timestamp.is_some() {
         // An active zero-length authenticated record is invisible to coreboot's

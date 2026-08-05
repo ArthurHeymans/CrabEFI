@@ -20,17 +20,23 @@
 //!   4. Optionally enroll default keys if none exist
 //! ```
 
-use super::enrollment::{self, EnrollmentStatus};
-use super::variables::{
-    DB_NAME, DBX_NAME, KEK_NAME, PK_NAME, SecureBootVariable, db_database, dbx_database,
-    kek_database, pk_database,
-};
-use super::{
-    AuthError, EFI_GLOBAL_VARIABLE_GUID, EFI_IMAGE_SECURITY_DATABASE_GUID, enter_setup_mode,
-    enter_user_mode, is_setup_mode,
-};
-use crate::efi::varstore::get_variable_timestamp;
 use alloc::vec::Vec;
+
+use crabefi_efi_types::{
+    authentication::EfiTime,
+    secure_boot::{
+        DB_NAME, DBX_NAME, EFI_CERT_TYPE_PKCS7_GUID, EFI_GLOBAL_VARIABLE_GUID,
+        EFI_IMAGE_SECURITY_DATABASE_GUID, KEK_NAME, PK_NAME, SECURE_BOOT_ENABLE_NAME,
+        SecureBootVariable,
+    },
+};
+use crabefi_runtime_abi::VariableTimestamp;
+use r_efi::efi::Guid;
+
+use super::enrollment::{self, EnrollmentStatus};
+use super::variables::{db_database, dbx_database, kek_database, pk_database};
+use super::{AuthError, enter_setup_mode, enter_user_mode, is_setup_mode};
+use crate::efi::varstore::get_variable_timestamp;
 
 /// Variable attributes for Secure Boot key variables
 const SECURE_BOOT_KEY_ATTRS: u32 = super::attributes::NON_VOLATILE
@@ -125,11 +131,10 @@ pub fn init_secure_boot(config: &SecureBootConfig) -> Result<EnrollmentStatus, A
 /// Called during boot initialization and by
 /// `handle_secure_boot_variable_update()` when PK is enrolled at runtime.
 pub fn load_secure_boot_enable_preference() -> bool {
-    use super::EFI_GLOBAL_VARIABLE_GUID;
-    use super::variables::SECURE_BOOT_ENABLE_NAME;
-
-    if let Some(data) = get_variable_data(&EFI_GLOBAL_VARIABLE_GUID, SECURE_BOOT_ENABLE_NAME)
-        && !data.is_empty()
+    if let Some(data) = get_variable_data(
+        &Guid::from_bytes(&EFI_GLOBAL_VARIABLE_GUID),
+        SECURE_BOOT_ENABLE_NAME,
+    ) && !data.is_empty()
         && data[0] == 1
     {
         log::debug!("Loaded SecureBootEnable preference: enabled");
@@ -151,15 +156,13 @@ pub fn init_secure_boot_default() -> Result<EnrollmentStatus, AuthError> {
 /// databases. It also restores timestamps for proper
 /// monotonic timestamp validation on future authenticated variable updates.
 fn load_keys_from_variables() -> EnrollmentStatus {
-    use super::structures::EfiTime;
-
     pk_database().clear();
     kek_database().clear();
     db_database().clear();
     dbx_database().clear();
 
     // Load PK
-    if let Some(data) = get_variable_data(&EFI_GLOBAL_VARIABLE_GUID, PK_NAME)
+    if let Some(data) = get_variable_data(&Guid::from_bytes(&EFI_GLOBAL_VARIABLE_GUID), PK_NAME)
         && !data.is_empty()
     {
         let mut pk = pk_database();
@@ -168,8 +171,10 @@ fn load_keys_from_variables() -> EnrollmentStatus {
         } else {
             log::debug!("Loaded {} PK entries", pk.len());
             // Restore timestamp from stored variable for monotonic validation
-            if let Some(ts) = get_variable_timestamp(&EFI_GLOBAL_VARIABLE_GUID, PK_NAME) {
-                pk.set_timestamp(EfiTime::from_serialized(&ts));
+            if let Some(ts) =
+                get_variable_timestamp(&Guid::from_bytes(&EFI_GLOBAL_VARIABLE_GUID), PK_NAME)
+            {
+                pk.set_timestamp(efi_time_from_timestamp(ts));
                 log::debug!(
                     "Restored PK timestamp: {}-{:02}-{:02}",
                     ts.year,
@@ -181,7 +186,7 @@ fn load_keys_from_variables() -> EnrollmentStatus {
     }
 
     // Load KEK
-    if let Some(data) = get_variable_data(&EFI_GLOBAL_VARIABLE_GUID, KEK_NAME)
+    if let Some(data) = get_variable_data(&Guid::from_bytes(&EFI_GLOBAL_VARIABLE_GUID), KEK_NAME)
         && !data.is_empty()
     {
         let mut kek = kek_database();
@@ -190,8 +195,10 @@ fn load_keys_from_variables() -> EnrollmentStatus {
         } else {
             log::debug!("Loaded {} KEK entries", kek.len());
             // Restore timestamp
-            if let Some(ts) = get_variable_timestamp(&EFI_GLOBAL_VARIABLE_GUID, KEK_NAME) {
-                kek.set_timestamp(EfiTime::from_serialized(&ts));
+            if let Some(ts) =
+                get_variable_timestamp(&Guid::from_bytes(&EFI_GLOBAL_VARIABLE_GUID), KEK_NAME)
+            {
+                kek.set_timestamp(efi_time_from_timestamp(ts));
                 log::debug!(
                     "Restored KEK timestamp: {}-{:02}-{:02}",
                     ts.year,
@@ -203,8 +210,10 @@ fn load_keys_from_variables() -> EnrollmentStatus {
     }
 
     // Load db
-    if let Some(data) = get_variable_data(&EFI_IMAGE_SECURITY_DATABASE_GUID, DB_NAME)
-        && !data.is_empty()
+    if let Some(data) = get_variable_data(
+        &Guid::from_bytes(&EFI_IMAGE_SECURITY_DATABASE_GUID),
+        DB_NAME,
+    ) && !data.is_empty()
     {
         let mut db = db_database();
         if let Err(e) = db.load_from_signature_lists(&data) {
@@ -212,8 +221,11 @@ fn load_keys_from_variables() -> EnrollmentStatus {
         } else {
             log::debug!("Loaded {} db entries", db.len());
             // Restore timestamp
-            if let Some(ts) = get_variable_timestamp(&EFI_IMAGE_SECURITY_DATABASE_GUID, DB_NAME) {
-                db.set_timestamp(EfiTime::from_serialized(&ts));
+            if let Some(ts) = get_variable_timestamp(
+                &Guid::from_bytes(&EFI_IMAGE_SECURITY_DATABASE_GUID),
+                DB_NAME,
+            ) {
+                db.set_timestamp(efi_time_from_timestamp(ts));
                 log::debug!(
                     "Restored db timestamp: {}-{:02}-{:02}",
                     ts.year,
@@ -225,8 +237,10 @@ fn load_keys_from_variables() -> EnrollmentStatus {
     }
 
     // Load dbx
-    if let Some(data) = get_variable_data(&EFI_IMAGE_SECURITY_DATABASE_GUID, DBX_NAME)
-        && !data.is_empty()
+    if let Some(data) = get_variable_data(
+        &Guid::from_bytes(&EFI_IMAGE_SECURITY_DATABASE_GUID),
+        DBX_NAME,
+    ) && !data.is_empty()
     {
         let mut dbx = dbx_database();
         if let Err(e) = dbx.load_from_signature_lists(&data) {
@@ -234,8 +248,11 @@ fn load_keys_from_variables() -> EnrollmentStatus {
         } else {
             log::debug!("Loaded {} dbx entries", dbx.len());
             // Restore timestamp
-            if let Some(ts) = get_variable_timestamp(&EFI_IMAGE_SECURITY_DATABASE_GUID, DBX_NAME) {
-                dbx.set_timestamp(EfiTime::from_serialized(&ts));
+            if let Some(ts) = get_variable_timestamp(
+                &Guid::from_bytes(&EFI_IMAGE_SECURITY_DATABASE_GUID),
+                DBX_NAME,
+            ) {
+                dbx.set_timestamp(efi_time_from_timestamp(ts));
                 log::debug!(
                     "Restored dbx timestamp: {}-{:02}-{:02}",
                     ts.year,
@@ -255,8 +272,24 @@ pub(crate) fn refresh_key_databases() {
 }
 
 /// Get variable data from the authoritative runtime image store.
-fn get_variable_data(guid: &r_efi::efi::Guid, name: &[u16]) -> Option<Vec<u8>> {
+fn get_variable_data(guid: &Guid, name: &[u16]) -> Option<Vec<u8>> {
     crate::efi::runtime_image::client::variables::get(guid, name).map(|(_, data)| data)
+}
+
+fn efi_time_from_timestamp(timestamp: VariableTimestamp) -> EfiTime {
+    EfiTime {
+        year: timestamp.year,
+        month: timestamp.month,
+        day: timestamp.day,
+        hour: timestamp.hour,
+        minute: timestamp.minute,
+        second: timestamp.second,
+        pad1: timestamp.pad1,
+        nanosecond: timestamp.nanosecond,
+        timezone: timestamp.timezone,
+        daylight: timestamp.daylight,
+        pad2: timestamp.pad2,
+    }
 }
 
 // name_matches consolidated into crate::efi::utils::ucs2_eq
@@ -287,7 +320,7 @@ pub fn persist_key_databases() -> Result<(), AuthError> {
             let data = kek.to_signature_lists();
             let timestamp = *kek.timestamp();
             if !data.is_empty() {
-                persist_key_variable(SecureBootVariable::KEK, &data, &timestamp)?;
+                persist_key_variable(SecureBootVariable::Kek, &data, &timestamp)?;
                 log::debug!("Persisted KEK ({} bytes)", data.len());
             }
         }
@@ -343,13 +376,16 @@ pub fn persist_key_databases() -> Result<(), AuthError> {
 fn persist_key_variable(
     var_type: SecureBootVariable,
     data: &[u8],
-    timestamp: &super::structures::EfiTime,
+    timestamp: &EfiTime,
 ) -> Result<(), AuthError> {
     let (guid, name) = match var_type {
-        SecureBootVariable::PK => (EFI_GLOBAL_VARIABLE_GUID, PK_NAME),
-        SecureBootVariable::KEK => (EFI_GLOBAL_VARIABLE_GUID, KEK_NAME),
-        SecureBootVariable::Db => (EFI_IMAGE_SECURITY_DATABASE_GUID, DB_NAME),
-        SecureBootVariable::Dbx => (EFI_IMAGE_SECURITY_DATABASE_GUID, DBX_NAME),
+        SecureBootVariable::PK => (Guid::from_bytes(&EFI_GLOBAL_VARIABLE_GUID), PK_NAME),
+        SecureBootVariable::Kek => (Guid::from_bytes(&EFI_GLOBAL_VARIABLE_GUID), KEK_NAME),
+        SecureBootVariable::Db => (Guid::from_bytes(&EFI_IMAGE_SECURITY_DATABASE_GUID), DB_NAME),
+        SecureBootVariable::Dbx => (
+            Guid::from_bytes(&EFI_IMAGE_SECURITY_DATABASE_GUID),
+            DBX_NAME,
+        ),
     };
 
     use zerocopy::IntoBytes;
@@ -367,7 +403,7 @@ fn persist_key_variable(
     envelope.extend_from_slice(&24u32.to_le_bytes());
     envelope.extend_from_slice(&super::WIN_CERT_REVISION.to_le_bytes());
     envelope.extend_from_slice(&super::WIN_CERT_TYPE_EFI_GUID.to_le_bytes());
-    envelope.extend_from_slice(super::EFI_CERT_TYPE_PKCS7_GUID.as_bytes());
+    envelope.extend_from_slice(&EFI_CERT_TYPE_PKCS7_GUID);
     envelope.extend_from_slice(data);
 
     let status = crate::efi::runtime_image::client::variables::set(
@@ -428,10 +464,10 @@ pub fn get_enrollment_summary() -> (usize, usize, usize, usize) {
 pub fn clear_all_keys() -> Result<(), AuthError> {
     log::warn!("Clearing all Secure Boot keys!");
 
-    let zero_timestamp = super::structures::EfiTime::zero();
+    let zero_timestamp = EfiTime::zero();
     for variable in [
         SecureBootVariable::PK,
-        SecureBootVariable::KEK,
+        SecureBootVariable::Kek,
         SecureBootVariable::Db,
         SecureBootVariable::Dbx,
     ] {

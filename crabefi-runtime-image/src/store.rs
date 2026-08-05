@@ -1,15 +1,14 @@
 //! Bounded packed EFI variable store and transaction buffer.
 
-use crabefi_runtime_abi::{MAX_VARIABLE_DATA_SIZE, MAX_VARIABLE_NAME_LEN, MAX_VARIABLES};
-
-use crate::{
-    auth::{
-        self, SECURE_BOOT_ENABLE_NAME, SecureBootVariable, identify_key_database,
-        is_status_variable,
-    },
-    deferred::SerializedTime,
-    efi,
+use crabefi_efi_types::secure_boot::{
+    EFI_GLOBAL_VARIABLE_GUID, SECURE_BOOT_ENABLE_NAME, SecureBootVariable, identify_key_database,
+    is_status_variable,
 };
+use crabefi_runtime_abi::{
+    MAX_VARIABLE_DATA_SIZE, MAX_VARIABLE_NAME_LEN, MAX_VARIABLES, VariableTimestamp,
+};
+
+use crate::efi;
 
 /// Total image-local variable payload capacity.
 ///
@@ -17,6 +16,20 @@ use crate::{
 /// for every slot. This keeps the runtime allocation bounded while retaining
 /// the UEFI per-variable maximum.
 pub const VARIABLE_ARENA_SIZE: usize = 128 * 1024;
+
+const ZERO_TIMESTAMP: VariableTimestamp = VariableTimestamp {
+    year: 0,
+    month: 0,
+    day: 0,
+    hour: 0,
+    minute: 0,
+    second: 0,
+    pad1: 0,
+    nanosecond: 0,
+    timezone: 0,
+    daylight: 0,
+    pad2: 0,
+};
 
 #[repr(C)]
 pub struct VariableSlot {
@@ -56,7 +69,7 @@ impl VariableSlot {
 pub struct VariableStore {
     slots: [VariableSlot; MAX_VARIABLES],
     arena: [u8; VARIABLE_ARENA_SIZE],
-    auth_timestamps: [SerializedTime; 4],
+    auth_timestamps: [VariableTimestamp; 4],
     setup_mode: bool,
     secure_boot: bool,
 }
@@ -105,7 +118,7 @@ impl VariableStore {
         Self {
             slots: [const { VariableSlot::empty() }; MAX_VARIABLES],
             arena: [0; VARIABLE_ARENA_SIZE],
-            auth_timestamps: [SerializedTime::zero(); 4],
+            auth_timestamps: [ZERO_TIMESTAMP; 4],
             setup_mode: true,
             secure_boot: false,
         }
@@ -118,7 +131,7 @@ impl VariableStore {
         name: &[u16],
         attributes: u32,
         data: &[u8],
-        timestamp: Option<SerializedTime>,
+        timestamp: Option<VariableTimestamp>,
     ) -> Result<(), efi::Status> {
         if is_status_variable(&guid, name) {
             return Ok(());
@@ -149,21 +162,20 @@ impl VariableStore {
         self.secure_boot
     }
 
-    pub fn auth_timestamp(&self, variable: SecureBootVariable) -> SerializedTime {
+    pub fn auth_timestamp(&self, variable: SecureBootVariable) -> VariableTimestamp {
         self.auth_timestamps[variable.index()]
     }
 
     pub fn commit_auth_timestamp(
         &mut self,
         variable: SecureBootVariable,
-        timestamp: SerializedTime,
+        timestamp: VariableTimestamp,
     ) {
         self.auth_timestamps[variable.index()] = timestamp;
     }
 
     pub fn key_database_data(&self, variable: SecureBootVariable) -> Option<&[u8]> {
-        let guid = *variable.guid().as_bytes();
-        self.find(&guid, variable.name(), false)
+        self.find(variable.guid(), variable.name(), false)
             .and_then(|slot| self.data(slot))
     }
 
@@ -171,9 +183,8 @@ impl VariableStore {
         self.setup_mode = self
             .key_database_data(SecureBootVariable::PK)
             .is_none_or(|data| data.is_empty());
-        let global = *auth::EFI_GLOBAL_VARIABLE_GUID.as_bytes();
         let preference = self
-            .find(&global, SECURE_BOOT_ENABLE_NAME, false)
+            .find(&EFI_GLOBAL_VARIABLE_GUID, SECURE_BOOT_ENABLE_NAME, false)
             .and_then(|slot| self.data(slot))
             .is_some_and(|data| data.first() == Some(&1));
         self.secure_boot = !self.setup_mode && preference;

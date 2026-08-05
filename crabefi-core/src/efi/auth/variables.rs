@@ -3,43 +3,15 @@
 //! This module handles the Secure Boot key databases and provides
 //! functions for managing authenticated variables.
 
-use super::crypto::constant_time_eq;
-use super::guid_to_bytes;
-use super::structures::{EfiTime, SignatureIterator, SignatureListIterator};
-use super::{AuthError, EFI_CERT_SHA256_GUID, EFI_CERT_X509_GUID};
 use alloc::vec::Vec;
 
-// ============================================================================
-// Secure Boot Variable Names
-// ============================================================================
+use crabefi_efi_types::{
+    authentication::{EfiSignatureList, EfiTime, SignatureIterator, SignatureListIterator},
+    constant_time_eq,
+    secure_boot::{EFI_CERT_SHA256_GUID, EFI_CERT_X509_GUID},
+};
 
-/// Platform Key variable name (UCS-2)
-pub const PK_NAME: &[u16] = &[0x50, 0x4B, 0x00]; // "PK\0"
-
-/// Key Exchange Key variable name (UCS-2)
-pub const KEK_NAME: &[u16] = &[0x4B, 0x45, 0x4B, 0x00]; // "KEK\0"
-
-/// Signature database variable name (UCS-2)
-pub const DB_NAME: &[u16] = &[0x64, 0x62, 0x00]; // "db\0"
-
-/// Forbidden signature database variable name (UCS-2)
-pub const DBX_NAME: &[u16] = &[0x64, 0x62, 0x78, 0x00]; // "dbx\0"
-
-/// SetupMode variable name (UCS-2)
-pub const SETUP_MODE_NAME: &[u16] = &[0x53, 0x65, 0x74, 0x75, 0x70, 0x4D, 0x6F, 0x64, 0x65, 0x00]; // "SetupMode\0"
-
-/// SecureBoot variable name (UCS-2)
-pub const SECURE_BOOT_NAME: &[u16] = &[
-    0x53, 0x65, 0x63, 0x75, 0x72, 0x65, 0x42, 0x6F, 0x6F, 0x74, 0x00,
-]; // "SecureBoot\0"
-
-/// SecureBootEnable variable name (UCS-2)
-/// This is a non-volatile variable that stores the user's preference for enabling Secure Boot.
-/// Unlike SecureBoot (which is a read-only status variable), this persists across resets.
-pub const SECURE_BOOT_ENABLE_NAME: &[u16] = &[
-    0x53, 0x65, 0x63, 0x75, 0x72, 0x65, 0x42, 0x6F, 0x6F, 0x74, 0x45, 0x6E, 0x61, 0x62, 0x6C, 0x65,
-    0x00,
-]; // "SecureBootEnable\0"
+use super::AuthError;
 
 // ============================================================================
 // Secure Boot Key Database
@@ -130,13 +102,11 @@ impl KeyDatabase {
 
     /// Serialize the database to signature list format
     pub fn to_signature_lists(&self) -> Vec<u8> {
-        use super::structures::EfiSignatureList;
-
         let mut result = Vec::new();
 
         // Group entries by certificate type
-        let x509_guid = guid_to_bytes(&EFI_CERT_X509_GUID);
-        let sha256_guid = guid_to_bytes(&EFI_CERT_SHA256_GUID);
+        let x509_guid = EFI_CERT_X509_GUID;
+        let sha256_guid = EFI_CERT_SHA256_GUID;
 
         let mut x509_entries: Vec<&KeyDatabaseEntry> = Vec::new();
         let mut sha256_entries: Vec<&KeyDatabaseEntry> = Vec::new();
@@ -210,7 +180,7 @@ impl KeyDatabase {
 
     /// Find an X.509 certificate in the database
     pub fn find_x509_certificate(&self, cert_data: &[u8]) -> Option<&KeyDatabaseEntry> {
-        let x509_guid = guid_to_bytes(&EFI_CERT_X509_GUID);
+        let x509_guid = EFI_CERT_X509_GUID;
         self.entries
             .iter()
             .find(|e| e.cert_type == x509_guid && e.data == cert_data)
@@ -221,7 +191,7 @@ impl KeyDatabase {
     /// Uses constant-time comparison to prevent timing side-channel attacks
     /// that could leak information about which hashes are in the database.
     pub fn contains_sha256_hash(&self, hash: &[u8; 32]) -> bool {
-        let sha256_guid = guid_to_bytes(&EFI_CERT_SHA256_GUID);
+        let sha256_guid = EFI_CERT_SHA256_GUID;
         self.entries.iter().any(|e| {
             e.cert_type == sha256_guid
                 && e.data.len() >= 32
@@ -231,7 +201,7 @@ impl KeyDatabase {
 
     /// Get all X.509 certificates in the database
     pub fn x509_certificates(&self) -> impl Iterator<Item = &[u8]> {
-        let x509_guid = guid_to_bytes(&EFI_CERT_X509_GUID);
+        let x509_guid = EFI_CERT_X509_GUID;
         self.entries
             .iter()
             .filter(move |e| e.cert_type == x509_guid)
@@ -282,18 +252,3 @@ pub fn db_database() -> spin::MutexGuard<'static, KeyDatabase> {
 pub fn dbx_database() -> spin::MutexGuard<'static, KeyDatabase> {
     DBX_DATABASE.lock()
 }
-
-/// Secure Boot variable type
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SecureBootVariable {
-    /// Platform Key
-    PK,
-    /// Key Exchange Key
-    KEK,
-    /// Allowed signature database
-    Db,
-    /// Forbidden signature database
-    Dbx,
-}
-
-// name_matches consolidated into crate::efi::utils::ucs2_eq

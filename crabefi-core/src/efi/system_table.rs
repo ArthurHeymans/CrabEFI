@@ -7,6 +7,7 @@
 
 use core::ffi::c_void;
 
+use crabefi_efi_types::crc32;
 use crabefi_runtime_abi::{ConfigurationRegistration, ConsoleRegistration, configuration_policy};
 use r_efi::efi::{self, Guid, Handle, TableHeader};
 use r_efi::protocols::simple_text_input::Protocol as SimpleTextInputProtocol;
@@ -732,7 +733,7 @@ unsafe fn update_table_header_crc32(header: *mut TableHeader) {
         hdr.crc32 = 0;
         let size = hdr.header_size as usize;
         let bytes = core::slice::from_raw_parts(header as *const u8, size);
-        hdr.crc32 = super::boot_services::compute_crc32(bytes);
+        hdr.crc32 = crc32::calculate(bytes);
     }
 }
 
