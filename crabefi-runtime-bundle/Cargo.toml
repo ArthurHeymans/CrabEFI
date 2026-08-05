@@ -1,0 +1,14 @@
+[package]
+name = "crabefi-runtime-bundle"
+version = "0.1.0"
+edition.workspace = true
+description = "Architecture-selected normalized Runtime Services images for CrabEFI"
+license.workspace = true
+repository.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[dev-dependencies]
+crabefi-runtime-abi = { path = "../crabefi-runtime-abi" }
+sha2 = { version = "0.10", default-features = false, features = ["force-soft"] }

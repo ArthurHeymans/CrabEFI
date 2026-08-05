@@ -7,6 +7,7 @@ members = [
   "crabefi-coreboot",
   "crabefi-drivers",
   "crabefi-efi-types",
+  "crabefi-runtime-bundle",
 ]
 exclude = [
   "xtask",
@@ -30,6 +31,7 @@ repository = "https://github.com/user/CrabEFI"
 
 [workspace.dependencies]
 crabefi-efi-types = { path = "crabefi-efi-types" }
+crabefi-runtime-bundle = { path = "crabefi-runtime-bundle" }
 r-efi = "5.3"
 log = "0.4"
 heapless = "0.9"

@@ -46,6 +46,42 @@ pub struct RuntimeArtifact {
     pub digest: [u8; 32],
 }
 
+/// Build and install the normalized image used by Cargo-only library consumers.
+pub fn bundle(arch: Arch) -> Result<()> {
+    let artifact = build(arch)?;
+    let destination = project_root()
+        .join("crabefi-runtime-bundle/images")
+        .join(arch.dir_name());
+    fs::create_dir_all(&destination)?;
+    atomic_copy(&artifact.image, &destination.join("runtime.img"))?;
+    atomic_write(&destination.join("sha256.bin"), &artifact.digest)?;
+    println!(
+        "Updated bundled Runtime Services image: {}",
+        destination.display()
+    );
+    Ok(())
+}
+
+fn atomic_copy(source: &Path, destination: &Path) -> Result<()> {
+    let bytes = fs::read(source)
+        .with_context(|| format!("read generated runtime image {}", source.display()))?;
+    atomic_write(destination, &bytes)
+}
+
+fn atomic_write(destination: &Path, bytes: &[u8]) -> Result<()> {
+    let temporary = destination.with_extension("tmp");
+    fs::write(&temporary, bytes)
+        .with_context(|| format!("write temporary bundle file {}", temporary.display()))?;
+    fs::rename(&temporary, destination).with_context(|| {
+        format!(
+            "replace bundled runtime file {} with {}",
+            destination.display(),
+            temporary.display()
+        )
+    })?;
+    Ok(())
+}
+
 pub fn build(arch: Arch) -> Result<RuntimeArtifact> {
     let root = project_root();
     let output = root.join("target/runtime").join(arch.dir_name());
@@ -416,12 +452,12 @@ fn dynamic_relocation_count(file: &object::File<'_>) -> Result<usize> {
 
 fn audit_dynamic_entries(dynamic: &[u8], rela_entry_size: u64) -> Result<usize> {
     const ELF64_DYN_SIZE: usize = 16;
-    if dynamic.len() % ELF64_DYN_SIZE != 0 {
+    if !dynamic.len().is_multiple_of(ELF64_DYN_SIZE) {
         bail!("runtime .dynamic has a partial ELF64 dynamic entry");
     }
     let mut rela_size = None;
     let mut rela_count = None;
-    for entry in dynamic.chunks_exact(ELF64_DYN_SIZE) {
+    for entry in dynamic.as_chunks::<ELF64_DYN_SIZE>().0 {
         let tag = i64::from_le_bytes(entry[..8].try_into()?);
         let value = u64::from_le_bytes(entry[8..].try_into()?);
         match tag {
@@ -443,10 +479,8 @@ fn audit_dynamic_entries(dynamic: &[u8], rela_entry_size: u64) -> Result<usize> 
             object::elf::DT_RELAENT if value != rela_entry_size => {
                 bail!("runtime DT_RELAENT is {value}, expected {rela_entry_size}")
             }
-            object::elf::DT_RELACOUNT => {
-                if rela_count.replace(value).is_some() {
-                    bail!("runtime .dynamic contains duplicate DT_RELACOUNT");
-                }
+            object::elf::DT_RELACOUNT if rela_count.replace(value).is_some() => {
+                bail!("runtime .dynamic contains duplicate DT_RELACOUNT");
             }
             _ => {}
         }

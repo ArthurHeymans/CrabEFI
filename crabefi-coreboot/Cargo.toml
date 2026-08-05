@@ -7,6 +7,9 @@ repository.workspace = true
 description = "CrabEFI as a coreboot payload binary"
 
 [features]
+default = ["bundled-runtime-image"]
+bundled-runtime-image = ["crabefi/bundled-runtime-image"]
+external-runtime-image = []
 ui = ["crabefi/ui"]
 
 [dependencies]

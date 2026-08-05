@@ -95,6 +95,9 @@ enum Commands {
         ui: bool,
     },
 
+    /// Regenerate the checked-in Cargo runtime bundle for one architecture
+    BundleRuntime,
+
     /// Run CrabEFI in QEMU
     Run {
         /// Path to coreboot ROM (default: ~/src/coreboot/build/coreboot.rom)
@@ -244,6 +247,7 @@ fn main() -> Result<()> {
 
     match cli.command {
         Commands::Build { release, ui } => cmd_build(release, ui, arch, machine),
+        Commands::BundleRuntime => runtime::bundle(arch),
         Commands::Run {
             coreboot_rom,
             ahci,
@@ -330,12 +334,16 @@ fn cmd_build(release: bool, ui: bool, arch: Arch, machine: Machine) -> Result<()
     // Build the coreboot payload binary (the binary target lives in the
     // crabefi-coreboot workspace member, not in the root library crate).
     cmd.arg("-p").arg("crabefi-coreboot");
+    cmd.arg("--no-default-features");
     if release {
         cmd.arg("--release");
     }
-    if ui {
-        cmd.arg("--features").arg("ui");
-    }
+    let features = if ui {
+        "external-runtime-image,ui"
+    } else {
+        "external-runtime-image"
+    };
+    cmd.arg("--features").arg(features);
 
     let target_triple = match arch {
         Arch::X86_64 => "x86_64-unknown-none",

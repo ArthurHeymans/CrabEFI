@@ -1334,8 +1334,8 @@ pub enum BootResult {
 ///
 /// # Minimal Configuration
 ///
-/// At minimum, provide `memory_map`, `timer`, and `reset`. Everything else
-/// is optional (with reduced functionality).
+/// At minimum, provide `memory_map`, `timer`, `reset`, `runtime_image`, and
+/// `runtime`. Everything else is optional (with reduced functionality).
 pub struct PlatformConfig<'a> {
     // ---- Required ----
     /// Physical memory map describing all RAM, MMIO, and reserved regions.
