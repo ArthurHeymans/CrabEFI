@@ -219,7 +219,7 @@ fn init_tcg_protocols(config: &mut crate::platform::TpmEventLogConfig) {
         } else {
             None
         };
-        if let Err(e) = init_tcg1_protocol(existing) {
+        if let Err(e) = init_tcg1_protocol(existing, config.tpm1_tis_base) {
             log::error!("TCG protocol init failed: {}", e);
         }
     }
@@ -342,7 +342,10 @@ pub(crate) fn measure_initial_boot() {
 }
 
 /// Initialize and install EFI_TCG_PROTOCOL (TPM 1.2).
-fn init_tcg1_protocol(existing_log: Option<&[u8]>) -> Result<(), &'static str> {
+fn init_tcg1_protocol(
+    existing_log: Option<&[u8]>,
+    tpm_base: Option<u64>,
+) -> Result<(), &'static str> {
     use tcg::event_log::DEFAULT_EVENT_LOG_SIZE;
 
     let log_pages = (DEFAULT_EVENT_LOG_SIZE as u64).div_ceil(allocator::PAGE_SIZE);
@@ -350,11 +353,21 @@ fn init_tcg1_protocol(existing_log: Option<&[u8]>) -> Result<(), &'static str> {
         .map(|buf| &mut buf[..DEFAULT_EVENT_LOG_SIZE])
         .ok_or("failed to allocate TCG event log buffer")?;
 
-    // CrabEFI does not currently have a TPM 1.2 transport. Install the legacy
-    // protocol for log discovery/HashAll compatibility, but do not advertise a
-    // physical TPM or accept PCR extends that would not reach hardware.
-    protocols::tcg::init_state(tcg1_buffer, existing_log, false)
-        .map_err(|_| "failed to initialize TCG state")?;
+    if let Some(base) = tpm_base {
+        let hardware_result =
+            unsafe { protocols::tcg::init_state_with_hardware(tcg1_buffer, existing_log, base) };
+        if hardware_result.is_err() {
+            log::warn!("TPM 1.2 hardware initialization failed; installing log-only TCG protocol");
+            let fallback_buffer = allocate_pages(log_pages)
+                .map(|buf| &mut buf[..DEFAULT_EVENT_LOG_SIZE])
+                .ok_or("failed to allocate fallback TCG event log buffer")?;
+            protocols::tcg::init_state(fallback_buffer, existing_log)
+                .map_err(|_| "failed to initialize fallback TCG state")?;
+        }
+    } else {
+        protocols::tcg::init_state(tcg1_buffer, existing_log)
+            .map_err(|_| "failed to initialize TCG state")?;
+    }
 
     let protocol = protocols::tcg::create_protocol();
     if protocol.is_null() {

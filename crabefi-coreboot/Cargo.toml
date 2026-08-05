@@ -25,9 +25,12 @@ zerocopy = { version = "0.8", default-features = false, features = ["derive"] }
 # ACPI table parsing and AML interpreter for platform device discovery.
 # Used by the coreboot payload to discover ECAM, GIC, UART, and DSDT
 # devices from ACPI tables before handing off to init_platform().
-# Pin to upstream BankField/IndexField support; crates.io 6.1.1 has todo!()
-# paths that panic-abort while loading AML from real firmware.
-acpi = { git = "https://github.com/ArthurHeymans/acpi.git", rev = "4f4adebf75234b52fe54c3e6e50c2cc13be41efe", default-features = false, features = [
+# Pin to upstream main: crates.io 6.1.1 has todo!() BankField/IndexField paths
+# that panic-abort while loading AML from real firmware, and only loads
+# package-element names eagerly (fails on forward references like
+# \_SB.PCI0.LPCB in the coreboot DSDT/SSDT). Upstream main has both the
+# BankField/IndexField support and lazy package name resolution (PR #320).
+acpi = { git = "https://github.com/ArthurHeymans/acpi.git", rev = "784a35b50bf9c39ce9b0a107cf8a5c296c52ddee", default-features = false, features = [
   "alloc",
   "aml",
 ] }

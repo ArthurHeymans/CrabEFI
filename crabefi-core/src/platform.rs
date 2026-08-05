@@ -1051,7 +1051,7 @@ impl FramebufferConfig {
 // TPM Event Log
 // ============================================================================
 
-/// TPM event-log and TPM 2.0 backend configuration.
+/// TPM event-log and hardware backend configuration.
 ///
 /// When the platform (e.g., coreboot) has already started measured boot and
 /// maintains a TPM event log, it can pass that log data to CrabEFI via this
@@ -1103,6 +1103,13 @@ pub struct TpmEventLogConfig<'a> {
     /// [`Tpm2DeviceConfig::TisMmio`], while library users can pass a `'static`
     /// driver implementing [`Tpm2Device`].
     pub tpm2_device: Tpm2DeviceConfig,
+
+    /// Optional MMIO base of a TPM 1.2 device using the TIS FIFO transport.
+    ///
+    /// When present with [`TpmLogFormat::Sha1Only`] or [`TpmLogFormat::Both`],
+    /// CrabEFI installs a hardware-backed `EFI_TCG_PROTOCOL` and forwards SHA-1
+    /// PCR extensions and raw TPM 1.2 commands to this device.
+    pub tpm1_tis_base: Option<u64>,
 }
 
 /// TPM event log format selection.
