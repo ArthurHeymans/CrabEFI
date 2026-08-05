@@ -195,8 +195,7 @@ impl<'a> ValidatedImage<'a> {
         if header.image_size == 0 {
             return Err(AbiError::ImageRange);
         }
-        if header.required_alignment < EFI_PAGE_SIZE || !header.required_alignment.is_power_of_two()
-        {
+        if header.required_alignment != EFI_PAGE_SIZE {
             return Err(AbiError::BadAlignment);
         }
         if header.feature_bits != feature_bits::REQUIRED {

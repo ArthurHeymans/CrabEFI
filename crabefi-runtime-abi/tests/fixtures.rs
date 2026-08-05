@@ -91,6 +91,10 @@ fn rejects_corrupt_layout_and_exports() {
     assert_eq!(parse(&bytes).err(), Some(AbiError::BadAlignment));
 
     let mut bytes = valid_image();
+    write_u32(&mut bytes, 44, 8192);
+    assert_eq!(parse(&bytes).err(), Some(AbiError::BadAlignment));
+
+    let mut bytes = valid_image();
     write_u32(&mut bytes, HEADER_SIZE + 20, 1 | 2 | 4 | 8);
     assert_eq!(
         parse(&bytes).err(),
