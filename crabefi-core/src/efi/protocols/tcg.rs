@@ -6,16 +6,13 @@
 //! - `StatusCheck`: Report whether a physical TPM 1.2 backend is available.
 //! - `HashAll`: Hash data using SHA-1.
 //! - `LogEvent`: Append an event to the SHA1 event log.
-//! - `PassThroughToTpm`: Not supported (no TPM 1.2 passthrough — returns UNSUPPORTED).
+//! - `PassThroughToTpm`: Forward raw commands to a TPM 1.2 backend.
 //! - `HashLogExtendEvent`: Hash data, extend PCRs, and log only when a physical
 //!   TPM 1.2 backend is configured.
 //!
-//! # Compatibility mode
-//!
-//! CrabEFI currently has no TPM 1.2 hardware transport. The legacy protocol can
-//! be installed for event-log discovery and SHA-1 hashing compatibility, but it
-//! does not advertise TPM presence and rejects PCR extends unless a real TPM 1.2
-//! backend is added.
+//! Without a hardware backend the legacy protocol remains available for
+//! event-log discovery and SHA-1 hashing compatibility, but does not advertise
+//! TPM presence or accept PCR-extending operations.
 //!
 //! # Reference
 //!
@@ -32,6 +29,7 @@ use spin::Mutex;
 use crate::efi::auth::authenticode::compute_authenticode_digests;
 use crate::efi::tcg::event_log::{EventLog, Sha1EventLog};
 use crate::efi::tcg::pcr::Sha1PcrBank;
+use crate::efi::tcg::tpm_tis::Tpm12Tis;
 use crate::efi::tcg::types::*;
 use crate::efi::utils::allocate_protocol_with_log;
 
@@ -47,8 +45,8 @@ struct TcgState {
     pcr_bank: Sha1PcrBank,
     /// SHA-1-only event log.
     event_log: Sha1EventLog,
-    /// Whether this protocol is backed by a physical TPM 1.2 device.
-    tpm_present: bool,
+    /// Physical TPM 1.2 backend used for PCR extension and passthrough.
+    hardware_tpm: Option<Tpm12Tis>,
 }
 
 /// Initialize the TCG (TPM 1.2) state.
@@ -56,12 +54,7 @@ struct TcgState {
 /// # Arguments
 /// * `buffer` - Pre-allocated buffer for the SHA-1 event log.
 /// * `existing_log` - Optional pre-existing log data to prepend.
-/// * `tpm_present` - Whether a physical TPM 1.2 device backs PCR extends.
-pub fn init_state(
-    buffer: &'static mut [u8],
-    existing_log: Option<&[u8]>,
-    tpm_present: bool,
-) -> Result<(), TcgError> {
+pub fn init_state(buffer: &'static mut [u8], existing_log: Option<&[u8]>) -> Result<(), TcgError> {
     let event_log = if let Some(existing) = existing_log {
         Sha1EventLog::from_existing(buffer, existing)?
     } else {
@@ -71,7 +64,32 @@ pub fn init_state(
     *TCG_STATE.lock() = Some(TcgState {
         pcr_bank: Sha1PcrBank::new(),
         event_log,
-        tpm_present,
+        hardware_tpm: None,
+    });
+
+    Ok(())
+}
+
+/// Initialize the TCG state with a physical TPM 1.2 TIS backend.
+///
+/// # Safety
+/// `tpm_base` must point to a valid TIS MMIO region.
+pub unsafe fn init_state_with_hardware(
+    buffer: &'static mut [u8],
+    existing_log: Option<&[u8]>,
+    tpm_base: u64,
+) -> Result<(), TcgError> {
+    let event_log = if let Some(existing) = existing_log {
+        Sha1EventLog::from_existing(buffer, existing)?
+    } else {
+        Sha1EventLog::new(buffer)
+    };
+    let tpm = unsafe { Tpm12Tis::probe(tpm_base)? };
+
+    *TCG_STATE.lock() = Some(TcgState {
+        pcr_bank: Sha1PcrBank::new(),
+        event_log,
+        hardware_tpm: Some(tpm),
     });
 
     Ok(())
@@ -105,6 +123,8 @@ fn extend_and_log(
         return Err(TcgError::InvalidPcrIndex);
     }
 
+    let tpm = state.hardware_tpm.as_mut().ok_or(TcgError::InternalError)?;
+    tpm.pcr_extend(pcr_index, sha1_digest)?;
     state.pcr_bank.extend(pcr_index as usize, sha1_digest)?;
     state
         .event_log
@@ -123,9 +143,7 @@ pub fn measure_event(
 ) -> Option<Result<(), TcgError>> {
     let mut guard = TCG_STATE.lock();
     let state = guard.as_mut()?;
-    if !state.tpm_present {
-        return None;
-    }
+    state.hardware_tpm.as_ref()?;
     let (sha1_digest, tagged_digest) = make_sha1_digest(data_to_hash);
     Some(extend_and_log(
         state,
@@ -145,9 +163,7 @@ pub fn precompute_pe_image_digests(
 ) -> Option<Result<(usize, [TaggedDigest; 5]), TcgError>> {
     let guard = TCG_STATE.lock();
     let state = guard.as_ref()?;
-    if !state.tpm_present {
-        return None;
-    }
+    state.hardware_tpm.as_ref()?;
     Some(
         compute_authenticode_digests(pe_data, &[TPM_ALG_SHA1]).map_err(|_| TcgError::InternalError),
     )
@@ -164,9 +180,7 @@ pub fn measure_pe_image_digests_event(
 ) -> Option<Result<(), TcgError>> {
     let mut guard = TCG_STATE.lock();
     let state = guard.as_mut()?;
-    if !state.tpm_present {
-        return None;
-    }
+    state.hardware_tpm.as_ref()?;
     Some((|| {
         let tagged_digest = digests
             .iter()
@@ -241,7 +255,7 @@ extern "efiapi" fn tcg_status_check(
                     rev_minor: 0,
                 },
                 hash_algorithm_bitmap: 0x01, // SHA-1
-                tpm_present_flag: u8::from(state.tpm_present),
+                tpm_present_flag: u8::from(state.hardware_tpm.is_some()),
                 tpm_deactivated_flag: 0,
             };
         }
@@ -263,7 +277,7 @@ extern "efiapi" fn tcg_status_check(
 
     if !event_log_last_entry.is_null() {
         unsafe {
-            *event_log_last_entry = if state.tpm_present {
+            *event_log_last_entry = if state.hardware_tpm.is_some() {
                 state
                     .event_log
                     .last_entry_offset()
@@ -274,7 +288,10 @@ extern "efiapi" fn tcg_status_check(
         }
     }
 
-    log::debug!("  -> SUCCESS (TPM present: {})", state.tpm_present);
+    log::debug!(
+        "  -> SUCCESS (TPM present: {})",
+        state.hardware_tpm.is_some()
+    );
     Status::SUCCESS
 }
 
@@ -391,7 +408,7 @@ extern "efiapi" fn tcg_log_event(
         None => return Status::DEVICE_ERROR,
     };
 
-    if !state.tpm_present {
+    if state.hardware_tpm.is_none() {
         return Status::DEVICE_ERROR;
     }
 
@@ -407,17 +424,34 @@ extern "efiapi" fn tcg_log_event(
 }
 
 /// `EFI_TCG_PROTOCOL.PassThroughToTpm`
-///
-/// Not supported — no physical TPM.
 extern "efiapi" fn tcg_pass_through_to_tpm(
-    _this: *mut TcgProtocolFfi,
-    _tpm_input_size: u32,
-    _tpm_input: *const u8,
-    _tpm_output_size: u32,
-    _tpm_output: *mut u8,
+    this: *mut TcgProtocolFfi,
+    tpm_input_size: u32,
+    tpm_input: *const u8,
+    tpm_output_size: u32,
+    tpm_output: *mut u8,
 ) -> Status {
-    log::debug!("TCG.PassThroughToTpm() -> UNSUPPORTED");
-    Status::UNSUPPORTED
+    if this.is_null()
+        || tpm_input.is_null()
+        || tpm_output.is_null()
+        || tpm_input_size < 10
+        || tpm_output_size < 10
+    {
+        return Status::INVALID_PARAMETER;
+    }
+
+    let input = unsafe { core::slice::from_raw_parts(tpm_input, tpm_input_size as usize) };
+    let output = unsafe { core::slice::from_raw_parts_mut(tpm_output, tpm_output_size as usize) };
+    let mut state = TCG_STATE.lock();
+    let Some(tpm) = state.as_mut().and_then(|state| state.hardware_tpm.as_mut()) else {
+        return Status::DEVICE_ERROR;
+    };
+
+    match tpm.submit_command(input, output) {
+        Ok(_) => Status::SUCCESS,
+        Err(TcgError::EventTooLarge) => Status::BUFFER_TOO_SMALL,
+        Err(_) => Status::DEVICE_ERROR,
+    }
 }
 
 /// `EFI_TCG_PROTOCOL.HashLogExtendEvent`
@@ -441,7 +475,7 @@ extern "efiapi" fn tcg_hash_log_extend_event(
         Some(s) => s,
         None => return Status::DEVICE_ERROR,
     };
-    if !state.tpm_present {
+    if state.hardware_tpm.is_none() {
         log::debug!("TCG.HashLogExtendEvent() -> DEVICE_ERROR (no physical TPM 1.2)");
         return Status::DEVICE_ERROR;
     }

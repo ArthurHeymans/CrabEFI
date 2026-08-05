@@ -1,7 +1,8 @@
 //! TPM TIS (TPM Interface Specification) MMIO driver.
 //!
 //! This module implements the TCG PC Client Platform TPM Profile (TIS)
-//! register interface for communicating with a hardware TPM 2.0 device
+//! register interface for communicating with hardware TPM 1.2 and TPM 2.0
+//! devices
 //! via memory-mapped I/O. This is the standard interface used by:
 //!
 //! - Discrete TPM chips (dTPM) on x86 platforms
@@ -17,8 +18,8 @@
 //! - TCG PC Client Specific TIS, Family 1.3
 
 use super::types::{
-    TPM_ALG_SHA1, TPM_ALG_SHA256, TPM_ALG_SHA384, TPM_ALG_SHA512, TaggedDigest, TcgError,
-    digest_size_for_algorithm,
+    SHA1_DIGEST_SIZE, TPM_ALG_SHA1, TPM_ALG_SHA256, TPM_ALG_SHA384, TPM_ALG_SHA512, TaggedDigest,
+    TcgError, digest_size_for_algorithm,
 };
 use crate::platform::{Tpm2Device, TpmDigest, TpmError, TpmPcrBanks};
 
@@ -60,6 +61,17 @@ const STS_CANCEL: u8 = 1;
 
 // TPM response codes
 const TPM_RC_SUCCESS: u32 = 0x000;
+
+// TPM 1.2 command and response constants. TPM 1.2 and TPM 2.0 share the
+// TIS FIFO transport, but use disjoint command/response tag spaces.
+const TPM12_TAG_RQU_COMMAND: u16 = 0x00C1;
+const TPM12_TAG_RSP_COMMAND: u16 = 0x00C4;
+const TPM12_TAG_RSP_AUTH1_COMMAND: u16 = 0x00C5;
+const TPM12_TAG_RSP_AUTH2_COMMAND: u16 = 0x00C6;
+const TPM12_ORD_STARTUP: u32 = 0x0000_0099;
+const TPM12_ORD_EXTEND: u32 = 0x0000_0014;
+const TPM12_ST_CLEAR: u16 = 0x0001;
+const TPM12_INVALID_POSTINIT: u32 = 0x0000_0026;
 
 // TPM2 command tags and codes
 const TPM_ST_NO_SESSIONS: u16 = 0x8001;
@@ -163,21 +175,21 @@ pub struct TpmTis {
     max_response_size: u16,
 }
 
+/// TPM family detected behind a TIS FIFO transport.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TpmFamily {
+    Tpm12,
+    Tpm20,
+}
+
+/// TPM 1.2 device using the TIS FIFO transport.
+pub struct Tpm12Tis {
+    transport: TpmTis,
+}
+
 impl TpmTis {
-    /// Probe for a TPM at the given MMIO base address and initialize it.
-    ///
-    /// This performs:
-    /// 1. Check that a TPM device is present (DID/VID != 0xFFFFFFFF)
-    /// 2. Request locality 0
-    /// 3. Send TPM2_Startup(CLEAR)
-    /// 4. Send TPM2_SelfTest(incremental) best-effort
-    /// 5. Query capabilities (active PCR banks, manufacturer ID)
-    ///
-    /// # Safety
-    ///
-    /// `base` must point to a valid TIS MMIO region (e.g., `0xFED40000`).
-    pub unsafe fn probe(base: u64) -> Result<Self, TcgError> {
-        // Check TPM presence via DID_VID register.
+    /// Open the common TIS transport without assuming a TPM command family.
+    unsafe fn open(base: u64) -> Result<Self, TcgError> {
         let did_vid = unsafe { tis_read32(base, TPM_DID_VID) };
         if did_vid == 0xFFFF_FFFF || did_vid == 0 {
             log::info!(
@@ -203,9 +215,59 @@ impl TpmTis {
             max_command_size: 0,
             max_response_size: 0,
         };
-
-        // Request locality 0.
         unsafe { tpm.request_locality()? };
+        Ok(tpm)
+    }
+
+    fn detect_family_inner(&mut self) -> Result<TpmFamily, TcgError> {
+        // TPM2_GetCapability(TPM_PROPERTIES, MANUFACTURER, 1). A TPM 1.2
+        // device rejects the ordinal using a legacy response tag, while a
+        // TPM 2.0 device always replies with a TPM2 response tag.
+        let mut cmd = [0u8; 22];
+        cmd[0..2].copy_from_slice(&TPM_ST_NO_SESSIONS.to_be_bytes());
+        cmd[2..6].copy_from_slice(&22u32.to_be_bytes());
+        cmd[6..10].copy_from_slice(&TPM2_CC_GET_CAPABILITY.to_be_bytes());
+        cmd[10..14].copy_from_slice(&TPM2_CAP_TPM_PROPERTIES.to_be_bytes());
+        cmd[14..18].copy_from_slice(&TPM2_PT_MANUFACTURER.to_be_bytes());
+        cmd[18..22].copy_from_slice(&1u32.to_be_bytes());
+
+        let mut resp = [0u8; 64];
+        let n = self.send_command(&cmd, &mut resp)?;
+        if n < 10 {
+            return Err(TcgError::InternalError);
+        }
+        classify_response_tag(u16::from_be_bytes([resp[0], resp[1]]))
+    }
+
+    /// Detect whether the TIS device implements TPM 1.2 or TPM 2.0.
+    ///
+    /// # Safety
+    /// `base` must point to a valid TIS MMIO region.
+    pub unsafe fn detect_family(base: u64) -> Result<TpmFamily, TcgError> {
+        let mut tpm = unsafe { Self::open(base)? };
+        let family = tpm.detect_family_inner()?;
+        log::info!("TPM TIS command family: {:?}", family);
+        Ok(family)
+    }
+
+    /// Probe for a TPM at the given MMIO base address and initialize it.
+    ///
+    /// This performs:
+    /// 1. Check that a TPM device is present (DID/VID != 0xFFFFFFFF)
+    /// 2. Request locality 0
+    /// 3. Send TPM2_Startup(CLEAR)
+    /// 4. Send TPM2_SelfTest(incremental) best-effort
+    /// 5. Query capabilities (active PCR banks, manufacturer ID)
+    ///
+    /// # Safety
+    ///
+    /// `base` must point to a valid TIS MMIO region (e.g., `0xFED40000`).
+    pub unsafe fn probe(base: u64) -> Result<Self, TcgError> {
+        let mut tpm = unsafe { Self::open(base)? };
+        if tpm.detect_family_inner()? != TpmFamily::Tpm20 {
+            log::error!("TIS device at {:#x} is not a TPM 2.0 device", base);
+            return Err(TcgError::InternalError);
+        }
 
         // TPM2_Startup(CLEAR).
         tpm.startup()?;
@@ -804,6 +866,94 @@ impl TpmTis {
     }
 }
 
+impl Tpm12Tis {
+    /// Probe and initialize a TPM 1.2 device on a TIS FIFO transport.
+    ///
+    /// # Safety
+    /// `base` must point to a valid TIS MMIO region.
+    pub unsafe fn probe(base: u64) -> Result<Self, TcgError> {
+        let mut transport = unsafe { TpmTis::open(base)? };
+
+        // Coreboot commonly starts the TPM before entering the payload, so a
+        // second TPM_Startup legitimately returns TPM_INVALID_POSTINIT.
+        let mut cmd = [0u8; 12];
+        cmd[0..2].copy_from_slice(&TPM12_TAG_RQU_COMMAND.to_be_bytes());
+        cmd[2..6].copy_from_slice(&12u32.to_be_bytes());
+        cmd[6..10].copy_from_slice(&TPM12_ORD_STARTUP.to_be_bytes());
+        cmd[10..12].copy_from_slice(&TPM12_ST_CLEAR.to_be_bytes());
+        let mut resp = [0u8; 64];
+        let n = transport.send_command(&cmd, &mut resp)?;
+        if n < 10
+            || classify_response_tag(u16::from_be_bytes([resp[0], resp[1]]))? != TpmFamily::Tpm12
+        {
+            log::error!("TIS device at {:#x} is not a TPM 1.2 device", base);
+            return Err(TcgError::InternalError);
+        }
+        let rc = response_code(&resp[..n])?;
+        if rc != TPM_RC_SUCCESS && rc != TPM12_INVALID_POSTINIT {
+            log::error!("TPM_Startup(ST_CLEAR) failed: rc={:#x}", rc);
+            return Err(TcgError::InternalError);
+        }
+
+        log::info!("TPM 1.2 TIS backend initialized");
+        Ok(Self { transport })
+    }
+
+    /// Extend a TPM 1.2 SHA-1 PCR.
+    pub fn pcr_extend(
+        &mut self,
+        pcr_index: u32,
+        digest: &[u8; SHA1_DIGEST_SIZE],
+    ) -> Result<(), TcgError> {
+        let mut cmd = [0u8; 34];
+        cmd[0..2].copy_from_slice(&TPM12_TAG_RQU_COMMAND.to_be_bytes());
+        cmd[2..6].copy_from_slice(&34u32.to_be_bytes());
+        cmd[6..10].copy_from_slice(&TPM12_ORD_EXTEND.to_be_bytes());
+        cmd[10..14].copy_from_slice(&pcr_index.to_be_bytes());
+        cmd[14..34].copy_from_slice(digest);
+
+        let mut resp = [0u8; 64];
+        let n = self.transport.send_command(&cmd, &mut resp)?;
+        let rc = response_code(&resp[..n])?;
+        if rc != TPM_RC_SUCCESS {
+            log::error!("TPM_Extend(pcr={}) failed: rc={:#x}", pcr_index, rc);
+            return Err(TcgError::InternalError);
+        }
+        Ok(())
+    }
+
+    /// Submit an arbitrary TPM 1.2 command through the TIS FIFO.
+    pub fn submit_command(
+        &mut self,
+        command: &[u8],
+        response: &mut [u8],
+    ) -> Result<usize, TcgError> {
+        self.transport.send_command(command, response)
+    }
+}
+
+fn response_code(response: &[u8]) -> Result<u32, TcgError> {
+    if response.len() < 10 {
+        return Err(TcgError::InternalError);
+    }
+    Ok(u32::from_be_bytes([
+        response[6],
+        response[7],
+        response[8],
+        response[9],
+    ]))
+}
+
+fn classify_response_tag(tag: u16) -> Result<TpmFamily, TcgError> {
+    match tag {
+        TPM12_TAG_RSP_COMMAND | TPM12_TAG_RSP_AUTH1_COMMAND | TPM12_TAG_RSP_AUTH2_COMMAND => {
+            Ok(TpmFamily::Tpm12)
+        }
+        TPM_ST_NO_SESSIONS | 0x8002 => Ok(TpmFamily::Tpm20),
+        _ => Err(TcgError::InternalError),
+    }
+}
+
 impl Tpm2Device for TpmTis {
     fn active_pcr_banks(&self) -> TpmPcrBanks {
         TpmPcrBanks::new(self.active_algorithms())
@@ -864,4 +1014,18 @@ fn manufacturer_id_to_str(id: u32) -> alloc::string::String {
         }
     }
     s
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{TpmFamily, classify_response_tag};
+
+    #[test]
+    fn response_tags_distinguish_tpm_families() {
+        assert_eq!(classify_response_tag(0x00c4), Ok(TpmFamily::Tpm12));
+        assert_eq!(classify_response_tag(0x00c5), Ok(TpmFamily::Tpm12));
+        assert_eq!(classify_response_tag(0x8001), Ok(TpmFamily::Tpm20));
+        assert_eq!(classify_response_tag(0x8002), Ok(TpmFamily::Tpm20));
+        assert!(classify_response_tag(0xffff).is_err());
+    }
 }

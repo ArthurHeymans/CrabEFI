@@ -1056,6 +1056,7 @@ pub extern "C" fn rust_main(coreboot_table_ptr: u64) -> ! {
                 // Hardware TPM transport is selected after ACPI namespace discovery.
                 // Coreboot's TPM log record does not describe the transport.
                 tpm2_device: crabefi::Tpm2DeviceConfig::None,
+                tpm1_tis_base: None,
             }
         }),
         heap_pre_initialized: false, // Set to true after Phase 7
@@ -1095,16 +1096,35 @@ pub extern "C" fn rust_main(coreboot_table_ptr: u64) -> ! {
         crabefi::state::with_drivers_mut(|d| d.acpi_info = acpi_info);
 
         #[cfg(target_arch = "x86_64")]
-        if let Some(device) = ["MSFT0101", "PNP0C31"]
+        if let Some((tpm_hid, device)) = ["MSFT0101", "PNP0C31"]
             .iter()
-            .find_map(|hid| acpi_info.find_device(hid))
+            .find_map(|hid| acpi_info.find_device(hid).map(|device| (*hid, device)))
             && device.mmio_base <= 0xfed4_0000
             && device.mmio_base.saturating_add(device.mmio_size) > 0xfed4_0000
         {
+            log::info!("ACPI exposes an MMIO TIS TPM at 0xfed40000 ({})", tpm_hid);
             if let Some(ref mut tpm) = config.tpm_event_log {
-                tpm.tpm2_device = crabefi::Tpm2DeviceConfig::TisMmio { base: 0xfed4_0000 };
+                match tpm_hid {
+                    "PNP0C31" => {
+                        // A TPM 1.2 platform must not expose EFI_TCG2_PROTOCOL:
+                        // Linux otherwise selects it and receives DEVICE_ERROR
+                        // for every attempted measurement.
+                        if tpm.format != crabefi::TpmLogFormat::Sha1Only {
+                            tpm.existing_log = None;
+                        }
+                        tpm.format = crabefi::TpmLogFormat::Sha1Only;
+                        if tpm.existing_log.is_none() {
+                            tpm.existing_log = unsafe { acpi::find_tcpa_event_log(rsdp) };
+                        }
+                        tpm.tpm1_tis_base = Some(0xfed4_0000);
+                        tpm.tpm2_device = crabefi::Tpm2DeviceConfig::None;
+                    }
+                    "MSFT0101" => {
+                        tpm.tpm2_device = crabefi::Tpm2DeviceConfig::TisMmio { base: 0xfed4_0000 };
+                    }
+                    _ => unreachable!(),
+                }
             }
-            log::info!("ACPI exposes an MMIO TIS TPM at 0xfed40000");
         } else {
             log::info!("No ACPI MMIO TIS TPM resource; skipping unsafe probe");
         }

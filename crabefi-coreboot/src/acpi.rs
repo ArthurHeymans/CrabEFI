@@ -302,6 +302,100 @@ pub unsafe fn discover_platform(rsdp_addr: u64) -> PlatformInfo {
     info
 }
 
+/// Locate a TPM 1.2 event log described by the ACPI TCPA table.
+///
+/// Some coreboot platforms publish the log through ACPI but do not export the
+/// corresponding standard-log CBMEM entry in the coreboot table. Copying this
+/// log into CrabEFI's EFI_TCG_PROTOCOL log keeps the log replayable against the
+/// PCR values coreboot extended before entering the payload.
+///
+/// # Safety
+/// `rsdp_addr` and all referenced ACPI/log memory must be identity mapped and
+/// remain valid for the firmware boot-services lifetime.
+#[cfg(target_arch = "x86_64")]
+pub unsafe fn find_tcpa_event_log(rsdp_addr: u64) -> Option<&'static [u8]> {
+    unsafe fn read_u32(address: u64) -> u32 {
+        unsafe { core::ptr::read_unaligned(address as *const u32) }
+    }
+    unsafe fn read_u64(address: u64) -> u64 {
+        unsafe { core::ptr::read_unaligned(address as *const u64) }
+    }
+
+    let rsdp = rsdp_addr as *const u8;
+    if unsafe { core::slice::from_raw_parts(rsdp, 8) } != b"RSD PTR " {
+        return None;
+    }
+    let revision = unsafe { core::ptr::read_unaligned(rsdp.add(15)) };
+    let (root, entry_size) = if revision >= 2 {
+        (unsafe { read_u64(rsdp_addr + 24) }, 8usize)
+    } else {
+        (unsafe { read_u32(rsdp_addr + 16) } as u64, 4usize)
+    };
+    if root == 0 {
+        return None;
+    }
+
+    let root_length = unsafe { read_u32(root + 4) } as usize;
+    if root_length < 36 {
+        return None;
+    }
+    let entry_count = (root_length - 36) / entry_size;
+    for index in 0..entry_count {
+        let entry_address = root + 36 + (index * entry_size) as u64;
+        let table = if entry_size == 8 {
+            unsafe { read_u64(entry_address) }
+        } else {
+            (unsafe { read_u32(entry_address) }) as u64
+        };
+        if table == 0 || unsafe { core::slice::from_raw_parts(table as *const u8, 4) } != b"TCPA" {
+            continue;
+        }
+
+        // ACPI TCPA client table: header(36), platform_class(2),
+        // log_area_minimum_length(4), log_area_start_address(8).
+        let table_length = unsafe { read_u32(table + 4) } as usize;
+        if table_length < 50 {
+            return None;
+        }
+        let maximum_length = unsafe { read_u32(table + 38) } as usize;
+        let log_address = unsafe { read_u64(table + 42) };
+        if maximum_length == 0 || log_address == 0 {
+            return None;
+        }
+
+        let allocation =
+            unsafe { core::slice::from_raw_parts(log_address as *const u8, maximum_length) };
+        let used = tcpa_log_used_length(allocation)?;
+        log::info!(
+            "ACPI TCPA event log found at {:#x} ({} used of {} bytes)",
+            log_address,
+            used,
+            maximum_length
+        );
+        return Some(&allocation[..used]);
+    }
+    None
+}
+
+#[cfg(target_arch = "x86_64")]
+fn tcpa_log_used_length(log: &[u8]) -> Option<usize> {
+    const HEADER_SIZE: usize = 4 + 4 + 20 + 4;
+    let mut offset = 0usize;
+    while offset + HEADER_SIZE <= log.len() {
+        let header = &log[offset..offset + HEADER_SIZE];
+        if header.iter().all(|byte| *byte == 0) || header.iter().all(|byte| *byte == 0xff) {
+            break;
+        }
+        let event_size = u32::from_le_bytes(header[28..32].try_into().ok()?) as usize;
+        let next = offset.checked_add(HEADER_SIZE)?.checked_add(event_size)?;
+        if next > log.len() {
+            return None;
+        }
+        offset = next;
+    }
+    (offset != 0).then_some(offset)
+}
+
 // ---------------------------------------------------------------------------
 // MADT — GIC distributor and redistributor (aarch64)
 // ---------------------------------------------------------------------------

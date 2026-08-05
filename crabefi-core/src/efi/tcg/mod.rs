@@ -57,5 +57,5 @@ pub mod types;
 
 pub use event_log::{CryptoAgileEventLog, EventLog, EventLogFormat, Sha1EventLog};
 pub use pcr::PcrBanks;
-pub use tpm_tis::TpmTis;
+pub use tpm_tis::{Tpm12Tis, TpmFamily, TpmTis};
 pub use types::*;
