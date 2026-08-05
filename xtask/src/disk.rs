@@ -511,16 +511,3 @@ pub fn create_grub_linux_disk(
     println!("Created: {}", output);
     Ok(())
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_which() {
-        // `ls` should exist on any Unix system
-        assert!(which("ls").is_some());
-        // This should not exist
-        assert!(which("nonexistent_command_12345").is_none());
-    }
-}

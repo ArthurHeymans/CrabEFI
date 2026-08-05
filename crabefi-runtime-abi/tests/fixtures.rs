@@ -1,6 +1,6 @@
 use crabefi_runtime_abi::{
-    AbiError, EXPORTS_SIZE, HEADER_SIZE, RuntimeExternalRange, RuntimeHandoff, ValidatedImage,
-    architecture, feature_bits,
+    AbiError, EXPORTS_SIZE, HEADER_SIZE, HandoffError, RuntimeExternalRange, RuntimeHandoff,
+    ValidatedImage, architecture, feature_bits, reset_mechanism, time_mechanism,
 };
 
 fn write_u16(bytes: &mut [u8], offset: usize, value: u16) {
@@ -83,6 +83,10 @@ fn rejects_corrupt_layout_and_exports() {
     assert_eq!(parse(&bytes).err(), Some(AbiError::BadMagic));
 
     let mut bytes = valid_image();
+    write_u32(&mut bytes, 16, 0);
+    assert_eq!(parse(&bytes).err(), Some(AbiError::ImageRange));
+
+    let mut bytes = valid_image();
     write_u32(&mut bytes, 44, 2048);
     assert_eq!(parse(&bytes).err(), Some(AbiError::BadAlignment));
 
@@ -163,17 +167,28 @@ fn rejects_invalid_relocation_slots_and_bounds() {
     );
 }
 
-#[test]
-fn handoff_rejects_overlapping_external_ranges() {
+fn valid_handoff(architecture: u16) -> RuntimeHandoff {
     let mut handoff = RuntimeHandoff::empty();
-    handoff.architecture = architecture::X86_64;
+    handoff.architecture = architecture;
     handoff.image_base = 0x10_0000;
-    handoff.image_size = 0x2000;
+    handoff.image_size = 0x1000;
     handoff.section_count = 1;
     handoff.sections[0].physical_base = handoff.image_base;
     handoff.sections[0].byte_len = handoff.image_size;
     handoff.deferred_buffer_base = 0x30_0000;
     handoff.deferred_buffer_size = 0x1_0000;
+    handoff.reset.mechanism = match architecture {
+        architecture::X86_64 => reset_mechanism::X86_LEGACY,
+        architecture::AARCH64 => reset_mechanism::PSCI_SMC,
+        architecture::RISCV64 => reset_mechanism::SBI_SRST,
+        _ => 0,
+    };
+    handoff
+}
+
+#[test]
+fn handoff_rejects_overlapping_external_ranges() {
+    let mut handoff = valid_handoff(architecture::X86_64);
     handoff.range_count = 2;
     handoff.ranges[0] = RuntimeExternalRange {
         physical_base: 0x20_0000,
@@ -190,15 +205,102 @@ fn handoff_rejects_overlapping_external_ranges() {
 
 #[test]
 fn handoff_rejects_section_provenance_mismatch() {
-    let mut handoff = RuntimeHandoff::empty();
-    handoff.architecture = architecture::X86_64;
-    handoff.image_base = 0x10_0000;
-    handoff.image_size = 0x1000;
-    handoff.section_count = 1;
-    handoff.deferred_buffer_base = 0x30_0000;
-    handoff.deferred_buffer_size = 0x1_0000;
-    handoff.sections[0].image_offset = 0;
+    let mut handoff = valid_handoff(architecture::X86_64);
     handoff.sections[0].physical_base = 0x20_0000;
-    handoff.sections[0].byte_len = 0x1000;
     assert!(handoff.validate().is_err());
+}
+
+#[test]
+fn handoff_reports_image_end_overflow() {
+    let mut handoff = valid_handoff(architecture::X86_64);
+    handoff.image_base = u64::MAX - 0xfff;
+    handoff.image_size = 0x2000;
+    handoff.sections[0].physical_base = handoff.image_base;
+    handoff.sections[0].byte_len = 0x1000;
+    assert_eq!(handoff.validate(), Err(HandoffError::Overflow));
+}
+
+#[test]
+fn handoff_validates_architecture_mechanism_pairs() {
+    let mut x86 = valid_handoff(architecture::X86_64);
+    x86.time.mechanism = time_mechanism::X86_CMOS;
+    x86.reset.io_or_mmio_base = 0xcf9;
+    assert_eq!(x86.validate(), Ok(()));
+
+    x86.time.mechanism = time_mechanism::PL031;
+    assert_eq!(x86.validate(), Err(HandoffError::Mechanism));
+    x86.time.mechanism = time_mechanism::UNSUPPORTED;
+    x86.reset.mechanism = reset_mechanism::PSCI_SMC;
+    assert_eq!(x86.validate(), Err(HandoffError::Mechanism));
+
+    let arm = valid_handoff(architecture::AARCH64);
+    assert_eq!(arm.validate(), Ok(()));
+    let riscv = valid_handoff(architecture::RISCV64);
+    assert_eq!(riscv.validate(), Ok(()));
+
+    let unknown = valid_handoff(99);
+    assert_eq!(unknown.validate(), Err(HandoffError::Mechanism));
+}
+
+#[test]
+fn handoff_requires_complete_pl031_range_containment() {
+    let mut handoff = valid_handoff(architecture::AARCH64);
+    handoff.time.mechanism = time_mechanism::PL031;
+    handoff.time.io_or_mmio_base = 0x20_0ffc;
+    assert_eq!(handoff.validate(), Err(HandoffError::Range));
+
+    handoff.range_count = 1;
+    handoff.ranges[0] = RuntimeExternalRange {
+        physical_base: 0x20_0000,
+        byte_len: 0x1000,
+        attributes: 1 << 63,
+    };
+    assert_eq!(handoff.validate(), Ok(()));
+
+    handoff.time.io_or_mmio_base += 1;
+    assert_eq!(handoff.validate(), Err(HandoffError::Range));
+    handoff.time.io_or_mmio_base = u64::MAX - 2;
+    assert_eq!(handoff.validate(), Err(HandoffError::Overflow));
+}
+
+#[test]
+fn handoff_rejects_contained_misaligned_mmio_time_bases() {
+    for (arch, mechanism) in [
+        (architecture::AARCH64, time_mechanism::PL031),
+        (architecture::RISCV64, time_mechanism::GOLDFISH_RTC),
+    ] {
+        let mut handoff = valid_handoff(arch);
+        handoff.time.mechanism = mechanism;
+        handoff.range_count = 1;
+        handoff.ranges[0] = RuntimeExternalRange {
+            physical_base: 0x20_0000,
+            byte_len: 0x1000,
+            attributes: 1 << 63,
+        };
+
+        handoff.time.io_or_mmio_base = 0x20_0100;
+        assert_eq!(handoff.validate(), Ok(()));
+        for offset in 1..4 {
+            handoff.time.io_or_mmio_base = 0x20_0100 + offset;
+            assert_eq!(handoff.validate(), Err(HandoffError::Range));
+        }
+        handoff.time.io_or_mmio_base = 0x20_0104;
+        assert_eq!(handoff.validate(), Ok(()));
+    }
+}
+
+#[test]
+fn handoff_requires_complete_goldfish_range_containment() {
+    let mut handoff = valid_handoff(architecture::RISCV64);
+    handoff.time.mechanism = time_mechanism::GOLDFISH_RTC;
+    handoff.time.io_or_mmio_base = 0x20_0ff8;
+    handoff.range_count = 1;
+    handoff.ranges[0] = RuntimeExternalRange {
+        physical_base: 0x20_0000,
+        byte_len: 0x1000,
+        attributes: 1 << 63,
+    };
+    assert_eq!(handoff.validate(), Ok(()));
+    handoff.time.io_or_mmio_base += 1;
+    assert_eq!(handoff.validate(), Err(HandoffError::Range));
 }

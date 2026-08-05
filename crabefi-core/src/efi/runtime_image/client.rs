@@ -27,6 +27,8 @@ const _: () = assert!(
     core::mem::size_of::<MemoryDescriptor>() == core::mem::size_of::<efi::MemoryDescriptor>()
         && core::mem::align_of::<MemoryDescriptor>()
             == core::mem::align_of::<efi::MemoryDescriptor>()
+        && core::mem::offset_of!(MemoryDescriptor, memory_type)
+            == core::mem::offset_of!(efi::MemoryDescriptor, r#type)
         && core::mem::offset_of!(MemoryDescriptor, physical_start)
             == core::mem::offset_of!(efi::MemoryDescriptor, physical_start)
         && core::mem::offset_of!(MemoryDescriptor, virtual_start)

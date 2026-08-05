@@ -461,7 +461,7 @@ pub trait VariableStoreLocator {
 /// It is used by [`crate::efi::varstore::Edk2VarStore`] to implement the
 /// EDK2 Firmware Volume format on top of raw flash.
 ///
-/// /// # Flash Semantics
+/// # Flash Semantics
 ///
 /// - `read` works on any valid offset.
 /// - `write` may require the region to be erased first (NOR flash: can only
@@ -1270,12 +1270,20 @@ pub struct RuntimeImageSource<'a> {
     pub expected_sha256: [u8; 32],
 }
 
-/// Warm-reset-preserved storage owned by the separate runtime image.
+/// Mandatory warm-reset-preserved storage owned exclusively by the separate
+/// runtime image.
+///
+/// The buffer must have a nonzero, page-aligned physical base and size, be
+/// reserved as `RuntimeServicesData`, and overlap neither the runtime image nor
+/// any external runtime MMIO range. No boot or operating-system component may
+/// reuse it. Its contents and physical address must survive a warm reset so
+/// deferred variable writes and staged capsules can be replayed on the next
+/// boot. A zero-sized “no storage” configuration is not supported.
 #[derive(Debug, Clone, Copy)]
 pub struct DeferredBufferConfig {
-    /// Physical base address of the page-aligned buffer.
+    /// Page-aligned physical base of the exclusively owned retained buffer.
     pub base: u64,
-    /// Page-aligned size of the buffer in bytes.
+    /// Nonzero page-aligned buffer size in bytes.
     pub size: usize,
 }
 
@@ -1288,7 +1296,7 @@ pub struct RuntimePlatformConfig<'a> {
     pub reset: crabefi_runtime_abi::RuntimeResetConfig,
     /// Explicit MMIO ranges that remain reachable after EBS.
     pub external_ranges: &'a [crabefi_runtime_abi::RuntimeExternalRange],
-    /// Warm-reset-preserved deferred variable storage.
+    /// Mandatory, exclusively owned warm-reset-preserved deferred storage.
     pub deferred_buffer: DeferredBufferConfig,
 }
 

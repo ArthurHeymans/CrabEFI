@@ -788,6 +788,43 @@ impl MemoryAllocator {
         Ok(())
     }
 
+    /// Split the leading code pages from one newly allocated private runtime
+    /// image. Public AllocateAddress deliberately cannot claim runtime data.
+    fn retype_runtime_image_code(
+        &mut self,
+        image_range: MemoryRange,
+        code_range: MemoryRange,
+    ) -> Result<(), efi::Status> {
+        if code_range.start != image_range.start || !image_range.contains(code_range) {
+            return Err(efi::Status::INVALID_PARAMETER);
+        }
+        let (allocation_index, _) = self
+            .find_allocation(code_range)
+            .filter(|(_, allocation)| {
+                allocation.range == image_range
+                    && allocation.memory_type == MemoryType::RuntimeServicesData
+            })
+            .ok_or(efi::Status::NOT_FOUND)?;
+        let descriptor_index = self
+            .find_descriptor(code_range, &[MemoryType::RuntimeServicesData])
+            .ok_or(efi::Status::NOT_FOUND)?;
+        let descriptor = self.entries[descriptor_index];
+        let attribute =
+            Self::allocation_attribute(MemoryType::RuntimeServicesCode, descriptor.attribute);
+        self.retype_range(
+            descriptor_index,
+            code_range,
+            MemoryType::RuntimeServicesCode,
+            attribute,
+        )?;
+        // The mandatory image has firmware lifetime and is not a public page
+        // allocation. Drop its temporary ownership record after the private
+        // split so neither its code nor data can be independently FreePages'd.
+        self.allocations.swap_remove(allocation_index);
+        self.map_key += 1;
+        Ok(())
+    }
+
     /// Allocate pages of memory.
     pub fn allocate_pages(
         &mut self,
@@ -831,11 +868,7 @@ impl MemoryAllocator {
             // Some loaders claim a subrange of their image allocation. Split
             // both the descriptor and ownership record so the three ranges can
             // subsequently be freed independently.
-            let claimable_types = [
-                MemoryType::LoaderCode,
-                MemoryType::LoaderData,
-                MemoryType::RuntimeServicesData,
-            ];
+            let claimable_types = [MemoryType::LoaderCode, MemoryType::LoaderData];
             let descriptor_index = match self.find_descriptor(range, &claimable_types) {
                 Some(index) => index,
                 None => return efi::Status::NOT_FOUND,
@@ -1070,6 +1103,19 @@ impl MemoryAllocator {
         }
     }
 
+    pub fn validate_map_key(&self, provided_map_key: usize) -> efi::Status {
+        if provided_map_key == self.map_key && !self.boot_services_exited {
+            efi::Status::SUCCESS
+        } else {
+            log::warn!(
+                "exit_boot_services: map_key mismatch or inactive allocator; expected {:#x}, got {:#x}",
+                self.map_key,
+                provided_map_key
+            );
+            efi::Status::INVALID_PARAMETER
+        }
+    }
+
     /// Mark boot services as exited
     pub fn exit_boot_services(&mut self, provided_map_key: usize) -> efi::Status {
         log::debug!(
@@ -1078,13 +1124,9 @@ impl MemoryAllocator {
             self.map_key
         );
 
-        if provided_map_key != self.map_key {
-            log::warn!(
-                "exit_boot_services: map_key mismatch! expected {:#x}, got {:#x}",
-                self.map_key,
-                provided_map_key
-            );
-            return efi::Status::INVALID_PARAMETER;
+        let key_status = self.validate_map_key(provided_map_key);
+        if key_status != efi::Status::SUCCESS {
+            return key_status;
         }
 
         self.boot_services_exited = true;
@@ -1465,18 +1507,18 @@ pub fn get_memory_map(
     )
 }
 
+/// Validate an ExitBootServices map key without changing allocator state.
+pub fn validate_map_key(map_key: usize) -> efi::Status {
+    state::allocator().validate_map_key(map_key)
+}
+
 /// Exit boot services
 pub fn exit_boot_services(map_key: usize) -> efi::Status {
     state::with_allocator_mut(|alloc| alloc.exit_boot_services(map_key))
 }
 
-/// Allocate one contiguous runtime image and split its leading code domain.
-///
-/// The normalized format covers the complete allocation with a leading code
-/// section followed by immutable and mutable data sections. The initial
-/// RuntimeServicesData allocation makes choosing a contiguous base atomic; the
-/// exact code subclaim then splits both the map
-/// descriptor and allocator ownership record.
+/// Allocate one contiguous runtime image and privately split its leading code
+/// domain without exposing RuntimeServicesData to public AllocateAddress claims.
 pub fn allocate_runtime_image_layout(
     image_pages: u64,
     code_pages: u64,
@@ -1484,28 +1526,27 @@ pub fn allocate_runtime_image_layout(
     if image_pages == 0 || code_pages == 0 || code_pages > image_pages {
         return Err(efi::Status::INVALID_PARAMETER);
     }
-    let mut base = 0;
-    let status = allocate_pages(
-        AllocateType::AllocateAnyPages,
-        MemoryType::RuntimeServicesData,
-        image_pages,
-        &mut base,
-    );
-    if status != efi::Status::SUCCESS {
-        return Err(status);
-    }
-    let mut code = base;
-    let status = allocate_pages(
-        AllocateType::AllocateAddress,
-        MemoryType::RuntimeServicesCode,
-        code_pages,
-        &mut code,
-    );
-    if status != efi::Status::SUCCESS {
-        let _ = free_pages(base, image_pages);
-        return Err(status);
-    }
-    Ok(base)
+    state::with_allocator_mut(|allocator| {
+        let mut base = 0;
+        let status = allocator.allocate_pages(
+            AllocateType::AllocateAnyPages,
+            MemoryType::RuntimeServicesData,
+            image_pages,
+            &mut base,
+        );
+        if status != efi::Status::SUCCESS {
+            return Err(status);
+        }
+        let image_range = MemoryRange::from_pages(base, image_pages, PAGE_SIZE)
+            .ok_or(efi::Status::OUT_OF_RESOURCES)?;
+        let code_range = MemoryRange::from_pages(base, code_pages, PAGE_SIZE)
+            .ok_or(efi::Status::OUT_OF_RESOURCES)?;
+        if let Err(status) = allocator.retype_runtime_image_code(image_range, code_range) {
+            let _ = allocator.free_pages(base, image_pages);
+            return Err(status);
+        }
+        Ok(base)
+    })
 }
 
 // Lock ordering: never hold POOL_STATE while entering the page allocator. Pool
@@ -1753,5 +1794,142 @@ pub fn reserve_boot_image_region() {
                 log::error!("CRITICAL: Failed to reserve boot data region: {:?}", e);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn allocator_with_ram() -> MemoryAllocator {
+        let mut allocator = MemoryAllocator::new();
+        allocator
+            .entries
+            .push(memory_descriptor(
+                MemoryType::ConventionalMemory,
+                0x10_0000,
+                32,
+                attributes::EFI_MEMORY_RAM_CAPS,
+            ))
+            .unwrap();
+        allocator
+    }
+
+    #[test]
+    fn public_allocate_address_cannot_subclaim_runtime_image_data() {
+        let mut allocator = allocator_with_ram();
+        let mut base = 0;
+        assert_eq!(
+            allocator.allocate_pages(
+                AllocateType::AllocateAnyPages,
+                MemoryType::RuntimeServicesData,
+                4,
+                &mut base,
+            ),
+            efi::Status::SUCCESS
+        );
+        let mut claim = base;
+        assert_eq!(
+            allocator.allocate_pages(
+                AllocateType::AllocateAddress,
+                MemoryType::RuntimeServicesCode,
+                1,
+                &mut claim,
+            ),
+            efi::Status::NOT_FOUND
+        );
+    }
+
+    #[test]
+    fn private_runtime_layout_split_preserves_runtime_attributes() {
+        let mut allocator = allocator_with_ram();
+        let mut base = 0;
+        assert_eq!(
+            allocator.allocate_pages(
+                AllocateType::AllocateAnyPages,
+                MemoryType::RuntimeServicesData,
+                4,
+                &mut base,
+            ),
+            efi::Status::SUCCESS
+        );
+        let image = MemoryRange::from_pages(base, 4, PAGE_SIZE).unwrap();
+        let code = MemoryRange::from_pages(base, 1, PAGE_SIZE).unwrap();
+        allocator.retype_runtime_image_code(image, code).unwrap();
+        let code_descriptor = allocator
+            .entries
+            .iter()
+            .find(|entry| entry.physical_start == base)
+            .unwrap();
+        assert_eq!(
+            code_descriptor.get_memory_type(),
+            Some(MemoryType::RuntimeServicesCode)
+        );
+        assert_ne!(
+            code_descriptor.attribute & attributes::EFI_MEMORY_RUNTIME,
+            0
+        );
+        assert_eq!(code_descriptor.attribute & attributes::EFI_MEMORY_XP, 0);
+        let data_descriptor = allocator
+            .entries
+            .iter()
+            .find(|entry| entry.physical_start == base + PAGE_SIZE)
+            .unwrap();
+        assert_eq!(
+            data_descriptor.get_memory_type(),
+            Some(MemoryType::RuntimeServicesData)
+        );
+        assert_ne!(data_descriptor.attribute & attributes::EFI_MEMORY_XP, 0);
+        assert_eq!(allocator.free_pages(base, 1), efi::Status::NOT_FOUND);
+        assert_eq!(
+            allocator.free_pages(base + PAGE_SIZE, 3),
+            efi::Status::NOT_FOUND
+        );
+        assert_eq!(
+            allocator
+                .entries
+                .iter()
+                .find(|entry| entry.physical_start == base)
+                .and_then(MemoryDescriptorExt::get_memory_type),
+            Some(MemoryType::RuntimeServicesCode)
+        );
+    }
+
+    #[test]
+    fn invalid_exit_map_key_leaves_boot_services_active() {
+        let mut allocator = allocator_with_ram();
+        let current = allocator.map_key();
+        assert_eq!(
+            allocator.exit_boot_services(current.wrapping_add(1)),
+            efi::Status::INVALID_PARAMETER
+        );
+        assert!(!allocator.boot_services_exited);
+        assert_eq!(allocator.exit_boot_services(current), efi::Status::SUCCESS);
+        assert!(allocator.boot_services_exited);
+    }
+
+    #[test]
+    fn loader_subclaims_remain_supported() {
+        let mut allocator = allocator_with_ram();
+        let mut base = 0;
+        assert_eq!(
+            allocator.allocate_pages(
+                AllocateType::AllocateAnyPages,
+                MemoryType::LoaderData,
+                4,
+                &mut base,
+            ),
+            efi::Status::SUCCESS
+        );
+        let mut claim = base;
+        assert_eq!(
+            allocator.allocate_pages(
+                AllocateType::AllocateAddress,
+                MemoryType::LoaderCode,
+                1,
+                &mut claim,
+            ),
+            efi::Status::SUCCESS
+        );
     }
 }

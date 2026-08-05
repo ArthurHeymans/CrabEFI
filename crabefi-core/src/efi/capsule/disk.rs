@@ -24,7 +24,7 @@ use r_efi::efi::Guid;
 pub const CAPSULE_FILE_DIRECTORY: &str = "EFI\\UpdateCapsule";
 
 /// `OsIndications` bit for FMP capsule support.
-pub const EFI_OS_INDICATIONS_FMP_CAPSULE_SUPPORTED: u64 = 0x0000_0000_0000_0001;
+pub const EFI_OS_INDICATIONS_FMP_CAPSULE_SUPPORTED: u64 = 0x0000_0000_0000_0008;
 
 /// `OsIndications` bit for file-based capsule delivery support.
 pub const EFI_OS_INDICATIONS_FILE_CAPSULE_DELIVERY_SUPPORTED: u64 = 0x0000_0000_0000_0004;
@@ -176,13 +176,22 @@ fn scan_device_for_capsules(
     None
 }
 
+const fn supported_capsule_indications(capsule_delivery_usable: bool) -> u64 {
+    if capsule_delivery_usable {
+        EFI_OS_INDICATIONS_FMP_CAPSULE_SUPPORTED
+            | EFI_OS_INDICATIONS_FILE_CAPSULE_DELIVERY_SUPPORTED
+    } else {
+        0
+    }
+}
+
 /// Install the `OsIndicationsSupported` EFI variable.
 ///
 /// This tells the OS which capsule delivery mechanisms are available.
-/// Called during boot initialization.
-pub fn install_os_indications_supported() {
-    let supported = EFI_OS_INDICATIONS_FMP_CAPSULE_SUPPORTED
-        | EFI_OS_INDICATIONS_FILE_CAPSULE_DELIVERY_SUPPORTED;
+/// Called during boot initialization after persistence and the applying backend
+/// have both been validated.
+pub fn install_os_indications_supported(capsule_delivery_usable: bool) {
+    let supported = supported_capsule_indications(capsule_delivery_usable);
 
     let name: &[u16] = &[
         'O' as u16, 's' as u16, 'I' as u16, 'n' as u16, 'd' as u16, 'i' as u16, 'c' as u16,
@@ -224,9 +233,7 @@ pub fn clear_os_indications_capsule_bits() {
         os_ind_name,
     ) && let Some(raw) = data.get(..8).and_then(|bytes| bytes.try_into().ok())
     {
-        let mut value = u64::from_le_bytes(raw);
-        value &= !(EFI_OS_INDICATIONS_FMP_CAPSULE_SUPPORTED
-            | EFI_OS_INDICATIONS_FILE_CAPSULE_DELIVERY_SUPPORTED);
+        let value = clear_capsule_bits(u64::from_le_bytes(raw));
         let bytes = value.to_le_bytes();
         let status = crate::efi::runtime_image::client::variables::set(
             &Guid::from_bytes(&EFI_GLOBAL_VARIABLE_GUID),
@@ -239,5 +246,34 @@ pub fn clear_os_indications_capsule_bits() {
         } else {
             log::warn!("Failed to clear OsIndications: {:?}", status);
         }
+    }
+}
+
+fn clear_capsule_bits(value: u64) -> u64 {
+    value
+        & !(EFI_OS_INDICATIONS_FMP_CAPSULE_SUPPORTED
+            | EFI_OS_INDICATIONS_FILE_CAPSULE_DELIVERY_SUPPORTED)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn capsule_indication_bits_require_usable_delivery() {
+        assert_eq!(supported_capsule_indications(false), 0);
+        assert_eq!(
+            supported_capsule_indications(true),
+            EFI_OS_INDICATIONS_FMP_CAPSULE_SUPPORTED
+                | EFI_OS_INDICATIONS_FILE_CAPSULE_DELIVERY_SUPPORTED
+        );
+    }
+
+    #[test]
+    fn capsule_indication_bits_use_uefi_assignments() {
+        let supported = EFI_OS_INDICATIONS_FMP_CAPSULE_SUPPORTED
+            | EFI_OS_INDICATIONS_FILE_CAPSULE_DELIVERY_SUPPORTED;
+        assert_eq!(supported, 0x0c);
+        assert_eq!(clear_capsule_bits(0x01 | supported), 0x01);
     }
 }

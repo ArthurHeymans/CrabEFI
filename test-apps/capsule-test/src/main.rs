@@ -130,8 +130,18 @@ impl TestCtx {
 // Entry Point
 // ============================================================================
 
+/// # Safety
+/// The firmware must pass a valid writable UEFI System Table for the duration
+/// of this entry-point call.
 #[no_mangle]
-pub extern "efiapi" fn efi_main(_image_handle: Handle, system_table: *mut SystemTable) -> Status {
+pub unsafe extern "efiapi" fn efi_main(
+    _image_handle: Handle,
+    system_table: *mut SystemTable,
+) -> Status {
+    if system_table.is_null() {
+        return Status::INVALID_PARAMETER;
+    }
+    // SAFETY: guaranteed by the UEFI image-entry contract and checked non-null.
     let con_out = unsafe { (*system_table).con_out };
     if con_out.is_null() {
         return Status::UNSUPPORTED;
@@ -339,8 +349,8 @@ fn test_os_indications_supported(ctx: &mut TestCtx) {
     ctx.print_hex64(value);
     ctx.print_str("\n");
 
-    // Check FMP capsule bit (bit 0)
-    if value & 0x01 != 0 {
+    // Check FMP capsule bit (bit 3)
+    if value & 0x08 != 0 {
         ctx.pass("os_ind_fmp_capsule_bit");
     } else {
         ctx.fail("os_ind_fmp_capsule_bit: FMP capsule bit not set");

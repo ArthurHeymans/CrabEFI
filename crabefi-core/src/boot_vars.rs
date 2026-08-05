@@ -301,9 +301,9 @@ fn boot_option_name(option_number: u16) -> [u16; MAX_VARIABLE_NAME_LEN] {
     name
 }
 
-/// Read a variable from the in-memory variable store.
+/// Read a variable from the authoritative runtime-image variable service.
 ///
-/// Returns `Some((attributes, data_slice))` if found, `None` otherwise.
+/// Returns `Some((attributes, data))` if found, `None` otherwise.
 fn read_variable(name: &[u16]) -> Option<(u32, alloc::vec::Vec<u8>)> {
     crate::efi::runtime_image::client::variables::get(
         &Guid::from_bytes(&EFI_GLOBAL_VARIABLE_GUID),
@@ -311,9 +311,10 @@ fn read_variable(name: &[u16]) -> Option<(u32, alloc::vec::Vec<u8>)> {
     )
 }
 
-/// Write (or create) a variable in the in-memory variable store.
+/// Write or create a variable through the authoritative runtime-image service.
 ///
-/// If `data` is empty and `attrs` is 0, the variable is deleted.
+/// If `data` is empty and `attrs` is zero, standard `SetVariable` deletion
+/// semantics apply.
 fn write_variable(name: &[u16], attrs: u32, data: &[u8]) -> bool {
     crate::efi::runtime_image::client::variables::set(
         &Guid::from_bytes(&EFI_GLOBAL_VARIABLE_GUID),
@@ -323,7 +324,7 @@ fn write_variable(name: &[u16], attrs: u32, data: &[u8]) -> bool {
     ) == r_efi::efi::Status::SUCCESS
 }
 
-/// Delete a variable from the in-memory store.
+/// Delete a variable through the authoritative runtime-image service.
 fn delete_variable(name: &[u16]) -> bool {
     write_variable(name, 0, &[])
 }

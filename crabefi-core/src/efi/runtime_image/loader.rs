@@ -2,7 +2,7 @@
 
 use crabefi_runtime_abi::{
     LoadedSection, MAX_EXTERNAL_RANGES, RelocationImport, RuntimeHandoff, ValidatedImage,
-    architecture, section_flags,
+    architecture, relocation_kind, section_flags,
 };
 use r_efi::efi::Status;
 use sha2::{Digest, Sha256};
@@ -130,7 +130,7 @@ pub fn load(
                 target_offset: relocation.target_offset,
                 patch_section: relocation.patch_section,
                 target_section: relocation.target_section,
-                kind: 1,
+                kind: relocation_kind::ABSOLUTE64,
                 reserved: [0; 12],
             })
             .map_err(LoadError::Image)?;
@@ -141,26 +141,32 @@ pub fn load(
     Ok(client)
 }
 
-fn reserve_deferred_buffer(platform: RuntimePlatformConfig<'_>) -> Result<(), LoadError> {
-    let base = platform.deferred_buffer.base;
-    let size =
-        u64::try_from(platform.deferred_buffer.size).map_err(|_| LoadError::InvalidLayout)?;
+fn validate_deferred_buffer(
+    deferred: crate::platform::DeferredBufferConfig,
+    external_ranges: &[crabefi_runtime_abi::RuntimeExternalRange],
+) -> Result<(u64, u64), LoadError> {
+    let base = deferred.base;
+    let size = u64::try_from(deferred.size).map_err(|_| LoadError::InvalidLayout)?;
+    let end = base.checked_add(size).ok_or(LoadError::InvalidLayout)?;
     if base == 0
         || size == 0
         || !base.is_multiple_of(PAGE_SIZE)
         || !size.is_multiple_of(PAGE_SIZE)
-        || base.checked_add(size).is_none()
-        || platform.external_ranges.iter().any(|range| {
+        || external_ranges.iter().any(|range| {
             let Some(range_end) = range.physical_base.checked_add(range.byte_len) else {
                 return true;
             };
-            let buffer_end = base + size;
-            base < range_end && range.physical_base < buffer_end
+            base < range_end && range.physical_base < end
         })
     {
         return Err(LoadError::InvalidLayout);
     }
+    Ok((base, size))
+}
 
+fn reserve_deferred_buffer(platform: RuntimePlatformConfig<'_>) -> Result<(), LoadError> {
+    let (base, size) =
+        validate_deferred_buffer(platform.deferred_buffer, platform.external_ranges)?;
     let pages = size / PAGE_SIZE;
     match allocator::carve_out_region(base, pages, MemoryType::RuntimeServicesData) {
         Ok(()) => Ok(()),
@@ -212,6 +218,13 @@ const fn current_architecture() -> u16 {
     return architecture::RISCV64;
 }
 
+#[cfg(any(target_arch = "aarch64", test))]
+const fn aarch64_cache_line_sizes(ctr_el0: u64) -> (u64, u64) {
+    let instruction = 4u64 << (ctr_el0 & 0x0f);
+    let data = 4u64 << ((ctr_el0 >> 16) & 0x0f);
+    (data, instruction)
+}
+
 fn synchronize_loaded_image(base: u64, size: u64) {
     #[cfg(target_arch = "x86_64")]
     unsafe {
@@ -221,17 +234,22 @@ fn synchronize_loaded_image(base: u64, size: u64) {
     }
     #[cfg(target_arch = "aarch64")]
     unsafe {
-        let mut address = base;
-        while address < base.saturating_add(size) {
-            // SAFETY: range is the newly written image allocation.
+        let ctr_el0: u64;
+        core::arch::asm!("mrs {}, ctr_el0", out(reg) ctr_el0, options(nomem, nostack));
+        let (data_stride, instruction_stride) = aarch64_cache_line_sizes(ctr_el0);
+        let end = base.saturating_add(size);
+        let mut address = base & !(data_stride - 1);
+        while address < end {
+            // SAFETY: cache maintenance may round down to the containing line;
+            // it does not dereference memory outside the new image allocation.
             core::arch::asm!("dc cvau, {}", in(reg) address, options(nostack));
-            address = address.saturating_add(64);
+            address = address.saturating_add(data_stride);
         }
         core::arch::asm!("dsb ish", options(nostack));
-        address = base;
-        while address < base.saturating_add(size) {
+        address = base & !(instruction_stride - 1);
+        while address < end {
             core::arch::asm!("ic ivau, {}", in(reg) address, options(nostack));
-            address = address.saturating_add(64);
+            address = address.saturating_add(instruction_stride);
         }
         core::arch::asm!("dsb ish", "isb", options(nostack));
     }
@@ -240,5 +258,55 @@ fn synchronize_loaded_image(base: u64, size: u64) {
         let _ = (base, size);
         // SAFETY: synchronizes instruction fetch with the copied image.
         core::arch::asm!("fence.i", options(nostack));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{aarch64_cache_line_sizes, validate_deferred_buffer};
+    use crate::platform::DeferredBufferConfig;
+    use crabefi_runtime_abi::RuntimeExternalRange;
+
+    #[test]
+    fn decodes_independent_aarch64_cache_line_sizes() {
+        assert_eq!(aarch64_cache_line_sizes(3 | (3 << 16)), (32, 32));
+        assert_eq!(aarch64_cache_line_sizes(4 | (5 << 16)), (128, 64));
+        assert_eq!(aarch64_cache_line_sizes(5 | (4 << 16)), (64, 128));
+    }
+
+    #[test]
+    fn deferred_buffer_contract_rejects_invalid_ranges() {
+        let valid = DeferredBufferConfig {
+            base: 0x40_0000,
+            size: 0x1_0000,
+        };
+        assert_eq!(
+            validate_deferred_buffer(valid, &[]).ok(),
+            Some((0x40_0000, 0x1_0000))
+        );
+        for invalid in [
+            DeferredBufferConfig { base: 0, ..valid },
+            DeferredBufferConfig { size: 0, ..valid },
+            DeferredBufferConfig {
+                base: valid.base + 1,
+                ..valid
+            },
+            DeferredBufferConfig {
+                size: valid.size - 1,
+                ..valid
+            },
+            DeferredBufferConfig {
+                base: u64::MAX - 0xfff,
+                size: 0x2000,
+            },
+        ] {
+            assert!(validate_deferred_buffer(invalid, &[]).is_err());
+        }
+        let overlap = RuntimeExternalRange {
+            physical_base: valid.base,
+            byte_len: 0x1000,
+            attributes: 1 << 63,
+        };
+        assert!(validate_deferred_buffer(valid, &[overlap]).is_err());
     }
 }

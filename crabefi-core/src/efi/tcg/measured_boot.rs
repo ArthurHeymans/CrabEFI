@@ -293,6 +293,14 @@ pub fn measure_boot_variables_all() {
 }
 
 /// Measure EFI handoff/configuration table pointers into PCR 1.
+const fn bounded_configuration_table_count(count: usize) -> usize {
+    if count > crabefi_runtime_abi::MAX_CONFIGURATION_TABLES {
+        crabefi_runtime_abi::MAX_CONFIGURATION_TABLES
+    } else {
+        count
+    }
+}
+
 pub fn measure_handoff_tables_all() {
     const ENTRY_SIZE: usize = 16 + 8;
     let mut event_buf = [0u8; 8 + crabefi_runtime_abi::MAX_CONFIGURATION_TABLES * ENTRY_SIZE];
@@ -309,8 +317,16 @@ pub fn measure_handoff_tables_all() {
             )
         };
         if !tables.is_null() {
-            for index in 0..table_count {
-                // SAFETY: index is bounded by the image-owned count.
+            let bounded_count = bounded_configuration_table_count(table_count);
+            if bounded_count != table_count {
+                log::warn!(
+                    "Clamping impossible configuration table count {} to {}",
+                    table_count,
+                    bounded_count
+                );
+            }
+            for index in 0..bounded_count {
+                // SAFETY: the count is clamped to the image-owned fixed array.
                 let table = unsafe { &*tables.add(index) };
                 if table.vendor_table.is_null() || off + ENTRY_SIZE > event_buf.len() {
                     continue;
@@ -336,6 +352,20 @@ pub fn measure_handoff_tables_all() {
         &event_buf[..off],
         "EFI handoff tables",
     );
+}
+
+#[cfg(test)]
+mod handoff_table_tests {
+    use super::bounded_configuration_table_count;
+
+    #[test]
+    fn oversized_configuration_count_is_bounded_to_owned_array() {
+        assert_eq!(bounded_configuration_table_count(3), 3);
+        assert_eq!(
+            bounded_configuration_table_count(usize::MAX),
+            crabefi_runtime_abi::MAX_CONFIGURATION_TABLES
+        );
+    }
 }
 
 /// Measure a separator event through all installed TCG protocols.

@@ -93,9 +93,10 @@ only for image-owned sections or retained MMIO ranges it must resolve.
 
 It resolves independent section/range deltas; converts image table pointers;
 calculates Runtime Services CRCs against the final virtual function pointers;
-and then publishes the virtual phase. Relocation writes derive provenance from
-the image state pointer and are fenced before CRC calculation. Relocations to
-executable code, transition atomics, and the image-local variable store are
+and then publishes the virtual phase. Relocation destinations are reconstructed
+from loader-exposed, range-validated firmware addresses with Rust's explicit
+exposed-provenance API and are fenced before CRC calculation. Relocations to
+executable code, transition atomics, the reset snapshot, and the image-local variable store are
 committed in a no-inline tail after release, so physically executing code never
 calls through a GOT slot that was changed to a virtual address.
 

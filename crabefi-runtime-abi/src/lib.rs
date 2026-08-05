@@ -9,6 +9,7 @@
 #![no_std]
 #![deny(unsafe_code)]
 
+pub mod capsule;
 pub mod format;
 pub mod handoff;
 

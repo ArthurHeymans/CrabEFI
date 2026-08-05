@@ -35,27 +35,32 @@ pub fn apply_capsule(data: &[u8], backend: &mut dyn CapsuleBackend) -> CapsuleRe
         Ok(h) => h,
         Err(e) => {
             log::error!("Failed to parse capsule header: {:?}", e);
-            return CapsuleResult::failure(CapsuleResultStatus::ErrorInvalidImage, 0);
+            return CapsuleResult::report_only(CapsuleResultStatus::ErrorInvalidImage);
         }
     };
+    let capsule_type = header::identify_capsule_type(&hdr.capsule_guid);
 
     if let Err(e) = header::validate_capsule(&hdr, data.len()) {
         log::error!("Capsule validation failed: {:?}", e);
-        return CapsuleResult::failure(CapsuleResultStatus::ErrorInvalidImage, 0);
+        return if capsule_type == CapsuleType::Fmp {
+            CapsuleResult::failure(CapsuleResultStatus::ErrorInvalidImage, 0)
+        } else {
+            CapsuleResult::report_only(CapsuleResultStatus::ErrorInvalidImage)
+        };
     }
 
     log::info!(
         "Processing capsule: type={:?}, size={}, flags={:#x}",
-        header::identify_capsule_type(&hdr.capsule_guid),
+        capsule_type,
         hdr.capsule_image_size,
         hdr.flags
     );
 
-    match header::identify_capsule_type(&hdr.capsule_guid) {
+    match capsule_type {
         CapsuleType::Fmp => apply_fmp_capsule(&hdr, data, backend),
         CapsuleType::WindowsUx => {
             log::info!("Skipping Windows UX capsule (informational only)");
-            CapsuleResult::success(0)
+            CapsuleResult::report_only(CapsuleResultStatus::Success)
         }
         CapsuleType::CapsuleOnDisk => {
             // Capsule-on-disk wrapper: the inner payload starts after the
@@ -64,13 +69,13 @@ pub fn apply_capsule(data: &[u8], backend: &mut dyn CapsuleBackend) -> CapsuleRe
             let inner_offset = hdr.header_size as usize;
             if inner_offset >= data.len() {
                 log::error!("Capsule-on-disk wrapper has no inner payload");
-                return CapsuleResult::failure(CapsuleResultStatus::ErrorInvalidImage, 0);
+                return CapsuleResult::report_only(CapsuleResultStatus::ErrorInvalidImage);
             }
             apply_capsule(&data[inner_offset..], backend)
         }
         CapsuleType::Unknown => {
             log::warn!("Unknown capsule GUID — skipping");
-            CapsuleResult::failure(CapsuleResultStatus::ErrorUnsupported, 0)
+            CapsuleResult::report_only(CapsuleResultStatus::ErrorUnsupported)
         }
     }
 }
@@ -97,6 +102,10 @@ fn apply_fmp_capsule(
             "Capsule contains {} embedded drivers — skipping (not supported)",
             fmp_hdr.embedded_driver_count
         );
+    }
+    if fmp_hdr.payload_item_count == 0 {
+        log::error!("FMP capsule contains no firmware payload items");
+        return CapsuleResult::failure(CapsuleResultStatus::ErrorInvalidImage, 0);
     }
 
     // Process each payload item
@@ -180,25 +189,36 @@ fn apply_fmp_payload_item(
         }
     };
 
-    let firmware_image = &update_image[image_payload_offset..];
+    let signed_firmware_image = &update_image[image_payload_offset..];
+    let (payload_header, firmware_image) =
+        match fmp::parse_fmp_payload_header(signed_firmware_image) {
+            Ok(payload) => payload,
+            Err(error) => {
+                log::error!("Failed to parse signed FMP payload header: {:?}", error);
+                return CapsuleResult::failure(CapsuleResultStatus::ErrorInvalidImage, 0);
+            }
+        };
+    let attempted_version = payload_header.firmware_version;
 
-    // Verify PKCS#7 signature
+    // Authenticate the version metadata together with the firmware bytes before
+    // using it for rollback policy. It is still useful for failure reporting if
+    // signature verification fails.
     let trust_store = backend.capsule_trust_store();
-    if let Err(e) = auth::verify_capsule_signature(&auth_hdr, firmware_image, trust_store) {
+    if let Err(e) = auth::verify_capsule_signature(&auth_hdr, signed_firmware_image, trust_store) {
         log::error!("Capsule signature verification failed: {:?}", e);
-        return CapsuleResult::failure(CapsuleResultStatus::ErrorAuthFailed, 0);
+        return CapsuleResult::failure(CapsuleResultStatus::ErrorAuthFailed, attempted_version);
     }
 
-    // Check version >= LSV
-    // The firmware image itself may encode a version; for now we trust
-    // the capsule's FMP header. The version check is against the current
-    // firmware's LSV to prevent rollback.
-    // TODO: Extract version from the firmware image once we define that encoding.
     log::info!(
-        "Firmware version check: current={:#x}, LSV={:#x}",
+        "Firmware version check: attempted={:#x}, current={:#x}, LSV={:#x}, incoming LSV={:#x}",
+        attempted_version,
         fw_info.version,
-        fw_info.lowest_supported_version
+        fw_info.lowest_supported_version,
+        payload_header.lowest_supported_version,
     );
+    if let Some(failure) = version_failure(attempted_version, fw_info.lowest_supported_version) {
+        return failure;
+    }
 
     // Parse RMAP manifest and validate against FMAP
     let fmap_regions = backend.fmap_regions();
@@ -206,7 +226,10 @@ fn apply_fmp_payload_item(
         Ok(regions) => regions,
         Err(e) => {
             log::error!("RMAP validation failed: {:?}", e);
-            return CapsuleResult::failure(CapsuleResultStatus::ErrorInvalidImage, 0);
+            return CapsuleResult::failure(
+                CapsuleResultStatus::ErrorInvalidImage,
+                attempted_version,
+            );
         }
     };
 
@@ -219,7 +242,10 @@ fn apply_fmp_payload_item(
         Some(size) => size,
         None => {
             log::error!("Approved RMAP regions exceed addressable image size");
-            return CapsuleResult::failure(CapsuleResultStatus::ErrorInvalidImage, 0);
+            return CapsuleResult::failure(
+                CapsuleResultStatus::ErrorInvalidImage,
+                attempted_version,
+            );
         }
     };
 
@@ -229,7 +255,7 @@ fn apply_fmp_payload_item(
             required_size,
             clean_image.len()
         );
-        return CapsuleResult::failure(CapsuleResultStatus::ErrorInvalidImage, 0);
+        return CapsuleResult::failure(CapsuleResultStatus::ErrorInvalidImage, attempted_version);
     }
 
     // Write firmware image to approved flash regions.
@@ -244,7 +270,10 @@ fn apply_fmp_payload_item(
                 region.offset,
                 region.size
             );
-            return CapsuleResult::failure(CapsuleResultStatus::ErrorInvalidImage, 0);
+            return CapsuleResult::failure(
+                CapsuleResultStatus::ErrorInvalidImage,
+                attempted_version,
+            );
         }
 
         let write_size = region.size as usize;
@@ -261,7 +290,10 @@ fn apply_fmp_payload_item(
 
         if let Err(e) = backend.write_firmware_region(region.name.as_str(), 0, region_data) {
             log::error!("Flash write failed for region '{}': {:?}", region.name, e);
-            return CapsuleResult::failure(CapsuleResultStatus::ErrorFlashWriteFailed, 0);
+            return CapsuleResult::failure(
+                CapsuleResultStatus::ErrorFlashWriteFailed,
+                attempted_version,
+            );
         }
 
         total_written += write_size;
@@ -273,10 +305,35 @@ fn apply_fmp_payload_item(
         approved_regions.len()
     );
 
-    CapsuleResult::success(fw_info.version)
+    CapsuleResult::success(attempted_version)
+}
+
+fn version_failure(attempted_version: u32, lowest_supported_version: u32) -> Option<CapsuleResult> {
+    (attempted_version < lowest_supported_version).then(|| {
+        log::error!(
+            "Capsule firmware version {:#x} is below LSV {:#x}",
+            attempted_version,
+            lowest_supported_version
+        );
+        CapsuleResult::failure(CapsuleResultStatus::ErrorVersionTooLow, attempted_version)
+    })
 }
 
 /// Check if a GUID matches a 16-byte array.
 fn guid_matches(guid: &r_efi::efi::Guid, bytes: &[u8; 16]) -> bool {
     guid.as_bytes() == bytes
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rollback_failure_reports_the_attempted_capsule_version() {
+        let failure = version_failure(0x0001_0001, 0x0002_0000).unwrap();
+        assert_eq!(failure.status, CapsuleResultStatus::ErrorVersionTooLow);
+        assert_eq!(failure.capsule_version, 0x0001_0001);
+        assert!(version_failure(0x0002_0000, 0x0002_0000).is_none());
+        assert!(version_failure(0x0002_0001, 0x0002_0000).is_none());
+    }
 }

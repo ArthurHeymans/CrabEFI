@@ -18,7 +18,7 @@ use r_efi::efi::Guid;
 ///
 /// This corresponds to `EFI_CAPSULE_HEADER` in the UEFI specification.
 /// The header is followed by capsule-type-specific data.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CapsuleHeader {
     /// Capsule type GUID.
     pub capsule_guid: Guid,
@@ -126,6 +126,8 @@ pub enum CapsuleError {
     InvalidFmpHeader,
     /// FMP capsule image header is invalid.
     InvalidFmpImageHeader,
+    /// Signed FMP payload metadata is missing or invalid.
+    InvalidFmpPayloadHeader,
     /// Capsule signature verification failed.
     AuthenticationFailed,
     /// Firmware version is below the lowest supported version.

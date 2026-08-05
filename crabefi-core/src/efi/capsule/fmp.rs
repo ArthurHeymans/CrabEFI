@@ -53,7 +53,7 @@ use super::header::CapsuleError;
 // ============================================================================
 
 /// Parsed FMP capsule header.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FmpCapsuleHeader {
     /// Header version (must be 1).
     pub version: u32,
@@ -74,7 +74,7 @@ const FMP_CAPSULE_HEADER_MIN_SIZE: usize = 4 + 2 + 2; // 8 bytes
 // ============================================================================
 
 /// Parsed FMP capsule image header (per-payload).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FmpImageHeader {
     /// Header version (1, 2, or 3).
     pub version: u32,
@@ -98,6 +98,24 @@ const FMP_IMAGE_HEADER_V1_SIZE: usize = 4 + 16 + 1 + 3 + 4 + 4; // 32 bytes
 const FMP_IMAGE_HEADER_V2_SIZE: usize = FMP_IMAGE_HEADER_V1_SIZE + 8; // 40 bytes
 /// FMP image header v3 size (v2 + u64 capsule support).
 const FMP_IMAGE_HEADER_V3_SIZE: usize = FMP_IMAGE_HEADER_V2_SIZE + 8; // 48 bytes
+
+// ============================================================================
+// EDK2 FMP payload metadata
+// ============================================================================
+
+/// Signed EDK2 FMP payload header (`MSS1`) preceding the raw firmware image.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FmpPayloadHeader {
+    /// Header size, including any future extension fields.
+    pub header_size: u32,
+    /// Version of the firmware being installed.
+    pub firmware_version: u32,
+    /// Rollback floor advertised by the incoming firmware.
+    pub lowest_supported_version: u32,
+}
+
+const FMP_PAYLOAD_HEADER_SIGNATURE: [u8; 4] = *b"MSS1";
+const FMP_PAYLOAD_HEADER_MIN_SIZE: usize = 16;
 
 // ============================================================================
 // EFI_FIRMWARE_IMAGE_AUTHENTICATION
@@ -274,6 +292,31 @@ pub fn fmp_image_header_size(version: u32) -> usize {
         2 => FMP_IMAGE_HEADER_V2_SIZE,
         _ => FMP_IMAGE_HEADER_V1_SIZE,
     }
+}
+
+/// Parse signed EDK2 `MSS1` metadata and return the raw firmware payload.
+pub fn parse_fmp_payload_header(data: &[u8]) -> Result<(FmpPayloadHeader, &[u8]), CapsuleError> {
+    if data.len() < FMP_PAYLOAD_HEADER_MIN_SIZE || data[..4] != FMP_PAYLOAD_HEADER_SIGNATURE {
+        return Err(CapsuleError::InvalidFmpPayloadHeader);
+    }
+
+    let header_size = u32::from_le_bytes([data[4], data[5], data[6], data[7]]);
+    let header_size_usize =
+        usize::try_from(header_size).map_err(|_| CapsuleError::InvalidFmpPayloadHeader)?;
+    if header_size_usize < FMP_PAYLOAD_HEADER_MIN_SIZE || header_size_usize > data.len() {
+        return Err(CapsuleError::InvalidFmpPayloadHeader);
+    }
+
+    let firmware_version = u32::from_le_bytes([data[8], data[9], data[10], data[11]]);
+    let lowest_supported_version = u32::from_le_bytes([data[12], data[13], data[14], data[15]]);
+    Ok((
+        FmpPayloadHeader {
+            header_size,
+            firmware_version,
+            lowest_supported_version,
+        },
+        &data[header_size_usize..],
+    ))
 }
 
 /// Parse the authentication header from the start of an FMP update image.
@@ -458,11 +501,48 @@ mod tests {
 
     #[test]
     fn reject_fmp_image_header_version_zero() {
-        let mut data = [0u8; 32];
+        let data = [0u8; 32];
         // version = 0 (invalid)
         assert_eq!(
             parse_fmp_image_header(&data),
             Err(CapsuleError::InvalidFmpImageHeader)
+        );
+    }
+
+    #[test]
+    fn fmp_payload_header_extracts_attempted_version_and_strips_extensions() {
+        let mut data = alloc::vec![0u8; 20];
+        data[..4].copy_from_slice(b"MSS1");
+        data[4..8].copy_from_slice(&18u32.to_le_bytes());
+        data[8..12].copy_from_slice(&0x1234_5678u32.to_le_bytes());
+        data[12..16].copy_from_slice(&0x1000_0000u32.to_le_bytes());
+        data[16..18].copy_from_slice(&[0xaa, 0xbb]);
+        data[18..].copy_from_slice(&[0xcc, 0xdd]);
+
+        let (header, payload) = parse_fmp_payload_header(&data).unwrap();
+        assert_eq!(header.header_size, 18);
+        assert_eq!(header.firmware_version, 0x1234_5678);
+        assert_eq!(header.lowest_supported_version, 0x1000_0000);
+        assert_eq!(payload, &[0xcc, 0xdd]);
+    }
+
+    #[test]
+    fn fmp_payload_header_rejects_missing_or_out_of_bounds_metadata() {
+        assert_eq!(
+            parse_fmp_payload_header(&[0; 16]),
+            Err(CapsuleError::InvalidFmpPayloadHeader)
+        );
+        let mut data = [0u8; 16];
+        data[..4].copy_from_slice(b"MSS1");
+        data[4..8].copy_from_slice(&15u32.to_le_bytes());
+        assert_eq!(
+            parse_fmp_payload_header(&data),
+            Err(CapsuleError::InvalidFmpPayloadHeader)
+        );
+        data[4..8].copy_from_slice(&17u32.to_le_bytes());
+        assert_eq!(
+            parse_fmp_payload_header(&data),
+            Err(CapsuleError::InvalidFmpPayloadHeader)
         );
     }
 

@@ -26,7 +26,12 @@ static HEAP_INITIALIZED: AtomicBool = AtomicBool::new(false);
 /// When the `global-allocator` feature is enabled, this is registered as the
 /// allocator. External firmware that provides its own allocator should not
 /// enable that feature.
-#[cfg_attr(feature = "global-allocator", global_allocator)]
+// Host workspace tests can unify this feature through the coreboot package;
+// never replace the test harness allocator outside bare-metal targets.
+#[cfg_attr(
+    all(feature = "global-allocator", target_os = "none"),
+    global_allocator
+)]
 pub static ALLOCATOR: LockedHeap = LockedHeap::empty();
 
 /// Initialize the global allocator.

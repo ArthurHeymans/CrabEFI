@@ -27,7 +27,7 @@ use crate::platform::FmapRegion;
 use super::header::CapsuleError;
 
 /// An approved write region after RMAP + FMAP validation.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ApprovedRegion {
     /// FMAP region name.
     pub name: heapless::String<32>,

@@ -219,6 +219,16 @@ impl ImageTables {
     }
 
     pub fn install(&mut self, registration: ConfigurationRegistration) -> Result<(), efi::Status> {
+        if registration.table_address != 0
+            && !matches!(
+                registration.policy,
+                configuration_policy::PLATFORM_PHYSICAL
+                    | configuration_policy::IMAGE_RUNTIME
+                    | configuration_policy::EXTERNAL_PHYSICAL
+            )
+        {
+            return Err(efi::Status::UNSUPPORTED);
+        }
         if let Some(index) = self.configuration[..self.configuration_count]
             .iter()
             .position(|entry| *entry.vendor_guid.as_bytes() == registration.guid)
@@ -247,14 +257,6 @@ impl ImageTables {
         }
         if registration.table_address == 0 {
             return Err(efi::Status::NOT_FOUND);
-        }
-        if !matches!(
-            registration.policy,
-            configuration_policy::PLATFORM_PHYSICAL
-                | configuration_policy::IMAGE_RUNTIME
-                | configuration_policy::EXTERNAL_PHYSICAL
-        ) {
-            return Err(efi::Status::UNSUPPORTED);
         }
         let index = self.configuration_count;
         if index >= MAX_CONFIGURATION_TABLES {
@@ -465,4 +467,72 @@ fn exact_runtime_descriptor(
             }))
         })?
         .ok_or(efi::Status::NOT_FOUND)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const GUID: [u8; 16] = [1, 0, 0, 0, 2, 0, 3, 0, 4, 5, 6, 7, 8, 9, 10, 11];
+
+    #[test]
+    fn invalid_policy_update_is_rejected_without_mutation() {
+        let mut tables = ImageTables::new();
+        tables
+            .install(ConfigurationRegistration {
+                guid: GUID,
+                table_address: 0x1000,
+                policy: configuration_policy::PLATFORM_PHYSICAL,
+                reserved: 0,
+            })
+            .unwrap();
+
+        assert_eq!(
+            tables.install(ConfigurationRegistration {
+                guid: GUID,
+                table_address: 0x2000,
+                policy: u32::MAX,
+                reserved: 0,
+            }),
+            Err(efi::Status::UNSUPPORTED)
+        );
+        assert_eq!(tables.configuration_count, 1);
+        assert_eq!(tables.configuration[0].vendor_table as usize, 0x1000);
+        assert_eq!(
+            tables.configuration_metadata[0].policy,
+            configuration_policy::PLATFORM_PHYSICAL
+        );
+        assert_eq!(tables.configuration_metadata[0].physical_address, 0x1000);
+    }
+
+    #[test]
+    fn valid_update_and_deletion_preserve_existing_semantics() {
+        let mut tables = ImageTables::new();
+        tables
+            .install(ConfigurationRegistration {
+                guid: GUID,
+                table_address: 0x1000,
+                policy: configuration_policy::PLATFORM_PHYSICAL,
+                reserved: 0,
+            })
+            .unwrap();
+        tables
+            .install(ConfigurationRegistration {
+                guid: GUID,
+                table_address: 0x2000,
+                policy: configuration_policy::EXTERNAL_PHYSICAL,
+                reserved: 0,
+            })
+            .unwrap();
+        assert_eq!(tables.configuration[0].vendor_table as usize, 0x2000);
+        tables
+            .install(ConfigurationRegistration {
+                guid: GUID,
+                table_address: 0,
+                policy: u32::MAX,
+                reserved: 0,
+            })
+            .unwrap();
+        assert_eq!(tables.configuration_count, 0);
+    }
 }

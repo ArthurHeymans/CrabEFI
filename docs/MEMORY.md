@@ -17,21 +17,27 @@ allocator and cannot retain a heap object.
 
 The checked normalized image covers one contiguous allocation with page-aligned
 RX code, RO/NX immutable data, and RW/NX mutable data sections. The loader
-initially allocates RuntimeServicesData, splits the leading code range to
-RuntimeServicesCode, copies/zeros sections, and applies only normalized
-relocation slots. The image-owned MAT publishes the exact code/data protection domains even
-where the EFI memory map merges adjacent data descriptors. Later
-RuntimeServices allocations remain spec-legal during Boot Services; only the
-image's own retained state is required for its Runtime Services implementation.
+initially allocates RuntimeServicesData and uses a private allocator operation
+to split the leading code range to RuntimeServicesCode; public
+`AllocateAddress` cannot subclaim or independently free image-owned runtime
+data. The loader then copies/zeros sections and applies only normalized
+relocation slots. The image-owned MAT publishes the exact code/data protection
+domains even where the EFI memory map merges adjacent data descriptors.
 
-Every runtime descriptor is either:
+Every runtime descriptor is one of:
 
-- an image code/data section; or
-- an explicit external range from `RuntimePlatformConfig`.
+- an image code/data section;
+- an explicit external MMIO range from `RuntimePlatformConfig`; or
+- the mandatory retained deferred buffer.
 
-External MMIO ranges require a platform-declared physical address, size, and
-attributes. They are not inferred from payload linker symbols. Deferred journals
-and capsule-staging ranges are not supported surfaces.
+External MMIO ranges require a platform-declared page-aligned physical address,
+size, and runtime attributes. They are not inferred from payload linker
+symbols. The deferred buffer is a nonzero page-aligned, exclusively owned
+`RuntimeServicesData` range whose contents and physical address survive warm
+reset. It holds the bounded post-EBS variable journal, capsule staging
+metadata, and CrabEFI's private reservation capsule nested in a
+coreboot-compatible transport wrapper; the next boot replays or processes those
+records before completing variable import.
 
 ## ExitBootServices
 

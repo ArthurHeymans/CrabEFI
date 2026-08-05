@@ -24,11 +24,25 @@ pub fn reset(config: RuntimeResetConfig, reset_type: efi::ResetType) -> ! {
         reset_mechanism::PSCI_SMC => {
             // SAFETY: PSCI conduit and function IDs are value-only platform
             // configuration; this call has no memory operands.
-            unsafe { core::arch::asm!("smc #0", in("x0") function, options(nomem, nostack)) };
+            unsafe {
+                core::arch::asm!(
+                    "smc #0",
+                    inlateout("x0") function => _,
+                    clobber_abi("C"),
+                    options(nostack)
+                )
+            };
         }
         reset_mechanism::PSCI_HVC => {
             // SAFETY: same contract as the SMC conduit above.
-            unsafe { core::arch::asm!("hvc #0", in("x0") function, options(nomem, nostack)) };
+            unsafe {
+                core::arch::asm!(
+                    "hvc #0",
+                    inlateout("x0") function => _,
+                    clobber_abi("C"),
+                    options(nostack)
+                )
+            };
         }
         _ => {}
     }
