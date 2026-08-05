@@ -8,6 +8,7 @@ pub const HEADER_SIZE: usize = 64;
 pub const SECTION_SIZE: usize = 32;
 pub const RELOCATION_SIZE: usize = 24;
 pub const EXPORTS_SIZE: usize = 64;
+pub const EXPORTS_VERSION: u16 = 1;
 pub const MAX_SECTIONS: usize = 8;
 /// The normalized image permits a bounded relocation manifest. Current
 /// supported images use fewer than 32 slots; 128 leaves audited growth room
@@ -37,6 +38,11 @@ pub mod feature_bits {
     pub const TIME: u64 = 1 << 3;
     pub const REQUIRED: u64 = VARIABLES | VIRTUAL_MAP | RESET | TIME;
     pub const KNOWN: u64 = REQUIRED;
+}
+
+/// Stable wire values for normalized-image relocation records.
+pub mod relocation_kind {
+    pub const ABSOLUTE64: u16 = 1;
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -127,7 +133,7 @@ impl TryFrom<u16> for RelocationKind {
 
     fn try_from(value: u16) -> Result<Self, Self::Error> {
         match value {
-            1 => Ok(Self::Absolute64),
+            relocation_kind::ABSOLUTE64 => Ok(Self::Absolute64),
             _ => Err(AbiError::BadRelocation),
         }
     }
@@ -186,9 +192,10 @@ impl<'a> ValidatedImage<'a> {
             feature_bits: read_u64(bytes, 48)?,
         };
 
-        if header.image_size == 0
-            || header.required_alignment < EFI_PAGE_SIZE
-            || !header.required_alignment.is_power_of_two()
+        if header.image_size == 0 {
+            return Err(AbiError::ImageRange);
+        }
+        if header.required_alignment < EFI_PAGE_SIZE || !header.required_alignment.is_power_of_two()
         {
             return Err(AbiError::BadAlignment);
         }
@@ -198,7 +205,10 @@ impl<'a> ValidatedImage<'a> {
         if usize::from(header.section_count) > MAX_SECTIONS || header.section_count == 0 {
             return Err(AbiError::TooManySections);
         }
-        if usize::try_from(header.relocation_count).map_or(true, |n| n > MAX_RELOCATIONS) {
+        if usize::try_from(header.relocation_count)
+            .ok()
+            .is_none_or(|count| count > MAX_RELOCATIONS)
+        {
             return Err(AbiError::TooManyRelocations);
         }
         table_range(
@@ -278,7 +288,7 @@ impl<'a> ValidatedImage<'a> {
     pub fn exports(&self) -> Result<RuntimeExportsV1, AbiError> {
         let offset =
             usize::try_from(self.header.exports_offset).map_err(|_| AbiError::BadExports)?;
-        if read_u16(self.bytes, offset)? != 1
+        if read_u16(self.bytes, offset)? != EXPORTS_VERSION
             || usize::from(read_u16(self.bytes, offset + 2)?) != EXPORTS_SIZE
         {
             return Err(AbiError::BadExports);

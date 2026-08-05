@@ -53,7 +53,8 @@ unsafe impl GlobalAlloc for ScratchAllocator {
             // allocator and are returned to it by the matching deallocator.
             return unsafe { std::alloc::System.alloc(layout) };
         }
-        if !active() || layout.size() == 0 {
+        if !active() || layout.size() == 0 || layout.align() > core::mem::align_of::<ScratchBytes>()
+        {
             return ptr::null_mut();
         }
         let align = layout.align();
@@ -189,5 +190,24 @@ mod tests {
         assert_eq!(high_water_for_test(), 32);
         reset();
         set_limit_for_test(SCRATCH_SIZE);
+    }
+
+    #[test]
+    fn arena_rejects_alignment_above_its_base_alignment() {
+        let _guard = test_lock();
+        activate();
+        for alignment in [1, 16, 4096] {
+            let pointer = unsafe {
+                ALLOCATOR.alloc(Layout::from_size_align(1, alignment).expect("valid layout"))
+            };
+            assert!(!pointer.is_null());
+            assert_eq!(pointer as usize % alignment, 0);
+        }
+        let before = high_water_for_test();
+        let pointer =
+            unsafe { ALLOCATOR.alloc(Layout::from_size_align(1, 8192).expect("valid layout")) };
+        assert!(pointer.is_null());
+        assert_eq!(high_water_for_test(), before);
+        reset();
     }
 }

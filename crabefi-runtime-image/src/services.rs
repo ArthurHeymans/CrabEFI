@@ -5,7 +5,7 @@ use core::ffi::c_void;
 use crabefi_efi_types::{authentication::validate_signature_database, secure_boot};
 use crabefi_runtime_abi::{
     BridgeRequest, MAX_VARIABLE_DATA_SIZE, MAX_VARIABLE_NAME_LEN, VariableTimestamp,
-    bridge_operation, phase, time_mechanism,
+    bridge_operation, capsule, phase, time_mechanism,
 };
 
 use crate::{
@@ -450,7 +450,9 @@ fn apply_variable(
     if let Err(status) = validate_set_arguments(attributes, input.len()) {
         return status;
     }
-    if secure_boot::is_status_variable(&guid, name) {
+    if secure_boot::is_status_variable(&guid, name)
+        || capsule::is_esrt_last_attempt_variable(&guid, name)
+    {
         return efi::Status::WRITE_PROTECTED;
     }
     let secure_variable = secure_boot::identify_key_database(&guid, name);
@@ -668,13 +670,26 @@ pub fn replay_deferred(lease: &mut state::Lease) -> Result<usize, efi::Status> {
                 record.attributes,
                 &record.data,
             );
-            if status == efi::Status::SUCCESS {
-                Ok(())
-            } else {
-                Err(status)
-            }
+            replay_apply_result(status, authenticated, deletion)
         },
     )
+}
+
+fn replay_apply_result(
+    status: efi::Status,
+    authenticated: bool,
+    deletion: bool,
+) -> Result<(), efi::Status> {
+    if status == efi::Status::SUCCESS
+        || (!authenticated && deletion && status == efi::Status::NOT_FOUND)
+    {
+        // A raw deletion may have reached durable storage before reset while
+        // its retained acknowledgement was lost. The absent imported value is
+        // then the requested final state, so replay can consume the record.
+        Ok(())
+    } else {
+        Err(status)
+    }
 }
 
 pub extern "efiapi" fn get_next_high_mono_count(_high_count: *mut u32) -> efi::Status {
@@ -999,6 +1014,55 @@ mod tests {
     }
 
     #[test]
+    fn firmware_imports_private_attempt_state_but_public_writes_cannot_forge_it() {
+        let mut store = VariableStore::new();
+        let mut transaction = VariableTransaction::new();
+        let mut deferred_transaction = deferred::DeferredTransaction::new();
+        let mut buffer = vec![0u8; 4096];
+        let guid = capsule::CAPSULE_REPORT_VARIABLE_GUID;
+        let name = capsule::ESRT_LAST_ATTEMPT_VARIABLE_NAME;
+
+        store
+            .import(
+                &mut transaction,
+                guid,
+                name,
+                RAW_ATTRIBUTES,
+                b"firmware",
+                None,
+            )
+            .unwrap();
+
+        for (attributes, value) in [
+            (RAW_ATTRIBUTES, b"forged".as_slice()),
+            (
+                RAW_ATTRIBUTES | efi::VARIABLE_APPEND_WRITE,
+                b"append".as_slice(),
+            ),
+            (0, b"".as_slice()),
+        ] {
+            assert_eq!(
+                apply_variable(
+                    &mut store,
+                    &mut transaction,
+                    Some(&mut deferred_transaction),
+                    phase::BOOT_ACTIVE,
+                    successful_bridge as *const () as u64,
+                    (buffer.as_mut_ptr(), buffer.len()),
+                    guid,
+                    name,
+                    attributes,
+                    value,
+                ),
+                efi::Status::WRITE_PROTECTED
+            );
+        }
+
+        let slot = store.find(&guid, name, false).unwrap();
+        assert_eq!(store.data(slot), Some(b"firmware".as_slice()));
+    }
+
+    #[test]
     fn real_service_path_covers_all_secure_databases_and_exhaustion() {
         let _guard = crate::scratch::test_lock();
         crate::scratch::activate();
@@ -1150,6 +1214,70 @@ mod tests {
             efi::Status::OUT_OF_RESOURCES
         );
         crate::scratch::set_limit_for_test(crate::scratch::SCRATCH_SIZE);
+        crate::scratch::reset();
+    }
+
+    #[test]
+    fn replay_consumes_already_persisted_raw_delete_and_continues() {
+        const GUID: [u8; 16] = [0x42; 16];
+        let _guard = crate::scratch::test_lock();
+        crate::scratch::activate();
+        let mut buffer = vec![0u8; 64 * 1024];
+        let mut transaction = deferred::DeferredTransaction::new();
+        deferred::prepare_retained(buffer.as_mut_ptr(), buffer.len()).unwrap();
+        for (name, deletion) in [(&[b'D' as u16][..], true), (&[b'N' as u16][..], false)] {
+            deferred::queue_write(
+                buffer.as_mut_ptr(),
+                buffer.len(),
+                &mut transaction,
+                deferred::DeferredWrite {
+                    guid: GUID,
+                    name,
+                    attributes: if deletion { 0 } else { RAW_ATTRIBUTES },
+                    data: if deletion { &[] } else { b"next" },
+                    timestamp: VariableTimestamp::default(),
+                    authenticated: false,
+                    deletion,
+                },
+            )
+            .unwrap();
+        }
+
+        let mut seen = 0usize;
+        assert_eq!(
+            deferred::replay(
+                buffer.as_mut_ptr(),
+                buffer.len(),
+                &mut transaction,
+                |_, authenticated, deletion| {
+                    seen += 1;
+                    replay_apply_result(
+                        if deletion {
+                            efi::Status::NOT_FOUND
+                        } else {
+                            efi::Status::SUCCESS
+                        },
+                        authenticated,
+                        deletion,
+                    )
+                },
+            ),
+            Ok(2)
+        );
+        assert_eq!(seen, 2);
+        assert_eq!(
+            deferred::replay(
+                buffer.as_mut_ptr(),
+                buffer.len(),
+                &mut transaction,
+                |_, _, _| panic!("acknowledged records replayed twice"),
+            ),
+            Ok(0)
+        );
+        assert_eq!(
+            replay_apply_result(efi::Status::NOT_FOUND, true, true),
+            Err(efi::Status::NOT_FOUND)
+        );
         crate::scratch::reset();
     }
 

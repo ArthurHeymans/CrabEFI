@@ -302,6 +302,10 @@ extern "efiapi" fn free_pool(buffer: *mut c_void) -> Status {
 // Event Functions (mostly unsupported)
 // ============================================================================
 
+const fn boot_event_type_supported(event_type: u32) -> bool {
+    event_type & EVT_RUNTIME == 0
+}
+
 extern "efiapi" fn create_event(
     event_type: u32,
     notify_tpl: Tpl,
@@ -318,8 +322,8 @@ extern "efiapi" fn create_event(
     if event.is_null() {
         return Status::INVALID_PARAMETER;
     }
-    if event_type & EVT_RUNTIME != 0 || event_type == EVT_SIGNAL_VIRTUAL_ADDRESS_CHANGE {
-        return Status::UNSUPPORTED;
+    if !boot_event_type_supported(event_type) {
+        return Status::INVALID_PARAMETER;
     }
 
     // Allocate an event ID from centralized state
@@ -1600,6 +1604,18 @@ extern "efiapi" fn exit_boot_services(image_handle: Handle, map_key: usize) -> S
         map_key
     );
 
+    // Reject a stale key before callbacks, measurements, or any irreversible
+    // transition. The allocator repeats this check at the actual commit point
+    // in case an EBS callback changes the map.
+    let key_status = allocator::validate_map_key(map_key);
+    if key_status != Status::SUCCESS {
+        return key_status;
+    }
+    let Some(runtime_image) = crate::state::efi().runtime_image else {
+        log::error!("ExitBootServices refused: runtime image client is missing");
+        return Status::DEVICE_ERROR;
+    };
+
     // TCG measured boot: measure ExitBootServices action into PCR 5.
     super::tcg::measured_boot::measure_action_all(5, "Exit Boot Services Invocation");
 
@@ -1652,9 +1668,6 @@ extern "efiapi" fn exit_boot_services(image_handle: Handle, map_key: usize) -> S
         );
 
         log::info!("ExitBootServices SUCCESS - transitioning to OS");
-        let runtime_image = crate::state::efi()
-            .runtime_image
-            .expect("runtime image client missing after successful EBS");
         crate::timestamp::record(crate::timestamp::TS_CRABEFI_EXIT_BOOT_SERVICES);
 
         // Clean up hardware state for OS handoff.
@@ -1672,17 +1685,30 @@ extern "efiapi" fn exit_boot_services(image_handle: Handle, map_key: usize) -> S
         // re-enable bus mastering for drivers it owns.
         crate::drivers::pci::disable_all_bus_mastering_for_handoff();
 
-        // Let platform glue clean up integration-specific handoff state before
-        // the OS takes over (for example, disabling non-runtime log buffers).
+        // Seal only after the allocator accepted the map key, while boot-time
+        // diagnostics are still reachable. A failed seal leaves no safe way to
+        // return to the OS after allocator EBS, so report it and halt explicitly.
+        if let Err(seal_status) = runtime_image.seal() {
+            log::error!(
+                "FATAL: runtime image seal failed after allocator ExitBootServices: {:?}",
+                seal_status
+            );
+            loop {
+                crate::arch::halt();
+            }
+        }
+        log::info!("Runtime image sealed successfully");
+
+        // Let platform glue clean up integration-specific handoff state only
+        // after the final fallible step; hooks may disable non-runtime log
+        // buffers needed to diagnose a seal failure.
         if let Some(hooks) = crate::state::drivers().platform.hooks {
             hooks.on_exit_boot_services();
         }
 
-        // CRITICAL: Disable logging. After ExitBootServices returns, the OS
-        // only maps EFI_MEMORY_RUNTIME regions. The serial MMIO (PL011, COM1,
-        // or CBMEM console buffer) is typically NOT in a runtime region, so
-        // any log! call during a runtime service (especially SetVirtualAddressMap)
-        // would page-fault writing to unmapped memory.
+        // CRITICAL: Disable logging only after the final fallible runtime-image
+        // transition. The OS generally does not map firmware log devices as
+        // runtime memory.
         log::set_max_level(log::LevelFilter::Off);
 
         // Switch from Secure EL1 to Non-Secure EL1 via a RAM trampoline.
@@ -1701,12 +1727,6 @@ extern "efiapi" fn exit_boot_services(image_handle: Handle, map_key: usize) -> S
         // fstart's EL3 exception vector. No-op if no EL3 exists.
         #[cfg(target_arch = "aarch64")]
         crate::arch::aarch64::ns_switch::install_ns_trampoline();
-
-        // Last firmware action: clear every boot pointer and consume the one
-        // BootActive persistence bridge inside the runtime image.
-        runtime_image
-            .seal()
-            .expect("runtime image seal failed after successful ExitBootServices");
     } else {
         super::tcg::measured_boot::measure_action_all(
             5,
@@ -2470,4 +2490,19 @@ fn measure_pe_image_for_tcg(
         event_data: event_data_ptr,
         event_data_size,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn create_event_rejects_all_runtime_event_types() {
+        assert!(boot_event_type_supported(0));
+        assert!(boot_event_type_supported(EVT_NOTIFY_SIGNAL));
+        assert!(!boot_event_type_supported(EVT_RUNTIME));
+        assert!(!boot_event_type_supported(
+            EVT_SIGNAL_VIRTUAL_ADDRESS_CHANGE
+        ));
+    }
 }

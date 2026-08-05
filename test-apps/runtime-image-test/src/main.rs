@@ -227,7 +227,6 @@ const DEFERRED_TEST_GUID: efi::Guid = efi::Guid::from_fields(
 #[cfg(target_arch = "x86_64")]
 const DEFERRED_ATTRIBUTES: u32 =
     efi::VARIABLE_NON_VOLATILE | efi::VARIABLE_BOOTSERVICE_ACCESS | efi::VARIABLE_RUNTIME_ACCESS;
-#[cfg(target_arch = "x86_64")]
 const CAPSULE_REPORT_GUID: efi::Guid = efi::Guid::from_fields(
     0x39b68c46,
     0xf7fb,
@@ -236,6 +235,31 @@ const CAPSULE_REPORT_GUID: efi::Guid = efi::Guid::from_fields(
     0xec,
     &[0x16, 0xb0, 0xf6, 0x98, 0x21, 0xf3],
 );
+const ESRT_LAST_ATTEMPT_NAME: [u16; 23] = [
+    b'C' as u16,
+    b'r' as u16,
+    b'a' as u16,
+    b'b' as u16,
+    b'E' as u16,
+    b'f' as u16,
+    b'i' as u16,
+    b'E' as u16,
+    b's' as u16,
+    b'r' as u16,
+    b't' as u16,
+    b'L' as u16,
+    b'a' as u16,
+    b's' as u16,
+    b't' as u16,
+    b'A' as u16,
+    b't' as u16,
+    b't' as u16,
+    b'e' as u16,
+    b'm' as u16,
+    b'p' as u16,
+    b't' as u16,
+    0,
+];
 #[cfg(target_arch = "x86_64")]
 const REPLAY_MARKER_NAME: [u16; 15] = [
     b'R' as u16,
@@ -649,6 +673,24 @@ fn exercise_variables(runtime: *mut efi::RuntimeServices) -> bool {
         && output[..5] == [1, 2, 3, 4, 5]
         && delete == Status::SUCCESS
         && secure_boot_policy_holds(runtime)
+        && esrt_last_attempt_is_write_protected(runtime)
+}
+
+fn esrt_last_attempt_is_write_protected(runtime: *mut efi::RuntimeServices) -> bool {
+    let mut name = ESRT_LAST_ATTEMPT_NAME;
+    let mut guid = CAPSULE_REPORT_GUID;
+    let mut forged = [0u8; 12];
+    unsafe {
+        ((*runtime).set_variable)(
+            name.as_mut_ptr(),
+            &mut guid,
+            efi::VARIABLE_NON_VOLATILE
+                | efi::VARIABLE_BOOTSERVICE_ACCESS
+                | efi::VARIABLE_RUNTIME_ACCESS,
+            forged.len(),
+            forged.as_mut_ptr().cast(),
+        ) == Status::WRITE_PROTECTED
+    }
 }
 
 fn secure_boot_policy_holds(runtime: *mut efi::RuntimeServices) -> bool {

@@ -28,12 +28,10 @@ pub fn reset(config: RuntimeResetConfig, reset_type: efi::ResetType) -> ! {
         unsafe {
             core::arch::asm!(
                 "ecall",
-                in("a0") sbi_type,
-                in("a1") 0usize,
+                inlateout("a0") sbi_type => _,
+                inlateout("a1") 0usize => _,
                 in("a6") 0usize,
                 in("a7") 0x5352_5354usize,
-                lateout("a0") _,
-                lateout("a1") _,
                 options(nostack)
             )
         };

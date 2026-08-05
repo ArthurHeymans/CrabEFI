@@ -82,6 +82,7 @@ fn prepare_runtime_test_flash(source: &Path) -> Result<tempfile::NamedTempFile> 
             .context("existing SMMSTORE lies outside flash")?
             .fill(0xff);
     } else {
+        let next_count = count.checked_add(1).context("FMAP area count overflow")?;
         let entry = areas
             .checked_add(usize::from(count) * FMAP_AREA_SIZE)
             .context("FMAP entry offset overflow")?;
@@ -113,7 +114,7 @@ fn prepare_runtime_test_flash(source: &Path) -> Result<tempfile::NamedTempFile> 
         entry_bytes[8..40].fill(0);
         entry_bytes[8..8 + b"SMMSTORE".len()].copy_from_slice(b"SMMSTORE");
         entry_bytes[40..42].copy_from_slice(&0u16.to_le_bytes());
-        bytes[count_offset..count_offset + 2].copy_from_slice(&(count + 1).to_le_bytes());
+        bytes[count_offset..count_offset + 2].copy_from_slice(&next_count.to_le_bytes());
     }
 
     let flash = tempfile::NamedTempFile::new().context("failed to create runtime test flash")?;
@@ -797,7 +798,10 @@ fn capture_when_ready(
 pub fn run_tests(config: &QemuConfig, disk_path: &Path, app_name: &str) -> Result<()> {
     RUNTIME_IMAGE_TWO_BOOT.store(app_name == "runtime-image-test", Ordering::Relaxed);
     WRITABLE_TEST_FLASH.store(
-        matches!(app_name, "runtime-image-test" | "secure-boot-test"),
+        matches!(
+            app_name,
+            "capsule-test" | "runtime-image-test" | "secure-boot-test"
+        ),
         Ordering::Relaxed,
     );
     println!(
@@ -1724,5 +1728,68 @@ mod tests {
     fn test_kvm_check() {
         // Just ensure it doesn't panic
         let _ = is_kvm_available();
+    }
+
+    fn fmap_flash(count: u16, extra_bytes: usize) -> tempfile::NamedTempFile {
+        const HEADER: usize = 56;
+        const AREA: usize = 42;
+        let area_bytes = usize::from(count).saturating_mul(AREA);
+        let mut bytes = vec![0xff; HEADER + area_bytes + extra_bytes];
+        bytes[..8].copy_from_slice(b"__FMAP__");
+        bytes[54..56].copy_from_slice(&count.to_le_bytes());
+        let file = tempfile::NamedTempFile::new().unwrap();
+        fs::write(file.path(), bytes).unwrap();
+        file
+    }
+
+    #[test]
+    fn runtime_flash_rejects_fmap_count_overflow_before_mutation() {
+        let source = fmap_flash(u16::MAX, 256 * 1024);
+        let original = fs::read(source.path()).unwrap();
+        let error = prepare_runtime_test_flash(source.path()).unwrap_err();
+        assert!(error.to_string().contains("FMAP area count overflow"));
+        assert_eq!(fs::read(source.path()).unwrap(), original);
+    }
+
+    #[test]
+    fn runtime_flash_accepts_last_available_fmap_count() {
+        let source = fmap_flash(u16::MAX - 1, 256 * 1024);
+        let flash = prepare_runtime_test_flash(source.path()).unwrap();
+        let bytes = fs::read(flash.path()).unwrap();
+        assert_eq!(
+            u16::from_le_bytes(bytes[54..56].try_into().unwrap()),
+            u16::MAX
+        );
+    }
+
+    #[test]
+    fn runtime_flash_reuses_existing_smmstore_at_max_count() {
+        let source = fmap_flash(u16::MAX, 256 * 1024);
+        let mut bytes = fs::read(source.path()).unwrap();
+        let smmstore_offset = bytes.len() - 128 * 1024;
+        bytes[56..60].copy_from_slice(&(smmstore_offset as u32).to_le_bytes());
+        bytes[60..64].copy_from_slice(&(64 * 1024u32).to_le_bytes());
+        bytes[64..96].fill(0);
+        bytes[64..72].copy_from_slice(b"SMMSTORE");
+        bytes[smmstore_offset..smmstore_offset + 64 * 1024].fill(0);
+        fs::write(source.path(), bytes).unwrap();
+
+        let flash = prepare_runtime_test_flash(source.path()).unwrap();
+        let bytes = fs::read(flash.path()).unwrap();
+        assert!(
+            bytes[smmstore_offset..smmstore_offset + 64 * 1024]
+                .iter()
+                .all(|byte| *byte == 0xff)
+        );
+        assert_eq!(
+            u16::from_le_bytes(bytes[54..56].try_into().unwrap()),
+            u16::MAX
+        );
+    }
+
+    #[test]
+    fn runtime_flash_rejects_truncated_fmap_area_table() {
+        let source = fmap_flash(2, 0);
+        assert!(prepare_runtime_test_flash(source.path()).is_err());
     }
 }

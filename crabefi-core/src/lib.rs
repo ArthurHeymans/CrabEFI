@@ -134,14 +134,14 @@ fn log_stack_usage(phase: &str) {
         static _stack_top: u8;
     }
 
-    // SAFETY: platform-entry's x86_64 linker script defines the contiguous
-    // stack range and assembly fills it with 0xA5 before calling Rust.
-    let (bottom, total) = unsafe {
-        let bottom = &raw const _stack_bottom;
-        let top = &raw const _stack_top;
-        (bottom, top.offset_from(bottom) as usize)
-    };
-    // SAFETY: `bottom..bottom + total` is the linker-defined stack range.
+    let bottom = &raw const _stack_bottom;
+    let top = &raw const _stack_top;
+    let bottom_address = bottom as usize;
+    let total = checked_linker_range_size(bottom_address, top as usize)
+        .expect("stack linker symbols are reversed");
+    assert!(total != 0, "stack linker range must be nonzero");
+    // SAFETY: platform-entry's x86_64 linker script defines this complete
+    // integer-checked stack range and assembly fills it with 0xA5 first.
     let stack = unsafe { core::slice::from_raw_parts(bottom, total) };
     let used = stack
         .iter()
@@ -155,6 +155,19 @@ fn log_stack_usage(phase: &str) {
         total,
         total - used,
     );
+}
+
+#[cfg(any(all(feature = "platform-entry", target_arch = "x86_64"), test))]
+const fn checked_linker_range_size(start: usize, end: usize) -> Option<usize> {
+    end.checked_sub(start)
+}
+
+const fn supports_capsule_delivery(
+    writable_persistence: bool,
+    retained_staging_ready: bool,
+    backend_available: bool,
+) -> bool {
+    writable_persistence && retained_staging_ready && backend_available
 }
 
 /// Common boot tail: variable persistence, Secure Boot, and boot manager.
@@ -179,15 +192,33 @@ fn init_persistence_and_boot(
         }
     };
 
+    let persistence_writable = persistence_available && efi::varstore::is_varstore_writable();
+    if persistence_available && !persistence_writable {
+        log::warn!("Variable store is preserved read-only; capsule updates are disabled");
+    }
+
     let runtime = state::efi()
         .runtime_image
         .expect("runtime image missing before deferred replay");
+    let capsule_backend_available = capsule_backend.is_some();
+    let mut capsule_delivery_usable = false;
     if persistence_available {
-        if let Err(status) = runtime.prepare_retained_staging() {
-            log::warn!("Runtime image retained staging setup failed: {:?}", status);
-        }
-        if let Err(status) = runtime.replay_deferred() {
-            log::warn!("Runtime image deferred replay failed: {:?}", status);
+        if persistence_writable {
+            match runtime.prepare_retained_staging() {
+                Ok(()) => {
+                    capsule_delivery_usable = supports_capsule_delivery(
+                        persistence_writable,
+                        true,
+                        capsule_backend_available,
+                    );
+                }
+                Err(status) => {
+                    log::warn!("Runtime image retained staging setup failed: {:?}", status)
+                }
+            }
+            if let Err(status) = runtime.replay_deferred() {
+                log::warn!("Runtime image deferred replay failed: {:?}", status);
+            }
         }
 
         logger::apply_persisted_level();
@@ -201,12 +232,23 @@ fn init_persistence_and_boot(
         }
     }
 
-    if let Some(backend) = capsule_backend {
-        let applied = efi::capsule::process_pending_capsules(backend);
-        if applied != 0 {
-            log::info!("Applied {} pending firmware capsule(s)", applied);
+    if persistence_writable {
+        if let Some(backend) = capsule_backend {
+            let applied = efi::capsule::process_pending_capsules(backend);
+            if applied != 0 {
+                log::info!("Applied {} pending firmware capsule(s)", applied);
+            }
         }
+    } else if capsule_backend_available {
+        log::warn!("Skipping pending capsules because writable result persistence is unavailable");
     }
+
+    // Reinstall ESRT after persistent variables and this boot's capsule attempts
+    // are visible so its last-attempt fields are authoritative across reboots.
+    if let Some(firmware) = state::drivers().platform.efi_fw_info {
+        efi::esrt::install_esrt(&firmware, capsule_delivery_usable);
+    }
+    efi::capsule::disk::install_os_indications_supported(capsule_delivery_usable);
 
     // Persistent records and firmware-created status values have now been
     // copied into the authoritative Runtime Services store.
@@ -234,6 +276,25 @@ fn init_persistence_and_boot(
 
     loop {
         arch::halt();
+    }
+}
+
+#[cfg(test)]
+mod linker_range_tests {
+    use super::{checked_linker_range_size, supports_capsule_delivery};
+
+    #[test]
+    fn checked_linker_range_rejects_reversed_symbols() {
+        assert_eq!(checked_linker_range_size(0x1000, 0x2000), Some(0x1000));
+        assert_eq!(checked_linker_range_size(0x2000, 0x1000), None);
+    }
+
+    #[test]
+    fn capsule_delivery_requires_writable_staging_and_an_applying_backend() {
+        assert!(!supports_capsule_delivery(false, true, true));
+        assert!(!supports_capsule_delivery(true, false, true));
+        assert!(!supports_capsule_delivery(true, true, false));
+        assert!(supports_capsule_delivery(true, true, true));
     }
 }
 
@@ -472,17 +533,15 @@ fn init_platform_impl(mut config: PlatformConfig) -> ! {
         drivers::mouse_cursor::init(fb.width, fb.height);
     }
 
-    // ---- 9b. Install ESRT and advertise capsule update support ----
+    // ---- 9b. Install the initial ESRT ----
     //
     // The ESRT is built from platform-provided firmware info and installed as
-    // an EFI Configuration Table for fwupd/LVFS discovery.
-    // OsIndicationsSupported tells the OS what capsule delivery mechanisms
-    // are available.
+    // an EFI Configuration Table for fwupd/LVFS discovery. Delivery flags and
+    // OsIndicationsSupported are finalized after persistence is initialized.
     if let Some(fw_info) = state::drivers().platform.efi_fw_info {
-        efi::esrt::install_esrt(&fw_info);
+        efi::esrt::install_esrt(&fw_info, false);
         log::info!("ESRT installed for firmware updates");
     }
-    efi::capsule::disk::install_os_indications_supported();
 
     log::info!("CrabEFI initialized successfully!");
     log::info!("EFI System Table at: {:p}", efi::get_system_table());

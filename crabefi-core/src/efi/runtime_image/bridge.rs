@@ -40,7 +40,7 @@ pub extern "C" fn dispatch(request: *const BridgeRequest) -> usize {
         return Status::INVALID_PARAMETER.as_usize();
     }
     let timestamp = (request.timestamp_valid != 0).then_some(request.timestamp);
-    let guid = guid_from_bytes(request.guid);
+    let guid = Guid::from_bytes(&request.guid);
     let result = match request.operation {
         bridge_operation::PERSIST_WRITE => {
             crate::efi::varstore::persistence::write_variable_to_storage_internal(
@@ -74,15 +74,26 @@ pub extern "C" fn dispatch(request: *const BridgeRequest) -> usize {
     }
 }
 
-fn guid_from_bytes(bytes: [u8; 16]) -> Guid {
-    Guid::from_fields(
-        u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]),
-        u16::from_le_bytes([bytes[4], bytes[5]]),
-        u16::from_le_bytes([bytes[6], bytes[7]]),
-        bytes[8],
-        bytes[9],
-        &[
-            bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15],
-        ],
-    )
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn guid_bytes_use_r_efi_mixed_endian_conversion() {
+        let bytes = [
+            0x78, 0x56, 0x34, 0x12, 0xbc, 0x9a, 0xf0, 0xde, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66,
+            0x77, 0x88,
+        ];
+        let guid = Guid::from_bytes(&bytes);
+        assert_eq!(guid.as_bytes(), &bytes);
+        let expected = Guid::from_fields(
+            0x1234_5678,
+            0x9abc,
+            0xdef0,
+            0x11,
+            0x22,
+            &[0x33, 0x44, 0x55, 0x66, 0x77, 0x88],
+        );
+        assert_eq!(guid.as_bytes(), expected.as_bytes());
+    }
 }

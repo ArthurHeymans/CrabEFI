@@ -1,12 +1,17 @@
 //! Validate-then-commit SetVirtualAddressMap implementation.
 
-use crabefi_runtime_abi::{MAX_EXTERNAL_RANGES, MAX_SECTIONS, section_flags};
+use crabefi_runtime_abi::{
+    MAX_EXTERNAL_RANGES, MAX_RELOCATIONS, MAX_SECTIONS, RuntimeTimeConfig, relocation_kind,
+    section_flags, time_mechanism,
+};
 
 use crate::{efi, state};
 
 const MAX_DESCRIPTORS: usize = 256;
 const PAGE_SIZE: u64 = 4096;
-const MAX_TAIL_RELOCATIONS: usize = 32;
+// Every format-valid relocation can target transition-sensitive storage, so
+// the no-allocation commit tail must cover the ABI's complete relocation bound.
+const MAX_TAIL_RELOCATIONS: usize = MAX_RELOCATIONS;
 
 #[derive(Clone, Copy)]
 struct Mapping {
@@ -222,7 +227,7 @@ fn resolve_ranges(
             .physical_base
             .checked_add(range.byte_len)
             .ok_or(efi::Status::INVALID_PARAMETER)?;
-        let expected_type = 11;
+        let expected_type = efi::MEMORY_MAPPED_IO;
         resolved[index] = (0..count)
             .try_fold(None, |found, descriptor_index| {
                 let candidate = mapping(read_descriptor(map, stride, descriptor_index)?)?;
@@ -272,6 +277,43 @@ fn resolve_deferred_buffer(
         .ok_or(efi::Status::NOT_FOUND)
 }
 
+fn virtual_time_config(
+    runtime: &state::RuntimeState,
+    range_virtual_bases: &[u64; MAX_EXTERNAL_RANGES],
+) -> Result<RuntimeTimeConfig, efi::Status> {
+    let width = match runtime.time.mechanism {
+        time_mechanism::PL031 => 4,
+        time_mechanism::GOLDFISH_RTC => 8,
+        _ => return Ok(runtime.time),
+    };
+    let physical_end = runtime
+        .time
+        .io_or_mmio_base
+        .checked_add(width)
+        .ok_or(efi::Status::INVALID_PARAMETER)?;
+    let (index, range) = runtime.ranges[..runtime.range_count]
+        .iter()
+        .enumerate()
+        .find(|(_, range)| {
+            range.physical_base <= runtime.time.io_or_mmio_base
+                && range
+                    .physical_base
+                    .checked_add(range.byte_len)
+                    .is_some_and(|end| physical_end <= end)
+        })
+        .ok_or(efi::Status::NOT_FOUND)?;
+    let offset = runtime
+        .time
+        .io_or_mmio_base
+        .checked_sub(range.physical_base)
+        .ok_or(efi::Status::INVALID_PARAMETER)?;
+    let mut config = runtime.time;
+    config.io_or_mmio_base = range_virtual_bases[index]
+        .checked_add(offset)
+        .ok_or(efi::Status::INVALID_PARAMETER)?;
+    Ok(config)
+}
+
 fn validate_and_commit(
     state_pointer: *mut state::RuntimeState,
     runtime: &mut state::RuntimeState,
@@ -310,6 +352,8 @@ fn validate_and_commit(
             .ok_or(efi::Status::INVALID_PARAMETER)?;
     }
 
+    let virtual_time = virtual_time_config(runtime, &range_virtual_bases)?;
+
     let deferred_offset = runtime
         .deferred_buffer_physical
         .checked_sub(deferred_mapping.physical)
@@ -324,7 +368,7 @@ fn validate_and_commit(
         .checked_add(runtime.tables.runtime.hdr.header_size.into())
         .ok_or(efi::Status::INVALID_PARAMETER)?;
     let state_address = runtime as *mut state::RuntimeState as u64;
-    let atomic_addresses = state::transition_atomic_addresses();
+    let transition_tail_addresses = state::transition_tail_addresses();
     let store_address = core::ptr::addr_of!(state::RUNTIME_VARIABLE_STORE) as u64;
     let mut tail = [SlotPatch::empty(); MAX_TAIL_RELOCATIONS];
     let mut tail_count = 0usize;
@@ -354,7 +398,9 @@ fn validate_and_commit(
             .target_offset
             .checked_sub(target_section.image_offset)
             .ok_or(efi::Status::INVALID_PARAMETER)?;
-        if target_relative >= target_section.byte_len || relocation.kind != 1 {
+        if target_relative >= target_section.byte_len
+            || relocation.kind != relocation_kind::ABSOLUTE64
+        {
             return Err(efi::Status::INVALID_PARAMETER);
         }
         let patch_address = patch_section
@@ -371,7 +417,7 @@ fn validate_and_commit(
         if target_section.flags & section_flags::EXECUTE != 0
             || physical_target == state_address
             || physical_target == store_address
-            || atomic_addresses.contains(&physical_target)
+            || transition_tail_addresses.contains(&physical_target)
         {
             if tail_count >= tail.len() {
                 return Err(efi::Status::OUT_OF_RESOURCES);
@@ -397,6 +443,7 @@ fn validate_and_commit(
     {
         range.virtual_base = *virtual_base;
     }
+    runtime.time = virtual_time;
     runtime.deferred_buffer_virtual = deferred_virtual;
 
     let sections = runtime.sections;
@@ -425,7 +472,7 @@ fn validate_and_commit(
     });
 
     // Patch every non-tail slot while physical aliases are executable.
-    commit_matching(state_pointer, runtime, &section_virtual_bases, |address| {
+    commit_matching(runtime, &section_virtual_bases, |address| {
         !(address >= runtime_table_start && address < runtime_table_end)
             && !tail[..tail_count]
                 .iter()
@@ -439,7 +486,6 @@ fn validate_and_commit(
 }
 
 fn commit_matching(
-    state_pointer: *mut state::RuntimeState,
     runtime: &state::RuntimeState,
     virtual_bases: &[u64; MAX_SECTIONS],
     predicate: impl Fn(u64) -> bool,
@@ -456,28 +502,27 @@ fn commit_matching(
         let value = virtual_bases[usize::from(relocation.target_section)]
             .checked_add(u64::from(target_relative))
             .expect("validated relocation target overflowed during SVAM commit");
-        // SAFETY: validation proved this aligned-width slot and target before
-        // commit; `with_addr` retains provenance from the runtime image state
-        // allocation rather than constructing a pointer from an integer.
-        unsafe { write_slot_from_state(state_pointer, patch_address, value) };
+        // SAFETY: the loader exposed these firmware addresses and validation
+        // proved this complete aligned-width destination before commit.
+        unsafe { write_slot_at_address(patch_address, value) };
     }
 }
 
 #[inline(always)]
-unsafe fn write_slot_from_state(state_pointer: *mut state::RuntimeState, address: u64, value: u64) {
-    let slot = state_pointer
-        .cast::<u8>()
-        .with_addr(address as usize)
-        .cast::<u64>();
-    // SAFETY: callers validate the aligned-width slot against the image's
-    // allocation, and `slot` retains that allocation's provenance.
+unsafe fn write_slot_at_address(address: u64, value: u64) {
+    // The destination can be in any validated runtime-image section; it is not
+    // derived from RuntimeState's allocation. Reconstitute the loader-exposed
+    // firmware address with explicit exposed provenance instead.
+    let slot = core::ptr::with_exposed_provenance_mut::<u64>(address as usize);
+    // SAFETY: callers validated the complete width inside a writable relocation
+    // slot whose address provenance was exposed by the boot loader.
     unsafe { slot.write_unaligned(value) };
 }
 
 #[unsafe(no_mangle)]
 #[inline(never)]
 fn runtime_image_commit_tail_and_return(
-    state_pointer: *mut state::RuntimeState,
+    _state_pointer: *mut state::RuntimeState,
     tail: *const SlotPatch,
     count: usize,
 ) {
@@ -487,7 +532,7 @@ fn runtime_image_commit_tail_and_return(
         let slot = unsafe { tail.add(index).read() };
         // SAFETY: validation established this image-local slot and the caller
         // invokes this only while physical aliases remain valid.
-        unsafe { write_slot_from_state(state_pointer, slot.address, slot.value) };
+        unsafe { write_slot_at_address(slot.address, slot.value) };
         index += 1;
     }
 }
@@ -550,5 +595,67 @@ fn canonical_virtual(address: u64) -> bool {
         } else {
             high == (u64::MAX >> (bit + 1))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn converts_mmio_time_base_to_matching_virtual_range() {
+        let mut runtime = state::RuntimeState::new();
+        runtime.time = RuntimeTimeConfig {
+            mechanism: time_mechanism::PL031,
+            reserved: 0,
+            io_or_mmio_base: 0x20_0120,
+        };
+        runtime.range_count = 1;
+        runtime.ranges[0] = state::RangeRecord {
+            physical_base: 0x20_0000,
+            virtual_base: 0,
+            byte_len: 0x1000,
+            attributes: efi::MEMORY_RUNTIME,
+        };
+        let mut virtual_bases = [0; MAX_EXTERNAL_RANGES];
+        virtual_bases[0] = 0xffff_8000_0020_0000;
+        let converted = virtual_time_config(&runtime, &virtual_bases).unwrap();
+        assert_eq!(converted.io_or_mmio_base, 0xffff_8000_0020_0120);
+    }
+
+    #[test]
+    fn rejects_mmio_time_base_without_complete_range() {
+        let mut runtime = state::RuntimeState::new();
+        runtime.time = RuntimeTimeConfig {
+            mechanism: time_mechanism::GOLDFISH_RTC,
+            reserved: 0,
+            io_or_mmio_base: 0x20_0ffc,
+        };
+        runtime.range_count = 1;
+        runtime.ranges[0] = state::RangeRecord {
+            physical_base: 0x20_0000,
+            virtual_base: 0,
+            byte_len: 0x1000,
+            attributes: efi::MEMORY_RUNTIME,
+        };
+        assert_eq!(
+            virtual_time_config(&runtime, &[0; MAX_EXTERNAL_RANGES]),
+            Err(efi::Status::NOT_FOUND)
+        );
+    }
+
+    #[test]
+    fn transition_tail_covers_the_format_relocation_limit() {
+        assert_eq!(MAX_TAIL_RELOCATIONS, MAX_RELOCATIONS);
+    }
+
+    #[test]
+    fn exposed_provenance_slot_write_reaches_validated_destination() {
+        let mut value = 0u64;
+        let address = (&mut value as *mut u64) as usize as u64;
+        // SAFETY: casting the local pointer exposed its provenance and the
+        // destination is one complete writable u64.
+        unsafe { write_slot_at_address(address, 0xfeed_face_dead_beef) };
+        assert_eq!(value, 0xfeed_face_dead_beef);
     }
 }

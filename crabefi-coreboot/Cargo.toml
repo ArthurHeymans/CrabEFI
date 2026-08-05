@@ -32,6 +32,12 @@ acpi = { git = "https://github.com/ArthurHeymans/acpi.git", rev = "4f4adebf75234
   "aml",
 ] }
 
+# `cargo clippy --workspace` checks the no_std payload on the host target. The
+# host-only allocator below satisfies that final binary without enabling the
+# firmware allocator in std test harnesses.
+[target.'cfg(not(target_os = "none"))'.dependencies]
+linked_list_allocator = { version = "0.10.6", default-features = false, features = ["use_spin"] }
+
 [target.'cfg(target_arch = "x86_64")'.dependencies]
 x86_64 = "0.15"
 
@@ -46,3 +52,7 @@ sha2 = "0.10"
 [[bin]]
 name = "crabefi"
 path = "src/main.rs"
+# The no_std/no_main firmware binary cannot link Rust's host test harness.
+# Host-testable leaf modules are covered by ci/run-coreboot-feature-tests.sh.
+test = false
+bench = false

@@ -55,8 +55,11 @@ delete_block = delete_match.group(0)
 assert "variables::delete(&COREBOOT_CFR_GUID, &name)" in delete_block, (
     "CFR deletes must use the authoritative runtime-image facade"
 )
-assert "status != efi::Status::SUCCESS" in delete_block, (
-    "CFR deletes must propagate runtime-image failures"
+assert "matches!(status, efi::Status::SUCCESS | efi::Status::NOT_FOUND)" in delete_block, (
+    "CFR deletes must treat an already-absent override as the requested default state"
+)
+assert 'return Err("Failed to delete CFR variable")' in delete_block, (
+    "CFR deletes must still propagate failures other than NOT_FOUND"
 )
 
 print("CFR runtime-image variable facade regression checks passed")

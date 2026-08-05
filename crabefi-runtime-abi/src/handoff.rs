@@ -1,6 +1,6 @@
 //! Fixed-width initialization, platform, and bridge records.
 
-use crate::format::{EFI_PAGE_SIZE, MAX_SECTIONS};
+use crate::format::{EFI_PAGE_SIZE, MAX_SECTIONS, architecture};
 
 pub const HANDOFF_VERSION: u32 = 3;
 pub const MAX_EXTERNAL_RANGES: usize = 8;
@@ -200,6 +200,9 @@ impl RuntimeHandoff {
         {
             return Err(HandoffError::Count);
         }
+        self.image_base
+            .checked_add(u64::from(self.image_size))
+            .ok_or(HandoffError::Overflow)?;
         self.sections[..section_count]
             .iter()
             .try_fold(0u64, |watermark, section| {
@@ -219,14 +222,13 @@ impl RuntimeHandoff {
                     .image_base
                     .checked_add(start)
                     .ok_or(HandoffError::Overflow)?;
-                let physical_end = section
+                section
                     .physical_base
                     .checked_add(u64::from(section.byte_len))
                     .ok_or(HandoffError::Overflow)?;
                 if start < watermark
                     || end > u64::from(self.image_size)
                     || section.physical_base != expected_physical
-                    || physical_end < section.physical_base
                 {
                     return Err(HandoffError::Section);
                 }
@@ -292,7 +294,42 @@ impl RuntimeHandoff {
                     return Err(HandoffError::Range);
                 }
                 Ok(())
-            })
+            })?;
+
+        let mmio_width = match (self.architecture, self.time.mechanism) {
+            (_, time_mechanism::UNSUPPORTED) | (architecture::X86_64, time_mechanism::X86_CMOS) => {
+                None
+            }
+            (architecture::AARCH64, time_mechanism::PL031) => Some(4),
+            (architecture::RISCV64, time_mechanism::GOLDFISH_RTC) => Some(8),
+            _ => return Err(HandoffError::Mechanism),
+        };
+        match (self.architecture, self.reset.mechanism) {
+            (architecture::X86_64, reset_mechanism::X86_LEGACY)
+            | (architecture::AARCH64, reset_mechanism::PSCI_SMC | reset_mechanism::PSCI_HVC)
+            | (architecture::RISCV64, reset_mechanism::SBI_SRST) => {}
+            _ => return Err(HandoffError::Mechanism),
+        }
+        if let Some(width) = mmio_width {
+            let end = self
+                .time
+                .io_or_mmio_base
+                .checked_add(width)
+                .ok_or(HandoffError::Overflow)?;
+            if self.time.io_or_mmio_base == 0
+                || !self.time.io_or_mmio_base.is_multiple_of(4)
+                || !self.ranges[..range_count].iter().any(|range| {
+                    range.physical_base <= self.time.io_or_mmio_base
+                        && range
+                            .physical_base
+                            .checked_add(range.byte_len)
+                            .is_some_and(|range_end| end <= range_end)
+                })
+            {
+                return Err(HandoffError::Range);
+            }
+        }
+        Ok(())
     }
 }
 
@@ -313,6 +350,7 @@ pub enum HandoffError {
     Section,
     Range,
     Overflow,
+    Mechanism,
 }
 
 #[repr(C)]

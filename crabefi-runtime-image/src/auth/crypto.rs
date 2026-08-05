@@ -14,6 +14,8 @@ const MAX_CHAIN_DEPTH: usize = 5;
 const MAX_RSA_BITS: usize = 4096;
 
 const OID_SIGNED_DATA: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x07, 0x02];
+const OID_DATA: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x07, 0x01];
+const OID_CONTENT_TYPE: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x09, 0x03];
 const OID_MESSAGE_DIGEST: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x09, 0x04];
 const OID_SHA256: &[u8] = &[0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01];
 const OID_SUBJECT_KEY_IDENTIFIER: &[u8] = &[0x55, 0x1d, 0x0e];
@@ -208,7 +210,7 @@ fn parse_tlv(bytes: &[u8]) -> Result<(Tlv<'_>, &[u8]), AuthError> {
         let mut length = 0usize;
         for byte in &bytes[2..2 + count] {
             length = length
-                .checked_shl(8)
+                .checked_mul(256)
                 .and_then(|value| value.checked_add(usize::from(*byte)))
                 .ok_or(AuthError::InvalidHeader)?;
         }
@@ -263,15 +265,17 @@ fn encapsulated_content_hash(
     detached: &[u8],
 ) -> Result<[u8; 32], AuthError> {
     let mut fields = Reader::new(encapsulated.value);
-    let _content_type = expect(fields.next()?, 0x06)?;
-    let hash = if let Some(explicit) = fields.optional(0xa0)? {
-        let content = parse_tlv(explicit.value)?.0;
-        Sha256::digest(content.value).into()
-    } else {
-        Sha256::digest(detached).into()
-    };
+    if expect(fields.next()?, 0x06)?.value != OID_DATA {
+        return Err(AuthError::InvalidHeader);
+    }
+    // UEFI authenticated-variable updates use detached CMS. Accepting eContent
+    // would authenticate attacker-selected attached bytes instead of the
+    // variable name/GUID/attributes/timestamp/payload assembled by the caller.
+    if fields.optional(0xa0)?.is_some() {
+        return Err(AuthError::InvalidHeader);
+    }
     fields.finish()?;
-    Ok(hash)
+    Ok(Sha256::digest(detached).into())
 }
 
 fn parse_signer(sequence: Tlv<'_>) -> Result<SignerView<'_>, AuthError> {
@@ -309,6 +313,7 @@ fn signed_attributes_digest(
     let Some(attributes) = attributes else {
         return Ok(*content_hash);
     };
+    let mut found_content_type = false;
     let mut found_digest = false;
     let mut entries = Reader::new(attributes.value);
     while !entries.remaining.is_empty() {
@@ -317,7 +322,21 @@ fn signed_attributes_digest(
         let oid = expect(fields.next()?, 0x06)?;
         let values = expect(fields.next()?, 0x31)?;
         fields.finish()?;
-        if oid.value == OID_MESSAGE_DIGEST {
+        if oid.value == OID_CONTENT_TYPE {
+            if found_content_type {
+                return Err(AuthError::InvalidHeader);
+            }
+            let mut values = Reader::new(values.value);
+            let content_type = expect(values.next()?, 0x06)?;
+            values.finish()?;
+            if content_type.value != OID_DATA {
+                return Err(AuthError::InvalidHeader);
+            }
+            found_content_type = true;
+        } else if oid.value == OID_MESSAGE_DIGEST {
+            if found_digest {
+                return Err(AuthError::InvalidHeader);
+            }
             let mut values = Reader::new(values.value);
             let digest = expect(values.next()?, 0x04)?;
             values.finish()?;
@@ -327,7 +346,7 @@ fn signed_attributes_digest(
             found_digest = true;
         }
     }
-    if !found_digest {
+    if !found_content_type || !found_digest {
         return Err(AuthError::InvalidHeader);
     }
     let mut hash = Sha256::new();

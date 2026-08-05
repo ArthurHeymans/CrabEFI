@@ -10,7 +10,7 @@ pub mod storage;
 pub(crate) use persistence::import_variable_into_runtime;
 pub use persistence::{
     get_variable_timestamp, get_varstore_stats, init as init_persistence, is_storage_available,
-    is_varstore_initialized,
+    is_varstore_initialized, is_varstore_writable,
 };
 pub use storage::{SpiStorageBackend, StorageBackend, StorageError};
 

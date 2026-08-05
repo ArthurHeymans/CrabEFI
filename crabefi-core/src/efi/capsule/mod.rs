@@ -20,6 +20,11 @@ pub mod header;
 pub mod result;
 pub mod rmap;
 
+use crabefi_runtime_abi::capsule::{
+    CAPSULE_HEADER_SIZE, RETAINED_RESERVATION_CAPSULE_GUID, RETAINED_RESERVATION_MARKER,
+    RETAINED_RESERVATION_WRAPPER_GUID,
+};
+
 use crate::platform::CapsuleBackend;
 
 pub use header::{CapsuleError, CapsuleType};
@@ -70,14 +75,14 @@ pub fn process_pending_capsules(backend: &mut dyn CapsuleBackend) -> usize {
             };
 
             if is_retained_reservation_capsule(capsule_data) {
-                log::debug!("Consumed retained-journal reservation capsule");
+                log::info!("Recognized retained-journal reservation capsule; skipping application");
                 continue;
             }
 
             let result = apply::apply_capsule(capsule_data, backend);
             result::record_capsule_result(i, &result);
 
-            if result.status == CapsuleResultStatus::Success {
+            if result.status == CapsuleResultStatus::Success && result.updates_esrt {
                 applied_count += 1;
             }
         }
@@ -102,7 +107,7 @@ pub fn process_pending_capsules(backend: &mut dyn CapsuleBackend) -> usize {
             let result = apply::apply_capsule(&capsule.data, backend);
             result::record_capsule_result(result_index, &result);
 
-            if result.status == CapsuleResultStatus::Success {
+            if result.status == CapsuleResultStatus::Success && result.updates_esrt {
                 applied_count += 1;
             }
         }
@@ -123,9 +128,86 @@ pub fn process_pending_capsules(backend: &mut dyn CapsuleBackend) -> usize {
 }
 
 fn is_retained_reservation_capsule(data: &[u8]) -> bool {
-    let Ok(header) = header::parse_capsule_header(data) else {
+    let Ok(wrapper) = header::parse_capsule_header(data) else {
         return false;
     };
-    header.capsule_guid.as_bytes() == header::WINDOWS_UX_CAPSULE_GUID.as_bytes()
-        && data.get(header.header_size as usize..header.header_size as usize + 4) == Some(b"CRDJ")
+    if wrapper.capsule_guid.as_bytes() != &RETAINED_RESERVATION_WRAPPER_GUID
+        || wrapper.header_size as usize != CAPSULE_HEADER_SIZE
+        || wrapper.flags != header::CAPSULE_FLAGS_PERSIST_ACROSS_RESET
+        || header::validate_capsule(&wrapper, data.len()).is_err()
+    {
+        return false;
+    }
+    let Some(private_data) =
+        data.get(wrapper.header_size as usize..wrapper.capsule_image_size as usize)
+    else {
+        return false;
+    };
+    let Ok(private) = header::parse_capsule_header(private_data) else {
+        return false;
+    };
+    private.capsule_guid.as_bytes() == &RETAINED_RESERVATION_CAPSULE_GUID
+        && private.header_size as usize == CAPSULE_HEADER_SIZE
+        && private.flags == header::CAPSULE_FLAGS_PERSIST_ACROSS_RESET
+        && private.capsule_image_size as usize == private_data.len()
+        && header::validate_capsule(&private, private_data.len()).is_ok()
+        && private_data
+            .get(CAPSULE_HEADER_SIZE..CAPSULE_HEADER_SIZE + RETAINED_RESERVATION_MARKER.len())
+            == Some(RETAINED_RESERVATION_MARKER.as_slice())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn reservation(inner_guid: &[u8; 16], marker: &[u8; 4]) -> [u8; 64] {
+        let mut data = [0u8; 64];
+        let wrapper_size = data.len() as u32;
+        data[..16].copy_from_slice(&RETAINED_RESERVATION_WRAPPER_GUID);
+        data[16..20].copy_from_slice(&(CAPSULE_HEADER_SIZE as u32).to_le_bytes());
+        data[20..24].copy_from_slice(&header::CAPSULE_FLAGS_PERSIST_ACROSS_RESET.to_le_bytes());
+        data[24..28].copy_from_slice(&wrapper_size.to_le_bytes());
+        let private = &mut data[CAPSULE_HEADER_SIZE..];
+        let private_size = private.len() as u32;
+        private[..16].copy_from_slice(inner_guid);
+        private[16..20].copy_from_slice(&(CAPSULE_HEADER_SIZE as u32).to_le_bytes());
+        private[20..24].copy_from_slice(&header::CAPSULE_FLAGS_PERSIST_ACROSS_RESET.to_le_bytes());
+        private[24..28].copy_from_slice(&private_size.to_le_bytes());
+        private[CAPSULE_HEADER_SIZE..CAPSULE_HEADER_SIZE + marker.len()].copy_from_slice(marker);
+        data
+    }
+
+    #[test]
+    fn retained_reservation_requires_wrapper_private_guid_and_marker() {
+        assert_eq!(
+            &RETAINED_RESERVATION_WRAPPER_GUID,
+            header::EDK2_CAPSULE_ON_DISK_GUID.as_bytes()
+        );
+        assert!(is_retained_reservation_capsule(&reservation(
+            &RETAINED_RESERVATION_CAPSULE_GUID,
+            &RETAINED_RESERVATION_MARKER,
+        )));
+        assert!(!is_retained_reservation_capsule(&reservation(
+            header::WINDOWS_UX_CAPSULE_GUID.as_bytes(),
+            &RETAINED_RESERVATION_MARKER,
+        )));
+        assert!(!is_retained_reservation_capsule(&reservation(
+            &RETAINED_RESERVATION_CAPSULE_GUID,
+            b"NOPE",
+        )));
+        let mut wrong_wrapper = reservation(
+            &RETAINED_RESERVATION_CAPSULE_GUID,
+            &RETAINED_RESERVATION_MARKER,
+        );
+        wrong_wrapper[..16].copy_from_slice(header::WINDOWS_UX_CAPSULE_GUID.as_bytes());
+        assert!(!is_retained_reservation_capsule(&wrong_wrapper));
+        let mut truncated_private = reservation(
+            &RETAINED_RESERVATION_CAPSULE_GUID,
+            &RETAINED_RESERVATION_MARKER,
+        );
+        let private_image_size = CAPSULE_HEADER_SIZE + 24;
+        truncated_private[private_image_size..private_image_size + 4]
+            .copy_from_slice(&32u32.to_le_bytes());
+        assert!(!is_retained_reservation_capsule(&truncated_private));
+    }
 }

@@ -34,7 +34,7 @@ use crabefi_runtime_abi::VariableTimestamp;
 use r_efi::efi::Guid;
 
 use super::enrollment::{self, EnrollmentStatus};
-use super::variables::{db_database, dbx_database, kek_database, pk_database};
+use super::variables::{KeyDatabase, db_database, dbx_database, kek_database, pk_database};
 use super::{AuthError, enter_setup_mode, enter_user_mode, is_setup_mode};
 use crate::efi::varstore::get_variable_timestamp;
 
@@ -43,6 +43,27 @@ const SECURE_BOOT_KEY_ATTRS: u32 = super::attributes::NON_VOLATILE
     | super::attributes::BOOTSERVICE_ACCESS
     | super::attributes::RUNTIME_ACCESS
     | super::attributes::TIME_BASED_AUTHENTICATED_WRITE_ACCESS;
+
+struct DatabaseSnapshot {
+    initialized: bool,
+    data: Option<Vec<u8>>,
+}
+
+impl DatabaseSnapshot {
+    const fn new() -> Self {
+        Self {
+            initialized: false,
+            data: None,
+        }
+    }
+
+    fn matches(&self, data: Option<&[u8]>) -> bool {
+        self.initialized && self.data.as_deref() == data
+    }
+}
+
+static KEY_DATABASE_SNAPSHOTS: spin::Mutex<[DatabaseSnapshot; 4]> =
+    spin::Mutex::new([const { DatabaseSnapshot::new() }; 4]);
 
 /// Secure Boot initialization configuration
 #[derive(Debug, Clone)]
@@ -156,119 +177,81 @@ pub fn init_secure_boot_default() -> Result<EnrollmentStatus, AuthError> {
 /// databases. It also restores timestamps for proper
 /// monotonic timestamp validation on future authenticated variable updates.
 fn load_keys_from_variables() -> EnrollmentStatus {
-    pk_database().clear();
-    kek_database().clear();
-    db_database().clear();
-    dbx_database().clear();
-
-    // Load PK
-    if let Some(data) = get_variable_data(&Guid::from_bytes(&EFI_GLOBAL_VARIABLE_GUID), PK_NAME)
-        && !data.is_empty()
-    {
-        let mut pk = pk_database();
-        if let Err(e) = pk.load_from_signature_lists(&data) {
-            log::warn!("Failed to parse PK variable: {:?}", e);
-        } else {
-            log::debug!("Loaded {} PK entries", pk.len());
-            // Restore timestamp from stored variable for monotonic validation
-            if let Some(ts) =
-                get_variable_timestamp(&Guid::from_bytes(&EFI_GLOBAL_VARIABLE_GUID), PK_NAME)
-            {
-                pk.set_timestamp(efi_time_from_timestamp(ts));
-                log::debug!(
-                    "Restored PK timestamp: {}-{:02}-{:02}",
-                    ts.year,
-                    ts.month,
-                    ts.day
-                );
-            }
-        }
+    for variable in [
+        SecureBootVariable::PK,
+        SecureBootVariable::Kek,
+        SecureBootVariable::Db,
+        SecureBootVariable::Dbx,
+    ] {
+        refresh_key_database(variable, true, true);
     }
-
-    // Load KEK
-    if let Some(data) = get_variable_data(&Guid::from_bytes(&EFI_GLOBAL_VARIABLE_GUID), KEK_NAME)
-        && !data.is_empty()
-    {
-        let mut kek = kek_database();
-        if let Err(e) = kek.load_from_signature_lists(&data) {
-            log::warn!("Failed to parse KEK variable: {:?}", e);
-        } else {
-            log::debug!("Loaded {} KEK entries", kek.len());
-            // Restore timestamp
-            if let Some(ts) =
-                get_variable_timestamp(&Guid::from_bytes(&EFI_GLOBAL_VARIABLE_GUID), KEK_NAME)
-            {
-                kek.set_timestamp(efi_time_from_timestamp(ts));
-                log::debug!(
-                    "Restored KEK timestamp: {}-{:02}-{:02}",
-                    ts.year,
-                    ts.month,
-                    ts.day
-                );
-            }
-        }
-    }
-
-    // Load db
-    if let Some(data) = get_variable_data(
-        &Guid::from_bytes(&EFI_IMAGE_SECURITY_DATABASE_GUID),
-        DB_NAME,
-    ) && !data.is_empty()
-    {
-        let mut db = db_database();
-        if let Err(e) = db.load_from_signature_lists(&data) {
-            log::warn!("Failed to parse db variable: {:?}", e);
-        } else {
-            log::debug!("Loaded {} db entries", db.len());
-            // Restore timestamp
-            if let Some(ts) = get_variable_timestamp(
-                &Guid::from_bytes(&EFI_IMAGE_SECURITY_DATABASE_GUID),
-                DB_NAME,
-            ) {
-                db.set_timestamp(efi_time_from_timestamp(ts));
-                log::debug!(
-                    "Restored db timestamp: {}-{:02}-{:02}",
-                    ts.year,
-                    ts.month,
-                    ts.day
-                );
-            }
-        }
-    }
-
-    // Load dbx
-    if let Some(data) = get_variable_data(
-        &Guid::from_bytes(&EFI_IMAGE_SECURITY_DATABASE_GUID),
-        DBX_NAME,
-    ) && !data.is_empty()
-    {
-        let mut dbx = dbx_database();
-        if let Err(e) = dbx.load_from_signature_lists(&data) {
-            log::warn!("Failed to parse dbx variable: {:?}", e);
-        } else {
-            log::debug!("Loaded {} dbx entries", dbx.len());
-            // Restore timestamp
-            if let Some(ts) = get_variable_timestamp(
-                &Guid::from_bytes(&EFI_IMAGE_SECURITY_DATABASE_GUID),
-                DBX_NAME,
-            ) {
-                dbx.set_timestamp(efi_time_from_timestamp(ts));
-                log::debug!(
-                    "Restored dbx timestamp: {}-{:02}-{:02}",
-                    ts.year,
-                    ts.month,
-                    ts.day
-                );
-            }
-        }
-    }
-
     enrollment::get_enrollment_status()
 }
 
-/// Refresh boot-only Authenticode key caches from standard GetVariable calls.
+fn key_database(variable: SecureBootVariable) -> spin::MutexGuard<'static, KeyDatabase> {
+    match variable {
+        SecureBootVariable::PK => pk_database(),
+        SecureBootVariable::Kek => kek_database(),
+        SecureBootVariable::Db => db_database(),
+        SecureBootVariable::Dbx => dbx_database(),
+    }
+}
+
+fn refresh_key_database(
+    variable: SecureBootVariable,
+    restore_persistent_timestamp: bool,
+    force: bool,
+) {
+    let guid = Guid::from_bytes(variable.guid());
+    let data = get_variable_data(&guid, variable.name());
+    if !force && KEY_DATABASE_SNAPSHOTS.lock()[variable.index()].matches(data.as_deref()) {
+        return;
+    }
+
+    let mut database = key_database(variable);
+    database.clear();
+    if let Some(value) = data.as_deref()
+        && !value.is_empty()
+    {
+        if let Err(error) = database.load_from_signature_lists(value) {
+            log::warn!("Failed to parse {:?} variable: {:?}", variable, error);
+        } else {
+            log::debug!("Loaded {} {:?} entries", database.len(), variable);
+            if restore_persistent_timestamp
+                && let Some(timestamp) = get_variable_timestamp(&guid, variable.name())
+            {
+                database.set_timestamp(efi_time_from_timestamp(timestamp));
+                log::debug!(
+                    "Restored {:?} timestamp: {}-{:02}-{:02}",
+                    variable,
+                    timestamp.year,
+                    timestamp.month,
+                    timestamp.day
+                );
+            }
+        }
+    }
+    drop(database);
+
+    let mut snapshots = KEY_DATABASE_SNAPSHOTS.lock();
+    snapshots[variable.index()] = DatabaseSnapshot {
+        initialized: true,
+        data,
+    };
+}
+
+/// Refresh boot-only Authenticode key caches from authoritative runtime-store
+/// snapshots. Unchanged values are not reparsed, and this verification-only
+/// path deliberately avoids persistent-store timestamp walks.
 pub(crate) fn refresh_key_databases() {
-    let _ = load_keys_from_variables();
+    for variable in [
+        SecureBootVariable::PK,
+        SecureBootVariable::Kek,
+        SecureBootVariable::Db,
+        SecureBootVariable::Dbx,
+    ] {
+        refresh_key_database(variable, false, false);
+    }
 }
 
 /// Get variable data from the authoritative runtime image store.
@@ -412,7 +395,11 @@ fn persist_key_variable(
         SECURE_BOOT_KEY_ATTRS,
         &envelope,
     );
-    if status == r_efi::efi::Status::SUCCESS {
+    if status == r_efi::efi::Status::SUCCESS
+        || (data.is_empty() && status == r_efi::efi::Status::NOT_FOUND)
+    {
+        // Clear-all is idempotent in Setup Mode; preserve ordinary public
+        // SetVariable semantics while accepting an already-absent key here.
         Ok(())
     } else if status == r_efi::efi::Status::OUT_OF_RESOURCES {
         Err(AuthError::BufferTooSmall)
@@ -462,14 +449,18 @@ pub fn get_enrollment_summary() -> (usize, usize, usize, usize) {
 /// After clearing, the system returns to Setup Mode and Secure Boot
 /// is disabled.
 pub fn clear_all_keys() -> Result<(), AuthError> {
+    if !is_setup_mode() {
+        log::warn!("Refusing unsigned Secure Boot key clearing in User Mode");
+        return Err(AuthError::AccessDenied);
+    }
     log::warn!("Clearing all Secure Boot keys!");
 
     let zero_timestamp = EfiTime::zero();
     for variable in [
-        SecureBootVariable::PK,
-        SecureBootVariable::Kek,
-        SecureBootVariable::Db,
         SecureBootVariable::Dbx,
+        SecureBootVariable::Db,
+        SecureBootVariable::Kek,
+        SecureBootVariable::PK,
     ] {
         if let Err(error) = persist_key_variable(variable, &[], &zero_timestamp) {
             // A preceding delete may already have changed live image policy.
@@ -487,7 +478,9 @@ pub fn clear_all_keys() -> Result<(), AuthError> {
 
 #[cfg(test)]
 mod tests {
+    use super::DatabaseSnapshot;
     use crate::efi::utils::ucs2_eq;
+    use alloc::vec;
 
     #[test]
     fn test_ucs2_eq() {
@@ -497,5 +490,17 @@ mod tests {
         assert!(ucs2_eq(&name1, &name1));
         assert!(ucs2_eq(&name2, &name1));
         assert!(ucs2_eq(&name1, &name2));
+    }
+
+    #[test]
+    fn database_snapshot_detects_authoritative_content_changes() {
+        let mut snapshot = DatabaseSnapshot::new();
+        assert!(!snapshot.matches(None));
+        snapshot.initialized = true;
+        assert!(snapshot.matches(None));
+        snapshot.data = Some(vec![1, 2, 3]);
+        assert!(snapshot.matches(Some(&[1, 2, 3])));
+        assert!(!snapshot.matches(Some(&[1, 2, 4])));
+        assert!(!snapshot.matches(None));
     }
 }

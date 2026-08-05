@@ -1041,7 +1041,7 @@ pub fn delete_option_value(option: &CfrOption) -> Result<(), &'static str> {
 
     let name = ascii_to_ucs2(&option.opt_name);
     let status = variables::delete(&COREBOOT_CFR_GUID, &name);
-    if status != efi::Status::SUCCESS {
+    if !matches!(status, efi::Status::SUCCESS | efi::Status::NOT_FOUND) {
         log::warn!(
             "Failed to delete CFR variable '{}': {:?}",
             option.opt_name,

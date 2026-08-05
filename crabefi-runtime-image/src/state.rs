@@ -7,6 +7,7 @@ use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use crabefi_runtime_abi::{
     LoadedSection, MAX_EXTERNAL_RANGES, MAX_RELOCATIONS, MAX_SECTIONS, RelocationImport,
     RuntimeExternalRange, RuntimeHandoff, RuntimeResetConfig, RuntimeTimeConfig, phase,
+    relocation_kind,
 };
 
 use crate::{
@@ -160,6 +161,10 @@ impl RuntimeState {
         {
             *destination = range_from_handoff(source);
         }
+        // Publish ResetSystem's lock-free snapshot before BootActive can be
+        // observed. The snapshot is outside RuntimeState so a re-entrant reset
+        // never reads through an outstanding mutable state lease.
+        RUNTIME_RESET_CONFIG.publish(handoff.reset);
         self.initialized = true;
         Ok(())
     }
@@ -170,7 +175,7 @@ impl RuntimeState {
         }
         if usize::from(relocation.patch_section) >= self.section_count
             || usize::from(relocation.target_section) >= self.section_count
-            || relocation.kind != 1
+            || relocation.kind != relocation_kind::ABSOLUTE64
         {
             return Err(efi::Status::INVALID_PARAMETER);
         }
@@ -215,6 +220,39 @@ fn range_from_handoff(range: &RuntimeExternalRange) -> RangeRecord {
         virtual_base: 0,
         byte_len: range.byte_len,
         attributes: range.attributes,
+    }
+}
+
+#[repr(transparent)]
+pub struct ResetConfigCell(UnsafeCell<RuntimeResetConfig>);
+
+// SAFETY: the value is published exactly once while the image is
+// Uninitialized, before BootActive is released, and is immutable afterward.
+unsafe impl Sync for ResetConfigCell {}
+
+impl ResetConfigCell {
+    const fn new() -> Self {
+        Self(UnsafeCell::new(RuntimeResetConfig {
+            mechanism: 0,
+            reserved: 0,
+            io_or_mmio_base: 0,
+        }))
+    }
+
+    fn publish(&self, config: RuntimeResetConfig) {
+        // SAFETY: RuntimeState::initialize is single-shot and serialized by the
+        // operation lock before BootActive publication.
+        unsafe { self.0.get().write(config) };
+    }
+
+    fn read(&self) -> RuntimeResetConfig {
+        // SAFETY: callers can observe this only after initialization publishes
+        // the immutable value before BootActive.
+        unsafe { self.0.get().read() }
+    }
+
+    fn address(&self) -> u64 {
+        self.0.get() as u64
     }
 }
 
@@ -270,6 +308,8 @@ impl RuntimeStoreCell {
 
 #[unsafe(no_mangle)]
 pub static RUNTIME_VARIABLE_STORE: RuntimeStoreCell = RuntimeStoreCell::new();
+#[unsafe(no_mangle)]
+pub static RUNTIME_RESET_CONFIG: ResetConfigCell = ResetConfigCell::new();
 #[unsafe(no_mangle)]
 pub static RUNTIME_STATE: RuntimeCell = RuntimeCell::new();
 #[unsafe(no_mangle)]
@@ -369,15 +409,14 @@ pub fn phase_value() -> u8 {
 /// Read the immutable reset configuration without taking the operation lease.
 /// ResetSystem must remain available even if a failing caller holds that lease.
 pub fn reset_config() -> RuntimeResetConfig {
-    // SAFETY: initialization writes this field before publishing BootActive and
-    // it is immutable for the lifetime of the image.
-    unsafe { (*RUNTIME_STATE.get()).reset }
+    RUNTIME_RESET_CONFIG.read()
 }
 
-pub fn transition_atomic_addresses() -> [u64; 2] {
+pub fn transition_tail_addresses() -> [u64; 3] {
     [
         core::ptr::addr_of!(RUNTIME_OPERATION_LOCK) as u64,
         core::ptr::addr_of!(RUNTIME_PHASE) as u64,
+        RUNTIME_RESET_CONFIG.address(),
     ]
 }
 
@@ -404,4 +443,25 @@ pub fn abort_virtual_transition() {
 pub fn publish_virtual_and_unlock() {
     RUNTIME_PHASE.store(phase::VIRTUAL, Ordering::Release);
     RUNTIME_OPERATION_LOCK.store(false, Ordering::Release);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reset_snapshot_is_independent_of_mutably_borrowed_runtime_state() {
+        let snapshot = ResetConfigCell::new();
+        let expected = RuntimeResetConfig {
+            mechanism: 3,
+            reserved: 0,
+            io_or_mmio_base: 0xcf9,
+        };
+        snapshot.publish(expected);
+
+        let mut runtime = RuntimeState::new();
+        let runtime_lease = &mut runtime;
+        runtime_lease.reset.io_or_mmio_base = 0x1234;
+        assert_eq!(snapshot.read(), expected);
+    }
 }

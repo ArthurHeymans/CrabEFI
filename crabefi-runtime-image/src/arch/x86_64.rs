@@ -111,9 +111,16 @@ pub fn read_time(config: RuntimeTimeConfig, out: &mut efi::Time) -> Result<(), e
     Err(efi::Status::DEVICE_ERROR)
 }
 
+fn reset_port(configured: u64) -> u16 {
+    match u16::try_from(configured) {
+        Ok(0) | Err(_) => 0xcf9,
+        Ok(port) => port,
+    }
+}
+
 pub fn reset(config: RuntimeResetConfig, reset_type: efi::ResetType) -> ! {
     if config.mechanism == reset_mechanism::X86_LEGACY {
-        let port = u16::try_from(config.io_or_mmio_base).unwrap_or(0xcf9);
+        let port = reset_port(config.io_or_mmio_base);
         // QEMU and most modern chipsets implement reset control at the
         // platform-provided CF9-compatible reset port.
         // SAFETY: initialization supplies the selected x86 reset mechanism.
@@ -137,5 +144,18 @@ pub fn reset(config: RuntimeResetConfig, reset_type: efi::ResetType) -> ! {
     loop {
         // SAFETY: halting is the terminal fallback after ResetSystem.
         unsafe { core::arch::asm!("cli; hlt", options(nomem, nostack)) };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::reset_port;
+
+    #[test]
+    fn reset_port_uses_cf9_for_missing_or_invalid_configuration() {
+        assert_eq!(reset_port(0), 0xcf9);
+        assert_eq!(reset_port(0xcf9), 0xcf9);
+        assert_eq!(reset_port(0x1234), 0x1234);
+        assert_eq!(reset_port(u64::from(u16::MAX) + 1), 0xcf9);
     }
 }

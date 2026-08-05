@@ -23,6 +23,8 @@ const OID_SIGNED_DATA: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x07,
 const OID_DATA: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x07, 0x01];
 const OID_SHA256: &[u8] = &[0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01];
 const OID_SHA1: &[u8] = &[0x2b, 0x0e, 0x03, 0x02, 0x1a];
+const OID_CONTENT_TYPE: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x09, 0x03];
+const OID_MESSAGE_DIGEST: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x09, 0x04];
 const OID_SHA256_WITH_RSA: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x0b];
 const OID_BASIC_CONSTRAINTS: &[u8] = &[0x55, 0x1d, 0x13];
 
@@ -61,8 +63,22 @@ fn algorithm(oid: &[u8]) -> Vec<u8> {
 }
 
 fn signed_data(digest_oid: &[u8], certificates: &[Vec<u8>], signers: &[Vec<u8>]) -> Vec<u8> {
+    signed_data_with_encapsulated(digest_oid, certificates, signers, OID_DATA, None)
+}
+
+fn signed_data_with_encapsulated(
+    digest_oid: &[u8],
+    certificates: &[Vec<u8>],
+    signers: &[Vec<u8>],
+    content_type: &[u8],
+    attached: Option<&[u8]>,
+) -> Vec<u8> {
     let digest_set = tlv(0x31, &algorithm(digest_oid));
-    let encapsulated = tlv(0x30, &tlv(0x06, OID_DATA));
+    let mut encapsulated_fields = tlv(0x06, content_type);
+    if let Some(content) = attached {
+        encapsulated_fields.extend_from_slice(&tlv(0xa0, &tlv(0x04, content)));
+    }
+    let encapsulated = tlv(0x30, &encapsulated_fields);
     let certificate_set = tlv(0xa0, &certificates.concat());
     let signer_set = tlv(0x31, &signers.concat());
     let body = tlv(
@@ -98,13 +114,7 @@ fn subject_public_key(key: &rsa::RsaPublicKey) -> Vec<u8> {
     tlv(0x30, &concat(&[tlv(0x30, &[]), tlv(0x03, &bits)]))
 }
 
-fn certificate(
-    key: &rsa::RsaPrivateKey,
-    serial: u8,
-    issuer: u8,
-    subject: u8,
-    ca: bool,
-) -> Vec<u8> {
+fn certificate(key: &rsa::RsaPrivateKey, serial: u8, issuer: u8, subject: u8, ca: bool) -> Vec<u8> {
     let public = rsa::RsaPublicKey::from(key);
     let mut tbs_fields = concat(&[
         integer(&[serial]),
@@ -118,10 +128,7 @@ fn certificate(
         let constraints = tlv(0x30, &tlv(0x01, &[0xff]));
         let extension = tlv(
             0x30,
-            &concat(&[
-                tlv(0x06, OID_BASIC_CONSTRAINTS),
-                tlv(0x04, &constraints),
-            ]),
+            &concat(&[tlv(0x06, OID_BASIC_CONSTRAINTS), tlv(0x04, &constraints)]),
         );
         tbs_fields.extend_from_slice(&tlv(0xa3, &tlv(0x30, &extension)));
     }
@@ -144,23 +151,43 @@ fn certificate(
 }
 
 fn signer(issuer: u8, serial: u8, signature: &[u8]) -> Vec<u8> {
+    signer_with_attributes(issuer, serial, None, signature)
+}
+
+fn signer_with_attributes(
+    issuer: u8,
+    serial: u8,
+    attributes: Option<&[u8]>,
+    signature: &[u8],
+) -> Vec<u8> {
     let identity = tlv(0x30, &concat(&[name(issuer), integer(&[serial])]));
+    let mut fields = concat(&[integer(&[1]), identity, algorithm(OID_SHA256)]);
+    if let Some(attributes) = attributes {
+        fields.extend_from_slice(&tlv(0xa0, attributes));
+    }
+    fields.extend_from_slice(&tlv(0x30, &[]));
+    fields.extend_from_slice(&tlv(0x04, signature));
+    tlv(0x30, &fields)
+}
+
+fn attribute(oid: &[u8], values: &[Vec<u8>]) -> Vec<u8> {
     tlv(
         0x30,
-        &concat(&[
-            integer(&[1]),
-            identity,
-            algorithm(OID_SHA256),
-            tlv(0x30, &[]),
-            tlv(0x04, signature),
-        ]),
+        &concat(&[tlv(0x06, oid), tlv(0x31, &values.concat())]),
     )
 }
 
+fn required_attributes(content: &[u8]) -> Vec<u8> {
+    let digest: [u8; 32] = Sha256::digest(content).into();
+    concat(&[
+        attribute(OID_CONTENT_TYPE, &[tlv(0x06, OID_DATA)]),
+        attribute(OID_MESSAGE_DIGEST, &[tlv(0x04, &digest)]),
+    ])
+}
+
 fn assert_rejected_without_panic(pkcs7: &[u8], trusted: &[u8]) {
-    let outcome = std::panic::catch_unwind(|| {
-        auth::crypto::verify_pkcs7_signature(pkcs7, &[], trusted)
-    });
+    let outcome =
+        std::panic::catch_unwind(|| auth::crypto::verify_pkcs7_signature(pkcs7, &[], trusted));
     let verification = outcome.expect("adversarial DER input must not panic");
     assert!(
         verification.is_err() || verification == Ok(false),
@@ -209,9 +236,8 @@ fn chain_deeper_than_five_is_rejected_without_panic() {
         .expect("test key signs content prehash")
         .to_vec();
     let input = signed_data(OID_SHA256, &certificates, &[signer(2, 1, &signature)]);
-    let outcome = std::panic::catch_unwind(|| {
-        auth::crypto::verify_pkcs7_signature(&input, &[], &trusted)
-    });
+    let outcome =
+        std::panic::catch_unwind(|| auth::crypto::verify_pkcs7_signature(&input, &[], &trusted));
     assert_eq!(
         outcome.expect("over-depth chain must not panic"),
         Err(auth::AuthError::ChainTooDeep)
@@ -222,6 +248,113 @@ fn chain_deeper_than_five_is_rejected_without_panic() {
 fn non_sha256_digest_set_is_rejected_without_panic() {
     let input = signed_data(OID_SHA1, &[], &[]);
     assert_rejected_without_panic(&input, &[]);
+}
+
+#[test]
+fn valid_detached_cms_is_accepted() {
+    let key = test_key();
+    let trusted = certificate(&key, 1, 1, 1, false);
+    let content = b"authenticated variable bytes";
+    let digest: [u8; 32] = Sha256::digest(content).into();
+    let signature = rsa::pkcs1v15::SigningKey::<Sha256>::new(key)
+        .sign_prehash(&digest)
+        .unwrap()
+        .to_vec();
+    let cms = signed_data(
+        OID_SHA256,
+        std::slice::from_ref(&trusted),
+        &[signer(1, 1, &signature)],
+    );
+    assert_eq!(
+        auth::crypto::verify_pkcs7_signature(&cms, content, &trusted),
+        Ok(true)
+    );
+}
+
+#[test]
+fn attached_content_and_wrong_encapsulated_type_are_rejected() {
+    let attached = signed_data_with_encapsulated(OID_SHA256, &[], &[], OID_DATA, Some(b"attached"));
+    assert_eq!(
+        auth::crypto::verify_pkcs7_signature(&attached, b"detached", &[]),
+        Err(auth::AuthError::InvalidHeader)
+    );
+    let wrong_type = signed_data_with_encapsulated(OID_SHA256, &[], &[], OID_SIGNED_DATA, None);
+    assert_eq!(
+        auth::crypto::verify_pkcs7_signature(&wrong_type, b"detached", &[]),
+        Err(auth::AuthError::InvalidHeader)
+    );
+}
+
+#[test]
+fn signed_attributes_require_unique_matching_content_type_and_digest() {
+    let key = test_key();
+    let trusted = certificate(&key, 1, 1, 1, false);
+    let content = b"signed attributes content";
+    let valid = required_attributes(content);
+    let valid_der = tlv(0x31, &valid);
+    let valid_digest: [u8; 32] = Sha256::digest(&valid_der).into();
+    let valid_signature = rsa::pkcs1v15::SigningKey::<Sha256>::new(key.clone())
+        .sign_prehash(&valid_digest)
+        .unwrap()
+        .to_vec();
+    let valid_cms = signed_data(
+        OID_SHA256,
+        std::slice::from_ref(&trusted),
+        &[signer_with_attributes(1, 1, Some(&valid), &valid_signature)],
+    );
+    assert_eq!(
+        auth::crypto::verify_pkcs7_signature(&valid_cms, content, &trusted),
+        Ok(true)
+    );
+
+    let content_type = attribute(OID_CONTENT_TYPE, &[tlv(0x06, OID_DATA)]);
+    let digest: [u8; 32] = Sha256::digest(content).into();
+    let message_digest = attribute(OID_MESSAGE_DIGEST, &[tlv(0x04, &digest)]);
+    let malformed = [
+        message_digest.clone(),
+        content_type.clone(),
+        concat(&[
+            content_type.clone(),
+            content_type.clone(),
+            message_digest.clone(),
+        ]),
+        concat(&[
+            content_type.clone(),
+            message_digest.clone(),
+            message_digest.clone(),
+        ]),
+        concat(&[
+            attribute(OID_CONTENT_TYPE, &[tlv(0x06, OID_SIGNED_DATA)]),
+            message_digest.clone(),
+        ]),
+        concat(&[
+            attribute(
+                OID_CONTENT_TYPE,
+                &[tlv(0x06, OID_DATA), tlv(0x06, OID_DATA)],
+            ),
+            message_digest.clone(),
+        ]),
+        concat(&[
+            content_type.clone(),
+            attribute(OID_MESSAGE_DIGEST, &[tlv(0x04, &[0; 32])]),
+        ]),
+        concat(&[
+            content_type,
+            attribute(
+                OID_MESSAGE_DIGEST,
+                &[tlv(0x04, &digest), tlv(0x04, &digest)],
+            ),
+        ]),
+    ];
+    for attributes in malformed {
+        let cms = signed_data(
+            OID_SHA256,
+            std::slice::from_ref(&trusted),
+            &[signer_with_attributes(1, 1, Some(&attributes), &[])],
+        );
+        let result = auth::crypto::verify_pkcs7_signature(&cms, content, &trusted);
+        assert!(result.is_err(), "malformed signed attributes were accepted");
+    }
 }
 
 fn test_key() -> rsa::RsaPrivateKey {

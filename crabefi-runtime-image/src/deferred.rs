@@ -3,7 +3,13 @@
 use alloc::vec::Vec;
 
 use crabefi_efi_types::crc32;
-use crabefi_runtime_abi::VariableTimestamp;
+use crabefi_runtime_abi::{
+    VariableTimestamp,
+    capsule::{
+        CAPSULE_HEADER_SIZE, RETAINED_RESERVATION_CAPSULE_GUID, RETAINED_RESERVATION_MARKER,
+        RETAINED_RESERVATION_WRAPPER_GUID,
+    },
+};
 use serde::{Deserialize, Serialize};
 
 use crate::{efi, scratch};
@@ -21,11 +27,6 @@ const HEADER_SIZE: usize = 32;
 const CAPSULE_DESCRIPTOR_SIZE: usize = 16;
 const RESERVATION_CAPSULE_OFFSET: usize = 4096;
 const JOURNAL_OFFSET: usize = 8192;
-const CAPSULE_HEADER_SIZE: usize = 28;
-const RESERVATION_MARKER: [u8; 4] = *b"CRDJ";
-const WINDOWS_UX_CAPSULE_GUID: [u8; 16] = [
-    0x62, 0x81, 0x8c, 0x3b, 0x8c, 0x18, 0xa4, 0x46, 0xae, 0xc9, 0xbe, 0x43, 0xf1, 0xd6, 0x56, 0x97,
-];
 const CAPSULE_FLAGS_PERSIST_ACROSS_RESET: u32 = 0x0001_0000;
 
 pub mod entry_flags {
@@ -201,7 +202,10 @@ pub fn prepare_retained(base: *mut u8, size: usize) -> Result<u64, efi::Status> 
 
 fn write_reservation_capsule(base: *mut u8, size: usize) {
     let capsule_size = (size - RESERVATION_CAPSULE_OFFSET) as u32;
-    // SAFETY: prepare_retained checked all fixed offsets against size.
+    let private_capsule_size = capsule_size - CAPSULE_HEADER_SIZE as u32;
+    // SAFETY: prepare_retained checked all fixed offsets against size. The
+    // recognized outer wrapper lets coreboot reserve and coalesce the range;
+    // the nested private GUID and marker remain the reservation identity.
     unsafe {
         write_descriptor(
             base,
@@ -209,21 +213,44 @@ fn write_reservation_capsule(base: *mut u8, size: usize) {
             u64::from(capsule_size),
             base.add(RESERVATION_CAPSULE_OFFSET) as u64,
         );
-        let capsule = base.add(RESERVATION_CAPSULE_OFFSET);
-        core::ptr::copy_nonoverlapping(WINDOWS_UX_CAPSULE_GUID.as_ptr(), capsule, 16);
-        capsule
+        let wrapper = base.add(RESERVATION_CAPSULE_OFFSET);
+        core::ptr::copy_nonoverlapping(
+            RETAINED_RESERVATION_WRAPPER_GUID.as_ptr(),
+            wrapper,
+            RETAINED_RESERVATION_WRAPPER_GUID.len(),
+        );
+        wrapper
             .add(16)
             .cast::<u32>()
             .write_unaligned(CAPSULE_HEADER_SIZE as u32);
-        capsule
+        wrapper
             .add(20)
             .cast::<u32>()
             .write_unaligned(CAPSULE_FLAGS_PERSIST_ACROSS_RESET);
-        capsule.add(24).cast::<u32>().write_unaligned(capsule_size);
+        wrapper.add(24).cast::<u32>().write_unaligned(capsule_size);
+
+        let private = wrapper.add(CAPSULE_HEADER_SIZE);
         core::ptr::copy_nonoverlapping(
-            RESERVATION_MARKER.as_ptr(),
-            capsule.add(CAPSULE_HEADER_SIZE),
-            RESERVATION_MARKER.len(),
+            RETAINED_RESERVATION_CAPSULE_GUID.as_ptr(),
+            private,
+            RETAINED_RESERVATION_CAPSULE_GUID.len(),
+        );
+        private
+            .add(16)
+            .cast::<u32>()
+            .write_unaligned(CAPSULE_HEADER_SIZE as u32);
+        private
+            .add(20)
+            .cast::<u32>()
+            .write_unaligned(CAPSULE_FLAGS_PERSIST_ACROSS_RESET);
+        private
+            .add(24)
+            .cast::<u32>()
+            .write_unaligned(private_capsule_size);
+        core::ptr::copy_nonoverlapping(
+            RETAINED_RESERVATION_MARKER.as_ptr(),
+            private.add(CAPSULE_HEADER_SIZE),
+            RETAINED_RESERVATION_MARKER.len(),
         );
     }
 }
@@ -349,6 +376,11 @@ pub fn queue_write(
         timestamp,
         crc: 0,
     };
+    // The checksum covers the postcard encoding with a zero CRC field. After
+    // storing that checksum we serialize again to obtain the persisted record.
+    // Postcard uses varints, so the zero-CRC and stored-record encodings can
+    // legitimately have different lengths; each length belongs only to its
+    // respective serialization domain.
     let crc_len = postcard::to_slice(&record, &mut transaction.bytes)
         .map_err(|_| efi::Status::OUT_OF_RESOURCES)?
         .len();
@@ -457,9 +489,10 @@ pub fn replay(
             entry.flags & entry_flags::IS_AUTHENTICATED != 0,
             entry.flags & entry_flags::IS_DELETION != 0,
         )?;
-        // The callback completed durable persistence. The acknowledgement bit
-        // is excluded from the journal CRC, so this one-byte retained write is
-        // an atomic consume point and cannot invalidate later records.
+        // The callback completed durable persistence. Journal CRC calculation
+        // normalizes the acknowledgement bit to zero, so this one-byte logical
+        // consume marker does not invalidate later records. Retention across a
+        // reset is provided by the platform's deferred-buffer contract.
         unsafe {
             base.add(entry_offset)
                 .write_volatile(entry.flags | entry_flags::ACKNOWLEDGED)
@@ -613,6 +646,35 @@ mod tests {
             buffer,
             JOURNAL_OFFSET + HEADER_SIZE + header.total_size as usize,
         )
+    }
+
+    #[test]
+    fn retained_reservation_wraps_private_guid_and_marker() {
+        let _guard = crate::scratch::test_lock();
+        let mut buffer = vec![0u8; 64 * 1024];
+        prepare_retained(buffer.as_mut_ptr(), buffer.len()).unwrap();
+        let wrapper = &buffer[RESERVATION_CAPSULE_OFFSET..];
+        assert_eq!(&wrapper[..16], RETAINED_RESERVATION_WRAPPER_GUID.as_slice());
+        assert_eq!(
+            u32::from_le_bytes(wrapper[24..28].try_into().unwrap()) as usize,
+            wrapper.len()
+        );
+        let private = &wrapper[CAPSULE_HEADER_SIZE..];
+        assert_eq!(&private[..16], RETAINED_RESERVATION_CAPSULE_GUID.as_slice());
+        assert_eq!(
+            u32::from_le_bytes(private[24..28].try_into().unwrap()) as usize,
+            private.len()
+        );
+        assert_eq!(
+            &private[CAPSULE_HEADER_SIZE..CAPSULE_HEADER_SIZE + 4],
+            RETAINED_RESERVATION_MARKER.as_slice()
+        );
+        const WINDOWS_UX_GUID: [u8; 16] = [
+            0x62, 0x81, 0x8c, 0x3b, 0x8c, 0x18, 0xa4, 0x46, 0xae, 0xc9, 0xbe, 0x43, 0xf1, 0xd6,
+            0x56, 0x97,
+        ];
+        assert_ne!(&private[..16], WINDOWS_UX_GUID.as_slice());
+        crate::scratch::reset();
     }
 
     #[test]

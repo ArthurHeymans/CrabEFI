@@ -12,6 +12,14 @@
 
 extern crate alloc;
 
+// Host-side workspace linting checks this no_std/no_main final binary without
+// linking a bare-metal target. Keep that check allocator local to the payload
+// so std test harnesses never inherit CrabEFI's uninitialized firmware heap.
+#[cfg(not(target_os = "none"))]
+#[global_allocator]
+static HOST_CHECK_ALLOCATOR: linked_list_allocator::LockedHeap =
+    linked_list_allocator::LockedHeap::empty();
+
 #[cfg(not(target_arch = "riscv64"))]
 mod acpi;
 #[cfg(target_arch = "aarch64")]
@@ -58,12 +66,19 @@ fn runtime_platform_config() -> crabefi::RuntimePlatformConfig<'static> {
         static _deferred_buffer_end: u8;
     }
 
-    let deferred_buffer = unsafe {
-        let start = core::ptr::addr_of!(_deferred_buffer_start);
-        let end = core::ptr::addr_of!(_deferred_buffer_end);
+    let deferred_buffer = {
+        let start = core::ptr::addr_of!(_deferred_buffer_start) as usize;
+        let end = core::ptr::addr_of!(_deferred_buffer_end) as usize;
+        let size = end
+            .checked_sub(start)
+            .expect("deferred-buffer linker symbols are reversed");
+        assert!(
+            start.is_multiple_of(4096) && size != 0 && size.is_multiple_of(4096),
+            "deferred-buffer linker range must be nonzero and page aligned"
+        );
         crabefi::DeferredBufferConfig {
             base: start as u64,
-            size: end.offset_from(start) as usize,
+            size,
         }
     };
 

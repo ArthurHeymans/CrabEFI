@@ -153,6 +153,8 @@ pub fn split_allocation<T: Copy>(
 
 #[cfg(test)]
 mod tests {
+    extern crate alloc;
+
     use super::*;
 
     const ORIGINAL: PageAllocation<u32> = PageAllocation {
@@ -260,7 +262,7 @@ mod tests {
         assert_eq!(parts[1].unwrap().range.end, parts[2].unwrap().range.start);
         assert_eq!(parts[1].unwrap(), replacement);
 
-        let records = parts.into_iter().flatten().collect::<std::vec::Vec<_>>();
+        let records = parts.into_iter().flatten().collect::<alloc::vec::Vec<_>>();
         assert_eq!(exact_cover(&records, ORIGINAL.range), Some(ORIGINAL));
     }
 

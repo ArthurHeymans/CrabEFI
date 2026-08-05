@@ -1,5 +1,6 @@
 //! Build, audit, and normalize the separately linked runtime image.
 
+use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -12,14 +13,15 @@ use object::{
 use serde_json::json;
 use sha2::{Digest, Sha256};
 
+use crabefi_runtime_abi::format::{
+    EFI_PAGE_SIZE, EXPORTS_SIZE, EXPORTS_VERSION, FORMAT_VERSION, HEADER_SIZE, MAGIC, MAX_SECTIONS,
+    RELOCATION_SIZE, SECTION_SIZE, ValidatedImage, architecture,
+    relocation_kind as abi_relocation_kind, section_flags as abi_section_flags,
+};
+
 use crate::{Arch, project_root};
 
-const MAGIC: &[u8; 8] = b"CRABRTI\0";
-const HEADER_SIZE: usize = 64;
-const SECTION_SIZE: usize = 32;
-const RELOCATION_SIZE: usize = 24;
-const EXPORTS_SIZE: usize = 64;
-const PAGE_SIZE: u64 = 4096;
+const PAGE_SIZE: u64 = EFI_PAGE_SIZE as u64;
 
 #[derive(Clone)]
 struct Segment {
@@ -52,15 +54,7 @@ pub fn build(arch: Arch) -> Result<RuntimeArtifact> {
     let cargo_target = root.join("target/runtime/.cargo").join(target);
     let map_path = output.join("runtime.map");
     let manifest = root.join("crabefi-runtime-image/Cargo.toml");
-    let linker_flags = match arch {
-        Arch::X86_64 => "-C relocation-model=pic -C code-model=small",
-        Arch::Aarch64 => "-C relocation-model=pic -C code-model=small",
-        Arch::Riscv64 => "-C relocation-model=pic -C code-model=medium -C link-arg=--no-relax",
-    };
-    let rustflags = format!(
-        "{linker_flags} -C linker=rust-lld -C link-arg=-pie -C link-arg=-Map={} -Z emit-stack-sizes -Z plt=yes",
-        map_path.display()
-    );
+    let rustflags = runtime_rustflags(arch, &map_path);
     let parent = root.parent().context("project root has no parent")?;
     let status = Command::new("cargo")
         .args([
@@ -76,7 +70,8 @@ pub fn build(arch: Arch) -> Result<RuntimeArtifact> {
         .args(["--release", "--target", target, "--target-dir"])
         .arg(&cargo_target)
         .current_dir(parent)
-        .env("RUSTFLAGS", rustflags)
+        .env_remove("RUSTFLAGS")
+        .env("CARGO_ENCODED_RUSTFLAGS", rustflags)
         .status()
         .context("failed to invoke nightly Cargo for the runtime image")?;
     if !status.success() {
@@ -101,21 +96,53 @@ pub fn build(arch: Arch) -> Result<RuntimeArtifact> {
     normalize(&elf_path, &output, arch)
 }
 
+fn runtime_rustflags(arch: Arch, map_path: &Path) -> OsString {
+    let code_model = match arch {
+        Arch::X86_64 | Arch::Aarch64 => "code-model=small",
+        Arch::Riscv64 => "code-model=medium",
+    };
+    let mut arguments = vec![
+        OsString::from("-C"),
+        OsString::from("relocation-model=pic"),
+        OsString::from("-C"),
+        OsString::from(code_model),
+    ];
+    if matches!(arch, Arch::Riscv64) {
+        arguments.extend([OsString::from("-C"), OsString::from("link-arg=--no-relax")]);
+    }
+    arguments.extend([
+        OsString::from("-C"),
+        OsString::from("linker=rust-lld"),
+        OsString::from("-C"),
+        OsString::from("link-arg=-pie"),
+        OsString::from("-C"),
+    ]);
+    let mut map_argument = OsString::from("link-arg=-Map=");
+    map_argument.push(map_path.as_os_str());
+    arguments.extend([
+        map_argument,
+        OsString::from("-Z"),
+        OsString::from("emit-stack-sizes"),
+        OsString::from("-Z"),
+        OsString::from("plt=yes"),
+    ]);
+
+    let mut encoded = OsString::new();
+    for (index, argument) in arguments.iter().enumerate() {
+        if index != 0 {
+            encoded.push("\u{1f}");
+        }
+        encoded.push(argument);
+    }
+    encoded
+}
+
 fn normalize(elf_path: &Path, output: &Path, arch: Arch) -> Result<RuntimeArtifact> {
     let elf_bytes = fs::read(elf_path)?;
     let file = object::File::parse(elf_bytes.as_slice()).context("parse runtime ELF")?;
     if file.kind() != ObjectKind::Dynamic || file.architecture() != object_arch(arch) {
         bail!("runtime ELF must be ET_DYN for the requested architecture");
     }
-    let imports = file.imports().context("read runtime imports")?;
-    if !imports.is_empty() {
-        let names: Vec<_> = imports
-            .iter()
-            .map(|import| String::from_utf8_lossy(import.name()).into_owned())
-            .collect();
-        bail!("runtime ELF has undefined imports: {names:?}");
-    }
-
     let mut segments = file
         .segments()
         .filter_map(|segment| {
@@ -130,9 +157,9 @@ fn normalize(elf_path: &Path, output: &Path, arch: Arch) -> Result<RuntimeArtifa
             let permissions = segment.permissions();
             let mut flags = section_flags(permissions);
             if segment.data()?.len() < usize::try_from(memory_size)? {
-                flags |= 1 << 3;
+                flags |= abi_section_flags::ZERO_FILL;
             }
-            if flags & 2 != 0 && flags & 4 != 0 {
+            if flags & abi_section_flags::WRITE != 0 && flags & abi_section_flags::EXECUTE != 0 {
                 bail!("runtime ELF contains a writable/executable PT_LOAD");
             }
             if !address.is_multiple_of(PAGE_SIZE)
@@ -155,7 +182,7 @@ fn normalize(elf_path: &Path, output: &Path, arch: Arch) -> Result<RuntimeArtifa
         })
         .collect::<Result<Vec<_>>>()?;
     segments.sort_by_key(|segment| segment.address);
-    if segments.is_empty() || segments.len() > 8 {
+    if segments.is_empty() || segments.len() > MAX_SECTIONS {
         bail!("runtime ELF has an unsupported PT_LOAD count");
     }
     for pair in segments.windows(2) {
@@ -186,7 +213,7 @@ fn normalize(elf_path: &Path, output: &Path, arch: Arch) -> Result<RuntimeArtifa
         segments[index].memory_size = normalized_end - normalized_start;
         segments[index].data = data;
         if segments[index].data.len() < usize::try_from(segments[index].memory_size)? {
-            segments[index].flags |= 1 << 3;
+            segments[index].flags |= abi_section_flags::ZERO_FILL;
         }
     }
     let image_size = linked_image_end;
@@ -201,7 +228,8 @@ fn normalize(elf_path: &Path, output: &Path, arch: Arch) -> Result<RuntimeArtifa
         );
     }
     for relocation in &relocations {
-        segments[usize::from(relocation.patch_section)].flags |= 1 << 4;
+        segments[usize::from(relocation.patch_section)].flags |=
+            abi_section_flags::RELOCATION_SLOTS;
     }
     audit_native_relocations(&file, &segments, arch)?;
     let exports = collect_exports(&file, image_size)?;
@@ -217,8 +245,8 @@ fn normalize(elf_path: &Path, output: &Path, arch: Arch) -> Result<RuntimeArtifa
             .context("normalized runtime image size overflow")?;
     }
     let mut normalized = vec![0u8; data_offset];
-    normalized[..8].copy_from_slice(MAGIC);
-    write_u16(&mut normalized, 8, 1);
+    normalized[..8].copy_from_slice(&MAGIC);
+    write_u16(&mut normalized, 8, FORMAT_VERSION);
     write_u16(&mut normalized, 10, architecture_id(arch));
     write_u16(&mut normalized, 12, HEADER_SIZE as u16);
     write_u32(&mut normalized, 16, image_size_u32);
@@ -228,7 +256,7 @@ fn normalize(elf_path: &Path, output: &Path, arch: Arch) -> Result<RuntimeArtifa
     write_u32(&mut normalized, 32, relocations.len() as u32);
     write_u32(&mut normalized, 36, exports_offset as u32);
     write_u16(&mut normalized, 40, EXPORTS_SIZE as u16);
-    write_u32(&mut normalized, 44, PAGE_SIZE as u32);
+    write_u32(&mut normalized, 44, EFI_PAGE_SIZE);
     write_u64(
         &mut normalized,
         48,
@@ -253,9 +281,13 @@ fn normalize(elf_path: &Path, output: &Path, arch: Arch) -> Result<RuntimeArtifa
         write_u64(&mut normalized, offset + 8, 0);
         normalized[offset + 16] = relocation.patch_section;
         normalized[offset + 17] = relocation.target_section;
-        write_u16(&mut normalized, offset + 18, 1);
+        write_u16(
+            &mut normalized,
+            offset + 18,
+            abi_relocation_kind::ABSOLUTE64,
+        );
     }
-    write_u16(&mut normalized, exports_offset, 1);
+    write_u16(&mut normalized, exports_offset, EXPORTS_VERSION);
     write_u16(&mut normalized, exports_offset + 2, EXPORTS_SIZE as u16);
     for (index, value) in exports.iter().enumerate() {
         write_u32(&mut normalized, exports_offset + 8 + index * 4, *value);
@@ -301,7 +333,7 @@ fn normalize(elf_path: &Path, output: &Path, arch: Arch) -> Result<RuntimeArtifa
     )?;
     write_json(
         output.join("build.json"),
-        &json!({ "target": target_triple(arch), "format": 1, "sha256": hex(&digest) }),
+        &json!({ "target": target_triple(arch), "format": FORMAT_VERSION, "sha256": hex(&digest) }),
     )?;
 
     let symbols = file
@@ -313,7 +345,10 @@ fn normalize(elf_path: &Path, output: &Path, arch: Arch) -> Result<RuntimeArtifa
         .collect::<String>();
     fs::write(output.join("symbols.txt"), &symbols)?;
     fs::write(output.join("runtime-image.sym"), symbols)?;
-    run_audit_tools(elf_path, output, relocations.len())?;
+    ValidatedImage::parse(&normalized, architecture_id(arch)).map_err(|error| {
+        anyhow::anyhow!("normalized runtime image failed ABI self-validation: {error}")
+    })?;
+    run_audit_tools(elf_path, output, arch, relocations.len())?;
     Ok(RuntimeArtifact {
         image: image_path,
         digest,
@@ -376,22 +411,51 @@ fn dynamic_relocation_count(file: &object::File<'_>) -> Result<usize> {
     if dynamic.len() % ELF64_DYN_SIZE != 0 {
         bail!("runtime .dynamic has a partial ELF64 dynamic entry");
     }
+    audit_dynamic_entries(dynamic, ELF64_RELA_SIZE)
+}
+
+fn audit_dynamic_entries(dynamic: &[u8], rela_entry_size: u64) -> Result<usize> {
+    const ELF64_DYN_SIZE: usize = 16;
+    if dynamic.len() % ELF64_DYN_SIZE != 0 {
+        bail!("runtime .dynamic has a partial ELF64 dynamic entry");
+    }
     let mut rela_size = None;
     let mut rela_count = None;
     for entry in dynamic.chunks_exact(ELF64_DYN_SIZE) {
         let tag = i64::from_le_bytes(entry[..8].try_into()?);
         let value = u64::from_le_bytes(entry[8..].try_into()?);
         match tag {
-            object::elf::DT_RELASZ => rela_size = Some(value),
-            object::elf::DT_RELACOUNT => rela_count = Some(value),
+            object::elf::DT_NULL => break,
+            object::elf::DT_NEEDED => bail!("runtime ELF contains DT_NEEDED"),
+            object::elf::DT_REL
+            | object::elf::DT_RELSZ
+            | object::elf::DT_RELENT
+            | object::elf::DT_JMPREL
+            | object::elf::DT_PLTRELSZ
+            | object::elf::DT_PLTREL => {
+                bail!("runtime ELF contains unsupported dynamic tag {tag}")
+            }
+            object::elf::DT_RELASZ => {
+                if rela_size.replace(value).is_some() {
+                    bail!("runtime .dynamic contains duplicate DT_RELASZ");
+                }
+            }
+            object::elf::DT_RELAENT if value != rela_entry_size => {
+                bail!("runtime DT_RELAENT is {value}, expected {rela_entry_size}")
+            }
+            object::elf::DT_RELACOUNT => {
+                if rela_count.replace(value).is_some() {
+                    bail!("runtime .dynamic contains duplicate DT_RELACOUNT");
+                }
+            }
             _ => {}
         }
     }
     let rela_size = rela_size.context("runtime .dynamic is missing DT_RELASZ")?;
-    let from_size = usize::try_from(rela_size / ELF64_RELA_SIZE)?;
-    if rela_size == 0 || rela_size % ELF64_RELA_SIZE != 0 {
+    if rela_size == 0 || rela_size % rela_entry_size != 0 {
         bail!("runtime DT_RELASZ is not a non-zero multiple of ELF64 Rela size");
     }
+    let from_size = usize::try_from(rela_size / rela_entry_size)?;
     let from_count =
         usize::try_from(rela_count.context("runtime .dynamic is missing DT_RELACOUNT")?)?;
     if from_size != from_count {
@@ -490,7 +554,160 @@ fn collect_exports(file: &object::File<'_>, image_size: u64) -> Result<[u32; 12]
     Ok(values)
 }
 
-fn run_audit_tools(elf: &Path, output: &Path, relocation_slots: usize) -> Result<()> {
+#[derive(Clone, Copy)]
+struct Instruction<'a> {
+    mnemonic: &'a str,
+    operands: &'a str,
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct CallAudit {
+    indirect: usize,
+    register_indirect: usize,
+}
+
+fn parse_instruction(line: &str) -> Option<Instruction<'_>> {
+    let (_, body) = line.split_once(':')?;
+    let body = body.trim();
+    if body.is_empty() || body.starts_with('<') {
+        return None;
+    }
+    let split = body.find(char::is_whitespace).unwrap_or(body.len());
+    let mnemonic = &body[..split];
+    if mnemonic.is_empty() {
+        return None;
+    }
+    Some(Instruction {
+        mnemonic,
+        operands: body[split..].trim(),
+    })
+}
+
+fn instruction_is_call(arch: Arch, instruction: Instruction<'_>) -> Result<bool> {
+    let (recognized, call) = match arch {
+        Arch::X86_64 => {
+            let call = matches!(instruction.mnemonic, "call" | "callq");
+            (call, call)
+        }
+        Arch::Aarch64 => {
+            let call = matches!(instruction.mnemonic, "bl" | "blr");
+            (call, call)
+        }
+        Arch::Riscv64 => {
+            let recognized = matches!(
+                instruction.mnemonic,
+                "jal" | "jalr" | "call" | "tail" | "jr"
+            );
+            let call = matches!(instruction.mnemonic, "jal" | "call")
+                || (instruction.mnemonic == "jalr" && riscv_jalr_links(instruction.operands));
+            (recognized, call)
+        }
+    };
+    let suspicious_unknown = match arch {
+        Arch::X86_64 => instruction.mnemonic.starts_with("call"),
+        Arch::Aarch64 => instruction.mnemonic.starts_with("bl"),
+        Arch::Riscv64 => instruction.mnemonic.starts_with("jal"),
+    };
+    if suspicious_unknown && !recognized {
+        bail!(
+            "unrecognized call instruction syntax: {} {}",
+            instruction.mnemonic,
+            instruction.operands
+        );
+    }
+    Ok(call)
+}
+
+fn instruction_is_forbidden_in_transition_tail(
+    arch: Arch,
+    instruction: Instruction<'_>,
+) -> Result<bool> {
+    if arch == Arch::Riscv64
+        && (matches!(instruction.mnemonic, "jr" | "tail") || instruction.mnemonic == "jalr")
+    {
+        // Non-linking register jumps are just as unsafe as calls after the
+        // transition tail has changed relocation targets.
+        return Ok(true);
+    }
+    instruction_is_call(arch, instruction)
+}
+
+fn riscv_auipc_direct(previous: Option<Instruction<'_>>, operands: &str) -> bool {
+    let Some(previous) = previous.filter(|instruction| instruction.mnemonic == "auipc") else {
+        return false;
+    };
+    let register = previous
+        .operands
+        .split(',')
+        .next()
+        .unwrap_or_default()
+        .trim();
+    let Some(base) = riscv_jalr_base(operands) else {
+        return false;
+    };
+    register == base || matches!((register, base), ("ra", "x1") | ("x1", "ra"))
+}
+
+fn riscv_jalr_base(operands: &str) -> Option<&str> {
+    let address = operands
+        .split_once(',')
+        .map_or(operands, |(_, address)| address)
+        .trim();
+    if let Some((_, tail)) = address.rsplit_once('(') {
+        return tail.split_once(')').map(|(register, _)| register.trim());
+    }
+    address
+        .split_whitespace()
+        .next()
+        .filter(|value| !value.is_empty())
+}
+
+fn riscv_jalr_links(operands: &str) -> bool {
+    let Some((destination, _)) = operands.split_once(',') else {
+        // The one-operand spelling has an implicit `ra` destination.
+        return true;
+    };
+    !matches!(destination.trim(), "zero" | "x0")
+}
+
+fn audit_indirect_calls(arch: Arch, text: &str) -> Result<CallAudit> {
+    let mut audit = CallAudit::default();
+    let mut previous = None;
+    for line in text.lines() {
+        let Some(instruction) = parse_instruction(line) else {
+            continue;
+        };
+        let _ = instruction_is_call(arch, instruction)?;
+        match arch {
+            Arch::X86_64
+                if matches!(instruction.mnemonic, "call" | "callq")
+                    && instruction.operands.starts_with('*') =>
+            {
+                audit.indirect += 1;
+                if !instruction.operands.contains("(%rip)") {
+                    audit.register_indirect += 1;
+                }
+            }
+            Arch::Aarch64 if instruction.mnemonic == "blr" => {
+                audit.indirect += 1;
+                audit.register_indirect += 1;
+            }
+            Arch::Riscv64
+                if instruction.mnemonic == "jalr"
+                    && riscv_jalr_links(instruction.operands)
+                    && !riscv_auipc_direct(previous, instruction.operands) =>
+            {
+                audit.indirect += 1;
+                audit.register_indirect += 1;
+            }
+            _ => {}
+        }
+        previous = Some(instruction);
+    }
+    Ok(audit)
+}
+
+fn run_audit_tools(elf: &Path, output: &Path, arch: Arch, relocation_slots: usize) -> Result<()> {
     let disassembly = Command::new(llvm_tool("llvm-objdump")?)
         .args(["--disassemble", "--no-show-raw-insn"])
         .arg(elf)
@@ -503,22 +720,16 @@ fn run_audit_tools(elf: &Path, output: &Path, relocation_slots: usize) -> Result
     let text = String::from_utf8_lossy(&disassembly.stdout);
     let tail = disassembly_body(&text, "runtime_image_commit_tail_and_return")
         .context("runtime tail relocation function was removed or inlined")?;
-    if tail
-        .lines()
-        .any(|line| line.contains("call") || line.contains("\tbl\t") || line.contains("\tjal\t"))
-    {
-        bail!("runtime tail relocation function contains a call");
+    for line in tail.lines() {
+        if let Some(instruction) = parse_instruction(line)
+            && instruction_is_forbidden_in_transition_tail(arch, instruction)?
+        {
+            bail!("runtime tail relocation function contains a call or indirect tail jump");
+        }
     }
-    let indirect_calls = text
-        .lines()
-        .filter(|line| line.contains("callq\t*") || line.contains("call\t*"))
-        .count();
-    let register_indirect_calls = text
-        .lines()
-        .filter(|line| {
-            (line.contains("callq\t*") || line.contains("call\t*")) && !line.contains("(%rip)")
-        })
-        .count();
+    let call_audit = audit_indirect_calls(arch, &text)?;
+    let indirect_calls = call_audit.indirect;
+    let register_indirect_calls = call_audit.register_indirect;
     // PIC code may call compiler-builtins through relocation slots and has one
     // explicit BootActive bridge call. The packed-arena move operation can load
     // a GOT slot into a register first, so permit one additional register call.
@@ -578,6 +789,15 @@ fn disassembly_body<'a>(text: &'a str, symbol: &str) -> Option<&'a str> {
     Some(body.split_once("\n\n").map_or(body, |(body, _)| body))
 }
 
+fn parse_rustc_host(verbose_version: &str) -> Option<&str> {
+    let mut hosts = verbose_version.lines().filter_map(|line| {
+        let host = line.strip_prefix("host:")?.trim();
+        (!host.is_empty() && !host.chars().any(char::is_whitespace)).then_some(host)
+    });
+    let host = hosts.next()?;
+    hosts.next().is_none().then_some(host)
+}
+
 fn llvm_tool(name: &str) -> Result<PathBuf> {
     if Command::new(name)
         .arg("--version")
@@ -594,11 +814,21 @@ fn llvm_tool(name: &str) -> Result<PathBuf> {
         bail!("cannot locate required LLVM tool {name}");
     }
     let sysroot = String::from_utf8(output.stdout)?.trim().to_owned();
+    let verbose = Command::new("rustc")
+        .args(["+nightly", "-vV"])
+        .output()
+        .context("query nightly Rust host triple for LLVM tools")?;
+    if !verbose.status.success() {
+        bail!("cannot query nightly Rust host triple for required LLVM tool {name}");
+    }
+    let verbose = String::from_utf8(verbose.stdout)?;
+    let host = parse_rustc_host(&verbose).context("nightly rustc -vV has no valid host line")?;
+    let executable = format!("{name}{}", std::env::consts::EXE_SUFFIX);
     let path = PathBuf::from(sysroot)
         .join("lib/rustlib")
-        .join(std::env::consts::ARCH.to_owned() + "-unknown-linux-gnu")
+        .join(host)
         .join("bin")
-        .join(name);
+        .join(executable);
     if !path.exists() {
         bail!("required LLVM tool not found: {}", path.display());
     }
@@ -618,12 +848,12 @@ fn containing_segment(segments: &[Segment], address: u64, width: u64) -> Option<
 }
 
 fn section_flags(permissions: Permissions) -> u32 {
-    let mut flags = 1;
+    let mut flags = abi_section_flags::READ;
     if permissions.writable() {
-        flags |= 2;
+        flags |= abi_section_flags::WRITE;
     }
     if permissions.executable() {
-        flags |= 4;
+        flags |= abi_section_flags::EXECUTE;
     }
     flags
 }
@@ -638,9 +868,9 @@ fn object_arch(arch: Arch) -> object::Architecture {
 
 fn architecture_id(arch: Arch) -> u16 {
     match arch {
-        Arch::X86_64 => 1,
-        Arch::Aarch64 => 2,
-        Arch::Riscv64 => 3,
+        Arch::X86_64 => architecture::X86_64,
+        Arch::Aarch64 => architecture::AARCH64,
+        Arch::Riscv64 => architecture::RISCV64,
     }
 }
 
@@ -679,4 +909,128 @@ fn hex(bytes: &[u8]) -> String {
         let _ = write!(output, "{byte:02x}");
         output
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_portable_rustc_host_triples() {
+        for host in [
+            "x86_64-unknown-linux-gnu",
+            "x86_64-unknown-linux-musl",
+            "aarch64-apple-darwin",
+            "x86_64-pc-windows-msvc",
+        ] {
+            let output = format!("rustc 1.90.0-nightly\nbinary: rustc\nhost: {host}\n");
+            assert_eq!(parse_rustc_host(&output), Some(host));
+        }
+        assert_eq!(parse_rustc_host("rustc nightly\n"), None);
+        assert_eq!(parse_rustc_host("host: malformed host\n"), None);
+        assert_eq!(parse_rustc_host("host:\n"), None);
+    }
+
+    #[test]
+    fn audits_indirect_calls_for_each_architecture() {
+        let x86 = "0: callq *%rax\n1: callq *0x10(%rip)\n2: call 0x40\n";
+        assert_eq!(
+            audit_indirect_calls(Arch::X86_64, x86).unwrap(),
+            CallAudit {
+                indirect: 2,
+                register_indirect: 1,
+            }
+        );
+
+        let aarch64 = "0: bl 0x40\n4: blr x27\n8: ret\n";
+        assert_eq!(
+            audit_indirect_calls(Arch::Aarch64, aarch64).unwrap(),
+            CallAudit {
+                indirect: 1,
+                register_indirect: 1,
+            }
+        );
+
+        let riscv = concat!(
+            "0: auipc ra, 0x7\n",
+            "4: jalr ra <alloc::raw_vec::RawVecInner<A>::grow_amortized>\n",
+            "8: auipc x1, 0\n",
+            "c: jalr 16(ra)\n",
+            "10: jalr s9\n",
+            "14: jalr zero, 0(ra)\n",
+            "18: jr s9\n",
+            "1c: jal 0x80\n",
+        );
+        assert_eq!(
+            audit_indirect_calls(Arch::Riscv64, riscv).unwrap(),
+            CallAudit {
+                indirect: 1,
+                register_indirect: 1,
+            }
+        );
+        let jr = parse_instruction("0: jr s9\n").unwrap();
+        assert!(!instruction_is_call(Arch::Riscv64, jr).unwrap());
+        assert!(instruction_is_forbidden_in_transition_tail(Arch::Riscv64, jr).unwrap());
+        let non_linking_jalr = parse_instruction("0: jalr zero, 0(s9)\n").unwrap();
+        assert!(!instruction_is_call(Arch::Riscv64, non_linking_jalr).unwrap());
+        assert!(
+            instruction_is_forbidden_in_transition_tail(Arch::Riscv64, non_linking_jalr).unwrap()
+        );
+        assert!(audit_indirect_calls(Arch::Aarch64, "0: blraa x0, x1\n").is_err());
+    }
+
+    #[test]
+    fn encoded_rustflags_preserve_map_paths_with_spaces() {
+        let directory =
+            std::env::temp_dir().join(format!("crabefi xtask rustflags {}", std::process::id()));
+        fs::create_dir_all(&directory).unwrap();
+        let map_path = directory.join("runtime image.map");
+        fs::write(&map_path, []).unwrap();
+
+        let encoded = runtime_rustflags(Arch::Riscv64, &map_path);
+        let arguments: Vec<_> = encoded.to_str().unwrap().split('\u{1f}').collect();
+        let expected = format!("link-arg=-Map={}", map_path.display());
+        assert!(arguments.contains(&expected.as_str()));
+        assert!(arguments.contains(&"link-arg=--no-relax"));
+        assert!(!arguments.iter().any(|argument| argument == &"runtime"));
+
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    fn dynamic(entries: &[(i64, u64)]) -> Vec<u8> {
+        entries
+            .iter()
+            .flat_map(|(tag, value)| {
+                let mut entry = [0u8; 16];
+                entry[..8].copy_from_slice(&tag.to_le_bytes());
+                entry[8..].copy_from_slice(&value.to_le_bytes());
+                entry
+            })
+            .collect()
+    }
+
+    #[test]
+    fn dynamic_audit_accepts_relative_only_and_rejects_loader_dependencies() {
+        let valid = dynamic(&[
+            (object::elf::DT_RELASZ, 24),
+            (object::elf::DT_RELAENT, 24),
+            (object::elf::DT_RELACOUNT, 1),
+            (object::elf::DT_NULL, 0),
+        ]);
+        assert_eq!(audit_dynamic_entries(&valid, 24).unwrap(), 1);
+
+        for tag in [
+            object::elf::DT_NEEDED,
+            object::elf::DT_REL,
+            object::elf::DT_JMPREL,
+            object::elf::DT_PLTRELSZ,
+        ] {
+            let invalid = dynamic(&[
+                (tag, 1),
+                (object::elf::DT_RELASZ, 24),
+                (object::elf::DT_RELACOUNT, 1),
+            ]);
+            assert!(audit_dynamic_entries(&invalid, 24).is_err());
+        }
+    }
 }

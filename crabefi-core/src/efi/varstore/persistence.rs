@@ -325,44 +325,62 @@ fn migrate_non_auth_store(storage_size: u32, data_size: u32) -> Result<(), VarSt
         });
         active.push(variable);
     }
+
+    // Prebuild and bounds-check every expanded authenticated record before any
+    // write could be enabled. This catches deterministic legacy->authenticated
+    // growth without risking the source generation.
+    match preflight_non_auth_migration(storage_size, data_size, &active) {
+        Ok(final_offset) => log::warn!(
+            "Legacy variable store requires authenticated migration ({} records, {:#x} bytes), but the sole flash bank was preserved because no atomic staging bank is available",
+            active.len(),
+            final_offset
+        ),
+        Err(VarStoreError::StoreFull) => log::warn!(
+            "Legacy variable store cannot fit authenticated headers; preserving it read-only"
+        ),
+        Err(error) => return Err(error),
+    }
+
     let write_offset = state::with_storage_mut(|storage| {
-        storage
-            .enable_writes()
-            .map_err(|_| VarStoreError::SpiError)?;
-        storage
-            .erase(0, storage_size)
-            .map_err(|_| VarStoreError::SpiError)?;
-        storage
-            .write(0, &edk2::build_fv_headers(storage_size))
-            .map_err(|_| VarStoreError::SpiError)?;
-        let mut offset = edk2::VARIABLE_DATA_OFFSET;
-        for variable in &active {
-            let mut write_fn = |at: u32, bytes: &[u8]| storage.write(at, bytes).is_ok();
-            offset = edk2::write_variable(
-                &mut write_fn,
-                offset,
-                &variable.guid,
-                &variable.name,
-                variable.attributes,
-                &variable.data,
-                None,
-            )
-            .ok_or(VarStoreError::SpiError)?;
-        }
-        Ok::<u32, VarStoreError>(offset)
+        let mut read_fn = |offset: u32, buffer: &mut [u8]| storage.read(offset, buffer).is_ok();
+        edk2::find_write_offset(&mut read_fn, false, data_size)
     })
-    .ok_or(VarStoreError::NotInitialized)??;
+    .ok_or(VarStoreError::NotInitialized)?;
     state::with_varstore_mut(|store| {
         store.initialized = true;
-        store.auth_format = true;
+        store.auth_format = false;
         store.data_size = data_size;
         store.write_offset = write_offset;
     });
-    log::info!(
-        "Migrated non-authenticated variable store; retained {} live records",
-        active.len()
-    );
     Ok(())
+}
+
+fn preflight_non_auth_migration(
+    storage_size: u32,
+    data_size: u32,
+    active: &[edk2::FvVariable],
+) -> Result<u32, VarStoreError> {
+    let limit = edk2::VARIABLE_DATA_OFFSET
+        .checked_add(data_size)
+        .filter(|limit| *limit <= storage_size)
+        .ok_or(VarStoreError::InvalidHeader)?;
+    let mut offset = edk2::VARIABLE_DATA_OFFSET;
+    for variable in active {
+        let record = edk2::build_variable_record(
+            &variable.guid,
+            &variable.name,
+            variable.attributes,
+            &variable.data,
+            None,
+        )
+        .ok_or(VarStoreError::InvalidArgument)?;
+        let record_len = u32::try_from(record.len()).map_err(|_| VarStoreError::StoreFull)?;
+        offset = offset
+            .checked_add(record_len)
+            .filter(|end| *end <= limit)
+            .ok_or(VarStoreError::StoreFull)?;
+    }
+    Ok(offset)
 }
 
 /// Load variables from storage into the in-memory cache
@@ -442,19 +460,37 @@ pub fn get_variable_timestamp(guid: &r_efi::efi::Guid, name: &[u16]) -> Option<V
     let guid = edk2::guid_to_bytes(guid);
     state::with_storage_mut(|storage| {
         let mut read_fn = |offset: u32, buffer: &mut [u8]| storage.read(offset, buffer).is_ok();
-        edk2::walk_variables(&mut read_fn, true, variable_store.data_size)
-            .into_iter()
-            .filter(|variable| variable.guid == guid && edk2::name_matches(&variable.name, name))
-            .filter_map(|variable| variable.timestamp)
-            .next_back()
+        let variables = edk2::walk_variables(&mut read_fn, true, variable_store.data_size);
+        latest_matching_timestamp(&variables, &guid, name)
     })
     .flatten()
+}
+
+fn latest_matching_timestamp(
+    variables: &[edk2::FvVariable],
+    guid: &[u8; 16],
+    name: &[u16],
+) -> Option<VariableTimestamp> {
+    variables
+        .iter()
+        .filter(|variable| edk2::is_var_added(variable.state))
+        .filter(|variable| variable.guid == *guid && edk2::name_matches(&variable.name, name))
+        .filter_map(|variable| variable.timestamp)
+        .next_back()
 }
 
 /// Write a variable to storage using EDK2 FV format
 ///
 /// The new prepared record is committed and verified before older records are
 /// retired. The function never performs destructive single-bank compaction.
+fn require_writable_store(initialized: bool, auth_format: bool) -> Result<(), VarStoreError> {
+    if initialized && auth_format {
+        Ok(())
+    } else {
+        Err(VarStoreError::NotInitialized)
+    }
+}
+
 pub(crate) fn write_variable_to_storage_internal(
     guid: &r_efi::efi::Guid,
     name: &[u16],
@@ -463,14 +499,13 @@ pub(crate) fn write_variable_to_storage_internal(
     timestamp: Option<VariableTimestamp>,
 ) -> Result<(), VarStoreError> {
     let vs = state::varstore();
-    if !vs.initialized || !vs.auth_format {
-        return Err(VarStoreError::NotInitialized);
-    }
+    require_writable_store(vs.initialized, vs.auth_format)?;
 
     let guid_bytes = edk2::guid_to_bytes(guid);
 
     // Preflight a new record without changing the currently visible durable value.
-    let record = edk2::build_variable_record(&guid_bytes, name, attributes, data, timestamp);
+    let record = edk2::build_variable_record(&guid_bytes, name, attributes, data, timestamp)
+        .ok_or(VarStoreError::InvalidArgument)?;
     let record_len = record.len() as u32;
 
     let storage_size =
@@ -704,14 +739,12 @@ pub(crate) fn write_variable_deletion_internal(
     attributes: u32,
     timestamp: Option<VariableTimestamp>,
 ) -> Result<(), VarStoreError> {
+    let vs = state::varstore();
+    require_writable_store(vs.initialized, vs.auth_format)?;
     if timestamp.is_some() {
         // An active zero-length authenticated record is invisible to coreboot's
         // variable reader but retains the verified deletion replay floor.
         return write_variable_to_storage_internal(guid, name, attributes, &[], timestamp);
-    }
-    let vs = state::varstore();
-    if !vs.initialized {
-        return Err(VarStoreError::NotInitialized);
     }
 
     let guid_bytes = edk2::guid_to_bytes(guid);
@@ -725,6 +758,7 @@ fn delete_existing_record_except(
     keep_state_offset: Option<u32>,
 ) -> Result<(), VarStoreError> {
     let vs = state::varstore();
+    require_writable_store(vs.initialized, vs.auth_format)?;
     let auth_format = vs.auth_format;
     let data_size = vs.data_size;
 
@@ -788,9 +822,15 @@ pub fn is_storage_available() -> bool {
     state::with_storage_mut(|_| ()).is_some()
 }
 
-/// Check if variable store is initialized
+/// Check if variable store is initialized.
 pub fn is_varstore_initialized() -> bool {
     state::varstore().initialized
+}
+
+/// Check whether the initialized store accepts durable authenticated writes.
+pub fn is_varstore_writable() -> bool {
+    let store = state::varstore();
+    store.initialized && store.auth_format
 }
 
 /// Get variable store statistics
@@ -800,6 +840,55 @@ pub fn get_varstore_stats() -> Option<(u32, u32, u32)> {
     let vs = state::varstore();
     let (base, size) = state::with_storage_mut(|s| (s.base_offset(), s.size()))?;
     Some((base, size, vs.write_offset))
+}
+
+/// Durably write a firmware-private value, then import it through the
+/// privileged pre-boot runtime-image interface.
+pub(crate) fn persist_firmware_variable(
+    guid: &r_efi::efi::Guid,
+    name: &[u16],
+    attributes: u32,
+    data: &[u8],
+) -> Result<(), VarStoreError> {
+    let name_len = name
+        .iter()
+        .position(|unit| *unit == 0)
+        .unwrap_or(name.len());
+    if name_len == 0 || name_len > crabefi_runtime_abi::MAX_VARIABLE_NAME_LEN {
+        return Err(VarStoreError::InvalidArgument);
+    }
+    if data.len() > crabefi_runtime_abi::MAX_VARIABLE_DATA_SIZE {
+        return Err(VarStoreError::DataTooLarge);
+    }
+    let data_len = u32::try_from(data.len()).map_err(|_| VarStoreError::DataTooLarge)?;
+    let mut terminated_name = [0u16; crabefi_runtime_abi::MAX_VARIABLE_NAME_LEN + 1];
+    terminated_name[..name_len].copy_from_slice(&name[..name_len]);
+    write_variable_to_storage_internal(
+        guid,
+        &terminated_name[..=name_len],
+        attributes,
+        data,
+        None,
+    )?;
+
+    let client = state::efi()
+        .runtime_image
+        .ok_or(VarStoreError::NotInitialized)?;
+    client
+        .import_variable(&crabefi_runtime_abi::VariableImport {
+            name_address: terminated_name.as_ptr() as u64,
+            name_len: name_len as u32,
+            attributes,
+            guid: edk2::guid_to_bytes(guid),
+            data_address: data.as_ptr() as u64,
+            data_len,
+            timestamp_valid: 0,
+            timestamp: VariableTimestamp::default(),
+        })
+        .map_err(|status| match status {
+            r_efi::efi::Status::OUT_OF_RESOURCES => VarStoreError::StoreFull,
+            _ => VarStoreError::InvalidArgument,
+        })
 }
 
 /// Publish a boot-produced value through the standard image SetVariable path.
@@ -812,5 +901,109 @@ pub(crate) fn import_variable_into_runtime(
     let status = crate::efi::runtime_image::client::variables::set(guid, name, attributes, data);
     if status != r_efi::efi::Status::SUCCESS {
         log::warn!("Runtime image rejected boot variable update: {:?}", status);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloc::vec;
+
+    fn variable(state: u8, timestamp: u16, data: Vec<u8>) -> edk2::FvVariable {
+        edk2::FvVariable {
+            guid: [0x5a; 16],
+            name: vec![b'T' as u16, 0],
+            attributes: 7,
+            data,
+            timestamp: Some(VariableTimestamp {
+                year: timestamp,
+                month: 1,
+                day: 1,
+                ..VariableTimestamp::default()
+            }),
+            state,
+            state_offset: 0,
+        }
+    }
+
+    #[test]
+    fn timestamp_ignores_later_incomplete_and_retired_records() {
+        let variables = vec![
+            variable(edk2::VAR_ADDED, 2024, vec![1]),
+            variable(0x7f, 2025, vec![2]),
+            variable(0xfd, 2026, vec![3]),
+        ];
+        assert_eq!(
+            latest_matching_timestamp(&variables, &[0x5a; 16], &[b'T' as u16]),
+            Some(VariableTimestamp {
+                year: 2024,
+                month: 1,
+                day: 1,
+                ..VariableTimestamp::default()
+            })
+        );
+    }
+
+    #[test]
+    fn timestamp_keeps_active_authenticated_deletion_floor() {
+        let variables = vec![
+            variable(edk2::VAR_ADDED, 2024, vec![1]),
+            variable(edk2::VAR_ADDED, 2027, Vec::new()),
+        ];
+        assert_eq!(
+            latest_matching_timestamp(&variables, &[0x5a; 16], &[b'T' as u16])
+                .map(|timestamp| timestamp.year),
+            Some(2027)
+        );
+    }
+
+    #[test]
+    fn preserved_legacy_store_rejects_every_write_path() {
+        assert_eq!(
+            require_writable_store(true, false),
+            Err(VarStoreError::NotInitialized)
+        );
+        assert_eq!(
+            require_writable_store(false, true),
+            Err(VarStoreError::NotInitialized)
+        );
+        assert_eq!(require_writable_store(true, true), Ok(()));
+    }
+
+    #[test]
+    fn standard_edk2_size_reaches_migration_preflight() {
+        let storage_size = 256u32;
+        let mut headers = edk2::build_fv_headers(storage_size);
+        let vs_offset = edk2::FV_HEADER_LENGTH;
+        let non_auth_guid = [
+            0x16, 0x36, 0xcf, 0xdd, 0x75, 0x32, 0x64, 0x41, 0x98, 0xb6, 0xfe, 0x85, 0x70, 0x7f,
+            0xfe, 0x7d,
+        ];
+        headers[vs_offset..vs_offset + 16].copy_from_slice(&non_auth_guid);
+        let standard_size = storage_size - edk2::FV_HEADER_LENGTH as u32;
+        headers[vs_offset + 0x10..vs_offset + 0x14].copy_from_slice(&standard_size.to_le_bytes());
+
+        let validation = edk2::validate_fv(&headers, storage_size);
+        assert!(validation.valid);
+        assert!(!validation.auth_format);
+        assert_eq!(
+            preflight_non_auth_migration(storage_size, validation.data_size, &[]),
+            Ok(edk2::VARIABLE_DATA_OFFSET)
+        );
+    }
+
+    #[test]
+    fn expanded_legacy_migration_is_preflighted_without_flash_mutation() {
+        let storage_size = 256;
+        let data_size = storage_size - edk2::VARIABLE_DATA_OFFSET;
+        let variable = variable(edk2::VAR_ADDED, 0, vec![0xa5; 100]);
+        // The legacy 32-byte header fits, while the 60-byte authenticated
+        // record does not. Preflight fails before migration has any write path.
+        let legacy_size = 32 + variable.name.len() * 2 + variable.data.len();
+        assert!(legacy_size <= data_size as usize);
+        assert_eq!(
+            preflight_non_auth_migration(storage_size, data_size, &[variable]),
+            Err(VarStoreError::StoreFull)
+        );
     }
 }

@@ -27,6 +27,10 @@ let config = crabefi::PlatformConfig {
             io_or_mmio_base: 0,
         },
         external_ranges: &[],
+        deferred_buffer: crabefi::DeferredBufferConfig {
+            base: retained_buffer_physical,
+            size: retained_buffer_size,
+        },
     },
     // block devices, tables, console, TPM, storage locator, ...
 };
@@ -41,22 +45,41 @@ error; there is no monolithic fallback.
 
 `Timer`, `ResetHandler`, `PlatformHooks`, device traits, and loggers are
 boot-only. Runtime time/reset behavior uses integer mechanism records copied
-into image state. MMIO time mechanisms additionally require an explicit
-retained runtime MMIO range.
+into image state. PL031 and Goldfish RTC bases must be fully contained in an
+explicit retained runtime MMIO range; port-I/O, PSCI, and SBI mechanisms do not
+require an MMIO range.
 
-External ranges are retained runtime MMIO mappings used only by image-local
-architecture mechanisms such as PL031 or Goldfish RTC. Capsule updates and
-post-EBS nonvolatile persistence are image-local unsupported stubs; integrations
-must not declare a journal or capsule compatibility range.
+External ranges are retained MMIO mappings used only by image-local
+architecture mechanisms. Each range must have page-aligned physical bounds and
+its descriptor must retain `EFI_MEMORY_RUNTIME` plus the declared attributes.
+
+## Retained deferred buffer
+
+`deferred_buffer` is mandatory. Its base and size must be nonzero and page
+aligned, the complete range must be reserved as `RuntimeServicesData`, and it
+must overlap neither the runtime image nor an external MMIO range. The runtime
+image owns the range exclusively; boot code and the OS must not allocate or
+reuse it. Both its contents and physical address must survive a warm reset.
+
+After ExitBootServices, runtime nonvolatile variable writes are committed to a
+bounded journal in this buffer. `UpdateCapsule()` stages its descriptor there
+and requires `PERSIST_ACROSS_RESET`. On the next boot, CrabEFI reserves the
+range via a coreboot-compatible capsule-on-disk wrapper around its private
+reservation capsule, replays deferred records through the temporary persistence
+bridge, processes a staged capsule, and acknowledges records only after durable
+completion. The wrapper is transport only: reservation recognition still
+requires the nested CrabEFI-private GUID and marker. Capsule and journal
+capacity remain bounded by the configured buffer and runtime ABI limits.
 
 ## Variables
 
 A `VariableStoreLocator` may identify an EDK2-compatible flash region. CrabEFI
 imports active records and firmware-created boot values directly into the
 runtime image before an EFI application can run. Boot writes use one audited
-pre-seal persistence bridge: durable storage
-commit occurs before the image-store commit. The bridge is erased at EBS.
+pre-seal persistence bridge: durable storage commit occurs before the
+image-store commit. The bridge is erased at successful EBS seal.
 
-The removed `VariableBackend`, `RuntimeRegion`, and `DeferredBufferConfig` APIs
-must not be implemented by integrations. Runtime survival is provided only by
-the image and explicit ranges.
+The old `VariableBackend` and `RuntimeRegion` APIs remain removed.
+`DeferredBufferConfig` is their mandatory, narrowly scoped replacement for
+warm-reset replay; runtime survival otherwise comes from the separate image and
+explicit external ranges.

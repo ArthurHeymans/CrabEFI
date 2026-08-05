@@ -111,7 +111,12 @@ pub extern "C" fn runtime_image_import_variable(import: *const VariableImport) -
         Ok(length) if length <= crabefi_runtime_abi::MAX_VARIABLE_DATA_SIZE => length,
         _ => return efi::Status::OUT_OF_RESOURCES.as_usize(),
     };
-    if import.name_address == 0 || (data_len != 0 && import.data_address == 0) {
+    if import.name_address == 0
+        || !import
+            .name_address
+            .is_multiple_of(core::mem::align_of::<u16>() as u64)
+        || (data_len != 0 && import.data_address == 0)
+    {
         return efi::Status::INVALID_PARAMETER.as_usize();
     }
     // SAFETY: lengths are ABI-bounded and the boot importer guarantees readable
@@ -331,4 +336,22 @@ pub extern "C" fn runtime_image_get_system_table() -> u64 {
         Err(_) => return 0,
     };
     core::ptr::addr_of!(lease.state().tables.system) as u64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn variable_import_rejects_odd_utf16_address_before_dereference() {
+        let import = VariableImport {
+            name_address: 1,
+            name_len: 1,
+            ..VariableImport::default()
+        };
+        assert_eq!(
+            runtime_image_import_variable(&import),
+            efi::Status::INVALID_PARAMETER.as_usize()
+        );
+    }
 }

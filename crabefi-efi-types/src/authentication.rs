@@ -40,10 +40,11 @@ impl EfiTime {
     /// Return whether every field is within the EFI-defined range.
     pub fn is_valid(&self) -> bool {
         let year = self.year;
+        let month = self.month;
         let timezone = self.timezone;
         (1900..=9999).contains(&year)
-            && (1..=12).contains(&self.month)
-            && (1..=31).contains(&self.day)
+            && (1..=12).contains(&month)
+            && (1..=Self::days_in_month(year, month)).contains(&self.day)
             && self.hour <= 23
             && self.minute <= 59
             && self.second <= 59
@@ -58,11 +59,49 @@ impl EfiTime {
         self.to_utc_units() > other.to_utc_units()
     }
 
+    const fn leap_year(year: u16) -> bool {
+        year.is_multiple_of(4) && (!year.is_multiple_of(100) || year.is_multiple_of(400))
+    }
+
+    const fn days_in_month(year: u16, month: u8) -> u8 {
+        match month {
+            1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+            4 | 6 | 9 | 11 => 30,
+            2 if Self::leap_year(year) => 29,
+            2 => 28,
+            _ => 0,
+        }
+    }
+
+    const fn days_before_month(year: u16, month: u8) -> u16 {
+        let days = match month {
+            1 => 0,
+            2 => 31,
+            3 => 59,
+            4 => 90,
+            5 => 120,
+            6 => 151,
+            7 => 181,
+            8 => 212,
+            9 => 243,
+            10 => 273,
+            11 => 304,
+            12 => 334,
+            _ => 0,
+        };
+        if month > 2 && Self::leap_year(year) {
+            days + 1
+        } else {
+            days
+        }
+    }
+
     fn to_utc_units(self) -> i128 {
-        let year = i128::from(self.year);
-        let month = i128::from(self.month);
-        let day = i128::from(self.day);
-        let days = year * 365 + year / 4 - year / 100 + year / 400 + (month - 1) * 30 + day;
+        let completed_year = i128::from(self.year) - 1;
+        let days = completed_year * 365 + completed_year / 4 - completed_year / 100
+            + completed_year / 400
+            + i128::from(Self::days_before_month(self.year, self.month))
+            + i128::from(self.day.saturating_sub(1));
         let mut seconds = days * 86_400
             + i128::from(self.hour) * 3_600
             + i128::from(self.minute) * 60
@@ -248,5 +287,52 @@ impl<'a> Iterator for SignatureIterator<'a> {
         owner.copy_from_slice(bytes.get(..16)?);
         self.index += 1;
         Some((owner, &bytes[16..]))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::EfiTime;
+
+    fn time(year: u16, month: u8, day: u8) -> EfiTime {
+        EfiTime {
+            year,
+            month,
+            day,
+            hour: 0,
+            minute: 0,
+            second: 0,
+            pad1: 0,
+            nanosecond: 0,
+            timezone: 0,
+            daylight: 0,
+            pad2: 0,
+        }
+    }
+
+    #[test]
+    fn validates_gregorian_month_lengths() {
+        assert!(time(2024, 2, 29).is_valid());
+        assert!(!time(2025, 2, 29).is_valid());
+        assert!(!time(1900, 2, 29).is_valid());
+        assert!(time(2000, 2, 29).is_valid());
+        assert!(!time(2025, 4, 31).is_valid());
+    }
+
+    #[test]
+    fn orders_consecutive_gregorian_days() {
+        assert!(time(2025, 2, 1).is_after(&time(2025, 1, 31)));
+        assert!(time(2024, 3, 1).is_after(&time(2024, 2, 29)));
+        assert!(time(2025, 1, 1).is_after(&time(2024, 12, 31)));
+    }
+
+    #[test]
+    fn compares_timezone_equivalent_instants() {
+        let utc = time(2025, 1, 31);
+        let mut east = utc;
+        east.hour = 1;
+        east.timezone = 60;
+        assert!(!utc.is_after(&east));
+        assert!(!east.is_after(&utc));
     }
 }
