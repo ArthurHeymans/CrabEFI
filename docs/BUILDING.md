@@ -46,10 +46,22 @@ The `./crabefi` wrapper invokes the xtask build system:
 
 The output ELF is at `target/<triple>/release/crabefi`.
 
-### Required wrapper build
+### Direct Cargo build
 
-Direct payload Cargo builds are intentionally rejected because they cannot bind
-a matching normalized runtime image. Use:
+`crabefi-coreboot` uses the checked-in, architecture-matched runtime bundle by
+default, so external build systems such as coreboot can invoke Cargo directly:
+
+```bash
+cargo build -p crabefi-coreboot --release --target x86_64-unknown-none
+```
+
+This mode supports the normal `ui` feature and does not require runtime-image
+environment variables.
+
+### Fresh audited runtime build
+
+The wrapper rebuilds and audits the Runtime Services image, then selects
+`crabefi-coreboot`'s `external-runtime-image` mode to bind that exact artifact:
 
 ```bash
 ./crabefi build --arch x86-64
@@ -81,11 +93,30 @@ map, symbols, disassembly, stack report, digest, and JSON audits are under
 
 | Feature | Default | Description |
 |---------|---------|-------------|
+| `bundled-runtime-image` | off | Embed the architecture-matched normalized Runtime Services image for Cargo-only library integration |
 | `platform-entry` | off | Include CrabEFI's own `_start` entry point, EL2 page table setup, and exception vectors. Disable when integrating CrabEFI as a library into firmware that provides its own entry point. |
 | `global-allocator` | off | Register the built-in bump allocator as `#[global_allocator]` |
 | `fb-log` | off | Log to framebuffer (very slow, debugging only) |
 
 The `crabefi-coreboot` binary enables both `platform-entry` and `global-allocator` automatically. External firmware that provides its own entry point and allocator should not enable these features.
+
+For the `crabefi-coreboot` package itself, `bundled-runtime-image` is enabled by
+default. `external-runtime-image` is mutually exclusive and is selected by the
+wrapper with `--no-default-features` when embedding a freshly audited artifact.
+
+### Updating the Cargo runtime bundle
+
+Maintainers regenerate a bundled image from the audited runtime build with:
+
+```bash
+./crabefi bundle-runtime --arch x86-64
+./crabefi bundle-runtime --arch aarch64
+./crabefi bundle-runtime --arch riscv64
+```
+
+The generated normalized images and raw SHA-256 digests are stored under
+`crabefi-runtime-bundle/images/`. Library consumers should not need to run
+these commands; they consume the checked-in image selected by Cargo.
 
 ## Testing
 

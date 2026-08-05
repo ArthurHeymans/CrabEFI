@@ -16,7 +16,16 @@ fn main() {
     } else {
         panic!("unsupported coreboot payload target: {target}");
     };
-    embed_runtime_image(runtime_architecture);
+    let bundled_runtime = std::env::var_os("CARGO_FEATURE_BUNDLED_RUNTIME_IMAGE").is_some();
+    let external_runtime = std::env::var_os("CARGO_FEATURE_EXTERNAL_RUNTIME_IMAGE").is_some();
+    match (bundled_runtime, external_runtime) {
+        (true, false) => {}
+        (false, true) => embed_runtime_image(runtime_architecture),
+        (true, true) => {
+            panic!("bundled-runtime-image and external-runtime-image are mutually exclusive")
+        }
+        (false, false) => panic!("select either bundled-runtime-image or external-runtime-image"),
+    }
     let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap();
     let manifest_path = std::path::Path::new(&manifest_dir);
 

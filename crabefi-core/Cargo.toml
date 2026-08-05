@@ -10,6 +10,9 @@ readme = "../README.md"
 
 [features]
 default = []
+# Embed the checked, architecture-matched Runtime Services image so external
+# firmware can integrate CrabEFI using Cargo alone.
+bundled-runtime-image = ["dep:crabefi-runtime-bundle"]
 # Enable linker-symbol-backed runtime regions used by CrabEFI-owned payloads.
 # Disable when linking CrabEFI as a library into external firmware.
 platform-entry = []
@@ -24,6 +27,7 @@ ui = []
 
 [dependencies]
 crabefi-efi-types = { workspace = true }
+crabefi-runtime-bundle = { workspace = true, optional = true }
 crabefi-runtime-abi = { path = "../crabefi-runtime-abi" }
 r-efi = { workspace = true }
 log = { workspace = true }

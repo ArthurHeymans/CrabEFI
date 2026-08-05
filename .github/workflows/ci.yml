@@ -29,6 +29,7 @@ jobs:
           cargo fmt --manifest-path "$GITHUB_WORKSPACE/crabefi-runtime-abi/Cargo.toml" -- --check
           cargo fmt --manifest-path "$GITHUB_WORKSPACE/crabefi-runtime-image/Cargo.toml" -- --check
           cargo fmt --manifest-path "$GITHUB_WORKSPACE/test-apps/runtime-image-test/Cargo.toml" -- --check
+          cargo fmt --manifest-path "$GITHUB_WORKSPACE/ci/fixtures/library-consumer/Cargo.toml" -- --check
 
   coreboot-feature-tests:
     name: Coreboot feature regression tests
@@ -47,6 +48,7 @@ jobs:
           cd "$HOME"
           cargo test --manifest-path "$GITHUB_WORKSPACE/crabefi-runtime-abi/Cargo.toml"
           cargo test --manifest-path "$GITHUB_WORKSPACE/crabefi-runtime-image/Cargo.toml"
+          cargo test --manifest-path "$GITHUB_WORKSPACE/crabefi-runtime-bundle/Cargo.toml"
 
   # ── x86_64 ────────────────────────────────────────────────────────────
 
@@ -95,8 +97,19 @@ jobs:
       - name: Install stable toolchain for xtask
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Build coreboot payload with Cargo-only runtime
+        run: cargo build -p crabefi-coreboot --release --target x86_64-unknown-none
+
       - name: Build release
         run: ./crabefi build --arch x86-64
+
+      - name: Build Cargo-only library consumer
+        run: |
+          cargo +nightly -Z build-std=core,compiler_builtins,alloc \
+            -Z build-std-features=compiler-builtins-mem \
+            build --release \
+            --manifest-path ci/fixtures/library-consumer/Cargo.toml \
+            --target x86_64-unknown-none
 
       - name: Report reserved stack
         run: |
@@ -551,6 +564,14 @@ jobs:
       - name: Build release
         run: ./crabefi build --arch aarch64 --machine sbsa
 
+      - name: Build Cargo-only library consumer
+        run: |
+          cargo +nightly -Z build-std=core,compiler_builtins,alloc \
+            -Z build-std-features=compiler-builtins-mem \
+            build --release \
+            --manifest-path ci/fixtures/library-consumer/Cargo.toml \
+            --target aarch64-unknown-none
+
       - name: Upload CrabEFI ELF (aarch64)
         uses: actions/upload-artifact@v7
         with:
@@ -727,6 +748,14 @@ jobs:
 
       - name: Build release
         run: ./crabefi build --arch riscv64
+
+      - name: Build Cargo-only library consumer
+        run: |
+          cargo +nightly -Z build-std=core,compiler_builtins,alloc \
+            -Z build-std-features=compiler-builtins-mem \
+            build --release \
+            --manifest-path ci/fixtures/library-consumer/Cargo.toml \
+            --target riscv64gc-unknown-none-elf
 
       - name: Show ELF info
         run: |

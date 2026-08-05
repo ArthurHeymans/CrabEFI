@@ -21,6 +21,8 @@ pub mod bls;
 pub mod boot;
 mod boot_manager;
 pub mod boot_vars;
+#[cfg(feature = "bundled-runtime-image")]
+mod bundled_runtime;
 #[cfg(feature = "ui")]
 pub mod cursor;
 pub mod drivers;
@@ -63,6 +65,8 @@ pub fn reset_system() -> ! {
 }
 
 // Re-export the public platform API at the crate root for ergonomic access.
+#[cfg(feature = "bundled-runtime-image")]
+pub use bundled_runtime::BUNDLED_RUNTIME_IMAGE;
 pub use crabefi_runtime_abi::{
     RuntimeExternalRange, RuntimeResetConfig, RuntimeTimeConfig, reset_mechanism, time_mechanism,
 };

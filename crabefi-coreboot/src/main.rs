@@ -37,6 +37,7 @@ mod cfr_menu;
 mod fmap;
 mod framebuffer;
 mod memory;
+#[cfg(feature = "external-runtime-image")]
 mod runtime_blob;
 mod tables;
 #[cfg(target_arch = "x86_64")]
@@ -54,9 +55,17 @@ use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 const MAX_MEMORY_REGIONS: usize = 96;
 
 fn runtime_image_source() -> crabefi::RuntimeImageSource<'static> {
-    crabefi::RuntimeImageSource {
-        bytes: runtime_blob::RUNTIME_IMAGE,
-        expected_sha256: runtime_blob::RUNTIME_IMAGE_SHA256,
+    #[cfg(feature = "bundled-runtime-image")]
+    {
+        crabefi::BUNDLED_RUNTIME_IMAGE
+    }
+
+    #[cfg(feature = "external-runtime-image")]
+    {
+        crabefi::RuntimeImageSource {
+            bytes: runtime_blob::RUNTIME_IMAGE,
+            expected_sha256: runtime_blob::RUNTIME_IMAGE_SHA256,
+        }
     }
 }
 

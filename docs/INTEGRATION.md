@@ -4,6 +4,32 @@
 must also supply the normalized separate Runtime Services image built from
 `crabefi-runtime-image`.
 
+## Cargo-only integration
+
+Enable `crabefi-core`'s `bundled-runtime-image` feature to embed the normalized
+image generated from the same CrabEFI source revision:
+
+```toml
+[dependencies]
+crabefi = {
+    package = "crabefi-core",
+    git = "https://github.com/ArthurHeymans/CrabEFI.git",
+    rev = "<pinned revision>",
+    default-features = false,
+    features = ["bundled-runtime-image"],
+}
+```
+
+Then use `crabefi::BUNDLED_RUNTIME_IMAGE` for `PlatformConfig::runtime_image`.
+This requires no xtask invocation, environment variables, or separately managed
+artifact. Cargo selects the image for the compilation target. Platforms that
+authenticate or provision their own image can leave the feature disabled and
+construct `RuntimeImageSource` directly.
+
+The bundled image only removes artifact-build plumbing. Runtime mechanism
+selection and the warm-reset-retained deferred buffer remain platform-owned
+requirements.
+
 ## Mandatory runtime fields
 
 ```rust,ignore
@@ -11,10 +37,7 @@ let config = crabefi::PlatformConfig {
     memory_map: &regions,
     timer: &boot_timer,
     reset: &boot_reset,
-    runtime_image: crabefi::RuntimeImageSource {
-        bytes: normalized_runtime_image,
-        expected_sha256: runtime_image_sha256,
-    },
+    runtime_image: crabefi::BUNDLED_RUNTIME_IMAGE,
     runtime: crabefi::RuntimePlatformConfig {
         time: crabefi::RuntimeTimeConfig {
             mechanism: crabefi::time_mechanism::UNSUPPORTED,
