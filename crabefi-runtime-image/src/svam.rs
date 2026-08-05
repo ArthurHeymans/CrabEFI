@@ -140,7 +140,17 @@ fn validate_descriptor_stream(
         {
             return Err(efi::Status::INVALID_PARAMETER);
         }
-        if descriptor.attribute & efi::MEMORY_RUNTIME == 0 {
+        // x86 Linux includes BootServicesCode/Data descriptors in the map it
+        // passes to SetVirtualAddressMap as a compatibility mapping for buggy
+        // firmware. They are not runtime-owned mappings and are ignored below.
+        // Descriptors used for CrabEFI state are still required to carry
+        // EFI_MEMORY_RUNTIME by the individual resolvers.
+        let linux_boot_services_mapping = cfg!(target_arch = "x86_64")
+            && matches!(
+                descriptor.r#type,
+                efi::BOOT_SERVICES_CODE | efi::BOOT_SERVICES_DATA
+            );
+        if descriptor.attribute & efi::MEMORY_RUNTIME == 0 && !linux_boot_services_mapping {
             return Err(efi::Status::INVALID_PARAMETER);
         }
         let current = mapping(descriptor)?;
@@ -197,6 +207,7 @@ fn resolve_sections(
             .try_fold(None, |found, descriptor_index| {
                 let candidate = mapping(read_descriptor(map, stride, descriptor_index)?)?;
                 if candidate.memory_type != expected_type
+                    || candidate.attributes & efi::MEMORY_RUNTIME == 0
                     || candidate.virtual_address == 0
                     || candidate.physical > section.physical_base
                     || !candidate
@@ -263,6 +274,7 @@ fn resolve_deferred_buffer(
         .try_fold(None, |found, index| {
             let candidate = mapping(read_descriptor(map, stride, index)?)?;
             if candidate.memory_type != efi::RUNTIME_SERVICES_DATA
+                || candidate.attributes & efi::MEMORY_RUNTIME == 0
                 || candidate.virtual_address == 0
                 || candidate.physical > runtime.deferred_buffer_physical
                 || !candidate.physical_end().is_some_and(|value| value >= end)
@@ -601,6 +613,55 @@ fn canonical_virtual(address: u64) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn accepts_linux_boot_services_compatibility_mapping() {
+        let descriptors = [efi::MemoryDescriptor {
+            r#type: efi::BOOT_SERVICES_DATA,
+            physical_start: 0x20_0000,
+            virtual_start: 0xffff_fffe_ffe0_0000,
+            number_of_pages: 4,
+            attribute: efi::MEMORY_WB,
+        }];
+        assert_eq!(
+            validate_descriptor_stream(
+                descriptors.as_ptr().cast(),
+                core::mem::size_of::<efi::MemoryDescriptor>(),
+                descriptors.len(),
+            ),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn runtime_section_requires_runtime_attribute() {
+        let mut runtime = state::RuntimeState::new();
+        runtime.section_count = 1;
+        runtime.sections[0] = state::SectionRecord {
+            physical_base: 0x40_0000,
+            virtual_base: 0,
+            image_offset: 0,
+            byte_len: PAGE_SIZE as u32,
+            flags: section_flags::EXECUTE,
+        };
+        let descriptors = [efi::MemoryDescriptor {
+            r#type: efi::RUNTIME_SERVICES_CODE,
+            physical_start: 0x40_0000,
+            virtual_start: 0xffff_fffe_ffc0_0000,
+            number_of_pages: 1,
+            attribute: efi::MEMORY_WB,
+        }];
+        assert!(matches!(
+            resolve_sections(
+                &runtime,
+                descriptors.as_ptr().cast(),
+                core::mem::size_of::<efi::MemoryDescriptor>(),
+                descriptors.len(),
+            ),
+            Err(efi::Status::NOT_FOUND)
+        ));
+    }
 
     #[test]
     fn converts_mmio_time_base_to_matching_virtual_range() {

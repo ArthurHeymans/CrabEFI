@@ -518,7 +518,14 @@ fn make_identity_virtual_map(
         // output_count never exceeds index, so overlapping compaction is valid.
         let source = unsafe { map.cast::<u8>().add(index * stride) };
         let mut descriptor = unsafe { (source as *const efi::MemoryDescriptor).read_unaligned() };
-        if descriptor.attribute & efi::MEMORY_RUNTIME == 0 {
+        // Match native x86 Linux: alongside runtime descriptors, include boot
+        // services code/data as compatibility mappings for firmware that still
+        // touches those regions after ExitBootServices.
+        let linux_boot_services_mapping = matches!(
+            descriptor.r#type,
+            efi::BOOT_SERVICES_CODE | efi::BOOT_SERVICES_DATA
+        );
+        if descriptor.attribute & efi::MEMORY_RUNTIME == 0 && !linux_boot_services_mapping {
             continue;
         }
         descriptor.virtual_start = descriptor.physical_start;
