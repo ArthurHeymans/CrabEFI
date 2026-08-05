@@ -17,6 +17,9 @@
 use alloc::vec;
 use alloc::vec::Vec;
 
+use crabefi_efi_types::secure_boot::EFI_GLOBAL_VARIABLE_GUID;
+use r_efi::efi::Guid;
+
 /// The directory on the ESP where capsule files are placed.
 pub const CAPSULE_FILE_DIRECTORY: &str = "EFI\\UpdateCapsule";
 
@@ -39,15 +42,17 @@ pub struct DiskCapsule {
 /// Reads the `OsIndications` EFI variable and checks whether the
 /// `FILE_CAPSULE_DELIVERY_SUPPORTED` bit is set.
 pub fn is_file_capsule_delivery_requested() -> bool {
-    use crate::efi::auth::EFI_GLOBAL_VARIABLE_GUID;
     let os_ind_name: &[u16] = &[
         'O' as u16, 's' as u16, 'I' as u16, 'n' as u16, 'd' as u16, 'i' as u16, 'c' as u16,
         'a' as u16, 't' as u16, 'i' as u16, 'o' as u16, 'n' as u16, 's' as u16, 0,
     ];
-    crate::efi::runtime_image::client::variables::get(&EFI_GLOBAL_VARIABLE_GUID, os_ind_name)
-        .and_then(|(_, data)| data.get(..8).and_then(|bytes| bytes.try_into().ok()))
-        .map(u64::from_le_bytes)
-        .is_some_and(|value| value & EFI_OS_INDICATIONS_FILE_CAPSULE_DELIVERY_SUPPORTED != 0)
+    crate::efi::runtime_image::client::variables::get(
+        &Guid::from_bytes(&EFI_GLOBAL_VARIABLE_GUID),
+        os_ind_name,
+    )
+    .and_then(|(_, data)| data.get(..8).and_then(|bytes| bytes.try_into().ok()))
+    .map(u64::from_le_bytes)
+    .is_some_and(|value| value & EFI_OS_INDICATIONS_FILE_CAPSULE_DELIVERY_SUPPORTED != 0)
 }
 
 /// Scan the ESP for capsule files and return their contents.
@@ -176,8 +181,6 @@ fn scan_device_for_capsules(
 /// This tells the OS which capsule delivery mechanisms are available.
 /// Called during boot initialization.
 pub fn install_os_indications_supported() {
-    use crate::efi::auth::EFI_GLOBAL_VARIABLE_GUID;
-
     let supported = EFI_OS_INDICATIONS_FMP_CAPSULE_SUPPORTED
         | EFI_OS_INDICATIONS_FILE_CAPSULE_DELIVERY_SUPPORTED;
 
@@ -194,7 +197,7 @@ pub fn install_os_indications_supported() {
     let attributes = 0x06u32; // BS | RT
 
     crate::efi::varstore::import_variable_into_runtime(
-        &EFI_GLOBAL_VARIABLE_GUID,
+        &Guid::from_bytes(&EFI_GLOBAL_VARIABLE_GUID),
         name,
         attributes,
         &data,
@@ -211,22 +214,22 @@ pub fn install_os_indications_supported() {
 ///
 /// This prevents re-processing on subsequent boots.
 pub fn clear_os_indications_capsule_bits() {
-    use crate::efi::auth::EFI_GLOBAL_VARIABLE_GUID;
     let os_ind_name: &[u16] = &[
         'O' as u16, 's' as u16, 'I' as u16, 'n' as u16, 'd' as u16, 'i' as u16, 'c' as u16,
         'a' as u16, 't' as u16, 'i' as u16, 'o' as u16, 'n' as u16, 's' as u16, 0,
     ];
 
-    if let Some((attributes, data)) =
-        crate::efi::runtime_image::client::variables::get(&EFI_GLOBAL_VARIABLE_GUID, os_ind_name)
-        && let Some(raw) = data.get(..8).and_then(|bytes| bytes.try_into().ok())
+    if let Some((attributes, data)) = crate::efi::runtime_image::client::variables::get(
+        &Guid::from_bytes(&EFI_GLOBAL_VARIABLE_GUID),
+        os_ind_name,
+    ) && let Some(raw) = data.get(..8).and_then(|bytes| bytes.try_into().ok())
     {
         let mut value = u64::from_le_bytes(raw);
         value &= !(EFI_OS_INDICATIONS_FMP_CAPSULE_SUPPORTED
             | EFI_OS_INDICATIONS_FILE_CAPSULE_DELIVERY_SUPPORTED);
         let bytes = value.to_le_bytes();
         let status = crate::efi::runtime_image::client::variables::set(
-            &EFI_GLOBAL_VARIABLE_GUID,
+            &Guid::from_bytes(&EFI_GLOBAL_VARIABLE_GUID),
             os_ind_name,
             attributes,
             &bytes,

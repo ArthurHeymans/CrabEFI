@@ -70,6 +70,20 @@ updates, appends, and deletions are verified inside the runtime image using its
 authoritative key databases, replay timestamps, and bounded BSS scratch
 allocator. Boot enrollment uses the same standard `SetVariable` entry point.
 
+The split intentionally has two narrowly scoped certificate verifiers. The
+runtime image uses the bounded, allocation-free, hand-rolled PKCS#7/X.509
+verifier in `crabefi-runtime-image/src/auth/crypto.rs`; boot retains the
+`cms`/`x509_cert`-based verifier solely for Authenticode image verification.
+Both deliberately skip certificate `notBefore`/`notAfter` checks. This
+preserves the pre-split `check_validity_period = false` behavior and matches
+EDK2 and U-Boot Secure Boot handling, where firmware time does not gate trust
+in an enrolled certificate.
+
+The allocation-free `crabefi-efi-types` crate single-sources the EFI time
+comparison, authenticated-variable and signature-list structures, and the
+Secure Boot variable names and GUIDs used by boot and the runtime image. This
+keeps parsing and policy identifiers identical across the image boundary.
+
 ## Virtual addressing and memory permissions
 
 `SetVirtualAddressMap` is validate-then-commit and remains retryable after a
@@ -119,9 +133,10 @@ relocation metadata/counts, indirect-call bounds, native relocation domains,
 and stack budget are enforced rather than represented by placeholder JSON.
 
 The repository verifies ABI parsing/relocation fixtures, authenticated-variable
-and deferred-journal host tests, format/lint/check/build coverage for all
-supported architectures, and QEMU boot paths including two-boot replay and
-capsule consumption. The only remaining verification gap is physical-board
+and deferred-journal host tests, adversarial host tests for the bounded PKCS#7
+DER parser and its certificate/signer/chain limits, format/lint/check/build
+coverage for all supported architectures, and QEMU boot paths including
+two-boot replay and capsule consumption. The only remaining verification gap is physical-board
 boot coverage (including board-specific reset, RTC, SPI compaction,
 warm-reset retention, and platform MMIO wiring); no physical hardware is
 available in this environment.

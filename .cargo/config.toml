@@ -1,7 +1,7 @@
 # NOTE: Use ./xtask script to run xtask (it needs different build settings)
 #
 # Linker scripts are handled by crabefi-coreboot/build.rs.
-# Only compilation flags and build-std settings live here.
+# Build-std is passed by xtask so host-side Cargo commands remain unaffected.
 
 [target.x86_64-unknown-none]
 rustflags = [
@@ -18,7 +18,3 @@ rustflags = [
 rustflags = [
     "-C", "relocation-model=static",
 ]
-
-[unstable]
-build-std = ["core", "compiler_builtins", "alloc"]
-build-std-features = ["compiler-builtins-mem"]

@@ -1,7 +1,4 @@
-[unstable]
-build-std = ["core", "compiler_builtins", "alloc"]
-build-std-features = ["compiler-builtins-mem"]
-
-# `xtask::runtime` owns target codegen flags because it must also add the
-# architecture-specific map path. Keeping this file free of rustflags avoids
-# a second configuration silently overridden by RUSTFLAGS.
+# `xtask::runtime` owns build-std and target codegen flags because it must also
+# add the architecture-specific map path. Keeping this file free of build
+# options avoids affecting host-side tests and avoids a second configuration
+# silently overridden by the xtask command line and RUSTFLAGS.

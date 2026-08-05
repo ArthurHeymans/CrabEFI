@@ -2,9 +2,11 @@
 
 use alloc::vec::Vec;
 
+use crabefi_efi_types::crc32;
+use crabefi_runtime_abi::VariableTimestamp;
 use serde::{Deserialize, Serialize};
 
-use crate::{crc32, efi, scratch};
+use crate::{efi, scratch};
 
 pub const MAX_NAME_LEN: usize = 64;
 pub const MAX_DATA_SIZE: usize = 32 * 1024;
@@ -89,63 +91,22 @@ pub struct SerializedGuid {
     pub bytes: [u8; 16],
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SerializedTime {
-    pub year: u16,
-    pub month: u8,
-    pub day: u8,
-    pub hour: u8,
-    pub minute: u8,
-    pub second: u8,
-    pub nanosecond: u32,
-    pub timezone: i16,
-    pub daylight: u8,
-}
-
-impl SerializedTime {
-    pub const fn zero() -> Self {
-        Self {
-            year: 0,
-            month: 0,
-            day: 0,
-            hour: 0,
-            minute: 0,
-            second: 0,
-            nanosecond: 0,
-            timezone: 0,
-            daylight: 0,
-        }
-    }
-
-    pub fn from_abi(value: crabefi_runtime_abi::VariableTimestamp) -> Self {
-        Self {
-            year: value.year,
-            month: value.month,
-            day: value.day,
-            hour: value.hour,
-            minute: value.minute,
-            second: value.second,
-            nanosecond: value.nanosecond,
-            timezone: value.timezone,
-            daylight: value.daylight,
-        }
-    }
-
-    pub fn to_abi(self) -> crabefi_runtime_abi::VariableTimestamp {
-        crabefi_runtime_abi::VariableTimestamp {
-            year: self.year,
-            month: self.month,
-            day: self.day,
-            hour: self.hour,
-            minute: self.minute,
-            second: self.second,
-            pad1: 0,
-            nanosecond: self.nanosecond,
-            timezone: self.timezone,
-            daylight: self.daylight,
-            pad2: 0,
-        }
-    }
+#[derive(Serialize, Deserialize)]
+#[serde(remote = "VariableTimestamp")]
+struct VariableTimestampDef {
+    year: u16,
+    month: u8,
+    day: u8,
+    hour: u8,
+    minute: u8,
+    second: u8,
+    #[serde(skip)]
+    pad1: u8,
+    nanosecond: u32,
+    timezone: i16,
+    daylight: u8,
+    #[serde(skip)]
+    pad2: u8,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -157,7 +118,8 @@ pub struct VariableRecord {
     pub name: Vec<u16>,
     pub data: Vec<u8>,
     pub monotonic_count: u64,
-    pub timestamp: SerializedTime,
+    #[serde(with = "VariableTimestampDef")]
+    pub timestamp: VariableTimestamp,
     pub crc: u32,
 }
 
@@ -180,7 +142,8 @@ struct VariableRecordRef<'a> {
     name: &'a [u16],
     data: &'a [u8],
     monotonic_count: u64,
-    timestamp: SerializedTime,
+    #[serde(with = "VariableTimestampDef")]
+    timestamp: VariableTimestamp,
     crc: u32,
 }
 
@@ -340,7 +303,7 @@ pub struct DeferredWrite<'a> {
     pub name: &'a [u16],
     pub attributes: u32,
     pub data: &'a [u8],
-    pub timestamp: SerializedTime,
+    pub timestamp: VariableTimestamp,
     pub authenticated: bool,
     pub deletion: bool,
 }
@@ -632,7 +595,7 @@ mod tests {
                 name: &[b'T' as u16, b'e' as u16, b's' as u16, b't' as u16],
                 attributes: 7,
                 data: &[1, 2, 3, 4],
-                timestamp: SerializedTime::zero(),
+                timestamp: VariableTimestamp::default(),
                 authenticated: false,
                 deletion: false,
             },

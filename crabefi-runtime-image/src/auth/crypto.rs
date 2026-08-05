@@ -1,5 +1,6 @@
 //! Borrowed CMS/X.509 parsing and bounded RSA verification.
 
+use crabefi_efi_types::constant_time_eq;
 use rsa::traits::PublicKeyParts;
 use sha2::{Digest, Sha256};
 
@@ -570,16 +571,4 @@ fn verify_rsa_signature(
         rsa::pkcs1v15::Signature::try_from(signature).map_err(|_| AuthError::CryptoError)?;
     let verifier = rsa::pkcs1v15::VerifyingKey::<Sha256>::new(key.clone());
     Ok(verifier.verify_prehash(digest, &signature).is_ok())
-}
-
-fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
-    let difference = left.len() ^ right.len();
-    let mut result = difference as u8
-        | (difference >> 8) as u8
-        | (difference >> 16) as u8
-        | (difference >> 24) as u8;
-    for (left, right) in left.iter().zip(right) {
-        result |= left ^ right;
-    }
-    result == 0
 }

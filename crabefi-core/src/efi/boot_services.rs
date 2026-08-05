@@ -19,6 +19,8 @@ use crate::state::{
 };
 use alloc::vec::Vec;
 use core::ffi::c_void;
+
+use crabefi_efi_types::crc32;
 use r_efi::efi::{self, Boolean, Guid, Handle, Status, SystemTable, TableHeader, Tpl};
 use r_efi::protocols::device_path::Protocol as DevicePathProtocol;
 
@@ -2271,41 +2273,9 @@ extern "efiapi" fn calculate_crc32(data: *mut c_void, data_size: usize, crc32: *
     }
 
     let slice = unsafe { core::slice::from_raw_parts(data as *const u8, data_size) };
-    let result = compute_crc32(slice);
+    let result = crc32::calculate(slice);
     unsafe { *crc32 = result };
     Status::SUCCESS
-}
-
-/// CRC32 lookup table (IEEE 802.3 polynomial, generated at compile time)
-const CRC32_TABLE: [u32; 256] = {
-    const POLY: u32 = 0xEDB8_8320; // IEEE 802.3 polynomial (reversed)
-    let mut table = [0u32; 256];
-    let mut i = 0;
-    while i < 256 {
-        let mut crc = i as u32;
-        let mut j = 0;
-        while j < 8 {
-            if crc & 1 != 0 {
-                crc = (crc >> 1) ^ POLY;
-            } else {
-                crc >>= 1;
-            }
-            j += 1;
-        }
-        table[i] = crc;
-        i += 1;
-    }
-    table
-};
-
-/// Compute CRC32 of a byte slice (IEEE 802.3 polynomial)
-pub fn compute_crc32(data: &[u8]) -> u32 {
-    let mut crc = 0xFFFF_FFFF_u32;
-    for &byte in data {
-        let index = ((crc ^ byte as u32) & 0xFF) as usize;
-        crc = CRC32_TABLE[index] ^ (crc >> 8);
-    }
-    !crc
 }
 
 extern "efiapi" fn copy_mem(destination: *mut c_void, source: *mut c_void, length: usize) {

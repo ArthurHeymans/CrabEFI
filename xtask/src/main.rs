@@ -319,7 +319,14 @@ fn cmd_build(release: bool, ui: bool, arch: Arch, machine: Machine) -> Result<()
     let runtime = runtime::build(arch)?;
 
     let mut cmd = std::process::Command::new("cargo");
-    cmd.arg("build");
+    cmd.args([
+        "+nightly",
+        "-Z",
+        "build-std=core,compiler_builtins,alloc",
+        "-Z",
+        "build-std-features=compiler-builtins-mem",
+        "build",
+    ]);
     // Build the coreboot payload binary (the binary target lives in the
     // crabefi-coreboot workspace member, not in the root library crate).
     cmd.arg("-p").arg("crabefi-coreboot");

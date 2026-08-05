@@ -2,13 +2,14 @@
 
 use core::ffi::c_void;
 
+use crabefi_efi_types::crc32;
 use crabefi_runtime_abi::{
     ConfigurationRegistration, ConsoleRegistration, EsrtRegistration, MAX_CONFIGURATION_TABLES,
     configuration_policy, section_flags,
 };
 
 use crate::{
-    crc32, efi, services,
+    efi, services,
     state::{RangeRecord, SectionRecord},
 };
 

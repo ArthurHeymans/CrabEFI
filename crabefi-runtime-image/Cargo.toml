@@ -8,6 +8,7 @@ build = "build.rs"
 [workspace]
 
 [dependencies]
+crabefi-efi-types = { path = "../crabefi-efi-types" }
 crabefi-runtime-abi = { path = "../crabefi-runtime-abi" }
 postcard = { version = "1.0", default-features = false, features = ["alloc"] }
 r-efi = "5.3"

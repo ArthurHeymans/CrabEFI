@@ -2,8 +2,7 @@
 
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned};
 
-use crate::deferred::SerializedTime;
-
+/// Packed EFI timestamp used by time-based authenticated variables.
 #[repr(C, packed)]
 #[derive(Debug, Clone, Copy, FromBytes, IntoBytes, Immutable, KnownLayout, Unaligned)]
 pub struct EfiTime {
@@ -21,6 +20,24 @@ pub struct EfiTime {
 }
 
 impl EfiTime {
+    /// Construct an all-zero timestamp.
+    pub const fn zero() -> Self {
+        Self {
+            year: 0,
+            month: 0,
+            day: 0,
+            hour: 0,
+            minute: 0,
+            second: 0,
+            pad1: 0,
+            nanosecond: 0,
+            timezone: 0,
+            daylight: 0,
+            pad2: 0,
+        }
+    }
+
+    /// Return whether every field is within the EFI-defined range.
     pub fn is_valid(&self) -> bool {
         let year = self.year;
         let timezone = self.timezone;
@@ -36,6 +53,7 @@ impl EfiTime {
             && self.pad2 == 0
     }
 
+    /// Return whether this timestamp has greater nanosecond-precision UTC units.
     pub fn is_after(&self, other: &Self) -> bool {
         self.to_utc_units() > other.to_utc_units()
     }
@@ -54,38 +72,9 @@ impl EfiTime {
         }
         seconds * 1_000_000_000 + i128::from(self.nanosecond)
     }
-
-    pub fn to_serialized(self) -> SerializedTime {
-        SerializedTime {
-            year: self.year,
-            month: self.month,
-            day: self.day,
-            hour: self.hour,
-            minute: self.minute,
-            second: self.second,
-            nanosecond: self.nanosecond,
-            timezone: self.timezone,
-            daylight: self.daylight,
-        }
-    }
-
-    pub fn from_serialized(value: SerializedTime) -> Self {
-        Self {
-            year: value.year,
-            month: value.month,
-            day: value.day,
-            hour: value.hour,
-            minute: value.minute,
-            second: value.second,
-            pad1: 0,
-            nanosecond: value.nanosecond,
-            timezone: value.timezone,
-            daylight: value.daylight,
-            pad2: 0,
-        }
-    }
 }
 
+/// Base WIN_CERTIFICATE header.
 #[repr(C, packed)]
 #[derive(Debug, Clone, Copy, FromBytes, Immutable, KnownLayout, Unaligned)]
 pub struct WinCertificate {
@@ -94,6 +83,7 @@ pub struct WinCertificate {
     pub w_certificate_type: u16,
 }
 
+/// WIN_CERTIFICATE header carrying an EFI certificate-type GUID.
 #[repr(C, packed)]
 #[derive(Debug, Clone, Copy, FromBytes, Immutable, KnownLayout, Unaligned)]
 pub struct WinCertificateUefiGuid {
@@ -105,6 +95,7 @@ impl WinCertificateUefiGuid {
     pub const HEADER_SIZE: usize = core::mem::size_of::<Self>();
 }
 
+/// Header for a time-based authenticated variable update.
 #[repr(C, packed)]
 #[derive(Debug, Clone, Copy, FromBytes, Immutable, KnownLayout, Unaligned)]
 pub struct EfiVariableAuthentication2 {
@@ -136,6 +127,7 @@ impl EfiVariableAuthentication2 {
     }
 }
 
+/// Header for one list in an EFI signature database.
 #[repr(C, packed)]
 #[derive(Debug, Clone, Copy, FromBytes, Immutable, KnownLayout, Unaligned)]
 pub struct EfiSignatureList {
@@ -179,6 +171,7 @@ pub fn validate_signature_database(mut data: &[u8]) -> bool {
     list_count != 0
 }
 
+/// Iterator over complete lists in an EFI signature database.
 pub struct SignatureListIterator<'a> {
     data: &'a [u8],
     offset: usize,
@@ -216,6 +209,7 @@ impl<'a> Iterator for SignatureListIterator<'a> {
     }
 }
 
+/// Iterator over owner GUID and payload pairs in one signature list.
 pub struct SignatureIterator<'a> {
     list: &'a EfiSignatureList,
     data: &'a [u8],

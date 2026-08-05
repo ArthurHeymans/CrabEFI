@@ -21,9 +21,13 @@
 //! Then:      [u8]   OptionalData       (remaining bytes)
 //! ```
 
-use crate::efi::auth::{EFI_GLOBAL_VARIABLE_GUID, attributes};
 use core::fmt::Write;
+
+use crabefi_efi_types::secure_boot::EFI_GLOBAL_VARIABLE_GUID;
 use crabefi_runtime_abi::MAX_VARIABLE_NAME_LEN;
+use r_efi::efi::Guid;
+
+use crate::efi::auth::attributes;
 use heapless::Vec as HeaplessVec;
 
 // ============================================================================
@@ -301,15 +305,22 @@ fn boot_option_name(option_number: u16) -> [u16; MAX_VARIABLE_NAME_LEN] {
 ///
 /// Returns `Some((attributes, data_slice))` if found, `None` otherwise.
 fn read_variable(name: &[u16]) -> Option<(u32, alloc::vec::Vec<u8>)> {
-    crate::efi::runtime_image::client::variables::get(&EFI_GLOBAL_VARIABLE_GUID, name)
+    crate::efi::runtime_image::client::variables::get(
+        &Guid::from_bytes(&EFI_GLOBAL_VARIABLE_GUID),
+        name,
+    )
 }
 
 /// Write (or create) a variable in the in-memory variable store.
 ///
 /// If `data` is empty and `attrs` is 0, the variable is deleted.
 fn write_variable(name: &[u16], attrs: u32, data: &[u8]) -> bool {
-    crate::efi::runtime_image::client::variables::set(&EFI_GLOBAL_VARIABLE_GUID, name, attrs, data)
-        == r_efi::efi::Status::SUCCESS
+    crate::efi::runtime_image::client::variables::set(
+        &Guid::from_bytes(&EFI_GLOBAL_VARIABLE_GUID),
+        name,
+        attrs,
+        data,
+    ) == r_efi::efi::Status::SUCCESS
 }
 
 /// Delete a variable from the in-memory store.

@@ -2,17 +2,45 @@
 
 mod crypto;
 mod signature;
-pub mod structures;
-pub mod variables;
 
 pub use signature::verify_authenticated_variable;
-pub use structures::validate_signature_database;
-pub use variables::{
-    EFI_GLOBAL_VARIABLE_GUID, SECURE_BOOT_ENABLE_NAME, SECURE_BOOT_NAME, SETUP_MODE_NAME,
-    SecureBootVariable, identify_key_database, is_status_variable,
-};
+
+use crabefi_efi_types::authentication::EfiTime;
+use crabefi_runtime_abi::VariableTimestamp;
 
 use crate::efi;
+
+pub fn efi_time_from_timestamp(value: VariableTimestamp) -> EfiTime {
+    EfiTime {
+        year: value.year,
+        month: value.month,
+        day: value.day,
+        hour: value.hour,
+        minute: value.minute,
+        second: value.second,
+        pad1: value.pad1,
+        nanosecond: value.nanosecond,
+        timezone: value.timezone,
+        daylight: value.daylight,
+        pad2: value.pad2,
+    }
+}
+
+pub fn timestamp_from_efi_time(value: EfiTime) -> VariableTimestamp {
+    VariableTimestamp {
+        year: value.year,
+        month: value.month,
+        day: value.day,
+        hour: value.hour,
+        minute: value.minute,
+        second: value.second,
+        pad1: value.pad1,
+        nanosecond: value.nanosecond,
+        timezone: value.timezone,
+        daylight: value.daylight,
+        pad2: value.pad2,
+    }
+}
 
 pub const MAX_AUTHENTICATED_ENVELOPE_SIZE: usize = 48 * 1024;
 /// Complete RSA/CMS service-operation reservation, including signed-data assembly.

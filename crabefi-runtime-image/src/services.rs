@@ -2,9 +2,10 @@
 
 use core::ffi::c_void;
 
+use crabefi_efi_types::{authentication::validate_signature_database, secure_boot};
 use crabefi_runtime_abi::{
-    BridgeRequest, MAX_VARIABLE_DATA_SIZE, MAX_VARIABLE_NAME_LEN, bridge_operation, phase,
-    time_mechanism,
+    BridgeRequest, MAX_VARIABLE_DATA_SIZE, MAX_VARIABLE_NAME_LEN, VariableTimestamp,
+    bridge_operation, phase, time_mechanism,
 };
 
 use crate::{
@@ -186,10 +187,10 @@ pub extern "efiapi" fn get_variable(
         Ok(lease) => lease,
         Err(status) => return status,
     };
-    if guid == *auth::EFI_GLOBAL_VARIABLE_GUID.as_bytes() {
-        let value = if name.as_slice() == auth::SETUP_MODE_NAME {
+    if guid == secure_boot::EFI_GLOBAL_VARIABLE_GUID {
+        let value = if secure_boot::name_matches(name.as_slice(), secure_boot::SETUP_MODE_NAME) {
             Some(u8::from(lease.variables().setup_mode()))
-        } else if name.as_slice() == auth::SECURE_BOOT_NAME {
+        } else if secure_boot::name_matches(name.as_slice(), secure_boot::SECURE_BOOT_NAME) {
             Some(u8::from(lease.variables().secure_boot_enabled()))
         } else {
             None
@@ -273,19 +274,19 @@ pub extern "efiapi" fn get_next_variable_name(
     };
     if current_name.len == 0 {
         return write_next_name(
-            auth::SETUP_MODE_NAME,
-            *auth::EFI_GLOBAL_VARIABLE_GUID.as_bytes(),
+            secure_boot::SETUP_MODE_NAME,
+            secure_boot::EFI_GLOBAL_VARIABLE_GUID,
             supplied,
             variable_name_size,
             variable_name,
             vendor_guid,
         );
     }
-    if current_guid == *auth::EFI_GLOBAL_VARIABLE_GUID.as_bytes()
-        && current_name.as_slice() == auth::SETUP_MODE_NAME
+    if current_guid == secure_boot::EFI_GLOBAL_VARIABLE_GUID
+        && secure_boot::name_matches(current_name.as_slice(), secure_boot::SETUP_MODE_NAME)
     {
         return write_next_name(
-            auth::SECURE_BOOT_NAME,
+            secure_boot::SECURE_BOOT_NAME,
             current_guid,
             supplied,
             variable_name_size,
@@ -295,8 +296,8 @@ pub extern "efiapi" fn get_next_variable_name(
     }
     let runtime_only = lease.state().runtime_only();
     let mut visible = lease.variables().visible_slots(runtime_only);
-    let next = if current_guid == *auth::EFI_GLOBAL_VARIABLE_GUID.as_bytes()
-        && current_name.as_slice() == auth::SECURE_BOOT_NAME
+    let next = if current_guid == secure_boot::EFI_GLOBAL_VARIABLE_GUID
+        && secure_boot::name_matches(current_name.as_slice(), secure_boot::SECURE_BOOT_NAME)
     {
         visible.next()
     } else {
@@ -449,10 +450,10 @@ fn apply_variable(
     if let Err(status) = validate_set_arguments(attributes, input.len()) {
         return status;
     }
-    if auth::is_status_variable(&guid, name) {
+    if secure_boot::is_status_variable(&guid, name) {
         return efi::Status::WRITE_PROTECTED;
     }
-    let secure_variable = auth::identify_key_database(&guid, name);
+    let secure_variable = secure_boot::identify_key_database(&guid, name);
     let authenticated = attributes & efi::VARIABLE_TIME_BASED_AUTHENTICATED_WRITE_ACCESS != 0;
     if secure_variable.is_some() && !authenticated && !store.setup_mode() {
         return efi::Status::SECURITY_VIOLATION;
@@ -464,7 +465,7 @@ fn apply_variable(
         match auth::verify_authenticated_variable(store, name, &guid, attributes, input) {
             Ok(verified) => (
                 verified.payload,
-                Some(verified.timestamp.to_serialized()),
+                Some(auth::timestamp_from_efi_time(verified.timestamp)),
                 verified.secure_variable,
             ),
             Err(error) => return error.into(),
@@ -501,7 +502,7 @@ fn apply_variable(
     let Some(staged) = transaction.data(staged_len) else {
         return efi::Status::DEVICE_ERROR;
     };
-    if secure_variable.is_some() && !prepared.delete && !auth::validate_signature_database(staged) {
+    if secure_variable.is_some() && !prepared.delete && !validate_signature_database(staged) {
         return efi::Status::INVALID_PARAMETER;
     }
 
@@ -521,9 +522,7 @@ fn apply_variable(
                 data_address: staged.as_ptr() as u64,
                 timestamp_valid: u32::from(timestamp.is_some()),
                 reserved: 0,
-                timestamp: timestamp
-                    .unwrap_or(deferred::SerializedTime::zero())
-                    .to_abi(),
+                timestamp: timestamp.unwrap_or_default(),
             };
             if let Err(status) = call_boot_bridge(bridge, &request) {
                 return status;
@@ -542,7 +541,7 @@ fn apply_variable(
                         name,
                         attributes,
                         data: input,
-                        timestamp: timestamp.unwrap_or(deferred::SerializedTime::zero()),
+                        timestamp: timestamp.unwrap_or_default(),
                         authenticated: true,
                         deletion: prepared.delete,
                     },
@@ -561,7 +560,7 @@ fn apply_variable(
                             prepared.attributes
                         },
                         data: staged,
-                        timestamp: deferred::SerializedTime::zero(),
+                        timestamp: VariableTimestamp::default(),
                         authenticated: false,
                         deletion: prepared.delete,
                     },
@@ -647,7 +646,7 @@ pub fn replay_deferred(lease: &mut state::Lease) -> Result<usize, efi::Status> {
             }
             let name = &record.name[..name_len];
             if authenticated
-                && let Some(variable) = auth::identify_key_database(&record.guid.bytes, name)
+                && let Some(variable) = secure_boot::identify_key_database(&record.guid.bytes, name)
             {
                 let floor = store.auth_timestamp(variable);
                 if floor == record.timestamp {
@@ -913,8 +912,10 @@ pub fn time_is_supported(mechanism: u32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crabefi_efi_types::authentication::EfiVariableAuthentication2;
+
     use crate::{
-        auth::{self, structures::EfiVariableAuthentication2},
+        auth,
         store::{VariableStore, VariableTransaction},
     };
 
@@ -946,7 +947,7 @@ mod tests {
         deferred_transaction: &mut deferred::DeferredTransaction,
         buffer: &mut [u8],
         current_phase: u8,
-        variable: auth::SecureBootVariable,
+        variable: secure_boot::SecureBootVariable,
         attributes: u32,
         data: &[u8],
     ) -> efi::Status {
@@ -958,7 +959,7 @@ mod tests {
             current_phase,
             successful_bridge as *const () as u64,
             (buffer.as_mut_ptr(), buffer.len()),
-            *variable.guid().as_bytes(),
+            *variable.guid(),
             variable.name(),
             attributes,
             data,
@@ -975,10 +976,10 @@ mod tests {
     ) {
         let pk = include_bytes!("../tests/fixtures/pk.esl");
         for variable in [
-            auth::SecureBootVariable::Kek,
-            auth::SecureBootVariable::Db,
-            auth::SecureBootVariable::Dbx,
-            auth::SecureBootVariable::PK,
+            secure_boot::SecureBootVariable::Kek,
+            secure_boot::SecureBootVariable::Db,
+            secure_boot::SecureBootVariable::Dbx,
+            secure_boot::SecureBootVariable::PK,
         ] {
             assert_eq!(
                 apply(
@@ -1020,7 +1021,7 @@ mod tests {
                 &mut deferred_transaction,
                 &mut buffer,
                 phase::BOOT_ACTIVE,
-                auth::SecureBootVariable::Kek,
+                secure_boot::SecureBootVariable::Kek,
                 AUTH_ATTRIBUTES,
                 include_bytes!("../tests/fixtures/unauthorized-update.bin"),
             ),
@@ -1029,25 +1030,25 @@ mod tests {
 
         let operations = [
             (
-                auth::SecureBootVariable::Db,
+                secure_boot::SecureBootVariable::Db,
                 include_bytes!("../tests/fixtures/db-update.bin").as_slice(),
                 include_bytes!("../tests/fixtures/db-append.bin").as_slice(),
                 include_bytes!("../tests/fixtures/db-delete.bin").as_slice(),
             ),
             (
-                auth::SecureBootVariable::Dbx,
+                secure_boot::SecureBootVariable::Dbx,
                 include_bytes!("../tests/fixtures/dbx-update.bin").as_slice(),
                 include_bytes!("../tests/fixtures/dbx-append.bin").as_slice(),
                 include_bytes!("../tests/fixtures/dbx-delete.bin").as_slice(),
             ),
             (
-                auth::SecureBootVariable::Kek,
+                secure_boot::SecureBootVariable::Kek,
                 include_bytes!("../tests/fixtures/kek-update.bin").as_slice(),
                 include_bytes!("../tests/fixtures/kek-append.bin").as_slice(),
                 include_bytes!("../tests/fixtures/kek-delete.bin").as_slice(),
             ),
             (
-                auth::SecureBootVariable::PK,
+                secure_boot::SecureBootVariable::PK,
                 include_bytes!("../tests/fixtures/pk-update.bin").as_slice(),
                 include_bytes!("../tests/fixtures/pk-append.bin").as_slice(),
                 include_bytes!("../tests/fixtures/pk-delete.bin").as_slice(),
@@ -1093,7 +1094,7 @@ mod tests {
                 ),
                 efi::Status::SUCCESS
             );
-            assert!(auth::validate_signature_database(
+            assert!(validate_signature_database(
                 store.key_database_data(variable).unwrap()
             ));
             assert_eq!(
@@ -1142,7 +1143,7 @@ mod tests {
                 &mut deferred_transaction,
                 &mut buffer,
                 phase::BOOT_ACTIVE,
-                auth::SecureBootVariable::Kek,
+                secure_boot::SecureBootVariable::Kek,
                 AUTH_ATTRIBUTES,
                 include_bytes!("../tests/fixtures/kek-update.bin"),
             ),
@@ -1269,7 +1270,7 @@ mod tests {
                 &mut deferred_transaction,
                 &mut buffer,
                 phase::SEALED_PHYSICAL,
-                auth::SecureBootVariable::Db,
+                secure_boot::SecureBootVariable::Db,
                 AUTH_ATTRIBUTES,
                 include_bytes!("../tests/fixtures/db-update.bin"),
             ),
@@ -1322,7 +1323,7 @@ mod tests {
             Ok(0)
         );
         assert_eq!(
-            reboot_store.key_database_data(auth::SecureBootVariable::Db),
+            reboot_store.key_database_data(secure_boot::SecureBootVariable::Db),
             Some(fixture_payload(include_bytes!(
                 "../tests/fixtures/db-update.bin"
             )))

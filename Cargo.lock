@@ -129,6 +129,7 @@ dependencies = [
  "bitflags",
  "cms",
  "const-oid 0.9.6",
+ "crabefi-efi-types",
  "crabefi-runtime-abi",
  "der 0.7.10",
  "fdt",
@@ -184,6 +185,13 @@ dependencies = [
  "spin 0.12.2",
  "tock-registers",
  "x86_64",
+ "zerocopy",
+]
+
+[[package]]
+name = "crabefi-efi-types"
+version = "0.1.0"
+dependencies = [
  "zerocopy",
 ]
 

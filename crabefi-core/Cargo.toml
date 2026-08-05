@@ -23,6 +23,7 @@ fb-log = []
 ui = []
 
 [dependencies]
+crabefi-efi-types = { workspace = true }
 crabefi-runtime-abi = { path = "../crabefi-runtime-abi" }
 r-efi = { workspace = true }
 log = { workspace = true }

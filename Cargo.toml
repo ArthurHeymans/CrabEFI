@@ -2,7 +2,12 @@
 # xtask and test-apps are NOT workspace members (different build targets).
 
 [workspace]
-members = ["crabefi-core", "crabefi-coreboot", "crabefi-drivers"]
+members = [
+  "crabefi-core",
+  "crabefi-coreboot",
+  "crabefi-drivers",
+  "crabefi-efi-types",
+]
 exclude = [
   "xtask",
   "crabefi-runtime-abi",
@@ -24,6 +29,7 @@ license = "Apache-2.0 OR MIT"
 repository = "https://github.com/user/CrabEFI"
 
 [workspace.dependencies]
+crabefi-efi-types = { path = "crabefi-efi-types" }
 r-efi = "5.3"
 log = "0.4"
 heapless = "0.9"

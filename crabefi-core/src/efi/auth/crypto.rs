@@ -13,6 +13,8 @@ use super::revocation::{RevocationCheckResult, RevocationConfig, check_certifica
 use super::time;
 use alloc::vec;
 use alloc::vec::Vec;
+
+use crabefi_efi_types::constant_time_eq;
 use der::{Decode, Encode, referenced::OwnedToRef};
 use sha2::{Digest, Sha256};
 use x509_cert::Certificate;
@@ -387,39 +389,6 @@ fn build_signed_attrs_digest(
         // No signed attributes - hash the content directly
         Ok(*content_hash)
     }
-}
-
-/// Constant-time byte array comparison to prevent timing attacks
-///
-/// This function compares two byte slices in constant time to prevent
-/// timing side-channel attacks. The execution time is independent of
-/// where (or whether) the bytes differ.
-///
-/// # Security
-///
-/// Use this function when comparing:
-/// - Cryptographic hashes (SHA-256, etc.)
-/// - Message authentication codes (HMACs)
-/// - Any security-sensitive byte comparisons
-///
-/// Do NOT use regular `==` for these comparisons as it may short-circuit
-/// on the first differing byte, leaking information through timing.
-///
-/// The length comparison is also done in constant time to avoid leaking
-/// whether the lengths match via an early return.
-#[inline(never)]
-pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    // Fold the length difference into the result so mismatched lengths
-    // don't cause a timing-observable early return. We OR-fold all bytes
-    // of the XOR'd length to catch differences in any byte position.
-    let d = a.len() ^ b.len();
-    let len_diff = (d as u8) | ((d >> 8) as u8) | ((d >> 16) as u8) | ((d >> 24) as u8);
-    let mut result = len_diff;
-    // Iterate the shorter slice; the length mismatch already poisons `result`.
-    for (x, y) in a.iter().zip(b.iter()) {
-        result |= x ^ y;
-    }
-    result == 0
 }
 
 // ============================================================================

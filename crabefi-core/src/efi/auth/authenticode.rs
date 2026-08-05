@@ -25,6 +25,8 @@ use crate::efi::tcg::types::{
 };
 use crate::pe::{DATA_DIRECTORY_ENTRY_SIZE, IMAGE_DIRECTORY_ENTRY_SECURITY, parse_headers};
 use alloc::vec::Vec;
+
+use crabefi_efi_types::constant_time_eq;
 use sha1::Sha1;
 use sha2::{Digest, Sha256, Sha384, Sha512};
 
@@ -503,7 +505,7 @@ fn verify_authenticode_signature(
     // a valid signature from one PE image is attached to a different image.
     match extract_spc_authenticode_hash(sig.pkcs7_data) {
         Ok(Some(ref spc_hash)) => {
-            if !super::crypto::constant_time_eq(spc_hash, image_hash) {
+            if !constant_time_eq(spc_hash, image_hash) {
                 log::warn!(
                     "Authenticode hash in SpcIndirectDataContent does not match computed image hash"
                 );
