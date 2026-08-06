@@ -67,7 +67,7 @@ rsa = { version = "0.9", default-features = false }
 x509-cert = { version = "0.2", default-features = false }
 der = { version = "0.7", default-features = false }
 const-oid = { version = "0.9", default-features = false }
-signature = { version = "2.2", default-features = false }
+signature = { version = "3.0", default-features = false }
 cms = { version = "0.2", default-features = false }
 spki = { version = "0.8", default-features = false }
 
