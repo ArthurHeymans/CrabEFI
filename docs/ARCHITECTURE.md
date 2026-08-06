@@ -43,9 +43,11 @@ names/GUIDs are single-sourced in `crabefi-efi-types` on both sides of the image
 boundary.
 
 Certificate verification remains intentionally split by execution domain. The
-runtime image's authenticated-variable path uses its bounded, allocation-free,
-hand-rolled PKCS#7/X.509 verifier; boot uses `cms`/`x509_cert` only for
-Authenticode. Neither path enforces certificate `notBefore`/`notAfter`,
+runtime image's authenticated-variable path uses a hand-rolled PKCS#7/X.509
+parser and allocator-aware `crypto-bigint` RSA exponentiation whose temporaries
+are lifetime-scoped to the bounded image-local BSS scratch arena. Signed-data
+hashing is incremental, so the runtime image requires no global allocator;
+boot uses `cms`/`x509_cert` only for Authenticode. Neither path enforces certificate `notBefore`/`notAfter`,
 preserving the old `check_validity_period = false` policy and matching EDK2 and
 U-Boot.
 

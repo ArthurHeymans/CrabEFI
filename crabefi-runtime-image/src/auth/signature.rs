@@ -1,7 +1,5 @@
 //! Authentication-envelope parsing and Secure Boot authorization selection.
 
-use alloc::vec::Vec;
-
 use crabefi_efi_types::{
     authentication::{
         EfiTime, EfiVariableAuthentication2, SignatureIterator, SignatureListIterator,
@@ -11,6 +9,7 @@ use crabefi_efi_types::{
         EFI_CERT_TYPE_PKCS7_GUID, EFI_CERT_X509_GUID, SecureBootVariable, identify_key_database,
     },
 };
+use sha2::{Digest, Sha256};
 use zerocopy::IntoBytes;
 
 use super::{
@@ -69,20 +68,20 @@ pub fn verify_authenticated_variable<'a>(
         if signature.is_empty() {
             return Err(AuthError::InvalidHeader);
         }
-        let signed = build_signed_data(
+        let signed_hash = signed_data_hash(
             variable_name,
             vendor_guid,
             attributes,
             &authentication.time_stamp,
             payload,
-        )?;
+        );
         let authorized = if let Some(variable) = secure_variable {
             let database = variable.authorizing_database();
-            verify_database(store, database, signature, &signed)?
+            verify_database(store, database, signature, &signed_hash)?
                 || (database == SecureBootVariable::Kek
-                    && verify_database(store, SecureBootVariable::PK, signature, &signed)?)
+                    && verify_database(store, SecureBootVariable::PK, signature, &signed_hash)?)
         } else {
-            verify_database(store, SecureBootVariable::Db, signature, &signed)?
+            verify_database(store, SecureBootVariable::Db, signature, &signed_hash)?
         };
         if !authorized {
             return Err(AuthError::SignatureVerificationFailed);
@@ -100,7 +99,7 @@ fn verify_database(
     store: &VariableStore,
     database: SecureBootVariable,
     signature: &[u8],
-    signed_data: &[u8],
+    signed_hash: &[u8; 32],
 ) -> Result<bool, AuthError> {
     let Some(data) = store.key_database_data(database) else {
         return Ok(false);
@@ -116,7 +115,7 @@ fn verify_database(
             if count > MAX_DATABASE_CERTIFICATES {
                 return Err(AuthError::OutOfResources);
             }
-            match super::crypto::verify_pkcs7_signature(signature, signed_data, certificate) {
+            match super::crypto::verify_pkcs7_signature_hash(signature, signed_hash, certificate) {
                 Ok(true) => return Ok(true),
                 Ok(false) => {}
                 Err(AuthError::InvalidHeader | AuthError::CertificateParseError) => {}
@@ -127,31 +126,22 @@ fn verify_database(
     Ok(false)
 }
 
-fn build_signed_data(
+fn signed_data_hash(
     name: &[u16],
     guid: &[u8; 16],
     attributes: u32,
     timestamp: &EfiTime,
     data: &[u8],
-) -> Result<Vec<u8>, AuthError> {
-    let capacity = name
-        .len()
-        .checked_mul(2)
-        .and_then(|size| size.checked_add(16 + 4 + 16))
-        .and_then(|size| size.checked_add(data.len()))
-        .ok_or(AuthError::OutOfResources)?;
-    let mut result = Vec::new();
-    result
-        .try_reserve_exact(capacity)
-        .map_err(|_| AuthError::OutOfResources)?;
+) -> [u8; 32] {
+    let mut hash = Sha256::new();
     for unit in name.iter().take_while(|unit| **unit != 0) {
-        result.extend_from_slice(&unit.to_le_bytes());
+        hash.update(unit.to_le_bytes());
     }
-    result.extend_from_slice(guid);
-    result.extend_from_slice(&attributes.to_le_bytes());
-    result.extend_from_slice(timestamp.as_bytes());
-    result.extend_from_slice(data);
-    Ok(result)
+    hash.update(guid);
+    hash.update(attributes.to_le_bytes());
+    hash.update(timestamp.as_bytes());
+    hash.update(data);
+    hash.finalize().into()
 }
 
 const _: () = assert!(core::mem::size_of::<efi::Time>() == core::mem::size_of::<EfiTime>());
@@ -326,7 +316,9 @@ mod tests {
             crate::auth::timestamp_from_efi_time(deletion.timestamp),
         );
         assert!(store.key_database_data(SecureBootVariable::Db).is_none());
-        assert!(crate::scratch::high_water_for_test() < crate::scratch::SCRATCH_SIZE);
+        assert!(
+            crate::scratch::high_water_for_test() <= super::super::AUTH_OPERATION_SCRATCH_BOUND
+        );
         crate::scratch::reset();
     }
 
@@ -354,7 +346,9 @@ mod tests {
                 .unwrap_err(),
             AuthError::SignatureVerificationFailed
         );
-        assert!(crate::scratch::high_water_for_test() < 384 * 1024);
+        assert!(
+            crate::scratch::high_water_for_test() <= super::super::AUTH_OPERATION_SCRATCH_BOUND
+        );
         crate::scratch::reset();
     }
 

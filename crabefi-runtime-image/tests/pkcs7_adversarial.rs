@@ -1,20 +1,44 @@
 //! Adversarial host tests for the runtime image's bounded CMS/DER parser.
 
-use rsa::rand_core::{CryptoRng, RngCore};
+use core::convert::Infallible;
+
+use rsa::rand_core::{TryCryptoRng, TryRng};
 use rsa::signature::{SignatureEncoding, hazmat::PrehashSigner};
 use rsa::traits::PublicKeyParts;
 use sha2::{Digest, Sha256};
 
 mod scratch {
-    pub fn checkpoint() -> usize {
-        0
+    use allocator_api2::alloc::{AllocError, Allocator};
+    use core::{alloc::Layout, ptr::NonNull};
+    use std::alloc::{GlobalAlloc, System};
+
+    #[derive(Clone, Copy)]
+    pub struct TestAlloc;
+
+    // SAFETY: all operations delegate to the process system allocator.
+    unsafe impl Allocator for TestAlloc {
+        fn allocate(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
+            if layout.size() == 0 {
+                let pointer = NonNull::new(layout.align() as *mut u8).ok_or(AllocError)?;
+                return Ok(NonNull::slice_from_raw_parts(pointer, 0));
+            }
+            let pointer = unsafe { System.alloc(layout) };
+            let pointer = NonNull::new(pointer).ok_or(AllocError)?;
+            Ok(NonNull::slice_from_raw_parts(pointer, layout.size()))
+        }
+
+        unsafe fn deallocate(&self, pointer: NonNull<u8>, layout: Layout) {
+            unsafe { System.dealloc(pointer.as_ptr(), layout) }
+        }
+    }
+
+    pub fn with_scope<R>(body: impl FnOnce(TestAlloc) -> R) -> Option<R> {
+        Some(body(TestAlloc))
     }
 
     pub fn preflight(_required: usize) -> bool {
         true
     }
-
-    pub fn rewind(_checkpoint: usize) {}
 }
 
 mod auth;
@@ -105,8 +129,8 @@ fn subject_public_key(key: &rsa::RsaPublicKey) -> Vec<u8> {
     let key_sequence = tlv(
         0x30,
         &concat(&[
-            integer(&key.n().to_bytes_be()),
-            integer(&key.e().to_bytes_be()),
+            integer(&key.n().to_be_bytes_trimmed_vartime()),
+            integer(&key.e().to_be_bytes_trimmed_vartime()),
         ]),
     );
     let mut bits = vec![0];
@@ -360,34 +384,32 @@ fn signed_attributes_require_unique_matching_content_type_and_digest() {
 fn test_key() -> rsa::RsaPrivateKey {
     struct DeterministicRng(u64);
 
-    impl RngCore for DeterministicRng {
-        fn next_u32(&mut self) -> u32 {
-            self.next_u64() as u32
+    impl TryRng for DeterministicRng {
+        type Error = Infallible;
+
+        fn try_next_u32(&mut self) -> Result<u32, Self::Error> {
+            Ok(self.try_next_u64()? as u32)
         }
 
-        fn next_u64(&mut self) -> u64 {
+        fn try_next_u64(&mut self) -> Result<u64, Self::Error> {
             let mut value = self.0;
             value ^= value << 13;
             value ^= value >> 7;
             value ^= value << 17;
             self.0 = value;
-            value
+            Ok(value)
         }
 
-        fn fill_bytes(&mut self, destination: &mut [u8]) {
+        fn try_fill_bytes(&mut self, destination: &mut [u8]) -> Result<(), Self::Error> {
             for chunk in destination.chunks_mut(8) {
-                let bytes = self.next_u64().to_le_bytes();
+                let bytes = self.try_next_u64()?.to_le_bytes();
                 chunk.copy_from_slice(&bytes[..chunk.len()]);
             }
-        }
-
-        fn try_fill_bytes(&mut self, destination: &mut [u8]) -> Result<(), rsa::rand_core::Error> {
-            self.fill_bytes(destination);
             Ok(())
         }
     }
 
-    impl CryptoRng for DeterministicRng {}
+    impl TryCryptoRng for DeterministicRng {}
 
     rsa::RsaPrivateKey::new(&mut DeterministicRng(0x5eed_cafe_f00d_beef), 1024)
         .expect("deterministic test key generation")
