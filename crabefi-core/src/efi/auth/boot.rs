@@ -132,13 +132,11 @@ pub fn init_secure_boot(config: &SecureBootConfig) -> Result<EnrollmentStatus, A
     // Step 5: Load and apply SecureBootEnable preference from persistent storage
     // This is the user's saved preference from previous boot
     if !is_setup_mode() {
-        let enable_from_storage = load_secure_boot_enable_preference();
-        if enable_from_storage || config.enable_secure_boot {
-            // Use internal function to avoid re-persisting what we just loaded
-            super::set_secure_boot_derived(true);
+        if config.enable_secure_boot && !load_secure_boot_enable_preference() {
+            super::enable_secure_boot();
+        }
+        if super::is_secure_boot_enabled() {
             log::info!("Secure Boot: Enabled (from persisted preference)");
-            // Update status variables to reflect the enabled state
-            let _ = update_status_variables();
         }
     }
 
@@ -244,13 +242,21 @@ fn refresh_key_database(
 /// snapshots. Unchanged values are not reparsed, and this verification-only
 /// path deliberately avoids persistent-store timestamp walks.
 pub(crate) fn refresh_key_databases() {
+    refresh_key_databases_with_force(false);
+}
+
+fn force_refresh_key_databases() {
+    refresh_key_databases_with_force(true);
+}
+
+fn refresh_key_databases_with_force(force: bool) {
     for variable in [
         SecureBootVariable::PK,
         SecureBootVariable::Kek,
         SecureBootVariable::Db,
         SecureBootVariable::Dbx,
     ] {
-        refresh_key_database(variable, false, false);
+        refresh_key_database(variable, false, force);
     }
 }
 
@@ -277,14 +283,33 @@ fn efi_time_from_timestamp(timestamp: VariableTimestamp) -> EfiTime {
 
 // name_matches consolidated into crate::efi::utils::ucs2_eq
 
-/// Enroll default keys and persist them to SMMSTORE
-fn enroll_and_persist_default_keys() -> Result<(), AuthError> {
-    // First, enroll keys in memory
-    enrollment::enroll_default_keys()?;
+/// Enroll the default keys through the authoritative variable-store path.
+///
+/// Enrollment is only allowed in Setup Mode. Existing boot-only caches are
+/// discarded first so retrying after a partial failed enrollment cannot append
+/// duplicate certificates.
+pub fn enroll_and_persist_default_keys() -> Result<(), AuthError> {
+    if !is_setup_mode() {
+        return Err(AuthError::AccessDenied);
+    }
 
-    // Then persist each key database to SMMSTORE
-    persist_key_databases()?;
+    for variable in [
+        SecureBootVariable::PK,
+        SecureBootVariable::Kek,
+        SecureBootVariable::Db,
+        SecureBootVariable::Dbx,
+    ] {
+        key_database(variable).clear();
+    }
 
+    if let Err(error) = enrollment::enroll_default_keys().and_then(|()| persist_key_databases()) {
+        // Persistence may have committed only a prefix of the databases. Make
+        // the runtime store authoritative again before returning to the UI.
+        force_refresh_key_databases();
+        return Err(error);
+    }
+
+    force_refresh_key_databases();
     Ok(())
 }
 
@@ -348,6 +373,8 @@ pub fn persist_key_databases() -> Result<(), AuthError> {
         }
     }
 
+    // Keep snapshots synchronized with the authoritative runtime variables.
+    force_refresh_key_databases();
     log::info!("Secure Boot key databases persisted to SMMSTORE");
     Ok(())
 }
@@ -465,12 +492,14 @@ pub fn clear_all_keys() -> Result<(), AuthError> {
         if let Err(error) = persist_key_variable(variable, &[], &zero_timestamp) {
             // A preceding delete may already have changed live image policy.
             // Always reconcile disposable boot caches before reporting failure.
-            refresh_key_databases();
+            force_refresh_key_databases();
             return Err(error);
         }
-        refresh_key_databases();
     }
 
+    // An already-absent variable is an idempotent delete, but stale boot-only
+    // caches must still be discarded.
+    force_refresh_key_databases();
     update_status_variables()?;
     log::info!("All Secure Boot keys cleared - system in Setup Mode");
     Ok(())

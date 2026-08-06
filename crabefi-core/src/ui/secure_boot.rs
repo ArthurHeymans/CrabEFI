@@ -125,10 +125,16 @@ fn handle_action(idx: usize) -> Option<(&'static str, bool)> {
                 }
             }
         }
-        1 => match auth::enrollment::enroll_default_keys() {
-            Ok(_) => Some(("Default keys enrolled", true)),
-            Err(_) => Some(("Failed to enroll keys", false)),
-        },
+        1 => {
+            if !auth::is_setup_mode() {
+                Some(("Keys already enrolled", false))
+            } else {
+                match auth::boot::enroll_and_persist_default_keys() {
+                    Ok(_) => Some(("Default keys enrolled", true)),
+                    Err(_) => Some(("Failed to enroll keys", false)),
+                }
+            }
+        }
         4 => match auth::boot::clear_all_keys() {
             Ok(_) => Some(("All keys cleared", true)),
             Err(_) => Some(("Failed to clear keys", false)),
