@@ -476,18 +476,38 @@ pub fn get_enrollment_summary() -> (usize, usize, usize, usize) {
 /// After clearing, the system returns to Setup Mode and Secure Boot
 /// is disabled.
 pub fn clear_all_keys() -> Result<(), AuthError> {
+    log::warn!("Clearing all Secure Boot keys by physical-presence setup action!");
+
+    // Public SetVariable correctly rejects an unsigned PK deletion in User
+    // Mode, even when signature verification has been disabled. Firmware setup
+    // is the physical-presence authority, so remove PK through the privileged
+    // pre-boot persistence/import path first. This transitions the live policy
+    // into Setup Mode; the remaining databases can then use ordinary unsigned
+    // SetVariable deletes.
     if !is_setup_mode() {
-        log::warn!("Refusing unsigned Secure Boot key clearing in User Mode");
-        return Err(AuthError::AccessDenied);
+        let guid = Guid::from_bytes(&EFI_GLOBAL_VARIABLE_GUID);
+        if crate::efi::varstore::persistence::persist_firmware_variable(
+            &guid,
+            PK_NAME,
+            SECURE_BOOT_KEY_ATTRS,
+            &[],
+        )
+        .is_err()
+        {
+            force_refresh_key_databases();
+            return Err(AuthError::CryptoError);
+        }
+        force_refresh_key_databases();
+        if !is_setup_mode() {
+            return Err(AuthError::AccessDenied);
+        }
     }
-    log::warn!("Clearing all Secure Boot keys!");
 
     let zero_timestamp = EfiTime::zero();
     for variable in [
         SecureBootVariable::Dbx,
         SecureBootVariable::Db,
         SecureBootVariable::Kek,
-        SecureBootVariable::PK,
     ] {
         if let Err(error) = persist_key_variable(variable, &[], &zero_timestamp) {
             // A preceding delete may already have changed live image policy.
