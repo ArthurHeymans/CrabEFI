@@ -10,10 +10,8 @@ build = "build.rs"
 [dependencies]
 crabefi-efi-types = { path = "../crabefi-efi-types" }
 crabefi-runtime-abi = { path = "../crabefi-runtime-abi" }
-postcard = { version = "1.0", default-features = false, features = ["alloc"] }
 r-efi = "5.3"
 rsa = { version = "0.9", default-features = false }
-serde = { version = "1.0", default-features = false, features = ["alloc", "derive"] }
 sha2 = { version = "0.10", default-features = false, features = ["force-soft", "oid"] }
 zerocopy = { version = "0.8", default-features = false, features = ["derive"] }
 
