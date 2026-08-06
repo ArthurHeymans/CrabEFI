@@ -147,7 +147,7 @@ dependencies = [
  "rsa",
  "sha1",
  "sha2",
- "signature",
+ "signature 3.0.0",
  "spin 0.12.2",
  "spki 0.8.0",
  "tock-registers",
@@ -623,7 +623,7 @@ dependencies = [
  "pkcs1",
  "pkcs8",
  "rand_core",
- "signature",
+ "signature 2.2.0",
  "spki 0.7.3",
  "subtle",
  "zeroize",
@@ -678,6 +678,12 @@ dependencies = [
  "digest",
  "rand_core",
 ]
+
+[[package]]
+name = "signature"
+version = "3.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "28d567dcbaf0049cb8ac2608a76cd95ff9e4412e1899d389ee400918ca7537f5"
 
 [[package]]
 name = "smallvec"
