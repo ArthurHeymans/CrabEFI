@@ -10,8 +10,26 @@ BootServicesData. Payload text, rodata, globals, stack, page tables, drivers,
 protocol databases, event callbacks, the global heap, and allocator metadata
 are reclaimable after ExitBootServices.
 
-The 4 MiB Rust allocation heap is BootServicesData. Runtime code has no global
-allocator and cannot retain a heap object.
+The 4 MiB Rust allocation heap is BootServicesData and is reclaimed after
+ExitBootServices. Runtime code must never retain an object allocated from that
+heap: the old in-payload Runtime Services design could otherwise carry a boot
+heap pointer across EBS or SetVirtualAddressMap, after the backing pages became
+conventional memory or were no longer reachable at their physical address.
+
+The separate runtime image instead has a fixed 512 KiB allocation arena in the
+image's `.bss`. The arena is therefore part of the image-owned
+RuntimeServicesData mapping and is converted with the rest of the image during
+SetVirtualAddressMap; it never calls UEFI allocation services or depends on the
+boot heap. Allocation is enabled only while the serialized runtime-operation
+lease is held, is monotonic within each non-nesting scratch scope, and is fully
+scrubbed and reset before the service returns.
+
+RSA uses `allocator-api2` explicitly. A scratch scope lends a lifetime-branded
+allocator to `crypto_bigint::BoxedUintIn`, so the compiler prevents RSA bigint
+results or temporaries from outliving the scope which rewinds their arena
+region. Authenticated-variable signed data is fed incrementally into SHA-256
+rather than assembled in a `Vec`. The runtime image therefore has no global
+allocator, allocation error handler, or general-purpose allocation API.
 
 ## Runtime image memory
 
@@ -23,6 +41,28 @@ to split the leading code range to RuntimeServicesCode; public
 data. The loader then copies/zeros sections and applies only normalized
 relocation slots. The image-owned MAT publishes the exact code/data protection
 domains even where the EFI memory map merges adjacent data descriptors.
+
+The audited release images currently reserve about 756 KiB of runtime address
+space on both x86_64 and AArch64:
+
+| Mapping | Size | Contents |
+| --- | ---: | --- |
+| RX | 60 KiB | runtime code plus leading page/alignment space |
+| RO/NX | 4 KiB | immutable data |
+| RW/NX | 692 KiB | variable store, runtime state, scratch arena, and padding |
+
+Normalized on-disk images are currently about 240 KiB. The dominant resident
+allocations are the 512 KiB scratch arena, roughly 170 KiB of variable-store
+state, and under 5 KiB of runtime state. The remainder is code, immutable data,
+dynamic metadata, small synchronization globals, and page/alignment padding.
+
+Scratch capacity is deliberately larger than observed demand. Normal
+certificate fixtures use under 8 KiB. A regression test executes repeated full
+public exponentiations with maximum-width 4096-bit operands and enforces a
+16 KiB per-exponentiation bound. Each RSA verification has its own non-nesting
+scope, so certificate-chain and signer traversal reuse that same arena region
+instead of accumulating allocations. The complete 512 KiB arena is still
+scrubbed at operation end and remains reserved as image-owned runtime memory.
 
 Every runtime descriptor is one of:
 
