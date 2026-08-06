@@ -1,6 +1,4 @@
-//! Deferred-v1 journal access using the image-local bounded scratch allocator.
-
-use alloc::vec::Vec;
+//! Deferred-v2 journal access using a fixed zerocopy wire header.
 
 use crabefi_efi_types::crc32;
 use crabefi_runtime_abi::{
@@ -10,9 +8,10 @@ use crabefi_runtime_abi::{
         RETAINED_RESERVATION_WRAPPER_GUID,
     },
 };
-use serde::{Deserialize, Serialize};
+use zerocopy::byteorder::little_endian::{I16, U16, U32, U64};
+use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned};
 
-use crate::{efi, scratch};
+use crate::efi;
 
 pub const MAX_NAME_LEN: usize = 64;
 pub const MAX_DATA_SIZE: usize = 32 * 1024;
@@ -22,7 +21,7 @@ const RECORD_MAGIC: u16 = 0xaa55;
 const STATE_VALID: u8 = 0x7f;
 const STATE_DELETED: u8 = 0x00;
 const DEFERRED_MAGIC: u32 = 0x4642_5643;
-const DEFERRED_VERSION: u8 = 1;
+const DEFERRED_VERSION: u8 = 2;
 const HEADER_SIZE: usize = 32;
 const CAPSULE_DESCRIPTOR_SIZE: usize = 16;
 const RESERVATION_CAPSULE_OFFSET: usize = 4096;
@@ -87,44 +86,92 @@ impl DeferredHeader {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SerializedGuid {
     pub bytes: [u8; 16],
 }
 
-#[derive(Serialize, Deserialize)]
-#[serde(remote = "VariableTimestamp")]
-struct VariableTimestampDef {
-    year: u16,
+#[repr(C)]
+#[derive(Clone, Copy, FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned)]
+struct VariableTimestampWire {
+    year: U16,
     month: u8,
     day: u8,
     hour: u8,
     minute: u8,
     second: u8,
-    #[serde(skip)]
     pad1: u8,
-    nanosecond: u32,
-    timezone: i16,
+    nanosecond: U32,
+    timezone: I16,
     daylight: u8,
-    #[serde(skip)]
     pad2: u8,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct VariableRecord {
+impl From<VariableTimestamp> for VariableTimestampWire {
+    fn from(timestamp: VariableTimestamp) -> Self {
+        Self {
+            year: U16::new(timestamp.year),
+            month: timestamp.month,
+            day: timestamp.day,
+            hour: timestamp.hour,
+            minute: timestamp.minute,
+            second: timestamp.second,
+            pad1: timestamp.pad1,
+            nanosecond: U32::new(timestamp.nanosecond),
+            timezone: I16::new(timestamp.timezone),
+            daylight: timestamp.daylight,
+            pad2: timestamp.pad2,
+        }
+    }
+}
+
+impl From<VariableTimestampWire> for VariableTimestamp {
+    fn from(timestamp: VariableTimestampWire) -> Self {
+        Self {
+            year: timestamp.year.get(),
+            month: timestamp.month,
+            day: timestamp.day,
+            hour: timestamp.hour,
+            minute: timestamp.minute,
+            second: timestamp.second,
+            pad1: timestamp.pad1,
+            nanosecond: timestamp.nanosecond.get(),
+            timezone: timestamp.timezone.get(),
+            daylight: timestamp.daylight,
+            pad2: timestamp.pad2,
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned)]
+struct VariableRecordHeader {
+    magic: U16,
+    state: u8,
+    reserved1: u8,
+    attributes: U32,
+    guid: [u8; 16],
+    name_len: U16,
+    reserved2: U16,
+    data_len: U32,
+    monotonic_count: U64,
+    timestamp: VariableTimestampWire,
+    crc: U32,
+}
+
+#[derive(Debug)]
+pub struct VariableRecord<'a> {
     pub magic: u16,
     pub state: u8,
     pub attributes: u32,
     pub guid: SerializedGuid,
-    pub name: Vec<u16>,
-    pub data: Vec<u8>,
-    pub monotonic_count: u64,
-    #[serde(with = "VariableTimestampDef")]
+    pub name: [u16; MAX_NAME_LEN + 1],
+    pub data: &'a [u8],
     pub timestamp: VariableTimestamp,
     pub crc: u32,
 }
 
-impl VariableRecord {
+impl VariableRecord<'_> {
     pub fn active(&self) -> bool {
         self.magic == RECORD_MAGIC && self.state == STATE_VALID
     }
@@ -132,20 +179,6 @@ impl VariableRecord {
     pub fn deleted(&self) -> bool {
         self.magic == RECORD_MAGIC && self.state == STATE_DELETED
     }
-}
-
-#[derive(Serialize)]
-struct VariableRecordRef<'a> {
-    magic: u16,
-    state: u8,
-    attributes: u32,
-    guid: SerializedGuid,
-    name: &'a [u16],
-    data: &'a [u8],
-    monotonic_count: u64,
-    #[serde(with = "VariableTimestampDef")]
-    timestamp: VariableTimestamp,
-    crc: u32,
 }
 
 #[repr(C)]
@@ -190,12 +223,13 @@ pub fn prepare_retained(base: *mut u8, size: usize) -> Result<u64, efi::Status> 
     let (journal, journal_size) = journal_range(base, size)?;
     // SAFETY: journal_range proved the fixed header lies in retained memory.
     let header = unsafe { journal.cast::<DeferredHeader>().read_unaligned() };
-    if header.magic == DEFERRED_MAGIC {
-        if !valid_journal(journal, journal_size, header) {
-            return Err(efi::Status::DEVICE_ERROR);
-        }
-    } else {
+    if header.magic != DEFERRED_MAGIC || header.version != DEFERRED_VERSION {
+        // Journal wire formats are not replay-compatible. Discard entries from
+        // older firmware explicitly rather than permanently rejecting retained
+        // memory that still carries our magic with a different version.
         initialize_journal(journal, journal_size)?;
+    } else if !valid_journal(journal, journal_size, header) {
+        return Err(efi::Status::DEVICE_ERROR);
     }
     Ok(base as u64)
 }
@@ -362,35 +396,38 @@ pub fn queue_write(
     } else {
         STATE_VALID
     };
-    let mut terminated_name = [0u16; MAX_NAME_LEN + 1];
-    terminated_name[..name.len()].copy_from_slice(name);
-    let serialized_name = &terminated_name[..=name.len()];
-    let mut record = VariableRecordRef {
-        magic: RECORD_MAGIC,
+    let name_len = name.len() + 1;
+    let name_bytes_len = name_len
+        .checked_mul(core::mem::size_of::<u16>())
+        .ok_or(efi::Status::OUT_OF_RESOURCES)?;
+    let record_len = core::mem::size_of::<VariableRecordHeader>()
+        .checked_add(name_bytes_len)
+        .and_then(|length| length.checked_add(data.len()))
+        .filter(|length| *length <= MAX_ENTRY_SIZE)
+        .ok_or(efi::Status::OUT_OF_RESOURCES)?;
+    let mut record = VariableRecordHeader {
+        magic: U16::new(RECORD_MAGIC),
         state,
-        attributes,
-        guid: SerializedGuid { bytes: guid },
-        name: serialized_name,
-        data,
-        monotonic_count: 0,
-        timestamp,
-        crc: 0,
+        reserved1: 0,
+        attributes: U32::new(attributes),
+        guid,
+        name_len: U16::new(name_len as u16),
+        reserved2: U16::new(0),
+        data_len: U32::new(data.len() as u32),
+        monotonic_count: U64::new(0),
+        timestamp: timestamp.into(),
+        crc: U32::new(0),
     };
-    // The checksum covers the postcard encoding with a zero CRC field. After
-    // storing that checksum we serialize again to obtain the persisted record.
-    // Postcard uses varints, so the zero-CRC and stored-record encodings can
-    // legitimately have different lengths; each length belongs only to its
-    // respective serialization domain.
-    let crc_len = postcard::to_slice(&record, &mut transaction.bytes)
-        .map_err(|_| efi::Status::OUT_OF_RESOURCES)?
-        .len();
-    record.crc = crc32::calculate(&transaction.bytes[..crc_len]);
-    let record_len = postcard::to_slice(&record, &mut transaction.bytes)
-        .map_err(|_| efi::Status::OUT_OF_RESOURCES)?
-        .len();
-    if record_len > MAX_ENTRY_SIZE {
-        return Err(efi::Status::OUT_OF_RESOURCES);
+    let header_len = core::mem::size_of::<VariableRecordHeader>();
+    transaction.bytes[..header_len].copy_from_slice(record.as_bytes());
+    let mut offset = header_len;
+    for unit in name.iter().copied().chain(core::iter::once(0)) {
+        transaction.bytes[offset..offset + 2].copy_from_slice(&unit.to_le_bytes());
+        offset += 2;
     }
+    transaction.bytes[offset..record_len].copy_from_slice(data);
+    record.crc = U32::new(record_crc(&transaction.bytes[..record_len]));
+    transaction.bytes[..header_len].copy_from_slice(record.as_bytes());
 
     // SAFETY: fixed header lies inside the validated retained journal.
     let mut header = unsafe { base.cast::<DeferredHeader>().read_unaligned() };
@@ -450,7 +487,7 @@ pub fn queue_write(
 pub fn replay(
     base: *mut u8,
     size: usize,
-    transaction: &mut DeferredTransaction,
+    _transaction: &mut DeferredTransaction,
     mut apply: impl FnMut(&VariableRecord, bool, bool) -> Result<(), efi::Status>,
 ) -> Result<usize, efi::Status> {
     let (base, size) = journal_range(base, size)?;
@@ -473,14 +510,10 @@ pub fn replay(
             offset += length;
             continue;
         }
-        if !scratch::preflight(length.saturating_mul(3)) {
-            return Err(efi::Status::OUT_OF_RESOURCES);
-        }
         // SAFETY: valid_journal proved the complete serialized record lies in range.
         let bytes = unsafe { core::slice::from_raw_parts(base.add(offset), length) };
-        let record =
-            postcard::from_bytes::<VariableRecord>(bytes).map_err(|_| efi::Status::DEVICE_ERROR)?;
-        let crc = record_crc(&record, transaction)?;
+        let record = decode_record(bytes)?;
+        let crc = record_crc(bytes);
         if crc != record.crc || !(record.active() || record.deleted()) {
             return Err(efi::Status::DEVICE_ERROR);
         }
@@ -583,29 +616,63 @@ fn all_acknowledged(base: *const u8, header: DeferredHeader) -> bool {
     true
 }
 
-fn record_crc(
-    record: &VariableRecord,
-    transaction: &mut DeferredTransaction,
-) -> Result<u32, efi::Status> {
-    let reference = VariableRecordRef {
-        magic: record.magic,
-        state: record.state,
-        attributes: record.attributes,
-        guid: record.guid,
-        name: &record.name,
-        data: &record.data,
-        monotonic_count: record.monotonic_count,
-        timestamp: record.timestamp,
-        crc: 0,
-    };
-    let length = postcard::to_slice(&reference, &mut transaction.bytes)
-        .map_err(|_| efi::Status::INVALID_PARAMETER)?
-        .len();
-    Ok(crc32::calculate(&transaction.bytes[..length]))
+fn decode_record(bytes: &[u8]) -> Result<VariableRecord<'_>, efi::Status> {
+    let (header, payload) =
+        VariableRecordHeader::read_from_prefix(bytes).map_err(|_| efi::Status::DEVICE_ERROR)?;
+    if header.reserved1 != 0 || header.reserved2.get() != 0 {
+        return Err(efi::Status::DEVICE_ERROR);
+    }
+    let name_len = header.name_len.get() as usize;
+    if name_len == 0 || name_len > MAX_NAME_LEN + 1 {
+        return Err(efi::Status::DEVICE_ERROR);
+    }
+    let name_bytes_len = name_len
+        .checked_mul(core::mem::size_of::<u16>())
+        .ok_or(efi::Status::DEVICE_ERROR)?;
+    let data_len = header.data_len.get() as usize;
+    if name_bytes_len
+        .checked_add(data_len)
+        .is_none_or(|length| length != payload.len())
+    {
+        return Err(efi::Status::DEVICE_ERROR);
+    }
+    let mut name = [0u16; MAX_NAME_LEN + 1];
+    let (name_bytes, remainder) = payload[..name_bytes_len].as_chunks::<2>();
+    debug_assert!(remainder.is_empty());
+    for (unit, bytes) in name[..name_len].iter_mut().zip(name_bytes) {
+        *unit = u16::from_le_bytes([bytes[0], bytes[1]]);
+    }
+    if name[name_len - 1] != 0 || name[..name_len - 1].contains(&0) {
+        return Err(efi::Status::DEVICE_ERROR);
+    }
+    Ok(VariableRecord {
+        magic: header.magic.get(),
+        state: header.state,
+        attributes: header.attributes.get(),
+        guid: SerializedGuid { bytes: header.guid },
+        name,
+        data: &payload[name_bytes_len..],
+        timestamp: header.timestamp.into(),
+        crc: header.crc.get(),
+    })
+}
+
+fn record_crc(bytes: &[u8]) -> u32 {
+    const CRC_OFFSET: usize = core::mem::offset_of!(VariableRecordHeader, crc);
+    const CRC_END: usize = CRC_OFFSET + core::mem::size_of::<U32>();
+    crc32::calculate_with(bytes.len(), |index| {
+        if (CRC_OFFSET..CRC_END).contains(&index) {
+            0
+        } else {
+            bytes[index]
+        }
+    })
 }
 
 const _: () = assert!(core::mem::size_of::<DeferredHeader>() == HEADER_SIZE);
 const _: () = assert!(core::mem::size_of::<EntryHeader>() == 8);
+const _: () = assert!(core::mem::size_of::<VariableTimestampWire>() == 16);
+const _: () = assert!(core::mem::size_of::<VariableRecordHeader>() == 60);
 
 #[cfg(test)]
 mod tests {
@@ -649,6 +716,30 @@ mod tests {
     }
 
     #[test]
+    fn prepare_retained_discards_journals_from_other_versions() {
+        let _guard = crate::scratch::test_lock();
+        let mut buffer = vec![0u8; 64 * 1024];
+        let journal = unsafe { buffer.as_mut_ptr().add(JOURNAL_OFFSET) };
+        let mut old_header = DeferredHeader::empty();
+        old_header.version = DEFERRED_VERSION - 1;
+        old_header.entry_count = 1;
+        old_header.total_size = 8;
+        old_header.header_crc = old_header.header_crc();
+        // SAFETY: the buffer has room for the fixed journal header.
+        unsafe { journal.cast::<DeferredHeader>().write_unaligned(old_header) };
+
+        prepare_retained(buffer.as_mut_ptr(), buffer.len()).unwrap();
+
+        // SAFETY: prepare_retained initialized the fixed journal header.
+        let header = unsafe { journal.cast::<DeferredHeader>().read_unaligned() };
+        assert!(header.valid());
+        assert_eq!(header.entry_count, 0);
+        assert_eq!(header.total_size, 0);
+        assert_eq!(header.data_crc, crc32::calculate(&[]));
+        crate::scratch::reset();
+    }
+
+    #[test]
     fn retained_reservation_wraps_private_guid_and_marker() {
         let _guard = crate::scratch::test_lock();
         let mut buffer = vec![0u8; 64 * 1024];
@@ -678,12 +769,12 @@ mod tests {
     }
 
     #[test]
-    fn deferred_v1_round_trip_and_crc_rejection() {
+    fn deferred_v2_round_trip_and_crc_rejection() {
         let _guard = crate::scratch::test_lock();
         let (mut buffer, used) = queued_fixture();
         assert_eq!(
             &buffer[JOURNAL_OFFSET..used],
-            include_bytes!("../tests/fixtures/deferred-v1.bin")
+            include_bytes!("../tests/fixtures/deferred-v2.bin")
         );
         let mut transaction = DeferredTransaction::new();
         let mut seen = false;
@@ -695,7 +786,7 @@ mod tests {
                 seen = true;
                 assert!(!authenticated && !deletion);
                 assert_eq!(
-                    record.name,
+                    &record.name[..5],
                     [b'T' as u16, b'e' as u16, b's' as u16, b't' as u16, 0]
                 );
                 assert_eq!(record.data, [1, 2, 3, 4]);

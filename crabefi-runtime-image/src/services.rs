@@ -668,7 +668,7 @@ pub fn replay_deferred(lease: &mut state::Lease) -> Result<usize, efi::Status> {
                 record.guid.bytes,
                 name,
                 record.attributes,
-                &record.data,
+                record.data,
             );
             replay_apply_result(status, authenticated, deletion)
         },
@@ -956,6 +956,7 @@ mod tests {
             .unwrap()
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn apply(
         store: &mut VariableStore,
         transaction: &mut VariableTransaction,
@@ -1348,7 +1349,7 @@ mod tests {
                     record.guid.bytes,
                     &record.name[..name_len],
                     record.attributes,
-                    &record.data,
+                    record.data,
                 );
                 if status == efi::Status::SUCCESS {
                     persisted += 1;
@@ -1430,7 +1431,7 @@ mod tests {
                     record.guid.bytes,
                     &record.name[..name_len],
                     record.attributes,
-                    &record.data,
+                    record.data,
                 );
                 if status == efi::Status::SUCCESS {
                     Ok(())
