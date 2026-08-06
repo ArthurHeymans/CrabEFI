@@ -380,7 +380,14 @@ fn normalize(elf_path: &Path, output: &Path, arch: Arch) -> Result<RuntimeArtifa
         })
         .collect::<String>();
     fs::write(output.join("symbols.txt"), &symbols)?;
-    fs::write(output.join("runtime-image.sym"), symbols)?;
+    fs::write(output.join("runtime-image.sym"), &symbols)?;
+    let panic_symbols = audit_panic_symbols(&symbols);
+    if !panic_symbols.is_empty() {
+        bail!(
+            "runtime ELF contains Rust panic symbols:\n{}",
+            panic_symbols.join("\n")
+        );
+    }
     ValidatedImage::parse(&normalized, architecture_id(arch)).map_err(|error| {
         anyhow::anyhow!("normalized runtime image failed ABI self-validation: {error}")
     })?;
@@ -761,6 +768,13 @@ fn run_audit_tools(elf: &Path, output: &Path, arch: Arch, relocation_slots: usiz
             bail!("runtime tail relocation function contains a call or indirect tail jump");
         }
     }
+    let panic_calls = audit_reachable_panic_calls(&text);
+    if !panic_calls.is_empty() {
+        bail!(
+            "runtime disassembly contains reachable Rust panic calls:\n{}",
+            panic_calls.join("\n")
+        );
+    }
     let call_audit = audit_indirect_calls(arch, &text)?;
     let indirect_calls = call_audit.indirect;
     let register_indirect_calls = call_audit.register_indirect;
@@ -782,6 +796,7 @@ fn run_audit_tools(elf: &Path, output: &Path, arch: Arch, relocation_slots: usiz
             "register_indirect_calls": register_indirect_calls,
             "relocation_slots": relocation_slots,
             "allowed_indirect_calls": allowed_indirect_calls,
+            "reachable_panic_calls": panic_calls.len(),
             "violations": violations,
         }),
     )?;
@@ -815,6 +830,64 @@ fn run_audit_tools(elf: &Path, output: &Path, arch: Arch, relocation_slots: usiz
         }),
     )?;
     Ok(())
+}
+
+fn audit_panic_symbols(symbols: &str) -> Vec<String> {
+    const PANIC_SYMBOLS: &[&str] = &[
+        "rust_begin_unwind",
+        "panic_is_possible",
+        "panicking",
+        "panic_fmt",
+        "panic_bounds_check",
+        "unwrap_failed",
+        "expect_failed",
+        "slice_index_fail",
+        "len_mismatch_fail",
+        "handle_alloc_error",
+    ];
+    symbols
+        .lines()
+        .filter(|line| PANIC_SYMBOLS.iter().any(|symbol| line.contains(symbol)))
+        .map(str::to_owned)
+        .collect()
+}
+
+fn audit_reachable_panic_calls(text: &str) -> Vec<String> {
+    const PANIC_TARGETS: &[&str] = &[
+        "rust_begin_unwind",
+        "panicking",
+        "panic_",
+        "unwrap_failed",
+        "expect_failed",
+        "slice_index_fail",
+        "len_mismatch_fail",
+        "handle_alloc_error",
+        "crabefi_runtime_panic_is_possible",
+    ];
+    let mut function = "<unknown>";
+    let mut violations = Vec::new();
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.ends_with(">:")
+            && let Some((_, rest)) = trimmed.split_once('<')
+            && let Some((name, _)) = rest.rsplit_once(">:")
+        {
+            function = name;
+            continue;
+        }
+        let is_call = trimmed.contains("call")
+            || trimmed.starts_with("bl\t")
+            || trimmed.contains(" bl ")
+            || trimmed.contains("jal");
+        if !is_call || !PANIC_TARGETS.iter().any(|target| trimmed.contains(target)) {
+            continue;
+        }
+        let support_function = PANIC_TARGETS.iter().any(|target| function.contains(target));
+        if !support_function {
+            violations.push(format!("{function}: {trimmed}"));
+        }
+    }
+    violations
 }
 
 fn disassembly_body<'a>(text: &'a str, symbol: &str) -> Option<&'a str> {
@@ -1011,6 +1084,35 @@ mod tests {
             instruction_is_forbidden_in_transition_tail(Arch::Riscv64, non_linking_jalr).unwrap()
         );
         assert!(audit_indirect_calls(Arch::Aarch64, "0: blraa x0, x1\n").is_err());
+    }
+
+    #[test]
+    fn panic_symbol_audit_rejects_retained_panic_support() {
+        assert!(audit_panic_symbols("0x10 runtime_image_init\n").is_empty());
+        let violations = audit_panic_symbols(concat!(
+            "0x20 __rustc::rust_begin_unwind\n",
+            "0x30 crabefi_runtime_panic_is_possible\n",
+        ));
+        assert_eq!(violations.len(), 2);
+    }
+
+    #[test]
+    fn panic_audit_ignores_support_code_and_rejects_runtime_callers() {
+        let support_only = concat!(
+            "0000 <core::panicking::panic_fmt>:\n",
+            "  0: callq 0x10 <__rustc::rust_begin_unwind>\n",
+            "0010 <__rustc::rust_begin_unwind>:\n",
+            " 10: callq 0x20 <crabefi_runtime_panic_is_possible>\n",
+        );
+        assert!(audit_reachable_panic_calls(support_only).is_empty());
+
+        let reachable = concat!(
+            "1000 <runtime_image_init>:\n",
+            "1004: callq 0x20 <core::panicking::panic_bounds_check>\n",
+        );
+        let violations = audit_reachable_panic_calls(reachable);
+        assert_eq!(violations.len(), 1);
+        assert!(violations[0].contains("runtime_image_init"));
     }
 
     #[test]

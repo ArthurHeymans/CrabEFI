@@ -149,14 +149,18 @@ impl RuntimeState {
         self.deferred_buffer_physical = handoff.deferred_buffer_base;
         self.deferred_buffer_size = usize::try_from(handoff.deferred_buffer_size)
             .map_err(|_| efi::Status::INVALID_PARAMETER)?;
-        for (destination, source) in self.sections[..self.section_count]
+        for (destination, source) in self
+            .sections
             .iter_mut()
+            .take(self.section_count)
             .zip(handoff.sections.iter())
         {
             *destination = section_from_handoff(source);
         }
-        for (destination, source) in self.ranges[..self.range_count]
+        for (destination, source) in self
+            .ranges
             .iter_mut()
+            .take(self.range_count)
             .zip(handoff.ranges.iter())
         {
             *destination = range_from_handoff(source);

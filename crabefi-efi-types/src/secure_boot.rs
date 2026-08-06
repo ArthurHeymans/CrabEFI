@@ -128,7 +128,7 @@ pub fn name_matches(left: &[u16], right: &[u16]) -> bool {
             .iter()
             .position(|unit| *unit == 0)
             .unwrap_or(name.len());
-        &name[..length]
+        name.get(..length).unwrap_or(&[])
     }
 
     unterminated(left) == unterminated(right)

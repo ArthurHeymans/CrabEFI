@@ -80,7 +80,7 @@ dependencies = [
  "allocator-api2",
  "crabefi-efi-types",
  "crabefi-runtime-abi",
- "crypto-bigint",
+ "crypto-bigint 0.7.5 (git+https://github.com/ArthurHeymans/crypto-bigint?rev=07a5d396134739ac0d02b15b1cd9c3f0ed60350e)",
  "r-efi",
  "rsa",
  "sha2",
@@ -90,15 +90,26 @@ dependencies = [
 [[package]]
 name = "crypto-bigint"
 version = "0.7.5"
-source = "git+https://github.com/ArthurHeymans/crypto-bigint?rev=8da705a86237f2c9804ddb30140715bd360983c3#8da705a86237f2c9804ddb30140715bd360983c3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1a52aa3fcda4e6302a9f48734f234d35d4721b96f8fe07d073f07ce9df4f0271"
 dependencies = [
- "allocator-api2",
  "cpubits",
  "ctutils",
  "num-traits",
  "rand_core",
  "serdect",
  "zeroize",
+]
+
+[[package]]
+name = "crypto-bigint"
+version = "0.7.5"
+source = "git+https://github.com/ArthurHeymans/crypto-bigint?rev=07a5d396134739ac0d02b15b1cd9c3f0ed60350e#07a5d396134739ac0d02b15b1cd9c3f0ed60350e"
+dependencies = [
+ "allocator-api2",
+ "cpubits",
+ "ctutils",
+ "num-traits",
 ]
 
 [[package]]
@@ -116,7 +127,7 @@ version = "0.7.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3633a51a39c69ebbaa4feaa694bd83d241e4093901c84a0963b19d9bb3f0cf8f"
 dependencies = [
- "crypto-bigint",
+ "crypto-bigint 0.7.5 (registry+https://github.com/rust-lang/crates.io-index)",
  "rand_core",
 ]
 
@@ -201,7 +212,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "30b2aa4ba0d89f73d1e332df05be0eeab8840351c36ca5654341dfdb57bb3caf"
 dependencies = [
  "const-oid",
- "crypto-bigint",
+ "crypto-bigint 0.7.5 (registry+https://github.com/rust-lang/crates.io-index)",
  "crypto-primes",
  "digest",
  "rand_core",
@@ -305,18 +316,18 @@ checksum = "e6e4313cd5fcd3dad5cafa179702e2b244f760991f45397d14d4ebf38247da75"
 
 [[package]]
 name = "zerocopy"
-version = "0.8.55"
+version = "0.8.56"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b5a105cd7b140f6eeec8acff2ea38135d3cab283ada58540f629fe51e46696eb"
+checksum = "556764e583adb45a9f8d413c2a147fa7e8d821e48e12b14fd560b607998b75eb"
 dependencies = [
  "zerocopy-derive",
 ]
 
 [[package]]
 name = "zerocopy-derive"
-version = "0.8.55"
+version = "0.8.56"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0fe976fb70c78cd64cccfe3a6fc142244e8a77b70959b30faf9d0ac37ee228eb"
+checksum = "f2ab42fc20575779bd240faa45f94a74256f755c0fa9e89f0ede20d91d0cdfc1"
 dependencies = [
  "proc-macro2",
  "quote",

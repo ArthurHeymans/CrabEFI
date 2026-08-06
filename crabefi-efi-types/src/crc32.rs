@@ -2,7 +2,11 @@
 
 /// Calculate the IEEE CRC-32 of a byte slice.
 pub fn calculate(bytes: &[u8]) -> u32 {
-    calculate_with(bytes.len(), |index| bytes[index])
+    bytes.iter().copied().fold(u32::MAX, |crc, byte| {
+        (0..8).fold(crc ^ u32::from(byte), |value, _| {
+            (value >> 1) ^ (0xedb8_8320 & 0u32.wrapping_sub(value & 1))
+        })
+    }) ^ u32::MAX
 }
 
 /// Calculate IEEE CRC-32 over bytes supplied by index.
