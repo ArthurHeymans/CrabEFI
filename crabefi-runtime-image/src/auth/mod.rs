@@ -1,8 +1,10 @@
 //! Image-local UEFI time-based authenticated-variable enforcement.
 
 mod crypto;
+mod limits;
 mod signature;
 
+pub use limits::{AUTH_OPERATION_SCRATCH_BOUND, MAX_AUTHENTICATED_ENVELOPE_SIZE};
 pub use signature::verify_authenticated_variable;
 
 use crabefi_efi_types::authentication::EfiTime;
@@ -42,9 +44,6 @@ pub fn timestamp_from_efi_time(value: EfiTime) -> VariableTimestamp {
     }
 }
 
-pub const MAX_AUTHENTICATED_ENVELOPE_SIZE: usize = 48 * 1024;
-/// Complete RSA/CMS service-operation reservation, including signed-data assembly.
-pub const AUTH_OPERATION_SCRATCH_BOUND: usize = 440 * 1024;
 pub const WIN_CERT_REVISION: u16 = 0x0200;
 pub const WIN_CERT_TYPE_EFI_GUID: u16 = 0x0ef1;
 
@@ -88,9 +87,38 @@ mod tests {
         let _guard = crate::scratch::test_lock();
         crate::scratch::activate();
         crate::scratch::set_limit_for_test(0);
-        let error = crypto::verify_pkcs7_signature(&[0x30, 0], &[], &[0x30, 0]).unwrap_err();
+        let error = crypto::verify_rsa_parts_for_test(&[3], &[3], &[1], &[0; 32]).unwrap_err();
         assert_eq!(efi::Status::from(error), efi::Status::OUT_OF_RESOURCES);
         crate::scratch::reset();
         crate::scratch::set_limit_for_test(crate::scratch::SCRATCH_SIZE);
+    }
+
+    #[test]
+    fn maximum_width_rsa_stays_within_operation_scratch_bound() {
+        let _guard = crate::scratch::test_lock();
+        crate::scratch::activate();
+        crate::scratch::set_limit_for_test(AUTH_OPERATION_SCRATCH_BOUND);
+
+        const MAX_RSA_BYTES: usize = 4096 / 8;
+        let modulus = [0xff; MAX_RSA_BYTES];
+        let signature = [0xa5; MAX_RSA_BYTES];
+        // Three operations would exceed the bound without per-operation
+        // rewinding (a single 4096-bit op uses roughly half the bound), so a
+        // missing rewind is caught by the high-water assertion below.
+        for _ in 0..3 {
+            let verified = crypto::verify_rsa_parts_for_test(
+                &modulus,
+                &[0x01, 0x00, 0x01],
+                &signature,
+                &[0u8; 32],
+            )
+            .unwrap();
+            assert!(!verified);
+        }
+        let high_water = crate::scratch::high_water_for_test();
+        crate::scratch::reset();
+        crate::scratch::set_limit_for_test(crate::scratch::SCRATCH_SIZE);
+
+        assert!(high_water <= AUTH_OPERATION_SCRATCH_BOUND);
     }
 }

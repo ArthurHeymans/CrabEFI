@@ -361,8 +361,7 @@ impl SpecIdEvent {
         off += 4;
 
         // Algorithm entries: (algorithmId: u16, digestSize: u16)
-        for i in 0..self.num_algorithms as usize {
-            let (alg, size) = self.digest_sizes[i];
+        for &(alg, size) in self.digest_sizes.iter().take(self.num_algorithms as usize) {
             buf[off..off + 2].copy_from_slice(&alg.to_le_bytes());
             off += 2;
             buf[off..off + 2].copy_from_slice(&size.to_le_bytes());

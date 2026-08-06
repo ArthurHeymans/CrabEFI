@@ -2,13 +2,10 @@
 
 #![cfg_attr(all(not(test), target_os = "none"), no_std)]
 #![cfg_attr(all(not(test), target_os = "none"), no_main)]
-#![cfg_attr(all(not(test), target_os = "none"), feature(alloc_error_handler))]
 #![deny(unsafe_op_in_unsafe_fn)]
 // Exported C ABI entry points validate every pointer and copy all retained
 // fields immediately; keeping them safe matches firmware caller conventions.
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
-
-extern crate alloc;
 
 mod arch;
 mod auth;
@@ -32,14 +29,6 @@ use crabefi_runtime_abi::{
 #[cfg(all(not(test), target_os = "none"))]
 #[panic_handler]
 fn panic(_info: &PanicInfo<'_>) -> ! {
-    loop {
-        core::hint::spin_loop();
-    }
-}
-
-#[cfg(all(not(test), target_os = "none"))]
-#[alloc_error_handler]
-fn allocation_error(_layout: core::alloc::Layout) -> ! {
     loop {
         core::hint::spin_loop();
     }

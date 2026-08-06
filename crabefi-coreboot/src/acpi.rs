@@ -276,8 +276,7 @@ pub unsafe fn discover_platform(rsdp_addr: u64) -> PlatformInfo {
     }
     if info.dsdt_device_count > 0 {
         log::info!("  DSDT devices: {}", info.dsdt_device_count);
-        for i in 0..info.dsdt_device_count {
-            let dev = &info.dsdt_devices[i];
+        for dev in info.dsdt_devices.iter().take(info.dsdt_device_count) {
             if let Some(irq) = dev.irq {
                 log::info!(
                     "    {} [{}] mmio={:#x}+{:#x} irq={}",

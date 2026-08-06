@@ -1996,10 +1996,10 @@ extern "efiapi" fn protocols_per_handle(
     let ptr_array = buf as *mut *mut Guid;
     let guid_array = unsafe { buf.add(ptrs_size) } as *mut Guid;
 
-    for i in 0..count {
+    for (i, protocol) in entry.protocols.iter().take(count).enumerate() {
         unsafe {
             let guid_ptr = guid_array.add(i);
-            *guid_ptr = entry.protocols[i].guid;
+            *guid_ptr = protocol.guid;
             *ptr_array.add(i) = guid_ptr;
         }
     }

@@ -23,9 +23,22 @@ synchronization. ELF normalization rejects missing, zero, or inconsistent
 The runtime image owns all Runtime Services entry points and unsupported stubs,
 Runtime/System Tables, configuration storage, Runtime Properties, Memory
 Attributes Table (MAT), ESRT storage, variable metadata/payload arena,
-transaction buffer, manifests, phase machine, and image-local time/reset code.
-The packed variable arena is 128 KiB; its per-variable limit remains 16 KiB.
-Large zero-initialized store state is in `.bss`, not ROM data.
+transaction buffer, manifests, phase machine, image-local time/reset code, and
+a fixed 512 KiB scratch allocator. The packed variable arena is 128 KiB; its
+per-variable limit remains 16 KiB. Large zero-initialized store and scratch
+state is in `.bss`, not ROM data.
+
+The scratch arena is intentionally different from the boot payload heap. Its
+storage is image-owned RuntimeServicesData, so SVAM maps it with the image
+rather than leaving allocations in reclaimed BootServicesData. It is active
+only under the single runtime-operation lease and resets and scrubs all
+allocations before each service returns. RSA bigint allocations use an
+`allocator-api2` allocator branded with a nested scratch-scope lifetime, which
+prevents those containers from escaping the scope in safe Rust. Signed-data
+assembly is allocation-free and updates SHA-256 incrementally. The runtime
+image has no global allocator. This avoids the pre-split failure mode where
+Runtime Services could retain a pointer into the boot heap across EBS or
+address conversion.
 
 Boot code owns drivers, persistence hardware, heap, logging, protocols, and
 Boot Services. Before EBS, one typed BootActive persistence bridge may write
@@ -71,9 +84,11 @@ authoritative key databases, replay timestamps, and bounded BSS scratch
 allocator. Boot enrollment uses the same standard `SetVariable` entry point.
 
 The split intentionally has two narrowly scoped certificate verifiers. The
-runtime image uses the bounded, allocation-free, hand-rolled PKCS#7/X.509
-verifier in `crabefi-runtime-image/src/auth/crypto.rs`; boot retains the
-`cms`/`x509_cert`-based verifier solely for Authenticode image verification.
+runtime image uses the hand-rolled PKCS#7/X.509 parser in
+`crabefi-runtime-image/src/auth/crypto.rs` together with allocator-aware
+`crypto-bigint` RSA public exponentiation over a lifetime-scoped image-local
+scratch allocator; boot retains the `cms`/`x509_cert`-based verifier solely for
+Authenticode image verification.
 Both deliberately skip certificate `notBefore`/`notAfter` checks. This
 preserves the pre-split `check_validity_period = false` behavior and matches
 EDK2 and U-Boot Secure Boot handling, where firmware time does not gate trust

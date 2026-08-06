@@ -461,9 +461,6 @@ fn apply_variable(
         return efi::Status::SECURITY_VIOLATION;
     }
     let (payload, timestamp, authenticated_variable) = if authenticated {
-        if !crate::scratch::preflight(auth::AUTH_OPERATION_SCRATCH_BOUND) {
-            return efi::Status::OUT_OF_RESOURCES;
-        }
         match auth::verify_authenticated_variable(store, name, &guid, attributes, input) {
             Ok(verified) => (
                 verified.payload,
@@ -967,7 +964,7 @@ mod tests {
         attributes: u32,
         data: &[u8],
     ) -> efi::Status {
-        let checkpoint = crate::scratch::checkpoint();
+        let checkpoint = crate::scratch::checkpoint_for_test();
         let status = apply_variable(
             store,
             transaction,
@@ -980,7 +977,8 @@ mod tests {
             attributes,
             data,
         );
-        crate::scratch::rewind(checkpoint);
+        // SAFETY: `apply_variable` returned, so no scratch-backed value remains live.
+        unsafe { crate::scratch::rewind_for_test(checkpoint) };
         status
     }
 

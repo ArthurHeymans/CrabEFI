@@ -1,7 +1,10 @@
 //! Borrowed CMS/X.509 parsing and bounded RSA verification.
 
+use allocator_api2::alloc::Allocator;
+use core::cmp::Ordering;
+
 use crabefi_efi_types::constant_time_eq;
-use rsa::traits::PublicKeyParts;
+use crypto_bigint::{BoxedUintIn, PowModInError};
 use sha2::{Digest, Sha256};
 
 use super::AuthError;
@@ -12,6 +15,14 @@ const MAX_SIGNERS: usize = 8;
 const MAX_CERTIFICATE_SIZE: usize = 16 * 1024;
 const MAX_CHAIN_DEPTH: usize = 5;
 const MAX_RSA_BITS: usize = 4096;
+const MAX_RSA_BYTES: usize = MAX_RSA_BITS / 8;
+// Match the 32-bit publicExponent accepted by Windows certificate tooling and
+// cap attacker-controlled exponentiation work during runtime verification.
+const MAX_RSA_EXPONENT: u64 = u32::MAX as u64;
+const SHA256_DIGEST_INFO_PREFIX: &[u8] = &[
+    0x30, 0x31, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01, 0x05,
+    0x00, 0x04, 0x20,
+];
 
 const OID_SIGNED_DATA: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x07, 0x02];
 const OID_DATA: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x07, 0x01];
@@ -103,25 +114,26 @@ struct SignerView<'a> {
     signature: &'a [u8],
 }
 
+#[cfg(test)]
+// The integration-test include uses this wrapper, while the binary's unit-test
+// configuration compiles it without a local caller.
+#[allow(dead_code)]
 pub fn verify_pkcs7_signature(
     pkcs7_data: &[u8],
     signed_content: &[u8],
     trusted_cert: &[u8],
 ) -> Result<bool, AuthError> {
-    let checkpoint = scratch::checkpoint();
-    let result = verify_pkcs7_signature_inner(pkcs7_data, signed_content, trusted_cert);
-    scratch::rewind(checkpoint);
-    result
+    let content_hash: [u8; 32] = Sha256::digest(signed_content).into();
+    verify_pkcs7_signature_hash(pkcs7_data, &content_hash, trusted_cert)
 }
 
-fn verify_pkcs7_signature_inner(
+pub fn verify_pkcs7_signature_hash(
     pkcs7_data: &[u8],
-    signed_content: &[u8],
+    content_hash: &[u8; 32],
     trusted_cert: &[u8],
 ) -> Result<bool, AuthError> {
     if pkcs7_data.len() > super::MAX_AUTHENTICATED_ENVELOPE_SIZE
         || trusted_cert.len() > MAX_CERTIFICATE_SIZE
-        || !scratch::preflight(256 * 1024)
     {
         return Err(AuthError::OutOfResources);
     }
@@ -137,7 +149,7 @@ fn verify_pkcs7_signature_inner(
     let _version = expect(signed.next()?, 0x02)?;
     validate_digest_set(expect(signed.next()?, 0x31)?)?;
     let encapsulated = expect(signed.next()?, 0x30)?;
-    let content_hash = encapsulated_content_hash(encapsulated, signed_content)?;
+    validate_detached_content(encapsulated)?;
 
     let mut certificates = [None; MAX_CERTIFICATES];
     let mut certificate_count = 0usize;
@@ -176,9 +188,8 @@ fn verify_pkcs7_signature_inner(
         else {
             continue;
         };
-        let content_digest = signed_attributes_digest(signer.signed_attributes, &content_hash)?;
-        let key = rsa_key(&signer_certificate)?;
-        if verify_rsa_signature(&key, signer.signature, &content_digest)?
+        let content_digest = signed_attributes_digest(signer.signed_attributes, content_hash)?;
+        if verify_rsa_signature(signer_certificate, signer.signature, &content_digest)?
             && certificate_authorized(
                 signer_certificate,
                 trusted,
@@ -260,10 +271,7 @@ fn validate_sha256_algorithm(algorithm: Tlv<'_>) -> Result<(), AuthError> {
     fields.finish()
 }
 
-fn encapsulated_content_hash(
-    encapsulated: Tlv<'_>,
-    detached: &[u8],
-) -> Result<[u8; 32], AuthError> {
+fn validate_detached_content(encapsulated: Tlv<'_>) -> Result<(), AuthError> {
     let mut fields = Reader::new(encapsulated.value);
     if expect(fields.next()?, 0x06)?.value != OID_DATA {
         return Err(AuthError::InvalidHeader);
@@ -274,8 +282,7 @@ fn encapsulated_content_hash(
     if fields.optional(0xa0)?.is_some() {
         return Err(AuthError::InvalidHeader);
     }
-    fields.finish()?;
-    Ok(Sha256::digest(detached).into())
+    fields.finish()
 }
 
 fn parse_signer(sequence: Tlv<'_>) -> Result<SignerView<'_>, AuthError> {
@@ -565,29 +572,132 @@ fn verify_certificate(
     issuer: CertificateView<'_>,
 ) -> Result<bool, AuthError> {
     let digest: [u8; 32] = Sha256::digest(certificate.tbs).into();
-    verify_rsa_signature(&rsa_key(&issuer)?, certificate.signature, &digest)
-}
-
-fn rsa_key(certificate: &CertificateView<'_>) -> Result<rsa::RsaPublicKey, AuthError> {
-    let modulus = rsa::BigUint::from_bytes_be(certificate.modulus);
-    let exponent = rsa::BigUint::from_bytes_be(certificate.exponent);
-    let key =
-        rsa::RsaPublicKey::new(modulus, exponent).map_err(|_| AuthError::CertificateParseError)?;
-    if key.n().bits() > MAX_RSA_BITS {
-        return Err(AuthError::OutOfResources);
-    }
-    Ok(key)
+    verify_rsa_signature(issuer, certificate.signature, &digest)
 }
 
 fn verify_rsa_signature(
-    key: &rsa::RsaPublicKey,
+    certificate: CertificateView<'_>,
     signature: &[u8],
     digest: &[u8; 32],
 ) -> Result<bool, AuthError> {
-    use rsa::signature::hazmat::PrehashVerifier;
+    if !scratch::preflight(super::AUTH_OPERATION_SCRATCH_BOUND) {
+        return Err(AuthError::OutOfResources);
+    }
+    let verification = scratch::with_scope(|allocator| {
+        verify_rsa_signature_with_allocator(certificate, signature, digest, allocator)
+    });
+    debug_assert!(
+        verification.is_some(),
+        "RSA verification attempted to nest scratch scopes"
+    );
+    verification.unwrap_or(Err(AuthError::OutOfResources))
+}
 
+fn verify_rsa_signature_with_allocator<A: Allocator + Copy>(
+    certificate: CertificateView<'_>,
+    signature: &[u8],
+    digest: &[u8; 32],
+    allocator: A,
+) -> Result<bool, AuthError> {
+    if certificate.modulus.is_empty()
+        || certificate.modulus.len() > MAX_RSA_BYTES
+        || certificate.exponent.is_empty()
+        || certificate.exponent.len() > core::mem::size_of::<u64>()
+    {
+        return Ok(false);
+    }
+    // DER INTEGER minimal encoding may strip the leading zero byte, so a
+    // valid signature can be one byte shorter than the modulus. Left-pad it
+    // back to modulus width; the value-below-modulus check below still holds.
+    if signature.len() + 1 < certificate.modulus.len()
+        || signature.len() > certificate.modulus.len()
+    {
+        return Ok(false);
+    }
+    let mut padded_signature = [0u8; MAX_RSA_BYTES];
+    let offset = certificate.modulus.len() - signature.len();
+    padded_signature[offset..offset + signature.len()].copy_from_slice(signature);
+    let signature = &padded_signature[..certificate.modulus.len()];
+
+    let exponent_value = certificate
+        .exponent
+        .iter()
+        .fold(0u64, |value, byte| (value << 8) | u64::from(*byte));
+    if !(2..=MAX_RSA_EXPONENT).contains(&exponent_value) || exponent_value & 1 == 0 {
+        return Ok(false);
+    }
+
+    let modulus = BoxedUintIn::try_from_be_slice_vartime(certificate.modulus, allocator)
+        .map_err(map_bigint_error)?;
+    let exponent = BoxedUintIn::try_from_be_slice_vartime(certificate.exponent, allocator)
+        .map_err(map_bigint_error)?;
     let signature =
-        rsa::pkcs1v15::Signature::try_from(signature).map_err(|_| AuthError::CryptoError)?;
-    let verifier = rsa::pkcs1v15::VerifyingKey::<Sha256>::new(key.clone());
-    Ok(verifier.verify_prehash(digest, &signature).is_ok())
+        BoxedUintIn::try_from_be_slice_vartime(signature, allocator).map_err(map_bigint_error)?;
+    if modulus.bits_vartime() > MAX_RSA_BITS as u32
+        || !bool::from(modulus.is_odd())
+        || exponent.cmp_vartime(&modulus) != Ordering::Less
+        || signature.cmp_vartime(&modulus) != Ordering::Less
+    {
+        return Ok(false);
+    }
+
+    let encoded = signature
+        .pow_mod_vartime(&exponent, &modulus)
+        .map_err(map_bigint_error)?;
+    let mut encoded_bytes = [0u8; MAX_RSA_BYTES];
+    let encoded_bytes = &mut encoded_bytes[..certificate.modulus.len()];
+    encoded
+        .write_be_bytes(encoded_bytes)
+        .map_err(|_| AuthError::CryptoError)?;
+    Ok(verify_pkcs1v15_sha256_encoding(encoded_bytes, digest))
+}
+
+fn map_bigint_error(error: PowModInError) -> AuthError {
+    match error {
+        PowModInError::Alloc => AuthError::OutOfResources,
+        PowModInError::InvalidInput => AuthError::CertificateParseError,
+    }
+}
+
+fn verify_pkcs1v15_sha256_encoding(encoded: &[u8], digest: &[u8; 32]) -> bool {
+    let payload_len = SHA256_DIGEST_INFO_PREFIX.len() + digest.len();
+    let Some(separator) = encoded.len().checked_sub(payload_len + 1) else {
+        return false;
+    };
+    separator >= 10
+        && encoded.starts_with(&[0x00, 0x01])
+        && encoded[2..separator].iter().all(|byte| *byte == 0xff)
+        && encoded[separator] == 0
+        && encoded[separator + 1..separator + 1 + SHA256_DIGEST_INFO_PREFIX.len()]
+            == *SHA256_DIGEST_INFO_PREFIX
+        && encoded[separator + 1 + SHA256_DIGEST_INFO_PREFIX.len()..] == *digest
+}
+
+#[cfg(test)]
+// The integration-test include compiles this helper unused; auth unit tests
+// call it to measure the production RSA allocation path.
+#[allow(dead_code)]
+pub(super) fn verify_rsa_parts_for_test(
+    modulus: &[u8],
+    exponent: &[u8],
+    signature: &[u8],
+    digest: &[u8; 32],
+) -> Result<bool, AuthError> {
+    verify_rsa_signature(
+        CertificateView {
+            raw: &[],
+            tbs: &[],
+            serial: &[],
+            issuer: &[],
+            subject: &[],
+            subject_key_identifier: None,
+            basic_constraints_ca: None,
+            key_usage: None,
+            modulus,
+            exponent,
+            signature: &[],
+        },
+        signature,
+        digest,
+    )
 }
