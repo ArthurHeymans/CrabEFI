@@ -275,23 +275,9 @@ pub fn show_secure_boot_menu() {
     }
 }
 
-/// Enroll default keys
+/// Enroll default keys through the authoritative runtime variable store.
 fn enroll_default_keys() -> Result<(), &'static str> {
-    use crate::efi::auth::enrollment;
-
-    // Enroll in memory
-    enrollment::enroll_default_keys().map_err(|_| "Failed to enroll keys")?;
-
-    // Enter user mode
-    auth::enter_user_mode();
-
-    // Persist to storage
-    secure_boot::persist_key_databases().map_err(|_| "Failed to persist keys")?;
-
-    // Update status variables
-    secure_boot::update_status_variables().map_err(|_| "Failed to update status")?;
-
-    Ok(())
+    secure_boot::enroll_and_persist_default_keys().map_err(|_| "Failed to enroll keys")
 }
 
 /// Enroll custom PK from ESP

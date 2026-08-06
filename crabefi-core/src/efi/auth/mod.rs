@@ -41,8 +41,6 @@ pub use crypto::*;
 pub use signature::*;
 pub use variables::*;
 
-use core::sync::atomic::{AtomicBool, Ordering};
-
 use crabefi_efi_types::secure_boot::{
     EFI_GLOBAL_VARIABLE_GUID, SECURE_BOOT_ENABLE_NAME, SECURE_BOOT_NAME, SETUP_MODE_NAME,
 };
@@ -236,9 +234,6 @@ pub const WIN_CERT_TYPE_EFI_GUID: u16 = 0x0EF1;
 const SECURE_BOOT_ENABLE_ATTRS: u32 =
     attributes::NON_VOLATILE | attributes::BOOTSERVICE_ACCESS | attributes::RUNTIME_ACCESS;
 
-static SETUP_MODE: AtomicBool = AtomicBool::new(true);
-static SECURE_BOOT_ENABLED: AtomicBool = AtomicBool::new(false);
-
 /// Read the image-owned standard SetupMode variable.
 pub fn is_setup_mode() -> bool {
     crate::efi::runtime_image::client::variables::get(
@@ -266,37 +261,35 @@ pub fn verify_pe_image_secure_boot(pe_data: &[u8]) -> Result<bool, AuthError> {
     authenticode::verify_pe_image_secure_boot(pe_data)
 }
 
-/// Enter User Mode (called when PK is enrolled).
+/// Log the transition requested by key enrollment.
+///
+/// The authoritative mode is synthesized by the runtime variable store from
+/// the PK variable; there is deliberately no second local state copy.
 pub fn enter_user_mode() {
-    SETUP_MODE.store(false, Ordering::Release);
     log::info!("Secure Boot: Entering User Mode");
 }
 
-/// Enter Setup Mode (called when PK is deleted).
+/// Log the transition requested by PK deletion.
 pub fn enter_setup_mode() {
-    SETUP_MODE.store(true, Ordering::Release);
-    SECURE_BOOT_ENABLED.store(false, Ordering::Release);
     log::info!("Secure Boot: Entering Setup Mode");
 }
 
 /// Enable Secure Boot (only valid in User Mode).
 pub fn enable_secure_boot() {
     if !is_setup_mode() {
-        SECURE_BOOT_ENABLED.store(true, Ordering::Release);
-        log::info!("Secure Boot: Enabled");
         persist_secure_boot_enable_preference(true);
+        if is_secure_boot_enabled() {
+            log::info!("Secure Boot: Enabled");
+        }
     }
-}
-
-pub(crate) fn set_secure_boot_derived(enabled: bool) {
-    SECURE_BOOT_ENABLED.store(enabled, Ordering::Release);
 }
 
 /// Disable Secure Boot.
 pub fn disable_secure_boot() {
-    SECURE_BOOT_ENABLED.store(false, Ordering::Release);
-    log::info!("Secure Boot: Disabled");
     persist_secure_boot_enable_preference(false);
+    if !is_secure_boot_enabled() {
+        log::info!("Secure Boot: Disabled");
+    }
 }
 
 /// Persist the SecureBootEnable preference to non-volatile storage
