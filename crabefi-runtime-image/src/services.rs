@@ -318,8 +318,11 @@ pub extern "efiapi" fn get_next_variable_name(
     let Some(slot) = next else {
         return efi::Status::NOT_FOUND;
     };
+    let Some(name) = slot.name.get(..usize::from(slot.name_len)) else {
+        return efi::Status::DEVICE_ERROR;
+    };
     write_next_name(
-        &slot.name[..usize::from(slot.name_len)],
+        name,
         slot.guid,
         supplied,
         variable_name_size,
@@ -571,7 +574,9 @@ fn apply_variable(
         }
     }
 
-    store.commit(transaction, prepared, name);
+    if let Err(status) = store.commit(transaction, prepared, name) {
+        return status;
+    }
     if let (Some(variable), Some(timestamp)) = (authenticated_variable, timestamp) {
         store.commit_auth_timestamp(variable, timestamp);
     }

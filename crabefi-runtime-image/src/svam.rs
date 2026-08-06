@@ -193,7 +193,12 @@ fn resolve_sections(
     count: usize,
 ) -> Result<[Mapping; MAX_SECTIONS], efi::Status> {
     let mut resolved = [Mapping::empty(); MAX_SECTIONS];
-    for (index, section) in runtime.sections[..runtime.section_count].iter().enumerate() {
+    for (index, section) in runtime
+        .sections
+        .iter()
+        .take(runtime.section_count)
+        .enumerate()
+    {
         let expected_type = if section.flags & section_flags::EXECUTE != 0 {
             efi::RUNTIME_SERVICES_CODE
         } else {
@@ -203,7 +208,9 @@ fn resolve_sections(
             .physical_base
             .checked_add(u64::from(section.byte_len))
             .ok_or(efi::Status::INVALID_PARAMETER)?;
-        resolved[index] = (0..count)
+        *resolved
+            .get_mut(index)
+            .ok_or(efi::Status::INVALID_PARAMETER)? = (0..count)
             .try_fold(None, |found, descriptor_index| {
                 let candidate = mapping(read_descriptor(map, stride, descriptor_index)?)?;
                 if candidate.memory_type != expected_type
@@ -233,13 +240,15 @@ fn resolve_ranges(
     count: usize,
 ) -> Result<[Mapping; MAX_EXTERNAL_RANGES], efi::Status> {
     let mut resolved = [Mapping::empty(); MAX_EXTERNAL_RANGES];
-    for (index, range) in runtime.ranges[..runtime.range_count].iter().enumerate() {
+    for (index, range) in runtime.ranges.iter().take(runtime.range_count).enumerate() {
         let range_end = range
             .physical_base
             .checked_add(range.byte_len)
             .ok_or(efi::Status::INVALID_PARAMETER)?;
         let expected_type = efi::MEMORY_MAPPED_IO;
-        resolved[index] = (0..count)
+        *resolved
+            .get_mut(index)
+            .ok_or(efi::Status::INVALID_PARAMETER)? = (0..count)
             .try_fold(None, |found, descriptor_index| {
                 let candidate = mapping(read_descriptor(map, stride, descriptor_index)?)?;
                 if candidate.memory_type != expected_type
@@ -303,8 +312,10 @@ fn virtual_time_config(
         .io_or_mmio_base
         .checked_add(width)
         .ok_or(efi::Status::INVALID_PARAMETER)?;
-    let (index, range) = runtime.ranges[..runtime.range_count]
+    let (index, range) = runtime
+        .ranges
         .iter()
+        .take(runtime.range_count)
         .enumerate()
         .find(|(_, range)| {
             range.physical_base <= runtime.time.io_or_mmio_base
@@ -320,8 +331,9 @@ fn virtual_time_config(
         .checked_sub(range.physical_base)
         .ok_or(efi::Status::INVALID_PARAMETER)?;
     let mut config = runtime.time;
-    config.io_or_mmio_base = range_virtual_bases[index]
-        .checked_add(offset)
+    config.io_or_mmio_base = range_virtual_bases
+        .get(index)
+        .and_then(|base| base.checked_add(offset))
         .ok_or(efi::Status::INVALID_PARAMETER)?;
     Ok(config)
 }
@@ -334,8 +346,10 @@ fn validate_and_commit(
     deferred_mapping: Mapping,
 ) -> Result<(), efi::Status> {
     let mut section_virtual_bases = [0u64; MAX_SECTIONS];
-    for ((section, mapping), virtual_base) in runtime.sections[..runtime.section_count]
+    for ((section, mapping), virtual_base) in runtime
+        .sections
         .iter()
+        .take(runtime.section_count)
         .zip(section_mappings.iter())
         .zip(section_virtual_bases.iter_mut())
     {
@@ -349,8 +363,10 @@ fn validate_and_commit(
             .ok_or(efi::Status::INVALID_PARAMETER)?;
     }
     let mut range_virtual_bases = [0u64; MAX_EXTERNAL_RANGES];
-    for ((range, mapping), virtual_base) in runtime.ranges[..runtime.range_count]
+    for ((range, mapping), virtual_base) in runtime
+        .ranges
         .iter()
+        .take(runtime.range_count)
         .zip(range_mappings.iter())
         .zip(range_virtual_bases.iter_mut())
     {
@@ -386,7 +402,7 @@ fn validate_and_commit(
     let mut tail_count = 0usize;
 
     // Validation pass: no writes.
-    for relocation in &runtime.relocations[..runtime.relocation_count] {
+    for relocation in runtime.relocations.iter().take(runtime.relocation_count) {
         let patch_section = runtime
             .sections
             .get(usize::from(relocation.patch_section))
@@ -419,8 +435,9 @@ fn validate_and_commit(
             .physical_base
             .checked_add(u64::from(patch_relative))
             .ok_or(efi::Status::INVALID_PARAMETER)?;
-        let virtual_target = section_virtual_bases[usize::from(relocation.target_section)]
-            .checked_add(u64::from(target_relative))
+        let virtual_target = section_virtual_bases
+            .get(usize::from(relocation.target_section))
+            .and_then(|base| base.checked_add(u64::from(target_relative)))
             .ok_or(efi::Status::INVALID_PARAMETER)?;
         let physical_target = target_section
             .physical_base
@@ -434,7 +451,9 @@ fn validate_and_commit(
             if tail_count >= tail.len() {
                 return Err(efi::Status::OUT_OF_RESOURCES);
             }
-            tail[tail_count] = SlotPatch {
+            *tail
+                .get_mut(tail_count)
+                .ok_or(efi::Status::OUT_OF_RESOURCES)? = SlotPatch {
                 address: patch_address,
                 value: virtual_target,
             };
@@ -443,14 +462,18 @@ fn validate_and_commit(
     }
 
     // Infallible commit begins. First publish resolved bases in image state.
-    for (section, virtual_base) in runtime.sections[..runtime.section_count]
+    for (section, virtual_base) in runtime
+        .sections
         .iter_mut()
+        .take(runtime.section_count)
         .zip(section_virtual_bases.iter())
     {
         section.virtual_base = *virtual_base;
     }
-    for (range, virtual_base) in runtime.ranges[..runtime.range_count]
+    for (range, virtual_base) in runtime
+        .ranges
         .iter_mut()
+        .take(runtime.range_count)
         .zip(range_virtual_bases.iter())
     {
         range.virtual_base = *virtual_base;
@@ -461,7 +484,7 @@ fn validate_and_commit(
     let sections = runtime.sections;
     let section_count = runtime.section_count;
     runtime.tables.convert_internal_pointers(|physical| {
-        sections[..section_count].iter().find_map(|section| {
+        sections.iter().take(section_count).find_map(|section| {
             let offset = physical.checked_sub(section.physical_base)?;
             (offset < u64::from(section.byte_len))
                 .then(|| section.virtual_base.checked_add(offset))?
@@ -474,11 +497,11 @@ fn validate_and_commit(
     core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
     runtime.tables.recompute_crcs();
     runtime.tables.recompute_runtime_crc_with(|address, byte| {
-        tail[..tail_count]
-            .iter()
+        tail.iter()
+            .take(tail_count)
             .find_map(|slot| {
                 let offset = address.checked_sub(slot.address)?;
-                (offset < 8).then(|| slot.value.to_le_bytes()[offset as usize])
+                slot.value.to_le_bytes().get(offset as usize).copied()
             })
             .unwrap_or(byte)
     });
@@ -486,8 +509,9 @@ fn validate_and_commit(
     // Patch every non-tail slot while physical aliases are executable.
     commit_matching(runtime, &section_virtual_bases, |address| {
         !(address >= runtime_table_start && address < runtime_table_end)
-            && !tail[..tail_count]
+            && !tail
                 .iter()
+                .take(tail_count)
                 .any(|slot| slot.address == address)
     });
 
@@ -502,18 +526,31 @@ fn commit_matching(
     virtual_bases: &[u64; MAX_SECTIONS],
     predicate: impl Fn(u64) -> bool,
 ) {
-    for relocation in &runtime.relocations[..runtime.relocation_count] {
-        let patch_section = runtime.sections[usize::from(relocation.patch_section)];
-        let target_section = runtime.sections[usize::from(relocation.target_section)];
-        let patch_relative = relocation.patch_offset - patch_section.image_offset;
-        let target_relative = relocation.target_offset - target_section.image_offset;
-        let patch_address = patch_section.physical_base + u64::from(patch_relative);
+    for relocation in runtime.relocations.iter().take(runtime.relocation_count) {
+        let patch_index = usize::from(relocation.patch_section);
+        let target_index = usize::from(relocation.target_section);
+        // SAFETY: the preceding validation pass checked both section indices,
+        // relocation offsets, and both address additions before commit began.
+        let (patch_section, target_section, target_base) = unsafe {
+            (
+                *runtime.sections.get_unchecked(patch_index),
+                *runtime.sections.get_unchecked(target_index),
+                *virtual_bases.get_unchecked(target_index),
+            )
+        };
+        let patch_relative = relocation
+            .patch_offset
+            .wrapping_sub(patch_section.image_offset);
+        let target_relative = relocation
+            .target_offset
+            .wrapping_sub(target_section.image_offset);
+        let patch_address = patch_section
+            .physical_base
+            .wrapping_add(u64::from(patch_relative));
         if !predicate(patch_address) {
             continue;
         }
-        let value = virtual_bases[usize::from(relocation.target_section)]
-            .checked_add(u64::from(target_relative))
-            .expect("validated relocation target overflowed during SVAM commit");
+        let value = target_base.wrapping_add(u64::from(target_relative));
         // SAFETY: the loader exposed these firmware addresses and validation
         // proved this complete aligned-width destination before commit.
         unsafe { write_slot_at_address(patch_address, value) };

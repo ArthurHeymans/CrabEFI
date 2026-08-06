@@ -419,15 +419,44 @@ pub fn queue_write(
         crc: U32::new(0),
     };
     let header_len = core::mem::size_of::<VariableRecordHeader>();
-    transaction.bytes[..header_len].copy_from_slice(record.as_bytes());
+    transaction
+        .bytes
+        .get_mut(..header_len)
+        .ok_or(efi::Status::OUT_OF_RESOURCES)?
+        .iter_mut()
+        .zip(record.as_bytes())
+        .for_each(|(destination, source)| *destination = *source);
     let mut offset = header_len;
     for unit in name.iter().copied().chain(core::iter::once(0)) {
-        transaction.bytes[offset..offset + 2].copy_from_slice(&unit.to_le_bytes());
-        offset += 2;
+        let end = offset.checked_add(2).ok_or(efi::Status::OUT_OF_RESOURCES)?;
+        transaction
+            .bytes
+            .get_mut(offset..end)
+            .ok_or(efi::Status::OUT_OF_RESOURCES)?
+            .iter_mut()
+            .zip(unit.to_le_bytes())
+            .for_each(|(destination, source)| *destination = source);
+        offset = end;
     }
-    transaction.bytes[offset..record_len].copy_from_slice(data);
-    record.crc = U32::new(record_crc(&transaction.bytes[..record_len]));
-    transaction.bytes[..header_len].copy_from_slice(record.as_bytes());
+    transaction
+        .bytes
+        .get_mut(offset..record_len)
+        .ok_or(efi::Status::OUT_OF_RESOURCES)?
+        .iter_mut()
+        .zip(data)
+        .for_each(|(destination, source)| *destination = *source);
+    let serialized = transaction
+        .bytes
+        .get(..record_len)
+        .ok_or(efi::Status::OUT_OF_RESOURCES)?;
+    record.crc = U32::new(record_crc(serialized));
+    transaction
+        .bytes
+        .get_mut(..header_len)
+        .ok_or(efi::Status::OUT_OF_RESOURCES)?
+        .iter_mut()
+        .zip(record.as_bytes())
+        .for_each(|(destination, source)| *destination = *source);
 
     // SAFETY: fixed header lies inside the validated retained journal.
     let mut header = unsafe { base.cast::<DeferredHeader>().read_unaligned() };

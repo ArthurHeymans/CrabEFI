@@ -146,7 +146,7 @@ impl VariableStore {
         }
         let mut prepared = self.prepare(guid, name, attributes, data.len())?;
         self.stage(transaction, &mut prepared, data, false)?;
-        self.commit(transaction, prepared, name);
+        self.commit(transaction, prepared, name)?;
         if let (Some(variable), Some(timestamp)) = (secure_variable, timestamp) {
             self.auth_timestamps[variable.index()] = timestamp;
         }
@@ -268,9 +268,9 @@ impl VariableStore {
         input: &[u8],
         append: bool,
     ) -> Result<&'a [u8], efi::Status> {
-        let old = if append && self.slots[prepared.slot].in_use != 0 {
-            self.data(&self.slots[prepared.slot])
-                .ok_or(efi::DEVICE_ERROR)?
+        let slot = self.slots.get(prepared.slot).ok_or(efi::DEVICE_ERROR)?;
+        let old = if append && slot.in_use != 0 {
+            self.data(slot).ok_or(efi::DEVICE_ERROR)?
         } else {
             &[]
         };
@@ -287,13 +287,14 @@ impl VariableStore {
         transaction: &VariableTransaction,
         prepared: PreparedWrite,
         name: &[u16],
-    ) {
+    ) -> Result<(), efi::Status> {
         if prepared.delete {
-            self.slots[prepared.slot].in_use = 0;
-            self.slots[prepared.slot].data_len = 0;
-            self.slots[prepared.slot].data_offset = 0;
+            let slot = self.slots.get_mut(prepared.slot).ok_or(efi::DEVICE_ERROR)?;
+            slot.in_use = 0;
+            slot.data_len = 0;
+            slot.data_offset = 0;
             self.refresh_policy();
-            return;
+            return Ok(());
         }
 
         let mut used = 0usize;
@@ -303,26 +304,55 @@ impl VariableStore {
             }
             let old = slot.data_offset as usize;
             let len = usize::from(slot.data_len);
+            let old_end = old.checked_add(len).ok_or(efi::DEVICE_ERROR)?;
+            let new_end = used.checked_add(len).ok_or(efi::DEVICE_ERROR)?;
+            if old_end > self.arena.len() || new_end > self.arena.len() {
+                return Err(efi::DEVICE_ERROR);
+            }
             if old != used {
-                self.arena.copy_within(old..old + len, used);
+                // SAFETY: both source and destination ranges were checked
+                // against the arena above. `ptr::copy` permits overlap.
+                unsafe {
+                    core::ptr::copy(
+                        self.arena.as_ptr().add(old),
+                        self.arena.as_mut_ptr().add(used),
+                        len,
+                    );
+                }
                 slot.data_offset = used as u32;
             }
-            used += len;
+            used = new_end;
         }
 
-        let slot = &mut self.slots[prepared.slot];
+        let data_end = used
+            .checked_add(prepared.data_len)
+            .ok_or(efi::OUT_OF_RESOURCES)?;
+        let source = transaction
+            .bytes
+            .get(..prepared.data_len)
+            .ok_or(efi::DEVICE_ERROR)?;
+        let destination = self
+            .arena
+            .get_mut(used..data_end)
+            .ok_or(efi::OUT_OF_RESOURCES)?;
+        destination.copy_from_slice(source);
+
+        let slot = self.slots.get_mut(prepared.slot).ok_or(efi::DEVICE_ERROR)?;
+        if prepared.name_len != name.len() || prepared.name_len > slot.name.len() {
+            return Err(efi::DEVICE_ERROR);
+        }
         slot.in_use = 0;
         slot.guid = prepared.guid;
         slot.attributes = prepared.attributes;
         slot.name_len = prepared.name_len as u16;
         slot.data_len = prepared.data_len as u16;
         slot.data_offset = used as u32;
-        slot.name[..prepared.name_len].copy_from_slice(name);
-        slot.name[prepared.name_len..].fill(0);
-        self.arena[used..used + prepared.data_len]
-            .copy_from_slice(&transaction.bytes[..prepared.data_len]);
+        let (slot_name, remainder) = slot.name.split_at_mut(prepared.name_len);
+        slot_name.copy_from_slice(name);
+        remainder.fill(0);
         slot.in_use = 1;
         self.refresh_policy();
+        Ok(())
     }
 
     pub const fn maximum_storage() -> u64 {

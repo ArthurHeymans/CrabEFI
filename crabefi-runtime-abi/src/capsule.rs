@@ -64,7 +64,7 @@ pub fn is_esrt_last_attempt_variable(guid: &[u8; 16], name: &[u16]) -> bool {
         .iter()
         .position(|unit| *unit == 0)
         .unwrap_or(name.len());
-    &name[..name_len] == ESRT_LAST_ATTEMPT_VARIABLE_NAME
+    name.get(..name_len) == Some(ESRT_LAST_ATTEMPT_VARIABLE_NAME)
 }
 
 #[cfg(test)]

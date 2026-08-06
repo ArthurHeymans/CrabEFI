@@ -287,7 +287,7 @@ mod tests {
         store
             .stage(&mut transaction, &mut prepared, append.payload, true)
             .unwrap();
-        store.commit(&transaction, prepared, DB_NAME);
+        store.commit(&transaction, prepared, DB_NAME).unwrap();
         store.commit_auth_timestamp(
             SecureBootVariable::Db,
             crate::auth::timestamp_from_efi_time(append.timestamp),
@@ -310,7 +310,7 @@ mod tests {
         store
             .stage(&mut transaction, &mut prepared, &[], false)
             .unwrap();
-        store.commit(&transaction, prepared, DB_NAME);
+        store.commit(&transaction, prepared, DB_NAME).unwrap();
         store.commit_auth_timestamp(
             SecureBootVariable::Db,
             crate::auth::timestamp_from_efi_time(deletion.timestamp),
@@ -369,7 +369,7 @@ mod tests {
         store
             .stage(&mut transaction, &mut prepared, verified.payload, false)
             .unwrap();
-        store.commit(&transaction, prepared, PK_NAME);
+        store.commit(&transaction, prepared, PK_NAME).unwrap();
         store.commit_auth_timestamp(SecureBootVariable::PK, timestamp);
         assert!(!store.setup_mode());
 
@@ -383,7 +383,7 @@ mod tests {
         store
             .stage(&mut transaction, &mut deletion, &[], false)
             .unwrap();
-        store.commit(&transaction, deletion, PK_NAME);
+        store.commit(&transaction, deletion, PK_NAME).unwrap();
         assert!(store.setup_mode());
         assert!(!store.secure_boot_enabled());
         assert_eq!(store.auth_timestamp(SecureBootVariable::PK), timestamp);

@@ -28,10 +28,24 @@ use crabefi_runtime_abi::{
 
 #[cfg(all(not(test), target_os = "none"))]
 #[panic_handler]
+#[inline(never)]
 fn panic(_info: &PanicInfo<'_>) -> ! {
+    crabefi_runtime_panic_is_possible();
     loop {
         core::hint::spin_loop();
     }
+}
+
+/// Stable panic sink used by the audited runtime build.
+///
+/// The runtime ELF retains panic support for its freestanding panic lang item,
+/// so the audit examines direct callers and permits this sink only from that
+/// support code. Any service path reaching a panic helper fails the build.
+#[cfg(all(not(test), target_os = "none"))]
+#[unsafe(no_mangle)]
+#[inline(never)]
+fn crabefi_runtime_panic_is_possible() {
+    core::hint::black_box(());
 }
 
 #[cfg(all(not(test), not(target_os = "none")))]
@@ -283,11 +297,16 @@ pub extern "C" fn runtime_image_prepare_ebs(
     let runtime = lease.state_mut();
     let sections = runtime.sections;
     let ranges = runtime.ranges;
-    match runtime.tables.prepare_memory_attributes(
-        descriptors,
-        &sections[..runtime.section_count],
-        &ranges[..runtime.range_count],
-    ) {
+    let Some(sections) = sections.get(..runtime.section_count) else {
+        return efi::Status::DEVICE_ERROR.as_usize();
+    };
+    let Some(ranges) = ranges.get(..runtime.range_count) else {
+        return efi::Status::DEVICE_ERROR.as_usize();
+    };
+    match runtime
+        .tables
+        .prepare_memory_attributes(descriptors, sections, ranges)
+    {
         Ok(()) => efi::Status::SUCCESS.as_usize(),
         Err(status) => status.as_usize(),
     }
