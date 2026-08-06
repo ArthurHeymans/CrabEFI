@@ -6,7 +6,9 @@
 
 pub mod qemu;
 
-use rflasher_internal::{Bdf, HostAccess, MmioAccess, PciConfigAccess};
+use rflasher_internal::{
+    HostAccess, MmioAccess, PciAddress as RflasherPciAddress, PciConfigAccess,
+};
 
 use crate::drivers::{mmio::MmioRegion, pci};
 use crate::platform::{FirmwareStorage, FirmwareStorageRegion, StorageError};
@@ -16,25 +18,33 @@ use crate::platform::{FirmwareStorage, FirmwareStorageRegion, StorageError};
 pub struct CrabEfiPciAccess;
 
 impl CrabEfiPciAccess {
-    fn addr(bdf: Bdf) -> pci::PciAddress {
-        // CrabEFI currently enumerates PCI segment 0 only.
-        pci::PciAddress::new(0, bdf.bus, bdf.device, bdf.function)
+    fn addr(address: RflasherPciAddress) -> pci::PciAddress {
+        pci::PciAddress::new(
+            address.segment(),
+            address.bus(),
+            address.device(),
+            address.function(),
+        )
     }
 
-    fn offset_to_u8(bdf: Bdf, offset: u16, write: bool) -> rflasher_internal::Result<u8> {
+    fn offset_to_u8(
+        address: RflasherPciAddress,
+        offset: u16,
+        write: bool,
+    ) -> rflasher_internal::Result<u8> {
         if offset > u8::MAX as u16 {
             let error = if write {
                 rflasher_internal::PciAccessError::ConfigWrite {
-                    bus: bdf.bus,
-                    device: bdf.device,
-                    function: bdf.function,
+                    bus: address.bus(),
+                    device: address.device(),
+                    function: address.function(),
                     register: offset,
                 }
             } else {
                 rflasher_internal::PciAccessError::ConfigRead {
-                    bus: bdf.bus,
-                    device: bdf.device,
-                    function: bdf.function,
+                    bus: address.bus(),
+                    device: address.device(),
+                    function: address.function(),
                     register: offset,
                 }
             };
@@ -46,36 +56,53 @@ impl CrabEfiPciAccess {
 }
 
 impl PciConfigAccess for CrabEfiPciAccess {
-    fn read8(&self, bdf: Bdf, offset: u16) -> rflasher_internal::Result<u8> {
-        let offset = Self::offset_to_u8(bdf, offset, false)?;
-        Ok(pci::read_config_u8(Self::addr(bdf), offset))
+    type Error = rflasher_internal::InternalError;
+
+    fn read8(&self, address: RflasherPciAddress, offset: u16) -> rflasher_internal::Result<u8> {
+        let offset = Self::offset_to_u8(address, offset, false)?;
+        Ok(pci::read_config_u8(Self::addr(address), offset))
     }
 
-    fn read16(&self, bdf: Bdf, offset: u16) -> rflasher_internal::Result<u16> {
-        let offset = Self::offset_to_u8(bdf, offset, false)?;
-        Ok(pci::read_config_u16(Self::addr(bdf), offset))
+    fn read16(&self, address: RflasherPciAddress, offset: u16) -> rflasher_internal::Result<u16> {
+        let offset = Self::offset_to_u8(address, offset, false)?;
+        Ok(pci::read_config_u16(Self::addr(address), offset))
     }
 
-    fn read32(&self, bdf: Bdf, offset: u16) -> rflasher_internal::Result<u32> {
-        let offset = Self::offset_to_u8(bdf, offset, false)?;
-        Ok(pci::read_config_u32(Self::addr(bdf), offset))
+    fn read32(&self, address: RflasherPciAddress, offset: u16) -> rflasher_internal::Result<u32> {
+        let offset = Self::offset_to_u8(address, offset, false)?;
+        Ok(pci::read_config_u32(Self::addr(address), offset))
     }
 
-    fn write8(&self, bdf: Bdf, offset: u16, value: u8) -> rflasher_internal::Result<()> {
-        let offset = Self::offset_to_u8(bdf, offset, true)?;
-        pci::write_config_u8(Self::addr(bdf), offset, value);
+    fn write8(
+        &self,
+        address: RflasherPciAddress,
+        offset: u16,
+        value: u8,
+    ) -> rflasher_internal::Result<()> {
+        let offset = Self::offset_to_u8(address, offset, true)?;
+        pci::write_config_u8(Self::addr(address), offset, value);
         Ok(())
     }
 
-    fn write16(&self, bdf: Bdf, offset: u16, value: u16) -> rflasher_internal::Result<()> {
-        let offset = Self::offset_to_u8(bdf, offset, true)?;
-        pci::write_config_u16(Self::addr(bdf), offset, value);
+    fn write16(
+        &self,
+        address: RflasherPciAddress,
+        offset: u16,
+        value: u16,
+    ) -> rflasher_internal::Result<()> {
+        let offset = Self::offset_to_u8(address, offset, true)?;
+        pci::write_config_u16(Self::addr(address), offset, value);
         Ok(())
     }
 
-    fn write32(&self, bdf: Bdf, offset: u16, value: u32) -> rflasher_internal::Result<()> {
-        let offset = Self::offset_to_u8(bdf, offset, true)?;
-        pci::write_config_u32(Self::addr(bdf), offset, value);
+    fn write32(
+        &self,
+        address: RflasherPciAddress,
+        offset: u16,
+        value: u32,
+    ) -> rflasher_internal::Result<()> {
+        let offset = Self::offset_to_u8(address, offset, true)?;
+        pci::write_config_u32(Self::addr(address), offset, value);
         Ok(())
     }
 }
@@ -399,10 +426,12 @@ fn rflasher_pci_device(dev: &pci::PciDevice) -> rflasher_internal::PciDevice {
         ((dev.class_code as u32) << 16) | ((dev.subclass as u32) << 8) | (dev.prog_if as u32);
 
     rflasher_internal::PciDevice {
-        domain: 0,
-        bus: dev.address.bus(),
-        device: dev.address.device(),
-        function: dev.address.function(),
+        address: RflasherPciAddress::new(
+            0,
+            dev.address.bus(),
+            dev.address.device(),
+            dev.address.function(),
+        ),
         vendor_id: dev.vendor_id,
         device_id: dev.device_id,
         revision_id: dev.revision,
@@ -487,7 +516,7 @@ pub fn detect_and_init() -> Option<AnySpiController> {
             match rflasher_internal::enable_amd_spi100_with_host(
                 &CrabEfiPciAccess,
                 chipset.enable,
-                Bdf::with_segment(chipset.domain, chipset.bus, chipset.device, 0),
+                RflasherPciAddress::new(chipset.domain, chipset.bus, chipset.device, 0),
                 chipset.revision_id,
             )
             .and_then(|info| info.create_controller_with_host(CrabEfiPciAccess))

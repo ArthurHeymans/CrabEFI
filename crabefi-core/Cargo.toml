@@ -50,10 +50,10 @@ noto-sans-mono-bitmap = { version = "0.3", default-features = false, features = 
 ] }
 tock-registers = "0.10"
 zerocopy = { version = "0.8", default-features = false, features = ["derive"] }
-rflasher-core = { git = "https://github.com/ArthurHeymans/rflasher.git", rev = "2f0b625865c0a530b3f151166be95319543e2aff", default-features = false, features = [
+rflasher-core = { git = "https://github.com/ArthurHeymans/rflasher.git", rev = "a06d37b6c45a59b68a3a01b7b8abee73a10ea8a0", default-features = false, features = [
   "is_sync",
 ] }
-rflasher-internal = { git = "https://github.com/ArthurHeymans/rflasher.git", rev = "2f0b625865c0a530b3f151166be95319543e2aff", default-features = false, features = [
+rflasher-internal = { git = "https://github.com/ArthurHeymans/rflasher.git", rev = "a06d37b6c45a59b68a3a01b7b8abee73a10ea8a0", default-features = false, features = [
   "is_sync",
 ] }
 

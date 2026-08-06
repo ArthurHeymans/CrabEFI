@@ -322,7 +322,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0bfb9eb618601c89945a70e254898da93b13be0388091d42117462b265bb3fad"
 dependencies = [
  "hash32",
- "serde",
  "stable_deref_trait",
 ]
 
@@ -480,12 +479,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "once_cell"
-version = "1.21.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
-
-[[package]]
 name = "paste"
 version = "1.0.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -591,27 +584,44 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ec0be4795e2f6a28069bec0b5ff3e2ac9bafc99e6a9a7dc3547996c5c816922c"
 
 [[package]]
+name = "rflasher-chip-types"
+version = "0.1.0"
+source = "git+https://github.com/ArthurHeymans/rflasher.git?rev=a06d37b6c45a59b68a3a01b7b8abee73a10ea8a0#a06d37b6c45a59b68a3a01b7b8abee73a10ea8a0"
+dependencies = [
+ "bitflags",
+ "heapless 0.8.0",
+]
+
+[[package]]
 name = "rflasher-core"
 version = "0.1.0"
-source = "git+https://github.com/ArthurHeymans/rflasher.git?rev=2f0b625865c0a530b3f151166be95319543e2aff#2f0b625865c0a530b3f151166be95319543e2aff"
+source = "git+https://github.com/ArthurHeymans/rflasher.git?rev=a06d37b6c45a59b68a3a01b7b8abee73a10ea8a0#a06d37b6c45a59b68a3a01b7b8abee73a10ea8a0"
 dependencies = [
  "bitflags",
  "embedded-io",
  "embedded-io-async",
- "heapless 0.8.0",
  "log",
  "maybe-async",
- "once_cell",
+ "rflasher-chip-types",
  "zerocopy",
 ]
 
 [[package]]
 name = "rflasher-internal"
 version = "0.1.0"
-source = "git+https://github.com/ArthurHeymans/rflasher.git?rev=2f0b625865c0a530b3f151166be95319543e2aff#2f0b625865c0a530b3f151166be95319543e2aff"
+source = "git+https://github.com/ArthurHeymans/rflasher.git?rev=a06d37b6c45a59b68a3a01b7b8abee73a10ea8a0#a06d37b6c45a59b68a3a01b7b8abee73a10ea8a0"
 dependencies = [
  "log",
  "rflasher-core",
+ "rflasher-pci",
+]
+
+[[package]]
+name = "rflasher-pci"
+version = "0.1.0"
+source = "git+https://github.com/ArthurHeymans/rflasher.git?rev=a06d37b6c45a59b68a3a01b7b8abee73a10ea8a0#a06d37b6c45a59b68a3a01b7b8abee73a10ea8a0"
+dependencies = [
+ "pci_types",
 ]
 
 [[package]]
@@ -645,35 +655,6 @@ name = "scopeguard"
 version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
-
-[[package]]
-name = "serde"
-version = "1.0.228"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9a8e94ea7f378bd32cbbd37198a4a91436180c5bb472411e48b5ec2e2124ae9e"
-dependencies = [
- "serde_core",
-]
-
-[[package]]
-name = "serde_core"
-version = "1.0.228"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "41d385c7d4ca58e59fc732af25c3983b67ac852c1a25000afe1175de458b67ad"
-dependencies = [
- "serde_derive",
-]
-
-[[package]]
-name = "serde_derive"
-version = "1.0.228"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d540f220d3187173da220f885ab66608367b6574e925011a9353e4badda91d79"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 2.0.114",
-]
 
 [[package]]
 name = "sha1"
