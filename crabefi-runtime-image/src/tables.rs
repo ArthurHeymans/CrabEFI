@@ -229,25 +229,50 @@ impl ImageTables {
         {
             return Err(efi::Status::UNSUPPORTED);
         }
-        if let Some(index) = self.configuration[..self.configuration_count]
+        if let Some(index) = self
+            .configuration
             .iter()
+            .take(self.configuration_count)
             .position(|entry| *entry.vendor_guid.as_bytes() == registration.guid)
         {
             if registration.table_address == 0 {
-                self.configuration
-                    .copy_within(index + 1..self.configuration_count, index);
-                self.configuration_metadata
-                    .copy_within(index + 1..self.configuration_count, index);
+                let move_count = self.configuration_count - index - 1;
+                // SAFETY: `index` came from the initialized prefix and
+                // configuration_count never exceeds either fixed array. The
+                // source and destination may overlap, so use `ptr::copy`.
+                unsafe {
+                    core::ptr::copy(
+                        self.configuration.as_ptr().add(index + 1),
+                        self.configuration.as_mut_ptr().add(index),
+                        move_count,
+                    );
+                    core::ptr::copy(
+                        self.configuration_metadata.as_ptr().add(index + 1),
+                        self.configuration_metadata.as_mut_ptr().add(index),
+                        move_count,
+                    );
+                }
                 self.configuration_count -= 1;
-                self.configuration[self.configuration_count] = efi::ConfigurationTable {
+                *self
+                    .configuration
+                    .get_mut(self.configuration_count)
+                    .ok_or(efi::Status::DEVICE_ERROR)? = efi::ConfigurationTable {
                     vendor_guid: efi::Guid::from_bytes(&[0; 16]),
                     vendor_table: core::ptr::null_mut(),
                 };
-                self.configuration_metadata[self.configuration_count] =
-                    ConfigurationMetadata::empty();
+                *self
+                    .configuration_metadata
+                    .get_mut(self.configuration_count)
+                    .ok_or(efi::Status::DEVICE_ERROR)? = ConfigurationMetadata::empty();
             } else {
-                self.configuration[index].vendor_table = registration.table_address as *mut c_void;
-                self.configuration_metadata[index] = ConfigurationMetadata {
+                self.configuration
+                    .get_mut(index)
+                    .ok_or(efi::Status::DEVICE_ERROR)?
+                    .vendor_table = registration.table_address as *mut c_void;
+                *self
+                    .configuration_metadata
+                    .get_mut(index)
+                    .ok_or(efi::Status::DEVICE_ERROR)? = ConfigurationMetadata {
                     policy: registration.policy,
                     physical_address: registration.table_address,
                 };
@@ -262,11 +287,17 @@ impl ImageTables {
         if index >= MAX_CONFIGURATION_TABLES {
             return Err(efi::Status::OUT_OF_RESOURCES);
         }
-        self.configuration[index] = efi::ConfigurationTable {
+        *self
+            .configuration
+            .get_mut(index)
+            .ok_or(efi::Status::OUT_OF_RESOURCES)? = efi::ConfigurationTable {
             vendor_guid: efi::Guid::from_bytes(&registration.guid),
             vendor_table: registration.table_address as *mut c_void,
         };
-        self.configuration_metadata[index] = ConfigurationMetadata {
+        *self
+            .configuration_metadata
+            .get_mut(index)
+            .ok_or(efi::Status::OUT_OF_RESOURCES)? = ConfigurationMetadata {
             policy: registration.policy,
             physical_address: registration.table_address,
         };
@@ -372,12 +403,16 @@ impl ImageTables {
         self.system.configuration_table = convert(self.system.configuration_table as u64)
             .unwrap_or(self.system.configuration_table as u64)
             as *mut efi::ConfigurationTable;
-        for index in 0..self.configuration_count {
-            if self.configuration_metadata[index].policy == configuration_policy::IMAGE_RUNTIME {
-                let physical = self.configuration_metadata[index].physical_address;
-                if let Some(virtual_address) = convert(physical) {
-                    self.configuration[index].vendor_table = virtual_address as *mut c_void;
-                }
+        for (entry, metadata) in self
+            .configuration
+            .iter_mut()
+            .zip(self.configuration_metadata.iter())
+            .take(self.configuration_count)
+        {
+            if metadata.policy == configuration_policy::IMAGE_RUNTIME
+                && let Some(virtual_address) = convert(metadata.physical_address)
+            {
+                entry.vendor_table = virtual_address as *mut c_void;
             }
         }
     }

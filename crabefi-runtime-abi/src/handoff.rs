@@ -203,8 +203,9 @@ impl RuntimeHandoff {
         self.image_base
             .checked_add(u64::from(self.image_size))
             .ok_or(HandoffError::Overflow)?;
-        self.sections[..section_count]
+        self.sections
             .iter()
+            .take(section_count)
             .try_fold(0u64, |watermark, section| {
                 if section.physical_base == 0
                     || !section
@@ -247,7 +248,7 @@ impl RuntimeHandoff {
                 .deferred_buffer_base
                 .checked_add(self.deferred_buffer_size)
                 .is_none()
-            || self.sections[..section_count].iter().any(|section| {
+            || self.sections.iter().take(section_count).any(|section| {
                 ranges_overlap(
                     section.physical_base,
                     u64::from(section.byte_len),
@@ -259,8 +260,9 @@ impl RuntimeHandoff {
             return Err(HandoffError::Range);
         }
 
-        self.ranges[..range_count]
+        self.ranges
             .iter()
+            .take(range_count)
             .enumerate()
             .try_for_each(|(index, range)| {
                 if range.physical_base == 0
@@ -276,14 +278,14 @@ impl RuntimeHandoff {
                     range.byte_len,
                     self.deferred_buffer_base,
                     self.deferred_buffer_size,
-                ) || self.ranges[..index].iter().any(|previous| {
+                ) || self.ranges.iter().take(index).any(|previous| {
                     ranges_overlap(
                         previous.physical_base,
                         previous.byte_len,
                         range.physical_base,
                         range.byte_len,
                     )
-                }) || self.sections[..section_count].iter().any(|section| {
+                }) || self.sections.iter().take(section_count).any(|section| {
                     ranges_overlap(
                         section.physical_base,
                         u64::from(section.byte_len),
@@ -318,7 +320,7 @@ impl RuntimeHandoff {
                 .ok_or(HandoffError::Overflow)?;
             if self.time.io_or_mmio_base == 0
                 || !self.time.io_or_mmio_base.is_multiple_of(4)
-                || !self.ranges[..range_count].iter().any(|range| {
+                || !self.ranges.iter().take(range_count).any(|range| {
                     range.physical_base <= self.time.io_or_mmio_base
                         && range
                             .physical_base

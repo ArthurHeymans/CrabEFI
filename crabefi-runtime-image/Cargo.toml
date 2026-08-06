@@ -11,7 +11,12 @@ build = "build.rs"
 allocator-api2 = { version = "=0.3.1", default-features = false }
 crabefi-efi-types = { path = "../crabefi-efi-types" }
 crabefi-runtime-abi = { path = "../crabefi-runtime-abi" }
-crypto-bigint = { version = "=0.7.5", default-features = false, features = ["allocator-api2"] }
+# Temporary audited fork adding allocator-api2-backed BoxedUintIn, bounded-stack
+# variable-time modular exponentiation, and panic-free verification primitives.
+# Fork audit reference: https://github.com/ArthurHeymans/crypto-bigint/commit/07a5d396134739ac0d02b15b1cd9c3f0ed60350e
+# Upstream status: no PR/issue yet. Replace this pin once those APIs are in a
+# published upstream release.
+crypto-bigint = { git = "https://github.com/ArthurHeymans/crypto-bigint", rev = "07a5d396134739ac0d02b15b1cd9c3f0ed60350e", default-features = false, features = ["allocator-api2"] }
 r-efi = "5.3"
 # This crate is a standalone workspace and intentionally uses sha2 0.11 so its
 # rsa 0.10 host tests share the same digest traits; other firmware crates remain
@@ -24,14 +29,6 @@ zerocopy = { version = "0.8", default-features = false, features = ["derive"] }
 # Host-test-only signing dependency. Keep the exact prerelease pinned so test
 # certificate generation does not drift independently of the verifier.
 rsa = { version = "=0.10.0-rc.18", default-features = false }
-
-[patch.crates-io]
-# Temporary audited fork of 0.7.5 adding allocator-api2-backed BoxedUintIn and
-# bounded-stack variable-time modular exponentiation without a global allocator.
-# Fork audit reference: https://github.com/ArthurHeymans/crypto-bigint/commit/8da705a86237f2c9804ddb30140715bd360983c3
-# Upstream status: no PR/issue yet. Remove this patch once those APIs are in a
-# published upstream release.
-crypto-bigint = { git = "https://github.com/ArthurHeymans/crypto-bigint", rev = "8da705a86237f2c9804ddb30140715bd360983c3" }
 
 [[bin]]
 name = "crabefi-runtime-image"

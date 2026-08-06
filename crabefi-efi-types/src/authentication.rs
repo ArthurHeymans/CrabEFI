@@ -204,7 +204,10 @@ pub fn validate_signature_database(mut data: &[u8]) -> bool {
         {
             return false;
         }
-        data = &data[size..];
+        let Some(remaining) = data.get(size..) else {
+            return false;
+        };
+        data = remaining;
         list_count += 1;
     }
     list_count != 0
@@ -284,9 +287,11 @@ impl<'a> Iterator for SignatureIterator<'a> {
             .checked_add(self.index.checked_mul(size)?)?;
         let bytes = self.data.get(start..start.checked_add(size)?)?;
         let mut owner = [0u8; 16];
-        owner.copy_from_slice(bytes.get(..16)?);
+        for (destination, source) in owner.iter_mut().zip(bytes.get(..16)?.iter()) {
+            *destination = *source;
+        }
         self.index += 1;
-        Some((owner, &bytes[16..]))
+        Some((owner, bytes.get(16..)?))
     }
 }
 

@@ -183,8 +183,12 @@ pub fn verify_pkcs7_signature_hash(
             return Err(AuthError::OutOfResources);
         }
         let signer = parse_signer(expect(signer_reader.next()?, 0x30)?)?;
-        let Some(signer_certificate) =
-            find_signer(signer.identity, &certificates[..certificate_count])?
+        let Some(signer_certificate) = find_signer(
+            signer.identity,
+            certificates
+                .get(..certificate_count)
+                .ok_or(AuthError::CertificateParseError)?,
+        )?
         else {
             continue;
         };
@@ -193,7 +197,9 @@ pub fn verify_pkcs7_signature_hash(
             && certificate_authorized(
                 signer_certificate,
                 trusted,
-                &certificates[..certificate_count],
+                certificates
+                    .get(..certificate_count)
+                    .ok_or(AuthError::CertificateParseError)?,
                 0,
             )?
         {
@@ -358,7 +364,11 @@ fn signed_attributes_digest(
     }
     let mut hash = Sha256::new();
     hash.update([0x31]);
-    hash.update(&attributes.full[1..]);
+    let attributes_body = attributes
+        .full
+        .get(1..)
+        .ok_or(AuthError::CertificateParseError)?;
+    hash.update(attributes_body);
     Ok(hash.finalize().into())
 }
 
@@ -634,7 +644,7 @@ fn verify_rsa_signature_with_allocator<A: Allocator + Copy>(
     let signature =
         BoxedUintIn::try_from_be_slice_vartime(signature, allocator).map_err(map_bigint_error)?;
     if modulus.bits_vartime() > MAX_RSA_BITS as u32
-        || !bool::from(modulus.is_odd())
+        || !modulus.is_odd()
         || exponent.cmp_vartime(&modulus) != Ordering::Less
         || signature.cmp_vartime(&modulus) != Ordering::Less
     {
@@ -645,7 +655,9 @@ fn verify_rsa_signature_with_allocator<A: Allocator + Copy>(
         .pow_mod_vartime(&exponent, &modulus)
         .map_err(map_bigint_error)?;
     let mut encoded_bytes = [0u8; MAX_RSA_BYTES];
-    let encoded_bytes = &mut encoded_bytes[..certificate.modulus.len()];
+    let encoded_bytes = encoded_bytes
+        .get_mut(..certificate.modulus.len())
+        .ok_or(AuthError::CertificateParseError)?;
     encoded
         .write_be_bytes(encoded_bytes)
         .map_err(|_| AuthError::CryptoError)?;
@@ -664,13 +676,27 @@ fn verify_pkcs1v15_sha256_encoding(encoded: &[u8], digest: &[u8; 32]) -> bool {
     let Some(separator) = encoded.len().checked_sub(payload_len + 1) else {
         return false;
     };
-    separator >= 10
-        && encoded.starts_with(&[0x00, 0x01])
-        && encoded[2..separator].iter().all(|byte| *byte == 0xff)
-        && encoded[separator] == 0
-        && encoded[separator + 1..separator + 1 + SHA256_DIGEST_INFO_PREFIX.len()]
-            == *SHA256_DIGEST_INFO_PREFIX
-        && encoded[separator + 1 + SHA256_DIGEST_INFO_PREFIX.len()..] == *digest
+    if separator < 10 || !encoded.starts_with(&[0x00, 0x01]) {
+        return false;
+    }
+    let Some(padding) = encoded.get(2..separator) else {
+        return false;
+    };
+    let Some(separator_byte) = encoded.get(separator) else {
+        return false;
+    };
+    let prefix_start = separator + 1;
+    let prefix_end = prefix_start + SHA256_DIGEST_INFO_PREFIX.len();
+    let Some(prefix) = encoded.get(prefix_start..prefix_end) else {
+        return false;
+    };
+    let Some(encoded_digest) = encoded.get(prefix_end..) else {
+        return false;
+    };
+    padding.iter().all(|byte| *byte == 0xff)
+        && *separator_byte == 0
+        && prefix == SHA256_DIGEST_INFO_PREFIX
+        && encoded_digest == digest
 }
 
 #[cfg(test)]
