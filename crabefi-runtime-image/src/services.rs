@@ -261,7 +261,7 @@ pub extern "efiapi" fn get_next_variable_name(
     let current_name = if first == 0 {
         Name::empty()
     } else {
-        match read_name(variable_name) {
+        match read_name_bounded(variable_name, supplied / core::mem::size_of::<u16>()) {
             Ok(name) => name,
             Err(status) => return status,
         }
@@ -880,13 +880,17 @@ impl Name {
 }
 
 fn read_name(pointer: *const u16) -> Result<Name, efi::Status> {
+    read_name_bounded(pointer, MAX_VARIABLE_NAME_LEN + 1)
+}
+
+fn read_name_bounded(pointer: *const u16, available_units: usize) -> Result<Name, efi::Status> {
     if pointer.is_null() {
         return Err(efi::Status::INVALID_PARAMETER);
     }
     let mut name = Name::empty();
-    while name.len < MAX_VARIABLE_NAME_LEN {
-        // SAFETY: UEFI variable names are NUL-terminated. The bounded walk
-        // reads at most the ABI maximum plus its required terminator.
+    while name.len < MAX_VARIABLE_NAME_LEN && name.len < available_units {
+        // SAFETY: the bounded walk stays within both the ABI maximum and the
+        // caller-declared buffer extent.
         let unit = unsafe { pointer.add(name.len).read() };
         if unit == 0 {
             return if name.len == 0 {
@@ -898,8 +902,11 @@ fn read_name(pointer: *const u16) -> Result<Name, efi::Status> {
         name.units[name.len] = unit;
         name.len += 1;
     }
-    // SAFETY: one final unit is required to terminate a maximum-length name.
-    if unsafe { pointer.add(MAX_VARIABLE_NAME_LEN).read() } == 0 {
+    // SAFETY: one final unit is read only when the caller's declared buffer
+    // includes it.
+    if available_units > MAX_VARIABLE_NAME_LEN
+        && unsafe { pointer.add(MAX_VARIABLE_NAME_LEN).read() } == 0
+    {
         Ok(name)
     } else {
         Err(efi::Status::INVALID_PARAMETER)
@@ -956,6 +963,15 @@ mod tests {
         auth,
         store::{VariableStore, VariableTransaction},
     };
+
+    #[test]
+    fn bounded_name_read_rejects_missing_terminator_without_exceeding_declared_extent() {
+        let name = [b'A' as u16];
+        assert!(matches!(
+            read_name_bounded(name.as_ptr(), name.len()),
+            Err(status) if status == efi::Status::INVALID_PARAMETER
+        ));
+    }
 
     const AUTH_ATTRIBUTES: u32 = efi::VARIABLE_NON_VOLATILE
         | efi::VARIABLE_BOOTSERVICE_ACCESS
