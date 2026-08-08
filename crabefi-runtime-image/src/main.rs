@@ -52,7 +52,12 @@ fn crabefi_runtime_panic_is_possible() {
 fn main() {}
 
 #[unsafe(no_mangle)]
-pub extern "C" fn runtime_image_init(handoff: *const RuntimeHandoff) -> usize {
+/// # Safety
+///
+/// `handoff` must point to an initialized, readable `RuntimeHandoff` for the
+/// duration of this call. Every nonzero address/length pair in the handoff must
+/// describe memory satisfying the runtime ABI contract.
+pub unsafe extern "C" fn runtime_image_init(handoff: *const RuntimeHandoff) -> usize {
     if handoff.is_null() || state::phase_value() != phase::UNINITIALIZED {
         return efi::Status::INVALID_PARAMETER.as_usize();
     }
@@ -70,7 +75,13 @@ pub extern "C" fn runtime_image_init(handoff: *const RuntimeHandoff) -> usize {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn runtime_image_import_relocation(relocation: *const RelocationImport) -> usize {
+/// # Safety
+///
+/// `relocation` must point to an initialized, readable `RelocationImport` for
+/// the duration of this call.
+pub unsafe extern "C" fn runtime_image_import_relocation(
+    relocation: *const RelocationImport,
+) -> usize {
     if relocation.is_null()
         || !matches!(
             state::phase_value(),
@@ -94,7 +105,12 @@ pub extern "C" fn runtime_image_import_relocation(relocation: *const RelocationI
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn runtime_image_import_variable(import: *const VariableImport) -> usize {
+/// # Safety
+///
+/// `import` must point to an initialized, readable `VariableImport`. Its name
+/// and data address/length pairs must remain readable for the duration of this
+/// call and must not be concurrently mutated.
+pub unsafe extern "C" fn runtime_image_import_variable(import: *const VariableImport) -> usize {
     if import.is_null()
         || !matches!(
             state::phase_value(),
@@ -222,7 +238,11 @@ pub extern "C" fn runtime_image_activate(boot_services: u64) -> usize {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn runtime_image_register_configuration(
+/// # Safety
+///
+/// `registration` must point to an initialized, readable registration value
+/// for the duration of this call.
+pub unsafe extern "C" fn runtime_image_register_configuration(
     registration: *const ConfigurationRegistration,
 ) -> usize {
     if registration.is_null() {
@@ -240,7 +260,13 @@ pub extern "C" fn runtime_image_register_configuration(
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn runtime_image_set_console(registration: *const ConsoleRegistration) -> usize {
+/// # Safety
+///
+/// `registration` must point to an initialized, readable registration value
+/// for the duration of this call.
+pub unsafe extern "C" fn runtime_image_set_console(
+    registration: *const ConsoleRegistration,
+) -> usize {
     if registration.is_null() {
         return efi::Status::INVALID_PARAMETER.as_usize();
     }
@@ -260,7 +286,13 @@ pub extern "C" fn runtime_image_set_console(registration: *const ConsoleRegistra
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn runtime_image_install_esrt(registration: *const EsrtRegistration) -> usize {
+/// # Safety
+///
+/// `registration` must point to an initialized, readable registration value
+/// for the duration of this call.
+pub unsafe extern "C" fn runtime_image_install_esrt(
+    registration: *const EsrtRegistration,
+) -> usize {
     if registration.is_null() {
         return efi::Status::INVALID_PARAMETER.as_usize();
     }
@@ -280,7 +312,11 @@ pub extern "C" fn runtime_image_install_esrt(registration: *const EsrtRegistrati
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn runtime_image_prepare_ebs(
+/// # Safety
+///
+/// `descriptors` must point to `descriptor_count` initialized, readable memory
+/// descriptors for the duration of this call.
+pub unsafe extern "C" fn runtime_image_prepare_ebs(
     descriptors: *const efi::MemoryDescriptor,
     descriptor_count: usize,
 ) -> usize {
@@ -358,7 +394,7 @@ mod tests {
             ..VariableImport::default()
         };
         assert_eq!(
-            runtime_image_import_variable(&import),
+            unsafe { runtime_image_import_variable(&import) },
             efi::Status::INVALID_PARAMETER.as_usize()
         );
     }
