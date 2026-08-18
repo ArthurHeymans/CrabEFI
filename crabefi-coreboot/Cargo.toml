@@ -33,7 +33,7 @@ zerocopy = { version = "0.8", default-features = false, features = ["derive"] }
 # package-element names eagerly (fails on forward references like
 # \_SB.PCI0.LPCB in the coreboot DSDT/SSDT). Upstream main has both the
 # BankField/IndexField support and lazy package name resolution (PR #320).
-acpi = { git = "https://github.com/ArthurHeymans/acpi.git", rev = "784a35b50bf9c39ce9b0a107cf8a5c296c52ddee", default-features = false, features = [
+acpi = { git = "https://github.com/rust-osdev/acpi.git", rev = "cb34d9d42c8d2795bfac4955ff83b04a060a797d", default-features = false, features = [
   "alloc",
   "aml",
 ] }
