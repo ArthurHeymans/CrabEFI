@@ -28,6 +28,12 @@ pub const MAX_DATA_SIZE: usize = MAX_AUTHENTICATED_ENVELOPE_SIZE;
 pub const MAX_ENTRY_SIZE: usize =
     core::mem::size_of::<VariableRecordHeader>() + (MAX_NAME_LEN + 1) * 2 + MAX_DATA_SIZE;
 
+// Capacity note: the retained deferred buffer reserved by the payload linker
+// scripts is 128 KiB, of which [`JOURNAL_OFFSET`] is reserved for the private
+// reservation capsule. That leaves room for two full-width entries plus the
+// journal header; smaller entries pack more densely. If `MAX_DATA_SIZE` or
+// `MAX_ENTRY_SIZE` grows, grow the linker reservation to match.
+
 const RECORD_MAGIC: u16 = 0xaa55;
 const STATE_VALID: u8 = 0x7f;
 const STATE_DELETED: u8 = 0x00;

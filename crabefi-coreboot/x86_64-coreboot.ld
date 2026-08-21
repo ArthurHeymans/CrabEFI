@@ -57,7 +57,7 @@ SECTIONS {
        CapsuleUpdateData reservation capsule before optional DRAM clearing. */
     .deferred_buffer ALIGN(4096) (NOLOAD) : {
         _deferred_buffer_start = .;
-        . += 64K;
+        . += 128K;
         _deferred_buffer_end = .;
     } :defer
 
