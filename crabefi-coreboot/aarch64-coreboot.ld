@@ -66,7 +66,7 @@ SECTIONS {
     /* Warm-reset retained and excluded from the payload's PT_LOAD extent. */
     .deferred_buffer (NOLOAD) : ALIGN(4096) {
         _deferred_buffer_start = .;
-        . += 64K;
+        . += 128K;
         _deferred_buffer_end = .;
     } :defer
 
