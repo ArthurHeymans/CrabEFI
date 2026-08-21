@@ -1,4 +1,20 @@
 //! Borrowed CMS/X.509 parsing and bounded RSA verification.
+//!
+//! # Accepted limitations
+//!
+//! This verifier is deliberately minimal and every gap below fails closed
+//! (unparsable or unverifiable input is rejected):
+//! - No certificate validity-period or revocation checking.
+//! - Issuer/subject chaining compares the DER name bytes exactly instead of
+//!   normalizing alternative encodings; a differently-encoded name simply
+//!   fails to chain.
+//! - The direct-issuance path does not require the trusted (db/PK)
+//!   certificate to be a CA — only intermediates are checked for the CA bit.
+//!   This grants no escalation: a trusted certificate's key can always sign
+//!   the PKCS#7 directly anyway.
+//! - The SignerInfo `signatureAlgorithm` OID is accepted but ignored;
+//!   verification is unconditionally RSA-SHA256, so a mismatched OID just
+//!   fails verification.
 
 use allocator_api2::alloc::Allocator;
 use core::cmp::Ordering;

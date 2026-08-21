@@ -1,4 +1,11 @@
 //! Deferred-v2 journal access using a fixed zerocopy wire header.
+//!
+//! The journal is a crash-consistency mechanism, not an authenticity boundary:
+//! its CRC32 guards against torn writes and unrelated memory damage, but any
+//! attacker who can rewrite the journal can already issue runtime service
+//! calls directly. Writes are queued only after the in-image policy checks
+//! (including signature verification for authenticated variables) have
+//! accepted them.
 
 use crabefi_efi_types::crc32;
 use crabefi_runtime_abi::{
@@ -11,11 +18,15 @@ use crabefi_runtime_abi::{
 use zerocopy::byteorder::little_endian::{I16, U16, U32, U64};
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned};
 
+use crate::auth::MAX_AUTHENTICATED_ENVELOPE_SIZE;
 use crate::efi;
 
 pub const MAX_NAME_LEN: usize = 64;
-pub const MAX_DATA_SIZE: usize = 32 * 1024;
-pub const MAX_ENTRY_SIZE: usize = 16 * 1024;
+/// Records carry the complete authenticated input envelope so a full-width
+/// envelope always fits a single journal entry.
+pub const MAX_DATA_SIZE: usize = MAX_AUTHENTICATED_ENVELOPE_SIZE;
+pub const MAX_ENTRY_SIZE: usize =
+    core::mem::size_of::<VariableRecordHeader>() + (MAX_NAME_LEN + 1) * 2 + MAX_DATA_SIZE;
 
 const RECORD_MAGIC: u16 = 0xaa55;
 const STATE_VALID: u8 = 0x7f;
@@ -322,21 +333,25 @@ pub fn stage_capsule(
             descriptor.add(1).read_unaligned(),
         )
     };
-    if length == 0 || address == 0 || length > u64::from(capsule_size) {
+    if length == 0
+        || address == 0
+        || length > u64::from(capsule_size)
+        // The described physical block must not wrap; coreboot consumes this
+        // descriptor pair verbatim on the next boot.
+        || address.checked_add(length).is_none()
+    {
         return Err(efi::Status::INVALID_PARAMETER);
     }
+    let next_descriptor = scatter_gather_list
+        .checked_add(CAPSULE_DESCRIPTOR_SIZE as u64)
+        .ok_or(efi::Status::INVALID_PARAMETER)?;
     // SAFETY: the retained range has all fixed descriptor slots.
     unsafe {
         write_descriptor(base, 1, length, address);
         if length == u64::from(capsule_size) {
             write_descriptor(base, 2, 0, 0);
         } else {
-            write_descriptor(
-                base,
-                2,
-                0,
-                scatter_gather_list + CAPSULE_DESCRIPTOR_SIZE as u64,
-            );
+            write_descriptor(base, 2, 0, next_descriptor);
         }
     }
     Ok(())
@@ -794,6 +809,25 @@ mod tests {
             0x56, 0x97,
         ];
         assert_ne!(&private[..16], WINDOWS_UX_GUID.as_slice());
+        crate::scratch::reset();
+    }
+
+    #[test]
+    fn stage_capsule_rejects_wrapping_scatter_gather_blocks() {
+        let _guard = crate::scratch::test_lock();
+        let mut buffer = vec![0u8; 64 * 1024];
+        let mut descriptors = [0u8; CAPSULE_DESCRIPTOR_SIZE];
+        descriptors[..8].copy_from_slice(&u64::from(u32::MAX).to_le_bytes());
+        descriptors[8..].copy_from_slice(&u64::MAX.to_le_bytes());
+        assert_eq!(
+            stage_capsule(
+                buffer.as_mut_ptr(),
+                buffer.len(),
+                u32::MAX,
+                descriptors.as_ptr() as u64,
+            ),
+            Err(efi::Status::INVALID_PARAMETER)
+        );
         crate::scratch::reset();
     }
 

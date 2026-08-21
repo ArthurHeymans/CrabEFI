@@ -463,6 +463,18 @@ fn apply_variable(
     if secure_variable.is_some() && !authenticated && !store.setup_mode() {
         return efi::Status::SECURITY_VIOLATION;
     }
+    // EDK2 parity (AuthService.c `ProcessVariable`): a variable that exists
+    // with time-based authentication keeps requiring an authenticated
+    // envelope for every later update, append, and deletion, whatever its
+    // GUID. Raw requests fail closed instead of silently rewriting or
+    // removing authenticated content.
+    if !authenticated
+        && store.find(&guid, name, false).is_some_and(|slot| {
+            slot.attributes & efi::VARIABLE_TIME_BASED_AUTHENTICATED_WRITE_ACCESS != 0
+        })
+    {
+        return efi::Status::WRITE_PROTECTED;
+    }
     let (payload, timestamp, authenticated_variable) = if authenticated {
         match auth::verify_authenticated_variable(store, name, &guid, attributes, input) {
             Ok(verified) => (
@@ -784,6 +796,13 @@ pub extern "efiapi" fn query_capsule_capabilities(
     {
         return efi::Status::UNSUPPORTED;
     }
+    // Match `update_capsule`'s structural header checks so a capsule cannot
+    // pass the capability query and then fail the update itself.
+    if header.header_size < core::mem::size_of::<efi::CapsuleHeader>() as u32
+        || header.capsule_image_size < header.header_size
+    {
+        return efi::Status::INVALID_PARAMETER;
+    }
     unsafe {
         maximum_capsule_size.write(MAX_CAPSULE_SIZE);
         reset_type.write(efi::RESET_WARM);
@@ -1064,6 +1083,139 @@ mod tests {
 
         let slot = store.find(&guid, name, false).unwrap();
         assert_eq!(store.data(slot), Some(b"firmware".as_slice()));
+    }
+
+    #[test]
+    fn raw_writes_cannot_modify_previously_authenticated_variables() {
+        let _guard = crate::scratch::test_lock();
+        crate::scratch::activate();
+        let mut store = VariableStore::new();
+        let mut transaction = VariableTransaction::new();
+        let mut deferred_transaction = deferred::DeferredTransaction::new();
+        let mut buffer = vec![0u8; 64 * 1024];
+        let guid = [0x42; 16];
+        let name = [b'A' as u16, b'u' as u16, b't' as u16, b'h' as u16];
+
+        // Boot import is firmware-authoritative and may enroll an
+        // authenticated variable directly.
+        store
+            .import(
+                &mut transaction,
+                guid,
+                &name,
+                AUTH_ATTRIBUTES,
+                b"payload",
+                None,
+            )
+            .unwrap();
+
+        for (attributes, value) in [
+            (
+                AUTH_ATTRIBUTES & !efi::VARIABLE_TIME_BASED_AUTHENTICATED_WRITE_ACCESS,
+                b"raw".as_slice(),
+            ),
+            (
+                (AUTH_ATTRIBUTES & !efi::VARIABLE_TIME_BASED_AUTHENTICATED_WRITE_ACCESS)
+                    | efi::VARIABLE_APPEND_WRITE,
+                b"append".as_slice(),
+            ),
+            (0, b"".as_slice()),
+        ] {
+            assert_eq!(
+                apply_variable(
+                    &mut store,
+                    &mut transaction,
+                    Some(&mut deferred_transaction),
+                    phase::BOOT_ACTIVE,
+                    successful_bridge as *const () as u64,
+                    (buffer.as_mut_ptr(), buffer.len()),
+                    guid,
+                    &name,
+                    attributes,
+                    value,
+                ),
+                efi::Status::WRITE_PROTECTED
+            );
+        }
+
+        // Authenticated requests pass the gate and reach signature
+        // verification, which rejects the truncated envelope.
+        assert_eq!(
+            apply_variable(
+                &mut store,
+                &mut transaction,
+                Some(&mut deferred_transaction),
+                phase::BOOT_ACTIVE,
+                successful_bridge as *const () as u64,
+                (buffer.as_mut_ptr(), buffer.len()),
+                guid,
+                &name,
+                AUTH_ATTRIBUTES,
+                b"garbage",
+            ),
+            efi::Status::INVALID_PARAMETER
+        );
+
+        // The authenticated content is untouched by every rejected attempt.
+        let slot = store.find(&guid, &name, false).unwrap();
+        assert_eq!(store.data(slot), Some(b"payload".as_slice()));
+        assert_eq!(slot.attributes, AUTH_ATTRIBUTES);
+        crate::scratch::reset();
+    }
+
+    #[test]
+    fn query_capsule_capabilities_validates_header_like_update_capsule() {
+        let header = efi::CapsuleHeader {
+            capsule_guid: efi::Guid::from_bytes(&[0; 16]),
+            header_size: core::mem::size_of::<efi::CapsuleHeader>() as u32,
+            flags: CAPSULE_FLAGS_PERSIST_ACROSS_RESET,
+            capsule_image_size: core::mem::size_of::<efi::CapsuleHeader>() as u32 - 1,
+        };
+        let mut array = [&header as *const efi::CapsuleHeader as *mut efi::CapsuleHeader];
+        let mut maximum = 0u64;
+        let mut reset_type = efi::RESET_COLD;
+        assert_eq!(
+            query_capsule_capabilities(
+                array.as_mut_ptr(),
+                array.len(),
+                &mut maximum,
+                &mut reset_type,
+            ),
+            efi::Status::INVALID_PARAMETER
+        );
+
+        let truncated = efi::CapsuleHeader {
+            header_size: core::mem::size_of::<efi::CapsuleHeader>() as u32 - 1,
+            capsule_image_size: 4096,
+            ..header
+        };
+        let mut array = [&truncated as *const efi::CapsuleHeader as *mut efi::CapsuleHeader];
+        assert_eq!(
+            query_capsule_capabilities(
+                array.as_mut_ptr(),
+                array.len(),
+                &mut maximum,
+                &mut reset_type,
+            ),
+            efi::Status::INVALID_PARAMETER
+        );
+
+        let valid = efi::CapsuleHeader {
+            capsule_image_size: 4096,
+            ..header
+        };
+        let mut array = [&valid as *const efi::CapsuleHeader as *mut efi::CapsuleHeader];
+        assert_eq!(
+            query_capsule_capabilities(
+                array.as_mut_ptr(),
+                array.len(),
+                &mut maximum,
+                &mut reset_type,
+            ),
+            efi::Status::SUCCESS
+        );
+        assert_eq!(maximum, MAX_CAPSULE_SIZE);
+        assert_eq!(reset_type, efi::RESET_WARM);
     }
 
     #[test]
