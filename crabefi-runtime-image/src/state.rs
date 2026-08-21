@@ -2,12 +2,12 @@
 
 use core::cell::UnsafeCell;
 use core::marker::PhantomData;
-use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 
 use crabefi_runtime_abi::{
     LoadedSection, MAX_EXTERNAL_RANGES, MAX_RELOCATIONS, MAX_SECTIONS, RelocationImport,
     RuntimeExternalRange, RuntimeHandoff, RuntimeResetConfig, RuntimeTimeConfig, phase,
-    relocation_kind,
+    relocation_kind, section_flags,
 };
 
 use crate::{
@@ -177,9 +177,29 @@ impl RuntimeState {
         if self.import_finished || self.relocation_count >= MAX_RELOCATIONS {
             return Err(efi::Status::OUT_OF_RESOURCES);
         }
-        if usize::from(relocation.patch_section) >= self.section_count
-            || usize::from(relocation.target_section) >= self.section_count
-            || relocation.kind != relocation_kind::ABSOLUTE64
+        let patch_index = usize::from(relocation.patch_section);
+        let target_index = usize::from(relocation.target_section);
+        if patch_index >= self.section_count || target_index >= self.section_count {
+            return Err(efi::Status::INVALID_PARAMETER);
+        }
+        let patch = self
+            .sections
+            .get(patch_index)
+            .copied()
+            .ok_or(efi::Status::INVALID_PARAMETER)?;
+        let target = self
+            .sections
+            .get(target_index)
+            .copied()
+            .ok_or(efi::Status::INVALID_PARAMETER)?;
+        // Mirror the normalized-image manifest checks (format.rs) so an
+        // invalid record is rejected at import instead of only at
+        // SetVirtualAddressMap time.
+        if relocation.kind != relocation_kind::ABSOLUTE64
+            || patch.flags & section_flags::RELOCATION_SLOTS == 0
+            || !relocation.patch_offset.is_multiple_of(8)
+            || !offset_within_section(&patch, relocation.patch_offset, 8)
+            || !offset_within_section(&target, relocation.target_offset, 1)
         {
             return Err(efi::Status::INVALID_PARAMETER);
         }
@@ -218,6 +238,20 @@ fn section_from_handoff(section: &LoadedSection) -> SectionRecord {
     }
 }
 
+/// Return whether `[offset, offset + width)` lies fully inside the section's
+/// image-relative `[image_offset, image_offset + byte_len)` range.
+fn offset_within_section(section: &SectionRecord, offset: u32, width: u32) -> bool {
+    section
+        .image_offset
+        .checked_add(section.byte_len)
+        .is_some_and(|section_end| {
+            offset >= section.image_offset
+                && offset
+                    .checked_add(width)
+                    .is_some_and(|end| end <= section_end)
+        })
+}
+
 fn range_from_handoff(range: &RuntimeExternalRange) -> RangeRecord {
     RangeRecord {
         physical_base: range.physical_base,
@@ -227,36 +261,47 @@ fn range_from_handoff(range: &RuntimeExternalRange) -> RangeRecord {
     }
 }
 
-#[repr(transparent)]
-pub struct ResetConfigCell(UnsafeCell<RuntimeResetConfig>);
-
-// SAFETY: the value is published exactly once while the image is
-// Uninitialized, before BootActive is released, and is immutable afterward.
-unsafe impl Sync for ResetConfigCell {}
+/// Lock-free snapshot of the reset configuration for `ResetSystem`.
+///
+/// The pair is published exactly once while the image is Uninitialized: the
+/// base word first, then the header word with `Release`. The `Acquire` header
+/// load in `read` makes the prior base store visible without taking the
+/// operation lease, so a re-entrant reset never reads a torn configuration.
+/// A zero header word means the snapshot has not been published yet, which
+/// leaves the architecture fallbacks in charge.
+#[repr(C)]
+pub struct ResetConfigCell {
+    header: AtomicU64,
+    base: AtomicU64,
+}
 
 impl ResetConfigCell {
     const fn new() -> Self {
-        Self(UnsafeCell::new(RuntimeResetConfig {
-            mechanism: 0,
-            reserved: 0,
-            io_or_mmio_base: 0,
-        }))
+        Self {
+            header: AtomicU64::new(0),
+            base: AtomicU64::new(0),
+        }
     }
 
     fn publish(&self, config: RuntimeResetConfig) {
-        // SAFETY: RuntimeState::initialize is single-shot and serialized by the
-        // operation lock before BootActive publication.
-        unsafe { self.0.get().write(config) };
+        self.base.store(config.io_or_mmio_base, Ordering::Relaxed);
+        self.header.store(
+            u64::from(config.mechanism) | (u64::from(config.reserved) << 32),
+            Ordering::Release,
+        );
     }
 
     fn read(&self) -> RuntimeResetConfig {
-        // SAFETY: callers can observe this only after initialization publishes
-        // the immutable value before BootActive.
-        unsafe { self.0.get().read() }
+        let header = self.header.load(Ordering::Acquire);
+        RuntimeResetConfig {
+            mechanism: header as u32,
+            reserved: (header >> 32) as u32,
+            io_or_mmio_base: self.base.load(Ordering::Relaxed),
+        }
     }
 
     fn address(&self) -> u64 {
-        self.0.get() as u64
+        core::ptr::addr_of!(self.header) as u64
     }
 }
 
@@ -464,8 +509,84 @@ mod tests {
         snapshot.publish(expected);
 
         let mut runtime = RuntimeState::new();
-        let runtime_lease = &mut runtime;
-        runtime_lease.reset.io_or_mmio_base = 0x1234;
+        runtime.reset.io_or_mmio_base = 0x1234;
+        assert_ne!(runtime.reset.io_or_mmio_base, expected.io_or_mmio_base);
         assert_eq!(snapshot.read(), expected);
+    }
+
+    #[test]
+    fn unpublished_reset_snapshot_reads_as_unconfigured() {
+        let snapshot = ResetConfigCell::new();
+        assert_eq!(snapshot.read().mechanism, 0);
+        assert_eq!(snapshot.read().io_or_mmio_base, 0);
+    }
+
+    #[test]
+    fn import_relocation_validates_offsets_against_imported_sections() {
+        let mut runtime = RuntimeState::new();
+        runtime.section_count = 2;
+        runtime.sections[0] = SectionRecord {
+            physical_base: 0x10_0000,
+            virtual_base: 0,
+            image_offset: 0,
+            byte_len: 0x1000,
+            flags: section_flags::EXECUTE,
+        };
+        runtime.sections[1] = SectionRecord {
+            physical_base: 0x10_1000,
+            virtual_base: 0,
+            image_offset: 0x1000,
+            byte_len: 0x1000,
+            flags: section_flags::RELOCATION_SLOTS | section_flags::WRITE,
+        };
+        let valid = RelocationImport {
+            patch_offset: 0x1008,
+            target_offset: 0x0,
+            patch_section: 1,
+            target_section: 0,
+            kind: relocation_kind::ABSOLUTE64,
+            reserved: [0; 12],
+        };
+        assert!(runtime.import_relocation(&valid).is_ok());
+
+        for invalid in [
+            // Patch slot outside the relocation-slot section.
+            RelocationImport {
+                patch_offset: 0x8,
+                ..valid
+            },
+            // Patch slot crosses the section end.
+            RelocationImport {
+                patch_offset: 0x1ff8 + 8,
+                ..valid
+            },
+            // Unaligned patch slot.
+            RelocationImport {
+                patch_offset: 0x1004,
+                ..valid
+            },
+            // Target offset equals the section end.
+            RelocationImport {
+                target_offset: 0x1000,
+                ..valid
+            },
+            // Section index past the imported sections.
+            RelocationImport {
+                patch_section: 2,
+                ..valid
+            },
+            RelocationImport {
+                target_section: 2,
+                ..valid
+            },
+            // Unknown relocation kind.
+            RelocationImport {
+                kind: relocation_kind::ABSOLUTE64 + 1,
+                ..valid
+            },
+        ] {
+            assert!(runtime.import_relocation(&invalid).is_err());
+        }
+        assert_eq!(runtime.relocation_count, 1);
     }
 }

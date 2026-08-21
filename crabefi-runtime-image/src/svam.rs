@@ -443,11 +443,21 @@ fn validate_and_commit(
             .physical_base
             .checked_add(u64::from(target_relative))
             .ok_or(efi::Status::INVALID_PARAMETER)?;
-        if target_section.flags & section_flags::EXECUTE != 0
+        let tail_required = target_section.flags & section_flags::EXECUTE != 0
             || physical_target == state_address
             || physical_target == store_address
-            || transition_tail_addresses.contains(&physical_target)
+            || transition_tail_addresses.contains(&physical_target);
+        // `commit_matching` skips every patch address inside the Runtime
+        // Services table, so a table-resident slot that is not classified for
+        // the tail would never be patched and would silently keep its stale
+        // physical value after the virtual transition. Reject it instead.
+        if patch_address >= runtime_table_start
+            && patch_address < runtime_table_end
+            && !tail_required
         {
+            return Err(efi::Status::INVALID_PARAMETER);
+        }
+        if tail_required {
             if tail_count >= tail.len() {
                 return Err(efi::Status::OUT_OF_RESOURCES);
             }
