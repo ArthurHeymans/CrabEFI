@@ -39,11 +39,20 @@ pub struct VariableSlot {
     pub data_len: u16,
     pub data_offset: u32,
     pub in_use: u8,
+    /// Bit flags; see [`VariableSlot::FLAG_TOMBSTONE`]. Zero while in use.
     pub reserved: [u8; 3],
     pub name: [u16; MAX_VARIABLE_NAME_LEN],
+    /// Timestamp of the last accepted authenticated write or deletion.
+    pub timestamp: VariableTimestamp,
 }
 
 impl VariableSlot {
+    /// Set on slots left behind by an authenticated deletion. A tombstone is
+    /// invisible to variable lookups but keeps the variable's last
+    /// authentication timestamp alive so it can neither be re-created raw nor
+    /// rolled back past the deletion.
+    pub const FLAG_TOMBSTONE: u8 = 1;
+
     pub const fn empty() -> Self {
         Self {
             guid: [0; 16],
@@ -54,11 +63,23 @@ impl VariableSlot {
             in_use: 0,
             reserved: [0; 3],
             name: [0; MAX_VARIABLE_NAME_LEN],
+            timestamp: ZERO_TIMESTAMP,
         }
     }
 
     pub fn matches(&self, guid: &[u8; 16], name: &[u16]) -> bool {
         self.in_use != 0
+            && self.guid == *guid
+            && usize::from(self.name_len) == name.len()
+            && self.name.get(..name.len()) == Some(name)
+    }
+
+    const fn is_tombstone(&self) -> bool {
+        self.reserved[0] & Self::FLAG_TOMBSTONE != 0
+    }
+
+    fn tombstone_matches(&self, guid: &[u8; 16], name: &[u16]) -> bool {
+        self.is_tombstone()
             && self.guid == *guid
             && usize::from(self.name_len) == name.len()
             && self.name.get(..name.len()) == Some(name)
@@ -111,6 +132,9 @@ pub struct PreparedWrite {
     pub attributes: u32,
     pub guid: [u8; 16],
     pub delete: bool,
+    /// Authentication timestamp to record with the committed slot. Zero for
+    /// unauthenticated writes; callers stamp it before `commit`.
+    pub timestamp: VariableTimestamp,
 }
 
 impl VariableStore {
@@ -144,12 +168,83 @@ impl VariableStore {
             self.refresh_policy();
             return Ok(());
         }
+        if data.is_empty()
+            && let Some(timestamp) = timestamp
+            && attributes & efi::VARIABLE_TIME_BASED_AUTHENTICATED_WRITE_ACCESS != 0
+        {
+            // The boot side persists authenticated deletions as zero-length
+            // records carrying the verified deletion timestamp. Keep it as a
+            // tombstone so the floor survives the reboot.
+            self.record_tombstone(guid, name, attributes, timestamp)?;
+            return Ok(());
+        }
         let mut prepared = self.prepare(guid, name, attributes, data.len())?;
+        prepared.timestamp = timestamp.unwrap_or_default();
         self.stage(transaction, &mut prepared, data, false)?;
         self.commit(transaction, prepared, name)?;
         if let (Some(variable), Some(timestamp)) = (secure_variable, timestamp) {
             self.auth_timestamps[variable.index()] = timestamp;
         }
+        self.refresh_policy();
+        Ok(())
+    }
+
+    /// Last authentication timestamp recorded for a variable, including the
+    /// tombstone left behind by an authenticated deletion.
+    ///
+    /// Returns `None` when the variable has no authenticated history. This is
+    /// the anti-rollback floor enforced on later authenticated updates.
+    pub fn auth_history_timestamp(
+        &self,
+        guid: &[u8; 16],
+        name: &[u16],
+    ) -> Option<VariableTimestamp> {
+        self.slots.iter().find_map(|slot| {
+            let authenticated_history = (slot.matches(guid, name)
+                && slot.attributes & efi::VARIABLE_TIME_BASED_AUTHENTICATED_WRITE_ACCESS != 0)
+                || slot.tombstone_matches(guid, name);
+            authenticated_history.then_some(slot.timestamp)
+        })
+    }
+
+    /// Record a deletion tombstone for an authenticated variable.
+    fn record_tombstone(
+        &mut self,
+        guid: [u8; 16],
+        name: &[u16],
+        attributes: u32,
+        timestamp: VariableTimestamp,
+    ) -> Result<(), efi::Status> {
+        if name.is_empty() || name.len() > MAX_VARIABLE_NAME_LEN {
+            return Err(efi::INVALID_PARAMETER);
+        }
+        let index = self
+            .slots
+            .iter()
+            .position(|slot| slot.matches(&guid, name))
+            .or_else(|| {
+                self.slots
+                    .iter()
+                    .position(|slot| slot.tombstone_matches(&guid, name))
+            })
+            .or_else(|| {
+                self.slots
+                    .iter()
+                    .position(|slot| slot.in_use == 0 && !slot.is_tombstone())
+            })
+            .ok_or(efi::OUT_OF_RESOURCES)?;
+        let slot = &mut self.slots[index];
+        slot.in_use = 0;
+        slot.data_len = 0;
+        slot.data_offset = 0;
+        slot.guid = guid;
+        slot.attributes = attributes & !efi::VARIABLE_APPEND_WRITE;
+        slot.name_len = name.len() as u16;
+        let (slot_name, remainder) = slot.name.split_at_mut(name.len());
+        slot_name.copy_from_slice(name);
+        remainder.fill(0);
+        slot.timestamp = timestamp;
+        slot.reserved[0] |= VariableSlot::FLAG_TOMBSTONE;
         self.refresh_policy();
         Ok(())
     }
@@ -239,10 +334,17 @@ impl VariableStore {
                 index
             }
             (None, true) => return Err(efi::NOT_FOUND),
+            // Prefer reclaiming this variable's own tombstone so re-creation
+            // after an authenticated deletion does not leak slots.
             (None, false) => self
                 .slots
                 .iter()
-                .position(|slot| slot.in_use == 0)
+                .position(|slot| slot.tombstone_matches(&guid, name))
+                .or_else(|| {
+                    self.slots
+                        .iter()
+                        .position(|slot| slot.in_use == 0 && !slot.is_tombstone())
+                })
                 .ok_or(efi::OUT_OF_RESOURCES)?,
         };
         Ok(PreparedWrite {
@@ -258,6 +360,7 @@ impl VariableStore {
             }),
             guid,
             delete,
+            timestamp: VariableTimestamp::default(),
         })
     }
 
@@ -293,6 +396,15 @@ impl VariableStore {
             slot.in_use = 0;
             slot.data_len = 0;
             slot.data_offset = 0;
+            if prepared.timestamp != VariableTimestamp::default() {
+                // Authenticated deletions leave a timestamped tombstone so the
+                // variable cannot be re-created raw or rolled back.
+                slot.attributes = prepared.attributes;
+                slot.timestamp = prepared.timestamp;
+                slot.reserved[0] |= VariableSlot::FLAG_TOMBSTONE;
+            } else {
+                slot.timestamp = VariableTimestamp::default();
+            }
             self.refresh_policy();
             return Ok(());
         }
@@ -350,6 +462,8 @@ impl VariableStore {
         let (slot_name, remainder) = slot.name.split_at_mut(prepared.name_len);
         slot_name.copy_from_slice(name);
         remainder.fill(0);
+        slot.reserved[0] &= !VariableSlot::FLAG_TOMBSTONE;
+        slot.timestamp = prepared.timestamp;
         slot.in_use = 1;
         self.refresh_policy();
         Ok(())
