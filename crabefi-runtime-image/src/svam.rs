@@ -539,8 +539,27 @@ fn commit_matching(
     for relocation in runtime.relocations.iter().take(runtime.relocation_count) {
         let patch_index = usize::from(relocation.patch_section);
         let target_index = usize::from(relocation.target_section);
+        // Mirror the validation pass so a future edit there cannot silently
+        // invalidate the safety argument of the unchecked accesses below.
+        debug_assert!(
+            patch_index < runtime.section_count && target_index < runtime.section_count,
+            "relocation section index escaped validation"
+        );
+        debug_assert!(
+            runtime.sections.get(patch_index).is_some_and(|section| {
+                state::offset_within_section(section, relocation.patch_offset, 8)
+            }),
+            "relocation patch slot escaped validation"
+        );
+        debug_assert!(
+            runtime.sections.get(target_index).is_some_and(|section| {
+                state::offset_within_section(section, relocation.target_offset, 1)
+            }),
+            "relocation target escaped validation"
+        );
         // SAFETY: the preceding validation pass checked both section indices,
-        // relocation offsets, and both address additions before commit began.
+        // relocation offsets, and both address additions before commit began;
+        // the debug assertions above pin those invariants to this loop.
         let (patch_section, target_section, target_base) = unsafe {
             (
                 *runtime.sections.get_unchecked(patch_index),
