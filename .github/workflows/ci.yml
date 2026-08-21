@@ -49,6 +49,7 @@ jobs:
           cargo test --manifest-path "$GITHUB_WORKSPACE/crabefi-runtime-abi/Cargo.toml"
           cargo test --manifest-path "$GITHUB_WORKSPACE/crabefi-runtime-image/Cargo.toml"
           cargo test --manifest-path "$GITHUB_WORKSPACE/crabefi-runtime-bundle/Cargo.toml"
+          cargo test --manifest-path "$GITHUB_WORKSPACE/xtask/Cargo.toml"
 
   # ── x86_64 ────────────────────────────────────────────────────────────
 
