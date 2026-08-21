@@ -463,16 +463,13 @@ fn apply_variable(
     if secure_variable.is_some() && !authenticated && !store.setup_mode() {
         return efi::Status::SECURITY_VIOLATION;
     }
-    // EDK2 parity (AuthService.c `ProcessVariable`): a variable that exists
-    // with time-based authentication keeps requiring an authenticated
+    // EDK2 parity (AuthService.c `ProcessVariable`): a variable with
+    // time-based authentication history keeps requiring an authenticated
     // envelope for every later update, append, and deletion, whatever its
-    // GUID. Raw requests fail closed instead of silently rewriting or
-    // removing authenticated content.
-    if !authenticated
-        && store.find(&guid, name, false).is_some_and(|slot| {
-            slot.attributes & efi::VARIABLE_TIME_BASED_AUTHENTICATED_WRITE_ACCESS != 0
-        })
-    {
+    // GUID. This includes tombstones left by authenticated deletions, so a
+    // deleted variable cannot be silently re-created with raw content. Raw
+    // requests fail closed instead.
+    if !authenticated && store.auth_history_timestamp(&guid, name).is_some() {
         return efi::Status::WRITE_PROTECTED;
     }
     let (payload, timestamp, authenticated_variable) = if authenticated {
@@ -509,6 +506,9 @@ fn apply_variable(
         Ok(prepared) => prepared,
         Err(status) => return status,
     };
+    // Authenticated commits (including deletions) record their timestamp so
+    // later envelopes must be strictly newer.
+    prepared.timestamp = timestamp.unwrap_or_default();
     let staged_len = match store.stage(transaction, &mut prepared, payload, append) {
         Ok(staged) => staged.len(),
         Err(status) => return status,
@@ -661,13 +661,15 @@ pub fn replay_deferred(lease: &mut state::Lease) -> Result<usize, efi::Status> {
                 return Err(efi::Status::DEVICE_ERROR);
             }
             let name = &record.name[..name_len];
-            if authenticated
-                && let Some(variable) = secure_boot::identify_key_database(&record.guid.bytes, name)
-            {
-                let floor = store.auth_timestamp(variable);
-                if floor == record.timestamp {
+            if authenticated {
+                let secure_floor = secure_boot::identify_key_database(&record.guid.bytes, name)
+                    .map(|variable| store.auth_timestamp(variable));
+                let already_applied = secure_floor == Some(record.timestamp)
+                    || store.auth_history_timestamp(&record.guid.bytes, name)
+                        == Some(record.timestamp);
+                if already_applied {
                     // Persistence committed before the retained acknowledgement.
-                    // The imported floor proves this authenticated operation has
+                    // The recorded floor proves this authenticated operation has
                     // already taken effect, including append and deletion.
                     return Ok(());
                 }
@@ -1160,6 +1162,136 @@ mod tests {
         let slot = store.find(&guid, &name, false).unwrap();
         assert_eq!(store.data(slot), Some(b"payload".as_slice()));
         assert_eq!(slot.attributes, AUTH_ATTRIBUTES);
+        crate::scratch::reset();
+    }
+
+    /// Minimal authenticated-variable envelope with an empty PKCS#7 payload.
+    /// Enough to pass header validation and carry a timestamp, but never a
+    /// valid signature.
+    fn unsigned_envelope(year: u16) -> Vec<u8> {
+        use crabefi_efi_types::secure_boot::EFI_CERT_TYPE_PKCS7_GUID;
+
+        let mut envelope = Vec::new();
+        envelope.extend_from_slice(&year.to_le_bytes());
+        envelope.extend_from_slice(&[1, 1, 0, 0, 0, 0]); // month..pad1
+        envelope.extend_from_slice(&0u32.to_le_bytes()); // nanosecond
+        envelope.extend_from_slice(&0i16.to_le_bytes()); // timezone
+        envelope.push(0); // daylight
+        envelope.push(0); // pad2
+        envelope.extend_from_slice(&24u32.to_le_bytes()); // dw_length
+        envelope.extend_from_slice(&0x0200u16.to_le_bytes()); // w_revision
+        envelope.extend_from_slice(&0x0ef1u16.to_le_bytes()); // w_certificate_type
+        envelope.extend_from_slice(&EFI_CERT_TYPE_PKCS7_GUID);
+        envelope
+    }
+
+    #[test]
+    fn deleted_authenticated_variables_keep_rollback_floors() {
+        let _guard = crate::scratch::test_lock();
+        crate::scratch::activate();
+        let mut store = VariableStore::new();
+        let mut transaction = VariableTransaction::new();
+        let mut buffer = vec![0u8; 64 * 1024];
+        let guid = [0x42; 16];
+        let name = [b'A' as u16, b'u' as u16, b't' as u16, b'h' as u16];
+        let timestamp = |year: u16| VariableTimestamp {
+            year,
+            month: 1,
+            day: 1,
+            ..VariableTimestamp::default()
+        };
+
+        // Boot import of the live variable followed by its persisted deletion
+        // record (zero-length data, newer timestamp).
+        store
+            .import(
+                &mut transaction,
+                guid,
+                &name,
+                AUTH_ATTRIBUTES,
+                b"payload",
+                Some(timestamp(2024)),
+            )
+            .unwrap();
+        store
+            .import(
+                &mut transaction,
+                guid,
+                &name,
+                AUTH_ATTRIBUTES,
+                &[],
+                Some(timestamp(2025)),
+            )
+            .unwrap();
+
+        // The deletion is invisible as a variable but keeps its floor.
+        assert!(store.find(&guid, &name, false).is_none());
+        assert_eq!(
+            store.auth_history_timestamp(&guid, &name),
+            Some(timestamp(2025))
+        );
+
+        // Raw requests cannot re-create or delete the deleted variable.
+        for attributes in [RAW_ATTRIBUTES, RAW_ATTRIBUTES | efi::VARIABLE_APPEND_WRITE] {
+            assert_eq!(
+                apply_variable(
+                    &mut store,
+                    &mut transaction,
+                    None,
+                    phase::BOOT_ACTIVE,
+                    successful_bridge as *const () as u64,
+                    (buffer.as_mut_ptr(), buffer.len()),
+                    guid,
+                    &name,
+                    attributes,
+                    b"raw",
+                ),
+                efi::Status::WRITE_PROTECTED
+            );
+        }
+
+        // A stale signed envelope is rejected by the timestamp floor before
+        // signature verification even runs.
+        assert!(matches!(
+            auth::verify_authenticated_variable(
+                &store,
+                &name,
+                &guid,
+                AUTH_ATTRIBUTES,
+                &unsigned_envelope(2024),
+            ),
+            Err(auth::AuthError::InvalidTimestamp)
+        ));
+        // A newer envelope passes the floor and fails on the empty signature
+        // instead, proving the floor itself did not reject it.
+        assert!(matches!(
+            auth::verify_authenticated_variable(
+                &store,
+                &name,
+                &guid,
+                AUTH_ATTRIBUTES,
+                &unsigned_envelope(2026),
+            ),
+            Err(auth::AuthError::InvalidHeader)
+        ));
+
+        // Re-creation reclaims the tombstone slot and records the new floor.
+        store
+            .import(
+                &mut transaction,
+                guid,
+                &name,
+                AUTH_ATTRIBUTES,
+                b"new payload",
+                Some(timestamp(2026)),
+            )
+            .unwrap();
+        let slot = store.find(&guid, &name, false).unwrap();
+        assert_eq!(store.data(slot), Some(b"new payload".as_slice()));
+        assert_eq!(
+            store.auth_history_timestamp(&guid, &name),
+            Some(timestamp(2026))
+        );
         crate::scratch::reset();
     }
 

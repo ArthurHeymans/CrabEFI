@@ -63,6 +63,15 @@ pub fn verify_authenticated_variable<'a>(
             return Err(AuthError::InvalidTimestamp);
         }
     }
+    // Every authenticated variable carries its last accepted timestamp —
+    // live or as a deletion tombstone — so replaying an older signed
+    // envelope fails even for variables outside the secure-boot databases.
+    if let Some(previous) = store.auth_history_timestamp(vendor_guid, variable_name) {
+        let previous = super::efi_time_from_timestamp(previous);
+        if !authentication.time_stamp.is_after(&previous) {
+            return Err(AuthError::InvalidTimestamp);
+        }
+    }
 
     if !store.setup_mode() || secure_variable.is_none() {
         if signature.is_empty() {
