@@ -240,7 +240,7 @@ fn section_from_handoff(section: &LoadedSection) -> SectionRecord {
 
 /// Return whether `[offset, offset + width)` lies fully inside the section's
 /// image-relative `[image_offset, image_offset + byte_len)` range.
-fn offset_within_section(section: &SectionRecord, offset: u32, width: u32) -> bool {
+pub(crate) fn offset_within_section(section: &SectionRecord, offset: u32, width: u32) -> bool {
     section
         .image_offset
         .checked_add(section.byte_len)
@@ -268,7 +268,9 @@ fn range_from_handoff(range: &RuntimeExternalRange) -> RangeRecord {
 /// load in `read` makes the prior base store visible without taking the
 /// operation lease, so a re-entrant reset never reads a torn configuration.
 /// A zero header word means the snapshot has not been published yet, which
-/// leaves the architecture fallbacks in charge.
+/// leaves the architecture fallbacks in charge. This reserves
+/// `mechanism == 0` as "unpublished": every ABI reset mechanism constant
+/// must be nonzero for a published snapshot to ever be read.
 #[repr(C)]
 pub struct ResetConfigCell {
     header: AtomicU64,
@@ -293,6 +295,13 @@ impl ResetConfigCell {
 
     fn read(&self) -> RuntimeResetConfig {
         let header = self.header.load(Ordering::Acquire);
+        if header == 0 {
+            return RuntimeResetConfig {
+                mechanism: 0,
+                reserved: 0,
+                io_or_mmio_base: 0,
+            };
+        }
         RuntimeResetConfig {
             mechanism: header as u32,
             reserved: (header >> 32) as u32,
@@ -517,8 +526,16 @@ mod tests {
     #[test]
     fn unpublished_reset_snapshot_reads_as_unconfigured() {
         let snapshot = ResetConfigCell::new();
-        assert_eq!(snapshot.read().mechanism, 0);
-        assert_eq!(snapshot.read().io_or_mmio_base, 0);
+        snapshot.base.store(0xcf9, Ordering::Relaxed);
+
+        assert_eq!(
+            snapshot.read(),
+            RuntimeResetConfig {
+                mechanism: 0,
+                reserved: 0,
+                io_or_mmio_base: 0,
+            }
+        );
     }
 
     #[test]
