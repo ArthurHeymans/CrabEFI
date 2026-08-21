@@ -864,6 +864,11 @@ fn audit_reachable_panic_calls(text: &str) -> Vec<String> {
         "handle_alloc_error",
         "crabefi_runtime_panic_is_possible",
     ];
+    // Direct calls plus the tail-call form each architecture uses for
+    // noreturn destinations such as panic handlers.
+    const TRANSFER_MNEMONICS: &[&str] = &[
+        "call", "callq", "jmp", "jmpq", "b", "br", "braa", "bl", "jal", "jalr", "j", "jr", "tail",
+    ];
     let mut function = "<unknown>";
     let mut violations = Vec::new();
     for line in text.lines() {
@@ -875,11 +880,12 @@ fn audit_reachable_panic_calls(text: &str) -> Vec<String> {
             function = name;
             continue;
         }
-        let is_call = trimmed.contains("call")
-            || trimmed.starts_with("bl\t")
-            || trimmed.contains(" bl ")
-            || trimmed.contains("jal");
-        if !is_call || !PANIC_TARGETS.iter().any(|target| trimmed.contains(target)) {
+        let Some(instruction) = parse_instruction(trimmed) else {
+            continue;
+        };
+        if !TRANSFER_MNEMONICS.contains(&instruction.mnemonic)
+            || !PANIC_TARGETS.iter().any(|target| trimmed.contains(target))
+        {
             continue;
         }
         let support_function = PANIC_TARGETS.iter().any(|target| function.contains(target));
@@ -1113,6 +1119,27 @@ mod tests {
         let violations = audit_reachable_panic_calls(reachable);
         assert_eq!(violations.len(), 1);
         assert!(violations[0].contains("runtime_image_init"));
+    }
+
+    #[test]
+    fn panic_audit_rejects_tail_calls_into_panic_machinery() {
+        for line in [
+            "1004: jmp 0x20 <crabefi_runtime_panic_is_possible>",
+            "1008: jmpq 0x20 <__rustc::rust_begin_unwind>",
+            "100c: b 0x20 <core::panicking::panic_fmt>",
+            "1010: j 0x20 <core::panicking::panic_bounds_check>",
+        ] {
+            let text = concat!("1000 <runtime_image_init>:\n").to_string() + line + "\n";
+            let violations = audit_reachable_panic_calls(&text);
+            assert_eq!(violations.len(), 1, "missed tail call: {line}");
+        }
+
+        // Ordinary control flow must not be flagged.
+        let text = concat!(
+            "1000 <runtime_image_init>:\n",
+            "1004: jmp 0x20 <runtime_image_init+0x24>\n",
+        );
+        assert!(audit_reachable_panic_calls(text).is_empty());
     }
 
     #[test]
