@@ -180,7 +180,14 @@ impl EfiSignatureList {
     pub const HEADER_SIZE: usize = core::mem::size_of::<Self>();
 }
 
-/// Validate that every byte belongs to a complete EFI signature list.
+/// Validates that a byte slice consists entirely of complete EFI signature lists.
+///
+/// # Examples
+///
+/// ```
+/// assert!(!validate_signature_database(&[]));
+/// ```
+pub fn?
 pub fn validate_signature_database(mut data: &[u8]) -> bool {
     if data.is_empty() {
         return false;
@@ -277,6 +284,20 @@ impl<'a> SignatureIterator<'a> {
 impl<'a> Iterator for SignatureIterator<'a> {
     type Item = ([u8; 16], &'a [u8]);
 
+    /// Returns the next signature's owner GUID and payload.
+    ///
+    /// Iteration ends when all signatures have been consumed or the next signature
+    /// is incomplete or outside the available data.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # let mut signatures = signature_iterator;
+    /// if let Some((owner, payload)) = signatures.next() {
+    ///     assert_eq!(owner.len(), 16);
+    ///     assert!(!payload.is_empty());
+    /// }
+    /// ```
     fn next(&mut self) -> Option<Self::Item> {
         if self.index >= self.count {
             return None;

@@ -1,6 +1,16 @@
-//! Allocation-free IEEE CRC-32 helpers.
+/// Calculates the IEEE CRC-32 checksum of a byte slice.
 
-/// Calculate the IEEE CRC-32 of a byte slice.
+///
+
+/// # Examples
+
+///
+
+/// ```
+
+/// assert_eq!(calculate(b"123456789"), 0xcbf4_3926);
+
+/// ```
 pub fn calculate(bytes: &[u8]) -> u32 {
     bytes.iter().copied().fold(u32::MAX, |crc, byte| {
         (0..8).fold(crc ^ u32::from(byte), |value, _| {

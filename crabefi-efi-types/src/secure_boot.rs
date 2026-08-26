@@ -121,8 +121,27 @@ impl SecureBootVariable {
     }
 }
 
-/// Compare a possibly NUL-terminated EFI name with an unterminated constant.
+/// Compares UTF-16 names after truncating each at its first NUL code unit.
+///
+/// # Returns
+///
+/// `true` if the names match up to their first NUL code unit, `false` otherwise.
+///
+/// # Examples
+///
+/// ```
+/// assert!(name_matches(&[b'P' as u16, b'K' as u16, 0], &[b'P' as u16, b'K' as u16]));
+/// assert!(!name_matches(&[b'P' as u16, 0], &[b'K' as u16]));
+/// ```
 pub fn name_matches(left: &[u16], right: &[u16]) -> bool {
+    /// Returns the portion of a UTF-16 name before its first NUL unit.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let name = [b'P' as u16, b'K' as u16, 0, b'x' as u16];
+    /// assert_eq!(unterminated(&name), &[b'P' as u16, b'K' as u16]);
+    /// ```
     fn unterminated(name: &[u16]) -> &[u16] {
         let length = name
             .iter()

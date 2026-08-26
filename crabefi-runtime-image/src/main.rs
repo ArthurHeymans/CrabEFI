@@ -36,11 +36,15 @@ fn panic(_info: &PanicInfo<'_>) -> ! {
     }
 }
 
-/// Stable panic sink used by the audited runtime build.
+/// Provides a stable entry point for the freestanding panic handler.
 ///
-/// The runtime ELF retains panic support for its freestanding panic lang item,
-/// so the audit examines direct callers and permits this sink only from that
-/// support code. Any service path reaching a panic helper fails the build.
+/// # Examples
+///
+/// ```rust,ignore
+/// crabefi_runtime_panic_is_possible();
+/// ```
+///
+/// This function has no effect beyond providing a non-inlined panic sink.
 #[cfg(all(not(test), target_os = "none"))]
 #[unsafe(no_mangle)]
 #[inline(never)]
@@ -279,6 +283,23 @@ pub extern "C" fn runtime_image_install_esrt(registration: *const EsrtRegistrati
     }
 }
 
+/// Prepares runtime memory attributes from the supplied memory descriptors.
+///
+/// # Arguments
+///
+/// * `descriptors` - Pointer to the memory descriptors.
+/// * `descriptor_count` - Number of descriptors, limited to 32.
+///
+/// # Returns
+///
+/// An EFI status code indicating whether memory attributes were prepared.
+///
+/// # Examples
+///
+/// ```
+/// let status = runtime_image_prepare_ebs(core::ptr::null(), 0);
+/// assert_ne!(status, 0);
+/// ```
 #[unsafe(no_mangle)]
 pub extern "C" fn runtime_image_prepare_ebs(
     descriptors: *const efi::MemoryDescriptor,

@@ -369,6 +369,43 @@ pub struct DeferredWrite<'a> {
     pub deletion: bool,
 }
 
+/// Queues a variable write in the retained journal.
+///
+/// The write is serialized with its metadata, UTF-16 name, data, and record CRC,
+/// then appended as a journal entry. When the journal has no available space and
+/// all existing entries are acknowledged, it is reset before the new entry is
+/// appended.
+///
+/// # Errors
+///
+/// Returns `efi::Status::INVALID_PARAMETER` for an empty or oversized name,
+/// `efi::Status::OUT_OF_RESOURCES` when the write cannot fit, or
+/// `efi::Status::DEVICE_ERROR` when the journal is invalid.
+///
+/// # Examples
+///
+/// ```no_run
+/// let mut transaction = DeferredTransaction::new();
+///
+/// queue_write(
+///     journal_base,
+///     journal_size,
+///     &mut transaction,
+///     write,
+/// )?;
+/// # Ok::<(), efi::Status>(())
+/// ```
+///
+/// # Parameters
+///
+/// * `base` and `size` identify the retained journal region.
+/// * `transaction` provides staging storage for the serialized record.
+/// * `write` contains the variable metadata and payload to queue.
+///
+/// # Returns
+///
+/// `Ok(())` when the write is appended successfully; otherwise, the
+/// corresponding EFI error status.
 pub fn queue_write(
     base: *mut u8,
     size: usize,

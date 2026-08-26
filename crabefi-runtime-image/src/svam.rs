@@ -186,6 +186,21 @@ fn validate_descriptor_stream(
     })
 }
 
+/// Resolves the runtime image sections to their covering virtual memory descriptors.
+///
+/// Each section must have exactly one runtime descriptor with the expected memory
+/// type, runtime attributes, a nonzero virtual address, and sufficient physical
+/// coverage.
+///
+/// # Examples
+///
+/// ```ignore
+/// let mappings = resolve_sections(&runtime, map, descriptor_size, descriptor_count)?;
+/// assert_eq!(mappings.len(), MAX_SECTIONS);
+/// # Ok::<(), efi::Status>(())
+/// ```
+///
+/// Returns the resolved mapping for each configured section.
 fn resolve_sections(
     runtime: &state::RuntimeState,
     map: *const u8,
@@ -233,6 +248,19 @@ fn resolve_sections(
     Ok(resolved)
 }
 
+/// Resolves each configured external range to its covering virtual memory descriptor.
+///
+/// # Examples
+///
+/// ```no_run
+/// # let runtime: &state::RuntimeState = unimplemented!();
+/// let mappings = resolve_ranges(runtime, core::ptr::null(), 0, 0);
+/// assert!(mappings.is_err());
+/// ```
+///
+/// Returns `NOT_FOUND` when a range has no matching descriptor and
+/// `INVALID_PARAMETER` when a range is ambiguously mapped or address arithmetic
+/// overflows.
 fn resolve_ranges(
     runtime: &state::RuntimeState,
     map: *const u8,
@@ -298,6 +326,28 @@ fn resolve_deferred_buffer(
         .ok_or(efi::Status::NOT_FOUND)
 }
 
+/// Translates a supported MMIO time-register base into its virtual address.
+///
+/// PL031 and Goldfish RTC configurations require a containing external range;
+/// other time mechanisms retain their existing configuration.
+///
+/// # Errors
+///
+/// Returns `efi::Status::INVALID_PARAMETER` if address arithmetic overflows or
+/// `efi::Status::NOT_FOUND` if the time registers are not fully covered by an
+/// external range.
+///
+/// # Examples
+///
+/// ```ignore
+/// let config = virtual_time_config(&runtime, &range_virtual_bases)?;
+/// assert_eq!(config.mechanism, runtime.time.mechanism);
+/// # Ok::<(), efi::Status>(())
+/// ```
+///
+/// # Returns
+///
+/// The runtime time configuration with its MMIO base translated when required.
 fn virtual_time_config(
     runtime: &state::RuntimeState,
     range_virtual_bases: &[u64; MAX_EXTERNAL_RANGES],
@@ -338,6 +388,21 @@ fn virtual_time_config(
     Ok(config)
 }
 
+/// Validates relocation patches and commits the runtime state for virtual addressing.
+///
+/// Publishes translated section, range, time, deferred-buffer, table-pointer, and CRC state,
+/// then applies deferred patches after releasing the physical transition lock.
+///
+/// # Errors
+///
+/// Returns an EFI error if address calculations, relocation metadata, or relocation capacity are
+/// invalid.
+///
+/// # Examples
+///
+/// ```
+/// # // Example omitted: requires initialized runtime transition state.
+/// ```
 fn validate_and_commit(
     state_pointer: *mut state::RuntimeState,
     runtime: &mut state::RuntimeState,
@@ -521,6 +586,22 @@ fn validate_and_commit(
     Ok(())
 }
 
+/// Applies validated relocation patches whose patch addresses satisfy `predicate`.
+///
+/// Each selected patch is updated with the translated address of its relocation target.
+///
+/// # Examples
+///
+/// ```ignore
+/// commit_matching(&runtime, &virtual_bases, |address| {
+///     address >= deferred_start && address < deferred_end
+/// });
+/// ```
+fn commit_matching(
+runtime: &state::RuntimeState,
+virtual_bases: &[u64; MAX_SECTIONS],
+predicate: impl Fn(u64) -> bool,
+) {
 fn commit_matching(
     runtime: &state::RuntimeState,
     virtual_bases: &[u64; MAX_SECTIONS],

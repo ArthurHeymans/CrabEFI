@@ -124,6 +124,29 @@ impl VariableStore {
         }
     }
 
+    /// Imports a variable update into the store and refreshes Secure Boot policy.
+    ///
+    /// Status variables are ignored. For recognized Secure Boot databases, an empty
+    /// update with a timestamp updates authentication history without changing the
+    /// variable data.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let mut store = VariableStore::new();
+    /// let mut transaction = VariableTransaction::new();
+    ///
+    /// assert!(store
+    ///     .import(
+    ///         &mut transaction,
+    ///         [0; 16],
+    ///         &[b'V' as u16],
+    ///         0,
+    ///         b"value",
+    ///         None,
+    ///     )
+    ///     .is_ok());
+    /// ```
     pub fn import(
         &mut self,
         transaction: &mut VariableTransaction,
@@ -261,6 +284,29 @@ impl VariableStore {
         })
     }
 
+    /// Stages variable data in a transaction and verifies that it fits in the store.
+    ///
+    /// When `append` is `true`, the existing variable data is prepended to `input`.
+    /// The prepared write's data length is updated to match the staged data.
+    ///
+    /// # Errors
+    ///
+    /// Returns `efi::DEVICE_ERROR` when the target slot or its existing data is invalid,
+    /// or `efi::OUT_OF_RESOURCES` when the transaction or variable store lacks capacity.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// let store = VariableStore::new();
+    /// let mut transaction = VariableTransaction::new();
+    /// let mut prepared = store.prepare(&guid, &name, attributes, 3)?;
+    ///
+    /// let staged = store.stage(&mut transaction, &mut prepared, b"abc", false)?;
+    /// assert_eq!(staged, b"abc");
+    /// # Ok::<(), efi::Status>(())
+    /// ```
+    ///
+    /// `guid`, `name`, and `attributes` represent the variable being prepared.
     pub fn stage<'a>(
         &self,
         transaction: &'a mut VariableTransaction,
@@ -282,6 +328,27 @@ impl VariableStore {
         Ok(staged)
     }
 
+    /// Commits a prepared variable write or deletion to the store.
+    ///
+    /// Writes compact active variable data before storing the new payload, updates the
+    /// target slot's metadata, and refreshes Secure Boot policy. Returns an error if
+    /// slot metadata, payload bounds, or available storage are invalid.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # let result: Result<(), efi::Status> = {
+    /// store.commit(&transaction, prepared, name)
+    /// # };
+    /// # result
+    /// # ;
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Returns `efi::Status::DEVICE_ERROR` for invalid slot metadata, name lengths,
+    /// or payload bounds. Returns `efi::Status::OUT_OF_RESOURCES` when the payload
+    /// exceeds available arena capacity.
     pub fn commit(
         &mut self,
         transaction: &VariableTransaction,
@@ -355,6 +422,13 @@ impl VariableStore {
         Ok(())
     }
 
+    /// Returns the total capacity of the variable data arena in bytes.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// assert_eq!(VariableStore::maximum_storage(), 128 * 1024);
+    /// ```
     pub const fn maximum_storage() -> u64 {
         VARIABLE_ARENA_SIZE as u64
     }

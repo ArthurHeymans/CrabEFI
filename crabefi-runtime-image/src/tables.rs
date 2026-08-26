@@ -218,6 +218,31 @@ impl ImageTables {
         })
     }
 
+    /// Installs, updates, or removes an image configuration table entry.
+    ///
+    /// An existing entry is updated when its GUID matches the registration. A registration
+    /// with a zero table address removes the matching entry; attempting to remove an
+    /// unknown entry returns `NOT_FOUND`. Nonzero addresses require a supported configuration
+    /// policy.
+    ///
+    /// # Errors
+    ///
+    /// Returns `UNSUPPORTED` for an invalid policy, `NOT_FOUND` when removing an unknown
+    /// entry, or `OUT_OF_RESOURCES` when no configuration-table capacity remains.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let mut tables = todo!();
+    /// let registration = ConfigurationRegistration {
+    ///     guid: [0; 16],
+    ///     table_address: 0x1000,
+    ///     policy: configuration_policy::PLATFORM_PHYSICAL,
+    /// };
+    ///
+    /// tables.install(registration)?;
+    /// # Ok::<(), efi::Status>(())
+    /// ```
     pub fn install(&mut self, registration: ConfigurationRegistration) -> Result<(), efi::Status> {
         if registration.table_address != 0
             && !matches!(
@@ -393,6 +418,16 @@ impl ImageTables {
         self.recompute_crcs();
     }
 
+    /// Converts internal system-table and image-runtime configuration-table pointers using the supplied address-conversion function.
+    ///
+    /// Pointers for which the conversion function returns `None` retain their original addresses.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # let mut tables: ImageTables = unimplemented!();
+    /// tables.convert_internal_pointers(|address| Some(address));
+    /// ```
     pub fn convert_internal_pointers(&mut self, mut convert: impl FnMut(u64) -> Option<u64>) {
         self.system.firmware_vendor = convert(self.system.firmware_vendor as u64)
             .unwrap_or(self.system.firmware_vendor as u64)

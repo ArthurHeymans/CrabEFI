@@ -127,6 +127,30 @@ pub fn verify_pkcs7_signature(
     verify_pkcs7_signature_hash(pkcs7_data, &content_hash, trusted_cert)
 }
 
+/// Verifies a SHA-256 hash against a detached CMS/PKCS#7 signature and trusted certificate.
+///
+/// Returns `true` when a signer is valid and authorized by the trusted certificate,
+/// `false` when signers are present but none validate, and an error for malformed or
+/// resource-exhausting input.
+///
+/// # Examples
+///
+/// ```
+/// let content_hash = [0u8; 32];
+/// let result = verify_pkcs7_signature_hash(&[], &content_hash, &[]);
+/// assert!(result.is_err());
+/// ```
+///
+/// # Arguments
+///
+/// * `pkcs7_data` - DER-encoded detached CMS/PKCS#7 signed data.
+/// * `content_hash` - SHA-256 hash of the detached content.
+/// * `trusted_cert` - DER-encoded certificate trusted for signer authorization.
+///
+/// # Errors
+///
+/// Returns an error when the CMS structure, certificates, signer data, or resource
+/// limits are invalid.
 pub fn verify_pkcs7_signature_hash(
     pkcs7_data: &[u8],
     content_hash: &[u8; 32],
@@ -319,6 +343,26 @@ fn parse_signer(sequence: Tlv<'_>) -> Result<SignerView<'_>, AuthError> {
     })
 }
 
+/// Validates signed attributes and computes the digest used for signature verification.
+///
+/// Without signed attributes, the supplied content digest is returned unchanged. With
+/// signed attributes, the content-type and message-digest attributes are validated
+/// before hashing the encoded attribute set.
+///
+/// # Examples
+///
+/// ```
+/// let content_hash = [0u8; 32];
+/// let digest = signed_attributes_digest(None, &content_hash).unwrap();
+/// assert_eq!(digest, content_hash);
+/// ```
+///
+/// # Errors
+///
+/// Returns an error if the attributes are malformed, incomplete, use an unsupported
+/// content type, or contain a digest that does not match `content_hash`.
+///
+/// `content_hash` is the SHA-256 digest of the signed content.
 fn signed_attributes_digest(
     attributes: Option<Tlv<'_>>,
     content_hash: &[u8; 32],
@@ -603,6 +647,27 @@ fn verify_rsa_signature(
     verification.unwrap_or(Err(AuthError::OutOfResources))
 }
 
+/// Verifies an RSA PKCS#1 v1.5 signature against a SHA-256 digest using bounded allocations.
+///
+/// The signature must correspond to the certificate's RSA public key. Invalid key parameters,
+/// signature values, or encoded signatures return `Ok(false)`.
+///
+/// # Examples
+///
+/// ```rust,ignore
+/// let valid = verify_rsa_signature_with_allocator(certificate, signature, &digest, allocator)?;
+/// assert!(valid);
+/// # Ok::<(), AuthError>(())
+/// ```
+///
+/// # Errors
+///
+/// Returns an error if bounded big-integer allocation or cryptographic encoding fails.
+///
+/// # Returns
+///
+/// `Ok(true)` if the signature is valid, `Ok(false)` if it is invalid, or an error when
+/// verification cannot be completed.
 fn verify_rsa_signature_with_allocator<A: Allocator + Copy>(
     certificate: CertificateView<'_>,
     signature: &[u8],
@@ -671,6 +736,24 @@ fn map_bigint_error(error: PowModInError) -> AuthError {
     }
 }
 
+/// Validates a PKCS#1 v1.5 encoded SHA-256 digest.
+///
+/// # Examples
+///
+/// ```
+/// let digest = [0x42; 32];
+/// let prefix = [
+///     0x30, 0x31, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04,
+///     0x02, 0x01, 0x05, 0x00, 0x04, 0x20,
+/// ];
+/// let mut encoded = vec![0x00, 0x01];
+/// encoded.extend([0xff; 8]);
+/// encoded.push(0x00);
+/// encoded.extend(prefix);
+/// encoded.extend(digest);
+///
+/// assert!(verify_pkcs1v15_sha256_encoding(&encoded, &digest));
+/// ```
 fn verify_pkcs1v15_sha256_encoding(encoded: &[u8], digest: &[u8; 32]) -> bool {
     let payload_len = SHA256_DIGEST_INFO_PREFIX.len() + digest.len();
     let Some(separator) = encoded.len().checked_sub(payload_len + 1) else {

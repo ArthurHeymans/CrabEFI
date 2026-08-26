@@ -131,6 +131,24 @@ impl RuntimeState {
         }
     }
 
+    /// Initializes runtime state from a validated handoff and publishes its reset configuration.
+    ///
+    /// Initialization can be performed only once. Invalid handoffs and values that cannot
+    /// be represented by the runtime state are rejected with `efi::Status::INVALID_PARAMETER`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # fn example(handoff: &RuntimeHandoff) {
+    /// let mut state = RuntimeState::new();
+    /// assert!(state.initialize(handoff).is_ok());
+    /// # }
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Returns `efi::Status::INVALID_PARAMETER` if the state is already initialized or
+    /// the handoff is invalid.
     pub fn initialize(&mut self, handoff: &RuntimeHandoff) -> Result<(), efi::Status> {
         if self.initialized {
             return Err(efi::Status::INVALID_PARAMETER);

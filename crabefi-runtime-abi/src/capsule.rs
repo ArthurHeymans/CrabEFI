@@ -55,7 +55,43 @@ pub const ESRT_LAST_ATTEMPT_VARIABLE_NAME: &[u16] = &[
     b't' as u16,
 ];
 
-/// Return whether a variable is the firmware-private ESRT attempt record.
+/// Identifies the firmware-private ESRT last-attempt variable.
+
+///
+
+/// # Arguments
+
+///
+
+/// * `guid` - The variable's vendor GUID.
+
+/// * `name` - The variable name, optionally terminated by a null code unit.
+
+///
+
+/// # Returns
+
+///
+
+/// `true` if the GUID and name identify the ESRT last-attempt variable, `false` otherwise.
+
+///
+
+/// # Examples
+
+///
+
+/// ```
+
+/// assert!(is_esrt_last_attempt_variable(
+
+///     &CAPSULE_REPORT_VARIABLE_GUID,
+
+///     ESRT_LAST_ATTEMPT_VARIABLE_NAME,
+
+/// ));
+
+/// ```
 pub fn is_esrt_last_attempt_variable(guid: &[u8; 16], name: &[u16]) -> bool {
     if guid != &CAPSULE_REPORT_VARIABLE_GUID {
         return false;

@@ -184,6 +184,14 @@ impl RuntimeHandoff {
         }
     }
 
+    /// Validates the ABI metadata, image layout, memory ranges, and platform mechanisms.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let handoff = RuntimeHandoff::empty();
+    /// assert!(matches!(handoff.validate(), Err(HandoffError::Count)));
+    /// ```
     pub fn validate(&self) -> Result<(), HandoffError> {
         if self.abi_version != HANDOFF_VERSION
             || usize::try_from(self.struct_size).ok() != Some(core::mem::size_of::<Self>())

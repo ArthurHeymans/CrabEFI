@@ -173,6 +173,23 @@ fn runtime_rustflags(arch: Arch, map_path: &Path) -> OsString {
     encoded
 }
 
+/// Validates an architecture-specific runtime ELF and serializes it into the normalized runtime image format.
+///
+/// The generated output includes the runtime image, digest, ABI metadata, relocation and section reports,
+/// symbol listings, and audit reports. The function rejects invalid segments, unsupported relocations,
+/// missing exports, retained panic symbols, and images that fail ABI or audit validation.
+///
+/// # Examples
+///
+/// ```no_run
+/// let artifact = normalize(
+///     std::path::Path::new("runtime.elf"),
+///     std::path::Path::new("out"),
+///     Arch::X86_64,
+/// )?;
+/// assert!(artifact.image.exists());
+/// # Ok::<(), anyhow::Error>(())
+/// ```
 fn normalize(elf_path: &Path, output: &Path, arch: Arch) -> Result<RuntimeArtifact> {
     let elf_bytes = fs::read(elf_path)?;
     let file = object::File::parse(elf_bytes.as_slice()).context("parse runtime ELF")?;
@@ -748,6 +765,18 @@ fn audit_indirect_calls(arch: Arch, text: &str) -> Result<CallAudit> {
     Ok(audit)
 }
 
+/// Audits a linked runtime image with LLVM disassembly and stack-size reports.
+///
+/// The audit records raw and JSON reports in `output` and rejects forbidden
+/// transition-tail instructions, reachable panic calls, excessive indirect
+/// calls, or functions exceeding the stack budget.
+///
+/// # Examples
+///
+/// ```ignore
+/// run_audit_tools(elf_path, output_dir, arch, relocation_slots)?;
+/// # Ok::<(), anyhow::Error>(())
+/// ```
 fn run_audit_tools(elf: &Path, output: &Path, arch: Arch, relocation_slots: usize) -> Result<()> {
     let disassembly = Command::new(llvm_tool("llvm-objdump")?)
         .args(["--disassemble", "--no-show-raw-insn"])
@@ -832,6 +861,20 @@ fn run_audit_tools(elf: &Path, output: &Path, arch: Arch, relocation_slots: usiz
     Ok(())
 }
 
+/// Finds symbol-listing lines that contain known Rust panic-support symbols.
+///
+/// # Examples
+///
+/// ```
+/// let symbols = "0000 rust_begin_unwind\n0000 runtime_entry";
+/// let retained = audit_panic_symbols(symbols);
+///
+/// assert_eq!(retained, ["0000 rust_begin_unwind"]);
+/// ```
+///
+/// # Returns
+///
+/// The matching symbol-listing lines.
 fn audit_panic_symbols(symbols: &str) -> Vec<String> {
     const PANIC_SYMBOLS: &[&str] = &[
         "rust_begin_unwind",
@@ -852,6 +895,13 @@ fn audit_panic_symbols(symbols: &str) -> Vec<String> {
         .collect()
 }
 
+/// Finds calls and tail transfers to panic-related symbols from non-panic support functions.
+///
+/// # Examples
+///
+/// ```
+/// assert!(audit_reachable_panic_calls("").is_empty());
+/// ```
 fn audit_reachable_panic_calls(text: &str) -> Vec<String> {
     const PANIC_TARGETS: &[&str] = &[
         "rust_begin_unwind",
@@ -896,6 +946,22 @@ fn audit_reachable_panic_calls(text: &str) -> Vec<String> {
     violations
 }
 
+/// Extracts the disassembly body for a named symbol from objdump output.
+///
+/// # Examples
+///
+/// ```
+/// let text = "00000000 <start>:\n\tret\n\n00000001 <next>:\n\tnop\n";
+///
+/// assert_eq!(
+///     disassembly_body(text, "start"),
+///     Some("00000000 <start>:\n\tret")
+/// );
+/// assert_eq!(disassembly_body(text, "missing"), None);
+/// ```
+///
+/// Returns `Some` with the symbol's disassembly through the next blank line, or
+/// `None` when the symbol is absent.
 fn disassembly_body<'a>(text: &'a str, symbol: &str) -> Option<&'a str> {
     let start = text.find(&format!("<{symbol}>:"))?;
     let body = &text[start..];

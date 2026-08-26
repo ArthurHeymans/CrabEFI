@@ -241,6 +241,35 @@ fn write_variable_result(
     efi::Status::SUCCESS
 }
 
+/// Advances to the next visible UEFI variable name and vendor GUID.
+///
+/// The function updates the supplied name, GUID, and required buffer size. It
+/// also exposes synthesized Secure Boot variables during enumeration.
+///
+/// # Arguments
+///
+/// * `variable_name_size` - The size of the name buffer in bytes; updated with
+///   the required size when the buffer is too small.
+/// * `variable_name` - The current variable name and destination for the next
+///   name, encoded as UTF-16.
+/// * `vendor_guid` - The current variable's vendor GUID and destination for the
+///   next GUID.
+///
+/// # Returns
+///
+/// An EFI status indicating success, an invalid parameter, insufficient buffer
+/// space, exhaustion of the variable list, or another error.
+///
+/// # Examples
+///
+/// ```
+/// let status = get_next_variable_name(
+///     std::ptr::null_mut::<usize>(),
+///     std::ptr::null_mut::<u16>(),
+///     std::ptr::null_mut::<efi::Guid>(),
+/// );
+/// assert_eq!(status, efi::Status::INVALID_PARAMETER);
+/// ```
 pub extern "efiapi" fn get_next_variable_name(
     variable_name_size: *mut usize,
     variable_name: *mut u16,
@@ -437,7 +466,40 @@ fn set_variable_locked(
     )
 }
 
-#[allow(clippy::too_many_arguments)]
+/// Applies a variable update, including authentication, policy checks, staging, and persistence.
+///
+/// Nonvolatile updates are persisted immediately during the boot-active phase or queued for
+/// deferred persistence afterward. The returned status indicates whether the update was accepted.
+///
+/// # Examples
+///
+/// ```ignore
+/// let status = apply_variable(
+///     &mut store,
+///     &mut transaction,
+///     deferred_transaction,
+///     current_phase,
+///     bridge,
+///     buffer,
+///     guid,
+///     name,
+///     attributes,
+///     input,
+/// );
+/// assert_eq!(status, efi::Status::SUCCESS);
+/// ```
+///
+/// # Arguments
+///
+/// * `attributes` — EFI variable attributes governing access and authentication.
+/// * `input` — Variable data, or an empty slice to request deletion.
+/// * `current_phase` — Current firmware execution phase.
+/// * `bridge` — Boot-service persistence bridge address.
+/// * `buffer` — Retained storage buffer used for deferred persistence.
+///
+/// # Returns
+///
+/// An EFI status describing whether the variable was updated successfully.
 fn apply_variable(
     store: &mut VariableStore,
     transaction: &mut VariableTransaction,
