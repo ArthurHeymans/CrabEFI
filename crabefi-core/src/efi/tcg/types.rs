@@ -322,8 +322,13 @@ impl SpecIdEvent {
     /// The caller must wrap this in a `TcgPcrEventHdr` with PCR=0,
     /// event_type=EV_NO_ACTION, digest=all-zeros.
     ///
-    /// Returns the number of bytes written, or `None` if the buffer is too small.
+    /// Returns the number of bytes written, or `None` if the algorithm count is
+    /// invalid or the buffer is too small.
     pub fn serialize(&self, buf: &mut [u8]) -> Option<usize> {
+        if self.num_algorithms as usize > self.digest_sizes.len() {
+            return None;
+        }
+
         // Minimum: signature(16) + platformClass(4) + specVersionMinor(1)
         //        + specVersionMajor(1) + specErrata(1) + uintnSize(1)
         //        + numberOfAlgorithms(4) + algorithms(4*n) + vendorInfoSize(1)
