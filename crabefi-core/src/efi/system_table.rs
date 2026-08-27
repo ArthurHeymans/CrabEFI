@@ -478,6 +478,22 @@ pub fn install_acpi_tables(rsdp: u64) {
             log::info!("RSDP is in AcpiMemoryNvs (acceptable)");
             false
         }
+        Some(MemoryType::ReservedMemoryType) => {
+            // Platform-reserved firmware table area (e.g. coreboot LB_MEM_TABLE
+            // in CBMEM). The OS preserves reserved regions as-is, so the ACPI
+            // tables need no re-typing. Re-typing only the pages holding
+            // tables would carve a small AcpiReclaim island out of the
+            // otherwise uniform firmware region; that fragments the OS
+            // resource tree and trips drivers that remap the whole area
+            // (observed on the x220 as Linux "resource sanity check"
+            // warnings when the coreboot-table driver memremaps the entire
+            // CBMEM region).
+            log::info!(
+                "RSDP at {:#x} is in platform-reserved memory - the OS preserves it, no re-typing needed",
+                rsdp
+            );
+            false
+        }
         Some(mem_type) => {
             log::info!(
                 "RSDP at {:#x} is in {:?} memory - will mark ACPI regions",
