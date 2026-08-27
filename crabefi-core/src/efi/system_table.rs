@@ -500,23 +500,28 @@ pub fn install_acpi_tables(rsdp: u64) {
         mark_acpi_tables_memory(rsdp);
     }
 
-    // Install in EFI configuration table
-    if revision >= 2 {
-        // ACPI 2.0+
-        let status = install_configuration_table(&ACPI_20_TABLE_GUID, rsdp as *mut c_void);
-        if status == efi::Status::SUCCESS {
-            log::info!("Installed ACPI 2.0 configuration table");
-        } else {
-            log::error!("Failed to install ACPI 2.0 table: {:?}", status);
-        }
-    }
-
-    // Also install as ACPI 1.0 for compatibility
-    let status = install_configuration_table(&ACPI_TABLE_GUID, rsdp as *mut c_void);
-    if status == efi::Status::SUCCESS {
-        log::info!("Installed ACPI 1.0 configuration table");
+    // Install in EFI configuration table.
+    //
+    // Publish the RSDP under exactly one GUID, chosen to match its own
+    // revision. Handing an ACPI 2.0 (rev >= 2) RSDP to the OS twice via both
+    // GUIDs makes it walk/reserve the table chain twice (e.g. Linux reports
+    // and reserves FACS twice) and violates the expectation that the legacy
+    // GUID carries a genuine rev-1 RSDP. Only use the legacy GUID when the
+    // RSDP really is rev 1.
+    let status = if revision >= 2 {
+        install_configuration_table(&ACPI_20_TABLE_GUID, rsdp as *mut c_void)
     } else {
-        log::error!("Failed to install ACPI 1.0 table: {:?}", status);
+        install_configuration_table(&ACPI_TABLE_GUID, rsdp as *mut c_void)
+    };
+    if status == efi::Status::SUCCESS {
+        let version = if revision >= 2 { "2.0" } else { "1.0" };
+        log::info!("Installed ACPI {} configuration table", version);
+    } else {
+        log::error!(
+            "Failed to install ACPI {} table: {:?}",
+            if revision >= 2 { "2.0" } else { "1.0" },
+            status
+        );
     }
 
     let system_table = get_system_table();
