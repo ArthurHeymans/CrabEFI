@@ -5,7 +5,6 @@
 
 #![no_std]
 #![cfg_attr(target_arch = "x86_64", feature(abi_x86_interrupt))]
-#![feature(never_type)] // Used for -> ! return type in payload chainloading
 #![deny(unsafe_op_in_unsafe_fn)]
 // Allow common firmware code patterns
 #![allow(clippy::result_unit_err)] // Result<(), ()> is common in embedded code

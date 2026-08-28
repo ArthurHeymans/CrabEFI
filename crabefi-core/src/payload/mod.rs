@@ -198,7 +198,7 @@ pub unsafe fn chainload_payload(
     fs: &mut FatFilesystem<'_>,
     entry: &PayloadEntry,
     cbtable_ptr: *const u8,
-) -> Result<!, PayloadError> {
+) -> Result<core::convert::Infallible, PayloadError> {
     log::info!("Loading payload: {} from {}", entry.name, entry.path);
 
     // Static buffer for payload loading. Using UnsafeCell wrapped in a

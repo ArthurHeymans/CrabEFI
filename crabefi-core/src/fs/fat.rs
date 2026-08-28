@@ -1259,8 +1259,7 @@ impl<'a> FatFilesystem<'a> {
 
         if lfn.active && lfn.len > 0 {
             // Use LFN - convert UTF-16 to UTF-8
-            for i in 0..lfn.len {
-                let ch = lfn.chars[i];
+            for &ch in lfn.chars.iter().take(lfn.len) {
                 if ch == 0 {
                     break;
                 }
