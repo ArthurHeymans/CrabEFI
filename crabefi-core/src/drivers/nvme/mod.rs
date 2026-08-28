@@ -37,7 +37,11 @@ register_bitfields! [
         /// Memory Page Size Minimum (2^(12+MPSMIN) bytes)
         MPSMIN OFFSET(48) NUMBITS(4) [],
         /// Memory Page Size Maximum (2^(12+MPSMAX) bytes)
-        MPSMAX OFFSET(52) NUMBITS(4) []
+        MPSMAX OFFSET(52) NUMBITS(4) [],
+        /// Controller Ready With Media mode supported
+        CRMS_CRWMS OFFSET(59) NUMBITS(1) [],
+        /// Controller Ready Independent of Media mode supported
+        CRMS_CRIMS OFFSET(60) NUMBITS(1) []
     ]
 ];
 
@@ -88,6 +92,13 @@ register_bitfields! [
         ASQS OFFSET(0) NUMBITS(12) [],
         /// Admin Completion Queue Size (0's based)
         ACQS OFFSET(16) NUMBITS(12) []
+    ],
+    /// Controller Ready Timeouts (CRTO)
+    CRTO [
+        /// Controller Ready With Media Timeout (in 500ms units)
+        CRWMT OFFSET(0) NUMBITS(16) [],
+        /// Controller Ready Independent of Media Timeout (in 500ms units)
+        CRIMT OFFSET(16) NUMBITS(16) []
     ]
 ];
 
@@ -120,6 +131,10 @@ pub struct NvmeRegisters {
     pub acq_low: ReadWrite<u32>,
     /// Admin Completion Queue Base Address, high DWORD
     pub acq_high: ReadWrite<u32>,
+    /// Registers between ACQ (0x30) and CRTO (0x68)
+    _reserved1: [u32; 12],
+    /// Controller Ready Timeouts
+    pub crto: ReadOnly<u32, CRTO::Register>,
 }
 
 /// NVMe admin commands
@@ -593,17 +608,18 @@ impl NvmeController {
         // The pointer is valid for the lifetime of the NvmeController.
         let regs = unsafe { &*self.regs };
 
-        // CAP.TO specifies the maximum controller-ready transition time in
-        // 500 ms units. A zero value still permits one 500 ms unit.
-        let controller_timeout_ms = core::cmp::max(regs.cap.read(CAP::TO), 1) * 500;
+        // CAP.TO specifies the maximum disable transition time in 500 ms
+        // units. A zero value still permits one 500 ms unit.
+        let disable_timeout_units = core::cmp::max(regs.cap.read(CAP::TO), 1);
+        let disable_timeout_ms = disable_timeout_units * 500;
 
         // Disable the controller
         regs.cc.modify(CC::EN::CLEAR);
 
-        if !wait_for(controller_timeout_ms, || regs.csts.read(CSTS::RDY) == 0) {
+        if !wait_for(disable_timeout_ms, || regs.csts.read(CSTS::RDY) == 0) {
             log::error!(
                 "NVMe: Timeout waiting {} ms for controller to disable",
-                controller_timeout_ms
+                disable_timeout_ms
             );
             return Err(NvmeError::Timeout);
         }
@@ -646,8 +662,7 @@ impl NvmeController {
         // - I/O Submission Queue Entry Size (IOSQES) = 6 (64 bytes)
         // - I/O Completion Queue Entry Size (IOCQES) = 4 (16 bytes)
         regs.cc.write(
-            CC::EN::SET
-                + CC::CSS.val(0)
+            CC::CSS.val(0)
                 + CC::MPS.val(0)
                 + CC::AMS.val(0)
                 + CC::SHN.val(0)
@@ -655,8 +670,28 @@ impl NvmeController {
                 + CC::IOCQES.val(4),
         );
 
-        // Wait for the CAP.TO-defined controller-ready transition.
-        let timeout = Timeout::from_ms(controller_timeout_ms);
+        // NVMe 2.0 controllers may advertise the wider Controller Ready With
+        // Media timeout in CRTO. Use the larger value because some devices
+        // report a CRTO value smaller than the legacy CAP.TO value.
+        let cap_timeout_units = core::cmp::max(regs.cap.read(CAP::TO), 1);
+        let enable_timeout_units = if regs.cap.read(CAP::CRMS_CRWMS) != 0 {
+            let crto_timeout_units = u64::from(regs.crto.read(CRTO::CRWMT));
+            if crto_timeout_units < cap_timeout_units {
+                log::warn!(
+                    "NVMe: CRTO.CRWMT {} is smaller than CAP.TO {}; using CAP.TO",
+                    crto_timeout_units,
+                    cap_timeout_units
+                );
+            }
+            core::cmp::max(crto_timeout_units, cap_timeout_units)
+        } else {
+            cap_timeout_units
+        };
+        let enable_timeout_ms = enable_timeout_units * 500;
+
+        regs.cc.modify(CC::EN::SET);
+
+        let timeout = Timeout::from_ms(enable_timeout_ms);
         while !timeout.is_expired() {
             if regs.csts.read(CSTS::RDY) != 0 {
                 log::debug!("NVMe controller ready");
