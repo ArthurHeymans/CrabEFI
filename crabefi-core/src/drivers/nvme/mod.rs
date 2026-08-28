@@ -112,10 +112,14 @@ pub struct NvmeRegisters {
     pub nssr: ReadWrite<u32>,
     /// Admin Queue Attributes
     pub aqa: ReadWrite<u32, AQA::Register>,
-    /// Admin Submission Queue Base Address
-    pub asq: ReadWrite<u64>,
-    /// Admin Completion Queue Base Address
-    pub acq: ReadWrite<u64>,
+    /// Admin Submission Queue Base Address, low DWORD
+    pub asq_low: ReadWrite<u32>,
+    /// Admin Submission Queue Base Address, high DWORD
+    pub asq_high: ReadWrite<u32>,
+    /// Admin Completion Queue Base Address, low DWORD
+    pub acq_low: ReadWrite<u32>,
+    /// Admin Completion Queue Base Address, high DWORD
+    pub acq_high: ReadWrite<u32>,
 }
 
 /// NVMe admin commands
@@ -539,9 +543,29 @@ impl NvmeController {
     /// Write a doorbell register (doorbells are outside the typed register struct)
     #[inline]
     fn write_doorbell(&self, offset: u64, value: u32) {
+        // Order queue-memory updates before notifying the controller through MMIO.
+        barrier::mmio_write();
         unsafe {
             ptr::write_volatile((self.mmio_base + offset) as *mut u32, value);
         }
+    }
+
+    /// Write a 64-bit NVMe queue-base register as ordered low/high DWORDs.
+    ///
+    /// NVMe queue-base address registers must be programmed by writing the low
+    /// DWORD first and the high DWORD second. This also matches Linux, EDK2 DXE,
+    /// SeaBIOS, and U-Boot and avoids controllers that do not accept a native
+    /// 64-bit MMIO transaction for ASQ or ACQ.
+    #[inline]
+    fn write_queue_base(low: &ReadWrite<u32>, high: &ReadWrite<u32>, address: u64) {
+        low.set(address as u32);
+        high.set((address >> 32) as u32);
+    }
+
+    /// Read a 64-bit NVMe queue-base register as low/high DWORDs.
+    #[inline]
+    fn read_queue_base(low: &ReadWrite<u32>, high: &ReadWrite<u32>) -> u64 {
+        u64::from(low.get()) | (u64::from(high.get()) << 32)
     }
 
     /// Get doorbell register offset for a queue
@@ -569,12 +593,18 @@ impl NvmeController {
         // The pointer is valid for the lifetime of the NvmeController.
         let regs = unsafe { &*self.regs };
 
+        // CAP.TO specifies the maximum controller-ready transition time in
+        // 500 ms units. A zero value still permits one 500 ms unit.
+        let controller_timeout_ms = core::cmp::max(regs.cap.read(CAP::TO), 1) * 500;
+
         // Disable the controller
         regs.cc.modify(CC::EN::CLEAR);
 
-        // Wait for controller to become disabled (up to 1 second)
-        if !wait_for(1000, || regs.csts.read(CSTS::RDY) == 0) {
-            log::error!("NVMe: Timeout waiting for controller to disable");
+        if !wait_for(controller_timeout_ms, || regs.csts.read(CSTS::RDY) == 0) {
+            log::error!(
+                "NVMe: Timeout waiting {} ms for controller to disable",
+                controller_timeout_ms
+            );
             return Err(NvmeError::Timeout);
         }
 
@@ -584,11 +614,29 @@ impl NvmeController {
                 + AQA::ACQS.val((ADMIN_QUEUE_SIZE - 1) as u32),
         );
 
-        // Set admin submission queue base address
-        regs.asq.set(self.admin_sq as u64);
+        // Program 64-bit queue addresses as low then high DWORD writes, as
+        // required for NVMe queue-base registers.
+        let admin_sq_address = self.admin_sq as u64;
+        let admin_cq_address = self.admin_cq as u64;
+        Self::write_queue_base(&regs.asq_low, &regs.asq_high, admin_sq_address);
+        Self::write_queue_base(&regs.acq_low, &regs.acq_high, admin_cq_address);
 
-        // Set admin completion queue base address
-        regs.acq.set(self.admin_cq as u64);
+        let programmed_asq = Self::read_queue_base(&regs.asq_low, &regs.asq_high);
+        let programmed_acq = Self::read_queue_base(&regs.acq_low, &regs.acq_high);
+        log::debug!(
+            "NVMe admin queues: AQA={:#010x}, ASQ={:#018x}, ACQ={:#018x}",
+            regs.aqa.get(),
+            programmed_asq,
+            programmed_acq
+        );
+        if programmed_asq != admin_sq_address || programmed_acq != admin_cq_address {
+            log::error!(
+                "NVMe admin queue register readback mismatch: expected ASQ={:#018x} ACQ={:#018x}",
+                admin_sq_address,
+                admin_cq_address
+            );
+            return Err(NvmeError::NotReady);
+        }
 
         // Configure controller:
         // - Memory Page Size (MPS) = 0 (4KB)
@@ -607,8 +655,8 @@ impl NvmeController {
                 + CC::IOCQES.val(4),
         );
 
-        // Wait for controller to become ready (up to 2 seconds per spec)
-        let timeout = Timeout::from_ms(2000);
+        // Wait for the CAP.TO-defined controller-ready transition.
+        let timeout = Timeout::from_ms(controller_timeout_ms);
         while !timeout.is_expired() {
             if regs.csts.read(CSTS::RDY) != 0 {
                 log::debug!("NVMe controller ready");
@@ -652,7 +700,7 @@ impl NvmeController {
         unsafe {
             ptr::write_volatile(self.admin_sq.add(tail), *cmd);
         }
-        barrier::mmio_write();
+        barrier::dma_write();
 
         self.admin_sq_tail = ((tail + 1) % ADMIN_QUEUE_SIZE) as u16;
         self.ring_sq_doorbell(0, self.admin_sq_tail);
@@ -861,7 +909,7 @@ impl NvmeController {
         unsafe {
             ptr::write_volatile(self.io_sq.add(tail), *cmd);
         }
-        barrier::mmio_write();
+        barrier::dma_write();
 
         self.io_sq_tail = ((tail + 1) % IO_QUEUE_SIZE) as u16;
         self.ring_sq_doorbell(1, self.io_sq_tail);
