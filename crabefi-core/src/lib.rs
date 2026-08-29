@@ -73,10 +73,11 @@ pub use platform::{
     BlockDevice, BlockDeviceInfo, BlockError, BootResult, CapsuleBackend, CapsuleRegion,
     ConsoleInput, DebugOutput, DeferredBufferConfig, FirmwareInfo, FirmwareMmapWindow,
     FirmwareStorage, FirmwareStorageLocation, FirmwareStorageRegion, FmapRegion, FramebufferConfig,
-    Key, KeyState, MemoryRegion, MemoryType, PlatformConfig, PlatformHooks, ResetHandler,
-    ResetType, Rng, RngError, RuntimeImageSource, RuntimePlatformConfig, StorageBackend,
-    StorageError, Timer, TimestampRecorder, Tpm2Device, Tpm2DeviceConfig, TpmDigest, TpmError,
-    TpmEventLogConfig, TpmLogFormat, TpmPcrBanks, VariableStoreLocator, VariableStoreRegion,
+    Key, KeyState, MemoryRegion, MemoryType, PciEcamRegion, PlatformConfig, PlatformHooks,
+    ResetHandler, ResetType, Rng, RngError, RuntimeImageSource, RuntimePlatformConfig,
+    StorageBackend, StorageError, Timer, TimestampRecorder, Tpm2Device, Tpm2DeviceConfig,
+    TpmDigest, TpmError, TpmEventLogConfig, TpmLogFormat, TpmPcrBanks, VariableStoreLocator,
+    VariableStoreRegion,
 };
 
 /// Display a Secure Boot violation error on screen
@@ -446,8 +447,8 @@ fn init_platform_impl(mut config: PlatformConfig) -> ! {
 
         if let Some(plat) = unsafe { fdt::parse(fdt_addr, fdt_size) } {
             log::info!(
-                "FDT parsed: ECAM={:?}, GIC={:?}, UART={:?}",
-                plat.ecam_base,
+                "FDT parsed: ECAM regions={}, GIC={:?}, UART={:?}",
+                plat.ecam_region_count,
                 plat.gicd,
                 plat.uart_base
             );
@@ -551,19 +552,27 @@ fn init_platform_impl(mut config: PlatformConfig) -> ! {
 
     // ---- 12. Discover PCI ECAM and initialize PCI ----
     //
-    // Priority: config.ecam_base > acpi_info.ecam_base > fdt_info.ecam_base.
-    // acpi_info is populated by the platform before entry (when
-    // heap_pre_initialized is true) or left empty for library consumers
-    // that provide ecam_base directly.
-    if let Some(ecam) = config.ecam_base {
-        log::info!("PCI ECAM base from platform: {:#x}", ecam);
-        drivers::pci::set_ecam_region(ecam, config.ecam_size);
-    } else if let Some(ecam) = state::drivers().acpi_info.ecam_base {
-        log::info!("PCI ECAM base from ACPI MCFG: {:#x}", ecam);
-        drivers::pci::set_ecam_region(ecam, state::drivers().acpi_info.ecam_size);
-    } else if let Some(ecam) = state::drivers().fdt_info.ecam_base {
-        log::info!("PCI ECAM base from FDT: {:#x}", ecam);
-        drivers::pci::set_ecam_region(ecam, state::drivers().fdt_info.ecam_size);
+    // Priority: explicit platform regions, then all ACPI MCFG allocations,
+    // then the FDT host bridge. Absence is explicit off x86.
+    if !config.ecam_regions.is_empty() {
+        log::info!(
+            "PCI ECAM regions from platform: {}",
+            config.ecam_regions.len()
+        );
+        drivers::pci::set_ecam_regions(config.ecam_regions);
+    } else {
+        let acpi_info = state::drivers().acpi_info;
+        let fdt_info = state::drivers().fdt_info;
+        if !acpi_info.ecam_regions().is_empty() {
+            log::info!(
+                "PCI ECAM regions from ACPI MCFG: {}",
+                acpi_info.ecam_region_count
+            );
+            drivers::pci::set_ecam_regions(acpi_info.ecam_regions());
+        } else if !fdt_info.ecam_regions().is_empty() {
+            log::info!("PCI ECAM region from FDT");
+            drivers::pci::set_ecam_regions(fdt_info.ecam_regions());
+        }
     }
 
     drivers::pci::init();

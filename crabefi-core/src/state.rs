@@ -564,7 +564,7 @@ use crate::drivers::pci::access::AnyPciAccess;
 use crate::drivers::serial::{AnySerial, PlatformSerial};
 use crate::drivers::storage::StorageRegistry;
 use crate::efi::protocols::serial_io::SerialIoMode;
-use crate::platform::FramebufferConfig;
+use crate::platform::{FramebufferConfig, PciEcamRegion};
 use heapless::Vec as HeaplessVec;
 use r_efi::efi::Boolean;
 use r_efi::protocols::simple_text_output::Mode as SimpleTextOutputMode;
@@ -612,10 +612,10 @@ pub struct DriverState {
     /// Populated by platforms that perform ACPI discovery before calling
     /// [`crate::init_platform()`] (using `heap_pre_initialized`).  Library
     /// consumers that provide MMIO regions via `PlatformConfig.memory_map`
-    /// and ECAM via `PlatformConfig.ecam_base` leave this empty.
+    /// and ECAM via `PlatformConfig.ecam_regions` leave this empty.
     ///
-    /// `init_platform()` checks `acpi_info.ecam_base` as a fallback for PCI
-    /// ECAM discovery (after `config.ecam_base`, before `fdt_info.ecam_base`).
+    /// `init_platform()` checks all `acpi_info.ecam_regions` after explicit
+    /// platform regions and before the FDT host-bridge region.
     pub acpi_info: crate::fdt::PlatformInfo,
 }
 
@@ -648,10 +648,8 @@ impl Default for DriverState {
 pub struct PciState {
     /// Enumerated PCI device list
     pub devices: HeaplessVec<PciDevice, MAX_PCI_DEVICES>,
-    /// PCIe ECAM base address (from ACPI MCFG or coreboot)
-    pub ecam_base: Option<u64>,
-    /// PCIe ECAM window size in bytes, when known.
-    pub ecam_size: Option<u64>,
+    /// Validated PCIe ECAM allocations (from platform, ACPI MCFG, or FDT).
+    pub ecam_regions: HeaplessVec<PciEcamRegion, { crate::fdt::MAX_ECAM_REGIONS }>,
     /// Config space access method (legacy I/O CAM or PCIe ECAM)
     pub access: AnyPciAccess,
 }
@@ -660,18 +658,11 @@ impl PciState {
     pub const fn new() -> Self {
         Self {
             devices: HeaplessVec::new(),
-            ecam_base: None,
-            ecam_size: None,
-            // x86 defaults to legacy I/O CAM (ports 0xCF8/0xCFC).
-            // Non-x86 defaults to ECAM at address 0 — PCI init will
-            // replace this once a real ECAM base is discovered from
-            // ACPI MCFG, FDT, or PlatformConfig.ecam_base. Reads to
-            // ECAM address 0 return bus errors / 0xFFFFFFFF (no device),
-            // which is the correct "nothing here" response.
+            ecam_regions: HeaplessVec::new(),
             #[cfg(target_arch = "x86_64")]
             access: AnyPciAccess::IoCam(crate::drivers::pci::access::IoCamAccess),
             #[cfg(not(target_arch = "x86_64"))]
-            access: AnyPciAccess::Ecam(crate::drivers::pci::access::EcamAccess::new(0)),
+            access: AnyPciAccess::Unavailable,
         }
     }
 }

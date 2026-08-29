@@ -144,6 +144,7 @@ pub mod block;
 pub mod keyboard;
 pub mod keyboard_common;
 pub mod mmio;
+pub(crate) mod mmio_bounds;
 #[cfg(all(feature = "ui", target_arch = "x86_64"))]
 pub mod mouse;
 #[cfg(feature = "ui")]

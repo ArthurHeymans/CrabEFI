@@ -7,6 +7,8 @@
 //! During PCI enumeration, the driver registry matches discovered devices against
 //! registered drivers and calls their lifecycle methods.
 
+use core::sync::atomic::{AtomicU8, Ordering};
+
 use super::PciDevice;
 
 /// Error type for driver operations
@@ -236,6 +238,8 @@ static PCI_DRIVERS: &[&dyn PciDriver] = &[
     &SdhciPciDriver,
 ];
 
+static BOUND_DRIVERS: AtomicU8 = AtomicU8::new(0);
+
 /// Bind drivers to a discovered PCI device
 ///
 /// Iterates the driver table and calls probe/init for the first matching driver.
@@ -246,7 +250,7 @@ static PCI_DRIVERS: &[&dyn PciDriver] = &[
 /// # Returns
 /// The name of the driver that claimed the device, or None
 pub fn bind_driver(device: &PciDevice) -> Option<&'static str> {
-    for driver in PCI_DRIVERS {
+    for (driver_index, driver) in PCI_DRIVERS.iter().enumerate() {
         // Check match criteria
         let matches = driver.match_criteria().iter().any(|m| {
             m.class == device.class_code
@@ -274,6 +278,7 @@ pub fn bind_driver(device: &PciDevice) -> Option<&'static str> {
 
         match driver.init(device) {
             Ok(()) => {
+                BOUND_DRIVERS.fetch_or(1 << driver_index, Ordering::Relaxed);
                 log::info!(
                     "PCI {}: {} driver initialized successfully",
                     device.address,
@@ -300,8 +305,11 @@ pub fn bind_driver(device: &PciDevice) -> Option<&'static str> {
 ///
 /// Called during ExitBootServices to cleanly stop all hardware.
 pub fn shutdown_all() {
-    for driver in PCI_DRIVERS {
-        if let Err(e) = driver.shutdown() {
+    let bound = BOUND_DRIVERS.swap(0, Ordering::Relaxed);
+    for (driver_index, driver) in PCI_DRIVERS.iter().enumerate() {
+        if bound & (1 << driver_index) != 0
+            && let Err(e) = driver.shutdown()
+        {
             log::warn!("{} driver shutdown failed: {}", driver.name(), e);
         }
     }

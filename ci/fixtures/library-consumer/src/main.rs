@@ -81,8 +81,7 @@ pub extern "C" fn _start() -> ! {
         capsule_backend: None,
         hooks: None,
         rng: None,
-        ecam_base: None,
-        ecam_size: None,
+        ecam_regions: &[],
         runtime_image: crabefi::BUNDLED_RUNTIME_IMAGE,
         runtime: RuntimePlatformConfig {
             time: runtime_time_config(),
