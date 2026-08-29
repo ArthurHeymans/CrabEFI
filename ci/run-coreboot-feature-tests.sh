@@ -28,6 +28,21 @@ rustc --edition=2024 --test \
     -o "$TMPDIR/pool_free_list_tests"
 "$TMPDIR/pool_free_list_tests"
 
+for test_source in \
+    "$ROOT/crabefi-core/src/efi/dma_range.rs" \
+    "$ROOT/crabefi-core/src/drivers/mmio_bounds.rs" \
+    "$ROOT/crabefi-core/src/drivers/nvme/logic.rs" \
+    "$ROOT/crabefi-core/src/drivers/ahci/logic.rs" \
+    "$ROOT/crabefi-core/src/drivers/sdhci/logic.rs" \
+    "$ROOT/crabefi-core/src/drivers/pci/access_rules.rs" \
+    "$ROOT/crabefi-core/src/drivers/pci/capability.rs" \
+    "$ROOT/crabefi-core/src/drivers/pci/command.rs"
+do
+    test_name="$(basename "${test_source%.rs}")_tests"
+    rustc --edition=2024 --test "$test_source" -o "$TMPDIR/$test_name"
+    "$TMPDIR/$test_name"
+done
+
 python3 - "$ROOT/crabefi-coreboot/src/cfr.rs" <<'PY'
 import re
 import sys
