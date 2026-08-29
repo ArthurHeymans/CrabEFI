@@ -470,6 +470,9 @@ pub const FIS_TYPE_DEV_BITS: u8 = 0xA1;
 // ATA Commands
 // ============================================================================
 
+/// Read DMA (28-bit LBA)
+pub const ATA_CMD_READ_DMA: u8 = 0xC8;
+
 /// Read DMA Extended (48-bit LBA)
 pub const ATA_CMD_READ_DMA_EXT: u8 = 0x25;
 

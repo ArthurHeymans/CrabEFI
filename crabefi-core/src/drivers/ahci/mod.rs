@@ -3,17 +3,22 @@
 //! This module provides a minimal AHCI driver for reading from SATA devices.
 //! It implements the basic AHCI command set needed for booting.
 
+pub mod logic;
 pub mod regs;
 
 use crate::barrier;
 use crate::drivers::pci::{self, PciDevice};
 use crate::efi;
-use crate::efi::allocator::PAGE_SIZE_USIZE;
+use crate::efi::dma::{DmaBuffer, DmaCoherency, DmaDirection, DmaMask};
 use crate::time::{Timeout, wait_for};
 use core::ptr;
 use spin::Mutex;
 use tock_registers::interfaces::{ReadWriteable, Readable, Writeable};
 
+use logic::{
+    AtaAddressing, SignatureKind, classify_signature, encode_read_fis, identify_geometry,
+    read_range_valid,
+};
 use regs::*;
 
 /// Command Header (32 bytes)
@@ -135,21 +140,6 @@ impl FisRegH2D {
     fn set_command(&mut self, cmd: u8) {
         self.command = cmd;
     }
-
-    fn set_lba(&mut self, lba: u64) {
-        self.lba0 = (lba & 0xFF) as u8;
-        self.lba1 = ((lba >> 8) & 0xFF) as u8;
-        self.lba2 = ((lba >> 16) & 0xFF) as u8;
-        self.lba3 = ((lba >> 24) & 0xFF) as u8;
-        self.lba4 = ((lba >> 32) & 0xFF) as u8;
-        self.lba5 = ((lba >> 40) & 0xFF) as u8;
-        self.device = 0x40; // LBA mode
-    }
-
-    fn set_count(&mut self, count: u16) {
-        self.count_l = (count & 0xFF) as u8;
-        self.count_h = ((count >> 8) & 0xFF) as u8;
-    }
 }
 
 /// Physical Region Descriptor Table Entry (16 bytes)
@@ -173,43 +163,11 @@ impl PrdtEntry {
     }
 
     fn set_byte_count(&mut self, count: u32, interrupt: bool) -> Result<(), AhciError> {
-        if count == 0 {
+        if count == 0 || count > 4 * 1024 * 1024 {
             return Err(AhciError::InvalidParameter);
         }
         self.dbc = (count - 1) | if interrupt { 1u32 << 31 } else { 0 };
         Ok(())
-    }
-}
-
-/// Page-backed DMA buffer that frees its pages on scope exit.
-struct DmaBuffer {
-    memory: &'static mut [u8],
-    pages: u64,
-}
-
-impl DmaBuffer {
-    fn new(len: usize) -> Result<Self, AhciError> {
-        let pages = len.div_ceil(PAGE_SIZE_USIZE).max(1) as u64;
-        let memory = efi::allocate_pages(pages).ok_or(AhciError::AllocationFailed)?;
-        Ok(Self { memory, pages })
-    }
-
-    fn as_ptr(&self) -> *const u8 {
-        self.memory.as_ptr()
-    }
-
-    fn as_mut_ptr(&mut self) -> *mut u8 {
-        self.memory.as_mut_ptr()
-    }
-
-    fn addr(&self) -> u64 {
-        self.memory.as_ptr() as u64
-    }
-}
-
-impl Drop for DmaBuffer {
-    fn drop(&mut self) {
-        efi::free_pages(self.memory, self.pages);
     }
 }
 
@@ -286,12 +244,18 @@ pub struct AhciPort {
     received_fis: *mut ReceivedFis,
     /// Command tables (one per command slot)
     cmd_tables: [*mut CommandTable; 32],
+    /// Owns all memory programmed into CLB/FB/CTBA registers.
+    _cmd_list_dma: DmaBuffer,
+    _received_fis_dma: DmaBuffer,
+    _cmd_tables_dma: DmaBuffer,
     /// Device type
     pub device_type: DeviceType,
     /// Sector count (for SATA drives)
     pub sector_count: u64,
     /// Sector size
     pub sector_size: u32,
+    /// ATA address encoding selected from IDENTIFY DEVICE.
+    addressing: Option<AtaAddressing>,
 }
 
 /// Device type detected on port
@@ -345,6 +309,10 @@ pub struct AhciController {
     num_cmd_slots: u8,
     /// Ports implemented bitmap
     ports_implemented: u32,
+    /// Whether PxCMD.CLO is implemented.
+    supports_clo: bool,
+    /// Address mask applied to every HBA-visible allocation.
+    dma_mask: DmaMask,
     /// Active ports
     ports: heapless::Vec<AhciPort, 32>,
 }
@@ -364,6 +332,16 @@ pub enum AhciError {
     AllocationFailed,
     /// Invalid parameter
     InvalidParameter,
+    /// AHCI mode could not be established.
+    AhciModeUnavailable,
+    /// Host reset did not complete.
+    ResetFailed,
+    /// Port recovery could not produce a usable link/engine.
+    RecoveryFailed,
+    /// Device does not advertise usable LBA addressing.
+    UnsupportedAddressing,
+    /// DMA allocation or synchronization failed.
+    DmaError,
 }
 
 impl core::fmt::Display for AhciError {
@@ -375,6 +353,11 @@ impl core::fmt::Display for AhciError {
             AhciError::Timeout => write!(f, "timeout"),
             AhciError::AllocationFailed => write!(f, "allocation failed"),
             AhciError::InvalidParameter => write!(f, "invalid parameter"),
+            AhciError::AhciModeUnavailable => write!(f, "AHCI mode unavailable"),
+            AhciError::ResetFailed => write!(f, "HBA reset failed"),
+            AhciError::RecoveryFailed => write!(f, "port recovery failed"),
+            AhciError::UnsupportedAddressing => write!(f, "unsupported ATA addressing"),
+            AhciError::DmaError => write!(f, "DMA synchronization failed"),
         }
     }
 }
@@ -409,6 +392,45 @@ impl AhciController {
         }
     }
 
+    fn enable_ahci_mode(hba: &AhciHbaRegisters) -> Result<(), AhciError> {
+        for _ in 0..5 {
+            hba.ghc.modify(GHC::AE::SET);
+            if hba.ghc.is_set(GHC::AE) {
+                return Ok(());
+            }
+            crate::time::delay_us(10_000);
+        }
+        Err(AhciError::AhciModeUnavailable)
+    }
+
+    fn bios_handoff(hba: &AhciHbaRegisters) -> Result<(), AhciError> {
+        if !hba.cap2.is_set(CAP2::BOH) || !hba.bohc.is_set(BOHC::BOS) {
+            return Ok(());
+        }
+        hba.bohc.modify(BOHC::OOS::SET);
+        if wait_for(1000, || {
+            !hba.bohc.is_set(BOHC::BOS) && !hba.bohc.is_set(BOHC::BB)
+        }) {
+            Ok(())
+        } else {
+            log::error!("AHCI: BIOS/OS handoff failed, BOHC={:#x}", hba.bohc.get());
+            Err(AhciError::ResetFailed)
+        }
+    }
+
+    fn reset_hba(hba: &AhciHbaRegisters) -> Result<(), AhciError> {
+        hba.ghc.modify(GHC::HR::SET);
+        if !wait_for(1000, || !hba.ghc.is_set(GHC::HR)) {
+            return Err(AhciError::ResetFailed);
+        }
+        Self::enable_ahci_mode(hba)
+    }
+
+    fn allocate_dma(&self, len: usize) -> Result<DmaBuffer, AhciError> {
+        DmaBuffer::allocate(len, self.dma_mask, DmaCoherency::Coherent)
+            .map_err(|_| AhciError::AllocationFailed)
+    }
+
     /// Create a new AHCI controller from a PCI device
     pub fn new(pci_dev: &PciDevice) -> Result<Self, AhciError> {
         let mmio_base = pci_dev.mmio_base().ok_or(AhciError::NoDevice)?;
@@ -421,25 +443,23 @@ impl AhciController {
 
         let hba = unsafe { &*hba_regs };
 
-        // Reset the HBA first
+        Self::enable_ahci_mode(hba)?;
+        Self::bios_handoff(hba)?;
         log::debug!("AHCI: Resetting HBA...");
-        hba.ghc.modify(GHC::HR::SET);
-
-        // Wait for reset to complete (up to 1 second)
-        if !wait_for(1000, || !hba.ghc.is_set(GHC::HR)) {
-            log::error!("AHCI: HBA reset didn't complete within 1s");
-            return Err(AhciError::Timeout);
-        }
-        log::debug!("AHCI: HBA reset complete");
-
-        // Enable AHCI mode
-        hba.ghc.modify(GHC::AE::SET);
+        Self::reset_hba(hba)?;
+        log::debug!("AHCI: HBA reset complete, AHCI mode enabled");
 
         // Read capabilities using typed access
         let num_cmd_slots = (hba.cap.read(CAP::NCS) + 1) as u8;
         let num_ports = (hba.cap.read(CAP::NP) + 1) as u8;
         let ports_implemented = hba.pi.get();
         let supports_sss = hba.cap.is_set(CAP::SSS);
+        let supports_clo = hba.cap.is_set(CAP::SCLO);
+        let dma_mask = if hba.cap.is_set(CAP::S64A) {
+            DmaMask::bits64()
+        } else {
+            DmaMask::bits32()
+        };
 
         // Read version
         let major = hba.vs.read(VS::MJR);
@@ -453,21 +473,13 @@ impl AhciController {
             supports_sss
         );
 
-        // Perform BIOS/OS handoff if needed
-        if hba.cap2.is_set(CAP2::BOH) && hba.bohc.is_set(BOHC::BOS) {
-            // BIOS owns the HBA
-            log::debug!("Performing BIOS/OS handoff...");
-            hba.bohc.modify(BOHC::OOS::SET);
-            if !wait_for(100, || !hba.bohc.is_set(BOHC::BOS)) {
-                log::warn!("AHCI: BIOS/OS handoff timed out");
-            }
-        }
-
         let mut controller = Self {
             pci_address: pci_dev.address,
             mmio_base,
             num_cmd_slots,
             ports_implemented,
+            supports_clo,
+            dma_mask,
             ports: heapless::Vec::new(),
         };
 
@@ -509,13 +521,15 @@ impl AhciController {
                 crate::time::delay_us(100);
             }
 
-            // Check if device is present and active
-            let det = port_regs.ssts.read(PORT_SSTS::DET);
-            let ipm = port_regs.ssts.read(PORT_SSTS::IPM);
-
-            if det != 3 || ipm != 1 {
+            // Require stable communication, but give DET=1/slow links one COMRESET.
+            let mut det = port_regs.ssts.read(PORT_SSTS::DET);
+            if det != 3 && self.comreset_port(port_num) {
+                det = self.port_regs(port_num).ssts.read(PORT_SSTS::DET);
+            }
+            let ipm = self.port_regs(port_num).ssts.read(PORT_SSTS::IPM);
+            if det != 3 {
                 log::debug!(
-                    "AHCI Port {}: No device (DET={}, IPM={})",
+                    "AHCI Port {}: No stable link (DET={}, IPM={})",
                     port_num,
                     det,
                     ipm
@@ -536,15 +550,17 @@ impl AhciController {
                             port_num,
                             port.sector_count
                         );
-                        if self.ports.push(port).is_err() {
+                        if let Err(port) = self.ports.push(port) {
                             log::warn!("AHCI: Failed to add port {} - port list full", port_num);
+                            self.discard_port(port)?;
                         }
                     } else if port.device_type == DeviceType::Satapi {
                         if port.sector_count == 0 {
                             log::info!(
-                                "AHCI Port {}: SATAPI device has no readable media; skipping boot scan",
+                                "AHCI Port {}: SATAPI device has no readable media; stopping unused port",
                                 port_num
                             );
+                            self.discard_port(port)?;
                         } else {
                             log::info!(
                                 "AHCI Port {}: SATAPI device, {} sectors (sector_size={})",
@@ -552,15 +568,21 @@ impl AhciController {
                                 port.sector_count,
                                 port.sector_size
                             );
-                            if self.ports.push(port).is_err() {
+                            if let Err(port) = self.ports.push(port) {
                                 log::warn!(
                                     "AHCI: Failed to add port {} - port list full",
                                     port_num
                                 );
+                                self.discard_port(port)?;
                             }
                         }
                     } else {
-                        log::info!("AHCI Port {}: {:?} device", port_num, port.device_type);
+                        log::info!(
+                            "AHCI Port {}: {:?} device is unsupported; stopping port",
+                            port_num,
+                            port.device_type
+                        );
+                        self.discard_port(port)?;
                     }
                 }
                 Err(e) => {
@@ -578,21 +600,14 @@ impl AhciController {
         // Stop command processing
         self.stop_port(port_num)?;
 
-        // Allocate command list (1KB, 1024-byte aligned)
-        let cmd_list_mem = efi::allocate_pages(1).ok_or(AhciError::AllocationFailed)?;
-        cmd_list_mem.fill(0);
-        let cmd_list_addr = cmd_list_mem.as_ptr() as u64;
-
-        // Allocate received FIS (256 bytes, 256-byte aligned)
-        let received_fis_mem = efi::allocate_pages(1).ok_or(AhciError::AllocationFailed)?;
-        received_fis_mem.fill(0);
-        let received_fis_addr = received_fis_mem.as_ptr() as u64;
-
-        // Allocate command tables (one per slot, 256-byte aligned each)
+        let cmd_list_dma = self.allocate_dma(1024)?;
+        let received_fis_dma = self.allocate_dma(256)?;
+        let cmd_tables_dma = self
+            .allocate_dma(usize::from(self.num_cmd_slots) * core::mem::size_of::<CommandTable>())?;
+        let cmd_list_addr = cmd_list_dma.dma_address();
+        let received_fis_addr = received_fis_dma.dma_address();
+        let cmd_tables_page = cmd_tables_dma.dma_address();
         let mut cmd_tables = [ptr::null_mut(); 32];
-        let cmd_tables_mem = efi::allocate_pages(4).ok_or(AhciError::AllocationFailed)?;
-        cmd_tables_mem.fill(0);
-        let cmd_tables_page = cmd_tables_mem.as_ptr() as u64;
 
         for (i, cmd_table) in cmd_tables
             .iter_mut()
@@ -625,41 +640,53 @@ impl AhciController {
         // Start command processing
         self.start_port(port_num)?;
 
-        // Put port into active state and wait for ready
-        let port_regs = self.port_regs(port_num);
-        port_regs.cmd.modify(PORT_CMD::ICC::Active);
-
-        // Wait for device to become ready (BSY=0, DRQ=0) - up to 30 seconds
+        // Put port into active state and wait for ready.
         let mut ready = false;
-        let timeout = Timeout::from_ms(30000);
-        while !timeout.is_expired() {
-            if !port_regs.tfd.is_set(PORT_TFD::STS_BSY) && !port_regs.tfd.is_set(PORT_TFD::STS_DRQ)
-            {
-                ready = true;
-                break;
+        {
+            let port_regs = self.port_regs(port_num);
+            port_regs.cmd.modify(PORT_CMD::ICC::Active);
+            let timeout = Timeout::from_ms(30000);
+            while !timeout.is_expired() {
+                if !port_regs.tfd.is_set(PORT_TFD::STS_BSY)
+                    && !port_regs.tfd.is_set(PORT_TFD::STS_DRQ)
+                {
+                    ready = true;
+                    break;
+                }
+                crate::time::delay_us(10000);
             }
-            crate::time::delay_us(10000);
         }
 
         if !ready {
             log::warn!(
-                "AHCI Port {}: Device not ready (TFD={:#x}), trying anyway",
-                port_num,
-                port_regs.tfd.get()
+                "AHCI Port {}: device busy after start; issuing COMRESET",
+                port_num
             );
+            if !self.comreset_port(port_num) {
+                return Err(AhciError::PortNotReady);
+            }
+            self.start_port(port_num)?;
+            if !wait_for(5000, || {
+                let regs = self.port_regs(port_num);
+                !regs.tfd.is_set(PORT_TFD::STS_BSY) && !regs.tfd.is_set(PORT_TFD::STS_DRQ)
+            }) {
+                return Err(AhciError::PortNotReady);
+            }
         }
 
         // Read the signature
-        let sig = port_regs.sig.get();
+        let sig = self.port_regs(port_num).sig.get();
 
-        // Determine device type from signature
-        let device_type = match sig {
-            SATA_SIG_ATA => DeviceType::Sata,
-            SATA_SIG_ATAPI => DeviceType::Satapi,
-            SATA_SIG_SEMB => DeviceType::Semb,
-            SATA_SIG_PM => DeviceType::PortMultiplier,
-            0xFFFFFFFF | 0x00000000 => DeviceType::Sata,
-            _ => DeviceType::None,
+        let device_type = match classify_signature(sig) {
+            Some(SignatureKind::Sata) => DeviceType::Sata,
+            Some(SignatureKind::Satapi) => DeviceType::Satapi,
+            Some(SignatureKind::Semb) => DeviceType::Semb,
+            Some(SignatureKind::PortMultiplier) => DeviceType::PortMultiplier,
+            None => {
+                log::warn!("AHCI port {}: invalid signature {:#x}", port_num, sig);
+                self.stop_port(port_num)?;
+                return Err(AhciError::NoDevice);
+            }
         };
 
         let mut port = AhciPort {
@@ -667,26 +694,47 @@ impl AhciController {
             cmd_list: cmd_list_addr as *mut CommandHeader,
             received_fis: received_fis_addr as *mut ReceivedFis,
             cmd_tables,
+            _cmd_list_dma: cmd_list_dma,
+            _received_fis_dma: received_fis_dma,
+            _cmd_tables_dma: cmd_tables_dma,
             device_type,
             sector_count: 0,
             sector_size: 512,
+            addressing: None,
         };
 
         // Identify the device
         if device_type == DeviceType::Sata {
-            if let Err(e) = self.identify_device(&mut port) {
-                log::warn!("AHCI Port {}: IDENTIFY failed: {:?}", port_num, e);
+            if let Err(error) = self.identify_device(&mut port) {
+                let _ = self.stop_port(port_num);
+                return Err(error);
             }
-        } else if device_type == DeviceType::Satapi
-            && let Err(e) = self.identify_device_atapi(&mut port)
-        {
-            log::warn!("AHCI Port {}: IDENTIFY PACKET failed: {:?}", port_num, e);
+        } else if device_type == DeviceType::Satapi {
+            if let Err(error) = self.identify_device_atapi(&mut port) {
+                let _ = self.stop_port(port_num);
+                return Err(error);
+            }
+        } else {
+            self.stop_port(port_num)?;
+            return Err(AhciError::NoDevice);
         }
 
         Ok(port)
     }
 
     /// Stop command processing on a port
+    fn discard_port(&mut self, port: AhciPort) -> Result<(), AhciError> {
+        match self.stop_port(port.port_num) {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                // The HBA may still own these pages. Leak rather than returning
+                // them to the allocator while DMA can continue.
+                core::mem::forget(port);
+                Err(error)
+            }
+        }
+    }
+
     fn stop_port(&mut self, port_num: u8) -> Result<(), AhciError> {
         let port_regs = self.port_regs(port_num);
 
@@ -695,7 +743,8 @@ impl AhciController {
 
         // Wait for CR (Command List Running) to clear (AHCI spec: up to 500ms)
         if !wait_for(500, || !port_regs.cmd.is_set(PORT_CMD::CR)) {
-            log::warn!("AHCI Port {}: Timeout waiting for CR to clear", port_num);
+            log::error!("AHCI Port {}: Timeout waiting for CR to clear", port_num);
+            return Err(AhciError::RecoveryFailed);
         }
 
         // Clear FRE (FIS Receive Enable) bit
@@ -703,7 +752,8 @@ impl AhciController {
 
         // Wait for FR (FIS Receive Running) to clear
         if !wait_for(500, || !port_regs.cmd.is_set(PORT_CMD::FR)) {
-            log::warn!("AHCI Port {}: Timeout stopping command engine", port_num);
+            log::error!("AHCI Port {}: Timeout waiting for FR to clear", port_num);
+            return Err(AhciError::RecoveryFailed);
         }
         Ok(())
     }
@@ -714,7 +764,7 @@ impl AhciController {
 
         // Wait for CR to clear before starting new commands
         if !wait_for(500, || !port_regs.cmd.is_set(PORT_CMD::CR)) {
-            log::warn!("AHCI: port {} CR did not clear before start", port_num);
+            return Err(AhciError::RecoveryFailed);
         }
 
         // Enable FIS receive
@@ -751,9 +801,12 @@ impl AhciController {
             .ok_or(AhciError::PortNotReady)?;
 
         // Allocate buffer for identify data (512 bytes)
-        let buffer = efi::allocate_pages(1).ok_or(AhciError::AllocationFailed)?;
-        buffer.fill(0);
-        let buffer_addr = buffer.as_ptr() as u64;
+        let mut buffer = self.allocate_dma(512)?;
+        buffer.as_mut_slice().fill(0);
+        let buffer_addr = buffer.dma_address();
+        buffer
+            .sync_for_device(0..buffer.len(), DmaDirection::FromDevice)
+            .map_err(|_| AhciError::DmaError)?;
 
         // Setup command header
         let header = unsafe { &mut *port.cmd_list.add(slot as usize) };
@@ -779,31 +832,19 @@ impl AhciController {
         // Issue command
         self.issue_command(port, slot)?;
 
-        // Parse identify data
-        let identify = unsafe { core::slice::from_raw_parts(buffer.as_ptr() as *const u16, 256) };
+        buffer
+            .sync_for_cpu(0..buffer.len(), DmaDirection::FromDevice)
+            .map_err(|_| AhciError::DmaError)?;
+        let identify =
+            unsafe { core::slice::from_raw_parts(buffer.dma_address() as *const u16, 256) };
 
-        // Word 60-61: Total number of user addressable sectors (28-bit LBA)
-        let lba28_sectors = (identify[61] as u64) << 16 | identify[60] as u64;
-
-        // Word 100-103: Total number of user addressable sectors (48-bit LBA)
-        let lba48_sectors = (identify[103] as u64) << 48
-            | (identify[102] as u64) << 32
-            | (identify[101] as u64) << 16
-            | identify[100] as u64;
-
-        port.sector_count = if lba48_sectors > 0 {
-            lba48_sectors
-        } else {
-            lba28_sectors
-        };
-
-        // Word 106: Physical/Logical sector size info
-        let sector_info = identify[106];
-        if sector_info & (1 << 12) != 0 {
-            port.sector_size = ((identify[118] as u32) << 16 | identify[117] as u32) * 2;
-        } else {
-            port.sector_size = 512;
-        }
+        let identify_array: &[u16; 256] = identify
+            .try_into()
+            .map_err(|_| AhciError::UnsupportedAddressing)?;
+        let geometry = identify_geometry(identify_array).ok_or(AhciError::UnsupportedAddressing)?;
+        port.addressing = Some(geometry.addressing);
+        port.sector_count = geometry.sector_count;
+        port.sector_size = geometry.sector_size;
 
         let model = extract_ata_model(identify);
         let model_str = core::str::from_utf8(&model).unwrap_or("Unknown").trim();
@@ -817,7 +858,6 @@ impl AhciController {
             (port.sector_count * port.sector_size as u64) / (1024 * 1024)
         );
 
-        efi::free_pages(buffer, 1);
         Ok(())
     }
 
@@ -828,8 +868,11 @@ impl AhciController {
             .ok_or(AhciError::PortNotReady)?;
 
         // Allocate buffer for identify data (512 bytes)
-        let buffer = efi::allocate_pages(1).ok_or(AhciError::AllocationFailed)?;
-        buffer.fill(0);
+        let mut buffer = self.allocate_dma(512)?;
+        buffer.as_mut_slice().fill(0);
+        buffer
+            .sync_for_device(0..buffer.len(), DmaDirection::FromDevice)
+            .map_err(|_| AhciError::DmaError)?;
 
         // IDENTIFY PACKET DEVICE is an ATA command, not an ATA PACKET command.
         // Do not set the AHCI command-header ATAPI bit here; that bit is only
@@ -851,27 +894,24 @@ impl AhciController {
         fis.set_command(ATA_CMD_IDENTIFY_PACKET);
 
         // Setup PRDT
-        let buffer_addr = buffer.as_ptr() as u64;
+        let buffer_addr = buffer.dma_address();
         table.prdt[0].set_address(buffer_addr);
         table.prdt[0].set_byte_count(512, true)?;
 
         // Issue command. Match Linux's first IDENTIFY/IDENTIFY PACKET timeout
         // budget: long enough for real devices, but not a 30s boot stall when
         // the dock bay is empty or confused.
-        if let Err(e) = self.issue_command_on_port_with_timeout(port.port_num, slot, 5000) {
-            efi::free_pages(buffer, 1);
-            return Err(e);
-        }
-
-        // Parse identify packet data
-        let identify = unsafe { core::slice::from_raw_parts(buffer.as_ptr() as *const u16, 256) };
+        self.issue_command_on_port_with_timeout(port.port_num, slot, 5000)?;
+        buffer
+            .sync_for_cpu(0..buffer.len(), DmaDirection::FromDevice)
+            .map_err(|_| AhciError::DmaError)?;
+        let identify =
+            unsafe { core::slice::from_raw_parts(buffer.dma_address() as *const u16, 256) };
 
         let model = extract_ata_model(identify);
         let model_str = core::str::from_utf8(&model).unwrap_or("Unknown").trim();
 
         log::info!("AHCI Port {}: ATAPI device: {}", port.port_num, model_str);
-
-        efi::free_pages(buffer, 1);
 
         // Now get the capacity using READ CAPACITY
         self.read_capacity_atapi(port)?;
@@ -886,9 +926,12 @@ impl AhciController {
             .ok_or(AhciError::PortNotReady)?;
 
         // Allocate buffer for capacity data (8 bytes)
-        let buffer = efi::allocate_pages(1).ok_or(AhciError::AllocationFailed)?;
-        buffer.fill(0);
-        let buffer_addr = buffer.as_ptr() as u64;
+        let mut buffer = self.allocate_dma(8)?;
+        buffer.as_mut_slice().fill(0);
+        let buffer_addr = buffer.dma_address();
+        buffer
+            .sync_for_device(0..buffer.len(), DmaDirection::FromDevice)
+            .map_err(|_| AhciError::DmaError)?;
 
         // Setup command header (set ATAPI bit)
         let header = unsafe { &mut *port.cmd_list.add(slot as usize) };
@@ -919,12 +962,13 @@ impl AhciController {
             log::warn!("READ CAPACITY failed: {:?}, using defaults", e);
             port.sector_size = 2048;
             port.sector_count = 0;
-            efi::free_pages(buffer, 1);
             return Ok(());
         }
 
-        // Parse capacity data (big-endian)
-        let data = &buffer[..8];
+        buffer
+            .sync_for_cpu(0..buffer.len(), DmaDirection::FromDevice)
+            .map_err(|_| AhciError::DmaError)?;
+        let data = &buffer.as_slice()[..8];
         let last_lba = u32::from_be_bytes([data[0], data[1], data[2], data[3]]);
         let block_size = u32::from_be_bytes([data[4], data[5], data[6], data[7]]);
 
@@ -939,7 +983,6 @@ impl AhciController {
             (port.sector_count * port.sector_size as u64) / (1024 * 1024)
         );
 
-        efi::free_pages(buffer, 1);
         Ok(())
     }
 
@@ -970,11 +1013,18 @@ impl AhciController {
         num_sectors: u32,
         buffer: *mut u8,
     ) -> Result<(), AhciError> {
-        if port_index >= self.ports.len() {
+        if port_index >= self.ports.len() || num_sectors == 0 || buffer.is_null() {
+            return Err(AhciError::InvalidParameter);
+        }
+        let port = &self.ports[port_index];
+        if start_lba
+            .checked_add(u64::from(num_sectors))
+            .is_none_or(|end| end > port.sector_count)
+        {
             return Err(AhciError::InvalidParameter);
         }
 
-        let device_type = self.ports[port_index].device_type;
+        let device_type = port.device_type;
         let sector_size = self.ports[port_index].sector_size;
         let max_chunk = if device_type == DeviceType::Satapi {
             Self::MAX_ATAPI_SECTORS_PER_CMD
@@ -994,7 +1044,13 @@ impl AhciController {
 
             remaining -= chunk;
             lba += chunk as u64;
-            buf_offset += (chunk * sector_size) as usize;
+            buf_offset = buf_offset
+                .checked_add(
+                    (chunk as usize)
+                        .checked_mul(sector_size as usize)
+                        .ok_or(AhciError::InvalidParameter)?,
+                )
+                .ok_or(AhciError::InvalidParameter)?;
         }
 
         Ok(())
@@ -1019,6 +1075,7 @@ impl AhciController {
 
             match result {
                 Ok(()) => return Ok(()),
+                Err(AhciError::RecoveryFailed) => return Err(AhciError::RecoveryFailed),
                 Err(e) if attempt + 1 < Self::MAX_RETRIES => {
                     log::warn!(
                         "AHCI port {}: read LBA {} failed ({:?}), retry {}/{}",
@@ -1047,42 +1104,59 @@ impl AhciController {
         num_sectors: u32,
         buffer: *mut u8,
     ) -> Result<(), AhciError> {
-        let port_num = self.ports[port_index].port_num;
-        let sector_size = self.ports[port_index].sector_size;
-        let cmd_list = self.ports[port_index].cmd_list;
-        let cmd_tables = self.ports[port_index].cmd_tables;
-
+        let port = &self.ports[port_index];
+        let port_num = port.port_num;
+        let addressing = port.addressing.ok_or(AhciError::UnsupportedAddressing)?;
+        if !read_range_valid(addressing, port.sector_count, start_lba, num_sectors) {
+            return Err(AhciError::InvalidParameter);
+        }
+        let byte_count = num_sectors
+            .checked_mul(port.sector_size)
+            .ok_or(AhciError::InvalidParameter)?;
+        let cmd_list = port.cmd_list;
+        let cmd_tables = port.cmd_tables;
+        let bounce = self.allocate_dma(byte_count as usize)?;
+        bounce
+            .sync_for_device(0..bounce.len(), DmaDirection::FromDevice)
+            .map_err(|_| AhciError::DmaError)?;
         let slot = self
             .find_free_slot(port_num)
             .ok_or(AhciError::PortNotReady)?;
-
-        // Setup command header
         let header = unsafe { &mut *cmd_list.add(slot as usize) };
         header.dw0 = 0;
         header.set_cfl(5);
         header.set_write(false);
         header.set_prdtl(1);
         header.prdbc = 0;
-
-        // Setup command table
         let table = unsafe { &mut *cmd_tables[slot as usize] };
         *table = CommandTable::default();
-
-        // Setup FIS for READ DMA EXT
+        let encoded = encode_read_fis(addressing, start_lba, num_sectors)
+            .ok_or(AhciError::InvalidParameter)?;
         let fis = unsafe { &mut *(table.cfis.as_mut_ptr() as *mut FisRegH2D) };
         *fis = FisRegH2D::new();
-        fis.set_command(ATA_CMD_READ_DMA_EXT);
-        fis.set_lba(start_lba);
-        fis.set_count(num_sectors as u16);
-
-        // Setup PRDT - use actual sector size instead of assuming 512
-        let byte_count = num_sectors * sector_size;
-        table.prdt[0].set_address(buffer as u64);
+        fis.command = encoded.command;
+        fis.lba0 = encoded.lba[0];
+        fis.lba1 = encoded.lba[1];
+        fis.lba2 = encoded.lba[2];
+        fis.lba3 = encoded.lba[3];
+        fis.lba4 = encoded.lba[4];
+        fis.lba5 = encoded.lba[5];
+        fis.device = encoded.device;
+        fis.count_l = encoded.count_low;
+        fis.count_h = encoded.count_high;
+        table.prdt[0].set_address(bounce.dma_address());
         table.prdt[0].set_byte_count(byte_count, true)?;
-
-        // Issue command
         self.issue_command_on_port(port_num, slot)?;
-
+        bounce
+            .sync_for_cpu(0..bounce.len(), DmaDirection::FromDevice)
+            .map_err(|_| AhciError::DmaError)?;
+        unsafe {
+            ptr::copy_nonoverlapping(
+                bounce.dma_address() as *const u8,
+                buffer,
+                byte_count as usize,
+            )
+        };
         Ok(())
     }
 
@@ -1095,66 +1169,60 @@ impl AhciController {
         buffer: *mut u8,
         sector_size: u32,
     ) -> Result<(), AhciError> {
-        let port_num = self.ports[port_index].port_num;
-        let cmd_list = self.ports[port_index].cmd_list;
-        let cmd_tables = self.ports[port_index].cmd_tables;
-
+        let port = &self.ports[port_index];
+        if start_lba > u32::MAX as u64
+            || num_sectors == 0
+            || num_sectors > u16::MAX as u32
+            || start_lba
+                .checked_add(num_sectors as u64)
+                .is_none_or(|end| end > port.sector_count)
+        {
+            return Err(AhciError::InvalidParameter);
+        }
+        let port_num = port.port_num;
+        let cmd_list = port.cmd_list;
+        let cmd_tables = port.cmd_tables;
+        let byte_count = num_sectors
+            .checked_mul(sector_size)
+            .ok_or(AhciError::InvalidParameter)?;
+        let bounce = self.allocate_dma(byte_count as usize)?;
+        bounce
+            .sync_for_device(0..bounce.len(), DmaDirection::FromDevice)
+            .map_err(|_| AhciError::DmaError)?;
         let slot = self
             .find_free_slot(port_num)
             .ok_or(AhciError::PortNotReady)?;
-
-        // Setup command header (set ATAPI bit)
         let header = unsafe { &mut *cmd_list.add(slot as usize) };
         header.init_atapi();
-
-        // Setup command table
         let table = unsafe { &mut *cmd_tables[slot as usize] };
         *table = CommandTable::default();
-
-        // Setup FIS for ATAPI PACKET command
         let fis = unsafe { &mut *(table.cfis.as_mut_ptr() as *mut FisRegH2D) };
         *fis = FisRegH2D::new();
         fis.set_command(ATA_CMD_PACKET);
-        fis.feature_l = 1; // DMA mode (required for AHCI DMA transfers)
-
-        let byte_count = num_sectors * sector_size;
-        // Cap byte count hint to 16-bit max to avoid overflow in LBA Mid/High fields
-        let byte_count_hint = byte_count.min(0xFFFE);
-        fis.lba1 = (byte_count_hint & 0xFF) as u8;
-        fis.lba2 = ((byte_count_hint >> 8) & 0xFF) as u8;
-
-        // Setup ATAPI command (SCSI READ(10))
-        // acmd[] is already zeroed by CommandTable::default()
-        // READ(10) transfer length is 16-bit; chunking limits us to 16 sectors
-        debug_assert!(
-            num_sectors <= 0xFFFF,
-            "SCSI READ(10) transfer length overflow"
-        );
+        fis.feature_l = 1;
+        let byte_count_hint = byte_count.min(0xfffe);
+        fis.lba1 = byte_count_hint as u8;
+        fis.lba2 = (byte_count_hint >> 8) as u8;
         table.acmd[0] = SCSI_CMD_READ_10;
-        table.acmd[2] = ((start_lba >> 24) & 0xFF) as u8;
-        table.acmd[3] = ((start_lba >> 16) & 0xFF) as u8;
-        table.acmd[4] = ((start_lba >> 8) & 0xFF) as u8;
-        table.acmd[5] = (start_lba & 0xFF) as u8;
-        table.acmd[7] = ((num_sectors >> 8) & 0xFF) as u8;
-        table.acmd[8] = (num_sectors & 0xFF) as u8;
-
-        // Setup PRDT
-        table.prdt[0].set_address(buffer as u64);
+        table.acmd[2] = (start_lba >> 24) as u8;
+        table.acmd[3] = (start_lba >> 16) as u8;
+        table.acmd[4] = (start_lba >> 8) as u8;
+        table.acmd[5] = start_lba as u8;
+        table.acmd[7] = (num_sectors >> 8) as u8;
+        table.acmd[8] = num_sectors as u8;
+        table.prdt[0].set_address(bounce.dma_address());
         table.prdt[0].set_byte_count(byte_count, true)?;
-
-        log::trace!(
-            "read_sectors_atapi: LBA={}, count={}, byte_count={}, buffer={:p}",
-            start_lba,
-            num_sectors,
-            byte_count,
-            buffer
-        );
-
-        // Issue command
         self.issue_command_on_port(port_num, slot)?;
-
-        log::trace!("read_sectors_atapi: command completed successfully");
-
+        bounce
+            .sync_for_cpu(0..bounce.len(), DmaDirection::FromDevice)
+            .map_err(|_| AhciError::DmaError)?;
+        unsafe {
+            ptr::copy_nonoverlapping(
+                bounce.dma_address() as *const u8,
+                buffer,
+                byte_count as usize,
+            )
+        };
         Ok(())
     }
 
@@ -1175,105 +1243,195 @@ impl AhciController {
         timeout_ms: u64,
     ) -> Result<(), AhciError> {
         barrier::mmio_write();
-
         let port_regs = self.port_regs(port_num);
-
-        // Clear stale interrupt and error status before issuing the command.
-        // This prevents a leftover TFES from a previous failed command from
-        // immediately failing the new one.
-        port_regs.is.set(0xFFFFFFFF);
-        port_regs.serr.set(0xFFFFFFFF);
-
-        // Issue command
+        port_regs.is.set(u32::MAX);
+        port_regs.serr.set(u32::MAX);
         port_regs.ci.set(1 << slot);
-
-        // Wait for completion
+        const FATAL_IS: u32 = (1 << 30) | (1 << 29) | (1 << 28) | (1 << 27) | (1 << 24);
         let timeout = Timeout::from_ms(timeout_ms);
-        let mut error = None;
+        let mut failure = None;
         while !timeout.is_expired() {
-            let ci = port_regs.ci.get();
-            if ci & (1 << slot) == 0 {
-                // Command completed - check for errors
+            let interrupt_status = port_regs.is.get();
+            if interrupt_status & FATAL_IS != 0 {
+                failure = Some(AhciError::CommandFailed);
+                break;
+            }
+            if port_regs.ci.get() & (1 << slot) == 0 {
                 if port_regs.tfd.is_set(PORT_TFD::STS_ERR)
+                    || port_regs.tfd.is_set(PORT_TFD::STS_BSY)
                     || port_regs.tfd.is_set(PORT_TFD::STS_DRQ)
+                    || port_regs.is.get() & FATAL_IS != 0
                 {
-                    log::error!(
-                        "AHCI port {}: command error TFD={:#x}",
-                        port_num,
-                        port_regs.tfd.get()
-                    );
-                    error = Some(AhciError::CommandFailed);
+                    failure = Some(AhciError::CommandFailed);
                     break;
                 }
                 return Ok(());
             }
-
-            // Check for fatal errors (Task File Error)
-            if port_regs.is.is_set(PORT_IS::TFES) {
-                log::error!(
-                    "AHCI port {}: task file error TFD={:#x}, IS={:#x}",
-                    port_num,
-                    port_regs.tfd.get(),
-                    port_regs.is.get()
-                );
-                error = Some(AhciError::CommandFailed);
-                break;
-            }
             core::hint::spin_loop();
         }
-
-        let error = error.unwrap_or_else(|| {
-            log::error!("AHCI port {}: command timeout", port_num);
-            AhciError::Timeout
-        });
-
-        // Error recovery per AHCI spec section 6.2.2
-        self.recover_port(port_num);
-
-        Err(error)
+        let failure = failure.unwrap_or(AhciError::Timeout);
+        self.log_port_diagnostics(port_num, slot, timeout_ms);
+        match self.recover_port(port_num) {
+            Ok(()) => Err(failure),
+            Err(_) => Err(AhciError::RecoveryFailed),
+        }
     }
 
-    /// Perform error recovery on a port per AHCI spec section 6.2.2
-    ///
-    /// This stops the command engine, clears error and interrupt status bits,
-    /// and restarts the command engine so subsequent commands can succeed.
-    fn recover_port(&mut self, port_num: u8) {
-        log::warn!("AHCI port {}: performing error recovery", port_num);
+    fn log_port_diagnostics(&self, port_num: u8, slot: u8, timeout_ms: u64) {
+        let regs = self.port_regs(port_num);
+        barrier::dma_read();
+        let clb = u64::from(regs.clb.get()) | (u64::from(regs.clbu.get()) << 32);
+        let fb = u64::from(regs.fb.get()) | (u64::from(regs.fbu.get()) << 32);
+        let prdbc = if clb == 0 {
+            0
+        } else {
+            unsafe { ptr::read_volatile((clb as *const CommandHeader).add(slot as usize)) }.prdbc
+        };
+        let (d2h_status, d2h_error) = if fb == 0 {
+            (0, 0)
+        } else {
+            let received = unsafe { &*(fb as *const ReceivedFis) };
+            (received.rfis[2], received.rfis[3])
+        };
+        log::error!(
+            "AHCI {} port {} slot {} failure (budget={}ms): CMD={:#x} CI={:#x} SACT={:#x} IS={:#x} SERR={:#x} TFD={:#x} SSTS={:#x} SIG={:#x} PRDBC={} D2H status/error={:#04x}/{:#04x}",
+            self.pci_address,
+            port_num,
+            slot,
+            timeout_ms,
+            regs.cmd.get(),
+            regs.ci.get(),
+            regs.sact.get(),
+            regs.is.get(),
+            regs.serr.get(),
+            regs.tfd.get(),
+            regs.ssts.get(),
+            regs.sig.get(),
+            prdbc,
+            d2h_status,
+            d2h_error
+        );
+    }
 
-        let port_regs = self.port_regs(port_num);
-
-        // 1. Clear PxCMD.ST to stop the command engine
-        port_regs.cmd.modify(PORT_CMD::ST::CLEAR);
-
-        // 2. Wait for PxCMD.CR to clear (command list no longer running)
-        if !wait_for(500, || !port_regs.cmd.is_set(PORT_CMD::CR)) {
-            log::warn!("AHCI port {}: CR did not clear during recovery", port_num);
+    fn kick_engine_with_clo(&self, port_num: u8) -> bool {
+        if !self.supports_clo {
+            return false;
         }
+        let regs = self.port_regs(port_num);
+        regs.cmd.modify(PORT_CMD::CLO::SET);
+        wait_for(500, || !regs.cmd.is_set(PORT_CMD::CLO))
+    }
 
-        // 3. Clear error bits
-        port_regs.serr.set(0xFFFFFFFF); // Clear all SError bits
-        port_regs.is.set(0xFFFFFFFF); // Clear all interrupt status bits
-
-        // 4. Re-enable FIS receive if needed
-        if !port_regs.cmd.is_set(PORT_CMD::FRE) {
-            port_regs.cmd.modify(PORT_CMD::FRE::SET);
+    fn debounce_link(&self, port_num: u8) -> bool {
+        let regs = self.port_regs(port_num);
+        let timeout = Timeout::from_ms(2000);
+        while !timeout.is_expired() {
+            crate::time::delay_us(5000);
+            let det = regs.ssts.read(PORT_SSTS::DET);
+            if det != 1 {
+                crate::time::delay_us(100_000);
+                if regs.ssts.read(PORT_SSTS::DET) == det {
+                    return det == 3;
+                }
+            }
         }
+        false
+    }
 
-        // 5. Restart the command engine
-        port_regs.cmd.modify(PORT_CMD::ST::SET);
+    fn comreset_port(&self, port_num: u8) -> bool {
+        let regs = self.port_regs(port_num);
+        regs.cmd.modify(PORT_CMD::ST::CLEAR);
+        if !wait_for(500, || !regs.cmd.is_set(PORT_CMD::CR)) {
+            log::error!(
+                "AHCI port {}: COMRESET aborted because CR stayed set",
+                port_num
+            );
+            return false;
+        }
+        regs.cmd.modify(PORT_CMD::FRE::CLEAR);
+        if !wait_for(500, || !regs.cmd.is_set(PORT_CMD::FR)) {
+            log::error!(
+                "AHCI port {}: COMRESET aborted because FR stayed set",
+                port_num
+            );
+            return false;
+        }
+        let saved_sctl = regs.sctl.get() & !0xf;
+        regs.sctl.set(saved_sctl | 1);
+        let _ = regs.sctl.get();
+        crate::time::delay_us(1000);
+        regs.sctl.set(saved_sctl);
+        let _ = regs.sctl.get();
+        regs.cmd.modify(PORT_CMD::ICC::Active);
+        self.debounce_link(port_num)
+    }
 
-        // 6. Wait for device ready (BSY=0, DRQ=0) up to 5 seconds
-        if !wait_for(5000, || {
-            !port_regs.tfd.is_set(PORT_TFD::STS_BSY) && !port_regs.tfd.is_set(PORT_TFD::STS_DRQ)
-        }) {
+    fn recover_port(&mut self, port_num: u8) -> Result<(), AhciError> {
+        let regs = self.port_regs(port_num);
+        regs.cmd.modify(PORT_CMD::ST::CLEAR);
+        let stopped = wait_for(500, || !regs.cmd.is_set(PORT_CMD::CR));
+        regs.cmd.modify(PORT_CMD::FRE::CLEAR);
+        let fis_stopped = wait_for(500, || !regs.cmd.is_set(PORT_CMD::FR));
+        let busy = regs.tfd.is_set(PORT_TFD::STS_BSY) || regs.tfd.is_set(PORT_TFD::STS_DRQ);
+        let clo_ok = !busy || self.kick_engine_with_clo(port_num);
+        if busy && !clo_ok {
             log::warn!(
-                "AHCI port {}: device not ready after recovery (TFD={:#x})",
-                port_num,
-                port_regs.tfd.get()
+                "AHCI {} port {}: CLO unavailable or timed out; falling back to COMRESET",
+                self.pci_address,
+                port_num
             );
         }
-
-        log::debug!("AHCI port {}: error recovery complete", port_num);
+        let need_reset = !stopped
+            || !fis_stopped
+            || !clo_ok
+            || regs.ci.get() != 0
+            || regs.tfd.is_set(PORT_TFD::STS_BSY)
+            || regs.tfd.is_set(PORT_TFD::STS_DRQ)
+            || regs.ssts.read(PORT_SSTS::DET) != 3;
+        if need_reset && !self.comreset_port(port_num) {
+            log::error!(
+                "AHCI {} port {}: COMRESET failed/offline",
+                self.pci_address,
+                port_num
+            );
+            return Err(AhciError::RecoveryFailed);
+        }
+        regs.serr.set(u32::MAX);
+        regs.is.set(u32::MAX);
+        let hba = unsafe { &*(self.mmio_base as *const AhciHbaRegisters) };
+        hba.is.set(1 << port_num);
+        if !wait_for(5000, || {
+            regs.ssts.read(PORT_SSTS::DET) == 3
+                && !regs.tfd.is_set(PORT_TFD::STS_BSY)
+                && !regs.tfd.is_set(PORT_TFD::STS_DRQ)
+                && regs.ci.get() == 0
+                && regs.sact.get() == 0
+                && !regs.cmd.is_set(PORT_CMD::CR)
+                && !regs.cmd.is_set(PORT_CMD::FR)
+        }) {
+            log::error!(
+                "AHCI {} port {}: recovery did not reach a ready link (CMD={:#x} CI={:#x} SACT={:#x} SSTS={:#x} TFD={:#x})",
+                self.pci_address,
+                port_num,
+                regs.cmd.get(),
+                regs.ci.get(),
+                regs.sact.get(),
+                regs.ssts.get(),
+                regs.tfd.get()
+            );
+            return Err(AhciError::RecoveryFailed);
+        }
+        regs.cmd.modify(PORT_CMD::FRE::SET);
+        regs.cmd.modify(PORT_CMD::ST::SET);
+        log::warn!(
+            "AHCI {} port {} recovered: CMD={:#x} SSTS={:#x} TFD={:#x}",
+            self.pci_address,
+            port_num,
+            regs.cmd.get(),
+            regs.ssts.get(),
+            regs.tfd.get()
+        );
+        Ok(())
     }
 
     /// Get the number of active ports
@@ -1342,8 +1500,11 @@ impl AhciController {
         // 512-byte-block rounded transfer length.
         let transfer_blocks = (buffer.len() as u32).div_ceil(512);
         let transfer_len = (transfer_blocks as usize) * 512;
-        let dma_buffer = DmaBuffer::new(transfer_len)?;
-        let dma_addr = dma_buffer.addr();
+        let dma_buffer = self.allocate_dma(transfer_len)?;
+        let dma_addr = dma_buffer.dma_address();
+        dma_buffer
+            .sync_for_device(0..dma_buffer.len(), DmaDirection::FromDevice)
+            .map_err(|_| AhciError::DmaError)?;
 
         // Setup command header
         let header = unsafe { &mut *cmd_list.add(slot as usize) };
@@ -1385,9 +1546,12 @@ impl AhciController {
 
         // Copy data from DMA buffer to caller's buffer
         let bytes_transferred = if result.is_ok() {
+            dma_buffer
+                .sync_for_cpu(0..dma_buffer.len(), DmaDirection::FromDevice)
+                .map_err(|_| AhciError::DmaError)?;
             unsafe {
                 core::ptr::copy_nonoverlapping(
-                    dma_buffer.as_ptr(),
+                    dma_buffer.dma_address() as *const u8,
                     buffer.as_mut_ptr(),
                     buffer.len(),
                 );
@@ -1453,15 +1617,15 @@ impl AhciController {
         // 512-byte-block rounded transfer length.
         let transfer_blocks = (buffer.len() as u32).div_ceil(512);
         let transfer_len = (transfer_blocks as usize) * 512;
-        let mut dma_buffer = DmaBuffer::new(transfer_len)?;
-        let dma_addr = dma_buffer.addr();
+        let mut dma_buffer = self.allocate_dma(transfer_len)?;
+        let dma_addr = dma_buffer.dma_address();
 
-        // Copy data to DMA buffer. Zero-fill the rounded padding so the device
-        // never receives stale firmware memory for non-512-byte-aligned payloads.
-        dma_buffer.memory.fill(0);
-        unsafe {
-            core::ptr::copy_nonoverlapping(buffer.as_ptr(), dma_buffer.as_mut_ptr(), buffer.len());
-        }
+        // Zero-fill rounded padding before device ownership.
+        dma_buffer.as_mut_slice().fill(0);
+        dma_buffer.as_mut_slice()[..buffer.len()].copy_from_slice(buffer);
+        dma_buffer
+            .sync_for_device(0..dma_buffer.len(), DmaDirection::ToDevice)
+            .map_err(|_| AhciError::DmaError)?;
 
         // Setup command header
         let header = unsafe { &mut *cmd_list.add(slot as usize) };
@@ -1505,6 +1669,41 @@ impl AhciController {
             log::debug!("AHCI Trusted Send: success");
         })
     }
+
+    fn shutdown_controller(&mut self) {
+        let hba = unsafe { &*(self.mmio_base as *const AhciHbaRegisters) };
+        hba.ghc.modify(GHC::IE::CLEAR);
+        for port_num in 0..32u8 {
+            if self.ports_implemented & (1 << port_num) == 0 {
+                continue;
+            }
+            let regs = self.port_regs(port_num);
+            regs.ie.set(0);
+            regs.cmd.modify(PORT_CMD::ST::CLEAR);
+            let cr_clear = wait_for(500, || !regs.cmd.is_set(PORT_CMD::CR));
+            regs.cmd.modify(PORT_CMD::FRE::CLEAR);
+            let fr_clear = wait_for(500, || !regs.cmd.is_set(PORT_CMD::FR));
+            if !cr_clear || !fr_clear {
+                log::error!(
+                    "AHCI {} port {}: handoff quiesce failed CMD={:#x} CI={:#x} SACT={:#x}",
+                    self.pci_address,
+                    port_num,
+                    regs.cmd.get(),
+                    regs.ci.get(),
+                    regs.sact.get()
+                );
+            } else {
+                log::debug!(
+                    "AHCI {} port {} quiesced: ST/CR/FRE/FR clear",
+                    self.pci_address,
+                    port_num
+                );
+            }
+            regs.is.set(u32::MAX);
+            regs.serr.set(u32::MAX);
+            hba.is.set(1 << port_num);
+        }
+    }
 }
 
 /// Registry of initialized AHCI controllers
@@ -1541,8 +1740,13 @@ pub fn init_device(dev: &pci::PciDevice) -> Result<(), ()> {
 /// Shutdown all AHCI controllers
 ///
 /// Called during ExitBootServices to prepare for OS handoff.
-/// Currently a placeholder — the OS will reset controllers during its own init.
 pub fn shutdown() {
+    let controllers = AHCI_CONTROLLERS.controllers.lock();
+    for controller in controllers.iter() {
+        // SAFETY: the registry lock excludes other controller users.
+        unsafe { &mut *controller.0 }.shutdown_controller();
+    }
+    drop(controllers);
     AHCI_CONTROLLERS.shutdown_log();
 }
 
@@ -1677,10 +1881,18 @@ pub fn global_read_sectors(lba: u64, buffer: &mut [u8]) -> Result<(), ()> {
         .get_port(port_index)
         .map(|p| p.sector_size as usize)
         .unwrap_or(512);
-    let num_sectors = (buffer.len() / sector_size).max(1) as u32;
+    if sector_size == 0 || buffer.is_empty() || !buffer.len().is_multiple_of(sector_size) {
+        log::error!(
+            "global_read_sectors: buffer length {} is not a non-zero multiple of sector size {}",
+            buffer.len(),
+            sector_size
+        );
+        return Err(());
+    }
+    let num_sectors = u32::try_from(buffer.len() / sector_size).map_err(|_| ())?;
 
-    // Safety: buffer.as_mut_ptr() points to a valid slice of `buffer.len()` bytes,
-    // and num_sectors * sector_size <= buffer.len() by construction above.
+    // Safety: the exact-multiple check above proves the raw read writes exactly
+    // `buffer.len()` bytes into this slice.
     unsafe { controller.read_sectors(port_index, lba, num_sectors, buffer.as_mut_ptr()) }.map_err(
         |e| {
             log::error!("global_read_sectors: read failed at LBA {}: {:?}", lba, e);

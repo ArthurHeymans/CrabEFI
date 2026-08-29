@@ -193,6 +193,16 @@ pub fn get_device(device_id: u32) -> Option<StorageDevice> {
 /// This is the unified read function used by BlockIO protocol.
 pub fn read_sectors(device_id: u32, lba: u64, buffer: &mut [u8]) -> Result<(), ()> {
     let device = get_device(device_id).ok_or(())?;
+    let block_size = usize::try_from(device.block_size).map_err(|_| ())?;
+    if block_size == 0 || buffer.is_empty() || !buffer.len().is_multiple_of(block_size) {
+        log::error!(
+            "Storage read buffer length {} is not a non-zero multiple of block size {}",
+            buffer.len(),
+            block_size
+        );
+        return Err(());
+    }
+    let num_sectors = u32::try_from(buffer.len() / block_size).map_err(|_| ())?;
 
     match device.device_type {
         StorageType::Usb { .. } => {
@@ -208,7 +218,6 @@ pub fn read_sectors(device_id: u32, lba: u64, buffer: &mut [u8]) -> Result<(), (
             if let Some(controller_ptr) = crate::drivers::nvme::get_controller(controller_id) {
                 // Safety: pointer valid for firmware lifetime; no overlapping &mut created
                 let controller = unsafe { &mut *controller_ptr };
-                let num_sectors = (buffer.len() as u32).div_ceil(device.block_size);
                 controller
                     .read_sectors(nsid, lba, num_sectors, buffer.as_mut_ptr())
                     .map_err(|e| {
@@ -225,7 +234,6 @@ pub fn read_sectors(device_id: u32, lba: u64, buffer: &mut [u8]) -> Result<(), (
         } => {
             if let Some(controller_ptr) = crate::drivers::ahci::get_controller(controller_id) {
                 let controller = unsafe { &mut *controller_ptr };
-                let num_sectors = (buffer.len() as u32).div_ceil(device.block_size);
                 unsafe {
                     controller
                         .read_sectors(port, lba, num_sectors, buffer.as_mut_ptr())
@@ -252,8 +260,16 @@ pub fn read_sectors(device_id: u32, lba: u64, buffer: &mut [u8]) -> Result<(), (
         }
         StorageType::Platform { index } => with_platform_block_device(index, |dev| {
             let info = dev.info();
-            let count = (buffer.len() as u32).div_ceil(info.block_size);
-            dev.read_blocks(lba, count, buffer).map_err(|e| {
+            if info.block_size != device.block_size {
+                log::error!(
+                    "Platform device {} block size changed from {} to {}",
+                    index,
+                    device.block_size,
+                    info.block_size
+                );
+                return Err(());
+            }
+            dev.read_blocks(lba, num_sectors, buffer).map_err(|e| {
                 log::error!(
                     "Platform device {} read failed at LBA {}: {:?}",
                     index,
