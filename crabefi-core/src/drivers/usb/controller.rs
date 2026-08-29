@@ -588,6 +588,8 @@ pub enum UsbError {
     Disconnected,
     /// Operation not supported by this controller
     NotSupported,
+    /// PCI configuration space could not be accessed safely.
+    PciConfig,
 }
 
 /// USB device handle - identifies a device on a controller
@@ -628,6 +630,29 @@ pub trait UsbController {
         index: u16,
         data: Option<&mut [u8]>,
     ) -> Result<usize, UsbError>;
+
+    /// Clear an endpoint halt and restore its transfer state.
+    ///
+    /// Legacy controllers override this to reset their software data toggle to
+    /// DATA0 after the request succeeds. xHCI recovers halted transfer rings in
+    /// its transfer-error path, so the standard request is sufficient there.
+    fn clear_endpoint_halt(
+        &mut self,
+        device: u8,
+        endpoint: u8,
+        is_in: bool,
+    ) -> Result<(), UsbError> {
+        let endpoint_address = endpoint | if is_in { 0x80 } else { 0 };
+        self.control_transfer(
+            device,
+            req_type::DIR_OUT | req_type::TYPE_STANDARD | req_type::RCPT_ENDPOINT,
+            request::CLEAR_FEATURE,
+            0,
+            u16::from(endpoint_address),
+            None,
+        )?;
+        Ok(())
+    }
 
     /// Perform a bulk transfer
     ///
@@ -881,6 +906,29 @@ impl UsbDevice {
         device.hub_addr = hub_addr;
         device.hub_port = hub_port;
         device
+    }
+
+    /// Reset one configured bulk endpoint's software toggle to DATA0.
+    pub fn reset_bulk_toggle(&mut self, endpoint: u8, is_in: bool) -> Result<(), UsbError> {
+        let configured = if is_in {
+            self.bulk_in.as_ref()
+        } else {
+            self.bulk_out.as_ref()
+        }
+        .ok_or(UsbError::InvalidParameter)?;
+
+        if configured.number != endpoint
+            || configured.direction != if is_in { Direction::In } else { Direction::Out }
+        {
+            return Err(UsbError::InvalidParameter);
+        }
+
+        if is_in {
+            self.bulk_in_toggle = false;
+        } else {
+            self.bulk_out_toggle = false;
+        }
+        Ok(())
     }
 
     /// Get DeviceInfo for this device

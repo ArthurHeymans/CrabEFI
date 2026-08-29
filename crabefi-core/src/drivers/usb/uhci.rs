@@ -12,6 +12,7 @@ use super::controller::{
     enumerate_hub_ports,
 };
 use super::uhci_regs::{PORTSC, USBCMD, USBSTS, UhciRegs};
+use crate::arch::{flush_cache_range, invalidate_cache_range};
 use crate::barrier;
 use crate::drivers::pci::{self, PciAddress, PciDevice};
 use crate::efi;
@@ -162,6 +163,7 @@ impl TransferDescriptor {
         length: usize,
         is_in: bool,
         toggle: bool,
+        short_packet_detect: bool,
         next: u32,
         is_low_speed: bool,
     ) -> Self {
@@ -174,6 +176,9 @@ impl TransferDescriptor {
         td.ctrl_sts = Self::CS_ACTIVE | (3 << Self::CS_CERR_SHIFT);
         if is_low_speed {
             td.ctrl_sts |= Self::CS_LOWSPEED;
+        }
+        if short_packet_detect {
+            td.ctrl_sts |= Self::CS_SPD;
         }
         td.token = if is_in {
             Self::TK_PID_IN
@@ -289,18 +294,18 @@ impl UhciController {
         log::info!("UHCI controller at I/O base {:#x}", io_base);
 
         // Allocate frame list (4KB aligned)
-        let frame_list_mem = efi::allocate_pages(1).ok_or(UsbError::AllocationFailed)?;
+        let frame_list_mem = efi::allocate_pages_below_4g(1).ok_or(UsbError::AllocationFailed)?;
         let frame_list = frame_list_mem.as_ptr() as u64;
 
         // Allocate QH
-        let qh_mem = efi::allocate_pages(1).ok_or(UsbError::AllocationFailed)?;
+        let qh_mem = efi::allocate_pages_below_4g(1).ok_or(UsbError::AllocationFailed)?;
         qh_mem.fill(0);
         let qh = qh_mem.as_ptr() as u64;
 
         // Allocate DMA buffer
         let dma_pages = Self::DMA_BUFFER_SIZE.div_ceil(4096);
         let dma_buffer_mem =
-            efi::allocate_pages(dma_pages as u64).ok_or(UsbError::AllocationFailed)?;
+            efi::allocate_pages_below_4g(dma_pages as u64).ok_or(UsbError::AllocationFailed)?;
         let dma_buffer = dma_buffer_mem.as_ptr() as u64;
 
         let mut controller = Self {
@@ -339,7 +344,7 @@ impl UhciController {
     /// this before taking control of the controller.
     fn disable_legacy_support(&mut self) {
         // UHCI legacy support register is at PCI config offset 0xC0
-        const USBLEGSUP: u8 = 0xC0;
+        const USBLEGSUP: u16 = 0xC0;
 
         let legsup = pci::read_config_u16(self.pci_address, USBLEGSUP);
 
@@ -402,6 +407,9 @@ impl UhciController {
                 ptr::write_volatile(frame_list.add(i), (self.qh as u32) | FrameListPointer::QH);
             }
         }
+
+        flush_cache_range(self.qh, core::mem::size_of::<QueueHead>());
+        flush_cache_range(self.frame_list, Self::FRAME_LIST_SIZE * 4);
 
         // Set frame list base
         regs.flbaseadd().set(self.frame_list as u32);
@@ -721,6 +729,7 @@ impl UhciController {
                 chunk,
                 is_in,
                 toggle,
+                is_in && i + 1 < num_data_tds,
                 next_td,
                 is_low_speed,
             );
@@ -733,16 +742,27 @@ impl UhciController {
         let status_dir_in = if data_len > 0 { !is_in } else { true };
         *status_td = TransferDescriptor::status(device.address, status_dir_in, 0, is_low_speed);
 
+        flush_cache_range(setup_addr, 8);
+        if data_len > 0 {
+            if is_in {
+                invalidate_cache_range(data_buffer, data_len);
+            } else {
+                flush_cache_range(data_buffer, data_len);
+            }
+        }
+        flush_cache_range(td_base, 32 * (num_data_tds + 2));
         barrier::dma_write();
 
         // Point QH element to first TD
         let qh = unsafe { &mut *(self.qh as *mut QueueHead) };
         qh.element_link = setup_td_addr as u32;
+        flush_cache_range(self.qh, core::mem::size_of::<QueueHead>());
         barrier::dma_write();
 
         // Wait for status TD completion
         let timeout = Timeout::from_ms(5000);
         loop {
+            invalidate_cache_range(status_td_addr, 32);
             barrier::dma_read();
             let sts = unsafe { ptr::read_volatile(&status_td.ctrl_sts) };
             if sts & TransferDescriptor::CS_ACTIVE == 0 {
@@ -751,6 +771,7 @@ impl UhciController {
             if timeout.is_expired() {
                 // Clear QH before returning
                 qh.element_link = QueueHead::TERMINATE;
+                flush_cache_range(self.qh, core::mem::size_of::<QueueHead>());
                 barrier::dma_write();
                 return Err(UsbError::Timeout);
             }
@@ -759,7 +780,10 @@ impl UhciController {
 
         // Clear QH
         qh.element_link = QueueHead::TERMINATE;
+        flush_cache_range(self.qh, core::mem::size_of::<QueueHead>());
         barrier::dma_write();
+
+        invalidate_cache_range(td_base, 32 * (num_data_tds + 2));
 
         // Check setup TD and all data TDs for errors
         let setup_td = unsafe { &*(setup_td_addr as *const TransferDescriptor) };
@@ -802,6 +826,7 @@ impl UhciController {
                 let buf_offset = i * max_packet;
                 let copy_len = chunk_transferred.min(d.len() - total);
                 if copy_len > 0 {
+                    invalidate_cache_range(data_buffer + buf_offset as u64, copy_len);
                     unsafe {
                         ptr::copy_nonoverlapping(
                             (data_buffer + buf_offset as u64) as *const u8,
@@ -852,6 +877,33 @@ impl UsbController for UhciController {
         // Clone the device to avoid borrow issues
         let dev_copy = dev.clone();
         self.control_transfer_internal(&dev_copy, request_type, request, value, index, data)
+    }
+
+    fn clear_endpoint_halt(
+        &mut self,
+        device: u8,
+        endpoint: u8,
+        is_in: bool,
+    ) -> Result<(), UsbError> {
+        let mut dev_copy = self
+            .get_device(device)
+            .ok_or(UsbError::DeviceNotFound)?
+            .clone();
+        dev_copy.reset_bulk_toggle(endpoint, is_in)?;
+        let endpoint_address = endpoint | if is_in { 0x80 } else { 0 };
+        self.control_transfer_internal(
+            &dev_copy,
+            super::controller::req_type::DIR_OUT
+                | super::controller::req_type::TYPE_STANDARD
+                | super::controller::req_type::RCPT_ENDPOINT,
+            super::controller::request::CLEAR_FEATURE,
+            0,
+            u16::from(endpoint_address),
+            None,
+        )?;
+        self.get_device_mut(device)
+            .ok_or(UsbError::DeviceNotFound)?
+            .reset_bulk_toggle(endpoint, is_in)
     }
 
     fn bulk_transfer(
@@ -912,21 +964,30 @@ impl UsbController for UhciController {
                 chunk,
                 is_in,
                 toggle,
+                false,
                 0,
                 is_low_speed,
             );
             td.ctrl_sts |= TransferDescriptor::CS_IOC;
 
+            if is_in {
+                invalidate_cache_range(data_buffer, chunk);
+            } else {
+                flush_cache_range(data_buffer, chunk);
+            }
+            flush_cache_range(td_addr, 32);
             barrier::dma_write();
 
             // Point QH to TD
             let qh = unsafe { &mut *(self.qh as *mut QueueHead) };
             qh.element_link = td_addr as u32;
+            flush_cache_range(self.qh, core::mem::size_of::<QueueHead>());
             barrier::dma_write();
 
             // Wait for completion
             let timeout = Timeout::from_ms(5000);
             while !timeout.is_expired() {
+                invalidate_cache_range(td_addr, 32);
                 barrier::dma_read();
                 if !td.is_active() {
                     break;
@@ -936,7 +997,10 @@ impl UsbController for UhciController {
 
             // Clear QH
             qh.element_link = QueueHead::TERMINATE;
+            flush_cache_range(self.qh, core::mem::size_of::<QueueHead>());
             barrier::dma_write();
+
+            invalidate_cache_range(td_addr, 32);
 
             // Check result
             if td.is_active() {
@@ -954,6 +1018,7 @@ impl UsbController for UhciController {
 
             // Copy data for IN
             if is_in && transferred > 0 {
+                invalidate_cache_range(data_buffer, transferred);
                 unsafe {
                     ptr::copy_nonoverlapping(
                         data_buffer as *const u8,

@@ -7,6 +7,7 @@
 //! - OHCI Specification 1.0a
 //! - libpayload ohci.c
 
+use crate::arch::{flush_cache_range, invalidate_cache_range};
 use crate::barrier;
 use crate::drivers::pci::{self, PciAddress, PciDevice};
 use crate::efi;
@@ -308,24 +309,24 @@ impl OhciController {
         log::info!("OHCI: {} ports", num_ports);
 
         // Allocate HCCA (256-byte aligned)
-        let hcca_mem = efi::allocate_pages(1).ok_or(UsbError::AllocationFailed)?;
+        let hcca_mem = efi::allocate_pages_below_4g(1).ok_or(UsbError::AllocationFailed)?;
         hcca_mem.fill(0);
         let hcca = hcca_mem.as_ptr() as u64;
 
         // Allocate control ED
-        let control_ed_mem = efi::allocate_pages(1).ok_or(UsbError::AllocationFailed)?;
+        let control_ed_mem = efi::allocate_pages_below_4g(1).ok_or(UsbError::AllocationFailed)?;
         control_ed_mem.fill(0);
         let control_ed = control_ed_mem.as_ptr() as u64;
 
         // Allocate bulk ED
-        let bulk_ed_mem = efi::allocate_pages(1).ok_or(UsbError::AllocationFailed)?;
+        let bulk_ed_mem = efi::allocate_pages_below_4g(1).ok_or(UsbError::AllocationFailed)?;
         bulk_ed_mem.fill(0);
         let bulk_ed = bulk_ed_mem.as_ptr() as u64;
 
         // Allocate DMA buffer
         let dma_pages = Self::DMA_BUFFER_SIZE.div_ceil(4096);
         let dma_buffer_mem =
-            efi::allocate_pages(dma_pages as u64).ok_or(UsbError::AllocationFailed)?;
+            efi::allocate_pages_below_4g(dma_pages as u64).ok_or(UsbError::AllocationFailed)?;
         let dma_buffer = dma_buffer_mem.as_ptr() as u64;
 
         let mut controller = Self {
@@ -542,6 +543,9 @@ impl OhciController {
     ) -> Result<usize, UsbError> {
         let is_in = (request_type & 0x80) != 0;
         let data_len = data.as_ref().map(|d| d.len()).unwrap_or(0);
+        if data_len > 4096 || data_len > u16::MAX as usize {
+            return Err(UsbError::InvalidParameter);
+        }
 
         // Build setup packet
         let setup_addr = self.dma_buffer;
@@ -606,13 +610,24 @@ impl OhciController {
             ed.tail_td = (td_base + 32) as u32;
         }
 
+        flush_cache_range(setup_addr, 8);
+        if data_len > 0 {
+            if is_in {
+                invalidate_cache_range(data_buffer, data_len);
+            } else {
+                flush_cache_range(data_buffer, data_len);
+            }
+        }
+        flush_cache_range(ed_addr, 32);
+        flush_cache_range(td_base, 48);
         barrier::dma_write();
 
         // Insert ED into control list
         let head_ed = unsafe { &mut *(self.control_ed as *mut EndpointDescriptor) };
         ed.next_ed = head_ed.next_ed;
-        barrier::dma_write();
+        flush_cache_range(ed_addr, 32);
         head_ed.next_ed = ed_addr as u32;
+        flush_cache_range(self.control_ed, 32);
         barrier::mmio_write();
 
         // Tell controller list is filled
@@ -623,6 +638,7 @@ impl OhciController {
         let timeout = Timeout::from_ms(5000);
 
         while !timeout.is_expired() {
+            invalidate_cache_range(status_td_addr, 16);
             barrier::dma_read();
             if status_td.is_complete() {
                 break;
@@ -632,7 +648,11 @@ impl OhciController {
 
         // Remove ED from list
         head_ed.next_ed = ed.next_ed;
+        flush_cache_range(self.control_ed, 32);
         barrier::dma_write();
+
+        invalidate_cache_range(td_base, 48);
+        invalidate_cache_range(ed_addr, 32);
 
         // Check result
         if !status_td.is_complete() {
@@ -661,6 +681,7 @@ impl OhciController {
             } else {
                 (data_td.cbp - data_buffer as u32) as usize
             };
+            invalidate_cache_range(data_buffer, transferred.min(d.len()));
             unsafe {
                 ptr::copy_nonoverlapping(
                     data_buffer as *const u8,
@@ -704,6 +725,33 @@ impl UsbController for OhciController {
         // Clone the device to avoid borrow issues
         let dev_copy = dev.clone();
         self.control_transfer_internal(&dev_copy, request_type, request, value, index, data)
+    }
+
+    fn clear_endpoint_halt(
+        &mut self,
+        device: u8,
+        endpoint: u8,
+        is_in: bool,
+    ) -> Result<(), UsbError> {
+        let mut dev_copy = self
+            .get_device(device)
+            .ok_or(UsbError::DeviceNotFound)?
+            .clone();
+        dev_copy.reset_bulk_toggle(endpoint, is_in)?;
+        let endpoint_address = endpoint | if is_in { 0x80 } else { 0 };
+        self.control_transfer_internal(
+            &dev_copy,
+            super::controller::req_type::DIR_OUT
+                | super::controller::req_type::TYPE_STANDARD
+                | super::controller::req_type::RCPT_ENDPOINT,
+            super::controller::request::CLEAR_FEATURE,
+            0,
+            u16::from(endpoint_address),
+            None,
+        )?;
+        self.get_device_mut(device)
+            .ok_or(UsbError::DeviceNotFound)?
+            .reset_bulk_toggle(endpoint, is_in)
     }
 
     fn bulk_transfer(
@@ -779,13 +827,21 @@ impl UsbController for OhciController {
             ed.head_td = td_addr as u32 | if toggle { 2 } else { 0 };
             ed.tail_td = (td_addr + 16) as u32;
 
+            if is_in {
+                invalidate_cache_range(data_buffer, chunk);
+            } else {
+                flush_cache_range(data_buffer, chunk);
+            }
+            flush_cache_range(ed_addr, 32);
+            flush_cache_range(td_addr, 32);
             barrier::dma_write();
 
             // Insert into bulk list
             let head_ed = unsafe { &mut *(self.bulk_ed as *mut EndpointDescriptor) };
             ed.next_ed = head_ed.next_ed;
-            barrier::dma_write();
+            flush_cache_range(ed_addr, 32);
             head_ed.next_ed = ed_addr as u32;
+            flush_cache_range(self.bulk_ed, 32);
             barrier::mmio_write();
 
             // Trigger bulk list
@@ -794,6 +850,7 @@ impl UsbController for OhciController {
             // Wait for completion
             let timeout = Timeout::from_ms(5000);
             while !timeout.is_expired() {
+                invalidate_cache_range(td_addr, 32);
                 barrier::dma_read();
                 if td.is_complete() {
                     break;
@@ -803,7 +860,11 @@ impl UsbController for OhciController {
 
             // Remove from list
             head_ed.next_ed = ed.next_ed;
+            flush_cache_range(self.bulk_ed, 32);
             barrier::dma_write();
+
+            invalidate_cache_range(td_addr, 32);
+            invalidate_cache_range(ed_addr, 32);
 
             // Check result
             if !td.is_complete() {
@@ -831,6 +892,7 @@ impl UsbController for OhciController {
 
             // Copy data for IN
             if is_in && transferred > 0 {
+                invalidate_cache_range(data_buffer, transferred);
                 unsafe {
                     ptr::copy_nonoverlapping(
                         data_buffer as *const u8,

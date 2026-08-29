@@ -315,52 +315,29 @@ impl UsbMassStorage {
         // Step 2: Wait for device recovery (EDK2 uses 100ms, Linux uses 6 seconds)
         time::delay_ms(100);
 
-        // Step 3: Clear HALT on Bulk-In endpoint
-        // CLEAR_FEATURE(ENDPOINT_HALT): bmRequestType=0x02, bRequest=0x01, wValue=0, wIndex=endpoint
-        let bulk_in_addr = self.bulk_in | 0x80; // IN endpoint address
-        let result = controller.control_transfer(
-            self.device_addr,
-            0x02, // Standard request, Host-to-Device, Endpoint
-            0x01, // CLEAR_FEATURE
-            0,    // ENDPOINT_HALT feature selector
-            bulk_in_addr as u16,
-            None,
-        );
-        if let Err(e) = result {
-            log::warn!("USB BOT: Clear Bulk-In halt failed: {:?}", e);
+        // Steps 3-4: clear both bulk endpoint halts. The host-controller
+        // implementation also restores any software/HCD endpoint state.
+        if let Err(error) = controller.clear_endpoint_halt(self.device_addr, self.bulk_in, true) {
+            log::warn!("USB BOT: Clear Bulk-In halt failed: {:?}", error);
         }
-
-        // Step 4: Clear HALT on Bulk-Out endpoint
-        let result = controller.control_transfer(
-            self.device_addr,
-            0x02, // Standard request, Host-to-Device, Endpoint
-            0x01, // CLEAR_FEATURE
-            0,    // ENDPOINT_HALT feature selector
-            self.bulk_out as u16,
-            None,
-        );
-        if let Err(e) = result {
-            log::warn!("USB BOT: Clear Bulk-Out halt failed: {:?}", e);
+        if let Err(error) = controller.clear_endpoint_halt(self.device_addr, self.bulk_out, false) {
+            log::warn!("USB BOT: Clear Bulk-Out halt failed: {:?}", error);
         }
 
         log::debug!("USB BOT: Reset recovery complete");
     }
 
-    /// Clear a stalled endpoint by sending CLEAR_FEATURE(ENDPOINT_HALT).
-    ///
-    /// Per EDK2's UsbBotDataTransfer: on a data phase stall, clear the
-    /// stalled endpoint before attempting to read the CSW.
+    /// Clear a stalled endpoint before continuing BOT recovery.
     fn clear_endpoint_halt(&self, controller: &mut dyn UsbController, endpoint: u8, is_in: bool) {
-        let ep_addr = if is_in { endpoint | 0x80 } else { endpoint };
-        log::debug!("USB BOT: Clearing halt on endpoint {:#x}", ep_addr);
-        let _ = controller.control_transfer(
-            self.device_addr,
-            0x02, // Standard, Host-to-Device, Endpoint
-            0x01, // CLEAR_FEATURE
-            0,    // ENDPOINT_HALT
-            ep_addr as u16,
-            None,
-        );
+        let endpoint_address = endpoint | if is_in { 0x80 } else { 0 };
+        log::debug!("USB BOT: Clearing halt on endpoint {:#x}", endpoint_address);
+        if let Err(error) = controller.clear_endpoint_halt(self.device_addr, endpoint, is_in) {
+            log::warn!(
+                "USB BOT: Failed to clear endpoint {:#x}: {:?}",
+                endpoint_address,
+                error
+            );
+        }
     }
 
     /// Send a SCSI command using the Bulk-Only Transport protocol.
