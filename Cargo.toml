@@ -1,11 +1,10 @@
-# Workspace: core library, reusable drivers, and platform payloads are separate crates.
+# Workspace: the core library and platform payloads are separate crates.
 # xtask and test-apps are NOT workspace members (different build targets).
 
 [workspace]
 members = [
   "crabefi-core",
   "crabefi-coreboot",
-  "crabefi-drivers",
   "crabefi-efi-types",
   "crabefi-runtime-bundle",
 ]

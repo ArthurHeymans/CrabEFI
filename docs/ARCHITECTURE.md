@@ -2,9 +2,8 @@
 
 ## Crates
 
-- `crabefi-core`: boot-time, platform-independent UEFI implementation
+- `crabefi-core`: boot-time UEFI implementation and hardware drivers
 - `crabefi-coreboot`: coreboot payload and platform discovery
-- `crabefi-drivers`: reusable boot-time drivers
 - `crabefi-efi-types`: shared, allocation-free EFI time, signature-list, and Secure Boot definitions
 - `crabefi-runtime-abi`: excluded, host-testable pointer-free format/handoff ABI
 - `crabefi-runtime-image`: excluded, separately linked `no_std` Runtime Services image
