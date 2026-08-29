@@ -164,7 +164,6 @@ dependencies = [
  "acpi",
  "cc",
  "crabefi-core",
- "crabefi-drivers",
  "crabefi-runtime-abi",
  "fdt",
  "heapless 0.9.3",
@@ -172,20 +171,6 @@ dependencies = [
  "log",
  "r-efi",
  "sha2",
- "x86_64",
- "zerocopy",
-]
-
-[[package]]
-name = "crabefi-drivers"
-version = "0.1.0"
-dependencies = [
- "bitflags",
- "crabefi-core",
- "heapless 0.9.3",
- "log",
- "spin 0.12.2",
- "tock-registers",
  "x86_64",
  "zerocopy",
 ]

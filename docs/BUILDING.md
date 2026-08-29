@@ -81,7 +81,6 @@ map, symbols, disassembly, stack report, digest, and JSON audits are under
 | `Cargo.toml` | Virtual workspace root |
 | `crabefi-core/Cargo.toml` | Core library manifest |
 | `crabefi-coreboot/Cargo.toml` | Coreboot binary manifest |
-| `crabefi-drivers/Cargo.toml` | Drivers library manifest |
 | `.cargo/config.toml` | `build-std` settings, target-specific rustflags |
 | `crabefi-coreboot/build.rs` | Runtime embedding, linker selection, `PAYLOAD_BASE` |
 | `crabefi-runtime-image/.cargo/config.toml` | Isolated runtime build with image-local bounded scratch allocation |

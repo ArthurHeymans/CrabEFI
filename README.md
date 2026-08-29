@@ -43,9 +43,8 @@ nix develop
 
 | Crate | Description |
 |-------|-------------|
-| `crabefi-core` | Core library -- platform-agnostic UEFI implementation |
+| `crabefi-core` | Core library -- UEFI implementation and boot-time hardware drivers |
 | `crabefi-coreboot` | Coreboot payload binary (arch entry points, table parsing) |
-| `crabefi-drivers` | Standard hardware drivers (NVMe, AHCI, USB, SDHCI, SPI, serial) |
 | `crabefi-runtime-abi` | Pointer-free normalized image/handoff ABI |
 | `crabefi-runtime-image` | Separate EFI Runtime Services image with image-local bounded scratch allocation |
 

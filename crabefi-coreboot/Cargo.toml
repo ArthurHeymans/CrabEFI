@@ -17,8 +17,6 @@ crabefi = { package = "crabefi-core", path = "../crabefi-core", features = [
   "global-allocator",
   "platform-entry",
 ] }
-crabefi-drivers = { path = "../crabefi-drivers" }
-
 # Needed for coreboot table parsing and early setup
 log = "0.4"
 r-efi = "5.3"
