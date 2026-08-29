@@ -1,55 +1,48 @@
-//! x86_64 Cache Management
+//! x86_64 DMA cache synchronization.
 //!
-//! This module provides cache management functions for DMA operations.
-//! These are essential when the CPU and hardware devices (like USB controllers)
-//! share memory regions.
+//! Normal PCI DMA is hardware coherent on x86. Ownership transitions therefore
+//! need ordering, not cache eviction; in particular, unconditional `clflush`
+//! can discard useful data and is not a substitute for DMA ownership rules.
 
-use crate::barrier;
+use crate::arch::{DmaCacheOperation, DmaSyncError};
 
-/// Cache line size (typically 64 bytes on modern x86)
-pub const CACHE_LINE_SIZE: usize = 64;
-
-/// Flush a memory range from CPU cache to main memory
-///
-/// This ensures that DMA-capable devices see the data written by the CPU.
-/// Uses the CLFLUSH instruction to write back and invalidate cache lines.
-///
-/// # Arguments
-///
-/// * `addr` - Starting address of the memory range
-/// * `size` - Size of the memory range in bytes
+/// Order writes before transferring ownership to a coherent device.
 #[inline]
-pub fn flush_cache_range(addr: u64, size: usize) {
-    let start = addr as usize & !(CACHE_LINE_SIZE - 1);
-    let end = (addr as usize + size + CACHE_LINE_SIZE - 1) & !(CACHE_LINE_SIZE - 1);
-
-    // A full-system barrier preserves CLFLUSH ordering on older AMD processors.
-    barrier::mmio_general();
-
-    for line in (start..end).step_by(CACHE_LINE_SIZE) {
-        unsafe {
-            core::arch::asm!(
-                "clflush [{}]",
-                in(reg) line,
-                options(nostack, preserves_flags)
-            );
-        }
-    }
-    // Ensure cache maintenance completes before continuing.
-    barrier::mmio_general();
+pub fn sync_for_device(
+    _addr: u64,
+    _size: usize,
+    _operation: DmaCacheOperation,
+) -> Result<(), DmaSyncError> {
+    crate::barrier::publish_to_device();
+    Ok(())
 }
 
-/// Invalidate a memory range in CPU cache
-///
-/// This ensures the CPU sees data written by DMA-capable devices.
-/// On x86, CLFLUSH both writes back and invalidates, so we use the same
-/// instruction as flush_cache_range.
-///
-/// # Arguments
-///
-/// * `addr` - Starting address of the memory range
-/// * `size` - Size of the memory range in bytes
+/// Order reads after a coherent device returns ownership to the CPU.
 #[inline]
-pub fn invalidate_cache_range(addr: u64, size: usize) {
-    flush_cache_range(addr, size);
+pub fn sync_for_cpu(
+    _addr: u64,
+    _size: usize,
+    _operation: DmaCacheOperation,
+) -> Result<(), DmaSyncError> {
+    crate::barrier::consume_from_device();
+    Ok(())
+}
+
+/// Compatibility helper for existing coherent DMA submission paths.
+#[inline]
+pub fn flush_cache_range(_addr: u64, _size: usize) {
+    crate::barrier::publish_to_device();
+}
+
+/// Compatibility helper for existing coherent DMA completion paths.
+#[inline]
+pub fn invalidate_cache_range(_addr: u64, _size: usize) {
+    crate::barrier::consume_from_device();
+}
+
+/// Compatibility helper for bidirectional coherent DMA paths.
+#[inline]
+pub fn clean_invalidate_cache_range(_addr: u64, _size: usize) {
+    crate::barrier::publish_to_device();
+    crate::barrier::consume_from_device();
 }

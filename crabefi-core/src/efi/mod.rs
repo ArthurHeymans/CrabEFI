@@ -7,6 +7,8 @@ pub mod allocator;
 pub mod auth;
 pub mod boot_services;
 pub mod capsule;
+pub mod dma;
+pub(crate) mod dma_range;
 pub mod esrt;
 pub mod guid_fmt;
 pub mod image_loader;
@@ -985,10 +987,10 @@ pub fn add_platform_mmio_regions() {
     // the Linux kernel's early memory-map processing.  Only add ECAM
     // when the coreboot map does not already cover it (aarch64 SBSA).
     #[cfg(not(target_arch = "riscv64"))]
-    if let Some(base) = plat.ecam_base
-        && let Some(size) = plat.ecam_size
-    {
-        add_mmio(base, size, "PCIe ECAM");
+    for region in plat.ecam_regions() {
+        if let Some(size) = region.byte_len() {
+            add_mmio(region.base, size, "PCIe ECAM");
+        }
     }
     // SBSA ECAM (0xF0000000-0x100000000) is already in coreboot map as Reserved
 }

@@ -1,38 +1,44 @@
-//! RISC-V Cache Management
+//! RISC-V cache synchronization.
 //!
-//! RISC-V cache management is relatively simple compared to ARM:
-//! - `fence.i` ensures instruction fetch coherence
-//! - `fence` (with appropriate ordering bits) ensures memory ordering
-//!
-//! The base ISA does not have cache-line flush/invalidate instructions.
-//! The Zicbom extension adds `cbo.clean`, `cbo.flush`, `cbo.inval` but
-//! is optional. For QEMU virt (which is cache-coherent), simple fences
-//! are sufficient.
+//! Base RISC-V fences order memory but do not clean or invalidate cache data.
+//! Until Zicbom is discovered and configured, explicitly non-coherent DMA must
+//! fail closed. Existing QEMU-virt paths use coherent DMA and need ordering only.
 
-use crate::barrier;
+use crate::arch::{DmaCacheOperation, DmaSyncError};
 
-/// Cache line size (64 bytes is typical for RISC-V implementations).
-pub const CACHE_LINE_SIZE: usize = 64;
+/// Reject non-coherent device ownership without a cache-block mechanism.
+#[inline]
+pub fn sync_for_device(
+    _addr: u64,
+    _size: usize,
+    _operation: DmaCacheOperation,
+) -> Result<(), DmaSyncError> {
+    Err(DmaSyncError::Unsupported)
+}
 
-/// Flush (clean) a memory range from CPU cache to main memory.
-///
-/// On RISC-V without Zicbom, this is a full fence which ensures all
-/// prior stores are visible to DMA / other harts.
+/// Reject non-coherent CPU ownership without a cache-block mechanism.
+#[inline]
+pub fn sync_for_cpu(
+    _addr: u64,
+    _size: usize,
+    _operation: DmaCacheOperation,
+) -> Result<(), DmaSyncError> {
+    Err(DmaSyncError::Unsupported)
+}
+
+/// Compatibility ordering for existing coherent DMA submission paths.
 #[inline]
 pub fn flush_cache_range(_addr: u64, _size: usize) {
-    barrier::dma_write();
+    crate::barrier::publish_to_device();
 }
 
-/// Invalidate a memory range in CPU cache.
-///
-/// On RISC-V without Zicbom, this is a full fence.
+/// Compatibility ordering for existing coherent DMA completion paths.
 #[inline]
 pub fn invalidate_cache_range(_addr: u64, _size: usize) {
-    barrier::dma_read();
+    crate::barrier::consume_from_device();
 }
 
-/// Instruction fence — ensure subsequent instruction fetches see
-/// stores that have already completed.
+/// Instruction fence — ensure subsequent instruction fetches see completed stores.
 #[inline]
 pub fn fence_i() {
     unsafe {

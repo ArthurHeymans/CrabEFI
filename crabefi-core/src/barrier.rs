@@ -7,16 +7,28 @@
 
 use mem_barrier::{BarrierKind, BarrierType, mem_barrier};
 
-/// Order CPU reads of memory owned or updated by a DMA-capable device.
+/// Publish CPU writes before transferring ownership to a DMA-capable device.
 #[inline]
-pub fn dma_read() {
+pub fn publish_to_device() {
+    mem_barrier(BarrierKind::Dma, BarrierType::Write);
+}
+
+/// Consume memory after a DMA-capable device has transferred ownership to the CPU.
+#[inline]
+pub fn consume_from_device() {
     mem_barrier(BarrierKind::Dma, BarrierType::Read);
 }
 
-/// Order CPU writes before transferring ownership to a DMA-capable device.
+/// Compatibility alias for existing DMA completion paths.
+#[inline]
+pub fn dma_read() {
+    consume_from_device();
+}
+
+/// Compatibility alias for existing DMA submission paths.
 #[inline]
 pub fn dma_write() {
-    mem_barrier(BarrierKind::Dma, BarrierType::Write);
+    publish_to_device();
 }
 
 /// Order writes before notifying a device through MMIO.
@@ -26,6 +38,7 @@ pub fn mmio_write() {
 }
 
 /// Order both reads and writes across an MMIO handoff.
+#[cfg(target_arch = "riscv64")]
 #[inline]
 pub fn mmio_general() {
     mem_barrier(BarrierKind::Mmio, BarrierType::General);
@@ -37,9 +50,12 @@ mod tests {
 
     #[test]
     fn all_hardware_barrier_helpers_are_callable() {
+        publish_to_device();
+        consume_from_device();
         dma_read();
         dma_write();
         mmio_write();
+        #[cfg(target_arch = "riscv64")]
         mmio_general();
     }
 }
