@@ -3,15 +3,23 @@
 //! This module provides a minimal NVMe driver for reading from NVMe SSDs.
 //! It implements the basic NVMe command set needed for booting.
 
+pub mod logic;
+
 use crate::barrier;
 use crate::drivers::pci::{self, PciAddress, PciDevice};
 use crate::efi;
+use crate::efi::dma::{DmaBuffer, DmaCoherency, DmaDirection, DmaMask};
 use crate::time::{Timeout, wait_for};
 use core::ptr;
 use spin::Mutex;
 use tock_registers::interfaces::{ReadWriteable, Readable, Writeable};
 use tock_registers::register_bitfields;
 use tock_registers::registers::{ReadOnly, ReadWrite};
+
+use logic::{
+    QueueState, build_prps, cap_timeout_ms, decode_lba_size, effective_queue_depth,
+    max_prp_transfer, ready_timeout_ms, sectors_per_chunk, supports_4k_page,
+};
 
 // NVMe Controller Register definitions using tock-registers
 register_bitfields! [
@@ -164,9 +172,11 @@ mod io_cmd {
     pub const READ: u8 = 0x02;
 }
 
-/// Queue sizes (must be power of 2)
-const ADMIN_QUEUE_SIZE: usize = 16;
-const IO_QUEUE_SIZE: usize = 64;
+const ADMIN_QUEUE_LIMIT: u16 = 16;
+const IO_QUEUE_LIMIT: u16 = 64;
+const CONTROLLER_PAGE_SIZE: usize = 4096;
+const COMMAND_TIMEOUT_MS: u64 = 5000;
+const SHUTDOWN_TIMEOUT_MS: u64 = 5000;
 
 /// NVMe Submission Queue Entry (64 bytes)
 #[repr(C, align(64))]
@@ -241,6 +251,14 @@ impl CompletionQueueEntry {
     fn cid(&self) -> u16 {
         // Command ID is in bits 0-15 of DW3
         (self.status_cid & 0xFFFF) as u16
+    }
+
+    fn sq_head(&self) -> u16 {
+        (self.sq_head_sqid & 0xffff) as u16
+    }
+
+    fn sq_id(&self) -> u16 {
+        (self.sq_head_sqid >> 16) as u16
     }
 
     fn is_error(&self) -> bool {
@@ -444,32 +462,36 @@ pub struct NvmeController {
     mmio_base: u64,
     /// Doorbell stride (in bytes)
     doorbell_stride: usize,
+    /// Capability value captured before controller programming.
+    initial_cap: u64,
     /// Admin submission queue
     admin_sq: *mut SubmissionQueueEntry,
     /// Admin completion queue
     admin_cq: *mut CompletionQueueEntry,
-    /// Admin submission queue tail
-    admin_sq_tail: u16,
-    /// Admin completion queue head
-    admin_cq_head: u16,
-    /// Admin completion queue phase
-    admin_cq_phase: bool,
-    /// Command ID counter
-    next_cid: u16,
+    /// Admin queue bookkeeping and owned DMA allocations.
+    admin_queue: QueueState,
+    admin_sq_dma: DmaBuffer,
+    admin_cq_dma: DmaBuffer,
     /// I/O submission queue
     io_sq: *mut SubmissionQueueEntry,
     /// I/O completion queue
     io_cq: *mut CompletionQueueEntry,
-    /// I/O submission queue tail
-    io_sq_tail: u16,
-    /// I/O completion queue head
-    io_cq_head: u16,
-    /// I/O completion queue phase
-    io_cq_phase: bool,
+    /// I/O queue bookkeeping and owned DMA allocations.
+    io_queue: QueueState,
+    io_sq_dma: Option<DmaBuffer>,
+    io_cq_dma: Option<DmaBuffer>,
     /// Detected namespaces
     namespaces: heapless::Vec<NvmeNamespace, 8>,
-    /// Page-aligned DMA buffer for data transfers (avoids corruption from misaligned buffers)
-    dma_buffer: *mut u8,
+    /// Permanent Identify payload, retained across command timeouts.
+    identify: DmaBuffer,
+    /// Controller memory page size selected in CC.MPS.
+    controller_page_size: usize,
+    /// Page-backed staging area sized for the largest accepted logical block.
+    staging: Option<DmaBuffer>,
+    /// One page containing PRP-list entries for transfers over two pages.
+    prp_list: DmaBuffer,
+    /// A timed-out data command still owns shared DMA memory.
+    dma_quarantined: bool,
 }
 
 /// NVMe error type
@@ -489,6 +511,14 @@ pub enum NvmeError {
     AllocationFailed,
     /// Invalid parameter
     InvalidParameter,
+    /// Controller capabilities cannot be safely programmed by this driver.
+    UnsupportedCapability,
+    /// Namespace LBA or metadata format is unsupported.
+    UnsupportedLbaFormat,
+    /// Queue has no safe slot or command identifier.
+    QueueFull,
+    /// DMA ownership synchronization failed.
+    DmaError,
 }
 
 impl NvmeController {
@@ -504,7 +534,20 @@ impl NvmeController {
         let regs_ref = unsafe { &*regs };
         let cap = regs_ref.cap.get();
         let doorbell_stride = 4usize << regs_ref.cap.read(CAP::DSTRD);
-        let max_queue_entries = (regs_ref.cap.read(CAP::MQES) + 1) as usize;
+        let mqes = regs_ref.cap.read(CAP::MQES) as u16;
+        let max_queue_entries = usize::from(mqes) + 1;
+        if !supports_4k_page(
+            regs_ref.cap.read(CAP::MPSMIN) as u8,
+            regs_ref.cap.read(CAP::MPSMAX) as u8,
+        ) {
+            log::error!("NVMe: controller does not support 4 KiB memory pages");
+            return Err(NvmeError::UnsupportedCapability);
+        }
+        let admin_depth = effective_queue_depth(ADMIN_QUEUE_LIMIT, mqes);
+        let io_depth = effective_queue_depth(IO_QUEUE_LIMIT, mqes);
+        if admin_depth < 2 || io_depth < 2 {
+            return Err(NvmeError::UnsupportedCapability);
+        }
 
         log::debug!("NVMe CAP: {:#018x}", cap);
         log::debug!("  Doorbell stride: {} bytes", doorbell_stride);
@@ -516,42 +559,72 @@ impl NvmeController {
         let tertiary = regs_ref.vs.read(VS::TER);
         log::info!("NVMe version: {}.{}.{}", major, minor, tertiary);
 
-        // Allocate queues using EFI memory allocator
-        // Each queue needs to be 4KB aligned
-        let admin_sq_mem = efi::allocate_pages(1).ok_or(NvmeError::AllocationFailed)?;
-        admin_sq_mem.fill(0);
-        let admin_sq = admin_sq_mem.as_mut_ptr() as *mut SubmissionQueueEntry;
-
-        let admin_cq_mem = efi::allocate_pages(1).ok_or(NvmeError::AllocationFailed)?;
-        admin_cq_mem.fill(0);
-        let admin_cq = admin_cq_mem.as_mut_ptr() as *mut CompletionQueueEntry;
-
-        // Allocate a page-aligned DMA buffer for data transfers
-        // This prevents corruption when callers pass misaligned buffers
-        let dma_buffer_mem = efi::allocate_pages(1).ok_or(NvmeError::AllocationFailed)?;
-        let dma_buffer = dma_buffer_mem.as_mut_ptr();
+        let admin_sq_dma = DmaBuffer::allocate(
+            usize::from(admin_depth) * core::mem::size_of::<SubmissionQueueEntry>(),
+            DmaMask::bits64(),
+            DmaCoherency::Coherent,
+        )
+        .map_err(|_| NvmeError::AllocationFailed)?;
+        let admin_cq_dma = DmaBuffer::allocate(
+            usize::from(admin_depth) * core::mem::size_of::<CompletionQueueEntry>(),
+            DmaMask::bits64(),
+            DmaCoherency::Coherent,
+        )
+        .map_err(|_| NvmeError::AllocationFailed)?;
+        let admin_sq = admin_sq_dma.dma_address() as *mut SubmissionQueueEntry;
+        let admin_cq = admin_cq_dma.dma_address() as *mut CompletionQueueEntry;
+        let identify = DmaBuffer::allocate(
+            CONTROLLER_PAGE_SIZE,
+            DmaMask::bits64(),
+            DmaCoherency::Coherent,
+        )
+        .map_err(|_| NvmeError::AllocationFailed)?;
+        let prp_list = DmaBuffer::allocate(
+            CONTROLLER_PAGE_SIZE,
+            DmaMask::bits64(),
+            DmaCoherency::Coherent,
+        )
+        .map_err(|_| NvmeError::AllocationFailed)?;
 
         let mut controller = Self {
             pci_address: pci_dev.address,
             regs,
             mmio_base,
             doorbell_stride,
+            initial_cap: cap,
             admin_sq,
             admin_cq,
-            admin_sq_tail: 0,
-            admin_cq_head: 0,
-            admin_cq_phase: true,
-            next_cid: 0,
+            admin_queue: QueueState::new(admin_depth),
+            admin_sq_dma,
+            admin_cq_dma,
             io_sq: ptr::null_mut(),
             io_cq: ptr::null_mut(),
-            io_sq_tail: 0,
-            io_cq_head: 0,
-            io_cq_phase: true,
+            io_queue: QueueState::new(io_depth),
+            io_sq_dma: None,
+            io_cq_dma: None,
             namespaces: heapless::Vec::new(),
-            dma_buffer,
+            identify,
+            controller_page_size: CONTROLLER_PAGE_SIZE,
+            staging: None,
+            prp_list,
+            dma_quarantined: false,
         };
 
-        controller.init()?;
+        if let Err(error) = controller.init() {
+            let regs = unsafe { &*controller.regs };
+            regs.cc.modify(CC::EN::CLEAR + CC::SHN.val(0));
+            let disabled = wait_for(cap_timeout_ms(regs.cap.read(CAP::TO)), || {
+                regs.csts.read(CSTS::RDY) == 0
+            });
+            if !disabled {
+                log::error!(
+                    "NVMe {}: initialization failed and RDY stayed set; leaking DMA allocations",
+                    controller.pci_address
+                );
+                core::mem::forget(controller);
+            }
+            return Err(error);
+        }
         Ok(controller)
     }
 
@@ -610,8 +683,7 @@ impl NvmeController {
 
         // CAP.TO specifies the maximum disable transition time in 500 ms
         // units. A zero value still permits one 500 ms unit.
-        let disable_timeout_units = core::cmp::max(regs.cap.read(CAP::TO), 1);
-        let disable_timeout_ms = disable_timeout_units * 500;
+        let disable_timeout_ms = cap_timeout_ms(regs.cap.read(CAP::TO));
 
         // Disable the controller
         regs.cc.modify(CC::EN::CLEAR);
@@ -625,10 +697,9 @@ impl NvmeController {
         }
 
         // Set admin queue attributes
-        regs.aqa.write(
-            AQA::ASQS.val((ADMIN_QUEUE_SIZE - 1) as u32)
-                + AQA::ACQS.val((ADMIN_QUEUE_SIZE - 1) as u32),
-        );
+        let admin_qsize = u32::from(self.admin_queue.depth - 1);
+        regs.aqa
+            .write(AQA::ASQS.val(admin_qsize) + AQA::ACQS.val(admin_qsize));
 
         // Program 64-bit queue addresses as low then high DWORD writes, as
         // required for NVMe queue-base registers.
@@ -673,22 +744,30 @@ impl NvmeController {
         // NVMe 2.0 controllers may advertise the wider Controller Ready With
         // Media timeout in CRTO. Use the larger value because some devices
         // report a CRTO value smaller than the legacy CAP.TO value.
-        let cap_timeout_units = core::cmp::max(regs.cap.read(CAP::TO), 1);
-        let enable_timeout_units = if regs.cap.read(CAP::CRMS_CRWMS) != 0 {
-            let crto_timeout_units = u64::from(regs.crto.read(CRTO::CRWMT));
-            if crto_timeout_units < cap_timeout_units {
-                log::warn!(
-                    "NVMe: CRTO.CRWMT {} is smaller than CAP.TO {}; using CAP.TO",
-                    crto_timeout_units,
-                    cap_timeout_units
-                );
-            }
-            core::cmp::max(crto_timeout_units, cap_timeout_units)
-        } else {
-            cap_timeout_units
-        };
-        let enable_timeout_ms = enable_timeout_units * 500;
+        let enable_timeout_ms = ready_timeout_ms(
+            regs.cap.read(CAP::TO),
+            regs.cap
+                .is_set(CAP::CRMS_CRWMS)
+                .then(|| u64::from(regs.crto.read(CRTO::CRWMT))),
+        );
 
+        let reread_cap = regs.cap.get();
+        let reread_mqes = regs.cap.read(CAP::MQES) as u16;
+        if !supports_4k_page(
+            regs.cap.read(CAP::MPSMIN) as u8,
+            regs.cap.read(CAP::MPSMAX) as u8,
+        ) || effective_queue_depth(ADMIN_QUEUE_LIMIT, reread_mqes) < self.admin_queue.depth
+            || effective_queue_depth(IO_QUEUE_LIMIT, reread_mqes) < self.io_queue.depth
+            || regs.cap.read(CAP::DSTRD) != ((self.initial_cap >> 32) & 0xf)
+        {
+            log::error!(
+                "NVMe: CAP changed incompatibly while enabling ({:#018x} -> {:#018x})",
+                self.initial_cap,
+                reread_cap
+            );
+            return Err(NvmeError::UnsupportedCapability);
+        }
+        log::debug!("NVMe CAP after CC programming: {:#018x}", regs.cap.get());
         regs.cc.modify(CC::EN::SET);
 
         let timeout = Timeout::from_ms(enable_timeout_ms);
@@ -722,127 +801,275 @@ impl NvmeController {
         Ok(())
     }
 
-    /// Get the next command ID
-    fn next_command_id(&mut self) -> u16 {
-        let cid = self.next_cid;
-        self.next_cid = self.next_cid.wrapping_add(1);
-        cid
-    }
-
-    /// Submit a command to the admin queue
-    fn submit_admin_command(&mut self, cmd: &SubmissionQueueEntry) -> u16 {
-        let tail = self.admin_sq_tail as usize;
-        unsafe {
-            ptr::write_volatile(self.admin_sq.add(tail), *cmd);
+    fn submit_admin_command(&mut self, mut cmd: SubmissionQueueEntry) -> Result<u16, NvmeError> {
+        self.refresh_dma_quarantine();
+        if self.dma_quarantined {
+            return Err(NvmeError::QueueFull);
         }
-        barrier::dma_write();
-
-        self.admin_sq_tail = ((tail + 1) % ADMIN_QUEUE_SIZE) as u16;
-        self.ring_sq_doorbell(0, self.admin_sq_tail);
-
-        (cmd.cdw0 >> 16) as u16 // Return CID
+        let (cid, slot) = self.admin_queue.reserve().ok_or(NvmeError::QueueFull)?;
+        cmd.set_cid(cid);
+        unsafe { ptr::write_volatile(self.admin_sq.add(slot as usize), cmd) };
+        self.admin_sq_dma
+            .sync_for_device(0..self.admin_sq_dma.len(), DmaDirection::ToDevice)
+            .map_err(|_| NvmeError::DmaError)?;
+        self.ring_sq_doorbell(0, self.admin_queue.sq_tail);
+        Ok(cid)
     }
 
-    /// Wait for admin command completion
-    fn wait_admin_completion(&mut self, cid: u16) -> Result<CompletionQueueEntry, NvmeError> {
-        let timeout = Timeout::from_ms(5000); // 5 second timeout for admin commands
+    fn submit_io_command(&mut self, mut cmd: SubmissionQueueEntry) -> Result<u16, NvmeError> {
+        self.refresh_dma_quarantine();
+        if self.dma_quarantined {
+            return Err(NvmeError::QueueFull);
+        }
+        let (cid, slot) = self.io_queue.reserve().ok_or(NvmeError::QueueFull)?;
+        cmd.set_cid(cid);
+        unsafe { ptr::write_volatile(self.io_sq.add(slot as usize), cmd) };
+        let dma = self.io_sq_dma.as_ref().ok_or(NvmeError::NotReady)?;
+        dma.sync_for_device(0..dma.len(), DmaDirection::ToDevice)
+            .map_err(|_| NvmeError::DmaError)?;
+        self.ring_sq_doorbell(1, self.io_queue.sq_tail);
+        Ok(cid)
+    }
 
-        while !timeout.is_expired() {
+    fn drain_cq(
+        cq: *mut CompletionQueueEntry,
+        state: &mut QueueState,
+        queue_id: u16,
+        requested_cid: Option<u16>,
+    ) -> (Option<CompletionQueueEntry>, bool) {
+        let mut requested = None;
+        let mut drained = false;
+        for _ in 0..state.depth {
+            let head = state.cq_head as usize;
+            let observed = unsafe { ptr::read_volatile(cq.add(head)) };
+            if observed.phase() != state.cq_phase {
+                break;
+            }
             barrier::dma_read();
-            let head = self.admin_cq_head as usize;
-            let entry = unsafe { ptr::read_volatile(self.admin_cq.add(head)) };
-
-            if entry.phase() == self.admin_cq_phase && entry.cid() == cid {
-                // Advance head
-                self.admin_cq_head = ((head + 1) % ADMIN_QUEUE_SIZE) as u16;
-                if self.admin_cq_head == 0 {
-                    self.admin_cq_phase = !self.admin_cq_phase;
+            let entry = unsafe { ptr::read_volatile(cq.add(head)) };
+            if entry.phase() != state.cq_phase {
+                break;
+            }
+            let cid = entry.cid();
+            let sq_head = if entry.sq_id() == queue_id {
+                entry.sq_head()
+            } else {
+                log::error!(
+                    "NVMe CQ{}: completion CID {} reported unexpected SQID {}",
+                    queue_id,
+                    cid,
+                    entry.sq_id()
+                );
+                state.sq_head
+            };
+            match state.retire(cid, sq_head) {
+                Some(pending) if pending.timed_out => {
+                    log::warn!("NVMe CQ{}: consumed late completion CID {}", queue_id, cid);
                 }
-                self.ring_cq_doorbell(0, self.admin_cq_head);
+                Some(_) => {}
+                None => log::warn!(
+                    "NVMe CQ{}: consumed completion for untracked CID {}",
+                    queue_id,
+                    cid
+                ),
+            }
+            if requested_cid == Some(cid) {
+                requested = Some(entry);
+            }
+            state.advance_cq();
+            drained = true;
+        }
+        (requested, drained)
+    }
 
-                if entry.is_error() {
-                    return Err(NvmeError::CommandFailed(
+    fn refresh_dma_quarantine(&mut self) {
+        if self
+            .admin_cq_dma
+            .sync_for_cpu(0..self.admin_cq_dma.len(), DmaDirection::FromDevice)
+            .is_err()
+        {
+            self.dma_quarantined = true;
+            return;
+        }
+        let (admin_entry, admin_drained) =
+            Self::drain_cq(self.admin_cq, &mut self.admin_queue, 0, None);
+        debug_assert!(admin_entry.is_none());
+        if admin_drained {
+            self.ring_cq_doorbell(0, self.admin_queue.cq_head);
+        }
+        if !self.io_cq.is_null() {
+            let Some(io_cq_dma) = self.io_cq_dma.as_ref() else {
+                self.dma_quarantined = true;
+                return;
+            };
+            if io_cq_dma
+                .sync_for_cpu(0..io_cq_dma.len(), DmaDirection::FromDevice)
+                .is_err()
+            {
+                self.dma_quarantined = true;
+                return;
+            }
+            let (io_entry, io_drained) = Self::drain_cq(self.io_cq, &mut self.io_queue, 1, None);
+            debug_assert!(io_entry.is_none());
+            if io_drained {
+                self.ring_cq_doorbell(1, self.io_queue.cq_head);
+            }
+        }
+        self.dma_quarantined = self
+            .admin_queue
+            .pending()
+            .chain(self.io_queue.pending())
+            .any(|pending| pending.timed_out);
+    }
+
+    fn wait_completion(
+        &mut self,
+        queue_id: u16,
+        cid: u16,
+    ) -> Result<CompletionQueueEntry, NvmeError> {
+        let timeout = Timeout::from_ms(COMMAND_TIMEOUT_MS);
+        while !timeout.is_expired() {
+            let (entry, drained, head) = if queue_id == 0 {
+                self.admin_cq_dma
+                    .sync_for_cpu(0..self.admin_cq_dma.len(), DmaDirection::FromDevice)
+                    .map_err(|_| NvmeError::DmaError)?;
+                let (entry, drained) =
+                    Self::drain_cq(self.admin_cq, &mut self.admin_queue, 0, Some(cid));
+                (entry, drained, self.admin_queue.cq_head)
+            } else {
+                let dma = self.io_cq_dma.as_ref().ok_or(NvmeError::NotReady)?;
+                dma.sync_for_cpu(0..dma.len(), DmaDirection::FromDevice)
+                    .map_err(|_| NvmeError::DmaError)?;
+                let (entry, drained) = Self::drain_cq(self.io_cq, &mut self.io_queue, 1, Some(cid));
+                (entry, drained, self.io_queue.cq_head)
+            };
+            if drained {
+                self.ring_cq_doorbell(queue_id, head);
+            }
+            if let Some(entry) = entry {
+                return if entry.is_error() {
+                    Err(NvmeError::CommandFailed(
                         entry.status_code_type(),
                         entry.status_code(),
-                    ));
-                }
-                return Ok(entry);
+                    ))
+                } else {
+                    Ok(entry)
+                };
             }
             core::hint::spin_loop();
+        }
+        let state = if queue_id == 0 {
+            &mut self.admin_queue
+        } else {
+            &mut self.io_queue
+        };
+        state.mark_timed_out(cid);
+        self.dma_quarantined = true;
+        let regs = unsafe { &*self.regs };
+        let current = unsafe {
+            ptr::read_volatile(if queue_id == 0 {
+                self.admin_cq.add(state.cq_head as usize)
+            } else {
+                self.io_cq.add(state.cq_head as usize)
+            })
+        };
+        log::error!(
+            "NVMe {} CQ timeout: requested CID={}, SQ head/tail={}/{}, CQ head/phase={}/{}, CSTS={:#x}, CQE cid={} phase={}",
+            self.pci_address,
+            cid,
+            state.sq_head,
+            state.sq_tail,
+            state.cq_head,
+            state.cq_phase as u8,
+            regs.csts.get(),
+            current.cid(),
+            current.phase() as u8
+        );
+        for pending in state.pending() {
+            log::error!(
+                "NVMe pending CID={} timed_out={}",
+                pending.cid,
+                pending.timed_out
+            );
         }
         Err(NvmeError::Timeout)
     }
 
+    fn wait_admin_completion(&mut self, cid: u16) -> Result<CompletionQueueEntry, NvmeError> {
+        self.wait_completion(0, cid)
+    }
+
+    fn wait_io_completion(&mut self, cid: u16) -> Result<CompletionQueueEntry, NvmeError> {
+        self.wait_completion(1, cid)
+    }
+
     /// Identify the controller
     fn identify_controller(&mut self) -> Result<(), NvmeError> {
-        // Allocate a page for identify data
-        let identify_mem = efi::allocate_pages(1).ok_or(NvmeError::AllocationFailed)?;
-        let identify_addr = identify_mem.as_ptr() as u64;
-
-        // Build identify command
+        self.identify.as_mut_slice().fill(0);
+        let identify_addr = self.identify.dma_address();
+        self.identify
+            .sync_for_device(0..self.identify.len(), DmaDirection::FromDevice)
+            .map_err(|_| NvmeError::DmaError)?;
         let mut cmd = SubmissionQueueEntry::new();
         cmd.set_opcode(admin_cmd::IDENTIFY);
-        cmd.set_cid(self.next_command_id());
-        cmd.nsid = 0;
         cmd.prp1 = identify_addr;
-        cmd.cdw10 = 0x01; // CNS = 01 (Identify Controller)
-
-        let cid = self.submit_admin_command(&cmd);
+        cmd.cdw10 = 0x01;
+        let cid = self.submit_admin_command(cmd)?;
         self.wait_admin_completion(cid)?;
-
-        // Parse identify data
-        let ctrl = unsafe { &*(identify_mem.as_ptr() as *const IdentifyController) };
-
-        // Extract model and serial number
+        self.identify
+            .sync_for_cpu(0..self.identify.len(), DmaDirection::FromDevice)
+            .map_err(|_| NvmeError::DmaError)?;
+        let ctrl = unsafe { &*(identify_addr as *const IdentifyController) };
         let model = core::str::from_utf8(&ctrl.mn).unwrap_or("Unknown").trim();
         let serial = core::str::from_utf8(&ctrl.sn).unwrap_or("Unknown").trim();
         let firmware = core::str::from_utf8(&ctrl.fr).unwrap_or("Unknown").trim();
-
         log::info!(
             "NVMe Controller: {} (S/N: {}, FW: {})",
             model,
             serial,
             firmware
         );
-
-        // Free the identify data page
-        efi::free_pages(identify_mem, 1);
-
         Ok(())
     }
 
     /// Create I/O submission and completion queues
     fn create_io_queues(&mut self) -> Result<(), NvmeError> {
-        // Allocate I/O queues
-        let io_sq_mem = efi::allocate_pages(1).ok_or(NvmeError::AllocationFailed)?;
-        io_sq_mem.fill(0);
-        self.io_sq = io_sq_mem.as_mut_ptr() as *mut SubmissionQueueEntry;
-
-        let io_cq_mem = efi::allocate_pages(1).ok_or(NvmeError::AllocationFailed)?;
-        io_cq_mem.fill(0);
-        self.io_cq = io_cq_mem.as_mut_ptr() as *mut CompletionQueueEntry;
+        let io_sq_dma = DmaBuffer::allocate(
+            usize::from(self.io_queue.depth) * core::mem::size_of::<SubmissionQueueEntry>(),
+            DmaMask::bits64(),
+            DmaCoherency::Coherent,
+        )
+        .map_err(|_| NvmeError::AllocationFailed)?;
+        let io_cq_dma = DmaBuffer::allocate(
+            usize::from(self.io_queue.depth) * core::mem::size_of::<CompletionQueueEntry>(),
+            DmaMask::bits64(),
+            DmaCoherency::Coherent,
+        )
+        .map_err(|_| NvmeError::AllocationFailed)?;
+        self.io_sq = io_sq_dma.dma_address() as *mut SubmissionQueueEntry;
+        self.io_cq = io_cq_dma.dma_address() as *mut CompletionQueueEntry;
+        self.io_sq_dma = Some(io_sq_dma);
+        self.io_cq_dma = Some(io_cq_dma);
 
         // Create I/O Completion Queue (queue ID = 1)
         let mut cmd = SubmissionQueueEntry::new();
         cmd.set_opcode(admin_cmd::CREATE_CQ);
-        cmd.set_cid(self.next_command_id());
         cmd.prp1 = self.io_cq as u64;
-        cmd.cdw10 = ((IO_QUEUE_SIZE - 1) as u32) << 16 | 1; // QSIZE | QCQID
+        cmd.cdw10 = (u32::from(self.io_queue.depth - 1) << 16) | 1; // QSIZE | QCQID
         cmd.cdw11 = 0x01; // PC=1 (physically contiguous), IEN=0, IV=0
 
-        let cid = self.submit_admin_command(&cmd);
+        let cid = self.submit_admin_command(cmd)?;
         self.wait_admin_completion(cid)?;
         log::debug!("Created I/O completion queue 1");
 
         // Create I/O Submission Queue (queue ID = 1)
         let mut cmd = SubmissionQueueEntry::new();
         cmd.set_opcode(admin_cmd::CREATE_SQ);
-        cmd.set_cid(self.next_command_id());
         cmd.prp1 = self.io_sq as u64;
-        cmd.cdw10 = ((IO_QUEUE_SIZE - 1) as u32) << 16 | 1; // QSIZE | QSQID
+        cmd.cdw10 = (u32::from(self.io_queue.depth - 1) << 16) | 1; // QSIZE | QSQID
         cmd.cdw11 = (1 << 16) | 0x01; // CQID=1 | PC=1
 
-        let cid = self.submit_admin_command(&cmd);
+        let cid = self.submit_admin_command(cmd)?;
         self.wait_admin_completion(cid)?;
         log::debug!("Created I/O submission queue 1");
 
@@ -851,75 +1078,95 @@ impl NvmeController {
 
     /// Identify namespaces
     fn identify_namespaces(&mut self) -> Result<(), NvmeError> {
-        // Allocate a page for identify data
-        let identify_mem = efi::allocate_pages(1).ok_or(NvmeError::AllocationFailed)?;
-        let identify_addr = identify_mem.as_ptr() as u64;
-
-        // Get active namespace list
+        let mut largest_block = 0usize;
+        let identify_addr = self.identify.dma_address();
+        self.identify.as_mut_slice().fill(0);
+        self.identify
+            .sync_for_device(0..self.identify.len(), DmaDirection::FromDevice)
+            .map_err(|_| NvmeError::DmaError)?;
         let mut cmd = SubmissionQueueEntry::new();
         cmd.set_opcode(admin_cmd::IDENTIFY);
-        cmd.set_cid(self.next_command_id());
-        cmd.nsid = 0;
         cmd.prp1 = identify_addr;
-        cmd.cdw10 = 0x02; // CNS = 02 (Active Namespace ID list)
-
-        let cid = self.submit_admin_command(&cmd);
+        cmd.cdw10 = 0x02;
+        let cid = self.submit_admin_command(cmd)?;
         self.wait_admin_completion(cid)?;
+        self.identify
+            .sync_for_cpu(0..self.identify.len(), DmaDirection::FromDevice)
+            .map_err(|_| NvmeError::DmaError)?;
+        let mut namespace_ids = [0u32; 1024];
+        namespace_ids.copy_from_slice(unsafe {
+            core::slice::from_raw_parts(identify_addr as *const u32, 1024)
+        });
 
-        // Parse namespace list
-        let ns_list =
-            unsafe { core::slice::from_raw_parts(identify_mem.as_ptr() as *const u32, 1024) };
-
-        for &nsid in ns_list.iter() {
-            if nsid == 0 {
-                break;
-            }
-
-            // Identify this namespace
+        for nsid in namespace_ids.into_iter().take_while(|nsid| *nsid != 0) {
+            self.identify.as_mut_slice().fill(0);
+            self.identify
+                .sync_for_device(0..self.identify.len(), DmaDirection::FromDevice)
+                .map_err(|_| NvmeError::DmaError)?;
             let mut cmd = SubmissionQueueEntry::new();
             cmd.set_opcode(admin_cmd::IDENTIFY);
-            cmd.set_cid(self.next_command_id());
             cmd.nsid = nsid;
             cmd.prp1 = identify_addr;
-            cmd.cdw10 = 0x00; // CNS = 00 (Identify Namespace)
-
-            let cid = self.submit_admin_command(&cmd);
+            let cid = self.submit_admin_command(cmd)?;
             self.wait_admin_completion(cid)?;
-
-            let ns = unsafe { &*(identify_mem.as_ptr() as *const IdentifyNamespace) };
-            let lba_format_idx = ns.flbas & 0x0F;
-            let lba_format = ns.lbaf[lba_format_idx as usize];
-            let lba_data_size = (lba_format >> 16) & 0xFF;
-            let block_size = 1u32 << lba_data_size;
-
+            self.identify
+                .sync_for_cpu(0..self.identify.len(), DmaDirection::FromDevice)
+                .map_err(|_| NvmeError::DmaError)?;
+            let ns = unsafe { &*(identify_addr as *const IdentifyNamespace) };
+            if ns.nsze == 0 {
+                log::warn!("NVMe namespace {} has zero size; skipping", nsid);
+                continue;
+            }
+            let Some(block_size) = decode_lba_size(ns.flbas, ns.nlbaf, &ns.lbaf) else {
+                log::warn!(
+                    "NVMe namespace {} has unsupported LBA/metadata format",
+                    nsid
+                );
+                continue;
+            };
+            let max_transfer = max_prp_transfer(self.controller_page_size)
+                .ok_or(NvmeError::UnsupportedLbaFormat)?;
+            if block_size as usize > max_transfer {
+                log::warn!(
+                    "NVMe namespace {} LBA size {} exceeds PRP limit {}",
+                    nsid,
+                    block_size,
+                    max_transfer
+                );
+                continue;
+            }
+            largest_block = largest_block.max(block_size as usize);
             let namespace = NvmeNamespace {
                 nsid,
                 num_blocks: ns.nsze,
                 block_size,
             };
-
+            let size_mb = namespace
+                .num_blocks
+                .saturating_mul(u64::from(namespace.block_size))
+                / (1024 * 1024);
             log::info!(
                 "NVMe Namespace {}: {} blocks x {} bytes = {} MB",
                 nsid,
                 namespace.num_blocks,
                 namespace.block_size,
-                (namespace.num_blocks * namespace.block_size as u64) / (1024 * 1024)
+                size_mb
             );
-
             if self.namespaces.push(namespace).is_err() {
-                log::warn!(
-                    "NVMe: Failed to add namespace {} - namespace list full",
-                    nsid
-                );
+                log::warn!("NVMe: namespace list full; skipping namespace {}", nsid);
             }
         }
-
-        efi::free_pages(identify_mem, 1);
-
         if self.namespaces.is_empty() {
             return Err(NvmeError::NoNamespaces);
         }
-
+        self.staging = Some(
+            DmaBuffer::allocate(
+                largest_block.max(CONTROLLER_PAGE_SIZE),
+                DmaMask::bits64(),
+                DmaCoherency::Coherent,
+            )
+            .map_err(|_| NvmeError::AllocationFailed)?,
+        );
         Ok(())
     }
 
@@ -936,63 +1183,6 @@ impl NvmeController {
     /// Get the PCI address of this controller
     pub fn pci_address(&self) -> PciAddress {
         self.pci_address
-    }
-
-    /// Submit an I/O command
-    fn submit_io_command(&mut self, cmd: &SubmissionQueueEntry) -> u16 {
-        let tail = self.io_sq_tail as usize;
-        unsafe {
-            ptr::write_volatile(self.io_sq.add(tail), *cmd);
-        }
-        barrier::dma_write();
-
-        self.io_sq_tail = ((tail + 1) % IO_QUEUE_SIZE) as u16;
-        self.ring_sq_doorbell(1, self.io_sq_tail);
-
-        (cmd.cdw0 >> 16) as u16 // Return CID
-    }
-
-    /// Wait for I/O command completion
-    fn wait_io_completion(&mut self, cid: u16) -> Result<CompletionQueueEntry, NvmeError> {
-        let timeout = Timeout::from_ms(5000); // 5 second timeout for I/O
-        while !timeout.is_expired() {
-            barrier::dma_read();
-
-            let head = self.io_cq_head as usize;
-            let entry = unsafe { ptr::read_volatile(self.io_cq.add(head)) };
-
-            if entry.phase() == self.io_cq_phase && entry.cid() == cid {
-                // Advance head
-                self.io_cq_head = ((head + 1) % IO_QUEUE_SIZE) as u16;
-                if self.io_cq_head == 0 {
-                    self.io_cq_phase = !self.io_cq_phase;
-                }
-                self.ring_cq_doorbell(1, self.io_cq_head);
-
-                if entry.is_error() {
-                    return Err(NvmeError::CommandFailed(
-                        entry.status_code_type(),
-                        entry.status_code(),
-                    ));
-                }
-                return Ok(entry);
-            }
-
-            core::hint::spin_loop();
-        }
-
-        let head = self.io_cq_head as usize;
-        let entry = unsafe { ptr::read_volatile(self.io_cq.add(head)) };
-        log::error!(
-            "NVMe I/O timeout! cid={}, cq_head={}, cq_phase={}, entry_phase={}, entry_cid={}, sq_tail={}",
-            cid,
-            head,
-            self.io_cq_phase as u8,
-            entry.phase() as u8,
-            entry.cid(),
-            self.io_sq_tail,
-        );
-        Err(NvmeError::Timeout)
     }
 
     /// Read sectors from a namespace.
@@ -1015,37 +1205,34 @@ impl NvmeController {
         let ns = self
             .get_namespace(nsid)
             .ok_or(NvmeError::InvalidNamespace)?;
-        let block_size = ns.block_size;
-
+        let block_size = ns.block_size as usize;
+        let namespace_blocks = ns.num_blocks;
         if num_sectors == 0 || buffer.is_null() {
             return Err(NvmeError::InvalidParameter);
         }
-
-        let transfer_size = (num_sectors as u64)
-            .checked_mul(block_size as u64)
+        let end_lba = start_lba
+            .checked_add(u64::from(num_sectors))
             .ok_or(NvmeError::InvalidParameter)?;
-
-        // Our DMA buffer is one page (4096 bytes), so we can only transfer up to 4KB at a time
-        // For larger transfers, we need to loop
-        if transfer_size > 4096 {
-            // Handle large transfers by reading one page at a time
-            let sectors_per_page = 4096 / block_size;
-            let mut remaining_sectors = num_sectors;
-            let mut current_lba = start_lba;
-            let mut current_buffer = buffer;
-            while remaining_sectors > 0 {
-                let sectors_this_read = core::cmp::min(remaining_sectors, sectors_per_page);
-
-                self.read_sectors_internal(nsid, current_lba, sectors_this_read, current_buffer)?;
-                remaining_sectors -= sectors_this_read;
-                current_lba += sectors_this_read as u64;
-                current_buffer =
-                    unsafe { current_buffer.add((sectors_this_read * block_size) as usize) };
-            }
-            return Ok(());
+        if end_lba > namespace_blocks {
+            return Err(NvmeError::InvalidParameter);
         }
-
-        self.read_sectors_internal(nsid, start_lba, num_sectors, buffer)
+        let staging_len = self.staging.as_ref().ok_or(NvmeError::NotReady)?.len();
+        let chunk_limit =
+            sectors_per_chunk(block_size, staging_len).ok_or(NvmeError::UnsupportedLbaFormat)?;
+        let mut remaining = num_sectors;
+        let mut current_lba = start_lba;
+        let mut byte_offset = 0usize;
+        while remaining != 0 {
+            let chunk = remaining.min(chunk_limit);
+            let destination = buffer.wrapping_add(byte_offset);
+            self.read_sectors_internal(nsid, current_lba, chunk, destination)?;
+            remaining -= chunk;
+            current_lba += u64::from(chunk);
+            byte_offset = byte_offset
+                .checked_add(chunk as usize * block_size)
+                .ok_or(NvmeError::InvalidParameter)?;
+        }
+        Ok(())
     }
 
     /// Internal read function that uses the page-aligned DMA buffer.
@@ -1059,40 +1246,64 @@ impl NvmeController {
         num_sectors: u32,
         buffer: *mut u8,
     ) -> Result<(), NvmeError> {
-        let ns = self
+        let block_size = self
             .get_namespace(nsid)
-            .ok_or(NvmeError::InvalidNamespace)?;
-        let block_size = ns.block_size;
+            .ok_or(NvmeError::InvalidNamespace)?
+            .block_size as usize;
         let transfer_size = (num_sectors as usize)
-            .checked_mul(block_size as usize)
+            .checked_mul(block_size)
             .ok_or(NvmeError::InvalidParameter)?;
-
-        // Guard against DMA buffer overflow — the DMA buffer is exactly one page (4096 bytes)
-        if transfer_size > 4096 {
+        if num_sectors == 0 || num_sectors > 65536 || buffer.is_null() {
             return Err(NvmeError::InvalidParameter);
         }
 
-        // Use our page-aligned DMA buffer to avoid corruption from misaligned caller buffers
-        // The DMA buffer is guaranteed to be 4KB aligned by allocate_pages()
+        let (prp1, prp2) = {
+            let staging = self.staging.as_ref().ok_or(NvmeError::NotReady)?;
+            if transfer_size > staging.len() {
+                return Err(NvmeError::InvalidParameter);
+            }
+            let list_address = self.prp_list.dma_address();
+            let list = unsafe {
+                core::slice::from_raw_parts_mut(
+                    list_address as *mut u64,
+                    self.controller_page_size / core::mem::size_of::<u64>(),
+                )
+            };
+            let prps = build_prps(
+                staging.dma_address(),
+                transfer_size,
+                self.controller_page_size,
+                list_address,
+                list,
+            )
+            .ok_or(NvmeError::UnsupportedLbaFormat)?;
+            self.prp_list
+                .sync_for_device(0..self.prp_list.len(), DmaDirection::ToDevice)
+                .map_err(|_| NvmeError::DmaError)?;
+            staging
+                .sync_for_device(0..transfer_size, DmaDirection::FromDevice)
+                .map_err(|_| NvmeError::DmaError)?;
+            (prps.prp1, prps.prp2)
+        };
+
         let mut cmd = SubmissionQueueEntry::new();
         cmd.set_opcode(io_cmd::READ);
-        let cid_val = self.next_command_id();
-        cmd.set_cid(cid_val);
         cmd.nsid = nsid;
-        cmd.prp1 = self.dma_buffer as u64; // Use aligned DMA buffer
-
+        cmd.prp1 = prp1;
+        cmd.prp2 = prp2;
         cmd.cdw10 = start_lba as u32;
         cmd.cdw11 = (start_lba >> 32) as u32;
-        cmd.cdw12 = num_sectors - 1; // Number of logical blocks (0-based)
+        cmd.cdw12 = num_sectors - 1;
 
-        let cid = self.submit_io_command(&cmd);
+        let cid = self.submit_io_command(cmd)?;
         self.wait_io_completion(cid)?;
-
-        // Copy data from DMA buffer to caller's buffer
+        let staging = self.staging.as_ref().ok_or(NvmeError::NotReady)?;
+        staging
+            .sync_for_cpu(0..transfer_size, DmaDirection::FromDevice)
+            .map_err(|_| NvmeError::DmaError)?;
         unsafe {
-            ptr::copy_nonoverlapping(self.dma_buffer, buffer, transfer_size);
+            ptr::copy_nonoverlapping(staging.dma_address() as *const u8, buffer, transfer_size);
         }
-
         Ok(())
     }
 
@@ -1154,13 +1365,19 @@ impl NvmeController {
         // CDW11: Allocation Length (transfer length in dwords)
         let mut cmd = SubmissionQueueEntry::new();
         cmd.set_opcode(admin_cmd::SECURITY_RECEIVE);
-        cmd.set_cid(self.next_command_id());
+        let staging = self.staging.as_ref().ok_or(NvmeError::NotReady)?;
+        if buffer.len() > staging.len() {
+            return Err(NvmeError::InvalidParameter);
+        }
+        staging
+            .sync_for_device(0..buffer.len(), DmaDirection::FromDevice)
+            .map_err(|_| NvmeError::DmaError)?;
         cmd.nsid = nsid;
-        cmd.prp1 = self.dma_buffer as u64;
+        cmd.prp1 = staging.dma_address();
         cmd.cdw10 = ((protocol_id as u32) << 24) | (sp_specific as u32);
         cmd.cdw11 = buffer.len() as u32; // Allocation length in bytes per NVMe spec
 
-        let cid = self.submit_admin_command(&cmd);
+        let cid = self.submit_admin_command(cmd)?;
         let completion = self.wait_admin_completion(cid)?;
 
         // The completion DW0 contains the number of bytes transferred (for some implementations)
@@ -1171,9 +1388,16 @@ impl NvmeController {
             buffer.len()
         };
 
-        // Copy data from DMA buffer to caller's buffer
+        let staging = self.staging.as_ref().ok_or(NvmeError::NotReady)?;
+        staging
+            .sync_for_cpu(0..bytes_transferred, DmaDirection::FromDevice)
+            .map_err(|_| NvmeError::DmaError)?;
         unsafe {
-            ptr::copy_nonoverlapping(self.dma_buffer, buffer.as_mut_ptr(), bytes_transferred);
+            ptr::copy_nonoverlapping(
+                staging.dma_address() as *const u8,
+                buffer.as_mut_ptr(),
+                bytes_transferred,
+            );
         }
 
         log::debug!(
@@ -1202,7 +1426,7 @@ impl NvmeController {
         sp_specific: u16,
         buffer: &[u8],
     ) -> Result<(), NvmeError> {
-        if buffer.len() > 4096 {
+        if buffer.is_empty() || buffer.len() > 4096 {
             return Err(NvmeError::InvalidParameter);
         }
 
@@ -1214,23 +1438,27 @@ impl NvmeController {
             buffer.len()
         );
 
-        // Copy data to DMA buffer
-        unsafe {
-            ptr::copy_nonoverlapping(buffer.as_ptr(), self.dma_buffer, buffer.len());
+        let staging = self.staging.as_mut().ok_or(NvmeError::NotReady)?;
+        if buffer.len() > staging.len() {
+            return Err(NvmeError::InvalidParameter);
         }
+        staging.as_mut_slice()[..buffer.len()].copy_from_slice(buffer);
+        staging
+            .sync_for_device(0..buffer.len(), DmaDirection::ToDevice)
+            .map_err(|_| NvmeError::DmaError)?;
+        let staging_address = staging.dma_address();
 
         // Build security send command
         // CDW10: Security Protocol ID (bits 31:24), reserved (bits 23:16), SP Specific (bits 15:0)
         // CDW11: Transfer Length (in dwords)
         let mut cmd = SubmissionQueueEntry::new();
         cmd.set_opcode(admin_cmd::SECURITY_SEND);
-        cmd.set_cid(self.next_command_id());
         cmd.nsid = nsid;
-        cmd.prp1 = self.dma_buffer as u64;
+        cmd.prp1 = staging_address;
         cmd.cdw10 = ((protocol_id as u32) << 24) | (sp_specific as u32);
         cmd.cdw11 = buffer.len() as u32; // Transfer length in bytes per NVMe spec
 
-        let cid = self.submit_admin_command(&cmd);
+        let cid = self.submit_admin_command(cmd)?;
         self.wait_admin_completion(cid)?;
 
         log::debug!("NVMe Security Send: success");
@@ -1246,6 +1474,55 @@ impl NvmeController {
     pub fn nvme_version(&self) -> u32 {
         let regs = unsafe { &*self.regs };
         regs.vs.get()
+    }
+
+    fn shutdown_controller(&mut self) {
+        self.refresh_dma_quarantine();
+        let regs = unsafe { &*self.regs };
+        let cc_before = regs.cc.get();
+        let csts_before = regs.csts.get();
+        regs.cc.modify(CC::SHN.val(1));
+        if !wait_for(SHUTDOWN_TIMEOUT_MS, || regs.csts.read(CSTS::SHST) == 2) {
+            log::error!(
+                "NVMe {}: shutdown timeout; leaving CC.EN set until PCI bus mastering is disabled (budget={}ms CC={:#x} CSTS={:#x})",
+                self.pci_address,
+                SHUTDOWN_TIMEOUT_MS,
+                regs.cc.get(),
+                regs.csts.get()
+            );
+        } else {
+            // CAP.TO applies to the ready transition after EN is cleared, not
+            // to normal shutdown completion.
+            regs.cc.modify(CC::EN::CLEAR + CC::SHN.val(0));
+            let disable_budget = cap_timeout_ms(regs.cap.read(CAP::TO));
+            if !wait_for(disable_budget, || regs.csts.read(CSTS::RDY) == 0) {
+                log::error!(
+                    "NVMe {}: HANDOFF UNSAFE, RDY stayed set (budget={}ms CC={:#x} CSTS={:#x}, initial CC={:#x} CSTS={:#x})",
+                    self.pci_address,
+                    disable_budget,
+                    regs.cc.get(),
+                    regs.csts.get(),
+                    cc_before,
+                    csts_before
+                );
+                for pending in self.admin_queue.pending().chain(self.io_queue.pending()) {
+                    log::error!(
+                        "NVMe pending CID={} timed_out={}",
+                        pending.cid,
+                        pending.timed_out
+                    );
+                }
+            } else {
+                self.dma_quarantined = false;
+                log::debug!("NVMe {}: SHST complete and RDY=0", self.pci_address);
+            }
+        }
+        if regs.csts.read(CSTS::CFS) != 0 {
+            log::error!(
+                "NVMe {}: controller fatal status at shutdown",
+                self.pci_address
+            );
+        }
     }
 }
 
@@ -1285,24 +1562,10 @@ pub fn init_device(dev: &pci::PciDevice) -> Result<(), ()> {
 /// Called during ExitBootServices to prepare for OS handoff.
 /// Currently a placeholder — the OS will reset controllers during its own init.
 pub fn shutdown() {
-    // Disable all NVMe controllers before OS handoff.
-    // The Linux NVMe driver resets the controller (CC.EN=0 → wait CSTS.RDY=0)
-    // during probe. If CrabEFI leaves the controller enabled with active queues,
-    // the kernel's reset may hang. Explicitly disable here so the kernel finds
-    // a clean controller state.
     let controllers = NVME_CONTROLLERS.controllers.lock();
     for ctrl_ptr in controllers.iter() {
-        // SAFETY: controller pointer is valid for firmware lifetime
-        let ctrl = unsafe { &*ctrl_ptr.0 };
-        let regs = unsafe { &*ctrl.regs };
-        // Issue shutdown notification (CC.SHN = Normal)
-        regs.cc.modify(CC::SHN.val(1));
-        // Wait for SHST to indicate completion (up to 500ms)
-        let _ = wait_for(500, || regs.csts.read(CSTS::SHST) == 2);
-        // Disable the controller (CC.EN = 0)
-        regs.cc.modify(CC::EN::CLEAR + CC::SHN.val(0));
-        // Wait for RDY=0 (up to 500ms)
-        let _ = wait_for(500, || regs.csts.read(CSTS::RDY) == 0);
+        // SAFETY: the registry lock excludes controller users during handoff.
+        unsafe { &mut *ctrl_ptr.0 }.shutdown_controller();
     }
     drop(controllers);
     NVME_CONTROLLERS.shutdown_log();
