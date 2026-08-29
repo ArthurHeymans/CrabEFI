@@ -60,7 +60,7 @@ pub const PAGE_SIZE_USIZE: usize = 4096;
 /// On aarch64: coreboot/TF-A sets up the MMU covering the full address space,
 /// including DRAM at 1TB+ on QEMU SBSA. No artificial cap needed.
 #[cfg(target_arch = "x86_64")]
-const MAX_IDENTITY_MAPPED_ADDRESS: u64 = 0x10_0000_0000; // 64GB
+const MAX_IDENTITY_MAPPED_ADDRESS: u64 = 0x0f_ffff_ffff; // Last byte below 64GB
 #[cfg(target_arch = "aarch64")]
 const MAX_IDENTITY_MAPPED_ADDRESS: u64 = u64::MAX;
 /// On riscv64: No MMU (satp=0), identity mapped — no limit needed.
@@ -1189,43 +1189,31 @@ impl MemoryAllocator {
 
     /// Find free pages that fit the requirements
     fn find_free_pages(&self, num_pages: u64, max_addr: u64) -> Option<u64> {
-        // Check for overflow in size calculation
         let size = num_pages.checked_mul(PAGE_SIZE)?;
 
-        // Limit max_addr to the identity-mapped region.
-        // On x86_64, our page tables only cover the first 64GB, so allocating
-        // above that would cause page faults. On aarch64, the full address
-        // space is mapped and this is a no-op.
+        // EFI AllocateMaxAddress is inclusive: the final byte of the entire
+        // allocation must be no greater than the caller's maximum address.
         #[allow(clippy::unnecessary_min_or_max)]
         let max_addr = max_addr.min(MAX_IDENTITY_MAPPED_ADDRESS);
+        let max_end = max_addr.checked_add(1);
 
-        // Search from high to low addresses (prefer high memory within mapped region)
+        // Search from high to low addresses (prefer high memory within the limit).
         for entry in self.entries.iter().rev() {
-            if entry.get_memory_type() != Some(MemoryType::ConventionalMemory) {
+            if entry.get_memory_type() != Some(MemoryType::ConventionalMemory)
+                || entry.physical_start > max_addr
+            {
                 continue;
             }
 
-            // Skip entries entirely above our limit
-            if entry.physical_start >= max_addr {
+            let usable_end = max_end.map_or(entry.end(), |end| entry.end().min(end));
+            let minimum_end = entry.physical_start.checked_add(size)?;
+            if usable_end < minimum_end {
                 continue;
             }
 
-            let entry_end = entry.end();
-            if entry_end > max_addr {
-                // Can we fit below max_addr within this entry?
-                let usable_end = max_addr.min(entry_end);
-                if usable_end >= entry.physical_start + size {
-                    let addr = (usable_end - size) & !(PAGE_SIZE - 1);
-                    if addr >= entry.physical_start {
-                        return Some(addr);
-                    }
-                }
-            } else if entry.number_of_pages >= num_pages {
-                // Allocate from the end of the region
-                let addr = entry_end - size;
-                if addr >= entry.physical_start {
-                    return Some(addr);
-                }
+            let address = (usable_end - size) & !(PAGE_SIZE - 1);
+            if address >= entry.physical_start {
+                return Some(address);
             }
         }
 
