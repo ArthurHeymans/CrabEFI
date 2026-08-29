@@ -4,6 +4,7 @@
 //! controllers. It supports PCI-based SDHCI controllers and implements the
 //! SD card protocol for reading sectors.
 
+mod logic;
 pub mod regs;
 
 use crate::barrier;
@@ -621,15 +622,20 @@ impl SdhciController {
         // Clear command complete status
         regs.int_status.write(INT_STATUS::CMD_COMPLETE::SET);
 
-        // Read response
-        let response = [
+        // SDHCI strips the CRC/end bit from 136-bit responses and shifts the
+        // payload across its response registers. Normalize R2 once so every
+        // CSD/CID consumer uses canonical bits 127:0 in MSW-first order.
+        let raw_response = [
             regs.response0.get(),
             regs.response1.get(),
             regs.response2.get(),
             regs.response3.get(),
         ];
-
-        Ok(response)
+        Ok(if resp_type == MMC_RSP_R2 {
+            logic::normalize_r2(raw_response)
+        } else {
+            raw_response
+        })
     }
 
     /// Initialize the SD card
@@ -741,10 +747,10 @@ impl SdhciController {
         let cid = self.send_command(MMC_CMD_ALL_SEND_CID, 0, MMC_RSP_R2)?;
         log::debug!(
             "SDHCI: CID: {:08x} {:08x} {:08x} {:08x}",
-            cid[3],
-            cid[2],
+            cid[0],
             cid[1],
-            cid[0]
+            cid[2],
+            cid[3]
         );
 
         // CMD3: SEND_RELATIVE_ADDR (get RCA)
@@ -756,7 +762,7 @@ impl SdhciController {
         // CMD9: SEND_CSD (get card specific data)
         log::debug!("SDHCI: Sending CMD9 (SEND_CSD)");
         let csd = self.send_command(MMC_CMD_SEND_CSD, (self.rca as u32) << 16, MMC_RSP_R2)?;
-        self.parse_csd(&csd);
+        self.parse_csd(&csd)?;
 
         // CMD7: SELECT_CARD (select the card)
         log::debug!("SDHCI: Sending CMD7 (SELECT_CARD)");
@@ -842,10 +848,10 @@ impl SdhciController {
         let cid = self.send_command(MMC_CMD_ALL_SEND_CID, 0, MMC_RSP_R2)?;
         log::debug!(
             "SDHCI: eMMC CID: {:08x} {:08x} {:08x} {:08x}",
-            cid[3],
-            cid[2],
+            cid[0],
             cid[1],
-            cid[0]
+            cid[2],
+            cid[3]
         );
 
         self.rca = EMMC_RCA;
@@ -858,7 +864,7 @@ impl SdhciController {
 
         log::debug!("SDHCI: eMMC CMD9 (SEND_CSD)");
         let csd = self.send_command(MMC_CMD_SEND_CSD, (self.rca as u32) << 16, MMC_RSP_R2)?;
-        self.parse_csd(&csd);
+        self.parse_csd(&csd)?;
 
         log::debug!("SDHCI: eMMC CMD7 (SELECT_CARD)");
         self.send_command(MMC_CMD_SELECT_CARD, (self.rca as u32) << 16, MMC_RSP_R1B)?;
@@ -910,48 +916,29 @@ impl SdhciController {
     }
 
     /// Parse CSD register to get card capacity
-    fn parse_csd(&mut self, csd: &[u32; 4]) {
+    fn parse_csd(&mut self, csd: &[u32; 4]) -> Result<(), SdhciError> {
         log::debug!(
-            "SDHCI: Raw CSD: [{:08x}, {:08x}, {:08x}, {:08x}]",
+            "SDHCI: Canonical CSD: [{:08x}, {:08x}, {:08x}, {:08x}]",
             csd[0],
             csd[1],
             csd[2],
             csd[3]
         );
 
-        let csd_structure = (csd[3] >> 22) & 0x03;
-        log::debug!("SDHCI: CSD_STRUCTURE = {}", csd_structure);
-
-        if csd_structure == 0 {
-            // CSD Version 1.0 (SDSC)
-            let c_size = ((csd[2] & 0x3FF) << 2) | ((csd[1] >> 30) & 0x03);
-            let c_size_mult = (csd[1] >> 15) & 0x07;
-            let read_bl_len = (csd[2] >> 16) & 0x0F;
-
-            let mult = 1u64 << (c_size_mult + 2);
-            let blocknr = (c_size as u64 + 1) * mult;
-            let block_len = 1u64 << read_bl_len;
-
-            self.num_blocks = blocknr * block_len / SD_BLOCK_SIZE as u64;
-            log::debug!(
-                "SDHCI: CSD v1.0: c_size={}, c_size_mult={}, read_bl_len={}",
-                c_size,
-                c_size_mult,
-                read_bl_len
-            );
-        } else {
-            // CSD Version 2.0 (SDHC/SDXC)
-            let c_size = (csd[1] >> 8) & 0x3FFFFF;
-            log::debug!("SDHCI: CSD v2.0: c_size={} (raw bits)", c_size);
-            self.num_blocks = (c_size as u64 + 1) * 1024;
+        let blocks = match self.media {
+            SdhciMedia::Sd => logic::parse_sd_csd(csd),
+            SdhciMedia::Emmc => logic::parse_mmc_csd(csd),
         }
+        .filter(|blocks| *blocks != 0)
+        .ok_or(SdhciError::CardInitFailed)?;
+        self.num_blocks = blocks;
 
         log::debug!(
-            "SDHCI: CSD structure={}, capacity={} blocks ({} MB)",
-            csd_structure,
+            "SDHCI: CSD capacity={} blocks ({} MB)",
             self.num_blocks,
-            (self.num_blocks * 512) / (1024 * 1024)
+            self.num_blocks.saturating_mul(512) / (1024 * 1024)
         );
+        Ok(())
     }
 
     /// Try to enable high-speed mode by negotiating with the card via CMD6
@@ -963,6 +950,7 @@ impl SdhciController {
     fn try_high_speed(&mut self) -> Result<(), SdhciError> {
         // CMD6 argument: [31] Mode (0=check, 1=switch), [3:0] Access Mode (1=high-speed)
         const CMD6_CHECK_HIGH_SPEED: u32 = 0x00FF_FFF1; // Check mode, function group 1 = HS
+        const CMD6_SWITCH_DEFAULT_SPEED: u32 = 0x80FF_FFF0;
         const CMD6_SWITCH_HIGH_SPEED: u32 = 0x80FF_FFF1; // Switch mode, function group 1 = HS
 
         // CMD6 returns 64 bytes (512 bits) of status data. We use the DMA
@@ -970,27 +958,19 @@ impl SdhciController {
         // high-speed.
         self.cmd6_transfer(CMD6_CHECK_HIGH_SPEED)?;
 
-        // Read the 64-byte status from the DMA buffer
-        // Byte 13 (bits [379:376]) contains the function selected for group 1
-        // If the card supports high-speed, it will report function 1
-        let status_byte = unsafe { *self.dma_buffer.add(13) };
-        let selected_function = status_byte & 0x0F;
-
-        if selected_function != 1 {
-            log::debug!(
-                "SDHCI: Card does not support high-speed (function={})",
-                selected_function
-            );
+        // In check mode byte 13 is the function-group-1 support bitmap.
+        let status = unsafe { &*(self.dma_buffer as *const [u8; 64]) };
+        if !logic::cmd6_supports_high_speed(status) {
+            log::debug!("SDHCI: Card does not advertise high-speed support");
             return Err(SdhciError::NotSupported);
         }
 
         // Now send CMD6 in switch mode to actually enable high-speed on the card
         self.cmd6_transfer(CMD6_SWITCH_HIGH_SPEED)?;
 
-        // Verify the switch was successful
-        let status_byte = unsafe { *self.dma_buffer.add(13) };
-        let selected_function = status_byte & 0x0F;
-
+        // In switch mode byte 16 reports the selected group-1 function.
+        let status = unsafe { &*(self.dma_buffer as *const [u8; 64]) };
+        let selected_function = logic::cmd6_selected_function(status);
         if selected_function != 1 {
             log::warn!(
                 "SDHCI: High-speed switch failed (function={})",
@@ -1003,8 +983,26 @@ impl SdhciController {
         let regs = self.regs();
         regs.host_control.modify(HOST_CONTROL::HIGH_SPEED::SET);
 
-        // Set 50 MHz clock
-        self.set_clock(HIGH_SPEED_CLOCK_HZ)?;
+        // Set 50 MHz clock. If the host cannot establish it, restore both the
+        // card and host to default-speed timing before reporting the optional
+        // high-speed negotiation as unsupported.
+        if let Err(error) = self.set_clock(HIGH_SPEED_CLOCK_HZ) {
+            let clock_restored = self.set_clock(DEFAULT_CLOCK_HZ).is_ok();
+            let card_restored =
+                clock_restored && self.cmd6_transfer(CMD6_SWITCH_DEFAULT_SPEED).is_ok();
+            self.regs()
+                .host_control
+                .modify(HOST_CONTROL::HIGH_SPEED::CLEAR);
+            if clock_restored && card_restored {
+                log::warn!("SDHCI: High-speed clock failed; restored default-speed mode");
+                return Err(SdhciError::NotSupported);
+            }
+            log::error!(
+                "SDHCI: Failed to restore default-speed mode after: {:?}",
+                error
+            );
+            return Err(error);
+        }
 
         Ok(())
     }
