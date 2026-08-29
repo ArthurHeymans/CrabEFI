@@ -23,8 +23,12 @@
 //! devices are matched against drivers automatically.
 
 pub mod access;
+pub(crate) mod access_rules;
+pub(crate) mod capability;
+pub(crate) mod command;
 pub mod driver;
 
+pub use access::ConfigAccessError;
 use access::{AnyPciAccess, PciAccess};
 
 use crate::state;
@@ -57,10 +61,6 @@ pub const CLASS_SERIAL: u8 = 0x0C;
 
 /// System peripheral subclasses
 pub const SUBCLASS_SDHCI: u8 = 0x05; // SD Host Controller
-
-/// Invalid vendor ID (no device present)
-const INVALID_VENDOR_ID: u16 = 0xFFFF;
-const ECAM_BYTES_PER_BUS: u64 = 1 << 20;
 
 // ============================================================================
 // Global PCI Access
@@ -239,12 +239,18 @@ fn probe_bar(access: &AnyPciAccess, addr: PciAddress, bar_index: usize) -> PciBa
 }
 
 /// Scan a single device/function and add to device list if valid
-fn scan_device(access: &AnyPciAccess, bus: u8, device: u8, function: u8) -> Option<PciDevice> {
-    let addr = PciAddress::new(0, bus, device, function);
+fn scan_device(
+    access: &AnyPciAccess,
+    segment: u16,
+    bus: u8,
+    device: u8,
+    function: u8,
+) -> Option<PciDevice> {
+    let addr = PciAddress::new(segment, bus, device, function);
     let header = PciHeader::new(addr);
     let (vendor_id, device_id) = header.id(access);
-
-    if vendor_id == INVALID_VENDOR_ID {
+    let id = u32::from(vendor_id) | (u32::from(device_id) << 16);
+    if !access_rules::valid_device_id(id) {
         return None;
     }
 
@@ -279,22 +285,34 @@ fn scan_device(access: &AnyPciAccess, bus: u8, device: u8, function: u8) -> Opti
     Some(dev)
 }
 
-/// Enable bus mastering, memory space, and I/O space for a device
+fn enabled_command(dev: &PciDevice, original: CommandRegister) -> CommandRegister {
+    let has_io = dev
+        .bars
+        .iter()
+        .any(|bar| bar.bar_type == BarType::Io && bar.address != 0);
+    let has_memory = dev.bars.iter().any(|bar| {
+        matches!(bar.bar_type, BarType::Memory32 | BarType::Memory64) && bar.address != 0
+    });
+    CommandRegister::from_bits_retain(command::enabled_command(
+        original.bits(),
+        has_io,
+        has_memory,
+        true,
+    ))
+}
+
+/// Enable only assigned decode types and bus mastering for a DMA driver.
 pub fn enable_device(dev: &PciDevice) {
     with_access(|access| {
         let mut header = PciHeader::new(dev.address);
-        let command = header.command(access);
-        let new_command = command
-            | CommandRegister::IO_ENABLE
-            | CommandRegister::MEMORY_ENABLE
-            | CommandRegister::BUS_MASTER_ENABLE;
-        header.update_command(access, |_| new_command);
-
+        let original = header.command(access);
+        let enabled = enabled_command(dev, original);
+        header.update_command(access, |_| enabled);
         log::debug!(
             "Enabled device {}: cmd {:#06x} -> {:#06x}",
             dev.address,
-            command.bits(),
-            new_command.bits()
+            original.bits(),
+            enabled.bits()
         );
     });
 }
@@ -320,64 +338,59 @@ pub fn write_config16(addr: PciAddress, offset: u16, value: u16) {
 /// enumeration and driver binding).
 pub fn init() {
     log::info!("Initializing PCI subsystem...");
+    let regions = state::drivers().pci.ecam_regions.clone();
+    let new_access = access::create_access(regions.as_slice());
 
-    // Select access method based on ECAM availability
-    let pci_state = &state::drivers().pci;
-    let ecam_base = pci_state.ecam_base;
-    let ecam_size = pci_state.ecam_size;
-    let new_access = access::create_access(ecam_base);
-    let max_bus = max_bus_for_access(ecam_base, ecam_size);
-
-    // Set access method and enumerate devices in one closure so we can
-    // borrow both `pci.access` and `pci.devices` without aliasing issues.
     state::with_drivers_mut(|drivers| {
-        drivers.pci.access = new_access;
         let pci = &mut drivers.pci;
+        pci.access = new_access;
         pci.devices.clear();
-        if let Some(max_bus) = max_bus {
-            enumerate_devices(&pci.access, &mut pci.devices, max_bus);
+        match &pci.access {
+            AnyPciAccess::Unavailable => log::info!("PCI enumeration skipped: unavailable"),
+            AnyPciAccess::IoCam(_) => {
+                enumerate_region(&pci.access, &mut pci.devices, 0, 0, u8::MAX)
+            }
+            AnyPciAccess::Ecam(ecam) => {
+                let regions = ecam.regions();
+                for region in regions {
+                    log::debug!(
+                        "PCI: enumerating segment {} buses {:02x}-{:02x}",
+                        region.segment,
+                        region.bus_start,
+                        region.bus_end
+                    );
+                    enumerate_region(
+                        &pci.access,
+                        &mut pci.devices,
+                        region.segment,
+                        region.bus_start,
+                        region.bus_end,
+                    );
+                    if pci.devices.is_full() {
+                        break;
+                    }
+                }
+            }
         }
+        log::info!(
+            "PCI enumeration complete: {} devices found",
+            pci.devices.len()
+        );
     });
 }
 
-fn max_bus_for_access(ecam_base: Option<u64>, ecam_size: Option<u64>) -> Option<u8> {
-    if ecam_base.is_none() {
-        return Some(u8::MAX);
-    }
-
-    let Some(size) = ecam_size else {
-        log::warn!("PCI ECAM size unknown; scanning all 256 buses");
-        return Some(u8::MAX);
-    };
-
-    let bus_count = size / ECAM_BYTES_PER_BUS;
-    if bus_count == 0 {
-        log::warn!(
-            "PCI ECAM window size {:#x} is smaller than one bus; skipping enumeration",
-            size
-        );
-        return None;
-    }
-
-    let max_bus = (bus_count.min(256) - 1) as u8;
-    log::debug!(
-        "PCI ECAM window size {:#x}: scanning buses 00-{:02x}",
-        size,
-        max_bus
-    );
-    Some(max_bus)
-}
-
-/// Enumerate all PCI devices
-fn enumerate_devices(
+/// Enumerate one declared PCI segment/bus range.
+fn enumerate_region(
     access: &AnyPciAccess,
     devices: &mut heapless::Vec<PciDevice, { state::MAX_PCI_DEVICES }>,
-    max_bus: u8,
+    segment: u16,
+    bus_start: u8,
+    bus_end: u8,
 ) {
-    for bus in 0..=max_bus {
+    for bus in bus_start..=bus_end {
         for device in 0..32u8 {
             // First check function 0
-            if let Some(dev) = scan_device(access, bus, device, 0) {
+            if let Some(dev) = scan_device(access, segment, bus, device, 0) {
                 let is_multi_function = dev.multi_function;
 
                 log::debug!(
@@ -397,7 +410,7 @@ fn enumerate_devices(
                 // Check other functions if multi-function
                 if is_multi_function {
                     for function in 1..8u8 {
-                        if let Some(dev) = scan_device(access, bus, device, function) {
+                        if let Some(dev) = scan_device(access, segment, bus, device, function) {
                             log::debug!(
                                 "PCI {}: {:04x}:{:04x} class={:02x}:{:02x}",
                                 dev.address,
@@ -417,8 +430,6 @@ fn enumerate_devices(
             }
         }
     }
-
-    log::info!("PCI enumeration complete: {} devices found", devices.len());
 }
 
 /// Bind drivers to all enumerated PCI devices
@@ -587,55 +598,142 @@ pub fn print_devices() {
     }
 }
 
-/// Set ECAM base address (from ACPI MCFG table)
-pub fn set_ecam_base(base: u64) {
-    set_ecam_region(base, None);
+/// Store validated, non-overlapping ECAM allocations for PCI initialization.
+pub fn set_ecam_regions(regions: &[crate::platform::PciEcamRegion]) {
+    state::with_drivers_mut(|drivers| {
+        let stored = &mut drivers.pci.ecam_regions;
+        stored.clear();
+        for &region in regions {
+            let overlaps = stored.iter().any(|current| {
+                current.segment == region.segment
+                    && current.bus_start <= region.bus_end
+                    && region.bus_start <= current.bus_end
+            });
+            if !region.is_valid() || overlaps {
+                log::warn!("PCI: skipping invalid/overlapping ECAM region {:?}", region);
+                continue;
+            }
+            if stored.push(region).is_err() {
+                log::warn!("PCI: ECAM region capacity exhausted");
+                break;
+            }
+        }
+    });
 }
 
-pub fn set_ecam_region(base: u64, size: Option<u64>) {
-    state::with_drivers_mut(|drivers| {
-        drivers.pci.ecam_base = Some(base);
-        drivers.pci.ecam_size = size;
-    });
-    if let Some(size) = size {
-        log::debug!("ECAM region set to {:#x}+{:#x}", base, size);
-    } else {
-        log::debug!("ECAM base set to {:#x} (size unknown)", base);
-    }
+// ============================================================================
+// Bounded conventional capability walking
+// ============================================================================
+
+/// Find a conventional PCI capability using the header's initial pointer.
+pub fn find_capability(
+    addr: PciAddress,
+    capability_id: u8,
+) -> Result<Option<u8>, ConfigAccessError> {
+    with_access(|access| {
+        let status = access.try_read16(addr, 0x06)?;
+        let header_type = access.try_read8(addr, 0x0e)?;
+        let Some(pointer_offset) = capability::capability_pointer_offset(status, header_type)
+        else {
+            return Ok(None);
+        };
+        let start = access.try_read8(addr, pointer_offset)?;
+        capability::find_capability_from(start, capability_id, access.max_offset(), |offset| {
+            access.try_read32(addr, offset)
+        })
+    })
+}
+
+/// Find a conventional PCI capability from a controller-supplied start pointer.
+pub fn find_capability_from(
+    addr: PciAddress,
+    start: u8,
+    capability_id: u8,
+) -> Result<Option<u8>, ConfigAccessError> {
+    with_access(|access| {
+        if access.try_read16(addr, 0x06)? & (1 << 4) == 0 {
+            return Ok(None);
+        }
+        capability::find_capability_from(start, capability_id, access.max_offset(), |offset| {
+            access.try_read32(addr, offset)
+        })
+    })
 }
 
 // ============================================================================
 // Public PCI Configuration Space Access (via trait)
 // ============================================================================
 
-/// Read a 32-bit value from PCI configuration space
-pub fn read_config_u32(addr: PciAddress, offset: u8) -> u32 {
-    with_access(|access| access.read32(addr, offset as u16))
+/// Read a checked 32-bit value from PCI configuration space.
+pub fn try_read_config_u32(addr: PciAddress, offset: u16) -> Result<u32, ConfigAccessError> {
+    with_access(|access| access.try_read32(addr, offset))
 }
 
-/// Write a 32-bit value to PCI configuration space
-pub fn write_config_u32(addr: PciAddress, offset: u8, value: u32) {
-    with_access(|access| access.write32(addr, offset as u16, value))
+/// Write a checked 32-bit value to PCI configuration space.
+pub fn try_write_config_u32(
+    addr: PciAddress,
+    offset: u16,
+    value: u32,
+) -> Result<(), ConfigAccessError> {
+    with_access(|access| access.try_write32(addr, offset, value))
 }
 
-/// Read a 16-bit value from PCI configuration space
-pub fn read_config_u16(addr: PciAddress, offset: u8) -> u16 {
-    with_access(|access| access.read16(addr, offset as u16))
+/// Read a checked 16-bit value from PCI configuration space.
+pub fn try_read_config_u16(addr: PciAddress, offset: u16) -> Result<u16, ConfigAccessError> {
+    with_access(|access| access.try_read16(addr, offset))
 }
 
-/// Write a 16-bit value to PCI configuration space
-pub fn write_config_u16(addr: PciAddress, offset: u8, value: u16) {
-    with_access(|access| access.write16(addr, offset as u16, value))
+/// Write a checked 16-bit value to PCI configuration space.
+pub fn try_write_config_u16(
+    addr: PciAddress,
+    offset: u16,
+    value: u16,
+) -> Result<(), ConfigAccessError> {
+    with_access(|access| access.try_write16(addr, offset, value))
 }
 
-/// Read an 8-bit value from PCI configuration space
-pub fn read_config_u8(addr: PciAddress, offset: u8) -> u8 {
-    with_access(|access| access.read8(addr, offset as u16))
+/// Read a checked 8-bit value from PCI configuration space.
+pub fn try_read_config_u8(addr: PciAddress, offset: u16) -> Result<u8, ConfigAccessError> {
+    with_access(|access| access.try_read8(addr, offset))
 }
 
-/// Write an 8-bit value to PCI configuration space
-pub fn write_config_u8(addr: PciAddress, offset: u8, value: u8) {
-    with_access(|access| access.write8(addr, offset as u16, value))
+/// Write a checked 8-bit value to PCI configuration space.
+pub fn try_write_config_u8(
+    addr: PciAddress,
+    offset: u16,
+    value: u8,
+) -> Result<(), ConfigAccessError> {
+    with_access(|access| access.try_write8(addr, offset, value))
+}
+
+/// Read a 32-bit value, returning all ones after logging an invalid access.
+pub fn read_config_u32(addr: PciAddress, offset: u16) -> u32 {
+    with_access(|access| access.read32(addr, offset))
+}
+
+/// Write a 32-bit value, logging and ignoring an invalid access.
+pub fn write_config_u32(addr: PciAddress, offset: u16, value: u32) {
+    with_access(|access| access.write32(addr, offset, value))
+}
+
+/// Read a 16-bit value, returning all ones on invalid access.
+pub fn read_config_u16(addr: PciAddress, offset: u16) -> u16 {
+    with_access(|access| access.read16(addr, offset))
+}
+
+/// Write a 16-bit value, ignoring an invalid access.
+pub fn write_config_u16(addr: PciAddress, offset: u16, value: u16) {
+    with_access(|access| access.write16(addr, offset, value))
+}
+
+/// Read an 8-bit value, returning all ones on invalid access.
+pub fn read_config_u8(addr: PciAddress, offset: u16) -> u8 {
+    with_access(|access| access.read8(addr, offset))
+}
+
+/// Write an 8-bit value, ignoring an invalid access.
+pub fn write_config_u8(addr: PciAddress, offset: u16, value: u8) {
+    with_access(|access| access.write8(addr, offset, value))
 }
 
 #[cfg(test)]

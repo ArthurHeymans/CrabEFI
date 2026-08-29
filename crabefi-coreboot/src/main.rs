@@ -714,8 +714,7 @@ fn riscv_fdt_only_boot(fdt_ptr: u64, fdt_size: u32) -> ! {
         capsule_backend: None,
         hooks: Some(&hooks),
         rng: None,
-        ecam_base: None,
-        ecam_size: None,
+        ecam_regions: &[],
         runtime_image: runtime_image_source(),
         runtime: runtime_platform_config(),
         tpm_event_log: None,
@@ -1017,8 +1016,7 @@ pub extern "C" fn rust_main(coreboot_table_ptr: u64) -> ! {
         capsule_backend: Some(&mut capsule_backend),
         hooks: Some(&hooks),
         rng: None,
-        ecam_base: None, // May be filled from ACPI MCFG below
-        ecam_size: None,
+        ecam_regions: &[], // ACPI/FDT discovery is selected by the library below.
         runtime_image: runtime_image_source(),
         runtime: runtime_platform_config(),
         // Enable measured boot.
@@ -1176,20 +1174,23 @@ pub extern "C" fn rust_main(coreboot_table_ptr: u64) -> ! {
             && let Some(info) =
                 unsafe { crabefi::fdt::parse(fdt_data.as_ptr() as u64, fdt_data.len() as u32) }
         {
-            if let Some(ecam) = info.ecam_base {
-                config.ecam_base = Some(ecam);
-                config.ecam_size = info.ecam_size;
-                log::info!("ECAM base from FDT: {:#x}", ecam);
+            if let Some(region) = info.ecam_regions().first() {
+                log::info!("ECAM region from FDT: {:?}", region);
                 ecam_found = true;
             }
             // Store FDT info so add_platform_mmio_regions() can read it
             crabefi::state::with_drivers_mut(|d| d.fdt_info = info);
         }
-        // Fallback: use coreboot's configured ECAM base for QEMU virt (0x30000000)
+        // Fallback: use coreboot's configured QEMU-virt ECAM allocation.
         if !ecam_found {
-            config.ecam_base = Some(0x3000_0000);
-            config.ecam_size = Some(0x1000_0000);
-            log::info!("ECAM base from coreboot config: 0x30000000");
+            const FALLBACK: crabefi::PciEcamRegion = crabefi::PciEcamRegion {
+                base: 0x3000_0000,
+                segment: 0,
+                bus_start: 0,
+                bus_end: 0xff,
+            };
+            config.ecam_regions = core::slice::from_ref(&FALLBACK);
+            log::info!("ECAM region from coreboot config: {:?}", FALLBACK);
         }
 
         // Now that fdt_info is populated, register MMIO regions from FDT

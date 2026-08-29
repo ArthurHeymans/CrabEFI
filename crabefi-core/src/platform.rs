@@ -1343,6 +1343,52 @@ pub enum BootResult {
 ///
 /// At minimum, provide `memory_map`, `timer`, `reset`, `runtime_image`, and
 /// `runtime`. Everything else is optional (with reduced functionality).
+/// One standards-compliant PCIe ECAM allocation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PciEcamRegion {
+    /// Physical base corresponding to `bus_start`.
+    pub base: u64,
+    /// PCI segment group number.
+    pub segment: u16,
+    /// First bus represented by this allocation.
+    pub bus_start: u8,
+    /// Last bus represented by this allocation (inclusive).
+    pub bus_end: u8,
+}
+
+impl Default for PciEcamRegion {
+    fn default() -> Self {
+        Self::EMPTY
+    }
+}
+
+impl PciEcamRegion {
+    /// Empty sentinel used by fixed-capacity discovery storage.
+    pub const EMPTY: Self = Self {
+        base: 0,
+        segment: 0,
+        bus_start: 1,
+        bus_end: 0,
+    };
+
+    /// Return the required ECAM window size.
+    pub const fn byte_len(self) -> Option<u64> {
+        if self.base == 0 || self.bus_start > self.bus_end || !self.base.is_multiple_of(1 << 20) {
+            return None;
+        }
+        let buses = self.bus_end as u64 - self.bus_start as u64 + 1;
+        buses.checked_mul(1 << 20)
+    }
+
+    /// Return whether the allocation is aligned, ordered, and non-wrapping.
+    pub const fn is_valid(self) -> bool {
+        match self.byte_len() {
+            Some(size) => self.base.checked_add(size).is_some(),
+            None => false,
+        }
+    }
+}
+
 pub struct PlatformConfig<'a> {
     // ---- Required ----
     /// Physical memory map describing all RAM, MMIO, and reserved regions.
@@ -1410,14 +1456,11 @@ pub struct PlatformConfig<'a> {
     /// Hardware random number generator for `EFI_RNG_PROTOCOL`.
     pub rng: Option<&'a dyn Rng>,
 
-    /// PCI ECAM configuration space base address.
+    /// PCI ECAM allocations supplied directly by the platform.
     ///
-    /// If provided, CrabEFI uses this directly for PCI config space access.
-    /// Otherwise, it discovers the ECAM base from ACPI MCFG or FDT.
-    pub ecam_base: Option<u64>,
-
-    /// Size of the PCI ECAM window in bytes, when `ecam_base` is provided.
-    pub ecam_size: Option<u64>,
+    /// When empty, CrabEFI falls back to ACPI MCFG, then FDT discovery. On
+    /// x86 only, absence of ECAM falls back to legacy segment-0 CF8/CFC.
+    pub ecam_regions: &'a [PciEcamRegion],
 
     // ---- Runtime Support ----
     /// Mandatory normalized separate Runtime Services image.

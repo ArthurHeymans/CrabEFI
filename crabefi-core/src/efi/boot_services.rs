@@ -1658,6 +1658,19 @@ extern "efiapi" fn exit_boot_services(image_handle: Handle, map_key: usize) -> S
         return prepare_status;
     }
 
+    // Event callbacks and MAT rebuilding may have changed the memory map. Do a
+    // final key check before any irreversible hardware quiescence.
+    let key_status = allocator::validate_map_key(map_key);
+    if key_status != Status::SUCCESS {
+        return key_status;
+    }
+
+    // Stop every firmware-owned DMA engine while BootServices allocations are
+    // still typed and cannot yet be reused by the OS. Clearing BME is the final
+    // safety net for devices without complete driver shutdown coverage.
+    crate::drivers::pci::shutdown_drivers();
+    crate::drivers::pci::disable_all_bus_mastering_for_handoff();
+
     let status = allocator::exit_boot_services(map_key);
 
     if status == Status::SUCCESS {
@@ -1673,17 +1686,6 @@ extern "efiapi" fn exit_boot_services(image_handle: Handle, map_key: usize) -> S
         // Clean up hardware state for OS handoff.
         // Re-enable keyboard interrupts so Linux's i8042 driver works.
         crate::drivers::keyboard_common::cleanup();
-
-        // Stop firmware-owned PCI drivers before returning to the OS.  USB and
-        // storage controllers may have DMA rings/bounce buffers allocated from
-        // BootServices memory; after ExitBootServices Linux may immediately
-        // reuse those pages for early stacks or metadata.
-        crate::drivers::pci::shutdown_drivers();
-
-        // Final DMA safety net: regardless of per-driver shutdown coverage,
-        // clear Bus Master Enable on every enumerated PCI function.  Linux will
-        // re-enable bus mastering for drivers it owns.
-        crate::drivers::pci::disable_all_bus_mastering_for_handoff();
 
         // Seal only after the allocator accepted the map key, while boot-time
         // diagnostics are still reachable. A failed seal leaves no safe way to

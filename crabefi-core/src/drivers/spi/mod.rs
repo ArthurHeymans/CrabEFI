@@ -27,31 +27,27 @@ impl CrabEfiPciAccess {
         )
     }
 
-    fn offset_to_u8(
+    fn access_error(
         address: RflasherPciAddress,
         offset: u16,
         write: bool,
-    ) -> rflasher_internal::Result<u8> {
-        if offset > u8::MAX as u16 {
-            let error = if write {
-                rflasher_internal::PciAccessError::ConfigWrite {
-                    bus: address.bus(),
-                    device: address.device(),
-                    function: address.function(),
-                    register: offset,
-                }
-            } else {
-                rflasher_internal::PciAccessError::ConfigRead {
-                    bus: address.bus(),
-                    device: address.device(),
-                    function: address.function(),
-                    register: offset,
-                }
-            };
-            return Err(rflasher_internal::InternalError::PciAccess(error));
-        }
-
-        Ok(offset as u8)
+    ) -> rflasher_internal::InternalError {
+        let error = if write {
+            rflasher_internal::PciAccessError::ConfigWrite {
+                bus: address.bus(),
+                device: address.device(),
+                function: address.function(),
+                register: offset,
+            }
+        } else {
+            rflasher_internal::PciAccessError::ConfigRead {
+                bus: address.bus(),
+                device: address.device(),
+                function: address.function(),
+                register: offset,
+            }
+        };
+        rflasher_internal::InternalError::PciAccess(error)
     }
 }
 
@@ -59,18 +55,18 @@ impl PciConfigAccess for CrabEfiPciAccess {
     type Error = rflasher_internal::InternalError;
 
     fn read8(&self, address: RflasherPciAddress, offset: u16) -> rflasher_internal::Result<u8> {
-        let offset = Self::offset_to_u8(address, offset, false)?;
-        Ok(pci::read_config_u8(Self::addr(address), offset))
+        pci::try_read_config_u8(Self::addr(address), offset)
+            .map_err(|_| Self::access_error(address, offset, false))
     }
 
     fn read16(&self, address: RflasherPciAddress, offset: u16) -> rflasher_internal::Result<u16> {
-        let offset = Self::offset_to_u8(address, offset, false)?;
-        Ok(pci::read_config_u16(Self::addr(address), offset))
+        pci::try_read_config_u16(Self::addr(address), offset)
+            .map_err(|_| Self::access_error(address, offset, false))
     }
 
     fn read32(&self, address: RflasherPciAddress, offset: u16) -> rflasher_internal::Result<u32> {
-        let offset = Self::offset_to_u8(address, offset, false)?;
-        Ok(pci::read_config_u32(Self::addr(address), offset))
+        pci::try_read_config_u32(Self::addr(address), offset)
+            .map_err(|_| Self::access_error(address, offset, false))
     }
 
     fn write8(
@@ -79,9 +75,8 @@ impl PciConfigAccess for CrabEfiPciAccess {
         offset: u16,
         value: u8,
     ) -> rflasher_internal::Result<()> {
-        let offset = Self::offset_to_u8(address, offset, true)?;
-        pci::write_config_u8(Self::addr(address), offset, value);
-        Ok(())
+        pci::try_write_config_u8(Self::addr(address), offset, value)
+            .map_err(|_| Self::access_error(address, offset, true))
     }
 
     fn write16(
@@ -90,9 +85,8 @@ impl PciConfigAccess for CrabEfiPciAccess {
         offset: u16,
         value: u16,
     ) -> rflasher_internal::Result<()> {
-        let offset = Self::offset_to_u8(address, offset, true)?;
-        pci::write_config_u16(Self::addr(address), offset, value);
-        Ok(())
+        pci::try_write_config_u16(Self::addr(address), offset, value)
+            .map_err(|_| Self::access_error(address, offset, true))
     }
 
     fn write32(
@@ -101,9 +95,8 @@ impl PciConfigAccess for CrabEfiPciAccess {
         offset: u16,
         value: u32,
     ) -> rflasher_internal::Result<()> {
-        let offset = Self::offset_to_u8(address, offset, true)?;
-        pci::write_config_u32(Self::addr(address), offset, value);
-        Ok(())
+        pci::try_write_config_u32(Self::addr(address), offset, value)
+            .map_err(|_| Self::access_error(address, offset, true))
     }
 }
 

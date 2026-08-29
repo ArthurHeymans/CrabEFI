@@ -5,6 +5,8 @@
 //!
 //! Uses the `fdt` crate for parsing on aarch64; the module is a no-op on x86.
 
+use crate::platform::PciEcamRegion;
+
 /// Maximum number of devices discovered from DSDT.
 pub const MAX_DSDT_DEVICES: usize = 16;
 
@@ -77,13 +79,16 @@ impl core::fmt::Debug for DsdtDevice {
     }
 }
 
+/// Maximum number of distinct PCI ECAM allocations retained from firmware.
+pub const MAX_ECAM_REGIONS: usize = 8;
+
 /// Platform information extracted from an FDT or ACPI tables.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct PlatformInfo {
-    /// PCIe ECAM configuration space base address
-    pub ecam_base: Option<u64>,
-    /// PCIe ECAM size
-    pub ecam_size: Option<u64>,
+    /// Validated PCIe ECAM allocations.
+    pub ecam_regions: [PciEcamRegion; MAX_ECAM_REGIONS],
+    /// Number of populated ECAM allocations.
+    pub ecam_region_count: usize,
     /// PCIe 32-bit MMIO window (base, size)
     pub pcie_mmio32: Option<(u64, u64)>,
     /// PCIe 64-bit MMIO window (base, size)
@@ -105,8 +110,8 @@ pub struct PlatformInfo {
 impl PlatformInfo {
     pub const fn new() -> Self {
         Self {
-            ecam_base: None,
-            ecam_size: None,
+            ecam_regions: [PciEcamRegion::EMPTY; MAX_ECAM_REGIONS],
+            ecam_region_count: 0,
             pcie_mmio32: None,
             pcie_mmio64: None,
             pcie_pio: None,
@@ -116,6 +121,28 @@ impl PlatformInfo {
             dsdt_devices: [DsdtDevice::empty(); MAX_DSDT_DEVICES],
             dsdt_device_count: 0,
         }
+    }
+
+    /// Return all discovered ECAM allocations.
+    pub fn ecam_regions(&self) -> &[PciEcamRegion] {
+        &self.ecam_regions[..self.ecam_region_count]
+    }
+
+    /// Retain one validated ECAM allocation, rejecting overlap and excess.
+    pub fn push_ecam_region(&mut self, region: PciEcamRegion) -> bool {
+        if !region.is_valid()
+            || self.ecam_regions().iter().any(|current| {
+                current.segment == region.segment
+                    && current.bus_start <= region.bus_end
+                    && region.bus_start <= current.bus_end
+            })
+            || self.ecam_region_count == MAX_ECAM_REGIONS
+        {
+            return false;
+        }
+        self.ecam_regions[self.ecam_region_count] = region;
+        self.ecam_region_count += 1;
+        true
     }
 
     /// Find the first DSDT device whose `_HID` matches `hid`.
@@ -154,11 +181,13 @@ pub unsafe fn parse(fdt_addr: u64, fdt_size: u32) -> Option<PlatformInfo> {
     extract_uart(&dt, &mut info);
 
     log::info!("FDT parsed:");
-    if let Some(base) = info.ecam_base {
+    for region in info.ecam_regions() {
         log::info!(
-            "  ECAM: {:#x} (size {:#x})",
-            base,
-            info.ecam_size.unwrap_or(0)
+            "  ECAM: segment {} buses {:02x}-{:02x} at {:#x}",
+            region.segment,
+            region.bus_start,
+            region.bus_end,
+            region.base
         );
     }
     if let Some((base, size)) = info.pcie_mmio32 {
@@ -217,13 +246,47 @@ fn extract_pcie(dt: &fdt::Fdt, info: &mut PlatformInfo) {
         None => return,
     };
 
-    // ECAM from the `reg` property
+    // ECAM from `reg`, preserving the optional declared `bus-range`.
     if let Some(mut regs) = node.reg()
         && let Some(reg) = regs.next()
     {
-        info.ecam_base = Some(reg.starting_address as u64);
-        if let Some(size) = reg.size {
-            info.ecam_size = Some(size as u64);
+        let bus_range = match node.property("bus-range") {
+            None => Some((0, u8::MAX)),
+            Some(property) => {
+                let bytes = property.value;
+                if bytes.len() < 8 {
+                    None
+                } else {
+                    let start = u32::from_be_bytes(bytes[0..4].try_into().unwrap_or_default());
+                    let end = u32::from_be_bytes(bytes[4..8].try_into().unwrap_or_default());
+                    (start <= u8::MAX as u32 && end <= u8::MAX as u32)
+                        .then_some((start as u8, end as u8))
+                }
+            }
+        };
+        let declared_size = reg.size.map(|size| size as u64).unwrap_or(0);
+        if let Some((bus_start, bus_end)) = bus_range {
+            let region = PciEcamRegion {
+                base: reg.starting_address as u64,
+                segment: 0,
+                bus_start,
+                bus_end,
+            };
+            if region
+                .byte_len()
+                .is_some_and(|required| declared_size >= required)
+                && info.push_ecam_region(region)
+            {
+                log::debug!("FDT PCI: retained ECAM region {:?}", region);
+            } else {
+                log::warn!(
+                    "FDT PCI: invalid ECAM base/range/size ({:?}, size={:#x})",
+                    region,
+                    declared_size
+                );
+            }
+        } else {
+            log::warn!("FDT PCI: malformed bus-range; ECAM region skipped");
         }
     }
 
