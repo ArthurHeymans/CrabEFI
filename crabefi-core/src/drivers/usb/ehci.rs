@@ -22,12 +22,7 @@ use super::controller::{
     HUB_DESCRIPTOR_TYPE, SetupPacket, UsbController, UsbDevice, UsbError, UsbSpeed,
     enumerate_device, hub_feature, hub_port_change, hub_port_status, req_type, request,
 };
-#[cfg(target_arch = "aarch64")]
-use crate::arch::aarch64::cache::{flush_cache_range, invalidate_cache_range};
-#[cfg(target_arch = "riscv64")]
-use crate::arch::riscv64::cache::{flush_cache_range, invalidate_cache_range};
-#[cfg(target_arch = "x86_64")]
-use crate::arch::x86_64::cache::{flush_cache_range, invalidate_cache_range};
+use crate::arch::{flush_cache_range, invalidate_cache_range};
 use crate::barrier;
 use crate::drivers::pci::{self, PciAddress, PciDevice};
 use crate::efi;
@@ -152,38 +147,31 @@ impl Qtd {
     }
 
     /// Set up buffers for a transfer
-    pub fn set_buffers(&mut self, addr: u64, len: usize) {
-        // First buffer pointer includes the offset within the page
+    pub fn max_transfer_len(addr: u64) -> usize {
+        let page_window = 5 * 0x1000 - (addr as usize & 0x0fff);
+        page_window.min(0x7fff)
+    }
+
+    pub fn set_buffers(&mut self, addr: u64, len: usize) -> Result<(), UsbError> {
+        if len > Self::max_transfer_len(addr) || addr.checked_add(len as u64).is_none() {
+            return Err(UsbError::InvalidParameter);
+        }
+
+        self.buffer = [0; 5];
+        self.buffer_hi = [0; 5];
         self.buffer[0] = addr as u32;
         self.buffer_hi[0] = (addr >> 32) as u32;
 
-        // Subsequent buffer pointers are page-aligned
-        let mut remaining = len;
-        let mut current_addr = addr;
-
-        for i in 1..5 {
-            if remaining == 0 {
-                break;
-            }
-            // Move to next 4KB page
-            current_addr = (current_addr + 0x1000) & !0xFFF;
-            self.buffer[i] = current_addr as u32;
-            self.buffer_hi[i] = (current_addr >> 32) as u32;
-
-            let page_offset = (addr & 0xFFF) as usize;
-            let first_page_bytes = 0x1000 - page_offset;
-            if i == 1 {
-                if remaining > first_page_bytes {
-                    remaining -= first_page_bytes;
-                } else {
-                    remaining = 0;
-                }
-            } else if remaining > 0x1000 {
-                remaining -= 0x1000;
-            } else {
-                remaining = 0;
-            }
+        let pages = ((addr as usize & 0x0fff) + len).div_ceil(0x1000).max(1);
+        let first_page = addr & !0x0fff;
+        for index in 1..pages {
+            let page = first_page
+                .checked_add((index * 0x1000) as u64)
+                .ok_or(UsbError::InvalidParameter)?;
+            self.buffer[index] = page as u32;
+            self.buffer_hi[index] = (page >> 32) as u32;
         }
+        Ok(())
     }
 
     /// Check if qTD is active
@@ -507,50 +495,43 @@ impl EhciController {
             return Ok(());
         }
 
-        let mut cap_offset = eecp;
-        while cap_offset != 0 {
-            let cap = pci::read_config_u32(pci_addr, cap_offset);
-            let cap_id = (cap & 0xFF) as u8;
+        let Some(cap_offset) = pci::find_capability_from(pci_addr, eecp, USBLEGSUP_CAP_ID)
+            .map_err(|_| UsbError::PciConfig)?
+        else {
+            return Ok(());
+        };
+        let cap_offset = cap_offset as u16;
+        let cap =
+            pci::try_read_config_u32(pci_addr, cap_offset).map_err(|_| UsbError::PciConfig)?;
+        log::trace!("EHCI: Found USBLEGSUP at offset {:#x}", cap_offset);
 
-            if cap_id == USBLEGSUP_CAP_ID {
-                log::trace!("EHCI: Found USBLEGSUP at offset {:#x}", cap_offset);
+        if (cap & usblegsup::HC_BIOS_OWNED) != 0 {
+            log::trace!("EHCI: Requesting ownership from BIOS");
+            pci::try_write_config_u32(pci_addr, cap_offset, cap | usblegsup::HC_OS_OWNED)
+                .map_err(|_| UsbError::PciConfig)?;
 
-                // Check if BIOS owns the controller
-                if (cap & usblegsup::HC_BIOS_OWNED) != 0 {
-                    log::trace!("EHCI: Requesting ownership from BIOS");
-
-                    // Set OS owned bit
-                    pci::write_config_u32(pci_addr, cap_offset, cap | usblegsup::HC_OS_OWNED);
-
-                    // Wait for BIOS to release (up to 1 second)
-                    let timeout = Timeout::from_ms(1000);
-                    while !timeout.is_expired() {
-                        let cap = pci::read_config_u32(pci_addr, cap_offset);
-                        if (cap & usblegsup::HC_BIOS_OWNED) == 0 {
-                            log::trace!("EHCI: BIOS released ownership");
-                            break;
-                        }
-                        crate::time::delay_ms(10);
-                    }
-
-                    let cap = pci::read_config_u32(pci_addr, cap_offset);
-                    if (cap & usblegsup::HC_BIOS_OWNED) != 0 {
-                        log::warn!("EHCI: BIOS did not release ownership, forcing");
-                        pci::write_config_u32(pci_addr, cap_offset, usblegsup::HC_OS_OWNED);
-                    }
+            let timeout = Timeout::from_ms(1000);
+            while !timeout.is_expired() {
+                let cap = pci::try_read_config_u32(pci_addr, cap_offset)
+                    .map_err(|_| UsbError::PciConfig)?;
+                if (cap & usblegsup::HC_BIOS_OWNED) == 0 {
+                    log::trace!("EHCI: BIOS released ownership");
+                    break;
                 }
-
-                // Disable SMI generation (USBLEGCTLSTS is at offset +4)
-                pci::write_config_u32(pci_addr, cap_offset + 4, 0);
-
-                break;
+                crate::time::delay_ms(10);
             }
 
-            // Next capability
-            cap_offset = ((cap >> 8) & 0xFF) as u8;
+            let cap =
+                pci::try_read_config_u32(pci_addr, cap_offset).map_err(|_| UsbError::PciConfig)?;
+            if (cap & usblegsup::HC_BIOS_OWNED) != 0 {
+                log::warn!("EHCI: BIOS did not release ownership, forcing");
+                pci::try_write_config_u32(pci_addr, cap_offset, usblegsup::HC_OS_OWNED)
+                    .map_err(|_| UsbError::PciConfig)?;
+            }
         }
 
-        Ok(())
+        // Disable SMI generation only after locating a valid USB legacy capability.
+        pci::try_write_config_u32(pci_addr, cap_offset + 4, 0).map_err(|_| UsbError::PciConfig)
     }
 
     /// Initialize the controller
@@ -1117,6 +1098,12 @@ impl EhciController {
     ) -> Result<usize, UsbError> {
         let is_in = (request_type & 0x80) != 0;
         let data_len = data.as_ref().map(|d| d.len()).unwrap_or(0);
+        if data_len > Self::DMA_BUFFER_SIZE - 64
+            || data_len > u16::MAX as usize
+            || data_len > Qtd::max_transfer_len(self.dma_buffer + 64)
+        {
+            return Err(UsbError::InvalidParameter);
+        }
 
         log::trace!(
             "EHCI: control_transfer dev={} req={:#x} val={:#x} len={}",
@@ -1192,7 +1179,7 @@ impl EhciController {
                 | Qtd::TOKEN_TOGGLE
                 | (3 << Qtd::TOKEN_CERR_SHIFT)
                 | ((data_len as u32) << Qtd::TOKEN_BYTES_SHIFT);
-            qtd_data.set_buffers(data_addr, data_len);
+            qtd_data.set_buffers(data_addr, data_len)?;
         }
 
         // Setup qTD (first in chain)
@@ -1208,7 +1195,7 @@ impl EhciController {
             | Qtd::TOKEN_PID_SETUP
             | (3 << Qtd::TOKEN_CERR_SHIFT)
             | (8 << Qtd::TOKEN_BYTES_SHIFT); // Setup is always 8 bytes
-        qtd_setup.set_buffers(setup_addr, 8);
+        qtd_setup.set_buffers(setup_addr, 8)?;
 
         // Build QH for this transfer
         let mut ep_chars = (device.address as u32 & Qh::EP_DEVADDR_MASK)
@@ -1262,8 +1249,12 @@ impl EhciController {
 
         // Flush setup packet data to main memory
         flush_cache_range(setup_addr, 8);
-        if data_len > 0 && !is_in {
-            flush_cache_range(data_addr, data_len);
+        if data_len > 0 {
+            if is_in {
+                invalidate_cache_range(data_addr, data_len);
+            } else {
+                flush_cache_range(data_addr, data_len);
+            }
         }
 
         // Flush qTDs to main memory so EHCI can see them
@@ -1518,13 +1509,20 @@ impl EhciController {
                 .unwrap_or(512)
         };
 
-        // Use DMA buffer for data
+        // Use DMA buffer for data. One qTD has a 15-bit byte count and five
+        // buffer pointers, so reject requests that cannot be represented.
         let data_addr = self.dma_buffer;
+        if data.len() > Self::DMA_BUFFER_SIZE || data.len() > Qtd::max_transfer_len(data_addr) {
+            return Err(UsbError::InvalidParameter);
+        }
         let qh_addr = self.bulk_qh;
         let qtd_addr = self.bulk_qtd;
 
-        // Copy OUT data to DMA buffer
-        if !is_in {
+        // Prepare the bounce buffer before device ownership. IN must discard
+        // any dirty CPU lines before DMA starts, not only after completion.
+        if is_in {
+            invalidate_cache_range(data_addr, data.len());
+        } else {
             unsafe {
                 ptr::copy_nonoverlapping(data.as_ptr(), data_addr as *mut u8, data.len());
             }
@@ -1545,7 +1543,7 @@ impl EhciController {
             | Qtd::TOKEN_IOC
             | (3 << Qtd::TOKEN_CERR_SHIFT)
             | ((data.len() as u32) << Qtd::TOKEN_BYTES_SHIFT);
-        qtd.set_buffers(data_addr, data.len());
+        qtd.set_buffers(data_addr, data.len())?;
 
         barrier::dma_write();
 
@@ -1704,6 +1702,31 @@ impl UsbController for EhciController {
         // Clone the device to avoid borrow issues
         let dev_copy = dev.clone();
         self.control_transfer_internal(&dev_copy, request_type, request, value, index, data)
+    }
+
+    fn clear_endpoint_halt(
+        &mut self,
+        device: u8,
+        endpoint: u8,
+        is_in: bool,
+    ) -> Result<(), UsbError> {
+        let mut dev_copy = self
+            .get_device(device)
+            .ok_or(UsbError::DeviceNotFound)?
+            .clone();
+        dev_copy.reset_bulk_toggle(endpoint, is_in)?;
+        let endpoint_address = endpoint | if is_in { 0x80 } else { 0 };
+        self.control_transfer_internal(
+            &dev_copy,
+            req_type::DIR_OUT | req_type::TYPE_STANDARD | req_type::RCPT_ENDPOINT,
+            request::CLEAR_FEATURE,
+            0,
+            u16::from(endpoint_address),
+            None,
+        )?;
+        self.get_device_mut(device)
+            .ok_or(UsbError::DeviceNotFound)?
+            .reset_bulk_toggle(endpoint, is_in)
     }
 
     fn bulk_transfer(
