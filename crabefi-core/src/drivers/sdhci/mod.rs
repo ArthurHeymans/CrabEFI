@@ -784,14 +784,18 @@ impl SdhciController {
         // Switch to default speed (25 MHz)
         self.set_clock(DEFAULT_CLOCK_HZ)?;
 
-        // Try to enable high-speed mode if supported
+        // Try to enable high-speed mode if supported. Unsupported cards can
+        // continue at default speed, but a failed timing rollback is fatal.
         if self
             .regs()
             .capabilities
             .is_set(CAPABILITIES::SUPPORT_HIGHSPEED)
-            && self.try_high_speed().is_ok()
         {
-            log::info!("SDHCI: High-speed mode enabled (50 MHz)");
+            match self.try_high_speed() {
+                Ok(()) => log::info!("SDHCI: High-speed mode enabled (50 MHz)"),
+                Err(SdhciError::NotSupported) => {}
+                Err(error) => return Err(error),
+            }
         }
 
         self.card_initialized = true;
@@ -1002,6 +1006,13 @@ impl SdhciController {
                 "SDHCI: Failed to restore default-speed mode after: {:?}",
                 error
             );
+            // The card timing mode is now unknown. Stop its clock and reset the
+            // host before propagating a fatal initialization failure.
+            let _ = self.set_clock(0);
+            let _ = self.reset_all();
+            self.regs()
+                .host_control
+                .modify(HOST_CONTROL::HIGH_SPEED::CLEAR);
             return Err(error);
         }
 

@@ -337,6 +337,20 @@ impl UhciController {
         UhciRegs::new(self.io_base)
     }
 
+    fn stop_schedule(&self) -> bool {
+        let regs = self.regs();
+        regs.usbcmd().modify(USBCMD::RS::CLEAR);
+        barrier::mmio_write();
+        wait_for(100, || regs.usbsts().is_set(USBSTS::HCHALTED))
+    }
+
+    fn start_schedule(&self) -> bool {
+        let regs = self.regs();
+        regs.usbcmd().modify(USBCMD::RS::SET);
+        barrier::mmio_write();
+        wait_for(100, || !regs.usbsts().is_set(USBSTS::HCHALTED))
+    }
+
     /// Disable UHCI legacy support (BIOS keyboard/mouse emulation)
     ///
     /// UHCI has a legacy support register at PCI config offset 0xC0 (USBLEGSUP)
@@ -729,7 +743,7 @@ impl UhciController {
                 chunk,
                 is_in,
                 toggle,
-                false,
+                is_in && i + 1 < num_data_tds,
                 next_td,
                 is_low_speed,
             );
@@ -759,20 +773,46 @@ impl UhciController {
         flush_cache_range(self.qh, core::mem::size_of::<QueueHead>());
         barrier::dma_write();
 
-        // Wait for status TD completion
+        // Wait for status TD completion. CS_SPD stops vertical traversal on a
+        // short packet, so redirect the QH to the status stage when that occurs.
         let timeout = Timeout::from_ms(5000);
+        let mut repaired_short_packet = false;
         loop {
-            invalidate_cache_range(status_td_addr, 32);
+            invalidate_cache_range(td_base, 32 * (num_data_tds + 2));
             barrier::dma_read();
+
+            if is_in && !repaired_short_packet {
+                for i in 0..num_data_tds.saturating_sub(1) {
+                    let td_addr = first_data_td_addr + (i as u64) * 32;
+                    let td = unsafe { &*(td_addr as *const TransferDescriptor) };
+                    let expected = (data_len - i * max_packet).min(max_packet);
+                    if !td.is_active() && !td.has_error() && td.actual_length() < expected {
+                        qh.element_link = status_td_addr as u32;
+                        flush_cache_range(self.qh, core::mem::size_of::<QueueHead>());
+                        barrier::dma_write();
+                        repaired_short_packet = true;
+                        break;
+                    }
+                }
+            }
+
             let sts = unsafe { ptr::read_volatile(&status_td.ctrl_sts) };
             if sts & TransferDescriptor::CS_ACTIVE == 0 {
                 break;
             }
             if timeout.is_expired() {
-                // Clear QH before returning
+                let halted = self.stop_schedule();
+                if !halted {
+                    log::error!("UHCI: schedule did not halt after control timeout; resetting");
+                    self.cleanup();
+                }
                 qh.element_link = QueueHead::TERMINATE;
                 flush_cache_range(self.qh, core::mem::size_of::<QueueHead>());
                 barrier::dma_write();
+                if halted && !self.start_schedule() {
+                    log::error!("UHCI: schedule did not restart after control timeout");
+                    self.cleanup();
+                }
                 return Err(UsbError::Timeout);
             }
             core::hint::spin_loop();
@@ -995,15 +1035,31 @@ impl UsbController for UhciController {
                 core::hint::spin_loop();
             }
 
-            // Clear QH
+            let completed = !td.is_active();
+            let halted = if completed {
+                false
+            } else {
+                let halted = self.stop_schedule();
+                if !halted {
+                    log::error!("UHCI: schedule did not halt after bulk timeout; resetting");
+                    self.cleanup();
+                }
+                halted
+            };
+
+            // Clear the QH only after a timed-out schedule has halted.
             qh.element_link = QueueHead::TERMINATE;
             flush_cache_range(self.qh, core::mem::size_of::<QueueHead>());
             barrier::dma_write();
+            if halted && !self.start_schedule() {
+                log::error!("UHCI: schedule did not restart after bulk timeout");
+                self.cleanup();
+            }
 
             invalidate_cache_range(td_addr, 32);
 
             // Check result
-            if td.is_active() {
+            if !completed {
                 return Err(UsbError::Timeout);
             }
 
