@@ -729,7 +729,7 @@ impl UhciController {
                 chunk,
                 is_in,
                 toggle,
-                is_in && i + 1 < num_data_tds,
+                false,
                 next_td,
                 is_low_speed,
             );
@@ -970,12 +970,12 @@ impl UsbController for UhciController {
             );
             td.ctrl_sts |= TransferDescriptor::CS_IOC;
 
+            flush_cache_range(td_addr, 32);
             if is_in {
                 invalidate_cache_range(data_buffer, chunk);
             } else {
                 flush_cache_range(data_buffer, chunk);
             }
-            flush_cache_range(td_addr, 32);
             barrier::dma_write();
 
             // Point QH to TD

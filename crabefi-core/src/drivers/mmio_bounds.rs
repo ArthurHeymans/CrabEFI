@@ -2,6 +2,7 @@
 
 /// Validate a half-open access within a region.
 pub fn checked_access(
+    region_base: u64,
     region_size: usize,
     offset: u64,
     width: usize,
@@ -13,7 +14,8 @@ pub fn checked_access(
     let Ok(offset) = usize::try_from(offset) else {
         return None;
     };
-    if !offset.is_multiple_of(alignment) {
+    let address = region_base.checked_add(offset as u64)?;
+    if !address.is_multiple_of(alignment as u64) {
         return None;
     }
     match offset.checked_add(width) {
@@ -36,16 +38,22 @@ mod tests {
 
     #[test]
     fn accepts_last_valid_access() {
-        assert_eq!(checked_access(0x1000, 0xffc, 4, 4), Some(0xffc));
-        assert_eq!(checked_access(0x1000, 0xff8, 8, 8), Some(0xff8));
+        assert_eq!(checked_access(0x8000, 0x1000, 0xffc, 4, 4), Some(0xffc));
+        assert_eq!(checked_access(0x8000, 0x1000, 0xff8, 8, 8), Some(0xff8));
     }
 
     #[test]
     fn rejects_end_straddles_misalignment_and_overflow() {
-        assert_eq!(checked_access(0x1000, 0x1000, 1, 1), None);
-        assert_eq!(checked_access(0x1000, 0xffe, 4, 4), None);
-        assert_eq!(checked_access(0x1000, 3, 4, 4), None);
-        assert_eq!(checked_access(usize::MAX, u64::MAX, 8, 8), None);
+        assert_eq!(checked_access(0x8000, 0x1000, 0x1000, 1, 1), None);
+        assert_eq!(checked_access(0x8000, 0x1000, 0xffe, 4, 4), None);
+        assert_eq!(checked_access(0x8000, 0x1000, 3, 4, 4), None);
+        assert_eq!(checked_access(u64::MAX, usize::MAX, 1, 8, 8), None);
+    }
+
+    #[test]
+    fn validates_effective_address_alignment() {
+        assert_eq!(checked_access(0x8001, 0x1000, 3, 4, 4), Some(3));
+        assert_eq!(checked_access(0x8001, 0x1000, 4, 4, 4), None);
     }
 
     #[test]

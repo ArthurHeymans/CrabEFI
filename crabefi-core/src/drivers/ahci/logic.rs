@@ -1,5 +1,11 @@
 //! Pure AHCI/ATA geometry, signature, DMA-range, and FIS calculations.
 
+/// Read DMA (28-bit LBA).
+pub const ATA_CMD_READ_DMA: u8 = 0xc8;
+
+/// Read DMA Extended (48-bit LBA).
+pub const ATA_CMD_READ_DMA_EXT: u8 = 0x25;
+
 /// Device class represented by an exact SATA signature.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SignatureKind {
@@ -149,14 +155,14 @@ pub const fn encode_read_fis(addressing: AtaAddressing, lba: u64, count: u32) ->
     }
     match addressing {
         AtaAddressing::Lba28 if count <= 256 => Some(ReadFis {
-            command: 0xc8,
+            command: ATA_CMD_READ_DMA,
             lba: [lba as u8, (lba >> 8) as u8, (lba >> 16) as u8, 0, 0, 0],
             device: 0x40 | ((lba >> 24) as u8 & 0x0f),
             count_low: if count == 256 { 0 } else { count as u8 },
             count_high: 0,
         }),
         AtaAddressing::Lba48 if count <= 65536 => Some(ReadFis {
-            command: 0x25,
+            command: ATA_CMD_READ_DMA_EXT,
             lba: [
                 lba as u8,
                 (lba >> 8) as u8,

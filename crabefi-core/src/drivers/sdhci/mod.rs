@@ -7,6 +7,7 @@
 mod logic;
 pub mod regs;
 
+use crate::arch::{DmaCacheOperation, dma_cache_for_cpu, dma_cache_for_device};
 use crate::barrier;
 use crate::drivers::pci::{self, PciAddress, PciDevice};
 use crate::efi;
@@ -956,21 +957,19 @@ impl SdhciController {
         // CMD6 returns 64 bytes (512 bits) of status data. We use the DMA
         // buffer to receive it. Check mode first to see if the card supports
         // high-speed.
-        self.cmd6_transfer(CMD6_CHECK_HIGH_SPEED)?;
+        let status = self.cmd6_transfer(CMD6_CHECK_HIGH_SPEED)?;
 
         // In check mode byte 13 is the function-group-1 support bitmap.
-        let status = unsafe { &*(self.dma_buffer as *const [u8; 64]) };
-        if !logic::cmd6_supports_high_speed(status) {
+        if !logic::cmd6_supports_high_speed(&status) {
             log::debug!("SDHCI: Card does not advertise high-speed support");
             return Err(SdhciError::NotSupported);
         }
 
         // Now send CMD6 in switch mode to actually enable high-speed on the card
-        self.cmd6_transfer(CMD6_SWITCH_HIGH_SPEED)?;
+        let status = self.cmd6_transfer(CMD6_SWITCH_HIGH_SPEED)?;
 
         // In switch mode byte 16 reports the selected group-1 function.
-        let status = unsafe { &*(self.dma_buffer as *const [u8; 64]) };
-        let selected_function = logic::cmd6_selected_function(status);
+        let selected_function = logic::cmd6_selected_function(&status);
         if selected_function != 1 {
             log::warn!(
                 "SDHCI: High-speed switch failed (function={})",
@@ -988,12 +987,14 @@ impl SdhciController {
         // high-speed negotiation as unsupported.
         if let Err(error) = self.set_clock(HIGH_SPEED_CLOCK_HZ) {
             let clock_restored = self.set_clock(DEFAULT_CLOCK_HZ).is_ok();
-            let card_restored =
-                clock_restored && self.cmd6_transfer(CMD6_SWITCH_DEFAULT_SPEED).is_ok();
-            self.regs()
-                .host_control
-                .modify(HOST_CONTROL::HIGH_SPEED::CLEAR);
+            let card_restored = clock_restored
+                && self
+                    .cmd6_transfer(CMD6_SWITCH_DEFAULT_SPEED)
+                    .is_ok_and(|status| logic::cmd6_selected_function(&status) == 0);
             if clock_restored && card_restored {
+                self.regs()
+                    .host_control
+                    .modify(HOST_CONTROL::HIGH_SPEED::CLEAR);
                 log::warn!("SDHCI: High-speed clock failed; restored default-speed mode");
                 return Err(SdhciError::NotSupported);
             }
@@ -1008,8 +1009,9 @@ impl SdhciController {
     }
 
     /// Send CMD6 (SWITCH_FUNC) and receive 64 bytes of status data via SDMA
-    fn cmd6_transfer(&mut self, arg: u32) -> Result<(), SdhciError> {
-        self.read_data_command(SD_CMD_SWITCH_FUNC, arg, 64)
+    fn cmd6_transfer(&mut self, arg: u32) -> Result<[u8; 64], SdhciError> {
+        self.read_data_command(SD_CMD_SWITCH_FUNC, arg, 64)?;
+        Ok(unsafe { *(self.dma_buffer as *const [u8; 64]) })
     }
 
     /// Send a single-block read-data command into the DMA buffer.
@@ -1026,6 +1028,8 @@ impl SdhciController {
             if dma_addr > u32::MAX as u64 {
                 return Err(SdhciError::DmaError);
             }
+            dma_cache_for_device(dma_addr, block_size as usize, DmaCacheOperation::Invalidate)
+                .map_err(|_| SdhciError::DmaError)?;
             regs.sdma_addr.set(dma_addr as u32);
 
             regs.block_size
@@ -1077,6 +1081,14 @@ impl SdhciController {
 
             core::hint::spin_loop();
         }
+
+        dma_cache_for_cpu(
+            self.dma_buffer as u64,
+            block_size as usize,
+            DmaCacheOperation::Invalidate,
+        )
+        .map_err(|_| SdhciError::DmaError)?;
+        barrier::dma_read();
 
         Ok(())
     }
@@ -1149,6 +1161,8 @@ impl SdhciController {
                 );
                 return Err(SdhciError::DmaError);
             }
+            dma_cache_for_device(dma_addr, transfer_size, DmaCacheOperation::Invalidate)
+                .map_err(|_| SdhciError::DmaError)?;
             regs.sdma_addr.set(dma_addr as u32);
 
             // Set block size with SDMA boundary (512KB)
@@ -1319,7 +1333,12 @@ impl SdhciController {
             }
         }
 
-        // Order CPU reads after the DMA engine has completed.
+        dma_cache_for_cpu(
+            self.dma_buffer as u64,
+            transfer_size,
+            DmaCacheOperation::Invalidate,
+        )
+        .map_err(|_| SdhciError::DmaError)?;
         barrier::dma_read();
 
         // Copy data from DMA buffer to caller's buffer
