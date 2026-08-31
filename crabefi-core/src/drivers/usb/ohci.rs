@@ -360,6 +360,40 @@ impl OhciController {
         unsafe { &*((self.port_regs_base + port as u64 * 4) as *const ohci_regs::OhciPortRegs) }
     }
 
+    fn quiesce_list(&mut self, control: bool) -> bool {
+        if control {
+            self.regs().hccontrol.modify(HCCONTROL::CLE::CLEAR);
+        } else {
+            self.regs().hccontrol.modify(HCCONTROL::BLE::CLEAR);
+        }
+        barrier::mmio_write();
+
+        let stopped = wait_for(100, || {
+            if control {
+                self.regs().hccontrolcurrented.get() == 0
+            } else {
+                self.regs().hcbulkcurrented.get() == 0
+            }
+        });
+        if !stopped {
+            log::error!(
+                "OHCI: {} list did not quiesce; resetting controller",
+                if control { "control" } else { "bulk" }
+            );
+            self.cleanup();
+        }
+        stopped
+    }
+
+    fn resume_list(&self, control: bool) {
+        if control {
+            self.regs().hccontrol.modify(HCCONTROL::CLE::SET);
+        } else {
+            self.regs().hccontrol.modify(HCCONTROL::BLE::SET);
+        }
+        barrier::mmio_write();
+    }
+
     /// Initialize the controller
     fn init(&mut self) -> Result<(), UsbError> {
         // Save frame interval (raw access for complex bit manipulation)
@@ -646,7 +680,11 @@ impl OhciController {
             core::hint::spin_loop();
         }
 
-        // Remove ED from list
+        let completed = status_td.is_complete();
+        let resume_list = !completed && self.quiesce_list(true);
+
+        // Remove ED from the list only after a timed-out controller has stopped
+        // fetching it.
         head_ed.next_ed = ed.next_ed;
         flush_cache_range(self.control_ed, 32);
         barrier::dma_write();
@@ -655,7 +693,10 @@ impl OhciController {
         invalidate_cache_range(ed_addr, 32);
 
         // Check result
-        if !status_td.is_complete() {
+        if !completed {
+            if resume_list {
+                self.resume_list(true);
+            }
             return Err(UsbError::Timeout);
         }
 
@@ -858,7 +899,11 @@ impl UsbController for OhciController {
                 core::hint::spin_loop();
             }
 
-            // Remove from list
+            let completed = td.is_complete();
+            let resume_list = !completed && self.quiesce_list(false);
+
+            // Remove from the list only after a timed-out controller has stopped
+            // fetching this ED and TD.
             head_ed.next_ed = ed.next_ed;
             flush_cache_range(self.bulk_ed, 32);
             barrier::dma_write();
@@ -867,7 +912,10 @@ impl UsbController for OhciController {
             invalidate_cache_range(ed_addr, 32);
 
             // Check result
-            if !td.is_complete() {
+            if !completed {
+                if resume_list {
+                    self.resume_list(false);
+                }
                 return Err(UsbError::Timeout);
             }
 
