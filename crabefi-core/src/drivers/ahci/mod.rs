@@ -552,7 +552,7 @@ impl AhciController {
                         );
                         if let Err(port) = self.ports.push(port) {
                             log::warn!("AHCI: Failed to add port {} - port list full", port_num);
-                            self.discard_port(port)?;
+                            self.discard_port_logged(port);
                         }
                     } else if port.device_type == DeviceType::Satapi {
                         if port.sector_count == 0 {
@@ -560,7 +560,7 @@ impl AhciController {
                                 "AHCI Port {}: SATAPI device has no readable media; stopping unused port",
                                 port_num
                             );
-                            self.discard_port(port)?;
+                            self.discard_port_logged(port);
                         } else {
                             log::info!(
                                 "AHCI Port {}: SATAPI device, {} sectors (sector_size={})",
@@ -573,7 +573,7 @@ impl AhciController {
                                     "AHCI: Failed to add port {} - port list full",
                                     port_num
                                 );
-                                self.discard_port(port)?;
+                                self.discard_port_logged(port);
                             }
                         }
                     } else {
@@ -582,7 +582,7 @@ impl AhciController {
                             port_num,
                             port.device_type
                         );
-                        self.discard_port(port)?;
+                        self.discard_port_logged(port);
                     }
                 }
                 Err(e) => {
@@ -614,7 +614,7 @@ impl AhciController {
             .enumerate()
             .take(self.num_cmd_slots as usize)
         {
-            let table_addr = cmd_tables_page + (i * 256) as u64;
+            let table_addr = cmd_tables_page + (i * core::mem::size_of::<CommandTable>()) as u64;
             *cmd_table = table_addr as *mut CommandTable;
 
             // Set command table address in command header
@@ -637,8 +637,26 @@ impl AhciController {
             port_regs.is.set(0xFFFFFFFF);
         }
 
-        // Start command processing
-        self.start_port(port_num)?;
+        let mut port = AhciPort {
+            port_num,
+            cmd_list: cmd_list_addr as *mut CommandHeader,
+            received_fis: received_fis_addr as *mut ReceivedFis,
+            cmd_tables,
+            _cmd_list_dma: cmd_list_dma,
+            _received_fis_dma: received_fis_dma,
+            _cmd_tables_dma: cmd_tables_dma,
+            device_type: DeviceType::None,
+            sector_count: 0,
+            sector_size: 512,
+            addressing: None,
+        };
+
+        // Start command processing. Once the DMA addresses have been programmed,
+        // every failure must quiesce the port or retain its backing allocations.
+        if let Err(error) = self.start_port(port_num) {
+            self.discard_port_logged(port);
+            return Err(error);
+        }
 
         // Put port into active state and wait for ready.
         let mut ready = false;
@@ -663,13 +681,18 @@ impl AhciController {
                 port_num
             );
             if !self.comreset_port(port_num) {
+                self.discard_port_logged(port);
                 return Err(AhciError::PortNotReady);
             }
-            self.start_port(port_num)?;
+            if let Err(error) = self.start_port(port_num) {
+                self.discard_port_logged(port);
+                return Err(error);
+            }
             if !wait_for(5000, || {
                 let regs = self.port_regs(port_num);
                 !regs.tfd.is_set(PORT_TFD::STS_BSY) && !regs.tfd.is_set(PORT_TFD::STS_DRQ)
             }) {
+                self.discard_port_logged(port);
                 return Err(AhciError::PortNotReady);
             }
         }
@@ -684,38 +707,25 @@ impl AhciController {
             Some(SignatureKind::PortMultiplier) => DeviceType::PortMultiplier,
             None => {
                 log::warn!("AHCI port {}: invalid signature {:#x}", port_num, sig);
-                self.stop_port(port_num)?;
+                self.discard_port_logged(port);
                 return Err(AhciError::NoDevice);
             }
         };
-
-        let mut port = AhciPort {
-            port_num,
-            cmd_list: cmd_list_addr as *mut CommandHeader,
-            received_fis: received_fis_addr as *mut ReceivedFis,
-            cmd_tables,
-            _cmd_list_dma: cmd_list_dma,
-            _received_fis_dma: received_fis_dma,
-            _cmd_tables_dma: cmd_tables_dma,
-            device_type,
-            sector_count: 0,
-            sector_size: 512,
-            addressing: None,
-        };
+        port.device_type = device_type;
 
         // Identify the device
         if device_type == DeviceType::Sata {
             if let Err(error) = self.identify_device(&mut port) {
-                let _ = self.stop_port(port_num);
+                self.discard_port_logged(port);
                 return Err(error);
             }
         } else if device_type == DeviceType::Satapi {
             if let Err(error) = self.identify_device_atapi(&mut port) {
-                let _ = self.stop_port(port_num);
+                self.discard_port_logged(port);
                 return Err(error);
             }
         } else {
-            self.stop_port(port_num)?;
+            self.discard_port_logged(port);
             return Err(AhciError::NoDevice);
         }
 
@@ -732,6 +742,31 @@ impl AhciController {
                 core::mem::forget(port);
                 Err(error)
             }
+        }
+    }
+
+    fn discard_port_logged(&mut self, port: AhciPort) {
+        let port_num = port.port_num;
+        if let Err(error) = self.discard_port(port) {
+            log::error!(
+                "AHCI Port {}: could not quiesce discarded port: {:?}",
+                port_num,
+                error
+            );
+        }
+    }
+
+    fn finish_dma_command(
+        buffer: DmaBuffer,
+        result: Result<(), AhciError>,
+    ) -> Result<DmaBuffer, AhciError> {
+        match result {
+            Ok(()) => Ok(buffer),
+            Err(error @ AhciError::RecoveryFailed) => {
+                core::mem::forget(buffer);
+                Err(error)
+            }
+            Err(error) => Err(error),
         }
     }
 
@@ -830,7 +865,8 @@ impl AhciController {
         table.prdt[0].set_byte_count(512, true)?;
 
         // Issue command
-        self.issue_command(port, slot)?;
+        let result = self.issue_command(port, slot);
+        let buffer = Self::finish_dma_command(buffer, result)?;
 
         buffer
             .sync_for_cpu(0..buffer.len(), DmaDirection::FromDevice)
@@ -901,7 +937,8 @@ impl AhciController {
         // Issue command. Match Linux's first IDENTIFY/IDENTIFY PACKET timeout
         // budget: long enough for real devices, but not a 30s boot stall when
         // the dock bay is empty or confused.
-        self.issue_command_on_port_with_timeout(port.port_num, slot, 5000)?;
+        let result = self.issue_command_on_port_with_timeout(port.port_num, slot, 5000);
+        let buffer = Self::finish_dma_command(buffer, result)?;
         buffer
             .sync_for_cpu(0..buffer.len(), DmaDirection::FromDevice)
             .map_err(|_| AhciError::DmaError)?;
@@ -957,13 +994,20 @@ impl AhciController {
         table.prdt[0].set_byte_count(8, true)?;
 
         // Issue command. Empty optical drives can fail this; keep discovery
-        // responsive and mark the device as no-media below.
-        if let Err(e) = self.issue_command_on_port_with_timeout(port.port_num, slot, 5000) {
-            log::warn!("READ CAPACITY failed: {:?}, using defaults", e);
-            port.sector_size = 2048;
-            port.sector_count = 0;
-            return Ok(());
-        }
+        // responsive and mark the device as no-media below. A failed recovery
+        // is different: the HBA may still own the buffer, so retain it and
+        // propagate the failure.
+        let result = self.issue_command_on_port_with_timeout(port.port_num, slot, 5000);
+        let buffer = match Self::finish_dma_command(buffer, result) {
+            Ok(buffer) => buffer,
+            Err(AhciError::RecoveryFailed) => return Err(AhciError::RecoveryFailed),
+            Err(error) => {
+                log::warn!("READ CAPACITY failed: {:?}, using defaults", error);
+                port.sector_size = 2048;
+                port.sector_count = 0;
+                return Ok(());
+            }
+        };
 
         buffer
             .sync_for_cpu(0..buffer.len(), DmaDirection::FromDevice)
@@ -1146,7 +1190,8 @@ impl AhciController {
         fis.count_h = encoded.count_high;
         table.prdt[0].set_address(bounce.dma_address());
         table.prdt[0].set_byte_count(byte_count, true)?;
-        self.issue_command_on_port(port_num, slot)?;
+        let result = self.issue_command_on_port(port_num, slot);
+        let bounce = Self::finish_dma_command(bounce, result)?;
         bounce
             .sync_for_cpu(0..bounce.len(), DmaDirection::FromDevice)
             .map_err(|_| AhciError::DmaError)?;
@@ -1212,7 +1257,8 @@ impl AhciController {
         table.acmd[8] = num_sectors as u8;
         table.prdt[0].set_address(bounce.dma_address());
         table.prdt[0].set_byte_count(byte_count, true)?;
-        self.issue_command_on_port(port_num, slot)?;
+        let result = self.issue_command_on_port(port_num, slot);
+        let bounce = Self::finish_dma_command(bounce, result)?;
         bounce
             .sync_for_cpu(0..bounce.len(), DmaDirection::FromDevice)
             .map_err(|_| AhciError::DmaError)?;
@@ -1543,31 +1589,20 @@ impl AhciController {
 
         // Issue command
         let result = self.issue_command_on_port(port_num, slot);
+        let dma_buffer = Self::finish_dma_command(dma_buffer, result)?;
 
-        // Copy data from DMA buffer to caller's buffer
-        let bytes_transferred = if result.is_ok() {
-            dma_buffer
-                .sync_for_cpu(0..dma_buffer.len(), DmaDirection::FromDevice)
-                .map_err(|_| AhciError::DmaError)?;
-            unsafe {
-                core::ptr::copy_nonoverlapping(
-                    dma_buffer.dma_address() as *const u8,
-                    buffer.as_mut_ptr(),
-                    buffer.len(),
-                );
-            }
-            buffer.len()
-        } else {
-            0
-        };
-
-        result.map(|_| {
-            log::debug!(
-                "AHCI Trusted Receive: {} bytes transferred",
-                bytes_transferred
+        dma_buffer
+            .sync_for_cpu(0..dma_buffer.len(), DmaDirection::FromDevice)
+            .map_err(|_| AhciError::DmaError)?;
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                dma_buffer.dma_address() as *const u8,
+                buffer.as_mut_ptr(),
+                buffer.len(),
             );
-            bytes_transferred
-        })
+        }
+        log::debug!("AHCI Trusted Receive: {} bytes transferred", buffer.len());
+        Ok(buffer.len())
     }
 
     /// ATA TRUSTED SEND (command 0x5E)
@@ -1664,10 +1699,9 @@ impl AhciController {
 
         // Issue command
         let result = self.issue_command_on_port(port_num, slot);
-
-        result.map(|_| {
-            log::debug!("AHCI Trusted Send: success");
-        })
+        let _dma_buffer = Self::finish_dma_command(dma_buffer, result)?;
+        log::debug!("AHCI Trusted Send: success");
+        Ok(())
     }
 
     fn shutdown_controller(&mut self) {

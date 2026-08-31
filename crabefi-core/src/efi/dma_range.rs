@@ -15,6 +15,9 @@ pub const fn pages_for_len(byte_len: usize, page_size: u64) -> Option<u64> {
 
 /// Return whether every byte of a page allocation is visible through `mask`.
 pub const fn allocation_fits_mask(base: u64, pages: u64, page_size: u64, mask: u64) -> bool {
+    if pages == 0 || page_size == 0 {
+        return false;
+    }
     let Some(size) = pages.checked_mul(page_size) else {
         return false;
     };
@@ -71,6 +74,8 @@ mod tests {
         assert!(allocation_fits_mask(0, 1, 4096, u64::MAX));
         assert!(!allocation_fits_mask(u64::MAX - 4095, 2, 4096, u64::MAX));
         assert!(!allocation_fits_mask(0, u64::MAX, 4096, u64::MAX));
+        assert!(!allocation_fits_mask(0, 0, 4096, u64::MAX));
+        assert!(!allocation_fits_mask(0, 1, 0, u64::MAX));
     }
 
     #[test]

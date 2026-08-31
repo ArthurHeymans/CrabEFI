@@ -305,12 +305,17 @@ pub fn bind_driver(device: &PciDevice) -> Option<&'static str> {
 ///
 /// Called during ExitBootServices to cleanly stop all hardware.
 pub fn shutdown_all() {
-    let bound = BOUND_DRIVERS.swap(0, Ordering::Relaxed);
+    let bound = BOUND_DRIVERS.load(Ordering::Relaxed);
     for (driver_index, driver) in PCI_DRIVERS.iter().enumerate() {
-        if bound & (1 << driver_index) != 0
-            && let Err(e) = driver.shutdown()
-        {
-            log::warn!("{} driver shutdown failed: {}", driver.name(), e);
+        let bit = 1 << driver_index;
+        if bound & bit == 0 {
+            continue;
+        }
+        match driver.shutdown() {
+            Ok(()) => {
+                BOUND_DRIVERS.fetch_and(!bit, Ordering::Relaxed);
+            }
+            Err(e) => log::warn!("{} driver shutdown failed: {}", driver.name(), e),
         }
     }
 }

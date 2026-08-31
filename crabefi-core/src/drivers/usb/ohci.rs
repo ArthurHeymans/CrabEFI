@@ -611,6 +611,8 @@ impl OhciController {
         }
 
         flush_cache_range(setup_addr, 8);
+        flush_cache_range(ed_addr, 32);
+        flush_cache_range(td_base, 48);
         if data_len > 0 {
             if is_in {
                 invalidate_cache_range(data_buffer, data_len);
@@ -618,8 +620,6 @@ impl OhciController {
                 flush_cache_range(data_buffer, data_len);
             }
         }
-        flush_cache_range(ed_addr, 32);
-        flush_cache_range(td_base, 48);
         barrier::dma_write();
 
         // Insert ED into control list
@@ -827,13 +827,13 @@ impl UsbController for OhciController {
             ed.head_td = td_addr as u32 | if toggle { 2 } else { 0 };
             ed.tail_td = (td_addr + 16) as u32;
 
+            flush_cache_range(ed_addr, 32);
+            flush_cache_range(td_addr, 32);
             if is_in {
                 invalidate_cache_range(data_buffer, chunk);
             } else {
                 flush_cache_range(data_buffer, chunk);
             }
-            flush_cache_range(ed_addr, 32);
-            flush_cache_range(td_addr, 32);
             barrier::dma_write();
 
             // Insert into bulk list

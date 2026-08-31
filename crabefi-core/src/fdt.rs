@@ -235,21 +235,29 @@ pub unsafe fn parse(_fdt_addr: u64, _fdt_size: u32) -> Option<PlatformInfo> {
 /// `ranges` property maps PCI child addresses to CPU addresses.
 #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
 fn extract_pcie(dt: &fdt::Fdt, info: &mut PlatformInfo) {
-    // Find the PCI host bridge node
-    let pci_node = dt.all_nodes().find(|n| {
-        n.compatible()
-            .is_some_and(|c| c.all().any(|s| s.contains("pci")))
-    });
+    let mut used_segments = [None; MAX_ECAM_REGIONS];
+    let mut used_segment_count = 0;
+    for node in dt.all_nodes().filter(|node| {
+        node.compatible()
+            .is_some_and(|compatible| compatible.all().any(|value| value.contains("pci")))
+    }) {
+        let segment = node
+            .property("linux,pci-domain")
+            .and_then(|property| property.as_usize())
+            .and_then(|value| u16::try_from(value).ok());
+        if let Some(segment) = segment
+            && !used_segments[..used_segment_count].contains(&Some(segment))
+            && used_segment_count < MAX_ECAM_REGIONS
+        {
+            used_segments[used_segment_count] = Some(segment);
+            used_segment_count += 1;
+        }
+    }
 
-    let node = match pci_node {
-        Some(n) => n,
-        None => return,
-    };
-
-    // ECAM from `reg`, preserving the optional declared `bus-range`.
-    if let Some(mut regs) = node.reg()
-        && let Some(reg) = regs.next()
-    {
+    for node in dt.all_nodes().filter(|node| {
+        node.compatible()
+            .is_some_and(|compatible| compatible.all().any(|value| value.contains("pci")))
+    }) {
         let bus_range = match node.property("bus-range") {
             None => Some((0, u8::MAX)),
             Some(property) => {
@@ -264,76 +272,97 @@ fn extract_pcie(dt: &fdt::Fdt, info: &mut PlatformInfo) {
                 }
             }
         };
-        let declared_size = reg.size.map(|size| size as u64).unwrap_or(0);
+        let declared_segment = node
+            .property("linux,pci-domain")
+            .and_then(|property| property.as_usize())
+            .and_then(|value| u16::try_from(value).ok());
+        let segment = declared_segment.unwrap_or_else(|| {
+            (0..=u16::MAX)
+                .find(|candidate| !used_segments[..used_segment_count].contains(&Some(*candidate)))
+                .unwrap_or(u16::MAX)
+        });
+        if declared_segment.is_none()
+            && used_segment_count < MAX_ECAM_REGIONS
+            && !used_segments[..used_segment_count].contains(&Some(segment))
+        {
+            used_segments[used_segment_count] = Some(segment);
+            used_segment_count += 1;
+        }
+
         if let Some((bus_start, bus_end)) = bus_range {
-            let region = PciEcamRegion {
-                base: reg.starting_address as u64,
-                segment: 0,
-                bus_start,
-                bus_end,
-            };
-            if region
-                .byte_len()
-                .is_some_and(|required| declared_size >= required)
-                && info.push_ecam_region(region)
-            {
-                log::debug!("FDT PCI: retained ECAM region {:?}", region);
-            } else {
-                log::warn!(
-                    "FDT PCI: invalid ECAM base/range/size ({:?}, size={:#x})",
-                    region,
-                    declared_size
-                );
+            if let Some(regs) = node.reg() {
+                for reg in regs {
+                    let declared_size = reg.size.map(|size| size as u64).unwrap_or(0);
+                    let region = PciEcamRegion {
+                        base: reg.starting_address as u64,
+                        segment,
+                        bus_start,
+                        bus_end,
+                    };
+                    if region
+                        .byte_len()
+                        .is_some_and(|required| declared_size >= required)
+                        && info.push_ecam_region(region)
+                    {
+                        log::debug!("FDT PCI: retained ECAM region {:?}", region);
+                    } else {
+                        log::warn!(
+                            "FDT PCI: invalid ECAM base/range/size ({:?}, size={:#x})",
+                            region,
+                            declared_size
+                        );
+                    }
+                }
             }
         } else {
             log::warn!("FDT PCI: malformed bus-range; ECAM region skipped");
         }
-    }
 
-    // Parse `ranges` property for MMIO / PIO windows.
-    // Each ranges entry maps a PCI address to a CPU address:
-    //   <pci_addr_hi> <pci_addr_lo(1-2 cells)> <cpu_addr(1-2 cells)> <size(1-2 cells)>
-    // pci_addr_hi encodes the space type in bits [25:24]:
-    //   0x01 = I/O, 0x02 = 32-bit mem, 0x03 = 64-bit prefetchable mem
-    if let Some(ranges_raw) = node.property("ranges") {
-        let data = ranges_raw.value;
-        // PCI nodes have #address-cells=3 (hi, mid, lo) by convention
-        let child_ac: usize = node
-            .property("#address-cells")
-            .and_then(|p| p.as_usize())
-            .unwrap_or(3);
-        let child_sc: usize = node
-            .property("#size-cells")
-            .and_then(|p| p.as_usize())
-            .unwrap_or(2);
-        // Parent (CPU) #address-cells comes from root
-        let parent_ac: usize = dt
-            .root()
-            .property("#address-cells")
-            .and_then(|p| p.as_usize())
-            .unwrap_or(2);
+        // PlatformInfo currently exposes one window of each kind, so retain
+        // the first host bridge's values while still collecting every ECAM.
+        if let Some(ranges_raw) = node.property("ranges") {
+            let data = ranges_raw.value;
+            let child_ac = node
+                .property("#address-cells")
+                .and_then(|property| property.as_usize())
+                .unwrap_or(3);
+            let child_sc = node
+                .property("#size-cells")
+                .and_then(|property| property.as_usize())
+                .unwrap_or(2);
+            let parent_ac = dt
+                .root()
+                .property("#address-cells")
+                .and_then(|property| property.as_usize())
+                .unwrap_or(2);
 
-        let entry_bytes = (child_ac + parent_ac + child_sc) * 4;
-        if entry_bytes > 0 {
-            let mut off = 0;
-            while off + entry_bytes <= data.len() {
-                let pci_hi = u32::from_be_bytes(data[off..off + 4].try_into().unwrap_or_default());
-                let space = (pci_hi >> 24) & 0x03;
+            let entry_bytes = (child_ac + parent_ac + child_sc) * 4;
+            if entry_bytes > 0 {
+                let mut off = 0;
+                while off + entry_bytes <= data.len() {
+                    let pci_hi =
+                        u32::from_be_bytes(data[off..off + 4].try_into().unwrap_or_default());
+                    let space = (pci_hi >> 24) & 0x03;
+                    let cpu_off = off + child_ac * 4;
+                    let cpu_addr = read_cells(data, cpu_off, parent_ac);
+                    let size_off = cpu_off + parent_ac * 4;
+                    let size = read_cells(data, size_off, child_sc);
 
-                let cpu_off = off + child_ac * 4;
-                let cpu_addr = read_cells(data, cpu_off, parent_ac);
+                    match space {
+                        0x01 if info.pcie_pio.is_none() => {
+                            info.pcie_pio = Some((cpu_addr, size));
+                        }
+                        0x02 if info.pcie_mmio32.is_none() => {
+                            info.pcie_mmio32 = Some((cpu_addr, size));
+                        }
+                        0x03 if info.pcie_mmio64.is_none() => {
+                            info.pcie_mmio64 = Some((cpu_addr, size));
+                        }
+                        _ => {}
+                    }
 
-                let size_off = cpu_off + parent_ac * 4;
-                let size = read_cells(data, size_off, child_sc);
-
-                match space {
-                    0x01 => info.pcie_pio = Some((cpu_addr, size)),
-                    0x02 => info.pcie_mmio32 = Some((cpu_addr, size)),
-                    0x03 => info.pcie_mmio64 = Some((cpu_addr, size)),
-                    _ => {}
+                    off += entry_bytes;
                 }
-
-                off += entry_bytes;
             }
         }
     }

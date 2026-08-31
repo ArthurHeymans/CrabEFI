@@ -82,7 +82,7 @@ impl MmioRegion {
     /// A new `MmioRegion` starting at `base + offset` with the given size.
     #[inline]
     pub fn subregion(&self, offset: u64, size: usize) -> Self {
-        let offset = checked_access(self.size, offset, size, 1).unwrap_or_else(|| {
+        let offset = checked_access(self.base(), self.size, offset, size, 1).unwrap_or_else(|| {
             panic!(
                 "MMIO subregion out of bounds: offset={:#x}, size={:#x}, region_size={:#x}",
                 offset, size, self.size
@@ -98,7 +98,7 @@ impl MmioRegion {
 
     #[inline]
     fn check_access(&self, offset: u64, width: usize, alignment: usize) -> usize {
-        checked_access(self.size, offset, width, alignment).unwrap_or_else(|| {
+        checked_access(self.base(), self.size, offset, width, alignment).unwrap_or_else(|| {
             panic!(
                 "invalid MMIO access: offset={:#x}, width={}, alignment={}, region_size={:#x}",
                 offset, width, alignment, self.size
