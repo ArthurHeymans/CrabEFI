@@ -527,14 +527,14 @@ fn boot_uefi_entry(entry: &menu::BootEntry) {
         return;
     }
 
-    let phase1_ok = crate::with_disk(&entry.device_type, |disk| {
+    let device_info = crate::with_disk(&entry.device_type, |disk| {
         let info = disk.info();
         let storage_id =
             match storage::register_device(entry.device_type, info.num_blocks, info.block_size) {
                 Some(id) => id,
                 None => {
                     log::error!("Failed to register device");
-                    return false;
+                    return None;
                 }
             };
         let _ = boot::install_block_io_protocols(
@@ -544,29 +544,25 @@ fn boot_uefi_entry(entry: &menu::BootEntry) {
             info.num_blocks,
             &path_info,
         );
-        true
-    });
+        Some((info.num_blocks, info.block_size))
+    })
+    .flatten();
 
-    if phase1_ok != Some(true) {
+    let Some((num_blocks, block_size)) = device_info else {
         log::error!("Failed to create disk for BlockIO installation");
         return;
-    }
+    };
 
-    // Phase 2: Re-create disk for ESP boot (previous borrows ended)
-    let booted = crate::with_disk(&entry.device_type, |disk| {
-        let info = disk.info();
-        boot::try_boot_from_esp(
-            disk,
-            &entry.partition,
-            entry.partition_num,
-            &path_info,
-            &entry.device_type,
-            info.num_blocks,
-            info.block_size,
-        )
-    });
-
-    if booted == Some(true) {
+    // Do not hold a controller borrow while the filesystem and Block I/O
+    // protocol perform their own short, serialized device accesses.
+    if boot::try_boot_from_esp(
+        &entry.partition,
+        entry.partition_num,
+        &path_info,
+        &entry.device_type,
+        num_blocks,
+        block_size,
+    ) {
         return;
     }
     log::error!("Failed to boot UEFI entry");

@@ -178,11 +178,13 @@ impl DmaBuffer {
             .checked_sub(domain.device_base)
             .ok_or(DmaError::OutOfResources)?;
         let device_limited_cpu_last = domain.cpu_base.saturating_add(device_mask_offset);
-        let mut address = cpu_end.saturating_sub(1).min(device_limited_cpu_last);
-        let status = allocator::allocate_pages(
-            AllocateType::AllocateMaxAddress,
+        let max_address = cpu_end.saturating_sub(1).min(device_limited_cpu_last);
+        let mut address = 0;
+        let status = allocator::allocate_pages_in_range(
             MemoryType::BootServicesData,
             pages,
+            domain.cpu_base,
+            max_address,
             &mut address,
         );
         if status != Status::SUCCESS {

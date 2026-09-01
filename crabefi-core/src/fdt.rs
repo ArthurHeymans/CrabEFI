@@ -270,30 +270,26 @@ pub unsafe fn parse(_fdt_addr: u64, _fdt_size: u32) -> Option<PlatformInfo> {
 /// `ranges` property maps PCI child addresses to CPU addresses.
 #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
 fn extract_pcie(dt: &fdt::Fdt, info: &mut PlatformInfo) {
-    let Some(root) = dt.find_node("/") else {
-        return;
-    };
-    for node in root.children().filter(|node| {
+    for node in dt.all_nodes().filter(|node| {
         node.compatible().is_some_and(|compatible| {
             compatible
                 .all()
                 .any(|value| value == "pci-host-ecam-generic")
         })
     }) {
-        let Some(segment_property) = node.property("linux,pci-domain") else {
-            log::warn!(
-                "FDT PCI: host {} has no linux,pci-domain; skipped",
-                node.name
-            );
-            continue;
-        };
-        let Some(segment) = (segment_property.value.len() == 4)
-            .then(|| segment_property.as_usize())
-            .flatten()
-            .and_then(|value| u16::try_from(value).ok())
-        else {
-            log::warn!("FDT PCI: host {} has malformed linux,pci-domain", node.name);
-            continue;
+        let segment = match node.property("linux,pci-domain") {
+            None => 0,
+            Some(property) => {
+                let Some(segment) = (property.value.len() == 4)
+                    .then(|| property.as_usize())
+                    .flatten()
+                    .and_then(|value| u16::try_from(value).ok())
+                else {
+                    log::warn!("FDT PCI: host {} has malformed linux,pci-domain", node.name);
+                    continue;
+                };
+                segment
+            }
         };
 
         let bus_range = match node.property("bus-range") {
@@ -409,6 +405,22 @@ fn extract_pcie(dt: &fdt::Fdt, info: &mut PlatformInfo) {
                     "FDT PCI: unsupported dma-ranges cell shape for host {}",
                     node.name
                 );
+            }
+        } else if node.property("dma-coherent").is_some() {
+            let domain = DmaDomain {
+                cpu_base: 0,
+                device_base: 0,
+                size: u64::MAX,
+                coherency: crate::efi::dma::DmaCoherency::Coherent,
+            };
+            if info
+                .pci_dma_domains
+                .push(PciDmaDomain { segment, domain })
+                .is_ok()
+            {
+                log::debug!("FDT PCI: retained coherent identity DMA domain");
+            } else {
+                log::warn!("FDT PCI: DMA-domain capacity exhausted");
             }
         } else {
             log::warn!(

@@ -1502,6 +1502,9 @@ impl EhciController {
         .filter(|info| info.number == endpoint)
         .ok_or(UsbError::DeviceNotFound)?;
         let max_packet = endpoint_info.max_packet_size;
+        if max_packet == 0 {
+            return Err(UsbError::InvalidParameter);
+        }
 
         // Use DMA buffer for data. One qTD has a 15-bit byte count and five
         // buffer pointers, so reject requests that cannot be represented.

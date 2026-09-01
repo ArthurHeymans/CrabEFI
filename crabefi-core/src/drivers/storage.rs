@@ -245,9 +245,11 @@ pub fn read_sectors(device_id: u32, lba: u64, buffer: &mut [u8]) -> Result<(), (
         }),
         StorageType::Sdhci { controller_id } => {
             crate::drivers::sdhci::with_controller(controller_id, |controller| {
-                controller.read_sector(lba, buffer).map_err(|error| {
-                    log::error!("SDHCI read failed at LBA {}: {:?}", lba, error);
-                })
+                controller
+                    .read_sectors(lba, num_sectors, buffer)
+                    .map_err(|error| {
+                        log::error!("SDHCI read failed at LBA {}: {:?}", lba, error);
+                    })
             })
             .unwrap_or_else(|| {
                 log::error!("SDHCI controller {} not found", controller_id);
