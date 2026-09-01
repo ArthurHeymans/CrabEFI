@@ -524,9 +524,8 @@ impl EhciController {
             let cap =
                 pci::try_read_config_u32(pci_addr, cap_offset).map_err(|_| UsbError::PciConfig)?;
             if (cap & usblegsup::HC_BIOS_OWNED) != 0 {
-                log::warn!("EHCI: BIOS did not release ownership, forcing");
-                pci::try_write_config_u32(pci_addr, cap_offset, usblegsup::HC_OS_OWNED)
-                    .map_err(|_| UsbError::PciConfig)?;
+                log::error!("EHCI: BIOS did not release controller ownership");
+                return Err(UsbError::Timeout);
             }
         }
 
@@ -1495,19 +1494,14 @@ impl EhciController {
         data: &mut [u8],
         toggle: bool,
     ) -> Result<(usize, bool), UsbError> {
-        let max_packet = if is_in {
-            device
-                .bulk_in
-                .as_ref()
-                .map(|e| e.max_packet_size)
-                .unwrap_or(512)
+        let endpoint_info = if is_in {
+            device.bulk_in.as_ref()
         } else {
-            device
-                .bulk_out
-                .as_ref()
-                .map(|e| e.max_packet_size)
-                .unwrap_or(512)
-        };
+            device.bulk_out.as_ref()
+        }
+        .filter(|info| info.number == endpoint)
+        .ok_or(UsbError::DeviceNotFound)?;
+        let max_packet = endpoint_info.max_packet_size;
 
         // Use DMA buffer for data. One qTD has a 15-bit byte count and five
         // buffer pointers, so reject requests that cannot be represented.

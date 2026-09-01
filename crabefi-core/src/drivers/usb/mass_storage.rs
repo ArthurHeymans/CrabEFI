@@ -210,7 +210,8 @@ impl UsbMassStorage {
         );
 
         // Test Unit Ready (may need multiple attempts as device spins up)
-        let mut tur_ok = false;
+        let mut ready = false;
+        let mut readiness_error = MassStorageError::NotReady;
         for attempt in 0..5 {
             match self.test_unit_ready(controller) {
                 Ok(()) => {
@@ -218,23 +219,25 @@ impl UsbMassStorage {
                         "USB Mass Storage: TEST_UNIT_READY succeeded on attempt {}",
                         attempt
                     );
-                    tur_ok = true;
+                    ready = true;
                     break;
                 }
-                Err(e) => {
+                Err(error) => {
                     log::debug!(
                         "USB Mass Storage: TEST_UNIT_READY failed attempt {}: {:?}",
                         attempt,
-                        e
+                        error
                     );
+                    readiness_error = error;
                     // Delay 100ms between retries
                     time::delay_ms(100);
                 }
             }
         }
 
-        if !tur_ok {
-            log::debug!("USB Mass Storage: TEST_UNIT_READY failed all attempts, continuing anyway");
+        if !ready {
+            log::error!("USB Mass Storage: device did not become ready");
+            return Err(readiness_error);
         }
 
         // Inquiry
@@ -245,26 +248,13 @@ impl UsbMassStorage {
             core::str::from_utf8(&self.vendor).unwrap_or("?").trim()
         );
 
-        // Read Capacity - may fail if no media is present (e.g., card reader without card)
         log::debug!("USB Mass Storage: sending READ_CAPACITY");
-        match self.read_capacity(controller) {
-            Ok(()) => {
-                log::debug!(
-                    "USB Mass Storage: READ_CAPACITY succeeded, blocks={} size={}",
-                    self.num_blocks,
-                    self.block_size
-                );
-            }
-            Err(e) => {
-                // READ_CAPACITY failure is not fatal - might just be a card reader without media
-                log::debug!(
-                    "USB Mass Storage: READ_CAPACITY failed: {:?} (no media?)",
-                    e
-                );
-                // Keep default values: num_blocks=0, block_size=512
-                // This allows enumeration but filesystem operations will fail
-            }
-        }
+        self.read_capacity(controller)?;
+        log::debug!(
+            "USB Mass Storage: READ_CAPACITY succeeded, blocks={} size={}",
+            self.num_blocks,
+            self.block_size
+        );
 
         log::info!(
             "USB Mass Storage: {} {} - {} blocks x {} bytes = {} MB",
@@ -294,50 +284,47 @@ impl UsbMassStorage {
     ///
     /// This is the same sequence used by EDK2 (UsbBotResetDevice) and
     /// Linux (usb_stor_Bulk_reset + usb_stor_reset_common).
-    fn bot_reset_recovery(&mut self, controller: &mut dyn UsbController) {
+    fn bot_reset_recovery(
+        &mut self,
+        controller: &mut dyn UsbController,
+    ) -> Result<(), MassStorageError> {
         log::debug!("USB BOT: Performing reset recovery");
 
         // Step 1: Send class-specific Bulk-Only Mass Storage Reset
         // bmRequestType=0x21 (class, interface), bRequest=0xFF, wValue=0, wIndex=interface
-        let result = controller.control_transfer(
+        controller.control_transfer(
             self.device_addr,
             0x21,                         // Class request, Host-to-Device, Interface
             0xFF,                         // Bulk-Only Mass Storage Reset
             0,                            // wValue
             self.interface_number as u16, // wIndex = interface number
             None,                         // No data
-        );
-        if let Err(e) = result {
-            log::warn!("USB BOT: Mass Storage Reset request failed: {:?}", e);
-            // Continue with clear halts anyway
-        }
+        )?;
 
         // Step 2: Wait for device recovery (EDK2 uses 100ms, Linux uses 6 seconds)
         time::delay_ms(100);
 
         // Steps 3-4: clear both bulk endpoint halts. The host-controller
         // implementation also restores any software/HCD endpoint state.
-        if let Err(error) = controller.clear_endpoint_halt(self.device_addr, self.bulk_in, true) {
-            log::warn!("USB BOT: Clear Bulk-In halt failed: {:?}", error);
-        }
-        if let Err(error) = controller.clear_endpoint_halt(self.device_addr, self.bulk_out, false) {
-            log::warn!("USB BOT: Clear Bulk-Out halt failed: {:?}", error);
-        }
+        controller.clear_endpoint_halt(self.device_addr, self.bulk_in, true)?;
+        controller.clear_endpoint_halt(self.device_addr, self.bulk_out, false)?;
 
         log::debug!("USB BOT: Reset recovery complete");
+        Ok(())
     }
 
     /// Clear a stalled endpoint before continuing BOT recovery.
-    fn clear_endpoint_halt(&self, controller: &mut dyn UsbController, endpoint: u8, is_in: bool) {
+    fn clear_endpoint_halt(
+        &self,
+        controller: &mut dyn UsbController,
+        endpoint: u8,
+        is_in: bool,
+    ) -> Result<(), MassStorageError> {
         let endpoint_address = endpoint | if is_in { 0x80 } else { 0 };
         log::debug!("USB BOT: Clearing halt on endpoint {:#x}", endpoint_address);
-        if let Err(error) = controller.clear_endpoint_halt(self.device_addr, endpoint, is_in) {
-            log::warn!(
-                "USB BOT: Failed to clear endpoint {:#x}: {:?}",
-                endpoint_address,
-                error
-            );
-        }
+        controller
+            .clear_endpoint_halt(self.device_addr, endpoint, is_in)
+            .map_err(MassStorageError::from)
     }
 
     /// Send a SCSI command using the Bulk-Only Transport protocol.
@@ -388,7 +375,7 @@ impl UsbMassStorage {
             log::debug!("USB SCSI: CBW transfer failed: {:?}", e);
             if matches!(e, UsbError::Stall) {
                 // Per BOT spec 5.3.1: Bulk-Out stall on CBW requires Reset Recovery
-                self.bot_reset_recovery(controller);
+                self.bot_reset_recovery(controller)?;
             }
             return Err(MassStorageError::Usb(e));
         }
@@ -410,10 +397,10 @@ impl UsbMassStorage {
                     if matches!(e, UsbError::Stall) {
                         // Per EDK2's UsbBotDataTransfer: clear the stalled endpoint
                         let ep = if is_read { self.bulk_in } else { self.bulk_out };
-                        self.clear_endpoint_halt(controller, ep, is_read);
+                        self.clear_endpoint_halt(controller, ep, is_read)?;
                     } else if matches!(e, UsbError::Timeout) {
                         // Per EDK2: timeout during data phase triggers full reset
-                        self.bot_reset_recovery(controller);
+                        self.bot_reset_recovery(controller)?;
                         return Err(MassStorageError::Usb(e));
                     }
                     // For babble and transaction errors: continue to CSW phase
@@ -436,7 +423,7 @@ impl UsbMassStorage {
             Ok(n) => Ok(n),
             Err(UsbError::Stall) => {
                 // Per EDK2: clear the stall and retry CSW once
-                self.clear_endpoint_halt(controller, self.bulk_in, true);
+                self.clear_endpoint_halt(controller, self.bulk_in, true)?;
                 controller.bulk_transfer(self.device_addr, self.bulk_in, true, &mut csw_buf)
             }
             Err(e) => Err(e),
@@ -445,7 +432,7 @@ impl UsbMassStorage {
         if let Err(e) = csw_result {
             log::debug!("USB SCSI: CSW transfer failed: {:?}", e);
             // CSW transfer failed even after retry — perform full reset recovery
-            self.bot_reset_recovery(controller);
+            self.bot_reset_recovery(controller)?;
             // Return the original data phase error if there was one
             return Err(MassStorageError::Usb(data_phase_error.unwrap_or(e)));
         }
@@ -477,7 +464,7 @@ impl UsbMassStorage {
                 CSW_SIGNATURE
             );
             // Invalid CSW requires Reset Recovery per BOT spec
-            self.bot_reset_recovery(controller);
+            self.bot_reset_recovery(controller)?;
             return Err(MassStorageError::InvalidCsw);
         }
 
@@ -487,7 +474,7 @@ impl UsbMassStorage {
                 csw_tag,
                 cbw_tag
             );
-            self.bot_reset_recovery(controller);
+            self.bot_reset_recovery(controller)?;
             return Err(MassStorageError::InvalidCsw);
         }
 
@@ -511,12 +498,12 @@ impl UsbMassStorage {
             csw_status::PHASE_ERROR => {
                 log::debug!("USB SCSI: Phase error for command {:#04x}", cdb[0]);
                 // Phase error requires Reset Recovery per BOT spec
-                self.bot_reset_recovery(controller);
+                self.bot_reset_recovery(controller)?;
                 Err(MassStorageError::PhaseError)
             }
             _ => {
                 log::debug!("USB SCSI: Unknown CSW status {}", csw_stat);
-                self.bot_reset_recovery(controller);
+                self.bot_reset_recovery(controller)?;
                 Err(MassStorageError::InvalidCsw)
             }
         }
@@ -934,25 +921,13 @@ impl UsbMassStorage {
 // Global USB Mass Storage Device
 // ============================================================================
 
-use crate::efi;
 use spin::Mutex;
 
 /// Global state for USB mass storage
 struct GlobalUsbState {
-    /// Pointer to the mass storage device
-    device_ptr: *mut UsbMassStorage,
-    /// Pointer to the controller (as trait object)
-    /// This is stored directly to avoid lock contention during reads
-    controller_ptr: *mut dyn UsbController,
+    device: UsbMassStorage,
+    controller_index: usize,
 }
-
-// SAFETY: GlobalUsbState contains raw pointers to UsbMassStorage and UsbController.
-// These pointers are:
-// 1. Allocated via EFI page allocator and remain valid for firmware lifetime
-// 2. Only accessed while holding the GLOBAL_USB_STATE mutex
-// 3. The UsbController pointer is a trait object stored in ALL_CONTROLLERS
-// The firmware is single-threaded and USB operations are serialized.
-unsafe impl Send for GlobalUsbState {}
 
 /// Global USB mass storage device and controller
 static GLOBAL_USB_STATE: Mutex<Option<GlobalUsbState>> = Mutex::new(None);
@@ -962,81 +937,39 @@ static GLOBAL_USB_STATE: Mutex<Option<GlobalUsbState>> = Mutex::new(None);
 /// This takes ownership of the device and stores it for later use by the
 /// filesystem protocol. Uses the controller at the specified index.
 pub fn store_global_device(device: UsbMassStorage, controller_index: usize) -> bool {
-    // Get the controller pointer from ALL_CONTROLLERS
-    let controller_ptr = match super::get_controller_ptr(controller_index) {
-        Some(c) => c,
-        None => {
-            log::error!(
-                "Failed to get USB controller {} for global device",
-                controller_index
-            );
-            return false;
-        }
-    };
-
-    // SAFETY: controller_ptr is obtained from get_controller_ptr which returns valid pointers
-    unsafe { store_global_device_with_controller_ptr(device, controller_ptr) }
-}
-
-/// Store a USB mass storage device globally with a specific controller pointer
-///
-/// This version takes the controller pointer directly, avoiding the need to
-/// look up the controller later (which could cause lock contention).
-///
-/// # Safety
-///
-/// The controller_ptr must point to a valid UsbController that remains valid
-/// for the lifetime of the firmware.
-pub unsafe fn store_global_device_with_controller_ptr(
-    device: UsbMassStorage,
-    controller_ptr: *mut dyn UsbController,
-) -> bool {
-    // Allocate memory for the device
-    let size = core::mem::size_of::<UsbMassStorage>();
-    let pages = size.div_ceil(4096);
-
-    if let Some(mem) = efi::allocate_pages(pages as u64) {
-        let device_ptr = mem.as_mut_ptr() as *mut UsbMassStorage;
-        unsafe {
-            core::ptr::write(device_ptr, device);
-        }
-
-        // Get controller type for logging before storing
-        let controller_type = unsafe { (*controller_ptr).controller_type() };
-
-        *GLOBAL_USB_STATE.lock() = Some(GlobalUsbState {
-            device_ptr,
-            controller_ptr,
-        });
-        log::info!(
-            "USB mass storage device stored globally (controller: {})",
-            controller_type
+    if controller_index >= super::controller_count() {
+        log::error!(
+            "Failed to get USB controller {} for global device",
+            controller_index
         );
-        true
-    } else {
-        log::error!("Failed to allocate memory for global USB device");
-        false
+        return false;
     }
-}
-
-/// Get a raw pointer to the global USB mass storage device.
-///
-/// The pointer remains valid for the firmware lifetime. Callers must only
-/// create a temporary `&mut UsbMassStorage` for the immediate operation and
-/// must not retain it across calls that may access the same global device.
-pub fn get_global_device_ptr() -> Option<*mut UsbMassStorage> {
-    GLOBAL_USB_STATE
-        .lock()
-        .as_ref()
-        .map(|state| state.device_ptr)
+    *GLOBAL_USB_STATE.lock() = Some(GlobalUsbState {
+        device,
+        controller_index,
+    });
+    log::info!("USB mass storage device stored globally");
+    true
 }
 
 /// Access the global USB mass storage device through a scoped mutable borrow.
 pub fn with_global_device<R>(f: impl FnOnce(&mut UsbMassStorage) -> R) -> Option<R> {
-    let device_ptr = get_global_device_ptr()?;
-    // Safety: The device pointer was allocated with EFI pages and remains valid
-    // for the firmware lifetime. The borrow is scoped to this closure.
-    Some(f(unsafe { &mut *device_ptr }))
+    let mut state = GLOBAL_USB_STATE.lock();
+    Some(f(&mut state.as_mut()?.device))
+}
+
+/// Access the selected mass-storage device and its controller under scoped locks.
+pub fn with_global_device_and_controller<R>(
+    controller_index: usize,
+    f: impl FnOnce(&mut UsbMassStorage, &mut dyn UsbController) -> R,
+) -> Option<R> {
+    if GLOBAL_USB_STATE.lock().as_ref()?.controller_index != controller_index {
+        return None;
+    }
+    super::with_controller(controller_index, |controller| {
+        with_global_device(|device| f(device, controller))
+    })
+    .flatten()
 }
 
 /// Read sectors from the global USB device
@@ -1047,36 +980,31 @@ pub fn with_global_device<R>(f: impl FnOnce(&mut UsbMassStorage) -> R) -> Option
 pub fn global_read_sectors(lba: u64, buffer: &mut [u8]) -> Result<(), ()> {
     log::trace!("USB mass storage: read LBA {}", lba);
 
-    // Get the device and controller pointers (release lock immediately)
-    let (device_ptr, controller_ptr) = {
-        let guard = GLOBAL_USB_STATE.lock();
-        match guard.as_ref() {
-            Some(state) => (state.device_ptr, state.controller_ptr),
-            None => {
-                log::error!("USB mass storage: no device configured");
-                return Err(());
-            }
+    let controller_index = GLOBAL_USB_STATE
+        .lock()
+        .as_ref()
+        .map(|state| state.controller_index)
+        .ok_or(())?;
+    with_global_device_and_controller(controller_index, |device, controller| {
+        let block_size = device.block_size as usize;
+        if block_size == 0 || buffer.is_empty() || !buffer.len().is_multiple_of(block_size) {
+            return Err(());
         }
-    };
-
-    // Safety: Pointers were set up during store_global_device and remain valid
-    // for the entire boot process (memory is allocated via efi::allocate_pages)
-    let device = unsafe { &mut *device_ptr };
-    let controller = unsafe { &mut *controller_ptr };
-
-    // Calculate how many sectors the buffer can hold
-    let block_size = device.block_size as usize;
-    let num_sectors = buffer.len().checked_div(block_size).unwrap_or(1).max(1) as u32;
-
-    let result = device.read_sectors_generic(controller, lba, num_sectors, buffer);
-    if let Err(ref e) = result {
-        log::error!(
-            "USB mass storage: read failed at LBA {} ({} sectors) via {}: {:?}",
-            lba,
-            num_sectors,
-            controller.controller_type(),
-            e
-        );
-    }
-    result.map_err(|_| ())
+        let num_sectors = u32::try_from(buffer.len() / block_size).map_err(|_| ())?;
+        device
+            .read_sectors_generic(controller, lba, num_sectors, buffer)
+            .map_err(|error| {
+                log::error!(
+                    "USB mass storage: read failed at LBA {} ({} sectors) via {}: {:?}",
+                    lba,
+                    num_sectors,
+                    controller.controller_type(),
+                    error
+                );
+            })
+    })
+    .unwrap_or_else(|| {
+        log::error!("USB mass storage: no device configured");
+        Err(())
+    })
 }

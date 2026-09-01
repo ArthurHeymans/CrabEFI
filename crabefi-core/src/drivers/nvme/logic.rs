@@ -13,7 +13,7 @@ pub struct PendingCommand {
 }
 
 /// Pure queue bookkeeping for one NVMe submission/completion queue pair.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug)]
 pub struct QueueState {
     /// Actual controller-supported queue depth.
     pub depth: u16,
@@ -97,11 +97,22 @@ impl QueueState {
         }
     }
 
+    /// Return whether a completion can safely update this queue's state.
+    pub fn accepts_completion(&self, cid: u16, sq_head: u16) -> bool {
+        sq_head < self.depth
+            && self
+                .pending
+                .iter()
+                .flatten()
+                .any(|pending| pending.cid == cid)
+    }
+
     /// Retire a completed CID and record controller-reported SQ progress.
     pub fn retire(&mut self, cid: u16, sq_head: u16) -> Option<PendingCommand> {
-        if sq_head < self.depth {
-            self.sq_head = sq_head;
+        if !self.accepts_completion(cid, sq_head) {
+            return None;
         }
+        self.sq_head = sq_head;
         let entry = self
             .pending
             .iter_mut()
@@ -263,6 +274,12 @@ mod tests {
         let (other, _) = queue.reserve().expect("test fixture should be valid");
         assert!(queue.reserve().is_none());
         assert!(queue.mark_timed_out(late));
+        let original_head = queue.sq_head;
+        assert!(!queue.accepts_completion(u16::MAX, 1));
+        assert!(!queue.accepts_completion(late, queue.depth));
+        assert!(queue.retire(u16::MAX, 1).is_none());
+        assert!(queue.retire(late, queue.depth).is_none());
+        assert_eq!(queue.sq_head, original_head);
 
         // A poll batch must be able to retire a stale completion before the
         // requested CID and continue through another completion after it.

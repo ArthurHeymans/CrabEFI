@@ -226,93 +226,94 @@ extern "efiapi" fn nvme_pass_thru(
         packet.queue_type
     );
 
-    // Get the controller
-    // Safety: pointer valid for firmware lifetime; no overlapping &mut created
-    let controller = match nvme::get_controller(ctx.controller_index) {
-        Some(ptr) => unsafe { &mut *ptr },
-        None => {
-            log::error!("NvmePassThru.PassThru: controller not found");
-            return Status::DEVICE_ERROR;
-        }
-    };
+    nvme::with_controller(ctx.controller_index, |controller| {
+        // For now, we support a limited set of commands via the existing API
+        // In a full implementation, we would submit raw commands to the queues
 
-    // For now, we support a limited set of commands via the existing API
-    // In a full implementation, we would submit raw commands to the queues
+        // Check if this is a security command
+        if packet.queue_type == NVME_ADMIN_QUEUE {
+            match opcode {
+                0x82 => {
+                    // Security Receive
+                    if !packet.transfer_buffer.is_null() && packet.transfer_length > 0 {
+                        let buffer = unsafe {
+                            core::slice::from_raw_parts_mut(
+                                packet.transfer_buffer as *mut u8,
+                                packet.transfer_length as usize,
+                            )
+                        };
+                        let protocol_id = ((cmd.cdw10 >> 24) & 0xFF) as u8;
+                        let sp_specific = (cmd.cdw10 & 0xFFFF) as u16;
 
-    // Check if this is a security command
-    if packet.queue_type == NVME_ADMIN_QUEUE {
-        match opcode {
-            0x82 => {
-                // Security Receive
-                if !packet.transfer_buffer.is_null() && packet.transfer_length > 0 {
-                    let buffer = unsafe {
-                        core::slice::from_raw_parts_mut(
-                            packet.transfer_buffer as *mut u8,
-                            packet.transfer_length as usize,
-                        )
-                    };
-                    let protocol_id = ((cmd.cdw10 >> 24) & 0xFF) as u8;
-                    let sp_specific = (cmd.cdw10 & 0xFFFF) as u16;
-
-                    match controller.security_receive(
-                        namespace_id,
-                        protocol_id,
-                        sp_specific,
-                        buffer,
-                    ) {
-                        Ok(bytes) => {
-                            if !packet.nvme_completion.is_null() {
-                                let completion = unsafe { &mut *packet.nvme_completion };
-                                completion.dw0 = bytes as u32;
-                                completion.dw1 = 0;
-                                completion.dw2 = 0;
-                                completion.dw3 = 0; // Success
+                        match controller.security_receive(
+                            namespace_id,
+                            protocol_id,
+                            sp_specific,
+                            buffer,
+                        ) {
+                            Ok(bytes) => {
+                                if !packet.nvme_completion.is_null() {
+                                    let completion = unsafe { &mut *packet.nvme_completion };
+                                    completion.dw0 = bytes as u32;
+                                    completion.dw1 = 0;
+                                    completion.dw2 = 0;
+                                    completion.dw3 = 0; // Success
+                                }
+                                return Status::SUCCESS;
                             }
-                            return Status::SUCCESS;
+                            Err(_) => return Status::DEVICE_ERROR,
                         }
-                        Err(_) => return Status::DEVICE_ERROR,
                     }
                 }
-            }
-            0x81 => {
-                // Security Send
-                if !packet.transfer_buffer.is_null() && packet.transfer_length > 0 {
-                    let buffer = unsafe {
-                        core::slice::from_raw_parts(
-                            packet.transfer_buffer as *const u8,
-                            packet.transfer_length as usize,
-                        )
-                    };
-                    let protocol_id = ((cmd.cdw10 >> 24) & 0xFF) as u8;
-                    let sp_specific = (cmd.cdw10 & 0xFFFF) as u16;
+                0x81 => {
+                    // Security Send
+                    if !packet.transfer_buffer.is_null() && packet.transfer_length > 0 {
+                        let buffer = unsafe {
+                            core::slice::from_raw_parts(
+                                packet.transfer_buffer as *const u8,
+                                packet.transfer_length as usize,
+                            )
+                        };
+                        let protocol_id = ((cmd.cdw10 >> 24) & 0xFF) as u8;
+                        let sp_specific = (cmd.cdw10 & 0xFFFF) as u16;
 
-                    match controller.security_send(namespace_id, protocol_id, sp_specific, buffer) {
-                        Ok(()) => {
-                            if !packet.nvme_completion.is_null() {
-                                let completion = unsafe { &mut *packet.nvme_completion };
-                                completion.dw0 = 0;
-                                completion.dw1 = 0;
-                                completion.dw2 = 0;
-                                completion.dw3 = 0; // Success
+                        match controller.security_send(
+                            namespace_id,
+                            protocol_id,
+                            sp_specific,
+                            buffer,
+                        ) {
+                            Ok(()) => {
+                                if !packet.nvme_completion.is_null() {
+                                    let completion = unsafe { &mut *packet.nvme_completion };
+                                    completion.dw0 = 0;
+                                    completion.dw1 = 0;
+                                    completion.dw2 = 0;
+                                    completion.dw3 = 0; // Success
+                                }
+                                return Status::SUCCESS;
                             }
-                            return Status::SUCCESS;
+                            Err(_) => return Status::DEVICE_ERROR,
                         }
-                        Err(_) => return Status::DEVICE_ERROR,
                     }
                 }
+                _ => {
+                    log::warn!("NvmePassThru: unsupported admin opcode {:#x}", opcode);
+                    return Status::UNSUPPORTED;
+                }
             }
-            _ => {
-                log::warn!("NvmePassThru: unsupported admin opcode {:#x}", opcode);
-                return Status::UNSUPPORTED;
-            }
+        } else {
+            // I/O commands - for now just return unsupported
+            log::warn!("NvmePassThru: I/O commands not yet implemented");
+            return Status::UNSUPPORTED;
         }
-    } else {
-        // I/O commands - for now just return unsupported
-        log::warn!("NvmePassThru: I/O commands not yet implemented");
-        return Status::UNSUPPORTED;
-    }
 
-    Status::INVALID_PARAMETER
+        Status::INVALID_PARAMETER
+    })
+    .unwrap_or_else(|| {
+        log::error!("NvmePassThru.PassThru: controller not found");
+        Status::DEVICE_ERROR
+    })
 }
 
 /// Get the next namespace ID
@@ -334,44 +335,39 @@ extern "efiapi" fn nvme_get_next_namespace(
         }
     };
 
-    // Safety: pointer valid for firmware lifetime; no overlapping &mut created
-    let controller = match nvme::get_controller(ctx.controller_index) {
-        Some(ptr) => unsafe { &mut *ptr },
-        None => {
-            return Status::DEVICE_ERROR;
-        }
-    };
+    nvme::with_controller(ctx.controller_index, |controller| {
+        let namespaces = controller.namespaces();
+        let current_nsid = unsafe { *namespace_id };
 
-    let namespaces = controller.namespaces();
-    let current_nsid = unsafe { *namespace_id };
+        log::debug!(
+            "NvmePassThru.GetNextNamespace: current={:#x}, total={}",
+            current_nsid,
+            namespaces.len()
+        );
 
-    log::debug!(
-        "NvmePassThru.GetNextNamespace: current={:#x}, total={}",
-        current_nsid,
-        namespaces.len()
-    );
-
-    if current_nsid == 0xFFFFFFFF {
-        // Return first namespace
-        if let Some(ns) = namespaces.first() {
-            unsafe { *namespace_id = ns.nsid };
-            return Status::SUCCESS;
-        }
-        return Status::NOT_FOUND;
-    }
-
-    // Find current namespace and return the next one
-    for (i, ns) in namespaces.iter().enumerate() {
-        if ns.nsid == current_nsid {
-            if let Some(next) = namespaces.get(i + 1) {
-                unsafe { *namespace_id = next.nsid };
+        if current_nsid == 0xFFFFFFFF {
+            // Return first namespace
+            if let Some(ns) = namespaces.first() {
+                unsafe { *namespace_id = ns.nsid };
                 return Status::SUCCESS;
             }
             return Status::NOT_FOUND;
         }
-    }
 
-    Status::NOT_FOUND
+        // Find current namespace and return the next one
+        for (i, ns) in namespaces.iter().enumerate() {
+            if ns.nsid == current_nsid {
+                if let Some(next) = namespaces.get(i + 1) {
+                    unsafe { *namespace_id = next.nsid };
+                    return Status::SUCCESS;
+                }
+                return Status::NOT_FOUND;
+            }
+        }
+
+        Status::NOT_FOUND
+    })
+    .unwrap_or(Status::DEVICE_ERROR)
 }
 
 /// Build a device path for a namespace
@@ -476,14 +472,14 @@ pub fn create_nvme_pass_thru_protocol(
     };
 
     // Get controller to read version
-    // Safety: pointer valid for firmware lifetime; no overlapping &mut created
-    let nvme_version = match nvme::get_controller(controller_index) {
-        Some(ptr) => unsafe { &mut *ptr }.nvme_version(),
-        None => {
-            log::error!("NvmePassThru: controller {} not found", controller_index);
-            return core::ptr::null_mut();
-        }
-    };
+    let nvme_version =
+        match nvme::with_controller(controller_index, |controller| controller.nvme_version()) {
+            Some(version) => version,
+            None => {
+                log::error!("NvmePassThru: controller {} not found", controller_index);
+                return core::ptr::null_mut();
+            }
+        };
 
     // Allocate mode structure
     let mode_ptr =

@@ -444,16 +444,14 @@ fn discover_entries_on_disk(
 fn discover_nvme_entries(menu: &mut BootMenu) {
     use crate::drivers::nvme;
 
-    let Some(controller_ptr) = nvme::get_controller(0) else {
+    let Some((nsid, pci_addr)) = nvme::with_controller(0, |controller| {
+        controller
+            .default_namespace()
+            .map(|namespace| (namespace.nsid, controller.pci_address()))
+    })
+    .flatten() else {
         return;
     };
-    // Safety: pointer valid for firmware lifetime; no overlapping &mut created
-    let controller = unsafe { &mut *controller_ptr };
-    let Some(ns) = controller.default_namespace() else {
-        return;
-    };
-    let nsid = ns.nsid;
-    let pci_addr = controller.pci_address();
 
     if !nvme::store_global_device(0, nsid) {
         return;
@@ -489,13 +487,11 @@ fn discover_nvme_entries(menu: &mut BootMenu) {
 fn discover_ahci_entries(menu: &mut BootMenu) {
     use crate::drivers::ahci;
 
-    let Some(controller_ptr) = ahci::get_controller(0) else {
+    let Some((pci_addr, num_ports)) = ahci::with_controller(0, |controller| {
+        (controller.pci_address(), controller.num_active_ports())
+    }) else {
         return;
     };
-    // Safety: pointer valid for firmware lifetime; no overlapping &mut created
-    let controller = unsafe { &mut *controller_ptr };
-    let pci_addr = controller.pci_address();
-    let num_ports = controller.num_active_ports();
 
     for port_index in 0..num_ports {
         if !ahci::store_global_device(0, port_index) {
@@ -614,35 +610,23 @@ fn discover_usb_entries(menu: &mut BootMenu) {
         device_addr
     );
 
-    let Some(controller_ptr) = usb::get_controller_ptr(controller_id) else {
-        log::error!("Failed to get controller {} pointer", controller_id);
-        return;
-    };
-
     // Create and store the mass storage device
-    let device_created = usb::with_controller(controller_id, |controller| {
-        match UsbMassStorage::new(controller, device_addr) {
-            Ok(usb_device) => {
-                if usb_device.num_blocks == 0 {
-                    log::info!("USB Mass Storage: no media present, skipping");
-                    return false;
-                }
-                // SAFETY: controller_ptr is obtained from get_controller_ptr and is valid
-                unsafe {
-                    mass_storage::store_global_device_with_controller_ptr(
-                        usb_device,
-                        controller_ptr,
-                    )
-                }
-            }
-            Err(e) => {
-                log::debug!("Failed to create USB mass storage: {:?}", e);
-                false
-            }
-        }
+    let device = usb::with_controller(controller_id, |controller| {
+        UsbMassStorage::new(controller, device_addr)
     });
-
-    if device_created != Some(true) {
+    let usb_device = match device {
+        Some(Ok(device)) if device.num_blocks != 0 => device,
+        Some(Ok(_)) => {
+            log::info!("USB Mass Storage: no media present, skipping");
+            return;
+        }
+        Some(Err(error)) => {
+            log::debug!("Failed to create USB mass storage: {:?}", error);
+            return;
+        }
+        None => return,
+    };
+    if !mass_storage::store_global_device(usb_device, controller_id) {
         return;
     }
 
@@ -676,17 +660,19 @@ fn discover_sdhci_entries(menu: &mut BootMenu) {
     use crate::drivers::sdhci;
 
     for controller_id in 0..sdhci::controller_count() {
-        let Some(controller_ptr) = sdhci::get_controller(controller_id) else {
+        let Some((pci_device, pci_function, label)) =
+            sdhci::with_controller(controller_id, |controller| {
+                if !controller.is_ready() {
+                    return None;
+                }
+                Some(match controller.pci_address() {
+                    Some(addr) => (addr.device(), addr.function(), "SD card"),
+                    None => (0, 0, "eMMC"),
+                })
+            })
+            .flatten()
+        else {
             continue;
-        };
-        // Safety: pointer valid for firmware lifetime
-        let controller = unsafe { &mut *controller_ptr };
-        if !controller.is_ready() {
-            continue;
-        }
-        let (pci_device, pci_function, label) = match controller.pci_address() {
-            Some(addr) => (addr.device(), addr.function(), "SD card"),
-            None => (0, 0, "eMMC"),
         };
 
         if !sdhci::store_global_device(controller_id) {

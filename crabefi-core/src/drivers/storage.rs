@@ -3,6 +3,8 @@
 //! This module provides a common interface for all storage devices (USB, NVMe, AHCI)
 //! that can be used by the BlockIO protocol and filesystem code.
 
+use spin::Mutex;
+
 /// Maximum number of storage devices we can track
 const MAX_STORAGE_DEVICES: usize = 8;
 
@@ -20,9 +22,15 @@ pub const MAX_PLATFORM_BLOCK_DEVICES: usize = 8;
 ///
 /// Every non-zero entry is a valid `*mut dyn platform::BlockDevice` whose
 /// referent lives for the firmware's entire lifetime (`init_platform` is `-> !`).
-static mut PLATFORM_BLOCK_PTRS: [[usize; 2]; MAX_PLATFORM_BLOCK_DEVICES] =
-    [[0; 2]; MAX_PLATFORM_BLOCK_DEVICES];
-static mut PLATFORM_BLOCK_COUNT: usize = 0;
+struct PlatformBlockRegistry {
+    pointers: [[usize; 2]; MAX_PLATFORM_BLOCK_DEVICES],
+    count: usize,
+}
+
+static PLATFORM_BLOCKS: Mutex<PlatformBlockRegistry> = Mutex::new(PlatformBlockRegistry {
+    pointers: [[0; 2]; MAX_PLATFORM_BLOCK_DEVICES],
+    count: 0,
+});
 
 /// Register platform-provided block devices from [`crate::PlatformConfig`].
 ///
@@ -35,26 +43,23 @@ pub unsafe fn register_platform_block_devices(
     devices: &mut [&mut dyn crate::platform::BlockDevice],
 ) {
     let count = devices.len().min(MAX_PLATFORM_BLOCK_DEVICES);
+    let mut registry = PLATFORM_BLOCKS.lock();
     for (i, dev) in devices.iter_mut().enumerate().take(count) {
         let fat: *mut dyn crate::platform::BlockDevice = *dev;
         // SAFETY: A trait object pointer is exactly two usizes (data + vtable).
         // We store it raw and reconstruct it in with_platform_block_device().
         unsafe {
-            PLATFORM_BLOCK_PTRS[i] =
+            registry.pointers[i] =
                 core::mem::transmute::<*mut dyn crate::platform::BlockDevice, [usize; 2]>(fat);
         }
     }
-    unsafe {
-        PLATFORM_BLOCK_COUNT = count;
-    }
+    registry.count = count;
     log::info!("Registered {} platform block device(s)", count);
 }
 
 /// Number of registered platform block devices.
 pub fn platform_block_device_count() -> usize {
-    // SAFETY: read-only after init_platform() completes registration;
-    // single-threaded firmware.
-    unsafe { PLATFORM_BLOCK_COUNT }
+    PLATFORM_BLOCKS.lock().count
 }
 
 /// Access a platform block device by index, calling `f` with a mutable reference.
@@ -64,15 +69,14 @@ pub fn with_platform_block_device<R>(
     index: usize,
     f: impl FnOnce(&mut dyn crate::platform::BlockDevice) -> R,
 ) -> Option<R> {
-    // SAFETY: single-threaded firmware; read-only count set during init.
-    let count = unsafe { PLATFORM_BLOCK_COUNT };
-    if index >= count {
+    let registry = PLATFORM_BLOCKS.lock();
+    if index >= registry.count {
         return None;
     }
-    // SAFETY: PLATFORM_BLOCK_PTRS[index] was written by register_platform_block_devices()
+    // SAFETY: the pointer entry was written by register_platform_block_devices()
     // from a valid `*mut dyn BlockDevice`. The referent is alive (-> ! contract).
     unsafe {
-        let words = PLATFORM_BLOCK_PTRS[index];
+        let words = registry.pointers[index];
         if words[0] == 0 {
             return None;
         }
@@ -214,49 +218,41 @@ pub fn read_sectors(device_id: u32, lba: u64, buffer: &mut [u8]) -> Result<(), (
         StorageType::Nvme {
             controller_id,
             nsid,
-        } => {
-            if let Some(controller_ptr) = crate::drivers::nvme::get_controller(controller_id) {
-                // Safety: pointer valid for firmware lifetime; no overlapping &mut created
-                let controller = unsafe { &mut *controller_ptr };
-                controller
-                    .read_sectors(nsid, lba, num_sectors, buffer.as_mut_ptr())
-                    .map_err(|e| {
-                        log::error!("NVMe read failed at LBA {}: {:?}", lba, e);
-                    })
-            } else {
-                log::error!("NVMe controller {} not found", controller_id);
-                Err(())
-            }
-        }
+        } => crate::drivers::nvme::with_controller(controller_id, |controller| {
+            controller
+                .read_sectors(nsid, lba, num_sectors, buffer)
+                .map_err(|error| {
+                    log::error!("NVMe read failed at LBA {}: {:?}", lba, error);
+                })
+        })
+        .unwrap_or_else(|| {
+            log::error!("NVMe controller {} not found", controller_id);
+            Err(())
+        }),
         StorageType::Ahci {
             controller_id,
             port,
-        } => {
-            if let Some(controller_ptr) = crate::drivers::ahci::get_controller(controller_id) {
-                let controller = unsafe { &mut *controller_ptr };
-                unsafe {
-                    controller
-                        .read_sectors(port, lba, num_sectors, buffer.as_mut_ptr())
-                        .map_err(|e| {
-                            log::error!("AHCI read failed at LBA {}: {:?}", lba, e);
-                        })
-                }
-            } else {
-                log::error!("AHCI controller {} not found", controller_id);
-                Err(())
-            }
-        }
-        StorageType::Sdhci { controller_id } => {
-            if let Some(controller_ptr) = crate::drivers::sdhci::get_controller(controller_id) {
-                // Safety: pointer valid for firmware lifetime; no overlapping &mut created
-                let controller = unsafe { &mut *controller_ptr };
-                controller.read_sector(lba, buffer).map_err(|e| {
-                    log::error!("SDHCI read failed at LBA {}: {:?}", lba, e);
+        } => crate::drivers::ahci::with_controller(controller_id, |controller| {
+            controller
+                .read_sectors_into(port, lba, num_sectors, buffer)
+                .map_err(|error| {
+                    log::error!("AHCI read failed at LBA {}: {:?}", lba, error);
                 })
-            } else {
+        })
+        .unwrap_or_else(|| {
+            log::error!("AHCI controller {} not found", controller_id);
+            Err(())
+        }),
+        StorageType::Sdhci { controller_id } => {
+            crate::drivers::sdhci::with_controller(controller_id, |controller| {
+                controller.read_sector(lba, buffer).map_err(|error| {
+                    log::error!("SDHCI read failed at LBA {}: {:?}", lba, error);
+                })
+            })
+            .unwrap_or_else(|| {
                 log::error!("SDHCI controller {} not found", controller_id);
                 Err(())
-            }
+            })
         }
         StorageType::Platform { index } => with_platform_block_device(index, |dev| {
             let info = dev.info();

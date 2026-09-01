@@ -275,16 +275,15 @@ fn try_boot_file_from_esps(file_path: &str) -> boot_vars::BootAttemptResult {
 fn try_boot_file_on_nvme(file_path: &str) -> bool {
     use crate::drivers::nvme;
 
-    for controller_id in 0.. {
-        let Some(controller_ptr) = nvme::get_controller(controller_id) else {
-            break;
-        };
-        let controller = unsafe { &mut *controller_ptr };
-        let Some(ns) = controller.default_namespace() else {
+    for controller_id in 0..nvme::controller_count() {
+        let Some((nsid, pci_addr)) = nvme::with_controller(controller_id, |controller| {
+            controller
+                .default_namespace()
+                .map(|namespace| (namespace.nsid, controller.pci_address()))
+        })
+        .flatten() else {
             continue;
         };
-        let nsid = ns.nsid;
-        let pci_addr = controller.pci_address();
 
         if !nvme::store_global_device(controller_id, nsid) {
             continue;
@@ -311,13 +310,12 @@ fn try_boot_file_on_nvme(file_path: &str) -> bool {
 fn try_boot_file_on_ahci(file_path: &str) -> bool {
     use crate::drivers::ahci;
 
-    for controller_id in 0.. {
-        let Some(controller_ptr) = ahci::get_controller(controller_id) else {
-            break;
+    for controller_id in 0..ahci::controller_count() {
+        let Some((pci_addr, num_ports)) = ahci::with_controller(controller_id, |controller| {
+            (controller.pci_address(), controller.num_active_ports())
+        }) else {
+            continue;
         };
-        let controller = unsafe { &mut *controller_ptr };
-        let pci_addr = controller.pci_address();
-        let num_ports = controller.num_active_ports();
 
         for port_index in 0..num_ports {
             if !ahci::store_global_device(controller_id, port_index) {
@@ -347,29 +345,12 @@ fn try_boot_file_on_usb(file_path: &str) -> bool {
     let Some((controller_id, device_addr)) = usb::find_mass_storage() else {
         return false;
     };
-    let Some(controller_ptr) = usb::get_controller_ptr(controller_id) else {
+    let Some(Ok(usb_device)) = usb::with_controller(controller_id, |controller| {
+        UsbMassStorage::new(controller, device_addr)
+    }) else {
         return false;
     };
-
-    let device_created =
-        usb::with_controller(controller_id, |controller| {
-            match UsbMassStorage::new(controller, device_addr) {
-                Ok(usb_device) => {
-                    if usb_device.num_blocks == 0 {
-                        return false;
-                    }
-                    unsafe {
-                        mass_storage::store_global_device_with_controller_ptr(
-                            usb_device,
-                            controller_ptr,
-                        )
-                    }
-                }
-                Err(_) => false,
-            }
-        });
-
-    if device_created != Some(true) {
+    if usb_device.num_blocks == 0 || !mass_storage::store_global_device(usb_device, controller_id) {
         return false;
     }
 
@@ -385,17 +366,19 @@ fn try_boot_file_on_sdhci(file_path: &str) -> bool {
     use crate::drivers::sdhci;
 
     for controller_id in 0..sdhci::controller_count() {
-        let Some(controller_ptr) = sdhci::get_controller(controller_id) else {
+        let Some((pci_device, pci_function)) =
+            sdhci::with_controller(controller_id, |controller| {
+                controller.is_ready().then(|| {
+                    controller
+                        .pci_address()
+                        .map(|addr| (addr.device(), addr.function()))
+                        .unwrap_or((0, 0))
+                })
+            })
+            .flatten()
+        else {
             continue;
         };
-        let controller = unsafe { &mut *controller_ptr };
-        if !controller.is_ready() {
-            continue;
-        }
-        let (pci_device, pci_function) = controller
-            .pci_address()
-            .map(|addr| (addr.device(), addr.function()))
-            .unwrap_or((0, 0));
 
         if !sdhci::store_global_device(controller_id) {
             continue;

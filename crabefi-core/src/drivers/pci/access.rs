@@ -380,8 +380,8 @@ impl PciAccess for AnyPciAccess {
     }
 }
 
-/// Select ECAM when described, otherwise x86 legacy CAM or unavailable PCI.
-pub fn create_access(regions: &[PciEcamRegion]) -> AnyPciAccess {
+/// Select ECAM when validly described, otherwise an explicitly permitted legacy CAM.
+pub fn create_access(regions: &[PciEcamRegion], allow_legacy_cam: bool) -> AnyPciAccess {
     if let Some(ecam) = EcamAccess::new(regions) {
         log::info!("PCI: using {} ECAM allocation(s)", ecam.regions().len());
         return AnyPciAccess::Ecam(ecam);
@@ -389,11 +389,17 @@ pub fn create_access(regions: &[PciEcamRegion]) -> AnyPciAccess {
 
     #[cfg(target_arch = "x86_64")]
     {
-        log::info!("PCI: no ECAM; using legacy segment-0 I/O CAM");
-        AnyPciAccess::IoCam(IoCamAccess)
+        if allow_legacy_cam {
+            log::info!("PCI: no ECAM supplied; using legacy segment-0 I/O CAM");
+            AnyPciAccess::IoCam(IoCamAccess)
+        } else {
+            log::error!("PCI unavailable: explicit ECAM configuration was invalid");
+            AnyPciAccess::Unavailable
+        }
     }
     #[cfg(not(target_arch = "x86_64"))]
     {
+        let _ = allow_legacy_cam;
         log::warn!("PCI unavailable: no valid ECAM allocation");
         AnyPciAccess::Unavailable
     }

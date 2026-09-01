@@ -31,26 +31,16 @@ pub fn init() {
 /// Initialize NVMe pass-through protocols
 fn init_nvme_pass_thru() {
     // Iterate over all NVMe controllers
-    for controller_index in 0..8 {
-        let Some(controller_ptr) = nvme::get_controller(controller_index) else {
-            break;
-        };
-        // Guard against null or obviously-invalid pointers (can happen if the
-        // controller registry's internal Vec is corrupted, e.g. by a stray DMA
-        // write or memory overlap).
-        if controller_ptr.is_null() || (controller_ptr as usize) < 0x1000 {
-            log::warn!(
-                "NVMe controller {} has invalid pointer {:p}, skipping",
-                controller_index,
-                controller_ptr,
-            );
+    for controller_index in 0..nvme::controller_count() {
+        let Some((pci_addr, namespaces)) = nvme::with_controller(controller_index, |controller| {
+            let mut namespaces = heapless::Vec::<_, 8>::new();
+            namespaces
+                .extend_from_slice(controller.namespaces())
+                .expect("NVMe namespace registry capacity must match protocol capacity");
+            (controller.pci_address(), namespaces)
+        }) else {
             continue;
-        }
-        // Safety: pointer valid for firmware lifetime; no overlapping &mut created
-        let controller = unsafe { &mut *controller_ptr };
-
-        let pci_addr = controller.pci_address();
-        let namespaces = controller.namespaces();
+        };
 
         if namespaces.is_empty() {
             continue;
@@ -159,15 +149,12 @@ fn init_nvme_pass_thru() {
 /// Initialize AHCI/SATA pass-through protocols
 fn init_ahci_pass_thru() {
     // Iterate over all AHCI controllers
-    for controller_index in 0..4 {
-        let Some(controller_ptr) = ahci::get_controller(controller_index) else {
-            break;
+    for controller_index in 0..ahci::controller_count() {
+        let Some((pci_addr, num_ports)) = ahci::with_controller(controller_index, |controller| {
+            (controller.pci_address(), controller.num_active_ports())
+        }) else {
+            continue;
         };
-        // Safety: pointer valid for firmware lifetime; no overlapping &mut created
-        let controller = unsafe { &mut *controller_ptr };
-
-        let pci_addr = controller.pci_address();
-        let num_ports = controller.num_active_ports();
 
         if num_ports == 0 {
             continue;
@@ -226,12 +213,19 @@ fn init_ahci_pass_thru() {
 
         // For each active port, install Storage Security Command Protocol
         for port_index in 0..num_ports {
-            let Some(port) = controller.get_port(port_index) else {
+            let Some((port_num, device_type)) =
+                ahci::with_controller(controller_index, |controller| {
+                    controller
+                        .get_port(port_index)
+                        .map(|port| (port.port_num, port.device_type))
+                })
+                .flatten()
+            else {
                 continue;
             };
 
             // Skip non-SATA devices (no TCG Opal support)
-            if port.device_type != ahci::DeviceType::Sata {
+            if device_type != ahci::DeviceType::Sata {
                 continue;
             }
 
@@ -239,7 +233,7 @@ fn init_ahci_pass_thru() {
             let device_handle = match boot_services::create_handle() {
                 Some(h) => h,
                 None => {
-                    log::error!("Failed to create handle for AHCI port {}", port.port_num);
+                    log::error!("Failed to create handle for AHCI port {}", port_num);
                     continue;
                 }
             };
@@ -248,7 +242,7 @@ fn init_ahci_pass_thru() {
             let device_path_ptr = device_path::create_sata_device_path(
                 pci_addr.device(),
                 pci_addr.function(),
-                port.port_num as u16,
+                port_num as u16,
             );
             if !device_path_ptr.is_null() {
                 boot_services::install_protocol(
@@ -260,7 +254,7 @@ fn init_ahci_pass_thru() {
 
             // Install Storage Security Command Protocol
             let storage_security = storage_security::create_storage_security_protocol(
-                port.port_num as u32, // Use port number as media_id
+                port_num as u32, // Use port number as media_id
                 StorageType::Ahci {
                     controller_id: controller_index,
                     port: port_index,
@@ -274,7 +268,7 @@ fn init_ahci_pass_thru() {
                 );
                 log::debug!(
                     "Installed Storage Security Protocol on AHCI port {} handle {:?}",
-                    port.port_num,
+                    port_num,
                     device_handle
                 );
             }

@@ -281,7 +281,7 @@ pub unsafe fn discover_platform(rsdp_addr: u64) -> PlatformInfo {
         ECAM_BUS_STARTS[index].store(region.bus_start, Ordering::Relaxed);
         ECAM_BUS_ENDS[index].store(region.bus_end, Ordering::Relaxed);
     }
-    ECAM_REGION_COUNT.store(info.ecam_region_count, Ordering::Release);
+    ECAM_REGION_COUNT.store(info.ecam_regions.len(), Ordering::Release);
 
     // 3. Try to build the full AML interpreter for DSDT device discovery.
     match acpi::platform::AcpiPlatform::new(tables, handler) {
@@ -312,9 +312,9 @@ pub unsafe fn discover_platform(rsdp_addr: u64) -> PlatformInfo {
     if let Some(base) = info.uart_base {
         log::info!("  UART: {:#x}", base);
     }
-    if info.dsdt_device_count > 0 {
-        log::info!("  DSDT devices: {}", info.dsdt_device_count);
-        for dev in info.dsdt_devices.iter().take(info.dsdt_device_count) {
+    if !info.dsdt_devices.is_empty() {
+        log::info!("  DSDT devices: {}", info.dsdt_devices.len());
+        for dev in &info.dsdt_devices {
             if let Some(irq) = dev.irq {
                 log::info!(
                     "    {} [{}] mmio={:#x}+{:#x} irq={}",
@@ -550,7 +550,7 @@ fn discover_namespace_devices(
         if level.kind != NamespaceLevelKind::Device {
             return Ok(true);
         }
-        if info.dsdt_device_count >= MAX_DSDT_DEVICES {
+        if info.dsdt_devices.len() >= MAX_DSDT_DEVICES {
             return Ok(false); // stop recursing, array full
         }
 
@@ -657,7 +657,7 @@ fn discover_namespace_devices(
         // Only store devices that have MMIO resources.
         if mmio_base != 0 && mmio_size != 0 {
             let name = extract_device_name(path);
-            info.dsdt_devices[info.dsdt_device_count] = DsdtDevice {
+            let device = DsdtDevice {
                 hid: hid_buf,
                 hid_len: hid_len as u8,
                 name,
@@ -665,7 +665,7 @@ fn discover_namespace_devices(
                 mmio_size,
                 irq,
             };
-            info.dsdt_device_count += 1;
+            let _ = info.dsdt_devices.push(device);
         }
 
         Ok(true) // continue recursing into children

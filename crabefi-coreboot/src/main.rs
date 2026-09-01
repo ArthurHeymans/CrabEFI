@@ -1100,7 +1100,7 @@ pub extern "C" fn rust_main(coreboot_table_ptr: u64) -> ! {
     #[cfg(not(target_arch = "riscv64"))]
     if let Some(rsdp) = crabefi::state::drivers().platform.acpi_rsdp {
         let acpi_info = unsafe { acpi::discover_platform(rsdp) };
-        crabefi::state::with_drivers_mut(|d| d.acpi_info = acpi_info);
+        crabefi::state::with_drivers_mut(|d| d.acpi_info = acpi_info.clone());
 
         #[cfg(target_arch = "x86_64")]
         if let Some((tpm_hid, device)) = ["MSFT0101", "PNP0C31"]
@@ -1169,30 +1169,16 @@ pub extern "C" fn rust_main(coreboot_table_ptr: u64) -> ! {
     // causing the Linux kernel to fail mapping RuntimeServicesData in efi_mm.
     #[cfg(target_arch = "riscv64")]
     {
-        let mut ecam_found = false;
         if let Some(fdt_data) = fdt_slice
             && let Some(info) =
                 unsafe { crabefi::fdt::parse(fdt_data.as_ptr() as u64, fdt_data.len() as u32) }
         {
-            if let Some(region) = info.ecam_regions().first() {
+            for region in info.ecam_regions() {
                 log::info!("ECAM region from FDT: {:?}", region);
-                ecam_found = true;
             }
             // Store FDT info so add_platform_mmio_regions() can read it
             crabefi::state::with_drivers_mut(|d| d.fdt_info = info);
         }
-        // Fallback: use coreboot's configured QEMU-virt ECAM allocation.
-        if !ecam_found {
-            const FALLBACK: crabefi::PciEcamRegion = crabefi::PciEcamRegion {
-                base: 0x3000_0000,
-                segment: 0,
-                bus_start: 0,
-                bus_end: 0xff,
-            };
-            config.ecam_regions = core::slice::from_ref(&FALLBACK);
-            log::info!("ECAM region from coreboot config: {:?}", FALLBACK);
-        }
-
         // Now that fdt_info is populated, register MMIO regions from FDT
         crabefi::efi::add_platform_mmio_regions();
     }

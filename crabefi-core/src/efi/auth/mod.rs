@@ -122,18 +122,11 @@ fn search_nvme_disks<T>(
 ) -> Option<T> {
     use crate::drivers::{block::NvmeDisk, nvme};
 
-    // First borrow: get namespace info, then drop the reference
-    let nsid = {
-        let controller_ptr = nvme::get_controller(0)?;
-        let controller = unsafe { &*controller_ptr };
-        controller.default_namespace().map(|ns| ns.nsid)?
-    };
-
-    // Second borrow: create disk for I/O
-    let controller_ptr = nvme::get_controller(0)?;
-    let controller = unsafe { &mut *controller_ptr };
-    let mut disk = NvmeDisk::new(controller, nsid);
-    f(&mut disk, "NVMe")
+    nvme::with_controller(0, |controller| {
+        let nsid = controller.default_namespace()?.nsid;
+        let mut disk = NvmeDisk::new(controller, nsid);
+        f(&mut disk, "NVMe")
+    })?
 }
 
 fn search_ahci_disks<T>(
@@ -141,16 +134,16 @@ fn search_ahci_disks<T>(
 ) -> Option<T> {
     use crate::drivers::{ahci, block::AhciDisk};
 
-    let controller_ptr = ahci::get_controller(0)?;
-    let num_ports = unsafe { &*controller_ptr }.num_active_ports();
+    let num_ports = ahci::with_controller(0, |controller| controller.num_active_ports())?;
 
     for port_index in 0..num_ports {
-        if let Some(controller_ptr) = ahci::get_controller(0) {
-            let controller = unsafe { &mut *controller_ptr };
+        if let Some(result) = ahci::with_controller(0, |controller| {
             let mut disk = AhciDisk::new(controller, port_index);
-            if let Some(result) = f(&mut disk, "SATA") {
-                return Some(result);
-            }
+            f(&mut disk, "SATA")
+        })
+        .flatten()
+        {
+            return Some(result);
         }
     }
 
@@ -163,16 +156,15 @@ fn search_sdhci_disks<T>(
     use crate::drivers::{block::SdhciDisk, sdhci};
 
     for controller_id in 0..sdhci::controller_count() {
-        let controller_ptr = sdhci::get_controller(controller_id)?;
-        let controller = unsafe { &mut *controller_ptr };
-        if !controller.is_ready() {
-            continue;
-        }
-
-        let controller_ptr = sdhci::get_controller(controller_id)?;
-        let controller = unsafe { &mut *controller_ptr };
-        let mut disk = SdhciDisk::new(controller);
-        if let Some(result) = f(&mut disk, "SD") {
+        if let Some(result) = sdhci::with_controller(controller_id, |controller| {
+            if !controller.is_ready() {
+                return None;
+            }
+            let mut disk = SdhciDisk::new(controller);
+            f(&mut disk, "SD")
+        })
+        .flatten()
+        {
             return Some(result);
         }
     }

@@ -155,6 +155,9 @@ fn register_controller<T>(
             name,
             address
         );
+        // SAFETY: registration failed, so the initialized controller is still
+        // exclusively owned by this allocation and must be dropped before free.
+        unsafe { ptr::drop_in_place(controller_ptr) };
         efi::free_pages(alloc, pages as u64);
         return Err(());
     }
@@ -437,29 +440,6 @@ where
     let result = with_usb_controller!(handle, mut |controller| f(controller));
 
     Some(result)
-}
-
-/// Get a raw pointer to a controller
-///
-/// This is useful when you need to store the controller pointer for later use,
-/// such as in global_read_sectors. The pointer remains valid for the entire boot
-/// process since controllers are allocated via efi::allocate_pages and never freed.
-///
-/// # Safety
-/// The caller must ensure the controller is not accessed after ExitBootServices.
-pub fn get_controller_ptr(index: usize) -> Option<*mut dyn UsbController> {
-    let controllers = ALL_CONTROLLERS.lock();
-    let handle = controllers.get(index)?;
-
-    let ptr: *mut dyn UsbController = match handle {
-        UsbControllerHandle::Xhci(p) => *p as *mut dyn UsbController,
-        UsbControllerHandle::Ehci(p) => *p as *mut dyn UsbController,
-        UsbControllerHandle::Ohci(p) => *p as *mut dyn UsbController,
-        #[cfg(target_arch = "x86_64")]
-        UsbControllerHandle::Uhci(p) => *p as *mut dyn UsbController,
-    };
-
-    Some(ptr)
 }
 
 // ============================================================================

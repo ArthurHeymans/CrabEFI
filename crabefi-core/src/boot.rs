@@ -279,9 +279,9 @@ fn create_block_device_for_sfs(
             Some(AnyBlockDevice::Usb(block_dev))
         }
         menu::DeviceType::Sdhci { controller_id } => {
-            let removable = crate::drivers::sdhci::get_controller(controller_id)
-                .map(|ptr| unsafe { (&*ptr).removable() })
-                .unwrap_or(true);
+            let removable = crate::drivers::sdhci::with_controller(controller_id, |controller| {
+                controller.removable()
+            })?;
             let block_dev = SdhciBlockDevice::new_with_removable(
                 controller_id,
                 num_blocks,

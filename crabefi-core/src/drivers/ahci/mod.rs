@@ -8,8 +8,7 @@ pub mod regs;
 
 use crate::barrier;
 use crate::drivers::pci::{self, PciDevice};
-use crate::efi;
-use crate::efi::dma::{DmaBuffer, DmaCoherency, DmaDirection, DmaMask};
+use crate::efi::dma::{DmaBuffer, DmaDirection, DmaMask};
 use crate::time::{Timeout, wait_for};
 use core::ptr;
 use spin::Mutex;
@@ -235,19 +234,10 @@ impl Default for ReceivedFis {
 pub struct AhciPort {
     /// Port number
     pub port_num: u8,
-    /// Command list (32 entries, 1KB)
-    cmd_list: *mut CommandHeader,
-    /// Received FIS (256 bytes)
-    // This field appears unused but must be kept alive — the HBA hardware
-    // writes DMA data to the memory this pointer refers to.
-    #[allow(dead_code)]
-    received_fis: *mut ReceivedFis,
-    /// Command tables (one per command slot)
-    cmd_tables: [*mut CommandTable; 32],
     /// Owns all memory programmed into CLB/FB/CTBA registers.
-    _cmd_list_dma: DmaBuffer,
+    cmd_list_dma: DmaBuffer,
     _received_fis_dma: DmaBuffer,
-    _cmd_tables_dma: DmaBuffer,
+    cmd_tables_dma: DmaBuffer,
     /// Device type
     pub device_type: DeviceType,
     /// Sector count (for SATA drives)
@@ -256,6 +246,17 @@ pub struct AhciPort {
     pub sector_size: u32,
     /// ATA address encoding selected from IDENTIFY DEVICE.
     addressing: Option<AtaAddressing>,
+}
+
+impl AhciPort {
+    fn command_header_ptr(&self, slot: u8) -> *mut CommandHeader {
+        (self.cmd_list_dma.cpu_address() as *mut CommandHeader).wrapping_add(slot as usize)
+    }
+
+    fn command_table_ptr(&self, slot: u8) -> *mut CommandTable {
+        let offset = slot as usize * core::mem::size_of::<CommandTable>();
+        (self.cmd_tables_dma.cpu_address() as *mut u8).wrapping_add(offset) as *mut CommandTable
+    }
 }
 
 /// Device type detected on port
@@ -340,6 +341,8 @@ pub enum AhciError {
     RecoveryFailed,
     /// Device does not advertise usable LBA addressing.
     UnsupportedAddressing,
+    /// No explicit platform DMA translation domain is available.
+    DmaDomainUnavailable,
     /// DMA allocation or synchronization failed.
     DmaError,
 }
@@ -357,6 +360,7 @@ impl core::fmt::Display for AhciError {
             AhciError::ResetFailed => write!(f, "HBA reset failed"),
             AhciError::RecoveryFailed => write!(f, "port recovery failed"),
             AhciError::UnsupportedAddressing => write!(f, "unsupported ATA addressing"),
+            AhciError::DmaDomainUnavailable => write!(f, "DMA domain unavailable"),
             AhciError::DmaError => write!(f, "DMA synchronization failed"),
         }
     }
@@ -427,7 +431,8 @@ impl AhciController {
     }
 
     fn allocate_dma(&self, len: usize) -> Result<DmaBuffer, AhciError> {
-        DmaBuffer::allocate(len, self.dma_mask, DmaCoherency::Coherent)
+        let domain = pci::dma_domain(self.pci_address).ok_or(AhciError::DmaDomainUnavailable)?;
+        DmaBuffer::allocate_in_domain(len, self.dma_mask, domain)
             .map_err(|_| AhciError::AllocationFailed)
     }
 
@@ -605,20 +610,15 @@ impl AhciController {
         let cmd_tables_dma = self
             .allocate_dma(usize::from(self.num_cmd_slots) * core::mem::size_of::<CommandTable>())?;
         let cmd_list_addr = cmd_list_dma.dma_address();
+        let cmd_list_cpu = cmd_list_dma.cpu_address();
         let received_fis_addr = received_fis_dma.dma_address();
         let cmd_tables_page = cmd_tables_dma.dma_address();
-        let mut cmd_tables = [ptr::null_mut(); 32];
 
-        for (i, cmd_table) in cmd_tables
-            .iter_mut()
-            .enumerate()
-            .take(self.num_cmd_slots as usize)
-        {
+        for i in 0..self.num_cmd_slots as usize {
             let table_addr = cmd_tables_page + (i * core::mem::size_of::<CommandTable>()) as u64;
-            *cmd_table = table_addr as *mut CommandTable;
 
             // Set command table address in command header
-            let header = unsafe { &mut *(cmd_list_addr as *mut CommandHeader).add(i) };
+            let header = unsafe { &mut *(cmd_list_cpu as *mut CommandHeader).add(i) };
             header.set_ctba(table_addr);
         }
 
@@ -639,12 +639,9 @@ impl AhciController {
 
         let mut port = AhciPort {
             port_num,
-            cmd_list: cmd_list_addr as *mut CommandHeader,
-            received_fis: received_fis_addr as *mut ReceivedFis,
-            cmd_tables,
-            _cmd_list_dma: cmd_list_dma,
+            cmd_list_dma,
             _received_fis_dma: received_fis_dma,
-            _cmd_tables_dma: cmd_tables_dma,
+            cmd_tables_dma,
             device_type: DeviceType::None,
             sector_count: 0,
             sector_size: 512,
@@ -844,7 +841,7 @@ impl AhciController {
             .map_err(|_| AhciError::DmaError)?;
 
         // Setup command header
-        let header = unsafe { &mut *port.cmd_list.add(slot as usize) };
+        let header = unsafe { &mut *port.command_header_ptr(slot) };
         header.dw0 = 0;
         header.set_cfl(5); // 5 DWORDs for H2D FIS
         header.set_write(false);
@@ -852,7 +849,7 @@ impl AhciController {
         header.prdbc = 0;
 
         // Setup command table
-        let table = unsafe { &mut *port.cmd_tables[slot as usize] };
+        let table = unsafe { &mut *port.command_table_ptr(slot) };
         *table = CommandTable::default();
 
         // Setup FIS
@@ -872,7 +869,7 @@ impl AhciController {
             .sync_for_cpu(0..buffer.len(), DmaDirection::FromDevice)
             .map_err(|_| AhciError::DmaError)?;
         let identify =
-            unsafe { core::slice::from_raw_parts(buffer.dma_address() as *const u16, 256) };
+            unsafe { core::slice::from_raw_parts(buffer.cpu_address() as *const u16, 256) };
 
         let identify_array: &[u16; 256] = identify
             .try_into()
@@ -913,7 +910,7 @@ impl AhciController {
         // IDENTIFY PACKET DEVICE is an ATA command, not an ATA PACKET command.
         // Do not set the AHCI command-header ATAPI bit here; that bit is only
         // for command 0xA0 with a CDB in CommandTable::acmd.
-        let header = unsafe { &mut *port.cmd_list.add(slot as usize) };
+        let header = unsafe { &mut *port.command_header_ptr(slot) };
         header.dw0 = 0;
         header.set_cfl(5);
         header.set_write(false);
@@ -921,7 +918,7 @@ impl AhciController {
         header.prdbc = 0;
 
         // Setup command table
-        let table = unsafe { &mut *port.cmd_tables[slot as usize] };
+        let table = unsafe { &mut *port.command_table_ptr(slot) };
         *table = CommandTable::default();
 
         // Setup FIS for IDENTIFY PACKET DEVICE
@@ -943,7 +940,7 @@ impl AhciController {
             .sync_for_cpu(0..buffer.len(), DmaDirection::FromDevice)
             .map_err(|_| AhciError::DmaError)?;
         let identify =
-            unsafe { core::slice::from_raw_parts(buffer.dma_address() as *const u16, 256) };
+            unsafe { core::slice::from_raw_parts(buffer.cpu_address() as *const u16, 256) };
 
         let model = extract_ata_model(identify);
         let model_str = core::str::from_utf8(&model).unwrap_or("Unknown").trim();
@@ -971,11 +968,11 @@ impl AhciController {
             .map_err(|_| AhciError::DmaError)?;
 
         // Setup command header (set ATAPI bit)
-        let header = unsafe { &mut *port.cmd_list.add(slot as usize) };
+        let header = unsafe { &mut *port.command_header_ptr(slot) };
         header.init_atapi();
 
         // Setup command table
-        let table = unsafe { &mut *port.cmd_tables[slot as usize] };
+        let table = unsafe { &mut *port.command_table_ptr(slot) };
         *table = CommandTable::default();
 
         // Setup FIS for ATAPI PACKET command
@@ -993,21 +990,8 @@ impl AhciController {
         table.prdt[0].set_address(buffer_addr);
         table.prdt[0].set_byte_count(8, true)?;
 
-        // Issue command. Empty optical drives can fail this; keep discovery
-        // responsive and mark the device as no-media below. A failed recovery
-        // is different: the HBA may still own the buffer, so retain it and
-        // propagate the failure.
         let result = self.issue_command_on_port_with_timeout(port.port_num, slot, 5000);
-        let buffer = match Self::finish_dma_command(buffer, result) {
-            Ok(buffer) => buffer,
-            Err(AhciError::RecoveryFailed) => return Err(AhciError::RecoveryFailed),
-            Err(error) => {
-                log::warn!("READ CAPACITY failed: {:?}, using defaults", error);
-                port.sector_size = 2048;
-                port.sector_count = 0;
-                return Ok(());
-            }
-        };
+        let buffer = Self::finish_dma_command(buffer, result)?;
 
         buffer
             .sync_for_cpu(0..buffer.len(), DmaDirection::FromDevice)
@@ -1046,21 +1030,24 @@ impl AhciController {
     ///
     /// Each chunk is retried up to 3 times on transient errors.
     ///
-    /// # Safety
-    ///
-    /// `buffer` must point to a valid, writable region of at least
-    /// `num_sectors * sector_size` bytes.
-    pub unsafe fn read_sectors(
+    pub fn read_sectors_into(
         &mut self,
         port_index: usize,
         start_lba: u64,
         num_sectors: u32,
-        buffer: *mut u8,
+        buffer: &mut [u8],
     ) -> Result<(), AhciError> {
-        if port_index >= self.ports.len() || num_sectors == 0 || buffer.is_null() {
+        if port_index >= self.ports.len() || num_sectors == 0 {
             return Err(AhciError::InvalidParameter);
         }
         let port = &self.ports[port_index];
+        let required_len = usize::try_from(num_sectors)
+            .ok()
+            .and_then(|count| count.checked_mul(port.sector_size as usize))
+            .ok_or(AhciError::InvalidParameter)?;
+        if buffer.len() != required_len {
+            return Err(AhciError::InvalidParameter);
+        }
         if start_lba
             .checked_add(u64::from(num_sectors))
             .is_none_or(|end| end > port.sector_count)
@@ -1082,7 +1069,7 @@ impl AhciController {
 
         while remaining > 0 {
             let chunk = remaining.min(max_chunk);
-            let buf_ptr = unsafe { buffer.add(buf_offset) };
+            let buf_ptr = unsafe { buffer.as_mut_ptr().add(buf_offset) };
 
             self.read_chunk_with_retry(port_index, device_type, lba, chunk, buf_ptr, sector_size)?;
 
@@ -1157,8 +1144,8 @@ impl AhciController {
         let byte_count = num_sectors
             .checked_mul(port.sector_size)
             .ok_or(AhciError::InvalidParameter)?;
-        let cmd_list = port.cmd_list;
-        let cmd_tables = port.cmd_tables;
+        let cmd_list = port.cmd_list_dma.cpu_address() as *mut CommandHeader;
+        let cmd_tables = port.cmd_tables_dma.cpu_address() as *mut u8;
         let bounce = self.allocate_dma(byte_count as usize)?;
         bounce
             .sync_for_device(0..bounce.len(), DmaDirection::FromDevice)
@@ -1172,7 +1159,10 @@ impl AhciController {
         header.set_write(false);
         header.set_prdtl(1);
         header.prdbc = 0;
-        let table = unsafe { &mut *cmd_tables[slot as usize] };
+        let table = unsafe {
+            &mut *(cmd_tables.add(slot as usize * core::mem::size_of::<CommandTable>())
+                as *mut CommandTable)
+        };
         *table = CommandTable::default();
         let encoded = encode_read_fis(addressing, start_lba, num_sectors)
             .ok_or(AhciError::InvalidParameter)?;
@@ -1197,7 +1187,7 @@ impl AhciController {
             .map_err(|_| AhciError::DmaError)?;
         unsafe {
             ptr::copy_nonoverlapping(
-                bounce.dma_address() as *const u8,
+                bounce.cpu_address() as *const u8,
                 buffer,
                 byte_count as usize,
             )
@@ -1225,8 +1215,8 @@ impl AhciController {
             return Err(AhciError::InvalidParameter);
         }
         let port_num = port.port_num;
-        let cmd_list = port.cmd_list;
-        let cmd_tables = port.cmd_tables;
+        let cmd_list = port.cmd_list_dma.cpu_address() as *mut CommandHeader;
+        let cmd_tables = port.cmd_tables_dma.cpu_address() as *mut u8;
         let byte_count = num_sectors
             .checked_mul(sector_size)
             .ok_or(AhciError::InvalidParameter)?;
@@ -1239,7 +1229,10 @@ impl AhciController {
             .ok_or(AhciError::PortNotReady)?;
         let header = unsafe { &mut *cmd_list.add(slot as usize) };
         header.init_atapi();
-        let table = unsafe { &mut *cmd_tables[slot as usize] };
+        let table = unsafe {
+            &mut *(cmd_tables.add(slot as usize * core::mem::size_of::<CommandTable>())
+                as *mut CommandTable)
+        };
         *table = CommandTable::default();
         let fis = unsafe { &mut *(table.cfis.as_mut_ptr() as *mut FisRegH2D) };
         *fis = FisRegH2D::new();
@@ -1264,7 +1257,7 @@ impl AhciController {
             .map_err(|_| AhciError::DmaError)?;
         unsafe {
             ptr::copy_nonoverlapping(
-                bounce.dma_address() as *const u8,
+                bounce.cpu_address() as *const u8,
                 buffer,
                 byte_count as usize,
             )
@@ -1326,19 +1319,15 @@ impl AhciController {
     fn log_port_diagnostics(&self, port_num: u8, slot: u8, timeout_ms: u64) {
         let regs = self.port_regs(port_num);
         barrier::dma_read();
-        let clb = u64::from(regs.clb.get()) | (u64::from(regs.clbu.get()) << 32);
-        let fb = u64::from(regs.fb.get()) | (u64::from(regs.fbu.get()) << 32);
-        let prdbc = if clb == 0 {
-            0
-        } else {
-            unsafe { ptr::read_volatile((clb as *const CommandHeader).add(slot as usize)) }.prdbc
-        };
-        let (d2h_status, d2h_error) = if fb == 0 {
-            (0, 0)
-        } else {
-            let received = unsafe { &*(fb as *const ReceivedFis) };
+        let port = self.ports.iter().find(|port| port.port_num == port_num);
+        let prdbc = port.map_or(0, |port| {
+            unsafe { ptr::read_volatile(port.command_header_ptr(slot)) }.prdbc
+        });
+        let (d2h_status, d2h_error) = port.map_or((0, 0), |port| {
+            let received =
+                unsafe { &*(port._received_fis_dma.cpu_address() as *const ReceivedFis) };
             (received.rfis[2], received.rfis[3])
-        };
+        });
         log::error!(
             "AHCI {} port {} slot {} failure (budget={}ms): CMD={:#x} CI={:#x} SACT={:#x} IS={:#x} SERR={:#x} TFD={:#x} SSTS={:#x} SIG={:#x} PRDBC={} D2H status/error={:#04x}/{:#04x}",
             self.pci_address,
@@ -1535,8 +1524,8 @@ impl AhciController {
         );
 
         let port_num = self.ports[port_index].port_num;
-        let cmd_list = self.ports[port_index].cmd_list;
-        let cmd_tables = self.ports[port_index].cmd_tables;
+        let cmd_list = self.ports[port_index].cmd_list_dma.cpu_address() as *mut CommandHeader;
+        let cmd_tables = self.ports[port_index].cmd_tables_dma.cpu_address() as *mut u8;
 
         let slot = self
             .find_free_slot(port_num)
@@ -1561,7 +1550,10 @@ impl AhciController {
         header.prdbc = 0;
 
         // Setup command table
-        let table = unsafe { &mut *cmd_tables[slot as usize] };
+        let table = unsafe {
+            &mut *(cmd_tables.add(slot as usize * core::mem::size_of::<CommandTable>())
+                as *mut CommandTable)
+        };
         *table = CommandTable::default();
 
         // Setup FIS for TRUSTED RECEIVE DMA
@@ -1596,7 +1588,7 @@ impl AhciController {
             .map_err(|_| AhciError::DmaError)?;
         unsafe {
             core::ptr::copy_nonoverlapping(
-                dma_buffer.dma_address() as *const u8,
+                dma_buffer.cpu_address() as *const u8,
                 buffer.as_mut_ptr(),
                 buffer.len(),
             );
@@ -1641,8 +1633,8 @@ impl AhciController {
         );
 
         let port_num = self.ports[port_index].port_num;
-        let cmd_list = self.ports[port_index].cmd_list;
-        let cmd_tables = self.ports[port_index].cmd_tables;
+        let cmd_list = self.ports[port_index].cmd_list_dma.cpu_address() as *mut CommandHeader;
+        let cmd_tables = self.ports[port_index].cmd_tables_dma.cpu_address() as *mut u8;
 
         let slot = self
             .find_free_slot(port_num)
@@ -1671,7 +1663,10 @@ impl AhciController {
         header.prdbc = 0;
 
         // Setup command table
-        let table = unsafe { &mut *cmd_tables[slot as usize] };
+        let table = unsafe {
+            &mut *(cmd_tables.add(slot as usize * core::mem::size_of::<CommandTable>())
+                as *mut CommandTable)
+        };
         *table = CommandTable::default();
 
         // Setup FIS for TRUSTED SEND DMA
@@ -1775,12 +1770,7 @@ pub fn init_device(dev: &pci::PciDevice) -> Result<(), ()> {
 ///
 /// Called during ExitBootServices to prepare for OS handoff.
 pub fn shutdown() {
-    let controllers = AHCI_CONTROLLERS.controllers.lock();
-    for controller in controllers.iter() {
-        // SAFETY: the registry lock excludes other controller users.
-        unsafe { &mut *controller.0 }.shutdown_controller();
-    }
-    drop(controllers);
+    AHCI_CONTROLLERS.for_each_mut(AhciController::shutdown_controller);
     AHCI_CONTROLLERS.shutdown_log();
 }
 
@@ -1808,19 +1798,14 @@ pub fn init() {
     );
 }
 
-/// Get a raw pointer to an AHCI controller
-///
-/// Returns a raw pointer rather than `&'static mut` to avoid aliasing UB.
-/// Callers must ensure they do not create overlapping mutable references.
-///
-/// # Safety
-///
-/// The returned pointer is valid for the firmware lifetime. Callers must
-/// convert to `&mut` only for the duration of their immediate operation
-/// and must not hold the reference across calls that may also access
-/// the same controller.
-pub fn get_controller(index: usize) -> Option<*mut AhciController> {
-    AHCI_CONTROLLERS.get(index)
+/// Access one AHCI controller while retaining exclusive registry ownership.
+pub fn with_controller<R>(index: usize, f: impl FnOnce(&mut AhciController) -> R) -> Option<R> {
+    AHCI_CONTROLLERS.with_mut(index, f)
+}
+
+/// Return the number of registered AHCI controllers.
+pub fn controller_count() -> usize {
+    AHCI_CONTROLLERS.count()
 }
 
 // SAFETY: AhciController contains raw pointers to MMIO registers and DMA buffers.
@@ -1836,49 +1821,27 @@ unsafe impl Send for AhciPort {}
 // ============================================================================
 
 /// Global AHCI device info for filesystem reads
+#[derive(Clone, Copy)]
 struct GlobalAhciDevice {
     controller_index: usize,
     port_index: usize,
 }
 
-/// Pointer wrapper for global storage
-struct GlobalAhciDevicePtr(*mut GlobalAhciDevice);
-
-// SAFETY: GlobalAhciDevicePtr wraps a pointer to GlobalAhciDevice allocated via EFI.
-// All access is protected by the GLOBAL_AHCI_DEVICE mutex.
-unsafe impl Send for GlobalAhciDevicePtr {}
-
 /// Global AHCI device for filesystem protocol
-static GLOBAL_AHCI_DEVICE: Mutex<Option<GlobalAhciDevicePtr>> = Mutex::new(None);
+static GLOBAL_AHCI_DEVICE: Mutex<Option<GlobalAhciDevice>> = Mutex::new(None);
 
 /// Store AHCI device info globally for SimpleFileSystem protocol
 pub fn store_global_device(controller_index: usize, port_index: usize) -> bool {
-    let size = core::mem::size_of::<GlobalAhciDevice>();
-    let pages = size.div_ceil(4096);
-
-    if let Some(mem) = efi::allocate_pages(pages as u64) {
-        let device_ptr = mem.as_mut_ptr() as *mut GlobalAhciDevice;
-        unsafe {
-            core::ptr::write(
-                device_ptr,
-                GlobalAhciDevice {
-                    controller_index,
-                    port_index,
-                },
-            );
-        }
-
-        *GLOBAL_AHCI_DEVICE.lock() = Some(GlobalAhciDevicePtr(device_ptr));
-        log::info!(
-            "AHCI device stored globally (controller={}, port={})",
-            controller_index,
-            port_index
-        );
-        true
-    } else {
-        log::error!("Failed to allocate memory for global AHCI device");
-        false
-    }
+    *GLOBAL_AHCI_DEVICE.lock() = Some(GlobalAhciDevice {
+        controller_index,
+        port_index,
+    });
+    log::info!(
+        "AHCI device stored globally (controller={}, port={})",
+        controller_index,
+        port_index
+    );
+    true
 }
 
 /// Read a sector from the global AHCI device
@@ -1886,67 +1849,50 @@ pub fn store_global_device(controller_index: usize, port_index: usize) -> bool {
 /// The LBA is interpreted as a device block LBA (in terms of the device's native
 /// sector size - 512 bytes for SATA, 2048 bytes for SATAPI/CD-ROM).
 pub fn global_read_sectors(lba: u64, buffer: &mut [u8]) -> Result<(), ()> {
-    let (controller_index, port_index) = match GLOBAL_AHCI_DEVICE.lock().as_ref() {
-        Some(ptr) => unsafe {
-            let device = &*ptr.0;
-            (device.controller_index, device.port_index)
-        },
+    let (controller_index, port_index) = match *GLOBAL_AHCI_DEVICE.lock() {
+        Some(device) => (device.controller_index, device.port_index),
         None => {
             log::error!("global_read_sectors: no AHCI device stored");
             return Err(());
         }
     };
 
-    // Safety: pointer valid for firmware lifetime; no overlapping &mut created
-    let controller = match get_controller(controller_index) {
-        Some(ptr) => unsafe { &mut *ptr },
-        None => {
-            log::error!(
-                "global_read_sectors: no AHCI controller at index {}",
-                controller_index
-            );
+    with_controller(controller_index, |controller| {
+        let sector_size = controller
+            .get_port(port_index)
+            .map(|port| port.sector_size as usize)
+            .ok_or(())?;
+        if sector_size == 0 || buffer.is_empty() || !buffer.len().is_multiple_of(sector_size) {
             return Err(());
         }
-    };
-
-    // Compute sector count from buffer size for multi-sector reads.
-    // The caller is responsible for providing the correct LBA in device block terms.
-    let sector_size = controller
-        .get_port(port_index)
-        .map(|p| p.sector_size as usize)
-        .unwrap_or(512);
-    if sector_size == 0 || buffer.is_empty() || !buffer.len().is_multiple_of(sector_size) {
+        let num_sectors = u32::try_from(buffer.len() / sector_size).map_err(|_| ())?;
+        controller
+            .read_sectors_into(port_index, lba, num_sectors, buffer)
+            .map_err(|error| {
+                log::error!(
+                    "global_read_sectors: read failed at LBA {}: {:?}",
+                    lba,
+                    error
+                );
+            })
+    })
+    .unwrap_or_else(|| {
         log::error!(
-            "global_read_sectors: buffer length {} is not a non-zero multiple of sector size {}",
-            buffer.len(),
-            sector_size
+            "global_read_sectors: no AHCI controller at index {}",
+            controller_index
         );
-        return Err(());
-    }
-    let num_sectors = u32::try_from(buffer.len() / sector_size).map_err(|_| ())?;
-
-    // Safety: the exact-multiple check above proves the raw read writes exactly
-    // `buffer.len()` bytes into this slice.
-    unsafe { controller.read_sectors(port_index, lba, num_sectors, buffer.as_mut_ptr()) }.map_err(
-        |e| {
-            log::error!("global_read_sectors: read failed at LBA {}: {:?}", lba, e);
-        },
-    )
+        Err(())
+    })
 }
 
 /// Get the sector size of the global AHCI device
 pub fn global_sector_size() -> Option<u32> {
     let (controller_index, port_index) = {
         let guard = GLOBAL_AHCI_DEVICE.lock();
-        let ptr = guard.as_ref()?;
-        unsafe {
-            let device = &*ptr.0;
-            (device.controller_index, device.port_index)
-        }
+        let device = guard.as_ref()?;
+        (device.controller_index, device.port_index)
     };
-
-    // Safety: pointer valid for firmware lifetime; no overlapping &mut created
-    let controller = unsafe { &mut *get_controller(controller_index)? };
-    let port = controller.get_port(port_index)?;
-    Some(port.sector_size)
+    with_controller(controller_index, |controller| {
+        controller.get_port(port_index).map(|port| port.sector_size)
+    })?
 }

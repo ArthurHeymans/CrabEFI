@@ -31,6 +31,7 @@ pub mod driver;
 pub use access::ConfigAccessError;
 use access::{AnyPciAccess, PciAccess};
 
+use crate::efi::dma::DmaDomain;
 use crate::state;
 pub use pci_types::{
     BaseClass, CommandRegister, ConfigRegionAccess, DeviceId, DeviceRevision, HeaderType,
@@ -327,6 +328,28 @@ pub fn write_config16(addr: PciAddress, offset: u16, value: u16) {
     with_access(|access| access.write16(addr, offset, value));
 }
 
+/// Return the explicitly described DMA domain for a PCI device.
+pub fn dma_domain(address: PciAddress) -> Option<DmaDomain> {
+    #[cfg(target_arch = "x86_64")]
+    {
+        let _ = address;
+        Some(DmaDomain {
+            cpu_base: 0,
+            device_base: 0,
+            size: u64::MAX,
+            coherency: crate::efi::dma::DmaCoherency::Coherent,
+        })
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let drivers = state::drivers();
+        drivers
+            .fdt_info
+            .pci_dma_domain(address.segment())
+            .or_else(|| drivers.acpi_info.pci_dma_domain(address.segment()))
+    }
+}
+
 // ============================================================================
 // Initialization
 // ============================================================================
@@ -338,8 +361,14 @@ pub fn write_config16(addr: PciAddress, offset: u16, value: u16) {
 /// enumeration and driver binding).
 pub fn init() {
     log::info!("Initializing PCI subsystem...");
-    let regions = state::drivers().pci.ecam_regions.clone();
-    let new_access = access::create_access(regions.as_slice());
+    let (regions, ecam_configured) = {
+        let drivers = state::drivers();
+        (
+            drivers.pci.ecam_regions.clone(),
+            drivers.pci.ecam_configured,
+        )
+    };
+    let new_access = access::create_access(regions.as_slice(), !ecam_configured);
 
     state::with_drivers_mut(|drivers| {
         let pci = &mut drivers.pci;
@@ -599,26 +628,29 @@ pub fn print_devices() {
 }
 
 /// Store validated, non-overlapping ECAM allocations for PCI initialization.
-pub fn set_ecam_regions(regions: &[crate::platform::PciEcamRegion]) {
-    state::with_drivers_mut(|drivers| {
-        let stored = &mut drivers.pci.ecam_regions;
-        stored.clear();
-        for &region in regions {
-            let overlaps = stored.iter().any(|current| {
-                current.segment == region.segment
-                    && current.bus_start <= region.bus_end
-                    && region.bus_start <= current.bus_end
+pub fn set_ecam_regions(regions: &[crate::platform::PciEcamRegion]) -> Result<(), ()> {
+    let mut validated =
+        heapless::Vec::<crate::platform::PciEcamRegion, { crate::fdt::MAX_ECAM_REGIONS }>::new();
+    for &region in regions {
+        let overlaps = validated.iter().any(|current| {
+            current.segment == region.segment
+                && current.bus_start <= region.bus_end
+                && region.bus_start <= current.bus_end
+        });
+        if !region.is_valid() || overlaps || validated.push(region).is_err() {
+            log::error!("PCI: rejected explicit ECAM configuration at {:?}", region);
+            state::with_drivers_mut(|drivers| {
+                drivers.pci.ecam_regions.clear();
+                drivers.pci.ecam_configured = true;
             });
-            if !region.is_valid() || overlaps {
-                log::warn!("PCI: skipping invalid/overlapping ECAM region {:?}", region);
-                continue;
-            }
-            if stored.push(region).is_err() {
-                log::warn!("PCI: ECAM region capacity exhausted");
-                break;
-            }
+            return Err(());
         }
+    }
+    state::with_drivers_mut(|drivers| {
+        drivers.pci.ecam_regions = validated;
+        drivers.pci.ecam_configured = true;
     });
+    Ok(())
 }
 
 // ============================================================================
