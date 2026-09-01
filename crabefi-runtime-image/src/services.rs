@@ -1296,6 +1296,89 @@ mod tests {
     }
 
     #[test]
+    fn imported_secure_database_deletions_keep_authenticated_history() {
+        let _guard = crate::scratch::test_lock();
+        crate::scratch::activate();
+        let mut store = VariableStore::new();
+        let mut transaction = VariableTransaction::new();
+        let mut deferred_transaction = deferred::DeferredTransaction::new();
+        let mut buffer = vec![0u8; 64 * 1024];
+        let variable = secure_boot::SecureBootVariable::PK;
+        let timestamp = |year: u16| VariableTimestamp {
+            year,
+            month: 1,
+            day: 1,
+            ..VariableTimestamp::default()
+        };
+
+        store
+            .import(
+                &mut transaction,
+                *variable.guid(),
+                variable.name(),
+                AUTH_ATTRIBUTES,
+                include_bytes!("../tests/fixtures/pk.esl"),
+                Some(timestamp(2024)),
+            )
+            .unwrap();
+        assert!(!store.setup_mode());
+
+        store
+            .import(
+                &mut transaction,
+                *variable.guid(),
+                variable.name(),
+                AUTH_ATTRIBUTES,
+                &[],
+                Some(timestamp(2025)),
+            )
+            .unwrap();
+
+        assert!(store.setup_mode());
+        assert!(store.find(variable.guid(), variable.name(), false).is_none());
+        assert_eq!(store.auth_timestamp(variable), timestamp(2025));
+        assert_eq!(
+            store.auth_history_timestamp(variable.guid(), variable.name()),
+            Some(timestamp(2025))
+        );
+
+        // Setup Mode permits unsigned authenticated enrollment, but the
+        // deletion history must still reject raw re-creation.
+        assert_eq!(
+            apply(
+                &mut store,
+                &mut transaction,
+                &mut deferred_transaction,
+                &mut buffer,
+                phase::BOOT_ACTIVE,
+                variable,
+                RAW_ATTRIBUTES,
+                include_bytes!("../tests/fixtures/pk.esl"),
+            ),
+            efi::Status::WRITE_PROTECTED
+        );
+        assert!(matches!(
+            auth::verify_authenticated_variable(
+                &store,
+                variable.name(),
+                variable.guid(),
+                AUTH_ATTRIBUTES,
+                &unsigned_envelope(2025),
+            ),
+            Err(auth::AuthError::InvalidTimestamp)
+        ));
+        assert!(auth::verify_authenticated_variable(
+            &store,
+            variable.name(),
+            variable.guid(),
+            AUTH_ATTRIBUTES,
+            &unsigned_envelope(2026),
+        )
+        .is_ok());
+        crate::scratch::reset();
+    }
+
+    #[test]
     fn query_capsule_capabilities_validates_header_like_update_capsule() {
         let header = efi::CapsuleHeader {
             capsule_guid: efi::Guid::from_bytes(&[0; 16]),
