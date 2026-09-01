@@ -1335,7 +1335,11 @@ mod tests {
             .unwrap();
 
         assert!(store.setup_mode());
-        assert!(store.find(variable.guid(), variable.name(), false).is_none());
+        assert!(
+            store
+                .find(variable.guid(), variable.name(), false)
+                .is_none()
+        );
         assert_eq!(store.auth_timestamp(variable), timestamp(2025));
         assert_eq!(
             store.auth_history_timestamp(variable.guid(), variable.name()),
@@ -1367,14 +1371,16 @@ mod tests {
             ),
             Err(auth::AuthError::InvalidTimestamp)
         ));
-        assert!(auth::verify_authenticated_variable(
-            &store,
-            variable.name(),
-            variable.guid(),
-            AUTH_ATTRIBUTES,
-            &unsigned_envelope(2026),
-        )
-        .is_ok());
+        assert!(
+            auth::verify_authenticated_variable(
+                &store,
+                variable.name(),
+                variable.guid(),
+                AUTH_ATTRIBUTES,
+                &unsigned_envelope(2026),
+            )
+            .is_ok()
+        );
         crate::scratch::reset();
     }
 
