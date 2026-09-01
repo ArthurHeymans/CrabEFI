@@ -840,8 +840,8 @@ impl MemoryAllocator {
             return efi::Status::UNSUPPORTED;
         }
         let address = match alloc_type {
-            AllocateType::AllocateAnyPages => self.find_free_pages(num_pages, u64::MAX),
-            AllocateType::AllocateMaxAddress => self.find_free_pages(num_pages, *memory),
+            AllocateType::AllocateAnyPages => self.find_free_pages(num_pages, 0, u64::MAX),
+            AllocateType::AllocateMaxAddress => self.find_free_pages(num_pages, 0, *memory),
             AllocateType::AllocateAddress => {
                 if !memory.is_multiple_of(PAGE_SIZE) {
                     return efi::Status::INVALID_PARAMETER;
@@ -1188,8 +1188,9 @@ impl MemoryAllocator {
     }
 
     /// Find free pages that fit the requirements
-    fn find_free_pages(&self, num_pages: u64, max_addr: u64) -> Option<u64> {
+    fn find_free_pages(&self, num_pages: u64, min_addr: u64, max_addr: u64) -> Option<u64> {
         let size = num_pages.checked_mul(PAGE_SIZE)?;
+        let min_addr = min_addr.checked_add(PAGE_SIZE - 1)? & !(PAGE_SIZE - 1);
 
         // EFI AllocateMaxAddress is inclusive: the final byte of the entire
         // allocation must be no greater than the caller's maximum address.
@@ -1201,18 +1202,20 @@ impl MemoryAllocator {
         for entry in self.entries.iter().rev() {
             if entry.get_memory_type() != Some(MemoryType::ConventionalMemory)
                 || entry.physical_start > max_addr
+                || entry.end() <= min_addr
             {
                 continue;
             }
 
             let usable_end = max_end.map_or(entry.end(), |end| entry.end().min(end));
-            let minimum_end = entry.physical_start.checked_add(size)?;
+            let usable_start = entry.physical_start.max(min_addr);
+            let minimum_end = usable_start.checked_add(size)?;
             if usable_end < minimum_end {
                 continue;
             }
 
             let address = (usable_end - size) & !(PAGE_SIZE - 1);
-            if address >= entry.physical_start {
+            if address >= usable_start {
                 return Some(address);
             }
         }
@@ -1393,6 +1396,28 @@ pub fn allocate_pages(
 ) -> efi::Status {
     state::with_allocator_mut(|alloc| {
         alloc.allocate_pages(alloc_type, memory_type, num_pages, memory)
+    })
+}
+
+/// Allocate pages wholly contained in an inclusive physical-address range.
+pub fn allocate_pages_in_range(
+    memory_type: MemoryType,
+    num_pages: u64,
+    min_address: u64,
+    max_address: u64,
+    memory: &mut u64,
+) -> efi::Status {
+    state::with_allocator_mut(|allocator| {
+        let Some(address) = allocator.find_free_pages(num_pages, min_address, max_address) else {
+            return efi::Status::OUT_OF_RESOURCES;
+        };
+        *memory = address;
+        allocator.allocate_pages(
+            AllocateType::AllocateAddress,
+            memory_type,
+            num_pages,
+            memory,
+        )
     })
 }
 

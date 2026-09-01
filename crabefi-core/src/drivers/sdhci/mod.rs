@@ -11,7 +11,6 @@ use crate::barrier;
 use crate::drivers::pci::{self, PciAddress, PciDevice};
 use crate::efi::dma::{DmaBuffer, DmaCoherency, DmaDirection, DmaMask};
 use crate::time::{Timeout, wait_for};
-use core::ptr;
 use spin::Mutex;
 use tock_registers::interfaces::{ReadWriteable, Readable, Writeable};
 
@@ -1354,14 +1353,7 @@ impl SdhciController {
             .map_err(|_| SdhciError::DmaError)?;
         barrier::dma_read();
 
-        // Copy data from DMA buffer to caller's buffer
-        unsafe {
-            ptr::copy_nonoverlapping(
-                self.dma_buffer.as_slice().as_ptr(),
-                buffer.as_mut_ptr(),
-                transfer_size,
-            );
-        }
+        buffer.copy_from_slice(&self.dma_buffer.as_slice()[..transfer_size]);
 
         Ok(())
     }

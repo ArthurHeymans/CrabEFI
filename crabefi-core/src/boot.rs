@@ -306,7 +306,6 @@ fn create_block_device_for_sfs(
 /// protocols on a new handle, then loads and executes the EFI bootloader.
 ///
 /// # Arguments
-/// * `disk` - Block device to read from
 /// * `esp` - ESP partition info
 /// * `partition_num` - 1-based partition number of the ESP
 /// * `path_info` - Device path info for protocol installation
@@ -314,7 +313,6 @@ fn create_block_device_for_sfs(
 /// * `num_blocks` - Total number of blocks on the device
 /// * `block_size` - Block size in bytes
 pub fn try_boot_from_esp(
-    disk: &mut dyn BlockDevice,
     esp: &fs::gpt::Partition,
     partition_num: u32,
     path_info: &DevicePathInfo,
@@ -322,16 +320,22 @@ pub fn try_boot_from_esp(
     num_blocks: u64,
     block_size: u32,
 ) -> bool {
-    // Create block device for SimpleFileSystem
+    let mut disk = match create_block_device_for_sfs(device_type, num_blocks, block_size) {
+        Some(disk) => disk,
+        None => {
+            log::error!("Failed to create block device for ESP");
+            return false;
+        }
+    };
     let block_device = match create_block_device_for_sfs(device_type, num_blocks, block_size) {
-        Some(bd) => bd,
+        Some(block_device) => block_device,
         None => {
             log::error!("Failed to create block device for SFS");
             return false;
         }
     };
 
-    // Initialize SimpleFileSystem protocol with the block device
+    // Initialize SimpleFileSystem protocol with independently locked storage.
     let sfs_protocol = simple_file_system::init(block_device, esp.first_lba);
     if sfs_protocol.is_null() {
         log::error!("Failed to initialize SimpleFileSystem protocol");
@@ -339,7 +343,7 @@ pub fn try_boot_from_esp(
     }
 
     // Mount FAT filesystem
-    match fs::fat::FatFilesystem::new(disk, esp.first_lba) {
+    match fs::fat::FatFilesystem::new(&mut disk, esp.first_lba) {
         Ok(mut fat) => {
             log::info!("FAT filesystem mounted on ESP");
 

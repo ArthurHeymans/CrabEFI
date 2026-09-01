@@ -9,19 +9,13 @@
 //!   (`_HID`, `_CRS` resource templates with all memory descriptor types)
 
 use acpi::{AcpiTables, Handle, Handler, PciAddress, PhysicalMapping};
+use alloc::rc::Rc;
+use core::cell::RefCell;
 use core::ptr::NonNull;
-use core::sync::atomic::{AtomicU8, AtomicU16, AtomicU64, AtomicUsize, Ordering};
 use crabefi::PciEcamRegion;
+#[cfg(target_arch = "aarch64")]
+use crabefi::fdt::PciDmaDomain;
 use crabefi::fdt::{DsdtDevice, MAX_DSDT_DEVICES, MAX_ECAM_REGIONS, PlatformInfo};
-
-// Validated MCFG regions used by the AML handler after table discovery.
-static ECAM_REGION_COUNT: AtomicUsize = AtomicUsize::new(0);
-static ECAM_BASES: [AtomicU64; MAX_ECAM_REGIONS] = [const { AtomicU64::new(0) }; MAX_ECAM_REGIONS];
-static ECAM_SEGMENTS: [AtomicU16; MAX_ECAM_REGIONS] =
-    [const { AtomicU16::new(0) }; MAX_ECAM_REGIONS];
-static ECAM_BUS_STARTS: [AtomicU8; MAX_ECAM_REGIONS] =
-    [const { AtomicU8::new(0) }; MAX_ECAM_REGIONS];
-static ECAM_BUS_ENDS: [AtomicU8; MAX_ECAM_REGIONS] = [const { AtomicU8::new(0) }; MAX_ECAM_REGIONS];
 
 // ---------------------------------------------------------------------------
 // Handler — bridges the `acpi` crate to CrabEFI's hardware
@@ -29,7 +23,54 @@ static ECAM_BUS_ENDS: [AtomicU8; MAX_ECAM_REGIONS] = [const { AtomicU8::new(0) }
 
 /// ACPI handler for a firmware environment with identity-mapped physical memory.
 #[derive(Clone)]
-struct CrabEfiHandler;
+struct CrabEfiHandler {
+    ecam_regions: Rc<RefCell<heapless::Vec<PciEcamRegion, MAX_ECAM_REGIONS>>>,
+}
+
+impl CrabEfiHandler {
+    fn new() -> Self {
+        Self {
+            ecam_regions: Rc::new(RefCell::new(heapless::Vec::new())),
+        }
+    }
+
+    fn set_ecam_regions(&self, regions: &[PciEcamRegion]) {
+        let mut owned = self.ecam_regions.borrow_mut();
+        owned.clear();
+        for region in regions {
+            if owned.push(*region).is_err() {
+                log::warn!("ACPI AML: ECAM region capacity exhausted");
+                break;
+            }
+        }
+    }
+
+    fn ecam_address(&self, address: PciAddress, offset: u16, width: u16) -> Option<usize> {
+        if width == 0
+            || !width.is_power_of_two()
+            || !offset.is_multiple_of(width)
+            || offset.checked_add(width - 1)? > 4095
+        {
+            return None;
+        }
+        self.ecam_regions.borrow().iter().find_map(|region| {
+            if address.segment() != region.segment
+                || address.bus() < region.bus_start
+                || address.bus() > region.bus_end
+            {
+                return None;
+            }
+            let relative = ((address.bus() - region.bus_start) as u64) << 20
+                | (address.device() as u64) << 15
+                | (address.function() as u64) << 12
+                | offset as u64;
+            region
+                .base
+                .checked_add(relative)
+                .and_then(|value| usize::try_from(value).ok())
+        })
+    }
+}
 
 impl Handler for CrabEfiHandler {
     // --- Physical memory mapping (identity-mapped) ---
@@ -148,26 +189,29 @@ impl Handler for CrabEfiHandler {
     // --- PCI configuration space (ECAM on aarch64, I/O CAM on x86) ---
 
     fn read_pci_u8(&self, address: PciAddress, offset: u16) -> u8 {
-        ecam_address(address, offset, 1).map_or(u8::MAX, |address| self.read_u8(address))
+        self.ecam_address(address, offset, 1)
+            .map_or(u8::MAX, |address| self.read_u8(address))
     }
     fn read_pci_u16(&self, address: PciAddress, offset: u16) -> u16 {
-        ecam_address(address, offset, 2).map_or(u16::MAX, |address| self.read_u16(address))
+        self.ecam_address(address, offset, 2)
+            .map_or(u16::MAX, |address| self.read_u16(address))
     }
     fn read_pci_u32(&self, address: PciAddress, offset: u16) -> u32 {
-        ecam_address(address, offset, 4).map_or(u32::MAX, |address| self.read_u32(address))
+        self.ecam_address(address, offset, 4)
+            .map_or(u32::MAX, |address| self.read_u32(address))
     }
     fn write_pci_u8(&self, address: PciAddress, offset: u16, value: u8) {
-        if let Some(address) = ecam_address(address, offset, 1) {
+        if let Some(address) = self.ecam_address(address, offset, 1) {
             self.write_u8(address, value);
         }
     }
     fn write_pci_u16(&self, address: PciAddress, offset: u16, value: u16) {
-        if let Some(address) = ecam_address(address, offset, 2) {
+        if let Some(address) = self.ecam_address(address, offset, 2) {
             self.write_u16(address, value);
         }
     }
     fn write_pci_u32(&self, address: PciAddress, offset: u16, value: u32) {
-        if let Some(address) = ecam_address(address, offset, 4) {
+        if let Some(address) = self.ecam_address(address, offset, 4) {
             self.write_u32(address, value);
         }
     }
@@ -213,34 +257,6 @@ impl Handler for CrabEfiHandler {
     fn release(&self, _mutex: Handle) {}
 }
 
-/// Compute a checked ECAM MMIO address for an AML PCI config-space access.
-fn ecam_address(address: PciAddress, offset: u16, width: u16) -> Option<usize> {
-    if width == 0
-        || !width.is_power_of_two()
-        || !offset.is_multiple_of(width)
-        || offset.checked_add(width - 1)? > 4095
-    {
-        return None;
-    }
-    let count = ECAM_REGION_COUNT.load(Ordering::Acquire);
-    (0..count).find_map(|index| {
-        let segment = ECAM_SEGMENTS[index].load(Ordering::Relaxed);
-        let bus_start = ECAM_BUS_STARTS[index].load(Ordering::Relaxed);
-        let bus_end = ECAM_BUS_ENDS[index].load(Ordering::Relaxed);
-        if address.segment() != segment || address.bus() < bus_start || address.bus() > bus_end {
-            return None;
-        }
-        let relative = ((address.bus() - bus_start) as u64) << 20
-            | (address.device() as u64) << 15
-            | (address.function() as u64) << 12
-            | offset as u64;
-        ECAM_BASES[index]
-            .load(Ordering::Relaxed)
-            .checked_add(relative)
-            .and_then(|value| usize::try_from(value).ok())
-    })
-}
-
 // ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
@@ -257,7 +273,7 @@ fn ecam_address(address: PciAddress, offset: u16, width: u16) -> Option<usize> {
 /// table pointers reachable from it must reside in mapped memory.
 pub unsafe fn discover_platform(rsdp_addr: u64) -> PlatformInfo {
     let mut info = PlatformInfo::new();
-    let handler = CrabEfiHandler;
+    let handler = CrabEfiHandler::new();
 
     // 1. Parse the RSDP → XSDT/RSDT table chain.
     let tables = match unsafe { AcpiTables::from_rsdp(handler.clone(), rsdp_addr as usize) } {
@@ -273,15 +289,31 @@ pub unsafe fn discover_platform(rsdp_addr: u64) -> PlatformInfo {
     parse_mcfg(&tables, &mut info);
     parse_spcr(&tables, &mut info);
 
-    // Publish every validated MCFG allocation to the AML PCI handler.
-    ECAM_REGION_COUNT.store(0, Ordering::Relaxed);
-    for (index, region) in info.ecam_regions().iter().enumerate() {
-        ECAM_BASES[index].store(region.base, Ordering::Relaxed);
-        ECAM_SEGMENTS[index].store(region.segment, Ordering::Relaxed);
-        ECAM_BUS_STARTS[index].store(region.bus_start, Ordering::Relaxed);
-        ECAM_BUS_ENDS[index].store(region.bus_end, Ordering::Relaxed);
+    // SBSA coreboot platforms expose coherent, identity-mapped PCI DMA but
+    // ACPI MCFG itself carries no DMA translation metadata.
+    #[cfg(target_arch = "aarch64")]
+    for region in info.ecam_regions.clone() {
+        let domain = crabefi::efi::dma::DmaDomain {
+            cpu_base: 0,
+            device_base: 0,
+            size: u64::MAX,
+            coherency: crabefi::efi::dma::DmaCoherency::Coherent,
+        };
+        if info
+            .pci_dma_domains
+            .push(PciDmaDomain {
+                segment: region.segment,
+                domain,
+            })
+            .is_err()
+        {
+            log::warn!("ACPI: PCI DMA-domain capacity exhausted");
+            break;
+        }
     }
-    ECAM_REGION_COUNT.store(info.ecam_regions.len(), Ordering::Release);
+
+    // Give the AML handler owned access to every validated MCFG allocation.
+    handler.set_ecam_regions(info.ecam_regions());
 
     // 3. Try to build the full AML interpreter for DSDT device discovery.
     match acpi::platform::AcpiPlatform::new(tables, handler) {

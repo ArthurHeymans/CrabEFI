@@ -559,7 +559,9 @@ fn init_platform_impl(mut config: PlatformConfig) -> ! {
             "PCI ECAM regions from platform: {}",
             config.ecam_regions.len()
         );
-        let _ = drivers::pci::set_ecam_regions(config.ecam_regions);
+        if let Err(error) = drivers::pci::set_ecam_regions(config.ecam_regions) {
+            log::error!("PCI ECAM regions from platform rejected: {:?}", error);
+        }
     } else {
         let acpi_info = state::drivers().acpi_info.clone();
         let fdt_info = state::drivers().fdt_info.clone();
@@ -568,10 +570,17 @@ fn init_platform_impl(mut config: PlatformConfig) -> ! {
                 "PCI ECAM regions from ACPI MCFG: {}",
                 acpi_info.ecam_regions.len()
             );
-            let _ = drivers::pci::set_ecam_regions(acpi_info.ecam_regions());
+            if let Err(error) = drivers::pci::set_ecam_regions(acpi_info.ecam_regions()) {
+                log::error!("PCI ECAM regions from ACPI MCFG rejected: {:?}", error);
+            }
         } else if !fdt_info.ecam_regions().is_empty() {
-            log::info!("PCI ECAM region from FDT");
-            let _ = drivers::pci::set_ecam_regions(fdt_info.ecam_regions());
+            log::info!(
+                "PCI ECAM regions from FDT: {}",
+                fdt_info.ecam_regions().len()
+            );
+            if let Err(error) = drivers::pci::set_ecam_regions(fdt_info.ecam_regions()) {
+                log::error!("PCI ECAM regions from FDT rejected: {:?}", error);
+            }
         }
     }
 

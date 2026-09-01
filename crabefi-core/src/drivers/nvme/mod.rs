@@ -1402,7 +1402,7 @@ impl NvmeController {
             return Err(NvmeError::InvalidParameter);
         }
         staging
-            .sync_for_device(0..buffer.len(), DmaDirection::FromDevice)
+            .sync_for_device(0..staging.len(), DmaDirection::FromDevice)
             .map_err(|_| NvmeError::DmaError)?;
         cmd.nsid = nsid;
         cmd.prp1 = staging.dma_address();
@@ -1469,7 +1469,7 @@ impl NvmeController {
         }
         staging.as_mut_slice()[..buffer.len()].copy_from_slice(buffer);
         staging
-            .sync_for_device(0..buffer.len(), DmaDirection::ToDevice)
+            .sync_for_device(0..staging.len(), DmaDirection::ToDevice)
             .map_err(|_| NvmeError::DmaError)?;
         let staging_address = staging.dma_address();
 
