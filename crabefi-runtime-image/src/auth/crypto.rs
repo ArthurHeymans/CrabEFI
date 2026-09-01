@@ -13,8 +13,8 @@
 //!   This grants no escalation: a trusted certificate's key can always sign
 //!   the PKCS#7 directly anyway.
 //! - The SignerInfo `signatureAlgorithm` OID is accepted but ignored;
-//!   verification is unconditionally RSA-SHA256, so a mismatched OID just
-//!   fails verification.
+//!   verification treats every signature as RSA-SHA256 regardless of the
+//!   declared algorithm.
 
 use allocator_api2::alloc::Allocator;
 use core::cmp::Ordering;

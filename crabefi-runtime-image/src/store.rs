@@ -162,13 +162,6 @@ impl VariableStore {
         }
         let secure_variable = identify_key_database(&guid, name);
         if data.is_empty()
-            && let (Some(variable), Some(timestamp)) = (secure_variable, timestamp)
-        {
-            self.auth_timestamps[variable.index()] = timestamp;
-            self.refresh_policy();
-            return Ok(());
-        }
-        if data.is_empty()
             && let Some(timestamp) = timestamp
             && attributes & efi::VARIABLE_TIME_BASED_AUTHENTICATED_WRITE_ACCESS != 0
         {
@@ -176,6 +169,9 @@ impl VariableStore {
             // records carrying the verified deletion timestamp. Keep it as a
             // tombstone so the floor survives the reboot.
             self.record_tombstone(guid, name, attributes, timestamp)?;
+            if let Some(variable) = secure_variable {
+                self.auth_timestamps[variable.index()] = timestamp;
+            }
             return Ok(());
         }
         let mut prepared = self.prepare(guid, name, attributes, data.len())?;
