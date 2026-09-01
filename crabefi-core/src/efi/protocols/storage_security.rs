@@ -306,13 +306,12 @@ fn nvme_security_receive(
     sp_specific: u16,
     buffer: &mut [u8],
 ) -> Result<usize, &'static str> {
-    // Safety: pointer valid for firmware lifetime; no overlapping &mut created
-    let controller =
-        unsafe { &mut *nvme::get_controller(controller_index).ok_or("NVMe controller not found")? };
-
-    controller
-        .security_receive(nsid, protocol_id, sp_specific, buffer)
-        .map_err(|_| "NVMe security receive failed")
+    nvme::with_controller(controller_index, |controller| {
+        controller
+            .security_receive(nsid, protocol_id, sp_specific, buffer)
+            .map_err(|_| "NVMe security receive failed")
+    })
+    .ok_or("NVMe controller not found")?
 }
 
 /// NVMe Security Send (admin opcode 0x81)
@@ -323,13 +322,12 @@ fn nvme_security_send(
     sp_specific: u16,
     buffer: &[u8],
 ) -> Result<(), &'static str> {
-    // Safety: pointer valid for firmware lifetime; no overlapping &mut created
-    let controller =
-        unsafe { &mut *nvme::get_controller(controller_index).ok_or("NVMe controller not found")? };
-
-    controller
-        .security_send(nsid, protocol_id, sp_specific, buffer)
-        .map_err(|_| "NVMe security send failed")
+    nvme::with_controller(controller_index, |controller| {
+        controller
+            .security_send(nsid, protocol_id, sp_specific, buffer)
+            .map_err(|_| "NVMe security send failed")
+    })
+    .ok_or("NVMe controller not found")?
 }
 
 // ============================================================================
@@ -344,13 +342,12 @@ fn ahci_security_receive(
     sp_specific: u16,
     buffer: &mut [u8],
 ) -> Result<usize, &'static str> {
-    // Safety: pointer valid for firmware lifetime; no overlapping &mut created
-    let controller =
-        unsafe { &mut *ahci::get_controller(controller_index).ok_or("AHCI controller not found")? };
-
-    controller
-        .trusted_receive(port, protocol_id, sp_specific, buffer)
-        .map_err(|_| "AHCI trusted receive failed")
+    ahci::with_controller(controller_index, |controller| {
+        controller
+            .trusted_receive(port, protocol_id, sp_specific, buffer)
+            .map_err(|_| "AHCI trusted receive failed")
+    })
+    .ok_or("AHCI controller not found")?
 }
 
 /// AHCI TRUSTED SEND (ATA command 0x5E)
@@ -361,13 +358,12 @@ fn ahci_security_send(
     sp_specific: u16,
     buffer: &[u8],
 ) -> Result<(), &'static str> {
-    // Safety: pointer valid for firmware lifetime; no overlapping &mut created
-    let controller =
-        unsafe { &mut *ahci::get_controller(controller_index).ok_or("AHCI controller not found")? };
-
-    controller
-        .trusted_send(port, protocol_id, sp_specific, buffer)
-        .map_err(|_| "AHCI trusted send failed")
+    ahci::with_controller(controller_index, |controller| {
+        controller
+            .trusted_send(port, protocol_id, sp_specific, buffer)
+            .map_err(|_| "AHCI trusted send failed")
+    })
+    .ok_or("AHCI controller not found")?
 }
 
 // ============================================================================
@@ -381,21 +377,12 @@ fn usb_security_receive(
     sp_specific: u16,
     buffer: &mut [u8],
 ) -> Result<usize, &'static str> {
-    // Execute with the USB controller
-    let result = usb::with_controller(controller_index, |controller| {
-        usb::mass_storage::with_global_device(|device| {
-            device
-                .security_protocol_in(controller, protocol_id, sp_specific, buffer)
-                .map_err(|_| "USB security protocol in failed")
-        })
-        .unwrap_or(Err("No USB mass storage device configured"))
-    });
-
-    match result {
-        Some(Ok(bytes)) => Ok(bytes),
-        Some(Err(e)) => Err(e),
-        None => Err("USB controller not available"),
-    }
+    usb::mass_storage::with_global_device_and_controller(controller_index, |device, controller| {
+        device
+            .security_protocol_in(controller, protocol_id, sp_specific, buffer)
+            .map_err(|_| "USB security protocol in failed")
+    })
+    .ok_or("USB controller or mass storage device not available")?
 }
 
 /// USB SCSI SECURITY PROTOCOL OUT (opcode 0xB5)
@@ -405,21 +392,12 @@ fn usb_security_send(
     sp_specific: u16,
     buffer: &[u8],
 ) -> Result<(), &'static str> {
-    // Execute with the USB controller
-    let result = usb::with_controller(controller_index, |controller| {
-        usb::mass_storage::with_global_device(|device| {
-            device
-                .security_protocol_out(controller, protocol_id, sp_specific, buffer)
-                .map_err(|_| "USB security protocol out failed")
-        })
-        .unwrap_or(Err("No USB mass storage device configured"))
-    });
-
-    match result {
-        Some(Ok(())) => Ok(()),
-        Some(Err(e)) => Err(e),
-        None => Err("USB controller not available"),
-    }
+    usb::mass_storage::with_global_device_and_controller(controller_index, |device, controller| {
+        device
+            .security_protocol_out(controller, protocol_id, sp_specific, buffer)
+            .map_err(|_| "USB security protocol out failed")
+    })
+    .ok_or("USB controller or mass storage device not available")?
 }
 
 // ============================================================================

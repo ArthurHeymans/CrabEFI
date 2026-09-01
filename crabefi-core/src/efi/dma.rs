@@ -1,8 +1,8 @@
-//! Mask-aware, identity-mapped DMA buffers and ownership synchronization.
+//! Mask-aware DMA buffers with explicit translation and ownership synchronization.
 //!
-//! CrabEFI currently has no IOMMU or host-bridge translation layer, so the DMA
-//! address is the allocated physical address. Buffers are page-backed to keep
-//! non-coherent cache-line maintenance exclusive to the allocation.
+//! PCI callers provide a firmware-described DMA domain. Buffers retain both
+//! the CPU physical allocation and translated device address, and page backing
+//! keeps non-coherent cache-line maintenance exclusive to the allocation.
 
 use core::ops::Range;
 
@@ -10,7 +10,9 @@ use r_efi::efi::Status;
 
 use crate::arch::{DmaCacheOperation, DmaSyncError};
 use crate::efi::allocator::{self, AllocateType, MemoryType, PAGE_SIZE, PAGE_SIZE_USIZE};
-use crate::efi::dma_range::{allocation_fits_mask, checked_subrange, pages_for_len};
+use crate::efi::dma_range::{
+    allocation_fits_mask, checked_subrange, pages_for_len, translate_dma_range,
+};
 
 /// Inclusive highest address visible to a DMA-capable device.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -52,6 +54,35 @@ pub enum DmaCoherency {
     NonCoherent,
 }
 
+/// One contiguous CPU-to-device DMA translation window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DmaDomain {
+    /// First CPU physical address in the window.
+    pub cpu_base: u64,
+    /// Device-visible address corresponding to `cpu_base`.
+    pub device_base: u64,
+    /// Window size in bytes.
+    pub size: u64,
+    /// Cache ownership model for devices in this domain.
+    pub coherency: DmaCoherency,
+}
+
+impl DmaDomain {
+    fn cpu_end(self) -> Option<u64> {
+        self.cpu_base.checked_add(self.size)
+    }
+
+    fn device_address(self, cpu_address: u64, byte_len: u64) -> Option<u64> {
+        translate_dma_range(
+            cpu_address,
+            byte_len,
+            self.cpu_base,
+            self.device_base,
+            self.size,
+        )
+    }
+}
+
 /// Direction of data movement relative to the CPU.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DmaDirection {
@@ -86,6 +117,7 @@ impl From<DmaSyncError> for DmaError {
 /// Exclusively owned, page-backed identity-DMA allocation.
 pub struct DmaBuffer {
     address: u64,
+    device_address: u64,
     byte_len: usize,
     pages: u64,
     coherency: DmaCoherency,
@@ -123,15 +155,68 @@ impl DmaBuffer {
         unsafe { core::slice::from_raw_parts_mut(address as *mut u8, allocation_len) }.fill(0);
         Ok(Self {
             address,
+            device_address: address,
             byte_len,
             pages,
             coherency,
         })
     }
 
-    /// Return the identity-mapped device-visible address.
-    pub const fn dma_address(&self) -> u64 {
+    /// Allocate inside an explicitly described DMA translation window.
+    pub fn allocate_in_domain(
+        byte_len: usize,
+        mask: DmaMask,
+        domain: DmaDomain,
+    ) -> Result<Self, DmaError> {
+        let pages = pages_for_len(byte_len, PAGE_SIZE).ok_or(DmaError::InvalidRange)?;
+        let allocation_len = pages.checked_mul(PAGE_SIZE).ok_or(DmaError::InvalidRange)?;
+        let allocation_len_usize =
+            usize::try_from(allocation_len).map_err(|_| DmaError::InvalidRange)?;
+        let cpu_end = domain.cpu_end().ok_or(DmaError::InvalidRange)?;
+        let device_mask_offset = mask
+            .max_address()
+            .checked_sub(domain.device_base)
+            .ok_or(DmaError::OutOfResources)?;
+        let device_limited_cpu_last = domain.cpu_base.saturating_add(device_mask_offset);
+        let mut address = cpu_end.saturating_sub(1).min(device_limited_cpu_last);
+        let status = allocator::allocate_pages(
+            AllocateType::AllocateMaxAddress,
+            MemoryType::BootServicesData,
+            pages,
+            &mut address,
+        );
+        if status != Status::SUCCESS {
+            return Err(DmaError::OutOfResources);
+        }
+        let Some(device_address) = domain.device_address(address, allocation_len) else {
+            let _ = allocator::free_pages(address, pages);
+            return Err(DmaError::OutOfResources);
+        };
+        if !allocation_fits_mask(device_address, pages, PAGE_SIZE, mask.max_address()) {
+            let _ = allocator::free_pages(address, pages);
+            return Err(DmaError::OutOfResources);
+        }
+        // SAFETY: the allocator returned an exclusive CPU mapping covering the
+        // complete page-rounded allocation retained by this owner.
+        unsafe { core::slice::from_raw_parts_mut(address as *mut u8, allocation_len_usize) }
+            .fill(0);
+        Ok(Self {
+            address,
+            device_address,
+            byte_len,
+            pages,
+            coherency: domain.coherency,
+        })
+    }
+
+    /// Return the CPU physical address of the owned allocation.
+    pub const fn cpu_address(&self) -> u64 {
         self.address
+    }
+
+    /// Return the device-visible address after domain translation.
+    pub const fn dma_address(&self) -> u64 {
+        self.device_address
     }
 
     /// Return the requested byte length (excluding page-rounding padding).

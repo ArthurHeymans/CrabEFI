@@ -650,6 +650,8 @@ pub struct PciState {
     pub devices: HeaplessVec<PciDevice, MAX_PCI_DEVICES>,
     /// Validated PCIe ECAM allocations (from platform, ACPI MCFG, or FDT).
     pub ecam_regions: HeaplessVec<PciEcamRegion, { crate::fdt::MAX_ECAM_REGIONS }>,
+    /// Whether firmware explicitly supplied ECAM configuration.
+    pub ecam_configured: bool,
     /// Config space access method (legacy I/O CAM or PCIe ECAM)
     pub access: AnyPciAccess,
 }
@@ -659,6 +661,7 @@ impl PciState {
         Self {
             devices: HeaplessVec::new(),
             ecam_regions: HeaplessVec::new(),
+            ecam_configured: false,
             #[cfg(target_arch = "x86_64")]
             access: AnyPciAccess::IoCam(crate::drivers::pci::access::IoCamAccess),
             #[cfg(not(target_arch = "x86_64"))]

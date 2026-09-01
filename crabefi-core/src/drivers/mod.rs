@@ -29,31 +29,25 @@ pub mod ahci;
 
 use spin::Mutex;
 
-/// Send-able wrapper for a raw controller pointer.
+/// Registry-owned handle to one controller allocation.
 ///
 /// # Safety
 ///
 /// The wrapped pointer must remain valid for the firmware lifetime.
 /// All access must be serialized through the parent `ControllerRegistry` mutex.
 /// CrabEFI is single-threaded, so this is trivially satisfied.
-struct ControllerPtr<T>(*mut T);
+struct ControllerPtr<T>(core::ptr::NonNull<T>);
 
-// SAFETY: CrabEFI is single-threaded firmware. Controller pointers are allocated
-// via the EFI page allocator and remain valid for the firmware's lifetime. All
-// access is serialized through the ControllerRegistry's Mutex.
-//
-// The blanket impl (not bounded on `T: Send`) is intentional: controller types
-// like NvmeController contain raw pointers (making them `!Send` by default),
-// but in this single-threaded firmware context sharing across "threads" cannot
-// occur. The ControllerPtr wrapper is module-private, limiting the scope.
-unsafe impl<T> Send for ControllerPtr<T> {}
+// SAFETY: ownership may cross the mutex boundary only when the controller type
+// itself explicitly satisfies `Send`.
+unsafe impl<T: Send> Send for ControllerPtr<T> {}
 
 /// Generic registry for PCI-based hardware controllers.
 ///
 /// Encapsulates the common pattern of:
 /// 1. Allocating controller structs via the EFI page allocator
-/// 2. Storing pointers in a `Mutex<heapless::Vec>`
-/// 3. Looking up controllers by index
+/// 2. Storing owned allocation handles in a `Mutex<heapless::Vec>`
+/// 3. Providing lock-scoped controller access by index
 ///
 /// This eliminates ~100 lines of near-identical boilerplate per driver
 /// (NVMe, AHCI, SDHCI all previously had their own copy).
@@ -90,11 +84,11 @@ impl<T, const N: usize> ControllerRegistry<T, N> {
             log::error!("{}: Failed to allocate memory for controller", self.name);
         })?;
 
-        let controller_box = mem.as_mut_ptr() as *mut T;
+        let controller_box = core::ptr::NonNull::new(mem.as_mut_ptr().cast::<T>()).ok_or(())?;
         // Safety: we just allocated `pages` pages (>= size_of::<T>() bytes),
         // so `controller_box` is valid, aligned, and non-overlapping.
         unsafe {
-            core::ptr::write(controller_box, controller);
+            controller_box.as_ptr().write(controller);
         }
 
         let mut controllers = self.controllers.lock();
@@ -103,7 +97,7 @@ impl<T, const N: usize> ControllerRegistry<T, N> {
             // Safety: `controller_box` was initialized with `ptr::write` above and
             // has not been moved into the registry. Drop it before freeing pages so
             // future controller types with Drop glue are handled correctly.
-            unsafe { core::ptr::drop_in_place(controller_box) };
+            unsafe { core::ptr::drop_in_place(controller_box.as_ptr()) };
             crate::efi::free_pages(mem, pages as u64);
             return Err(());
         }
@@ -111,15 +105,22 @@ impl<T, const N: usize> ControllerRegistry<T, N> {
         Ok(())
     }
 
-    /// Get a raw pointer to a controller by index.
-    ///
-    /// The returned pointer is valid for the firmware lifetime. Callers must
-    /// convert to `&mut` only for the duration of their immediate operation
-    /// and must not hold the reference across calls that may also access
-    /// the same controller.
-    pub fn get(&self, index: usize) -> Option<*mut T> {
-        let controllers = self.controllers.lock();
-        controllers.get(index).map(|ptr| ptr.0)
+    /// Mutably access one controller while retaining the registry lock.
+    pub fn with_mut<R>(&self, index: usize, f: impl FnOnce(&mut T) -> R) -> Option<R> {
+        let mut controllers = self.controllers.lock();
+        let controller = controllers.get_mut(index)?;
+        // SAFETY: registration creates one allocation per entry and the mutex
+        // retains exclusive access for the complete closure invocation.
+        Some(f(unsafe { controller.0.as_mut() }))
+    }
+
+    /// Mutably visit every registered controller under one registry lock.
+    pub fn for_each_mut(&self, mut f: impl FnMut(&mut T)) {
+        let mut controllers = self.controllers.lock();
+        for controller in controllers.iter_mut() {
+            // SAFETY: each entry owns a distinct allocation and the mutex is held.
+            f(unsafe { controller.0.as_mut() });
+        }
     }
 
     /// Number of registered controllers.

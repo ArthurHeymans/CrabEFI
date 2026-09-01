@@ -5,6 +5,7 @@
 //!
 //! Uses the `fdt` crate for parsing on aarch64; the module is a no-op on x86.
 
+use crate::efi::dma::DmaDomain;
 use crate::platform::PciEcamRegion;
 
 /// Maximum number of devices discovered from DSDT.
@@ -81,20 +82,53 @@ impl core::fmt::Debug for DsdtDevice {
 
 /// Maximum number of distinct PCI ECAM allocations retained from firmware.
 pub const MAX_ECAM_REGIONS: usize = 8;
+/// Maximum number of PCI host-bridge address windows retained from firmware.
+pub const MAX_PCI_WINDOWS: usize = 24;
+/// Maximum number of PCI DMA domains retained from firmware.
+pub const MAX_PCI_DMA_DOMAINS: usize = 8;
+
+/// PCI host-bridge address-space kind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PciWindowKind {
+    /// PCI I/O-port space.
+    Pio,
+    /// Non-prefetchable 32-bit memory space.
+    Mmio32,
+    /// Prefetchable 64-bit memory space.
+    Mmio64,
+}
+
+/// One firmware-described PCI host-bridge CPU address window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PciWindow {
+    /// PCI segment owning this window.
+    pub segment: u16,
+    /// Address-space kind.
+    pub kind: PciWindowKind,
+    /// CPU-visible base address.
+    pub base: u64,
+    /// Window size in bytes.
+    pub size: u64,
+}
+
+/// One firmware-described DMA domain for a PCI segment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PciDmaDomain {
+    /// PCI segment using this domain.
+    pub segment: u16,
+    /// CPU/device translation and coherency metadata.
+    pub domain: DmaDomain,
+}
 
 /// Platform information extracted from an FDT or ACPI tables.
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Debug, Default, Clone)]
 pub struct PlatformInfo {
     /// Validated PCIe ECAM allocations.
-    pub ecam_regions: [PciEcamRegion; MAX_ECAM_REGIONS],
-    /// Number of populated ECAM allocations.
-    pub ecam_region_count: usize,
-    /// PCIe 32-bit MMIO window (base, size)
-    pub pcie_mmio32: Option<(u64, u64)>,
-    /// PCIe 64-bit MMIO window (base, size)
-    pub pcie_mmio64: Option<(u64, u64)>,
-    /// PCIe I/O (PIO) window — CPU address and size
-    pub pcie_pio: Option<(u64, u64)>,
+    pub ecam_regions: heapless::Vec<PciEcamRegion, MAX_ECAM_REGIONS>,
+    /// Firmware-described PCI address windows, kept per host segment.
+    pub pci_windows: heapless::Vec<PciWindow, MAX_PCI_WINDOWS>,
+    /// Explicit PCI DMA translation domains.
+    pub pci_dma_domains: heapless::Vec<PciDmaDomain, MAX_PCI_DMA_DOMAINS>,
     /// GIC distributor base address and size
     pub gicd: Option<(u64, u64)>,
     /// GIC redistributor base address and size (GICv3+)
@@ -102,30 +136,25 @@ pub struct PlatformInfo {
     /// PL011 UART base address
     pub uart_base: Option<u64>,
     /// Devices discovered from DSDT `Device` scopes.
-    pub dsdt_devices: [DsdtDevice; MAX_DSDT_DEVICES],
-    /// Number of valid entries in `dsdt_devices`.
-    pub dsdt_device_count: usize,
+    pub dsdt_devices: heapless::Vec<DsdtDevice, MAX_DSDT_DEVICES>,
 }
 
 impl PlatformInfo {
     pub const fn new() -> Self {
         Self {
-            ecam_regions: [PciEcamRegion::EMPTY; MAX_ECAM_REGIONS],
-            ecam_region_count: 0,
-            pcie_mmio32: None,
-            pcie_mmio64: None,
-            pcie_pio: None,
+            ecam_regions: heapless::Vec::new(),
+            pci_windows: heapless::Vec::new(),
+            pci_dma_domains: heapless::Vec::new(),
             gicd: None,
             gicr: None,
             uart_base: None,
-            dsdt_devices: [DsdtDevice::empty(); MAX_DSDT_DEVICES],
-            dsdt_device_count: 0,
+            dsdt_devices: heapless::Vec::new(),
         }
     }
 
     /// Return all discovered ECAM allocations.
     pub fn ecam_regions(&self) -> &[PciEcamRegion] {
-        &self.ecam_regions[..self.ecam_region_count]
+        self.ecam_regions.as_slice()
     }
 
     /// Retain one validated ECAM allocation, rejecting overlap and excess.
@@ -136,20 +165,23 @@ impl PlatformInfo {
                     && current.bus_start <= region.bus_end
                     && region.bus_start <= current.bus_end
             })
-            || self.ecam_region_count == MAX_ECAM_REGIONS
         {
             return false;
         }
-        self.ecam_regions[self.ecam_region_count] = region;
-        self.ecam_region_count += 1;
-        true
+        self.ecam_regions.push(region).is_ok()
+    }
+
+    /// Return the explicit DMA domain for one PCI segment.
+    pub fn pci_dma_domain(&self, segment: u16) -> Option<DmaDomain> {
+        self.pci_dma_domains
+            .iter()
+            .find(|entry| entry.segment == segment)
+            .map(|entry| entry.domain)
     }
 
     /// Find the first DSDT device whose `_HID` matches `hid`.
     pub fn find_device(&self, hid: &str) -> Option<&DsdtDevice> {
-        self.dsdt_devices[..self.dsdt_device_count]
-            .iter()
-            .find(|d| d.hid_str() == hid)
+        self.dsdt_devices.iter().find(|d| d.hid_str() == hid)
     }
 }
 
@@ -190,14 +222,17 @@ pub unsafe fn parse(fdt_addr: u64, fdt_size: u32) -> Option<PlatformInfo> {
             region.base
         );
     }
-    if let Some((base, size)) = info.pcie_mmio32 {
-        log::info!("  PCIe MMIO32: {:#x} size {:#x}", base, size);
+    for dma in &info.pci_dma_domains {
+        log::info!("  PCI segment {} DMA: {:?}", dma.segment, dma.domain);
     }
-    if let Some((base, size)) = info.pcie_mmio64 {
-        log::info!("  PCIe MMIO64: {:#x} size {:#x}", base, size);
-    }
-    if let Some((base, size)) = info.pcie_pio {
-        log::info!("  PCIe PIO: {:#x} size {:#x}", base, size);
+    for window in &info.pci_windows {
+        log::info!(
+            "  PCI segment {} {:?}: {:#x} size {:#x}",
+            window.segment,
+            window.kind,
+            window.base,
+            window.size
+        );
     }
     if let Some((base, size)) = info.gicd {
         log::info!("  GICD: {:#x} size {:#x}", base, size);
@@ -235,133 +270,214 @@ pub unsafe fn parse(_fdt_addr: u64, _fdt_size: u32) -> Option<PlatformInfo> {
 /// `ranges` property maps PCI child addresses to CPU addresses.
 #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
 fn extract_pcie(dt: &fdt::Fdt, info: &mut PlatformInfo) {
-    let mut used_segments = [None; MAX_ECAM_REGIONS];
-    let mut used_segment_count = 0;
-    for node in dt.all_nodes().filter(|node| {
-        node.compatible()
-            .is_some_and(|compatible| compatible.all().any(|value| value.contains("pci")))
+    let Some(root) = dt.find_node("/") else {
+        return;
+    };
+    for node in root.children().filter(|node| {
+        node.compatible().is_some_and(|compatible| {
+            compatible
+                .all()
+                .any(|value| value == "pci-host-ecam-generic")
+        })
     }) {
-        let segment = node
-            .property("linux,pci-domain")
-            .and_then(|property| property.as_usize())
-            .and_then(|value| u16::try_from(value).ok());
-        if let Some(segment) = segment
-            && !used_segments[..used_segment_count].contains(&Some(segment))
-            && used_segment_count < MAX_ECAM_REGIONS
-        {
-            used_segments[used_segment_count] = Some(segment);
-            used_segment_count += 1;
-        }
-    }
+        let Some(segment_property) = node.property("linux,pci-domain") else {
+            log::warn!(
+                "FDT PCI: host {} has no linux,pci-domain; skipped",
+                node.name
+            );
+            continue;
+        };
+        let Some(segment) = (segment_property.value.len() == 4)
+            .then(|| segment_property.as_usize())
+            .flatten()
+            .and_then(|value| u16::try_from(value).ok())
+        else {
+            log::warn!("FDT PCI: host {} has malformed linux,pci-domain", node.name);
+            continue;
+        };
 
-    for node in dt.all_nodes().filter(|node| {
-        node.compatible()
-            .is_some_and(|compatible| compatible.all().any(|value| value.contains("pci")))
-    }) {
         let bus_range = match node.property("bus-range") {
-            None => Some((0, u8::MAX)),
+            None => {
+                log::warn!("FDT PCI: host {} has no bus-range; skipped", node.name);
+                None
+            }
             Some(property) => {
                 let bytes = property.value;
-                if bytes.len() < 8 {
+                if bytes.len() != 8 {
                     None
                 } else {
-                    let start = u32::from_be_bytes(bytes[0..4].try_into().unwrap_or_default());
-                    let end = u32::from_be_bytes(bytes[4..8].try_into().unwrap_or_default());
-                    (start <= u8::MAX as u32 && end <= u8::MAX as u32)
-                        .then_some((start as u8, end as u8))
+                    let start = u32::from_be_bytes(bytes[0..4].try_into().expect("four bytes"));
+                    let end = u32::from_be_bytes(bytes[4..8].try_into().expect("four bytes"));
+                    (start <= end && end <= u8::MAX as u32).then_some((start as u8, end as u8))
                 }
             }
         };
-        let declared_segment = node
-            .property("linux,pci-domain")
-            .and_then(|property| property.as_usize())
-            .and_then(|value| u16::try_from(value).ok());
-        let segment = declared_segment.unwrap_or_else(|| {
-            (0..=u16::MAX)
-                .find(|candidate| !used_segments[..used_segment_count].contains(&Some(*candidate)))
-                .unwrap_or(u16::MAX)
-        });
-        if declared_segment.is_none()
-            && used_segment_count < MAX_ECAM_REGIONS
-            && !used_segments[..used_segment_count].contains(&Some(segment))
-        {
-            used_segments[used_segment_count] = Some(segment);
-            used_segment_count += 1;
-        }
+        let Some((bus_start, bus_end)) = bus_range else {
+            log::warn!("FDT PCI: malformed bus-range; ECAM region skipped");
+            continue;
+        };
 
-        if let Some((bus_start, bus_end)) = bus_range {
-            if let Some(regs) = node.reg() {
-                for reg in regs {
-                    let declared_size = reg.size.map(|size| size as u64).unwrap_or(0);
-                    let region = PciEcamRegion {
-                        base: reg.starting_address as u64,
-                        segment,
-                        bus_start,
-                        bus_end,
+        let Some(mut regs) = node.reg() else {
+            log::warn!("FDT PCI: host {} has no ECAM reg", node.name);
+            continue;
+        };
+        let Some(reg) = regs.next() else {
+            continue;
+        };
+        if regs.next().is_some() {
+            log::warn!(
+                "FDT PCI: host {} has ambiguous multiple reg entries",
+                node.name
+            );
+            continue;
+        }
+        let Some(declared_size) = reg.size.map(|size| size as u64) else {
+            log::warn!("FDT PCI: host {} ECAM reg has no size", node.name);
+            continue;
+        };
+        let region = PciEcamRegion {
+            base: reg.starting_address as u64,
+            segment,
+            bus_start,
+            bus_end,
+        };
+        if !region
+            .byte_len()
+            .is_some_and(|required| declared_size >= required)
+            || !info.push_ecam_region(region)
+        {
+            log::warn!(
+                "FDT PCI: invalid ECAM base/range/size ({:?}, size={:#x})",
+                region,
+                declared_size
+            );
+            continue;
+        }
+        log::debug!("FDT PCI: retained ECAM region {:?}", region);
+
+        let child_ac = node.property("#address-cells").and_then(|p| p.as_usize());
+        let child_sc = node.property("#size-cells").and_then(|p| p.as_usize());
+        let parent_ac = dt
+            .root()
+            .property("#address-cells")
+            .and_then(|p| p.as_usize());
+        if let Some(dma_ranges) = node.property("dma-ranges") {
+            let data = dma_ranges.value;
+            let shape = child_ac
+                .zip(parent_ac)
+                .zip(child_sc)
+                .filter(|((child, parent), size)| {
+                    *child == 3 && (1..=2).contains(parent) && (1..=2).contains(size)
+                });
+            if let Some(((child, parent), size_cells)) = shape {
+                let entry_bytes = (child + parent + size_cells) * 4;
+                if data.len() == entry_bytes {
+                    let pci_hi = u32::from_be_bytes(data[0..4].try_into().expect("four bytes"));
+                    let kind = (pci_hi >> 24) & 0x03;
+                    let device_base = read_cells(data, 4, child - 1);
+                    let cpu_off = child * 4;
+                    let cpu_base = read_cells(data, cpu_off, parent);
+                    let size = read_cells(data, cpu_off + parent * 4, size_cells);
+                    let domain = DmaDomain {
+                        cpu_base,
+                        device_base,
+                        size,
+                        coherency: if node.property("dma-coherent").is_some() {
+                            crate::efi::dma::DmaCoherency::Coherent
+                        } else {
+                            crate::efi::dma::DmaCoherency::NonCoherent
+                        },
                     };
-                    if region
-                        .byte_len()
-                        .is_some_and(|required| declared_size >= required)
-                        && info.push_ecam_region(region)
+                    if (kind == 0x02 || kind == 0x03)
+                        && size != 0
+                        && cpu_base.checked_add(size).is_some()
+                        && device_base.checked_add(size).is_some()
+                        && info
+                            .pci_dma_domains
+                            .push(PciDmaDomain { segment, domain })
+                            .is_ok()
                     {
-                        log::debug!("FDT PCI: retained ECAM region {:?}", region);
+                        log::debug!("FDT PCI: retained DMA domain {:?}", domain);
                     } else {
-                        log::warn!(
-                            "FDT PCI: invalid ECAM base/range/size ({:?}, size={:#x})",
-                            region,
-                            declared_size
-                        );
+                        log::warn!("FDT PCI: invalid DMA domain for host {}", node.name);
                     }
+                } else {
+                    log::warn!("FDT PCI: dma-ranges must contain exactly one complete window");
                 }
+            } else {
+                log::warn!(
+                    "FDT PCI: unsupported dma-ranges cell shape for host {}",
+                    node.name
+                );
             }
         } else {
-            log::warn!("FDT PCI: malformed bus-range; ECAM region skipped");
+            log::warn!(
+                "FDT PCI: host {} has no dma-ranges; PCI DMA disabled",
+                node.name
+            );
         }
 
-        // PlatformInfo currently exposes one window of each kind, so retain
-        // the first host bridge's values while still collecting every ECAM.
         if let Some(ranges_raw) = node.property("ranges") {
             let data = ranges_raw.value;
-            let child_ac = node
-                .property("#address-cells")
-                .and_then(|property| property.as_usize())
-                .unwrap_or(3);
-            let child_sc = node
-                .property("#size-cells")
-                .and_then(|property| property.as_usize())
-                .unwrap_or(2);
-            let parent_ac = dt
+            let Some(child_ac) = node.property("#address-cells").and_then(|p| p.as_usize()) else {
+                log::warn!("FDT PCI: host {} has no #address-cells", node.name);
+                continue;
+            };
+            let Some(child_sc) = node.property("#size-cells").and_then(|p| p.as_usize()) else {
+                log::warn!("FDT PCI: host {} has no #size-cells", node.name);
+                continue;
+            };
+            let Some(parent_ac) = dt
                 .root()
                 .property("#address-cells")
-                .and_then(|property| property.as_usize())
-                .unwrap_or(2);
+                .and_then(|p| p.as_usize())
+            else {
+                log::warn!("FDT PCI: root has no #address-cells");
+                continue;
+            };
+            if child_ac != 3 || !(1..=2).contains(&child_sc) || !(1..=2).contains(&parent_ac) {
+                log::warn!(
+                    "FDT PCI: unsupported ranges cell shape for host {}",
+                    node.name
+                );
+                continue;
+            }
+            let Some(entry_bytes) = (child_ac + parent_ac + child_sc).checked_mul(4) else {
+                continue;
+            };
+            if entry_bytes == 0 || !data.len().is_multiple_of(entry_bytes) {
+                log::warn!("FDT PCI: malformed ranges length for host {}", node.name);
+                continue;
+            }
 
-            let entry_bytes = (child_ac + parent_ac + child_sc) * 4;
-            if entry_bytes > 0 {
-                let mut off = 0;
-                while off + entry_bytes <= data.len() {
-                    let pci_hi =
-                        u32::from_be_bytes(data[off..off + 4].try_into().unwrap_or_default());
-                    let space = (pci_hi >> 24) & 0x03;
-                    let cpu_off = off + child_ac * 4;
-                    let cpu_addr = read_cells(data, cpu_off, parent_ac);
-                    let size_off = cpu_off + parent_ac * 4;
-                    let size = read_cells(data, size_off, child_sc);
-
-                    match space {
-                        0x01 if info.pcie_pio.is_none() => {
-                            info.pcie_pio = Some((cpu_addr, size));
-                        }
-                        0x02 if info.pcie_mmio32.is_none() => {
-                            info.pcie_mmio32 = Some((cpu_addr, size));
-                        }
-                        0x03 if info.pcie_mmio64.is_none() => {
-                            info.pcie_mmio64 = Some((cpu_addr, size));
-                        }
-                        _ => {}
-                    }
-
-                    off += entry_bytes;
+            for off in (0..data.len()).step_by(entry_bytes) {
+                let pci_hi = u32::from_be_bytes(data[off..off + 4].try_into().expect("four bytes"));
+                let kind = match (pci_hi >> 24) & 0x03 {
+                    0x01 => PciWindowKind::Pio,
+                    0x02 => PciWindowKind::Mmio32,
+                    0x03 => PciWindowKind::Mmio64,
+                    _ => continue,
+                };
+                let cpu_off = off + child_ac * 4;
+                let cpu_addr = read_cells(data, cpu_off, parent_ac);
+                let size_off = cpu_off + parent_ac * 4;
+                let size = read_cells(data, size_off, child_sc);
+                if size == 0 || cpu_addr.checked_add(size).is_none() {
+                    log::warn!("FDT PCI: invalid {:?} window for host {}", kind, node.name);
+                    continue;
+                }
+                if info
+                    .pci_windows
+                    .push(PciWindow {
+                        segment,
+                        kind,
+                        base: cpu_addr,
+                        size,
+                    })
+                    .is_err()
+                {
+                    log::warn!("FDT PCI: address-window capacity exhausted");
+                    break;
                 }
             }
         }

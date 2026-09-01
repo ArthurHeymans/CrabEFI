@@ -289,107 +289,103 @@ extern "efiapi" fn ata_pass_thru(
         packet.protocol
     );
 
-    // Get the controller
-    // Safety: pointer valid for firmware lifetime; no overlapping &mut created
-    let controller = match ahci::get_controller(ctx.controller_index) {
-        Some(ptr) => unsafe { &mut *ptr },
-        None => {
-            log::error!("AtaPassThru.PassThru: controller not found");
-            return Status::DEVICE_ERROR;
-        }
-    };
+    ahci::with_controller(ctx.controller_index, |controller| {
+        // Find the port index that matches the requested port number
+        let port_index = match (0..controller.num_active_ports()).find(|&i| {
+            controller
+                .get_port(i)
+                .is_some_and(|p| p.port_num as u16 == port)
+        }) {
+            Some(idx) => idx,
+            None => {
+                log::error!("AtaPassThru.PassThru: port {} not found", port);
+                return Status::INVALID_PARAMETER;
+            }
+        };
 
-    // Find the port index that matches the requested port number
-    let port_index = match (0..controller.num_active_ports()).find(|&i| {
-        controller
-            .get_port(i)
-            .is_some_and(|p| p.port_num as u16 == port)
-    }) {
-        Some(idx) => idx,
-        None => {
-            log::error!("AtaPassThru.PassThru: port {} not found", port);
-            return Status::INVALID_PARAMETER;
-        }
-    };
+        // Handle specific commands
+        match command {
+            0x5C => {
+                // TRUSTED RECEIVE DMA
+                if !packet.in_data_buffer.is_null() && packet.in_transfer_length > 0 {
+                    let buffer = unsafe {
+                        core::slice::from_raw_parts_mut(
+                            packet.in_data_buffer as *mut u8,
+                            packet.in_transfer_length as usize,
+                        )
+                    };
+                    let protocol_id = acb.ata_features;
+                    let sp_specific = ((acb.ata_device_head & 0x0F) as u16)
+                        | ((acb.ata_cylinder_high as u16) << 8);
 
-    // Handle specific commands
-    match command {
-        0x5C => {
-            // TRUSTED RECEIVE DMA
-            if !packet.in_data_buffer.is_null() && packet.in_transfer_length > 0 {
-                let buffer = unsafe {
-                    core::slice::from_raw_parts_mut(
-                        packet.in_data_buffer as *mut u8,
-                        packet.in_transfer_length as usize,
-                    )
-                };
-                let protocol_id = acb.ata_features;
-                let sp_specific =
-                    ((acb.ata_device_head & 0x0F) as u16) | ((acb.ata_cylinder_high as u16) << 8);
-
-                match controller.trusted_receive(port_index, protocol_id, sp_specific, buffer) {
-                    Ok(bytes) => {
-                        if !packet.asb.is_null() {
-                            let asb = unsafe { &mut *packet.asb };
-                            asb.ata_status = 0x50; // Ready, no error
-                            asb.ata_error = 0;
+                    match controller.trusted_receive(port_index, protocol_id, sp_specific, buffer) {
+                        Ok(bytes) => {
+                            if !packet.asb.is_null() {
+                                let asb = unsafe { &mut *packet.asb };
+                                asb.ata_status = 0x50; // Ready, no error
+                                asb.ata_error = 0;
+                            }
+                            packet.in_transfer_length = bytes as u32;
+                            return Status::SUCCESS;
                         }
-                        packet.in_transfer_length = bytes as u32;
-                        return Status::SUCCESS;
-                    }
-                    Err(e) => {
-                        log::error!("AtaPassThru: TRUSTED RECEIVE failed: {:?}", e);
-                        if !packet.asb.is_null() {
-                            let asb = unsafe { &mut *packet.asb };
-                            asb.ata_status = 0x51; // Error
-                            asb.ata_error = 0x04; // Aborted command
+                        Err(e) => {
+                            log::error!("AtaPassThru: TRUSTED RECEIVE failed: {:?}", e);
+                            if !packet.asb.is_null() {
+                                let asb = unsafe { &mut *packet.asb };
+                                asb.ata_status = 0x51; // Error
+                                asb.ata_error = 0x04; // Aborted command
+                            }
+                            return Status::DEVICE_ERROR;
                         }
-                        return Status::DEVICE_ERROR;
                     }
                 }
             }
-        }
-        0x5E => {
-            // TRUSTED SEND DMA
-            if !packet.out_data_buffer.is_null() && packet.out_transfer_length > 0 {
-                let buffer = unsafe {
-                    core::slice::from_raw_parts(
-                        packet.out_data_buffer as *const u8,
-                        packet.out_transfer_length as usize,
-                    )
-                };
-                let protocol_id = acb.ata_features;
-                let sp_specific =
-                    ((acb.ata_device_head & 0x0F) as u16) | ((acb.ata_cylinder_high as u16) << 8);
+            0x5E => {
+                // TRUSTED SEND DMA
+                if !packet.out_data_buffer.is_null() && packet.out_transfer_length > 0 {
+                    let buffer = unsafe {
+                        core::slice::from_raw_parts(
+                            packet.out_data_buffer as *const u8,
+                            packet.out_transfer_length as usize,
+                        )
+                    };
+                    let protocol_id = acb.ata_features;
+                    let sp_specific = ((acb.ata_device_head & 0x0F) as u16)
+                        | ((acb.ata_cylinder_high as u16) << 8);
 
-                match controller.trusted_send(port_index, protocol_id, sp_specific, buffer) {
-                    Ok(()) => {
-                        if !packet.asb.is_null() {
-                            let asb = unsafe { &mut *packet.asb };
-                            asb.ata_status = 0x50; // Ready, no error
-                            asb.ata_error = 0;
+                    match controller.trusted_send(port_index, protocol_id, sp_specific, buffer) {
+                        Ok(()) => {
+                            if !packet.asb.is_null() {
+                                let asb = unsafe { &mut *packet.asb };
+                                asb.ata_status = 0x50; // Ready, no error
+                                asb.ata_error = 0;
+                            }
+                            return Status::SUCCESS;
                         }
-                        return Status::SUCCESS;
-                    }
-                    Err(e) => {
-                        log::error!("AtaPassThru: TRUSTED SEND failed: {:?}", e);
-                        if !packet.asb.is_null() {
-                            let asb = unsafe { &mut *packet.asb };
-                            asb.ata_status = 0x51; // Error
-                            asb.ata_error = 0x04; // Aborted command
+                        Err(e) => {
+                            log::error!("AtaPassThru: TRUSTED SEND failed: {:?}", e);
+                            if !packet.asb.is_null() {
+                                let asb = unsafe { &mut *packet.asb };
+                                asb.ata_status = 0x51; // Error
+                                asb.ata_error = 0x04; // Aborted command
+                            }
+                            return Status::DEVICE_ERROR;
                         }
-                        return Status::DEVICE_ERROR;
                     }
                 }
             }
+            _ => {
+                log::warn!("AtaPassThru: unsupported command {:#x}", command);
+                return Status::UNSUPPORTED;
+            }
         }
-        _ => {
-            log::warn!("AtaPassThru: unsupported command {:#x}", command);
-            return Status::UNSUPPORTED;
-        }
-    }
 
-    Status::INVALID_PARAMETER
+        Status::INVALID_PARAMETER
+    })
+    .unwrap_or_else(|| {
+        log::error!("AtaPassThru.PassThru: controller not found");
+        Status::DEVICE_ERROR
+    })
 }
 
 /// Get the next port number
@@ -408,46 +404,41 @@ extern "efiapi" fn ata_get_next_port(this: *mut AtaPassThruProtocol, port: *mut 
         }
     };
 
-    // Safety: pointer valid for firmware lifetime; no overlapping &mut created
-    let controller = match ahci::get_controller(ctx.controller_index) {
-        Some(ptr) => unsafe { &mut *ptr },
-        None => {
-            return Status::DEVICE_ERROR;
-        }
-    };
+    ahci::with_controller(ctx.controller_index, |controller| {
+        let current_port = unsafe { *port };
 
-    let current_port = unsafe { *port };
+        log::debug!(
+            "AtaPassThru.GetNextPort: current={:#x}, num_ports={}",
+            current_port,
+            controller.num_active_ports()
+        );
 
-    log::debug!(
-        "AtaPassThru.GetNextPort: current={:#x}, num_ports={}",
-        current_port,
-        controller.num_active_ports()
-    );
-
-    if current_port == 0xFFFF {
-        // Return first port
-        if let Some(p) = controller.get_port(0) {
-            unsafe { *port = p.port_num as u16 };
-            return Status::SUCCESS;
-        }
-        return Status::NOT_FOUND;
-    }
-
-    // Find current port and return the next one
-    for i in 0..controller.num_active_ports() {
-        if let Some(p) = controller.get_port(i)
-            && p.port_num as u16 == current_port
-        {
-            // Found current, return next
-            if let Some(next_p) = controller.get_port(i + 1) {
-                unsafe { *port = next_p.port_num as u16 };
+        if current_port == 0xFFFF {
+            // Return first port
+            if let Some(p) = controller.get_port(0) {
+                unsafe { *port = p.port_num as u16 };
                 return Status::SUCCESS;
             }
             return Status::NOT_FOUND;
         }
-    }
 
-    Status::NOT_FOUND
+        // Find current port and return the next one
+        for i in 0..controller.num_active_ports() {
+            if let Some(p) = controller.get_port(i)
+                && p.port_num as u16 == current_port
+            {
+                // Found current, return next
+                if let Some(next_p) = controller.get_port(i + 1) {
+                    unsafe { *port = next_p.port_num as u16 };
+                    return Status::SUCCESS;
+                }
+                return Status::NOT_FOUND;
+            }
+        }
+
+        Status::NOT_FOUND
+    })
+    .unwrap_or(Status::DEVICE_ERROR)
 }
 
 /// Get the next device on a port (port multiplier support)
@@ -470,42 +461,37 @@ extern "efiapi" fn ata_get_next_device(
         }
     };
 
-    // Safety: pointer valid for firmware lifetime; no overlapping &mut created
-    let controller = match ahci::get_controller(ctx.controller_index) {
-        Some(ptr) => unsafe { &mut *ptr },
-        None => {
-            return Status::DEVICE_ERROR;
+    ahci::with_controller(ctx.controller_index, |controller| {
+        // Verify the port exists
+        let port_exists = (0..controller.num_active_ports()).any(|i| {
+            controller
+                .get_port(i)
+                .is_some_and(|p| p.port_num as u16 == port)
+        });
+
+        if !port_exists {
+            return Status::INVALID_PARAMETER;
         }
-    };
 
-    // Verify the port exists
-    let port_exists = (0..controller.num_active_ports()).any(|i| {
-        controller
-            .get_port(i)
-            .is_some_and(|p| p.port_num as u16 == port)
-    });
+        let current_pmp = unsafe { *port_multiplier_port };
 
-    if !port_exists {
-        return Status::INVALID_PARAMETER;
-    }
+        log::debug!(
+            "AtaPassThru.GetNextDevice: port={}, current_pmp={:#x}",
+            port,
+            current_pmp
+        );
 
-    let current_pmp = unsafe { *port_multiplier_port };
+        // No port multiplier support - each port has device at PMP 0
+        if current_pmp == 0xFFFF {
+            // 0xFFFF means "get first device", return PMP 0 (no port multiplier)
+            unsafe { *port_multiplier_port = 0 };
+            return Status::SUCCESS;
+        }
 
-    log::debug!(
-        "AtaPassThru.GetNextDevice: port={}, current_pmp={:#x}",
-        port,
-        current_pmp
-    );
-
-    // No port multiplier support - each port has device at PMP 0
-    if current_pmp == 0xFFFF {
-        // 0xFFFF means "get first device", return PMP 0 (no port multiplier)
-        unsafe { *port_multiplier_port = 0 };
-        return Status::SUCCESS;
-    }
-
-    // Already returned the only device (PMP 0)
-    Status::NOT_FOUND
+        // Already returned the only device (PMP 0)
+        Status::NOT_FOUND
+    })
+    .unwrap_or(Status::DEVICE_ERROR)
 }
 
 /// Build a device path for an ATA device
@@ -608,29 +594,22 @@ extern "efiapi" fn ata_reset_port(this: *mut AtaPassThruProtocol, port: u16) -> 
 
     log::info!("AtaPassThru.ResetPort: port={}", port);
 
-    // Safety: pointer valid for firmware lifetime; no overlapping &mut created
-    let controller = match ahci::get_controller(ctx.controller_index) {
-        Some(ptr) => unsafe { &mut *ptr },
-        None => {
-            return Status::DEVICE_ERROR;
+    ahci::with_controller(ctx.controller_index, |controller| {
+        // Verify the port exists
+        let port_exists = (0..controller.num_active_ports()).any(|i| {
+            controller
+                .get_port(i)
+                .is_some_and(|p| p.port_num as u16 == port)
+        });
+
+        if !port_exists {
+            return Status::INVALID_PARAMETER;
         }
-    };
 
-    // Verify the port exists
-    let port_exists = (0..controller.num_active_ports()).any(|i| {
-        controller
-            .get_port(i)
-            .is_some_and(|p| p.port_num as u16 == port)
-    });
-
-    if !port_exists {
-        return Status::INVALID_PARAMETER;
-    }
-
-    // TODO: Implement actual port reset via AHCI COMRESET
-    // For now, just return success
-    log::warn!("AtaPassThru.ResetPort: port reset not fully implemented");
-    Status::SUCCESS
+        log::warn!("AtaPassThru.ResetPort: port reset is not implemented");
+        Status::UNSUPPORTED
+    })
+    .unwrap_or(Status::DEVICE_ERROR)
 }
 
 /// Reset a device
@@ -671,7 +650,7 @@ pub fn create_ata_pass_thru_protocol(
     };
 
     // Verify controller exists
-    if ahci::get_controller(controller_index).is_none() {
+    if controller_index >= ahci::controller_count() {
         log::error!("AtaPassThru: controller {} not found", controller_index);
         return core::ptr::null_mut();
     }

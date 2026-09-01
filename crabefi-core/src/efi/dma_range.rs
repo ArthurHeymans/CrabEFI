@@ -27,6 +27,26 @@ pub const fn allocation_fits_mask(base: u64, pages: u64, page_size: u64, mask: u
     last_byte <= mask
 }
 
+/// Translate a complete CPU range through one half-open DMA window.
+pub const fn translate_dma_range(
+    cpu_address: u64,
+    byte_len: u64,
+    cpu_base: u64,
+    device_base: u64,
+    window_size: u64,
+) -> Option<u64> {
+    let Some(offset) = cpu_address.checked_sub(cpu_base) else {
+        return None;
+    };
+    let Some(end) = offset.checked_add(byte_len) else {
+        return None;
+    };
+    if byte_len == 0 || end > window_size {
+        return None;
+    }
+    device_base.checked_add(offset)
+}
+
 /// Validate a half-open subrange against a buffer length.
 pub const fn checked_subrange(range: &Range<usize>, len: usize) -> Option<(usize, usize)> {
     if range.start > range.end || range.end > len {
@@ -76,6 +96,23 @@ mod tests {
         assert!(!allocation_fits_mask(0, u64::MAX, 4096, u64::MAX));
         assert!(!allocation_fits_mask(0, 0, 4096, u64::MAX));
         assert!(!allocation_fits_mask(0, 1, 0, u64::MAX));
+    }
+
+    #[test]
+    fn dma_translation_requires_the_complete_range() {
+        assert_eq!(
+            translate_dma_range(0x8000_1000, 0x1000, 0x8000_0000, 0x4000_0000, 0x20_0000),
+            Some(0x4000_1000)
+        );
+        assert_eq!(
+            translate_dma_range(0x7fff_f000, 0x1000, 0x8000_0000, 0x4000_0000, 0x20_0000),
+            None
+        );
+        assert_eq!(
+            translate_dma_range(0x801f_f000, 0x2000, 0x8000_0000, 0x4000_0000, 0x20_0000),
+            None
+        );
+        assert_eq!(translate_dma_range(0, 0, 0, 0, u64::MAX), None);
     }
 
     #[test]

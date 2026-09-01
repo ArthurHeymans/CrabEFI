@@ -212,14 +212,12 @@ impl BlockDevice for NvmeBlockDevice {
 
     fn read_blocks(&mut self, lba: u64, count: u32, buffer: &mut [u8]) -> Result<(), BlockError> {
         self.validate_read(lba, count, buffer)?;
-        // Safety: pointer valid for firmware lifetime; no overlapping &mut created
-        let controller = unsafe {
-            &mut *nvme::get_controller(self.controller_id).ok_or(BlockError::DeviceError)?
-        };
-
-        controller
-            .read_sectors(self.nsid, lba, count, buffer.as_mut_ptr())
-            .map_err(BlockError::from)
+        nvme::with_controller(self.controller_id, |controller| {
+            controller
+                .read_sectors(self.nsid, lba, count, buffer)
+                .map_err(BlockError::from)
+        })
+        .ok_or(BlockError::DeviceError)?
     }
 }
 
@@ -284,14 +282,12 @@ impl BlockDevice for AhciBlockDevice {
 
     fn read_blocks(&mut self, lba: u64, count: u32, buffer: &mut [u8]) -> Result<(), BlockError> {
         self.validate_read(lba, count, buffer)?;
-        // Safety: pointer valid for firmware lifetime; no overlapping &mut created
-        let controller = unsafe {
-            &mut *ahci::get_controller(self.controller_id).ok_or(BlockError::DeviceError)?
-        };
-
-        // Safety: buffer.as_mut_ptr() is valid for buffer.len() bytes
-        unsafe { controller.read_sectors(self.port, lba, count, buffer.as_mut_ptr()) }
-            .map_err(BlockError::from)
+        ahci::with_controller(self.controller_id, |controller| {
+            controller
+                .read_sectors_into(self.port, lba, count, buffer)
+                .map_err(BlockError::from)
+        })
+        .ok_or(BlockError::DeviceError)?
     }
 }
 
@@ -421,14 +417,12 @@ impl BlockDevice for SdhciBlockDevice {
 
     fn read_blocks(&mut self, lba: u64, count: u32, buffer: &mut [u8]) -> Result<(), BlockError> {
         self.validate_read(lba, count, buffer)?;
-        // Safety: pointer valid for firmware lifetime; no overlapping &mut created
-        let controller = unsafe {
-            &mut *sdhci::get_controller(self.controller_id).ok_or(BlockError::DeviceError)?
-        };
-
-        controller
-            .read_sectors(lba, count, buffer.as_mut_ptr())
-            .map_err(BlockError::from)
+        sdhci::with_controller(self.controller_id, |controller| {
+            controller
+                .read_sectors(lba, count, buffer)
+                .map_err(BlockError::from)
+        })
+        .ok_or(BlockError::DeviceError)?
     }
 }
 
@@ -476,7 +470,7 @@ impl<'a> BlockDevice for NvmeDisk<'a> {
     fn read_blocks(&mut self, lba: u64, count: u32, buffer: &mut [u8]) -> Result<(), BlockError> {
         self.validate_read(lba, count, buffer)?;
         self.controller
-            .read_sectors(self.nsid, lba, count, buffer.as_mut_ptr())
+            .read_sectors(self.nsid, lba, count, buffer)
             .map_err(BlockError::from)
     }
 }
@@ -520,12 +514,9 @@ impl<'a> BlockDevice for AhciDisk<'a> {
 
     fn read_blocks(&mut self, lba: u64, count: u32, buffer: &mut [u8]) -> Result<(), BlockError> {
         self.validate_read(lba, count, buffer)?;
-        // Safety: buffer.as_mut_ptr() is valid for buffer.len() bytes
-        unsafe {
-            self.controller
-                .read_sectors(self.port, lba, count, buffer.as_mut_ptr())
-        }
-        .map_err(BlockError::from)
+        self.controller
+            .read_sectors_into(self.port, lba, count, buffer)
+            .map_err(BlockError::from)
     }
 }
 
@@ -596,7 +587,7 @@ impl<'a> BlockDevice for SdhciDisk<'a> {
     fn read_blocks(&mut self, lba: u64, count: u32, buffer: &mut [u8]) -> Result<(), BlockError> {
         self.validate_read(lba, count, buffer)?;
         self.controller
-            .read_sectors(lba, count, buffer.as_mut_ptr())
+            .read_sectors(lba, count, buffer)
             .map_err(BlockError::from)
     }
 }
@@ -650,17 +641,16 @@ pub fn create_nvme_device(
     nsid: u32,
     media_id: u32,
 ) -> Option<NvmeBlockDevice> {
-    // Safety: pointer valid for firmware lifetime; no overlapping &mut created
-    let controller = unsafe { &mut *nvme::get_controller(controller_id)? };
-    let ns = controller.get_namespace(nsid)?;
-
-    Some(NvmeBlockDevice::new(
-        controller_id,
-        nsid,
-        ns.num_blocks,
-        ns.block_size,
-        media_id,
-    ))
+    nvme::with_controller(controller_id, |controller| {
+        let ns = controller.get_namespace(nsid)?;
+        Some(NvmeBlockDevice::new(
+            controller_id,
+            nsid,
+            ns.num_blocks,
+            ns.block_size,
+            media_id,
+        ))
+    })?
 }
 
 /// Create an AHCI block device from a controller and port
@@ -669,33 +659,29 @@ pub fn create_ahci_device(
     port: usize,
     media_id: u32,
 ) -> Option<AhciBlockDevice> {
-    // Safety: pointer valid for firmware lifetime; no overlapping &mut created
-    let controller = unsafe { &mut *ahci::get_controller(controller_id)? };
-    let port_info = controller.get_port(port)?;
-
-    Some(AhciBlockDevice::new(
-        controller_id,
-        port,
-        port_info.sector_count,
-        port_info.sector_size,
-        media_id,
-    ))
+    ahci::with_controller(controller_id, |controller| {
+        let port_info = controller.get_port(port)?;
+        Some(AhciBlockDevice::new(
+            controller_id,
+            port,
+            port_info.sector_count,
+            port_info.sector_size,
+            media_id,
+        ))
+    })?
 }
 
 /// Create an SDHCI block device from a controller
 pub fn create_sdhci_device(controller_id: usize, media_id: u32) -> Option<SdhciBlockDevice> {
-    // Safety: pointer valid for firmware lifetime; no overlapping &mut created
-    let controller = unsafe { &mut *sdhci::get_controller(controller_id)? };
-
-    if !controller.is_ready() {
-        return None;
-    }
-
-    Some(SdhciBlockDevice::new_with_removable(
-        controller_id,
-        controller.num_blocks(),
-        controller.block_size(),
-        media_id,
-        controller.removable(),
-    ))
+    sdhci::with_controller(controller_id, |controller| {
+        controller.is_ready().then(|| {
+            SdhciBlockDevice::new_with_removable(
+                controller_id,
+                controller.num_blocks(),
+                controller.block_size(),
+                media_id,
+                controller.removable(),
+            )
+        })
+    })?
 }

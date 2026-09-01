@@ -448,7 +448,7 @@ fn init_platform_impl(mut config: PlatformConfig) -> ! {
         if let Some(plat) = unsafe { fdt::parse(fdt_addr, fdt_size) } {
             log::info!(
                 "FDT parsed: ECAM regions={}, GIC={:?}, UART={:?}",
-                plat.ecam_region_count,
+                plat.ecam_regions.len(),
                 plat.gicd,
                 plat.uart_base
             );
@@ -559,19 +559,19 @@ fn init_platform_impl(mut config: PlatformConfig) -> ! {
             "PCI ECAM regions from platform: {}",
             config.ecam_regions.len()
         );
-        drivers::pci::set_ecam_regions(config.ecam_regions);
+        let _ = drivers::pci::set_ecam_regions(config.ecam_regions);
     } else {
-        let acpi_info = state::drivers().acpi_info;
-        let fdt_info = state::drivers().fdt_info;
+        let acpi_info = state::drivers().acpi_info.clone();
+        let fdt_info = state::drivers().fdt_info.clone();
         if !acpi_info.ecam_regions().is_empty() {
             log::info!(
                 "PCI ECAM regions from ACPI MCFG: {}",
-                acpi_info.ecam_region_count
+                acpi_info.ecam_regions.len()
             );
-            drivers::pci::set_ecam_regions(acpi_info.ecam_regions());
+            let _ = drivers::pci::set_ecam_regions(acpi_info.ecam_regions());
         } else if !fdt_info.ecam_regions().is_empty() {
             log::info!("PCI ECAM region from FDT");
-            drivers::pci::set_ecam_regions(fdt_info.ecam_regions());
+            let _ = drivers::pci::set_ecam_regions(fdt_info.ecam_regions());
         }
     }
 
@@ -630,34 +630,31 @@ pub(crate) fn with_disk<R>(
         menu::DeviceType::Nvme {
             controller_id,
             nsid,
-        } => {
-            let controller = unsafe { &mut *drivers::nvme::get_controller(controller_id)? };
+        } => drivers::nvme::with_controller(controller_id, |controller| {
             let mut disk = NvmeDisk::new(controller, nsid);
-            Some(f(&mut disk))
-        }
+            f(&mut disk)
+        }),
         menu::DeviceType::Ahci {
             controller_id,
             port,
-        } => {
-            let controller = unsafe { &mut *drivers::ahci::get_controller(controller_id)? };
+        } => drivers::ahci::with_controller(controller_id, |controller| {
             let mut disk = AhciDisk::new(controller, port);
-            Some(f(&mut disk))
-        }
-        menu::DeviceType::Usb {
-            controller_id,
-            device_addr: _,
-        } => {
-            let controller_ptr = drivers::usb::get_controller_ptr(controller_id)?;
-            let device_ptr = drivers::usb::mass_storage::get_global_device_ptr()?;
-            let controller = unsafe { &mut *controller_ptr };
-            let usb_device = unsafe { &mut *device_ptr };
-            let mut disk = UsbDisk::new(usb_device, controller);
-            Some(f(&mut disk))
+            f(&mut disk)
+        }),
+        menu::DeviceType::Usb { controller_id, .. } => {
+            drivers::usb::mass_storage::with_global_device_and_controller(
+                controller_id,
+                |usb_device, controller| {
+                    let mut disk = UsbDisk::new(usb_device, controller);
+                    f(&mut disk)
+                },
+            )
         }
         menu::DeviceType::Sdhci { controller_id } => {
-            let controller = unsafe { &mut *drivers::sdhci::get_controller(controller_id)? };
-            let mut disk = SdhciDisk::new(controller);
-            Some(f(&mut disk))
+            drivers::sdhci::with_controller(controller_id, |controller| {
+                let mut disk = SdhciDisk::new(controller);
+                f(&mut disk)
+            })
         }
         menu::DeviceType::Platform { index } => {
             drivers::storage::with_platform_block_device(index, |dev| {

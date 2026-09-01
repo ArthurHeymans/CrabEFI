@@ -934,7 +934,7 @@ pub fn add_platform_mmio_regions() {
     };
 
     // Try to get platform info from FDT (if available)
-    let plat = crate::state::drivers().fdt_info;
+    let plat = crate::state::drivers().fdt_info.clone();
 
     // Interrupt controller — from FDT only (GIC on aarch64, PLIC on riscv64).
     // The `gicd` field is reused for PLIC on RISC-V (see fdt.rs:extract_gic).
@@ -958,25 +958,20 @@ pub fn add_platform_mmio_regions() {
         log::warn!("add_platform_mmio_regions: no interrupt controller found in FDT");
     }
 
-    // PCIe PIO — from FDT only.
-    if let Some((base, size)) = plat.pcie_pio {
-        add_mmio(base, size, "PCIe PIO");
-    }
-
-    // PCIe 32-bit MMIO — from FDT only.
-    if let Some((base, size)) = plat.pcie_mmio32 {
-        add_mmio(base, size, "PCIe MMIO32");
-    }
-
-    // PCIe 64-bit MMIO (if from FDT)
-    //
-    // Skip on RISC-V: OpenSBI 1.1's PMP configuration does not cover the
-    // 64-bit MMIO range (e.g. 0x3_0000_0000+), so S-mode accesses there
-    // fault.  All PCI BARs are placed in the 32-bit window instead.
-    // Adding the (often 16 GB) region also bloats the EFI memory map.
-    #[cfg(not(target_arch = "riscv64"))]
-    if let Some((base, size)) = plat.pcie_mmio64 {
-        add_mmio(base, size, "PCIe MMIO64");
+    for window in &plat.pci_windows {
+        match window.kind {
+            crate::fdt::PciWindowKind::Pio => {
+                add_mmio(window.base, window.size, "PCIe PIO");
+            }
+            crate::fdt::PciWindowKind::Mmio32 => {
+                add_mmio(window.base, window.size, "PCIe MMIO32");
+            }
+            crate::fdt::PciWindowKind::Mmio64 => {
+                // OpenSBI's PMP setup may not expose the 64-bit PCI window.
+                #[cfg(not(target_arch = "riscv64"))]
+                add_mmio(window.base, window.size, "PCIe MMIO64");
+            }
+        }
     }
 
     // PCIe ECAM — from FDT

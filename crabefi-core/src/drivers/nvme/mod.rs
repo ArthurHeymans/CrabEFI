@@ -7,8 +7,7 @@ pub mod logic;
 
 use crate::barrier;
 use crate::drivers::pci::{self, PciAddress, PciDevice};
-use crate::efi;
-use crate::efi::dma::{DmaBuffer, DmaCoherency, DmaDirection, DmaMask};
+use crate::efi::dma::{DmaBuffer, DmaDirection, DmaDomain, DmaMask};
 use crate::time::{Timeout, wait_for};
 use core::ptr;
 use spin::Mutex;
@@ -442,7 +441,7 @@ pub struct LbaFormat {
 }
 
 /// NVMe namespace information
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub struct NvmeNamespace {
     /// Namespace ID
     pub nsid: u32,
@@ -464,18 +463,12 @@ pub struct NvmeController {
     doorbell_stride: usize,
     /// Capability value captured before controller programming.
     initial_cap: u64,
-    /// Admin submission queue
-    admin_sq: *mut SubmissionQueueEntry,
-    /// Admin completion queue
-    admin_cq: *mut CompletionQueueEntry,
+    /// Explicit platform DMA translation and coherency domain.
+    dma_domain: DmaDomain,
     /// Admin queue bookkeeping and owned DMA allocations.
     admin_queue: QueueState,
     admin_sq_dma: DmaBuffer,
     admin_cq_dma: DmaBuffer,
-    /// I/O submission queue
-    io_sq: *mut SubmissionQueueEntry,
-    /// I/O completion queue
-    io_cq: *mut CompletionQueueEntry,
     /// I/O queue bookkeeping and owned DMA allocations.
     io_queue: QueueState,
     io_sq_dma: Option<DmaBuffer>,
@@ -519,13 +512,38 @@ pub enum NvmeError {
     QueueFull,
     /// DMA ownership synchronization failed.
     DmaError,
+    /// No explicit platform DMA translation domain is available.
+    DmaDomainUnavailable,
+    /// A completion entry did not match a submitted command or queue.
+    MalformedCompletion,
 }
 
 impl NvmeController {
+    fn admin_sq_ptr(&self) -> *mut SubmissionQueueEntry {
+        self.admin_sq_dma.cpu_address() as *mut SubmissionQueueEntry
+    }
+
+    fn admin_cq_ptr(&self) -> *mut CompletionQueueEntry {
+        self.admin_cq_dma.cpu_address() as *mut CompletionQueueEntry
+    }
+
+    fn io_sq_ptr(&self) -> Option<*mut SubmissionQueueEntry> {
+        self.io_sq_dma
+            .as_ref()
+            .map(|dma| dma.cpu_address() as *mut SubmissionQueueEntry)
+    }
+
+    fn io_cq_ptr(&self) -> Option<*mut CompletionQueueEntry> {
+        self.io_cq_dma
+            .as_ref()
+            .map(|dma| dma.cpu_address() as *mut CompletionQueueEntry)
+    }
+
     /// Create a new NVMe controller from a PCI device
     pub fn new(pci_dev: &PciDevice) -> Result<Self, NvmeError> {
         let mmio_base = pci_dev.mmio_base().ok_or(NvmeError::NotReady)?;
         let regs = mmio_base as *mut NvmeRegisters;
+        let dma_domain = pci::dma_domain(pci_dev.address).ok_or(NvmeError::DmaDomainUnavailable)?;
 
         // Enable the device (bus master + memory space)
         pci::enable_device(pci_dev);
@@ -559,32 +577,24 @@ impl NvmeController {
         let tertiary = regs_ref.vs.read(VS::TER);
         log::info!("NVMe version: {}.{}.{}", major, minor, tertiary);
 
-        let admin_sq_dma = DmaBuffer::allocate(
+        let admin_sq_dma = DmaBuffer::allocate_in_domain(
             usize::from(admin_depth) * core::mem::size_of::<SubmissionQueueEntry>(),
             DmaMask::bits64(),
-            DmaCoherency::Coherent,
+            dma_domain,
         )
         .map_err(|_| NvmeError::AllocationFailed)?;
-        let admin_cq_dma = DmaBuffer::allocate(
+        let admin_cq_dma = DmaBuffer::allocate_in_domain(
             usize::from(admin_depth) * core::mem::size_of::<CompletionQueueEntry>(),
             DmaMask::bits64(),
-            DmaCoherency::Coherent,
+            dma_domain,
         )
         .map_err(|_| NvmeError::AllocationFailed)?;
-        let admin_sq = admin_sq_dma.dma_address() as *mut SubmissionQueueEntry;
-        let admin_cq = admin_cq_dma.dma_address() as *mut CompletionQueueEntry;
-        let identify = DmaBuffer::allocate(
-            CONTROLLER_PAGE_SIZE,
-            DmaMask::bits64(),
-            DmaCoherency::Coherent,
-        )
-        .map_err(|_| NvmeError::AllocationFailed)?;
-        let prp_list = DmaBuffer::allocate(
-            CONTROLLER_PAGE_SIZE,
-            DmaMask::bits64(),
-            DmaCoherency::Coherent,
-        )
-        .map_err(|_| NvmeError::AllocationFailed)?;
+        let identify =
+            DmaBuffer::allocate_in_domain(CONTROLLER_PAGE_SIZE, DmaMask::bits64(), dma_domain)
+                .map_err(|_| NvmeError::AllocationFailed)?;
+        let prp_list =
+            DmaBuffer::allocate_in_domain(CONTROLLER_PAGE_SIZE, DmaMask::bits64(), dma_domain)
+                .map_err(|_| NvmeError::AllocationFailed)?;
 
         let mut controller = Self {
             pci_address: pci_dev.address,
@@ -592,13 +602,10 @@ impl NvmeController {
             mmio_base,
             doorbell_stride,
             initial_cap: cap,
-            admin_sq,
-            admin_cq,
+            dma_domain,
             admin_queue: QueueState::new(admin_depth),
             admin_sq_dma,
             admin_cq_dma,
-            io_sq: ptr::null_mut(),
-            io_cq: ptr::null_mut(),
             io_queue: QueueState::new(io_depth),
             io_sq_dma: None,
             io_cq_dma: None,
@@ -703,8 +710,8 @@ impl NvmeController {
 
         // Program 64-bit queue addresses as low then high DWORD writes, as
         // required for NVMe queue-base registers.
-        let admin_sq_address = self.admin_sq as u64;
-        let admin_cq_address = self.admin_cq as u64;
+        let admin_sq_address = self.admin_sq_dma.dma_address();
+        let admin_cq_address = self.admin_cq_dma.dma_address();
         Self::write_queue_base(&regs.asq_low, &regs.asq_high, admin_sq_address);
         Self::write_queue_base(&regs.acq_low, &regs.acq_high, admin_cq_address);
 
@@ -808,7 +815,7 @@ impl NvmeController {
         }
         let (cid, slot) = self.admin_queue.reserve().ok_or(NvmeError::QueueFull)?;
         cmd.set_cid(cid);
-        unsafe { ptr::write_volatile(self.admin_sq.add(slot as usize), cmd) };
+        unsafe { ptr::write_volatile(self.admin_sq_ptr().add(slot as usize), cmd) };
         self.admin_sq_dma
             .sync_for_device(0..self.admin_sq_dma.len(), DmaDirection::ToDevice)
             .map_err(|_| NvmeError::DmaError)?;
@@ -823,7 +830,8 @@ impl NvmeController {
         }
         let (cid, slot) = self.io_queue.reserve().ok_or(NvmeError::QueueFull)?;
         cmd.set_cid(cid);
-        unsafe { ptr::write_volatile(self.io_sq.add(slot as usize), cmd) };
+        let io_sq = self.io_sq_ptr().ok_or(NvmeError::NotReady)?;
+        unsafe { ptr::write_volatile(io_sq.add(slot as usize), cmd) };
         let dma = self.io_sq_dma.as_ref().ok_or(NvmeError::NotReady)?;
         dma.sync_for_device(0..dma.len(), DmaDirection::ToDevice)
             .map_err(|_| NvmeError::DmaError)?;
@@ -836,7 +844,7 @@ impl NvmeController {
         state: &mut QueueState,
         queue_id: u16,
         requested_cid: Option<u16>,
-    ) -> (Option<CompletionQueueEntry>, bool) {
+    ) -> (Option<CompletionQueueEntry>, bool, bool) {
         let mut requested = None;
         let mut drained = false;
         for _ in 0..state.depth {
@@ -851,27 +859,22 @@ impl NvmeController {
                 break;
             }
             let cid = entry.cid();
-            let sq_head = if entry.sq_id() == queue_id {
-                entry.sq_head()
-            } else {
+            let sq_head = entry.sq_head();
+            if entry.sq_id() != queue_id || !state.accepts_completion(cid, sq_head) {
                 log::error!(
-                    "NVMe CQ{}: completion CID {} reported unexpected SQID {}",
+                    "NVMe CQ{}: rejecting malformed completion CID {} SQID {} SQHD {}",
                     queue_id,
                     cid,
-                    entry.sq_id()
+                    entry.sq_id(),
+                    sq_head,
                 );
-                state.sq_head
-            };
-            match state.retire(cid, sq_head) {
-                Some(pending) if pending.timed_out => {
-                    log::warn!("NVMe CQ{}: consumed late completion CID {}", queue_id, cid);
-                }
-                Some(_) => {}
-                None => log::warn!(
-                    "NVMe CQ{}: consumed completion for untracked CID {}",
-                    queue_id,
-                    cid
-                ),
+                return (requested, drained, true);
+            }
+            let pending = state
+                .retire(cid, sq_head)
+                .expect("validated completion must retire a pending command");
+            if pending.timed_out {
+                log::warn!("NVMe CQ{}: consumed late completion CID {}", queue_id, cid);
             }
             if requested_cid == Some(cid) {
                 requested = Some(entry);
@@ -879,7 +882,7 @@ impl NvmeController {
             state.advance_cq();
             drained = true;
         }
-        (requested, drained)
+        (requested, drained, false)
     }
 
     fn refresh_dma_quarantine(&mut self) {
@@ -891,13 +894,18 @@ impl NvmeController {
             self.dma_quarantined = true;
             return;
         }
-        let (admin_entry, admin_drained) =
-            Self::drain_cq(self.admin_cq, &mut self.admin_queue, 0, None);
+        let admin_cq = self.admin_cq_ptr();
+        let (admin_entry, admin_drained, admin_malformed) =
+            Self::drain_cq(admin_cq, &mut self.admin_queue, 0, None);
         debug_assert!(admin_entry.is_none());
         if admin_drained {
             self.ring_cq_doorbell(0, self.admin_queue.cq_head);
         }
-        if !self.io_cq.is_null() {
+        if admin_malformed {
+            self.dma_quarantined = true;
+            return;
+        }
+        if let Some(io_cq) = self.io_cq_ptr() {
             let Some(io_cq_dma) = self.io_cq_dma.as_ref() else {
                 self.dma_quarantined = true;
                 return;
@@ -909,10 +917,15 @@ impl NvmeController {
                 self.dma_quarantined = true;
                 return;
             }
-            let (io_entry, io_drained) = Self::drain_cq(self.io_cq, &mut self.io_queue, 1, None);
+            let (io_entry, io_drained, io_malformed) =
+                Self::drain_cq(io_cq, &mut self.io_queue, 1, None);
             debug_assert!(io_entry.is_none());
             if io_drained {
                 self.ring_cq_doorbell(1, self.io_queue.cq_head);
+            }
+            if io_malformed {
+                self.dma_quarantined = true;
+                return;
             }
         }
         self.dma_quarantined = self
@@ -929,22 +942,29 @@ impl NvmeController {
     ) -> Result<CompletionQueueEntry, NvmeError> {
         let timeout = Timeout::from_ms(COMMAND_TIMEOUT_MS);
         while !timeout.is_expired() {
-            let (entry, drained, head) = if queue_id == 0 {
+            let (entry, drained, malformed, head) = if queue_id == 0 {
                 self.admin_cq_dma
                     .sync_for_cpu(0..self.admin_cq_dma.len(), DmaDirection::FromDevice)
                     .map_err(|_| NvmeError::DmaError)?;
-                let (entry, drained) =
-                    Self::drain_cq(self.admin_cq, &mut self.admin_queue, 0, Some(cid));
-                (entry, drained, self.admin_queue.cq_head)
+                let admin_cq = self.admin_cq_ptr();
+                let (entry, drained, malformed) =
+                    Self::drain_cq(admin_cq, &mut self.admin_queue, 0, Some(cid));
+                (entry, drained, malformed, self.admin_queue.cq_head)
             } else {
                 let dma = self.io_cq_dma.as_ref().ok_or(NvmeError::NotReady)?;
                 dma.sync_for_cpu(0..dma.len(), DmaDirection::FromDevice)
                     .map_err(|_| NvmeError::DmaError)?;
-                let (entry, drained) = Self::drain_cq(self.io_cq, &mut self.io_queue, 1, Some(cid));
-                (entry, drained, self.io_queue.cq_head)
+                let io_cq = self.io_cq_ptr().ok_or(NvmeError::NotReady)?;
+                let (entry, drained, malformed) =
+                    Self::drain_cq(io_cq, &mut self.io_queue, 1, Some(cid));
+                (entry, drained, malformed, self.io_queue.cq_head)
             };
             if drained {
                 self.ring_cq_doorbell(queue_id, head);
+            }
+            if malformed {
+                self.dma_quarantined = true;
+                return Err(NvmeError::MalformedCompletion);
             }
             if let Some(entry) = entry {
                 return if entry.is_error() {
@@ -958,6 +978,11 @@ impl NvmeController {
             }
             core::hint::spin_loop();
         }
+        let cq = if queue_id == 0 {
+            self.admin_cq_ptr()
+        } else {
+            self.io_cq_ptr().ok_or(NvmeError::NotReady)?
+        };
         let state = if queue_id == 0 {
             &mut self.admin_queue
         } else {
@@ -966,13 +991,7 @@ impl NvmeController {
         state.mark_timed_out(cid);
         self.dma_quarantined = true;
         let regs = unsafe { &*self.regs };
-        let current = unsafe {
-            ptr::read_volatile(if queue_id == 0 {
-                self.admin_cq.add(state.cq_head as usize)
-            } else {
-                self.io_cq.add(state.cq_head as usize)
-            })
-        };
+        let current = unsafe { ptr::read_volatile(cq.add(state.cq_head as usize)) };
         log::error!(
             "NVMe {} CQ timeout: requested CID={}, SQ head/tail={}/{}, CQ head/phase={}/{}, CSTS={:#x}, CQE cid={} phase={}",
             self.pci_address,
@@ -1019,7 +1038,7 @@ impl NvmeController {
         self.identify
             .sync_for_cpu(0..self.identify.len(), DmaDirection::FromDevice)
             .map_err(|_| NvmeError::DmaError)?;
-        let ctrl = unsafe { &*(identify_addr as *const IdentifyController) };
+        let ctrl = unsafe { &*(self.identify.cpu_address() as *const IdentifyController) };
         let model = core::str::from_utf8(&ctrl.mn).unwrap_or("Unknown").trim();
         let serial = core::str::from_utf8(&ctrl.sn).unwrap_or("Unknown").trim();
         let firmware = core::str::from_utf8(&ctrl.fr).unwrap_or("Unknown").trim();
@@ -1034,27 +1053,29 @@ impl NvmeController {
 
     /// Create I/O submission and completion queues
     fn create_io_queues(&mut self) -> Result<(), NvmeError> {
-        let io_sq_dma = DmaBuffer::allocate(
+        let io_sq_dma = DmaBuffer::allocate_in_domain(
             usize::from(self.io_queue.depth) * core::mem::size_of::<SubmissionQueueEntry>(),
             DmaMask::bits64(),
-            DmaCoherency::Coherent,
+            self.dma_domain,
         )
         .map_err(|_| NvmeError::AllocationFailed)?;
-        let io_cq_dma = DmaBuffer::allocate(
+        let io_cq_dma = DmaBuffer::allocate_in_domain(
             usize::from(self.io_queue.depth) * core::mem::size_of::<CompletionQueueEntry>(),
             DmaMask::bits64(),
-            DmaCoherency::Coherent,
+            self.dma_domain,
         )
         .map_err(|_| NvmeError::AllocationFailed)?;
-        self.io_sq = io_sq_dma.dma_address() as *mut SubmissionQueueEntry;
-        self.io_cq = io_cq_dma.dma_address() as *mut CompletionQueueEntry;
         self.io_sq_dma = Some(io_sq_dma);
         self.io_cq_dma = Some(io_cq_dma);
 
         // Create I/O Completion Queue (queue ID = 1)
         let mut cmd = SubmissionQueueEntry::new();
         cmd.set_opcode(admin_cmd::CREATE_CQ);
-        cmd.prp1 = self.io_cq as u64;
+        cmd.prp1 = self
+            .io_cq_dma
+            .as_ref()
+            .ok_or(NvmeError::NotReady)?
+            .dma_address();
         cmd.cdw10 = (u32::from(self.io_queue.depth - 1) << 16) | 1; // QSIZE | QCQID
         cmd.cdw11 = 0x01; // PC=1 (physically contiguous), IEN=0, IV=0
 
@@ -1065,7 +1086,11 @@ impl NvmeController {
         // Create I/O Submission Queue (queue ID = 1)
         let mut cmd = SubmissionQueueEntry::new();
         cmd.set_opcode(admin_cmd::CREATE_SQ);
-        cmd.prp1 = self.io_sq as u64;
+        cmd.prp1 = self
+            .io_sq_dma
+            .as_ref()
+            .ok_or(NvmeError::NotReady)?
+            .dma_address();
         cmd.cdw10 = (u32::from(self.io_queue.depth - 1) << 16) | 1; // QSIZE | QSQID
         cmd.cdw11 = (1 << 16) | 0x01; // CQID=1 | PC=1
 
@@ -1095,7 +1120,7 @@ impl NvmeController {
             .map_err(|_| NvmeError::DmaError)?;
         let mut namespace_ids = [0u32; 1024];
         namespace_ids.copy_from_slice(unsafe {
-            core::slice::from_raw_parts(identify_addr as *const u32, 1024)
+            core::slice::from_raw_parts(self.identify.cpu_address() as *const u32, 1024)
         });
 
         for nsid in namespace_ids.into_iter().take_while(|nsid| *nsid != 0) {
@@ -1112,7 +1137,7 @@ impl NvmeController {
             self.identify
                 .sync_for_cpu(0..self.identify.len(), DmaDirection::FromDevice)
                 .map_err(|_| NvmeError::DmaError)?;
-            let ns = unsafe { &*(identify_addr as *const IdentifyNamespace) };
+            let ns = unsafe { &*(self.identify.cpu_address() as *const IdentifyNamespace) };
             if ns.nsze == 0 {
                 log::warn!("NVMe namespace {} has zero size; skipping", nsid);
                 continue;
@@ -1160,10 +1185,10 @@ impl NvmeController {
             return Err(NvmeError::NoNamespaces);
         }
         self.staging = Some(
-            DmaBuffer::allocate(
+            DmaBuffer::allocate_in_domain(
                 largest_block.max(CONTROLLER_PAGE_SIZE),
                 DmaMask::bits64(),
-                DmaCoherency::Coherent,
+                self.dma_domain,
             )
             .map_err(|_| NvmeError::AllocationFailed)?,
         );
@@ -1190,24 +1215,26 @@ impl NvmeController {
     /// Uses an internal page-aligned DMA buffer to avoid corruption when
     /// callers pass misaligned buffers (e.g., stack buffers).
     ///
-    /// # Safety contract
-    ///
-    /// The caller must ensure that `buffer` points to a valid, writable memory
-    /// region of at least `num_sectors * block_size` bytes. Passing an
-    /// insufficiently sized buffer will result in memory corruption.
     pub fn read_sectors(
         &mut self,
         nsid: u32,
         start_lba: u64,
         num_sectors: u32,
-        buffer: *mut u8,
+        buffer: &mut [u8],
     ) -> Result<(), NvmeError> {
         let ns = self
             .get_namespace(nsid)
             .ok_or(NvmeError::InvalidNamespace)?;
         let block_size = ns.block_size as usize;
         let namespace_blocks = ns.num_blocks;
-        if num_sectors == 0 || buffer.is_null() {
+        if num_sectors == 0 {
+            return Err(NvmeError::InvalidParameter);
+        }
+        let required_len = usize::try_from(num_sectors)
+            .ok()
+            .and_then(|count| count.checked_mul(block_size))
+            .ok_or(NvmeError::InvalidParameter)?;
+        if buffer.len() != required_len {
             return Err(NvmeError::InvalidParameter);
         }
         let end_lba = start_lba
@@ -1224,8 +1251,15 @@ impl NvmeController {
         let mut byte_offset = 0usize;
         while remaining != 0 {
             let chunk = remaining.min(chunk_limit);
-            let destination = buffer.wrapping_add(byte_offset);
-            self.read_sectors_internal(nsid, current_lba, chunk, destination)?;
+            let chunk_len = (chunk as usize)
+                .checked_mul(block_size)
+                .ok_or(NvmeError::InvalidParameter)?;
+            self.read_sectors_internal(
+                nsid,
+                current_lba,
+                chunk,
+                &mut buffer[byte_offset..byte_offset + chunk_len],
+            )?;
             remaining -= chunk;
             current_lba += u64::from(chunk);
             byte_offset = byte_offset
@@ -1244,7 +1278,7 @@ impl NvmeController {
         nsid: u32,
         start_lba: u64,
         num_sectors: u32,
-        buffer: *mut u8,
+        buffer: &mut [u8],
     ) -> Result<(), NvmeError> {
         let block_size = self
             .get_namespace(nsid)
@@ -1253,7 +1287,7 @@ impl NvmeController {
         let transfer_size = (num_sectors as usize)
             .checked_mul(block_size)
             .ok_or(NvmeError::InvalidParameter)?;
-        if num_sectors == 0 || num_sectors > 65536 || buffer.is_null() {
+        if num_sectors == 0 || num_sectors > 65536 || buffer.len() != transfer_size {
             return Err(NvmeError::InvalidParameter);
         }
 
@@ -1265,7 +1299,7 @@ impl NvmeController {
             let list_address = self.prp_list.dma_address();
             let list = unsafe {
                 core::slice::from_raw_parts_mut(
-                    list_address as *mut u64,
+                    self.prp_list.cpu_address() as *mut u64,
                     self.controller_page_size / core::mem::size_of::<u64>(),
                 )
             };
@@ -1281,7 +1315,7 @@ impl NvmeController {
                 .sync_for_device(0..self.prp_list.len(), DmaDirection::ToDevice)
                 .map_err(|_| NvmeError::DmaError)?;
             staging
-                .sync_for_device(0..transfer_size, DmaDirection::FromDevice)
+                .sync_for_device(0..staging.len(), DmaDirection::FromDevice)
                 .map_err(|_| NvmeError::DmaError)?;
             (prps.prp1, prps.prp2)
         };
@@ -1299,11 +1333,9 @@ impl NvmeController {
         self.wait_io_completion(cid)?;
         let staging = self.staging.as_ref().ok_or(NvmeError::NotReady)?;
         staging
-            .sync_for_cpu(0..transfer_size, DmaDirection::FromDevice)
+            .sync_for_cpu(0..staging.len(), DmaDirection::FromDevice)
             .map_err(|_| NvmeError::DmaError)?;
-        unsafe {
-            ptr::copy_nonoverlapping(staging.dma_address() as *const u8, buffer, transfer_size);
-        }
+        buffer.copy_from_slice(&staging.as_slice()[..transfer_size]);
         Ok(())
     }
 
@@ -1323,7 +1355,7 @@ impl NvmeController {
         }
 
         let num_sectors = (buffer.len() / block_size) as u32;
-        self.read_sectors(nsid, lba, num_sectors, buffer.as_mut_ptr())
+        self.read_sectors(nsid, lba, num_sectors, buffer)
     }
     // ========================================================================
     // Security Commands (TCG Opal, IEEE 1667)
@@ -1378,23 +1410,16 @@ impl NvmeController {
         cmd.cdw11 = buffer.len() as u32; // Allocation length in bytes per NVMe spec
 
         let cid = self.submit_admin_command(cmd)?;
-        let completion = self.wait_admin_completion(cid)?;
+        self.wait_admin_completion(cid)?;
 
-        // The completion DW0 contains the number of bytes transferred (for some implementations)
-        // For simplicity, we assume the full buffer was used if no error
-        let bytes_transferred = if completion.dw0 > 0 && completion.dw0 <= buffer.len() as u32 {
-            completion.dw0 as usize
-        } else {
-            buffer.len()
-        };
-
+        let bytes_transferred = buffer.len();
         let staging = self.staging.as_ref().ok_or(NvmeError::NotReady)?;
         staging
-            .sync_for_cpu(0..bytes_transferred, DmaDirection::FromDevice)
+            .sync_for_cpu(0..staging.len(), DmaDirection::FromDevice)
             .map_err(|_| NvmeError::DmaError)?;
         unsafe {
             ptr::copy_nonoverlapping(
-                staging.dma_address() as *const u8,
+                staging.cpu_address() as *const u8,
                 buffer.as_mut_ptr(),
                 bytes_transferred,
             );
@@ -1562,12 +1587,7 @@ pub fn init_device(dev: &pci::PciDevice) -> Result<(), ()> {
 /// Called during ExitBootServices to prepare for OS handoff.
 /// Currently a placeholder — the OS will reset controllers during its own init.
 pub fn shutdown() {
-    let controllers = NVME_CONTROLLERS.controllers.lock();
-    for ctrl_ptr in controllers.iter() {
-        // SAFETY: the registry lock excludes controller users during handoff.
-        unsafe { &mut *ctrl_ptr.0 }.shutdown_controller();
-    }
-    drop(controllers);
+    NVME_CONTROLLERS.for_each_mut(NvmeController::shutdown_controller);
     NVME_CONTROLLERS.shutdown_log();
 }
 
@@ -1595,19 +1615,14 @@ pub fn init() {
     );
 }
 
-/// Get a raw pointer to an NVMe controller
-///
-/// Returns a raw pointer rather than `&'static mut` to avoid aliasing UB.
-/// Callers must ensure they do not create overlapping mutable references.
-///
-/// # Safety
-///
-/// The returned pointer is valid for the firmware lifetime. Callers must
-/// convert to `&mut` only for the duration of their immediate operation
-/// and must not hold the reference across calls that may also access
-/// the same controller.
-pub fn get_controller(index: usize) -> Option<*mut NvmeController> {
-    NVME_CONTROLLERS.get(index)
+/// Access one NVMe controller while retaining exclusive registry ownership.
+pub fn with_controller<R>(index: usize, f: impl FnOnce(&mut NvmeController) -> R) -> Option<R> {
+    NVME_CONTROLLERS.with_mut(index, f)
+}
+
+/// Return the number of registered NVMe controllers.
+pub fn controller_count() -> usize {
+    NVME_CONTROLLERS.count()
 }
 
 // SAFETY: NvmeController contains raw pointers to MMIO registers and DMA buffers.
@@ -1623,22 +1638,14 @@ unsafe impl Send for NvmeController {}
 // ============================================================================
 
 /// Global NVMe device info for filesystem reads
+#[derive(Clone, Copy)]
 struct GlobalNvmeDevice {
     controller_index: usize,
     nsid: u32,
 }
 
-/// Pointer wrapper for global storage
-struct GlobalNvmeDevicePtr(*mut GlobalNvmeDevice);
-
-// SAFETY: GlobalNvmeDevicePtr wraps a pointer to GlobalNvmeDevice allocated via EFI.
-// All access is protected by the GLOBAL_NVME_DEVICE mutex, ensuring no concurrent
-// access. The pointed-to data contains only indices (not raw pointers to hardware),
-// and the firmware runs single-threaded.
-unsafe impl Send for GlobalNvmeDevicePtr {}
-
 /// Global NVMe device for filesystem protocol
-static GLOBAL_NVME_DEVICE: Mutex<Option<GlobalNvmeDevicePtr>> = Mutex::new(None);
+static GLOBAL_NVME_DEVICE: Mutex<Option<GlobalNvmeDevice>> = Mutex::new(None);
 
 /// Store NVMe device info globally for SimpleFileSystem protocol
 ///
@@ -1649,34 +1656,16 @@ static GLOBAL_NVME_DEVICE: Mutex<Option<GlobalNvmeDevicePtr>> = Mutex::new(None)
 /// # Returns
 /// `true` if the device was stored successfully
 pub fn store_global_device(controller_index: usize, nsid: u32) -> bool {
-    let size = core::mem::size_of::<GlobalNvmeDevice>();
-
-    match efi::allocator::allocate_pool(efi::allocator::MemoryType::BootServicesData, size) {
-        Ok(ptr) => {
-            let device_ptr = ptr as *mut GlobalNvmeDevice;
-            unsafe {
-                core::ptr::write(
-                    device_ptr,
-                    GlobalNvmeDevice {
-                        controller_index,
-                        nsid,
-                    },
-                );
-            }
-
-            *GLOBAL_NVME_DEVICE.lock() = Some(GlobalNvmeDevicePtr(device_ptr));
-            log::info!(
-                "NVMe device stored globally (controller={}, nsid={})",
-                controller_index,
-                nsid
-            );
-            true
-        }
-        Err(_) => {
-            log::error!("Failed to allocate memory for global NVMe device");
-            false
-        }
-    }
+    *GLOBAL_NVME_DEVICE.lock() = Some(GlobalNvmeDevice {
+        controller_index,
+        nsid,
+    });
+    log::info!(
+        "NVMe device stored globally (controller={}, nsid={})",
+        controller_index,
+        nsid
+    );
+    true
 }
 
 /// Read sectors from the global NVMe device
@@ -1685,33 +1674,29 @@ pub fn store_global_device(controller_index: usize, nsid: u32) -> bool {
 /// Supports reading multiple sectors by inferring sector count from buffer size.
 pub fn global_read_sectors(lba: u64, buffer: &mut [u8]) -> Result<(), ()> {
     // Get the device info
-    let (controller_index, nsid) = match GLOBAL_NVME_DEVICE.lock().as_ref() {
-        Some(ptr) => unsafe {
-            let device = &*ptr.0;
-            (device.controller_index, device.nsid)
-        },
+    let (controller_index, nsid) = match *GLOBAL_NVME_DEVICE.lock() {
+        Some(device) => (device.controller_index, device.nsid),
         None => {
             log::error!("global_read_sectors: no NVMe device stored");
             return Err(());
         }
     };
 
-    // Get the controller
-    // Safety: pointer valid for firmware lifetime; no overlapping &mut created
-    let controller = match get_controller(controller_index) {
-        Some(ptr) => unsafe { &mut *ptr },
-        None => {
+    with_controller(controller_index, |controller| {
+        controller.read_sector(nsid, lba, buffer).map_err(|error| {
             log::error!(
-                "global_read_sectors: no NVMe controller at index {}",
-                controller_index
+                "global_read_sectors: read failed at LBA {}: {:?}",
+                lba,
+                error
             );
-            return Err(());
-        }
-    };
-
-    // Read the sector
-    controller.read_sector(nsid, lba, buffer).map_err(|e| {
-        log::error!("global_read_sectors: read failed at LBA {}: {:?}", lba, e);
+        })
+    })
+    .unwrap_or_else(|| {
+        log::error!(
+            "global_read_sectors: no NVMe controller at index {}",
+            controller_index
+        );
+        Err(())
     })
 }
 
@@ -1719,15 +1704,12 @@ pub fn global_read_sectors(lba: u64, buffer: &mut [u8]) -> Result<(), ()> {
 pub fn global_sector_size() -> Option<u32> {
     let (controller_index, nsid) = {
         let guard = GLOBAL_NVME_DEVICE.lock();
-        let ptr = guard.as_ref()?;
-        unsafe {
-            let device = &*ptr.0;
-            (device.controller_index, device.nsid)
-        }
+        let device = guard.as_ref()?;
+        (device.controller_index, device.nsid)
     };
-
-    // Safety: pointer valid for firmware lifetime; no overlapping &mut created
-    let controller = unsafe { &mut *get_controller(controller_index)? };
-    let ns = controller.get_namespace(nsid)?;
-    Some(ns.block_size)
+    with_controller(controller_index, |controller| {
+        controller
+            .get_namespace(nsid)
+            .map(|namespace| namespace.block_size)
+    })?
 }

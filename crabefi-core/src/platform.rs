@@ -1356,21 +1356,7 @@ pub struct PciEcamRegion {
     pub bus_end: u8,
 }
 
-impl Default for PciEcamRegion {
-    fn default() -> Self {
-        Self::EMPTY
-    }
-}
-
 impl PciEcamRegion {
-    /// Empty sentinel used by fixed-capacity discovery storage.
-    pub const EMPTY: Self = Self {
-        base: 0,
-        segment: 0,
-        bus_start: 1,
-        bus_end: 0,
-    };
-
     /// Return the required ECAM window size.
     pub const fn byte_len(self) -> Option<u64> {
         if self.base == 0 || self.bus_start > self.bus_end || !self.base.is_multiple_of(1 << 20) {

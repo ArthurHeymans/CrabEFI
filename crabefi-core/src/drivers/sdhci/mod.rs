@@ -7,10 +7,9 @@
 mod logic;
 pub mod regs;
 
-use crate::arch::{DmaCacheOperation, dma_cache_for_cpu, dma_cache_for_device};
 use crate::barrier;
 use crate::drivers::pci::{self, PciAddress, PciDevice};
-use crate::efi;
+use crate::efi::dma::{DmaBuffer, DmaCoherency, DmaDirection, DmaMask};
 use crate::time::{Timeout, wait_for};
 use core::ptr;
 use spin::Mutex;
@@ -73,6 +72,8 @@ pub enum SdhciError {
     NotInitialized,
     /// Reset failed
     ResetFailed,
+    /// Recovery failed after a timing-mode transition error.
+    RecoveryFailed,
     /// No card present
     NoCard,
     /// Card initialization failed
@@ -139,8 +140,8 @@ pub struct SdhciController {
     num_blocks: u64,
     /// Block size (always 512 for SD)
     block_size: u32,
-    /// DMA buffer (page-aligned)
-    dma_buffer: *mut u8,
+    /// Exclusively owned SDMA bounce buffer.
+    dma_buffer: DmaBuffer,
 }
 
 // SAFETY: SdhciController contains raw pointers to MMIO registers and DMA buffer.
@@ -189,8 +190,8 @@ impl SdhciController {
         let regs = mmio_base as *const SdhciRegisters;
 
         // SDMA is 32-bit, so the bounce buffer must be below 4 GiB.
-        let dma_buffer_mem = efi::allocate_pages_below_4g(1).ok_or(SdhciError::AllocationFailed)?;
-        let dma_buffer = dma_buffer_mem.as_mut_ptr();
+        let dma_buffer = DmaBuffer::allocate(4096, DmaMask::bits32(), DmaCoherency::NonCoherent)
+            .map_err(|_| SdhciError::AllocationFailed)?;
 
         let mut controller = Self {
             identity,
@@ -880,7 +881,7 @@ impl SdhciController {
         match self.read_data_command(MMC_CMD_SEND_EXT_CSD, 0, 512) {
             Ok(()) => {
                 barrier::dma_read();
-                let ext_csd = unsafe { core::slice::from_raw_parts(self.dma_buffer, 512) };
+                let ext_csd = &self.dma_buffer.as_slice()[..512];
                 let sec_count = u32::from_le_bytes([
                     ext_csd[EXT_CSD_SEC_COUNT],
                     ext_csd[EXT_CSD_SEC_COUNT + 1],
@@ -1008,12 +1009,17 @@ impl SdhciController {
             );
             // The card timing mode is now unknown. Stop its clock and reset the
             // host before propagating a fatal initialization failure.
-            let _ = self.set_clock(0);
-            let _ = self.reset_all();
+            let clock_stopped = self.set_clock(0).is_ok();
+            let host_reset = self.reset_all().is_ok();
+            self.card_initialized = false;
             self.regs()
                 .host_control
                 .modify(HOST_CONTROL::HIGH_SPEED::CLEAR);
-            return Err(error);
+            return if clock_stopped && host_reset {
+                Err(error)
+            } else {
+                Err(SdhciError::RecoveryFailed)
+            };
         }
 
         Ok(())
@@ -1022,7 +1028,9 @@ impl SdhciController {
     /// Send CMD6 (SWITCH_FUNC) and receive 64 bytes of status data via SDMA
     fn cmd6_transfer(&mut self, arg: u32) -> Result<[u8; 64], SdhciError> {
         self.read_data_command(SD_CMD_SWITCH_FUNC, arg, 64)?;
-        Ok(unsafe { *(self.dma_buffer as *const [u8; 64]) })
+        self.dma_buffer.as_slice()[..64]
+            .try_into()
+            .map_err(|_| SdhciError::DmaError)
     }
 
     /// Send a single-block read-data command into the DMA buffer.
@@ -1035,11 +1043,9 @@ impl SdhciController {
             regs.int_status.set(0xFFFFFFFF);
 
             // SDMA address — use existing page-aligned DMA buffer
-            let dma_addr = self.dma_buffer as u64;
-            if dma_addr > u32::MAX as u64 {
-                return Err(SdhciError::DmaError);
-            }
-            dma_cache_for_device(dma_addr, block_size as usize, DmaCacheOperation::Invalidate)
+            let dma_addr = self.dma_buffer.dma_address();
+            self.dma_buffer
+                .sync_for_device(0..self.dma_buffer.len(), DmaDirection::FromDevice)
                 .map_err(|_| SdhciError::DmaError)?;
             regs.sdma_addr.set(dma_addr as u32);
 
@@ -1093,12 +1099,9 @@ impl SdhciController {
             core::hint::spin_loop();
         }
 
-        dma_cache_for_cpu(
-            self.dma_buffer as u64,
-            block_size as usize,
-            DmaCacheOperation::Invalidate,
-        )
-        .map_err(|_| SdhciError::DmaError)?;
+        self.dma_buffer
+            .sync_for_cpu(0..self.dma_buffer.len(), DmaDirection::FromDevice)
+            .map_err(|_| SdhciError::DmaError)?;
         barrier::dma_read();
 
         Ok(())
@@ -1109,7 +1112,7 @@ impl SdhciController {
         &mut self,
         start_lba: u64,
         count: u32,
-        buffer: *mut u8,
+        buffer: &mut [u8],
     ) -> Result<(), SdhciError> {
         if !self.card_initialized {
             return Err(SdhciError::NotInitialized);
@@ -1119,23 +1122,31 @@ impl SdhciController {
             return Err(SdhciError::InvalidParameter);
         }
 
-        let transfer_size = count as usize * SD_BLOCK_SIZE as usize;
+        let transfer_size = (count as usize)
+            .checked_mul(SD_BLOCK_SIZE as usize)
+            .ok_or(SdhciError::InvalidParameter)?;
+        if buffer.len() != transfer_size {
+            return Err(SdhciError::InvalidParameter);
+        }
 
         // For transfers larger than one page, do multiple transfers
         if transfer_size > 4096 {
             let sectors_per_page = 4096 / SD_BLOCK_SIZE as usize;
             let mut remaining = count;
             let mut current_lba = start_lba;
-            let mut current_buffer = buffer;
+            let mut byte_offset = 0;
 
             while remaining > 0 {
                 let sectors_this_read = core::cmp::min(remaining, sectors_per_page as u32);
-                self.read_sectors_internal(current_lba, sectors_this_read, current_buffer)?;
+                let byte_len = sectors_this_read as usize * SD_BLOCK_SIZE as usize;
+                self.read_sectors_internal(
+                    current_lba,
+                    sectors_this_read,
+                    &mut buffer[byte_offset..byte_offset + byte_len],
+                )?;
                 remaining -= sectors_this_read;
                 current_lba += sectors_this_read as u64;
-                current_buffer = unsafe {
-                    current_buffer.add(sectors_this_read as usize * SD_BLOCK_SIZE as usize)
-                };
+                byte_offset += byte_len;
             }
             return Ok(());
         }
@@ -1148,7 +1159,7 @@ impl SdhciController {
         &mut self,
         start_lba: u64,
         count: u32,
-        buffer: *mut u8,
+        buffer: &mut [u8],
     ) -> Result<(), SdhciError> {
         let transfer_size = count as usize * SD_BLOCK_SIZE as usize;
 
@@ -1164,15 +1175,9 @@ impl SdhciController {
 
             // Set DMA address (use our page-aligned buffer)
             // SDMA only supports 32-bit addresses; verify buffer is below 4 GiB
-            let dma_addr = self.dma_buffer as u64;
-            if dma_addr > u32::MAX as u64 {
-                log::error!(
-                    "SDHCI: DMA buffer at {:#x} exceeds 32-bit SDMA limit",
-                    dma_addr
-                );
-                return Err(SdhciError::DmaError);
-            }
-            dma_cache_for_device(dma_addr, transfer_size, DmaCacheOperation::Invalidate)
+            let dma_addr = self.dma_buffer.dma_address();
+            self.dma_buffer
+                .sync_for_device(0..self.dma_buffer.len(), DmaDirection::FromDevice)
                 .map_err(|_| SdhciError::DmaError)?;
             regs.sdma_addr.set(dma_addr as u32);
 
@@ -1344,17 +1349,18 @@ impl SdhciController {
             }
         }
 
-        dma_cache_for_cpu(
-            self.dma_buffer as u64,
-            transfer_size,
-            DmaCacheOperation::Invalidate,
-        )
-        .map_err(|_| SdhciError::DmaError)?;
+        self.dma_buffer
+            .sync_for_cpu(0..self.dma_buffer.len(), DmaDirection::FromDevice)
+            .map_err(|_| SdhciError::DmaError)?;
         barrier::dma_read();
 
         // Copy data from DMA buffer to caller's buffer
         unsafe {
-            ptr::copy_nonoverlapping(self.dma_buffer, buffer, transfer_size);
+            ptr::copy_nonoverlapping(
+                self.dma_buffer.as_slice().as_ptr(),
+                buffer.as_mut_ptr(),
+                transfer_size,
+            );
         }
 
         Ok(())
@@ -1366,12 +1372,13 @@ impl SdhciController {
     /// If the buffer is larger than one sector, multiple sectors are read
     /// in a single operation for performance.
     pub fn read_sector(&mut self, lba: u64, buffer: &mut [u8]) -> Result<(), SdhciError> {
-        if buffer.len() < SD_BLOCK_SIZE as usize {
+        if buffer.is_empty() || !buffer.len().is_multiple_of(SD_BLOCK_SIZE as usize) {
             return Err(SdhciError::InvalidParameter);
         }
 
-        let num_sectors = (buffer.len() / SD_BLOCK_SIZE as usize).max(1) as u32;
-        self.read_sectors(lba, num_sectors, buffer.as_mut_ptr())
+        let num_sectors = u32::try_from(buffer.len() / SD_BLOCK_SIZE as usize)
+            .map_err(|_| SdhciError::InvalidParameter)?;
+        self.read_sectors(lba, num_sectors, buffer)
     }
 
     /// Get the number of blocks on the card
@@ -1510,12 +1517,9 @@ pub fn init() {
     );
 }
 
-/// Get an SDHCI controller by index
-///
-/// Returns a raw pointer to avoid `&'static mut` aliasing UB.
-/// The caller must ensure no overlapping mutable references are created.
-pub fn get_controller(index: usize) -> Option<*mut SdhciController> {
-    SDHCI_CONTROLLERS.get(index)
+/// Access one SDHCI controller while retaining exclusive registry ownership.
+pub fn with_controller<R>(index: usize, f: impl FnOnce(&mut SdhciController) -> R) -> Option<R> {
+    SDHCI_CONTROLLERS.with_mut(index, f)
 }
 
 /// Get the number of initialized SDHCI controllers
@@ -1528,21 +1532,13 @@ pub fn controller_count() -> usize {
 // ============================================================================
 
 /// Global SDHCI device info for filesystem reads
+#[derive(Clone, Copy)]
 struct GlobalSdhciDevice {
     controller_index: usize,
 }
 
-/// Pointer wrapper for global storage
-struct GlobalSdhciDevicePtr(*mut GlobalSdhciDevice);
-
-// SAFETY: GlobalSdhciDevicePtr wraps a pointer to GlobalSdhciDevice allocated via EFI.
-// All access is protected by the GLOBAL_SDHCI_DEVICE mutex, ensuring no concurrent
-// access. The pointed-to data contains only the controller index (not raw pointers
-// to hardware), and the firmware runs single-threaded.
-unsafe impl Send for GlobalSdhciDevicePtr {}
-
 /// Global SDHCI device for filesystem protocol
-static GLOBAL_SDHCI_DEVICE: Mutex<Option<GlobalSdhciDevicePtr>> = Mutex::new(None);
+static GLOBAL_SDHCI_DEVICE: Mutex<Option<GlobalSdhciDevice>> = Mutex::new(None);
 
 /// Store SDHCI device info globally for SimpleFileSystem protocol
 ///
@@ -1552,26 +1548,12 @@ static GLOBAL_SDHCI_DEVICE: Mutex<Option<GlobalSdhciDevicePtr>> = Mutex::new(Non
 /// # Returns
 /// `true` if the device was stored successfully
 pub fn store_global_device(controller_index: usize) -> bool {
-    // Allocate memory for the device info
-    let size = core::mem::size_of::<GlobalSdhciDevice>();
-    let pages = size.div_ceil(4096);
-
-    if let Some(mem) = efi::allocate_pages(pages as u64) {
-        let device_ptr = mem.as_mut_ptr() as *mut GlobalSdhciDevice;
-        unsafe {
-            ptr::write(device_ptr, GlobalSdhciDevice { controller_index });
-        }
-
-        *GLOBAL_SDHCI_DEVICE.lock() = Some(GlobalSdhciDevicePtr(device_ptr));
-        log::info!(
-            "SDHCI device stored globally (controller={})",
-            controller_index
-        );
-        true
-    } else {
-        log::error!("Failed to allocate memory for global SDHCI device");
-        false
-    }
+    *GLOBAL_SDHCI_DEVICE.lock() = Some(GlobalSdhciDevice { controller_index });
+    log::info!(
+        "SDHCI device stored globally (controller={})",
+        controller_index
+    );
+    true
 }
 
 /// Read sectors from the global SDHCI device
@@ -1582,31 +1564,28 @@ pub fn global_read_sectors(lba: u64, buffer: &mut [u8]) -> Result<(), ()> {
     log::trace!("SDHCI global_read_sectors: LBA={}", lba);
 
     // Get the device info
-    let controller_index = match GLOBAL_SDHCI_DEVICE.lock().as_ref() {
-        Some(ptr) => unsafe { (*ptr.0).controller_index },
+    let controller_index = match *GLOBAL_SDHCI_DEVICE.lock() {
+        Some(device) => device.controller_index,
         None => {
             log::error!("global_read_sectors: no SDHCI device stored");
             return Err(());
         }
     };
 
-    // Get the controller
-    // Safety: pointer valid for firmware lifetime; no overlapping &mut created
-    let controller = match get_controller(controller_index) {
-        Some(c) => unsafe { &mut *c },
-        None => {
+    with_controller(controller_index, |controller| {
+        controller.read_sector(lba, buffer).map_err(|error| {
             log::error!(
-                "global_read_sectors: no SDHCI controller at index {}",
-                controller_index
+                "global_read_sectors: read failed at LBA {}: {:?}",
+                lba,
+                error
             );
-            return Err(());
-        }
-    };
-
-    // Read the sector
-    let result = controller.read_sector(lba, buffer);
-    if let Err(ref e) = result {
-        log::error!("global_read_sectors: read failed at LBA {}: {:?}", lba, e);
-    }
-    result.map_err(|_| ())
+        })
+    })
+    .unwrap_or_else(|| {
+        log::error!(
+            "global_read_sectors: no SDHCI controller at index {}",
+            controller_index
+        );
+        Err(())
+    })
 }
