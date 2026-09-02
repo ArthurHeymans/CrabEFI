@@ -2512,13 +2512,10 @@ impl XhciController {
 
     /// Bulk transfer
     ///
-    /// Splits large transfers into ≤ 64KB TRBs, each as its own independent TD
-    /// with IOC (matching EDK2's approach). Collects one completion event per TRB.
-    ///
-    /// Features:
-    /// - Splits transfers into independent 64KB TRBs (no chaining)
-    /// - Sets ISP (Interrupt on Short Packet) for IN transfers to detect short packets
-    /// - Automatically recovers from stall errors by resetting the endpoint
+    /// Large requests are submitted as a sequence of independent 64 KiB TDs.
+    /// Only one TD is visible to the controller at a time, so a short packet
+    /// ends the request before a later TD can consume the following BOT CSW.
+    /// This retains large SCSI commands without relying on chained xHCI TRBs.
     pub fn bulk_transfer(
         &mut self,
         slot_id: u8,
@@ -2526,7 +2523,8 @@ impl XhciController {
         is_in: bool,
         data: &mut [u8],
     ) -> Result<usize, XhciError> {
-        // Calculate DCI (Device Context Index)
+        const TD_MAX_TRANSFER_SIZE: usize = 0x10000;
+
         let dci = if is_in {
             (ep as usize * 2) + 1
         } else {
@@ -2543,84 +2541,81 @@ impl XhciController {
             data.as_ptr() as u64
         );
 
-        // Queue all TRBs for this transfer
-        let trb_count = self.queue_bulk_trbs(slot_id, dci, is_in, data)?;
+        let mut transferred_total = 0usize;
+        while transferred_total < data.len() {
+            let chunk_end = (transferred_total + TD_MAX_TRANSFER_SIZE).min(data.len());
+            let chunk = &mut data[transferred_total..chunk_end];
+            self.queue_bulk_trb(slot_id, dci, is_in, chunk)?;
 
-        // Publish the DMA transfer ring before its MMIO doorbell.
-        barrier::mmio_write();
-        self.ring_doorbell(slot_id, dci as u8);
+            barrier::mmio_write();
+            self.ring_doorbell(slot_id, dci as u8);
 
-        // Wait for all TRB completions
-        match self.wait_transfer_completion(slot_id, ep, trb_count) {
-            Ok(total_residual) => {
-                let transferred = data.len().saturating_sub(total_residual as usize);
-                log::trace!(
-                    "xHCI: bulk transfer complete, len={} residual={} transferred={}",
-                    data.len(),
-                    total_residual,
-                    transferred
-                );
-                Ok(transferred)
-            }
-            Err(XhciError::StallError) => {
-                // Endpoint stalled - reset it and return the error
-                // The caller may retry the transfer after handling the stall
-                log::debug!(
-                    "xHCI: Bulk transfer stalled on slot={} dci={}, resetting endpoint",
-                    slot_id,
-                    dci
-                );
-                if let Err(e) = self.reset_endpoint(slot_id, dci as u8) {
-                    log::warn!("xHCI: Failed to reset endpoint after stall: {:?}", e);
+            match self.wait_transfer_completion(slot_id, ep, 1) {
+                Ok(residual) => {
+                    let transferred = chunk.len().saturating_sub(residual as usize);
+                    transferred_total += transferred;
+                    if transferred < chunk.len() {
+                        log::trace!(
+                            "xHCI: bulk transfer ended on short packet, transferred={}/{}",
+                            transferred_total,
+                            data.len()
+                        );
+                        return Ok(transferred_total);
+                    }
                 }
-                Err(XhciError::StallError)
-            }
-            Err(XhciError::TransferFailed(Ok(
-                cc @ (event::CompletionCode::BabbleDetectedError
-                | event::CompletionCode::UsbTransactionError),
-            ))) => {
-                // Babble and transaction errors halt bulk endpoints (xHCI spec 4.8.3).
-                // Recovery is the same as for stalls: Reset Endpoint + Set TR Dequeue Pointer.
-                // Both EDK2 (XhcRecoverHaltedEndpoint) and Linux (xhci_handle_halted_endpoint
-                // with EP_HARD_RESET) perform identical recovery for these errors.
-                log::debug!(
-                    "xHCI: Bulk transfer failed with {:?} on slot={} dci={}, resetting endpoint",
-                    cc,
-                    slot_id,
-                    dci
-                );
-                if let Err(e) = self.reset_endpoint(slot_id, dci as u8) {
-                    log::warn!(
-                        "xHCI: Failed to reset endpoint after completion code {:?}: {:?}",
-                        cc,
-                        e
+                Err(XhciError::StallError) => {
+                    log::debug!(
+                        "xHCI: Bulk transfer stalled on slot={} dci={}, resetting endpoint",
+                        slot_id,
+                        dci
                     );
+                    if let Err(e) = self.reset_endpoint(slot_id, dci as u8) {
+                        log::warn!("xHCI: Failed to reset endpoint after stall: {:?}", e);
+                    }
+                    return Err(XhciError::StallError);
                 }
-                Err(XhciError::TransferFailed(Ok(cc)))
+                Err(XhciError::TransferFailed(Ok(
+                    cc @ (event::CompletionCode::BabbleDetectedError
+                    | event::CompletionCode::UsbTransactionError),
+                ))) => {
+                    log::debug!(
+                        "xHCI: Bulk transfer failed with {:?} on slot={} dci={}, resetting endpoint",
+                        cc,
+                        slot_id,
+                        dci
+                    );
+                    if let Err(e) = self.reset_endpoint(slot_id, dci as u8) {
+                        log::warn!(
+                            "xHCI: Failed to reset endpoint after completion code {:?}: {:?}",
+                            cc,
+                            e
+                        );
+                    }
+                    return Err(XhciError::TransferFailed(Ok(cc)));
+                }
+                Err(e) => return Err(e),
             }
-            Err(e) => Err(e),
         }
+
+        log::trace!(
+            "xHCI: bulk transfer complete, transferred={}",
+            transferred_total
+        );
+        Ok(transferred_total)
     }
 
-    /// Queue TRBs for a bulk transfer
+    /// Queue one independent bulk TD.
     ///
-    /// Splits large transfers into ≤ 64KB (0x10000 byte) TRBs, matching EDK2's
-    /// proven approach: **each TRB is its own independent TD** with IOC=1 and
-    /// ISP=1. No chaining, no deferred first TRB, no TD_SIZE — just simple
-    /// per-TRB completion events that the wait loop collects.
-    ///
-    /// This avoids complex chained-TRB interactions that cause BABBLE on some
-    /// Intel xHCI controllers (e.g. ThinkPad T480).
-    ///
-    /// Returns the number of TRBs queued.
-    fn queue_bulk_trbs(
+    /// Keeping the TD to one 64 KiB TRB avoids the chained-TRB interactions
+    /// that cause BABBLE on some Intel xHCI controllers.
+    fn queue_bulk_trb(
         &mut self,
         slot_id: u8,
         dci: usize,
         is_in: bool,
         data: &mut [u8],
-    ) -> Result<usize, XhciError> {
-        const TRB_MAX_TRANSFER_SIZE: usize = 0x10000; // 64KB per TRB (EDK2 convention)
+    ) -> Result<(), XhciError> {
+        debug_assert!(data.len() <= 0x10000);
 
         let slot = self
             .slots
@@ -2632,36 +2627,17 @@ impl XhciController {
             .as_mut()
             .ok_or(XhciError::DeviceNotFound)?;
 
-        let mut buf_addr = data.as_ptr() as u64;
-        let mut remaining = data.len();
-        let mut trb_count = 0usize;
-
-        while remaining > 0 {
-            let chunk_size = remaining.min(TRB_MAX_TRANSFER_SIZE);
-
-            let mut trb = transfer::Normal::new();
-            trb.set_data_buffer_pointer(buf_addr)
-                .set_trb_transfer_length(chunk_size as u32)
-                .set_interrupt_on_completion();
-            if is_in {
-                trb.set_interrupt_on_short_packet();
-            }
-
-            ring.enqueue(trb, false);
-            trb_count += 1;
-
-            buf_addr += chunk_size as u64;
-            remaining -= chunk_size;
+        let mut trb = transfer::Normal::new();
+        trb.set_data_buffer_pointer(data.as_ptr() as u64)
+            .set_trb_transfer_length(data.len() as u32)
+            .set_interrupt_on_completion();
+        if is_in {
+            trb.set_interrupt_on_short_packet();
         }
 
-        log::trace!(
-            "xHCI: queued {} TRBs for bulk transfer ({}B each, {}B total)",
-            trb_count,
-            TRB_MAX_TRANSFER_SIZE,
-            data.len()
-        );
-
-        Ok(trb_count)
+        ring.enqueue(trb, false);
+        log::trace!("xHCI: queued {}B bulk TD", data.len());
+        Ok(())
     }
 
     /// Find a mass storage device

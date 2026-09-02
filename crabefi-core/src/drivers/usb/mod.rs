@@ -451,6 +451,10 @@ impl UsbController for XhciController {
         "xHCI"
     }
 
+    fn max_bulk_transfer_size(&self) -> usize {
+        1024 * 1024
+    }
+
     fn control_transfer(
         &mut self,
         device: u8,
