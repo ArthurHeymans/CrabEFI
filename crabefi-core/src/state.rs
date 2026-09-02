@@ -30,8 +30,6 @@ use crate::cell::{Local, LocalCell};
 static EFI: Local<EfiState> = Local::new(EfiState::new());
 /// Hardware driver state.
 static DRIVERS: Local<DriverState> = Local::new(DriverState::new());
-/// EFI console state.
-static CONSOLE: Local<ConsoleState> = Local::new(ConsoleState::new());
 /// Validated boot-side client for the separately allocated runtime image.
 static RUNTIME_IMAGE: LocalCell<Option<crate::efi::runtime_image::RuntimeImageClient>> =
     LocalCell::new(None);
@@ -460,116 +458,6 @@ impl Default for PlatformInfo {
 }
 
 // ============================================================================
-// Console State
-// ============================================================================
-
-/// Console screen mode (Text or Graphics)
-///
-/// Used by the ConsoleControl protocol to track the current display mode.
-#[repr(u32)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ScreenMode {
-    /// Text mode
-    Text = 0,
-    /// Graphics mode
-    Graphics = 1,
-    /// Maximum mode value (for bounds checking)
-    MaxValue = 2,
-}
-
-/// Console and display state
-pub struct ConsoleState {
-    /// EFI console framebuffer info
-    pub efi_framebuffer: Option<FramebufferConfig>,
-    /// EFI console cursor position (col, row)
-    pub cursor_pos: (u32, u32),
-    /// EFI console dimensions (cols, rows)
-    pub dimensions: (u32, u32),
-    /// Console start row (EFI console uses bottom half of screen)
-    pub start_row: u32,
-
-    /// Pixel offset for centering the text region horizontally (EDK2 DeltaX)
-    pub delta_x: u32,
-    /// Pixel offset for centering the text region vertically (EDK2 DeltaY)
-    pub delta_y: u32,
-
-    /// Current foreground color (RGB) set by SetAttribute
-    pub fg_color: (u8, u8, u8),
-    /// Current background color (RGB) set by SetAttribute
-    pub bg_color: (u8, u8, u8),
-
-    /// Input state for escape sequence parsing
-    pub input: InputState,
-
-    /// GOP framebuffer for graphics output protocol Blt operations
-    pub gop_framebuffer: Option<FramebufferConfig>,
-
-    /// Screen mode (Text or Graphics) for ConsoleControl protocol
-    pub screen_mode: ScreenMode,
-}
-
-impl ConsoleState {
-    pub const fn new() -> Self {
-        Self {
-            efi_framebuffer: None,
-            cursor_pos: (0, 0),
-            dimensions: (80, 25),
-            start_row: 0,
-            delta_x: 0,
-            delta_y: 0,
-            fg_color: (170, 170, 170), // EFI_LIGHTGRAY (attribute 0x07, index 7)
-            bg_color: (0, 0, 0),       // EFI_BLACK default
-            input: InputState::new(),
-            gop_framebuffer: None,
-            screen_mode: ScreenMode::Graphics,
-        }
-    }
-}
-
-impl Default for ConsoleState {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-/// Maximum size of the escape sequence buffer
-pub const ESCAPE_BUF_SIZE: usize = 8;
-
-/// Input state for escape sequence parsing
-pub struct InputState {
-    /// Buffer for escape sequence bytes
-    pub escape_buf: [u8; ESCAPE_BUF_SIZE],
-    /// Number of bytes in the escape buffer
-    pub escape_len: usize,
-    /// Whether we're currently in an escape sequence
-    pub in_escape: bool,
-    /// Queued key to return (scan_code, unicode_char)
-    pub queued_key: Option<(u16, u16)>,
-    /// Key read-ahead by CheckEvent/WaitForEvent to confirm real input
-    /// This prevents false "keyboard ready" signals from modifier-only
-    /// or mouse data in the PS/2 output buffer.
-    pub pending_key: Option<(u16, u16)>,
-}
-
-impl Default for InputState {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl InputState {
-    pub const fn new() -> Self {
-        Self {
-            escape_buf: [0; ESCAPE_BUF_SIZE],
-            escape_len: 0,
-            in_escape: false,
-            queued_key: None,
-            pending_key: None,
-        }
-    }
-}
-
-// ============================================================================
 // Accessors
 // ============================================================================
 
@@ -599,20 +487,6 @@ pub fn drivers() -> Ref<'static, DriverState> {
 #[track_caller]
 pub fn with_drivers_mut<R>(f: impl FnOnce(&mut DriverState) -> R) -> R {
     DRIVERS.with_mut(f)
-}
-
-/// Borrow console state.
-#[inline]
-#[track_caller]
-pub fn console() -> Ref<'static, ConsoleState> {
-    CONSOLE.borrow()
-}
-
-/// Mutate console state through a closure.
-#[inline]
-#[track_caller]
-pub fn with_console_mut<R>(f: impl FnOnce(&mut ConsoleState) -> R) -> R {
-    CONSOLE.with_mut(f)
 }
 
 /// The runtime image client, once the runtime image has been loaded.

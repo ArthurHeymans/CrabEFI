@@ -7,8 +7,8 @@
 use core::ffi::c_void;
 use r_efi::efi::{Boolean, Guid, Status};
 
+use crate::efi::protocols::console::{self, ScreenMode};
 use crate::efi::utils::allocate_protocol_with_log;
-use crate::state::ScreenMode;
 
 /// Console Control Protocol GUID
 /// {F42F7782-012E-4C12-9956-49F94304F721}
@@ -45,7 +45,7 @@ extern "efiapi" fn console_get_mode(
     if !mode.is_null() {
         // SAFETY: mode is a non-null pointer from the caller; single-threaded firmware.
         unsafe {
-            *mode = crate::state::console().screen_mode;
+            *mode = console::state().screen_mode;
         }
     }
 
@@ -79,16 +79,15 @@ extern "efiapi" fn console_set_mode(
         return Status::INVALID_PARAMETER;
     }
 
-    let prev_mode = crate::state::with_console_mut(|console| {
-        core::mem::replace(&mut console.screen_mode, mode)
-    });
+    let prev_mode =
+        console::with_state_mut(|console| core::mem::replace(&mut console.screen_mode, mode));
 
     log::debug!("ConsoleControl.SetMode({:?} -> {:?})", prev_mode, mode);
 
     match mode {
         ScreenMode::Text => {
             // Switch to text mode: set up centered text area
-            crate::state::with_console_mut(|console| {
+            console::with_state_mut(|console| {
                 let Some(ref fb) = console.efi_framebuffer else {
                     return;
                 };
@@ -119,7 +118,7 @@ extern "efiapi" fn console_set_mode(
         }
         ScreenMode::Graphics => {
             // Switch to graphics mode: clear screen for GOP consumers
-            crate::state::with_console_mut(|console| {
+            console::with_state_mut(|console| {
                 let Some(ref fb) = console.efi_framebuffer else {
                     return;
                 };
