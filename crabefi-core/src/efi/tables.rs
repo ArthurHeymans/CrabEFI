@@ -221,6 +221,17 @@ impl LoadedImageEntry {
     }
 }
 
+/// One tracked `OpenProtocol` relationship.
+#[derive(Clone, Copy)]
+pub struct OpenProtocolEntry {
+    pub handle: Handle,
+    pub protocol: Guid,
+    pub agent_handle: Handle,
+    pub controller_handle: Handle,
+    pub attributes: u32,
+    pub open_count: u32,
+}
+
 /// Boot Services tables: handles, events, and loaded images.
 pub struct Tables {
     /// Handle database, allocated after heap startup.
@@ -229,6 +240,8 @@ pub struct Tables {
     pub handle_count: usize,
     /// Next handle value (unique identifier)
     pub next_handle: usize,
+    /// Active protocol opens, grown fallibly from the firmware heap.
+    pub open_protocols: Vec<OpenProtocolEntry>,
 
     /// Event database, allocated after heap startup.
     pub events: Vec<EventEntry>,
@@ -253,6 +266,7 @@ impl Tables {
             handles: Vec::new(),
             handle_count: 0,
             next_handle: 1,
+            open_protocols: Vec::new(),
             events: Vec::new(),
             next_event_id: 2, // Start at 2, reserve 1 for keyboard
             loaded_images: Vec::new(),
