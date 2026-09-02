@@ -5,19 +5,18 @@
 //!
 //! # State Management
 //!
-//! Boot Services state (handles, events, loaded images) lives in the
-//! `crate::state` EFI cell. Access it via `crate::state::efi()` and
-//! `crate::state::with_efi_mut()`.
+//! Boot Services state (handles, events, loaded images) lives in
+//! [`super::tables`]. Access it via `tables()` and `with_tables_mut()`.
 
 use super::allocator::{self, AllocateType, MemoryDescriptor, MemoryType};
 use super::image_loader;
 use super::protocols::loaded_image::{LOADED_IMAGE_PROTOCOL_GUID, create_loaded_image_protocol};
 use super::system_table;
-use crate::pe;
-use crate::state::{
-    self, EventEntry, LoadedImageEntry, MAX_EVENTS, MAX_HANDLES, MAX_PROTOCOLS_PER_HANDLE,
-    ProtocolEntry,
+use super::tables::{
+    EventEntry, LoadedImageEntry, MAX_EVENTS, MAX_HANDLES, MAX_PROTOCOLS_PER_HANDLE, ProtocolEntry,
+    TimerType, tables, with_tables_mut,
 };
+use crate::pe;
 use alloc::vec::Vec;
 use core::ffi::c_void;
 
@@ -328,7 +327,7 @@ extern "efiapi" fn create_event(
     }
 
     // Allocate an event ID from centralized state
-    state::with_efi_mut(|efi_state| {
+    with_tables_mut(|efi_state| {
         let event_id = efi_state.next_event_id;
 
         if event_id >= MAX_EVENTS {
@@ -347,7 +346,7 @@ extern "efiapi" fn create_event(
             notify_function,
             notify_context,
             event_group: None,
-            timer_type: state::TimerType::Cancel,
+            timer_type: TimerType::Cancel,
             timer_trigger_time: 0,
             timer_deadline_tsc: 0,
         };
@@ -379,12 +378,12 @@ extern "efiapi" fn set_timer(
         return Status::INVALID_PARAMETER;
     }
 
-    let timer = match state::TimerType::try_from(timer_type) {
+    let timer = match TimerType::try_from(timer_type) {
         Ok(t) => t,
         Err(_) => return Status::INVALID_PARAMETER,
     };
 
-    state::with_efi_mut(|efi_state| {
+    with_tables_mut(|efi_state| {
         let entry = &mut efi_state.events[event_id];
 
         // Verify this is a timer event
@@ -397,12 +396,12 @@ extern "efiapi" fn set_timer(
         entry.timer_trigger_time = trigger_time;
 
         match timer {
-            state::TimerType::Cancel => {
+            TimerType::Cancel => {
                 entry.timer_deadline_tsc = 0;
                 entry.signaled = false;
                 log::debug!("  -> SUCCESS (timer cancelled)");
             }
-            state::TimerType::Periodic | state::TimerType::Relative => {
+            TimerType::Periodic | TimerType::Relative => {
                 // Convert 100ns units to TSC ticks
                 let tsc_freq = crate::time::tsc_frequency();
                 if tsc_freq == 0 {
@@ -423,7 +422,7 @@ extern "efiapi" fn set_timer(
 }
 
 fn notify_wait_event(event_id: usize, event: efi::Event) {
-    let notify_fn = state::with_efi_mut(|efi_state| {
+    let notify_fn = with_tables_mut(|efi_state| {
         let entry = &efi_state.events[event_id];
         if !entry.signaled && entry.event_type & EVT_NOTIFY_WAIT != 0 {
             entry.notify_function.map(|f| (f, entry.notify_context))
@@ -489,7 +488,7 @@ extern "efiapi" fn wait_for_event(
 
                 // Per UEFI spec: WaitForEvent clears the signaled state
                 // of the event that triggered the return.
-                let signaled = state::with_efi_mut(|efi_state| {
+                let signaled = with_tables_mut(|efi_state| {
                     let was_signaled = efi_state.events[event_id].signaled;
                     if was_signaled {
                         efi_state.events[event_id].signaled = false;
@@ -517,7 +516,7 @@ extern "efiapi" fn signal_event(event: efi::Event) -> Status {
 
     if event_id > 0 && event_id < MAX_EVENTS {
         // Get notify function if present, then mark signaled
-        let notify_fn = state::with_efi_mut(|efi_state| {
+        let notify_fn = with_tables_mut(|efi_state| {
             efi_state.events[event_id].signaled = true;
             let entry = &efi_state.events[event_id];
             if entry.event_type & EVT_NOTIFY_SIGNAL != 0 {
@@ -542,7 +541,7 @@ extern "efiapi" fn close_event(event: efi::Event) -> Status {
     log::debug!("BS.CloseEvent(event={})", event_id);
 
     if event_id > 0 && event_id < MAX_EVENTS {
-        state::with_efi_mut(|efi_state| {
+        with_tables_mut(|efi_state| {
             efi_state.events[event_id] = EventEntry::empty();
         });
     }
@@ -583,7 +582,7 @@ extern "efiapi" fn check_event(event: efi::Event) -> Status {
         // Per UEFI spec: CheckEvent clears the signaled state when
         // returning SUCCESS (for EVT_NOTIFY_WAIT events, the notify
         // function is called first, then the event is cleared).
-        let signaled = state::with_efi_mut(|efi_state| {
+        let signaled = with_tables_mut(|efi_state| {
             let was_signaled = efi_state.events[event_id].signaled;
             if was_signaled {
                 efi_state.events[event_id].signaled = false;
@@ -600,11 +599,11 @@ extern "efiapi" fn check_event(event: efi::Event) -> Status {
 
 /// Check if a timer event has expired and signal it if so
 fn check_timer_event(event_id: usize) {
-    state::with_efi_mut(|efi_state| {
+    with_tables_mut(|efi_state| {
         let entry = &mut efi_state.events[event_id];
 
         // Only process timer events with an active deadline
-        if entry.event_type & EVT_TIMER == 0 || entry.timer_type == state::TimerType::Cancel {
+        if entry.event_type & EVT_TIMER == 0 || entry.timer_type == TimerType::Cancel {
             return;
         }
 
@@ -617,18 +616,18 @@ fn check_timer_event(event_id: usize) {
             entry.signaled = true;
 
             match entry.timer_type {
-                state::TimerType::Periodic => {
+                TimerType::Periodic => {
                     // Reset deadline for next period
                     let tsc_per_us = (crate::time::tsc_frequency() / 1_000_000).max(1);
                     let us = entry.timer_trigger_time / 10;
                     let tsc_offset = us * tsc_per_us;
                     entry.timer_deadline_tsc = now + tsc_offset;
                 }
-                state::TimerType::Relative => {
+                TimerType::Relative => {
                     // One-shot: clear the deadline
                     entry.timer_deadline_tsc = 0;
                 }
-                state::TimerType::Cancel => {}
+                TimerType::Cancel => {}
             }
         }
     });
@@ -662,7 +661,7 @@ fn signal_event_group(group_guid: &Guid) {
         MAX_EVENTS,
     > = heapless::Vec::new();
 
-    state::with_efi_mut(|efi_state| {
+    with_tables_mut(|efi_state| {
         for (i, entry) in efi_state.events.iter_mut().enumerate() {
             if let Some(ref group) = entry.event_group
                 && *group == *group_guid
@@ -708,7 +707,7 @@ pub(crate) fn measure_efi_application_start(is_application: bool) {
         return;
     }
 
-    let should_signal = crate::state::with_efi_mut(|efi| {
+    let should_signal = with_tables_mut(|efi| {
         if !efi.ready_to_boot_signaled {
             efi.ready_to_boot_signaled = true;
             true
@@ -743,7 +742,7 @@ pub(crate) fn measure_efi_application_start(is_application: bool) {
 
 /// Measure return from an EFI boot application attempt.
 pub(crate) fn measure_efi_application_return(is_application: bool) {
-    if is_application && crate::state::efi().ready_to_boot_signaled {
+    if is_application && tables().ready_to_boot_signaled {
         super::tcg::measured_boot::measure_action_all(
             4,
             "Returning from EFI Application from Boot Option",
@@ -791,7 +790,7 @@ extern "efiapi" fn create_event_ex(
         // Store the event group GUID on the newly created event
         let event_id = unsafe { *event } as usize;
         if event_id > 0 && event_id < MAX_EVENTS {
-            state::with_efi_mut(|efi_state| {
+            with_tables_mut(|efi_state| {
                 efi_state.events[event_id].event_group = Some(unsafe { *event_group });
             });
         }
@@ -822,7 +821,7 @@ extern "efiapi" fn install_protocol_interface(
     let guid = unsafe { *protocol };
     let handle_ptr = unsafe { *handle };
 
-    state::with_efi_mut(|efi_state| {
+    with_tables_mut(|efi_state| {
         // If handle is null, create a new handle
         if handle_ptr.is_null() {
             if efi_state.handle_count >= MAX_HANDLES {
@@ -955,7 +954,7 @@ extern "efiapi" fn locate_handle(
         buffer
     );
 
-    let efi_state = state::efi();
+    let efi_state = tables();
 
     // Collect matching handles based on search type
     let matching: heapless::Vec<Handle, MAX_HANDLES> = match search_type {
@@ -1080,7 +1079,7 @@ extern "efiapi" fn locate_device_path(
     }
 
     // Find a handle with both the specified protocol and a DEVICE_PATH protocol
-    let efi_state = state::efi();
+    let efi_state = tables();
 
     let found = efi_state.handles[..efi_state.handle_count]
         .iter()
@@ -1338,7 +1337,7 @@ extern "efiapi" fn load_image(
     }
 
     // Store the loaded image info so StartImage can find it
-    let store_result = state::with_efi_mut(|efi_state| {
+    let store_result = with_tables_mut(|efi_state| {
         let slot = efi_state
             .loaded_images
             .iter_mut()
@@ -1406,7 +1405,7 @@ extern "efiapi" fn start_image(
 
     // Find the loaded image entry
     let (entry_point, image_base, image_subsystem) = {
-        let efi_state = state::efi();
+        let efi_state = tables();
         match efi_state
             .loaded_images
             .iter()
@@ -1435,7 +1434,7 @@ extern "efiapi" fn start_image(
     let is_application = image_subsystem == 10;
     measure_efi_application_start(is_application);
 
-    let deferred_measurement = state::with_efi_mut(|efi_state| {
+    let deferred_measurement = with_tables_mut(|efi_state| {
         efi_state
             .loaded_images
             .iter_mut()
@@ -1547,7 +1546,7 @@ extern "efiapi" fn unload_image(image_handle: Handle) -> Status {
     }
 
     // Find and remove the loaded image entry
-    let image_info = state::with_efi_mut(|efi_state| {
+    let image_info = with_tables_mut(|efi_state| {
         efi_state
             .loaded_images
             .iter_mut()
@@ -1628,7 +1627,7 @@ extern "efiapi" fn exit_boot_services(image_handle: Handle, map_key: usize) -> S
     // Also signal any legacy EVT_SIGNAL_EXIT_BOOT_SERVICES events
     {
         let mut legacy_events: heapless::Vec<usize, MAX_EVENTS> = heapless::Vec::new();
-        state::with_efi_mut(|efi_state| {
+        with_tables_mut(|efi_state| {
             for (i, event) in efi_state.events.iter_mut().enumerate() {
                 if event.event_type == EVT_SIGNAL_EXIT_BOOT_SERVICES {
                     event.signaled = true;
@@ -1638,7 +1637,7 @@ extern "efiapi" fn exit_boot_services(image_handle: Handle, map_key: usize) -> S
         });
         for event_id in &legacy_events {
             let notify_fn = {
-                let efi_state = state::efi();
+                let efi_state = tables();
                 let entry = &efi_state.events[*event_id];
                 entry.notify_function.map(|f| (f, entry.notify_context))
             };
@@ -1750,7 +1749,7 @@ extern "efiapi" fn get_next_monotonic_count(count: *mut u64) -> Status {
         return Status::INVALID_PARAMETER;
     }
 
-    state::with_efi_mut(|efi_state| {
+    with_tables_mut(|efi_state| {
         efi_state.monotonic_count += 1;
         unsafe { *count = efi_state.monotonic_count };
         Status::SUCCESS
@@ -1831,7 +1830,7 @@ extern "efiapi" fn open_protocol(
         attributes
     );
 
-    let efi_state = state::efi();
+    let efi_state = tables();
 
     // Find the handle entry
     let handle_entry = efi_state.handles[..efi_state.handle_count]
@@ -1903,7 +1902,7 @@ extern "efiapi" fn close_protocol(
     }
 
     // Verify the handle exists and has this protocol
-    let efi_state = state::efi();
+    let efi_state = tables();
     let handle_exists = efi_state.handles[..efi_state.handle_count]
         .iter()
         .any(|entry| {
@@ -1957,7 +1956,7 @@ extern "efiapi" fn protocols_per_handle(
         return Status::INVALID_PARAMETER;
     }
 
-    let efi_state = state::efi();
+    let efi_state = tables();
 
     // Find the handle entry
     let entry = match efi_state.handles[..efi_state.handle_count]
@@ -2120,7 +2119,7 @@ extern "efiapi" fn locate_protocol(
     let guid = unsafe { *protocol };
     log::trace!("BS.LocateProtocol(protocol={})", GuidFmt(guid));
 
-    let efi_state = state::efi();
+    let efi_state = tables();
 
     // Find first handle with this protocol
     let found = efi_state.handles[..efi_state.handle_count]
@@ -2219,7 +2218,7 @@ extern "efiapi" fn install_multiple_protocol_interfaces(
                 let prev_guid_ptr = args[j].0 as *const Guid;
                 if !prev_guid_ptr.is_null() {
                     let prev_guid = unsafe { *prev_guid_ptr };
-                    state::with_efi_mut(|efi_state| {
+                    with_tables_mut(|efi_state| {
                         if let Some(entry) = efi_state.handles[..efi_state.handle_count]
                             .iter_mut()
                             .find(|e| e.handle == target_handle)
@@ -2271,7 +2270,7 @@ extern "efiapi" fn uninstall_multiple_protocol_interfaces(
         log::debug!("  Uninstalling protocol: {}", GuidFmt(guid));
 
         // Find and remove the protocol from the handle
-        state::with_efi_mut(|efi_state| {
+        with_tables_mut(|efi_state| {
             if let Some(entry) = efi_state.handles[..efi_state.handle_count]
                 .iter_mut()
                 .find(|e| e.handle == handle)
@@ -2329,7 +2328,7 @@ use super::guid_fmt::GuidFmt;
 // (was ~350 lines of GUID-to-name mappings)
 /// Create a new handle and register it
 pub fn create_handle() -> Option<Handle> {
-    state::with_efi_mut(|efi_state| {
+    with_tables_mut(|efi_state| {
         if efi_state.handle_count >= MAX_HANDLES {
             return None;
         }
@@ -2348,7 +2347,7 @@ pub fn create_handle() -> Option<Handle> {
 
 /// Install a protocol on an existing handle
 pub fn install_protocol(handle: Handle, guid: &Guid, interface: *mut c_void) -> Status {
-    state::with_efi_mut(|efi_state| {
+    with_tables_mut(|efi_state| {
         if let Some(entry) = efi_state.handles[..efi_state.handle_count]
             .iter_mut()
             .find(|e| e.handle == handle)
@@ -2381,7 +2380,7 @@ pub fn install_protocol(handle: Handle, guid: &Guid, interface: *mut c_void) -> 
 ///
 /// Returns the interface pointer, or null if not found.
 pub fn get_protocol_on_handle(handle: Handle, guid: &Guid) -> *mut c_void {
-    let efi_state = state::efi();
+    let efi_state = tables();
 
     efi_state.handles[..efi_state.handle_count]
         .iter()

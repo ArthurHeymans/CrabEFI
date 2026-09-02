@@ -14,7 +14,6 @@ use super::allocator::{self, MemoryType};
 use super::boot_services;
 use super::protocols::loaded_image::LOADED_IMAGE_PROTOCOL_GUID;
 use super::protocols::simple_file_system::SIMPLE_FILE_SYSTEM_GUID;
-use crate::state;
 
 /// Device path type for Media
 const DEVICE_PATH_TYPE_MEDIA: u8 = device_path::TYPE_MEDIA;
@@ -255,7 +254,7 @@ pub(crate) fn load_image_from_device_path(
 
 /// Find a handle that has a specific protocol installed
 pub(crate) fn find_handle_with_protocol(protocol_guid: &Guid) -> Option<Handle> {
-    let efi_state = state::efi();
+    let efi_state = super::tables::tables();
 
     efi_state.handles[..efi_state.handle_count]
         .iter()
@@ -363,7 +362,7 @@ fn find_best_sfs_handle_for_device_path(device_path: *mut DevicePathProtocol) ->
         return None;
     }
 
-    let efi_state = state::efi();
+    let efi_state = super::tables::tables();
     let dp_guid = r_efi::protocols::device_path::PROTOCOL_GUID;
 
     let mut best_handle: Option<Handle> = None;
@@ -413,7 +412,7 @@ pub(crate) fn get_device_handle_from_parent(parent_handle: Handle) -> Handle {
     }
 
     // Try to get the LoadedImageProtocol from the parent
-    let efi_state = state::efi();
+    let efi_state = super::tables::tables();
     efi_state
         .handles
         .iter()
