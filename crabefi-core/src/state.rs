@@ -22,16 +22,12 @@ use core::cell::Ref;
 
 use crate::cell::{Local, LocalCell};
 
-use crate::fs::fat::FatType;
-
 // ============================================================================
 // Subsystem statics
 // ============================================================================
 
 /// EFI service bookkeeping: handles, events, loaded images, filesystem.
 static EFI: Local<EfiState> = Local::new(EfiState::new());
-/// Filesystem block device.
-static BLOCK_DEVICE: Local<Option<crate::drivers::block::AnyBlockDevice>> = Local::new(None);
 /// Hardware driver state.
 static DRIVERS: Local<DriverState> = Local::new(DriverState::new());
 /// EFI console state.
@@ -268,9 +264,6 @@ pub struct EfiState {
     /// Per UEFI spec, this should only be signaled once before the first
     /// boot option is attempted.
     pub ready_to_boot_signaled: bool,
-
-    /// Filesystem state for SimpleFileSystem protocol
-    pub filesystem: Option<FilesystemState>,
 }
 
 impl EfiState {
@@ -284,7 +277,6 @@ impl EfiState {
             loaded_images: Vec::new(),
             monotonic_count: 0,
             ready_to_boot_signaled: false,
-            filesystem: None,
         }
     }
 }
@@ -578,64 +570,6 @@ impl InputState {
 }
 
 // ============================================================================
-// Filesystem State
-// ============================================================================
-
-/// Filesystem state - stores partition info for reading files
-#[derive(Clone, Copy)]
-pub struct FilesystemState {
-    /// First LBA of the partition (in device blocks)
-    pub partition_start: u64,
-    /// FAT type
-    pub fat_type: FatType,
-    /// Bytes per sector (FAT's logical sector size)
-    pub bytes_per_sector: u16,
-    /// Device block size (physical block size, may differ from bytes_per_sector)
-    pub device_block_size: u32,
-    /// Sectors per cluster
-    pub sectors_per_cluster: u8,
-    /// First FAT sector (relative to partition start, in FAT sectors)
-    pub fat_start: u32,
-    /// Sectors per FAT
-    pub sectors_per_fat: u32,
-    /// First data sector (relative to partition start, in FAT sectors)
-    pub data_start: u32,
-    /// Root directory cluster (FAT32) or 0 (FAT12/16)
-    pub root_cluster: u32,
-    /// Root directory sector start (FAT12/16 only, in FAT sectors)
-    pub root_dir_start: u32,
-    /// Root directory sector count (FAT12/16 only)
-    pub root_dir_sectors: u32,
-}
-
-impl FilesystemState {
-    pub const fn empty() -> Self {
-        Self {
-            partition_start: 0,
-            fat_type: FatType::Fat12,
-            bytes_per_sector: 0,
-            device_block_size: 0,
-            sectors_per_cluster: 0,
-            fat_start: 0,
-            sectors_per_fat: 0,
-            data_start: 0,
-            root_cluster: 0,
-            root_dir_start: 0,
-            root_dir_sectors: 0,
-        }
-    }
-
-    /// Translate FAT sector to device block
-    pub fn fat_sector_to_device_block(&self, fat_sector: u64) -> u64 {
-        if self.bytes_per_sector as u32 == self.device_block_size {
-            fat_sector
-        } else {
-            (fat_sector * self.bytes_per_sector as u64) / self.device_block_size as u64
-        }
-    }
-}
-
-// ============================================================================
 // Accessors
 // ============================================================================
 
@@ -679,23 +613,6 @@ pub fn console() -> Ref<'static, ConsoleState> {
 #[track_caller]
 pub fn with_console_mut<R>(f: impl FnOnce(&mut ConsoleState) -> R) -> R {
     CONSOLE.with_mut(f)
-}
-
-/// Mutate the block device through a closure.
-///
-/// Returns `None` if no block device is configured.
-#[inline]
-#[track_caller]
-pub fn with_block_device_mut<R>(
-    f: impl FnOnce(&mut crate::drivers::block::AnyBlockDevice) -> R,
-) -> Option<R> {
-    BLOCK_DEVICE.borrow_mut().as_mut().map(f)
-}
-
-/// Install the filesystem block device.
-#[track_caller]
-pub fn set_block_device(device: crate::drivers::block::AnyBlockDevice) {
-    *BLOCK_DEVICE.borrow_mut() = Some(device);
 }
 
 /// The runtime image client, once the runtime image has been loaded.

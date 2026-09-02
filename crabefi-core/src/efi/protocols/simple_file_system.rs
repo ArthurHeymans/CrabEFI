@@ -13,12 +13,61 @@ use r_efi::protocols::simple_file_system as efi_sfs;
 use spin::Mutex;
 use zerocopy::FromBytes;
 
+use crate::cell::{Local, LocalCell};
 use crate::drivers::block::{AnyBlockDevice, BlockDevice};
-use crate::fs::fat::{DirectoryEntry, FatFilesystem};
-use crate::state;
+use crate::fs::fat::{DirectoryEntry, FatFilesystem, FatType};
 
-// Re-export FilesystemState for backward compatibility with lib.rs
-pub use crate::state::FilesystemState;
+/// Filesystem state - stores partition info for reading files
+#[derive(Clone, Copy)]
+pub struct FilesystemState {
+    /// First LBA of the partition (in device blocks)
+    pub partition_start: u64,
+    /// FAT type
+    pub fat_type: FatType,
+    /// Bytes per sector (FAT's logical sector size)
+    pub bytes_per_sector: u16,
+    /// Device block size (physical block size, may differ from bytes_per_sector)
+    pub device_block_size: u32,
+    /// Sectors per cluster
+    pub sectors_per_cluster: u8,
+    /// First FAT sector (relative to partition start, in FAT sectors)
+    pub fat_start: u32,
+    /// Sectors per FAT
+    pub sectors_per_fat: u32,
+    /// First data sector (relative to partition start, in FAT sectors)
+    pub data_start: u32,
+    /// Root directory cluster (FAT32) or 0 (FAT12/16)
+    pub root_cluster: u32,
+    /// Root directory sector start (FAT12/16 only, in FAT sectors)
+    pub root_dir_start: u32,
+    /// Root directory sector count (FAT12/16 only)
+    pub root_dir_sectors: u32,
+}
+
+impl FilesystemState {
+    /// Translate FAT sector to device block
+    pub fn fat_sector_to_device_block(&self, fat_sector: u64) -> u64 {
+        if self.bytes_per_sector as u32 == self.device_block_size {
+            fat_sector
+        } else {
+            (fat_sector * self.bytes_per_sector as u64) / self.device_block_size as u64
+        }
+    }
+}
+
+/// Mounted FAT filesystem geometry.
+static FILESYSTEM: LocalCell<Option<FilesystemState>> = LocalCell::new(None);
+/// Block device backing the mounted filesystem.
+static BLOCK_DEVICE: Local<Option<AnyBlockDevice>> = Local::new(None);
+
+/// Mutate the block device through a closure.
+///
+/// Returns `None` if no block device is configured.
+#[inline]
+#[track_caller]
+fn with_block_device_mut<R>(f: impl FnOnce(&mut AnyBlockDevice) -> R) -> Option<R> {
+    BLOCK_DEVICE.borrow_mut().as_mut().map(f)
+}
 
 /// Re-export GUIDs
 pub const SIMPLE_FILE_SYSTEM_GUID: Guid = efi_sfs::PROTOCOL_GUID;
@@ -140,8 +189,8 @@ pub fn init(block_device: AnyBlockDevice, partition_start: u64) -> *mut efi_sfs:
         }
     };
 
-    state::with_efi_mut(|efi| efi.filesystem = Some(fs_state));
-    state::set_block_device(temp_device);
+    FILESYSTEM.set(Some(fs_state));
+    *BLOCK_DEVICE.borrow_mut() = Some(temp_device);
 
     log::info!(
         "SimpleFileSystem: initialized with partition at LBA {}",
@@ -183,7 +232,7 @@ extern "efiapi" fn sfs_open_volume(
     };
 
     // Initialize as root directory
-    let filesystem = state::efi().filesystem;
+    let filesystem = FILESYSTEM.get();
     let fs_state = match filesystem {
         Some(s) => s,
         None => {
@@ -264,14 +313,14 @@ extern "efiapi" fn file_open(
     log::info!("File.Open: full path = {:?}", full_path_str);
 
     // Get partition start
-    let filesystem = state::efi().filesystem;
+    let filesystem = FILESYSTEM.get();
     let partition_start = match filesystem {
         Some(s) => s.partition_start,
         None => return Status::NOT_READY,
     };
 
     // Find the file using FatFilesystem
-    let result = state::with_block_device_mut(|device| {
+    let result = with_block_device_mut(|device| {
         let mut fat = match FatFilesystem::new(device, partition_start) {
             Ok(f) => f,
             Err(_) => return Err(()),
@@ -396,7 +445,7 @@ extern "efiapi" fn file_read(
         return Status::SUCCESS;
     }
 
-    let filesystem = state::efi().filesystem;
+    let filesystem = FILESYSTEM.get();
     let partition_start = match filesystem {
         Some(s) => s.partition_start,
         None => return Status::NOT_READY,
@@ -406,7 +455,7 @@ extern "efiapi" fn file_read(
 
     // Create a fake DirectoryEntry for read_file
     // We need to read using the stored cluster and position
-    let result = state::with_block_device_mut(|device| {
+    let result = with_block_device_mut(|device| {
         let mut fat = match FatFilesystem::new(device, partition_start) {
             Ok(f) => f,
             Err(_) => return Err(()),
@@ -582,7 +631,7 @@ extern "efiapi" fn file_get_info(
             return Status::INVALID_PARAMETER;
         }
 
-        let filesystem = state::efi().filesystem;
+        let filesystem = FILESYSTEM.get();
         let fs_state = match filesystem {
             Some(s) => s,
             None => return Status::NOT_READY,
@@ -844,7 +893,7 @@ fn create_file_entry(first_cluster: u32, file_size: u32) -> DirectoryEntry {
 
 /// Read directory entries
 fn read_directory(buffer_size: *mut usize, buffer: *mut c_void, handle_idx: usize) -> Status {
-    let filesystem = state::efi().filesystem;
+    let filesystem = FILESYSTEM.get();
     let partition_start = match filesystem {
         Some(s) => s.partition_start,
         None => return Status::NOT_READY,
@@ -859,7 +908,7 @@ fn read_directory(buffer_size: *mut usize, buffer: *mut c_void, handle_idx: usiz
     };
 
     // Get directory entry at current position
-    let entry_result = state::with_block_device_mut(|device| {
+    let entry_result = with_block_device_mut(|device| {
         let mut fat = match FatFilesystem::new(device, partition_start) {
             Ok(f) => f,
             Err(_) => return Err(()),
