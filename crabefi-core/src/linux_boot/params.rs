@@ -7,6 +7,7 @@
 
 use core::mem;
 
+use crate::efi::allocator::{MemoryDescriptor, MemoryType as EfiMemoryType};
 use crate::platform::{MemoryRegion, MemoryType};
 
 /// E820 memory map entry (20 bytes)
@@ -67,6 +68,30 @@ impl From<&MemoryRegion> for E820Entry {
             entry_type,
         }
     }
+}
+
+impl From<&MemoryDescriptor> for E820Entry {
+    fn from(descriptor: &MemoryDescriptor) -> Self {
+        let entry_type = match EfiMemoryType::try_from(descriptor.memory_type) {
+            Ok(EfiMemoryType::ConventionalMemory) => E820Entry::RAM_TYPE,
+            Ok(EfiMemoryType::AcpiReclaimMemory) => E820Entry::ACPI_RECLAIMABLE_TYPE,
+            Ok(EfiMemoryType::AcpiMemoryNvs) => E820Entry::ACPI_NVS_TYPE,
+            _ => E820Entry::RESERVED_TYPE,
+        };
+
+        Self {
+            addr: descriptor.physical_start,
+            size: descriptor.number_of_pages.saturating_mul(4096),
+            entry_type,
+        }
+    }
+}
+
+/// Failure while converting the EFI memory map to the Linux E820 format.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum E820MapError {
+    /// The coalesced map does not fit in the 128-entry boot protocol table.
+    TooManyEntries,
 }
 
 /// Linux setup header (at offset 0x1f1 in boot sector, 119 bytes)
@@ -408,6 +433,52 @@ impl BootParams {
         }
     }
 
+    /// Set the E820 memory map from the effective EFI memory map.
+    ///
+    /// Adjacent descriptors that map to the same E820 type are coalesced so
+    /// allocator splits do not unnecessarily consume the 128-entry table.
+    ///
+    /// # Arguments
+    /// * `descriptors` - Complete, address-sorted EFI memory map
+    ///
+    /// # Returns
+    /// The number of E820 entries written.
+    ///
+    /// # Errors
+    /// Returns [`E820MapError::TooManyEntries`] when the coalesced map exceeds
+    /// the Linux boot protocol's 128-entry limit.
+    pub fn set_efi_memory_map(
+        &mut self,
+        descriptors: &[MemoryDescriptor],
+    ) -> Result<usize, E820MapError> {
+        let mut table = [E820Entry::default(); 128];
+        let mut count = 0;
+
+        for descriptor in descriptors {
+            let entry = E820Entry::from(descriptor);
+            if count > 0 {
+                let previous = table[count - 1];
+                if previous.entry_type == entry.entry_type
+                    && previous.addr.checked_add(previous.size) == Some(entry.addr)
+                    && let Some(size) = previous.size.checked_add(entry.size)
+                {
+                    table[count - 1].size = size;
+                    continue;
+                }
+            }
+
+            if count == table.len() {
+                return Err(E820MapError::TooManyEntries);
+            }
+            table[count] = entry;
+            count += 1;
+        }
+
+        self.e820_table = table;
+        self.e820_entries = count as u8;
+        Ok(count)
+    }
+
     /// Get the number of E820 entries
     pub fn num_e820_entries(&self) -> usize {
         self.e820_entries as usize
@@ -511,3 +582,63 @@ const _: () = assert!(mem::size_of::<ScreenInfo>() == 0x40);
 const _: () = assert!(mem::size_of::<SetupHeader>() == 119);
 const _: () = assert!(mem::size_of::<E820Entry>() == 20);
 const _: () = assert!(mem::size_of::<BootParams>() == 4096);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn descriptor(memory_type: EfiMemoryType, addr: u64) -> MemoryDescriptor {
+        MemoryDescriptor::new(memory_type as u32, addr, 1, 0)
+    }
+
+    #[test]
+    fn allocated_efi_memory_stays_reserved() {
+        for memory_type in [
+            EfiMemoryType::LoaderCode,
+            EfiMemoryType::LoaderData,
+            EfiMemoryType::BootServicesCode,
+            EfiMemoryType::BootServicesData,
+        ] {
+            let entry_type = E820Entry::from(&descriptor(memory_type, 0)).entry_type;
+            assert_eq!(entry_type, E820Entry::RESERVED_TYPE);
+        }
+        let entry_type =
+            E820Entry::from(&descriptor(EfiMemoryType::ConventionalMemory, 0)).entry_type;
+        assert_eq!(entry_type, E820Entry::RAM_TYPE);
+    }
+
+    #[test]
+    fn efi_map_coalesces_adjacent_equal_e820_types() {
+        let descriptors = [
+            descriptor(EfiMemoryType::LoaderCode, 0),
+            descriptor(EfiMemoryType::BootServicesData, 4096),
+            descriptor(EfiMemoryType::ConventionalMemory, 8192),
+            descriptor(EfiMemoryType::ConventionalMemory, 12288),
+        ];
+        let mut params = BootParams::new();
+
+        assert_eq!(params.set_efi_memory_map(&descriptors), Ok(2));
+        let reserved_size = params.e820_entry(0).unwrap().size;
+        let ram_size = params.e820_entry(1).unwrap().size;
+        assert_eq!(reserved_size, 8192);
+        assert_eq!(ram_size, 8192);
+    }
+
+    #[test]
+    fn efi_map_rejects_more_than_128_coalesced_entries() {
+        let descriptors: [MemoryDescriptor; 129] = core::array::from_fn(|index| {
+            let memory_type = if index % 2 == 0 {
+                EfiMemoryType::ConventionalMemory
+            } else {
+                EfiMemoryType::AcpiReclaimMemory
+            };
+            descriptor(memory_type, index as u64 * 4096)
+        });
+        let mut params = BootParams::new();
+
+        assert_eq!(
+            params.set_efi_memory_map(&descriptors),
+            Err(E820MapError::TooManyEntries)
+        );
+    }
+}

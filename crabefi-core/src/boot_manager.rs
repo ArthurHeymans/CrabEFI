@@ -627,34 +627,11 @@ fn boot_linux_entry(
         log::debug!("FAT initrd path: {}", p);
     }
 
-    // Get memory regions and ACPI RSDP from state
-    let (memory_regions, acpi_rsdp) = {
-        let handoff = crate::handoff::get();
-        // Copy memory regions to a local buffer (we can't borrow across the disk operations)
-        let mut regions = heapless::Vec::<
-            crate::platform::MemoryRegion,
-            { crate::handoff::MAX_MEMORY_REGIONS },
-        >::new();
-        for region in handoff.memory_regions.iter() {
-            if regions.push(*region).is_err() {
-                log::warn!("Direct Linux memory map copy is full; remaining regions omitted");
-                break;
-            }
-        }
-        (regions, handoff.acpi_rsdp)
-    };
-
-    // Get framebuffer info for Linux console
+    let acpi_rsdp = crate::handoff::get().acpi_rsdp;
     let framebuffer = crate::handoff::framebuffer();
 
-    if memory_regions.is_empty() {
-        log::error!("No memory regions available for Linux boot");
-        return;
-    }
-
     log::debug!(
-        "Memory regions: {}, ACPI RSDP: {:?}, Framebuffer: {}",
-        memory_regions.len(),
+        "ACPI RSDP: {:?}, Framebuffer: {}",
         acpi_rsdp,
         if framebuffer.is_some() { "yes" } else { "no" }
     );
@@ -673,7 +650,6 @@ fn boot_linux_entry(
             &kernel_path,
             initrd_fat_path.as_deref(),
             cmdline,
-            &memory_regions,
             acpi_rsdp,
             framebuffer.as_ref(),
             false, // Don't use EFI handover for direct boot
