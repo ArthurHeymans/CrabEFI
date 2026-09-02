@@ -1611,7 +1611,7 @@ extern "efiapi" fn exit_boot_services(image_handle: Handle, map_key: usize) -> S
     if key_status != Status::SUCCESS {
         return key_status;
     }
-    let Some(runtime_image) = crate::state::runtime_image() else {
+    let Some(runtime_image) = crate::efi::runtime_image::installed() else {
         log::error!("ExitBootServices refused: runtime image client is missing");
         return Status::DEVICE_ERROR;
     };
@@ -1704,7 +1704,7 @@ extern "efiapi" fn exit_boot_services(image_handle: Handle, map_key: usize) -> S
         // Let platform glue clean up integration-specific handoff state only
         // after the final fallible step; hooks may disable non-runtime log
         // buffers needed to diagnose a seal failure.
-        if let Some(hooks) = crate::state::platform_callbacks().hooks {
+        if let Some(hooks) = crate::handoff::callbacks().hooks {
             hooks.on_exit_boot_services();
         }
 

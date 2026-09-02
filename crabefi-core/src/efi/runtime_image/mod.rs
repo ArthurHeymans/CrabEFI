@@ -4,5 +4,5 @@ pub mod bridge;
 pub mod client;
 mod loader;
 
-pub use client::RuntimeImageClient;
+pub use client::{RuntimeImageClient, install, installed};
 pub use loader::{LoadError, load};

@@ -471,7 +471,7 @@ impl EventLog for Sha1EventLog {
         // a zero digest would produce a valid-looking but incorrect log entry.
         let sha1_digest = digests
             .iter()
-            .find(|d| d.algorithm == super::types::TPM_ALG_SHA1)
+            .find(|h| h.algorithm == super::types::TPM_ALG_SHA1)
             .map(|d| {
                 let mut out = [0u8; SHA1_DIGEST_SIZE];
                 out.copy_from_slice(&d.digest[..SHA1_DIGEST_SIZE]);

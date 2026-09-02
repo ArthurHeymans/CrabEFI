@@ -546,7 +546,7 @@ impl OhciController {
         let slot = self
             .devices
             .iter()
-            .position(|d| d.is_none())
+            .position(|h| h.is_none())
             .ok_or(UsbError::NoFreeSlots)?;
 
         let initial_device = UsbDevice::new(0, port, speed);
@@ -576,7 +576,7 @@ impl OhciController {
         data: Option<&mut [u8]>,
     ) -> Result<usize, UsbError> {
         let is_in = (request_type & 0x80) != 0;
-        let data_len = data.as_ref().map(|d| d.len()).unwrap_or(0);
+        let data_len = data.as_ref().map(|h| h.len()).unwrap_or(0);
         if data_len > 4096 || data_len > u16::MAX as usize {
             return Err(UsbError::InvalidParameter);
         }
@@ -739,7 +739,7 @@ impl OhciController {
     fn get_device_mut(&mut self, address: u8) -> Option<&mut UsbDevice> {
         self.devices
             .iter_mut()
-            .find_map(|d| d.as_mut().filter(|d| d.address == address))
+            .find_map(|h| h.as_mut().filter(|h| h.address == address))
     }
 
     /// Get PCI address

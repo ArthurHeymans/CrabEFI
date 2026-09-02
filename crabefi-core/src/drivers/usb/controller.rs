@@ -738,7 +738,7 @@ pub trait UsbController {
     fn get_device(&self, address: u8) -> Option<&UsbDevice> {
         self.devices()
             .iter()
-            .find_map(|d| d.as_ref().filter(|d| d.address == address))
+            .find_map(|h| h.as_ref().filter(|h| h.address == address))
     }
 
     /// Find a mass storage device
@@ -748,7 +748,7 @@ pub trait UsbController {
     fn find_mass_storage(&self) -> Option<u8> {
         self.devices()
             .iter()
-            .find_map(|d| d.as_ref().filter(|d| d.is_mass_storage).map(|d| d.address))
+            .find_map(|h| h.as_ref().filter(|h| h.is_mass_storage).map(|h| h.address))
     }
 
     /// Find a HID keyboard device
@@ -758,7 +758,7 @@ pub trait UsbController {
     fn find_hid_keyboard(&self) -> Option<u8> {
         self.devices()
             .iter()
-            .find_map(|d| d.as_ref().filter(|d| d.is_hid_keyboard).map(|d| d.address))
+            .find_map(|h| h.as_ref().filter(|h| h.is_hid_keyboard).map(|h| h.address))
     }
 
     /// Find a HID mouse device
@@ -768,12 +768,12 @@ pub trait UsbController {
     fn find_hid_mouse(&self) -> Option<u8> {
         self.devices()
             .iter()
-            .find_map(|d| d.as_ref().filter(|d| d.is_hid_mouse).map(|d| d.address))
+            .find_map(|h| h.as_ref().filter(|h| h.is_hid_mouse).map(|h| h.address))
     }
 
     /// Get mouse interrupt endpoint info for a device
     fn get_mouse_interrupt_endpoint(&self, device: u8) -> Option<EndpointInfo> {
-        self.get_device(device).and_then(|d| d.mouse_interrupt_in)
+        self.get_device(device).and_then(|h| h.mouse_interrupt_in)
     }
 
     /// Get device info
@@ -789,7 +789,7 @@ pub trait UsbController {
 
     /// Get interrupt endpoint info for a device
     fn get_interrupt_endpoint(&self, device: u8) -> Option<EndpointInfo> {
-        self.get_device(device).and_then(|d| d.interrupt_in)
+        self.get_device(device).and_then(|h| h.interrupt_in)
     }
 }
 

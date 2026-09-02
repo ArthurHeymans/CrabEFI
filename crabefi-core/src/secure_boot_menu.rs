@@ -85,7 +85,7 @@ const MENU_OPTIONS: [MenuOption; 6] = [
 /// This displays Secure Boot status and allows the user to manage settings.
 pub fn show_secure_boot_menu() {
     // Get framebuffer for rendering
-    let fb_info = crate::state::get_framebuffer();
+    let fb_info = crate::handoff::framebuffer();
     let mut fb_console = fb_info.as_ref().map(FramebufferConsole::new);
 
     let mut selected = 0usize;
@@ -252,7 +252,7 @@ pub fn show_secure_boot_menu() {
                         break;
                     }
                     KeyPress::Char('f') | KeyPress::Char('F') => {
-                        if let Some(hooks) = crate::state::platform_callbacks().hooks {
+                        if let Some(hooks) = crate::handoff::callbacks().hooks {
                             if !hooks.show_firmware_settings() {
                                 status_message = Some(("Firmware settings not available", false));
                             }

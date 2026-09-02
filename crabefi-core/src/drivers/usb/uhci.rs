@@ -525,7 +525,7 @@ impl UhciController {
         let slot = self
             .devices
             .iter()
-            .position(|d| d.is_none())
+            .position(|h| h.is_none())
             .ok_or(UsbError::NoFreeSlots)?;
 
         let initial_device = UsbDevice::new(0, port, speed);
@@ -573,7 +573,7 @@ impl UhciController {
         let slot = self
             .devices
             .iter()
-            .position(|d| d.is_none())
+            .position(|h| h.is_none())
             .ok_or(UsbError::NoFreeSlots)?;
 
         let initial_device = UsbDevice::new_on_hub(0, hub_port, speed, hub_addr, hub_port_num);
@@ -648,7 +648,7 @@ impl UhciController {
         data: Option<&mut [u8]>,
     ) -> Result<usize, UsbError> {
         let is_in = (request_type & 0x80) != 0;
-        let data_len = data.as_ref().map(|d| d.len()).unwrap_or(0);
+        let data_len = data.as_ref().map(|h| h.len()).unwrap_or(0);
         let is_low_speed = device.speed == UsbSpeed::Low;
         let max_packet = device.ep0_max_packet.max(8) as usize;
 
@@ -890,7 +890,7 @@ impl UhciController {
     fn get_device_mut(&mut self, address: u8) -> Option<&mut UsbDevice> {
         self.devices
             .iter_mut()
-            .find_map(|d| d.as_mut().filter(|d| d.address == address))
+            .find_map(|h| h.as_mut().filter(|h| h.address == address))
     }
 
     /// Get PCI address

@@ -33,6 +33,7 @@ pub mod fdt;
 pub mod framebuffer_console;
 pub mod fs;
 pub mod grub;
+pub mod handoff;
 pub mod heap;
 #[cfg(target_arch = "x86_64")]
 pub mod linux_boot;
@@ -43,7 +44,6 @@ pub mod payload;
 pub mod pe;
 pub mod platform;
 pub mod secure_boot_menu;
-pub mod state;
 pub mod time;
 pub mod timestamp;
 #[cfg(feature = "ui")]
@@ -55,7 +55,7 @@ use crate::drivers::block::{AhciDisk, NvmeDisk, SdhciDisk, UsbDisk};
 pub fn reset_system() -> ! {
     log::info!("System reset requested");
 
-    if let Some(reset) = state::platform_callbacks().reset {
+    if let Some(reset) = handoff::callbacks().reset {
         reset.reset(ResetType::Cold);
     }
 
@@ -105,7 +105,7 @@ pub fn display_secure_boot_error() {
     drivers::serial::write_str("\x1b[0m\r\n"); // Reset color
 
     // Output to framebuffer if available
-    if let Some(fb_info) = state::get_framebuffer() {
+    if let Some(fb_info) = handoff::framebuffer() {
         let mut console = FramebufferConsole::new(&fb_info);
 
         // Calculate center position
@@ -202,7 +202,8 @@ fn init_persistence_and_boot(
         log::warn!("Variable store is preserved read-only; capsule updates are disabled");
     }
 
-    let runtime = state::runtime_image().expect("runtime image missing before deferred replay");
+    let runtime = crate::efi::runtime_image::installed()
+        .expect("runtime image missing before deferred replay");
     let capsule_backend_available = capsule_backend.is_some();
     let mut capsule_delivery_usable = false;
     if persistence_available {
@@ -248,7 +249,7 @@ fn init_persistence_and_boot(
 
     // Reinstall ESRT after persistent variables and this boot's capsule attempts
     // are visible so its last-attempt fields are authoritative across reboots.
-    let firmware_info = state::drivers().platform.efi_fw_info;
+    let firmware_info = handoff::get().efi_fw_info;
     if let Some(firmware) = firmware_info {
         efi::esrt::install_esrt(&firmware, capsule_delivery_usable);
     }
@@ -393,7 +394,7 @@ pub fn init_platform(mut config: PlatformConfig) -> ! {
 
     // ---- 4. Store ACPI RSDP in driver state ----
     if let Some(rsdp) = config.acpi_rsdp {
-        state::with_drivers_mut(|d| d.platform.acpi_rsdp = Some(rsdp));
+        handoff::with_mut(|h| h.acpi_rsdp = Some(rsdp));
         log::info!("ACPI RSDP: {:#x}", rsdp);
     }
 
@@ -413,7 +414,7 @@ pub fn init_platform(mut config: PlatformConfig) -> ! {
                 plat.gicd,
                 plat.uart_base
             );
-            state::with_drivers_mut(|d| d.fdt_info = plat);
+            handoff::with_mut(|h| h.fdt_info = plat);
         }
     }
 
@@ -447,16 +448,16 @@ pub fn init_platform(mut config: PlatformConfig) -> ! {
             &'static dyn crate::platform::ResetHandler,
         >(config.reset)
     };
-    state::set_platform_callbacks(state::PlatformCallbacks {
+    handoff::set_callbacks(handoff::Callbacks {
         hooks,
         reset: Some(reset),
         timestamp_recorder,
     });
-    state::with_drivers_mut(|d| {
-        d.platform.efi_fw_info = config.firmware_info;
-        d.platform.capsule_regions.clear();
+    handoff::with_mut(|h| {
+        h.efi_fw_info = config.firmware_info;
+        h.capsule_regions.clear();
         for region in config.capsule_regions {
-            if d.platform.capsule_regions.push(*region).is_err() {
+            if h.capsule_regions.push(*region).is_err() {
                 log::warn!("Too many platform capsule regions for state storage");
                 break;
             }
@@ -494,9 +495,9 @@ pub fn init_platform(mut config: PlatformConfig) -> ! {
 
     // Initialize mouse cursor system (ui feature only).
     // Must come after efi::init_from_platform(), which stores the framebuffer
-    // in global state via state::store_framebuffer().
+    // in global state via handoff::store_framebuffer().
     #[cfg(feature = "ui")]
-    if let Some(fb) = crate::state::get_framebuffer() {
+    if let Some(fb) = handoff::framebuffer() {
         drivers::mouse_cursor::init(fb.width, fb.height);
     }
 
@@ -505,7 +506,7 @@ pub fn init_platform(mut config: PlatformConfig) -> ! {
     // The ESRT is built from platform-provided firmware info and installed as
     // an EFI Configuration Table for fwupd/LVFS discovery. Delivery flags and
     // OsIndicationsSupported are finalized after persistence is initialized.
-    let firmware_info = state::drivers().platform.efi_fw_info;
+    let firmware_info = handoff::get().efi_fw_info;
     if let Some(fw_info) = firmware_info {
         efi::esrt::install_esrt(&fw_info, false);
         log::info!("ESRT installed for firmware updates");
@@ -527,8 +528,8 @@ pub fn init_platform(mut config: PlatformConfig) -> ! {
             log::error!("PCI ECAM regions from platform rejected: {:?}", error);
         }
     } else {
-        let acpi_info = state::drivers().acpi_info.clone();
-        let fdt_info = state::drivers().fdt_info.clone();
+        let acpi_info = handoff::get().acpi_info.clone();
+        let fdt_info = handoff::get().fdt_info.clone();
         if !acpi_info.ecam_regions().is_empty() {
             log::info!(
                 "PCI ECAM regions from ACPI MCFG: {}",

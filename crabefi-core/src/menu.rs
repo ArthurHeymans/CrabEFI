@@ -931,7 +931,7 @@ pub fn show_menu(menu: &mut BootMenu) -> Option<usize> {
     }
 
     // Get framebuffer for console and cursor rendering.
-    let fb_config = crate::state::get_framebuffer();
+    let fb_config = crate::handoff::framebuffer();
     #[cfg(feature = "ui")]
     let fb_info = fb_config;
     #[cfg(not(feature = "ui"))]
@@ -1021,7 +1021,7 @@ pub fn show_menu(menu: &mut BootMenu) -> Option<usize> {
                 }
                 KeyPress::Char('f') | KeyPress::Char('F') => {
                     // Open platform-provided firmware settings menu.
-                    if let Some(hooks) = crate::state::platform_callbacks().hooks {
+                    if let Some(hooks) = crate::handoff::callbacks().hooks {
                         if !hooks.show_firmware_settings() {
                             draw_status("Firmware settings not available", &mut fb_console);
                             delay_ms(500);

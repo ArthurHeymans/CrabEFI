@@ -251,7 +251,7 @@ fn sidebar_hit() -> Option<NavItem> {
 // ═══════════════════════════════════════════════════════════════════════
 
 pub fn show_graphical_menu(menu: &mut BootMenu) -> Option<usize> {
-    let fb = crate::state::get_framebuffer()?;
+    let fb = crate::handoff::framebuffer()?;
     let mut screen = NavItem::Boot;
 
     loop {
@@ -273,7 +273,7 @@ pub fn show_graphical_menu(menu: &mut BootMenu) -> Option<usize> {
 }
 
 pub fn show_no_media_screen() {
-    let fb = match crate::state::get_framebuffer() {
+    let fb = match crate::handoff::framebuffer() {
         Some(f) => f,
         None => return,
     };

@@ -342,7 +342,7 @@ impl UsbMassStorage {
         data: Option<&mut [u8]>,
         is_read: bool,
     ) -> Result<usize, MassStorageError> {
-        let data_len = data.as_ref().map(|d| d.len()).unwrap_or(0);
+        let data_len = data.as_ref().map(|h| h.len()).unwrap_or(0);
 
         // Build CBW
         let mut cbw = CommandBlockWrapper::default();
