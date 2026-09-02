@@ -135,6 +135,10 @@ impl TryFrom<u32> for TimerType {
 /// Event entry for tracking created events
 #[derive(Clone, Copy)]
 pub struct EventEntry {
+    /// Whether this slot currently holds a live EFI event.
+    pub in_use: bool,
+    /// Generation encoded into dynamic handles to reject stale slot aliases.
+    pub generation: usize,
     pub event_type: u32,
     pub notify_tpl: efi::Tpl,
     pub signaled: bool,
@@ -156,6 +160,8 @@ pub struct EventEntry {
 impl EventEntry {
     pub const fn empty() -> Self {
         Self {
+            in_use: false,
+            generation: 0,
             event_type: 0,
             notify_tpl: 0,
             signaled: false,
@@ -273,8 +279,6 @@ pub struct Tables {
 
     /// Event database, allocated after heap startup.
     pub events: Vec<EventEntry>,
-    /// Next event ID (starting at 2, 1 is reserved for keyboard)
-    pub next_event_id: usize,
 
     /// Loaded images database, allocated after heap startup.
     pub loaded_images: Vec<LoadedImageEntry>,
@@ -299,7 +303,6 @@ impl Tables {
             next_registration: 1,
             protocol_generation: 0,
             events: Vec::new(),
-            next_event_id: 2, // Start at 2, reserve 1 for keyboard
             loaded_images: Vec::new(),
             monotonic_count: 0,
             ready_to_boot_signaled: false,
