@@ -7,43 +7,20 @@
 
 use core::ffi::c_void;
 use r_efi::efi::{Handle, Status};
+use r_efi::protocols::disk_io;
 
 use super::block_io::{BLOCK_IO_PROTOCOL_GUID, BlockIoProtocol};
 use crate::efi::boot_services;
 use crate::efi::utils::allocate_protocol_with_log;
 
-/// Disk I/O Protocol GUID
-pub const DISK_IO_PROTOCOL_GUID: r_efi::efi::Guid = r_efi::efi::Guid::from_fields(
-    0xCE345171,
-    0xBA0B,
-    0x11d2,
-    0x8E,
-    0x4F,
-    &[0x00, 0xA0, 0xC9, 0x69, 0x72, 0x3B],
-);
+/// Disk I/O Protocol GUID supplied by `r-efi`.
+pub const DISK_IO_PROTOCOL_GUID: r_efi::efi::Guid = disk_io::PROTOCOL_GUID;
 
-/// Disk I/O Protocol revision
-const DISK_IO_REVISION: u64 = 0x0001_0000;
+/// Disk I/O Protocol revision supplied by `r-efi`.
+const DISK_IO_REVISION: u64 = disk_io::REVISION;
 
-/// Disk I/O Protocol structure (matches r_efi::protocols::disk_io::Protocol)
-#[repr(C)]
-pub struct DiskIoProtocol {
-    pub revision: u64,
-    pub read_disk: extern "efiapi" fn(
-        this: *mut DiskIoProtocol,
-        media_id: u32,
-        offset: u64,
-        buffer_size: usize,
-        buffer: *mut c_void,
-    ) -> Status,
-    pub write_disk: extern "efiapi" fn(
-        this: *mut DiskIoProtocol,
-        media_id: u32,
-        offset: u64,
-        buffer_size: usize,
-        buffer: *mut c_void,
-    ) -> Status,
-}
+/// Disk I/O protocol ABI supplied by `r-efi`.
+pub type DiskIoProtocol = disk_io::Protocol;
 
 /// Maximum number of DiskIO instances (must match MAX_BLOCK_IO_INSTANCES)
 const MAX_DISK_IO_INSTANCES: usize = 16;

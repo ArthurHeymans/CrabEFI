@@ -4,83 +4,22 @@
 //! use its built-in filesystem drivers (ISO9660, ext4, etc.) to read partitions.
 
 use core::ffi::c_void;
-use r_efi::efi::{Guid, Status};
+use r_efi::efi::{Boolean, Status};
+use r_efi::protocols::block_io;
 
 use crate::efi::utils::allocate_protocol_with_log;
 
-/// Block I/O Protocol GUID
-pub const BLOCK_IO_PROTOCOL_GUID: Guid = Guid::from_fields(
-    0x964e5b21,
-    0x6459,
-    0x11d2,
-    0x8e,
-    0x39,
-    &[0x00, 0xa0, 0xc9, 0x69, 0x72, 0x3b],
-);
+/// Block I/O Protocol GUID.
+pub const BLOCK_IO_PROTOCOL_GUID: r_efi::efi::Guid = block_io::PROTOCOL_GUID;
 
-/// Block I/O Protocol revision
-pub const BLOCK_IO_REVISION: u64 = 0x00010000; // EFI_BLOCK_IO_PROTOCOL_REVISION
+/// Block I/O Protocol revision.
+pub const BLOCK_IO_REVISION: u64 = block_io::REVISION;
 
-/// Block I/O Media structure
-///
-/// Note: UEFI `BOOLEAN` is defined as `UINT8`, not C `_Bool`. Using `u8` here
-/// instead of Rust `bool` ensures correct ABI layout matching the UEFI spec's
-/// `EFI_BLOCK_IO_MEDIA` structure. Three bytes of padding after `write_caching`
-/// align `block_size` to its natural 4-byte boundary.
-#[repr(C)]
-pub struct BlockIoMedia {
-    /// Media ID - changes when media is changed
-    pub media_id: u32,
-    /// True (1) if media is removable
-    pub removable_media: u8,
-    /// True (1) if media is present
-    pub media_present: u8,
-    /// True (1) if this is a logical partition
-    pub logical_partition: u8,
-    /// True (1) if media is read-only
-    pub read_only: u8,
-    /// True (1) if WriteBlocks() must be called with entire blocks
-    pub write_caching: u8,
-    /// Padding to align block_size to 4-byte boundary
-    _pad1: [u8; 3],
-    /// Block size in bytes
-    pub block_size: u32,
-    /// IO alignment requirement (0 or power of 2)
-    pub io_align: u32,
-    /// Padding for alignment
-    _pad2: u32,
-    /// Last logical block address
-    pub last_block: u64,
-}
-/// Block I/O Protocol structure
-#[repr(C)]
-pub struct BlockIoProtocol {
-    /// Protocol revision
-    pub revision: u64,
-    /// Pointer to BlockIoMedia
-    pub media: *mut BlockIoMedia,
-    /// Reset function
-    pub reset:
-        extern "efiapi" fn(this: *mut BlockIoProtocol, extended_verification: bool) -> Status,
-    /// Read blocks function
-    pub read_blocks: extern "efiapi" fn(
-        this: *mut BlockIoProtocol,
-        media_id: u32,
-        lba: u64,
-        buffer_size: usize,
-        buffer: *mut c_void,
-    ) -> Status,
-    /// Write blocks function
-    pub write_blocks: extern "efiapi" fn(
-        this: *mut BlockIoProtocol,
-        media_id: u32,
-        lba: u64,
-        buffer_size: usize,
-        buffer: *mut c_void,
-    ) -> Status,
-    /// Flush blocks function
-    pub flush_blocks: extern "efiapi" fn(this: *mut BlockIoProtocol) -> Status,
-}
+/// Block I/O media structure supplied by `r-efi`.
+pub type BlockIoMedia = block_io::Media;
+
+/// Block I/O protocol ABI supplied by `r-efi`.
+pub type BlockIoProtocol = block_io::Protocol;
 
 /// Internal context for BlockIO protocol instance
 #[derive(Clone, Copy)]
@@ -109,7 +48,7 @@ static CTX_MAP: ProtocolContextMap<BlockIoContext, BlockIoProtocol, MAX_BLOCK_IO
 /// Reset the block device
 extern "efiapi" fn block_io_reset(
     _this: *mut BlockIoProtocol,
-    _extended_verification: bool,
+    _extended_verification: Boolean,
 ) -> Status {
     log::debug!("BlockIO.Reset()");
     Status::SUCCESS
@@ -282,16 +221,17 @@ fn create_block_io_internal(
     // Allocate media structure
     let media_ptr = allocate_protocol_with_log::<BlockIoMedia>("BlockIoMedia", |m| {
         m.media_id = media_id;
-        m.removable_media = 1; // Assume removable for now
-        m.media_present = 1;
-        m.logical_partition = if is_partition { 1 } else { 0 };
-        m.read_only = 1; // We only support read for booting
-        m.write_caching = 0;
-        m._pad1 = [0; 3];
+        m.removable_media = true; // Assume removable for now
+        m.media_present = true;
+        m.logical_partition = is_partition;
+        m.read_only = true; // We only support read for booting
+        m.write_caching = false;
         m.block_size = block_size;
         m.io_align = 0;
-        m._pad2 = 0;
         m.last_block = num_blocks.saturating_sub(1);
+        m.lowest_aligned_lba = 0;
+        m.logical_blocks_per_physical_block = 1;
+        m.optimal_transfer_length_granularity = 0;
     });
     if media_ptr.is_null() {
         return core::ptr::null_mut();

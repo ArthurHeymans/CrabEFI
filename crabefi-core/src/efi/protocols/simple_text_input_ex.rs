@@ -15,82 +15,30 @@ use crate::efi::protocols::console;
 use crate::efi::utils::allocate_protocol_with_log;
 use crate::state;
 use core::ffi::c_void;
-use r_efi::efi::{Boolean, Event, Guid, Handle, Status};
+use r_efi::efi::{Boolean, Event, Handle, Status};
 use r_efi::protocols::simple_text_input::InputKey;
+use r_efi::protocols::simple_text_input_ex;
 
 // ============================================================================
 // Protocol GUID
 // ============================================================================
 
-/// EFI_SIMPLE_TEXT_INPUT_EX_PROTOCOL_GUID
-/// {DD9E7534-7762-4698-8C14-F58517A625AA}
-pub const SIMPLE_TEXT_INPUT_EX_PROTOCOL_GUID: Guid = Guid::from_fields(
-    0xdd9e7534,
-    0x7762,
-    0x4698,
-    0x8c,
-    0x14,
-    &[0xf5, 0x85, 0x17, 0xa6, 0x25, 0xaa],
-);
+/// Simple Text Input Ex Protocol GUID supplied by `r-efi`.
+pub const SIMPLE_TEXT_INPUT_EX_PROTOCOL_GUID: r_efi::efi::Guid =
+    simple_text_input_ex::PROTOCOL_GUID;
 
 // ============================================================================
 // Protocol Structures (matching UEFI spec)
 // ============================================================================
 
-/// EFI_KEY_STATE - describes the shift/toggle state of the keyboard
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default)]
-pub struct KeyState {
-    /// Shift key state (EFI_SHIFT_STATE_VALID | modifier bits)
-    pub key_shift_state: u32,
-    /// Toggle key state (EFI_TOGGLE_STATE_VALID | toggle bits)
-    pub key_toggle_state: u8,
-}
-
-/// EFI_KEY_DATA - a key press with associated state
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default)]
-pub struct KeyData {
-    /// The EFI scan code and Unicode value
-    pub key: InputKey,
-    /// Shift and toggle state at time of key press
-    pub key_state: KeyState,
-}
-
-// Compile-time layout assertions matching UEFI spec sizes:
-// EFI_KEY_STATE: UINT32 + UINT8 = 5 bytes + 3 padding = 8 bytes (repr(C))
-// EFI_KEY_DATA: EFI_INPUT_KEY (4 bytes) + EFI_KEY_STATE (8 bytes) = 12 bytes
-const _: () = assert!(core::mem::size_of::<KeyState>() == 8);
-const _: () = assert!(core::mem::size_of::<KeyData>() == 12);
-
-/// Key notification callback function type
-pub type KeyNotifyFunction = extern "efiapi" fn(key_data: *mut KeyData) -> Status;
-
-/// EFI_SIMPLE_TEXT_INPUT_EX_PROTOCOL
-#[repr(C)]
-pub struct SimpleTextInputExProtocol {
-    pub reset: extern "efiapi" fn(
-        this: *mut SimpleTextInputExProtocol,
-        extended_verification: Boolean,
-    ) -> Status,
-    pub read_key_stroke_ex:
-        extern "efiapi" fn(this: *mut SimpleTextInputExProtocol, key_data: *mut KeyData) -> Status,
-    pub wait_for_key_ex: Event,
-    pub set_state: extern "efiapi" fn(
-        this: *mut SimpleTextInputExProtocol,
-        key_toggle_state: *mut u8,
-    ) -> Status,
-    pub register_key_notify: extern "efiapi" fn(
-        this: *mut SimpleTextInputExProtocol,
-        key_data: *mut KeyData,
-        key_notification_function: KeyNotifyFunction,
-        notify_handle: *mut Handle,
-    ) -> Status,
-    pub unregister_key_notify: extern "efiapi" fn(
-        this: *mut SimpleTextInputExProtocol,
-        notification_handle: Handle,
-    ) -> Status,
-}
+/// Key state ABI supplied by `r-efi`.
+pub type KeyState = simple_text_input_ex::KeyState;
+/// Key data ABI supplied by `r-efi`.
+pub type KeyData = simple_text_input_ex::KeyData;
+/// Key notification callback ABI supplied by `r-efi`.
+pub type KeyNotifyFunction = simple_text_input_ex::KeyNotifyFunction;
+/// Simple Text Input Ex protocol ABI supplied by `r-efi`.
+pub type SimpleTextInputExProtocol = simple_text_input_ex::Protocol;
 
 // ============================================================================
 // Key Notification Registry
