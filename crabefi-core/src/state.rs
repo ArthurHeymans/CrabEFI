@@ -18,99 +18,11 @@
 //!   else borrows, so logging inside a `with_*_mut` closure never conflicts.
 
 use alloc::vec::Vec;
-use core::cell::{Cell, Ref, RefCell, RefMut};
+use core::cell::Ref;
+
+use crate::cell::{Local, LocalCell};
 
 use crate::fs::fat::FatType;
-
-// ============================================================================
-// Cells
-// ============================================================================
-
-/// Interior-mutable cell for single-hart firmware.
-///
-/// A `RefCell` that is `Sync` so it can live in a `static`.
-pub struct Local<T>(RefCell<T>);
-
-// SAFETY: CrabEFI runs on one hart and never accesses firmware state from
-// interrupt context, so the `RefCell` borrow counters can never be raced.
-unsafe impl<T> Sync for Local<T> {}
-
-impl<T> Local<T> {
-    /// Wrap a value.
-    pub const fn new(value: T) -> Self {
-        Self(RefCell::new(value))
-    }
-
-    /// Borrow the value immutably. Panics if it is mutably borrowed.
-    #[inline]
-    #[track_caller]
-    pub fn borrow(&self) -> Ref<'_, T> {
-        self.0.borrow()
-    }
-
-    /// Borrow the value mutably. Panics if it is already borrowed.
-    #[inline]
-    #[track_caller]
-    pub fn borrow_mut(&self) -> RefMut<'_, T> {
-        self.0.borrow_mut()
-    }
-
-    /// Borrow the value mutably, or `None` if it is already borrowed.
-    #[inline]
-    pub fn try_borrow_mut(&self) -> Option<RefMut<'_, T>> {
-        self.0.try_borrow_mut().ok()
-    }
-
-    /// Run `f` on a mutable borrow that ends when `f` returns.
-    #[inline]
-    #[track_caller]
-    pub fn with_mut<R>(&self, f: impl FnOnce(&mut T) -> R) -> R {
-        f(&mut self.borrow_mut())
-    }
-}
-
-/// Interior-mutable cell for `Copy` values in single-hart firmware.
-///
-/// A `Cell` that is `Sync` so it can live in a `static`. Reads and writes copy
-/// the value, so this can never conflict with any other access.
-pub struct LocalCell<T>(Cell<T>);
-
-// SAFETY: See `Local`.
-unsafe impl<T> Sync for LocalCell<T> {}
-
-impl<T: Copy> LocalCell<T> {
-    /// Wrap a value.
-    pub const fn new(value: T) -> Self {
-        Self(Cell::new(value))
-    }
-
-    /// Copy the value out.
-    #[inline]
-    pub fn get(&self) -> T {
-        self.0.get()
-    }
-
-    /// Replace the value.
-    #[inline]
-    pub fn set(&self, value: T) {
-        self.0.set(value)
-    }
-
-    /// Modify the value in place through a copy.
-    #[inline]
-    pub fn update(&self, f: impl FnOnce(&mut T)) {
-        let mut value = self.get();
-        f(&mut value);
-        self.set(value);
-    }
-
-    /// Raw pointer to the value, for protocol structures that expose a
-    /// firmware-owned mode block to EFI applications.
-    #[inline]
-    pub fn as_ptr(&self) -> *mut T {
-        self.0.as_ptr()
-    }
-}
 
 // ============================================================================
 // Subsystem statics

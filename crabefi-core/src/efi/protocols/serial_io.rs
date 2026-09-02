@@ -81,23 +81,22 @@ pub struct SerialIoMode {
 
 /// Current port settings. `Protocol.mode` points at this cell; EFI callers
 /// read and write it through that pointer only.
-static IO_MODE: crate::state::LocalCell<SerialIoMode> =
-    crate::state::LocalCell::new(SerialIoMode {
-        control_mask: EFI_SERIAL_CLEAR_TO_SEND
-            | EFI_SERIAL_DATA_SET_READY
-            | EFI_SERIAL_RING_INDICATE
-            | EFI_SERIAL_CARRIER_DETECT
-            | EFI_SERIAL_INPUT_BUFFER_EMPTY
-            | EFI_SERIAL_OUTPUT_BUFFER_EMPTY
-            | EFI_SERIAL_REQUEST_TO_SEND
-            | EFI_SERIAL_DATA_TERMINAL_READY,
-        timeout: 1000000,
-        baud_rate: 115200,
-        receive_fifo_depth: 16,
-        data_bits: 8,
-        parity: 1,    // NoParity
-        stop_bits: 1, // OneStopBit
-    });
+static IO_MODE: crate::cell::LocalCell<SerialIoMode> = crate::cell::LocalCell::new(SerialIoMode {
+    control_mask: EFI_SERIAL_CLEAR_TO_SEND
+        | EFI_SERIAL_DATA_SET_READY
+        | EFI_SERIAL_RING_INDICATE
+        | EFI_SERIAL_CARRIER_DETECT
+        | EFI_SERIAL_INPUT_BUFFER_EMPTY
+        | EFI_SERIAL_OUTPUT_BUFFER_EMPTY
+        | EFI_SERIAL_REQUEST_TO_SEND
+        | EFI_SERIAL_DATA_TERMINAL_READY,
+    timeout: 1000000,
+    baud_rate: 115200,
+    receive_fifo_depth: 16,
+    data_bits: 8,
+    parity: 1,    // NoParity
+    stop_bits: 1, // OneStopBit
+});
 
 /// EFI Serial IO Protocol structure
 #[repr(C)]

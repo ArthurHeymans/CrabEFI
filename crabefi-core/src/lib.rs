@@ -22,6 +22,7 @@ mod boot_manager;
 pub mod boot_vars;
 #[cfg(feature = "bundled-runtime-image")]
 mod bundled_runtime;
+pub mod cell;
 #[cfg(feature = "ui")]
 pub mod cursor;
 pub mod drivers;

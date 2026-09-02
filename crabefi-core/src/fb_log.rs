@@ -3,9 +3,9 @@
 //! This module provides logging output to the framebuffer. It is disabled by
 //! default as it is very slow. Enable with the `fb-log` feature flag.
 
+use crate::cell::LocalCell;
 use crate::framebuffer_console::{CHAR_HEIGHT, CHAR_WIDTH, Color, render_glyph};
 use crate::platform::FramebufferConfig;
-use crate::state::LocalCell;
 use core::fmt::Write;
 use log::Level;
 
