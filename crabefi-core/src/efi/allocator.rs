@@ -9,8 +9,8 @@
 //!
 //! # State Management
 //!
-//! The allocator lives in a `crate::state` cell.
-//! Access it via `crate::state::allocator()` or `crate::state::with_allocator_mut()`.
+//! The allocator lives in a module-private cell; the free functions below are
+//! its only public surface.
 
 use core::sync::atomic::{AtomicBool, Ordering};
 
@@ -18,7 +18,10 @@ pub use crabefi_runtime_abi::MemoryDescriptor;
 use heapless::Vec;
 use r_efi::efi;
 
-use crate::state;
+use crate::cell::Local;
+
+/// Page allocator and memory map.
+static ALLOCATOR: Local<MemoryAllocator> = Local::new(MemoryAllocator::new());
 
 // Keep these dependency-free helpers in flat files so the CI regression job
 // can compile and execute them directly with `rustc --test`.
@@ -1266,7 +1269,7 @@ impl MemoryAllocator {
 
 /// Initialize the global allocator from a platform-provided memory map.
 pub fn init_from_platform(regions: &[crate::platform::MemoryRegion]) {
-    state::with_allocator_mut(|alloc| {
+    ALLOCATOR.with_mut(|alloc| {
         alloc.init_from_platform(regions);
     });
 }
@@ -1277,7 +1280,7 @@ pub fn reserve_region(
     num_pages: u64,
     memory_type: MemoryType,
 ) -> Result<(), efi::Status> {
-    state::with_allocator_mut(|alloc| alloc.reserve_region(physical_start, num_pages, memory_type))
+    ALLOCATOR.with_mut(|alloc| alloc.reserve_region(physical_start, num_pages, memory_type))
 }
 
 /// Reserve all ConventionalMemory fragments in a range while preserving
@@ -1287,9 +1290,8 @@ pub fn reserve_region_fragments(
     num_pages: u64,
     memory_type: MemoryType,
 ) -> Result<(), efi::Status> {
-    state::with_allocator_mut(|alloc| {
-        alloc.reserve_region_fragments(physical_start, num_pages, memory_type)
-    })
+    ALLOCATOR
+        .with_mut(|alloc| alloc.reserve_region_fragments(physical_start, num_pages, memory_type))
 }
 
 /// Force-add a memory region to the map
@@ -1300,9 +1302,7 @@ pub fn force_add_region(
     num_pages: u64,
     memory_type: MemoryType,
 ) -> Result<(), efi::Status> {
-    state::with_allocator_mut(|alloc| {
-        alloc.force_add_region(physical_start, num_pages, memory_type)
-    })
+    ALLOCATOR.with_mut(|alloc| alloc.force_add_region(physical_start, num_pages, memory_type))
 }
 
 /// Carve a physical range out of its containing map entry as `memory_type`.
@@ -1320,7 +1320,7 @@ pub fn carve_out_region(
         MemoryType::ConventionalMemory,
         MemoryType::BootServicesData,
     ];
-    state::with_allocator_mut(|alloc| {
+    ALLOCATOR.with_mut(|alloc| {
         alloc.carve_out_from(physical_start, num_pages, memory_type, source_types)
     })
 }
@@ -1329,14 +1329,14 @@ pub fn carve_out_region(
 ///
 /// This properly splits existing regions and marks the specified range as AcpiReclaimMemory.
 pub fn mark_as_acpi_reclaim(addr: u64, num_pages: u64) -> Result<(), efi::Status> {
-    state::with_allocator_mut(|alloc| alloc.mark_as_acpi_reclaim(addr, num_pages))
+    ALLOCATOR.with_mut(|alloc| alloc.mark_as_acpi_reclaim(addr, num_pages))
 }
 
 /// Mark a memory region as Reserved Memory
 ///
 /// This properly splits existing regions and marks the specified range as ReservedMemoryType.
 pub fn mark_as_reserved(addr: u64, num_pages: u64) -> Result<(), efi::Status> {
-    state::with_allocator_mut(|alloc| alloc.mark_as_reserved(addr, num_pages))
+    ALLOCATOR.with_mut(|alloc| alloc.mark_as_reserved(addr, num_pages))
 }
 
 /// Allocate pages of memory
@@ -1346,9 +1346,7 @@ pub fn allocate_pages(
     num_pages: u64,
     memory: &mut u64,
 ) -> efi::Status {
-    state::with_allocator_mut(|alloc| {
-        alloc.allocate_pages(alloc_type, memory_type, num_pages, memory)
-    })
+    ALLOCATOR.with_mut(|alloc| alloc.allocate_pages(alloc_type, memory_type, num_pages, memory))
 }
 
 /// Allocate pages wholly contained in an inclusive physical-address range.
@@ -1359,7 +1357,7 @@ pub fn allocate_pages_in_range(
     max_address: u64,
     memory: &mut u64,
 ) -> efi::Status {
-    state::with_allocator_mut(|allocator| {
+    ALLOCATOR.with_mut(|allocator| {
         let Some(address) = allocator.find_free_pages(num_pages, min_address, max_address) else {
             return efi::Status::OUT_OF_RESOURCES;
         };
@@ -1375,24 +1373,24 @@ pub fn allocate_pages_in_range(
 
 /// Free previously allocated pages
 pub fn free_pages(memory: u64, num_pages: u64) -> efi::Status {
-    state::with_allocator_mut(|alloc| alloc.free_pages(memory, num_pages))
+    ALLOCATOR.with_mut(|alloc| alloc.free_pages(memory, num_pages))
 }
 
 /// Dump the full memory map to the log (for debugging).
 pub fn dump_memory_map() {
-    let alloc = state::allocator();
+    let alloc = ALLOCATOR.borrow();
     alloc.dump_entries();
 }
 
 /// Get the memory map size
 pub fn get_memory_map_size() -> usize {
-    let alloc = state::allocator();
+    let alloc = ALLOCATOR.borrow();
     alloc.entry_count() * core::mem::size_of::<MemoryDescriptor>()
 }
 
 /// Get current map key
 pub fn get_map_key() -> usize {
-    let alloc = state::allocator();
+    let alloc = ALLOCATOR.borrow();
     alloc.map_key()
 }
 
@@ -1401,7 +1399,7 @@ pub fn get_map_key() -> usize {
 /// Returns the memory type if the address is within a known memory region,
 /// or None if the address is not in any known region.
 pub fn copy_runtime_descriptors(output: &mut [MemoryDescriptor]) -> Result<usize, efi::Status> {
-    let allocator = state::allocator();
+    let allocator = ALLOCATOR.borrow();
     let runtime = allocator
         .entries
         .iter()
@@ -1419,7 +1417,7 @@ pub fn copy_runtime_descriptors(output: &mut [MemoryDescriptor]) -> Result<usize
 
 /// Find the memory type for a given physical address.
 pub fn get_memory_type_at(address: u64) -> Option<MemoryType> {
-    let alloc = state::allocator();
+    let alloc = ALLOCATOR.borrow();
     alloc
         .entries
         .iter()
@@ -1435,7 +1433,7 @@ pub fn range_has_memory_type(base: u64, size: u64, memory_type: MemoryType) -> b
     if size == 0 {
         return false;
     }
-    let allocator = state::allocator();
+    let allocator = ALLOCATOR.borrow();
     let mut covered = base;
     for descriptor in allocator.entries.iter() {
         if descriptor.end() <= covered {
@@ -1462,7 +1460,7 @@ pub fn get_memory_map(
     descriptor_size: &mut usize,
     descriptor_version: &mut u32,
 ) -> efi::Status {
-    let alloc = state::allocator();
+    let alloc = ALLOCATOR.borrow();
     alloc.get_memory_map(
         memory_map_size,
         memory_map,
@@ -1474,12 +1472,12 @@ pub fn get_memory_map(
 
 /// Validate an ExitBootServices map key without changing allocator state.
 pub fn validate_map_key(map_key: usize) -> efi::Status {
-    state::allocator().validate_map_key(map_key)
+    ALLOCATOR.borrow().validate_map_key(map_key)
 }
 
 /// Exit boot services
 pub fn exit_boot_services(map_key: usize) -> efi::Status {
-    state::with_allocator_mut(|alloc| alloc.exit_boot_services(map_key))
+    ALLOCATOR.with_mut(|alloc| alloc.exit_boot_services(map_key))
 }
 
 /// Allocate one contiguous runtime image and privately split its leading code
@@ -1491,7 +1489,7 @@ pub fn allocate_runtime_image_layout(
     if image_pages == 0 || code_pages == 0 || code_pages > image_pages {
         return Err(efi::Status::INVALID_PARAMETER);
     }
-    state::with_allocator_mut(|allocator| {
+    ALLOCATOR.with_mut(|allocator| {
         let mut base = 0;
         let status = allocator.allocate_pages(
             AllocateType::AllocateAnyPages,
@@ -1717,7 +1715,7 @@ pub fn reserve_boot_image_region() {
     ];
 
     // Reserve the CODE region (executable, no XP attribute)
-    match state::with_allocator_mut(|alloc| {
+    match ALLOCATOR.with_mut(|alloc| {
         alloc.carve_out_from(
             code_start_aligned,
             code_pages,
@@ -1740,7 +1738,7 @@ pub fn reserve_boot_image_region() {
     // Reserve the DATA region (non-executable, XP attribute set)
     // Skip if there are no pages to reserve
     if data_pages > 0 {
-        match state::with_allocator_mut(|alloc| {
+        match ALLOCATOR.with_mut(|alloc| {
             alloc.carve_out_from(
                 data_start_aligned,
                 data_pages,
