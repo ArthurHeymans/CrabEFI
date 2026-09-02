@@ -15,7 +15,8 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use crabefi_efi_types::constant_time_eq;
-use der::{Decode, Encode, referenced::OwnedToRef};
+use der::{Decode, Encode};
+use rsa::pkcs1::DecodeRsaPublicKey;
 use sha2::{Digest, Sha256};
 use x509_cert::Certificate;
 use x509_cert::ext::pkix::KeyUsage as X509KeyUsage;
@@ -309,8 +310,8 @@ fn extract_message_digest(
                 && let Some(value) = attr.values.get(0)
             {
                 let value_bytes = value.to_der().map_err(|_| AuthError::InvalidHeader)?;
-                let oct =
-                    OctetStringRef::from_der(&value_bytes).map_err(|_| AuthError::InvalidHeader)?;
+                let oct = <&OctetStringRef>::from_der(&value_bytes)
+                    .map_err(|_| AuthError::InvalidHeader)?;
                 return Ok(Some(oct.as_bytes().to_vec()));
             }
         }
@@ -331,12 +332,12 @@ fn find_signer_certificate(
             // Find cert matching issuer and serial number
             for cert_der in embedded_certs {
                 if let Ok(cert) = parse_cert(cert_der) {
-                    let tbs = &cert.tbs_certificate;
+                    let tbs = &cert.tbs_certificate();
                     // Compare issuer (DER-encoded) and serial number
-                    if let Ok(cert_issuer_der) = tbs.issuer.to_der()
+                    if let Ok(cert_issuer_der) = tbs.issuer().to_der()
                         && let Ok(signer_issuer_der) = issuer_and_serial.issuer.to_der()
                         && cert_issuer_der == signer_issuer_der
-                        && tbs.serial_number.as_bytes()
+                        && tbs.serial_number().as_bytes()
                             == issuer_and_serial.serial_number.as_bytes()
                     {
                         return Ok(Some(cert_der.clone()));
@@ -364,7 +365,7 @@ fn find_signer_certificate(
 fn extract_subject_key_identifier(cert_der: &[u8]) -> Result<Vec<u8>, AuthError> {
     let cert = Certificate::from_der(cert_der).map_err(|_| AuthError::CertificateParseError)?;
 
-    if let Some(extensions) = &cert.tbs_certificate.extensions {
+    if let Some(extensions) = &cert.tbs_certificate().extensions() {
         for ext in extensions.iter() {
             if ext.extn_id == const_oid::db::rfc5280::ID_CE_SUBJECT_KEY_IDENTIFIER {
                 return Ok(ext.extn_value.as_bytes().to_vec());
@@ -429,9 +430,9 @@ pub fn build_and_verify_chain(
     let trust_anchor = parse_cert(trust_anchor_der)?;
 
     // Quick check: is the end-entity directly the trust anchor?
-    if end_entity.tbs_certificate.subject == trust_anchor.tbs_certificate.subject
-        && end_entity.tbs_certificate.serial_number.as_bytes()
-            == trust_anchor.tbs_certificate.serial_number.as_bytes()
+    if end_entity.tbs_certificate().subject() == trust_anchor.tbs_certificate().subject()
+        && end_entity.tbs_certificate().serial_number().as_bytes()
+            == trust_anchor.tbs_certificate().serial_number().as_bytes()
     {
         // Self-signed or directly trusted - verify the chain
         if verify_single_cert(end_entity_der, trust_anchor_der, config)? {
@@ -442,7 +443,7 @@ pub fn build_and_verify_chain(
     }
 
     // Quick check: is the end-entity directly issued by the trust anchor?
-    if end_entity.tbs_certificate.issuer == trust_anchor.tbs_certificate.subject
+    if end_entity.tbs_certificate().issuer() == trust_anchor.tbs_certificate().subject()
         && verify_single_cert(end_entity_der, trust_anchor_der, config)?
     {
         return Ok(CertificateChain {
@@ -456,8 +457,8 @@ pub fn build_and_verify_chain(
     // Use recursive chain building with cycle detection (DER-encoded subjects)
     let mut visited: Vec<Vec<u8>> = vec![
         end_entity
-            .tbs_certificate
-            .subject
+            .tbs_certificate()
+            .subject()
             .to_der()
             .map_err(|_| AuthError::CertificateParseError)?,
     ];
@@ -513,7 +514,7 @@ fn build_chain_recursive(
     }
 
     // Check if current cert is issued by trust anchor
-    if current_cert.tbs_certificate.issuer == trust_anchor.tbs_certificate.subject {
+    if current_cert.tbs_certificate().issuer() == trust_anchor.tbs_certificate().subject() {
         // Verify this link
         if verify_chain_link(current_cert_der, trust_anchor_der, config)? {
             chain.push(trust_anchor_der.to_vec());
@@ -525,14 +526,14 @@ fn build_chain_recursive(
     for intermediate_der in intermediates {
         if let Ok(intermediate) = parse_cert(intermediate_der) {
             // Check if this intermediate issued the current certificate
-            if current_cert.tbs_certificate.issuer != intermediate.tbs_certificate.subject {
+            if current_cert.tbs_certificate().issuer() != intermediate.tbs_certificate().subject() {
                 continue;
             }
 
             // Check for cycles (prevent infinite loops) using DER-encoded subjects
             let intermediate_subject_der = intermediate
-                .tbs_certificate
-                .subject
+                .tbs_certificate()
+                .subject()
                 .to_der()
                 .map_err(|_| AuthError::CertificateParseError)?;
             if visited.contains(&intermediate_subject_der) {
@@ -548,8 +549,8 @@ fn build_chain_recursive(
             // Check revocation status of intermediate if enabled
             if config.check_revocation {
                 // Find the issuer of this intermediate for revocation checking
-                let issuer_der = if intermediate.tbs_certificate.issuer
-                    == trust_anchor.tbs_certificate.subject
+                let issuer_der = if intermediate.tbs_certificate().issuer()
+                    == trust_anchor.tbs_certificate().subject()
                 {
                     Some(trust_anchor_der)
                 } else {
@@ -558,7 +559,8 @@ fn build_chain_recursive(
                         .find(|c| {
                             parse_cert(c)
                                 .map(|p| {
-                                    p.tbs_certificate.subject == intermediate.tbs_certificate.issuer
+                                    p.tbs_certificate().subject()
+                                        == intermediate.tbs_certificate().issuer()
                                 })
                                 .unwrap_or(false)
                         })
@@ -633,7 +635,7 @@ fn verify_chain_link(
     let issuer = parse_cert(issuer_der)?;
 
     // Check issuer/subject match
-    if cert.tbs_certificate.issuer != issuer.tbs_certificate.subject {
+    if cert.tbs_certificate().issuer() != issuer.tbs_certificate().subject() {
         return Ok(false);
     }
 
@@ -661,7 +663,7 @@ fn verify_chain_link(
     }
 
     // Verify the signature
-    let cert_signature = cert.signature.raw_bytes();
+    let cert_signature = cert.signature().raw_bytes();
     let tbs_bytes = match extract_tbs_bytes(cert_der) {
         Ok(bytes) => bytes,
         Err(e) => {
@@ -701,11 +703,11 @@ fn verify_single_cert(
     let cert = parse_cert(cert_der)?;
     let trust_anchor = parse_cert(trust_anchor_der)?;
 
-    let tbs = &cert.tbs_certificate;
+    let tbs = &cert.tbs_certificate();
     // For self-signed certs, verify signature against self
-    let issuer_der = if tbs.issuer == tbs.subject {
+    let issuer_der = if tbs.issuer() == tbs.subject() {
         cert_der
-    } else if tbs.issuer == trust_anchor.tbs_certificate.subject {
+    } else if tbs.issuer() == trust_anchor.tbs_certificate().subject() {
         trust_anchor_der
     } else {
         return Ok(false);
@@ -819,7 +821,7 @@ pub fn verify_certificate_chain(
 /// This prevents use of expired or not-yet-valid certificates.
 fn validate_certificate_time(cert_der: &[u8]) -> Result<(), AuthError> {
     let cert = parse_cert(cert_der)?;
-    let validity = &cert.tbs_certificate.validity;
+    let validity = &cert.tbs_certificate().validity();
 
     // Get current time from the system
     // Note: In a real implementation, this should come from a trusted time source
@@ -953,7 +955,7 @@ pub fn validate_key_usage_for_code_signing(cert_der: &[u8]) -> Result<(), AuthEr
 fn extract_basic_constraints(cert_der: &[u8]) -> Result<Option<X509BasicConstraints>, AuthError> {
     let cert = Certificate::from_der(cert_der).map_err(|_| AuthError::CertificateParseError)?;
 
-    if let Some(extensions) = &cert.tbs_certificate.extensions {
+    if let Some(extensions) = &cert.tbs_certificate().extensions() {
         for ext in extensions.iter() {
             if ext.extn_id == const_oid::db::rfc5280::ID_CE_BASIC_CONSTRAINTS {
                 let bc = X509BasicConstraints::from_der(ext.extn_value.as_bytes())
@@ -970,7 +972,7 @@ fn extract_basic_constraints(cert_der: &[u8]) -> Result<Option<X509BasicConstrai
 fn extract_key_usage(cert_der: &[u8]) -> Result<Option<X509KeyUsage>, AuthError> {
     let cert = Certificate::from_der(cert_der).map_err(|_| AuthError::CertificateParseError)?;
 
-    if let Some(extensions) = &cert.tbs_certificate.extensions {
+    if let Some(extensions) = &cert.tbs_certificate().extensions() {
         for ext in extensions.iter() {
             if ext.extn_id == const_oid::db::rfc5280::ID_CE_KEY_USAGE {
                 let ku = X509KeyUsage::from_der(ext.extn_value.as_bytes())
@@ -1022,7 +1024,7 @@ fn extract_tbs_bytes(cert_der: &[u8]) -> Result<&[u8], AuthError> {
 
     // Skip the outer Certificate SEQUENCE header
     let outer = Header::decode(&mut reader).map_err(|_| AuthError::CertificateParseError)?;
-    if outer.tag != Tag::Sequence {
+    if outer.tag() != Tag::Sequence {
         return Err(AuthError::CertificateParseError);
     }
 
@@ -1046,8 +1048,12 @@ fn parse_cert(cert_der: &[u8]) -> Result<Certificate, AuthError> {
 
 /// Extract the RSA public key from a parsed certificate's SPKI
 fn extract_rsa_key(cert: &Certificate) -> Result<rsa::RsaPublicKey, AuthError> {
-    let spki_ref = cert.tbs_certificate.subject_public_key_info.owned_to_ref();
-    rsa::RsaPublicKey::try_from(spki_ref).map_err(|e| {
+    let public_key_der = cert
+        .tbs_certificate()
+        .subject_public_key_info()
+        .subject_public_key
+        .raw_bytes();
+    rsa::RsaPublicKey::from_pkcs1_der(public_key_der).map_err(|e| {
         log::debug!("Failed to extract RSA public key from SPKI: {:?}", e);
         AuthError::CertificateParseError
     })

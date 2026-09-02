@@ -486,7 +486,7 @@ fn extract_spc_authenticode_hash(pkcs7_data: &[u8]) -> Result<Option<Vec<u8>>, A
                 // Skip AlgorithmIdentifier
                 let _ = digest_seq.tlv_bytes()?;
                 // Read digest OCTET STRING
-                let digest: OctetStringRef = digest_seq.decode()?;
+                let digest: &OctetStringRef = digest_seq.decode()?;
                 Ok(digest.as_bytes().to_vec())
             })
         })
