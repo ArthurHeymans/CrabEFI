@@ -15,7 +15,7 @@ use super::system_table;
 use crate::pe;
 use crate::state::{
     self, EventEntry, LoadedImageEntry, MAX_EVENTS, MAX_HANDLES, MAX_PROTOCOLS_PER_HANDLE,
-    ProtocolEntry,
+    OpenProtocolEntry, ProtocolEntry,
 };
 use alloc::vec::Vec;
 use core::ffi::c_void;
@@ -1798,16 +1798,42 @@ extern "efiapi" fn open_protocol(
     handle: Handle,
     protocol: *mut Guid,
     interface: *mut *mut c_void,
-    _agent_handle: Handle,
-    _controller_handle: Handle,
+    agent_handle: Handle,
+    controller_handle: Handle,
     attributes: u32,
 ) -> Status {
     if handle.is_null() || protocol.is_null() {
         return Status::INVALID_PARAMETER;
     }
 
+    const VALID_ATTRIBUTES: u32 = efi::OPEN_PROTOCOL_BY_HANDLE_PROTOCOL
+        | efi::OPEN_PROTOCOL_GET_PROTOCOL
+        | efi::OPEN_PROTOCOL_TEST_PROTOCOL
+        | efi::OPEN_PROTOCOL_BY_CHILD_CONTROLLER
+        | efi::OPEN_PROTOCOL_BY_DRIVER
+        | efi::OPEN_PROTOCOL_EXCLUSIVE;
+    let base_attributes = attributes & !efi::OPEN_PROTOCOL_EXCLUSIVE;
+    if attributes & !VALID_ATTRIBUTES != 0
+        || !matches!(
+            base_attributes,
+            efi::OPEN_PROTOCOL_BY_HANDLE_PROTOCOL
+                | efi::OPEN_PROTOCOL_GET_PROTOCOL
+                | efi::OPEN_PROTOCOL_TEST_PROTOCOL
+                | efi::OPEN_PROTOCOL_BY_CHILD_CONTROLLER
+                | efi::OPEN_PROTOCOL_BY_DRIVER
+        )
+        || ((matches!(
+            base_attributes,
+            efi::OPEN_PROTOCOL_BY_CHILD_CONTROLLER | efi::OPEN_PROTOCOL_BY_DRIVER
+        ) || attributes & efi::OPEN_PROTOCOL_EXCLUSIVE != 0)
+            && agent_handle.is_null())
+        || (base_attributes == efi::OPEN_PROTOCOL_BY_CHILD_CONTROLLER
+            && controller_handle.is_null())
+    {
+        return Status::INVALID_PARAMETER;
+    }
+
     let guid = unsafe { *protocol };
-    let guid_name = super::guid_fmt::lookup_guid_name(&guid);
     log::debug!(
         "BS.OpenProtocol(handle={:?}, protocol={}, attr={:#x})",
         handle,
@@ -1815,48 +1841,83 @@ extern "efiapi" fn open_protocol(
         attributes
     );
 
-    let efi_state = unsafe { &*state::efi_ptr() };
+    let result = state::with_efi_mut(|efi_state| {
+        let Some(handle_entry) = efi_state.handles[..efi_state.handle_count]
+            .iter()
+            .find(|entry| entry.handle == handle)
+        else {
+            return Err(Status::INVALID_PARAMETER);
+        };
+        let Some(protocol_entry) = handle_entry.protocols[..handle_entry.protocol_count]
+            .iter()
+            .find(|entry| entry.guid == guid)
+        else {
+            return Err(Status::UNSUPPORTED);
+        };
+        let protocol_interface = protocol_entry.interface;
+        let exclusive = attributes & efi::OPEN_PROTOCOL_EXCLUSIVE != 0;
 
-    // Find the handle entry
-    let handle_entry = efi_state.handles[..efi_state.handle_count]
-        .iter()
-        .find(|entry| entry.handle == handle);
+        if !exclusive
+            && matches!(
+                base_attributes,
+                efi::OPEN_PROTOCOL_BY_HANDLE_PROTOCOL
+                    | efi::OPEN_PROTOCOL_GET_PROTOCOL
+                    | efi::OPEN_PROTOCOL_TEST_PROTOCOL
+            )
+        {
+            return Ok(protocol_interface);
+        }
 
-    let Some(entry) = handle_entry else {
-        log::warn!("  -> INVALID_PARAMETER (handle not found)");
-        return Status::INVALID_PARAMETER;
+        if efi_state.open_protocols.iter().any(|open| {
+            open.handle == handle
+                && open.protocol == guid
+                && ((open.attributes & efi::OPEN_PROTOCOL_EXCLUSIVE != 0) || exclusive)
+                && (open.agent_handle != agent_handle
+                    || open.controller_handle != controller_handle)
+        }) {
+            return Err(Status::ACCESS_DENIED);
+        }
+
+        if let Some(open) = efi_state.open_protocols.iter_mut().find(|open| {
+            open.handle == handle
+                && open.protocol == guid
+                && open.agent_handle == agent_handle
+                && open.controller_handle == controller_handle
+                && open.attributes == attributes
+        }) {
+            open.open_count = open.open_count.saturating_add(1);
+        } else {
+            if efi_state.open_protocols.try_reserve(1).is_err() {
+                return Err(Status::OUT_OF_RESOURCES);
+            }
+            efi_state.open_protocols.push(OpenProtocolEntry {
+                handle,
+                protocol: guid,
+                agent_handle,
+                controller_handle,
+                attributes,
+                open_count: 1,
+            });
+        }
+
+        Ok(protocol_interface)
+    });
+
+    let iface = match result {
+        Ok(iface) => iface,
+        Err(status) => return status,
     };
-
-    // Find the protocol on this handle
-    let proto = entry.protocols[..entry.protocol_count]
-        .iter()
-        .find(|p| p.guid == guid);
-
-    let Some(proto) = proto else {
-        log::warn!("  -> UNSUPPORTED (protocol not on handle)");
-        return Status::UNSUPPORTED;
-    };
-
-    let iface = proto.interface;
     if !interface.is_null() {
         unsafe { *interface = iface };
     }
-    log::trace!("  -> SUCCESS (interface={:?})", iface);
 
-    // For LOADED_IMAGE, log important fields
-    if guid_name == "LOADED_IMAGE" && !iface.is_null() {
+    if guid == LOADED_IMAGE_PROTOCOL_GUID && !iface.is_null() {
         let lip = iface as *const r_efi::protocols::loaded_image::Protocol;
-        let dev_handle = unsafe { (*lip).device_handle };
-        let sys_table = unsafe { (*lip).system_table };
-        log::trace!("  -> LOADED_IMAGE.DeviceHandle = {:?}", dev_handle);
-        log::trace!("  -> LOADED_IMAGE.SystemTable = {:?}", sys_table);
-        // Check if SystemTable looks valid
-        if !sys_table.is_null() {
-            let bs = unsafe { (*sys_table).boot_services };
-            log::trace!("  -> LOADED_IMAGE.SystemTable->BootServices = {:?}", bs);
-        } else {
-            log::error!("  -> LOADED_IMAGE.SystemTable is NULL!");
-        }
+        log::trace!(
+            "  -> LOADED_IMAGE(DeviceHandle={:?}, SystemTable={:?})",
+            unsafe { (*lip).device_handle },
+            unsafe { (*lip).system_table }
+        );
     }
 
     Status::SUCCESS
@@ -1865,47 +1926,31 @@ extern "efiapi" fn open_protocol(
 extern "efiapi" fn close_protocol(
     handle: Handle,
     protocol: *mut Guid,
-    _agent_handle: Handle,
-    _controller_handle: Handle,
+    agent_handle: Handle,
+    controller_handle: Handle,
 ) -> Status {
-    let guid = if protocol.is_null() {
-        log::debug!("BS.CloseProtocol: protocol is NULL");
-        return Status::INVALID_PARAMETER;
-    } else {
-        unsafe { *protocol }
-    };
-
-    log::debug!(
-        "BS.CloseProtocol(handle={:?}, protocol={})",
-        handle,
-        GuidFmt(guid)
-    );
-
-    if handle.is_null() {
-        log::debug!("  -> INVALID_PARAMETER (handle is NULL)");
+    if handle.is_null() || protocol.is_null() || agent_handle.is_null() {
         return Status::INVALID_PARAMETER;
     }
+    let guid = unsafe { *protocol };
 
-    // Verify the handle exists and has this protocol
-    let efi_state = unsafe { &*state::efi_ptr() };
-    let handle_exists = efi_state.handles[..efi_state.handle_count]
-        .iter()
-        .any(|entry| {
-            entry.handle == handle
-                && entry.protocols[..entry.protocol_count]
-                    .iter()
-                    .any(|p| p.guid == guid)
-        });
+    state::with_efi_mut(|efi_state| {
+        let Some(index) = efi_state.open_protocols.iter().position(|open| {
+            open.handle == handle
+                && open.protocol == guid
+                && open.agent_handle == agent_handle
+                && open.controller_handle == controller_handle
+        }) else {
+            return Status::NOT_FOUND;
+        };
 
-    if !handle_exists {
-        log::debug!("  -> NOT_FOUND");
-        return Status::NOT_FOUND;
-    }
-
-    // In our simple implementation, we don't track open protocol usage,
-    // so close is effectively a no-op but we return SUCCESS
-    log::debug!("  -> SUCCESS");
-    Status::SUCCESS
+        if efi_state.open_protocols[index].open_count > 1 {
+            efi_state.open_protocols[index].open_count -= 1;
+        } else {
+            efi_state.open_protocols.remove(index);
+        }
+        Status::SUCCESS
+    })
 }
 
 extern "efiapi" fn open_protocol_information(
@@ -1920,13 +1965,62 @@ extern "efiapi" fn open_protocol_information(
         return Status::INVALID_PARAMETER;
     }
 
-    // We don't track protocol open/close agents in our simple implementation.
-    // Return an empty list -- this is valid per UEFI spec (zero agents have opened it).
-    unsafe {
-        *entry_buffer = core::ptr::null_mut();
-        *entry_count = 0;
+    let guid = unsafe { *protocol };
+    let record_count = state::with_efi_mut(|efi_state| {
+        let protocol_exists = efi_state.handles[..efi_state.handle_count]
+            .iter()
+            .any(|entry| {
+                entry.handle == handle
+                    && entry.protocols[..entry.protocol_count]
+                        .iter()
+                        .any(|entry| entry.guid == guid)
+            });
+        protocol_exists.then(|| {
+            efi_state
+                .open_protocols
+                .iter()
+                .filter(|open| open.handle == handle && open.protocol == guid)
+                .count()
+        })
+    });
+    let Some(record_count) = record_count else {
+        return Status::NOT_FOUND;
+    };
+
+    if record_count == 0 {
+        unsafe {
+            *entry_buffer = core::ptr::null_mut();
+            *entry_count = 0;
+        }
+        return Status::SUCCESS;
     }
 
+    let size = record_count * core::mem::size_of::<efi::OpenProtocolInformationEntry>();
+    let buffer = match allocator::allocate_pool(MemoryType::BootServicesData, size) {
+        Ok(buffer) => buffer as *mut efi::OpenProtocolInformationEntry,
+        Err(status) => return status,
+    };
+    state::with_efi_mut(|efi_state| {
+        for (index, open) in efi_state
+            .open_protocols
+            .iter()
+            .filter(|open| open.handle == handle && open.protocol == guid)
+            .enumerate()
+        {
+            unsafe {
+                buffer.add(index).write(efi::OpenProtocolInformationEntry {
+                    agent_handle: open.agent_handle,
+                    controller_handle: open.controller_handle,
+                    attributes: open.attributes,
+                    open_count: open.open_count,
+                });
+            }
+        }
+    });
+    unsafe {
+        *entry_buffer = buffer;
+        *entry_count = record_count;
+    }
     Status::SUCCESS
 }
 
@@ -2327,6 +2421,14 @@ fn reclaim_empty_handle(handle: Handle) {
 /// Remove one protocol interface and reclaim an empty handle slot.
 fn remove_protocol(handle: Handle, guid: &Guid, interface: Option<*mut c_void>) -> Status {
     state::with_efi_mut(|efi_state| {
+        if efi_state
+            .open_protocols
+            .iter()
+            .any(|open| open.handle == handle && open.protocol == *guid)
+        {
+            return Status::ACCESS_DENIED;
+        }
+
         let Some(handle_index) = efi_state.handles[..efi_state.handle_count]
             .iter()
             .position(|entry| entry.handle == handle)
