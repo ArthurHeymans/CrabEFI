@@ -199,8 +199,22 @@ fn status_result(status: usize) -> Result<(), Status> {
     }
 }
 
+/// Validated boot-side client for the separately allocated runtime image.
+static CLIENT: crate::cell::LocalCell<Option<RuntimeImageClient>> =
+    crate::cell::LocalCell::new(None);
+
+/// The runtime image client, once the runtime image has been loaded.
+pub fn installed() -> Option<RuntimeImageClient> {
+    CLIENT.get()
+}
+
+/// Publish the runtime image client.
+pub fn install(client: RuntimeImageClient) {
+    CLIENT.set(Some(client));
+}
+
 fn client() -> Option<RuntimeImageClient> {
-    crate::state::runtime_image()
+    installed()
 }
 
 pub fn get_system_table() -> *mut efi::SystemTable {

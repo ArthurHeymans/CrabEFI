@@ -36,7 +36,6 @@ use crate::drivers::spi::{self, SpiController};
 use crate::platform::{
     FirmwareStorage, FirmwareStorageLocation, FirmwareStorageRegion, VariableStoreLocator,
 };
-use crate::state;
 
 use super::VarStoreError;
 use super::edk2;
@@ -454,7 +453,7 @@ fn load_variables_from_storage() -> Result<(), VarStoreError> {
         active_vars.push(var);
     }
 
-    let client = state::runtime_image().ok_or(VarStoreError::NotInitialized)?;
+    let client = crate::efi::runtime_image::installed().ok_or(VarStoreError::NotInitialized)?;
     for variable in &active_vars {
         let name_len = variable
             .name
@@ -908,7 +907,7 @@ pub(crate) fn persist_firmware_variable(
         None,
     )?;
 
-    let client = state::runtime_image().ok_or(VarStoreError::NotInitialized)?;
+    let client = crate::efi::runtime_image::installed().ok_or(VarStoreError::NotInitialized)?;
     client
         .import_variable(&crabefi_runtime_abi::VariableImport {
             name_address: terminated_name.as_ptr() as u64,

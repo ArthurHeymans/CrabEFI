@@ -26,7 +26,7 @@ pub const LAST_ATTEMPT_STATUS_ERROR_AUTH_ERROR: u32 = 5;
 
 /// Copy value-only firmware metadata into runtime-image ESRT storage.
 pub fn install_esrt(firmware: &FirmwareInfo, capsule_delivery_usable: bool) {
-    let Some(client) = crate::state::runtime_image() else {
+    let Some(client) = crate::efi::runtime_image::installed() else {
         log::error!("Cannot install ESRT before runtime image activation");
         return;
     };

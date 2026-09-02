@@ -16,7 +16,6 @@ use spin::Mutex;
 use zerocopy::{FromBytes, Immutable, KnownLayout, Unaligned};
 
 use crate::efi::tcg::types::{CryptoAgileEvent, TaggedDigest, TcgError};
-use crate::state;
 
 /// ACPI 2.0 RSDP GUID.
 pub const ACPI_20_TABLE_GUID: Guid = Guid::from_fields(
@@ -143,7 +142,7 @@ pub(crate) fn set_std_err(handle: Handle, protocol: *mut SimpleTextOutputProtoco
 }
 
 fn set_console(kind: u32, handle: Handle, protocol: *mut c_void) {
-    let status = state::runtime_image()
+    let status = crate::efi::runtime_image::installed()
         .ok_or(efi::Status::NOT_READY)
         .and_then(|client| {
             client.set_console(&ConsoleRegistration {
@@ -165,7 +164,7 @@ fn set_console(kind: u32, handle: Handle, protocol: *mut c_void) {
 /// tables before EBS. Their payload storage remains at its physical address;
 /// only image-owned runtime tables are converted during SVAM.
 pub fn install_configuration_table(guid: &Guid, table: *mut c_void) -> efi::Status {
-    let Some(client) = state::runtime_image() else {
+    let Some(client) = crate::efi::runtime_image::installed() else {
         return efi::Status::NOT_READY;
     };
     let mut guid_bytes = [0u8; 16];
@@ -903,7 +902,7 @@ pub fn rebuild_memory_attributes_table_in_place() -> efi::Status {
             return status;
         }
     };
-    let Some(client) = state::runtime_image() else {
+    let Some(client) = crate::efi::runtime_image::installed() else {
         return efi::Status::NOT_READY;
     };
     match client.prepare_ebs(&descriptors[..count]) {

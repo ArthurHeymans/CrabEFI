@@ -795,7 +795,7 @@ impl EhciController {
         let slot = self
             .devices
             .iter()
-            .position(|d| d.is_none())
+            .position(|h| h.is_none())
             .ok_or(UsbError::NoFreeSlots)?;
 
         // Use the shared enumeration helper. Some USB flash drives need an
@@ -858,7 +858,7 @@ impl EhciController {
         let slot = self
             .devices
             .iter()
-            .position(|d| d.is_none())
+            .position(|h| h.is_none())
             .ok_or(UsbError::NoFreeSlots)?;
 
         // Use the shared enumeration helper
@@ -1096,7 +1096,7 @@ impl EhciController {
         data: Option<&mut [u8]>,
     ) -> Result<usize, UsbError> {
         let is_in = (request_type & 0x80) != 0;
-        let data_len = data.as_ref().map(|d| d.len()).unwrap_or(0);
+        let data_len = data.as_ref().map(|h| h.len()).unwrap_or(0);
         if data_len > Self::DMA_BUFFER_SIZE - 64
             || data_len > u16::MAX as usize
             || data_len > Qtd::max_transfer_len(self.dma_buffer + 64)
@@ -1645,7 +1645,7 @@ impl EhciController {
     fn get_device_mut(&mut self, address: u8) -> Option<&mut UsbDevice> {
         self.devices
             .iter_mut()
-            .find_map(|d| d.as_mut().filter(|d| d.address == address))
+            .find_map(|h| h.as_mut().filter(|h| h.address == address))
     }
 
     /// Get PCI address

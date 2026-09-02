@@ -250,7 +250,7 @@ impl PcrBanks {
         for bank in self.banks[..self.count].iter_mut() {
             let digest = digests
                 .iter()
-                .find(|d| d.algorithm == bank.algorithm())
+                .find(|h| h.algorithm == bank.algorithm())
                 .ok_or(TcgError::UnsupportedAlgorithm)?;
             bank.extend(index, digest.as_slice())?;
         }

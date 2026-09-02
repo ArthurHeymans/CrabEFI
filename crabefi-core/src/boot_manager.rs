@@ -624,7 +624,6 @@ fn boot_linux_entry(
     cmdline: &heapless::String<512>,
 ) {
     use crate::fs;
-    use crate::state;
 
     // Defense in depth: Direct Linux boot entries should not appear in the menu
     // when Secure Boot is active (filtered in scan_partition_for_entries), but
@@ -672,17 +671,17 @@ fn boot_linux_entry(
 
     // Get memory regions and ACPI RSDP from state
     let (memory_regions, acpi_rsdp) = {
-        let drivers = state::drivers();
+        let handoff = crate::handoff::get();
         // Copy memory regions to a local buffer (we can't borrow across the disk operations)
         let mut regions = heapless::Vec::<crate::platform::MemoryRegion, 64>::new();
-        for region in drivers.platform.memory_regions.iter() {
+        for region in handoff.memory_regions.iter() {
             let _ = regions.push(*region);
         }
-        (regions, drivers.platform.acpi_rsdp)
+        (regions, handoff.acpi_rsdp)
     };
 
     // Get framebuffer info for Linux console
-    let framebuffer = crate::state::get_framebuffer();
+    let framebuffer = crate::handoff::framebuffer();
 
     if memory_regions.is_empty() {
         log::error!("No memory regions available for Linux boot");

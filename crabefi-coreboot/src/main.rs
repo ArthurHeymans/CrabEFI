@@ -48,7 +48,7 @@ use core::panic::PanicInfo;
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 // ============================================================================
-// Memory map size limit (matches state::MAX_MEMORY_REGIONS + MMIO headroom)
+// Memory map size limit (matches crabefi::handoff::MAX_MEMORY_REGIONS + MMIO headroom)
 // ============================================================================
 
 /// Maximum number of platform memory regions we can pass to init_platform().
@@ -821,7 +821,7 @@ pub extern "C" fn rust_main(coreboot_table_ptr: u64) -> ! {
     });
 
     if let Some(fb) = cb_info.framebuffer {
-        crabefi::state::store_framebuffer(crabefi::FramebufferConfig::from(fb));
+        crabefi::handoff::store_framebuffer(crabefi::FramebufferConfig::from(fb));
     }
 
     if let Some(addr) = cb_info.framebuffer_record_addr {
@@ -844,14 +844,11 @@ pub extern "C" fn rust_main(coreboot_table_ptr: u64) -> ! {
 
     // Store memory regions and ACPI RSDP (used by direct Linux boot path
     // and by ACPI discovery after heap init).
-    crabefi::state::with_drivers_mut(|drivers| {
+    crabefi::handoff::with_mut(|h| {
         for region in cb_info.memory_map.iter() {
-            let _ = drivers
-                .platform
-                .memory_regions
-                .push(convert_memory_region(region));
+            let _ = h.memory_regions.push(convert_memory_region(region));
         }
-        drivers.platform.acpi_rsdp = cb_info.acpi_rsdp;
+        h.acpi_rsdp = cb_info.acpi_rsdp;
     });
 
     // ================================================================
@@ -962,7 +959,7 @@ pub extern "C" fn rust_main(coreboot_table_ptr: u64) -> ! {
     });
 
     let mut capsule_regions =
-        [crabefi::CapsuleRegion { base: 0, size: 0 }; crabefi::state::MAX_CAPSULES];
+        [crabefi::CapsuleRegion { base: 0, size: 0 }; crabefi::handoff::MAX_CAPSULES];
     let mut capsule_count = 0;
     for capsule in cb_info.capsules.iter() {
         if capsule_count >= capsule_regions.len() {
@@ -1073,15 +1070,15 @@ pub extern "C" fn rust_main(coreboot_table_ptr: u64) -> ! {
     // ---- ACPI platform discovery ----
     //
     // The AML interpreter allocates, so this must run after heap::init().
-    // Results go into DriverState::acpi_info which init_platform() reads
+    // Results go into handoff::Handoff::acpi_info which init_platform() reads
     // for ECAM base and add_platform_mmio_regions() reads for MMIO.
     // RISC-V platforms use FDT rather than ACPI, so skip this.
     #[cfg(not(target_arch = "riscv64"))]
-    let acpi_rsdp = crabefi::state::drivers().platform.acpi_rsdp;
+    let acpi_rsdp = crabefi::handoff::get().acpi_rsdp;
     #[cfg(not(target_arch = "riscv64"))]
     if let Some(rsdp) = acpi_rsdp {
         let acpi_info = unsafe { acpi::discover_platform(rsdp) };
-        crabefi::state::with_drivers_mut(|d| d.acpi_info = acpi_info.clone());
+        crabefi::handoff::with_mut(|h| h.acpi_info = acpi_info.clone());
 
         #[cfg(target_arch = "x86_64")]
         if let Some((tpm_hid, device)) = ["MSFT0101", "PNP0C31"]
@@ -1158,7 +1155,7 @@ pub extern "C" fn rust_main(coreboot_table_ptr: u64) -> ! {
                 log::info!("ECAM region from FDT: {:?}", region);
             }
             // Store FDT info so add_platform_mmio_regions() can read it
-            crabefi::state::with_drivers_mut(|d| d.fdt_info = info);
+            crabefi::handoff::with_mut(|h| h.fdt_info = info);
         }
         // Now that fdt_info is populated, register MMIO regions from FDT
         crabefi::efi::add_platform_mmio_regions();

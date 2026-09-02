@@ -181,7 +181,7 @@ impl PlatformInfo {
 
     /// Find the first DSDT device whose `_HID` matches `hid`.
     pub fn find_device(&self, hid: &str) -> Option<&DsdtDevice> {
-        self.dsdt_devices.iter().find(|d| d.hid_str() == hid)
+        self.dsdt_devices.iter().find(|h| h.hid_str() == hid)
     }
 }
 

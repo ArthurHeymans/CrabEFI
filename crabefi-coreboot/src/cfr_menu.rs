@@ -114,12 +114,12 @@ pub fn show_cfr_menu() {
     };
 
     #[cfg(feature = "ui")]
-    if let Some(fb) = crabefi::state::get_framebuffer() {
+    if let Some(fb) = crabefi::handoff::framebuffer() {
         show_cfr_menu_graphical(cfr_info, &fb);
         return;
     }
 
-    let fb_info = crabefi::state::get_framebuffer();
+    let fb_info = crabefi::handoff::framebuffer();
     let mut fb_console = fb_info.as_ref().map(FramebufferConsole::new);
 
     let mut items = build_menu_items(cfr_info);

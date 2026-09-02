@@ -89,7 +89,7 @@ pub fn init_from_platform(config: &mut crate::platform::PlatformConfig) {
 
     let runtime_client = runtime_image::load(config.runtime_image, config.runtime)
         .unwrap_or_else(|error| panic!("mandatory runtime image failed to load: {:?}", error));
-    crate::state::set_runtime_image(runtime_client);
+    runtime_image::install(runtime_client);
 
     // The System and Runtime tables are image-owned.
     system_table::init();
@@ -116,8 +116,8 @@ pub fn init_from_platform(config: &mut crate::platform::PlatformConfig) {
 
     if let Some(fb) = config.framebuffer {
         // Store globally so menus and boot_manager can access it via
-        // state::get_framebuffer() — works for both coreboot and platform paths.
-        crate::state::store_framebuffer(fb);
+        // handoff::framebuffer() — works for both coreboot and platform paths.
+        crate::handoff::store_framebuffer(fb);
         if let Some(handle) = console_handle {
             init_graphics_output_on_handle(&fb, handle);
         }
@@ -935,7 +935,7 @@ pub fn add_platform_mmio_regions() {
     };
 
     // Try to get platform info from FDT (if available)
-    let plat = crate::state::drivers().fdt_info.clone();
+    let plat = crate::handoff::get().fdt_info.clone();
 
     // Interrupt controller — from FDT only (GIC on aarch64, PLIC on riscv64).
     // The `gicd` field is reused for PLIC on RISC-V (see fdt.rs:extract_gic).

@@ -374,11 +374,11 @@ pub fn dma_domain(address: PciAddress) -> Option<DmaDomain> {
     }
     #[cfg(not(target_arch = "x86_64"))]
     {
-        let drivers = crate::state::drivers();
-        drivers
+        let handoff = crate::handoff::get();
+        handoff
             .fdt_info
             .pci_dma_domain(address.segment())
-            .or_else(|| drivers.acpi_info.pci_dma_domain(address.segment()))
+            .or_else(|| handoff.acpi_info.pci_dma_domain(address.segment()))
     }
 }
 

@@ -1303,7 +1303,7 @@ impl XhciController {
             .ok_or(XhciError::DeviceNotFound)?;
 
         let is_in = (request_type & 0x80) != 0;
-        let data_len = data.as_ref().map(|d| d.len()).unwrap_or(0);
+        let data_len = data.as_ref().map(|h| h.len()).unwrap_or(0);
 
         // Save cycle state before enqueuing the first (deferred) TRB
         let first_trb_cycle = ring.cycle;
