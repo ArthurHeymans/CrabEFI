@@ -673,9 +673,15 @@ fn boot_linux_entry(
     let (memory_regions, acpi_rsdp) = {
         let handoff = crate::handoff::get();
         // Copy memory regions to a local buffer (we can't borrow across the disk operations)
-        let mut regions = heapless::Vec::<crate::platform::MemoryRegion, 64>::new();
+        let mut regions = heapless::Vec::<
+            crate::platform::MemoryRegion,
+            { crate::handoff::MAX_MEMORY_REGIONS },
+        >::new();
         for region in handoff.memory_regions.iter() {
-            let _ = regions.push(*region);
+            if regions.push(*region).is_err() {
+                log::warn!("Direct Linux memory map copy is full; remaining regions omitted");
+                break;
+            }
         }
         (regions, handoff.acpi_rsdp)
     };

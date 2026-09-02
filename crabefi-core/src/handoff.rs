@@ -13,8 +13,8 @@ use heapless::Vec;
 use crate::cell::{Local, LocalCell};
 use crate::platform::{CapsuleRegion, FirmwareInfo, FramebufferConfig, MemoryRegion};
 
-/// Maximum number of memory regions we can store
-pub const MAX_MEMORY_REGIONS: usize = 64;
+/// Maximum number of memory regions we can store.
+pub const MAX_MEMORY_REGIONS: usize = 96;
 
 /// Maximum number of capsule regions we can store.
 pub const MAX_CAPSULES: usize = 32;
