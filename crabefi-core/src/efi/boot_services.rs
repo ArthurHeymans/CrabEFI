@@ -14,8 +14,8 @@ use super::protocols::loaded_image::{LOADED_IMAGE_PROTOCOL_GUID, create_loaded_i
 use super::system_table;
 use crate::pe;
 use crate::state::{
-    self, EventEntry, LoadedImageEntry, MAX_EVENTS, MAX_HANDLES, MAX_PROTOCOLS_PER_HANDLE,
-    OpenProtocolEntry, ProtocolEntry,
+    self, EventEntry, LoadedImageEntry, MAX_EVENTS, MAX_PROTOCOLS_PER_HANDLE, OpenProtocolEntry,
+    ProtocolEntry,
 };
 use alloc::vec::Vec;
 use core::ffi::c_void;
@@ -910,63 +910,78 @@ extern "efiapi" fn locate_handle(
         buffer
     );
 
-    let efi_state = unsafe { &*state::efi_ptr() };
-
-    // Collect matching handles based on search type
-    let matching: heapless::Vec<Handle, MAX_HANDLES> = match search_type {
-        efi::ALL_HANDLES => efi_state.handles[..efi_state.handle_count]
-            .iter()
-            .map(|entry| entry.handle)
-            .collect(),
-        efi::BY_REGISTER_NOTIFY => {
-            log::debug!("  -> NOT_FOUND (BY_REGISTER_NOTIFY not fully supported)");
-            return Status::NOT_FOUND;
-        }
-        efi::BY_PROTOCOL => {
-            if protocol.is_null() {
-                return Status::INVALID_PARAMETER;
+    // The handle database can grow beyond its initial reservation, so collect
+    // onto the heap rather than silently truncating at MAX_HANDLES.
+    let matching = {
+        let efi_state = unsafe { &*state::efi_ptr() };
+        match search_type {
+            efi::ALL_HANDLES => match collect_handles(efi_state, |_| true) {
+                Ok(handles) => handles,
+                Err(status) => return status,
+            },
+            efi::BY_REGISTER_NOTIFY => {
+                log::debug!("  -> NOT_FOUND (BY_REGISTER_NOTIFY not supported)");
+                return Status::NOT_FOUND;
             }
-            let guid = unsafe { *protocol };
-            efi_state.handles[..efi_state.handle_count]
-                .iter()
-                .filter(|entry| {
+            efi::BY_PROTOCOL => {
+                if protocol.is_null() {
+                    return Status::INVALID_PARAMETER;
+                }
+                let guid = unsafe { *protocol };
+                match collect_handles(efi_state, |entry| {
                     entry.protocols[..entry.protocol_count]
                         .iter()
                         .any(|p| p.guid == guid)
-                })
-                .map(|entry| entry.handle)
-                .collect()
-        }
-        _ => {
-            log::debug!(
-                "  -> INVALID_PARAMETER (unknown search type {})",
-                search_type
-            );
-            return Status::INVALID_PARAMETER;
+                }) {
+                    Ok(handles) => handles,
+                    Err(status) => return status,
+                }
+            }
+            _ => {
+                log::debug!(
+                    "  -> INVALID_PARAMETER (unknown search type {})",
+                    search_type
+                );
+                return Status::INVALID_PARAMETER;
+            }
         }
     };
 
-    // Check for no matches FIRST, before buffer size checks
     if matching.is_empty() {
         log::debug!("  -> NOT_FOUND (no matching handles)");
         return Status::NOT_FOUND;
     }
 
     let required_size = matching.len() * core::mem::size_of::<Handle>();
-
     if buffer.is_null() || unsafe { *buffer_size } < required_size {
         unsafe { *buffer_size = required_size };
         log::debug!("  -> BUFFER_TOO_SMALL (need {} bytes)", required_size);
         return Status::BUFFER_TOO_SMALL;
     }
 
-    // Copy handles to buffer using slice copy
     let dest = unsafe { core::slice::from_raw_parts_mut(buffer, matching.len()) };
-    dest.copy_from_slice(&matching[..]);
+    dest.copy_from_slice(&matching);
     unsafe { *buffer_size = required_size };
 
-    log::debug!("  -> found {} handles: {:?}", matching.len(), &matching[..]);
+    log::debug!("  -> found {} handles: {:?}", matching.len(), &matching);
     Status::SUCCESS
+}
+
+fn collect_handles(
+    efi_state: &state::EfiState,
+    filter: impl Fn(&state::HandleEntry) -> bool,
+) -> Result<Vec<Handle>, Status> {
+    let mut handles = Vec::new();
+    if handles.try_reserve_exact(efi_state.handle_count).is_err() {
+        return Err(Status::OUT_OF_RESOURCES);
+    }
+    handles.extend(
+        efi_state.handles[..efi_state.handle_count]
+            .iter()
+            .filter(|entry| filter(entry))
+            .map(|entry| entry.handle),
+    );
+    Ok(handles)
 }
 
 unsafe fn device_path_node_len(dp: *mut DevicePathProtocol) -> Option<usize> {
@@ -2549,13 +2564,18 @@ use super::guid_fmt::GuidFmt;
 /// Create a new handle and register it
 pub fn create_handle() -> Option<Handle> {
     state::with_efi_mut(|efi_state| {
-        if efi_state.handle_count >= MAX_HANDLES {
+        if efi_state.handle_count == efi_state.handles.len()
+            && efi_state.handles.try_reserve(1).is_err()
+        {
             return None;
         }
 
         let handle = efi_state.next_handle as *mut c_void;
         efi_state.next_handle += 1;
 
+        if efi_state.handle_count == efi_state.handles.len() {
+            efi_state.handles.push(crate::state::HandleEntry::empty());
+        }
         let idx = efi_state.handle_count;
         efi_state.handles[idx].handle = handle;
         efi_state.handles[idx].protocol_count = 0;
