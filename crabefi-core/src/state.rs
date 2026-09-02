@@ -394,6 +394,17 @@ impl Default for VarStoreState {
     }
 }
 
+/// One tracked `OpenProtocol` relationship.
+#[derive(Clone, Copy)]
+pub struct OpenProtocolEntry {
+    pub handle: Handle,
+    pub protocol: Guid,
+    pub agent_handle: Handle,
+    pub controller_handle: Handle,
+    pub attributes: u32,
+    pub open_count: u32,
+}
+
 /// EFI subsystem state
 pub struct EfiState {
     /// Validated boot-side client for the separately allocated runtime image.
@@ -403,6 +414,8 @@ pub struct EfiState {
     pub handles: Vec<HandleEntry>,
     /// Number of active handles
     pub handle_count: usize,
+    /// Active protocol opens, grown fallibly from the firmware heap.
+    pub open_protocols: Vec<OpenProtocolEntry>,
     /// Next handle value (unique identifier)
     pub next_handle: usize,
 
@@ -432,6 +445,7 @@ impl EfiState {
             runtime_image: None,
             handles: Vec::new(),
             handle_count: 0,
+            open_protocols: Vec::new(),
             next_handle: 1,
             events: Vec::new(),
             next_event_id: 2, // Start at 2, reserve 1 for keyboard
