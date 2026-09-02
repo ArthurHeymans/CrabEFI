@@ -445,8 +445,6 @@ fn mark_acpi_tables_memory(rsdp_addr: u64) {
 
 /// Install ACPI tables from coreboot
 pub fn install_acpi_tables(rsdp: u64) {
-    use super::allocator::{MemoryType, get_memory_type_at};
-
     if rsdp == 0 {
         log::warn!("ACPI RSDP address is null, skipping ACPI table installation");
         return;
@@ -468,53 +466,11 @@ pub fn install_acpi_tables(rsdp: u64) {
         revision
     );
 
-    // Check what memory type the RSDP is in and mark ACPI regions if needed
-    let needs_marking = match get_memory_type_at(rsdp) {
-        Some(MemoryType::AcpiReclaimMemory) => {
-            log::info!("RSDP is already in AcpiReclaimMemory (correct)");
-            false
-        }
-        Some(MemoryType::AcpiMemoryNvs) => {
-            log::info!("RSDP is in AcpiMemoryNvs (acceptable)");
-            false
-        }
-        Some(MemoryType::ReservedMemoryType) => {
-            // Platform-reserved firmware table area (e.g. coreboot LB_MEM_TABLE
-            // in CBMEM). The OS preserves reserved regions as-is, so the ACPI
-            // tables need no re-typing. Re-typing only the pages holding
-            // tables would carve a small AcpiReclaim island out of the
-            // otherwise uniform firmware region; that fragments the OS
-            // resource tree and trips drivers that remap the whole area
-            // (observed on the x220 as Linux "resource sanity check"
-            // warnings when the coreboot-table driver memremaps the entire
-            // CBMEM region).
-            log::info!(
-                "RSDP at {:#x} is in platform-reserved memory - the OS preserves it, no re-typing needed",
-                rsdp
-            );
-            false
-        }
-        Some(mem_type) => {
-            log::info!(
-                "RSDP at {:#x} is in {:?} memory - will mark ACPI regions",
-                rsdp,
-                mem_type
-            );
-            true
-        }
-        None => {
-            log::info!(
-                "RSDP at {:#x} is not in any known memory region - will mark ACPI regions",
-                rsdp
-            );
-            true
-        }
-    };
-
-    // Mark all ACPI tables as AcpiReclaimMemory if needed
-    if needs_marking {
-        mark_acpi_tables_memory(rsdp);
-    }
+    // Walk the complete table chain so RAM-backed tables are re-typed even
+    // when the RSDP itself lives in platform-reserved memory. The allocator
+    // preserves tables already covered by ReservedMemoryType,
+    // AcpiReclaimMemory, or AcpiMemoryNvs descriptors.
+    mark_acpi_tables_memory(rsdp);
 
     // Install in EFI configuration table.
     //
