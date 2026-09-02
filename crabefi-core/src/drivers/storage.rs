@@ -183,8 +183,8 @@ pub fn register_device(device_type: StorageType, num_blocks: u64, block_size: u3
 
 /// Get a storage device by ID
 pub fn get_device(device_id: u32) -> Option<StorageDevice> {
-    let registry = &crate::state::drivers().storage_registry;
-    registry
+    crate::state::drivers()
+        .storage_registry
         .devices
         .iter()
         .flatten()

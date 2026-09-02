@@ -9,8 +9,8 @@
 //!
 //! # State Management
 //!
-//! The allocator state is stored in the centralized `FirmwareState` structure.
-//! Access it via `crate::state::allocator()` or `crate::state::allocator_mut()`.
+//! The allocator lives in a `crate::state` cell.
+//! Access it via `crate::state::allocator()` or `crate::state::with_allocator_mut()`.
 
 use core::sync::atomic::{AtomicBool, Ordering};
 

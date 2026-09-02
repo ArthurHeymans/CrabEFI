@@ -88,7 +88,7 @@ pub fn init_from_platform(config: &mut crate::platform::PlatformConfig) {
 
     let runtime_client = runtime_image::load(config.runtime_image, config.runtime)
         .unwrap_or_else(|error| panic!("mandatory runtime image failed to load: {:?}", error));
-    crate::state::with_efi_mut(|efi| efi.runtime_image = Some(runtime_client));
+    crate::state::set_runtime_image(runtime_client);
 
     // The System and Runtime tables are image-owned.
     system_table::init();

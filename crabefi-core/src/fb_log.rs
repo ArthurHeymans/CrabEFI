@@ -5,8 +5,14 @@
 
 use crate::framebuffer_console::{CHAR_HEIGHT, CHAR_WIDTH, Color, render_glyph};
 use crate::platform::FramebufferConfig;
+use crate::state::LocalCell;
 use core::fmt::Write;
 use log::Level;
+
+/// Framebuffer used for log output, if enabled.
+static LOGGER_FRAMEBUFFER: LocalCell<Option<FramebufferConfig>> = LocalCell::new(None);
+/// Logger cursor position (row, col).
+static LOGGER_CURSOR: LocalCell<(u32, u32)> = LocalCell::new((0, 0));
 
 /// Set the framebuffer for logging output
 ///
@@ -16,16 +22,14 @@ pub fn set_framebuffer(fb: FramebufferConfig) {
     unsafe {
         fb.clear(0, 0, 0);
     }
-    let console = unsafe { &mut (*crate::state::console_mut_ptr()) };
-    console.logger_framebuffer = Some(fb);
-    console.logger_cursor = (0, 0);
+    LOGGER_FRAMEBUFFER.set(Some(fb));
+    LOGGER_CURSOR.set((0, 0));
 }
 
 /// Log a message to the framebuffer
 pub fn log_to_framebuffer(level: Level, ts: u64, args: &core::fmt::Arguments) {
-    let fb_info = match unsafe { (*crate::state::console_mut_ptr()).logger_framebuffer } {
-        Some(fb) => fb,
-        None => return,
+    let Some(fb_info) = LOGGER_FRAMEBUFFER.get() else {
+        return;
     };
 
     // Level strings for framebuffer (no ANSI)
@@ -37,7 +41,7 @@ pub fn log_to_framebuffer(level: Level, ts: u64, args: &core::fmt::Arguments) {
         Level::Trace => ("TRACE", Color::new(192, 64, 192)), // Purple
     };
 
-    let (mut row, mut col) = unsafe { (*crate::state::console_mut_ptr()).logger_cursor };
+    let (mut row, mut col) = LOGGER_CURSOR.get();
     let cols = fb_info.width / CHAR_WIDTH;
     let rows = fb_info.height / CHAR_HEIGHT;
 
@@ -97,9 +101,7 @@ pub fn log_to_framebuffer(level: Level, ts: u64, args: &core::fmt::Arguments) {
     }
 
     // Update cursor
-    unsafe {
-        (*crate::state::console_mut_ptr()).logger_cursor = (row, col);
-    }
+    LOGGER_CURSOR.set((row, col));
 }
 
 /// Clear a line on the framebuffer

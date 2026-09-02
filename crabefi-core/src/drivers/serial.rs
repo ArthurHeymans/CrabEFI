@@ -10,6 +10,8 @@
 
 use core::fmt::{self, Write};
 
+use crate::state::Local;
+
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 use tock_registers::interfaces::{Readable, Writeable};
 
@@ -20,6 +22,21 @@ use super::serial_regs::uart16550::{self, FCR, LCR, MCR, Uart16550Regs};
 
 /// Maximum iterations to wait for TX ready (prevents infinite loop on missing hardware)
 const TX_TIMEOUT_ITERATIONS: u32 = 100_000;
+
+/// Serial port state: hardware driver and optional debug mirror.
+struct SerialState {
+    /// Active serial port driver (16550 UART, PL011, or platform-provided primary output).
+    driver: Option<AnySerial>,
+    /// Optional mirror for debug output such as a firmware memory console.
+    debug_sink: Option<PlatformSerial>,
+}
+
+/// The serial subsystem. Nothing outside this module borrows it, so writing
+/// from inside a `log!` macro can never conflict with other state borrows.
+static SERIAL: Local<SerialState> = Local::new(SerialState {
+    driver: None,
+    debug_sink: None,
+});
 
 // ============================================================================
 // 16550 UART Backend (x86 port I/O + MMIO fallback)
@@ -405,10 +422,9 @@ impl Write for Pl011Port {
 
 /// Adapter that wraps a platform-provided `DebugOutput` trait object.
 ///
-/// Stores a raw pointer because the serial subsystem is accessed via
-/// `drivers_mut_ptr()` (raw pointers) throughout CrabEFI to avoid
-/// aliasing with active `&mut FirmwareState` references in closures.
-pub(crate) struct PlatformSerial {
+/// Stores a raw pointer because the platform object is owned by the caller of
+/// `init_platform()`, which never returns.
+struct PlatformSerial {
     /// Raw pointer to the platform's debug output trait object.
     /// Valid for the entire firmware lifetime (caller guarantees this).
     inner: *mut dyn crate::platform::DebugOutput,
@@ -452,7 +468,7 @@ impl Write for PlatformSerial {
 // ============================================================================
 
 /// Runtime-selected serial port type
-pub(crate) enum AnySerial {
+enum AnySerial {
     Uart16550(SerialPort),
     #[cfg(target_arch = "aarch64")]
     Pl011(Pl011Port),
@@ -548,11 +564,7 @@ pub fn init_from_config(info: &SerialConfig) {
             let mut port = Pl011Port::new(info.baseaddr);
             if port.functional {
                 let _ = port.write_str("\r\n[CrabEFI] PL011 serial initialized\r\n");
-                // SAFETY: Single-threaded firmware; raw pointer avoids re-entrancy
-                // issues since serial is called from log macros inside other state closures.
-                unsafe {
-                    (*crate::state::drivers_mut_ptr()).serial.driver = Some(AnySerial::Pl011(port));
-                }
+                SERIAL.borrow_mut().driver = Some(AnySerial::Pl011(port));
                 return;
             }
         }
@@ -570,12 +582,7 @@ pub fn init_from_config(info: &SerialConfig) {
         };
         if serial.init_16550(info.baud, info.input_hertz) {
             let _ = serial.write_str("\r\n[CrabEFI] MMIO serial initialized\r\n");
-            // SAFETY: Single-threaded firmware; raw pointer avoids re-entrancy
-            // issues since serial is called from log macros inside other state closures.
-            unsafe {
-                (*crate::state::drivers_mut_ptr()).serial.driver =
-                    Some(AnySerial::Uart16550(serial));
-            }
+            SERIAL.borrow_mut().driver = Some(AnySerial::Uart16550(serial));
         }
     } else {
         // I/O port UART (x86 only)
@@ -589,12 +596,7 @@ pub fn init_from_config(info: &SerialConfig) {
             };
             if serial.init_16550(info.baud, info.input_hertz) {
                 let _ = serial.write_str("\r\n[CrabEFI] Serial initialized\r\n");
-                // SAFETY: Single-threaded firmware; raw pointer avoids re-entrancy
-                // issues since serial is called from log macros inside other state closures.
-                unsafe {
-                    (*crate::state::drivers_mut_ptr()).serial.driver =
-                        Some(AnySerial::Uart16550(serial));
-                }
+                SERIAL.borrow_mut().driver = Some(AnySerial::Uart16550(serial));
             }
         }
         #[cfg(not(target_arch = "x86_64"))]
@@ -615,12 +617,7 @@ pub fn init_from_config(info: &SerialConfig) {
 /// `raw` must point to a valid `DebugOutput` that lives for the entire
 /// firmware lifetime (i.e., at least until `init_platform()` returns).
 pub unsafe fn init_from_platform_raw(raw: *mut dyn crate::platform::DebugOutput) {
-    let plat = PlatformSerial::new(raw);
-    // SAFETY: Single-threaded firmware; raw pointer avoids re-entrancy
-    // issues since serial is called from log macros inside other state closures.
-    unsafe {
-        (*crate::state::drivers_mut_ptr()).serial.driver = Some(AnySerial::Platform(plat));
-    }
+    SERIAL.borrow_mut().driver = Some(AnySerial::Platform(PlatformSerial::new(raw)));
 }
 
 /// Add a platform-provided mirror for all serial/console output.
@@ -635,19 +632,17 @@ pub unsafe fn init_from_platform_raw(raw: *mut dyn crate::platform::DebugOutput)
 /// `raw` must point to a valid `DebugOutput` that lives for the entire firmware
 /// lifetime (i.e., at least until `init_platform()` returns).
 pub unsafe fn add_platform_debug_sink_raw(raw: *mut dyn crate::platform::DebugOutput) {
-    let sink = PlatformSerial::new(raw);
-    // SAFETY: Single-threaded firmware; raw pointer avoids re-entrancy
-    // issues since serial is called from log macros inside other state closures.
-    unsafe {
-        (*crate::state::drivers_mut_ptr()).serial.debug_sink = Some(sink);
-    }
+    SERIAL.borrow_mut().debug_sink = Some(PlatformSerial::new(raw));
 }
 
 /// Write a string to the serial port and optional debug mirror.
+///
+/// Output is dropped if the serial state is already borrowed, which can only
+/// happen when a driver itself panics mid-write.
 pub fn write_str(s: &str) {
-    // SAFETY: Single-threaded firmware; raw pointer avoids re-entrancy
-    // issues since serial is called from log macros inside other state closures.
-    let serial_state = unsafe { &mut (*crate::state::drivers_mut_ptr()).serial };
+    let Some(mut serial_state) = SERIAL.try_borrow_mut() else {
+        return;
+    };
     if let Some(serial) = &mut serial_state.driver {
         let _ = serial.write_str(s);
     }
@@ -663,9 +658,9 @@ pub fn write_fmt(args: fmt::Arguments) {
 
 /// Write a single byte to the serial port and optional debug mirror.
 pub fn write_byte(byte: u8) {
-    // SAFETY: Single-threaded firmware; raw pointer avoids re-entrancy
-    // issues since serial is called from log macros inside other state closures.
-    let serial_state = unsafe { &mut (*crate::state::drivers_mut_ptr()).serial };
+    let Some(mut serial_state) = SERIAL.try_borrow_mut() else {
+        return;
+    };
     if let Some(serial) = &mut serial_state.driver {
         serial.write_byte(byte);
     }
@@ -676,10 +671,9 @@ pub fn write_byte(byte: u8) {
 
 /// Check if there is input available on the serial port.
 pub fn has_input() -> bool {
-    // Read-only check -- use immutable access (no raw pointer needed). The debug
-    // mirror is output-only, so it is intentionally ignored for input.
-    crate::state::drivers()
-        .serial
+    // The debug mirror is output-only, so it is intentionally ignored for input.
+    SERIAL
+        .borrow()
         .driver
         .as_ref()
         .is_some_and(AnySerial::has_input)
@@ -687,10 +681,11 @@ pub fn has_input() -> bool {
 
 /// Try to read a byte from the serial port (non-blocking).
 pub fn try_read() -> Option<u8> {
-    // SAFETY: Single-threaded firmware; raw pointer avoids re-entrancy
-    // issues since serial is called from log macros inside other state closures.
-    let driver = unsafe { &mut (*crate::state::drivers_mut_ptr()).serial.driver };
-    driver.as_mut().and_then(AnySerial::try_read_byte)
+    SERIAL
+        .borrow_mut()
+        .driver
+        .as_mut()
+        .and_then(AnySerial::try_read_byte)
 }
 
 /// Macro for printing to serial

@@ -54,7 +54,7 @@ use crate::drivers::block::{AhciDisk, NvmeDisk, SdhciDisk, UsbDisk};
 pub fn reset_system() -> ! {
     log::info!("System reset requested");
 
-    if let Some(reset) = state::try_get().and_then(|state| state.drivers.platform.reset) {
+    if let Some(reset) = state::platform_callbacks().reset {
         reset.reset(ResetType::Cold);
     }
 
@@ -201,9 +201,7 @@ fn init_persistence_and_boot(
         log::warn!("Variable store is preserved read-only; capsule updates are disabled");
     }
 
-    let runtime = state::efi()
-        .runtime_image
-        .expect("runtime image missing before deferred replay");
+    let runtime = state::runtime_image().expect("runtime image missing before deferred replay");
     let capsule_backend_available = capsule_backend.is_some();
     let mut capsule_delivery_usable = false;
     if persistence_available {
@@ -249,7 +247,8 @@ fn init_persistence_and_boot(
 
     // Reinstall ESRT after persistent variables and this boot's capsule attempts
     // are visible so its last-attempt fields are authoritative across reboots.
-    if let Some(firmware) = state::drivers().platform.efi_fw_info {
+    let firmware_info = state::drivers().platform.efi_fw_info;
+    if let Some(firmware) = firmware_info {
         efi::esrt::install_esrt(&firmware, capsule_delivery_usable);
     }
     efi::capsule::disk::install_os_indications_supported(capsule_delivery_usable);
@@ -308,14 +307,6 @@ mod linker_range_tests {
 /// builds a [`PlatformConfig`] with platform-specific trait implementations
 /// and calls this function to start the UEFI boot manager.
 ///
-/// # Pre-initialized state
-///
-/// If the caller has already called [`state::init()`] before this function
-/// (e.g., to store coreboot-specific data in [`state::DriverState`]), this
-/// function detects the pre-initialized state and skips creating a new
-/// [`state::FirmwareState`]. The caller's `FirmwareState` must live on a
-/// stack frame that never returns (e.g., `rust_main() -> !`).
-///
 /// # Never returns
 ///
 /// This function never returns (`-> !`). When a UEFI application calls
@@ -341,38 +332,7 @@ mod linker_range_tests {
 /// };
 /// crabefi::init_platform(config); // never returns
 /// ```
-pub fn init_platform(config: PlatformConfig) -> ! {
-    if state::is_initialized() {
-        // Caller pre-initialized state (e.g., coreboot payload storing
-        // SMMSTORE/SPI/CBMEM info before calling us). Their FirmwareState
-        // lives on a -> ! frame so it outlives us.
-        init_platform_impl(config)
-    } else {
-        // Fresh start: allocate FirmwareState on this stack frame.
-        init_with_local_state(config)
-    }
-}
-
-/// Use a statically allocated [`state::FirmwareState`] for fresh starts and
-/// delegate to [`init_platform_impl`].
-///
-/// Keeping this in static storage avoids putting the ~1 MiB state object on the
-/// firmware stack.
-static mut LOCAL_FIRMWARE_STATE: state::FirmwareState = state::FirmwareState::new();
-
-#[inline(never)]
-fn init_with_local_state(config: PlatformConfig) -> ! {
-    // SAFETY: Single-threaded firmware entry point. This static lives for the
-    // full firmware lifetime and is only used on the fresh-start path.
-    unsafe {
-        let firmware_state = core::ptr::addr_of_mut!(LOCAL_FIRMWARE_STATE);
-        state::init(&mut *firmware_state);
-    }
-    init_platform_impl(config)
-}
-
-/// Core initialization logic shared by all callers of [`init_platform`].
-fn init_platform_impl(mut config: PlatformConfig) -> ! {
+pub fn init_platform(mut config: PlatformConfig) -> ! {
     // ---- 1. Install exception / interrupt vectors ----
     //
     // On aarch64: without this, VBAR_ELx defaults to 0x0 and any exception
@@ -486,11 +446,13 @@ fn init_platform_impl(mut config: PlatformConfig) -> ! {
             &'static dyn crate::platform::ResetHandler,
         >(config.reset)
     };
+    state::set_platform_callbacks(state::PlatformCallbacks {
+        hooks,
+        reset: Some(reset),
+        timestamp_recorder,
+    });
     state::with_drivers_mut(|d| {
         d.platform.efi_fw_info = config.firmware_info;
-        d.platform.hooks = hooks;
-        d.platform.reset = Some(reset);
-        d.platform.timestamp_recorder = timestamp_recorder;
         d.platform.capsule_regions.clear();
         for region in config.capsule_regions {
             if d.platform.capsule_regions.push(*region).is_err() {
@@ -542,7 +504,8 @@ fn init_platform_impl(mut config: PlatformConfig) -> ! {
     // The ESRT is built from platform-provided firmware info and installed as
     // an EFI Configuration Table for fwupd/LVFS discovery. Delivery flags and
     // OsIndicationsSupported are finalized after persistence is initialized.
-    if let Some(fw_info) = state::drivers().platform.efi_fw_info {
+    let firmware_info = state::drivers().platform.efi_fw_info;
+    if let Some(fw_info) = firmware_info {
         efi::esrt::install_esrt(&fw_info, false);
         log::info!("ESRT installed for firmware updates");
     }

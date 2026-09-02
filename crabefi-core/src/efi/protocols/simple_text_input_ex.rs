@@ -158,44 +158,43 @@ extern "efiapi" fn text_input_ex_read_key_stroke(
     // Get current shift/toggle state (always valid, even if no key pressed)
     let (shift_state, toggle_state) = keyboard::get_efi_key_state();
 
-    state::with_console_mut(|console_state| {
-        let input_state = &mut console_state.input;
+    // Read the key with the console borrowed, then release it before running
+    // notification callbacks, which may call back into the console protocols.
+    let key =
+        state::with_console_mut(|console_state| console::try_read_key(&mut console_state.input));
 
-        // Use the shared key-reading function from console module
-        match console::try_read_key(input_state) {
-            Some((scan_code, unicode_char)) => {
-                unsafe {
-                    (*key_data).key.scan_code = scan_code;
-                    (*key_data).key.unicode_char = unicode_char;
-                    (*key_data).key_state.key_shift_state = shift_state;
-                    (*key_data).key_state.key_toggle_state = toggle_state;
-                }
-
-                log::trace!(
-                    "SimpleTextInputEx.ReadKeyStrokeEx: scan={:#x}, unicode={:#x}, shift={:#x}, toggle={:#x}",
-                    scan_code,
-                    unicode_char,
-                    shift_state,
-                    toggle_state
-                );
-
-                // Dispatch key notifications
-                dispatch_key_notifications(scan_code, unicode_char, shift_state, toggle_state);
-
-                Status::SUCCESS
+    match key {
+        Some((scan_code, unicode_char)) => {
+            unsafe {
+                (*key_data).key.scan_code = scan_code;
+                (*key_data).key.unicode_char = unicode_char;
+                (*key_data).key_state.key_shift_state = shift_state;
+                (*key_data).key_state.key_toggle_state = toggle_state;
             }
-            None => {
-                // No key available — still report the current state per spec
-                unsafe {
-                    (*key_data).key.scan_code = 0;
-                    (*key_data).key.unicode_char = 0;
-                    (*key_data).key_state.key_shift_state = shift_state;
-                    (*key_data).key_state.key_toggle_state = toggle_state;
-                }
-                Status::NOT_READY
-            }
+
+            log::trace!(
+                "SimpleTextInputEx.ReadKeyStrokeEx: scan={:#x}, unicode={:#x}, shift={:#x}, toggle={:#x}",
+                scan_code,
+                unicode_char,
+                shift_state,
+                toggle_state
+            );
+
+            dispatch_key_notifications(scan_code, unicode_char, shift_state, toggle_state);
+
+            Status::SUCCESS
         }
-    })
+        None => {
+            // No key available — still report the current state per spec
+            unsafe {
+                (*key_data).key.scan_code = 0;
+                (*key_data).key.unicode_char = 0;
+                (*key_data).key_state.key_shift_state = shift_state;
+                (*key_data).key_state.key_toggle_state = toggle_state;
+            }
+            Status::NOT_READY
+        }
+    }
 }
 
 extern "efiapi" fn text_input_ex_set_state(

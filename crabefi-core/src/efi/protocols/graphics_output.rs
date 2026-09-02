@@ -224,11 +224,10 @@ extern "efiapi" fn gop_blt(
         return Status::INVALID_PARAMETER;
     }
 
-    let console = state::console();
-    let fb = match console.gop_framebuffer.as_ref() {
-        Some(fb) => fb,
-        None => return Status::DEVICE_ERROR,
+    let Some(fb) = state::console().gop_framebuffer else {
+        return Status::DEVICE_ERROR;
     };
+    let fb = &fb;
     let fb_width = fb.width as usize;
     let fb_height = fb.height as usize;
     let fb_ptr = fb.physical_address as *mut u8;

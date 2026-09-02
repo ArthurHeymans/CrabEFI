@@ -185,16 +185,12 @@ pub unsafe extern "C" fn exception_rust_handler(
     };
     let ec = (esr >> 26) & 0x3f;
 
-    // Use the firmware's serial driver — but only after state is initialized.
-    // Calling drivers::serial before state::init() would hit the null-pointer
-    // assert in state::get_mut_ptr() and cause a recursive panic.
-    if crate::state::is_initialized() {
-        crate::drivers::serial::write_fmt(format_args!(
-            "\r\n*** EXCEPTION ({name}) \
-             ESR={esr:#018x} ELR={elr:#018x} FAR={far:#018x} \
-             SP={sp:#018x} EC={ec:#x}\r\n"
-        ));
-    }
+    // The serial driver silently drops output until a port is configured.
+    crate::drivers::serial::write_fmt(format_args!(
+        "\r\n*** EXCEPTION ({name}) \
+         ESR={esr:#018x} ELR={elr:#018x} FAR={far:#018x} \
+         SP={sp:#018x} EC={ec:#x}\r\n"
+    ));
 
     loop {
         // SAFETY: wfe is side-effect-free with respect to memory.

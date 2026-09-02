@@ -31,7 +31,7 @@ pub const TS_CRABEFI_EXIT_BOOT_SERVICES: u32 = 1508;
 ///
 /// This is a no-op when the platform did not provide a timestamp recorder.
 pub fn record(id: u32) {
-    if let Some(recorder) = crate::state::drivers().platform.timestamp_recorder {
+    if let Some(recorder) = crate::state::platform_callbacks().timestamp_recorder {
         recorder.record(id);
     }
 }

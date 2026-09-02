@@ -63,17 +63,9 @@ const LOG_LEVEL_VARIABLE_ATTRS: u32 = crate::efi::auth::attributes::NON_VOLATILE
     | crate::efi::auth::attributes::RUNTIME_ACCESS;
 
 /// Get microseconds elapsed since boot.
-///
-/// Uses raw-pointer read (see *Log-Path Contract* in [`crate::state`]) to
-/// avoid creating a `&DriverState` reference that would alias with a live
-/// `&mut` from `with_*_mut()` closures.
 pub fn get_us_since_boot() -> u64 {
     let current = read_counter();
-    // SAFETY: single-threaded firmware; field is written once at init,
-    // only read afterwards. Raw pointer avoids aliasing with &mut held
-    // by with_*_mut() closures that may log.
-    let boot = unsafe { (*crate::state::drivers_mut_ptr()).timing.boot_counter };
-    let delta = current.saturating_sub(boot);
+    let delta = current.saturating_sub(crate::time::boot_counter());
     let freq = crate::time::counter_frequency().max(1);
     ((delta as u128 * 1_000_000) / freq as u128) as u64
 }
@@ -125,11 +117,7 @@ pub fn init() {
     // log::set_logger() returns Err if a logger is already registered.
     if log::set_logger(&LOGGER).is_ok() {
         // Record the boot counter for relative timestamps.
-        // SAFETY: single-threaded init; raw pointer avoids re-entrancy
-        // issues with the state lock.
-        unsafe {
-            (*crate::state::drivers_mut_ptr()).timing.boot_counter = read_counter();
-        }
+        crate::time::set_boot_counter(read_counter());
         log::set_max_level(DEFAULT_LEVEL);
     }
 }

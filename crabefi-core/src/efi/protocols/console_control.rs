@@ -79,11 +79,9 @@ extern "efiapi" fn console_set_mode(
         return Status::INVALID_PARAMETER;
     }
 
-    let prev_mode = crate::state::console().screen_mode;
-    // SAFETY: Single-threaded firmware; no aliasing &mut exists at this point.
-    unsafe {
-        (*crate::state::console_mut_ptr()).screen_mode = mode;
-    }
+    let prev_mode = crate::state::with_console_mut(|console| {
+        core::mem::replace(&mut console.screen_mode, mode)
+    });
 
     log::debug!("ConsoleControl.SetMode({:?} -> {:?})", prev_mode, mode);
 

@@ -11,7 +11,7 @@ use crate::time::delay_ms;
 use render::FontSize;
 
 pub fn show(fb: &FramebufferInfo) -> ScreenNav {
-    let Some(hooks) = crate::state::drivers().platform.hooks else {
+    let Some(hooks) = crate::state::platform_callbacks().hooks else {
         return show_no_settings(fb);
     };
 

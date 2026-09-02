@@ -55,7 +55,7 @@ pub fn process_pending_capsules(backend: &mut dyn CapsuleBackend) -> usize {
     let mut applied_count = 0;
 
     // Source 1: Capsules from platform-provided reserved memory regions.
-    let platform_capsules = &crate::state::drivers().platform.capsule_regions;
+    let platform_capsules = crate::state::drivers().platform.capsule_regions.clone();
     let platform_capsule_count = platform_capsules.len();
     if platform_capsule_count > 0 {
         log::info!("Processing {} platform capsule(s)", platform_capsule_count);

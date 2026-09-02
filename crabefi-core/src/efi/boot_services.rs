@@ -5,8 +5,9 @@
 //!
 //! # State Management
 //!
-//! Boot Services state (handles, events, loaded images) is stored in the
-//! centralized `FirmwareState` structure. Access it via `crate::state::efi_mut()`.
+//! Boot Services state (handles, events, loaded images) lives in the
+//! `crate::state` EFI cell. Access it via `crate::state::efi()` and
+//! `crate::state::with_efi_mut()`.
 
 use super::allocator::{self, AllocateType, MemoryDescriptor, MemoryType};
 use super::image_loader;
@@ -526,7 +527,7 @@ extern "efiapi" fn signal_event(event: efi::Event) -> Status {
             }
         });
 
-        // Call notify function outside the state lock
+        // Call notify function outside the state borrow
         if let Some((func, context)) = notify_fn {
             log::debug!("  -> Calling notify function for event {}", event_id);
             func(event, context);
@@ -655,7 +656,7 @@ const EFI_EVENT_GROUP_EXIT_BOOT_SERVICES: Guid = Guid::from_fields(
 
 /// Signal all events belonging to a specific event group
 fn signal_event_group(group_guid: &Guid) {
-    // Collect events to signal (need to avoid holding state lock during callbacks)
+    // Collect events to signal (must not hold a state borrow during callbacks)
     let mut events_to_signal: heapless::Vec<
         (usize, Option<efi::EventNotify>, *mut c_void),
         MAX_EVENTS,
@@ -681,7 +682,7 @@ fn signal_event_group(group_guid: &Guid) {
         }
     });
 
-    // Call notify functions outside the state lock
+    // Call notify functions outside the state borrow
     for (event_id, notify_fn, context) in &events_to_signal {
         if let Some(func) = notify_fn {
             log::debug!("signal_event_group: calling notify for event {}", event_id);
@@ -1611,7 +1612,7 @@ extern "efiapi" fn exit_boot_services(image_handle: Handle, map_key: usize) -> S
     if key_status != Status::SUCCESS {
         return key_status;
     }
-    let Some(runtime_image) = crate::state::efi().runtime_image else {
+    let Some(runtime_image) = crate::state::runtime_image() else {
         log::error!("ExitBootServices refused: runtime image client is missing");
         return Status::DEVICE_ERROR;
     };
@@ -1704,7 +1705,7 @@ extern "efiapi" fn exit_boot_services(image_handle: Handle, map_key: usize) -> S
         // Let platform glue clean up integration-specific handoff state only
         // after the final fallible step; hooks may disable non-runtime log
         // buffers needed to diagnose a seal failure.
-        if let Some(hooks) = crate::state::drivers().platform.hooks {
+        if let Some(hooks) = crate::state::platform_callbacks().hooks {
             hooks.on_exit_boot_services();
         }
 
