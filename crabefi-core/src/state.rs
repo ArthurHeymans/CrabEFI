@@ -209,6 +209,7 @@ impl ProtocolEntry {
 }
 
 /// Handle entry in the handle database
+#[derive(Clone, Copy)]
 pub struct HandleEntry {
     pub handle: Handle,
     pub protocols: [ProtocolEntry; MAX_PROTOCOLS_PER_HANDLE],
