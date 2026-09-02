@@ -813,76 +813,61 @@ extern "efiapi" fn install_protocol_interface(
         return Status::INVALID_PARAMETER;
     }
 
-    // Only native interface type is supported
     if interface_type != efi::NATIVE_INTERFACE {
         return Status::INVALID_PARAMETER;
     }
 
-    let guid = unsafe { *protocol };
-    let handle_ptr = unsafe { *handle };
+    let target_handle = if unsafe { (*handle).is_null() } {
+        let Some(new_handle) = create_handle() else {
+            return Status::OUT_OF_RESOURCES;
+        };
+        unsafe { *handle = new_handle };
+        new_handle
+    } else {
+        unsafe { *handle }
+    };
 
-    state::with_efi_mut(|efi_state| {
-        // If handle is null, create a new handle
-        if handle_ptr.is_null() {
-            if efi_state.handle_count >= MAX_HANDLES {
-                return Status::OUT_OF_RESOURCES;
-            }
-
-            let new_handle = efi_state.next_handle as *mut c_void;
-            efi_state.next_handle += 1;
-
-            let idx = efi_state.handle_count;
-            efi_state.handles[idx].handle = new_handle;
-            efi_state.handles[idx].protocols[0] = ProtocolEntry { guid, interface };
-            efi_state.handles[idx].protocol_count = 1;
-            efi_state.handle_count += 1;
-
-            unsafe { *handle = new_handle };
-            return Status::SUCCESS;
-        }
-
-        // Find existing handle
-        if let Some(entry) = efi_state.handles[..efi_state.handle_count]
-            .iter_mut()
-            .find(|e| e.handle == handle_ptr)
-        {
-            // Check if protocol already installed
-            if entry.protocols[..entry.protocol_count]
-                .iter()
-                .any(|p| p.guid == guid)
-            {
-                return Status::INVALID_PARAMETER; // Protocol already installed
-            }
-
-            // Add new protocol
-            if entry.protocol_count >= MAX_PROTOCOLS_PER_HANDLE {
-                return Status::OUT_OF_RESOURCES;
-            }
-
-            entry.protocols[entry.protocol_count] = ProtocolEntry { guid, interface };
-            entry.protocol_count += 1;
-            return Status::SUCCESS;
-        }
-
-        Status::INVALID_PARAMETER
-    })
+    install_protocol(target_handle, &unsafe { *protocol }, interface)
 }
 
 extern "efiapi" fn reinstall_protocol_interface(
-    _handle: Handle,
-    _protocol: *mut Guid,
-    _old_interface: *mut c_void,
-    _new_interface: *mut c_void,
+    handle: Handle,
+    protocol: *mut Guid,
+    old_interface: *mut c_void,
+    new_interface: *mut c_void,
 ) -> Status {
-    Status::NOT_FOUND
+    if handle.is_null() || protocol.is_null() {
+        return Status::INVALID_PARAMETER;
+    }
+
+    let guid = unsafe { *protocol };
+    state::with_efi_mut(|efi_state| {
+        let Some(entry) = efi_state.handles[..efi_state.handle_count]
+            .iter_mut()
+            .find(|entry| entry.handle == handle)
+        else {
+            return Status::NOT_FOUND;
+        };
+        let Some(protocol_entry) = entry.protocols[..entry.protocol_count]
+            .iter_mut()
+            .find(|entry| entry.guid == guid && entry.interface == old_interface)
+        else {
+            return Status::NOT_FOUND;
+        };
+        protocol_entry.interface = new_interface;
+        Status::SUCCESS
+    })
 }
 
 extern "efiapi" fn uninstall_protocol_interface(
-    _handle: Handle,
-    _protocol: *mut Guid,
-    _interface: *mut c_void,
+    handle: Handle,
+    protocol: *mut Guid,
+    interface: *mut c_void,
 ) -> Status {
-    Status::NOT_FOUND
+    if handle.is_null() || protocol.is_null() {
+        return Status::INVALID_PARAMETER;
+    }
+    remove_protocol(handle, &unsafe { *protocol }, Some(interface))
 }
 
 extern "efiapi" fn handle_protocol(
@@ -2218,22 +2203,10 @@ extern "efiapi" fn install_multiple_protocol_interfaces(
                 let prev_guid_ptr = args[j].0 as *const Guid;
                 if !prev_guid_ptr.is_null() {
                     let prev_guid = unsafe { *prev_guid_ptr };
-                    state::with_efi_mut(|efi_state| {
-                        if let Some(entry) = efi_state.handles[..efi_state.handle_count]
-                            .iter_mut()
-                            .find(|e| e.handle == target_handle)
-                            && let Some(pos) = entry.protocols[..entry.protocol_count]
-                                .iter()
-                                .position(|p| p.guid == prev_guid)
-                        {
-                            entry
-                                .protocols
-                                .copy_within(pos + 1..entry.protocol_count, pos);
-                            entry.protocol_count -= 1;
-                        }
-                    });
+                    let _ = remove_protocol(target_handle, &prev_guid, None);
                 }
             }
+            reclaim_empty_handle(target_handle);
             return status;
         }
     }
@@ -2265,24 +2238,14 @@ extern "efiapi" fn uninstall_multiple_protocol_interfaces(
     let args = [(arg1, arg2), (arg3, arg4), (arg5, arg6), (arg7, arg8)];
 
     // Uninstall each protocol
-    for (guid_ptr, _) in args.iter().take_while(|(g, _)| !g.is_null()) {
+    for (guid_ptr, interface) in args.iter().take_while(|(g, _)| !g.is_null()) {
         let guid = unsafe { *(*guid_ptr as *const Guid) };
         log::debug!("  Uninstalling protocol: {}", GuidFmt(guid));
 
-        // Find and remove the protocol from the handle
-        state::with_efi_mut(|efi_state| {
-            if let Some(entry) = efi_state.handles[..efi_state.handle_count]
-                .iter_mut()
-                .find(|e| e.handle == handle)
-                && let Some(j) = entry.protocols[..entry.protocol_count]
-                    .iter()
-                    .position(|p| p.guid == guid)
-            {
-                // Remove by shifting remaining protocols down
-                entry.protocols.copy_within(j + 1..entry.protocol_count, j);
-                entry.protocol_count -= 1;
-            }
-        });
+        let status = remove_protocol(handle, &guid, Some(*interface));
+        if status != Status::SUCCESS {
+            return status;
+        }
     }
 
     log::trace!("  -> SUCCESS");
@@ -2342,6 +2305,60 @@ pub fn create_handle() -> Option<Handle> {
         efi_state.handle_count += 1;
 
         Some(handle)
+    })
+}
+
+fn reclaim_empty_handle(handle: Handle) {
+    state::with_efi_mut(|efi_state| {
+        let Some(index) = efi_state.handles[..efi_state.handle_count]
+            .iter()
+            .position(|entry| entry.handle == handle && entry.protocol_count == 0)
+        else {
+            return;
+        };
+        efi_state
+            .handles
+            .copy_within(index + 1..efi_state.handle_count, index);
+        efi_state.handle_count -= 1;
+        efi_state.handles[efi_state.handle_count] = crate::state::HandleEntry::empty();
+    });
+}
+
+/// Remove one protocol interface and reclaim an empty handle slot.
+fn remove_protocol(handle: Handle, guid: &Guid, interface: Option<*mut c_void>) -> Status {
+    state::with_efi_mut(|efi_state| {
+        let Some(handle_index) = efi_state.handles[..efi_state.handle_count]
+            .iter()
+            .position(|entry| entry.handle == handle)
+        else {
+            return Status::NOT_FOUND;
+        };
+        let entry = &mut efi_state.handles[handle_index];
+        let Some(protocol_index) =
+            entry.protocols[..entry.protocol_count]
+                .iter()
+                .position(|entry| {
+                    entry.guid == *guid && interface.is_none_or(|iface| entry.interface == iface)
+                })
+        else {
+            return Status::NOT_FOUND;
+        };
+
+        entry
+            .protocols
+            .copy_within(protocol_index + 1..entry.protocol_count, protocol_index);
+        entry.protocol_count -= 1;
+        entry.protocols[entry.protocol_count] = ProtocolEntry::empty();
+
+        if entry.protocol_count == 0 {
+            efi_state
+                .handles
+                .copy_within(handle_index + 1..efi_state.handle_count, handle_index);
+            efi_state.handle_count -= 1;
+            efi_state.handles[efi_state.handle_count] = crate::state::HandleEntry::empty();
+        }
+
+        Status::SUCCESS
     })
 }
 
