@@ -712,18 +712,15 @@ impl MemoryAllocator {
 
     /// Mark a memory region as ACPI Reclaim Memory.
     ///
-    /// Splits the containing entry as needed. Skips regions already typed as
-    /// `AcpiReclaimMemory` or `AcpiMemoryNvs`.
+    /// Splits the containing entry as needed. Coreboot commonly places ACPI
+    /// tables inside a broadly reserved CBMEM range, so verified table pages
+    /// must override `ReservedMemoryType`. Preserve only existing ACPI types.
     pub fn mark_as_acpi_reclaim(&mut self, addr: u64, num_pages: u64) -> Result<(), efi::Status> {
         self.mark_region_as(
             addr,
             num_pages,
             MemoryType::AcpiReclaimMemory,
-            &[
-                MemoryType::ReservedMemoryType,
-                MemoryType::AcpiReclaimMemory,
-                MemoryType::AcpiMemoryNvs,
-            ],
+            &[MemoryType::AcpiReclaimMemory, MemoryType::AcpiMemoryNvs],
         )
     }
 
@@ -1420,10 +1417,25 @@ pub fn get_map_key() -> usize {
     alloc.map_key()
 }
 
-/// Find the memory type for a given physical address
+/// Copy the effective EFI memory map into `output`.
 ///
-/// Returns the memory type if the address is within a known memory region,
-/// or None if the address is not in any known region.
+/// # Arguments
+/// * `output` - Destination for every current memory descriptor
+///
+/// # Returns
+/// The number of copied descriptors, or `BUFFER_TOO_SMALL` when `output` cannot
+/// hold the complete map.
+pub fn copy_descriptors(output: &mut [MemoryDescriptor]) -> Result<usize, efi::Status> {
+    let allocator = ALLOCATOR.borrow();
+    if output.len() < allocator.entries.len() {
+        return Err(efi::Status::BUFFER_TOO_SMALL);
+    }
+    for (slot, descriptor) in output.iter_mut().zip(&allocator.entries) {
+        *slot = *descriptor;
+    }
+    Ok(allocator.entries.len())
+}
+
 pub fn copy_runtime_descriptors(output: &mut [MemoryDescriptor]) -> Result<usize, efi::Status> {
     let allocator = ALLOCATOR.borrow();
     let runtime = allocator
@@ -1805,7 +1817,7 @@ mod tests {
     }
 
     #[test]
-    fn acpi_marking_preserves_platform_reserved_memory() {
+    fn acpi_marking_retypes_verified_platform_reserved_memory() {
         let mut allocator = allocator_with_ram();
         let reserved_start = 0x20_0000;
         allocator
@@ -1827,7 +1839,7 @@ mod tests {
                 .iter()
                 .find(|entry| entry.physical_start == reserved_start)
                 .and_then(MemoryDescriptorExt::get_memory_type),
-            Some(MemoryType::ReservedMemoryType)
+            Some(MemoryType::AcpiReclaimMemory)
         );
         assert_eq!(
             allocator
