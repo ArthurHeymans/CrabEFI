@@ -997,6 +997,44 @@ pub fn run_tests(config: &QemuConfig, disk_path: &Path, app_name: &str) -> Resul
                 failed += 1;
             }
         }
+        "protocol-notify-test" => {
+            if result.output.contains("RegisterProtocolNotify Test") {
+                println!("[PASS] test_started: protocol notify test started");
+                passed += 1;
+            } else {
+                println!("[FAIL] test_started: protocol notify test did not start");
+                failed += 1;
+            }
+
+            // Each check is asserted individually so a regression names itself
+            // instead of only collapsing the final summary line.
+            for (marker, label) in [
+                ("[PASS] register_notify", "register_notify"),
+                ("[PASS] empty_queue", "empty_queue"),
+                ("[PASS] install_signals", "install_signals"),
+                ("[PASS] drain_once", "drain_once"),
+                ("[PASS] locate_handle_buffer", "locate_handle_buffer"),
+                ("[PASS] guid_scoping", "guid_scoping"),
+                ("[PASS] unknown_registration", "unknown_registration"),
+                ("[PASS] close_event", "close_event"),
+            ] {
+                if result.output.contains(marker) {
+                    println!("[PASS] {label}");
+                    passed += 1;
+                } else {
+                    println!("[FAIL] {label}");
+                    failed += 1;
+                }
+            }
+
+            if result.output.contains("All protocol notify tests passed!") {
+                println!("[PASS] all_passed: All protocol notify tests passed");
+                passed += 1;
+            } else {
+                println!("[FAIL] all_passed: Not all protocol notify tests passed");
+                failed += 1;
+            }
+        }
         "grub-linux" => {
             // ── GRUB + Linux + u-root boot-chain test ────────────────
             // Full boot path: CrabEFI -> GRUB -> Linux -> u-root init.

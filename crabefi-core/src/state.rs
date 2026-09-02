@@ -180,6 +180,15 @@ pub const MAX_HANDLES: usize = 64;
 /// Maximum number of protocols per handle
 pub const MAX_PROTOCOLS_PER_HANDLE: usize = 8;
 
+/// Maximum number of live `RegisterProtocolNotify` registrations.
+pub const MAX_PROTOCOL_NOTIFIES: usize = 16;
+
+/// Maximum handles queued for one registration before new arrivals are dropped.
+///
+/// A registration whose owner never drains it with `LocateHandle`
+/// (`ByRegisterNotify`) must not be able to grow without bound.
+pub const MAX_NOTIFY_PENDING: usize = 32;
+
 /// Maximum number of events we can track
 pub const MAX_EVENTS: usize = 32;
 
@@ -405,6 +414,21 @@ pub struct OpenProtocolEntry {
     pub open_count: u32,
 }
 
+/// One `RegisterProtocolNotify` registration.
+///
+/// `pending` holds handles that gained a matching interface since the owner
+/// last drained the registration with `LocateHandle` (`ByRegisterNotify`).
+pub struct ProtocolNotifyEntry {
+    /// Opaque token handed back to the caller as `Registration`.
+    pub registration: usize,
+    /// Protocol the caller asked to be notified about.
+    pub protocol: Guid,
+    /// Event signaled when a matching interface is installed.
+    pub event: efi::Event,
+    /// Handles queued for delivery, oldest first.
+    pub pending: HeaplessVec<Handle, MAX_NOTIFY_PENDING>,
+}
+
 /// EFI subsystem state
 pub struct EfiState {
     /// Validated boot-side client for the separately allocated runtime image.
@@ -416,6 +440,10 @@ pub struct EfiState {
     pub handle_count: usize,
     /// Active protocol opens, grown fallibly from the firmware heap.
     pub open_protocols: Vec<OpenProtocolEntry>,
+    /// Live protocol-notify registrations, grown fallibly from the heap.
+    pub protocol_notifies: Vec<ProtocolNotifyEntry>,
+    /// Next opaque registration token handed out by RegisterProtocolNotify.
+    pub next_registration: usize,
     /// Next handle value (unique identifier)
     pub next_handle: usize,
 
@@ -446,6 +474,8 @@ impl EfiState {
             handles: Vec::new(),
             handle_count: 0,
             open_protocols: Vec::new(),
+            protocol_notifies: Vec::new(),
+            next_registration: 1,
             next_handle: 1,
             events: Vec::new(),
             next_event_id: 2, // Start at 2, reserve 1 for keyboard
