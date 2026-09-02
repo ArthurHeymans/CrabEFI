@@ -127,7 +127,6 @@ pub fn init() {
     if has_rndr() {
         // Verify RNDR actually works
         if rndr64().is_some() {
-            crate::state::with_drivers_mut(|d| d.rng_available = true);
             RNG_METHOD.store(RngMethod::Rndr as u8, Ordering::Release);
             log::info!("RNG: RNDR instruction available (FEAT_RNG)");
             return;
@@ -135,7 +134,6 @@ pub fn init() {
     }
 
     if check_smccc_trng() {
-        crate::state::with_drivers_mut(|d| d.rng_available = true);
         RNG_METHOD.store(RngMethod::SmcccTrng as u8, Ordering::Release);
         log::info!("RNG: SMCCC TRNG available");
         return;
@@ -146,7 +144,7 @@ pub fn init() {
 
 /// Check if hardware RNG is available and functional
 pub fn is_supported() -> bool {
-    crate::state::drivers().rng_available
+    RngMethod::from_u8(RNG_METHOD.load(Ordering::Acquire)) != RngMethod::None
 }
 
 /// Fill a byte buffer with random data

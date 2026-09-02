@@ -3,7 +3,12 @@
 //! Provides access to the RDRAND instruction, which implements a
 //! NIST SP800-90A AES-CTR-256 DRBG in hardware.
 
+use core::sync::atomic::{AtomicBool, Ordering};
+
 use x86_64::instructions::random::RdRand;
+
+/// Whether RDRAND passed the functional self-test at init.
+static RNG_AVAILABLE: AtomicBool = AtomicBool::new(false);
 
 /// Maximum number of RDRAND retries per Intel SDM Section 7.3.17
 const RDRAND_RETRY_LIMIT: usize = 10;
@@ -52,7 +57,7 @@ fn test_rdrand(rng: RdRand) -> bool {
 /// Must be called before `is_supported()`.
 pub fn init() {
     let available = RdRand::new().is_some_and(test_rdrand);
-    crate::state::with_drivers_mut(|d| d.rng_available = available);
+    RNG_AVAILABLE.store(available, Ordering::Relaxed);
 
     if is_supported() {
         log::info!("RDRAND available (SP800-90 CTR-256)");
@@ -63,7 +68,7 @@ pub fn init() {
 
 /// Check if RDRAND is available and functional
 pub fn is_supported() -> bool {
-    crate::state::drivers().rng_available
+    RNG_AVAILABLE.load(Ordering::Relaxed)
 }
 
 /// Fill a byte buffer with random data from RDRAND
