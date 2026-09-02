@@ -30,8 +30,6 @@ use crate::fs::fat::FatType;
 
 /// EFI service bookkeeping: handles, events, loaded images, filesystem.
 static EFI: Local<EfiState> = Local::new(EfiState::new());
-/// Page allocator and memory map.
-static ALLOCATOR: Local<MemoryAllocator> = Local::new(MemoryAllocator::new());
 /// Persistent variable-store bookkeeping.
 static VARSTORE: LocalCell<VarStoreState> = LocalCell::new(VarStoreState::new());
 /// Filesystem block device.
@@ -85,7 +83,6 @@ fn init_entries<T>(entries: &mut Vec<T>, len: usize, init: impl FnMut() -> T) ->
 // EFI State
 // ============================================================================
 
-use crate::efi::allocator::MemoryAllocator;
 use crate::efi::tcg::types::TaggedDigest;
 use r_efi::efi::{self, Guid, Handle};
 
@@ -720,20 +717,6 @@ pub fn console() -> Ref<'static, ConsoleState> {
 #[track_caller]
 pub fn with_console_mut<R>(f: impl FnOnce(&mut ConsoleState) -> R) -> R {
     CONSOLE.with_mut(f)
-}
-
-/// Borrow the memory allocator.
-#[inline]
-#[track_caller]
-pub fn allocator() -> Ref<'static, MemoryAllocator> {
-    ALLOCATOR.borrow()
-}
-
-/// Mutate the memory allocator through a closure.
-#[inline]
-#[track_caller]
-pub fn with_allocator_mut<R>(f: impl FnOnce(&mut MemoryAllocator) -> R) -> R {
-    ALLOCATOR.with_mut(f)
 }
 
 /// Mutate the block device through a closure.
