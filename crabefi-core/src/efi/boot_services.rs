@@ -45,6 +45,11 @@ pub const KEYBOARD_EVENT_ID: usize = 1;
 #[cfg(feature = "ui")]
 pub const POINTER_EVENT_ID: usize = 2;
 
+#[cfg(feature = "ui")]
+const FIRST_DYNAMIC_EVENT_ID: usize = POINTER_EVENT_ID + 1;
+#[cfg(not(feature = "ui"))]
+const FIRST_DYNAMIC_EVENT_ID: usize = KEYBOARD_EVENT_ID + 1;
+
 /// Static boot services table
 static mut BOOT_SERVICES: efi::BootServices = efi::BootServices {
     hdr: TableHeader {
@@ -306,6 +311,50 @@ const fn boot_event_type_supported(event_type: u32) -> bool {
     event_type & EVT_RUNTIME == 0
 }
 
+fn find_free_event_slot(events: &[EventEntry]) -> Option<usize> {
+    events
+        .iter()
+        .enumerate()
+        .skip(FIRST_DYNAMIC_EVENT_ID)
+        .find_map(|(event_id, entry)| (!entry.in_use).then_some(event_id))
+}
+
+fn next_event_generation(generation: usize) -> usize {
+    let max_generation = usize::MAX / MAX_EVENTS;
+    if generation == 0 || generation == max_generation {
+        1
+    } else {
+        generation + 1
+    }
+}
+
+fn event_handle(event_id: usize, generation: usize) -> efi::Event {
+    (generation * MAX_EVENTS + event_id) as *mut c_void
+}
+
+fn event_id_for_handle(events: &[EventEntry], event: efi::Event) -> Option<usize> {
+    let raw = event as usize;
+    if raw == KEYBOARD_EVENT_ID {
+        return Some(KEYBOARD_EVENT_ID);
+    }
+    #[cfg(feature = "ui")]
+    if raw == POINTER_EVENT_ID {
+        return Some(POINTER_EVENT_ID);
+    }
+
+    let event_id = raw % MAX_EVENTS;
+    let generation = raw / MAX_EVENTS;
+    (event_id >= FIRST_DYNAMIC_EVENT_ID
+        && generation != 0
+        && events[event_id].in_use
+        && events[event_id].generation == generation)
+        .then_some(event_id)
+}
+
+fn dynamic_event_id_for_handle(events: &[EventEntry], event: efi::Event) -> Option<usize> {
+    event_id_for_handle(events, event).filter(|event_id| *event_id >= FIRST_DYNAMIC_EVENT_ID)
+}
+
 extern "efiapi" fn create_event(
     event_type: u32,
     notify_tpl: Tpl,
@@ -326,19 +375,19 @@ extern "efiapi" fn create_event(
         return Status::INVALID_PARAMETER;
     }
 
-    // Allocate an event ID from centralized state
+    // Allocate a reusable event slot from centralized state.
     with_tables_mut(|efi_state| {
-        let event_id = efi_state.next_event_id;
-
-        if event_id >= MAX_EVENTS {
+        let Some(event_id) = find_free_event_slot(&efi_state.events) else {
             log::error!("  -> OUT_OF_RESOURCES (no more event slots)");
             return Status::OUT_OF_RESOURCES;
-        }
+        };
 
-        efi_state.next_event_id += 1;
+        let generation = next_event_generation(efi_state.events[event_id].generation);
 
-        // Store event info including notify callback
+        // Store event info including notify callback.
         efi_state.events[event_id] = EventEntry {
+            in_use: true,
+            generation,
             event_type,
             notify_tpl,
             signaled: false,
@@ -351,12 +400,17 @@ extern "efiapi" fn create_event(
             timer_deadline_tsc: 0,
         };
 
-        // Return the event ID as the event handle
+        let handle = event_handle(event_id, generation);
         unsafe {
-            *event = event_id as *mut c_void;
+            *event = handle;
         }
 
-        log::debug!("  -> SUCCESS (event={:#x})", event_id);
+        log::debug!(
+            "  -> SUCCESS (event={:?}, slot={}, generation={})",
+            handle,
+            event_id,
+            generation
+        );
         Status::SUCCESS
     })
 }
@@ -373,17 +427,15 @@ extern "efiapi" fn set_timer(
         trigger_time
     );
 
-    let event_id = event as usize;
-    if event_id == 0 || event_id >= MAX_EVENTS {
-        return Status::INVALID_PARAMETER;
-    }
-
     let timer = match TimerType::try_from(timer_type) {
         Ok(t) => t,
         Err(_) => return Status::INVALID_PARAMETER,
     };
 
     with_tables_mut(|efi_state| {
+        let Some(event_id) = dynamic_event_id_for_handle(&efi_state.events, event) else {
+            return Status::INVALID_PARAMETER;
+        };
         let entry = &mut efi_state.events[event_id];
 
         // Verify this is a timer event
@@ -458,7 +510,11 @@ extern "efiapi" fn wait_for_event(
     loop {
         // Check each event
         for (i, &evt) in events_to_wait.iter().enumerate() {
-            let event_id = evt as usize;
+            let Some(event_id) =
+                with_tables_mut(|efi_state| event_id_for_handle(&efi_state.events, evt))
+            else {
+                return Status::INVALID_PARAMETER;
+            };
 
             // Check if it's the keyboard event and there's actual key input.
             // We do a real read-ahead (not just peek at status registers) to
@@ -481,8 +537,8 @@ extern "efiapi" fn wait_for_event(
                 return Status::SUCCESS;
             }
 
-            // Check if a regular event is signaled (including timer check)
-            if event_id > 0 && event_id < MAX_EVENTS {
+            // Check if a regular dynamic event is signaled, including timers.
+            if event_id >= FIRST_DYNAMIC_EVENT_ID {
                 notify_wait_event(event_id, evt);
                 check_timer_event(event_id);
 
@@ -511,47 +567,54 @@ extern "efiapi" fn wait_for_event(
 }
 
 extern "efiapi" fn signal_event(event: efi::Event) -> Status {
-    let event_id = event as usize;
-    log::debug!("BS.SignalEvent(event={})", event_id);
+    log::debug!("BS.SignalEvent(event={:?})", event);
 
-    if event_id > 0 && event_id < MAX_EVENTS {
-        // Get notify function if present, then mark signaled
-        let notify_fn = with_tables_mut(|efi_state| {
-            efi_state.events[event_id].signaled = true;
-            let entry = &efi_state.events[event_id];
-            if entry.event_type & EVT_NOTIFY_SIGNAL != 0 {
-                entry.notify_function.map(|f| (f, entry.notify_context))
-            } else {
-                None
-            }
-        });
+    let notify = with_tables_mut(|efi_state| {
+        let Some(event_id) = dynamic_event_id_for_handle(&efi_state.events, event) else {
+            return Err(Status::INVALID_PARAMETER);
+        };
+        efi_state.events[event_id].signaled = true;
+        let entry = &efi_state.events[event_id];
+        let notify_fn = if entry.event_type & EVT_NOTIFY_SIGNAL != 0 {
+            entry.notify_function.map(|f| (f, entry.notify_context))
+        } else {
+            None
+        };
+        Ok((event_id, notify_fn))
+    });
 
-        // Call notify function outside the state borrow
-        if let Some((func, context)) = notify_fn {
-            log::debug!("  -> Calling notify function for event {}", event_id);
-            func(event, context);
-        }
+    let (event_id, notify_fn) = match notify {
+        Ok(result) => result,
+        Err(status) => return status,
+    };
+    if let Some((func, context)) = notify_fn {
+        log::debug!("  -> Calling notify function for event {}", event_id);
+        func(event, context);
     }
 
     Status::SUCCESS
 }
 
 extern "efiapi" fn close_event(event: efi::Event) -> Status {
-    let event_id = event as usize;
-    log::debug!("BS.CloseEvent(event={})", event_id);
+    log::debug!("BS.CloseEvent(event={:?})", event);
 
-    if event_id > 0 && event_id < MAX_EVENTS {
-        with_tables_mut(|efi_state| {
-            efi_state.events[event_id] = EventEntry::empty();
-        });
-    }
-
-    Status::SUCCESS
+    with_tables_mut(|efi_state| {
+        let Some(event_id) = dynamic_event_id_for_handle(&efi_state.events, event) else {
+            return Status::INVALID_PARAMETER;
+        };
+        let generation = efi_state.events[event_id].generation;
+        efi_state.events[event_id] = EventEntry::empty();
+        efi_state.events[event_id].generation = generation;
+        Status::SUCCESS
+    })
 }
 
 extern "efiapi" fn check_event(event: efi::Event) -> Status {
-    let event_id = event as usize;
-    log::trace!("BS.CheckEvent(event={})", event_id);
+    let Some(event_id) = with_tables_mut(|efi_state| event_id_for_handle(&efi_state.events, event))
+    else {
+        return Status::INVALID_PARAMETER;
+    };
+    log::trace!("BS.CheckEvent(event={:?}, slot={})", event, event_id);
 
     // Special case for keyboard event — do a real read-ahead check
     if event_id == KEYBOARD_EVENT_ID {
@@ -572,8 +635,8 @@ extern "efiapi" fn check_event(event: efi::Event) -> Status {
         }
     }
 
-    // Check regular events
-    if event_id > 0 && event_id < MAX_EVENTS {
+    // Check regular dynamic events.
+    if event_id >= FIRST_DYNAMIC_EVENT_ID {
         notify_wait_event(event_id, event);
 
         // Check timer expiration
@@ -663,7 +726,8 @@ fn signal_event_group(group_guid: &Guid) {
 
     with_tables_mut(|efi_state| {
         for (i, entry) in efi_state.events.iter_mut().enumerate() {
-            if let Some(ref group) = entry.event_group
+            if entry.in_use
+                && let Some(ref group) = entry.event_group
                 && *group == *group_guid
             {
                 entry.signaled = true;
@@ -673,7 +737,7 @@ fn signal_event_group(group_guid: &Guid) {
                     None
                 };
                 let _ = events_to_signal.push((
-                    i,
+                    event_handle(i, entry.generation) as usize,
                     notify.map(|(f, _)| f),
                     notify.map(|(_, c)| c).unwrap_or(core::ptr::null_mut()),
                 ));
@@ -682,10 +746,13 @@ fn signal_event_group(group_guid: &Guid) {
     });
 
     // Call notify functions outside the state borrow
-    for (event_id, notify_fn, context) in &events_to_signal {
+    for (event_handle, notify_fn, context) in &events_to_signal {
         if let Some(func) = notify_fn {
-            log::debug!("signal_event_group: calling notify for event {}", event_id);
-            func(*event_id as efi::Event, *context);
+            log::debug!(
+                "signal_event_group: calling notify for event {:#x}",
+                event_handle
+            );
+            func(*event_handle as efi::Event, *context);
         }
     }
 
@@ -787,13 +854,12 @@ extern "efiapi" fn create_event_ex(
     );
 
     if status == Status::SUCCESS && !event_group.is_null() {
-        // Store the event group GUID on the newly created event
-        let event_id = unsafe { *event } as usize;
-        if event_id > 0 && event_id < MAX_EVENTS {
-            with_tables_mut(|efi_state| {
+        let handle = unsafe { *event };
+        with_tables_mut(|efi_state| {
+            if let Some(event_id) = dynamic_event_id_for_handle(&efi_state.events, handle) {
                 efi_state.events[event_id].event_group = Some(unsafe { *event_group });
-            });
-        }
+            }
+        });
     }
 
     status
@@ -1629,20 +1695,24 @@ extern "efiapi" fn exit_boot_services(image_handle: Handle, map_key: usize) -> S
         let mut legacy_events: heapless::Vec<usize, MAX_EVENTS> = heapless::Vec::new();
         with_tables_mut(|efi_state| {
             for (i, event) in efi_state.events.iter_mut().enumerate() {
-                if event.event_type == EVT_SIGNAL_EXIT_BOOT_SERVICES {
+                if event.in_use && event.event_type == EVT_SIGNAL_EXIT_BOOT_SERVICES {
                     event.signaled = true;
-                    let _ = legacy_events.push(i);
+                    let _ = legacy_events.push(event_handle(i, event.generation) as usize);
                 }
             }
         });
-        for event_id in &legacy_events {
+        for handle in &legacy_events {
             let notify_fn = {
                 let efi_state = tables();
-                let entry = &efi_state.events[*event_id];
-                entry.notify_function.map(|f| (f, entry.notify_context))
+                dynamic_event_id_for_handle(&efi_state.events, *handle as efi::Event).and_then(
+                    |event_id| {
+                        let entry = &efi_state.events[event_id];
+                        entry.notify_function.map(|f| (f, entry.notify_context))
+                    },
+                )
             };
             if let Some((func, context)) = notify_fn {
-                func(*event_id as efi::Event, context);
+                func(*handle as efi::Event, context);
             }
         }
     }
@@ -2505,5 +2575,44 @@ mod tests {
         assert!(!boot_event_type_supported(
             EVT_SIGNAL_VIRTUAL_ADDRESS_CHANGE
         ));
+    }
+
+    #[test]
+    fn static_events_are_not_dynamic_handles() {
+        let events = [EventEntry::empty(); MAX_EVENTS];
+        assert_eq!(
+            dynamic_event_id_for_handle(&events, KEYBOARD_EVENT_ID as efi::Event),
+            None
+        );
+        #[cfg(feature = "ui")]
+        assert_eq!(
+            dynamic_event_id_for_handle(&events, POINTER_EVENT_ID as efi::Event),
+            None
+        );
+    }
+
+    #[test]
+    fn closed_event_slots_are_reused_without_reusing_handles() {
+        let mut events = [EventEntry::empty(); MAX_EVENTS];
+        let first = find_free_event_slot(&events).unwrap();
+        let first_generation = next_event_generation(events[first].generation);
+        events[first].in_use = true;
+        events[first].generation = first_generation;
+        let stale_handle = event_handle(first, first_generation);
+        assert_eq!(event_id_for_handle(&events, stale_handle), Some(first));
+        assert_eq!(find_free_event_slot(&events), Some(first + 1));
+
+        events[first].in_use = false;
+        let second_generation = next_event_generation(events[first].generation);
+        events[first].in_use = true;
+        events[first].generation = second_generation;
+        let replacement_handle = event_handle(first, second_generation);
+
+        assert_ne!(stale_handle, replacement_handle);
+        assert_eq!(event_id_for_handle(&events, stale_handle), None);
+        assert_eq!(
+            event_id_for_handle(&events, replacement_handle),
+            Some(first)
+        );
     }
 }
