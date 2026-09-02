@@ -99,16 +99,20 @@ extern "efiapi" fn block_io_read_blocks(
 
     let num_blocks = buffer_size / block_size;
 
-    // Check bounds
-    if lba + num_blocks as u64 > ctx.num_blocks {
+    let Some(absolute_lba) = crate::efi::block_range::checked_absolute_lba(
+        ctx.start_lba,
+        lba,
+        num_blocks as u64,
+        ctx.num_blocks,
+    ) else {
         log::debug!(
-            "BlockIO.ReadBlocks: LBA {} + {} blocks exceeds device size {}",
+            "BlockIO.ReadBlocks: invalid LBA {} + {} blocks for device size {}",
             lba,
             num_blocks,
             ctx.num_blocks
         );
         return Status::INVALID_PARAMETER;
-    }
+    };
 
     log::trace!(
         "BlockIO.ReadBlocks(media={}, lba={}, blocks={}, size={})",
@@ -123,7 +127,6 @@ extern "efiapi" fn block_io_read_blocks(
     // (e.g., 128 sectors / 64KB per SCSI command for USB). This avoids the massive
     // overhead of issuing one BOT transaction (CBW + data + CSW) per 512-byte sector.
     let buffer_slice = unsafe { core::slice::from_raw_parts_mut(buffer as *mut u8, buffer_size) };
-    let absolute_lba = ctx.start_lba + lba;
 
     if storage::read_sectors(ctx.storage_device_id, absolute_lba, buffer_slice).is_err() {
         log::error!(
