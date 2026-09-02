@@ -92,40 +92,11 @@ static mut BOOT_SERVICES: efi::BootServices = efi::BootServices {
     protocols_per_handle,
     locate_handle_buffer,
     locate_protocol,
-    // These are variadic functions - we use transmute to cast our extended-signature
-    // functions to the expected type. The caller passes all args regardless of signature.
-    install_multiple_protocol_interfaces: unsafe {
-        core::mem::transmute::<
-            extern "efiapi" fn(
-                *mut Handle,
-                *mut c_void,
-                *mut c_void,
-                *mut c_void,
-                *mut c_void,
-                *mut c_void,
-                *mut c_void,
-                *mut c_void,
-                *mut c_void,
-            ) -> Status,
-            extern "efiapi" fn(*mut Handle, *mut c_void, *mut c_void) -> Status,
-        >(install_multiple_protocol_interfaces)
-    },
-    uninstall_multiple_protocol_interfaces: unsafe {
-        core::mem::transmute::<
-            extern "efiapi" fn(
-                Handle,
-                *mut c_void,
-                *mut c_void,
-                *mut c_void,
-                *mut c_void,
-                *mut c_void,
-                *mut c_void,
-                *mut c_void,
-                *mut c_void,
-            ) -> Status,
-            extern "efiapi" fn(Handle, *mut c_void, *mut c_void) -> Status,
-        >(uninstall_multiple_protocol_interfaces)
-    },
+    // r-efi's function-pointer aliases omit the variadic tail. These entry
+    // points preserve the real UEFI ABI and parse protocol/interface pairs
+    // through the terminating NULL protocol argument.
+    install_multiple_protocol_interfaces: INSTALL_MULTIPLE_PROTOCOL_INTERFACES,
+    uninstall_multiple_protocol_interfaces: UNINSTALL_MULTIPLE_PROTOCOL_INTERFACES,
     calculate_crc32,
     copy_mem,
     set_mem,
@@ -2216,134 +2187,326 @@ extern "efiapi" fn locate_protocol(
     Status::NOT_FOUND
 }
 
-// Note: These are variadic in the real UEFI spec. We handle this by accepting
-// enough arguments for the common case (up to 4 protocol pairs) and iterating
-// until we find a NULL GUID terminator.
-extern "efiapi" fn install_multiple_protocol_interfaces(
-    handle: *mut Handle,
-    // Variadic args come as pairs: (GUID*, interface*), terminated by NULL
-    arg1: *mut c_void,
-    arg2: *mut c_void,
-    arg3: *mut c_void,
-    arg4: *mut c_void,
-    arg5: *mut c_void,
-    arg6: *mut c_void,
-    arg7: *mut c_void,
-    arg8: *mut c_void,
-) -> Status {
-    if handle.is_null() {
-        log::debug!("BS.InstallMultipleProtocolInterfaces: handle ptr is NULL");
+type InstallMultipleFn = extern "efiapi" fn(*mut Handle, *mut c_void, *mut c_void) -> Status;
+type UninstallMultipleFn = extern "efiapi" fn(Handle, *mut c_void, *mut c_void) -> Status;
+
+#[cfg(target_arch = "x86_64")]
+core::arch::global_asm!(
+    r#"
+    .global crabefi_install_multiple_protocol_interfaces_entry
+    .type crabefi_install_multiple_protocol_interfaces_entry,@function
+crabefi_install_multiple_protocol_interfaces_entry:
+    mov r10, rsp
+    sub rsp, 40
+    lea rax, [r10 + 40]
+    mov [rsp + 32], rax
+    call crabefi_install_multiple_protocol_interfaces_x64
+    add rsp, 40
+    ret
+
+    .global crabefi_uninstall_multiple_protocol_interfaces_entry
+    .type crabefi_uninstall_multiple_protocol_interfaces_entry,@function
+crabefi_uninstall_multiple_protocol_interfaces_entry:
+    mov r10, rsp
+    sub rsp, 40
+    lea rax, [r10 + 40]
+    mov [rsp + 32], rax
+    call crabefi_uninstall_multiple_protocol_interfaces_x64
+    add rsp, 40
+    ret
+"#
+);
+
+#[cfg(target_arch = "x86_64")]
+unsafe extern "efiapi" {
+    fn crabefi_install_multiple_protocol_interfaces_entry(
+        handle: *mut Handle,
+        protocol: *mut c_void,
+        interface: *mut c_void,
+    ) -> Status;
+    fn crabefi_uninstall_multiple_protocol_interfaces_entry(
+        handle: Handle,
+        protocol: *mut c_void,
+        interface: *mut c_void,
+    ) -> Status;
+}
+
+#[cfg(target_arch = "x86_64")]
+const INSTALL_MULTIPLE_PROTOCOL_INTERFACES: InstallMultipleFn = unsafe {
+    core::mem::transmute::<
+        unsafe extern "efiapi" fn(*mut Handle, *mut c_void, *mut c_void) -> Status,
+        InstallMultipleFn,
+    >(crabefi_install_multiple_protocol_interfaces_entry)
+};
+
+#[cfg(target_arch = "x86_64")]
+const UNINSTALL_MULTIPLE_PROTOCOL_INTERFACES: UninstallMultipleFn = unsafe {
+    core::mem::transmute::<
+        unsafe extern "efiapi" fn(Handle, *mut c_void, *mut c_void) -> Status,
+        UninstallMultipleFn,
+    >(crabefi_uninstall_multiple_protocol_interfaces_entry)
+};
+
+#[cfg(not(target_arch = "x86_64"))]
+const INSTALL_MULTIPLE_PROTOCOL_INTERFACES: InstallMultipleFn = unsafe {
+    core::mem::transmute::<
+        unsafe extern "C" fn(*mut Handle, *mut c_void, *mut c_void, ...) -> Status,
+        InstallMultipleFn,
+    >(install_multiple_protocol_interfaces_c)
+};
+
+#[cfg(not(target_arch = "x86_64"))]
+const UNINSTALL_MULTIPLE_PROTOCOL_INTERFACES: UninstallMultipleFn = unsafe {
+    core::mem::transmute::<
+        unsafe extern "C" fn(Handle, *mut c_void, *mut c_void, ...) -> Status,
+        UninstallMultipleFn,
+    >(uninstall_multiple_protocol_interfaces_c)
+};
+
+const MAX_PROTOCOL_PAIRS: usize = 16;
+
+fn collect_protocol_pair(
+    pairs: &mut Vec<(Guid, *mut c_void)>,
+    protocol: *mut c_void,
+    interface: *mut c_void,
+) -> Result<bool, Status> {
+    if protocol.is_null() {
+        return Ok(false);
+    }
+    if pairs.len() >= MAX_PROTOCOL_PAIRS {
+        return Err(Status::INVALID_PARAMETER);
+    }
+    if pairs.try_reserve(1).is_err() {
+        return Err(Status::OUT_OF_RESOURCES);
+    }
+    pairs.push((unsafe { *(protocol as *const Guid) }, interface));
+    Ok(true)
+}
+
+fn install_multiple_pairs(handle: *mut Handle, pairs: &[(Guid, *mut c_void)]) -> Status {
+    if handle.is_null() || pairs.is_empty() {
         return Status::INVALID_PARAMETER;
     }
 
-    // Collect the argument pairs
-    let args = [(arg1, arg2), (arg3, arg4), (arg5, arg6), (arg7, arg8)];
-
-    // Count how many valid protocol pairs we have (until NULL GUID)
-    let pair_count = args
-        .iter()
-        .take_while(|(guid_ptr, _)| !guid_ptr.is_null())
-        .count();
-
-    log::debug!(
-        "BS.InstallMultipleProtocolInterfaces(handle={:?}, {} protocols)",
-        unsafe { *handle },
-        pair_count
-    );
-
-    if pair_count == 0 {
-        // No protocols to install, just return success
-        return Status::SUCCESS;
-    }
-
-    // If handle points to NULL, create a new handle
-    let target_handle = if unsafe { (*handle).is_null() } {
-        match create_handle() {
-            Some(h) => {
-                unsafe { *handle = h };
-                log::debug!("  Created new handle: {:?}", h);
-                h
-            }
-            None => {
-                log::error!("  Failed to create handle");
-                return Status::OUT_OF_RESOURCES;
-            }
-        }
+    let created_handle = unsafe { (*handle).is_null() };
+    let target_handle = if created_handle {
+        let Some(new_handle) = create_handle() else {
+            return Status::OUT_OF_RESOURCES;
+        };
+        unsafe { *handle = new_handle };
+        new_handle
     } else {
         unsafe { *handle }
     };
 
-    // Install each protocol, rolling back on failure
-    for i in 0..pair_count {
-        let guid_ptr = args[i].0 as *mut Guid;
-        let interface = args[i].1;
-
-        if guid_ptr.is_null() {
-            break;
-        }
-
-        let guid = unsafe { *guid_ptr };
-        log::debug!("  Installing protocol: {}", GuidFmt(guid));
-
-        let status = install_protocol(target_handle, &guid, interface);
+    for (index, (guid, interface)) in pairs.iter().enumerate() {
+        let status = install_protocol(target_handle, guid, *interface);
         if status != Status::SUCCESS {
-            log::error!(
-                "  Failed to install protocol {}: {:?}",
-                GuidFmt(guid),
-                status
-            );
-            // Rollback: uninstall previously installed protocols from this call
-            for j in (0..i).rev() {
-                let prev_guid_ptr = args[j].0 as *const Guid;
-                if !prev_guid_ptr.is_null() {
-                    let prev_guid = unsafe { *prev_guid_ptr };
-                    let _ = remove_protocol(target_handle, &prev_guid, None);
+            let mut rollback_complete = true;
+            for (installed_guid, installed_interface) in pairs[..index].iter().rev() {
+                let rollback_status =
+                    remove_protocol(target_handle, installed_guid, Some(*installed_interface));
+                if rollback_status != Status::SUCCESS {
+                    rollback_complete = false;
+                    log::error!(
+                        "InstallMultipleProtocolInterfaces rollback failed for {} on {:?}: {:?}",
+                        GuidFmt(*installed_guid),
+                        target_handle,
+                        rollback_status
+                    );
                 }
             }
-            reclaim_empty_handle(target_handle);
+            if created_handle && rollback_complete && reclaim_empty_handle(target_handle) {
+                unsafe { *handle = core::ptr::null_mut() };
+            }
             return status;
         }
     }
-
-    log::trace!("  -> SUCCESS");
     Status::SUCCESS
 }
 
-extern "efiapi" fn uninstall_multiple_protocol_interfaces(
-    handle: Handle,
-    arg1: *mut c_void,
-    arg2: *mut c_void,
-    arg3: *mut c_void,
-    arg4: *mut c_void,
-    arg5: *mut c_void,
-    arg6: *mut c_void,
-    arg7: *mut c_void,
-    arg8: *mut c_void,
-) -> Status {
-    log::debug!(
-        "BS.UninstallMultipleProtocolInterfaces(handle={:?})",
-        handle
-    );
+fn reclaim_empty_handle(handle: Handle) -> bool {
+    state::with_efi_mut(|efi_state| {
+        let Some(index) = efi_state.handles[..efi_state.handle_count]
+            .iter()
+            .position(|entry| entry.handle == handle)
+        else {
+            // Removing the final installed protocol already reclaimed it.
+            return true;
+        };
+        if efi_state.handles[index].protocol_count != 0 {
+            return false;
+        }
+        efi_state
+            .handles
+            .copy_within(index + 1..efi_state.handle_count, index);
+        efi_state.handle_count -= 1;
+        efi_state.handles[efi_state.handle_count] = crate::state::HandleEntry::empty();
+        true
+    })
+}
 
-    if handle.is_null() {
+fn uninstall_multiple_pairs(handle: Handle, pairs: &[(Guid, *mut c_void)]) -> Status {
+    if handle.is_null() || pairs.is_empty() {
         return Status::INVALID_PARAMETER;
     }
+    for (index, pair) in pairs.iter().enumerate() {
+        if pairs[..index].contains(pair) {
+            return Status::INVALID_PARAMETER;
+        }
+    }
 
-    let args = [(arg1, arg2), (arg3, arg4), (arg5, arg6), (arg7, arg8)];
+    let validation = unsafe { &*state::efi_ptr() };
+    let Some(handle_entry) = validation.handles[..validation.handle_count]
+        .iter()
+        .find(|entry| entry.handle == handle)
+    else {
+        return Status::INVALID_PARAMETER;
+    };
+    for (guid, interface) in pairs {
+        if !handle_entry.protocols[..handle_entry.protocol_count]
+            .iter()
+            .any(|entry| entry.guid == *guid && entry.interface == *interface)
+        {
+            return Status::NOT_FOUND;
+        }
+        if validation
+            .open_protocols
+            .iter()
+            .any(|open| open.handle == handle && open.protocol == *guid)
+        {
+            return Status::ACCESS_DENIED;
+        }
+    }
 
-    // Uninstall each protocol
-    for (guid_ptr, interface) in args.iter().take_while(|(g, _)| !g.is_null()) {
-        let guid = unsafe { *(*guid_ptr as *const Guid) };
-        log::debug!("  Uninstalling protocol: {}", GuidFmt(guid));
-
-        let status = remove_protocol(handle, &guid, Some(*interface));
+    for (guid, interface) in pairs {
+        let status = remove_protocol(handle, guid, Some(*interface));
         if status != Status::SUCCESS {
             return status;
         }
     }
-
-    log::trace!("  -> SUCCESS");
     Status::SUCCESS
+}
+
+#[cfg(target_arch = "x86_64")]
+unsafe fn collect_x64_pairs(
+    first_protocol: *mut c_void,
+    first_interface: *mut c_void,
+    second_protocol: *mut c_void,
+    stack_arguments: *const *mut c_void,
+) -> Result<Vec<(Guid, *mut c_void)>, Status> {
+    let mut pairs = Vec::new();
+    if !collect_protocol_pair(&mut pairs, first_protocol, first_interface)? {
+        return Ok(pairs);
+    }
+
+    let mut protocol = second_protocol;
+    let mut arguments = stack_arguments;
+    while !protocol.is_null() {
+        let interface = unsafe { *arguments };
+        collect_protocol_pair(&mut pairs, protocol, interface)?;
+        protocol = unsafe { *arguments.add(1) };
+        arguments = unsafe { arguments.add(2) };
+    }
+    Ok(pairs)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[unsafe(no_mangle)]
+extern "efiapi" fn crabefi_install_multiple_protocol_interfaces_x64(
+    handle: *mut Handle,
+    first_protocol: *mut c_void,
+    first_interface: *mut c_void,
+    second_protocol: *mut c_void,
+    stack_arguments: *const *mut c_void,
+) -> Status {
+    let pairs = match unsafe {
+        collect_x64_pairs(
+            first_protocol,
+            first_interface,
+            second_protocol,
+            stack_arguments,
+        )
+    } {
+        Ok(pairs) => pairs,
+        Err(status) => return status,
+    };
+    install_multiple_pairs(handle, &pairs)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[unsafe(no_mangle)]
+extern "efiapi" fn crabefi_uninstall_multiple_protocol_interfaces_x64(
+    handle: Handle,
+    first_protocol: *mut c_void,
+    first_interface: *mut c_void,
+    second_protocol: *mut c_void,
+    stack_arguments: *const *mut c_void,
+) -> Status {
+    let pairs = match unsafe {
+        collect_x64_pairs(
+            first_protocol,
+            first_interface,
+            second_protocol,
+            stack_arguments,
+        )
+    } {
+        Ok(pairs) => pairs,
+        Err(status) => return status,
+    };
+    uninstall_multiple_pairs(handle, &pairs)
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+unsafe extern "C" fn install_multiple_protocol_interfaces_c(
+    handle: *mut Handle,
+    first_protocol: *mut c_void,
+    first_interface: *mut c_void,
+    mut arguments: ...
+) -> Status {
+    let mut pairs = Vec::new();
+    match collect_protocol_pair(&mut pairs, first_protocol, first_interface) {
+        Ok(true) => {}
+        Ok(false) => return Status::INVALID_PARAMETER,
+        Err(status) => return status,
+    }
+    loop {
+        let protocol: *mut c_void = unsafe { arguments.next_arg() };
+        if protocol.is_null() {
+            break;
+        }
+        let interface: *mut c_void = unsafe { arguments.next_arg() };
+        if let Err(status) = collect_protocol_pair(&mut pairs, protocol, interface) {
+            return status;
+        }
+    }
+    install_multiple_pairs(handle, &pairs)
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+unsafe extern "C" fn uninstall_multiple_protocol_interfaces_c(
+    handle: Handle,
+    first_protocol: *mut c_void,
+    first_interface: *mut c_void,
+    mut arguments: ...
+) -> Status {
+    let mut pairs = Vec::new();
+    match collect_protocol_pair(&mut pairs, first_protocol, first_interface) {
+        Ok(true) => {}
+        Ok(false) => return Status::INVALID_PARAMETER,
+        Err(status) => return status,
+    }
+    loop {
+        let protocol: *mut c_void = unsafe { arguments.next_arg() };
+        if protocol.is_null() {
+            break;
+        }
+        let interface: *mut c_void = unsafe { arguments.next_arg() };
+        if let Err(status) = collect_protocol_pair(&mut pairs, protocol, interface) {
+            return status;
+        }
+    }
+    uninstall_multiple_pairs(handle, &pairs)
 }
 
 extern "efiapi" fn calculate_crc32(data: *mut c_void, data_size: usize, crc32: *mut u32) -> Status {
@@ -2400,22 +2563,6 @@ pub fn create_handle() -> Option<Handle> {
 
         Some(handle)
     })
-}
-
-fn reclaim_empty_handle(handle: Handle) {
-    state::with_efi_mut(|efi_state| {
-        let Some(index) = efi_state.handles[..efi_state.handle_count]
-            .iter()
-            .position(|entry| entry.handle == handle && entry.protocol_count == 0)
-        else {
-            return;
-        };
-        efi_state
-            .handles
-            .copy_within(index + 1..efi_state.handle_count, index);
-        efi_state.handle_count -= 1;
-        efi_state.handles[efi_state.handle_count] = crate::state::HandleEntry::empty();
-    });
 }
 
 /// Remove one protocol interface and reclaim an empty handle slot.
