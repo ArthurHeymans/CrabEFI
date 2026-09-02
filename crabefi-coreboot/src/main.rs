@@ -382,7 +382,7 @@ impl CorebootCapsuleBackend {
             return;
         }
         self.fmap_loaded = true;
-        let parsed = crabefi::state::with_storage_mut(|storage| {
+        let parsed = crabefi::efi::varstore::with_storage_mut(|storage| {
             fmap::read_fmap(storage.controller_mut(), self.fmap_offset)
         })
         .flatten();
@@ -428,7 +428,7 @@ impl crabefi::CapsuleBackend for CorebootCapsuleBackend {
         if offset as u64 + data.len() as u64 > u64::from(region.size) {
             return Err(crabefi::StorageError::InvalidArgument);
         }
-        crabefi::state::with_storage_mut(|storage| {
+        crabefi::efi::varstore::with_storage_mut(|storage| {
             let controller = storage.controller_mut();
             crabefi::FirmwareStorage::enable_writes(controller)?;
             crabefi::FirmwareStorage::erase(

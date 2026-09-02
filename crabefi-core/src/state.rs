@@ -30,12 +30,8 @@ use crate::fs::fat::FatType;
 
 /// EFI service bookkeeping: handles, events, loaded images, filesystem.
 static EFI: Local<EfiState> = Local::new(EfiState::new());
-/// Persistent variable-store bookkeeping.
-static VARSTORE: LocalCell<VarStoreState> = LocalCell::new(VarStoreState::new());
 /// Filesystem block device.
 static BLOCK_DEVICE: Local<Option<crate::drivers::block::AnyBlockDevice>> = Local::new(None);
-/// Storage backend for variable persistence (SPI flash).
-static STORAGE: Local<Option<crate::efi::varstore::SpiStorageBackend>> = Local::new(None);
 /// Hardware driver state.
 static DRIVERS: Local<DriverState> = Local::new(DriverState::new());
 /// EFI console state.
@@ -245,40 +241,6 @@ impl LoadedImageEntry {
             measurement_event_data: core::ptr::null_mut(),
             measurement_event_data_size: 0,
         }
-    }
-}
-
-/// Variable store persistence state
-///
-/// Tracks the runtime state of the persistent variable store region.
-/// The actual storage location is determined at runtime from coreboot
-/// tables (SMMSTORE v2) or FMAP (SMMSTORE region).
-#[derive(Clone, Copy)]
-pub struct VarStoreState {
-    /// Whether the store header has been validated/written
-    pub initialized: bool,
-    /// Next free location for appending records (relative to store start)
-    pub write_offset: u32,
-    /// Whether the EDK2 FV uses authenticated variable headers (60 bytes vs 32)
-    pub auth_format: bool,
-    /// Size of the variable data area (after FV + VS headers)
-    pub data_size: u32,
-}
-
-impl VarStoreState {
-    pub const fn new() -> Self {
-        Self {
-            initialized: false,
-            write_offset: 0,
-            auth_format: false,
-            data_size: 0,
-        }
-    }
-}
-
-impl Default for VarStoreState {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -734,35 +696,6 @@ pub fn with_block_device_mut<R>(
 #[track_caller]
 pub fn set_block_device(device: crate::drivers::block::AnyBlockDevice) {
     *BLOCK_DEVICE.borrow_mut() = Some(device);
-}
-
-/// Mutate the variable-store storage backend through a closure.
-///
-/// Returns `None` if no storage backend is configured.
-#[inline]
-#[track_caller]
-pub fn with_storage_mut<R>(
-    f: impl FnOnce(&mut crate::efi::varstore::SpiStorageBackend) -> R,
-) -> Option<R> {
-    STORAGE.borrow_mut().as_mut().map(f)
-}
-
-/// Install the variable-store storage backend.
-#[track_caller]
-pub fn set_storage(backend: crate::efi::varstore::SpiStorageBackend) {
-    *STORAGE.borrow_mut() = Some(backend);
-}
-
-/// Copy of the variable-store bookkeeping.
-#[inline]
-pub fn varstore() -> VarStoreState {
-    VARSTORE.get()
-}
-
-/// Update the variable-store bookkeeping through a closure.
-#[inline]
-pub fn with_varstore_mut(f: impl FnOnce(&mut VarStoreState)) {
-    VARSTORE.update(f)
 }
 
 /// The runtime image client, once the runtime image has been loaded.

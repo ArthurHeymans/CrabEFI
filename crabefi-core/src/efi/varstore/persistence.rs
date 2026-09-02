@@ -31,6 +31,7 @@ use alloc::vec::Vec;
 
 use crabefi_runtime_abi::VariableTimestamp;
 
+use crate::cell::{Local, LocalCell};
 use crate::drivers::spi::{self, SpiController};
 use crate::platform::{
     FirmwareStorage, FirmwareStorageLocation, FirmwareStorageRegion, VariableStoreLocator,
@@ -40,6 +41,48 @@ use crate::state;
 use super::VarStoreError;
 use super::edk2;
 use super::storage::{SpiStorageBackend, StorageBackend};
+
+/// Variable store persistence state
+///
+/// Tracks the runtime state of the persistent variable store region.
+/// The actual storage location is determined at runtime from coreboot
+/// tables (SMMSTORE v2) or FMAP (SMMSTORE region).
+#[derive(Clone, Copy)]
+struct VarStoreState {
+    /// Whether the store header has been validated/written
+    initialized: bool,
+    /// Next free location for appending records (relative to store start)
+    write_offset: u32,
+    /// Whether the EDK2 FV uses authenticated variable headers (60 bytes vs 32)
+    auth_format: bool,
+    /// Size of the variable data area (after FV + VS headers)
+    data_size: u32,
+}
+
+impl VarStoreState {
+    const fn new() -> Self {
+        Self {
+            initialized: false,
+            write_offset: 0,
+            auth_format: false,
+            data_size: 0,
+        }
+    }
+}
+
+/// Persistent variable-store bookkeeping.
+static VARSTORE: LocalCell<VarStoreState> = LocalCell::new(VarStoreState::new());
+/// Storage backend for variable persistence (SPI flash).
+static STORAGE: Local<Option<SpiStorageBackend>> = Local::new(None);
+
+/// Mutate the variable-store storage backend through a closure.
+///
+/// Returns `None` if no storage backend is configured.
+#[inline]
+#[track_caller]
+pub fn with_storage_mut<R>(f: impl FnOnce(&mut SpiStorageBackend) -> R) -> Option<R> {
+    STORAGE.borrow_mut().as_mut().map(f)
+}
 
 /// Default variable store base address in SPI flash
 /// This is typically at the end of the flash region
@@ -90,7 +133,7 @@ pub fn init(locator: Option<&dyn VariableStoreLocator>) -> Result<(), VarStoreEr
     // flash devices.
     configure_from_locator(&mut backend, locator)?;
 
-    state::set_storage(backend);
+    *STORAGE.borrow_mut() = Some(backend);
 
     // Initialize the variable store region
     init_varstore()?;
@@ -203,7 +246,7 @@ fn init_varstore() -> Result<(), VarStoreError> {
     // Read enough bytes for FV header + VS header
     let header_size = edk2::FV_HEADER_LENGTH + edk2::VS_HEADER_LENGTH;
     let mut header_bytes = [0u8; 128]; // Enough for FV + VS headers (100 bytes needed)
-    let storage_size = state::with_storage_mut(|storage| {
+    let storage_size = with_storage_mut(|storage| {
         storage
             .read(0, &mut header_bytes[..header_size])
             .map_err(|_| VarStoreError::SpiError)?;
@@ -247,18 +290,18 @@ fn init_varstore() -> Result<(), VarStoreError> {
             return Ok(());
         }
 
-        state::with_varstore_mut(|vs| {
+        VARSTORE.update(|vs| {
             vs.initialized = true;
             vs.auth_format = true;
             vs.data_size = validation.data_size;
         });
-        let write_offset = state::with_storage_mut(|storage| {
+        let write_offset = with_storage_mut(|storage| {
             let mut read_fn =
                 |offset: u32, buf: &mut [u8]| -> bool { storage.read(offset, buf).is_ok() };
             edk2::find_write_offset(&mut read_fn, true, validation.data_size)
         })
         .ok_or(VarStoreError::NotInitialized)?;
-        state::with_varstore_mut(|vs| vs.write_offset = write_offset);
+        VARSTORE.update(|vs| vs.write_offset = write_offset);
         log::info!("Variable store write offset: {:#x}", write_offset);
         return Ok(());
     }
@@ -273,7 +316,7 @@ fn init_varstore() -> Result<(), VarStoreError> {
     let fv_headers = edk2::build_fv_headers(storage_size);
 
     // Try to enable writes, erase, and write headers
-    state::with_storage_mut(|storage| {
+    with_storage_mut(|storage| {
         if let Err(e) = storage.enable_writes() {
             log::warn!("Could not enable storage writes: {:?}", e);
             // Continue anyway - the erase/write will fail if truly locked
@@ -295,7 +338,7 @@ fn init_varstore() -> Result<(), VarStoreError> {
 
     let data_size = storage_size - edk2::FV_HEADER_LENGTH as u32 - edk2::VS_HEADER_LENGTH as u32;
 
-    state::with_varstore_mut(|vs| {
+    VARSTORE.update(|vs| {
         vs.initialized = true;
         vs.auth_format = true;
         vs.data_size = data_size;
@@ -307,7 +350,7 @@ fn init_varstore() -> Result<(), VarStoreError> {
 }
 
 fn migrate_non_auth_store(storage_size: u32, data_size: u32) -> Result<(), VarStoreError> {
-    let variables = state::with_storage_mut(|storage| {
+    let variables = with_storage_mut(|storage| {
         let mut read_fn = |offset: u32, buffer: &mut [u8]| storage.read(offset, buffer).is_ok();
         edk2::walk_variables(&mut read_fn, false, data_size)
     })
@@ -338,12 +381,12 @@ fn migrate_non_auth_store(storage_size: u32, data_size: u32) -> Result<(), VarSt
         Err(error) => return Err(error),
     }
 
-    let write_offset = state::with_storage_mut(|storage| {
+    let write_offset = with_storage_mut(|storage| {
         let mut read_fn = |offset: u32, buffer: &mut [u8]| storage.read(offset, buffer).is_ok();
         edk2::find_write_offset(&mut read_fn, false, data_size)
     })
     .ok_or(VarStoreError::NotInitialized)?;
-    state::with_varstore_mut(|store| {
+    VARSTORE.update(|store| {
         store.initialized = true;
         store.auth_format = false;
         store.data_size = data_size;
@@ -382,7 +425,7 @@ fn preflight_non_auth_migration(
 
 /// Load variables from storage into the in-memory cache
 fn load_variables_from_storage() -> Result<(), VarStoreError> {
-    let vs = state::varstore();
+    let vs = VARSTORE.get();
     if !vs.initialized {
         return Err(VarStoreError::NotInitialized);
     }
@@ -390,7 +433,7 @@ fn load_variables_from_storage() -> Result<(), VarStoreError> {
     let data_size = vs.data_size;
 
     // Walk all variable records in the FV
-    let vars = state::with_storage_mut(|storage| {
+    let vars = with_storage_mut(|storage| {
         let mut read_fn =
             |offset: u32, buf: &mut [u8]| -> bool { storage.read(offset, buf).is_ok() };
         edk2::walk_variables(&mut read_fn, auth_format, data_size)
@@ -448,12 +491,12 @@ fn load_variables_from_storage() -> Result<(), VarStoreError> {
 
 /// Get the latest durable authenticated timestamp, including deletion floors.
 pub fn get_variable_timestamp(guid: &r_efi::efi::Guid, name: &[u16]) -> Option<VariableTimestamp> {
-    let variable_store = state::varstore();
+    let variable_store = VARSTORE.get();
     if !variable_store.initialized || !variable_store.auth_format {
         return None;
     }
     let guid = edk2::guid_to_bytes(guid);
-    state::with_storage_mut(|storage| {
+    with_storage_mut(|storage| {
         let mut read_fn = |offset: u32, buffer: &mut [u8]| storage.read(offset, buffer).is_ok();
         let variables = edk2::walk_variables(&mut read_fn, true, variable_store.data_size);
         latest_matching_timestamp(&variables, &guid, name)
@@ -493,7 +536,7 @@ pub(crate) fn write_variable_to_storage_internal(
     data: &[u8],
     timestamp: Option<VariableTimestamp>,
 ) -> Result<(), VarStoreError> {
-    let vs = state::varstore();
+    let vs = VARSTORE.get();
     require_writable_store(vs.initialized, vs.auth_format)?;
 
     let guid_bytes = edk2::guid_to_bytes(guid);
@@ -503,20 +546,19 @@ pub(crate) fn write_variable_to_storage_internal(
         .ok_or(VarStoreError::InvalidArgument)?;
     let record_len = record.len() as u32;
 
-    let storage_size =
-        state::with_storage_mut(|s| s.size()).ok_or(VarStoreError::NotInitialized)?;
+    let storage_size = with_storage_mut(|s| s.size()).ok_or(VarStoreError::NotInitialized)?;
 
-    let mut write_offset = state::varstore().write_offset;
+    let mut write_offset = VARSTORE.get().write_offset;
     if !write_slot_available(write_offset, record_len, storage_size)? {
         compact_variable_store()?;
-        write_offset = state::varstore().write_offset;
+        write_offset = VARSTORE.get().write_offset;
         if !write_slot_available(write_offset, record_len, storage_size)? {
             return Err(VarStoreError::StoreFull);
         }
     }
 
     // Write the new record using multi-stage protocol
-    let new_offset = state::with_storage_mut(|storage| {
+    let new_offset = with_storage_mut(|storage| {
         if let Err(e) = storage.enable_writes() {
             log::warn!("Could not enable storage writes: {:?}", e);
         }
@@ -544,7 +586,7 @@ pub(crate) fn write_variable_to_storage_internal(
     // The new VAR_ADDED record is now durable and is the visible commit point.
     // Retirement cannot turn that committed outcome back into a reported
     // failure; a later compaction will reclaim any stale predecessor.
-    state::with_varstore_mut(|vs| vs.write_offset = new_offset);
+    VARSTORE.update(|vs| vs.write_offset = new_offset);
     if let Err(error) = delete_existing_record_except(&guid_bytes, name, Some(write_offset + 2)) {
         log::warn!(
             "Variable committed but predecessor retirement failed: {:?}",
@@ -575,11 +617,11 @@ fn write_slot_available(offset: u32, len: u32, storage_size: u32) -> Result<bool
 /// the normal header-valid then VAR_ADDED protocol rather than becoming
 /// permanently unreclaimable after ordinary updates.
 fn compact_variable_store() -> Result<(), VarStoreError> {
-    let vs = state::varstore();
+    let vs = VARSTORE.get();
     if !vs.initialized || !vs.auth_format {
         return Err(VarStoreError::StoreFull);
     }
-    let vars = state::with_storage_mut(|storage| {
+    let vars = with_storage_mut(|storage| {
         let mut read_fn = |offset: u32, buf: &mut [u8]| storage.read(offset, buf).is_ok();
         edk2::walk_variables(&mut read_fn, vs.auth_format, vs.data_size)
     })
@@ -595,8 +637,8 @@ fn compact_variable_store() -> Result<(), VarStoreError> {
         active.push(variable);
     }
     let storage_size =
-        state::with_storage_mut(|storage| storage.size()).ok_or(VarStoreError::NotInitialized)?;
-    let end = state::with_storage_mut(|storage| {
+        with_storage_mut(|storage| storage.size()).ok_or(VarStoreError::NotInitialized)?;
+    let end = with_storage_mut(|storage| {
         if let Err(error) = storage.enable_writes() {
             log::warn!(
                 "Could not enable storage writes before compaction: {:?}",
@@ -626,7 +668,7 @@ fn compact_variable_store() -> Result<(), VarStoreError> {
         Ok::<u32, VarStoreError>(offset)
     })
     .ok_or(VarStoreError::NotInitialized)??;
-    state::with_varstore_mut(|store| {
+    VARSTORE.update(|store| {
         store.write_offset = end;
     });
     log::info!(
@@ -640,7 +682,7 @@ fn compact_variable_store() -> Result<(), VarStoreError> {
 fn is_erased_for_write(offset: u32, len: u32) -> Result<bool, VarStoreError> {
     const CHUNK_SIZE: usize = 256;
 
-    state::with_storage_mut(|storage| {
+    with_storage_mut(|storage| {
         let mut remaining = len as usize;
         let mut current = offset;
         let mut buffer = [0u8; CHUNK_SIZE];
@@ -666,7 +708,7 @@ fn is_erased_for_write(offset: u32, len: u32) -> Result<bool, VarStoreError> {
 
 /// Verify that a just-written record is readable through the SPI controller.
 fn verify_written_record(offset: u32, expected: &[u8]) -> Result<(), VarStoreError> {
-    state::with_storage_mut(|storage| {
+    with_storage_mut(|storage| {
         let mut controller_bytes = alloc::vec![0; expected.len()];
         storage
             .read_controller(offset, &mut controller_bytes)
@@ -734,7 +776,7 @@ pub(crate) fn write_variable_deletion_internal(
     attributes: u32,
     timestamp: Option<VariableTimestamp>,
 ) -> Result<(), VarStoreError> {
-    let vs = state::varstore();
+    let vs = VARSTORE.get();
     require_writable_store(vs.initialized, vs.auth_format)?;
     if timestamp.is_some() {
         // An active zero-length authenticated record is invisible to coreboot's
@@ -752,13 +794,13 @@ fn delete_existing_record_except(
     name: &[u16],
     keep_state_offset: Option<u32>,
 ) -> Result<(), VarStoreError> {
-    let vs = state::varstore();
+    let vs = VARSTORE.get();
     require_writable_store(vs.initialized, vs.auth_format)?;
     let auth_format = vs.auth_format;
     let data_size = vs.data_size;
 
     // Walk all records to find matching ones
-    let vars = state::with_storage_mut(|storage| {
+    let vars = with_storage_mut(|storage| {
         let mut read_fn =
             |offset: u32, buf: &mut [u8]| -> bool { storage.read(offset, buf).is_ok() };
         edk2::walk_variables(&mut read_fn, auth_format, data_size)
@@ -773,7 +815,7 @@ fn delete_existing_record_except(
             && edk2::name_matches(&var.name, name)
         {
             // Mark as deleted by writing to the state byte
-            let deleted = state::with_storage_mut(|storage| {
+            let deleted = with_storage_mut(|storage| {
                 if let Err(e) = storage.enable_writes() {
                     log::warn!("Could not enable storage writes: {:?}", e);
                 }
@@ -790,7 +832,7 @@ fn delete_existing_record_except(
                 );
                 return Err(VarStoreError::SpiError);
             }
-            let state_byte = state::with_storage_mut(|storage| {
+            let state_byte = with_storage_mut(|storage| {
                 let mut byte = [0u8; 1];
                 storage
                     .read_controller(var.state_offset, &mut byte)
@@ -814,17 +856,17 @@ fn delete_existing_record_except(
 
 /// Check if storage backend is available
 pub fn is_storage_available() -> bool {
-    state::with_storage_mut(|_| ()).is_some()
+    with_storage_mut(|_| ()).is_some()
 }
 
 /// Check if variable store is initialized.
 pub fn is_varstore_initialized() -> bool {
-    state::varstore().initialized
+    VARSTORE.get().initialized
 }
 
 /// Check whether the initialized store accepts durable authenticated writes.
 pub fn is_varstore_writable() -> bool {
-    let store = state::varstore();
+    let store = VARSTORE.get();
     store.initialized && store.auth_format
 }
 
@@ -832,8 +874,8 @@ pub fn is_varstore_writable() -> bool {
 ///
 /// Returns (base_offset, size, write_offset)
 pub fn get_varstore_stats() -> Option<(u32, u32, u32)> {
-    let vs = state::varstore();
-    let (base, size) = state::with_storage_mut(|s| (s.base_offset(), s.size()))?;
+    let vs = VARSTORE.get();
+    let (base, size) = with_storage_mut(|s| (s.base_offset(), s.size()))?;
     Some((base, size, vs.write_offset))
 }
 
