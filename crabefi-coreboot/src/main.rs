@@ -634,7 +634,7 @@ fn extract_timer_freq_from_fdt(fdt_ptr: u64, fdt_size: u32) {
         if freq > 0 {
             // SAFETY: single-threaded init, state already initialized
             unsafe {
-                let t = &mut (*crabefi::state::drivers_mut_ptr()).timing;
+                let t = &mut (*crabefi::state::drivers_ptr()).timing;
                 t.counter_freq_hz = freq;
                 t.counter_cycles_per_us = (freq / 1_000_000).max(1);
             }
@@ -689,7 +689,9 @@ fn riscv_fdt_only_boot(fdt_ptr: u64, fdt_size: u32) -> ! {
     let region_count = build_memory_map_from_fdt(fdt_ptr, fdt_size, &mut memory_regions);
 
     let timer = CorebootTimer {
-        freq_hz: crabefi::state::drivers().timing.counter_freq_hz,
+        freq_hz: unsafe { &*crabefi::state::drivers_ptr() }
+            .timing
+            .counter_freq_hz,
     };
     let reset = CorebootReset;
     let hooks = CorebootHooks;
@@ -938,7 +940,9 @@ pub extern "C" fn rust_main(coreboot_table_ptr: u64) -> ! {
 
     // Create timer backed by the calibrated arch counter.
     let timer = CorebootTimer {
-        freq_hz: crabefi::state::drivers().timing.counter_freq_hz,
+        freq_hz: unsafe { &*crabefi::state::drivers_ptr() }
+            .timing
+            .counter_freq_hz,
     };
 
     let reset = CorebootReset;
@@ -1098,7 +1102,10 @@ pub extern "C" fn rust_main(coreboot_table_ptr: u64) -> ! {
     // for ECAM base and add_platform_mmio_regions() reads for MMIO.
     // RISC-V platforms use FDT rather than ACPI, so skip this.
     #[cfg(not(target_arch = "riscv64"))]
-    if let Some(rsdp) = crabefi::state::drivers().platform.acpi_rsdp {
+    if let Some(rsdp) = unsafe { &*crabefi::state::drivers_ptr() }
+        .platform
+        .acpi_rsdp
+    {
         let acpi_info = unsafe { acpi::discover_platform(rsdp) };
         crabefi::state::with_drivers_mut(|d| d.acpi_info = acpi_info.clone());
 

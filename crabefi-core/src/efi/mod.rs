@@ -934,7 +934,7 @@ pub fn add_platform_mmio_regions() {
     };
 
     // Try to get platform info from FDT (if available)
-    let plat = crate::state::drivers().fdt_info.clone();
+    let plat = unsafe { &*crate::state::drivers_ptr() }.fdt_info.clone();
 
     // Interrupt controller — from FDT only (GIC on aarch64, PLIC on riscv64).
     // The `gicd` field is reused for PLIC on RISC-V (see fdt.rs:extract_gic).

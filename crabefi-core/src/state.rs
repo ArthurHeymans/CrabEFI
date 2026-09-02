@@ -1,74 +1,21 @@
 //! Global Firmware State
 //!
-//! This module provides a centralized state structure for CrabEFI that holds all
-//! mutable state. Instead of having many scattered `static Mutex<T>` variables,
-//! we allocate a single `FirmwareState` struct on the stack in the entry point
-//! and store a pointer to it in a single global.
+//! `FirmwareState` is allocated by the entry point and published through one
+//! raw pointer. It does not expose `&'static` references. Instead, each major
+//! subsystem lives in its own `UnsafeCell` and has a raw-pointer projection
+//! (`efi_ptr`, `drivers_ptr`, `allocator_ptr`, and so on).
 //!
-//! This is more idiomatic Rust because:
-//! - State ownership is clear (it lives on the main stack)
-//! - All state is colocated, making it easier to reason about
-//! - We minimize the number of global statics
+//! The subsystem split matters: an EFI mutation no longer creates an exclusive
+//! borrow of driver, console, allocator, or variable-store state. Mutable
+//! closure accessors borrow only one cell and use always-on re-entrancy guards.
+//! Log sinks use raw projections and must restrict themselves to their assigned
+//! fields so logging can remain allocation-free and non-locking.
 //!
-//! # Architecture
-//!
-//! ```text
-//! init() in lib.rs
-//!   |
-//!   v
-//! FirmwareState on stack
-//!   |
-//!   +-- efi: EfiState
-//!   |     +-- handles, events, loaded_images
-//!   |     +-- config_tables, variables, varstore
-//!   |     +-- allocator, secure boot flags
-//!   |
-//!   +-- drivers: DriverState
-//!   |     +-- pci: PciState (devices, ecam, access method)
-//!   |     +-- serial: SerialState (driver, port, EFI mode)
-//!   |     +-- timing: TimingState (counter freq, boot timestamp)
-//!   |     +-- platform: PlatformInfo (framebuffer, SPI, handoff data)
-//!   |     +-- keyboard, usb_keyboard, storage_registry, rng
-//!   |
-//!   +-- console: ConsoleState
-//!         +-- framebuffer, cursor, dimensions, colors
-//!         +-- input state, screen_mode, output_mode
-//! ```
-//!
-//! # Thread Safety
-//!
-//! CrabEFI is single-threaded firmware. We use `UnsafeCell` for interior
-//! mutability without the overhead of `Mutex`. The UEFI spec guarantees
-//! that Boot Services are not reentrant.
-//!
-//! # Log-Path Contract
-//!
-//! Functions called from the `log` crate macros — serial output
-//! ([`crate::drivers::serial`]), platform log sinks, framebuffer logging
-//! ([`crate::fb_log`]), and the timestamp helper
-//! ([`crate::logger::get_us_since_boot`]) — must **never** create Rust
-//! references (`&` or `&mut`) into `FirmwareState`.
-//!
-//! This is necessary because `log::info!()` and friends may fire *inside*
-//! a `with_mut()` / `with_drivers_mut()` closure, which holds a live
-//! `&mut FirmwareState`.  Creating any `&FirmwareState` (e.g. via
-//! [`drivers()`] or [`try_get()`]) would alias with that `&mut` — UB
-//! under Rust's reference rules.
-//!
-//! Instead, log-path code uses **raw-pointer field access**:
-//!
-//! - **Writes**: `(*drivers_mut_ptr()).serial.driver` (serial, fb_log)
-//! - **Reads**: `(*drivers_mut_ptr()).timing.boot_counter` (timestamps)
-//!
-//! Raw-pointer access is sound here because:
-//!
-//! 1. The firmware is single-threaded — no data races.
-//! 2. The log-path functions only touch their own disjoint fields
-//!    (e.g. `serial.driver`, `console.logger_*`, `timing.boot_counter`).
-//! 3. They never read or write fields that the enclosing `with_mut()`
-//!    closure is currently modifying.
+//! CrabEFI is single-threaded. The atomic pointer and borrow flags therefore use
+//! `Ordering::Relaxed`; they publish no cross-thread synchronization guarantee.
 
 use alloc::vec::Vec;
+use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicPtr, Ordering};
 
 use crate::fs::fat::FatType;
@@ -78,11 +25,33 @@ use crate::fs::fat::FatType;
 /// This is the ONLY global mutable state. It points to a `FirmwareState`
 /// allocated on the stack in `init()`.
 static STATE_PTR: AtomicPtr<FirmwareState> = AtomicPtr::new(core::ptr::null_mut());
+static EFI_BORROWED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+static DRIVER_BORROWED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+static CONSOLE_BORROWED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+static ALLOCATOR_BORROWED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+static VARSTORE_BORROWED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
 
-/// Re-entrancy guard for `with_mut`. In debug builds, detects nested calls
-/// that would create aliasing `&mut` references (undefined behavior).
-#[cfg(debug_assertions)]
-static IN_WITH_MUT: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+struct BorrowGuard(&'static core::sync::atomic::AtomicBool);
+
+impl BorrowGuard {
+    #[inline]
+    fn enter(flag: &'static core::sync::atomic::AtomicBool, name: &str) -> Self {
+        assert!(
+            !flag.swap(true, Ordering::Relaxed),
+            "re-entrant mutable {name} state access"
+        );
+        Self(flag)
+    }
+}
+
+impl Drop for BorrowGuard {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Relaxed);
+    }
+}
 
 /// Initialize the global state pointer.
 ///
@@ -95,100 +64,29 @@ pub unsafe fn init(state: &mut FirmwareState) {
     // SAFETY: The caller guarantees that `state` remains valid for the
     // firmware lifetime and no other state has been installed.
     let _ = unsafe { (state as *const FirmwareState).as_ref() };
-    STATE_PTR.store(state as *mut FirmwareState, Ordering::Release);
+    STATE_PTR.store(state as *mut FirmwareState, Ordering::Relaxed);
 }
 
 /// Check if state has been initialized.
 pub fn is_initialized() -> bool {
-    !STATE_PTR.load(Ordering::Acquire).is_null()
+    !STATE_PTR.load(Ordering::Relaxed).is_null()
 }
 
-/// Get a reference to the global firmware state.
+/// Get the raw pointer to the global firmware state.
 ///
-/// # Panics
-///
-/// Panics if called before `init()`.
+/// No reference is returned: callers must project a subsystem pointer before
+/// accessing state, so aliasing is explicit at every unsafe access site.
 #[inline]
-pub fn get() -> &'static FirmwareState {
-    let ptr = STATE_PTR.load(Ordering::Acquire);
-    assert!(!ptr.is_null(), "FirmwareState not initialized");
-    unsafe { &*ptr }
-}
-
-/// Get a raw mutable pointer to the global firmware state.
-///
-/// This returns a raw pointer rather than a reference to avoid creating
-/// multiple aliasing `&mut` references which would be undefined behavior.
-///
-/// # Panics
-///
-/// Panics if called before `init()`.
-///
-/// # Safety Note
-///
-/// The returned pointer is valid for the firmware lifetime. Callers must
-/// ensure they don't create overlapping mutable references when dereferencing.
-/// In single-threaded firmware this is typically safe, but care must be taken
-/// with nested function calls.
-#[inline]
-pub fn get_mut_ptr() -> *mut FirmwareState {
-    let ptr = STATE_PTR.load(Ordering::Acquire);
+pub fn state_ptr() -> *mut FirmwareState {
+    let ptr = STATE_PTR.load(Ordering::Relaxed);
     assert!(!ptr.is_null(), "FirmwareState not initialized");
     ptr
 }
 
-/// Access the firmware state mutably through a closure.
-///
-/// This is the preferred way to mutate firmware state as it makes the
-/// borrowing scope explicit and prevents accidental aliasing.
-///
-/// # Example
-///
-/// ```ignore
-/// state::with_mut(|state| {
-///     state.efi.handle_count += 1;
-/// });
-/// ```
+/// Try to get the raw global state pointer before initialization completes.
 #[inline]
-pub fn with_mut<F, R>(f: F) -> R
-where
-    F: FnOnce(&mut FirmwareState) -> R,
-{
-    #[cfg(debug_assertions)]
-    assert!(
-        !IN_WITH_MUT.swap(true, Ordering::Acquire),
-        "Nested with_mut call detected — this creates aliasing &mut references (UB). \
-         Refactor to avoid re-entrant state access."
-    );
-
-    let ptr = STATE_PTR.load(Ordering::Acquire);
-    assert!(!ptr.is_null(), "FirmwareState not initialized");
-    // SAFETY: Single-threaded firmware, closure scope limits aliasing.
-    // The debug_assertions guard above detects re-entrant calls at runtime.
-    let result = unsafe { f(&mut *ptr) };
-
-    #[cfg(debug_assertions)]
-    IN_WITH_MUT.store(false, Ordering::Release);
-
-    result
-}
-
-/// Try to get a reference to the global firmware state.
-///
-/// Returns `None` if state has not been initialized yet.
-#[inline]
-pub fn try_get() -> Option<&'static FirmwareState> {
-    let ptr = STATE_PTR.load(Ordering::Acquire);
-    (!ptr.is_null()).then(|| unsafe { &*ptr })
-}
-
-/// Try to get a raw mutable pointer to the global firmware state.
-///
-/// Returns `None` if state has not been initialized yet.
-/// See `get_mut_ptr()` for safety considerations.
-#[inline]
-pub fn try_get_mut_ptr() -> Option<*mut FirmwareState> {
-    let ptr = STATE_PTR.load(Ordering::Acquire);
+pub fn try_state_ptr() -> Option<*mut FirmwareState> {
+    let ptr = STATE_PTR.load(Ordering::Relaxed);
     (!ptr.is_null()).then_some(ptr)
 }
 
@@ -231,14 +129,18 @@ fn init_entries<T>(entries: &mut Vec<T>, len: usize, init: impl FnMut() -> T) ->
 /// This struct holds all mutable state for the firmware, organized into
 /// logical subsystems.
 pub struct FirmwareState {
-    /// EFI subsystem state (handles, events, allocator, etc.)
-    pub efi: EfiState,
-
-    /// Hardware driver state
-    pub drivers: DriverState,
-
-    /// Console and display state
-    pub console: ConsoleState,
+    /// EFI service state.
+    efi: UnsafeCell<EfiState>,
+    /// Page and pool allocator state, isolated from EFI service bookkeeping.
+    allocator: UnsafeCell<MemoryAllocator>,
+    /// Persistent variable-store bookkeeping.
+    varstore: UnsafeCell<VarStoreState>,
+    /// Filesystem block device.
+    block_device: UnsafeCell<Option<crate::drivers::block::AnyBlockDevice>>,
+    /// Hardware driver state.
+    drivers: UnsafeCell<DriverState>,
+    /// Console and display state.
+    console: UnsafeCell<ConsoleState>,
 }
 
 impl FirmwareState {
@@ -248,9 +150,12 @@ impl FirmwareState {
     /// or stack allocation.
     pub const fn new() -> Self {
         Self {
-            efi: EfiState::new(),
-            drivers: DriverState::new(),
-            console: ConsoleState::new(),
+            efi: UnsafeCell::new(EfiState::new()),
+            allocator: UnsafeCell::new(MemoryAllocator::new()),
+            varstore: UnsafeCell::new(VarStoreState::new()),
+            block_device: UnsafeCell::new(None),
+            drivers: UnsafeCell::new(DriverState::new()),
+            console: UnsafeCell::new(ConsoleState::new()),
         }
     }
 }
@@ -508,12 +413,6 @@ pub struct EfiState {
     /// Loaded images database, allocated after heap startup.
     pub loaded_images: Vec<LoadedImageEntry>,
 
-    /// Variable store persistence state (SMMSTORE tracking)
-    pub varstore: VarStoreState,
-
-    /// Memory allocator
-    pub allocator: MemoryAllocator,
-
     /// Monotonic counter for GetNextMonotonicCount
     pub monotonic_count: u64,
 
@@ -524,9 +423,6 @@ pub struct EfiState {
 
     /// Filesystem state for SimpleFileSystem protocol
     pub filesystem: Option<FilesystemState>,
-
-    /// Block device for filesystem access
-    pub block_device: Option<crate::drivers::block::AnyBlockDevice>,
 }
 
 impl EfiState {
@@ -539,12 +435,10 @@ impl EfiState {
             events: Vec::new(),
             next_event_id: 2, // Start at 2, reserve 1 for keyboard
             loaded_images: Vec::new(),
-            varstore: VarStoreState::new(),
-            allocator: MemoryAllocator::new(),
+
             monotonic_count: 0,
             ready_to_boot_signaled: false,
             filesystem: None,
-            block_device: None,
         }
     }
 }
@@ -1015,52 +909,36 @@ impl FilesystemState {
 // Helper functions for accessing state components
 // ============================================================================
 
-/// Get a reference to the EFI state.
+/// Get a raw pointer to EFI service state.
 #[inline]
-pub fn efi() -> &'static EfiState {
-    &get().efi
+pub fn efi_ptr() -> *mut EfiState {
+    unsafe { UnsafeCell::raw_get(core::ptr::addr_of!((*state_ptr()).efi)) }
 }
 
-/// Get a raw mutable pointer to the EFI state.
-/// See `get_mut_ptr()` for safety considerations.
-#[inline]
-pub fn efi_mut_ptr() -> *mut EfiState {
-    let ptr = get_mut_ptr();
-    // Safety: ptr is valid, we're just computing an offset
-    unsafe { core::ptr::addr_of_mut!((*ptr).efi) }
-}
-
-/// Access EFI state mutably through a closure.
+/// Access EFI service state mutably through its disjoint cell.
 #[inline]
 pub fn with_efi_mut<F, R>(f: F) -> R
 where
     F: FnOnce(&mut EfiState) -> R,
 {
-    with_mut(|state| f(&mut state.efi))
+    let _guard = BorrowGuard::enter(&EFI_BORROWED, "EFI");
+    unsafe { f(&mut *efi_ptr()) }
 }
 
-/// Get a reference to the driver state.
+/// Get a raw pointer to driver state.
 #[inline]
-pub fn drivers() -> &'static DriverState {
-    &get().drivers
+pub fn drivers_ptr() -> *mut DriverState {
+    unsafe { UnsafeCell::raw_get(core::ptr::addr_of!((*state_ptr()).drivers)) }
 }
 
-/// Get a raw mutable pointer to the driver state.
-/// See `get_mut_ptr()` for safety considerations.
-#[inline]
-pub fn drivers_mut_ptr() -> *mut DriverState {
-    let ptr = get_mut_ptr();
-    // Safety: ptr is valid, we're just computing an offset
-    unsafe { core::ptr::addr_of_mut!((*ptr).drivers) }
-}
-
-/// Access driver state mutably through a closure.
+/// Access driver state mutably through its disjoint cell.
 #[inline]
 pub fn with_drivers_mut<F, R>(f: F) -> R
 where
     F: FnOnce(&mut DriverState) -> R,
 {
-    with_mut(|state| f(&mut state.drivers))
+    let _guard = BorrowGuard::enter(&DRIVER_BORROWED, "driver");
+    unsafe { f(&mut *drivers_ptr()) }
 }
 
 // ---------------------------------------------------------------------------
@@ -1085,55 +963,39 @@ pub fn store_framebuffer(fb: crate::platform::FramebufferConfig) {
 /// or the platform library's `FramebufferConfig`. Used by boot menus,
 /// `boot_linux()` (screen_info), and error display.
 pub fn get_framebuffer() -> Option<crate::platform::FramebufferConfig> {
-    try_get().and_then(|state| state.drivers.platform.framebuffer)
+    unsafe { (*drivers_ptr()).platform.framebuffer }
 }
 
-/// Get a reference to the console state.
+/// Get a raw pointer to console state.
 #[inline]
-pub fn console() -> &'static ConsoleState {
-    &get().console
+pub fn console_ptr() -> *mut ConsoleState {
+    unsafe { UnsafeCell::raw_get(core::ptr::addr_of!((*state_ptr()).console)) }
 }
 
-/// Get a raw mutable pointer to the console state.
-/// See `get_mut_ptr()` for safety considerations.
-#[inline]
-pub fn console_mut_ptr() -> *mut ConsoleState {
-    let ptr = get_mut_ptr();
-    // Safety: ptr is valid, we're just computing an offset
-    unsafe { core::ptr::addr_of_mut!((*ptr).console) }
-}
-
-/// Access console state mutably through a closure.
+/// Access console state mutably through its disjoint cell.
 #[inline]
 pub fn with_console_mut<F, R>(f: F) -> R
 where
     F: FnOnce(&mut ConsoleState) -> R,
 {
-    with_mut(|state| f(&mut state.console))
+    let _guard = BorrowGuard::enter(&CONSOLE_BORROWED, "console");
+    unsafe { f(&mut *console_ptr()) }
 }
 
-/// Get a reference to the memory allocator.
+/// Get a raw pointer to allocator state.
 #[inline]
-pub fn allocator() -> &'static MemoryAllocator {
-    &get().efi.allocator
+pub fn allocator_ptr() -> *mut MemoryAllocator {
+    unsafe { UnsafeCell::raw_get(core::ptr::addr_of!((*state_ptr()).allocator)) }
 }
 
-/// Get a raw mutable pointer to the memory allocator.
-/// See `get_mut_ptr()` for safety considerations.
-#[inline]
-pub fn allocator_mut_ptr() -> *mut MemoryAllocator {
-    let ptr = get_mut_ptr();
-    // Safety: ptr is valid, we're just computing an offset
-    unsafe { core::ptr::addr_of_mut!((*ptr).efi.allocator) }
-}
-
-/// Access allocator state mutably through a closure.
+/// Access allocator state mutably through its disjoint cell.
 #[inline]
 pub fn with_allocator_mut<F, R>(f: F) -> R
 where
     F: FnOnce(&mut MemoryAllocator) -> R,
 {
-    with_mut(|state| f(&mut state.efi.allocator))
+    let _guard = BorrowGuard::enter(&ALLOCATOR_BORROWED, "allocator");
+    unsafe { f(&mut *allocator_ptr()) }
 }
 
 /// Access the block device mutably through a closure.
@@ -1144,7 +1006,17 @@ pub fn with_block_device_mut<F, R>(f: F) -> Option<R>
 where
     F: FnOnce(&mut crate::drivers::block::AnyBlockDevice) -> R,
 {
-    with_mut(|state| state.efi.block_device.as_mut().map(f))
+    unsafe { (*block_device_ptr()).as_mut().map(f) }
+}
+
+/// Replace the filesystem block device.
+pub fn set_block_device(device: crate::drivers::block::AnyBlockDevice) {
+    unsafe { *block_device_ptr() = Some(device) };
+}
+
+#[inline]
+fn block_device_ptr() -> *mut Option<crate::drivers::block::AnyBlockDevice> {
+    unsafe { UnsafeCell::raw_get(core::ptr::addr_of!((*state_ptr()).block_device)) }
 }
 
 /// Access the storage backend mutably through a closure.
@@ -1155,20 +1027,21 @@ pub fn with_storage_mut<F, R>(f: F) -> Option<R>
 where
     F: FnOnce(&mut crate::efi::varstore::SpiStorageBackend) -> R,
 {
-    with_mut(|state| state.drivers.platform.storage.as_mut().map(f))
+    unsafe { (*drivers_ptr()).platform.storage.as_mut().map(f) }
 }
 
-/// Get a reference to the varstore state.
+/// Get a raw pointer to variable-store state.
 #[inline]
-pub fn varstore() -> &'static VarStoreState {
-    &get().efi.varstore
+pub fn varstore_ptr() -> *mut VarStoreState {
+    unsafe { UnsafeCell::raw_get(core::ptr::addr_of!((*state_ptr()).varstore)) }
 }
 
-/// Access varstore state mutably through a closure.
+/// Access variable-store state mutably through its disjoint cell.
 #[inline]
 pub fn with_varstore_mut<F, R>(f: F) -> R
 where
     F: FnOnce(&mut VarStoreState) -> R,
 {
-    with_mut(|state| f(&mut state.efi.varstore))
+    let _guard = BorrowGuard::enter(&VARSTORE_BORROWED, "variable-store");
+    unsafe { f(&mut *varstore_ptr()) }
 }

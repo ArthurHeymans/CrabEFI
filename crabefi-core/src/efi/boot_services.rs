@@ -742,7 +742,7 @@ pub(crate) fn measure_efi_application_start(is_application: bool) {
 
 /// Measure return from an EFI boot application attempt.
 pub(crate) fn measure_efi_application_return(is_application: bool) {
-    if is_application && crate::state::efi().ready_to_boot_signaled {
+    if is_application && unsafe { &*crate::state::efi_ptr() }.ready_to_boot_signaled {
         super::tcg::measured_boot::measure_action_all(
             4,
             "Returning from EFI Application from Boot Option",
@@ -954,7 +954,7 @@ extern "efiapi" fn locate_handle(
         buffer
     );
 
-    let efi_state = state::efi();
+    let efi_state = unsafe { &*state::efi_ptr() };
 
     // Collect matching handles based on search type
     let matching: heapless::Vec<Handle, MAX_HANDLES> = match search_type {
@@ -1079,7 +1079,7 @@ extern "efiapi" fn locate_device_path(
     }
 
     // Find a handle with both the specified protocol and a DEVICE_PATH protocol
-    let efi_state = state::efi();
+    let efi_state = unsafe { &*state::efi_ptr() };
 
     let found = efi_state.handles[..efi_state.handle_count]
         .iter()
@@ -1405,7 +1405,7 @@ extern "efiapi" fn start_image(
 
     // Find the loaded image entry
     let (entry_point, image_base, image_subsystem) = {
-        let efi_state = state::efi();
+        let efi_state = unsafe { &*state::efi_ptr() };
         match efi_state
             .loaded_images
             .iter()
@@ -1611,7 +1611,7 @@ extern "efiapi" fn exit_boot_services(image_handle: Handle, map_key: usize) -> S
     if key_status != Status::SUCCESS {
         return key_status;
     }
-    let Some(runtime_image) = crate::state::efi().runtime_image else {
+    let Some(runtime_image) = unsafe { &*crate::state::efi_ptr() }.runtime_image else {
         log::error!("ExitBootServices refused: runtime image client is missing");
         return Status::DEVICE_ERROR;
     };
@@ -1637,7 +1637,7 @@ extern "efiapi" fn exit_boot_services(image_handle: Handle, map_key: usize) -> S
         });
         for event_id in &legacy_events {
             let notify_fn = {
-                let efi_state = state::efi();
+                let efi_state = unsafe { &*state::efi_ptr() };
                 let entry = &efi_state.events[*event_id];
                 entry.notify_function.map(|f| (f, entry.notify_context))
             };
@@ -1704,7 +1704,7 @@ extern "efiapi" fn exit_boot_services(image_handle: Handle, map_key: usize) -> S
         // Let platform glue clean up integration-specific handoff state only
         // after the final fallible step; hooks may disable non-runtime log
         // buffers needed to diagnose a seal failure.
-        if let Some(hooks) = crate::state::drivers().platform.hooks {
+        if let Some(hooks) = unsafe { &*crate::state::drivers_ptr() }.platform.hooks {
             hooks.on_exit_boot_services();
         }
 
@@ -1830,7 +1830,7 @@ extern "efiapi" fn open_protocol(
         attributes
     );
 
-    let efi_state = state::efi();
+    let efi_state = unsafe { &*state::efi_ptr() };
 
     // Find the handle entry
     let handle_entry = efi_state.handles[..efi_state.handle_count]
@@ -1902,7 +1902,7 @@ extern "efiapi" fn close_protocol(
     }
 
     // Verify the handle exists and has this protocol
-    let efi_state = state::efi();
+    let efi_state = unsafe { &*state::efi_ptr() };
     let handle_exists = efi_state.handles[..efi_state.handle_count]
         .iter()
         .any(|entry| {
@@ -1956,7 +1956,7 @@ extern "efiapi" fn protocols_per_handle(
         return Status::INVALID_PARAMETER;
     }
 
-    let efi_state = state::efi();
+    let efi_state = unsafe { &*state::efi_ptr() };
 
     // Find the handle entry
     let entry = match efi_state.handles[..efi_state.handle_count]
@@ -2119,7 +2119,7 @@ extern "efiapi" fn locate_protocol(
     let guid = unsafe { *protocol };
     log::trace!("BS.LocateProtocol(protocol={})", GuidFmt(guid));
 
-    let efi_state = state::efi();
+    let efi_state = unsafe { &*state::efi_ptr() };
 
     // Find first handle with this protocol
     let found = efi_state.handles[..efi_state.handle_count]
@@ -2380,7 +2380,7 @@ pub fn install_protocol(handle: Handle, guid: &Guid, interface: *mut c_void) -> 
 ///
 /// Returns the interface pointer, or null if not found.
 pub fn get_protocol_on_handle(handle: Handle, guid: &Guid) -> *mut c_void {
-    let efi_state = state::efi();
+    let efi_state = unsafe { &*state::efi_ptr() };
 
     efi_state.handles[..efi_state.handle_count]
         .iter()

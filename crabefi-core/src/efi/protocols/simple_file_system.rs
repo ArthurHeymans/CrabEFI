@@ -142,8 +142,8 @@ pub fn init(block_device: AnyBlockDevice, partition_start: u64) -> *mut efi_sfs:
 
     state::with_efi_mut(|efi| {
         efi.filesystem = Some(fs_state);
-        efi.block_device = Some(temp_device);
     });
+    state::set_block_device(temp_device);
 
     log::info!(
         "SimpleFileSystem: initialized with partition at LBA {}",
@@ -185,7 +185,7 @@ extern "efiapi" fn sfs_open_volume(
     };
 
     // Initialize as root directory
-    let fs_state = match state::efi().filesystem {
+    let fs_state = match unsafe { &*state::efi_ptr() }.filesystem {
         Some(s) => s,
         None => {
             log::error!("SFS.OpenVolume: filesystem not initialized");
@@ -265,7 +265,7 @@ extern "efiapi" fn file_open(
     log::info!("File.Open: full path = {:?}", full_path_str);
 
     // Get partition start
-    let partition_start = match state::efi().filesystem {
+    let partition_start = match unsafe { &*state::efi_ptr() }.filesystem {
         Some(s) => s.partition_start,
         None => return Status::NOT_READY,
     };
@@ -396,7 +396,7 @@ extern "efiapi" fn file_read(
         return Status::SUCCESS;
     }
 
-    let partition_start = match state::efi().filesystem {
+    let partition_start = match unsafe { &*state::efi_ptr() }.filesystem {
         Some(s) => s.partition_start,
         None => return Status::NOT_READY,
     };
@@ -581,7 +581,7 @@ extern "efiapi" fn file_get_info(
             return Status::INVALID_PARAMETER;
         }
 
-        let fs_state = match state::efi().filesystem {
+        let fs_state = match unsafe { &*state::efi_ptr() }.filesystem {
             Some(s) => s,
             None => return Status::NOT_READY,
         };
@@ -842,7 +842,7 @@ fn create_file_entry(first_cluster: u32, file_size: u32) -> DirectoryEntry {
 
 /// Read directory entries
 fn read_directory(buffer_size: *mut usize, buffer: *mut c_void, handle_idx: usize) -> Status {
-    let partition_start = match state::efi().filesystem {
+    let partition_start = match unsafe { &*state::efi_ptr() }.filesystem {
         Some(s) => s.partition_start,
         None => return Status::NOT_READY,
     };

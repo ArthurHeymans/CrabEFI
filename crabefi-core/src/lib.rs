@@ -54,7 +54,9 @@ use crate::drivers::block::{AhciDisk, NvmeDisk, SdhciDisk, UsbDisk};
 pub fn reset_system() -> ! {
     log::info!("System reset requested");
 
-    if let Some(reset) = state::try_get().and_then(|state| state.drivers.platform.reset) {
+    if state::is_initialized()
+        && let Some(reset) = unsafe { (*state::drivers_ptr()).platform.reset }
+    {
         reset.reset(ResetType::Cold);
     }
 
@@ -201,7 +203,7 @@ fn init_persistence_and_boot(
         log::warn!("Variable store is preserved read-only; capsule updates are disabled");
     }
 
-    let runtime = state::efi()
+    let runtime = unsafe { &*state::efi_ptr() }
         .runtime_image
         .expect("runtime image missing before deferred replay");
     let capsule_backend_available = capsule_backend.is_some();
@@ -249,7 +251,7 @@ fn init_persistence_and_boot(
 
     // Reinstall ESRT after persistent variables and this boot's capsule attempts
     // are visible so its last-attempt fields are authoritative across reboots.
-    if let Some(firmware) = state::drivers().platform.efi_fw_info {
+    if let Some(firmware) = unsafe { &*state::drivers_ptr() }.platform.efi_fw_info {
         efi::esrt::install_esrt(&firmware, capsule_delivery_usable);
     }
     efi::capsule::disk::install_os_indications_supported(capsule_delivery_usable);
@@ -542,7 +544,7 @@ fn init_platform_impl(mut config: PlatformConfig) -> ! {
     // The ESRT is built from platform-provided firmware info and installed as
     // an EFI Configuration Table for fwupd/LVFS discovery. Delivery flags and
     // OsIndicationsSupported are finalized after persistence is initialized.
-    if let Some(fw_info) = state::drivers().platform.efi_fw_info {
+    if let Some(fw_info) = unsafe { &*state::drivers_ptr() }.platform.efi_fw_info {
         efi::esrt::install_esrt(&fw_info, false);
         log::info!("ESRT installed for firmware updates");
     }
@@ -563,8 +565,8 @@ fn init_platform_impl(mut config: PlatformConfig) -> ! {
             log::error!("PCI ECAM regions from platform rejected: {:?}", error);
         }
     } else {
-        let acpi_info = state::drivers().acpi_info.clone();
-        let fdt_info = state::drivers().fdt_info.clone();
+        let acpi_info = unsafe { &*state::drivers_ptr() }.acpi_info.clone();
+        let fdt_info = unsafe { &*state::drivers_ptr() }.fdt_info.clone();
         if !acpi_info.ecam_regions().is_empty() {
             log::info!(
                 "PCI ECAM regions from ACPI MCFG: {}",

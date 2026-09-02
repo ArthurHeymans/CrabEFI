@@ -224,7 +224,7 @@ extern "efiapi" fn gop_blt(
         return Status::INVALID_PARAMETER;
     }
 
-    let console = state::console();
+    let console = unsafe { &*state::console_ptr() };
     let fb = match console.gop_framebuffer.as_ref() {
         Some(fb) => fb,
         None => return Status::DEVICE_ERROR,

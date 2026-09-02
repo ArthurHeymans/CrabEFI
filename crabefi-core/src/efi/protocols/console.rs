@@ -274,7 +274,7 @@ pub fn get_text_output_protocol() -> *mut SimpleTextOutputProtocol {
     // at the centralized console state so EFI callers can read it directly.
     unsafe {
         TEXT_OUTPUT_PROTOCOL.mode =
-            core::ptr::addr_of_mut!((*crate::state::console_mut_ptr()).output_mode);
+            core::ptr::addr_of_mut!((*crate::state::console_ptr()).output_mode);
         &raw mut TEXT_OUTPUT_PROTOCOL
     }
 }
@@ -553,7 +553,7 @@ extern "efiapi" fn text_output_reset(
     // Reset console state
     // SAFETY: Single-threaded firmware; raw pointer to centralized console state.
     unsafe {
-        let mode = &mut (*crate::state::console_mut_ptr()).output_mode;
+        let mode = &mut (*crate::state::console_ptr()).output_mode;
         mode.cursor_column = 0;
         mode.cursor_row = 0;
         mode.attribute = 0x07;
@@ -580,8 +580,7 @@ extern "efiapi" fn text_output_string(
     // Holding an `&mut ConsoleState.output_mode` across those calls would
     // create aliasing &mut references (UB).  Raw pointer writes are fine
     // in single-threaded firmware.
-    let mode_ptr =
-        unsafe { core::ptr::addr_of_mut!((*crate::state::console_mut_ptr()).output_mode) };
+    let mode_ptr = unsafe { core::ptr::addr_of_mut!((*crate::state::console_ptr()).output_mode) };
     let mut ptr = string;
     unsafe {
         while *ptr != 0 {
@@ -686,7 +685,7 @@ extern "efiapi" fn text_output_set_mode(
 
     // SAFETY: Single-threaded firmware; raw pointer to centralized console state.
     unsafe {
-        (*crate::state::console_mut_ptr()).output_mode.mode = mode_number as i32;
+        (*crate::state::console_ptr()).output_mode.mode = mode_number as i32;
     }
 
     Status::SUCCESS
@@ -732,7 +731,7 @@ extern "efiapi" fn text_output_set_attribute(
 ) -> Status {
     // SAFETY: Single-threaded firmware; raw pointer to centralized console state.
     unsafe {
-        (*crate::state::console_mut_ptr()).output_mode.attribute = attribute as i32;
+        (*crate::state::console_ptr()).output_mode.attribute = attribute as i32;
     }
 
     let fg = attribute & 0x0F;
@@ -794,7 +793,7 @@ extern "efiapi" fn text_output_clear_screen(_this: *mut SimpleTextOutputProtocol
 
     // SAFETY: Single-threaded firmware; raw pointer to centralized console state.
     unsafe {
-        let mode = &mut (*crate::state::console_mut_ptr()).output_mode;
+        let mode = &mut (*crate::state::console_ptr()).output_mode;
         mode.cursor_column = 0;
         mode.cursor_row = 0;
     }
@@ -839,7 +838,7 @@ extern "efiapi" fn text_output_set_cursor_position(
 
     // SAFETY: Single-threaded firmware; raw pointer to centralized console state.
     unsafe {
-        let mode = &mut (*crate::state::console_mut_ptr()).output_mode;
+        let mode = &mut (*crate::state::console_ptr()).output_mode;
         mode.cursor_column = column as i32;
         mode.cursor_row = row as i32;
     }
@@ -861,9 +860,7 @@ extern "efiapi" fn text_output_enable_cursor(
     let is_visible: bool = visible.into();
     // SAFETY: Single-threaded firmware; raw pointer to centralized console state.
     unsafe {
-        (*crate::state::console_mut_ptr())
-            .output_mode
-            .cursor_visible = visible;
+        (*crate::state::console_ptr()).output_mode.cursor_visible = visible;
     }
 
     if is_visible {

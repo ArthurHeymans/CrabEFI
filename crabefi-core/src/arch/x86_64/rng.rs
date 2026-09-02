@@ -63,7 +63,7 @@ pub fn init() {
 
 /// Check if RDRAND is available and functional
 pub fn is_supported() -> bool {
-    crate::state::drivers().rng_available
+    unsafe { &*crate::state::drivers_ptr() }.rng_available
 }
 
 /// Fill a byte buffer with random data from RDRAND

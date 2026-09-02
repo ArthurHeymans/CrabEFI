@@ -72,7 +72,7 @@ pub fn get_us_since_boot() -> u64 {
     // SAFETY: single-threaded firmware; field is written once at init,
     // only read afterwards. Raw pointer avoids aliasing with &mut held
     // by with_*_mut() closures that may log.
-    let boot = unsafe { (*crate::state::drivers_mut_ptr()).timing.boot_counter };
+    let boot = unsafe { (*crate::state::drivers_ptr()).timing.boot_counter };
     let delta = current.saturating_sub(boot);
     let freq = crate::time::counter_frequency().max(1);
     ((delta as u128 * 1_000_000) / freq as u128) as u64
@@ -128,7 +128,7 @@ pub fn init() {
         // SAFETY: single-threaded init; raw pointer avoids re-entrancy
         // issues with the state lock.
         unsafe {
-            (*crate::state::drivers_mut_ptr()).timing.boot_counter = read_counter();
+            (*crate::state::drivers_ptr()).timing.boot_counter = read_counter();
         }
         log::set_max_level(DEFAULT_LEVEL);
     }

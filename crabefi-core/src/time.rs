@@ -34,7 +34,9 @@ pub fn read_counter() -> u64 {
 
 /// Get the counter frequency in Hz
 pub fn counter_frequency() -> u64 {
-    crate::state::drivers().timing.counter_freq_hz
+    unsafe { &*crate::state::drivers_ptr() }
+        .timing
+        .counter_freq_hz
 }
 
 // Re-export read_counter as rdtsc on x86 for backwards compat with existing callers
@@ -57,7 +59,9 @@ pub fn rdtsc() -> u64 {
 
 // Re-export counter_frequency as tsc_frequency for backwards compat
 pub fn tsc_frequency() -> u64 {
-    crate::state::drivers().timing.counter_freq_hz
+    unsafe { &*crate::state::drivers_ptr() }
+        .timing
+        .counter_freq_hz
 }
 
 // ============================================================================
@@ -300,7 +304,7 @@ mod x86_calibration {
                 // SAFETY: single-threaded init; raw pointer avoids re-entrancy
                 // issues with the state lock.
                 unsafe {
-                    let t = &mut (*crate::state::drivers_mut_ptr()).timing;
+                    let t = &mut (*crate::state::drivers_ptr()).timing;
                     t.counter_freq_hz = freq;
                     t.counter_cycles_per_us = cycles_per_us;
                 }
@@ -334,7 +338,7 @@ mod aarch64_timer {
             // SAFETY: single-threaded init; raw pointer avoids re-entrancy
             // issues with the state lock.
             unsafe {
-                let t = &mut (*crate::state::drivers_mut_ptr()).timing;
+                let t = &mut (*crate::state::drivers_ptr()).timing;
                 t.counter_freq_hz = fallback;
                 t.counter_cycles_per_us = fallback / 1_000_000;
             }
@@ -345,7 +349,7 @@ mod aarch64_timer {
         // SAFETY: single-threaded init; raw pointer avoids re-entrancy
         // issues with the state lock.
         unsafe {
-            let t = &mut (*crate::state::drivers_mut_ptr()).timing;
+            let t = &mut (*crate::state::drivers_ptr()).timing;
             t.counter_freq_hz = freq;
             t.counter_cycles_per_us = cycles_per_us.max(1);
         }
@@ -374,7 +378,9 @@ mod riscv64_timer {
     /// If not set yet (e.g., no FDT parsed before timer init), we use
     /// 10 MHz which is the QEMU virt default.
     pub fn init(_acpi_rsdp: Option<u64>) {
-        let freq = crate::state::drivers().timing.counter_freq_hz;
+        let freq = unsafe { &*crate::state::drivers_ptr() }
+            .timing
+            .counter_freq_hz;
 
         if freq == 0 {
             log::error!(
@@ -387,7 +393,7 @@ mod riscv64_timer {
         let cycles_per_us = (freq / 1_000_000).max(1);
         // SAFETY: single-threaded init
         unsafe {
-            let t = &mut (*crate::state::drivers_mut_ptr()).timing;
+            let t = &mut (*crate::state::drivers_ptr()).timing;
             t.counter_cycles_per_us = cycles_per_us;
         }
 
@@ -425,7 +431,7 @@ pub fn init_from_platform(timer: &dyn crate::platform::Timer) {
         // SAFETY: single-threaded init; raw pointer avoids re-entrancy
         // issues with the state lock.
         unsafe {
-            let t = &mut (*crate::state::drivers_mut_ptr()).timing;
+            let t = &mut (*crate::state::drivers_ptr()).timing;
             t.counter_freq_hz = fallback;
             t.counter_cycles_per_us = 1;
         }
@@ -436,7 +442,7 @@ pub fn init_from_platform(timer: &dyn crate::platform::Timer) {
     // SAFETY: single-threaded init; raw pointer avoids re-entrancy
     // issues with the state lock.
     unsafe {
-        let t = &mut (*crate::state::drivers_mut_ptr()).timing;
+        let t = &mut (*crate::state::drivers_ptr()).timing;
         t.counter_freq_hz = freq;
         t.counter_cycles_per_us = cycles_per_us;
         t.boot_counter = timer.current_ticks();
@@ -452,7 +458,10 @@ pub fn init_from_platform(timer: &dyn crate::platform::Timer) {
 /// Spin-wait for approximately `us` microseconds
 #[inline]
 pub fn delay_us(us: u64) {
-    let cycles = us * crate::state::drivers().timing.counter_cycles_per_us;
+    let cycles = us
+        * unsafe { &*crate::state::drivers_ptr() }
+            .timing
+            .counter_cycles_per_us;
     let start = read_counter();
     while read_counter().wrapping_sub(start) < cycles {
         core::hint::spin_loop();
@@ -488,7 +497,10 @@ impl Timeout {
     /// Create a timeout that expires after `us` microseconds
     #[inline]
     pub fn from_us(us: u64) -> Self {
-        let cycles = us * crate::state::drivers().timing.counter_cycles_per_us;
+        let cycles = us
+            * unsafe { &*crate::state::drivers_ptr() }
+                .timing
+                .counter_cycles_per_us;
         Self {
             deadline: read_counter().wrapping_add(cycles),
         }

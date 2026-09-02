@@ -1021,7 +1021,7 @@ pub fn show_menu(menu: &mut BootMenu) -> Option<usize> {
                 }
                 KeyPress::Char('f') | KeyPress::Char('F') => {
                     // Open platform-provided firmware settings menu.
-                    if let Some(hooks) = crate::state::drivers().platform.hooks {
+                    if let Some(hooks) = unsafe { &*crate::state::drivers_ptr() }.platform.hooks {
                         if !hooks.show_firmware_settings() {
                             draw_status("Firmware settings not available", &mut fb_console);
                             delay_ms(500);

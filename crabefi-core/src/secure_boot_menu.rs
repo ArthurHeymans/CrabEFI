@@ -252,7 +252,8 @@ pub fn show_secure_boot_menu() {
                         break;
                     }
                     KeyPress::Char('f') | KeyPress::Char('F') => {
-                        if let Some(hooks) = crate::state::drivers().platform.hooks {
+                        if let Some(hooks) = unsafe { &*crate::state::drivers_ptr() }.platform.hooks
+                        {
                             if !hooks.show_firmware_settings() {
                                 status_message = Some(("Firmware settings not available", false));
                             }

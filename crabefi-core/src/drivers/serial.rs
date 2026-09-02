@@ -406,7 +406,7 @@ impl Write for Pl011Port {
 /// Adapter that wraps a platform-provided `DebugOutput` trait object.
 ///
 /// Stores a raw pointer because the serial subsystem is accessed via
-/// `drivers_mut_ptr()` (raw pointers) throughout CrabEFI to avoid
+/// `drivers_ptr()` (raw pointers) throughout CrabEFI to avoid
 /// aliasing with active `&mut FirmwareState` references in closures.
 pub(crate) struct PlatformSerial {
     /// Raw pointer to the platform's debug output trait object.
@@ -551,7 +551,7 @@ pub fn init_from_config(info: &SerialConfig) {
                 // SAFETY: Single-threaded firmware; raw pointer avoids re-entrancy
                 // issues since serial is called from log macros inside other state closures.
                 unsafe {
-                    (*crate::state::drivers_mut_ptr()).serial.driver = Some(AnySerial::Pl011(port));
+                    (*crate::state::drivers_ptr()).serial.driver = Some(AnySerial::Pl011(port));
                 }
                 return;
             }
@@ -573,8 +573,7 @@ pub fn init_from_config(info: &SerialConfig) {
             // SAFETY: Single-threaded firmware; raw pointer avoids re-entrancy
             // issues since serial is called from log macros inside other state closures.
             unsafe {
-                (*crate::state::drivers_mut_ptr()).serial.driver =
-                    Some(AnySerial::Uart16550(serial));
+                (*crate::state::drivers_ptr()).serial.driver = Some(AnySerial::Uart16550(serial));
             }
         }
     } else {
@@ -592,7 +591,7 @@ pub fn init_from_config(info: &SerialConfig) {
                 // SAFETY: Single-threaded firmware; raw pointer avoids re-entrancy
                 // issues since serial is called from log macros inside other state closures.
                 unsafe {
-                    (*crate::state::drivers_mut_ptr()).serial.driver =
+                    (*crate::state::drivers_ptr()).serial.driver =
                         Some(AnySerial::Uart16550(serial));
                 }
             }
@@ -619,7 +618,7 @@ pub unsafe fn init_from_platform_raw(raw: *mut dyn crate::platform::DebugOutput)
     // SAFETY: Single-threaded firmware; raw pointer avoids re-entrancy
     // issues since serial is called from log macros inside other state closures.
     unsafe {
-        (*crate::state::drivers_mut_ptr()).serial.driver = Some(AnySerial::Platform(plat));
+        (*crate::state::drivers_ptr()).serial.driver = Some(AnySerial::Platform(plat));
     }
 }
 
@@ -639,7 +638,7 @@ pub unsafe fn add_platform_debug_sink_raw(raw: *mut dyn crate::platform::DebugOu
     // SAFETY: Single-threaded firmware; raw pointer avoids re-entrancy
     // issues since serial is called from log macros inside other state closures.
     unsafe {
-        (*crate::state::drivers_mut_ptr()).serial.debug_sink = Some(sink);
+        (*crate::state::drivers_ptr()).serial.debug_sink = Some(sink);
     }
 }
 
@@ -647,7 +646,7 @@ pub unsafe fn add_platform_debug_sink_raw(raw: *mut dyn crate::platform::DebugOu
 pub fn write_str(s: &str) {
     // SAFETY: Single-threaded firmware; raw pointer avoids re-entrancy
     // issues since serial is called from log macros inside other state closures.
-    let serial_state = unsafe { &mut (*crate::state::drivers_mut_ptr()).serial };
+    let serial_state = unsafe { &mut (*crate::state::drivers_ptr()).serial };
     if let Some(serial) = &mut serial_state.driver {
         let _ = serial.write_str(s);
     }
@@ -665,7 +664,7 @@ pub fn write_fmt(args: fmt::Arguments) {
 pub fn write_byte(byte: u8) {
     // SAFETY: Single-threaded firmware; raw pointer avoids re-entrancy
     // issues since serial is called from log macros inside other state closures.
-    let serial_state = unsafe { &mut (*crate::state::drivers_mut_ptr()).serial };
+    let serial_state = unsafe { &mut (*crate::state::drivers_ptr()).serial };
     if let Some(serial) = &mut serial_state.driver {
         serial.write_byte(byte);
     }
@@ -678,7 +677,7 @@ pub fn write_byte(byte: u8) {
 pub fn has_input() -> bool {
     // Read-only check -- use immutable access (no raw pointer needed). The debug
     // mirror is output-only, so it is intentionally ignored for input.
-    crate::state::drivers()
+    unsafe { &*crate::state::drivers_ptr() }
         .serial
         .driver
         .as_ref()
@@ -689,7 +688,7 @@ pub fn has_input() -> bool {
 pub fn try_read() -> Option<u8> {
     // SAFETY: Single-threaded firmware; raw pointer avoids re-entrancy
     // issues since serial is called from log macros inside other state closures.
-    let driver = unsafe { &mut (*crate::state::drivers_mut_ptr()).serial.driver };
+    let driver = unsafe { &mut (*crate::state::drivers_ptr()).serial.driver };
     driver.as_mut().and_then(AnySerial::try_read_byte)
 }
 
