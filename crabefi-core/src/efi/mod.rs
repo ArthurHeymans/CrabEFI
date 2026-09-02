@@ -15,6 +15,7 @@ pub mod image_loader;
 pub mod protocols;
 pub mod runtime_image;
 pub mod system_table;
+pub mod tables;
 pub mod tcg;
 pub mod utils;
 pub mod varstore;
@@ -74,7 +75,7 @@ pub fn init_from_platform(config: &mut crate::platform::PlatformConfig) {
         panic!("Failed to initialize heap allocator");
     }
     let (heap_before, heap_total) = crate::heap::stats();
-    if !crate::state::init_efi_caches() {
+    if !tables::init_caches() {
         panic!("Failed to initialize EFI state tables");
     }
     let (heap_after, _) = crate::heap::stats();
