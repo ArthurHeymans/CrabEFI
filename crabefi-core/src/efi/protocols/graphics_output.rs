@@ -4,130 +4,31 @@
 //! framebuffer access to the OS. We expose the framebuffer information from
 //! coreboot tables.
 
-use r_efi::efi::{Guid, Status};
+use r_efi::efi::Status;
+use r_efi::protocols::graphics_output;
 
 use crate::efi::allocator::{MemoryType, allocate_pool};
 use crate::efi::utils::allocate_protocol_with_log;
 use crate::platform::FramebufferConfig;
 use crate::state;
 
-/// EFI_GRAPHICS_OUTPUT_PROTOCOL GUID
-pub const GRAPHICS_OUTPUT_GUID: Guid = Guid::from_fields(
-    0x9042a9de,
-    0x23dc,
-    0x4a38,
-    0x96,
-    0xfb,
-    &[0x7a, 0xde, 0xd0, 0x80, 0x51, 0x6a],
-);
+/// Graphics Output Protocol GUID supplied by `r-efi`.
+pub const GRAPHICS_OUTPUT_GUID: r_efi::efi::Guid = graphics_output::PROTOCOL_GUID;
 
-/// Pixel format enumeration
-#[repr(u32)]
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum PixelFormat {
-    /// Red-Green-Blue-Reserved 8-bit per color
-    RedGreenBlueReserved8BitPerColor = 0,
-    /// Blue-Green-Red-Reserved 8-bit per color
-    BlueGreenRedReserved8BitPerColor = 1,
-    /// Pixel format defined by pixel_bitmask
-    BitMask = 2,
-    /// Only valid for Blt operations
-    BltOnly = 3,
-}
-
-/// Pixel bitmask structure for BitMask pixel format
-#[repr(C)]
-#[derive(Debug, Clone, Copy, Default)]
-pub struct PixelBitmask {
-    pub red_mask: u32,
-    pub green_mask: u32,
-    pub blue_mask: u32,
-    pub reserved_mask: u32,
-}
-
-/// GOP Mode Information structure
-#[repr(C)]
-#[derive(Debug, Clone)]
-pub struct GopModeInfo {
-    /// Version of the structure (should be 0)
-    pub version: u32,
-    /// Horizontal resolution in pixels
-    pub horizontal_resolution: u32,
-    /// Vertical resolution in pixels
-    pub vertical_resolution: u32,
-    /// Pixel format
-    pub pixel_format: PixelFormat,
-    /// Pixel bitmask (only valid if pixel_format is BitMask)
-    pub pixel_information: PixelBitmask,
-    /// Number of pixels per video memory scan line
-    pub pixels_per_scan_line: u32,
-}
-
-/// GOP Mode structure
-#[repr(C)]
-pub struct GopMode {
-    /// Maximum mode number supported (0-based, so max_mode=1 means mode 0 only)
-    pub max_mode: u32,
-    /// Current mode number
-    pub mode: u32,
-    /// Pointer to mode information
-    pub info: *mut GopModeInfo,
-    /// Size of the mode information structure
-    pub size_of_info: usize,
-    /// Physical address of the framebuffer
-    pub frame_buffer_base: u64,
-    /// Size of the framebuffer in bytes
-    pub frame_buffer_size: usize,
-}
-
-/// BLT (Block Transfer) operation types
-#[repr(u32)]
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum BltOperation {
-    /// Fill rectangle with color
-    VideoFill = 0,
-    /// Copy from video to buffer
-    VideoToBltBuffer = 1,
-    /// Copy from buffer to video
-    BufferToVideo = 2,
-    /// Copy within video memory
-    VideoToVideo = 3,
-}
-
-/// BLT pixel structure (BGRA format)
-#[repr(C)]
-#[derive(Debug, Clone, Copy, Default)]
-pub struct BltPixel {
-    pub blue: u8,
-    pub green: u8,
-    pub red: u8,
-    pub reserved: u8,
-}
-
-/// Graphics Output Protocol structure
-#[repr(C)]
-pub struct GraphicsOutputProtocol {
-    pub query_mode: extern "efiapi" fn(
-        this: *mut GraphicsOutputProtocol,
-        mode_number: u32,
-        size_of_info: *mut usize,
-        info: *mut *mut GopModeInfo,
-    ) -> Status,
-    pub set_mode: extern "efiapi" fn(this: *mut GraphicsOutputProtocol, mode_number: u32) -> Status,
-    pub blt: extern "efiapi" fn(
-        this: *mut GraphicsOutputProtocol,
-        blt_buffer: *mut BltPixel,
-        blt_operation: BltOperation,
-        source_x: usize,
-        source_y: usize,
-        destination_x: usize,
-        destination_y: usize,
-        width: usize,
-        height: usize,
-        delta: usize,
-    ) -> Status,
-    pub mode: *mut GopMode,
-}
+/// Pixel format ABI supplied by `r-efi`.
+pub type PixelFormat = graphics_output::GraphicsPixelFormat;
+/// Pixel bitmask ABI supplied by `r-efi`.
+pub type PixelBitmask = graphics_output::PixelBitmask;
+/// GOP mode information ABI supplied by `r-efi`.
+pub type GopModeInfo = graphics_output::ModeInformation;
+/// GOP mode ABI supplied by `r-efi`.
+pub type GopMode = graphics_output::Mode;
+/// BLT operation ABI supplied by `r-efi`.
+pub type BltOperation = graphics_output::BltOperation;
+/// BLT pixel ABI supplied by `r-efi`.
+pub type BltPixel = graphics_output::BltPixel;
+/// Graphics Output Protocol ABI supplied by `r-efi`.
+pub type GraphicsOutputProtocol = graphics_output::Protocol;
 
 /// Query available video mode information
 extern "efiapi" fn gop_query_mode(
@@ -241,7 +142,7 @@ extern "efiapi" fn gop_blt(
     };
 
     match blt_operation {
-        BltOperation::VideoFill => {
+        graphics_output::BLT_VIDEO_FILL => {
             // Fill a rectangle with a single color
             if blt_buffer.is_null() {
                 return Status::INVALID_PARAMETER;
@@ -264,7 +165,7 @@ extern "efiapi" fn gop_blt(
             }
         }
 
-        BltOperation::VideoToBltBuffer => {
+        graphics_output::BLT_VIDEO_TO_BLT_BUFFER => {
             // Copy from video memory to buffer
             if blt_buffer.is_null() {
                 return Status::INVALID_PARAMETER;
@@ -288,7 +189,7 @@ extern "efiapi" fn gop_blt(
             }
         }
 
-        BltOperation::BufferToVideo => {
+        graphics_output::BLT_BUFFER_TO_VIDEO => {
             // Copy from buffer to video memory
             if blt_buffer.is_null() {
                 return Status::INVALID_PARAMETER;
@@ -312,7 +213,7 @@ extern "efiapi" fn gop_blt(
             }
         }
 
-        BltOperation::VideoToVideo => {
+        graphics_output::BLT_VIDEO_TO_VIDEO => {
             // Copy within video memory
             if source_x + width > fb_width || source_y + height > fb_height {
                 return Status::INVALID_PARAMETER;
@@ -357,6 +258,7 @@ extern "efiapi" fn gop_blt(
                 }
             }
         }
+        _ => return Status::INVALID_PARAMETER,
     }
 
     Status::SUCCESS
@@ -459,7 +361,12 @@ unsafe fn read_pixel_from_fb(
                     reserved: 0,
                 }
             }
-            _ => BltPixel::default(),
+            _ => BltPixel {
+                blue: 0,
+                green: 0,
+                red: 0,
+                reserved: 0,
+            },
         }
     }
 }
@@ -477,8 +384,13 @@ pub fn create_gop(framebuffer: &FramebufferConfig) -> *mut GraphicsOutputProtoco
         {
             // BGRA (most common)
             (
-                PixelFormat::BlueGreenRedReserved8BitPerColor,
-                PixelBitmask::default(),
+                graphics_output::PIXEL_BLUE_GREEN_RED_RESERVED_8_BIT_PER_COLOR,
+                PixelBitmask {
+                    red_mask: 0,
+                    green_mask: 0,
+                    blue_mask: 0,
+                    reserved_mask: 0,
+                },
             )
         } else if framebuffer.red_mask_pos == 0
             && framebuffer.green_mask_pos == 8
@@ -486,8 +398,13 @@ pub fn create_gop(framebuffer: &FramebufferConfig) -> *mut GraphicsOutputProtoco
         {
             // RGBA
             (
-                PixelFormat::RedGreenBlueReserved8BitPerColor,
-                PixelBitmask::default(),
+                graphics_output::PIXEL_RED_GREEN_BLUE_RESERVED_8_BIT_PER_COLOR,
+                PixelBitmask {
+                    red_mask: 0,
+                    green_mask: 0,
+                    blue_mask: 0,
+                    reserved_mask: 0,
+                },
             )
         } else {
             // Custom bitmask
@@ -497,7 +414,7 @@ pub fn create_gop(framebuffer: &FramebufferConfig) -> *mut GraphicsOutputProtoco
                 blue_mask: 0xFF << framebuffer.blue_mask_pos,
                 reserved_mask: 0,
             };
-            (PixelFormat::BitMask, bitmask)
+            (graphics_output::PIXEL_BIT_MASK, bitmask)
         }
     } else {
         // For non-32bpp, use bitmask
@@ -507,7 +424,7 @@ pub fn create_gop(framebuffer: &FramebufferConfig) -> *mut GraphicsOutputProtoco
             blue_mask: ((1u32 << framebuffer.blue_mask_size) - 1) << framebuffer.blue_mask_pos,
             reserved_mask: 0,
         };
-        (PixelFormat::BitMask, bitmask)
+        (graphics_output::PIXEL_BIT_MASK, bitmask)
     };
 
     // Allocate mode info
