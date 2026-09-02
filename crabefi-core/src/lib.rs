@@ -13,6 +13,8 @@
 
 // Enable alloc crate for heap allocations (needed for RustCrypto)
 extern crate alloc;
+#[cfg(test)]
+extern crate std;
 
 pub mod arch;
 pub(crate) mod barrier;

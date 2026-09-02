@@ -75,6 +75,8 @@ pub const MAX_LOADED_IMAGES: usize = 16;
 pub struct ProtocolEntry {
     pub guid: Guid,
     pub interface: *mut core::ffi::c_void,
+    /// Installation order; reinstall moves the instance to the end.
+    pub generation: u64,
 }
 
 impl ProtocolEntry {
@@ -82,6 +84,7 @@ impl ProtocolEntry {
         Self {
             guid: Guid::from_fields(0, 0, 0, 0, 0, &[0, 0, 0, 0, 0, 0]),
             interface: core::ptr::null_mut(),
+            generation: 0,
         }
     }
 }
@@ -221,6 +224,25 @@ impl LoadedImageEntry {
     }
 }
 
+/// Maximum number of live `RegisterProtocolNotify` registrations.
+pub const MAX_PROTOCOL_NOTIFIES: usize = 16;
+
+/// One `RegisterProtocolNotify` registration.
+///
+/// A cursor over live protocol instances, shared by LocateHandle and
+/// LocateProtocol. Removed instances disappear without leaving stale handles;
+/// no per-registration queue or capacity limit is needed.
+pub struct ProtocolNotifyEntry {
+    /// Opaque token handed back to the caller as `Registration`.
+    pub registration: usize,
+    /// Protocol the caller asked to be notified about.
+    pub protocol: Guid,
+    /// Event signaled when a matching interface is installed.
+    pub event: efi::Event,
+    /// Generation last delivered; zero starts before all existing instances.
+    pub cursor: u64,
+}
+
 /// One tracked `OpenProtocol` relationship.
 #[derive(Clone, Copy)]
 pub struct OpenProtocolEntry {
@@ -242,6 +264,12 @@ pub struct Tables {
     pub next_handle: usize,
     /// Active protocol opens, grown fallibly from the firmware heap.
     pub open_protocols: Vec<OpenProtocolEntry>,
+    /// Live protocol-notify registrations, grown fallibly from the heap.
+    pub protocol_notifies: Vec<ProtocolNotifyEntry>,
+    /// Next opaque registration token handed out by RegisterProtocolNotify.
+    pub next_registration: usize,
+    /// Monotonic order for installed/reinstalled protocol instances.
+    pub protocol_generation: u64,
 
     /// Event database, allocated after heap startup.
     pub events: Vec<EventEntry>,
@@ -267,6 +295,9 @@ impl Tables {
             handle_count: 0,
             next_handle: 1,
             open_protocols: Vec::new(),
+            protocol_notifies: Vec::new(),
+            next_registration: 1,
+            protocol_generation: 0,
             events: Vec::new(),
             next_event_id: 2, // Start at 2, reserve 1 for keyboard
             loaded_images: Vec::new(),

@@ -8,13 +8,18 @@
 //! Boot Services state (handles, events, loaded images) lives in
 //! [`super::tables`]. Access it via `tables()` and `with_tables_mut()`.
 
+#[cfg(test)]
+#[path = "boot_services_tests.rs"]
+mod protocol_tests;
+
 use super::allocator::{self, AllocateType, MemoryDescriptor, MemoryType};
 use super::image_loader;
 use super::protocols::loaded_image::{LOADED_IMAGE_PROTOCOL_GUID, create_loaded_image_protocol};
 use super::system_table;
 use super::tables::{
-    EventEntry, HandleEntry, LoadedImageEntry, MAX_EVENTS, MAX_PROTOCOLS_PER_HANDLE,
-    OpenProtocolEntry, ProtocolEntry, Tables, TimerType, tables, with_tables_mut,
+    EventEntry, HandleEntry, LoadedImageEntry, MAX_EVENTS, MAX_PROTOCOL_NOTIFIES,
+    MAX_PROTOCOLS_PER_HANDLE, OpenProtocolEntry, ProtocolEntry, ProtocolNotifyEntry, Tables,
+    TimerType, tables, with_tables_mut,
 };
 use crate::pe;
 use alloc::vec::Vec;
@@ -514,6 +519,11 @@ extern "efiapi" fn close_event(event: efi::Event) -> Status {
     if event_id > 0 && event_id < MAX_EVENTS {
         with_tables_mut(|efi_state| {
             efi_state.events[event_id] = EventEntry::empty();
+            // A registration outlives its event otherwise, and would keep
+            // signaling a closed event slot on every matching install.
+            efi_state
+                .protocol_notifies
+                .retain(|notify| notify.event != event);
         });
     }
 
@@ -812,18 +822,18 @@ extern "efiapi" fn reinstall_protocol_interface(
     }
 
     let guid = unsafe { *protocol };
-    with_tables_mut(|efi_state| {
+    let (status, notify_events) = with_tables_mut(|efi_state| {
         let Some(entry) = efi_state.handles[..efi_state.handle_count]
             .iter_mut()
             .find(|entry| entry.handle == handle)
         else {
-            return Status::NOT_FOUND;
+            return (Status::NOT_FOUND, heapless::Vec::new());
         };
         let Some(protocol_entry) = entry.protocols[..entry.protocol_count]
             .iter_mut()
             .find(|entry| entry.guid == guid && entry.interface == old_interface)
         else {
-            return Status::NOT_FOUND;
+            return (Status::NOT_FOUND, heapless::Vec::new());
         };
         if efi_state.open_protocols.iter().any(|open| {
             open.handle == handle
@@ -832,14 +842,28 @@ extern "efiapi" fn reinstall_protocol_interface(
         }) {
             // Built-in drivers have no DisconnectController implementation. Do not
             // replace an interface while a driver or exclusive user still holds it.
-            return Status::ACCESS_DENIED;
+            return (Status::ACCESS_DENIED, heapless::Vec::new());
         }
         efi_state
             .open_protocols
             .retain(|open| open.handle != handle || open.protocol != guid);
+        let Some(generation) = efi_state.protocol_generation.checked_add(1) else {
+            return (Status::OUT_OF_RESOURCES, heapless::Vec::new());
+        };
+        efi_state.protocol_generation = generation;
+        protocol_entry.generation = generation;
         protocol_entry.interface = new_interface;
-        Status::SUCCESS
-    })
+        // Per the UEFI spec a reinstall notifies registrations just like an
+        // install, so drivers can rebind to the replacement interface.
+        let events = protocol_notification_events(efi_state, &guid);
+        (Status::SUCCESS, events)
+    });
+
+    for event in notify_events {
+        signal_event(event);
+    }
+
+    status
 }
 
 extern "efiapi" fn uninstall_protocol_interface(
@@ -887,17 +911,91 @@ extern "efiapi" fn handle_protocol(
 }
 
 extern "efiapi" fn register_protocol_notify(
-    _protocol: *mut Guid,
-    _event: efi::Event,
-    _registration: *mut *mut c_void,
+    protocol: *mut Guid,
+    event: efi::Event,
+    registration: *mut *mut c_void,
 ) -> Status {
-    Status::UNSUPPORTED
+    if protocol.is_null() || registration.is_null() {
+        return Status::INVALID_PARAMETER;
+    }
+    let event_id = event as usize;
+    if event_id == 0 || event_id >= MAX_EVENTS {
+        return Status::INVALID_PARAMETER;
+    }
+
+    let guid = unsafe { *protocol };
+    log::debug!("BS.RegisterProtocolNotify(protocol={})", GuidFmt(guid));
+
+    with_tables_mut(|efi_state| {
+        if efi_state.protocol_notifies.len() >= MAX_PROTOCOL_NOTIFIES
+            || efi_state.protocol_notifies.try_reserve(1).is_err()
+        {
+            log::warn!("  -> OUT_OF_RESOURCES (notify registration table full)");
+            return Status::OUT_OF_RESOURCES;
+        }
+
+        let token = efi_state.next_registration;
+        let Some(next_token) = token.checked_add(1) else {
+            return Status::OUT_OF_RESOURCES;
+        };
+        efi_state.next_registration = next_token;
+        efi_state.protocol_notifies.push(ProtocolNotifyEntry {
+            registration: token,
+            protocol: guid,
+            event,
+            cursor: 0,
+        });
+
+        unsafe { *registration = token as *mut c_void };
+        log::debug!("  -> SUCCESS (registration={:#x})", token);
+        Status::SUCCESS
+    })
+}
+
+/// Collect events to signal after releasing the database borrow.
+fn protocol_notification_events(
+    efi_state: &Tables,
+    guid: &Guid,
+) -> heapless::Vec<efi::Event, MAX_PROTOCOL_NOTIFIES> {
+    efi_state
+        .protocol_notifies
+        .iter()
+        .filter(|notify| notify.protocol == *guid)
+        .map(|notify| notify.event)
+        .collect()
+}
+
+/// Peek the next live instance without advancing a registration's shared cursor.
+fn next_registered_protocol(
+    efi_state: &Tables,
+    token: usize,
+    protocol: Option<Guid>,
+) -> Result<(usize, Handle, ProtocolEntry), Status> {
+    let (index, notify) = efi_state
+        .protocol_notifies
+        .iter()
+        .enumerate()
+        .find(|(_, notify)| notify.registration == token)
+        .ok_or(Status::INVALID_PARAMETER)?;
+    if protocol.is_some_and(|guid| guid != notify.protocol) {
+        return Err(Status::INVALID_PARAMETER);
+    }
+    efi_state.handles[..efi_state.handle_count]
+        .iter()
+        .flat_map(|handle| {
+            handle.protocols[..handle.protocol_count]
+                .iter()
+                .map(move |entry| (index, handle.handle, *entry))
+        })
+        .filter(|(_, _, entry)| entry.guid == notify.protocol && entry.generation > notify.cursor)
+        .min_by_key(|(_, _, entry)| entry.generation)
+        .ok_or(Status::NOT_FOUND)
 }
 
 extern "efiapi" fn locate_handle(
     search_type: efi::LocateSearchType,
     protocol: *mut Guid,
-    _search_key: *mut c_void,
+    search_key: *mut c_void,
     buffer_size: *mut usize,
     buffer: *mut Handle,
 ) -> Status {
@@ -922,8 +1020,29 @@ extern "efiapi" fn locate_handle(
         buffer
     );
 
-    // The handle database can grow beyond its initial reservation, so collect
-    // onto the heap rather than silently truncating at MAX_HANDLES.
+    if search_type == efi::BY_REGISTER_NOTIFY {
+        return with_tables_mut(|efi_state| {
+            let (index, handle, entry) =
+                match next_registered_protocol(efi_state, search_key as usize, None) {
+                    Ok(next) => next,
+                    Err(status) => return status,
+                };
+            let required_size = core::mem::size_of::<Handle>();
+            let capacity = unsafe { *buffer_size };
+            unsafe { *buffer_size = required_size };
+            if buffer.is_null() || capacity < required_size {
+                return Status::BUFFER_TOO_SMALL;
+            }
+            unsafe { *buffer = handle };
+            efi_state.protocol_notifies[index].cursor = entry.generation;
+            Status::SUCCESS
+        });
+    }
+
+    // Collect matching handles based on search type. The handle database grows
+    // past its preallocated size, so this collects onto the heap rather than
+    // into a fixed-capacity buffer that would silently truncate the result.
+    //
     let matching = {
         let efi_state = tables();
         match search_type {
@@ -931,10 +1050,6 @@ extern "efiapi" fn locate_handle(
                 Ok(handles) => handles,
                 Err(status) => return status,
             },
-            efi::BY_REGISTER_NOTIFY => {
-                log::debug!("  -> NOT_FOUND (BY_REGISTER_NOTIFY not supported)");
-                return Status::NOT_FOUND;
-            }
             efi::BY_PROTOCOL => {
                 if protocol.is_null() {
                     return Status::INVALID_PARAMETER;
@@ -959,26 +1074,39 @@ extern "efiapi" fn locate_handle(
         }
     };
 
+    // Check for no matches FIRST, before buffer size checks
     if matching.is_empty() {
         log::debug!("  -> NOT_FOUND (no matching handles)");
         return Status::NOT_FOUND;
     }
 
     let required_size = matching.len() * core::mem::size_of::<Handle>();
+
     if buffer.is_null() || unsafe { *buffer_size } < required_size {
         unsafe { *buffer_size = required_size };
         log::debug!("  -> BUFFER_TOO_SMALL (need {} bytes)", required_size);
         return Status::BUFFER_TOO_SMALL;
     }
 
+    // Copy handles to buffer using slice copy
     let dest = unsafe { core::slice::from_raw_parts_mut(buffer, matching.len()) };
-    dest.copy_from_slice(&matching);
+    dest.copy_from_slice(&matching[..]);
     unsafe { *buffer_size = required_size };
 
     log::debug!("  -> found {} handles: {:?}", matching.len(), matching);
+
+    log::debug!("  -> found {} handles: {:?}", matching.len(), &matching[..]);
     Status::SUCCESS
 }
 
+/// Collect the handles matching `filter` onto the firmware heap.
+///
+/// # Arguments
+/// * `efi_state` - Borrowed EFI state.
+/// * `filter` - Predicate applied to each live handle entry.
+///
+/// # Returns
+/// The matching handles, or `Err(OUT_OF_RESOURCES)` when the heap cannot hold them.
 fn collect_handles(
     efi_state: &Tables,
     filter: impl Fn(&HandleEntry) -> bool,
@@ -2215,7 +2343,7 @@ extern "efiapi" fn locate_handle_buffer(
 
 extern "efiapi" fn locate_protocol(
     protocol: *mut Guid,
-    _registration: *mut c_void,
+    registration: *mut c_void,
     interface: *mut *mut c_void,
 ) -> Status {
     if protocol.is_null() || interface.is_null() {
@@ -2224,6 +2352,19 @@ extern "efiapi" fn locate_protocol(
 
     let guid = unsafe { *protocol };
     log::trace!("BS.LocateProtocol(protocol={})", GuidFmt(guid));
+
+    if !registration.is_null() {
+        return with_tables_mut(|efi_state| {
+            let (index, _, entry) =
+                match next_registered_protocol(efi_state, registration as usize, Some(guid)) {
+                    Ok(next) => next,
+                    Err(status) => return status,
+                };
+            unsafe { *interface = entry.interface };
+            efi_state.protocol_notifies[index].cursor = entry.generation;
+            Status::SUCCESS
+        });
+    }
 
     let efi_state = tables();
 
@@ -2356,7 +2497,9 @@ fn install_multiple_pairs(handle: *mut Handle, pairs: &[(Guid, *mut c_void)]) ->
     };
 
     for (index, (guid, interface)) in pairs.iter().enumerate() {
-        let status = install_protocol(target_handle, guid, *interface);
+        // No callbacks may observe a partial transaction or acquire opens that
+        // prevent rollback. Publish notifications only after every pair succeeds.
+        let status = install_protocol_internal(target_handle, guid, *interface, false);
         if status != Status::SUCCESS {
             let mut rollback_complete = true;
             for (installed_guid, installed_interface) in pairs[..index].iter().rev() {
@@ -2377,6 +2520,18 @@ fn install_multiple_pairs(handle: *mut Handle, pairs: &[(Guid, *mut c_void)]) ->
             }
             return status;
         }
+    }
+    let events: heapless::Vec<efi::Event, MAX_PROTOCOL_NOTIFIES> = {
+        let efi_state = tables();
+        efi_state
+            .protocol_notifies
+            .iter()
+            .filter(|notify| pairs.iter().any(|(guid, _)| *guid == notify.protocol))
+            .map(|notify| notify.event)
+            .collect()
+    };
+    for event in events {
+        signal_event(event);
     }
     Status::SUCCESS
 }
@@ -2688,7 +2843,17 @@ fn remove_protocol(handle: Handle, guid: &Guid, interface: Option<*mut c_void>) 
 
 /// Install a protocol on an existing handle
 pub fn install_protocol(handle: Handle, guid: &Guid, interface: *mut c_void) -> Status {
-    with_tables_mut(|efi_state| {
+    install_protocol_internal(handle, guid, interface, true)
+}
+
+/// Install an instance, optionally deferring notification until a transaction commits.
+fn install_protocol_internal(
+    handle: Handle,
+    guid: &Guid,
+    interface: *mut c_void,
+    notify: bool,
+) -> Status {
+    let (status, notify_events) = with_tables_mut(|efi_state| {
         if let Some(entry) = efi_state.handles[..efi_state.handle_count]
             .iter_mut()
             .find(|e| e.handle == handle)
@@ -2698,23 +2863,41 @@ pub fn install_protocol(handle: Handle, guid: &Guid, interface: *mut c_void) -> 
                 .iter()
                 .any(|p| p.guid == *guid)
             {
-                return Status::INVALID_PARAMETER;
+                return (Status::INVALID_PARAMETER, heapless::Vec::new());
             }
 
             if entry.protocol_count >= MAX_PROTOCOLS_PER_HANDLE {
-                return Status::OUT_OF_RESOURCES;
+                return (Status::OUT_OF_RESOURCES, heapless::Vec::new());
             }
 
+            let Some(generation) = efi_state.protocol_generation.checked_add(1) else {
+                return (Status::OUT_OF_RESOURCES, heapless::Vec::new());
+            };
+            efi_state.protocol_generation = generation;
             entry.protocols[entry.protocol_count] = ProtocolEntry {
                 guid: *guid,
                 interface,
+                generation,
             };
             entry.protocol_count += 1;
-            return Status::SUCCESS;
+            let events = if notify {
+                protocol_notification_events(efi_state, guid)
+            } else {
+                heapless::Vec::new()
+            };
+            return (Status::SUCCESS, events);
         }
 
-        Status::INVALID_PARAMETER
-    })
+        (Status::INVALID_PARAMETER, heapless::Vec::new())
+    });
+
+    // Signaled outside the state borrow: notify callbacks call back into Boot
+    // Services, and a nested mutable borrow trips the state re-entrancy guard.
+    for event in notify_events {
+        signal_event(event);
+    }
+
+    status
 }
 
 /// Look up a protocol interface on a handle (internal helper).
