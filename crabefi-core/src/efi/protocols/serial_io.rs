@@ -299,8 +299,7 @@ pub fn create_protocol() -> *mut Protocol {
         p.get_control = serial_get_control;
         p.write = serial_write;
         p.read = serial_read;
-        p.mode =
-            unsafe { core::ptr::addr_of_mut!((*crate::state::drivers_mut_ptr()).serial.io_mode) };
+        p.mode = unsafe { core::ptr::addr_of_mut!((*crate::state::drivers_ptr()).serial.io_mode) };
         p.device_type_guid = core::ptr::null();
     });
     if ptr.is_null() {

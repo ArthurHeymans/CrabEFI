@@ -72,7 +72,7 @@ fn with_access<F, R>(f: F) -> R
 where
     F: FnOnce(&AnyPciAccess) -> R,
 {
-    let access = &state::drivers().pci.access;
+    let access = &unsafe { &*state::drivers_ptr() }.pci.access;
     f(access)
 }
 
@@ -342,7 +342,7 @@ pub fn dma_domain(address: PciAddress) -> Option<DmaDomain> {
     }
     #[cfg(not(target_arch = "x86_64"))]
     {
-        let drivers = state::drivers();
+        let drivers = unsafe { &*state::drivers_ptr() };
         drivers
             .fdt_info
             .pci_dma_domain(address.segment())
@@ -362,7 +362,7 @@ pub fn dma_domain(address: PciAddress) -> Option<DmaDomain> {
 pub fn init() {
     log::info!("Initializing PCI subsystem...");
     let (regions, ecam_configured) = {
-        let drivers = state::drivers();
+        let drivers = unsafe { &*state::drivers_ptr() };
         (
             drivers.pci.ecam_regions.clone(),
             drivers.pci.ecam_configured,
@@ -471,7 +471,7 @@ fn enumerate_region(
 pub fn bind_drivers() {
     log::info!("Binding PCI drivers to devices...");
 
-    let devices = state::drivers().pci.devices.clone();
+    let devices = unsafe { &*state::drivers_ptr() }.pci.devices.clone();
 
     let mut bound_count = 0;
     for device in devices.iter() {
@@ -497,7 +497,7 @@ pub fn shutdown_drivers() {
 /// by firmware.  Any device left bus-mastering can scribble over pages Linux
 /// has already repurposed for early stacks or metadata.
 pub fn disable_all_bus_mastering_for_handoff() {
-    let devices = state::drivers().pci.devices.clone();
+    let devices = unsafe { &*state::drivers_ptr() }.pci.devices.clone();
     if devices.is_empty() {
         return;
     }
@@ -535,7 +535,7 @@ pub fn disable_all_bus_mastering_for_handoff() {
 
 /// Find all NVMe controllers
 pub fn find_nvme_controllers() -> heapless::Vec<PciDevice, 8> {
-    let drivers = state::drivers();
+    let drivers = unsafe { &*state::drivers_ptr() };
     let devices = &drivers.pci.devices;
     let mut result = heapless::Vec::new();
     for dev in devices.iter() {
@@ -554,7 +554,7 @@ pub fn find_nvme_controllers() -> heapless::Vec<PciDevice, 8> {
 
 /// Find all AHCI controllers
 pub fn find_ahci_controllers() -> heapless::Vec<PciDevice, 8> {
-    let drivers = state::drivers();
+    let drivers = unsafe { &*state::drivers_ptr() };
     let devices = &drivers.pci.devices;
     let mut result = heapless::Vec::new();
     for dev in devices.iter() {
@@ -573,7 +573,7 @@ pub fn find_ahci_controllers() -> heapless::Vec<PciDevice, 8> {
 
 /// Find all SDHCI controllers
 pub fn find_sdhci_controllers() -> heapless::Vec<PciDevice, 8> {
-    let drivers = state::drivers();
+    let drivers = unsafe { &*state::drivers_ptr() };
     let devices = &drivers.pci.devices;
     let mut result = heapless::Vec::new();
     for dev in devices.iter() {
@@ -592,12 +592,12 @@ pub fn find_sdhci_controllers() -> heapless::Vec<PciDevice, 8> {
 
 /// Get all enumerated PCI devices
 pub fn get_all_devices() -> heapless::Vec<PciDevice, { state::MAX_PCI_DEVICES }> {
-    state::drivers().pci.devices.clone()
+    unsafe { &*state::drivers_ptr() }.pci.devices.clone()
 }
 
 /// Print information about all PCI devices
 pub fn print_devices() {
-    let drivers = state::drivers();
+    let drivers = unsafe { &*state::drivers_ptr() };
     let devices = &drivers.pci.devices;
 
     log::info!("PCI Devices:");

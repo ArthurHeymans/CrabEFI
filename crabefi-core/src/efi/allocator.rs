@@ -10,7 +10,7 @@
 //! # State Management
 //!
 //! The allocator state is stored in the centralized `FirmwareState` structure.
-//! Access it via `crate::state::allocator()` or `crate::state::allocator_mut()`.
+//! Access it via `unsafe { &*crate::state::allocator_ptr() }` or `crate::state::allocator_mut()`.
 
 use core::sync::atomic::{AtomicBool, Ordering};
 
@@ -1380,19 +1380,19 @@ pub fn free_pages(memory: u64, num_pages: u64) -> efi::Status {
 
 /// Dump the full memory map to the log (for debugging).
 pub fn dump_memory_map() {
-    let alloc = state::allocator();
+    let alloc = unsafe { &*state::allocator_ptr() };
     alloc.dump_entries();
 }
 
 /// Get the memory map size
 pub fn get_memory_map_size() -> usize {
-    let alloc = state::allocator();
+    let alloc = unsafe { &*state::allocator_ptr() };
     alloc.entry_count() * core::mem::size_of::<MemoryDescriptor>()
 }
 
 /// Get current map key
 pub fn get_map_key() -> usize {
-    let alloc = state::allocator();
+    let alloc = unsafe { &*state::allocator_ptr() };
     alloc.map_key()
 }
 
@@ -1401,7 +1401,7 @@ pub fn get_map_key() -> usize {
 /// Returns the memory type if the address is within a known memory region,
 /// or None if the address is not in any known region.
 pub fn copy_runtime_descriptors(output: &mut [MemoryDescriptor]) -> Result<usize, efi::Status> {
-    let allocator = state::allocator();
+    let allocator = unsafe { &*state::allocator_ptr() };
     let runtime = allocator
         .entries
         .iter()
@@ -1419,7 +1419,7 @@ pub fn copy_runtime_descriptors(output: &mut [MemoryDescriptor]) -> Result<usize
 
 /// Find the memory type for a given physical address.
 pub fn get_memory_type_at(address: u64) -> Option<MemoryType> {
-    let alloc = state::allocator();
+    let alloc = unsafe { &*state::allocator_ptr() };
     alloc
         .entries
         .iter()
@@ -1435,7 +1435,7 @@ pub fn range_has_memory_type(base: u64, size: u64, memory_type: MemoryType) -> b
     if size == 0 {
         return false;
     }
-    let allocator = state::allocator();
+    let allocator = unsafe { &*state::allocator_ptr() };
     let mut covered = base;
     for descriptor in allocator.entries.iter() {
         if descriptor.end() <= covered {
@@ -1462,7 +1462,7 @@ pub fn get_memory_map(
     descriptor_size: &mut usize,
     descriptor_version: &mut u32,
 ) -> efi::Status {
-    let alloc = state::allocator();
+    let alloc = unsafe { &*state::allocator_ptr() };
     alloc.get_memory_map(
         memory_map_size,
         memory_map,
@@ -1474,7 +1474,7 @@ pub fn get_memory_map(
 
 /// Validate an ExitBootServices map key without changing allocator state.
 pub fn validate_map_key(map_key: usize) -> efi::Status {
-    state::allocator().validate_map_key(map_key)
+    unsafe { &*state::allocator_ptr() }.validate_map_key(map_key)
 }
 
 /// Exit boot services

@@ -45,7 +45,7 @@ extern "efiapi" fn console_get_mode(
     if !mode.is_null() {
         // SAFETY: mode is a non-null pointer from the caller; single-threaded firmware.
         unsafe {
-            *mode = crate::state::console().screen_mode;
+            *mode = (&*crate::state::console_ptr()).screen_mode;
         }
     }
 
@@ -79,10 +79,10 @@ extern "efiapi" fn console_set_mode(
         return Status::INVALID_PARAMETER;
     }
 
-    let prev_mode = crate::state::console().screen_mode;
+    let prev_mode = unsafe { &*crate::state::console_ptr() }.screen_mode;
     // SAFETY: Single-threaded firmware; no aliasing &mut exists at this point.
     unsafe {
-        (*crate::state::console_mut_ptr()).screen_mode = mode;
+        (*crate::state::console_ptr()).screen_mode = mode;
     }
 
     log::debug!("ConsoleControl.SetMode({:?} -> {:?})", prev_mode, mode);

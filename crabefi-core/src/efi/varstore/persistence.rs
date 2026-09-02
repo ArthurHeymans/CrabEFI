@@ -91,8 +91,8 @@ pub fn init(locator: Option<&dyn VariableStoreLocator>) -> Result<(), VarStoreEr
     configure_from_locator(&mut backend, locator)?;
 
     // Store the backend in global state
-    state::with_mut(|s| {
-        s.drivers.platform.storage = Some(backend);
+    state::with_drivers_mut(|drivers| {
+        drivers.platform.storage = Some(backend);
     });
 
     // Initialize the variable store region
@@ -385,7 +385,7 @@ fn preflight_non_auth_migration(
 
 /// Load variables from storage into the in-memory cache
 fn load_variables_from_storage() -> Result<(), VarStoreError> {
-    let vs = state::varstore();
+    let vs = unsafe { &*state::varstore_ptr() };
     if !vs.initialized {
         return Err(VarStoreError::NotInitialized);
     }
@@ -414,7 +414,7 @@ fn load_variables_from_storage() -> Result<(), VarStoreError> {
         active_vars.push(var);
     }
 
-    let client = state::efi()
+    let client = unsafe { &*state::efi_ptr() }
         .runtime_image
         .ok_or(VarStoreError::NotInitialized)?;
     for variable in &active_vars {
@@ -453,7 +453,7 @@ fn load_variables_from_storage() -> Result<(), VarStoreError> {
 
 /// Get the latest durable authenticated timestamp, including deletion floors.
 pub fn get_variable_timestamp(guid: &r_efi::efi::Guid, name: &[u16]) -> Option<VariableTimestamp> {
-    let variable_store = state::varstore();
+    let variable_store = unsafe { &*state::varstore_ptr() };
     if !variable_store.initialized || !variable_store.auth_format {
         return None;
     }
@@ -498,7 +498,7 @@ pub(crate) fn write_variable_to_storage_internal(
     data: &[u8],
     timestamp: Option<VariableTimestamp>,
 ) -> Result<(), VarStoreError> {
-    let vs = state::varstore();
+    let vs = unsafe { &*state::varstore_ptr() };
     require_writable_store(vs.initialized, vs.auth_format)?;
 
     let guid_bytes = edk2::guid_to_bytes(guid);
@@ -511,10 +511,10 @@ pub(crate) fn write_variable_to_storage_internal(
     let storage_size =
         state::with_storage_mut(|s| s.size()).ok_or(VarStoreError::NotInitialized)?;
 
-    let mut write_offset = state::varstore().write_offset;
+    let mut write_offset = unsafe { &*state::varstore_ptr() }.write_offset;
     if !write_slot_available(write_offset, record_len, storage_size)? {
         compact_variable_store()?;
-        write_offset = state::varstore().write_offset;
+        write_offset = unsafe { &*state::varstore_ptr() }.write_offset;
         if !write_slot_available(write_offset, record_len, storage_size)? {
             return Err(VarStoreError::StoreFull);
         }
@@ -580,7 +580,7 @@ fn write_slot_available(offset: u32, len: u32, storage_size: u32) -> Result<bool
 /// the normal header-valid then VAR_ADDED protocol rather than becoming
 /// permanently unreclaimable after ordinary updates.
 fn compact_variable_store() -> Result<(), VarStoreError> {
-    let vs = state::varstore();
+    let vs = unsafe { &*state::varstore_ptr() };
     if !vs.initialized || !vs.auth_format {
         return Err(VarStoreError::StoreFull);
     }
@@ -739,7 +739,7 @@ pub(crate) fn write_variable_deletion_internal(
     attributes: u32,
     timestamp: Option<VariableTimestamp>,
 ) -> Result<(), VarStoreError> {
-    let vs = state::varstore();
+    let vs = unsafe { &*state::varstore_ptr() };
     require_writable_store(vs.initialized, vs.auth_format)?;
     if timestamp.is_some() {
         // An active zero-length authenticated record is invisible to coreboot's
@@ -757,7 +757,7 @@ fn delete_existing_record_except(
     name: &[u16],
     keep_state_offset: Option<u32>,
 ) -> Result<(), VarStoreError> {
-    let vs = state::varstore();
+    let vs = unsafe { &*state::varstore_ptr() };
     require_writable_store(vs.initialized, vs.auth_format)?;
     let auth_format = vs.auth_format;
     let data_size = vs.data_size;
@@ -824,12 +824,12 @@ pub fn is_storage_available() -> bool {
 
 /// Check if variable store is initialized.
 pub fn is_varstore_initialized() -> bool {
-    state::varstore().initialized
+    unsafe { &*state::varstore_ptr() }.initialized
 }
 
 /// Check whether the initialized store accepts durable authenticated writes.
 pub fn is_varstore_writable() -> bool {
-    let store = state::varstore();
+    let store = unsafe { &*state::varstore_ptr() };
     store.initialized && store.auth_format
 }
 
@@ -837,7 +837,7 @@ pub fn is_varstore_writable() -> bool {
 ///
 /// Returns (base_offset, size, write_offset)
 pub fn get_varstore_stats() -> Option<(u32, u32, u32)> {
-    let vs = state::varstore();
+    let vs = unsafe { &*state::varstore_ptr() };
     let (base, size) = state::with_storage_mut(|s| (s.base_offset(), s.size()))?;
     Some((base, size, vs.write_offset))
 }
@@ -871,7 +871,7 @@ pub(crate) fn persist_firmware_variable(
         None,
     )?;
 
-    let client = state::efi()
+    let client = unsafe { &*state::efi_ptr() }
         .runtime_image
         .ok_or(VarStoreError::NotInitialized)?;
     client

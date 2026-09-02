@@ -16,14 +16,14 @@ pub fn set_framebuffer(fb: FramebufferConfig) {
     unsafe {
         fb.clear(0, 0, 0);
     }
-    let console = unsafe { &mut (*crate::state::console_mut_ptr()) };
+    let console = unsafe { &mut (*crate::state::console_ptr()) };
     console.logger_framebuffer = Some(fb);
     console.logger_cursor = (0, 0);
 }
 
 /// Log a message to the framebuffer
 pub fn log_to_framebuffer(level: Level, ts: u64, args: &core::fmt::Arguments) {
-    let fb_info = match unsafe { (*crate::state::console_mut_ptr()).logger_framebuffer } {
+    let fb_info = match unsafe { (*crate::state::console_ptr()).logger_framebuffer } {
         Some(fb) => fb,
         None => return,
     };
@@ -37,7 +37,7 @@ pub fn log_to_framebuffer(level: Level, ts: u64, args: &core::fmt::Arguments) {
         Level::Trace => ("TRACE", Color::new(192, 64, 192)), // Purple
     };
 
-    let (mut row, mut col) = unsafe { (*crate::state::console_mut_ptr()).logger_cursor };
+    let (mut row, mut col) = unsafe { (*crate::state::console_ptr()).logger_cursor };
     let cols = fb_info.width / CHAR_WIDTH;
     let rows = fb_info.height / CHAR_HEIGHT;
 
@@ -98,7 +98,7 @@ pub fn log_to_framebuffer(level: Level, ts: u64, args: &core::fmt::Arguments) {
 
     // Update cursor
     unsafe {
-        (*crate::state::console_mut_ptr()).logger_cursor = (row, col);
+        (*crate::state::console_ptr()).logger_cursor = (row, col);
     }
 }
 
