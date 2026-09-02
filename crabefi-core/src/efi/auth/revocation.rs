@@ -88,7 +88,7 @@ pub fn extract_crl_distribution_points(
 
     let mut points = Vec::new();
 
-    if let Some(extensions) = &cert.tbs_certificate.extensions {
+    if let Some(extensions) = &cert.tbs_certificate().extensions() {
         for ext in extensions.iter() {
             if ext.extn_id == <CrlDistributionPoints as const_oid::AssociatedOid>::OID {
                 let cdps = CrlDistributionPoints::from_der(ext.extn_value.as_bytes())
@@ -130,7 +130,7 @@ pub fn parse_crl(crl_der: &[u8]) -> Result<CertificateRevocationList, AuthError>
         return Err(AuthError::InvalidHeader);
     }
 
-    let crl = CertificateList::from_der(crl_der).map_err(|e| {
+    let crl: CertificateList = CertificateList::from_der(crl_der).map_err(|e| {
         log::debug!("Failed to parse CRL: {:?}", e);
         AuthError::CertificateParseError
     })?;
@@ -262,7 +262,7 @@ pub fn extract_ocsp_responders(cert_der: &[u8]) -> Result<Vec<OcspResponder>, Au
 
     let mut responders = Vec::new();
 
-    if let Some(extensions) = &cert.tbs_certificate.extensions {
+    if let Some(extensions) = &cert.tbs_certificate().extensions() {
         for ext in extensions.iter() {
             if ext.extn_id == <AuthorityInfoAccessSyntax as const_oid::AssociatedOid>::OID {
                 let aia = AuthorityInfoAccessSyntax::from_der(ext.extn_value.as_bytes())
@@ -309,22 +309,22 @@ pub fn build_ocsp_request(cert_der: &[u8], issuer_der: &[u8]) -> Result<Vec<u8>,
 
     // Get issuer name hash (SHA-1)
     let issuer_name_der = issuer
-        .tbs_certificate
-        .subject
+        .tbs_certificate()
+        .subject()
         .to_der()
         .map_err(|_| AuthError::CertificateParseError)?;
     let issuer_name_hash = sha1_hash(&issuer_name_der);
 
     // Get issuer key hash (SHA-1 of the issuer's public key)
     let issuer_key_der = issuer
-        .tbs_certificate
-        .subject_public_key_info
+        .tbs_certificate()
+        .subject_public_key_info()
         .subject_public_key
         .raw_bytes();
     let issuer_key_hash = sha1_hash(issuer_key_der);
 
     // Get serial number
-    let serial_number = cert.tbs_certificate.serial_number.as_bytes();
+    let serial_number = cert.tbs_certificate().serial_number().as_bytes();
 
     // Build the OCSP request manually (no x509-ocsp crate available)
     // OCSPRequest ::= SEQUENCE {
@@ -609,7 +609,7 @@ pub fn check_crl_revocation(
         Err(_) => return RevocationCheckResult::Unknown,
     };
 
-    let serial_number = cert.tbs_certificate.serial_number.as_bytes();
+    let serial_number = cert.tbs_certificate().serial_number().as_bytes();
 
     // Check if the serial number is in the revoked list
     for revoked in &crl.revoked_certificates {
@@ -656,7 +656,7 @@ pub fn check_certificate_revocation(
         Err(_) => return RevocationCheckResult::Unknown,
     };
 
-    let issuer_name = match issuer.tbs_certificate.subject.to_der() {
+    let issuer_name = match issuer.tbs_certificate().subject().to_der() {
         Ok(n) => n,
         Err(_) => return RevocationCheckResult::Unknown,
     };
