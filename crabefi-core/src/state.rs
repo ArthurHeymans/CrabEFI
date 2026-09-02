@@ -40,20 +40,8 @@ static PLATFORM_CALLBACKS: LocalCell<PlatformCallbacks> = LocalCell::new(Platfor
 // Driver State
 // ============================================================================
 
-use crate::drivers::pci::PciDevice;
-use crate::drivers::pci::access::AnyPciAccess;
-use crate::drivers::storage::StorageRegistry;
-use crate::platform::{FramebufferConfig, PciEcamRegion};
+use crate::platform::FramebufferConfig;
 use heapless::Vec as HeaplessVec;
-
-/// Maximum number of PCI devices
-pub const MAX_PCI_DEVICES: usize = 64;
-
-/// Maximum number of storage controllers
-pub const MAX_STORAGE_CONTROLLERS: usize = 4;
-
-/// Maximum number of storage devices in registry
-pub const MAX_STORAGE_DEVICES: usize = 16;
 
 /// Maximum number of memory regions we can store
 pub const MAX_MEMORY_REGIONS: usize = 64;
@@ -63,17 +51,8 @@ pub const MAX_CAPSULES: usize = 32;
 
 /// Hardware driver state, organized into logical subsystems.
 pub struct DriverState {
-    /// PCI bus subsystem
-    pub pci: PciState,
-
     /// Platform hardware info from platform config.
     pub platform: PlatformInfo,
-
-    /// Storage device registry (tracks all block devices)
-    pub(crate) storage_registry: StorageRegistry,
-
-    /// Hardware RNG available and functional
-    pub rng_available: bool,
 
     /// Platform info from FDT (PCIe, GIC, etc.)
     pub fdt_info: crate::fdt::PlatformInfo,
@@ -93,10 +72,7 @@ pub struct DriverState {
 impl DriverState {
     pub const fn new() -> Self {
         Self {
-            pci: PciState::new(),
             platform: PlatformInfo::new(),
-            storage_registry: StorageRegistry::new(),
-            rng_available: false,
             fdt_info: crate::fdt::PlatformInfo::new(),
             acpi_info: crate::fdt::PlatformInfo::new(),
         }
@@ -104,42 +80,6 @@ impl DriverState {
 }
 
 impl Default for DriverState {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-// ----------------------------------------------------------------------------
-// PCI State
-// ----------------------------------------------------------------------------
-
-/// PCI bus subsystem state
-pub struct PciState {
-    /// Enumerated PCI device list
-    pub devices: HeaplessVec<PciDevice, MAX_PCI_DEVICES>,
-    /// Validated PCIe ECAM allocations (from platform, ACPI MCFG, or FDT).
-    pub ecam_regions: HeaplessVec<PciEcamRegion, { crate::fdt::MAX_ECAM_REGIONS }>,
-    /// Whether firmware explicitly supplied ECAM configuration.
-    pub ecam_configured: bool,
-    /// Config space access method (legacy I/O CAM or PCIe ECAM)
-    pub access: AnyPciAccess,
-}
-
-impl PciState {
-    pub const fn new() -> Self {
-        Self {
-            devices: HeaplessVec::new(),
-            ecam_regions: HeaplessVec::new(),
-            ecam_configured: false,
-            #[cfg(target_arch = "x86_64")]
-            access: AnyPciAccess::IoCam(crate::drivers::pci::access::IoCamAccess),
-            #[cfg(not(target_arch = "x86_64"))]
-            access: AnyPciAccess::Unavailable,
-        }
-    }
-}
-
-impl Default for PciState {
     fn default() -> Self {
         Self::new()
     }

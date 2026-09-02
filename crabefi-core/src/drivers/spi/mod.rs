@@ -412,7 +412,7 @@ fn map_core_error(error: rflasher_core::error::Error) -> SpiError {
 }
 
 type RflasherPciDevices =
-    heapless::Vec<rflasher_internal::PciDevice, { crate::state::MAX_PCI_DEVICES }>;
+    heapless::Vec<rflasher_internal::PciDevice, { crate::drivers::pci::MAX_PCI_DEVICES }>;
 
 fn rflasher_pci_device(dev: &pci::PciDevice) -> rflasher_internal::PciDevice {
     let class =

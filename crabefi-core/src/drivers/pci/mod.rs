@@ -31,8 +31,41 @@ pub mod driver;
 pub use access::ConfigAccessError;
 use access::{AnyPciAccess, PciAccess};
 
+use crate::cell::Local;
 use crate::efi::dma::DmaDomain;
-use crate::state;
+use crate::platform::PciEcamRegion;
+
+/// Maximum number of PCI devices
+pub const MAX_PCI_DEVICES: usize = 64;
+
+/// PCI bus subsystem state
+struct PciState {
+    /// Enumerated PCI device list
+    devices: heapless::Vec<PciDevice, MAX_PCI_DEVICES>,
+    /// Validated PCIe ECAM allocations (from platform, ACPI MCFG, or FDT).
+    ecam_regions: heapless::Vec<PciEcamRegion, { crate::fdt::MAX_ECAM_REGIONS }>,
+    /// Whether firmware explicitly supplied ECAM configuration.
+    ecam_configured: bool,
+    /// Config space access method (legacy I/O CAM or PCIe ECAM)
+    access: AnyPciAccess,
+}
+
+impl PciState {
+    const fn new() -> Self {
+        Self {
+            devices: heapless::Vec::new(),
+            ecam_regions: heapless::Vec::new(),
+            ecam_configured: false,
+            #[cfg(target_arch = "x86_64")]
+            access: AnyPciAccess::IoCam(access::IoCamAccess),
+            #[cfg(not(target_arch = "x86_64"))]
+            access: AnyPciAccess::Unavailable,
+        }
+    }
+}
+
+/// The PCI subsystem.
+static PCI: Local<PciState> = Local::new(PciState::new());
 pub use pci_types::{
     BaseClass, CommandRegister, ConfigRegionAccess, DeviceId, DeviceRevision, HeaderType,
     Interface, PciAddress, PciHeader, StatusRegister, SubClass, VendorId,
@@ -72,8 +105,7 @@ fn with_access<F, R>(f: F) -> R
 where
     F: FnOnce(&AnyPciAccess) -> R,
 {
-    let access = &state::drivers().pci.access;
-    f(access)
+    f(&PCI.borrow().access)
 }
 
 // ============================================================================
@@ -342,7 +374,7 @@ pub fn dma_domain(address: PciAddress) -> Option<DmaDomain> {
     }
     #[cfg(not(target_arch = "x86_64"))]
     {
-        let drivers = state::drivers();
+        let drivers = crate::state::drivers();
         drivers
             .fdt_info
             .pci_dma_domain(address.segment())
@@ -362,16 +394,12 @@ pub fn dma_domain(address: PciAddress) -> Option<DmaDomain> {
 pub fn init() {
     log::info!("Initializing PCI subsystem...");
     let (regions, ecam_configured) = {
-        let drivers = state::drivers();
-        (
-            drivers.pci.ecam_regions.clone(),
-            drivers.pci.ecam_configured,
-        )
+        let pci = PCI.borrow();
+        (pci.ecam_regions.clone(), pci.ecam_configured)
     };
     let new_access = access::create_access(regions.as_slice(), !ecam_configured);
 
-    state::with_drivers_mut(|drivers| {
-        let pci = &mut drivers.pci;
+    PCI.with_mut(|pci| {
         pci.access = new_access;
         pci.devices.clear();
         match &pci.access {
@@ -411,7 +439,7 @@ pub fn init() {
 /// Enumerate one declared PCI segment/bus range.
 fn enumerate_region(
     access: &AnyPciAccess,
-    devices: &mut heapless::Vec<PciDevice, { state::MAX_PCI_DEVICES }>,
+    devices: &mut heapless::Vec<PciDevice, MAX_PCI_DEVICES>,
     segment: u16,
     bus_start: u8,
     bus_end: u8,
@@ -471,7 +499,7 @@ fn enumerate_region(
 pub fn bind_drivers() {
     log::info!("Binding PCI drivers to devices...");
 
-    let devices = state::drivers().pci.devices.clone();
+    let devices = PCI.borrow().devices.clone();
 
     let mut bound_count = 0;
     for device in devices.iter() {
@@ -497,7 +525,7 @@ pub fn shutdown_drivers() {
 /// by firmware.  Any device left bus-mastering can scribble over pages Linux
 /// has already repurposed for early stacks or metadata.
 pub fn disable_all_bus_mastering_for_handoff() {
-    let devices = state::drivers().pci.devices.clone();
+    let devices = PCI.borrow().devices.clone();
     if devices.is_empty() {
         return;
     }
@@ -535,8 +563,8 @@ pub fn disable_all_bus_mastering_for_handoff() {
 
 /// Find all NVMe controllers
 pub fn find_nvme_controllers() -> heapless::Vec<PciDevice, 8> {
-    let drivers = state::drivers();
-    let devices = &drivers.pci.devices;
+    let pci = PCI.borrow();
+    let devices = &pci.devices;
     let mut result = heapless::Vec::new();
     for dev in devices.iter() {
         if dev.is_nvme() {
@@ -554,8 +582,8 @@ pub fn find_nvme_controllers() -> heapless::Vec<PciDevice, 8> {
 
 /// Find all AHCI controllers
 pub fn find_ahci_controllers() -> heapless::Vec<PciDevice, 8> {
-    let drivers = state::drivers();
-    let devices = &drivers.pci.devices;
+    let pci = PCI.borrow();
+    let devices = &pci.devices;
     let mut result = heapless::Vec::new();
     for dev in devices.iter() {
         if dev.is_ahci() {
@@ -573,8 +601,8 @@ pub fn find_ahci_controllers() -> heapless::Vec<PciDevice, 8> {
 
 /// Find all SDHCI controllers
 pub fn find_sdhci_controllers() -> heapless::Vec<PciDevice, 8> {
-    let drivers = state::drivers();
-    let devices = &drivers.pci.devices;
+    let pci = PCI.borrow();
+    let devices = &pci.devices;
     let mut result = heapless::Vec::new();
     for dev in devices.iter() {
         if dev.is_sdhci() {
@@ -591,14 +619,14 @@ pub fn find_sdhci_controllers() -> heapless::Vec<PciDevice, 8> {
 }
 
 /// Get all enumerated PCI devices
-pub fn get_all_devices() -> heapless::Vec<PciDevice, { state::MAX_PCI_DEVICES }> {
-    state::drivers().pci.devices.clone()
+pub fn get_all_devices() -> heapless::Vec<PciDevice, MAX_PCI_DEVICES> {
+    PCI.borrow().devices.clone()
 }
 
 /// Print information about all PCI devices
 pub fn print_devices() {
-    let drivers = state::drivers();
-    let devices = &drivers.pci.devices;
+    let pci = PCI.borrow();
+    let devices = &pci.devices;
 
     log::info!("PCI Devices:");
     for dev in devices.iter() {
@@ -639,16 +667,16 @@ pub fn set_ecam_regions(regions: &[crate::platform::PciEcamRegion]) -> Result<()
         });
         if !region.is_valid() || overlaps || validated.push(region).is_err() {
             log::error!("PCI: rejected explicit ECAM configuration at {:?}", region);
-            state::with_drivers_mut(|drivers| {
-                drivers.pci.ecam_regions.clear();
-                drivers.pci.ecam_configured = true;
+            PCI.with_mut(|pci| {
+                pci.ecam_regions.clear();
+                pci.ecam_configured = true;
             });
             return Err(());
         }
     }
-    state::with_drivers_mut(|drivers| {
-        drivers.pci.ecam_regions = validated;
-        drivers.pci.ecam_configured = true;
+    PCI.with_mut(|pci| {
+        pci.ecam_regions = validated;
+        pci.ecam_configured = true;
     });
     Ok(())
 }

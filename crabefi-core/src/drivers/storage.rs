@@ -5,6 +5,8 @@
 
 use spin::Mutex;
 
+use crate::cell::Local;
+
 /// Maximum number of storage devices we can track
 const MAX_STORAGE_DEVICES: usize = 8;
 
@@ -137,25 +139,20 @@ pub struct StorageDevice {
 }
 
 /// Internal storage for registered devices
-pub(crate) struct StorageRegistry {
+struct StorageRegistry {
     devices: [Option<StorageDevice>; MAX_STORAGE_DEVICES],
     next_id: u32,
 }
 
-impl StorageRegistry {
-    pub(crate) const fn new() -> Self {
-        Self {
-            devices: [const { None }; MAX_STORAGE_DEVICES],
-            next_id: 0,
-        }
-    }
-}
+/// Registered block devices.
+static REGISTRY: Local<StorageRegistry> = Local::new(StorageRegistry {
+    devices: [const { None }; MAX_STORAGE_DEVICES],
+    next_id: 0,
+});
 
 /// Register a storage device and get its device ID
 pub fn register_device(device_type: StorageType, num_blocks: u64, block_size: u32) -> Option<u32> {
-    crate::state::with_drivers_mut(|drivers| {
-        let registry = &mut drivers.storage_registry;
-
+    REGISTRY.with_mut(|registry| {
         // Find a free slot index first
         let slot_idx = registry.devices.iter().position(|slot| slot.is_none())?;
 
@@ -183,8 +180,8 @@ pub fn register_device(device_type: StorageType, num_blocks: u64, block_size: u3
 
 /// Get a storage device by ID
 pub fn get_device(device_id: u32) -> Option<StorageDevice> {
-    crate::state::drivers()
-        .storage_registry
+    REGISTRY
+        .borrow()
         .devices
         .iter()
         .flatten()
