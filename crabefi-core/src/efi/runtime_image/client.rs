@@ -200,7 +200,7 @@ fn status_result(status: usize) -> Result<(), Status> {
 }
 
 fn client() -> Option<RuntimeImageClient> {
-    crate::state::try_get().and_then(|state| state.efi.runtime_image)
+    crate::state::runtime_image()
 }
 
 pub fn get_system_table() -> *mut efi::SystemTable {

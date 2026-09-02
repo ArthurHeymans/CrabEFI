@@ -68,6 +68,7 @@ pub enum StopBitsType {
 
 /// Serial IO Mode structure - contains current settings
 #[repr(C)]
+#[derive(Clone, Copy)]
 pub struct SerialIoMode {
     pub control_mask: u32,
     pub timeout: u32,
@@ -77,6 +78,26 @@ pub struct SerialIoMode {
     pub parity: u32,
     pub stop_bits: u32,
 }
+
+/// Current port settings. `Protocol.mode` points at this cell; EFI callers
+/// read and write it through that pointer only.
+static IO_MODE: crate::state::LocalCell<SerialIoMode> =
+    crate::state::LocalCell::new(SerialIoMode {
+        control_mask: EFI_SERIAL_CLEAR_TO_SEND
+            | EFI_SERIAL_DATA_SET_READY
+            | EFI_SERIAL_RING_INDICATE
+            | EFI_SERIAL_CARRIER_DETECT
+            | EFI_SERIAL_INPUT_BUFFER_EMPTY
+            | EFI_SERIAL_OUTPUT_BUFFER_EMPTY
+            | EFI_SERIAL_REQUEST_TO_SEND
+            | EFI_SERIAL_DATA_TERMINAL_READY,
+        timeout: 1000000,
+        baud_rate: 115200,
+        receive_fifo_depth: 16,
+        data_bits: 8,
+        parity: 1,    // NoParity
+        stop_bits: 1, // OneStopBit
+    });
 
 /// EFI Serial IO Protocol structure
 #[repr(C)]
@@ -299,8 +320,7 @@ pub fn create_protocol() -> *mut Protocol {
         p.get_control = serial_get_control;
         p.write = serial_write;
         p.read = serial_read;
-        p.mode =
-            unsafe { core::ptr::addr_of_mut!((*crate::state::drivers_mut_ptr()).serial.io_mode) };
+        p.mode = IO_MODE.as_ptr();
         p.device_type_guid = core::ptr::null();
     });
     if ptr.is_null() {

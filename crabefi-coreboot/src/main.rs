@@ -632,12 +632,7 @@ fn extract_timer_freq_from_fdt(fdt_ptr: u64, fdt_size: u32) {
         };
 
         if freq > 0 {
-            // SAFETY: single-threaded init, state already initialized
-            unsafe {
-                let t = &mut (*crabefi::state::drivers_mut_ptr()).timing;
-                t.counter_freq_hz = freq;
-                t.counter_cycles_per_us = (freq / 1_000_000).max(1);
-            }
+            crabefi::time::set_counter_frequency(freq);
         }
     }
 }
@@ -647,12 +642,6 @@ fn extract_timer_freq_from_fdt(fdt_ptr: u64, fdt_size: u32) {
 /// This builds a minimal `PlatformConfig` from FDT data and boots.
 #[cfg(target_arch = "riscv64")]
 fn riscv_fdt_only_boot(fdt_ptr: u64, fdt_size: u32) -> ! {
-    // Initialize firmware state
-    let mut firmware_state = crabefi::state::FirmwareState::new();
-    unsafe {
-        crabefi::state::init(&mut firmware_state);
-    }
-
     // Initialize serial from MMIO (QEMU virt 16550 at 0x10000000)
     crabefi::drivers::serial::init_from_config(&crabefi::drivers::serial::SerialConfig {
         mmio: true,
@@ -689,7 +678,7 @@ fn riscv_fdt_only_boot(fdt_ptr: u64, fdt_size: u32) -> ! {
     let region_count = build_memory_map_from_fdt(fdt_ptr, fdt_size, &mut memory_regions);
 
     let timer = CorebootTimer {
-        freq_hz: crabefi::state::drivers().timing.counter_freq_hz,
+        freq_hz: crabefi::time::counter_frequency(),
     };
     let reset = CorebootReset;
     let hooks = CorebootHooks;
@@ -796,16 +785,6 @@ pub extern "C" fn rust_main(coreboot_table_ptr: u64) -> ! {
 
     let mut cbmem_output = cbmem_console::CbmemConsole::new();
 
-    // ================================================================
-    // Phase 1: Initialize firmware state (needed for all state access)
-    // ================================================================
-    let mut firmware_state = crabefi::state::FirmwareState::new();
-    // SAFETY: Single-threaded firmware entry point. The state lives on
-    // this stack frame which never returns (-> !).
-    unsafe {
-        crabefi::state::init(&mut firmware_state);
-    }
-
     // On RISC-V, extract timer frequency from FDT now that state is initialized.
     #[cfg(target_arch = "riscv64")]
     {
@@ -817,14 +796,14 @@ pub extern "C" fn rust_main(coreboot_table_ptr: u64) -> ! {
     }
 
     // ================================================================
-    // Phase 2: Parse coreboot tables (reads raw memory, no heap needed)
+    // Phase 1: Parse coreboot tables (reads raw memory, no heap needed)
     // ================================================================
     // SAFETY: The parser first tries the payload entry argument and falls back
     // to scanning the standard coreboot table locations if it is not valid.
     let cb_info = unsafe { tables::parse(coreboot_table_ptr as *const u8) };
 
     // ================================================================
-    // Phase 3: Store coreboot-specific info in global state
+    // Phase 2: Store coreboot-specific info in global state
     // ================================================================
     //
     // These fields are used by the SPI variable persistence subsystem
@@ -876,7 +855,7 @@ pub extern "C" fn rust_main(coreboot_table_ptr: u64) -> ! {
     });
 
     // ================================================================
-    // Phase 4: Initialize serial and logging
+    // Phase 3: Initialize serial and logging
     // ================================================================
     if let Some(ref serial) = cb_info.serial {
         crabefi::drivers::serial::init_from_config(&crabefi::drivers::serial::SerialConfig {
@@ -920,12 +899,12 @@ pub extern "C" fn rust_main(coreboot_table_ptr: u64) -> ! {
     log_coreboot_info(&cb_info);
 
     // ================================================================
-    // Phase 5: Calibrate timer (needs serial for logging)
+    // Phase 4: Calibrate timer (needs serial for logging)
     // ================================================================
     crabefi::time::init(cb_info.acpi_rsdp);
 
     // ================================================================
-    // Phase 6: Build PlatformConfig
+    // Phase 5: Build PlatformConfig
     // ================================================================
 
     // Convert coreboot memory map to platform format.
@@ -938,7 +917,7 @@ pub extern "C" fn rust_main(coreboot_table_ptr: u64) -> ! {
 
     // Create timer backed by the calibrated arch counter.
     let timer = CorebootTimer {
-        freq_hz: crabefi::state::drivers().timing.counter_freq_hz,
+        freq_hz: crabefi::time::counter_frequency(),
     };
 
     let reset = CorebootReset;
@@ -1066,11 +1045,11 @@ pub extern "C" fn rust_main(coreboot_table_ptr: u64) -> ! {
                 tpm1_tis_base: None,
             }
         }),
-        heap_pre_initialized: false, // Set to true after Phase 7
+        heap_pre_initialized: false, // Set to true after Phase 6
     };
 
     // ================================================================
-    // Phase 7: Bootstrap page allocator and heap early
+    // Phase 6: Bootstrap page allocator and heap early
     //
     // We only need the page allocator (for heap::init) and the heap
     // (for ACPI AML / CFR parsing).  The full EFI environment (system
@@ -1085,7 +1064,7 @@ pub extern "C" fn rust_main(coreboot_table_ptr: u64) -> ! {
     config.heap_pre_initialized = true;
 
     // ================================================================
-    // Phase 8: Post-heap platform discovery
+    // Phase 7: Post-heap platform discovery
     //
     // Now that the heap is available we can run ACPI AML interpretation,
     // register MMIO regions, and parse CFR options.
@@ -1094,11 +1073,13 @@ pub extern "C" fn rust_main(coreboot_table_ptr: u64) -> ! {
     // ---- ACPI platform discovery ----
     //
     // The AML interpreter allocates, so this must run after heap::init().
-    // Results go into state.drivers.acpi_info which init_platform() reads
+    // Results go into DriverState::acpi_info which init_platform() reads
     // for ECAM base and add_platform_mmio_regions() reads for MMIO.
     // RISC-V platforms use FDT rather than ACPI, so skip this.
     #[cfg(not(target_arch = "riscv64"))]
-    if let Some(rsdp) = crabefi::state::drivers().platform.acpi_rsdp {
+    let acpi_rsdp = crabefi::state::drivers().platform.acpi_rsdp;
+    #[cfg(not(target_arch = "riscv64"))]
+    if let Some(rsdp) = acpi_rsdp {
         let acpi_info = unsafe { acpi::discover_platform(rsdp) };
         crabefi::state::with_drivers_mut(|d| d.acpi_info = acpi_info.clone());
 
@@ -1199,7 +1180,7 @@ pub extern "C" fn rust_main(coreboot_table_ptr: u64) -> ! {
     }
 
     // ================================================================
-    // Phase 9: Hand off to the library (never returns)
+    // Phase 8: Hand off to the library (never returns)
     // ================================================================
     crabefi::init_platform(config)
 }

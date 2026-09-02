@@ -6,8 +6,61 @@
 
 #[cfg(target_arch = "x86_64")]
 use crate::arch::x86_64::io;
+use crate::state::LocalCell;
 #[cfg(target_arch = "x86_64")]
 use zerocopy::{FromBytes, Immutable, KnownLayout, Unaligned};
+
+/// Timing calibration state.
+///
+/// On x86, the TSC is calibrated against the ACPI PM timer.
+/// On aarch64, the ARM Generic Timer frequency register is read directly.
+#[derive(Clone, Copy)]
+struct TimingState {
+    /// Counter frequency in Hz (set during calibration)
+    counter_freq_hz: u64,
+    /// Counter cycles per microsecond (cached for fast delay loops)
+    counter_cycles_per_us: u64,
+    /// Initial counter value at boot (for relative timestamps in log output)
+    boot_counter: u64,
+    /// Whether `counter_freq_hz` was set by calibration or the platform rather
+    /// than being the pre-calibration placeholder.
+    calibrated: bool,
+}
+
+/// Calibration data. A plain `Copy` cell so the log path can read it from any
+/// context without a borrow.
+///
+/// The placeholder frequency keeps early log timestamps and delays sane until
+/// the architecture calibration runs; it is not a valid final value on any
+/// architecture.
+static TIMING: LocalCell<TimingState> = LocalCell::new(TimingState {
+    counter_freq_hz: 2_000_000_000,
+    counter_cycles_per_us: 2000,
+    boot_counter: 0,
+    calibrated: false,
+});
+
+/// Record the calibrated counter frequency.
+///
+/// Cycles per microsecond are derived from it and clamped to at least 1 so
+/// delay loops always make progress.
+pub fn set_counter_frequency(freq_hz: u64) {
+    TIMING.update(|t| {
+        t.counter_freq_hz = freq_hz;
+        t.counter_cycles_per_us = (freq_hz / 1_000_000).max(1);
+        t.calibrated = true;
+    });
+}
+
+/// Counter value recorded at boot, for relative timestamps.
+pub fn boot_counter() -> u64 {
+    TIMING.get().boot_counter
+}
+
+/// Record the boot counter value.
+pub fn set_boot_counter(counter: u64) {
+    TIMING.update(|t| t.boot_counter = counter);
+}
 
 // ============================================================================
 // Architecture-agnostic counter interface
@@ -34,7 +87,7 @@ pub fn read_counter() -> u64 {
 
 /// Get the counter frequency in Hz
 pub fn counter_frequency() -> u64 {
-    crate::state::drivers().timing.counter_freq_hz
+    TIMING.get().counter_freq_hz
 }
 
 // Re-export read_counter as rdtsc on x86 for backwards compat with existing callers
@@ -57,7 +110,7 @@ pub fn rdtsc() -> u64 {
 
 // Re-export counter_frequency as tsc_frequency for backwards compat
 pub fn tsc_frequency() -> u64 {
-    crate::state::drivers().timing.counter_freq_hz
+    counter_frequency()
 }
 
 // ============================================================================
@@ -297,13 +350,7 @@ mod x86_calibration {
 
             if let Some(freq) = calibrate_tsc_with_pm_timer() {
                 let cycles_per_us = freq / 1_000_000;
-                // SAFETY: single-threaded init; raw pointer avoids re-entrancy
-                // issues with the state lock.
-                unsafe {
-                    let t = &mut (*crate::state::drivers_mut_ptr()).timing;
-                    t.counter_freq_hz = freq;
-                    t.counter_cycles_per_us = cycles_per_us;
-                }
+                super::set_counter_frequency(freq);
 
                 log::info!(
                     "TSC calibrated: {} MHz ({} cycles/us)",
@@ -330,25 +377,12 @@ mod aarch64_timer {
 
         if freq == 0 {
             log::warn!("ARM Generic Timer frequency is 0, using 62.5 MHz fallback");
-            let fallback = 62_500_000u64;
-            // SAFETY: single-threaded init; raw pointer avoids re-entrancy
-            // issues with the state lock.
-            unsafe {
-                let t = &mut (*crate::state::drivers_mut_ptr()).timing;
-                t.counter_freq_hz = fallback;
-                t.counter_cycles_per_us = fallback / 1_000_000;
-            }
+            super::set_counter_frequency(62_500_000);
             return;
         }
 
         let cycles_per_us = freq / 1_000_000;
-        // SAFETY: single-threaded init; raw pointer avoids re-entrancy
-        // issues with the state lock.
-        unsafe {
-            let t = &mut (*crate::state::drivers_mut_ptr()).timing;
-            t.counter_freq_hz = freq;
-            t.counter_cycles_per_us = cycles_per_us.max(1);
-        }
+        super::set_counter_frequency(freq);
 
         log::info!(
             "ARM Generic Timer: {} MHz ({} cycles/us)",
@@ -370,26 +404,17 @@ mod aarch64_timer {
 mod riscv64_timer {
     /// Initialize riscv64 timing.
     ///
-    /// The timer frequency comes from the FDT (`/cpus/timebase-frequency`).
-    /// If not set yet (e.g., no FDT parsed before timer init), we use
-    /// 10 MHz which is the QEMU virt default.
+    /// The timer frequency comes from the FDT (`/cpus/timebase-frequency`) and
+    /// must be recorded with [`super::set_counter_frequency`] before this runs.
+    /// If it was not, fall back to 10 MHz, the QEMU virt default.
     pub fn init(_acpi_rsdp: Option<u64>) {
-        let freq = crate::state::drivers().timing.counter_freq_hz;
-
-        if freq == 0 {
-            log::error!(
-                "RISC-V timer: counter_freq_hz not set — \
-                 must be initialized from FDT/coreboot tables before timer init"
-            );
-            return;
+        if !super::TIMING.get().calibrated {
+            log::warn!("RISC-V timer: no timebase frequency from FDT, using 10 MHz fallback");
+            super::set_counter_frequency(10_000_000);
         }
 
+        let freq = super::counter_frequency();
         let cycles_per_us = (freq / 1_000_000).max(1);
-        // SAFETY: single-threaded init
-        unsafe {
-            let t = &mut (*crate::state::drivers_mut_ptr()).timing;
-            t.counter_cycles_per_us = cycles_per_us;
-        }
 
         log::info!(
             "RISC-V timer: {} MHz ({} cycles/us)",
@@ -421,26 +446,13 @@ pub fn init_from_platform(timer: &dyn crate::platform::Timer) {
     let freq = timer.ticks_per_second();
     if freq == 0 {
         log::warn!("Platform timer reports 0 Hz frequency, using 1 MHz fallback");
-        let fallback = 1_000_000u64;
-        // SAFETY: single-threaded init; raw pointer avoids re-entrancy
-        // issues with the state lock.
-        unsafe {
-            let t = &mut (*crate::state::drivers_mut_ptr()).timing;
-            t.counter_freq_hz = fallback;
-            t.counter_cycles_per_us = 1;
-        }
+        set_counter_frequency(1_000_000);
         return;
     }
 
     let cycles_per_us = (freq / 1_000_000).max(1);
-    // SAFETY: single-threaded init; raw pointer avoids re-entrancy
-    // issues with the state lock.
-    unsafe {
-        let t = &mut (*crate::state::drivers_mut_ptr()).timing;
-        t.counter_freq_hz = freq;
-        t.counter_cycles_per_us = cycles_per_us;
-        t.boot_counter = timer.current_ticks();
-    }
+    set_counter_frequency(freq);
+    set_boot_counter(timer.current_ticks());
 
     log::info!(
         "Platform timer: {} MHz ({} cycles/us)",
@@ -452,7 +464,7 @@ pub fn init_from_platform(timer: &dyn crate::platform::Timer) {
 /// Spin-wait for approximately `us` microseconds
 #[inline]
 pub fn delay_us(us: u64) {
-    let cycles = us * crate::state::drivers().timing.counter_cycles_per_us;
+    let cycles = us * TIMING.get().counter_cycles_per_us;
     let start = read_counter();
     while read_counter().wrapping_sub(start) < cycles {
         core::hint::spin_loop();
@@ -488,7 +500,7 @@ impl Timeout {
     /// Create a timeout that expires after `us` microseconds
     #[inline]
     pub fn from_us(us: u64) -> Self {
-        let cycles = us * crate::state::drivers().timing.counter_cycles_per_us;
+        let cycles = us * TIMING.get().counter_cycles_per_us;
         Self {
             deadline: read_counter().wrapping_add(cycles),
         }
