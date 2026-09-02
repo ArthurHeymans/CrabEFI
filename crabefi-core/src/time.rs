@@ -6,7 +6,7 @@
 
 #[cfg(target_arch = "x86_64")]
 use crate::arch::x86_64::io;
-use crate::state::LocalCell;
+use crate::cell::LocalCell;
 #[cfg(target_arch = "x86_64")]
 use zerocopy::{FromBytes, Immutable, KnownLayout, Unaligned};
 

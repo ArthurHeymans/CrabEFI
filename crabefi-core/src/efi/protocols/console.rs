@@ -9,12 +9,13 @@
 //! - Serial console: ANSI escape sequences are parsed for arrow keys, function keys, etc.
 //! - PS/2 keyboard: Scancodes are translated to EFI keys via the i8042 keyboard controller.
 
+use crate::cell::LocalCell;
 use crate::drivers::keyboard_common as keyboard;
 use crate::drivers::serial;
 use crate::efi::boot_services::KEYBOARD_EVENT_ID;
 use crate::framebuffer_console::{CHAR_HEIGHT, CHAR_WIDTH, VGA_FONT_8X16};
 use crate::platform::FramebufferConfig;
-use crate::state::{self, InputState, LocalCell};
+use crate::state::{self, InputState};
 use core::ffi::c_void;
 use r_efi::efi::{Boolean, Event, Guid, Status};
 use r_efi::protocols::simple_text_input::{InputKey, Protocol as SimpleTextInputProtocol};

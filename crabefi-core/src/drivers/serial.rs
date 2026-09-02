@@ -10,7 +10,7 @@
 
 use core::fmt::{self, Write};
 
-use crate::state::Local;
+use crate::cell::Local;
 
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 use tock_registers::interfaces::{Readable, Writeable};
