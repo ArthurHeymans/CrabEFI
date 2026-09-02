@@ -738,7 +738,11 @@ impl MemoryAllocator {
             addr,
             num_pages,
             MemoryType::AcpiReclaimMemory,
-            &[MemoryType::AcpiReclaimMemory, MemoryType::AcpiMemoryNvs],
+            &[
+                MemoryType::ReservedMemoryType,
+                MemoryType::AcpiReclaimMemory,
+                MemoryType::AcpiMemoryNvs,
+            ],
         )
     }
 
@@ -1826,6 +1830,41 @@ mod tests {
             ))
             .unwrap();
         allocator
+    }
+
+    #[test]
+    fn acpi_marking_preserves_platform_reserved_memory() {
+        let mut allocator = allocator_with_ram();
+        let reserved_start = 0x20_0000;
+        allocator
+            .entries
+            .push(memory_descriptor(
+                MemoryType::ReservedMemoryType,
+                reserved_start,
+                4,
+                attributes::EFI_MEMORY_RAM_CAPS,
+            ))
+            .unwrap();
+
+        allocator.mark_as_acpi_reclaim(reserved_start, 4).unwrap();
+        allocator.mark_as_acpi_reclaim(0x10_0000, 4).unwrap();
+
+        assert_eq!(
+            allocator
+                .entries
+                .iter()
+                .find(|entry| entry.physical_start == reserved_start)
+                .and_then(MemoryDescriptorExt::get_memory_type),
+            Some(MemoryType::ReservedMemoryType)
+        );
+        assert_eq!(
+            allocator
+                .entries
+                .iter()
+                .find(|entry| entry.physical_start == 0x10_0000)
+                .and_then(MemoryDescriptorExt::get_memory_type),
+            Some(MemoryType::AcpiReclaimMemory)
+        );
     }
 
     #[test]
