@@ -5,20 +5,13 @@
 //!
 //! Reference: UEFI Specification 2.10, Section 7.2
 
-use r_efi::efi::{Guid, PhysicalAddress, Status};
+use r_efi::efi::{PhysicalAddress, Status};
+use r_efi::protocols::memory_attribute;
 
 use crate::efi::utils::allocate_protocol_with_log;
 
-/// Memory Attribute Protocol GUID
-/// {f4560cf6-40ec-4b4a-a192-bf1d57d0b189}
-pub const MEMORY_ATTRIBUTE_PROTOCOL_GUID: Guid = Guid::from_fields(
-    0xf4560cf6,
-    0x40ec,
-    0x4b4a,
-    0xa1,
-    0x92,
-    &[0xbf, 0x1d, 0x57, 0xd0, 0xb1, 0x89],
-);
+/// Memory Attribute Protocol GUID supplied by `r-efi`.
+pub const MEMORY_ATTRIBUTE_PROTOCOL_GUID: r_efi::efi::Guid = memory_attribute::PROTOCOL_GUID;
 
 /// Memory attribute bits
 /// Read Protect - memory cannot be read
@@ -31,28 +24,8 @@ pub const EFI_MEMORY_RO: u64 = 0x0000000000020000;
 /// Mask of all valid memory protection attributes
 pub const EFI_MEMORY_ACCESS_MASK: u64 = EFI_MEMORY_RP | EFI_MEMORY_XP | EFI_MEMORY_RO;
 
-/// EFI Memory Attribute Protocol structure
-#[repr(C)]
-pub struct Protocol {
-    pub get_memory_attributes: extern "efiapi" fn(
-        this: *mut Protocol,
-        base_address: PhysicalAddress,
-        length: u64,
-        attributes: *mut u64,
-    ) -> Status,
-    pub set_memory_attributes: extern "efiapi" fn(
-        this: *mut Protocol,
-        base_address: PhysicalAddress,
-        length: u64,
-        attributes: u64,
-    ) -> Status,
-    pub clear_memory_attributes: extern "efiapi" fn(
-        this: *mut Protocol,
-        base_address: PhysicalAddress,
-        length: u64,
-        attributes: u64,
-    ) -> Status,
-}
+/// Memory Attribute protocol ABI supplied by `r-efi`.
+pub type Protocol = memory_attribute::Protocol;
 
 /// Get memory attributes for a region
 ///
