@@ -6,7 +6,7 @@
 //!
 //! Reference: https://www.kernel.org/doc/html/latest/arch/x86/boot.html
 
-use super::params::{BootParams, HEADER_OFFSET, SetupHeader};
+use super::params::{BootParams, E820MapError, HEADER_OFFSET, SetupHeader};
 
 /// Errors that can occur during bzImage loading
 #[derive(Debug)]
@@ -211,7 +211,6 @@ pub unsafe fn set_cmdline(cmdline: &str, addr: u32) -> Result<(), BzImageError> 
 /// # Arguments
 ///
 /// * `bzimage` - Parsed bzImage information
-/// * `memory_regions` - Platform memory map
 /// * `acpi_rsdp` - ACPI RSDP address (optional)
 /// * `framebuffer` - Framebuffer info (optional)
 /// * `kernel_addr` - Address where kernel is loaded
@@ -219,22 +218,36 @@ pub unsafe fn set_cmdline(cmdline: &str, addr: u32) -> Result<(), BzImageError> 
 ///
 /// # Returns
 ///
-/// Initialized boot parameters structure
+/// Initialized boot parameters structure.
+///
+/// # Errors
+/// Returns [`E820MapError::TooManyEntries`] when the complete effective EFI map
+/// cannot be represented by the Linux boot protocol's E820 table.
 pub fn prepare_boot_params(
     bzimage: &BzImage,
-    memory_regions: &[crate::platform::MemoryRegion],
     acpi_rsdp: Option<u64>,
     framebuffer: Option<&crate::platform::FramebufferConfig>,
     kernel_addr: u32,
     cmdline_addr: u32,
-) -> BootParams {
+) -> Result<BootParams, E820MapError> {
     let mut params = BootParams::new();
 
     // Copy the setup header from the bzImage
     params.hdr = bzimage.header;
 
-    // Set memory map
-    params.set_memory_map(memory_regions);
+    // Direct Linux boot bypasses EFI GetMemoryMap(), so use the allocator's
+    // complete effective map. Coalescing happens after EFI types are converted
+    // to E820 types, avoiding a fixed-size intermediate descriptor buffer.
+    let (descriptor_count, e820_count) = crate::efi::allocator::with_descriptors(|descriptors| {
+        params
+            .set_efi_memory_map(descriptors)
+            .map(|count| (descriptors.len(), count))
+    })?;
+    log::info!(
+        "Direct Linux E820 map built from {} EFI descriptors ({} entries)",
+        descriptor_count,
+        e820_count
+    );
 
     // Set ACPI RSDP if available
     if let Some(rsdp) = acpi_rsdp {
@@ -255,5 +268,5 @@ pub fn prepare_boot_params(
     // Set command line pointer
     params.set_cmdline(cmdline_addr);
 
-    params
+    Ok(params)
 }

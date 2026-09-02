@@ -35,9 +35,10 @@ pub mod bzimage;
 pub mod params;
 
 pub use bzimage::{BOOT_PARAMS_ADDR, BzImage, BzImageError, CMDLINE_ADDR, DEFAULT_KERNEL_ADDR};
-pub use params::{BootParams, E820Entry, SetupHeader};
+pub use params::{BootParams, E820Entry, E820MapError, SetupHeader};
 
 use crate::drivers::block::BlockDevice;
+#[cfg(test)]
 use crate::platform::MemoryRegion;
 
 /// Maximum kernel size we support (64 MB)
@@ -94,11 +95,21 @@ pub enum LinuxBootError {
     KernelTooLarge,
     /// Initrd too large
     InitrdTooLarge,
+    /// Effective firmware memory map exceeds the Linux E820 table
+    MemoryMapTooLarge,
 }
 
 impl From<BzImageError> for LinuxBootError {
     fn from(e: BzImageError) -> Self {
         LinuxBootError::KernelLoad(e)
+    }
+}
+
+impl From<E820MapError> for LinuxBootError {
+    fn from(error: E820MapError) -> Self {
+        match error {
+            E820MapError::TooManyEntries => LinuxBootError::MemoryMapTooLarge,
+        }
     }
 }
 
@@ -250,7 +261,6 @@ impl LoadedLinux {
 /// * `kernel_path` - Path to the kernel file (FAT path format)
 /// * `initrd_path` - Optional path to initrd file
 /// * `cmdline` - Kernel command line
-/// * `memory_regions` - Platform memory map
 /// * `acpi_rsdp` - ACPI RSDP address (optional)
 /// * `framebuffer` - Framebuffer info (optional)
 /// * `use_efi_handover` - Whether to use EFI handover if available
@@ -267,7 +277,6 @@ pub fn load_linux_from_disk(
     kernel_path: &str,
     initrd_path: Option<&str>,
     cmdline: &str,
-    memory_regions: &[MemoryRegion],
     acpi_rsdp: Option<u64>,
     framebuffer: Option<&crate::platform::FramebufferConfig>,
     use_efi_handover: bool,
@@ -347,12 +356,11 @@ pub fn load_linux_from_disk(
     // Prepare boot parameters first so we can validate addresses BEFORE writing
     let mut boot_params = bzimage::prepare_boot_params(
         &bzimage,
-        memory_regions,
         acpi_rsdp,
         framebuffer,
         DEFAULT_KERNEL_ADDR as u32,
         CMDLINE_ADDR,
-    );
+    )?;
 
     // Validate that all hardcoded addresses are in usable RAM BEFORE writing to them
     let cmdline_size = cmdline.len() as u64 + 1; // +1 for null terminator
