@@ -189,6 +189,8 @@ struct ScsiPassThruContext {
     pci_function: u8,
     /// USB port number
     usb_port: u8,
+    /// Stable target-ID buffer returned to protocol callers.
+    target_id: *mut u8,
 }
 
 use super::context_map::ProtocolContextMap;
@@ -199,10 +201,6 @@ const MAX_INSTANCES: usize = 8;
 /// Protocol-to-context map
 static CTX_MAP: ProtocolContextMap<ScsiPassThruContext, ExtScsiPassThruProtocol, MAX_INSTANCES> =
     ProtocolContextMap::new();
-
-/// Target ID storage for each instance
-static mut TARGET_IDS: [[u8; TARGET_MAX_BYTES]; MAX_INSTANCES] =
-    [[0; TARGET_MAX_BYTES]; MAX_INSTANCES];
 
 /// Get context for a protocol instance
 fn get_context(protocol: *mut ExtScsiPassThruProtocol) -> Option<ScsiPassThruContext> {
@@ -412,8 +410,8 @@ extern "efiapi" fn scsi_get_next_target_lun(
         return Status::INVALID_PARAMETER;
     }
 
-    let ctx_idx = match CTX_MAP.find_index(this) {
-        Some(i) => i,
+    let ctx = match get_context(this) {
+        Some(ctx) => ctx,
         None => {
             log::error!("ScsiPassThru.GetNextTargetLun: unknown protocol instance");
             return Status::INVALID_PARAMETER;
@@ -431,17 +429,16 @@ extern "efiapi" fn scsi_get_next_target_lun(
     };
 
     log::debug!(
-        "ScsiPassThru.GetNextTargetLun: ctx={}, is_initial={}",
-        ctx_idx,
+        "ScsiPassThru.GetNextTargetLun: controller={}, is_initial={}",
+        ctx.controller_index,
         is_initial
     );
 
     if is_initial {
         // Return the first (and only) target: target ID 0, LUN 0
         unsafe {
-            let target_storage = core::ptr::addr_of_mut!(TARGET_IDS);
-            (*target_storage)[ctx_idx].fill(0);
-            *target = (*target_storage)[ctx_idx].as_mut_ptr();
+            core::ptr::write_bytes(ctx.target_id, 0, TARGET_MAX_BYTES);
+            *target = ctx.target_id;
             *lun = 0;
         }
         return Status::SUCCESS;
@@ -499,8 +496,8 @@ extern "efiapi" fn scsi_get_target_lun(
         return Status::INVALID_PARAMETER;
     }
 
-    let ctx_idx = match CTX_MAP.find_index(this) {
-        Some(i) => i,
+    let ctx = match get_context(this) {
+        Some(ctx) => ctx,
         None => {
             log::error!("ScsiPassThru.GetTargetLun: unknown protocol instance");
             return Status::INVALID_PARAMETER;
@@ -526,9 +523,8 @@ extern "efiapi" fn scsi_get_target_lun(
 
             // Return target ID 0 and LUN 0
             unsafe {
-                let target_storage = core::ptr::addr_of_mut!(TARGET_IDS);
-                (*target_storage)[ctx_idx].fill(0);
-                *target = (*target_storage)[ctx_idx].as_mut_ptr();
+                core::ptr::write_bytes(ctx.target_id, 0, TARGET_MAX_BYTES);
+                *target = ctx.target_id;
                 *lun = 0;
             }
             return Status::SUCCESS;
@@ -589,8 +585,8 @@ extern "efiapi" fn scsi_get_next_target(
         return Status::INVALID_PARAMETER;
     }
 
-    let ctx_idx = match CTX_MAP.find_index(this) {
-        Some(i) => i,
+    let ctx = match get_context(this) {
+        Some(ctx) => ctx,
         None => {
             log::error!("ScsiPassThru.GetNextTarget: unknown protocol instance");
             return Status::INVALID_PARAMETER;
@@ -608,17 +604,16 @@ extern "efiapi" fn scsi_get_next_target(
     };
 
     log::debug!(
-        "ScsiPassThru.GetNextTarget: ctx={}, is_initial={}",
-        ctx_idx,
+        "ScsiPassThru.GetNextTarget: controller={}, is_initial={}",
+        ctx.controller_index,
         is_initial
     );
 
     if is_initial {
         // Return the first (and only) target: target ID 0
         unsafe {
-            let target_storage = core::ptr::addr_of_mut!(TARGET_IDS);
-            (*target_storage)[ctx_idx].fill(0);
-            *target = (*target_storage)[ctx_idx].as_mut_ptr();
+            core::ptr::write_bytes(ctx.target_id, 0, TARGET_MAX_BYTES);
+            *target = ctx.target_id;
         }
         return Status::SUCCESS;
     }
@@ -687,6 +682,19 @@ pub fn create_scsi_pass_thru_protocol(
         return core::ptr::null_mut();
     }
 
+    let target_id = match crate::efi::allocator::allocate_pool(
+        crate::efi::allocator::MemoryType::BootServicesData,
+        TARGET_MAX_BYTES,
+    ) {
+        Ok(target_id) => target_id,
+        Err(_) => {
+            crate::efi::allocator::free_pool(protocol_ptr.cast());
+            crate::efi::allocator::free_pool(mode_ptr.cast());
+            return core::ptr::null_mut();
+        }
+    };
+    unsafe { core::ptr::write_bytes(target_id, 0, TARGET_MAX_BYTES) };
+
     // Store context
     CTX_MAP.store(
         ctx_idx,
@@ -696,6 +704,7 @@ pub fn create_scsi_pass_thru_protocol(
             pci_device,
             pci_function,
             usb_port,
+            target_id,
         },
         protocol_ptr,
     );
