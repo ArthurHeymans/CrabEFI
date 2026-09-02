@@ -15,44 +15,19 @@ use zerocopy::FromBytes;
 
 use crate::cell::{Local, LocalCell};
 use crate::drivers::block::{AnyBlockDevice, BlockDevice};
-use crate::fs::fat::{DirectoryEntry, FatFilesystem, FatType};
+use crate::fs::fat::{DirectoryEntry, FatFilesystem, FatGeometry, FileClusterHint};
 
-/// Filesystem state - stores partition info for reading files
+/// Mounted filesystem state reused by every file operation.
 #[derive(Clone, Copy)]
 pub struct FilesystemState {
-    /// First LBA of the partition (in device blocks)
+    /// First LBA of the partition (in device blocks).
     pub partition_start: u64,
-    /// FAT type
-    pub fat_type: FatType,
-    /// Bytes per sector (FAT's logical sector size)
-    pub bytes_per_sector: u16,
-    /// Device block size (physical block size, may differ from bytes_per_sector)
+    /// Validated FAT geometry parsed when the filesystem was mounted.
+    pub geometry: FatGeometry,
+    /// Physical block size reported through EFI filesystem information.
     pub device_block_size: u32,
-    /// Sectors per cluster
-    pub sectors_per_cluster: u8,
-    /// First FAT sector (relative to partition start, in FAT sectors)
-    pub fat_start: u32,
-    /// Sectors per FAT
-    pub sectors_per_fat: u32,
-    /// First data sector (relative to partition start, in FAT sectors)
-    pub data_start: u32,
-    /// Root directory cluster (FAT32) or 0 (FAT12/16)
+    /// Root directory cluster (FAT32) or 0 (FAT12/16).
     pub root_cluster: u32,
-    /// Root directory sector start (FAT12/16 only, in FAT sectors)
-    pub root_dir_start: u32,
-    /// Root directory sector count (FAT12/16 only)
-    pub root_dir_sectors: u32,
-}
-
-impl FilesystemState {
-    /// Translate FAT sector to device block
-    pub fn fat_sector_to_device_block(&self, fat_sector: u64) -> u64 {
-        if self.bytes_per_sector as u32 == self.device_block_size {
-            fat_sector
-        } else {
-            (fat_sector * self.bytes_per_sector as u64) / self.device_block_size as u64
-        }
-    }
 }
 
 /// Mounted FAT filesystem geometry.
@@ -102,6 +77,8 @@ struct FileHandle {
     file_size: u64,
     /// First cluster of file
     first_cluster: u32,
+    /// Last resolved location in the file's cluster chain.
+    cluster_hint: FileClusterHint,
     /// Is this a directory?
     is_directory: bool,
     /// The File Protocol struct for this handle
@@ -117,6 +94,7 @@ impl FileHandle {
             position: 0,
             file_size: 0,
             first_cluster: 0,
+            cluster_hint: FileClusterHint::new(0),
             is_directory: false,
             protocol: efi_file::Protocol {
                 revision: efi_file::REVISION,
@@ -160,29 +138,17 @@ static mut SFS_PROTOCOL: efi_sfs::Protocol = efi_sfs::Protocol {
 /// # Returns
 /// Pointer to the SimpleFileSystem protocol, or null on failure
 pub fn init(block_device: AnyBlockDevice, partition_start: u64) -> *mut efi_sfs::Protocol {
-    // Get device info before creating FatFilesystem to avoid borrow conflicts
     let mut temp_device = block_device;
     let device_block_size = temp_device.info().block_size;
 
-    // Create a temporary FatFilesystem to get filesystem info
+    // Parse and validate the BPB once. Later operations reuse this geometry.
     let fs_state = match FatFilesystem::new(&mut temp_device, partition_start) {
-        Ok(fat) => {
-            let fat_type = fat.fat_type();
-            let root_cluster = fat.root_cluster();
-            FilesystemState {
-                partition_start,
-                fat_type,
-                bytes_per_sector: 512, // Standard FAT sector size
-                device_block_size,
-                sectors_per_cluster: 0, // Not needed anymore
-                fat_start: 0,           // Not needed anymore
-                sectors_per_fat: 0,     // Not needed anymore
-                data_start: 0,          // Not needed anymore
-                root_cluster,
-                root_dir_start: 0,   // Not needed anymore
-                root_dir_sectors: 0, // Not needed anymore
-            }
-        }
+        Ok(fat) => FilesystemState {
+            partition_start,
+            geometry: fat.geometry(),
+            device_block_size,
+            root_cluster: fat.root_cluster(),
+        },
         Err(e) => {
             log::error!("SimpleFileSystem: failed to mount FAT filesystem: {:?}", e);
             return core::ptr::null_mut();
@@ -247,6 +213,7 @@ extern "efiapi" fn sfs_open_volume(
     handles[handle_idx].position = 0;
     handles[handle_idx].file_size = 0;
     handles[handle_idx].first_cluster = fs_state.root_cluster;
+    handles[handle_idx].cluster_hint = FileClusterHint::new(fs_state.root_cluster);
     handles[handle_idx].is_directory = true;
 
     // Return pointer to the protocol in this handle
@@ -312,19 +279,15 @@ extern "efiapi" fn file_open(
 
     log::info!("File.Open: full path = {:?}", full_path_str);
 
-    // Get partition start
-    let filesystem = FILESYSTEM.get();
-    let partition_start = match filesystem {
-        Some(s) => s.partition_start,
+    let filesystem = match FILESYSTEM.get() {
+        Some(state) => state,
         None => return Status::NOT_READY,
     };
 
-    // Find the file using FatFilesystem
+    // Find the file using the geometry validated at mount time.
     let result = with_block_device_mut(|device| {
-        let mut fat = match FatFilesystem::new(device, partition_start) {
-            Ok(f) => f,
-            Err(_) => return Err(()),
-        };
+        let mut fat =
+            FatFilesystem::from_geometry(device, filesystem.partition_start, filesystem.geometry);
 
         match fat.find_file(full_path_str) {
             Ok(entry) => Ok((
@@ -351,6 +314,7 @@ extern "efiapi" fn file_open(
             handles[handle_idx].position = 0;
             handles[handle_idx].file_size = size as u64;
             handles[handle_idx].first_cluster = cluster;
+            handles[handle_idx].cluster_hint = FileClusterHint::new(cluster);
             handles[handle_idx].is_directory = is_dir;
 
             unsafe {
@@ -384,6 +348,7 @@ extern "efiapi" fn file_close(this: *mut efi_file::Protocol) -> Status {
         handles[idx].in_use = false;
         handles[idx].path_len = 0;
         handles[idx].position = 0;
+        handles[idx].cluster_hint = FileClusterHint::new(0);
         Status::SUCCESS
     } else {
         Status::INVALID_PARAMETER
@@ -408,7 +373,7 @@ extern "efiapi" fn file_read(
     log::debug!("File.Read(this={:?}, size={})", this, requested_size);
 
     // Get handle info
-    let (is_dir, file_size, position, first_cluster, handle_idx) = {
+    let (is_dir, file_size, position, first_cluster, cluster_hint, handle_idx) = {
         let handles = FILE_HANDLES.lock();
         let idx = match find_handle_index_unlocked(&handles, this) {
             Some(i) => i,
@@ -419,6 +384,7 @@ extern "efiapi" fn file_read(
             handles[idx].file_size,
             handles[idx].position,
             handles[idx].first_cluster,
+            handles[idx].cluster_hint,
             idx,
         )
     };
@@ -445,34 +411,30 @@ extern "efiapi" fn file_read(
         return Status::SUCCESS;
     }
 
-    let filesystem = FILESYSTEM.get();
-    let partition_start = match filesystem {
-        Some(s) => s.partition_start,
+    let filesystem = match FILESYSTEM.get() {
+        Some(state) => state,
         None => return Status::NOT_READY,
     };
 
     let buf_slice = unsafe { core::slice::from_raw_parts_mut(buffer as *mut u8, bytes_to_read) };
 
-    // Create a fake DirectoryEntry for read_file
-    // We need to read using the stored cluster and position
     let result = with_block_device_mut(|device| {
-        let mut fat = match FatFilesystem::new(device, partition_start) {
-            Ok(f) => f,
-            Err(_) => return Err(()),
-        };
-
-        // Create a minimal entry for reading
+        let mut fat =
+            FatFilesystem::from_geometry(device, filesystem.partition_start, filesystem.geometry);
         let entry = create_file_entry(first_cluster, file_size as u32);
-        fat.read_file(&entry, position as u32, buf_slice)
+        let mut next_hint = cluster_hint;
+        fat.read_file_with_hint(&entry, position as u32, buf_slice, &mut next_hint)
+            .map(|bytes_read| (bytes_read, next_hint))
             .map_err(|_| ())
     });
 
     match result {
-        Some(Ok(bytes_read)) => {
+        Some(Ok((bytes_read, next_hint))) => {
             // Update position
             {
                 let mut handles = FILE_HANDLES.lock();
                 handles[handle_idx].position += bytes_read as u64;
+                handles[handle_idx].cluster_hint = next_hint;
             }
 
             unsafe { *buffer_size = bytes_read };
@@ -893,9 +855,8 @@ fn create_file_entry(first_cluster: u32, file_size: u32) -> DirectoryEntry {
 
 /// Read directory entries
 fn read_directory(buffer_size: *mut usize, buffer: *mut c_void, handle_idx: usize) -> Status {
-    let filesystem = FILESYSTEM.get();
-    let partition_start = match filesystem {
-        Some(s) => s.partition_start,
+    let filesystem = match FILESYSTEM.get() {
+        Some(state) => state,
         None => return Status::NOT_READY,
     };
 
@@ -909,10 +870,8 @@ fn read_directory(buffer_size: *mut usize, buffer: *mut c_void, handle_idx: usiz
 
     // Get directory entry at current position
     let entry_result = with_block_device_mut(|device| {
-        let mut fat = match FatFilesystem::new(device, partition_start) {
-            Ok(f) => f,
-            Err(_) => return Err(()),
-        };
+        let mut fat =
+            FatFilesystem::from_geometry(device, filesystem.partition_start, filesystem.geometry);
 
         fat.get_directory_entry_at_position(cluster, position)
             .map_err(|_| ())
