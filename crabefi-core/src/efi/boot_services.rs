@@ -1668,8 +1668,7 @@ extern "efiapi" fn exit_boot_services(image_handle: Handle, map_key: usize) -> S
     // Stop every firmware-owned DMA engine while BootServices allocations are
     // still typed and cannot yet be reused by the OS. Clearing BME is the final
     // safety net for devices without complete driver shutdown coverage.
-    crate::drivers::pci::shutdown_drivers();
-    crate::drivers::pci::disable_all_bus_mastering_for_handoff();
+    crate::drivers::quiesce_dma_for_os_handoff();
 
     let status = allocator::exit_boot_services(map_key);
 
