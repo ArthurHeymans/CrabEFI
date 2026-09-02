@@ -654,6 +654,15 @@ pub trait UsbController {
         Ok(())
     }
 
+    /// Largest data stage this controller should receive in one class command.
+    ///
+    /// Legacy controllers use a conservative limit because their transfer
+    /// descriptors cannot represent arbitrarily large buffers. Implementations
+    /// may split the request into smaller safe host-controller transactions.
+    fn max_bulk_transfer_size(&self) -> usize {
+        8 * 1024
+    }
+
     /// Perform a bulk transfer
     ///
     /// # Arguments

@@ -604,18 +604,10 @@ impl UsbMassStorage {
     /// want to stall too long.
     const MAX_READ_RETRIES: u32 = 3;
 
-    /// Maximum bytes per SCSI READ command.
-    ///
-    /// EHCI qTDs can describe at most five 4KiB pages. Keep transfers well
-    /// below that hardware limit so high-speed USB reads do not silently
-    /// truncate or corrupt data while boot files are being loaded.
-    const MAX_BYTES_PER_CMD: usize = 8 * 1024;
-
     /// Read sectors from the device with chunking and retry logic.
     ///
-    /// Large reads are split into chunks of MAX_BYTES_PER_CMD to ensure
-    /// compatibility with all USB mass storage devices. Each chunk is retried
-    /// up to MAX_READ_RETRIES times on failure.
+    /// Large reads are split at the host controller's bulk-transfer limit.
+    /// Each chunk is retried up to MAX_READ_RETRIES times on failure.
     ///
     /// Inspired by EDK2's UsbBootExecCmdWithRetry which retries up to 5 times
     /// with a 60-second overall timeout. Our BOT-level error recovery (endpoint
@@ -633,7 +625,7 @@ impl UsbMassStorage {
             return Err(MassStorageError::InvalidParameter);
         }
 
-        let sectors_per_cmd = (Self::MAX_BYTES_PER_CMD / block_size).max(1) as u32;
+        let sectors_per_cmd = (controller.max_bulk_transfer_size() / block_size).max(1) as u32;
         let mut lba = start_lba;
         let mut remaining = num_sectors;
         let mut offset = 0usize;
