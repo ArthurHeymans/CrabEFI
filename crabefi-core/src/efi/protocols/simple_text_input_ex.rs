@@ -13,7 +13,6 @@ use crate::drivers::keyboard_common as keyboard;
 use crate::efi::boot_services::KEYBOARD_EVENT_ID;
 use crate::efi::protocols::console;
 use crate::efi::utils::allocate_protocol_with_log;
-use crate::state;
 use core::ffi::c_void;
 use r_efi::efi::{Boolean, Event, Guid, Handle, Status};
 use r_efi::protocols::simple_text_input::InputKey;
@@ -138,7 +137,7 @@ extern "efiapi" fn text_input_ex_reset(
     _extended_verification: Boolean,
 ) -> Status {
     log::debug!("SimpleTextInputEx.Reset()");
-    state::with_console_mut(|console| {
+    console::with_state_mut(|console| {
         console.input.pending_key = None;
         console.input.queued_key = None;
         console.input.in_escape = false;
@@ -161,7 +160,7 @@ extern "efiapi" fn text_input_ex_read_key_stroke(
     // Read the key with the console borrowed, then release it before running
     // notification callbacks, which may call back into the console protocols.
     let key =
-        state::with_console_mut(|console_state| console::try_read_key(&mut console_state.input));
+        console::with_state_mut(|console_state| console::try_read_key(&mut console_state.input));
 
     match key {
         Some((scan_code, unicode_char)) => {

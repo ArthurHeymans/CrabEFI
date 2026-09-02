@@ -7,9 +7,9 @@
 use r_efi::efi::{Guid, Status};
 
 use crate::efi::allocator::{MemoryType, allocate_pool};
+use crate::efi::protocols::console;
 use crate::efi::utils::allocate_protocol_with_log;
 use crate::platform::FramebufferConfig;
-use crate::state;
 
 /// EFI_GRAPHICS_OUTPUT_PROTOCOL GUID
 pub const GRAPHICS_OUTPUT_GUID: Guid = Guid::from_fields(
@@ -224,7 +224,7 @@ extern "efiapi" fn gop_blt(
         return Status::INVALID_PARAMETER;
     }
 
-    let Some(fb) = state::console().gop_framebuffer else {
+    let Some(fb) = console::state().gop_framebuffer else {
         return Status::DEVICE_ERROR;
     };
     let fb = &fb;
@@ -551,7 +551,7 @@ pub fn create_gop(framebuffer: &FramebufferConfig) -> *mut GraphicsOutputProtoco
     }
 
     // Store global state for Blt operations
-    state::with_console_mut(|console| {
+    console::with_state_mut(|console| {
         console.gop_framebuffer = Some(*framebuffer);
     });
 

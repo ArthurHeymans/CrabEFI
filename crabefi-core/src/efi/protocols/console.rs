@@ -9,13 +9,12 @@
 //! - Serial console: ANSI escape sequences are parsed for arrow keys, function keys, etc.
 //! - PS/2 keyboard: Scancodes are translated to EFI keys via the i8042 keyboard controller.
 
-use crate::cell::LocalCell;
+use crate::cell::{Local, LocalCell};
 use crate::drivers::keyboard_common as keyboard;
 use crate::drivers::serial;
 use crate::efi::boot_services::KEYBOARD_EVENT_ID;
 use crate::framebuffer_console::{CHAR_HEIGHT, CHAR_WIDTH, VGA_FONT_8X16};
 use crate::platform::FramebufferConfig;
-use crate::state::{self, InputState};
 use core::ffi::c_void;
 use r_efi::efi::{Boolean, Event, Guid, Status};
 use r_efi::protocols::simple_text_input::{InputKey, Protocol as SimpleTextInputProtocol};
@@ -36,7 +35,134 @@ static OUTPUT_MODE: LocalCell<SimpleTextOutputMode> = LocalCell::new(SimpleTextO
 });
 
 // ============================================================================
-// EFI Framebuffer Console State (stored in state::ConsoleState)
+// Console State
+// ============================================================================
+
+/// Console screen mode (Text or Graphics)
+///
+/// Used by the ConsoleControl protocol to track the current display mode.
+#[repr(u32)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScreenMode {
+    /// Text mode
+    Text = 0,
+    /// Graphics mode
+    Graphics = 1,
+    /// Maximum mode value (for bounds checking)
+    MaxValue = 2,
+}
+
+/// Console and display state
+pub struct ConsoleState {
+    /// EFI console framebuffer info
+    pub efi_framebuffer: Option<FramebufferConfig>,
+    /// EFI console cursor position (col, row)
+    pub cursor_pos: (u32, u32),
+    /// EFI console dimensions (cols, rows)
+    pub dimensions: (u32, u32),
+    /// Console start row (EFI console uses bottom half of screen)
+    pub start_row: u32,
+
+    /// Pixel offset for centering the text region horizontally (EDK2 DeltaX)
+    pub delta_x: u32,
+    /// Pixel offset for centering the text region vertically (EDK2 DeltaY)
+    pub delta_y: u32,
+
+    /// Current foreground color (RGB) set by SetAttribute
+    pub fg_color: (u8, u8, u8),
+    /// Current background color (RGB) set by SetAttribute
+    pub bg_color: (u8, u8, u8),
+
+    /// Input state for escape sequence parsing
+    pub input: InputState,
+
+    /// GOP framebuffer for graphics output protocol Blt operations
+    pub gop_framebuffer: Option<FramebufferConfig>,
+
+    /// Screen mode (Text or Graphics) for ConsoleControl protocol
+    pub screen_mode: ScreenMode,
+}
+
+impl ConsoleState {
+    pub const fn new() -> Self {
+        Self {
+            efi_framebuffer: None,
+            cursor_pos: (0, 0),
+            dimensions: (80, 25),
+            start_row: 0,
+            delta_x: 0,
+            delta_y: 0,
+            fg_color: (170, 170, 170), // EFI_LIGHTGRAY (attribute 0x07, index 7)
+            bg_color: (0, 0, 0),       // EFI_BLACK default
+            input: InputState::new(),
+            gop_framebuffer: None,
+            screen_mode: ScreenMode::Graphics,
+        }
+    }
+}
+
+impl Default for ConsoleState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Maximum size of the escape sequence buffer
+pub const ESCAPE_BUF_SIZE: usize = 8;
+
+/// Input state for escape sequence parsing
+pub struct InputState {
+    /// Buffer for escape sequence bytes
+    pub escape_buf: [u8; ESCAPE_BUF_SIZE],
+    /// Number of bytes in the escape buffer
+    pub escape_len: usize,
+    /// Whether we're currently in an escape sequence
+    pub in_escape: bool,
+    /// Queued key to return (scan_code, unicode_char)
+    pub queued_key: Option<(u16, u16)>,
+    /// Key read-ahead by CheckEvent/WaitForEvent to confirm real input
+    /// This prevents false "keyboard ready" signals from modifier-only
+    /// or mouse data in the PS/2 output buffer.
+    pub pending_key: Option<(u16, u16)>,
+}
+
+impl Default for InputState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl InputState {
+    pub const fn new() -> Self {
+        Self {
+            escape_buf: [0; ESCAPE_BUF_SIZE],
+            escape_len: 0,
+            in_escape: false,
+            queued_key: None,
+            pending_key: None,
+        }
+    }
+}
+
+/// The EFI console.
+static CONSOLE: Local<ConsoleState> = Local::new(ConsoleState::new());
+
+/// Borrow console state.
+#[inline]
+#[track_caller]
+pub fn state() -> core::cell::Ref<'static, ConsoleState> {
+    CONSOLE.borrow()
+}
+
+/// Mutate console state through a closure.
+#[inline]
+#[track_caller]
+pub fn with_state_mut<R>(f: impl FnOnce(&mut ConsoleState) -> R) -> R {
+    CONSOLE.with_mut(f)
+}
+
+// ============================================================================
+// EFI Framebuffer Console
 // ============================================================================
 
 /// Initialize the EFI console with framebuffer support
@@ -48,7 +174,7 @@ pub fn init_framebuffer(fb: FramebufferConfig) {
     // Use bottom half of screen for EFI console output
     let efi_start_row = rows / 2;
 
-    state::with_console_mut(|console| {
+    with_state_mut(|console| {
         console.dimensions = (cols, rows - efi_start_row);
         console.cursor_pos = (0, efi_start_row);
         console.start_row = efi_start_row;
@@ -65,7 +191,7 @@ pub fn init_framebuffer(fb: FramebufferConfig) {
 
 /// Write a character to the EFI framebuffer console
 fn fb_put_char(c: char) {
-    state::with_console_mut(|console| {
+    with_state_mut(|console| {
         let Some(ref fb) = console.efi_framebuffer else {
             return;
         };
@@ -252,7 +378,7 @@ mod scan_codes {
 }
 
 // ============================================================================
-// Input Buffer for Escape Sequence Parsing (stored in state::ConsoleState.input)
+// Input Buffer for Escape Sequence Parsing (stored in ConsoleState::input)
 // ============================================================================
 
 /// Static text input protocol
@@ -302,7 +428,7 @@ extern "efiapi" fn text_input_reset(
     _extended_verification: Boolean,
 ) -> Status {
     log::debug!("ConIn.Reset()");
-    state::with_console_mut(|console| {
+    with_state_mut(|console| {
         console.input.pending_key = None;
         console.input.queued_key = None;
         console.input.in_escape = false;
@@ -319,7 +445,7 @@ extern "efiapi" fn text_input_read_key_stroke(
         return Status::INVALID_PARAMETER;
     }
 
-    state::with_console_mut(|console| {
+    with_state_mut(|console| {
         let input_state = &mut console.input;
 
         match try_read_key(input_state) {
@@ -391,7 +517,7 @@ pub(crate) fn try_read_key(input_state: &mut InputState) -> Option<(u16, u16)> {
 fn process_serial_byte(input_state: &mut InputState, byte: u8) -> (u16, u16) {
     if input_state.in_escape {
         // We're collecting an escape sequence
-        if input_state.escape_len < state::ESCAPE_BUF_SIZE {
+        if input_state.escape_len < ESCAPE_BUF_SIZE {
             input_state.escape_buf[input_state.escape_len] = byte;
             input_state.escape_len += 1;
         }
@@ -670,7 +796,7 @@ extern "efiapi" fn text_output_query_mode(
     }
 
     // Return the actual text dimensions from the framebuffer
-    state::with_console_mut(|console| {
+    with_state_mut(|console| {
         let (cols, r) = console.dimensions;
         unsafe {
             *columns = cols as usize;
@@ -740,7 +866,7 @@ extern "efiapi" fn text_output_set_attribute(
     // Update framebuffer console colors
     let fg_rgb = efi_color_to_rgb(fg);
     let bg_rgb = efi_color_to_rgb(bg);
-    state::with_console_mut(|console| {
+    with_state_mut(|console| {
         console.fg_color = fg_rgb;
         console.bg_color = bg_rgb;
     });
@@ -797,7 +923,7 @@ extern "efiapi" fn text_output_clear_screen(_this: *mut SimpleTextOutputProtocol
     });
 
     // Clear the ENTIRE framebuffer (bootloader expects full screen)
-    state::with_console_mut(|console| {
+    with_state_mut(|console| {
         let Some(ref fb) = console.efi_framebuffer else {
             return;
         };
@@ -841,7 +967,7 @@ extern "efiapi" fn text_output_set_cursor_position(
 
     // Update framebuffer cursor position
     // Row is relative to the EFI console area, so add start_row to get absolute row
-    state::with_console_mut(|console| {
+    with_state_mut(|console| {
         let start_row = console.start_row;
         console.cursor_pos = (column as u32, start_row + row as u32);
     });
@@ -948,7 +1074,7 @@ fn format_cursor_pos(buf: &mut [u8], row: usize, col: usize) -> usize {
 /// output buffer that would cause `has_key()` to return true without any
 /// actual EFI key being produced.
 pub(crate) fn keyboard_check_ready() -> bool {
-    state::with_console_mut(|console| {
+    with_state_mut(|console| {
         let input = &mut console.input;
 
         // Already have a pending key from a previous check
