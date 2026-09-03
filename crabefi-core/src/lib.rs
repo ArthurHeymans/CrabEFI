@@ -70,11 +70,11 @@ pub use platform::{
     BlockDevice, BlockDeviceInfo, BlockError, BootResult, CapsuleBackend, CapsuleRegion,
     ConsoleInput, DebugOutput, DeferredBufferConfig, FirmwareInfo, FirmwareMmapWindow,
     FirmwareStorage, FirmwareStorageLocation, FirmwareStorageRegion, FmapRegion, FramebufferConfig,
-    Key, KeyState, MemoryRegion, MemoryType, PciEcamRegion, PlatformConfig, PlatformHooks,
-    ResetHandler, ResetType, Rng, RngError, RuntimeImageSource, RuntimePlatformConfig,
-    StorageBackend, StorageError, Timer, TimestampRecorder, Tpm2Device, Tpm2DeviceConfig,
-    TpmDigest, TpmError, TpmEventLogConfig, TpmLogFormat, TpmPcrBanks, VariableStoreLocator,
-    VariableStoreRegion,
+    Key, KeyState, MemoryRegion, MemoryType, PciEcamRegion, PlatformConfig, PlatformConfigBuilder,
+    PlatformHooks, ResetHandler, ResetType, Rng, RngError, RuntimeImageSource,
+    RuntimePlatformConfig, StorageBackend, StorageError, Timer, TimestampRecorder, Tpm2Device,
+    Tpm2DeviceConfig, TpmDigest, TpmError, TpmEventLogConfig, TpmLogFormat, TpmPcrBanks,
+    VariableStoreLocator, VariableStoreRegion,
 };
 
 /// Display a Secure Boot violation error on screen
