@@ -70,6 +70,8 @@ impl<T, const N: usize> ControllerRegistry<T, N> {
     /// Allocates EFI pages for the controller struct, moves it there, and
     /// stores the pointer. Returns `Err(())` on allocation failure or if
     /// the registry is full.
+    // Failure details are logged at the error site; callers only branch on success.
+    #[allow(clippy::result_unit_err)]
     pub fn register(&self, controller: T) -> Result<(), ()> {
         let size = core::mem::size_of::<T>();
         let pages = size.div_ceil(4096);

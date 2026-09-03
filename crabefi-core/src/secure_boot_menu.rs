@@ -338,6 +338,9 @@ fn confirm_action(fb_console: &mut Option<FramebufferConsole>, message: &str) ->
 }
 
 /// Draw the complete menu
+// Menu state is flat counters rendered in one pass; grouping them would
+// scatter the row layout across an extra struct.
+#[allow(clippy::too_many_arguments)]
 fn draw_menu(
     fb_console: &mut Option<FramebufferConsole>,
     selected: usize,
@@ -392,6 +395,8 @@ fn draw_header(fb_console: &mut Option<FramebufferConsole>, cols: usize) {
 }
 
 /// Draw the status section
+// Same flat menu-state counters as draw_menu.
+#[allow(clippy::too_many_arguments)]
 fn draw_status(
     fb_console: &mut Option<FramebufferConsole>,
     start_row: usize,
