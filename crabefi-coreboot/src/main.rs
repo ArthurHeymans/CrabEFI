@@ -1134,8 +1134,8 @@ pub extern "C" fn rust_main(coreboot_table_ptr: u64) -> ! {
     // call is a no-op.
     // ================================================================
     crabefi::efi::allocator::init_from_platform(config.memory_map);
-    if !crabefi::heap::init() {
-        log::error!("Failed to initialize heap allocator!");
+    if let Err(e) = crabefi::heap::init() {
+        log::error!("Failed to initialize heap allocator: {e}");
     }
     config.heap_pre_initialized = true;
 
