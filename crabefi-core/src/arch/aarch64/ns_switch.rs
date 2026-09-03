@@ -29,7 +29,7 @@ const TRAMPOLINE_CODE: [u32; 5] = [
 ];
 
 /// Transient BootServicesData buffer used only during ExitBootServices.
-static mut TRAMPOLINE_BUF: [u32; 5] = [0; 5];
+static TRAMPOLINE_BUF: crate::cell::StaticMut<[u32; 5]> = crate::cell::StaticMut::new([0; 5]);
 
 /// Transition from Secure EL1 to Non-Secure EL1.
 ///
@@ -59,12 +59,13 @@ pub fn install_ns_trampoline() {
 
     unsafe {
         // Write trampoline instructions to the RAM buffer.
+        let buf = TRAMPOLINE_BUF.get().cast::<u32>();
         for (i, &insn) in TRAMPOLINE_CODE.iter().enumerate() {
-            core::ptr::write_volatile(&raw mut TRAMPOLINE_BUF[i], insn);
+            core::ptr::write_volatile(buf.add(i), insn);
         }
 
         // Cache maintenance: clean data cache, invalidate instruction cache.
-        let addr = &raw const TRAMPOLINE_BUF as usize;
+        let addr = buf as usize;
         core::arch::asm!(
             "dc cvau, {addr}",
             "dsb ish",
