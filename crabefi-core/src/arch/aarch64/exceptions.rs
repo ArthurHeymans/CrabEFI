@@ -11,6 +11,8 @@
 
 use core::arch::global_asm;
 
+use crate::cell::StaticMut;
+
 /// Exception stack (4 KiB, 16-byte aligned for AArch64 ABI).
 ///
 /// Used by exception handlers to avoid corrupting the firmware stack
@@ -22,7 +24,7 @@ struct ExcStack([u8; 4096]);
 #[unsafe(no_mangle)]
 #[used]
 #[unsafe(link_section = ".bss.exc_stack")]
-static mut EXC_STACK: ExcStack = ExcStack([0u8; 4096]);
+static EXC_STACK: StaticMut<ExcStack> = StaticMut::new(ExcStack([0u8; 4096]));
 
 // Export _exc_stack_top = EXC_STACK + 4096.
 global_asm!(
