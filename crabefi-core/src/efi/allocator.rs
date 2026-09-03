@@ -82,15 +82,28 @@ pub enum AllocateType {
     AllocateAddress = 2,
 }
 
+/// Rejected [`AllocateType`] value from an EFI caller.
+///
+/// Carries the offending raw value so callers can log it instead of
+/// silently dropping it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InvalidAllocateType(pub u32);
+
+impl core::fmt::Display for InvalidAllocateType {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "invalid AllocateType value {}", self.0)
+    }
+}
+
 impl TryFrom<u32> for AllocateType {
-    type Error = u32;
+    type Error = InvalidAllocateType;
 
     fn try_from(value: u32) -> Result<Self, Self::Error> {
         match value {
             0 => Ok(AllocateType::AllocateAnyPages),
             1 => Ok(AllocateType::AllocateMaxAddress),
             2 => Ok(AllocateType::AllocateAddress),
-            other => Err(other),
+            other => Err(InvalidAllocateType(other)),
         }
     }
 }
@@ -139,7 +152,7 @@ impl MemoryType {
 }
 
 impl TryFrom<u32> for MemoryType {
-    type Error = u32;
+    type Error = InvalidMemoryType;
 
     fn try_from(value: u32) -> Result<Self, Self::Error> {
         match value {
@@ -158,8 +171,21 @@ impl TryFrom<u32> for MemoryType {
             12 => Ok(MemoryType::MemoryMappedIoPortSpace),
             13 => Ok(MemoryType::PalCode),
             14 => Ok(MemoryType::PersistentMemory),
-            other => Err(other),
+            other => Err(InvalidMemoryType(other)),
         }
+    }
+}
+
+/// Rejected [`MemoryType`] value from an EFI caller.
+///
+/// Carries the offending raw value so callers can log it instead of
+/// silently dropping it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InvalidMemoryType(pub u32);
+
+impl core::fmt::Display for InvalidMemoryType {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "invalid MemoryType value {}", self.0)
     }
 }
 
