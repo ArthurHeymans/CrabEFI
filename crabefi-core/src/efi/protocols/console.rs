@@ -239,6 +239,9 @@ fn fb_put_char(c: char) {
 /// Draw a character at a specific position, applying centering offsets.
 ///
 /// Uses the current foreground/background colors from ConsoleState.
+// Glyph blit coordinates map 1:1 to framebuffer axes; grouping them would
+// hide the per-axis arithmetic below.
+#[allow(clippy::too_many_arguments)]
 fn fb_draw_char(
     fb: &FramebufferConfig,
     c: char,

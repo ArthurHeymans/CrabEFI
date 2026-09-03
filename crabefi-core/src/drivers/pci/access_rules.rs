@@ -14,6 +14,9 @@ pub const fn valid_device_id(id: u32) -> bool {
 }
 
 /// Calculate an ECAM byte offset relative to a region's physical base.
+// Parameters mirror the ECAM address components; grouping them would hide the
+// 1:1 mapping with the PCI address layout validated here.
+#[allow(clippy::too_many_arguments)]
 pub const fn ecam_offset(
     region_segment: u16,
     bus_start: u8,

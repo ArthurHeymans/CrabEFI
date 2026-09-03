@@ -343,6 +343,8 @@ impl UsbMassStorage {
     ///   the host to always attempt to receive the CSW)
     /// - Stalled data endpoints are cleared before reading CSW
     /// - Phase errors and invalid CSW trigger BOT Reset Recovery
+    // Sequential CBW field setup reads clearer than one large struct literal.
+    #[allow(clippy::field_reassign_with_default)]
     fn scsi_command(
         &mut self,
         controller: &mut dyn UsbController,
@@ -1036,6 +1038,8 @@ pub fn with_global_device_and_controller<R>(
 /// This function can be used as the read callback for the SimpleFileSystem protocol.
 /// It uses the stored controller pointer directly to avoid lock contention.
 /// Supports reading multiple sectors in a single SCSI command for performance.
+// Failures are logged at the error site; callers only branch on success.
+#[allow(clippy::result_unit_err)]
 pub fn global_read_sectors(lba: u64, buffer: &mut [u8]) -> Result<(), ()> {
     log::trace!("USB mass storage: read LBA {}", lba);
 

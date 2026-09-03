@@ -194,6 +194,8 @@ pub fn get_device(device_id: u32) -> Option<StorageDevice> {
 /// Read sectors from a storage device
 ///
 /// This is the unified read function used by BlockIO protocol.
+// Failure details are logged at the error site; callers only branch on success.
+#[allow(clippy::result_unit_err)]
 pub fn read_sectors(device_id: u32, lba: u64, buffer: &mut [u8]) -> Result<(), ()> {
     let device = get_device(device_id).ok_or(())?;
     let block_size = usize::try_from(device.block_size).map_err(|_| ())?;

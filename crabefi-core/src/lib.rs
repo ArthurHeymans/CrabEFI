@@ -6,10 +6,6 @@
 #![no_std]
 #![cfg_attr(target_arch = "x86_64", feature(abi_x86_interrupt))]
 #![deny(unsafe_op_in_unsafe_fn)]
-// Allow common firmware code patterns
-#![allow(clippy::result_unit_err)] // Result<(), ()> is common in embedded code
-#![allow(clippy::too_many_arguments)] // USB/hardware APIs often require many parameters
-#![allow(clippy::field_reassign_with_default)] // Clearer than complex struct initializers
 
 // Enable alloc crate for heap allocations (needed for RustCrypto)
 extern crate alloc;

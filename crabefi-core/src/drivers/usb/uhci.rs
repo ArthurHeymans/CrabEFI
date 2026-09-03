@@ -137,6 +137,8 @@ impl TransferDescriptor {
     pub const TK_MAXLEN_MASK: u32 = 0x7FF << 21;
 
     /// Create a SETUP TD
+    // Sequential TD field setup reads clearer than one large struct literal.
+    #[allow(clippy::field_reassign_with_default)]
     pub fn setup(device: u8, buffer: u32, next: u32, is_low_speed: bool) -> Self {
         let mut td = Self::default();
         td.link_ptr = if next != 0 {
@@ -156,6 +158,10 @@ impl TransferDescriptor {
     }
 
     /// Create a DATA TD
+    // TD fields mirror the UHCI packet layout; a parameter struct would add
+    // indirection at every call site, and sequential setup reads clearer
+    // than one large struct literal here.
+    #[allow(clippy::too_many_arguments, clippy::field_reassign_with_default)]
     pub fn data(
         device: u8,
         endpoint: u8,
@@ -199,6 +205,8 @@ impl TransferDescriptor {
     }
 
     /// Create a STATUS TD
+    // Sequential TD field setup reads clearer than one large struct literal.
+    #[allow(clippy::field_reassign_with_default)]
     pub fn status(device: u8, is_in: bool, next: u32, is_low_speed: bool) -> Self {
         let mut td = Self::default();
         td.link_ptr = if next != 0 {
