@@ -18,8 +18,6 @@
 //! - coreboot/src/commonlib/include/commonlib/cfr.h
 //! - coreboot/Documentation/drivers/cfr.md
 
-#![allow(dead_code)]
-
 use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -52,6 +50,9 @@ pub const CFR_OPTFLAG_READONLY: u32 = 1 << 0;
 pub const CFR_OPTFLAG_INACTIVE: u32 = 1 << 1;
 pub const CFR_OPTFLAG_SUPPRESS: u32 = 1 << 2;
 pub const CFR_OPTFLAG_VOLATILE: u32 = 1 << 3;
+// Set by coreboot for options that remain visible at runtime; parsed but not
+// acted on yet — kept so the flags word stays a complete transcription.
+#[allow(dead_code)]
 pub const CFR_OPTFLAG_RUNTIME: u32 = 1 << 4;
 
 // Numeric display flags
@@ -245,6 +246,7 @@ impl CfrForm {
 #[derive(Debug, Clone)]
 pub struct CfrInfo {
     /// CFR version
+    #[allow(dead_code)] // Parsed header field; version gating not implemented yet.
     pub version: u32,
     /// Top-level forms
     pub forms: Vec<CfrForm>,
@@ -290,6 +292,9 @@ impl CfrInfo {
     /// - dependency_id is 0 (no dependency)
     /// - The dependency option's current value matches one of dep_values
     /// - dep_values is empty and the dependency value != 0
+    ///
+    /// Not yet wired into the menu renderer; dependency gating is a TODO.
+    #[allow(dead_code)]
     pub fn is_dependency_met(&self, dependency_id: u64, dep_values: &[u32]) -> bool {
         if dependency_id == 0 {
             return true;
@@ -1035,6 +1040,9 @@ pub fn write_option_value(option: &CfrOption, value: &CfrValue) -> Result<(), &'
 }
 
 /// Delete a CFR option from storage (revert to default)
+// Completes the write/delete facade checked structurally by
+// ci/run-coreboot-feature-tests.sh; no menu path calls it yet.
+#[allow(dead_code)]
 pub fn delete_option_value(option: &CfrOption) -> Result<(), &'static str> {
     use crabefi::efi::runtime_image::client::variables;
     use r_efi::efi;

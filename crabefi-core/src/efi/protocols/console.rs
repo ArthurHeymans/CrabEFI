@@ -352,9 +352,7 @@ pub const SIMPLE_TEXT_OUTPUT_PROTOCOL_GUID: Guid = Guid::from_fields(
 // ============================================================================
 
 /// EFI Scan codes for special keys
-#[allow(dead_code)]
 mod scan_codes {
-    pub const SCAN_NULL: u16 = 0x0000;
     pub const SCAN_UP: u16 = 0x0001;
     pub const SCAN_DOWN: u16 = 0x0002;
     pub const SCAN_RIGHT: u16 = 0x0003;

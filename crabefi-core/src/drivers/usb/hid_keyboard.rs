@@ -91,13 +91,13 @@ pub struct UsbHidKeyboard {
     /// Device address
     device_address: u8,
     /// Interrupt endpoint number (USB endpoint hardware property)
-    #[allow(dead_code)]
+    #[allow(dead_code)] // Endpoint descriptor shadow; completeness for re-enumeration.
     endpoint: u8,
     /// Max packet size (USB endpoint hardware property)
-    #[allow(dead_code)]
+    #[allow(dead_code)] // Endpoint descriptor shadow; completeness for re-enumeration.
     max_packet: u16,
     /// Polling interval in ms (USB endpoint hardware property)
-    #[allow(dead_code)]
+    #[allow(dead_code)] // Endpoint descriptor shadow; completeness for re-enumeration.
     interval: u8,
     /// Previous report (for detecting changes)
     prev_report: KeyboardReport,

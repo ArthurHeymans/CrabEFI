@@ -38,9 +38,6 @@ const TPM_STS: usize = 0x018;
 const TPM_DATA_FIFO: usize = 0x024;
 /// TIS register: Device ID / Vendor ID.
 const TPM_DID_VID: usize = 0xF00;
-/// TIS register: Interface ID (PTP).
-#[allow(dead_code)]
-const TPM_INTF_ID: usize = 0x030;
 
 // TPM_ACCESS bits
 const ACCESS_VALID: u8 = 1 << 7;
@@ -53,7 +50,6 @@ const ACCESS_REQUEST_USE: u8 = 1 << 1;
 const STS_VALID: u8 = 1 << 7;
 const STS_COMMAND_READY: u8 = 1 << 6;
 const STS_DATA_AVAIL: u8 = 1 << 4;
-#[allow(dead_code)]
 const STS_EXPECT: u8 = 1 << 3;
 const STS_GO: u8 = 1 << 5;
 const STS_CANCEL_OFFSET: usize = TPM_STS + 3;
