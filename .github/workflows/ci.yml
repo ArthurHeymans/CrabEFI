@@ -42,6 +42,14 @@ jobs:
       - name: Run coreboot feature regression tests
         run: ci/run-coreboot-feature-tests.sh
 
+      - name: Install nightly toolchain for workspace unit tests
+        uses: dtolnay/rust-toolchain@nightly
+
+      - name: Run workspace library unit tests
+        # build-std is passed only on xtask's firmware invocations, so host
+        # cargo test works for all workspace library crates here.
+        run: cargo test --workspace
+
       - name: Run runtime host tests
         run: |
           cd "$HOME"
