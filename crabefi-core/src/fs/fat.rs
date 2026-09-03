@@ -389,11 +389,14 @@ impl core::fmt::Display for FatError {
 }
 
 /// Validated FAT filesystem geometry that can be reused across operations.
-#[derive(Clone, Copy)]
+///
+/// This describes on-media layout only. Host properties such as the device
+/// block size are deliberately excluded so that a controller quirk cannot
+/// masquerade as a media change (or hide one).
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub struct FatGeometry {
     fat_type: FatType,
     bytes_per_sector: u16,
-    device_block_size: u32,
     sectors_per_cluster: u8,
     fat_start: u32,
     data_start: u32,
@@ -609,17 +612,21 @@ impl<'a> FatFilesystem<'a> {
     }
 
     /// Reopen a previously validated filesystem without rereading its BPB.
+    ///
+    /// The host block size is always taken from the live device, never from
+    /// the cache, so a controller quirk cannot silently change the access path.
     pub fn from_geometry(
         device: &'a mut dyn BlockDevice,
         partition_start: u64,
         geometry: FatGeometry,
     ) -> Self {
+        let device_block_size = device.info().block_size;
         Self {
             device,
             partition_start,
             fat_type: geometry.fat_type,
             bytes_per_sector: geometry.bytes_per_sector,
-            device_block_size: geometry.device_block_size,
+            device_block_size,
             sectors_per_cluster: geometry.sectors_per_cluster,
             fat_start: geometry.fat_start,
             data_start: geometry.data_start,
@@ -637,7 +644,6 @@ impl<'a> FatFilesystem<'a> {
         FatGeometry {
             fat_type: self.fat_type,
             bytes_per_sector: self.bytes_per_sector,
-            device_block_size: self.device_block_size,
             sectors_per_cluster: self.sectors_per_cluster,
             fat_start: self.fat_start,
             data_start: self.data_start,

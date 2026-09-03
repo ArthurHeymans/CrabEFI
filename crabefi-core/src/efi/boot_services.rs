@@ -566,22 +566,38 @@ extern "efiapi" fn wait_for_event(
     }
 }
 
+/// Pending notify callback extracted when signaling an event.
+type SignaledNotify = Option<(efi::EventNotify, *mut c_void)>;
+
+/// Mark an event signaled and extract its pending `EVT_NOTIFY_SIGNAL` callback.
+///
+/// Factored out of `signal_event` so the lookup/state mutation is unit
+/// testable without global tables. Uses the general handle lookup on purpose:
+/// the handle's static/dynamic classification is an internal detail and must
+/// not narrow public `SignalEvent` semantics — any valid event (including the
+/// static keyboard/pointer events) signals successfully. Only the
+/// notification behavior depends on the event type.
+fn signal_event_entry(
+    events: &mut [EventEntry],
+    event: efi::Event,
+) -> Result<(usize, SignaledNotify), Status> {
+    let Some(event_id) = event_id_for_handle(events, event) else {
+        return Err(Status::INVALID_PARAMETER);
+    };
+    events[event_id].signaled = true;
+    let entry = &events[event_id];
+    let notify_fn = if entry.event_type & EVT_NOTIFY_SIGNAL != 0 {
+        entry.notify_function.map(|f| (f, entry.notify_context))
+    } else {
+        None
+    };
+    Ok((event_id, notify_fn))
+}
+
 extern "efiapi" fn signal_event(event: efi::Event) -> Status {
     log::debug!("BS.SignalEvent(event={:?})", event);
 
-    let notify = with_tables_mut(|efi_state| {
-        let Some(event_id) = dynamic_event_id_for_handle(&efi_state.events, event) else {
-            return Err(Status::INVALID_PARAMETER);
-        };
-        efi_state.events[event_id].signaled = true;
-        let entry = &efi_state.events[event_id];
-        let notify_fn = if entry.event_type & EVT_NOTIFY_SIGNAL != 0 {
-            entry.notify_function.map(|f| (f, entry.notify_context))
-        } else {
-            None
-        };
-        Ok((event_id, notify_fn))
-    });
+    let notify = with_tables_mut(|efi_state| signal_event_entry(&mut efi_state.events, event));
 
     let (event_id, notify_fn) = match notify {
         Ok(result) => result,
@@ -595,17 +611,25 @@ extern "efiapi" fn signal_event(event: efi::Event) -> Status {
     Status::SUCCESS
 }
 
+fn close_dynamic_event(events: &mut [EventEntry], event: efi::Event) -> bool {
+    let Some(event_id) = dynamic_event_id_for_handle(events, event) else {
+        return false;
+    };
+    let generation = events[event_id].generation;
+    events[event_id] = EventEntry::empty();
+    events[event_id].generation = generation;
+    true
+}
+
 extern "efiapi" fn close_event(event: efi::Event) -> Status {
     log::debug!("BS.CloseEvent(event={:?})", event);
 
     with_tables_mut(|efi_state| {
-        let Some(event_id) = dynamic_event_id_for_handle(&efi_state.events, event) else {
-            return Status::INVALID_PARAMETER;
-        };
-        let generation = efi_state.events[event_id].generation;
-        efi_state.events[event_id] = EventEntry::empty();
-        efi_state.events[event_id].generation = generation;
-        Status::SUCCESS
+        if close_dynamic_event(&mut efi_state.events, event) {
+            Status::SUCCESS
+        } else {
+            Status::INVALID_PARAMETER
+        }
     })
 }
 
@@ -2577,6 +2601,64 @@ mod tests {
         ));
     }
 
+    /// Regression test for SignalEvent on static events: exercises the same
+    /// `signal_event_entry` helper `signal_event` calls, so switching the
+    /// implementation back to `dynamic_event_id_for_handle` fails this test
+    /// instead of silently regressing to INVALID_PARAMETER.
+    #[test]
+    fn signal_helper_accepts_static_events() {
+        let mut events = [EventEntry::empty(); MAX_EVENTS];
+        let (event_id, notify) = signal_event_entry(&mut events, KEYBOARD_EVENT_ID as efi::Event)
+            .expect("SignalEvent must accept the static keyboard event");
+        assert_eq!(event_id, KEYBOARD_EVENT_ID);
+        assert!(notify.is_none());
+        assert!(events[KEYBOARD_EVENT_ID].signaled);
+        #[cfg(feature = "ui")]
+        {
+            let (event_id, _) = signal_event_entry(&mut events, POINTER_EVENT_ID as efi::Event)
+                .expect("SignalEvent must accept the static pointer event");
+            assert_eq!(event_id, POINTER_EVENT_ID);
+            assert!(events[POINTER_EVENT_ID].signaled);
+        }
+    }
+
+    #[test]
+    fn signal_helper_rejects_invalid_handles() {
+        let mut events = [EventEntry::empty(); MAX_EVENTS];
+        assert_eq!(
+            signal_event_entry(&mut events, core::ptr::null_mut()).unwrap_err(),
+            Status::INVALID_PARAMETER
+        );
+    }
+
+    #[test]
+    fn signal_helper_returns_notify_signal_callbacks() {
+        extern "efiapi" fn notify(_event: efi::Event, _context: *mut c_void) {}
+        let mut events = [EventEntry::empty(); MAX_EVENTS];
+        let event_id = find_free_event_slot(&events).unwrap();
+        let generation = next_event_generation(events[event_id].generation);
+        events[event_id] = EventEntry {
+            in_use: true,
+            generation,
+            event_type: EVT_NOTIFY_SIGNAL,
+            notify_tpl: 0,
+            signaled: false,
+            is_keyboard_event: false,
+            notify_function: Some(notify),
+            notify_context: core::ptr::null_mut(),
+            event_group: None,
+            timer_type: TimerType::Cancel,
+            timer_trigger_time: 0,
+            timer_deadline_tsc: 0,
+        };
+        let handle = event_handle(event_id, generation);
+        let (signaled_id, callback) =
+            signal_event_entry(&mut events, handle).expect("dynamic notify event must signal");
+        assert_eq!(signaled_id, event_id);
+        assert!(callback.is_some());
+        assert!(events[event_id].signaled);
+    }
+
     #[test]
     fn static_events_are_not_dynamic_handles() {
         let events = [EventEntry::empty(); MAX_EVENTS];
@@ -2592,6 +2674,20 @@ mod tests {
     }
 
     #[test]
+    fn close_rejects_closed_events_and_double_close() {
+        let mut events = [EventEntry::empty(); MAX_EVENTS];
+        let event_id = find_free_event_slot(&events).unwrap();
+        let generation = next_event_generation(events[event_id].generation);
+        events[event_id].in_use = true;
+        events[event_id].generation = generation;
+        let handle = event_handle(event_id, generation);
+
+        assert!(close_dynamic_event(&mut events, handle));
+        assert_eq!(event_id_for_handle(&events, handle), None);
+        assert!(!close_dynamic_event(&mut events, handle));
+    }
+
+    #[test]
     fn closed_event_slots_are_reused_without_reusing_handles() {
         let mut events = [EventEntry::empty(); MAX_EVENTS];
         let first = find_free_event_slot(&events).unwrap();
@@ -2602,7 +2698,7 @@ mod tests {
         assert_eq!(event_id_for_handle(&events, stale_handle), Some(first));
         assert_eq!(find_free_event_slot(&events), Some(first + 1));
 
-        events[first].in_use = false;
+        assert!(close_dynamic_event(&mut events, stale_handle));
         let second_generation = next_event_generation(events[first].generation);
         events[first].in_use = true;
         events[first].generation = second_generation;
