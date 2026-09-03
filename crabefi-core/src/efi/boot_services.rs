@@ -21,6 +21,7 @@ use super::tables::{
     MAX_PROTOCOLS_PER_HANDLE, OpenProtocolEntry, ProtocolEntry, ProtocolNotifyEntry, Tables,
     TimerType, tables, with_tables_mut,
 };
+use crate::cell::StaticMut;
 use crate::pe;
 use alloc::vec::Vec;
 use core::ffi::c_void;
@@ -56,7 +57,7 @@ const FIRST_DYNAMIC_EVENT_ID: usize = POINTER_EVENT_ID + 1;
 const FIRST_DYNAMIC_EVENT_ID: usize = KEYBOARD_EVENT_ID + 1;
 
 /// Static boot services table
-static mut BOOT_SERVICES: efi::BootServices = efi::BootServices {
+static BOOT_SERVICES: StaticMut<efi::BootServices> = StaticMut::new(efi::BootServices {
     hdr: TableHeader {
         signature: EFI_BOOT_SERVICES_SIGNATURE,
         revision: EFI_BOOT_SERVICES_REVISION,
@@ -111,11 +112,11 @@ static mut BOOT_SERVICES: efi::BootServices = efi::BootServices {
     copy_mem,
     set_mem,
     create_event_ex,
-};
+});
 
 /// Get a pointer to the boot services table
 pub fn get_boot_services() -> *mut efi::BootServices {
-    &raw mut BOOT_SERVICES
+    BOOT_SERVICES.get()
 }
 
 // ============================================================================

@@ -13,7 +13,7 @@ use r_efi::protocols::simple_file_system as efi_sfs;
 use spin::Mutex;
 use zerocopy::FromBytes;
 
-use crate::cell::{Local, LocalCell};
+use crate::cell::{Local, LocalCell, StaticMut};
 use crate::drivers::block::{AnyBlockDevice, BlockDevice};
 use crate::fs::fat::{DirectoryEntry, FatFilesystem, FatGeometry, FileClusterHint};
 
@@ -137,10 +137,10 @@ static FILE_HANDLES: Mutex<[FileHandle; MAX_FILE_HANDLES]> =
     Mutex::new([const { FileHandle::empty() }; MAX_FILE_HANDLES]);
 
 /// Simple File System Protocol instance
-static mut SFS_PROTOCOL: efi_sfs::Protocol = efi_sfs::Protocol {
+static SFS_PROTOCOL: StaticMut<efi_sfs::Protocol> = StaticMut::new(efi_sfs::Protocol {
     revision: efi_sfs::REVISION,
     open_volume: sfs_open_volume,
-};
+});
 
 /// Initialize the simple file system protocol with a block device
 ///
@@ -177,7 +177,7 @@ pub fn init(block_device: AnyBlockDevice, partition_start: u64) -> *mut efi_sfs:
         partition_start
     );
 
-    &raw mut SFS_PROTOCOL
+    SFS_PROTOCOL.get()
 }
 
 /// Get the Simple File System Protocol GUID
