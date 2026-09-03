@@ -37,6 +37,7 @@ mod cfr_menu;
 mod fmap;
 mod framebuffer;
 mod memory;
+mod memory_map;
 #[cfg(feature = "external-runtime-image")]
 mod runtime_blob;
 mod tables;
@@ -53,6 +54,30 @@ use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 /// Maximum number of platform memory regions we can pass to init_platform().
 const MAX_MEMORY_REGIONS: usize = crabefi::handoff::MAX_MEMORY_REGIONS;
+
+impl memory_map::Region for crabefi::MemoryRegion {
+    type Kind = crabefi::MemoryType;
+
+    fn base(self) -> u64 {
+        self.base
+    }
+
+    fn size(self) -> u64 {
+        self.size
+    }
+
+    fn kind(self) -> Self::Kind {
+        self.region_type
+    }
+
+    fn from_parts(base: u64, size: u64, region_type: Self::Kind) -> Self {
+        Self {
+            base,
+            size,
+            region_type,
+        }
+    }
+}
 
 fn runtime_image_source() -> crabefi::RuntimeImageSource<'static> {
     #[cfg(feature = "bundled-runtime-image")]
@@ -476,214 +501,17 @@ fn convert_memory_map(
     let mut count = 0;
     for region in cb_map {
         if count >= MAX_MEMORY_REGIONS {
+            log::warn!(
+                "Coreboot memory map has {} regions but only {} fit; truncating the remainder",
+                cb_map.len(),
+                MAX_MEMORY_REGIONS
+            );
             break;
         }
         out[count] = convert_memory_region(region);
         count += 1;
     }
     count
-}
-
-fn push_memory_region(
-    out: &mut [crabefi::MemoryRegion; MAX_MEMORY_REGIONS],
-    count: &mut usize,
-    region: crabefi::MemoryRegion,
-) -> bool {
-    if region.size == 0 {
-        return true;
-    }
-
-    if let Some(previous) = count.checked_sub(1).map(|index| &mut out[index])
-        && previous.region_type == region.region_type
-        && previous.base.checked_add(previous.size) == Some(region.base)
-    {
-        let Some(size) = previous.size.checked_add(region.size) else {
-            return false;
-        };
-        previous.size = size;
-        return true;
-    }
-
-    if *count == out.len() {
-        return false;
-    }
-    out[*count] = region;
-    *count += 1;
-    true
-}
-
-/// Overlay the active framebuffer on the platform memory map as MMIO.
-///
-/// Coreboot's LB_MEM table commonly omits PCI BAR apertures. Retyping the
-/// complete page-aligned framebuffer range also handles partially overlapping
-/// LB_MEM entries without emitting overlapping EFI memory descriptors.
-fn append_framebuffer_region(
-    framebuffer: Option<crabefi::FramebufferConfig>,
-    out: &mut [crabefi::MemoryRegion; MAX_MEMORY_REGIONS],
-    count: usize,
-) -> usize {
-    const PAGE_SIZE: u64 = 4096;
-
-    let Some(framebuffer) = framebuffer else {
-        return count;
-    };
-    let framebuffer_size = framebuffer.size();
-    if framebuffer_size == 0 {
-        log::warn!("Framebuffer has an empty physical range");
-        return count;
-    }
-    let Some(end) = framebuffer
-        .physical_address
-        .checked_add(framebuffer_size)
-        .and_then(|end| end.checked_add(PAGE_SIZE - 1))
-        .map(|end| end & !(PAGE_SIZE - 1))
-    else {
-        log::warn!("Framebuffer range overflows physical address space");
-        return count;
-    };
-    let base = framebuffer.physical_address & !(PAGE_SIZE - 1);
-
-    let mut existing = *out;
-    existing[..count].sort_unstable_by_key(|region| region.base);
-    let mut updated = [crabefi::MemoryRegion {
-        base: 0,
-        size: 0,
-        region_type: crabefi::MemoryType::Reserved,
-    }; MAX_MEMORY_REGIONS];
-    let mut updated_count = 0usize;
-    let mut framebuffer_cursor = base;
-
-    for region in existing[..count].iter().copied() {
-        let Some(region_end) = region.base.checked_add(region.size) else {
-            log::warn!("Platform memory region at {:#x} overflows", region.base);
-            return count;
-        };
-
-        let emit = |updated: &mut [crabefi::MemoryRegion; MAX_MEMORY_REGIONS],
-                    updated_count: &mut usize,
-                    region: crabefi::MemoryRegion| {
-            push_memory_region(updated, updated_count, region)
-        };
-
-        if region_end <= base {
-            if !emit(&mut updated, &mut updated_count, region) {
-                log::warn!("Platform memory map is full; framebuffer MMIO omitted");
-                return count;
-            }
-            continue;
-        }
-
-        if region.base >= end {
-            if framebuffer_cursor < end {
-                if !emit(
-                    &mut updated,
-                    &mut updated_count,
-                    crabefi::MemoryRegion {
-                        base: framebuffer_cursor,
-                        size: end - framebuffer_cursor,
-                        region_type: crabefi::MemoryType::Mmio,
-                    },
-                ) {
-                    log::warn!("Platform memory map is full; framebuffer MMIO omitted");
-                    return count;
-                }
-                framebuffer_cursor = end;
-            }
-            if !emit(&mut updated, &mut updated_count, region) {
-                log::warn!("Platform memory map is full; framebuffer MMIO omitted");
-                return count;
-            }
-            continue;
-        }
-
-        if region.base < base
-            && !emit(
-                &mut updated,
-                &mut updated_count,
-                crabefi::MemoryRegion {
-                    base: region.base,
-                    size: base - region.base,
-                    region_type: region.region_type,
-                },
-            )
-        {
-            log::warn!("Platform memory map is full; framebuffer MMIO omitted");
-            return count;
-        }
-
-        let overlap_start = region.base.max(base);
-        if framebuffer_cursor < overlap_start {
-            if !emit(
-                &mut updated,
-                &mut updated_count,
-                crabefi::MemoryRegion {
-                    base: framebuffer_cursor,
-                    size: overlap_start - framebuffer_cursor,
-                    region_type: crabefi::MemoryType::Mmio,
-                },
-            ) {
-                log::warn!("Platform memory map is full; framebuffer MMIO omitted");
-                return count;
-            }
-            framebuffer_cursor = overlap_start;
-        }
-
-        let overlap_end = region_end.min(end);
-        let mmio_start = framebuffer_cursor.max(overlap_start);
-        if mmio_start < overlap_end
-            && !emit(
-                &mut updated,
-                &mut updated_count,
-                crabefi::MemoryRegion {
-                    base: mmio_start,
-                    size: overlap_end - mmio_start,
-                    region_type: crabefi::MemoryType::Mmio,
-                },
-            )
-        {
-            log::warn!("Platform memory map is full; framebuffer MMIO omitted");
-            return count;
-        }
-        framebuffer_cursor = framebuffer_cursor.max(overlap_end);
-
-        if region_end > end
-            && !emit(
-                &mut updated,
-                &mut updated_count,
-                crabefi::MemoryRegion {
-                    base: end,
-                    size: region_end - end,
-                    region_type: region.region_type,
-                },
-            )
-        {
-            log::warn!("Platform memory map is full; framebuffer MMIO omitted");
-            return count;
-        }
-    }
-
-    if framebuffer_cursor < end
-        && !push_memory_region(
-            &mut updated,
-            &mut updated_count,
-            crabefi::MemoryRegion {
-                base: framebuffer_cursor,
-                size: end - framebuffer_cursor,
-                region_type: crabefi::MemoryType::Mmio,
-            },
-        )
-    {
-        log::warn!("Platform memory map is full; framebuffer MMIO omitted");
-        return count;
-    }
-
-    *out = updated;
-    log::info!(
-        "Reported framebuffer MMIO region: {:#x}-{:#x}",
-        base,
-        end - 1
-    );
-    updated_count
 }
 
 // ============================================================================
@@ -1022,8 +850,18 @@ pub extern "C" fn rust_main(coreboot_table_ptr: u64) -> ! {
         Some(recorder)
     });
 
-    if let Some(fb) = cb_info.framebuffer {
-        crabefi::handoff::store_framebuffer(crabefi::FramebufferConfig::from(fb));
+    // A zero-size (or null-address) framebuffer descriptor is malformed.
+    // It must disable the framebuffer everywhere — handoff, logging, GOP,
+    // and the memory-map overlay — or consumers and descriptors disagree.
+    // Validated once here so all downstream sites share one decision. Note:
+    // logging is not initialized yet at this point, so the warning for the
+    // malformed case is emitted after `logger::init()` below.
+    let validated_framebuffer = cb_info
+        .framebuffer
+        .map(crabefi::FramebufferConfig::from)
+        .filter(|fb| fb.size() != 0 && fb.physical_address != 0);
+    if let Some(fb) = validated_framebuffer {
+        crabefi::handoff::store_framebuffer(fb);
     }
 
     if let Some(addr) = cb_info.framebuffer_record_addr {
@@ -1082,8 +920,14 @@ pub extern "C" fn rust_main(coreboot_table_ptr: u64) -> ! {
     crabefi::logger::init();
     apply_early_log_level(&cb_info);
 
-    if let Some(fb) = cb_info.framebuffer {
-        crabefi::logger::set_framebuffer(crabefi::FramebufferConfig::from(fb));
+    if let Some(fb) = validated_framebuffer {
+        crabefi::logger::set_framebuffer(fb);
+    } else if let Some(raw) = cb_info.framebuffer.map(crabefi::FramebufferConfig::from) {
+        log::warn!(
+            "Ignoring malformed framebuffer descriptor (addr={:#x}, size={} bytes)",
+            raw.physical_address,
+            raw.size()
+        );
     }
 
     log::info!("CrabEFI v{} starting...", env!("CARGO_PKG_VERSION"));
@@ -1107,19 +951,43 @@ pub extern "C" fn rust_main(coreboot_table_ptr: u64) -> ! {
         size: 0,
         region_type: crabefi::MemoryType::Reserved,
     }; MAX_MEMORY_REGIONS];
-    let framebuffer = cb_info.framebuffer.map(crabefi::FramebufferConfig::from);
+    let framebuffer = validated_framebuffer;
     let region_count = convert_memory_map(&cb_info.memory_map, &mut memory_regions);
-    let region_count = append_framebuffer_region(framebuffer, &mut memory_regions, region_count);
+    let region_count = match framebuffer {
+        Some(framebuffer) => {
+            let count = memory_map::overlay_framebuffer_region(
+                &mut memory_regions,
+                region_count,
+                framebuffer.physical_address,
+                framebuffer.size(),
+                crabefi::MemoryType::Mmio,
+            )
+            .unwrap_or_else(|error| {
+                // EmptyFramebuffer is unreachable: malformed descriptors are
+                // filtered into `None` above. Overlay failures here mean the
+                // map cannot safely describe the display aperture, so stop
+                // rather than hand the OS a corrupt memory map.
+                panic!("Cannot safely report framebuffer MMIO: {:?}", error)
+            });
+            log::info!(
+                "Reported framebuffer MMIO region at {:#x} ({} bytes)",
+                framebuffer.physical_address,
+                framebuffer.size()
+            );
+            count
+        }
+        None => region_count,
+    };
 
     // Direct Linux boot consumes the handoff copy rather than the EFI page
     // allocator, so publish the same finalized, non-overlapping map to both.
     crabefi::handoff::with_mut(|handoff| {
         handoff.memory_regions.clear();
         for region in &memory_regions[..region_count] {
-            if handoff.memory_regions.push(*region).is_err() {
-                log::warn!("Direct Linux memory map is full; remaining regions omitted");
-                break;
-            }
+            handoff
+                .memory_regions
+                .push(*region)
+                .expect("finalized memory map exceeds handoff capacity");
         }
     });
 
