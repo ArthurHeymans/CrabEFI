@@ -34,21 +34,42 @@ static HEAP_INITIALIZED: AtomicBool = AtomicBool::new(false);
 )]
 pub static ALLOCATOR: LockedHeap = LockedHeap::empty();
 
+/// Failure to initialize the global allocator.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HeapInitError {
+    /// [`init()`] was already called successfully.
+    AlreadyInitialized,
+    /// The backing page allocation failed with the given EFI status.
+    PageAllocation(r_efi::efi::Status),
+}
+
+impl core::fmt::Display for HeapInitError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            HeapInitError::AlreadyInitialized => {
+                write!(f, "global allocator is already initialized")
+            }
+            HeapInitError::PageAllocation(status) => {
+                write!(f, "failed to allocate heap memory: {status:?}")
+            }
+        }
+    }
+}
+
 /// Initialize the global allocator.
 ///
 /// This must be called early in the boot process, after the EFI page allocator
 /// is initialized and before code that uses `alloc`.
 ///
-/// # Returns
+/// # Errors
 ///
-/// `true` if initialization succeeded, `false` otherwise.
-pub fn init() -> bool {
+/// Returns [`HeapInitError::AlreadyInitialized`] if already initialized, or
+/// [`HeapInitError::PageAllocation`] if the backing pages cannot be allocated.
+pub fn init() -> Result<(), HeapInitError> {
     use crate::efi::allocator::{AllocateType, MemoryType, allocate_pages};
-    use r_efi::efi::Status;
 
     if HEAP_INITIALIZED.swap(true, Ordering::AcqRel) {
-        log::error!("Global allocator is already initialized");
-        return false;
+        return Err(HeapInitError::AlreadyInitialized);
     }
 
     // The global heap and its in-band free-list metadata are boot-only.
@@ -59,10 +80,9 @@ pub fn init() -> bool {
         HEAP_PAGES,
         &mut heap_addr,
     );
-    if status != Status::SUCCESS {
+    if status != r_efi::efi::Status::SUCCESS {
         HEAP_INITIALIZED.store(false, Ordering::Release);
-        log::error!("Failed to allocate heap memory: {:?}", status);
-        return false;
+        return Err(HeapInitError::PageAllocation(status));
     }
 
     // SAFETY: `heap_addr` is a newly allocated, page-aligned BootServicesData
@@ -76,7 +96,7 @@ pub fn init() -> bool {
         heap_addr,
         HEAP_SIZE / 1024
     );
-    true
+    Ok(())
 }
 
 /// Check if the allocator is initialized.
