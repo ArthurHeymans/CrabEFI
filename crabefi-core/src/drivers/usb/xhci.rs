@@ -492,7 +492,12 @@ impl XhciController {
         let mmio_base = pci_dev.mmio_base().ok_or(XhciError::NotReady)?;
         // SAFETY: mmio_base is a PCI BAR address for this xHCI controller,
         // mapped by the platform and valid for the device's lifetime.
-        let mmio = unsafe { MmioRegion::new(mmio_base, XHCI_MMIO_SIZE) };
+        let mmio = unsafe {
+            MmioRegion::try_new(mmio_base, XHCI_MMIO_SIZE).map_err(|e| {
+                log::error!("xHCI MMIO region invalid at {mmio_base:#x}: {e}");
+                XhciError::InvalidParameter
+            })?
+        };
 
         // Enable the device (bus master + memory space)
         pci::enable_device(pci_dev);
