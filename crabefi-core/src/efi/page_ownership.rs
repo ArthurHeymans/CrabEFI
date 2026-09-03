@@ -412,7 +412,7 @@ mod tests {
         let split = range(0x1000, 0x9000)
             .split_around(range(0x3000, 0x6000))
             .unwrap();
-        let parts: std::vec::Vec<_> = split.parts().collect();
+        let parts: alloc::vec::Vec<_> = split.parts().collect();
         assert_eq!(parts.len(), 3);
         assert!(parts.windows(2).all(|pair| pair[0].is_adjacent_to(pair[1])));
         assert_eq!(parts[0].start(), range(0x1000, 0x9000).start());
