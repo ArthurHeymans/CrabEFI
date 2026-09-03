@@ -13,8 +13,6 @@
 //! - https://chromium.googlesource.com/chromiumos/third_party/flashmap/
 //! - coreboot/src/commonlib/bsd/include/commonlib/bsd/fmap_serialized.h
 
-#![allow(dead_code)]
-
 use heapless::{String, Vec};
 use zerocopy::{FromBytes, Immutable, KnownLayout, Unaligned};
 
@@ -76,6 +74,8 @@ pub const FMAP_AREA_SIZE: usize = core::mem::size_of::<FmapArea>();
 
 /// Parsed FMAP information
 #[derive(Debug, Clone)]
+// Header fields are parsed for completeness; consumers currently use `areas`.
+#[allow(dead_code)]
 pub struct FmapInfo {
     /// Base address of the firmware
     pub base: u64,
@@ -89,6 +89,8 @@ pub struct FmapInfo {
 
 /// Parsed FMAP area information
 #[derive(Debug, Clone)]
+// `flags` is parsed for completeness; area lookup currently matches names.
+#[allow(dead_code)]
 pub struct FmapAreaInfo {
     /// Offset from flash base
     pub offset: u32,

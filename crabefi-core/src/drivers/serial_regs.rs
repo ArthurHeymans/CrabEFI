@@ -216,7 +216,6 @@ pub mod uart16550 {
 
         /// Modem Status Register (read-only)
         #[inline]
-        #[allow(dead_code)]
         pub fn msr(&self) -> PortReadOnly8<MSR::Register> {
             PortReadOnly8::new(self.base + MSR_OFFSET)
         }

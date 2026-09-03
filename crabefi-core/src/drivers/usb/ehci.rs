@@ -337,7 +337,7 @@ pub struct EhciController {
     /// PCI address
     pci_address: PciAddress,
     /// Pointer to capability registers (hardware MMIO region — must remain referenced)
-    #[allow(dead_code)]
+    #[allow(dead_code)] // MMIO mapping must stay referenced; reads go through op_regs.
     cap_regs: *const EhciCapRegs,
     /// Pointer to operational registers
     op_regs: *const EhciOpRegs,

@@ -75,7 +75,6 @@ pub(crate) mod ports {
 }
 
 /// Controller commands (written to port 0x64)
-#[allow(dead_code)]
 mod cmd {
     /// Read controller configuration byte
     pub const READ_CONFIG: u8 = 0x20;
@@ -83,10 +82,6 @@ mod cmd {
     pub const WRITE_CONFIG: u8 = 0x60;
     /// Disable auxiliary (mouse) port
     pub const DISABLE_AUX: u8 = 0xA7;
-    /// Enable auxiliary (mouse) port
-    pub const ENABLE_AUX: u8 = 0xA8;
-    /// Test auxiliary port
-    pub const TEST_AUX: u8 = 0xA9;
     /// Controller self-test
     pub const SELF_TEST: u8 = 0xAA;
     /// Test keyboard port
@@ -98,26 +93,14 @@ mod cmd {
 }
 
 /// Keyboard commands (written to port 0x60)
-#[allow(dead_code)]
 mod kb_cmd {
-    /// Set LEDs (followed by LED byte)
-    pub const SET_LEDS: u8 = 0xED;
-    /// Echo (for testing)
-    pub const ECHO: u8 = 0xEE;
-    /// Set scancode set
-    pub const SET_SCANCODE: u8 = 0xF0;
     /// Enable scanning
     pub const ENABLE: u8 = 0xF4;
-    /// Disable scanning
-    pub const DISABLE: u8 = 0xF5;
-    /// Set default parameters
-    pub const SET_DEFAULT: u8 = 0xF6;
     /// Reset and self-test
     pub const RESET: u8 = 0xFF;
 }
 
 /// Keyboard response codes
-#[allow(dead_code)]
 mod response {
     /// Command acknowledged
     pub const ACK: u8 = 0xFA;
@@ -125,8 +108,6 @@ mod response {
     pub const RESEND: u8 = 0xFE;
     /// Self-test passed
     pub const SELF_TEST_PASS: u8 = 0xAA;
-    /// Echo response
-    pub const ECHO: u8 = 0xEE;
 }
 
 /// Bit masks for raw byte manipulation

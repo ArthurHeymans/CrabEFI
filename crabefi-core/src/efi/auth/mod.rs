@@ -200,7 +200,6 @@ pub mod attributes {
 
     /// Variable is authenticated with a monotonic count (deprecated)
     /// This is the legacy authentication method, superseded by time-based auth
-    #[allow(dead_code)]
     pub const AUTHENTICATED_WRITE_ACCESS: u32 = 0x00000010;
 
     /// Combined attributes for typical Secure Boot variables

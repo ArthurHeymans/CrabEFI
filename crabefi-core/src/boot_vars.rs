@@ -38,11 +38,9 @@ use heapless::Vec as HeaplessVec;
 pub const LOAD_OPTION_ACTIVE: u32 = 0x00000001;
 
 /// EFI_LOAD_OPTION attribute: force reconnect of all drivers before boot
-#[allow(dead_code)]
 pub const LOAD_OPTION_FORCE_RECONNECT: u32 = 0x00000002;
 
 /// EFI_LOAD_OPTION attribute: option is hidden from the user
-#[allow(dead_code)]
 pub const LOAD_OPTION_HIDDEN: u32 = 0x00000008;
 
 /// EFI_LOAD_OPTION attribute mask for option category
@@ -52,7 +50,6 @@ pub const LOAD_OPTION_CATEGORY: u32 = 0x00001F00;
 pub const LOAD_OPTION_CATEGORY_BOOT: u32 = 0x00000000;
 
 /// Category: this is an application (not a boot option)
-#[allow(dead_code)]
 pub const LOAD_OPTION_CATEGORY_APP: u32 = 0x00000100;
 
 /// NV+BS+RT attributes for persistent boot variables

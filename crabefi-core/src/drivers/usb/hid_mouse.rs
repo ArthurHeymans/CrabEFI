@@ -56,10 +56,10 @@ pub struct UsbHidMouse {
     /// Interrupt endpoint number
     endpoint: u8,
     /// Max packet size
-    #[allow(dead_code)]
+    #[allow(dead_code)] // Endpoint descriptor shadow; completeness for re-enumeration.
     max_packet: u16,
     /// Polling interval in ms
-    #[allow(dead_code)]
+    #[allow(dead_code)] // Endpoint descriptor shadow; completeness for re-enumeration.
     interval: u8,
     /// Accumulated X relative motion
     rel_x: i32,

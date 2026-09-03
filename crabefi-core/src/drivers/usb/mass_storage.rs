@@ -11,14 +11,11 @@ use crate::time;
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned};
 
 /// SCSI Commands
-#[allow(dead_code)]
 mod scsi_cmd {
     pub const TEST_UNIT_READY: u8 = 0x00;
-    pub const REQUEST_SENSE: u8 = 0x03;
     pub const INQUIRY: u8 = 0x12;
     pub const READ_CAPACITY_10: u8 = 0x25;
     pub const READ_10: u8 = 0x28;
-    pub const WRITE_10: u8 = 0x2A;
     pub const READ_CAPACITY_16: u8 = 0x9E;
 }
 
@@ -115,7 +112,7 @@ pub struct UsbMassStorage {
     /// Bulk OUT endpoint number
     bulk_out: u8,
     /// Maximum packet size (USB endpoint hardware property)
-    #[allow(dead_code)]
+    #[allow(dead_code)] // Endpoint descriptor shadow; completeness for re-enumeration.
     max_packet: u16,
     /// USB interface number for BOT reset recovery
     interface_number: u8,

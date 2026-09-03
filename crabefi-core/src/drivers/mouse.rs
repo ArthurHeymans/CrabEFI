@@ -47,8 +47,6 @@ mod mouse_cmd {
     pub const ENABLE: u8 = 0xF4;
     pub const DISABLE: u8 = 0xF5;
     pub const SET_DEFAULTS: u8 = 0xF6;
-    #[allow(dead_code)]
-    pub const RESET: u8 = 0xFF;
 }
 
 mod aux_cmd {
@@ -101,11 +99,6 @@ const SYN_MOTION_SCALE: i32 = 8;
 enum MouseProtocol {
     /// Standard PS/2 mouse — 3-byte packets.
     Standard,
-    /// Microsoft IntelliMouse — 4-byte packets (scroll wheel). Kept for
-    /// non-ThinkPad hardware but not actively negotiated; we fall back to
-    /// Standard to avoid multiplexing issues on EC-multiplexed ports.
-    #[allow(dead_code)]
-    IntelliMouse,
     /// Synaptics touchpad in absolute mode — 6-byte packets.
     /// Pass-through (TrackPoint) packets are embedded inside these.
     SynapticsAbsolute,
@@ -115,7 +108,6 @@ impl MouseProtocol {
     fn packet_size(self) -> usize {
         match self {
             MouseProtocol::Standard => 3,
-            MouseProtocol::IntelliMouse => 4,
             MouseProtocol::SynapticsAbsolute => 6,
         }
     }
@@ -441,7 +433,7 @@ impl MouseState {
 
     fn decode_packet(&mut self) {
         match self.protocol {
-            MouseProtocol::Standard | MouseProtocol::IntelliMouse => {
+            MouseProtocol::Standard => {
                 self.decode_standard_packet();
             }
             MouseProtocol::SynapticsAbsolute => {
@@ -491,8 +483,8 @@ impl MouseState {
         // Signature from Linux `synaptics_is_pt_packet()`.
         if (buf[0] & 0xFC) == 0x84 && (buf[3] & 0xCC) == 0xC4 {
             // TrackPoint 3-byte PS/2 packet is at bytes 1, 4, 5.
-            // (byte 2 would carry the 4th byte if TrackPoint were in IntelliMouse
-            //  mode, but we keep TrackPoint in Standard 3-byte mode.)
+            // (byte 2 would carry a 4th wheel byte in 4-byte mode, but we
+            //  keep TrackPoint in Standard 3-byte mode.)
             let tp0 = buf[1]; // buttons (L/R/M) + X/Y overflow/sign bits
             let tp1 = buf[4]; // X delta
             let tp2 = buf[5]; // Y delta

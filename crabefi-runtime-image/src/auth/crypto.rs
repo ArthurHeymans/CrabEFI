@@ -133,7 +133,6 @@ struct SignerView<'a> {
 #[cfg(test)]
 // The integration-test include uses this wrapper, while the binary's unit-test
 // configuration compiles it without a local caller.
-#[allow(dead_code)]
 pub fn verify_pkcs7_signature(
     pkcs7_data: &[u8],
     signed_content: &[u8],
@@ -718,7 +717,6 @@ fn verify_pkcs1v15_sha256_encoding(encoded: &[u8], digest: &[u8; 32]) -> bool {
 #[cfg(test)]
 // The integration-test include compiles this helper unused; auth unit tests
 // call it to measure the production RSA allocation path.
-#[allow(dead_code)]
 pub(super) fn verify_rsa_parts_for_test(
     modulus: &[u8],
     exponent: &[u8],
