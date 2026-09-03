@@ -13,24 +13,30 @@ const MAX_STORAGE_DEVICES: usize = 8;
 /// Maximum number of platform-provided block devices.
 pub const MAX_PLATFORM_BLOCK_DEVICES: usize = 8;
 
-/// Global storage for platform-provided block device fat pointers.
+/// Global storage for platform-provided block devices.
 ///
 /// Populated by [`register_platform_block_devices()`] during
-/// [`crate::init_platform()`]. Each entry is a raw fat pointer
-/// (`*mut dyn platform::BlockDevice`) stored as two `usize` words
-/// (data pointer + vtable pointer).
+/// [`crate::init_platform()`]. Fat pointers are stored directly as
+/// `Option<*mut dyn>` — no `transmute` through `[usize; 2]` needed, since
+/// raw pointers are `Copy` and always `Send`, keeping the `Mutex` `Sync`.
 ///
 /// # Safety invariant
 ///
-/// Every non-zero entry is a valid `*mut dyn platform::BlockDevice` whose
+/// Every `Some` entry is a valid `*mut dyn platform::BlockDevice` whose
 /// referent lives for the firmware's entire lifetime (`init_platform` is `-> !`).
 struct PlatformBlockRegistry {
-    pointers: [[usize; 2]; MAX_PLATFORM_BLOCK_DEVICES],
+    pointers: [Option<*mut dyn crate::platform::BlockDevice>; MAX_PLATFORM_BLOCK_DEVICES],
     count: usize,
 }
 
+// SAFETY: all accesses go through the `PLATFORM_BLOCKS` mutex, every stored
+// referent lives for the firmware lifetime (`init_platform() -> !`), and
+// CrabEFI is single-hart, so no thread can race the pointer metadata.
+unsafe impl Send for PlatformBlockRegistry {}
+unsafe impl Sync for PlatformBlockRegistry {}
+
 static PLATFORM_BLOCKS: Mutex<PlatformBlockRegistry> = Mutex::new(PlatformBlockRegistry {
-    pointers: [[0; 2]; MAX_PLATFORM_BLOCK_DEVICES],
+    pointers: [None; MAX_PLATFORM_BLOCK_DEVICES],
     count: 0,
 });
 
@@ -48,12 +54,13 @@ pub unsafe fn register_platform_block_devices(
     let mut registry = PLATFORM_BLOCKS.lock();
     for (i, dev) in devices.iter_mut().enumerate().take(count) {
         let fat: *mut dyn crate::platform::BlockDevice = *dev;
-        // SAFETY: A trait object pointer is exactly two usizes (data + vtable).
-        // We store it raw and reconstruct it in with_platform_block_device().
-        unsafe {
-            registry.pointers[i] =
-                core::mem::transmute::<*mut dyn crate::platform::BlockDevice, [usize; 2]>(fat);
-        }
+        // SAFETY: lifetime extension from the config borrow to 'static.
+        // Justified by the `init_platform() -> !` contract documented above:
+        // the referent outlives firmware. Layout is untouched, unlike the
+        // previous `[usize; 2]` transmute.
+        let fat: *mut (dyn crate::platform::BlockDevice + 'static) =
+            unsafe { core::mem::transmute(fat) };
+        registry.pointers[i] = Some(fat);
     }
     registry.count = count;
     log::info!("Registered {} platform block device(s)", count);
@@ -78,12 +85,7 @@ pub fn with_platform_block_device<R>(
     // SAFETY: the pointer entry was written by register_platform_block_devices()
     // from a valid `*mut dyn BlockDevice`. The referent is alive (-> ! contract).
     unsafe {
-        let words = registry.pointers[index];
-        if words[0] == 0 {
-            return None;
-        }
-        let fat: *mut dyn crate::platform::BlockDevice =
-            core::mem::transmute::<[usize; 2], *mut dyn crate::platform::BlockDevice>(words);
+        let fat = registry.pointers[index]?;
         Some(f(&mut *fat))
     }
 }
