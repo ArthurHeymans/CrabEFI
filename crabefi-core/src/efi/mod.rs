@@ -68,16 +68,14 @@ pub fn init_from_platform(config: &mut crate::platform::PlatformConfig) {
     // The EFI state tables are heap-backed, so initialize the heap after the
     // page allocator and runtime regions are ready but before system-table and
     // protocol setup starts using them.
-    if !config.heap_pre_initialized && !crate::heap::init() {
-        panic!("Failed to initialize heap allocator");
+    if !config.heap_pre_initialized {
+        crate::heap::init().unwrap_or_else(|e| panic!("Failed to initialize heap allocator: {e}"));
     }
     if !crate::heap::is_initialized() {
         panic!("Failed to initialize heap allocator");
     }
     let (heap_before, heap_total) = crate::heap::stats();
-    if !tables::init_caches() {
-        panic!("Failed to initialize EFI state tables");
-    }
+    tables::init_caches().unwrap_or_else(|e| panic!("Failed to initialize EFI state tables: {e}"));
     let (heap_after, _) = crate::heap::stats();
     log::info!(
         "MEMORY_REPORT heap_before_efi_tables={} heap_after_efi_tables={} heap_delta={} heap_total={}",

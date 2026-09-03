@@ -28,34 +28,50 @@ pub fn with_tables_mut<R>(f: impl FnOnce(&mut Tables) -> R) -> R {
     TABLES.with_mut(f)
 }
 
+/// Failure to allocate the fixed-size EFI state tables.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TableInitError;
+
+impl core::fmt::Display for TableInitError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "out of memory while allocating EFI state tables")
+    }
+}
+
 /// Allocate fixed-size EFI state tables after heap startup.
 ///
 /// All tables keep their maximum length so their backing storage never moves.
 /// Variable payloads remain empty until a variable is loaded or written.
 ///
-/// # Returns
-/// `true` when every table is ready.
-pub fn init_caches() -> bool {
+/// # Errors
+///
+/// Returns [`TableInitError`] when the heap cannot back any of the tables.
+pub fn init_caches() -> Result<(), TableInitError> {
     with_tables_mut(|efi| {
-        init_entries(&mut efi.handles, MAX_HANDLES, HandleEntry::empty)
-            && init_entries(&mut efi.events, MAX_EVENTS, EventEntry::empty)
-            && init_entries(
-                &mut efi.loaded_images,
-                MAX_LOADED_IMAGES,
-                LoadedImageEntry::empty,
-            )
+        init_entries(&mut efi.handles, MAX_HANDLES, HandleEntry::empty)?;
+        init_entries(&mut efi.events, MAX_EVENTS, EventEntry::empty)?;
+        init_entries(
+            &mut efi.loaded_images,
+            MAX_LOADED_IMAGES,
+            LoadedImageEntry::empty,
+        )?;
+        Ok(())
     })
 }
 
-fn init_entries<T>(entries: &mut Vec<T>, len: usize, init: impl FnMut() -> T) -> bool {
+fn init_entries<T>(
+    entries: &mut Vec<T>,
+    len: usize,
+    init: impl FnMut() -> T,
+) -> Result<(), TableInitError> {
     if !entries.is_empty() {
-        return true;
+        return Ok(());
     }
     if entries.try_reserve_exact(len).is_err() {
-        return false;
+        return Err(TableInitError);
     }
     entries.resize_with(len, init);
-    true
+    Ok(())
 }
 
 /// Maximum number of handles we can track
