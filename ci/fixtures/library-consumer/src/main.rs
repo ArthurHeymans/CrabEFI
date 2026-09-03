@@ -6,8 +6,8 @@
 use core::panic::PanicInfo;
 
 use crabefi::{
-    BlockDevice, DeferredBufferConfig, MemoryRegion, MemoryType, PlatformConfig, ResetHandler,
-    ResetType, RuntimePlatformConfig, RuntimeResetConfig, RuntimeTimeConfig, Timer,
+    BlockDevice, DeferredBufferConfig, MemoryRegion, MemoryType, PlatformConfigBuilder,
+    ResetHandler, ResetType, RuntimePlatformConfig, RuntimeResetConfig, RuntimeTimeConfig, Timer,
 };
 
 // The embedding firmware, rather than crabefi-core, owns this symbol. The
@@ -63,38 +63,25 @@ pub extern "C" fn _start() -> ! {
     ];
     let mut block_devices: [&mut dyn BlockDevice; 0] = [];
 
-    crabefi::init_platform(PlatformConfig {
-        memory_map: &memory_map,
-        timer: &TIMER,
-        timestamp_recorder: None,
-        reset: &RESET,
-        block_devices: &mut block_devices,
-        variable_store_locator: None,
-        debug_output: None,
-        console_input: None,
-        framebuffer: None,
-        acpi_rsdp: None,
-        smbios: None,
-        fdt: None,
-        firmware_info: None,
-        capsule_regions: &[],
-        capsule_backend: None,
-        hooks: None,
-        rng: None,
-        ecam_regions: &[],
-        runtime_image: crabefi::BUNDLED_RUNTIME_IMAGE,
-        runtime: RuntimePlatformConfig {
-            time: runtime_time_config(),
-            reset: runtime_reset_config(),
-            external_ranges: &[],
-            deferred_buffer: DeferredBufferConfig {
-                base: deferred_base,
-                size: 4096,
+    crabefi::init_platform(
+        PlatformConfigBuilder::new(
+            &memory_map,
+            &TIMER,
+            &RESET,
+            &mut block_devices,
+            crabefi::BUNDLED_RUNTIME_IMAGE,
+            RuntimePlatformConfig {
+                time: runtime_time_config(),
+                reset: runtime_reset_config(),
+                external_ranges: &[],
+                deferred_buffer: DeferredBufferConfig {
+                    base: deferred_base,
+                    size: 4096,
+                },
             },
-        },
-        tpm_event_log: None,
-        heap_pre_initialized: false,
-    })
+        )
+        .build(),
+    )
 }
 
 const fn runtime_time_config() -> RuntimeTimeConfig {
