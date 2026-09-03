@@ -5,6 +5,8 @@
 
 use core::arch::global_asm;
 
+use crabefi::cell::StaticMut;
+
 // Static page tables in BSS - will be initialized at runtime
 #[repr(C, align(4096))]
 pub struct PageTable {
@@ -22,11 +24,11 @@ impl PageTable {
 // 64GB requires 64 Page Directories (64 * 512 * 2MB = 64GB)
 #[unsafe(no_mangle)]
 #[unsafe(link_section = ".page_tables")]
-static mut PML4: PageTable = PageTable::empty();
+static PML4: StaticMut<PageTable> = StaticMut::new(PageTable::empty());
 
 #[unsafe(no_mangle)]
 #[unsafe(link_section = ".page_tables")]
-static mut PDPT: PageTable = PageTable::empty();
+static PDPT: StaticMut<PageTable> = StaticMut::new(PageTable::empty());
 
 /// Number of Page Directories for identity mapping
 /// 64 PDs * 512 entries * 2MB per entry = 64GB
@@ -34,8 +36,8 @@ const NUM_PAGE_DIRECTORIES: usize = 64;
 
 #[unsafe(no_mangle)]
 #[unsafe(link_section = ".page_tables")]
-static mut PD: [PageTable; NUM_PAGE_DIRECTORIES] =
-    [const { PageTable::empty() }; NUM_PAGE_DIRECTORIES];
+static PD: StaticMut<[PageTable; NUM_PAGE_DIRECTORIES]> =
+    StaticMut::new([const { PageTable::empty() }; NUM_PAGE_DIRECTORIES]);
 
 // Assembly entry point - Intel syntax
 // Note: The GDT is defined in assembly below (gdt64/gdt64_ptr)
