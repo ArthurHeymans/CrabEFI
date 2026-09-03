@@ -6,6 +6,8 @@
 use core::ffi::c_void;
 use r_efi::efi::{Boolean, Char8, Char16, Guid};
 
+use crate::cell::StaticMut;
+
 /// Unicode Collation Protocol GUID (version 2)
 pub const UNICODE_COLLATION_PROTOCOL2_GUID: Guid = Guid::from_fields(
     0xa4c751fc,
@@ -63,19 +65,20 @@ pub struct UnicodeCollationProtocol {
 static SUPPORTED_LANGUAGES: [u8; 4] = *b"eng\0";
 
 /// Static protocol instance
-static mut UNICODE_COLLATION: UnicodeCollationProtocol = UnicodeCollationProtocol {
-    stri_coll,
-    metai_match,
-    str_lwr,
-    str_upr,
-    fat_to_str,
-    str_to_fat,
-    supported_languages: SUPPORTED_LANGUAGES.as_ptr() as *const Char8,
-};
+static UNICODE_COLLATION: StaticMut<UnicodeCollationProtocol> =
+    StaticMut::new(UnicodeCollationProtocol {
+        stri_coll,
+        metai_match,
+        str_lwr,
+        str_upr,
+        fat_to_str,
+        str_to_fat,
+        supported_languages: SUPPORTED_LANGUAGES.as_ptr() as *const Char8,
+    });
 
 /// Get the Unicode Collation Protocol
 pub fn get_protocol() -> *mut UnicodeCollationProtocol {
-    &raw mut UNICODE_COLLATION
+    UNICODE_COLLATION.get()
 }
 
 /// Get the protocol as a void pointer
