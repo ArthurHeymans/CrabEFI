@@ -3,8 +3,6 @@
 //! Parses the coreboot tables to extract system information.
 //! Reference: coreboot/src/commonlib/include/commonlib/coreboot_tables.h
 
-#![allow(dead_code)]
-
 use crate::framebuffer::FramebufferInfo;
 use crate::memory::{MemoryRegion, MemoryType};
 use heapless::Vec;
@@ -14,6 +12,10 @@ use zerocopy::{FromBytes, Immutable, KnownLayout, Unaligned};
 const MAX_MEMORY_REGIONS: usize = 64;
 
 /// Coreboot table tags
+///
+/// Complete transcription of the tag list in coreboot's `coreboot_tables.h`;
+/// parsers match on a subset, so unused tags are expected here rather than
+/// deleted one by one as parser coverage grows.
 #[allow(dead_code)]
 pub mod tags {
     pub const CB_TAG_UNUSED: u32 = 0x0000;
@@ -98,7 +100,7 @@ struct CbMemoryRange {
 ///
 /// Matches coreboot's `struct lb_serial` from coreboot_tables.h:
 /// - tag, size: record header (8 bytes)
-/// - type: LB_SERIAL_TYPE_IO_MAPPED (1) or LB_SERIAL_TYPE_MEMORY_MAPPED (2)
+/// - type: 1 (I/O port mapped) or LB_SERIAL_TYPE_MEMORY_MAPPED (2)
 /// - baseaddr: I/O port or MMIO address
 /// - baud: baud rate (e.g., 115200)
 /// - regwidth: register width in bytes
@@ -299,8 +301,6 @@ struct CbCapsule {
     range_size: u32,
 }
 
-/// Coreboot serial type: I/O port mapped
-pub const LB_SERIAL_TYPE_IO_MAPPED: u32 = 1;
 /// Coreboot serial type: Memory mapped
 pub const LB_SERIAL_TYPE_MEMORY_MAPPED: u32 = 2;
 
@@ -325,6 +325,9 @@ impl SerialInfo {
 ///
 /// This provides information for accessing UEFI variable storage
 /// through coreboot's SMMSTORE v2 interface.
+// The SMMSTORE driver is not written yet; the struct is parsed for handoff
+// completeness so only the allow below goes stale when it lands.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy)]
 pub struct Smmstorev2Info {
     /// Number of writable blocks in SMM
@@ -347,6 +350,8 @@ pub const MAX_FLASH_MMAP_WINDOWS: usize = 4;
 /// SPI flash information
 ///
 /// Contains information about the system's SPI flash from coreboot tables.
+// Consumed incrementally as the SPI backends grow; parsed fields stay.
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct SpiFlashInfo {
     /// Total flash size in bytes
@@ -362,6 +367,9 @@ pub struct SpiFlashInfo {
 /// Boot media parameters
 ///
 /// Contains information about the boot media layout from coreboot tables.
+// CBFS fields are parsed for handoff completeness; only FMAP offset is
+// consumed so far.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy)]
 pub struct BootMediaInfo {
     /// Offset of FMAP in boot media (relative to start of flash)

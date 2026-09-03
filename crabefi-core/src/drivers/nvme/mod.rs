@@ -145,18 +145,10 @@ pub struct NvmeRegisters {
 }
 
 /// NVMe admin commands
-#[allow(dead_code)]
 mod admin_cmd {
-    pub const DELETE_SQ: u8 = 0x00;
     pub const CREATE_SQ: u8 = 0x01;
-    pub const GET_LOG_PAGE: u8 = 0x02;
-    pub const DELETE_CQ: u8 = 0x04;
     pub const CREATE_CQ: u8 = 0x05;
     pub const IDENTIFY: u8 = 0x06;
-    pub const ABORT: u8 = 0x08;
-    pub const SET_FEATURES: u8 = 0x09;
-    pub const GET_FEATURES: u8 = 0x0A;
-    pub const ASYNC_EVENT_REQUEST: u8 = 0x0C;
     /// Security Send (for TCG Opal, IEEE 1667, etc.)
     pub const SECURITY_SEND: u8 = 0x81;
     /// Security Receive (for TCG Opal, IEEE 1667, etc.)
@@ -164,10 +156,7 @@ mod admin_cmd {
 }
 
 /// NVMe I/O commands
-#[allow(dead_code)]
 mod io_cmd {
-    pub const FLUSH: u8 = 0x00;
-    pub const WRITE: u8 = 0x01;
     pub const READ: u8 = 0x02;
 }
 

@@ -299,6 +299,7 @@ pub struct XhciController {
     pci_address: PciAddress,
     /// MMIO region (kept alive so the mapping is not dropped)
     #[allow(dead_code)]
+    // Retained for the mapping lifetime; register I/O goes through `registers`.
     mmio: MmioRegion,
     /// xHCI register accessors.
     registers: Registers<IdentityMapper>,

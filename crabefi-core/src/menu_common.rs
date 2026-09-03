@@ -22,7 +22,6 @@ pub enum KeyPress {
     /// Mouse click at pixel coordinates.
     #[cfg(feature = "ui")]
     MouseClick {
-        #[allow(dead_code)]
         x: u32,
         y: u32,
     },

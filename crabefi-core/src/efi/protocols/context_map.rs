@@ -102,7 +102,6 @@ impl<Ctx: Copy, Proto, const N: usize> ProtocolContextMap<Ctx, Proto, N> {
     /// Remove the context and protocol pointer at the given index.
     ///
     /// Returns the context if present.
-    #[allow(dead_code)]
     pub fn remove(&self, idx: usize) -> Option<Ctx> {
         if idx < N {
             let mut inner = self.inner.lock();

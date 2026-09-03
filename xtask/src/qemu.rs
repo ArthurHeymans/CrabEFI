@@ -246,14 +246,7 @@ fn spawn_swtpm() -> Result<(SwtpmProcess, Vec<String>)> {
 
 /// Test result from QEMU run
 #[derive(Debug)]
-#[allow(dead_code)] // Fields will be used when expanding test framework
 pub struct TestResult {
-    /// Whether all tests passed
-    pub success: bool,
-    /// Number of tests that passed
-    pub passed: usize,
-    /// Total number of tests
-    pub total: usize,
     /// Captured serial output
     pub output: String,
 }
@@ -536,17 +529,6 @@ fn is_kvm_available() -> bool {
         && std::fs::metadata("/dev/kvm")
             .map(|m| !m.permissions().readonly())
             .unwrap_or(false)
-}
-
-/// Wrapper to kill child process on drop
-#[allow(dead_code)]
-struct ChildGuard(Child);
-
-impl Drop for ChildGuard {
-    fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
-    }
 }
 
 /// Run QEMU interactively (for `xtask run`)
@@ -1713,9 +1695,6 @@ fn parse_qemu_output(output: &std::process::Output) -> Result<TestResult> {
     let clean_output = ansi_re.replace_all(&combined, "").to_string();
 
     Ok(TestResult {
-        success: clean_output.contains("EFI app executed successfully"),
-        passed: 0, // Will be calculated by caller
-        total: 0,
         output: clean_output,
     })
 }
