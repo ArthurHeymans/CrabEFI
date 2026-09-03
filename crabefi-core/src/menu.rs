@@ -181,6 +181,8 @@ impl BootEntry {
     }
 
     /// Create a new boot entry with specific kind and category
+    // Entry fields map 1:1 to the boot database columns filled here.
+    #[allow(clippy::too_many_arguments)]
     pub fn new_with_kind(
         name: &str,
         path: &str,

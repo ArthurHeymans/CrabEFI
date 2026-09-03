@@ -1421,6 +1421,8 @@ static SDHCI_CONTROLLERS: super::ControllerRegistry<SdhciController, MAX_SDHCI_C
 ///
 /// # Arguments
 /// * `dev` - The PCI device to initialize as an SDHCI controller
+// Failures are logged at the error site; callers only branch on success.
+#[allow(clippy::result_unit_err)]
 pub fn init_device(dev: &pci::PciDevice) -> Result<(), ()> {
     log::info!(
         "Initializing SDHCI controller at {}: {:04x}:{:04x}",
@@ -1443,6 +1445,8 @@ pub fn init_device(dev: &pci::PciDevice) -> Result<(), ()> {
 }
 
 /// Initialize an ACPI-described MMIO SDHCI controller.
+// Failures are logged at the error site; callers only branch on success.
+#[allow(clippy::result_unit_err)]
 pub fn init_mmio_device(dev: &crate::fdt::DsdtDevice, media: SdhciMedia) -> Result<(), ()> {
     if dev.mmio_base == 0 || dev.mmio_size == 0 {
         return Err(());
@@ -1552,6 +1556,8 @@ pub fn store_global_device(controller_index: usize) -> bool {
 ///
 /// This function is used as the read callback for the SimpleFileSystem protocol.
 /// Supports reading multiple sectors by inferring sector count from buffer size.
+// Failures are logged at the error site; callers only branch on success.
+#[allow(clippy::result_unit_err)]
 pub fn global_read_sectors(lba: u64, buffer: &mut [u8]) -> Result<(), ()> {
     log::trace!("SDHCI global_read_sectors: LBA={}", lba);
 

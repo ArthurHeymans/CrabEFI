@@ -202,6 +202,8 @@ pub fn fill_rounded_rect(fb: &FramebufferInfo, x: i32, y: i32, w: u32, h: u32, r
 // ═══════════════════════════════════════════════════════════════════════
 
 /// Draw a soft glow border around a rounded rectangle.
+// Immediate-mode draw parameters mirror the framebuffer blit coordinates.
+#[allow(clippy::too_many_arguments)]
 pub fn draw_glow(
     fb: &FramebufferInfo,
     x: i32,
@@ -253,6 +255,8 @@ pub fn draw_glow(
 // ═══════════════════════════════════════════════════════════════════════
 
 /// Draw a horizontal progress bar.
+// Immediate-mode draw parameters mirror the framebuffer blit coordinates.
+#[allow(clippy::too_many_arguments)]
 pub fn draw_progress_bar(
     fb: &FramebufferInfo,
     x: i32,
@@ -464,6 +468,8 @@ pub fn draw_text(
 }
 
 /// Draw text with extra letter-spacing (for "tracking-widest" labels).
+// Immediate-mode draw parameters mirror the framebuffer blit coordinates.
+#[allow(clippy::too_many_arguments)]
 pub fn draw_text_spaced(
     fb: &FramebufferInfo,
     px: i32,
@@ -489,6 +495,8 @@ pub fn text_width_spaced(s: &str, size: FontSize, spacing: i32) -> u32 {
 }
 
 /// Draw text right-aligned ending at `rx + rw`.
+// Immediate-mode draw parameters mirror the framebuffer blit coordinates.
+#[allow(clippy::too_many_arguments)]
 pub fn draw_text_right(
     fb: &FramebufferInfo,
     rx: i32,
@@ -505,6 +513,8 @@ pub fn draw_text_right(
 }
 
 /// Draw text centered horizontally within `[rx, rx+rw)`.
+// Immediate-mode draw parameters mirror the framebuffer blit coordinates.
+#[allow(clippy::too_many_arguments)]
 pub fn draw_text_centered(
     fb: &FramebufferInfo,
     rx: i32,

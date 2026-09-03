@@ -656,6 +656,8 @@ pub fn print_devices() {
 }
 
 /// Store validated, non-overlapping ECAM allocations for PCI initialization.
+// Failure details are logged at the error site; callers only branch on success.
+#[allow(clippy::result_unit_err)]
 pub fn set_ecam_regions(regions: &[crate::platform::PciEcamRegion]) -> Result<(), ()> {
     let mut validated =
         heapless::Vec::<crate::platform::PciEcamRegion, { crate::fdt::MAX_ECAM_REGIONS }>::new();
