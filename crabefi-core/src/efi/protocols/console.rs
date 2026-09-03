@@ -9,7 +9,7 @@
 //! - Serial console: ANSI escape sequences are parsed for arrow keys, function keys, etc.
 //! - PS/2 keyboard: Scancodes are translated to EFI keys via the i8042 keyboard controller.
 
-use crate::cell::{Local, LocalCell};
+use crate::cell::{Local, LocalCell, StaticMut};
 use crate::drivers::keyboard_common as keyboard;
 use crate::drivers::serial;
 use crate::efi::boot_services::KEYBOARD_EVENT_ID;
@@ -384,38 +384,41 @@ mod scan_codes {
 /// Static text input protocol
 /// Note: wait_for_key is set to KEYBOARD_EVENT_ID which is the special event
 /// used for keyboard input polling
-static mut TEXT_INPUT_PROTOCOL: SimpleTextInputProtocol = SimpleTextInputProtocol {
-    reset: text_input_reset,
-    read_key_stroke: text_input_read_key_stroke,
-    wait_for_key: KEYBOARD_EVENT_ID as *mut c_void as Event,
-};
+static TEXT_INPUT_PROTOCOL: StaticMut<SimpleTextInputProtocol> =
+    StaticMut::new(SimpleTextInputProtocol {
+        reset: text_input_reset,
+        read_key_stroke: text_input_read_key_stroke,
+        wait_for_key: KEYBOARD_EVENT_ID as *mut c_void as Event,
+    });
 
 /// Static text output protocol
-static mut TEXT_OUTPUT_PROTOCOL: SimpleTextOutputProtocol = SimpleTextOutputProtocol {
-    reset: text_output_reset,
-    output_string: text_output_string,
-    test_string: text_output_test_string,
-    query_mode: text_output_query_mode,
-    set_mode: text_output_set_mode,
-    set_attribute: text_output_set_attribute,
-    clear_screen: text_output_clear_screen,
-    set_cursor_position: text_output_set_cursor_position,
-    enable_cursor: text_output_enable_cursor,
-    mode: core::ptr::null_mut(),
-};
+static TEXT_OUTPUT_PROTOCOL: StaticMut<SimpleTextOutputProtocol> =
+    StaticMut::new(SimpleTextOutputProtocol {
+        reset: text_output_reset,
+        output_string: text_output_string,
+        test_string: text_output_test_string,
+        query_mode: text_output_query_mode,
+        set_mode: text_output_set_mode,
+        set_attribute: text_output_set_attribute,
+        clear_screen: text_output_clear_screen,
+        set_cursor_position: text_output_set_cursor_position,
+        enable_cursor: text_output_enable_cursor,
+        mode: core::ptr::null_mut(),
+    });
 
 /// Get the text input protocol
 pub fn get_text_input_protocol() -> *mut SimpleTextInputProtocol {
-    &raw mut TEXT_INPUT_PROTOCOL
+    TEXT_INPUT_PROTOCOL.get()
 }
 
 /// Get the text output protocol
 pub fn get_text_output_protocol() -> *mut SimpleTextOutputProtocol {
-    // SAFETY: Single-threaded firmware; the static protocol is only ever
-    // handed out through this function.
+    // SAFETY: single-hart firmware; the static protocol is only ever handed
+    // out through this function, and `mode` is firmware-owned for the
+    // protocol's lifetime.
     unsafe {
-        TEXT_OUTPUT_PROTOCOL.mode = OUTPUT_MODE.as_ptr();
-        &raw mut TEXT_OUTPUT_PROTOCOL
+        (*TEXT_OUTPUT_PROTOCOL.get()).mode = OUTPUT_MODE.as_ptr();
+        TEXT_OUTPUT_PROTOCOL.get()
     }
 }
 

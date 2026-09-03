@@ -16,6 +16,7 @@
 //!
 //! - UEFI Specification 2.10, Section 12.5
 
+use crate::cell::StaticMut;
 use crate::efi::boot_services::POINTER_EVENT_ID;
 use core::ffi::c_void;
 use r_efi::efi::{Boolean, Event, Status};
@@ -208,27 +209,27 @@ unsafe extern "efiapi" fn pointer_get_state(
 // ============================================================================
 
 /// Global pointer mode
-static mut POINTER_MODE: SimplePointerMode = SimplePointerMode {
+static POINTER_MODE: StaticMut<SimplePointerMode> = StaticMut::new(SimplePointerMode {
     resolution_x: RESOLUTION_X,
     resolution_y: RESOLUTION_Y,
     resolution_z: RESOLUTION_Z,
     left_button: Boolean::TRUE,
     right_button: Boolean::TRUE,
-};
+});
 
 /// Global protocol instance
-static mut POINTER_PROTOCOL: SimplePointerProtocol = SimplePointerProtocol {
+static POINTER_PROTOCOL: StaticMut<SimplePointerProtocol> = StaticMut::new(SimplePointerProtocol {
     reset: pointer_reset,
     get_state: pointer_get_state,
     wait_for_input: POINTER_EVENT_ID as *mut c_void as Event,
-    mode: core::ptr::addr_of_mut!(POINTER_MODE),
-};
+    mode: POINTER_MODE.get(),
+});
 
 /// Get a pointer to the global SimplePointerProtocol instance.
 ///
 /// The returned pointer is valid for the firmware lifetime.
 pub fn get_protocol() -> *mut SimplePointerProtocol {
-    core::ptr::addr_of_mut!(POINTER_PROTOCOL)
+    POINTER_PROTOCOL.get()
 }
 
 /// Get the protocol GUID.

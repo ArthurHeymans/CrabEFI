@@ -12,6 +12,7 @@ use core::ffi::c_void;
 use r_efi::efi::{Event, Guid, Status};
 use r_efi::protocols::device_path::Protocol as DevicePathProtocol;
 
+use crate::cell::StaticMut;
 use crate::drivers::usb;
 use crate::efi::protocols::device_path::{self, UsbDevicePathNode};
 use crate::efi::utils::allocate_protocol_with_log;
@@ -201,8 +202,8 @@ static CTX_MAP: ProtocolContextMap<ScsiPassThruContext, ExtScsiPassThruProtocol,
     ProtocolContextMap::new();
 
 /// Target ID storage for each instance
-static mut TARGET_IDS: [[u8; TARGET_MAX_BYTES]; MAX_INSTANCES] =
-    [[0; TARGET_MAX_BYTES]; MAX_INSTANCES];
+static TARGET_IDS: StaticMut<[[u8; TARGET_MAX_BYTES]; MAX_INSTANCES]> =
+    StaticMut::new([[0; TARGET_MAX_BYTES]; MAX_INSTANCES]);
 
 /// Get context for a protocol instance
 fn get_context(protocol: *mut ExtScsiPassThruProtocol) -> Option<ScsiPassThruContext> {
@@ -439,7 +440,7 @@ extern "efiapi" fn scsi_get_next_target_lun(
     if is_initial {
         // Return the first (and only) target: target ID 0, LUN 0
         unsafe {
-            let target_storage = core::ptr::addr_of_mut!(TARGET_IDS);
+            let target_storage = TARGET_IDS.get();
             (*target_storage)[ctx_idx].fill(0);
             *target = (*target_storage)[ctx_idx].as_mut_ptr();
             *lun = 0;
@@ -526,7 +527,7 @@ extern "efiapi" fn scsi_get_target_lun(
 
             // Return target ID 0 and LUN 0
             unsafe {
-                let target_storage = core::ptr::addr_of_mut!(TARGET_IDS);
+                let target_storage = TARGET_IDS.get();
                 (*target_storage)[ctx_idx].fill(0);
                 *target = (*target_storage)[ctx_idx].as_mut_ptr();
                 *lun = 0;
@@ -616,7 +617,7 @@ extern "efiapi" fn scsi_get_next_target(
     if is_initial {
         // Return the first (and only) target: target ID 0
         unsafe {
-            let target_storage = core::ptr::addr_of_mut!(TARGET_IDS);
+            let target_storage = TARGET_IDS.get();
             (*target_storage)[ctx_idx].fill(0);
             *target = (*target_storage)[ctx_idx].as_mut_ptr();
         }
