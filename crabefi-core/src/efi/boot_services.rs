@@ -185,12 +185,18 @@ extern "efiapi" fn allocate_pages(
 
     let alloc_type = match AllocateType::try_from(alloc_type) {
         Ok(t) => t,
-        Err(_) => return Status::INVALID_PARAMETER,
+        Err(e) => {
+            log::debug!("BS.AllocatePages: {e}");
+            return Status::INVALID_PARAMETER;
+        }
     };
 
     let mem_type = match MemoryType::try_from(memory_type) {
         Ok(t) => t,
-        Err(_) => return Status::INVALID_PARAMETER,
+        Err(e) => {
+            log::debug!("BS.AllocatePages: {e}");
+            return Status::INVALID_PARAMETER;
+        }
     };
 
     let mut addr = unsafe { *memory };
@@ -282,7 +288,10 @@ extern "efiapi" fn allocate_pool(
 
     let mem_type = match MemoryType::try_from(pool_type) {
         Ok(t) => t,
-        Err(_) => return Status::INVALID_PARAMETER,
+        Err(e) => {
+            log::debug!("BS.AllocatePool: {e}");
+            return Status::INVALID_PARAMETER;
+        }
     };
 
     match allocator::allocate_pool(mem_type, size) {
@@ -429,7 +438,10 @@ extern "efiapi" fn set_timer(
 
     let timer = match TimerType::try_from(timer_type) {
         Ok(t) => t,
-        Err(_) => return Status::INVALID_PARAMETER,
+        Err(e) => {
+            log::debug!("BS.SetTimer: {e}");
+            return Status::INVALID_PARAMETER;
+        }
     };
 
     with_tables_mut(|efi_state| {

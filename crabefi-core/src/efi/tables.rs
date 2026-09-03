@@ -116,15 +116,28 @@ pub enum TimerType {
 }
 
 impl TryFrom<u32> for TimerType {
-    type Error = u32;
+    type Error = InvalidTimerType;
 
     fn try_from(value: u32) -> Result<Self, Self::Error> {
         match value {
             0 => Ok(TimerType::Cancel),
             1 => Ok(TimerType::Periodic),
             2 => Ok(TimerType::Relative),
-            other => Err(other),
+            other => Err(InvalidTimerType(other)),
         }
+    }
+}
+
+/// Rejected [`TimerType`] value from an EFI caller.
+///
+/// Carries the offending raw value so callers can log it instead of
+/// silently dropping it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InvalidTimerType(pub u32);
+
+impl core::fmt::Display for InvalidTimerType {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "invalid TimerType value {}", self.0)
     }
 }
 
