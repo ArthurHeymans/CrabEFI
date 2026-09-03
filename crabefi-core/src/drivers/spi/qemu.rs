@@ -143,7 +143,12 @@ impl QemuPflashController {
     fn init_with_config(host_base: u64, flash_size: u32) -> Result<Self> {
         // SAFETY: host_base is a platform-provided or known QEMU pflash MMIO
         // base address, valid for the flash region.
-        let pflash = unsafe { MmioRegion::new(host_base, flash_size as usize) };
+        let pflash = unsafe {
+            MmioRegion::try_new(host_base, flash_size as usize).map_err(|e| {
+                log::error!("QEMU pflash MMIO region invalid at {host_base:#x}: {e}");
+                SpiError::InvalidArgument
+            })?
+        };
 
         let mut controller = Self {
             pflash,
@@ -189,7 +194,12 @@ impl QemuPflashController {
     fn try_init_at(host_base: u64, flash_size: u32) -> Result<Self> {
         // SAFETY: host_base is a candidate pflash MMIO address from a known
         // QEMU configuration, validated by subsequent read probes below.
-        let pflash = unsafe { MmioRegion::new(host_base, flash_size as usize) };
+        let pflash = unsafe {
+            MmioRegion::try_new(host_base, flash_size as usize).map_err(|e| {
+                log::debug!("QEMU pflash probe at {host_base:#x} rejected: {e}");
+                SpiError::InvalidArgument
+            })?
+        };
 
         // Verify this is pflash by probing for plausible flash contents.
         // Try to find a suitable test byte (not 0xFF, not ending in 0)

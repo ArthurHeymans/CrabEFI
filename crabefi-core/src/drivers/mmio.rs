@@ -9,7 +9,7 @@
 //! ```rust,ignore
 //! use crate::drivers::mmio::MmioRegion;
 //!
-//! let mmio = MmioRegion::new(0xFED0_0000, 0x1000);
+//! let mmio = MmioRegion::try_new(0xFED0_0000, 0x1000).expect("valid MMIO region");
 //! let value = mmio.read32(0x00);  // Read 32-bit register at offset 0
 //! mmio.write32(0x04, 0x1234);     // Write 32-bit register at offset 4
 //! ```
@@ -19,6 +19,44 @@ use tock_registers::interfaces::{Readable, Writeable};
 use tock_registers::registers::{ReadOnly, ReadWrite, WriteOnly};
 
 use crate::drivers::mmio_bounds::{checked_access, checked_region};
+
+/// Failure to construct or narrow an [`MmioRegion`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MmioError {
+    /// Base address was null.
+    NullBase,
+    /// Range was empty or wrapped the address space.
+    EmptyOrWrapping { base: u64, size: usize },
+    /// Subregion leaves the parent region.
+    OutOfBounds {
+        offset: u64,
+        size: usize,
+        region_size: usize,
+    },
+    /// `base + offset` overflowed.
+    Overflow,
+}
+
+impl core::fmt::Display for MmioError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            MmioError::NullBase => write!(f, "MMIO base address cannot be null"),
+            MmioError::EmptyOrWrapping { base, size } => write!(
+                f,
+                "MMIO region must be nonempty and non-wrapping: base={base:#x}, size={size:#x}"
+            ),
+            MmioError::OutOfBounds {
+                offset,
+                size,
+                region_size,
+            } => write!(
+                f,
+                "MMIO subregion out of bounds: offset={offset:#x}, size={size:#x}, region_size={region_size:#x}"
+            ),
+            MmioError::Overflow => write!(f, "MMIO subregion address overflow"),
+        }
+    }
+}
 
 /// A memory-mapped I/O region providing safe register access.
 ///
@@ -41,6 +79,35 @@ unsafe impl Send for MmioRegion {}
 unsafe impl Sync for MmioRegion {}
 
 impl MmioRegion {
+    /// Create a new MMIO region from a base address and size, checked.
+    ///
+    /// # Arguments
+    ///
+    /// * `base` - Physical base address of the MMIO region
+    /// * `size` - Size of the MMIO region in bytes
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure:
+    /// - `base` is a valid physical address mapped for MMIO access
+    /// - The region `[base, base + size)` is valid for the device
+    /// - The region remains valid for the lifetime of this struct
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MmioError`] when `base` is null or the range is empty or
+    /// wraps the address space. Use this from fallible init paths instead of
+    /// the panicking [`MmioRegion::new`].
+    pub unsafe fn try_new(base: u64, size: usize) -> Result<Self, MmioError> {
+        if checked_region(base, size).is_none() {
+            return Err(MmioError::EmptyOrWrapping { base, size });
+        }
+        let Some(ptr) = NonNull::new(base as *mut u8) else {
+            return Err(MmioError::NullBase);
+        };
+        Ok(Self { base: ptr, size })
+    }
+
     /// Create a new MMIO region from a base address and size.
     ///
     /// # Arguments
@@ -57,17 +124,46 @@ impl MmioRegion {
     ///
     /// # Panics
     ///
-    /// Panics if `base` is null.
+    /// Panics if `base` is null or the range is empty/wrapping. This is a
+    /// programmer bug (device tree/PCI BAR decoding went wrong), not a
+    /// runtime EFI error, so aborting with a serial message is intentional.
+    /// Fallible callers should use [`MmioRegion::try_new`] instead.
     pub unsafe fn new(base: u64, size: usize) -> Self {
-        checked_region(base, size).expect("MMIO region must be nonempty and non-wrapping");
-        let ptr = NonNull::new(base as *mut u8).expect("MMIO base address cannot be null");
-        Self { base: ptr, size }
+        // SAFETY: validated by try_new; panic message preserves the old text
+        // so existing serial-log triage keeps working.
+        unsafe { Self::try_new(base, size).expect("MMIO region must be nonempty and non-wrapping") }
     }
 
     /// Get the base address of this MMIO region.
     #[inline]
     pub fn base(&self) -> u64 {
         self.base.as_ptr() as u64
+    }
+
+    /// Create a fallible sub-region at a specific offset.
+    ///
+    /// # Arguments
+    ///
+    /// * `offset` - Offset from the base address
+    /// * `size` - Size of the sub-region in bytes
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MmioError::OutOfBounds`] when the subrange leaves this
+    /// region, or [`MmioError::Overflow`] when `base + offset` overflows.
+    pub fn try_subregion(&self, offset: u64, size: usize) -> Result<Self, MmioError> {
+        let Some(offset) = checked_access(self.base(), self.size, offset, size, 1) else {
+            return Err(MmioError::OutOfBounds {
+                offset,
+                size,
+                region_size: self.size,
+            });
+        };
+        let Some(base) = self.base().checked_add(offset as u64) else {
+            return Err(MmioError::Overflow);
+        };
+        // SAFETY: the checked subrange is contained in the caller-validated region.
+        unsafe { Self::try_new(base, size) }
     }
 
     /// Create a sub-region at a specific offset.
@@ -80,20 +176,19 @@ impl MmioRegion {
     /// # Returns
     ///
     /// A new `MmioRegion` starting at `base + offset` with the given size.
+    ///
+    /// # Panics
+    ///
+    /// Panics on out-of-bounds ranges (driver bug). Fallible callers should
+    /// use [`MmioRegion::try_subregion`].
     #[inline]
     pub fn subregion(&self, offset: u64, size: usize) -> Self {
-        let offset = checked_access(self.base(), self.size, offset, size, 1).unwrap_or_else(|| {
+        self.try_subregion(offset, size).unwrap_or_else(|_| {
             panic!(
-                "MMIO subregion out of bounds: offset={:#x}, size={:#x}, region_size={:#x}",
-                offset, size, self.size
+                "MMIO subregion out of bounds: offset={offset:#x}, size={size:#x}, region_size={:#x}",
+                self.size
             )
-        });
-        let base = self
-            .base()
-            .checked_add(offset as u64)
-            .expect("MMIO subregion address overflow");
-        // SAFETY: the checked subrange is contained in the caller-validated region.
-        unsafe { Self::new(base, size) }
+        })
     }
 
     #[inline]
