@@ -156,6 +156,12 @@ impl LoadedLinux {
 
         log::info!("Boot params copied to {:#x}", BOOT_PARAMS_ADDR);
 
+        // Direct boot bypasses EFI ExitBootServices, so perform the same DMA
+        // shutdown before Linux can reclaim firmware-owned buffers. Without
+        // this, active USB/storage controllers can corrupt pages after the jump.
+        crate::drivers::quiesce_dma_for_os_handoff();
+        crate::drivers::keyboard_common::cleanup();
+
         // SAFETY: Disabling interrupts and jumping to kernel entry point.
         // The caller guarantees the kernel is properly loaded and boot params are valid.
         unsafe {
@@ -252,6 +258,9 @@ impl LoadedLinux {
 /// # Returns
 ///
 /// `LoadedLinux` ready to boot
+// Boot inputs span disk, kernel, and platform concerns; callers pass them
+// straight through from handoff data, so a parameter struct adds no clarity.
+#[allow(clippy::too_many_arguments)]
 pub fn load_linux_from_disk(
     disk: &mut dyn BlockDevice,
     partition_start: u64,

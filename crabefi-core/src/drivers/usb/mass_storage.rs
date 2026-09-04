@@ -11,14 +11,11 @@ use crate::time;
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned};
 
 /// SCSI Commands
-#[allow(dead_code)]
 mod scsi_cmd {
     pub const TEST_UNIT_READY: u8 = 0x00;
-    pub const REQUEST_SENSE: u8 = 0x03;
     pub const INQUIRY: u8 = 0x12;
     pub const READ_CAPACITY_10: u8 = 0x25;
     pub const READ_10: u8 = 0x28;
-    pub const WRITE_10: u8 = 0x2A;
     pub const READ_CAPACITY_16: u8 = 0x9E;
 }
 
@@ -115,7 +112,7 @@ pub struct UsbMassStorage {
     /// Bulk OUT endpoint number
     bulk_out: u8,
     /// Maximum packet size (USB endpoint hardware property)
-    #[allow(dead_code)]
+    #[allow(dead_code)] // Endpoint descriptor shadow; completeness for re-enumeration.
     max_packet: u16,
     /// USB interface number for BOT reset recovery
     interface_number: u8,
@@ -140,6 +137,8 @@ pub enum MassStorageError {
     Usb(UsbError),
     /// Invalid CSW
     InvalidCsw,
+    /// A fixed-length command transferred fewer bytes than requested.
+    ShortTransfer,
     /// Command failed
     CommandFailed,
     /// Phase error
@@ -154,6 +153,12 @@ impl From<UsbError> for MassStorageError {
     fn from(e: UsbError) -> Self {
         MassStorageError::Usb(e)
     }
+}
+
+#[derive(Clone, Copy)]
+struct ScsiTransfer {
+    transferred: usize,
+    residue: u32,
 }
 
 impl UsbMassStorage {
@@ -335,13 +340,15 @@ impl UsbMassStorage {
     ///   the host to always attempt to receive the CSW)
     /// - Stalled data endpoints are cleared before reading CSW
     /// - Phase errors and invalid CSW trigger BOT Reset Recovery
+    // Sequential CBW field setup reads clearer than one large struct literal.
+    #[allow(clippy::field_reassign_with_default)]
     fn scsi_command(
         &mut self,
         controller: &mut dyn UsbController,
         cdb: &[u8],
         data: Option<&mut [u8]>,
         is_read: bool,
-    ) -> Result<usize, MassStorageError> {
+    ) -> Result<ScsiTransfer, MassStorageError> {
         let data_len = data.as_ref().map(|h| h.len()).unwrap_or(0);
 
         // Build CBW
@@ -429,12 +436,24 @@ impl UsbMassStorage {
             Err(e) => Err(e),
         };
 
-        if let Err(e) = csw_result {
-            log::debug!("USB SCSI: CSW transfer failed: {:?}", e);
-            // CSW transfer failed even after retry — perform full reset recovery
+        let csw_len = match csw_result {
+            Ok(n) => n,
+            Err(e) => {
+                log::debug!("USB SCSI: CSW transfer failed: {:?}", e);
+                // CSW transfer failed even after retry — perform full reset recovery
+                self.bot_reset_recovery(controller)?;
+                // Return the original data phase error if there was one
+                return Err(MassStorageError::Usb(data_phase_error.unwrap_or(e)));
+            }
+        };
+        if csw_len != csw_buf.len() {
+            log::debug!(
+                "USB SCSI: Short CSW transfer: got {} bytes, expected {}",
+                csw_len,
+                csw_buf.len()
+            );
             self.bot_reset_recovery(controller)?;
-            // Return the original data phase error if there was one
-            return Err(MassStorageError::Usb(data_phase_error.unwrap_or(e)));
+            return Err(MassStorageError::InvalidCsw);
         }
 
         // Parse CSW using zerocopy
@@ -489,8 +508,23 @@ impl UsbMassStorage {
             return Err(MassStorageError::Usb(e));
         }
 
+        if csw_residue as usize > data_len {
+            // Warn: an impossible residue means a broken device or a
+            // transport bug, and the retry loop is about to fire.
+            log::warn!(
+                "USB SCSI: Invalid CSW residue {} exceeds transfer length {}",
+                csw_residue,
+                data_len
+            );
+            self.bot_reset_recovery(controller)?;
+            return Err(MassStorageError::InvalidCsw);
+        }
+
         match csw_stat {
-            csw_status::PASSED => Ok(transferred),
+            csw_status::PASSED => Ok(ScsiTransfer {
+                transferred,
+                residue: csw_residue,
+            }),
             csw_status::FAILED => {
                 log::debug!("USB SCSI: Command {:#04x} failed (CSW status=1)", cdb[0]);
                 Err(MassStorageError::CommandFailed)
@@ -604,18 +638,10 @@ impl UsbMassStorage {
     /// want to stall too long.
     const MAX_READ_RETRIES: u32 = 3;
 
-    /// Maximum bytes per SCSI READ command.
-    ///
-    /// EHCI qTDs can describe at most five 4KiB pages. Keep transfers well
-    /// below that hardware limit so high-speed USB reads do not silently
-    /// truncate or corrupt data while boot files are being loaded.
-    const MAX_BYTES_PER_CMD: usize = 8 * 1024;
-
     /// Read sectors from the device with chunking and retry logic.
     ///
-    /// Large reads are split into chunks of MAX_BYTES_PER_CMD to ensure
-    /// compatibility with all USB mass storage devices. Each chunk is retried
-    /// up to MAX_READ_RETRIES times on failure.
+    /// Large reads are split at the host controller's bulk-transfer limit.
+    /// Each chunk is retried up to MAX_READ_RETRIES times on failure.
     ///
     /// Inspired by EDK2's UsbBootExecCmdWithRetry which retries up to 5 times
     /// with a 60-second overall timeout. Our BOT-level error recovery (endpoint
@@ -629,11 +655,14 @@ impl UsbMassStorage {
         buffer: &mut [u8],
     ) -> Result<(), MassStorageError> {
         let block_size = self.block_size as usize;
-        if buffer.len() < (num_sectors as usize * block_size) {
+        let Some(required_len) = (num_sectors as usize).checked_mul(block_size) else {
+            return Err(MassStorageError::InvalidParameter);
+        };
+        if block_size == 0 || buffer.len() < required_len {
             return Err(MassStorageError::InvalidParameter);
         }
-
-        let sectors_per_cmd = (Self::MAX_BYTES_PER_CMD / block_size).max(1) as u32;
+        let sectors_per_cmd =
+            (controller.max_bulk_transfer_size() / block_size).clamp(1, u16::MAX as usize) as u32;
         let mut lba = start_lba;
         let mut remaining = num_sectors;
         let mut offset = 0usize;
@@ -730,8 +759,23 @@ impl UsbMassStorage {
             0,
         ];
 
-        let transfer_len = count as usize * self.block_size as usize;
-        self.scsi_command(controller, &cdb, Some(&mut buffer[..transfer_len]), true)?;
+        let transfer_len = (count as usize)
+            .checked_mul(self.block_size as usize)
+            .ok_or(MassStorageError::InvalidParameter)?;
+        let result =
+            self.scsi_command(controller, &cdb, Some(&mut buffer[..transfer_len]), true)?;
+        if result.transferred != transfer_len || result.residue != 0 {
+            // Warn, not debug: a short fixed-length READ means the retry loop
+            // is about to fire, and field reports need to identify whether
+            // the device or the transport is at fault.
+            log::warn!(
+                "USB READ(10): short transfer: got {} bytes with {} residue, expected {}",
+                result.transferred,
+                result.residue,
+                transfer_len
+            );
+            return Err(MassStorageError::ShortTransfer);
+        }
 
         Ok(())
     }
@@ -766,8 +810,20 @@ impl UsbMassStorage {
             0,
         ];
 
-        let transfer_len = count as usize * self.block_size as usize;
-        self.scsi_command(controller, &cdb, Some(&mut buffer[..transfer_len]), true)?;
+        let transfer_len = (count as usize)
+            .checked_mul(self.block_size as usize)
+            .ok_or(MassStorageError::InvalidParameter)?;
+        let result =
+            self.scsi_command(controller, &cdb, Some(&mut buffer[..transfer_len]), true)?;
+        if result.transferred != transfer_len || result.residue != 0 {
+            log::warn!(
+                "USB READ(16): short transfer: got {} bytes with {} residue, expected {}",
+                result.transferred,
+                result.residue,
+                transfer_len
+            );
+            return Err(MassStorageError::ShortTransfer);
+        }
 
         Ok(())
     }
@@ -834,6 +890,7 @@ impl UsbMassStorage {
         );
 
         self.scsi_command(controller, &cdb, Some(buffer), true)
+            .map(|result| result.transferred)
     }
 
     /// SCSI SECURITY PROTOCOL OUT command (opcode 0xB5)
@@ -914,6 +971,7 @@ impl UsbMassStorage {
         is_read: bool,
     ) -> Result<usize, MassStorageError> {
         self.scsi_command(controller, cdb, data, is_read)
+            .map(|result| result.transferred)
     }
 }
 
@@ -977,6 +1035,8 @@ pub fn with_global_device_and_controller<R>(
 /// This function can be used as the read callback for the SimpleFileSystem protocol.
 /// It uses the stored controller pointer directly to avoid lock contention.
 /// Supports reading multiple sectors in a single SCSI command for performance.
+// Failures are logged at the error site; callers only branch on success.
+#[allow(clippy::result_unit_err)]
 pub fn global_read_sectors(lba: u64, buffer: &mut [u8]) -> Result<(), ()> {
     log::trace!("USB mass storage: read LBA {}", lba);
 

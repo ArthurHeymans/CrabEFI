@@ -388,6 +388,41 @@ impl core::fmt::Display for FatError {
     }
 }
 
+/// Validated FAT filesystem geometry that can be reused across operations.
+///
+/// This describes on-media layout only. Host properties such as the device
+/// block size are deliberately excluded so that a controller quirk cannot
+/// masquerade as a media change (or hide one).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct FatGeometry {
+    fat_type: FatType,
+    bytes_per_sector: u16,
+    sectors_per_cluster: u8,
+    fat_start: u32,
+    data_start: u32,
+    root_cluster: u32,
+    root_dir_start: u32,
+    root_dir_sectors: u32,
+    data_clusters: u32,
+}
+
+/// Cached location in a file's cluster chain.
+#[derive(Clone, Copy)]
+pub struct FileClusterHint {
+    file_cluster: u32,
+    disk_cluster: u32,
+}
+
+impl FileClusterHint {
+    /// Start a cluster-chain lookup at the beginning of a file.
+    pub const fn new(first_cluster: u32) -> Self {
+        Self {
+            file_cluster: 0,
+            disk_cluster: first_cluster,
+        }
+    }
+}
+
 /// FAT filesystem instance
 pub struct FatFilesystem<'a> {
     /// Block device
@@ -574,6 +609,49 @@ impl<'a> FatFilesystem<'a> {
             fat_block_cache: [0u8; MAX_BLOCK_SIZE],
             fat_block_cached: u64::MAX, // Invalid, forces first read
         })
+    }
+
+    /// Reopen a previously validated filesystem without rereading its BPB.
+    ///
+    /// The host block size is always taken from the live device, never from
+    /// the cache, so a controller quirk cannot silently change the access path.
+    pub fn from_geometry(
+        device: &'a mut dyn BlockDevice,
+        partition_start: u64,
+        geometry: FatGeometry,
+    ) -> Self {
+        let device_block_size = device.info().block_size;
+        Self {
+            device,
+            partition_start,
+            fat_type: geometry.fat_type,
+            bytes_per_sector: geometry.bytes_per_sector,
+            device_block_size,
+            sectors_per_cluster: geometry.sectors_per_cluster,
+            fat_start: geometry.fat_start,
+            data_start: geometry.data_start,
+            root_cluster: geometry.root_cluster,
+            root_dir_start: geometry.root_dir_start,
+            root_dir_sectors: geometry.root_dir_sectors,
+            data_clusters: geometry.data_clusters,
+            fat_block_cache: [0u8; MAX_BLOCK_SIZE],
+            fat_block_cached: u64::MAX,
+        }
+    }
+
+    /// Return the validated geometry needed to reopen this filesystem.
+    pub const fn geometry(&self) -> FatGeometry {
+        FatGeometry {
+            fat_type: self.fat_type,
+            bytes_per_sector: self.bytes_per_sector,
+            sectors_per_cluster: self.sectors_per_cluster,
+            fat_start: self.fat_start,
+            data_start: self.data_start,
+            root_cluster: self.root_cluster,
+            root_dir_start: self.root_dir_start,
+            root_dir_sectors: self.root_dir_sectors,
+            data_clusters: self.data_clusters,
+        }
     }
 
     /// Get the device block and byte offset for a cluster
@@ -1096,6 +1174,18 @@ impl<'a> FatFilesystem<'a> {
         offset: u32,
         buffer: &mut [u8],
     ) -> Result<usize, FatError> {
+        let mut hint = FileClusterHint::new(entry.first_cluster());
+        self.read_file_with_hint(entry, offset, buffer, &mut hint)
+    }
+
+    /// Read a file while reusing a previously resolved cluster-chain location.
+    pub fn read_file_with_hint(
+        &mut self,
+        entry: &DirectoryEntry,
+        offset: u32,
+        buffer: &mut [u8],
+        hint: &mut FileClusterHint,
+    ) -> Result<usize, FatError> {
         if entry.is_directory() {
             return Err(FatError::NotAFile);
         }
@@ -1108,17 +1198,28 @@ impl<'a> FatFilesystem<'a> {
         let bytes_to_read = core::cmp::min(buffer.len() as u32, file_size - offset) as usize;
         let cluster_size = self.sectors_per_cluster as u32 * self.bytes_per_sector as u32;
 
-        let mut cluster = entry.first_cluster();
         let skip_clusters = offset / cluster_size;
         let cluster_offset = (offset % cluster_size) as usize;
+        let (mut cluster_index, mut cluster) =
+            if hint.disk_cluster >= 2 && hint.file_cluster <= skip_clusters {
+                (hint.file_cluster, hint.disk_cluster)
+            } else {
+                (0, entry.first_cluster())
+            };
 
         // Skip to starting cluster
-        for _ in 0..skip_clusters {
+        while cluster_index < skip_clusters {
             match self.next_cluster(cluster)? {
-                Some(next) => cluster = next,
+                Some(next) => {
+                    cluster = next;
+                    cluster_index += 1;
+                }
                 None => return Ok(0),
             }
         }
+
+        hint.file_cluster = cluster_index;
+        hint.disk_cluster = cluster;
 
         let mut cluster_buffer = [0u8; 65536]; // Max cluster size (128 sectors * 512 bytes)
         let mut bytes_read = 0;
@@ -1132,8 +1233,17 @@ impl<'a> FatFilesystem<'a> {
                 .copy_from_slice(&cluster_buffer[cluster_offset..cluster_offset + copy_len]);
             bytes_read += copy_len;
 
+            if cluster_offset + copy_len < cluster_size as usize {
+                return Ok(bytes_read);
+            }
+
             match self.next_cluster(cluster)? {
-                Some(next) => cluster = next,
+                Some(next) => {
+                    cluster = next;
+                    cluster_index += 1;
+                    hint.file_cluster = cluster_index;
+                    hint.disk_cluster = cluster;
+                }
                 None => return Ok(bytes_read),
             }
         }
@@ -1173,7 +1283,12 @@ impl<'a> FatFilesystem<'a> {
 
             // Advance to the next cluster after the run
             match self.next_cluster(current)? {
-                Some(next) => cluster = next,
+                Some(next) => {
+                    cluster = next;
+                    cluster_index += run_len;
+                    hint.file_cluster = cluster_index;
+                    hint.disk_cluster = cluster;
+                }
                 None => return Ok(bytes_read),
             }
         }
@@ -1185,6 +1300,8 @@ impl<'a> FatFilesystem<'a> {
             buffer[bytes_read..bytes_read + remaining]
                 .copy_from_slice(&cluster_buffer[..remaining]);
             bytes_read += remaining;
+            hint.file_cluster = cluster_index;
+            hint.disk_cluster = cluster;
         }
 
         Ok(bytes_read)

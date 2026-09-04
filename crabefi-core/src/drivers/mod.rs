@@ -70,6 +70,8 @@ impl<T, const N: usize> ControllerRegistry<T, N> {
     /// Allocates EFI pages for the controller struct, moves it there, and
     /// stores the pointer. Returns `Err(())` on allocation failure or if
     /// the registry is full.
+    // Failure details are logged at the error site; callers only branch on success.
+    #[allow(clippy::result_unit_err)]
     pub fn register(&self, controller: T) -> Result<(), ()> {
         let size = core::mem::size_of::<T>();
         let pages = size.div_ceil(4096);
@@ -158,3 +160,13 @@ pub mod serial_regs;
 pub mod spi;
 pub mod storage;
 pub mod usb;
+
+/// Stop firmware-owned DMA before transferring control to an operating system.
+///
+/// Driver shutdown handles controller-specific teardown. Clearing bus mastering
+/// afterwards is the final safety net for devices without complete shutdown
+/// coverage or for controllers that failed to quiesce cleanly.
+pub fn quiesce_dma_for_os_handoff() {
+    pci::shutdown_drivers();
+    pci::disable_all_bus_mastering_for_handoff();
+}

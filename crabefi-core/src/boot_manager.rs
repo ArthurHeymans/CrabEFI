@@ -568,48 +568,6 @@ fn boot_uefi_entry(entry: &menu::BootEntry) {
     log::error!("Failed to boot UEFI entry");
 }
 
-/// Boot Linux from a block device (shared logic for all device types)
-///
-/// Loads the kernel, optional initrd, and command line from a FAT partition
-/// on the given block device, then boots Linux directly.
-///
-/// This is x86-only as it uses the bzImage/x86 boot protocol.
-/// On aarch64, Linux boot uses a different protocol (not yet implemented).
-#[cfg(target_arch = "x86_64")]
-fn boot_linux_from_device(
-    disk: &mut dyn crate::drivers::block::BlockDevice,
-    partition_first_lba: u64,
-    kernel_path: &str,
-    initrd_fat_path: Option<&str>,
-    cmdline: &str,
-    memory_regions: &[crate::platform::MemoryRegion],
-    acpi_rsdp: Option<u64>,
-    framebuffer: Option<&crate::platform::FramebufferConfig>,
-) -> bool {
-    match crate::linux_boot::load_linux_from_disk(
-        disk,
-        partition_first_lba,
-        kernel_path,
-        initrd_fat_path,
-        cmdline,
-        memory_regions,
-        acpi_rsdp,
-        framebuffer,
-        false, // Don't use EFI handover for direct boot
-    ) {
-        Ok(mut loaded) => {
-            log::info!("Linux loaded successfully, booting...");
-            unsafe {
-                loaded.boot_direct();
-            }
-        }
-        Err(e) => {
-            log::error!("Failed to load Linux: {:?}", e);
-            false
-        }
-    }
-}
-
 /// Boot a direct Linux entry (BLS Type #1 or GRUB)
 ///
 /// This uses the linux_boot module to load and boot the kernel directly,
@@ -673,9 +631,15 @@ fn boot_linux_entry(
     let (memory_regions, acpi_rsdp) = {
         let handoff = crate::handoff::get();
         // Copy memory regions to a local buffer (we can't borrow across the disk operations)
-        let mut regions = heapless::Vec::<crate::platform::MemoryRegion, 64>::new();
+        let mut regions = heapless::Vec::<
+            crate::platform::MemoryRegion,
+            { crate::handoff::MAX_MEMORY_REGIONS },
+        >::new();
         for region in handoff.memory_regions.iter() {
-            let _ = regions.push(*region);
+            if regions.push(*region).is_err() {
+                log::warn!("Direct Linux memory map copy is full; remaining regions omitted");
+                break;
+            }
         }
         (regions, handoff.acpi_rsdp)
     };
@@ -702,8 +666,8 @@ fn boot_linux_entry(
         return;
     }
 
-    if crate::with_disk(&entry.device_type, |disk| {
-        boot_linux_from_device(
+    let loaded = crate::with_disk(&entry.device_type, |disk| {
+        crate::linux_boot::load_linux_from_disk(
             disk,
             entry.partition.first_lba,
             &kernel_path,
@@ -712,11 +676,21 @@ fn boot_linux_entry(
             &memory_regions,
             acpi_rsdp,
             framebuffer.as_ref(),
-        );
-    })
-    .is_none()
-    {
-        log::error!("Failed to create disk for Linux boot");
+            false, // Don't use EFI handover for direct boot
+        )
+    });
+
+    match loaded {
+        Some(Ok(mut loaded)) => {
+            // The disk/controller borrow must be released before shutdown:
+            // direct boot quiesces every firmware-owned DMA engine.
+            log::info!("Linux loaded successfully, booting...");
+            unsafe {
+                loaded.boot_direct();
+            }
+        }
+        Some(Err(e)) => log::error!("Failed to load Linux: {:?}", e),
+        None => log::error!("Failed to create disk for Linux boot"),
     }
 
     // Note: We intentionally don't fall back to UEFI boot here.

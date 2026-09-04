@@ -6,10 +6,6 @@
 #![no_std]
 #![cfg_attr(target_arch = "x86_64", feature(abi_x86_interrupt))]
 #![deny(unsafe_op_in_unsafe_fn)]
-// Allow common firmware code patterns
-#![allow(clippy::result_unit_err)] // Result<(), ()> is common in embedded code
-#![allow(clippy::too_many_arguments)] // USB/hardware APIs often require many parameters
-#![allow(clippy::field_reassign_with_default)] // Clearer than complex struct initializers
 
 // Enable alloc crate for heap allocations (needed for RustCrypto)
 extern crate alloc;
@@ -74,11 +70,11 @@ pub use platform::{
     BlockDevice, BlockDeviceInfo, BlockError, BootResult, CapsuleBackend, CapsuleRegion,
     ConsoleInput, DebugOutput, DeferredBufferConfig, FirmwareInfo, FirmwareMmapWindow,
     FirmwareStorage, FirmwareStorageLocation, FirmwareStorageRegion, FmapRegion, FramebufferConfig,
-    Key, KeyState, MemoryRegion, MemoryType, PciEcamRegion, PlatformConfig, PlatformHooks,
-    ResetHandler, ResetType, Rng, RngError, RuntimeImageSource, RuntimePlatformConfig,
-    StorageBackend, StorageError, Timer, TimestampRecorder, Tpm2Device, Tpm2DeviceConfig,
-    TpmDigest, TpmError, TpmEventLogConfig, TpmLogFormat, TpmPcrBanks, VariableStoreLocator,
-    VariableStoreRegion,
+    Key, KeyState, MemoryRegion, MemoryType, PciEcamRegion, PlatformConfig, PlatformConfigBuilder,
+    PlatformHooks, ResetHandler, ResetType, Rng, RngError, RuntimeImageSource,
+    RuntimePlatformConfig, StorageBackend, StorageError, Timer, TimestampRecorder, Tpm2Device,
+    Tpm2DeviceConfig, TpmDigest, TpmError, TpmEventLogConfig, TpmLogFormat, TpmPcrBanks,
+    VariableStoreLocator, VariableStoreRegion,
 };
 
 /// Display a Secure Boot violation error on screen

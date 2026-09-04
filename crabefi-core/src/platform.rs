@@ -1485,3 +1485,212 @@ pub struct PlatformConfig<'a> {
     /// handing off to the library, removing the need for a callback.
     pub heap_pre_initialized: bool,
 }
+
+/// Builder for [`PlatformConfig`].
+///
+/// The struct-literal form requires spelling all ~20 fields even when most
+/// are `None`/empty. The builder takes the six always-required inputs in
+/// [`PlatformConfigBuilder::new`] and defaults everything else to disabled,
+/// so external firmware only names what it provides:
+///
+/// ```ignore
+/// let config = crabefi::PlatformConfigBuilder::new(
+///     &memory_map,
+///     &timer,
+///     &reset,
+///     &mut block_devices,
+///     crabefi::BUNDLED_RUNTIME_IMAGE,
+///     runtime,
+/// )
+/// .framebuffer(fb)
+/// .acpi_rsdp(rsdp)
+/// .build();
+/// crabefi::init_platform(config); // never returns
+/// ```
+pub struct PlatformConfigBuilder<'a> {
+    memory_map: &'a [MemoryRegion],
+    timer: &'a dyn Timer,
+    reset: &'a dyn ResetHandler,
+    block_devices: &'a mut [&'a mut dyn BlockDevice],
+    runtime_image: RuntimeImageSource<'a>,
+    runtime: RuntimePlatformConfig<'a>,
+    timestamp_recorder: Option<&'a dyn TimestampRecorder>,
+    variable_store_locator: Option<&'a dyn VariableStoreLocator>,
+    debug_output: Option<&'a mut dyn DebugOutput>,
+    console_input: Option<&'a mut dyn ConsoleInput>,
+    framebuffer: Option<FramebufferConfig>,
+    acpi_rsdp: Option<u64>,
+    smbios: Option<u64>,
+    fdt: Option<&'a [u8]>,
+    firmware_info: Option<FirmwareInfo>,
+    capsule_regions: &'a [CapsuleRegion],
+    capsule_backend: Option<&'a mut dyn CapsuleBackend>,
+    hooks: Option<&'a dyn PlatformHooks>,
+    rng: Option<&'a dyn Rng>,
+    ecam_regions: &'a [PciEcamRegion],
+    tpm_event_log: Option<TpmEventLogConfig<'a>>,
+    heap_pre_initialized: bool,
+}
+
+impl<'a> PlatformConfigBuilder<'a> {
+    /// Start a config with the inputs every platform must provide.
+    pub fn new(
+        memory_map: &'a [MemoryRegion],
+        timer: &'a dyn Timer,
+        reset: &'a dyn ResetHandler,
+        block_devices: &'a mut [&'a mut dyn BlockDevice],
+        runtime_image: RuntimeImageSource<'a>,
+        runtime: RuntimePlatformConfig<'a>,
+    ) -> Self {
+        Self {
+            memory_map,
+            timer,
+            reset,
+            block_devices,
+            runtime_image,
+            runtime,
+            timestamp_recorder: None,
+            variable_store_locator: None,
+            debug_output: None,
+            console_input: None,
+            framebuffer: None,
+            acpi_rsdp: None,
+            smbios: None,
+            fdt: None,
+            firmware_info: None,
+            capsule_regions: &[],
+            capsule_backend: None,
+            hooks: None,
+            rng: None,
+            ecam_regions: &[],
+            tpm_event_log: None,
+            heap_pre_initialized: false,
+        }
+    }
+
+    /// Firmware-visible boot timestamp recorder.
+    pub fn timestamp_recorder(mut self, value: &'a dyn TimestampRecorder) -> Self {
+        self.timestamp_recorder = Some(value);
+        self
+    }
+
+    /// Backend that locates persistent variable storage.
+    pub fn variable_store_locator(mut self, value: &'a dyn VariableStoreLocator) -> Self {
+        self.variable_store_locator = Some(value);
+        self
+    }
+
+    /// Debug/log output (also backs `EFI_SERIAL_IO_PROTOCOL` if alone).
+    pub fn debug_output(mut self, value: &'a mut dyn DebugOutput) -> Self {
+        self.debug_output = Some(value);
+        self
+    }
+
+    /// Keyboard/console input for `SimpleTextInput` and the boot menu.
+    pub fn console_input(mut self, value: &'a mut dyn ConsoleInput) -> Self {
+        self.console_input = Some(value);
+        self
+    }
+
+    /// Framebuffer for GOP and the boot menu.
+    pub fn framebuffer(mut self, value: FramebufferConfig) -> Self {
+        self.framebuffer = Some(value);
+        self
+    }
+
+    /// ACPI RSDP physical address.
+    pub fn acpi_rsdp(mut self, value: u64) -> Self {
+        self.acpi_rsdp = Some(value);
+        self
+    }
+
+    /// SMBIOS entry point physical address.
+    pub fn smbios(mut self, value: u64) -> Self {
+        self.smbios = Some(value);
+        self
+    }
+
+    /// Flattened Device Tree blob.
+    pub fn fdt(mut self, value: &'a [u8]) -> Self {
+        self.fdt = Some(value);
+        self
+    }
+
+    /// Firmware identity for ESRT/capsule updates.
+    pub fn firmware_info(mut self, value: FirmwareInfo) -> Self {
+        self.firmware_info = Some(value);
+        self
+    }
+
+    /// In-memory capsules to process during boot.
+    pub fn capsule_regions(mut self, value: &'a [CapsuleRegion]) -> Self {
+        self.capsule_regions = value;
+        self
+    }
+
+    /// Backend used to validate and apply pending capsules.
+    pub fn capsule_backend(mut self, value: &'a mut dyn CapsuleBackend) -> Self {
+        self.capsule_backend = Some(value);
+        self
+    }
+
+    /// Platform lifecycle callbacks.
+    pub fn hooks(mut self, value: &'a dyn PlatformHooks) -> Self {
+        self.hooks = Some(value);
+        self
+    }
+
+    /// Hardware RNG for `EFI_RNG_PROTOCOL`.
+    pub fn rng(mut self, value: &'a dyn Rng) -> Self {
+        self.rng = Some(value);
+        self
+    }
+
+    /// PCI ECAM allocations (skips ACPI MCFG/FDT discovery when set).
+    pub fn ecam_regions(mut self, value: &'a [PciEcamRegion]) -> Self {
+        self.ecam_regions = value;
+        self
+    }
+
+    /// TPM event log configuration for measured boot.
+    pub fn tpm_event_log(mut self, value: TpmEventLogConfig<'a>) -> Self {
+        self.tpm_event_log = Some(value);
+        self
+    }
+
+    /// Skip EFI/heap setup because the caller already ran it.
+    ///
+    /// See [`PlatformConfig::heap_pre_initialized`] for the contract.
+    pub fn heap_pre_initialized(mut self, value: bool) -> Self {
+        self.heap_pre_initialized = value;
+        self
+    }
+
+    /// Finish the config for [`crate::init_platform()`].
+    pub fn build(self) -> PlatformConfig<'a> {
+        PlatformConfig {
+            memory_map: self.memory_map,
+            timer: self.timer,
+            timestamp_recorder: self.timestamp_recorder,
+            reset: self.reset,
+            block_devices: self.block_devices,
+            variable_store_locator: self.variable_store_locator,
+            debug_output: self.debug_output,
+            console_input: self.console_input,
+            framebuffer: self.framebuffer,
+            acpi_rsdp: self.acpi_rsdp,
+            smbios: self.smbios,
+            fdt: self.fdt,
+            firmware_info: self.firmware_info,
+            capsule_regions: self.capsule_regions,
+            capsule_backend: self.capsule_backend,
+            hooks: self.hooks,
+            rng: self.rng,
+            ecam_regions: self.ecam_regions,
+            runtime_image: self.runtime_image,
+            runtime: self.runtime,
+            tpm_event_log: self.tpm_event_log,
+            heap_pre_initialized: self.heap_pre_initialized,
+        }
+    }
+}

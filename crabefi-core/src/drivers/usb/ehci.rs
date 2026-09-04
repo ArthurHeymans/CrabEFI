@@ -277,6 +277,8 @@ impl Qh {
     }
 
     /// Configure QH with hub support for split transactions
+    // Split-transaction parameters mirror the EHCI QH layout 1:1.
+    #[allow(clippy::too_many_arguments)]
     pub fn configure_with_hub(
         &mut self,
         device_addr: u8,
@@ -335,7 +337,7 @@ pub struct EhciController {
     /// PCI address
     pci_address: PciAddress,
     /// Pointer to capability registers (hardware MMIO region — must remain referenced)
-    #[allow(dead_code)]
+    #[allow(dead_code)] // MMIO mapping must stay referenced; reads go through op_regs.
     cap_regs: *const EhciCapRegs,
     /// Pointer to operational registers
     op_regs: *const EhciOpRegs,

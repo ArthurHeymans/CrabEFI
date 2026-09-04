@@ -1745,6 +1745,8 @@ static AHCI_CONTROLLERS: super::ControllerRegistry<AhciController, 4> =
 ///
 /// # Arguments
 /// * `dev` - The PCI device to initialize as an AHCI controller
+// Failures are logged at the error site; callers only branch on success.
+#[allow(clippy::result_unit_err)]
 pub fn init_device(dev: &pci::PciDevice) -> Result<(), ()> {
     log::info!(
         "Initializing AHCI controller at {}: {:04x}:{:04x}",
@@ -1848,6 +1850,8 @@ pub fn store_global_device(controller_index: usize, port_index: usize) -> bool {
 ///
 /// The LBA is interpreted as a device block LBA (in terms of the device's native
 /// sector size - 512 bytes for SATA, 2048 bytes for SATAPI/CD-ROM).
+// Failures are logged at the error site; callers only branch on success.
+#[allow(clippy::result_unit_err)]
 pub fn global_read_sectors(lba: u64, buffer: &mut [u8]) -> Result<(), ()> {
     let (controller_index, port_index) = match *GLOBAL_AHCI_DEVICE.lock() {
         Some(device) => (device.controller_index, device.port_index),

@@ -61,13 +61,13 @@ checksum = "9330f8b2ff13f34540b44e946ef35111825727b38d33286ef986142615121801"
 
 [[package]]
 name = "cms"
-version = "0.2.3"
+version = "0.3.0-pre.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7b77c319abfd5219629c45c34c89ba945ed3c5e49fcde9d16b6c3885f118a730"
+checksum = "986e7713348fbe5322df18082d73a0ad53a2946dbb7a02452cf3622b83b91e7c"
 dependencies = [
- "const-oid 0.9.6",
- "der 0.7.10",
- "spki 0.7.3",
+ "const-oid 0.10.2",
+ "der 0.8.1",
+ "spki 0.8.0",
  "x509-cert",
 ]
 
@@ -105,11 +105,11 @@ dependencies = [
  "atomic_refcell",
  "bitflags",
  "cms",
- "const-oid 0.9.6",
+ "const-oid 0.10.2",
  "crabefi-efi-types",
  "crabefi-runtime-abi",
  "crabefi-runtime-bundle",
- "der 0.7.10",
+ "der 0.8.1",
  "fdt",
  "heapless 0.9.3",
  "linked_list_allocator",
@@ -124,9 +124,8 @@ dependencies = [
  "rsa",
  "sha1",
  "sha2",
- "signature",
+ "signature 3.0.0",
  "spin 0.12.2",
- "spki 0.8.0",
  "tock-registers",
  "x509-cert",
  "x86_64",
@@ -174,9 +173,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e7c1832837b905bbfb5101e07cc24c8deddf52f93225eee6ead5f4d63d53ddcb"
 dependencies = [
  "const-oid 0.9.6",
- "der_derive",
- "flagset",
- "pem-rfc7468",
  "zeroize",
 ]
 
@@ -187,13 +183,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a69dedd701da44b0536442edf09c81a64b0ab97a7a4a5e3d1971f00027cbc63d"
 dependencies = [
  "const-oid 0.10.2",
+ "der_derive",
+ "flagset",
+ "zeroize",
 ]
 
 [[package]]
 name = "der_derive"
-version = "0.7.3"
+version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8034092389675178f570469e6c3b0465d3d30b4505c294a6550db47f3c17ad18"
+checksum = "59600e2c2d636fde9b65e99cc6445ac770c63d3628195ff39932b8d6d7409903"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -264,7 +263,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0bfb9eb618601c89945a70e254898da93b13be0388091d42117462b265bb3fad"
 dependencies = [
  "hash32",
- "serde",
  "stable_deref_trait",
 ]
 
@@ -421,12 +419,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "once_cell"
-version = "1.21.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
-
-[[package]]
 name = "paste"
 version = "1.0.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -440,15 +432,6 @@ checksum = "f0c2a105c657261a938ff68ee231c199a3d80eef33976004829de761ef5b1a9b"
 dependencies = [
  "bit_field",
  "bitflags",
-]
-
-[[package]]
-name = "pem-rfc7468"
-version = "0.7.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "88b39c9bfcfc231068454382784bb460aae594343fb030d46e9f50a645418412"
-dependencies = [
- "base64ct",
 ]
 
 [[package]]
@@ -532,27 +515,44 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ec0be4795e2f6a28069bec0b5ff3e2ac9bafc99e6a9a7dc3547996c5c816922c"
 
 [[package]]
+name = "rflasher-chip-types"
+version = "0.1.0"
+source = "git+https://github.com/ArthurHeymans/rflasher.git?rev=a06d37b6c45a59b68a3a01b7b8abee73a10ea8a0#a06d37b6c45a59b68a3a01b7b8abee73a10ea8a0"
+dependencies = [
+ "bitflags",
+ "heapless 0.8.0",
+]
+
+[[package]]
 name = "rflasher-core"
 version = "0.1.0"
-source = "git+https://github.com/ArthurHeymans/rflasher.git?rev=2f0b625865c0a530b3f151166be95319543e2aff#2f0b625865c0a530b3f151166be95319543e2aff"
+source = "git+https://github.com/ArthurHeymans/rflasher.git?rev=a06d37b6c45a59b68a3a01b7b8abee73a10ea8a0#a06d37b6c45a59b68a3a01b7b8abee73a10ea8a0"
 dependencies = [
  "bitflags",
  "embedded-io",
  "embedded-io-async",
- "heapless 0.8.0",
  "log",
  "maybe-async",
- "once_cell",
+ "rflasher-chip-types",
  "zerocopy",
 ]
 
 [[package]]
 name = "rflasher-internal"
 version = "0.1.0"
-source = "git+https://github.com/ArthurHeymans/rflasher.git?rev=2f0b625865c0a530b3f151166be95319543e2aff#2f0b625865c0a530b3f151166be95319543e2aff"
+source = "git+https://github.com/ArthurHeymans/rflasher.git?rev=a06d37b6c45a59b68a3a01b7b8abee73a10ea8a0#a06d37b6c45a59b68a3a01b7b8abee73a10ea8a0"
 dependencies = [
  "log",
  "rflasher-core",
+ "rflasher-pci",
+]
+
+[[package]]
+name = "rflasher-pci"
+version = "0.1.0"
+source = "git+https://github.com/ArthurHeymans/rflasher.git?rev=a06d37b6c45a59b68a3a01b7b8abee73a10ea8a0#a06d37b6c45a59b68a3a01b7b8abee73a10ea8a0"
+dependencies = [
+ "pci_types",
 ]
 
 [[package]]
@@ -569,7 +569,7 @@ dependencies = [
  "pkcs1",
  "pkcs8",
  "rand_core",
- "signature",
+ "signature 2.2.0",
  "spki 0.7.3",
  "subtle",
  "zeroize",
@@ -586,35 +586,6 @@ name = "scopeguard"
 version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
-
-[[package]]
-name = "serde"
-version = "1.0.229"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4148590afebada386688f18773da617792bf2ef03ffc1e4cbd2b1d45b023e0ba"
-dependencies = [
- "serde_core",
-]
-
-[[package]]
-name = "serde_core"
-version = "1.0.229"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "67dca2c9c51e58a4791a4b1ed58308b39c64224d349a935ab5039aa360942a48"
-dependencies = [
- "serde_derive",
-]
-
-[[package]]
-name = "serde_derive"
-version = "1.0.229"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e7a5d71263a5a7d47b41f6b3f06ba276f10cc18b0931f1799f710578e2309348"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 3.0.3",
-]
 
 [[package]]
 name = "sha1"
@@ -647,6 +618,12 @@ dependencies = [
  "digest",
  "rand_core",
 ]
+
+[[package]]
+name = "signature"
+version = "3.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "28d567dcbaf0049cb8ac2608a76cd95ff9e4412e1899d389ee400918ca7537f5"
 
 [[package]]
 name = "smallvec"
@@ -694,6 +671,7 @@ version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1d9efca8738c78ee9484207732f728b1ef517bbb1833d6fc0879ca898a522f6f"
 dependencies = [
+ "base64ct",
  "der 0.8.1",
 ]
 
@@ -732,17 +710,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "syn"
-version = "3.0.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "53e9bae58849f64dfa4f5d5ae372c8341f7305f82a3868709269343628b659a3"
-dependencies = [
- "proc-macro2",
- "quote",
- "unicode-ident",
-]
-
-[[package]]
 name = "tock-registers"
 version = "0.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -774,13 +741,13 @@ checksum = "442887c63f2c839b346c192d047a7c87e73d0689c9157b00b53dcc27dd5ea793"
 
 [[package]]
 name = "x509-cert"
-version = "0.2.5"
+version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1301e935010a701ae5f8655edc0ad17c44bad3ac5ce8c39185f75453b720ae94"
+checksum = "105ef4642d9cb137ef83d623d0e4bf08b8adf69e9918ca904a174adb6d3d038b"
 dependencies = [
- "const-oid 0.9.6",
- "der 0.7.10",
- "spki 0.7.3",
+ "const-oid 0.10.2",
+ "der 0.8.1",
+ "spki 0.8.0",
 ]
 
 [[package]]

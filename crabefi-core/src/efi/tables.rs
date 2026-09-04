@@ -28,34 +28,50 @@ pub fn with_tables_mut<R>(f: impl FnOnce(&mut Tables) -> R) -> R {
     TABLES.with_mut(f)
 }
 
+/// Failure to allocate the fixed-size EFI state tables.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TableInitError;
+
+impl core::fmt::Display for TableInitError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "out of memory while allocating EFI state tables")
+    }
+}
+
 /// Allocate fixed-size EFI state tables after heap startup.
 ///
 /// All tables keep their maximum length so their backing storage never moves.
 /// Variable payloads remain empty until a variable is loaded or written.
 ///
-/// # Returns
-/// `true` when every table is ready.
-pub fn init_caches() -> bool {
+/// # Errors
+///
+/// Returns [`TableInitError`] when the heap cannot back any of the tables.
+pub fn init_caches() -> Result<(), TableInitError> {
     with_tables_mut(|efi| {
-        init_entries(&mut efi.handles, MAX_HANDLES, HandleEntry::empty)
-            && init_entries(&mut efi.events, MAX_EVENTS, EventEntry::empty)
-            && init_entries(
-                &mut efi.loaded_images,
-                MAX_LOADED_IMAGES,
-                LoadedImageEntry::empty,
-            )
+        init_entries(&mut efi.handles, MAX_HANDLES, HandleEntry::empty)?;
+        init_entries(&mut efi.events, MAX_EVENTS, EventEntry::empty)?;
+        init_entries(
+            &mut efi.loaded_images,
+            MAX_LOADED_IMAGES,
+            LoadedImageEntry::empty,
+        )?;
+        Ok(())
     })
 }
 
-fn init_entries<T>(entries: &mut Vec<T>, len: usize, init: impl FnMut() -> T) -> bool {
+fn init_entries<T>(
+    entries: &mut Vec<T>,
+    len: usize,
+    init: impl FnMut() -> T,
+) -> Result<(), TableInitError> {
     if !entries.is_empty() {
-        return true;
+        return Ok(());
     }
     if entries.try_reserve_exact(len).is_err() {
-        return false;
+        return Err(TableInitError);
     }
     entries.resize_with(len, init);
-    true
+    Ok(())
 }
 
 /// Maximum number of handles we can track
@@ -116,21 +132,38 @@ pub enum TimerType {
 }
 
 impl TryFrom<u32> for TimerType {
-    type Error = u32;
+    type Error = InvalidTimerType;
 
     fn try_from(value: u32) -> Result<Self, Self::Error> {
         match value {
             0 => Ok(TimerType::Cancel),
             1 => Ok(TimerType::Periodic),
             2 => Ok(TimerType::Relative),
-            other => Err(other),
+            other => Err(InvalidTimerType(other)),
         }
+    }
+}
+
+/// Rejected [`TimerType`] value from an EFI caller.
+///
+/// Carries the offending raw value so callers can log it instead of
+/// silently dropping it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InvalidTimerType(pub u32);
+
+impl core::fmt::Display for InvalidTimerType {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "invalid TimerType value {}", self.0)
     }
 }
 
 /// Event entry for tracking created events
 #[derive(Clone, Copy)]
 pub struct EventEntry {
+    /// Whether this slot currently holds a live EFI event.
+    pub in_use: bool,
+    /// Generation encoded into dynamic handles to reject stale slot aliases.
+    pub generation: usize,
     pub event_type: u32,
     pub notify_tpl: efi::Tpl,
     pub signaled: bool,
@@ -152,6 +185,8 @@ pub struct EventEntry {
 impl EventEntry {
     pub const fn empty() -> Self {
         Self {
+            in_use: false,
+            generation: 0,
             event_type: 0,
             notify_tpl: 0,
             signaled: false,
@@ -231,8 +266,6 @@ pub struct Tables {
 
     /// Event database, allocated after heap startup.
     pub events: Vec<EventEntry>,
-    /// Next event ID (starting at 2, 1 is reserved for keyboard)
-    pub next_event_id: usize,
 
     /// Loaded images database, allocated after heap startup.
     pub loaded_images: Vec<LoadedImageEntry>,
@@ -253,7 +286,6 @@ impl Tables {
             handle_count: 0,
             next_handle: 1,
             events: Vec::new(),
-            next_event_id: 2, // Start at 2, reserve 1 for keyboard
             loaded_images: Vec::new(),
             monotonic_count: 0,
             ready_to_boot_signaled: false,

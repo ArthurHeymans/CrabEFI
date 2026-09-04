@@ -492,6 +492,9 @@ pub fn build_and_verify_chain(
 }
 
 /// Recursively build the certificate chain
+// Chain state threads through each recursion level; grouping it would hide
+// which state each level reads versus mutates.
+#[allow(clippy::too_many_arguments)]
 fn build_chain_recursive(
     current_cert: &Certificate,
     current_cert_der: &[u8],

@@ -37,6 +37,7 @@ mod cfr_menu;
 mod fmap;
 mod framebuffer;
 mod memory;
+mod memory_map;
 #[cfg(feature = "external-runtime-image")]
 mod runtime_blob;
 mod tables;
@@ -48,11 +49,35 @@ use core::panic::PanicInfo;
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 // ============================================================================
-// Memory map size limit (matches crabefi::handoff::MAX_MEMORY_REGIONS + MMIO headroom)
+// Memory map size limit
 // ============================================================================
 
 /// Maximum number of platform memory regions we can pass to init_platform().
-const MAX_MEMORY_REGIONS: usize = 96;
+const MAX_MEMORY_REGIONS: usize = crabefi::handoff::MAX_MEMORY_REGIONS;
+
+impl memory_map::Region for crabefi::MemoryRegion {
+    type Kind = crabefi::MemoryType;
+
+    fn base(self) -> u64 {
+        self.base
+    }
+
+    fn size(self) -> u64 {
+        self.size
+    }
+
+    fn kind(self) -> Self::Kind {
+        self.region_type
+    }
+
+    fn from_parts(base: u64, size: u64, region_type: Self::Kind) -> Self {
+        Self {
+            base,
+            size,
+            region_type,
+        }
+    }
+}
 
 fn runtime_image_source() -> crabefi::RuntimeImageSource<'static> {
     #[cfg(feature = "bundled-runtime-image")]
@@ -476,6 +501,11 @@ fn convert_memory_map(
     let mut count = 0;
     for region in cb_map {
         if count >= MAX_MEMORY_REGIONS {
+            log::warn!(
+                "Coreboot memory map has {} regions but only {} fit; truncating the remainder",
+                cb_map.len(),
+                MAX_MEMORY_REGIONS
+            );
             break;
         }
         out[count] = convert_memory_region(region);
@@ -820,8 +850,18 @@ pub extern "C" fn rust_main(coreboot_table_ptr: u64) -> ! {
         Some(recorder)
     });
 
-    if let Some(fb) = cb_info.framebuffer {
-        crabefi::handoff::store_framebuffer(crabefi::FramebufferConfig::from(fb));
+    // A zero-size (or null-address) framebuffer descriptor is malformed.
+    // It must disable the framebuffer everywhere — handoff, logging, GOP,
+    // and the memory-map overlay — or consumers and descriptors disagree.
+    // Validated once here so all downstream sites share one decision. Note:
+    // logging is not initialized yet at this point, so the warning for the
+    // malformed case is emitted after `logger::init()` below.
+    let validated_framebuffer = cb_info
+        .framebuffer
+        .map(crabefi::FramebufferConfig::from)
+        .filter(|fb| fb.size() != 0 && fb.physical_address != 0);
+    if let Some(fb) = validated_framebuffer {
+        crabefi::handoff::store_framebuffer(fb);
     }
 
     if let Some(addr) = cb_info.framebuffer_record_addr {
@@ -842,14 +882,9 @@ pub extern "C" fn rust_main(coreboot_table_ptr: u64) -> ! {
         crabefi::drivers::spi::qemu::configure_pflash(host_base, flash_size);
     }
 
-    // Store memory regions and ACPI RSDP (used by direct Linux boot path
-    // and by ACPI discovery after heap init).
-    crabefi::handoff::with_mut(|h| {
-        for region in cb_info.memory_map.iter() {
-            let _ = h.memory_regions.push(convert_memory_region(region));
-        }
-        h.acpi_rsdp = cb_info.acpi_rsdp;
-    });
+    // Store the ACPI RSDP for discovery after heap initialization. The direct
+    // Linux memory map is stored after the framebuffer overlay is finalized.
+    crabefi::handoff::with_mut(|h| h.acpi_rsdp = cb_info.acpi_rsdp);
 
     // ================================================================
     // Phase 3: Initialize serial and logging
@@ -885,8 +920,14 @@ pub extern "C" fn rust_main(coreboot_table_ptr: u64) -> ! {
     crabefi::logger::init();
     apply_early_log_level(&cb_info);
 
-    if let Some(fb) = cb_info.framebuffer {
-        crabefi::logger::set_framebuffer(crabefi::FramebufferConfig::from(fb));
+    if let Some(fb) = validated_framebuffer {
+        crabefi::logger::set_framebuffer(fb);
+    } else if let Some(raw) = cb_info.framebuffer.map(crabefi::FramebufferConfig::from) {
+        log::warn!(
+            "Ignoring malformed framebuffer descriptor (addr={:#x}, size={} bytes)",
+            raw.physical_address,
+            raw.size()
+        );
     }
 
     log::info!("CrabEFI v{} starting...", env!("CARGO_PKG_VERSION"));
@@ -910,7 +951,45 @@ pub extern "C" fn rust_main(coreboot_table_ptr: u64) -> ! {
         size: 0,
         region_type: crabefi::MemoryType::Reserved,
     }; MAX_MEMORY_REGIONS];
+    let framebuffer = validated_framebuffer;
     let region_count = convert_memory_map(&cb_info.memory_map, &mut memory_regions);
+    let region_count = match framebuffer {
+        Some(framebuffer) => {
+            let count = memory_map::overlay_framebuffer_region(
+                &mut memory_regions,
+                region_count,
+                framebuffer.physical_address,
+                framebuffer.size(),
+                crabefi::MemoryType::Mmio,
+            )
+            .unwrap_or_else(|error| {
+                // EmptyFramebuffer is unreachable: malformed descriptors are
+                // filtered into `None` above. Overlay failures here mean the
+                // map cannot safely describe the display aperture, so stop
+                // rather than hand the OS a corrupt memory map.
+                panic!("Cannot safely report framebuffer MMIO: {:?}", error)
+            });
+            log::info!(
+                "Reported framebuffer MMIO region at {:#x} ({} bytes)",
+                framebuffer.physical_address,
+                framebuffer.size()
+            );
+            count
+        }
+        None => region_count,
+    };
+
+    // Direct Linux boot consumes the handoff copy rather than the EFI page
+    // allocator, so publish the same finalized, non-overlapping map to both.
+    crabefi::handoff::with_mut(|handoff| {
+        handoff.memory_regions.clear();
+        for region in &memory_regions[..region_count] {
+            handoff
+                .memory_regions
+                .push(*region)
+                .expect("finalized memory map exceeds handoff capacity");
+        }
+    });
 
     // Create timer backed by the calibrated arch counter.
     let timer = CorebootTimer {
@@ -983,7 +1062,7 @@ pub extern "C" fn rust_main(coreboot_table_ptr: u64) -> ! {
         variable_store_locator: Some(&variable_store_locator),
         debug_output: None, // Already set up via serial::init_from_config()
         console_input: None,
-        framebuffer: cb_info.framebuffer.map(crabefi::FramebufferConfig::from),
+        framebuffer,
         acpi_rsdp: cb_info.acpi_rsdp,
         smbios: cb_info.smbios,
         fdt: fdt_slice,
@@ -1055,8 +1134,8 @@ pub extern "C" fn rust_main(coreboot_table_ptr: u64) -> ! {
     // call is a no-op.
     // ================================================================
     crabefi::efi::allocator::init_from_platform(config.memory_map);
-    if !crabefi::heap::init() {
-        log::error!("Failed to initialize heap allocator!");
+    if let Err(e) = crabefi::heap::init() {
+        log::error!("Failed to initialize heap allocator: {e}");
     }
     config.heap_pre_initialized = true;
 

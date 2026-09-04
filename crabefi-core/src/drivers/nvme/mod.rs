@@ -6,6 +6,7 @@
 pub mod logic;
 
 use crate::barrier;
+use crate::drivers::mmio::MmioRegion;
 use crate::drivers::pci::{self, PciAddress, PciDevice};
 use crate::efi::dma::{DmaBuffer, DmaDirection, DmaDomain, DmaMask};
 use crate::time::{Timeout, wait_for};
@@ -145,18 +146,10 @@ pub struct NvmeRegisters {
 }
 
 /// NVMe admin commands
-#[allow(dead_code)]
 mod admin_cmd {
-    pub const DELETE_SQ: u8 = 0x00;
     pub const CREATE_SQ: u8 = 0x01;
-    pub const GET_LOG_PAGE: u8 = 0x02;
-    pub const DELETE_CQ: u8 = 0x04;
     pub const CREATE_CQ: u8 = 0x05;
     pub const IDENTIFY: u8 = 0x06;
-    pub const ABORT: u8 = 0x08;
-    pub const SET_FEATURES: u8 = 0x09;
-    pub const GET_FEATURES: u8 = 0x0A;
-    pub const ASYNC_EVENT_REQUEST: u8 = 0x0C;
     /// Security Send (for TCG Opal, IEEE 1667, etc.)
     pub const SECURITY_SEND: u8 = 0x81;
     /// Security Receive (for TCG Opal, IEEE 1667, etc.)
@@ -164,10 +157,7 @@ mod admin_cmd {
 }
 
 /// NVMe I/O commands
-#[allow(dead_code)]
 mod io_cmd {
-    pub const FLUSH: u8 = 0x00;
-    pub const WRITE: u8 = 0x01;
     pub const READ: u8 = 0x02;
 }
 
@@ -451,14 +441,17 @@ pub struct NvmeNamespace {
     pub block_size: u32,
 }
 
+/// Doorbell registers start at this MMIO offset (NVMe §3.1).
+const DOORBELL_BASE: u64 = 0x1000;
+
 /// NVMe controller
 pub struct NvmeController {
     /// PCI address (bus:device.function)
     pci_address: PciAddress,
     /// Pointer to memory-mapped registers (mutable — we write CC, AQA, ASQ, ACQ, etc.)
     regs: *mut NvmeRegisters,
-    /// MMIO base address (for doorbell access)
-    mmio_base: u64,
+    /// Bounds-checked doorbell window (queue notification registers past 0x1000).
+    doorbells: MmioRegion,
     /// Doorbell stride (in bytes)
     doorbell_stride: usize,
     /// Capability value captured before controller programming.
@@ -596,10 +589,23 @@ impl NvmeController {
             DmaBuffer::allocate_in_domain(CONTROLLER_PAGE_SIZE, DmaMask::bits64(), dma_domain)
                 .map_err(|_| NvmeError::AllocationFailed)?;
 
+        // Doorbell window covers the admin pair (queue 0) and the single I/O
+        // pair (queue 1): relative offsets [0, 3 * stride + 4). Out-of-range
+        // writes below panic with the offset instead of corrupting MMIO.
+        // SAFETY: PCI BAR base for this controller, valid for its lifetime.
+        let doorbells = unsafe {
+            MmioRegion::try_new(mmio_base + DOORBELL_BASE, 3 * doorbell_stride + 4).map_err(
+                |e| {
+                    log::error!("NVMe doorbell window invalid at {mmio_base:#x}: {e}");
+                    NvmeError::InvalidParameter
+                },
+            )?
+        };
+
         let mut controller = Self {
             pci_address: pci_dev.address,
             regs,
-            mmio_base,
+            doorbells,
             doorbell_stride,
             initial_cap: cap,
             dma_domain,
@@ -635,14 +641,15 @@ impl NvmeController {
         Ok(controller)
     }
 
-    /// Write a doorbell register (doorbells are outside the typed register struct)
+    /// Write a doorbell register (doorbells are outside the typed register struct).
+    ///
+    /// Takes a region-relative offset from [`Self::doorbell_offset`]; the
+    /// bounds check turns a driver bug into a panic instead of a wild MMIO write.
     #[inline]
     fn write_doorbell(&self, offset: u64, value: u32) {
         // Order queue-memory updates before notifying the controller through MMIO.
         barrier::mmio_write();
-        unsafe {
-            ptr::write_volatile((self.mmio_base + offset) as *mut u32, value);
-        }
+        self.doorbells.write32(offset, value);
     }
 
     /// Write a 64-bit NVMe queue-base register as ordered low/high DWORDs.
@@ -663,11 +670,10 @@ impl NvmeController {
         u64::from(low.get()) | (u64::from(high.get()) << 32)
     }
 
-    /// Get doorbell register offset for a queue
+    /// Get doorbell register offset for a queue, relative to [`DOORBELL_BASE`].
     fn doorbell_offset(&self, queue_id: u16, is_completion: bool) -> u64 {
-        let base = 0x1000u64;
         let idx = (queue_id as u64) * 2 + if is_completion { 1 } else { 0 };
-        base + idx * (self.doorbell_stride as u64)
+        idx * (self.doorbell_stride as u64)
     }
 
     /// Ring the submission queue doorbell
@@ -1561,6 +1567,8 @@ static NVME_CONTROLLERS: super::ControllerRegistry<NvmeController, 4> =
 ///
 /// # Arguments
 /// * `dev` - The PCI device to initialize as an NVMe controller
+// Failures are logged at the error site; callers only branch on success.
+#[allow(clippy::result_unit_err)]
 pub fn init_device(dev: &pci::PciDevice) -> Result<(), ()> {
     log::info!(
         "Initializing NVMe controller at {}: {:04x}:{:04x}",
@@ -1672,6 +1680,8 @@ pub fn store_global_device(controller_index: usize, nsid: u32) -> bool {
 ///
 /// This function is used as the read callback for the SimpleFileSystem protocol.
 /// Supports reading multiple sectors by inferring sector count from buffer size.
+// Failures are logged at the error site; callers only branch on success.
+#[allow(clippy::result_unit_err)]
 pub fn global_read_sectors(lba: u64, buffer: &mut [u8]) -> Result<(), ()> {
     // Get the device info
     let (controller_index, nsid) = match *GLOBAL_NVME_DEVICE.lock() {

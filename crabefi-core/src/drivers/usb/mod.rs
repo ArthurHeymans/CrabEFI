@@ -172,6 +172,8 @@ fn register_controller<T>(
 ///
 /// # Arguments
 /// * `dev` - The PCI device to initialize as a USB controller
+// Failures are logged at the error site; callers only branch on success.
+#[allow(clippy::result_unit_err)]
 pub fn init_device(dev: &pci::PciDevice) -> Result<(), ()> {
     let mut controllers = ALL_CONTROLLERS.lock();
 
@@ -449,6 +451,10 @@ where
 impl UsbController for XhciController {
     fn controller_type(&self) -> &'static str {
         "xHCI"
+    }
+
+    fn max_bulk_transfer_size(&self) -> usize {
+        1024 * 1024
     }
 
     fn control_transfer(

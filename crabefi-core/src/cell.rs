@@ -8,8 +8,12 @@
 //! Never hold a borrow across a call into foreign code: a loaded image entry
 //! point, an event notify function, or a platform trait object. Copy what is
 //! needed out of the cell, drop the borrow, then call.
+//!
+//! [`StaticMut`] covers the remaining case: firmware-lifetime singletons
+//! (EFI protocol tables, the Boot Services table) that are shared with EFI
+//! callers as `*mut` and therefore cannot go through borrow-checked `Local`.
 
-use core::cell::{Cell, Ref, RefCell, RefMut};
+use core::cell::{Cell, Ref, RefCell, RefMut, UnsafeCell};
 
 /// Interior-mutable cell for single-hart firmware.
 ///
@@ -95,5 +99,32 @@ impl<T: Copy> LocalCell<T> {
     #[inline]
     pub fn as_ptr(&self) -> *mut T {
         self.0.as_ptr()
+    }
+}
+
+/// Raw mutable cell for firmware-lifetime singletons shared as `*mut`.
+///
+/// Unlike [`Local`], this performs no borrow checking: callers get a raw
+/// pointer and must uphold the usual single-hart discipline (no concurrent
+/// access, no aliasing `&mut`). Use it only for objects that EFI callers
+/// require as `*mut` — protocol tables, the Boot Services table — where a
+/// borrow-checked cell cannot be held across the foreign call anyway.
+pub struct StaticMut<T>(UnsafeCell<T>);
+
+// SAFETY: same single-hart invariant as `Local`; all access is serialized by
+// firmware control flow, never from interrupt context or a second hart.
+unsafe impl<T> Send for StaticMut<T> {}
+unsafe impl<T> Sync for StaticMut<T> {}
+
+impl<T> StaticMut<T> {
+    /// Wrap a value.
+    pub const fn new(value: T) -> Self {
+        Self(UnsafeCell::new(value))
+    }
+
+    /// Raw pointer to the value, valid for the firmware lifetime.
+    #[inline]
+    pub const fn get(&self) -> *mut T {
+        self.0.get()
     }
 }
