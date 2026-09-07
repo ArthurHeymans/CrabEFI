@@ -148,7 +148,7 @@ dependencies = [
  "sha1",
  "sha2",
  "signature 3.0.0",
- "spin 0.12.2",
+ "spin 0.12.3",
  "tock-registers",
  "x509-cert",
  "x86_64",
@@ -689,9 +689,9 @@ checksum = "3763264f6b73151db08c50ff20d7d8a0b8796e021cdea7ceedad07b80155fa0e"
 
 [[package]]
 name = "spin"
-version = "0.12.2"
+version = "0.12.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8abadc99fd9c7bbb7d0ca2b31d72a067d0c0dcd7aad25ab8cac71ba91417694b"
+checksum = "0134f9043ed38b087ac4f7d4af44c79e2c9e5094421fe3164f435ce585953b10"
 dependencies = [
  "lock_api",
 ]
