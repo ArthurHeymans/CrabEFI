@@ -7,6 +7,10 @@ use crate::drivers::block::{BlockDevice, BlockError};
 use alloc::vec::Vec;
 use zerocopy::{FromBytes, Immutable, KnownLayout, Unaligned};
 
+#[cfg(test)]
+#[path = "gpt_tests.rs"]
+mod tests;
+
 /// Maximum supported block size (4KB - handles most devices including CD-ROMs)
 const MAX_BLOCK_SIZE: usize = 4096;
 
@@ -299,60 +303,73 @@ impl From<BlockError> for GptError {
 
 /// Read and parse the GPT header
 ///
-/// Handles both standard disks (512-byte sectors) and hybrid ISOs on CD-ROMs
-/// (2048-byte sectors with GPT embedded at byte offset 512).
+/// Handles native logical sectors (including 4Kn) and hybrid ISO images.
 pub fn read_gpt_header(device: &mut dyn BlockDevice) -> Result<GptHeader, GptError> {
-    // Use device's actual block size, capped at MAX_BLOCK_SIZE
-    let info = device.info();
-    let block_size = (info.block_size as usize).min(MAX_BLOCK_SIZE);
+    read_gpt_layout(device).map(|(header, _)| header)
+}
 
-    // Allocate buffer large enough for any supported block size
-    let mut buffer = [0u8; MAX_BLOCK_SIZE];
-
-    // For devices with block sizes > 512 bytes (like CD-ROMs), the GPT on hybrid
-    // ISOs is at byte offset 512, which is inside the first block (LBA 0).
-    // For standard 512-byte sector devices, GPT is at LBA 1.
-    let (lba, gpt_offset) = if block_size > MIN_BLOCK_SIZE {
-        // Hybrid ISO: GPT header at byte 512 (inside LBA 0)
-        (0, MIN_BLOCK_SIZE)
-    } else {
-        // Standard disk: GPT header at LBA 1
-        (1, 0)
-    };
-
-    log::debug!(
-        "Reading GPT header from LBA {} offset {} (block_size={})...",
-        lba,
-        gpt_offset,
-        block_size
-    );
-
-    device.read_block(lba, &mut buffer[..block_size])?;
-
-    // Parse header from the appropriate offset using zerocopy
-    let header = GptHeader::read_from_prefix(&buffer[gpt_offset..])
-        .map_err(|_| GptError::InvalidHeader)?
-        .0;
-
-    // Copy fields for logging to avoid reference to packed struct
-    let signature = header.signature;
-    let revision = header.revision;
-    let num_partition_entries = header.num_partition_entries;
-    let partition_entry_size = header.partition_entry_size;
-
-    if !header.is_valid() {
-        log::debug!("Invalid GPT signature: {:#018x}", signature);
+/// Prefer native GPT at device LBA 1. Only use 512-byte ISO addressing when
+/// a header is actually found at byte 512; block size alone cannot identify it.
+/// Keep this decision shared by discovery and measured boot.
+fn read_gpt_layout(device: &mut dyn BlockDevice) -> Result<(GptHeader, bool), GptError> {
+    let block_size = device.info().block_size as usize;
+    if !(MIN_BLOCK_SIZE..=MAX_BLOCK_SIZE).contains(&block_size) || !block_size.is_power_of_two() {
         return Err(GptError::InvalidHeader);
     }
+    let mut buffer = [0u8; MAX_BLOCK_SIZE];
+    device.read_block(1, &mut buffer[..block_size])?;
+    let header = GptHeader::read_from_prefix(&buffer[..block_size])
+        .map_err(|_| GptError::InvalidHeader)?
+        .0;
+    if header.is_valid() {
+        return Ok((header, false));
+    }
+    if block_size > MIN_BLOCK_SIZE {
+        device.read_block(0, &mut buffer[..block_size])?;
+        let header = GptHeader::read_from_prefix(&buffer[MIN_BLOCK_SIZE..block_size])
+            .map_err(|_| GptError::InvalidHeader)?
+            .0;
+        if header.is_valid() {
+            return Ok((header, true));
+        }
+    }
+    Err(GptError::InvalidHeader)
+}
 
-    log::debug!(
-        "GPT Header: revision={:#x}, entries={}, entry_size={}",
-        revision,
-        num_partition_entries,
-        partition_entry_size
-    );
-
-    Ok(header)
+/// Validate and translate a partition without rounding away a byte offset.
+/// The block-device partition abstraction can expose only whole native blocks.
+fn partition_lba_range(
+    info: crate::drivers::block::BlockDeviceInfo,
+    entry: &GptPartitionEntry,
+    is_hybrid: bool,
+) -> Result<(u64, u64), GptError> {
+    let block_size = u64::from(info.block_size);
+    let unit = if is_hybrid {
+        MIN_BLOCK_SIZE as u64
+    } else {
+        block_size
+    };
+    if block_size == 0 || entry.first_lba > entry.last_lba {
+        return Err(GptError::InvalidHeader);
+    }
+    let start = entry
+        .first_lba
+        .checked_mul(unit)
+        .ok_or(GptError::InvalidHeader)?;
+    let end = entry
+        .last_lba
+        .checked_add(1)
+        .and_then(|end| end.checked_mul(unit))
+        .ok_or(GptError::InvalidHeader)?;
+    if !start.is_multiple_of(block_size) || !end.is_multiple_of(block_size) {
+        return Err(GptError::InvalidHeader);
+    }
+    let first_lba = start / block_size;
+    let last_lba = end / block_size - 1;
+    if last_lba >= info.num_blocks {
+        return Err(GptError::InvalidHeader);
+    }
+    Ok((first_lba, last_lba))
 }
 
 /// Build an `EFI_GPT_DATA` event payload for TCG measured boot.
@@ -367,7 +384,7 @@ pub fn build_gpt_measurement_event(
 ) -> Result<Vec<u8>, GptError> {
     let info = device.info();
     let block_size = (info.block_size as usize).clamp(MIN_BLOCK_SIZE, MAX_BLOCK_SIZE);
-    let is_hybrid = block_size > MIN_BLOCK_SIZE;
+    let (_, is_hybrid) = read_gpt_layout(device)?;
 
     let entry_size = header.partition_entry_size as usize;
     let (entries_byte_offset, total_entries, total_bytes_needed) =
@@ -407,6 +424,7 @@ pub fn build_gpt_measurement_event(
             .map_err(|_| GptError::InvalidHeader)?
             .0;
         if !entry.is_empty() {
+            partition_lba_range(info, &entry, is_hybrid)?;
             raw_entries.extend_from_slice(&entry_buf);
         }
     }
@@ -440,9 +458,8 @@ pub fn read_partitions(
     let info = device.info();
     let block_size = (info.block_size as usize).clamp(MIN_BLOCK_SIZE, MAX_BLOCK_SIZE);
 
-    // For hybrid ISOs on large-block devices, the GPT's LBA values are in 512-byte terms.
-    // We need to translate to actual device blocks.
-    let is_hybrid = block_size > MIN_BLOCK_SIZE;
+    // Detect the on-disk layout rather than treating all large sectors as ISO media.
+    let (_, is_hybrid) = read_gpt_layout(device)?;
 
     let entry_size = header.partition_entry_size as usize;
     if entry_size < core::mem::size_of::<GptPartitionEntry>() || entry_size > MAX_BLOCK_SIZE {
@@ -503,14 +520,7 @@ pub fn read_partitions(
             .0;
 
         if !entry.is_empty() {
-            // For hybrid ISOs, translate GPT LBAs (512-byte terms) to device LBAs.
-            let (first_lba, last_lba) = if is_hybrid {
-                let first = entry.first_lba * MIN_BLOCK_SIZE as u64 / block_size as u64;
-                let last = entry.last_lba * MIN_BLOCK_SIZE as u64 / block_size as u64;
-                (first, last)
-            } else {
-                (entry.first_lba, entry.last_lba)
-            };
+            let (first_lba, last_lba) = partition_lba_range(info, &entry, is_hybrid)?;
 
             let partition = Partition {
                 type_guid: entry.type_guid,
