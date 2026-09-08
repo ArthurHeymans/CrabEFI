@@ -59,7 +59,7 @@ pub(super) fn event_handle(event_id: usize, generation: usize) -> efi::Event {
     (generation * MAX_EVENTS + event_id) as *mut c_void
 }
 
-fn event_id_for_handle(events: &[EventEntry], event: efi::Event) -> Option<usize> {
+pub(super) fn event_id_for_handle(events: &[EventEntry], event: efi::Event) -> Option<usize> {
     let raw = event as usize;
     if raw == KEYBOARD_EVENT_ID {
         return Some(KEYBOARD_EVENT_ID);
@@ -243,52 +243,13 @@ pub(super) extern "efiapi" fn wait_for_event(
     loop {
         // Check each event
         for (i, &evt) in events_to_wait.iter().enumerate() {
-            let Some(event_id) =
-                with_tables_mut(|efi_state| event_id_for_handle(&efi_state.events, evt))
-            else {
-                return Status::INVALID_PARAMETER;
-            };
-
-            // Check if it's the keyboard event and there's actual key input.
-            // We do a real read-ahead (not just peek at status registers) to
-            // avoid false positives from modifier keys, mouse data, etc.
-            if event_id == KEYBOARD_EVENT_ID
-                && crate::efi::protocols::console::keyboard_check_ready()
-            {
-                unsafe { *index = i };
-                log::debug!("  -> SUCCESS (keyboard input ready, index={})", i);
-                return Status::SUCCESS;
-            }
-
-            // Check if it's the pointer event and there's mouse input.
-            #[cfg(feature = "ui")]
-            if event_id == POINTER_EVENT_ID
-                && crate::efi::protocols::simple_pointer::pointer_check_ready()
-            {
-                unsafe { *index = i };
-                log::debug!("  -> SUCCESS (pointer input ready, index={})", i);
-                return Status::SUCCESS;
-            }
-
-            // Check if a regular dynamic event is signaled, including timers.
-            if event_id >= FIRST_DYNAMIC_EVENT_ID {
-                notify_wait_event(event_id, evt);
-                check_timer_event(event_id);
-
-                // Per UEFI spec: WaitForEvent clears the signaled state
-                // of the event that triggered the return.
-                let signaled = with_tables_mut(|efi_state| {
-                    let was_signaled = efi_state.events[event_id].signaled;
-                    if was_signaled {
-                        efi_state.events[event_id].signaled = false;
-                    }
-                    was_signaled
-                });
-                if signaled {
+            match check_event(evt) {
+                Status::SUCCESS => {
                     unsafe { *index = i };
-                    log::debug!("  -> SUCCESS (event signaled, index={})", i);
                     return Status::SUCCESS;
                 }
+                Status::NOT_READY => continue,
+                status => return status,
             }
         }
 
@@ -378,84 +339,65 @@ pub(super) extern "efiapi" fn check_event(event: efi::Event) -> Status {
     };
     log::trace!("BS.CheckEvent(event={:?}, slot={})", event, event_id);
 
-    // Special case for keyboard event — do a real read-ahead check
-    if event_id == KEYBOARD_EVENT_ID {
-        if crate::efi::protocols::console::keyboard_check_ready() {
-            return Status::SUCCESS;
-        } else {
-            return Status::NOT_READY;
+    // Poll hardware without holding a table borrow: platform input can reenter.
+    let ready = match event_id {
+        KEYBOARD_EVENT_ID => crate::efi::protocols::console::keyboard_check_ready(),
+        #[cfg(feature = "ui")]
+        POINTER_EVENT_ID => crate::efi::protocols::simple_pointer::pointer_check_ready(),
+        _ => {
+            notify_wait_event(event_id, event);
+            false
         }
-    }
+    };
 
-    // Special case for pointer event — poll hardware and peek
-    #[cfg(feature = "ui")]
-    if event_id == POINTER_EVENT_ID {
-        if crate::efi::protocols::simple_pointer::pointer_check_ready() {
-            return Status::SUCCESS;
-        } else {
-            return Status::NOT_READY;
-        }
-    }
-
-    // Check regular dynamic events.
-    if event_id >= FIRST_DYNAMIC_EVENT_ID {
-        notify_wait_event(event_id, event);
-
-        // Check timer expiration
-        check_timer_event(event_id);
-
-        // Per UEFI spec: CheckEvent clears the signaled state when
-        // returning SUCCESS (for EVT_NOTIFY_WAIT events, the notify
-        // function is called first, then the event is cleared).
-        let signaled = with_tables_mut(|efi_state| {
-            let was_signaled = efi_state.events[event_id].signaled;
-            if was_signaled {
-                efi_state.events[event_id].signaled = false;
-            }
-            was_signaled
-        });
-        if signaled {
-            return Status::SUCCESS;
-        }
-    }
-
-    Status::NOT_READY
+    with_tables_mut(|efi_state| consume_event_signal(&mut efi_state.events, event, ready))
 }
 
-/// Check if a timer event has expired and signal it if so
-fn check_timer_event(event_id: usize) {
-    with_tables_mut(|efi_state| {
-        let entry = &mut efi_state.events[event_id];
+/// Revalidate after foreign callbacks before touching timers or consuming a signal.
+fn consume_event_signal(events: &mut [EventEntry], event: efi::Event, ready: bool) -> Status {
+    let Some(event_id) = event_id_for_handle(events, event) else {
+        return Status::INVALID_PARAMETER;
+    };
+    let entry = &mut events[event_id];
+    check_timer_event(entry);
+    if ready || entry.signaled {
+        entry.signaled = false;
+        Status::SUCCESS
+    } else {
+        Status::NOT_READY
+    }
+}
 
-        // Only process timer events with an active deadline
-        if entry.event_type & EVT_TIMER == 0 || entry.timer_type == TimerType::Cancel {
-            return;
-        }
+/// Check if a timer event has expired and signal it if so.
+fn check_timer_event(entry: &mut EventEntry) {
+    // Only process timer events with an active deadline
+    if entry.event_type & EVT_TIMER == 0 || entry.timer_type == TimerType::Cancel {
+        return;
+    }
 
-        if entry.timer_deadline_tsc == 0 {
-            return;
-        }
+    if entry.timer_deadline_tsc == 0 {
+        return;
+    }
 
-        let now = crate::time::rdtsc();
-        if now >= entry.timer_deadline_tsc {
-            entry.signaled = true;
+    let now = crate::time::rdtsc();
+    if now >= entry.timer_deadline_tsc {
+        entry.signaled = true;
 
-            match entry.timer_type {
-                TimerType::Periodic => {
-                    // Reset deadline for next period
-                    let tsc_per_us = (crate::time::tsc_frequency() / 1_000_000).max(1);
-                    let us = entry.timer_trigger_time / 10;
-                    let tsc_offset = us * tsc_per_us;
-                    entry.timer_deadline_tsc = now + tsc_offset;
-                }
-                TimerType::Relative => {
-                    // One-shot: clear the deadline
-                    entry.timer_deadline_tsc = 0;
-                }
-                TimerType::Cancel => {}
+        match entry.timer_type {
+            TimerType::Periodic => {
+                // Reset deadline for next period
+                let tsc_per_us = (crate::time::tsc_frequency() / 1_000_000).max(1);
+                let us = entry.timer_trigger_time / 10;
+                let tsc_offset = us * tsc_per_us;
+                entry.timer_deadline_tsc = now + tsc_offset;
             }
+            TimerType::Relative => {
+                // One-shot: clear the deadline
+                entry.timer_deadline_tsc = 0;
+            }
+            TimerType::Cancel => {}
         }
-    });
+    }
 }
 
 /// EFI_EVENT_GROUP_READY_TO_BOOT GUID
@@ -643,12 +585,25 @@ mod tests {
         assert_eq!(event_id, KEYBOARD_EVENT_ID);
         assert!(notify.is_none());
         assert!(events[KEYBOARD_EVENT_ID].signaled);
+        assert_eq!(
+            consume_event_signal(&mut events, KEYBOARD_EVENT_ID as efi::Event, false),
+            Status::SUCCESS
+        );
+        assert_eq!(
+            consume_event_signal(&mut events, KEYBOARD_EVENT_ID as efi::Event, false),
+            Status::NOT_READY
+        );
         #[cfg(feature = "ui")]
         {
             let (event_id, _) = signal_event_entry(&mut events, POINTER_EVENT_ID as efi::Event)
                 .expect("SignalEvent must accept the static pointer event");
             assert_eq!(event_id, POINTER_EVENT_ID);
             assert!(events[POINTER_EVENT_ID].signaled);
+            assert_eq!(
+                consume_event_signal(&mut events, POINTER_EVENT_ID as efi::Event, false),
+                Status::SUCCESS
+            );
+            assert!(!events[POINTER_EVENT_ID].signaled);
         }
     }
 
@@ -733,6 +688,19 @@ mod tests {
         events[first].in_use = true;
         events[first].generation = second_generation;
         let replacement_handle = event_handle(first, second_generation);
+
+        // Model a notify callback closing itself and signaling its replacement.
+        signal_event_entry(&mut events, replacement_handle).unwrap();
+        assert_eq!(
+            consume_event_signal(&mut events, stale_handle, false),
+            Status::INVALID_PARAMETER
+        );
+        assert!(events[first].signaled);
+        assert_eq!(
+            consume_event_signal(&mut events, replacement_handle, false),
+            Status::SUCCESS
+        );
+        assert!(!events[first].signaled);
 
         assert_ne!(stale_handle, replacement_handle);
         assert_eq!(event_id_for_handle(&events, stale_handle), None);

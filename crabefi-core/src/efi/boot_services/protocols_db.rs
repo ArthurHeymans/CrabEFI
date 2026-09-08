@@ -5,10 +5,10 @@
 use super::super::guid_fmt::GuidFmt;
 use super::super::system_table;
 use super::super::tables::{
-    HandleEntry, MAX_EVENTS, MAX_PROTOCOL_NOTIFIES, ProtocolEntry, ProtocolNotifyEntry, Tables,
-    tables, with_tables_mut,
+    HandleEntry, MAX_PROTOCOL_NOTIFIES, ProtocolEntry, ProtocolNotifyEntry, Tables, tables,
+    with_tables_mut,
 };
-use super::events::signal_event;
+use super::events::{event_id_for_handle, signal_event};
 use super::{create_handle, install_protocol, protocol_open_blocks_removal, remove_protocol};
 use alloc::vec::Vec;
 use core::ffi::c_void;
@@ -153,38 +153,75 @@ pub(super) extern "efiapi" fn register_protocol_notify(
     if protocol.is_null() || registration.is_null() {
         return Status::INVALID_PARAMETER;
     }
-    let event_id = event as usize;
-    if event_id == 0 || event_id >= MAX_EVENTS {
-        return Status::INVALID_PARAMETER;
-    }
-
     let guid = unsafe { *protocol };
     log::debug!("BS.RegisterProtocolNotify(protocol={})", GuidFmt(guid));
 
-    with_tables_mut(|efi_state| {
-        if efi_state.protocol_notifies.len() >= MAX_PROTOCOL_NOTIFIES
-            || efi_state.protocol_notifies.try_reserve(1).is_err()
-        {
-            log::warn!("  -> OUT_OF_RESOURCES (notify registration table full)");
-            return Status::OUT_OF_RESOURCES;
+    match with_tables_mut(|state| register_notify(state, guid, event)) {
+        Ok(token) => {
+            unsafe { *registration = token as *mut c_void };
+            log::debug!("  -> SUCCESS (registration={:#x})", token);
+            Status::SUCCESS
         }
+        Err(status) => status,
+    }
+}
 
-        let token = efi_state.next_registration;
-        let Some(next_token) = token.checked_add(1) else {
-            return Status::OUT_OF_RESOURCES;
-        };
-        efi_state.next_registration = next_token;
-        efi_state.protocol_notifies.push(ProtocolNotifyEntry {
-            registration: token,
-            protocol: guid,
-            event,
-            cursor: 0,
-        });
+/// Validate the live event and allocate its notification registration together.
+fn register_notify(state: &mut Tables, protocol: Guid, event: efi::Event) -> Result<usize, Status> {
+    if event_id_for_handle(&state.events, event).is_none() {
+        return Err(Status::INVALID_PARAMETER);
+    }
+    if state.protocol_notifies.len() >= MAX_PROTOCOL_NOTIFIES
+        || state.protocol_notifies.try_reserve(1).is_err()
+    {
+        return Err(Status::OUT_OF_RESOURCES);
+    }
+    let token = state.next_registration;
+    state.next_registration = token.checked_add(1).ok_or(Status::OUT_OF_RESOURCES)?;
+    state.protocol_notifies.push(ProtocolNotifyEntry {
+        registration: token,
+        protocol,
+        event,
+        cursor: 0,
+    });
+    Ok(token)
+}
 
-        unsafe { *registration = token as *mut c_void };
-        log::debug!("  -> SUCCESS (registration={:#x})", token);
-        Status::SUCCESS
-    })
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::efi::boot_services::events::event_handle;
+    use crate::efi::tables::{EventEntry, MAX_EVENTS};
+
+    #[test]
+    fn notification_registration_validates_event_generations() {
+        let mut state = Tables::new();
+        state.events.resize(MAX_EVENTS, EventEntry::empty());
+        let slot = 3;
+        state.events[slot].in_use = true;
+        state.events[slot].generation = 1;
+        let event = event_handle(slot, 1);
+        let guid = Guid::from_fields(1, 2, 3, 4, 5, &[6; 6]);
+
+        assert!(register_notify(&mut state, guid, event).is_ok());
+        assert_eq!(
+            protocol_notification_events(&state, &guid).as_slice(),
+            &[event]
+        );
+        state.events[slot].generation = 2;
+        assert_eq!(
+            register_notify(&mut state, guid, event),
+            Err(Status::INVALID_PARAMETER)
+        );
+        let replacement = event_handle(slot, 2);
+        assert!(register_notify(&mut state, guid, replacement).is_ok());
+        state.events[slot].in_use = false;
+        assert_eq!(
+            register_notify(&mut state, guid, replacement),
+            Err(Status::INVALID_PARAMETER)
+        );
+        assert_eq!(state.protocol_notifies.len(), 2);
+    }
 }
 
 /// Collect events to signal after releasing the database borrow.
