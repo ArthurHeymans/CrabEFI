@@ -9,12 +9,13 @@ use super::super::protocols::loaded_image::{
     LOADED_IMAGE_PROTOCOL_GUID, create_loaded_image_protocol,
 };
 use super::super::system_table;
-use super::super::tables::{LoadedImageEntry, MAX_EVENTS, tables, with_tables_mut};
+use super::super::tables::{LoadedImageEntry, MAX_EVENTS, Tables, tables, with_tables_mut};
 use super::events::signal_event_group;
 use super::events::{
     EVT_SIGNAL_EXIT_BOOT_SERVICES, dynamic_event_id_for_handle, event_handle,
     measure_efi_application_return, measure_efi_application_start,
 };
+use super::protocol_open_blocks_removal;
 use crate::pe;
 use alloc::vec::Vec;
 use core::ffi::c_void;
@@ -445,6 +446,109 @@ pub(super) extern "efiapi" fn exit(
     exit_status
 }
 
+/// Detach an image only when no other agent still has a blocking open on it.
+fn detach_loaded_image(
+    state: &mut Tables,
+    image_handle: Handle,
+) -> Result<Option<LoadedImageEntry>, Status> {
+    if state.open_protocols.iter().any(|open| {
+        (open.handle == image_handle || open.controller_handle == image_handle)
+            && open.agent_handle != image_handle
+            && protocol_open_blocks_removal(open.attributes)
+    }) {
+        return Err(Status::ACCESS_DENIED);
+    }
+    let Some(entry) = state
+        .loaded_images
+        .iter_mut()
+        .find(|entry| entry.handle == image_handle)
+    else {
+        return Ok(None);
+    };
+    let image = core::mem::replace(entry, LoadedImageEntry::empty());
+    state.open_protocols.retain(|open| {
+        open.agent_handle != image_handle
+            && open.controller_handle != image_handle
+            && open.handle != image_handle
+    });
+    Ok(Some(image))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::efi::tables::OpenProtocolEntry;
+
+    #[test]
+    fn unload_preserves_images_with_external_blocking_opens() {
+        let image = 1usize as Handle;
+        let other = 2usize as Handle;
+        for attributes in [
+            efi::OPEN_PROTOCOL_BY_DRIVER,
+            efi::OPEN_PROTOCOL_BY_CHILD_CONTROLLER,
+            efi::OPEN_PROTOCOL_EXCLUSIVE,
+        ] {
+            for (handle, controller) in [(image, other), (other, image)] {
+                let mut state = Tables::new();
+                state.loaded_images.push(LoadedImageEntry {
+                    handle: image,
+                    alloc_base: 0x1000,
+                    num_pages: 1,
+                    ..LoadedImageEntry::empty()
+                });
+                state.open_protocols.push(OpenProtocolEntry {
+                    handle,
+                    protocol: LOADED_IMAGE_PROTOCOL_GUID,
+                    agent_handle: other,
+                    controller_handle: controller,
+                    attributes,
+                    open_count: 1,
+                });
+                assert!(matches!(
+                    detach_loaded_image(&mut state, image),
+                    Err(Status::ACCESS_DENIED)
+                ));
+                assert_eq!(state.loaded_images[0].handle, image);
+                assert_eq!(state.loaded_images[0].alloc_base, 0x1000);
+                assert_eq!(state.open_protocols.len(), 1);
+            }
+        }
+    }
+
+    #[test]
+    fn unload_releases_image_opens_but_preserves_unrelated_opens() {
+        let image = 1usize as Handle;
+        let other = 2usize as Handle;
+        let mut state = Tables::new();
+        state.loaded_images.push(LoadedImageEntry {
+            handle: image,
+            alloc_base: 0x1000,
+            num_pages: 1,
+            ..LoadedImageEntry::empty()
+        });
+        for (handle, agent, controller) in [
+            (other, image, other),
+            (image, image, other),
+            (other, image, image),
+            (other, other, other),
+        ] {
+            state.open_protocols.push(OpenProtocolEntry {
+                handle,
+                protocol: LOADED_IMAGE_PROTOCOL_GUID,
+                agent_handle: agent,
+                controller_handle: controller,
+                attributes: efi::OPEN_PROTOCOL_BY_DRIVER,
+                open_count: 1,
+            });
+        }
+        let detached = detach_loaded_image(&mut state, image).unwrap().unwrap();
+        assert_eq!(detached.alloc_base, 0x1000);
+        assert!(state.loaded_images[0].handle.is_null());
+        assert_eq!(state.open_protocols.len(), 1);
+        assert_eq!(state.open_protocols[0].agent_handle, other);
+    }
+}
+
 pub(super) extern "efiapi" fn unload_image(image_handle: Handle) -> Status {
     log::debug!("BS.UnloadImage(handle={:?})", image_handle);
 
@@ -453,26 +557,20 @@ pub(super) extern "efiapi" fn unload_image(image_handle: Handle) -> Status {
         return Status::INVALID_PARAMETER;
     }
 
-    // Find and remove the loaded image entry
-    let image_info = with_tables_mut(|efi_state| {
-        efi_state
-            .loaded_images
-            .iter_mut()
-            .find(|entry| entry.handle == image_handle)
-            .map(|entry| {
-                let result = (
-                    entry.alloc_base,
-                    entry.num_pages,
-                    entry.measurement_event_data,
-                );
-                // Clear the entry
-                *entry = LoadedImageEntry::empty();
-                result
-            })
-    });
+    // Validate and remove relationships before the image's pages can be reused.
+    let image_info = match with_tables_mut(|efi_state| detach_loaded_image(efi_state, image_handle))
+    {
+        Ok(info) => info,
+        Err(status) => return status,
+    };
 
     match image_info {
-        Some((alloc_base, num_pages, measurement_event_data)) => {
+        Some(LoadedImageEntry {
+            alloc_base,
+            num_pages,
+            measurement_event_data,
+            ..
+        }) => {
             // Free the image memory (using alloc_base, not image_base,
             // since the image may have been aligned within the allocation)
             let status = allocator::free_pages(alloc_base, num_pages);
