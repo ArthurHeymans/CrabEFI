@@ -29,6 +29,10 @@ impl super::XhciController {
         )?;
 
         let total_len = u16::from_le_bytes([header[2], header[3]]) as usize;
+        if total_len < header.len() {
+            log::debug!("xHCI: invalid wTotalLength {}", total_len);
+            return Err(XhciError::InvalidParameter);
+        }
         let total_len = total_len.min(config_buf.len());
 
         // Get full configuration

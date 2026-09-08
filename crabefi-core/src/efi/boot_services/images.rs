@@ -181,6 +181,9 @@ pub(super) extern "efiapi" fn load_image(
         Some(h) => h,
         None => {
             log::error!("BS.LoadImage: Failed to create handle");
+            if let Some(measurement) = deferred_measurement {
+                let _ = allocator::free_pool(measurement.event_data);
+            }
             pe::unload_image(&loaded_image);
             return Status::OUT_OF_RESOURCES;
         }

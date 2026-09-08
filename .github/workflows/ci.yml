@@ -5,6 +5,10 @@ on:
     branches: [main, master, SBSA, RISCV64]
   pull_request: {}
 
+# Least privilege: no job in this workflow needs to write to the repository.
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
 

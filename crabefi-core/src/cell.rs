@@ -109,6 +109,11 @@ impl<T: Copy> LocalCell<T> {
 /// access, no aliasing `&mut`). Use it only for objects that EFI callers
 /// require as `*mut` — protocol tables, the Boot Services table — where a
 /// borrow-checked cell cannot be held across the foreign call anyway.
+///
+/// `repr(transparent)` guarantees the payload lives at offset zero: AArch64
+/// assembly computes `_exc_stack_top` as `EXC_STACK + size`, which is only
+/// sound if the wrapper adds no padding or reordering.
+#[repr(transparent)]
 pub struct StaticMut<T>(UnsafeCell<T>);
 
 // SAFETY: same single-hart invariant as `Local`; all access is serialized by

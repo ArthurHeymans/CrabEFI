@@ -424,12 +424,14 @@ pub(super) extern "efiapi" fn locate_device_path(
         return Status::INVALID_PARAMETER;
     }
 
-    // Find a handle with both the specified protocol and a DEVICE_PATH protocol
+    // Find the handle with both the specified protocol and a DEVICE_PATH protocol.
+    // UEFI requires the longest matching prefix, so evaluate every candidate
+    // and keep the one that consumes the most bytes of the input path.
     let efi_state = tables();
 
     let found = efi_state.handles[..efi_state.handle_count]
         .iter()
-        .find_map(|entry| {
+        .filter_map(|entry| {
             let protocols = &entry.protocols[..entry.protocol_count];
 
             let has_protocol = protocols.iter().any(|p| p.guid == guid);
@@ -446,8 +448,13 @@ pub(super) extern "efiapi" fn locate_device_path(
             }
 
             let remaining = unsafe { device_path_prefix_match(handle_dp, input_dp) }?;
-            Some((entry.handle, remaining))
-        });
+            // `remaining` points into the input path past the matched prefix,
+            // so its offset from the input start is the consumed length.
+            let consumed = (remaining as usize).wrapping_sub(input_dp as usize);
+            Some((consumed, entry.handle, remaining))
+        })
+        .max_by_key(|(consumed, _, _)| *consumed)
+        .map(|(_, handle, remaining)| (handle, remaining));
 
     if let Some((handle, remaining)) = found {
         log::debug!(

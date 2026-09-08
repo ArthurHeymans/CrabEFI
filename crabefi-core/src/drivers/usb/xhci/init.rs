@@ -216,14 +216,17 @@ impl super::XhciController {
 
     /// Initialize the controller
     pub(super) fn init(&mut self) -> Result<(), XhciError> {
-        wait_for(100, || {
+        if !wait_for(100, || {
             !self
                 .registers
                 .operational
                 .usbsts
                 .read_volatile()
                 .controller_not_ready()
-        });
+        }) {
+            log::error!("xHCI: controller not ready (CNR still set)");
+            return Err(XhciError::Timeout);
+        }
 
         self.registers
             .operational
@@ -231,13 +234,16 @@ impl super::XhciController {
             .update_volatile(|command| {
                 command.clear_run_stop();
             });
-        wait_for(100, || {
+        if !wait_for(100, || {
             self.registers
                 .operational
                 .usbsts
                 .read_volatile()
                 .hc_halted()
-        });
+        }) {
+            log::error!("xHCI: controller did not halt");
+            return Err(XhciError::Timeout);
+        }
 
         self.registers
             .operational
@@ -246,7 +252,7 @@ impl super::XhciController {
                 command.set_host_controller_reset();
             });
         crate::time::delay_ms(1);
-        wait_for(500, || {
+        if !wait_for(500, || {
             !self
                 .registers
                 .operational
@@ -259,7 +265,10 @@ impl super::XhciController {
                     .usbsts
                     .read_volatile()
                     .controller_not_ready()
-        });
+        }) {
+            log::error!("xHCI: host controller reset did not complete");
+            return Err(XhciError::Timeout);
+        }
 
         self.registers
             .operational
@@ -267,8 +276,12 @@ impl super::XhciController {
             .update_volatile(|command| {
                 command.clear_interrupter_enable();
             });
+        // Enable only the slots we can actually track: slot IDs are 1-based
+        // and index directly into `slots`, so the highest usable ID is
+        // `len() - 1` (index 0 is never assigned). Programming more would let
+        // the controller hand out IDs with no table entry.
         self.registers.operational.config.update_volatile(|config| {
-            config.set_max_device_slots_enabled(self.slots.capacity() as u8);
+            config.set_max_device_slots_enabled(self.slots.len().saturating_sub(1) as u8);
         });
 
         // Allocate and set up DCBAA (Device Context Base Address Array)
