@@ -8,12 +8,17 @@
 //! Boot Services state (handles, events, loaded images) lives in
 //! [`super::tables`]. Access it via `tables()` and `with_tables_mut()`.
 
+#[cfg(test)]
+#[path = "boot_services_tests.rs"]
+mod protocol_tests;
+
 use super::allocator::{self, AllocateType, MemoryDescriptor, MemoryType};
 use super::image_loader;
 use super::protocols::loaded_image::{LOADED_IMAGE_PROTOCOL_GUID, create_loaded_image_protocol};
 use super::system_table;
 use super::tables::{
-    EventEntry, LoadedImageEntry, MAX_EVENTS, MAX_HANDLES, MAX_PROTOCOLS_PER_HANDLE, ProtocolEntry,
+    EventEntry, HandleEntry, LoadedImageEntry, MAX_EVENTS, MAX_PROTOCOL_NOTIFIES,
+    MAX_PROTOCOLS_PER_HANDLE, OpenProtocolEntry, ProtocolEntry, ProtocolNotifyEntry, Tables,
     TimerType, tables, with_tables_mut,
 };
 use crate::pe;
@@ -92,40 +97,11 @@ static mut BOOT_SERVICES: efi::BootServices = efi::BootServices {
     protocols_per_handle,
     locate_handle_buffer,
     locate_protocol,
-    // These are variadic functions - we use transmute to cast our extended-signature
-    // functions to the expected type. The caller passes all args regardless of signature.
-    install_multiple_protocol_interfaces: unsafe {
-        core::mem::transmute::<
-            extern "efiapi" fn(
-                *mut Handle,
-                *mut c_void,
-                *mut c_void,
-                *mut c_void,
-                *mut c_void,
-                *mut c_void,
-                *mut c_void,
-                *mut c_void,
-                *mut c_void,
-            ) -> Status,
-            extern "efiapi" fn(*mut Handle, *mut c_void, *mut c_void) -> Status,
-        >(install_multiple_protocol_interfaces)
-    },
-    uninstall_multiple_protocol_interfaces: unsafe {
-        core::mem::transmute::<
-            extern "efiapi" fn(
-                Handle,
-                *mut c_void,
-                *mut c_void,
-                *mut c_void,
-                *mut c_void,
-                *mut c_void,
-                *mut c_void,
-                *mut c_void,
-                *mut c_void,
-            ) -> Status,
-            extern "efiapi" fn(Handle, *mut c_void, *mut c_void) -> Status,
-        >(uninstall_multiple_protocol_interfaces)
-    },
+    // r-efi's function-pointer aliases omit the variadic tail. These entry
+    // points preserve the real UEFI ABI and parse protocol/interface pairs
+    // through the terminating NULL protocol argument.
+    install_multiple_protocol_interfaces: INSTALL_MULTIPLE_PROTOCOL_INTERFACES,
+    uninstall_multiple_protocol_interfaces: UNINSTALL_MULTIPLE_PROTOCOL_INTERFACES,
     calculate_crc32,
     copy_mem,
     set_mem,
@@ -543,6 +519,11 @@ extern "efiapi" fn close_event(event: efi::Event) -> Status {
     if event_id > 0 && event_id < MAX_EVENTS {
         with_tables_mut(|efi_state| {
             efi_state.events[event_id] = EventEntry::empty();
+            // A registration outlives its event otherwise, and would keep
+            // signaling a closed event slot on every matching install.
+            efi_state
+                .protocol_notifies
+                .retain(|notify| notify.event != event);
         });
     }
 
@@ -813,76 +794,87 @@ extern "efiapi" fn install_protocol_interface(
         return Status::INVALID_PARAMETER;
     }
 
-    // Only native interface type is supported
     if interface_type != efi::NATIVE_INTERFACE {
         return Status::INVALID_PARAMETER;
     }
 
-    let guid = unsafe { *protocol };
-    let handle_ptr = unsafe { *handle };
+    let target_handle = if unsafe { (*handle).is_null() } {
+        let Some(new_handle) = create_handle() else {
+            return Status::OUT_OF_RESOURCES;
+        };
+        unsafe { *handle = new_handle };
+        new_handle
+    } else {
+        unsafe { *handle }
+    };
 
-    with_tables_mut(|efi_state| {
-        // If handle is null, create a new handle
-        if handle_ptr.is_null() {
-            if efi_state.handle_count >= MAX_HANDLES {
-                return Status::OUT_OF_RESOURCES;
-            }
-
-            let new_handle = efi_state.next_handle as *mut c_void;
-            efi_state.next_handle += 1;
-
-            let idx = efi_state.handle_count;
-            efi_state.handles[idx].handle = new_handle;
-            efi_state.handles[idx].protocols[0] = ProtocolEntry { guid, interface };
-            efi_state.handles[idx].protocol_count = 1;
-            efi_state.handle_count += 1;
-
-            unsafe { *handle = new_handle };
-            return Status::SUCCESS;
-        }
-
-        // Find existing handle
-        if let Some(entry) = efi_state.handles[..efi_state.handle_count]
-            .iter_mut()
-            .find(|e| e.handle == handle_ptr)
-        {
-            // Check if protocol already installed
-            if entry.protocols[..entry.protocol_count]
-                .iter()
-                .any(|p| p.guid == guid)
-            {
-                return Status::INVALID_PARAMETER; // Protocol already installed
-            }
-
-            // Add new protocol
-            if entry.protocol_count >= MAX_PROTOCOLS_PER_HANDLE {
-                return Status::OUT_OF_RESOURCES;
-            }
-
-            entry.protocols[entry.protocol_count] = ProtocolEntry { guid, interface };
-            entry.protocol_count += 1;
-            return Status::SUCCESS;
-        }
-
-        Status::INVALID_PARAMETER
-    })
+    install_protocol(target_handle, &unsafe { *protocol }, interface)
 }
 
 extern "efiapi" fn reinstall_protocol_interface(
-    _handle: Handle,
-    _protocol: *mut Guid,
-    _old_interface: *mut c_void,
-    _new_interface: *mut c_void,
+    handle: Handle,
+    protocol: *mut Guid,
+    old_interface: *mut c_void,
+    new_interface: *mut c_void,
 ) -> Status {
-    Status::NOT_FOUND
+    if handle.is_null() || protocol.is_null() {
+        return Status::INVALID_PARAMETER;
+    }
+
+    let guid = unsafe { *protocol };
+    let (status, notify_events) = with_tables_mut(|efi_state| {
+        let Some(entry) = efi_state.handles[..efi_state.handle_count]
+            .iter_mut()
+            .find(|entry| entry.handle == handle)
+        else {
+            return (Status::NOT_FOUND, heapless::Vec::new());
+        };
+        let Some(protocol_entry) = entry.protocols[..entry.protocol_count]
+            .iter_mut()
+            .find(|entry| entry.guid == guid && entry.interface == old_interface)
+        else {
+            return (Status::NOT_FOUND, heapless::Vec::new());
+        };
+        if efi_state.open_protocols.iter().any(|open| {
+            open.handle == handle
+                && open.protocol == guid
+                && protocol_open_blocks_removal(open.attributes)
+        }) {
+            // Built-in drivers have no DisconnectController implementation. Do not
+            // replace an interface while a driver or exclusive user still holds it.
+            return (Status::ACCESS_DENIED, heapless::Vec::new());
+        }
+        efi_state
+            .open_protocols
+            .retain(|open| open.handle != handle || open.protocol != guid);
+        let Some(generation) = efi_state.protocol_generation.checked_add(1) else {
+            return (Status::OUT_OF_RESOURCES, heapless::Vec::new());
+        };
+        efi_state.protocol_generation = generation;
+        protocol_entry.generation = generation;
+        protocol_entry.interface = new_interface;
+        // Per the UEFI spec a reinstall notifies registrations just like an
+        // install, so drivers can rebind to the replacement interface.
+        let events = protocol_notification_events(efi_state, &guid);
+        (Status::SUCCESS, events)
+    });
+
+    for event in notify_events {
+        signal_event(event);
+    }
+
+    status
 }
 
 extern "efiapi" fn uninstall_protocol_interface(
-    _handle: Handle,
-    _protocol: *mut Guid,
-    _interface: *mut c_void,
+    handle: Handle,
+    protocol: *mut Guid,
+    interface: *mut c_void,
 ) -> Status {
-    Status::NOT_FOUND
+    if handle.is_null() || protocol.is_null() {
+        return Status::INVALID_PARAMETER;
+    }
+    remove_protocol(handle, &unsafe { *protocol }, Some(interface))
 }
 
 extern "efiapi" fn handle_protocol(
@@ -919,17 +911,91 @@ extern "efiapi" fn handle_protocol(
 }
 
 extern "efiapi" fn register_protocol_notify(
-    _protocol: *mut Guid,
-    _event: efi::Event,
-    _registration: *mut *mut c_void,
+    protocol: *mut Guid,
+    event: efi::Event,
+    registration: *mut *mut c_void,
 ) -> Status {
-    Status::UNSUPPORTED
+    if protocol.is_null() || registration.is_null() {
+        return Status::INVALID_PARAMETER;
+    }
+    let event_id = event as usize;
+    if event_id == 0 || event_id >= MAX_EVENTS {
+        return Status::INVALID_PARAMETER;
+    }
+
+    let guid = unsafe { *protocol };
+    log::debug!("BS.RegisterProtocolNotify(protocol={})", GuidFmt(guid));
+
+    with_tables_mut(|efi_state| {
+        if efi_state.protocol_notifies.len() >= MAX_PROTOCOL_NOTIFIES
+            || efi_state.protocol_notifies.try_reserve(1).is_err()
+        {
+            log::warn!("  -> OUT_OF_RESOURCES (notify registration table full)");
+            return Status::OUT_OF_RESOURCES;
+        }
+
+        let token = efi_state.next_registration;
+        let Some(next_token) = token.checked_add(1) else {
+            return Status::OUT_OF_RESOURCES;
+        };
+        efi_state.next_registration = next_token;
+        efi_state.protocol_notifies.push(ProtocolNotifyEntry {
+            registration: token,
+            protocol: guid,
+            event,
+            cursor: 0,
+        });
+
+        unsafe { *registration = token as *mut c_void };
+        log::debug!("  -> SUCCESS (registration={:#x})", token);
+        Status::SUCCESS
+    })
+}
+
+/// Collect events to signal after releasing the database borrow.
+fn protocol_notification_events(
+    efi_state: &Tables,
+    guid: &Guid,
+) -> heapless::Vec<efi::Event, MAX_PROTOCOL_NOTIFIES> {
+    efi_state
+        .protocol_notifies
+        .iter()
+        .filter(|notify| notify.protocol == *guid)
+        .map(|notify| notify.event)
+        .collect()
+}
+
+/// Peek the next live instance without advancing a registration's shared cursor.
+fn next_registered_protocol(
+    efi_state: &Tables,
+    token: usize,
+    protocol: Option<Guid>,
+) -> Result<(usize, Handle, ProtocolEntry), Status> {
+    let (index, notify) = efi_state
+        .protocol_notifies
+        .iter()
+        .enumerate()
+        .find(|(_, notify)| notify.registration == token)
+        .ok_or(Status::INVALID_PARAMETER)?;
+    if protocol.is_some_and(|guid| guid != notify.protocol) {
+        return Err(Status::INVALID_PARAMETER);
+    }
+    efi_state.handles[..efi_state.handle_count]
+        .iter()
+        .flat_map(|handle| {
+            handle.protocols[..handle.protocol_count]
+                .iter()
+                .map(move |entry| (index, handle.handle, *entry))
+        })
+        .filter(|(_, _, entry)| entry.guid == notify.protocol && entry.generation > notify.cursor)
+        .min_by_key(|(_, _, entry)| entry.generation)
+        .ok_or(Status::NOT_FOUND)
 }
 
 extern "efiapi" fn locate_handle(
     search_type: efi::LocateSearchType,
     protocol: *mut Guid,
-    _search_key: *mut c_void,
+    search_key: *mut c_void,
     buffer_size: *mut usize,
     buffer: *mut Handle,
 ) -> Status {
@@ -954,39 +1020,57 @@ extern "efiapi" fn locate_handle(
         buffer
     );
 
-    let efi_state = tables();
-
-    // Collect matching handles based on search type
-    let matching: heapless::Vec<Handle, MAX_HANDLES> = match search_type {
-        efi::ALL_HANDLES => efi_state.handles[..efi_state.handle_count]
-            .iter()
-            .map(|entry| entry.handle)
-            .collect(),
-        efi::BY_REGISTER_NOTIFY => {
-            log::debug!("  -> NOT_FOUND (BY_REGISTER_NOTIFY not fully supported)");
-            return Status::NOT_FOUND;
-        }
-        efi::BY_PROTOCOL => {
-            if protocol.is_null() {
-                return Status::INVALID_PARAMETER;
+    if search_type == efi::BY_REGISTER_NOTIFY {
+        return with_tables_mut(|efi_state| {
+            let (index, handle, entry) =
+                match next_registered_protocol(efi_state, search_key as usize, None) {
+                    Ok(next) => next,
+                    Err(status) => return status,
+                };
+            let required_size = core::mem::size_of::<Handle>();
+            let capacity = unsafe { *buffer_size };
+            unsafe { *buffer_size = required_size };
+            if buffer.is_null() || capacity < required_size {
+                return Status::BUFFER_TOO_SMALL;
             }
-            let guid = unsafe { *protocol };
-            efi_state.handles[..efi_state.handle_count]
-                .iter()
-                .filter(|entry| {
+            unsafe { *buffer = handle };
+            efi_state.protocol_notifies[index].cursor = entry.generation;
+            Status::SUCCESS
+        });
+    }
+
+    // Collect matching handles based on search type. The handle database grows
+    // past its preallocated size, so this collects onto the heap rather than
+    // into a fixed-capacity buffer that would silently truncate the result.
+    //
+    let matching = {
+        let efi_state = tables();
+        match search_type {
+            efi::ALL_HANDLES => match collect_handles(&efi_state, |_| true) {
+                Ok(handles) => handles,
+                Err(status) => return status,
+            },
+            efi::BY_PROTOCOL => {
+                if protocol.is_null() {
+                    return Status::INVALID_PARAMETER;
+                }
+                let guid = unsafe { *protocol };
+                match collect_handles(&efi_state, |entry| {
                     entry.protocols[..entry.protocol_count]
                         .iter()
                         .any(|p| p.guid == guid)
-                })
-                .map(|entry| entry.handle)
-                .collect()
-        }
-        _ => {
-            log::debug!(
-                "  -> INVALID_PARAMETER (unknown search type {})",
-                search_type
-            );
-            return Status::INVALID_PARAMETER;
+                }) {
+                    Ok(handles) => handles,
+                    Err(status) => return status,
+                }
+            }
+            _ => {
+                log::debug!(
+                    "  -> INVALID_PARAMETER (unknown search type {})",
+                    search_type
+                );
+                return Status::INVALID_PARAMETER;
+            }
         }
     };
 
@@ -1009,8 +1093,35 @@ extern "efiapi" fn locate_handle(
     dest.copy_from_slice(&matching[..]);
     unsafe { *buffer_size = required_size };
 
+    log::debug!("  -> found {} handles: {:?}", matching.len(), matching);
+
     log::debug!("  -> found {} handles: {:?}", matching.len(), &matching[..]);
     Status::SUCCESS
+}
+
+/// Collect the handles matching `filter` onto the firmware heap.
+///
+/// # Arguments
+/// * `efi_state` - Borrowed EFI state.
+/// * `filter` - Predicate applied to each live handle entry.
+///
+/// # Returns
+/// The matching handles, or `Err(OUT_OF_RESOURCES)` when the heap cannot hold them.
+fn collect_handles(
+    efi_state: &Tables,
+    filter: impl Fn(&HandleEntry) -> bool,
+) -> Result<Vec<Handle>, Status> {
+    let mut handles = Vec::new();
+    if handles.try_reserve_exact(efi_state.handle_count).is_err() {
+        return Err(Status::OUT_OF_RESOURCES);
+    }
+    handles.extend(
+        efi_state.handles[..efi_state.handle_count]
+            .iter()
+            .filter(|entry| filter(entry))
+            .map(|entry| entry.handle),
+    );
+    Ok(handles)
 }
 
 unsafe fn device_path_node_len(dp: *mut DevicePathProtocol) -> Option<usize> {
@@ -1545,6 +1656,15 @@ extern "efiapi" fn unload_image(image_handle: Handle) -> Status {
         return Status::INVALID_PARAMETER;
     }
 
+    // Refuse to free an image whose handle is still managed by another agent.
+    if tables().open_protocols.iter().any(|open| {
+        (open.handle == image_handle || open.controller_handle == image_handle)
+            && open.agent_handle != image_handle
+            && protocol_open_blocks_removal(open.attributes)
+    }) {
+        return Status::ACCESS_DENIED;
+    }
+
     // Find and remove the loaded image entry
     let image_info = with_tables_mut(|efi_state| {
         efi_state
@@ -1565,6 +1685,14 @@ extern "efiapi" fn unload_image(image_handle: Handle) -> Status {
 
     match image_info {
         Some((alloc_base, num_pages, measurement_event_data)) => {
+            // Drop image-owned relationships before its code and data disappear.
+            with_tables_mut(|efi_state| {
+                efi_state.open_protocols.retain(|open| {
+                    open.agent_handle != image_handle
+                        && open.controller_handle != image_handle
+                        && open.handle != image_handle
+                });
+            });
             // Free the image memory (using alloc_base, not image_base,
             // since the image may have been aligned within the allocation)
             let status = allocator::free_pages(alloc_base, num_pages);
@@ -1813,16 +1941,42 @@ extern "efiapi" fn open_protocol(
     handle: Handle,
     protocol: *mut Guid,
     interface: *mut *mut c_void,
-    _agent_handle: Handle,
-    _controller_handle: Handle,
+    agent_handle: Handle,
+    controller_handle: Handle,
     attributes: u32,
 ) -> Status {
     if handle.is_null() || protocol.is_null() {
         return Status::INVALID_PARAMETER;
     }
 
+    const DRIVER_EXCLUSIVE: u32 = efi::OPEN_PROTOCOL_BY_DRIVER | efi::OPEN_PROTOCOL_EXCLUSIVE;
+    let base_attributes = attributes & !efi::OPEN_PROTOCOL_EXCLUSIVE;
+    if !matches!(
+        attributes,
+        efi::OPEN_PROTOCOL_BY_HANDLE_PROTOCOL
+            | efi::OPEN_PROTOCOL_GET_PROTOCOL
+            | efi::OPEN_PROTOCOL_TEST_PROTOCOL
+            | efi::OPEN_PROTOCOL_BY_CHILD_CONTROLLER
+            | efi::OPEN_PROTOCOL_BY_DRIVER
+            | efi::OPEN_PROTOCOL_EXCLUSIVE
+            | DRIVER_EXCLUSIVE
+    ) || ((matches!(
+        base_attributes,
+        efi::OPEN_PROTOCOL_BY_CHILD_CONTROLLER | efi::OPEN_PROTOCOL_BY_DRIVER
+    ) || attributes & efi::OPEN_PROTOCOL_EXCLUSIVE != 0)
+        && agent_handle.is_null())
+        || (attributes != efi::OPEN_PROTOCOL_TEST_PROTOCOL && interface.is_null())
+        || (matches!(
+            base_attributes,
+            efi::OPEN_PROTOCOL_BY_CHILD_CONTROLLER | efi::OPEN_PROTOCOL_BY_DRIVER
+        ) && controller_handle.is_null())
+        || (base_attributes == efi::OPEN_PROTOCOL_BY_CHILD_CONTROLLER
+            && controller_handle == handle)
+    {
+        return Status::INVALID_PARAMETER;
+    }
+
     let guid = unsafe { *protocol };
-    let guid_name = super::guid_fmt::lookup_guid_name(&guid);
     log::debug!(
         "BS.OpenProtocol(handle={:?}, protocol={}, attr={:#x})",
         handle,
@@ -1830,48 +1984,97 @@ extern "efiapi" fn open_protocol(
         attributes
     );
 
-    let efi_state = tables();
+    let result = with_tables_mut(|efi_state| {
+        let Some(handle_entry) = efi_state.handles[..efi_state.handle_count]
+            .iter()
+            .find(|entry| entry.handle == handle)
+        else {
+            return Err(Status::INVALID_PARAMETER);
+        };
+        let Some(protocol_entry) = handle_entry.protocols[..handle_entry.protocol_count]
+            .iter()
+            .find(|entry| entry.guid == guid)
+        else {
+            return Err(Status::UNSUPPORTED);
+        };
+        let protocol_interface = protocol_entry.interface;
+        let exclusive = attributes & efi::OPEN_PROTOCOL_EXCLUSIVE != 0;
 
-    // Find the handle entry
-    let handle_entry = efi_state.handles[..efi_state.handle_count]
-        .iter()
-        .find(|entry| entry.handle == handle);
+        // Ordinary opens with an agent are observable through OpenProtocolInformation
+        // and CloseProtocol, but do not prevent interface teardown.
+        if agent_handle.is_null() {
+            return Ok(protocol_interface);
+        }
 
-    let Some(entry) = handle_entry else {
-        log::warn!("  -> INVALID_PARAMETER (handle not found)");
-        return Status::INVALID_PARAMETER;
+        // A repeated driver open returns its existing interface without adding
+        // another relationship, including BY_DRIVER | EXCLUSIVE.
+        if attributes & efi::OPEN_PROTOCOL_BY_DRIVER != 0
+            && efi_state.open_protocols.iter().any(|open| {
+                open.handle == handle
+                    && open.protocol == guid
+                    && open.agent_handle == agent_handle
+                    && open.controller_handle == controller_handle
+                    && open.attributes == attributes
+            })
+        {
+            unsafe { *interface = protocol_interface };
+            return Err(Status::ALREADY_STARTED);
+        }
+
+        // There is no driver-disconnect implementation to evict an existing
+        // owner. Reject rather than pretending to grant exclusive access.
+        if (exclusive || base_attributes == efi::OPEN_PROTOCOL_BY_DRIVER)
+            && efi_state.open_protocols.iter().any(|open| {
+                open.handle == handle
+                    && open.protocol == guid
+                    && open.attributes
+                        & (efi::OPEN_PROTOCOL_BY_DRIVER | efi::OPEN_PROTOCOL_EXCLUSIVE)
+                        != 0
+            })
+        {
+            return Err(Status::ACCESS_DENIED);
+        }
+
+        if let Some(open) = efi_state.open_protocols.iter_mut().find(|open| {
+            open.handle == handle
+                && open.protocol == guid
+                && open.agent_handle == agent_handle
+                && open.controller_handle == controller_handle
+                && open.attributes == attributes
+        }) {
+            open.open_count = open.open_count.saturating_add(1);
+        } else {
+            if efi_state.open_protocols.try_reserve(1).is_err() {
+                return Err(Status::OUT_OF_RESOURCES);
+            }
+            efi_state.open_protocols.push(OpenProtocolEntry {
+                handle,
+                protocol: guid,
+                agent_handle,
+                controller_handle,
+                attributes,
+                open_count: 1,
+            });
+        }
+
+        Ok(protocol_interface)
+    });
+
+    let iface = match result {
+        Ok(iface) => iface,
+        Err(status) => return status,
     };
-
-    // Find the protocol on this handle
-    let proto = entry.protocols[..entry.protocol_count]
-        .iter()
-        .find(|p| p.guid == guid);
-
-    let Some(proto) = proto else {
-        log::warn!("  -> UNSUPPORTED (protocol not on handle)");
-        return Status::UNSUPPORTED;
-    };
-
-    let iface = proto.interface;
-    if !interface.is_null() {
+    if attributes != efi::OPEN_PROTOCOL_TEST_PROTOCOL && !interface.is_null() {
         unsafe { *interface = iface };
     }
-    log::trace!("  -> SUCCESS (interface={:?})", iface);
 
-    // For LOADED_IMAGE, log important fields
-    if guid_name == "LOADED_IMAGE" && !iface.is_null() {
+    if guid == LOADED_IMAGE_PROTOCOL_GUID && !iface.is_null() {
         let lip = iface as *const r_efi::protocols::loaded_image::Protocol;
-        let dev_handle = unsafe { (*lip).device_handle };
-        let sys_table = unsafe { (*lip).system_table };
-        log::trace!("  -> LOADED_IMAGE.DeviceHandle = {:?}", dev_handle);
-        log::trace!("  -> LOADED_IMAGE.SystemTable = {:?}", sys_table);
-        // Check if SystemTable looks valid
-        if !sys_table.is_null() {
-            let bs = unsafe { (*sys_table).boot_services };
-            log::trace!("  -> LOADED_IMAGE.SystemTable->BootServices = {:?}", bs);
-        } else {
-            log::error!("  -> LOADED_IMAGE.SystemTable is NULL!");
-        }
+        log::trace!(
+            "  -> LOADED_IMAGE(DeviceHandle={:?}, SystemTable={:?})",
+            unsafe { (*lip).device_handle },
+            unsafe { (*lip).system_table }
+        );
     }
 
     Status::SUCCESS
@@ -1880,47 +2083,29 @@ extern "efiapi" fn open_protocol(
 extern "efiapi" fn close_protocol(
     handle: Handle,
     protocol: *mut Guid,
-    _agent_handle: Handle,
-    _controller_handle: Handle,
+    agent_handle: Handle,
+    controller_handle: Handle,
 ) -> Status {
-    let guid = if protocol.is_null() {
-        log::debug!("BS.CloseProtocol: protocol is NULL");
-        return Status::INVALID_PARAMETER;
-    } else {
-        unsafe { *protocol }
-    };
-
-    log::debug!(
-        "BS.CloseProtocol(handle={:?}, protocol={})",
-        handle,
-        GuidFmt(guid)
-    );
-
-    if handle.is_null() {
-        log::debug!("  -> INVALID_PARAMETER (handle is NULL)");
+    if handle.is_null() || protocol.is_null() || agent_handle.is_null() {
         return Status::INVALID_PARAMETER;
     }
+    let guid = unsafe { *protocol };
 
-    // Verify the handle exists and has this protocol
-    let efi_state = tables();
-    let handle_exists = efi_state.handles[..efi_state.handle_count]
-        .iter()
-        .any(|entry| {
-            entry.handle == handle
-                && entry.protocols[..entry.protocol_count]
-                    .iter()
-                    .any(|p| p.guid == guid)
+    with_tables_mut(|efi_state| {
+        let previous_len = efi_state.open_protocols.len();
+        // CloseProtocol closes all matching records, regardless of OpenCount.
+        efi_state.open_protocols.retain(|open| {
+            !(open.handle == handle
+                && open.protocol == guid
+                && open.agent_handle == agent_handle
+                && open.controller_handle == controller_handle)
         });
-
-    if !handle_exists {
-        log::debug!("  -> NOT_FOUND");
-        return Status::NOT_FOUND;
-    }
-
-    // In our simple implementation, we don't track open protocol usage,
-    // so close is effectively a no-op but we return SUCCESS
-    log::debug!("  -> SUCCESS");
-    Status::SUCCESS
+        if efi_state.open_protocols.len() == previous_len {
+            Status::NOT_FOUND
+        } else {
+            Status::SUCCESS
+        }
+    })
 }
 
 extern "efiapi" fn open_protocol_information(
@@ -1935,13 +2120,62 @@ extern "efiapi" fn open_protocol_information(
         return Status::INVALID_PARAMETER;
     }
 
-    // We don't track protocol open/close agents in our simple implementation.
-    // Return an empty list -- this is valid per UEFI spec (zero agents have opened it).
-    unsafe {
-        *entry_buffer = core::ptr::null_mut();
-        *entry_count = 0;
+    let guid = unsafe { *protocol };
+    let record_count = with_tables_mut(|efi_state| {
+        let protocol_exists = efi_state.handles[..efi_state.handle_count]
+            .iter()
+            .any(|entry| {
+                entry.handle == handle
+                    && entry.protocols[..entry.protocol_count]
+                        .iter()
+                        .any(|entry| entry.guid == guid)
+            });
+        protocol_exists.then(|| {
+            efi_state
+                .open_protocols
+                .iter()
+                .filter(|open| open.handle == handle && open.protocol == guid)
+                .count()
+        })
+    });
+    let Some(record_count) = record_count else {
+        return Status::NOT_FOUND;
+    };
+
+    if record_count == 0 {
+        unsafe {
+            *entry_buffer = core::ptr::null_mut();
+            *entry_count = 0;
+        }
+        return Status::SUCCESS;
     }
 
+    let size = record_count * core::mem::size_of::<efi::OpenProtocolInformationEntry>();
+    let buffer = match allocator::allocate_pool(MemoryType::BootServicesData, size) {
+        Ok(buffer) => buffer as *mut efi::OpenProtocolInformationEntry,
+        Err(status) => return status,
+    };
+    with_tables_mut(|efi_state| {
+        for (index, open) in efi_state
+            .open_protocols
+            .iter()
+            .filter(|open| open.handle == handle && open.protocol == guid)
+            .enumerate()
+        {
+            unsafe {
+                buffer.add(index).write(efi::OpenProtocolInformationEntry {
+                    agent_handle: open.agent_handle,
+                    controller_handle: open.controller_handle,
+                    attributes: open.attributes,
+                    open_count: open.open_count,
+                });
+            }
+        }
+    });
+    unsafe {
+        *entry_buffer = buffer;
+        *entry_count = record_count;
+    }
     Status::SUCCESS
 }
 
@@ -2109,7 +2343,7 @@ extern "efiapi" fn locate_handle_buffer(
 
 extern "efiapi" fn locate_protocol(
     protocol: *mut Guid,
-    _registration: *mut c_void,
+    registration: *mut c_void,
     interface: *mut *mut c_void,
 ) -> Status {
     if protocol.is_null() || interface.is_null() {
@@ -2118,6 +2352,19 @@ extern "efiapi" fn locate_protocol(
 
     let guid = unsafe { *protocol };
     log::trace!("BS.LocateProtocol(protocol={})", GuidFmt(guid));
+
+    if !registration.is_null() {
+        return with_tables_mut(|efi_state| {
+            let (index, _, entry) =
+                match next_registered_protocol(efi_state, registration as usize, Some(guid)) {
+                    Ok(next) => next,
+                    Err(status) => return status,
+                };
+            unsafe { *interface = entry.interface };
+            efi_state.protocol_notifies[index].cursor = entry.generation;
+            Status::SUCCESS
+        });
+    }
 
     let efi_state = tables();
 
@@ -2137,156 +2384,342 @@ extern "efiapi" fn locate_protocol(
     Status::NOT_FOUND
 }
 
-// Note: These are variadic in the real UEFI spec. We handle this by accepting
-// enough arguments for the common case (up to 4 protocol pairs) and iterating
-// until we find a NULL GUID terminator.
-extern "efiapi" fn install_multiple_protocol_interfaces(
-    handle: *mut Handle,
-    // Variadic args come as pairs: (GUID*, interface*), terminated by NULL
-    arg1: *mut c_void,
-    arg2: *mut c_void,
-    arg3: *mut c_void,
-    arg4: *mut c_void,
-    arg5: *mut c_void,
-    arg6: *mut c_void,
-    arg7: *mut c_void,
-    arg8: *mut c_void,
-) -> Status {
-    if handle.is_null() {
-        log::debug!("BS.InstallMultipleProtocolInterfaces: handle ptr is NULL");
+type InstallMultipleFn = extern "efiapi" fn(*mut Handle, *mut c_void, *mut c_void) -> Status;
+type UninstallMultipleFn = extern "efiapi" fn(Handle, *mut c_void, *mut c_void) -> Status;
+
+#[cfg(target_arch = "x86_64")]
+core::arch::global_asm!(
+    r#"
+    .global crabefi_install_multiple_protocol_interfaces_entry
+    .type crabefi_install_multiple_protocol_interfaces_entry,@function
+crabefi_install_multiple_protocol_interfaces_entry:
+    mov r10, rsp
+    sub rsp, 40
+    lea rax, [r10 + 40]
+    mov [rsp + 32], rax
+    call crabefi_install_multiple_protocol_interfaces_x64
+    add rsp, 40
+    ret
+
+    .global crabefi_uninstall_multiple_protocol_interfaces_entry
+    .type crabefi_uninstall_multiple_protocol_interfaces_entry,@function
+crabefi_uninstall_multiple_protocol_interfaces_entry:
+    mov r10, rsp
+    sub rsp, 40
+    lea rax, [r10 + 40]
+    mov [rsp + 32], rax
+    call crabefi_uninstall_multiple_protocol_interfaces_x64
+    add rsp, 40
+    ret
+"#
+);
+
+#[cfg(target_arch = "x86_64")]
+unsafe extern "efiapi" {
+    fn crabefi_install_multiple_protocol_interfaces_entry(
+        handle: *mut Handle,
+        protocol: *mut c_void,
+        interface: *mut c_void,
+    ) -> Status;
+    fn crabefi_uninstall_multiple_protocol_interfaces_entry(
+        handle: Handle,
+        protocol: *mut c_void,
+        interface: *mut c_void,
+    ) -> Status;
+}
+
+#[cfg(target_arch = "x86_64")]
+const INSTALL_MULTIPLE_PROTOCOL_INTERFACES: InstallMultipleFn = unsafe {
+    core::mem::transmute::<
+        unsafe extern "efiapi" fn(*mut Handle, *mut c_void, *mut c_void) -> Status,
+        InstallMultipleFn,
+    >(crabefi_install_multiple_protocol_interfaces_entry)
+};
+
+#[cfg(target_arch = "x86_64")]
+const UNINSTALL_MULTIPLE_PROTOCOL_INTERFACES: UninstallMultipleFn = unsafe {
+    core::mem::transmute::<
+        unsafe extern "efiapi" fn(Handle, *mut c_void, *mut c_void) -> Status,
+        UninstallMultipleFn,
+    >(crabefi_uninstall_multiple_protocol_interfaces_entry)
+};
+
+#[cfg(not(target_arch = "x86_64"))]
+const INSTALL_MULTIPLE_PROTOCOL_INTERFACES: InstallMultipleFn = unsafe {
+    core::mem::transmute::<
+        unsafe extern "C" fn(*mut Handle, *mut c_void, *mut c_void, ...) -> Status,
+        InstallMultipleFn,
+    >(install_multiple_protocol_interfaces_c)
+};
+
+#[cfg(not(target_arch = "x86_64"))]
+const UNINSTALL_MULTIPLE_PROTOCOL_INTERFACES: UninstallMultipleFn = unsafe {
+    core::mem::transmute::<
+        unsafe extern "C" fn(Handle, *mut c_void, *mut c_void, ...) -> Status,
+        UninstallMultipleFn,
+    >(uninstall_multiple_protocol_interfaces_c)
+};
+
+const MAX_PROTOCOL_PAIRS: usize = 16;
+
+fn collect_protocol_pair(
+    pairs: &mut Vec<(Guid, *mut c_void)>,
+    protocol: *mut c_void,
+    interface: *mut c_void,
+) -> Result<bool, Status> {
+    if protocol.is_null() {
+        return Ok(false);
+    }
+    if pairs.len() >= MAX_PROTOCOL_PAIRS {
+        return Err(Status::INVALID_PARAMETER);
+    }
+    if pairs.try_reserve(1).is_err() {
+        return Err(Status::OUT_OF_RESOURCES);
+    }
+    pairs.push((unsafe { *(protocol as *const Guid) }, interface));
+    Ok(true)
+}
+
+fn install_multiple_pairs(handle: *mut Handle, pairs: &[(Guid, *mut c_void)]) -> Status {
+    if handle.is_null() || pairs.is_empty() {
         return Status::INVALID_PARAMETER;
     }
 
-    // Collect the argument pairs
-    let args = [(arg1, arg2), (arg3, arg4), (arg5, arg6), (arg7, arg8)];
-
-    // Count how many valid protocol pairs we have (until NULL GUID)
-    let pair_count = args
-        .iter()
-        .take_while(|(guid_ptr, _)| !guid_ptr.is_null())
-        .count();
-
-    log::debug!(
-        "BS.InstallMultipleProtocolInterfaces(handle={:?}, {} protocols)",
-        unsafe { *handle },
-        pair_count
-    );
-
-    if pair_count == 0 {
-        // No protocols to install, just return success
-        return Status::SUCCESS;
-    }
-
-    // If handle points to NULL, create a new handle
-    let target_handle = if unsafe { (*handle).is_null() } {
-        match create_handle() {
-            Some(h) => {
-                unsafe { *handle = h };
-                log::debug!("  Created new handle: {:?}", h);
-                h
-            }
-            None => {
-                log::error!("  Failed to create handle");
-                return Status::OUT_OF_RESOURCES;
-            }
-        }
+    let created_handle = unsafe { (*handle).is_null() };
+    let target_handle = if created_handle {
+        let Some(new_handle) = create_handle() else {
+            return Status::OUT_OF_RESOURCES;
+        };
+        unsafe { *handle = new_handle };
+        new_handle
     } else {
         unsafe { *handle }
     };
 
-    // Install each protocol, rolling back on failure
-    for i in 0..pair_count {
-        let guid_ptr = args[i].0 as *mut Guid;
-        let interface = args[i].1;
-
-        if guid_ptr.is_null() {
-            break;
-        }
-
-        let guid = unsafe { *guid_ptr };
-        log::debug!("  Installing protocol: {}", GuidFmt(guid));
-
-        let status = install_protocol(target_handle, &guid, interface);
+    for (index, (guid, interface)) in pairs.iter().enumerate() {
+        // No callbacks may observe a partial transaction or acquire opens that
+        // prevent rollback. Publish notifications only after every pair succeeds.
+        let status = install_protocol_internal(target_handle, guid, *interface, false);
         if status != Status::SUCCESS {
-            log::error!(
-                "  Failed to install protocol {}: {:?}",
-                GuidFmt(guid),
-                status
-            );
-            // Rollback: uninstall previously installed protocols from this call
-            for j in (0..i).rev() {
-                let prev_guid_ptr = args[j].0 as *const Guid;
-                if !prev_guid_ptr.is_null() {
-                    let prev_guid = unsafe { *prev_guid_ptr };
-                    with_tables_mut(|efi_state| {
-                        if let Some(entry) = efi_state.handles[..efi_state.handle_count]
-                            .iter_mut()
-                            .find(|e| e.handle == target_handle)
-                            && let Some(pos) = entry.protocols[..entry.protocol_count]
-                                .iter()
-                                .position(|p| p.guid == prev_guid)
-                        {
-                            entry
-                                .protocols
-                                .copy_within(pos + 1..entry.protocol_count, pos);
-                            entry.protocol_count -= 1;
-                        }
-                    });
+            let mut rollback_complete = true;
+            for (installed_guid, installed_interface) in pairs[..index].iter().rev() {
+                let rollback_status =
+                    remove_protocol(target_handle, installed_guid, Some(*installed_interface));
+                if rollback_status != Status::SUCCESS {
+                    rollback_complete = false;
+                    log::error!(
+                        "InstallMultipleProtocolInterfaces rollback failed for {} on {:?}: {:?}",
+                        GuidFmt(*installed_guid),
+                        target_handle,
+                        rollback_status
+                    );
                 }
+            }
+            if created_handle && rollback_complete && reclaim_empty_handle(target_handle) {
+                unsafe { *handle = core::ptr::null_mut() };
             }
             return status;
         }
     }
-
-    log::trace!("  -> SUCCESS");
+    let events: heapless::Vec<efi::Event, MAX_PROTOCOL_NOTIFIES> = {
+        let efi_state = tables();
+        efi_state
+            .protocol_notifies
+            .iter()
+            .filter(|notify| pairs.iter().any(|(guid, _)| *guid == notify.protocol))
+            .map(|notify| notify.event)
+            .collect()
+    };
+    for event in events {
+        signal_event(event);
+    }
     Status::SUCCESS
 }
 
-extern "efiapi" fn uninstall_multiple_protocol_interfaces(
-    handle: Handle,
-    arg1: *mut c_void,
-    arg2: *mut c_void,
-    arg3: *mut c_void,
-    arg4: *mut c_void,
-    arg5: *mut c_void,
-    arg6: *mut c_void,
-    arg7: *mut c_void,
-    arg8: *mut c_void,
-) -> Status {
-    log::debug!(
-        "BS.UninstallMultipleProtocolInterfaces(handle={:?})",
-        handle
-    );
+fn reclaim_empty_handle(handle: Handle) -> bool {
+    with_tables_mut(|efi_state| {
+        let Some(index) = efi_state.handles[..efi_state.handle_count]
+            .iter()
+            .position(|entry| entry.handle == handle)
+        else {
+            // Removing the final installed protocol already reclaimed it.
+            return true;
+        };
+        if efi_state.handles[index].protocol_count != 0 {
+            return false;
+        }
+        efi_state
+            .handles
+            .copy_within(index + 1..efi_state.handle_count, index);
+        efi_state.handle_count -= 1;
+        efi_state.handles[efi_state.handle_count] = HandleEntry::empty();
+        true
+    })
+}
 
-    if handle.is_null() {
+fn uninstall_multiple_pairs(handle: Handle, pairs: &[(Guid, *mut c_void)]) -> Status {
+    if handle.is_null() || pairs.is_empty() {
         return Status::INVALID_PARAMETER;
     }
-
-    let args = [(arg1, arg2), (arg3, arg4), (arg5, arg6), (arg7, arg8)];
-
-    // Uninstall each protocol
-    for (guid_ptr, _) in args.iter().take_while(|(g, _)| !g.is_null()) {
-        let guid = unsafe { *(*guid_ptr as *const Guid) };
-        log::debug!("  Uninstalling protocol: {}", GuidFmt(guid));
-
-        // Find and remove the protocol from the handle
-        with_tables_mut(|efi_state| {
-            if let Some(entry) = efi_state.handles[..efi_state.handle_count]
-                .iter_mut()
-                .find(|e| e.handle == handle)
-                && let Some(j) = entry.protocols[..entry.protocol_count]
-                    .iter()
-                    .position(|p| p.guid == guid)
-            {
-                // Remove by shifting remaining protocols down
-                entry.protocols.copy_within(j + 1..entry.protocol_count, j);
-                entry.protocol_count -= 1;
-            }
-        });
+    for (index, pair) in pairs.iter().enumerate() {
+        if pairs[..index].contains(pair) {
+            return Status::INVALID_PARAMETER;
+        }
     }
 
-    log::trace!("  -> SUCCESS");
+    let validation = tables();
+    let Some(handle_entry) = validation.handles[..validation.handle_count]
+        .iter()
+        .find(|entry| entry.handle == handle)
+    else {
+        return Status::INVALID_PARAMETER;
+    };
+    for (guid, interface) in pairs {
+        if !handle_entry.protocols[..handle_entry.protocol_count]
+            .iter()
+            .any(|entry| entry.guid == *guid && entry.interface == *interface)
+        {
+            return Status::NOT_FOUND;
+        }
+        if validation.open_protocols.iter().any(|open| {
+            open.handle == handle
+                && open.protocol == *guid
+                && protocol_open_blocks_removal(open.attributes)
+        }) {
+            return Status::ACCESS_DENIED;
+        }
+    }
+
+    // Mutation must not overlap the validation borrow of the handle database.
+    drop(validation);
+    for (guid, interface) in pairs {
+        let status = remove_protocol(handle, guid, Some(*interface));
+        if status != Status::SUCCESS {
+            return status;
+        }
+    }
     Status::SUCCESS
+}
+
+#[cfg(target_arch = "x86_64")]
+unsafe fn collect_x64_pairs(
+    first_protocol: *mut c_void,
+    first_interface: *mut c_void,
+    second_protocol: *mut c_void,
+    stack_arguments: *const *mut c_void,
+) -> Result<Vec<(Guid, *mut c_void)>, Status> {
+    let mut pairs = Vec::new();
+    if !collect_protocol_pair(&mut pairs, first_protocol, first_interface)? {
+        return Ok(pairs);
+    }
+
+    let mut protocol = second_protocol;
+    let mut arguments = stack_arguments;
+    while !protocol.is_null() {
+        let interface = unsafe { *arguments };
+        collect_protocol_pair(&mut pairs, protocol, interface)?;
+        protocol = unsafe { *arguments.add(1) };
+        arguments = unsafe { arguments.add(2) };
+    }
+    Ok(pairs)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[unsafe(no_mangle)]
+extern "efiapi" fn crabefi_install_multiple_protocol_interfaces_x64(
+    handle: *mut Handle,
+    first_protocol: *mut c_void,
+    first_interface: *mut c_void,
+    second_protocol: *mut c_void,
+    stack_arguments: *const *mut c_void,
+) -> Status {
+    let pairs = match unsafe {
+        collect_x64_pairs(
+            first_protocol,
+            first_interface,
+            second_protocol,
+            stack_arguments,
+        )
+    } {
+        Ok(pairs) => pairs,
+        Err(status) => return status,
+    };
+    install_multiple_pairs(handle, &pairs)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[unsafe(no_mangle)]
+extern "efiapi" fn crabefi_uninstall_multiple_protocol_interfaces_x64(
+    handle: Handle,
+    first_protocol: *mut c_void,
+    first_interface: *mut c_void,
+    second_protocol: *mut c_void,
+    stack_arguments: *const *mut c_void,
+) -> Status {
+    let pairs = match unsafe {
+        collect_x64_pairs(
+            first_protocol,
+            first_interface,
+            second_protocol,
+            stack_arguments,
+        )
+    } {
+        Ok(pairs) => pairs,
+        Err(status) => return status,
+    };
+    uninstall_multiple_pairs(handle, &pairs)
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+unsafe extern "C" fn install_multiple_protocol_interfaces_c(
+    handle: *mut Handle,
+    first_protocol: *mut c_void,
+    first_interface: *mut c_void,
+    mut arguments: ...
+) -> Status {
+    let mut pairs = Vec::new();
+    match collect_protocol_pair(&mut pairs, first_protocol, first_interface) {
+        Ok(true) => {}
+        Ok(false) => return Status::INVALID_PARAMETER,
+        Err(status) => return status,
+    }
+    loop {
+        let protocol: *mut c_void = unsafe { arguments.next_arg() };
+        if protocol.is_null() {
+            break;
+        }
+        let interface: *mut c_void = unsafe { arguments.next_arg() };
+        if let Err(status) = collect_protocol_pair(&mut pairs, protocol, interface) {
+            return status;
+        }
+    }
+    install_multiple_pairs(handle, &pairs)
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+unsafe extern "C" fn uninstall_multiple_protocol_interfaces_c(
+    handle: Handle,
+    first_protocol: *mut c_void,
+    first_interface: *mut c_void,
+    mut arguments: ...
+) -> Status {
+    let mut pairs = Vec::new();
+    match collect_protocol_pair(&mut pairs, first_protocol, first_interface) {
+        Ok(true) => {}
+        Ok(false) => return Status::INVALID_PARAMETER,
+        Err(status) => return status,
+    }
+    loop {
+        let protocol: *mut c_void = unsafe { arguments.next_arg() };
+        if protocol.is_null() {
+            break;
+        }
+        let interface: *mut c_void = unsafe { arguments.next_arg() };
+        if let Err(status) = collect_protocol_pair(&mut pairs, protocol, interface) {
+            return status;
+        }
+    }
+    uninstall_multiple_pairs(handle, &pairs)
 }
 
 extern "efiapi" fn calculate_crc32(data: *mut c_void, data_size: usize, crc32: *mut u32) -> Status {
@@ -2329,13 +2762,18 @@ use super::guid_fmt::GuidFmt;
 /// Create a new handle and register it
 pub fn create_handle() -> Option<Handle> {
     with_tables_mut(|efi_state| {
-        if efi_state.handle_count >= MAX_HANDLES {
+        if efi_state.handle_count == efi_state.handles.len()
+            && efi_state.handles.try_reserve(1).is_err()
+        {
             return None;
         }
 
         let handle = efi_state.next_handle as *mut c_void;
         efi_state.next_handle += 1;
 
+        if efi_state.handle_count == efi_state.handles.len() {
+            efi_state.handles.push(HandleEntry::empty());
+        }
         let idx = efi_state.handle_count;
         efi_state.handles[idx].handle = handle;
         efi_state.handles[idx].protocol_count = 0;
@@ -2345,9 +2783,77 @@ pub fn create_handle() -> Option<Handle> {
     })
 }
 
+/// Driver, child-controller and exclusive relationships require an explicit close.
+fn protocol_open_blocks_removal(attributes: u32) -> bool {
+    attributes
+        & (efi::OPEN_PROTOCOL_BY_DRIVER
+            | efi::OPEN_PROTOCOL_BY_CHILD_CONTROLLER
+            | efi::OPEN_PROTOCOL_EXCLUSIVE)
+        != 0
+}
+
+/// Remove one protocol interface and reclaim an empty handle slot.
+fn remove_protocol(handle: Handle, guid: &Guid, interface: Option<*mut c_void>) -> Status {
+    with_tables_mut(|efi_state| {
+        if efi_state.open_protocols.iter().any(|open| {
+            open.handle == handle
+                && open.protocol == *guid
+                && protocol_open_blocks_removal(open.attributes)
+        }) {
+            return Status::ACCESS_DENIED;
+        }
+
+        let Some(handle_index) = efi_state.handles[..efi_state.handle_count]
+            .iter()
+            .position(|entry| entry.handle == handle)
+        else {
+            return Status::NOT_FOUND;
+        };
+        let entry = &mut efi_state.handles[handle_index];
+        let Some(protocol_index) =
+            entry.protocols[..entry.protocol_count]
+                .iter()
+                .position(|entry| {
+                    entry.guid == *guid && interface.is_none_or(|iface| entry.interface == iface)
+                })
+        else {
+            return Status::NOT_FOUND;
+        };
+
+        efi_state
+            .open_protocols
+            .retain(|open| open.handle != handle || open.protocol != *guid);
+        entry
+            .protocols
+            .copy_within(protocol_index + 1..entry.protocol_count, protocol_index);
+        entry.protocol_count -= 1;
+        entry.protocols[entry.protocol_count] = ProtocolEntry::empty();
+
+        if entry.protocol_count == 0 {
+            efi_state
+                .handles
+                .copy_within(handle_index + 1..efi_state.handle_count, handle_index);
+            efi_state.handle_count -= 1;
+            efi_state.handles[efi_state.handle_count] = HandleEntry::empty();
+        }
+
+        Status::SUCCESS
+    })
+}
+
 /// Install a protocol on an existing handle
 pub fn install_protocol(handle: Handle, guid: &Guid, interface: *mut c_void) -> Status {
-    with_tables_mut(|efi_state| {
+    install_protocol_internal(handle, guid, interface, true)
+}
+
+/// Install an instance, optionally deferring notification until a transaction commits.
+fn install_protocol_internal(
+    handle: Handle,
+    guid: &Guid,
+    interface: *mut c_void,
+    notify: bool,
+) -> Status {
+    let (status, notify_events) = with_tables_mut(|efi_state| {
         if let Some(entry) = efi_state.handles[..efi_state.handle_count]
             .iter_mut()
             .find(|e| e.handle == handle)
@@ -2357,23 +2863,41 @@ pub fn install_protocol(handle: Handle, guid: &Guid, interface: *mut c_void) -> 
                 .iter()
                 .any(|p| p.guid == *guid)
             {
-                return Status::INVALID_PARAMETER;
+                return (Status::INVALID_PARAMETER, heapless::Vec::new());
             }
 
             if entry.protocol_count >= MAX_PROTOCOLS_PER_HANDLE {
-                return Status::OUT_OF_RESOURCES;
+                return (Status::OUT_OF_RESOURCES, heapless::Vec::new());
             }
 
+            let Some(generation) = efi_state.protocol_generation.checked_add(1) else {
+                return (Status::OUT_OF_RESOURCES, heapless::Vec::new());
+            };
+            efi_state.protocol_generation = generation;
             entry.protocols[entry.protocol_count] = ProtocolEntry {
                 guid: *guid,
                 interface,
+                generation,
             };
             entry.protocol_count += 1;
-            return Status::SUCCESS;
+            let events = if notify {
+                protocol_notification_events(efi_state, guid)
+            } else {
+                heapless::Vec::new()
+            };
+            return (Status::SUCCESS, events);
         }
 
-        Status::INVALID_PARAMETER
-    })
+        (Status::INVALID_PARAMETER, heapless::Vec::new())
+    });
+
+    // Signaled outside the state borrow: notify callbacks call back into Boot
+    // Services, and a nested mutable borrow trips the state re-entrancy guard.
+    for event in notify_events {
+        signal_event(event);
+    }
+
+    status
 }
 
 /// Look up a protocol interface on a handle (internal helper).

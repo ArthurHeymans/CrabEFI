@@ -29,6 +29,7 @@ rustc --edition=2024 --test \
 "$TMPDIR/pool_free_list_tests"
 
 for test_source in \
+    "$ROOT/crabefi-core/src/efi/block_range.rs" \
     "$ROOT/crabefi-core/src/efi/dma_range.rs" \
     "$ROOT/crabefi-core/src/drivers/mmio_bounds.rs" \
     "$ROOT/crabefi-core/src/drivers/nvme/logic.rs" \

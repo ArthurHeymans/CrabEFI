@@ -5,6 +5,7 @@
 
 pub mod allocator;
 pub mod auth;
+pub(crate) mod block_range;
 pub mod boot_services;
 pub mod capsule;
 pub mod dma;
