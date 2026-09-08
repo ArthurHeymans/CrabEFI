@@ -16,12 +16,50 @@ fn bulk_dma_offset(address: u64) -> usize {
     (address.wrapping_neg() & (TD_MAX_TRANSFER_SIZE as u64 - 1)) as usize
 }
 
+/// Owns the DMA buffer for one endpoint across nonblocking polls.
+pub(super) struct InterruptPoll {
+    slot: u8,
+    dci: u8,
+    td: u64,
+    bounce: Option<DmaBuffer>,
+    offset: usize,
+    len: usize,
+    completion: Option<super::RawTrb>,
+}
+
+impl InterruptPoll {
+    fn capture(&mut self, raw: super::RawTrb) -> bool {
+        let pointer = u64::from(raw[0]) | (u64::from(raw[1]) << 32);
+        let slot = (raw[3] >> 24) as u8;
+        let dci = ((raw[3] >> 16) & 0x1f) as u8;
+        if super::raw_trb_type(&raw) == 32
+            && self.slot == slot
+            && self.dci == dci
+            && self.td == pointer
+        {
+            self.completion = Some(raw);
+            true
+        } else {
+            false
+        }
+    }
+}
+
+impl Drop for InterruptPoll {
+    fn drop(&mut self) {
+        if self.td != 0 && self.completion.is_none() {
+            // No completion proves that DMA stopped. Preserve the mapping if
+            // the controller is dropped without first quiescing this endpoint.
+            if let Some(bounce) = self.bounce.take() {
+                core::mem::forget(bounce);
+            }
+        }
+    }
+}
+
 impl super::XhciController {
-    /// Perform a single synchronous interrupt IN transfer.
-    ///
-    /// Queues one Normal TRB on the interrupt endpoint's transfer ring,
-    /// uses a DMA-domain bounce buffer, and waits for its completion event.
-    /// Failed polls cancel the old TD before releasing that buffer.
+    /// Poll a persistent interrupt IN TD without waiting for a NAKing device.
+    /// Zero means no report yet, not a completed zero-filled HID report.
     pub(super) fn interrupt_transfer_impl(
         &mut self,
         slot_id: u8,
@@ -34,73 +72,122 @@ impl super::XhciController {
         if data.is_empty() {
             return Ok(0);
         }
+        self.poll_interrupt_events()?;
         let in_dci = (endpoint as usize * 2) + 1;
-        let domain = pci::dma_domain(self.pci_address).ok_or(XhciError::NotReady)?;
-        let mask = if self
-            .registers
-            .capability
-            .hccparams1
-            .read_volatile()
-            .addressing_capability()
-        {
-            DmaMask::bits64()
+        let index = self
+            .interrupt_polls
+            .iter()
+            .position(|poll| poll.slot == slot_id && poll.dci == in_dci as u8);
+        let mut transferred = 0;
+        let mut poll = if let Some(index) = index {
+            let poll = &self.interrupt_polls[index];
+            if poll.len != data.len() {
+                return Err(XhciError::InvalidParameter);
+            }
+            let Some(raw) = poll.completion else {
+                return Ok(0);
+            };
+            // Leave failed endpoints quarantined. Never reset an idle endpoint
+            // or repeatedly allocate buffers when a device is unplugged.
+            let event =
+                event::TransferEvent::try_from(raw).map_err(|_| XhciError::InvalidParameter)?;
+            if !matches!(
+                event.completion_code(),
+                Ok(event::CompletionCode::Success | event::CompletionCode::ShortPacket)
+            ) {
+                return Err(XhciError::TransferFailed(event.completion_code()));
+            }
+            let poll = self.interrupt_polls.swap_remove(index);
+            let bounce = poll.bounce.as_ref().ok_or(XhciError::NotReady)?;
+            bounce
+                .sync_for_cpu(0..bounce.len(), DmaDirection::FromDevice)
+                .map_err(|_| XhciError::NotReady)?;
+            transferred = poll
+                .len
+                .saturating_sub(event.trb_transfer_length() as usize);
+            data[..transferred]
+                .copy_from_slice(&bounce.as_slice()[poll.offset..poll.offset + transferred]);
+            poll
         } else {
-            DmaMask::bits32()
+            let domain = pci::dma_domain(self.pci_address).ok_or(XhciError::NotReady)?;
+            let mask = if self
+                .registers
+                .capability
+                .hccparams1
+                .read_volatile()
+                .addressing_capability()
+            {
+                DmaMask::bits64()
+            } else {
+                DmaMask::bits32()
+            };
+            let bounce =
+                DmaBuffer::allocate_in_domain(data.len() + TD_MAX_TRANSFER_SIZE - 1, mask, domain)
+                    .map_err(|_| XhciError::AllocationFailed)?;
+            let offset = bulk_dma_offset(bounce.dma_address());
+            InterruptPoll {
+                slot: slot_id,
+                dci: in_dci as u8,
+                td: 0,
+                bounce: Some(bounce),
+                offset,
+                len: data.len(),
+                completion: None,
+            }
         };
-        let bounce =
-            DmaBuffer::allocate_in_domain(data.len() + TD_MAX_TRANSFER_SIZE - 1, mask, domain)
-                .map_err(|_| XhciError::AllocationFailed)?;
-        let offset = bulk_dma_offset(bounce.dma_address());
+        let bounce = poll.bounce.as_ref().ok_or(XhciError::NotReady)?;
         bounce
             .sync_for_device(0..bounce.len(), DmaDirection::FromDevice)
             .map_err(|_| XhciError::NotReady)?;
-        let td = self.queue_bulk_trb(
+        poll.td = self.queue_bulk_trb(
             slot_id,
             in_dci,
             true,
-            bounce.dma_address() + offset as u64,
-            data.len(),
+            bounce.dma_address() + poll.offset as u64,
+            poll.len,
         )?;
+        poll.completion = None;
+        self.interrupt_polls.push(poll);
         barrier::mmio_write();
         self.ring_doorbell(slot_id, in_dci as u8);
+        Ok(transferred)
+    }
 
-        match self.wait_transfer_td(slot_id, endpoint, td) {
-            Ok(residual) => {
-                bounce
-                    .sync_for_cpu(0..bounce.len(), DmaDirection::FromDevice)
-                    .map_err(|_| XhciError::NotReady)?;
-                let transferred = data.len().saturating_sub(residual as usize);
-                data[..transferred]
-                    .copy_from_slice(&bounce.as_slice()[offset..offset + transferred]);
-                Ok(transferred)
-            }
-            Err(error) => {
-                // A timeout does not cancel DMA. Stop and skip the old TD before
-                // allowing another poll; Reset Endpoint is only for halted EPs.
-                let cancelled = if matches!(error, XhciError::StallError) {
-                    self.reset_endpoint(slot_id, in_dci as u8)
-                } else {
-                    self.stop_endpoint(slot_id, in_dci as u8)
-                };
-                if cancelled.is_err() {
-                    // Quarantine the endpoint and retain its DMA mapping if we
-                    // cannot prove the old TD is no longer controller-owned.
-                    core::mem::forget(bounce);
-                    if let Some(slot) = self
-                        .slots
-                        .get_mut(slot_id as usize)
-                        .and_then(Option::as_mut)
-                    {
-                        slot.transfer_rings[in_dci - 1] = None;
+    /// Route completions even when command or bulk-transfer code owns the ring.
+    pub(super) fn capture_interrupt_event(&mut self, raw: super::RawTrb) -> bool {
+        self.interrupt_polls
+            .iter_mut()
+            .any(|poll| poll.capture(raw))
+    }
+
+    fn poll_interrupt_events(&mut self) -> Result<(), XhciError> {
+        // Bounded even if hardware keeps publishing events while we poll.
+        // Command/bulk operations are synchronous and never overlap this poll.
+        for _ in 0..self.event_ring.size {
+            let address = self.event_ring.base + (self.event_ring.dequeue_idx * 16) as u64;
+            let Some(raw) = super::read_event_trb(address, self.event_ring.cycle) else {
+                break;
+            };
+            if !self.capture_interrupt_event(raw) {
+                match event::Allowed::try_from(raw) {
+                    // USB hotplug is not implemented, as in the synchronous waiters.
+                    Ok(event::Allowed::PortStatusChange(_)) => {}
+                    Ok(event::Allowed::HostController(host)) => {
+                        return Err(XhciError::TransferFailed(host.completion_code()));
                     }
-                } else {
-                    bounce
-                        .sync_for_cpu(0..bounce.len(), DmaDirection::FromDevice)
-                        .map_err(|_| XhciError::NotReady)?;
+                    // Preserve any unrelated completion for its synchronous
+                    // waiter rather than silently stealing it from the ring.
+                    _ => break,
                 }
-                Err(error)
             }
+            self.event_ring.dequeue_idx += 1;
+            if self.event_ring.dequeue_idx == self.event_ring.size {
+                self.event_ring.dequeue_idx = 0;
+                self.event_ring.cycle = !self.event_ring.cycle;
+            }
+            self.update_erdp();
         }
+        Ok(())
     }
 
     /// Configure bulk endpoints
@@ -377,7 +464,34 @@ impl super::XhciController {
 
 #[cfg(test)]
 mod tests {
-    use super::{TD_MAX_TRANSFER_SIZE, bulk_dma_offset};
+    use super::{InterruptPoll, TD_MAX_TRANSFER_SIZE, bulk_dma_offset};
+
+    #[test]
+    fn interrupt_completion_matches_slot_direction_and_td() {
+        let mut poll = InterruptPoll {
+            slot: 2,
+            dci: 3,
+            td: 0x1000,
+            bounce: None,
+            offset: 0,
+            len: 8,
+            completion: None,
+        };
+        let completed = [
+            0x1000,
+            0,
+            (13 << 24) | 5,
+            (2 << 24) | (3 << 16) | (32 << 10) | 1,
+        ];
+        for (word, bit) in [(0, 4), (3, 1 << 24), (3, 1 << 16), (3, 1 << 10)] {
+            let mut unrelated = completed;
+            unrelated[word] ^= bit;
+            assert!(!poll.capture(unrelated));
+            assert!(poll.completion.is_none());
+        }
+        assert!(poll.capture(completed));
+        assert_eq!(poll.completion, Some(completed));
+    }
 
     #[test]
     fn bounce_window_fits_all_device_address_alignments() {

@@ -121,17 +121,6 @@ impl super::XhciController {
         self.discard_endpoint_transfers(slot_id, dci)
     }
 
-    /// Stop an active endpoint before releasing a timed-out transfer buffer.
-    pub(super) fn stop_endpoint(&mut self, slot_id: u8, dci: u8) -> Result<(), XhciError> {
-        let mut command = command::StopEndpoint::new();
-        command.set_slot_id(slot_id).set_endpoint_id(dci);
-        self.cmd_ring.enqueue(command, false);
-        barrier::mmio_write();
-        self.ring_doorbell(0, 0);
-        self.wait_command_completion()?;
-        self.discard_endpoint_transfers(slot_id, dci)
-    }
-
     /// Skip pending TDs while the endpoint is stopped or halted.
     fn discard_endpoint_transfers(&mut self, slot_id: u8, dci: u8) -> Result<(), XhciError> {
         // Step 2: Send Set TR Dequeue Pointer command

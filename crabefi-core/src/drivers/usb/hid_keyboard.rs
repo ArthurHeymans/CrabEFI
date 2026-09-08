@@ -12,6 +12,10 @@ use super::controller::{UsbController, UsbError, hid_request, req_type};
 use crate::time::Timeout;
 use spin::Mutex;
 
+#[cfg(test)]
+#[path = "hid_keyboard_tests.rs"]
+mod tests;
+
 // ============================================================================
 // HID Boot Protocol Keyboard
 // ============================================================================
@@ -90,6 +94,8 @@ pub struct UsbHidKeyboard {
     controller_idx: usize,
     /// Device address
     device_address: u8,
+    /// Interface owning the boot-protocol interrupt endpoint.
+    interface_number: u8,
     /// Interrupt endpoint number (USB endpoint hardware property)
     #[allow(dead_code)] // Endpoint descriptor shadow; completeness for re-enumeration.
     endpoint: u8,
@@ -131,6 +137,7 @@ impl UsbHidKeyboard {
         Self {
             controller_idx,
             device_address,
+            interface_number: 0,
             endpoint,
             max_packet,
             interval,
@@ -151,13 +158,15 @@ impl UsbHidKeyboard {
         &mut self,
         controller: &mut C,
     ) -> Result<(), UsbError> {
+        self.interface_number =
+            controller.hid_interface_number(self.device_address, self.endpoint)?;
         // SET_PROTOCOL with protocol = 0 (boot protocol)
         controller.control_transfer(
             self.device_address,
             req_type::DIR_OUT | req_type::TYPE_CLASS | req_type::RCPT_INTERFACE,
             hid_request::SET_PROTOCOL,
             0, // Boot protocol
-            0, // Interface 0
+            self.interface_number as u16,
             None,
         )?;
         Ok(())
@@ -176,7 +185,7 @@ impl UsbHidKeyboard {
             req_type::DIR_OUT | req_type::TYPE_CLASS | req_type::RCPT_INTERFACE,
             hid_request::SET_IDLE,
             (duration as u16) << 8, // Duration in high byte
-            0,                      // Interface 0
+            self.interface_number as u16,
             None,
         )?;
         Ok(())
@@ -199,7 +208,7 @@ impl UsbHidKeyboard {
             req_type::DIR_OUT | req_type::TYPE_CLASS | req_type::RCPT_INTERFACE,
             hid_request::SET_REPORT,
             0x0200, // Report type = Output (2), Report ID = 0
-            0,      // Interface 0
+            self.interface_number as u16,
             Some(&mut data),
         )?;
         Ok(())
@@ -745,19 +754,31 @@ pub fn poll<C: UsbController>(controller: &mut C) {
         None => return,
     };
 
-    // Try to get a report via control transfer (since interrupt queues aren't implemented)
+    poll_report(keyboard, controller);
+}
+
+fn poll_report<C: UsbController>(keyboard: &mut UsbHidKeyboard, controller: &mut C) {
+    // Most real keyboards require interrupt IN; GET_REPORT is only a legacy
+    // controller fallback. A pending interrupt TD is not an all-keys-up report.
     let mut report_buf = [0u8; 8];
-    let result = controller.control_transfer(
+    let result = match controller.interrupt_transfer(
         keyboard.device_address(),
-        req_type::DIR_IN | req_type::TYPE_CLASS | req_type::RCPT_INTERFACE,
-        hid_request::GET_REPORT,
-        0x0100, // Report type = Input (1), Report ID = 0
-        0,      // Interface 0
-        Some(&mut report_buf),
-    );
+        keyboard.endpoint,
+        &mut report_buf,
+    ) {
+        Err(UsbError::NotSupported) => controller.control_transfer(
+            keyboard.device_address(),
+            req_type::DIR_IN | req_type::TYPE_CLASS | req_type::RCPT_INTERFACE,
+            hid_request::GET_REPORT,
+            0x0100,
+            keyboard.interface_number as u16,
+            Some(&mut report_buf),
+        ),
+        result => result,
+    };
 
     match result {
-        Ok(_) => {
+        Ok(8) => {
             let report = KeyboardReport {
                 modifiers: report_buf[0],
                 reserved: report_buf[1],
@@ -772,8 +793,8 @@ pub fn poll<C: UsbController>(controller: &mut C) {
             };
             keyboard.process_report(&report);
         }
-        Err(_) => {
-            // Silently ignore errors - keyboard might not have anything new
+        _ => {
+            // No completion, short report, or error: retain the held-key state.
         }
     }
 

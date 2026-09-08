@@ -15,6 +15,10 @@ use crate::time::Timeout;
 use core::ptr;
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned};
 
+#[cfg(test)]
+#[path = "configuration_tests.rs"]
+mod configuration_tests;
+
 // ============================================================================
 // USB Speed
 // ============================================================================
@@ -681,7 +685,10 @@ pub trait UsbController {
         data: &mut [u8],
     ) -> Result<usize, UsbError>;
 
-    /// Perform a single synchronous interrupt IN transfer.
+    /// Poll an interrupt IN endpoint without waiting for input.
+    ///
+    /// Returns zero while a report is pending. Implementations must retain DMA
+    /// ownership between polls and must not keep a pointer into `data`.
     ///
     /// This is the correct way to poll HID devices (mice, keyboards) since
     /// many devices do not implement the GET_REPORT class request and will
@@ -696,6 +703,36 @@ pub trait UsbController {
         _data: &mut [u8],
     ) -> Result<usize, UsbError> {
         Err(UsbError::NotSupported)
+    }
+
+    /// Fetch a complete, bounded configuration; never parse a truncated prefix.
+    fn read_configuration(&mut self, device: u8) -> Result<ConfigurationInfo, UsbError> {
+        read_configuration_with(|buffer| {
+            self.control_transfer(
+                device,
+                req_type::DIR_IN | req_type::TYPE_STANDARD | req_type::RCPT_DEVICE,
+                request::GET_DESCRIPTOR,
+                (desc_type::CONFIGURATION as u16) << 8,
+                0,
+                Some(buffer),
+            )
+        })
+    }
+
+    /// Resolve the interface owning a discovered HID interrupt endpoint.
+    /// Composite devices need this interface number in every HID class request.
+    fn hid_interface_number(&mut self, device: u8, endpoint: u8) -> Result<u8, UsbError> {
+        let config = self.read_configuration(device)?;
+        config.interfaces[..config.num_interfaces]
+            .iter()
+            .find(|iface| {
+                (iface.is_hid_keyboard() || iface.is_hid_mouse())
+                    && iface
+                        .find_interrupt_in()
+                        .is_some_and(|ep| ep.number == endpoint)
+            })
+            .map(|iface| iface.interface_number)
+            .ok_or(UsbError::DeviceNotFound)
     }
 
     /// Create an interrupt transfer queue
@@ -1094,8 +1131,131 @@ impl<'a> Iterator for DescriptorIterator<'a> {
     }
 }
 
-/// Parse configuration descriptor to find interfaces and endpoints
+/// Firmware resource limits. Descriptors beyond these limits are rejected,
+/// not partially interpreted as a different set of device functions.
+const MAX_CONFIGURATION_DESCRIPTOR_SIZE: usize = 4096;
+const MAX_CONFIGURATION_INTERFACES: usize = 8;
+const MAX_INTERFACE_ENDPOINTS: usize = 4;
+
+fn read_configuration_with(
+    mut read: impl FnMut(&mut [u8]) -> Result<usize, UsbError>,
+) -> Result<ConfigurationInfo, UsbError> {
+    let mut header = [0u8; 9];
+    if read(&mut header)? != header.len() || header[0] != 9 || header[1] != desc_type::CONFIGURATION
+    {
+        return Err(UsbError::InvalidParameter);
+    }
+    let length = u16::from_le_bytes([header[2], header[3]]) as usize;
+    if length < header.len() {
+        return Err(UsbError::InvalidParameter);
+    }
+    if length > MAX_CONFIGURATION_DESCRIPTOR_SIZE {
+        return Err(UsbError::NotSupported);
+    }
+    let mut buffer = alloc::vec![0; length];
+    if read(&mut buffer)? != length {
+        return Err(UsbError::InvalidParameter);
+    }
+    parse_configuration_checked(&buffer)
+}
+
+pub fn parse_configuration_checked(config_data: &[u8]) -> Result<ConfigurationInfo, UsbError> {
+    if config_data.len() < 9
+        || config_data[0] != 9
+        || config_data[1] != desc_type::CONFIGURATION
+        || u16::from_le_bytes([config_data[2], config_data[3]]) as usize != config_data.len()
+        || config_data[5] == 0
+    {
+        return Err(UsbError::InvalidParameter);
+    }
+    if config_data.len() > MAX_CONFIGURATION_DESCRIPTOR_SIZE {
+        return Err(UsbError::NotSupported);
+    }
+    let mut bytes = 0;
+    let mut interfaces = 0;
+    let mut seen = [false; 256];
+    let mut active = false;
+    let mut hid = false;
+    let mut endpoints = 0;
+    let mut expected_endpoints = 0;
+    let mut interrupt_packet = None;
+    for (kind, data) in DescriptorIterator::new(config_data) {
+        bytes += data.len();
+        match kind {
+            desc_type::INTERFACE => {
+                if (active && endpoints != expected_endpoints) || data.len() < 9 {
+                    return Err(UsbError::InvalidParameter);
+                }
+                // SET_CONFIGURATION activates alternate setting zero only.
+                active = data[3] == 0;
+                hid = data[5] == class::HID && data[6] == 1 && matches!(data[7], 1 | 2);
+                endpoints = 0;
+                expected_endpoints = data[4] as usize;
+                interrupt_packet = None;
+                if active {
+                    if seen[data[2] as usize] {
+                        return Err(UsbError::InvalidParameter);
+                    }
+                    seen[data[2] as usize] = true;
+                    interfaces += 1;
+                    if interfaces > MAX_CONFIGURATION_INTERFACES
+                        || expected_endpoints > MAX_INTERFACE_ENDPOINTS
+                    {
+                        return Err(UsbError::NotSupported);
+                    }
+                }
+            }
+            desc_type::ENDPOINT => {
+                if data.len() < 7 {
+                    return Err(UsbError::InvalidParameter);
+                }
+                interrupt_packet = None;
+                if active {
+                    endpoints += 1;
+                    if endpoints > expected_endpoints {
+                        return Err(UsbError::InvalidParameter);
+                    }
+                    if hid && data[2] & 0x80 != 0 && data[3] & 3 == 3 {
+                        interrupt_packet = Some(u16::from_le_bytes([data[4], data[5]]) & 0x7ff);
+                    }
+                }
+            }
+            48 if interrupt_packet.is_some() => {
+                // SuperSpeed Endpoint Companion. The current HID context
+                // supports one packet per interval, not bursts or SS extensions.
+                if data.len() < 6 {
+                    return Err(UsbError::InvalidParameter);
+                }
+                if data[2] != 0
+                    || data[3] != 0
+                    || Some(u16::from_le_bytes([data[4], data[5]])) != interrupt_packet
+                {
+                    return Err(UsbError::NotSupported);
+                }
+                interrupt_packet = None;
+            }
+            _ => {}
+        }
+    }
+    if bytes != config_data.len()
+        || (active && endpoints != expected_endpoints)
+        || interfaces != config_data[4] as usize
+    {
+        return Err(UsbError::InvalidParameter);
+    }
+    Ok(parse_configuration_inner(config_data))
+}
+
+/// Compatibility entry point for legacy enumeration. Invalid or unsupported
+/// descriptors must expose no partial interfaces/endpoints to those callers.
 pub fn parse_configuration(config_data: &[u8]) -> ConfigurationInfo {
+    parse_configuration_checked(config_data).unwrap_or_else(|error| {
+        log::warn!("USB: rejected configuration descriptor: {:?}", error);
+        ConfigurationInfo::default()
+    })
+}
+
+fn parse_configuration_inner(config_data: &[u8]) -> ConfigurationInfo {
     let mut info = ConfigurationInfo::default();
 
     if config_data.len() < 9 {
@@ -1123,7 +1283,9 @@ pub fn parse_configuration(config_data: &[u8]) -> ConfigurationInfo {
                 }
 
                 // Parse interface descriptor using zerocopy
-                if let Ok((iface, _)) = InterfaceDescriptor::read_from_prefix(desc_data) {
+                if let Ok((iface, _)) = InterfaceDescriptor::read_from_prefix(desc_data)
+                    && iface.alternate_setting == 0
+                {
                     current_interface = Some(InterfaceInfo {
                         interface_number: iface.interface_number,
                         alternate_setting: iface.alternate_setting,
@@ -1203,14 +1365,14 @@ impl InterfaceInfo {
 
     /// Check if this is a HID keyboard interface
     pub fn is_hid_keyboard(&self) -> bool {
-        self.interface_class == class::HID
+        self.alternate_setting == 0 && self.interface_class == class::HID
             && self.interface_subclass == 0x01 // Boot interface
             && self.interface_protocol == 0x01 // Keyboard
     }
 
     /// Check if this is a HID mouse interface (boot protocol mouse)
     pub fn is_hid_mouse(&self) -> bool {
-        self.interface_class == class::HID
+        self.alternate_setting == 0 && self.interface_class == class::HID
             && self.interface_subclass == 0x01 // Boot interface
             && self.interface_protocol == 0x02 // Mouse
     }
@@ -1319,32 +1481,16 @@ where
     log::info!("  Device {}: VID={:04x} PID={:04x}", address, vid, pid);
 
     // Step 4: Get configuration descriptor
-    let mut config_buf = [0u8; 256];
-    let mut header = [0u8; 9];
-
-    do_control(
-        &device,
-        req_type::DIR_IN | req_type::TYPE_STANDARD | req_type::RCPT_DEVICE,
-        request::GET_DESCRIPTOR,
-        (desc_type::CONFIGURATION as u16) << 8,
-        0,
-        Some(&mut header),
-    )?;
-
-    let total_len = u16::from_le_bytes([header[2], header[3]]) as usize;
-    let total_len = total_len.min(config_buf.len());
-
-    do_control(
-        &device,
-        req_type::DIR_IN | req_type::TYPE_STANDARD | req_type::RCPT_DEVICE,
-        request::GET_DESCRIPTOR,
-        (desc_type::CONFIGURATION as u16) << 8,
-        0,
-        Some(&mut config_buf[..total_len]),
-    )?;
-
-    // Step 5: Parse configuration
-    device.config_info = parse_configuration(&config_buf[..total_len]);
+    device.config_info = read_configuration_with(|buffer| {
+        do_control(
+            &device,
+            req_type::DIR_IN | req_type::TYPE_STANDARD | req_type::RCPT_DEVICE,
+            request::GET_DESCRIPTOR,
+            (desc_type::CONFIGURATION as u16) << 8,
+            0,
+            Some(buffer),
+        )
+    })?;
 
     // Check if this is a hub (device class)
     if device.device_desc.device_class == class::HUB {

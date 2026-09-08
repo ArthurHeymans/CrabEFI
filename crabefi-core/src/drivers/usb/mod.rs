@@ -538,20 +538,11 @@ impl UsbController for XhciController {
     }
 
     fn find_hid_keyboard(&self) -> Option<u8> {
-        // Check all slots for HID keyboard devices
-        (0..xhci::MAX_SLOTS as u8).find(|&slot_id| {
-            self.get_slot(slot_id)
-                .map(|slot| slot.is_hid_keyboard)
-                .unwrap_or(false)
-        })
+        self.find_slot(|slot| slot.is_hid_keyboard)
     }
 
     fn find_hid_mouse(&self) -> Option<u8> {
-        (0..xhci::MAX_SLOTS as u8).find(|&slot_id| {
-            self.get_slot(slot_id)
-                .map(|slot| slot.is_hid_mouse)
-                .unwrap_or(false)
-        })
+        self.find_slot(|slot| slot.is_hid_mouse)
     }
 
     fn get_mouse_interrupt_endpoint(&self, device: u8) -> Option<self::controller::EndpointInfo> {

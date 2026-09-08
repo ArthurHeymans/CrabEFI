@@ -53,6 +53,8 @@ pub struct UsbHidMouse {
     controller_idx: usize,
     /// Device address
     device_address: u8,
+    /// Interface owning the boot-protocol interrupt endpoint.
+    interface_number: u8,
     /// Interrupt endpoint number
     endpoint: u8,
     /// Max packet size
@@ -85,6 +87,7 @@ impl UsbHidMouse {
         Self {
             controller_idx,
             device_address,
+            interface_number: 0,
             endpoint,
             max_packet,
             interval,
@@ -97,13 +100,15 @@ impl UsbHidMouse {
     }
 
     /// Set boot protocol mode
-    fn set_boot_protocol<C: UsbController>(&self, controller: &mut C) -> Result<(), UsbError> {
+    fn set_boot_protocol<C: UsbController>(&mut self, controller: &mut C) -> Result<(), UsbError> {
+        self.interface_number =
+            controller.hid_interface_number(self.device_address, self.endpoint)?;
         controller.control_transfer(
             self.device_address,
             req_type::DIR_OUT | req_type::TYPE_CLASS | req_type::RCPT_INTERFACE,
             hid_request::SET_PROTOCOL,
             0, // Boot protocol
-            0, // Interface 0
+            self.interface_number as u16,
             None,
         )?;
         Ok(())
@@ -117,7 +122,7 @@ impl UsbHidMouse {
             req_type::DIR_OUT | req_type::TYPE_CLASS | req_type::RCPT_INTERFACE,
             hid_request::SET_IDLE,
             (duration as u16) << 8,
-            0,
+            self.interface_number as u16,
             None,
         )?;
         Ok(())
@@ -187,7 +192,7 @@ pub fn init_mouse<C: UsbController>(
         ep_info.interval
     );
 
-    let mouse = UsbHidMouse::new(
+    let mut mouse = UsbHidMouse::new(
         controller_idx,
         device_addr,
         ep_info.number,
@@ -280,7 +285,7 @@ pub fn poll<C: UsbController>(controller: &mut C) {
         req_type::DIR_IN | req_type::TYPE_CLASS | req_type::RCPT_INTERFACE,
         hid_request::GET_REPORT,
         0x0100, // Report type = Input (1), Report ID = 0
-        0,      // Interface 0
+        mouse.interface_number as u16,
         Some(&mut ctrl_buf),
     );
 
