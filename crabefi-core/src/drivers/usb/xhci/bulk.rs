@@ -355,8 +355,10 @@ impl super::XhciController {
             barrier::mmio_write();
             self.ring_doorbell(slot_id, dci as u8);
 
-            // Error paths retain the allocation: a timeout or failed recovery
-            // does not prove that the controller has stopped referencing it.
+            // A timeout does not prove the controller has stopped referencing
+            // the buffer, so it is retained below. Error completions (stall,
+            // babble) do: the event means the controller finished with the TD,
+            // so those arms release the bounce window.
             match self.wait_transfer_td(slot_id, ep, td) {
                 Ok(residual) => {
                     bounce
@@ -378,7 +380,9 @@ impl super::XhciController {
                     }
                 }
                 Err(XhciError::StallError) => {
-                    core::mem::forget(bounce);
+                    // The transfer event proves the controller finished with this
+                    // TD, so the bounce window is safe to release even if the
+                    // endpoint reset below fails.
                     log::debug!(
                         "xHCI: Bulk transfer stalled on slot={} dci={}, resetting endpoint",
                         slot_id,
@@ -393,7 +397,7 @@ impl super::XhciController {
                     cc @ (event::CompletionCode::BabbleDetectedError
                     | event::CompletionCode::UsbTransactionError),
                 ))) => {
-                    core::mem::forget(bounce);
+                    // Same as the stall arm: the error completion retires the TD.
                     log::debug!(
                         "xHCI: Bulk transfer failed with {:?} on slot={} dci={}, resetting endpoint",
                         cc,
@@ -410,6 +414,8 @@ impl super::XhciController {
                     return Err(XhciError::TransferFailed(Ok(cc)));
                 }
                 Err(e) => {
+                    // Timeout or an unrecovered error: the controller may still
+                    // own the TD, so retain the DMA mapping rather than free it.
                     core::mem::forget(bounce);
                     return Err(e);
                 }
