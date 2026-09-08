@@ -1,13 +1,36 @@
 //! xHCI endpoint configuration by device class.
 
-use super::super::controller::{
-    ConfigurationInfo, desc_type, parse_configuration, req_type, request,
-};
+use super::super::controller::{ConfigurationInfo, UsbController};
 use super::{TrbRing, XhciError};
 use crate::barrier;
 use crate::efi;
 use xhci::context::EndpointType;
 use xhci::ring::trb::command;
+
+/// xHCI schedules in powers of two microframes. Never poll less frequently
+/// than the LS/FS descriptor requests; HS/SS bInterval is already exponent + 1.
+fn hid_interval(speed: u8, interval: u8) -> u8 {
+    if speed >= 3 {
+        interval.clamp(1, 16) - 1
+    } else {
+        ((interval.max(1) as u32 * 8).ilog2() as u8).max(3)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::hid_interval;
+
+    #[test]
+    fn interrupt_intervals_respect_usb_periods() {
+        assert_eq!(hid_interval(1, 1), 3);
+        assert_eq!(hid_interval(2, 10), 6); // 8 ms, not 16 ms
+        assert_eq!(hid_interval(1, 255), 10);
+        assert_eq!(hid_interval(3, 1), 0);
+        assert_eq!(hid_interval(3, 4), 3);
+        assert_eq!(hid_interval(4, 16), 15);
+    }
+}
 
 impl super::XhciController {
     /// Fetch and parse the full configuration descriptor for a device
@@ -15,37 +38,14 @@ impl super::XhciController {
         &mut self,
         slot_id: u8,
     ) -> Result<ConfigurationInfo, XhciError> {
-        let mut config_buf = [0u8; 256];
-
-        // First get just the header to learn total length
-        let mut header = [0u8; 9];
-        self.control_transfer(
-            slot_id,
-            req_type::DIR_IN | req_type::TYPE_STANDARD | req_type::RCPT_DEVICE,
-            request::GET_DESCRIPTOR,
-            (desc_type::CONFIGURATION as u16) << 8,
-            0,
-            Some(&mut header),
-        )?;
-
-        let total_len = u16::from_le_bytes([header[2], header[3]]) as usize;
-        if total_len < header.len() {
-            log::debug!("xHCI: invalid wTotalLength {}", total_len);
-            return Err(XhciError::InvalidParameter);
-        }
-        let total_len = total_len.min(config_buf.len());
-
-        // Get full configuration
-        self.control_transfer(
-            slot_id,
-            req_type::DIR_IN | req_type::TYPE_STANDARD | req_type::RCPT_DEVICE,
-            request::GET_DESCRIPTOR,
-            (desc_type::CONFIGURATION as u16) << 8,
-            0,
-            Some(&mut config_buf[..total_len]),
-        )?;
-
-        Ok(parse_configuration(&config_buf[..total_len]))
+        self.read_configuration(slot_id).map_err(|error| {
+            log::warn!(
+                "xHCI: configuration descriptor for slot {}: {:?}",
+                slot_id,
+                error
+            );
+            XhciError::UsbError
+        })
     }
 
     /// Configure a mass storage device
@@ -166,10 +166,24 @@ impl super::XhciController {
             return Err(XhciError::DeviceNotFound);
         }
 
-        // Set configuration
-        self.set_configuration(slot_id, config_info.configuration_value)?;
+        // Do not reset another function's already-configured endpoints.
+        let already_configured = self
+            .slots
+            .get(slot_id as usize)
+            .and_then(Option::as_ref)
+            .is_some_and(|slot| slot.is_mass_storage || slot.is_hid_mouse);
+        if !already_configured {
+            self.set_configuration(slot_id, config_info.configuration_value)?;
+        }
 
-        // Update slot info (but don't configure endpoint - we use control transfers for HID)
+        self.configure_hid_interrupt_endpoint(
+            slot_id,
+            interrupt_in,
+            interrupt_max_packet,
+            interrupt_interval,
+        )?;
+
+        // Update slot info after configuring the interrupt pipe.
         if let Some(slot) = self
             .slots
             .get_mut(slot_id as usize)
@@ -187,10 +201,7 @@ impl super::XhciController {
 
     /// Configure a HID mouse device.
     ///
-    /// Unlike the keyboard (which may get away with GET_REPORT on some
-    /// hardware), USB mice almost universally require interrupt IN transfers.
-    /// We configure the interrupt endpoint with a transfer ring here so that
-    /// `interrupt_transfer()` can queue Normal TRBs on it later.
+    /// Configure the interrupt pipe, shared with HID keyboards.
     pub(super) fn configure_hid_mouse(&mut self, slot_id: u8) -> Result<(), XhciError> {
         let config_info = self.get_config_descriptor(slot_id)?;
 
@@ -229,6 +240,35 @@ impl super::XhciController {
             self.set_configuration(slot_id, config_info.configuration_value)?;
         }
 
+        self.configure_hid_interrupt_endpoint(
+            slot_id,
+            interrupt_in,
+            interrupt_max_packet,
+            interrupt_interval,
+        )?;
+        if let Some(slot) = self
+            .slots
+            .get_mut(slot_id as usize)
+            .and_then(Option::as_mut)
+        {
+            slot.is_hid_mouse = true;
+            slot.mouse_interrupt_in_ep = interrupt_in;
+            slot.mouse_interrupt_max_packet = interrupt_max_packet;
+            slot.mouse_interrupt_interval = interrupt_interval;
+        }
+        Ok(())
+    }
+
+    fn configure_hid_interrupt_endpoint(
+        &mut self,
+        slot_id: u8,
+        interrupt_in: u8,
+        interrupt_max_packet: u16,
+        interrupt_interval: u8,
+    ) -> Result<(), XhciError> {
+        if interrupt_in == 0 || interrupt_in > 15 || interrupt_max_packet == 0 {
+            return Err(XhciError::InvalidParameter);
+        }
         // ── Configure the interrupt IN endpoint on the xHC ──
         //
         // Allocate a transfer ring and tell the controller about the endpoint
@@ -248,10 +288,6 @@ impl super::XhciController {
                 .and_then(|s| s.as_mut())
                 .ok_or(XhciError::DeviceNotFound)?;
 
-            slot.is_hid_mouse = true;
-            slot.mouse_interrupt_in_ep = interrupt_in;
-            slot.mouse_interrupt_max_packet = interrupt_max_packet;
-            slot.mouse_interrupt_interval = interrupt_interval;
             slot.transfer_rings[in_dci - 1] = Some(ring);
 
             // Set up input context for Configure Endpoint
@@ -261,7 +297,8 @@ impl super::XhciController {
             }
             Self::copy_device_slot_context(input, slot.device_context, context_size);
             let slot_ctx = Self::input_slot_context(input, context_size);
-            slot_ctx.set_context_entries(in_dci as u8);
+            // Adding a second HID function must not hide a higher existing DCI.
+            slot_ctx.set_context_entries(slot_ctx.context_entries().max(in_dci as u8));
             let control = Self::input_control_context(input, context_size);
             control.set_add_context_flag(0);
             control.set_add_context_flag(in_dci);
@@ -271,31 +308,27 @@ impl super::XhciController {
             //   For LS/FS: period = 2^(Interval) * 125µs, bInterval is in ms
             //   Use Interval such that 2^Interval ≈ bInterval * 8
             //   For HS: bInterval already is exponent+1
-            let speed = slot.speed;
-            let xhci_interval = if speed >= 3 {
-                // High/Super speed: bInterval is already exponent form
-                interrupt_interval.max(1)
+            let xhci_interval = hid_interval(slot.speed, interrupt_interval);
+            let max_packet = interrupt_max_packet & 0x7ff;
+            let max_burst = if slot.speed == 3 {
+                ((interrupt_max_packet >> 11) & 3) as u8
             } else {
-                // Low/Full speed: bInterval in ms, convert to 125µs exponent
-                // 2^N * 125µs ≈ bInterval * 1000µs → N ≈ log2(bInterval*8)
-                let frames = (interrupt_interval as u32).max(1) * 8;
-                let mut n = 0u8;
-                let mut v = 1u32;
-                while v < frames && n < 15 {
-                    n += 1;
-                    v <<= 1;
-                }
-                n.max(3) // At least 1ms (2^3 * 125µs)
+                0
             };
+            if max_packet == 0 || max_burst == 3 {
+                return Err(XhciError::InvalidParameter);
+            }
+            let payload = max_packet * (max_burst as u16 + 1);
 
             let ep_ctx = Self::input_ep_context(input, context_size, in_dci - 1);
             ep_ctx.set_endpoint_type(EndpointType::InterruptIn);
-            ep_ctx.set_max_packet_size(interrupt_max_packet);
-            ep_ctx.set_max_burst_size(0);
+            ep_ctx.set_max_packet_size(max_packet);
+            ep_ctx.set_max_burst_size(max_burst);
             ep_ctx.set_error_count(3);
             ep_ctx.set_tr_dequeue_pointer(ring_addr);
             ep_ctx.set_dequeue_cycle_state();
-            ep_ctx.set_average_trb_length(interrupt_max_packet);
+            ep_ctx.set_average_trb_length(max_packet);
+            ep_ctx.set_max_endpoint_service_time_interval_payload_low(payload);
             ep_ctx.set_interval(xhci_interval);
         }
 
@@ -318,7 +351,7 @@ impl super::XhciController {
         self.wait_command_completion()?;
 
         log::info!(
-            "USB HID Mouse configured on slot {}, interrupt EP {} (DCI {})",
+            "USB HID interrupt pipe configured on slot {}, EP {} (DCI {})",
             slot_id,
             interrupt_in,
             in_dci

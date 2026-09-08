@@ -44,6 +44,9 @@ impl super::XhciController {
                 }
                 self.update_erdp();
 
+                if self.capture_interrupt_event(raw) {
+                    continue;
+                }
                 match event::Allowed::try_from(raw) {
                     Ok(event::Allowed::CommandCompletion(completion)) => {
                         if (u64::from(raw[0]) | (u64::from(raw[1]) << 32)) != expected {
@@ -126,6 +129,9 @@ impl super::XhciController {
                 }
                 self.update_erdp();
 
+                if self.capture_interrupt_event(raw) {
+                    continue;
+                }
                 match event::Allowed::try_from(raw) {
                     Ok(event::Allowed::TransferEvent(transfer_event)) => {
                         let event_slot = (raw[3] >> 24) as u8;
@@ -223,7 +229,8 @@ impl super::XhciController {
                 }
                 consumed += 1;
 
-                if event::TransferEvent::try_from(raw).is_ok() {
+                if !self.capture_interrupt_event(raw) && event::TransferEvent::try_from(raw).is_ok()
+                {
                     drained += 1;
                 }
             } else {

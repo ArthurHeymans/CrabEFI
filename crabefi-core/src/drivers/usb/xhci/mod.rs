@@ -122,10 +122,12 @@ pub struct XhciController {
     /// Active device slots, indexed by slot ID.
     ///
     /// Slot IDs are assigned by the controller (1-based). We pre-fill the Vec
-    /// to `MAX_SLOTS` entries (all `None`) so slot IDs map directly to indices.
+    /// to `max_slots + 1` entries (all `None`), reserving index zero.
     /// All accesses use `.get()` / `.get_mut()` to safely handle out-of-range
     /// slot IDs without panicking.
-    slots: heapless::Vec<Option<UsbSlot>, MAX_SLOTS>,
+    slots: heapless::Vec<Option<UsbSlot>, { MAX_SLOTS + 1 }>,
+    /// Persistent interrupt TDs; their DMA buffers remain alive between polls.
+    interrupt_polls: alloc::vec::Vec<bulk::InterruptPoll>,
 }
 
 /// xHCI error type
@@ -166,14 +168,23 @@ unsafe impl Send for XhciController {}
 // through the parent XhciController. Single-threaded firmware ensures no races.
 unsafe impl Send for UsbSlot {}
 
+fn find_device_slot<T>(slots: &[Option<T>], mut matches: impl FnMut(&T) -> bool) -> Option<u8> {
+    slots.iter().enumerate().skip(1).find_map(|(id, slot)| {
+        slot.as_ref()
+            .filter(|slot| matches(slot))
+            .and_then(|_| u8::try_from(id).ok())
+    })
+}
+
 impl XhciController {
     /// Find a mass storage device
     pub fn find_mass_storage(&self) -> Option<u8> {
-        self.slots.iter().enumerate().find_map(|(slot_id, slot)| {
-            slot.as_ref()
-                .filter(|s| s.is_mass_storage)
-                .map(|_| slot_id as u8)
-        })
+        self.find_slot(|slot| slot.is_mass_storage)
+    }
+
+    /// Search the actual slot table, including its highest one-based slot ID.
+    pub(super) fn find_slot(&self, matches: impl FnMut(&UsbSlot) -> bool) -> Option<u8> {
+        find_device_slot(&self.slots, matches)
     }
 
     /// Get slot info
@@ -287,6 +298,23 @@ mod tests {
     use core::mem::size_of;
     use xhci::context::{self, InputHandler};
     use xhci::ring::trb::{self, command, event, transfer};
+
+    #[test]
+    fn discovery_includes_highest_slot_and_ignores_reserved_zero() {
+        let mut slots = [None; MAX_SLOTS + 1];
+        slots[0] = Some("keyboard");
+        assert_eq!(find_device_slot(&slots, |class| *class == "keyboard"), None);
+        for class in ["keyboard", "mouse", "storage"] {
+            slots[MAX_SLOTS] = Some(class);
+            assert_eq!(
+                find_device_slot(&slots, |value| *value == class),
+                Some(MAX_SLOTS as u8)
+            );
+        }
+        assert_eq!(find_device_slot(&slots[..MAX_SLOTS], |_| true), None);
+        slots[2] = Some("mouse");
+        assert_eq!(find_device_slot(&slots, |class| *class == "mouse"), Some(2));
+    }
 
     #[test]
     fn event_trb_read_requires_expected_cycle_and_returns_coherent_raw() {

@@ -123,10 +123,9 @@ impl super::XhciController {
             num_scratchpad_bufs
         );
 
-        // Pre-fill slot Vec to max_slots entries (all None) so slot IDs
-        // from the controller map directly to Vec indices.
+        // Slot IDs are one-based; include the highest advertised slot.
         let mut slots = heapless::Vec::new();
-        for _ in 0..max_slots {
+        for _ in 0..=max_slots {
             let _ = slots.push(None);
         }
 
@@ -143,6 +142,7 @@ impl super::XhciController {
             erst: 0,
             event_ring: TrbRing::empty(), // Will be initialized in init()
             slots,
+            interrupt_polls: alloc::vec::Vec::new(),
         };
 
         controller.init()?;
