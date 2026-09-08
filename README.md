@@ -39,6 +39,26 @@ nix develop
 ./crabefi build --arch aarch64
 ```
 
+## USB and pointing devices
+
+Connect USB boot drives and input devices **before starting CrabEFI**. USB
+hotplug/rescanning is not currently supported; restart after attaching a device.
+Native 4K logical sectors are supported, including GPT-partitioned USB storage.
+Hybrid ISO partitions must start and end on native logical-block boundaries;
+unaligned or out-of-device GPT ranges are rejected instead of rounded.
+
+USB configuration descriptors are bounded to 4 KiB, eight active interfaces,
+and four endpoints per interface. Alternate setting zero is used; CrabEFI does
+not activate other settings. SuperSpeed HID bursts and extended service payloads
+are explicitly unsupported rather than configured as single-packet endpoints.
+
+USB input uses HID boot-protocol keyboards and mice. The built-in PS/2 driver
+supports standard relative mice and Synaptics touchpads with PS/2 compatibility;
+SMBus/I²C-only touchpads and replacement trackpads using other protocols are not
+supported. `--features ui` enables the graphical menu, not additional touchpad
+protocols. When reporting a non-working replacement trackpad, include its model,
+Linux input-device identification, and CrabEFI's PS/2/USB initialization logs.
+
 ## Workspace Structure
 
 | Crate | Description |

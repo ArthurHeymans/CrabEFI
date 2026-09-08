@@ -520,7 +520,7 @@ fn run_no_media(fb: &FramebufferInfo) -> ScreenNav {
         cx,
         mid_y + 28,
         cw,
-        "Connect a USB drive to continue",
+        "Connect a USB drive, then press R to restart",
         FontSize::Small,
         theme::TEXT_DIM,
         None,
