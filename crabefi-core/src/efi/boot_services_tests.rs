@@ -73,8 +73,9 @@ fn next(registration: *mut c_void) -> Result<Handle, Status> {
 // One test owns the global database throughout: no parallel tests race its cells.
 #[test]
 fn protocol_transactions_cursors_and_open_lifecycle() {
+    let _execution = crate::efi::boot_services::IMAGE_EXECUTION_TEST_LOCK.lock().unwrap();
     with_tables_mut(|state| *state = Tables::new());
-    assert!(init_caches());
+    init_caches().unwrap();
     let a = core::ptr::dangling_mut::<u64>().cast::<c_void>();
     let b = core::ptr::dangling_mut::<u32>().cast::<c_void>();
     let mut transaction_handle: Handle = null_mut();

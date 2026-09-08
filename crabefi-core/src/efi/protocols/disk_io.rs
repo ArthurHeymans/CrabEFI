@@ -98,9 +98,9 @@ extern "efiapi" fn disk_io_read_disk(
 
     // If already block-aligned, read directly into buffer
     if start_offset == 0 && buffer_size == aligned_size {
-        let status = unsafe {
+        let status = boot_services::with_image_callback(|| unsafe {
             ((*block_io).read_blocks)(block_io, media_id, start_lba, buffer_size, buffer)
-        };
+        });
         return status;
     }
 
@@ -119,7 +119,7 @@ extern "efiapi" fn disk_io_read_disk(
         }
     };
 
-    let status = unsafe {
+    let status = boot_services::with_image_callback(|| unsafe {
         ((*block_io).read_blocks)(
             block_io,
             media_id,
@@ -127,7 +127,7 @@ extern "efiapi" fn disk_io_read_disk(
             aligned_size,
             temp_buf as *mut c_void,
         )
-    };
+    });
 
     if status == Status::SUCCESS {
         // Copy the requested portion from the aligned buffer

@@ -111,8 +111,6 @@ pub struct XhciController {
     context_size: u8,
     /// Device Context Base Address Array
     dcbaa: u64,
-    /// Scratchpad buffer array pointer (stored in DCBAA[0])
-    scratchpad_array: u64,
     /// Number of scratchpad buffers
     num_scratchpad_bufs: u16,
     /// Command ring
@@ -287,7 +285,7 @@ pub fn do_interrupt_transfer(
 mod tests {
     use super::*;
     use core::mem::size_of;
-    use xhci::context::{self, InputControlHandler, InputHandler, SlotHandler};
+    use xhci::context::{self, InputHandler};
     use xhci::ring::trb::{self, command, event, transfer};
 
     #[test]

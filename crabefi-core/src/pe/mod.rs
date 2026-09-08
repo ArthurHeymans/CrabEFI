@@ -15,7 +15,7 @@ use object::read::pe::{
     ImageNtHeaders, ImageOptionalHeader as _, PeFile, PeFile32, PeFile64, optional_header_magic,
 };
 use object::{LittleEndian, pe as object_pe};
-use r_efi::efi::{Handle, Status, SystemTable};
+use r_efi::efi::Status;
 use zerocopy::{FromBytes, Immutable, KnownLayout, Unaligned};
 
 /// DOS header magic "MZ"
@@ -182,9 +182,6 @@ struct BaseRelocation {
     size_of_block: u32,
     // Followed by array of u16 type/offset values
 }
-
-/// EFI application entry point type
-pub type EfiEntryPoint = extern "efiapi" fn(Handle, *mut SystemTable) -> Status;
 
 /// Parsed PE headers information (for reading PE metadata without loading)
 pub struct PeHeaders<'a> {
@@ -865,33 +862,6 @@ fn apply_relocations(
     }
 
     Ok(())
-}
-
-/// Execute a loaded PE image
-///
-/// # Arguments
-/// * `image` - The loaded image info
-/// * `image_handle` - Handle to pass to the image
-/// * `system_table` - System table pointer to pass to the image
-///
-/// # Returns
-/// * Status returned by the image
-pub fn execute_image(
-    image: &LoadedImage,
-    image_handle: Handle,
-    system_table: *mut SystemTable,
-) -> Status {
-    log::info!("PE: Executing image at {:#x}", image.entry_point);
-
-    // Safety: entry_point was validated to be within the image during load_image
-    let entry: EfiEntryPoint = unsafe { core::mem::transmute(image.entry_point) };
-
-    // Call the entry point
-    let status = entry(image_handle, system_table);
-
-    log::info!("PE: Image returned with status: {:?}", status);
-
-    status
 }
 
 /// Unload a PE image and free its memory

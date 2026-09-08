@@ -57,7 +57,8 @@ impl super::XhciController {
         // Find mass storage interface
         let mut bulk_in = 0u8;
         let mut bulk_out = 0u8;
-        let mut bulk_max_packet = 0u16;
+        let mut bulk_in_max_packet = 0u16;
+        let mut bulk_out_max_packet = 0u16;
         let mut ms_interface_number = 0u8;
         let mut found = false;
 
@@ -71,15 +72,16 @@ impl super::XhciController {
 
                 if let Some(ep) = iface.find_bulk_in() {
                     bulk_in = ep.number;
-                    bulk_max_packet = ep.max_packet_size;
+                    bulk_in_max_packet = ep.max_packet_size;
                     log::debug!(
                         "    Bulk IN EP: {} max_packet: {}",
                         bulk_in,
-                        bulk_max_packet
+                        bulk_in_max_packet
                     );
                 }
                 if let Some(ep) = iface.find_bulk_out() {
                     bulk_out = ep.number;
+                    bulk_out_max_packet = ep.max_packet_size;
                     log::debug!(
                         "    Bulk OUT EP: {} max_packet: {}",
                         bulk_out,
@@ -99,7 +101,13 @@ impl super::XhciController {
         self.set_configuration(slot_id, config_info.configuration_value)?;
 
         // Configure endpoints
-        self.configure_bulk_endpoints(slot_id, bulk_in, bulk_out, bulk_max_packet)?;
+        self.configure_bulk_endpoints(
+            slot_id,
+            bulk_in,
+            bulk_out,
+            bulk_in_max_packet,
+            bulk_out_max_packet,
+        )?;
 
         // Update slot info
         if let Some(slot) = self
@@ -111,7 +119,8 @@ impl super::XhciController {
             slot.mass_storage_interface = ms_interface_number;
             slot.bulk_in_ep = bulk_in;
             slot.bulk_out_ep = bulk_out;
-            slot.bulk_max_packet = bulk_max_packet;
+            slot.bulk_in_max_packet = bulk_in_max_packet;
+            slot.bulk_out_max_packet = bulk_out_max_packet;
         }
 
         log::info!("USB Mass Storage device configured on slot {}", slot_id);

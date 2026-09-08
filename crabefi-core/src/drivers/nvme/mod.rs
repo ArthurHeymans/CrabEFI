@@ -7,7 +7,7 @@ pub mod logic;
 
 use crate::barrier;
 use crate::drivers::mmio::MmioRegion;
-use crate::drivers::pci::{self, PciAddress, PciDevice};
+use crate::drivers::pci::{self, BarType, PciAddress, PciBar, PciDevice};
 use crate::efi::dma::{DmaBuffer, DmaDirection, DmaDomain, DmaMask};
 use crate::time::{Timeout, wait_for};
 use core::ptr;
@@ -511,6 +511,73 @@ pub enum NvmeError {
     MalformedCompletion,
 }
 
+/// Validate BAR0 before constructing a typed register reference. BAR sizes may
+/// be unknown because PCI enumeration deliberately does not probe live BARs.
+fn validate_register_bar(bar: &PciBar) -> Result<(), NvmeError> {
+    // Even the minimum doorbell stride needs four doorbells for our admin
+    // and I/O queue pairs; reject an unusable window before reading CAP.
+    let register_size = DOORBELL_BASE + 4 * core::mem::size_of::<u32>() as u64;
+    if !matches!(bar.bar_type, BarType::Memory32 | BarType::Memory64)
+        || bar.address == 0
+        || !bar.address.is_multiple_of(CONTROLLER_PAGE_SIZE as u64)
+        || bar.address.checked_add(register_size).is_none()
+        || (bar.size != 0 && bar.size < register_size)
+        || (bar.bar_type == BarType::Memory32
+            && bar
+                .address
+                .checked_add(register_size)
+                .is_none_or(|end| end > 1u64 << 32))
+    {
+        return Err(NvmeError::InvalidParameter);
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod bar_tests {
+    use super::*;
+
+    #[test]
+    fn validates_register_bar_before_mmio_access() {
+        let valid = PciBar {
+            bar_type: BarType::Memory64,
+            address: 0xf000_0000,
+            size: 0,
+            prefetchable: false,
+        };
+        assert!(validate_register_bar(&valid).is_ok());
+        for bar in [
+            PciBar {
+                address: 0,
+                ..valid
+            },
+            PciBar {
+                address: 0xf000_0010,
+                ..valid
+            },
+            PciBar {
+                address: u64::MAX - 0xfff,
+                ..valid
+            },
+            PciBar {
+                bar_type: BarType::Io,
+                ..valid
+            },
+            PciBar { size: 8, ..valid },
+            PciBar {
+                bar_type: BarType::Memory32,
+                address: 1u64 << 32,
+                ..valid
+            },
+        ] {
+            assert!(matches!(
+                validate_register_bar(&bar),
+                Err(NvmeError::InvalidParameter)
+            ));
+        }
+    }
+}
+
 impl NvmeController {
     fn admin_sq_ptr(&self) -> *mut SubmissionQueueEntry {
         self.admin_sq_dma.cpu_address() as *mut SubmissionQueueEntry
@@ -534,7 +601,11 @@ impl NvmeController {
 
     /// Create a new NVMe controller from a PCI device
     pub fn new(pci_dev: &PciDevice) -> Result<Self, NvmeError> {
-        let mmio_base = pci_dev.mmio_base().ok_or(NvmeError::NotReady)?;
+        // NVMe controller registers are in BAR0 (BAR1 is its upper half for
+        // a 64-bit BAR), not an arbitrary later memory BAR.
+        let bar = &pci_dev.bars[0];
+        validate_register_bar(bar)?;
+        let mmio_base = bar.address;
         let regs = mmio_base as *mut NvmeRegisters;
         let dma_domain = pci::dma_domain(pci_dev.address).ok_or(NvmeError::DmaDomainUnavailable)?;
 
@@ -542,6 +613,8 @@ impl NvmeController {
         pci::enable_device(pci_dev);
 
         // Read capabilities using typed register access
+        // SAFETY: the platform supplies mapped PCI resources. BAR0's type,
+        // alignment and register range were validated before enabling decode.
         let regs_ref = unsafe { &*regs };
         let cap = regs_ref.cap.get();
         let doorbell_stride = 4usize << regs_ref.cap.read(CAP::DSTRD);
@@ -592,6 +665,15 @@ impl NvmeController {
         // Doorbell window covers the admin pair (queue 0) and the single I/O
         // pair (queue 1): relative offsets [0, 3 * stride + 4). Out-of-range
         // writes below panic with the offset instead of corrupting MMIO.
+        let doorbell_end = DOORBELL_BASE + (3 * doorbell_stride + 4) as u64;
+        if (bar.size != 0 && doorbell_end > bar.size)
+            || (bar.bar_type == BarType::Memory32
+                && mmio_base
+                    .checked_add(doorbell_end)
+                    .is_none_or(|end| end > 1u64 << 32))
+        {
+            return Err(NvmeError::InvalidParameter);
+        }
         // SAFETY: PCI BAR base for this controller, valid for its lifetime.
         let doorbells = unsafe {
             MmioRegion::try_new(

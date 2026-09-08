@@ -26,7 +26,6 @@ use crate::efi::protocols::device_path::{self, DEVICE_PATH_PROTOCOL_GUID, Device
 use crate::efi::protocols::simple_file_system::{self, SIMPLE_FILE_SYSTEM_GUID};
 use crate::fs;
 use crate::menu;
-use crate::pe;
 
 static GPT_MEASURED: AtomicBool = AtomicBool::new(false);
 
@@ -465,215 +464,56 @@ fn load_and_execute_bootloader(
     file_size: u32,
     device_handle: r_efi::efi::Handle,
 ) -> Result<(), Status> {
-    use crate::display_secure_boot_error;
+    use core::ptr;
     use efi::allocator::{MemoryType, allocate_pool, free_pool};
-    use efi::protocols::loaded_image::{LOADED_IMAGE_PROTOCOL_GUID, create_loaded_image_protocol};
-    use r_efi::efi::Guid;
-
-    /// EFI_LOADED_IMAGE_DEVICE_PATH_PROTOCOL_GUID
-    const LOADED_IMAGE_DEVICE_PATH_GUID: Guid = Guid::from_fields(
-        0xbc62157e,
-        0x3e33,
-        0x4fec,
-        0x99,
-        0x20,
-        &[0x2d, 0x3b, 0x36, 0xd7, 0x50, 0xdf],
-    );
 
     log::info!("Loading bootloader: {} ({} bytes)", path, file_size);
-
-    // Allocate buffer for raw file data
-    let buffer_ptr = allocate_pool(MemoryType::LoaderData, file_size as usize)
-        .map_err(|_| Status::OUT_OF_RESOURCES)?;
-
-    // Read the file into the buffer
+    let buffer_ptr = allocate_pool(MemoryType::LoaderData, file_size as usize)?;
+    // SAFETY: the pool allocation spans file_size bytes and is exclusively owned here.
     let buffer = unsafe { core::slice::from_raw_parts_mut(buffer_ptr, file_size as usize) };
-
     let bytes_read = fat.read_file_all(path, buffer).map_err(|e| {
         log::error!("Failed to read bootloader file: {:?}", e);
         let _ = free_pool(buffer_ptr);
         Status::DEVICE_ERROR
     })?;
 
-    log::info!("Read {} bytes from {}", bytes_read, path);
-
-    // Secure Boot verification (if enabled)
-    if efi::auth::is_secure_boot_enabled() {
-        log::debug!("Secure Boot: Verifying image...");
-        match efi::auth::verify_pe_image_secure_boot(&buffer[..bytes_read]) {
-            Ok(true) => {
-                log::info!("Secure Boot: Image verification passed");
-            }
-            Ok(false) => {
-                log::error!("Secure Boot: Image verification FAILED - not authorized");
-                display_secure_boot_error();
-                let _ = free_pool(buffer_ptr);
-                return Err(Status::SECURITY_VIOLATION);
-            }
-            Err(e) => {
-                log::error!("Secure Boot: Verification error: {:?}", e);
-                display_secure_boot_error();
-                let _ = free_pool(buffer_ptr);
-                return Err(Status::SECURITY_VIOLATION);
-            }
-        }
-    }
-
-    // Load the PE image
-    let loaded_image = pe::load_image(&buffer[..bytes_read]).inspect_err(|&status| {
-        log::error!("Failed to load PE image: {:?}", status);
-        let _ = free_pool(buffer_ptr);
-    })?;
-
-    let image_link_time_address = pe::parse_headers(&buffer[..bytes_read])
-        .map(|headers| headers.preferred_image_base())
-        .unwrap_or(0);
     let device_dp =
         boot_services::get_protocol_on_handle(device_handle, &DEVICE_PATH_PROTOCOL_GUID);
-    let loaded_image_dp = device_path::create_loaded_image_device_path(
-        device_dp as *const r_efi::protocols::device_path::Protocol,
-        path,
-    );
-
-    // This path bypasses BS.StartImage, so perform the same ReadyToBoot /
-    // boot-attempt measurements before measuring and executing the application.
-    efi::boot_services::measure_efi_application_start(true);
-
-    // TCG measured boot: hash the PE image and log an EFI_IMAGE_LOAD_EVENT.
-    let loaded_image_dp = loaded_image_dp as *const r_efi::protocols::device_path::Protocol;
-    let event_data = boot_services::serialize_tcg_image_load_event(
-        &loaded_image,
-        image_link_time_address,
-        loaded_image_dp,
-    );
-    if let Err(e) = efi::tcg::measured_boot::measure_pe_image_all(
-        4,
-        efi::tcg::types::EV_EFI_BOOT_SERVICES_APPLICATION,
-        &buffer[..bytes_read],
-        &event_data,
-    ) {
-        log::warn!("Failed to measure bootloader PE image: {:?}", e);
-    }
-
-    // Free the raw file buffer
-    let _ = free_pool(buffer_ptr);
-
-    log::info!(
-        "PE image loaded at {:#x}, entry point {:#x}, size {:#x}",
-        loaded_image.image_base,
-        loaded_image.entry_point,
-        loaded_image.image_size
-    );
-
-    // Create an image handle for the loaded bootloader
-    let image_handle = boot_services::create_handle().ok_or_else(|| {
-        log::error!("Failed to create image handle");
-        Status::OUT_OF_RESOURCES
-    })?;
-
-    // Create and install LoadedImageProtocol
-    let system_table = efi::get_system_table();
-    let firmware_handle = efi::get_firmware_handle();
-
-    let loaded_image_protocol = create_loaded_image_protocol(
-        firmware_handle,
-        system_table,
-        device_handle,
-        loaded_image.image_base,
-        loaded_image.image_size,
-    );
-
-    if loaded_image_protocol.is_null() {
-        log::error!("Failed to create LoadedImageProtocol");
-        pe::unload_image(&loaded_image);
+    let full_path = device_path::create_loaded_image_device_path(device_dp.cast(), path);
+    if full_path.is_null() {
+        let _ = free_pool(buffer_ptr);
         return Err(Status::OUT_OF_RESOURCES);
     }
 
-    // Set the file path in LoadedImageProtocol
-    let file_path = device_path::create_file_path_device_path(path);
-    if !file_path.is_null() {
-        unsafe {
-            efi::protocols::loaded_image::set_file_path(loaded_image_protocol, file_path);
-        }
-        log::debug!("Set LoadedImage.FilePath to: {}", path);
-    }
-
-    let status = boot_services::install_protocol(
-        image_handle,
-        &LOADED_IMAGE_PROTOCOL_GUID,
-        loaded_image_protocol as *mut core::ffi::c_void,
+    // Use the same authentication, measurement, protocol ownership, and execution
+    // lifecycle as subsequently loaded children. LoadImage copies both buffers.
+    let bs = unsafe { &*boot_services::get_boot_services() };
+    let mut image_handle = ptr::null_mut();
+    let status = (bs.load_image)(
+        r_efi::efi::Boolean::TRUE,
+        efi::get_firmware_handle(),
+        full_path,
+        buffer_ptr.cast(),
+        bytes_read,
+        &mut image_handle,
     );
-
+    let _ = free_pool(buffer_ptr);
+    let _ = free_pool(full_path.cast());
     if status != Status::SUCCESS {
-        log::error!("Failed to install LoadedImageProtocol: {:?}", status);
-        pe::unload_image(&loaded_image);
         return Err(status);
     }
 
-    log::info!("LoadedImageProtocol installed on handle {:?}", image_handle);
-
-    // Install EFI_LOADED_IMAGE_DEVICE_PATH_PROTOCOL
-    // This is the full device path: <partition device path> / FilePath(bootloader)
-    // Windows Boot Manager uses this to locate its boot device.
-    if !loaded_image_dp.is_null() {
-        let status = boot_services::install_protocol(
-            image_handle,
-            &LOADED_IMAGE_DEVICE_PATH_GUID,
-            loaded_image_dp as *mut core::ffi::c_void,
-        );
-        if status == Status::SUCCESS {
-            log::info!(
-                "LoadedImageDevicePath protocol installed on handle {:?}",
-                image_handle
-            );
-        } else {
-            log::warn!("Failed to install LoadedImageDevicePath: {:?}", status);
-        }
-    }
-    if !device_handle.is_null() {
-        log::info!(
-            "DeviceHandle set to {:?} (with SimpleFileSystem)",
-            device_handle
-        );
-    }
     log::info!("Executing bootloader...");
-
-    // Recompute CRC32 checksums since we've installed new protocols/handles
-    efi::system_table::update_crc32();
-
-    // Debug: verify system table integrity before execution
-    unsafe {
-        let st = &*system_table;
-        log::debug!(
-            "SystemTable check: boot_services={:?}, runtime_services={:?}",
-            st.boot_services,
-            st.runtime_services
-        );
-        if !st.boot_services.is_null() {
-            let bs = &*st.boot_services;
-            log::debug!(
-                "BootServices check: signature={:#x}, check_event={:?}",
-                bs.hdr.signature,
-                bs.check_event
-            );
-        } else {
-            log::error!("CRITICAL: boot_services is NULL!");
-        }
-    }
-
-    let exec_status = pe::execute_image(&loaded_image, image_handle, system_table);
-
-    // If the bootloader returns, log and measure it.
-    log::info!("Bootloader returned with status: {:?}", exec_status);
-    efi::boot_services::measure_efi_application_return(true);
-
-    // Clean up
-    pe::unload_image(&loaded_image);
-
-    if exec_status == Status::SUCCESS {
+    // No exit-data consumer at this level; StartImage frees any returned data.
+    let status = (bs.start_image)(image_handle, ptr::null_mut(), ptr::null_mut());
+    log::info!("Bootloader returned with status: {:?}", status);
+    if status == Status::SUCCESS {
         Ok(())
     } else {
-        Err(exec_status)
+        // StartImage can also fail before invoking the application. If it did
+        // run, its automatic teardown already removed the handle.
+        let _ = (bs.unload_image)(image_handle);
+        Err(status)
     }
 }
 

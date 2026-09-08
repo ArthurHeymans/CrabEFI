@@ -365,8 +365,6 @@ pub(super) extern "efiapi" fn locate_handle(
     dest.copy_from_slice(&matching[..]);
     unsafe { *buffer_size = required_size };
 
-    log::debug!("  -> found {} handles: {:?}", matching.len(), matching);
-
     log::debug!("  -> found {} handles: {:?}", matching.len(), &matching[..]);
     Status::SUCCESS
 }

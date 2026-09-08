@@ -12,6 +12,17 @@ use xhci::registers::capability::CapabilityParameters1;
 use xhci::registers::operational::PortStatusAndControlRegister;
 use xhci::registers::{Access64, Doorbell, Registers};
 
+/// PAGESIZE is a bitmap: bit n advertises 2^(12+n) bytes, not a count.
+fn scratchpad_page_size(mask: u16) -> Option<u32> {
+    (mask != 0).then(|| 4096u32 << mask.trailing_zeros())
+}
+
+/// Align an interior page in an overallocated, 4 KiB-aligned allocation.
+fn scratchpad_address(base: u64, page_size: u32) -> u64 {
+    let mask = u64::from(page_size) - 1;
+    (base + mask) & !mask
+}
+
 impl super::XhciController {
     /// Take ownership of the controller from BIOS/SMM
     ///
@@ -103,7 +114,8 @@ impl super::XhciController {
             hw_max_slots,
         );
 
-        let page_size = u32::from(registers.operational.pagesize.read_volatile().get()) << 12;
+        let page_size = scratchpad_page_size(registers.operational.pagesize.read_volatile().get())
+            .ok_or(XhciError::NotReady)?;
 
         log::debug!(
             "xHCI: context_size={}, scratchpad_bufs={}",
@@ -126,7 +138,6 @@ impl super::XhciController {
             page_size,
             context_size,
             dcbaa: 0,
-            scratchpad_array: 0,
             num_scratchpad_bufs,
             cmd_ring: TrbRing::empty(), // Will be initialized in init()
             erst: 0,
@@ -308,20 +319,22 @@ impl super::XhciController {
             let sp_array_mem =
                 efi::allocate_pages(sp_array_pages).ok_or(XhciError::AllocationFailed)?;
             sp_array_mem.fill(0);
-            self.scratchpad_array = sp_array_mem.as_ptr() as u64;
+            let scratchpad_array = sp_array_mem.as_ptr() as u64;
 
             // Allocate the actual scratchpad buffers (page-aligned, page-sized)
             // Each buffer must be page-aligned according to the controller's page size
-            let page_size = self.page_size.max(4096) as usize;
+            let page_size = self.page_size;
             for i in 0..self.num_scratchpad_bufs as usize {
-                // Allocate one page per scratchpad buffer
-                let buf_pages = (page_size as u64).div_ceil(4096);
+                // EFI only guarantees 4 KiB alignment. Retain enough pages
+                // to fit a controller-page-aligned interior buffer, including
+                // controllers which do not advertise support for 4 KiB pages.
+                let buf_pages = 2 * (u64::from(page_size) / 4096) - 1;
                 let buf_mem = efi::allocate_pages(buf_pages).ok_or(XhciError::AllocationFailed)?;
                 buf_mem.fill(0);
-                let buf_addr = buf_mem.as_ptr() as u64;
+                let buf_addr = scratchpad_address(buf_mem.as_ptr() as u64, page_size);
 
                 // Store pointer in scratchpad array
-                let sp_array_entry = (self.scratchpad_array + (i as u64 * 8)) as *mut u64;
+                let sp_array_entry = (scratchpad_array + (i as u64 * 8)) as *mut u64;
                 unsafe {
                     ptr::write_volatile(sp_array_entry, buf_addr);
                 }
@@ -330,12 +343,12 @@ impl super::XhciController {
             // Store scratchpad array pointer in DCBAA[0]
             let dcbaa_entry0 = self.dcbaa as *mut u64;
             unsafe {
-                ptr::write_volatile(dcbaa_entry0, self.scratchpad_array);
+                ptr::write_volatile(dcbaa_entry0, scratchpad_array);
             }
 
             log::debug!(
                 "xHCI: Scratchpad array at {:#x}, stored in DCBAA[0]",
-                self.scratchpad_array
+                scratchpad_array
             );
         }
 
@@ -405,14 +418,25 @@ impl super::XhciController {
             .update_volatile(|command| {
                 command.set_run_stop().set_interrupter_enable();
             });
-        wait_for(100, || {
+        if !wait_for(100, || {
             !self
                 .registers
                 .operational
                 .usbsts
                 .read_volatile()
                 .hc_halted()
-        });
+        }) {
+            log::error!("xHCI: host controller failed to start");
+            self.registers
+                .operational
+                .usbcmd
+                .update_volatile(|command| {
+                    command.clear_run_stop();
+                });
+            // Controller-visible allocations remain retained even if stopping
+            // also fails; a delayed start must never access freed memory.
+            return Err(XhciError::Timeout);
+        }
 
         // Power on all ports - many real hardware controllers require explicit port power
         self.power_on_ports();
@@ -436,5 +460,35 @@ impl super::XhciController {
             log::debug!("xHCI: Powered on port {}", port);
         }
         crate::time::delay_ms(20);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{scratchpad_address, scratchpad_page_size};
+
+    #[test]
+    fn pagesize_selects_smallest_supported_page() {
+        assert_eq!(scratchpad_page_size(0), None);
+        assert_eq!(scratchpad_page_size(0b1011), Some(4096));
+        assert_eq!(scratchpad_page_size(0b1010), Some(8192));
+        for bit in 0..16 {
+            assert_eq!(scratchpad_page_size(1 << bit), Some(4096 << bit));
+        }
+    }
+
+    #[test]
+    fn scratchpad_alignment_fits_retained_allocation() {
+        for bit in 0..16 {
+            let size = 4096u32 << bit;
+            let allocation_len = 2 * u64::from(size) - 4096;
+            for offset in (0..u64::from(size)).step_by(4096) {
+                let base = 0x1_0000_0000 + offset;
+                let aligned = scratchpad_address(base, size);
+                assert_eq!(aligned % u64::from(size), 0);
+                assert!(aligned >= base);
+                assert!(aligned + u64::from(size) <= base + allocation_len);
+            }
+        }
     }
 }

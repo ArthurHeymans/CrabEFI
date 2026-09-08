@@ -101,6 +101,15 @@ fn get_protocol_on_handle(handle: Handle, guid: &Guid) -> Option<*mut c_void> {
 pub(crate) fn load_image_from_device_path(
     device_path: *mut DevicePathProtocol,
 ) -> Result<(*mut c_void, usize, Handle), Status> {
+    // Filesystem methods may belong to an image. Exit must not abandon our
+    // open files or pool buffer while one of those methods is on the stack.
+    boot_services::with_image_callback(|| read_image_file(device_path))
+}
+
+/// Read through the selected filesystem inside a protected callback boundary.
+fn read_image_file(
+    device_path: *mut DevicePathProtocol,
+) -> Result<(*mut c_void, usize, Handle), Status> {
     // Extract the file path from the device path
     let (path_ptr, path_len) =
         extract_file_path_from_device_path(device_path).ok_or_else(|| {
