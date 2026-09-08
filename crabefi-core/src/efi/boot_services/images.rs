@@ -19,7 +19,13 @@ use super::protocol_open_blocks_removal;
 use crate::pe;
 use alloc::vec::Vec;
 use core::ffi::c_void;
-use r_efi::efi::{self, Boolean, Guid, Handle, Status, SystemTable};
+use r_efi::efi::{self, Boolean, Guid, Handle, Status};
+
+#[path = "image_execution.rs"]
+mod execution;
+pub(super) use execution::exit;
+
+static STARTED: crate::cell::Local<Vec<(Handle, bool)>> = crate::cell::Local::new(Vec::new());
 use r_efi::protocols::device_path::Protocol as DevicePathProtocol;
 
 /// EFI_EVENT_GROUP_EXIT_BOOT_SERVICES GUID
@@ -31,6 +37,52 @@ const EFI_EVENT_GROUP_EXIT_BOOT_SERVICES: Guid = Guid::from_fields(
     0x48,
     &[0x74, 0x8F, 0x37, 0xBA, 0xA2, 0xDF],
 );
+
+/// Full device path to the loaded image (distinct from LoadedImage.FilePath).
+const LOADED_IMAGE_DEVICE_PATH_GUID: Guid = Guid::from_fields(
+    0xbc62157e,
+    0x3e33,
+    0x4fec,
+    0x99,
+    0x20,
+    &[0x2d, 0x3b, 0x36, 0xd7, 0x50, 0xdf],
+);
+
+/// Co-own a copied full path with the LoadedImage allocation, so caller buffers
+/// may be freed immediately after LoadImage. One FreePool releases both.
+fn own_image_path(
+    protocol: *mut r_efi::protocols::loaded_image::Protocol,
+    path: *mut DevicePathProtocol,
+) -> (
+    *mut r_efi::protocols::loaded_image::Protocol,
+    *mut DevicePathProtocol,
+) {
+    if protocol.is_null() || path.is_null() {
+        return (protocol, core::ptr::null_mut());
+    }
+    // SAFETY: LoadImage's caller supplies a valid terminated device path.
+    let path_size = unsafe { super::super::protocols::device_path::device_path_size(path) };
+    let protocol_size = core::mem::size_of::<r_efi::protocols::loaded_image::Protocol>();
+    let allocation = protocol_size
+        .checked_add(path_size)
+        .and_then(|size| allocator::allocate_pool(MemoryType::BootServicesData, size).ok());
+    let result = match allocation {
+        Some(allocation) => {
+            let owned = allocation.cast::<r_efi::protocols::loaded_image::Protocol>();
+            // SAFETY: fresh pool storage fits the protocol and complete byte path;
+            // the protocol contains only plain EFI fields, with no Rust ownership.
+            unsafe {
+                core::ptr::copy_nonoverlapping(protocol, owned, 1);
+                let owned_path = allocation.add(protocol_size);
+                core::ptr::copy_nonoverlapping(path.cast::<u8>(), owned_path, path_size);
+                (owned, owned_path.cast())
+            }
+        }
+        None => (core::ptr::null_mut(), core::ptr::null_mut()),
+    };
+    let _ = allocator::free_pool(protocol.cast());
+    result
+}
 
 // ============================================================================
 // Image Functions
@@ -207,31 +259,54 @@ pub(super) extern "efiapi" fn load_image(
         loaded_image.image_size,
     );
 
+    let (loaded_image_protocol, owned_path) = own_image_path(loaded_image_protocol, device_path);
     if loaded_image_protocol.is_null() {
         log::error!("BS.LoadImage: Failed to create LoadedImageProtocol");
         if let Some(measurement) = deferred_measurement {
             let _ = allocator::free_pool(measurement.event_data);
         }
         pe::unload_image(&loaded_image);
+        reclaim_image_handle(new_handle);
         return Status::OUT_OF_RESOURCES;
     }
 
-    // Set the device path on the loaded image if provided
-    if !device_path.is_null() {
+    // Resolve buffer-loaded images against their supplied full path too: the
+    // firmware parent itself has no filesystem device to inherit.
+    if !owned_path.is_null() {
+        let mut remaining = owned_path;
+        let mut resolved = core::ptr::null_mut();
+        let mut guid = super::super::protocols::simple_file_system::SIMPLE_FILE_SYSTEM_GUID;
+        let located =
+            super::protocols_db::locate_device_path(&mut guid, &mut remaining, &mut resolved);
+        // SAFETY: both paths point within our co-owned allocation; the interface
+        // is not yet published and will retain these bytes until UnloadImage.
         unsafe {
-            super::super::protocols::loaded_image::set_file_path(
-                loaded_image_protocol,
-                device_path,
-            );
+            if located == Status::SUCCESS {
+                (*loaded_image_protocol).device_handle = resolved;
+                (*loaded_image_protocol).file_path = remaining;
+            } else {
+                (*loaded_image_protocol).file_path = owned_path;
+            }
         }
     }
 
     // Install the LoadedImageProtocol on the handle
-    let status = super::install_protocol(
+    let status = super::install_protocol_internal(
         new_handle,
         &LOADED_IMAGE_PROTOCOL_GUID,
         loaded_image_protocol as *mut c_void,
+        false,
     );
+    let status = if status == Status::SUCCESS && !owned_path.is_null() {
+        super::install_protocol_internal(
+            new_handle,
+            &LOADED_IMAGE_DEVICE_PATH_GUID,
+            owned_path.cast(),
+            false,
+        )
+    } else {
+        status
+    };
 
     if status != Status::SUCCESS {
         log::error!(
@@ -242,6 +317,8 @@ pub(super) extern "efiapi" fn load_image(
             let _ = allocator::free_pool(measurement.event_data);
         }
         pe::unload_image(&loaded_image);
+        let _ = allocator::free_pool(loaded_image_protocol.cast());
+        reclaim_image_handle(new_handle);
         return status;
     }
 
@@ -282,7 +359,21 @@ pub(super) extern "efiapi" fn load_image(
             let _ = allocator::free_pool(measurement.event_data);
         }
         pe::unload_image(&loaded_image);
+        reclaim_image_handle(new_handle);
+        let _ = allocator::free_pool(loaded_image_protocol.cast());
         return Status::OUT_OF_RESOURCES;
+    }
+
+    for guid in [LOADED_IMAGE_PROTOCOL_GUID, LOADED_IMAGE_DEVICE_PATH_GUID] {
+        if guid == LOADED_IMAGE_DEVICE_PATH_GUID && owned_path.is_null() {
+            continue;
+        }
+        let notifications = with_tables_mut(|state| {
+            super::protocols_db::protocol_notification_events(state, &guid)
+        });
+        for event in notifications {
+            super::events::signal_event(event);
+        }
     }
 
     // Return the new handle
@@ -331,6 +422,21 @@ pub(super) extern "efiapi" fn start_image(
             }
         }
     };
+
+    let mark_status = STARTED.with_mut(|started| {
+        if started.iter().any(|(handle, _)| *handle == image_handle) {
+            return Status::INVALID_PARAMETER;
+        }
+        if started.try_reserve(1).is_err() {
+            return Status::OUT_OF_RESOURCES;
+        }
+        // Mark running before ReadyToBoot can reenter UnloadImage.
+        started.push((image_handle, true));
+        Status::SUCCESS
+    });
+    if mark_status != Status::SUCCESS {
+        return mark_status;
+    }
 
     log::info!(
         "BS.StartImage: Executing image at {:#x} (base={:#x})",
@@ -391,59 +497,131 @@ pub(super) extern "efiapi" fn start_image(
     // Get the system table
     let system_table = super::super::get_system_table();
 
-    // Define the entry point function type
-    type EfiEntryPoint = extern "efiapi" fn(Handle, *mut SystemTable) -> Status;
-
-    // Call the entry point
-    let entry: EfiEntryPoint = unsafe { core::mem::transmute(entry_point) };
-    let status = entry(image_handle, system_table);
+    let mut context = execution::Context::new(image_handle);
+    execution::CURRENT.set(core::ptr::addr_of_mut!(context));
+    // SAFETY: entry_point is the validated PE entry; context stays at a stable
+    // address until the assembly invocation returns, normally or via Exit.
+    let returned = unsafe {
+        execution::invoke(
+            core::ptr::addr_of_mut!(context),
+            entry_point as usize,
+            image_handle,
+            system_table,
+        )
+    };
+    execution::CURRENT.set(context.previous);
+    STARTED.with_mut(|started| {
+        if let Some((_, running)) = started
+            .iter_mut()
+            .find(|(handle, _)| *handle == image_handle)
+        {
+            *running = false;
+        }
+    });
+    let status = if context.exited {
+        context.status
+    } else {
+        returned
+    };
 
     log::info!("BS.StartImage: Image returned with status: {:?}", status);
     measure_efi_application_return(is_application);
 
-    // Set exit data if provided (we don't support exit data currently)
-    if !exit_data_size.is_null() {
+    if !exit_data_size.is_null() && !exit_data.is_null() {
+        // SAFETY: caller supplies writable output parameters. Ownership of the
+        // pool allocation transfers to the StartImage caller, not the image.
         unsafe {
-            *exit_data_size = 0;
+            *exit_data_size = context.size;
+            *exit_data = context.data;
         }
-    }
-    if !exit_data.is_null() {
-        unsafe {
-            *exit_data = core::ptr::null_mut();
-        }
+    } else if !context.data.is_null() {
+        let _ = allocator::free_pool(context.data.cast());
     }
 
+    // Applications, and drivers that failed initialization, do not stay resident.
+    if is_application || status.is_error() {
+        let _ = release_image(image_handle);
+    }
     status
 }
 
-/// EFI Boot Service: Exit
-///
-/// UEFI Spec Compliance Note: A fully conformant `Exit()` implementation must
-/// perform a non-local return (longjmp) back to the corresponding `StartImage()`
-/// call, unwinding the call stack. This requires saving the execution context
-/// (registers, stack pointer) in `StartImage()` via setjmp, and restoring it here.
-///
-/// Current limitation: This implementation simply returns `exit_status` to the
-/// caller, which means `Exit()` only works correctly when called directly from
-/// the image's entry point (the common case for UEFI bootloaders like shim and
-/// GRUB). It will NOT correctly unwind nested image calls or calls from deep
-/// within a loaded image's call stack.
-///
-/// This is acceptable for our boot use case (shim → GRUB → Linux), but would
-/// need a proper setjmp/longjmp implementation for full UEFI application support.
-pub(super) extern "efiapi" fn exit(
+/// Prepare Exit without abandoning a Rust frame. The assembly wrapper performs
+/// the transfer only after this function has returned and released all borrows.
+extern "efiapi" fn prepare_exit(
     image_handle: Handle,
     exit_status: Status,
     exit_data_size: usize,
-    _exit_data: *mut u16,
-) -> Status {
-    log::info!(
-        "BS.Exit(handle={:?}, status={:?}, data_size={})",
-        image_handle,
-        exit_status,
-        exit_data_size
-    );
-    exit_status
+    exit_data: *mut u16,
+) -> usize {
+    let current = execution::CURRENT.get();
+    if current.is_null() || unsafe { (*current).handle != image_handle } {
+        // UEFI also permits Exit on an image that has not been started.
+        return if STARTED
+            .with_mut(|started| started.iter().any(|(handle, _)| *handle == image_handle))
+        {
+            Status::INVALID_PARAMETER.as_usize()
+        } else {
+            // Return success through the assembly wrapper, not as a context.
+            let status = release_image(image_handle);
+            if status == Status::SUCCESS {
+                0
+            } else {
+                status.as_usize()
+            }
+        };
+    }
+    // Exit may only abandon image frames, not an intervening firmware callback.
+    if unsafe { (*current).callback_depth } != super::image_callback_depth() {
+        return Status::INVALID_PARAMETER.as_usize();
+    }
+    let (data, size) = if exit_status == Status::SUCCESS || exit_data_size == 0 {
+        (core::ptr::null_mut(), 0)
+    } else {
+        if exit_data.is_null() {
+            return Status::INVALID_PARAMETER.as_usize();
+        }
+        let buffer = match allocator::allocate_pool(MemoryType::BootServicesData, exit_data_size) {
+            Ok(buffer) => buffer,
+            Err(status) => return status.as_usize(),
+        };
+        // SAFETY: EFI caller supplies exit_data_size readable bytes; the fresh
+        // allocation is disjoint and remains valid after freeing image pages.
+        unsafe {
+            core::ptr::copy_nonoverlapping(exit_data.cast::<u8>(), buffer, exit_data_size);
+        }
+        (buffer.cast(), exit_data_size)
+    };
+    // SAFETY: CURRENT points at the innermost live assembly invocation's context.
+    // No references or table borrows remain live across the non-local transfer.
+    unsafe {
+        (*current).status = exit_status;
+        (*current).data = data;
+        (*current).size = size;
+        (*current).exited = true;
+    }
+    current as usize
+}
+
+/// Remove image-owned protocol records and reclaim the now-empty handle.
+/// Interface allocation ownership is handled by the caller, not the database.
+fn reclaim_image_handle(image_handle: Handle) {
+    with_tables_mut(|state| remove_image_handle_records(state, image_handle));
+}
+
+fn remove_image_handle_records(state: &mut Tables, image_handle: Handle) {
+    if let Some(index) = state.handles[..state.handle_count]
+        .iter()
+        .position(|h| h.handle == image_handle)
+    {
+        state
+            .handles
+            .copy_within(index + 1..state.handle_count, index);
+        state.handle_count -= 1;
+        state.handles[state.handle_count] = super::super::tables::HandleEntry::empty();
+    }
+    state
+        .open_protocols
+        .retain(|open| open.handle != image_handle);
 }
 
 /// Detach an image only when no other agent still has a blocking open on it.
@@ -478,6 +656,19 @@ fn detach_loaded_image(
 mod tests {
     use super::*;
     use crate::efi::tables::OpenProtocolEntry;
+
+    #[test]
+    fn pending_start_cannot_be_unloaded_before_context_initialization() {
+        let _guard = crate::efi::boot_services::IMAGE_EXECUTION_TEST_LOCK
+            .lock()
+            .unwrap();
+        let image = 0xf000usize as Handle;
+        assert!(execution::CURRENT.get().is_null());
+        STARTED.with_mut(|started| started.push((image, true)));
+        let status = unload_image(image);
+        STARTED.with_mut(|started| started.retain(|(handle, _)| *handle != image));
+        assert_eq!(status, Status::ACCESS_DENIED);
+    }
 
     #[test]
     fn unload_preserves_images_with_external_blocking_opens() {
@@ -516,6 +707,40 @@ mod tests {
     }
 
     #[test]
+    fn image_cleanup_removes_protocols_and_reclaims_handle_slot() {
+        use crate::efi::tables::{HandleEntry, ProtocolEntry};
+
+        let image = 1usize as Handle;
+        let other = 2usize as Handle;
+        for count in [0, 1, 2] {
+            let mut state = Tables::new();
+            let mut record = HandleEntry {
+                handle: image,
+                ..HandleEntry::empty()
+            };
+            record.protocol_count = count;
+            for protocol in &mut record.protocols[..count] {
+                *protocol = ProtocolEntry {
+                    guid: LOADED_IMAGE_PROTOCOL_GUID,
+                    interface: 0x1000usize as *mut c_void,
+                    generation: 1,
+                };
+            }
+            state.handles.push(record);
+            state.handles.push(HandleEntry {
+                handle: other,
+                ..HandleEntry::empty()
+            });
+            state.handle_count = 2;
+            remove_image_handle_records(&mut state, image);
+            assert_eq!(state.handle_count, 1);
+            assert_eq!(state.handles[0].handle, other);
+            assert!(state.handles[1].handle.is_null());
+            assert_eq!(state.handles[1].protocol_count, 0);
+        }
+    }
+
+    #[test]
     fn unload_releases_image_opens_but_preserves_unrelated_opens() {
         let image = 1usize as Handle;
         let other = 2usize as Handle;
@@ -550,57 +775,65 @@ mod tests {
 }
 
 pub(super) extern "efiapi" fn unload_image(image_handle: Handle) -> Status {
-    log::debug!("BS.UnloadImage(handle={:?})", image_handle);
+    // This includes starts pending ReadyToBoot/measurement callbacks, before
+    // an initialized assembly context exists.
+    if STARTED.with_mut(|started| {
+        started
+            .iter()
+            .any(|(handle, running)| *handle == image_handle && *running)
+    }) {
+        return Status::ACCESS_DENIED;
+    }
+    // Active images cannot be freed while their instruction pointer is live.
+    let mut current = execution::CURRENT.get();
+    while !current.is_null() {
+        // SAFETY: contexts form the live, single-hart StartImage invocation stack.
+        unsafe {
+            if (*current).handle == image_handle {
+                return Status::ACCESS_DENIED;
+            }
+            current = (*current).previous;
+        }
+    }
+    if STARTED.with_mut(|started| started.iter().any(|(handle, _)| *handle == image_handle)) {
+        let protocol = super::get_protocol_on_handle(image_handle, &LOADED_IMAGE_PROTOCOL_GUID)
+            .cast::<r_efi::protocols::loaded_image::Protocol>();
+        if protocol.is_null() {
+            return Status::INVALID_PARAMETER;
+        }
+        // SAFETY: the interface remains installed while its unload callback runs.
+        let Some(unload) = (unsafe { (*protocol).unload }) else {
+            return Status::UNSUPPORTED;
+        };
+        let status = super::with_image_callback(|| unload(image_handle));
+        if status != Status::SUCCESS {
+            return status;
+        }
+    }
+    release_image(image_handle)
+}
 
+fn release_image(image_handle: Handle) -> Status {
     if image_handle.is_null() {
-        log::error!("BS.UnloadImage: image_handle is NULL");
         return Status::INVALID_PARAMETER;
     }
-
-    // Validate and remove relationships before the image's pages can be reused.
-    let image_info = match with_tables_mut(|efi_state| detach_loaded_image(efi_state, image_handle))
-    {
-        Ok(info) => info,
+    let image = match with_tables_mut(|state| detach_loaded_image(state, image_handle)) {
+        Ok(Some(image)) => image,
+        Ok(None) => return Status::INVALID_PARAMETER,
         Err(status) => return status,
     };
-
-    match image_info {
-        Some(LoadedImageEntry {
-            alloc_base,
-            num_pages,
-            measurement_event_data,
-            ..
-        }) => {
-            // Free the image memory (using alloc_base, not image_base,
-            // since the image may have been aligned within the allocation)
-            let status = allocator::free_pages(alloc_base, num_pages);
-            if status != Status::SUCCESS {
-                log::warn!(
-                    "BS.UnloadImage: Failed to free pages at {:#x}: {:?}",
-                    alloc_base,
-                    status
-                );
-            }
-
-            if !measurement_event_data.is_null() {
-                let _ = allocator::free_pool(measurement_event_data);
-            }
-
-            // Remove protocols from the handle
-            // Note: In a full implementation, we should uninstall all protocols
-            // For now, we just log success
-            log::debug!("BS.UnloadImage: SUCCESS");
-            Status::SUCCESS
-        }
-        None => {
-            log::warn!(
-                "BS.UnloadImage: handle {:?} not found in loaded images",
-                image_handle
-            );
-            // Return success anyway - the handle might have been loaded differently
-            Status::SUCCESS
-        }
+    let protocol = super::get_protocol_on_handle(image_handle, &LOADED_IMAGE_PROTOCOL_GUID);
+    // Remove every interface before freeing code/data: image-installed interfaces
+    // can point inside those pages too. Only LoadedImage is allocated by us.
+    reclaim_image_handle(image_handle);
+    STARTED.with_mut(|started| started.retain(|(handle, _)| *handle != image_handle));
+    if !protocol.is_null() {
+        let _ = allocator::free_pool(protocol.cast());
     }
+    if !image.measurement_event_data.is_null() {
+        let _ = allocator::free_pool(image.measurement_event_data);
+    }
+    allocator::free_pages(image.alloc_base, image.num_pages)
 }
 
 pub(super) extern "efiapi" fn exit_boot_services(image_handle: Handle, map_key: usize) -> Status {
@@ -652,7 +885,7 @@ pub(super) extern "efiapi" fn exit_boot_services(image_handle: Handle, map_key: 
                 )
             };
             if let Some((func, context)) = notify_fn {
-                func(*handle as efi::Event, context);
+                super::with_image_callback(|| func(*handle as efi::Event, context));
             }
         }
     }

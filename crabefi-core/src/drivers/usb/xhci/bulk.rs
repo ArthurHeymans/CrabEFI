@@ -20,41 +20,87 @@ impl super::XhciController {
     /// Perform a single synchronous interrupt IN transfer.
     ///
     /// Queues one Normal TRB on the interrupt endpoint's transfer ring,
-    /// rings the doorbell, and waits for the completion event.  Reuses the
-    /// existing `wait_transfer_completion` path.
+    /// uses a DMA-domain bounce buffer, and waits for its completion event.
+    /// Failed polls cancel the old TD before releasing that buffer.
     pub(super) fn interrupt_transfer_impl(
         &mut self,
         slot_id: u8,
         endpoint: u8,
         data: &mut [u8],
     ) -> Result<usize, XhciError> {
+        if endpoint == 0 || endpoint > 15 || data.len() > TD_MAX_TRANSFER_SIZE {
+            return Err(XhciError::InvalidParameter);
+        }
+        if data.is_empty() {
+            return Ok(0);
+        }
         let in_dci = (endpoint as usize * 2) + 1;
-
-        let slot = self
-            .slots
-            .get_mut(slot_id as usize)
-            .and_then(|s| s.as_mut())
-            .ok_or(XhciError::DeviceNotFound)?;
-
-        let ring = slot.transfer_rings[in_dci - 1]
-            .as_mut()
-            .ok_or(XhciError::DeviceNotFound)?;
-
-        // Queue a Normal TRB for the interrupt IN transfer
-        let mut trb = transfer::Normal::new();
-        trb.set_data_buffer_pointer(data.as_ptr() as u64)
-            .set_trb_transfer_length((data.len() as u32) & 0x1ffff)
-            .set_interrupt_on_completion()
-            .set_interrupt_on_short_packet();
-
-        ring.enqueue(trb, false);
+        let domain = pci::dma_domain(self.pci_address).ok_or(XhciError::NotReady)?;
+        let mask = if self
+            .registers
+            .capability
+            .hccparams1
+            .read_volatile()
+            .addressing_capability()
+        {
+            DmaMask::bits64()
+        } else {
+            DmaMask::bits32()
+        };
+        let bounce =
+            DmaBuffer::allocate_in_domain(data.len() + TD_MAX_TRANSFER_SIZE - 1, mask, domain)
+                .map_err(|_| XhciError::AllocationFailed)?;
+        let offset = bulk_dma_offset(bounce.dma_address());
+        bounce
+            .sync_for_device(0..bounce.len(), DmaDirection::FromDevice)
+            .map_err(|_| XhciError::NotReady)?;
+        let td = self.queue_bulk_trb(
+            slot_id,
+            in_dci,
+            true,
+            bounce.dma_address() + offset as u64,
+            data.len(),
+        )?;
         barrier::mmio_write();
         self.ring_doorbell(slot_id, in_dci as u8);
 
-        // Reuse the existing transfer completion path (expects 1 TRB event).
-        let residual = self.wait_transfer_completion(slot_id, endpoint, 1)?;
-        let transferred = data.len().saturating_sub(residual as usize);
-        Ok(transferred)
+        match self.wait_transfer_td(slot_id, endpoint, td) {
+            Ok(residual) => {
+                bounce
+                    .sync_for_cpu(0..bounce.len(), DmaDirection::FromDevice)
+                    .map_err(|_| XhciError::NotReady)?;
+                let transferred = data.len().saturating_sub(residual as usize);
+                data[..transferred]
+                    .copy_from_slice(&bounce.as_slice()[offset..offset + transferred]);
+                Ok(transferred)
+            }
+            Err(error) => {
+                // A timeout does not cancel DMA. Stop and skip the old TD before
+                // allowing another poll; Reset Endpoint is only for halted EPs.
+                let cancelled = if matches!(error, XhciError::StallError) {
+                    self.reset_endpoint(slot_id, in_dci as u8)
+                } else {
+                    self.stop_endpoint(slot_id, in_dci as u8)
+                };
+                if cancelled.is_err() {
+                    // Quarantine the endpoint and retain its DMA mapping if we
+                    // cannot prove the old TD is no longer controller-owned.
+                    core::mem::forget(bounce);
+                    if let Some(slot) = self
+                        .slots
+                        .get_mut(slot_id as usize)
+                        .and_then(Option::as_mut)
+                    {
+                        slot.transfer_rings[in_dci - 1] = None;
+                    }
+                } else {
+                    bounce
+                        .sync_for_cpu(0..bounce.len(), DmaDirection::FromDevice)
+                        .map_err(|_| XhciError::NotReady)?;
+                }
+                Err(error)
+            }
+        }
     }
 
     /// Configure bulk endpoints
@@ -63,7 +109,8 @@ impl super::XhciController {
         slot_id: u8,
         bulk_in: u8,
         bulk_out: u8,
-        max_packet: u16,
+        in_max_packet: u16,
+        out_max_packet: u16,
     ) -> Result<(), XhciError> {
         let slot = self
             .slots
@@ -106,22 +153,22 @@ impl super::XhciController {
         // Bulk IN endpoint
         let in_ep_ctx = Self::input_ep_context(input, context_size, in_dci - 1);
         in_ep_ctx.set_endpoint_type(EndpointType::BulkIn);
-        in_ep_ctx.set_max_packet_size(max_packet);
+        in_ep_ctx.set_max_packet_size(in_max_packet);
         in_ep_ctx.set_max_burst_size(0);
         in_ep_ctx.set_error_count(3);
         in_ep_ctx.set_tr_dequeue_pointer(in_ring_addr);
         in_ep_ctx.set_dequeue_cycle_state();
-        in_ep_ctx.set_average_trb_length(max_packet);
+        in_ep_ctx.set_average_trb_length(in_max_packet);
 
         // Bulk OUT endpoint
         let out_ep_ctx = Self::input_ep_context(input, context_size, out_dci - 1);
         out_ep_ctx.set_endpoint_type(EndpointType::BulkOut);
-        out_ep_ctx.set_max_packet_size(max_packet);
+        out_ep_ctx.set_max_packet_size(out_max_packet);
         out_ep_ctx.set_max_burst_size(0);
         out_ep_ctx.set_error_count(3);
         out_ep_ctx.set_tr_dequeue_pointer(out_ring_addr);
         out_ep_ctx.set_dequeue_cycle_state();
-        out_ep_ctx.set_average_trb_length(max_packet);
+        out_ep_ctx.set_average_trb_length(out_max_packet);
 
         // Store rings
         slot.transfer_rings[in_dci - 1] = Some(in_ring);
@@ -216,14 +263,14 @@ impl super::XhciController {
             bounce
                 .sync_for_device(0..bounce.len(), direction)
                 .map_err(|_| XhciError::NotReady)?;
-            self.queue_bulk_trb(slot_id, dci, is_in, dma_address, chunk_len)?;
+            let td = self.queue_bulk_trb(slot_id, dci, is_in, dma_address, chunk_len)?;
 
             barrier::mmio_write();
             self.ring_doorbell(slot_id, dci as u8);
 
             // Error paths retain the allocation: a timeout or failed recovery
             // does not prove that the controller has stopped referencing it.
-            match self.wait_transfer_completion(slot_id, ep, 1) {
+            match self.wait_transfer_td(slot_id, ep, td) {
                 Ok(residual) => {
                     bounce
                         .sync_for_cpu(0..bounce.len(), direction)
@@ -300,7 +347,7 @@ impl super::XhciController {
         is_in: bool,
         dma_address: u64,
         len: usize,
-    ) -> Result<(), XhciError> {
+    ) -> Result<u64, XhciError> {
         debug_assert!(len <= TD_MAX_TRANSFER_SIZE);
         debug_assert_eq!(dma_address & (TD_MAX_TRANSFER_SIZE as u64 - 1), 0);
 
@@ -322,9 +369,9 @@ impl super::XhciController {
             trb.set_interrupt_on_short_packet();
         }
 
-        ring.enqueue(trb, false);
-        log::trace!("xHCI: queued {}B bulk TD", len);
-        Ok(())
+        let td = ring.enqueue(trb, false);
+        log::trace!("xHCI: queued {}B TD", len);
+        Ok(td)
     }
 }
 

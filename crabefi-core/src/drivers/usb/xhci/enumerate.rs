@@ -1,13 +1,11 @@
 //! xHCI port enumeration and hubs.
 
 use super::super::controller::{
-    DeviceDescriptor, HUB_DESCRIPTOR_TYPE, hub_feature, hub_port_status, req_type, request,
+    HUB_DESCRIPTOR_TYPE, hub_feature, hub_port_status, req_type, request,
 };
-use super::{TrbRing, UsbSlot, XhciError};
+use super::XhciError;
 use crate::barrier;
-use crate::efi;
 use crate::time::Timeout;
-use xhci::context::EndpointType;
 use xhci::ring::trb::command;
 
 impl super::XhciController {
@@ -271,111 +269,16 @@ impl super::XhciController {
         root_port: u8,
     ) -> Result<(), XhciError> {
         let slot_id = self.enable_slot()?;
-        // Slot IDs are 1-based indices into `slots`; reject anything the
-        // table cannot hold before allocating contexts below.
-        if slot_id == 0 || slot_id as usize >= self.slots.len() {
-            log::error!("xHCI: slot ID {} outside tracked range", slot_id);
-            return Err(XhciError::InvalidParameter);
-        }
-
-        // Allocate device context
-        let device_context_mem = efi::allocate_pages(1).ok_or(XhciError::AllocationFailed)?;
-        device_context_mem.fill(0);
-        let device_context = device_context_mem.as_ptr() as u64;
-
-        // Allocate input context
-        let input_context_mem = efi::allocate_pages(1).ok_or(XhciError::AllocationFailed)?;
-        input_context_mem.fill(0);
-        let input_context = input_context_mem.as_ptr() as u64;
-
-        // Allocate transfer ring for control endpoint
-        let transfer_ring_mem = efi::allocate_pages(1).ok_or(XhciError::AllocationFailed)?;
-        let transfer_ring = transfer_ring_mem.as_ptr() as u64;
-
-        let input_ptr = input_context as *mut u8;
-        let control = Self::input_control_context(input_ptr, self.context_size);
-        control.set_add_context_flag(0);
-        control.set_add_context_flag(1);
-
-        // Slot context with hub topology info
-        let slot_ctx = Self::input_slot_context(input_ptr, self.context_size);
-        slot_ctx.set_context_entries(1);
-        slot_ctx.set_speed(speed);
-        slot_ctx.set_root_hub_port_number(root_port + 1);
-        slot_ctx.set_route_string(route_string);
-        slot_ctx.set_parent_hub_slot_id(hub_slot_id);
-        slot_ctx.set_parent_port_number(hub_port);
-
-        // Control endpoint
-        let max_packet = match speed {
-            1 => 64, // Full speed: updated from bMaxPacketSize0 before longer transfers
-            2 => 8,
-            3 => 64,
-            4 => 512,
-            _ => 8,
-        };
-
-        let ep0_ctx = Self::input_ep_context(input_ptr, self.context_size, 0);
-        ep0_ctx.set_endpoint_type(EndpointType::Control);
-        ep0_ctx.set_max_packet_size(max_packet);
-        ep0_ctx.set_max_burst_size(0);
-        ep0_ctx.set_error_count(3);
-        ep0_ctx.set_tr_dequeue_pointer(transfer_ring);
-        ep0_ctx.set_dequeue_cycle_state();
-        ep0_ctx.set_average_trb_length(8);
-
-        let ring = TrbRing::new(transfer_ring, 256);
-
-        // DCBAA
-        let dcbaa_entry = unsafe { &mut *((self.dcbaa + (slot_id as u64 * 8)) as *mut u64) };
-        *dcbaa_entry = device_context;
-
-        // Address Device command
-        let mut command = command::AddressDevice::new();
-        command
-            .set_input_context_pointer(input_context)
-            .set_slot_id(slot_id);
-
-        self.cmd_ring.enqueue(command, false);
-        barrier::mmio_write();
-        self.ring_doorbell(0, 0);
-        self.wait_command_completion()?;
-        crate::time::delay_ms(2);
-
-        // Store slot info
-        let mut transfer_rings: [Option<TrbRing>; 31] = core::array::from_fn(|_| None);
-        transfer_rings[0] = Some(ring);
-
-        let slot_entry = self
-            .slots
-            .get_mut(slot_id as usize)
-            .ok_or(XhciError::NoFreeSlots)?;
-        *slot_entry = Some(UsbSlot {
+        self.address_slot(
             slot_id,
-            device_context: device_context as *mut u8,
-            input_context: input_context as *mut u8,
-            transfer_rings,
-            device_desc: DeviceDescriptor::default(),
-            port: hub_port,
             speed,
-            is_mass_storage: false,
-            mass_storage_interface: 0,
-            bulk_in_ep: 0,
-            bulk_out_ep: 0,
-            bulk_max_packet: 0,
-            is_hid_keyboard: false,
-            is_hid_mouse: false,
-            interrupt_in_ep: 0,
-            mouse_interrupt_in_ep: 0,
-            mouse_interrupt_max_packet: 0,
-            mouse_interrupt_interval: 0,
-            interrupt_max_packet: 0,
-            interrupt_interval: 0,
-            is_hub: false,
-            hub_ports: 0,
-            route_string,
-            root_port,
-        });
+            super::slots::SlotRoute {
+                port: hub_port,
+                root_port,
+                route_string,
+                parent_hub: Some((hub_slot_id, hub_port)),
+            },
+        )?;
 
         // Now enumerate the device (get descriptor, configure, etc.)
         match self.get_device_descriptor(slot_id) {
@@ -554,6 +457,13 @@ impl super::XhciController {
                     }
                 }
             }
+
+            // USB2 speed is not reliable until reset has enabled the port.
+            let status = self.portsc(port);
+            if !status.current_connect_status() || !status.port_enabled_disabled() {
+                continue;
+            }
+            let speed = status.port_speed();
 
             // Enable slot and address device
             match self.enable_slot() {

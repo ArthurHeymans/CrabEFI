@@ -240,7 +240,7 @@ pub mod variables {
         let mut size = 0usize;
         // SAFETY: runtime points to the validated image table and all inputs
         // are immediate boot-owned buffers.
-        let first = unsafe {
+        let first = crate::efi::boot_services::with_image_callback(|| unsafe {
             ((*runtime).get_variable)(
                 name.as_mut_ptr(),
                 &mut guid,
@@ -248,7 +248,7 @@ pub mod variables {
                 &mut size,
                 core::ptr::null_mut(),
             )
-        };
+        });
         if first == Status::NOT_FOUND {
             return None;
         }
@@ -260,7 +260,7 @@ pub mod variables {
             return None;
         }
         data.resize(size, 0);
-        let status = unsafe {
+        let status = crate::efi::boot_services::with_image_callback(|| unsafe {
             ((*runtime).get_variable)(
                 name.as_mut_ptr(),
                 &mut guid,
@@ -268,7 +268,7 @@ pub mod variables {
                 &mut size,
                 data.as_mut_ptr().cast::<c_void>(),
             )
-        };
+        });
         (status == Status::SUCCESS).then_some((attributes, data))
     }
 
@@ -286,7 +286,7 @@ pub mod variables {
         }
         // SAFETY: runtime points to the validated image table and all immediate
         // caller buffers remain live for the duration of this call.
-        unsafe {
+        crate::efi::boot_services::with_image_callback(|| unsafe {
             ((*runtime).set_variable)(
                 name.as_mut_ptr(),
                 &mut guid,
@@ -294,7 +294,7 @@ pub mod variables {
                 data.len(),
                 data.as_ptr() as *mut c_void,
             )
-        }
+        })
     }
 
     pub fn delete(guid: &Guid, name: &[u16]) -> Status {

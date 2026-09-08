@@ -1,0 +1,18 @@
+[package]
+name = "image-exit-test"
+version = "0.1.0"
+edition = "2024"
+description = "On-disk nested LoadImage/StartImage/Exit lifecycle test"
+
+[workspace]
+
+[dependencies]
+r-efi = "5.3"
+
+[profile.release]
+panic = "abort"
+lto = true
+opt-level = "z"
+
+[profile.dev]
+panic = "abort"

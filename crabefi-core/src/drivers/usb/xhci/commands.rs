@@ -10,6 +10,14 @@ impl super::XhciController {
         &mut self,
     ) -> Result<event::CommandCompletion, XhciError> {
         let timeout = Timeout::from_ms(5000);
+        // Commands are synchronous. Ignore late completions from an earlier
+        // timed-out command, especially when proving Disable/Stop completed.
+        let index = self
+            .cmd_ring
+            .enqueue_idx
+            .checked_sub(1)
+            .unwrap_or(self.cmd_ring.size - 2);
+        let expected = self.cmd_ring.base + (index * trb::BYTES) as u64;
 
         log::debug!(
             "xHCI: Waiting for command, dequeue_idx={}, expect_cycle={}",
@@ -38,6 +46,9 @@ impl super::XhciController {
 
                 match event::Allowed::try_from(raw) {
                     Ok(event::Allowed::CommandCompletion(completion)) => {
+                        if (u64::from(raw[0]) | (u64::from(raw[1]) << 32)) != expected {
+                            continue;
+                        }
                         let completion_code = completion.completion_code();
                         if completion_code == Ok(event::CompletionCode::Success) {
                             return Ok(completion);
@@ -75,9 +86,29 @@ impl super::XhciController {
     /// polling, timeout, and ERDP policy while decoding events upstream.
     pub(super) fn wait_transfer_completion(
         &mut self,
-        _slot: u8,
-        _ep: u8,
+        slot: u8,
+        ep: u8,
         expected_trbs: usize,
+    ) -> Result<u32, XhciError> {
+        self.wait_transfer_events(slot, ep, expected_trbs, None)
+    }
+
+    /// Wait for one particular TD, rejecting stale completions after cancellation.
+    pub(super) fn wait_transfer_td(
+        &mut self,
+        slot: u8,
+        ep: u8,
+        trb: u64,
+    ) -> Result<u32, XhciError> {
+        self.wait_transfer_events(slot, ep, 1, Some(trb))
+    }
+
+    fn wait_transfer_events(
+        &mut self,
+        slot: u8,
+        ep: u8,
+        expected_trbs: usize,
+        expected_td: Option<u64>,
     ) -> Result<u32, XhciError> {
         let timeout = Timeout::from_ms(5000);
         let mut completed = 0usize;
@@ -97,6 +128,15 @@ impl super::XhciController {
 
                 match event::Allowed::try_from(raw) {
                     Ok(event::Allowed::TransferEvent(transfer_event)) => {
+                        let event_slot = (raw[3] >> 24) as u8;
+                        let event_dci = ((raw[3] >> 16) & 0x1f) as u8;
+                        let pointer = u64::from(raw[0]) | (u64::from(raw[1]) << 32);
+                        if event_slot != slot
+                            || event_dci / 2 != ep
+                            || expected_td.is_some_and(|expected| expected != pointer)
+                        {
+                            continue;
+                        }
                         let residual = transfer_event.trb_transfer_length();
                         let completion_code = transfer_event.completion_code();
                         log::trace!(

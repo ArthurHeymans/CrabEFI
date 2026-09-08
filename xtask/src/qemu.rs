@@ -979,6 +979,17 @@ pub fn run_tests(config: &QemuConfig, disk_path: &Path, app_name: &str) -> Resul
                 failed += 1;
             }
         }
+        "image-exit-test" => {
+            if result.output.contains("All image exit tests passed!")
+                && !result.output.contains("[FAIL] image_exit")
+            {
+                println!("[PASS] image_exit: Nested Exit, exit data, and image cleanup");
+                passed += 1;
+            } else {
+                println!("[FAIL] image_exit: Image lifecycle test did not pass");
+                failed += 1;
+            }
+        }
         "protocol-notify-test" => {
             if result.output.contains("RegisterProtocolNotify Test") {
                 println!("[PASS] test_started: protocol notify test started");

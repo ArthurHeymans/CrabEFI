@@ -606,7 +606,7 @@ impl UsbController for XhciController {
             number: slot.bulk_in_ep,
             direction: self::controller::Direction::In,
             transfer_type: self::controller::EndpointType::Bulk,
-            max_packet_size: slot.bulk_max_packet,
+            max_packet_size: slot.bulk_in_max_packet,
             interval: 0,
             toggle: false,
         };
@@ -615,7 +615,7 @@ impl UsbController for XhciController {
             number: slot.bulk_out_ep,
             direction: self::controller::Direction::Out,
             transfer_type: self::controller::EndpointType::Bulk,
-            max_packet_size: slot.bulk_max_packet,
+            max_packet_size: slot.bulk_out_max_packet,
             interval: 0,
             toggle: false,
         };

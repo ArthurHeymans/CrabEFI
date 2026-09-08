@@ -16,8 +16,7 @@ mod protocols_db;
 pub use events::KEYBOARD_EVENT_ID;
 #[cfg(feature = "ui")]
 pub use events::POINTER_EVENT_ID;
-pub(crate) use events::{measure_efi_application_return, measure_efi_application_start};
-pub(crate) use images::serialize_tcg_image_load_event;
+pub(crate) use events::measure_efi_application_start;
 
 use super::allocator::{self, MemoryType};
 use super::guid_fmt::GuidFmt;
@@ -26,13 +25,50 @@ use super::tables::{
     HandleEntry, MAX_PROTOCOL_NOTIFIES, MAX_PROTOCOLS_PER_HANDLE, OpenProtocolEntry, ProtocolEntry,
     tables, with_tables_mut,
 };
-use crate::cell::StaticMut;
+use crate::cell::{LocalCell, StaticMut};
 use alloc::vec::Vec;
 use core::ffi::c_void;
 use r_efi::protocols::device_path::Protocol as DevicePathProtocol;
 
 use crabefi_efi_types::crc32;
 use r_efi::efi::{self, Boolean, Guid, Handle, Status, TableHeader, Tpl};
+
+/// Depth of firmware-to-image callbacks, distinct from nested StartImage calls.
+static IMAGE_CALLBACK_DEPTH: LocalCell<usize> = LocalCell::new(0);
+
+// Host tests that invoke foreign code share the single-hart execution globals.
+#[cfg(test)]
+pub(crate) static IMAGE_EXECUTION_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Return the callback depth that an image invocation may safely Exit through.
+pub(crate) fn image_callback_depth() -> usize {
+    IMAGE_CALLBACK_DEPTH.get()
+}
+
+/// Call foreign code without allowing Exit to abandon the calling Rust frames.
+///
+/// # Arguments
+/// * `callback` - An image-provided event, protocol method, or unload callback.
+///
+/// # Returns
+/// The callback's return value. A nested StartImage establishes its own boundary
+/// at this depth and can still Exit normally.
+pub(crate) fn with_image_callback<R>(callback: impl FnOnce() -> R) -> R {
+    struct RestoreDepth(usize);
+    impl Drop for RestoreDepth {
+        fn drop(&mut self) {
+            IMAGE_CALLBACK_DEPTH.set(self.0);
+        }
+    }
+    let previous = image_callback_depth();
+    let _restore = RestoreDepth(previous);
+    IMAGE_CALLBACK_DEPTH.set(
+        previous
+            .checked_add(1)
+            .expect("image callback depth overflow"),
+    );
+    callback()
+}
 
 /// Boot Services signature "BOOTSERV"
 const EFI_BOOT_SERVICES_SIGNATURE: u64 = 0x56524553544F4F42;
