@@ -461,7 +461,8 @@ extern "efiapi" fn file_read(
                 .map_err(|_| Status::DEVICE_ERROR);
         }
         let mut fat =
-            FatFilesystem::from_geometry(device, filesystem.partition_start, filesystem.geometry);
+            FatFilesystem::from_geometry(device, filesystem.partition_start, filesystem.geometry)
+                .map_err(|_| Status::DEVICE_ERROR)?;
         let entry = create_file_entry(first_cluster, file_size as u32);
         let mut next_hint = cluster_hint;
         fat.read_file_with_hint(&entry, position as u32, buf_slice, &mut next_hint)
@@ -928,7 +929,8 @@ fn read_directory(buffer_size: *mut usize, buffer: *mut c_void, handle_idx: usiz
                 .map_err(|_| Status::DEVICE_ERROR);
         }
         let mut fat =
-            FatFilesystem::from_geometry(device, filesystem.partition_start, filesystem.geometry);
+            FatFilesystem::from_geometry(device, filesystem.partition_start, filesystem.geometry)
+                .map_err(|_| Status::DEVICE_ERROR)?;
 
         fat.get_directory_entry_at_position(cluster, position)
             .map_err(|_| Status::DEVICE_ERROR)
