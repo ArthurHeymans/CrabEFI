@@ -99,12 +99,12 @@ impl MmioRegion {
     /// wraps the address space. Use this from fallible init paths instead of
     /// the panicking [`MmioRegion::new`].
     pub unsafe fn try_new(base: u64, size: usize) -> Result<Self, MmioError> {
-        if checked_region(base, size).is_none() {
-            return Err(MmioError::EmptyOrWrapping { base, size });
-        }
         let Some(ptr) = NonNull::new(base as *mut u8) else {
             return Err(MmioError::NullBase);
         };
+        if checked_region(base, size).is_none() {
+            return Err(MmioError::EmptyOrWrapping { base, size });
+        }
         Ok(Self { base: ptr, size })
     }
 

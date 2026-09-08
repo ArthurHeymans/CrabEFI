@@ -594,12 +594,16 @@ impl NvmeController {
         // writes below panic with the offset instead of corrupting MMIO.
         // SAFETY: PCI BAR base for this controller, valid for its lifetime.
         let doorbells = unsafe {
-            MmioRegion::try_new(mmio_base + DOORBELL_BASE, 3 * doorbell_stride + 4).map_err(
-                |e| {
-                    log::error!("NVMe doorbell window invalid at {mmio_base:#x}: {e}");
-                    NvmeError::InvalidParameter
-                },
-            )?
+            MmioRegion::try_new(
+                mmio_base
+                    .checked_add(DOORBELL_BASE)
+                    .ok_or(NvmeError::InvalidParameter)?,
+                3 * doorbell_stride + 4,
+            )
+            .map_err(|e| {
+                log::error!("NVMe doorbell window invalid at {mmio_base:#x}: {e}");
+                NvmeError::InvalidParameter
+            })?
         };
 
         let mut controller = Self {

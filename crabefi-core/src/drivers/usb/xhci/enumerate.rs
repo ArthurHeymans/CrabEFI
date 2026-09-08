@@ -271,6 +271,12 @@ impl super::XhciController {
         root_port: u8,
     ) -> Result<(), XhciError> {
         let slot_id = self.enable_slot()?;
+        // Slot IDs are 1-based indices into `slots`; reject anything the
+        // table cannot hold before allocating contexts below.
+        if slot_id == 0 || slot_id as usize >= self.slots.len() {
+            log::error!("xHCI: slot ID {} outside tracked range", slot_id);
+            return Err(XhciError::InvalidParameter);
+        }
 
         // Allocate device context
         let device_context_mem = efi::allocate_pages(1).ok_or(XhciError::AllocationFailed)?;
