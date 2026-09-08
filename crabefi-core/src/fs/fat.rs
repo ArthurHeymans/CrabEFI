@@ -370,6 +370,8 @@ pub enum FatError {
     InvalidCluster,
     /// Buffer too small
     BufferTooSmall,
+    /// Device block size exceeds the internal read buffer
+    UnsupportedBlockSize,
 }
 
 impl core::fmt::Display for FatError {
@@ -384,6 +386,9 @@ impl core::fmt::Display for FatError {
             FatError::EndOfFile => write!(f, "end of file"),
             FatError::InvalidCluster => write!(f, "invalid cluster"),
             FatError::BufferTooSmall => write!(f, "buffer too small"),
+            FatError::UnsupportedBlockSize => {
+                write!(f, "device block size exceeds the FAT read buffer")
+            }
         }
     }
 }
@@ -458,9 +463,14 @@ pub struct FatFilesystem<'a> {
 impl<'a> FatFilesystem<'a> {
     /// Create a new FAT filesystem instance
     pub fn new(device: &'a mut dyn BlockDevice, partition_start: u64) -> Result<Self, FatError> {
-        // Use device's actual block size for reading
+        // Use device's actual block size for reading. The FAT read buffer holds
+        // one device block, so a larger block cannot be read correctly.
         let info = device.info();
-        let block_size = (info.block_size as usize).min(MAX_BLOCK_SIZE);
+        let block_size = info.block_size as usize;
+        if !(1..=MAX_BLOCK_SIZE).contains(&block_size) {
+            log::debug!("Unsupported device block size: {block_size}");
+            return Err(FatError::UnsupportedBlockSize);
+        }
         let mut buffer = [0u8; MAX_BLOCK_SIZE];
 
         // Read the boot sector
@@ -615,13 +625,24 @@ impl<'a> FatFilesystem<'a> {
     ///
     /// The host block size is always taken from the live device, never from
     /// the cache, so a controller quirk cannot silently change the access path.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FatError::UnsupportedBlockSize`] when the live device reports
+    /// a block size the internal read buffer cannot hold. [`Self::new`]
+    /// enforces the same bound, so this only fails if the device changed
+    /// between mounting and this call.
     pub fn from_geometry(
         device: &'a mut dyn BlockDevice,
         partition_start: u64,
         geometry: FatGeometry,
-    ) -> Self {
+    ) -> Result<Self, FatError> {
         let device_block_size = device.info().block_size;
-        Self {
+        if !(1..=MAX_BLOCK_SIZE as u32).contains(&device_block_size) {
+            log::debug!("Unsupported device block size: {device_block_size}");
+            return Err(FatError::UnsupportedBlockSize);
+        }
+        Ok(Self {
             device,
             partition_start,
             fat_type: geometry.fat_type,
@@ -636,7 +657,7 @@ impl<'a> FatFilesystem<'a> {
             data_clusters: geometry.data_clusters,
             fat_block_cache: [0u8; MAX_BLOCK_SIZE],
             fat_block_cached: u64::MAX,
-        }
+        })
     }
 
     /// Return the validated geometry needed to reopen this filesystem.
