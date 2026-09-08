@@ -971,16 +971,10 @@ pub extern "C" fn rust_main(coreboot_table_ptr: u64) -> ! {
                     count
                 }
                 // EmptyFramebuffer is unreachable: malformed descriptors are
-                // filtered into `None` above. A rejected or overlapping map is
-                // coreboot's, not ours; keep booting with the un-overlaid map
-                // rather than halting a payload that cannot report the fault.
-                Err(error) => {
-                    log::error!(
-                        "Framebuffer MMIO overlay rejected ({error:?}); \
-                         using the platform memory map unchanged"
-                    );
-                    region_count
-                }
+                // filtered into `None` above. Continuing after any other error
+                // could leave the framebuffer aperture classified as allocatable
+                // RAM, so fail closed instead of publishing an unsafe map.
+                Err(error) => panic!("Framebuffer MMIO overlay rejected: {error:?}"),
             }
         }
         None => region_count,
