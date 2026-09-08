@@ -661,7 +661,7 @@ impl UsbMassStorage {
         if block_size == 0 || buffer.len() < required_len {
             return Err(MassStorageError::InvalidParameter);
         }
-        let sectors_per_cmd =
+        let mut sectors_per_cmd =
             (controller.max_bulk_transfer_size() / block_size).clamp(1, u16::MAX as usize) as u32;
         let mut lba = start_lba;
         let mut remaining = num_sectors;
@@ -669,12 +669,28 @@ impl UsbMassStorage {
 
         while remaining > 0 {
             let chunk = remaining.min(sectors_per_cmd);
-            self.read_sectors_with_retry(
+            match self.read_sectors_with_retry(
                 controller,
                 lba,
                 chunk,
                 &mut buffer[offset..offset + chunk as usize * block_size],
-            )?;
+            ) {
+                Ok(()) => {}
+                // Some bridges cap the data phase below what we asked for. Halve
+                // the request and retry instead of failing the whole read; a
+                // single sector that still comes up short is a real error.
+                Err(MassStorageError::ShortTransfer) if chunk > 1 => {
+                    sectors_per_cmd = (chunk / 2).max(1);
+                    log::debug!(
+                        "USB mass storage: short {} sector read at LBA {}, retrying with {}",
+                        chunk,
+                        lba,
+                        sectors_per_cmd
+                    );
+                    continue;
+                }
+                Err(e) => return Err(e),
+            }
 
             lba += chunk as u64;
             remaining -= chunk;
