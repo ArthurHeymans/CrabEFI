@@ -11,9 +11,14 @@ use r_efi::protocols::loaded_image;
 /// Re-export the GUID for external use
 pub const LOADED_IMAGE_PROTOCOL_GUID: Guid = loaded_image::PROTOCOL_GUID;
 
-/// Unload callback - not supported
+/// Unload callback for images the firmware loaded itself.
+///
+/// It deliberately does no work: the image owns no resources the firmware did
+/// not allocate for it, and `UnloadImage` frees the image pages itself once
+/// this callback reports success. Returning `EFI_UNSUPPORTED` here made
+/// `UnloadImage` fail for every image the firmware had loaded.
 extern "efiapi" fn unload_image(_image_handle: Handle) -> Status {
-    Status::UNSUPPORTED
+    Status::SUCCESS
 }
 
 /// Create a new Loaded Image Protocol instance for a loaded EFI application
@@ -106,5 +111,17 @@ pub unsafe fn set_file_path(
         unsafe {
             (*protocol).file_path = device_path;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_unload_reports_success_so_unload_image_can_free_the_pages() {
+        // UnloadImage only releases the image when its callback reports
+        // success; the firmware's own no-op callback must not veto that.
+        assert_eq!(unload_image(core::ptr::null_mut()), Status::SUCCESS);
     }
 }
