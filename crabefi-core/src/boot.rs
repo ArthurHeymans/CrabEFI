@@ -467,6 +467,7 @@ fn load_and_execute_bootloader(
 ) -> Result<(), Status> {
     use core::ptr;
     use efi::allocator::{MemoryType, allocate_pool, free_pool};
+    use efi::protocols::loaded_image::LOADED_IMAGE_PROTOCOL_GUID;
 
     log::info!("Loading bootloader: {} ({} bytes)", path, file_size);
     let buffer_ptr = allocate_pool(MemoryType::LoaderData, file_size as usize)?;
@@ -502,6 +503,21 @@ fn load_and_execute_bootloader(
     let _ = free_pool(full_path.cast());
     if status != Status::SUCCESS {
         return Err(status);
+    }
+
+    // LoadImage derives LoadedImage.DeviceHandle by resolving the device path it
+    // was given. A platform-provided block device has no device path protocol,
+    // so that resolution fails and DeviceHandle is left NULL. Restore the handle
+    // this bootloader was read from: shim and GRUB use it to locate their own
+    // config and modules.
+    let loaded_image =
+        boot_services::get_protocol_on_handle(image_handle, &LOADED_IMAGE_PROTOCOL_GUID)
+            as *mut r_efi::protocols::loaded_image::Protocol;
+    if !loaded_image.is_null() && unsafe { (*loaded_image).device_handle.is_null() } {
+        // SAFETY: the protocol is installed on the image handle we just created
+        // and remains live until UnloadImage/StartImage teardown.
+        unsafe { (*loaded_image).device_handle = device_handle };
+        log::info!("LoadedImage.DeviceHandle restored to {device_handle:?}");
     }
 
     log::info!("Executing bootloader...");
