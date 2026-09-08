@@ -955,26 +955,33 @@ pub extern "C" fn rust_main(coreboot_table_ptr: u64) -> ! {
     let region_count = convert_memory_map(&cb_info.memory_map, &mut memory_regions);
     let region_count = match framebuffer {
         Some(framebuffer) => {
-            let count = memory_map::overlay_framebuffer_region(
+            match memory_map::overlay_framebuffer_region(
                 &mut memory_regions,
                 region_count,
                 framebuffer.physical_address,
                 framebuffer.size(),
                 crabefi::MemoryType::Mmio,
-            )
-            .unwrap_or_else(|error| {
+            ) {
+                Ok(count) => {
+                    log::info!(
+                        "Reported framebuffer MMIO region at {:#x} ({} bytes)",
+                        framebuffer.physical_address,
+                        framebuffer.size()
+                    );
+                    count
+                }
                 // EmptyFramebuffer is unreachable: malformed descriptors are
-                // filtered into `None` above. Overlay failures here mean the
-                // map cannot safely describe the display aperture, so stop
-                // rather than hand the OS a corrupt memory map.
-                panic!("Cannot safely report framebuffer MMIO: {:?}", error)
-            });
-            log::info!(
-                "Reported framebuffer MMIO region at {:#x} ({} bytes)",
-                framebuffer.physical_address,
-                framebuffer.size()
-            );
-            count
+                // filtered into `None` above. A rejected or overlapping map is
+                // coreboot's, not ours; keep booting with the un-overlaid map
+                // rather than halting a payload that cannot report the fault.
+                Err(error) => {
+                    log::error!(
+                        "Framebuffer MMIO overlay rejected ({error:?}); \
+                         using the platform memory map unchanged"
+                    );
+                    region_count
+                }
+            }
         }
         None => region_count,
     };
