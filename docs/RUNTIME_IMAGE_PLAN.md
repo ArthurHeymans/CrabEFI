@@ -87,8 +87,9 @@ The split intentionally has two narrowly scoped certificate verifiers. The
 runtime image uses the hand-rolled PKCS#7/X.509 parser in
 `crabefi-runtime-image/src/auth/crypto.rs` together with allocator-aware
 `crypto-bigint` RSA public exponentiation over a lifetime-scoped image-local
-scratch allocator; boot retains the `cms`/`x509_cert`-based verifier solely for
-Authenticode image verification.
+scratch allocator; boot parses CMS/X.509 on the minimal `asn1` crate
+(`crabefi-core/src/efi/auth/asn1_views.rs`) and verifies RSA with the `rsa`
+crate for Authenticode image verification.
 Both deliberately skip certificate `notBefore`/`notAfter` checks. This
 preserves the pre-split `check_validity_period = false` behavior and matches
 EDK2 and U-Boot Secure Boot handling, where firmware time does not gate trust

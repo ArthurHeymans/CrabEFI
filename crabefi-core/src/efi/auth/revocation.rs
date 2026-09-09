@@ -14,17 +14,12 @@
 //! is CRL/dbx only.
 
 use super::AuthError;
+use super::asn1_views;
 use alloc::string::String;
 use alloc::vec::Vec;
-use der::{Decode, Encode};
-use x509_cert::Certificate;
-use x509_cert::crl::CertificateList;
-use x509_cert::ext::pkix::name::GeneralName;
 
-// Re-export x509_cert's CrlReason for use by callers.
-// Variant naming differs slightly from the old hand-rolled enum:
-//   CaCompromise (was CACompromise), AaCompromise (was AACompromise)
-pub use x509_cert::ext::pkix::crl::CrlReason;
+// Local CRL reason codes (previously re-exported from x509_cert).
+pub use super::asn1_views::CrlReason;
 
 // ============================================================================
 // CRL (Certificate Revocation List) Support
@@ -80,45 +75,28 @@ pub struct CrlDistributionPoint {
 pub fn extract_crl_distribution_points(
     cert_der: &[u8],
 ) -> Result<Vec<CrlDistributionPoint>, AuthError> {
-    use x509_cert::ext::pkix::crl::CrlDistributionPoints;
-    use x509_cert::ext::pkix::name::DistributionPointName;
-
-    let cert = Certificate::from_der(cert_der).map_err(|_| AuthError::CertificateParseError)?;
-
-    let mut points = Vec::new();
-
-    if let Some(extensions) = &cert.tbs_certificate().extensions() {
-        for ext in extensions.iter() {
-            if ext.extn_id == <CrlDistributionPoints as const_oid::AssociatedOid>::OID {
-                let cdps = CrlDistributionPoints::from_der(ext.extn_value.as_bytes())
-                    .map_err(|_| AuthError::CertificateParseError)?;
-
-                for dp in cdps.0.iter() {
-                    if let Some(DistributionPointName::FullName(names)) = &dp.distribution_point {
-                        for name in names {
-                            if let GeneralName::UniformResourceIdentifier(uri) = name {
-                                points.push(CrlDistributionPoint {
-                                    uri: String::from(uri.as_str()),
-                                });
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    Ok(points)
+    let cert = asn1_views::parse_cert_view(cert_der)?;
+    let Some(extensions_der) = cert.extensions_der else {
+        return Ok(Vec::new());
+    };
+    let Some(value) =
+        asn1_views::find_extension(extensions_der, asn1_views::OID_CRL_DISTRIBUTION_POINTS)?
+    else {
+        return Ok(Vec::new());
+    };
+    asn1_views::extract_crl_uris(value)?
+        .into_iter()
+        .map(|uri| {
+            core::str::from_utf8(&uri)
+                .map(|s| CrlDistributionPoint {
+                    uri: String::from(s),
+                })
+                .map_err(|_| AuthError::CertificateParseError)
+        })
+        .collect()
 }
 
-/// Convert an x509_cert Time to a Unix timestamp (seconds since epoch)
-fn time_to_unix(t: x509_cert::time::Time) -> i64 {
-    t.to_unix_duration().as_secs() as i64
-}
-
-/// Parse a DER-encoded CRL
-///
-/// Uses `x509_cert::crl::CertificateList::from_der()` for structured parsing.
+/// Parse a DER-encoded CRL into the cached representation.
 pub fn parse_crl(crl_der: &[u8]) -> Result<CertificateRevocationList, AuthError> {
     if crl_der.len() > MAX_CRL_SIZE {
         log::warn!(
@@ -129,58 +107,26 @@ pub fn parse_crl(crl_der: &[u8]) -> Result<CertificateRevocationList, AuthError>
         return Err(AuthError::InvalidHeader);
     }
 
-    let crl: CertificateList = CertificateList::from_der(crl_der).map_err(|e| {
-        log::debug!("Failed to parse CRL: {:?}", e);
-        AuthError::CertificateParseError
-    })?;
+    let crl = asn1_views::parse_crl_view(crl_der, MAX_REVOKED_CERTS)?;
 
-    let tbs = &crl.tbs_cert_list;
-
-    let issuer = tbs
-        .issuer
-        .to_der()
-        .map_err(|_| AuthError::CertificateParseError)?;
-
-    let this_update = time_to_unix(tbs.this_update);
-    let next_update = tbs.next_update.map(time_to_unix);
-
-    // Parse revoked certificates
-    let revoked_certificates: Vec<_> = tbs
-        .revoked_certificates
-        .as_ref()
-        .map(|revoked| {
-            revoked
-                .iter()
-                .take(MAX_REVOKED_CERTS)
-                .map(|rc| {
-                    let serial_number = rc.serial_number.as_bytes().to_vec();
-                    let revocation_date = time_to_unix(rc.revocation_date);
-
-                    // Extract CRL reason from entry extensions
-                    let reason = rc.crl_entry_extensions.as_ref().and_then(|exts| {
-                        exts.iter()
-                            .find(|e| e.extn_id == <CrlReason as const_oid::AssociatedOid>::OID)
-                            .and_then(|e| CrlReason::from_der(e.extn_value.as_bytes()).ok())
-                    });
-
-                    RevokedCertificate {
-                        serial_number,
-                        revocation_date,
-                        reason,
-                    }
-                })
-                .collect()
+    let revoked_certificates = crl
+        .revoked
+        .iter()
+        .map(|rc| RevokedCertificate {
+            serial_number: rc.serial.to_vec(),
+            revocation_date: rc.revocation_date,
+            reason: rc.reason,
         })
-        .unwrap_or_default();
+        .collect::<Vec<_>>();
 
     if revoked_certificates.len() >= MAX_REVOKED_CERTS {
         log::warn!("CRL contains too many revoked certificates, truncated");
     }
 
     Ok(CertificateRevocationList {
-        issuer,
-        this_update,
-        next_update,
+        issuer: crl.issuer_der.to_vec(),
+        this_update: crl.this_update,
+        next_update: crl.next_update,
         revoked_certificates,
     })
 }
@@ -190,7 +136,7 @@ pub fn parse_crl(crl_der: &[u8]) -> Result<CertificateRevocationList, AuthError>
 // ============================================================================
 
 /// Revocation check result
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RevocationCheckResult {
     /// Certificate is not revoked
     Good,
@@ -317,16 +263,14 @@ pub fn check_crl_revocation(
     cert_der: &[u8],
     crl: &CertificateRevocationList,
 ) -> RevocationCheckResult {
-    let cert = match Certificate::from_der(cert_der) {
+    let cert = match asn1_views::parse_cert_view(cert_der) {
         Ok(c) => c,
         Err(_) => return RevocationCheckResult::Unknown,
     };
 
-    let serial_number = cert.tbs_certificate().serial_number().as_bytes();
-
     // Check if the serial number is in the revoked list
     for revoked in &crl.revoked_certificates {
-        if revoked.serial_number == serial_number {
+        if revoked.serial_number == cert.serial {
             return RevocationCheckResult::Revoked {
                 reason: revoked.reason,
                 revocation_time: revoked.revocation_date,
@@ -361,13 +305,8 @@ pub fn check_certificate_revocation(
     }
 
     // Get the issuer name for CRL lookup
-    let issuer = match Certificate::from_der(issuer_der) {
-        Ok(c) => c,
-        Err(_) => return RevocationCheckResult::Unknown,
-    };
-
-    let issuer_name = match issuer.tbs_certificate().subject().to_der() {
-        Ok(n) => n,
+    let issuer_name = match asn1_views::parse_cert_view(issuer_der) {
+        Ok(c) => c.subject_der.to_vec(),
         Err(_) => return RevocationCheckResult::Unknown,
     };
 
