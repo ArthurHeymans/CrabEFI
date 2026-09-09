@@ -102,6 +102,26 @@ fn superspeed_hid_bursts_and_nonstandard_payloads_are_explicitly_unsupported() {
 }
 
 #[test]
+fn interface_count_mismatch_is_tolerated() {
+    let mut descriptors = hid_interface(3, 0, 1).to_vec();
+    descriptors.extend_from_slice(&INTERRUPT_IN);
+    // bNumInterfaces claims two interfaces but only one is present.
+    let bytes = configuration(2, &descriptors);
+    let parsed = parse_configuration_checked(&bytes).unwrap();
+    assert_eq!(parsed.num_interfaces, 1);
+    assert_eq!(parsed.interfaces[0].interface_number, 3);
+    assert!(parsed.interfaces[0].is_hid_keyboard());
+
+    // bConfigurationValue == 0 would leave the device unconfigured.
+    let mut zero_configuration = bytes;
+    zero_configuration[5] = 0;
+    assert!(matches!(
+        parse_configuration_checked(&zero_configuration),
+        Err(UsbError::InvalidParameter)
+    ));
+}
+
+#[test]
 fn truncated_and_malformed_configurations_are_rejected() {
     let mut descriptors = hid_interface(0, 0, 1).to_vec();
     descriptors.extend_from_slice(&INTERRUPT_IN);
