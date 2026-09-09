@@ -310,8 +310,10 @@ pub fn read_gpt_header(device: &mut dyn BlockDevice) -> Result<GptHeader, GptErr
 
 /// Prefer native GPT at device LBA 1. Only use 512-byte ISO addressing when
 /// a header is actually found at byte 512; block size alone cannot identify it.
-/// Keep this decision shared by discovery and measured boot.
-fn read_gpt_layout(device: &mut dyn BlockDevice) -> Result<(GptHeader, bool), GptError> {
+/// Keep this decision shared by discovery and measured boot. Callers that read
+/// partitions and the measurement event pass the result to the `_with` helpers
+/// so one probe covers the whole boot scan.
+pub(crate) fn read_gpt_layout(device: &mut dyn BlockDevice) -> Result<(GptHeader, bool), GptError> {
     let block_size = device.info().block_size as usize;
     if !(MIN_BLOCK_SIZE..=MAX_BLOCK_SIZE).contains(&block_size) || !block_size.is_power_of_two() {
         return Err(GptError::InvalidHeader);
@@ -382,9 +384,18 @@ pub fn build_gpt_measurement_event(
     device: &mut dyn BlockDevice,
     header: &GptHeader,
 ) -> Result<Vec<u8>, GptError> {
+    let (_, is_hybrid) = read_gpt_layout(device)?;
+    build_gpt_measurement_event_with(device, header, is_hybrid)
+}
+
+/// Build the `EFI_GPT_DATA` payload for an already-detected layout.
+pub(crate) fn build_gpt_measurement_event_with(
+    device: &mut dyn BlockDevice,
+    header: &GptHeader,
+    is_hybrid: bool,
+) -> Result<Vec<u8>, GptError> {
     let info = device.info();
     let block_size = (info.block_size as usize).clamp(MIN_BLOCK_SIZE, MAX_BLOCK_SIZE);
-    let (_, is_hybrid) = read_gpt_layout(device)?;
 
     let entry_size = header.partition_entry_size as usize;
     let (entries_byte_offset, total_entries, total_bytes_needed) =
@@ -452,14 +463,22 @@ pub fn read_partitions(
     device: &mut dyn BlockDevice,
     header: &GptHeader,
 ) -> Result<heapless::Vec<Partition, 16>, GptError> {
+    // Detect the on-disk layout rather than treating all large sectors as ISO media.
+    let (_, is_hybrid) = read_gpt_layout(device)?;
+    read_partitions_with(device, header, is_hybrid)
+}
+
+/// Read partition entries for an already-detected layout.
+pub(crate) fn read_partitions_with(
+    device: &mut dyn BlockDevice,
+    header: &GptHeader,
+    is_hybrid: bool,
+) -> Result<heapless::Vec<Partition, 16>, GptError> {
     let mut partitions = heapless::Vec::new();
 
     // Use device's actual block size, capped at MAX_BLOCK_SIZE
     let info = device.info();
     let block_size = (info.block_size as usize).clamp(MIN_BLOCK_SIZE, MAX_BLOCK_SIZE);
-
-    // Detect the on-disk layout rather than treating all large sectors as ISO media.
-    let (_, is_hybrid) = read_gpt_layout(device)?;
 
     let entry_size = header.partition_entry_size as usize;
     if entry_size < core::mem::size_of::<GptPartitionEntry>() || entry_size > MAX_BLOCK_SIZE {
@@ -642,7 +661,9 @@ pub fn read_mbr_partitions(
 pub fn read_partitions_auto(
     device: &mut dyn BlockDevice,
 ) -> Result<heapless::Vec<Partition, 16>, GptError> {
-    match read_gpt_header(device).and_then(|header| read_partitions(device, &header)) {
+    match read_gpt_layout(device)
+        .and_then(|(header, is_hybrid)| read_partitions_with(device, &header, is_hybrid))
+    {
         Ok(partitions) => Ok(partitions),
         Err(gpt_error) => {
             log::debug!("GPT partition scan failed: {:?}; trying MBR", gpt_error);

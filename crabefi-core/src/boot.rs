@@ -90,43 +90,30 @@ pub fn install_block_io_protocols(
 
     // Read GPT partitions, falling back to MBR for removable media. If a GPT is
     // present, measure its header and non-empty partition entries into PCR 5 per
-    // the TCG PC Client PFP EFI_GPT_DATA event format.
-    let partitions = match fs::gpt::read_gpt_header(disk) {
-        Ok(header) => match fs::gpt::read_partitions(disk, &header) {
-            Ok(p) => {
-                if let Ok(event_data) = fs::gpt::build_gpt_measurement_event(disk, &header)
-                    && !GPT_MEASURED.swap(true, Ordering::Relaxed)
-                {
-                    // EDK2 measures EV_EFI_GPT_EVENT once per boot, not once per boot attempt.
-                    efi::tcg::measured_boot::measure_event_all(
-                        5,
-                        efi::tcg::types::EV_EFI_GPT_EVENT,
-                        &event_data,
-                        &event_data,
-                        "GPT partition table",
-                    );
-                }
-                p
+    // the TCG PC Client PFP EFI_GPT_DATA event format. The layout is detected
+    // once and reused for the partition scan and the measurement payload.
+    let gpt_scan = fs::gpt::read_gpt_layout(disk).and_then(|(header, is_hybrid)| {
+        fs::gpt::read_partitions_with(disk, &header, is_hybrid).map(|p| (header, is_hybrid, p))
+    });
+    let partitions = match gpt_scan {
+        Ok((header, is_hybrid, partitions)) => {
+            if let Ok(event_data) =
+                fs::gpt::build_gpt_measurement_event_with(disk, &header, is_hybrid)
+                && !GPT_MEASURED.swap(true, Ordering::Relaxed)
+            {
+                // EDK2 measures EV_EFI_GPT_EVENT once per boot, not once per boot attempt.
+                efi::tcg::measured_boot::measure_event_all(
+                    5,
+                    efi::tcg::types::EV_EFI_GPT_EVENT,
+                    &event_data,
+                    &event_data,
+                    "GPT partition table",
+                );
             }
-            Err(e) => {
-                log::debug!("Failed to read GPT partitions: {:?}; trying MBR", e);
-                match fs::gpt::read_mbr_partitions(disk) {
-                    Ok(p) => {
-                        let mut partitions = heapless::Vec::new();
-                        for partition in p {
-                            let _ = partitions.push(partition);
-                        }
-                        partitions
-                    }
-                    Err(e) => {
-                        log::debug!("Failed to read partition table: {:?}", e);
-                        return None;
-                    }
-                }
-            }
-        },
-        Err(gpt_error) => {
-            log::debug!("GPT partition scan failed: {:?}; trying MBR", gpt_error);
+            partitions
+        }
+        Err(error) => {
+            log::debug!("GPT partition scan failed: {:?}; trying MBR", error);
             match fs::gpt::read_mbr_partitions(disk) {
                 Ok(p) => {
                     let mut partitions = heapless::Vec::new();
