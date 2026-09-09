@@ -194,8 +194,6 @@ mod tests {
 
     #[test]
     fn signed_pk_kek_db_append_delete_and_unauthorized_paths() {
-        let _guard = crate::scratch::test_lock();
-        crate::scratch::activate();
         let mut store = VariableStore::new();
         let mut transaction = VariableTransaction::new();
         let global = EFI_GLOBAL_VARIABLE_GUID;
@@ -325,16 +323,10 @@ mod tests {
             crate::auth::timestamp_from_efi_time(deletion.timestamp),
         );
         assert!(store.key_database_data(SecureBootVariable::Db).is_none());
-        assert!(
-            crate::scratch::high_water_for_test() <= super::super::AUTH_OPERATION_SCRATCH_BOUND
-        );
-        crate::scratch::reset();
     }
 
     #[test]
-    fn maximum_authenticated_input_stays_within_scratch() {
-        let _guard = crate::scratch::test_lock();
-        crate::scratch::activate();
+    fn maximum_authenticated_input_verifies_without_arena() {
         let mut store = VariableStore::new();
         let mut transaction = VariableTransaction::new();
         let global = EFI_GLOBAL_VARIABLE_GUID;
@@ -355,10 +347,6 @@ mod tests {
                 .unwrap_err(),
             AuthError::SignatureVerificationFailed
         );
-        assert!(
-            crate::scratch::high_water_for_test() <= super::super::AUTH_OPERATION_SCRATCH_BOUND
-        );
-        crate::scratch::reset();
     }
 
     #[test]

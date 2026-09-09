@@ -2,8 +2,8 @@
 //!
 //! This module provides the global allocator used by `alloc`. Its backing pages
 //! are BootServicesData and intentionally disappear after ExitBootServices.
-//! The separate runtime image uses its own bounded BSS scratch allocator and
-//! never reaches this boot allocator.
+//! The separate runtime image uses fixed stack buffers instead and never
+//! reaches this boot allocator.
 
 use core::sync::atomic::{AtomicBool, Ordering};
 

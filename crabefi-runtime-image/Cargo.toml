@@ -9,25 +9,19 @@ build = "build.rs"
 
 [features]
 default = []
-secure-boot = ["dep:allocator-api2", "dep:crypto-bigint", "dep:sha2"]
+secure-boot = ["dep:sha2", "dep:zeroize"]
 full = ["secure-boot"]
 
 [dependencies]
-allocator-api2 = { optional = true, version = "=0.3.1", default-features = false }
 crabefi-efi-types = { path = "../crabefi-efi-types" }
 crabefi-runtime-abi = { path = "../crabefi-runtime-abi" }
-# Temporary audited fork adding allocator-api2-backed BoxedUintIn, bounded-stack
-# variable-time modular exponentiation, and panic-free verification primitives.
-# Fork audit reference: https://github.com/ArthurHeymans/crypto-bigint/commit/07a5d396134739ac0d02b15b1cd9c3f0ed60350e
-# Upstream status: no PR/issue yet. Replace this pin once those APIs are in a
-# published upstream release.
-crypto-bigint = { optional = true, git = "https://github.com/ArthurHeymans/crypto-bigint", rev = "07a5d396134739ac0d02b15b1cd9c3f0ed60350e", default-features = false, features = ["allocator-api2"] }
 r-efi = "5.3"
 # This crate is a standalone workspace and intentionally uses sha2 0.11 so its
-# rsa 0.10 host tests share the same digest traits; other firmware crates remain
-# independently on sha2 0.10. Exact-pin so a new 0.11.x release cannot silently
-# change the verifier's digest implementation.
+# rsa 0.10 host tests share the same digest traits. Exact-pin so a new 0.11.x
+# release cannot silently change the verifier's digest implementation.
 sha2 = { optional = true, version = "=0.11.0", default-features = false, features = ["oid"] }
+# Secret scrubbing for stack RSA buffers (core-only, no allocator needed).
+zeroize = { optional = true, version = "1", default-features = false }
 zerocopy = { version = "0.8", default-features = false, features = ["derive"] }
 
 [dev-dependencies]

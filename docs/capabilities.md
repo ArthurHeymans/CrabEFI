@@ -30,8 +30,8 @@ For a host-provided variable region, use `default-features = false` and
 protocols, measurements and final-event table are not compiled/registered; without
 `xhci` its PCI probe does not claim that controller. With authentication omitted,
 key/enabling writes and authenticated envelopes return errors, standard status
-variables remain read-only (`SecureBoot=0`, `SetupMode=1`), and no verifier or
-crypto scratch allocator is compiled into the runtime. Previously persisted `PK`
+variables remain read-only (`SecureBoot=0`, `SetupMode=1`), and no verifier
+is compiled into the runtime. Previously persisted `PK`
 may remain readable in the basic profile; it does not enable enforcement or
 change the reported `SecureBoot=0`/`SetupMode=1`. Protected key/auth-history writes
 remain denied. This is not an authenticated-variable implementation.

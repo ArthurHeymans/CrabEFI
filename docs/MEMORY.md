@@ -16,20 +16,16 @@ heap: the old in-payload Runtime Services design could otherwise carry a boot
 heap pointer across EBS or SetVirtualAddressMap, after the backing pages became
 conventional memory or were no longer reachable at their physical address.
 
-The separate runtime image instead has a fixed 64 KiB allocation arena in the
-image's `.bss`. The arena is therefore part of the image-owned
-RuntimeServicesData mapping and is converted with the rest of the image during
-SetVirtualAddressMap; it never calls UEFI allocation services or depends on the
-boot heap. Allocation is enabled only while the serialized runtime-operation
-lease is held, is monotonic within each non-nesting scratch scope, and is fully
-scrubbed and reset before the service returns.
-
-RSA uses `allocator-api2` explicitly. A scratch scope lends a lifetime-branded
-allocator to `crypto_bigint::BoxedUintIn`, so the compiler prevents RSA bigint
-results or temporaries from outliving the scope which rewinds their arena
-region. Authenticated-variable signed data is fed incrementally into SHA-256
-rather than assembled in a `Vec`. The runtime image therefore has no global
-allocator, allocation error handler, or general-purpose allocation API.
+The separate runtime image performs RSA verification on fixed stack
+buffers instead of an allocation arena. Operands are `[u64; 64]` arrays
+(4096-bit maximum) with an explicit runtime width, combined by a
+schoolbook Montgomery ladder whose worst frame is about 4 KiB — enforced
+by the link-time stack-sizes audit against the 16 KiB budget. (Upstream
+const-generic multiplication monomorphizes Karatsuba recursion into a
+~25 KiB frame at these widths and cannot be used here.) There is no heap,
+no allocator, and no dynamic lifetime to manage: temporaries are plain
+stack locals that cannot outlive their frame, and every working buffer is
+scrubbed on return via `zeroize`.
 
 ## Runtime image memory
 
@@ -42,27 +38,28 @@ data. The loader then copies/zeros sections and applies only normalized
 relocation slots. The image-owned MAT publishes the exact code/data protection
 domains even where the EFI memory map merges adjacent data descriptors.
 
-The audited release images currently reserve about 308 KiB of runtime address
+The audited release images currently reserve about 244 KiB of runtime address
 space on both x86_64 and AArch64:
 
 | Mapping | Size | Contents |
 | --- | ---: | --- |
 | RX | 60 KiB | runtime code plus leading page/alignment space |
 | RO/NX | 4 KiB | immutable data |
-| RW/NX | 244 KiB | variable store, runtime state, scratch arena, and padding |
+| RW/NX | 180 KiB | variable store, runtime state, and padding |
 
-Normalized on-disk images are currently about 66 KiB. The dominant resident
-allocations are the 64 KiB scratch arena, roughly 170 KiB of variable-store
-state, and under 5 KiB of runtime state. The remainder is code, immutable data,
+Normalized on-disk images are currently about 64 KiB. The dominant resident
+allocation is roughly 170 KiB of variable-store state, plus under 5 KiB of
+runtime state. The remainder is code, immutable data,
 dynamic metadata, small synchronization globals, and page/alignment padding.
 
-Scratch capacity is deliberately larger than observed demand. Normal
-certificate fixtures use under 8 KiB. A regression test executes repeated full
-public exponentiations with maximum-width 4096-bit operands and enforces a
-16 KiB per-exponentiation bound. Each RSA verification has its own non-nesting
-scope, so certificate-chain and signer traversal reuse that same arena region
-instead of accumulating allocations. The complete 64 KiB arena is still
-scrubbed at operation end and remains reserved as image-owned runtime memory.
+RSA stack usage is deliberately bounded. Normal certificate fixtures use
+under 8 KiB of transient bigint state. A regression test executes repeated
+full public exponentiations with maximum-width 4096-bit operands, and the
+link-time stack-sizes audit fails the image build if any function exceeds
+the 16 KiB budget (worst frame is currently under 4 KiB). Each RSA
+verification allocates nothing: operands live in fixed stack buffers that
+are scrubbed before return, so certificate-chain and signer traversal
+leave no retained state behind.
 
 Every runtime descriptor is one of:
 

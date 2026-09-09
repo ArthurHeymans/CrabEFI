@@ -23,22 +23,18 @@ synchronization. ELF normalization rejects missing, zero, or inconsistent
 The runtime image owns all Runtime Services entry points and unsupported stubs,
 Runtime/System Tables, configuration storage, Runtime Properties, Memory
 Attributes Table (MAT), ESRT storage, variable metadata/payload arena,
-transaction buffer, manifests, phase machine, image-local time/reset code, and
-a fixed 64 KiB scratch allocator. The packed variable arena is 128 KiB; its
-per-variable limit remains 16 KiB. Large zero-initialized store and scratch
-state is in `.bss`, not ROM data.
+transaction buffer, manifests, phase machine, and image-local time/reset
+code. The packed variable arena is 128 KiB; its
+per-variable limit remains 16 KiB. Large zero-initialized store state is
+in `.bss`, not ROM data.
 
-The scratch arena is intentionally different from the boot payload heap. Its
-storage is image-owned RuntimeServicesData, so SVAM maps it with the image
-rather than leaving allocations in reclaimed BootServicesData. It is active
-only under the single runtime-operation lease and resets and scrubs all
-allocations before each service returns. RSA bigint allocations use an
-`allocator-api2` allocator branded with a nested scratch-scope lifetime, which
-prevents those containers from escaping the scope in safe Rust. Signed-data
+RSA verification allocates nothing: operands live in fixed stack buffers
+(`[u64; 64]`, 4096-bit maximum) combined by a schoolbook Montgomery
+ladder, with temporaries that cannot outlive their frame. Signed-data
 assembly is allocation-free and updates SHA-256 incrementally. The runtime
-image has no global allocator. This avoids the pre-split failure mode where
-Runtime Services could retain a pointer into the boot heap across EBS or
-address conversion.
+image has no heap and no global allocator. This avoids the pre-split
+failure mode where Runtime Services could retain a pointer into the boot
+heap across EBS or address conversion.
 
 Boot code owns drivers, persistence hardware, heap, logging, protocols, and
 Boot Services. Before EBS, one typed BootActive persistence bridge may write
@@ -80,14 +76,14 @@ image-store updates succeed.
 SecureBoot and SetupMode under the EFI global variable GUID are derived,
 read-only status variables. PK, KEK, db, and dbx time-based authenticated
 updates, appends, and deletions are verified inside the runtime image using its
-authoritative key databases, replay timestamps, and bounded BSS scratch
-allocator. Boot enrollment uses the same standard `SetVariable` entry point.
+authoritative key databases, replay timestamps, and fixed stack RSA buffers.
+Boot enrollment uses the same standard `SetVariable` entry point.
 
 The split intentionally has two narrowly scoped certificate verifiers. The
 runtime image uses the hand-rolled PKCS#7/X.509 parser in
-`crabefi-runtime-image/src/auth/crypto.rs` together with allocator-aware
-`crypto-bigint` RSA public exponentiation over a lifetime-scoped image-local
-scratch allocator; boot parses CMS/X.509 on the minimal `asn1` crate
+`crabefi-runtime-image/src/auth/crypto.rs` together with stack-backed
+schoolbook Montgomery RSA exponentiation (`auth/bigint.rs`, no allocator);
+boot parses CMS/X.509 on the minimal `asn1` crate
 (`crabefi-core/src/efi/auth/asn1_views.rs`) and verifies RSA with the `rsa`
 crate for Authenticode image verification.
 Both deliberately skip certificate `notBefore`/`notAfter` checks. This

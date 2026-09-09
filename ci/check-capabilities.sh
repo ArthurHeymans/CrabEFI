@@ -20,6 +20,15 @@ if grep -E '^(rsa |crypto-bigint |allocator-api2 |sha2 )' "$TMP/runtime-tree"; t
     exit 1
 fi
 
+# Stack-backed schoolbook RSA replaced the allocator-backed fork: neither
+# may re-enter through any runtime capability.
+cargo tree --locked --manifest-path crabefi-runtime-image/Cargo.toml --target x86_64-unknown-none \
+    --no-default-features --features full --edges normal --prefix none > "$TMP/runtime-full-tree"
+if grep -E '^(crypto-bigint |allocator-api2 )' "$TMP/runtime-full-tree"; then
+    echo 'Allocator-backed bigint fork present in the secure runtime' >&2
+    exit 1
+fi
+
 cargo tree --locked -p crabefi-core --target x86_64-unknown-none --no-default-features \
     --features capsule-update --edges normal --prefix none > "$TMP/capsule-tree"
 if grep -E '^rflasher-' "$TMP/capsule-tree"; then
