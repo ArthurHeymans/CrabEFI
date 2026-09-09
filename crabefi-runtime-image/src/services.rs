@@ -467,8 +467,13 @@ fn apply_variable(
             && store
                 .find(&guid, name, false)
                 .is_some_and(|slot| slot.attributes & efi::VARIABLE_NON_VOLATILE != 0));
-    if current_phase != phase::BOOT_ACTIVE && nonvolatile && (buffer.0.is_null() || buffer.1 == 0) {
-        return efi::Status::UNSUPPORTED;
+    if current_phase != phase::BOOT_ACTIVE && nonvolatile {
+        if buffer.0.is_null() || buffer.1 == 0 {
+            return efi::Status::UNSUPPORTED;
+        }
+        if let Err(status) = deferred::validate_profile(buffer.0, buffer.1) {
+            return status;
+        }
     }
     if secure_boot::is_status_variable(&guid, name)
         || capsule::is_esrt_last_attempt_variable(&guid, name)

@@ -75,7 +75,9 @@ pub extern "C" fn dispatch(request: *const BridgeRequest) -> usize {
     };
     match result {
         Ok(()) => Status::SUCCESS.as_usize(),
-        Err(VarStoreError::NotInitialized) => Status::WRITE_PROTECTED.as_usize(),
+        Err(VarStoreError::NotInitialized | VarStoreError::WriteProtected) => {
+            Status::WRITE_PROTECTED.as_usize()
+        }
         Err(VarStoreError::StoreFull) => Status::OUT_OF_RESOURCES.as_usize(),
         Err(
             VarStoreError::InvalidArgument

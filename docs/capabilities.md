@@ -13,7 +13,7 @@ when measuring its dependency closure.
 | `tpm` | TPM transport, TCG protocols, event tables and boot measurements |
 | `xhci` | USB 3 host controller implementation and dependency |
 | `secure-boot` | UEFI image/key verification and authenticated-variable runtime |
-| `capsule-update` | Signed firmware capsule application and SPI result persistence |
+| `capsule-update` | Signed firmware capsule application and bounded variable-store result persistence (no SPI dependency) |
 | `pkcs7` | Shared verifier dependencies, used by Secure Boot and capsules |
 | `ui` | Graphical setup, mouse support and multi-size monospace bitmap fonts |
 | `full` | Existing standalone non-graphical capabilities (all above except `ui`) |
@@ -31,7 +31,10 @@ protocols, measurements and final-event table are not compiled/registered; witho
 `xhci` its PCI probe does not claim that controller. With authentication omitted,
 key/enabling writes and authenticated envelopes return errors, standard status
 variables remain read-only (`SecureBoot=0`, `SetupMode=1`), and no verifier or
-crypto scratch allocator is compiled into the runtime.
+crypto scratch allocator is compiled into the runtime. Previously persisted `PK`
+may remain readable in the basic profile; it does not enable enforcement or
+change the reported `SecureBoot=0`/`SetupMode=1`. Protected key/auth-history writes
+remain denied. This is not an authenticated-variable implementation.
 
 Storage drivers are currently retained: AHCI, NVMe, SDHCI and USB 1/2 storage;
 PS/2 and serial console also remain. There is **no IDE/ATA driver** in CrabEFI.
@@ -82,14 +85,30 @@ all allocated image RAM before copying initialized sections and relocating it.
 There is one `StorageBackend` contract, re-exported at the crate root. It exposes
 name, exact size, program/erase granularity, current protection state and
 region-relative `read`, `program`, `erase`. It has **no unlock/enable-writes or
-whole-device access method**. Trusted platform metadata determines the region;
+whole-device access method**. `VariableStorage::Platform` and its builder method
+are unavailable without `variable-store`, so forgetting the feature is a compile
+error rather than a silent backend downgrade. Trusted platform metadata determines the region;
 mutable variable contents never determine device addresses or region bounds.
 Operations are bounded and checked for overflow/alignment. EDK2 variable state
 updates require byte programming: a backend advertising a larger minimum must
 provide a safe byte-program adapter or is rejected. Erase requests are never
 rounded into adjacent firmware. A protected backend stays protected, and partial
 I/O errors propagate rather than being reported as successful durable writes.
+EFI callers receive `WRITE_PROTECTED` for protection failures, distinct from
+`DEVICE_ERROR` for hardware I/O failures, including EDK2 callback operations.
 The standalone SPI adapter retains its explicit controller policy separately.
+
+Every region, including standalone SPI, is initialized only if its **entire
+contents are erased** (`0xff`, as required by the backend's NOR-compatible erase
+contract). Bounded chunk reads inspect the whole declared region; zero bytes are
+not blank. Invalid non-erased headers/checksums/partial formats return
+`InvalidHeader` unchanged. Read failures and protected/unknown protection states
+never authorize formatting. Valid existing stores mount normally. Selecting SPI
+is not permission to reset corrupted storage; there is no automatic factory
+reset or destructive-format opt-in. Configured bounded-backend mount failures
+stop boot rather than silently selecting volatile storage. An explicitly absent
+backend (or unavailable optional standalone SPI transport) remains distinct.
+This approved initialization policy does not select an OS NV persistence policy.
 
 An fstart integration should reserve an explicit mutable FFS/image region and
 exclude its contents from outer image/directory hashes, signatures and checksums.
@@ -109,7 +128,12 @@ code must never dereference a boot stack, backend vtable or reclaimed boot image
 
 The current runtime image has **no native persistent flash driver or SMM storage
 service**. With a configured retained buffer it can queue NV writes in a CRC-bound
-RAM journal for replay at a later boot. That is retained-memory/warm-reset staging,
+RAM journal for replay at a later boot. Journal format v3 binds the exact runtime
+capability bits into the local header CRC. A different profile returns
+`UNSUPPORTED` before changing retained bytes, staging a transaction, or invoking
+a replay callback. Same-profile warm-reset replay remains supported; old wire
+versions retain their explicit discard-on-preparation behavior. This capability
+binding is compatibility checking, not cryptographic authentication. That is retained-memory/warm-reset staging,
 not power-loss durability. `DeferredBufferConfig::disabled()` explicitly passes
 zero base and size together: the loader/ABI accept absence, reserve/map nothing,
 and SVAM never translates address zero. Mixed-zero, overflow, alignment and

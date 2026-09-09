@@ -40,8 +40,18 @@ pub enum VarStoreError {
     DataTooLarge,
     StoreFull,
     StorageFailure,
+    WriteProtected,
     InvalidArgument,
     CrcMismatch,
+}
+
+impl From<StorageError> for VarStoreError {
+    fn from(error: StorageError) -> Self {
+        match error {
+            StorageError::WriteProtected => Self::WriteProtected,
+            _ => Self::StorageFailure,
+        }
+    }
 }
 
 pub type Result<T> = core::result::Result<T, VarStoreError>;

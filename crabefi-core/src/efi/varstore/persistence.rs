@@ -104,6 +104,30 @@ impl core::ops::DerefMut for Storage {
     }
 }
 impl Storage {
+    // Preserve typed media errors across EDK2's boolean callback interface.
+    fn with_program<T>(
+        &mut self,
+        operation: impl FnOnce(&mut dyn FnMut(u32, &[u8]) -> bool) -> T,
+    ) -> Result<T, VarStoreError> {
+        let mut failure = None;
+        let result = operation(&mut |offset, bytes| {
+            if failure.is_some() {
+                return false;
+            }
+            match self.program(offset, bytes) {
+                Ok(()) => true,
+                Err(error) => {
+                    failure = Some(error);
+                    false
+                }
+            }
+        });
+        match failure {
+            Some(error) => Err(error.into()),
+            None => Ok(result),
+        }
+    }
+
     fn read(&mut self, offset: u32, data: &mut [u8]) -> Result<(), StorageError> {
         validate_range(self.size(), offset, data.len(), 1)?;
         core::ops::DerefMut::deref_mut(self).read(offset, data)
@@ -211,6 +235,7 @@ pub fn init(source: VariableStorage<'static>) -> Result<(), VarStoreError> {
     };
     *STORAGE.borrow_mut() = Some(storage);
     if let Err(error) = init_varstore().and_then(|()| load_variables_from_storage()) {
+        VARSTORE.set(VarStoreState::new());
         detach_backend();
         return Err(error);
     }
@@ -353,7 +378,8 @@ fn validate_variable_store_region(
 
 /// Initialize the variable store region
 ///
-/// Reads the FV header to validate the region, or formats it if invalid.
+/// Regions are formatted only when entirely erased; invalid non-erased contents
+/// are preserved, independent of transport. Selecting SPI never authorizes reset.
 /// This uses EDK2 Firmware Volume format compatible with coreboot's SMMSTORE.
 fn init_varstore() -> Result<(), VarStoreError> {
     // Read enough bytes for FV header + VS header
@@ -362,7 +388,7 @@ fn init_varstore() -> Result<(), VarStoreError> {
     let storage_size = with_storage_mut(|storage| {
         storage
             .read(0, &mut header_bytes[..header_size])
-            .map_err(|_| VarStoreError::StorageFailure)?;
+            .map_err(VarStoreError::from)?;
         Ok::<u32, VarStoreError>(storage.size())
     })
     .ok_or(VarStoreError::NotInitialized)??;
@@ -419,7 +445,17 @@ fn init_varstore() -> Result<(), VarStoreError> {
         return Ok(());
     }
 
-    // FV header invalid or missing - format the store with EDK2 FV headers
+    if !is_erased_for_write(0, storage_size)? {
+        return Err(VarStoreError::InvalidHeader);
+    }
+
+    if with_storage_mut(|storage| storage.is_write_protected())
+        .ok_or(VarStoreError::NotInitialized)?
+    {
+        return Err(VarStoreError::WriteProtected);
+    }
+
+    // Only completely erased storage may be initialized, on every transport.
     log::info!(
         "Formatting variable store as EDK2 FV (size {} KB)...",
         storage_size / 1024
@@ -428,17 +464,17 @@ fn init_varstore() -> Result<(), VarStoreError> {
     // Build EDK2 FV + VS headers
     let fv_headers = edk2::build_fv_headers(storage_size);
 
-    // Try to enable writes, erase, and write headers
+    // Erase and initialize only within the selected region; never unlock here.
     with_storage_mut(|storage| {
         // Erase the region
         storage
             .erase(0, storage_size)
-            .map_err(|_| VarStoreError::StorageFailure)?;
+            .map_err(VarStoreError::from)?;
 
         // Write new FV + VS headers
         storage
             .program(0, &fv_headers)
-            .map_err(|_| VarStoreError::StorageFailure)?;
+            .map_err(VarStoreError::from)?;
 
         Ok::<(), VarStoreError>(())
     })
@@ -667,19 +703,19 @@ pub(crate) fn write_variable_to_storage_internal(
 
     // Write the new record using multi-stage protocol
     let new_offset = with_storage_mut(|storage| {
-        let mut write_fn =
-            |offset: u32, data: &[u8]| -> bool { storage.program(offset, data).is_ok() };
-        edk2::write_variable(
-            &mut write_fn,
-            write_offset,
-            &guid_bytes,
-            name,
-            attributes,
-            data,
-            timestamp,
-        )
+        storage.with_program(|mut write| {
+            edk2::write_variable(
+                &mut write,
+                write_offset,
+                &guid_bytes,
+                name,
+                attributes,
+                data,
+                timestamp,
+            )
+        })
     })
-    .ok_or(VarStoreError::NotInitialized)?
+    .ok_or(VarStoreError::NotInitialized)??
     .ok_or(VarStoreError::StorageFailure)?;
 
     let mut expected_record = record;
@@ -746,23 +782,25 @@ fn compact_variable_store() -> Result<(), VarStoreError> {
     let end = with_storage_mut(|storage| {
         storage
             .erase(0, storage_size)
-            .map_err(|_| VarStoreError::StorageFailure)?;
+            .map_err(VarStoreError::from)?;
         storage
             .program(0, &edk2::build_fv_headers(storage_size))
-            .map_err(|_| VarStoreError::StorageFailure)?;
+            .map_err(VarStoreError::from)?;
         let mut offset = edk2::VARIABLE_DATA_OFFSET;
         for variable in &active {
-            let mut write_fn = |at: u32, bytes: &[u8]| storage.program(at, bytes).is_ok();
-            offset = edk2::write_variable(
-                &mut write_fn,
-                offset,
-                &variable.guid,
-                &variable.name,
-                variable.attributes,
-                &variable.data,
-                variable.timestamp,
-            )
-            .ok_or(VarStoreError::StorageFailure)?;
+            offset = storage
+                .with_program(|mut write| {
+                    edk2::write_variable(
+                        &mut write,
+                        offset,
+                        &variable.guid,
+                        &variable.name,
+                        variable.attributes,
+                        &variable.data,
+                        variable.timestamp,
+                    )
+                })?
+                .ok_or(VarStoreError::StorageFailure)?;
         }
         Ok::<u32, VarStoreError>(offset)
     })
@@ -790,7 +828,7 @@ fn is_erased_for_write(offset: u32, len: u32) -> Result<bool, VarStoreError> {
             let chunk_len = remaining.min(CHUNK_SIZE);
             storage
                 .read_controller(current, &mut buffer[..chunk_len])
-                .map_err(|_| VarStoreError::StorageFailure)?;
+                .map_err(VarStoreError::from)?;
 
             if buffer[..chunk_len].iter().any(|&byte| byte != 0xFF) {
                 return Ok(false);
@@ -811,7 +849,7 @@ fn verify_written_record(offset: u32, expected: &[u8]) -> Result<(), VarStoreErr
         let mut controller_bytes = alloc::vec![0; expected.len()];
         storage
             .read_controller(offset, &mut controller_bytes)
-            .map_err(|_| VarStoreError::StorageFailure)?;
+            .map_err(VarStoreError::from)?;
 
         if controller_bytes.as_slice() != expected {
             log_record_mismatch("controller", offset, expected, &controller_bytes);
@@ -915,11 +953,9 @@ fn delete_existing_record_except(
         {
             // Mark as deleted by writing to the state byte
             let deleted = with_storage_mut(|storage| {
-                let mut write_fn =
-                    |offset: u32, data: &[u8]| -> bool { storage.program(offset, data).is_ok() };
-                edk2::mark_deleted(&mut write_fn, var.state_offset)
+                storage.with_program(|mut write| edk2::mark_deleted(&mut write, var.state_offset))
             })
-            .ok_or(VarStoreError::NotInitialized)?;
+            .ok_or(VarStoreError::NotInitialized)??;
 
             if !deleted {
                 log::warn!(
@@ -932,7 +968,7 @@ fn delete_existing_record_except(
                 let mut byte = [0u8; 1];
                 storage
                     .read_controller(var.state_offset, &mut byte)
-                    .map_err(|_| VarStoreError::StorageFailure)?;
+                    .map_err(VarStoreError::from)?;
                 Ok::<u8, VarStoreError>(byte[0])
             })
             .ok_or(VarStoreError::NotInitialized)??;

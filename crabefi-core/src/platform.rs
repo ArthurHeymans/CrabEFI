@@ -462,6 +462,7 @@ pub use crate::efi::varstore::storage::StorageBackend;
 ///
 /// Platform backends own trusted region bounds and remain borrowed until boot
 /// services end. They are never retained as runtime/SVAM callable trait objects.
+#[cfg(feature = "variable-store")]
 #[derive(Default)]
 pub enum VariableStorage<'a> {
     /// Variables are volatile; durable writes fail.
@@ -472,6 +473,25 @@ pub enum VariableStorage<'a> {
     /// Standalone payload's explicit whole-device SPI discovery adapter.
     #[cfg(feature = "spi-flash")]
     Spi(&'a dyn VariableStoreLocator),
+}
+
+/// Without `variable-store`, only explicitly absent storage can be selected.
+/// A host backend must never be silently ignored.
+///
+/// ```compile_fail
+/// use crabefi::{StorageBackend, VariableStorage};
+/// fn select(backend: &mut dyn StorageBackend) -> VariableStorage<'_> {
+///     VariableStorage::Platform(backend)
+/// }
+/// ```
+#[cfg(not(feature = "variable-store"))]
+pub type VariableStorage<'a> = VolatileVariableStorage;
+
+#[cfg(not(feature = "variable-store"))]
+#[derive(Default)]
+pub enum VolatileVariableStorage {
+    #[default]
+    None,
 }
 
 // ============================================================================
