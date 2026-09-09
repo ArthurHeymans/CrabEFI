@@ -428,8 +428,6 @@ impl Lease {
 
 impl Drop for Lease {
     fn drop(&mut self) {
-        #[cfg(feature = "secure-boot")]
-        crate::scratch::reset();
         RUNTIME_OPERATION_LOCK.store(false, Ordering::Release);
     }
 }
@@ -441,8 +439,6 @@ pub fn try_lease() -> Result<Lease, efi::Status> {
     {
         return Err(efi::Status::DEVICE_ERROR);
     }
-    #[cfg(feature = "secure-boot")]
-    crate::scratch::activate();
     Ok(Lease {
         _not_send: PhantomData,
     })

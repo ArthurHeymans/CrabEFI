@@ -12,8 +12,8 @@
 The runtime image shares pointer-free handoff definitions through
 `crabefi-runtime-abi` and EFI authentication definitions through
 `crabefi-efi-types`. It has no dependency on `crabefi-core`, `log`, drivers, or
-platform traits. Cryptographic operations use only the bounded image-local BSS
-scratch arena, not an unbounded or post-seal general-purpose heap.
+platform traits. Cryptographic operations use only fixed stack buffers,
+not an unbounded or post-seal general-purpose heap.
 
 ## Boot flow
 
@@ -43,8 +43,9 @@ boundary.
 
 Certificate verification remains intentionally split by execution domain. The
 runtime image's authenticated-variable path uses a hand-rolled PKCS#7/X.509
-parser and allocator-aware `crypto-bigint` RSA exponentiation whose temporaries
-are lifetime-scoped to the bounded image-local BSS scratch arena. Signed-data
+parser and stack-backed schoolbook Montgomery RSA exponentiation over fixed
+`[u64; 64]` buffers (no allocator; worst frame ~4 KiB against the 16 KiB
+link-time stack budget). Signed-data
 hashing is incremental, so the runtime image requires no global allocator;
 boot parses CMS/X.509 on the minimal `asn1` crate (`efi::auth::asn1_views`)
 and verifies RSA with the `rsa` crate. Neither path enforces certificate `notBefore`/`notAfter`,
