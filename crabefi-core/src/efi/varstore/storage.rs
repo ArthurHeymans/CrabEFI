@@ -24,101 +24,58 @@ use alloc::vec;
 #[cfg(test)]
 use alloc::vec::Vec;
 
-/// Errors that can occur during storage operations
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum StorageError {
-    /// Storage device not initialized
-    NotInitialized,
-    /// Storage device is write-protected
-    WriteProtected,
-    /// Access denied (locked region)
-    AccessDenied,
-    /// Operation timed out
-    Timeout,
-    /// Invalid address or length
-    InvalidArgument,
-    /// Generic I/O error
-    IoError,
-    /// Operation not supported by this backend
-    NotSupported,
-}
-
-/// Result type for storage operations
+/// Shared storage errors used by both platform and region adapters.
+pub use crate::platform::StorageError;
+/// Region operation result.
 pub type Result<T> = core::result::Result<T, StorageError>;
 
-/// Storage backend trait
+/// Exclusive access to one platform-selected variable region, never a whole chip.
 ///
-/// This trait abstracts storage operations, allowing different backends
-/// (SPI flash, memory, etc.) to be used interchangeably by the variable store.
-///
-/// # Implementation Notes
-///
-/// - `read` should work on any valid offset within the storage size
-/// - `write` may require the region to be erased first (flash semantics)
-/// - `erase` sets bytes to 0xFF (NOR flash erased state)
-/// - `enable_writes` may be a no-op for some backends (e.g., memory)
+/// Offsets are relative to trusted region bounds. Implementations must reject
+/// overflow/out-of-range operations and must not round erase/program requests
+/// outside that region. Program operations complete before returning success;
+/// reads after programming must observe completed media contents. No method
+/// may unlock unrelated firmware ranges. Errors may leave partially programmed
+/// bytes; this interface does not promise atomicity or power-fail recovery.
 pub trait StorageBackend: Send {
-    /// Get the backend name (for logging/debugging)
+    /// Backend name for diagnostics.
     fn name(&self) -> &str;
-
-    /// Get the total storage size in bytes
+    /// Exact region size in bytes, from trusted platform metadata.
     fn size(&self) -> u32;
-
-    /// Check if the storage is write-protected
+    /// Minimum program offset/length granularity; EDK2 state updates require 1.
+    fn program_granularity(&self) -> u32;
+    /// Minimum erase offset/length granularity (never rounded by the consumer).
+    fn erase_granularity(&self) -> u32;
+    /// Whether this region currently disallows writes. This API cannot unlock it.
     fn is_write_protected(&self) -> bool;
-
-    /// Enable writes to the storage
-    ///
-    /// This may need to clear write-protection bits on some hardware.
-    /// Returns Ok(()) if writes are enabled, or an error if they cannot be enabled.
-    fn enable_writes(&mut self) -> Result<()>;
-
-    /// Read data from storage
-    ///
-    /// # Arguments
-    /// - `offset`: Byte offset within the storage
-    /// - `buffer`: Buffer to read data into
-    ///
-    /// # Errors
-    /// - `InvalidArgument` if offset + buffer.len() exceeds storage size
-    /// - `IoError` if the read operation fails
+    /// Read bytes within the region.
     fn read(&mut self, offset: u32, buffer: &mut [u8]) -> Result<()>;
-
-    /// Write data to storage
-    ///
-    /// # Arguments
-    /// - `offset`: Byte offset within the storage
-    /// - `data`: Data to write
-    ///
-    /// # Notes
-    /// For flash storage, the region should be erased first (bytes must be 0xFF).
-    /// Writing can only clear bits (1->0), not set them.
-    ///
-    /// # Errors
-    /// - `WriteProtected` if writes are not enabled
-    /// - `InvalidArgument` if offset + data.len() exceeds storage size
-    /// - `IoError` if the write operation fails
-    fn write(&mut self, offset: u32, data: &[u8]) -> Result<()>;
-
-    /// Erase a region of storage
-    ///
-    /// Sets all bytes in the region to 0xFF (NOR flash erased state).
-    ///
-    /// # Arguments
-    /// - `offset`: Starting byte offset (may be aligned to erase block size)
-    /// - `size`: Number of bytes to erase (may be rounded up to erase block size)
-    ///
-    /// # Errors
-    /// - `WriteProtected` if writes are not enabled
-    /// - `InvalidArgument` if offset + size exceeds storage size
-    /// - `IoError` if the erase operation fails
+    /// Program bytes, respecting erase-before-program and 1-to-0 media semantics.
+    fn program(&mut self, offset: u32, data: &[u8]) -> Result<()>;
+    /// Erase an exactly aligned range to 0xff without affecting its neighbours.
     fn erase(&mut self, offset: u32, size: u32) -> Result<()>;
+}
+
+/// Check a region-relative byte range and alignment without narrowing lengths.
+#[cfg(feature = "variable-store")]
+pub(crate) fn validate_range(size: u32, offset: u32, len: usize, alignment: u32) -> Result<()> {
+    if alignment == 0
+        || !offset.is_multiple_of(alignment)
+        || !len.is_multiple_of(alignment as usize)
+        || (offset as u64)
+            .checked_add(len as u64)
+            .is_none_or(|end| end > size as u64)
+    {
+        return Err(StorageError::InvalidArgument);
+    }
+    Ok(())
 }
 
 /// Wrapper to adapt SPI controllers to the StorageBackend trait
 ///
 /// This wrapper allows existing SPI controller implementations to be used
 /// as storage backends without modifying them.
+#[cfg(feature = "spi-flash")]
 pub struct SpiStorageBackend {
     /// The underlying SPI controller (boxed for dynamic dispatch)
     controller: crate::drivers::spi::AnySpiController,
@@ -130,7 +87,21 @@ pub struct SpiStorageBackend {
     mapped_read_base: Option<u64>,
 }
 
+#[cfg(feature = "spi-flash")]
 impl SpiStorageBackend {
+    pub(crate) fn prepare_writes(&mut self) -> Result<()> {
+        use crate::drivers::spi::SpiController;
+        self.controller.enable_writes().map_err(|e| {
+            log::warn!("SPI enable_writes failed: {:?}", e);
+            match e {
+                crate::drivers::spi::SpiError::WriteProtected => StorageError::WriteProtected,
+                crate::drivers::spi::SpiError::AccessDenied => StorageError::AccessDenied,
+                crate::drivers::spi::SpiError::Timeout => StorageError::Timeout,
+                _ => StorageError::IoError,
+            }
+        })
+    }
+
     /// Create a new SPI storage backend
     ///
     /// # Arguments
@@ -213,6 +184,7 @@ impl SpiStorageBackend {
     }
 }
 
+#[cfg(feature = "spi-flash")]
 fn read_mapped_flash(phys_base: u64, offset: u32, buffer: &mut [u8]) -> Result<()> {
     let start = phys_base
         .checked_add(offset as u64)
@@ -231,7 +203,15 @@ fn read_mapped_flash(phys_base: u64, offset: u32, buffer: &mut [u8]) -> Result<(
     Ok(())
 }
 
+#[cfg(feature = "spi-flash")]
 impl StorageBackend for SpiStorageBackend {
+    fn program_granularity(&self) -> u32 {
+        1
+    }
+    fn erase_granularity(&self) -> u32 {
+        4096
+    }
+
     fn name(&self) -> &str {
         use crate::drivers::spi::SpiController;
         self.controller.name()
@@ -244,19 +224,6 @@ impl StorageBackend for SpiStorageBackend {
     fn is_write_protected(&self) -> bool {
         use crate::drivers::spi::SpiController;
         !self.controller.writes_enabled()
-    }
-
-    fn enable_writes(&mut self) -> Result<()> {
-        use crate::drivers::spi::SpiController;
-        self.controller.enable_writes().map_err(|e| {
-            log::warn!("SPI enable_writes failed: {:?}", e);
-            match e {
-                crate::drivers::spi::SpiError::WriteProtected => StorageError::WriteProtected,
-                crate::drivers::spi::SpiError::AccessDenied => StorageError::AccessDenied,
-                crate::drivers::spi::SpiError::Timeout => StorageError::Timeout,
-                _ => StorageError::IoError,
-            }
-        })
     }
 
     fn read(&mut self, offset: u32, buffer: &mut [u8]) -> Result<()> {
@@ -287,7 +254,7 @@ impl StorageBackend for SpiStorageBackend {
         })
     }
 
-    fn write(&mut self, offset: u32, data: &[u8]) -> Result<()> {
+    fn program(&mut self, offset: u32, data: &[u8]) -> Result<()> {
         use crate::drivers::spi::SpiController;
 
         // Check bounds
@@ -318,6 +285,16 @@ impl StorageBackend for SpiStorageBackend {
 
         // Check bounds
         if offset as u64 + size as u64 > self.storage_size as u64 {
+            return Err(StorageError::InvalidArgument);
+        }
+
+        validate_range(
+            self.storage_size,
+            offset,
+            size as usize,
+            self.erase_granularity(),
+        )?;
+        if !self.base_offset.is_multiple_of(self.erase_granularity()) {
             return Err(StorageError::InvalidArgument);
         }
 
@@ -395,6 +372,13 @@ impl MemoryBackend {
 
 #[cfg(test)]
 impl StorageBackend for MemoryBackend {
+    fn program_granularity(&self) -> u32 {
+        1
+    }
+    fn erase_granularity(&self) -> u32 {
+        1
+    }
+
     fn name(&self) -> &str {
         &self.name
     }
@@ -405,11 +389,6 @@ impl StorageBackend for MemoryBackend {
 
     fn is_write_protected(&self) -> bool {
         self.write_protected
-    }
-
-    fn enable_writes(&mut self) -> Result<()> {
-        self.write_protected = false;
-        Ok(())
     }
 
     fn read(&mut self, offset: u32, buffer: &mut [u8]) -> Result<()> {
@@ -426,7 +405,7 @@ impl StorageBackend for MemoryBackend {
         Ok(())
     }
 
-    fn write(&mut self, offset: u32, data: &[u8]) -> Result<()> {
+    fn program(&mut self, offset: u32, data: &[u8]) -> Result<()> {
         if self.write_protected {
             return Err(StorageError::WriteProtected);
         }

@@ -26,24 +26,39 @@
 //! - **Setup Mode**: When PK is empty, authenticated writes skip signature verification
 //! - **User Mode**: When PK is enrolled, all authenticated variable writes require valid signatures
 
+#[cfg(any(feature = "secure-boot", feature = "tpm"))]
 pub mod authenticode;
+#[cfg(feature = "secure-boot")]
 pub mod boot;
+#[cfg(feature = "pkcs7")]
 mod crypto;
+#[cfg(feature = "secure-boot")]
 pub mod dbx_update;
+#[cfg(feature = "secure-boot")]
 pub mod enrollment;
+#[cfg(feature = "secure-boot")]
 pub mod key_files;
+#[cfg(feature = "pkcs7")]
 pub mod revocation;
+#[cfg(feature = "secure-boot")]
 mod signature;
+#[cfg(feature = "pkcs7")]
 pub(crate) mod time;
+#[cfg(feature = "secure-boot")]
 mod variables;
 
+#[cfg(feature = "pkcs7")]
 pub use crypto::*;
+#[cfg(feature = "secure-boot")]
 pub use signature::*;
+#[cfg(feature = "secure-boot")]
 pub use variables::*;
 
+#[cfg(feature = "secure-boot")]
 use crabefi_efi_types::secure_boot::{
     EFI_GLOBAL_VARIABLE_GUID, SECURE_BOOT_ENABLE_NAME, SECURE_BOOT_NAME, SETUP_MODE_NAME,
 };
+#[cfg(feature = "secure-boot")]
 use r_efi::efi::Guid;
 
 // ============================================================================
@@ -52,11 +67,13 @@ use r_efi::efi::Guid;
 
 /// Maximum DER length we'll accept (64 MB)
 /// This prevents DoS attacks with maliciously crafted length fields
+#[cfg(feature = "pkcs7")]
 const MAX_DER_LENGTH: usize = 64 * 1024 * 1024;
 
 /// Parse DER length encoding
 ///
 /// Returns `(length, bytes_consumed)` on success.
+#[cfg(feature = "pkcs7")]
 pub(crate) fn parse_der_length(data: &[u8]) -> Result<(usize, usize), AuthError> {
     if data.is_empty() {
         return Err(AuthError::CertificateParseError);
@@ -222,10 +239,12 @@ pub const WIN_CERT_TYPE_EFI_GUID: u16 = 0x0EF1;
 
 /// Variable attributes for the SecureBootEnable user preference variable
 /// This is non-volatile so it persists across resets
+#[cfg(feature = "secure-boot")]
 const SECURE_BOOT_ENABLE_ATTRS: u32 =
     attributes::NON_VOLATILE | attributes::BOOTSERVICE_ACCESS | attributes::RUNTIME_ACCESS;
 
 /// Read the image-owned standard SetupMode variable.
+#[cfg(feature = "secure-boot")]
 pub fn is_setup_mode() -> bool {
     crate::efi::runtime_image::client::variables::get(
         &Guid::from_bytes(&EFI_GLOBAL_VARIABLE_GUID),
@@ -236,6 +255,7 @@ pub fn is_setup_mode() -> bool {
 }
 
 /// Read the image-owned standard SecureBoot variable.
+#[cfg(feature = "secure-boot")]
 pub fn is_secure_boot_enabled() -> bool {
     crate::efi::runtime_image::client::variables::get(
         &Guid::from_bytes(&EFI_GLOBAL_VARIABLE_GUID),
@@ -247,6 +267,7 @@ pub fn is_secure_boot_enabled() -> bool {
 
 /// Verify a PE image after refreshing disposable boot-only key caches through
 /// the standard Runtime Services GetVariable entry point.
+#[cfg(feature = "secure-boot")]
 pub fn verify_pe_image_secure_boot(pe_data: &[u8]) -> Result<bool, AuthError> {
     boot::refresh_key_databases();
     authenticode::verify_pe_image_secure_boot(pe_data)
@@ -256,16 +277,19 @@ pub fn verify_pe_image_secure_boot(pe_data: &[u8]) -> Result<bool, AuthError> {
 ///
 /// The authoritative mode is synthesized by the runtime variable store from
 /// the PK variable; there is deliberately no second local state copy.
+#[cfg(feature = "secure-boot")]
 pub fn enter_user_mode() {
     log::info!("Secure Boot: Entering User Mode");
 }
 
 /// Log the transition requested by PK deletion.
+#[cfg(feature = "secure-boot")]
 pub fn enter_setup_mode() {
     log::info!("Secure Boot: Entering Setup Mode");
 }
 
 /// Enable Secure Boot (only valid in User Mode).
+#[cfg(feature = "secure-boot")]
 pub fn enable_secure_boot() {
     if !is_setup_mode() {
         persist_secure_boot_enable_preference(true);
@@ -276,6 +300,7 @@ pub fn enable_secure_boot() {
 }
 
 /// Disable Secure Boot.
+#[cfg(feature = "secure-boot")]
 pub fn disable_secure_boot() {
     persist_secure_boot_enable_preference(false);
     if !is_secure_boot_enabled() {
@@ -284,6 +309,7 @@ pub fn disable_secure_boot() {
 }
 
 /// Persist the SecureBootEnable preference to non-volatile storage
+#[cfg(feature = "secure-boot")]
 fn persist_secure_boot_enable_preference(enabled: bool) {
     let value: u8 = if enabled { 1 } else { 0 };
     let status = crate::efi::runtime_image::client::variables::set(
@@ -373,4 +399,10 @@ impl From<AuthError> for r_efi::efi::Status {
             AuthError::ChainBuildingFailed => r_efi::efi::Status::SECURITY_VIOLATION,
         }
     }
+}
+
+/// Secure Boot cannot be enabled when image authentication is omitted.
+#[cfg(not(feature = "secure-boot"))]
+pub fn is_secure_boot_enabled() -> bool {
+    false
 }

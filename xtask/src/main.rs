@@ -96,7 +96,11 @@ enum Commands {
     },
 
     /// Regenerate the checked-in Cargo runtime bundle for one architecture
-    BundleRuntime,
+    BundleRuntime {
+        /// Include UEFI authenticated variables and Secure Boot policy.
+        #[arg(long)]
+        secure_boot: bool,
+    },
 
     /// Run CrabEFI in QEMU
     Run {
@@ -247,7 +251,7 @@ fn main() -> Result<()> {
 
     match cli.command {
         Commands::Build { release, ui } => cmd_build(release, ui, arch, machine),
-        Commands::BundleRuntime => runtime::bundle(arch),
+        Commands::BundleRuntime { secure_boot } => runtime::bundle(arch, secure_boot),
         Commands::Run {
             coreboot_rom,
             ahci,

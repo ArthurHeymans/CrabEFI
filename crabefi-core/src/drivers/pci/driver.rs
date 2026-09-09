@@ -181,8 +181,10 @@ impl PciDriver for UsbPciDriver {
     }
 
     fn probe(&self, device: &PciDevice) -> bool {
-        // Accept known USB controller types
-        matches!(device.prog_if, 0x00 | 0x10 | 0x20 | 0x30)
+        // Do not claim a controller whose implementation was not selected.
+        matches!(device.prog_if, 0x10 | 0x20)
+            || (cfg!(target_arch = "x86_64") && device.prog_if == 0x00)
+            || (cfg!(feature = "xhci") && device.prog_if == 0x30)
     }
 
     fn init(&self, device: &PciDevice) -> Result<(), DriverError> {

@@ -27,8 +27,9 @@ authenticate or provision their own image can leave the feature disabled and
 construct `RuntimeImageSource` directly.
 
 The bundled image only removes artifact-build plumbing. Runtime mechanism
-selection and the warm-reset-retained deferred buffer remain platform-owned
-requirements.
+selection and the optional warm-reset-retained deferred buffer remain platform-owned.
+See [capabilities](capabilities.md) for additive feature selection, exact runtime
+capability matching, and the bounded `variable-store` backend.
 
 ## Mandatory runtime fields
 
@@ -55,7 +56,7 @@ let config = crabefi::PlatformConfig {
             size: retained_buffer_size,
         },
     },
-    // block devices, tables, console, TPM, storage locator, ...
+    // block devices, tables, console, optional TPM, variable_storage, ...
 };
 crabefi::init_platform(config)
 ```
@@ -78,14 +79,19 @@ its descriptor must retain `EFI_MEMORY_RUNTIME` plus the declared attributes.
 
 ## Retained deferred buffer
 
-`deferred_buffer` is mandatory. Its base and size must be nonzero and page
-aligned, the complete range must be reserved as `RuntimeServicesData`, and it
+Use `DeferredBufferConfig::disabled()` (zero base and size together) to omit
+retained staging. Disabled post-EBS NV writes and capsule staging return
+`UNSUPPORTED`, while boot-time backend writes, reads, volatile variables and
+other runtime services remain available. This is not native runtime persistence.
+
+When enabled, the buffer's base and size must be nonzero and page aligned, the complete range must be reserved as `RuntimeServicesData`, and it
 must overlap neither the runtime image nor an external MMIO range. The runtime
 image owns the range exclusively; boot code and the OS must not allocate or
 reuse it. Both its contents and physical address must survive a warm reset.
 
-After ExitBootServices, runtime nonvolatile variable writes are committed to a
-bounded journal in this buffer. `UpdateCapsule()` stages its descriptor there
+After ExitBootServices, runtime nonvolatile variable writes are queued in a
+bounded journal in this buffer. Success means warm-reset-retained staging,
+not power-loss durability; a RAM CRC does not make volatile memory persistent. `UpdateCapsule()` stages its descriptor there
 and requires `PERSIST_ACROSS_RESET`. On the next boot, CrabEFI reserves the
 range via a coreboot-compatible capsule-on-disk wrapper around its private
 reservation capsule, replays deferred records through the temporary persistence
@@ -96,13 +102,18 @@ capacity remain bounded by the configured buffer and runtime ABI limits.
 
 ## Variables
 
-A `VariableStoreLocator` may identify an EDK2-compatible flash region. CrabEFI
-imports active records and firmware-created boot values directly into the
+Enable `variable-store` and pass `VariableStorage::Platform(&mut backend)` (or
+`.variable_storage(&mut backend)` on the builder) for an exclusively bounded,
+platform-owned region. `StorageBackend` reports exact capacity and program/erase
+granularity and offers region-relative read/program/erase, never whole-chip
+unlock authority. The optional `spi-flash` capability keeps the standalone
+`VariableStoreLocator`/SPI adapter. CrabEFI imports active EDK2 records and
+firmware-created boot values directly into the
 runtime image before an EFI application can run. Boot writes use one audited
 pre-seal persistence bridge: durable storage commit occurs before the
 image-store commit. The bridge is erased at successful EBS seal.
 
 The old `VariableBackend` and `RuntimeRegion` APIs remain removed.
-`DeferredBufferConfig` is their mandatory, narrowly scoped replacement for
+`DeferredBufferConfig` is the optional, narrowly scoped contract for
 warm-reset replay; runtime survival otherwise comes from the separate image and
 explicit external ranges.

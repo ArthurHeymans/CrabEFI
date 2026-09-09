@@ -175,6 +175,7 @@ pub(super) extern "efiapi" fn load_image(
     };
 
     // Secure Boot verification (if enabled)
+    #[cfg(feature = "secure-boot")]
     if super::super::auth::is_secure_boot_enabled() {
         log::debug!("BS.LoadImage: Secure Boot verification required");
         match super::super::auth::verify_pe_image_secure_boot(data) {
@@ -220,6 +221,7 @@ pub(super) extern "efiapi" fn load_image(
 
     // TCG measured boot: drivers are measured now; applications are deferred
     // until StartImage after ReadyToBoot, with digests computed before freeing data.
+    #[cfg(feature = "tpm")]
     let deferred_measurement = measure_pe_image_for_tcg(
         data,
         &loaded_image,
@@ -234,6 +236,7 @@ pub(super) extern "efiapi" fn load_image(
         Some(h) => h,
         None => {
             log::error!("BS.LoadImage: Failed to create handle");
+            #[cfg(feature = "tpm")]
             if let Some(measurement) = deferred_measurement {
                 let _ = allocator::free_pool(measurement.event_data);
             }
@@ -262,6 +265,7 @@ pub(super) extern "efiapi" fn load_image(
     let (loaded_image_protocol, owned_path) = own_image_path(loaded_image_protocol, device_path);
     if loaded_image_protocol.is_null() {
         log::error!("BS.LoadImage: Failed to create LoadedImageProtocol");
+        #[cfg(feature = "tpm")]
         if let Some(measurement) = deferred_measurement {
             let _ = allocator::free_pool(measurement.event_data);
         }
@@ -313,6 +317,7 @@ pub(super) extern "efiapi" fn load_image(
             "BS.LoadImage: Failed to install LoadedImageProtocol: {:?}",
             status
         );
+        #[cfg(feature = "tpm")]
         if let Some(measurement) = deferred_measurement {
             let _ = allocator::free_pool(measurement.event_data);
         }
@@ -339,6 +344,7 @@ pub(super) extern "efiapi" fn load_image(
                 entry.num_pages = loaded_image.num_pages;
                 entry.parent_handle = parent_image_handle;
                 entry.subsystem = image_subsystem;
+                #[cfg(feature = "tpm")]
                 if let Some(measurement) = deferred_measurement {
                     entry.measurement_pcr = measurement.pcr_index;
                     entry.measurement_event_type = measurement.event_type;
@@ -355,6 +361,7 @@ pub(super) extern "efiapi" fn load_image(
 
     if !store_result {
         log::error!("BS.LoadImage: No space in loaded images table");
+        #[cfg(feature = "tpm")]
         if let Some(measurement) = deferred_measurement {
             let _ = allocator::free_pool(measurement.event_data);
         }
@@ -449,6 +456,7 @@ pub(super) extern "efiapi" fn start_image(
     let is_application = image_subsystem == 10;
     measure_efi_application_start(is_application);
 
+    #[cfg(feature = "tpm")]
     let deferred_measurement = with_tables_mut(|efi_state| {
         efi_state
             .loaded_images
@@ -473,6 +481,7 @@ pub(super) extern "efiapi" fn start_image(
             })
     });
 
+    #[cfg(feature = "tpm")]
     if let Some(measurement) = deferred_measurement {
         let event_data = unsafe {
             // SAFETY: deferred measurement event data was allocated and filled in
@@ -830,6 +839,7 @@ fn release_image(image_handle: Handle) -> Status {
     if !protocol.is_null() {
         let _ = allocator::free_pool(protocol.cast());
     }
+    #[cfg(feature = "tpm")]
     if !image.measurement_event_data.is_null() {
         let _ = allocator::free_pool(image.measurement_event_data);
     }
@@ -856,6 +866,7 @@ pub(super) extern "efiapi" fn exit_boot_services(image_handle: Handle, map_key: 
     };
 
     // TCG measured boot: measure ExitBootServices action into PCR 5.
+    #[cfg(feature = "tpm")]
     super::super::tcg::measured_boot::measure_action_all(5, "Exit Boot Services Invocation");
 
     // Signal EXIT_BOOT_SERVICES event group BEFORE finalizing the memory map.
@@ -917,6 +928,7 @@ pub(super) extern "efiapi" fn exit_boot_services(image_handle: Handle, map_key: 
 
     if status == Status::SUCCESS {
         // TCG measured boot: measure ExitBootServices success into PCR 5.
+        #[cfg(feature = "tpm")]
         super::super::tcg::measured_boot::measure_action_all(
             5,
             "Exit Boot Services Returned with Success",
@@ -941,6 +953,8 @@ pub(super) extern "efiapi" fn exit_boot_services(image_handle: Handle, map_key: 
                 crate::arch::halt();
             }
         }
+        #[cfg(feature = "variable-store")]
+        crate::efi::varstore::persistence::detach_backend();
         log::info!("Runtime image sealed successfully");
 
         // Let platform glue clean up integration-specific handoff state only
@@ -972,6 +986,7 @@ pub(super) extern "efiapi" fn exit_boot_services(image_handle: Handle, map_key: 
         #[cfg(target_arch = "aarch64")]
         crate::arch::aarch64::ns_switch::install_ns_trampoline();
     } else {
+        #[cfg(feature = "tpm")]
         super::super::tcg::measured_boot::measure_action_all(
             5,
             "Exit Boot Services Returned with Failure",
@@ -983,6 +998,7 @@ pub(super) extern "efiapi" fn exit_boot_services(image_handle: Handle, map_key: 
 }
 
 #[derive(Clone, Copy)]
+#[cfg(feature = "tpm")]
 struct DeferredImageMeasurement {
     pcr_index: u32,
     event_type: u32,
@@ -992,6 +1008,7 @@ struct DeferredImageMeasurement {
     event_data_size: usize,
 }
 
+#[cfg(feature = "tpm")]
 pub(crate) fn serialize_tcg_image_load_event(
     loaded_image: &pe::LoadedImage,
     image_link_time_address: u64,
@@ -1020,6 +1037,7 @@ pub(crate) fn serialize_tcg_image_load_event(
 ///
 /// Driver images are measured immediately. Application image digests and event
 /// data are precomputed here so `StartImage()` can log them after ReadyToBoot.
+#[cfg(feature = "tpm")]
 fn measure_pe_image_for_tcg(
     pe_data: &[u8],
     loaded_image: &pe::LoadedImage,

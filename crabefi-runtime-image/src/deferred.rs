@@ -18,13 +18,17 @@ use crabefi_runtime_abi::{
 use zerocopy::byteorder::little_endian::{I16, U16, U32, U64};
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned};
 
+#[cfg(feature = "secure-boot")]
 use crate::auth::MAX_AUTHENTICATED_ENVELOPE_SIZE;
 use crate::efi;
 
 pub const MAX_NAME_LEN: usize = 64;
 /// Records carry the complete authenticated input envelope so a full-width
 /// envelope always fits a single journal entry.
+#[cfg(feature = "secure-boot")]
 pub const MAX_DATA_SIZE: usize = MAX_AUTHENTICATED_ENVELOPE_SIZE;
+#[cfg(not(feature = "secure-boot"))]
+pub const MAX_DATA_SIZE: usize = crabefi_runtime_abi::MAX_VARIABLE_DATA_SIZE;
 pub const MAX_ENTRY_SIZE: usize =
     core::mem::size_of::<VariableRecordHeader>() + (MAX_NAME_LEN + 1) * 2 + MAX_DATA_SIZE;
 
@@ -729,7 +733,6 @@ mod tests {
     use super::*;
 
     fn queued_fixture() -> (Vec<u8>, usize) {
-        crate::scratch::activate();
         let mut buffer = vec![0u8; 64 * 1024];
         let mut transaction = DeferredTransaction::new();
         prepare_retained(buffer.as_mut_ptr(), buffer.len()).unwrap();
@@ -767,7 +770,6 @@ mod tests {
 
     #[test]
     fn prepare_retained_discards_journals_from_other_versions() {
-        let _guard = crate::scratch::test_lock();
         let mut buffer = vec![0u8; 64 * 1024];
         let journal = unsafe { buffer.as_mut_ptr().add(JOURNAL_OFFSET) };
         let mut old_header = DeferredHeader::empty();
@@ -786,12 +788,10 @@ mod tests {
         assert_eq!(header.entry_count, 0);
         assert_eq!(header.total_size, 0);
         assert_eq!(header.data_crc, crc32::calculate(&[]));
-        crate::scratch::reset();
     }
 
     #[test]
     fn retained_reservation_wraps_private_guid_and_marker() {
-        let _guard = crate::scratch::test_lock();
         let mut buffer = vec![0u8; 64 * 1024];
         prepare_retained(buffer.as_mut_ptr(), buffer.len()).unwrap();
         let wrapper = &buffer[RESERVATION_CAPSULE_OFFSET..];
@@ -815,12 +815,10 @@ mod tests {
             0x56, 0x97,
         ];
         assert_ne!(&private[..16], WINDOWS_UX_GUID.as_slice());
-        crate::scratch::reset();
     }
 
     #[test]
     fn stage_capsule_rejects_wrapping_scatter_gather_blocks() {
-        let _guard = crate::scratch::test_lock();
         let mut buffer = vec![0u8; 64 * 1024];
         let mut descriptors = [0u8; CAPSULE_DESCRIPTOR_SIZE];
         descriptors[..8].copy_from_slice(&u64::from(u32::MAX).to_le_bytes());
@@ -834,12 +832,10 @@ mod tests {
             ),
             Err(efi::Status::INVALID_PARAMETER)
         );
-        crate::scratch::reset();
     }
 
     #[test]
     fn deferred_v2_round_trip_and_crc_rejection() {
-        let _guard = crate::scratch::test_lock();
         let (mut buffer, used) = queued_fixture();
         assert_eq!(
             &buffer[JOURNAL_OFFSET..used],
@@ -920,6 +916,5 @@ mod tests {
             Ok(0)
         );
         assert_eq!(retries, 1);
-        crate::scratch::reset();
     }
 }

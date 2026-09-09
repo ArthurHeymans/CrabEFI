@@ -18,6 +18,7 @@ See the [docs/](docs/README.md) directory:
 - [Building](docs/BUILDING.md) - How to build CrabEFI and run tests
 - [Architecture](docs/ARCHITECTURE.md) - Workspace layout and code organization
 - [Integration](docs/INTEGRATION.md) - Using CrabEFI as a library in external firmware
+- [Capabilities](docs/capabilities.md) - Minimal/full feature sets, runtime identity and bounded variable storage
 - [Memory Management](docs/MEMORY.md) - Memory layout, allocators, and EFI memory map
 
 ## Quick Start

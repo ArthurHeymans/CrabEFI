@@ -274,7 +274,10 @@ fn resolve_deferred_buffer(
     map: *const u8,
     stride: usize,
     count: usize,
-) -> Result<Mapping, efi::Status> {
+) -> Result<Option<Mapping>, efi::Status> {
+    if runtime.deferred_buffer_physical == 0 && runtime.deferred_buffer_size == 0 {
+        return Ok(None);
+    }
     let end = runtime
         .deferred_buffer_physical
         .checked_add(runtime.deferred_buffer_size as u64)
@@ -296,6 +299,7 @@ fn resolve_deferred_buffer(
             Ok(Some(candidate))
         })?
         .ok_or(efi::Status::NOT_FOUND)
+        .map(Some)
 }
 
 fn virtual_time_config(
@@ -343,7 +347,7 @@ fn validate_and_commit(
     runtime: &mut state::RuntimeState,
     section_mappings: &[Mapping; MAX_SECTIONS],
     range_mappings: &[Mapping; MAX_EXTERNAL_RANGES],
-    deferred_mapping: Mapping,
+    deferred_mapping: Option<Mapping>,
 ) -> Result<(), efi::Status> {
     let mut section_virtual_bases = [0u64; MAX_SECTIONS];
     for ((section, mapping), virtual_base) in runtime
@@ -382,14 +386,18 @@ fn validate_and_commit(
 
     let virtual_time = virtual_time_config(runtime, &range_virtual_bases)?;
 
-    let deferred_offset = runtime
-        .deferred_buffer_physical
-        .checked_sub(deferred_mapping.physical)
-        .ok_or(efi::Status::INVALID_PARAMETER)?;
-    let deferred_virtual = deferred_mapping
-        .virtual_address
-        .checked_add(deferred_offset)
-        .ok_or(efi::Status::INVALID_PARAMETER)?;
+    let deferred_virtual = if let Some(mapping) = deferred_mapping {
+        let offset = runtime
+            .deferred_buffer_physical
+            .checked_sub(mapping.physical)
+            .ok_or(efi::Status::INVALID_PARAMETER)?;
+        mapping
+            .virtual_address
+            .checked_add(offset)
+            .ok_or(efi::Status::INVALID_PARAMETER)?
+    } else {
+        0
+    };
 
     let runtime_table_start = core::ptr::addr_of!(runtime.tables.runtime) as u64;
     let runtime_table_end = runtime_table_start

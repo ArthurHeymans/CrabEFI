@@ -3,7 +3,8 @@
 use core::fmt;
 
 pub const MAGIC: [u8; 8] = *b"CRABRTI\0";
-pub const FORMAT_VERSION: u16 = 1;
+// Version 2 binds optional capabilities; v1 full images had no Secure Boot bit.
+pub const FORMAT_VERSION: u16 = 2;
 pub const HEADER_SIZE: usize = 64;
 pub const SECTION_SIZE: usize = 32;
 pub const RELOCATION_SIZE: usize = 24;
@@ -37,7 +38,9 @@ pub mod feature_bits {
     pub const RESET: u64 = 1 << 2;
     pub const TIME: u64 = 1 << 3;
     pub const REQUIRED: u64 = VARIABLES | VIRTUAL_MAP | RESET | TIME;
-    pub const KNOWN: u64 = REQUIRED;
+    /// Authenticated variables and UEFI Secure Boot policy are implemented.
+    pub const SECURE_BOOT: u64 = 1 << 4;
+    pub const KNOWN: u64 = REQUIRED | SECURE_BOOT;
 }
 
 /// Stable wire values for normalized-image relocation records.
@@ -198,7 +201,9 @@ impl<'a> ValidatedImage<'a> {
         if header.required_alignment != EFI_PAGE_SIZE {
             return Err(AbiError::BadAlignment);
         }
-        if header.feature_bits != feature_bits::REQUIRED {
+        if header.feature_bits & feature_bits::REQUIRED != feature_bits::REQUIRED
+            || header.feature_bits & !feature_bits::KNOWN != 0
+        {
             return Err(AbiError::UnknownFeatures);
         }
         if usize::from(header.section_count) > MAX_SECTIONS || header.section_count == 0 {

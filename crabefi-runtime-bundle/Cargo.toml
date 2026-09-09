@@ -6,6 +6,10 @@ description = "Architecture-selected normalized Runtime Services images for Crab
 license.workspace = true
 repository.workspace = true
 
+[features]
+default = []
+secure-boot = []
+
 [lib]
 path = "src/lib.rs"
 

@@ -8,6 +8,8 @@ pub mod auth;
 pub(crate) mod block_range;
 pub mod boot_services;
 pub mod capsule;
+#[cfg(any(feature = "secure-boot", feature = "tpm"))]
+pub mod digest;
 pub mod dma;
 pub(crate) mod dma_range;
 pub mod esrt;
@@ -17,6 +19,7 @@ pub mod protocols;
 pub mod runtime_image;
 pub mod system_table;
 pub mod tables;
+#[cfg(feature = "tpm")]
 pub mod tcg;
 pub mod utils;
 pub mod varstore;
@@ -127,6 +130,7 @@ pub fn init_from_platform(config: &mut crate::platform::PlatformConfig) {
     install_standard_protocols_and_finalize();
 
     // Install TCG protocols for measured boot if the platform requested it.
+    #[cfg(feature = "tpm")]
     if let Some(ref mut tpm_config) = config.tpm_event_log {
         init_tcg_protocols(tpm_config);
         system_table::update_crc32();
@@ -171,6 +175,7 @@ fn install_standard_protocols_and_finalize() {
 ///
 /// Each protocol is initialized independently so a failure in one does
 /// not prevent the other from being installed.
+#[cfg(feature = "tpm")]
 fn init_tcg_protocols(config: &mut crate::platform::TpmEventLogConfig) {
     use crate::platform::{Tpm2DeviceConfig, TpmLogFormat};
 
@@ -228,6 +233,7 @@ fn init_tcg_protocols(config: &mut crate::platform::TpmEventLogConfig) {
 }
 
 /// Initialize and install EFI_TCG2_PROTOCOL (TPM 2.0).
+#[cfg(feature = "tpm")]
 fn init_tcg2_protocol(existing_log: Option<&[u8]>, enable_sha1: bool) -> Result<(), &'static str> {
     use tcg::event_log::DEFAULT_EVENT_LOG_SIZE;
 
@@ -257,6 +263,7 @@ fn init_tcg2_protocol(existing_log: Option<&[u8]>, enable_sha1: bool) -> Result<
 }
 
 /// Initialize and install EFI_TCG2_PROTOCOL with a TIS MMIO hardware TPM.
+#[cfg(feature = "tpm")]
 fn init_tcg2_protocol_tis(
     existing_log: Option<&[u8]>,
     tpm_base: u64,
@@ -295,6 +302,7 @@ fn init_tcg2_protocol_tis(
 }
 
 /// Initialize and install EFI_TCG2_PROTOCOL with a platform TPM driver.
+#[cfg(feature = "tpm")]
 fn init_tcg2_protocol_platform_tpm(
     existing_log: Option<&[u8]>,
     tpm: &'static mut dyn crate::platform::Tpm2Device,
@@ -335,6 +343,7 @@ fn init_tcg2_protocol_platform_tpm(
 /// This measures:
 /// - S-CRTM version into PCR 0
 /// - Secure Boot variables into PCR 7 (with separator)
+#[cfg(feature = "tpm")]
 pub(crate) fn measure_initial_boot() {
     // Measure S-CRTM version (firmware version string) into PCR 0.
     tcg::measured_boot::measure_s_crtm_version_all(env!("CARGO_PKG_VERSION"));
@@ -344,6 +353,7 @@ pub(crate) fn measure_initial_boot() {
 }
 
 /// Initialize and install EFI_TCG_PROTOCOL (TPM 1.2).
+#[cfg(feature = "tpm")]
 fn init_tcg1_protocol(
     existing_log: Option<&[u8]>,
     tpm_base: Option<u64>,

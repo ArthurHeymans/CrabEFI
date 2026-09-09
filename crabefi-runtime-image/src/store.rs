@@ -91,7 +91,8 @@ pub struct VariableStore {
     slots: [VariableSlot; MAX_VARIABLES],
     arena: [u8; VARIABLE_ARENA_SIZE],
     auth_timestamps: [VariableTimestamp; 4],
-    setup_mode: bool,
+    // Store the zero-initialized polarity so the large store stays in BSS.
+    user_mode: bool,
     secure_boot: bool,
 }
 
@@ -143,7 +144,7 @@ impl VariableStore {
             slots: [const { VariableSlot::empty() }; MAX_VARIABLES],
             arena: [0; VARIABLE_ARENA_SIZE],
             auth_timestamps: [ZERO_TIMESTAMP; 4],
-            setup_mode: true,
+            user_mode: false,
             secure_boot: false,
         }
     }
@@ -246,7 +247,7 @@ impl VariableStore {
     }
 
     pub fn setup_mode(&self) -> bool {
-        self.setup_mode
+        !self.user_mode
     }
 
     pub fn secure_boot_enabled(&self) -> bool {
@@ -271,14 +272,15 @@ impl VariableStore {
     }
 
     pub fn refresh_policy(&mut self) {
-        self.setup_mode = self
-            .key_database_data(SecureBootVariable::PK)
-            .is_none_or(|data| data.is_empty());
+        self.user_mode = cfg!(feature = "secure-boot")
+            && self
+                .key_database_data(SecureBootVariable::PK)
+                .is_some_and(|data| !data.is_empty());
         let preference = self
             .find(&EFI_GLOBAL_VARIABLE_GUID, SECURE_BOOT_ENABLE_NAME, false)
             .and_then(|slot| self.data(slot))
             .is_some_and(|data| data.first() == Some(&1));
-        self.secure_boot = !self.setup_mode && preference;
+        self.secure_boot = self.user_mode && preference;
     }
 
     pub fn find(&self, guid: &[u8; 16], name: &[u16], runtime_only: bool) -> Option<&VariableSlot> {

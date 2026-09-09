@@ -407,7 +407,7 @@ impl CorebootCapsuleBackend {
             return;
         }
         self.fmap_loaded = true;
-        let parsed = crabefi::efi::varstore::with_storage_mut(|storage| {
+        let parsed = crabefi::efi::varstore::with_spi_storage_mut(|storage| {
             fmap::read_fmap(storage.controller_mut(), self.fmap_offset)
         })
         .flatten();
@@ -453,7 +453,7 @@ impl crabefi::CapsuleBackend for CorebootCapsuleBackend {
         if offset as u64 + data.len() as u64 > u64::from(region.size) {
             return Err(crabefi::StorageError::InvalidArgument);
         }
-        crabefi::efi::varstore::with_storage_mut(|storage| {
+        crabefi::efi::varstore::with_spi_storage_mut(|storage| {
             let controller = storage.controller_mut();
             crabefi::FirmwareStorage::enable_writes(controller)?;
             crabefi::FirmwareStorage::erase(
@@ -721,7 +721,7 @@ fn riscv_fdt_only_boot(fdt_ptr: u64, fdt_size: u32) -> ! {
         timestamp_recorder: None,
         reset: &reset,
         block_devices: &mut [],
-        variable_store_locator: None,
+        variable_storage: crabefi::VariableStorage::None,
         debug_output: None,
         console_input: None,
         framebuffer: None,
@@ -1059,7 +1059,7 @@ pub extern "C" fn rust_main(coreboot_table_ptr: u64) -> ! {
         timestamp_recorder: timestamp_recorder_ref,
         reset: &reset,
         block_devices: &mut [],
-        variable_store_locator: Some(&variable_store_locator),
+        variable_storage: crabefi::VariableStorage::Spi(&variable_store_locator),
         debug_output: None, // Already set up via serial::init_from_config()
         console_input: None,
         framebuffer,

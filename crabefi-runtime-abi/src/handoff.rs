@@ -236,26 +236,28 @@ impl RuntimeHandoff {
                 Ok(end)
             })?;
 
-        if self.deferred_buffer_base == 0
-            || self.deferred_buffer_size == 0
-            || !self
-                .deferred_buffer_base
-                .is_multiple_of(u64::from(EFI_PAGE_SIZE))
-            || !self
-                .deferred_buffer_size
-                .is_multiple_of(u64::from(EFI_PAGE_SIZE))
-            || self
-                .deferred_buffer_base
-                .checked_add(self.deferred_buffer_size)
-                .is_none()
-            || self.sections.iter().take(section_count).any(|section| {
-                ranges_overlap(
-                    section.physical_base,
-                    u64::from(section.byte_len),
-                    self.deferred_buffer_base,
-                    self.deferred_buffer_size,
-                )
-            })
+        let deferred_disabled = self.deferred_buffer_base == 0 && self.deferred_buffer_size == 0;
+        if !deferred_disabled
+            && (self.deferred_buffer_base == 0
+                || self.deferred_buffer_size == 0
+                || !self
+                    .deferred_buffer_base
+                    .is_multiple_of(u64::from(EFI_PAGE_SIZE))
+                || !self
+                    .deferred_buffer_size
+                    .is_multiple_of(u64::from(EFI_PAGE_SIZE))
+                || self
+                    .deferred_buffer_base
+                    .checked_add(self.deferred_buffer_size)
+                    .is_none()
+                || self.sections.iter().take(section_count).any(|section| {
+                    ranges_overlap(
+                        section.physical_base,
+                        u64::from(section.byte_len),
+                        self.deferred_buffer_base,
+                        self.deferred_buffer_size,
+                    )
+                }))
         {
             return Err(HandoffError::Range);
         }

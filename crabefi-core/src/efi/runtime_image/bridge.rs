@@ -1,10 +1,22 @@
 //! Audited BootActive persistence bridge consumed by runtime-image seal.
 
-use crabefi_runtime_abi::{BridgeRequest, bridge_operation};
-use r_efi::efi::{Guid, Status};
+use crabefi_runtime_abi::BridgeRequest;
+#[cfg(feature = "variable-store")]
+use crabefi_runtime_abi::bridge_operation;
+#[cfg(any(feature = "variable-store", test))]
+use r_efi::efi::Guid;
+use r_efi::efi::Status;
 
+#[cfg(feature = "variable-store")]
 use crate::efi::varstore::VarStoreError;
 
+/// Firmware without direct-flash persistence rejects every bridge operation.
+#[cfg(not(feature = "variable-store"))]
+pub extern "C" fn dispatch(_request: *const BridgeRequest) -> usize {
+    Status::UNSUPPORTED.as_usize()
+}
+
+#[cfg(feature = "variable-store")]
 #[allow(clippy::not_unsafe_ptr_arg_deref)]
 pub extern "C" fn dispatch(request: *const BridgeRequest) -> usize {
     if request.is_null() {
