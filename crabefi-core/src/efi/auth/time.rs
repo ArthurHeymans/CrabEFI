@@ -3,14 +3,13 @@
 //! Provides RTC reading and date-to-timestamp conversion used by
 //! multiple auth submodules (crypto, revocation, dbx_update).
 
-use super::AuthError;
 use crabefi_efi_types::authentication::EfiTime;
 
 /// Convert a date/time to Unix timestamp (seconds since 1970-01-01 00:00:00 UTC)
 ///
-/// Uses [`der::DateTime`] for years >= 1970 (handles leap years correctly).
-/// Falls back to manual arithmetic for pre-1970 dates (needed for some CRL/cert
-/// parsing where UTCTime maps 50-99 to 1950-1999).
+/// Pure days-from-civil arithmetic (Howard Hinnant's algorithm); no date
+/// library needed. Handles pre-1970 dates (negative results) used by CRL/cert
+/// parsing where UTCTime maps 50-99 to 1950-1999.
 pub(crate) fn datetime_to_unix_timestamp(
     year: i64,
     month: i64,
@@ -19,61 +18,18 @@ pub(crate) fn datetime_to_unix_timestamp(
     minute: i64,
     second: i64,
 ) -> i64 {
-    // Try der::DateTime for post-1970 dates (it validates and computes correctly)
-    if year >= 1970
-        && let Ok(dt) = der::DateTime::new(
-            year as u16,
-            month as u8,
-            day as u8,
-            hour as u8,
-            minute as u8,
-            second as u8,
-        )
-    {
-        return dt.unix_duration().as_secs() as i64;
-    }
-
-    // Fallback for pre-1970 or invalid dates: manual arithmetic preserving the
-    // original behavior (returns negative for pre-1970, garbage for truly invalid
-    // inputs -- callers should treat extreme values as suspect).
-    let years_since_1970 = year - 1970;
-    let leap_years = (year - 1969) / 4 - (year - 1901) / 100 + (year - 1601) / 400;
-
-    let days_before_month = match month {
-        1 => 0,
-        2 => 31,
-        3 => 59,
-        4 => 90,
-        5 => 120,
-        6 => 151,
-        7 => 181,
-        8 => 212,
-        9 => 243,
-        10 => 273,
-        11 => 304,
-        12 => 334,
-        _ => 0,
+    // Shift March to month 0 so leap days fall at the end of the year.
+    let (y, m) = if month <= 2 {
+        (year - 1, month + 9)
+    } else {
+        (year, month - 3)
     };
-
-    let is_leap = (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0);
-    let leap_day_adjustment = if is_leap && month > 2 { 1 } else { 0 };
-
-    let total_days =
-        years_since_1970 * 365 + leap_years + days_before_month + day - 1 + leap_day_adjustment;
-
-    total_days * 86400 + hour * 3600 + minute * 60 + second
-}
-
-/// Convert an x509 `Time` to a Unix timestamp
-pub(crate) fn x509_time_to_unix(time: &x509_cert::time::Time) -> Result<i64, AuthError> {
-    use x509_cert::time::Time;
-
-    let dt = match time {
-        Time::UtcTime(t) => t.to_date_time(),
-        Time::GeneralTime(t) => t.to_date_time(),
-    };
-
-    Ok(dt.unix_duration().as_secs() as i64)
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400; // [0, 399]
+    let doy = (153 * m + 2) / 5 + day - 1; // [0, 365]
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy; // [0, 146096]
+    let days = era * 146097 + doe - 719468; // Days since 1970-01-01.
+    days * 86400 + hour * 3600 + minute * 60 + second
 }
 
 /// Read the current date/time from the hardware RTC
@@ -82,6 +38,15 @@ pub(crate) fn x509_time_to_unix(time: &x509_cert::time::Time) -> Result<i64, Aut
 ///
 /// - **x86_64**: Reads the CMOS RTC via I/O ports 0x70/0x71
 /// - **aarch64**: Returns a fallback value (PL031 RTC support TODO)
+/// Deterministic stand-in for host unit tests: the fixtures in
+/// auth/testdata/ are valid across this date (certs 2026-09-09 +825d,
+/// CRLs +30d), so time-dependent checks behave deterministically.
+#[cfg(test)]
+pub(crate) fn read_rtc_time() -> (u16, u8, u8, u8, u8, u8) {
+    (2026, 9, 10, 0, 0, 0)
+}
+
+#[cfg(not(test))]
 pub(crate) fn read_rtc_time() -> (u16, u8, u8, u8, u8, u8) {
     #[cfg(target_arch = "x86_64")]
     {
@@ -105,6 +70,7 @@ pub(crate) fn read_rtc_time() -> (u16, u8, u8, u8, u8, u8) {
 
 /// x86 CMOS RTC implementation
 #[cfg(target_arch = "x86_64")]
+#[cfg_attr(test, allow(dead_code))] // Test builds use the stubbed read_rtc_time above.
 fn read_rtc_time_x86() -> (u16, u8, u8, u8, u8, u8) {
     use crate::arch::x86_64::io;
 
@@ -209,4 +175,32 @@ pub(crate) fn current_unix_timestamp() -> i64 {
         minute as i64,
         second as i64,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn known_timestamps() {
+        // Epoch, Y2K, leap day, 32-bit limit, pre-1970.
+        assert_eq!(datetime_to_unix_timestamp(1970, 1, 1, 0, 0, 0), 0);
+        assert_eq!(datetime_to_unix_timestamp(2000, 1, 1, 0, 0, 0), 946_684_800);
+        assert_eq!(
+            datetime_to_unix_timestamp(2024, 2, 29, 12, 0, 0),
+            1_709_208_000
+        );
+        assert_eq!(
+            datetime_to_unix_timestamp(2038, 1, 19, 3, 14, 7),
+            2_147_483_647
+        );
+        assert_eq!(
+            datetime_to_unix_timestamp(1950, 1, 1, 0, 0, 0),
+            -631_152_000
+        );
+        assert_eq!(
+            datetime_to_unix_timestamp(2025, 6, 15, 8, 30, 45),
+            1_749_976_245
+        );
+    }
 }

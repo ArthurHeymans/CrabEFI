@@ -454,54 +454,22 @@ pub fn verify_pe_image_secure_boot(pe_data: &[u8]) -> Result<bool, AuthError> {
 /// the hash from the DigestInfo, which should match our computed Authenticode hash.
 #[cfg(feature = "secure-boot")]
 fn extract_spc_authenticode_hash(pkcs7_data: &[u8]) -> Result<Option<Vec<u8>>, AuthError> {
-    use cms::content_info::ContentInfo;
-    use cms::signed_data::SignedData;
-    use der::asn1::OctetStringRef;
-    use der::{Decode, Encode, Reader, SliceReader, Tagged};
+    use super::asn1_views;
 
     let actual_pkcs7 = super::crypto::trim_der_trailing_bytes(pkcs7_data)?;
-    let content_info = ContentInfo::from_der(actual_pkcs7).map_err(|_| AuthError::InvalidHeader)?;
-    let signed_data_bytes = content_info
-        .content
-        .to_der()
-        .map_err(|_| AuthError::InvalidHeader)?;
-    let cms_signed_data =
-        SignedData::from_der(&signed_data_bytes).map_err(|_| AuthError::InvalidHeader)?;
+    let signed =
+        asn1_views::parse_signed_data(actual_pkcs7).map_err(|_| AuthError::InvalidHeader)?;
 
-    let econtent = match cms_signed_data.encap_content_info.econtent {
-        Some(ref ec) => ec,
+    let econtent = match signed.econtent_hash_input {
+        Some(ec) => ec,
         None => return Ok(None),
     };
 
-    // Get SpcIndirectDataContent bytes for parsing.
-    // If eContent is OCTET STRING, the value is the DER of SpcIndirectDataContent.
-    // If eContent is a SEQUENCE (direct encoding), we need the full DER.
-    let spc_owned: Vec<u8>;
-    let spc_data: &[u8] = if econtent.tag() == der::Tag::OctetString {
-        econtent.value()
-    } else {
-        spc_owned = econtent.to_der().map_err(|_| AuthError::InvalidHeader)?;
-        &spc_owned
-    };
-
-    // Parse SpcIndirectDataContent SEQUENCE to extract the digest
-    let mut reader = SliceReader::new(spc_data).map_err(|_| AuthError::InvalidHeader)?;
-    let hash = reader
-        .sequence(|seq| {
-            // Skip SpcAttributeTypeAndOptionalValue (first element)
-            let _ = seq.tlv_bytes()?;
-            // Parse DigestInfo SEQUENCE (second element)
-            seq.sequence(|digest_seq| {
-                // Skip AlgorithmIdentifier
-                let _ = digest_seq.tlv_bytes()?;
-                // Read digest OCTET STRING
-                let digest: &OctetStringRef = digest_seq.decode()?;
-                Ok(digest.as_bytes().to_vec())
-            })
-        })
-        .map_err(|_: der::Error| AuthError::InvalidHeader)?;
-
-    Ok(Some(hash))
+    // The eContent carries SpcIndirectDataContent (possibly OCTET STRING
+    // wrapped); extract the DigestInfo digest from it.
+    asn1_views::extract_spc_digest(econtent)
+        .map(Some)
+        .map_err(|_| AuthError::InvalidHeader)
 }
 
 /// Verify an Authenticode signature against the db database
