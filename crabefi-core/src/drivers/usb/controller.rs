@@ -1237,11 +1237,17 @@ pub fn parse_configuration_checked(config_data: &[u8]) -> Result<ConfigurationIn
             _ => {}
         }
     }
-    if bytes != config_data.len()
-        || (active && endpoints != expected_endpoints)
-        || interfaces != config_data[4] as usize
-    {
+    if bytes != config_data.len() || (active && endpoints != expected_endpoints) {
         return Err(UsbError::InvalidParameter);
+    }
+    if interfaces != config_data[4] as usize {
+        // SET_CONFIGURATION uses bConfigurationValue, and the parsed interfaces
+        // are already bounded, so a stale interface count is not fatal.
+        log::warn!(
+            "USB: bNumInterfaces {} does not match {} active interfaces",
+            config_data[4],
+            interfaces
+        );
     }
     Ok(parse_configuration_inner(config_data))
 }
