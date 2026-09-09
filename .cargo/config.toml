@@ -3,18 +3,31 @@
 # Linker scripts are handled by crabefi-coreboot/build.rs.
 # Build-std is passed by xtask so host-side Cargo commands remain unaffected.
 
+# sha2_backend="soft" preserves the pre-0.11 `force-soft` behavior: pure
+# software SHA-256/512 with no runtime CPU-feature dispatch. This keeps hash
+# behavior deterministic in early-boot and runtime-services contexts and
+# avoids compiling the x86-sha / AVX2 / ARMv8 dispatch paths into firmware.
+# sha2_backend_soft="compact" selects the looped software implementation
+# over the unrolled one: less .text for hash operations where firmware
+# boot-time latency (not GB/s throughput) is what matters.
 [target.x86_64-unknown-none]
 rustflags = [
     "-C", "relocation-model=pic",
     "-C", "code-model=kernel",
+    "--cfg", "sha2_backend=\"soft\"",
+    "--cfg", "sha2_backend_soft=\"compact\"",
 ]
 
 [target.aarch64-unknown-none]
 rustflags = [
     "-C", "relocation-model=static",
+    "--cfg", "sha2_backend=\"soft\"",
+    "--cfg", "sha2_backend_soft=\"compact\"",
 ]
 
 [target.riscv64gc-unknown-none-elf]
 rustflags = [
     "-C", "relocation-model=static",
+    "--cfg", "sha2_backend=\"soft\"",
+    "--cfg", "sha2_backend_soft=\"compact\"",
 ]
