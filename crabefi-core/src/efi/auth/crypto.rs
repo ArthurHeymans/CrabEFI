@@ -1103,7 +1103,7 @@ fn verify_rsa_signature_raw(
     signature: &[u8],
     message_hash: &[u8; 32],
 ) -> Result<bool, AuthError> {
-    use rsa::signature::hazmat::PrehashVerifier;
+    use signature::hazmat::PrehashVerifier;
 
     let verifying_key = rsa::pkcs1v15::VerifyingKey::<Sha256>::new(public_key.clone());
 
