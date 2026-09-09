@@ -7,40 +7,6 @@ use rsa::signature::{SignatureEncoding, hazmat::PrehashSigner};
 use rsa::traits::PublicKeyParts;
 use sha2::{Digest, Sha256};
 
-mod scratch {
-    use allocator_api2::alloc::{AllocError, Allocator};
-    use core::{alloc::Layout, ptr::NonNull};
-    use std::alloc::{GlobalAlloc, System};
-
-    #[derive(Clone, Copy)]
-    pub struct TestAlloc;
-
-    // SAFETY: all operations delegate to the process system allocator.
-    unsafe impl Allocator for TestAlloc {
-        fn allocate(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
-            if layout.size() == 0 {
-                let pointer = NonNull::new(layout.align() as *mut u8).ok_or(AllocError)?;
-                return Ok(NonNull::slice_from_raw_parts(pointer, 0));
-            }
-            let pointer = unsafe { System.alloc(layout) };
-            let pointer = NonNull::new(pointer).ok_or(AllocError)?;
-            Ok(NonNull::slice_from_raw_parts(pointer, layout.size()))
-        }
-
-        unsafe fn deallocate(&self, pointer: NonNull<u8>, layout: Layout) {
-            unsafe { System.dealloc(pointer.as_ptr(), layout) }
-        }
-    }
-
-    pub fn with_scope<R>(body: impl FnOnce(TestAlloc) -> R) -> Option<R> {
-        Some(body(TestAlloc))
-    }
-
-    pub fn preflight(_required: usize) -> bool {
-        true
-    }
-}
-
 mod auth;
 
 const OID_SIGNED_DATA: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x07, 0x02];
