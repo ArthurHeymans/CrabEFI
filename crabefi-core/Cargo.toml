@@ -73,11 +73,11 @@ rflasher-internal = { optional = true, git = "https://github.com/ArthurHeymans/r
 ] }
 
 # RustCrypto crates for UEFI Secure Boot authentication (all no_std compatible)
-sha1 = { optional = true, version = "0.10", default-features = false, features = ["force-soft"] }
-sha2 = { version = "0.10", default-features = false, features = [
-  "force-soft",
+sha1 = { optional = true, version = "0.11", default-features = false }
+sha2 = { version = "0.11", default-features = false, features = ["oid"] }
+rsa = { optional = true, version = "=0.10.0-rc.18", default-features = false, features = [
+  "encoding",
 ] }
-rsa = { optional = true, version = "0.9", default-features = false }
 x509-cert = { optional = true, version = "0.3", default-features = false }
 der = { optional = true, version = "0.8", default-features = false }
 const-oid = { optional = true, version = "0.10", default-features = false }
