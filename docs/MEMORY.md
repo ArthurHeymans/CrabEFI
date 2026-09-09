@@ -16,7 +16,7 @@ heap: the old in-payload Runtime Services design could otherwise carry a boot
 heap pointer across EBS or SetVirtualAddressMap, after the backing pages became
 conventional memory or were no longer reachable at their physical address.
 
-The separate runtime image instead has a fixed 512 KiB allocation arena in the
+The separate runtime image instead has a fixed 64 KiB allocation arena in the
 image's `.bss`. The arena is therefore part of the image-owned
 RuntimeServicesData mapping and is converted with the rest of the image during
 SetVirtualAddressMap; it never calls UEFI allocation services or depends on the
@@ -42,17 +42,17 @@ data. The loader then copies/zeros sections and applies only normalized
 relocation slots. The image-owned MAT publishes the exact code/data protection
 domains even where the EFI memory map merges adjacent data descriptors.
 
-The audited release images currently reserve about 756 KiB of runtime address
+The audited release images currently reserve about 308 KiB of runtime address
 space on both x86_64 and AArch64:
 
 | Mapping | Size | Contents |
 | --- | ---: | --- |
 | RX | 60 KiB | runtime code plus leading page/alignment space |
 | RO/NX | 4 KiB | immutable data |
-| RW/NX | 692 KiB | variable store, runtime state, scratch arena, and padding |
+| RW/NX | 244 KiB | variable store, runtime state, scratch arena, and padding |
 
-Normalized on-disk images are currently about 240 KiB. The dominant resident
-allocations are the 512 KiB scratch arena, roughly 170 KiB of variable-store
+Normalized on-disk images are currently about 66 KiB. The dominant resident
+allocations are the 64 KiB scratch arena, roughly 170 KiB of variable-store
 state, and under 5 KiB of runtime state. The remainder is code, immutable data,
 dynamic metadata, small synchronization globals, and page/alignment padding.
 
@@ -61,7 +61,7 @@ certificate fixtures use under 8 KiB. A regression test executes repeated full
 public exponentiations with maximum-width 4096-bit operands and enforces a
 16 KiB per-exponentiation bound. Each RSA verification has its own non-nesting
 scope, so certificate-chain and signer traversal reuse that same arena region
-instead of accumulating allocations. The complete 512 KiB arena is still
+instead of accumulating allocations. The complete 64 KiB arena is still
 scrubbed at operation end and remains reserved as image-owned runtime memory.
 
 Every runtime descriptor is one of:

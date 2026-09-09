@@ -7,7 +7,15 @@ use core::marker::PhantomData;
 use core::ptr::{self, NonNull};
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-pub const SCRATCH_SIZE: usize = 512 * 1024;
+/// Total arena reservation: 64 KiB.
+///
+/// A single RSA verification needs at most 16 KiB (see
+/// `auth::limits::AUTH_OPERATION_SCRATCH_BOUND`); scopes never nest, so at
+/// most one operation's worth is live at any time. 64 KiB is 4x the proven
+/// bound, verified by the high-water regression tests. The reservation is
+/// page-aligned BSS, so shrinking it directly shrinks reserved
+/// RuntimeServicesData and the per-operation full-arena scrub in [`reset`].
+pub const SCRATCH_SIZE: usize = 64 * 1024;
 
 #[repr(C, align(4096))]
 struct ScratchBytes([u8; SCRATCH_SIZE]);

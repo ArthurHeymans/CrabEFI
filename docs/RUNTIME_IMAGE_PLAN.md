@@ -24,7 +24,7 @@ The runtime image owns all Runtime Services entry points and unsupported stubs,
 Runtime/System Tables, configuration storage, Runtime Properties, Memory
 Attributes Table (MAT), ESRT storage, variable metadata/payload arena,
 transaction buffer, manifests, phase machine, image-local time/reset code, and
-a fixed 512 KiB scratch allocator. The packed variable arena is 128 KiB; its
+a fixed 64 KiB scratch allocator. The packed variable arena is 128 KiB; its
 per-variable limit remains 16 KiB. Large zero-initialized store and scratch
 state is in `.bss`, not ROM data.
 
