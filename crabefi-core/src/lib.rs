@@ -41,6 +41,7 @@ pub mod menu_common;
 pub mod payload;
 pub mod pe;
 pub mod platform;
+#[cfg(feature = "secure-boot")]
 pub mod secure_boot_menu;
 pub mod time;
 pub mod timestamp;
@@ -76,7 +77,7 @@ pub use platform::{
     PlatformHooks, ResetHandler, ResetType, Rng, RngError, RuntimeImageSource,
     RuntimePlatformConfig, StorageBackend, StorageError, Timer, TimestampRecorder, Tpm2Device,
     Tpm2DeviceConfig, TpmDigest, TpmError, TpmEventLogConfig, TpmLogFormat, TpmPcrBanks,
-    VariableStoreLocator, VariableStoreRegion,
+    VariableStorage, VariableStoreLocator, VariableStoreRegion,
 };
 
 /// Display a Secure Boot violation error on screen
@@ -84,6 +85,7 @@ pub use platform::{
 /// This function displays a prominent red error message in the center of the screen
 /// when Secure Boot verification fails. It also outputs to the serial console.
 /// The display persists for a few seconds so the user can see it.
+#[cfg(feature = "secure-boot")]
 pub fn display_secure_boot_error() {
     use framebuffer_console::{Color, DEFAULT_BG, FramebufferConsole};
 
@@ -180,11 +182,21 @@ const fn supports_capsule_delivery(
 /// Extracting it eliminates ~40 lines of near-identical code between the
 /// two entry points.
 fn init_persistence_and_boot(
-    variable_store_locator: Option<&dyn platform::VariableStoreLocator>,
+    variable_storage: platform::VariableStorage<'_>,
     capsule_backend: Option<&mut dyn platform::CapsuleBackend>,
+    retained_staging: bool,
 ) -> ! {
     // ---- Variable persistence ----
-    let persistence_available = match efi::varstore::init_persistence(variable_store_locator) {
+    // SAFETY: init_platform and this tail never return, so the caller's borrowed
+    // backend stays live throughout boot. The runtime never receives its vtable:
+    // it uses the boot bridge only while BootActive, erases that bridge on seal,
+    // and ExitBootServices then detaches this boot-owned reference.
+    let variable_storage = unsafe {
+        core::mem::transmute::<platform::VariableStorage<'_>, platform::VariableStorage<'static>>(
+            variable_storage,
+        )
+    };
+    let persistence_available = match efi::varstore::init_persistence(variable_storage) {
         Ok(()) => {
             log::info!("Variable store persistence initialized");
             true
@@ -202,10 +214,10 @@ fn init_persistence_and_boot(
 
     let runtime = crate::efi::runtime_image::installed()
         .expect("runtime image missing before deferred replay");
-    let capsule_backend_available = capsule_backend.is_some();
+    let capsule_backend_available = cfg!(feature = "capsule-update") && capsule_backend.is_some();
     let mut capsule_delivery_usable = false;
     if persistence_available {
-        if persistence_writable {
+        if persistence_writable && retained_staging {
             match runtime.prepare_retained_staging() {
                 Ok(()) => {
                     capsule_delivery_usable = supports_capsule_delivery(
@@ -224,6 +236,7 @@ fn init_persistence_and_boot(
         }
 
         logger::apply_persisted_level();
+        #[cfg(feature = "secure-boot")]
         match efi::auth::boot::init_secure_boot_default() {
             Ok(status) => log::info!(
                 "Secure Boot: mode={}, enabled={}",
@@ -234,6 +247,7 @@ fn init_persistence_and_boot(
         }
     }
 
+    #[cfg(feature = "capsule-update")]
     if persistence_writable {
         if let Some(backend) = capsule_backend {
             let applied = efi::capsule::process_pending_capsules(backend);
@@ -263,6 +277,7 @@ fn init_persistence_and_boot(
     // TCG protocols are installed during EFI initialization, but initial
     // measurements must wait until persistent variables and Secure Boot state
     // have been loaded so PCR7 reflects the actual PK/KEK/db/dbx contents.
+    #[cfg(feature = "tpm")]
     efi::measure_initial_boot();
 
     // ---- Boot manager ----
@@ -560,7 +575,11 @@ pub fn init_platform(mut config: PlatformConfig) -> ! {
     }
 
     // ---- 16. Variable persistence, Secure Boot, and boot manager ----
-    init_persistence_and_boot(config.variable_store_locator, config.capsule_backend);
+    init_persistence_and_boot(
+        config.variable_storage,
+        config.capsule_backend,
+        config.runtime.deferred_buffer.size != 0,
+    );
 }
 
 /// Store a device globally for SimpleFileSystem reads.

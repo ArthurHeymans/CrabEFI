@@ -41,7 +41,7 @@
 //!     block_devices: &mut [&mut my_emmc],
 //!     runtime_image: runtime_image_source,
 //!     runtime: runtime_platform_config,
-//!     variable_store_locator: None,
+//!     variable_storage: VariableStorage::None,
 //!     // ...
 //! };
 //! crabefi::init_platform(config); // never returns
@@ -455,41 +455,23 @@ pub trait VariableStoreLocator {
     ) -> Option<VariableStoreRegion>;
 }
 
-/// Raw byte-level storage backend.
+/// The bounded variable-region storage contract (no whole-device write authority).
+pub use crate::efi::varstore::storage::StorageBackend;
+
+/// Source of the boot-time persistent variable region.
 ///
-/// This trait provides low-level read/write/erase access to a storage device.
-/// It is used by [`crate::efi::varstore::Edk2VarStore`] to implement the
-/// EDK2 Firmware Volume format on top of raw flash.
-///
-/// # Flash Semantics
-///
-/// - `read` works on any valid offset.
-/// - `write` may require the region to be erased first (NOR flash: can only
-///   clear bits 1→0).
-/// - `erase` sets bytes to `0xFF` (NOR flash erased state).
-pub trait StorageBackend: Send {
-    /// Backend name for logging.
-    fn name(&self) -> &str;
-
-    /// Total storage size in bytes.
-    fn size(&self) -> u32;
-
-    /// Whether the storage is currently write-protected.
-    fn is_write_protected(&self) -> bool;
-
-    /// Enable writes (may clear hardware write-protection bits).
-    fn enable_writes(&mut self) -> Result<(), StorageError>;
-
-    /// Read data from storage.
-    fn read(&mut self, offset: u32, buffer: &mut [u8]) -> Result<(), StorageError>;
-
-    /// Write data to storage.
-    ///
-    /// For flash: the target region should be erased first.
-    fn write(&mut self, offset: u32, data: &[u8]) -> Result<(), StorageError>;
-
-    /// Erase a region (sets bytes to `0xFF`).
-    fn erase(&mut self, offset: u32, size: u32) -> Result<(), StorageError>;
+/// Platform backends own trusted region bounds and remain borrowed until boot
+/// services end. They are never retained as runtime/SVAM callable trait objects.
+#[derive(Default)]
+pub enum VariableStorage<'a> {
+    /// Variables are volatile; durable writes fail.
+    #[default]
+    None,
+    /// Host-owned backend exposing only the selected variable region.
+    Platform(&'a mut dyn StorageBackend),
+    /// Standalone payload's explicit whole-device SPI discovery adapter.
+    #[cfg(feature = "spi-flash")]
+    Spi(&'a dyn VariableStoreLocator),
 }
 
 // ============================================================================
@@ -1277,7 +1259,7 @@ pub struct RuntimeImageSource<'a> {
     pub expected_sha256: [u8; 32],
 }
 
-/// Mandatory warm-reset-preserved storage owned exclusively by the separate
+/// Optional warm-reset-preserved storage owned exclusively by the separate
 /// runtime image.
 ///
 /// The buffer must have a nonzero, page-aligned physical base and size, be
@@ -1285,13 +1267,22 @@ pub struct RuntimeImageSource<'a> {
 /// any external runtime MMIO range. No boot or operating-system component may
 /// reuse it. Its contents and physical address must survive a warm reset so
 /// deferred variable writes and staged capsules can be replayed on the next
-/// boot. A zero-sized “no storage” configuration is not supported.
+/// boot. Use [`Self::disabled()`] to omit retained staging; this does not
+/// disable boot-time persistent writes through a bounded platform backend.
 #[derive(Debug, Clone, Copy)]
 pub struct DeferredBufferConfig {
     /// Page-aligned physical base of the exclusively owned retained buffer.
     pub base: u64,
     /// Nonzero page-aligned buffer size in bytes.
     pub size: usize,
+}
+
+impl DeferredBufferConfig {
+    /// Omit retained staging. Post-EBS NV writes/capsules are unsupported unless
+    /// a future genuinely persistent runtime backend is supplied.
+    pub const fn disabled() -> Self {
+        Self { base: 0, size: 0 }
+    }
 }
 
 /// Value-only runtime platform mechanisms and retained external ranges.
@@ -1303,7 +1294,7 @@ pub struct RuntimePlatformConfig<'a> {
     pub reset: crabefi_runtime_abi::RuntimeResetConfig,
     /// Explicit MMIO ranges that remain reachable after EBS.
     pub external_ranges: &'a [crabefi_runtime_abi::RuntimeExternalRange],
-    /// Mandatory, exclusively owned warm-reset-preserved deferred storage.
+    /// Optional, exclusively owned warm-reset-preserved deferred storage.
     pub deferred_buffer: DeferredBufferConfig,
 }
 
@@ -1396,13 +1387,12 @@ pub struct PlatformConfig<'a> {
     /// these for ESP partitions and boot entries.
     pub block_devices: &'a mut [&'a mut dyn BlockDevice],
 
-    /// Platform-specific persistent variable-store locator.
+    /// Persistent variables through a platform-owned, bounded region.
     ///
-    /// Direct-flash integrations provide this when CrabEFI should manage an
-    /// EDK2-compatible variable store itself. Coreboot implements this by
-    /// consulting its SMMSTORE records and FMAP. Library consumers that want
-    /// volatile variables can leave this as `None`.
-    pub variable_store_locator: Option<&'a dyn VariableStoreLocator>,
+    /// `Platform` never discovers/unlocks whole-chip flash. The optional `Spi`
+    /// adapter preserves standalone coreboot discovery. `None` keeps variables
+    /// volatile and rejects durable writes. The backend is boot-lifetime only.
+    pub variable_storage: VariableStorage<'a>,
 
     // ---- Console ----
     /// Debug/log output (serial port or equivalent).
@@ -1469,6 +1459,7 @@ pub struct PlatformConfig<'a> {
     ///
     /// When `None`, no TCG protocols are installed (bootloaders will see
     /// "protocol not found" and skip measured boot).
+    #[cfg(feature = "tpm")]
     pub tpm_event_log: Option<TpmEventLogConfig<'a>>,
 
     // ---- Pre-initialization ----
@@ -1515,7 +1506,7 @@ pub struct PlatformConfigBuilder<'a> {
     runtime_image: RuntimeImageSource<'a>,
     runtime: RuntimePlatformConfig<'a>,
     timestamp_recorder: Option<&'a dyn TimestampRecorder>,
-    variable_store_locator: Option<&'a dyn VariableStoreLocator>,
+    variable_storage: VariableStorage<'a>,
     debug_output: Option<&'a mut dyn DebugOutput>,
     console_input: Option<&'a mut dyn ConsoleInput>,
     framebuffer: Option<FramebufferConfig>,
@@ -1528,6 +1519,7 @@ pub struct PlatformConfigBuilder<'a> {
     hooks: Option<&'a dyn PlatformHooks>,
     rng: Option<&'a dyn Rng>,
     ecam_regions: &'a [PciEcamRegion],
+    #[cfg(feature = "tpm")]
     tpm_event_log: Option<TpmEventLogConfig<'a>>,
     heap_pre_initialized: bool,
 }
@@ -1550,7 +1542,7 @@ impl<'a> PlatformConfigBuilder<'a> {
             runtime_image,
             runtime,
             timestamp_recorder: None,
-            variable_store_locator: None,
+            variable_storage: VariableStorage::None,
             debug_output: None,
             console_input: None,
             framebuffer: None,
@@ -1563,6 +1555,7 @@ impl<'a> PlatformConfigBuilder<'a> {
             hooks: None,
             rng: None,
             ecam_regions: &[],
+            #[cfg(feature = "tpm")]
             tpm_event_log: None,
             heap_pre_initialized: false,
         }
@@ -1575,8 +1568,16 @@ impl<'a> PlatformConfigBuilder<'a> {
     }
 
     /// Backend that locates persistent variable storage.
+    #[cfg(feature = "spi-flash")]
     pub fn variable_store_locator(mut self, value: &'a dyn VariableStoreLocator) -> Self {
-        self.variable_store_locator = Some(value);
+        self.variable_storage = VariableStorage::Spi(value);
+        self
+    }
+
+    /// Use an already bounded, platform-owned variable region during boot.
+    #[cfg(feature = "variable-store")]
+    pub fn variable_storage(mut self, value: &'a mut dyn StorageBackend) -> Self {
+        self.variable_storage = VariableStorage::Platform(value);
         self
     }
 
@@ -1653,6 +1654,7 @@ impl<'a> PlatformConfigBuilder<'a> {
     }
 
     /// TPM event log configuration for measured boot.
+    #[cfg(feature = "tpm")]
     pub fn tpm_event_log(mut self, value: TpmEventLogConfig<'a>) -> Self {
         self.tpm_event_log = Some(value);
         self
@@ -1674,7 +1676,7 @@ impl<'a> PlatformConfigBuilder<'a> {
             timestamp_recorder: self.timestamp_recorder,
             reset: self.reset,
             block_devices: self.block_devices,
-            variable_store_locator: self.variable_store_locator,
+            variable_storage: self.variable_storage,
             debug_output: self.debug_output,
             console_input: self.console_input,
             framebuffer: self.framebuffer,
@@ -1689,6 +1691,7 @@ impl<'a> PlatformConfigBuilder<'a> {
             ecam_regions: self.ecam_regions,
             runtime_image: self.runtime_image,
             runtime: self.runtime,
+            #[cfg(feature = "tpm")]
             tpm_event_log: self.tpm_event_log,
             heap_pre_initialized: self.heap_pre_initialized,
         }

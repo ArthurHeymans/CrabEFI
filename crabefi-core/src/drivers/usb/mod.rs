@@ -30,10 +30,12 @@ pub mod ohci_regs;
 pub mod uhci;
 #[cfg(target_arch = "x86_64")]
 pub mod uhci_regs;
+#[cfg(feature = "xhci")]
 pub mod xhci;
 
 pub use self::controller::{DeviceInfo, UsbController, UsbError, UsbSpeed};
 pub use mass_storage::UsbMassStorage;
+#[cfg(feature = "xhci")]
 pub use xhci::{XhciController, XhciError};
 
 use crate::drivers::pci;
@@ -49,6 +51,7 @@ use core::ptr;
 
 /// Unified USB controller handle
 pub enum UsbControllerHandle {
+    #[cfg(feature = "xhci")]
     Xhci(*mut XhciController),
     Ehci(*mut ehci::EhciController),
     Ohci(*mut ohci::OhciController),
@@ -73,6 +76,7 @@ macro_rules! with_usb_controller {
     // Mutable access version
     ($handle:expr, mut |$controller:ident| $body:expr) => {
         match $handle {
+            #[cfg(feature = "xhci")]
             UsbControllerHandle::Xhci(ptr) => {
                 let $controller = unsafe { &mut **ptr };
                 $body
@@ -95,6 +99,7 @@ macro_rules! with_usb_controller {
     // Immutable access version
     ($handle:expr, |$controller:ident| $body:expr) => {
         match $handle {
+            #[cfg(feature = "xhci")]
             UsbControllerHandle::Xhci(ptr) => {
                 let $controller = unsafe { &**ptr };
                 $body
@@ -205,6 +210,7 @@ pub fn init_device(dev: &pci::PciDevice) -> Result<(), ()> {
     }
 
     match dev.prog_if {
+        #[cfg(feature = "xhci")]
         0x30 => init_usb_controller!("xHCI", XhciController, Xhci),
         0x20 => init_usb_controller!("EHCI", ehci::EhciController, Ehci),
         0x10 => init_usb_controller!("OHCI", ohci::OhciController, Ohci),
@@ -448,6 +454,7 @@ where
 // UsbController impl for XhciController (for compatibility)
 // ============================================================================
 
+#[cfg(feature = "xhci")]
 impl UsbController for XhciController {
     fn controller_type(&self) -> &'static str {
         "xHCI"

@@ -23,6 +23,7 @@ SECTIONS
   . = ALIGN(0x1000);
   .rodata :
   {
+    KEEP(*(.runtime.capabilities))
     *(.rodata .rodata.* .rodata.cst*)
   } :rodata
 

@@ -43,7 +43,14 @@ fn show_no_settings(fb: &FramebufferInfo) -> ScreenNav {
         theme::TEXT_DIM,
         None,
     );
-    draw_footer(fb, "S Security  F Firmware  R Reset  Esc Back");
+    draw_footer(
+        fb,
+        if cfg!(feature = "secure-boot") {
+            "S Security  F Firmware  R Reset  Esc Back"
+        } else {
+            "F Firmware  R Reset  Esc Back"
+        },
+    );
 
     loop {
         poll_and_render_cursor(fb, &mut cursor);
@@ -51,6 +58,7 @@ fn show_no_settings(fb: &FramebufferInfo) -> ScreenNav {
 
         if let Some(key) = menu_common::read_key() {
             match key {
+                #[cfg(feature = "secure-boot")]
                 KeyPress::Char('s') | KeyPress::Char('S') => {
                     cursor.hide(fb);
                     return ScreenNav::Nav(NavItem::Security);

@@ -47,11 +47,15 @@ pub struct RuntimeArtifact {
 }
 
 /// Build and install the normalized image used by Cargo-only library consumers.
-pub fn bundle(arch: Arch) -> Result<()> {
-    let artifact = build(arch)?;
-    let destination = project_root()
-        .join("crabefi-runtime-bundle/images")
-        .join(arch.dir_name());
+pub fn bundle(arch: Arch, secure_boot: bool) -> Result<()> {
+    let artifact = build_with_capabilities(arch, secure_boot)?;
+    let images = project_root().join("crabefi-runtime-bundle/images");
+    let destination = if secure_boot {
+        images
+    } else {
+        images.join("basic")
+    }
+    .join(arch.dir_name());
     fs::create_dir_all(&destination)?;
     atomic_copy(&artifact.image, &destination.join("runtime.img"))?;
     atomic_write(&destination.join("sha256.bin"), &artifact.digest)?;
@@ -83,8 +87,19 @@ fn atomic_write(destination: &Path, bytes: &[u8]) -> Result<()> {
 }
 
 pub fn build(arch: Arch) -> Result<RuntimeArtifact> {
+    // Standalone coreboot payloads explicitly retain their full feature set.
+    build_with_capabilities(arch, true)
+}
+
+fn build_with_capabilities(arch: Arch, secure_boot: bool) -> Result<RuntimeArtifact> {
     let root = project_root();
-    let output = root.join("target/runtime").join(arch.dir_name());
+    let runtime = root.join("target/runtime");
+    let output = if secure_boot {
+        runtime
+    } else {
+        runtime.join("basic")
+    }
+    .join(arch.dir_name());
     fs::create_dir_all(&output)?;
     let target = target_triple(arch);
     let cargo_target = root.join("target/runtime/.cargo").join(target);
@@ -92,7 +107,8 @@ pub fn build(arch: Arch) -> Result<RuntimeArtifact> {
     let manifest = root.join("crabefi-runtime-image/Cargo.toml");
     let rustflags = runtime_rustflags(arch, &map_path);
     let parent = root.parent().context("project root has no parent")?;
-    let status = Command::new("cargo")
+    let mut command = Command::new("cargo");
+    command
         .args([
             "+nightly",
             "-Z",
@@ -100,11 +116,17 @@ pub fn build(arch: Arch) -> Result<RuntimeArtifact> {
             "-Z",
             "build-std-features=compiler-builtins-mem",
             "build",
+            "--locked",
+            "--no-default-features",
             "--manifest-path",
         ])
         .arg(&manifest)
         .args(["--release", "--target", target, "--target-dir"])
-        .arg(&cargo_target)
+        .arg(&cargo_target);
+    if secure_boot {
+        command.args(["--features", "secure-boot"]);
+    }
+    let status = command
         .current_dir(parent)
         .env_remove("RUSTFLAGS")
         .env("CARGO_ENCODED_RUSTFLAGS", rustflags)
@@ -129,7 +151,24 @@ pub fn build(arch: Arch) -> Result<RuntimeArtifact> {
     if map_path.exists() {
         fs::copy(&map_path, output.join("runtime-image.map"))?;
     }
-    normalize(&elf_path, &output, arch)
+    normalize(&elf_path, &output, arch, secure_boot)
+}
+
+/// Read capabilities from source-owned ELF data, never infer them from a filename.
+fn runtime_capabilities(file: &object::File<'_>) -> Result<u64> {
+    let symbol = file
+        .symbols()
+        .find(|symbol| symbol.name() == Ok("RUNTIME_IMAGE_FEATURE_BITS"))
+        .context("runtime ELF has no capability identity")?;
+    let section = file.section_by_index(
+        symbol
+            .section_index()
+            .context("capability identity has no section")?,
+    )?;
+    let bytes = section
+        .data_range(symbol.address(), 8)?
+        .context("truncated runtime capability identity")?;
+    Ok(u64::from_le_bytes(bytes.try_into()?))
 }
 
 fn runtime_rustflags(arch: Arch, map_path: &Path) -> OsString {
@@ -173,11 +212,26 @@ fn runtime_rustflags(arch: Arch, map_path: &Path) -> OsString {
     encoded
 }
 
-fn normalize(elf_path: &Path, output: &Path, arch: Arch) -> Result<RuntimeArtifact> {
+fn normalize(
+    elf_path: &Path,
+    output: &Path,
+    arch: Arch,
+    secure_boot: bool,
+) -> Result<RuntimeArtifact> {
     let elf_bytes = fs::read(elf_path)?;
     let file = object::File::parse(elf_bytes.as_slice()).context("parse runtime ELF")?;
     if file.kind() != ObjectKind::Dynamic || file.architecture() != object_arch(arch) {
         bail!("runtime ELF must be ET_DYN for the requested architecture");
+    }
+    let capabilities = runtime_capabilities(&file)?;
+    let expected_capabilities = crabefi_runtime_abi::feature_bits::REQUIRED
+        | if secure_boot {
+            crabefi_runtime_abi::feature_bits::SECURE_BOOT
+        } else {
+            0
+        };
+    if capabilities != expected_capabilities {
+        bail!("runtime ELF capabilities do not match the requested bundle");
     }
     let mut segments = file
         .segments()
@@ -293,11 +347,7 @@ fn normalize(elf_path: &Path, output: &Path, arch: Arch) -> Result<RuntimeArtifa
     write_u32(&mut normalized, 36, exports_offset as u32);
     write_u16(&mut normalized, 40, EXPORTS_SIZE as u16);
     write_u32(&mut normalized, 44, EFI_PAGE_SIZE);
-    write_u64(
-        &mut normalized,
-        48,
-        crabefi_runtime_abi::feature_bits::REQUIRED,
-    );
+    write_u64(&mut normalized, 48, capabilities);
 
     for (index, segment) in segments.iter().enumerate() {
         let offset = section_offset + index * SECTION_SIZE;

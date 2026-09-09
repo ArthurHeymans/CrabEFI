@@ -61,6 +61,7 @@ pub const EFI_BOOT_PATH: &str = "EFI\\BOOT\\BOOTRISCV64.EFI";
 const MENU_TITLE: &str = "CrabEFI Boot Menu";
 
 /// Help text
+#[cfg(feature = "secure-boot")]
 const HELP_TEXT: &str = "Enter: Boot | F: Firmware | C: Cmdline | S: Secure Boot | R: Reset";
 
 /// Re-export storage device type for backward compatibility
@@ -1014,6 +1015,7 @@ pub fn show_menu(menu: &mut BootMenu) -> Option<usize> {
                     // Future: file browser
                     draw_status("File browser not yet implemented", &mut fb_console);
                 }
+                #[cfg(feature = "secure-boot")]
                 KeyPress::Char('s') | KeyPress::Char('S') => {
                     // Open Secure Boot settings menu
                     crate::secure_boot_menu::show_secure_boot_menu();
@@ -1843,3 +1845,6 @@ fn draw_cmdline_editor_line(
         console.reset_colors();
     }
 }
+
+#[cfg(not(feature = "secure-boot"))]
+const HELP_TEXT: &str = "Enter: Boot | F: Firmware | C: Cmdline | R: Reset";

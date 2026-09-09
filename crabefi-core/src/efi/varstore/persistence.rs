@@ -14,7 +14,7 @@
 //!
 //! # Storage Strategy
 //!
-//! - **BootActive**: the audited runtime-image bridge durably updates SPI flash
+//! - **BootActive**: the audited runtime-image bridge updates the bounded backend
 //!   before the image store commits a non-volatile variable.
 //! - **After ExitBootServices**: the bridge is erased and the runtime image
 //!   commits nonvolatile writes to its retained deferred journal. The next boot
@@ -23,7 +23,8 @@
 //! # Persistent Config Region
 //!
 //! The location of the variable store region is determined by a
-//! platform-provided [`crate::platform::VariableStoreLocator`]. This keeps
+//! platform-provided bounded [`crate::platform::StorageBackend`], or an explicit
+//! standalone [`crate::platform::VariableStoreLocator`] SPI adapter. This keeps
 //! coreboot-specific concepts such as SMMSTORE table records and FMAP out of
 //! the library persistence path.
 
@@ -32,14 +33,19 @@ use alloc::vec::Vec;
 use crabefi_runtime_abi::VariableTimestamp;
 
 use crate::cell::{Local, LocalCell};
+#[cfg(feature = "spi-flash")]
 use crate::drivers::spi::{self, SpiController};
+#[cfg(feature = "spi-flash")]
 use crate::platform::{
     FirmwareStorage, FirmwareStorageLocation, FirmwareStorageRegion, VariableStoreLocator,
 };
+use crate::platform::{StorageError, VariableStorage};
 
 use super::VarStoreError;
 use super::edk2;
-use super::storage::{SpiStorageBackend, StorageBackend};
+#[cfg(feature = "spi-flash")]
+use super::storage::SpiStorageBackend;
+use super::storage::{StorageBackend, validate_range};
 
 /// Variable store persistence state
 ///
@@ -71,44 +77,148 @@ impl VarStoreState {
 
 /// Persistent variable-store bookkeeping.
 static VARSTORE: LocalCell<VarStoreState> = LocalCell::new(VarStoreState::new());
-/// Storage backend for variable persistence (SPI flash).
-static STORAGE: Local<Option<SpiStorageBackend>> = Local::new(None);
+/// Boot-lifetime backend, never callable from the sealed runtime image.
+enum Storage {
+    Platform(&'static mut dyn StorageBackend),
+    #[cfg(feature = "spi-flash")]
+    Spi(SpiStorageBackend),
+}
 
-/// Mutate the variable-store storage backend through a closure.
-///
-/// Returns `None` if no storage backend is configured.
-#[inline]
-#[track_caller]
-pub fn with_storage_mut<R>(f: impl FnOnce(&mut SpiStorageBackend) -> R) -> Option<R> {
+impl core::ops::Deref for Storage {
+    type Target = dyn StorageBackend;
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::Platform(backend) => &**backend,
+            #[cfg(feature = "spi-flash")]
+            Self::Spi(backend) => backend,
+        }
+    }
+}
+impl core::ops::DerefMut for Storage {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        match self {
+            Self::Platform(backend) => &mut **backend,
+            #[cfg(feature = "spi-flash")]
+            Self::Spi(backend) => backend,
+        }
+    }
+}
+impl Storage {
+    fn read(&mut self, offset: u32, data: &mut [u8]) -> Result<(), StorageError> {
+        validate_range(self.size(), offset, data.len(), 1)?;
+        core::ops::DerefMut::deref_mut(self).read(offset, data)
+    }
+    fn program(&mut self, offset: u32, data: &[u8]) -> Result<(), StorageError> {
+        validate_range(self.size(), offset, data.len(), self.program_granularity())?;
+        if self.is_write_protected() {
+            return Err(StorageError::WriteProtected);
+        }
+        core::ops::DerefMut::deref_mut(self).program(offset, data)
+    }
+    fn erase(&mut self, offset: u32, size: u32) -> Result<(), StorageError> {
+        validate_range(self.size(), offset, size as usize, self.erase_granularity())?;
+        if self.is_write_protected() {
+            return Err(StorageError::WriteProtected);
+        }
+        core::ops::DerefMut::deref_mut(self).erase(offset, size)
+    }
+    fn read_controller(&mut self, offset: u32, data: &mut [u8]) -> Result<(), StorageError> {
+        validate_range(self.size(), offset, data.len(), 1)?;
+        match self {
+            Self::Platform(backend) => backend.read(offset, data),
+            #[cfg(feature = "spi-flash")]
+            Self::Spi(backend) => backend.read_controller(offset, data),
+        }
+    }
+    fn has_mapped_read_base(&self) -> bool {
+        match self {
+            Self::Platform(_) => false,
+            #[cfg(feature = "spi-flash")]
+            Self::Spi(backend) => backend.has_mapped_read_base(),
+        }
+    }
+    fn base_offset(&self) -> u32 {
+        match self {
+            Self::Platform(_) => 0,
+            #[cfg(feature = "spi-flash")]
+            Self::Spi(backend) => backend.base_offset(),
+        }
+    }
+}
+
+static STORAGE: Local<Option<Storage>> = Local::new(None);
+
+fn with_storage_mut<R>(f: impl FnOnce(&mut Storage) -> R) -> Option<R> {
     STORAGE.borrow_mut().as_mut().map(f)
+}
+
+/// Standalone capsule code may explicitly use its SPI adapter, never a platform backend.
+#[cfg(feature = "spi-flash")]
+pub fn with_spi_storage_mut<R>(f: impl FnOnce(&mut SpiStorageBackend) -> R) -> Option<R> {
+    with_storage_mut(|storage| match storage {
+        Storage::Spi(backend) => Some(f(backend)),
+        Storage::Platform(_) => None,
+    })
+    .flatten()
+}
+
+/// Forget the boot-owned reference before its memory can be reclaimed by the OS.
+pub(crate) fn detach_backend() {
+    // After EBS the boot allocator is sealed. Reclaiming the boot memory is
+    // the OS's job; erase access without running backend allocation destructors.
+    let _detached = core::mem::ManuallyDrop::new(STORAGE.borrow_mut().take());
+}
+
+fn validate_backend(backend: &dyn StorageBackend) -> Result<(), VarStoreError> {
+    let minimum = (edk2::FV_HEADER_LENGTH + edk2::VS_HEADER_LENGTH) as u32;
+    if backend.size() < minimum || backend.program_granularity() != 1 {
+        return Err(VarStoreError::InvalidArgument);
+    }
+    validate_range(
+        backend.size(),
+        0,
+        backend.size() as usize,
+        backend.erase_granularity(),
+    )
+    .map_err(|_| VarStoreError::InvalidArgument)
 }
 
 /// Default variable store base address in SPI flash
 /// This is typically at the end of the flash region
 /// Used only as fallback if coreboot tables don't provide config info
+#[cfg(feature = "spi-flash")]
 pub const DEFAULT_VARSTORE_BASE: u32 = 0x00F00000; // 15MB offset (for 16MB flash)
 
 /// Default variable store size (256KB)
 /// Used only as fallback if coreboot tables don't provide config info
+#[cfg(feature = "spi-flash")]
 pub const DEFAULT_VARSTORE_SIZE: u32 = 256 * 1024;
 
 /// Initialize the variable store persistence layer
 ///
-/// This should be called early in boot to:
-/// 1. Return immediately if the platform did not provide a variable-store locator
-/// 2. Detect and initialize the storage backend (SPI controller)
-/// 3. Ask the platform locator for the persistent variable-store region
-/// 4. Read existing variables from storage
-/// 5. Import them into the authoritative runtime image store
-pub fn init(locator: Option<&dyn VariableStoreLocator>) -> Result<(), VarStoreError> {
-    log::info!("Initializing variable store persistence...");
-
-    let Some(locator) = locator else {
-        log::warn!("No variable-store locator provided - persistence DISABLED");
-        log::warn!("Variables will be lost on reboot");
-        return Err(VarStoreError::NotInitialized);
+/// Validates a host-owned bounded region (or the explicitly selected standalone
+/// SPI adapter), reads EDK2 records, and imports them into the runtime image.
+/// The supplied backend is used only until ExitBootServices seals the bridge.
+pub fn init(source: VariableStorage<'static>) -> Result<(), VarStoreError> {
+    let storage = match source {
+        VariableStorage::None => return Err(VarStoreError::NotInitialized),
+        VariableStorage::Platform(backend) => {
+            validate_backend(backend)?;
+            Storage::Platform(backend)
+        }
+        #[cfg(feature = "spi-flash")]
+        VariableStorage::Spi(locator) => Storage::Spi(probe_spi(locator)?),
     };
+    *STORAGE.borrow_mut() = Some(storage);
+    if let Err(error) = init_varstore().and_then(|()| load_variables_from_storage()) {
+        detach_backend();
+        return Err(error);
+    }
+    Ok(())
+}
 
+#[cfg(feature = "spi-flash")]
+fn probe_spi(locator: &dyn VariableStoreLocator) -> Result<SpiStorageBackend, VarStoreError> {
     // Detect SPI controller after confirming the platform wants direct-flash
     // variable persistence.  Library integrations without a locator should not
     // probe platform-specific SPI hardware as a side effect.
@@ -131,20 +241,23 @@ pub fn init(locator: Option<&dyn VariableStoreLocator>) -> Result<(), VarStoreEr
     // safe region; using a guessed address could overwrite boot code on small
     // flash devices.
     configure_from_locator(&mut backend, locator)?;
+    validate_backend(&backend)?;
+    if !backend
+        .base_offset()
+        .is_multiple_of(backend.erase_granularity())
+    {
+        return Err(VarStoreError::InvalidArgument);
+    }
+    // Only this explicit standalone SPI adapter can change controller protection.
+    if let Err(error) = backend.prepare_writes() {
+        log::warn!("SPI variable region remains write-protected: {:?}", error);
+    }
 
-    *STORAGE.borrow_mut() = Some(backend);
-
-    // Initialize the variable store region
-    init_varstore()?;
-
-    // Import existing variables from storage into the runtime image.
-    load_variables_from_storage()?;
-
-    log::info!("Variable store persistence initialized");
-    Ok(())
+    Ok(backend)
 }
 
 /// Configure the variable store from the platform-provided locator.
+#[cfg(feature = "spi-flash")]
 fn configure_from_locator(
     backend: &mut SpiStorageBackend,
     locator: &dyn VariableStoreLocator,
@@ -181,6 +294,7 @@ fn configure_from_locator(
 }
 
 /// Validate and narrow a located variable-store region for the current storage backend.
+#[cfg(feature = "spi-flash")]
 fn validate_variable_store_region(
     region: FirmwareStorageRegion,
     storage_capacity: Option<u64>,
@@ -248,7 +362,7 @@ fn init_varstore() -> Result<(), VarStoreError> {
     let storage_size = with_storage_mut(|storage| {
         storage
             .read(0, &mut header_bytes[..header_size])
-            .map_err(|_| VarStoreError::SpiError)?;
+            .map_err(|_| VarStoreError::StorageFailure)?;
         Ok::<u32, VarStoreError>(storage.size())
     })
     .ok_or(VarStoreError::NotInitialized)??;
@@ -316,20 +430,15 @@ fn init_varstore() -> Result<(), VarStoreError> {
 
     // Try to enable writes, erase, and write headers
     with_storage_mut(|storage| {
-        if let Err(e) = storage.enable_writes() {
-            log::warn!("Could not enable storage writes: {:?}", e);
-            // Continue anyway - the erase/write will fail if truly locked
-        }
-
         // Erase the region
         storage
             .erase(0, storage_size)
-            .map_err(|_| VarStoreError::SpiError)?;
+            .map_err(|_| VarStoreError::StorageFailure)?;
 
         // Write new FV + VS headers
         storage
-            .write(0, &fv_headers)
-            .map_err(|_| VarStoreError::SpiError)?;
+            .program(0, &fv_headers)
+            .map_err(|_| VarStoreError::StorageFailure)?;
 
         Ok::<(), VarStoreError>(())
     })
@@ -558,11 +667,8 @@ pub(crate) fn write_variable_to_storage_internal(
 
     // Write the new record using multi-stage protocol
     let new_offset = with_storage_mut(|storage| {
-        if let Err(e) = storage.enable_writes() {
-            log::warn!("Could not enable storage writes: {:?}", e);
-        }
         let mut write_fn =
-            |offset: u32, data: &[u8]| -> bool { storage.write(offset, data).is_ok() };
+            |offset: u32, data: &[u8]| -> bool { storage.program(offset, data).is_ok() };
         edk2::write_variable(
             &mut write_fn,
             write_offset,
@@ -574,7 +680,7 @@ pub(crate) fn write_variable_to_storage_internal(
         )
     })
     .ok_or(VarStoreError::NotInitialized)?
-    .ok_or(VarStoreError::SpiError)?;
+    .ok_or(VarStoreError::StorageFailure)?;
 
     let mut expected_record = record;
     if let Some(state) = expected_record.get_mut(2) {
@@ -638,21 +744,15 @@ fn compact_variable_store() -> Result<(), VarStoreError> {
     let storage_size =
         with_storage_mut(|storage| storage.size()).ok_or(VarStoreError::NotInitialized)?;
     let end = with_storage_mut(|storage| {
-        if let Err(error) = storage.enable_writes() {
-            log::warn!(
-                "Could not enable storage writes before compaction: {:?}",
-                error
-            );
-        }
         storage
             .erase(0, storage_size)
-            .map_err(|_| VarStoreError::SpiError)?;
+            .map_err(|_| VarStoreError::StorageFailure)?;
         storage
-            .write(0, &edk2::build_fv_headers(storage_size))
-            .map_err(|_| VarStoreError::SpiError)?;
+            .program(0, &edk2::build_fv_headers(storage_size))
+            .map_err(|_| VarStoreError::StorageFailure)?;
         let mut offset = edk2::VARIABLE_DATA_OFFSET;
         for variable in &active {
-            let mut write_fn = |at: u32, bytes: &[u8]| storage.write(at, bytes).is_ok();
+            let mut write_fn = |at: u32, bytes: &[u8]| storage.program(at, bytes).is_ok();
             offset = edk2::write_variable(
                 &mut write_fn,
                 offset,
@@ -662,7 +762,7 @@ fn compact_variable_store() -> Result<(), VarStoreError> {
                 &variable.data,
                 variable.timestamp,
             )
-            .ok_or(VarStoreError::SpiError)?;
+            .ok_or(VarStoreError::StorageFailure)?;
         }
         Ok::<u32, VarStoreError>(offset)
     })
@@ -690,7 +790,7 @@ fn is_erased_for_write(offset: u32, len: u32) -> Result<bool, VarStoreError> {
             let chunk_len = remaining.min(CHUNK_SIZE);
             storage
                 .read_controller(current, &mut buffer[..chunk_len])
-                .map_err(|_| VarStoreError::SpiError)?;
+                .map_err(|_| VarStoreError::StorageFailure)?;
 
             if buffer[..chunk_len].iter().any(|&byte| byte != 0xFF) {
                 return Ok(false);
@@ -705,17 +805,17 @@ fn is_erased_for_write(offset: u32, len: u32) -> Result<bool, VarStoreError> {
     .ok_or(VarStoreError::NotInitialized)?
 }
 
-/// Verify that a just-written record is readable through the SPI controller.
+/// Verify completed media writes; the SPI adapter also diagnoses stale mapped reads.
 fn verify_written_record(offset: u32, expected: &[u8]) -> Result<(), VarStoreError> {
     with_storage_mut(|storage| {
         let mut controller_bytes = alloc::vec![0; expected.len()];
         storage
             .read_controller(offset, &mut controller_bytes)
-            .map_err(|_| VarStoreError::SpiError)?;
+            .map_err(|_| VarStoreError::StorageFailure)?;
 
         if controller_bytes.as_slice() != expected {
             log_record_mismatch("controller", offset, expected, &controller_bytes);
-            return Err(VarStoreError::SpiError);
+            return Err(VarStoreError::StorageFailure);
         }
 
         if storage.has_mapped_read_base() {
@@ -815,11 +915,8 @@ fn delete_existing_record_except(
         {
             // Mark as deleted by writing to the state byte
             let deleted = with_storage_mut(|storage| {
-                if let Err(e) = storage.enable_writes() {
-                    log::warn!("Could not enable storage writes: {:?}", e);
-                }
                 let mut write_fn =
-                    |offset: u32, data: &[u8]| -> bool { storage.write(offset, data).is_ok() };
+                    |offset: u32, data: &[u8]| -> bool { storage.program(offset, data).is_ok() };
                 edk2::mark_deleted(&mut write_fn, var.state_offset)
             })
             .ok_or(VarStoreError::NotInitialized)?;
@@ -829,18 +926,18 @@ fn delete_existing_record_except(
                     "Failed to mark variable as deleted at state_offset {:#x}",
                     var.state_offset
                 );
-                return Err(VarStoreError::SpiError);
+                return Err(VarStoreError::StorageFailure);
             }
             let state_byte = with_storage_mut(|storage| {
                 let mut byte = [0u8; 1];
                 storage
                     .read_controller(var.state_offset, &mut byte)
-                    .map_err(|_| VarStoreError::SpiError)?;
+                    .map_err(|_| VarStoreError::StorageFailure)?;
                 Ok::<u8, VarStoreError>(byte[0])
             })
             .ok_or(VarStoreError::NotInitialized)??;
             if edk2::is_var_added(state_byte) {
-                return Err(VarStoreError::SpiError);
+                return Err(VarStoreError::StorageFailure);
             }
 
             log::debug!(
@@ -866,7 +963,9 @@ pub fn is_varstore_initialized() -> bool {
 /// Check whether the initialized store accepts durable authenticated writes.
 pub fn is_varstore_writable() -> bool {
     let store = VARSTORE.get();
-    store.initialized && store.auth_format
+    store.initialized
+        && store.auth_format
+        && with_storage_mut(|backend| !backend.is_write_protected()).unwrap_or(false)
 }
 
 /// Get variable store statistics
@@ -925,18 +1024,9 @@ pub(crate) fn persist_firmware_variable(
         })
 }
 
-/// Publish a boot-produced value through the standard image SetVariable path.
-pub(crate) fn import_variable_into_runtime(
-    guid: &r_efi::efi::Guid,
-    name: &[u16],
-    attributes: u32,
-    data: &[u8],
-) {
-    let status = crate::efi::runtime_image::client::variables::set(guid, name, attributes, data);
-    if status != r_efi::efi::Status::SUCCESS {
-        log::warn!("Runtime image rejected boot variable update: {:?}", status);
-    }
-}
+#[cfg(test)]
+#[path = "backend_tests.rs"]
+mod backend_tests;
 
 #[cfg(test)]
 mod tests {

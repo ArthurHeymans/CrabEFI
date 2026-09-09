@@ -245,6 +245,7 @@ pub unsafe fn chainload_payload(
     };
 
     crate::efi::boot_services::measure_efi_application_start(true);
+    #[cfg(feature = "tpm")]
     crate::efi::tcg::measured_boot::measure_event_all(
         4,
         crate::efi::tcg::types::EV_IPL,

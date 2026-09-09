@@ -9,6 +9,7 @@ use core::cell::Ref;
 use r_efi::efi::{self, Guid, Handle};
 
 use crate::cell::Local;
+#[cfg(feature = "tpm")]
 use crate::efi::tcg::types::TaggedDigest;
 
 /// The Boot Services tables.
@@ -225,16 +226,22 @@ pub struct LoadedImageEntry {
     /// PE subsystem value from the optional header.
     pub subsystem: u16,
     /// Pending PCR index for deferred application image measurement.
+    #[cfg(feature = "tpm")]
     pub measurement_pcr: u32,
     /// Pending TCG event type for deferred application image measurement.
+    #[cfg(feature = "tpm")]
     pub measurement_event_type: u32,
     /// Number of valid precomputed authenticode digests.
+    #[cfg(feature = "tpm")]
     pub measurement_digest_count: usize,
     /// Precomputed authenticode digests for deferred application measurement.
+    #[cfg(feature = "tpm")]
     pub measurement_digests: [TaggedDigest; 5],
     /// Serialized EFI_IMAGE_LOAD_EVENT data for deferred application measurement.
+    #[cfg(feature = "tpm")]
     pub measurement_event_data: *mut u8,
     /// Size of the deferred event data buffer.
+    #[cfg(feature = "tpm")]
     pub measurement_event_data_size: usize,
 }
 
@@ -249,11 +256,17 @@ impl LoadedImageEntry {
             num_pages: 0,
             parent_handle: core::ptr::null_mut(),
             subsystem: 0,
+            #[cfg(feature = "tpm")]
             measurement_pcr: 0,
+            #[cfg(feature = "tpm")]
             measurement_event_type: 0,
+            #[cfg(feature = "tpm")]
             measurement_digest_count: 0,
+            #[cfg(feature = "tpm")]
             measurement_digests: [TaggedDigest::zeroed(0); 5],
+            #[cfg(feature = "tpm")]
             measurement_event_data: core::ptr::null_mut(),
+            #[cfg(feature = "tpm")]
             measurement_event_data_size: 0,
         }
     }

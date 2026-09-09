@@ -497,6 +497,7 @@ pub fn load_linux_from_disk(
     }
 
     crate::efi::boot_services::measure_efi_application_start(true);
+    #[cfg(feature = "tpm")]
     crate::efi::tcg::measured_boot::measure_event_all(
         4,
         crate::efi::tcg::types::EV_IPL,
@@ -504,10 +505,12 @@ pub fn load_linux_from_disk(
         b"linux kernel",
         "linux kernel",
     );
+    #[cfg(feature = "tpm")]
     if let Some(addr) = initrd_addr {
         // Safety: initrd_addr/initrd_size were set only after read_file_all filled this RAM range.
         let initrd =
             unsafe { core::slice::from_raw_parts(addr as *const u8, initrd_size as usize) };
+        #[cfg(feature = "tpm")]
         crate::efi::tcg::measured_boot::measure_event_all(
             4,
             crate::efi::tcg::types::EV_IPL,
@@ -516,6 +519,7 @@ pub fn load_linux_from_disk(
             "linux initrd",
         );
     }
+    #[cfg(feature = "tpm")]
     crate::efi::tcg::measured_boot::measure_event_all(
         4,
         crate::efi::tcg::types::EV_IPL,

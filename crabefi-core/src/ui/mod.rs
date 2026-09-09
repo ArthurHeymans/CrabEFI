@@ -7,6 +7,7 @@
 
 pub mod firmware_settings;
 pub mod render;
+#[cfg(feature = "secure-boot")]
 pub mod secure_boot;
 pub mod theme;
 
@@ -26,6 +27,7 @@ use render::{FontSize, Rgb};
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum NavItem {
     Boot,
+    #[cfg(feature = "secure-boot")]
     Security,
     Firmware,
 }
@@ -46,8 +48,9 @@ enum BootResult {
     Nav(NavItem),
 }
 
-const NAV_ITEMS: [(NavItem, &str); 3] = [
+const NAV_ITEMS: &[(NavItem, &str)] = &[
     (NavItem::Boot, "BOOT"),
+    #[cfg(feature = "secure-boot")]
     (NavItem::Security, "SECURITY"),
     (NavItem::Firmware, "FIRMWARE"),
 ];
@@ -55,8 +58,9 @@ const NAV_ITEMS: [(NavItem, &str); 3] = [
 fn nav_item_index(item: NavItem) -> usize {
     match item {
         NavItem::Boot => 0,
+        #[cfg(feature = "secure-boot")]
         NavItem::Security => 1,
-        NavItem::Firmware => 2,
+        NavItem::Firmware => 1 + cfg!(feature = "secure-boot") as usize,
     }
 }
 
@@ -260,6 +264,7 @@ pub fn show_graphical_menu(menu: &mut BootMenu) -> Option<usize> {
                 BootResult::Selected(idx) => return Some(idx),
                 BootResult::Nav(nav) => screen = nav,
             },
+            #[cfg(feature = "secure-boot")]
             NavItem::Security => match secure_boot::show(&fb) {
                 ScreenNav::Nav(nav) => screen = nav,
                 ScreenNav::Back => screen = NavItem::Boot,
@@ -285,6 +290,7 @@ pub fn show_no_media_screen() {
                 ScreenNav::Nav(nav) => screen = nav,
                 ScreenNav::Back => return,
             },
+            #[cfg(feature = "secure-boot")]
             NavItem::Security => match secure_boot::show(&fb) {
                 ScreenNav::Nav(nav) => screen = nav,
                 ScreenNav::Back => screen = NavItem::Boot,
@@ -410,6 +416,7 @@ fn run_boot(fb: &FramebufferInfo, menu: &mut BootMenu) -> BootResult {
                     cursor.hide(fb);
                     return BootResult::Selected(st.sel);
                 }
+                #[cfg(feature = "secure-boot")]
                 KeyPress::Char('s') | KeyPress::Char('S') => {
                     cursor.hide(fb);
                     return BootResult::Nav(NavItem::Security);
@@ -537,7 +544,14 @@ fn run_no_media(fb: &FramebufferInfo) -> ScreenNav {
         None,
     );
 
-    draw_footer(fb, "S: Security  F: Firmware  R: Reset  Esc: Halt");
+    draw_footer(
+        fb,
+        if cfg!(feature = "secure-boot") {
+            "S: Security  F: Firmware  R: Reset  Esc: Halt"
+        } else {
+            "F: Firmware  R: Reset  Esc: Halt"
+        },
+    );
 
     loop {
         poll_and_render_cursor(fb, &mut cursor);
@@ -549,6 +563,7 @@ fn run_no_media(fb: &FramebufferInfo) -> ScreenNav {
                 KeyPress::Char('r') | KeyPress::Char('R') => {
                     crate::reset_system();
                 }
+                #[cfg(feature = "secure-boot")]
                 KeyPress::Char('s') | KeyPress::Char('S') => {
                     cursor.hide(fb);
                     return ScreenNav::Nav(NavItem::Security);
@@ -825,7 +840,11 @@ fn paint_boot_footer(fb: &FramebufferInfo, st: &BState) {
     } else {
         draw_footer(
             fb,
-            "Up/Down Navigate  Enter Boot  S Security  F Firmware  R Reset",
+            if cfg!(feature = "secure-boot") {
+                "Up/Down Navigate  Enter Boot  S Security  F Firmware  R Reset"
+            } else {
+                "Up/Down Navigate  Enter Boot  F Firmware  R Reset"
+            },
         );
     }
 }

@@ -481,8 +481,11 @@ pub(crate) fn measure_efi_application_start(is_application: bool) {
         // TCG measured boot: measure pre-OS handoff state, boot variables,
         // boot action, and separators before the first boot attempt, per TCG
         // PFP / EDK2 ReadyToBoot ordering.
+        #[cfg(feature = "tpm")]
         super::super::tcg::measured_boot::measure_handoff_tables_all();
+        #[cfg(feature = "tpm")]
         super::super::tcg::measured_boot::measure_boot_variables_all();
+        #[cfg(feature = "tpm")]
         super::super::tcg::measured_boot::measure_action_all(
             4,
             "Calling EFI Application from Boot Option",
@@ -490,10 +493,12 @@ pub(crate) fn measure_efi_application_start(is_application: bool) {
 
         // Measure separator events into PCR 0-6.
         // PCR 7 already has its separator from Secure Boot variable measurement.
+        #[cfg(feature = "tpm")]
         super::super::tcg::measured_boot::measure_all_separators_all();
 
         signal_event_group(&EFI_EVENT_GROUP_READY_TO_BOOT);
     } else {
+        #[cfg(feature = "tpm")]
         super::super::tcg::measured_boot::measure_action_all(
             4,
             "Calling EFI Application from Boot Option",
@@ -504,6 +509,7 @@ pub(crate) fn measure_efi_application_start(is_application: bool) {
 /// Measure return from an EFI boot application attempt.
 pub(crate) fn measure_efi_application_return(is_application: bool) {
     if is_application && tables().ready_to_boot_signaled {
+        #[cfg(feature = "tpm")]
         super::super::tcg::measured_boot::measure_action_all(
             4,
             "Returning from EFI Application from Boot Option",

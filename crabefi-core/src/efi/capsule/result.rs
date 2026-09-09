@@ -78,6 +78,7 @@ impl CapsuleResult {
     }
 
     /// Create a capsule report that must not change firmware-resource state.
+    #[cfg(any(feature = "capsule-update", test))]
     pub(crate) fn report_only(status: CapsuleResultStatus) -> Self {
         Self {
             status,

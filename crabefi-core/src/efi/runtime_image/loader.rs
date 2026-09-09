@@ -16,10 +16,24 @@ use super::client::RuntimeImageClient;
 #[derive(Debug, Clone, Copy)]
 pub enum LoadError {
     DigestMismatch,
+    CapabilityMismatch,
     InvalidFormat(crabefi_runtime_abi::AbiError),
     InvalidLayout,
     Allocation(Status),
     Image(Status),
+}
+
+fn validate_capabilities(bits: u64) -> Result<(), LoadError> {
+    let expected = crabefi_runtime_abi::feature_bits::REQUIRED
+        | if cfg!(feature = "secure-boot") {
+            crabefi_runtime_abi::feature_bits::SECURE_BOOT
+        } else {
+            0
+        };
+    if bits != expected {
+        return Err(LoadError::CapabilityMismatch);
+    }
+    Ok(())
 }
 
 pub fn load(
@@ -32,6 +46,7 @@ pub fn load(
     }
     let image = ValidatedImage::parse(source.bytes, current_architecture())
         .map_err(LoadError::InvalidFormat)?;
+    validate_capabilities(image.header().feature_bits)?;
     validate_layout(&image, platform.external_ranges.len())?;
     reserve_deferred_buffer(platform)?;
     let header = image.header();
@@ -145,6 +160,9 @@ fn validate_deferred_buffer(
     deferred: crate::platform::DeferredBufferConfig,
     external_ranges: &[crabefi_runtime_abi::RuntimeExternalRange],
 ) -> Result<(u64, u64), LoadError> {
+    if deferred.base == 0 && deferred.size == 0 {
+        return Ok((0, 0));
+    }
     let base = deferred.base;
     let size = u64::try_from(deferred.size).map_err(|_| LoadError::InvalidLayout)?;
     let end = base.checked_add(size).ok_or(LoadError::InvalidLayout)?;
@@ -167,6 +185,9 @@ fn validate_deferred_buffer(
 fn reserve_deferred_buffer(platform: RuntimePlatformConfig<'_>) -> Result<(), LoadError> {
     let (base, size) =
         validate_deferred_buffer(platform.deferred_buffer, platform.external_ranges)?;
+    if size == 0 {
+        return Ok(());
+    }
     let pages = size / PAGE_SIZE;
     match allocator::carve_out_region(base, pages, MemoryType::RuntimeServicesData) {
         Ok(()) => Ok(()),
@@ -268,6 +289,22 @@ mod tests {
     use crabefi_runtime_abi::RuntimeExternalRange;
 
     #[test]
+    fn runtime_capabilities_must_match_the_boot_verifier() {
+        use crabefi_runtime_abi::feature_bits::{REQUIRED, SECURE_BOOT};
+        let expected = REQUIRED
+            | if cfg!(feature = "secure-boot") {
+                SECURE_BOOT
+            } else {
+                0
+            };
+        assert!(super::validate_capabilities(expected).is_ok());
+        assert!(matches!(
+            super::validate_capabilities(expected ^ SECURE_BOOT),
+            Err(super::LoadError::CapabilityMismatch)
+        ));
+    }
+
+    #[test]
     fn decodes_independent_aarch64_cache_line_sizes() {
         assert_eq!(aarch64_cache_line_sizes(3 | (3 << 16)), (32, 32));
         assert_eq!(aarch64_cache_line_sizes(4 | (5 << 16)), (128, 64));
@@ -276,6 +313,10 @@ mod tests {
 
     #[test]
     fn deferred_buffer_contract_rejects_invalid_ranges() {
+        assert_eq!(
+            validate_deferred_buffer(DeferredBufferConfig::disabled(), &[]).ok(),
+            Some((0, 0))
+        );
         let valid = DeferredBufferConfig {
             base: 0x40_0000,
             size: 0x1_0000,

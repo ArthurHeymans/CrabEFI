@@ -17,7 +17,7 @@ fn valid_image() -> Vec<u8> {
     let data_offset = exports_offset + EXPORTS_SIZE;
     let mut bytes = vec![0u8; data_offset + 4];
     bytes[..8].copy_from_slice(b"CRABRTI\0");
-    write_u16(&mut bytes, 8, 1);
+    write_u16(&mut bytes, 8, crabefi_runtime_abi::FORMAT_VERSION);
     write_u16(&mut bytes, 10, architecture::X86_64);
     write_u16(&mut bytes, 12, HEADER_SIZE as u16);
     write_u32(&mut bytes, 16, 4096);
@@ -118,7 +118,7 @@ fn rejects_invalid_relocation_slots_and_bounds() {
     let data_offset = exports_offset + EXPORTS_SIZE;
     let mut bytes = vec![0u8; data_offset + 8];
     bytes[..8].copy_from_slice(b"CRABRTI\0");
-    write_u16(&mut bytes, 8, 1);
+    write_u16(&mut bytes, 8, crabefi_runtime_abi::FORMAT_VERSION);
     write_u16(&mut bytes, 10, architecture::X86_64);
     write_u16(&mut bytes, 12, HEADER_SIZE as u16);
     write_u32(&mut bytes, 16, 4096);
@@ -188,6 +188,26 @@ fn valid_handoff(architecture: u16) -> RuntimeHandoff {
         _ => 0,
     };
     handoff
+}
+
+#[test]
+fn optional_retained_buffer_requires_both_zero_or_a_complete_valid_range() {
+    let mut handoff = valid_handoff(architecture::X86_64);
+    handoff.deferred_buffer_base = 0;
+    handoff.deferred_buffer_size = 0;
+    assert_eq!(handoff.validate(), Ok(()));
+    for (base, size) in [
+        (0, 4096),
+        (0x30_0000, 0),
+        (0x30_0001, 4096),
+        (0x30_0000, 4095),
+        (u64::MAX - 4095, 8192),
+        (handoff.image_base, 4096),
+    ] {
+        handoff.deferred_buffer_base = base;
+        handoff.deferred_buffer_size = size;
+        assert!(handoff.validate().is_err());
+    }
 }
 
 #[test]

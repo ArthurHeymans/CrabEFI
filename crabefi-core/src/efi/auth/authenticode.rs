@@ -16,21 +16,26 @@
 //! - UEFI Specification Section 32 (Secure Boot)
 
 use super::AuthError;
+#[cfg(feature = "secure-boot")]
 use super::crypto::verify_pkcs7_signature;
+#[cfg(feature = "secure-boot")]
 use super::signature::{is_certificate_forbidden, is_hash_allowed, is_hash_forbidden};
+#[cfg(feature = "secure-boot")]
 use super::variables::db_database;
-use crate::efi::tcg::types::{
+use crate::efi::digest::{
     SHA1_DIGEST_SIZE, SHA256_DIGEST_SIZE, SHA384_DIGEST_SIZE, SHA512_DIGEST_SIZE, TPM_ALG_SHA1,
     TPM_ALG_SHA256, TPM_ALG_SHA384, TPM_ALG_SHA512, TaggedDigest, digest_size_for_algorithm,
 };
 use crate::pe::{DATA_DIRECTORY_ENTRY_SIZE, IMAGE_DIRECTORY_ENTRY_SECURITY, parse_headers};
 use alloc::vec::Vec;
 
+#[cfg(feature = "secure-boot")]
 use crabefi_efi_types::constant_time_eq;
 use sha1::Sha1;
 use sha2::{Digest, Sha256, Sha384, Sha512};
 
 /// WIN_CERTIFICATE header type for PKCS#7
+#[cfg(feature = "secure-boot")]
 const WIN_CERT_TYPE_PKCS_SIGNED_DATA: u16 = 0x0002;
 
 fn is_supported_authenticode_algorithm(algorithm: u16) -> bool {
@@ -66,6 +71,7 @@ struct SectionInfo {
 }
 
 /// Embedded Authenticode signature data
+#[cfg(feature = "secure-boot")]
 pub struct AuthenticodeSignature<'a> {
     /// The PKCS#7 SignedData blob
     pub pkcs7_data: &'a [u8],
@@ -319,6 +325,7 @@ fn parse_pe_for_hash(pe_data: &[u8]) -> Result<PeInfo, AuthError> {
 /// # Returns
 ///
 /// The Authenticode signature if present, or None if unsigned
+#[cfg(feature = "secure-boot")]
 pub fn extract_authenticode_signature(
     pe_data: &[u8],
 ) -> Result<Option<AuthenticodeSignature<'_>>, AuthError> {
@@ -398,6 +405,7 @@ pub fn extract_authenticode_signature(
 /// * `Ok(true)` - Image is authorized for execution
 /// * `Ok(false)` - Image is NOT authorized
 /// * `Err(...)` - Verification error
+#[cfg(feature = "secure-boot")]
 pub fn verify_pe_image_secure_boot(pe_data: &[u8]) -> Result<bool, AuthError> {
     // Compute the Authenticode hash
     let image_hash = compute_authenticode_hash(pe_data)?;
@@ -444,6 +452,7 @@ pub fn verify_pe_image_secure_boot(pe_data: &[u8]) -> Result<bool, AuthError> {
 ///
 /// This function parses the eContent from the PKCS#7 SignedData and extracts
 /// the hash from the DigestInfo, which should match our computed Authenticode hash.
+#[cfg(feature = "secure-boot")]
 fn extract_spc_authenticode_hash(pkcs7_data: &[u8]) -> Result<Option<Vec<u8>>, AuthError> {
     use cms::content_info::ContentInfo;
     use cms::signed_data::SignedData;
@@ -496,6 +505,7 @@ fn extract_spc_authenticode_hash(pkcs7_data: &[u8]) -> Result<Option<Vec<u8>>, A
 }
 
 /// Verify an Authenticode signature against the db database
+#[cfg(feature = "secure-boot")]
 fn verify_authenticode_signature(
     image_hash: &[u8],
     sig: &AuthenticodeSignature,

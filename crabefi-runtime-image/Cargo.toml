@@ -7,8 +7,13 @@ build = "build.rs"
 
 [workspace]
 
+[features]
+default = []
+secure-boot = ["dep:allocator-api2", "dep:crypto-bigint", "dep:sha2"]
+full = ["secure-boot"]
+
 [dependencies]
-allocator-api2 = { version = "=0.3.1", default-features = false }
+allocator-api2 = { optional = true, version = "=0.3.1", default-features = false }
 crabefi-efi-types = { path = "../crabefi-efi-types" }
 crabefi-runtime-abi = { path = "../crabefi-runtime-abi" }
 # Temporary audited fork adding allocator-api2-backed BoxedUintIn, bounded-stack
@@ -16,19 +21,23 @@ crabefi-runtime-abi = { path = "../crabefi-runtime-abi" }
 # Fork audit reference: https://github.com/ArthurHeymans/crypto-bigint/commit/07a5d396134739ac0d02b15b1cd9c3f0ed60350e
 # Upstream status: no PR/issue yet. Replace this pin once those APIs are in a
 # published upstream release.
-crypto-bigint = { git = "https://github.com/ArthurHeymans/crypto-bigint", rev = "07a5d396134739ac0d02b15b1cd9c3f0ed60350e", default-features = false, features = ["allocator-api2"] }
+crypto-bigint = { optional = true, git = "https://github.com/ArthurHeymans/crypto-bigint", rev = "07a5d396134739ac0d02b15b1cd9c3f0ed60350e", default-features = false, features = ["allocator-api2"] }
 r-efi = "5.3"
 # This crate is a standalone workspace and intentionally uses sha2 0.11 so its
 # rsa 0.10 host tests share the same digest traits; other firmware crates remain
 # independently on sha2 0.10. Exact-pin so a new 0.11.x release cannot silently
 # change the verifier's digest implementation.
-sha2 = { version = "=0.11.0", default-features = false, features = ["oid"] }
+sha2 = { optional = true, version = "=0.11.0", default-features = false, features = ["oid"] }
 zerocopy = { version = "0.8", default-features = false, features = ["derive"] }
 
 [dev-dependencies]
 # Host-test-only signing dependency. Keep the exact prerelease pinned so test
 # certificate generation does not drift independently of the verifier.
 rsa = { version = "=0.10.0-rc.18", default-features = false }
+
+[[test]]
+name = "pkcs7_adversarial"
+required-features = ["secure-boot"]
 
 [[bin]]
 name = "crabefi-runtime-image"

@@ -12,7 +12,9 @@
 //! Call [`process_pending_capsules()`] during boot initialization, after
 //! the variable store is initialized but before launching the OS.
 
+#[cfg(feature = "capsule-update")]
 pub mod apply;
+#[cfg(feature = "capsule-update")]
 pub mod auth;
 pub mod disk;
 pub mod fmp;
@@ -20,11 +22,13 @@ pub mod header;
 pub mod result;
 pub mod rmap;
 
+#[cfg(any(feature = "capsule-update", test))]
 use crabefi_runtime_abi::capsule::{
     CAPSULE_HEADER_SIZE, RETAINED_RESERVATION_CAPSULE_GUID, RETAINED_RESERVATION_MARKER,
     RETAINED_RESERVATION_WRAPPER_GUID,
 };
 
+#[cfg(feature = "capsule-update")]
 use crate::platform::CapsuleBackend;
 
 pub use header::{CapsuleError, CapsuleType};
@@ -51,6 +55,7 @@ pub use result::{CapsuleResult, CapsuleResultStatus};
 ///
 /// The number of capsules successfully applied. If any capsule was applied,
 /// the caller should trigger a system reset.
+#[cfg(feature = "capsule-update")]
 pub fn process_pending_capsules(backend: &mut dyn CapsuleBackend) -> usize {
     let mut applied_count = 0;
 
@@ -127,6 +132,7 @@ pub fn process_pending_capsules(backend: &mut dyn CapsuleBackend) -> usize {
     applied_count
 }
 
+#[cfg(any(feature = "capsule-update", test))]
 fn is_retained_reservation_capsule(data: &[u8]) -> bool {
     let Ok(wrapper) = header::parse_capsule_header(data) else {
         return false;

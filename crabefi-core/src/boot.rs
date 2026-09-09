@@ -11,6 +11,7 @@
 //! These replace the four `install_block_io_for_{usb,nvme,ahci,sdhci}_disk` functions
 //! and the four `try_boot_from_esp_{usb,nvme,ahci,sdhci}` functions.
 
+#[cfg(feature = "tpm")]
 use core::sync::atomic::{AtomicBool, Ordering};
 
 use r_efi::efi::Status;
@@ -27,6 +28,7 @@ use crate::efi::protocols::simple_file_system::{self, SIMPLE_FILE_SYSTEM_GUID};
 use crate::fs;
 use crate::menu;
 
+#[cfg(feature = "tpm")]
 static GPT_MEASURED: AtomicBool = AtomicBool::new(false);
 
 /// Install BlockIO and DevicePath protocols for a disk and all its GPT partitions
@@ -96,9 +98,10 @@ pub fn install_block_io_protocols(
         fs::gpt::read_partitions_with(disk, &header, is_hybrid).map(|p| (header, is_hybrid, p))
     });
     let partitions = match gpt_scan {
-        Ok((header, is_hybrid, partitions)) => {
+        Ok((_header, _is_hybrid, partitions)) => {
+            #[cfg(feature = "tpm")]
             if let Ok(event_data) =
-                fs::gpt::build_gpt_measurement_event_with(disk, &header, is_hybrid)
+                fs::gpt::build_gpt_measurement_event_with(disk, &_header, _is_hybrid)
                 && !GPT_MEASURED.swap(true, Ordering::Relaxed)
             {
                 // EDK2 measures EV_EFI_GPT_EVENT once per boot, not once per boot attempt.

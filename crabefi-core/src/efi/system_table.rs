@@ -12,9 +12,11 @@ use crabefi_runtime_abi::{ConfigurationRegistration, ConsoleRegistration, config
 use r_efi::efi::{self, Guid, Handle, TableHeader};
 use r_efi::protocols::simple_text_input::Protocol as SimpleTextInputProtocol;
 use r_efi::protocols::simple_text_output::Protocol as SimpleTextOutputProtocol;
+#[cfg(feature = "tpm")]
 use spin::Mutex;
 use zerocopy::{FromBytes, Immutable, KnownLayout, Unaligned};
 
+#[cfg(feature = "tpm")]
 use crate::efi::tcg::types::{CryptoAgileEvent, TaggedDigest, TcgError};
 
 /// ACPI 2.0 RSDP GUID.
@@ -757,6 +759,7 @@ pub struct EfiMemoryAttributesTable {
 }
 
 /// TCG2 Final Events Table GUID
+#[cfg(feature = "tpm")]
 pub const EFI_TCG2_FINAL_EVENTS_TABLE_GUID: Guid = Guid::from_fields(
     0x1e2ed096,
     0x30e2,
@@ -768,6 +771,7 @@ pub const EFI_TCG2_FINAL_EVENTS_TABLE_GUID: Guid = Guid::from_fields(
 
 /// TCG2 Final Events Table structure
 #[repr(C)]
+#[cfg(feature = "tpm")]
 pub struct Tcg2FinalEventsTable {
     /// Version (must be 1)
     pub version: u64,
@@ -775,13 +779,16 @@ pub struct Tcg2FinalEventsTable {
     pub number_of_events: u64,
 }
 
+#[cfg(feature = "tpm")]
 const TCG2_FINAL_EVENTS_CAPACITY: usize = 64 * 1024;
 
+#[cfg(feature = "tpm")]
 struct Tcg2FinalEventsStorage {
     table_addr: usize,
     used: usize,
 }
 
+#[cfg(feature = "tpm")]
 static TCG2_FINAL_EVENTS: Mutex<Option<Tcg2FinalEventsStorage>> = Mutex::new(None);
 
 /// Install the TCG2 Final Events Table configuration table.
@@ -790,6 +797,7 @@ static TCG2_FINAL_EVENTS: Mutex<Option<Tcg2FinalEventsStorage>> = Mutex::new(Non
 /// is first called. This is separate from the main TCG2 event log
 /// (which is returned by `EFI_TCG2_PROTOCOL.GetEventLog`). The OS
 /// kernel concatenates both to get the complete measurement history.
+#[cfg(feature = "tpm")]
 pub fn install_tpm_event_log() {
     use super::allocator::{self, MemoryType};
 
@@ -844,6 +852,7 @@ pub fn install_tpm_event_log() {
 }
 
 /// Append an event to the TCG2 Final Events Table.
+#[cfg(feature = "tpm")]
 pub fn append_tpm_final_event(
     pcr_index: u32,
     event_type: u32,

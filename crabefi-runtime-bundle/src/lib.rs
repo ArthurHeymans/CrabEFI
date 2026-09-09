@@ -7,20 +7,32 @@
 #![no_std]
 #![deny(unsafe_code)]
 
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(target_arch = "x86_64", feature = "secure-boot"))]
 const IMAGE_BYTES: &[u8] = include_bytes!("../images/x86_64/runtime.img");
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(target_arch = "x86_64", not(feature = "secure-boot")))]
+const IMAGE_BYTES: &[u8] = include_bytes!("../images/basic/x86_64/runtime.img");
+#[cfg(all(target_arch = "x86_64", feature = "secure-boot"))]
 const DIGEST_BYTES: &[u8; 32] = include_bytes!("../images/x86_64/sha256.bin");
+#[cfg(all(target_arch = "x86_64", not(feature = "secure-boot")))]
+const DIGEST_BYTES: &[u8; 32] = include_bytes!("../images/basic/x86_64/sha256.bin");
 
-#[cfg(target_arch = "aarch64")]
+#[cfg(all(target_arch = "aarch64", feature = "secure-boot"))]
 const IMAGE_BYTES: &[u8] = include_bytes!("../images/aarch64/runtime.img");
-#[cfg(target_arch = "aarch64")]
+#[cfg(all(target_arch = "aarch64", not(feature = "secure-boot")))]
+const IMAGE_BYTES: &[u8] = include_bytes!("../images/basic/aarch64/runtime.img");
+#[cfg(all(target_arch = "aarch64", feature = "secure-boot"))]
 const DIGEST_BYTES: &[u8; 32] = include_bytes!("../images/aarch64/sha256.bin");
+#[cfg(all(target_arch = "aarch64", not(feature = "secure-boot")))]
+const DIGEST_BYTES: &[u8; 32] = include_bytes!("../images/basic/aarch64/sha256.bin");
 
-#[cfg(target_arch = "riscv64")]
+#[cfg(all(target_arch = "riscv64", feature = "secure-boot"))]
 const IMAGE_BYTES: &[u8] = include_bytes!("../images/riscv64/runtime.img");
-#[cfg(target_arch = "riscv64")]
+#[cfg(all(target_arch = "riscv64", not(feature = "secure-boot")))]
+const IMAGE_BYTES: &[u8] = include_bytes!("../images/basic/riscv64/runtime.img");
+#[cfg(all(target_arch = "riscv64", feature = "secure-boot"))]
 const DIGEST_BYTES: &[u8; 32] = include_bytes!("../images/riscv64/sha256.bin");
+#[cfg(all(target_arch = "riscv64", not(feature = "secure-boot")))]
+const DIGEST_BYTES: &[u8; 32] = include_bytes!("../images/basic/riscv64/sha256.bin");
 
 #[cfg(not(any(
     target_arch = "x86_64",
@@ -37,31 +49,86 @@ pub const SHA256: [u8; 32] = *DIGEST_BYTES;
 
 #[cfg(test)]
 mod tests {
-    use crabefi_runtime_abi::{ValidatedImage, architecture};
+    use crabefi_runtime_abi::{AbiError, ValidatedImage, architecture, feature_bits};
     use sha2::{Digest, Sha256};
 
-    fn validate(bytes: &[u8], expected_digest: &[u8; 32], expected_architecture: u16) {
-        ValidatedImage::parse(bytes, expected_architecture).expect("valid bundled runtime image");
+    fn validate(bytes: &[u8], digest: &[u8; 32], arch: u16, secure_boot: bool) {
+        let image = ValidatedImage::parse(bytes, arch).expect("valid bundled runtime image");
+        let expected = feature_bits::REQUIRED
+            | if secure_boot {
+                feature_bits::SECURE_BOOT
+            } else {
+                0
+            };
+        assert_eq!(image.header().feature_bits, expected);
         let actual: [u8; 32] = Sha256::digest(bytes).into();
-        assert_eq!(&actual, expected_digest);
+        assert_eq!(&actual, digest);
     }
 
     #[test]
-    fn all_bundled_images_are_valid_and_digest_bound() {
+    fn bundles_are_digest_and_capability_bound() {
         validate(
             include_bytes!("../images/x86_64/runtime.img"),
             include_bytes!("../images/x86_64/sha256.bin"),
             architecture::X86_64,
+            true,
+        );
+        validate(
+            include_bytes!("../images/basic/x86_64/runtime.img"),
+            include_bytes!("../images/basic/x86_64/sha256.bin"),
+            architecture::X86_64,
+            false,
         );
         validate(
             include_bytes!("../images/aarch64/runtime.img"),
             include_bytes!("../images/aarch64/sha256.bin"),
             architecture::AARCH64,
+            true,
+        );
+        validate(
+            include_bytes!("../images/basic/aarch64/runtime.img"),
+            include_bytes!("../images/basic/aarch64/sha256.bin"),
+            architecture::AARCH64,
+            false,
         );
         validate(
             include_bytes!("../images/riscv64/runtime.img"),
             include_bytes!("../images/riscv64/sha256.bin"),
             architecture::RISCV64,
+            true,
+        );
+        validate(
+            include_bytes!("../images/basic/riscv64/runtime.img"),
+            include_bytes!("../images/basic/riscv64/sha256.bin"),
+            architecture::RISCV64,
+            false,
+        );
+    }
+
+    #[test]
+    fn old_unlabelled_full_bundles_are_rejected() {
+        let mut bytes = *include_bytes!("../images/x86_64/runtime.img");
+        bytes[8..10].copy_from_slice(&1u16.to_le_bytes());
+        assert!(matches!(
+            ValidatedImage::parse(&bytes, architecture::X86_64),
+            Err(AbiError::BadVersion)
+        ));
+    }
+
+    #[test]
+    fn selected_bundle_matches_cargo_capability() {
+        let architecture = if cfg!(target_arch = "x86_64") {
+            architecture::X86_64
+        } else if cfg!(target_arch = "aarch64") {
+            architecture::AARCH64
+        } else {
+            architecture::RISCV64
+        };
+        validate(
+            super::IMAGE,
+            &super::SHA256,
+            architecture,
+            cfg!(feature = "secure-boot"),
         );
     }
 }

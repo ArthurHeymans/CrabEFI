@@ -9,10 +9,13 @@ use crabefi_runtime_abi::{
 };
 
 use crate::{
-    arch, auth, deferred, efi, state,
+    arch, deferred, efi, state,
     store::{VariableStore, VariableTransaction},
     svam,
 };
+
+#[cfg(feature = "secure-boot")]
+use crate::auth;
 
 const MAX_CAPSULE_SIZE: u64 = 16 * 1024 * 1024;
 const CAPSULE_FLAGS_PERSIST_ACROSS_RESET: u32 = 0x0001_0000;
@@ -395,14 +398,20 @@ fn validate_set_arguments(attributes: u32, data_size: usize) -> Result<(), efi::
     {
         return Err(efi::Status::INVALID_PARAMETER);
     }
-    if attributes & efi::VARIABLE_AUTHENTICATED_WRITE_ACCESS != 0 {
+    if attributes & efi::VARIABLE_AUTHENTICATED_WRITE_ACCESS != 0
+        || (!cfg!(feature = "secure-boot")
+            && attributes & efi::VARIABLE_TIME_BASED_AUTHENTICATED_WRITE_ACCESS != 0)
+    {
         return Err(efi::Status::UNSUPPORTED);
     }
+    #[cfg(feature = "secure-boot")]
     let maximum = if attributes & efi::VARIABLE_TIME_BASED_AUTHENTICATED_WRITE_ACCESS != 0 {
         auth::MAX_AUTHENTICATED_ENVELOPE_SIZE
     } else {
         MAX_VARIABLE_DATA_SIZE
     };
+    #[cfg(not(feature = "secure-boot"))]
+    let maximum = MAX_VARIABLE_DATA_SIZE;
     if data_size > maximum {
         return Err(efi::Status::OUT_OF_RESOURCES);
     }
@@ -453,12 +462,27 @@ fn apply_variable(
     if let Err(status) = validate_set_arguments(attributes, input.len()) {
         return status;
     }
+    let nonvolatile = attributes & efi::VARIABLE_NON_VOLATILE != 0
+        || (input.is_empty()
+            && store
+                .find(&guid, name, false)
+                .is_some_and(|slot| slot.attributes & efi::VARIABLE_NON_VOLATILE != 0));
+    if current_phase != phase::BOOT_ACTIVE && nonvolatile && (buffer.0.is_null() || buffer.1 == 0) {
+        return efi::Status::UNSUPPORTED;
+    }
     if secure_boot::is_status_variable(&guid, name)
         || capsule::is_esrt_last_attempt_variable(&guid, name)
     {
         return efi::Status::WRITE_PROTECTED;
     }
     let secure_variable = secure_boot::identify_key_database(&guid, name);
+    #[cfg(not(feature = "secure-boot"))]
+    if secure_variable.is_some()
+        || (guid == secure_boot::EFI_GLOBAL_VARIABLE_GUID
+            && secure_boot::name_matches(name, secure_boot::SECURE_BOOT_ENABLE_NAME))
+    {
+        return efi::Status::UNSUPPORTED;
+    }
     let authenticated = attributes & efi::VARIABLE_TIME_BASED_AUTHENTICATED_WRITE_ACCESS != 0;
     if secure_variable.is_some() && !authenticated && !store.setup_mode() {
         return efi::Status::SECURITY_VIOLATION;
@@ -472,6 +496,7 @@ fn apply_variable(
     if !authenticated && store.auth_history_timestamp(&guid, name).is_some() {
         return efi::Status::WRITE_PROTECTED;
     }
+    #[cfg(feature = "secure-boot")]
     let (payload, timestamp, authenticated_variable) = if authenticated {
         match auth::verify_authenticated_variable(store, name, &guid, attributes, input) {
             Ok(verified) => (
@@ -484,6 +509,12 @@ fn apply_variable(
     } else {
         (input, None, None)
     };
+    #[cfg(not(feature = "secure-boot"))]
+    let (payload, timestamp, authenticated_variable) = (
+        input,
+        None::<VariableTimestamp>,
+        None::<secure_boot::SecureBootVariable>,
+    );
     if payload.len() > MAX_VARIABLE_DATA_SIZE {
         return efi::Status::OUT_OF_RESOURCES;
     }
@@ -599,6 +630,9 @@ fn apply_variable(
 pub fn prepare_retained_staging(lease: &mut state::Lease) -> Result<(), efi::Status> {
     let bridge = lease.state().boot_bridge;
     let buffer = lease.state().deferred_buffer();
+    if buffer.0.is_null() || buffer.1 == 0 {
+        return Err(efi::Status::UNSUPPORTED);
+    }
     if bridge == 0 {
         return Err(efi::Status::WRITE_PROTECTED);
     }
@@ -637,6 +671,9 @@ pub fn prepare_retained_staging(lease: &mut state::Lease) -> Result<(), efi::Sta
 pub fn replay_deferred(lease: &mut state::Lease) -> Result<usize, efi::Status> {
     let bridge = lease.state().boot_bridge;
     let buffer = lease.state().deferred_buffer();
+    if buffer.0.is_null() || buffer.1 == 0 {
+        return Err(efi::Status::UNSUPPORTED);
+    }
     if bridge == 0 {
         return Err(efi::Status::WRITE_PROTECTED);
     }
@@ -758,6 +795,9 @@ pub extern "efiapi" fn update_capsule(
         Err(_) => return efi::Status::DEVICE_ERROR,
     };
     let buffer = lease.state().deferred_buffer();
+    if !capsule_delivery_available(lease.state()) {
+        return efi::Status::UNSUPPORTED;
+    }
     match deferred::stage_capsule(
         buffer.0,
         buffer.1,
@@ -767,6 +807,13 @@ pub extern "efiapi" fn update_capsule(
         Ok(()) => efi::Status::SUCCESS,
         Err(status) => status,
     }
+}
+
+fn capsule_delivery_available(runtime: &state::RuntimeState) -> bool {
+    runtime.deferred_buffer_size != 0
+        && runtime.deferred_buffer_physical != 0
+        && runtime.tables.esrt.header.resource_count != 0
+        && runtime.tables.esrt.entry.capsule_flags & CAPSULE_FLAGS_PERSIST_ACROSS_RESET != 0
 }
 
 pub extern "efiapi" fn query_capsule_capabilities(
@@ -805,6 +852,13 @@ pub extern "efiapi" fn query_capsule_capabilities(
     {
         return efi::Status::INVALID_PARAMETER;
     }
+    let lease = match state::try_lease() {
+        Ok(lease) => lease,
+        Err(status) => return status,
+    };
+    if !capsule_delivery_available(lease.state()) {
+        return efi::Status::UNSUPPORTED;
+    }
     unsafe {
         maximum_capsule_size.write(MAX_CAPSULE_SIZE);
         reset_type.write(efi::RESET_WARM);
@@ -836,6 +890,9 @@ pub extern "efiapi" fn query_variable_info(
         Ok(lease) => lease,
         Err(status) => return status,
     };
+    if state::phase_value() != phase::BOOT_ACTIVE && lease.state().deferred_buffer_size == 0 {
+        return efi::Status::UNSUPPORTED;
+    }
     // SAFETY: all required outputs were checked non-null.
     unsafe {
         maximum_variable_storage_size.write(crate::store::VariableStore::maximum_storage());
@@ -954,7 +1011,11 @@ pub fn time_is_supported(mechanism: u32) -> bool {
     return mechanism == time_mechanism::GOLDFISH_RTC;
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "secure-boot")))]
+#[path = "basic_tests.rs"]
+mod basic_tests;
+
+#[cfg(all(test, feature = "secure-boot"))]
 mod tests {
     use super::*;
     use crabefi_efi_types::authentication::EfiVariableAuthentication2;
@@ -1402,6 +1463,22 @@ mod tests {
 
     #[test]
     fn query_capsule_capabilities_validates_header_like_update_capsule() {
+        let _guard = crate::scratch::test_lock();
+        let saved = {
+            let mut lease = state::try_lease().unwrap();
+            let runtime = lease.state_mut();
+            let saved = (
+                runtime.deferred_buffer_physical,
+                runtime.deferred_buffer_size,
+                runtime.tables.esrt.header.resource_count,
+                runtime.tables.esrt.entry.capsule_flags,
+            );
+            runtime.deferred_buffer_physical = 0x30_0000;
+            runtime.deferred_buffer_size = 0x1_0000;
+            runtime.tables.esrt.header.resource_count = 1;
+            runtime.tables.esrt.entry.capsule_flags = CAPSULE_FLAGS_PERSIST_ACROSS_RESET;
+            saved
+        };
         let header = efi::CapsuleHeader {
             capsule_guid: efi::Guid::from_bytes(&[0; 16]),
             header_size: core::mem::size_of::<efi::CapsuleHeader>() as u32,
@@ -1453,6 +1530,14 @@ mod tests {
         );
         assert_eq!(maximum, MAX_CAPSULE_SIZE);
         assert_eq!(reset_type, efi::RESET_WARM);
+        let mut lease = state::try_lease().unwrap();
+        let runtime = lease.state_mut();
+        (
+            runtime.deferred_buffer_physical,
+            runtime.deferred_buffer_size,
+            runtime.tables.esrt.header.resource_count,
+            runtime.tables.esrt.entry.capsule_flags,
+        ) = saved;
     }
 
     #[test]

@@ -8,9 +8,11 @@
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 mod arch;
+#[cfg(feature = "secure-boot")]
 mod auth;
 mod deferred;
 mod efi;
+#[cfg(feature = "secure-boot")]
 mod scratch;
 mod services;
 mod state;
@@ -20,6 +22,17 @@ mod tables;
 
 #[cfg(all(not(test), target_os = "none"))]
 use core::panic::PanicInfo;
+
+/// Source-selected capabilities read by the normalizer from the linked ELF.
+#[used]
+#[unsafe(no_mangle)]
+#[unsafe(link_section = ".runtime.capabilities")]
+pub static RUNTIME_IMAGE_FEATURE_BITS: u64 = crabefi_runtime_abi::feature_bits::REQUIRED
+    | if cfg!(feature = "secure-boot") {
+        crabefi_runtime_abi::feature_bits::SECURE_BOOT
+    } else {
+        0
+    };
 
 use crabefi_runtime_abi::{
     ConfigurationRegistration, ConsoleRegistration, EsrtRegistration, RelocationImport,
@@ -385,9 +398,51 @@ pub extern "C" fn runtime_image_get_system_table() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    static RUNTIME_TEST: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn seal_erases_boot_bridge_and_runtime_nv_never_calls_it() {
+        use core::sync::atomic::{AtomicUsize, Ordering};
+        static CALLS: AtomicUsize = AtomicUsize::new(0);
+        extern "C" fn boot_only(_request: *const crabefi_runtime_abi::BridgeRequest) -> usize {
+            CALLS.fetch_add(1, Ordering::Relaxed);
+            efi::Status::DEVICE_ERROR.as_usize()
+        }
+        let _guard = RUNTIME_TEST.lock().unwrap();
+        #[cfg(feature = "secure-boot")]
+        let _scratch_guard = crate::scratch::test_lock();
+        state::set_phase(phase::UNINITIALIZED, phase::BOOT_ACTIVE).unwrap();
+        {
+            let mut lease = state::try_lease().unwrap();
+            lease.state_mut().boot_bridge = boot_only as *const () as u64;
+        }
+        assert_eq!(runtime_image_seal(), efi::Status::SUCCESS.as_usize());
+        assert_eq!(state::phase_value(), phase::SEALED_PHYSICAL);
+        {
+            let lease = state::try_lease().unwrap();
+            assert_eq!(lease.state().boot_bridge, 0);
+            assert!(lease.state().tables.system.boot_services.is_null());
+        }
+        let name = [b'N' as u16, 0];
+        let guid = efi::Guid::from_bytes(&[0x42; 16]);
+        let data = [1u8];
+        let status = services::set_variable(
+            name.as_ptr().cast_mut(),
+            &guid as *const _ as *mut _,
+            efi::VARIABLE_NON_VOLATILE
+                | efi::VARIABLE_BOOTSERVICE_ACCESS
+                | efi::VARIABLE_RUNTIME_ACCESS,
+            data.len(),
+            data.as_ptr().cast_mut().cast(),
+        );
+        assert_ne!(status, efi::Status::SUCCESS);
+        assert_eq!(CALLS.load(Ordering::Relaxed), 0);
+        state::set_phase(phase::SEALED_PHYSICAL, phase::UNINITIALIZED).unwrap();
+    }
 
     #[test]
     fn variable_import_rejects_odd_utf16_address_before_dereference() {
+        let _guard = RUNTIME_TEST.lock().unwrap();
         let import = VariableImport {
             name_address: 1,
             name_len: 1,
