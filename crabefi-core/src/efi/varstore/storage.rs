@@ -10,7 +10,7 @@
 //!
 //! The `StorageBackend` trait provides a minimal interface for block storage:
 //! - Read/write/erase operations
-//! - Write enable control
+//! - Write-protection reporting (no unlock control)
 //! - Basic device info
 //!
 //! This abstracts away the details of how storage is accessed, allowing
@@ -47,6 +47,7 @@ pub trait StorageBackend: Send {
     /// Minimum erase offset/length granularity (never rounded by the consumer).
     fn erase_granularity(&self) -> u32;
     /// Whether this region currently disallows writes. This API cannot unlock it.
+    /// Unknown protection status must conservatively return true.
     fn is_write_protected(&self) -> bool;
     /// Read bytes within the region.
     fn read(&mut self, offset: u32, buffer: &mut [u8]) -> Result<()>;

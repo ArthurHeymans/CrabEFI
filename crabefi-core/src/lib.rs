@@ -196,10 +196,24 @@ fn init_persistence_and_boot(
             variable_storage,
         )
     };
+    let storage_requested = !matches!(&variable_storage, platform::VariableStorage::None);
+    #[cfg(feature = "variable-store")]
+    let host_storage_required = matches!(&variable_storage, platform::VariableStorage::Platform(_));
+    #[cfg(not(feature = "variable-store"))]
+    let host_storage_required = false;
     let persistence_available = match efi::varstore::init_persistence(variable_storage) {
         Ok(()) => {
             log::info!("Variable store persistence initialized");
             true
+        }
+        Err(e)
+            if host_storage_required
+                || (storage_requested && e != efi::varstore::VarStoreError::NotInitialized) =>
+        {
+            panic!(
+                "Configured variable storage failed to initialize (no volatile fallback): {:?}",
+                e
+            );
         }
         Err(e) => {
             log::info!("Variable persistence not available: {:?}", e);

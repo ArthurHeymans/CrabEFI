@@ -17,7 +17,7 @@ tpm = ["dep:sha1"]
 # UEFI image/key authentication, independent of a host firmware's signed FFS.
 secure-boot = ["pkcs7", "crabefi-runtime-bundle?/secure-boot"]
 # Signed firmware capsule application requires durable result persistence.
-capsule-update = ["pkcs7", "spi-flash"]
+capsule-update = ["pkcs7", "variable-store"]
 # Shared verification implementation, not a runtime policy switch.
 pkcs7 = ["sha2/oid", "dep:sha1", "dep:rsa", "dep:x509-cert", "dep:der", "dep:const-oid", "dep:signature", "dep:cms"]
 # Preserve the standalone payload's existing non-graphical capabilities explicitly.

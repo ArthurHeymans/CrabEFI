@@ -59,6 +59,21 @@ fn parses_checked_fixture() {
 }
 
 #[test]
+fn rejects_missing_and_unknown_feature_bits() {
+    for bits in [
+        feature_bits::REQUIRED & !feature_bits::TIME,
+        feature_bits::REQUIRED | (1 << 63),
+    ] {
+        let mut bytes = valid_image();
+        bytes[48..56].copy_from_slice(&bits.to_le_bytes());
+        assert_eq!(
+            ValidatedImage::parse(&bytes, architecture::X86_64).err(),
+            Some(AbiError::UnknownFeatures)
+        );
+    }
+}
+
+#[test]
 fn rejects_architecture_and_unknown_flags() {
     let mut bytes = valid_image();
     assert_eq!(

@@ -1,4 +1,4 @@
-//! Deferred-v2 journal access using a fixed zerocopy wire header.
+//! Capability-bound deferred-v3 journal access using a fixed zerocopy wire header.
 //!
 //! The journal is a crash-consistency mechanism, not an authenticity boundary:
 //! its CRC32 guards against torn writes and unrelated memory damage, but any
@@ -42,7 +42,7 @@ const RECORD_MAGIC: u16 = 0xaa55;
 const STATE_VALID: u8 = 0x7f;
 const STATE_DELETED: u8 = 0x00;
 const DEFERRED_MAGIC: u32 = 0x4642_5643;
-const DEFERRED_VERSION: u8 = 2;
+const DEFERRED_VERSION: u8 = 3;
 const HEADER_SIZE: usize = 32;
 const CAPSULE_DESCRIPTOR_SIZE: usize = 16;
 const RESERVATION_CAPSULE_OFFSET: usize = 4096;
@@ -73,7 +73,8 @@ struct DeferredHeader {
     total_size: u32,
     header_crc: u32,
     data_crc: u32,
-    reserved: [u8; 12],
+    features: [u8; 8],
+    reserved: [u8; 4],
 }
 
 impl DeferredHeader {
@@ -86,23 +87,26 @@ impl DeferredHeader {
             total_size: 0,
             header_crc: 0,
             data_crc: 0,
-            reserved: [0; 12],
+            features: crate::RUNTIME_IMAGE_FEATURE_BITS.to_le_bytes(),
+            reserved: [0; 4],
         }
     }
 
     fn header_crc(self) -> u32 {
-        let mut bytes = [0u8; 12];
+        let mut bytes = [0u8; 20];
         bytes[..4].copy_from_slice(&self.magic.to_le_bytes());
         bytes[4] = self.version;
         bytes[5] = self.flags;
         bytes[6..8].copy_from_slice(&self.entry_count.to_le_bytes());
         bytes[8..12].copy_from_slice(&self.total_size.to_le_bytes());
+        bytes[12..].copy_from_slice(&self.features);
         crc32::calculate(&bytes)
     }
 
     fn valid(self) -> bool {
         self.magic == DEFERRED_MAGIC
             && self.version == DEFERRED_VERSION
+            && u64::from_le_bytes(self.features) == crate::RUNTIME_IMAGE_FEATURE_BITS
             && self.header_crc == self.header_crc()
     }
 }
@@ -239,11 +243,10 @@ pub fn prepare_retained(base: *mut u8, size: usize) -> Result<u64, efi::Status> 
     if base.is_null() || size < JOURNAL_OFFSET + HEADER_SIZE || size > u32::MAX as usize {
         return Err(efi::Status::OUT_OF_RESOURCES);
     }
-    write_reservation_capsule(base, size);
-    clear_staged_capsule(base);
     let (journal, journal_size) = journal_range(base, size)?;
     // SAFETY: journal_range proved the fixed header lies in retained memory.
     let header = unsafe { journal.cast::<DeferredHeader>().read_unaligned() };
+    reject_profile_mismatch(header)?;
     if header.magic != DEFERRED_MAGIC || header.version != DEFERRED_VERSION {
         // Journal wire formats are not replay-compatible. Discard entries from
         // older firmware explicitly rather than permanently rejecting retained
@@ -252,7 +255,22 @@ pub fn prepare_retained(base: *mut u8, size: usize) -> Result<u64, efi::Status> 
     } else if !valid_journal(journal, journal_size, header) {
         return Err(efi::Status::DEVICE_ERROR);
     }
+    write_reservation_capsule(base, size);
+    clear_staged_capsule(base);
     Ok(base as u64)
+}
+
+// CRC is local integrity, not authentication. Refuse a different profile before
+// parsing its differently bounded entries or modifying any retained bytes.
+fn reject_profile_mismatch(header: DeferredHeader) -> Result<(), efi::Status> {
+    if header.magic == DEFERRED_MAGIC
+        && header.version == DEFERRED_VERSION
+        && u64::from_le_bytes(header.features) != crate::RUNTIME_IMAGE_FEATURE_BITS
+    {
+        Err(efi::Status::UNSUPPORTED)
+    } else {
+        Ok(())
+    }
 }
 
 fn write_reservation_capsule(base: *mut u8, size: usize) {
@@ -333,6 +351,9 @@ pub fn stage_capsule(
     {
         return Err(efi::Status::INVALID_PARAMETER);
     }
+    let (journal, _) = journal_range(base, size)?;
+    // SAFETY: journal_range checked the complete fixed header.
+    reject_profile_mismatch(unsafe { journal.cast::<DeferredHeader>().read_unaligned() })?;
     let descriptor = scatter_gather_list as *const u64;
     // SAFETY: UpdateCapsule defines scatter_gather_list as a readable physical
     // EFI_CAPSULE_BLOCK_DESCRIPTOR list and this immediate call reads its first
@@ -384,6 +405,19 @@ fn journal_range(base: *mut u8, size: usize) -> Result<(*mut u8, usize), efi::St
     Ok((unsafe { base.add(JOURNAL_OFFSET) }, size - JOURNAL_OFFSET))
 }
 
+/// Check compatibility before the caller stages any live variable transaction.
+pub fn validate_profile(base: *mut u8, size: usize) -> Result<(), efi::Status> {
+    let (journal, _) = journal_range(base, size)?;
+    // SAFETY: journal_range checked the complete fixed header.
+    let header = unsafe { journal.cast::<DeferredHeader>().read_unaligned() };
+    reject_profile_mismatch(header)?;
+    if header.valid() {
+        Ok(())
+    } else {
+        Err(efi::Status::DEVICE_ERROR)
+    }
+}
+
 pub struct DeferredWrite<'a> {
     pub guid: [u8; 16],
     pub name: &'a [u16],
@@ -410,6 +444,12 @@ pub fn queue_write(
         deletion,
     } = write;
     let (base, size) = journal_range(base, size)?;
+    // SAFETY: journal_range checked the complete fixed header.
+    let mut header = unsafe { base.cast::<DeferredHeader>().read_unaligned() };
+    reject_profile_mismatch(header)?;
+    if !valid_journal(base, size, header) {
+        return Err(efi::Status::DEVICE_ERROR);
+    }
     if name.is_empty() || name.len() > MAX_NAME_LEN {
         return Err(efi::Status::INVALID_PARAMETER);
     }
@@ -483,11 +523,6 @@ pub fn queue_write(
         .zip(record.as_bytes())
         .for_each(|(destination, source)| *destination = *source);
 
-    // SAFETY: fixed header lies inside the validated retained journal.
-    let mut header = unsafe { base.cast::<DeferredHeader>().read_unaligned() };
-    if !valid_journal(base, size, header) {
-        return Err(efi::Status::DEVICE_ERROR);
-    }
     let entry_size = core::mem::size_of::<EntryHeader>()
         .checked_add(record_len)
         .ok_or(efi::Status::OUT_OF_RESOURCES)?;
@@ -547,6 +582,7 @@ pub fn replay(
     let (base, size) = journal_range(base, size)?;
     // SAFETY: fixed header lies inside the retained journal.
     let header = unsafe { base.cast::<DeferredHeader>().read_unaligned() };
+    reject_profile_mismatch(header)?;
     if !valid_journal(base, size, header) {
         return Err(efi::Status::DEVICE_ERROR);
     }
@@ -791,6 +827,61 @@ mod tests {
     }
 
     #[test]
+    fn retained_profile_mismatch_preserves_bytes_and_never_replays() {
+        let (mut buffer, _) = queued_fixture();
+        let journal = unsafe {
+            buffer
+                .as_mut_ptr()
+                .add(JOURNAL_OFFSET)
+                .cast::<DeferredHeader>()
+        };
+        let mut header = unsafe { journal.read_unaligned() };
+        header.features = (crate::RUNTIME_IMAGE_FEATURE_BITS
+            ^ crabefi_runtime_abi::feature_bits::SECURE_BOOT)
+            .to_le_bytes();
+        header.header_crc = header.header_crc();
+        unsafe { journal.write_unaligned(header) };
+        let before = buffer.clone();
+        assert_eq!(
+            prepare_retained(buffer.as_mut_ptr(), buffer.len()),
+            Err(efi::Status::UNSUPPORTED)
+        );
+        let mut transaction = DeferredTransaction::new();
+        assert_eq!(
+            replay(
+                buffer.as_mut_ptr(),
+                buffer.len(),
+                &mut transaction,
+                |_, _, _| panic!("mismatched journal replayed")
+            ),
+            Err(efi::Status::UNSUPPORTED)
+        );
+        assert_eq!(
+            validate_profile(buffer.as_mut_ptr(), buffer.len()),
+            Err(efi::Status::UNSUPPORTED)
+        );
+        assert_eq!(
+            queue_write(
+                buffer.as_mut_ptr(),
+                buffer.len(),
+                &mut transaction,
+                DeferredWrite {
+                    guid: [0x42; 16],
+                    name: &[b'X' as u16],
+                    attributes: 7,
+                    data: &[9],
+                    timestamp: VariableTimestamp::default(),
+                    authenticated: false,
+                    deletion: false,
+                }
+            ),
+            Err(efi::Status::UNSUPPORTED)
+        );
+        assert!(transaction.bytes.iter().all(|byte| *byte == 0));
+        assert_eq!(buffer, before);
+    }
+
+    #[test]
     fn retained_reservation_wraps_private_guid_and_marker() {
         let mut buffer = vec![0u8; 64 * 1024];
         prepare_retained(buffer.as_mut_ptr(), buffer.len()).unwrap();
@@ -835,11 +926,15 @@ mod tests {
     }
 
     #[test]
-    fn deferred_v2_round_trip_and_crc_rejection() {
+    fn deferred_v3_round_trip_and_crc_rejection() {
         let (mut buffer, used) = queued_fixture();
         assert_eq!(
             &buffer[JOURNAL_OFFSET..used],
-            include_bytes!("../tests/fixtures/deferred-v2.bin")
+            if cfg!(feature = "secure-boot") {
+                include_bytes!("../tests/fixtures/deferred-v3-full.bin")
+            } else {
+                include_bytes!("../tests/fixtures/deferred-v3-basic.bin")
+            }
         );
         let mut transaction = DeferredTransaction::new();
         let mut seen = false;
@@ -880,6 +975,8 @@ mod tests {
         assert!(!called);
 
         let (mut retained, _) = queued_fixture();
+        // Simulate the next boot's preparation, preserving same-profile records.
+        prepare_retained(retained.as_mut_ptr(), retained.len()).unwrap();
         assert_eq!(
             replay(
                 retained.as_mut_ptr(),
