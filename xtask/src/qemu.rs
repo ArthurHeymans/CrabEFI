@@ -779,13 +779,10 @@ fn capture_when_ready(
 /// Run integration tests in QEMU
 pub fn run_tests(config: &QemuConfig, disk_path: &Path, app_name: &str) -> Result<()> {
     RUNTIME_IMAGE_TWO_BOOT.store(app_name == "runtime-image-test", Ordering::Relaxed);
-    WRITABLE_TEST_FLASH.store(
-        matches!(
-            app_name,
-            "capsule-test" | "runtime-image-test" | "secure-boot-test"
-        ),
-        Ordering::Relaxed,
-    );
+    // Every x86 integration run advertises SMMSTORE to the payload. Boot it
+    // from writable snapshot pflash so variable persistence can initialize
+    // without mutating the checked-in ROM.
+    WRITABLE_TEST_FLASH.store(true, Ordering::Relaxed);
     println!(
         "=== CrabEFI Integration Tests ({}, {:?}) ===\n",
         app_name, config.arch
