@@ -63,6 +63,9 @@ const MENU_TITLE: &str = "CrabEFI Boot Menu";
 /// Help text
 #[cfg(feature = "secure-boot")]
 const HELP_TEXT: &str = "Enter: Boot | F: Firmware | C: Cmdline | S: Secure Boot | R: Reset";
+/// Help text without the Secure Boot entry.
+#[cfg(not(feature = "secure-boot"))]
+const HELP_TEXT: &str = "Enter: Boot | F: Firmware | C: Cmdline | R: Reset";
 
 /// Re-export storage device type for backward compatibility
 pub type DeviceType = StorageType;
@@ -1845,6 +1848,3 @@ fn draw_cmdline_editor_line(
         console.reset_colors();
     }
 }
-
-#[cfg(not(feature = "secure-boot"))]
-const HELP_TEXT: &str = "Enter: Boot | F: Firmware | C: Cmdline | R: Reset";

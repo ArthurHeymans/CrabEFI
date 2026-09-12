@@ -71,13 +71,17 @@ pub use crabefi_runtime_abi::{
 };
 pub use platform::{
     BlockDevice, BlockDeviceInfo, BlockError, BootResult, CapsuleBackend, CapsuleRegion,
-    ConsoleInput, DebugOutput, DeferredBufferConfig, FirmwareInfo, FirmwareMmapWindow,
-    FirmwareStorage, FirmwareStorageLocation, FirmwareStorageRegion, FmapRegion, FramebufferConfig,
+    ConsoleInput, DebugOutput, DeferredBufferConfig, FirmwareInfo, FmapRegion, FramebufferConfig,
     Key, KeyState, MemoryRegion, MemoryType, PciEcamRegion, PlatformConfig, PlatformConfigBuilder,
     PlatformHooks, ResetHandler, ResetType, Rng, RngError, RuntimeImageSource,
     RuntimePlatformConfig, StorageBackend, StorageError, Timer, TimestampRecorder, Tpm2Device,
     Tpm2DeviceConfig, TpmDigest, TpmError, TpmEventLogConfig, TpmLogFormat, TpmPcrBanks,
-    VariableStorage, VariableStoreLocator, VariableStoreRegion,
+    VariableStorage,
+};
+#[cfg(feature = "spi-flash")]
+pub use platform::{
+    FirmwareMmapWindow, FirmwareStorage, FirmwareStorageLocation, FirmwareStorageRegion,
+    VariableStoreLocator, VariableStoreRegion,
 };
 
 /// Display a Secure Boot violation error on screen
@@ -196,27 +200,19 @@ fn init_persistence_and_boot(
             variable_storage,
         )
     };
-    let storage_requested = !matches!(&variable_storage, platform::VariableStorage::None);
-    #[cfg(feature = "variable-store")]
-    let host_storage_required = matches!(&variable_storage, platform::VariableStorage::Platform(_));
-    #[cfg(not(feature = "variable-store"))]
-    let host_storage_required = false;
+    // A configured but unusable store (corrupted contents, protected media,
+    // I/O errors) never halts the boot: log the failure and continue with
+    // volatile variables.
     let persistence_available = match efi::varstore::init_persistence(variable_storage) {
         Ok(()) => {
             log::info!("Variable store persistence initialized");
             true
         }
-        Err(e)
-            if host_storage_required
-                || (storage_requested && e != efi::varstore::VarStoreError::NotInitialized) =>
-        {
-            panic!(
-                "Configured variable storage failed to initialize (no volatile fallback): {:?}",
+        Err(e) => {
+            log::error!(
+                "Variable persistence unavailable ({:?}); variables will be volatile",
                 e
             );
-        }
-        Err(e) => {
-            log::info!("Variable persistence not available: {:?}", e);
             false
         }
     };

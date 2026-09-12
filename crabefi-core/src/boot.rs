@@ -31,6 +31,30 @@ use crate::menu;
 #[cfg(feature = "tpm")]
 static GPT_MEASURED: AtomicBool = AtomicBool::new(false);
 
+/// Measure the GPT header and non-empty partition entries into PCR 5, once per
+/// boot, per the TCG PC Client PFP EFI_GPT_DATA event format. Without the `tpm`
+/// capability this is a no-op; the caller still reuses the detected layout for
+/// the partition scan.
+#[cfg(feature = "tpm")]
+fn measure_gpt_once(disk: &mut dyn BlockDevice, header: &fs::gpt::GptHeader, is_hybrid: bool) {
+    if let Ok(event_data) = fs::gpt::build_gpt_measurement_event_with(disk, header, is_hybrid)
+        && !GPT_MEASURED.swap(true, Ordering::Relaxed)
+    {
+        // EDK2 measures EV_EFI_GPT_EVENT once per boot, not once per boot attempt.
+        efi::tcg::measured_boot::measure_event_all(
+            5,
+            efi::tcg::types::EV_EFI_GPT_EVENT,
+            &event_data,
+            &event_data,
+            "GPT partition table",
+        );
+    }
+}
+
+/// Without `tpm` there is nothing to measure.
+#[cfg(not(feature = "tpm"))]
+fn measure_gpt_once(_disk: &mut dyn BlockDevice, _header: &fs::gpt::GptHeader, _is_hybrid: bool) {}
+
 /// Install BlockIO and DevicePath protocols for a disk and all its GPT partitions
 ///
 /// This replaces the four `install_block_io_for_{usb,nvme,ahci,sdhci}_disk` functions.
@@ -98,21 +122,8 @@ pub fn install_block_io_protocols(
         fs::gpt::read_partitions_with(disk, &header, is_hybrid).map(|p| (header, is_hybrid, p))
     });
     let partitions = match gpt_scan {
-        Ok((_header, _is_hybrid, partitions)) => {
-            #[cfg(feature = "tpm")]
-            if let Ok(event_data) =
-                fs::gpt::build_gpt_measurement_event_with(disk, &_header, _is_hybrid)
-                && !GPT_MEASURED.swap(true, Ordering::Relaxed)
-            {
-                // EDK2 measures EV_EFI_GPT_EVENT once per boot, not once per boot attempt.
-                efi::tcg::measured_boot::measure_event_all(
-                    5,
-                    efi::tcg::types::EV_EFI_GPT_EVENT,
-                    &event_data,
-                    &event_data,
-                    "GPT partition table",
-                );
-            }
+        Ok((header, is_hybrid, partitions)) => {
+            measure_gpt_once(disk, &header, is_hybrid);
             partitions
         }
         Err(error) => {

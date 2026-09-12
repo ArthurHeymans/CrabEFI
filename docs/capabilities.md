@@ -105,8 +105,9 @@ not blank. Invalid non-erased headers/checksums/partial formats return
 `InvalidHeader` unchanged. Read failures and protected/unknown protection states
 never authorize formatting. Valid existing stores mount normally. Selecting SPI
 is not permission to reset corrupted storage; there is no automatic factory
-reset or destructive-format opt-in. Configured bounded-backend mount failures
-stop boot rather than silently selecting volatile storage. An explicitly absent
+reset or destructive-format opt-in. A configured backend whose mount fails
+(corruption, protection or I/O errors) is logged and boot continues with
+volatile variables; it never halts the platform. An explicitly absent
 backend (or unavailable optional standalone SPI transport) remains distinct.
 This approved initialization policy does not select an OS NV persistence policy.
 
@@ -139,7 +140,12 @@ zero base and size together: the loader/ABI accept absence, reserve/map nothing,
 and SVAM never translates address zero. Mixed-zero, overflow, alignment and
 range-overlap failures remain errors. Disabled post-EBS NV writes (including
 deletion) and capsule requests return `UNSUPPORTED` before staging or variable
-mutation. Existing-variable reads, volatile writes, time/reset and SVAM remain
+mutation. Capsule service availability depends only on the retained-buffer
+configuration; ESRT contents are a discovery table and never disable it.
+`QueryVariableInfo` still answers from the runtime RAM store when staging is
+disabled: volatile writes remain possible there and `SetVariable` stays the
+authority on NV failures. Existing-variable reads, volatile writes, time/reset
+and SVAM remain
 available; active boot-time NV backends still perform real writes. Disabling the
 retained journal is **not** native runtime persistence, and is independent of
 Secure Boot and of fstart's final runtime-persistence policy. Full coreboot keeps
