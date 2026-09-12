@@ -230,11 +230,19 @@ fn init_persistence_and_boot(
         if persistence_writable && retained_staging {
             match runtime.prepare_retained_staging() {
                 Ok(()) => {
-                    capsule_delivery_usable = supports_capsule_delivery(
+                    let boot_consumer_ready = supports_capsule_delivery(
                         persistence_writable,
                         true,
                         capsule_backend_available,
                     );
+                    if boot_consumer_ready {
+                        match runtime.enable_capsule_delivery() {
+                            Ok(()) => capsule_delivery_usable = true,
+                            Err(status) => {
+                                log::warn!("Runtime capsule delivery setup failed: {:?}", status)
+                            }
+                        }
+                    }
                 }
                 Err(status) => {
                     log::warn!("Runtime image retained staging setup failed: {:?}", status)

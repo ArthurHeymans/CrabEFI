@@ -814,10 +814,13 @@ pub extern "efiapi" fn update_capsule(
     }
 }
 
-/// Capsule staging needs only retained storage; ESRT contents are a discovery
-/// table and never disable the runtime service.
+/// Capsule staging requires retained storage and boot-time confirmation that
+/// the platform can apply capsules and persist their results. ESRT contents are
+/// discovery data and never control the runtime service.
 fn capsule_delivery_available(runtime: &state::RuntimeState) -> bool {
-    runtime.deferred_buffer_size != 0 && runtime.deferred_buffer_physical != 0
+    runtime.capsule_delivery_enabled
+        && runtime.deferred_buffer_size != 0
+        && runtime.deferred_buffer_physical != 0
 }
 
 pub extern "efiapi" fn query_capsule_capabilities(
@@ -1473,9 +1476,11 @@ mod tests {
             let saved = (
                 runtime.deferred_buffer_physical,
                 runtime.deferred_buffer_size,
+                runtime.capsule_delivery_enabled,
             );
             runtime.deferred_buffer_physical = 0x30_0000;
             runtime.deferred_buffer_size = 0x1_0000;
+            runtime.capsule_delivery_enabled = true;
             saved
         };
         let header = efi::CapsuleHeader {
@@ -1534,6 +1539,7 @@ mod tests {
         (
             runtime.deferred_buffer_physical,
             runtime.deferred_buffer_size,
+            runtime.capsule_delivery_enabled,
         ) = saved;
     }
 

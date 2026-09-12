@@ -222,6 +222,10 @@ pub extern "C" fn runtime_image_finish_import(operation: u32) -> usize {
             lease.state_mut().import_finished = true;
             efi::Status::SUCCESS.as_usize()
         }
+        crabefi_runtime_abi::finish_import_operation::ENABLE_CAPSULE_DELIVERY => {
+            lease.state_mut().capsule_delivery_enabled = true;
+            efi::Status::SUCCESS.as_usize()
+        }
         _ => efi::Status::INVALID_PARAMETER.as_usize(),
     }
 }
