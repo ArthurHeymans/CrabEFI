@@ -19,7 +19,9 @@ secure-boot = ["pkcs7", "crabefi-runtime-bundle?/secure-boot"]
 # Signed firmware capsule application requires durable result persistence.
 capsule-update = ["pkcs7", "variable-store"]
 # Shared verification implementation, not a runtime policy switch.
-pkcs7 = ["sha2/oid", "dep:sha1", "dep:rsa", "dep:x509-cert", "dep:der", "dep:const-oid", "dep:signature", "dep:cms"]
+# CMS/X.509 parsing is hand-rolled on the minimal `asn1` crate; only RSA,
+# hashing, and signature traits come from RustCrypto.
+pkcs7 = ["sha2/oid", "dep:sha1", "dep:rsa", "dep:signature", "dep:asn1"]
 # Preserve the standalone payload's existing non-graphical capabilities explicitly.
 full = ["tpm", "xhci", "spi-flash", "secure-boot", "capsule-update"]
 # Direct flash variable persistence; omitted when the host provides no flash store.
@@ -73,16 +75,15 @@ rflasher-internal = { optional = true, git = "https://github.com/ArthurHeymans/r
 ] }
 
 # RustCrypto crates for UEFI Secure Boot authentication (all no_std compatible)
-sha1 = { optional = true, version = "0.10", default-features = false, features = ["force-soft"] }
-sha2 = { version = "0.10", default-features = false, features = [
-  "force-soft",
+sha1 = { optional = true, version = "0.11", default-features = false }
+sha2 = { version = "0.11", default-features = false }
+rsa = { optional = true, version = "=0.10.0-rc.18", default-features = false, features = [
+  "encoding",
 ] }
-rsa = { optional = true, version = "0.9", default-features = false }
-x509-cert = { optional = true, version = "0.3", default-features = false }
-der = { optional = true, version = "0.8", default-features = false }
-const-oid = { optional = true, version = "0.10", default-features = false }
+# Minimal DER parser for CMS/X.509 verification (no_std via
+# no-default-features). Replaces the cms/x509-cert/der framework.
+asn1 = { optional = true, version = "0.24", default-features = false }
 signature = { optional = true, version = "3.0", default-features = false }
-cms = { optional = true, version = "=0.3.0-pre.2", default-features = false }
 
 [target.'cfg(target_arch = "x86_64")'.dependencies]
 x86_64 = "0.15"
