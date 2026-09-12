@@ -236,6 +236,7 @@ pub enum StorageError {
 }
 
 /// Byte range within a firmware storage device.
+#[cfg(feature = "spi-flash")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FirmwareStorageRegion {
     /// Absolute byte offset from the start of the firmware storage device.
@@ -245,6 +246,7 @@ pub struct FirmwareStorageRegion {
 }
 
 /// CPU-visible mapping window for a firmware storage device.
+#[cfg(feature = "spi-flash")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FirmwareMmapWindow {
     /// Physical address where this storage window is visible to the CPU.
@@ -256,6 +258,7 @@ pub struct FirmwareMmapWindow {
 }
 
 /// Platform-described firmware storage location.
+#[cfg(feature = "spi-flash")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FirmwareStorageLocation {
     /// The platform already described the region as a firmware-storage offset.
@@ -283,6 +286,7 @@ pub enum FirmwareStorageLocation {
 /// offsets. Platforms that describe regions by CPU-visible memory mappings can
 /// expose generic mmap windows or override [`resolve_mapped_region()`](Self::resolve_mapped_region)
 /// to translate those physical addresses into storage offsets.
+#[cfg(feature = "spi-flash")]
 pub trait FirmwareStorage {
     /// Backend name for logging.
     fn name(&self) -> &str;
@@ -359,6 +363,7 @@ pub trait FirmwareStorage {
 }
 
 /// A located variable-store region in firmware storage.
+#[cfg(feature = "spi-flash")]
 #[derive(Debug, Clone)]
 pub struct VariableStoreRegion {
     /// Region name for logging, for example `SMMSTORE`.
@@ -367,6 +372,7 @@ pub struct VariableStoreRegion {
     pub location: FirmwareStorageLocation,
 }
 
+#[cfg(feature = "spi-flash")]
 impl VariableStoreRegion {
     /// Create an offset-addressed variable-store region descriptor.
     ///
@@ -440,6 +446,7 @@ impl VariableStoreRegion {
 /// SMMSTORE table records and FMAP; other integrations can use device-tree
 /// properties, fixed board configuration, SMM, or any other platform-specific
 /// mechanism.
+#[cfg(feature = "spi-flash")]
 pub trait VariableStoreLocator {
     /// Locate the persistent EFI variable-store region.
     ///

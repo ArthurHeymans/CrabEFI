@@ -814,11 +814,10 @@ pub extern "efiapi" fn update_capsule(
     }
 }
 
+/// Capsule staging needs only retained storage; ESRT contents are a discovery
+/// table and never disable the runtime service.
 fn capsule_delivery_available(runtime: &state::RuntimeState) -> bool {
-    runtime.deferred_buffer_size != 0
-        && runtime.deferred_buffer_physical != 0
-        && runtime.tables.esrt.header.resource_count != 0
-        && runtime.tables.esrt.entry.capsule_flags & CAPSULE_FLAGS_PERSIST_ACROSS_RESET != 0
+    runtime.deferred_buffer_size != 0 && runtime.deferred_buffer_physical != 0
 }
 
 pub extern "efiapi" fn query_capsule_capabilities(
@@ -895,9 +894,8 @@ pub extern "efiapi" fn query_variable_info(
         Ok(lease) => lease,
         Err(status) => return status,
     };
-    if state::phase_value() != phase::BOOT_ACTIVE && lease.state().deferred_buffer_size == 0 {
-        return efi::Status::UNSUPPORTED;
-    }
+    // Without retained staging the RAM store still answers: volatile writes
+    // remain possible and SetVariable stays the authority on NV failures.
     // SAFETY: all required outputs were checked non-null.
     unsafe {
         maximum_variable_storage_size.write(crate::store::VariableStore::maximum_storage());
@@ -1475,13 +1473,9 @@ mod tests {
             let saved = (
                 runtime.deferred_buffer_physical,
                 runtime.deferred_buffer_size,
-                runtime.tables.esrt.header.resource_count,
-                runtime.tables.esrt.entry.capsule_flags,
             );
             runtime.deferred_buffer_physical = 0x30_0000;
             runtime.deferred_buffer_size = 0x1_0000;
-            runtime.tables.esrt.header.resource_count = 1;
-            runtime.tables.esrt.entry.capsule_flags = CAPSULE_FLAGS_PERSIST_ACROSS_RESET;
             saved
         };
         let header = efi::CapsuleHeader {
@@ -1540,8 +1534,6 @@ mod tests {
         (
             runtime.deferred_buffer_physical,
             runtime.deferred_buffer_size,
-            runtime.tables.esrt.header.resource_count,
-            runtime.tables.esrt.entry.capsule_flags,
         ) = saved;
     }
 
