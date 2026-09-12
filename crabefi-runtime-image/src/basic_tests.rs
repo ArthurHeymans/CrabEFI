@@ -2,13 +2,25 @@
 
 use crate::{
     efi,
-    services::apply_variable,
+    services::{apply_variable, capsule_delivery_available},
+    state::RuntimeState,
     store::{VariableStore, VariableTransaction},
 };
 use crabefi_efi_types::secure_boot;
 use crabefi_runtime_abi::phase;
 
 const ATTRIBUTES: u32 = efi::VARIABLE_BOOTSERVICE_ACCESS | efi::VARIABLE_RUNTIME_ACCESS;
+
+#[test]
+fn capsule_delivery_requires_boot_consumer_enablement() {
+    let mut runtime = RuntimeState::new();
+    runtime.deferred_buffer_physical = 0x1000;
+    runtime.deferred_buffer_size = 0x1000;
+    assert!(!capsule_delivery_available(&runtime));
+
+    runtime.capsule_delivery_enabled = true;
+    assert!(capsule_delivery_available(&runtime));
+}
 
 #[test]
 fn ordinary_variables_work_at_boot_and_runtime_without_authentication() {

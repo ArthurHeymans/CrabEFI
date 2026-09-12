@@ -95,6 +95,7 @@ pub struct RuntimeState {
     pub deferred_buffer_physical: u64,
     pub deferred_buffer_virtual: u64,
     pub deferred_buffer_size: usize,
+    pub capsule_delivery_enabled: bool,
     pub initialized: bool,
     pub import_finished: bool,
 }
@@ -126,6 +127,7 @@ impl RuntimeState {
             deferred_buffer_physical: 0,
             deferred_buffer_virtual: 0,
             deferred_buffer_size: 0,
+            capsule_delivery_enabled: false,
             initialized: false,
             import_finished: false,
         }

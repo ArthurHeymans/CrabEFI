@@ -140,8 +140,9 @@ zero base and size together: the loader/ABI accept absence, reserve/map nothing,
 and SVAM never translates address zero. Mixed-zero, overflow, alignment and
 range-overlap failures remain errors. Disabled post-EBS NV writes (including
 deletion) and capsule requests return `UNSUPPORTED` before staging or variable
-mutation. Capsule service availability depends only on the retained-buffer
-configuration; ESRT contents are a discovery table and never disable it.
+mutation. Capsule service availability requires a configured retained buffer,
+writable variable persistence for result recording, and a boot-time capsule
+backend; ESRT contents are a discovery table and never disable it.
 `QueryVariableInfo` still answers from the runtime RAM store when staging is
 disabled: volatile writes remain possible there and `SetVariable` stays the
 authority on NV failures. Existing-variable reads, volatile writes, time/reset

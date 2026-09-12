@@ -139,6 +139,12 @@ impl RuntimeImageClient {
         ))
     }
 
+    pub fn enable_capsule_delivery(&self) -> Result<(), Status> {
+        status_result((self.exports.finish_import)(
+            crabefi_runtime_abi::finish_import_operation::ENABLE_CAPSULE_DELIVERY,
+        ))
+    }
+
     pub fn finish_import(&self) -> Result<(), Status> {
         status_result((self.exports.finish_import)(
             crabefi_runtime_abi::finish_import_operation::COMPLETE_IMPORT,

@@ -49,6 +49,8 @@ pub mod finish_import_operation {
     pub const REPLAY_DEFERRED: u32 = 2;
     /// Derive final policy and reject all subsequent boot imports.
     pub const COMPLETE_IMPORT: u32 = 3;
+    /// Confirm that boot can consume staged capsules and persist their results.
+    pub const ENABLE_CAPSULE_DELIVERY: u32 = 4;
 }
 
 /// UEFI memory descriptor shared by the boot allocator and runtime-image ABI.
