@@ -973,11 +973,11 @@ unsafe extern "C" fn install_multiple_protocol_interfaces_c(
         Err(status) => return status,
     }
     loop {
-        let protocol: *mut c_void = unsafe { arguments.arg() };
+        let protocol: *mut c_void = unsafe { arguments.next_arg() };
         if protocol.is_null() {
             break;
         }
-        let interface: *mut c_void = unsafe { arguments.arg() };
+        let interface: *mut c_void = unsafe { arguments.next_arg() };
         if let Err(status) = collect_protocol_pair(&mut pairs, protocol, interface) {
             return status;
         }
@@ -999,11 +999,11 @@ unsafe extern "C" fn uninstall_multiple_protocol_interfaces_c(
         Err(status) => return status,
     }
     loop {
-        let protocol: *mut c_void = unsafe { arguments.arg() };
+        let protocol: *mut c_void = unsafe { arguments.next_arg() };
         if protocol.is_null() {
             break;
         }
-        let interface: *mut c_void = unsafe { arguments.arg() };
+        let interface: *mut c_void = unsafe { arguments.next_arg() };
         if let Err(status) = collect_protocol_pair(&mut pairs, protocol, interface) {
             return status;
         }
