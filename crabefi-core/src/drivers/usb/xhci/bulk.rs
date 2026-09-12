@@ -355,8 +355,9 @@ impl super::XhciController {
             barrier::mmio_write();
             self.ring_doorbell(slot_id, dci as u8);
 
-            // Error paths retain the allocation: a timeout or failed recovery
-            // does not prove that the controller has stopped referencing it.
+            // Error completions halt the endpoint, but recovery must also skip
+            // the old TD before a later doorbell can resume it. Release the
+            // buffer only after recovery confirms that it is no longer reachable.
             match self.wait_transfer_td(slot_id, ep, td) {
                 Ok(residual) => {
                     bounce
@@ -377,39 +378,40 @@ impl super::XhciController {
                         return Ok(transferred_total);
                     }
                 }
-                Err(XhciError::StallError) => {
-                    core::mem::forget(bounce);
-                    log::debug!(
-                        "xHCI: Bulk transfer stalled on slot={} dci={}, resetting endpoint",
-                        slot_id,
-                        dci
-                    );
-                    if let Err(e) = self.reset_endpoint(slot_id, dci as u8) {
-                        log::warn!("xHCI: Failed to reset endpoint after stall: {:?}", e);
-                    }
-                    return Err(XhciError::StallError);
-                }
-                Err(XhciError::TransferFailed(Ok(
-                    cc @ (event::CompletionCode::BabbleDetectedError
-                    | event::CompletionCode::UsbTransactionError),
-                ))) => {
-                    core::mem::forget(bounce);
+                Err(
+                    error @ (XhciError::StallError
+                    | XhciError::TransferFailed(Ok(
+                        event::CompletionCode::BabbleDetectedError
+                        | event::CompletionCode::UsbTransactionError,
+                    ))),
+                ) => {
                     log::debug!(
                         "xHCI: Bulk transfer failed with {:?} on slot={} dci={}, resetting endpoint",
-                        cc,
+                        error,
                         slot_id,
                         dci
                     );
-                    if let Err(e) = self.reset_endpoint(slot_id, dci as u8) {
-                        log::warn!(
-                            "xHCI: Failed to reset endpoint after completion code {:?}: {:?}",
-                            cc,
-                            e
-                        );
+                    if let Err(recovery) = self.reset_endpoint(slot_id, dci as u8) {
+                        log::warn!("xHCI: Failed to recover bulk endpoint: {:?}", recovery);
+                        // Reset may have succeeded while Set TR Dequeue failed.
+                        // Keep the old buffer mapped and prevent future doorbells
+                        // from restarting the endpoint at that old TD.
+                        core::mem::forget(bounce);
+                        if let Some(slot) = self
+                            .slots
+                            .get_mut(slot_id as usize)
+                            .and_then(Option::as_mut)
+                        {
+                            slot.transfer_rings[dci - 1] = None;
+                        }
+                    } else if let Err(sync) = bounce.sync_for_cpu(0..bounce.len(), direction) {
+                        log::warn!("xHCI: Failed to reclaim bulk DMA ownership: {:?}", sync);
                     }
-                    return Err(XhciError::TransferFailed(Ok(cc)));
+                    return Err(error);
                 }
                 Err(e) => {
+                    // Timeout or an unrecovered error: the controller may still
+                    // own the TD, so retain the DMA mapping rather than free it.
                     core::mem::forget(bounce);
                     return Err(e);
                 }
