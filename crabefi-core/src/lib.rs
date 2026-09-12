@@ -5,6 +5,9 @@
 
 #![no_std]
 #![cfg_attr(target_arch = "x86_64", feature(abi_x86_interrupt))]
+// C-variadic protocol-install shims only exist off x86_64; keep the
+// unstable gate off x86_64 so it never goes stale there unnoticed.
+#![cfg_attr(not(target_arch = "x86_64"), feature(c_variadic))]
 #![deny(unsafe_op_in_unsafe_fn)]
 
 // Enable alloc crate for heap allocations (needed for RustCrypto)
