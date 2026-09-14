@@ -31,7 +31,7 @@ repository = "https://github.com/user/CrabEFI"
 [workspace.dependencies]
 crabefi-efi-types = { path = "crabefi-efi-types" }
 crabefi-runtime-bundle = { path = "crabefi-runtime-bundle" }
-r-efi = "5.3"
+r-efi = "7.1"
 log = "0.4"
 heapless = "0.9"
 mem-barrier = "0.1"
