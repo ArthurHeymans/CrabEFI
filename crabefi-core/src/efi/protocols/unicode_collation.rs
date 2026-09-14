@@ -342,3 +342,31 @@ extern "efiapi" fn str_to_fat(
 
     has_illegal
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn protocol_versions_have_distinct_interfaces_and_language_formats() {
+        let v1 = get_protocol();
+        let v2 = get_protocol2();
+
+        assert!(!v1.is_null());
+        assert!(!v2.is_null());
+        assert_ne!(v1, v2);
+
+        // SAFETY: Both pointers refer to static protocol instances whose
+        // supported-language fields point to static NUL-terminated arrays.
+        unsafe {
+            assert_eq!(
+                core::slice::from_raw_parts((*v1).supported_languages.cast::<u8>(), 4),
+                b"eng\0"
+            );
+            assert_eq!(
+                core::slice::from_raw_parts((*v2).supported_languages.cast::<u8>(), 6),
+                b"en-US\0"
+            );
+        }
+    }
+}
