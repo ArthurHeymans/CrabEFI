@@ -4,17 +4,12 @@
 //! to query information about themselves (base address, size, etc.).
 
 use core::ffi::c_void;
-use r_efi::efi::{Guid, Handle, Status, SystemTable};
+use r_efi::efi::{Guid, Handle, SystemTable};
 use r_efi::protocols::device_path::Protocol as DevicePathProtocol;
 use r_efi::protocols::loaded_image;
 
 /// Re-export the GUID for external use
 pub const LOADED_IMAGE_PROTOCOL_GUID: Guid = loaded_image::PROTOCOL_GUID;
-
-/// Unload callback - not supported
-extern "efiapi" fn unload_image(_image_handle: Handle) -> Status {
-    Status::UNSUPPORTED
-}
 
 /// Create a new Loaded Image Protocol instance for a loaded EFI application
 ///
@@ -51,7 +46,10 @@ pub fn create_loaded_image_protocol(
         p.image_size = image_size;
         p.image_code_type = r_efi::efi::LOADER_CODE;
         p.image_data_type = r_efi::efi::LOADER_DATA;
-        p.unload = Some(unload_image);
+        // Images are resident unless they explicitly install their own unload
+        // handler. A successful firmware-provided default would let callers
+        // free driver code that never opted into unloading.
+        p.unload = None;
     });
     if ptr.is_null() {
         return ptr;
