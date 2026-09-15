@@ -233,8 +233,24 @@ pub fn prepare_boot_params(
     // Copy the setup header from the bzImage
     params.hdr = bzimage.header;
 
-    // Set memory map
-    params.set_memory_map(memory_regions);
+    // Direct Linux boot bypasses EFI GetMemoryMap(), so use the allocator's
+    // effective map rather than the original platform map. The allocator map
+    // contains ACPI table retyping and all firmware reservations made during
+    // CrabEFI initialization.
+    let mut descriptors = [crate::efi::allocator::MemoryDescriptor::default(); 128];
+    match crate::efi::allocator::copy_descriptors(&mut descriptors) {
+        Ok(count) => {
+            params.set_efi_memory_map(&descriptors[..count]);
+            log::info!("Direct Linux E820 map built from {} EFI descriptors", count);
+        }
+        Err(status) => {
+            log::warn!(
+                "Unable to snapshot EFI memory map ({:?}); using platform map",
+                status
+            );
+            params.set_memory_map(memory_regions);
+        }
+    }
 
     // Set ACPI RSDP if available
     if let Some(rsdp) = acpi_rsdp {

@@ -7,6 +7,7 @@
 
 use core::mem;
 
+use crate::efi::allocator::{MemoryDescriptor, MemoryType as EfiMemoryType};
 use crate::platform::{MemoryRegion, MemoryType};
 
 /// E820 memory map entry (20 bytes)
@@ -64,6 +65,29 @@ impl From<&MemoryRegion> for E820Entry {
         Self {
             addr: region.base,
             size: region.size,
+            entry_type,
+        }
+    }
+}
+
+impl From<&MemoryDescriptor> for E820Entry {
+    fn from(descriptor: &MemoryDescriptor) -> Self {
+        let entry_type = match EfiMemoryType::try_from(descriptor.memory_type) {
+            Ok(
+                EfiMemoryType::LoaderCode
+                | EfiMemoryType::LoaderData
+                | EfiMemoryType::BootServicesCode
+                | EfiMemoryType::BootServicesData
+                | EfiMemoryType::ConventionalMemory,
+            ) => E820Entry::RAM_TYPE,
+            Ok(EfiMemoryType::AcpiReclaimMemory) => E820Entry::ACPI_RECLAIMABLE_TYPE,
+            Ok(EfiMemoryType::AcpiMemoryNvs) => E820Entry::ACPI_NVS_TYPE,
+            _ => E820Entry::RESERVED_TYPE,
+        };
+
+        Self {
+            addr: descriptor.physical_start,
+            size: descriptor.number_of_pages.saturating_mul(4096),
             entry_type,
         }
     }
@@ -405,6 +429,15 @@ impl BootParams {
 
         for (i, region) in regions.iter().take(count).enumerate() {
             self.e820_table[i] = E820Entry::from(region);
+        }
+    }
+
+    pub fn set_efi_memory_map(&mut self, descriptors: &[MemoryDescriptor]) {
+        let count = descriptors.len().min(128);
+        self.e820_entries = count as u8;
+
+        for (i, descriptor) in descriptors.iter().take(count).enumerate() {
+            self.e820_table[i] = E820Entry::from(descriptor);
         }
     }
 
