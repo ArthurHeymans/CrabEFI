@@ -660,39 +660,62 @@ fn extract_message_digest_from_attrs(content: &[u8]) -> Result<Option<Vec<u8>>, 
 
 /// Extract the digest OCTET STRING from SpcIndirectDataContent bytes.
 ///
-/// Accepts both the OCTET STRING-wrapped and directly-encoded forms,
-/// matching previous behavior.
+/// Accepts every encoding the previous implementation handled:
+/// - an OCTET STRING wrapping the SpcIndirectDataContent DER,
+/// - the full SpcIndirectDataContent SEQUENCE TLV,
+/// - the bare SpcIndirectDataContent content bytes, which is what
+///   [`SignedDataView::econtent_hash_input`] yields for a directly-encoded
+///   (non-OCTET-STRING-wrapped) Authenticode eContent.
 pub fn extract_spc_digest(spc_der: &[u8]) -> Result<Vec<u8>, AuthError> {
-    // If wrapped in OCTET STRING, unwrap to the inner DER first.
-    let inner = asn1::parse(
-        spc_der,
+    let (first, rest) = asn1::strip_tlv(spc_der).map_err(|_| AuthError::InvalidHeader)?;
+    let first_tag = first.tag().as_u8().ok_or(AuthError::InvalidHeader)?;
+    let children = if first_tag == TAG_OCTET_STRING {
+        // Wrapped form: the OCTET STRING spans the whole input and its
+        // content is exactly the full SEQUENCE TLV.
+        if !rest.is_empty() {
+            return Err(AuthError::InvalidHeader);
+        }
+        let (inner, inner_rest) =
+            asn1::strip_tlv(first.data()).map_err(|_| AuthError::InvalidHeader)?;
+        if !inner_rest.is_empty() {
+            return Err(AuthError::InvalidHeader);
+        }
+        spc_sequence_children(&inner)?
+    } else if rest.is_empty() {
+        // Full SpcIndirectDataContent TLV: the children are inside it.
+        spc_sequence_children(&first)?
+    } else {
+        // Directly-encoded eContent: the input already is the concatenated
+        // children (SpcAttributeTypeAndOptionalValue, DigestInfo).
+        spc_der
+    };
+    parse_spc_children(children)
+}
+
+fn spc_sequence_children<'a>(tlv: &asn1::Tlv<'a>) -> Result<&'a [u8], AuthError> {
+    if tlv.tag().as_u8() != Some(TAG_SEQUENCE) {
+        return Err(AuthError::InvalidHeader);
+    }
+    Ok(tlv.data())
+}
+
+/// Parse SpcIndirectDataContent content bytes: skip
+/// SpcAttributeTypeAndOptionalValue, then DigestInfo { alg, digest }.
+fn parse_spc_children(children: &[u8]) -> Result<Vec<u8>, AuthError> {
+    asn1::parse(
+        children,
         |p: &mut asn1::Parser<'_>| -> Result<_, AuthError> {
-            if p.peek_tag()
-                .is_some_and(|t| t.as_u8() == Some(TAG_OCTET_STRING))
-            {
-                Ok(p.read_element::<&[u8]>()?)
-            } else {
-                // Direct encoding: the whole input is the content.
-                Ok(spc_der)
-            }
+            // SpcAttributeTypeAndOptionalValue (skipped).
+            let _data = p.read_element::<asn1::Tlv>()?;
+            // DigestInfo SEQUENCE { alg (skip), digest OCTET STRING }.
+            p.read_element::<asn1::Sequence>()?.parse(
+                |p: &mut asn1::Parser<'_>| -> Result<_, AuthError> {
+                    let _alg = p.read_element::<asn1::Tlv>()?;
+                    Ok(p.read_element::<&[u8]>()?.to_vec())
+                },
+            )
         },
     )
-    .map_err(|_| AuthError::InvalidHeader)?;
-    asn1::parse(inner, |p: &mut asn1::Parser<'_>| -> Result<_, AuthError> {
-        p.read_element::<asn1::Sequence>()?.parse(
-            |p: &mut asn1::Parser<'_>| -> Result<_, AuthError> {
-                // Skip SpcAttributeTypeAndOptionalValue.
-                let _data = p.read_element::<asn1::Tlv>()?;
-                // DigestInfo SEQUENCE { alg (skip), digest OCTET STRING }.
-                p.read_element::<asn1::Sequence>()?.parse(
-                    |p: &mut asn1::Parser<'_>| -> Result<_, AuthError> {
-                        let _alg = p.read_element::<asn1::Tlv>()?;
-                        Ok(p.read_element::<&[u8]>()?.to_vec())
-                    },
-                )
-            },
-        )
-    })
     .map_err(|_| AuthError::InvalidHeader)
 }
 
@@ -927,7 +950,19 @@ pub fn extract_crl_uris(ext_value: &[u8]) -> Result<Vec<Vec<u8>>, AuthError> {
     Ok(uris)
 }
 
+/// Maximum GeneralName nesting accepted below a DistributionPoint. Real
+/// encodings need two levels ([0] distributionPoint -> [0] fullName ->
+/// [6] URI); the bound keeps hostile input off the firmware call stack.
+const MAX_URI_DEPTH: u8 = 4;
+
 fn collect_uris(data: &[u8], out: &mut Vec<Vec<u8>>) -> Result<(), AuthError> {
+    collect_uris_at(data, out, 0)
+}
+
+fn collect_uris_at(data: &[u8], out: &mut Vec<Vec<u8>>, depth: u8) -> Result<(), AuthError> {
+    if depth > MAX_URI_DEPTH {
+        return Err(AuthError::CertificateParseError);
+    }
     // Walk raw TLVs; any context-6 (URI) primitive captures its content.
     // GeneralName UniformResourceIdentifier = [6] IMPLICIT IA5String.
     let mut rest = data;
@@ -937,7 +972,7 @@ fn collect_uris(data: &[u8], out: &mut Vec<Vec<u8>>) -> Result<(), AuthError> {
         if tag_of(&tlv)? == 0x86 {
             out.push(tlv.data().to_vec());
         } else if tlv.tag().is_constructed() {
-            collect_uris(tlv.data(), out)?;
+            collect_uris_at(tlv.data(), out, depth + 1)?;
         }
     }
     Ok(())
@@ -946,6 +981,7 @@ fn collect_uris(data: &[u8], out: &mut Vec<Vec<u8>>) -> Result<(), AuthError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloc::vec;
 
     #[test]
     fn tlv_trim_rejects_truncated_and_indefinite() {
@@ -979,6 +1015,113 @@ mod tests {
         assert_eq!(CrlReason::from_u32(1), Some(CrlReason::KeyCompromise));
         assert_eq!(CrlReason::from_u32(7), None);
         assert_eq!(CrlReason::from_u32(10), Some(CrlReason::AaCompromise));
+    }
+
+    #[test]
+    fn crl_reason_skips_other_entry_extensions() {
+        // invalidityDate (2.5.29.24) with a GeneralizedTime, then
+        // cRLReasons (2.5.29.21) = keyCompromise. The first extension must be
+        // consumed fully, not fail the parse.
+        let exts = [
+            0x30, 0x15, 0x06, 0x03, 0x55, 0x1d, 0x18, 0x04, 0x0e, 0x18, 0x0c, b'2', b'0', b'2',
+            b'4', b'0', b'1', b'0', b'1', b'0', b'0', b'0', b'0', //
+            0x30, 0x0d, 0x06, 0x03, 0x55, 0x1d, 0x15, 0x01, 0x01, 0xff, 0x04, 0x03, 0x0a, 0x01,
+            0x01,
+        ];
+        assert_eq!(
+            find_crl_reason(&exts).unwrap(),
+            Some(CrlReason::KeyCompromise)
+        );
+        assert_eq!(find_crl_reason(&exts[..0x17]).unwrap(), None);
+    }
+
+    #[test]
+    fn crl_uri_nesting_is_bounded() {
+        // DistributionPoint { [0] { [0] { [6] "u" } } }: valid shape.
+        let dp = [0x30, 0x07, 0xa0, 0x05, 0xa0, 0x03, 0x86, 0x01, b'u'];
+        let mut ext = vec![0x30, dp.len() as u8];
+        ext.extend_from_slice(&dp);
+        assert_eq!(extract_crl_uris(&ext).unwrap(), vec![b"u".to_vec()]);
+        // Wrap the URI in more constructed layers than allowed.
+        let mut nested = vec![0x86, 0x01, b'u'];
+        for _ in 0..=MAX_URI_DEPTH {
+            let mut wrapped = vec![0xa0, nested.len() as u8];
+            wrapped.extend_from_slice(&nested);
+            nested = wrapped;
+        }
+        let mut deep_dp = vec![0x30, nested.len() as u8];
+        deep_dp.extend_from_slice(&nested);
+        let mut deep = vec![0x30, deep_dp.len() as u8];
+        deep.extend_from_slice(&deep_dp);
+        assert!(extract_crl_uris(&deep).is_err());
+    }
+
+    #[test]
+    fn find_extension_accepts_wrapped_and_bare() {
+        // Extensions ::= SEQUENCE { Extension { OID 2.5.29.19, OCTET STRING 30 00 } }
+        let bare = [
+            0x30, 0x0b, 0x30, 0x09, 0x06, 0x03, 0x55, 0x1d, 0x13, 0x04, 0x02, 0x30, 0x00,
+        ];
+        let mut wrapped = vec![TAG_CONTEXT_3, bare.len() as u8];
+        wrapped.extend_from_slice(&bare);
+        for form in [&bare[..], &wrapped[..]] {
+            assert_eq!(
+                find_extension(form, OID_BASIC_CONSTRAINTS).unwrap(),
+                Some(&[0x30, 0x00][..])
+            );
+            assert_eq!(find_extension(form, OID_KEY_USAGE).unwrap(), None);
+        }
+    }
+
+    /// Build SpcIndirectDataContent content bytes: a dummy
+    /// SpcAttributeTypeAndOptionalValue followed by a SHA-256 DigestInfo
+    /// over 32 known digest bytes.
+    fn spc_children() -> (Vec<u8>, [u8; 32]) {
+        // SpcAttributeTypeAndOptionalValue: SEQUENCE { OID 1.3.14.3.2.26 }
+        let data = [0x30, 0x07, 0x06, 0x05, 0x2b, 0x0e, 0x03, 0x02, 0x1a];
+        let digest = [0xabu8; 32];
+        // DigestInfo: SEQUENCE { AlgorithmIdentifier SHA-256, OCTET STRING }
+        let mut digest_info = vec![
+            0x30, 0x31, // SEQUENCE, 49 bytes
+            0x30, 0x0d, // AlgorithmIdentifier SEQUENCE, 13 bytes
+            0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01, // sha256 OID
+            0x05, 0x00, // NULL
+            0x04, 0x20, // OCTET STRING, 32 bytes
+        ];
+        digest_info.extend_from_slice(&digest);
+        let mut children = data.to_vec();
+        children.extend_from_slice(&digest_info);
+        (children, digest)
+    }
+
+    #[test]
+    fn spc_digest_all_encodings() {
+        let (children, digest) = spc_children();
+        // Full SpcIndirectDataContent SEQUENCE TLV.
+        let mut full = vec![0x30, children.len() as u8];
+        full.extend_from_slice(&children);
+        // OCTET STRING wrapping the full TLV.
+        let mut wrapped = vec![0x04, full.len() as u8];
+        wrapped.extend_from_slice(&full);
+
+        for form in [&children, &full, &wrapped] {
+            assert_eq!(extract_spc_digest(form).unwrap(), digest);
+        }
+        // Trailing garbage is rejected in every form.
+        let mut padded = wrapped.clone();
+        padded.push(0);
+        assert!(extract_spc_digest(&padded).is_err());
+        let mut padded_children = children.clone();
+        padded_children.push(0);
+        assert!(extract_spc_digest(&padded_children).is_err());
+        // Not a SEQUENCE, truncated content.
+        assert!(extract_spc_digest(&[0x31, 0x00]).is_err());
+        assert!(extract_spc_digest(&children[..4]).is_err());
+        // Wrapped form with trailing content inside the OCTET STRING.
+        let mut bad_wrap = vec![0x04, full.len() as u8 + 1];
+        bad_wrap.extend_from_slice(&full);
+        bad_wrap.push(0);
+        assert!(extract_spc_digest(&bad_wrap).is_err());
     }
 
     #[test]
