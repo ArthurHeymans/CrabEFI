@@ -1,4 +1,4 @@
-//! CrabEFI separately linked EFI runtime image with bounded scratch allocation.
+//! CrabEFI separately linked EFI runtime image with stack-bounded RSA verification.
 
 #![cfg_attr(all(not(test), target_os = "none"), no_std)]
 #![cfg_attr(all(not(test), target_os = "none"), no_main)]
@@ -12,8 +12,6 @@ mod arch;
 mod auth;
 mod deferred;
 mod efi;
-#[cfg(feature = "secure-boot")]
-mod scratch;
 mod services;
 mod state;
 mod store;
@@ -413,8 +411,6 @@ mod tests {
             efi::Status::DEVICE_ERROR.as_usize()
         }
         let _guard = RUNTIME_TEST.lock().unwrap();
-        #[cfg(feature = "secure-boot")]
-        let _scratch_guard = crate::scratch::test_lock();
         state::set_phase(phase::UNINITIALIZED, phase::BOOT_ACTIVE).unwrap();
         {
             let mut lease = state::try_lease().unwrap();

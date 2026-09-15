@@ -1073,8 +1073,7 @@ mod tests {
         attributes: u32,
         data: &[u8],
     ) -> efi::Status {
-        let checkpoint = crate::scratch::checkpoint_for_test();
-        let status = apply_variable(
+        apply_variable(
             store,
             transaction,
             Some(deferred_transaction),
@@ -1085,10 +1084,7 @@ mod tests {
             variable.name(),
             attributes,
             data,
-        );
-        // SAFETY: `apply_variable` returned, so no scratch-backed value remains live.
-        unsafe { crate::scratch::rewind_for_test(checkpoint) };
-        status
+        )
     }
 
     fn enroll_raw(
@@ -1172,8 +1168,6 @@ mod tests {
 
     #[test]
     fn raw_writes_cannot_modify_previously_authenticated_variables() {
-        let _guard = crate::scratch::test_lock();
-        crate::scratch::activate();
         let mut store = VariableStore::new();
         let mut transaction = VariableTransaction::new();
         let mut deferred_transaction = deferred::DeferredTransaction::new();
@@ -1245,7 +1239,6 @@ mod tests {
         let slot = store.find(&guid, &name, false).unwrap();
         assert_eq!(store.data(slot), Some(b"payload".as_slice()));
         assert_eq!(slot.attributes, AUTH_ATTRIBUTES);
-        crate::scratch::reset();
     }
 
     /// Minimal authenticated-variable envelope with an empty PKCS#7 payload.
@@ -1270,8 +1263,6 @@ mod tests {
 
     #[test]
     fn deleted_authenticated_variables_keep_rollback_floors() {
-        let _guard = crate::scratch::test_lock();
-        crate::scratch::activate();
         let mut store = VariableStore::new();
         let mut transaction = VariableTransaction::new();
         let mut buffer = vec![0u8; 64 * 1024];
@@ -1375,13 +1366,10 @@ mod tests {
             store.auth_history_timestamp(&guid, &name),
             Some(timestamp(2026))
         );
-        crate::scratch::reset();
     }
 
     #[test]
     fn imported_secure_database_deletions_keep_authenticated_history() {
-        let _guard = crate::scratch::test_lock();
-        crate::scratch::activate();
         let mut store = VariableStore::new();
         let mut transaction = VariableTransaction::new();
         let mut deferred_transaction = deferred::DeferredTransaction::new();
@@ -1464,12 +1452,10 @@ mod tests {
             )
             .is_ok()
         );
-        crate::scratch::reset();
     }
 
     #[test]
     fn query_capsule_capabilities_validates_header_like_update_capsule() {
-        let _guard = crate::scratch::test_lock();
         let saved = {
             let mut lease = state::try_lease().unwrap();
             let runtime = lease.state_mut();
@@ -1544,9 +1530,7 @@ mod tests {
     }
 
     #[test]
-    fn real_service_path_covers_all_secure_databases_and_exhaustion() {
-        let _guard = crate::scratch::test_lock();
-        crate::scratch::activate();
+    fn real_service_path_covers_all_secure_databases() {
         let mut store = VariableStore::new();
         let mut transaction = VariableTransaction::new();
         let mut deferred_transaction = deferred::DeferredTransaction::new();
@@ -1671,38 +1655,11 @@ mod tests {
         }
         assert!(store.setup_mode());
         assert!(!store.secure_boot_enabled());
-        assert!(crate::scratch::high_water_for_test() < auth::AUTH_OPERATION_SCRATCH_BOUND);
-
-        let mut exhausted_store = VariableStore::new();
-        enroll_raw(
-            &mut exhausted_store,
-            &mut transaction,
-            &mut deferred_transaction,
-            &mut buffer,
-        );
-        crate::scratch::set_limit_for_test(auth::AUTH_OPERATION_SCRATCH_BOUND - 1);
-        assert_eq!(
-            apply(
-                &mut exhausted_store,
-                &mut transaction,
-                &mut deferred_transaction,
-                &mut buffer,
-                phase::BOOT_ACTIVE,
-                secure_boot::SecureBootVariable::Kek,
-                AUTH_ATTRIBUTES,
-                include_bytes!("../tests/fixtures/kek-update.bin"),
-            ),
-            efi::Status::OUT_OF_RESOURCES
-        );
-        crate::scratch::set_limit_for_test(crate::scratch::SCRATCH_SIZE);
-        crate::scratch::reset();
     }
 
     #[test]
     fn replay_consumes_already_persisted_raw_delete_and_continues() {
         const GUID: [u8; 16] = [0x42; 16];
-        let _guard = crate::scratch::test_lock();
-        crate::scratch::activate();
         let mut buffer = vec![0u8; 64 * 1024];
         let mut transaction = deferred::DeferredTransaction::new();
         deferred::prepare_retained(buffer.as_mut_ptr(), buffer.len()).unwrap();
@@ -1759,7 +1716,6 @@ mod tests {
             replay_apply_result(efi::Status::NOT_FOUND, true, true),
             Err(efi::Status::NOT_FOUND)
         );
-        crate::scratch::reset();
     }
 
     #[test]
@@ -1782,8 +1738,6 @@ mod tests {
         ];
         const VALUE: &[u8] = b"CrabRT";
 
-        let _guard = crate::scratch::test_lock();
-        crate::scratch::activate();
         let mut store = VariableStore::new();
         let mut transaction = VariableTransaction::new();
         let mut deferred_transaction = deferred::DeferredTransaction::new();
@@ -1854,13 +1808,10 @@ mod tests {
             ),
             Ok(0)
         );
-        crate::scratch::reset();
     }
 
     #[test]
     fn authenticated_post_ebs_write_replays_once_through_service_logic() {
-        let _guard = crate::scratch::test_lock();
-        crate::scratch::activate();
         let mut store = VariableStore::new();
         let mut transaction = VariableTransaction::new();
         let mut deferred_transaction = deferred::DeferredTransaction::new();
@@ -1937,6 +1888,5 @@ mod tests {
                 "../tests/fixtures/db-update.bin"
             )))
         );
-        crate::scratch::reset();
     }
 }

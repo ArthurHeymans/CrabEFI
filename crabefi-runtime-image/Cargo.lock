@@ -3,12 +3,6 @@
 version = 4
 
 [[package]]
-name = "allocator-api2"
-version = "0.3.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c583acf993cf4245c4acb0a2cc2ab1f9cc097de73411bb6d3647ff6af2b1013d"
-
-[[package]]
 name = "autocfg"
 version = "1.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -77,14 +71,13 @@ version = "0.1.0"
 name = "crabefi-runtime-image"
 version = "0.1.0"
 dependencies = [
- "allocator-api2",
  "crabefi-efi-types",
  "crabefi-runtime-abi",
- "crypto-bigint 0.7.5 (git+https://github.com/ArthurHeymans/crypto-bigint?rev=07a5d396134739ac0d02b15b1cd9c3f0ed60350e)",
  "r-efi",
  "rsa",
  "sha2",
  "zerocopy",
+ "zeroize",
 ]
 
 [[package]]
@@ -102,17 +95,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "crypto-bigint"
-version = "0.7.5"
-source = "git+https://github.com/ArthurHeymans/crypto-bigint?rev=07a5d396134739ac0d02b15b1cd9c3f0ed60350e#07a5d396134739ac0d02b15b1cd9c3f0ed60350e"
-dependencies = [
- "allocator-api2",
- "cpubits",
- "ctutils",
- "num-traits",
-]
-
-[[package]]
 name = "crypto-common"
 version = "0.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -127,7 +109,7 @@ version = "0.7.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3633a51a39c69ebbaa4feaa694bd83d241e4093901c84a0963b19d9bb3f0cf8f"
 dependencies = [
- "crypto-bigint 0.7.5 (registry+https://github.com/rust-lang/crates.io-index)",
+ "crypto-bigint",
  "rand_core",
 ]
 
@@ -212,7 +194,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "30b2aa4ba0d89f73d1e332df05be0eeab8840351c36ca5654341dfdb57bb3caf"
 dependencies = [
  "const-oid",
- "crypto-bigint 0.7.5 (registry+https://github.com/rust-lang/crates.io-index)",
+ "crypto-bigint",
  "crypto-primes",
  "digest",
  "rand_core",

@@ -1,10 +1,11 @@
 //! Image-local UEFI time-based authenticated-variable enforcement.
 
+mod bigint;
 mod crypto;
 mod limits;
 mod signature;
 
-pub use limits::{AUTH_OPERATION_SCRATCH_BOUND, MAX_AUTHENTICATED_ENVELOPE_SIZE};
+pub use limits::MAX_AUTHENTICATED_ENVELOPE_SIZE;
 pub use signature::verify_authenticated_variable;
 
 use crabefi_efi_types::authentication::EfiTime;
@@ -83,28 +84,24 @@ mod tests {
     use super::*;
 
     #[test]
-    fn scratch_exhaustion_maps_to_out_of_resources() {
-        let _guard = crate::scratch::test_lock();
-        crate::scratch::activate();
-        crate::scratch::set_limit_for_test(0);
-        let error = crypto::verify_rsa_parts_for_test(&[3], &[3], &[1], &[0; 32]).unwrap_err();
-        assert_eq!(efi::Status::from(error), efi::Status::OUT_OF_RESOURCES);
-        crate::scratch::reset();
-        crate::scratch::set_limit_for_test(crate::scratch::SCRATCH_SIZE);
+    fn oversize_modulus_fails_soft() {
+        // Inputs above the stack-backed maximum width fail soft (Ok(false)),
+        // exactly like the previous arena-preflight path: unauthenticated
+        // data must never become a hard error.
+        let modulus = [0xffu8; 4096 / 8 + 1];
+        let verified = crypto::verify_rsa_parts_for_test(&modulus, &[1], &[1], &[0; 32]).unwrap();
+        assert!(!verified);
     }
 
     #[test]
-    fn maximum_width_rsa_stays_within_operation_scratch_bound() {
-        let _guard = crate::scratch::test_lock();
-        crate::scratch::activate();
-        crate::scratch::set_limit_for_test(AUTH_OPERATION_SCRATCH_BOUND);
-
+    fn maximum_width_rsa_completes_without_arena() {
+        // A 4096-bit verification runs entirely on fixed stack buffers.
+        // The 16 KiB firmware stack fit is enforced separately by the
+        // link-time stack-sizes audit, which fails the image build on
+        // any function exceeding budget.
         const MAX_RSA_BYTES: usize = 4096 / 8;
         let modulus = [0xff; MAX_RSA_BYTES];
         let signature = [0xa5; MAX_RSA_BYTES];
-        // Three operations would exceed the bound without per-operation
-        // rewinding (a single 4096-bit op uses roughly half the bound), so a
-        // missing rewind is caught by the high-water assertion below.
         for _ in 0..3 {
             let verified = crypto::verify_rsa_parts_for_test(
                 &modulus,
@@ -115,10 +112,5 @@ mod tests {
             .unwrap();
             assert!(!verified);
         }
-        let high_water = crate::scratch::high_water_for_test();
-        crate::scratch::reset();
-        crate::scratch::set_limit_for_test(crate::scratch::SCRATCH_SIZE);
-
-        assert!(high_water <= AUTH_OPERATION_SCRATCH_BOUND);
     }
 }

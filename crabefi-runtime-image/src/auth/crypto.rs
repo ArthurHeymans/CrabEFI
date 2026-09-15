@@ -16,15 +16,13 @@
 //!   verification treats every signature as RSA-SHA256 regardless of the
 //!   declared algorithm.
 
-use allocator_api2::alloc::Allocator;
 use core::cmp::Ordering;
 
 use crabefi_efi_types::constant_time_eq;
-use crypto_bigint::{BoxedUintIn, PowModInError};
 use sha2::{Digest, Sha256};
 
 use super::AuthError;
-use crate::scratch;
+use super::bigint;
 
 const MAX_CERTIFICATES: usize = 16;
 const MAX_SIGNERS: usize = 8;
@@ -605,25 +603,6 @@ fn verify_rsa_signature(
     signature: &[u8],
     digest: &[u8; 32],
 ) -> Result<bool, AuthError> {
-    if !scratch::preflight(super::AUTH_OPERATION_SCRATCH_BOUND) {
-        return Err(AuthError::OutOfResources);
-    }
-    let verification = scratch::with_scope(|allocator| {
-        verify_rsa_signature_with_allocator(certificate, signature, digest, allocator)
-    });
-    debug_assert!(
-        verification.is_some(),
-        "RSA verification attempted to nest scratch scopes"
-    );
-    verification.unwrap_or(Err(AuthError::OutOfResources))
-}
-
-fn verify_rsa_signature_with_allocator<A: Allocator + Copy>(
-    certificate: CertificateView<'_>,
-    signature: &[u8],
-    digest: &[u8; 32],
-    allocator: A,
-) -> Result<bool, AuthError> {
     if certificate.modulus.is_empty()
         || certificate.modulus.len() > MAX_RSA_BYTES
         || certificate.exponent.is_empty()
@@ -652,37 +631,36 @@ fn verify_rsa_signature_with_allocator<A: Allocator + Copy>(
         return Ok(false);
     }
 
-    let modulus = BoxedUintIn::try_from_be_slice_vartime(certificate.modulus, allocator)
-        .map_err(map_bigint_error)?;
-    let exponent = BoxedUintIn::try_from_be_slice_vartime(certificate.exponent, allocator)
-        .map_err(map_bigint_error)?;
-    let signature =
-        BoxedUintIn::try_from_be_slice_vartime(signature, allocator).map_err(map_bigint_error)?;
-    if modulus.bits_vartime() > MAX_RSA_BITS as u32
-        || !modulus.is_odd()
-        || exponent.cmp_vartime(&modulus) != Ordering::Less
-        || signature.cmp_vartime(&modulus) != Ordering::Less
+    // Byte-level pre-checks mirroring the previous bigint comparisons:
+    // odd nonzero modulus, exponent and signature below the modulus.
+    // Leading zeros are ignored by the comparison, as before.
+    if !bigint::is_odd_nonzero(certificate.modulus)
+        || bigint::cmp_be(certificate.exponent, certificate.modulus) != Ordering::Less
+        || bigint::cmp_be(signature, certificate.modulus) != Ordering::Less
     {
         return Ok(false);
     }
 
-    let encoded = signature
-        .pow_mod_vartime(&exponent, &modulus)
-        .map_err(map_bigint_error)?;
     let mut encoded_bytes = [0u8; MAX_RSA_BYTES];
-    let encoded_bytes = encoded_bytes
+    let encoded = encoded_bytes
         .get_mut(..certificate.modulus.len())
         .ok_or(AuthError::CertificateParseError)?;
-    encoded
-        .write_be_bytes(encoded_bytes)
-        .map_err(|_| AuthError::CryptoError)?;
-    Ok(verify_pkcs1v15_sha256_encoding(encoded_bytes, digest))
+    bigint::mod_pow_vartime(
+        signature,
+        certificate.exponent,
+        certificate.modulus,
+        encoded,
+    )
+    .map_err(map_bigint_error)?;
+    Ok(verify_pkcs1v15_sha256_encoding(encoded, digest))
 }
 
-fn map_bigint_error(error: PowModInError) -> AuthError {
+fn map_bigint_error(error: bigint::BigintError) -> AuthError {
     match error {
-        PowModInError::Alloc => AuthError::OutOfResources,
-        PowModInError::InvalidInput => AuthError::CertificateParseError,
+        // Oversize inputs cannot address the fixed stack buffers; surface
+        // as resource exhaustion, like arena exhaustion before.
+        bigint::BigintError::TooLarge => AuthError::OutOfResources,
+        bigint::BigintError::InvalidInput => AuthError::CertificateParseError,
     }
 }
 

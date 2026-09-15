@@ -20,12 +20,32 @@ if grep -E '^(rsa |crypto-bigint |allocator-api2 |sha2 )' "$TMP/runtime-tree"; t
     exit 1
 fi
 
+# Stack-backed schoolbook RSA replaced the allocator-backed fork: neither
+# may re-enter through any runtime capability.
+cargo tree --locked --manifest-path crabefi-runtime-image/Cargo.toml --target x86_64-unknown-none \
+    --no-default-features --features full --edges normal --prefix none > "$TMP/runtime-full-tree"
+if grep -E '^(crypto-bigint |allocator-api2 )' "$TMP/runtime-full-tree"; then
+    echo 'Allocator-backed bigint fork present in the secure runtime' >&2
+    exit 1
+fi
+
 cargo tree --locked -p crabefi-core --target x86_64-unknown-none --no-default-features \
     --features capsule-update --edges normal --prefix none > "$TMP/capsule-tree"
 if grep -E '^rflasher-' "$TMP/capsule-tree"; then
     echo 'Capsule application must not require SPI discovery' >&2
     exit 1
 fi
+
+# CMS/X.509 parsing lives in the minimal asn1-crate port. The legacy
+# cms/x509-cert framework must not re-enter through any capability.
+for features in secure-boot capsule-update; do
+    cargo tree --locked -p crabefi-core --target x86_64-unknown-none --no-default-features \
+        --features "$features" --edges normal --prefix none > "$TMP/auth-tree"
+    if grep -E '^(x509-cert |cms |num-bigint)' "$TMP/auth-tree"; then
+        echo "Legacy CMS/X.509 framework present under feature $features" >&2
+        exit 1
+    fi
+done
 
 for target in x86_64-unknown-none aarch64-unknown-none riscv64gc-unknown-none-elf; do
     cargo check --locked -p crabefi-core --target "$target" --release \
