@@ -360,16 +360,20 @@ pub fn build_and_verify_chain(
     let end_entity = parse_cert_view(end_entity_der)?;
     let trust_anchor = parse_cert_view(trust_anchor_der)?;
 
-    // Quick check: is the end-entity directly the trust anchor?
-    if end_entity.subject_der == trust_anchor.subject_der
-        && end_entity.serial == trust_anchor.serial
-    {
-        // Self-signed or directly trusted - verify the chain
-        if verify_single_cert(end_entity_der, trust_anchor_der, config)? {
-            return Ok(CertificateChain {
-                certificates: vec![end_entity_der.to_vec()],
-            });
+    // Quick check: is the end-entity byte-for-byte the trust anchor? The db
+    // is a flat allow-list, so exact identity is trusted as-is. Only exact
+    // identity counts: a forged self-signed certificate carrying the
+    // anchor's subject and serial must never be verified against itself.
+    if end_entity_der == trust_anchor_der {
+        if config.check_validity_period
+            && let Err(e) = validate_certificate_time(end_entity_der)
+        {
+            log::debug!("Trust anchor validity check failed: {:?}", e);
+            return Err(AuthError::ChainBuildingFailed);
         }
+        return Ok(CertificateChain {
+            certificates: vec![end_entity_der.to_vec()],
+        });
     }
 
     // Quick check: is the end-entity directly issued by the trust anchor?
@@ -593,14 +597,13 @@ fn verify_chain_link(
     verify_rsa_signature_raw(&issuer_rsa_key, cert.signature, &tbs_hash)
 }
 
-/// Verify a single certificate against a trust anchor (for direct trust)
+/// Verify a certificate issued directly by a trust anchor.
 ///
 /// Per the UEFI specification, certificates in the db are explicit trust
-/// anchors for image verification.  When the signer certificate IS the db
-/// certificate (direct trust), we must NOT enforce CA-only extensions
-/// (basicConstraints, keyUsage) because tools like `sbctl` generate plain
-/// end-entity certificates without CA:TRUE.  edk2 and u-boot behave the
-/// same way — the db is a flat allow-list, not a CA trust store.
+/// anchors for image verification, so CA-only extensions (basicConstraints,
+/// keyUsage) are NOT enforced on the anchor: tools like `sbctl` generate
+/// plain end-entity certificates without CA:TRUE. edk2 and u-boot behave
+/// the same way — the db is a flat allow-list, not a CA trust store.
 fn verify_single_cert(
     cert_der: &[u8],
     trust_anchor_der: &[u8],
@@ -608,17 +611,10 @@ fn verify_single_cert(
 ) -> Result<bool, AuthError> {
     let cert = parse_cert_view(cert_der)?;
     let trust_anchor = parse_cert_view(trust_anchor_der)?;
-
-    // For self-signed certs, verify signature against self
-    let issuer_der = if cert.issuer_der == cert.subject_der {
-        cert_der
-    } else if cert.issuer_der == trust_anchor.subject_der {
-        trust_anchor_der
-    } else {
+    if cert.issuer_der != trust_anchor.subject_der {
         return Ok(false);
-    };
+    }
 
-    // For direct trust (cert is directly in db), relax CA-only checks.
     // The db entry is an explicit trust anchor — its extensions are irrelevant.
     let relaxed_config = ChainBuildingConfig {
         max_depth: config.max_depth,
@@ -630,7 +626,7 @@ fn verify_single_cert(
         check_validity_period: config.check_validity_period,
     };
 
-    verify_chain_link(cert_der, issuer_der, &relaxed_config)
+    verify_chain_link(cert_der, trust_anchor_der, &relaxed_config)
 }
 
 /// Verify a certificate chain with full revocation checking
@@ -972,6 +968,9 @@ mod fixture_tests {
     const CMS_KEYID: &[u8] = include_bytes!("testdata/cms_keyid.der");
     const CRL_EMPTY: &[u8] = include_bytes!("testdata/crl_empty.der");
     const CRL_ONE: &[u8] = include_bytes!("testdata/crl_one.der");
+    /// Self-signed under a different key, but with CA's exact subject and
+    /// serial: must never be accepted when CA is the trust anchor.
+    const FORGED_CA: &[u8] = include_bytes!("testdata/forged_ca.der");
 
     #[test]
     fn cert_views_are_sane() {
@@ -1028,6 +1027,26 @@ mod fixture_tests {
         };
         let chain = build_and_verify_chain(LEAF, CA, &[], &config).unwrap();
         assert_eq!(chain.len(), 2);
+    }
+
+    #[test]
+    fn forged_self_signed_anchor_lookalike_rejected() {
+        let ca = parse_cert_view(CA).unwrap();
+        let forged = parse_cert_view(FORGED_CA).unwrap();
+        assert_eq!(forged.subject_der, ca.subject_der);
+        assert_eq!(forged.serial, ca.serial);
+        assert_ne!(forged.spki_key_der, ca.spki_key_der);
+        // Secure Boot image verification skips validity periods, so trust
+        // must come from the anchor identity alone.
+        let config = ChainBuildingConfig {
+            check_validity_period: false,
+            ..ChainBuildingConfig::default()
+        };
+        assert!(build_and_verify_chain(FORGED_CA, CA, &[], &config).is_err());
+        assert!(build_and_verify_chain(FORGED_CA, CA, &[FORGED_CA], &config).is_err());
+        // The genuine anchor is trusted by identity alone.
+        let chain = build_and_verify_chain(CA, CA, &[], &config).unwrap();
+        assert_eq!(chain.len(), 1);
     }
 
     #[test]
