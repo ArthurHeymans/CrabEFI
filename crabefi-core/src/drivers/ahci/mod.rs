@@ -438,13 +438,25 @@ impl AhciController {
 
     /// Create a new AHCI controller from a PCI device
     pub fn new(pci_dev: &PciDevice) -> Result<Self, AhciError> {
-        let mmio_base = pci_dev.mmio_base().ok_or(AhciError::NoDevice)?;
+        // Per the AHCI specification the HBA register block (ABAR) lives in
+        // BAR5 (PCI config offset 0x24). Other memory BARs on SATA controllers
+        // (e.g. Intel's BAR0/BAR1) decode unrelated register blocks, so the
+        // generic "first memory BAR" helper must not be used here.
+        let abar = &pci_dev.bars[5];
+        if !matches!(
+            abar.bar_type,
+            pci::BarType::Memory32 | pci::BarType::Memory64
+        ) || abar.address == 0
+        {
+            return Err(AhciError::NoDevice);
+        }
+        let mmio_base = abar.address;
         let hba_regs = mmio_base as *const AhciHbaRegisters;
 
         // Enable the device (bus master + memory space)
         pci::enable_device(pci_dev);
 
-        log::debug!("AHCI: MMIO base at {:#x}", mmio_base);
+        log::debug!("AHCI: ABAR (BAR5) at {:#x}", mmio_base);
 
         let hba = unsafe { &*hba_regs };
 
