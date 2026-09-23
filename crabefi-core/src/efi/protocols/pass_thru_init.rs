@@ -5,7 +5,7 @@
 
 use core::ffi::c_void;
 
-use crate::drivers::storage::StorageType;
+use crate::drivers::storage::StorageId;
 use crate::drivers::{ahci, nvme, usb};
 use crate::efi::boot_services;
 use crate::efi::protocols::ata_pass_thru::{self, ATA_PASS_THRU_GUID};
@@ -125,7 +125,7 @@ fn init_nvme_pass_thru() {
             // Install Storage Security Command Protocol
             let storage_security = storage_security::create_storage_security_protocol(
                 ns.nsid, // Use nsid as media_id
-                StorageType::Nvme {
+                StorageId::Nvme {
                     controller_id: controller_index,
                     nsid: ns.nsid,
                 },
@@ -255,7 +255,7 @@ fn init_ahci_pass_thru() {
             // Install Storage Security Command Protocol
             let storage_security = storage_security::create_storage_security_protocol(
                 port_num as u32, // Use port number as media_id
-                StorageType::Ahci {
+                StorageId::Ahci {
                     controller_id: controller_index,
                     port: port_index,
                 },
@@ -278,13 +278,18 @@ fn init_ahci_pass_thru() {
 
 /// Initialize USB SCSI pass-through protocols
 fn init_usb_pass_thru() {
-    // Find all USB mass storage devices
     log::info!("Scanning for USB mass storage devices...");
-    let Some((controller_index, device_addr)) = usb::find_mass_storage() else {
+    let devices = usb::find_mass_storage_devices();
+    if devices.is_empty() {
         log::info!("No USB mass storage devices found for pass-through protocols");
-        return;
-    };
+    }
+    for (controller_index, device_addr) in devices {
+        init_usb_device_pass_thru(controller_index, device_addr);
+    }
+}
 
+/// Install USB SCSI pass-through protocols for one mass storage device
+fn init_usb_device_pass_thru(controller_index: usize, device_addr: u8) {
     log::info!(
         "Installing USB SCSI pass-through protocols for device {} on controller {}",
         device_addr,
@@ -339,7 +344,7 @@ fn init_usb_pass_thru() {
     // Install Storage Security Command Protocol for USB device
     let storage_security = storage_security::create_storage_security_protocol(
         device_addr as u32, // Use device address as media_id
-        StorageType::Usb {
+        StorageId::Usb {
             controller_id: controller_index,
             device_addr,
         },

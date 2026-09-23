@@ -13,7 +13,7 @@ use core::ffi::c_void;
 
 use r_efi::efi::{Guid, Status};
 
-use crate::drivers::storage::StorageType;
+use crate::drivers::storage::StorageId;
 use crate::drivers::{ahci, nvme, usb};
 use crate::efi::utils::allocate_protocol_with_log;
 
@@ -64,7 +64,7 @@ struct StorageSecurityContext {
     /// Media ID (for validation)
     media_id: u32,
     /// Storage type and device identifier
-    storage_type: StorageType,
+    storage_type: StorageId,
 }
 
 use super::context_map::ProtocolContextMap;
@@ -140,7 +140,7 @@ extern "efiapi" fn storage_security_receive_data(
 
     // Dispatch based on storage type
     let result = match ctx.storage_type {
-        StorageType::Nvme {
+        StorageId::Nvme {
             controller_id,
             nsid,
         } => nvme_security_receive(
@@ -150,7 +150,7 @@ extern "efiapi" fn storage_security_receive_data(
             security_protocol_specific,
             buffer,
         ),
-        StorageType::Ahci {
+        StorageId::Ahci {
             controller_id,
             port,
         } => ahci_security_receive(
@@ -160,17 +160,21 @@ extern "efiapi" fn storage_security_receive_data(
             security_protocol_specific,
             buffer,
         ),
-        StorageType::Usb { controller_id, .. } => usb_security_receive(
+        StorageId::Usb {
             controller_id,
+            device_addr,
+        } => usb_security_receive(
+            controller_id,
+            device_addr,
             security_protocol_id,
             security_protocol_specific,
             buffer,
         ),
-        StorageType::Sdhci { .. } => {
+        StorageId::Sdhci { .. } => {
             log::warn!("StorageSecurity: SDHCI security commands not supported");
             return Status::UNSUPPORTED;
         }
-        StorageType::Platform { .. } => {
+        StorageId::Platform { .. } => {
             log::warn!("StorageSecurity: Platform device security commands not supported");
             return Status::UNSUPPORTED;
         }
@@ -246,7 +250,7 @@ extern "efiapi" fn storage_security_send_data(
 
     // Dispatch based on storage type
     let result = match ctx.storage_type {
-        StorageType::Nvme {
+        StorageId::Nvme {
             controller_id,
             nsid,
         } => nvme_security_send(
@@ -256,7 +260,7 @@ extern "efiapi" fn storage_security_send_data(
             security_protocol_specific,
             buffer,
         ),
-        StorageType::Ahci {
+        StorageId::Ahci {
             controller_id,
             port,
         } => ahci_security_send(
@@ -266,17 +270,21 @@ extern "efiapi" fn storage_security_send_data(
             security_protocol_specific,
             buffer,
         ),
-        StorageType::Usb { controller_id, .. } => usb_security_send(
+        StorageId::Usb {
             controller_id,
+            device_addr,
+        } => usb_security_send(
+            controller_id,
+            device_addr,
             security_protocol_id,
             security_protocol_specific,
             buffer,
         ),
-        StorageType::Sdhci { .. } => {
+        StorageId::Sdhci { .. } => {
             log::warn!("StorageSecurity: SDHCI security commands not supported");
             return Status::UNSUPPORTED;
         }
-        StorageType::Platform { .. } => {
+        StorageId::Platform { .. } => {
             log::warn!("StorageSecurity: Platform device security commands not supported");
             return Status::UNSUPPORTED;
         }
@@ -373,11 +381,12 @@ fn ahci_security_send(
 /// USB SCSI SECURITY PROTOCOL IN (opcode 0xA2)
 fn usb_security_receive(
     controller_index: usize,
+    device_addr: u8,
     protocol_id: u8,
     sp_specific: u16,
     buffer: &mut [u8],
 ) -> Result<usize, &'static str> {
-    usb::mass_storage::with_global_device_and_controller(controller_index, |device, controller| {
+    usb::mass_storage::with_device(controller_index, device_addr, |device, controller| {
         device
             .security_protocol_in(controller, protocol_id, sp_specific, buffer)
             .map_err(|_| "USB security protocol in failed")
@@ -388,11 +397,12 @@ fn usb_security_receive(
 /// USB SCSI SECURITY PROTOCOL OUT (opcode 0xB5)
 fn usb_security_send(
     controller_index: usize,
+    device_addr: u8,
     protocol_id: u8,
     sp_specific: u16,
     buffer: &[u8],
 ) -> Result<(), &'static str> {
-    usb::mass_storage::with_global_device_and_controller(controller_index, |device, controller| {
+    usb::mass_storage::with_device(controller_index, device_addr, |device, controller| {
         device
             .security_protocol_out(controller, protocol_id, sp_specific, buffer)
             .map_err(|_| "USB security protocol out failed")
@@ -414,7 +424,7 @@ fn usb_security_send(
 /// Pointer to the protocol instance, or null on failure
 pub fn create_storage_security_protocol(
     media_id: u32,
-    storage_type: StorageType,
+    storage_type: StorageId,
 ) -> *mut StorageSecurityCommandProtocol {
     // Find a free context slot
     let ctx_idx = match CTX_MAP.find_free_slot() {

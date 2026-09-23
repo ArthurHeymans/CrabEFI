@@ -121,8 +121,11 @@ macro_rules! with_usb_controller {
     };
 }
 
+/// Maximum number of USB host controllers
+const MAX_CONTROLLERS: usize = 8;
+
 /// Global list of all USB controllers
-static ALL_CONTROLLERS: Mutex<heapless::Vec<UsbControllerHandle, 8>> =
+static ALL_CONTROLLERS: Mutex<heapless::Vec<UsbControllerHandle, MAX_CONTROLLERS>> =
     Mutex::new(heapless::Vec::new());
 
 // ============================================================================
@@ -141,7 +144,7 @@ static ALL_CONTROLLERS: Mutex<heapless::Vec<UsbControllerHandle, 8>> =
 /// * `name` - Controller type name for logging
 /// * `address` - PCI address for logging
 fn register_controller<T>(
-    controllers: &mut heapless::Vec<UsbControllerHandle, 8>,
+    controllers: &mut heapless::Vec<UsbControllerHandle, MAX_CONTROLLERS>,
     controller: T,
     wrap: fn(*mut T) -> UsbControllerHandle,
     name: &str,
@@ -375,25 +378,21 @@ pub fn controller_count() -> usize {
     ALL_CONTROLLERS.lock().len()
 }
 
-/// Find a mass storage device across all controllers
+/// Find the mass storage device on every controller.
 ///
-/// Returns (controller_index, device_address) if found
-pub fn find_mass_storage() -> Option<(usize, u8)> {
+/// Returns `(controller_index, device_address)` pairs.
+pub fn find_mass_storage_devices() -> heapless::Vec<(usize, u8), MAX_CONTROLLERS> {
     let controllers = ALL_CONTROLLERS.lock();
 
-    log::debug!(
-        "find_mass_storage: checking {} controllers",
-        controllers.len()
-    );
-
-    controllers.iter().enumerate().find_map(|(idx, handle)| {
-        let device = with_usb_controller!(handle, |controller| {
-            let result = controller.find_mass_storage();
-            log::debug!("  Controller {}: find_mass_storage() = {:?}", idx, result);
-            result
-        });
-        device.map(|addr| (idx, addr))
-    })
+    controllers
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, handle)| {
+            let device = with_usb_controller!(handle, |controller| controller.find_mass_storage());
+            log::debug!("  Controller {}: find_mass_storage() = {:?}", idx, device);
+            device.map(|addr| (idx, addr))
+        })
+        .collect()
 }
 
 /// Poll USB keyboards

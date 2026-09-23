@@ -1,282 +1,391 @@
-//! Unified Storage Device Abstraction
+//! Storage Device Enumeration and Access
 //!
-//! This module provides a common interface for all storage devices (USB, NVMe, AHCI)
-//! that can be used by the BlockIO protocol and filesystem code.
+//! Every disk CrabEFI can boot from is identified by a [`StorageId`].
+//! [`devices()`] enumerates all of them (NVMe namespaces, AHCI ports, USB mass
+//! storage, SDHCI cards and platform-provided devices) and [`with_disk()`]
+//! lends one out as a `&mut dyn BlockDevice` for the duration of a closure.
 
-use spin::Mutex;
+use core::fmt::Write;
+
+use heapless::{String, Vec};
 
 use crate::cell::Local;
-
-/// Maximum number of storage devices we can track
-const MAX_STORAGE_DEVICES: usize = 8;
+use crate::drivers::block::{BlockDevice, BlockDeviceInfo, BlockError};
+use crate::drivers::pci::PciAddress;
+use crate::drivers::{ahci, nvme, sdhci, usb};
 
 /// Maximum number of platform-provided block devices.
-pub const MAX_PLATFORM_BLOCK_DEVICES: usize = 8;
+const MAX_PLATFORM_BLOCK_DEVICES: usize = 8;
 
-/// Global storage for platform-provided block devices.
-///
-/// Populated by [`register_platform_block_devices()`] during
-/// [`crate::init_platform()`]. Fat pointers are stored directly as
-/// `Option<*mut dyn>` — no `transmute` through `[usize; 2]` needed, since
-/// raw pointers are `Copy` and always `Send`, keeping the `Mutex` `Sync`.
-///
-/// # Safety invariant
-///
-/// Every `Some` entry is a valid `*mut dyn platform::BlockDevice` whose
-/// referent lives for the firmware's entire lifetime (`init_platform` is `-> !`).
-struct PlatformBlockRegistry {
-    pointers: [Option<*mut dyn crate::platform::BlockDevice>; MAX_PLATFORM_BLOCK_DEVICES],
-    count: usize,
-}
+/// Maximum number of devices returned by [`devices()`].
+const MAX_STORAGE_DEVICES: usize = 16;
 
-// SAFETY: all accesses go through the `PLATFORM_BLOCKS` mutex, every stored
-// referent lives for the firmware lifetime (`init_platform() -> !`), and
-// CrabEFI is single-hart, so no thread can race the pointer metadata.
-unsafe impl Send for PlatformBlockRegistry {}
-unsafe impl Sync for PlatformBlockRegistry {}
-
-static PLATFORM_BLOCKS: Mutex<PlatformBlockRegistry> = Mutex::new(PlatformBlockRegistry {
-    pointers: [None; MAX_PLATFORM_BLOCK_DEVICES],
-    count: 0,
-});
+/// Platform-provided block devices registered by [`crate::init_platform()`].
+///
+/// Every entry points to a device that lives for the firmware's entire
+/// lifetime (`init_platform` is `-> !`).
+static PLATFORM_BLOCK_DEVICES: Local<Vec<*mut dyn BlockDevice, MAX_PLATFORM_BLOCK_DEVICES>> =
+    Local::new(Vec::new());
 
 /// Register platform-provided block devices from [`crate::PlatformConfig`].
 ///
 /// # Safety
 ///
-/// Must be called exactly once from `init_platform()` before the boot manager
-/// runs. The block device references in `devices` must remain valid for the
+/// The block device references in `devices` must remain valid for the
 /// firmware's entire lifetime (guaranteed by `init_platform() -> !`).
-pub unsafe fn register_platform_block_devices(
-    devices: &mut [&mut dyn crate::platform::BlockDevice],
-) {
-    let count = devices.len().min(MAX_PLATFORM_BLOCK_DEVICES);
-    let mut registry = PLATFORM_BLOCKS.lock();
-    for (i, dev) in devices.iter_mut().enumerate().take(count) {
-        let fat: *mut dyn crate::platform::BlockDevice = *dev;
-        // SAFETY: lifetime extension from the config borrow to 'static.
-        // Justified by the `init_platform() -> !` contract documented above:
-        // the referent outlives firmware. Layout is untouched, unlike the
-        // previous `[usize; 2]` transmute.
-        let fat: *mut (dyn crate::platform::BlockDevice + 'static) =
-            unsafe { core::mem::transmute(fat) };
-        registry.pointers[i] = Some(fat);
-    }
-    registry.count = count;
-    log::info!("Registered {} platform block device(s)", count);
+pub unsafe fn register_platform_block_devices(devices: &mut [&mut dyn BlockDevice]) {
+    PLATFORM_BLOCK_DEVICES.with_mut(|registered| {
+        registered.clear();
+        for device in devices.iter_mut().take(MAX_PLATFORM_BLOCK_DEVICES) {
+            let device: *mut dyn BlockDevice = *device;
+            // SAFETY: extends the config borrow to 'static; the caller
+            // guarantees the referent outlives the firmware.
+            let device: *mut (dyn BlockDevice + 'static) = unsafe { core::mem::transmute(device) };
+            let _ = registered.push(device);
+        }
+        log::info!("Registered {} platform block device(s)", registered.len());
+    });
 }
 
-/// Number of registered platform block devices.
-pub fn platform_block_device_count() -> usize {
-    PLATFORM_BLOCKS.lock().count
-}
-
-/// Access a platform block device by index, calling `f` with a mutable reference.
-///
-/// Returns `None` if the index is out of range.
-pub fn with_platform_block_device<R>(
-    index: usize,
-    f: impl FnOnce(&mut dyn crate::platform::BlockDevice) -> R,
-) -> Option<R> {
-    let registry = PLATFORM_BLOCKS.lock();
-    if index >= registry.count {
-        return None;
-    }
-    // SAFETY: the pointer entry was written by register_platform_block_devices()
-    // from a valid `*mut dyn BlockDevice`. The referent is alive (-> ! contract).
-    unsafe {
-        let fat = registry.pointers[index]?;
-        Some(f(&mut *fat))
-    }
-}
-
-/// Storage device type and instance identifier
-///
-/// This is the canonical enum for identifying a specific storage device across
-/// the entire codebase: menu, boot, storage registry, and EFI protocols.
+/// Identity of one storage device across menu, boot and EFI protocols.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum StorageType {
-    /// NVMe SSD
+pub enum StorageId {
+    /// NVMe namespace
     Nvme { controller_id: usize, nsid: u32 },
-    /// AHCI/SATA disk
+    /// AHCI/SATA port (index into the controller's active ports)
     Ahci { controller_id: usize, port: usize },
-    /// USB mass storage
+    /// USB mass storage device
     Usb {
         controller_id: usize,
         device_addr: u8,
     },
-    /// SDHCI (SD Card)
+    /// SDHCI (SD card / eMMC)
     Sdhci { controller_id: usize },
     /// Platform-provided block device (via [`crate::PlatformConfig::block_devices`]).
-    ///
-    /// The `index` identifies the device's position in the global platform
-    /// block device array, set up by [`crate::init_platform()`].
     Platform { index: usize },
 }
 
-impl StorageType {
+impl StorageId {
     /// Get a short description of the device type
     pub fn description(&self) -> &'static str {
         match self {
-            StorageType::Nvme { .. } => "NVMe",
-            StorageType::Ahci { .. } => "SATA",
-            StorageType::Usb { .. } => "USB",
-            StorageType::Sdhci { .. } => "SD",
-            StorageType::Platform { .. } => "Platform",
+            StorageId::Nvme { .. } => "NVMe",
+            StorageId::Ahci { .. } => "SATA",
+            StorageId::Usb { .. } => "USB",
+            StorageId::Sdhci { .. } => "SD",
+            StorageId::Platform { .. } => "Platform",
         }
     }
 }
 
-/// Storage device information
-#[derive(Clone, Copy)]
+/// A storage device found by [`devices()`].
+#[derive(Debug, Clone)]
 pub struct StorageDevice {
-    /// Device type and identifiers
-    pub device_type: StorageType,
-    /// Total number of blocks
-    pub num_blocks: u64,
-    /// Block size in bytes
-    pub block_size: u32,
-    /// Device ID for BlockIO media_id
-    pub device_id: u32,
+    /// Device identity used with [`with_disk()`].
+    pub id: StorageId,
+    /// PCI address of the controller, when the device sits behind one.
+    pub pci: Option<PciAddress>,
+    /// Geometry and media properties.
+    pub info: BlockDeviceInfo,
+    /// Short display name for boot menu entries (e.g. "NVMe ns1").
+    pub label: String<32>,
 }
 
-/// Internal storage for registered devices
-struct StorageRegistry {
-    devices: [Option<StorageDevice>; MAX_STORAGE_DEVICES],
-    next_id: u32,
-}
-
-/// Registered block devices.
-static REGISTRY: Local<StorageRegistry> = Local::new(StorageRegistry {
-    devices: [const { None }; MAX_STORAGE_DEVICES],
-    next_id: 0,
-});
-
-/// Register a storage device and get its device ID
-pub fn register_device(device_type: StorageType, num_blocks: u64, block_size: u32) -> Option<u32> {
-    REGISTRY.with_mut(|registry| {
-        // Find a free slot index first
-        let slot_idx = registry.devices.iter().position(|slot| slot.is_none())?;
-
-        let device_id = registry.next_id;
-        registry.next_id += 1;
-
-        registry.devices[slot_idx] = Some(StorageDevice {
-            device_type,
-            num_blocks,
-            block_size,
-            device_id,
-        });
-
-        log::info!(
-            "Storage: registered {:?} as device {} ({} blocks x {} bytes)",
-            device_type,
-            device_id,
-            num_blocks,
-            block_size
-        );
-
-        Some(device_id)
-    })
-}
-
-/// Get a storage device by ID
-pub fn get_device(device_id: u32) -> Option<StorageDevice> {
-    REGISTRY
-        .borrow()
-        .devices
-        .iter()
-        .flatten()
-        .find(|dev| dev.device_id == device_id)
-        .copied()
-}
-
-/// Read sectors from a storage device
+/// Enumerate every available storage device.
 ///
-/// This is the unified read function used by BlockIO protocol.
-// Failure details are logged at the error site; callers only branch on success.
-#[allow(clippy::result_unit_err)]
-pub fn read_sectors(device_id: u32, lba: u64, buffer: &mut [u8]) -> Result<(), ()> {
-    let device = get_device(device_id).ok_or(())?;
-    let block_size = usize::try_from(device.block_size).map_err(|_| ())?;
-    if block_size == 0 || buffer.is_empty() || !buffer.len().is_multiple_of(block_size) {
-        log::error!(
-            "Storage read buffer length {} is not a non-zero multiple of block size {}",
-            buffer.len(),
-            block_size
-        );
-        return Err(());
-    }
-    let num_sectors = u32::try_from(buffer.len() / block_size).map_err(|_| ())?;
-
-    match device.device_type {
-        StorageType::Usb { .. } => {
-            // TODO: USB mass storage currently only supports a single global device.
-            // A per-device registry (similar to NVMe/AHCI) is needed to support
-            // multiple USB storage devices simultaneously.
-            crate::drivers::usb::mass_storage::global_read_sectors(lba, buffer)
+/// Order: NVMe namespaces, AHCI ports, USB mass storage, SDHCI cards, then
+/// platform-provided devices. USB mass-storage devices are initialized on
+/// first sight and stay registered afterwards.
+pub fn devices() -> Vec<StorageDevice, MAX_STORAGE_DEVICES> {
+    let mut devices = Vec::new();
+    let mut push = |device: StorageDevice| {
+        if devices.push(device).is_err() {
+            log::warn!("Storage: device list full, ignoring remaining devices");
         }
-        StorageType::Nvme {
+    };
+
+    for controller_id in 0..nvme::controller_count() {
+        nvme::with_controller(controller_id, |controller| {
+            let pci = controller.pci_address();
+            for namespace in controller.namespaces() {
+                push(StorageDevice {
+                    id: StorageId::Nvme {
+                        controller_id,
+                        nsid: namespace.nsid,
+                    },
+                    pci: Some(pci),
+                    info: fixed_disk_info(namespace.num_blocks, namespace.block_size),
+                    label: label(format_args!("NVMe ns{}", namespace.nsid)),
+                });
+            }
+        });
+    }
+
+    for controller_id in 0..ahci::controller_count() {
+        ahci::with_controller(controller_id, |controller| {
+            let pci = controller.pci_address();
+            for port in 0..controller.num_active_ports() {
+                let Some(port_info) = controller.get_port(port) else {
+                    continue;
+                };
+                push(StorageDevice {
+                    id: StorageId::Ahci {
+                        controller_id,
+                        port,
+                    },
+                    pci: Some(pci),
+                    info: fixed_disk_info(port_info.sector_count, port_info.sector_size),
+                    label: label(format_args!("SATA port {}", port)),
+                });
+            }
+        });
+    }
+
+    for (controller_id, device_addr) in usb::find_mass_storage_devices() {
+        if !usb::mass_storage::probe(controller_id, device_addr) {
+            continue;
+        }
+        usb::mass_storage::with_device(controller_id, device_addr, |device, controller| {
+            push(StorageDevice {
+                id: StorageId::Usb {
+                    controller_id,
+                    device_addr,
+                },
+                pci: None,
+                info: usb_disk_info(device),
+                label: label(format_args!("{} USB", controller.controller_type())),
+            });
+        });
+    }
+
+    for controller_id in 0..sdhci::controller_count() {
+        sdhci::with_controller(controller_id, |controller| {
+            if !controller.is_ready() {
+                return;
+            }
+            let pci = controller.pci_address();
+            push(StorageDevice {
+                id: StorageId::Sdhci { controller_id },
+                pci,
+                info: sdhci_disk_info(controller),
+                label: label(format_args!(
+                    "{}",
+                    if pci.is_some() { "SD card" } else { "eMMC" }
+                )),
+            });
+        });
+    }
+
+    PLATFORM_BLOCK_DEVICES.with_mut(|platform_devices| {
+        for (index, &device) in platform_devices.iter().enumerate() {
+            // SAFETY: registered devices outlive the firmware and the borrow
+            // of the registry serializes access to them.
+            let device = unsafe { &*device };
+            push(StorageDevice {
+                id: StorageId::Platform { index },
+                pci: None,
+                info: device.info(),
+                label: label(format_args!("{}", device.name())),
+            });
+        }
+    });
+
+    devices
+}
+
+/// Lend the device identified by `id` to `f` as a `&mut dyn BlockDevice`.
+///
+/// The owning controller stays locked while `f` runs, so `f` must not call
+/// into loaded images or access the same controller through another path.
+///
+/// # Returns
+/// The closure's result, or [`BlockError::NoMedia`] when `id` does not
+/// resolve to a present device.
+pub fn with_disk<R>(
+    id: StorageId,
+    f: impl FnOnce(&mut dyn BlockDevice) -> R,
+) -> Result<R, BlockError> {
+    match id {
+        StorageId::Nvme {
             controller_id,
             nsid,
-        } => crate::drivers::nvme::with_controller(controller_id, |controller| {
-            controller
-                .read_sectors(nsid, lba, num_sectors, buffer)
-                .map_err(|error| {
-                    log::error!("NVMe read failed at LBA {}: {:?}", lba, error);
-                })
-        })
-        .unwrap_or_else(|| {
-            log::error!("NVMe controller {} not found", controller_id);
-            Err(())
+        } => nvme::with_controller(controller_id, |controller| {
+            let namespace = controller.get_namespace(nsid)?;
+            let info = fixed_disk_info(namespace.num_blocks, namespace.block_size);
+            Some(f(&mut Disk::new(info, |lba, count, buffer| {
+                controller
+                    .read_sectors(nsid, lba, count, buffer)
+                    .map_err(read_failed(id, lba))
+            })))
         }),
-        StorageType::Ahci {
+        StorageId::Ahci {
             controller_id,
             port,
-        } => crate::drivers::ahci::with_controller(controller_id, |controller| {
-            controller
-                .read_sectors_into(port, lba, num_sectors, buffer)
-                .map_err(|error| {
-                    log::error!("AHCI read failed at LBA {}: {:?}", lba, error);
-                })
-        })
-        .unwrap_or_else(|| {
-            log::error!("AHCI controller {} not found", controller_id);
-            Err(())
-        }),
-        StorageType::Sdhci { controller_id } => {
-            crate::drivers::sdhci::with_controller(controller_id, |controller| {
+        } => ahci::with_controller(controller_id, |controller| {
+            let port_info = controller.get_port(port)?;
+            let info = fixed_disk_info(port_info.sector_count, port_info.sector_size);
+            Some(f(&mut Disk::new(info, |lba, count, buffer| {
                 controller
-                    .read_sectors(lba, num_sectors, buffer)
-                    .map_err(|error| {
-                        log::error!("SDHCI read failed at LBA {}: {:?}", lba, error);
-                    })
-            })
-            .unwrap_or_else(|| {
-                log::error!("SDHCI controller {} not found", controller_id);
-                Err(())
-            })
-        }
-        StorageType::Platform { index } => with_platform_block_device(index, |dev| {
-            let info = dev.info();
-            if info.block_size != device.block_size {
-                log::error!(
-                    "Platform device {} block size changed from {} to {}",
-                    index,
-                    device.block_size,
-                    info.block_size
-                );
-                return Err(());
+                    .read_sectors_into(port, lba, count, buffer)
+                    .map_err(read_failed(id, lba))
+            })))
+        }),
+        StorageId::Usb {
+            controller_id,
+            device_addr,
+        } => usb::mass_storage::with_device(controller_id, device_addr, |device, controller| {
+            let info = usb_disk_info(device);
+            Some(f(&mut Disk::new(info, |lba, count, buffer| {
+                device
+                    .read_sectors_generic(controller, lba, count, buffer)
+                    .map_err(read_failed(id, lba))
+            })))
+        }),
+        StorageId::Sdhci { controller_id } => sdhci::with_controller(controller_id, |controller| {
+            if !controller.is_ready() {
+                return None;
             }
-            dev.read_blocks(lba, num_sectors, buffer).map_err(|e| {
-                log::error!(
-                    "Platform device {} read failed at LBA {}: {:?}",
-                    index,
-                    lba,
-                    e
-                );
-            })
-        })
-        .unwrap_or(Err(())),
+            let info = sdhci_disk_info(controller);
+            Some(f(&mut Disk::new(info, |lba, count, buffer| {
+                controller
+                    .read_sectors(lba, count, buffer)
+                    .map_err(read_failed(id, lba))
+            })))
+        }),
+        StorageId::Platform { index } => Some(PLATFORM_BLOCK_DEVICES.with_mut(|devices| {
+            let &device = devices.get(index)?;
+            // SAFETY: registered devices outlive the firmware and the mutable
+            // borrow of the registry excludes any other access to them.
+            Some(f(unsafe { &mut *device }))
+        })),
+    }
+    .flatten()
+    .ok_or(BlockError::NoMedia)
+}
+
+/// Log a failed driver read and convert the driver error.
+fn read_failed<E>(id: StorageId, lba: u64) -> impl FnOnce(E) -> BlockError
+where
+    E: core::fmt::Debug + Into<BlockError>,
+{
+    move |error| {
+        log::error!("{:?}: read failed at LBA {}: {:?}", id, lba, error);
+        error.into()
+    }
+}
+
+/// A driver device borrowed for one [`with_disk()`] call.
+struct Disk<F> {
+    info: BlockDeviceInfo,
+    read: F,
+}
+
+impl<F> Disk<F>
+where
+    F: FnMut(u64, u32, &mut [u8]) -> Result<(), BlockError>,
+{
+    fn new(info: BlockDeviceInfo, read: F) -> Self {
+        Self { info, read }
+    }
+}
+
+impl<F> BlockDevice for Disk<F>
+where
+    F: FnMut(u64, u32, &mut [u8]) -> Result<(), BlockError>,
+{
+    fn info(&self) -> BlockDeviceInfo {
+        self.info
+    }
+
+    fn read_blocks(&mut self, lba: u64, count: u32, buffer: &mut [u8]) -> Result<(), BlockError> {
+        self.validate_read(lba, count, buffer)?;
+        if count == 0 {
+            return Ok(());
+        }
+        let len = count as usize * self.info.block_size as usize;
+        (self.read)(lba, count, &mut buffer[..len])
+    }
+}
+
+/// Media description of a fixed, writable disk.
+fn fixed_disk_info(num_blocks: u64, block_size: u32) -> BlockDeviceInfo {
+    BlockDeviceInfo {
+        num_blocks,
+        block_size,
+        media_id: 0,
+        removable: false,
+        read_only: false,
+    }
+}
+
+fn usb_disk_info(device: &usb::UsbMassStorage) -> BlockDeviceInfo {
+    BlockDeviceInfo {
+        removable: true,
+        ..fixed_disk_info(device.num_blocks, device.block_size)
+    }
+}
+
+fn sdhci_disk_info(controller: &sdhci::SdhciController) -> BlockDeviceInfo {
+    BlockDeviceInfo {
+        removable: controller.removable(),
+        ..fixed_disk_info(controller.num_blocks(), controller.block_size())
+    }
+}
+
+/// Format a device label, truncated to the label capacity.
+fn label(args: core::fmt::Arguments<'_>) -> String<32> {
+    struct Truncating(String<32>);
+
+    impl Write for Truncating {
+        fn write_str(&mut self, s: &str) -> core::fmt::Result {
+            s.chars()
+                .try_for_each(|c| self.0.push(c))
+                .map_err(|_| core::fmt::Error)
+        }
+    }
+
+    let mut label = Truncating(String::new());
+    let _ = label.write_fmt(args);
+    label.0
+}
+
+impl From<nvme::NvmeError> for BlockError {
+    fn from(e: nvme::NvmeError) -> Self {
+        match e {
+            nvme::NvmeError::InvalidNamespace => BlockError::NoMedia,
+            nvme::NvmeError::InvalidParameter => BlockError::InvalidParameter,
+            _ => BlockError::DeviceError,
+        }
+    }
+}
+
+impl From<ahci::AhciError> for BlockError {
+    fn from(e: ahci::AhciError) -> Self {
+        match e {
+            ahci::AhciError::NoDevice => BlockError::NoMedia,
+            ahci::AhciError::InvalidParameter => BlockError::InvalidParameter,
+            _ => BlockError::DeviceError,
+        }
+    }
+}
+
+impl From<usb::mass_storage::MassStorageError> for BlockError {
+    fn from(e: usb::mass_storage::MassStorageError) -> Self {
+        match e {
+            usb::mass_storage::MassStorageError::NotReady => BlockError::NoMedia,
+            usb::mass_storage::MassStorageError::InvalidParameter => BlockError::InvalidParameter,
+            _ => BlockError::DeviceError,
+        }
+    }
+}
+
+impl From<sdhci::SdhciError> for BlockError {
+    fn from(e: sdhci::SdhciError) -> Self {
+        match e {
+            sdhci::SdhciError::NoCard => BlockError::NoMedia,
+            sdhci::SdhciError::InvalidParameter => BlockError::InvalidParameter,
+            sdhci::SdhciError::NotInitialized => BlockError::NoMedia,
+            _ => BlockError::DeviceError,
+        }
     }
 }
