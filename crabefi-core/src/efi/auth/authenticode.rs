@@ -537,7 +537,7 @@ fn verify_authenticode_signature(
             continue;
         }
 
-        match verify_pkcs7_signature(sig.pkcs7_data, image_hash, cert_der) {
+        match verify_pkcs7_signature(sig.pkcs7_data, image_hash, cert_der, false) {
             Ok(true) => {
                 log::info!("Secure Boot: Signature verified successfully");
                 return Ok(true);
