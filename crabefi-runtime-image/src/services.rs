@@ -112,12 +112,12 @@ pub extern "efiapi" fn set_virtual_address_map(
     descriptor_version: u32,
     virtual_map: *mut efi::MemoryDescriptor,
 ) -> efi::Status {
-    svam::set_virtual_address_map(
+    efi::status(svam::set_virtual_address_map(
         memory_map_size,
         descriptor_size,
         descriptor_version,
         virtual_map,
-    )
+    ))
 }
 
 pub extern "efiapi" fn convert_pointer(

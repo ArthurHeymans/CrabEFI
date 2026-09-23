@@ -46,28 +46,25 @@ pub fn set_virtual_address_map(
     descriptor_size: usize,
     descriptor_version: u32,
     virtual_map: *mut efi::MemoryDescriptor,
-) -> efi::Status {
+) -> Result<(), efi::Status> {
     if virtual_map.is_null()
         || descriptor_version != efi::MEMORY_DESCRIPTOR_VERSION
         || descriptor_size < core::mem::size_of::<efi::MemoryDescriptor>()
         || memory_map_size == 0
         || !memory_map_size.is_multiple_of(descriptor_size)
     {
-        return efi::Status::INVALID_PARAMETER;
+        return Err(efi::Status::INVALID_PARAMETER);
     }
     let descriptor_count = memory_map_size / descriptor_size;
     if descriptor_count == 0 || descriptor_count > MAX_DESCRIPTORS {
-        return efi::Status::INVALID_PARAMETER;
+        return Err(efi::Status::INVALID_PARAMETER);
     }
-    let state_pointer = match state::begin_virtual_transition() {
-        Ok(pointer) => pointer,
-        Err(status) => return status,
-    };
+    let state_pointer = state::begin_virtual_transition()?;
     // SAFETY: begin_virtual_transition owns the global lease. The physical
     // state pointer is snapshotted once and is used through the whole commit.
     let runtime = unsafe { &mut *state_pointer };
 
-    let result = validate_descriptor_stream(virtual_map.cast(), descriptor_size, descriptor_count)
+    validate_descriptor_stream(virtual_map.cast(), descriptor_size, descriptor_count)
         .and_then(|()| {
             let section_mappings = resolve_sections(
                 runtime,
@@ -94,12 +91,8 @@ pub fn set_virtual_address_map(
                 &range_mappings,
                 deferred_mapping,
             )
-        });
-    if let Err(status) = result {
-        state::abort_virtual_transition();
-        return status;
-    }
-    efi::Status::SUCCESS
+        })
+        .inspect_err(|_| state::abort_virtual_transition())
 }
 
 fn validate_descriptor_stream(
