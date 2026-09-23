@@ -19,11 +19,11 @@ const EI_VERSION: usize = 6;
 const ELF64_PHDR_SIZE: usize = core::mem::size_of::<ProgramHeader64>();
 
 #[cfg(target_arch = "x86_64")]
-const EM_NATIVE: u16 = elf::EM_X86_64;
+const EM_NATIVE: elf::Machine = elf::EM_X86_64;
 #[cfg(target_arch = "aarch64")]
-const EM_NATIVE: u16 = elf::EM_AARCH64;
+const EM_NATIVE: elf::Machine = elf::EM_AARCH64;
 #[cfg(target_arch = "riscv64")]
-const EM_NATIVE: u16 = elf::EM_RISCV;
+const EM_NATIVE: elf::Machine = elf::EM_RISCV;
 
 /// Errors during ELF loading
 #[derive(Debug)]
@@ -81,10 +81,10 @@ impl Elf64 {
         if data[..elf::ELFMAG.len()] != elf::ELFMAG {
             return Err(ElfError::InvalidMagic);
         }
-        if data[EI_CLASS] != elf::ELFCLASS64 {
+        if data[EI_CLASS] != elf::ELFCLASS64.0 {
             return Err(ElfError::Not64Bit);
         }
-        if data[EI_DATA] != elf::ELFDATA2LSB {
+        if data[EI_DATA] != elf::ELFDATA2LSB.0 {
             return Err(ElfError::NotLittleEndian);
         }
 
@@ -98,7 +98,7 @@ impl Elf64 {
         if header.e_machine(endian) != EM_NATIVE {
             return Err(ElfError::WrongMachine);
         }
-        if header.e_version(endian) != u32::from(elf::EV_CURRENT)
+        if header.e_version(endian) != u32::from(elf::EV_CURRENT.0)
             || usize::from(header.e_ehsize(endian)) != ELF64_HEADER_SIZE
             || (header.e_phnum(endian) != 0 && header.e_phoff(endian) == 0)
         {
@@ -233,7 +233,7 @@ mod tests {
     impl TestPhdr {
         fn load(p_offset: u64, p_vaddr: u64, p_filesz: u64, p_memsz: u64) -> Self {
             Self {
-                p_type: elf::PT_LOAD,
+                p_type: elf::PT_LOAD.0,
                 p_offset,
                 p_vaddr,
                 p_filesz,
@@ -283,11 +283,11 @@ mod tests {
         let mut data = vec![0; ELF64_HEADER_SIZE.max(table_end).max(segment_end)];
 
         data[..elf::ELFMAG.len()].copy_from_slice(&elf::ELFMAG);
-        data[EI_CLASS] = elf::ELFCLASS64;
-        data[EI_DATA] = elf::ELFDATA2LSB;
-        data[EI_VERSION] = elf::EV_CURRENT;
-        put_u16(&mut data, 16, elf::ET_EXEC);
-        put_u16(&mut data, 18, EM_NATIVE);
+        data[EI_CLASS] = elf::ELFCLASS64.0;
+        data[EI_DATA] = elf::ELFDATA2LSB.0;
+        data[EI_VERSION] = elf::EV_CURRENT.0;
+        put_u16(&mut data, 16, elf::ET_EXEC.0);
+        put_u16(&mut data, 18, EM_NATIVE.0);
         put_u32(&mut data, 20, 1);
         put_u64(&mut data, 24, entry);
         put_u64(&mut data, 32, phoff as u64);
@@ -398,22 +398,22 @@ mod tests {
         assert!(matches!(Elf64::parse(&data), Err(ElfError::InvalidMagic)));
 
         let mut data = one_load();
-        data[EI_CLASS] = elf::ELFCLASS32;
+        data[EI_CLASS] = elf::ELFCLASS32.0;
         assert!(matches!(Elf64::parse(&data), Err(ElfError::Not64Bit)));
 
         let mut data = one_load();
-        data[EI_DATA] = elf::ELFDATA2MSB;
+        data[EI_DATA] = elf::ELFDATA2MSB.0;
         assert!(matches!(
             Elf64::parse(&data),
             Err(ElfError::NotLittleEndian)
         ));
 
         let mut data = one_load();
-        put_u16(&mut data, 16, elf::ET_REL);
+        put_u16(&mut data, 16, elf::ET_REL.0);
         assert!(matches!(Elf64::parse(&data), Err(ElfError::NotExecutable)));
 
         let mut data = one_load();
-        put_u16(&mut data, 18, EM_NATIVE.wrapping_add(1));
+        put_u16(&mut data, 18, EM_NATIVE.0.wrapping_add(1));
         assert!(matches!(Elf64::parse(&data), Err(ElfError::WrongMachine)));
 
         let mut data = one_load();
