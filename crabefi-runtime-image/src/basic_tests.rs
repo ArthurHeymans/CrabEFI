@@ -2,13 +2,27 @@
 
 use crate::{
     efi,
-    services::{apply_variable, capsule_delivery_available},
+    services::{VariableContext, VariableRequest, apply_variable, capsule_delivery_available},
     state::{Phase, RetainedBuffer, RuntimeState},
     store::{VariableStore, VariableTransaction},
 };
 use crabefi_efi_types::secure_boot;
 
 const ATTRIBUTES: u32 = efi::VARIABLE_BOOTSERVICE_ACCESS | efi::VARIABLE_RUNTIME_ACCESS;
+
+/// Apply a request without a boot bridge or retained buffer.
+fn apply(
+    store: &mut VariableStore,
+    transaction: &mut VariableTransaction,
+    phase: Phase,
+    request: VariableRequest<'_>,
+) -> efi::Status {
+    let context = VariableContext {
+        phase,
+        ..VariableContext::boot(store, transaction, 0)
+    };
+    efi::status(apply_variable(context, request))
+}
 
 #[test]
 fn capsule_delivery_requires_boot_consumer_enablement() {
@@ -35,17 +49,16 @@ fn ordinary_variables_work_at_boot_and_runtime_without_authentication() {
         (Phase::SealedPhysical, b"runtime".as_slice()),
     ] {
         assert_eq!(
-            apply_variable(
+            apply(
                 &mut store,
                 &mut transaction,
-                None,
                 phase,
-                0,
-                None,
-                guid,
-                &name,
-                ATTRIBUTES,
-                data
+                VariableRequest {
+                    guid,
+                    name: &name,
+                    attributes: ATTRIBUTES,
+                    data,
+                },
             ),
             efi::Status::SUCCESS
         );
@@ -76,17 +89,16 @@ fn authentication_and_key_writes_are_unsupported_not_silently_accepted() {
         ),
     ] {
         assert_eq!(
-            apply_variable(
+            apply(
                 &mut store,
                 &mut transaction,
-                None,
                 Phase::BootActive,
-                0,
-                None,
-                guid,
-                name,
-                attributes,
-                b"invalid"
+                VariableRequest {
+                    guid,
+                    name,
+                    attributes,
+                    data: b"invalid",
+                },
             ),
             efi::Status::UNSUPPORTED
         );
@@ -102,17 +114,16 @@ fn status_variables_are_write_protected_and_missing_nv_backend_does_not_succeed(
     let mut transaction = VariableTransaction::new();
     for name in [secure_boot::SETUP_MODE_NAME, secure_boot::SECURE_BOOT_NAME] {
         assert_eq!(
-            apply_variable(
+            apply(
                 &mut store,
                 &mut transaction,
-                None,
                 Phase::BootActive,
-                0,
-                None,
-                secure_boot::EFI_GLOBAL_VARIABLE_GUID,
-                name,
-                ATTRIBUTES,
-                &[1]
+                VariableRequest {
+                    guid: secure_boot::EFI_GLOBAL_VARIABLE_GUID,
+                    name,
+                    attributes: ATTRIBUTES,
+                    data: &[1],
+                },
             ),
             efi::Status::WRITE_PROTECTED
         );
@@ -123,17 +134,16 @@ fn status_variables_are_write_protected_and_missing_nv_backend_does_not_succeed(
         (Phase::SealedPhysical, efi::Status::UNSUPPORTED),
     ] {
         assert_eq!(
-            apply_variable(
+            apply(
                 &mut store,
                 &mut transaction,
-                None,
                 phase,
-                0,
-                None,
-                [0x42; 16],
-                &name,
-                ATTRIBUTES | efi::VARIABLE_NON_VOLATILE,
-                b"nv"
+                VariableRequest {
+                    guid: [0x42; 16],
+                    name: &name,
+                    attributes: ATTRIBUTES | efi::VARIABLE_NON_VOLATILE,
+                    data: b"nv",
+                },
             ),
             expected
         );
