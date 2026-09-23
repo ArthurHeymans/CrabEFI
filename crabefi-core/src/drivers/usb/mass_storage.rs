@@ -994,9 +994,6 @@ impl UsbMassStorage {
 // Registered Mass Storage Devices
 // ============================================================================
 
-/// Maximum number of initialized mass storage devices.
-const MAX_MASS_STORAGE_DEVICES: usize = 8;
-
 /// An initialized mass storage device and the controller it is attached to.
 struct RegisteredDevice {
     controller_id: usize,
@@ -1004,8 +1001,7 @@ struct RegisteredDevice {
 }
 
 /// Initialized mass storage devices.
-static DEVICES: Local<heapless::Vec<RegisteredDevice, MAX_MASS_STORAGE_DEVICES>> =
-    Local::new(heapless::Vec::new());
+static DEVICES: Local<alloc::vec::Vec<RegisteredDevice>> = Local::new(alloc::vec::Vec::new());
 
 fn is_registered(controller_id: usize, device_addr: u8) -> bool {
     DEVICES.borrow().iter().any(|registered| {
@@ -1043,17 +1039,11 @@ pub fn probe(controller_id: usize, device_addr: u8) -> bool {
         None => return false,
     };
 
-    let registered = DEVICES
-        .borrow_mut()
-        .push(RegisteredDevice {
-            controller_id,
-            device,
-        })
-        .is_ok();
-    if !registered {
-        log::warn!("USB mass storage device list full");
-    }
-    registered
+    DEVICES.borrow_mut().push(RegisteredDevice {
+        controller_id,
+        device,
+    });
+    true
 }
 
 /// Access a registered mass storage device together with its controller.

@@ -787,14 +787,16 @@ pub trait UsbController {
             .find_map(|h| h.as_ref().filter(|h| h.address == address))
     }
 
-    /// Find a mass storage device
-    ///
-    /// # Returns
-    /// Device address/slot ID if found
+    /// Find the first mass storage device address/slot ID, if any.
     fn find_mass_storage(&self) -> Option<u8> {
         self.devices()
             .iter()
             .find_map(|h| h.as_ref().filter(|h| h.is_mass_storage).map(|h| h.address))
+    }
+
+    /// Visit every mass storage device address on this controller.
+    fn for_each_mass_storage(&self, f: &mut dyn FnMut(u8)) {
+        for_each_mass_storage_device(self.devices(), f);
     }
 
     /// Find a HID keyboard device
@@ -869,6 +871,28 @@ pub struct DeviceInfo {
 // ============================================================================
 // Common USB Device State
 // ============================================================================
+
+fn for_each_mass_storage_device(devices: &[Option<UsbDevice>], f: &mut dyn FnMut(u8)) {
+    for device in devices.iter().flatten().filter(|d| d.is_mass_storage) {
+        f(device.address);
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn legacy_mass_storage_discovery_visits_every_device() {
+    let mut first = UsbDevice::new(1, 0, UsbSpeed::High);
+    first.is_mass_storage = true;
+    let keyboard = UsbDevice::new(2, 1, UsbSpeed::High);
+    let mut second = UsbDevice::new(3, 2, UsbSpeed::High);
+    second.is_mass_storage = true;
+    let mut found = alloc::vec::Vec::new();
+    for_each_mass_storage_device(
+        &[Some(first), Some(keyboard), None, Some(second)],
+        &mut |addr| found.push(addr),
+    );
+    assert_eq!(found, [1, 3]);
+}
 
 /// Common USB device state shared across EHCI/OHCI/UHCI controllers
 ///
