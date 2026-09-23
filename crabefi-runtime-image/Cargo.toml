@@ -9,11 +9,12 @@ build = "build.rs"
 
 [features]
 default = []
-secure-boot = ["dep:sha2"]
+secure-boot = ["dep:sha2", "dep:crabefi-pkcs7"]
 full = ["secure-boot"]
 
 [dependencies]
 crabefi-efi-types = { path = "../crabefi-efi-types" }
+crabefi-pkcs7 = { path = "../crabefi-pkcs7", optional = true }
 crabefi-runtime-abi = { path = "../crabefi-runtime-abi" }
 bitflags = { version = "2", default-features = false }
 heapless = { version = "0.9", default-features = false }
