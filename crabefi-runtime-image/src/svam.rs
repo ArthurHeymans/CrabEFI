@@ -250,18 +250,18 @@ fn resolve_deferred_buffer(
     stride: usize,
     count: usize,
 ) -> Result<Option<Mapping>, efi::Status> {
-    if runtime.deferred_buffer_physical == 0 && runtime.deferred_buffer_size == 0 {
+    let Some(retained) = runtime.retained else {
         return Ok(None);
-    }
-    let end = runtime
-        .deferred_buffer_physical
-        .checked_add(runtime.deferred_buffer_size as u64)
+    };
+    let end = retained
+        .physical_base
+        .checked_add(retained.size as u64)
         .ok_or(efi::Status::INVALID_PARAMETER)?;
     unique_mapping(map, stride, count, |candidate| {
         covers_runtime(
             candidate,
             efi::RUNTIME_SERVICES_DATA,
-            runtime.deferred_buffer_physical,
+            retained.physical_base,
             end,
         )
     })
@@ -300,17 +300,24 @@ fn virtual_time_config(
     Ok(TimeConfig { base, ..time })
 }
 
+/// Virtual address of `physical` inside the descriptor `mapping` it.
+fn virtual_base(physical: u64, mapping: &Mapping) -> Result<u64, efi::Status> {
+    physical
+        .checked_sub(mapping.physical)
+        .and_then(|offset| mapping.virtual_address.checked_add(offset))
+        .ok_or(efi::Status::INVALID_PARAMETER)
+}
+
 /// Virtual base of each physical region given the descriptor mapping it.
 fn virtual_bases<const N: usize>(
     physical_bases: impl Iterator<Item = u64>,
     mappings: &[Mapping],
 ) -> Result<Vec<u64, N>, efi::Status> {
-    collect_bounded(physical_bases.zip(mappings).map(|(physical, mapping)| {
-        physical
-            .checked_sub(mapping.physical)
-            .and_then(|offset| mapping.virtual_address.checked_add(offset))
-            .ok_or(efi::Status::INVALID_PARAMETER)
-    }))
+    collect_bounded(
+        physical_bases
+            .zip(mappings)
+            .map(|(physical, mapping)| virtual_base(physical, mapping)),
+    )
 }
 
 fn validate_and_commit(
@@ -331,18 +338,11 @@ fn validate_and_commit(
 
     let virtual_time = virtual_time_config(runtime, &range_virtual_bases)?;
 
-    let deferred_virtual = if let Some(mapping) = deferred_mapping {
-        let offset = runtime
-            .deferred_buffer_physical
-            .checked_sub(mapping.physical)
-            .ok_or(efi::Status::INVALID_PARAMETER)?;
-        mapping
-            .virtual_address
-            .checked_add(offset)
-            .ok_or(efi::Status::INVALID_PARAMETER)?
-    } else {
-        0
-    };
+    let retained_virtual_base = runtime
+        .retained
+        .zip(deferred_mapping)
+        .map(|(retained, mapping)| virtual_base(retained.physical_base, &mapping))
+        .transpose()?;
 
     let runtime_table_start = core::ptr::addr_of!(runtime.tables.runtime) as u64;
     let runtime_table_end = runtime_table_start
@@ -426,7 +426,9 @@ fn validate_and_commit(
         range.virtual_base = *virtual_base;
     }
     runtime.time = virtual_time;
-    runtime.deferred_buffer_virtual = deferred_virtual;
+    if let (Some(retained), Some(base)) = (&mut runtime.retained, retained_virtual_base) {
+        retained.virtual_base = base;
+    }
 
     let sections = &runtime.sections;
     runtime.tables.convert_internal_pointers(|physical| {

@@ -12,7 +12,7 @@ use crabefi_runtime_abi::{
 use heapless::Vec;
 
 use crate::{
-    deferred::DeferredTransaction,
+    deferred::{DeferredRegion, DeferredTransaction},
     efi,
     store::{VariableStore, VariableTransaction},
     tables::ImageTables,
@@ -108,6 +108,15 @@ pub struct ResetConfig {
     pub base: u64,
 }
 
+/// Retained deferred buffer described by the handoff.
+#[derive(Clone, Copy)]
+pub struct RetainedBuffer {
+    pub physical_base: u64,
+    /// Zero until SetVirtualAddressMap commits.
+    pub virtual_base: u64,
+    pub size: usize,
+}
+
 pub struct RuntimeState {
     pub tables: ImageTables,
     pub sections: Vec<SectionRecord, MAX_SECTIONS>,
@@ -115,9 +124,7 @@ pub struct RuntimeState {
     pub relocations: Vec<RelocationRecord, MAX_RELOCATIONS>,
     pub time: TimeConfig,
     pub boot_bridge: u64,
-    pub deferred_buffer_physical: u64,
-    pub deferred_buffer_virtual: u64,
-    pub deferred_buffer_size: usize,
+    pub retained: Option<RetainedBuffer>,
     pub capsule_delivery_enabled: bool,
 }
 
@@ -133,9 +140,7 @@ impl RuntimeState {
                 base: 0,
             },
             boot_bridge: 0,
-            deferred_buffer_physical: 0,
-            deferred_buffer_virtual: 0,
-            deferred_buffer_size: 0,
+            retained: None,
             capsule_delivery_enabled: false,
         }
     }
@@ -167,9 +172,14 @@ impl RuntimeState {
             base: handoff.reset.io_or_mmio_base,
         };
         self.boot_bridge = handoff.boot_bridge;
-        self.deferred_buffer_physical = handoff.deferred_buffer_base;
-        self.deferred_buffer_size = usize::try_from(handoff.deferred_buffer_size)
-            .map_err(|_| efi::Status::INVALID_PARAMETER)?;
+        self.retained = match (handoff.deferred_buffer_base, handoff.deferred_buffer_size) {
+            (0, 0) => None,
+            (physical_base, size) => Some(RetainedBuffer {
+                physical_base,
+                virtual_base: 0,
+                size: usize::try_from(size).map_err(|_| efi::Status::INVALID_PARAMETER)?,
+            }),
+        };
         // Publish ResetSystem's lock-free snapshot before boot services can
         // call it. The snapshot is outside RuntimeState so a re-entrant reset
         // never reads through an outstanding mutable state lease.
@@ -210,13 +220,20 @@ impl RuntimeState {
             .map_err(|_| efi::Status::OUT_OF_RESOURCES)
     }
 
-    pub fn deferred_buffer(&self) -> (*mut u8, usize) {
+    /// The retained buffer at its address for the current phase.
+    pub fn deferred_region(&mut self) -> Option<DeferredRegion<'_>> {
+        let retained = self.retained?;
         let base = if Phase::current() == Phase::Virtual {
-            self.deferred_buffer_virtual
+            retained.virtual_base
         } else {
-            self.deferred_buffer_physical
+            retained.physical_base
         };
-        (base as *mut u8, self.deferred_buffer_size)
+        // SAFETY: the handoff validated a nonzero, page-aligned range the boot
+        // allocator reserved as RuntimeServicesData for this image, and it is
+        // mapped at `base` in the current phase. The region borrows the leased
+        // state mutably, so it is the only live view of those bytes.
+        let bytes = unsafe { core::slice::from_raw_parts_mut(base as *mut u8, retained.size) };
+        Some(DeferredRegion::new(bytes))
     }
 }
 
@@ -324,11 +341,12 @@ impl RuntimeCell {
     }
 }
 
+/// Variable store and its scratch buffers, kept outside `RuntimeState`.
 #[repr(C)]
 pub struct RuntimeStore {
-    store: VariableStore,
-    transaction: VariableTransaction,
-    deferred_transaction: DeferredTransaction,
+    pub store: VariableStore,
+    pub transaction: VariableTransaction,
+    pub deferred_transaction: DeferredTransaction,
 }
 
 impl RuntimeStore {
@@ -399,29 +417,14 @@ impl Lease {
         unsafe { &(*RUNTIME_VARIABLE_STORE.get()).store }
     }
 
-    pub fn variables_mut(&mut self) -> (&mut VariableStore, &mut VariableTransaction) {
-        // SAFETY: the two fields are disjoint and this lease uniquely owns the
-        // runtime operation lock for the duration of both mutable references.
+    /// Disjoint mutable views of the runtime state and the variable store.
+    pub fn parts_mut(&mut self) -> (&mut RuntimeState, &mut RuntimeStore) {
+        // SAFETY: the two statics are distinct and this lease uniquely owns
+        // the runtime operation lock for the duration of both references.
         unsafe {
-            let store = &mut *RUNTIME_VARIABLE_STORE.get();
-            (&mut store.store, &mut store.transaction)
-        }
-    }
-
-    pub fn variable_state_mut(
-        &mut self,
-    ) -> (
-        &mut VariableStore,
-        &mut VariableTransaction,
-        &mut DeferredTransaction,
-    ) {
-        // SAFETY: all three fields are disjoint and the lease is unique.
-        unsafe {
-            let store = &mut *RUNTIME_VARIABLE_STORE.get();
             (
-                &mut store.store,
-                &mut store.transaction,
-                &mut store.deferred_transaction,
+                &mut *RUNTIME_STATE.get(),
+                &mut *RUNTIME_VARIABLE_STORE.get(),
             )
         }
     }

@@ -3,7 +3,7 @@
 use crate::{
     efi,
     services::{apply_variable, capsule_delivery_available},
-    state::{Phase, RuntimeState},
+    state::{Phase, RetainedBuffer, RuntimeState},
     store::{VariableStore, VariableTransaction},
 };
 use crabefi_efi_types::secure_boot;
@@ -13,8 +13,11 @@ const ATTRIBUTES: u32 = efi::VARIABLE_BOOTSERVICE_ACCESS | efi::VARIABLE_RUNTIME
 #[test]
 fn capsule_delivery_requires_boot_consumer_enablement() {
     let mut runtime = RuntimeState::new();
-    runtime.deferred_buffer_physical = 0x1000;
-    runtime.deferred_buffer_size = 0x1000;
+    runtime.retained = Some(RetainedBuffer {
+        physical_base: 0x1000,
+        virtual_base: 0,
+        size: 0x1000,
+    });
     assert!(!capsule_delivery_available(&runtime));
 
     runtime.capsule_delivery_enabled = true;
@@ -38,7 +41,7 @@ fn ordinary_variables_work_at_boot_and_runtime_without_authentication() {
                 None,
                 phase,
                 0,
-                (core::ptr::null_mut(), 0),
+                None,
                 guid,
                 &name,
                 ATTRIBUTES,
@@ -79,7 +82,7 @@ fn authentication_and_key_writes_are_unsupported_not_silently_accepted() {
                 None,
                 Phase::BootActive,
                 0,
-                (core::ptr::null_mut(), 0),
+                None,
                 guid,
                 name,
                 attributes,
@@ -105,7 +108,7 @@ fn status_variables_are_write_protected_and_missing_nv_backend_does_not_succeed(
                 None,
                 Phase::BootActive,
                 0,
-                (core::ptr::null_mut(), 0),
+                None,
                 secure_boot::EFI_GLOBAL_VARIABLE_GUID,
                 name,
                 ATTRIBUTES,
@@ -126,7 +129,7 @@ fn status_variables_are_write_protected_and_missing_nv_backend_does_not_succeed(
                 None,
                 phase,
                 0,
-                (core::ptr::null_mut(), 0),
+                None,
                 [0x42; 16],
                 &name,
                 ATTRIBUTES | efi::VARIABLE_NON_VOLATILE,

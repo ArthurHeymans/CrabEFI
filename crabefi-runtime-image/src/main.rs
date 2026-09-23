@@ -183,9 +183,9 @@ unsafe fn import_variable(import: Option<&VariableImport>) -> Result<(), efi::St
         _ => return Err(efi::Status::INVALID_PARAMETER),
     };
     let mut lease = state::lease_in(&[Phase::Importing])?;
-    let (store, transaction) = lease.variables_mut();
-    store.import(
-        transaction,
+    let (_, variables) = lease.parts_mut();
+    variables.store.import(
+        &mut variables.transaction,
         import.guid,
         name,
         import.attributes,
@@ -224,7 +224,7 @@ pub extern "C" fn runtime_image_enable_capsule_delivery() -> usize {
 #[unsafe(no_mangle)]
 pub extern "C" fn runtime_image_complete_import() -> usize {
     export_status(state::lease_in(&[Phase::Importing]).map(|mut lease| {
-        lease.variables_mut().0.refresh_policy();
+        lease.parts_mut().1.store.refresh_policy();
         lease.advance(Phase::BootActive);
     }))
 }
