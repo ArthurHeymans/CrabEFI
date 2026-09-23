@@ -231,13 +231,15 @@ fn actual_loader_seal_svam_and_runtime_services_with_and_without_retained_stagin
         let data = [1u8];
         let boot_writes_before = writes.load(Ordering::Relaxed);
         assert_eq!(
-            (unsafe { (*runtime).set_variable })(
-                nv_name.as_mut_ptr(),
-                &guid as *const _ as *mut _,
-                attributes | efi::VARIABLE_NON_VOLATILE,
-                data.len(),
-                data.as_ptr().cast_mut().cast()
-            ),
+            unsafe {
+                ((*runtime).set_variable)(
+                    nv_name.as_mut_ptr(),
+                    &guid as *const _ as *mut _,
+                    attributes | efi::VARIABLE_NON_VOLATILE,
+                    data.len(),
+                    data.as_ptr().cast_mut().cast(),
+                )
+            },
             efi::Status::SUCCESS
         );
         assert!(writes.load(Ordering::Relaxed) > boot_writes_before);
@@ -249,13 +251,15 @@ fn actual_loader_seal_svam_and_runtime_services_with_and_without_retained_stagin
             failure.store(mode, Ordering::Relaxed);
             let rejected = [3u8];
             assert_eq!(
-                (unsafe { (*runtime).set_variable })(
-                    nv_name.as_mut_ptr(),
-                    &guid as *const _ as *mut _,
-                    attributes | efi::VARIABLE_NON_VOLATILE,
-                    1,
-                    rejected.as_ptr().cast_mut().cast()
-                ),
+                unsafe {
+                    ((*runtime).set_variable)(
+                        nv_name.as_mut_ptr(),
+                        &guid as *const _ as *mut _,
+                        attributes | efi::VARIABLE_NON_VOLATILE,
+                        1,
+                        rejected.as_ptr().cast_mut().cast(),
+                    )
+                },
                 status
             );
         }
@@ -270,13 +274,15 @@ fn actual_loader_seal_svam_and_runtime_services_with_and_without_retained_stagin
         if !retained {
             let rejected = [3u8];
             assert_eq!(
-                (unsafe { (*runtime).set_variable })(
-                    nv_name.as_mut_ptr(),
-                    &guid as *const _ as *mut _,
-                    attributes | efi::VARIABLE_NON_VOLATILE,
-                    1,
-                    rejected.as_ptr().cast_mut().cast()
-                ),
+                unsafe {
+                    ((*runtime).set_variable)(
+                        nv_name.as_mut_ptr(),
+                        &guid as *const _ as *mut _,
+                        attributes | efi::VARIABLE_NON_VOLATILE,
+                        1,
+                        rejected.as_ptr().cast_mut().cast(),
+                    )
+                },
                 efi::Status::UNSUPPORTED
             );
         }
@@ -284,12 +290,14 @@ fn actual_loader_seal_svam_and_runtime_services_with_and_without_retained_stagin
             descriptor.virtual_start = ram.2 as u64 + (descriptor.physical_start - ram.0 as u64);
         }
         assert_eq!(
-            (unsafe { (*runtime).set_virtual_address_map })(
-                count * core::mem::size_of::<allocator::MemoryDescriptor>(),
-                core::mem::size_of::<allocator::MemoryDescriptor>(),
-                efi::MEMORY_DESCRIPTOR_VERSION,
-                descriptors.as_mut_ptr().cast()
-            ),
+            unsafe {
+                ((*runtime).set_virtual_address_map)(
+                    count * core::mem::size_of::<allocator::MemoryDescriptor>(),
+                    core::mem::size_of::<allocator::MemoryDescriptor>(),
+                    efi::MEMORY_DESCRIPTOR_VERSION,
+                    descriptors.as_mut_ptr().cast(),
+                )
+            },
             efi::Status::SUCCESS
         );
         // The table itself and its function pointers now reside in the second alias.
@@ -297,23 +305,27 @@ fn actual_loader_seal_svam_and_runtime_services_with_and_without_retained_stagin
             as *mut efi::RuntimeServices;
         let new_data = [2u8];
         assert_eq!(
-            (unsafe { (*runtime).set_variable })(
-                volatile_name.as_mut_ptr(),
-                &guid as *const _ as *mut _,
-                attributes,
-                1,
-                new_data.as_ptr().cast_mut().cast()
-            ),
+            unsafe {
+                ((*runtime).set_variable)(
+                    volatile_name.as_mut_ptr(),
+                    &guid as *const _ as *mut _,
+                    attributes,
+                    1,
+                    new_data.as_ptr().cast_mut().cast(),
+                )
+            },
             efi::Status::SUCCESS
         );
         assert_eq!(
-            (unsafe { (*runtime).set_variable })(
-                nv_name.as_mut_ptr(),
-                &guid as *const _ as *mut _,
-                attributes | efi::VARIABLE_NON_VOLATILE,
-                1,
-                new_data.as_ptr().cast_mut().cast()
-            ),
+            unsafe {
+                ((*runtime).set_variable)(
+                    nv_name.as_mut_ptr(),
+                    &guid as *const _ as *mut _,
+                    attributes | efi::VARIABLE_NON_VOLATILE,
+                    1,
+                    new_data.as_ptr().cast_mut().cast(),
+                )
+            },
             if retained {
                 efi::Status::SUCCESS
             } else {
@@ -329,25 +341,29 @@ fn actual_loader_seal_svam_and_runtime_services_with_and_without_retained_stagin
         let mut size = value.len();
         let mut returned_attributes = 0;
         assert_eq!(
-            (unsafe { (*runtime).get_variable })(
-                nv_name.as_mut_ptr(),
-                &guid as *const _ as *mut _,
-                &mut returned_attributes,
-                &mut size,
-                value.as_mut_ptr().cast()
-            ),
+            unsafe {
+                ((*runtime).get_variable)(
+                    nv_name.as_mut_ptr(),
+                    &guid as *const _ as *mut _,
+                    &mut returned_attributes,
+                    &mut size,
+                    value.as_mut_ptr().cast(),
+                )
+            },
             efi::Status::SUCCESS
         );
         assert_eq!(value, if retained { [2] } else { [1] });
         if !retained {
             assert_eq!(
-                (unsafe { (*runtime).set_variable })(
-                    nv_name.as_mut_ptr(),
-                    &guid as *const _ as *mut _,
-                    0,
-                    0,
-                    core::ptr::null_mut()
-                ),
+                unsafe {
+                    ((*runtime).set_variable)(
+                        nv_name.as_mut_ptr(),
+                        &guid as *const _ as *mut _,
+                        0,
+                        0,
+                        core::ptr::null_mut(),
+                    )
+                },
                 efi::Status::UNSUPPORTED
             );
             let mut header = efi::CapsuleHeader {
@@ -360,23 +376,25 @@ fn actual_loader_seal_svam_and_runtime_services_with_and_without_retained_stagin
             let mut maximum = 0;
             let mut reset = efi::RESET_COLD;
             assert_eq!(
-                (unsafe { (*runtime).query_capsule_capabilities })(
-                    &mut header_pointer,
-                    1,
-                    &mut maximum,
-                    &mut reset
-                ),
+                unsafe {
+                    ((*runtime).query_capsule_capabilities)(
+                        &mut header_pointer,
+                        1,
+                        &mut maximum,
+                        &mut reset,
+                    )
+                },
                 efi::Status::UNSUPPORTED
             );
             assert_eq!(maximum, 0);
             assert_eq!(
-                (unsafe { (*runtime).update_capsule })(&mut header_pointer, 1, 0x1000),
+                unsafe { ((*runtime).update_capsule)(&mut header_pointer, 1, 0x1000) },
                 efi::Status::UNSUPPORTED
             );
         }
         let mut time = core::mem::MaybeUninit::<efi::Time>::uninit();
         assert_eq!(
-            (unsafe { (*runtime).get_time })(time.as_mut_ptr(), core::ptr::null_mut()),
+            unsafe { ((*runtime).get_time)(time.as_mut_ptr(), core::ptr::null_mut()) },
             efi::Status::UNSUPPORTED
         );
         if retained {
@@ -402,13 +420,15 @@ fn actual_loader_seal_svam_and_runtime_services_with_and_without_retained_stagin
             let mut size = restored.len();
             let mut flags = 0;
             assert_eq!(
-                (unsafe { (*warm.runtime_services()).get_variable })(
-                    nv_name.as_mut_ptr(),
-                    &guid as *const _ as *mut _,
-                    &mut flags,
-                    &mut size,
-                    restored.as_mut_ptr().cast()
-                ),
+                unsafe {
+                    ((*warm.runtime_services()).get_variable)(
+                        nv_name.as_mut_ptr(),
+                        &guid as *const _ as *mut _,
+                        &mut flags,
+                        &mut size,
+                        restored.as_mut_ptr().cast(),
+                    )
+                },
                 efi::Status::SUCCESS
             );
             assert_eq!(restored, [2]);

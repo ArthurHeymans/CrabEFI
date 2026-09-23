@@ -289,7 +289,9 @@ fn dispatch_key_notifications(
         // Safety: we only read entries that were written above
         let pending = unsafe { entry.assume_init_ref() };
         let mut kd = pending.key_data;
-        crate::efi::boot_services::with_image_callback(|| (pending.callback)(&mut kd));
+        // SAFETY: this registered callback receives a live, writable KeyData
+        // for the duration of the call.
+        crate::efi::boot_services::with_image_callback(|| unsafe { (pending.callback)(&mut kd) });
     }
 }
 

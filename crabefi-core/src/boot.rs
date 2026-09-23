@@ -386,14 +386,18 @@ fn execute_bootloader(
     // lifecycle as subsequently loaded children. LoadImage copies both buffers.
     let bs = unsafe { &*boot_services::get_boot_services() };
     let mut image_handle = ptr::null_mut();
-    let status = (bs.load_image)(
-        r_efi::efi::Boolean::TRUE,
-        efi::get_firmware_handle(),
-        full_path,
-        image.buffer.cast(),
-        image.len,
-        &mut image_handle,
-    );
+    // SAFETY: both buffers are live for this call; LoadImage receives a valid
+    // firmware handle and writes the new handle to image_handle.
+    let status = unsafe {
+        (bs.load_image)(
+            r_efi::efi::Boolean::TRUE,
+            efi::get_firmware_handle(),
+            full_path,
+            image.buffer.cast(),
+            image.len,
+            &mut image_handle,
+        )
+    };
     let _ = free_pool(image.buffer);
     let _ = free_pool(full_path.cast());
     if status != Status::SUCCESS {
@@ -417,14 +421,16 @@ fn execute_bootloader(
 
     log::info!("Executing bootloader...");
     // No exit-data consumer at this level; StartImage frees any returned data.
-    let status = (bs.start_image)(image_handle, ptr::null_mut(), ptr::null_mut());
+    // SAFETY: image_handle came from a successful LoadImage; no exit data is requested.
+    let status = unsafe { (bs.start_image)(image_handle, ptr::null_mut(), ptr::null_mut()) };
     log::info!("Bootloader returned with status: {:?}", status);
     if status == Status::SUCCESS {
         Ok(())
     } else {
         // StartImage can also fail before invoking the application. If it did
         // run, its automatic teardown already removed the handle.
-        let _ = (bs.unload_image)(image_handle);
+        // SAFETY: image_handle is the loaded image from this invocation.
+        let _ = unsafe { (bs.unload_image)(image_handle) };
         Err(status)
     }
 }
