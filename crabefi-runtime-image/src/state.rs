@@ -6,8 +6,8 @@ use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 
 use crabefi_runtime_abi::{
     LoadedSection, MAX_EXTERNAL_RANGES, MAX_RELOCATIONS, MAX_SECTIONS, RelocationImport,
-    RuntimeExternalRange, RuntimeHandoff, RuntimeResetConfig, RuntimeTimeConfig, phase,
-    relocation_kind, section_flags,
+    RuntimeExternalRange, RuntimeHandoff, RuntimeResetConfig, RuntimeTimeConfig, relocation_kind,
+    section_flags,
 };
 
 use crate::{
@@ -16,6 +16,55 @@ use crate::{
     store::{VariableStore, VariableTransaction},
     tables::ImageTables,
 };
+
+/// Lifecycle phase of the runtime image, published through [`RUNTIME_PHASE`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum Phase {
+    /// No handoff has been accepted.
+    Uninitialized,
+    /// The handoff is accepted and relocations are being imported.
+    Loaded,
+    /// Boot services are active and persisted variables are being imported.
+    Importing,
+    /// Boot services are active and the variable store is authoritative.
+    BootActive,
+    /// ExitBootServices sealed the image; it still runs at physical addresses.
+    SealedPhysical,
+    /// SetVirtualAddressMap committed the virtual mapping.
+    Virtual,
+}
+
+impl Phase {
+    /// Phases in which boot services are still active.
+    pub const BOOT_SERVICES: &[Self] = &[Self::Importing, Self::BootActive];
+
+    /// The phase currently published in [`RUNTIME_PHASE`].
+    pub fn current() -> Self {
+        match RUNTIME_PHASE.load(Ordering::Acquire) {
+            1 => Self::Loaded,
+            2 => Self::Importing,
+            3 => Self::BootActive,
+            4 => Self::SealedPhysical,
+            5 => Self::Virtual,
+            _ => Self::Uninitialized,
+        }
+    }
+
+    fn publish(self) {
+        RUNTIME_PHASE.store(self as u8, Ordering::Release);
+    }
+
+    /// Boot services are active.
+    pub fn boot_services(self) -> bool {
+        Self::BOOT_SERVICES.contains(&self)
+    }
+
+    /// ExitBootServices has completed.
+    pub fn runtime(self) -> bool {
+        matches!(self, Self::SealedPhysical | Self::Virtual)
+    }
+}
 
 #[derive(Clone, Copy)]
 pub struct SectionRecord {
@@ -96,8 +145,6 @@ pub struct RuntimeState {
     pub deferred_buffer_virtual: u64,
     pub deferred_buffer_size: usize,
     pub capsule_delivery_enabled: bool,
-    pub initialized: bool,
-    pub import_finished: bool,
 }
 
 impl RuntimeState {
@@ -128,15 +175,10 @@ impl RuntimeState {
             deferred_buffer_virtual: 0,
             deferred_buffer_size: 0,
             capsule_delivery_enabled: false,
-            initialized: false,
-            import_finished: false,
         }
     }
 
     pub fn initialize(&mut self, handoff: &RuntimeHandoff) -> Result<(), efi::Status> {
-        if self.initialized {
-            return Err(efi::Status::INVALID_PARAMETER);
-        }
         handoff
             .validate()
             .map_err(|_| efi::Status::INVALID_PARAMETER)?;
@@ -167,16 +209,15 @@ impl RuntimeState {
         {
             *destination = range_from_handoff(source);
         }
-        // Publish ResetSystem's lock-free snapshot before BootActive can be
-        // observed. The snapshot is outside RuntimeState so a re-entrant reset
+        // Publish ResetSystem's lock-free snapshot before boot services can
+        // call it. The snapshot is outside RuntimeState so a re-entrant reset
         // never reads through an outstanding mutable state lease.
         RUNTIME_RESET_CONFIG.publish(handoff.reset);
-        self.initialized = true;
         Ok(())
     }
 
     pub fn import_relocation(&mut self, relocation: &RelocationImport) -> Result<(), efi::Status> {
-        if self.import_finished || self.relocation_count >= MAX_RELOCATIONS {
+        if self.relocation_count >= MAX_RELOCATIONS {
             return Err(efi::Status::OUT_OF_RESOURCES);
         }
         let patch_index = usize::from(relocation.patch_section);
@@ -216,12 +257,8 @@ impl RuntimeState {
         Ok(())
     }
 
-    pub fn runtime_only(&self) -> bool {
-        RUNTIME_PHASE.load(Ordering::Acquire) >= phase::SEALED_PHYSICAL
-    }
-
     pub fn deferred_buffer(&self) -> (*mut u8, usize) {
-        let base = if RUNTIME_PHASE.load(Ordering::Acquire) == phase::VIRTUAL {
+        let base = if Phase::current() == Phase::Virtual {
             self.deferred_buffer_virtual
         } else {
             self.deferred_buffer_physical
@@ -265,7 +302,7 @@ fn range_from_handoff(range: &RuntimeExternalRange) -> RangeRecord {
 
 /// Lock-free snapshot of the reset configuration for `ResetSystem`.
 ///
-/// The pair is published exactly once while the image is Uninitialized: the
+/// The pair is published exactly once while the image is uninitialized: the
 /// base word first, then the header word with `Release`. The `Acquire` header
 /// load in `read` makes the prior base store visible without taking the
 /// operation lease, so a re-entrant reset never reads a torn configuration.
@@ -375,13 +412,23 @@ pub static RUNTIME_STATE: RuntimeCell = RuntimeCell::new();
 #[unsafe(no_mangle)]
 pub static RUNTIME_OPERATION_LOCK: AtomicBool = AtomicBool::new(false);
 #[unsafe(no_mangle)]
-pub static RUNTIME_PHASE: AtomicU8 = AtomicU8::new(phase::UNINITIALIZED);
+pub static RUNTIME_PHASE: AtomicU8 = AtomicU8::new(Phase::Uninitialized as u8);
 
+/// Exclusive access to the image state for one operation.
 pub struct Lease {
     _not_send: PhantomData<*mut ()>,
 }
 
 impl Lease {
+    pub fn phase(&self) -> Phase {
+        Phase::current()
+    }
+
+    /// Publish the next lifecycle phase while holding the operation lock.
+    pub fn advance(&mut self, phase: Phase) {
+        phase.publish();
+    }
+
     pub fn state(&self) -> &RuntimeState {
         // SAFETY: this lease owns the operation lock until Drop and is !Send.
         unsafe { &*RUNTIME_STATE.get() }
@@ -432,11 +479,15 @@ impl Drop for Lease {
     }
 }
 
-pub fn try_lease() -> Result<Lease, efi::Status> {
-    if RUNTIME_OPERATION_LOCK
+fn acquire_lock() -> bool {
+    RUNTIME_OPERATION_LOCK
         .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
-        .is_err()
-    {
+        .is_ok()
+}
+
+/// Lease the state in any phase; fails while another operation holds it.
+pub fn lease() -> Result<Lease, efi::Status> {
+    if !acquire_lock() {
         return Err(efi::Status::DEVICE_ERROR);
     }
     Ok(Lease {
@@ -444,24 +495,14 @@ pub fn try_lease() -> Result<Lease, efi::Status> {
     })
 }
 
-pub fn try_lease_phase(expected: u8) -> Result<Lease, efi::Status> {
-    let lease = try_lease()?;
-    if RUNTIME_PHASE.load(Ordering::Acquire) != expected {
-        drop(lease);
-        return Err(efi::Status::UNSUPPORTED);
+/// Lease the state only while the image is in one of `phases`.
+pub fn lease_in(phases: &[Phase]) -> Result<Lease, efi::Status> {
+    let lease = lease()?;
+    if phases.contains(&lease.phase()) {
+        Ok(lease)
+    } else {
+        Err(efi::Status::UNSUPPORTED)
     }
-    Ok(lease)
-}
-
-pub fn set_phase(from: u8, to: u8) -> Result<(), efi::Status> {
-    RUNTIME_PHASE
-        .compare_exchange(from, to, Ordering::AcqRel, Ordering::Acquire)
-        .map(|_| ())
-        .map_err(|_| efi::Status::UNSUPPORTED)
-}
-
-pub fn phase_value() -> u8 {
-    RUNTIME_PHASE.load(Ordering::Acquire)
 }
 
 /// Read the immutable reset configuration without taking the operation lease.
@@ -479,13 +520,10 @@ pub fn transition_tail_addresses() -> [u64; 3] {
 }
 
 pub fn begin_virtual_transition() -> Result<*mut RuntimeState, efi::Status> {
-    if RUNTIME_OPERATION_LOCK
-        .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
-        .is_err()
-    {
+    if !acquire_lock() {
         return Err(efi::Status::NOT_READY);
     }
-    if RUNTIME_PHASE.load(Ordering::Acquire) != phase::SEALED_PHYSICAL {
+    if Phase::current() != Phase::SealedPhysical {
         RUNTIME_OPERATION_LOCK.store(false, Ordering::Release);
         return Err(efi::Status::UNSUPPORTED);
     }
@@ -499,7 +537,7 @@ pub fn abort_virtual_transition() {
 /// Publish Virtual and release the operation lock before relocation slots that
 /// address these atomics are changed. No image state may be accessed afterward.
 pub fn publish_virtual_and_unlock() {
-    RUNTIME_PHASE.store(phase::VIRTUAL, Ordering::Release);
+    Phase::Virtual.publish();
     RUNTIME_OPERATION_LOCK.store(false, Ordering::Release);
 }
 

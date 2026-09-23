@@ -3,11 +3,10 @@
 use crate::{
     efi,
     services::{apply_variable, capsule_delivery_available},
-    state::RuntimeState,
+    state::{Phase, RuntimeState},
     store::{VariableStore, VariableTransaction},
 };
 use crabefi_efi_types::secure_boot;
-use crabefi_runtime_abi::phase;
 
 const ATTRIBUTES: u32 = efi::VARIABLE_BOOTSERVICE_ACCESS | efi::VARIABLE_RUNTIME_ACCESS;
 
@@ -29,8 +28,8 @@ fn ordinary_variables_work_at_boot_and_runtime_without_authentication() {
     let guid = [0x42; 16];
     let name = [b'T' as u16];
     for (phase, data) in [
-        (phase::BOOT_ACTIVE, b"boot".as_slice()),
-        (phase::SEALED_PHYSICAL, b"runtime".as_slice()),
+        (Phase::BootActive, b"boot".as_slice()),
+        (Phase::SealedPhysical, b"runtime".as_slice()),
     ] {
         assert_eq!(
             apply_variable(
@@ -78,7 +77,7 @@ fn authentication_and_key_writes_are_unsupported_not_silently_accepted() {
                 &mut store,
                 &mut transaction,
                 None,
-                phase::BOOT_ACTIVE,
+                Phase::BootActive,
                 0,
                 (core::ptr::null_mut(), 0),
                 guid,
@@ -104,7 +103,7 @@ fn status_variables_are_write_protected_and_missing_nv_backend_does_not_succeed(
                 &mut store,
                 &mut transaction,
                 None,
-                phase::BOOT_ACTIVE,
+                Phase::BootActive,
                 0,
                 (core::ptr::null_mut(), 0),
                 secure_boot::EFI_GLOBAL_VARIABLE_GUID,
@@ -117,8 +116,8 @@ fn status_variables_are_write_protected_and_missing_nv_backend_does_not_succeed(
     }
     let name = [b'N' as u16];
     for (phase, expected) in [
-        (phase::BOOT_ACTIVE, efi::Status::WRITE_PROTECTED),
-        (phase::SEALED_PHYSICAL, efi::Status::UNSUPPORTED),
+        (Phase::BootActive, efi::Status::WRITE_PROTECTED),
+        (Phase::SealedPhysical, efi::Status::UNSUPPORTED),
     ] {
         assert_eq!(
             apply_variable(

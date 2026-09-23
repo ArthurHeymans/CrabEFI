@@ -5,13 +5,10 @@ use core::ffi::c_void;
 use crabefi_efi_types::crc32;
 use crabefi_runtime_abi::{
     ConfigurationRegistration, ConsoleRegistration, EsrtRegistration, MAX_CONFIGURATION_TABLES,
-    MemoryDescriptor, configuration_policy, section_flags,
+    MAX_RUNTIME_DESCRIPTORS, MemoryDescriptor, configuration_policy, section_flags,
 };
 
-use crate::{
-    efi, services,
-    state::{RangeRecord, SectionRecord},
-};
+use crate::{efi, services, state::SectionRecord};
 
 const UEFI_REVISION: u32 = (2 << 16) | 100;
 const FIRMWARE_REVISION: u32 = 0x0001_0000;
@@ -67,7 +64,7 @@ pub struct ImageTables {
     pub configuration_metadata: [ConfigurationMetadata; MAX_CONFIGURATION_TABLES],
     pub configuration_count: usize,
     pub properties: efi::RtPropertiesTable,
-    pub memory_attributes: efi::MemoryAttributesTable<32>,
+    pub memory_attributes: efi::MemoryAttributesTable<MAX_RUNTIME_DESCRIPTORS>,
     pub esrt: EsrtTable,
 }
 
@@ -161,7 +158,7 @@ impl ImageTables {
                 number_of_entries: 0,
                 descriptor_size: core::mem::size_of::<efi::MemoryDescriptor>() as u32,
                 reserved: 0,
-                entry: [EMPTY_DESCRIPTOR; 32],
+                entry: [EMPTY_DESCRIPTOR; MAX_RUNTIME_DESCRIPTORS],
             },
             esrt: EsrtTable {
                 header: EsrtHeader {
@@ -348,7 +345,6 @@ impl ImageTables {
         &mut self,
         descriptors: &[MemoryDescriptor],
         sections: &[SectionRecord],
-        _ranges: &[RangeRecord],
     ) -> Result<(), efi::Status> {
         let mut count = 0usize;
         for section in sections {
