@@ -136,29 +136,22 @@ pub extern "efiapi" fn convert_pointer(
         Ok(lease) => lease,
         Err(status) => return status,
     };
-    let converted = lease
-        .state()
+    let runtime = lease.state();
+    let converted = runtime
         .sections
         .iter()
-        .take(lease.state().section_count)
         .find_map(|section| {
             let offset = physical.checked_sub(section.physical_base)?;
             (offset < u64::from(section.byte_len))
                 .then(|| section.virtual_base.checked_add(offset))?
         })
         .or_else(|| {
-            lease
-                .state()
-                .ranges
-                .iter()
-                .take(lease.state().range_count)
-                .find_map(|range| {
-                    let offset = physical.checked_sub(range.physical_base)?;
-                    (offset < range.byte_len).then(|| range.virtual_base.checked_add(offset))?
-                })
+            runtime.ranges.iter().find_map(|range| {
+                let offset = physical.checked_sub(range.physical_base)?;
+                (offset < range.byte_len).then(|| range.virtual_base.checked_add(offset))?
+            })
         })
         .or_else(|| {
-            let runtime = lease.state();
             let offset = physical.checked_sub(runtime.deferred_buffer_physical)?;
             (offset < runtime.deferred_buffer_size as u64)
                 .then(|| runtime.deferred_buffer_virtual.checked_add(offset))?
@@ -263,7 +256,7 @@ pub extern "efiapi" fn get_next_variable_name(
     // SAFETY: at least one UTF-16 unit is available because supplied >= 2.
     let first = unsafe { variable_name.read() };
     let current_name = if first == 0 {
-        Name::empty()
+        Name::new()
     } else {
         match read_name_bounded(variable_name, supplied / core::mem::size_of::<u16>()) {
             Ok(name) => name,
@@ -276,7 +269,7 @@ pub extern "efiapi" fn get_next_variable_name(
         Ok(lease) => lease,
         Err(status) => return status,
     };
-    if current_name.len == 0 {
+    if current_name.is_empty() {
         return write_next_name(
             secure_boot::SETUP_MODE_NAME,
             secure_boot::EFI_GLOBAL_VARIABLE_GUID,
@@ -926,23 +919,8 @@ fn call_boot_bridge(address: u64, request: &BridgeRequest) -> Result<(), efi::St
     }
 }
 
-struct Name {
-    units: [u16; MAX_VARIABLE_NAME_LEN],
-    len: usize,
-}
-
-impl Name {
-    const fn empty() -> Self {
-        Self {
-            units: [0; MAX_VARIABLE_NAME_LEN],
-            len: 0,
-        }
-    }
-
-    fn as_slice(&self) -> &[u16] {
-        self.units.get(..self.len).unwrap_or(&[])
-    }
-}
+/// Variable name copied out of caller memory, without its terminator.
+type Name = heapless::Vec<u16, MAX_VARIABLE_NAME_LEN>;
 
 fn read_name(pointer: *const u16) -> Result<Name, efi::Status> {
     read_name_bounded(pointer, MAX_VARIABLE_NAME_LEN + 1)
@@ -952,20 +930,20 @@ fn read_name_bounded(pointer: *const u16, available_units: usize) -> Result<Name
     if pointer.is_null() {
         return Err(efi::Status::INVALID_PARAMETER);
     }
-    let mut name = Name::empty();
-    while name.len < MAX_VARIABLE_NAME_LEN && name.len < available_units {
+    let mut name = Name::new();
+    while name.len() < MAX_VARIABLE_NAME_LEN && name.len() < available_units {
         // SAFETY: the bounded walk stays within both the ABI maximum and the
         // caller-declared buffer extent.
-        let unit = unsafe { pointer.add(name.len).read() };
+        let unit = unsafe { pointer.add(name.len()).read() };
         if unit == 0 {
-            return if name.len == 0 {
+            return if name.is_empty() {
                 Err(efi::Status::INVALID_PARAMETER)
             } else {
                 Ok(name)
             };
         }
-        name.units[name.len] = unit;
-        name.len += 1;
+        name.push(unit)
+            .map_err(|_| efi::Status::INVALID_PARAMETER)?;
     }
     // SAFETY: one final unit is read only when the caller's declared buffer
     // includes it.

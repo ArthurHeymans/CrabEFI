@@ -8,6 +8,8 @@ use crabefi_runtime_abi::{
     MAX_RUNTIME_DESCRIPTORS, MemoryDescriptor, configuration_policy, section_flags,
 };
 
+use heapless::Vec;
+
 use crate::{efi, services, state::SectionRecord};
 
 const UEFI_REVISION: u32 = (2 << 16) | 100;
@@ -40,19 +42,12 @@ pub struct EsrtTable {
     pub entry: EsrtEntry,
 }
 
+/// Image-private record kept alongside each published configuration entry.
 #[derive(Clone, Copy)]
 pub struct ConfigurationMetadata {
+    pub guid: [u8; 16],
     pub policy: u32,
     pub physical_address: u64,
-}
-
-impl ConfigurationMetadata {
-    const fn empty() -> Self {
-        Self {
-            policy: 0,
-            physical_address: 0,
-        }
-    }
 }
 
 #[repr(C)]
@@ -60,9 +55,8 @@ pub struct ImageTables {
     pub runtime: efi::RuntimeServices,
     pub system: efi::SystemTable,
     pub vendor: [u16; 8],
-    pub configuration: [efi::ConfigurationTable; MAX_CONFIGURATION_TABLES],
-    pub configuration_metadata: [ConfigurationMetadata; MAX_CONFIGURATION_TABLES],
-    pub configuration_count: usize,
+    pub configuration: Vec<efi::ConfigurationTable, MAX_CONFIGURATION_TABLES>,
+    pub configuration_metadata: Vec<ConfigurationMetadata, MAX_CONFIGURATION_TABLES>,
     pub properties: efi::RtPropertiesTable,
     pub memory_attributes: efi::MemoryAttributesTable<MAX_RUNTIME_DESCRIPTORS>,
     pub esrt: EsrtTable,
@@ -71,10 +65,6 @@ pub struct ImageTables {
 impl ImageTables {
     pub const fn new() -> Self {
         const EMPTY_GUID: efi::Guid = efi::Guid::from_bytes(&[0; 16]);
-        const EMPTY_CONFIGURATION_ENTRY: efi::ConfigurationTable = efi::ConfigurationTable {
-            vendor_guid: EMPTY_GUID,
-            vendor_table: core::ptr::null_mut(),
-        };
         const EMPTY_DESCRIPTOR: efi::MemoryDescriptor = efi::MemoryDescriptor {
             r#type: 0,
             physical_start: 0,
@@ -137,9 +127,8 @@ impl ImageTables {
                 b'I' as u16,
                 0,
             ],
-            configuration: [EMPTY_CONFIGURATION_ENTRY; MAX_CONFIGURATION_TABLES],
-            configuration_metadata: [ConfigurationMetadata::empty(); MAX_CONFIGURATION_TABLES],
-            configuration_count: 0,
+            configuration: Vec::new(),
+            configuration_metadata: Vec::new(),
             properties: efi::RtPropertiesTable {
                 version: efi::RT_PROPERTIES_TABLE_VERSION,
                 length: core::mem::size_of::<efi::RtPropertiesTable>() as u16,
@@ -226,79 +215,48 @@ impl ImageTables {
         {
             return Err(efi::Status::UNSUPPORTED);
         }
-        if let Some(index) = self
-            .configuration
-            .iter()
-            .take(self.configuration_count)
-            .position(|entry| *entry.vendor_guid.as_bytes() == registration.guid)
-        {
-            if registration.table_address == 0 {
-                let move_count = self.configuration_count - index - 1;
-                // SAFETY: `index` came from the initialized prefix and
-                // configuration_count never exceeds either fixed array. The
-                // source and destination may overlap, so use `ptr::copy`.
-                unsafe {
-                    core::ptr::copy(
-                        self.configuration.as_ptr().add(index + 1),
-                        self.configuration.as_mut_ptr().add(index),
-                        move_count,
-                    );
-                    core::ptr::copy(
-                        self.configuration_metadata.as_ptr().add(index + 1),
-                        self.configuration_metadata.as_mut_ptr().add(index),
-                        move_count,
-                    );
-                }
-                self.configuration_count -= 1;
-                *self
-                    .configuration
-                    .get_mut(self.configuration_count)
-                    .ok_or(efi::Status::DEVICE_ERROR)? = efi::ConfigurationTable {
-                    vendor_guid: efi::Guid::from_bytes(&[0; 16]),
-                    vendor_table: core::ptr::null_mut(),
-                };
-                *self
-                    .configuration_metadata
-                    .get_mut(self.configuration_count)
-                    .ok_or(efi::Status::DEVICE_ERROR)? = ConfigurationMetadata::empty();
-            } else {
-                self.configuration
-                    .get_mut(index)
-                    .ok_or(efi::Status::DEVICE_ERROR)?
-                    .vendor_table = registration.table_address as *mut c_void;
-                *self
-                    .configuration_metadata
-                    .get_mut(index)
-                    .ok_or(efi::Status::DEVICE_ERROR)? = ConfigurationMetadata {
-                    policy: registration.policy,
-                    physical_address: registration.table_address,
-                };
-            }
-            self.publish_configuration_count();
-            return Ok(());
-        }
-        if registration.table_address == 0 {
-            return Err(efi::Status::NOT_FOUND);
-        }
-        let index = self.configuration_count;
-        if index >= MAX_CONFIGURATION_TABLES {
-            return Err(efi::Status::OUT_OF_RESOURCES);
-        }
-        *self
-            .configuration
-            .get_mut(index)
-            .ok_or(efi::Status::OUT_OF_RESOURCES)? = efi::ConfigurationTable {
-            vendor_guid: efi::Guid::from_bytes(&registration.guid),
-            vendor_table: registration.table_address as *mut c_void,
-        };
-        *self
-            .configuration_metadata
-            .get_mut(index)
-            .ok_or(efi::Status::OUT_OF_RESOURCES)? = ConfigurationMetadata {
+        let metadata = ConfigurationMetadata {
+            guid: registration.guid,
             policy: registration.policy,
             physical_address: registration.table_address,
         };
-        self.configuration_count += 1;
+        let existing = self
+            .configuration
+            .iter()
+            .position(|entry| *entry.vendor_guid.as_bytes() == registration.guid);
+        match (existing, registration.table_address) {
+            (Some(_), 0) => {
+                self.configuration
+                    .retain(|entry| *entry.vendor_guid.as_bytes() != registration.guid);
+                self.configuration_metadata
+                    .retain(|entry| entry.guid != registration.guid);
+            }
+            (Some(index), address) => {
+                self.configuration
+                    .get_mut(index)
+                    .ok_or(efi::Status::DEVICE_ERROR)?
+                    .vendor_table = address as *mut c_void;
+                *self
+                    .configuration_metadata
+                    .get_mut(index)
+                    .ok_or(efi::Status::DEVICE_ERROR)? = metadata;
+            }
+            (None, 0) => return Err(efi::Status::NOT_FOUND),
+            (None, address) => {
+                if self.configuration.is_full() || self.configuration_metadata.is_full() {
+                    return Err(efi::Status::OUT_OF_RESOURCES);
+                }
+                self.configuration
+                    .push(efi::ConfigurationTable {
+                        vendor_guid: efi::Guid::from_bytes(&registration.guid),
+                        vendor_table: address as *mut c_void,
+                    })
+                    .map_err(|_| efi::Status::OUT_OF_RESOURCES)?;
+                self.configuration_metadata
+                    .push(metadata)
+                    .map_err(|_| efi::Status::OUT_OF_RESOURCES)?;
+            }
+        }
         self.publish_configuration_count();
         Ok(())
     }
@@ -403,7 +361,6 @@ impl ImageTables {
             .configuration
             .iter_mut()
             .zip(self.configuration_metadata.iter())
-            .take(self.configuration_count)
         {
             if metadata.policy == configuration_policy::IMAGE_RUNTIME
                 && let Some(virtual_address) = convert(metadata.physical_address)
@@ -444,7 +401,7 @@ impl ImageTables {
     }
 
     fn publish_configuration_count(&mut self) {
-        self.system.number_of_table_entries = self.configuration_count;
+        self.system.number_of_table_entries = self.configuration.len();
         self.recompute_crcs();
     }
 }
@@ -527,7 +484,7 @@ mod tests {
             }),
             Err(efi::Status::UNSUPPORTED)
         );
-        assert_eq!(tables.configuration_count, 1);
+        assert_eq!(tables.configuration.len(), 1);
         assert_eq!(tables.configuration[0].vendor_table as usize, 0x1000);
         assert_eq!(
             tables.configuration_metadata[0].policy,
@@ -564,6 +521,6 @@ mod tests {
                 reserved: 0,
             })
             .unwrap();
-        assert_eq!(tables.configuration_count, 0);
+        assert_eq!(tables.configuration.len(), 0);
     }
 }

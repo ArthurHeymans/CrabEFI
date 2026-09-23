@@ -164,52 +164,58 @@ impl RuntimeHandoff {
         }
     }
 
+    /// The populated prefix of `sections`.
+    pub fn sections(&self) -> Result<&[LoadedSection], HandoffError> {
+        self.sections
+            .get(..usize::from(self.section_count))
+            .ok_or(HandoffError::Count)
+    }
+
+    /// The populated prefix of `ranges`.
+    pub fn ranges(&self) -> Result<&[RuntimeExternalRange], HandoffError> {
+        self.ranges
+            .get(..usize::from(self.range_count))
+            .ok_or(HandoffError::Count)
+    }
+
     pub fn validate(&self) -> Result<(), HandoffError> {
-        let section_count = usize::from(self.section_count);
-        let range_count = usize::from(self.range_count);
-        if section_count == 0
-            || section_count > MAX_SECTIONS
-            || range_count > MAX_EXTERNAL_RANGES
-            || self.image_base == 0
-            || self.image_size == 0
-        {
+        let sections = self.sections()?;
+        let ranges = self.ranges()?;
+        if sections.is_empty() || self.image_base == 0 || self.image_size == 0 {
             return Err(HandoffError::Count);
         }
         self.image_base
             .checked_add(u64::from(self.image_size))
             .ok_or(HandoffError::Overflow)?;
-        self.sections
-            .iter()
-            .take(section_count)
-            .try_fold(0u64, |watermark, section| {
-                if section.physical_base == 0
-                    || !section
-                        .physical_base
-                        .is_multiple_of(u64::from(EFI_PAGE_SIZE))
-                    || section.byte_len == 0
-                {
-                    return Err(HandoffError::Section);
-                }
-                let start = u64::from(section.image_offset);
-                let end = start
-                    .checked_add(u64::from(section.byte_len))
-                    .ok_or(HandoffError::Overflow)?;
-                let expected_physical = self
-                    .image_base
-                    .checked_add(start)
-                    .ok_or(HandoffError::Overflow)?;
-                section
+        sections.iter().try_fold(0u64, |watermark, section| {
+            if section.physical_base == 0
+                || !section
                     .physical_base
-                    .checked_add(u64::from(section.byte_len))
-                    .ok_or(HandoffError::Overflow)?;
-                if start < watermark
-                    || end > u64::from(self.image_size)
-                    || section.physical_base != expected_physical
-                {
-                    return Err(HandoffError::Section);
-                }
-                Ok(end)
-            })?;
+                    .is_multiple_of(u64::from(EFI_PAGE_SIZE))
+                || section.byte_len == 0
+            {
+                return Err(HandoffError::Section);
+            }
+            let start = u64::from(section.image_offset);
+            let end = start
+                .checked_add(u64::from(section.byte_len))
+                .ok_or(HandoffError::Overflow)?;
+            let expected_physical = self
+                .image_base
+                .checked_add(start)
+                .ok_or(HandoffError::Overflow)?;
+            section
+                .physical_base
+                .checked_add(u64::from(section.byte_len))
+                .ok_or(HandoffError::Overflow)?;
+            if start < watermark
+                || end > u64::from(self.image_size)
+                || section.physical_base != expected_physical
+            {
+                return Err(HandoffError::Section);
+            }
+            Ok(end)
+        })?;
 
         let deferred_disabled = self.deferred_buffer_base == 0 && self.deferred_buffer_size == 0;
         if !deferred_disabled
@@ -225,7 +231,7 @@ impl RuntimeHandoff {
                     .deferred_buffer_base
                     .checked_add(self.deferred_buffer_size)
                     .is_none()
-                || self.sections.iter().take(section_count).any(|section| {
+                || sections.iter().any(|section| {
                     ranges_overlap(
                         section.physical_base,
                         u64::from(section.byte_len),
@@ -237,43 +243,39 @@ impl RuntimeHandoff {
             return Err(HandoffError::Range);
         }
 
-        self.ranges
-            .iter()
-            .take(range_count)
-            .enumerate()
-            .try_for_each(|(index, range)| {
-                if range.physical_base == 0
-                    || range.byte_len == 0
-                    || !range.physical_base.is_multiple_of(u64::from(EFI_PAGE_SIZE))
-                    || !range.byte_len.is_multiple_of(u64::from(EFI_PAGE_SIZE))
-                    || range.physical_base.checked_add(range.byte_len).is_none()
-                {
-                    return Err(HandoffError::Range);
-                }
-                if ranges_overlap(
+        ranges.iter().enumerate().try_for_each(|(index, range)| {
+            if range.physical_base == 0
+                || range.byte_len == 0
+                || !range.physical_base.is_multiple_of(u64::from(EFI_PAGE_SIZE))
+                || !range.byte_len.is_multiple_of(u64::from(EFI_PAGE_SIZE))
+                || range.physical_base.checked_add(range.byte_len).is_none()
+            {
+                return Err(HandoffError::Range);
+            }
+            if ranges_overlap(
+                range.physical_base,
+                range.byte_len,
+                self.deferred_buffer_base,
+                self.deferred_buffer_size,
+            ) || ranges.iter().take(index).any(|previous| {
+                ranges_overlap(
+                    previous.physical_base,
+                    previous.byte_len,
                     range.physical_base,
                     range.byte_len,
-                    self.deferred_buffer_base,
-                    self.deferred_buffer_size,
-                ) || self.ranges.iter().take(index).any(|previous| {
-                    ranges_overlap(
-                        previous.physical_base,
-                        previous.byte_len,
-                        range.physical_base,
-                        range.byte_len,
-                    )
-                }) || self.sections.iter().take(section_count).any(|section| {
-                    ranges_overlap(
-                        section.physical_base,
-                        u64::from(section.byte_len),
-                        range.physical_base,
-                        range.byte_len,
-                    )
-                }) {
-                    return Err(HandoffError::Range);
-                }
-                Ok(())
-            })?;
+                )
+            }) || sections.iter().any(|section| {
+                ranges_overlap(
+                    section.physical_base,
+                    u64::from(section.byte_len),
+                    range.physical_base,
+                    range.byte_len,
+                )
+            }) {
+                return Err(HandoffError::Range);
+            }
+            Ok(())
+        })?;
 
         let mmio_width = match (self.architecture, self.time.mechanism) {
             (_, time_mechanism::UNSUPPORTED) | (architecture::X86_64, time_mechanism::X86_CMOS) => {
@@ -297,7 +299,7 @@ impl RuntimeHandoff {
                 .ok_or(HandoffError::Overflow)?;
             if self.time.io_or_mmio_base == 0
                 || !self.time.io_or_mmio_base.is_multiple_of(4)
-                || !self.ranges.iter().take(range_count).any(|range| {
+                || !ranges.iter().any(|range| {
                     range.physical_base <= self.time.io_or_mmio_base
                         && range
                             .physical_base

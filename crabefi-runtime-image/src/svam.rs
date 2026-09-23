@@ -4,8 +4,12 @@ use crabefi_runtime_abi::{
     MAX_EXTERNAL_RANGES, MAX_RELOCATIONS, MAX_SECTIONS, RuntimeTimeConfig, relocation_kind,
     section_flags, time_mechanism,
 };
+use heapless::Vec;
 
-use crate::{efi, state};
+use crate::{
+    efi,
+    state::{self, collect_bounded},
+};
 
 const MAX_DESCRIPTORS: usize = 256;
 const PAGE_SIZE: u64 = 4096;
@@ -23,16 +27,6 @@ struct Mapping {
 }
 
 impl Mapping {
-    const fn empty() -> Self {
-        Self {
-            physical: 0,
-            virtual_address: 0,
-            byte_len: 0,
-            memory_type: 0,
-            attributes: 0,
-        }
-    }
-
     fn physical_end(self) -> Option<u64> {
         self.physical.checked_add(self.byte_len)
     }
@@ -46,15 +40,6 @@ impl Mapping {
 struct SlotPatch {
     address: u64,
     value: u64,
-}
-
-impl SlotPatch {
-    const fn empty() -> Self {
-        Self {
-            address: 0,
-            value: 0,
-        }
-    }
 }
 
 pub fn set_virtual_address_map(
@@ -186,19 +171,44 @@ fn validate_descriptor_stream(
     })
 }
 
+/// Find the one descriptor accepted by `matches`; a second match is ambiguous.
+fn unique_mapping(
+    map: *const u8,
+    stride: usize,
+    count: usize,
+    matches: impl Fn(&Mapping) -> bool,
+) -> Result<Mapping, efi::Status> {
+    (0..count)
+        .try_fold(None, |found, index| {
+            let candidate = mapping(read_descriptor(map, stride, index)?)?;
+            if !matches(&candidate) {
+                return Ok(found);
+            }
+            if found.is_some() {
+                return Err(efi::Status::INVALID_PARAMETER);
+            }
+            Ok(Some(candidate))
+        })?
+        .ok_or(efi::Status::NOT_FOUND)
+}
+
+/// Whether `candidate` is a virtually mapped runtime descriptor of
+/// `memory_type` covering `[physical, end)`.
+fn covers_runtime(candidate: &Mapping, memory_type: u32, physical: u64, end: u64) -> bool {
+    candidate.memory_type == memory_type
+        && candidate.attributes & efi::MEMORY_RUNTIME != 0
+        && candidate.virtual_address != 0
+        && candidate.physical <= physical
+        && candidate.physical_end().is_some_and(|value| value >= end)
+}
+
 fn resolve_sections(
     runtime: &state::RuntimeState,
     map: *const u8,
     stride: usize,
     count: usize,
-) -> Result<[Mapping; MAX_SECTIONS], efi::Status> {
-    let mut resolved = [Mapping::empty(); MAX_SECTIONS];
-    for (index, section) in runtime
-        .sections
-        .iter()
-        .take(runtime.section_count)
-        .enumerate()
-    {
+) -> Result<Vec<Mapping, MAX_SECTIONS>, efi::Status> {
+    collect_bounded(runtime.sections.iter().map(|section| {
         let expected_type = if section.flags & section_flags::EXECUTE != 0 {
             efi::RUNTIME_SERVICES_CODE
         } else {
@@ -208,29 +218,10 @@ fn resolve_sections(
             .physical_base
             .checked_add(u64::from(section.byte_len))
             .ok_or(efi::Status::INVALID_PARAMETER)?;
-        *resolved
-            .get_mut(index)
-            .ok_or(efi::Status::INVALID_PARAMETER)? = (0..count)
-            .try_fold(None, |found, descriptor_index| {
-                let candidate = mapping(read_descriptor(map, stride, descriptor_index)?)?;
-                if candidate.memory_type != expected_type
-                    || candidate.attributes & efi::MEMORY_RUNTIME == 0
-                    || candidate.virtual_address == 0
-                    || candidate.physical > section.physical_base
-                    || !candidate
-                        .physical_end()
-                        .is_some_and(|end| end >= section_end)
-                {
-                    return Ok(found);
-                }
-                if found.is_some() {
-                    return Err(efi::Status::INVALID_PARAMETER);
-                }
-                Ok(Some(candidate))
-            })?
-            .ok_or(efi::Status::NOT_FOUND)?;
-    }
-    Ok(resolved)
+        unique_mapping(map, stride, count, |candidate| {
+            covers_runtime(candidate, expected_type, section.physical_base, section_end)
+        })
+    }))
 }
 
 fn resolve_ranges(
@@ -238,35 +229,20 @@ fn resolve_ranges(
     map: *const u8,
     stride: usize,
     count: usize,
-) -> Result<[Mapping; MAX_EXTERNAL_RANGES], efi::Status> {
-    let mut resolved = [Mapping::empty(); MAX_EXTERNAL_RANGES];
-    for (index, range) in runtime.ranges.iter().take(runtime.range_count).enumerate() {
+) -> Result<Vec<Mapping, MAX_EXTERNAL_RANGES>, efi::Status> {
+    collect_bounded(runtime.ranges.iter().map(|range| {
         let range_end = range
             .physical_base
             .checked_add(range.byte_len)
             .ok_or(efi::Status::INVALID_PARAMETER)?;
-        let expected_type = efi::MEMORY_MAPPED_IO;
-        *resolved
-            .get_mut(index)
-            .ok_or(efi::Status::INVALID_PARAMETER)? = (0..count)
-            .try_fold(None, |found, descriptor_index| {
-                let candidate = mapping(read_descriptor(map, stride, descriptor_index)?)?;
-                if candidate.memory_type != expected_type
-                    || candidate.virtual_address == 0
-                    || candidate.attributes & range.attributes != range.attributes
-                    || candidate.physical > range.physical_base
-                    || !candidate.physical_end().is_some_and(|end| end >= range_end)
-                {
-                    return Ok(found);
-                }
-                if found.is_some() {
-                    return Err(efi::Status::INVALID_PARAMETER);
-                }
-                Ok(Some(candidate))
-            })?
-            .ok_or(efi::Status::NOT_FOUND)?;
-    }
-    Ok(resolved)
+        unique_mapping(map, stride, count, |candidate| {
+            candidate.memory_type == efi::MEMORY_MAPPED_IO
+                && candidate.virtual_address != 0
+                && candidate.attributes & range.attributes == range.attributes
+                && candidate.physical <= range.physical_base
+                && candidate.physical_end().is_some_and(|end| end >= range_end)
+        })
+    }))
 }
 
 fn resolve_deferred_buffer(
@@ -282,29 +258,20 @@ fn resolve_deferred_buffer(
         .deferred_buffer_physical
         .checked_add(runtime.deferred_buffer_size as u64)
         .ok_or(efi::Status::INVALID_PARAMETER)?;
-    (0..count)
-        .try_fold(None, |found, index| {
-            let candidate = mapping(read_descriptor(map, stride, index)?)?;
-            if candidate.memory_type != efi::RUNTIME_SERVICES_DATA
-                || candidate.attributes & efi::MEMORY_RUNTIME == 0
-                || candidate.virtual_address == 0
-                || candidate.physical > runtime.deferred_buffer_physical
-                || !candidate.physical_end().is_some_and(|value| value >= end)
-            {
-                return Ok(found);
-            }
-            if found.is_some() {
-                return Err(efi::Status::INVALID_PARAMETER);
-            }
-            Ok(Some(candidate))
-        })?
-        .ok_or(efi::Status::NOT_FOUND)
-        .map(Some)
+    unique_mapping(map, stride, count, |candidate| {
+        covers_runtime(
+            candidate,
+            efi::RUNTIME_SERVICES_DATA,
+            runtime.deferred_buffer_physical,
+            end,
+        )
+    })
+    .map(Some)
 }
 
 fn virtual_time_config(
     runtime: &state::RuntimeState,
-    range_virtual_bases: &[u64; MAX_EXTERNAL_RANGES],
+    range_virtual_bases: &[u64],
 ) -> Result<RuntimeTimeConfig, efi::Status> {
     let width = match runtime.time.mechanism {
         time_mechanism::PL031 => 4,
@@ -319,7 +286,6 @@ fn virtual_time_config(
     let (index, range) = runtime
         .ranges
         .iter()
-        .take(runtime.range_count)
         .enumerate()
         .find(|(_, range)| {
             range.physical_base <= runtime.time.io_or_mmio_base
@@ -342,47 +308,34 @@ fn virtual_time_config(
     Ok(config)
 }
 
+/// Virtual base of each physical region given the descriptor mapping it.
+fn virtual_bases<const N: usize>(
+    physical_bases: impl Iterator<Item = u64>,
+    mappings: &[Mapping],
+) -> Result<Vec<u64, N>, efi::Status> {
+    collect_bounded(physical_bases.zip(mappings).map(|(physical, mapping)| {
+        physical
+            .checked_sub(mapping.physical)
+            .and_then(|offset| mapping.virtual_address.checked_add(offset))
+            .ok_or(efi::Status::INVALID_PARAMETER)
+    }))
+}
+
 fn validate_and_commit(
     state_pointer: *mut state::RuntimeState,
     runtime: &mut state::RuntimeState,
-    section_mappings: &[Mapping; MAX_SECTIONS],
-    range_mappings: &[Mapping; MAX_EXTERNAL_RANGES],
+    section_mappings: &[Mapping],
+    range_mappings: &[Mapping],
     deferred_mapping: Option<Mapping>,
 ) -> Result<(), efi::Status> {
-    let mut section_virtual_bases = [0u64; MAX_SECTIONS];
-    for ((section, mapping), virtual_base) in runtime
-        .sections
-        .iter()
-        .take(runtime.section_count)
-        .zip(section_mappings.iter())
-        .zip(section_virtual_bases.iter_mut())
-    {
-        let offset = section
-            .physical_base
-            .checked_sub(mapping.physical)
-            .ok_or(efi::Status::INVALID_PARAMETER)?;
-        *virtual_base = mapping
-            .virtual_address
-            .checked_add(offset)
-            .ok_or(efi::Status::INVALID_PARAMETER)?;
-    }
-    let mut range_virtual_bases = [0u64; MAX_EXTERNAL_RANGES];
-    for ((range, mapping), virtual_base) in runtime
-        .ranges
-        .iter()
-        .take(runtime.range_count)
-        .zip(range_mappings.iter())
-        .zip(range_virtual_bases.iter_mut())
-    {
-        let offset = range
-            .physical_base
-            .checked_sub(mapping.physical)
-            .ok_or(efi::Status::INVALID_PARAMETER)?;
-        *virtual_base = mapping
-            .virtual_address
-            .checked_add(offset)
-            .ok_or(efi::Status::INVALID_PARAMETER)?;
-    }
+    let section_virtual_bases: Vec<u64, MAX_SECTIONS> = virtual_bases(
+        runtime.sections.iter().map(|section| section.physical_base),
+        section_mappings,
+    )?;
+    let range_virtual_bases: Vec<u64, MAX_EXTERNAL_RANGES> = virtual_bases(
+        runtime.ranges.iter().map(|range| range.physical_base),
+        range_mappings,
+    )?;
 
     let virtual_time = virtual_time_config(runtime, &range_virtual_bases)?;
 
@@ -406,11 +359,10 @@ fn validate_and_commit(
     let state_address = runtime as *mut state::RuntimeState as u64;
     let transition_tail_addresses = state::transition_tail_addresses();
     let store_address = core::ptr::addr_of!(state::RUNTIME_VARIABLE_STORE) as u64;
-    let mut tail = [SlotPatch::empty(); MAX_TAIL_RELOCATIONS];
-    let mut tail_count = 0usize;
+    let mut tail: Vec<SlotPatch, MAX_TAIL_RELOCATIONS> = Vec::new();
 
     // Validation pass: no writes.
-    for relocation in runtime.relocations.iter().take(runtime.relocation_count) {
+    for relocation in &runtime.relocations {
         let patch_section = runtime
             .sections
             .get(usize::from(relocation.patch_section))
@@ -466,43 +418,27 @@ fn validate_and_commit(
             return Err(efi::Status::INVALID_PARAMETER);
         }
         if tail_required {
-            if tail_count >= tail.len() {
-                return Err(efi::Status::OUT_OF_RESOURCES);
-            }
-            *tail
-                .get_mut(tail_count)
-                .ok_or(efi::Status::OUT_OF_RESOURCES)? = SlotPatch {
+            tail.push(SlotPatch {
                 address: patch_address,
                 value: virtual_target,
-            };
-            tail_count += 1;
+            })
+            .map_err(|_| efi::Status::OUT_OF_RESOURCES)?;
         }
     }
 
     // Infallible commit begins. First publish resolved bases in image state.
-    for (section, virtual_base) in runtime
-        .sections
-        .iter_mut()
-        .take(runtime.section_count)
-        .zip(section_virtual_bases.iter())
-    {
+    for (section, virtual_base) in runtime.sections.iter_mut().zip(&section_virtual_bases) {
         section.virtual_base = *virtual_base;
     }
-    for (range, virtual_base) in runtime
-        .ranges
-        .iter_mut()
-        .take(runtime.range_count)
-        .zip(range_virtual_bases.iter())
-    {
+    for (range, virtual_base) in runtime.ranges.iter_mut().zip(&range_virtual_bases) {
         range.virtual_base = *virtual_base;
     }
     runtime.time = virtual_time;
     runtime.deferred_buffer_virtual = deferred_virtual;
 
-    let sections = runtime.sections;
-    let section_count = runtime.section_count;
+    let sections = &runtime.sections;
     runtime.tables.convert_internal_pointers(|physical| {
-        sections.iter().take(section_count).find_map(|section| {
+        sections.iter().find_map(|section| {
             let offset = physical.checked_sub(section.physical_base)?;
             (offset < u64::from(section.byte_len))
                 .then(|| section.virtual_base.checked_add(offset))?
@@ -516,7 +452,6 @@ fn validate_and_commit(
     runtime.tables.recompute_crcs();
     runtime.tables.recompute_runtime_crc_with(|address, byte| {
         tail.iter()
-            .take(tail_count)
             .find_map(|slot| {
                 let offset = address.checked_sub(slot.address)?;
                 slot.value.to_le_bytes().get(offset as usize).copied()
@@ -527,30 +462,27 @@ fn validate_and_commit(
     // Patch every non-tail slot while physical aliases are executable.
     commit_matching(runtime, &section_virtual_bases, |address| {
         !(address >= runtime_table_start && address < runtime_table_end)
-            && !tail
-                .iter()
-                .take(tail_count)
-                .any(|slot| slot.address == address)
+            && !tail.iter().any(|slot| slot.address == address)
     });
 
     // No image state or transition atomic is accessed after this release.
     state::publish_virtual_and_unlock();
-    runtime_image_commit_tail_and_return(state_pointer, tail.as_ptr(), tail_count);
+    runtime_image_commit_tail_and_return(state_pointer, tail.as_ptr(), tail.len());
     Ok(())
 }
 
 fn commit_matching(
     runtime: &state::RuntimeState,
-    virtual_bases: &[u64; MAX_SECTIONS],
+    virtual_bases: &[u64],
     predicate: impl Fn(u64) -> bool,
 ) {
-    for relocation in runtime.relocations.iter().take(runtime.relocation_count) {
+    for relocation in &runtime.relocations {
         let patch_index = usize::from(relocation.patch_section);
         let target_index = usize::from(relocation.target_section);
         // Mirror the validation pass so a future edit there cannot silently
         // invalidate the safety argument of the unchecked accesses below.
         debug_assert!(
-            patch_index < runtime.section_count && target_index < runtime.section_count,
+            patch_index < runtime.sections.len() && target_index < runtime.sections.len(),
             "relocation section index escaped validation"
         );
         debug_assert!(
@@ -614,7 +546,7 @@ fn runtime_image_commit_tail_and_return(
 ) {
     let mut index = 0;
     while index < count {
-        // SAFETY: the fixed stack tail array has `count` initialized entries.
+        // SAFETY: the stack tail vector has `count` initialized entries.
         let slot = unsafe { tail.add(index).read() };
         // SAFETY: validation established this image-local slot and the caller
         // invokes this only while physical aliases remain valid.
@@ -711,14 +643,13 @@ mod tests {
     #[test]
     fn runtime_section_requires_runtime_attribute() {
         let mut runtime = state::RuntimeState::new();
-        runtime.section_count = 1;
-        runtime.sections[0] = state::SectionRecord {
+        runtime.sections = Vec::from_array([state::SectionRecord {
             physical_base: 0x40_0000,
             virtual_base: 0,
             image_offset: 0,
             byte_len: PAGE_SIZE as u32,
             flags: section_flags::EXECUTE,
-        };
+        }]);
         let descriptors = [efi::MemoryDescriptor {
             r#type: efi::RUNTIME_SERVICES_CODE,
             physical_start: 0x40_0000,
@@ -745,16 +676,13 @@ mod tests {
             reserved: 0,
             io_or_mmio_base: 0x20_0120,
         };
-        runtime.range_count = 1;
-        runtime.ranges[0] = state::RangeRecord {
+        runtime.ranges = Vec::from_array([state::RangeRecord {
             physical_base: 0x20_0000,
             virtual_base: 0,
             byte_len: 0x1000,
             attributes: efi::MEMORY_RUNTIME,
-        };
-        let mut virtual_bases = [0; MAX_EXTERNAL_RANGES];
-        virtual_bases[0] = 0xffff_8000_0020_0000;
-        let converted = virtual_time_config(&runtime, &virtual_bases).unwrap();
+        }]);
+        let converted = virtual_time_config(&runtime, &[0xffff_8000_0020_0000]).unwrap();
         assert_eq!(converted.io_or_mmio_base, 0xffff_8000_0020_0120);
     }
 
@@ -766,15 +694,14 @@ mod tests {
             reserved: 0,
             io_or_mmio_base: 0x20_0ffc,
         };
-        runtime.range_count = 1;
-        runtime.ranges[0] = state::RangeRecord {
+        runtime.ranges = Vec::from_array([state::RangeRecord {
             physical_base: 0x20_0000,
             virtual_base: 0,
             byte_len: 0x1000,
             attributes: efi::MEMORY_RUNTIME,
-        };
+        }]);
         assert_eq!(
-            virtual_time_config(&runtime, &[0; MAX_EXTERNAL_RANGES]),
+            virtual_time_config(&runtime, &[0]),
             Err(efi::Status::NOT_FOUND)
         );
     }

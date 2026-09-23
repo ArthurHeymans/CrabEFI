@@ -312,13 +312,9 @@ pub unsafe extern "C" fn runtime_image_prepare_ebs(
     let descriptors = unsafe { core::slice::from_raw_parts(descriptors, descriptor_count) };
     export_status(state::lease_in(Phase::BOOT_SERVICES).and_then(|mut lease| {
         let runtime = lease.state_mut();
-        let sections = runtime
-            .sections
-            .get(..runtime.section_count)
-            .ok_or(efi::Status::DEVICE_ERROR)?;
         runtime
             .tables
-            .prepare_memory_attributes(descriptors, sections)
+            .prepare_memory_attributes(descriptors, &runtime.sections)
     }))
 }
 
