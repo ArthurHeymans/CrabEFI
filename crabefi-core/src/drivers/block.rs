@@ -1,51 +1,44 @@
-//! Unified Block Device Abstraction
+//! Block Device Abstraction
 //!
-//! This module provides a common interface for all storage devices (NVMe, AHCI, USB)
-//! that maps directly to the UEFI EFI_BLOCK_IO_PROTOCOL.
-//!
-//! # Architecture
-//!
-//! All block devices implement the `BlockDevice` trait, providing:
-//! - Device information (block count, block size, removable, etc.)
-//! - Block read operations
-//!
-//! The `AnyBlockDevice` enum provides type-safe dispatch without trait objects,
-//! similar to how `UsbControllerHandle` works for USB controllers.
+//! The [`BlockDevice`] trait is the single read interface for every disk
+//! CrabEFI boots from: in-tree NVMe, AHCI, USB mass storage and SDHCI devices
+//! as well as platform-provided devices from
+//! [`crate::PlatformConfig::block_devices`]. Filesystem, partition and boot
+//! code only see `&mut dyn BlockDevice`.
 
 use crate::drivers::{ahci, nvme, sdhci, usb};
 
-/// Standard sector size (512 bytes)
-pub const SECTOR_SIZE: usize = 512;
-
-/// Information about a block device
+/// Information about a block device.
 ///
-/// This structure maps closely to EFI_BLOCK_IO_MEDIA.
+/// Maps closely to `EFI_BLOCK_IO_MEDIA` from the UEFI specification.
 #[derive(Clone, Copy, Debug)]
 pub struct BlockDeviceInfo {
-    /// Total number of blocks on the device
+    /// Total number of logical blocks on the device.
     pub num_blocks: u64,
-    /// Size of each block in bytes
+    /// Size of each logical block in bytes (typically 512).
     pub block_size: u32,
-    /// Media ID (changes if media is replaced)
+    /// Media identifier (changes if removable media is swapped).
     pub media_id: u32,
-    /// True if the device is removable (USB, CD-ROM, etc.)
+    /// Whether the device has removable media (e.g., USB stick, SD card).
     pub removable: bool,
-    /// True if the device is read-only
+    /// Whether the media is read-only.
     pub read_only: bool,
 }
 
-/// Unified error type for block operations
-#[derive(Debug)]
+/// Errors returned by block device operations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum BlockError {
-    /// Generic device error
+    /// Unspecified device error.
     DeviceError,
-    /// Invalid parameter (bad LBA, buffer too small, etc.)
+    /// Invalid parameter (bad LBA, buffer too small, etc.).
     InvalidParameter,
-    /// LBA out of range
+    /// LBA out of range for this device.
     OutOfRange,
-    /// No media present (for removable devices)
+    /// No media present (removable device with nothing inserted, or the
+    /// device is no longer available).
     NoMedia,
-    /// Media has changed since last access
+    /// Media changed since last access.
     MediaChanged,
 }
 
@@ -58,6 +51,87 @@ impl core::fmt::Display for BlockError {
             BlockError::NoMedia => write!(f, "no media present"),
             BlockError::MediaChanged => write!(f, "media changed"),
         }
+    }
+}
+
+/// Block-level storage device interface.
+///
+/// # Implementor's Guide
+///
+/// - `read_blocks` must handle arbitrary LBA ranges within bounds.
+/// - `info()` should return consistent values for the device's lifetime.
+/// - `name()` is displayed in the boot menu for platform-provided devices;
+///   make it descriptive (e.g., `"eMMC: partition 0"`).
+///
+/// # Example
+///
+/// ```ignore
+/// struct MyEmmc { base: u64, num_sectors: u64 }
+///
+/// impl crabefi::BlockDevice for MyEmmc {
+///     fn info(&self) -> crabefi::BlockDeviceInfo {
+///         crabefi::BlockDeviceInfo {
+///             num_blocks: self.num_sectors,
+///             block_size: 512,
+///             media_id: 0,
+///             removable: false,
+///             read_only: false,
+///         }
+///     }
+///     fn read_blocks(&mut self, lba: u64, count: u32, buffer: &mut [u8])
+///         -> Result<(), crabefi::BlockError>
+///     {
+///         self.validate_read(lba, count, buffer)?;
+///         // ... hardware-specific read ...
+///         Ok(())
+///     }
+///     fn name(&self) -> &str { "eMMC" }
+/// }
+/// ```
+pub trait BlockDevice {
+    /// Get device information (block count, block size, media properties).
+    fn info(&self) -> BlockDeviceInfo;
+
+    /// Read contiguous blocks from the device.
+    ///
+    /// # Arguments
+    /// * `lba` - Starting logical block address.
+    /// * `count` - Number of blocks to read.
+    /// * `buffer` - Destination buffer (must be at least `count * block_size` bytes).
+    fn read_blocks(&mut self, lba: u64, count: u32, buffer: &mut [u8]) -> Result<(), BlockError>;
+
+    /// Human-readable device name for the boot menu.
+    fn name(&self) -> &str {
+        "Block Device"
+    }
+
+    /// Validate parameters for a read operation.
+    ///
+    /// Checks the LBA range and buffer size. Implementations should call this
+    /// at the start of `read_blocks`.
+    fn validate_read(&self, lba: u64, count: u32, buffer: &[u8]) -> Result<(), BlockError> {
+        let info = self.info();
+        if count == 0 {
+            return Ok(());
+        }
+        let end_lba = lba
+            .checked_add(count as u64)
+            .ok_or(BlockError::OutOfRange)?;
+        if end_lba > info.num_blocks {
+            return Err(BlockError::OutOfRange);
+        }
+        let required = (count as usize)
+            .checked_mul(info.block_size as usize)
+            .ok_or(BlockError::InvalidParameter)?;
+        if buffer.len() < required {
+            return Err(BlockError::InvalidParameter);
+        }
+        Ok(())
+    }
+
+    /// Read a single block (convenience wrapper).
+    fn read_block(&mut self, lba: u64, buffer: &mut [u8]) -> Result<(), BlockError> {
+        self.read_blocks(lba, 1, buffer)
     }
 }
 
@@ -101,53 +175,6 @@ impl From<sdhci::SdhciError> for BlockError {
             sdhci::SdhciError::NotInitialized => BlockError::NoMedia,
             _ => BlockError::DeviceError,
         }
-    }
-}
-
-/// Trait for block-level storage devices
-///
-/// All storage devices (NVMe namespaces, AHCI ports, USB mass storage) implement
-/// this trait, providing a unified interface for block I/O operations.
-pub trait BlockDevice {
-    /// Get device information
-    fn info(&self) -> BlockDeviceInfo;
-
-    /// Read blocks from the device
-    ///
-    /// # Arguments
-    /// * `lba` - Starting logical block address
-    /// * `count` - Number of blocks to read
-    /// * `buffer` - Buffer to read into (must be at least count * block_size bytes)
-    ///
-    /// # Returns
-    /// Ok(()) on success, Err(BlockError) on failure
-    fn read_blocks(&mut self, lba: u64, count: u32, buffer: &mut [u8]) -> Result<(), BlockError>;
-
-    /// Validate parameters for a read operation
-    ///
-    /// Checks that the LBA range is within bounds and the buffer is large enough.
-    /// Implementations should call this at the start of `read_blocks`.
-    fn validate_read(&self, lba: u64, count: u32, buffer: &[u8]) -> Result<(), BlockError> {
-        let info = self.info();
-        if count == 0 {
-            return Ok(());
-        }
-        let end_lba = lba
-            .checked_add(count as u64)
-            .ok_or(BlockError::OutOfRange)?;
-        if end_lba > info.num_blocks {
-            return Err(BlockError::OutOfRange);
-        }
-        let required = count as usize * info.block_size as usize;
-        if buffer.len() < required {
-            return Err(BlockError::InvalidParameter);
-        }
-        Ok(())
-    }
-
-    /// Read a single block (convenience method)
-    fn read_block(&mut self, lba: u64, buffer: &mut [u8]) -> Result<(), BlockError> {
-        self.read_blocks(lba, 1, buffer)
     }
 }
 
