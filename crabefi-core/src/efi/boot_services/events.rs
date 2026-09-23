@@ -221,7 +221,8 @@ fn notify_wait_event(event_id: usize, event: efi::Event) {
             "  -> Calling EVT_NOTIFY_WAIT function for event {}",
             event_id
         );
-        super::with_image_callback(|| func(event, context));
+        // SAFETY: the callback and context are registered on this live event.
+        super::with_image_callback(|| unsafe { func(event, context) });
     }
 }
 
@@ -299,7 +300,8 @@ pub(super) extern "efiapi" fn signal_event(event: efi::Event) -> Status {
     };
     if let Some((func, context)) = notify_fn {
         log::debug!("  -> Calling notify function for event {}", event_id);
-        super::with_image_callback(|| func(event, context));
+        // SAFETY: the callback and context are registered on this live event.
+        super::with_image_callback(|| unsafe { func(event, context) });
     }
 
     Status::SUCCESS
@@ -446,7 +448,8 @@ pub(super) fn signal_event_group(group_guid: &Guid) {
                 "signal_event_group: calling notify for event {:#x}",
                 event_handle
             );
-            super::with_image_callback(|| func(*event_handle as efi::Event, *context));
+            // SAFETY: the callback and context were copied from a live event.
+            super::with_image_callback(|| unsafe { func(*event_handle as efi::Event, *context) });
         }
     }
 

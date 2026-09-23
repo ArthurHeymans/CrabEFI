@@ -814,7 +814,9 @@ pub(super) extern "efiapi" fn unload_image(image_handle: Handle) -> Status {
         let Some(unload) = (unsafe { (*protocol).unload }) else {
             return Status::UNSUPPORTED;
         };
-        let status = super::with_image_callback(|| unload(image_handle));
+        // SAFETY: this callback belongs to the installed LoadedImage protocol,
+        // which remains live until after it returns.
+        let status = super::with_image_callback(|| unsafe { unload(image_handle) });
         if status != Status::SUCCESS {
             return status;
         }
@@ -896,7 +898,8 @@ pub(super) extern "efiapi" fn exit_boot_services(image_handle: Handle, map_key: 
                 )
             };
             if let Some((func, context)) = notify_fn {
-                super::with_image_callback(|| func(*handle as efi::Event, context));
+                // SAFETY: the callback and context belong to this live event.
+                super::with_image_callback(|| unsafe { func(*handle as efi::Event, context) });
             }
         }
     }
