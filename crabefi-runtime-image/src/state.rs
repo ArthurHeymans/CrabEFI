@@ -9,6 +9,7 @@ use crabefi_runtime_abi::{
     RuntimeExternalRange, RuntimeHandoff, RuntimeResetConfig, RuntimeTimeConfig, relocation_kind,
     section_flags,
 };
+use heapless::Vec;
 
 use crate::{
     deferred::DeferredTransaction,
@@ -75,35 +76,12 @@ pub struct SectionRecord {
     pub flags: u32,
 }
 
-impl SectionRecord {
-    const fn empty() -> Self {
-        Self {
-            physical_base: 0,
-            virtual_base: 0,
-            image_offset: 0,
-            byte_len: 0,
-            flags: 0,
-        }
-    }
-}
-
 #[derive(Clone, Copy)]
 pub struct RangeRecord {
     pub physical_base: u64,
     pub virtual_base: u64,
     pub byte_len: u64,
     pub attributes: u64,
-}
-
-impl RangeRecord {
-    const fn empty() -> Self {
-        Self {
-            physical_base: 0,
-            virtual_base: 0,
-            byte_len: 0,
-            attributes: 0,
-        }
-    }
 }
 
 #[derive(Clone, Copy)]
@@ -115,31 +93,12 @@ pub struct RelocationRecord {
     pub kind: u16,
 }
 
-impl RelocationRecord {
-    const fn empty() -> Self {
-        Self {
-            patch_offset: 0,
-            target_offset: 0,
-            patch_section: 0,
-            target_section: 0,
-            kind: 0,
-        }
-    }
-}
-
 pub struct RuntimeState {
     pub tables: ImageTables,
-    pub image_base: u64,
-    pub image_size: u32,
-    pub architecture: u16,
-    pub section_count: usize,
-    pub sections: [SectionRecord; MAX_SECTIONS],
-    pub range_count: usize,
-    pub ranges: [RangeRecord; MAX_EXTERNAL_RANGES],
-    pub relocation_count: usize,
-    pub relocations: [RelocationRecord; MAX_RELOCATIONS],
+    pub sections: Vec<SectionRecord, MAX_SECTIONS>,
+    pub ranges: Vec<RangeRecord, MAX_EXTERNAL_RANGES>,
+    pub relocations: Vec<RelocationRecord, MAX_RELOCATIONS>,
     pub time: RuntimeTimeConfig,
-    pub reset: RuntimeResetConfig,
     pub boot_bridge: u64,
     pub deferred_buffer_physical: u64,
     pub deferred_buffer_virtual: u64,
@@ -151,21 +110,10 @@ impl RuntimeState {
     pub const fn new() -> Self {
         Self {
             tables: ImageTables::new(),
-            image_base: 0,
-            image_size: 0,
-            architecture: 0,
-            section_count: 0,
-            sections: [SectionRecord::empty(); MAX_SECTIONS],
-            range_count: 0,
-            ranges: [RangeRecord::empty(); MAX_EXTERNAL_RANGES],
-            relocation_count: 0,
-            relocations: [RelocationRecord::empty(); MAX_RELOCATIONS],
+            sections: Vec::new(),
+            ranges: Vec::new(),
+            relocations: Vec::new(),
             time: RuntimeTimeConfig {
-                mechanism: 0,
-                reserved: 0,
-                io_or_mmio_base: 0,
-            },
-            reset: RuntimeResetConfig {
                 mechanism: 0,
                 reserved: 0,
                 io_or_mmio_base: 0,
@@ -182,33 +130,23 @@ impl RuntimeState {
         handoff
             .validate()
             .map_err(|_| efi::Status::INVALID_PARAMETER)?;
-        self.image_base = handoff.image_base;
-        self.image_size = handoff.image_size;
-        self.architecture = handoff.architecture;
-        self.section_count = usize::from(handoff.section_count);
-        self.range_count = usize::from(handoff.range_count);
+        let sections = handoff
+            .sections()
+            .map_err(|_| efi::Status::INVALID_PARAMETER)?;
+        let ranges = handoff
+            .ranges()
+            .map_err(|_| efi::Status::INVALID_PARAMETER)?;
+        self.sections = collect_bounded(
+            sections
+                .iter()
+                .map(|section| Ok(section_from_handoff(section))),
+        )?;
+        self.ranges = collect_bounded(ranges.iter().map(|range| Ok(range_from_handoff(range))))?;
         self.time = handoff.time;
-        self.reset = handoff.reset;
         self.boot_bridge = handoff.boot_bridge;
         self.deferred_buffer_physical = handoff.deferred_buffer_base;
         self.deferred_buffer_size = usize::try_from(handoff.deferred_buffer_size)
             .map_err(|_| efi::Status::INVALID_PARAMETER)?;
-        for (destination, source) in self
-            .sections
-            .iter_mut()
-            .take(self.section_count)
-            .zip(handoff.sections.iter())
-        {
-            *destination = section_from_handoff(source);
-        }
-        for (destination, source) in self
-            .ranges
-            .iter_mut()
-            .take(self.range_count)
-            .zip(handoff.ranges.iter())
-        {
-            *destination = range_from_handoff(source);
-        }
         // Publish ResetSystem's lock-free snapshot before boot services can
         // call it. The snapshot is outside RuntimeState so a re-entrant reset
         // never reads through an outstanding mutable state lease.
@@ -217,22 +155,14 @@ impl RuntimeState {
     }
 
     pub fn import_relocation(&mut self, relocation: &RelocationImport) -> Result<(), efi::Status> {
-        if self.relocation_count >= MAX_RELOCATIONS {
-            return Err(efi::Status::OUT_OF_RESOURCES);
-        }
-        let patch_index = usize::from(relocation.patch_section);
-        let target_index = usize::from(relocation.target_section);
-        if patch_index >= self.section_count || target_index >= self.section_count {
-            return Err(efi::Status::INVALID_PARAMETER);
-        }
         let patch = self
             .sections
-            .get(patch_index)
+            .get(usize::from(relocation.patch_section))
             .copied()
             .ok_or(efi::Status::INVALID_PARAMETER)?;
         let target = self
             .sections
-            .get(target_index)
+            .get(usize::from(relocation.target_section))
             .copied()
             .ok_or(efi::Status::INVALID_PARAMETER)?;
         // Mirror the normalized-image manifest checks (format.rs) so an
@@ -246,15 +176,15 @@ impl RuntimeState {
         {
             return Err(efi::Status::INVALID_PARAMETER);
         }
-        self.relocations[self.relocation_count] = RelocationRecord {
-            patch_offset: relocation.patch_offset,
-            target_offset: relocation.target_offset,
-            patch_section: relocation.patch_section,
-            target_section: relocation.target_section,
-            kind: relocation.kind,
-        };
-        self.relocation_count += 1;
-        Ok(())
+        self.relocations
+            .push(RelocationRecord {
+                patch_offset: relocation.patch_offset,
+                target_offset: relocation.target_offset,
+                patch_section: relocation.patch_section,
+                target_section: relocation.target_section,
+                kind: relocation.kind,
+            })
+            .map_err(|_| efi::Status::OUT_OF_RESOURCES)
     }
 
     pub fn deferred_buffer(&self) -> (*mut u8, usize) {
@@ -265,6 +195,19 @@ impl RuntimeState {
         };
         (base as *mut u8, self.deferred_buffer_size)
     }
+}
+
+/// Collect fallible `items`, failing instead of truncating beyond `N`.
+pub fn collect_bounded<T, const N: usize>(
+    items: impl Iterator<Item = Result<T, efi::Status>>,
+) -> Result<Vec<T, N>, efi::Status> {
+    let mut collected = Vec::new();
+    for item in items {
+        collected
+            .push(item?)
+            .map_err(|_| efi::Status::INVALID_PARAMETER)?;
+    }
+    Ok(collected)
 }
 
 fn section_from_handoff(section: &LoadedSection) -> SectionRecord {
@@ -546,7 +489,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn reset_snapshot_is_independent_of_mutably_borrowed_runtime_state() {
+    fn published_reset_snapshot_reads_back() {
         let snapshot = ResetConfigCell::new();
         let expected = RuntimeResetConfig {
             mechanism: 3,
@@ -554,10 +497,6 @@ mod tests {
             io_or_mmio_base: 0xcf9,
         };
         snapshot.publish(expected);
-
-        let mut runtime = RuntimeState::new();
-        runtime.reset.io_or_mmio_base = 0x1234;
-        assert_ne!(runtime.reset.io_or_mmio_base, expected.io_or_mmio_base);
         assert_eq!(snapshot.read(), expected);
     }
 
@@ -579,21 +518,22 @@ mod tests {
     #[test]
     fn import_relocation_validates_offsets_against_imported_sections() {
         let mut runtime = RuntimeState::new();
-        runtime.section_count = 2;
-        runtime.sections[0] = SectionRecord {
-            physical_base: 0x10_0000,
-            virtual_base: 0,
-            image_offset: 0,
-            byte_len: 0x1000,
-            flags: section_flags::EXECUTE,
-        };
-        runtime.sections[1] = SectionRecord {
-            physical_base: 0x10_1000,
-            virtual_base: 0,
-            image_offset: 0x1000,
-            byte_len: 0x1000,
-            flags: section_flags::RELOCATION_SLOTS | section_flags::WRITE,
-        };
+        runtime.sections = Vec::from_array([
+            SectionRecord {
+                physical_base: 0x10_0000,
+                virtual_base: 0,
+                image_offset: 0,
+                byte_len: 0x1000,
+                flags: section_flags::EXECUTE,
+            },
+            SectionRecord {
+                physical_base: 0x10_1000,
+                virtual_base: 0,
+                image_offset: 0x1000,
+                byte_len: 0x1000,
+                flags: section_flags::RELOCATION_SLOTS | section_flags::WRITE,
+            },
+        ]);
         let valid = RelocationImport {
             patch_offset: 0x1008,
             target_offset: 0x0,
@@ -642,6 +582,6 @@ mod tests {
         ] {
             assert!(runtime.import_relocation(&invalid).is_err());
         }
-        assert_eq!(runtime.relocation_count, 1);
+        assert_eq!(runtime.relocations.len(), 1);
     }
 }
