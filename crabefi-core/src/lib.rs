@@ -666,45 +666,7 @@ pub(crate) fn with_disk<R>(
             })
         }
         menu::DeviceType::Platform { index } => {
-            drivers::storage::with_platform_block_device(index, |dev| {
-                let mut shim = PlatformBlockShim(dev);
-                f(&mut shim)
-            })
+            drivers::storage::with_platform_block_device(index, f)
         }
-    }
-}
-
-/// Shim that adapts a [`platform::BlockDevice`] to the internal
-/// [`drivers::block::BlockDevice`] trait used by the boot path.
-struct PlatformBlockShim<'a>(&'a mut dyn platform::BlockDevice);
-
-impl drivers::block::BlockDevice for PlatformBlockShim<'_> {
-    fn info(&self) -> drivers::block::BlockDeviceInfo {
-        let i = self.0.info();
-        drivers::block::BlockDeviceInfo {
-            num_blocks: i.num_blocks,
-            block_size: i.block_size,
-            media_id: 0,
-            removable: false,
-            read_only: false,
-        }
-    }
-
-    fn read_blocks(
-        &mut self,
-        lba: u64,
-        count: u32,
-        buffer: &mut [u8],
-    ) -> Result<(), drivers::block::BlockError> {
-        // `BlockError` is #[non_exhaustive]; the `_` arm covers future variants.
-        #[allow(unreachable_patterns)]
-        self.0.read_blocks(lba, count, buffer).map_err(|e| match e {
-            platform::BlockError::DeviceError => drivers::block::BlockError::DeviceError,
-            platform::BlockError::InvalidParameter => drivers::block::BlockError::InvalidParameter,
-            platform::BlockError::OutOfRange => drivers::block::BlockError::OutOfRange,
-            platform::BlockError::NoMedia => drivers::block::BlockError::NoMedia,
-            platform::BlockError::MediaChanged => drivers::block::BlockError::MediaChanged,
-            _ => drivers::block::BlockError::DeviceError,
-        })
     }
 }
