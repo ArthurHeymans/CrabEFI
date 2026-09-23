@@ -79,13 +79,11 @@ updates, appends, and deletions are verified inside the runtime image using its
 authoritative key databases, replay timestamps, and fixed stack RSA buffers.
 Boot enrollment uses the same standard `SetVariable` entry point.
 
-The split intentionally has two narrowly scoped certificate verifiers. The
-runtime image uses the hand-rolled PKCS#7/X.509 parser in
-`crabefi-runtime-image/src/auth/crypto.rs` together with stack-backed
-schoolbook Montgomery RSA exponentiation (`auth/bigint.rs`, no allocator);
-boot parses CMS/X.509 on the minimal `asn1` crate
-(`crabefi-core/src/efi/auth/asn1_views.rs`) and verifies RSA with the `rsa`
-crate for Authenticode image verification.
+Both sides verify certificates with the shared allocation-free
+`crabefi-pkcs7` crate (DER/X.509/CMS views and stack-backed schoolbook
+Montgomery RSA). The runtime image applies its authenticated-variable policy in
+`crabefi-runtime-image/src/auth/crypto.rs`; boot applies chain building,
+revocation and Authenticode policy in `crabefi-core/src/efi/auth/`.
 Both deliberately skip certificate `notBefore`/`notAfter` checks. This
 preserves the pre-split `check_validity_period = false` behavior and matches
 EDK2 and U-Boot Secure Boot handling, where firmware time does not gate trust

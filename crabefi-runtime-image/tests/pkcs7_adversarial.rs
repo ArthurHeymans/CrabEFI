@@ -1,4 +1,5 @@
-//! Adversarial host tests for the runtime image's bounded CMS/DER parser.
+//! Adversarial host tests for the runtime image's authenticated-variable CMS
+//! policy.
 
 use core::convert::Infallible;
 
@@ -17,6 +18,15 @@ const OID_CONTENT_TYPE: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x09
 const OID_MESSAGE_DIGEST: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x09, 0x04];
 const OID_SHA256_WITH_RSA: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x0b];
 const OID_BASIC_CONSTRAINTS: &[u8] = &[0x55, 0x1d, 0x13];
+
+fn verify_pkcs7_signature(
+    pkcs7: &[u8],
+    content: &[u8],
+    trusted: &[u8],
+) -> Result<bool, auth::AuthError> {
+    let content_hash: [u8; 32] = Sha256::digest(content).into();
+    auth::crypto::verify_pkcs7_signature_hash(pkcs7, &content_hash, trusted)
+}
 
 fn tlv(tag: u8, value: &[u8]) -> Vec<u8> {
     let mut result = vec![tag];
@@ -176,23 +186,12 @@ fn required_attributes(content: &[u8]) -> Vec<u8> {
 }
 
 fn assert_rejected_without_panic(pkcs7: &[u8], trusted: &[u8]) {
-    let outcome =
-        std::panic::catch_unwind(|| auth::crypto::verify_pkcs7_signature(pkcs7, &[], trusted));
+    let outcome = std::panic::catch_unwind(|| verify_pkcs7_signature(pkcs7, &[], trusted));
     let verification = outcome.expect("adversarial DER input must not panic");
     assert!(
         verification.is_err() || verification == Ok(false),
         "malformed or over-limit input was accepted"
     );
-}
-
-#[test]
-fn truncated_tlv_is_rejected_without_panic() {
-    assert_rejected_without_panic(&[0x30, 0x82, 0x01], &[]);
-}
-
-#[test]
-fn length_past_end_of_buffer_is_rejected_without_panic() {
-    assert_rejected_without_panic(&[0x30, 0x84, 0xff, 0xff, 0xff, 0xff], &[]);
 }
 
 #[test]
@@ -226,8 +225,7 @@ fn chain_deeper_than_five_is_rejected_without_panic() {
         .expect("test key signs content prehash")
         .to_vec();
     let input = signed_data(OID_SHA256, &certificates, &[signer(2, 1, &signature)]);
-    let outcome =
-        std::panic::catch_unwind(|| auth::crypto::verify_pkcs7_signature(&input, &[], &trusted));
+    let outcome = std::panic::catch_unwind(|| verify_pkcs7_signature(&input, &[], &trusted));
     assert_eq!(
         outcome.expect("over-depth chain must not panic"),
         Err(auth::AuthError::ChainTooDeep)
@@ -255,22 +253,19 @@ fn valid_detached_cms_is_accepted() {
         std::slice::from_ref(&trusted),
         &[signer(1, 1, &signature)],
     );
-    assert_eq!(
-        auth::crypto::verify_pkcs7_signature(&cms, content, &trusted),
-        Ok(true)
-    );
+    assert_eq!(verify_pkcs7_signature(&cms, content, &trusted), Ok(true));
 }
 
 #[test]
 fn attached_content_and_wrong_encapsulated_type_are_rejected() {
     let attached = signed_data_with_encapsulated(OID_SHA256, &[], &[], OID_DATA, Some(b"attached"));
     assert_eq!(
-        auth::crypto::verify_pkcs7_signature(&attached, b"detached", &[]),
+        verify_pkcs7_signature(&attached, b"detached", &[]),
         Err(auth::AuthError::InvalidHeader)
     );
     let wrong_type = signed_data_with_encapsulated(OID_SHA256, &[], &[], OID_SIGNED_DATA, None);
     assert_eq!(
-        auth::crypto::verify_pkcs7_signature(&wrong_type, b"detached", &[]),
+        verify_pkcs7_signature(&wrong_type, b"detached", &[]),
         Err(auth::AuthError::InvalidHeader)
     );
 }
@@ -293,7 +288,7 @@ fn signed_attributes_require_unique_matching_content_type_and_digest() {
         &[signer_with_attributes(1, 1, Some(&valid), &valid_signature)],
     );
     assert_eq!(
-        auth::crypto::verify_pkcs7_signature(&valid_cms, content, &trusted),
+        verify_pkcs7_signature(&valid_cms, content, &trusted),
         Ok(true)
     );
 
@@ -342,7 +337,7 @@ fn signed_attributes_require_unique_matching_content_type_and_digest() {
             std::slice::from_ref(&trusted),
             &[signer_with_attributes(1, 1, Some(&attributes), &[])],
         );
-        let result = auth::crypto::verify_pkcs7_signature(&cms, content, &trusted);
+        let result = verify_pkcs7_signature(&cms, content, &trusted);
         assert!(result.is_err(), "malformed signed attributes were accepted");
     }
 }

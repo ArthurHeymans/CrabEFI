@@ -1,6 +1,5 @@
 //! Image-local UEFI time-based authenticated-variable enforcement.
 
-mod bigint;
 mod crypto;
 mod limits;
 mod signature;
@@ -76,20 +75,5 @@ impl From<AuthError> for efi::Status {
             AuthError::CryptoError => efi::Status::DEVICE_ERROR,
             AuthError::OutOfResources => efi::Status::OUT_OF_RESOURCES,
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn oversize_modulus_fails_soft() {
-        // Inputs above the stack-backed maximum width fail soft (Ok(false)),
-        // exactly like the previous arena-preflight path: unauthenticated
-        // data must never become a hard error.
-        let modulus = [0xffu8; 4096 / 8 + 1];
-        let verified = crypto::verify_rsa_parts_for_test(&modulus, &[1], &[1], &[0; 32]).unwrap();
-        assert!(!verified);
     }
 }
