@@ -13,10 +13,11 @@ use object::{
 use serde_json::json;
 use sha2::{Digest, Sha256};
 
+use crabefi_runtime_abi::exports::{EXPORT_COUNT, ExportOffsets};
 use crabefi_runtime_abi::format::{
-    EFI_PAGE_SIZE, EXPORTS_SIZE, EXPORTS_VERSION, FORMAT_VERSION, HEADER_SIZE, MAGIC, MAX_SECTIONS,
-    RELOCATION_SIZE, SECTION_SIZE, ValidatedImage, architecture,
-    relocation_kind as abi_relocation_kind, section_flags as abi_section_flags,
+    EFI_PAGE_SIZE, EXPORTS_SIZE, HEADER_SIZE, MAX_SECTIONS, RELOCATION_SIZE, RuntimeImageHeader,
+    SECTION_SIZE, ValidatedImage, architecture, relocation_kind as abi_relocation_kind,
+    section_flags as abi_section_flags,
 };
 
 use crate::{Arch, project_root};
@@ -335,19 +336,17 @@ fn normalize(
             .context("normalized runtime image size overflow")?;
     }
     let mut normalized = vec![0u8; data_offset];
-    normalized[..8].copy_from_slice(&MAGIC);
-    write_u16(&mut normalized, 8, FORMAT_VERSION);
-    write_u16(&mut normalized, 10, architecture_id(arch));
-    write_u16(&mut normalized, 12, HEADER_SIZE as u16);
-    write_u32(&mut normalized, 16, image_size_u32);
-    write_u32(&mut normalized, 20, section_offset as u32);
-    write_u16(&mut normalized, 24, segments.len() as u16);
-    write_u32(&mut normalized, 28, relocation_offset as u32);
-    write_u32(&mut normalized, 32, relocations.len() as u32);
-    write_u32(&mut normalized, 36, exports_offset as u32);
-    write_u16(&mut normalized, 40, EXPORTS_SIZE as u16);
-    write_u32(&mut normalized, 44, EFI_PAGE_SIZE);
-    write_u64(&mut normalized, 48, capabilities);
+    let header = RuntimeImageHeader {
+        architecture: architecture_id(arch),
+        section_count: u16::try_from(segments.len())?,
+        image_size: image_size_u32,
+        section_offset: u32::try_from(section_offset)?,
+        relocation_offset: u32::try_from(relocation_offset)?,
+        relocation_count: u32::try_from(relocations.len())?,
+        exports_offset: u32::try_from(exports_offset)?,
+        feature_bits: capabilities,
+    };
+    normalized[..HEADER_SIZE].copy_from_slice(&header.to_bytes());
 
     for (index, segment) in segments.iter().enumerate() {
         let offset = section_offset + index * SECTION_SIZE;
@@ -373,10 +372,8 @@ fn normalize(
             abi_relocation_kind::ABSOLUTE64,
         );
     }
-    write_u16(&mut normalized, exports_offset, EXPORTS_VERSION);
-    write_u16(&mut normalized, exports_offset + 2, EXPORTS_SIZE as u16);
     for (index, value) in exports.iter().enumerate() {
-        write_u32(&mut normalized, exports_offset + 8 + index * 4, *value);
+        write_u32(&mut normalized, exports_offset + index * 4, *value);
     }
 
     let image_path = output.join("runtime.img");
@@ -419,7 +416,7 @@ fn normalize(
     )?;
     write_json(
         output.join("build.json"),
-        &json!({ "target": target_triple(arch), "format": FORMAT_VERSION, "sha256": hex(&digest) }),
+        &json!({ "target": target_triple(arch), "sha256": hex(&digest) }),
     )?;
 
     let symbols = file
@@ -617,30 +614,16 @@ fn native_cross_domain_allowed(arch: Arch, flags: object::RelocationFlags) -> bo
     }
 }
 
-fn collect_exports(file: &object::File<'_>, image_size: u64) -> Result<[u32; 12]> {
-    const NAMES: [&str; 12] = [
-        "runtime_image_init",
-        "runtime_image_import_relocation",
-        "runtime_image_import_variable",
-        "runtime_image_finish_import",
-        "runtime_image_activate",
-        "runtime_image_register_configuration",
-        "runtime_image_set_console",
-        "runtime_image_install_esrt",
-        "runtime_image_prepare_ebs",
-        "runtime_image_seal",
-        "runtime_image_get_runtime_services",
-        "runtime_image_get_system_table",
-    ];
-    let mut values = [0u32; 12];
-    for (index, name) in NAMES.iter().enumerate() {
+fn collect_exports(file: &object::File<'_>, image_size: u64) -> Result<[u32; EXPORT_COUNT]> {
+    let mut values = [0u32; EXPORT_COUNT];
+    for (value, name) in values.iter_mut().zip(ExportOffsets::SYMBOLS) {
         let symbol = file
             .symbol_by_name(name)
             .with_context(|| format!("missing required runtime export {name}"))?;
         if symbol.address() >= image_size {
             bail!("runtime export {name} is outside the image");
         }
-        values[index] = u32::try_from(symbol.address())?;
+        *value = u32::try_from(symbol.address())?;
     }
     Ok(values)
 }

@@ -2,18 +2,16 @@
 
 use core::fmt;
 
+use crate::exports::{EXPORT_COUNT, ExportOffsets};
+
 pub const MAGIC: [u8; 8] = *b"CRABRTI\0";
-// Version 2 binds optional capabilities; v1 full images had no Secure Boot bit.
-pub const FORMAT_VERSION: u16 = 2;
-pub const HEADER_SIZE: usize = 64;
+pub const HEADER_SIZE: usize = 40;
 pub const SECTION_SIZE: usize = 32;
 pub const RELOCATION_SIZE: usize = 24;
-pub const EXPORTS_SIZE: usize = 64;
-pub const EXPORTS_VERSION: u16 = 1;
+/// Byte size of the export table: one image-relative `u32` per export.
+pub const EXPORTS_SIZE: usize = EXPORT_COUNT * 4;
 pub const MAX_SECTIONS: usize = 8;
-/// The normalized image permits a bounded relocation manifest. Current
-/// supported images use fewer than 32 slots; 128 leaves audited growth room
-/// without placing a multi-kilobyte zero manifest in RuntimeServicesData.
+/// Bound on the relocation manifest; the image keeps every record resident.
 pub const MAX_RELOCATIONS: usize = 128;
 pub const EFI_PAGE_SIZE: u32 = 4096;
 
@@ -52,9 +50,7 @@ pub mod relocation_kind {
 pub enum AbiError {
     Truncated,
     BadMagic,
-    BadVersion,
     BadArchitecture,
-    BadHeaderSize,
     BadAlignment,
     UnknownFeatures,
     TooManySections,
@@ -75,18 +71,46 @@ impl fmt::Display for AbiError {
     }
 }
 
+/// Normalized image header.
+///
+/// | offset | field               |
+/// |--------|---------------------|
+/// | 0      | magic `[u8; 8]`     |
+/// | 8      | architecture `u16`  |
+/// | 10     | section_count `u16` |
+/// | 12     | image_size `u32`    |
+/// | 16     | section_offset `u32`|
+/// | 20     | relocation_offset `u32` |
+/// | 24     | relocation_count `u32`  |
+/// | 28     | exports_offset `u32`    |
+/// | 32     | feature_bits `u64`      |
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RuntimeImageHeader {
     pub architecture: u16,
+    pub section_count: u16,
     pub image_size: u32,
     pub section_offset: u32,
-    pub section_count: u16,
     pub relocation_offset: u32,
     pub relocation_count: u32,
     pub exports_offset: u32,
-    pub exports_size: u16,
-    pub required_alignment: u32,
     pub feature_bits: u64,
+}
+
+impl RuntimeImageHeader {
+    /// Serialize the header in its normalized little-endian layout.
+    pub fn to_bytes(&self) -> [u8; HEADER_SIZE] {
+        let mut bytes = [0u8; HEADER_SIZE];
+        bytes[..8].copy_from_slice(&MAGIC);
+        bytes[8..10].copy_from_slice(&self.architecture.to_le_bytes());
+        bytes[10..12].copy_from_slice(&self.section_count.to_le_bytes());
+        bytes[12..16].copy_from_slice(&self.image_size.to_le_bytes());
+        bytes[16..20].copy_from_slice(&self.section_offset.to_le_bytes());
+        bytes[20..24].copy_from_slice(&self.relocation_offset.to_le_bytes());
+        bytes[24..28].copy_from_slice(&self.relocation_count.to_le_bytes());
+        bytes[28..32].copy_from_slice(&self.exports_offset.to_le_bytes());
+        bytes[32..40].copy_from_slice(&self.feature_bits.to_le_bytes());
+        bytes
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -142,22 +166,6 @@ impl TryFrom<u16> for RelocationKind {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct RuntimeExportsV1 {
-    pub init: u32,
-    pub import_relocation: u32,
-    pub import_variable: u32,
-    pub finish_import: u32,
-    pub activate: u32,
-    pub register_configuration: u32,
-    pub set_console: u32,
-    pub install_esrt: u32,
-    pub prepare_ebs: u32,
-    pub seal: u32,
-    pub runtime_services: u32,
-    pub system_table: u32,
-}
-
 #[derive(Clone, Copy)]
 pub struct ValidatedImage<'a> {
     bytes: &'a [u8],
@@ -172,34 +180,21 @@ impl<'a> ValidatedImage<'a> {
         if bytes.get(..8) != Some(MAGIC.as_slice()) {
             return Err(AbiError::BadMagic);
         }
-        if read_u16(bytes, 8)? != FORMAT_VERSION {
-            return Err(AbiError::BadVersion);
-        }
-        let found_arch = read_u16(bytes, 10)?;
-        if found_arch != architecture {
+        let header = RuntimeImageHeader {
+            architecture: read_u16(bytes, 8)?,
+            section_count: read_u16(bytes, 10)?,
+            image_size: read_u32(bytes, 12)?,
+            section_offset: read_u32(bytes, 16)?,
+            relocation_offset: read_u32(bytes, 20)?,
+            relocation_count: read_u32(bytes, 24)?,
+            exports_offset: read_u32(bytes, 28)?,
+            feature_bits: read_u64(bytes, 32)?,
+        };
+        if header.architecture != architecture {
             return Err(AbiError::BadArchitecture);
         }
-        if usize::from(read_u16(bytes, 12)?) != HEADER_SIZE {
-            return Err(AbiError::BadHeaderSize);
-        }
-        let header = RuntimeImageHeader {
-            architecture: found_arch,
-            image_size: read_u32(bytes, 16)?,
-            section_offset: read_u32(bytes, 20)?,
-            section_count: read_u16(bytes, 24)?,
-            relocation_offset: read_u32(bytes, 28)?,
-            relocation_count: read_u32(bytes, 32)?,
-            exports_offset: read_u32(bytes, 36)?,
-            exports_size: read_u16(bytes, 40)?,
-            required_alignment: read_u32(bytes, 44)?,
-            feature_bits: read_u64(bytes, 48)?,
-        };
-
         if header.image_size == 0 {
             return Err(AbiError::ImageRange);
-        }
-        if header.required_alignment != EFI_PAGE_SIZE {
-            return Err(AbiError::BadAlignment);
         }
         if header.feature_bits & feature_bits::REQUIRED != feature_bits::REQUIRED
             || header.feature_bits & !feature_bits::KNOWN != 0
@@ -227,10 +222,7 @@ impl<'a> ValidatedImage<'a> {
             header.relocation_count,
             RELOCATION_SIZE,
         )?;
-        if usize::from(header.exports_size) != EXPORTS_SIZE {
-            return Err(AbiError::BadExports);
-        }
-        checked_range(bytes, header.exports_offset, u32::from(header.exports_size))?;
+        checked_range(bytes, header.exports_offset, EXPORTS_SIZE as u32)?;
 
         let image = Self { bytes, header };
         image.validate_sections()?;
@@ -289,49 +281,20 @@ impl<'a> ValidatedImage<'a> {
         })
     }
 
-    pub fn exports(&self) -> Result<RuntimeExportsV1, AbiError> {
-        let offset =
+    pub fn exports(&self) -> Result<ExportOffsets, AbiError> {
+        let start =
             usize::try_from(self.header.exports_offset).map_err(|_| AbiError::BadExports)?;
-        if read_u16(self.bytes, offset)? != EXPORTS_VERSION
-            || usize::from(read_u16(self.bytes, offset + 2)?) != EXPORTS_SIZE
+        let mut offsets = [0u32; EXPORT_COUNT];
+        for (index, offset) in offsets.iter_mut().enumerate() {
+            *offset = read_u32(self.bytes, start + index * 4)?;
+        }
+        if offsets
+            .iter()
+            .any(|offset| *offset >= self.header.image_size)
         {
             return Err(AbiError::BadExports);
         }
-        let exports = RuntimeExportsV1 {
-            init: read_u32(self.bytes, offset + 8)?,
-            import_relocation: read_u32(self.bytes, offset + 12)?,
-            import_variable: read_u32(self.bytes, offset + 16)?,
-            finish_import: read_u32(self.bytes, offset + 20)?,
-            activate: read_u32(self.bytes, offset + 24)?,
-            register_configuration: read_u32(self.bytes, offset + 28)?,
-            set_console: read_u32(self.bytes, offset + 32)?,
-            install_esrt: read_u32(self.bytes, offset + 36)?,
-            prepare_ebs: read_u32(self.bytes, offset + 40)?,
-            seal: read_u32(self.bytes, offset + 44)?,
-            runtime_services: read_u32(self.bytes, offset + 48)?,
-            system_table: read_u32(self.bytes, offset + 52)?,
-        };
-        let image_size = self.header.image_size;
-        let valid = [
-            exports.init,
-            exports.import_relocation,
-            exports.import_variable,
-            exports.finish_import,
-            exports.activate,
-            exports.register_configuration,
-            exports.set_console,
-            exports.install_esrt,
-            exports.prepare_ebs,
-            exports.seal,
-            exports.runtime_services,
-            exports.system_table,
-        ]
-        .into_iter()
-        .all(|value| value < image_size);
-        if !valid {
-            return Err(AbiError::BadExports);
-        }
-        Ok(exports)
+        Ok(ExportOffsets::from_array(offsets))
     }
 
     pub fn section_bytes(&self, section: RuntimeSection) -> Result<&'a [u8], AbiError> {

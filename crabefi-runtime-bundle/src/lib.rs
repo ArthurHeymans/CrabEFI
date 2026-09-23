@@ -49,7 +49,7 @@ pub const SHA256: [u8; 32] = *DIGEST_BYTES;
 
 #[cfg(test)]
 mod tests {
-    use crabefi_runtime_abi::{AbiError, ValidatedImage, architecture, feature_bits};
+    use crabefi_runtime_abi::{ValidatedImage, architecture, feature_bits};
     use sha2::{Digest, Sha256};
 
     fn validate(bytes: &[u8], digest: &[u8; 32], arch: u16, secure_boot: bool) {
@@ -103,16 +103,6 @@ mod tests {
             architecture::RISCV64,
             false,
         );
-    }
-
-    #[test]
-    fn old_unlabelled_full_bundles_are_rejected() {
-        let mut bytes = *include_bytes!("../images/x86_64/runtime.img");
-        bytes[8..10].copy_from_slice(&1u16.to_le_bytes());
-        assert!(matches!(
-            ValidatedImage::parse(&bytes, architecture::X86_64),
-            Err(AbiError::BadVersion)
-        ));
     }
 
     #[test]

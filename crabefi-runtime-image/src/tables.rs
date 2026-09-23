@@ -5,7 +5,7 @@ use core::ffi::c_void;
 use crabefi_efi_types::crc32;
 use crabefi_runtime_abi::{
     ConfigurationRegistration, ConsoleRegistration, EsrtRegistration, MAX_CONFIGURATION_TABLES,
-    configuration_policy, section_flags,
+    MemoryDescriptor, configuration_policy, section_flags,
 };
 
 use crate::{
@@ -346,7 +346,7 @@ impl ImageTables {
 
     pub fn prepare_memory_attributes(
         &mut self,
-        descriptors: &[efi::MemoryDescriptor],
+        descriptors: &[MemoryDescriptor],
         sections: &[SectionRecord],
         _ranges: &[RangeRecord],
     ) -> Result<(), efi::Status> {
@@ -454,7 +454,7 @@ impl ImageTables {
 }
 
 fn exact_runtime_descriptor(
-    descriptors: &[efi::MemoryDescriptor],
+    descriptors: &[MemoryDescriptor],
     physical_start: u64,
     byte_len: u64,
     memory_type: u32,
@@ -473,7 +473,7 @@ fn exact_runtime_descriptor(
                 .checked_mul(4096)
                 .and_then(|length| descriptor.physical_start.checked_add(length))
                 .ok_or(efi::Status::INVALID_PARAMETER)?;
-            if descriptor.r#type != memory_type
+            if descriptor.memory_type != memory_type
                 || descriptor.attribute & efi::MEMORY_RUNTIME == 0
                 || descriptor.physical_start > physical_start
                 || descriptor_end < physical_end

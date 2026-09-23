@@ -1,6 +1,7 @@
 use crabefi_runtime_abi::{
-    AbiError, EXPORTS_SIZE, HEADER_SIZE, HandoffError, RuntimeExternalRange, RuntimeHandoff,
-    ValidatedImage, architecture, feature_bits, reset_mechanism, time_mechanism,
+    AbiError, EXPORT_COUNT, EXPORTS_SIZE, HEADER_SIZE, HandoffError, RELOCATION_SIZE,
+    RuntimeExternalRange, RuntimeHandoff, RuntimeImageHeader, SECTION_SIZE, ValidatedImage,
+    architecture, feature_bits, reset_mechanism, time_mechanism,
 };
 
 fn write_u16(bytes: &mut [u8], offset: usize, value: u16) {
@@ -11,42 +12,46 @@ fn write_u32(bytes: &mut [u8], offset: usize, value: u32) {
     bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
 }
 
-fn valid_image() -> Vec<u8> {
-    let section_offset = HEADER_SIZE;
-    let exports_offset = section_offset + 32;
-    let data_offset = exports_offset + EXPORTS_SIZE;
-    let mut bytes = vec![0u8; data_offset + 4];
-    bytes[..8].copy_from_slice(b"CRABRTI\0");
-    write_u16(&mut bytes, 8, crabefi_runtime_abi::FORMAT_VERSION);
-    write_u16(&mut bytes, 10, architecture::X86_64);
-    write_u16(&mut bytes, 12, HEADER_SIZE as u16);
-    write_u32(&mut bytes, 16, 4096);
-    write_u32(&mut bytes, 20, section_offset as u32);
-    write_u16(&mut bytes, 24, 1);
-    write_u32(&mut bytes, 28, exports_offset as u32);
-    write_u32(&mut bytes, 32, 0);
-    write_u32(&mut bytes, 36, exports_offset as u32);
-    write_u16(&mut bytes, 40, EXPORTS_SIZE as u16);
-    write_u32(&mut bytes, 44, 4096);
-    bytes[48..56].copy_from_slice(&feature_bits::REQUIRED.to_le_bytes());
+fn header(relocation_count: u32) -> RuntimeImageHeader {
+    let relocation_offset = (HEADER_SIZE + SECTION_SIZE) as u32;
+    RuntimeImageHeader {
+        architecture: architecture::X86_64,
+        section_count: 1,
+        image_size: 4096,
+        section_offset: HEADER_SIZE as u32,
+        relocation_offset,
+        relocation_count,
+        exports_offset: relocation_offset + relocation_count * RELOCATION_SIZE as u32,
+        feature_bits: feature_bits::REQUIRED,
+    }
+}
 
+/// Build a one-section image whose data follows the export table.
+fn image(header: RuntimeImageHeader, file_size: u32, flags: u32) -> Vec<u8> {
+    let data_offset = header.exports_offset as usize + EXPORTS_SIZE;
+    let mut bytes = vec![0u8; data_offset + file_size as usize];
+    bytes[..HEADER_SIZE].copy_from_slice(&header.to_bytes());
+    let section_offset = header.section_offset as usize;
     write_u32(&mut bytes, section_offset, data_offset as u32);
     write_u32(&mut bytes, section_offset + 4, 0);
-    write_u32(&mut bytes, section_offset + 8, 4);
+    write_u32(&mut bytes, section_offset + 8, file_size);
     write_u32(&mut bytes, section_offset + 12, 4096);
     write_u32(&mut bytes, section_offset + 16, 4096);
-    write_u32(&mut bytes, section_offset + 20, 1 | 4 | 8);
-
-    write_u16(&mut bytes, exports_offset, 1);
-    write_u16(&mut bytes, exports_offset + 2, EXPORTS_SIZE as u16);
-    for index in 0..12 {
+    write_u32(&mut bytes, section_offset + 20, flags);
+    for index in 0..EXPORT_COUNT {
         write_u32(
             &mut bytes,
-            exports_offset + 8 + index * 4,
+            header.exports_offset as usize + index * 4,
             16 + index as u32,
         );
     }
-    bytes[data_offset..data_offset + 4].copy_from_slice(b"code");
+    bytes
+}
+
+fn valid_image() -> Vec<u8> {
+    let mut bytes = image(header(0), 4, 1 | 4 | 8);
+    let data_offset = bytes.len() - 4;
+    bytes[data_offset..].copy_from_slice(b"code");
     bytes
 }
 
@@ -65,7 +70,7 @@ fn rejects_missing_and_unknown_feature_bits() {
         feature_bits::REQUIRED | (1 << 63),
     ] {
         let mut bytes = valid_image();
-        bytes[48..56].copy_from_slice(&bits.to_le_bytes());
+        bytes[32..40].copy_from_slice(&bits.to_le_bytes());
         assert_eq!(
             ValidatedImage::parse(&bytes, architecture::X86_64).err(),
             Some(AbiError::UnknownFeatures)
@@ -98,15 +103,11 @@ fn rejects_corrupt_layout_and_exports() {
     assert_eq!(parse(&bytes).err(), Some(AbiError::BadMagic));
 
     let mut bytes = valid_image();
-    write_u32(&mut bytes, 16, 0);
+    write_u32(&mut bytes, 12, 0);
     assert_eq!(parse(&bytes).err(), Some(AbiError::ImageRange));
 
     let mut bytes = valid_image();
-    write_u32(&mut bytes, 44, 2048);
-    assert_eq!(parse(&bytes).err(), Some(AbiError::BadAlignment));
-
-    let mut bytes = valid_image();
-    write_u32(&mut bytes, 44, 8192);
+    write_u32(&mut bytes, HEADER_SIZE + 16, 2048);
     assert_eq!(parse(&bytes).err(), Some(AbiError::BadAlignment));
 
     let mut bytes = valid_image();
@@ -117,8 +118,7 @@ fn rejects_corrupt_layout_and_exports() {
     );
 
     let mut bytes = valid_image();
-    let exports_offset = HEADER_SIZE + 32;
-    write_u32(&mut bytes, exports_offset + 8, 4096);
+    write_u32(&mut bytes, HEADER_SIZE + SECTION_SIZE, 4096);
     assert_eq!(parse(&bytes).err(), Some(AbiError::BadExports));
 
     let bytes = valid_image();
@@ -127,37 +127,13 @@ fn rejects_corrupt_layout_and_exports() {
 
 #[test]
 fn rejects_invalid_relocation_slots_and_bounds() {
-    let section_offset = HEADER_SIZE;
-    let relocation_offset = section_offset + 32;
-    let exports_offset = relocation_offset + 24;
-    let data_offset = exports_offset + EXPORTS_SIZE;
-    let mut bytes = vec![0u8; data_offset + 8];
-    bytes[..8].copy_from_slice(b"CRABRTI\0");
-    write_u16(&mut bytes, 8, crabefi_runtime_abi::FORMAT_VERSION);
-    write_u16(&mut bytes, 10, architecture::X86_64);
-    write_u16(&mut bytes, 12, HEADER_SIZE as u16);
-    write_u32(&mut bytes, 16, 4096);
-    write_u32(&mut bytes, 20, section_offset as u32);
-    write_u16(&mut bytes, 24, 1);
-    write_u32(&mut bytes, 28, relocation_offset as u32);
-    write_u32(&mut bytes, 32, 1);
-    write_u32(&mut bytes, 36, exports_offset as u32);
-    write_u16(&mut bytes, 40, EXPORTS_SIZE as u16);
-    write_u32(&mut bytes, 44, 4096);
-    bytes[48..56].copy_from_slice(&feature_bits::REQUIRED.to_le_bytes());
-    write_u32(&mut bytes, section_offset, data_offset as u32);
-    write_u32(&mut bytes, section_offset + 8, 8);
-    write_u32(&mut bytes, section_offset + 12, 4096);
-    write_u32(&mut bytes, section_offset + 16, 4096);
-    write_u32(&mut bytes, section_offset + 20, 1 | 4 | 8 | 16);
+    let header = header(1);
+    let section_offset = header.section_offset as usize;
+    let relocation_offset = header.relocation_offset as usize;
+    let mut bytes = image(header, 8, 1 | 4 | 8 | 16);
     write_u32(&mut bytes, relocation_offset, 0);
     write_u32(&mut bytes, relocation_offset + 4, 8);
     write_u16(&mut bytes, relocation_offset + 18, 1);
-    write_u16(&mut bytes, exports_offset, 1);
-    write_u16(&mut bytes, exports_offset + 2, EXPORTS_SIZE as u16);
-    for index in 0..12 {
-        write_u32(&mut bytes, exports_offset + 8 + index * 4, index as u32);
-    }
     assert!(ValidatedImage::parse(&bytes, architecture::X86_64).is_ok());
 
     let mut unaligned = bytes.clone();
