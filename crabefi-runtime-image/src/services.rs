@@ -9,7 +9,9 @@ use crabefi_runtime_abi::{
 };
 
 use crate::{
-    arch, deferred, efi,
+    arch,
+    deferred::{self, DeferredRegion},
+    efi,
     state::{self, Phase},
     store::{VariableStore, VariableTransaction},
     svam,
@@ -152,9 +154,9 @@ pub extern "efiapi" fn convert_pointer(
             })
         })
         .or_else(|| {
-            let offset = physical.checked_sub(runtime.deferred_buffer_physical)?;
-            (offset < runtime.deferred_buffer_size as u64)
-                .then(|| runtime.deferred_buffer_virtual.checked_add(offset))?
+            let retained = runtime.retained?;
+            let offset = physical.checked_sub(retained.physical_base)?;
+            (offset < retained.size as u64).then(|| retained.virtual_base.checked_add(offset))?
         });
     let Some(converted) = converted else {
         return efi::Status::NOT_FOUND;
@@ -423,16 +425,15 @@ fn set_variable_locked(
     if matches!(current_phase, Phase::Uninitialized | Phase::Loaded) {
         return efi::Status::DEVICE_ERROR;
     }
-    let bridge = lease.state().boot_bridge;
-    let buffer = lease.state().deferred_buffer();
-    let (store, transaction, deferred_transaction) = lease.variable_state_mut();
+    let (runtime, variables) = lease.parts_mut();
+    let bridge = runtime.boot_bridge;
     apply_variable(
-        store,
-        transaction,
-        Some(deferred_transaction),
+        &mut variables.store,
+        &mut variables.transaction,
+        Some(&mut variables.deferred_transaction),
         current_phase,
         bridge,
-        buffer,
+        runtime.deferred_region(),
         guid,
         name,
         attributes,
@@ -447,7 +448,7 @@ fn apply_variable(
     deferred_transaction: Option<&mut deferred::DeferredTransaction>,
     current_phase: Phase,
     bridge: u64,
-    buffer: (*mut u8, usize),
+    mut region: Option<DeferredRegion<'_>>,
     guid: [u8; 16],
     name: &[u16],
     attributes: u32,
@@ -462,10 +463,10 @@ fn apply_variable(
                 .find(&guid, name, false)
                 .is_some_and(|slot| slot.attributes & efi::VARIABLE_NON_VOLATILE != 0));
     if !current_phase.boot_services() && nonvolatile {
-        if buffer.0.is_null() || buffer.1 == 0 {
+        let Some(region) = region.as_ref() else {
             return efi::Status::UNSUPPORTED;
-        }
-        if let Err(status) = deferred::validate_profile(buffer.0, buffer.1) {
+        };
+        if let Err(status) = region.validate_profile() {
             return status;
         }
     }
@@ -572,13 +573,13 @@ fn apply_variable(
                 return status;
             }
         } else {
-            let Some(deferred_transaction) = deferred_transaction else {
+            let (Some(deferred_transaction), Some(region)) =
+                (deferred_transaction, region.as_mut())
+            else {
                 return efi::Status::DEVICE_ERROR;
             };
             let queued = if authenticated {
-                deferred::queue_write(
-                    buffer.0,
-                    buffer.1,
+                region.queue_write(
                     deferred_transaction,
                     deferred::DeferredWrite {
                         guid,
@@ -591,9 +592,7 @@ fn apply_variable(
                     },
                 )
             } else {
-                deferred::queue_write(
-                    buffer.0,
-                    buffer.1,
+                region.queue_write(
                     deferred_transaction,
                     deferred::DeferredWrite {
                         guid,
@@ -627,18 +626,15 @@ fn apply_variable(
 }
 
 pub fn prepare_retained_staging(lease: &mut state::Lease) -> Result<(), efi::Status> {
-    let bridge = lease.state().boot_bridge;
-    let buffer = lease.state().deferred_buffer();
-    if buffer.0.is_null() || buffer.1 == 0 {
-        return Err(efi::Status::UNSUPPORTED);
-    }
+    let (runtime, variables) = lease.parts_mut();
+    let bridge = runtime.boot_bridge;
+    let mut region = runtime.deferred_region().ok_or(efi::Status::UNSUPPORTED)?;
     if bridge == 0 {
         return Err(efi::Status::WRITE_PROTECTED);
     }
-    let pointer = deferred::prepare_retained(buffer.0, buffer.1)?;
-    let data = pointer.to_le_bytes();
+    let data = region.prepare_retained()?.to_le_bytes();
     let guid = *CAPSULE_UPDATE_GUID.as_bytes();
-    let (store, transaction, _) = lease.variable_state_mut();
+    let (store, transaction) = (&mut variables.store, &mut variables.transaction);
     if store
         .find(&guid, CAPSULE_UPDATE_NAME, false)
         .and_then(|slot| store.data(slot))
@@ -652,7 +648,7 @@ pub fn prepare_retained_staging(lease: &mut state::Lease) -> Result<(), efi::Sta
         None,
         Phase::BootActive,
         bridge,
-        buffer,
+        None,
         guid,
         CAPSULE_UPDATE_NAME,
         efi::VARIABLE_NON_VOLATILE
@@ -668,63 +664,55 @@ pub fn prepare_retained_staging(lease: &mut state::Lease) -> Result<(), efi::Sta
 }
 
 pub fn replay_deferred(lease: &mut state::Lease) -> Result<usize, efi::Status> {
-    let bridge = lease.state().boot_bridge;
-    let buffer = lease.state().deferred_buffer();
-    if buffer.0.is_null() || buffer.1 == 0 {
-        return Err(efi::Status::UNSUPPORTED);
-    }
+    let (runtime, variables) = lease.parts_mut();
+    let bridge = runtime.boot_bridge;
+    let mut region = runtime.deferred_region().ok_or(efi::Status::UNSUPPORTED)?;
     if bridge == 0 {
         return Err(efi::Status::WRITE_PROTECTED);
     }
-    let (store, transaction, deferred_transaction) = lease.variable_state_mut();
-    deferred::replay(
-        buffer.0,
-        buffer.1,
-        deferred_transaction,
-        |record, authenticated, deletion| {
-            if authenticated
-                != (record.attributes & efi::VARIABLE_TIME_BASED_AUTHENTICATED_WRITE_ACCESS != 0)
-                || (!authenticated && deletion != record.deleted())
-            {
-                return Err(efi::Status::DEVICE_ERROR);
+    let (store, transaction) = (&mut variables.store, &mut variables.transaction);
+    region.replay(|record, authenticated, deletion| {
+        if authenticated
+            != (record.attributes & efi::VARIABLE_TIME_BASED_AUTHENTICATED_WRITE_ACCESS != 0)
+            || (!authenticated && deletion != record.deleted())
+        {
+            return Err(efi::Status::DEVICE_ERROR);
+        }
+        let name_len = record
+            .name
+            .iter()
+            .position(|unit| *unit == 0)
+            .unwrap_or(record.name.len());
+        if name_len == 0 || name_len > MAX_VARIABLE_NAME_LEN {
+            return Err(efi::Status::DEVICE_ERROR);
+        }
+        let name = &record.name[..name_len];
+        if authenticated {
+            let secure_floor = secure_boot::identify_key_database(&record.guid.bytes, name)
+                .map(|variable| store.auth_timestamp(variable));
+            let already_applied = secure_floor == Some(record.timestamp)
+                || store.auth_history_timestamp(&record.guid.bytes, name) == Some(record.timestamp);
+            if already_applied {
+                // Persistence committed before the retained acknowledgement.
+                // The recorded floor proves this authenticated operation has
+                // already taken effect, including append and deletion.
+                return Ok(());
             }
-            let name_len = record
-                .name
-                .iter()
-                .position(|unit| *unit == 0)
-                .unwrap_or(record.name.len());
-            if name_len == 0 || name_len > MAX_VARIABLE_NAME_LEN {
-                return Err(efi::Status::DEVICE_ERROR);
-            }
-            let name = &record.name[..name_len];
-            if authenticated {
-                let secure_floor = secure_boot::identify_key_database(&record.guid.bytes, name)
-                    .map(|variable| store.auth_timestamp(variable));
-                let already_applied = secure_floor == Some(record.timestamp)
-                    || store.auth_history_timestamp(&record.guid.bytes, name)
-                        == Some(record.timestamp);
-                if already_applied {
-                    // Persistence committed before the retained acknowledgement.
-                    // The recorded floor proves this authenticated operation has
-                    // already taken effect, including append and deletion.
-                    return Ok(());
-                }
-            }
-            let status = apply_variable(
-                store,
-                transaction,
-                None,
-                Phase::BootActive,
-                bridge,
-                buffer,
-                record.guid.bytes,
-                name,
-                record.attributes,
-                record.data,
-            );
-            replay_apply_result(status, authenticated, deletion)
-        },
-    )
+        }
+        let status = apply_variable(
+            store,
+            transaction,
+            None,
+            Phase::BootActive,
+            bridge,
+            None,
+            record.guid.bytes,
+            name,
+            record.attributes,
+            record.data,
+        );
+        replay_apply_result(status, authenticated, deletion)
+    })
 }
 
 fn replay_apply_result(
@@ -790,32 +778,31 @@ pub extern "efiapi" fn update_capsule(
         return efi::Status::INVALID_PARAMETER;
     }
 
-    let lease = match state::lease() {
+    let mut lease = match state::lease() {
         Ok(lease) => lease,
         Err(_) => return efi::Status::DEVICE_ERROR,
     };
-    let buffer = lease.state().deferred_buffer();
     if !capsule_delivery_available(lease.state()) {
         return efi::Status::UNSUPPORTED;
     }
-    match deferred::stage_capsule(
-        buffer.0,
-        buffer.1,
-        header.capsule_image_size,
-        scatter_gather_list,
-    ) {
-        Ok(()) => efi::Status::SUCCESS,
-        Err(status) => status,
+    if !scatter_gather_list.is_multiple_of(8) {
+        return efi::Status::INVALID_PARAMETER;
     }
+    // SAFETY: UpdateCapsule defines scatter_gather_list as a readable physical
+    // EFI_CAPSULE_BLOCK_DESCRIPTOR list; only its first descriptor is read.
+    let first_block =
+        unsafe { (scatter_gather_list as *const deferred::CapsuleBlockDescriptor).read() };
+    let Some(mut region) = lease.state_mut().deferred_region() else {
+        return efi::Status::UNSUPPORTED;
+    };
+    efi::status(region.stage_capsule(header.capsule_image_size, scatter_gather_list, first_block))
 }
 
 /// Capsule staging requires retained storage and boot-time confirmation that
 /// the platform can apply capsules and persist their results. ESRT contents are
 /// discovery data and never control the runtime service.
 fn capsule_delivery_available(runtime: &state::RuntimeState) -> bool {
-    runtime.capsule_delivery_enabled
-        && runtime.deferred_buffer_size != 0
-        && runtime.deferred_buffer_physical != 0
+    runtime.capsule_delivery_enabled && runtime.retained.is_some()
 }
 
 pub extern "efiapi" fn query_capsule_capabilities(
@@ -1059,7 +1046,7 @@ mod tests {
             Some(deferred_transaction),
             current_phase,
             successful_bridge as *const () as u64,
-            (buffer.as_mut_ptr(), buffer.len()),
+            Some(DeferredRegion::new(buffer)),
             *variable.guid(),
             variable.name(),
             attributes,
@@ -1102,7 +1089,6 @@ mod tests {
         let mut store = VariableStore::new();
         let mut transaction = VariableTransaction::new();
         let mut deferred_transaction = deferred::DeferredTransaction::new();
-        let mut buffer = vec![0u8; 4096];
         let guid = capsule::CAPSULE_REPORT_VARIABLE_GUID;
         let name = capsule::ESRT_LAST_ATTEMPT_VARIABLE_NAME;
 
@@ -1132,7 +1118,7 @@ mod tests {
                     Some(&mut deferred_transaction),
                     Phase::BootActive,
                     successful_bridge as *const () as u64,
-                    (buffer.as_mut_ptr(), buffer.len()),
+                    None,
                     guid,
                     name,
                     attributes,
@@ -1151,7 +1137,6 @@ mod tests {
         let mut store = VariableStore::new();
         let mut transaction = VariableTransaction::new();
         let mut deferred_transaction = deferred::DeferredTransaction::new();
-        let mut buffer = vec![0u8; 64 * 1024];
         let guid = [0x42; 16];
         let name = [b'A' as u16, b'u' as u16, b't' as u16, b'h' as u16];
 
@@ -1187,7 +1172,7 @@ mod tests {
                     Some(&mut deferred_transaction),
                     Phase::BootActive,
                     successful_bridge as *const () as u64,
-                    (buffer.as_mut_ptr(), buffer.len()),
+                    None,
                     guid,
                     &name,
                     attributes,
@@ -1206,7 +1191,7 @@ mod tests {
                 Some(&mut deferred_transaction),
                 Phase::BootActive,
                 successful_bridge as *const () as u64,
-                (buffer.as_mut_ptr(), buffer.len()),
+                None,
                 guid,
                 &name,
                 AUTH_ATTRIBUTES,
@@ -1245,7 +1230,6 @@ mod tests {
     fn deleted_authenticated_variables_keep_rollback_floors() {
         let mut store = VariableStore::new();
         let mut transaction = VariableTransaction::new();
-        let mut buffer = vec![0u8; 64 * 1024];
         let guid = [0x42; 16];
         let name = [b'A' as u16, b'u' as u16, b't' as u16, b'h' as u16];
         let timestamp = |year: u16| VariableTimestamp {
@@ -1294,7 +1278,7 @@ mod tests {
                     None,
                     Phase::BootActive,
                     successful_bridge as *const () as u64,
-                    (buffer.as_mut_ptr(), buffer.len()),
+                    None,
                     guid,
                     &name,
                     attributes,
@@ -1439,13 +1423,12 @@ mod tests {
         let saved = {
             let mut lease = state::lease().unwrap();
             let runtime = lease.state_mut();
-            let saved = (
-                runtime.deferred_buffer_physical,
-                runtime.deferred_buffer_size,
-                runtime.capsule_delivery_enabled,
-            );
-            runtime.deferred_buffer_physical = 0x30_0000;
-            runtime.deferred_buffer_size = 0x1_0000;
+            let saved = (runtime.retained, runtime.capsule_delivery_enabled);
+            runtime.retained = Some(state::RetainedBuffer {
+                physical_base: 0x30_0000,
+                virtual_base: 0,
+                size: 0x1_0000,
+            });
             runtime.capsule_delivery_enabled = true;
             saved
         };
@@ -1502,11 +1485,7 @@ mod tests {
         assert_eq!(reset_type, efi::RESET_WARM);
         let mut lease = state::lease().unwrap();
         let runtime = lease.state_mut();
-        (
-            runtime.deferred_buffer_physical,
-            runtime.deferred_buffer_size,
-            runtime.capsule_delivery_enabled,
-        ) = saved;
+        (runtime.retained, runtime.capsule_delivery_enabled) = saved;
     }
 
     #[test]
@@ -1515,7 +1494,7 @@ mod tests {
         let mut transaction = VariableTransaction::new();
         let mut deferred_transaction = deferred::DeferredTransaction::new();
         let mut buffer = vec![0u8; 64 * 1024];
-        deferred::prepare_retained(buffer.as_mut_ptr(), buffer.len()).unwrap();
+        DeferredRegion::new(&mut buffer).prepare_retained().unwrap();
         enroll_raw(
             &mut store,
             &mut transaction,
@@ -1642,54 +1621,44 @@ mod tests {
         const GUID: [u8; 16] = [0x42; 16];
         let mut buffer = vec![0u8; 64 * 1024];
         let mut transaction = deferred::DeferredTransaction::new();
-        deferred::prepare_retained(buffer.as_mut_ptr(), buffer.len()).unwrap();
+        DeferredRegion::new(&mut buffer).prepare_retained().unwrap();
         for (name, deletion) in [(&[b'D' as u16][..], true), (&[b'N' as u16][..], false)] {
-            deferred::queue_write(
-                buffer.as_mut_ptr(),
-                buffer.len(),
-                &mut transaction,
-                deferred::DeferredWrite {
-                    guid: GUID,
-                    name,
-                    attributes: if deletion { 0 } else { RAW_ATTRIBUTES },
-                    data: if deletion { &[] } else { b"next" },
-                    timestamp: VariableTimestamp::default(),
-                    authenticated: false,
-                    deletion,
-                },
-            )
-            .unwrap();
+            DeferredRegion::new(&mut buffer)
+                .queue_write(
+                    &mut transaction,
+                    deferred::DeferredWrite {
+                        guid: GUID,
+                        name,
+                        attributes: if deletion { 0 } else { RAW_ATTRIBUTES },
+                        data: if deletion { &[] } else { b"next" },
+                        timestamp: VariableTimestamp::default(),
+                        authenticated: false,
+                        deletion,
+                    },
+                )
+                .unwrap();
         }
 
         let mut seen = 0usize;
         assert_eq!(
-            deferred::replay(
-                buffer.as_mut_ptr(),
-                buffer.len(),
-                &mut transaction,
-                |_, authenticated, deletion| {
-                    seen += 1;
-                    replay_apply_result(
-                        if deletion {
-                            efi::Status::NOT_FOUND
-                        } else {
-                            efi::Status::SUCCESS
-                        },
-                        authenticated,
-                        deletion,
-                    )
-                },
-            ),
+            DeferredRegion::new(&mut buffer).replay(|_, authenticated, deletion| {
+                seen += 1;
+                replay_apply_result(
+                    if deletion {
+                        efi::Status::NOT_FOUND
+                    } else {
+                        efi::Status::SUCCESS
+                    },
+                    authenticated,
+                    deletion,
+                )
+            },),
             Ok(2)
         );
         assert_eq!(seen, 2);
         assert_eq!(
-            deferred::replay(
-                buffer.as_mut_ptr(),
-                buffer.len(),
-                &mut transaction,
-                |_, _, _| panic!("acknowledged records replayed twice"),
-            ),
+            DeferredRegion::new(&mut buffer)
+                .replay(|_, _, _| panic!("acknowledged records replayed twice"),),
             Ok(0)
         );
         assert_eq!(
@@ -1722,7 +1691,7 @@ mod tests {
         let mut transaction = VariableTransaction::new();
         let mut deferred_transaction = deferred::DeferredTransaction::new();
         let mut buffer = vec![0u8; 64 * 1024];
-        deferred::prepare_retained(buffer.as_mut_ptr(), buffer.len()).unwrap();
+        DeferredRegion::new(&mut buffer).prepare_retained().unwrap();
         assert_eq!(
             apply_variable(
                 &mut store,
@@ -1730,7 +1699,7 @@ mod tests {
                 Some(&mut deferred_transaction),
                 Phase::SealedPhysical,
                 successful_bridge as *const () as u64,
-                (buffer.as_mut_ptr(), buffer.len()),
+                Some(DeferredRegion::new(&mut buffer)),
                 GUID,
                 NAME,
                 RAW_ATTRIBUTES,
@@ -1742,11 +1711,8 @@ mod tests {
         let mut reboot_store = VariableStore::new();
         let mut reboot_transaction = VariableTransaction::new();
         let mut persisted = 0usize;
-        let processed = deferred::replay(
-            buffer.as_mut_ptr(),
-            buffer.len(),
-            &mut deferred_transaction,
-            |record, authenticated, deletion| {
+        let processed = DeferredRegion::new(&mut buffer)
+            .replay(|record, authenticated, deletion| {
                 assert!(!authenticated);
                 assert!(!deletion);
                 assert_eq!(record.attributes, RAW_ATTRIBUTES);
@@ -1759,7 +1725,7 @@ mod tests {
                     None,
                     Phase::BootActive,
                     successful_bridge as *const () as u64,
-                    (buffer.as_mut_ptr(), buffer.len()),
+                    None,
                     record.guid.bytes,
                     &record.name[..name_len],
                     record.attributes,
@@ -1771,21 +1737,16 @@ mod tests {
                 } else {
                     Err(status)
                 }
-            },
-        )
-        .unwrap();
+            })
+            .unwrap();
         assert_eq!(processed, 1);
         assert_eq!(persisted, 1);
         let slot = reboot_store.find(&GUID, NAME, false).unwrap();
         assert_eq!(slot.attributes, RAW_ATTRIBUTES);
         assert_eq!(reboot_store.data(slot), Some(VALUE));
         assert_eq!(
-            deferred::replay(
-                buffer.as_mut_ptr(),
-                buffer.len(),
-                &mut deferred_transaction,
-                |_, _, _| panic!("acknowledged raw record replayed twice"),
-            ),
+            DeferredRegion::new(&mut buffer)
+                .replay(|_, _, _| panic!("acknowledged raw record replayed twice"),),
             Ok(0)
         );
     }
@@ -1796,7 +1757,7 @@ mod tests {
         let mut transaction = VariableTransaction::new();
         let mut deferred_transaction = deferred::DeferredTransaction::new();
         let mut buffer = vec![0u8; 64 * 1024];
-        deferred::prepare_retained(buffer.as_mut_ptr(), buffer.len()).unwrap();
+        DeferredRegion::new(&mut buffer).prepare_retained().unwrap();
         enroll_raw(
             &mut store,
             &mut transaction,
@@ -1825,11 +1786,8 @@ mod tests {
             &mut deferred_transaction,
             &mut buffer,
         );
-        let processed = deferred::replay(
-            buffer.as_mut_ptr(),
-            buffer.len(),
-            &mut deferred_transaction,
-            |record, authenticated, _| {
+        let processed = DeferredRegion::new(&mut buffer)
+            .replay(|record, authenticated, _| {
                 assert!(authenticated);
                 let name_len = record.name.iter().position(|unit| *unit == 0).unwrap();
                 let status = apply_variable(
@@ -1838,7 +1796,7 @@ mod tests {
                     None,
                     Phase::BootActive,
                     successful_bridge as *const () as u64,
-                    (buffer.as_mut_ptr(), buffer.len()),
+                    None,
                     record.guid.bytes,
                     &record.name[..name_len],
                     record.attributes,
@@ -1849,17 +1807,12 @@ mod tests {
                 } else {
                     Err(status)
                 }
-            },
-        )
-        .unwrap();
+            })
+            .unwrap();
         assert_eq!(processed, 1);
         assert_eq!(
-            deferred::replay(
-                buffer.as_mut_ptr(),
-                buffer.len(),
-                &mut deferred_transaction,
-                |_, _, _| panic!("acknowledged record replayed twice"),
-            ),
+            DeferredRegion::new(&mut buffer)
+                .replay(|_, _, _| panic!("acknowledged record replayed twice"),),
             Ok(0)
         );
         assert_eq!(
