@@ -5,9 +5,10 @@
 //! storage, SDHCI cards and platform-provided devices) and [`with_disk()`]
 //! lends one out as a `&mut dyn BlockDevice` for the duration of a closure.
 
+use alloc::vec::Vec;
 use core::fmt::Write;
 
-use heapless::{String, Vec};
+use heapless::{String, Vec as FixedVec};
 
 use crate::cell::Local;
 use crate::drivers::block::{BlockDevice, BlockDeviceInfo, BlockError};
@@ -17,15 +18,12 @@ use crate::drivers::{ahci, nvme, sdhci, usb};
 /// Maximum number of platform-provided block devices.
 const MAX_PLATFORM_BLOCK_DEVICES: usize = 8;
 
-/// Maximum number of devices returned by [`devices()`].
-const MAX_STORAGE_DEVICES: usize = 16;
-
 /// Platform-provided block devices registered by [`crate::init_platform()`].
 ///
 /// Every entry points to a device that lives for the firmware's entire
 /// lifetime (`init_platform` is `-> !`).
-static PLATFORM_BLOCK_DEVICES: Local<Vec<*mut dyn BlockDevice, MAX_PLATFORM_BLOCK_DEVICES>> =
-    Local::new(Vec::new());
+static PLATFORM_BLOCK_DEVICES: Local<FixedVec<*mut dyn BlockDevice, MAX_PLATFORM_BLOCK_DEVICES>> =
+    Local::new(FixedVec::new());
 
 /// Register platform-provided block devices from [`crate::PlatformConfig`].
 ///
@@ -96,13 +94,9 @@ pub struct StorageDevice {
 /// Order: NVMe namespaces, AHCI ports, USB mass storage, SDHCI cards, then
 /// platform-provided devices. USB mass-storage devices are initialized on
 /// first sight and stay registered afterwards.
-pub fn devices() -> Vec<StorageDevice, MAX_STORAGE_DEVICES> {
+pub fn devices() -> Vec<StorageDevice> {
     let mut devices = Vec::new();
-    let mut push = |device: StorageDevice| {
-        if devices.push(device).is_err() {
-            log::warn!("Storage: device list full, ignoring remaining devices");
-        }
-    };
+    let mut push = |device: StorageDevice| devices.push(device);
 
     for controller_id in 0..nvme::controller_count() {
         nvme::with_controller(controller_id, |controller| {

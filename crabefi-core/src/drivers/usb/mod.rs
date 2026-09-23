@@ -382,25 +382,23 @@ pub fn controller_count() -> usize {
     ALL_CONTROLLERS.lock().len()
 }
 
-/// Find the mass storage device on every controller.
+/// Find every mass storage device on every controller.
 ///
 /// Returns `(controller_index, device_address)` pairs, or none once the
 /// controllers are stopped for OS handoff.
-pub fn find_mass_storage_devices() -> heapless::Vec<(usize, u8), MAX_CONTROLLERS> {
+pub fn find_mass_storage_devices() -> alloc::vec::Vec<(usize, u8)> {
+    let mut devices = alloc::vec::Vec::new();
     if STOPPED.get() {
-        return heapless::Vec::new();
+        return devices;
     }
     let controllers = ALL_CONTROLLERS.lock();
 
-    controllers
-        .iter()
-        .enumerate()
-        .filter_map(|(idx, handle)| {
-            let device = with_usb_controller!(handle, |controller| controller.find_mass_storage());
-            log::debug!("  Controller {}: find_mass_storage() = {:?}", idx, device);
-            device.map(|addr| (idx, addr))
-        })
-        .collect()
+    for (idx, handle) in controllers.iter().enumerate() {
+        with_usb_controller!(handle, |controller| {
+            controller.for_each_mass_storage(&mut |addr| devices.push((idx, addr)));
+        });
+    }
+    devices
 }
 
 /// Poll USB keyboards
@@ -549,6 +547,10 @@ impl UsbController for XhciController {
 
     fn find_mass_storage(&self) -> Option<u8> {
         xhci::XhciController::find_mass_storage(self)
+    }
+
+    fn for_each_mass_storage(&self, f: &mut dyn FnMut(u8)) {
+        xhci::XhciController::for_each_mass_storage(self, f)
     }
 
     fn find_hid_keyboard(&self) -> Option<u8> {

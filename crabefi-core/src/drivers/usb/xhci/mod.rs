@@ -176,10 +176,29 @@ fn find_device_slot<T>(slots: &[Option<T>], mut matches: impl FnMut(&T) -> bool)
     })
 }
 
+fn for_each_device_slot<T>(
+    slots: &[Option<T>],
+    mut matches: impl FnMut(&T) -> bool,
+    f: &mut dyn FnMut(u8),
+) {
+    for (id, slot) in slots.iter().enumerate().skip(1) {
+        if slot.as_ref().is_some_and(&mut matches)
+            && let Ok(id) = u8::try_from(id)
+        {
+            f(id);
+        }
+    }
+}
+
 impl XhciController {
-    /// Find a mass storage device
+    /// Find the first mass storage slot.
     pub fn find_mass_storage(&self) -> Option<u8> {
         self.find_slot(|slot| slot.is_mass_storage)
+    }
+
+    /// Visit every mass storage slot, including the highest one-based slot ID.
+    pub fn for_each_mass_storage(&self, f: &mut dyn FnMut(u8)) {
+        for_each_device_slot(&self.slots, |slot| slot.is_mass_storage, f);
     }
 
     /// Search the actual slot table, including its highest one-based slot ID.
@@ -314,6 +333,20 @@ mod tests {
         assert_eq!(find_device_slot(&slots[..MAX_SLOTS], |_| true), None);
         slots[2] = Some("mouse");
         assert_eq!(find_device_slot(&slots, |class| *class == "mouse"), Some(2));
+    }
+
+    #[test]
+    fn mass_storage_discovery_visits_every_matching_slot() {
+        let mut slots = [None; MAX_SLOTS + 1];
+        slots[0] = Some("storage"); // Reserved slot must be ignored.
+        slots[1] = Some("storage");
+        slots[2] = Some("keyboard");
+        slots[MAX_SLOTS] = Some("storage");
+        let mut found = alloc::vec::Vec::new();
+        for_each_device_slot(&slots, |class| *class == "storage", &mut |id| {
+            found.push(id)
+        });
+        assert_eq!(found, [1, MAX_SLOTS as u8]);
     }
 
     #[test]
