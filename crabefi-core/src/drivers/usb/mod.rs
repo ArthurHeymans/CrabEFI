@@ -128,6 +128,9 @@ const MAX_CONTROLLERS: usize = 8;
 static ALL_CONTROLLERS: Mutex<heapless::Vec<UsbControllerHandle, MAX_CONTROLLERS>> =
     Mutex::new(heapless::Vec::new());
 
+/// Set once [`cleanup()`] has stopped every controller for OS handoff.
+static STOPPED: crate::cell::LocalCell<bool> = crate::cell::LocalCell::new(false);
+
 // ============================================================================
 // Initialization
 // ============================================================================
@@ -370,6 +373,7 @@ pub fn cleanup() {
         });
     }
 
+    STOPPED.set(true);
     log::info!("USB cleanup complete");
 }
 
@@ -380,8 +384,12 @@ pub fn controller_count() -> usize {
 
 /// Find the mass storage device on every controller.
 ///
-/// Returns `(controller_index, device_address)` pairs.
+/// Returns `(controller_index, device_address)` pairs, or none once the
+/// controllers are stopped for OS handoff.
 pub fn find_mass_storage_devices() -> heapless::Vec<(usize, u8), MAX_CONTROLLERS> {
+    if STOPPED.get() {
+        return heapless::Vec::new();
+    }
     let controllers = ALL_CONTROLLERS.lock();
 
     controllers
