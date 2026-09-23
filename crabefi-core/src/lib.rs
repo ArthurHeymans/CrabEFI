@@ -288,7 +288,7 @@ fn init_persistence_and_boot(
     // Persistent records and firmware-created status values have now been
     // copied into the authoritative Runtime Services store.
     runtime
-        .finish_import()
+        .complete_import()
         .expect("runtime image rejected variable import completion");
     timestamp::record(timestamp::TS_CRABEFI_VARSTORE_INIT);
 

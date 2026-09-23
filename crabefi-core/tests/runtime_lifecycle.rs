@@ -221,7 +221,7 @@ fn actual_loader_seal_svam_and_runtime_services_with_and_without_retained_stagin
         if retained {
             client.prepare_retained_staging().unwrap();
         }
-        client.finish_import().unwrap();
+        client.complete_import().unwrap();
         // SAFETY: loader validated and initialized this image-owned EFI table.
         let mut runtime = client.runtime_services();
         let guid = efi::Guid::from_bytes(&[0x42; 16]);
@@ -397,7 +397,7 @@ fn actual_loader_seal_svam_and_runtime_services_with_and_without_retained_stagin
             let after_replay = writes.load(Ordering::Relaxed);
             warm.replay_deferred().unwrap();
             assert_eq!(writes.load(Ordering::Relaxed), after_replay);
-            warm.finish_import().unwrap();
+            warm.complete_import().unwrap();
             let mut restored = [0u8];
             let mut size = restored.len();
             let mut flags = 0;

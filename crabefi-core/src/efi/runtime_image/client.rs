@@ -4,57 +4,44 @@ use alloc::vec::Vec;
 use core::ffi::c_void;
 
 use crabefi_runtime_abi::{
-    ConfigurationRegistration, ConsoleRegistration, EsrtRegistration, MemoryDescriptor,
-    RelocationImport, RuntimeExportsV1, RuntimeHandoff, VariableImport,
+    ConfigurationRegistration, ConsoleRegistration, EsrtRegistration, ExportOffsets,
+    MemoryDescriptor, RelocationImport, RuntimeHandoff, VariableImport,
 };
 use r_efi::efi::{self, Guid, Status};
 
-type Init = extern "C" fn(*const RuntimeHandoff) -> usize;
-type ImportRelocation = extern "C" fn(*const RelocationImport) -> usize;
-type ImportVariable = extern "C" fn(*const VariableImport) -> usize;
-type FinishImport = extern "C" fn(u32) -> usize;
-type Activate = extern "C" fn(u64) -> usize;
-type RegisterConfiguration = extern "C" fn(*const ConfigurationRegistration) -> usize;
-type SetConsole = extern "C" fn(*const ConsoleRegistration) -> usize;
-type InstallEsrt = extern "C" fn(*const EsrtRegistration) -> usize;
-type PrepareEbs = extern "C" fn(*const efi::MemoryDescriptor, usize) -> usize;
-type Seal = extern "C" fn() -> usize;
-type GetTable = extern "C" fn() -> u64;
+macro_rules! define_runtime_exports {
+    ($($field:ident: $symbol:ident => $signature:ty;)*) => {
+        /// Typed entry points of a loaded runtime image.
+        #[derive(Clone, Copy)]
+        struct RuntimeExports {
+            $($field: $signature,)*
+        }
 
-// The runtime ABI owns the descriptor storage, while the image consumes it as
-// r-efi descriptors. Keep the cast in `prepare_ebs` layout-checked.
-const _: () = assert!(
-    core::mem::size_of::<MemoryDescriptor>() == core::mem::size_of::<efi::MemoryDescriptor>()
-        && core::mem::align_of::<MemoryDescriptor>()
-            == core::mem::align_of::<efi::MemoryDescriptor>()
-        && core::mem::offset_of!(MemoryDescriptor, memory_type)
-            == core::mem::offset_of!(efi::MemoryDescriptor, r#type)
-        && core::mem::offset_of!(MemoryDescriptor, physical_start)
-            == core::mem::offset_of!(efi::MemoryDescriptor, physical_start)
-        && core::mem::offset_of!(MemoryDescriptor, virtual_start)
-            == core::mem::offset_of!(efi::MemoryDescriptor, virtual_start)
-        && core::mem::offset_of!(MemoryDescriptor, number_of_pages)
-            == core::mem::offset_of!(efi::MemoryDescriptor, number_of_pages)
-        && core::mem::offset_of!(MemoryDescriptor, attribute)
-            == core::mem::offset_of!(efi::MemoryDescriptor, attribute)
-);
+        impl RuntimeExports {
+            /// # Safety
+            ///
+            /// `offsets` must come from a validated image loaded at `base`.
+            unsafe fn resolve(base: u64, offsets: ExportOffsets) -> Self {
+                Self {
+                    // SAFETY: forwarded from the caller.
+                    $($field: unsafe { entry_point(base, offsets.$field) },)*
+                }
+            }
+        }
+    };
+}
+crabefi_runtime_abi::runtime_exports!(define_runtime_exports);
 
-/// All export offsets are validated by `ValidatedImage` before this one audited
-/// conversion from image-relative addresses to typed function pointers.
-#[derive(Clone, Copy)]
-struct RuntimeExports {
-    init: Init,
-    import_relocation: ImportRelocation,
-    import_variable: ImportVariable,
-    finish_import: FinishImport,
-    activate: Activate,
-    register_configuration: RegisterConfiguration,
-    set_console: SetConsole,
-    install_esrt: InstallEsrt,
-    prepare_ebs: PrepareEbs,
-    seal: Seal,
-    runtime_services: GetTable,
-    system_table: GetTable,
+/// Convert an image-relative export offset into its typed entry point.
+///
+/// # Safety
+///
+/// `F` must be the function pointer type of the export at `base + offset`.
+unsafe fn entry_point<F: Copy>(base: u64, offset: u32) -> F {
+    const { assert!(core::mem::size_of::<F>() == core::mem::size_of::<usize>()) };
+    let address = base.wrapping_add(u64::from(offset)) as usize;
+    // SAFETY: `F` is a pointer-sized function pointer type naming this address.
+    unsafe { core::mem::transmute_copy(&address) }
 }
 
 #[derive(Clone, Copy)]
@@ -70,85 +57,47 @@ unsafe impl Send for RuntimeImageClient {}
 unsafe impl Sync for RuntimeImageClient {}
 
 impl RuntimeImageClient {
-    pub(crate) fn new(base: u64, exports: RuntimeExportsV1) -> Self {
-        let address = |offset: u32| base.wrapping_add(u64::from(offset)) as usize;
-        // SAFETY: the checked normalized image proves each export offset lies
-        // within the independently allocated image and names the fixed C ABI.
-        let exports = unsafe {
-            RuntimeExports {
-                init: core::mem::transmute::<usize, Init>(address(exports.init)),
-                import_relocation: core::mem::transmute::<usize, ImportRelocation>(address(
-                    exports.import_relocation,
-                )),
-                import_variable: core::mem::transmute::<usize, ImportVariable>(address(
-                    exports.import_variable,
-                )),
-                finish_import: core::mem::transmute::<usize, FinishImport>(address(
-                    exports.finish_import,
-                )),
-                activate: core::mem::transmute::<usize, Activate>(address(exports.activate)),
-                register_configuration: core::mem::transmute::<usize, RegisterConfiguration>(
-                    address(exports.register_configuration),
-                ),
-                set_console: core::mem::transmute::<usize, SetConsole>(address(
-                    exports.set_console,
-                )),
-                install_esrt: core::mem::transmute::<usize, InstallEsrt>(address(
-                    exports.install_esrt,
-                )),
-                prepare_ebs: core::mem::transmute::<usize, PrepareEbs>(address(
-                    exports.prepare_ebs,
-                )),
-                seal: core::mem::transmute::<usize, Seal>(address(exports.seal)),
-                runtime_services: core::mem::transmute::<usize, GetTable>(address(
-                    exports.runtime_services,
-                )),
-                system_table: core::mem::transmute::<usize, GetTable>(address(
-                    exports.system_table,
-                )),
-            }
-        };
+    /// # Safety
+    ///
+    /// `offsets` must come from the validated image loaded and relocated at `base`.
+    pub(crate) unsafe fn new(base: u64, offsets: ExportOffsets) -> Self {
         Self {
-            exports,
+            // SAFETY: forwarded from the caller.
+            exports: unsafe { RuntimeExports::resolve(base, offsets) },
             runtime_services: core::ptr::null_mut(),
             system_table: core::ptr::null_mut(),
         }
     }
 
     pub(crate) fn initialize(&self, handoff: &RuntimeHandoff) -> Result<(), Status> {
-        status_result((self.exports.init)(handoff))
+        // SAFETY: the handoff is a live reference for this immediate call.
+        status_result(unsafe { (self.exports.init)(handoff) })
     }
 
     pub(crate) fn import_relocation(&self, relocation: &RelocationImport) -> Result<(), Status> {
-        status_result((self.exports.import_relocation)(relocation))
+        // SAFETY: the record is a live reference for this immediate call.
+        status_result(unsafe { (self.exports.import_relocation)(relocation) })
     }
 
     pub fn import_variable(&self, import: &VariableImport) -> Result<(), Status> {
-        status_result((self.exports.import_variable)(import))
+        // SAFETY: the record and the buffers it names are live for this call.
+        status_result(unsafe { (self.exports.import_variable)(import) })
     }
 
     pub fn prepare_retained_staging(&self) -> Result<(), Status> {
-        status_result((self.exports.finish_import)(
-            crabefi_runtime_abi::finish_import_operation::PREPARE_RETAINED_STAGING,
-        ))
+        status_result((self.exports.prepare_retained_staging)())
     }
 
     pub fn replay_deferred(&self) -> Result<(), Status> {
-        status_result((self.exports.finish_import)(
-            crabefi_runtime_abi::finish_import_operation::REPLAY_DEFERRED,
-        ))
+        status_result((self.exports.replay_deferred)())
     }
 
     pub fn enable_capsule_delivery(&self) -> Result<(), Status> {
-        status_result((self.exports.finish_import)(
-            crabefi_runtime_abi::finish_import_operation::ENABLE_CAPSULE_DELIVERY,
-        ))
+        status_result((self.exports.enable_capsule_delivery)())
     }
 
-    pub fn finish_import(&self) -> Result<(), Status> {
-        status_result((self.exports.finish_import)(
-            crabefi_runtime_abi::finish_import_operation::COMPLETE_IMPORT,
-        ))
+    pub fn complete_import(&self) -> Result<(), Status> {
+        status_result((self.exports.complete_import)())
     }
 
     pub(crate) fn activate(&mut self, boot_services: *mut efi::BootServices) -> Result<(), Status> {
@@ -165,22 +114,25 @@ impl RuntimeImageClient {
         &self,
         registration: &ConfigurationRegistration,
     ) -> Result<(), Status> {
-        status_result((self.exports.register_configuration)(registration))
+        // SAFETY: the record is a live reference for this immediate call.
+        status_result(unsafe { (self.exports.register_configuration)(registration) })
     }
 
     pub fn set_console(&self, registration: &ConsoleRegistration) -> Result<(), Status> {
-        status_result((self.exports.set_console)(registration))
+        // SAFETY: the record is a live reference for this immediate call.
+        status_result(unsafe { (self.exports.set_console)(registration) })
     }
 
     pub fn install_esrt(&self, registration: &EsrtRegistration) -> Result<(), Status> {
-        status_result((self.exports.install_esrt)(registration))
+        // SAFETY: the record is a live reference for this immediate call.
+        status_result(unsafe { (self.exports.install_esrt)(registration) })
     }
 
     pub fn prepare_ebs(&self, descriptors: &[MemoryDescriptor]) -> Result<(), Status> {
-        status_result((self.exports.prepare_ebs)(
-            descriptors.as_ptr().cast::<efi::MemoryDescriptor>(),
-            descriptors.len(),
-        ))
+        // SAFETY: the descriptor slice is live for this immediate call.
+        status_result(unsafe {
+            (self.exports.prepare_ebs)(descriptors.as_ptr(), descriptors.len())
+        })
     }
 
     pub fn seal(&self) -> Result<(), Status> {

@@ -33,9 +33,16 @@ pub static RUNTIME_IMAGE_FEATURE_BITS: u64 = crabefi_runtime_abi::feature_bits::
     };
 
 use crabefi_runtime_abi::{
-    ConfigurationRegistration, ConsoleRegistration, EsrtRegistration, RelocationImport,
-    RuntimeHandoff, VariableImport, phase,
+    ConfigurationRegistration, ConsoleRegistration, EsrtRegistration, MemoryDescriptor,
+    RelocationImport, RuntimeHandoff, VariableImport, phase,
 };
+
+macro_rules! check_export_signatures {
+    ($($field:ident: $symbol:ident => $signature:ty;)*) => {
+        $(const _: $signature = $symbol;)*
+    };
+}
+crabefi_runtime_abi::runtime_exports!(check_export_signatures);
 
 #[cfg(all(not(test), target_os = "none"))]
 #[panic_handler]
@@ -186,45 +193,62 @@ pub unsafe extern "C" fn runtime_image_import_variable(import: *const VariableIm
     }
 }
 
-#[unsafe(no_mangle)]
-pub extern "C" fn runtime_image_finish_import(operation: u32) -> usize {
+/// Lease the state for a boot-side import-stage operation.
+fn import_lease() -> Result<state::Lease, efi::Status> {
     if !matches!(
         state::phase_value(),
         phase::UNINITIALIZED | phase::BOOT_ACTIVE
     ) {
-        return efi::Status::UNSUPPORTED.as_usize();
+        return Err(efi::Status::UNSUPPORTED);
     }
-    let mut lease = match state::try_lease() {
-        Ok(lease) => lease,
-        Err(status) => return status.as_usize(),
-    };
+    let lease = state::try_lease()?;
     if !lease.state().initialized || lease.state().import_finished {
-        return efi::Status::INVALID_PARAMETER.as_usize();
+        return Err(efi::Status::INVALID_PARAMETER);
     }
-    match operation {
-        crabefi_runtime_abi::finish_import_operation::PREPARE_RETAINED_STAGING => {
-            match services::prepare_retained_staging(&mut lease) {
-                Ok(()) => efi::Status::SUCCESS.as_usize(),
-                Err(status) => status.as_usize(),
-            }
+    Ok(lease)
+}
+
+/// Initialize retained staging and publish its capsule pointer.
+#[unsafe(no_mangle)]
+pub extern "C" fn runtime_image_prepare_retained_staging() -> usize {
+    match import_lease().and_then(|mut lease| services::prepare_retained_staging(&mut lease)) {
+        Ok(()) => efi::Status::SUCCESS.as_usize(),
+        Err(status) => status.as_usize(),
+    }
+}
+
+/// Replay and durably consume retained deferred writes.
+#[unsafe(no_mangle)]
+pub extern "C" fn runtime_image_replay_deferred() -> usize {
+    match import_lease().and_then(|mut lease| services::replay_deferred(&mut lease)) {
+        Ok(_) => efi::Status::SUCCESS.as_usize(),
+        Err(status) => status.as_usize(),
+    }
+}
+
+/// Confirm that boot can consume staged capsules and persist their results.
+#[unsafe(no_mangle)]
+pub extern "C" fn runtime_image_enable_capsule_delivery() -> usize {
+    match import_lease() {
+        Ok(mut lease) => {
+            lease.state_mut().capsule_delivery_enabled = true;
+            efi::Status::SUCCESS.as_usize()
         }
-        crabefi_runtime_abi::finish_import_operation::REPLAY_DEFERRED => {
-            match services::replay_deferred(&mut lease) {
-                Ok(_) => efi::Status::SUCCESS.as_usize(),
-                Err(status) => status.as_usize(),
-            }
-        }
-        crabefi_runtime_abi::finish_import_operation::COMPLETE_IMPORT => {
+        Err(status) => status.as_usize(),
+    }
+}
+
+/// Derive final policy and reject all subsequent boot imports.
+#[unsafe(no_mangle)]
+pub extern "C" fn runtime_image_complete_import() -> usize {
+    match import_lease() {
+        Ok(mut lease) => {
             let (store, _) = lease.variables_mut();
             store.refresh_policy();
             lease.state_mut().import_finished = true;
             efi::Status::SUCCESS.as_usize()
         }
-        crabefi_runtime_abi::finish_import_operation::ENABLE_CAPSULE_DELIVERY => {
-            lease.state_mut().capsule_delivery_enabled = true;
-            efi::Status::SUCCESS.as_usize()
-        }
-        _ => efi::Status::INVALID_PARAMETER.as_usize(),
+        Err(status) => status.as_usize(),
     }
 }
 
@@ -332,7 +356,7 @@ pub unsafe extern "C" fn runtime_image_install_esrt(
 /// `descriptors` must point to `descriptor_count` initialized, readable memory
 /// descriptors for the duration of this call.
 pub unsafe extern "C" fn runtime_image_prepare_ebs(
-    descriptors: *const efi::MemoryDescriptor,
+    descriptors: *const MemoryDescriptor,
     descriptor_count: usize,
 ) -> usize {
     if descriptors.is_null() || descriptor_count > 32 {

@@ -10,8 +10,10 @@
 #![deny(unsafe_code)]
 
 pub mod capsule;
+pub mod exports;
 pub mod format;
 pub mod handoff;
 
+pub use exports::*;
 pub use format::*;
 pub use handoff::*;

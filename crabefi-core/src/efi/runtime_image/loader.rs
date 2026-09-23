@@ -102,7 +102,9 @@ pub fn load(
     synchronize_loaded_image(base, u64::from(header.image_size));
 
     let exports = image.exports().map_err(LoadError::InvalidFormat)?;
-    let mut client = RuntimeImageClient::new(base, exports);
+    // SAFETY: the exports come from the validated image just loaded and
+    // relocated at `base`.
+    let mut client = unsafe { RuntimeImageClient::new(base, exports) };
     let mut handoff = RuntimeHandoff::empty();
     handoff.architecture = current_architecture();
     handoff.image_base = base;

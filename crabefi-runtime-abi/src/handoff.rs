@@ -2,7 +2,6 @@
 
 use crate::format::{EFI_PAGE_SIZE, MAX_SECTIONS, architecture};
 
-pub const HANDOFF_VERSION: u32 = 3;
 pub const MAX_EXTERNAL_RANGES: usize = 8;
 pub const MAX_VARIABLES: usize = 64;
 pub const MAX_VARIABLE_NAME_LEN: usize = 64;
@@ -39,18 +38,6 @@ pub mod configuration_policy {
 pub mod bridge_operation {
     pub const PERSIST_WRITE: u32 = 1;
     pub const PERSIST_DELETE: u32 = 2;
-}
-
-/// Private lifecycle operations accepted by the existing finish-import export.
-pub mod finish_import_operation {
-    /// Initialize retained staging and publish its stable capsule pointer.
-    pub const PREPARE_RETAINED_STAGING: u32 = 1;
-    /// Replay and durably consume retained deferred writes while keeping imports open.
-    pub const REPLAY_DEFERRED: u32 = 2;
-    /// Derive final policy and reject all subsequent boot imports.
-    pub const COMPLETE_IMPORT: u32 = 3;
-    /// Confirm that boot can consume staged capsules and persist their results.
-    pub const ENABLE_CAPSULE_DELIVERY: u32 = 4;
 }
 
 /// UEFI memory descriptor shared by the boot allocator and runtime-image ABI.
@@ -128,8 +115,6 @@ pub struct RuntimeResetConfig {
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RuntimeHandoff {
-    pub abi_version: u32,
-    pub struct_size: u32,
     pub architecture: u16,
     pub section_count: u16,
     pub range_count: u16,
@@ -149,8 +134,6 @@ pub struct RuntimeHandoff {
 impl RuntimeHandoff {
     pub const fn empty() -> Self {
         Self {
-            abi_version: HANDOFF_VERSION,
-            struct_size: core::mem::size_of::<Self>() as u32,
             architecture: 0,
             section_count: 0,
             range_count: 0,
@@ -187,11 +170,6 @@ impl RuntimeHandoff {
     }
 
     pub fn validate(&self) -> Result<(), HandoffError> {
-        if self.abi_version != HANDOFF_VERSION
-            || usize::try_from(self.struct_size).ok() != Some(core::mem::size_of::<Self>())
-        {
-            return Err(HandoffError::Version);
-        }
         let section_count = usize::from(self.section_count);
         let range_count = usize::from(self.range_count);
         if section_count == 0
@@ -351,7 +329,6 @@ fn ranges_overlap(a_base: u64, a_len: u64, b_base: u64, b_len: u64) -> bool {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HandoffError {
-    Version,
     Count,
     Section,
     Range,
@@ -450,7 +427,7 @@ const _: () = assert!(core::mem::size_of::<LoadedSection>() == 24);
 const _: () = assert!(core::mem::size_of::<RuntimeExternalRange>() == 24);
 const _: () = assert!(core::mem::size_of::<RuntimeTimeConfig>() == 16);
 const _: () = assert!(core::mem::size_of::<RuntimeResetConfig>() == 16);
-const _: () = assert!(core::mem::size_of::<RuntimeHandoff>() == 472);
+const _: () = assert!(core::mem::size_of::<RuntimeHandoff>() == 464);
 const _: () = assert!(core::mem::size_of::<RelocationImport>() == 24);
 const _: () = assert!(core::mem::size_of::<VariableTimestamp>() == 16);
 const _: () = assert!(core::mem::size_of::<VariableImport>() == 64);
