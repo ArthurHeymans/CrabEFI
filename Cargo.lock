@@ -218,6 +218,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "crabefi-pkcs7"
+version = "0.1.0"
+dependencies = [
+ "sha2 0.11.0",
+]
+
+[[package]]
 name = "crabefi-runtime-abi"
 version = "0.1.0"
 
