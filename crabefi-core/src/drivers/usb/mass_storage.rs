@@ -7,6 +7,7 @@
 //! `UsbController` trait (xHCI, EHCI, OHCI, UHCI).
 
 use super::controller::{UsbController, UsbError};
+use crate::cell::Local;
 use crate::time;
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned};
 
@@ -749,8 +750,6 @@ impl UsbMassStorage {
         Err(last_error)
     }
 
-    // Note: read_sectors() was removed - use read_sectors_generic() instead
-
     /// READ(10) command
     fn read_10(
         &mut self,
@@ -992,95 +991,87 @@ impl UsbMassStorage {
 }
 
 // ============================================================================
-// Global USB Mass Storage Device
+// Registered Mass Storage Devices
 // ============================================================================
 
-use spin::Mutex;
+/// Maximum number of initialized mass storage devices.
+const MAX_MASS_STORAGE_DEVICES: usize = 8;
 
-/// Global state for USB mass storage
-struct GlobalUsbState {
+/// An initialized mass storage device and the controller it is attached to.
+struct RegisteredDevice {
+    controller_id: usize,
     device: UsbMassStorage,
-    controller_index: usize,
 }
 
-/// Global USB mass storage device and controller
-static GLOBAL_USB_STATE: Mutex<Option<GlobalUsbState>> = Mutex::new(None);
+/// Initialized mass storage devices.
+static DEVICES: Local<heapless::Vec<RegisteredDevice, MAX_MASS_STORAGE_DEVICES>> =
+    Local::new(heapless::Vec::new());
 
-/// Store a USB mass storage device globally
+fn is_registered(controller_id: usize, device_addr: u8) -> bool {
+    DEVICES.borrow().iter().any(|registered| {
+        registered.controller_id == controller_id && registered.device.device_addr == device_addr
+    })
+}
+
+/// Initialize and register the mass storage device at `device_addr` on
+/// controller `controller_id`, unless it is already registered.
 ///
-/// This takes ownership of the device and stores it for later use by the
-/// filesystem protocol. Uses the controller at the specified index.
-pub fn store_global_device(device: UsbMassStorage, controller_index: usize) -> bool {
-    if controller_index >= super::controller_count() {
-        log::error!(
-            "Failed to get USB controller {} for global device",
-            controller_index
-        );
-        return false;
+/// # Returns
+/// `true` if the device is registered with media present.
+pub fn probe(controller_id: usize, device_addr: u8) -> bool {
+    if is_registered(controller_id, device_addr) {
+        return true;
     }
-    *GLOBAL_USB_STATE.lock() = Some(GlobalUsbState {
-        device,
-        controller_index,
-    });
-    log::info!("USB mass storage device stored globally");
-    true
+
+    log::info!(
+        "Found USB mass storage on controller {}, device {}",
+        controller_id,
+        device_addr
+    );
+    let device = match super::with_controller(controller_id, |controller| {
+        UsbMassStorage::new(controller, device_addr)
+    }) {
+        Some(Ok(device)) if device.num_blocks != 0 => device,
+        Some(Ok(_)) => {
+            log::info!("USB Mass Storage: no media present, skipping");
+            return false;
+        }
+        Some(Err(error)) => {
+            log::debug!("Failed to create USB mass storage: {:?}", error);
+            return false;
+        }
+        None => return false,
+    };
+
+    let registered = DEVICES
+        .borrow_mut()
+        .push(RegisteredDevice {
+            controller_id,
+            device,
+        })
+        .is_ok();
+    if !registered {
+        log::warn!("USB mass storage device list full");
+    }
+    registered
 }
 
-/// Access the global USB mass storage device through a scoped mutable borrow.
-pub fn with_global_device<R>(f: impl FnOnce(&mut UsbMassStorage) -> R) -> Option<R> {
-    let mut state = GLOBAL_USB_STATE.lock();
-    Some(f(&mut state.as_mut()?.device))
-}
-
-/// Access the selected mass-storage device and its controller under scoped locks.
-pub fn with_global_device_and_controller<R>(
-    controller_index: usize,
+/// Access a registered mass storage device together with its controller.
+///
+/// # Returns
+/// `None` if the controller or device is not registered.
+pub fn with_device<R>(
+    controller_id: usize,
+    device_addr: u8,
     f: impl FnOnce(&mut UsbMassStorage, &mut dyn UsbController) -> R,
 ) -> Option<R> {
-    if GLOBAL_USB_STATE.lock().as_ref()?.controller_index != controller_index {
-        return None;
-    }
-    super::with_controller(controller_index, |controller| {
-        with_global_device(|device| f(device, controller))
+    super::with_controller(controller_id, |controller| {
+        let mut devices = DEVICES.borrow_mut();
+        let registered = devices.iter_mut().find(|registered| {
+            registered.controller_id == controller_id
+                && registered.device.device_addr == device_addr
+        })?;
+        Some(f(&mut registered.device, controller))
     })
     .flatten()
-}
-
-/// Read sectors from the global USB device
-///
-/// This function can be used as the read callback for the SimpleFileSystem protocol.
-/// It uses the stored controller pointer directly to avoid lock contention.
-/// Supports reading multiple sectors in a single SCSI command for performance.
-// Failures are logged at the error site; callers only branch on success.
-#[allow(clippy::result_unit_err)]
-pub fn global_read_sectors(lba: u64, buffer: &mut [u8]) -> Result<(), ()> {
-    log::trace!("USB mass storage: read LBA {}", lba);
-
-    let controller_index = GLOBAL_USB_STATE
-        .lock()
-        .as_ref()
-        .map(|state| state.controller_index)
-        .ok_or(())?;
-    with_global_device_and_controller(controller_index, |device, controller| {
-        let block_size = device.block_size as usize;
-        if block_size == 0 || buffer.is_empty() || !buffer.len().is_multiple_of(block_size) {
-            return Err(());
-        }
-        let num_sectors = u32::try_from(buffer.len() / block_size).map_err(|_| ())?;
-        device
-            .read_sectors_generic(controller, lba, num_sectors, buffer)
-            .map_err(|error| {
-                log::error!(
-                    "USB mass storage: read failed at LBA {} ({} sectors) via {}: {:?}",
-                    lba,
-                    num_sectors,
-                    controller.controller_type(),
-                    error
-                );
-            })
-    })
-    .unwrap_or_else(|| {
-        log::error!("USB mass storage: no device configured");
-        Err(())
-    })
 }

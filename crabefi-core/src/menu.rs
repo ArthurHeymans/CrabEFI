@@ -5,7 +5,7 @@
 //!
 //! # Features
 //!
-//! - Discovers boot entries from NVMe, AHCI, USB, and SD card storage devices
+//! - Discovers boot entries on every storage device (`storage::devices()`)
 //! - Supports multiple boot entry types:
 //!   - UEFI bootloaders (EFI\\BOOT\\BOOTX64.EFI or BOOTAA64.EFI)
 //!   - BLS (Boot Loader Specification) entries in /loader/entries/
@@ -16,8 +16,9 @@
 //! - Configurable auto-boot timeout with countdown
 
 use crate::drivers::block::BlockDevice;
+use crate::drivers::pci::PciAddress;
 use crate::drivers::serial as serial_driver;
-use crate::drivers::storage::StorageType;
+use crate::drivers::storage::{self, StorageDevice, StorageId};
 use crate::framebuffer_console::{
     Color, DEFAULT_BG, DEFAULT_FG, FramebufferConsole, HIGHLIGHT_BG, HIGHLIGHT_FG, TITLE_COLOR,
 };
@@ -66,9 +67,6 @@ const HELP_TEXT: &str = "Enter: Boot | F: Firmware | C: Cmdline | S: Secure Boot
 /// Help text without the Secure Boot entry.
 #[cfg(not(feature = "secure-boot"))]
 const HELP_TEXT: &str = "Enter: Boot | F: Firmware | C: Cmdline | R: Reset";
-
-/// Re-export storage device type for backward compatibility
-pub type DeviceType = StorageType;
 
 /// Boot entry kind - how this entry should be booted
 #[derive(Debug, Clone, Default)]
@@ -141,16 +139,14 @@ pub struct BootEntry {
     pub name: String<64>,
     /// Path to the EFI application (for UEFI entries)
     pub path: String<128>,
-    /// Device type and identifier
-    pub device_type: DeviceType,
+    /// Storage device holding the entry
+    pub storage: StorageId,
+    /// PCI address of the storage controller, if any
+    pub pci: Option<PciAddress>,
     /// Partition number (1-based)
     pub partition_num: u32,
     /// Partition information
     pub partition: gpt::Partition,
-    /// PCI device number
-    pub pci_device: u8,
-    /// PCI function number
-    pub pci_function: u8,
     /// Boot entry kind (how to boot this entry)
     pub kind: BootEntryKind,
     /// Boot category (for menu grouping)
@@ -162,50 +158,38 @@ impl BootEntry {
     pub fn new(
         name: &str,
         path: &str,
-        device_type: DeviceType,
+        device: &StorageDevice,
         partition_num: u32,
         partition: gpt::Partition,
-        pci_device: u8,
-        pci_function: u8,
     ) -> Self {
-        let mut entry = BootEntry {
-            name: String::new(),
-            path: String::new(),
-            device_type,
+        Self::new_with_kind(
+            name,
+            path,
+            device,
             partition_num,
             partition,
-            pci_device,
-            pci_function,
-            kind: BootEntryKind::Uefi,
-            category: BootCategory::Uefi,
-        };
-        let _ = entry.name.push_str(name);
-        let _ = entry.path.push_str(path);
-        entry
+            BootEntryKind::Uefi,
+            BootCategory::Uefi,
+        )
     }
 
     /// Create a new boot entry with specific kind and category
-    // Entry fields map 1:1 to the boot database columns filled here.
-    #[allow(clippy::too_many_arguments)]
     pub fn new_with_kind(
         name: &str,
         path: &str,
-        device_type: DeviceType,
+        device: &StorageDevice,
         partition_num: u32,
         partition: gpt::Partition,
-        pci_device: u8,
-        pci_function: u8,
         kind: BootEntryKind,
         category: BootCategory,
     ) -> Self {
         let mut entry = BootEntry {
             name: String::new(),
             path: String::new(),
-            device_type,
+            storage: device.id,
+            pci: device.pci,
             partition_num,
             partition,
-            pci_device,
-            pci_function,
             kind,
             category,
         };
@@ -221,7 +205,7 @@ impl BootEntry {
             buf,
             "{} ({}, partition {})",
             self.name,
-            self.device_type.description(),
+            self.storage.description(),
             self.partition_num
         );
     }
@@ -341,7 +325,8 @@ impl BootMenu {
 
 /// Discover boot entries from all storage devices
 ///
-/// Scans NVMe, AHCI, and USB devices for ESPs containing the arch-specific EFI bootloader.
+/// Scans every storage device for ESPs containing the arch-specific EFI
+/// bootloader, falling back to El Torito on disks without a partition table.
 ///
 /// # Returns
 ///
@@ -351,53 +336,37 @@ pub fn discover_boot_entries() -> BootMenu {
 
     log::info!("Discovering boot entries...");
 
-    // Scan NVMe devices
-    discover_nvme_entries(&mut menu);
-
-    // Scan AHCI devices
-    discover_ahci_entries(&mut menu);
-
-    // Scan USB devices
-    discover_usb_entries(&mut menu);
-
-    // Scan SDHCI devices (SD cards)
-    discover_sdhci_entries(&mut menu);
+    for device in storage::devices() {
+        let partitions = storage::with_disk(device.id, |disk| gpt::read_partitions_auto(disk).ok())
+            .ok()
+            .flatten();
+        match partitions {
+            Some(partitions) => discover_entries_on_disk(&device, &partitions, &mut menu),
+            None => try_el_torito_fallback(&device, &mut menu),
+        }
+    }
 
     log::info!("Found {} boot entries", menu.entry_count());
 
     menu
 }
 
-/// Discover boot entries on a disk that has already been stored globally.
+/// Discover boot entries on the partitions of one disk.
 ///
-/// Reads the GPT partition table, then for each ESP (or potential ESP) partition,
-/// mounts the FAT filesystem, checks for the arch-specific EFI bootloader, and scans for
-/// additional BLS/GRUB/payload entries.
+/// For each ESP (or potential ESP) partition, mounts the FAT filesystem,
+/// checks for the arch-specific EFI bootloader, and scans for additional
+/// BLS/GRUB/payload entries.
 ///
 /// # Arguments
 ///
-/// * `device_type` - Device type for the boot entries
-/// * `pci_device` - PCI device number
-/// * `pci_function` - PCI function number
-/// * `name_prefix` - Display name prefix (e.g. "NVMe ns1", "SATA port 0")
+/// * `device` - Disk holding the partitions
+/// * `partitions` - Partition table of the disk
 /// * `menu` - Boot menu to add entries to
 fn discover_entries_on_disk(
-    device_type: DeviceType,
-    pci_device: u8,
-    pci_function: u8,
-    name_prefix: &str,
+    device: &StorageDevice,
+    partitions: &[gpt::Partition],
     menu: &mut BootMenu,
 ) {
-    // Phase 1: Read GPT/MBR partitions and clone them out (releases the disk borrow)
-    let partitions =
-        crate::with_disk(&device_type, |disk| gpt::read_partitions_auto(disk).ok()).flatten();
-
-    let partitions = match partitions {
-        Some(p) => p,
-        None => return,
-    };
-
-    // Phase 2: For each ESP partition, mount FAT and scan for entries
     for (i, partition) in partitions.iter().enumerate() {
         let partition_num = (i + 1) as u32;
 
@@ -405,8 +374,7 @@ fn discover_entries_on_disk(
             continue;
         }
 
-        // Create a fresh disk for FAT mounting
-        crate::with_disk(&device_type, |disk| {
+        let _ = storage::with_disk(device.id, |disk| {
             let mut fat = match FatFilesystem::new(disk, partition.first_lba) {
                 Ok(f) => f,
                 Err(_) => return,
@@ -415,16 +383,14 @@ fn discover_entries_on_disk(
             // Check for UEFI bootloader
             if fat.file_size(EFI_BOOT_PATH).is_ok() {
                 let mut name: String<64> = String::new();
-                let _ = write!(name, "Boot Entry ({})", name_prefix);
+                let _ = write!(name, "Boot Entry ({})", device.label);
 
                 let entry = BootEntry::new(
                     &name,
                     EFI_BOOT_PATH,
-                    device_type,
+                    device,
                     partition_num,
                     partition.clone(),
-                    pci_device,
-                    pci_function,
                 );
 
                 if !menu.add_entry(entry) {
@@ -433,113 +399,14 @@ fn discover_entries_on_disk(
             }
 
             // Scan for additional entries (BLS, GRUB, payloads)
-            scan_partition_for_entries(
-                &mut fat,
-                device_type,
-                partition_num,
-                partition,
-                pci_device,
-                pci_function,
-                menu,
-            );
+            scan_partition_for_entries(&mut fat, device, partition_num, partition, menu);
         });
     }
 }
 
-/// Discover boot entries from NVMe devices
-fn discover_nvme_entries(menu: &mut BootMenu) {
-    use crate::drivers::nvme;
-
-    let Some((nsid, pci_addr)) = nvme::with_controller(0, |controller| {
-        controller
-            .default_namespace()
-            .map(|namespace| (namespace.nsid, controller.pci_address()))
-    })
-    .flatten() else {
-        return;
-    };
-
-    if !nvme::store_global_device(0, nsid) {
-        return;
-    }
-
-    let device_type = DeviceType::Nvme {
-        controller_id: 0,
-        nsid,
-    };
-
-    // Try partition-table based discovery first (GPT, then MBR).
-    let has_partitions =
-        crate::with_disk(&device_type, |disk| gpt::read_partitions_auto(disk).is_ok())
-            .unwrap_or(false);
-
-    if has_partitions {
-        let mut name_prefix: String<32> = String::new();
-        let _ = write!(name_prefix, "NVMe ns{}", nsid);
-        discover_entries_on_disk(
-            device_type,
-            pci_addr.device(),
-            pci_addr.function(),
-            &name_prefix,
-            menu,
-        );
-    } else {
-        // GPT failed — try El Torito (ISO9660) as fallback
-        try_el_torito_fallback(device_type, pci_addr.device(), pci_addr.function(), menu);
-    }
-}
-
-/// Discover boot entries from AHCI devices
-fn discover_ahci_entries(menu: &mut BootMenu) {
-    use crate::drivers::ahci;
-
-    let Some((pci_addr, num_ports)) = ahci::with_controller(0, |controller| {
-        (controller.pci_address(), controller.num_active_ports())
-    }) else {
-        return;
-    };
-
-    for port_index in 0..num_ports {
-        if !ahci::store_global_device(0, port_index) {
-            continue;
-        }
-
-        let device_type = DeviceType::Ahci {
-            controller_id: 0,
-            port: port_index,
-        };
-
-        let mut name_prefix: String<32> = String::new();
-        let _ = write!(name_prefix, "SATA port {}", port_index);
-
-        // Try partition-table based discovery first (GPT, then MBR).
-        let has_partitions =
-            crate::with_disk(&device_type, |disk| gpt::read_partitions_auto(disk).is_ok())
-                .unwrap_or(false);
-
-        if has_partitions {
-            discover_entries_on_disk(
-                device_type,
-                pci_addr.device(),
-                pci_addr.function(),
-                &name_prefix,
-                menu,
-            );
-        } else {
-            // GPT failed — try El Torito (ISO9660) as fallback
-            try_el_torito_fallback(device_type, pci_addr.device(), pci_addr.function(), menu);
-        }
-    }
-}
-
-/// Try El Torito (ISO9660) boot as a fallback for AHCI devices without GPT
-fn try_el_torito_fallback(
-    device_type: DeviceType,
-    pci_device: u8,
-    pci_function: u8,
-    menu: &mut BootMenu,
-) {
-    crate::with_disk(&device_type, |disk| {
+/// Try El Torito (ISO9660) boot on a disk without a partition table
+fn try_el_torito_fallback(device: &StorageDevice, menu: &mut BootMenu) {
+    let _ = storage::with_disk(device.id, |disk| {
         let efi_image = match iso9660::find_efi_boot_image(disk) {
             Ok(img) => img,
             Err(_) => return,
@@ -573,126 +440,19 @@ fn try_el_torito_fallback(
             return;
         }
 
-        let name_suffix = match device_type {
-            DeviceType::Ahci { port, .. } => {
-                let mut s: String<32> = String::new();
-                let _ = write!(s, "SATA port {}", port);
-                s
-            }
-            _ => {
-                let mut s: String<32> = String::new();
-                let _ = s.push_str(device_type.description());
-                s
-            }
-        };
         let mut name: String<64> = String::new();
-        let _ = write!(name, "ISO Boot ({})", name_suffix);
+        let _ = write!(name, "ISO Boot ({})", device.label);
 
         let entry = BootEntry::new(
             &name,
             EFI_BOOT_PATH,
-            device_type,
+            device,
             0, // No partition number for El Torito
             partition,
-            pci_device,
-            pci_function,
         );
 
         menu.add_entry(entry);
     });
-}
-
-/// Discover boot entries from USB devices (all controller types)
-fn discover_usb_entries(menu: &mut BootMenu) {
-    use crate::drivers::usb::{self, UsbMassStorage, mass_storage};
-
-    let Some((controller_id, device_addr)) = usb::find_mass_storage() else {
-        return;
-    };
-
-    log::info!(
-        "Found USB mass storage on controller {}, device {}",
-        controller_id,
-        device_addr
-    );
-
-    // Create and store the mass storage device
-    let device = usb::with_controller(controller_id, |controller| {
-        UsbMassStorage::new(controller, device_addr)
-    });
-    let usb_device = match device {
-        Some(Ok(device)) if device.num_blocks != 0 => device,
-        Some(Ok(_)) => {
-            log::info!("USB Mass Storage: no media present, skipping");
-            return;
-        }
-        Some(Err(error)) => {
-            log::debug!("Failed to create USB mass storage: {:?}", error);
-            return;
-        }
-        None => return,
-    };
-    if !mass_storage::store_global_device(usb_device, controller_id) {
-        return;
-    }
-
-    // Get controller type for the display name
-    let controller_type = usb::with_controller(controller_id, |c| c.controller_type());
-    let mut name_prefix: String<32> = String::new();
-    if let Some(ct) = controller_type {
-        let _ = write!(name_prefix, "{} USB", ct);
-    } else {
-        let _ = name_prefix.push_str("USB");
-    }
-
-    let device_type = DeviceType::Usb {
-        controller_id,
-        device_addr,
-    };
-
-    // USB uses the same shared discovery path — with_disk handles USB via
-    // mass_storage::get_global_device() + get_controller_ptr()
-    discover_entries_on_disk(
-        device_type,
-        0, // PCI device - TODO: get from controller
-        0, // PCI function - TODO: get from controller
-        &name_prefix,
-        menu,
-    );
-}
-
-/// Discover boot entries from SDHCI devices (SD cards)
-fn discover_sdhci_entries(menu: &mut BootMenu) {
-    use crate::drivers::sdhci;
-
-    for controller_id in 0..sdhci::controller_count() {
-        let Some((pci_device, pci_function, label)) =
-            sdhci::with_controller(controller_id, |controller| {
-                if !controller.is_ready() {
-                    return None;
-                }
-                Some(match controller.pci_address() {
-                    Some(addr) => (addr.device(), addr.function(), "SD card"),
-                    None => (0, 0, "eMMC"),
-                })
-            })
-            .flatten()
-        else {
-            continue;
-        };
-
-        if !sdhci::store_global_device(controller_id) {
-            continue;
-        }
-
-        discover_entries_on_disk(
-            DeviceType::Sdhci { controller_id },
-            pci_device,
-            pci_function,
-            label,
-            menu,
-        );
-    }
 }
 
 /// Check if a partition might be an ESP (fallback heuristic)
@@ -755,19 +515,15 @@ fn check_bootloader_exists(disk: &mut dyn BlockDevice, partition_start: u64) -> 
 /// # Arguments
 ///
 /// * `fat` - Mounted FAT filesystem
-/// * `device_type` - Device type for the boot entries
+/// * `device` - Storage device for the boot entries
 /// * `partition_num` - 1-based partition number
 /// * `partition` - Partition info
-/// * `pci_device` - PCI device number
-/// * `pci_function` - PCI function number
 /// * `menu` - Boot menu to add entries to
 fn scan_partition_for_entries(
     fat: &mut FatFilesystem<'_>,
-    device_type: DeviceType,
+    device: &StorageDevice,
     partition_num: u32,
     partition: &gpt::Partition,
-    pci_device: u8,
-    pci_function: u8,
     menu: &mut BootMenu,
 ) {
     // Check if Secure Boot is active - if so, skip direct Linux boot entries
@@ -800,11 +556,9 @@ fn scan_partition_for_entries(
                 let entry = BootEntry::new_with_kind(
                     &name,
                     &fat_path,
-                    device_type,
+                    device,
                     partition_num,
                     partition.clone(),
-                    pci_device,
-                    pci_function,
                     BootEntryKind::BlsLinux {
                         linux_path: fat_path.clone(),
                         initrd_path: initrd_fat_path,
@@ -860,11 +614,9 @@ fn scan_partition_for_entries(
                     let entry = BootEntry::new_with_kind(
                         &name,
                         &fat_path,
-                        device_type,
+                        device,
                         partition_num,
                         partition.clone(),
-                        pci_device,
-                        pci_function,
                         BootEntryKind::GrubLinux {
                             linux_path: fat_path.clone(),
                             initrd_path: initrd_fat_path,
@@ -903,11 +655,9 @@ fn scan_partition_for_entries(
     //     let entry = BootEntry::new_with_kind(
     //         &payload_entry.name,
     //         &payload_entry.path,
-    //         device_type,
+    //         device,
     //         partition_num,
     //         partition.clone(),
-    //         pci_device,
-    //         pci_function,
     //         BootEntryKind::Payload {
     //             path: payload_entry.path.clone(),
     //             format: payload_entry.format,

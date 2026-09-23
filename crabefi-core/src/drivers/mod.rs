@@ -13,13 +13,10 @@
 //!
 //! # Storage Abstraction
 //!
-//! All storage drivers provide:
-//! - `init_device(&PciDevice)` — Initialize from a discovered PCI device
-//! - `shutdown()` — Clean shutdown for OS handoff
-//! - `BlockDevice` trait implementation for unified I/O
-//!
-//! The `block` module provides the `BlockDevice` trait and `AnyBlockDevice`
-//! enum for type-safe dispatch across storage types.
+//! The `block` module defines the `BlockDevice` trait. The `storage` module
+//! identifies every disk by a `StorageId`, enumerates them with
+//! `storage::devices()` and lends one out as `&mut dyn BlockDevice` through
+//! `storage::with_disk()`.
 
 pub mod ahci;
 

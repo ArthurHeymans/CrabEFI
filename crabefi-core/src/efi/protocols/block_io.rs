@@ -7,6 +7,7 @@ use core::ffi::c_void;
 use r_efi::efi::{Boolean, Status};
 use r_efi::protocols::block_io;
 
+use crate::drivers::storage::{self, StorageId};
 use crate::efi::utils::allocate_protocol_with_log;
 
 /// Block I/O Protocol GUID.
@@ -26,8 +27,8 @@ pub type BlockIoProtocol = block_io::Protocol;
 struct BlockIoContext {
     /// Media ID (matches BlockIoMedia.media_id)
     media_id: u32,
-    /// Storage device ID from the storage registry
-    storage_device_id: u32,
+    /// Backing storage device
+    storage: StorageId,
     /// Starting LBA (0 for raw disk, partition start for partitions)
     start_lba: u64,
     /// Number of blocks
@@ -62,8 +63,6 @@ extern "efiapi" fn block_io_read_blocks(
     buffer_size: usize,
     buffer: *mut c_void,
 ) -> Status {
-    use crate::drivers::storage;
-
     if this.is_null() || buffer.is_null() {
         return Status::INVALID_PARAMETER;
     }
@@ -122,22 +121,31 @@ extern "efiapi" fn block_io_read_blocks(
         buffer_size
     );
 
-    // Read all blocks in a single call — the storage layer (USB mass storage, NVMe,
-    // AHCI) supports multi-sector reads and will chunk internally at optimal sizes
-    // (e.g., 128 sectors / 64KB per SCSI command for USB). This avoids the massive
-    // overhead of issuing one BOT transaction (CBW + data + CSW) per 512-byte sector.
+    // Read all blocks in a single call — the drivers support multi-sector reads
+    // and chunk internally at optimal sizes (e.g., 128 sectors / 64KB per SCSI
+    // command for USB). This avoids the massive overhead of issuing one BOT
+    // transaction (CBW + data + CSW) per 512-byte sector.
     let buffer_slice = unsafe { core::slice::from_raw_parts_mut(buffer as *mut u8, buffer_size) };
+    let Ok(count) = u32::try_from(num_blocks) else {
+        return Status::INVALID_PARAMETER;
+    };
 
-    if storage::read_sectors(ctx.storage_device_id, absolute_lba, buffer_slice).is_err() {
-        log::error!(
-            "BlockIO.ReadBlocks: read failed at LBA {} ({} blocks)",
-            absolute_lba,
-            num_blocks
-        );
-        return Status::DEVICE_ERROR;
+    match storage::with_disk(ctx.storage, |disk| {
+        disk.read_blocks(absolute_lba, count, buffer_slice)
+    })
+    .and_then(|read| read)
+    {
+        Ok(()) => Status::SUCCESS,
+        Err(error) => {
+            log::error!(
+                "BlockIO.ReadBlocks: read failed at LBA {} ({} blocks): {}",
+                absolute_lba,
+                num_blocks,
+                error
+            );
+            Status::DEVICE_ERROR
+        }
     }
-
-    Status::SUCCESS
 }
 
 /// Write blocks to the device (not supported - read only for boot)
@@ -161,24 +169,24 @@ extern "efiapi" fn block_io_flush_blocks(_this: *mut BlockIoProtocol) -> Status 
 /// Create a BlockIO protocol for the raw disk
 ///
 /// # Arguments
-/// * `storage_device_id` - Device ID from the storage registry
+/// * `storage` - Backing storage device
 /// * `num_blocks` - Total number of blocks on the disk
 /// * `block_size` - Size of each block in bytes
 ///
 /// # Returns
 /// Pointer to BlockIoProtocol, or null on failure
 pub fn create_disk_block_io(
-    storage_device_id: u32,
+    storage: StorageId,
     num_blocks: u64,
     block_size: u32,
 ) -> *mut BlockIoProtocol {
-    create_block_io_internal(storage_device_id, 0, 0, num_blocks, block_size, false)
+    create_block_io_internal(storage, 0, 0, num_blocks, block_size, false)
 }
 
 /// Create a BlockIO protocol for a partition
 ///
 /// # Arguments
-/// * `storage_device_id` - Device ID from the storage registry
+/// * `storage` - Backing storage device
 /// * `partition_num` - Partition number (1-based)
 /// * `start_lba` - Starting LBA of the partition
 /// * `num_blocks` - Number of blocks in the partition
@@ -187,14 +195,14 @@ pub fn create_disk_block_io(
 /// # Returns
 /// Pointer to BlockIoProtocol, or null on failure
 pub fn create_partition_block_io(
-    storage_device_id: u32,
+    storage: StorageId,
     partition_num: u32,
     start_lba: u64,
     num_blocks: u64,
     block_size: u32,
 ) -> *mut BlockIoProtocol {
     create_block_io_internal(
-        storage_device_id,
+        storage,
         partition_num,
         start_lba,
         num_blocks,
@@ -205,7 +213,7 @@ pub fn create_partition_block_io(
 
 /// Internal function to create BlockIO protocol
 fn create_block_io_internal(
-    storage_device_id: u32,
+    storage: StorageId,
     media_id: u32,
     start_lba: u64,
     num_blocks: u64,
@@ -259,7 +267,7 @@ fn create_block_io_internal(
         ctx_idx,
         BlockIoContext {
             media_id,
-            storage_device_id,
+            storage,
             start_lba,
             num_blocks,
             block_size,
@@ -269,10 +277,10 @@ fn create_block_io_internal(
 
     let kind = if is_partition { "partition" } else { "disk" };
     log::info!(
-        "BlockIO: created {} protocol (media={}, storage={}, start={}, blocks={}, bs={})",
+        "BlockIO: created {} protocol (media={}, storage={:?}, start={}, blocks={}, bs={})",
         kind,
         media_id,
-        storage_device_id,
+        storage,
         start_lba,
         num_blocks,
         block_size

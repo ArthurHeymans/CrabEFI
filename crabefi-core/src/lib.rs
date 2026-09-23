@@ -48,8 +48,6 @@ pub mod timestamp;
 #[cfg(feature = "ui")]
 pub mod ui;
 
-use crate::drivers::block::{AhciDisk, NvmeDisk, SdhciDisk, UsbDisk};
-
 /// Perform a system reset using the platform handler when available.
 pub fn reset_system() -> ! {
     log::info!("System reset requested");
@@ -598,75 +596,4 @@ pub fn init_platform(mut config: PlatformConfig) -> ! {
         config.capsule_backend,
         config.runtime.deferred_buffer.size != 0,
     );
-}
-
-/// Store a device globally for SimpleFileSystem reads.
-///
-/// Each device type has its own `store_global_device()` with different parameters.
-/// This dispatches to the right one based on the device type.
-pub(crate) fn store_device_globally(device_type: &menu::DeviceType) -> bool {
-    match *device_type {
-        menu::DeviceType::Nvme {
-            controller_id,
-            nsid,
-        } => drivers::nvme::store_global_device(controller_id, nsid),
-        menu::DeviceType::Ahci {
-            controller_id,
-            port,
-        } => drivers::ahci::store_global_device(controller_id, port),
-        // USB devices are stored globally during enumeration, not here
-        menu::DeviceType::Usb { .. } => true,
-        menu::DeviceType::Sdhci { controller_id } => {
-            drivers::sdhci::store_global_device(controller_id)
-        }
-        menu::DeviceType::Platform { .. } => true, // platform devices are always globally accessible
-    }
-}
-
-/// Create a block device from a device type and call the provided closure with it.
-///
-/// This centralizes the per-device-type controller acquisition and disk creation
-/// so that callers only need the generic `&mut dyn BlockDevice` interface.
-///
-/// # Returns
-/// `Some(R)` if the device was created and the closure returned a value,
-/// `None` if the device could not be created.
-pub(crate) fn with_disk<R>(
-    device_type: &menu::DeviceType,
-    f: impl FnOnce(&mut dyn drivers::block::BlockDevice) -> R,
-) -> Option<R> {
-    match *device_type {
-        menu::DeviceType::Nvme {
-            controller_id,
-            nsid,
-        } => drivers::nvme::with_controller(controller_id, |controller| {
-            let mut disk = NvmeDisk::new(controller, nsid);
-            f(&mut disk)
-        }),
-        menu::DeviceType::Ahci {
-            controller_id,
-            port,
-        } => drivers::ahci::with_controller(controller_id, |controller| {
-            let mut disk = AhciDisk::new(controller, port);
-            f(&mut disk)
-        }),
-        menu::DeviceType::Usb { controller_id, .. } => {
-            drivers::usb::mass_storage::with_global_device_and_controller(
-                controller_id,
-                |usb_device, controller| {
-                    let mut disk = UsbDisk::new(usb_device, controller);
-                    f(&mut disk)
-                },
-            )
-        }
-        menu::DeviceType::Sdhci { controller_id } => {
-            drivers::sdhci::with_controller(controller_id, |controller| {
-                let mut disk = SdhciDisk::new(controller);
-                f(&mut disk)
-            })
-        }
-        menu::DeviceType::Platform { index } => {
-            drivers::storage::with_platform_block_device(index, f)
-        }
-    }
 }

@@ -11,7 +11,6 @@ use crate::barrier;
 use crate::drivers::pci::{self, PciAddress, PciDevice};
 use crate::efi::dma::{DmaBuffer, DmaCoherency, DmaDirection, DmaMask};
 use crate::time::{Timeout, wait_for};
-use spin::Mutex;
 use tock_registers::interfaces::{ReadWriteable, Readable, Writeable};
 
 use regs::*;
@@ -1358,21 +1357,6 @@ impl SdhciController {
         Ok(())
     }
 
-    /// Read one or more sectors into a buffer
-    ///
-    /// The number of sectors to read is inferred from the buffer size.
-    /// If the buffer is larger than one sector, multiple sectors are read
-    /// in a single operation for performance.
-    pub fn read_sector(&mut self, lba: u64, buffer: &mut [u8]) -> Result<(), SdhciError> {
-        if buffer.is_empty() || !buffer.len().is_multiple_of(SD_BLOCK_SIZE as usize) {
-            return Err(SdhciError::InvalidParameter);
-        }
-
-        let num_sectors = u32::try_from(buffer.len() / SD_BLOCK_SIZE as usize)
-            .map_err(|_| SdhciError::InvalidParameter)?;
-        self.read_sectors(lba, num_sectors, buffer)
-    }
-
     /// Get the number of blocks on the card
     pub fn num_blocks(&self) -> u64 {
         self.num_blocks
@@ -1521,69 +1505,4 @@ pub fn with_controller<R>(index: usize, f: impl FnOnce(&mut SdhciController) -> 
 /// Get the number of initialized SDHCI controllers
 pub fn controller_count() -> usize {
     SDHCI_CONTROLLERS.count()
-}
-
-// ============================================================================
-// Global Device for SimpleFileSystem Protocol
-// ============================================================================
-
-/// Global SDHCI device info for filesystem reads
-#[derive(Clone, Copy)]
-struct GlobalSdhciDevice {
-    controller_index: usize,
-}
-
-/// Global SDHCI device for filesystem protocol
-static GLOBAL_SDHCI_DEVICE: Mutex<Option<GlobalSdhciDevice>> = Mutex::new(None);
-
-/// Store SDHCI device info globally for SimpleFileSystem protocol
-///
-/// # Arguments
-/// * `controller_index` - Index of the SDHCI controller
-///
-/// # Returns
-/// `true` if the device was stored successfully
-pub fn store_global_device(controller_index: usize) -> bool {
-    *GLOBAL_SDHCI_DEVICE.lock() = Some(GlobalSdhciDevice { controller_index });
-    log::info!(
-        "SDHCI device stored globally (controller={})",
-        controller_index
-    );
-    true
-}
-
-/// Read sectors from the global SDHCI device
-///
-/// This function is used as the read callback for the SimpleFileSystem protocol.
-/// Supports reading multiple sectors by inferring sector count from buffer size.
-// Failures are logged at the error site; callers only branch on success.
-#[allow(clippy::result_unit_err)]
-pub fn global_read_sectors(lba: u64, buffer: &mut [u8]) -> Result<(), ()> {
-    log::trace!("SDHCI global_read_sectors: LBA={}", lba);
-
-    // Get the device info
-    let controller_index = match *GLOBAL_SDHCI_DEVICE.lock() {
-        Some(device) => device.controller_index,
-        None => {
-            log::error!("global_read_sectors: no SDHCI device stored");
-            return Err(());
-        }
-    };
-
-    with_controller(controller_index, |controller| {
-        controller.read_sector(lba, buffer).map_err(|error| {
-            log::error!(
-                "global_read_sectors: read failed at LBA {}: {:?}",
-                lba,
-                error
-            );
-        })
-    })
-    .unwrap_or_else(|| {
-        log::error!(
-            "global_read_sectors: no SDHCI controller at index {}",
-            controller_index
-        );
-        Err(())
-    })
 }

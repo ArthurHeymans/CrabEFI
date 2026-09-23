@@ -67,81 +67,19 @@ use r_efi::efi::Guid;
 // Disk Search Helpers
 // ============================================================================
 
-/// Iterate over all available block devices (NVMe, AHCI, SDHCI) and call a
-/// function on each. Returns `Some(T)` as soon as the callback returns `Some`.
+/// Call `f` on every storage device until it returns `Some`.
 ///
-/// This avoids duplicating the controller-enumeration boilerplate in
-/// `key_files.rs` and `dbx_update.rs`.
+/// `f` receives the disk and a short description of its type.
 pub(crate) fn search_all_disks<T>(
     mut f: impl FnMut(&mut dyn crate::drivers::block::BlockDevice, &'static str) -> Option<T>,
 ) -> Option<T> {
-    // NVMe
-    if let Some(result) = search_nvme_disks(&mut f) {
-        return Some(result);
-    }
+    use crate::drivers::storage;
 
-    // AHCI
-    if let Some(result) = search_ahci_disks(&mut f) {
-        return Some(result);
-    }
-
-    // SDHCI
-    search_sdhci_disks(&mut f)
-}
-
-fn search_nvme_disks<T>(
-    f: &mut impl FnMut(&mut dyn crate::drivers::block::BlockDevice, &'static str) -> Option<T>,
-) -> Option<T> {
-    use crate::drivers::{block::NvmeDisk, nvme};
-
-    nvme::with_controller(0, |controller| {
-        let nsid = controller.default_namespace()?.nsid;
-        let mut disk = NvmeDisk::new(controller, nsid);
-        f(&mut disk, "NVMe")
-    })?
-}
-
-fn search_ahci_disks<T>(
-    f: &mut impl FnMut(&mut dyn crate::drivers::block::BlockDevice, &'static str) -> Option<T>,
-) -> Option<T> {
-    use crate::drivers::{ahci, block::AhciDisk};
-
-    let num_ports = ahci::with_controller(0, |controller| controller.num_active_ports())?;
-
-    for port_index in 0..num_ports {
-        if let Some(result) = ahci::with_controller(0, |controller| {
-            let mut disk = AhciDisk::new(controller, port_index);
-            f(&mut disk, "SATA")
-        })
-        .flatten()
-        {
-            return Some(result);
-        }
-    }
-
-    None
-}
-
-fn search_sdhci_disks<T>(
-    f: &mut impl FnMut(&mut dyn crate::drivers::block::BlockDevice, &'static str) -> Option<T>,
-) -> Option<T> {
-    use crate::drivers::{block::SdhciDisk, sdhci};
-
-    for controller_id in 0..sdhci::controller_count() {
-        if let Some(result) = sdhci::with_controller(controller_id, |controller| {
-            if !controller.is_ready() {
-                return None;
-            }
-            let mut disk = SdhciDisk::new(controller);
-            f(&mut disk, "SD")
-        })
-        .flatten()
-        {
-            return Some(result);
-        }
-    }
-
-    None
+    storage::devices().iter().find_map(|device| {
+        storage::with_disk(device.id, |disk| f(disk, device.id.description()))
+            .ok()
+            .flatten()
+    })
 }
 
 // ============================================================================

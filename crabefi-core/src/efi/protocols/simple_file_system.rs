@@ -13,22 +13,24 @@ use r_efi::protocols::simple_file_system as efi_sfs;
 use spin::Mutex;
 use zerocopy::FromBytes;
 
-use crate::cell::{Local, LocalCell, StaticMut};
-use crate::drivers::block::{AnyBlockDevice, BlockDevice};
+use crate::cell::{LocalCell, StaticMut};
+use crate::drivers::storage::{self, StorageId};
 use crate::fs::fat::{DirectoryEntry, FatFilesystem, FatGeometry, FileClusterHint};
 
 /// Mounted filesystem state reused by every file operation.
 ///
 /// `geometry` is the on-media layout parsed at mount. It is a cache, not a
-/// media-identity check: the block layer (`BlockDevice::info()`) returns the
-/// immutable descriptor captured at enumeration and never bumps `media_id`,
-/// so comparing mount-time identity against it cannot detect a swap.
+/// media-identity check: the block layer (`BlockDevice::info()`) never bumps
+/// `media_id`, so comparing mount-time identity against it cannot detect a
+/// swap.
 /// Detection of a differently shaped replacement comes from rereading the
 /// BPB (see `File.Open`/`File.Read`); a replacement with identical geometry
 /// is undetectable without lower-layer media-generation support, which no
 /// driver currently provides.
 #[derive(Clone, Copy)]
 pub struct FilesystemState {
+    /// Storage device holding the filesystem.
+    pub storage: StorageId,
     /// First LBA of the partition (in device blocks).
     pub partition_start: u64,
     /// Validated FAT geometry parsed when the filesystem was mounted.
@@ -43,19 +45,8 @@ pub struct FilesystemState {
     pub root_cluster: u32,
 }
 
-/// Mounted FAT filesystem geometry.
+/// Mounted FAT filesystem.
 static FILESYSTEM: LocalCell<Option<FilesystemState>> = LocalCell::new(None);
-/// Block device backing the mounted filesystem.
-static BLOCK_DEVICE: Local<Option<AnyBlockDevice>> = Local::new(None);
-
-/// Mutate the block device through a closure.
-///
-/// Returns `None` if no block device is configured.
-#[inline]
-#[track_caller]
-fn with_block_device_mut<R>(f: impl FnOnce(&mut AnyBlockDevice) -> R) -> Option<R> {
-    BLOCK_DEVICE.borrow_mut().as_mut().map(f)
-}
 
 /// Re-export GUIDs
 pub const SIMPLE_FILE_SYSTEM_GUID: Guid = efi_sfs::PROTOCOL_GUID;
@@ -142,35 +133,40 @@ static SFS_PROTOCOL: StaticMut<efi_sfs::Protocol> = StaticMut::new(efi_sfs::Prot
     open_volume: sfs_open_volume,
 });
 
-/// Initialize the simple file system protocol with a block device
+/// Initialize the simple file system protocol on a FAT partition
 ///
 /// # Arguments
-/// * `block_device` - The block device containing the FAT filesystem
+/// * `storage` - The storage device containing the FAT filesystem
 /// * `partition_start` - LBA of the partition start
 ///
 /// # Returns
 /// Pointer to the SimpleFileSystem protocol, or null on failure
-pub fn init(block_device: AnyBlockDevice, partition_start: u64) -> *mut efi_sfs::Protocol {
-    let mut temp_device = block_device;
-    let info = temp_device.info();
-
+pub fn init(storage: StorageId, partition_start: u64) -> *mut efi_sfs::Protocol {
     // Parse and validate the BPB once. Later operations reuse this geometry.
-    let fs_state = match FatFilesystem::new(&mut temp_device, partition_start) {
-        Ok(fat) => FilesystemState {
+    let mounted = storage::with_disk(storage, |disk| {
+        let info = disk.info();
+        FatFilesystem::new(disk, partition_start).map(|fat| FilesystemState {
+            storage,
             partition_start,
             geometry: fat.geometry(),
             device_block_size: info.block_size,
             removable: info.removable,
             root_cluster: fat.root_cluster(),
-        },
-        Err(e) => {
+        })
+    });
+    let fs_state = match mounted {
+        Ok(Ok(state)) => state,
+        Ok(Err(e)) => {
             log::error!("SimpleFileSystem: failed to mount FAT filesystem: {:?}", e);
+            return core::ptr::null_mut();
+        }
+        Err(e) => {
+            log::error!("SimpleFileSystem: storage {:?} unavailable: {}", storage, e);
             return core::ptr::null_mut();
         }
     };
 
     FILESYSTEM.set(Some(fs_state));
-    *BLOCK_DEVICE.borrow_mut() = Some(temp_device);
 
     log::info!(
         "SimpleFileSystem: initialized with partition at LBA {}",
@@ -301,7 +297,7 @@ extern "efiapi" fn file_open(
     // File.Open is relatively rare, so always reread the BPB here. A geometry
     // mismatch means differently shaped media appeared behind the mount and
     // must surface as MEDIA_CHANGED rather than wrong-disk data.
-    let result = with_block_device_mut(|device| {
+    let result = storage::with_disk(filesystem.storage, |device| {
         let mut fat = FatFilesystem::new(device, filesystem.partition_start)
             .map_err(|_| Status::DEVICE_ERROR)?;
         if fat.geometry() != filesystem.geometry {
@@ -319,7 +315,7 @@ extern "efiapi" fn file_open(
     });
 
     match result {
-        Some(Ok((cluster, size, is_dir))) => {
+        Ok(Ok((cluster, size, is_dir))) => {
             // Allocate a new file handle
             let mut handles = FILE_HANDLES.lock();
             let handle_idx = match handles.iter().position(|h| !h.in_use) {
@@ -348,12 +344,12 @@ extern "efiapi" fn file_open(
             );
             Status::SUCCESS
         }
-        Some(Err(status)) => {
+        Ok(Err(status)) => {
             log::debug!("File.Open failed: {:?}", status);
             status
         }
-        None => {
-            log::error!("File.Open: block device not available");
+        Err(error) => {
+            log::error!("File.Open: block device not available: {}", error);
             Status::NOT_READY
         }
     }
@@ -437,7 +433,7 @@ extern "efiapi" fn file_read(
 
     let buf_slice = unsafe { core::slice::from_raw_parts_mut(buffer as *mut u8, bytes_to_read) };
 
-    let result = with_block_device_mut(|device| {
+    let result = storage::with_disk(filesystem.storage, |device| {
         // Removable media can be swapped between Open and Read. The block
         // layer keeps only the immutable descriptor captured at enumeration
         // (no media-generation counter), so identity comparison cannot
@@ -471,7 +467,7 @@ extern "efiapi" fn file_read(
     });
 
     match result {
-        Some(Ok((bytes_read, next_hint))) => {
+        Ok(Ok((bytes_read, next_hint))) => {
             // Update position
             {
                 let mut handles = FILE_HANDLES.lock();
@@ -483,12 +479,12 @@ extern "efiapi" fn file_read(
             log::trace!("File.Read: read {} bytes", bytes_read);
             Status::SUCCESS
         }
-        Some(Err(status)) => {
+        Ok(Err(status)) => {
             log::error!("File.Read failed: {:?}", status);
             status
         }
-        None => {
-            log::error!("File.Read: block device not available");
+        Err(error) => {
+            log::error!("File.Read: block device not available: {}", error);
             Status::NOT_READY
         }
     }
@@ -916,7 +912,7 @@ fn read_directory(buffer_size: *mut usize, buffer: *mut c_void, handle_idx: usiz
     // Get directory entry at current position. Same media policy as
     // File.Read: removable devices reread the BPB so a differently shaped
     // replacement surfaces as MEDIA_CHANGED; fixed media uses the cache.
-    let entry_result = with_block_device_mut(|device| {
+    let entry_result = storage::with_disk(filesystem.storage, |device| {
         if filesystem.removable {
             let mut fat = FatFilesystem::new(device, filesystem.partition_start)
                 .map_err(|_| Status::DEVICE_ERROR)?;
@@ -937,7 +933,7 @@ fn read_directory(buffer_size: *mut usize, buffer: *mut c_void, handle_idx: usiz
     });
 
     match entry_result {
-        Some(Ok(Some((entry, filename)))) => {
+        Ok(Ok(Some((entry, filename)))) => {
             let filename_char_count = filename.chars().count();
             let filename_u16_len = filename_char_count + 1;
             let required_size = core::mem::size_of::<efi_file::Info>() + filename_u16_len * 2;
@@ -982,12 +978,12 @@ fn read_directory(buffer_size: *mut usize, buffer: *mut c_void, handle_idx: usiz
             unsafe { *buffer_size = required_size };
             Status::SUCCESS
         }
-        Some(Ok(None)) => {
+        Ok(Ok(None)) => {
             // End of directory
             unsafe { *buffer_size = 0 };
             Status::SUCCESS
         }
-        Some(Err(status)) => status,
-        None => Status::DEVICE_ERROR,
+        Ok(Err(status)) => status,
+        Err(_) => Status::DEVICE_ERROR,
     }
 }

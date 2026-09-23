@@ -11,7 +11,6 @@ use crate::drivers::pci::{self, PciDevice};
 use crate::efi::dma::{DmaBuffer, DmaDirection, DmaMask};
 use crate::time::{Timeout, wait_for};
 use core::ptr;
-use spin::Mutex;
 use tock_registers::interfaces::{ReadWriteable, Readable, Writeable};
 
 use logic::{
@@ -1829,86 +1828,3 @@ unsafe impl Send for AhciController {}
 // SAFETY: AhciPort contains raw pointers to DMA buffers.
 // All port access is serialized through the parent AhciController which is mutex-protected.
 unsafe impl Send for AhciPort {}
-
-// ============================================================================
-// Global AHCI Device for SimpleFileSystem Protocol
-// ============================================================================
-
-/// Global AHCI device info for filesystem reads
-#[derive(Clone, Copy)]
-struct GlobalAhciDevice {
-    controller_index: usize,
-    port_index: usize,
-}
-
-/// Global AHCI device for filesystem protocol
-static GLOBAL_AHCI_DEVICE: Mutex<Option<GlobalAhciDevice>> = Mutex::new(None);
-
-/// Store AHCI device info globally for SimpleFileSystem protocol
-pub fn store_global_device(controller_index: usize, port_index: usize) -> bool {
-    *GLOBAL_AHCI_DEVICE.lock() = Some(GlobalAhciDevice {
-        controller_index,
-        port_index,
-    });
-    log::info!(
-        "AHCI device stored globally (controller={}, port={})",
-        controller_index,
-        port_index
-    );
-    true
-}
-
-/// Read a sector from the global AHCI device
-///
-/// The LBA is interpreted as a device block LBA (in terms of the device's native
-/// sector size - 512 bytes for SATA, 2048 bytes for SATAPI/CD-ROM).
-// Failures are logged at the error site; callers only branch on success.
-#[allow(clippy::result_unit_err)]
-pub fn global_read_sectors(lba: u64, buffer: &mut [u8]) -> Result<(), ()> {
-    let (controller_index, port_index) = match *GLOBAL_AHCI_DEVICE.lock() {
-        Some(device) => (device.controller_index, device.port_index),
-        None => {
-            log::error!("global_read_sectors: no AHCI device stored");
-            return Err(());
-        }
-    };
-
-    with_controller(controller_index, |controller| {
-        let sector_size = controller
-            .get_port(port_index)
-            .map(|port| port.sector_size as usize)
-            .ok_or(())?;
-        if sector_size == 0 || buffer.is_empty() || !buffer.len().is_multiple_of(sector_size) {
-            return Err(());
-        }
-        let num_sectors = u32::try_from(buffer.len() / sector_size).map_err(|_| ())?;
-        controller
-            .read_sectors_into(port_index, lba, num_sectors, buffer)
-            .map_err(|error| {
-                log::error!(
-                    "global_read_sectors: read failed at LBA {}: {:?}",
-                    lba,
-                    error
-                );
-            })
-    })
-    .unwrap_or_else(|| {
-        log::error!(
-            "global_read_sectors: no AHCI controller at index {}",
-            controller_index
-        );
-        Err(())
-    })
-}
-
-/// Get the sector size of the global AHCI device
-pub fn global_sector_size() -> Option<u32> {
-    let (controller_index, port_index) = {
-        let guard = GLOBAL_AHCI_DEVICE.lock();
-        let device = guard.as_ref()?;
-        (device.controller_index, device.port_index)
-    };
-    with_controller(controller_index, |controller| {
-        controller.get_port(port_index).map(|port| port.sector_size)
-    })?
-}

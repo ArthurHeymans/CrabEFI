@@ -184,7 +184,7 @@ pub(crate) fn run(boot_var_state: boot_vars::BootVarState) {
         if let Some(entry) = boot_menu.get_entry(selected_index) {
             log::info!("Booting: {} from {}", entry.name, entry.path);
             log::info!("Entry kind: {:?}", entry.kind);
-            log::info!("Device type: {:?}", entry.device_type);
+            log::info!("Storage: {:?}", entry.storage);
             boot_selected_entry(entry);
             log::warn!("boot_selected_entry returned - boot failed!");
         } else {
@@ -248,148 +248,14 @@ fn try_boot_file_from_esps(file_path: &str) -> boot_vars::BootAttemptResult {
         p
     };
 
-    // Try NVMe devices
-    if try_boot_file_on_nvme(&fat_path) {
-        return boot_vars::BootAttemptResult::Success;
-    }
-
-    // Try AHCI devices
-    if try_boot_file_on_ahci(&fat_path) {
-        return boot_vars::BootAttemptResult::Success;
-    }
-
-    // Try USB devices
-    if try_boot_file_on_usb(&fat_path) {
-        return boot_vars::BootAttemptResult::Success;
-    }
-
-    // Try SDHCI devices
-    if try_boot_file_on_sdhci(&fat_path) {
+    if crate::drivers::storage::devices()
+        .iter()
+        .any(|device| try_boot_file_on_device(device, &fat_path))
+    {
         return boot_vars::BootAttemptResult::Success;
     }
 
     boot_vars::BootAttemptResult::Failed
-}
-
-/// Try to boot a file from NVMe ESPs
-fn try_boot_file_on_nvme(file_path: &str) -> bool {
-    use crate::drivers::nvme;
-
-    for controller_id in 0..nvme::controller_count() {
-        let Some((nsid, pci_addr)) = nvme::with_controller(controller_id, |controller| {
-            controller
-                .default_namespace()
-                .map(|namespace| (namespace.nsid, controller.pci_address()))
-        })
-        .flatten() else {
-            continue;
-        };
-
-        if !nvme::store_global_device(controller_id, nsid) {
-            continue;
-        }
-
-        let device_type = menu::DeviceType::Nvme {
-            controller_id,
-            nsid,
-        };
-
-        if try_boot_file_on_device(
-            &device_type,
-            pci_addr.device(),
-            pci_addr.function(),
-            file_path,
-        ) {
-            return true;
-        }
-    }
-    false
-}
-
-/// Try to boot a file from AHCI ESPs
-fn try_boot_file_on_ahci(file_path: &str) -> bool {
-    use crate::drivers::ahci;
-
-    for controller_id in 0..ahci::controller_count() {
-        let Some((pci_addr, num_ports)) = ahci::with_controller(controller_id, |controller| {
-            (controller.pci_address(), controller.num_active_ports())
-        }) else {
-            continue;
-        };
-
-        for port_index in 0..num_ports {
-            if !ahci::store_global_device(controller_id, port_index) {
-                continue;
-            }
-            let device_type = menu::DeviceType::Ahci {
-                controller_id,
-                port: port_index,
-            };
-            if try_boot_file_on_device(
-                &device_type,
-                pci_addr.device(),
-                pci_addr.function(),
-                file_path,
-            ) {
-                return true;
-            }
-        }
-    }
-    false
-}
-
-/// Try to boot a file from USB ESPs
-fn try_boot_file_on_usb(file_path: &str) -> bool {
-    use crate::drivers::usb::{self, UsbMassStorage, mass_storage};
-
-    let Some((controller_id, device_addr)) = usb::find_mass_storage() else {
-        return false;
-    };
-    let Some(Ok(usb_device)) = usb::with_controller(controller_id, |controller| {
-        UsbMassStorage::new(controller, device_addr)
-    }) else {
-        return false;
-    };
-    if usb_device.num_blocks == 0 || !mass_storage::store_global_device(usb_device, controller_id) {
-        return false;
-    }
-
-    let device_type = menu::DeviceType::Usb {
-        controller_id,
-        device_addr,
-    };
-    try_boot_file_on_device(&device_type, 0, 0, file_path)
-}
-
-/// Try to boot a file from SDHCI ESPs
-fn try_boot_file_on_sdhci(file_path: &str) -> bool {
-    use crate::drivers::sdhci;
-
-    for controller_id in 0..sdhci::controller_count() {
-        let Some((pci_device, pci_function)) =
-            sdhci::with_controller(controller_id, |controller| {
-                controller.is_ready().then(|| {
-                    controller
-                        .pci_address()
-                        .map(|addr| (addr.device(), addr.function()))
-                        .unwrap_or((0, 0))
-                })
-            })
-            .flatten()
-        else {
-            continue;
-        };
-
-        if !sdhci::store_global_device(controller_id) {
-            continue;
-        }
-
-        let device_type = menu::DeviceType::Sdhci { controller_id };
-        if try_boot_file_on_device(&device_type, pci_device, pci_function, file_path) {
-            return true;
-        }
-    }
-    false
 }
 
 /// Try to boot a specific file from ESPs on a given device.
@@ -397,20 +263,19 @@ fn try_boot_file_on_sdhci(file_path: &str) -> bool {
 /// Reads GPT/MBR partitions, finds ESP partitions, mounts FAT, checks if the file exists,
 /// and if so, boots it through the standard UEFI boot path.
 fn try_boot_file_on_device(
-    device_type: &menu::DeviceType,
-    pci_device: u8,
-    pci_function: u8,
+    device: &crate::drivers::storage::StorageDevice,
     file_path: &str,
 ) -> bool {
+    use crate::drivers::storage;
     use crate::fs::{fat::FatFilesystem, gpt};
 
     // Read GPT/MBR partitions
-    let partitions =
-        crate::with_disk(device_type, |disk| gpt::read_partitions_auto(disk).ok()).flatten();
-
-    let partitions = match partitions {
-        Some(p) => p,
-        None => return false,
+    let Some(partitions) =
+        storage::with_disk(device.id, |disk| gpt::read_partitions_auto(disk).ok())
+            .ok()
+            .flatten()
+    else {
+        return false;
     };
 
     // Look for ESPs containing the target file
@@ -422,12 +287,9 @@ fn try_boot_file_on_device(
         let partition_num = (i + 1) as u32;
 
         // Try to mount FAT and check for the file
-        let found = crate::with_disk(device_type, |disk| {
-            if let Ok(mut fat) = FatFilesystem::new(disk, partition.first_lba) {
-                fat.file_size(file_path).is_ok()
-            } else {
-                false
-            }
+        let found = storage::with_disk(device.id, |disk| {
+            FatFilesystem::new(disk, partition.first_lba)
+                .is_ok_and(|mut fat| fat.file_size(file_path).is_ok())
         })
         .unwrap_or(false);
 
@@ -438,7 +300,7 @@ fn try_boot_file_on_device(
         log::info!(
             "Found '{}' on {} partition {}",
             file_path,
-            device_type.description(),
+            device.id.description(),
             partition_num
         );
 
@@ -446,11 +308,9 @@ fn try_boot_file_on_device(
         let entry = menu::BootEntry::new(
             file_path,
             file_path,
-            *device_type,
+            device,
             partition_num,
             partition.clone(),
-            pci_device,
-            pci_function,
         );
 
         boot_uefi_entry(&entry);
@@ -512,56 +372,29 @@ fn boot_selected_entry(entry: &menu::BootEntry) {
 
 /// Boot a UEFI entry (EFI application or UKI)
 ///
-/// Uses the unified boot module to handle all storage types generically.
-/// Device-specific logic is encapsulated in `crate::store_device_globally()` and
-/// `crate::with_disk()`, keeping this function device-agnostic.
+/// Installs BlockIO protocols for the entry's disk, then boots from its ESP
+/// through the storage-agnostic boot module.
 fn boot_uefi_entry(entry: &menu::BootEntry) {
     use crate::boot;
     use crate::drivers::storage;
 
     let path_info = boot::device_path_info_from_entry(entry);
 
-    // Phase 1: Store device globally and install BlockIO protocols
-    if !crate::store_device_globally(&entry.device_type) {
-        log::error!("Failed to store device globally");
-        return;
-    }
-
-    let device_info = crate::with_disk(&entry.device_type, |disk| {
-        let info = disk.info();
-        let storage_id =
-            match storage::register_device(entry.device_type, info.num_blocks, info.block_size) {
-                Some(id) => id,
-                None => {
-                    log::error!("Failed to register device");
-                    return None;
-                }
-            };
-        let _ = boot::install_block_io_protocols(
-            disk,
-            storage_id,
-            info.block_size,
-            info.num_blocks,
-            &path_info,
-        );
-        Some((info.num_blocks, info.block_size))
-    })
-    .flatten();
-
-    let Some((num_blocks, block_size)) = device_info else {
-        log::error!("Failed to create disk for BlockIO installation");
-        return;
+    let info = match storage::with_disk(entry.storage, |disk| disk.info()) {
+        Ok(info) => info,
+        Err(error) => {
+            log::error!("Failed to access {:?}: {}", entry.storage, error);
+            return;
+        }
     };
+    boot::install_block_io_protocols(entry.storage, info, &path_info);
 
-    // Do not hold a controller borrow while the filesystem and Block I/O
-    // protocol perform their own short, serialized device accesses.
     if boot::try_boot_from_esp(
         &entry.partition,
         entry.partition_num,
         &path_info,
-        &entry.device_type,
-        num_blocks,
-        block_size,
+        entry.storage,
+        info.block_size,
     ) {
         return;
     }
@@ -636,14 +469,7 @@ fn boot_linux_entry(
         if framebuffer.is_some() { "yes" } else { "no" }
     );
 
-    // Store device globally for SimpleFileSystem reads, then create a disk
-    // and delegate to boot_linux_from_device for the shared load+boot logic.
-    if !crate::store_device_globally(&entry.device_type) {
-        log::error!("Failed to store device globally");
-        return;
-    }
-
-    let loaded = crate::with_disk(&entry.device_type, |disk| {
+    let loaded = crate::drivers::storage::with_disk(entry.storage, |disk| {
         crate::linux_boot::load_linux_from_disk(
             disk,
             entry.partition.first_lba,
@@ -657,7 +483,7 @@ fn boot_linux_entry(
     });
 
     match loaded {
-        Some(Ok(mut loaded)) => {
+        Ok(Ok(mut loaded)) => {
             // The disk/controller borrow must be released before shutdown:
             // direct boot quiesces every firmware-owned DMA engine.
             log::info!("Linux loaded successfully, booting...");
@@ -665,8 +491,8 @@ fn boot_linux_entry(
                 loaded.boot_direct();
             }
         }
-        Some(Err(e)) => log::error!("Failed to load Linux: {:?}", e),
-        None => log::error!("Failed to create disk for Linux boot"),
+        Ok(Err(e)) => log::error!("Failed to load Linux: {:?}", e),
+        Err(e) => log::error!("Failed to access disk for Linux boot: {}", e),
     }
 
     // Note: We intentionally don't fall back to UEFI boot here.

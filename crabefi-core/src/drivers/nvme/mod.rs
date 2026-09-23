@@ -11,7 +11,6 @@ use crate::drivers::pci::{self, BarType, PciAddress, PciBar, PciDevice};
 use crate::efi::dma::{DmaBuffer, DmaDirection, DmaDomain, DmaMask};
 use crate::time::{Timeout, wait_for};
 use core::ptr;
-use spin::Mutex;
 use tock_registers::interfaces::{ReadWriteable, Readable, Writeable};
 use tock_registers::register_bitfields;
 use tock_registers::registers::{ReadOnly, ReadWrite};
@@ -1431,24 +1430,6 @@ impl NvmeController {
         Ok(())
     }
 
-    /// Read one or more sectors into a buffer
-    ///
-    /// The number of sectors to read is inferred from the buffer size.
-    /// If the buffer is larger than one sector, multiple sectors are read
-    /// in a single operation for performance.
-    pub fn read_sector(&mut self, nsid: u32, lba: u64, buffer: &mut [u8]) -> Result<(), NvmeError> {
-        let ns = self
-            .get_namespace(nsid)
-            .ok_or(NvmeError::InvalidNamespace)?;
-
-        let block_size = ns.block_size as usize;
-        if buffer.len() < block_size {
-            return Err(NvmeError::InvalidParameter);
-        }
-
-        let num_sectors = (buffer.len() / block_size) as u32;
-        self.read_sectors(nsid, lba, num_sectors, buffer)
-    }
     // ========================================================================
     // Security Commands (TCG Opal, IEEE 1667)
     // ========================================================================
@@ -1726,86 +1707,3 @@ pub fn controller_count() -> usize {
 // 3. Only accessed while holding the NVME_CONTROLLERS mutex
 // The firmware is single-threaded; concurrent hardware access is not possible.
 unsafe impl Send for NvmeController {}
-
-// ============================================================================
-// Global NVMe Device for SimpleFileSystem Protocol
-// ============================================================================
-
-/// Global NVMe device info for filesystem reads
-#[derive(Clone, Copy)]
-struct GlobalNvmeDevice {
-    controller_index: usize,
-    nsid: u32,
-}
-
-/// Global NVMe device for filesystem protocol
-static GLOBAL_NVME_DEVICE: Mutex<Option<GlobalNvmeDevice>> = Mutex::new(None);
-
-/// Store NVMe device info globally for SimpleFileSystem protocol
-///
-/// # Arguments
-/// * `controller_index` - Index of the NVMe controller
-/// * `nsid` - Namespace ID to use for reads
-///
-/// # Returns
-/// `true` if the device was stored successfully
-pub fn store_global_device(controller_index: usize, nsid: u32) -> bool {
-    *GLOBAL_NVME_DEVICE.lock() = Some(GlobalNvmeDevice {
-        controller_index,
-        nsid,
-    });
-    log::info!(
-        "NVMe device stored globally (controller={}, nsid={})",
-        controller_index,
-        nsid
-    );
-    true
-}
-
-/// Read sectors from the global NVMe device
-///
-/// This function is used as the read callback for the SimpleFileSystem protocol.
-/// Supports reading multiple sectors by inferring sector count from buffer size.
-// Failures are logged at the error site; callers only branch on success.
-#[allow(clippy::result_unit_err)]
-pub fn global_read_sectors(lba: u64, buffer: &mut [u8]) -> Result<(), ()> {
-    // Get the device info
-    let (controller_index, nsid) = match *GLOBAL_NVME_DEVICE.lock() {
-        Some(device) => (device.controller_index, device.nsid),
-        None => {
-            log::error!("global_read_sectors: no NVMe device stored");
-            return Err(());
-        }
-    };
-
-    with_controller(controller_index, |controller| {
-        controller.read_sector(nsid, lba, buffer).map_err(|error| {
-            log::error!(
-                "global_read_sectors: read failed at LBA {}: {:?}",
-                lba,
-                error
-            );
-        })
-    })
-    .unwrap_or_else(|| {
-        log::error!(
-            "global_read_sectors: no NVMe controller at index {}",
-            controller_index
-        );
-        Err(())
-    })
-}
-
-/// Get the sector size of the global NVMe device
-pub fn global_sector_size() -> Option<u32> {
-    let (controller_index, nsid) = {
-        let guard = GLOBAL_NVME_DEVICE.lock();
-        let device = guard.as_ref()?;
-        (device.controller_index, device.nsid)
-    };
-    with_controller(controller_index, |controller| {
-        controller
-            .get_namespace(nsid)
-            .map(|namespace| namespace.block_size)
-    })?
-}

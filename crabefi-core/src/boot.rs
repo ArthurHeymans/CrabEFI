@@ -1,25 +1,19 @@
-//! Unified Boot Path Module
+//! UEFI Boot Path
 //!
-//! This module consolidates the boot logic that was previously duplicated
-//! per-storage-type in lib.rs. It provides:
+//! Storage-agnostic boot logic shared by every [`StorageId`]:
 //!
-//! - `install_block_io_protocols()` — Generic function to install BlockIO and DevicePath
-//!   protocols for a disk and all its GPT partitions
-//! - `try_boot_from_esp()` — Generic function to mount FAT on the ESP, install
-//!   SimpleFileSystem, and load/execute the EFI bootloader
-//!
-//! These replace the four `install_block_io_for_{usb,nvme,ahci,sdhci}_disk` functions
-//! and the four `try_boot_from_esp_{usb,nvme,ahci,sdhci}` functions.
+//! - `install_block_io_protocols()` — install BlockIO, DiskIO and DevicePath
+//!   protocols for a disk and all its partitions
+//! - `try_boot_from_esp()` — install SimpleFileSystem on the ESP and load and
+//!   execute the EFI bootloader
 
 #[cfg(feature = "tpm")]
 use core::sync::atomic::{AtomicBool, Ordering};
 
 use r_efi::efi::Status;
 
-use crate::drivers::block::{
-    AhciBlockDevice, AnyBlockDevice, BlockDevice, NvmeBlockDevice, SdhciBlockDevice, UsbBlockDevice,
-};
-use crate::drivers::storage;
+use crate::drivers::block::{BlockDevice, BlockDeviceInfo};
+use crate::drivers::storage::{self, StorageId};
 use crate::efi;
 use crate::efi::boot_services;
 use crate::efi::protocols::block_io::{self, BLOCK_IO_PROTOCOL_GUID};
@@ -55,28 +49,19 @@ fn measure_gpt_once(disk: &mut dyn BlockDevice, header: &fs::gpt::GptHeader, is_
 #[cfg(not(feature = "tpm"))]
 fn measure_gpt_once(_disk: &mut dyn BlockDevice, _header: &fs::gpt::GptHeader, _is_hybrid: bool) {}
 
-/// Install BlockIO and DevicePath protocols for a disk and all its GPT partitions
-///
-/// This replaces the four `install_block_io_for_{usb,nvme,ahci,sdhci}_disk` functions.
+/// Install BlockIO, DiskIO and DevicePath protocols for a disk and all its partitions
 ///
 /// # Arguments
-/// * `disk` - Block device to read GPT from
-/// * `storage_id` - Storage device ID for BlockIO media_id
-/// * `block_size` - Block size in bytes
-/// * `num_blocks` - Total number of blocks on the device
+/// * `storage` - Disk to read the partition table from
+/// * `info` - Geometry of the disk
 /// * `path_info` - Device-specific info for constructing device paths
-///
-/// # Returns
-/// The ESP partition and its 1-based partition number, if found
 pub fn install_block_io_protocols(
-    disk: &mut dyn BlockDevice,
-    storage_id: u32,
-    block_size: u32,
-    num_blocks: u64,
+    storage: StorageId,
+    info: BlockDeviceInfo,
     path_info: &DevicePathInfo,
-) -> Option<(u32, fs::gpt::Partition)> {
+) {
     // Create BlockIO for the raw disk (whole device)
-    let disk_block_io = block_io::create_disk_block_io(storage_id, num_blocks, block_size);
+    let disk_block_io = block_io::create_disk_block_io(storage, info.num_blocks, info.block_size);
 
     if !disk_block_io.is_null()
         && let Some(disk_handle) = boot_services::create_handle()
@@ -114,39 +99,17 @@ pub fn install_block_io_protocols(
         }
     }
 
-    // Read GPT partitions, falling back to MBR for removable media. If a GPT is
-    // present, measure its header and non-empty partition entries into PCR 5 per
-    // the TCG PC Client PFP EFI_GPT_DATA event format. The layout is detected
-    // once and reused for the partition scan and the measurement payload.
-    let gpt_scan = fs::gpt::read_gpt_layout(disk).and_then(|(header, is_hybrid)| {
-        fs::gpt::read_partitions_with(disk, &header, is_hybrid).map(|p| (header, is_hybrid, p))
-    });
-    let partitions = match gpt_scan {
-        Ok((header, is_hybrid, partitions)) => {
-            measure_gpt_once(disk, &header, is_hybrid);
-            partitions
+    let partitions = match storage::with_disk(storage, scan_partitions) {
+        Ok(Ok(partitions)) => partitions,
+        Ok(Err(error)) => {
+            log::debug!("Failed to read partition table: {:?}", error);
+            return;
         }
         Err(error) => {
-            log::debug!("GPT partition scan failed: {:?}; trying MBR", error);
-            match fs::gpt::read_mbr_partitions(disk) {
-                Ok(p) => {
-                    let mut partitions = heapless::Vec::new();
-                    for partition in p {
-                        let _ = partitions.push(partition);
-                    }
-                    partitions
-                }
-                Err(e) => {
-                    log::debug!("Failed to read partition table: {:?}", e);
-                    return None;
-                }
-            }
+            log::debug!("Failed to access {:?}: {}", storage, error);
+            return;
         }
     };
-
-    let mut esp_partition: Option<(u32, fs::gpt::Partition)> = None;
-    let mut candidate_partitions: heapless::Vec<(u32, fs::gpt::Partition), 8> =
-        heapless::Vec::new();
 
     // Create BlockIO for each partition
     for (i, partition) in partitions.iter().enumerate() {
@@ -154,336 +117,268 @@ pub fn install_block_io_protocols(
         let partition_blocks = partition.size_sectors();
 
         let partition_block_io = block_io::create_partition_block_io(
-            storage_id,
+            storage,
             partition_num,
             partition.first_lba,
             partition_blocks,
-            block_size,
+            info.block_size,
         );
 
-        if !partition_block_io.is_null()
-            && let Some(part_handle) = boot_services::create_handle()
-        {
-            // Install BlockIO
+        if partition_block_io.is_null() {
+            continue;
+        }
+        let Some(part_handle) = boot_services::create_handle() else {
+            continue;
+        };
+
+        // Install BlockIO
+        let status = boot_services::install_protocol(
+            part_handle,
+            &BLOCK_IO_PROTOCOL_GUID,
+            partition_block_io as *mut core::ffi::c_void,
+        );
+        if status == Status::SUCCESS {
+            log::info!(
+                "BlockIO protocol installed for partition {} on handle {:?}",
+                partition_num,
+                part_handle
+            );
+        }
+
+        // Install DiskIO protocol on partition handle
+        efi::protocols::disk_io::install_disk_io_on_handle(part_handle);
+
+        // Install DevicePath for partition
+        let part_device_path = device_path::create_partition_device_path(
+            path_info,
+            partition_num,
+            partition.first_lba,
+            partition_blocks,
+            &partition.partition_guid,
+        );
+
+        if !part_device_path.is_null() {
             let status = boot_services::install_protocol(
                 part_handle,
-                &BLOCK_IO_PROTOCOL_GUID,
-                partition_block_io as *mut core::ffi::c_void,
+                &DEVICE_PATH_PROTOCOL_GUID,
+                part_device_path as *mut core::ffi::c_void,
             );
             if status == Status::SUCCESS {
                 log::info!(
-                    "BlockIO protocol installed for partition {} on handle {:?}",
+                    "DevicePath protocol installed for partition {} on handle {:?}",
                     partition_num,
                     part_handle
                 );
             }
-
-            // Install DiskIO protocol on partition handle
-            efi::protocols::disk_io::install_disk_io_on_handle(part_handle);
-
-            // Install DevicePath for partition
-            let part_device_path = device_path::create_partition_device_path(
-                path_info,
-                partition_num,
-                partition.first_lba,
-                partition_blocks,
-                &partition.partition_guid,
-            );
-
-            if !part_device_path.is_null() {
-                let status = boot_services::install_protocol(
-                    part_handle,
-                    &DEVICE_PATH_PROTOCOL_GUID,
-                    part_device_path as *mut core::ffi::c_void,
-                );
-                if status == Status::SUCCESS {
-                    log::info!(
-                        "DevicePath protocol installed for partition {} on handle {:?}",
-                        partition_num,
-                        part_handle
-                    );
-                }
-            }
-        }
-
-        // Remember ESP for later (with partition number)
-        if partition.is_esp {
-            log::info!(
-                "Found ESP: partition {}, LBA {}-{} ({} MB)",
-                partition_num,
-                partition.first_lba,
-                partition.last_lba,
-                partition.size_bytes() / (1024 * 1024)
-            );
-            esp_partition = Some((partition_num, partition.clone()));
-        } else {
-            // Track as candidate for fallback (small partitions are more likely to be EFI boot)
-            let size_mb = partition.size_bytes() / (1024 * 1024);
-            if size_mb > 0 && size_mb < 512 && partition.first_lba > 0 {
-                let _ = candidate_partitions.push((partition_num, partition.clone()));
-            }
         }
     }
-
-    // If we found a proper ESP, return it
-    if esp_partition.is_some() {
-        return esp_partition;
-    }
-
-    // No proper ESP found - try candidate partitions (smaller ones first)
-    candidate_partitions
-        .as_mut_slice()
-        .sort_unstable_by_key(|(_, partition)| partition.size_bytes());
-
-    if let Some((partition_num, partition)) = candidate_partitions.first() {
-        log::debug!(
-            "Trying partition {} as potential ESP (no proper ESP found)",
-            partition_num
-        );
-        return Some((*partition_num, partition.clone()));
-    }
-
-    None
 }
 
-/// Create an `AnyBlockDevice` for the SimpleFileSystem protocol
+/// Read the partition table, measuring a GPT into PCR 5 once per boot.
 ///
-/// This creates the correct block device variant based on device type,
-/// used by the SFS protocol for filesystem reads.
-fn create_block_device_for_sfs(
-    device_type: &menu::DeviceType,
-    num_blocks: u64,
-    block_size: u32,
-) -> Option<AnyBlockDevice> {
-    match *device_type {
-        menu::DeviceType::Nvme {
-            controller_id,
-            nsid,
-        } => {
-            let block_dev = NvmeBlockDevice::new(controller_id, nsid, num_blocks, block_size, 0);
-            Some(AnyBlockDevice::Nvme(block_dev))
+/// Falls back to an MBR partition table when no GPT is present.
+fn scan_partitions(
+    disk: &mut dyn BlockDevice,
+) -> Result<heapless::Vec<fs::gpt::Partition, 16>, fs::gpt::GptError> {
+    // The layout is detected once and reused for the partition scan and the
+    // measurement payload.
+    let gpt_scan = fs::gpt::read_gpt_layout(disk).and_then(|(header, is_hybrid)| {
+        fs::gpt::read_partitions_with(disk, &header, is_hybrid).map(|p| (header, is_hybrid, p))
+    });
+    match gpt_scan {
+        Ok((header, is_hybrid, partitions)) => {
+            measure_gpt_once(disk, &header, is_hybrid);
+            Ok(partitions)
         }
-        menu::DeviceType::Ahci {
-            controller_id,
-            port,
-        } => {
-            let block_dev = AhciBlockDevice::new(controller_id, port, num_blocks, block_size, 0);
-            Some(AnyBlockDevice::Ahci(block_dev))
-        }
-        menu::DeviceType::Usb {
-            controller_id,
-            device_addr,
-        } => {
-            let block_dev =
-                UsbBlockDevice::new(controller_id, device_addr, num_blocks, block_size, 0);
-            Some(AnyBlockDevice::Usb(block_dev))
-        }
-        menu::DeviceType::Sdhci { controller_id } => {
-            let removable = crate::drivers::sdhci::with_controller(controller_id, |controller| {
-                controller.removable()
-            })?;
-            let block_dev = SdhciBlockDevice::new_with_removable(
-                controller_id,
-                num_blocks,
-                block_size,
-                0,
-                removable,
-            );
-            Some(AnyBlockDevice::Sdhci(block_dev))
-        }
-        menu::DeviceType::Platform { .. } => {
-            // Platform block devices are accessed through with_disk() → PlatformBlockShim
-            // rather than AnyBlockDevice, which only wraps PCI-discovered devices.
-            None
+        Err(error) => {
+            log::debug!("GPT partition scan failed: {:?}; trying MBR", error);
+            Ok(fs::gpt::read_mbr_partitions(disk)?.into_iter().collect())
         }
     }
 }
 
 /// Try to boot from an ESP partition
 ///
-/// This replaces the four `try_boot_from_esp_{usb,nvme,ahci,sdhci}` functions.
-/// It mounts FAT on the ESP, installs SimpleFileSystem + DevicePath + BlockIO
-/// protocols on a new handle, then loads and executes the EFI bootloader.
+/// Mounts the ESP as SimpleFileSystem, installs it together with DevicePath,
+/// BlockIO and DiskIO protocols on a new handle, then loads and executes the
+/// EFI bootloader.
 ///
 /// # Arguments
 /// * `esp` - ESP partition info
 /// * `partition_num` - 1-based partition number of the ESP
 /// * `path_info` - Device path info for protocol installation
-/// * `device_type` - Device type for creating block device and storage registration
-/// * `num_blocks` - Total number of blocks on the device
-/// * `block_size` - Block size in bytes
+/// * `storage` - Disk holding the ESP
+/// * `block_size` - Block size of the disk in bytes
 pub fn try_boot_from_esp(
     esp: &fs::gpt::Partition,
     partition_num: u32,
     path_info: &DevicePathInfo,
-    device_type: &menu::DeviceType,
-    num_blocks: u64,
+    storage: StorageId,
     block_size: u32,
 ) -> bool {
-    let mut disk = match create_block_device_for_sfs(device_type, num_blocks, block_size) {
-        Some(disk) => disk,
-        None => {
-            log::error!("Failed to create block device for ESP");
-            return false;
-        }
-    };
-    let block_device = match create_block_device_for_sfs(device_type, num_blocks, block_size) {
-        Some(block_device) => block_device,
-        None => {
-            log::error!("Failed to create block device for SFS");
-            return false;
-        }
-    };
-
-    // Initialize SimpleFileSystem protocol with independently locked storage.
-    let sfs_protocol = simple_file_system::init(block_device, esp.first_lba);
+    // Mounting the SimpleFileSystem also validates the FAT filesystem.
+    let sfs_protocol = simple_file_system::init(storage, esp.first_lba);
     if sfs_protocol.is_null() {
         log::error!("Failed to initialize SimpleFileSystem protocol");
         return false;
     }
+    log::info!("FAT filesystem mounted on ESP");
 
-    // Mount FAT filesystem
-    match fs::fat::FatFilesystem::new(&mut disk, esp.first_lba) {
-        Ok(mut fat) => {
-            log::info!("FAT filesystem mounted on ESP");
+    // Create a device handle with SimpleFileSystem and DevicePath protocols
+    let device_handle = match boot_services::create_handle() {
+        Some(h) => h,
+        None => {
+            log::error!("Failed to create device handle");
+            return false;
+        }
+    };
 
-            // Create a device handle with SimpleFileSystem and DevicePath protocols
-            let device_handle = match boot_services::create_handle() {
-                Some(h) => h,
-                None => {
-                    log::error!("Failed to create device handle");
-                    return false;
-                }
-            };
+    // Install DevicePath protocol on the device handle
+    let partition_size = esp.size_sectors();
+    let dp = device_path::create_partition_device_path(
+        path_info,
+        partition_num,
+        esp.first_lba,
+        partition_size,
+        &esp.partition_guid,
+    );
 
-            // Install DevicePath protocol on the device handle
-            let partition_size = esp.size_sectors();
-            let dp = device_path::create_partition_device_path(
-                path_info,
-                partition_num,
-                esp.first_lba,
-                partition_size,
-                &esp.partition_guid,
-            );
-
-            if !dp.is_null() {
-                let status = boot_services::install_protocol(
-                    device_handle,
-                    &DEVICE_PATH_PROTOCOL_GUID,
-                    dp as *mut core::ffi::c_void,
-                );
-                if status == Status::SUCCESS {
-                    log::info!(
-                        "DevicePath protocol installed on device handle {:?}",
-                        device_handle
-                    );
-                } else {
-                    log::warn!("Failed to install DevicePath protocol: {:?}", status);
-                }
-            }
-
-            // Install BlockIO protocol on the device handle
-            let storage_type = *device_type;
-            let storage_id = storage::register_device(storage_type, num_blocks, block_size);
-
-            if let Some(storage_id) = storage_id {
-                let block_io = block_io::create_partition_block_io(
-                    storage_id,
-                    partition_num,
-                    esp.first_lba,
-                    partition_size,
-                    block_size,
-                );
-
-                if !block_io.is_null() {
-                    let status = boot_services::install_protocol(
-                        device_handle,
-                        &BLOCK_IO_PROTOCOL_GUID,
-                        block_io as *mut core::ffi::c_void,
-                    );
-                    if status == Status::SUCCESS {
-                        log::info!(
-                            "BlockIO protocol installed on device handle {:?}",
-                            device_handle
-                        );
-                    } else {
-                        log::warn!("Failed to install BlockIO protocol: {:?}", status);
-                    }
-                }
-            }
-
-            // Install DiskIO protocol (byte-granular I/O wrapper over BlockIO)
-            efi::protocols::disk_io::install_disk_io_on_handle(device_handle);
-
-            // Install SimpleFileSystem protocol on the device handle
-            let status = boot_services::install_protocol(
-                device_handle,
-                &SIMPLE_FILE_SYSTEM_GUID,
-                sfs_protocol as *mut core::ffi::c_void,
-            );
-
-            if status != Status::SUCCESS {
-                log::error!("Failed to install SimpleFileSystem protocol: {:?}", status);
-                return false;
-            }
-
+    if !dp.is_null() {
+        let status = boot_services::install_protocol(
+            device_handle,
+            &DEVICE_PATH_PROTOCOL_GUID,
+            dp as *mut core::ffi::c_void,
+        );
+        if status == Status::SUCCESS {
             log::info!(
-                "SimpleFileSystem protocol installed on device handle {:?}",
+                "DevicePath protocol installed on device handle {:?}",
                 device_handle
             );
-
-            // Look for EFI bootloader
-            let boot_path = crate::menu::EFI_BOOT_PATH;
-            match fat.file_size(boot_path) {
-                Ok(size) => {
-                    log::info!("Found bootloader: {} ({} bytes)", boot_path, size);
-
-                    // Load and execute the bootloader with device handle
-                    match load_and_execute_bootloader(&mut fat, boot_path, size, device_handle) {
-                        Ok(()) => return true,
-                        Err(e) => {
-                            log::error!("Failed to execute bootloader: {:?}", e);
-                        }
-                    }
-                }
-                Err(e) => {
-                    log::warn!("Bootloader not found: {:?}", e);
-                }
-            }
-        }
-        Err(e) => {
-            log::error!("Failed to mount FAT filesystem: {:?}", e);
+        } else {
+            log::warn!("Failed to install DevicePath protocol: {:?}", status);
         }
     }
-    false
+
+    // Install BlockIO protocol on the device handle
+    let block_io = block_io::create_partition_block_io(
+        storage,
+        partition_num,
+        esp.first_lba,
+        partition_size,
+        block_size,
+    );
+
+    if !block_io.is_null() {
+        let status = boot_services::install_protocol(
+            device_handle,
+            &BLOCK_IO_PROTOCOL_GUID,
+            block_io as *mut core::ffi::c_void,
+        );
+        if status == Status::SUCCESS {
+            log::info!(
+                "BlockIO protocol installed on device handle {:?}",
+                device_handle
+            );
+        } else {
+            log::warn!("Failed to install BlockIO protocol: {:?}", status);
+        }
+    }
+
+    // Install DiskIO protocol (byte-granular I/O wrapper over BlockIO)
+    efi::protocols::disk_io::install_disk_io_on_handle(device_handle);
+
+    // Install SimpleFileSystem protocol on the device handle
+    let status = boot_services::install_protocol(
+        device_handle,
+        &SIMPLE_FILE_SYSTEM_GUID,
+        sfs_protocol as *mut core::ffi::c_void,
+    );
+
+    if status != Status::SUCCESS {
+        log::error!("Failed to install SimpleFileSystem protocol: {:?}", status);
+        return false;
+    }
+
+    log::info!(
+        "SimpleFileSystem protocol installed on device handle {:?}",
+        device_handle
+    );
+
+    // Read the bootloader, then release the disk before executing it: the
+    // loaded image reads through the same disk via the installed protocols.
+    let boot_path = crate::menu::EFI_BOOT_PATH;
+    let image = match storage::with_disk(storage, |disk| {
+        read_bootloader(disk, esp.first_lba, boot_path)
+    }) {
+        Ok(Ok(image)) => image,
+        Ok(Err(_)) => return false,
+        Err(error) => {
+            log::error!("Failed to access {:?}: {}", storage, error);
+            return false;
+        }
+    };
+
+    match execute_bootloader(image, boot_path, device_handle) {
+        Ok(()) => true,
+        Err(e) => {
+            log::error!("Failed to execute bootloader: {:?}", e);
+            false
+        }
+    }
 }
 
-/// Load and execute an EFI bootloader from the filesystem
-fn load_and_execute_bootloader(
-    fat: &mut fs::fat::FatFilesystem<'_>,
+/// A bootloader image read into a `LoaderData` pool buffer.
+struct BootloaderImage {
+    buffer: *mut u8,
+    len: usize,
+}
+
+/// Read an EFI bootloader from the FAT filesystem at `partition_start`.
+fn read_bootloader(
+    disk: &mut dyn BlockDevice,
+    partition_start: u64,
     path: &str,
-    file_size: u32,
+) -> Result<BootloaderImage, Status> {
+    use efi::allocator::{MemoryType, allocate_pool, free_pool};
+
+    let mut fat = fs::fat::FatFilesystem::new(disk, partition_start).map_err(|e| {
+        log::error!("Failed to mount FAT filesystem: {:?}", e);
+        Status::VOLUME_CORRUPTED
+    })?;
+    let file_size = fat.file_size(path).map_err(|e| {
+        log::warn!("Bootloader not found: {:?}", e);
+        Status::NOT_FOUND
+    })?;
+    log::info!("Loading bootloader: {} ({} bytes)", path, file_size);
+
+    let buffer = allocate_pool(MemoryType::LoaderData, file_size as usize)?;
+    // SAFETY: the pool allocation spans file_size bytes and is exclusively owned here.
+    let slice = unsafe { core::slice::from_raw_parts_mut(buffer, file_size as usize) };
+    match fat.read_file_all(path, slice) {
+        Ok(len) => Ok(BootloaderImage { buffer, len }),
+        Err(e) => {
+            log::error!("Failed to read bootloader file: {:?}", e);
+            let _ = free_pool(buffer);
+            Err(Status::DEVICE_ERROR)
+        }
+    }
+}
+
+/// Load and start a bootloader image, freeing its buffer.
+fn execute_bootloader(
+    image: BootloaderImage,
+    path: &str,
     device_handle: r_efi::efi::Handle,
 ) -> Result<(), Status> {
     use core::ptr;
-    use efi::allocator::{MemoryType, allocate_pool, free_pool};
+    use efi::allocator::free_pool;
     use efi::protocols::loaded_image::LOADED_IMAGE_PROTOCOL_GUID;
-
-    log::info!("Loading bootloader: {} ({} bytes)", path, file_size);
-    let buffer_ptr = allocate_pool(MemoryType::LoaderData, file_size as usize)?;
-    // SAFETY: the pool allocation spans file_size bytes and is exclusively owned here.
-    let buffer = unsafe { core::slice::from_raw_parts_mut(buffer_ptr, file_size as usize) };
-    let bytes_read = fat.read_file_all(path, buffer).map_err(|e| {
-        log::error!("Failed to read bootloader file: {:?}", e);
-        let _ = free_pool(buffer_ptr);
-        Status::DEVICE_ERROR
-    })?;
 
     let device_dp =
         boot_services::get_protocol_on_handle(device_handle, &DEVICE_PATH_PROTOCOL_GUID);
     let full_path = device_path::create_loaded_image_device_path(device_dp.cast(), path);
     if full_path.is_null() {
-        let _ = free_pool(buffer_ptr);
+        let _ = free_pool(image.buffer);
         return Err(Status::OUT_OF_RESOURCES);
     }
 
@@ -495,11 +390,11 @@ fn load_and_execute_bootloader(
         r_efi::efi::Boolean::TRUE,
         efi::get_firmware_handle(),
         full_path,
-        buffer_ptr.cast(),
-        bytes_read,
+        image.buffer.cast(),
+        image.len,
         &mut image_handle,
     );
-    let _ = free_pool(buffer_ptr);
+    let _ = free_pool(image.buffer);
     let _ = free_pool(full_path.cast());
     if status != Status::SUCCESS {
         return Err(status);
@@ -542,19 +437,16 @@ fn load_and_execute_bootloader(
 /// Windows Boot Manager, which expects a CDROM media device path node
 /// (type=0x04, subtype=0x02) rather than a HardDrive node.
 pub fn device_path_info_from_entry(entry: &menu::BootEntry) -> DevicePathInfo {
-    match entry.device_type {
-        menu::DeviceType::Nvme {
-            controller_id: _,
-            nsid,
-        } => DevicePathInfo::Nvme {
-            pci_device: entry.pci_device,
-            pci_function: entry.pci_function,
+    let (pci_device, pci_function) = entry
+        .pci
+        .map_or((0, 0), |address| (address.device(), address.function()));
+    match entry.storage {
+        StorageId::Nvme { nsid, .. } => DevicePathInfo::Nvme {
+            pci_device,
+            pci_function,
             namespace_id: nsid,
         },
-        menu::DeviceType::Ahci {
-            controller_id: _,
-            port,
-        } => {
+        StorageId::Ahci { port, .. } => {
             // Detect El Torito boot: partition_num == 0 means this came from
             // ISO9660 El Torito discovery (not GPT). Use CDROM device path.
             if entry.partition_num == 0 {
@@ -564,8 +456,8 @@ pub fn device_path_info_from_entry(entry: &menu::BootEntry) -> DevicePathInfo {
                     .saturating_sub(entry.partition.first_lba)
                     + 1;
                 DevicePathInfo::AhciCdrom {
-                    pci_device: entry.pci_device,
-                    pci_function: entry.pci_function,
+                    pci_device,
+                    pci_function,
                     port: port as u16,
                     boot_entry: 0, // Default boot catalog entry
                     partition_start: entry.partition.first_lba,
@@ -573,24 +465,21 @@ pub fn device_path_info_from_entry(entry: &menu::BootEntry) -> DevicePathInfo {
                 }
             } else {
                 DevicePathInfo::Ahci {
-                    pci_device: entry.pci_device,
-                    pci_function: entry.pci_function,
+                    pci_device,
+                    pci_function,
                     port: port as u16,
                 }
             }
         }
-        menu::DeviceType::Usb {
-            controller_id: _,
-            device_addr: _,
-        } => DevicePathInfo::Usb {
-            pci_device: entry.pci_device,
-            pci_function: entry.pci_function,
+        StorageId::Usb { .. } => DevicePathInfo::Usb {
+            pci_device,
+            pci_function,
             usb_port: 0,
         },
-        menu::DeviceType::Sdhci { controller_id: _ } => DevicePathInfo::Sdhci {
-            pci_device: entry.pci_device,
-            pci_function: entry.pci_function,
+        StorageId::Sdhci { .. } => DevicePathInfo::Sdhci {
+            pci_device,
+            pci_function,
         },
-        menu::DeviceType::Platform { index } => DevicePathInfo::Platform { index },
+        StorageId::Platform { index } => DevicePathInfo::Platform { index },
     }
 }
