@@ -19,9 +19,9 @@ secure-boot = ["pkcs7", "crabefi-runtime-bundle?/secure-boot"]
 # Signed firmware capsule application requires durable result persistence.
 capsule-update = ["pkcs7", "variable-store"]
 # Shared verification implementation, not a runtime policy switch.
-# CMS/X.509 parsing is hand-rolled on the minimal `asn1` crate; only RSA,
-# hashing, and signature traits come from RustCrypto.
-pkcs7 = ["sha2/oid", "dep:sha1", "dep:rsa", "dep:signature", "dep:asn1"]
+# CMS/X.509 views and RSA come from `crabefi-pkcs7`, shared with the runtime
+# image.
+pkcs7 = ["dep:sha1", "dep:crabefi-pkcs7"]
 # Preserve the standalone payload's existing non-graphical capabilities explicitly.
 full = ["tpm", "xhci", "spi-flash", "secure-boot", "capsule-update"]
 # Direct flash variable persistence; omitted when the host provides no flash store.
@@ -44,6 +44,7 @@ ui = ["dep:noto-sans-mono-bitmap"]
 
 [dependencies]
 crabefi-efi-types = { workspace = true }
+crabefi-pkcs7 = { workspace = true, optional = true }
 crabefi-runtime-bundle = { workspace = true, optional = true }
 crabefi-runtime-abi = { path = "../crabefi-runtime-abi" }
 r-efi = { workspace = true }
@@ -74,16 +75,9 @@ rflasher-internal = { optional = true, git = "https://github.com/ArthurHeymans/r
   "is_sync",
 ] }
 
-# RustCrypto crates for UEFI Secure Boot authentication (all no_std compatible)
+# RustCrypto hashes for Authenticode, measured boot and variable digests
 sha1 = { optional = true, version = "0.11", default-features = false }
 sha2 = { version = "0.11", default-features = false }
-rsa = { optional = true, version = "=0.10.0-rc.18", default-features = false, features = [
-  "encoding",
-] }
-# Minimal DER parser for CMS/X.509 verification (no_std via
-# no-default-features). Replaces the cms/x509-cert/der framework.
-asn1 = { optional = true, version = "0.24", default-features = false }
-signature = { optional = true, version = "3.0", default-features = false }
 
 [target.'cfg(target_arch = "x86_64")'.dependencies]
 x86_64 = "0.15"

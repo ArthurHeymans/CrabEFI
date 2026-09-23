@@ -31,6 +31,10 @@ use alloc::vec::Vec;
 
 #[cfg(feature = "secure-boot")]
 use crabefi_efi_types::constant_time_eq;
+#[cfg(feature = "secure-boot")]
+use crabefi_pkcs7::cms::SignedData;
+#[cfg(feature = "secure-boot")]
+use crabefi_pkcs7::der::{DecodeError, Tlv, tag};
 use sha1::Sha1;
 use sha2::{Digest, Sha256, Sha384, Sha512};
 
@@ -453,23 +457,33 @@ pub fn verify_pe_image_secure_boot(pe_data: &[u8]) -> Result<bool, AuthError> {
 /// This function parses the eContent from the PKCS#7 SignedData and extracts
 /// the hash from the DigestInfo, which should match our computed Authenticode hash.
 #[cfg(feature = "secure-boot")]
-fn extract_spc_authenticode_hash(pkcs7_data: &[u8]) -> Result<Option<Vec<u8>>, AuthError> {
-    use super::asn1_views;
-
-    let actual_pkcs7 = super::crypto::trim_der_trailing_bytes(pkcs7_data)?;
-    let signed =
-        asn1_views::parse_signed_data(actual_pkcs7).map_err(|_| AuthError::InvalidHeader)?;
-
-    let econtent = match signed.econtent_hash_input {
-        Some(ec) => ec,
-        None => return Ok(None),
-    };
-
-    // The eContent carries SpcIndirectDataContent (possibly OCTET STRING
-    // wrapped); extract the DigestInfo digest from it.
-    asn1_views::extract_spc_digest(econtent)
-        .map(Some)
+fn extract_spc_authenticode_hash(pkcs7_data: &[u8]) -> Result<Option<&[u8]>, AuthError> {
+    let signed = SignedData::parse(pkcs7_data).map_err(|_| AuthError::InvalidHeader)?;
+    signed
+        .encapsulated_content
+        .content
+        .map(spc_digest)
+        .transpose()
         .map_err(|_| AuthError::InvalidHeader)
+}
+
+/// Digest from an eContent carrying SpcIndirectDataContent, either directly
+/// (the SEQUENCE itself) or wrapped in an OCTET STRING.
+#[cfg(feature = "secure-boot")]
+fn spc_digest(econtent: Tlv<'_>) -> Result<&[u8], DecodeError> {
+    let spc = match econtent.tag {
+        tag::OCTET_STRING => econtent.inner()?,
+        _ => econtent,
+    };
+    let mut fields = spc.contents(tag::SEQUENCE)?;
+    // SpcAttributeTypeAndOptionalValue (skipped).
+    fields.read()?;
+    let mut digest_info = fields.read()?.contents(tag::SEQUENCE)?;
+    fields.finish()?;
+    digest_info.read()?;
+    let digest = digest_info.read()?.octet_string()?;
+    digest_info.finish()?;
+    Ok(digest)
 }
 
 /// Verify an Authenticode signature against the db database
@@ -482,7 +496,7 @@ fn verify_authenticode_signature(
     // SpcIndirectDataContent. This prevents signature transplant attacks where
     // a valid signature from one PE image is attached to a different image.
     match extract_spc_authenticode_hash(sig.pkcs7_data) {
-        Ok(Some(ref spc_hash)) => {
+        Ok(Some(spc_hash)) => {
             if !constant_time_eq(spc_hash, image_hash) {
                 log::warn!(
                     "Authenticode hash in SpcIndirectDataContent does not match computed image hash"
@@ -556,5 +570,45 @@ mod tests {
         mz_only[1] = b'Z';
         mz_only[60] = 0xFF; // Invalid PE offset
         assert!(parse_pe_for_hash(&mz_only).is_err());
+    }
+
+    /// SpcIndirectDataContent over 32 known digest bytes: a dummy
+    /// SpcAttributeTypeAndOptionalValue followed by a SHA-256 DigestInfo.
+    #[cfg(feature = "secure-boot")]
+    fn spc_indirect_data() -> (Vec<u8>, [u8; 32]) {
+        let digest = [0xabu8; 32];
+        let mut spc = alloc::vec![
+            0x30, 0x3c, // SpcIndirectDataContent SEQUENCE
+            0x30, 0x07, 0x06, 0x05, 0x2b, 0x0e, 0x03, 0x02, 0x1a, // SEQUENCE { OID }
+            0x30, 0x31, // DigestInfo SEQUENCE
+            0x30, 0x0d, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01, 0x05,
+            0x00, // sha256 AlgorithmIdentifier
+            0x04, 0x20, // digest OCTET STRING
+        ];
+        spc.extend_from_slice(&digest);
+        (spc, digest)
+    }
+
+    #[cfg(feature = "secure-boot")]
+    #[test]
+    fn spc_digest_accepts_direct_and_wrapped_econtent() {
+        let (spc, digest) = spc_indirect_data();
+        let mut wrapped = alloc::vec![0x04, spc.len() as u8];
+        wrapped.extend_from_slice(&spc);
+        for econtent in [&spc, &wrapped] {
+            assert_eq!(spc_digest(Tlv::parse(econtent).unwrap()), Ok(&digest[..]));
+        }
+
+        // Trailing bytes inside the wrapper or the SEQUENCE are rejected.
+        let mut padded_wrapper = alloc::vec![0x04, spc.len() as u8 + 1];
+        padded_wrapper.extend_from_slice(&spc);
+        padded_wrapper.push(0);
+        assert!(spc_digest(Tlv::parse(&padded_wrapper).unwrap()).is_err());
+        let mut padded_spc = spc.clone();
+        padded_spc[1] += 1;
+        padded_spc.push(0);
+        assert!(spc_digest(Tlv::parse(&padded_spc).unwrap()).is_err());
+        // Not a SEQUENCE.
+        assert!(spc_digest(Tlv::parse(&[0x31, 0x00]).unwrap()).is_err());
     }
 }

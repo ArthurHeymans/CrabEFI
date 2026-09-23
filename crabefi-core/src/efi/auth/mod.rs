@@ -26,8 +26,6 @@
 //! - **Setup Mode**: When PK is empty, authenticated writes skip signature verification
 //! - **User Mode**: When PK is enrolled, all authenticated variable writes require valid signatures
 
-#[cfg(feature = "pkcs7")]
-mod asn1_views;
 #[cfg(any(feature = "secure-boot", feature = "tpm"))]
 pub mod authenticode;
 #[cfg(feature = "secure-boot")]
@@ -330,12 +328,12 @@ pub enum AuthError {
     ChainBuildingFailed,
 }
 
-/// ASN.1 parse failures are certificate-structure errors. Boundaries that
-/// need `InvalidHeader` (PKCS#7/SPC framing, WIN_CERTIFICATE trim) map
-/// explicitly at their call sites instead of using this impl.
+/// DER decode failures are certificate-structure errors. Boundaries that
+/// need `InvalidHeader` (PKCS#7/SPC framing) map explicitly at their call
+/// sites instead of using this impl.
 #[cfg(feature = "pkcs7")]
-impl From<asn1::ParseError> for AuthError {
-    fn from(_: asn1::ParseError) -> Self {
+impl From<crabefi_pkcs7::der::DecodeError> for AuthError {
+    fn from(_: crabefi_pkcs7::der::DecodeError) -> Self {
         AuthError::CertificateParseError
     }
 }
