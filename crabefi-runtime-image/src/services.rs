@@ -5,11 +5,12 @@ use core::ffi::c_void;
 use crabefi_efi_types::{authentication::validate_signature_database, secure_boot};
 use crabefi_runtime_abi::{
     BridgeRequest, MAX_VARIABLE_DATA_SIZE, MAX_VARIABLE_NAME_LEN, VariableTimestamp,
-    bridge_operation, capsule, phase, time_mechanism,
+    bridge_operation, capsule, time_mechanism,
 };
 
 use crate::{
-    arch, deferred, efi, state,
+    arch, deferred, efi,
+    state::{self, Phase},
     store::{VariableStore, VariableTransaction},
     svam,
 };
@@ -54,7 +55,7 @@ pub extern "efiapi" fn get_time(
     if time.is_null() {
         return efi::Status::INVALID_PARAMETER;
     }
-    let lease = match state::try_lease() {
+    let lease = match state::lease() {
         Ok(lease) => lease,
         Err(status) => return status,
     };
@@ -128,10 +129,10 @@ pub extern "efiapi" fn convert_pointer(
             efi::Status::INVALID_PARAMETER
         };
     }
-    if state::phase_value() != phase::VIRTUAL {
+    if Phase::current() != Phase::Virtual {
         return efi::Status::NOT_STARTED;
     }
-    let lease = match state::try_lease() {
+    let lease = match state::lease() {
         Ok(lease) => lease,
         Err(status) => return status,
     };
@@ -186,7 +187,7 @@ pub extern "efiapi" fn get_variable(
     };
     // SAFETY: vendor_guid is non-null and UEFI guarantees readable GUID storage.
     let guid = *unsafe { vendor_guid.read() }.as_bytes();
-    let lease = match state::try_lease() {
+    let lease = match state::lease() {
         Ok(lease) => lease,
         Err(status) => return status,
     };
@@ -208,7 +209,7 @@ pub extern "efiapi" fn get_variable(
             );
         }
     }
-    let runtime_only = lease.state().runtime_only();
+    let runtime_only = lease.phase().runtime();
     let Some(slot) = lease.variables().find(&guid, name.as_slice(), runtime_only) else {
         return efi::Status::NOT_FOUND;
     };
@@ -271,7 +272,7 @@ pub extern "efiapi" fn get_next_variable_name(
     };
     // SAFETY: non-null GUID input.
     let current_guid = *unsafe { vendor_guid.read() }.as_bytes();
-    let lease = match state::try_lease() {
+    let lease = match state::lease() {
         Ok(lease) => lease,
         Err(status) => return status,
     };
@@ -297,7 +298,7 @@ pub extern "efiapi" fn get_next_variable_name(
             vendor_guid,
         );
     }
-    let runtime_only = lease.state().runtime_only();
+    let runtime_only = lease.phase().runtime();
     let mut visible = lease.variables().visible_slots(runtime_only);
     let next = if current_guid == secure_boot::EFI_GLOBAL_VARIABLE_GUID
         && secure_boot::name_matches(current_name.as_slice(), secure_boot::SECURE_BOOT_NAME)
@@ -383,7 +384,7 @@ pub extern "efiapi" fn set_variable(
         // SAFETY: UEFI caller promises `data_size` readable bytes.
         unsafe { core::slice::from_raw_parts(data.cast::<u8>(), data_size) }
     };
-    let mut lease = match state::try_lease() {
+    let mut lease = match state::lease() {
         Ok(lease) => lease,
         Err(status) => return status,
     };
@@ -425,8 +426,8 @@ fn set_variable_locked(
     attributes: u32,
     input: &[u8],
 ) -> efi::Status {
-    let current_phase = state::phase_value();
-    if current_phase == phase::UNINITIALIZED {
+    let current_phase = lease.phase();
+    if matches!(current_phase, Phase::Uninitialized | Phase::Loaded) {
         return efi::Status::DEVICE_ERROR;
     }
     let bridge = lease.state().boot_bridge;
@@ -451,7 +452,7 @@ fn apply_variable(
     store: &mut VariableStore,
     transaction: &mut VariableTransaction,
     deferred_transaction: Option<&mut deferred::DeferredTransaction>,
-    current_phase: u8,
+    current_phase: Phase,
     bridge: u64,
     buffer: (*mut u8, usize),
     guid: [u8; 16],
@@ -467,7 +468,7 @@ fn apply_variable(
             && store
                 .find(&guid, name, false)
                 .is_some_and(|slot| slot.attributes & efi::VARIABLE_NON_VOLATILE != 0));
-    if current_phase != phase::BOOT_ACTIVE && nonvolatile {
+    if !current_phase.boot_services() && nonvolatile {
         if buffer.0.is_null() || buffer.1 == 0 {
             return efi::Status::UNSUPPORTED;
         }
@@ -525,7 +526,7 @@ fn apply_variable(
     }
     let append = attributes & efi::VARIABLE_APPEND_WRITE != 0;
     let delete = payload.is_empty() && !append;
-    if current_phase != phase::BOOT_ACTIVE {
+    if !current_phase.boot_services() {
         let existing = store.find(&guid, name, false);
         if delete {
             match existing {
@@ -557,7 +558,7 @@ fn apply_variable(
     }
 
     if prepared.attributes & efi::VARIABLE_NON_VOLATILE != 0 {
-        if current_phase == phase::BOOT_ACTIVE {
+        if current_phase.boot_services() {
             let request = BridgeRequest {
                 operation: if prepared.delete {
                     bridge_operation::PERSIST_DELETE
@@ -656,7 +657,7 @@ pub fn prepare_retained_staging(lease: &mut state::Lease) -> Result<(), efi::Sta
         store,
         transaction,
         None,
-        phase::BOOT_ACTIVE,
+        Phase::BootActive,
         bridge,
         buffer,
         guid,
@@ -720,7 +721,7 @@ pub fn replay_deferred(lease: &mut state::Lease) -> Result<usize, efi::Status> {
                 store,
                 transaction,
                 None,
-                phase::BOOT_ACTIVE,
+                Phase::BootActive,
                 bridge,
                 buffer,
                 record.guid.bytes,
@@ -774,10 +775,11 @@ pub extern "efiapi" fn update_capsule(
     if capsule_count > 1 {
         return efi::Status::UNSUPPORTED;
     }
-    if state::phase_value() == phase::BOOT_ACTIVE {
+    let phase = Phase::current();
+    if phase.boot_services() {
         return efi::Status::UNSUPPORTED;
     }
-    if state::phase_value() < phase::SEALED_PHYSICAL || scatter_gather_list == 0 {
+    if !phase.runtime() || scatter_gather_list == 0 {
         return efi::Status::INVALID_PARAMETER;
     }
     // SAFETY: one pointer entry is required by the validated count.
@@ -795,7 +797,7 @@ pub extern "efiapi" fn update_capsule(
         return efi::Status::INVALID_PARAMETER;
     }
 
-    let lease = match state::try_lease() {
+    let lease = match state::lease() {
         Ok(lease) => lease,
         Err(_) => return efi::Status::DEVICE_ERROR,
     };
@@ -859,7 +861,7 @@ pub extern "efiapi" fn query_capsule_capabilities(
     {
         return efi::Status::INVALID_PARAMETER;
     }
-    let lease = match state::try_lease() {
+    let lease = match state::lease() {
         Ok(lease) => lease,
         Err(status) => return status,
     };
@@ -893,7 +895,7 @@ pub extern "efiapi" fn query_variable_info(
     {
         return efi::Status::INVALID_PARAMETER;
     }
-    let lease = match state::try_lease() {
+    let lease = match state::lease() {
         Ok(lease) => lease,
         Err(status) => return status,
     };
@@ -1068,7 +1070,7 @@ mod tests {
         transaction: &mut VariableTransaction,
         deferred_transaction: &mut deferred::DeferredTransaction,
         buffer: &mut [u8],
-        current_phase: u8,
+        current_phase: Phase,
         variable: secure_boot::SecureBootVariable,
         attributes: u32,
         data: &[u8],
@@ -1106,7 +1108,7 @@ mod tests {
                     transaction,
                     deferred_transaction,
                     buffer,
-                    phase::BOOT_ACTIVE,
+                    Phase::BootActive,
                     variable,
                     RAW_ATTRIBUTES,
                     pk,
@@ -1150,7 +1152,7 @@ mod tests {
                     &mut store,
                     &mut transaction,
                     Some(&mut deferred_transaction),
-                    phase::BOOT_ACTIVE,
+                    Phase::BootActive,
                     successful_bridge as *const () as u64,
                     (buffer.as_mut_ptr(), buffer.len()),
                     guid,
@@ -1205,7 +1207,7 @@ mod tests {
                     &mut store,
                     &mut transaction,
                     Some(&mut deferred_transaction),
-                    phase::BOOT_ACTIVE,
+                    Phase::BootActive,
                     successful_bridge as *const () as u64,
                     (buffer.as_mut_ptr(), buffer.len()),
                     guid,
@@ -1224,7 +1226,7 @@ mod tests {
                 &mut store,
                 &mut transaction,
                 Some(&mut deferred_transaction),
-                phase::BOOT_ACTIVE,
+                Phase::BootActive,
                 successful_bridge as *const () as u64,
                 (buffer.as_mut_ptr(), buffer.len()),
                 guid,
@@ -1312,7 +1314,7 @@ mod tests {
                     &mut store,
                     &mut transaction,
                     None,
-                    phase::BOOT_ACTIVE,
+                    Phase::BootActive,
                     successful_bridge as *const () as u64,
                     (buffer.as_mut_ptr(), buffer.len()),
                     guid,
@@ -1425,7 +1427,7 @@ mod tests {
                 &mut transaction,
                 &mut deferred_transaction,
                 &mut buffer,
-                phase::BOOT_ACTIVE,
+                Phase::BootActive,
                 variable,
                 RAW_ATTRIBUTES,
                 include_bytes!("../tests/fixtures/pk.esl"),
@@ -1457,7 +1459,7 @@ mod tests {
     #[test]
     fn query_capsule_capabilities_validates_header_like_update_capsule() {
         let saved = {
-            let mut lease = state::try_lease().unwrap();
+            let mut lease = state::lease().unwrap();
             let runtime = lease.state_mut();
             let saved = (
                 runtime.deferred_buffer_physical,
@@ -1520,7 +1522,7 @@ mod tests {
         );
         assert_eq!(maximum, MAX_CAPSULE_SIZE);
         assert_eq!(reset_type, efi::RESET_WARM);
-        let mut lease = state::try_lease().unwrap();
+        let mut lease = state::lease().unwrap();
         let runtime = lease.state_mut();
         (
             runtime.deferred_buffer_physical,
@@ -1549,7 +1551,7 @@ mod tests {
                 &mut transaction,
                 &mut deferred_transaction,
                 &mut buffer,
-                phase::BOOT_ACTIVE,
+                Phase::BootActive,
                 secure_boot::SecureBootVariable::Kek,
                 AUTH_ATTRIBUTES,
                 include_bytes!("../tests/fixtures/unauthorized-update.bin"),
@@ -1590,7 +1592,7 @@ mod tests {
                     &mut transaction,
                     &mut deferred_transaction,
                     &mut buffer,
-                    phase::BOOT_ACTIVE,
+                    Phase::BootActive,
                     variable,
                     AUTH_ATTRIBUTES,
                     update,
@@ -1603,7 +1605,7 @@ mod tests {
                     &mut transaction,
                     &mut deferred_transaction,
                     &mut buffer,
-                    phase::BOOT_ACTIVE,
+                    Phase::BootActive,
                     variable,
                     AUTH_ATTRIBUTES,
                     update,
@@ -1616,7 +1618,7 @@ mod tests {
                     &mut transaction,
                     &mut deferred_transaction,
                     &mut buffer,
-                    phase::BOOT_ACTIVE,
+                    Phase::BootActive,
                     variable,
                     AUTH_ATTRIBUTES | efi::VARIABLE_APPEND_WRITE,
                     append,
@@ -1632,7 +1634,7 @@ mod tests {
                     &mut transaction,
                     &mut deferred_transaction,
                     &mut buffer,
-                    phase::BOOT_ACTIVE,
+                    Phase::BootActive,
                     variable,
                     AUTH_ATTRIBUTES,
                     delete,
@@ -1645,7 +1647,7 @@ mod tests {
                     &mut transaction,
                     &mut deferred_transaction,
                     &mut buffer,
-                    phase::BOOT_ACTIVE,
+                    Phase::BootActive,
                     variable,
                     AUTH_ATTRIBUTES,
                     delete,
@@ -1748,7 +1750,7 @@ mod tests {
                 &mut store,
                 &mut transaction,
                 Some(&mut deferred_transaction),
-                phase::SEALED_PHYSICAL,
+                Phase::SealedPhysical,
                 successful_bridge as *const () as u64,
                 (buffer.as_mut_ptr(), buffer.len()),
                 GUID,
@@ -1777,7 +1779,7 @@ mod tests {
                     &mut reboot_store,
                     &mut reboot_transaction,
                     None,
-                    phase::BOOT_ACTIVE,
+                    Phase::BootActive,
                     successful_bridge as *const () as u64,
                     (buffer.as_mut_ptr(), buffer.len()),
                     record.guid.bytes,
@@ -1829,7 +1831,7 @@ mod tests {
                 &mut transaction,
                 &mut deferred_transaction,
                 &mut buffer,
-                phase::SEALED_PHYSICAL,
+                Phase::SealedPhysical,
                 secure_boot::SecureBootVariable::Db,
                 AUTH_ATTRIBUTES,
                 include_bytes!("../tests/fixtures/db-update.bin"),
@@ -1856,7 +1858,7 @@ mod tests {
                     &mut reboot_store,
                     &mut reboot_transaction,
                     None,
-                    phase::BOOT_ACTIVE,
+                    Phase::BootActive,
                     successful_bridge as *const () as u64,
                     (buffer.as_mut_ptr(), buffer.len()),
                     record.guid.bytes,

@@ -7,13 +7,8 @@ pub const MAX_VARIABLES: usize = 64;
 pub const MAX_VARIABLE_NAME_LEN: usize = 64;
 pub const MAX_VARIABLE_DATA_SIZE: usize = 16 * 1024;
 pub const MAX_CONFIGURATION_TABLES: usize = 24;
-
-pub mod phase {
-    pub const UNINITIALIZED: u8 = 0;
-    pub const BOOT_ACTIVE: u8 = 1;
-    pub const SEALED_PHYSICAL: u8 = 2;
-    pub const VIRTUAL: u8 = 3;
-}
+/// Maximum runtime memory descriptors passed to `runtime_image_prepare_ebs`.
+pub const MAX_RUNTIME_DESCRIPTORS: usize = 32;
 
 pub mod time_mechanism {
     pub const UNSUPPORTED: u32 = 0;

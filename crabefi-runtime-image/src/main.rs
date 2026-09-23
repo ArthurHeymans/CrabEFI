@@ -33,9 +33,11 @@ pub static RUNTIME_IMAGE_FEATURE_BITS: u64 = crabefi_runtime_abi::feature_bits::
     };
 
 use crabefi_runtime_abi::{
-    ConfigurationRegistration, ConsoleRegistration, EsrtRegistration, MemoryDescriptor,
-    RelocationImport, RuntimeHandoff, VariableImport, phase,
+    ConfigurationRegistration, ConsoleRegistration, EsrtRegistration, MAX_RUNTIME_DESCRIPTORS,
+    MemoryDescriptor, RelocationImport, RuntimeHandoff, VariableImport,
 };
+
+use state::Phase;
 
 macro_rules! check_export_signatures {
     ($($field:ident: $symbol:ident => $signature:ty;)*) => {
@@ -69,94 +71,104 @@ fn crabefi_runtime_panic_is_possible() {
 #[cfg(all(not(test), not(target_os = "none")))]
 fn main() {}
 
-#[unsafe(no_mangle)]
-/// # Safety
-///
-/// `handoff` must point to an initialized, readable `RuntimeHandoff` for the
-/// duration of this call. Every nonzero address/length pair in the handoff must
-/// describe memory satisfying the runtime ABI contract.
-pub unsafe extern "C" fn runtime_image_init(handoff: *const RuntimeHandoff) -> usize {
-    if handoff.is_null() || state::phase_value() != phase::UNINITIALIZED {
-        return efi::Status::INVALID_PARAMETER.as_usize();
-    }
-    // SAFETY: the boot loader passes a readable handoff for this immediate call;
-    // RuntimeState copies every retained field and stores no reference to it.
-    let handoff = unsafe { &*handoff };
-    let mut lease = match state::try_lease() {
-        Ok(lease) => lease,
-        Err(status) => return status.as_usize(),
-    };
-    match lease.state_mut().initialize(handoff) {
-        Ok(()) => efi::Status::SUCCESS.as_usize(),
-        Err(status) => status.as_usize(),
-    }
+/// Status returned across the image boundary for an export's result.
+fn export_status(result: Result<(), efi::Status>) -> usize {
+    efi::status(result).as_usize()
 }
 
-#[unsafe(no_mangle)]
 /// # Safety
 ///
-/// `relocation` must point to an initialized, readable `RelocationImport` for
-/// the duration of this call.
+/// `handoff` must be null or point to an initialized, readable
+/// `RuntimeHandoff` for the duration of this call. Every nonzero
+/// address/length pair in the handoff must describe memory satisfying the
+/// runtime ABI contract.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn runtime_image_init(handoff: *const RuntimeHandoff) -> usize {
+    // SAFETY: RuntimeState copies every retained field and stores no reference.
+    export_status(init(unsafe { handoff.as_ref() }))
+}
+
+fn init(handoff: Option<&RuntimeHandoff>) -> Result<(), efi::Status> {
+    let handoff = handoff.ok_or(efi::Status::INVALID_PARAMETER)?;
+    let mut lease = state::lease_in(&[Phase::Uninitialized])?;
+    lease.state_mut().initialize(handoff)?;
+    lease.advance(Phase::Loaded);
+    Ok(())
+}
+
+/// # Safety
+///
+/// `relocation` must be null or point to an initialized, readable
+/// `RelocationImport` for the duration of this call.
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn runtime_image_import_relocation(
     relocation: *const RelocationImport,
 ) -> usize {
-    if relocation.is_null()
-        || !matches!(
-            state::phase_value(),
-            phase::UNINITIALIZED | phase::BOOT_ACTIVE
-        )
-    {
-        return efi::Status::INVALID_PARAMETER.as_usize();
-    }
-    let mut lease = match state::try_lease() {
-        Ok(lease) => lease,
-        Err(status) => return status.as_usize(),
-    };
-    if !lease.state().initialized {
-        return efi::Status::INVALID_PARAMETER.as_usize();
-    }
     // SAFETY: immediate boot export call; no pointer is retained.
-    match lease.state_mut().import_relocation(unsafe { &*relocation }) {
-        Ok(()) => efi::Status::SUCCESS.as_usize(),
-        Err(status) => status.as_usize(),
-    }
+    let relocation = unsafe { relocation.as_ref() };
+    export_status(
+        relocation
+            .ok_or(efi::Status::INVALID_PARAMETER)
+            .and_then(|relocation| {
+                state::lease_in(&[Phase::Loaded])?
+                    .state_mut()
+                    .import_relocation(relocation)
+            }),
+    )
 }
 
 #[unsafe(no_mangle)]
+pub extern "C" fn runtime_image_activate(boot_services: u64) -> usize {
+    export_status(activate(boot_services))
+}
+
+fn activate(boot_services: u64) -> Result<(), efi::Status> {
+    if boot_services == 0 {
+        return Err(efi::Status::INVALID_PARAMETER);
+    }
+    let mut lease = state::lease_in(&[Phase::Loaded])?;
+    let runtime = lease.state_mut();
+    let time_supported = services::time_is_supported(runtime.time.mechanism);
+    runtime.tables.initialize(boot_services, time_supported)?;
+    lease.advance(Phase::Importing);
+    Ok(())
+}
+
 /// # Safety
 ///
-/// `import` must point to an initialized, readable `VariableImport`. Its name
-/// and data address/length pairs must remain readable for the duration of this
-/// call and must not be concurrently mutated.
+/// `import` must be null or point to an initialized, readable
+/// `VariableImport`. Its name and data address/length pairs must remain
+/// readable for the duration of this call and must not be concurrently mutated.
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn runtime_image_import_variable(import: *const VariableImport) -> usize {
-    if import.is_null()
-        || !matches!(
-            state::phase_value(),
-            phase::UNINITIALIZED | phase::BOOT_ACTIVE
-        )
-    {
-        return efi::Status::INVALID_PARAMETER.as_usize();
-    }
     // SAFETY: immediate import call. Address/length records point to boot-owned
     // readable buffers for this call only and are copied into the image store.
-    let import = unsafe { &*import };
-    let name_len = match usize::try_from(import.name_len) {
-        Ok(length) if length != 0 && length <= crabefi_runtime_abi::MAX_VARIABLE_NAME_LEN => length,
-        _ => return efi::Status::INVALID_PARAMETER.as_usize(),
-    };
-    let data_len = match usize::try_from(import.data_len) {
-        Ok(length) if length <= crabefi_runtime_abi::MAX_VARIABLE_DATA_SIZE => length,
-        _ => return efi::Status::OUT_OF_RESOURCES.as_usize(),
-    };
+    export_status(unsafe { import_variable(import.as_ref()) })
+}
+
+/// # Safety
+///
+/// The name and data address/length pairs of `import` must be readable for
+/// the duration of this call.
+unsafe fn import_variable(import: Option<&VariableImport>) -> Result<(), efi::Status> {
+    let import = import.ok_or(efi::Status::INVALID_PARAMETER)?;
+    let name_len = usize::try_from(import.name_len)
+        .ok()
+        .filter(|length| (1..=crabefi_runtime_abi::MAX_VARIABLE_NAME_LEN).contains(length))
+        .ok_or(efi::Status::INVALID_PARAMETER)?;
+    let data_len = usize::try_from(import.data_len)
+        .ok()
+        .filter(|length| *length <= crabefi_runtime_abi::MAX_VARIABLE_DATA_SIZE)
+        .ok_or(efi::Status::OUT_OF_RESOURCES)?;
     if import.name_address == 0
         || !import
             .name_address
             .is_multiple_of(core::mem::align_of::<u16>() as u64)
         || (data_len != 0 && import.data_address == 0)
     {
-        return efi::Status::INVALID_PARAMETER.as_usize();
+        return Err(efi::Status::INVALID_PARAMETER);
     }
-    // SAFETY: lengths are ABI-bounded and the boot importer guarantees readable
+    // SAFETY: lengths are ABI-bounded and the caller guarantees readable
     // buffers for the duration of this direct call.
     let name = unsafe { core::slice::from_raw_parts(import.name_address as *const u16, name_len) };
     let data = if data_len == 0 {
@@ -165,260 +177,173 @@ pub unsafe extern "C" fn runtime_image_import_variable(import: *const VariableIm
         // SAFETY: same immediate-call contract as `name`.
         unsafe { core::slice::from_raw_parts(import.data_address as *const u8, data_len) }
     };
-    let mut lease = match state::try_lease() {
-        Ok(lease) => lease,
-        Err(status) => return status.as_usize(),
+    let timestamp = match import.timestamp_valid {
+        0 => None,
+        1 => Some(import.timestamp),
+        _ => return Err(efi::Status::INVALID_PARAMETER),
     };
-    if !lease.state().initialized {
-        return efi::Status::INVALID_PARAMETER.as_usize();
-    }
-    if lease.state().import_finished {
-        return efi::Status::UNSUPPORTED.as_usize();
-    }
-    if import.timestamp_valid > 1 {
-        return efi::Status::INVALID_PARAMETER.as_usize();
-    }
-    let timestamp = (import.timestamp_valid != 0).then_some(import.timestamp);
+    let mut lease = state::lease_in(&[Phase::Importing])?;
     let (store, transaction) = lease.variables_mut();
-    match store.import(
+    store.import(
         transaction,
         import.guid,
         name,
         import.attributes,
         data,
         timestamp,
-    ) {
-        Ok(()) => efi::Status::SUCCESS.as_usize(),
-        Err(status) => status.as_usize(),
-    }
-}
-
-/// Lease the state for a boot-side import-stage operation.
-fn import_lease() -> Result<state::Lease, efi::Status> {
-    if !matches!(
-        state::phase_value(),
-        phase::UNINITIALIZED | phase::BOOT_ACTIVE
-    ) {
-        return Err(efi::Status::UNSUPPORTED);
-    }
-    let lease = state::try_lease()?;
-    if !lease.state().initialized || lease.state().import_finished {
-        return Err(efi::Status::INVALID_PARAMETER);
-    }
-    Ok(lease)
+    )
 }
 
 /// Initialize retained staging and publish its capsule pointer.
 #[unsafe(no_mangle)]
 pub extern "C" fn runtime_image_prepare_retained_staging() -> usize {
-    match import_lease().and_then(|mut lease| services::prepare_retained_staging(&mut lease)) {
-        Ok(()) => efi::Status::SUCCESS.as_usize(),
-        Err(status) => status.as_usize(),
-    }
+    export_status(
+        state::lease_in(&[Phase::Importing])
+            .and_then(|mut lease| services::prepare_retained_staging(&mut lease)),
+    )
 }
 
 /// Replay and durably consume retained deferred writes.
 #[unsafe(no_mangle)]
 pub extern "C" fn runtime_image_replay_deferred() -> usize {
-    match import_lease().and_then(|mut lease| services::replay_deferred(&mut lease)) {
-        Ok(_) => efi::Status::SUCCESS.as_usize(),
-        Err(status) => status.as_usize(),
-    }
+    export_status(
+        state::lease_in(&[Phase::Importing])
+            .and_then(|mut lease| services::replay_deferred(&mut lease).map(drop)),
+    )
 }
 
 /// Confirm that boot can consume staged capsules and persist their results.
 #[unsafe(no_mangle)]
 pub extern "C" fn runtime_image_enable_capsule_delivery() -> usize {
-    match import_lease() {
-        Ok(mut lease) => {
-            lease.state_mut().capsule_delivery_enabled = true;
-            efi::Status::SUCCESS.as_usize()
-        }
-        Err(status) => status.as_usize(),
-    }
+    export_status(state::lease_in(&[Phase::Importing]).map(|mut lease| {
+        lease.state_mut().capsule_delivery_enabled = true;
+    }))
 }
 
 /// Derive final policy and reject all subsequent boot imports.
 #[unsafe(no_mangle)]
 pub extern "C" fn runtime_image_complete_import() -> usize {
-    match import_lease() {
-        Ok(mut lease) => {
-            let (store, _) = lease.variables_mut();
-            store.refresh_policy();
-            lease.state_mut().import_finished = true;
-            efi::Status::SUCCESS.as_usize()
-        }
-        Err(status) => status.as_usize(),
-    }
+    export_status(state::lease_in(&[Phase::Importing]).map(|mut lease| {
+        lease.variables_mut().0.refresh_policy();
+        lease.advance(Phase::BootActive);
+    }))
 }
 
-#[unsafe(no_mangle)]
-pub extern "C" fn runtime_image_activate(boot_services: u64) -> usize {
-    if state::phase_value() != phase::UNINITIALIZED || boot_services == 0 {
-        return efi::Status::INVALID_PARAMETER.as_usize();
-    }
-    let mut lease = match state::try_lease() {
-        Ok(lease) => lease,
-        Err(status) => return status.as_usize(),
-    };
-    let runtime = lease.state_mut();
-    if !runtime.initialized {
-        return efi::Status::INVALID_PARAMETER.as_usize();
-    }
-    let time_supported = services::time_is_supported(runtime.time.mechanism);
-    if let Err(status) = runtime.tables.initialize(boot_services, time_supported) {
-        return status.as_usize();
-    }
-    drop(lease);
-    match state::set_phase(phase::UNINITIALIZED, phase::BOOT_ACTIVE) {
-        Ok(()) => efi::Status::SUCCESS.as_usize(),
-        Err(status) => status.as_usize(),
-    }
-}
-
-#[unsafe(no_mangle)]
 /// # Safety
 ///
-/// `registration` must point to an initialized, readable registration value
-/// for the duration of this call.
+/// `registration` must be null or point to an initialized, readable
+/// registration value for the duration of this call.
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn runtime_image_register_configuration(
     registration: *const ConfigurationRegistration,
 ) -> usize {
-    if registration.is_null() {
-        return efi::Status::INVALID_PARAMETER.as_usize();
-    }
-    let mut lease = match state::try_lease_phase(phase::BOOT_ACTIVE) {
-        Ok(lease) => lease,
-        Err(status) => return status.as_usize(),
-    };
     // SAFETY: immediate value-only registration call.
-    match lease.state_mut().tables.install(unsafe { *registration }) {
-        Ok(()) => efi::Status::SUCCESS.as_usize(),
-        Err(status) => status.as_usize(),
-    }
+    let registration = unsafe { registration.as_ref() };
+    export_status(
+        registration
+            .ok_or(efi::Status::INVALID_PARAMETER)
+            .and_then(|registration| {
+                state::lease_in(Phase::BOOT_SERVICES)?
+                    .state_mut()
+                    .tables
+                    .install(*registration)
+            }),
+    )
 }
 
-#[unsafe(no_mangle)]
 /// # Safety
 ///
-/// `registration` must point to an initialized, readable registration value
-/// for the duration of this call.
+/// `registration` must be null or point to an initialized, readable
+/// registration value for the duration of this call.
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn runtime_image_set_console(
     registration: *const ConsoleRegistration,
 ) -> usize {
-    if registration.is_null() {
-        return efi::Status::INVALID_PARAMETER.as_usize();
-    }
-    let mut lease = match state::try_lease_phase(phase::BOOT_ACTIVE) {
-        Ok(lease) => lease,
-        Err(status) => return status.as_usize(),
-    };
     // SAFETY: immediate value-only registration call.
-    match lease
-        .state_mut()
-        .tables
-        .set_console(unsafe { *registration })
-    {
-        Ok(()) => efi::Status::SUCCESS.as_usize(),
-        Err(status) => status.as_usize(),
-    }
+    let registration = unsafe { registration.as_ref() };
+    export_status(
+        registration
+            .ok_or(efi::Status::INVALID_PARAMETER)
+            .and_then(|registration| {
+                state::lease_in(Phase::BOOT_SERVICES)?
+                    .state_mut()
+                    .tables
+                    .set_console(*registration)
+            }),
+    )
 }
 
-#[unsafe(no_mangle)]
 /// # Safety
 ///
-/// `registration` must point to an initialized, readable registration value
-/// for the duration of this call.
+/// `registration` must be null or point to an initialized, readable
+/// registration value for the duration of this call.
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn runtime_image_install_esrt(
     registration: *const EsrtRegistration,
 ) -> usize {
-    if registration.is_null() {
-        return efi::Status::INVALID_PARAMETER.as_usize();
-    }
-    let mut lease = match state::try_lease_phase(phase::BOOT_ACTIVE) {
-        Ok(lease) => lease,
-        Err(status) => return status.as_usize(),
-    };
     // SAFETY: immediate value-only registration call.
-    match lease
-        .state_mut()
-        .tables
-        .install_esrt(unsafe { *registration })
-    {
-        Ok(()) => efi::Status::SUCCESS.as_usize(),
-        Err(status) => status.as_usize(),
-    }
+    let registration = unsafe { registration.as_ref() };
+    export_status(
+        registration
+            .ok_or(efi::Status::INVALID_PARAMETER)
+            .and_then(|registration| {
+                state::lease_in(Phase::BOOT_SERVICES)?
+                    .state_mut()
+                    .tables
+                    .install_esrt(*registration)
+            }),
+    )
 }
 
-#[unsafe(no_mangle)]
 /// # Safety
 ///
 /// `descriptors` must point to `descriptor_count` initialized, readable memory
 /// descriptors for the duration of this call.
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn runtime_image_prepare_ebs(
     descriptors: *const MemoryDescriptor,
     descriptor_count: usize,
 ) -> usize {
-    if descriptors.is_null() || descriptor_count > 32 {
+    if descriptors.is_null() || descriptor_count > MAX_RUNTIME_DESCRIPTORS {
         return efi::Status::INVALID_PARAMETER.as_usize();
     }
-    let mut lease = match state::try_lease_phase(phase::BOOT_ACTIVE) {
-        Ok(lease) => lease,
-        Err(status) => return status.as_usize(),
-    };
-    // SAFETY: boot allocator supplies exactly descriptor_count initialized
-    // descriptors for this allocation-free immediate call.
+    // SAFETY: the boot allocator supplies exactly `descriptor_count`
+    // initialized descriptors for this allocation-free immediate call.
     let descriptors = unsafe { core::slice::from_raw_parts(descriptors, descriptor_count) };
-    let runtime = lease.state_mut();
-    let sections = runtime.sections;
-    let ranges = runtime.ranges;
-    let Some(sections) = sections.get(..runtime.section_count) else {
-        return efi::Status::DEVICE_ERROR.as_usize();
-    };
-    let Some(ranges) = ranges.get(..runtime.range_count) else {
-        return efi::Status::DEVICE_ERROR.as_usize();
-    };
-    match runtime
-        .tables
-        .prepare_memory_attributes(descriptors, sections, ranges)
-    {
-        Ok(()) => efi::Status::SUCCESS.as_usize(),
-        Err(status) => status.as_usize(),
-    }
+    export_status(state::lease_in(Phase::BOOT_SERVICES).and_then(|mut lease| {
+        let runtime = lease.state_mut();
+        let sections = runtime
+            .sections
+            .get(..runtime.section_count)
+            .ok_or(efi::Status::DEVICE_ERROR)?;
+        runtime
+            .tables
+            .prepare_memory_attributes(descriptors, sections)
+    }))
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn runtime_image_seal() -> usize {
-    let mut lease = match state::try_lease_phase(phase::BOOT_ACTIVE) {
-        Ok(lease) => lease,
-        Err(status) => return status.as_usize(),
-    };
-    let runtime = lease.state_mut();
-    runtime.tables.seal();
-    runtime.boot_bridge = 0;
-    drop(lease);
-    match state::set_phase(phase::BOOT_ACTIVE, phase::SEALED_PHYSICAL) {
-        Ok(()) => efi::Status::SUCCESS.as_usize(),
-        Err(status) => status.as_usize(),
-    }
+    export_status(state::lease_in(Phase::BOOT_SERVICES).map(|mut lease| {
+        let runtime = lease.state_mut();
+        runtime.tables.seal();
+        runtime.boot_bridge = 0;
+        lease.advance(Phase::SealedPhysical);
+    }))
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn runtime_image_get_runtime_services() -> u64 {
-    let lease = match state::try_lease() {
-        Ok(lease) => lease,
-        Err(_) => return 0,
-    };
-    core::ptr::addr_of!(lease.state().tables.runtime) as u64
+    state::lease().map_or(0, |lease| {
+        core::ptr::addr_of!(lease.state().tables.runtime) as u64
+    })
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn runtime_image_get_system_table() -> u64 {
-    let lease = match state::try_lease() {
-        Ok(lease) => lease,
-        Err(_) => return 0,
-    };
-    core::ptr::addr_of!(lease.state().tables.system) as u64
+    state::lease().map_or(0, |lease| {
+        core::ptr::addr_of!(lease.state().tables.system) as u64
+    })
 }
 
 #[cfg(test)]
@@ -435,15 +360,15 @@ mod tests {
             efi::Status::DEVICE_ERROR.as_usize()
         }
         let _guard = RUNTIME_TEST.lock().unwrap();
-        state::set_phase(phase::UNINITIALIZED, phase::BOOT_ACTIVE).unwrap();
         {
-            let mut lease = state::try_lease().unwrap();
+            let mut lease = state::lease().unwrap();
+            lease.advance(Phase::BootActive);
             lease.state_mut().boot_bridge = boot_only as *const () as u64;
         }
         assert_eq!(runtime_image_seal(), efi::Status::SUCCESS.as_usize());
-        assert_eq!(state::phase_value(), phase::SEALED_PHYSICAL);
+        assert_eq!(Phase::current(), Phase::SealedPhysical);
         {
-            let lease = state::try_lease().unwrap();
+            let lease = state::lease().unwrap();
             assert_eq!(lease.state().boot_bridge, 0);
             assert!(lease.state().tables.system.boot_services.is_null());
         }
@@ -461,7 +386,7 @@ mod tests {
         );
         assert_ne!(status, efi::Status::SUCCESS);
         assert_eq!(CALLS.load(Ordering::Relaxed), 0);
-        state::set_phase(phase::SEALED_PHYSICAL, phase::UNINITIALIZED).unwrap();
+        state::lease().unwrap().advance(Phase::Uninitialized);
     }
 
     #[test]

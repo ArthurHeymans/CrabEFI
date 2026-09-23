@@ -902,8 +902,8 @@ pub fn install_memory_attributes_table() {}
 /// Refresh image-owned MAT storage from the final allocator map in place.
 pub fn rebuild_memory_attributes_table_in_place() -> efi::Status {
     use super::allocator::{self, MemoryDescriptor, MemoryType};
-    let mut descriptors =
-        [MemoryDescriptor::new(MemoryType::ReservedMemoryType as u32, 0, 0, 0); 32];
+    let mut descriptors = [MemoryDescriptor::new(MemoryType::ReservedMemoryType as u32, 0, 0, 0);
+        crabefi_runtime_abi::MAX_RUNTIME_DESCRIPTORS];
     let count = match allocator::copy_runtime_descriptors(&mut descriptors) {
         Ok(count) => count,
         Err(status) => {

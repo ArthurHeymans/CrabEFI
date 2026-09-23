@@ -10,6 +10,14 @@ pub const VARIABLE_KNOWN_ATTRIBUTES: u32 = VARIABLE_NON_VOLATILE
     | VARIABLE_TIME_BASED_AUTHENTICATED_WRITE_ACCESS
     | VARIABLE_APPEND_WRITE;
 
+/// Collapse an internal result into the status returned at an ABI boundary.
+pub fn status(result: Result<(), Status>) -> Status {
+    match result {
+        Ok(()) => Status::SUCCESS,
+        Err(status) => status,
+    }
+}
+
 // Kept for the bounded store, which deliberately does not otherwise depend on
 // the Runtime Services status spelling.
 pub const INVALID_PARAMETER: Status = Status::INVALID_PARAMETER;
