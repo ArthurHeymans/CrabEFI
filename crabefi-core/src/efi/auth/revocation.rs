@@ -14,12 +14,50 @@
 //! is CRL/dbx only.
 
 use super::AuthError;
-use super::asn1_views;
+use super::crypto::parse_cert_view;
 use alloc::string::String;
 use alloc::vec::Vec;
+use crabefi_pkcs7::der::{DecodeError, Reader, Tlv, tag};
+use crabefi_pkcs7::time::DateTime;
+use crabefi_pkcs7::x509::Extensions;
 
-// Local CRL reason codes (previously re-exported from x509_cert).
-pub use super::asn1_views::CrlReason;
+/// CRL distribution points extension: 2.5.29.31
+const OID_CRL_DISTRIBUTION_POINTS: &[u8] = &[0x55, 0x1d, 0x1f];
+/// CRL reason code entry extension: 2.5.29.21
+const OID_CRL_REASON: &[u8] = &[0x55, 0x1d, 0x15];
+
+/// CRL reason codes (RFC 5280 5.3.1)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CrlReason {
+    Unspecified = 0,
+    KeyCompromise = 1,
+    CaCompromise = 2,
+    AffiliationChanged = 3,
+    Superseded = 4,
+    CessationOfOperation = 5,
+    CertificateHold = 6,
+    RemoveFromCrl = 8,
+    PrivilegeWithdrawn = 9,
+    AaCompromise = 10,
+}
+
+impl CrlReason {
+    pub fn from_u32(value: u32) -> Option<Self> {
+        match value {
+            0 => Some(CrlReason::Unspecified),
+            1 => Some(CrlReason::KeyCompromise),
+            2 => Some(CrlReason::CaCompromise),
+            3 => Some(CrlReason::AffiliationChanged),
+            4 => Some(CrlReason::Superseded),
+            5 => Some(CrlReason::CessationOfOperation),
+            6 => Some(CrlReason::CertificateHold),
+            8 => Some(CrlReason::RemoveFromCrl),
+            9 => Some(CrlReason::PrivilegeWithdrawn),
+            10 => Some(CrlReason::AaCompromise),
+            _ => None,
+        }
+    }
+}
 
 // ============================================================================
 // CRL (Certificate Revocation List) Support
@@ -75,25 +113,52 @@ pub struct CrlDistributionPoint {
 pub fn extract_crl_distribution_points(
     cert_der: &[u8],
 ) -> Result<Vec<CrlDistributionPoint>, AuthError> {
-    let cert = asn1_views::parse_cert_view(cert_der)?;
-    let Some(extensions_der) = cert.extensions_der else {
+    let cert = parse_cert_view(cert_der)?;
+    let Some(extension) = cert.extensions.find(OID_CRL_DISTRIBUTION_POINTS) else {
         return Ok(Vec::new());
     };
-    let Some(value) =
-        asn1_views::find_extension(extensions_der, asn1_views::OID_CRL_DISTRIBUTION_POINTS)?
-    else {
-        return Ok(Vec::new());
-    };
-    asn1_views::extract_crl_uris(value)?
+    extract_crl_uris(extension.value)?
         .into_iter()
         .map(|uri| {
-            core::str::from_utf8(&uri)
+            core::str::from_utf8(uri)
                 .map(|s| CrlDistributionPoint {
                     uri: String::from(s),
                 })
                 .map_err(|_| AuthError::CertificateParseError)
         })
         .collect()
+}
+
+/// Extract CRL distribution-point URIs (context [6] IA5String) from a
+/// CRLDP extension value. Diagnostic only; the firmware cannot fetch.
+fn extract_crl_uris(ext_value: &[u8]) -> Result<Vec<&[u8]>, DecodeError> {
+    let mut uris = Vec::new();
+    for distribution_point in Tlv::parse(ext_value)?.contents(tag::SEQUENCE)? {
+        collect_uris(distribution_point?.value, &mut uris, 0)?;
+    }
+    Ok(uris)
+}
+
+/// Maximum GeneralName nesting accepted below a DistributionPoint. Real
+/// encodings need two levels ([0] distributionPoint -> [0] fullName ->
+/// [6] URI); the bound keeps hostile input off the firmware call stack.
+const MAX_URI_DEPTH: u8 = 4;
+
+/// Collect every GeneralName UniformResourceIdentifier ([6] IMPLICIT
+/// IA5String) found by walking constructed elements.
+fn collect_uris<'a>(data: &'a [u8], out: &mut Vec<&'a [u8]>, depth: u8) -> Result<(), DecodeError> {
+    if depth > MAX_URI_DEPTH {
+        return Err(DecodeError);
+    }
+    for element in Reader::new(data) {
+        let element = element?;
+        if element.tag == tag::context(6) {
+            out.push(element.value);
+        } else if tag::is_constructed(element.tag) {
+            collect_uris(element.value, out, depth + 1)?;
+        }
+    }
+    Ok(())
 }
 
 /// Parse a DER-encoded CRL into the cached representation.
@@ -107,28 +172,92 @@ pub fn parse_crl(crl_der: &[u8]) -> Result<CertificateRevocationList, AuthError>
         return Err(AuthError::InvalidHeader);
     }
 
-    let crl = asn1_views::parse_crl_view(crl_der, MAX_REVOKED_CERTS)?;
+    let mut crl = Tlv::parse(crl_der)?.contents(tag::SEQUENCE)?;
+    let tbs = crl.read_tag(tag::SEQUENCE)?;
+    // signatureAlgorithm + signatureValue (structure only; CRLs are trusted
+    // via their dbx/file source).
+    crl.read()?;
+    crl.read()?;
+    crl.finish()?;
 
-    let revoked_certificates = crl
-        .revoked
-        .iter()
-        .map(|rc| RevokedCertificate {
-            serial_number: rc.serial.to_vec(),
-            revocation_date: rc.revocation_date,
-            reason: rc.reason,
-        })
-        .collect::<Vec<_>>();
+    let mut fields = Reader::new(tbs.value);
+    fields.read_optional(tag::INTEGER)?;
+    fields.read()?;
+    let issuer = fields.read()?.encoded.to_vec();
+    let this_update = DateTime::parse(fields.read()?)?.unix_timestamp();
+    let next_update = match fields.peek_tag() {
+        Some(tag::UTC_TIME | tag::GENERALIZED_TIME) => {
+            Some(DateTime::parse(fields.read()?)?.unix_timestamp())
+        }
+        _ => None,
+    };
+    let mut revoked_certificates = Vec::new();
+    if !fields.is_empty() && fields.peek_tag() != Some(tag::context_constructed(0)) {
+        for entry in fields.read()?.contents(tag::SEQUENCE)? {
+            let entry = entry?;
+            // Keep walking past the cap so the whole list stays validated.
+            if revoked_certificates.len() < MAX_REVOKED_CERTS {
+                revoked_certificates.push(parse_revoked_entry(entry)?);
+            }
+        }
+    }
+    // Optional [0] EXPLICIT CRL extensions (e.g. CRL number): skipped.
+    fields.read_optional(tag::context_constructed(0))?;
+    fields.finish()?;
 
     if revoked_certificates.len() >= MAX_REVOKED_CERTS {
         log::warn!("CRL contains too many revoked certificates, truncated");
     }
 
     Ok(CertificateRevocationList {
-        issuer: crl.issuer_der.to_vec(),
-        this_update: crl.this_update,
-        next_update: crl.next_update,
+        issuer,
+        this_update,
+        next_update,
         revoked_certificates,
     })
+}
+
+fn parse_revoked_entry(entry: Tlv<'_>) -> Result<RevokedCertificate, DecodeError> {
+    let mut fields = entry.contents(tag::SEQUENCE)?;
+    let serial_number = fields.read()?.unsigned_integer()?.to_vec();
+    let revocation_date = DateTime::parse(fields.read()?)?.unix_timestamp();
+    let reason = fields
+        .read_optional(tag::SEQUENCE)?
+        .map(|extensions| crl_reason(Extensions::parse(extensions)?))
+        .transpose()?
+        .flatten();
+    fields.finish()?;
+    Ok(RevokedCertificate {
+        serial_number,
+        revocation_date,
+        reason,
+    })
+}
+
+/// First recognised cRLReason among the entry extensions.
+fn crl_reason(extensions: Extensions<'_>) -> Result<Option<CrlReason>, DecodeError> {
+    for extension in extensions.iter() {
+        if extension.oid != OID_CRL_REASON {
+            continue;
+        }
+        let enumerated = Tlv::parse(extension.value)?.expect(tag::ENUMERATED)?;
+        // ENUMERATED shares the INTEGER encoding rules.
+        let code = Tlv {
+            tag: tag::INTEGER,
+            ..enumerated
+        }
+        .unsigned_integer()?;
+        if code.len() > size_of::<u32>() {
+            return Err(DecodeError);
+        }
+        let code = code
+            .iter()
+            .fold(0u32, |code, byte| (code << 8) | u32::from(*byte));
+        if let Some(reason) = CrlReason::from_u32(code) {
+            return Ok(Some(reason));
+        }
+    }
+    Ok(None)
 }
 
 // ============================================================================
@@ -263,7 +392,7 @@ pub fn check_crl_revocation(
     cert_der: &[u8],
     crl: &CertificateRevocationList,
 ) -> RevocationCheckResult {
-    let cert = match asn1_views::parse_cert_view(cert_der) {
+    let cert = match parse_cert_view(cert_der) {
         Ok(c) => c,
         Err(_) => return RevocationCheckResult::Unknown,
     };
@@ -305,8 +434,8 @@ pub fn check_certificate_revocation(
     }
 
     // Get the issuer name for CRL lookup
-    let issuer_name = match asn1_views::parse_cert_view(issuer_der) {
-        Ok(c) => c.subject_der.to_vec(),
+    let issuer_name = match parse_cert_view(issuer_der) {
+        Ok(c) => c.subject.to_vec(),
         Err(_) => return RevocationCheckResult::Unknown,
     };
 
@@ -391,8 +520,57 @@ mod tests {
     use super::*;
 
     #[test]
+    fn crl_reason_round_trips() {
+        assert_eq!(CrlReason::from_u32(1), Some(CrlReason::KeyCompromise));
+        assert_eq!(CrlReason::from_u32(7), None);
+        assert_eq!(CrlReason::from_u32(10), Some(CrlReason::AaCompromise));
+    }
+
+    #[test]
+    fn crl_reason_skips_other_entry_extensions() {
+        // invalidityDate (2.5.29.24) with a GeneralizedTime, then
+        // cRLReasons (2.5.29.21) = keyCompromise.
+        let extensions = [
+            0x30, 0x26, //
+            0x30, 0x15, 0x06, 0x03, 0x55, 0x1d, 0x18, 0x04, 0x0e, 0x18, 0x0c, b'2', b'0', b'2',
+            b'4', b'0', b'1', b'0', b'1', b'0', b'0', b'0', b'0', //
+            0x30, 0x0d, 0x06, 0x03, 0x55, 0x1d, 0x15, 0x01, 0x01, 0xff, 0x04, 0x03, 0x0a, 0x01,
+            0x01,
+        ];
+        let parse = |bytes| Extensions::parse(Tlv::parse(bytes).unwrap()).unwrap();
+        assert_eq!(
+            crl_reason(parse(&extensions)),
+            Ok(Some(CrlReason::KeyCompromise))
+        );
+        let mut invalidity_only = extensions[..0x19].to_vec();
+        invalidity_only[1] = 0x17;
+        assert_eq!(crl_reason(parse(&invalidity_only)), Ok(None));
+    }
+
+    #[test]
+    fn crl_uri_nesting_is_bounded() {
+        // DistributionPoint { [0] { [0] { [6] "u" } } }: valid shape.
+        let dp = [0x30, 0x07, 0xa0, 0x05, 0xa0, 0x03, 0x86, 0x01, b'u'];
+        let mut ext = alloc::vec![0x30, dp.len() as u8];
+        ext.extend_from_slice(&dp);
+        assert_eq!(extract_crl_uris(&ext).unwrap(), alloc::vec![&b"u"[..]]);
+        // Wrap the URI in more constructed layers than allowed.
+        let mut nested = alloc::vec![0x86, 0x01, b'u'];
+        for _ in 0..=MAX_URI_DEPTH {
+            let mut wrapped = alloc::vec![0xa0, nested.len() as u8];
+            wrapped.extend_from_slice(&nested);
+            nested = wrapped;
+        }
+        let mut deep_dp = alloc::vec![0x30, nested.len() as u8];
+        deep_dp.extend_from_slice(&nested);
+        let mut deep = alloc::vec![0x30, deep_dp.len() as u8];
+        deep.extend_from_slice(&deep_dp);
+        assert!(extract_crl_uris(&deep).is_err());
+    }
+
+    #[test]
     fn test_crl_reason_values() {
-        // Verify the x509_cert CrlReason enum has expected values
+        // Discriminants are the RFC 5280 reason codes.
         assert_eq!(CrlReason::Unspecified as u32, 0);
         assert_eq!(CrlReason::KeyCompromise as u32, 1);
         assert_eq!(CrlReason::CessationOfOperation as u32, 5);

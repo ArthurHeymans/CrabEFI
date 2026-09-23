@@ -41,14 +41,15 @@ EBS. EFI time comparison, signature-list structures, and Secure Boot variable
 names/GUIDs are single-sourced in `crabefi-efi-types` on both sides of the image
 boundary.
 
-Certificate verification remains intentionally split by execution domain. The
-runtime image's authenticated-variable path uses a hand-rolled PKCS#7/X.509
-parser and stack-backed schoolbook Montgomery RSA exponentiation over fixed
-`[u64; 64]` buffers (no allocator; worst frame ~4 KiB against the 16 KiB
-link-time stack budget). Signed-data
-hashing is incremental, so the runtime image requires no global allocator;
-boot parses CMS/X.509 on the minimal `asn1` crate (`efi::auth::asn1_views`)
-and verifies RSA with the `rsa` crate. Neither path enforces certificate `notBefore`/`notAfter`,
+Certificate verification shares one allocation-free implementation,
+`crabefi-pkcs7`: DER, X.509 and PKCS#7 `SignedData` views plus RSA PKCS#1 v1.5
+SHA-256 verification with stack-backed schoolbook Montgomery exponentiation
+(worst runtime frame ~4 KiB against the 16 KiB link-time stack budget). Each
+side keeps its own policy on top: the runtime image's authenticated-variable
+policy lives in `crabefi-runtime-image/src/auth/crypto.rs`, and boot's chain
+building, revocation and Authenticode policy in `efi::auth`. Signed-data
+hashing is incremental, so the runtime image requires no global allocator.
+Neither path enforces certificate `notBefore`/`notAfter` for Secure Boot,
 preserving the old `check_validity_period = false` policy and matching EDK2 and
 U-Boot.
 

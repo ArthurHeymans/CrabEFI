@@ -1,7 +1,7 @@
 //! Capsule Signature Verification
 //!
-//! Verifies PKCS#7 signatures on FMP capsule update images using the
-//! existing RustCrypto infrastructure from `efi::auth`.
+//! Verifies PKCS#7 signatures on FMP capsule update images with the
+//! `efi::auth` chain-building verifier.
 //!
 //! # Trust Model
 //!

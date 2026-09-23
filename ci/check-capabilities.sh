@@ -39,8 +39,8 @@ if grep -E '^rflasher-' "$TMP/capsule-tree"; then
     exit 1
 fi
 
-# CMS/X.509 parsing lives in the minimal asn1-crate port. The legacy
-# cms/x509-cert framework must not re-enter through any capability.
+# CMS/X.509 parsing lives in crabefi-pkcs7. The legacy cms/x509-cert
+# framework must not re-enter through any capability.
 for features in secure-boot capsule-update; do
     cargo tree --locked -p crabefi-core --target x86_64-unknown-none --no-default-features \
         --features "$features" --edges normal --prefix none > "$TMP/auth-tree"
