@@ -158,6 +158,7 @@ const _: () = assert!(core::mem::size_of::<efi::Time>() == core::mem::size_of::<
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::efi::VariableAttributes;
     use crate::store::{VariableStore, VariableTransaction};
     use crabefi_efi_types::secure_boot::{
         DB_NAME, EFI_GLOBAL_VARIABLE_GUID, EFI_IMAGE_SECURITY_DATABASE_GUID, KEK_NAME, PK_NAME,
@@ -167,6 +168,7 @@ mod tests {
         | efi::VARIABLE_BOOTSERVICE_ACCESS
         | efi::VARIABLE_RUNTIME_ACCESS
         | efi::VARIABLE_TIME_BASED_AUTHENTICATED_WRITE_ACCESS;
+    const STORE_ATTRIBUTES: VariableAttributes = VariableAttributes::from_bits_retain(ATTRIBUTES);
 
     fn setup_envelope(year: u16, payload: &[u8]) -> Vec<u8> {
         let timestamp = EfiTime {
@@ -203,7 +205,7 @@ mod tests {
                 &mut transaction,
                 global,
                 PK_NAME,
-                ATTRIBUTES,
+                STORE_ATTRIBUTES,
                 include_bytes!("../../tests/fixtures/pk.esl"),
                 None,
             )
@@ -234,7 +236,7 @@ mod tests {
                 &mut transaction,
                 global,
                 KEK_NAME,
-                ATTRIBUTES,
+                STORE_ATTRIBUTES,
                 kek.payload,
                 Some(crate::auth::timestamp_from_efi_time(kek.timestamp)),
             )
@@ -271,7 +273,7 @@ mod tests {
                 &mut transaction,
                 database,
                 DB_NAME,
-                ATTRIBUTES,
+                STORE_ATTRIBUTES,
                 db.payload,
                 Some(crate::auth::timestamp_from_efi_time(db.timestamp)),
             )
@@ -289,7 +291,12 @@ mod tests {
         let mut expected_database = db.payload.to_vec();
         expected_database.extend_from_slice(append.payload);
         let mut prepared = store
-            .prepare(database, DB_NAME, append_attributes, append.payload.len())
+            .prepare(
+                database,
+                DB_NAME,
+                VariableAttributes::from_bits_retain(append_attributes),
+                append.payload.len(),
+            )
             .unwrap();
         store
             .stage(&mut transaction, &mut prepared, append.payload, true)
@@ -313,7 +320,9 @@ mod tests {
         )
         .unwrap();
         assert!(deletion.payload.is_empty());
-        let mut prepared = store.prepare(database, DB_NAME, ATTRIBUTES, 0).unwrap();
+        let mut prepared = store
+            .prepare(database, DB_NAME, STORE_ATTRIBUTES, 0)
+            .unwrap();
         store
             .stage(&mut transaction, &mut prepared, &[], false)
             .unwrap();
@@ -335,7 +344,7 @@ mod tests {
                 &mut transaction,
                 global,
                 PK_NAME,
-                ATTRIBUTES,
+                STORE_ATTRIBUTES,
                 include_bytes!("../../tests/fixtures/pk.esl"),
                 None,
             )
@@ -361,7 +370,7 @@ mod tests {
         assert_eq!(verified.payload, pk);
         let timestamp = crate::auth::timestamp_from_efi_time(verified.timestamp);
         let mut prepared = store
-            .prepare(guid, PK_NAME, ATTRIBUTES, verified.payload.len())
+            .prepare(guid, PK_NAME, STORE_ATTRIBUTES, verified.payload.len())
             .unwrap();
         store
             .stage(&mut transaction, &mut prepared, verified.payload, false)
@@ -376,7 +385,7 @@ mod tests {
             AuthError::InvalidTimestamp
         );
 
-        let mut deletion = store.prepare(guid, PK_NAME, ATTRIBUTES, 0).unwrap();
+        let mut deletion = store.prepare(guid, PK_NAME, STORE_ATTRIBUTES, 0).unwrap();
         store
             .stage(&mut transaction, &mut deletion, &[], false)
             .unwrap();

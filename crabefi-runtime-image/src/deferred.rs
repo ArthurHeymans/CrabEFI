@@ -21,7 +21,7 @@ use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned};
 
 #[cfg(feature = "secure-boot")]
 use crate::auth::MAX_AUTHENTICATED_ENVELOPE_SIZE;
-use crate::efi;
+use crate::efi::{self, VariableAttributes};
 
 pub const MAX_NAME_LEN: usize = 64;
 /// Records carry the complete authenticated input envelope so a full-width
@@ -287,7 +287,7 @@ impl DeferredTransaction {
 pub struct DeferredWrite<'a> {
     pub guid: [u8; 16],
     pub name: &'a [u16],
-    pub attributes: u32,
+    pub attributes: VariableAttributes,
     pub data: &'a [u8],
     pub timestamp: VariableTimestamp,
     pub authenticated: bool,
@@ -694,7 +694,7 @@ fn serialize_record<'t>(
             STATE_VALID
         },
         reserved1: 0,
-        attributes: U32::new(write.attributes),
+        attributes: U32::new(write.attributes.bits()),
         guid: write.guid,
         name_len: U16::new(name_len as u16),
         reserved2: U16::new(0),
@@ -791,7 +791,7 @@ mod tests {
         DeferredWrite {
             guid: [0x42; 16],
             name,
-            attributes: 7,
+            attributes: VariableAttributes::from_bits_retain(7),
             data: &[9],
             timestamp: VariableTimestamp::default(),
             authenticated: false,
@@ -817,7 +817,7 @@ mod tests {
                         0xdd, 0xee, 0xff, 0x10,
                     ],
                     name: &[b'T' as u16, b'e' as u16, b's' as u16, b't' as u16],
-                    attributes: 7,
+                    attributes: VariableAttributes::from_bits_retain(7),
                     data: &[1, 2, 3, 4],
                     timestamp: VariableTimestamp::default(),
                     authenticated: false,

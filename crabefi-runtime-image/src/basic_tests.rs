@@ -1,14 +1,15 @@
 //! Runtime policy checks without UEFI authentication support.
 
 use crate::{
-    efi,
+    efi::{self, VariableAttributes},
     services::{VariableContext, VariableRequest, apply_variable, capsule_delivery_available},
     state::{Phase, RetainedBuffer, RuntimeState},
     store::{VariableStore, VariableTransaction},
 };
 use crabefi_efi_types::secure_boot;
 
-const ATTRIBUTES: u32 = efi::VARIABLE_BOOTSERVICE_ACCESS | efi::VARIABLE_RUNTIME_ACCESS;
+const ATTRIBUTES: VariableAttributes =
+    VariableAttributes::BOOTSERVICE_ACCESS.union(VariableAttributes::RUNTIME_ACCESS);
 
 /// Apply a request without a boot bridge or retained buffer.
 fn apply(
@@ -75,7 +76,7 @@ fn authentication_and_key_writes_are_unsupported_not_silently_accepted() {
         (
             [0x42; 16],
             &[b'A' as u16][..],
-            ATTRIBUTES | efi::VARIABLE_TIME_BASED_AUTHENTICATED_WRITE_ACCESS,
+            ATTRIBUTES | VariableAttributes::TIME_BASED_AUTHENTICATED_WRITE_ACCESS,
         ),
         (
             secure_boot::EFI_GLOBAL_VARIABLE_GUID,
@@ -141,7 +142,7 @@ fn status_variables_are_write_protected_and_missing_nv_backend_does_not_succeed(
                 VariableRequest {
                     guid: [0x42; 16],
                     name: &name,
-                    attributes: ATTRIBUTES | efi::VARIABLE_NON_VOLATILE,
+                    attributes: ATTRIBUTES | VariableAttributes::NON_VOLATILE,
                     data: b"nv",
                 },
             ),

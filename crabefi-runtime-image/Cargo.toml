@@ -15,6 +15,7 @@ full = ["secure-boot"]
 [dependencies]
 crabefi-efi-types = { path = "../crabefi-efi-types" }
 crabefi-runtime-abi = { path = "../crabefi-runtime-abi" }
+bitflags = { version = "2", default-features = false }
 heapless = { version = "0.9", default-features = false }
 r-efi = "5.3"
 # This crate is a standalone workspace and intentionally uses sha2 0.11 so its
