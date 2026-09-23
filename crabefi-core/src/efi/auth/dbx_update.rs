@@ -392,7 +392,7 @@ fn verify_dbx_signature(pkcs7_data: &[u8], signed_data: &[u8]) -> Result<bool, A
     {
         let kek = kek_database();
         for cert_data in kek.x509_certificates() {
-            match verify_pkcs7_signature(pkcs7_data, signed_data, cert_data) {
+            match verify_pkcs7_signature(pkcs7_data, signed_data, cert_data, true) {
                 Ok(true) => {
                     log::info!("dbx update verified with KEK certificate");
                     return Ok(true);
@@ -410,7 +410,7 @@ fn verify_dbx_signature(pkcs7_data: &[u8], signed_data: &[u8]) -> Result<bool, A
     {
         let pk = pk_database();
         for cert_data in pk.x509_certificates() {
-            match verify_pkcs7_signature(pkcs7_data, signed_data, cert_data) {
+            match verify_pkcs7_signature(pkcs7_data, signed_data, cert_data, true) {
                 Ok(true) => {
                     log::info!("dbx update verified with PK certificate");
                     return Ok(true);

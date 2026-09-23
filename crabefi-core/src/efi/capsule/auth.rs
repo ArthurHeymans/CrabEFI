@@ -57,6 +57,7 @@ pub fn verify_capsule_signature(
             auth.pkcs7_data.as_slice(),
             image_data,
             cert_der,
+            true,
         ) {
             Ok(true) => {
                 log::info!("Capsule signature verified against trust store cert #{}", i);

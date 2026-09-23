@@ -129,6 +129,7 @@ pub fn sha256(data: &[u8]) -> [u8; 32] {
 /// * `pkcs7_data` - The PKCS#7 SignedData structure (DER encoded)
 /// * `signed_data` - The data that was signed (the Authenticode hash or authenticated variable data)
 /// * `trusted_cert` - A trusted X.509 certificate (DER encoded) from db
+/// * `require_detached` - Reject attached eContent when the caller supplies the authenticated payload
 ///
 /// # Returns
 ///
@@ -139,6 +140,7 @@ pub fn verify_pkcs7_signature(
     pkcs7_data: &[u8],
     signed_data: &[u8],
     trusted_cert: &[u8],
+    require_detached: bool,
 ) -> Result<bool, AuthError> {
     // WIN_CERTIFICATE is 8-byte aligned, so the parser ignores alignment
     // padding after the ContentInfo.
@@ -192,6 +194,7 @@ pub fn verify_pkcs7_signature(
     // - For attached content (e.g., Authenticode): hash the captured input
     // - For detached signatures (e.g., authenticated variables): hash the external data
     let computed_hash = match pkcs7.encapsulated_content.content {
+        Some(_) if require_detached => return Err(AuthError::InvalidHeader),
         Some(econtent) => sha256(econtent.value),
         None => sha256(signed_data),
     };
@@ -889,6 +892,7 @@ fn verify_rsa_signature(
 mod fixture_tests {
     use super::*;
     use crate::efi::auth::revocation;
+    use crabefi_pkcs7::der::{Reader, Tlv};
 
     const CA: &[u8] = include_bytes!("../../../../crabefi-pkcs7/testdata/ca.der");
     const LEAF: &[u8] = include_bytes!("../../../../crabefi-pkcs7/testdata/leaf.der");
@@ -906,7 +910,7 @@ mod fixture_tests {
     fn pkcs7_variants_verify() {
         for cms in [CMS_ATTRS, CMS_NOATTR, CMS_KEYID] {
             assert_eq!(
-                verify_pkcs7_signature(cms, DATA, CA),
+                verify_pkcs7_signature(cms, DATA, CA, true),
                 Ok(true),
                 "variant of {} bytes failed",
                 cms.len()
@@ -918,15 +922,97 @@ mod fixture_tests {
     fn pkcs7_tampered_data_rejects() {
         let mut bad = DATA.to_vec();
         bad[0] ^= 0xff;
-        assert_eq!(verify_pkcs7_signature(CMS_ATTRS, &bad, CA), Ok(false));
-        assert_eq!(verify_pkcs7_signature(CMS_NOATTR, &bad, CA), Ok(false));
+        assert_eq!(verify_pkcs7_signature(CMS_ATTRS, &bad, CA, true), Ok(false));
+        assert_eq!(
+            verify_pkcs7_signature(CMS_NOATTR, &bad, CA, true),
+            Ok(false)
+        );
+    }
+
+    // Turn the detached fixture into a valid attached signature without
+    // changing its signed attributes or signature over DATA.
+    fn attach_fixture_content(cms: &[u8]) -> Vec<u8> {
+        fn wrap(tag: u8, value: &[u8]) -> Vec<u8> {
+            let mut encoded = vec![tag];
+            if value.len() < 128 {
+                encoded.push(value.len() as u8);
+            } else {
+                let length = value.len().to_be_bytes();
+                let length = &length[length.iter().take_while(|&&byte| byte == 0).count()..];
+                encoded.push(0x80 | length.len() as u8);
+                encoded.extend_from_slice(length);
+            }
+            encoded.extend_from_slice(value);
+            encoded
+        }
+
+        let mut content_info = Tlv::parse(cms).unwrap().contents(tag::SEQUENCE).unwrap();
+        let content_type = content_info.read().unwrap();
+        let signed = content_info
+            .read_tag(tag::context_constructed(0))
+            .unwrap()
+            .inner()
+            .unwrap();
+        content_info.finish().unwrap();
+        let mut fields = Reader::new(signed.value);
+        let version = fields.read().unwrap();
+        let digest_algorithms = fields.read().unwrap();
+        let old_encapsulated = fields.read().unwrap();
+        let econtent_type = old_encapsulated
+            .contents(tag::SEQUENCE)
+            .unwrap()
+            .read()
+            .unwrap();
+        let content = wrap(tag::context_constructed(0), &wrap(tag::OCTET_STRING, DATA));
+        let encapsulated = wrap(
+            tag::SEQUENCE,
+            &[econtent_type.encoded, content.as_slice()].concat(),
+        );
+        let remaining = signed
+            .value
+            .get(
+                version.encoded.len()
+                    + digest_algorithms.encoded.len()
+                    + old_encapsulated.encoded.len()..,
+            )
+            .unwrap();
+        let signed = wrap(
+            tag::SEQUENCE,
+            &[
+                version.encoded,
+                digest_algorithms.encoded,
+                encapsulated.as_slice(),
+                remaining,
+            ]
+            .concat(),
+        );
+        let explicit = wrap(tag::context_constructed(0), &signed);
+        wrap(
+            tag::SEQUENCE,
+            &[content_type.encoded, explicit.as_slice()].concat(),
+        )
+    }
+
+    #[test]
+    fn detached_callers_reject_attached_content_even_with_valid_signature() {
+        let attached = attach_fixture_content(CMS_ATTRS);
+        let mut other_payload = DATA.to_vec();
+        other_payload[0] ^= 0xff;
+        assert_eq!(
+            verify_pkcs7_signature(&attached, &other_payload, CA, false),
+            Ok(true)
+        );
+        assert_eq!(
+            verify_pkcs7_signature(&attached, &other_payload, CA, true),
+            Err(AuthError::InvalidHeader)
+        );
     }
 
     #[test]
     fn pkcs7_garbage_inputs_error() {
-        assert!(verify_pkcs7_signature(b"junk", DATA, CA).is_err());
-        assert!(verify_pkcs7_signature(CMS_ATTRS, DATA, b"junk").is_err());
-        assert!(verify_pkcs7_signature(&[], DATA, CA).is_err());
+        assert!(verify_pkcs7_signature(b"junk", DATA, CA, true).is_err());
+        assert!(verify_pkcs7_signature(CMS_ATTRS, DATA, b"junk", true).is_err());
+        assert!(verify_pkcs7_signature(&[], DATA, CA, true).is_err());
     }
 
     #[test]
