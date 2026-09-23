@@ -24,6 +24,74 @@ pub mod reset_mechanism {
     pub const SBI_SRST: u32 = 4;
 }
 
+/// Parsed [`RuntimeTimeConfig::mechanism`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TimeMechanism {
+    Unsupported,
+    X86Cmos,
+    Pl031,
+    GoldfishRtc,
+}
+
+impl TimeMechanism {
+    /// Width of the MMIO register window the mechanism reads, if any.
+    pub const fn mmio_width(self) -> Option<u64> {
+        match self {
+            Self::Pl031 => Some(4),
+            Self::GoldfishRtc => Some(8),
+            Self::Unsupported | Self::X86Cmos => None,
+        }
+    }
+}
+
+impl TryFrom<u32> for TimeMechanism {
+    type Error = HandoffError;
+
+    fn try_from(value: u32) -> Result<Self, Self::Error> {
+        match value {
+            time_mechanism::UNSUPPORTED => Ok(Self::Unsupported),
+            time_mechanism::X86_CMOS => Ok(Self::X86Cmos),
+            time_mechanism::PL031 => Ok(Self::Pl031),
+            time_mechanism::GOLDFISH_RTC => Ok(Self::GoldfishRtc),
+            _ => Err(HandoffError::Mechanism),
+        }
+    }
+}
+
+/// Parsed [`RuntimeResetConfig::mechanism`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ResetMechanism {
+    X86Legacy,
+    PsciSmc,
+    PsciHvc,
+    SbiSrst,
+}
+
+impl TryFrom<u32> for ResetMechanism {
+    type Error = HandoffError;
+
+    fn try_from(value: u32) -> Result<Self, Self::Error> {
+        match value {
+            reset_mechanism::X86_LEGACY => Ok(Self::X86Legacy),
+            reset_mechanism::PSCI_SMC => Ok(Self::PsciSmc),
+            reset_mechanism::PSCI_HVC => Ok(Self::PsciHvc),
+            reset_mechanism::SBI_SRST => Ok(Self::SbiSrst),
+            _ => Err(HandoffError::Mechanism),
+        }
+    }
+}
+
+impl From<ResetMechanism> for u32 {
+    fn from(mechanism: ResetMechanism) -> Self {
+        match mechanism {
+            ResetMechanism::X86Legacy => reset_mechanism::X86_LEGACY,
+            ResetMechanism::PsciSmc => reset_mechanism::PSCI_SMC,
+            ResetMechanism::PsciHvc => reset_mechanism::PSCI_HVC,
+            ResetMechanism::SbiSrst => reset_mechanism::SBI_SRST,
+        }
+    }
+}
+
 pub mod configuration_policy {
     pub const PLATFORM_PHYSICAL: u32 = 1;
     pub const IMAGE_RUNTIME: u32 = 2;
@@ -277,21 +345,24 @@ impl RuntimeHandoff {
             Ok(())
         })?;
 
-        let mmio_width = match (self.architecture, self.time.mechanism) {
-            (_, time_mechanism::UNSUPPORTED) | (architecture::X86_64, time_mechanism::X86_CMOS) => {
-                None
-            }
-            (architecture::AARCH64, time_mechanism::PL031) => Some(4),
-            (architecture::RISCV64, time_mechanism::GOLDFISH_RTC) => Some(8),
-            _ => return Err(HandoffError::Mechanism),
-        };
-        match (self.architecture, self.reset.mechanism) {
-            (architecture::X86_64, reset_mechanism::X86_LEGACY)
-            | (architecture::AARCH64, reset_mechanism::PSCI_SMC | reset_mechanism::PSCI_HVC)
-            | (architecture::RISCV64, reset_mechanism::SBI_SRST) => {}
+        let time = TimeMechanism::try_from(self.time.mechanism)?;
+        match (self.architecture, time) {
+            (_, TimeMechanism::Unsupported)
+            | (architecture::X86_64, TimeMechanism::X86Cmos)
+            | (architecture::AARCH64, TimeMechanism::Pl031)
+            | (architecture::RISCV64, TimeMechanism::GoldfishRtc) => {}
             _ => return Err(HandoffError::Mechanism),
         }
-        if let Some(width) = mmio_width {
+        match (
+            self.architecture,
+            ResetMechanism::try_from(self.reset.mechanism)?,
+        ) {
+            (architecture::X86_64, ResetMechanism::X86Legacy)
+            | (architecture::AARCH64, ResetMechanism::PsciSmc | ResetMechanism::PsciHvc)
+            | (architecture::RISCV64, ResetMechanism::SbiSrst) => {}
+            _ => return Err(HandoffError::Mechanism),
+        }
+        if let Some(width) = time.mmio_width() {
             let end = self
                 .time
                 .io_or_mmio_base

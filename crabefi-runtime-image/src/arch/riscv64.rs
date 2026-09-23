@@ -1,14 +1,17 @@
 //! RISC-V goldfish RTC and SBI SRST mechanisms.
 
-use crabefi_runtime_abi::{RuntimeResetConfig, RuntimeTimeConfig, reset_mechanism, time_mechanism};
+use crabefi_runtime_abi::{ResetMechanism, TimeMechanism};
 
-use crate::efi;
+use crate::{
+    efi,
+    state::{ResetConfig, TimeConfig},
+};
 
-pub fn read_time(config: RuntimeTimeConfig, out: &mut efi::Time) -> Result<(), efi::Status> {
-    if config.mechanism != time_mechanism::GOLDFISH_RTC || config.io_or_mmio_base == 0 {
+pub fn read_time(config: TimeConfig, out: &mut efi::Time) -> Result<(), efi::Status> {
+    if config.mechanism != TimeMechanism::GoldfishRtc || config.base == 0 {
         return Err(efi::Status::UNSUPPORTED);
     }
-    let base = config.io_or_mmio_base as *const u32;
+    let base = config.base as *const u32;
     // SAFETY: initialization accepts this mechanism only with its MMIO page in
     // the retained external-range manifest. Reading low latches high.
     let (low, high) = unsafe { (base.read_volatile(), base.add(1).read_volatile()) };
@@ -16,8 +19,8 @@ pub fn read_time(config: RuntimeTimeConfig, out: &mut efi::Time) -> Result<(), e
     crate::services::time_from_unix(nanoseconds / 1_000_000_000, out)
 }
 
-pub fn reset(config: RuntimeResetConfig, reset_type: efi::ResetType) -> ! {
-    if config.mechanism == reset_mechanism::SBI_SRST {
+pub fn reset(config: Option<ResetConfig>, reset_type: efi::ResetType) -> ! {
+    if config.is_some_and(|config| config.mechanism == ResetMechanism::SbiSrst) {
         let sbi_type = match reset_type {
             efi::RESET_SHUTDOWN => 0usize,
             efi::RESET_WARM => 2usize,

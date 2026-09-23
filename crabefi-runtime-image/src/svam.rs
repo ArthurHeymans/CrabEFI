@@ -1,14 +1,13 @@
 //! Validate-then-commit SetVirtualAddressMap implementation.
 
 use crabefi_runtime_abi::{
-    MAX_EXTERNAL_RANGES, MAX_RELOCATIONS, MAX_SECTIONS, RuntimeTimeConfig, relocation_kind,
-    section_flags, time_mechanism,
+    MAX_EXTERNAL_RANGES, MAX_RELOCATIONS, MAX_SECTIONS, relocation_kind, section_flags,
 };
 use heapless::Vec;
 
 use crate::{
     efi,
-    state::{self, collect_bounded},
+    state::{self, TimeConfig, collect_bounded},
 };
 
 const MAX_DESCRIPTORS: usize = 256;
@@ -272,40 +271,33 @@ fn resolve_deferred_buffer(
 fn virtual_time_config(
     runtime: &state::RuntimeState,
     range_virtual_bases: &[u64],
-) -> Result<RuntimeTimeConfig, efi::Status> {
-    let width = match runtime.time.mechanism {
-        time_mechanism::PL031 => 4,
-        time_mechanism::GOLDFISH_RTC => 8,
-        _ => return Ok(runtime.time),
+) -> Result<TimeConfig, efi::Status> {
+    let time = runtime.time;
+    let Some(width) = time.mechanism.mmio_width() else {
+        return Ok(time);
     };
-    let physical_end = runtime
-        .time
-        .io_or_mmio_base
+    let physical_end = time
+        .base
         .checked_add(width)
         .ok_or(efi::Status::INVALID_PARAMETER)?;
-    let (index, range) = runtime
+    let (range, virtual_base) = runtime
         .ranges
         .iter()
-        .enumerate()
-        .find(|(_, range)| {
-            range.physical_base <= runtime.time.io_or_mmio_base
+        .zip(range_virtual_bases)
+        .find(|(range, _)| {
+            range.physical_base <= time.base
                 && range
                     .physical_base
                     .checked_add(range.byte_len)
                     .is_some_and(|end| physical_end <= end)
         })
         .ok_or(efi::Status::NOT_FOUND)?;
-    let offset = runtime
-        .time
-        .io_or_mmio_base
+    let base = time
+        .base
         .checked_sub(range.physical_base)
+        .and_then(|offset| virtual_base.checked_add(offset))
         .ok_or(efi::Status::INVALID_PARAMETER)?;
-    let mut config = runtime.time;
-    config.io_or_mmio_base = range_virtual_bases
-        .get(index)
-        .and_then(|base| base.checked_add(offset))
-        .ok_or(efi::Status::INVALID_PARAMETER)?;
-    Ok(config)
+    Ok(TimeConfig { base, ..time })
 }
 
 /// Virtual base of each physical region given the descriptor mapping it.
@@ -618,6 +610,8 @@ fn canonical_virtual(address: u64) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use crabefi_runtime_abi::TimeMechanism;
+
     use super::*;
 
     #[test]
@@ -671,10 +665,9 @@ mod tests {
     #[test]
     fn converts_mmio_time_base_to_matching_virtual_range() {
         let mut runtime = state::RuntimeState::new();
-        runtime.time = RuntimeTimeConfig {
-            mechanism: time_mechanism::PL031,
-            reserved: 0,
-            io_or_mmio_base: 0x20_0120,
+        runtime.time = TimeConfig {
+            mechanism: TimeMechanism::Pl031,
+            base: 0x20_0120,
         };
         runtime.ranges = Vec::from_array([state::RangeRecord {
             physical_base: 0x20_0000,
@@ -683,16 +676,15 @@ mod tests {
             attributes: efi::MEMORY_RUNTIME,
         }]);
         let converted = virtual_time_config(&runtime, &[0xffff_8000_0020_0000]).unwrap();
-        assert_eq!(converted.io_or_mmio_base, 0xffff_8000_0020_0120);
+        assert_eq!(converted.base, 0xffff_8000_0020_0120);
     }
 
     #[test]
     fn rejects_mmio_time_base_without_complete_range() {
         let mut runtime = state::RuntimeState::new();
-        runtime.time = RuntimeTimeConfig {
-            mechanism: time_mechanism::GOLDFISH_RTC,
-            reserved: 0,
-            io_or_mmio_base: 0x20_0ffc,
+        runtime.time = TimeConfig {
+            mechanism: TimeMechanism::GoldfishRtc,
+            base: 0x20_0ffc,
         };
         runtime.ranges = Vec::from_array([state::RangeRecord {
             physical_base: 0x20_0000,
