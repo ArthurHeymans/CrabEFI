@@ -1,8 +1,14 @@
 //! Image-local EFI Runtime Services entry points.
+//!
+//! Each `extern "efiapi"` service is a thin shim that converts the `Result` of
+//! its implementation into the returned status.
 
 use core::ffi::c_void;
 
-use crabefi_efi_types::{authentication::validate_signature_database, secure_boot};
+use crabefi_efi_types::{
+    authentication::validate_signature_database,
+    secure_boot::{self, SecureBootVariable},
+};
 use crabefi_runtime_abi::{
     BridgeRequest, MAX_VARIABLE_DATA_SIZE, MAX_VARIABLE_NAME_LEN, TimeMechanism, VariableTimestamp,
     bridge_operation, capsule,
@@ -13,7 +19,7 @@ use crate::{
     deferred::{self, DeferredRegion},
     efi,
     state::{self, Phase},
-    store::{VariableStore, VariableTransaction},
+    store::{PreparedWrite, VariableStore, VariableTransaction},
     svam,
 };
 
@@ -54,20 +60,20 @@ pub extern "efiapi" fn get_time(
     time: *mut efi::Time,
     capabilities: *mut efi::TimeCapabilities,
 ) -> efi::Status {
+    efi::status(current_time(time, capabilities))
+}
+
+fn current_time(
+    time: *mut efi::Time,
+    capabilities: *mut efi::TimeCapabilities,
+) -> Result<(), efi::Status> {
     if time.is_null() {
-        return efi::Status::INVALID_PARAMETER;
+        return Err(efi::Status::INVALID_PARAMETER);
     }
-    let lease = match state::lease() {
-        Ok(lease) => lease,
-        Err(status) => return status,
-    };
-    let config = lease.state().time;
+    let lease = state::lease()?;
     // SAFETY: UEFI requires `time` to name writable EFI_TIME storage. We have
     // checked null and write exactly one value.
-    let result = unsafe { arch::read_time(config, &mut *time) };
-    if let Err(status) = result {
-        return status;
-    }
+    arch::read_time(lease.state().time, unsafe { &mut *time })?;
     if !capabilities.is_null() {
         // SAFETY: optional output is written only when non-null.
         unsafe {
@@ -78,7 +84,7 @@ pub extern "efiapi" fn get_time(
             })
         };
     }
-    efi::Status::SUCCESS
+    Ok(())
 }
 
 pub extern "efiapi" fn set_time(_time: *mut efi::Time) -> efi::Status {
@@ -118,26 +124,27 @@ pub extern "efiapi" fn convert_pointer(
     debug_disposition: usize,
     address: *mut *mut c_void,
 ) -> efi::Status {
+    efi::status(convert_address(debug_disposition, address))
+}
+
+fn convert_address(debug_disposition: usize, address: *mut *mut c_void) -> Result<(), efi::Status> {
     const OPTIONAL_POINTER: usize = 1;
     if address.is_null() || debug_disposition & !OPTIONAL_POINTER != 0 {
-        return efi::Status::INVALID_PARAMETER;
+        return Err(efi::Status::INVALID_PARAMETER);
     }
     // SAFETY: address is the required writable pointer-to-pointer argument.
     let physical = unsafe { address.read() } as u64;
     if physical == 0 {
         return if debug_disposition & OPTIONAL_POINTER != 0 {
-            efi::Status::SUCCESS
+            Ok(())
         } else {
-            efi::Status::INVALID_PARAMETER
+            Err(efi::Status::INVALID_PARAMETER)
         };
     }
     if Phase::current() != Phase::Virtual {
-        return efi::Status::NOT_STARTED;
+        return Err(efi::Status::NOT_STARTED);
     }
-    let lease = match state::lease() {
-        Ok(lease) => lease,
-        Err(status) => return status,
-    };
+    let lease = state::lease()?;
     let runtime = lease.state();
     let converted = runtime
         .sections
@@ -157,13 +164,11 @@ pub extern "efiapi" fn convert_pointer(
             let retained = runtime.retained?;
             let offset = physical.checked_sub(retained.physical_base)?;
             (offset < retained.size as u64).then(|| retained.virtual_base.checked_add(offset))?
-        });
-    let Some(converted) = converted else {
-        return efi::Status::NOT_FOUND;
-    };
+        })
+        .ok_or(efi::Status::NOT_FOUND)?;
     // SAFETY: address is writable as required by the protocol call.
     unsafe { address.write(converted as *mut c_void) };
-    efi::Status::SUCCESS
+    Ok(())
 }
 
 pub extern "efiapi" fn get_variable(
@@ -173,19 +178,29 @@ pub extern "efiapi" fn get_variable(
     data_size: *mut usize,
     data: *mut c_void,
 ) -> efi::Status {
+    efi::status(read_variable(
+        variable_name,
+        vendor_guid,
+        attributes,
+        data_size,
+        data,
+    ))
+}
+
+fn read_variable(
+    variable_name: *mut u16,
+    vendor_guid: *mut efi::Guid,
+    attributes: *mut u32,
+    data_size: *mut usize,
+    data: *mut c_void,
+) -> Result<(), efi::Status> {
     if vendor_guid.is_null() || data_size.is_null() {
-        return efi::Status::INVALID_PARAMETER;
+        return Err(efi::Status::INVALID_PARAMETER);
     }
-    let name = match read_name(variable_name) {
-        Ok(name) => name,
-        Err(status) => return status,
-    };
+    let name = read_name(variable_name)?;
     // SAFETY: vendor_guid is non-null and UEFI guarantees readable GUID storage.
     let guid = *unsafe { vendor_guid.read() }.as_bytes();
-    let lease = match state::lease() {
-        Ok(lease) => lease,
-        Err(status) => return status,
-    };
+    let lease = state::lease()?;
     if guid == secure_boot::EFI_GLOBAL_VARIABLE_GUID {
         let value = if secure_boot::name_matches(name.as_slice(), secure_boot::SETUP_MODE_NAME) {
             Some(u8::from(lease.variables().setup_mode()))
@@ -205,12 +220,14 @@ pub extern "efiapi" fn get_variable(
         }
     }
     let runtime_only = lease.phase().runtime();
-    let Some(slot) = lease.variables().find(&guid, name.as_slice(), runtime_only) else {
-        return efi::Status::NOT_FOUND;
-    };
-    let Some(value) = lease.variables().data(slot) else {
-        return efi::Status::DEVICE_ERROR;
-    };
+    let slot = lease
+        .variables()
+        .find(&guid, name.as_slice(), runtime_only)
+        .ok_or(efi::Status::NOT_FOUND)?;
+    let value = lease
+        .variables()
+        .data(slot)
+        .ok_or(efi::Status::DEVICE_ERROR)?;
     write_variable_result(value, slot.attributes, attributes, data_size, data)
 }
 
@@ -220,12 +237,12 @@ fn write_variable_result(
     attributes: *mut u32,
     data_size: *mut usize,
     data: *mut c_void,
-) -> efi::Status {
+) -> Result<(), efi::Status> {
     // SAFETY: the caller supplied the required writable size pointer.
     let supplied = unsafe { data_size.read() };
     if supplied < value.len() || (!value.is_empty() && data.is_null()) {
         unsafe { data_size.write(value.len()) };
-        return efi::Status::BUFFER_TOO_SMALL;
+        return Err(efi::Status::BUFFER_TOO_SMALL);
     }
     if !value.is_empty() {
         // SAFETY: the caller reports a writable buffer large enough for value.
@@ -237,7 +254,7 @@ fn write_variable_result(
             attributes.write(variable_attributes);
         }
     }
-    efi::Status::SUCCESS
+    Ok(())
 }
 
 pub extern "efiapi" fn get_next_variable_name(
@@ -245,113 +262,97 @@ pub extern "efiapi" fn get_next_variable_name(
     variable_name: *mut u16,
     vendor_guid: *mut efi::Guid,
 ) -> efi::Status {
+    efi::status(next_variable_name(
+        variable_name_size,
+        variable_name,
+        vendor_guid,
+    ))
+}
+
+fn next_variable_name(
+    variable_name_size: *mut usize,
+    variable_name: *mut u16,
+    vendor_guid: *mut efi::Guid,
+) -> Result<(), efi::Status> {
     if variable_name_size.is_null() || variable_name.is_null() || vendor_guid.is_null() {
-        return efi::Status::INVALID_PARAMETER;
+        return Err(efi::Status::INVALID_PARAMETER);
     }
     // SAFETY: required inputs are non-null by the checks above.
     let supplied = unsafe { variable_name_size.read() };
     if supplied < 2 {
         // SAFETY: writable size output is required by UEFI.
         unsafe { variable_name_size.write(2) };
-        return efi::Status::BUFFER_TOO_SMALL;
+        return Err(efi::Status::BUFFER_TOO_SMALL);
     }
     // SAFETY: at least one UTF-16 unit is available because supplied >= 2.
     let first = unsafe { variable_name.read() };
     let current_name = if first == 0 {
         Name::new()
     } else {
-        match read_name_bounded(variable_name, supplied / core::mem::size_of::<u16>()) {
-            Ok(name) => name,
-            Err(status) => return status,
-        }
+        read_name_bounded(variable_name, supplied / core::mem::size_of::<u16>())?
     };
     // SAFETY: non-null GUID input.
     let current_guid = *unsafe { vendor_guid.read() }.as_bytes();
-    let lease = match state::lease() {
-        Ok(lease) => lease,
-        Err(status) => return status,
-    };
-    if current_name.is_empty() {
-        return write_next_name(
-            secure_boot::SETUP_MODE_NAME,
-            secure_boot::EFI_GLOBAL_VARIABLE_GUID,
-            supplied,
-            variable_name_size,
-            variable_name,
-            vendor_guid,
-        );
-    }
-    if current_guid == secure_boot::EFI_GLOBAL_VARIABLE_GUID
-        && secure_boot::name_matches(current_name.as_slice(), secure_boot::SETUP_MODE_NAME)
-    {
-        return write_next_name(
-            secure_boot::SECURE_BOOT_NAME,
-            current_guid,
-            supplied,
-            variable_name_size,
-            variable_name,
-            vendor_guid,
-        );
-    }
-    let runtime_only = lease.phase().runtime();
-    let mut visible = lease.variables().visible_slots(runtime_only);
-    let next = if current_guid == secure_boot::EFI_GLOBAL_VARIABLE_GUID
-        && secure_boot::name_matches(current_name.as_slice(), secure_boot::SECURE_BOOT_NAME)
-    {
-        visible.next()
-    } else {
-        let mut found = false;
-        let next = visible.find(|slot| {
-            if found {
-                true
-            } else {
-                found = slot.matches(&current_guid, current_name.as_slice());
-                false
-            }
-        });
-        if !found {
-            return efi::Status::INVALID_PARAMETER;
-        }
-        next
-    };
-    let Some(slot) = next else {
-        return efi::Status::NOT_FOUND;
-    };
-    let Some(name) = slot.name.get(..usize::from(slot.name_len)) else {
-        return efi::Status::DEVICE_ERROR;
-    };
-    write_next_name(
-        name,
-        slot.guid,
+    let lease = state::lease()?;
+    let output = NameOutput {
         supplied,
         variable_name_size,
         variable_name,
         vendor_guid,
-    )
+    };
+    if current_name.is_empty() {
+        return output.write(
+            secure_boot::SETUP_MODE_NAME,
+            secure_boot::EFI_GLOBAL_VARIABLE_GUID,
+        );
+    }
+    let is_global = |name| {
+        current_guid == secure_boot::EFI_GLOBAL_VARIABLE_GUID
+            && secure_boot::name_matches(current_name.as_slice(), name)
+    };
+    if is_global(secure_boot::SETUP_MODE_NAME) {
+        return output.write(secure_boot::SECURE_BOOT_NAME, current_guid);
+    }
+    let mut visible = lease.variables().visible_slots(lease.phase().runtime());
+    if !is_global(secure_boot::SECURE_BOOT_NAME) {
+        visible
+            .by_ref()
+            .position(|slot| slot.matches(&current_guid, current_name.as_slice()))
+            .ok_or(efi::Status::INVALID_PARAMETER)?;
+    }
+    let slot = visible.next().ok_or(efi::Status::NOT_FOUND)?;
+    let name = slot
+        .name
+        .get(..usize::from(slot.name_len))
+        .ok_or(efi::Status::DEVICE_ERROR)?;
+    output.write(name, slot.guid)
 }
 
-fn write_next_name(
-    name: &[u16],
-    guid: [u8; 16],
+/// Caller-supplied GetNextVariableName output buffers.
+struct NameOutput {
     supplied: usize,
     variable_name_size: *mut usize,
     variable_name: *mut u16,
     vendor_guid: *mut efi::Guid,
-) -> efi::Status {
-    let required = name.len().saturating_add(1).saturating_mul(2);
-    if supplied < required {
-        // SAFETY: writable size output is required by UEFI.
-        unsafe { variable_name_size.write(required) };
-        return efi::Status::BUFFER_TOO_SMALL;
+}
+
+impl NameOutput {
+    fn write(&self, name: &[u16], guid: [u8; 16]) -> Result<(), efi::Status> {
+        let required = name.len().saturating_add(1).saturating_mul(2);
+        if self.supplied < required {
+            // SAFETY: writable size output is required by UEFI.
+            unsafe { self.variable_name_size.write(required) };
+            return Err(efi::Status::BUFFER_TOO_SMALL);
+        }
+        // SAFETY: the caller supplied `required` writable bytes.
+        unsafe {
+            core::ptr::copy_nonoverlapping(name.as_ptr(), self.variable_name, name.len());
+            self.variable_name.add(name.len()).write(0);
+            self.vendor_guid.write(efi::Guid::from_bytes(&guid));
+            self.variable_name_size.write(required);
+        }
+        Ok(())
     }
-    // SAFETY: the caller supplied `required` writable bytes.
-    unsafe {
-        core::ptr::copy_nonoverlapping(name.as_ptr(), variable_name, name.len());
-        variable_name.add(name.len()).write(0);
-        vendor_guid.write(efi::Guid::from_bytes(&guid));
-        variable_name_size.write(required);
-    }
-    efi::Status::SUCCESS
 }
 
 pub extern "efiapi" fn set_variable(
@@ -361,29 +362,61 @@ pub extern "efiapi" fn set_variable(
     data_size: usize,
     data: *mut c_void,
 ) -> efi::Status {
+    efi::status(write_variable(
+        variable_name,
+        vendor_guid,
+        attributes,
+        data_size,
+        data,
+    ))
+}
+
+fn write_variable(
+    variable_name: *mut u16,
+    vendor_guid: *mut efi::Guid,
+    attributes: u32,
+    data_size: usize,
+    data: *mut c_void,
+) -> Result<(), efi::Status> {
     if vendor_guid.is_null() || (data_size != 0 && data.is_null()) {
-        return efi::Status::INVALID_PARAMETER;
+        return Err(efi::Status::INVALID_PARAMETER);
     }
-    if let Err(status) = validate_set_arguments(attributes, data_size) {
-        return status;
-    }
-    let name = match read_name(variable_name) {
-        Ok(name) => name,
-        Err(status) => return status,
-    };
+    validate_set_arguments(attributes, data_size)?;
+    let name = read_name(variable_name)?;
     // SAFETY: required pointers and input length were validated above.
     let guid = *unsafe { vendor_guid.read() }.as_bytes();
-    let input = if data_size == 0 {
+    let data = if data_size == 0 {
         &[]
     } else {
         // SAFETY: UEFI caller promises `data_size` readable bytes.
         unsafe { core::slice::from_raw_parts(data.cast::<u8>(), data_size) }
     };
-    let mut lease = match state::lease() {
-        Ok(lease) => lease,
-        Err(status) => return status,
-    };
-    set_variable_locked(&mut lease, guid, name.as_slice(), attributes, input)
+    let mut lease = state::lease()?;
+    let phase = lease.phase();
+    if matches!(phase, Phase::Uninitialized | Phase::Loaded) {
+        return Err(efi::Status::DEVICE_ERROR);
+    }
+    let (runtime, variables) = lease.parts_mut();
+    let bridge = runtime.boot_bridge;
+    let deferred = runtime.deferred_region().map(|region| DeferredSink {
+        transaction: &mut variables.deferred_transaction,
+        region,
+    });
+    apply_variable(
+        VariableContext {
+            store: &mut variables.store,
+            transaction: &mut variables.transaction,
+            phase,
+            bridge,
+            deferred,
+        },
+        VariableRequest {
+            guid,
+            name: name.as_slice(),
+            attributes,
+            data,
+        },
+    )
 }
 
 fn validate_set_arguments(attributes: u32, data_size: usize) -> Result<(), efi::Status> {
@@ -414,215 +447,291 @@ fn validate_set_arguments(attributes: u32, data_size: usize) -> Result<(), efi::
     Ok(())
 }
 
-fn set_variable_locked(
-    lease: &mut state::Lease,
+/// One SetVariable request as supplied by the caller.
+#[derive(Clone, Copy)]
+struct VariableRequest<'a> {
     guid: [u8; 16],
-    name: &[u16],
+    name: &'a [u16],
     attributes: u32,
-    input: &[u8],
-) -> efi::Status {
-    let current_phase = lease.phase();
-    if matches!(current_phase, Phase::Uninitialized | Phase::Loaded) {
-        return efi::Status::DEVICE_ERROR;
-    }
-    let (runtime, variables) = lease.parts_mut();
-    let bridge = runtime.boot_bridge;
-    apply_variable(
-        &mut variables.store,
-        &mut variables.transaction,
-        Some(&mut variables.deferred_transaction),
-        current_phase,
-        bridge,
-        runtime.deferred_region(),
-        guid,
-        name,
-        attributes,
-        input,
-    )
+    data: &'a [u8],
 }
 
-#[allow(clippy::too_many_arguments)]
-fn apply_variable(
-    store: &mut VariableStore,
-    transaction: &mut VariableTransaction,
-    deferred_transaction: Option<&mut deferred::DeferredTransaction>,
-    current_phase: Phase,
-    bridge: u64,
-    mut region: Option<DeferredRegion<'_>>,
-    guid: [u8; 16],
-    name: &[u16],
-    attributes: u32,
-    input: &[u8],
-) -> efi::Status {
-    if let Err(status) = validate_set_arguments(attributes, input.len()) {
-        return status;
+impl VariableRequest<'_> {
+    fn authenticated(&self) -> bool {
+        self.attributes & efi::VARIABLE_TIME_BASED_AUTHENTICATED_WRITE_ACCESS != 0
     }
-    let nonvolatile = attributes & efi::VARIABLE_NON_VOLATILE != 0
-        || (input.is_empty()
-            && store
-                .find(&guid, name, false)
-                .is_some_and(|slot| slot.attributes & efi::VARIABLE_NON_VOLATILE != 0));
-    if !current_phase.boot_services() && nonvolatile {
-        let Some(region) = region.as_ref() else {
-            return efi::Status::UNSUPPORTED;
-        };
-        if let Err(status) = region.validate_profile() {
-            return status;
+
+    fn append(&self) -> bool {
+        self.attributes & efi::VARIABLE_APPEND_WRITE != 0
+    }
+
+    /// The request creates, updates or deletes a non-volatile variable.
+    fn nonvolatile(&self, store: &VariableStore) -> bool {
+        self.attributes & efi::VARIABLE_NON_VOLATILE != 0
+            || (self.data.is_empty()
+                && store
+                    .find(&self.guid, self.name, false)
+                    .is_some_and(|slot| slot.attributes & efi::VARIABLE_NON_VOLATILE != 0))
+    }
+}
+
+/// Retained journal receiving non-volatile writes after ExitBootServices.
+struct DeferredSink<'a> {
+    transaction: &'a mut deferred::DeferredTransaction,
+    region: DeferredRegion<'a>,
+}
+
+/// Store and persistence targets of one variable write.
+struct VariableContext<'a> {
+    store: &'a mut VariableStore,
+    transaction: &'a mut VariableTransaction,
+    phase: Phase,
+    bridge: u64,
+    deferred: Option<DeferredSink<'a>>,
+}
+
+impl<'a> VariableContext<'a> {
+    /// Boot-time context persisting through the boot bridge.
+    fn boot(
+        store: &'a mut VariableStore,
+        transaction: &'a mut VariableTransaction,
+        bridge: u64,
+    ) -> Self {
+        Self {
+            store,
+            transaction,
+            phase: Phase::BootActive,
+            bridge,
+            deferred: None,
         }
     }
-    if secure_boot::is_status_variable(&guid, name)
-        || capsule::is_esrt_last_attempt_variable(&guid, name)
-    {
-        return efi::Status::WRITE_PROTECTED;
+}
+
+/// Request payload after authentication.
+struct Verified<'a> {
+    payload: &'a [u8],
+    timestamp: Option<VariableTimestamp>,
+    secure_variable: Option<SecureBootVariable>,
+}
+
+/// Validate, authenticate, persist and commit one variable write.
+fn apply_variable(
+    context: VariableContext<'_>,
+    request: VariableRequest<'_>,
+) -> Result<(), efi::Status> {
+    let VariableContext {
+        store,
+        transaction,
+        phase,
+        bridge,
+        mut deferred,
+    } = context;
+    validate_set_arguments(request.attributes, request.data.len())?;
+    if !phase.boot_services() && request.nonvolatile(store) {
+        deferred
+            .as_ref()
+            .ok_or(efi::Status::UNSUPPORTED)?
+            .region
+            .validate_profile()?;
     }
-    let secure_variable = secure_boot::identify_key_database(&guid, name);
+    let secure_variable = check_write_policy(store, &request)?;
+    let verified = verify(store, &request)?;
+    if verified.payload.len() > MAX_VARIABLE_DATA_SIZE {
+        return Err(efi::Status::OUT_OF_RESOURCES);
+    }
+    if !phase.boot_services() {
+        let delete = verified.payload.is_empty() && !request.append();
+        check_runtime_access(store, &request, delete)?;
+    }
+
+    let mut prepared = store.prepare(
+        request.guid,
+        request.name,
+        request.attributes,
+        verified.payload.len(),
+    )?;
+    // Authenticated commits (including deletions) record their timestamp so
+    // later envelopes must be strictly newer.
+    prepared.timestamp = verified.timestamp.unwrap_or_default();
+    let staged_len = store
+        .stage(
+            transaction,
+            &mut prepared,
+            verified.payload,
+            request.append(),
+        )?
+        .len();
+    let staged = transaction
+        .data(staged_len)
+        .ok_or(efi::Status::DEVICE_ERROR)?;
+    if secure_variable.is_some() && !prepared.delete && !validate_signature_database(staged) {
+        return Err(efi::Status::INVALID_PARAMETER);
+    }
+
+    if prepared.attributes & efi::VARIABLE_NON_VOLATILE != 0 {
+        if phase.boot_services() {
+            persist_through_bridge(bridge, &request, &prepared, staged, verified.timestamp)?;
+        } else {
+            let sink = deferred.as_mut().ok_or(efi::Status::DEVICE_ERROR)?;
+            queue_deferred(sink, &request, &prepared, staged, verified.timestamp)?;
+        }
+    }
+
+    store.commit(transaction, prepared, request.name)?;
+    if let (Some(variable), Some(timestamp)) = (verified.secure_variable, verified.timestamp) {
+        store.commit_auth_timestamp(variable, timestamp);
+    }
+    store.refresh_policy();
+    Ok(())
+}
+
+/// Reject writes to protected variables and raw writes to authenticated ones.
+fn check_write_policy(
+    store: &VariableStore,
+    request: &VariableRequest<'_>,
+) -> Result<Option<SecureBootVariable>, efi::Status> {
+    let (guid, name) = (&request.guid, request.name);
+    if secure_boot::is_status_variable(guid, name)
+        || capsule::is_esrt_last_attempt_variable(guid, name)
+    {
+        return Err(efi::Status::WRITE_PROTECTED);
+    }
+    let secure_variable = secure_boot::identify_key_database(guid, name);
     #[cfg(not(feature = "secure-boot"))]
     if secure_variable.is_some()
-        || (guid == secure_boot::EFI_GLOBAL_VARIABLE_GUID
+        || (*guid == secure_boot::EFI_GLOBAL_VARIABLE_GUID
             && secure_boot::name_matches(name, secure_boot::SECURE_BOOT_ENABLE_NAME))
     {
-        return efi::Status::UNSUPPORTED;
+        return Err(efi::Status::UNSUPPORTED);
     }
-    let authenticated = attributes & efi::VARIABLE_TIME_BASED_AUTHENTICATED_WRITE_ACCESS != 0;
-    if secure_variable.is_some() && !authenticated && !store.setup_mode() {
-        return efi::Status::SECURITY_VIOLATION;
+    if secure_variable.is_some() && !request.authenticated() && !store.setup_mode() {
+        return Err(efi::Status::SECURITY_VIOLATION);
     }
     // EDK2 parity (AuthService.c `ProcessVariable`): a variable with
     // time-based authentication history keeps requiring an authenticated
     // envelope for every later update, append, and deletion, whatever its
     // GUID. This includes tombstones left by authenticated deletions, so a
-    // deleted variable cannot be silently re-created with raw content. Raw
-    // requests fail closed instead.
-    if !authenticated && store.auth_history_timestamp(&guid, name).is_some() {
-        return efi::Status::WRITE_PROTECTED;
+    // deleted variable cannot be silently re-created with raw content.
+    if !request.authenticated() && store.auth_history_timestamp(guid, name).is_some() {
+        return Err(efi::Status::WRITE_PROTECTED);
     }
-    #[cfg(feature = "secure-boot")]
-    let (payload, timestamp, authenticated_variable) = if authenticated {
-        match auth::verify_authenticated_variable(store, name, &guid, attributes, input) {
-            Ok(verified) => (
-                verified.payload,
-                Some(auth::timestamp_from_efi_time(verified.timestamp)),
-                verified.secure_variable,
-            ),
-            Err(error) => return error.into(),
+    Ok(secure_variable)
+}
+
+#[cfg(feature = "secure-boot")]
+fn verify<'a>(
+    store: &VariableStore,
+    request: &VariableRequest<'a>,
+) -> Result<Verified<'a>, efi::Status> {
+    if !request.authenticated() {
+        return Ok(Verified {
+            payload: request.data,
+            timestamp: None,
+            secure_variable: None,
+        });
+    }
+    let verified = auth::verify_authenticated_variable(
+        store,
+        request.name,
+        &request.guid,
+        request.attributes,
+        request.data,
+    )?;
+    Ok(Verified {
+        payload: verified.payload,
+        timestamp: Some(auth::timestamp_from_efi_time(verified.timestamp)),
+        secure_variable: verified.secure_variable,
+    })
+}
+
+#[cfg(not(feature = "secure-boot"))]
+fn verify<'a>(
+    _store: &VariableStore,
+    request: &VariableRequest<'a>,
+) -> Result<Verified<'a>, efi::Status> {
+    Ok(Verified {
+        payload: request.data,
+        timestamp: None,
+        secure_variable: None,
+    })
+}
+
+/// After ExitBootServices only runtime-accessible variables may be written or
+/// deleted.
+fn check_runtime_access(
+    store: &VariableStore,
+    request: &VariableRequest<'_>,
+    delete: bool,
+) -> Result<(), efi::Status> {
+    if delete {
+        match store.find(&request.guid, request.name, false) {
+            Some(slot) if slot.attributes & efi::VARIABLE_RUNTIME_ACCESS != 0 => Ok(()),
+            Some(_) => Err(efi::Status::INVALID_PARAMETER),
+            None => Err(efi::Status::NOT_FOUND),
         }
+    } else if request.attributes & efi::VARIABLE_RUNTIME_ACCESS == 0 {
+        Err(efi::Status::INVALID_PARAMETER)
     } else {
-        (input, None, None)
-    };
-    #[cfg(not(feature = "secure-boot"))]
-    let (payload, timestamp, authenticated_variable) = (
-        input,
-        None::<VariableTimestamp>,
-        None::<secure_boot::SecureBootVariable>,
-    );
-    if payload.len() > MAX_VARIABLE_DATA_SIZE {
-        return efi::Status::OUT_OF_RESOURCES;
+        Ok(())
     }
-    let append = attributes & efi::VARIABLE_APPEND_WRITE != 0;
-    let delete = payload.is_empty() && !append;
-    if !current_phase.boot_services() {
-        let existing = store.find(&guid, name, false);
-        if delete {
-            match existing {
-                Some(slot) if slot.attributes & efi::VARIABLE_RUNTIME_ACCESS != 0 => {}
-                Some(_) => return efi::Status::INVALID_PARAMETER,
-                None => return efi::Status::NOT_FOUND,
-            }
-        } else if attributes & efi::VARIABLE_RUNTIME_ACCESS == 0 {
-            return efi::Status::INVALID_PARAMETER;
-        }
-    }
+}
 
-    let mut prepared = match store.prepare(guid, name, attributes, payload.len()) {
-        Ok(prepared) => prepared,
-        Err(status) => return status,
-    };
-    // Authenticated commits (including deletions) record their timestamp so
-    // later envelopes must be strictly newer.
-    prepared.timestamp = timestamp.unwrap_or_default();
-    let staged_len = match store.stage(transaction, &mut prepared, payload, append) {
-        Ok(staged) => staged.len(),
-        Err(status) => return status,
-    };
-    let Some(staged) = transaction.data(staged_len) else {
-        return efi::Status::DEVICE_ERROR;
-    };
-    if secure_variable.is_some() && !prepared.delete && !validate_signature_database(staged) {
-        return efi::Status::INVALID_PARAMETER;
-    }
-
-    if prepared.attributes & efi::VARIABLE_NON_VOLATILE != 0 {
-        if current_phase.boot_services() {
-            let request = BridgeRequest {
-                operation: if prepared.delete {
-                    bridge_operation::PERSIST_DELETE
-                } else {
-                    bridge_operation::PERSIST_WRITE
-                },
-                attributes: prepared.attributes,
-                guid,
-                name_address: name.as_ptr() as u64,
-                name_len: name.len() as u32,
-                data_len: staged_len as u32,
-                data_address: staged.as_ptr() as u64,
-                timestamp_valid: u32::from(timestamp.is_some()),
-                reserved: 0,
-                timestamp: timestamp.unwrap_or_default(),
-            };
-            if let Err(status) = call_boot_bridge(bridge, &request) {
-                return status;
-            }
-        } else {
-            let (Some(deferred_transaction), Some(region)) =
-                (deferred_transaction, region.as_mut())
-            else {
-                return efi::Status::DEVICE_ERROR;
-            };
-            let queued = if authenticated {
-                region.queue_write(
-                    deferred_transaction,
-                    deferred::DeferredWrite {
-                        guid,
-                        name,
-                        attributes,
-                        data: input,
-                        timestamp: timestamp.unwrap_or_default(),
-                        authenticated: true,
-                        deletion: prepared.delete,
-                    },
-                )
+fn persist_through_bridge(
+    bridge: u64,
+    request: &VariableRequest<'_>,
+    prepared: &PreparedWrite,
+    staged: &[u8],
+    timestamp: Option<VariableTimestamp>,
+) -> Result<(), efi::Status> {
+    call_boot_bridge(
+        bridge,
+        &BridgeRequest {
+            operation: if prepared.delete {
+                bridge_operation::PERSIST_DELETE
             } else {
-                region.queue_write(
-                    deferred_transaction,
-                    deferred::DeferredWrite {
-                        guid,
-                        name,
-                        attributes: if prepared.delete {
-                            0
-                        } else {
-                            prepared.attributes
-                        },
-                        data: staged,
-                        timestamp: VariableTimestamp::default(),
-                        authenticated: false,
-                        deletion: prepared.delete,
-                    },
-                )
-            };
-            if let Err(status) = queued {
-                return status;
-            }
-        }
-    }
+                bridge_operation::PERSIST_WRITE
+            },
+            attributes: prepared.attributes,
+            guid: request.guid,
+            name_address: request.name.as_ptr() as u64,
+            name_len: request.name.len() as u32,
+            data_len: staged.len() as u32,
+            data_address: staged.as_ptr() as u64,
+            timestamp_valid: u32::from(timestamp.is_some()),
+            reserved: 0,
+            timestamp: timestamp.unwrap_or_default(),
+        },
+    )
+}
 
-    if let Err(status) = store.commit(transaction, prepared, name) {
-        return status;
-    }
-    if let (Some(variable), Some(timestamp)) = (authenticated_variable, timestamp) {
-        store.commit_auth_timestamp(variable, timestamp);
-    }
-    store.refresh_policy();
-    efi::Status::SUCCESS
+/// Journal a runtime write for replay on the next boot. Authenticated
+/// requests keep their envelope so replay re-verifies it.
+fn queue_deferred(
+    sink: &mut DeferredSink<'_>,
+    request: &VariableRequest<'_>,
+    prepared: &PreparedWrite,
+    staged: &[u8],
+    timestamp: Option<VariableTimestamp>,
+) -> Result<(), efi::Status> {
+    let (attributes, data) = if request.authenticated() {
+        (request.attributes, request.data)
+    } else if prepared.delete {
+        (0, staged)
+    } else {
+        (prepared.attributes, staged)
+    };
+    sink.region.queue_write(
+        sink.transaction,
+        deferred::DeferredWrite {
+            guid: request.guid,
+            name: request.name,
+            attributes,
+            data,
+            timestamp: timestamp.unwrap_or_default(),
+            authenticated: request.authenticated(),
+            deletion: prepared.delete,
+        },
+    )
 }
 
 pub fn prepare_retained_staging(lease: &mut state::Lease) -> Result<(), efi::Status> {
@@ -642,25 +751,17 @@ pub fn prepare_retained_staging(lease: &mut state::Lease) -> Result<(), efi::Sta
     {
         return Ok(());
     }
-    let status = apply_variable(
-        store,
-        transaction,
-        None,
-        Phase::BootActive,
-        bridge,
-        None,
-        guid,
-        CAPSULE_UPDATE_NAME,
-        efi::VARIABLE_NON_VOLATILE
-            | efi::VARIABLE_BOOTSERVICE_ACCESS
-            | efi::VARIABLE_RUNTIME_ACCESS,
-        &data,
-    );
-    if status == efi::Status::SUCCESS {
-        Ok(())
-    } else {
-        Err(status)
-    }
+    apply_variable(
+        VariableContext::boot(store, transaction, bridge),
+        VariableRequest {
+            guid,
+            name: CAPSULE_UPDATE_NAME,
+            attributes: efi::VARIABLE_NON_VOLATILE
+                | efi::VARIABLE_BOOTSERVICE_ACCESS
+                | efi::VARIABLE_RUNTIME_ACCESS,
+            data: &data,
+        },
+    )
 }
 
 pub fn replay_deferred(lease: &mut state::Lease) -> Result<usize, efi::Status> {
@@ -699,36 +800,30 @@ pub fn replay_deferred(lease: &mut state::Lease) -> Result<usize, efi::Status> {
                 return Ok(());
             }
         }
-        let status = apply_variable(
-            store,
-            transaction,
-            None,
-            Phase::BootActive,
-            bridge,
-            None,
-            record.guid.bytes,
-            name,
-            record.attributes,
-            record.data,
+        let result = apply_variable(
+            VariableContext::boot(store, transaction, bridge),
+            VariableRequest {
+                guid: record.guid.bytes,
+                name,
+                attributes: record.attributes,
+                data: record.data,
+            },
         );
-        replay_apply_result(status, authenticated, deletion)
+        replay_apply_result(result, authenticated, deletion)
     })
 }
 
+/// A raw deletion may have reached durable storage before reset while its
+/// retained acknowledgement was lost. The absent imported value is then the
+/// requested final state, so replay can consume the record.
 fn replay_apply_result(
-    status: efi::Status,
+    result: Result<(), efi::Status>,
     authenticated: bool,
     deletion: bool,
 ) -> Result<(), efi::Status> {
-    if status == efi::Status::SUCCESS
-        || (!authenticated && deletion && status == efi::Status::NOT_FOUND)
-    {
-        // A raw deletion may have reached durable storage before reset while
-        // its retained acknowledgement was lost. The absent imported value is
-        // then the requested final state, so replay can consume the record.
-        Ok(())
-    } else {
-        Err(status)
+    match result {
+        Err(status) if status == efi::Status::NOT_FOUND && !authenticated && deletion => Ok(()),
+        result => result,
     }
 }
 
@@ -750,23 +845,35 @@ pub extern "efiapi" fn update_capsule(
     capsule_count: usize,
     scatter_gather_list: efi::PhysicalAddress,
 ) -> efi::Status {
+    efi::status(stage_capsule(
+        capsule_header_array,
+        capsule_count,
+        scatter_gather_list,
+    ))
+}
+
+fn stage_capsule(
+    capsule_header_array: *mut *mut efi::CapsuleHeader,
+    capsule_count: usize,
+    scatter_gather_list: efi::PhysicalAddress,
+) -> Result<(), efi::Status> {
     if capsule_header_array.is_null() || capsule_count == 0 {
-        return efi::Status::INVALID_PARAMETER;
+        return Err(efi::Status::INVALID_PARAMETER);
     }
     if capsule_count > 1 {
-        return efi::Status::UNSUPPORTED;
+        return Err(efi::Status::UNSUPPORTED);
     }
     let phase = Phase::current();
     if phase.boot_services() {
-        return efi::Status::UNSUPPORTED;
+        return Err(efi::Status::UNSUPPORTED);
     }
     if !phase.runtime() || scatter_gather_list == 0 {
-        return efi::Status::INVALID_PARAMETER;
+        return Err(efi::Status::INVALID_PARAMETER);
     }
     // SAFETY: one pointer entry is required by the validated count.
     let header = unsafe { capsule_header_array.read() };
     if header.is_null() {
-        return efi::Status::INVALID_PARAMETER;
+        return Err(efi::Status::INVALID_PARAMETER);
     }
     // SAFETY: the UEFI caller supplies a readable capsule header.
     let header = unsafe { &*header };
@@ -775,27 +882,25 @@ pub extern "efiapi" fn update_capsule(
         || header.capsule_image_size < header.header_size
         || u64::from(header.capsule_image_size) > MAX_CAPSULE_SIZE
     {
-        return efi::Status::INVALID_PARAMETER;
+        return Err(efi::Status::INVALID_PARAMETER);
     }
 
-    let mut lease = match state::lease() {
-        Ok(lease) => lease,
-        Err(_) => return efi::Status::DEVICE_ERROR,
-    };
+    let mut lease = state::lease().map_err(|_| efi::Status::DEVICE_ERROR)?;
     if !capsule_delivery_available(lease.state()) {
-        return efi::Status::UNSUPPORTED;
+        return Err(efi::Status::UNSUPPORTED);
     }
     if !scatter_gather_list.is_multiple_of(8) {
-        return efi::Status::INVALID_PARAMETER;
+        return Err(efi::Status::INVALID_PARAMETER);
     }
     // SAFETY: UpdateCapsule defines scatter_gather_list as a readable physical
     // EFI_CAPSULE_BLOCK_DESCRIPTOR list; only its first descriptor is read.
     let first_block =
         unsafe { (scatter_gather_list as *const deferred::CapsuleBlockDescriptor).read() };
-    let Some(mut region) = lease.state_mut().deferred_region() else {
-        return efi::Status::UNSUPPORTED;
-    };
-    efi::status(region.stage_capsule(header.capsule_image_size, scatter_gather_list, first_block))
+    lease
+        .state_mut()
+        .deferred_region()
+        .ok_or(efi::Status::UNSUPPORTED)?
+        .stage_capsule(header.capsule_image_size, scatter_gather_list, first_block)
 }
 
 /// Capsule staging requires retained storage and boot-time confirmation that
@@ -811,20 +916,34 @@ pub extern "efiapi" fn query_capsule_capabilities(
     maximum_capsule_size: *mut u64,
     reset_type: *mut efi::ResetType,
 ) -> efi::Status {
+    efi::status(capsule_capabilities(
+        capsule_header_array,
+        capsule_count,
+        maximum_capsule_size,
+        reset_type,
+    ))
+}
+
+fn capsule_capabilities(
+    capsule_header_array: *mut *mut efi::CapsuleHeader,
+    capsule_count: usize,
+    maximum_capsule_size: *mut u64,
+    reset_type: *mut efi::ResetType,
+) -> Result<(), efi::Status> {
     if capsule_header_array.is_null()
         || capsule_count == 0
         || maximum_capsule_size.is_null()
         || reset_type.is_null()
     {
-        return efi::Status::INVALID_PARAMETER;
+        return Err(efi::Status::INVALID_PARAMETER);
     }
     if capsule_count > 1 {
-        return efi::Status::UNSUPPORTED;
+        return Err(efi::Status::UNSUPPORTED);
     }
     // SAFETY: one pointer entry is required by the validated count.
     let header = unsafe { capsule_header_array.read() };
     if header.is_null() {
-        return efi::Status::INVALID_PARAMETER;
+        return Err(efi::Status::INVALID_PARAMETER);
     }
     // SAFETY: the UEFI caller supplies a readable capsule header and writable
     // output pointers.
@@ -832,27 +951,24 @@ pub extern "efiapi" fn query_capsule_capabilities(
     if header.flags & CAPSULE_FLAGS_PERSIST_ACROSS_RESET == 0
         || u64::from(header.capsule_image_size) > MAX_CAPSULE_SIZE
     {
-        return efi::Status::UNSUPPORTED;
+        return Err(efi::Status::UNSUPPORTED);
     }
     // Match `update_capsule`'s structural header checks so a capsule cannot
     // pass the capability query and then fail the update itself.
     if header.header_size < core::mem::size_of::<efi::CapsuleHeader>() as u32
         || header.capsule_image_size < header.header_size
     {
-        return efi::Status::INVALID_PARAMETER;
+        return Err(efi::Status::INVALID_PARAMETER);
     }
-    let lease = match state::lease() {
-        Ok(lease) => lease,
-        Err(status) => return status,
-    };
+    let lease = state::lease()?;
     if !capsule_delivery_available(lease.state()) {
-        return efi::Status::UNSUPPORTED;
+        return Err(efi::Status::UNSUPPORTED);
     }
     unsafe {
         maximum_capsule_size.write(MAX_CAPSULE_SIZE);
         reset_type.write(efi::RESET_WARM);
     }
-    efi::Status::SUCCESS
+    Ok(())
 }
 
 pub extern "efiapi" fn query_variable_info(
@@ -861,33 +977,44 @@ pub extern "efiapi" fn query_variable_info(
     remaining_variable_storage_size: *mut u64,
     maximum_variable_size: *mut u64,
 ) -> efi::Status {
+    efi::status(variable_info(
+        attributes,
+        maximum_variable_storage_size,
+        remaining_variable_storage_size,
+        maximum_variable_size,
+    ))
+}
+
+fn variable_info(
+    attributes: u32,
+    maximum_variable_storage_size: *mut u64,
+    remaining_variable_storage_size: *mut u64,
+    maximum_variable_size: *mut u64,
+) -> Result<(), efi::Status> {
     if maximum_variable_storage_size.is_null()
         || remaining_variable_storage_size.is_null()
         || maximum_variable_size.is_null()
         || attributes == 0
         || attributes & !efi::VARIABLE_KNOWN_ATTRIBUTES != 0
     {
-        return efi::Status::INVALID_PARAMETER;
+        return Err(efi::Status::INVALID_PARAMETER);
     }
     if attributes & (efi::VARIABLE_NON_VOLATILE | efi::VARIABLE_BOOTSERVICE_ACCESS)
         != efi::VARIABLE_NON_VOLATILE | efi::VARIABLE_BOOTSERVICE_ACCESS
         || attributes & efi::VARIABLE_APPEND_WRITE != 0
     {
-        return efi::Status::INVALID_PARAMETER;
+        return Err(efi::Status::INVALID_PARAMETER);
     }
-    let lease = match state::lease() {
-        Ok(lease) => lease,
-        Err(status) => return status,
-    };
+    let lease = state::lease()?;
     // Without retained staging the RAM store still answers: volatile writes
     // remain possible and SetVariable stays the authority on NV failures.
     // SAFETY: all required outputs were checked non-null.
     unsafe {
-        maximum_variable_storage_size.write(crate::store::VariableStore::maximum_storage());
+        maximum_variable_storage_size.write(VariableStore::maximum_storage());
         remaining_variable_storage_size.write(lease.variables().remaining_storage());
         maximum_variable_size.write(MAX_VARIABLE_DATA_SIZE as u64);
     }
-    efi::Status::SUCCESS
+    Ok(())
 }
 
 fn call_boot_bridge(address: u64, request: &BridgeRequest) -> Result<(), efi::Status> {
@@ -898,11 +1025,9 @@ fn call_boot_bridge(address: u64, request: &BridgeRequest) -> Result<(), efi::St
     // SAFETY: runtime initialization receives this one audited bridge address
     // from the boot loader. It is used only in BootActive and zeroed at seal.
     let bridge: Bridge = unsafe { core::mem::transmute(address as usize) };
-    let status = efi::Status::from_usize(bridge(request));
-    if status == efi::Status::SUCCESS {
-        Ok(())
-    } else {
-        Err(status)
+    match efi::Status::from_usize(bridge(request)) {
+        efi::Status::SUCCESS => Ok(()),
+        status => Err(status),
     }
 }
 
@@ -993,10 +1118,7 @@ mod tests {
     use super::*;
     use crabefi_efi_types::authentication::EfiVariableAuthentication2;
 
-    use crate::{
-        auth,
-        store::{VariableStore, VariableTransaction},
-    };
+    use crate::auth;
 
     #[test]
     fn bounded_name_read_rejects_missing_terminator_without_exceeding_declared_extent() {
@@ -1029,79 +1151,123 @@ mod tests {
             .unwrap()
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn apply(
-        store: &mut VariableStore,
-        transaction: &mut VariableTransaction,
-        deferred_transaction: &mut deferred::DeferredTransaction,
-        buffer: &mut [u8],
-        current_phase: Phase,
-        variable: secure_boot::SecureBootVariable,
-        attributes: u32,
-        data: &[u8],
-    ) -> efi::Status {
-        apply_variable(
-            store,
-            transaction,
-            Some(deferred_transaction),
-            current_phase,
-            successful_bridge as *const () as u64,
-            Some(DeferredRegion::new(buffer)),
-            *variable.guid(),
-            variable.name(),
-            attributes,
-            data,
-        )
+    /// Variable store with a successful boot bridge and a retained buffer.
+    struct Fixture {
+        store: VariableStore,
+        transaction: VariableTransaction,
+        deferred_transaction: deferred::DeferredTransaction,
+        buffer: Vec<u8>,
     }
 
-    fn enroll_raw(
-        store: &mut VariableStore,
-        transaction: &mut VariableTransaction,
-        deferred_transaction: &mut deferred::DeferredTransaction,
-        buffer: &mut [u8],
-    ) {
-        let pk = include_bytes!("../tests/fixtures/pk.esl");
-        for variable in [
-            secure_boot::SecureBootVariable::Kek,
-            secure_boot::SecureBootVariable::Db,
-            secure_boot::SecureBootVariable::Dbx,
-            secure_boot::SecureBootVariable::PK,
-        ] {
-            assert_eq!(
-                apply(
-                    store,
-                    transaction,
-                    deferred_transaction,
-                    buffer,
-                    Phase::BootActive,
-                    variable,
-                    RAW_ATTRIBUTES,
-                    pk,
-                ),
-                efi::Status::SUCCESS
-            );
+    impl Fixture {
+        fn new() -> Box<Self> {
+            Box::new(Self {
+                store: VariableStore::new(),
+                transaction: VariableTransaction::new(),
+                deferred_transaction: deferred::DeferredTransaction::new(),
+                buffer: vec![0; 64 * 1024],
+            })
         }
-        assert!(!store.setup_mode());
+
+        /// A fixture whose retained buffer holds an initialized journal.
+        fn retained() -> Box<Self> {
+            let mut fixture = Self::new();
+            DeferredRegion::new(&mut fixture.buffer)
+                .prepare_retained()
+                .unwrap();
+            fixture
+        }
+
+        fn write(
+            &mut self,
+            phase: Phase,
+            guid: [u8; 16],
+            name: &[u16],
+            attributes: u32,
+            data: &[u8],
+        ) -> efi::Status {
+            efi::status(apply_variable(
+                VariableContext {
+                    store: &mut self.store,
+                    transaction: &mut self.transaction,
+                    phase,
+                    bridge: successful_bridge as *const () as u64,
+                    deferred: Some(DeferredSink {
+                        transaction: &mut self.deferred_transaction,
+                        region: DeferredRegion::new(&mut self.buffer),
+                    }),
+                },
+                VariableRequest {
+                    guid,
+                    name,
+                    attributes,
+                    data,
+                },
+            ))
+        }
+
+        fn apply(
+            &mut self,
+            phase: Phase,
+            variable: SecureBootVariable,
+            attributes: u32,
+            data: &[u8],
+        ) -> efi::Status {
+            self.write(phase, *variable.guid(), variable.name(), attributes, data)
+        }
+
+        fn import(
+            &mut self,
+            guid: [u8; 16],
+            name: &[u16],
+            attributes: u32,
+            data: &[u8],
+            timestamp: Option<VariableTimestamp>,
+        ) {
+            self.store
+                .import(
+                    &mut self.transaction,
+                    guid,
+                    name,
+                    attributes,
+                    data,
+                    timestamp,
+                )
+                .unwrap();
+        }
+
+        fn enroll_raw(&mut self) {
+            let pk = include_bytes!("../tests/fixtures/pk.esl");
+            for variable in [
+                SecureBootVariable::Kek,
+                SecureBootVariable::Db,
+                SecureBootVariable::Dbx,
+                SecureBootVariable::PK,
+            ] {
+                assert_eq!(
+                    self.apply(Phase::BootActive, variable, RAW_ATTRIBUTES, pk),
+                    efi::Status::SUCCESS
+                );
+            }
+            assert!(!self.store.setup_mode());
+        }
+    }
+
+    fn timestamp(year: u16) -> VariableTimestamp {
+        VariableTimestamp {
+            year,
+            month: 1,
+            day: 1,
+            ..VariableTimestamp::default()
+        }
     }
 
     #[test]
     fn firmware_imports_private_attempt_state_but_public_writes_cannot_forge_it() {
-        let mut store = VariableStore::new();
-        let mut transaction = VariableTransaction::new();
-        let mut deferred_transaction = deferred::DeferredTransaction::new();
+        let mut fixture = Fixture::new();
         let guid = capsule::CAPSULE_REPORT_VARIABLE_GUID;
         let name = capsule::ESRT_LAST_ATTEMPT_VARIABLE_NAME;
-
-        store
-            .import(
-                &mut transaction,
-                guid,
-                name,
-                RAW_ATTRIBUTES,
-                b"firmware",
-                None,
-            )
-            .unwrap();
+        fixture.import(guid, name, RAW_ATTRIBUTES, b"firmware", None);
 
         for (attributes, value) in [
             (RAW_ATTRIBUTES, b"forged".as_slice()),
@@ -1112,72 +1278,33 @@ mod tests {
             (0, b"".as_slice()),
         ] {
             assert_eq!(
-                apply_variable(
-                    &mut store,
-                    &mut transaction,
-                    Some(&mut deferred_transaction),
-                    Phase::BootActive,
-                    successful_bridge as *const () as u64,
-                    None,
-                    guid,
-                    name,
-                    attributes,
-                    value,
-                ),
+                fixture.write(Phase::BootActive, guid, name, attributes, value),
                 efi::Status::WRITE_PROTECTED
             );
         }
 
-        let slot = store.find(&guid, name, false).unwrap();
-        assert_eq!(store.data(slot), Some(b"firmware".as_slice()));
+        let slot = fixture.store.find(&guid, name, false).unwrap();
+        assert_eq!(fixture.store.data(slot), Some(b"firmware".as_slice()));
     }
 
     #[test]
     fn raw_writes_cannot_modify_previously_authenticated_variables() {
-        let mut store = VariableStore::new();
-        let mut transaction = VariableTransaction::new();
-        let mut deferred_transaction = deferred::DeferredTransaction::new();
+        let mut fixture = Fixture::new();
         let guid = [0x42; 16];
         let name = [b'A' as u16, b'u' as u16, b't' as u16, b'h' as u16];
 
         // Boot import is firmware-authoritative and may enroll an
         // authenticated variable directly.
-        store
-            .import(
-                &mut transaction,
-                guid,
-                &name,
-                AUTH_ATTRIBUTES,
-                b"payload",
-                None,
-            )
-            .unwrap();
+        fixture.import(guid, &name, AUTH_ATTRIBUTES, b"payload", None);
 
+        let raw = AUTH_ATTRIBUTES & !efi::VARIABLE_TIME_BASED_AUTHENTICATED_WRITE_ACCESS;
         for (attributes, value) in [
-            (
-                AUTH_ATTRIBUTES & !efi::VARIABLE_TIME_BASED_AUTHENTICATED_WRITE_ACCESS,
-                b"raw".as_slice(),
-            ),
-            (
-                (AUTH_ATTRIBUTES & !efi::VARIABLE_TIME_BASED_AUTHENTICATED_WRITE_ACCESS)
-                    | efi::VARIABLE_APPEND_WRITE,
-                b"append".as_slice(),
-            ),
+            (raw, b"raw".as_slice()),
+            (raw | efi::VARIABLE_APPEND_WRITE, b"append".as_slice()),
             (0, b"".as_slice()),
         ] {
             assert_eq!(
-                apply_variable(
-                    &mut store,
-                    &mut transaction,
-                    Some(&mut deferred_transaction),
-                    Phase::BootActive,
-                    successful_bridge as *const () as u64,
-                    None,
-                    guid,
-                    &name,
-                    attributes,
-                    value,
-                ),
+                fixture.write(Phase::BootActive, guid, &name, attributes, value),
                 efi::Status::WRITE_PROTECTED
             );
         }
@@ -1185,24 +1312,13 @@ mod tests {
         // Authenticated requests pass the gate and reach signature
         // verification, which rejects the truncated envelope.
         assert_eq!(
-            apply_variable(
-                &mut store,
-                &mut transaction,
-                Some(&mut deferred_transaction),
-                Phase::BootActive,
-                successful_bridge as *const () as u64,
-                None,
-                guid,
-                &name,
-                AUTH_ATTRIBUTES,
-                b"garbage",
-            ),
+            fixture.write(Phase::BootActive, guid, &name, AUTH_ATTRIBUTES, b"garbage"),
             efi::Status::INVALID_PARAMETER
         );
 
         // The authenticated content is untouched by every rejected attempt.
-        let slot = store.find(&guid, &name, false).unwrap();
-        assert_eq!(store.data(slot), Some(b"payload".as_slice()));
+        let slot = fixture.store.find(&guid, &name, false).unwrap();
+        assert_eq!(fixture.store.data(slot), Some(b"payload".as_slice()));
         assert_eq!(slot.attributes, AUTH_ATTRIBUTES);
     }
 
@@ -1228,62 +1344,32 @@ mod tests {
 
     #[test]
     fn deleted_authenticated_variables_keep_rollback_floors() {
-        let mut store = VariableStore::new();
-        let mut transaction = VariableTransaction::new();
+        let mut fixture = Fixture::new();
         let guid = [0x42; 16];
         let name = [b'A' as u16, b'u' as u16, b't' as u16, b'h' as u16];
-        let timestamp = |year: u16| VariableTimestamp {
-            year,
-            month: 1,
-            day: 1,
-            ..VariableTimestamp::default()
-        };
 
         // Boot import of the live variable followed by its persisted deletion
         // record (zero-length data, newer timestamp).
-        store
-            .import(
-                &mut transaction,
-                guid,
-                &name,
-                AUTH_ATTRIBUTES,
-                b"payload",
-                Some(timestamp(2024)),
-            )
-            .unwrap();
-        store
-            .import(
-                &mut transaction,
-                guid,
-                &name,
-                AUTH_ATTRIBUTES,
-                &[],
-                Some(timestamp(2025)),
-            )
-            .unwrap();
+        fixture.import(
+            guid,
+            &name,
+            AUTH_ATTRIBUTES,
+            b"payload",
+            Some(timestamp(2024)),
+        );
+        fixture.import(guid, &name, AUTH_ATTRIBUTES, &[], Some(timestamp(2025)));
 
         // The deletion is invisible as a variable but keeps its floor.
-        assert!(store.find(&guid, &name, false).is_none());
+        assert!(fixture.store.find(&guid, &name, false).is_none());
         assert_eq!(
-            store.auth_history_timestamp(&guid, &name),
+            fixture.store.auth_history_timestamp(&guid, &name),
             Some(timestamp(2025))
         );
 
         // Raw requests cannot re-create or delete the deleted variable.
         for attributes in [RAW_ATTRIBUTES, RAW_ATTRIBUTES | efi::VARIABLE_APPEND_WRITE] {
             assert_eq!(
-                apply_variable(
-                    &mut store,
-                    &mut transaction,
-                    None,
-                    Phase::BootActive,
-                    successful_bridge as *const () as u64,
-                    None,
-                    guid,
-                    &name,
-                    attributes,
-                    b"raw",
-                ),
+                fixture.write(Phase::BootActive, guid, &name, attributes, b"raw"),
                 efi::Status::WRITE_PROTECTED
             );
         }
@@ -1292,7 +1378,7 @@ mod tests {
         // signature verification even runs.
         assert!(matches!(
             auth::verify_authenticated_variable(
-                &store,
+                &fixture.store,
                 &name,
                 &guid,
                 AUTH_ATTRIBUTES,
@@ -1304,7 +1390,7 @@ mod tests {
         // instead, proving the floor itself did not reject it.
         assert!(matches!(
             auth::verify_authenticated_variable(
-                &store,
+                &fixture.store,
                 &name,
                 &guid,
                 AUTH_ATTRIBUTES,
@@ -1314,61 +1400,45 @@ mod tests {
         ));
 
         // Re-creation reclaims the tombstone slot and records the new floor.
-        store
-            .import(
-                &mut transaction,
-                guid,
-                &name,
-                AUTH_ATTRIBUTES,
-                b"new payload",
-                Some(timestamp(2026)),
-            )
-            .unwrap();
-        let slot = store.find(&guid, &name, false).unwrap();
-        assert_eq!(store.data(slot), Some(b"new payload".as_slice()));
+        fixture.import(
+            guid,
+            &name,
+            AUTH_ATTRIBUTES,
+            b"new payload",
+            Some(timestamp(2026)),
+        );
+        let slot = fixture.store.find(&guid, &name, false).unwrap();
+        assert_eq!(fixture.store.data(slot), Some(b"new payload".as_slice()));
         assert_eq!(
-            store.auth_history_timestamp(&guid, &name),
+            fixture.store.auth_history_timestamp(&guid, &name),
             Some(timestamp(2026))
         );
     }
 
     #[test]
     fn imported_secure_database_deletions_keep_authenticated_history() {
-        let mut store = VariableStore::new();
-        let mut transaction = VariableTransaction::new();
-        let mut deferred_transaction = deferred::DeferredTransaction::new();
-        let mut buffer = vec![0u8; 64 * 1024];
-        let variable = secure_boot::SecureBootVariable::PK;
-        let timestamp = |year: u16| VariableTimestamp {
-            year,
-            month: 1,
-            day: 1,
-            ..VariableTimestamp::default()
-        };
+        let mut fixture = Fixture::new();
+        let variable = SecureBootVariable::PK;
+        let pk = include_bytes!("../tests/fixtures/pk.esl");
 
-        store
-            .import(
-                &mut transaction,
-                *variable.guid(),
-                variable.name(),
-                AUTH_ATTRIBUTES,
-                include_bytes!("../tests/fixtures/pk.esl"),
-                Some(timestamp(2024)),
-            )
-            .unwrap();
-        assert!(!store.setup_mode());
+        fixture.import(
+            *variable.guid(),
+            variable.name(),
+            AUTH_ATTRIBUTES,
+            pk,
+            Some(timestamp(2024)),
+        );
+        assert!(!fixture.store.setup_mode());
 
-        store
-            .import(
-                &mut transaction,
-                *variable.guid(),
-                variable.name(),
-                AUTH_ATTRIBUTES,
-                &[],
-                Some(timestamp(2025)),
-            )
-            .unwrap();
+        fixture.import(
+            *variable.guid(),
+            variable.name(),
+            AUTH_ATTRIBUTES,
+            &[],
+            Some(timestamp(2025)),
+        );
 
+        let store = &fixture.store;
         assert!(store.setup_mode());
         assert!(
             store
@@ -1384,21 +1454,12 @@ mod tests {
         // Setup Mode permits unsigned authenticated enrollment, but the
         // deletion history must still reject raw re-creation.
         assert_eq!(
-            apply(
-                &mut store,
-                &mut transaction,
-                &mut deferred_transaction,
-                &mut buffer,
-                Phase::BootActive,
-                variable,
-                RAW_ATTRIBUTES,
-                include_bytes!("../tests/fixtures/pk.esl"),
-            ),
+            fixture.apply(Phase::BootActive, variable, RAW_ATTRIBUTES, pk),
             efi::Status::WRITE_PROTECTED
         );
         assert!(matches!(
             auth::verify_authenticated_variable(
-                &store,
+                &fixture.store,
                 variable.name(),
                 variable.guid(),
                 AUTH_ATTRIBUTES,
@@ -1408,7 +1469,7 @@ mod tests {
         ));
         assert!(
             auth::verify_authenticated_variable(
-                &store,
+                &fixture.store,
                 variable.name(),
                 variable.guid(),
                 AUTH_ATTRIBUTES,
@@ -1490,26 +1551,13 @@ mod tests {
 
     #[test]
     fn real_service_path_covers_all_secure_databases() {
-        let mut store = VariableStore::new();
-        let mut transaction = VariableTransaction::new();
-        let mut deferred_transaction = deferred::DeferredTransaction::new();
-        let mut buffer = vec![0u8; 64 * 1024];
-        DeferredRegion::new(&mut buffer).prepare_retained().unwrap();
-        enroll_raw(
-            &mut store,
-            &mut transaction,
-            &mut deferred_transaction,
-            &mut buffer,
-        );
+        let mut fixture = Fixture::retained();
+        fixture.enroll_raw();
 
         assert_eq!(
-            apply(
-                &mut store,
-                &mut transaction,
-                &mut deferred_transaction,
-                &mut buffer,
+            fixture.apply(
                 Phase::BootActive,
-                secure_boot::SecureBootVariable::Kek,
+                SecureBootVariable::Kek,
                 AUTH_ATTRIBUTES,
                 include_bytes!("../tests/fixtures/unauthorized-update.bin"),
             ),
@@ -1518,102 +1566,54 @@ mod tests {
 
         let operations = [
             (
-                secure_boot::SecureBootVariable::Db,
+                SecureBootVariable::Db,
                 include_bytes!("../tests/fixtures/db-update.bin").as_slice(),
                 include_bytes!("../tests/fixtures/db-append.bin").as_slice(),
                 include_bytes!("../tests/fixtures/db-delete.bin").as_slice(),
             ),
             (
-                secure_boot::SecureBootVariable::Dbx,
+                SecureBootVariable::Dbx,
                 include_bytes!("../tests/fixtures/dbx-update.bin").as_slice(),
                 include_bytes!("../tests/fixtures/dbx-append.bin").as_slice(),
                 include_bytes!("../tests/fixtures/dbx-delete.bin").as_slice(),
             ),
             (
-                secure_boot::SecureBootVariable::Kek,
+                SecureBootVariable::Kek,
                 include_bytes!("../tests/fixtures/kek-update.bin").as_slice(),
                 include_bytes!("../tests/fixtures/kek-append.bin").as_slice(),
                 include_bytes!("../tests/fixtures/kek-delete.bin").as_slice(),
             ),
             (
-                secure_boot::SecureBootVariable::PK,
+                SecureBootVariable::PK,
                 include_bytes!("../tests/fixtures/pk-update.bin").as_slice(),
                 include_bytes!("../tests/fixtures/pk-append.bin").as_slice(),
                 include_bytes!("../tests/fixtures/pk-delete.bin").as_slice(),
             ),
         ];
+        let append_attributes = AUTH_ATTRIBUTES | efi::VARIABLE_APPEND_WRITE;
         for (variable, update, append, delete) in operations {
-            assert_eq!(
-                apply(
-                    &mut store,
-                    &mut transaction,
-                    &mut deferred_transaction,
-                    &mut buffer,
-                    Phase::BootActive,
-                    variable,
-                    AUTH_ATTRIBUTES,
-                    update,
-                ),
-                efi::Status::SUCCESS
-            );
-            assert_eq!(
-                apply(
-                    &mut store,
-                    &mut transaction,
-                    &mut deferred_transaction,
-                    &mut buffer,
-                    Phase::BootActive,
-                    variable,
-                    AUTH_ATTRIBUTES,
-                    update,
-                ),
-                efi::Status::SECURITY_VIOLATION
-            );
-            assert_eq!(
-                apply(
-                    &mut store,
-                    &mut transaction,
-                    &mut deferred_transaction,
-                    &mut buffer,
-                    Phase::BootActive,
-                    variable,
-                    AUTH_ATTRIBUTES | efi::VARIABLE_APPEND_WRITE,
-                    append,
-                ),
-                efi::Status::SUCCESS
-            );
+            for (attributes, data, expected) in [
+                (AUTH_ATTRIBUTES, update, efi::Status::SUCCESS),
+                (AUTH_ATTRIBUTES, update, efi::Status::SECURITY_VIOLATION),
+                (append_attributes, append, efi::Status::SUCCESS),
+            ] {
+                assert_eq!(
+                    fixture.apply(Phase::BootActive, variable, attributes, data),
+                    expected
+                );
+            }
             assert!(validate_signature_database(
-                store.key_database_data(variable).unwrap()
+                fixture.store.key_database_data(variable).unwrap()
             ));
-            assert_eq!(
-                apply(
-                    &mut store,
-                    &mut transaction,
-                    &mut deferred_transaction,
-                    &mut buffer,
-                    Phase::BootActive,
-                    variable,
-                    AUTH_ATTRIBUTES,
-                    delete,
-                ),
-                efi::Status::SUCCESS
-            );
-            assert_eq!(
-                apply(
-                    &mut store,
-                    &mut transaction,
-                    &mut deferred_transaction,
-                    &mut buffer,
-                    Phase::BootActive,
-                    variable,
-                    AUTH_ATTRIBUTES,
-                    delete,
-                ),
-                efi::Status::SECURITY_VIOLATION
-            );
+            for expected in [efi::Status::SUCCESS, efi::Status::SECURITY_VIOLATION] {
+                assert_eq!(
+                    fixture.apply(Phase::BootActive, variable, AUTH_ATTRIBUTES, delete),
+                    expected
+                );
+            }
         }
-        assert!(store.setup_mode());
-        assert!(!store.secure_boot_enabled());
+        assert!(fixture.store.setup_mode());
+        assert!(!fixture.store.secure_boot_enabled());
     }
 
     #[test]
@@ -1645,9 +1645,9 @@ mod tests {
                 seen += 1;
                 replay_apply_result(
                     if deletion {
-                        efi::Status::NOT_FOUND
+                        Err(efi::Status::NOT_FOUND)
                     } else {
-                        efi::Status::SUCCESS
+                        Ok(())
                     },
                     authenticated,
                     deletion,
@@ -1662,9 +1662,34 @@ mod tests {
             Ok(0)
         );
         assert_eq!(
-            replay_apply_result(efi::Status::NOT_FOUND, true, true),
+            replay_apply_result(Err(efi::Status::NOT_FOUND), true, true),
             Err(efi::Status::NOT_FOUND)
         );
+    }
+
+    /// Replay every retained record of `fixture` into `target` at boot,
+    /// passing each record to `inspect` first.
+    fn replay_into(
+        fixture: &mut Fixture,
+        target: &mut Fixture,
+        inspect: impl Fn(&deferred::VariableRecord<'_>, bool, bool),
+    ) -> usize {
+        DeferredRegion::new(&mut fixture.buffer)
+            .replay(|record, authenticated, deletion| {
+                inspect(record, authenticated, deletion);
+                let name_len = record.name.iter().position(|unit| *unit == 0).unwrap();
+                match target.write(
+                    Phase::BootActive,
+                    record.guid.bytes,
+                    &record.name[..name_len],
+                    record.attributes,
+                    record.data,
+                ) {
+                    efi::Status::SUCCESS => Ok(()),
+                    status => Err(status),
+                }
+            })
+            .unwrap()
     }
 
     #[test]
@@ -1687,65 +1712,31 @@ mod tests {
         ];
         const VALUE: &[u8] = b"CrabRT";
 
-        let mut store = VariableStore::new();
-        let mut transaction = VariableTransaction::new();
-        let mut deferred_transaction = deferred::DeferredTransaction::new();
-        let mut buffer = vec![0u8; 64 * 1024];
-        DeferredRegion::new(&mut buffer).prepare_retained().unwrap();
+        let mut fixture = Fixture::retained();
         assert_eq!(
-            apply_variable(
-                &mut store,
-                &mut transaction,
-                Some(&mut deferred_transaction),
-                Phase::SealedPhysical,
-                successful_bridge as *const () as u64,
-                Some(DeferredRegion::new(&mut buffer)),
-                GUID,
-                NAME,
-                RAW_ATTRIBUTES,
-                VALUE,
-            ),
+            fixture.write(Phase::SealedPhysical, GUID, NAME, RAW_ATTRIBUTES, VALUE),
             efi::Status::SUCCESS
         );
 
-        let mut reboot_store = VariableStore::new();
-        let mut reboot_transaction = VariableTransaction::new();
-        let mut persisted = 0usize;
-        let processed = DeferredRegion::new(&mut buffer)
-            .replay(|record, authenticated, deletion| {
+        let mut reboot = Fixture::new();
+        let processed = replay_into(
+            &mut fixture,
+            &mut reboot,
+            |record, authenticated, deletion| {
                 assert!(!authenticated);
                 assert!(!deletion);
                 assert_eq!(record.attributes, RAW_ATTRIBUTES);
                 assert_eq!(record.data, VALUE);
                 let name_len = record.name.iter().position(|unit| *unit == 0).unwrap();
                 assert_eq!(&record.name[..name_len], NAME);
-                let status = apply_variable(
-                    &mut reboot_store,
-                    &mut reboot_transaction,
-                    None,
-                    Phase::BootActive,
-                    successful_bridge as *const () as u64,
-                    None,
-                    record.guid.bytes,
-                    &record.name[..name_len],
-                    record.attributes,
-                    record.data,
-                );
-                if status == efi::Status::SUCCESS {
-                    persisted += 1;
-                    Ok(())
-                } else {
-                    Err(status)
-                }
-            })
-            .unwrap();
+            },
+        );
         assert_eq!(processed, 1);
-        assert_eq!(persisted, 1);
-        let slot = reboot_store.find(&GUID, NAME, false).unwrap();
+        let slot = reboot.store.find(&GUID, NAME, false).unwrap();
         assert_eq!(slot.attributes, RAW_ATTRIBUTES);
-        assert_eq!(reboot_store.data(slot), Some(VALUE));
+        assert_eq!(reboot.store.data(slot), Some(VALUE));
         assert_eq!(
-            DeferredRegion::new(&mut buffer)
+            DeferredRegion::new(&mut fixture.buffer)
                 .replay(|_, _, _| panic!("acknowledged raw record replayed twice"),),
             Ok(0)
         );
@@ -1753,70 +1744,31 @@ mod tests {
 
     #[test]
     fn authenticated_post_ebs_write_replays_once_through_service_logic() {
-        let mut store = VariableStore::new();
-        let mut transaction = VariableTransaction::new();
-        let mut deferred_transaction = deferred::DeferredTransaction::new();
-        let mut buffer = vec![0u8; 64 * 1024];
-        DeferredRegion::new(&mut buffer).prepare_retained().unwrap();
-        enroll_raw(
-            &mut store,
-            &mut transaction,
-            &mut deferred_transaction,
-            &mut buffer,
-        );
+        let mut fixture = Fixture::retained();
+        fixture.enroll_raw();
         assert_eq!(
-            apply(
-                &mut store,
-                &mut transaction,
-                &mut deferred_transaction,
-                &mut buffer,
+            fixture.apply(
                 Phase::SealedPhysical,
-                secure_boot::SecureBootVariable::Db,
+                SecureBootVariable::Db,
                 AUTH_ATTRIBUTES,
                 include_bytes!("../tests/fixtures/db-update.bin"),
             ),
             efi::Status::SUCCESS
         );
 
-        let mut reboot_store = VariableStore::new();
-        let mut reboot_transaction = VariableTransaction::new();
-        enroll_raw(
-            &mut reboot_store,
-            &mut reboot_transaction,
-            &mut deferred_transaction,
-            &mut buffer,
-        );
-        let processed = DeferredRegion::new(&mut buffer)
-            .replay(|record, authenticated, _| {
-                assert!(authenticated);
-                let name_len = record.name.iter().position(|unit| *unit == 0).unwrap();
-                let status = apply_variable(
-                    &mut reboot_store,
-                    &mut reboot_transaction,
-                    None,
-                    Phase::BootActive,
-                    successful_bridge as *const () as u64,
-                    None,
-                    record.guid.bytes,
-                    &record.name[..name_len],
-                    record.attributes,
-                    record.data,
-                );
-                if status == efi::Status::SUCCESS {
-                    Ok(())
-                } else {
-                    Err(status)
-                }
-            })
-            .unwrap();
+        let mut reboot = Fixture::new();
+        reboot.enroll_raw();
+        let processed = replay_into(&mut fixture, &mut reboot, |_, authenticated, _| {
+            assert!(authenticated)
+        });
         assert_eq!(processed, 1);
         assert_eq!(
-            DeferredRegion::new(&mut buffer)
+            DeferredRegion::new(&mut fixture.buffer)
                 .replay(|_, _, _| panic!("acknowledged record replayed twice"),),
             Ok(0)
         );
         assert_eq!(
-            reboot_store.key_database_data(secure_boot::SecureBootVariable::Db),
+            reboot.store.key_database_data(SecureBootVariable::Db),
             Some(fixture_payload(include_bytes!(
                 "../tests/fixtures/db-update.bin"
             )))

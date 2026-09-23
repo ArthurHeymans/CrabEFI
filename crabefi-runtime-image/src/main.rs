@@ -305,7 +305,7 @@ pub unsafe extern "C" fn runtime_image_prepare_ebs(
     descriptor_count: usize,
 ) -> usize {
     if descriptors.is_null() || descriptor_count > MAX_RUNTIME_DESCRIPTORS {
-        return efi::Status::INVALID_PARAMETER.as_usize();
+        return export_status(Err(efi::Status::INVALID_PARAMETER));
     }
     // SAFETY: the boot allocator supplies exactly `descriptor_count`
     // initialized descriptors for this allocation-free immediate call.
