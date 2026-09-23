@@ -8,7 +8,7 @@ use crabefi_runtime_abi::{
     MAX_VARIABLE_DATA_SIZE, MAX_VARIABLE_NAME_LEN, MAX_VARIABLES, VariableTimestamp,
 };
 
-use crate::efi;
+use crate::efi::{Status, VariableAttributes};
 
 /// Total image-local variable payload capacity.
 ///
@@ -34,7 +34,7 @@ const ZERO_TIMESTAMP: VariableTimestamp = VariableTimestamp {
 #[repr(C)]
 pub struct VariableSlot {
     pub guid: [u8; 16],
-    pub attributes: u32,
+    pub attributes: VariableAttributes,
     pub name_len: u16,
     pub data_len: u16,
     pub data_offset: u32,
@@ -56,7 +56,7 @@ impl VariableSlot {
     pub const fn empty() -> Self {
         Self {
             guid: [0; 16],
-            attributes: 0,
+            attributes: VariableAttributes::empty(),
             name_len: 0,
             data_len: 0,
             data_offset: 0,
@@ -109,12 +109,15 @@ impl VariableTransaction {
         }
     }
 
-    fn stage(&mut self, old: &[u8], input: &[u8]) -> Result<&[u8], efi::Status> {
+    fn stage(&mut self, old: &[u8], input: &[u8]) -> Result<&[u8], Status> {
         let total = old
             .len()
             .checked_add(input.len())
-            .ok_or(efi::OUT_OF_RESOURCES)?;
-        let destination = self.bytes.get_mut(..total).ok_or(efi::OUT_OF_RESOURCES)?;
+            .ok_or(Status::OUT_OF_RESOURCES)?;
+        let destination = self
+            .bytes
+            .get_mut(..total)
+            .ok_or(Status::OUT_OF_RESOURCES)?;
         let (prefix, suffix) = destination.split_at_mut(old.len());
         prefix.copy_from_slice(old);
         suffix.copy_from_slice(input);
@@ -130,7 +133,7 @@ pub struct PreparedWrite {
     pub slot: usize,
     pub data_len: usize,
     pub name_len: usize,
-    pub attributes: u32,
+    pub attributes: VariableAttributes,
     pub guid: [u8; 16],
     pub delete: bool,
     /// Authentication timestamp to record with the committed slot. Zero for
@@ -154,17 +157,17 @@ impl VariableStore {
         transaction: &mut VariableTransaction,
         guid: [u8; 16],
         name: &[u16],
-        attributes: u32,
+        attributes: VariableAttributes,
         data: &[u8],
         timestamp: Option<VariableTimestamp>,
-    ) -> Result<(), efi::Status> {
+    ) -> Result<(), Status> {
         if is_status_variable(&guid, name) {
             return Ok(());
         }
         let secure_variable = identify_key_database(&guid, name);
         if data.is_empty()
             && let Some(timestamp) = timestamp
-            && attributes & efi::VARIABLE_TIME_BASED_AUTHENTICATED_WRITE_ACCESS != 0
+            && attributes.contains(VariableAttributes::TIME_BASED_AUTHENTICATED_WRITE_ACCESS)
         {
             // The boot side persists authenticated deletions as zero-length
             // records carrying the verified deletion timestamp. Keep it as a
@@ -198,7 +201,9 @@ impl VariableStore {
     ) -> Option<VariableTimestamp> {
         self.slots.iter().find_map(|slot| {
             let authenticated_history = (slot.matches(guid, name)
-                && slot.attributes & efi::VARIABLE_TIME_BASED_AUTHENTICATED_WRITE_ACCESS != 0)
+                && slot
+                    .attributes
+                    .contains(VariableAttributes::TIME_BASED_AUTHENTICATED_WRITE_ACCESS))
                 || slot.tombstone_matches(guid, name);
             authenticated_history.then_some(slot.timestamp)
         })
@@ -209,11 +214,11 @@ impl VariableStore {
         &mut self,
         guid: [u8; 16],
         name: &[u16],
-        attributes: u32,
+        attributes: VariableAttributes,
         timestamp: VariableTimestamp,
-    ) -> Result<(), efi::Status> {
+    ) -> Result<(), Status> {
         if name.is_empty() || name.len() > MAX_VARIABLE_NAME_LEN {
-            return Err(efi::INVALID_PARAMETER);
+            return Err(Status::INVALID_PARAMETER);
         }
         let index = self
             .slots
@@ -229,13 +234,13 @@ impl VariableStore {
                     .iter()
                     .position(|slot| slot.in_use == 0 && !slot.is_tombstone())
             })
-            .ok_or(efi::OUT_OF_RESOURCES)?;
+            .ok_or(Status::OUT_OF_RESOURCES)?;
         let slot = &mut self.slots[index];
         slot.in_use = 0;
         slot.data_len = 0;
         slot.data_offset = 0;
         slot.guid = guid;
-        slot.attributes = attributes & !efi::VARIABLE_APPEND_WRITE;
+        slot.attributes = attributes.difference(VariableAttributes::APPEND_WRITE);
         slot.name_len = name.len() as u16;
         let (slot_name, remainder) = slot.name.split_at_mut(name.len());
         slot_name.copy_from_slice(name);
@@ -286,7 +291,7 @@ impl VariableStore {
     pub fn find(&self, guid: &[u8; 16], name: &[u16], runtime_only: bool) -> Option<&VariableSlot> {
         self.slots.iter().find(|slot| {
             slot.matches(guid, name)
-                && (!runtime_only || slot.attributes & efi::VARIABLE_RUNTIME_ACCESS != 0)
+                && (!runtime_only || slot.attributes.contains(VariableAttributes::RUNTIME_ACCESS))
         })
     }
 
@@ -299,7 +304,7 @@ impl VariableStore {
     pub fn visible_slots(&self, runtime_only: bool) -> impl Iterator<Item = &VariableSlot> {
         self.slots.iter().filter(move |slot| {
             slot.in_use != 0
-                && (!runtime_only || slot.attributes & efi::VARIABLE_RUNTIME_ACCESS != 0)
+                && (!runtime_only || slot.attributes.contains(VariableAttributes::RUNTIME_ACCESS))
         })
     }
 
@@ -307,19 +312,19 @@ impl VariableStore {
         &self,
         guid: [u8; 16],
         name: &[u16],
-        attributes: u32,
+        attributes: VariableAttributes,
         data_len: usize,
-    ) -> Result<PreparedWrite, efi::Status> {
+    ) -> Result<PreparedWrite, Status> {
         if name.is_empty()
             || name.len() > MAX_VARIABLE_NAME_LEN
             || data_len > MAX_VARIABLE_DATA_SIZE
         {
-            return Err(efi::INVALID_PARAMETER);
+            return Err(Status::INVALID_PARAMETER);
         }
         let existing = self.slots.iter().position(|slot| slot.matches(&guid, name));
-        let append = attributes & efi::VARIABLE_APPEND_WRITE != 0;
+        let append = attributes.contains(VariableAttributes::APPEND_WRITE);
         let delete = data_len == 0 && !append;
-        let attributes = attributes & !efi::VARIABLE_APPEND_WRITE;
+        let attributes = attributes.difference(VariableAttributes::APPEND_WRITE);
         let slot = match (existing, delete) {
             (Some(index), _) => {
                 if !delete
@@ -327,11 +332,11 @@ impl VariableStore {
                     && self.slots[index].attributes != attributes
                     && identify_key_database(&guid, name).is_none()
                 {
-                    return Err(efi::INVALID_PARAMETER);
+                    return Err(Status::INVALID_PARAMETER);
                 }
                 index
             }
-            (None, true) => return Err(efi::NOT_FOUND),
+            (None, true) => return Err(Status::NOT_FOUND),
             // Prefer reclaiming this variable's own tombstone so re-creation
             // after an authenticated deletion does not leak slots.
             (None, false) => self
@@ -343,7 +348,7 @@ impl VariableStore {
                         .iter()
                         .position(|slot| slot.in_use == 0 && !slot.is_tombstone())
                 })
-                .ok_or(efi::OUT_OF_RESOURCES)?,
+                .ok_or(Status::OUT_OF_RESOURCES)?,
         };
         Ok(PreparedWrite {
             slot,
@@ -368,16 +373,16 @@ impl VariableStore {
         prepared: &mut PreparedWrite,
         input: &[u8],
         append: bool,
-    ) -> Result<&'a [u8], efi::Status> {
-        let slot = self.slots.get(prepared.slot).ok_or(efi::DEVICE_ERROR)?;
+    ) -> Result<&'a [u8], Status> {
+        let slot = self.slots.get(prepared.slot).ok_or(Status::DEVICE_ERROR)?;
         let old = if append && slot.in_use != 0 {
-            self.data(slot).ok_or(efi::DEVICE_ERROR)?
+            self.data(slot).ok_or(Status::DEVICE_ERROR)?
         } else {
             &[]
         };
         let staged = transaction.stage(old, input)?;
         if staged.len() > self.available_after_replacing(prepared.slot) {
-            return Err(efi::OUT_OF_RESOURCES);
+            return Err(Status::OUT_OF_RESOURCES);
         }
         prepared.data_len = staged.len();
         Ok(staged)
@@ -388,9 +393,12 @@ impl VariableStore {
         transaction: &VariableTransaction,
         prepared: PreparedWrite,
         name: &[u16],
-    ) -> Result<(), efi::Status> {
+    ) -> Result<(), Status> {
         if prepared.delete {
-            let slot = self.slots.get_mut(prepared.slot).ok_or(efi::DEVICE_ERROR)?;
+            let slot = self
+                .slots
+                .get_mut(prepared.slot)
+                .ok_or(Status::DEVICE_ERROR)?;
             slot.in_use = 0;
             slot.data_len = 0;
             slot.data_offset = 0;
@@ -414,10 +422,10 @@ impl VariableStore {
             }
             let old = slot.data_offset as usize;
             let len = usize::from(slot.data_len);
-            let old_end = old.checked_add(len).ok_or(efi::DEVICE_ERROR)?;
-            let new_end = used.checked_add(len).ok_or(efi::DEVICE_ERROR)?;
+            let old_end = old.checked_add(len).ok_or(Status::DEVICE_ERROR)?;
+            let new_end = used.checked_add(len).ok_or(Status::DEVICE_ERROR)?;
             if old_end > self.arena.len() || new_end > self.arena.len() {
-                return Err(efi::DEVICE_ERROR);
+                return Err(Status::DEVICE_ERROR);
             }
             if old != used {
                 // SAFETY: both source and destination ranges were checked
@@ -436,20 +444,23 @@ impl VariableStore {
 
         let data_end = used
             .checked_add(prepared.data_len)
-            .ok_or(efi::OUT_OF_RESOURCES)?;
+            .ok_or(Status::OUT_OF_RESOURCES)?;
         let source = transaction
             .bytes
             .get(..prepared.data_len)
-            .ok_or(efi::DEVICE_ERROR)?;
+            .ok_or(Status::DEVICE_ERROR)?;
         let destination = self
             .arena
             .get_mut(used..data_end)
-            .ok_or(efi::OUT_OF_RESOURCES)?;
+            .ok_or(Status::OUT_OF_RESOURCES)?;
         destination.copy_from_slice(source);
 
-        let slot = self.slots.get_mut(prepared.slot).ok_or(efi::DEVICE_ERROR)?;
+        let slot = self
+            .slots
+            .get_mut(prepared.slot)
+            .ok_or(Status::DEVICE_ERROR)?;
         if prepared.name_len != name.len() || prepared.name_len > slot.name.len() {
-            return Err(efi::DEVICE_ERROR);
+            return Err(Status::DEVICE_ERROR);
         }
         slot.in_use = 0;
         slot.guid = prepared.guid;

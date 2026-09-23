@@ -188,7 +188,7 @@ unsafe fn import_variable(import: Option<&VariableImport>) -> Result<(), efi::St
         &mut variables.transaction,
         import.guid,
         name,
-        import.attributes,
+        efi::VariableAttributes::from_bits_retain(import.attributes),
         data,
         timestamp,
     )

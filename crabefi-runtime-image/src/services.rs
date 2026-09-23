@@ -17,7 +17,7 @@ use crabefi_runtime_abi::{
 use crate::{
     arch,
     deferred::{self, DeferredRegion},
-    efi,
+    efi::{self, VariableAttributes},
     state::{self, Phase},
     store::{PreparedWrite, VariableStore, VariableTransaction},
     svam,
@@ -212,7 +212,7 @@ fn read_variable(
         if let Some(value) = value {
             return write_variable_result(
                 &[value],
-                efi::VARIABLE_BOOTSERVICE_ACCESS | efi::VARIABLE_RUNTIME_ACCESS,
+                VariableAttributes::BOOTSERVICE_ACCESS | VariableAttributes::RUNTIME_ACCESS,
                 attributes,
                 data_size,
                 data,
@@ -233,7 +233,7 @@ fn read_variable(
 
 fn write_variable_result(
     value: &[u8],
-    variable_attributes: u32,
+    variable_attributes: VariableAttributes,
     attributes: *mut u32,
     data_size: *mut usize,
     data: *mut c_void,
@@ -251,7 +251,7 @@ fn write_variable_result(
     unsafe {
         data_size.write(value.len());
         if !attributes.is_null() {
-            attributes.write(variable_attributes);
+            attributes.write(variable_attributes.bits());
         }
     }
     Ok(())
@@ -381,6 +381,8 @@ fn write_variable(
     if vendor_guid.is_null() || (data_size != 0 && data.is_null()) {
         return Err(efi::Status::INVALID_PARAMETER);
     }
+    let attributes =
+        VariableAttributes::from_bits(attributes).ok_or(efi::Status::INVALID_PARAMETER)?;
     validate_set_arguments(attributes, data_size)?;
     let name = read_name(variable_name)?;
     // SAFETY: required pointers and input length were validated above.
@@ -419,22 +421,22 @@ fn write_variable(
     )
 }
 
-fn validate_set_arguments(attributes: u32, data_size: usize) -> Result<(), efi::Status> {
-    if attributes & !efi::VARIABLE_KNOWN_ATTRIBUTES != 0
-        || (data_size != 0 && attributes & efi::VARIABLE_BOOTSERVICE_ACCESS == 0)
-        || (attributes & efi::VARIABLE_RUNTIME_ACCESS != 0
-            && attributes & efi::VARIABLE_BOOTSERVICE_ACCESS == 0)
-    {
+fn validate_set_arguments(
+    attributes: VariableAttributes,
+    data_size: usize,
+) -> Result<(), efi::Status> {
+    let boot_access = attributes.contains(VariableAttributes::BOOTSERVICE_ACCESS);
+    if (data_size != 0 || attributes.contains(VariableAttributes::RUNTIME_ACCESS)) && !boot_access {
         return Err(efi::Status::INVALID_PARAMETER);
     }
-    if attributes & efi::VARIABLE_AUTHENTICATED_WRITE_ACCESS != 0
-        || (!cfg!(feature = "secure-boot")
-            && attributes & efi::VARIABLE_TIME_BASED_AUTHENTICATED_WRITE_ACCESS != 0)
+    let time_based = attributes.contains(VariableAttributes::TIME_BASED_AUTHENTICATED_WRITE_ACCESS);
+    if attributes.contains(VariableAttributes::AUTHENTICATED_WRITE_ACCESS)
+        || (!cfg!(feature = "secure-boot") && time_based)
     {
         return Err(efi::Status::UNSUPPORTED);
     }
     #[cfg(feature = "secure-boot")]
-    let maximum = if attributes & efi::VARIABLE_TIME_BASED_AUTHENTICATED_WRITE_ACCESS != 0 {
+    let maximum = if time_based {
         auth::MAX_AUTHENTICATED_ENVELOPE_SIZE
     } else {
         MAX_VARIABLE_DATA_SIZE
@@ -452,26 +454,27 @@ fn validate_set_arguments(attributes: u32, data_size: usize) -> Result<(), efi::
 struct VariableRequest<'a> {
     guid: [u8; 16],
     name: &'a [u16],
-    attributes: u32,
+    attributes: VariableAttributes,
     data: &'a [u8],
 }
 
 impl VariableRequest<'_> {
     fn authenticated(&self) -> bool {
-        self.attributes & efi::VARIABLE_TIME_BASED_AUTHENTICATED_WRITE_ACCESS != 0
+        self.attributes
+            .contains(VariableAttributes::TIME_BASED_AUTHENTICATED_WRITE_ACCESS)
     }
 
     fn append(&self) -> bool {
-        self.attributes & efi::VARIABLE_APPEND_WRITE != 0
+        self.attributes.contains(VariableAttributes::APPEND_WRITE)
     }
 
     /// The request creates, updates or deletes a non-volatile variable.
     fn nonvolatile(&self, store: &VariableStore) -> bool {
-        self.attributes & efi::VARIABLE_NON_VOLATILE != 0
+        self.attributes.contains(VariableAttributes::NON_VOLATILE)
             || (self.data.is_empty()
                 && store
                     .find(&self.guid, self.name, false)
-                    .is_some_and(|slot| slot.attributes & efi::VARIABLE_NON_VOLATILE != 0))
+                    .is_some_and(|slot| slot.attributes.contains(VariableAttributes::NON_VOLATILE)))
     }
 }
 
@@ -568,7 +571,10 @@ fn apply_variable(
         return Err(efi::Status::INVALID_PARAMETER);
     }
 
-    if prepared.attributes & efi::VARIABLE_NON_VOLATILE != 0 {
+    if prepared
+        .attributes
+        .contains(VariableAttributes::NON_VOLATILE)
+    {
         if phase.boot_services() {
             persist_through_bridge(bridge, &request, &prepared, staged, verified.timestamp)?;
         } else {
@@ -634,7 +640,7 @@ fn verify<'a>(
         store,
         request.name,
         &request.guid,
-        request.attributes,
+        request.attributes.bits(),
         request.data,
     )?;
     Ok(Verified {
@@ -665,11 +671,14 @@ fn check_runtime_access(
 ) -> Result<(), efi::Status> {
     if delete {
         match store.find(&request.guid, request.name, false) {
-            Some(slot) if slot.attributes & efi::VARIABLE_RUNTIME_ACCESS != 0 => Ok(()),
+            Some(slot) if slot.attributes.contains(VariableAttributes::RUNTIME_ACCESS) => Ok(()),
             Some(_) => Err(efi::Status::INVALID_PARAMETER),
             None => Err(efi::Status::NOT_FOUND),
         }
-    } else if request.attributes & efi::VARIABLE_RUNTIME_ACCESS == 0 {
+    } else if !request
+        .attributes
+        .contains(VariableAttributes::RUNTIME_ACCESS)
+    {
         Err(efi::Status::INVALID_PARAMETER)
     } else {
         Ok(())
@@ -691,7 +700,7 @@ fn persist_through_bridge(
             } else {
                 bridge_operation::PERSIST_WRITE
             },
-            attributes: prepared.attributes,
+            attributes: prepared.attributes.bits(),
             guid: request.guid,
             name_address: request.name.as_ptr() as u64,
             name_len: request.name.len() as u32,
@@ -716,7 +725,7 @@ fn queue_deferred(
     let (attributes, data) = if request.authenticated() {
         (request.attributes, request.data)
     } else if prepared.delete {
-        (0, staged)
+        (VariableAttributes::empty(), staged)
     } else {
         (prepared.attributes, staged)
     };
@@ -756,9 +765,9 @@ pub fn prepare_retained_staging(lease: &mut state::Lease) -> Result<(), efi::Sta
         VariableRequest {
             guid,
             name: CAPSULE_UPDATE_NAME,
-            attributes: efi::VARIABLE_NON_VOLATILE
-                | efi::VARIABLE_BOOTSERVICE_ACCESS
-                | efi::VARIABLE_RUNTIME_ACCESS,
+            attributes: VariableAttributes::NON_VOLATILE
+                | VariableAttributes::BOOTSERVICE_ACCESS
+                | VariableAttributes::RUNTIME_ACCESS,
             data: &data,
         },
     )
@@ -800,15 +809,19 @@ pub fn replay_deferred(lease: &mut state::Lease) -> Result<usize, efi::Status> {
                 return Ok(());
             }
         }
-        let result = apply_variable(
-            VariableContext::boot(store, transaction, bridge),
-            VariableRequest {
-                guid: record.guid.bytes,
-                name,
-                attributes: record.attributes,
-                data: record.data,
-            },
-        );
+        let result = VariableAttributes::from_bits(record.attributes)
+            .ok_or(efi::Status::INVALID_PARAMETER)
+            .and_then(|attributes| {
+                apply_variable(
+                    VariableContext::boot(store, transaction, bridge),
+                    VariableRequest {
+                        guid: record.guid.bytes,
+                        name,
+                        attributes,
+                        data: record.data,
+                    },
+                )
+            });
         replay_apply_result(result, authenticated, deletion)
     })
 }
@@ -994,14 +1007,14 @@ fn variable_info(
     if maximum_variable_storage_size.is_null()
         || remaining_variable_storage_size.is_null()
         || maximum_variable_size.is_null()
-        || attributes == 0
-        || attributes & !efi::VARIABLE_KNOWN_ATTRIBUTES != 0
     {
         return Err(efi::Status::INVALID_PARAMETER);
     }
-    if attributes & (efi::VARIABLE_NON_VOLATILE | efi::VARIABLE_BOOTSERVICE_ACCESS)
-        != efi::VARIABLE_NON_VOLATILE | efi::VARIABLE_BOOTSERVICE_ACCESS
-        || attributes & efi::VARIABLE_APPEND_WRITE != 0
+    let attributes =
+        VariableAttributes::from_bits(attributes).ok_or(efi::Status::INVALID_PARAMETER)?;
+    if !attributes
+        .contains(VariableAttributes::NON_VOLATILE | VariableAttributes::BOOTSERVICE_ACCESS)
+        || attributes.contains(VariableAttributes::APPEND_WRITE)
     {
         return Err(efi::Status::INVALID_PARAMETER);
     }
@@ -1129,13 +1142,11 @@ mod tests {
         ));
     }
 
-    const AUTH_ATTRIBUTES: u32 = efi::VARIABLE_NON_VOLATILE
-        | efi::VARIABLE_BOOTSERVICE_ACCESS
-        | efi::VARIABLE_RUNTIME_ACCESS
-        | efi::VARIABLE_TIME_BASED_AUTHENTICATED_WRITE_ACCESS;
-    const RAW_ATTRIBUTES: u32 = efi::VARIABLE_NON_VOLATILE
-        | efi::VARIABLE_BOOTSERVICE_ACCESS
-        | efi::VARIABLE_RUNTIME_ACCESS;
+    const RAW_ATTRIBUTES: VariableAttributes = VariableAttributes::NON_VOLATILE
+        .union(VariableAttributes::BOOTSERVICE_ACCESS)
+        .union(VariableAttributes::RUNTIME_ACCESS);
+    const AUTH_ATTRIBUTES: VariableAttributes =
+        RAW_ATTRIBUTES.union(VariableAttributes::TIME_BASED_AUTHENTICATED_WRITE_ACCESS);
 
     extern "C" fn successful_bridge(request: *const BridgeRequest) -> usize {
         if request.is_null() {
@@ -1183,7 +1194,7 @@ mod tests {
             phase: Phase,
             guid: [u8; 16],
             name: &[u16],
-            attributes: u32,
+            attributes: VariableAttributes,
             data: &[u8],
         ) -> efi::Status {
             efi::status(apply_variable(
@@ -1210,7 +1221,7 @@ mod tests {
             &mut self,
             phase: Phase,
             variable: SecureBootVariable,
-            attributes: u32,
+            attributes: VariableAttributes,
             data: &[u8],
         ) -> efi::Status {
             self.write(phase, *variable.guid(), variable.name(), attributes, data)
@@ -1220,7 +1231,7 @@ mod tests {
             &mut self,
             guid: [u8; 16],
             name: &[u16],
-            attributes: u32,
+            attributes: VariableAttributes,
             data: &[u8],
             timestamp: Option<VariableTimestamp>,
         ) {
@@ -1272,10 +1283,10 @@ mod tests {
         for (attributes, value) in [
             (RAW_ATTRIBUTES, b"forged".as_slice()),
             (
-                RAW_ATTRIBUTES | efi::VARIABLE_APPEND_WRITE,
+                RAW_ATTRIBUTES | VariableAttributes::APPEND_WRITE,
                 b"append".as_slice(),
             ),
-            (0, b"".as_slice()),
+            (VariableAttributes::empty(), b"".as_slice()),
         ] {
             assert_eq!(
                 fixture.write(Phase::BootActive, guid, name, attributes, value),
@@ -1297,11 +1308,12 @@ mod tests {
         // authenticated variable directly.
         fixture.import(guid, &name, AUTH_ATTRIBUTES, b"payload", None);
 
-        let raw = AUTH_ATTRIBUTES & !efi::VARIABLE_TIME_BASED_AUTHENTICATED_WRITE_ACCESS;
+        let raw =
+            AUTH_ATTRIBUTES.difference(VariableAttributes::TIME_BASED_AUTHENTICATED_WRITE_ACCESS);
         for (attributes, value) in [
             (raw, b"raw".as_slice()),
-            (raw | efi::VARIABLE_APPEND_WRITE, b"append".as_slice()),
-            (0, b"".as_slice()),
+            (raw | VariableAttributes::APPEND_WRITE, b"append".as_slice()),
+            (VariableAttributes::empty(), b"".as_slice()),
         ] {
             assert_eq!(
                 fixture.write(Phase::BootActive, guid, &name, attributes, value),
@@ -1367,7 +1379,10 @@ mod tests {
         );
 
         // Raw requests cannot re-create or delete the deleted variable.
-        for attributes in [RAW_ATTRIBUTES, RAW_ATTRIBUTES | efi::VARIABLE_APPEND_WRITE] {
+        for attributes in [
+            RAW_ATTRIBUTES,
+            RAW_ATTRIBUTES | VariableAttributes::APPEND_WRITE,
+        ] {
             assert_eq!(
                 fixture.write(Phase::BootActive, guid, &name, attributes, b"raw"),
                 efi::Status::WRITE_PROTECTED
@@ -1381,7 +1396,7 @@ mod tests {
                 &fixture.store,
                 &name,
                 &guid,
-                AUTH_ATTRIBUTES,
+                AUTH_ATTRIBUTES.bits(),
                 &unsigned_envelope(2024),
             ),
             Err(auth::AuthError::InvalidTimestamp)
@@ -1393,7 +1408,7 @@ mod tests {
                 &fixture.store,
                 &name,
                 &guid,
-                AUTH_ATTRIBUTES,
+                AUTH_ATTRIBUTES.bits(),
                 &unsigned_envelope(2026),
             ),
             Err(auth::AuthError::InvalidHeader)
@@ -1462,7 +1477,7 @@ mod tests {
                 &fixture.store,
                 variable.name(),
                 variable.guid(),
-                AUTH_ATTRIBUTES,
+                AUTH_ATTRIBUTES.bits(),
                 &unsigned_envelope(2025),
             ),
             Err(auth::AuthError::InvalidTimestamp)
@@ -1472,7 +1487,7 @@ mod tests {
                 &fixture.store,
                 variable.name(),
                 variable.guid(),
-                AUTH_ATTRIBUTES,
+                AUTH_ATTRIBUTES.bits(),
                 &unsigned_envelope(2026),
             )
             .is_ok()
@@ -1590,7 +1605,7 @@ mod tests {
                 include_bytes!("../tests/fixtures/pk-delete.bin").as_slice(),
             ),
         ];
-        let append_attributes = AUTH_ATTRIBUTES | efi::VARIABLE_APPEND_WRITE;
+        let append_attributes = AUTH_ATTRIBUTES | VariableAttributes::APPEND_WRITE;
         for (variable, update, append, delete) in operations {
             for (attributes, data, expected) in [
                 (AUTH_ATTRIBUTES, update, efi::Status::SUCCESS),
@@ -1629,7 +1644,11 @@ mod tests {
                     deferred::DeferredWrite {
                         guid: GUID,
                         name,
-                        attributes: if deletion { 0 } else { RAW_ATTRIBUTES },
+                        attributes: if deletion {
+                            VariableAttributes::empty()
+                        } else {
+                            RAW_ATTRIBUTES
+                        },
                         data: if deletion { &[] } else { b"next" },
                         timestamp: VariableTimestamp::default(),
                         authenticated: false,
@@ -1682,7 +1701,7 @@ mod tests {
                     Phase::BootActive,
                     record.guid.bytes,
                     &record.name[..name_len],
-                    record.attributes,
+                    VariableAttributes::from_bits_retain(record.attributes),
                     record.data,
                 ) {
                     efi::Status::SUCCESS => Ok(()),
@@ -1725,7 +1744,7 @@ mod tests {
             |record, authenticated, deletion| {
                 assert!(!authenticated);
                 assert!(!deletion);
-                assert_eq!(record.attributes, RAW_ATTRIBUTES);
+                assert_eq!(record.attributes, RAW_ATTRIBUTES.bits());
                 assert_eq!(record.data, VALUE);
                 let name_len = record.name.iter().position(|unit| *unit == 0).unwrap();
                 assert_eq!(&record.name[..name_len], NAME);
