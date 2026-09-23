@@ -1034,11 +1034,12 @@ fn call_boot_bridge(address: u64, request: &BridgeRequest) -> Result<(), efi::St
     if address == 0 {
         return Err(efi::Status::WRITE_PROTECTED);
     }
-    type Bridge = extern "C" fn(*const BridgeRequest) -> usize;
-    // SAFETY: runtime initialization receives this one audited bridge address
-    // from the boot loader. It is used only in BootActive and zeroed at seal.
+    type Bridge = unsafe extern "C" fn(*const BridgeRequest) -> usize;
+    // SAFETY: runtime initialization receives this bridge address from the
+    // boot loader. It is used only in BootActive and zeroed at seal.
     let bridge: Bridge = unsafe { core::mem::transmute(address as usize) };
-    match efi::Status::from_usize(bridge(request)) {
+    // SAFETY: `request` and the buffers it names outlive this synchronous call.
+    match efi::Status::from_usize(unsafe { bridge(request) }) {
         efi::Status::SUCCESS => Ok(()),
         status => Err(status),
     }

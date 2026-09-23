@@ -1,4 +1,4 @@
-//! Audited BootActive persistence bridge consumed by runtime-image seal.
+//! BootActive persistence bridge called by the runtime image.
 
 use crabefi_runtime_abi::BridgeRequest;
 #[cfg(feature = "variable-store")]
@@ -16,44 +16,61 @@ pub extern "C" fn dispatch(_request: *const BridgeRequest) -> usize {
     Status::UNSUPPORTED.as_usize()
 }
 
+/// Persist one variable write or deletion requested by the runtime image.
+///
+/// # Safety
+///
+/// `request` must be null or point to a readable `BridgeRequest` whose name
+/// and data address/length pairs are readable for the duration of this call.
 #[cfg(feature = "variable-store")]
-#[allow(clippy::not_unsafe_ptr_arg_deref)]
-pub extern "C" fn dispatch(request: *const BridgeRequest) -> usize {
-    if request.is_null() {
-        return Status::INVALID_PARAMETER.as_usize();
+pub unsafe extern "C" fn dispatch(request: *const BridgeRequest) -> usize {
+    // SAFETY: forwarded from the caller; nothing is retained after return.
+    let result = unsafe { request.as_ref() }
+        .ok_or(Status::INVALID_PARAMETER)
+        .and_then(|request| unsafe { persist(request) });
+    match result {
+        Ok(()) => Status::SUCCESS.as_usize(),
+        Err(status) => status.as_usize(),
     }
-    // SAFETY: the image calls the bridge synchronously while BootActive and
-    // retains neither the request nor its referenced immediate buffers.
-    let request = unsafe { &*request };
-    let name_len = match usize::try_from(request.name_len) {
-        Ok(length) if length != 0 && length <= crabefi_runtime_abi::MAX_VARIABLE_NAME_LEN => length,
-        _ => return Status::INVALID_PARAMETER.as_usize(),
-    };
-    let data_len = match usize::try_from(request.data_len) {
-        Ok(length) if length <= crabefi_runtime_abi::MAX_VARIABLE_DATA_SIZE => length,
-        _ => return Status::OUT_OF_RESOURCES.as_usize(),
-    };
+}
+
+/// # Safety
+///
+/// The name and data address/length pairs of `request` must be readable for
+/// the duration of this call.
+#[cfg(feature = "variable-store")]
+unsafe fn persist(request: &BridgeRequest) -> Result<(), Status> {
+    use crabefi_runtime_abi::{MAX_VARIABLE_DATA_SIZE, MAX_VARIABLE_NAME_LEN};
+
+    let name_len = usize::try_from(request.name_len)
+        .ok()
+        .filter(|length| (1..=MAX_VARIABLE_NAME_LEN).contains(length))
+        .ok_or(Status::INVALID_PARAMETER)?;
+    let data_len = usize::try_from(request.data_len)
+        .ok()
+        .filter(|length| *length <= MAX_VARIABLE_DATA_SIZE)
+        .ok_or(Status::OUT_OF_RESOURCES)?;
     if request.name_address == 0 || (data_len != 0 && request.data_address == 0) {
-        return Status::INVALID_PARAMETER.as_usize();
+        return Err(Status::INVALID_PARAMETER);
     }
-    // SAFETY: addresses originate in the active runtime service call and are
-    // bounded by the checked ABI limits for this synchronous dispatch.
+    // SAFETY: the caller guarantees readable buffers of the ABI-bounded
+    // lengths checked above.
     let name = unsafe { core::slice::from_raw_parts(request.name_address as *const u16, name_len) };
     let data = if data_len == 0 {
         &[]
     } else {
-        // SAFETY: same immediate-call contract as `name`.
+        // SAFETY: same contract as `name`.
         unsafe { core::slice::from_raw_parts(request.data_address as *const u8, data_len) }
     };
-    let mut terminated_name = [0u16; crabefi_runtime_abi::MAX_VARIABLE_NAME_LEN + 1];
+    let mut terminated_name = [0u16; MAX_VARIABLE_NAME_LEN + 1];
     terminated_name[..name_len].copy_from_slice(name);
     let name = &terminated_name[..=name_len];
     if request.timestamp_valid > 1 || request.reserved != 0 {
-        return Status::INVALID_PARAMETER.as_usize();
+        return Err(Status::INVALID_PARAMETER);
     }
     let timestamp = (request.timestamp_valid != 0).then_some(request.timestamp);
     let guid = Guid::from_bytes(&request.guid);
-    let result = match request.operation {
+    match request.operation {
         bridge_operation::PERSIST_WRITE => {
             crate::efi::varstore::persistence::write_variable_to_storage_internal(
                 &guid,
@@ -71,21 +88,16 @@ pub extern "C" fn dispatch(request: *const BridgeRequest) -> usize {
                 timestamp,
             )
         }
-        _ => return Status::UNSUPPORTED.as_usize(),
-    };
-    match result {
-        Ok(()) => Status::SUCCESS.as_usize(),
-        Err(VarStoreError::NotInitialized | VarStoreError::WriteProtected) => {
-            Status::WRITE_PROTECTED.as_usize()
-        }
-        Err(VarStoreError::StoreFull) => Status::OUT_OF_RESOURCES.as_usize(),
-        Err(
-            VarStoreError::InvalidArgument
-            | VarStoreError::NameTooLong
-            | VarStoreError::DataTooLarge,
-        ) => Status::INVALID_PARAMETER.as_usize(),
-        Err(_) => Status::DEVICE_ERROR.as_usize(),
+        _ => return Err(Status::UNSUPPORTED),
     }
+    .map_err(|error| match error {
+        VarStoreError::NotInitialized | VarStoreError::WriteProtected => Status::WRITE_PROTECTED,
+        VarStoreError::StoreFull => Status::OUT_OF_RESOURCES,
+        VarStoreError::InvalidArgument
+        | VarStoreError::NameTooLong
+        | VarStoreError::DataTooLarge => Status::INVALID_PARAMETER,
+        _ => Status::DEVICE_ERROR,
+    })
 }
 
 #[cfg(test)]
