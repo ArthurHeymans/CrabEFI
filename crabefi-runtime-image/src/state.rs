@@ -6,7 +6,7 @@ use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 
 use crabefi_runtime_abi::{
     LoadedSection, MAX_EXTERNAL_RANGES, MAX_RELOCATIONS, MAX_SECTIONS, RelocationImport,
-    RuntimeExternalRange, RuntimeHandoff, RuntimeResetConfig, RuntimeTimeConfig, relocation_kind,
+    ResetMechanism, RuntimeExternalRange, RuntimeHandoff, TimeMechanism, relocation_kind,
     section_flags,
 };
 use heapless::Vec;
@@ -93,12 +93,27 @@ pub struct RelocationRecord {
     pub kind: u16,
 }
 
+/// Time source selected by the handoff.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TimeConfig {
+    pub mechanism: TimeMechanism,
+    /// I/O port or MMIO base; virtual after SetVirtualAddressMap.
+    pub base: u64,
+}
+
+/// Reset conduit selected by the handoff.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ResetConfig {
+    pub mechanism: ResetMechanism,
+    pub base: u64,
+}
+
 pub struct RuntimeState {
     pub tables: ImageTables,
     pub sections: Vec<SectionRecord, MAX_SECTIONS>,
     pub ranges: Vec<RangeRecord, MAX_EXTERNAL_RANGES>,
     pub relocations: Vec<RelocationRecord, MAX_RELOCATIONS>,
-    pub time: RuntimeTimeConfig,
+    pub time: TimeConfig,
     pub boot_bridge: u64,
     pub deferred_buffer_physical: u64,
     pub deferred_buffer_virtual: u64,
@@ -113,10 +128,9 @@ impl RuntimeState {
             sections: Vec::new(),
             ranges: Vec::new(),
             relocations: Vec::new(),
-            time: RuntimeTimeConfig {
-                mechanism: 0,
-                reserved: 0,
-                io_or_mmio_base: 0,
+            time: TimeConfig {
+                mechanism: TimeMechanism::Unsupported,
+                base: 0,
             },
             boot_bridge: 0,
             deferred_buffer_physical: 0,
@@ -142,7 +156,16 @@ impl RuntimeState {
                 .map(|section| Ok(section_from_handoff(section))),
         )?;
         self.ranges = collect_bounded(ranges.iter().map(|range| Ok(range_from_handoff(range))))?;
-        self.time = handoff.time;
+        self.time = TimeConfig {
+            mechanism: TimeMechanism::try_from(handoff.time.mechanism)
+                .map_err(|_| efi::Status::INVALID_PARAMETER)?,
+            base: handoff.time.io_or_mmio_base,
+        };
+        let reset = ResetConfig {
+            mechanism: ResetMechanism::try_from(handoff.reset.mechanism)
+                .map_err(|_| efi::Status::INVALID_PARAMETER)?,
+            base: handoff.reset.io_or_mmio_base,
+        };
         self.boot_bridge = handoff.boot_bridge;
         self.deferred_buffer_physical = handoff.deferred_buffer_base;
         self.deferred_buffer_size = usize::try_from(handoff.deferred_buffer_size)
@@ -150,7 +173,7 @@ impl RuntimeState {
         // Publish ResetSystem's lock-free snapshot before boot services can
         // call it. The snapshot is outside RuntimeState so a re-entrant reset
         // never reads through an outstanding mutable state lease.
-        RUNTIME_RESET_CONFIG.publish(handoff.reset);
+        RUNTIME_RESET_CONFIG.publish(reset);
         Ok(())
     }
 
@@ -246,53 +269,41 @@ fn range_from_handoff(range: &RuntimeExternalRange) -> RangeRecord {
 /// Lock-free snapshot of the reset configuration for `ResetSystem`.
 ///
 /// The pair is published exactly once while the image is uninitialized: the
-/// base word first, then the header word with `Release`. The `Acquire` header
-/// load in `read` makes the prior base store visible without taking the
-/// operation lease, so a re-entrant reset never reads a torn configuration.
-/// A zero header word means the snapshot has not been published yet, which
-/// leaves the architecture fallbacks in charge. This reserves
-/// `mechanism == 0` as "unpublished": every ABI reset mechanism constant
-/// must be nonzero for a published snapshot to ever be read.
+/// base word first, then the mechanism word with `Release`. The `Acquire`
+/// mechanism load in `read` makes the prior base store visible without taking
+/// the operation lease, so a re-entrant reset never reads a torn
+/// configuration. Every ABI reset mechanism value is nonzero, so a zero
+/// mechanism word means the snapshot is unpublished.
 #[repr(C)]
 pub struct ResetConfigCell {
-    header: AtomicU64,
+    mechanism: AtomicU64,
     base: AtomicU64,
 }
 
 impl ResetConfigCell {
     const fn new() -> Self {
         Self {
-            header: AtomicU64::new(0),
+            mechanism: AtomicU64::new(0),
             base: AtomicU64::new(0),
         }
     }
 
-    fn publish(&self, config: RuntimeResetConfig) {
-        self.base.store(config.io_or_mmio_base, Ordering::Relaxed);
-        self.header.store(
-            u64::from(config.mechanism) | (u64::from(config.reserved) << 32),
-            Ordering::Release,
-        );
+    fn publish(&self, config: ResetConfig) {
+        self.base.store(config.base, Ordering::Relaxed);
+        self.mechanism
+            .store(u32::from(config.mechanism).into(), Ordering::Release);
     }
 
-    fn read(&self) -> RuntimeResetConfig {
-        let header = self.header.load(Ordering::Acquire);
-        if header == 0 {
-            return RuntimeResetConfig {
-                mechanism: 0,
-                reserved: 0,
-                io_or_mmio_base: 0,
-            };
-        }
-        RuntimeResetConfig {
-            mechanism: header as u32,
-            reserved: (header >> 32) as u32,
-            io_or_mmio_base: self.base.load(Ordering::Relaxed),
-        }
+    fn read(&self) -> Option<ResetConfig> {
+        let mechanism = u32::try_from(self.mechanism.load(Ordering::Acquire)).ok()?;
+        Some(ResetConfig {
+            mechanism: ResetMechanism::try_from(mechanism).ok()?,
+            base: self.base.load(Ordering::Relaxed),
+        })
     }
 
     fn address(&self) -> u64 {
-        core::ptr::addr_of!(self.header) as u64
+        core::ptr::addr_of!(self.mechanism) as u64
     }
 }
 
@@ -450,7 +461,7 @@ pub fn lease_in(phases: &[Phase]) -> Result<Lease, efi::Status> {
 
 /// Read the immutable reset configuration without taking the operation lease.
 /// ResetSystem must remain available even if a failing caller holds that lease.
-pub fn reset_config() -> RuntimeResetConfig {
+pub fn reset_config() -> Option<ResetConfig> {
     RUNTIME_RESET_CONFIG.read()
 }
 
@@ -491,28 +502,19 @@ mod tests {
     #[test]
     fn published_reset_snapshot_reads_back() {
         let snapshot = ResetConfigCell::new();
-        let expected = RuntimeResetConfig {
-            mechanism: 3,
-            reserved: 0,
-            io_or_mmio_base: 0xcf9,
+        let expected = ResetConfig {
+            mechanism: ResetMechanism::PsciHvc,
+            base: 0xcf9,
         };
         snapshot.publish(expected);
-        assert_eq!(snapshot.read(), expected);
+        assert_eq!(snapshot.read(), Some(expected));
     }
 
     #[test]
     fn unpublished_reset_snapshot_reads_as_unconfigured() {
         let snapshot = ResetConfigCell::new();
         snapshot.base.store(0xcf9, Ordering::Relaxed);
-
-        assert_eq!(
-            snapshot.read(),
-            RuntimeResetConfig {
-                mechanism: 0,
-                reserved: 0,
-                io_or_mmio_base: 0,
-            }
-        );
+        assert_eq!(snapshot.read(), None);
     }
 
     #[test]

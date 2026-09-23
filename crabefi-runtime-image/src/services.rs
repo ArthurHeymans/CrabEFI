@@ -4,8 +4,8 @@ use core::ffi::c_void;
 
 use crabefi_efi_types::{authentication::validate_signature_database, secure_boot};
 use crabefi_runtime_abi::{
-    BridgeRequest, MAX_VARIABLE_DATA_SIZE, MAX_VARIABLE_NAME_LEN, VariableTimestamp,
-    bridge_operation, capsule, time_mechanism,
+    BridgeRequest, MAX_VARIABLE_DATA_SIZE, MAX_VARIABLE_NAME_LEN, TimeMechanism, VariableTimestamp,
+    bridge_operation, capsule,
 };
 
 use crate::{
@@ -988,13 +988,13 @@ pub fn time_from_unix(seconds: u64, out: &mut efi::Time) -> Result<(), efi::Stat
     Ok(())
 }
 
-pub fn time_is_supported(mechanism: u32) -> bool {
+pub fn time_is_supported(mechanism: TimeMechanism) -> bool {
     #[cfg(target_arch = "x86_64")]
-    return mechanism == time_mechanism::X86_CMOS;
+    return mechanism == TimeMechanism::X86Cmos;
     #[cfg(target_arch = "aarch64")]
-    return mechanism == time_mechanism::PL031;
+    return mechanism == TimeMechanism::Pl031;
     #[cfg(target_arch = "riscv64")]
-    return mechanism == time_mechanism::GOLDFISH_RTC;
+    return mechanism == TimeMechanism::GoldfishRtc;
 }
 
 #[cfg(all(test, not(feature = "secure-boot")))]

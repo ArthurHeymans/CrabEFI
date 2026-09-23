@@ -1,8 +1,11 @@
 //! x86-64 CMOS time and legacy reset mechanisms.
 
-use crabefi_runtime_abi::{RuntimeResetConfig, RuntimeTimeConfig, reset_mechanism, time_mechanism};
+use crabefi_runtime_abi::{ResetMechanism, TimeMechanism};
 
-use crate::efi;
+use crate::{
+    efi,
+    state::{ResetConfig, TimeConfig},
+};
 
 #[inline]
 unsafe fn inb(port: u16) -> u8 {
@@ -46,8 +49,8 @@ fn wait_for_rtc_update() -> Result<(), efi::Status> {
     Err(efi::Status::DEVICE_ERROR)
 }
 
-pub fn read_time(config: RuntimeTimeConfig, out: &mut efi::Time) -> Result<(), efi::Status> {
-    if config.mechanism != time_mechanism::X86_CMOS {
+pub fn read_time(config: TimeConfig, out: &mut efi::Time) -> Result<(), efi::Status> {
+    if config.mechanism != TimeMechanism::X86Cmos {
         return Err(efi::Status::UNSUPPORTED);
     }
     for _ in 0..3 {
@@ -118,9 +121,13 @@ fn reset_port(configured: u64) -> u16 {
     }
 }
 
-pub fn reset(config: RuntimeResetConfig, reset_type: efi::ResetType) -> ! {
-    if config.mechanism == reset_mechanism::X86_LEGACY {
-        let port = reset_port(config.io_or_mmio_base);
+pub fn reset(config: Option<ResetConfig>, reset_type: efi::ResetType) -> ! {
+    if let Some(ResetConfig {
+        mechanism: ResetMechanism::X86Legacy,
+        base,
+    }) = config
+    {
+        let port = reset_port(base);
         // QEMU and most modern chipsets implement reset control at the
         // platform-provided CF9-compatible reset port.
         // SAFETY: initialization supplies the selected x86 reset mechanism.
