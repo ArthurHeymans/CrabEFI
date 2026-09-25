@@ -351,31 +351,35 @@ pub fn cache_crl(crl: CertificateRevocationList, current_time: i64) {
     ));
 }
 
-/// Look up a CRL from the cache
+impl CachedCrl {
+    /// Whether the CRL is recent enough to prove a certificate is not revoked
+    fn is_fresh(&self, current_time: i64, config: &RevocationConfig) -> bool {
+        current_time - self.cached_at <= config.max_crl_age
+            && self
+                .crl
+                .next_update
+                .is_none_or(|next_update| current_time <= next_update)
+    }
+}
+
+/// Look up the cached CRL for an issuer, regardless of its age
+fn cached_crl(issuer: &[u8]) -> Option<CachedCrl> {
+    CRL_CACHE
+        .lock()
+        .iter()
+        .find(|(cached_issuer, _)| cached_issuer == issuer)
+        .map(|(_, cached)| cached.clone())
+}
+
+/// Look up a fresh CRL from the cache
 pub fn get_cached_crl(
     issuer: &[u8],
     current_time: i64,
     config: &RevocationConfig,
 ) -> Option<CertificateRevocationList> {
-    let cache = CRL_CACHE.lock();
-
-    for (cached_issuer, cached_crl) in cache.iter() {
-        if cached_issuer == issuer {
-            // Check if CRL is still fresh
-            if current_time - cached_crl.cached_at <= config.max_crl_age {
-                // Also check CRL's own nextUpdate if available
-                if let Some(next_update) = cached_crl.crl.next_update {
-                    if current_time <= next_update {
-                        return Some(cached_crl.crl.clone());
-                    }
-                } else {
-                    return Some(cached_crl.crl.clone());
-                }
-            }
-        }
-    }
-
-    None
+    cached_crl(issuer)
+        .filter(|cached| cached.is_fresh(current_time, config))
+        .map(|cached| cached.crl)
 }
 
 /// Check if a certificate is revoked using a CRL
@@ -417,16 +421,17 @@ pub fn check_crl_revocation(
 /// * `cert_der` - The certificate to check
 /// * `issuer_der` - The issuer's certificate
 /// * `config` - Revocation checking configuration
-/// * `current_time` - Current time as Unix timestamp
+/// * `current_time` - Current time as Unix timestamp, if known
 ///
 /// # Returns
 ///
-/// The revocation status of the certificate
+/// The revocation status of the certificate. Without a current time a cached
+/// CRL can still prove revocation, but never that a certificate is good.
 pub fn check_certificate_revocation(
     cert_der: &[u8],
     issuer_der: &[u8],
     config: &RevocationConfig,
-    current_time: i64,
+    current_time: Option<i64>,
 ) -> RevocationCheckResult {
     // If CRL checking is disabled, skip checking
     if !config.enable_crl {
@@ -440,12 +445,7 @@ pub fn check_certificate_revocation(
     };
 
     if let Some(result) = try_crl_check(cert_der, &issuer_name, config, current_time) {
-        match result {
-            RevocationCheckResult::Revoked { .. } | RevocationCheckResult::Good => {
-                return result;
-            }
-            _ => {}
-        }
+        return result;
     }
 
     // Could not determine status
@@ -458,19 +458,24 @@ pub fn check_certificate_revocation(
 }
 
 /// Try to check revocation via CRL
+///
+/// A CRL entry stays authoritative after the CRL stops being fresh, because
+/// revocation is permanent. The exception is `certificateHold`, which may be
+/// lifted by a later CRL. Proving a certificate is *not* revoked always
+/// requires a fresh CRL, and therefore a known current time.
 fn try_crl_check(
     cert_der: &[u8],
     issuer_name: &[u8],
     config: &RevocationConfig,
-    current_time: i64,
+    current_time: Option<i64>,
 ) -> Option<RevocationCheckResult> {
-    // First check the cache
-    if let Some(crl) = get_cached_crl(issuer_name, current_time, config) {
-        let result = check_crl_revocation(cert_der, &crl);
-        match result {
-            RevocationCheckResult::Good | RevocationCheckResult::Revoked { .. } => {
-                return Some(result);
-            }
+    if let Some(cached) = cached_crl(issuer_name) {
+        let fresh = current_time.is_some_and(|now| cached.is_fresh(now, config));
+        match check_crl_revocation(cert_der, &cached.crl) {
+            RevocationCheckResult::Revoked { reason, .. }
+                if !fresh && reason == Some(CrlReason::CertificateHold) => {}
+            result @ RevocationCheckResult::Revoked { .. } => return Some(result),
+            RevocationCheckResult::Good if fresh => return Some(RevocationCheckResult::Good),
             _ => {}
         }
     }

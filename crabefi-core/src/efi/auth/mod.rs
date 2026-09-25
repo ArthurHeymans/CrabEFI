@@ -230,6 +230,8 @@ pub enum AuthError {
     InvalidHeader,
     /// Invalid timestamp (not monotonically increasing)
     InvalidTimestamp,
+    /// The current time is needed but unavailable
+    TimeUnavailable,
     /// Signature verification failed
     SignatureVerificationFailed,
     /// No suitable key found in key database
@@ -281,6 +283,7 @@ impl From<AuthError> for r_efi::efi::Status {
         match err {
             AuthError::InvalidHeader => r_efi::efi::Status::INVALID_PARAMETER,
             AuthError::InvalidTimestamp => r_efi::efi::Status::SECURITY_VIOLATION,
+            AuthError::TimeUnavailable => r_efi::efi::Status::DEVICE_ERROR,
             AuthError::SignatureVerificationFailed => r_efi::efi::Status::SECURITY_VIOLATION,
             AuthError::NoSuitableKey => r_efi::efi::Status::SECURITY_VIOLATION,
             AuthError::CertificateParseError => r_efi::efi::Status::INVALID_PARAMETER,

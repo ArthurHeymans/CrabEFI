@@ -30,6 +30,7 @@ use crabefi_efi_types::{
         SecureBootVariable,
     },
 };
+use crabefi_pkcs7::time::DateTime;
 use crabefi_runtime_abi::VariableTimestamp;
 use r_efi::efi::Guid;
 
@@ -379,6 +380,55 @@ pub fn persist_key_databases() -> Result<(), AuthError> {
     Ok(())
 }
 
+const EFI_UNSPECIFIED_TIMEZONE: i16 = 0x7FF;
+
+/// Lower bound for the timestamp of locally enrolled key databases.
+///
+/// This is not a claim about the current time. Enrolled databases carry the
+/// timestamp that later time-based authenticated writes must exceed, so it
+/// acts as an anti-replay floor: an update signed before it is rejected.
+const ENROLLMENT_TIMESTAMP_FLOOR: EfiTime = EfiTime {
+    year: 2025,
+    month: 1,
+    day: 1,
+    timezone: EFI_UNSPECIFIED_TIMEZONE,
+    ..EfiTime::zero()
+};
+
+/// Timestamp for key databases enrolled by the firmware itself.
+///
+/// Uses the RTC when it is readable and later than
+/// [`ENROLLMENT_TIMESTAMP_FLOOR`], and the floor otherwise. Enrollment must
+/// not depend on an RTC being present: the floor only limits how far back
+/// previously signed updates can be replayed.
+fn enrollment_timestamp() -> EfiTime {
+    enrollment_timestamp_from(super::time::read_rtc_time())
+}
+
+fn enrollment_timestamp_from(rtc: Result<DateTime, &'static str>) -> EfiTime {
+    match rtc.map(efi_time) {
+        Ok(now) if now.is_after(&ENROLLMENT_TIMESTAMP_FLOOR) => now,
+        Ok(_) => ENROLLMENT_TIMESTAMP_FLOOR,
+        Err(reason) => {
+            log::info!("Enrollment timestamp: RTC unavailable ({reason}), using floor");
+            ENROLLMENT_TIMESTAMP_FLOOR
+        }
+    }
+}
+
+fn efi_time(time: DateTime) -> EfiTime {
+    EfiTime {
+        year: time.year,
+        month: time.month,
+        day: time.day,
+        hour: time.hour,
+        minute: time.minute,
+        second: time.second,
+        timezone: EFI_UNSPECIFIED_TIMEZONE,
+        ..EfiTime::zero()
+    }
+}
+
 /// Persist a single key variable to SMMSTORE with its timestamp
 ///
 /// The timestamp is preserved for proper monotonic timestamp validation
@@ -401,7 +451,7 @@ fn persist_key_variable(
     use zerocopy::IntoBytes;
 
     let timestamp = if timestamp.year == 0 {
-        super::time::read_rtc_efi_time()
+        enrollment_timestamp()
     } else {
         *timestamp
     };
@@ -527,9 +577,10 @@ pub fn clear_all_keys() -> Result<(), AuthError> {
 
 #[cfg(test)]
 mod tests {
-    use super::DatabaseSnapshot;
+    use super::{DatabaseSnapshot, enrollment_timestamp_from};
     use crate::efi::utils::ucs2_eq;
     use alloc::vec;
+    use crabefi_pkcs7::time::DateTime;
 
     #[test]
     fn test_ucs2_eq() {
@@ -551,5 +602,33 @@ mod tests {
         assert!(snapshot.matches(Some(&[1, 2, 3])));
         assert!(!snapshot.matches(Some(&[1, 2, 4])));
         assert!(!snapshot.matches(None));
+    }
+
+    fn date(year: u16) -> DateTime {
+        DateTime {
+            year,
+            month: 6,
+            day: 1,
+            hour: 0,
+            minute: 0,
+            second: 0,
+        }
+    }
+
+    #[test]
+    fn enrollment_timestamp_never_goes_below_floor() {
+        for rtc in [Err("no RTC"), Ok(date(2000))] {
+            let timestamp = enrollment_timestamp_from(rtc);
+            assert!(timestamp.is_valid());
+            assert_eq!({ timestamp.year }, 2025);
+            assert_eq!(({ timestamp.month }, { timestamp.day }), (1, 1));
+        }
+    }
+
+    #[test]
+    fn enrollment_timestamp_follows_a_later_rtc() {
+        let timestamp = enrollment_timestamp_from(Ok(date(2030)));
+        assert!(timestamp.is_valid());
+        assert_eq!(({ timestamp.year }, { timestamp.month }), (2030, 6));
     }
 }
