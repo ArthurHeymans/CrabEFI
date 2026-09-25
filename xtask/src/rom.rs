@@ -211,14 +211,22 @@ fn pad_rom(rom_path: &Path, target_size: u64) -> Result<()> {
 
 /// Inject CrabEFI as the coreboot payload using cbfstool
 fn inject_crabefi_payload(rom_path: &Path, crabefi_elf: &Path) -> Result<()> {
-    // Remove existing payload if any
     println!("Preparing ROM with CrabEFI payload...");
-    let _ = Command::new("cbfstool")
-        .arg(rom_path)
-        .args(["remove", "-n", "fallback/payload"])
-        .status();
 
-    // Add CrabEFI as payload
+    // The checked-in base ROMs carry no payload, but a ROM with one must have
+    // it replaced: silently keeping a stale payload would make the QEMU run
+    // test the wrong CrabEFI build.
+    if cbfstool_contains_payload(rom_path)? {
+        let status = Command::new("cbfstool")
+            .arg(rom_path)
+            .args(["remove", "-n", "fallback/payload"])
+            .status()
+            .context("Failed to run cbfstool while removing the existing payload")?;
+        if !status.success() {
+            bail!("Failed to remove the existing CrabEFI payload from ROM");
+        }
+    }
+
     let status = Command::new("cbfstool")
         .arg(rom_path)
         .args(["add-payload", "-f"])
@@ -233,7 +241,25 @@ fn inject_crabefi_payload(rom_path: &Path, crabefi_elf: &Path) -> Result<()> {
         bail!("Failed to add CrabEFI payload to ROM");
     }
 
+    if !cbfstool_contains_payload(rom_path)? {
+        bail!("cbfstool reported success but fallback/payload is missing from ROM");
+    }
+
     Ok(())
+}
+
+fn cbfstool_contains_payload(rom_path: &Path) -> Result<bool> {
+    let output = Command::new("cbfstool")
+        .arg(rom_path)
+        .arg("print")
+        .output()
+        .context("Failed to inspect CBFS contents with cbfstool")?;
+    if !output.status.success() {
+        bail!("Failed to inspect CBFS contents with cbfstool");
+    }
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .any(|line| line.split_whitespace().next() == Some("fallback/payload")))
 }
 
 /// Prepare riscv64 (QEMU virt) firmware — single coreboot ROM (OpenSBI embedded)

@@ -12,6 +12,7 @@ scratch allocation used on every architecture.
 - [Integration](INTEGRATION.md) — embedding the boot library and mandatory runtime image
 - [Memory Management](MEMORY.md) — boot/runtime ownership and EFI memory map
 - [Separate Runtime Image Architecture](RUNTIME_IMAGE_PLAN.md) — implemented runtime boundary, loader, SVAM transaction, and current platform limitations
+- [Platform Compatibility](COMPATIBILITY.md) — QEMU CI coverage per platform, time/authentication policy, and known limitations
 
 Use `./crabefi build --arch <arch>` rather than invoking the payload package
 directly: the wrapper builds, audits, normalizes, and binds the matching runtime

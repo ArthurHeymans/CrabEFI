@@ -1,9 +1,7 @@
 //! Shared time utilities for the auth subsystem
 //!
-//! Provides RTC reading used by multiple auth submodules (crypto,
-//! revocation, dbx_update).
+//! Provides RTC reading for certificate validation and key enrollment.
 
-use crabefi_efi_types::authentication::EfiTime;
 use crabefi_pkcs7::time::DateTime;
 
 /// Deterministic stand-in for host unit tests: the certificate fixtures in
@@ -11,42 +9,41 @@ use crabefi_pkcs7::time::DateTime;
 /// this date (certs 2026-09-09 +825d, CRLs +30d), so time-dependent checks
 /// behave deterministically.
 #[cfg(test)]
-pub(crate) fn read_rtc_time() -> (u16, u8, u8, u8, u8, u8) {
-    (2026, 9, 10, 0, 0, 0)
+pub(crate) fn read_rtc_time() -> Result<DateTime, &'static str> {
+    Ok(DateTime {
+        year: 2026,
+        month: 9,
+        day: 10,
+        hour: 0,
+        minute: 0,
+        second: 0,
+    })
 }
 
-/// Read the current date/time from the hardware RTC
+/// Read the current UTC date/time from the hardware RTC.
 ///
-/// Returns `(year, month, day, hour, minute, second)`.
+/// Returns the reason instead of a substitute date when no usable time is
+/// available, so callers decide explicitly how to handle an unknown clock.
 ///
 /// - **x86_64**: Reads the CMOS RTC via I/O ports 0x70/0x71
-/// - **aarch64**: Returns a fallback value (PL031 RTC support TODO)
+/// - **aarch64**, **riscv64**: Unavailable; no boot-time PL031/Goldfish RTC
+///   reader is wired up
 #[cfg(not(test))]
-pub(crate) fn read_rtc_time() -> (u16, u8, u8, u8, u8, u8) {
+pub(crate) fn read_rtc_time() -> Result<DateTime, &'static str> {
     #[cfg(target_arch = "x86_64")]
     {
         read_rtc_time_x86()
     }
-    #[cfg(target_arch = "aarch64")]
+    #[cfg(not(target_arch = "x86_64"))]
     {
-        // TODO: Implement PL031 RTC reading for aarch64 SBSA
-        // For now, return a safe fallback time
-        log::debug!("RTC: aarch64 PL031 not yet implemented, using fallback time");
-        (2025, 1, 1, 0, 0, 0)
-    }
-    #[cfg(target_arch = "riscv64")]
-    {
-        // RISC-V has no standard RTC interface accessible from S-mode.
-        // The goldfish-rtc or similar would require FDT parsing.
-        log::debug!("RTC: RISC-V RTC not yet implemented, using fallback time");
-        (2025, 1, 1, 0, 0, 0)
+        Err("no boot-time RTC on this architecture")
     }
 }
 
 /// x86 CMOS RTC implementation
 #[cfg(target_arch = "x86_64")]
 #[cfg_attr(test, allow(dead_code))] // Test builds use the stubbed read_rtc_time above.
-fn read_rtc_time_x86() -> (u16, u8, u8, u8, u8, u8) {
+fn read_rtc_time_x86() -> Result<DateTime, &'static str> {
     use crate::arch::x86_64::io;
 
     // Wait for RTC update to complete (bounded to avoid infinite loop)
@@ -104,7 +101,7 @@ fn read_rtc_time_x86() -> (u16, u8, u8, u8, u8, u8) {
         || second > 59
     {
         log::warn!(
-            "RTC: invalid time values: {}-{:02}-{:02} {:02}:{:02}:{:02}, using fallback",
+            "RTC: invalid time values: {}-{:02}-{:02} {:02}:{:02}:{:02}",
             full_year,
             month,
             day,
@@ -112,43 +109,20 @@ fn read_rtc_time_x86() -> (u16, u8, u8, u8, u8, u8) {
             minute,
             second
         );
-        return (2025, 1, 1, 0, 0, 0);
+        return Err("invalid CMOS RTC values");
     }
 
-    (full_year, month, day, hour, minute, second)
-}
-
-/// Read the current time as an `EfiTime` struct
-///
-/// Convenience wrapper around [`read_rtc_time`] for callers that need
-/// the full UEFI time structure.
-pub(crate) fn read_rtc_efi_time() -> EfiTime {
-    let (year, month, day, hour, minute, second) = read_rtc_time();
-    EfiTime {
-        year,
+    Ok(DateTime {
+        year: full_year,
         month,
         day,
         hour,
         minute,
         second,
-        pad1: 0,
-        nanosecond: 0,
-        timezone: 0x7FF, // EFI_UNSPECIFIED_TIMEZONE
-        daylight: 0,
-        pad2: 0,
-    }
+    })
 }
 
-/// Read the current time as a Unix timestamp (seconds since epoch)
-pub(crate) fn current_unix_timestamp() -> i64 {
-    let (year, month, day, hour, minute, second) = read_rtc_time();
-    DateTime {
-        year,
-        month,
-        day,
-        hour,
-        minute,
-        second,
-    }
-    .unix_timestamp()
+/// Read the current time as a Unix timestamp (seconds since epoch).
+pub(crate) fn current_unix_timestamp() -> Result<i64, &'static str> {
+    read_rtc_time().map(|time| time.unix_timestamp())
 }

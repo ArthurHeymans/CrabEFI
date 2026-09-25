@@ -44,8 +44,8 @@ pub struct ChainBuildingConfig {
     pub check_revocation: bool,
     /// Revocation checking configuration
     pub revocation_config: RevocationConfig,
-    /// Current time as Unix timestamp (for validity period checking)
-    pub current_time: i64,
+    /// Current time as Unix timestamp, when the platform can provide one
+    pub current_time: Option<i64>,
     /// Whether to require CA certificates to have basicConstraints
     pub require_basic_constraints: bool,
     /// Whether to require CA certificates to have keyCertSign keyUsage
@@ -62,7 +62,7 @@ impl Default for ChainBuildingConfig {
             max_depth: DEFAULT_MAX_CHAIN_DEPTH,
             check_revocation: true,
             revocation_config: RevocationConfig::default(),
-            current_time: get_current_time_for_cert_validation(),
+            current_time: time::current_unix_timestamp().ok(),
             require_basic_constraints: true,
             require_key_usage: true,
             check_validity_period: true,
@@ -345,7 +345,7 @@ pub fn build_and_verify_chain(
     // anchor's subject and serial must never be verified against itself.
     if end_entity_der == trust_anchor_der {
         if config.check_validity_period
-            && let Err(e) = validate_certificate_time(end_entity_der)
+            && let Err(e) = validate_certificate_time(end_entity_der, config.current_time)
         {
             log::debug!("Trust anchor validity check failed: {:?}", e);
             return Err(AuthError::ChainBuildingFailed);
@@ -542,7 +542,7 @@ fn verify_chain_link(
 
     // Validate certificate time (skipped for Secure Boot image verification)
     if config.check_validity_period
-        && let Err(e) = validate_certificate_time(cert_der)
+        && let Err(e) = validate_certificate_time(cert_der, config.current_time)
     {
         log::debug!("Certificate validity check failed: {:?}", e);
         return Ok(false);
@@ -694,16 +694,18 @@ pub fn verify_certificate_chain(
 
 /// Validate a certificate's validity period (notBefore/notAfter)
 ///
-/// Checks that the current time is within the certificate's validity period.
-/// This prevents use of expired or not-yet-valid certificates.
-fn validate_certificate_time(cert_der: &[u8]) -> Result<(), AuthError> {
+/// Checks that `current_time` (Unix seconds) is within the certificate's
+/// validity period. This prevents use of expired or not-yet-valid
+/// certificates. Without a current time the check fails closed.
+fn validate_certificate_time(cert_der: &[u8], current_time: Option<i64>) -> Result<(), AuthError> {
     let validity = parse_cert_view(cert_der)?
         .validity()
         .map_err(|_| AuthError::CertificateParseError)?;
 
-    // Get current time from the system
-    // Note: In a real implementation, this should come from a trusted time source
-    let current_time = get_current_time_for_cert_validation();
+    let Some(current_time) = current_time else {
+        log::warn!("Certificate validity period cannot be checked: current time unavailable");
+        return Err(AuthError::TimeUnavailable);
+    };
 
     // Check if current time is before notBefore
     if current_time < validity.not_before {
@@ -831,13 +833,6 @@ fn extract_basic_constraints(cert_der: &[u8]) -> Result<Option<BasicConstraints>
 /// Extract the keyUsage extension from a certificate
 fn extract_key_usage(cert_der: &[u8]) -> Result<Option<KeyUsage>, AuthError> {
     Ok(parse_cert_view(cert_der)?.key_usage()?)
-}
-
-/// Get current time for certificate validation
-///
-/// Returns Unix timestamp (seconds since 1970-01-01 00:00:00 UTC)
-fn get_current_time_for_cert_validation() -> i64 {
-    time::current_unix_timestamp()
 }
 
 /// Parse a DER-encoded X.509 certificate with a decodable validity window
@@ -1026,6 +1021,17 @@ mod fixture_tests {
     }
 
     #[test]
+    fn chain_validity_check_fails_closed_without_time() {
+        let config = ChainBuildingConfig {
+            check_validity_period: true,
+            current_time: None,
+            ..ChainBuildingConfig::default()
+        };
+        assert!(build_and_verify_chain(LEAF, CA, &[], &config).is_err());
+        assert!(build_and_verify_chain(CA, CA, &[], &config).is_err());
+    }
+
+    #[test]
     fn forged_self_signed_anchor_lookalike_rejected() {
         let ca = parse_cert_view(CA).unwrap();
         let forged = parse_cert_view(FORGED_CA).unwrap();
@@ -1082,6 +1088,30 @@ mod fixture_tests {
         assert_eq!(
             revocation::check_crl_revocation(LEAF, &empty),
             revocation::RevocationCheckResult::Good
+        );
+    }
+
+    #[test]
+    fn cached_crl_proves_revocation_but_not_good_without_time() {
+        let crl = revocation::parse_crl(CRL_ONE).unwrap();
+        let cached_at = crl.this_update;
+        revocation::cache_crl(crl, cached_at);
+        let config = RevocationConfig {
+            allow_soft_fail: false,
+            ..RevocationConfig::default()
+        };
+        // LEAF is listed in CRL_ONE; CA (same issuer name) is not.
+        assert!(matches!(
+            check_certificate_revocation(LEAF, CA, &config, None),
+            RevocationCheckResult::Revoked { .. }
+        ));
+        assert_eq!(
+            check_certificate_revocation(CA, CA, &config, None),
+            RevocationCheckResult::Unknown
+        );
+        assert_eq!(
+            check_certificate_revocation(CA, CA, &config, Some(cached_at)),
+            RevocationCheckResult::Good
         );
     }
 
