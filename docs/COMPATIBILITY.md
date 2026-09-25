@@ -20,8 +20,8 @@ error. The runtime image can read PL031 and Goldfish RTCs, but the payload
 does not describe one yet.
 
 Secure Boot has no QEMU CI coverage on any platform. Signature and
-certificate-chain verification, revocation and the enrollment timestamp are
-covered only by host unit tests of `crabefi-core` with the `secure-boot`
+certificate-chain verification, revocation and firmware key-write timestamps
+are covered only by host unit tests of `crabefi-core` with the `secure-boot`
 feature.
 
 ## Authentication and time
@@ -30,11 +30,14 @@ feature.
   `notBefore`/`notAfter`, matching EDK2 and U-Boot. Validity checks that are
   requested elsewhere fail when no current time is available; CrabEFI does not
   substitute a date.
-- Key databases enrolled by the firmware itself get the RTC time, but never
-  less than 2025-01-01. This timestamp is the floor that later authenticated
-  writes must exceed, so enrollment works without an RTC.
+- Key-database writes made by the firmware itself (default-key enrollment,
+  clearing keys) do not use the RTC. Each one is timestamped one second after
+  the variable's latest known timestamp, but never earlier than the date
+  CrabEFI was built from (`SOURCE_DATE_EPOCH`, set by `./crabefi build` from
+  the commit date). A missing or wrong clock therefore cannot block later
+  signed updates.
 - The RTC is not authenticated. Anything that can set it can move the clock
-  used for these checks.
+  used for certificate validity checks.
 - Revocation is checked only against CRLs already in the in-memory cache.
   The boot path does not load any, so revocation checks currently soft-fail.
   CRL distribution points are logged for diagnostics only, as there is no

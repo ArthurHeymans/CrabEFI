@@ -377,6 +377,14 @@ fn cmd_build(release: bool, ui: bool, arch: Arch, machine: Machine) -> Result<()
         _ => {}
     }
 
+    // Key-database timestamps are floored at the build's source date; derive
+    // it from the checked-out commit unless the caller already set one.
+    if std::env::var_os("SOURCE_DATE_EPOCH").is_none()
+        && let Some(epoch) = commit_epoch(project_root)
+    {
+        cmd.env("SOURCE_DATE_EPOCH", epoch);
+    }
+
     cmd.current_dir(project_root);
     // Remove RUSTUP_TOOLCHAIN to let CrabEFI use its own rust-toolchain.toml
     cmd.env_remove("RUSTUP_TOOLCHAIN");
@@ -389,6 +397,18 @@ fn cmd_build(release: bool, ui: bool, arch: Arch, machine: Machine) -> Result<()
     let mode = if release { "release" } else { "debug" };
     println!("Built: target/{}/{}/crabefi", target_triple, mode);
     Ok(())
+}
+
+/// Committer date of `HEAD` as Unix seconds, if the tree is a git checkout.
+fn commit_epoch(project_root: &Path) -> Option<String> {
+    let output = std::process::Command::new("git")
+        .args(["log", "-1", "--format=%ct"])
+        .current_dir(project_root)
+        .output()
+        .ok()
+        .filter(|output| output.status.success())?;
+    let epoch = String::from_utf8(output.stdout).ok()?.trim().to_owned();
+    epoch.parse::<u64>().is_ok().then_some(epoch)
 }
 
 #[allow(clippy::too_many_arguments)]

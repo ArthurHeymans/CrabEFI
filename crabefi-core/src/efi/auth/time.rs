@@ -1,6 +1,6 @@
 //! Shared time utilities for the auth subsystem
 //!
-//! Provides RTC reading for certificate validation and key enrollment.
+//! Provides RTC reading for certificate validation.
 
 use crabefi_pkcs7::time::DateTime;
 

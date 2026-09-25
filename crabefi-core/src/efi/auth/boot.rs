@@ -327,9 +327,8 @@ pub fn persist_key_databases() -> Result<(), AuthError> {
         let kek = kek_database();
         if !kek.is_empty() {
             let data = kek.to_signature_lists();
-            let timestamp = *kek.timestamp();
             if !data.is_empty() {
-                persist_key_variable(SecureBootVariable::Kek, &data, &timestamp)?;
+                persist_key_variable(SecureBootVariable::Kek, &data)?;
                 log::debug!("Persisted KEK ({} bytes)", data.len());
             }
         }
@@ -340,9 +339,8 @@ pub fn persist_key_databases() -> Result<(), AuthError> {
         let db = db_database();
         if !db.is_empty() {
             let data = db.to_signature_lists();
-            let timestamp = *db.timestamp();
             if !data.is_empty() {
-                persist_key_variable(SecureBootVariable::Db, &data, &timestamp)?;
+                persist_key_variable(SecureBootVariable::Db, &data)?;
                 log::debug!("Persisted db ({} bytes)", data.len());
             }
         }
@@ -353,9 +351,8 @@ pub fn persist_key_databases() -> Result<(), AuthError> {
         let dbx = dbx_database();
         if !dbx.is_empty() {
             let data = dbx.to_signature_lists();
-            let timestamp = *dbx.timestamp();
             if !data.is_empty() {
-                persist_key_variable(SecureBootVariable::Dbx, &data, &timestamp)?;
+                persist_key_variable(SecureBootVariable::Dbx, &data)?;
                 log::debug!("Persisted dbx ({} bytes)", data.len());
             }
         }
@@ -366,9 +363,8 @@ pub fn persist_key_databases() -> Result<(), AuthError> {
         let pk = pk_database();
         if !pk.is_empty() {
             let data = pk.to_signature_lists();
-            let timestamp = *pk.timestamp();
             if !data.is_empty() {
-                persist_key_variable(SecureBootVariable::PK, &data, &timestamp)?;
+                persist_key_variable(SecureBootVariable::PK, &data)?;
                 log::debug!("Persisted PK ({} bytes)", data.len());
             }
         }
@@ -380,64 +376,98 @@ pub fn persist_key_databases() -> Result<(), AuthError> {
     Ok(())
 }
 
+include!(concat!(env!("OUT_DIR"), "/source_date_epoch.rs"));
+
+/// 2025-01-01T00:00:00Z: floor for builds without a usable `SOURCE_DATE_EPOCH`.
+const FIRMWARE_TIMESTAMP_FLOOR: i64 = 1_735_689_600;
+
+/// Latest timestamp this boot issued for each key database, in Unix seconds.
+static ISSUED_TIMESTAMPS: spin::Mutex<[i64; 4]> = spin::Mutex::new([i64::MIN; 4]);
+
+/// Timestamp for a key-database write made by the firmware itself.
+///
+/// Authenticated writes must be strictly newer than the last accepted one,
+/// including deletions. The firmware has no trustworthy clock, so it uses one
+/// second after the latest known timestamp for the variable, but never less
+/// than the date CrabEFI was built from. That keeps default-key enrollment,
+/// clearing and re-enrollment working without an RTC, and a wrong RTC can no
+/// longer push timestamps into the future.
+fn next_firmware_timestamp(variable: SecureBootVariable, guid: &Guid, name: &[u16]) -> EfiTime {
+    let persisted = get_variable_timestamp(guid, name)
+        .map(|timestamp| utc_seconds(&efi_time_from_timestamp(timestamp)));
+    let mut issued = ISSUED_TIMESTAMPS.lock();
+    let previous = persisted
+        .into_iter()
+        .fold(issued[variable.index()], i64::max);
+    let next = next_timestamp_after(previous);
+    issued[variable.index()] = next;
+    efi_time_from_unix(next)
+}
+
+/// One second after `previous`, but at least the build date.
+fn next_timestamp_after(previous: i64) -> i64 {
+    let build_date = i64::try_from(SOURCE_DATE_EPOCH).unwrap_or(i64::MAX);
+    previous
+        .saturating_add(1)
+        .max(build_date)
+        .max(FIRMWARE_TIMESTAMP_FLOOR)
+}
+
 const EFI_UNSPECIFIED_TIMEZONE: i16 = 0x7FF;
 
-/// Lower bound for the timestamp of locally enrolled key databases.
-///
-/// This is not a claim about the current time. Enrolled databases carry the
-/// timestamp that later time-based authenticated writes must exceed, so it
-/// acts as an anti-replay floor: an update signed before it is rejected.
-const ENROLLMENT_TIMESTAMP_FLOOR: EfiTime = EfiTime {
-    year: 2025,
-    month: 1,
-    day: 1,
-    timezone: EFI_UNSPECIFIED_TIMEZONE,
-    ..EfiTime::zero()
-};
-
-/// Timestamp for key databases enrolled by the firmware itself.
-///
-/// Uses the RTC when it is readable and later than
-/// [`ENROLLMENT_TIMESTAMP_FLOOR`], and the floor otherwise. Enrollment must
-/// not depend on an RTC being present: the floor only limits how far back
-/// previously signed updates can be replayed.
-fn enrollment_timestamp() -> EfiTime {
-    enrollment_timestamp_from(super::time::read_rtc_time())
-}
-
-fn enrollment_timestamp_from(rtc: Result<DateTime, &'static str>) -> EfiTime {
-    match rtc.map(efi_time) {
-        Ok(now) if now.is_after(&ENROLLMENT_TIMESTAMP_FLOOR) => now,
-        Ok(_) => ENROLLMENT_TIMESTAMP_FLOOR,
-        Err(reason) => {
-            log::info!("Enrollment timestamp: RTC unavailable ({reason}), using floor");
-            ENROLLMENT_TIMESTAMP_FLOOR
-        }
-    }
-}
-
-fn efi_time(time: DateTime) -> EfiTime {
-    EfiTime {
+/// Unix seconds of an EFI timestamp, honouring its timezone offset.
+fn utc_seconds(time: &EfiTime) -> i64 {
+    let local = DateTime {
         year: time.year,
         month: time.month,
         day: time.day,
         hour: time.hour,
         minute: time.minute,
         second: time.second,
+    }
+    .unix_timestamp();
+    match time.timezone {
+        EFI_UNSPECIFIED_TIMEZONE => local,
+        // Same convention as `EfiTime::is_after`, which enforces ordering.
+        timezone => local - i64::from(timezone) * 60,
+    }
+}
+
+/// UTC `EfiTime` for Unix seconds (civil-from-days, Howard Hinnant).
+fn efi_time_from_unix(seconds: i64) -> EfiTime {
+    let days = seconds.div_euclid(86_400);
+    let second_of_day = seconds.rem_euclid(86_400);
+    let days = days + 719_468;
+    let era = days.div_euclid(146_097);
+    let day_of_era = days.rem_euclid(146_097);
+    let year_of_era =
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_index = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month_index + 2) / 5 + 1;
+    let month = if month_index < 10 {
+        month_index + 3
+    } else {
+        month_index - 9
+    };
+    let year = era * 400 + year_of_era + i64::from(month <= 2);
+    EfiTime {
+        year: year as u16,
+        month: month as u8,
+        day: day as u8,
+        hour: (second_of_day / 3_600) as u8,
+        minute: (second_of_day / 60 % 60) as u8,
+        second: (second_of_day % 60) as u8,
         timezone: EFI_UNSPECIFIED_TIMEZONE,
         ..EfiTime::zero()
     }
 }
 
-/// Persist a single key variable to SMMSTORE with its timestamp
+/// Persist a single key variable to SMMSTORE
 ///
-/// The timestamp is preserved for proper monotonic timestamp validation
-/// on future authenticated variable updates.
-fn persist_key_variable(
-    var_type: SecureBootVariable,
-    data: &[u8],
-    timestamp: &EfiTime,
-) -> Result<(), AuthError> {
+/// The write carries [`next_firmware_timestamp`], so it passes the same
+/// monotonic timestamp check as any other authenticated update.
+fn persist_key_variable(var_type: SecureBootVariable, data: &[u8]) -> Result<(), AuthError> {
     let (guid, name) = match var_type {
         SecureBootVariable::PK => (Guid::from_bytes(&EFI_GLOBAL_VARIABLE_GUID), PK_NAME),
         SecureBootVariable::Kek => (Guid::from_bytes(&EFI_GLOBAL_VARIABLE_GUID), KEK_NAME),
@@ -450,11 +480,7 @@ fn persist_key_variable(
 
     use zerocopy::IntoBytes;
 
-    let timestamp = if timestamp.year == 0 {
-        enrollment_timestamp()
-    } else {
-        *timestamp
-    };
+    let timestamp = next_firmware_timestamp(var_type, &guid, name);
     let mut envelope = Vec::new();
     envelope
         .try_reserve_exact(40usize.saturating_add(data.len()))
@@ -553,13 +579,12 @@ pub fn clear_all_keys() -> Result<(), AuthError> {
         }
     }
 
-    let zero_timestamp = EfiTime::zero();
     for variable in [
         SecureBootVariable::Dbx,
         SecureBootVariable::Db,
         SecureBootVariable::Kek,
     ] {
-        if let Err(error) = persist_key_variable(variable, &[], &zero_timestamp) {
+        if let Err(error) = persist_key_variable(variable, &[]) {
             // A preceding delete may already have changed live image policy.
             // Always reconcile disposable boot caches before reporting failure.
             force_refresh_key_databases();
@@ -577,10 +602,13 @@ pub fn clear_all_keys() -> Result<(), AuthError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{DatabaseSnapshot, enrollment_timestamp_from};
+    use super::{
+        DatabaseSnapshot, EFI_UNSPECIFIED_TIMEZONE, FIRMWARE_TIMESTAMP_FLOOR, SOURCE_DATE_EPOCH,
+        efi_time_from_unix, next_timestamp_after, utc_seconds,
+    };
     use crate::efi::utils::ucs2_eq;
     use alloc::vec;
-    use crabefi_pkcs7::time::DateTime;
+    use crabefi_efi_types::authentication::EfiTime;
 
     #[test]
     fn test_ucs2_eq() {
@@ -604,31 +632,53 @@ mod tests {
         assert!(!snapshot.matches(None));
     }
 
-    fn date(year: u16) -> DateTime {
-        DateTime {
-            year,
-            month: 6,
-            day: 1,
-            hour: 0,
-            minute: 0,
-            second: 0,
+    fn date(time: &EfiTime) -> (u16, u8, u8, u8, u8, u8) {
+        (
+            time.year,
+            time.month,
+            time.day,
+            time.hour,
+            time.minute,
+            time.second,
+        )
+    }
+
+    #[test]
+    fn efi_time_from_unix_matches_known_dates() {
+        for (seconds, expected) in [
+            (0, (1970, 1, 1, 0, 0, 0)),
+            (951_782_400, (2000, 2, 29, 0, 0, 0)),
+            (1_790_368_857, (2026, 9, 25, 20, 40, 57)),
+            (253_402_300_799, (9999, 12, 31, 23, 59, 59)),
+        ] {
+            let time = efi_time_from_unix(seconds);
+            assert_eq!(date(&time), expected);
+            assert!(time.is_valid());
+            assert_eq!(utc_seconds(&time), seconds);
         }
     }
 
     #[test]
-    fn enrollment_timestamp_never_goes_below_floor() {
-        for rtc in [Err("no RTC"), Ok(date(2000))] {
-            let timestamp = enrollment_timestamp_from(rtc);
-            assert!(timestamp.is_valid());
-            assert_eq!({ timestamp.year }, 2025);
-            assert_eq!(({ timestamp.month }, { timestamp.day }), (1, 1));
-        }
+    fn firmware_timestamps_start_at_the_build_date() {
+        let build_date = i64::try_from(SOURCE_DATE_EPOCH)
+            .unwrap()
+            .max(FIRMWARE_TIMESTAMP_FLOOR);
+        assert_eq!(next_timestamp_after(i64::MIN), build_date);
+        assert_eq!(next_timestamp_after(0), build_date);
+        assert_eq!(next_timestamp_after(build_date), build_date + 1);
     }
 
     #[test]
-    fn enrollment_timestamp_follows_a_later_rtc() {
-        let timestamp = enrollment_timestamp_from(Ok(date(2030)));
-        assert!(timestamp.is_valid());
-        assert_eq!(({ timestamp.year }, { timestamp.month }), (2030, 6));
+    fn firmware_timestamps_follow_any_previous_timezone() {
+        for timezone in [-1440, -60, 0, 60, 1440, EFI_UNSPECIFIED_TIMEZONE] {
+            let previous = EfiTime {
+                timezone,
+                nanosecond: 999_999_999,
+                ..efi_time_from_unix(4_102_444_800) // 2100-01-01
+            };
+            let next = efi_time_from_unix(next_timestamp_after(utc_seconds(&previous)));
+            assert!(next.is_valid());
+            assert!(next.is_after(&previous), "timezone {timezone}");
+        }
     }
 }
