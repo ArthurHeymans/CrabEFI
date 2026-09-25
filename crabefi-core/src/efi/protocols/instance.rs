@@ -14,7 +14,9 @@ struct Instance<Proto, Ctx> {
 /// Firmware-lifetime instances of one protocol type.
 ///
 /// The linked list lets callbacks validate an untrusted `this` pointer by
-/// address before dereferencing it. Instances are never freed during boot.
+/// address before dereferencing it. Published instances stay live throughout
+/// boot; an instance whose publication fails must be passed to [`remove`]
+/// so retries cannot leak pool allocations.
 pub struct Registry<Proto, Ctx> {
     head: Local<*mut Instance<Proto, Ctx>>,
 }
@@ -56,10 +58,46 @@ impl<Proto, Ctx: Copy> Registry<Proto, Ctx> {
                 return Some(unsafe { (*cursor).ctx });
             }
             // SAFETY: every link is either null or an initialized allocation
-            // registered with this registry and never freed during boot.
+            // registered with this registry and never freed while linked.
             cursor = unsafe { (*cursor).next };
         }
         None
+    }
+
+    /// Unregister `protocol` and return its allocation to the pool.
+    ///
+    /// Call this when publishing an instance fails (for example a rejected
+    /// `InstallProtocol`) so repeated attempts cannot exhaust the
+    /// firmware's boot-time heap. Returns whether a registered instance
+    /// was removed.
+    pub fn remove(&self, protocol: *mut Proto) -> bool {
+        let mut head = self.head.borrow_mut();
+        let mut prev: *mut Instance<Proto, Ctx> = core::ptr::null_mut();
+        let mut cursor = *head;
+        while !cursor.is_null() {
+            // SAFETY: every link is either null or a registered allocation
+            // that stays live until unlinked and freed below.
+            let next = unsafe { (*cursor).next };
+            if cursor.cast::<Proto>() == protocol {
+                if prev.is_null() {
+                    *head = next;
+                } else {
+                    // SAFETY: `prev` is a live registered allocation.
+                    unsafe {
+                        (*prev).next = next;
+                    }
+                }
+                drop(head);
+                // SAFETY: `cursor` was allocated by `allocate` via
+                // `allocate_pool`, has just been unlinked, and is never
+                // touched again after this call.
+                let _ = crate::efi::allocator::free_pool(cursor.cast::<u8>());
+                return true;
+            }
+            prev = cursor;
+            cursor = next;
+        }
+        false
     }
 }
 
