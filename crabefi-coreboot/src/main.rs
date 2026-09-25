@@ -728,6 +728,8 @@ fn riscv_fdt_only_boot(fdt_ptr: u64, fdt_size: u32) -> ! {
         acpi_rsdp: None,
         smbios: None,
         fdt: Some(fdt_slice),
+        acpi_info: None,
+        discover_mmio: true,
         firmware_info: None,
         capsule_regions: &[],
         capsule_backend: None,
@@ -860,10 +862,6 @@ pub extern "C" fn rust_main(coreboot_table_ptr: u64) -> ! {
         .framebuffer
         .map(crabefi::FramebufferConfig::from)
         .filter(|fb| fb.size() != 0 && fb.physical_address != 0);
-    if let Some(fb) = validated_framebuffer {
-        crabefi::handoff::store_framebuffer(fb);
-    }
-
     if let Some(addr) = cb_info.framebuffer_record_addr {
         framebuffer::store_framebuffer_record_addr(addr);
     }
@@ -881,10 +879,6 @@ pub extern "C" fn rust_main(coreboot_table_ptr: u64) -> ! {
     {
         crabefi::drivers::spi::qemu::configure_pflash(host_base, flash_size);
     }
-
-    // Store the ACPI RSDP for discovery after heap initialization. The direct
-    // Linux memory map is stored after the framebuffer overlay is finalized.
-    crabefi::handoff::with_mut(|h| h.acpi_rsdp = cb_info.acpi_rsdp);
 
     // ================================================================
     // Phase 3: Initialize serial and logging
@@ -980,18 +974,6 @@ pub extern "C" fn rust_main(coreboot_table_ptr: u64) -> ! {
         None => region_count,
     };
 
-    // Direct Linux boot consumes the handoff copy rather than the EFI page
-    // allocator, so publish the same finalized, non-overlapping map to both.
-    crabefi::handoff::with_mut(|handoff| {
-        handoff.memory_regions.clear();
-        for region in &memory_regions[..region_count] {
-            handoff
-                .memory_regions
-                .push(*region)
-                .expect("finalized memory map exceeds handoff capacity");
-        }
-    });
-
     // Create timer backed by the calibrated arch counter.
     let timer = CorebootTimer {
         freq_hz: crabefi::time::counter_frequency(),
@@ -1067,6 +1049,8 @@ pub extern "C" fn rust_main(coreboot_table_ptr: u64) -> ! {
         acpi_rsdp: cb_info.acpi_rsdp,
         smbios: cb_info.smbios,
         fdt: fdt_slice,
+        acpi_info: None,
+        discover_mmio: cfg!(any(target_arch = "aarch64", target_arch = "riscv64")),
         firmware_info,
         capsule_regions: &capsule_regions[..capsule_count],
         capsule_backend: Some(&mut capsule_backend),
@@ -1154,15 +1138,14 @@ pub extern "C" fn rust_main(coreboot_table_ptr: u64) -> ! {
     // ---- ACPI platform discovery ----
     //
     // The AML interpreter allocates, so this must run after heap::init().
-    // Results go into handoff::Handoff::acpi_info which init_platform() reads
-    // for ECAM base and add_platform_mmio_regions() reads for MMIO.
+    // Discovered topology is passed to init_platform() through the config.
     // RISC-V platforms use FDT rather than ACPI, so skip this.
     #[cfg(not(target_arch = "riscv64"))]
-    let acpi_rsdp = crabefi::handoff::get().acpi_rsdp;
+    let acpi_rsdp = config.acpi_rsdp;
     #[cfg(not(target_arch = "riscv64"))]
     if let Some(rsdp) = acpi_rsdp {
         let acpi_info = unsafe { acpi::discover_platform(rsdp) };
-        crabefi::handoff::with_mut(|h| h.acpi_info = acpi_info.clone());
+        config.acpi_info = Some(acpi_info.clone());
 
         #[cfg(target_arch = "x86_64")]
         if let Some((tpm_hid, device)) = ["MSFT0101", "PNP0C31"]
@@ -1215,35 +1198,8 @@ pub extern "C" fn rust_main(coreboot_table_ptr: u64) -> ! {
         }
     }
 
-    // ---- Platform MMIO regions (aarch64 / riscv64) ----
-    //
-    // Coreboot's lb_memory table omits MMIO regions. Add them from the
-    // ACPI/FDT info we just discovered.
-    #[cfg(target_arch = "aarch64")]
-    crabefi::efi::add_platform_mmio_regions();
-
-    // ---- RISC-V: parse FDT for ECAM + MMIO info, then register MMIO ----
-    //
-    // FDT parsing MUST happen before add_platform_mmio_regions() so the
-    // FDT-derived PCIe MMIO windows are used instead of the SBSA defaults.
-    // Without this, the SBSA fallback adds a bogus 1.75 GB MMIO region at
-    // 0x80000000 that overlaps with DRAM and the CrabEFI runtime regions,
-    // causing the Linux kernel to fail mapping RuntimeServicesData in efi_mm.
-    #[cfg(target_arch = "riscv64")]
-    {
-        if let Some(fdt_data) = fdt_slice
-            && let Some(info) =
-                unsafe { crabefi::fdt::parse(fdt_data.as_ptr() as u64, fdt_data.len() as u32) }
-        {
-            for region in info.ecam_regions() {
-                log::info!("ECAM region from FDT: {:?}", region);
-            }
-            // Store FDT info so add_platform_mmio_regions() can read it
-            crabefi::handoff::with_mut(|h| h.fdt_info = info);
-        }
-        // Now that fdt_info is populated, register MMIO regions from FDT
-        crabefi::efi::add_platform_mmio_regions();
-    }
+    // init_platform() parses the FDT before adding its MMIO windows, including
+    // on RISC-V where the PCIe window must not be guessed from SBSA defaults.
 
     // ---- CFR parsing ----
     //

@@ -1329,6 +1329,13 @@ pub struct PlatformConfig<'a> {
     /// Flattened Device Tree blob (for DT-based platforms).
     pub fdt: Option<&'a [u8]>,
 
+    /// Platform-discovered ACPI topology (e.g. MCFG/DSDT), when available.
+    pub acpi_info: Option<crate::fdt::PlatformInfo>,
+
+    /// Discover MMIO regions from the FDT when the memory map omits them.
+    /// Leave disabled when the supplied memory map already covers MMIO.
+    pub discover_mmio: bool,
+
     /// Firmware identity and version information for ESRT/capsule updates.
     pub firmware_info: Option<FirmwareInfo>,
 
@@ -1376,13 +1383,10 @@ pub struct PlatformConfig<'a> {
     pub tpm_event_log: Option<TpmEventLogConfig<'a>>,
 
     // ---- Pre-initialization ----
-    /// Whether the EFI environment and heap allocator were already set up
-    /// before calling [`crate::init_platform()`].
+    /// Whether the page allocator and heap were initialized before entry.
     ///
-    /// When `true`, `init_platform()` skips [`efi::init_from_platform()`]
-    /// and [`heap::init()`]. The caller is responsible for having called
-    /// both before entry, so that `alloc` works and the EFI memory map /
-    /// system table are ready.
+    /// When `true`, `init_platform()` skips heap initialization. The EFI
+    /// tables and protocols are still set up by `init_platform()`.
     ///
     /// This allows platforms to perform heap-dependent initialization
     /// (e.g., ACPI AML parsing, firmware configuration parsing) *before*
@@ -1426,6 +1430,8 @@ pub struct PlatformConfigBuilder<'a> {
     acpi_rsdp: Option<u64>,
     smbios: Option<u64>,
     fdt: Option<&'a [u8]>,
+    acpi_info: Option<crate::fdt::PlatformInfo>,
+    discover_mmio: bool,
     firmware_info: Option<FirmwareInfo>,
     capsule_regions: &'a [CapsuleRegion],
     capsule_backend: Option<&'a mut dyn CapsuleBackend>,
@@ -1462,6 +1468,8 @@ impl<'a> PlatformConfigBuilder<'a> {
             acpi_rsdp: None,
             smbios: None,
             fdt: None,
+            acpi_info: None,
+            discover_mmio: false,
             firmware_info: None,
             capsule_regions: &[],
             capsule_backend: None,
@@ -1530,6 +1538,18 @@ impl<'a> PlatformConfigBuilder<'a> {
         self
     }
 
+    /// ACPI topology discovered before entering the boot library.
+    pub fn acpi_info(mut self, value: crate::fdt::PlatformInfo) -> Self {
+        self.acpi_info = Some(value);
+        self
+    }
+
+    /// Populate omitted MMIO regions from the FDT on AArch64/RISC-V.
+    pub fn discover_mmio(mut self, value: bool) -> Self {
+        self.discover_mmio = value;
+        self
+    }
+
     /// Firmware identity for ESRT/capsule updates.
     pub fn firmware_info(mut self, value: FirmwareInfo) -> Self {
         self.firmware_info = Some(value);
@@ -1573,7 +1593,7 @@ impl<'a> PlatformConfigBuilder<'a> {
         self
     }
 
-    /// Skip EFI/heap setup because the caller already ran it.
+    /// Skip heap setup because the caller already initialized it.
     ///
     /// See [`PlatformConfig::heap_pre_initialized`] for the contract.
     pub fn heap_pre_initialized(mut self, value: bool) -> Self {
@@ -1596,6 +1616,8 @@ impl<'a> PlatformConfigBuilder<'a> {
             acpi_rsdp: self.acpi_rsdp,
             smbios: self.smbios,
             fdt: self.fdt,
+            acpi_info: self.acpi_info,
+            discover_mmio: self.discover_mmio,
             firmware_info: self.firmware_info,
             capsule_regions: self.capsule_regions,
             capsule_backend: self.capsule_backend,

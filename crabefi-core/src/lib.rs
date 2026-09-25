@@ -484,6 +484,17 @@ pub fn init_platform(mut config: PlatformConfig) -> ! {
     });
     handoff::with_mut(|h| {
         h.efi_fw_info = config.firmware_info;
+        h.acpi_info = config.acpi_info.clone().unwrap_or_default();
+        // Direct Linux boot consumes the same finalized map as the EFI allocator.
+        h.memory_regions.clear();
+        if config.memory_map.len() <= h.memory_regions.capacity() {
+            for region in config.memory_map {
+                // Capacity was checked for the entire map above.
+                let _ = h.memory_regions.push(*region);
+            }
+        } else {
+            log::warn!("Platform memory map exceeds direct-Linux handoff capacity");
+        }
         h.capsule_regions.clear();
         for region in config.capsule_regions {
             if h.capsule_regions.push(*region).is_err() {

@@ -35,14 +35,12 @@ pub fn init_from_platform(config: &mut crate::platform::PlatformConfig) {
     // Initialize the memory allocator from the platform memory map
     allocator::init_from_platform(config.memory_map);
 
-    // NOTE: add_platform_mmio_regions() is NOT called here. In library mode
-    // the caller's memory_map is authoritative — it must include all MMIO
-    // regions (GIC, UART, PCIe windows, platform devices) as MemoryType::Mmio
-    // entries. This avoids duplicate memory map entries and removes the need
-    // for ACPI/FDT parsing inside the library for this purpose.
-    //
-    // Platforms that discover MMIO regions via ACPI (e.g., coreboot) call
-    // efi::add_platform_mmio_regions() themselves before init_platform().
+    // Explicit platform maps are authoritative. Coreboot's memory map omits
+    // some MMIO windows; it opts into adding those found in the FDT instead.
+    #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
+    if config.discover_mmio {
+        add_platform_mmio_regions();
+    }
 
     // On aarch64, reserve EL2 page tables if running at EL2.
     // When called from fstart (which typically runs at EL1), this is a no-op.
