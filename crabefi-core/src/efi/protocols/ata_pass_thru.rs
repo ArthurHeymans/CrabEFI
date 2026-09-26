@@ -235,18 +235,13 @@ struct AtaPassThruContext {
     pci_function: u8,
 }
 
-use super::context_map::ProtocolContextMap;
+use super::instance::Registry;
 
-/// Maximum number of ATA Pass Thru protocol instances
-const MAX_INSTANCES: usize = 8;
-
-/// Protocol-to-context map
-static CTX_MAP: ProtocolContextMap<AtaPassThruContext, AtaPassThruProtocol, MAX_INSTANCES> =
-    ProtocolContextMap::new();
+static INSTANCES: Registry<AtaPassThruProtocol, AtaPassThruContext> = Registry::new();
 
 /// Get context for a protocol instance
 fn get_context(protocol: *mut AtaPassThruProtocol) -> Option<AtaPassThruContext> {
-    CTX_MAP.get(protocol)
+    INSTANCES.get(protocol)
 }
 
 // ============================================================================
@@ -640,15 +635,6 @@ pub fn create_ata_pass_thru_protocol(
     pci_device: u8,
     pci_function: u8,
 ) -> *mut AtaPassThruProtocol {
-    // Find a free context slot
-    let ctx_idx = match CTX_MAP.find_free_slot() {
-        Some(i) => i,
-        None => {
-            log::error!("AtaPassThru: no free context slots");
-            return core::ptr::null_mut();
-        }
-    };
-
     // Verify controller exists
     if controller_index >= ahci::controller_count() {
         log::error!("AtaPassThru: controller {} not found", controller_index);
@@ -666,8 +652,14 @@ pub fn create_ata_pass_thru_protocol(
     }
 
     // Allocate protocol structure
-    let protocol_ptr =
-        allocate_protocol_with_log::<AtaPassThruProtocol>("AtaPassThruProtocol", |p| {
+    let protocol_ptr = INSTANCES.allocate(
+        "AtaPassThruProtocol",
+        AtaPassThruContext {
+            controller_index,
+            pci_device,
+            pci_function,
+        },
+        |p| {
             p.mode = mode_ptr;
             p.pass_thru = ata_pass_thru;
             p.get_next_port = ata_get_next_port;
@@ -676,23 +668,12 @@ pub fn create_ata_pass_thru_protocol(
             p.get_device = ata_get_device;
             p.reset_port = ata_reset_port;
             p.reset_device = ata_reset_device;
-        });
-
+        },
+    );
     if protocol_ptr.is_null() {
         crate::efi::allocator::free_pool(mode_ptr as *mut u8);
         return core::ptr::null_mut();
     }
-
-    // Store context
-    CTX_MAP.store(
-        ctx_idx,
-        AtaPassThruContext {
-            controller_index,
-            pci_device,
-            pci_function,
-        },
-        protocol_ptr,
-    );
 
     log::info!(
         "AtaPassThru: created protocol for controller {} (PCI {:02x}:{:x})",

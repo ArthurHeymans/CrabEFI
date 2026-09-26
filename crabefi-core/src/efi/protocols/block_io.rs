@@ -7,6 +7,7 @@ use core::ffi::c_void;
 use r_efi::efi::{Boolean, Status};
 use r_efi::protocols::block_io;
 
+use super::instance::Registry;
 use crate::drivers::storage::{self, StorageId};
 use crate::efi::utils::allocate_protocol_with_log;
 
@@ -37,14 +38,7 @@ struct BlockIoContext {
     block_size: u32,
 }
 
-use super::context_map::ProtocolContextMap;
-
-/// Maximum number of BlockIO instances
-const MAX_BLOCK_IO_INSTANCES: usize = 16;
-
-/// Protocol-to-context map
-static CTX_MAP: ProtocolContextMap<BlockIoContext, BlockIoProtocol, MAX_BLOCK_IO_INSTANCES> =
-    ProtocolContextMap::new();
+static INSTANCES: Registry<BlockIoProtocol, BlockIoContext> = Registry::new();
 
 /// Reset the block device
 extern "efiapi" fn block_io_reset(
@@ -67,7 +61,7 @@ extern "efiapi" fn block_io_read_blocks(
         return Status::INVALID_PARAMETER;
     }
 
-    let ctx = match CTX_MAP.get(this) {
+    let ctx = match INSTANCES.get(this) {
         Some(c) => c,
         None => {
             log::error!("BlockIO.ReadBlocks: unknown protocol instance");
@@ -220,15 +214,6 @@ fn create_block_io_internal(
     block_size: u32,
     is_partition: bool,
 ) -> *mut BlockIoProtocol {
-    // Find a free context slot
-    let ctx_idx = match CTX_MAP.find_free_slot() {
-        Some(i) => i,
-        None => {
-            log::error!("BlockIO: no free context slots");
-            return core::ptr::null_mut();
-        }
-    };
-
     // Allocate media structure
     let media_ptr = allocate_protocol_with_log::<BlockIoMedia>("BlockIoMedia", |m| {
         m.media_id = media_id;
@@ -249,22 +234,8 @@ fn create_block_io_internal(
     }
 
     // Allocate protocol structure
-    let protocol_ptr = allocate_protocol_with_log::<BlockIoProtocol>("BlockIoProtocol", |p| {
-        p.revision = BLOCK_IO_REVISION;
-        p.media = media_ptr;
-        p.reset = block_io_reset;
-        p.read_blocks = block_io_read_blocks;
-        p.write_blocks = block_io_write_blocks;
-        p.flush_blocks = block_io_flush_blocks;
-    });
-    if protocol_ptr.is_null() {
-        crate::efi::allocator::free_pool(media_ptr as *mut u8);
-        return core::ptr::null_mut();
-    }
-
-    // Store context
-    CTX_MAP.store(
-        ctx_idx,
+    let protocol_ptr = INSTANCES.allocate(
+        "BlockIoProtocol",
         BlockIoContext {
             media_id,
             storage,
@@ -272,8 +243,19 @@ fn create_block_io_internal(
             num_blocks,
             block_size,
         },
-        protocol_ptr,
+        |p| {
+            p.revision = BLOCK_IO_REVISION;
+            p.media = media_ptr;
+            p.reset = block_io_reset;
+            p.read_blocks = block_io_read_blocks;
+            p.write_blocks = block_io_write_blocks;
+            p.flush_blocks = block_io_flush_blocks;
+        },
     );
+    if protocol_ptr.is_null() {
+        crate::efi::allocator::free_pool(media_ptr as *mut u8);
+        return core::ptr::null_mut();
+    }
 
     let kind = if is_partition { "partition" } else { "disk" };
     log::info!(

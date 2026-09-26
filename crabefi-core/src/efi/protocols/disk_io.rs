@@ -10,8 +10,8 @@ use r_efi::efi::{Handle, Status};
 use r_efi::protocols::disk_io;
 
 use super::block_io::{BLOCK_IO_PROTOCOL_GUID, BlockIoProtocol};
+use super::instance::Registry;
 use crate::efi::boot_services;
-use crate::efi::utils::allocate_protocol_with_log;
 
 /// Disk I/O Protocol GUID supplied by `r-efi`.
 pub const DISK_IO_PROTOCOL_GUID: r_efi::efi::Guid = disk_io::PROTOCOL_GUID;
@@ -22,11 +22,6 @@ const DISK_IO_REVISION: u64 = disk_io::REVISION;
 /// Disk I/O protocol ABI supplied by `r-efi`.
 pub type DiskIoProtocol = disk_io::Protocol;
 
-/// Maximum number of DiskIO instances (must match MAX_BLOCK_IO_INSTANCES)
-const MAX_DISK_IO_INSTANCES: usize = 16;
-
-use super::context_map::ProtocolContextMap;
-
 /// DiskIO context: stores the handle so we can find BlockIO at read time
 #[derive(Clone, Copy)]
 struct DiskIoContext {
@@ -34,9 +29,7 @@ struct DiskIoContext {
     handle: Handle,
 }
 
-/// Protocol-to-context map
-static CTX_MAP: ProtocolContextMap<DiskIoContext, DiskIoProtocol, MAX_DISK_IO_INSTANCES> =
-    ProtocolContextMap::new();
+static INSTANCES: Registry<DiskIoProtocol, DiskIoContext> = Registry::new();
 
 /// Read from the disk at a byte offset
 ///
@@ -60,7 +53,7 @@ extern "efiapi" fn disk_io_read_disk(
         buffer_size
     );
 
-    let handle = match CTX_MAP.get(this) {
+    let handle = match INSTANCES.get(this) {
         Some(c) => c.handle,
         None => {
             log::error!("DiskIO.ReadDisk: unknown protocol instance");
@@ -175,17 +168,8 @@ pub fn install_disk_io_on_handle(handle: Handle) {
         return;
     }
 
-    // Find a free context slot
-    let ctx_idx = match CTX_MAP.find_free_slot() {
-        Some(i) => i,
-        None => {
-            log::error!("DiskIO: no free context slots");
-            return;
-        }
-    };
-
-    // Allocate the protocol structure
-    let protocol_ptr = allocate_protocol_with_log::<DiskIoProtocol>("DiskIoProtocol", |p| {
+    // Allocate the protocol structure and its handle context together.
+    let protocol_ptr = INSTANCES.allocate("DiskIoProtocol", DiskIoContext { handle }, |p| {
         p.revision = DISK_IO_REVISION;
         p.read_disk = disk_io_read_disk;
         p.write_disk = disk_io_write_disk;
@@ -194,9 +178,6 @@ pub fn install_disk_io_on_handle(handle: Handle) {
     if protocol_ptr.is_null() {
         return;
     }
-
-    // Store context
-    CTX_MAP.store(ctx_idx, DiskIoContext { handle }, protocol_ptr);
 
     // Install on the handle
     let status = boot_services::install_protocol(

@@ -173,18 +173,13 @@ struct NvmePassThruContext {
     pci_function: u8,
 }
 
-use super::context_map::ProtocolContextMap;
+use super::instance::Registry;
 
-/// Maximum number of NVMe Pass Thru protocol instances
-const MAX_INSTANCES: usize = 8;
-
-/// Protocol-to-context map
-static CTX_MAP: ProtocolContextMap<NvmePassThruContext, NvmExpressPassThruProtocol, MAX_INSTANCES> =
-    ProtocolContextMap::new();
+static INSTANCES: Registry<NvmExpressPassThruProtocol, NvmePassThruContext> = Registry::new();
 
 /// Get context for a protocol instance
 fn get_context(protocol: *mut NvmExpressPassThruProtocol) -> Option<NvmePassThruContext> {
-    CTX_MAP.get(protocol)
+    INSTANCES.get(protocol)
 }
 
 // ============================================================================
@@ -462,15 +457,6 @@ pub fn create_nvme_pass_thru_protocol(
     pci_device: u8,
     pci_function: u8,
 ) -> *mut NvmExpressPassThruProtocol {
-    // Find a free context slot
-    let ctx_idx = match CTX_MAP.find_free_slot() {
-        Some(i) => i,
-        None => {
-            log::error!("NvmePassThru: no free context slots");
-            return core::ptr::null_mut();
-        }
-    };
-
     // Get controller to read version
     let nvme_version =
         match nvme::with_controller(controller_index, |controller| controller.nvme_version()) {
@@ -494,8 +480,13 @@ pub fn create_nvme_pass_thru_protocol(
     }
 
     // Allocate protocol structure
-    let protocol_ptr = allocate_protocol_with_log::<NvmExpressPassThruProtocol>(
+    let protocol_ptr = INSTANCES.allocate(
         "NvmExpressPassThruProtocol",
+        NvmePassThruContext {
+            controller_index,
+            pci_device,
+            pci_function,
+        },
         |p| {
             p.mode = mode_ptr;
             p.pass_thru = nvme_pass_thru;
@@ -504,22 +495,10 @@ pub fn create_nvme_pass_thru_protocol(
             p.get_namespace = nvme_get_namespace;
         },
     );
-
     if protocol_ptr.is_null() {
         crate::efi::allocator::free_pool(mode_ptr as *mut u8);
         return core::ptr::null_mut();
     }
-
-    // Store context
-    CTX_MAP.store(
-        ctx_idx,
-        NvmePassThruContext {
-            controller_index,
-            pci_device,
-            pci_function,
-        },
-        protocol_ptr,
-    );
 
     log::info!(
         "NvmePassThru: created protocol for controller {} (PCI {:02x}:{:x}, NVMe version {:#x})",

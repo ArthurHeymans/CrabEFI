@@ -193,18 +193,13 @@ struct ScsiPassThruContext {
     target_id: *mut u8,
 }
 
-use super::context_map::ProtocolContextMap;
+use super::instance::Registry;
 
-/// Maximum number of SCSI Pass Thru protocol instances
-const MAX_INSTANCES: usize = 8;
-
-/// Protocol-to-context map
-static CTX_MAP: ProtocolContextMap<ScsiPassThruContext, ExtScsiPassThruProtocol, MAX_INSTANCES> =
-    ProtocolContextMap::new();
+static INSTANCES: Registry<ExtScsiPassThruProtocol, ScsiPassThruContext> = Registry::new();
 
 /// Get context for a protocol instance
 fn get_context(protocol: *mut ExtScsiPassThruProtocol) -> Option<ScsiPassThruContext> {
-    CTX_MAP.get(protocol)
+    INSTANCES.get(protocol)
 }
 
 // ============================================================================
@@ -644,15 +639,6 @@ pub fn create_scsi_pass_thru_protocol(
     pci_function: u8,
     usb_port: u8,
 ) -> *mut ExtScsiPassThruProtocol {
-    // Find a free context slot
-    let ctx_idx = match CTX_MAP.find_free_slot() {
-        Some(i) => i,
-        None => {
-            log::error!("ScsiPassThru: no free context slots");
-            return core::ptr::null_mut();
-        }
-    };
-
     // Allocate mode structure
     let mode_ptr = allocate_protocol_with_log::<ExtScsiPassThruMode>("ExtScsiPassThruMode", |m| {
         m.adapter_id = controller_index as u32;
@@ -664,40 +650,21 @@ pub fn create_scsi_pass_thru_protocol(
         return core::ptr::null_mut();
     }
 
-    // Allocate protocol structure
-    let protocol_ptr =
-        allocate_protocol_with_log::<ExtScsiPassThruProtocol>("ExtScsiPassThruProtocol", |p| {
-            p.mode = mode_ptr;
-            p.pass_thru = scsi_pass_thru;
-            p.get_next_target_lun = scsi_get_next_target_lun;
-            p.build_device_path = scsi_build_device_path;
-            p.get_target_lun = scsi_get_target_lun;
-            p.reset_channel = scsi_reset_channel;
-            p.reset_target_lun = scsi_reset_target_lun;
-            p.get_next_target = scsi_get_next_target;
-        });
-
-    if protocol_ptr.is_null() {
-        crate::efi::allocator::free_pool(mode_ptr as *mut u8);
-        return core::ptr::null_mut();
-    }
-
     let target_id = match crate::efi::allocator::allocate_pool(
         crate::efi::allocator::MemoryType::BootServicesData,
         TARGET_MAX_BYTES,
     ) {
         Ok(target_id) => target_id,
         Err(_) => {
-            crate::efi::allocator::free_pool(protocol_ptr.cast());
             crate::efi::allocator::free_pool(mode_ptr.cast());
             return core::ptr::null_mut();
         }
     };
     unsafe { core::ptr::write_bytes(target_id, 0, TARGET_MAX_BYTES) };
 
-    // Store context
-    CTX_MAP.store(
-        ctx_idx,
+    // Allocate the protocol only after every auxiliary allocation succeeds.
+    let protocol_ptr = INSTANCES.allocate(
+        "ExtScsiPassThruProtocol",
         ScsiPassThruContext {
             controller_index,
             device_addr,
@@ -706,8 +673,22 @@ pub fn create_scsi_pass_thru_protocol(
             usb_port,
             target_id,
         },
-        protocol_ptr,
+        |p| {
+            p.mode = mode_ptr;
+            p.pass_thru = scsi_pass_thru;
+            p.get_next_target_lun = scsi_get_next_target_lun;
+            p.build_device_path = scsi_build_device_path;
+            p.get_target_lun = scsi_get_target_lun;
+            p.reset_channel = scsi_reset_channel;
+            p.reset_target_lun = scsi_reset_target_lun;
+            p.get_next_target = scsi_get_next_target;
+        },
     );
+    if protocol_ptr.is_null() {
+        crate::efi::allocator::free_pool(target_id);
+        crate::efi::allocator::free_pool(mode_ptr.cast());
+        return core::ptr::null_mut();
+    }
 
     log::info!(
         "ScsiPassThru: created protocol for USB device {} on controller {} (PCI {:02x}:{:x}, port {})",

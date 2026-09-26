@@ -15,7 +15,6 @@ use r_efi::efi::{Guid, Status};
 
 use crate::drivers::storage::StorageId;
 use crate::drivers::{ahci, nvme, usb};
-use crate::efi::utils::allocate_protocol_with_log;
 
 /// Storage Security Command Protocol GUID
 /// {C88B0B6D-0DFC-49A7-9CB4-49074B4C3A78}
@@ -67,21 +66,14 @@ struct StorageSecurityContext {
     storage_type: StorageId,
 }
 
-use super::context_map::ProtocolContextMap;
+use super::instance::Registry;
 
-/// Maximum number of Storage Security protocol instances
-const MAX_INSTANCES: usize = 16;
-
-/// Protocol-to-context map
-static CTX_MAP: ProtocolContextMap<
-    StorageSecurityContext,
-    StorageSecurityCommandProtocol,
-    MAX_INSTANCES,
-> = ProtocolContextMap::new();
+static INSTANCES: Registry<StorageSecurityCommandProtocol, StorageSecurityContext> =
+    Registry::new();
 
 /// Get context for a protocol instance
 fn get_context(protocol: *mut StorageSecurityCommandProtocol) -> Option<StorageSecurityContext> {
-    CTX_MAP.get(protocol)
+    INSTANCES.get(protocol)
 }
 
 /// Receive data from security subsystem
@@ -426,37 +418,20 @@ pub fn create_storage_security_protocol(
     media_id: u32,
     storage_type: StorageId,
 ) -> *mut StorageSecurityCommandProtocol {
-    // Find a free context slot
-    let ctx_idx = match CTX_MAP.find_free_slot() {
-        Some(i) => i,
-        None => {
-            log::error!("StorageSecurity: no free context slots");
-            return core::ptr::null_mut();
-        }
-    };
-
-    // Allocate protocol structure
-    let protocol_ptr = allocate_protocol_with_log::<StorageSecurityCommandProtocol>(
+    let protocol_ptr = INSTANCES.allocate(
         "StorageSecurityCommandProtocol",
+        StorageSecurityContext {
+            media_id,
+            storage_type,
+        },
         |p| {
             p.receive_data = storage_security_receive_data;
             p.send_data = storage_security_send_data;
         },
     );
-
     if protocol_ptr.is_null() {
         return core::ptr::null_mut();
     }
-
-    // Store context
-    CTX_MAP.store(
-        ctx_idx,
-        StorageSecurityContext {
-            media_id,
-            storage_type,
-        },
-        protocol_ptr,
-    );
 
     log::info!(
         "StorageSecurity: created protocol (media={}, type={:?})",
