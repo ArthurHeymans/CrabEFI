@@ -65,6 +65,16 @@ The digest must be bound by the trusted containing firmware image. A missing,
 mismatched, malformed, or wrong-architecture runtime image is a fatal startup
 error; there is no monolithic fallback.
 
+## Platform discovery
+
+Platform code can pass discovered ACPI topology through
+`PlatformConfig::acpi_info` (or the builder's `.acpi_info(info)`). The core
+copies the finalized platform memory map into its direct-Linux handoff and
+parses the supplied FDT before EFI initialization. The caller's memory map is
+authoritative by default; platforms whose map omits FDT-described MMIO can set
+`discover_mmio` (or `.discover_mmio(true)`) on AArch64/RISC-V. Do not enable
+that option when the map already describes those windows.
+
 ## Platform mechanisms
 
 `Timer`, `ResetHandler`, `PlatformHooks`, device traits, and loggers are
