@@ -168,6 +168,12 @@ pub fn install_disk_io_on_handle(handle: Handle) {
         return;
     }
 
+    // Repeated boot attempts may revisit a handle. Do not allocate another
+    // instance when DiskIO is already present.
+    if !boot_services::get_protocol_on_handle(handle, &DISK_IO_PROTOCOL_GUID).is_null() {
+        return;
+    }
+
     // Allocate the protocol structure and its handle context together.
     let protocol_ptr = INSTANCES.allocate("DiskIoProtocol", DiskIoContext { handle }, |p| {
         p.revision = DISK_IO_REVISION;
@@ -189,6 +195,9 @@ pub fn install_disk_io_on_handle(handle: Handle) {
     if status == Status::SUCCESS {
         log::info!("DiskIO protocol installed on handle {:?}", handle);
     } else {
+        // A failed installation never publishes the protocol pointer. Release
+        // the instance so retries cannot exhaust the firmware's boot-time heap.
+        let _ = INSTANCES.remove(protocol_ptr);
         log::error!(
             "DiskIO: failed to install on handle {:?}: {:?}",
             handle,
