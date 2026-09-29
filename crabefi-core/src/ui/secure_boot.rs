@@ -24,32 +24,64 @@ pub fn show(fb: &FramebufferInfo) -> ScreenNav {
 
     draw_screen(fb, selected, hovered, sidebar_hov, scroll_offset, status);
 
+    // Repaint after `selected`/`scroll_offset` changed from `before`: just the cards, unless
+    // a status toast has to be wiped, which needs the full screen.
+    macro_rules! reselect {
+        ($before:expr, $had_status:expr) => {
+            if $had_status {
+                cursor.while_hidden(fb, || {
+                    draw_screen(fb, selected, hovered, sidebar_hov, scroll_offset, status)
+                });
+            } else if (selected, scroll_offset) != $before {
+                cursor.while_hidden(fb, || {
+                    if scroll_offset == $before.1 {
+                        [$before.0, selected].into_iter().for_each(|i| {
+                            paint_action_card(fb, i, selected, hovered, scroll_offset);
+                        });
+                    } else {
+                        let end = (scroll_offset + action_visible_slots(fb)).min(ACTION_COUNT);
+                        (scroll_offset..end).for_each(|i| {
+                            paint_action_card(fb, i, selected, hovered, scroll_offset);
+                        });
+                    }
+                    paint_action_scrollbar(fb, scroll_offset);
+                });
+            }
+        };
+    }
+
     loop {
         poll_and_render_cursor(fb, &mut cursor);
 
-        update_sidebar_hover(fb, &mut sidebar_hov, NavItem::Security);
+        update_sidebar_hover(fb, &mut cursor, &mut sidebar_hov, NavItem::Security);
 
         // ── Card hover ──
         let new_hov = action_hit(fb, scroll_offset);
         if new_hov != hovered {
-            hovered = new_hov;
-            draw_screen(fb, selected, hovered, sidebar_hov, scroll_offset, status);
+            let prev = core::mem::replace(&mut hovered, new_hov);
+            cursor.while_hidden(fb, || {
+                prev.into_iter().chain(new_hov).for_each(|i| {
+                    paint_action_card(fb, i, selected, hovered, scroll_offset);
+                });
+                paint_action_scrollbar(fb, scroll_offset);
+            });
         }
 
         if let Some(key) = menu_common::read_key() {
-            status = None;
+            let had_status = status.take().is_some();
+            let before = (selected, scroll_offset);
             match key {
                 KeyPress::Up | KeyPress::Char('k') => {
                     selected = selected.saturating_sub(1);
                     keep_action_visible(fb, selected, &mut scroll_offset);
-                    draw_screen(fb, selected, hovered, sidebar_hov, scroll_offset, status);
+                    reselect!(before, had_status);
                 }
                 KeyPress::Down | KeyPress::Char('j') => {
                     if selected < ACTION_COUNT - 1 {
                         selected += 1;
                     }
                     keep_action_visible(fb, selected, &mut scroll_offset);
-                    draw_screen(fb, selected, hovered, sidebar_hov, scroll_offset, status);
+                    reselect!(before, had_status);
                 }
                 KeyPress::Char('s') | KeyPress::Char('S') => {}
                 KeyPress::Char('f') | KeyPress::Char('F') => {
@@ -67,7 +99,9 @@ pub fn show(fb: &FramebufferInfo) -> ScreenNav {
                     if selected == ACTION_BACK {
                         return ScreenNav::Back;
                     }
-                    draw_screen(fb, selected, hovered, sidebar_hov, scroll_offset, status);
+                    cursor.while_hidden(fb, || {
+                        draw_screen(fb, selected, hovered, sidebar_hov, scroll_offset, status)
+                    });
                 }
                 #[cfg(feature = "ui")]
                 KeyPress::MouseClick { .. } => {
@@ -85,11 +119,21 @@ pub fn show(fb: &FramebufferInfo) -> ScreenNav {
                             if selected == ACTION_BACK {
                                 return ScreenNav::Back;
                             }
+                            cursor.while_hidden(fb, || {
+                                draw_screen(
+                                    fb,
+                                    selected,
+                                    hovered,
+                                    sidebar_hov,
+                                    scroll_offset,
+                                    status,
+                                )
+                            });
                         } else {
                             selected = idx;
                             keep_action_visible(fb, selected, &mut scroll_offset);
+                            reselect!(before, had_status);
                         }
-                        draw_screen(fb, selected, hovered, sidebar_hov, scroll_offset, status);
                     }
                 }
                 #[cfg(feature = "ui")]
@@ -100,7 +144,7 @@ pub fn show(fb: &FramebufferInfo) -> ScreenNav {
                         selected -= 1;
                     }
                     keep_action_visible(fb, selected, &mut scroll_offset);
-                    draw_screen(fb, selected, hovered, sidebar_hov, scroll_offset, status);
+                    reselect!(before, had_status);
                 }
                 _ => {}
             }
@@ -287,6 +331,19 @@ fn paint_action_card(
     }
 }
 
+fn paint_action_scrollbar(fb: &FramebufferInfo, scroll_offset: usize) {
+    let (list_x, list_y, list_w, list_h) = action_list_area(fb);
+    draw_scrollbar(
+        fb,
+        list_x + list_w as i32 - 4,
+        list_y,
+        list_h,
+        ACTION_COUNT,
+        scroll_offset,
+        action_visible_slots(fb),
+    );
+}
+
 fn draw_screen(
     fb: &FramebufferInfo,
     selected: usize,
@@ -415,16 +472,7 @@ fn draw_screen(
         paint_action_card(fb, i, selected, hovered, scroll_offset);
     }
 
-    let (list_x, list_y, list_w, list_h) = action_list_area(fb);
-    draw_scrollbar(
-        fb,
-        list_x + list_w as i32 - 4,
-        list_y,
-        list_h,
-        ACTION_COUNT,
-        scroll_offset,
-        action_visible_slots(fb),
-    );
+    paint_action_scrollbar(fb, scroll_offset);
 
     // Status toast
     if let Some((msg, ok)) = status {
