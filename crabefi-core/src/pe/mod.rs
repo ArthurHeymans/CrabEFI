@@ -205,6 +205,66 @@ pub struct PeHeaders<'a> {
     pub sections_offset: usize,
 }
 
+/// `IMAGE_SUBSYSTEM_EFI_APPLICATION`
+pub const SUBSYSTEM_EFI_APPLICATION: u16 = 10;
+/// `IMAGE_SUBSYSTEM_EFI_BOOT_SERVICE_DRIVER`
+pub const SUBSYSTEM_EFI_BOOT_SERVICE_DRIVER: u16 = 11;
+/// `IMAGE_SUBSYSTEM_EFI_RUNTIME_DRIVER`
+pub const SUBSYSTEM_EFI_RUNTIME_DRIVER: u16 = 12;
+
+pub(crate) fn image_memory_types(subsystem: u16) -> (MemoryType, MemoryType) {
+    match subsystem {
+        SUBSYSTEM_EFI_BOOT_SERVICE_DRIVER => {
+            (MemoryType::BootServicesCode, MemoryType::BootServicesData)
+        }
+        SUBSYSTEM_EFI_RUNTIME_DRIVER => (
+            MemoryType::RuntimeServicesCode,
+            MemoryType::RuntimeServicesData,
+        ),
+        _ => (MemoryType::LoaderCode, MemoryType::LoaderData),
+    }
+}
+
+type CodePages = heapless::Vec<core::ops::Range<u64>, { MAX_SECTIONS as usize }>;
+
+/// Executable sections own every page they touch; headers, data, BSS and
+/// alignment padding remain data. Shared pages must remain executable.
+fn image_code_pages(
+    sections: &[u8],
+    image_size: u32,
+    load_offset: u64,
+) -> Result<CodePages, Status> {
+    let mut code = CodePages::new();
+    for chunk in sections
+        .as_chunks::<{ core::mem::size_of::<SectionHeader>() }>()
+        .0
+    {
+        let (section, _) =
+            SectionHeader::ref_from_prefix(chunk).map_err(|_| Status::INVALID_PARAMETER)?;
+        let start = section.virtual_address as u64;
+        let end = start + section.virtual_size.max(section.size_of_raw_data) as u64;
+        if end > image_size as u64 {
+            return Err(Status::INVALID_PARAMETER);
+        }
+        if end > start && section.characteristics & object_pe::IMAGE_SCN_MEM_EXECUTE.0 != 0 {
+            code.push((load_offset + start) / PAGE_SIZE..(load_offset + end).div_ceil(PAGE_SIZE))
+                .map_err(|_| Status::OUT_OF_RESOURCES)?;
+        }
+    }
+    code.sort_unstable_by_key(|range| range.start);
+    let mut merged = CodePages::new();
+    for range in code {
+        if let Some(previous) = merged.last_mut()
+            && previous.end >= range.start
+        {
+            previous.end = previous.end.max(range.end);
+        } else {
+            merged.push(range).map_err(|_| Status::OUT_OF_RESOURCES)?;
+        }
+    }
+    Ok(merged)
+}
+
 impl<'a> PeHeaders<'a> {
     /// Get the offset of the checksum field from start of file
     pub fn checksum_offset(&self) -> usize {
@@ -231,10 +291,9 @@ impl<'a> PeHeaders<'a> {
 
     /// Get the PE subsystem value from the optional header.
     ///
-    /// Common EFI values:
-    /// - 10: `EFI_APPLICATION`
-    /// - 11: `EFI_BOOT_SERVICE_DRIVER`
-    /// - 12: `EFI_RUNTIME_SERVICES_DRIVER`
+    /// Common EFI values are [`SUBSYSTEM_EFI_APPLICATION`],
+    /// [`SUBSYSTEM_EFI_BOOT_SERVICE_DRIVER`] and
+    /// [`SUBSYSTEM_EFI_RUNTIME_DRIVER`].
     pub fn subsystem(&self) -> u16 {
         // The Subsystem field is at byte offset 68 in both PE32 and PE32+
         // optional headers.
@@ -536,6 +595,9 @@ pub fn load_image(data: &[u8]) -> Result<LoadedImage, Status> {
     // (section_alignment = 0x10000).  Over-allocate so we can align
     // the load address upward within the allocation.
     let section_alignment = opt_header.section_alignment as u64;
+    if !section_alignment.is_power_of_two() {
+        return Err(Status::INVALID_PARAMETER);
+    }
     let extra_align = if section_alignment > PAGE_SIZE {
         section_alignment
     } else {
@@ -710,6 +772,24 @@ pub fn load_image(data: &[u8]) -> Result<LoadedImage, Status> {
     }
 
     let entry_point = load_addr + entry_point_rva as u64;
+    let (code_type, data_type) = image_memory_types(opt_header.subsystem);
+    if code_type != MemoryType::LoaderCode {
+        // Stage as LoaderCode until all copying and relocations succeed. Then
+        // publish a matching code/data map, including EFI_MEMORY_RUNTIME for
+        // runtime drivers, before a LoadedImage protocol can expose the image.
+        let layout = (|| {
+            let code = image_code_pages(section_data, image_size, load_addr - alloc_base)?;
+            let entry_page = (entry_point - alloc_base) / PAGE_SIZE;
+            if !code.iter().any(|range| range.contains(&entry_page)) {
+                return Err(Status::INVALID_PARAMETER);
+            }
+            allocator::retype_pe_image(alloc_base, num_pages, code_type, data_type, &code)
+        })();
+        if let Err(status) = layout {
+            let _ = allocator::free_pe_image(alloc_base, num_pages);
+            return Err(status);
+        }
+    }
 
     log::info!(
         "PE: Loaded image at {:#x}, entry point at {:#x}",
@@ -866,7 +946,7 @@ fn apply_relocations(
 
 /// Unload a PE image and free its memory
 pub fn unload_image(image: &LoadedImage) -> Status {
-    allocator::free_pages(image.alloc_base, image.num_pages)
+    allocator::free_pe_image(image.alloc_base, image.num_pages)
 }
 
 #[cfg(test)]
@@ -922,6 +1002,42 @@ mod tests {
         put_u32(&mut data, section + 16, 0x20);
         put_u32(&mut data, section + 20, 0x180);
         data
+    }
+
+    #[test]
+    fn code_pages_merge_shared_pages_and_include_load_alignment() {
+        let mut sections = [0u8; 3 * core::mem::size_of::<SectionHeader>()];
+        for (chunk, (address, size, flags)) in sections.as_chunks_mut::<40>().0.iter_mut().zip([
+            (0x3800, 0x1000, object_pe::IMAGE_SCN_MEM_EXECUTE),
+            (0x1800, 0x2800, object_pe::IMAGE_SCN_MEM_EXECUTE),
+            (0x4800, 0x1000, object_pe::IMAGE_SCN_MEM_WRITE),
+        ]) {
+            put_u32(chunk, 8, size);
+            put_u32(chunk, 12, address);
+            put_u32(chunk, 36, flags.0);
+        }
+        assert_eq!(
+            image_code_pages(&sections, 0x6000, 0x2000)
+                .unwrap()
+                .as_slice(),
+            core::slice::from_ref(&(3..7))
+        );
+        assert!(image_code_pages(&sections, 0x5000, 0).is_err());
+        assert_eq!(
+            image_memory_types(SUBSYSTEM_EFI_RUNTIME_DRIVER),
+            (
+                MemoryType::RuntimeServicesCode,
+                MemoryType::RuntimeServicesData
+            )
+        );
+        assert_eq!(
+            image_memory_types(SUBSYSTEM_EFI_BOOT_SERVICE_DRIVER),
+            (MemoryType::BootServicesCode, MemoryType::BootServicesData)
+        );
+        assert_eq!(
+            image_memory_types(SUBSYSTEM_EFI_APPLICATION),
+            (MemoryType::LoaderCode, MemoryType::LoaderData)
+        );
     }
 
     #[test]

@@ -71,6 +71,26 @@ pub fn create_loaded_image_protocol(
     ptr
 }
 
+/// Set the code/data memory types from the PE/COFF subsystem.
+///
+/// `pe::load_image` has already finalized the image's code/data memory map;
+/// this only mirrors those types in the protocol before publication.
+///
+/// # Safety
+/// The protocol pointer must be valid and describe an image loaded with the
+/// supplied subsystem's memory types.
+pub unsafe fn set_image_subsystem(protocol: *mut loaded_image::Protocol, subsystem: u16) {
+    if protocol.is_null() {
+        return;
+    }
+    let (code, data) = crate::pe::image_memory_types(subsystem);
+    // SAFETY: the caller guarantees the protocol pointer is valid.
+    unsafe {
+        (*protocol).image_code_type = code as u32;
+        (*protocol).image_data_type = data as u32;
+    }
+}
+
 /// Set load options on a loaded image protocol
 ///
 /// # Safety

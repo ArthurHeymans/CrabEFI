@@ -807,6 +807,121 @@ impl MemoryAllocator {
         Ok(())
     }
 
+    /// Retype an exclusively owned PE staging allocation before publication.
+    /// Code offsets are sorted, nonoverlapping page ranges relative to `base`.
+    fn retype_pe_image(
+        &mut self,
+        base: u64,
+        pages: u64,
+        code_type: MemoryType,
+        data_type: MemoryType,
+        code: &[core::ops::Range<u64>],
+    ) -> Result<(), efi::Status> {
+        if self.boot_services_exited {
+            return Err(efi::Status::UNSUPPORTED);
+        }
+        let image = PageRange::from_bytes(base, pages).ok_or(efi::Status::INVALID_PARAMETER)?;
+        let (index, allocation) = self
+            .find_allocation(image)
+            .filter(|(_, allocation)| {
+                allocation.range == image && allocation.memory_type == MemoryType::LoaderCode
+            })
+            .ok_or(efi::Status::NOT_FOUND)?;
+        let descriptor = self
+            .find_descriptor(image, &[MemoryType::LoaderCode])
+            .ok_or(efi::Status::NOT_FOUND)?;
+        let mut previous_end = 0;
+        for range in code {
+            if range.start < previous_end || range.start >= range.end || range.end > pages {
+                return Err(efi::Status::INVALID_PARAMETER);
+            }
+            previous_end = range.end;
+        }
+        // Each split adds at most two descriptors and ownership records. Reserve
+        // all capacity before changing anything so failure leaves staging intact.
+        let extra = code
+            .len()
+            .checked_mul(2)
+            .and_then(|n| n.checked_add(2))
+            .ok_or(efi::Status::OUT_OF_RESOURCES)?;
+        if extra > MAX_MEMORY_ENTRIES - self.entries.len()
+            || extra > MAX_PAGE_ALLOCATIONS - self.allocations.len()
+        {
+            return Err(efi::Status::OUT_OF_RESOURCES);
+        }
+        let attribute = Self::allocation_attribute(data_type, allocation.restore_attribute);
+        self.retype_range(descriptor, image, data_type, attribute)?;
+        self.allocations[index].memory_type = data_type;
+        for offset in code {
+            let range =
+                PageRange::from_bytes(base + offset.start * PAGE_SIZE, offset.end - offset.start)
+                    .ok_or(efi::Status::INVALID_PARAMETER)?;
+            let (index, _) = self.find_allocation(range).ok_or(efi::Status::NOT_FOUND)?;
+            let descriptor = self
+                .find_descriptor(range, &[data_type])
+                .ok_or(efi::Status::NOT_FOUND)?;
+            let attribute = Self::allocation_attribute(code_type, allocation.restore_attribute);
+            self.retype_range(descriptor, range, code_type, attribute)?;
+            self.replace_allocation_range(
+                index,
+                range,
+                Some(PageAllocation {
+                    range,
+                    memory_type: code_type,
+                    restore_attribute: allocation.restore_attribute,
+                }),
+            )?;
+        }
+        self.map_key += 1;
+        Ok(())
+    }
+
+    /// Free the complete PE allocation across its private code/data splits.
+    /// Public FreePages keeps its stricter same-type ownership contract.
+    fn free_pe_image(&mut self, base: u64, pages: u64) -> efi::Status {
+        if self.boot_services_exited {
+            return efi::Status::UNSUPPORTED;
+        }
+        let Some(image) = PageRange::from_bytes(base, pages) else {
+            return efi::Status::INVALID_PARAMETER;
+        };
+        let mut covered = 0;
+        let mut restore = None;
+        for allocation in self.allocations.iter().filter(|a| a.range.overlaps(image)) {
+            if !image.contains(allocation.range)
+                || restore.is_some_and(|attribute| attribute != allocation.restore_attribute)
+            {
+                return efi::Status::NOT_FOUND;
+            }
+            restore = Some(allocation.restore_attribute);
+            covered += allocation.range.pages().get();
+        }
+        if covered != pages {
+            return efi::Status::NOT_FOUND;
+        }
+        if self.entries.len() > MAX_MEMORY_ENTRIES - 2 {
+            return efi::Status::OUT_OF_RESOURCES;
+        }
+        // Free in address order so the released prefix merges rather than
+        // introducing unbounded fragmentation in the descriptor table.
+        while let Some(allocation) = self
+            .allocations
+            .iter()
+            .copied()
+            .filter(|a| image.contains(a.range))
+            .min_by_key(|a| a.range.start())
+        {
+            let status = self.free_pages(
+                allocation.range.start_bytes(),
+                allocation.range.pages().get(),
+            );
+            if status != efi::Status::SUCCESS {
+                return status;
+            }
+        }
+        efi::Status::SUCCESS
+    }
+
     /// Allocate pages of memory.
     pub fn allocate_pages(
         &mut self,
@@ -1546,6 +1661,21 @@ pub fn allocate_runtime_image_layout(
     })
 }
 
+/// Finalize the PE staging allocation's subsystem-specific memory map.
+pub(crate) fn retype_pe_image(
+    base: u64,
+    pages: u64,
+    code_type: MemoryType,
+    data_type: MemoryType,
+    code: &[core::ops::Range<u64>],
+) -> Result<(), efi::Status> {
+    ALLOCATOR.with_mut(|a| a.retype_pe_image(base, pages, code_type, data_type, code))
+}
+
+pub(crate) fn free_pe_image(base: u64, pages: u64) -> efi::Status {
+    ALLOCATOR.with_mut(|a| a.free_pe_image(base, pages))
+}
+
 // Lock ordering: never hold POOL_STATE while entering the page allocator. Pool
 // growth deliberately drops this lock before AllocatePages to avoid re-entry.
 static POOL_STATE: spin::Mutex<PoolState> = spin::Mutex::new(PoolState::new());
@@ -1925,6 +2055,156 @@ mod tests {
                 .and_then(MemoryDescriptorExt::get_memory_type),
             Some(MemoryType::RuntimeServicesCode)
         );
+    }
+
+    #[test]
+    fn pe_driver_layout_is_retained_and_can_be_freed_as_one_image() {
+        for (code_type, data_type) in [
+            (
+                MemoryType::RuntimeServicesCode,
+                MemoryType::RuntimeServicesData,
+            ),
+            (MemoryType::BootServicesCode, MemoryType::BootServicesData),
+        ] {
+            let mut allocator = allocator_with_ram();
+            let mut base = 0;
+            assert_eq!(
+                allocator.allocate_pages(
+                    AllocateType::AllocateAnyPages,
+                    MemoryType::LoaderCode,
+                    8,
+                    &mut base
+                ),
+                efi::Status::SUCCESS
+            );
+            allocator
+                .retype_pe_image(base, 8, code_type, data_type, &[1..3, 5..6])
+                .unwrap();
+            for page in 0..8 {
+                let address = base + page * PAGE_SIZE;
+                let expected = if (1..3).contains(&page) || page == 5 {
+                    code_type
+                } else {
+                    data_type
+                };
+                let descriptor = allocator
+                    .entries
+                    .iter()
+                    .find(|entry| {
+                        entry
+                            .page_range()
+                            .unwrap()
+                            .contains(PageRange::from_bytes(address, 1).unwrap())
+                    })
+                    .unwrap();
+                assert_eq!(descriptor.get_memory_type(), Some(expected));
+                if code_type == MemoryType::RuntimeServicesCode {
+                    assert_ne!(descriptor.attribute & attributes::EFI_MEMORY_RUNTIME, 0);
+                    assert_eq!(
+                        descriptor.attribute & attributes::EFI_MEMORY_XP != 0,
+                        expected == data_type
+                    );
+                }
+            }
+            assert_eq!(allocator.free_pages(base, 8), efi::Status::NOT_FOUND);
+            assert_eq!(allocator.free_pe_image(base, 8), efi::Status::SUCCESS);
+            assert!(allocator.allocations.is_empty());
+            assert!(allocator.entries.iter().all(|entry| entry.get_memory_type()
+                == Some(MemoryType::ConventionalMemory)
+                && entry.attribute == attributes::EFI_MEMORY_RAM_CAPS));
+            assert_eq!(
+                allocator.allocate_pages(
+                    AllocateType::AllocateAnyPages,
+                    MemoryType::LoaderCode,
+                    8,
+                    &mut base
+                ),
+                efi::Status::SUCCESS
+            );
+            allocator
+                .retype_pe_image(base, 8, code_type, data_type, &[1..3, 5..6])
+                .unwrap();
+            assert_eq!(
+                allocator.exit_boot_services(allocator.map_key()),
+                efi::Status::SUCCESS
+            );
+            let image = PageRange::from_bytes(base, 8).unwrap();
+            for descriptor in allocator
+                .entries
+                .iter()
+                .filter(|entry| entry.page_range().unwrap().overlaps(image))
+            {
+                if code_type == MemoryType::RuntimeServicesCode {
+                    assert!(matches!(
+                        descriptor.get_memory_type(),
+                        Some(MemoryType::RuntimeServicesCode | MemoryType::RuntimeServicesData)
+                    ));
+                    assert_ne!(descriptor.attribute & attributes::EFI_MEMORY_RUNTIME, 0);
+                } else {
+                    assert_eq!(
+                        descriptor.get_memory_type(),
+                        Some(MemoryType::ConventionalMemory)
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn invalid_pe_layout_leaves_staging_allocation_owned() {
+        let mut allocator = allocator_with_ram();
+        let mut base = 0;
+        assert_eq!(
+            allocator.allocate_pages(
+                AllocateType::AllocateAnyPages,
+                MemoryType::LoaderCode,
+                8,
+                &mut base
+            ),
+            efi::Status::SUCCESS
+        );
+        let key = allocator.map_key();
+        for code in [
+            &[1..3, 2..4][..],
+            core::slice::from_ref(&(7..9)),
+            core::slice::from_ref(&(4..4)),
+        ] {
+            assert_eq!(
+                allocator.retype_pe_image(
+                    base,
+                    8,
+                    MemoryType::RuntimeServicesCode,
+                    MemoryType::RuntimeServicesData,
+                    code
+                ),
+                Err(efi::Status::INVALID_PARAMETER)
+            );
+            assert_eq!(allocator.map_key(), key);
+        }
+        while allocator.entries.len() < MAX_MEMORY_ENTRIES {
+            let address = 0x1000_0000 + allocator.entries.len() as u64 * 2 * PAGE_SIZE;
+            allocator
+                .entries
+                .push(memory_descriptor(
+                    MemoryType::ReservedMemoryType,
+                    address,
+                    1,
+                    0,
+                ))
+                .unwrap();
+        }
+        assert_eq!(
+            allocator.retype_pe_image(
+                base,
+                8,
+                MemoryType::RuntimeServicesCode,
+                MemoryType::RuntimeServicesData,
+                &[1..3, 5..6]
+            ),
+            Err(efi::Status::OUT_OF_RESOURCES)
+        );
+        assert_eq!(allocator.map_key(), key);
+        assert_eq!(allocator.free_pages(base, 8), efi::Status::SUCCESS);
     }
 
     #[test]
