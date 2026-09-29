@@ -1,6 +1,6 @@
 //! Block Device Abstraction
 //!
-//! The [`BlockDevice`] trait is the single read interface for every disk
+//! The [`BlockDevice`] trait is the single block interface for every disk
 //! CrabEFI boots from: in-tree NVMe, AHCI, USB mass storage and SDHCI devices
 //! as well as platform-provided devices from
 //! [`crate::PlatformConfig::block_devices`]. Filesystem, partition and boot
@@ -19,7 +19,8 @@ pub struct BlockDeviceInfo {
     pub media_id: u32,
     /// Whether the device has removable media (e.g., USB stick, SD card).
     pub removable: bool,
-    /// Whether the media is read-only.
+    /// Whether the media is read-only. Writes to a read-only device fail with
+    /// [`BlockError::WriteProtected`].
     pub read_only: bool,
 }
 
@@ -38,6 +39,8 @@ pub enum BlockError {
     NoMedia,
     /// Media changed since last access.
     MediaChanged,
+    /// The device or driver does not support writes.
+    WriteProtected,
 }
 
 impl core::fmt::Display for BlockError {
@@ -48,6 +51,7 @@ impl core::fmt::Display for BlockError {
             BlockError::OutOfRange => write!(f, "LBA out of range"),
             BlockError::NoMedia => write!(f, "no media present"),
             BlockError::MediaChanged => write!(f, "media changed"),
+            BlockError::WriteProtected => write!(f, "write protected"),
         }
     }
 }
@@ -57,6 +61,9 @@ impl core::fmt::Display for BlockError {
 /// # Implementor's Guide
 ///
 /// - `read_blocks` must handle arbitrary LBA ranges within bounds.
+/// - Writable devices override `write_blocks` (and `flush` if they cache
+///   writes) and report `read_only: false`. The defaults reject writes with
+///   [`BlockError::WriteProtected`].
 /// - `info()` should return consistent values for the device's lifetime.
 /// - `name()` is displayed in the boot menu for platform-provided devices;
 ///   make it descriptive (e.g., `"eMMC: partition 0"`).
@@ -79,7 +86,7 @@ impl core::fmt::Display for BlockError {
 ///     fn read_blocks(&mut self, lba: u64, count: u32, buffer: &mut [u8])
 ///         -> Result<(), crabefi::BlockError>
 ///     {
-///         self.validate_read(lba, count, buffer)?;
+///         self.validate_io(lba, count, buffer)?;
 ///         // ... hardware-specific read ...
 ///         Ok(())
 ///     }
@@ -98,16 +105,31 @@ pub trait BlockDevice {
     /// * `buffer` - Destination buffer (must be at least `count * block_size` bytes).
     fn read_blocks(&mut self, lba: u64, count: u32, buffer: &mut [u8]) -> Result<(), BlockError>;
 
+    /// Write contiguous blocks to the device.
+    ///
+    /// # Arguments
+    /// * `lba` - Starting logical block address.
+    /// * `count` - Number of blocks to write.
+    /// * `buffer` - Source data (must be at least `count * block_size` bytes).
+    fn write_blocks(&mut self, _lba: u64, _count: u32, _buffer: &[u8]) -> Result<(), BlockError> {
+        Err(BlockError::WriteProtected)
+    }
+
+    /// Commit writes still held in device or driver caches to stable media.
+    fn flush(&mut self) -> Result<(), BlockError> {
+        Ok(())
+    }
+
     /// Human-readable device name for the boot menu.
     fn name(&self) -> &str {
         "Block Device"
     }
 
-    /// Validate parameters for a read operation.
+    /// Validate parameters for a read or write operation.
     ///
     /// Checks the LBA range and buffer size. Implementations should call this
-    /// at the start of `read_blocks`.
-    fn validate_read(&self, lba: u64, count: u32, buffer: &[u8]) -> Result<(), BlockError> {
+    /// at the start of `read_blocks` and `write_blocks`.
+    fn validate_io(&self, lba: u64, count: u32, buffer: &[u8]) -> Result<(), BlockError> {
         let info = self.info();
         if count == 0 {
             return Ok(());
@@ -130,5 +152,10 @@ pub trait BlockDevice {
     /// Read a single block (convenience wrapper).
     fn read_block(&mut self, lba: u64, buffer: &mut [u8]) -> Result<(), BlockError> {
         self.read_blocks(lba, 1, buffer)
+    }
+
+    /// Write a single block (convenience wrapper).
+    fn write_block(&mut self, lba: u64, buffer: &[u8]) -> Result<(), BlockError> {
+        self.write_blocks(lba, 1, buffer)
     }
 }

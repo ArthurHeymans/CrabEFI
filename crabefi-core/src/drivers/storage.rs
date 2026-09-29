@@ -206,11 +206,14 @@ pub fn with_disk<R>(
         } => nvme::with_controller(controller_id, |controller| {
             let namespace = controller.get_namespace(nsid)?;
             let info = fixed_disk_info(namespace.num_blocks, namespace.block_size);
-            Some(f(&mut Disk::new(info, |lba, count, buffer| {
-                controller
-                    .read_sectors(nsid, lba, count, buffer)
-                    .map_err(read_failed(id, lba))
-            })))
+            Some(f(&mut Disk::new(
+                info,
+                ReadOnly(|lba, count, buffer: &mut [u8]| {
+                    controller
+                        .read_sectors(nsid, lba, count, buffer)
+                        .map_err(io_failed(id, "read", lba))
+                }),
+            )))
         }),
         StorageId::Ahci {
             controller_id,
@@ -218,33 +221,42 @@ pub fn with_disk<R>(
         } => ahci::with_controller(controller_id, |controller| {
             let port_info = controller.get_port(port)?;
             let info = fixed_disk_info(port_info.sector_count, port_info.sector_size);
-            Some(f(&mut Disk::new(info, |lba, count, buffer| {
-                controller
-                    .read_sectors_into(port, lba, count, buffer)
-                    .map_err(read_failed(id, lba))
-            })))
+            Some(f(&mut Disk::new(
+                info,
+                ReadOnly(|lba, count, buffer: &mut [u8]| {
+                    controller
+                        .read_sectors_into(port, lba, count, buffer)
+                        .map_err(io_failed(id, "read", lba))
+                }),
+            )))
         }),
         StorageId::Usb {
             controller_id,
             device_addr,
         } => usb::mass_storage::with_device(controller_id, device_addr, |device, controller| {
             let info = usb_disk_info(device);
-            Some(f(&mut Disk::new(info, |lba, count, buffer| {
-                device
-                    .read_sectors_generic(controller, lba, count, buffer)
-                    .map_err(read_failed(id, lba))
-            })))
+            Some(f(&mut Disk::new(
+                info,
+                UsbDisk {
+                    id,
+                    device,
+                    controller,
+                },
+            )))
         }),
         StorageId::Sdhci { controller_id } => sdhci::with_controller(controller_id, |controller| {
             if !controller.is_ready() {
                 return None;
             }
             let info = sdhci_disk_info(controller);
-            Some(f(&mut Disk::new(info, |lba, count, buffer| {
-                controller
-                    .read_sectors(lba, count, buffer)
-                    .map_err(read_failed(id, lba))
-            })))
+            Some(f(&mut Disk::new(
+                info,
+                ReadOnly(|lba, count, buffer: &mut [u8]| {
+                    controller
+                        .read_sectors(lba, count, buffer)
+                        .map_err(io_failed(id, "read", lba))
+                }),
+            )))
         }),
         StorageId::Platform { index } => Some(PLATFORM_BLOCK_DEVICES.with_mut(|devices| {
             let &device = devices.get(index)?;
@@ -257,64 +269,130 @@ pub fn with_disk<R>(
     .ok_or(BlockError::NoMedia)
 }
 
-/// Log a failed driver read and convert the driver error.
-fn read_failed<E>(id: StorageId, lba: u64) -> impl FnOnce(E) -> BlockError
+/// Log a failed driver transfer and convert the driver error.
+fn io_failed<E>(id: StorageId, op: &'static str, lba: u64) -> impl FnOnce(E) -> BlockError
 where
     E: core::fmt::Debug + Into<BlockError>,
 {
     move |error| {
-        log::error!("{:?}: read failed at LBA {}: {:?}", id, lba, error);
+        log::error!("{:?}: {} failed at LBA {}: {:?}", id, op, lba, error);
         error.into()
     }
 }
 
-/// A driver device borrowed for one [`with_disk()`] call.
-struct Disk<F> {
-    info: BlockDeviceInfo,
-    read: F,
-}
+/// Driver-specific block transfers behind a [`Disk`].
+///
+/// Parameters are already validated and buffers are trimmed to whole blocks.
+trait Driver {
+    fn read(&mut self, lba: u64, count: u32, buffer: &mut [u8]) -> Result<(), BlockError>;
 
-impl<F> Disk<F>
-where
-    F: FnMut(u64, u32, &mut [u8]) -> Result<(), BlockError>,
-{
-    fn new(info: BlockDeviceInfo, read: F) -> Self {
-        Self { info, read }
+    fn write(&mut self, _lba: u64, _count: u32, _buffer: &[u8]) -> Result<(), BlockError> {
+        Err(BlockError::WriteProtected)
+    }
+
+    fn flush(&mut self) -> Result<(), BlockError> {
+        Ok(())
     }
 }
 
-impl<F> BlockDevice for Disk<F>
+/// A driver that only implements reads.
+struct ReadOnly<F>(F);
+
+impl<F> Driver for ReadOnly<F>
 where
     F: FnMut(u64, u32, &mut [u8]) -> Result<(), BlockError>,
 {
+    fn read(&mut self, lba: u64, count: u32, buffer: &mut [u8]) -> Result<(), BlockError> {
+        (self.0)(lba, count, buffer)
+    }
+}
+
+/// A USB mass storage device with the controller it is attached to.
+struct UsbDisk<'a> {
+    id: StorageId,
+    device: &'a mut usb::UsbMassStorage,
+    controller: &'a mut dyn usb::UsbController,
+}
+
+impl Driver for UsbDisk<'_> {
+    fn read(&mut self, lba: u64, count: u32, buffer: &mut [u8]) -> Result<(), BlockError> {
+        self.device
+            .read_sectors_generic(self.controller, lba, count, buffer)
+            .map_err(io_failed(self.id, "read", lba))
+    }
+
+    fn write(&mut self, lba: u64, count: u32, buffer: &[u8]) -> Result<(), BlockError> {
+        self.device
+            .write_sectors_generic(self.controller, lba, count, buffer)
+            .map_err(io_failed(self.id, "write", lba))
+    }
+
+    fn flush(&mut self) -> Result<(), BlockError> {
+        self.device
+            .synchronize_cache(self.controller)
+            .map_err(io_failed(self.id, "cache flush", 0))
+    }
+}
+
+/// A driver device borrowed for one [`with_disk()`] call.
+struct Disk<D> {
+    info: BlockDeviceInfo,
+    driver: D,
+}
+
+impl<D: Driver> Disk<D> {
+    fn new(info: BlockDeviceInfo, driver: D) -> Self {
+        Self { info, driver }
+    }
+}
+
+impl<D: Driver> BlockDevice for Disk<D> {
     fn info(&self) -> BlockDeviceInfo {
         self.info
     }
 
     fn read_blocks(&mut self, lba: u64, count: u32, buffer: &mut [u8]) -> Result<(), BlockError> {
-        self.validate_read(lba, count, buffer)?;
+        self.validate_io(lba, count, buffer)?;
         if count == 0 {
             return Ok(());
         }
         let len = count as usize * self.info.block_size as usize;
-        (self.read)(lba, count, &mut buffer[..len])
+        self.driver.read(lba, count, &mut buffer[..len])
+    }
+
+    fn write_blocks(&mut self, lba: u64, count: u32, buffer: &[u8]) -> Result<(), BlockError> {
+        if self.info.read_only {
+            return Err(BlockError::WriteProtected);
+        }
+        self.validate_io(lba, count, buffer)?;
+        if count == 0 {
+            return Ok(());
+        }
+        let len = count as usize * self.info.block_size as usize;
+        self.driver.write(lba, count, &buffer[..len])
+    }
+
+    fn flush(&mut self) -> Result<(), BlockError> {
+        self.driver.flush()
     }
 }
 
-/// Media description of a fixed, writable disk.
+/// Media description of a fixed disk. Drivers with write support clear
+/// `read_only` themselves.
 fn fixed_disk_info(num_blocks: u64, block_size: u32) -> BlockDeviceInfo {
     BlockDeviceInfo {
         num_blocks,
         block_size,
         media_id: 0,
         removable: false,
-        read_only: false,
+        read_only: true,
     }
 }
 
 fn usb_disk_info(device: &usb::UsbMassStorage) -> BlockDeviceInfo {
     BlockDeviceInfo {
         removable: true,
+        read_only: false,
         ..fixed_disk_info(device.num_blocks, device.block_size)
     }
 }

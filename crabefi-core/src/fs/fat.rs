@@ -1,10 +1,16 @@
 //! FAT filesystem driver
 //!
-//! This module provides read support for FAT12/16/32 filesystems.
-//! Used to read files from the EFI System Partition.
+//! This module provides read support for FAT12/16/32 filesystems and, for
+//! FAT32, file and directory mutation (see [`mutate`]).
+//! Used to access files on the EFI System Partition.
 
 use crate::drivers::block::BlockDevice;
-use zerocopy::{FromBytes, Immutable, KnownLayout, Unaligned};
+use zerocopy::{FromBytes, FromZeros, Immutable, IntoBytes, KnownLayout, Unaligned};
+
+mod mutate;
+#[cfg(test)]
+#[path = "fat_tests.rs"]
+mod tests;
 
 /// Standard sector size (512 bytes) - used for FAT calculations
 pub const SECTOR_SIZE: usize = 512;
@@ -80,7 +86,7 @@ struct Fat32Ebr {
 
 /// FAT directory entry
 #[repr(C, packed)]
-#[derive(FromBytes, Immutable, KnownLayout, Unaligned, Clone, Copy, Debug)]
+#[derive(FromBytes, IntoBytes, Immutable, KnownLayout, Unaligned, Clone, Copy, Debug)]
 pub struct DirectoryEntry {
     /// Short name (8 characters)
     name: [u8; 8],
@@ -111,6 +117,30 @@ pub struct DirectoryEntry {
 }
 
 impl DirectoryEntry {
+    /// Build a record from its 8.3 name (name and extension, space padded).
+    fn new(short_name: [u8; 11], attr: u8, first_cluster: u32, file_size: u32) -> Self {
+        let mut entry = Self::new_zeroed();
+        entry.name.copy_from_slice(&short_name[..8]);
+        entry.ext.copy_from_slice(&short_name[8..]);
+        entry.attr = attr;
+        entry.set_first_cluster(first_cluster);
+        entry.file_size = file_size;
+        entry
+    }
+
+    fn set_first_cluster(&mut self, cluster: u32) {
+        self.first_cluster_hi = (cluster >> 16) as u16;
+        self.first_cluster_lo = cluster as u16;
+    }
+
+    /// Raw 8.3 name: 8 name bytes followed by 3 extension bytes.
+    fn short_name_bytes(&self) -> [u8; 11] {
+        let mut short = [0; 11];
+        short[..8].copy_from_slice(&self.name);
+        short[8..].copy_from_slice(&self.ext);
+        short
+    }
+
     /// Get the first cluster number
     pub fn first_cluster(&self) -> u32 {
         ((self.first_cluster_hi as u32) << 16) | (self.first_cluster_lo as u32)
@@ -197,7 +227,7 @@ const MAX_LFN_LENGTH: usize = 255;
 ///
 /// LFN entries store up to 13 UTF-16 characters each and precede the 8.3 entry.
 /// They are stored in reverse order (last part first).
-#[derive(Clone, Copy, FromBytes, Immutable, KnownLayout, Unaligned)]
+#[derive(Clone, Copy, FromBytes, IntoBytes, Immutable, KnownLayout, Unaligned)]
 #[repr(C, packed)]
 struct LfnEntry {
     /// Sequence number (0x40 | n for last, n for others)
@@ -219,6 +249,25 @@ struct LfnEntry {
 }
 
 impl LfnEntry {
+    /// Build a record holding up to 13 UTF-16 units. `last` marks the record
+    /// stored first on disk (the one carrying the end of the name).
+    fn new(sequence: u8, last: bool, checksum: u8, units: &[u16; 13]) -> Self {
+        let mut entry = Self::new_zeroed();
+        entry.seq = sequence | if last { 0x40 } else { 0 };
+        entry.attr = ATTR_LFN;
+        entry.checksum = checksum;
+        let mut bytes = units.iter().flat_map(|unit| unit.to_le_bytes());
+        for slot in entry
+            .name1
+            .iter_mut()
+            .chain(&mut entry.name2)
+            .chain(&mut entry.name3)
+        {
+            *slot = bytes.next().unwrap_or(0xff);
+        }
+        entry
+    }
+
     /// Check if this is the last (first encountered) LFN entry
     fn is_last(&self) -> bool {
         (self.seq & 0x40) != 0
@@ -372,6 +421,18 @@ pub enum FatError {
     BufferTooSmall,
     /// Device block size exceeds the internal read buffer
     UnsupportedBlockSize,
+    /// Mutation is only implemented for FAT32
+    ReadOnly,
+    /// Block-device write failed
+    WriteError,
+    /// Entry already exists
+    AlreadyExists,
+    /// Directory is not empty
+    DirectoryNotEmpty,
+    /// Invalid filename
+    InvalidName,
+    /// No free clusters or directory slots
+    NoSpace,
 }
 
 impl core::fmt::Display for FatError {
@@ -389,6 +450,12 @@ impl core::fmt::Display for FatError {
             FatError::UnsupportedBlockSize => {
                 write!(f, "device block size exceeds the FAT read buffer")
             }
+            FatError::ReadOnly => write!(f, "read-only FAT filesystem"),
+            FatError::WriteError => write!(f, "write error"),
+            FatError::AlreadyExists => write!(f, "entry already exists"),
+            FatError::DirectoryNotEmpty => write!(f, "directory not empty"),
+            FatError::InvalidName => write!(f, "invalid filename"),
+            FatError::NoSpace => write!(f, "filesystem full"),
         }
     }
 }
@@ -404,6 +471,8 @@ pub struct FatGeometry {
     bytes_per_sector: u16,
     sectors_per_cluster: u8,
     fat_start: u32,
+    num_fats: u8,
+    sectors_per_fat: u32,
     data_start: u32,
     root_cluster: u32,
     root_dir_start: u32,
@@ -444,6 +513,10 @@ pub struct FatFilesystem<'a> {
     sectors_per_cluster: u8,
     /// First FAT sector (relative to partition start)
     fat_start: u32,
+    /// Number of FAT copies
+    num_fats: u8,
+    /// Sectors occupied by one FAT copy
+    sectors_per_fat: u32,
     /// First data sector (relative to partition start)
     data_start: u32,
     /// Root directory first cluster (FAT32) or sector count (FAT12/16)
@@ -458,6 +531,8 @@ pub struct FatFilesystem<'a> {
     fat_block_cache: [u8; MAX_BLOCK_SIZE],
     /// Block number currently in cache (u64::MAX = invalid)
     fat_block_cached: u64,
+    /// No cluster below this number is free (allocation search start).
+    alloc_hint: u32,
 }
 
 impl<'a> FatFilesystem<'a> {
@@ -611,6 +686,8 @@ impl<'a> FatFilesystem<'a> {
             device_block_size: block_size as u32,
             sectors_per_cluster,
             fat_start,
+            num_fats: bpb_num_fats,
+            sectors_per_fat,
             data_start,
             root_cluster,
             root_dir_start,
@@ -618,6 +695,7 @@ impl<'a> FatFilesystem<'a> {
             data_clusters,
             fat_block_cache: [0u8; MAX_BLOCK_SIZE],
             fat_block_cached: u64::MAX, // Invalid, forces first read
+            alloc_hint: 2,
         })
     }
 
@@ -650,6 +728,8 @@ impl<'a> FatFilesystem<'a> {
             device_block_size,
             sectors_per_cluster: geometry.sectors_per_cluster,
             fat_start: geometry.fat_start,
+            num_fats: geometry.num_fats,
+            sectors_per_fat: geometry.sectors_per_fat,
             data_start: geometry.data_start,
             root_cluster: geometry.root_cluster,
             root_dir_start: geometry.root_dir_start,
@@ -657,6 +737,7 @@ impl<'a> FatFilesystem<'a> {
             data_clusters: geometry.data_clusters,
             fat_block_cache: [0u8; MAX_BLOCK_SIZE],
             fat_block_cached: u64::MAX,
+            alloc_hint: 2,
         })
     }
 
@@ -667,6 +748,8 @@ impl<'a> FatFilesystem<'a> {
             bytes_per_sector: self.bytes_per_sector,
             sectors_per_cluster: self.sectors_per_cluster,
             fat_start: self.fat_start,
+            num_fats: self.num_fats,
+            sectors_per_fat: self.sectors_per_fat,
             data_start: self.data_start,
             root_cluster: self.root_cluster,
             root_dir_start: self.root_dir_start,
@@ -851,9 +934,10 @@ impl<'a> FatFilesystem<'a> {
 
         let device_block_size = self.device_block_size as usize;
 
-        // Handle case where cluster is smaller than or equal to device block
-        if cluster_size <= device_block_size {
-            // Cluster fits within one or two device blocks
+        // Clusters smaller than a device block, or not block-aligned, are copied
+        // block by block so the bytes preceding the cluster are skipped.
+        if cluster_size <= device_block_size || start_offset != 0 {
+            // Cluster fits within one or more device blocks
             let mut temp_buffer = [0u8; MAX_BLOCK_SIZE];
             let mut bytes_copied = 0usize;
             let mut current_block = start_device_block;

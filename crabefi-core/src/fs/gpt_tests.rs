@@ -13,7 +13,7 @@ impl BlockDevice for Disk {
     }
 
     fn read_blocks(&mut self, lba: u64, count: u32, buffer: &mut [u8]) -> Result<(), BlockError> {
-        self.validate_read(lba, count, buffer)?;
+        self.validate_io(lba, count, buffer)?;
         let start = lba as usize * self.info.block_size as usize;
         let size = count as usize * self.info.block_size as usize;
         buffer[..size].fill(0);
@@ -47,7 +47,7 @@ fn disk(block_size: u32, hybrid: bool) -> Disk {
             block_size,
             media_id: 0,
             removable: true,
-            read_only: false,
+            read_only: true,
         },
         prefix,
     }
