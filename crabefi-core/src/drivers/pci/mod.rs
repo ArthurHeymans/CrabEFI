@@ -224,8 +224,8 @@ fn probe_bar(access: &AnyPciAccess, addr: PciAddress, bar_index: usize) -> PciBa
     let bar_offset = (0x10 + bar_index * 4) as u16;
     let original = access.read32(addr, bar_offset);
 
-    // Empty BAR
-    if original == 0 {
+    // Empty BAR (0), or an absent/non-decoding device (reads as all ones)
+    if original == 0 || original == u32::MAX {
         return PciBar::default();
     }
 
@@ -853,5 +853,13 @@ mod tests {
                 .command(TestConfig)
                 .contains(CommandRegister::BUS_MASTER_ENABLE)
         );
+    }
+
+    #[test]
+    fn probe_bar_treats_all_ones_as_empty() {
+        // `Unavailable` reads all ones, like an absent device.
+        let bar = probe_bar(&AnyPciAccess::Unavailable, PciAddress::new(0, 0, 0, 0), 0);
+        assert_eq!(bar.bar_type, BarType::default());
+        assert_eq!(bar.address, 0);
     }
 }
