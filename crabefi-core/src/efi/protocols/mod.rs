@@ -12,6 +12,7 @@ pub mod device_path_to_text;
 pub mod device_path_utilities;
 pub mod disk_io;
 pub mod graphics_output;
+pub mod hii;
 mod instance;
 pub mod loaded_image;
 pub mod memory_attribute;
