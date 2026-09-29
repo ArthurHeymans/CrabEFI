@@ -79,17 +79,16 @@ fn rndr64() -> Option<u64> {
 /// Check if SMCCC TRNG is available (via SMC to EL3 / TF-A)
 fn check_smccc_trng() -> bool {
     let ret: u64;
+    // SAFETY: SMC follows the SMCCC calling convention: x0 carries the
+    // function ID in and the result out, x1-x3 are clobbered as result
+    // registers, and the firmware may access memory.
     unsafe {
         core::arch::asm!(
-            "mov w0, {func_id:w}",
             "smc #0",
-            "mov {ret}, x0",
-            func_id = in(reg) SMCCC_TRNG_VERSION,
-            ret = out(reg) ret,
-            out("x1") _,
-            out("x2") _,
-            out("x3") _,
-            options(nomem, nostack)
+            inout("x0") u64::from(SMCCC_TRNG_VERSION) => ret,
+            lateout("x1") _,
+            lateout("x2") _,
+            lateout("x3") _,
         );
     }
     // Version should be >= 1.0 (0x10000)
@@ -101,19 +100,17 @@ fn check_smccc_trng() -> bool {
 fn smccc_trng_rnd64() -> Option<u64> {
     let ret: u64;
     let val: u64;
+    // SAFETY: SMC follows the SMCCC calling convention: x0 carries the
+    // function ID in and the status out, x1 carries the requested bit
+    // count in, x1-x3 return entropy (the low 64 bits are in x3), and the
+    // firmware may access memory.
     unsafe {
         core::arch::asm!(
-            "mov w0, {func_id:w}",
-            "mov x1, #64",      // 64 bits requested
             "smc #0",
-            "mov {ret}, x0",
-            "mov {val}, x3",    // Random value in x3
-            func_id = in(reg) SMCCC_TRNG_RND64,
-            ret = out(reg) ret,
-            val = out(reg) val,
-            out("x1") _,
-            out("x2") _,
-            options(nomem, nostack)
+            inout("x0") u64::from(SMCCC_TRNG_RND64) => ret,
+            inout("x1") 64u64 => _, // 64 bits requested
+            lateout("x2") _,
+            lateout("x3") val,
         );
     }
     // SUCCESS = 0
