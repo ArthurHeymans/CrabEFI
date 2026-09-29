@@ -65,8 +65,14 @@ pub struct UnicodeCollationProtocol {
 // language codes. EDK2 Shell opens Unicode Collation 2 during startup and
 // parses this field before it produces console output, so installing a legacy
 // `eng` string under the v2 GUID can make shell startup fail very early.
+//
+// The v2 list also carries the bare `en`. The UEFI SCT support library walks
+// this list three bytes at a time and compares each window against "en", so
+// with `en-US` alone it never finds a collation protocol and later calls
+// through a NULL pointer. "en-" and "US;" are harmless windows, and the
+// last one is "en" plus its terminator.
 static SUPPORTED_LANGUAGES_V1: [u8; 4] = *b"eng\0";
-static SUPPORTED_LANGUAGES_V2: [u8; 6] = *b"en-US\0";
+static SUPPORTED_LANGUAGES_V2: [u8; 9] = *b"en-US;en\0";
 
 /// Static legacy Unicode Collation Protocol instance.
 static UNICODE_COLLATION_V1: StaticMut<UnicodeCollationProtocol> =
@@ -364,8 +370,8 @@ mod tests {
                 b"eng\0"
             );
             assert_eq!(
-                core::slice::from_raw_parts((*v2).supported_languages.cast::<u8>(), 6),
-                b"en-US\0"
+                core::slice::from_raw_parts((*v2).supported_languages.cast::<u8>(), 9),
+                b"en-US;en\0"
             );
         }
     }
