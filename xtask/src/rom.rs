@@ -248,6 +248,27 @@ fn inject_crabefi_payload(rom_path: &Path, crabefi_elf: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Add a dummy payload to the ROM's CBFS, so CrabEFI has something to list as
+/// an alternative payload in its boot menu.
+pub fn add_test_cbfs_payload(rom_path: &Path, name: &str) -> Result<()> {
+    let payload = rom_path.with_extension("cbfs-test-payload.bin");
+    std::fs::write(&payload, b"CrabEFI CBFS payload menu test\n")
+        .context("Failed to create CBFS test payload")?;
+
+    let status = Command::new("cbfstool")
+        .arg(rom_path)
+        .args(["add-flat-binary", "-f"])
+        .arg(&payload)
+        .args(["-n", name, "-l", "0x100000", "-e", "0x100000", "-c", "none"])
+        .status()
+        .context("Failed to run cbfstool to add the CBFS test payload")?;
+    if !status.success() {
+        bail!("Failed to add the CBFS test payload to the ROM");
+    }
+
+    Ok(())
+}
+
 fn cbfstool_contains_payload(rom_path: &Path) -> Result<bool> {
     let output = Command::new("cbfstool")
         .arg(rom_path)

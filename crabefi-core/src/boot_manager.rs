@@ -328,6 +328,7 @@ fn try_boot_file_on_device(
 /// - UEFI/UKI entries: Load and execute EFI application
 /// - BLS/GRUB Linux entries: Direct Linux boot via linux_boot module
 /// - Payload entries: Chainload coreboot payload
+/// - Platform targets: Handed to [`PlatformHooks::boot_target()`](crate::PlatformHooks::boot_target)
 fn boot_selected_entry(entry: &menu::BootEntry) {
     log::info!("boot_selected_entry called");
 
@@ -366,6 +367,14 @@ fn boot_selected_entry(entry: &menu::BootEntry) {
         menu::BootEntryKind::Payload { path, format } => {
             log::info!("Dispatching to payload chainload");
             boot_payload_entry(entry, path, *format);
+        }
+
+        menu::BootEntryKind::PlatformTarget { name } => {
+            log::info!("Dispatching to platform boot target");
+            match crate::handoff::callbacks().hooks {
+                Some(hooks) => hooks.boot_target(name),
+                None => log::error!("No platform hooks to boot '{}'", name),
+            }
         }
     }
 }
