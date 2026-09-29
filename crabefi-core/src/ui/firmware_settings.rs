@@ -54,7 +54,7 @@ fn show_no_settings(fb: &FramebufferInfo) -> ScreenNav {
 
     loop {
         poll_and_render_cursor(fb, &mut cursor);
-        update_sidebar_hover(fb, &mut sidebar_hov, NavItem::Firmware);
+        update_sidebar_hover(fb, &mut cursor, &mut sidebar_hov, NavItem::Firmware);
 
         if let Some(key) = menu_common::read_key() {
             match key {
