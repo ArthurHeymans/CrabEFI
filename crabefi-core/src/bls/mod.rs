@@ -91,12 +91,13 @@ impl BlsDiscovery {
         if let Some(ref conf) = self.loader_conf
             && !conf.default.is_empty()
         {
-            // Try to find entry matching the default pattern
-            // The default can be a wildcard like "fedora-*" or exact like "fedora-40"
+            // systemd-boot's loader.conf default matches the entry filename
+            // (without .conf), commonly using glob patterns such as
+            // "nixos-generation-428-specialisation-lts" or "nixos-*".
             for (i, entry) in self.entries.iter().enumerate() {
-                // Simple matching: check if entry title/version contains the pattern
-                if entry.title.contains(conf.default.as_str())
-                    || entry.version.contains(conf.default.as_str())
+                if bls_default_matches(conf.default.as_str(), entry.id.as_str())
+                    || bls_default_matches(conf.default.as_str(), entry.title.as_str())
+                    || bls_default_matches(conf.default.as_str(), entry.version.as_str())
                 {
                     return i;
                 }
@@ -115,6 +116,22 @@ impl Default for BlsDiscovery {
     fn default() -> Self {
         Self::new()
     }
+}
+
+fn bls_default_matches(pattern: &str, value: &str) -> bool {
+    if pattern == value {
+        return true;
+    }
+
+    if let Some(prefix) = pattern.strip_suffix('*') {
+        return value.starts_with(prefix);
+    }
+
+    if let Some(suffix) = pattern.strip_prefix('*') {
+        return value.ends_with(suffix);
+    }
+
+    false
 }
 
 /// Discover BLS entries on a FAT filesystem
@@ -152,7 +169,14 @@ pub fn discover_entries(fs: &mut FatFilesystem<'_>) -> Result<BlsDiscovery, BlsE
         for filename in conf_files.iter() {
             let mut path: String<280> = String::new();
             let _ = core::fmt::write(&mut path, format_args!("{}\\{}", ENTRIES_DIR, filename));
-            if let Some(entry) = try_load_entry(fs, path.as_str()) {
+            if let Some(mut entry) = try_load_entry(fs, path.as_str()) {
+                entry.id.clear();
+                let id = filename.strip_suffix(".conf").unwrap_or(filename.as_str());
+                for ch in id.chars() {
+                    if entry.id.push(ch).is_err() {
+                        break;
+                    }
+                }
                 let _ = discovery.entries.push(entry);
             }
         }
@@ -215,4 +239,44 @@ fn try_load_entry(fs: &mut FatFilesystem<'_>, path: &str) -> Option<BlsEntry> {
 pub fn has_bls_entries(fs: &mut FatFilesystem<'_>) -> bool {
     // Check if loader.conf or the entries directory exists
     fs.file_size(LOADER_CONF_PATH).is_ok() || fs.find_file(ENTRIES_DIR).is_ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloc::format;
+
+    fn discovery(default: &str, ids: &[&str]) -> BlsDiscovery {
+        let mut d = BlsDiscovery::new();
+        for id in ids {
+            let mut e = BlsEntry::new();
+            let _ = e.id.push_str(id);
+            let _ = d.entries.push(e);
+        }
+        d.loader_conf = Some(LoaderConf::parse(&format!("default {default}\n")));
+        d
+    }
+
+    #[test]
+    fn default_matches_entry_id_exactly() {
+        let d = discovery(
+            "nixos-generation-2",
+            &["nixos-generation-1", "nixos-generation-2"],
+        );
+        assert_eq!(d.default_entry_index(), 1);
+    }
+
+    #[test]
+    fn default_glob_matches_prefix_and_suffix() {
+        let d = discovery("nixos-*", &["fedora-40", "nixos-generation-1"]);
+        assert_eq!(d.default_entry_index(), 1);
+        let d = discovery("*-lts", &["nixos-generation-1", "nixos-generation-1-lts"]);
+        assert_eq!(d.default_entry_index(), 1);
+    }
+
+    #[test]
+    fn unmatched_default_falls_back_to_first_entry() {
+        let d = discovery("arch-*", &["fedora-40", "nixos-generation-1"]);
+        assert_eq!(d.default_entry_index(), 0);
+    }
 }
