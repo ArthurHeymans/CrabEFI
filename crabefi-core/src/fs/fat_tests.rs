@@ -1,5 +1,14 @@
 //! FAT32 mutation tests on a sparse in-memory disk.
 
+#[path = "fat_efi_tests.rs"]
+mod efi;
+#[path = "fat_metadata_tests.rs"]
+mod metadata;
+#[path = "fat_mutation_tests.rs"]
+mod mutation;
+#[path = "fat_recovery_tests.rs"]
+mod recovery;
+
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 
@@ -12,6 +21,7 @@ const DATA_CLUSTERS: u32 = 65_600;
 const PARTITION_START: u64 = 8;
 
 /// Sparse disk: blocks that were never written read as zero.
+#[derive(Clone)]
 struct RamDisk {
     block_size: usize,
     blocks: BTreeMap<u64, Vec<u8>>,

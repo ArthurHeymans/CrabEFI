@@ -373,7 +373,11 @@ impl<D: Driver> BlockDevice for Disk<D> {
     }
 
     fn flush(&mut self) -> Result<(), BlockError> {
-        self.driver.flush()
+        if self.info.read_only {
+            Ok(())
+        } else {
+            self.driver.flush()
+        }
     }
 }
 
@@ -392,7 +396,7 @@ fn fixed_disk_info(num_blocks: u64, block_size: u32) -> BlockDeviceInfo {
 fn usb_disk_info(device: &usb::UsbMassStorage) -> BlockDeviceInfo {
     BlockDeviceInfo {
         removable: true,
-        read_only: false,
+        read_only: device.read_only,
         ..fixed_disk_info(device.num_blocks, device.block_size)
     }
 }
@@ -446,6 +450,7 @@ impl From<usb::mass_storage::MassStorageError> for BlockError {
         match e {
             usb::mass_storage::MassStorageError::NotReady => BlockError::NoMedia,
             usb::mass_storage::MassStorageError::InvalidParameter => BlockError::InvalidParameter,
+            usb::mass_storage::MassStorageError::WriteProtected => BlockError::WriteProtected,
             _ => BlockError::DeviceError,
         }
     }

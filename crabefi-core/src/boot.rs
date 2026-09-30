@@ -217,7 +217,8 @@ pub fn try_boot_from_esp(
     block_size: u32,
 ) -> bool {
     // Mounting the SimpleFileSystem also validates the FAT filesystem.
-    let sfs_protocol = simple_file_system::init(storage, esp.first_lba);
+    let sfs_protocol =
+        simple_file_system::init_partition(storage, esp.first_lba, esp.size_sectors());
     if sfs_protocol.is_null() {
         log::error!("Failed to initialize SimpleFileSystem protocol");
         return false;

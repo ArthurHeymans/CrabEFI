@@ -6,6 +6,9 @@
 //! [`crate::PlatformConfig::block_devices`]. Filesystem, partition and boot
 //! code only see `&mut dyn BlockDevice`.
 
+mod range;
+pub use range::{BlockRange, BlockWriteError};
+
 /// Information about a block device.
 ///
 /// Maps closely to `EFI_BLOCK_IO_MEDIA` from the UEFI specification.
@@ -111,6 +114,10 @@ pub trait BlockDevice {
     /// * `lba` - Starting logical block address.
     /// * `count` - Number of blocks to write.
     /// * `buffer` - Source data (must be at least `count * block_size` bytes).
+    ///
+    /// An error does not imply an atomic rollback: some blocks, including
+    /// part of a failed transfer, may already have changed. Filesystem metadata
+    /// must be published and recovered independently of this interface.
     fn write_blocks(&mut self, _lba: u64, _count: u32, _buffer: &[u8]) -> Result<(), BlockError> {
         Err(BlockError::WriteProtected)
     }
