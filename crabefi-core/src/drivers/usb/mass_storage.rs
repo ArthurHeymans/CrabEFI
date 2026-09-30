@@ -1,7 +1,7 @@
 //! USB Mass Storage Class driver (Bulk-Only Transport)
 //!
 //! This module implements the USB Mass Storage Class Bulk-Only Transport (BBB)
-//! protocol with SCSI command set for reading from USB drives.
+//! protocol with SCSI command set for reading and writing USB drives.
 //!
 //! This driver works with any USB host controller that implements the
 //! `UsbController` trait (xHCI, EHCI, OHCI, UHCI).
@@ -11,12 +11,23 @@ use crate::cell::Local;
 use crate::time;
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned};
 
+#[cfg(test)]
+#[path = "mass_storage_tests.rs"]
+mod tests;
+
 /// SCSI Commands
 mod scsi_cmd {
     pub const TEST_UNIT_READY: u8 = 0x00;
     pub const INQUIRY: u8 = 0x12;
+    pub const REQUEST_SENSE: u8 = 0x03;
+    pub const MODE_SENSE_6: u8 = 0x1a;
+    pub const MODE_SENSE_10: u8 = 0x5a;
     pub const READ_CAPACITY_10: u8 = 0x25;
     pub const READ_10: u8 = 0x28;
+    pub const WRITE_10: u8 = 0x2A;
+    pub const SYNCHRONIZE_CACHE_10: u8 = 0x35;
+    pub const READ_16: u8 = 0x88;
+    pub const WRITE_16: u8 = 0x8A;
     pub const READ_CAPACITY_16: u8 = 0x9E;
 }
 
@@ -125,6 +136,13 @@ pub struct UsbMassStorage {
     pub num_blocks: u64,
     /// Block size
     pub block_size: u32,
+    /// Write protection reported by MODE SENSE (unknown means read-only).
+    pub read_only: bool,
+    /// Writes may have reached the device, including failed/torn transfers.
+    /// Retained across per-operation Disk wrappers and protection changes.
+    writes_pending: bool,
+    /// Reused bounded OUT buffer: controller APIs require mutable DMA memory.
+    write_buffer: alloc::vec::Vec<u8>,
     /// Vendor string
     pub vendor: [u8; 8],
     /// Product string
@@ -148,6 +166,8 @@ pub enum MassStorageError {
     NotReady,
     /// Invalid parameter
     InvalidParameter,
+    WriteProtected,
+    OutOfResources,
 }
 
 impl From<UsbError> for MassStorageError {
@@ -160,6 +180,22 @@ impl From<UsbError> for MassStorageError {
 struct ScsiTransfer {
     transferred: usize,
     residue: u32,
+}
+
+/// Build a READ(10)/WRITE(10) CDB.
+fn rw_10_cdb(opcode: u8, lba: u32, count: u16) -> [u8; 10] {
+    let [l0, l1, l2, l3] = lba.to_be_bytes();
+    let [c0, c1] = count.to_be_bytes();
+    [opcode, 0, l0, l1, l2, l3, 0, c0, c1, 0]
+}
+
+/// Build a READ(16)/WRITE(16) CDB.
+fn rw_16_cdb(opcode: u8, lba: u64, count: u32) -> [u8; 16] {
+    let [l0, l1, l2, l3, l4, l5, l6, l7] = lba.to_be_bytes();
+    let [c0, c1, c2, c3] = count.to_be_bytes();
+    [
+        opcode, 0, l0, l1, l2, l3, l4, l5, l6, l7, c0, c1, c2, c3, 0, 0,
+    ]
 }
 
 impl UsbMassStorage {
@@ -196,6 +232,9 @@ impl UsbMassStorage {
             tag: 1,
             num_blocks: 0,
             block_size: 512,
+            read_only: true,
+            writes_pending: false,
+            write_buffer: alloc::vec::Vec::new(),
             vendor: [0; 8],
             product: [0; 16],
         };
@@ -261,6 +300,13 @@ impl UsbMassStorage {
             self.num_blocks,
             self.block_size
         );
+
+        self.read_only = self.query_write_protection(controller).unwrap_or(true);
+        // If cache durability cannot be established, keep this device read-only.
+        if !self.read_only && self.synchronize_cache(controller).is_err() {
+            self.request_sense(controller);
+            self.read_only = true;
+        }
 
         log::info!(
             "USB Mass Storage: {} {} - {} blocks x {} bytes = {} MB",
@@ -377,15 +423,20 @@ impl UsbMassStorage {
         let mut cbw_buf = [0u8; 31];
         cbw_buf.copy_from_slice(IntoBytes::as_bytes(&cbw));
 
-        if let Err(e) =
-            controller.bulk_transfer(self.device_addr, self.bulk_out, false, &mut cbw_buf)
-        {
-            log::debug!("USB SCSI: CBW transfer failed: {:?}", e);
-            if matches!(e, UsbError::Stall) {
-                // Per BOT spec 5.3.1: Bulk-Out stall on CBW requires Reset Recovery
+        match controller.bulk_transfer(self.device_addr, self.bulk_out, false, &mut cbw_buf) {
+            Ok(n) if n == cbw_buf.len() => {}
+            Ok(_) => {
                 self.bot_reset_recovery(controller)?;
+                return Err(MassStorageError::ShortTransfer);
             }
-            return Err(MassStorageError::Usb(e));
+            Err(e) => {
+                log::debug!("USB SCSI: CBW transfer failed: {:?}", e);
+                if matches!(e, UsbError::Stall) {
+                    // Per BOT spec 5.3.1: Bulk-Out stall requires Reset Recovery.
+                    self.bot_reset_recovery(controller)?;
+                }
+                return Err(MassStorageError::Usb(e));
+            }
         }
 
         // Phase 2: Data transfer (if any)
@@ -568,6 +619,56 @@ impl UsbMassStorage {
         }
 
         Ok(())
+    }
+
+    fn request_sense(&mut self, controller: &mut dyn UsbController) -> Option<u8> {
+        let mut response = [0u8; 18];
+        let result = self
+            .scsi_command(
+                controller,
+                &[scsi_cmd::REQUEST_SENSE, 0, 0, 0, 18, 0],
+                Some(&mut response),
+                true,
+            )
+            .ok()?;
+        if result.transferred < 3 {
+            return None;
+        }
+        match response[0] & 0x7f {
+            0x70 | 0x71 => Some(response[2] & 0xf),
+            0x72 | 0x73 => Some(response[1] & 0xf),
+            _ => None,
+        }
+    }
+
+    fn query_write_protection(&mut self, controller: &mut dyn UsbController) -> Option<bool> {
+        let mut header6 = [0u8; 4];
+        if let Ok(result) = self.scsi_command(
+            controller,
+            &[scsi_cmd::MODE_SENSE_6, 8, 0x3f, 0, 4, 0],
+            Some(&mut header6),
+            true,
+        ) && result.transferred == header6.len()
+            && result.residue == 0
+            && header6[0] >= 3
+        {
+            return Some(header6[2] & 0x80 != 0);
+        }
+        // Clear CHECK CONDITION before trying the alternative command.
+        self.request_sense(controller);
+        let mut header10 = [0u8; 8];
+        let result = self
+            .scsi_command(
+                controller,
+                &[scsi_cmd::MODE_SENSE_10, 8, 0x3f, 0, 0, 0, 0, 0, 8, 0],
+                Some(&mut header10),
+                true,
+            )
+            .ok()?;
+        (result.transferred == header10.len()
+            && result.residue == 0
+            && u16::from_be_bytes([header10[0], header10[1]]) >= 6)
+            .then_some(header10[3] & 0x80 != 0)
     }
 
     /// Read Capacity command
@@ -758,41 +859,8 @@ impl UsbMassStorage {
         count: u16,
         buffer: &mut [u8],
     ) -> Result<(), MassStorageError> {
-        let lba_bytes = lba.to_be_bytes();
-        let count_bytes = count.to_be_bytes();
-
-        let cdb = [
-            scsi_cmd::READ_10,
-            0,
-            lba_bytes[0],
-            lba_bytes[1],
-            lba_bytes[2],
-            lba_bytes[3],
-            0,
-            count_bytes[0],
-            count_bytes[1],
-            0,
-        ];
-
-        let transfer_len = (count as usize)
-            .checked_mul(self.block_size as usize)
-            .ok_or(MassStorageError::InvalidParameter)?;
-        let result =
-            self.scsi_command(controller, &cdb, Some(&mut buffer[..transfer_len]), true)?;
-        if result.transferred != transfer_len || result.residue != 0 {
-            // Warn, not debug: a short fixed-length READ means the retry loop
-            // is about to fire, and field reports need to identify whether
-            // the device or the transport is at fault.
-            log::warn!(
-                "USB READ(10): short transfer: got {} bytes with {} residue, expected {}",
-                result.transferred,
-                result.residue,
-                transfer_len
-            );
-            return Err(MassStorageError::ShortTransfer);
-        }
-
-        Ok(())
+        let cdb = rw_10_cdb(scsi_cmd::READ_10, lba, count);
+        self.transfer_blocks(controller, &cdb, count.into(), buffer, true)
     }
 
     /// READ(16) command (for large LBAs)
@@ -803,36 +871,31 @@ impl UsbMassStorage {
         count: u32,
         buffer: &mut [u8],
     ) -> Result<(), MassStorageError> {
-        let lba_bytes = lba.to_be_bytes();
-        let count_bytes = count.to_be_bytes();
+        let cdb = rw_16_cdb(scsi_cmd::READ_16, lba, count);
+        self.transfer_blocks(controller, &cdb, count, buffer, true)
+    }
 
-        let cdb = [
-            0x88, // READ(16)
-            0,
-            lba_bytes[0],
-            lba_bytes[1],
-            lba_bytes[2],
-            lba_bytes[3],
-            lba_bytes[4],
-            lba_bytes[5],
-            lba_bytes[6],
-            lba_bytes[7],
-            count_bytes[0],
-            count_bytes[1],
-            count_bytes[2],
-            count_bytes[3],
-            0,
-            0,
-        ];
-
+    /// Run a READ/WRITE command that must transfer exactly `count` blocks.
+    fn transfer_blocks(
+        &mut self,
+        controller: &mut dyn UsbController,
+        cdb: &[u8],
+        count: u32,
+        buffer: &mut [u8],
+        is_read: bool,
+    ) -> Result<(), MassStorageError> {
         let transfer_len = (count as usize)
             .checked_mul(self.block_size as usize)
             .ok_or(MassStorageError::InvalidParameter)?;
         let result =
-            self.scsi_command(controller, &cdb, Some(&mut buffer[..transfer_len]), true)?;
+            self.scsi_command(controller, cdb, Some(&mut buffer[..transfer_len]), is_read)?;
         if result.transferred != transfer_len || result.residue != 0 {
+            // Warn, not debug: a short fixed-length transfer means the retry
+            // loop is about to fire, and field reports need to identify
+            // whether the device or the transport is at fault.
             log::warn!(
-                "USB READ(16): short transfer: got {} bytes with {} residue, expected {}",
+                "USB SCSI {:#04x}: short transfer: got {} bytes with {} residue, expected {}",
+                cdb[0],
                 result.transferred,
                 result.residue,
                 transfer_len
@@ -841,6 +904,157 @@ impl UsbMassStorage {
         }
 
         Ok(())
+    }
+
+    /// Largest amount of data sent by one WRITE command.
+    ///
+    /// Caps the reused bounce buffer; each command is additionally bounded
+    /// by the live controller's bulk-transfer limit.
+    const MAX_WRITE_BYTES: usize = 64 * 1024;
+
+    /// Write sectors to the device in bounded chunks.
+    ///
+    /// Each chunk is retried up to MAX_READ_RETRIES times; rewriting the same
+    /// blocks is idempotent, so a retry after a failed or short transfer is
+    /// safe.
+    pub fn write_sectors_generic(
+        &mut self,
+        controller: &mut dyn UsbController,
+        start_lba: u64,
+        num_sectors: u32,
+        buffer: &[u8],
+    ) -> Result<(), MassStorageError> {
+        if self.read_only {
+            return Err(MassStorageError::WriteProtected);
+        }
+        if start_lba
+            .checked_add(num_sectors as u64)
+            .is_none_or(|end| end > self.num_blocks)
+        {
+            return Err(MassStorageError::InvalidParameter);
+        }
+        let block_size = self.block_size as usize;
+        if block_size == 0
+            || block_size > Self::MAX_WRITE_BYTES
+            || controller.max_bulk_transfer_size() < block_size
+        {
+            return Err(MassStorageError::InvalidParameter);
+        }
+        let required_len = (num_sectors as usize)
+            .checked_mul(block_size)
+            .filter(|&len| len <= buffer.len())
+            .ok_or(MassStorageError::InvalidParameter)?;
+        let sectors_per_cmd =
+            Self::MAX_WRITE_BYTES.min(controller.max_bulk_transfer_size()) / block_size;
+        let sectors_per_cmd = sectors_per_cmd.clamp(1, u16::MAX as usize);
+
+        buffer[..required_len]
+            .chunks(sectors_per_cmd * block_size)
+            .enumerate()
+            .try_for_each(|(index, chunk)| {
+                let lba = start_lba + (index * sectors_per_cmd) as u64;
+                self.write_chunk_with_retry(controller, lba, chunk)
+            })
+    }
+
+    /// Write one chunk of whole sectors, retrying on failure.
+    fn write_chunk_with_retry(
+        &mut self,
+        controller: &mut dyn UsbController,
+        lba: u64,
+        chunk: &[u8],
+    ) -> Result<(), MassStorageError> {
+        let count = (chunk.len() / self.block_size as usize) as u32;
+        let mut bounce = core::mem::take(&mut self.write_buffer);
+        if bounce.capacity() < chunk.len()
+            && bounce
+                .try_reserve(chunk.len().saturating_sub(bounce.len()))
+                .is_err()
+        {
+            self.write_buffer = bounce;
+            return Err(MassStorageError::OutOfResources);
+        }
+        bounce.resize(chunk.len(), 0);
+        // Set before issuing WRITE: an error does not prove that no data was
+        // accepted, nor that earlier writes became durable.
+        self.writes_pending = true;
+        let result = (|| {
+            let mut last_error = MassStorageError::NotReady;
+            for attempt in 0..=Self::MAX_READ_RETRIES {
+                bounce.copy_from_slice(chunk);
+                let result = if lba + count as u64 <= 0xFFFFFFFF {
+                    let cdb = rw_10_cdb(scsi_cmd::WRITE_10, lba as u32, count as u16);
+                    self.transfer_blocks(controller, &cdb, count, &mut bounce, false)
+                } else {
+                    let cdb = rw_16_cdb(scsi_cmd::WRITE_16, lba, count);
+                    self.transfer_blocks(controller, &cdb, count, &mut bounce, false)
+                };
+                match result {
+                    Ok(()) => return Ok(()),
+                    Err(MassStorageError::CommandFailed)
+                        if self.request_sense(controller) == Some(7) =>
+                    {
+                        self.read_only = true;
+                        return Err(MassStorageError::WriteProtected);
+                    }
+                    Err(e) => {
+                        log::debug!(
+                            "USB mass storage: write LBA {} ({} sectors) failed (attempt {}/{}): {:?}",
+                            lba,
+                            count,
+                            attempt + 1,
+                            Self::MAX_READ_RETRIES + 1,
+                            e
+                        );
+                        last_error = e;
+                        if attempt < Self::MAX_READ_RETRIES {
+                            time::delay_ms(10);
+                        }
+                    }
+                }
+            }
+
+            Err(last_error)
+        })();
+        self.write_buffer = bounce;
+        result
+    }
+
+    /// SYNCHRONIZE CACHE(10): commit the device's write cache to media.
+    pub fn synchronize_cache(
+        &mut self,
+        controller: &mut dyn UsbController,
+    ) -> Result<(), MassStorageError> {
+        // Devices excluded from writing (including those without cache-command
+        // support) have nothing to flush. Never skip accepted/uncertain writes
+        // merely because a subsequent DATA PROTECT made the device read-only.
+        if self.read_only && !self.writes_pending {
+            return Ok(());
+        }
+        // LBA 0 with a zero block count covers the whole medium.
+        let cdb = [scsi_cmd::SYNCHRONIZE_CACHE_10, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        // Cache synchronization is idempotent. A transient timeout can occur
+        // while the medium drains earlier writes; retry only after BOT reset
+        // recovery succeeds, without treating an exhausted retry as durable.
+        for attempt in 0..=Self::MAX_READ_RETRIES {
+            match self.scsi_command(controller, &cdb, None, false) {
+                Ok(_) => {
+                    self.writes_pending = false;
+                    return Ok(());
+                }
+                Err(MassStorageError::Usb(UsbError::Timeout))
+                    if attempt < Self::MAX_READ_RETRIES =>
+                {
+                    // A timeout can also have occurred in the CBW or recovery
+                    // itself. Explicitly establish BOT idle before retrying.
+                    self.bot_reset_recovery(controller)?;
+                    log::debug!("USB mass storage: cache flush timed out, retrying");
+                    time::delay_ms(10);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        unreachable!("the final attempt returns its result")
     }
 
     /// Get the device address (slot ID for xHCI, device address for others)
