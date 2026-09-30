@@ -13,6 +13,8 @@ use r_efi::protocols::simple_file_system as efi_sfs;
 use spin::Mutex;
 use zerocopy::FromBytes;
 
+mod info;
+
 use crate::cell::{LocalCell, StaticMut};
 use crate::drivers::storage::{self, StorageId};
 use crate::fs::fat::{DirectoryEntry, FatFilesystem, FatGeometry, FileClusterHint};
@@ -558,7 +560,6 @@ extern "efiapi" fn file_get_info(
     }
 
     let guid = unsafe { *info_type };
-    let requested_size = unsafe { *buffer_size };
 
     // Get handle info
     let (path, path_len, file_size, is_directory) = {
@@ -574,92 +575,34 @@ extern "efiapi" fn file_get_info(
     };
 
     if guid == FILE_INFO_GUID {
-        // EFI_FILE_INFO
         let path_str = core::str::from_utf8(&path[..path_len]).unwrap_or("");
         let filename = path_str.rsplit(['/', '\\']).next().unwrap_or("");
-        let filename_u16_len = filename.len() + 1; // +1 for null terminator
-
-        // Size = struct + filename in UTF-16
-        let required_size = core::mem::size_of::<efi_file::Info>() + filename_u16_len * 2;
-
-        if requested_size < required_size {
-            unsafe { *buffer_size = required_size };
-            return Status::BUFFER_TOO_SMALL;
-        }
-
-        if buffer.is_null() {
-            return Status::INVALID_PARAMETER;
-        }
-
-        // Fill in the info
-        let info = buffer as *mut efi_file::Info;
         unsafe {
-            (*info).size = required_size as u64;
-            (*info).file_size = file_size;
-            (*info).physical_size = file_size;
-            // Zero out times (not tracked)
-            (*info).create_time = core::mem::zeroed();
-            (*info).last_access_time = core::mem::zeroed();
-            (*info).modification_time = core::mem::zeroed();
-            (*info).attribute = if is_directory { FILE_DIRECTORY } else { 0 };
-
-            // Write filename as UTF-16 after the struct
-            let filename_ptr =
-                (info as *mut u8).add(core::mem::size_of::<efi_file::Info>()) as *mut u16;
-            for (i, c) in filename.chars().enumerate() {
-                *filename_ptr.add(i) = c as u16;
-            }
-            *filename_ptr.add(filename.len()) = 0; // null terminator
+            info::write_file_info(
+                buffer,
+                buffer_size,
+                file_size,
+                if is_directory { FILE_DIRECTORY } else { 0 },
+                filename,
+            )
         }
-
-        unsafe { *buffer_size = required_size };
-        log::debug!(
-            "File.GetInfo(FILE_INFO): size={}, is_dir={}",
-            file_size,
-            is_directory
-        );
-        Status::SUCCESS
     } else if guid == FILE_SYSTEM_INFO_GUID {
-        // EFI_FILE_SYSTEM_INFO
-        let label = "EFI";
-        let label_u16_len = label.len() + 1;
-        let required_size = core::mem::size_of::<efi_file::SystemInfo>() + label_u16_len * 2;
-
-        if requested_size < required_size {
-            unsafe { *buffer_size = required_size };
-            return Status::BUFFER_TOO_SMALL;
-        }
-
-        if buffer.is_null() {
-            return Status::INVALID_PARAMETER;
-        }
-
-        let filesystem = FILESYSTEM.get();
-        let fs_state = match filesystem {
-            Some(s) => s,
+        let fs_state = match FILESYSTEM.get() {
+            Some(state) => state,
             None => return Status::NOT_READY,
         };
-
-        let info = buffer as *mut efi_file::SystemInfo;
+        // The protocol still exposes read-only operations and unknown space.
         unsafe {
-            (*info).size = required_size as u64;
-            (*info).read_only = r_efi::efi::Boolean::TRUE; // Read-only
-            (*info).volume_size = 0; // Unknown
-            (*info).free_space = 0;
-            (*info).block_size = fs_state.device_block_size;
-
-            // Write label as UTF-16 after the struct
-            let label_ptr =
-                (info as *mut u8).add(core::mem::size_of::<efi_file::SystemInfo>()) as *mut u16;
-            for (i, c) in label.chars().enumerate() {
-                *label_ptr.add(i) = c as u16;
-            }
-            *label_ptr.add(label.len()) = 0;
+            info::write_system_info(
+                buffer,
+                buffer_size,
+                true,
+                0,
+                0,
+                fs_state.device_block_size,
+                "EFI",
+            )
         }
-
-        unsafe { *buffer_size = required_size };
-        log::debug!("File.GetInfo(FILE_SYSTEM_INFO)");
-        Status::SUCCESS
     } else {
         log::debug!("File.GetInfo: unknown info type");
         Status::UNSUPPORTED
@@ -934,39 +877,21 @@ fn read_directory(buffer_size: *mut usize, buffer: *mut c_void, handle_idx: usiz
 
     match entry_result {
         Ok(Ok(Some((entry, filename)))) => {
-            let filename_char_count = filename.chars().count();
-            let filename_u16_len = filename_char_count + 1;
-            let required_size = core::mem::size_of::<efi_file::Info>() + filename_u16_len * 2;
-            let requested_size = unsafe { *buffer_size };
-
-            if requested_size < required_size {
-                unsafe { *buffer_size = required_size };
-                return Status::BUFFER_TOO_SMALL;
-            }
-
-            if buffer.is_null() {
-                return Status::INVALID_PARAMETER;
-            }
-
-            // Fill info
-            let info = buffer as *mut efi_file::Info;
-            let is_dir = entry.is_directory();
-            let file_size = entry.file_size();
-            unsafe {
-                (*info).size = required_size as u64;
-                (*info).file_size = file_size as u64;
-                (*info).physical_size = file_size as u64;
-                (*info).create_time = core::mem::zeroed();
-                (*info).last_access_time = core::mem::zeroed();
-                (*info).modification_time = core::mem::zeroed();
-                (*info).attribute = if is_dir { FILE_DIRECTORY } else { 0 };
-
-                let filename_ptr =
-                    (info as *mut u8).add(core::mem::size_of::<efi_file::Info>()) as *mut u16;
-                for (i, c) in filename.chars().enumerate() {
-                    *filename_ptr.add(i) = c as u16;
-                }
-                *filename_ptr.add(filename_char_count) = 0;
+            let status = unsafe {
+                info::write_file_info(
+                    buffer,
+                    buffer_size,
+                    entry.file_size() as u64,
+                    if entry.is_directory() {
+                        FILE_DIRECTORY
+                    } else {
+                        0
+                    },
+                    &filename,
+                )
+            };
+            if status != Status::SUCCESS {
+                return status;
             }
 
             // Increment position
@@ -974,8 +899,6 @@ fn read_directory(buffer_size: *mut usize, buffer: *mut c_void, handle_idx: usiz
                 let mut handles = FILE_HANDLES.lock();
                 handles[handle_idx].position += 1;
             }
-
-            unsafe { *buffer_size = required_size };
             Status::SUCCESS
         }
         Ok(Ok(None)) => {
