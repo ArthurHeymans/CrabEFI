@@ -1,5 +1,7 @@
 //! FAT read and mutation tests on a sparse in-memory disk.
 
+#[path = "fat_efi_tests.rs"]
+mod efi;
 #[path = "fat_metadata_tests.rs"]
 mod metadata;
 #[path = "fat_mutation_tests.rs"]
