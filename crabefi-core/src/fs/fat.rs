@@ -1,10 +1,24 @@
 //! FAT filesystem driver
 //!
-//! This module provides read support for FAT12/16/32 filesystems.
-//! Used to read files from the EFI System Partition.
+//! This module provides read support for FAT12/16/32 filesystems and, for
+//! FAT32, file and directory mutation (see [`mutate`]).
+//! Used to access files on the EFI System Partition.
+//!
+//! [`FatFilesystem`] is a temporary device view. [`FatGeometry`] describes the
+//! validated layout; [`FatVolumeState`] retains live allocator and recovery state
+//! across device borrows. Lookup and mutation share decoded directory records
+//! and logical slot traversal. [`FatFile`] holds a record snapshot, not a cursor
+//! or access mode; handle ownership belongs to the filesystem's caller.
 
-use crate::drivers::block::BlockDevice;
-use zerocopy::{FromBytes, Immutable, KnownLayout, Unaligned};
+use crate::drivers::block::{BlockDevice, BlockRange};
+use zerocopy::little_endian::U32;
+use zerocopy::{FromBytes, FromZeros, Immutable, IntoBytes, KnownLayout, Unaligned};
+
+mod mutate;
+pub use mutate::{FatFile, FatFileId, FatWriteError};
+#[cfg(test)]
+#[path = "fat_tests.rs"]
+mod tests;
 
 /// Standard sector size (512 bytes) - used for FAT calculations
 pub const SECTOR_SIZE: usize = 512;
@@ -80,7 +94,7 @@ struct Fat32Ebr {
 
 /// FAT directory entry
 #[repr(C, packed)]
-#[derive(FromBytes, Immutable, KnownLayout, Unaligned, Clone, Copy, Debug)]
+#[derive(FromBytes, IntoBytes, Immutable, KnownLayout, Unaligned, Clone, Copy, Debug)]
 pub struct DirectoryEntry {
     /// Short name (8 characters)
     name: [u8; 8],
@@ -111,6 +125,30 @@ pub struct DirectoryEntry {
 }
 
 impl DirectoryEntry {
+    /// Build a record from its 8.3 name (name and extension, space padded).
+    fn new(short_name: [u8; 11], attr: u8, first_cluster: u32, file_size: u32) -> Self {
+        let mut entry = Self::new_zeroed();
+        entry.name.copy_from_slice(&short_name[..8]);
+        entry.ext.copy_from_slice(&short_name[8..]);
+        entry.attr = attr;
+        entry.set_first_cluster(first_cluster);
+        entry.file_size = file_size;
+        entry
+    }
+
+    fn set_first_cluster(&mut self, cluster: u32) {
+        self.first_cluster_hi = (cluster >> 16) as u16;
+        self.first_cluster_lo = cluster as u16;
+    }
+
+    /// Raw 8.3 name: 8 name bytes followed by 3 extension bytes.
+    fn short_name_bytes(&self) -> [u8; 11] {
+        let mut short = [0; 11];
+        short[..8].copy_from_slice(&self.name);
+        short[8..].copy_from_slice(&self.ext);
+        short
+    }
+
     /// Get the first cluster number
     pub fn first_cluster(&self) -> u32 {
         ((self.first_cluster_hi as u32) << 16) | (self.first_cluster_lo as u32)
@@ -176,6 +214,11 @@ impl DirectoryEntry {
                 .all(|(a, b)| a.eq_ignore_ascii_case(&b))
     }
 
+    /// On-media FAT attributes (including read-only, hidden and archive).
+    pub fn attributes(&self) -> u8 {
+        self.attr
+    }
+
     /// Get the file size in bytes
     pub fn file_size(&self) -> u32 {
         self.file_size
@@ -193,11 +236,34 @@ const ATTR_LFN: u8 = ATTR_READ_ONLY | ATTR_HIDDEN | ATTR_SYSTEM | ATTR_VOLUME_ID
 /// Maximum length of a long filename we support (255 chars as per VFAT spec)
 const MAX_LFN_LENGTH: usize = 255;
 
+/// A decoded directory record and the logical run that owns its long name.
+/// Shared by lookup, enumeration and mutation; offsets are partition-relative.
+#[derive(Clone, Copy)]
+struct DirectoryRecord {
+    entry: DirectoryEntry,
+    short_offset: u64,
+    first_offset: u64,
+}
+
+impl DirectoryRecord {
+    fn new(entry: DirectoryEntry, lfn: &LfnBuffer, position: u64, lfn_start: u64) -> Self {
+        Self {
+            entry,
+            short_offset: position,
+            first_offset: if lfn.belongs_to(&entry) {
+                lfn_start
+            } else {
+                position
+            },
+        }
+    }
+}
+
 /// Long File Name (LFN) entry structure
 ///
 /// LFN entries store up to 13 UTF-16 characters each and precede the 8.3 entry.
 /// They are stored in reverse order (last part first).
-#[derive(Clone, Copy, FromBytes, Immutable, KnownLayout, Unaligned)]
+#[derive(Clone, Copy, FromBytes, IntoBytes, Immutable, KnownLayout, Unaligned)]
 #[repr(C, packed)]
 struct LfnEntry {
     /// Sequence number (0x40 | n for last, n for others)
@@ -219,6 +285,32 @@ struct LfnEntry {
 }
 
 impl LfnEntry {
+    /// Checksum binding long-name records to their short directory entry.
+    fn short_name_checksum(short: &[u8; 11]) -> u8 {
+        short
+            .iter()
+            .fold(0u8, |sum, byte| sum.rotate_right(1).wrapping_add(*byte))
+    }
+
+    /// Build a record holding up to 13 UTF-16 units. `last` marks the record
+    /// stored first on disk (the one carrying the end of the name).
+    fn new(sequence: u8, last: bool, checksum: u8, units: &[u16; 13]) -> Self {
+        let mut entry = Self::new_zeroed();
+        entry.seq = sequence | if last { 0x40 } else { 0 };
+        entry.attr = ATTR_LFN;
+        entry.checksum = checksum;
+        let mut bytes = units.iter().flat_map(|unit| unit.to_le_bytes());
+        for slot in entry
+            .name1
+            .iter_mut()
+            .chain(&mut entry.name2)
+            .chain(&mut entry.name3)
+        {
+            *slot = bytes.next().unwrap_or(0xff);
+        }
+        entry
+    }
+
     /// Check if this is the last (first encountered) LFN entry
     fn is_last(&self) -> bool {
         (self.seq & 0x40) != 0
@@ -256,6 +348,7 @@ struct LfnBuffer {
     active: bool,
     /// Expected next sequence number
     expected_seq: u8,
+    checksum: u8,
 }
 
 impl LfnBuffer {
@@ -265,6 +358,7 @@ impl LfnBuffer {
             len: 0,
             active: false,
             expected_seq: 0,
+            checksum: 0,
         }
     }
 
@@ -278,13 +372,18 @@ impl LfnBuffer {
     /// Process an LFN entry
     fn process_lfn(&mut self, entry: &LfnEntry) {
         let seq = entry.sequence_number();
+        if seq == 0 || seq as usize > MAX_LFN_LENGTH.div_ceil(13) {
+            self.reset();
+            return;
+        }
 
         if entry.is_last() {
             // Start of a new LFN sequence (entries are in reverse order)
             self.reset();
             self.active = true;
             self.expected_seq = seq;
-        } else if !self.active || seq != self.expected_seq - 1 {
+            self.checksum = entry.checksum;
+        } else if !self.active || seq + 1 != self.expected_seq || entry.checksum != self.checksum {
             // Sequence broken, reset
             self.reset();
             return;
@@ -308,6 +407,13 @@ impl LfnBuffer {
         }
     }
 
+    fn belongs_to(&self, entry: &DirectoryEntry) -> bool {
+        self.active
+            && self.expected_seq == 1
+            && self.len > 0
+            && self.checksum == LfnEntry::short_name_checksum(&entry.short_name_bytes())
+    }
+
     /// Check if the accumulated LFN matches a name (case-insensitive)
     fn matches(&self, name: &str) -> bool {
         if !self.active || self.len == 0 {
@@ -321,6 +427,11 @@ impl LfnBuffer {
                 return false;
             }
 
+            // Only BMP LFNs are supported: do not alias supplementary
+            // characters to the low 16 bits of an unrelated name.
+            if ch.len_utf16() != 1 {
+                return false;
+            }
             let lfn_ch = self.chars[lfn_idx];
             // Simple ASCII case-insensitive comparison
             // For full Unicode support, we'd need more complex normalization
@@ -372,6 +483,18 @@ pub enum FatError {
     BufferTooSmall,
     /// Device block size exceeds the internal read buffer
     UnsupportedBlockSize,
+    /// Mutation is only implemented for FAT32
+    ReadOnly,
+    /// Block-device write failed
+    WriteError,
+    /// Entry already exists
+    AlreadyExists,
+    /// Directory is not empty
+    DirectoryNotEmpty,
+    /// Invalid filename
+    InvalidName,
+    /// No free clusters or directory slots
+    NoSpace,
 }
 
 impl core::fmt::Display for FatError {
@@ -389,6 +512,12 @@ impl core::fmt::Display for FatError {
             FatError::UnsupportedBlockSize => {
                 write!(f, "device block size exceeds the FAT read buffer")
             }
+            FatError::ReadOnly => write!(f, "read-only FAT filesystem"),
+            FatError::WriteError => write!(f, "write error"),
+            FatError::AlreadyExists => write!(f, "entry already exists"),
+            FatError::DirectoryNotEmpty => write!(f, "directory not empty"),
+            FatError::InvalidName => write!(f, "invalid filename"),
+            FatError::NoSpace => write!(f, "filesystem full"),
         }
     }
 }
@@ -404,11 +533,53 @@ pub struct FatGeometry {
     bytes_per_sector: u16,
     sectors_per_cluster: u8,
     fat_start: u32,
+    num_fats: u8,
+    sectors_per_fat: u32,
     data_start: u32,
     root_cluster: u32,
     root_dir_start: u32,
     root_dir_sectors: u32,
     data_clusters: u32,
+    total_sectors: u32,
+    active_fat: u8,
+    mirrored: bool,
+    fs_info_sector: Option<u32>,
+}
+
+/// Mutable volume state retained across temporary device borrows.
+///
+/// Chain generations invalidate cursors after mutation. A failed recovery
+/// disables further access; an unclean fresh mount remains read-only until
+/// repaired externally.
+#[derive(Clone, Copy)]
+pub struct FatVolumeState {
+    alloc_hint: u32,
+    generation: u64,
+    dirty: bool,
+    fs_info_invalidated: bool,
+    needs_repair: bool,
+    failed: bool,
+    free_clusters: Option<u32>,
+}
+
+impl FatVolumeState {
+    pub const fn failed(&self) -> bool {
+        self.failed
+    }
+
+    // Only fresh mount constructors initialize state, then check on-media
+    // status. Cached reborrows must receive state from that same mount.
+    const fn new() -> Self {
+        Self {
+            alloc_hint: 2,
+            generation: 0,
+            dirty: false,
+            fs_info_invalidated: false,
+            needs_repair: false,
+            failed: false,
+            free_clusters: None,
+        }
+    }
 }
 
 /// Cached location in a file's cluster chain.
@@ -416,6 +587,7 @@ pub struct FatGeometry {
 pub struct FileClusterHint {
     file_cluster: u32,
     disk_cluster: u32,
+    generation: u64,
 }
 
 impl FileClusterHint {
@@ -424,7 +596,29 @@ impl FileClusterHint {
         Self {
             file_cluster: 0,
             disk_cluster: first_cluster,
+            generation: u64::MAX,
         }
+    }
+}
+
+/// FAT32 advisory free-space information (always the first 512 bytes).
+#[derive(FromBytes, IntoBytes, Immutable, KnownLayout, Unaligned)]
+#[repr(C)]
+struct Fat32FsInfo {
+    lead_signature: zerocopy::byteorder::little_endian::U32,
+    reserved: [u8; 480],
+    structure_signature: zerocopy::byteorder::little_endian::U32,
+    free_count: zerocopy::byteorder::little_endian::U32,
+    next_free: zerocopy::byteorder::little_endian::U32,
+    reserved_tail: [u8; 12],
+    trail_signature: zerocopy::byteorder::little_endian::U32,
+}
+
+impl Fat32FsInfo {
+    fn valid(&self) -> bool {
+        self.lead_signature.get() == 0x4161_5252
+            && self.structure_signature.get() == 0x6141_7272
+            && self.trail_signature.get() == 0xaa55_0000
     }
 }
 
@@ -444,6 +638,10 @@ pub struct FatFilesystem<'a> {
     sectors_per_cluster: u8,
     /// First FAT sector (relative to partition start)
     fat_start: u32,
+    /// Number of FAT copies
+    num_fats: u8,
+    /// Sectors occupied by one FAT copy
+    sectors_per_fat: u32,
     /// First data sector (relative to partition start)
     data_start: u32,
     /// Root directory first cluster (FAT32) or sector count (FAT12/16)
@@ -458,16 +656,97 @@ pub struct FatFilesystem<'a> {
     fat_block_cache: [u8; MAX_BLOCK_SIZE],
     /// Block number currently in cache (u64::MAX = invalid)
     fat_block_cached: u64,
+    /// Validated physical partition range, independent of the BPB extent.
+    range: BlockRange,
+    total_sectors: u32,
+    active_fat: u8,
+    mirrored: bool,
+    fs_info_sector: Option<u32>,
+    state: FatVolumeState,
 }
 
 impl<'a> FatFilesystem<'a> {
+    fn cluster_size(&self) -> usize {
+        self.sectors_per_cluster as usize * self.bytes_per_sector as usize
+    }
+
+    /// Fresh mounts must not clear evidence of interrupted/failed mutation.
+    fn check_mount_status(&mut self) -> Result<(), FatError> {
+        if self.fat_type == FatType::Fat32 {
+            let mut status = U32::ZERO;
+            self.partition_read(
+                self.fat32_entry_offset(self.active_fat as u32, 1)?,
+                status.as_mut_bytes(),
+            )?;
+            self.state.needs_repair = status.get() & 0x0c00_0000 != 0x0c00_0000;
+        }
+        Ok(())
+    }
+
+    fn check_volume_range(&self, offset: u64, len: usize) -> Result<(), FatError> {
+        if offset
+            .checked_add(len as u64)
+            .is_none_or(|end| end > self.volume_size())
+        {
+            return Err(FatError::InvalidCluster);
+        }
+        Ok(())
+    }
+
+    fn partition_read(&mut self, offset: u64, output: &mut [u8]) -> Result<(), FatError> {
+        self.check_volume_range(offset, output.len())?;
+        self.range
+            .read(self.device, offset, output)
+            .map_err(|_| FatError::ReadError)
+    }
+
+    fn cluster_byte_offset(&self, cluster: u32) -> Result<u64, FatError> {
+        if cluster < 2 || cluster - 2 >= self.data_clusters {
+            return Err(FatError::InvalidCluster);
+        }
+        Ok(self.data_start as u64 * self.bytes_per_sector as u64
+            + (cluster - 2) as u64 * self.cluster_size() as u64)
+    }
+
+    /// Partition byte offset of a cluster's entry in FAT copy `copy`.
+    fn fat32_entry_offset(&self, copy: u32, cluster: u32) -> Result<u64, FatError> {
+        if copy >= self.num_fats as u32
+            || cluster >= self.data_clusters + 2
+            || cluster as u64 * 4 + 4 > self.sectors_per_fat as u64 * self.bytes_per_sector as u64
+        {
+            return Err(FatError::InvalidCluster);
+        }
+        Ok(
+            (self.fat_start as u64 + copy as u64 * self.sectors_per_fat as u64)
+                * self.bytes_per_sector as u64
+                + cluster as u64 * 4,
+        )
+    }
+
     /// Create a new FAT filesystem instance
     pub fn new(device: &'a mut dyn BlockDevice, partition_start: u64) -> Result<Self, FatError> {
+        let blocks = device
+            .info()
+            .num_blocks
+            .checked_sub(partition_start)
+            .ok_or(FatError::InvalidBpb)?;
+        Self::new_partition(device, partition_start, blocks)
+    }
+
+    /// Mount inside an independently known partition extent. Writable callers
+    /// should use this rather than trusting the BPB to bound a whole disk.
+    pub fn new_partition(
+        device: &'a mut dyn BlockDevice,
+        partition_start: u64,
+        blocks: u64,
+    ) -> Result<Self, FatError> {
+        let range =
+            BlockRange::new(device, partition_start, blocks).map_err(|_| FatError::InvalidBpb)?;
         // Use device's actual block size for reading. The FAT read buffer holds
         // one device block, so a larger block cannot be read correctly.
         let info = device.info();
         let block_size = info.block_size as usize;
-        if !(1..=MAX_BLOCK_SIZE).contains(&block_size) {
+        if !(512..=MAX_BLOCK_SIZE).contains(&block_size) || !block_size.is_power_of_two() {
             log::debug!("Unsupported device block size: {block_size}");
             return Err(FatError::UnsupportedBlockSize);
         }
@@ -554,8 +833,20 @@ impl<'a> FatFilesystem<'a> {
 
         // Calculate first data sector
         let fat_start = reserved_sectors;
-        let root_dir_start = fat_start + (num_fats * sectors_per_fat);
-        let data_start = root_dir_start + root_dir_sectors;
+        let root_dir_start = num_fats
+            .checked_mul(sectors_per_fat)
+            .and_then(|sectors| fat_start.checked_add(sectors))
+            .ok_or(FatError::InvalidBpb)?;
+        let data_start = root_dir_start
+            .checked_add(root_dir_sectors)
+            .ok_or(FatError::InvalidBpb)?;
+        if sectors_per_fat == 0
+            || total_sectors as u64 * bytes_per_sector as u64
+                > range.byte_len(device).map_err(|_| FatError::InvalidBpb)?
+            || bytes_per_sector as usize * sectors_per_cluster as usize > 65536
+        {
+            return Err(FatError::InvalidBpb);
+        }
 
         // Calculate total data clusters (with underflow protection for malformed BPBs)
         let data_sectors = total_sectors
@@ -583,6 +874,41 @@ impl<'a> FatFilesystem<'a> {
             0
         };
 
+        let entries = data_clusters as u64 + 2;
+        let needed = match fat_type {
+            FatType::Fat12 => (entries * 3).div_ceil(2),
+            FatType::Fat16 => entries * 2,
+            FatType::Fat32 => entries * 4,
+        };
+        if needed > sectors_per_fat as u64 * bytes_per_sector as u64 {
+            return Err(FatError::InvalidBpb);
+        }
+        let (active_fat, mirrored, fs_info_sector) = if fat_type == FatType::Fat32 {
+            let ebr = Fat32Ebr::read_from_prefix(&buffer[36..])
+                .map_err(|_| FatError::InvalidBpb)?
+                .0;
+            let mirrored = ebr.ext_flags & 0x80 == 0;
+            let active = if mirrored {
+                0
+            } else {
+                (ebr.ext_flags & 0xf) as u8
+            };
+            if active >= bpb_num_fats
+                || ebr.fs_version != 0
+                || root_dir_sectors != 0
+                || root_cluster < 2
+                || root_cluster - 2 >= data_clusters
+                || data_clusters + 1 >= 0x0fff_fff0
+            {
+                return Err(FatError::InvalidBpb);
+            }
+            let fs_info = (ebr.fs_info > 0 && (ebr.fs_info as u32) < reserved_sectors)
+                .then_some(ebr.fs_info as u32);
+            (active, mirrored, fs_info)
+        } else {
+            (0, true, None)
+        };
+
         log::info!(
             "FAT filesystem: {:?}, {} clusters, {} bytes/cluster",
             fat_type,
@@ -603,7 +929,7 @@ impl<'a> FatFilesystem<'a> {
             data_start
         );
 
-        Ok(Self {
+        let mut filesystem = Self {
             device,
             partition_start,
             fat_type,
@@ -611,6 +937,8 @@ impl<'a> FatFilesystem<'a> {
             device_block_size: block_size as u32,
             sectors_per_cluster,
             fat_start,
+            num_fats: bpb_num_fats,
+            sectors_per_fat,
             data_start,
             root_cluster,
             root_dir_start,
@@ -618,7 +946,15 @@ impl<'a> FatFilesystem<'a> {
             data_clusters,
             fat_block_cache: [0u8; MAX_BLOCK_SIZE],
             fat_block_cached: u64::MAX, // Invalid, forces first read
-        })
+            range,
+            total_sectors,
+            active_fat,
+            mirrored,
+            fs_info_sector,
+            state: FatVolumeState::new(),
+        };
+        filesystem.check_mount_status()?;
+        Ok(filesystem)
     }
 
     /// Reopen a previously validated filesystem without rereading its BPB.
@@ -637,8 +973,43 @@ impl<'a> FatFilesystem<'a> {
         partition_start: u64,
         geometry: FatGeometry,
     ) -> Result<Self, FatError> {
+        let blocks = device
+            .info()
+            .num_blocks
+            .checked_sub(partition_start)
+            .ok_or(FatError::InvalidBpb)?;
+        let mut filesystem = Self::from_geometry_in_partition(
+            device,
+            partition_start,
+            blocks,
+            geometry,
+            FatVolumeState::new(),
+        )?;
+        filesystem.check_mount_status()?;
+        Ok(filesystem)
+    }
+
+    /// Reborrow a mounted volume while preserving allocator and mutation state.
+    ///
+    /// Pass the state returned by [`Self::volume_state`] from the same mount,
+    /// and retain its updated value after every operation, including failures.
+    /// This is not a fresh mount; it deliberately preserves live dirty status.
+    pub fn from_geometry_in_partition(
+        device: &'a mut dyn BlockDevice,
+        partition_start: u64,
+        blocks: u64,
+        geometry: FatGeometry,
+        state: FatVolumeState,
+    ) -> Result<Self, FatError> {
+        let range =
+            BlockRange::new(device, partition_start, blocks).map_err(|_| FatError::InvalidBpb)?;
+        if geometry.total_sectors as u64 * geometry.bytes_per_sector as u64
+            > range.byte_len(device).map_err(|_| FatError::InvalidBpb)?
+        {
+            return Err(FatError::InvalidBpb);
+        }
         let device_block_size = device.info().block_size;
-        if !(1..=MAX_BLOCK_SIZE as u32).contains(&device_block_size) {
+        if !(512..=MAX_BLOCK_SIZE as u32).contains(&device_block_size) {
             log::debug!("Unsupported device block size: {device_block_size}");
             return Err(FatError::UnsupportedBlockSize);
         }
@@ -650,6 +1021,8 @@ impl<'a> FatFilesystem<'a> {
             device_block_size,
             sectors_per_cluster: geometry.sectors_per_cluster,
             fat_start: geometry.fat_start,
+            num_fats: geometry.num_fats,
+            sectors_per_fat: geometry.sectors_per_fat,
             data_start: geometry.data_start,
             root_cluster: geometry.root_cluster,
             root_dir_start: geometry.root_dir_start,
@@ -657,7 +1030,93 @@ impl<'a> FatFilesystem<'a> {
             data_clusters: geometry.data_clusters,
             fat_block_cache: [0u8; MAX_BLOCK_SIZE],
             fat_block_cached: u64::MAX,
+            range,
+            total_sectors: geometry.total_sectors,
+            active_fat: geometry.active_fat,
+            mirrored: geometry.mirrored,
+            fs_info_sector: geometry.fs_info_sector,
+            state,
         })
+    }
+
+    pub const fn volume_state(&self) -> FatVolumeState {
+        self.state
+    }
+
+    /// Unclean/error-marked volumes must be repaired externally before writing.
+    pub fn is_read_only(&self) -> bool {
+        self.device.info().read_only
+            || self.fat_type != FatType::Fat32
+            || self.state.needs_repair
+            || self.state.failed
+    }
+
+    pub fn volume_size(&self) -> u64 {
+        self.total_sectors as u64 * self.bytes_per_sector as u64
+    }
+
+    /// Count free clusters from the authoritative FAT, never from FSInfo hints.
+    pub fn free_space(&mut self) -> Result<u64, FatError> {
+        if self.state.failed {
+            return Err(FatError::InvalidCluster);
+        }
+        if let Some(count) = self.state.free_clusters {
+            return Ok(count as u64 * self.cluster_size() as u64);
+        }
+        let mut free = 0;
+        let base = (self.fat_start as u64 + self.active_fat as u64 * self.sectors_per_fat as u64)
+            * self.bytes_per_sector as u64;
+        if self.fat_type == FatType::Fat32 {
+            let mut chunk = [0u8; MAX_BLOCK_SIZE];
+            for first in (2..self.data_clusters + 2).step_by(MAX_BLOCK_SIZE / 4) {
+                let entries =
+                    (self.data_clusters + 2 - first).min((MAX_BLOCK_SIZE / 4) as u32) as usize;
+                self.partition_read(base + first as u64 * 4, &mut chunk[..entries * 4])?;
+                free += <[U32]>::ref_from_bytes(&chunk[..entries * 4])
+                    .map_err(|_| FatError::ReadError)?
+                    .iter()
+                    .filter(|value| value.get() & 0x0fff_ffff == 0)
+                    .count() as u32;
+            }
+        } else {
+            let entries = self.data_clusters as u64 + 2;
+            let fat_bytes = if self.fat_type == FatType::Fat12 {
+                (entries * 3).div_ceil(2)
+            } else {
+                entries * 2
+            };
+            // Include one lookahead byte for packed FAT12 entries that cross
+            // the chunk boundary. Read only the capacity validated at mount.
+            let mut table = [0u8; MAX_BLOCK_SIZE + 1];
+            let mut loaded_start = 0;
+            let mut loaded_len = 0;
+            for cluster in 2..self.data_clusters + 2 {
+                let offset = if self.fat_type == FatType::Fat12 {
+                    cluster as u64 * 3 / 2
+                } else {
+                    cluster as u64 * 2
+                };
+                if offset + 2 > loaded_start + loaded_len as u64 {
+                    loaded_start = offset / MAX_BLOCK_SIZE as u64 * MAX_BLOCK_SIZE as u64;
+                    loaded_len = (fat_bytes - loaded_start).min(table.len() as u64) as usize;
+                    self.partition_read(base + loaded_start, &mut table[..loaded_len])?;
+                }
+                let within = (offset - loaded_start) as usize;
+                let entry = u16::from_le_bytes([table[within], table[within + 1]]);
+                let entry = if self.fat_type == FatType::Fat12 {
+                    if cluster & 1 == 0 {
+                        entry & 0xfff
+                    } else {
+                        entry >> 4
+                    }
+                } else {
+                    entry
+                };
+                free += u32::from(entry == 0);
+            }
+        }
+        self.state.free_clusters = Some(free);
+        Ok(free as u64 * self.cluster_size() as u64)
     }
 
     /// Return the validated geometry needed to reopen this filesystem.
@@ -667,11 +1126,17 @@ impl<'a> FatFilesystem<'a> {
             bytes_per_sector: self.bytes_per_sector,
             sectors_per_cluster: self.sectors_per_cluster,
             fat_start: self.fat_start,
+            num_fats: self.num_fats,
+            sectors_per_fat: self.sectors_per_fat,
             data_start: self.data_start,
             root_cluster: self.root_cluster,
             root_dir_start: self.root_dir_start,
             root_dir_sectors: self.root_dir_sectors,
             data_clusters: self.data_clusters,
+            total_sectors: self.total_sectors,
+            active_fat: self.active_fat,
+            mirrored: self.mirrored,
+            fs_info_sector: self.fs_info_sector,
         }
     }
 
@@ -700,7 +1165,7 @@ impl<'a> FatFilesystem<'a> {
     /// Read the next cluster from the FAT (with single-block caching)
     fn next_cluster(&mut self, cluster: u32) -> Result<Option<u32>, FatError> {
         // Validate cluster number is in valid range (clusters 0 and 1 are reserved)
-        if cluster < 2 {
+        if self.state.failed || cluster < 2 || cluster - 2 >= self.data_clusters {
             return Err(FatError::InvalidCluster);
         }
 
@@ -721,7 +1186,9 @@ impl<'a> FatFilesystem<'a> {
             }
             FatType::Fat32 => {
                 let fat_byte_offset = cluster as u64 * 4;
-                (self.fat_start as u64 * bytes_per_sector) + fat_byte_offset
+                ((self.fat_start as u64 + self.active_fat as u64 * self.sectors_per_fat as u64)
+                    * bytes_per_sector)
+                    + fat_byte_offset
             }
         };
 
@@ -835,6 +1302,9 @@ impl<'a> FatFilesystem<'a> {
             }
         };
 
+        if next.is_some_and(|cluster| cluster < 2 || cluster - 2 >= self.data_clusters) {
+            return Err(FatError::InvalidCluster);
+        }
         Ok(next)
     }
 
@@ -851,9 +1321,10 @@ impl<'a> FatFilesystem<'a> {
 
         let device_block_size = self.device_block_size as usize;
 
-        // Handle case where cluster is smaller than or equal to device block
-        if cluster_size <= device_block_size {
-            // Cluster fits within one or two device blocks
+        // Clusters smaller than a device block, or not block-aligned, are copied
+        // block by block so the bytes preceding the cluster are skipped.
+        if cluster_size <= device_block_size || start_offset != 0 {
+            // Cluster fits within one or more device blocks
             let mut temp_buffer = [0u8; MAX_BLOCK_SIZE];
             let mut bytes_copied = 0usize;
             let mut current_block = start_device_block;
@@ -971,21 +1442,10 @@ impl<'a> FatFilesystem<'a> {
             0 // Special case for FAT12/16 root directory
         };
 
-        let parts: heapless::Vec<&str, 16> =
-            path.split(['/', '\\']).filter(|s| !s.is_empty()).collect();
-
-        log::debug!(
-            "FAT: path has {} components, starting at cluster {}",
-            parts.len(),
-            current_dir_cluster
-        );
-
-        for (i, part) in parts.iter().enumerate() {
-            let is_last = i == parts.len() - 1;
-
+        let mut parts = path.split(['/', '\\']).filter(|s| !s.is_empty()).peekable();
+        while let Some(part) = parts.next() {
             let entry = self.find_in_directory(current_dir_cluster, part)?;
-
-            if is_last {
+            if parts.peek().is_none() {
                 return Ok(entry);
             }
 
@@ -1022,21 +1482,61 @@ impl<'a> FatFilesystem<'a> {
         }
     }
 
+    /// Visit directory records in logical order, including fragmented chains.
+    /// Reads and mutations share this traversal and its partition-relative offsets.
+    /// `Continue` carries the directory's last cluster.
+    fn for_each_slot<T>(
+        &mut self,
+        directory: u32,
+        mut visit: impl FnMut(u64, &DirectoryEntry) -> core::ops::ControlFlow<T>,
+    ) -> Result<core::ops::ControlFlow<T, u32>, FatError> {
+        use core::ops::ControlFlow;
+
+        let cluster_size = self.cluster_size();
+        let chunk_size = MAX_BLOCK_SIZE.min(cluster_size);
+        let mut data = [0u8; MAX_BLOCK_SIZE];
+        let mut cluster = directory;
+        for _ in 0..self.data_clusters {
+            let base = self.cluster_byte_offset(cluster)?;
+            for chunk_start in (0..cluster_size).step_by(chunk_size) {
+                self.partition_read(base + chunk_start as u64, &mut data[..chunk_size])?;
+                let records = <[DirectoryEntry]>::ref_from_bytes(&data[..chunk_size])
+                    .map_err(|_| FatError::ReadError)?;
+                for (index, record) in records.iter().enumerate() {
+                    let position = base
+                        + (chunk_start + index * core::mem::size_of::<DirectoryEntry>()) as u64;
+                    if let ControlFlow::Break(value) = visit(position, record) {
+                        return Ok(ControlFlow::Break(value));
+                    }
+                }
+            }
+            match self.next_cluster(cluster)? {
+                Some(next) => cluster = next,
+                None => return Ok(ControlFlow::Continue(cluster)),
+            }
+        }
+        Err(FatError::InvalidCluster)
+    }
+
     /// Iterate over all directory entries in a directory, calling `visitor` for each
     /// non-free, non-LFN, non-volume-label entry.
     ///
-    /// The visitor receives `(&DirectoryEntry, &LfnBuffer)` and returns
+    /// The visitor receives `(&DirectoryRecord, &LfnBuffer)` and returns
     /// `ControlFlow::Continue(())` to keep iterating or `ControlFlow::Break(value)`
     /// to stop early with a result.
     ///
     /// Handles both FAT12/16 fixed root directories and cluster-chain directories.
-    fn for_each_dir_entry<T>(
+    fn for_each_dir_record<T>(
         &mut self,
         cluster: u32,
-        mut visitor: impl FnMut(&DirectoryEntry, &LfnBuffer) -> core::ops::ControlFlow<T>,
+        mut visitor: impl FnMut(&DirectoryRecord, &LfnBuffer) -> core::ops::ControlFlow<T>,
     ) -> Result<core::ops::ControlFlow<T>, FatError> {
-        let mut buffer = [0u8; 65536]; // Max cluster size
+        if self.state.failed {
+            return Err(FatError::InvalidCluster);
+        }
+        let mut buffer = [0u8; MAX_BLOCK_SIZE];
         let mut lfn_buffer = LfnBuffer::new();
+        let mut lfn_start = 0;
 
         if cluster == 0 && self.fat_type != FatType::Fat32 {
             // FAT12/16 root directory (fixed location)
@@ -1075,6 +1575,9 @@ impl<'a> FatFilesystem<'a> {
                     }
                     if entry.is_lfn() {
                         if let Ok((lfn_entry, _)) = LfnEntry::read_from_prefix(&buffer[pos..]) {
+                            if lfn_entry.is_last() {
+                                lfn_start = (device_block * device_block_size + pos) as u64;
+                            }
                             lfn_buffer.process_lfn(&lfn_entry);
                         }
                         pos += 32;
@@ -1088,7 +1591,13 @@ impl<'a> FatFilesystem<'a> {
                         continue;
                     }
 
-                    if let core::ops::ControlFlow::Break(val) = visitor(&entry, &lfn_buffer) {
+                    let record = DirectoryRecord::new(
+                        entry,
+                        &lfn_buffer,
+                        (device_block * device_block_size + pos) as u64,
+                        lfn_start,
+                    );
+                    if let core::ops::ControlFlow::Break(val) = visitor(&record, &lfn_buffer) {
                         return Ok(core::ops::ControlFlow::Break(val));
                     }
 
@@ -1102,51 +1611,38 @@ impl<'a> FatFilesystem<'a> {
                 }
             }
         } else {
-            // Cluster-chain directory
-            let mut current_cluster = cluster;
-            let cluster_size = self.sectors_per_cluster as usize * self.bytes_per_sector as usize;
-            let entries_per_cluster = cluster_size / 32;
-
-            loop {
-                self.read_cluster(current_cluster, &mut buffer[..cluster_size])?;
-
-                for i in 0..entries_per_cluster {
-                    let offset = i * 32;
-                    let entry = match DirectoryEntry::read_from_prefix(&buffer[offset..]) {
-                        Ok((e, _)) => e,
-                        Err(_) => break,
-                    };
-
-                    if entry.is_end() {
-                        return Ok(core::ops::ControlFlow::Continue(()));
-                    }
-                    if entry.is_free() {
-                        lfn_buffer.reset();
-                        continue;
-                    }
-                    if entry.is_lfn() {
-                        if let Ok((lfn_entry, _)) = LfnEntry::read_from_prefix(&buffer[offset..]) {
-                            lfn_buffer.process_lfn(&lfn_entry);
-                        }
-                        continue;
-                    }
-                    if entry.is_volume_id() {
-                        lfn_buffer.reset();
-                        continue;
-                    }
-
-                    if let core::ops::ControlFlow::Break(val) = visitor(&entry, &lfn_buffer) {
-                        return Ok(core::ops::ControlFlow::Break(val));
-                    }
-
+            // Reads and mutations use the same logical record iterator. It
+            // bounds chain traversal and needs only one small scratch chunk.
+            use core::ops::ControlFlow;
+            let result = self.for_each_slot(cluster, |position, entry| {
+                if entry.is_end() {
+                    return ControlFlow::Break(None);
+                }
+                if entry.is_free() || entry.is_volume_id() && !entry.is_lfn() {
                     lfn_buffer.reset();
+                    return ControlFlow::Continue(());
                 }
-
-                match self.next_cluster(current_cluster)? {
-                    Some(next) => current_cluster = next,
-                    None => break,
+                if entry.is_lfn() {
+                    if let Ok(lfn) = LfnEntry::read_from_bytes(entry.as_bytes()) {
+                        if lfn.is_last() {
+                            lfn_start = position;
+                        }
+                        lfn_buffer.process_lfn(&lfn);
+                    }
+                    return ControlFlow::Continue(());
                 }
-            }
+                let record = DirectoryRecord::new(*entry, &lfn_buffer, position, lfn_start);
+                let result = visitor(&record, &lfn_buffer);
+                lfn_buffer.reset();
+                match result {
+                    ControlFlow::Break(value) => ControlFlow::Break(Some(value)),
+                    ControlFlow::Continue(()) => ControlFlow::Continue(()),
+                }
+            })?;
+            return Ok(match result {
+                ControlFlow::Break(Some(value)) => ControlFlow::Break(value),
+                _ => ControlFlow::Continue(()),
+            });
         }
 
         Ok(core::ops::ControlFlow::Continue(()))
@@ -1174,16 +1670,26 @@ impl<'a> FatFilesystem<'a> {
 
     /// Find an entry in a directory
     fn find_in_directory(&mut self, cluster: u32, name: &str) -> Result<DirectoryEntry, FatError> {
+        self.find_record_in_directory(cluster, name)
+            .map(|record| record.entry)
+    }
+
+    fn find_record_in_directory(
+        &mut self,
+        cluster: u32,
+        name: &str,
+    ) -> Result<DirectoryRecord, FatError> {
         use core::ops::ControlFlow;
 
-        match self.for_each_dir_entry(cluster, |entry, lfn_buf| {
-            if lfn_buf.matches(name) || entry.matches_name(name) {
-                ControlFlow::Break(*entry)
+        match self.for_each_dir_record(cluster, |record, lfn_buf| {
+            let entry = &record.entry;
+            if (lfn_buf.belongs_to(entry) && lfn_buf.matches(name)) || entry.matches_name(name) {
+                ControlFlow::Break(*record)
             } else {
                 ControlFlow::Continue(())
             }
         })? {
-            ControlFlow::Break(entry) => Ok(entry),
+            ControlFlow::Break(record) => Ok(record),
             ControlFlow::Continue(()) => Err(FatError::NotFound),
         }
     }
@@ -1207,6 +1713,9 @@ impl<'a> FatFilesystem<'a> {
         buffer: &mut [u8],
         hint: &mut FileClusterHint,
     ) -> Result<usize, FatError> {
+        if self.state.failed {
+            return Err(FatError::InvalidCluster);
+        }
         if entry.is_directory() {
             return Err(FatError::NotAFile);
         }
@@ -1221,12 +1730,14 @@ impl<'a> FatFilesystem<'a> {
 
         let skip_clusters = offset / cluster_size;
         let cluster_offset = (offset % cluster_size) as usize;
-        let (mut cluster_index, mut cluster) =
-            if hint.disk_cluster >= 2 && hint.file_cluster <= skip_clusters {
-                (hint.file_cluster, hint.disk_cluster)
-            } else {
-                (0, entry.first_cluster())
-            };
+        let (mut cluster_index, mut cluster) = if hint.generation == self.state.generation
+            && hint.disk_cluster >= 2
+            && hint.file_cluster <= skip_clusters
+        {
+            (hint.file_cluster, hint.disk_cluster)
+        } else {
+            (0, entry.first_cluster())
+        };
 
         // Skip to starting cluster
         while cluster_index < skip_clusters {
@@ -1241,6 +1752,7 @@ impl<'a> FatFilesystem<'a> {
 
         hint.file_cluster = cluster_index;
         hint.disk_cluster = cluster;
+        hint.generation = self.state.generation;
 
         let mut cluster_buffer = [0u8; 65536]; // Max cluster size (128 sectors * 512 bytes)
         let mut bytes_read = 0;
@@ -1377,7 +1889,8 @@ impl<'a> FatFilesystem<'a> {
         let dir_cluster = self.resolve_dir_cluster(dir_path)?;
         let mut results: heapless::Vec<heapless::String<256>, 32> = heapless::Vec::new();
 
-        let _ = self.for_each_dir_entry(dir_cluster, |entry, lfn_buf| {
+        let _ = self.for_each_dir_record(dir_cluster, |record, lfn_buf| {
+            let entry = &record.entry;
             if entry.is_directory() {
                 return ControlFlow::Continue(());
             }
@@ -1392,10 +1905,13 @@ impl<'a> FatFilesystem<'a> {
     }
 
     /// Extract the display name from a directory entry, preferring LFN over short name
-    fn entry_display_name(entry: &DirectoryEntry, lfn: &LfnBuffer) -> heapless::String<256> {
-        let mut name = heapless::String::<256>::new();
+    fn entry_display_name<const N: usize>(
+        entry: &DirectoryEntry,
+        lfn: &LfnBuffer,
+    ) -> heapless::String<N> {
+        let mut name = heapless::String::<N>::new();
 
-        if lfn.active && lfn.len > 0 {
+        if lfn.belongs_to(entry) {
             // Use LFN - convert UTF-16 to UTF-8
             for &ch in lfn.chars.iter().take(lfn.len) {
                 if ch == 0 {
@@ -1438,7 +1954,8 @@ impl<'a> FatFilesystem<'a> {
         let dir_cluster = self.resolve_dir_cluster(dir_path)?;
         let mut results: heapless::Vec<heapless::String<256>, 16> = heapless::Vec::new();
 
-        let _ = self.for_each_dir_entry(dir_cluster, |entry, lfn_buf| {
+        let _ = self.for_each_dir_record(dir_cluster, |record, lfn_buf| {
+            let entry = &record.entry;
             if !entry.is_directory() {
                 return ControlFlow::Continue(());
             }
@@ -1468,12 +1985,13 @@ impl<'a> FatFilesystem<'a> {
         &mut self,
         cluster: u32,
         position: usize,
-    ) -> Result<Option<(DirectoryEntry, heapless::String<256>)>, FatError> {
+    ) -> Result<Option<(DirectoryEntry, heapless::String<768>)>, FatError> {
         use core::ops::ControlFlow;
 
         let mut current_position = 0usize;
 
-        match self.for_each_dir_entry(cluster, |entry, lfn_buf| {
+        match self.for_each_dir_record(cluster, |record, lfn_buf| {
+            let entry = &record.entry;
             if current_position == position {
                 let name = Self::entry_display_name(entry, lfn_buf);
                 ControlFlow::Break((*entry, name))
