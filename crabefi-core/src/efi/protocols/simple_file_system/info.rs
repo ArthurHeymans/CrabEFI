@@ -39,6 +39,62 @@ fn info_size(header: usize, name: &str) -> usize {
     header + (name.encode_utf16().count() + 1) * 2
 }
 
+pub(super) fn system_info_size(label: &str) -> usize {
+    info_size(size_of::<SystemInfoHeader>(), label)
+}
+
+pub(super) struct FileInfoUpdate {
+    pub(super) file_size: u64,
+    pub(super) attributes: u64,
+}
+
+/// Decode SetInfo without aligned references or trusting the flexible tail.
+/// A header-only request retains the current name, as existing callers expect.
+pub(super) fn read_file_info(buffer: &[u8], current_name: &str) -> Result<FileInfoUpdate, Status> {
+    let (header, _) =
+        FileInfoHeader::read_from_prefix(buffer).map_err(|_| Status::BAD_BUFFER_SIZE)?;
+    let declared = if header.size == 0 {
+        buffer.len()
+    } else {
+        usize::try_from(header.size).map_err(|_| Status::BAD_BUFFER_SIZE)?
+    };
+    if !(size_of::<FileInfoHeader>()..=buffer.len()).contains(&declared) {
+        return Err(Status::BAD_BUFFER_SIZE);
+    }
+    let name = &buffer[size_of::<FileInfoHeader>()..declared];
+    if !name.len().is_multiple_of(2) {
+        return Err(Status::BAD_BUFFER_SIZE);
+    }
+    if !requested_name_matches(name, current_name)
+        || header.create_time != [0; 16]
+        || header.last_access_time != [0; 16]
+        || header.modification_time != [0; 16]
+    {
+        return Err(Status::UNSUPPORTED);
+    }
+    Ok(FileInfoUpdate {
+        file_size: header.file_size,
+        attributes: header.attribute,
+    })
+}
+
+fn requested_name_matches(name: &[u8], current_name: &str) -> bool {
+    if name.is_empty() {
+        return true;
+    }
+    let mut current = current_name.encode_utf16();
+    for (index, bytes) in name.as_chunks::<2>().0.iter().enumerate() {
+        let unit = u16::from_ne_bytes(*bytes);
+        if unit == 0 {
+            return index == 0 || current.next().is_none();
+        }
+        if current.next() != Some(unit) {
+            return false;
+        }
+    }
+    false
+}
+
 /// # Safety
 /// `buffer_size` must point to a writable `usize`. A non-null `buffer` must
 /// cover the number of writable bytes declared by `buffer_size`.
@@ -120,6 +176,52 @@ mod tests {
     use super::*;
     use alloc::vec;
     use alloc::vec::Vec;
+
+    #[test]
+    fn set_info_matches_only_bounded_terminated_names() {
+        let name = "é.txt";
+        let required = info_size(size_of::<FileInfoHeader>(), name);
+        let mut output = vec![0; required + 1];
+        let mut size = required;
+        assert_eq!(
+            unsafe {
+                write_file_info(
+                    output.as_mut_ptr().add(1).cast(),
+                    &mut size,
+                    7,
+                    efi_file::ARCHIVE,
+                    name,
+                )
+            },
+            Status::SUCCESS
+        );
+        let update = read_file_info(&output[1..], name).unwrap();
+        assert_eq!(update.file_size, 7);
+        assert_eq!(update.attributes, efi_file::ARCHIVE);
+        assert!(matches!(
+            read_file_info(&output[1..], "other"),
+            Err(Status::UNSUPPORTED)
+        ));
+        let unterminated = required - 2;
+        output[1..9].copy_from_slice(&(unterminated as u64).to_ne_bytes());
+        assert!(matches!(
+            read_file_info(&output[1..1 + unterminated], name),
+            Err(Status::UNSUPPORTED)
+        ));
+        output[1..9].copy_from_slice(&(required as u64 + 1).to_ne_bytes());
+        assert!(matches!(
+            read_file_info(&output[1..], name),
+            Err(Status::BAD_BUFFER_SIZE)
+        ));
+        // Existing header-only SetInfo callers leave Size zero and retain the name.
+        output[1..9].fill(0);
+        assert_eq!(
+            read_file_info(&output[1..1 + size_of::<FileInfoHeader>()], name)
+                .unwrap()
+                .file_size,
+            7
+        );
+    }
 
     #[test]
     fn file_info_has_exact_size_and_works_unaligned() {
