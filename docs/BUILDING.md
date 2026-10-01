@@ -186,7 +186,7 @@ ci/build-sct-assets.sh --arch x86_64
 ```
 
 The default `ci/sct/smoke.seq` retains the original six Boot Services cases.
-CI additionally gates 46 distinct cases across seven subsystem sequences:
+CI additionally gates 48 distinct cases across seven subsystem sequences:
 
 ```bash
 ./crabefi test --app uefi-sct-smoke --disable-kvm --timeout 900 \

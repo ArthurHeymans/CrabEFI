@@ -6,6 +6,12 @@ not UEFI certification or proof that every required interface is conformant.
 Any compatibility claim must identify the architecture, machine, firmware
 profile, SCT version, passing cases, and remaining required-interface gaps.
 
+The engineering goal is enough UEFI compatibility for real bootloaders and OSes,
+not full conformance. Prioritize failures reachable on those paths. The P0 audit
+items below identify blockers to a *full-conformance claim*, not a requirement to
+implement every missing interface. In particular, EFI decompression is deferred
+unless compressed PCI option-ROM driver loading becomes a supported use case.
+
 ## Priority order
 
 | Priority | Interfaces / contracts | Why | Validation |
@@ -53,7 +59,7 @@ must not be presented as passing all of that protocol's conformance cases.
 
 The pinned package is `edk2-test-stable202509` for x86_64; its local inventory
 contains 608 registered cases in 78 modules. The old smoke selected six cases.
-The subsystem manifests select **46 distinct cases**, not 46 complete interfaces:
+The subsystem manifests select **48 distinct cases**, not 48 complete interfaces:
 
 | Manifest in `ci/sct/` | Cases | Scope / limits |
 | --- | ---: | --- |
@@ -61,7 +67,7 @@ The subsystem manifests select **46 distinct cases**, not 46 complete interfaces
 | `boot-services.seq` | 15 | Miscellaneous services, image start/unload/exit error paths, event creation/close, and two protocol-handler conformance cases |
 | `device-path.seq` | 11 | Installed node validation, text-to-path conformance/coverage, utility conformance; not full conversion functionality |
 | `block-io.seq` | 3 | Reset, reads, and read error contracts on every discovered Block I/O instance; no raw-block write qualification |
-| `filesystem.seq` | 4 | File close (including writable-file use), open and position error contracts; volume-label gaps below remain failures |
+| `filesystem.seq` | 6 | Volume opening, file close (including writable-file use), open/position/GetInfo error contracts and dedicated volume-label queries; not label mutation |
 | `hii-string.seq` | 6 | String parameter contracts and language enumeration; not complete font/SCSU/configuration support |
 | `variables.seq` | 1 | Variable-name enumeration conformance only; no persistence or full variable-service claim |
 
@@ -88,14 +94,14 @@ from those runs were **not** promoted as completed green profiles.
 
 | Priority | Observed gap | Next validation / fix |
 | --- | --- | --- |
-| P0 | Required-elements audit: missing `EFI_DECOMPRESS_PROTOCOL` | Implement the required EFI decompression interface with bounded input/scratch/output handling; rerun the audit |
+| P0 audit / deferred implementation | Required-elements audit: missing `EFI_DECOMPRESS_PROTOCOL` | Revisit for compressed PCI option-ROM drivers; it is not needed on the currently tested disk-boot paths |
 | P0 | Required-elements audit: runtime-properties mask assertion | Resolve the pinned SCT checker defect described below, without falsely advertising unsupported services |
 | P0 | Platform-specific audit fails with the package's default feature assumptions | Establish a spec-backed machine configuration; distinguish genuine conditional requirements from unadvertised optional capabilities |
 | P1 | Protocol uninstall/reinstall/install-multiple failures; subsequent clean-environment failures | Isolate protocol database lifecycle and rollback before running the larger group together |
 | P1 | Event functional/signal failures and wait timeout; runtime-event registration unsupported | Fix notification/TPL scheduling and investigate isolated waits; retain the runtime-event limitation |
 | P1 | `LoadImage_Conf` failures; `ExitBootServices_Conf` timeout | Test image error precedence/cleanup and EBS in separate disposable guests |
 | P1 | Allocation and monotonic-counter functional probes timed out | Isolate the expensive cases and determine whether budgets or implementations are at fault |
-| P1 | `OpenVolume_Func` and `GetInfo_Conf` fail because volume-label information is unsupported | Implement `EFI_FILE_SYSTEM_VOLUME_LABEL` contracts, including appropriate mutation semantics; do not label these cases irrelevant |
+| Deferred | Volume-label mutation and on-media FAT label discovery are unsupported | Both GetInfo formats expose the same existing firmware-assigned `EFI` label; implement real label discovery/renaming only when needed |
 | P1 | Variable get conformance failures and functional warnings; persistence unavailable in the tested default ROM | Fix argument contracts and validate with an actual writable runtime-storage profile, including reset/persistence boundaries |
 | P1/P2 | Device-path conversion functional/coverage failures | Complete the semantics of installed conversion protocols; preserve unsupported node/encoding limitations |
 | P2 | Broad HII run did not complete | Expand isolated database/string/configuration sequences; installed protocols remain obligations |
@@ -104,9 +110,15 @@ The first expansion also corrects null-buffer memory-map validation, event
 creation parameter validation, stale-media-ID read precedence, and null HII
 package-handle validation. Their selected SCT cases remain mandatory gates.
 
-Failing filesystem and required-element sequences remain reproducible under
-`ci/sct/characterization/`; they are **not green CI gates**. Use the same command
-above with one of those paths and retain its nonzero result and artifacts.
+The dedicated `EFI_FILE_SYSTEM_VOLUME_LABEL` getter returns a terminated UTF-16
+string without a filesystem-info header. It shares the existing `EFI` label
+with `EFI_FILE_SYSTEM_INFO`; `SetInfo` label mutation still returns `UNSUPPORTED`.
+The previously failing `OpenVolume_Func` and `GetInfo_Conf` cases are now in the
+filesystem gate.
+
+The failing required-element sequence remains reproducible at
+`ci/sct/characterization/required.seq`; it is **not a green CI gate**. Use the
+same command above with that path and retain its nonzero result and artifacts.
 Full UEFI compliance cannot be claimed while genuine required gaps remain.
 
 ### Runtime-properties audit discrepancy

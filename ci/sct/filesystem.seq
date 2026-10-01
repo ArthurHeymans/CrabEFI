@@ -1,30 +1,43 @@
 # filesystem: edk2-test-stable202509, x86_64/Q35. See docs/UEFI_CONFORMANCE.md.
-# Volume-label failures remain in characterization/filesystem.seq; this is not a full SFS gate.
+
+[Test Case]
+Revision = 0x00010000
+Guid = 3E59FED4-426A-4E00-8787-68A20F80B0B7
+Name = OpenVolume_Func
+Order = 0x00000000
+Iterations = 0x00000001
 
 [Test Case]
 Revision = 0x00010000
 Guid = 3EAEA622-0167-4213-B6D9-0AD3D0066679
 Name = Close_Func
-Order = 0x00000000
+Order = 0x00000001
 Iterations = 0x00000001
 
 [Test Case]
 Revision = 0x00010000
 Guid = 0BA666CB-B43A-4691-82E8-B2241EB9A9F9
 Name = Open_Conf
-Order = 0x00000001
+Order = 0x00000002
 Iterations = 0x00000001
 
 [Test Case]
 Revision = 0x00010000
 Guid = 8A2F13C7-A01C-4949-81C9-46B3FF349F92
 Name = GetPosition_Conf
-Order = 0x00000002
+Order = 0x00000003
 Iterations = 0x00000001
 
 [Test Case]
 Revision = 0x00010000
 Guid = A2FDC63E-2D01-4AAB-8880-E62C1E08D930
 Name = SetPosition_Conf
-Order = 0x00000003
+Order = 0x00000004
+Iterations = 0x00000001
+
+[Test Case]
+Revision = 0x00010000
+Guid = 8B16C09D-5321-4A63-B168-8E59590A436D
+Name = GetInfo_Conf
+Order = 0x00000005
 Iterations = 0x00000001
