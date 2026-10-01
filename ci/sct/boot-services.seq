@@ -1,0 +1,106 @@
+# boot-services: edk2-test-stable202509, x86_64/Q35. See docs/UEFI_CONFORMANCE.md.
+
+[Test Case]
+Revision = 0x00010000
+Guid = E9544E95-2792-494C-AC39-CC33688F9513
+Name = GetNextMonotonicCount_Conf
+Order = 0x00000000
+Iterations = 0x00000001
+
+[Test Case]
+Revision = 0x00010000
+Guid = E00A6879-AF7E-4238-AAD1-0B891E71D721
+Name = InstallConfigurationTable_Conf
+Order = 0x00000001
+Iterations = 0x00000001
+
+[Test Case]
+Revision = 0x00010000
+Guid = 718165E6-C904-43F1-9A93-DDE3467EEDC2
+Name = CalculateCrc32_Conf
+Order = 0x00000002
+Iterations = 0x00000001
+
+[Test Case]
+Revision = 0x00010000
+Guid = 539675B8-D9B3-4DC7-A8D0-FF19BBA13B86
+Name = Stall_Func
+Order = 0x00000003
+Iterations = 0x00000001
+
+[Test Case]
+Revision = 0x00010000
+Guid = 4397A610-8D5D-441B-8E7D-C23377F3EB67
+Name = CopyMem_Func
+Order = 0x00000004
+Iterations = 0x00000001
+
+[Test Case]
+Revision = 0x00010000
+Guid = 315BE343-A32D-461D-A3CC-5E6895CC2CBA
+Name = SetMem_Func
+Order = 0x00000005
+Iterations = 0x00000001
+
+[Test Case]
+Revision = 0x00010000
+Guid = B510F99F-FEE9-4AF6-BB0F-3C958EF7F166
+Name = CalculateCrc32_Func
+Order = 0x00000006
+Iterations = 0x00000001
+
+[Test Case]
+Revision = 0x00010000
+Guid = 61995EF9-D030-44B1-864C-55EF7D7CBB74
+Name = StartImage_Conf
+Order = 0x00000007
+Iterations = 0x00000001
+
+[Test Case]
+Revision = 0x00010000
+Guid = B9AFCAC3-198F-4783-A8CA-795978DFCFBA
+Name = UnloadImage_Conf
+Order = 0x00000008
+Iterations = 0x00000001
+
+[Test Case]
+Revision = 0x00010000
+Guid = DD6E776A-53A5-4A72-9EA6-FB71A7096EB5
+Name = Exit_Conf
+Order = 0x00000009
+Iterations = 0x00000001
+
+[Test Case]
+Revision = 0x00010000
+Guid = 50BF9D26-B53D-4CFF-BC10-BC6581BF509D
+Name = CreateEvent_Conf
+Order = 0x0000000a
+Iterations = 0x00000001
+
+[Test Case]
+Revision = 0x00010000
+Guid = EFBD4523-10DD-44B3-A520-58AF83E5BF64
+Name = CloseEvent_Func
+Order = 0x0000000b
+Iterations = 0x00000001
+
+[Test Case]
+Revision = 0x00010000
+Guid = F9B16C34-EAB5-4C9C-BE90-01B12E64F117
+Name = CreateEventEx_Conf
+Order = 0x0000000c
+Iterations = 0x00000001
+
+[Test Case]
+Revision = 0x00010000
+Guid = 6DF68724-5D03-4555-9FDC-AB4CE42B4509
+Name = InstallProtocolInterface_Conf
+Order = 0x0000000d
+Iterations = 0x00000001
+
+[Test Case]
+Revision = 0x00010000
+Guid = 91666998-769F-4075-8D43-C5F391736453
+Name = RegisterProtocolNotify_Conf
+Order = 0x0000000e
+Iterations = 0x00000001

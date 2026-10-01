@@ -1,0 +1,43 @@
+# hii-string: edk2-test-stable202509, x86_64/Q35. See docs/UEFI_CONFORMANCE.md.
+
+[Test Case]
+Revision = 0x00010000
+Guid = 94971A6A-B0EB-4C86-B34A-866886801DF9
+Name = NewStringConformance
+Order = 0x00000000
+Iterations = 0x00000001
+
+[Test Case]
+Revision = 0x00010000
+Guid = 9D28A801-49D8-4A7F-895E-732E436BDF3C
+Name = GetStringConformance
+Order = 0x00000001
+Iterations = 0x00000001
+
+[Test Case]
+Revision = 0x00010000
+Guid = 69DDDDBB-DCE4-4AFC-9060-26B4998E7DC1
+Name = SetStringConformance
+Order = 0x00000002
+Iterations = 0x00000001
+
+[Test Case]
+Revision = 0x00010000
+Guid = 5CE20B3C-CB59-412F-A137-BBE59422F860
+Name = GetLanguagesFunction
+Order = 0x00000003
+Iterations = 0x00000001
+
+[Test Case]
+Revision = 0x00010000
+Guid = 24E0CCA8-80F0-4391-8816-3BCC21616E54
+Name = GetLanguagesConformance
+Order = 0x00000004
+Iterations = 0x00000001
+
+[Test Case]
+Revision = 0x00010000
+Guid = AA37EDDC-68EE-4D69-8D0B-A431F1E7B80F
+Name = GetSecondaryLanguagesConformance
+Order = 0x00000005
+Iterations = 0x00000001

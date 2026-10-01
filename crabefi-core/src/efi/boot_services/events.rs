@@ -31,11 +31,15 @@ const FIRST_DYNAMIC_EVENT_ID: usize = POINTER_EVENT_ID + 1;
 const FIRST_DYNAMIC_EVENT_ID: usize = KEYBOARD_EVENT_ID + 1;
 
 // ============================================================================
-// Event Functions (mostly unsupported)
+// Boot-time event functions; runtime events are not supported.
 // ============================================================================
 
 const fn boot_event_type_supported(event_type: u32) -> bool {
-    event_type & EVT_RUNTIME == 0
+    let notify_bits = EVT_NOTIFY_WAIT | EVT_NOTIFY_SIGNAL;
+    event_type == EVT_SIGNAL_EXIT_BOOT_SERVICES
+        || (event_type & EVT_RUNTIME == 0
+            && event_type & !(EVT_TIMER | notify_bits) == 0
+            && event_type & notify_bits != notify_bits)
 }
 
 fn find_free_event_slot(events: &[EventEntry]) -> Option<usize> {
@@ -104,6 +108,19 @@ pub(super) extern "efiapi" fn create_event(
     if !boot_event_type_supported(event_type) {
         return Status::INVALID_PARAMETER;
     }
+    let notifies = event_type & (EVT_NOTIFY_WAIT | EVT_NOTIFY_SIGNAL) != 0;
+    if notifies
+        && (notify_function.is_none()
+            || (notify_tpl != efi::TPL_CALLBACK && notify_tpl != efi::TPL_NOTIFY))
+    {
+        return Status::INVALID_PARAMETER;
+    }
+    // Notification parameters are ignored for ordinary/timer-only events.
+    let (notify_tpl, notify_function, notify_context) = if notifies {
+        (notify_tpl, notify_function, notify_context)
+    } else {
+        (0, None, core::ptr::null_mut())
+    };
 
     // Allocate a reusable event slot from centralized state.
     with_tables_mut(|efi_state| {
@@ -543,7 +560,7 @@ pub(super) extern "efiapi" fn create_event_ex(
             .unwrap_or(&"NULL" as &dyn core::fmt::Display)
     );
 
-    if event.is_null() {
+    if event.is_null() || (!event_group.is_null() && event_type == EVT_SIGNAL_EXIT_BOOT_SERVICES) {
         return Status::INVALID_PARAMETER;
     }
 
@@ -580,6 +597,62 @@ mod tests {
         assert!(!boot_event_type_supported(
             EVT_SIGNAL_VIRTUAL_ADDRESS_CHANGE
         ));
+    }
+
+    #[test]
+    fn create_event_validates_type_callback_and_tpl_before_publishing() {
+        extern "efiapi" fn notify(_event: efi::Event, _context: *mut c_void) {}
+        let _execution = crate::efi::boot_services::IMAGE_EXECUTION_TEST_LOCK
+            .lock()
+            .unwrap();
+        let sentinel = core::ptr::dangling_mut::<u8>().cast();
+        let mut event = sentinel;
+        for event_type in [
+            2,
+            EVT_NOTIFY_WAIT | EVT_NOTIFY_SIGNAL,
+            EVT_TIMER | EVT_SIGNAL_EXIT_BOOT_SERVICES,
+        ] {
+            assert_eq!(
+                create_event(
+                    event_type,
+                    efi::TPL_CALLBACK,
+                    Some(notify),
+                    core::ptr::null_mut(),
+                    &mut event
+                ),
+                Status::INVALID_PARAMETER
+            );
+            assert_eq!(event, sentinel);
+        }
+        for event_type in [
+            EVT_NOTIFY_WAIT,
+            EVT_NOTIFY_SIGNAL,
+            EVT_TIMER | EVT_NOTIFY_SIGNAL,
+        ] {
+            assert_eq!(
+                create_event(
+                    event_type,
+                    efi::TPL_CALLBACK,
+                    None,
+                    core::ptr::null_mut(),
+                    &mut event
+                ),
+                Status::INVALID_PARAMETER
+            );
+            for tpl in [0, efi::TPL_APPLICATION, 7, 9, 15, 17, efi::TPL_HIGH_LEVEL] {
+                assert_eq!(
+                    create_event(
+                        event_type,
+                        tpl,
+                        Some(notify),
+                        core::ptr::null_mut(),
+                        &mut event
+                    ),
+                    Status::INVALID_PARAMETER
+                );
+                assert_eq!(event, sentinel);
+            }
+        }
     }
 
     /// Regression test for SignalEvent on static events: exercises the same

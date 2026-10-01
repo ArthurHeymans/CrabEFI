@@ -137,8 +137,12 @@ these commands; they consume the checked-in image selected by Cargo.
 # ConvertPointer, and post-SVAM reset (x86-64)
 ./crabefi test --app runtime-image-test --disable-kvm
 
-# Run directory enumeration test
-./crabefi test --app directory-test
+# Run directory enumeration, writable USB mutation and persistence checks
+./crabefi test --app directory-test --disable-kvm
+
+# Verify mutation is rejected on read-only backends
+./crabefi test --app directory-test --ahci --disable-kvm
+./crabefi test --app directory-test --nvme --disable-kvm
 
 # Disable KVM (when running inside a VM)
 ./crabefi test --app hello --disable-kvm
@@ -147,6 +151,13 @@ these commands; they consume the checked-in image selected by Cargo.
 ./crabefi test --arch aarch64 --machine sbsa --app hello --nvme --disable-kvm
 ./crabefi test --arch aarch64 --machine virt --app hello --nvme --disable-kvm
 ```
+
+The directory test uses a disposable disk. USB runs must exercise writes,
+shared handles, truncation and deletion; AHCI/NVMe runs must reject creation.
+After QEMU exits, the harness runs `fsck.fat -n` on a copy of the ESP and uses
+`mtype` to verify the USB run's flushed payload and zero-filled gap independently.
+Both tools come from the existing dosfstools/mtools test dependencies. CI gates
+all three backends; this is not physical-media or power-loss qualification.
 
 ### Interactive QEMU
 
@@ -174,10 +185,21 @@ ci/build-sct-assets.sh --arch x86_64
     --timeout 300
 ```
 
-The initial sequence intentionally exercises only a few low-risk Boot Services
-cases (`Stall`, `CopyMem`, `SetMem`, `CalculateCrc32`, pool allocation/free).
-Add more cases to the generated `smoke.seq` in `xtask/src/disk.rs` as CrabEFI's
-UEFI surface grows.
+The default `ci/sct/smoke.seq` retains the original six Boot Services cases.
+CI additionally gates 46 distinct cases across seven subsystem sequences:
+
+```bash
+./crabefi test --app uefi-sct-smoke --disable-kvm --timeout 900 \
+    --sct-sequence ci/sct/boot-memory.seq \
+    --sct-report-dir target/sct-reports/boot-memory
+```
+
+The selected sequence is the validation manifest; every dispatched instance
+must explicitly pass with zero assertion errors or warnings. Reports are
+retained in a unique directory under the requested report root (default:
+`target/sct-reports/smoke`), including failed runs. See
+[UEFI conformance priorities](UEFI_CONFORMANCE.md) for exact scopes, required
+interface gaps, and why these results are not a complete compliance claim.
 
 ### Windows Boot Manager smoke test
 

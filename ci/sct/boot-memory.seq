@@ -1,0 +1,43 @@
+# boot-memory: edk2-test-stable202509, x86_64/Q35. See docs/UEFI_CONFORMANCE.md.
+
+[Test Case]
+Revision = 0x00010000
+Guid = 2C437186-D178-40CF-A7B1-A2E86AF06D86
+Name = GetMemoryMap_Conf
+Order = 0x00000000
+Iterations = 0x00000001
+
+[Test Case]
+Revision = 0x00010000
+Guid = 4E87315F-BAD6-4B90-88C3-2972B1F9ACBE
+Name = AllocatePages_Conf
+Order = 0x00000001
+Iterations = 0x00000001
+
+[Test Case]
+Revision = 0x00010000
+Guid = F30940B6-DE0D-47B2-BEBE-E1C20C9213E9
+Name = FreePages_Conf
+Order = 0x00000002
+Iterations = 0x00000001
+
+[Test Case]
+Revision = 0x00010000
+Guid = 90023546-6C92-430A-B253-70110D9EFDFF
+Name = AllocatePool_Conf
+Order = 0x00000003
+Iterations = 0x00000001
+
+[Test Case]
+Revision = 0x00010000
+Guid = 49709F9F-A4D8-42D6-A684-4975EE0099DB
+Name = FreePool_Conf
+Order = 0x00000004
+Iterations = 0x00000001
+
+[Test Case]
+Revision = 0x00010000
+Guid = 0CDE8BE7-85DC-4E7C-A584-566A643A3562
+Name = GetMemoryMap_Func
+Order = 0x00000005
+Iterations = 0x00000001

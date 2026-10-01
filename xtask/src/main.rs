@@ -190,6 +190,14 @@ enum Commands {
         #[arg(long)]
         sct_assets_dir: Option<PathBuf>,
 
+        /// SCT sequence to run instead of ci/sct/smoke.seq.
+        #[arg(long, requires = "sct_report_dir")]
+        sct_sequence: Option<PathBuf>,
+
+        /// Directory for SCT serial output, summary, and detailed reports.
+        #[arg(long)]
+        sct_report_dir: Option<PathBuf>,
+
         /// Raw Windows/WinPE disk image for --app windows-boot-smoke.
         /// Defaults to windows-assets/<arch>/windows-smoke.img.
         #[arg(long)]
@@ -309,6 +317,8 @@ fn main() -> Result<()> {
             ui,
             boot_assets_dir,
             sct_assets_dir,
+            sct_sequence,
+            sct_report_dir,
             windows_disk,
             windows_media_dir,
             windows_success_markers,
@@ -325,6 +335,8 @@ fn main() -> Result<()> {
             machine,
             boot_assets_dir,
             sct_assets_dir,
+            sct_sequence,
+            sct_report_dir,
             windows_disk,
             windows_media_dir,
             windows_success_markers,
@@ -610,6 +622,8 @@ fn cmd_test(
     machine: Machine,
     boot_assets_dir: Option<PathBuf>,
     sct_assets_dir: Option<PathBuf>,
+    sct_sequence: Option<PathBuf>,
+    sct_report_dir: Option<PathBuf>,
     windows_disk: Option<PathBuf>,
     windows_media_dir: Option<PathBuf>,
     windows_success_markers: Vec<String>,
@@ -623,6 +637,21 @@ fn cmd_test(
     } else {
         qemu::StorageType::Usb
     };
+
+    if app != "uefi-sct-smoke" && (sct_sequence.is_some() || sct_report_dir.is_some()) {
+        bail!("SCT sequence/report options require --app uefi-sct-smoke");
+    }
+    let sequence = sct_sequence
+        .as_deref()
+        .map(resolve_project_path)
+        .map(fs::read_to_string)
+        .transpose()?
+        .unwrap_or_else(|| qemu::sct::SMOKE_SEQUENCE.to_owned());
+    let sequence = qemu::sct::Sequence::parse(&sequence)?;
+    let sct_report_dir = sct_report_dir
+        .as_deref()
+        .map(resolve_project_path)
+        .unwrap_or_else(|| project_root().join("target/sct-reports/smoke"));
 
     // Create temp dir for ROM and disk
     let temp_dir = tempfile::tempdir()?;
@@ -744,6 +773,7 @@ fn cmd_test(
             shell_efi.to_string_lossy().as_ref(),
             &sct_dir,
             arch,
+            &sequence.text,
         )?;
     } else if app == "windows-boot-smoke" {
         if arch != Arch::X86_64 {
@@ -805,7 +835,7 @@ fn cmd_test(
 
     // Run tests
     if app == "uefi-sct-smoke" {
-        qemu::run_uefi_sct_smoke_tests(&config, &disk_path)
+        qemu::run_uefi_sct_smoke_tests(&config, &disk_path, &sequence, &sct_report_dir)
     } else if app == "windows-boot-smoke" {
         let markers = if windows_success_markers.is_empty() {
             vec!["CRABEFI_WINDOWS_BOOT_SMOKE_SUCCESS".to_string()]

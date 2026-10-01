@@ -252,6 +252,47 @@ fn mutation_smoke_test(root: *mut r_efi::protocols::file::Protocol) -> Result<bo
         }
         check(((*reader).close)(reader), "close deleted handle")?;
         check(((*writer).delete)(writer), "delete replacement")?;
+
+        // Leave a closed, flushed sentinel for independent host-side readback.
+        // It preserves the same zero-filled gap exercised above.
+        let mut name = [0u16; 14];
+        for (unit, byte) in name.iter_mut().zip(b"CRABWRITE.BIN") {
+            *unit = (*byte).into();
+        }
+        check(
+            ((*root).open)(
+                root,
+                &mut writer,
+                name.as_mut_ptr(),
+                file::MODE_READ | file::MODE_WRITE | file::MODE_CREATE,
+                0,
+            ),
+            "create persistence sentinel",
+        )?;
+        size = payload.len();
+        check(
+            ((*writer).write)(writer, &mut size, payload.as_mut_ptr().cast()),
+            "write sentinel head",
+        )?;
+        if size != payload.len() {
+            return Err("sentinel head write count");
+        }
+        check(
+            ((*writer).set_position)(writer, 1024),
+            "seek sentinel past EOF",
+        )?;
+        size = tail.len();
+        check(
+            ((*writer).write)(writer, &mut size, tail.as_mut_ptr().cast()),
+            "write sentinel tail",
+        )?;
+        if size != tail.len() {
+            return Err("sentinel tail write count");
+        }
+        check(
+            ((*writer).close)(writer),
+            "close/flush persistence sentinel",
+        )?;
     }
     Ok(true)
 }
@@ -427,8 +468,11 @@ fn run_tests(image_handle: Handle, system_table: *mut SystemTable) -> bool {
         }
     }
 
-    // Close the directory handle
-    unsafe { ((*linux_dir).close)(linux_dir) };
+    // Close the directory handle before mutating the filesystem.
+    if unsafe { ((*linux_dir).close)(linux_dir) } != Status::SUCCESS {
+        println("[FAIL] close enumeration directory");
+        all_ok = false;
+    }
     match mutation_smoke_test(root) {
         Ok(true) => {
             println("[PASS] filesystem_mutation: writes, shared handles, truncate and delete")
@@ -440,7 +484,10 @@ fn run_tests(image_handle: Handle, system_table: *mut SystemTable) -> bool {
             all_ok = false;
         }
     }
-    unsafe { ((*root).close)(root) };
+    if unsafe { ((*root).close)(root) } != Status::SUCCESS {
+        println("[FAIL] close root volume");
+        all_ok = false;
+    }
 
     println("");
 
@@ -511,6 +558,19 @@ pub extern "efiapi" fn efi_main(image_handle: Handle, system_table: *mut SystemT
         println("Directory enumeration test FAILED!");
     }
 
+    // Exit QEMU gracefully after every handle has closed so the host can
+    // inspect the backing disk, rather than relying on timeout's SIGKILL.
+    unsafe {
+        let runtime = (*system_table).runtime_services;
+        if !runtime.is_null() {
+            ((*runtime).reset_system)(
+                efi::RESET_SHUTDOWN,
+                Status::SUCCESS,
+                0,
+                core::ptr::null_mut(),
+            );
+        }
+    }
     Status::SUCCESS
 }
 

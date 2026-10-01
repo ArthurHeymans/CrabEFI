@@ -744,7 +744,7 @@ extern "efiapi" fn new_string(
     string_font_info: *const hii_string::Info,
 ) -> Status {
     // Fonts are not implemented, so no supplied font exists in this database.
-    if string_id.is_null() || !string_font_info.is_null() {
+    if package_list.is_null() || string_id.is_null() || !string_font_info.is_null() {
         return Status::INVALID_PARAMETER;
     }
     let Some(language) = (unsafe { language_bytes(language) }) else {
@@ -796,7 +796,7 @@ extern "efiapi" fn get_string(
     string_size: *mut usize,
     string_font_info: *mut *mut hii_string::Info,
 ) -> Status {
-    if string_id == 0 || string_size.is_null() {
+    if package_list.is_null() || string_id == 0 || string_size.is_null() {
         return Status::INVALID_PARAMETER;
     }
     let Some(language_value) = (unsafe { language_bytes(language) }) else {
@@ -873,7 +873,7 @@ extern "efiapi" fn set_string(
     string: *mut Char16,
     string_font_info: *const hii_string::Info,
 ) -> Status {
-    if string_id == 0 || !string_font_info.is_null() {
+    if package_list.is_null() || string_id == 0 || !string_font_info.is_null() {
         return Status::INVALID_PARAMETER;
     }
     let Some(language) = (unsafe { language_bytes(language) }) else {
@@ -1002,7 +1002,7 @@ extern "efiapi" fn get_languages(
     languages: *mut Char8,
     languages_size: *mut usize,
 ) -> Status {
-    if languages_size.is_null() {
+    if package_list.is_null() || languages_size.is_null() {
         return Status::INVALID_PARAMETER;
     }
     let database = DATABASE.borrow();
@@ -1023,7 +1023,7 @@ extern "efiapi" fn get_secondary_languages(
     secondary_languages: *mut Char8,
     secondary_languages_size: *mut usize,
 ) -> Status {
-    if requested_primary.is_null() || secondary_languages_size.is_null() {
+    if package_list.is_null() || requested_primary.is_null() || secondary_languages_size.is_null() {
         return Status::INVALID_PARAMETER;
     }
     let Some(primary) = (unsafe { language_bytes(requested_primary) }) else {
@@ -1103,6 +1103,60 @@ mod tests {
         assert_eq!(find_string_in_package(&package, 3), Some(ascii("bc")));
         assert_eq!(find_string_in_package(&package, 4), None);
         assert_eq!(max_string_id_in_package(&package), Some(3));
+    }
+
+    #[test]
+    fn string_protocol_rejects_null_package_handles() {
+        let language = b"en-US\0".as_ptr().cast();
+        let mut value = [0x41u16, 0];
+        let mut id = 1;
+        let mut size = core::mem::size_of_val(&value);
+        let mut languages = [0; 16];
+        assert_eq!(
+            [
+                new_string(
+                    ptr::null(),
+                    ptr::null_mut(),
+                    &mut id,
+                    language,
+                    ptr::null(),
+                    value.as_mut_ptr(),
+                    ptr::null(),
+                ),
+                get_string(
+                    ptr::null(),
+                    language,
+                    ptr::null_mut(),
+                    id,
+                    value.as_mut_ptr(),
+                    &mut size,
+                    ptr::null_mut(),
+                ),
+                set_string(
+                    ptr::null(),
+                    ptr::null_mut(),
+                    id,
+                    language,
+                    value.as_mut_ptr(),
+                    ptr::null(),
+                ),
+                get_languages(
+                    ptr::null(),
+                    ptr::null_mut(),
+                    languages.as_mut_ptr(),
+                    &mut size
+                ),
+                get_secondary_languages(
+                    ptr::null(),
+                    ptr::null_mut(),
+                    language,
+                    languages.as_mut_ptr(),
+                    &mut size,
+                ),
+            ],
+            [Status::INVALID_PARAMETER; 5]
+        );
+        assert_eq!(id, 1);
     }
 
     #[test]

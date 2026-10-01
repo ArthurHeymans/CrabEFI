@@ -1084,6 +1084,11 @@ impl MemoryAllocator {
         descriptor_size: &mut usize,
         descriptor_version: &mut u32,
     ) -> efi::Status {
+        // A null buffer is a size query only when the caller supplies zero.
+        // Otherwise GetMemoryMap must report an invalid output parameter.
+        if memory_map.is_none() && *memory_map_size != 0 {
+            return efi::Status::INVALID_PARAMETER;
+        }
         let entry_size = core::mem::size_of::<MemoryDescriptor>();
 
         *descriptor_size = entry_size;
@@ -1927,6 +1932,47 @@ pub fn reserve_boot_image_region() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn memory_map_null_buffer_distinguishes_query_from_invalid_output() {
+        let allocator = allocator_with_ram();
+        let (mut size, mut key, mut descriptor_size, mut version) = (0, 0, 0, 0);
+        assert_eq!(
+            allocator.get_memory_map(
+                &mut size,
+                None,
+                &mut key,
+                &mut descriptor_size,
+                &mut version
+            ),
+            efi::Status::BUFFER_TOO_SMALL
+        );
+        let required = size;
+        assert_eq!(required, core::mem::size_of::<MemoryDescriptor>());
+        assert_eq!(
+            allocator.get_memory_map(
+                &mut size,
+                None,
+                &mut key,
+                &mut descriptor_size,
+                &mut version
+            ),
+            efi::Status::INVALID_PARAMETER
+        );
+        assert_eq!(size, required);
+        let mut map = [memory_descriptor(MemoryType::ConventionalMemory, 0, 0, 0)];
+        assert_eq!(
+            allocator.get_memory_map(
+                &mut size,
+                Some(&mut map),
+                &mut key,
+                &mut descriptor_size,
+                &mut version
+            ),
+            efi::Status::SUCCESS
+        );
+        assert_eq!(map[0].physical_start, 0x10_0000);
+    }
 
     fn allocator_with_ram() -> MemoryAllocator {
         let mut allocator = MemoryAllocator::new();
