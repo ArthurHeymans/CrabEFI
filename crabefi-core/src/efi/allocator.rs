@@ -1084,11 +1084,6 @@ impl MemoryAllocator {
         descriptor_size: &mut usize,
         descriptor_version: &mut u32,
     ) -> efi::Status {
-        // A null buffer is a size query only when the caller supplies zero.
-        // Otherwise GetMemoryMap must report an invalid output parameter.
-        if memory_map.is_none() && *memory_map_size != 0 {
-            return efi::Status::INVALID_PARAMETER;
-        }
         let entry_size = core::mem::size_of::<MemoryDescriptor>();
 
         *descriptor_size = entry_size;
@@ -1097,6 +1092,12 @@ impl MemoryAllocator {
 
         let merged_count = self.count_merged_entries();
         let required_size = merged_count * entry_size;
+
+        // An undersized null buffer is still a size query, even when the
+        // supplied size is nonzero. Reject null only once it could fit the map.
+        if memory_map.is_none() && *memory_map_size >= required_size {
+            return efi::Status::INVALID_PARAMETER;
+        }
 
         if let Some(map) = memory_map {
             if core::mem::size_of_val(map) < required_size {
@@ -1949,6 +1950,20 @@ mod tests {
         );
         let required = size;
         assert_eq!(required, core::mem::size_of::<MemoryDescriptor>());
+        for supplied in [1, required - 1] {
+            size = supplied;
+            assert_eq!(
+                allocator.get_memory_map(
+                    &mut size,
+                    None,
+                    &mut key,
+                    &mut descriptor_size,
+                    &mut version
+                ),
+                efi::Status::BUFFER_TOO_SMALL
+            );
+            assert_eq!(size, required);
+        }
         assert_eq!(
             allocator.get_memory_map(
                 &mut size,

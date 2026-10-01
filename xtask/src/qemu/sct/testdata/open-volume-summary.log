@@ -1,0 +1,89 @@
+------------------------------------------------------------
+OpenVolume_Func
+Revision 0x00010000
+Test Entry Point GUID: 3E59FED4-426A-4E00-8787-68A20F80B0B7
+Test Support Library GUIDs: 
+  1F9C2AE7-F147-4D19-A5E8-255AD005EB3E
+------------------------------------------------------------
+UEFI 2.6
+Test Configuration #0
+------------------------------------------------------------
+Function Test for OpenVolume
+------------------------------------------------------------
+Logfile: "\Sct\Overall\Summary.log"
+Test Started: 10/01/26  12:14p
+------------------------------------------------------------
+OpenVolume() Basic Test - checkpoint1 -- PASS
+E1BBBE46-1FE6-4F0B-8D2E-1B945C16F487
+C:\sct_workspace\edk2\SctPkg\TestCase\UEFI\EFI\Protocol\SimpleFileSystem\BlackBoxTest\SimpleFileSystemBBTestFunction.c:1814: OpenVolume Status - Success, TPL - 4
+
+OpenVolume() Basic Test - checkpoint1 -- PASS
+E4D6498C-C4D5-4DD2-9388-3C7BD2949B4C
+C:\sct_workspace\edk2\SctPkg\TestCase\UEFI\EFI\Protocol\SimpleFileSystem\BlackBoxTest\SimpleFileSystemBBTestFunction.c:1843: GetInfo (Fileinfo) Status - Success, TPL - 4
+
+OpenVolume() Basic Test - checkpoint1 -- PASS
+ACF4BB1E-292B-46A5-9D98-ACA10402431C
+C:\sct_workspace\edk2\SctPkg\TestCase\UEFI\EFI\Protocol\SimpleFileSystem\BlackBoxTest\SimpleFileSystemBBTestFunction.c:1870: Root's Attribute - 0x10, TPL - 4
+
+OpenVolume() Basic Test - checkpoint1 -- PASS
+21746222-29C8-4B78-873E-354E582679DE
+C:\sct_workspace\edk2\SctPkg\TestCase\UEFI\EFI\Protocol\SimpleFileSystem\BlackBoxTest\SimpleFileSystemBBTestFunction.c:1899: GetInfo (SystemInfo) Status - Success, TPL - 4
+
+OpenVolume() Basic Test - checkpoint1 -- PASS
+31B71760-BE9C-47AA-8C49-4CCF3344579F
+C:\sct_workspace\edk2\SctPkg\TestCase\UEFI\EFI\Protocol\SimpleFileSystem\BlackBoxTest\SimpleFileSystemBBTestFunction.c:1927: GetInfo (VolumeLabel) Status - Success, TPL - 4
+
+OpenVolume() Basic Test - checkpoint1 -- PASS
+943883D4-B2C6-4041-98AB-342F9C248C0C
+C:\sct_workspace\edk2\SctPkg\TestCase\UEFI\EFI\Protocol\SimpleFileSystem\BlackBoxTest\SimpleFileSystemBBTestFunction.c:1954: Compare (VolumeLabel), TPL - 4
+
+OpenVolume() Basic Test - checkpoint1 -- PASS
+2B9FE6A3-D6B0-4AB9-9E92-BE93BA4FCDE1
+C:\sct_workspace\edk2\SctPkg\TestCase\UEFI\EFI\Protocol\SimpleFileSystem\BlackBoxTest\SimpleFileSystemBBTestFunction.c:1989: Delete Root Status- Warning Delete Failure, TPL - 4
+
+OpenVolume() Basic Test - checkpoint1 -- PASS
+DF0CC997-16B5-4F26-9F95-B5535C73E686
+C:\sct_workspace\edk2\SctPkg\TestCase\UEFI\EFI\Protocol\SimpleFileSystem\BlackBoxTest\SimpleFileSystemBBTestFunction.c:1814: OpenVolume Status - Success, TPL - 8
+
+OpenVolume() Basic Test - checkpoint1 -- PASS
+ECA437CE-CCA2-4F7D-B055-42997846E55C
+C:\sct_workspace\edk2\SctPkg\TestCase\UEFI\EFI\Protocol\SimpleFileSystem\BlackBoxTest\SimpleFileSystemBBTestFunction.c:1843: GetInfo (Fileinfo) Status - Success, TPL - 8
+
+OpenVolume() Basic Test - checkpoint1 -- PASS
+7639775E-B879-4C64-87DE-966BB776B86B
+C:\sct_workspace\edk2\SctPkg\TestCase\UEFI\EFI\Protocol\SimpleFileSystem\BlackBoxTest\SimpleFileSystemBBTestFunction.c:1870: Root's Attribute - 0x10, TPL - 8
+
+OpenVolume() Basic Test - checkpoint1 -- PASS
+454082D8-05B5-48DF-B091-99B7DD870510
+C:\sct_workspace\edk2\SctPkg\TestCase\UEFI\EFI\Protocol\SimpleFileSystem\BlackBoxTest\SimpleFileSystemBBTestFunction.c:1899: GetInfo (SystemInfo) Status - Success, TPL - 8
+
+OpenVolume() Basic Test - checkpoint1 -- PASS
+7853B6A4-66BA-4D50-A906-D79A12A9218E
+C:\sct_workspace\edk2\SctPkg\TestCase\UEFI\EFI\Protocol\SimpleFileSystem\BlackBoxTest\SimpleFileSystemBBTestFunction.c:1927: GetInfo (VolumeLabel) Status - Success, TPL - 8
+
+OpenVolume() Basic Test - checkpoint1 -- PASS
+6FDEB4E4-E12D-4C6B-8E8C-CD83340B1FE6
+C:\sct_workspace\edk2\SctPkg\TestCase\UEFI\EFI\Protocol\SimpleFileSystem\BlackBoxTest\SimpleFileSystemBBTestFunction.c:1954: Compare (VolumeLabel), TPL - 8
+
+OpenVolume() Basic Test - checkpoint1 -- PASS
+F958F344-A399-437E-A885-29AB58E68891
+C:\sct_workspace\edk2\SctPkg\TestCase\UEFI\EFI\Protocol\SimpleFileSystem\BlackBoxTest\SimpleFileSystemBBTestFunction.c:1989: Delete Root Status- Warning Delete Failure, TPL - 8
+
+
+Returned Status Code: Success
+
+OpenVolume_Func: [PASSED]
+  Passes........... 14
+  Warnings......... 0
+  Errors........... 0
+------------------------------------------------------------
+UEFI 2.6
+Revision 0x00010000
+Test Entry Point GUID: 3E59FED4-426A-4E00-8787-68A20F80B0B7
+------------------------------------------------------------
+Logfile: "\Sct\Overall\Summary.log"
+Test Finished: 10/01/26  12:14p
+Elapsed Time: 00 Days 00:00:05
+
+------------------------------------------------------------
+------------------------------------------------------------

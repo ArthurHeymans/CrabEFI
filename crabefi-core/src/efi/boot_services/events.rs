@@ -111,7 +111,8 @@ pub(super) extern "efiapi" fn create_event(
     let notifies = event_type & (EVT_NOTIFY_WAIT | EVT_NOTIFY_SIGNAL) != 0;
     if notifies
         && (notify_function.is_none()
-            || (notify_tpl != efi::TPL_CALLBACK && notify_tpl != efi::TPL_NOTIFY))
+            || notify_tpl <= efi::TPL_APPLICATION
+            || notify_tpl >= efi::TPL_HIGH_LEVEL)
     {
         return Status::INVALID_PARAMETER;
     }
@@ -605,6 +606,7 @@ mod tests {
         let _execution = crate::efi::boot_services::IMAGE_EXECUTION_TEST_LOCK
             .lock()
             .unwrap();
+        crate::efi::tables::init_caches().unwrap();
         let sentinel = core::ptr::dangling_mut::<u8>().cast();
         let mut event = sentinel;
         for event_type in [
@@ -639,7 +641,7 @@ mod tests {
                 ),
                 Status::INVALID_PARAMETER
             );
-            for tpl in [0, efi::TPL_APPLICATION, 7, 9, 15, 17, efi::TPL_HIGH_LEVEL] {
+            for tpl in [0, 3, efi::TPL_APPLICATION, efi::TPL_HIGH_LEVEL] {
                 assert_eq!(
                     create_event(
                         event_type,
@@ -651,6 +653,29 @@ mod tests {
                     Status::INVALID_PARAMETER
                 );
                 assert_eq!(event, sentinel);
+            }
+            for tpl in [
+                7,
+                efi::TPL_CALLBACK,
+                9,
+                15,
+                efi::TPL_NOTIFY,
+                17,
+                efi::TPL_HIGH_LEVEL - 1,
+            ] {
+                assert_eq!(
+                    create_event(
+                        event_type,
+                        tpl,
+                        Some(notify),
+                        core::ptr::null_mut(),
+                        &mut event
+                    ),
+                    Status::SUCCESS
+                );
+                assert_ne!(event, sentinel);
+                assert_eq!(close_event(event), Status::SUCCESS);
+                event = sentinel;
             }
         }
     }

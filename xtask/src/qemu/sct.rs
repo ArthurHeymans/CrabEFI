@@ -8,6 +8,7 @@ pub(crate) const SMOKE_SEQUENCE: &str = include_str!("../../../ci/sct/smoke.seq"
 pub(crate) struct Sequence {
     pub text: String,
     pub names: Vec<String>,
+    guids: BTreeMap<String, String>,
 }
 
 impl Sequence {
@@ -21,6 +22,7 @@ impl Sequence {
             "unexpected SCT sequence preamble"
         );
         let mut guids = BTreeSet::new();
+        let mut guid_by_name = BTreeMap::new();
         let names = sections
             .enumerate()
             .map(|(index, section)| {
@@ -47,11 +49,10 @@ impl Sequence {
                 };
                 let number = |name| -> Result<u64> {
                     let value = field(name)?;
-                    Ok(if let Some(hex) = value.strip_prefix("0x") {
-                        u64::from_str_radix(hex, 16)?
-                    } else {
-                        value.parse()?
-                    })
+                    let hex = value
+                        .strip_prefix("0x")
+                        .context("SCT numeric fields require a 0x prefix")?;
+                    Ok(u64::from_str_radix(hex, 16)?)
                 };
                 ensure!(
                     number("Revision")? == 0x10000,
@@ -89,6 +90,7 @@ impl Sequence {
                             .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_'),
                     "invalid SCT test name"
                 );
+                guid_by_name.insert(name.to_owned(), guid.to_ascii_lowercase());
                 Ok(name.to_owned())
             })
             .collect::<Result<Vec<_>>>()?;
@@ -103,6 +105,7 @@ impl Sequence {
         Ok(Self {
             text: text.to_owned(),
             names,
+            guids: guid_by_name,
         })
     }
 }
@@ -226,16 +229,50 @@ pub(super) fn validate(serial: &str, summary: &str, sequence: &Sequence) -> Resu
     }
     let instances = dispatched_instances(&serial[start..done], sequence)?;
     let lines: Vec<_> = summary.lines().map(str::trim).collect();
+    // StandardTest repeats the GUID in each block's opening header and
+    // closing footer. Require both, in order, around exactly one result.
+    enum SummaryBlock<'a> {
+        Idle,
+        Open(&'a str),
+        Resulted(&'a str),
+    }
+    let mut block = SummaryBlock::Idle;
     for line in &lines {
-        if let Some((name, status)) = line.split_once(':') {
-            if status.trim().starts_with('[') {
-                ensure!(
-                    instances.contains_key(name.trim()),
-                    "unexpected SCT result {name}"
-                );
-            }
+        if let Some(guid) = line.strip_prefix("Test Entry Point GUID:") {
+            let guid = guid.trim();
+            block = match block {
+                SummaryBlock::Idle => SummaryBlock::Open(guid),
+                SummaryBlock::Open(_) => anyhow::bail!("SCT test header without a result"),
+                SummaryBlock::Resulted(expected) => {
+                    ensure!(
+                        guid.eq_ignore_ascii_case(expected),
+                        "SCT footer GUID mismatch"
+                    );
+                    SummaryBlock::Idle
+                }
+            };
+        }
+        if let Some((name, status)) = line.split_once(':')
+            && status.trim().starts_with('[')
+        {
+            let expected = sequence
+                .guids
+                .get(name.trim())
+                .with_context(|| format!("unexpected SCT result {name}"))?;
+            let SummaryBlock::Open(guid) = block else {
+                anyhow::bail!("SCT result missing its GUID header");
+            };
+            ensure!(
+                guid.eq_ignore_ascii_case(expected),
+                "{name}: SCT result GUID does not match the manifest"
+            );
+            block = SummaryBlock::Resulted(guid);
         }
     }
+    ensure!(
+        matches!(block, SummaryBlock::Idle),
+        "truncated SCT test result"
+    );
     for name in &sequence.names {
         let results: Vec<_> = lines
             .iter()
@@ -290,10 +327,43 @@ mod tests {
         super::validate(serial, summary, &Sequence::parse(SMOKE_SEQUENCE)?).map(|_| ())
     }
     fn summary() -> String {
-        Sequence::parse(SMOKE_SEQUENCE).unwrap().names.iter().map(|name| format!(
-            "{name}\nReturned Status Code: Success\n{name}: [PASSED]\n  Passes........... 12\n  Warnings......... 0\n  Errors........... 0\n"
+        let sequence = Sequence::parse(SMOKE_SEQUENCE).unwrap();
+        sequence.names.iter().map(|name| format!(
+            "{name}\nTest Entry Point GUID: {guid}\nReturned Status Code: Success\n{name}: [PASSED]\n  Passes........... 12\n  Warnings......... 0\n  Errors........... 0\n------------------------------------------------------------\nUEFI 2.6\nRevision 0x00010000\nTest Entry Point GUID: {guid}\n------------------------------------------------------------\n",
+            guid = sequence.guids[name]
         )).collect()
     }
+    #[test]
+    fn real_summary_requires_matching_header_result_and_footer() {
+        let text = include_str!("../../../ci/sct/filesystem.seq")
+            .split("\n\n")
+            .take(2)
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        let sequence = Sequence::parse(&text).unwrap();
+        let serial = "CRABEFI_SCT_SMOKE_START\nProtocol test: OpenVolume_Func\nInstances: 1/1\nIterations: 1/1\nDone!\nCRABEFI_SCT_SMOKE_DONE";
+        let good = include_str!("sct/testdata/open-volume-summary.log");
+        assert_eq!(super::validate(serial, good, &sequence).unwrap(), 1);
+        let footer = good.rfind("Test Entry Point GUID:").unwrap();
+        let mut mismatched = good.to_owned();
+        let guid_start = footer + "Test Entry Point GUID: ".len();
+        mismatched.replace_range(
+            guid_start..guid_start + 36,
+            "539675B8-D9B3-4DC7-A8D0-FF19BBA13B86",
+        );
+        for bad in [
+            mismatched.as_str(),
+            &good[..footer],
+            "Test Entry Point GUID: 3E59FED4-426A-4E00-8787-68A20F80B0B7\n",
+            "OpenVolume_Func: [PASSED]\n",
+        ] {
+            assert!(
+                super::validate(serial, bad, &sequence).is_err(),
+                "accepted {bad}"
+            );
+        }
+    }
+
     #[test]
     fn checked_in_sequences_are_well_formed() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../ci/sct");
@@ -316,6 +386,7 @@ mod tests {
         assert_eq!(sequence.names.len(), 6);
         for bad in [
             String::new(),
+            SMOKE_SEQUENCE.replace("0x00000001", "1"),
             SMOKE_SEQUENCE.replace("Iterations = 0x00000001", "Iterations = 0x00000002"),
             SMOKE_SEQUENCE.replace("Order      = 0x00000005", "Order      = 0x00000004"),
             SMOKE_SEQUENCE.replace("FreePool_Conf", "AllocatePool_Conf"),
@@ -358,6 +429,16 @@ mod tests {
         validate(SERIAL, &good.replace('\n', "\r\n")).unwrap();
         for bad in [
             good.replace("[PASSED]", "[FAILED]"),
+            good.replace(
+                "539675b8-d9b3-4dc7-a8d0-ff19bba13b86",
+                "4397a610-8d5d-441b-8e7d-c23377f3eb67",
+            ),
+            good.replace("Test Entry Point GUID:", "Missing GUID:"),
+            good.replace(
+                "Test Entry Point GUID:",
+                "Test Entry Point GUID: INVALID\nTest Entry Point GUID:",
+            ),
+            format!("{good}\nTest Entry Point GUID: 539675b8-d9b3-4dc7-a8d0-ff19bba13b86\n"),
             good.replace("Errors........... 0", "Errors........... 10"),
             good.replace("Errors........... 0", "Errors........... unknown"),
             good.replace("Warnings......... 0", "Warnings......... 1"),
@@ -371,7 +452,7 @@ mod tests {
             format!("{good}\nStall_Func: [PASSED]\n"),
             format!("{good}\nassertion -- FAIL\n"),
             format!("{good}\nFailures: 123\n"),
-            good[..good.len() - 6].to_owned(),
+            good[..good.rfind("Test Entry Point GUID:").unwrap()].to_owned(),
             String::new(),
         ] {
             assert!(validate(SERIAL, &bad).is_err(), "accepted: {bad}");

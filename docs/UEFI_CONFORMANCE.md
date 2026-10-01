@@ -34,7 +34,8 @@ reason to implement the entire EDK2 driver ecosystem.
 - Keep explicit, version-pinned sequences, not "run whatever tests happen to
   discover a protocol". The sequence is also the validation manifest.
 - Every selected case must have an explicit successful terminal result for each
-  dispatched instance, positive assertion passes, zero errors and zero warnings.
+  dispatched instance, a matching test-entry GUID, positive assertion passes,
+  zero errors and zero warnings.
   Protocol cases legitimately repeat per handle: require complete sequential
   instance dispatch and the exact result count. Missing/skipped, unsupported,
   extra or truncated results are not passes.
