@@ -179,6 +179,72 @@ cases (`Stall`, `CopyMem`, `SetMem`, `CalculateCrc32`, pool allocation/free).
 Add more cases to the generated `smoke.seq` in `xtask/src/disk.rs` as CrabEFI's
 UEFI surface grows.
 
+### Windows Boot Manager smoke test
+
+CrabEFI can also run a Windows/WinPE boot smoke test in QEMU. The preferred
+public-source path builds WinPE media from Microsoft's official Windows ADK and
+Windows PE add-on, then boots that media through CrabEFI and Windows Boot
+Manager. The generated WinPE image writes a deterministic marker to COM1 after
+`startnet.cmd` runs.
+
+The default marker is `CRABEFI_WINDOWS_BOOT_SMOKE_SUCCESS`. Generated WinPE
+markers must be nonempty printable ASCII. Success markers must not contain a
+failure marker such as `Recovery`, `Access Denied`, or `Status: 0xc000`.
+
+Build the WinPE media on Windows:
+
+```powershell
+ci/build-winpe-smoke-media.ps1 `
+    -Arch x86_64 `
+    -OutputDir windows-assets/x86_64/media `
+    -SuccessMarker CRABEFI_WINDOWS_BOOT_SMOKE_SUCCESS
+```
+
+Then run the smoke test from Linux:
+
+```bash
+./crabefi test --app windows-boot-smoke \
+    --windows-media-dir windows-assets/x86_64/media \
+    --windows-success-marker CRABEFI_WINDOWS_BOOT_SMOKE_SUCCESS \
+    --nvme \
+    --disable-kvm \
+    --timeout 900
+```
+
+For custom Windows or WinPE images, you can also pass a raw disk image instead:
+
+```bash
+./crabefi test --app windows-boot-smoke --windows-disk path/to/windows-smoke.img
+```
+
+If no explicit path is passed, the xtask looks for
+`windows-assets/x86_64/media` first, then `windows-assets/x86_64/windows-smoke.img`.
+Raw disk images are copied into a temporary directory before boot so the source
+artifact is not modified by QEMU.
+
+The GitHub Actions job is intentionally optional and runs only on pushes to
+`main` or `master`, never on PRs. Build and validate the media locally first,
+then package its contents (not the enclosing `media` directory):
+
+```bash
+tar -czf winpe-media.tar.gz -C windows-assets/x86_64/media .
+```
+
+Store this archive on an authenticated private HTTPS endpoint. Configure
+repository secrets `WINDOWS_SMOKE_MEDIA_URL` and `WINDOWS_SMOKE_MEDIA_TOKEN`
+(the endpoint must accept `Authorization: Bearer <token>`), then opt in with
+`ENABLE_WINDOWS_SMOKE=true`. The job fails if either secret is missing. The
+optional `WINDOWS_SMOKE_SUCCESS_MARKER` repository variable overrides the
+default serial marker and must match the provisioned media.
+
+WinPE media is **never stored in GitHub Actions caches or artifacts**: fork PRs
+can restore base-branch caches, regardless of the producing job's event guard.
+If upgrading from the earlier cache-based workflow, delete all
+`winpe-smoke-x86_64-*` caches before relying on this policy. Operators remain
+responsible for the media's licensing and private-storage access controls.
+Keep the job disabled until an actual successful Windows boot is obtained;
+a skipped job is not Windows validation.
+
 ### Test Applications
 
 Test apps live in `test-apps/` and target `x86_64-unknown-uefi` / `aarch64-unknown-uefi`:

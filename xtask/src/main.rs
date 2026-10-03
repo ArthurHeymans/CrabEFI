@@ -23,6 +23,7 @@ mod runtime;
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
@@ -151,6 +152,7 @@ enum Commands {
         ///
         /// Use "grub-linux" for the GRUB + Linux boot-chain test.
         /// Use "uefi-sct-smoke" for the UEFI SCT smoke subset.
+        /// Use "windows-boot-smoke" for a Windows Boot Manager smoke test.
         #[arg(long, default_value = "hello")]
         app: String,
 
@@ -187,6 +189,21 @@ enum Commands {
         /// Required when --app uefi-sct-smoke is used unless sct-assets/<arch> exists.
         #[arg(long)]
         sct_assets_dir: Option<PathBuf>,
+
+        /// Raw Windows/WinPE disk image for --app windows-boot-smoke.
+        /// Defaults to windows-assets/<arch>/windows-smoke.img.
+        #[arg(long)]
+        windows_disk: Option<PathBuf>,
+
+        /// Windows/WinPE boot media directory for --app windows-boot-smoke.
+        /// Defaults to windows-assets/<arch>/media if present.
+        #[arg(long)]
+        windows_media_dir: Option<PathBuf>,
+
+        /// Serial output marker that indicates a successful Windows smoke boot.
+        /// May be passed multiple times; any matching marker passes the test.
+        #[arg(long = "windows-success-marker")]
+        windows_success_markers: Vec<String>,
     },
 
     /// Take a screenshot of the graphical UI in headless QEMU
@@ -292,6 +309,9 @@ fn main() -> Result<()> {
             ui,
             boot_assets_dir,
             sct_assets_dir,
+            windows_disk,
+            windows_media_dir,
+            windows_success_markers,
         } => cmd_test(
             coreboot_rom,
             &app,
@@ -305,6 +325,9 @@ fn main() -> Result<()> {
             machine,
             boot_assets_dir,
             sct_assets_dir,
+            windows_disk,
+            windows_media_dir,
+            windows_success_markers,
         ),
         Commands::Screenshot {
             out,
@@ -559,6 +582,20 @@ fn cmd_screenshot(
     qemu::run_screenshot(&config, None, Path::new(out), timeout_s)
 }
 
+fn windows_source_media_dir(
+    disk: Option<&Path>,
+    media: Option<&Path>,
+    default_assets: &Path,
+) -> Option<PathBuf> {
+    media.map(resolve_project_path).or_else(|| {
+        if disk.is_some() {
+            return None;
+        }
+        let path = default_assets.join("media");
+        path.exists().then_some(path)
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 fn cmd_test(
     coreboot_rom: Option<String>,
@@ -573,6 +610,9 @@ fn cmd_test(
     machine: Machine,
     boot_assets_dir: Option<PathBuf>,
     sct_assets_dir: Option<PathBuf>,
+    windows_disk: Option<PathBuf>,
+    windows_media_dir: Option<PathBuf>,
+    windows_success_markers: Vec<String>,
 ) -> Result<()> {
     let storage = if ahci {
         qemu::StorageType::Ahci
@@ -705,6 +745,46 @@ fn cmd_test(
             &sct_dir,
             arch,
         )?;
+    } else if app == "windows-boot-smoke" {
+        if arch != Arch::X86_64 {
+            bail!("Windows boot smoke is currently wired for x86_64 only");
+        }
+
+        let default_assets_dir = project_root().join("windows-assets").join(arch.dir_name());
+        let source_media_dir = windows_source_media_dir(
+            windows_disk.as_deref(),
+            windows_media_dir.as_deref(),
+            &default_assets_dir,
+        );
+        let source_disk = windows_disk
+            .as_deref()
+            .map(resolve_project_path)
+            .unwrap_or_else(|| default_assets_dir.join("windows-smoke.img"));
+
+        if let Some(media_dir) = source_media_dir {
+            disk::create_windows_media_disk(
+                disk_path.to_string_lossy().as_ref(),
+                &media_dir,
+                arch,
+            )?;
+        } else if source_disk.exists() {
+            println!("Copying Windows smoke disk: {}", source_disk.display());
+            fs::copy(&source_disk, &disk_path).with_context(|| {
+                format!(
+                    "failed to copy Windows smoke disk {} to {}",
+                    source_disk.display(),
+                    disk_path.display()
+                )
+            })?;
+        } else {
+            bail!(
+                "Windows smoke assets not found.\n\
+                 Provide --windows-media-dir, provide --windows-disk, \
+                 or place assets at windows-assets/{}/media or windows-assets/{}/windows-smoke.img",
+                arch.dir_name(),
+                arch.dir_name(),
+            );
+        }
     } else {
         // ── Normal UEFI test app ─────────────────────────────────────
         println!("Building test app: {}", app);
@@ -726,6 +806,13 @@ fn cmd_test(
     // Run tests
     if app == "uefi-sct-smoke" {
         qemu::run_uefi_sct_smoke_tests(&config, &disk_path)
+    } else if app == "windows-boot-smoke" {
+        let markers = if windows_success_markers.is_empty() {
+            vec!["CRABEFI_WINDOWS_BOOT_SMOKE_SUCCESS".to_string()]
+        } else {
+            windows_success_markers
+        };
+        qemu::run_windows_boot_smoke_test(&config, &disk_path, &markers)
     } else {
         qemu::run_tests(&config, &disk_path, app)
     }
@@ -936,4 +1023,30 @@ fn find_test_app_efi(name: &str, arch: Arch) -> Result<String> {
     }
 
     anyhow::bail!("No .efi file found in {}", target_dir.display())
+}
+
+#[cfg(test)]
+mod windows_tests {
+    use super::*;
+
+    #[test]
+    fn explicit_disk_precedes_default_media_but_not_explicit_media() {
+        let assets = tempfile::tempdir().unwrap();
+        let media = assets.path().join("media");
+        fs::create_dir(&media).unwrap();
+        let disk = Path::new("custom.img");
+        assert_eq!(
+            windows_source_media_dir(None, None, assets.path()),
+            Some(media)
+        );
+        assert_eq!(
+            windows_source_media_dir(Some(disk), None, assets.path()),
+            None
+        );
+        let explicit_media = assets.path().join("custom-media");
+        assert_eq!(
+            windows_source_media_dir(Some(disk), Some(&explicit_media), assets.path()),
+            Some(explicit_media)
+        );
+    }
 }
