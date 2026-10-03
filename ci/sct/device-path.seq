@@ -1,0 +1,78 @@
+# device-path: edk2-test-stable202509, x86_64/Q35. See docs/UEFI_CONFORMANCE.md.
+
+[Test Case]
+Revision = 0x00010000
+Guid = C24C24FA-4A52-4968-BA54-16570F09BCA3
+Name = PathNode_Conf
+Order = 0x00000000
+Iterations = 0x00000001
+
+[Test Case]
+Revision = 0x00010000
+Guid = B09F3CAB-144D-4111-A391-6273AF5E0386
+Name = ConvertTextToDeviceNode_Conformance
+Order = 0x00000001
+Iterations = 0x00000001
+
+[Test Case]
+Revision = 0x00010000
+Guid = 26F7A7B7-A851-401B-80C0-1BDEEAD8E05C
+Name = ConvertTextToDevicePath_Conformance
+Order = 0x00000002
+Iterations = 0x00000001
+
+[Test Case]
+Revision = 0x00010000
+Guid = FA8223CE-039D-4886-8A9F-69D487C36A9D
+Name = ConvertTextToDevicePath_Coverage
+Order = 0x00000003
+Iterations = 0x00000001
+
+[Test Case]
+Revision = 0x00010000
+Guid = A2FBC1F0-35C3-42B9-B81F-5B30E14FFF2E
+Name = GetDevicePathSize_Conformance
+Order = 0x00000004
+Iterations = 0x00000001
+
+[Test Case]
+Revision = 0x00010000
+Guid = 74C9CD0A-348E-4AE4-91A2-7799E5432BBD
+Name = DuplicateDevicePath_Conformance
+Order = 0x00000005
+Iterations = 0x00000001
+
+[Test Case]
+Revision = 0x00010000
+Guid = 6FFC463D-16EE-46DF-B942-0FAD75C983C8
+Name = CreateDeviceNode_Conformance
+Order = 0x00000006
+Iterations = 0x00000001
+
+[Test Case]
+Revision = 0x00010000
+Guid = 88203701-B540-407C-97F0-CA8B2F872180
+Name = AppendDeviceNode_Conformance
+Order = 0x00000007
+Iterations = 0x00000001
+
+[Test Case]
+Revision = 0x00010000
+Guid = 91E4223C-F958-44CB-A65C-C4FD445CD158
+Name = AppendDevicePath_Conformance
+Order = 0x00000008
+Iterations = 0x00000001
+
+[Test Case]
+Revision = 0x00010000
+Guid = 05F7832C-F274-4D65-B869-7B361F079EAA
+Name = AppendDevicePathInstance_Conformance
+Order = 0x00000009
+Iterations = 0x00000001
+
+[Test Case]
+Revision = 0x00010000
+Guid = 3DDC0D17-610E-48EE-B2B7-5C10FAD2C8F5
+Name = GetNextDevicePathInstance_Conformance
+Order = 0x0000000a
+Iterations = 0x00000001

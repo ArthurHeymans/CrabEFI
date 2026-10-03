@@ -68,6 +68,33 @@ pub fn mtools_esp_image(disk_path: &Path) -> String {
     )
 }
 
+/// Check a generated test disk's ESP with dosfstools without repairing it.
+/// The extracted copy contains only the partition, not either GPT header.
+pub fn check_test_filesystem(disk_path: &Path) -> Result<()> {
+    let mut disk = File::open(disk_path)?;
+    let geometry = DiskGeometry::new(disk.metadata()?.len());
+    let length = (geometry.esp_end_sector - ESP_START_SECTOR + 1) * SECTOR_SIZE;
+    disk.seek(SeekFrom::Start(ESP_START_SECTOR * SECTOR_SIZE))?;
+    let mut partition = tempfile::NamedTempFile::new()?;
+    let copied = std::io::copy(&mut disk.take(length), &mut partition)?;
+    anyhow::ensure!(copied == length, "truncated test ESP");
+    partition.flush()?;
+    let output = Command::new("fsck.fat")
+        .arg("-n")
+        .arg(partition.path())
+        .output()
+        .context("failed to run fsck.fat on the test ESP")?;
+    anyhow::ensure!(
+        output.status.success(),
+        "test ESP failed fsck.fat ({}):\n{}{}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    println!("[PASS] filesystem_check: fsck.fat found no errors");
+    Ok(())
+}
+
 /// Create a test disk image with GPT partition table and FAT32 ESP
 ///
 /// # Arguments
@@ -597,6 +624,7 @@ pub fn create_uefi_sct_smoke_disk(
     shell_efi: &str,
     sct_dir: &Path,
     arch: Arch,
+    sequence: &str,
 ) -> Result<()> {
     if !Path::new(shell_efi).exists() {
         bail!("UEFI Shell binary not found: {}", shell_efi);
@@ -647,11 +675,7 @@ reset -s
         create_mtools_dir(&disk_with_offset, &format!("::/Sct/{dir}"))?;
     }
 
-    write_text_file_to_esp(
-        &disk_with_offset,
-        "::/Sct/Sequence/smoke.seq",
-        UEFI_SCT_SMOKE_SEQUENCE,
-    )?;
+    write_text_file_to_esp(&disk_with_offset, "::/Sct/Sequence/smoke.seq", sequence)?;
 
     println!("Installed UEFI Shell and SCT smoke sequence");
     Ok(())
@@ -690,49 +714,6 @@ pub fn create_windows_media_disk(output: &str, media_dir: &Path, arch: Arch) -> 
     );
     Ok(())
 }
-
-const UEFI_SCT_SMOKE_SEQUENCE: &str = r#"[Test Case]
-Revision   = 0x00010000
-Guid       = 539675B8-D9B3-4DC7-A8D0-FF19BBA13B86
-Name       = Stall_Func
-Order      = 0x00000000
-Iterations = 0x00000001
-
-[Test Case]
-Revision   = 0x00010000
-Guid       = 4397A610-8D5D-441B-8E7D-C23377F3EB67
-Name       = CopyMem_Func
-Order      = 0x00000001
-Iterations = 0x00000001
-
-[Test Case]
-Revision   = 0x00010000
-Guid       = 315BE343-A32D-461D-A3CC-5E6895CC2CBA
-Name       = SetMem_Func
-Order      = 0x00000002
-Iterations = 0x00000001
-
-[Test Case]
-Revision   = 0x00010000
-Guid       = B510F99F-FEE9-4AF6-BB0F-3C958EF7F166
-Name       = CalculateCrc32_Func
-Order      = 0x00000003
-Iterations = 0x00000001
-
-[Test Case]
-Revision   = 0x00010000
-Guid       = 90023546-6C92-430A-B253-70110D9EFDFF
-Name       = AllocatePool_Conf
-Order      = 0x00000004
-Iterations = 0x00000001
-
-[Test Case]
-Revision   = 0x00010000
-Guid       = 49709F9F-A4D8-42D6-A684-4975EE0099DB
-Name       = FreePool_Conf
-Order      = 0x00000005
-Iterations = 0x00000001
-"#;
 
 fn mtools_dir_exists(disk_with_offset: &str, path: &str) -> Result<bool> {
     let output = Command::new("mdir")

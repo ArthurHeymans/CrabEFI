@@ -48,6 +48,11 @@ static FILESYSTEM: LocalCell<Option<FilesystemState>> = LocalCell::new(None);
 pub const SIMPLE_FILE_SYSTEM_GUID: Guid = efi_sfs::PROTOCOL_GUID;
 pub const FILE_INFO_GUID: Guid = efi_file::INFO_ID;
 pub const FILE_SYSTEM_INFO_GUID: Guid = efi_file::SYSTEM_INFO_ID;
+pub const FILE_SYSTEM_VOLUME_LABEL_GUID: Guid = efi_file::SYSTEM_VOLUME_LABEL_ID;
+
+// Both information formats expose the existing firmware-assigned volume name.
+// Reading or renaming the on-media FAT label is not implemented.
+const VOLUME_LABEL: &str = "EFI";
 
 // A FAT name may contain 255 BMP characters (up to 765 UTF-8 bytes).
 const MAX_PATH_LEN: usize = 1024;
@@ -461,10 +466,13 @@ extern "efiapi" fn file_get_info(
             .unwrap_or("");
         return fill_file_info(handle.file.entry(), name, buffer_size, buffer);
     }
+    if guid == FILE_SYSTEM_VOLUME_LABEL_GUID {
+        return unsafe { info::write_volume_label(buffer, buffer_size, VOLUME_LABEL) };
+    }
     if guid != FILE_SYSTEM_INFO_GUID {
         return Status::UNSUPPORTED;
     }
-    let label = "EFI";
+    let label = VOLUME_LABEL;
     let required = info::system_info_size(label);
     if unsafe { *buffer_size } < required {
         unsafe {

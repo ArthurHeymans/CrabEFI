@@ -1,0 +1,8 @@
+# required: edk2-test-stable202509, x86_64/Q35. See docs/UEFI_CONFORMANCE.md.
+
+[Test Case]
+Revision = 0x00010000
+Guid = 117C9ABC-489D-4504-ACDB-12AACE8F505B
+Name = RequiredElements
+Order = 0x00000000
+Iterations = 0x00000001

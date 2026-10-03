@@ -399,6 +399,34 @@ fn filesystem_info_uses_the_flexible_label_offset() {
         returned,
         "EFI".encode_utf16().chain([0]).collect::<Vec<_>>()
     );
+    // The dedicated format exposes the same label, without the SystemInfo header.
+    guid = ef::SYSTEM_VOLUME_LABEL_ID;
+    size = 0;
+    assert_eq!(
+        unsafe { ((*root).get_info)(root, &mut guid, &mut size, core::ptr::null_mut()) },
+        Status::BUFFER_TOO_SMALL
+    );
+    assert_eq!(size, returned.len() * 2);
+    let mut label_only = alloc::vec![0xa5; size + 2];
+    assert_eq!(
+        unsafe {
+            ((*root).get_info)(
+                root,
+                &mut guid,
+                &mut size,
+                label_only.as_mut_ptr().add(1).cast(),
+            )
+        },
+        Status::SUCCESS
+    );
+    let expected: Vec<_> = returned.into_iter().flat_map(u16::to_ne_bytes).collect();
+    assert_eq!(&label_only[1..1 + size], expected);
+    assert_eq!(label_only[0], 0xa5);
+    assert_eq!(label_only[size + 1], 0xa5);
+    assert_eq!(
+        unsafe { ((*root).set_info)(root, &mut guid, size, label_only.as_mut_ptr().add(1).cast()) },
+        Status::UNSUPPORTED
+    );
     assert_eq!(unsafe { ((*root).close)(root) }, Status::SUCCESS);
 }
 

@@ -140,6 +140,20 @@ pub(super) unsafe fn write_system_info(
     unsafe { write_info(buffer, buffer_size, header.as_bytes(), label) }
 }
 
+/// Encode EFI_FILE_SYSTEM_VOLUME_LABEL: only a terminated UTF-16 string,
+/// with no Size field or filesystem-information header.
+///
+/// # Safety
+/// `buffer_size` must point to a writable `usize`. A non-null `buffer` must
+/// cover the number of writable bytes declared by `buffer_size`.
+pub(super) unsafe fn write_volume_label(
+    buffer: *mut c_void,
+    buffer_size: *mut usize,
+    label: &str,
+) -> Status {
+    unsafe { write_info(buffer, buffer_size, &[], label) }
+}
+
 unsafe fn write_info(
     buffer: *mut c_void,
     buffer_size: *mut usize,
@@ -260,6 +274,45 @@ mod tests {
                     .chain(core::iter::once(0))
                     .collect::<Vec<_>>()
             );
+            assert_eq!(output[0], 0xa5);
+            assert_eq!(output[required + 1], 0xa5);
+        }
+    }
+
+    #[test]
+    fn dedicated_volume_label_is_bounded_terminated_utf16() {
+        for label in ["", "EFI", "a😀"] {
+            let required = (label.encode_utf16().count() + 1) * 2;
+            let mut size = 0;
+            assert_eq!(
+                unsafe { write_volume_label(core::ptr::null_mut(), &mut size, label) },
+                Status::BUFFER_TOO_SMALL
+            );
+            assert_eq!(size, required);
+            assert_eq!(
+                unsafe { write_volume_label(core::ptr::null_mut(), &mut size, label) },
+                Status::INVALID_PARAMETER
+            );
+            let mut output = vec![0xa5; required + 2];
+            size = required - 1;
+            assert_eq!(
+                unsafe { write_volume_label(output.as_mut_ptr().add(1).cast(), &mut size, label) },
+                Status::BUFFER_TOO_SMALL
+            );
+            assert_eq!(size, required);
+            assert!(output.iter().all(|&byte| byte == 0xa5));
+            size = required + 1;
+            assert_eq!(
+                unsafe { write_volume_label(output.as_mut_ptr().add(1).cast(), &mut size, label) },
+                Status::SUCCESS
+            );
+            assert_eq!(size, required);
+            let expected: Vec<_> = label
+                .encode_utf16()
+                .chain([0])
+                .flat_map(u16::to_ne_bytes)
+                .collect();
+            assert_eq!(&output[1..1 + required], expected);
             assert_eq!(output[0], 0xa5);
             assert_eq!(output[required + 1], 0xa5);
         }

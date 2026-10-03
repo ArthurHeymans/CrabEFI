@@ -1,0 +1,22 @@
+# block-io: edk2-test-stable202509, x86_64/Q35. See docs/UEFI_CONFORMANCE.md.
+
+[Test Case]
+Revision = 0x00010000
+Guid = 826159D3-04A5-4CCE-8431-344707A8B57A
+Name = ReadBlocks_Conf
+Order = 0x00000000
+Iterations = 0x00000001
+
+[Test Case]
+Revision = 0x00010000
+Guid = B0501C52-1564-4945-B57B-1FD2C882FF91
+Name = Reset_Func
+Order = 0x00000001
+Iterations = 0x00000001
+
+[Test Case]
+Revision = 0x00010000
+Guid = A4284AE9-C988-4230-973A-5C19398C8254
+Name = ReadBlocks_Func
+Order = 0x00000002
+Iterations = 0x00000001

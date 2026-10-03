@@ -12,7 +12,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::{Arch, Machine};
 
-mod sct;
+mod filesystem;
+pub(crate) mod sct;
 
 static RUNTIME_IMAGE_TWO_BOOT: AtomicBool = AtomicBool::new(false);
 static WRITABLE_TEST_FLASH: AtomicBool = AtomicBool::new(false);
@@ -1155,60 +1156,15 @@ pub fn run_tests(config: &QemuConfig, disk_path: &Path, app_name: &str) -> Resul
             }
         }
         "directory-test" => {
-            // Check that the test app started
-            if result.output.contains("Directory Enumeration Test") {
-                println!("[PASS] test_started: Directory enumeration test started");
-                passed += 1;
-            } else {
-                println!("[FAIL] test_started: Test did not start");
-                failed += 1;
-            }
-
-            // Check OpenVolume succeeded
-            if result.output.contains("[PASS] OpenVolume succeeded") {
-                println!("[PASS] open_volume: OpenVolume succeeded");
-                passed += 1;
-            } else {
-                println!("[FAIL] open_volume: OpenVolume failed");
-                failed += 1;
-            }
-
-            // Check that the long filename (>64 chars) was found intact
-            if result.output.contains("[PASS] long_filename:") {
-                println!("[PASS] long_filename: Filename >64 chars returned intact");
-                passed += 1;
-            } else {
-                println!(
-                    "[FAIL] long_filename: Filename >64 chars NOT found (LFN truncation bug?)"
-                );
-                failed += 1;
-            }
-
-            // Check that the long filename's .efi suffix was preserved
-            if result.output.contains("[PASS] long_filename_suffix:") {
-                println!("[PASS] long_filename_suffix: .efi suffix preserved on long name");
-                passed += 1;
-            } else {
-                println!("[FAIL] long_filename_suffix: .efi suffix lost on long filename");
-                failed += 1;
-            }
-
-            // Check that the short filename was also found
-            if result.output.contains("[PASS] short_filename:") {
-                println!("[PASS] short_filename: Short filename found");
-                passed += 1;
-            } else {
-                println!("[FAIL] short_filename: Short filename not found");
-                failed += 1;
-            }
-
-            // Check overall result
-            if result.output.contains("test PASSED!") {
-                println!("[PASS] overall: Directory enumeration test passed");
-                passed += 1;
-            } else {
-                println!("[FAIL] overall: Directory enumeration test failed");
-                failed += 1;
+            match filesystem::validate(&result.output, matches!(config.storage, StorageType::Usb)) {
+                Ok(()) => {
+                    println!("[PASS] filesystem: directory and mutation/protection checks passed");
+                    passed += 1;
+                }
+                Err(error) => {
+                    println!("[FAIL] filesystem: {error}");
+                    failed += 1;
+                }
             }
         }
         "device-path-test" => {
@@ -1402,6 +1358,13 @@ pub fn run_tests(config: &QemuConfig, disk_path: &Path, app_name: &str) -> Resul
         bail!("{} test(s) failed", failed);
     }
 
+    if app_name == "directory-test" {
+        crate::disk::check_test_filesystem(disk_path)?;
+        if matches!(config.storage, StorageType::Usb) {
+            filesystem::verify_persisted_write(disk_path)?;
+            println!("[PASS] filesystem_persistence: independent payload readback passed");
+        }
+    }
     Ok(())
 }
 
@@ -1414,12 +1377,44 @@ pub fn run_tests(config: &QemuConfig, disk_path: &Path, app_name: &str) -> Resul
 /// # Returns
 /// `Ok(())` only if every selected test has an explicit successful result and
 /// complete assertion counters, with no errors or warnings.
-pub fn run_uefi_sct_smoke_tests(config: &QemuConfig, disk_path: &Path) -> Result<()> {
-    println!("=== UEFI SCT Smoke Tests ({:?}) ===\n", config.arch);
-    println!("Running SCT smoke sequence in QEMU...\n");
+pub fn run_uefi_sct_smoke_tests(
+    config: &QemuConfig,
+    disk_path: &Path,
+    sequence: &sct::Sequence,
+    report_dir: &Path,
+) -> Result<()> {
+    println!(
+        "=== UEFI SCT Tests ({:?}, {} cases) ===\n",
+        config.arch,
+        sequence.names.len()
+    );
+    fs::create_dir_all(report_dir)?;
+    // Fresh evidence for every run, without deleting a caller-supplied directory.
+    let report_dir = tempfile::Builder::new()
+        .prefix("sct-")
+        .tempdir_in(report_dir)?
+        .keep();
+    fs::write(report_dir.join("sequence.seq"), &sequence.text)?;
+    println!("SCT reports: {}", report_dir.display());
+    println!("Running SCT sequence in QEMU...\n");
 
     let result = run_qemu_with_capture(config, disk_path)?;
+    fs::write(report_dir.join("serial.log"), &result.output)?;
+    let image = crate::disk::mtools_esp_image(disk_path);
+    for directory in ["::/Sct/Overall", "::/Sct/Log", "::/Sct/Report"] {
+        let status = Command::new("mcopy")
+            .args(["-s", "-i", &image, directory])
+            .arg(&report_dir)
+            .status()
+            .context("copying SCT reports")?;
+        if !status.success() {
+            println!("Could not copy {directory}; serial output retained");
+        }
+    }
     let summary_log = extract_sct_log(disk_path, "::/Sct/Overall/Summary.log")?;
+    if let Some(ref summary) = summary_log {
+        fs::write(report_dir.join("summary.log"), summary)?;
+    }
 
     println!("\n=== SCT Smoke Results ===");
     println!("Serial output captured: {} bytes", result.output.len());
@@ -1433,13 +1428,39 @@ pub fn run_uefi_sct_smoke_tests(config: &QemuConfig, disk_path: &Path) -> Result
     let validated = summary_log
         .as_deref()
         .context("SCT Summary.log was not produced")
-        .and_then(|summary| sct::validate(&result.output, summary));
-    if let Err(error) = validated {
-        println!("[FAIL] SCT smoke: {error:#}");
-        println!("\n--- Captured Output ---\n{}", result.output);
-        return Err(error).context("UEFI SCT smoke validation failed");
-    }
-    println!("[PASS] SCT smoke: all six tests explicitly passed with zero errors or warnings");
+        .and_then(|summary| sct::validate(&result.output, summary, sequence));
+    use sha2::Digest;
+    let firmware_sha256 = format!(
+        "{:x}",
+        sha2::Sha256::digest(fs::read(&config.coreboot_rom)?)
+    );
+    fs::write(
+        report_dir.join("result.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "architecture": format!("{:?}", config.arch),
+            "machine": "q35",
+            "storage": format!("{:?}", config.storage),
+            "coreboot_rom_sha256": firmware_sha256,
+            "ci_revision": std::env::var("GITHUB_SHA").ok(),
+            "selected_cases": sequence.names,
+            "passed": validated.is_ok(),
+            "verified_instances": validated.as_ref().ok(),
+            "failure": validated.as_ref().err().map(|error| format!("{error:#}")),
+        }))?,
+    )?;
+    let instances = match validated {
+        Ok(instances) => instances,
+        Err(error) => {
+            println!("[FAIL] SCT: {error:#}");
+            println!("\n--- Captured Output ---\n{}", result.output);
+            return Err(error).context("UEFI SCT validation failed");
+        }
+    };
+    println!(
+        "[PASS] SCT: all {} selected cases across {} instances explicitly passed with zero errors or warnings",
+        sequence.names.len(),
+        instances
+    );
     Ok(())
 }
 

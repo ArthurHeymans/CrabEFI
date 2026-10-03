@@ -57,7 +57,7 @@ extern "efiapi" fn block_io_read_blocks(
     buffer_size: usize,
     buffer: *mut c_void,
 ) -> Status {
-    if this.is_null() || buffer.is_null() {
+    if this.is_null() {
         return Status::INVALID_PARAMETER;
     }
 
@@ -77,6 +77,11 @@ extern "efiapi" fn block_io_read_blocks(
             ctx.media_id
         );
         return Status::MEDIA_CHANGED;
+    }
+
+    // A stale media ID takes precedence over invalid transfer parameters.
+    if buffer.is_null() {
+        return Status::INVALID_PARAMETER;
     }
 
     // Calculate number of blocks to read
