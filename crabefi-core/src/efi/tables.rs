@@ -76,7 +76,10 @@ fn init_entries<T>(
 }
 
 /// Maximum number of handles we can track
-pub const MAX_HANDLES: usize = 64;
+///
+/// The UEFI SCT loads every test image up front (about 80 for the full
+/// package) and keeps them loaded, each with its own handle.
+pub const MAX_HANDLES: usize = 128;
 
 /// Maximum number of protocols per handle
 pub const MAX_PROTOCOLS_PER_HANDLE: usize = 8;
@@ -85,7 +88,7 @@ pub const MAX_PROTOCOLS_PER_HANDLE: usize = 8;
 pub const MAX_EVENTS: usize = 32;
 
 /// Maximum number of loaded images we can track
-pub const MAX_LOADED_IMAGES: usize = 16;
+pub const MAX_LOADED_IMAGES: usize = 128;
 
 /// Protocol interface entry
 #[derive(Clone, Copy)]
