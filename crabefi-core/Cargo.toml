@@ -68,12 +68,8 @@ noto-sans-mono-bitmap = { optional = true, version = "0.3", default-features = f
 ] }
 tock-registers = "0.10"
 zerocopy = { version = "0.8", default-features = false, features = ["derive"] }
-rflasher-core = { optional = true, git = "https://github.com/ArthurHeymans/rflasher.git", rev = "a06d37b6c45a59b68a3a01b7b8abee73a10ea8a0", default-features = false, features = [
-  "is_sync",
-] }
-rflasher-internal = { optional = true, git = "https://github.com/ArthurHeymans/rflasher.git", rev = "a06d37b6c45a59b68a3a01b7b8abee73a10ea8a0", default-features = false, features = [
-  "is_sync",
-] }
+rflasher-core = { optional = true, git = "https://github.com/ArthurHeymans/rflasher.git", rev = "29ee7febf0354f57ddf44e5078d90ef2af5d48c4", default-features = false }
+rflasher-internal = { optional = true, git = "https://github.com/ArthurHeymans/rflasher.git", rev = "29ee7febf0354f57ddf44e5078d90ef2af5d48c4", default-features = false }
 
 # RustCrypto hashes for Authenticode, measured boot and variable digests
 sha1 = { optional = true, version = "0.11", default-features = false }

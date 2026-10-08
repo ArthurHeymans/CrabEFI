@@ -387,7 +387,8 @@ fn map_internal_error(error: rflasher_internal::InternalError) -> SpiError {
         rflasher_internal::InternalError::MemoryMap { .. } => SpiError::InitFailed,
         rflasher_internal::InternalError::ChipsetEnable(_) => SpiError::InitFailed,
         rflasher_internal::InternalError::SpiInit(_) => SpiError::InitFailed,
-        rflasher_internal::InternalError::AccessDenied { .. } => SpiError::AccessDenied,
+        rflasher_internal::InternalError::AccessDenied { .. }
+        | rflasher_internal::InternalError::PermissionDenied { .. } => SpiError::AccessDenied,
         rflasher_internal::InternalError::InvalidDescriptor => SpiError::InvalidDescriptor,
         rflasher_internal::InternalError::NotSupported(_) => SpiError::NotSupported,
         rflasher_internal::InternalError::Io(_) => SpiError::CycleError,
