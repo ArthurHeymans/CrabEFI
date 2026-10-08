@@ -105,6 +105,13 @@ pub enum BootEntryKind {
         /// Payload format
         format: crate::payload::PayloadFormat,
     },
+
+    /// Boot target offered by the platform (see
+    /// [`crate::PlatformHooks::boot_targets()`]), e.g. a payload in flash.
+    PlatformTarget {
+        /// Name the platform uses to identify the target.
+        name: String<64>,
+    },
 }
 
 /// Category for menu grouping
@@ -198,9 +205,42 @@ impl BootEntry {
         entry
     }
 
+    /// Create an entry for a boot target offered by the platform.
+    ///
+    /// Such entries have no backing disk, so the storage and partition
+    /// fields only hold placeholders.
+    pub fn new_platform_target(name: &str) -> Self {
+        let mut target = String::new();
+        let _ = target.push_str(name);
+        let mut entry = BootEntry {
+            name: target.clone(),
+            path: String::new(),
+            storage: StorageId::Platform { index: 0 },
+            pci: None,
+            partition_num: 0,
+            partition: gpt::Partition {
+                type_guid: [0; 16],
+                partition_guid: [0; 16],
+                first_lba: 0,
+                last_lba: 0,
+                attributes: 0,
+                is_esp: false,
+                block_size: 0,
+            },
+            kind: BootEntryKind::PlatformTarget { name: target },
+            category: BootCategory::Payload,
+        };
+        let _ = entry.path.push_str("platform firmware");
+        entry
+    }
+
     /// Format a description for display
     pub fn format_description(&self, buf: &mut String<128>) {
         buf.clear();
+        if matches!(self.kind, BootEntryKind::PlatformTarget { .. }) {
+            let _ = buf.push_str(&self.name);
+            return;
+        }
         let _ = write!(
             buf,
             "{} ({}, partition {})",
@@ -225,7 +265,10 @@ impl BootEntry {
 
     /// Check if this is a payload entry
     pub fn is_payload(&self) -> bool {
-        matches!(self.kind, BootEntryKind::Payload { .. })
+        matches!(
+            self.kind,
+            BootEntryKind::Payload { .. } | BootEntryKind::PlatformTarget { .. }
+        )
     }
 
     /// Check if this entry has an editable command line
@@ -346,9 +389,24 @@ pub fn discover_boot_entries() -> BootMenu {
         }
     }
 
+    discover_platform_targets(&mut menu);
+
     log::info!("Found {} boot entries", menu.entry_count());
 
     menu
+}
+
+/// Add the boot targets the platform offers through its hooks.
+fn discover_platform_targets(menu: &mut BootMenu) {
+    let Some(hooks) = crate::handoff::callbacks().hooks else {
+        return;
+    };
+    for name in hooks.boot_targets().iter() {
+        log::info!("Found platform boot target: {}", name);
+        if !menu.add_entry(BootEntry::new_platform_target(name)) {
+            return; // Menu full
+        }
+    }
 }
 
 /// Discover boot entries on the partitions of one disk.

@@ -776,6 +776,9 @@ fn capture_when_ready(
     Ok(())
 }
 
+/// CBFS name of the dummy payload added for the `cbfs-payload-menu` test.
+pub const CBFS_TEST_PAYLOAD: &str = "seabios";
+
 /// Run integration tests in QEMU
 pub fn run_tests(config: &QemuConfig, disk_path: &Path, app_name: &str) -> Result<()> {
     RUNTIME_IMAGE_TWO_BOOT.store(app_name == "runtime-image-test", Ordering::Relaxed);
@@ -826,6 +829,16 @@ pub fn run_tests(config: &QemuConfig, disk_path: &Path, app_name: &str) -> Resul
                 passed += 1;
             } else {
                 println!("[FAIL] efi_app_executed: EFI application did not complete");
+                failed += 1;
+            }
+        }
+        "cbfs-payload-menu" => {
+            let marker = format!("Found platform boot target: {CBFS_TEST_PAYLOAD}");
+            if result.output.contains(&marker) {
+                println!("[PASS] cbfs_payload_entry: CBFS payload listed in boot menu");
+                passed += 1;
+            } else {
+                println!("[FAIL] cbfs_payload_entry: Expected '{marker}' in output");
                 failed += 1;
             }
         }

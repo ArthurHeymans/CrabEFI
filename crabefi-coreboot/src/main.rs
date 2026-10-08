@@ -31,6 +31,7 @@ mod arch_entry;
 #[cfg(target_arch = "x86_64")]
 #[path = "arch/x86_64/entry.rs"]
 mod arch_entry;
+mod cbfs;
 mod cbmem_console;
 mod cfr;
 mod cfr_menu;
@@ -190,7 +191,25 @@ impl crabefi::Timer for CorebootTimer {
 struct CorebootReset;
 
 /// Coreboot-specific lifecycle callbacks injected into the generic core.
-struct CorebootHooks;
+struct CorebootHooks {
+    /// Boot media description from the coreboot tables, if any.
+    boot_media: Option<tables::BootMediaInfo>,
+}
+
+impl CorebootHooks {
+    /// Find the CBFS to list payloads from as `(flash offset, size)`.
+    ///
+    /// Prefers the CBFS coreboot booted from and falls back to the FMAP
+    /// `COREBOOT` region.
+    fn cbfs_region(&self, storage: &mut dyn crabefi::FirmwareStorage) -> Option<(u64, u64)> {
+        if let Some(media) = self.boot_media.filter(|media| media.cbfs_size != 0) {
+            return Some((media.cbfs_offset, media.cbfs_size));
+        }
+        let fmap = fmap::read_fmap(storage, self.boot_media.map(|media| media.fmap_offset))?;
+        let region = fmap::find_region(&fmap, "COREBOOT")?;
+        Some((u64::from(region.offset), u64::from(region.size)))
+    }
+}
 
 impl crabefi::PlatformHooks for CorebootHooks {
     fn on_exit_boot_services(&self) {
@@ -211,6 +230,36 @@ impl crabefi::PlatformHooks for CorebootHooks {
     fn show_firmware_settings(&self) -> bool {
         cfr_menu::show_cfr_menu();
         true
+    }
+
+    fn boot_targets(&self) -> crabefi::PlatformBootTargets {
+        let mut targets = crabefi::PlatformBootTargets::new();
+        crabefi::efi::varstore::with_spi_storage_mut(|storage| {
+            let storage = storage.controller_mut();
+            let Some((offset, size)) = self.cbfs_region(storage) else {
+                log::debug!("No CBFS region found, not offering CBFS payloads");
+                return;
+            };
+            cbfs::for_each_payload(
+                size,
+                |relative, buf| {
+                    crabefi::FirmwareStorage::read(storage, offset + relative, buf).is_ok()
+                },
+                |name| {
+                    if let Ok(name) = name.try_into() {
+                        let _ = targets.push(name);
+                    }
+                },
+            );
+        });
+        targets
+    }
+
+    fn boot_target(&self, name: &str) {
+        log::error!(
+            "Cannot boot CBFS payload '{}': chainloading from CBFS is not implemented",
+            name
+        );
     }
 }
 
@@ -711,7 +760,7 @@ fn riscv_fdt_only_boot(fdt_ptr: u64, fdt_size: u32) -> ! {
         freq_hz: crabefi::time::counter_frequency(),
     };
     let reset = CorebootReset;
-    let hooks = CorebootHooks;
+    let hooks = CorebootHooks { boot_media: None };
 
     let fdt_slice = unsafe { core::slice::from_raw_parts(fdt_ptr as *const u8, fdt_size as usize) };
 
@@ -980,7 +1029,9 @@ pub extern "C" fn rust_main(coreboot_table_ptr: u64) -> ! {
     };
 
     let reset = CorebootReset;
-    let hooks = CorebootHooks;
+    let hooks = CorebootHooks {
+        boot_media: cb_info.boot_media,
+    };
     let variable_store_locator = CorebootVariableStoreLocator::new(&cb_info);
     #[cfg(target_arch = "x86_64")]
     let timestamp_recorder_ref = timestamp_recorder

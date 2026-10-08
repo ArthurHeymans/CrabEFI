@@ -149,7 +149,9 @@ enum Commands {
 
         /// Test app to run (default: hello)
         ///
-        /// Use "grub-linux" for the GRUB + Linux boot-chain test.
+        /// Use "grub-linux" for the GRUB + Linux boot-chain test, or
+        /// "cbfs-payload-menu" to check that payloads stored in CBFS are
+        /// listed in the boot menu.
         #[arg(long, default_value = "hello")]
         app: String,
 
@@ -578,10 +580,22 @@ fn cmd_test(
     // Create temp dir for ROM and disk
     let temp_dir = tempfile::tempdir()?;
 
+    // The CBFS payload menu test only differs from "hello" in its ROM.
+    let cbfs_payload_test = app == "cbfs-payload-menu";
+    let disk_app = if cbfs_payload_test { "hello" } else { app };
+
     // Prepare the ROM
     let firmware = if let Some(rom) = coreboot_rom {
+        let coreboot_rom = if cbfs_payload_test {
+            // Never modify a user-supplied ROM.
+            let copy = temp_dir.path().join("coreboot-cbfs-test.rom");
+            std::fs::copy(&rom, &copy)?;
+            copy
+        } else {
+            PathBuf::from(rom)
+        };
         rom::PreparedFirmware {
-            coreboot_rom: PathBuf::from(rom),
+            coreboot_rom,
             tfa_flash: None,
         }
     } else {
@@ -592,6 +606,9 @@ fn cmd_test(
         let crabefi_elf = rom::get_crabefi_elf(arch);
         rom::prepare_rom(&crabefi_elf, temp_dir.path(), arch, machine)?
     };
+    if cbfs_payload_test {
+        rom::add_test_cbfs_payload(&firmware.coreboot_rom, qemu::CBFS_TEST_PAYLOAD)?;
+    }
 
     let config = qemu::QemuConfig {
         coreboot_rom: firmware.coreboot_rom.to_string_lossy().to_string(),
@@ -665,12 +682,12 @@ fn cmd_test(
         )?;
     } else {
         // ── Normal UEFI test app ─────────────────────────────────────
-        println!("Building test app: {}", app);
-        cmd_build_test_app(app, arch)?;
+        println!("Building test app: {}", disk_app);
+        cmd_build_test_app(disk_app, arch)?;
 
-        let efi_path = find_test_app_efi(app, arch)?;
+        let efi_path = find_test_app_efi(disk_app, arch)?;
 
-        if app == "directory-test" {
+        if disk_app == "directory-test" {
             disk::create_directory_test_disk(
                 disk_path.to_string_lossy().as_ref(),
                 &efi_path,

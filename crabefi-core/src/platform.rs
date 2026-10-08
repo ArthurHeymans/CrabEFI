@@ -523,7 +523,24 @@ pub trait PlatformHooks {
     fn show_firmware_settings(&self) -> bool {
         false
     }
+
+    /// Boot targets the platform adds to the boot menu, for example payloads
+    /// stored in firmware flash. Called each time the menu is built.
+    fn boot_targets(&self) -> PlatformBootTargets {
+        PlatformBootTargets::new()
+    }
+
+    /// Boot the target `name` returned by [`boot_targets()`](Self::boot_targets).
+    ///
+    /// Returns only if booting failed.
+    fn boot_target(&self, _name: &str) {}
 }
+
+/// Maximum number of [`PlatformHooks::boot_targets()`] entries in the boot menu.
+pub const MAX_PLATFORM_BOOT_TARGETS: usize = 8;
+
+/// Display names of the boot targets offered by [`PlatformHooks::boot_targets()`].
+pub type PlatformBootTargets = heapless::Vec<heapless::String<64>, MAX_PLATFORM_BOOT_TARGETS>;
 
 // ============================================================================
 // Timer
