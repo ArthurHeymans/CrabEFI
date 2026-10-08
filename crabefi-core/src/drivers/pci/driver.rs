@@ -233,11 +233,9 @@ impl PciDriver for UsbPciDriver {
         &'a self,
         device: &'a PciDevice,
     ) -> BoxFuture<'a, Result<Registration, DriverError>> {
-        // USB controllers still initialize synchronously and register
-        // themselves; there is nothing left to publish.
         Box::pin(async move {
-            usb::init_device(device).map_err(|()| DriverError::InitFailed)?;
-            Ok(Box::new(|| Ok(())) as Registration)
+            let controller = usb::init_controller(device).await;
+            registration(device, controller, usb::register_controller)
         })
     }
 

@@ -40,6 +40,7 @@ pub use xhci::{XhciController, XhciError};
 
 use crate::drivers::pci;
 use crate::efi;
+use alloc::boxed::Box;
 use spin::Mutex;
 
 use core::mem;
@@ -146,7 +147,7 @@ static STOPPED: crate::cell::LocalCell<bool> = crate::cell::LocalCell::new(false
 /// * `wrap` - Closure to wrap the raw pointer into the appropriate `UsbControllerHandle` variant
 /// * `name` - Controller type name for logging
 /// * `address` - PCI address for logging
-fn register_controller<T>(
+fn store_controller<T>(
     controllers: &mut heapless::Vec<UsbControllerHandle, MAX_CONTROLLERS>,
     controller: T,
     wrap: fn(*mut T) -> UsbControllerHandle,
@@ -176,6 +177,16 @@ fn register_controller<T>(
     Ok(())
 }
 
+/// A USB host controller that finished bring-up but is not yet registered.
+pub enum InitializedController {
+    #[cfg(feature = "xhci")]
+    Xhci(Box<XhciController>),
+    Ehci(Box<ehci::EhciController>),
+    Ohci(Box<ohci::OhciController>),
+    #[cfg(target_arch = "x86_64")]
+    Uhci(Box<uhci::UhciController>),
+}
+
 /// Initialize a single USB controller from a PCI device
 ///
 /// Called by the PCI driver model when a USB host controller is discovered.
@@ -186,10 +197,30 @@ fn register_controller<T>(
 // Failures are logged at the error site; callers only branch on success.
 #[allow(clippy::result_unit_err)]
 pub fn init_device(dev: &pci::PciDevice) -> Result<(), ()> {
-    let mut controllers = ALL_CONTROLLERS.lock();
+    crate::exec::block_on(init_controller(dev)).and_then(|c| register_controller(dev.address, c))
+}
 
+/// USB 1.1 companion controllers (UHCI/OHCI) currently initializing, by PCI
+/// segment/bus/device.
+///
+/// Until EHCI sets CONFIGFLAG its ports are routed to the companions, so a
+/// companion's resets must not overlap EHCI taking the ports over. Companions
+/// sit at lower function numbers than their EHCI and therefore start
+/// initializing first; EHCI waits here until they are done.
+static COMPANIONS_INITIALIZING: crate::cell::Local<alloc::vec::Vec<(u16, u8, u8)>> =
+    crate::cell::Local::new(alloc::vec::Vec::new());
+
+fn companion_slot(address: pci::PciAddress) -> (u16, u8, u8) {
+    (address.segment(), address.bus(), address.device())
+}
+
+/// Bring up a USB host controller and enumerate its devices without
+/// registering it.
+// Failures are logged at the error site; callers only branch on success.
+#[allow(clippy::result_unit_err)]
+pub async fn init_controller(dev: &pci::PciDevice) -> Result<InitializedController, ()> {
     /// Helper macro to reduce per-controller-type boilerplate.
-    /// Logs init, calls the constructor, and registers the result.
+    /// Logs init and calls the constructor.
     macro_rules! init_usb_controller {
         ($name:expr, $ty:ty, $variant:ident) => {{
             log::info!(
@@ -199,29 +230,37 @@ pub fn init_device(dev: &pci::PciDevice) -> Result<(), ()> {
                 dev.vendor_id,
                 dev.device_id
             );
-            match <$ty>::new(dev) {
-                Ok(c) => register_controller(
-                    &mut controllers,
-                    c,
-                    UsbControllerHandle::$variant,
-                    $name,
-                    dev.address,
-                ),
-                Err(e) => {
-                    log::error!("  Failed to init {}: {:?}", $name, e);
-                    Err(())
-                }
-            }
+            <$ty>::new(dev)
+                .await
+                .map(|c| InitializedController::$variant(Box::new(c)))
+                .map_err(|e| log::error!("  Failed to init {} at {}: {:?}", $name, dev.address, e))
         }};
     }
 
+    let slot = companion_slot(dev.address);
     match dev.prog_if {
         #[cfg(feature = "xhci")]
         0x30 => init_usb_controller!("xHCI", XhciController, Xhci),
-        0x20 => init_usb_controller!("EHCI", ehci::EhciController, Ehci),
-        0x10 => init_usb_controller!("OHCI", ohci::OhciController, Ohci),
-        #[cfg(target_arch = "x86_64")]
-        0x00 => init_usb_controller!("UHCI", uhci::UhciController, Uhci),
+        0x20 => {
+            while COMPANIONS_INITIALIZING.borrow().contains(&slot) {
+                crate::exec::yield_now().await;
+            }
+            init_usb_controller!("EHCI", ehci::EhciController, Ehci)
+        }
+        0x10 | 0x00 => {
+            COMPANIONS_INITIALIZING.borrow_mut().push(slot);
+            let controller = if dev.prog_if == 0x10 {
+                init_usb_controller!("OHCI", ohci::OhciController, Ohci)
+            } else {
+                init_uhci(dev).await
+            };
+            COMPANIONS_INITIALIZING.with_mut(|initializing| {
+                if let Some(index) = initializing.iter().position(|s| *s == slot) {
+                    initializing.swap_remove(index);
+                }
+            });
+            controller
+        }
         _ => {
             log::debug!(
                 "Unknown USB controller prog_if {:#x} at {}",
@@ -230,6 +269,68 @@ pub fn init_device(dev: &pci::PciDevice) -> Result<(), ()> {
             );
             Err(())
         }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+async fn init_uhci(dev: &pci::PciDevice) -> Result<InitializedController, ()> {
+    log::info!(
+        "Initializing UHCI controller at {}: {:04x}:{:04x}",
+        dev.address,
+        dev.vendor_id,
+        dev.device_id
+    );
+    uhci::UhciController::new(dev)
+        .await
+        .map(|c| InitializedController::Uhci(Box::new(c)))
+        .map_err(|e| log::error!("  Failed to init UHCI at {}: {:?}", dev.address, e))
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+async fn init_uhci(dev: &pci::PciDevice) -> Result<InitializedController, ()> {
+    log::debug!("UHCI controller at {} is not supported here", dev.address);
+    Err(())
+}
+
+/// Register a controller from [`init_controller`] for device access.
+// Failures are logged at the error site; callers only branch on success.
+#[allow(clippy::result_unit_err)]
+pub fn register_controller(
+    address: pci::PciAddress,
+    controller: InitializedController,
+) -> Result<(), ()> {
+    let mut controllers = ALL_CONTROLLERS.lock();
+    match controller {
+        #[cfg(feature = "xhci")]
+        InitializedController::Xhci(c) => store_controller(
+            &mut controllers,
+            *c,
+            UsbControllerHandle::Xhci,
+            "xHCI",
+            address,
+        ),
+        InitializedController::Ehci(c) => store_controller(
+            &mut controllers,
+            *c,
+            UsbControllerHandle::Ehci,
+            "EHCI",
+            address,
+        ),
+        InitializedController::Ohci(c) => store_controller(
+            &mut controllers,
+            *c,
+            UsbControllerHandle::Ohci,
+            "OHCI",
+            address,
+        ),
+        #[cfg(target_arch = "x86_64")]
+        InitializedController::Uhci(c) => store_controller(
+            &mut controllers,
+            *c,
+            UsbControllerHandle::Uhci,
+            "UHCI",
+            address,
+        ),
     }
 }
 

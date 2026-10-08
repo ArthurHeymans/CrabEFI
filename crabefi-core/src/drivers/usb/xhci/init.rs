@@ -5,7 +5,8 @@ use crate::barrier;
 use crate::drivers::mmio::MmioRegion;
 use crate::drivers::pci::{self, PciDevice};
 use crate::efi;
-use crate::time::{Timeout, wait_for};
+use crate::exec;
+use crate::time::Timeout;
 use core::ptr;
 use xhci::extended_capabilities::{self, ExtendedCapability};
 use xhci::registers::capability::CapabilityParameters1;
@@ -73,7 +74,7 @@ impl super::XhciController {
     }
 
     /// Create a new xHCI controller from a PCI device
-    pub fn new(pci_dev: &PciDevice) -> Result<Self, XhciError> {
+    pub async fn new(pci_dev: &PciDevice) -> Result<Self, XhciError> {
         let mmio_base = pci_dev.mmio_base().ok_or(XhciError::NotReady)?;
         // SAFETY: mmio_base is a PCI BAR address for this xHCI controller,
         // mapped by the platform and valid for the device's lifetime.
@@ -145,12 +146,12 @@ impl super::XhciController {
             interrupt_polls: alloc::vec::Vec::new(),
         };
 
-        controller.init()?;
+        controller.init().await?;
 
         // Give USB devices time to connect and be detected
-        crate::time::delay_ms(50);
+        exec::sleep_ms(50).await;
 
-        controller.enumerate_ports()?;
+        controller.enumerate_ports().await?;
 
         Ok(controller)
     }
@@ -226,15 +227,17 @@ impl super::XhciController {
     }
 
     /// Initialize the controller
-    pub(super) fn init(&mut self) -> Result<(), XhciError> {
-        if !wait_for(100, || {
+    pub(super) async fn init(&mut self) -> Result<(), XhciError> {
+        if !exec::wait_for(100, || {
             !self
                 .registers
                 .operational
                 .usbsts
                 .read_volatile()
                 .controller_not_ready()
-        }) {
+        })
+        .await
+        {
             log::error!("xHCI: controller not ready (CNR still set)");
             return Err(XhciError::Timeout);
         }
@@ -245,13 +248,15 @@ impl super::XhciController {
             .update_volatile(|command| {
                 command.clear_run_stop();
             });
-        if !wait_for(100, || {
+        if !exec::wait_for(100, || {
             self.registers
                 .operational
                 .usbsts
                 .read_volatile()
                 .hc_halted()
-        }) {
+        })
+        .await
+        {
             log::error!("xHCI: controller did not halt");
             return Err(XhciError::Timeout);
         }
@@ -262,8 +267,8 @@ impl super::XhciController {
             .update_volatile(|command| {
                 command.set_host_controller_reset();
             });
-        crate::time::delay_ms(1);
-        if !wait_for(500, || {
+        exec::sleep_ms(1).await;
+        if !exec::wait_for(500, || {
             !self
                 .registers
                 .operational
@@ -276,7 +281,9 @@ impl super::XhciController {
                     .usbsts
                     .read_volatile()
                     .controller_not_ready()
-        }) {
+        })
+        .await
+        {
             log::error!("xHCI: host controller reset did not complete");
             return Err(XhciError::Timeout);
         }
@@ -418,14 +425,16 @@ impl super::XhciController {
             .update_volatile(|command| {
                 command.set_run_stop().set_interrupter_enable();
             });
-        if !wait_for(100, || {
+        if !exec::wait_for(100, || {
             !self
                 .registers
                 .operational
                 .usbsts
                 .read_volatile()
                 .hc_halted()
-        }) {
+        })
+        .await
+        {
             log::error!("xHCI: host controller failed to start");
             self.registers
                 .operational
@@ -439,7 +448,7 @@ impl super::XhciController {
         }
 
         // Power on all ports - many real hardware controllers require explicit port power
-        self.power_on_ports();
+        self.power_on_ports().await;
 
         log::info!("xHCI controller initialized");
         Ok(())
@@ -449,7 +458,7 @@ impl super::XhciController {
     ///
     /// Many xHCI controllers (especially on real hardware) require explicit
     /// port power enable. Without this, devices won't be detected.
-    pub(super) fn power_on_ports(&mut self) {
+    pub(super) async fn power_on_ports(&mut self) {
         for port in 0..self.num_ports {
             if self.portsc(port).port_power() {
                 continue;
@@ -459,7 +468,7 @@ impl super::XhciController {
             });
             log::debug!("xHCI: Powered on port {}", port);
         }
-        crate::time::delay_ms(20);
+        exec::sleep_ms(20).await;
     }
 }
 
