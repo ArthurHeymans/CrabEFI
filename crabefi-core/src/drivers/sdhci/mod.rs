@@ -10,6 +10,7 @@ pub mod regs;
 use crate::barrier;
 use crate::drivers::pci::{self, PciAddress, PciDevice};
 use crate::efi::dma::{DmaBuffer, DmaCoherency, DmaDirection, DmaMask};
+use crate::exec;
 use crate::time::{Timeout, wait_for};
 use tock_registers::interfaces::{ReadWriteable, Readable, Writeable};
 
@@ -158,7 +159,7 @@ impl SdhciController {
     }
 
     /// Create a new SDHCI controller from a PCI device
-    pub fn new(pci_dev: &PciDevice) -> Result<Self, SdhciError> {
+    pub async fn new(pci_dev: &PciDevice) -> Result<Self, SdhciError> {
         let mmio_base = pci_dev.mmio_base().ok_or(SdhciError::NotInitialized)?;
 
         // Enable the device (bus master + memory space)
@@ -171,10 +172,11 @@ impl SdhciController {
             true,
             true,
         )
+        .await
     }
 
     /// Create a new SDHCI controller from an MMIO base address.
-    pub fn new_mmio(
+    pub async fn new_mmio(
         mmio_base: u64,
         identity: SdhciIdentity,
         media: SdhciMedia,
@@ -211,12 +213,12 @@ impl SdhciController {
             dma_buffer,
         };
 
-        controller.init()?;
+        controller.init().await?;
         Ok(controller)
     }
 
     /// Initialize the SDHCI controller
-    fn init(&mut self) -> Result<(), SdhciError> {
+    async fn init(&mut self) -> Result<(), SdhciError> {
         // Read version and capabilities - extract values before assigning to self
         let (version, vendor_version, capabilities, capabilities_1, base_clk) = {
             let regs = self.regs();
@@ -272,7 +274,7 @@ impl SdhciController {
         self.reset_all()?;
 
         // Select a bus voltage supported by the controller.
-        self.set_power()?;
+        self.set_power().await?;
 
         // Enable interrupts
         {
@@ -303,7 +305,7 @@ impl SdhciController {
         if self.card_present {
             log::info!("SDHCI: Card detected ({:?})", self.media);
             // Initialize the card
-            if let Err(e) = self.init_card() {
+            if let Err(e) = self.init_card().await {
                 log::error!("SDHCI: Failed to initialize card: {:?}", e);
                 return Err(e);
             }
@@ -356,7 +358,7 @@ impl SdhciController {
     }
 
     /// Set bus power to a voltage supported by the controller.
-    fn set_power(&mut self) -> Result<(), SdhciError> {
+    async fn set_power(&mut self) -> Result<(), SdhciError> {
         let (voltage, ocr_voltage) = {
             let regs = self.regs();
             if regs.capabilities.is_set(CAPABILITIES::SUPPORT_3V3) {
@@ -380,10 +382,7 @@ impl SdhciController {
         regs.power_control
             .write(POWER_CONTROL::BUS_POWER::SET + voltage);
 
-        let timeout = Timeout::from_ms(50);
-        while !timeout.is_expired() {
-            core::hint::spin_loop();
-        }
+        exec::sleep_ms(50).await;
 
         Ok(())
     }
@@ -639,15 +638,15 @@ impl SdhciController {
     }
 
     /// Initialize the SD card
-    fn init_card(&mut self) -> Result<(), SdhciError> {
+    async fn init_card(&mut self) -> Result<(), SdhciError> {
         match self.media {
-            SdhciMedia::Sd => self.init_sd_card(),
-            SdhciMedia::Emmc => self.init_emmc(),
+            SdhciMedia::Sd => self.init_sd_card().await,
+            SdhciMedia::Emmc => self.init_emmc().await,
         }
     }
 
     /// Initialize an SD card
-    fn init_sd_card(&mut self) -> Result<(), SdhciError> {
+    async fn init_sd_card(&mut self) -> Result<(), SdhciError> {
         // Set identification clock (400 kHz)
         self.set_clock(INIT_CLOCK_HZ)?;
 
@@ -655,20 +654,14 @@ impl SdhciController {
         self.set_bus_width(1);
 
         // Small delay for card power-up
-        let timeout = Timeout::from_ms(10);
-        while !timeout.is_expired() {
-            core::hint::spin_loop();
-        }
+        exec::sleep_ms(10).await;
 
         // CMD0: GO_IDLE_STATE
         log::debug!("SDHCI: Sending CMD0 (GO_IDLE_STATE)");
         let _ = self.send_command(MMC_CMD_GO_IDLE_STATE, 0, MMC_RSP_NONE);
 
         // Small delay
-        let timeout = Timeout::from_ms(5);
-        while !timeout.is_expired() {
-            core::hint::spin_loop();
-        }
+        exec::sleep_ms(5).await;
 
         // CMD8: SEND_IF_COND (check for SD 2.0+)
         // Argument: 0x1AA = VHS (2.7-3.6V) + check pattern
@@ -702,28 +695,24 @@ impl SdhciController {
         let timeout = Timeout::from_ms(1000);
         let mut ocr: u32 = 0;
 
-        while !timeout.is_expired() {
-            // CMD55: APP_CMD (prefix for ACMD)
-            if self.send_command(MMC_CMD_APP_CMD, 0, MMC_RSP_R1).is_err() {
-                continue;
-            }
-
-            // ACMD41: SD_SEND_OP_COND
-            match self.send_command(SD_CMD_APP_SEND_OP_COND, ocr_arg, MMC_RSP_R3) {
-                Ok(resp) => {
-                    ocr = resp[0];
-                    if ocr & OCR_BUSY != 0 {
-                        log::debug!("SDHCI: Card ready, OCR={:#010x}", ocr);
-                        break;
-                    }
+        // Poll once more after the deadline: other controllers may delay
+        // this task past it.
+        loop {
+            // CMD55: APP_CMD (prefix for ACMD), then ACMD41: SD_SEND_OP_COND
+            if self.send_command(MMC_CMD_APP_CMD, 0, MMC_RSP_R1).is_ok()
+                && let Ok(resp) = self.send_command(SD_CMD_APP_SEND_OP_COND, ocr_arg, MMC_RSP_R3)
+            {
+                ocr = resp[0];
+                if ocr & OCR_BUSY != 0 {
+                    log::debug!("SDHCI: Card ready, OCR={:#010x}", ocr);
+                    break;
                 }
-                Err(_) => continue,
             }
-
-            // Small delay before retry
-            for _ in 0..10000 {
-                core::hint::spin_loop();
+            if timeout.is_expired() {
+                break;
             }
+            // Card still powering up; let other controllers progress.
+            exec::sleep_ms(1).await;
         }
 
         if ocr & OCR_BUSY == 0 {
@@ -809,17 +798,14 @@ impl SdhciController {
     }
 
     /// Initialize a non-removable eMMC device.
-    fn init_emmc(&mut self) -> Result<(), SdhciError> {
+    async fn init_emmc(&mut self) -> Result<(), SdhciError> {
         const EMMC_RCA: u16 = 1;
         const EXT_CSD_SEC_COUNT: usize = 212;
 
         self.set_clock(INIT_CLOCK_HZ)?;
         self.set_bus_width(1);
 
-        let timeout = Timeout::from_ms(10);
-        while !timeout.is_expired() {
-            core::hint::spin_loop();
-        }
+        exec::sleep_ms(10).await;
 
         log::debug!("SDHCI: eMMC CMD0 (GO_IDLE_STATE)");
         let _ = self.send_command(MMC_CMD_GO_IDLE_STATE, 0, MMC_RSP_NONE);
@@ -828,16 +814,19 @@ impl SdhciController {
         let timeout = Timeout::from_ms(1000);
         let mut ocr = 0u32;
         let ocr_arg = OCR_HCS | self.ocr_voltage;
-        while !timeout.is_expired() {
+        // Poll once more after the deadline: other controllers may delay
+        // this task past it.
+        loop {
             if let Ok(resp) = self.send_command(MMC_CMD_SEND_OP_COND, ocr_arg, MMC_RSP_R3) {
                 ocr = resp[0];
                 if ocr & OCR_BUSY != 0 {
                     break;
                 }
             }
-            for _ in 0..10000 {
-                core::hint::spin_loop();
+            if timeout.is_expired() {
+                break;
             }
+            exec::sleep_ms(1).await;
         }
 
         if ocr & OCR_BUSY == 0 {
@@ -1408,6 +1397,13 @@ static SDHCI_CONTROLLERS: super::ControllerRegistry<SdhciController, MAX_SDHCI_C
 // Failures are logged at the error site; callers only branch on success.
 #[allow(clippy::result_unit_err)]
 pub fn init_device(dev: &pci::PciDevice) -> Result<(), ()> {
+    exec::block_on(init_controller(dev)).and_then(|c| register_controller(dev.address, c))
+}
+
+/// Bring up an SDHCI controller and its card without publishing it.
+// Failures are logged at the error site; callers only branch on success.
+#[allow(clippy::result_unit_err)]
+pub async fn init_controller(dev: &pci::PciDevice) -> Result<SdhciController, ()> {
     log::info!(
         "Initializing SDHCI controller at {}: {:04x}:{:04x}",
         dev.address,
@@ -1415,16 +1411,21 @@ pub fn init_device(dev: &pci::PciDevice) -> Result<(), ()> {
         dev.device_id
     );
 
-    let controller = SdhciController::new(dev).map_err(|e| {
+    SdhciController::new(dev).await.map_err(|e| {
         log::error!(
             "Failed to initialize SDHCI controller at {}: {:?}",
             dev.address,
             e
         );
-    })?;
+    })
+}
 
+/// Publish a controller from [`init_controller`] for block I/O.
+// Failures are logged at the error site; callers only branch on success.
+#[allow(clippy::result_unit_err)]
+pub fn register_controller(address: PciAddress, controller: SdhciController) -> Result<(), ()> {
     SDHCI_CONTROLLERS.register(controller)?;
-    log::info!("SDHCI controller at {} initialized", dev.address);
+    log::info!("SDHCI controller at {} initialized", address);
     Ok(())
 }
 
@@ -1444,7 +1445,7 @@ pub fn init_mmio_device(dev: &crate::fdt::DsdtDevice, media: SdhciMedia) -> Resu
         dev.mmio_size,
     );
 
-    let controller = SdhciController::new_mmio(
+    let controller = exec::block_on(SdhciController::new_mmio(
         dev.mmio_base,
         SdhciIdentity::Acpi {
             name: dev.name,
@@ -1455,7 +1456,7 @@ pub fn init_mmio_device(dev: &crate::fdt::DsdtDevice, media: SdhciMedia) -> Resu
         media,
         false,
         false,
-    )
+    ))
     .map_err(|e| {
         log::error!("Failed to initialize MMIO SDHCI controller: {:?}", e);
     })?;

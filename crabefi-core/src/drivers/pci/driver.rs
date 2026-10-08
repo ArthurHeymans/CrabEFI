@@ -7,9 +7,29 @@
 //! During PCI enumeration, the driver registry matches discovered devices against
 //! registered drivers and calls their lifecycle methods.
 
+use alloc::boxed::Box;
 use core::sync::atomic::{AtomicU8, Ordering};
 
 use super::PciDevice;
+use crate::exec::{self, BoxFuture};
+
+/// Publishes an initialized controller so the rest of the firmware can use it.
+///
+/// Returned by [`PciDriver::init`] so that hardware bring-up of all devices can
+/// run concurrently while registration (which assigns controller indices)
+/// still happens in PCI enumeration order.
+pub type Registration = Box<dyn FnOnce() -> Result<(), ()>>;
+
+/// Defer `register` of a successfully initialized controller.
+fn registration<C: 'static>(
+    device: &PciDevice,
+    controller: Result<C, ()>,
+    register: fn(super::PciAddress, C) -> Result<(), ()>,
+) -> Result<Registration, DriverError> {
+    let controller = controller.map_err(|()| DriverError::InitFailed)?;
+    let address = device.address;
+    Ok(Box::new(move || register(address, controller)))
+}
 
 /// Error type for driver operations
 #[derive(Debug)]
@@ -49,7 +69,8 @@ pub struct PciDriverMatch {
 ///
 /// 1. **Match**: PCI subsystem checks `match_criteria()` against discovered devices
 /// 2. **Probe**: `probe()` is called for matching devices to confirm the driver can handle them
-/// 3. **Init**: `init()` is called to initialize the hardware
+/// 3. **Init**: `init()` brings up the hardware; the returned [`Registration`]
+///    publishes the controller
 /// 4. **Shutdown**: `shutdown()` is called during ExitBootServices or system reset
 pub trait PciDriver: Sync {
     /// Human-readable driver name
@@ -77,11 +98,20 @@ pub trait PciDriver: Sync {
     /// Called after `probe()` returns `true`. The driver should:
     /// 1. Enable the device (bus master, memory/IO space)
     /// 2. Configure hardware (queues, ports, DMA, etc.)
-    /// 3. Register any discovered sub-devices (namespaces, ports, etc.)
+    /// 3. Discover sub-devices (namespaces, ports, etc.)
+    ///
+    /// Hardware waits must be awaited (see [`crate::exec`]) so other devices
+    /// initialize meanwhile. Publishing the controller (anything that assigns
+    /// it an index or makes it visible to other code) is left to the returned
+    /// [`Registration`]; short synchronous global accesses such as PCI config
+    /// or allocations are fine.
     ///
     /// # Arguments
     /// * `device` - The PCI device to initialize
-    fn init(&self, device: &PciDevice) -> Result<(), DriverError>;
+    fn init<'a>(
+        &'a self,
+        device: &'a PciDevice,
+    ) -> BoxFuture<'a, Result<Registration, DriverError>>;
 
     /// Shutdown all devices managed by this driver
     ///
@@ -120,8 +150,14 @@ impl PciDriver for NvmePciDriver {
         true // Accept all NVMe controllers
     }
 
-    fn init(&self, device: &PciDevice) -> Result<(), DriverError> {
-        nvme::init_device(device).map_err(|()| DriverError::InitFailed)
+    fn init<'a>(
+        &'a self,
+        device: &'a PciDevice,
+    ) -> BoxFuture<'a, Result<Registration, DriverError>> {
+        Box::pin(async move {
+            let controller = nvme::init_controller(device).await;
+            registration(device, controller, nvme::register_controller)
+        })
     }
 
     fn shutdown(&self) -> Result<(), DriverError> {
@@ -152,8 +188,14 @@ impl PciDriver for AhciPciDriver {
         true // Accept all AHCI controllers
     }
 
-    fn init(&self, device: &PciDevice) -> Result<(), DriverError> {
-        ahci::init_device(device).map_err(|()| DriverError::InitFailed)
+    fn init<'a>(
+        &'a self,
+        device: &'a PciDevice,
+    ) -> BoxFuture<'a, Result<Registration, DriverError>> {
+        Box::pin(async move {
+            let controller = ahci::init_controller(device).await;
+            registration(device, controller, ahci::register_controller)
+        })
     }
 
     fn shutdown(&self) -> Result<(), DriverError> {
@@ -187,8 +229,14 @@ impl PciDriver for UsbPciDriver {
             || (cfg!(feature = "xhci") && device.prog_if == 0x30)
     }
 
-    fn init(&self, device: &PciDevice) -> Result<(), DriverError> {
-        usb::init_device(device).map_err(|()| DriverError::InitFailed)
+    fn init<'a>(
+        &'a self,
+        device: &'a PciDevice,
+    ) -> BoxFuture<'a, Result<Registration, DriverError>> {
+        Box::pin(async move {
+            let controller = usb::init_controller(device).await;
+            registration(device, controller, usb::register_controller)
+        })
     }
 
     fn shutdown(&self) -> Result<(), DriverError> {
@@ -219,8 +267,14 @@ impl PciDriver for SdhciPciDriver {
         true
     }
 
-    fn init(&self, device: &PciDevice) -> Result<(), DriverError> {
-        sdhci::init_device(device).map_err(|()| DriverError::InitFailed)
+    fn init<'a>(
+        &'a self,
+        device: &'a PciDevice,
+    ) -> BoxFuture<'a, Result<Registration, DriverError>> {
+        Box::pin(async move {
+            let controller = sdhci::init_controller(device).await;
+            registration(device, controller, sdhci::register_controller)
+        })
     }
 
     fn shutdown(&self) -> Result<(), DriverError> {
@@ -242,16 +296,14 @@ static PCI_DRIVERS: &[&dyn PciDriver] = &[
 
 static BOUND_DRIVERS: AtomicU8 = AtomicU8::new(0);
 
-/// Bind drivers to a discovered PCI device
+/// Bring up a discovered PCI device with the first matching driver.
 ///
-/// Iterates the driver table and calls probe/init for the first matching driver.
-///
-/// # Arguments
-/// * `device` - The PCI device to bind
+/// Iterates the driver table and calls probe/init for the first matching
+/// driver whose initialization succeeds.
 ///
 /// # Returns
-/// The name of the driver that claimed the device, or None
-pub fn bind_driver(device: &PciDevice) -> Option<&'static str> {
+/// The claiming driver's table index and its pending registration, or None
+async fn init_device(device: &PciDevice) -> Option<(usize, Registration)> {
     for (driver_index, driver) in PCI_DRIVERS.iter().enumerate() {
         // Check match criteria
         let matches = driver.match_criteria().iter().any(|m| {
@@ -278,16 +330,8 @@ pub fn bind_driver(device: &PciDevice) -> Option<&'static str> {
             device.device_id
         );
 
-        match driver.init(device) {
-            Ok(()) => {
-                BOUND_DRIVERS.fetch_or(1 << driver_index, Ordering::Relaxed);
-                log::info!(
-                    "PCI {}: {} driver initialized successfully",
-                    device.address,
-                    driver.name()
-                );
-                return Some(driver.name());
-            }
+        match driver.init(device).await {
+            Ok(registration) => return Some((driver_index, registration)),
             Err(e) => {
                 log::error!(
                     "PCI {}: {} driver init failed: {}",
@@ -301,6 +345,49 @@ pub fn bind_driver(device: &PciDevice) -> Option<&'static str> {
     }
 
     None
+}
+
+/// Bind drivers to all discovered PCI devices.
+///
+/// Hardware bring-up of all devices runs concurrently, since it is dominated
+/// by waiting on the hardware. Controllers are then registered in device
+/// order so controller indices do not depend on which device was fastest.
+///
+/// # Returns
+/// The number of devices bound to a driver
+pub fn bind_all(devices: &[PciDevice]) -> usize {
+    let initialized = exec::block_on(exec::join_all(
+        devices
+            .iter()
+            .map(|device| {
+                Box::pin(init_device(device)) as BoxFuture<'_, Option<(usize, Registration)>>
+            })
+            .collect(),
+    ));
+
+    devices
+        .iter()
+        .zip(initialized)
+        .filter_map(|(device, initialized)| {
+            let (driver_index, register) = initialized?;
+            let name = PCI_DRIVERS[driver_index].name();
+            if register().is_err() {
+                log::error!(
+                    "PCI {}: {} driver registration failed",
+                    device.address,
+                    name
+                );
+                return None;
+            }
+            BOUND_DRIVERS.fetch_or(1 << driver_index, Ordering::Relaxed);
+            log::info!(
+                "PCI {}: {} driver initialized successfully",
+                device.address,
+                name
+            );
+            Some(())
+        })
+        .count()
 }
 
 /// Shutdown all PCI drivers

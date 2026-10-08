@@ -26,7 +26,9 @@ use crate::arch::{flush_cache_range, invalidate_cache_range};
 use crate::barrier;
 use crate::drivers::pci::{self, PciAddress, PciDevice};
 use crate::efi;
+use crate::exec::{self, BoxFuture};
 use crate::time::{Timeout, wait_for};
+use alloc::boxed::Box;
 use core::ptr;
 use tock_registers::interfaces::{ReadWriteable, Readable, Writeable};
 
@@ -378,7 +380,7 @@ impl EhciController {
     const FRAME_LIST_SIZE: usize = 1024;
 
     /// Create a new EHCI controller from a PCI device
-    pub fn new(pci_dev: &PciDevice) -> Result<Self, UsbError> {
+    pub async fn new(pci_dev: &PciDevice) -> Result<Self, UsbError> {
         // EHCI uses MMIO from BAR0
         let mmio_base = pci_dev.mmio_base().ok_or(UsbError::NotReady)?;
 
@@ -470,10 +472,10 @@ impl EhciController {
         controller.take_ownership(pci_dev.address, eecp)?;
 
         // Initialize the controller
-        controller.init()?;
+        controller.init().await?;
 
         // Enumerate ports
-        controller.enumerate_ports()?;
+        controller.enumerate_ports().await?;
 
         Ok(controller)
     }
@@ -536,23 +538,23 @@ impl EhciController {
     }
 
     /// Initialize the controller
-    fn init(&mut self) -> Result<(), UsbError> {
+    async fn init(&mut self) -> Result<(), UsbError> {
         // Stop the controller
         self.op().usbcmd.modify(USBCMD::RS::CLEAR);
 
         // Wait for halt
-        if !wait_for(100, || self.op().usbsts.is_set(USBSTS::HCHALTED)) {
+        if !exec::wait_for(100, || self.op().usbsts.is_set(USBSTS::HCHALTED)).await {
             log::warn!("EHCI: Controller did not halt");
         }
 
         // Reset the controller
         self.op().usbcmd.write(USBCMD::HCRESET::SET);
 
-        if !wait_for(250, || !self.op().usbcmd.is_set(USBCMD::HCRESET)) {
+        if !exec::wait_for(250, || !self.op().usbcmd.is_set(USBCMD::HCRESET)).await {
             return Err(UsbError::Timeout);
         }
 
-        crate::time::delay_ms(10);
+        exec::sleep_ms(10).await;
 
         // Set 64-bit segment selector to 0 (if supported)
         if self.has_64bit {
@@ -604,7 +606,7 @@ impl EhciController {
             .write(USBCMD::RS::SET + USBCMD::ITC::Micro8);
 
         // Wait for running
-        if !wait_for(100, || !self.op().usbsts.is_set(USBSTS::HCHALTED)) {
+        if !exec::wait_for(100, || !self.op().usbsts.is_set(USBSTS::HCHALTED)).await {
             log::error!("EHCI: Controller did not start");
             return Err(UsbError::Timeout);
         }
@@ -612,7 +614,7 @@ impl EhciController {
         // Set Configure Flag - route all ports to EHCI
         self.op().configflag.write(CONFIGFLAG::CF::SET);
 
-        crate::time::delay_ms(100);
+        exec::sleep_ms(100).await;
 
         log::info!("EHCI controller initialized");
         Ok(())
@@ -676,7 +678,7 @@ impl EhciController {
     }
 
     /// Reset a root-hub port before retrying enumeration.
-    fn reset_port_for_retry(&mut self, port: u8) -> Result<(), UsbError> {
+    async fn reset_port_for_retry(&mut self, port: u8) -> Result<(), UsbError> {
         let port_reg = self.port(port);
 
         if !port_reg.portsc.is_set(PORTSC::CCS) {
@@ -684,30 +686,33 @@ impl EhciController {
         }
 
         port_reg.portsc.modify(PORTSC::PR::SET + PORTSC::PE::CLEAR);
-        crate::time::delay_ms(50);
+        exec::sleep_ms(50).await;
         port_reg.portsc.modify(PORTSC::PR::CLEAR);
-        crate::time::delay_ms(100);
+        exec::sleep_ms(100).await;
 
-        let timeout = Timeout::from_ms(250);
-        while !timeout.is_expired() {
-            if !port_reg.portsc.is_set(PORTSC::CCS) {
-                return Err(UsbError::Disconnected);
-            }
-            if port_reg.portsc.is_set(PORTSC::PE) {
-                port_reg
-                    .portsc
-                    .modify(PORTSC::CSC::SET + PORTSC::PEC::SET + PORTSC::OCC::SET);
-                crate::time::delay_ms(10);
-                return Ok(());
-            }
-            crate::time::delay_ms(1);
+        exec::wait_for(250, || {
+            port_reg.portsc.is_set(PORTSC::PE) || !port_reg.portsc.is_set(PORTSC::CCS)
+        })
+        .await;
+        if !port_reg.portsc.is_set(PORTSC::CCS) {
+            return Err(UsbError::Disconnected);
         }
-
-        Err(UsbError::Timeout)
+        if !port_reg.portsc.is_set(PORTSC::PE) {
+            return Err(UsbError::Timeout);
+        }
+        port_reg
+            .portsc
+            .modify(PORTSC::CSC::SET + PORTSC::PEC::SET + PORTSC::OCC::SET);
+        exec::sleep_ms(10).await;
+        Ok(())
     }
 
     /// Enumerate ports
-    fn enumerate_ports(&mut self) -> Result<(), UsbError> {
+    ///
+    /// Ports are reset and addressed one at a time: devices on different
+    /// root ports share the bus, so two of them must never be in the default
+    /// (address 0) state together.
+    async fn enumerate_ports(&mut self) -> Result<(), UsbError> {
         log::trace!("EHCI: Enumerating {} ports", self.num_ports);
 
         for port in 0..self.num_ports {
@@ -737,27 +742,19 @@ impl EhciController {
             // Reset the port (set PR, clear PE)
             port_reg.portsc.modify(PORTSC::PR::SET + PORTSC::PE::CLEAR);
 
-            crate::time::delay_ms(50); // USB spec: 10-20ms reset, we use 50ms
+            exec::sleep_ms(50).await; // USB spec: 10-20ms reset, we use 50ms
 
             // Clear reset and let endpoint zero settle before the first setup packet.
             port_reg.portsc.modify(PORTSC::PR::CLEAR);
 
-            crate::time::delay_ms(100);
+            exec::sleep_ms(100).await;
 
-            // Wait for enable
-            let timeout = Timeout::from_ms(250);
-            let mut enabled = false;
-            while !timeout.is_expired() {
-                if port_reg.portsc.is_set(PORTSC::PE) {
-                    enabled = true;
-                    break;
-                }
-                if !port_reg.portsc.is_set(PORTSC::CCS) {
-                    // Device disconnected during reset
-                    break;
-                }
-                crate::time::delay_ms(1);
-            }
+            // Wait for enable (or disconnect during reset)
+            exec::wait_for(250, || {
+                port_reg.portsc.is_set(PORTSC::PE) || !port_reg.portsc.is_set(PORTSC::CCS)
+            })
+            .await;
+            let enabled = port_reg.portsc.is_set(PORTSC::PE);
 
             if !enabled {
                 // Check if it's a full-speed device (should go to companion)
@@ -776,10 +773,10 @@ impl EhciController {
                 .portsc
                 .modify(PORTSC::CSC::SET + PORTSC::PEC::SET + PORTSC::OCC::SET);
 
-            crate::time::delay_ms(50);
+            exec::sleep_ms(50).await;
 
             // Device is high-speed if enabled on EHCI
-            if let Err(e) = self.attach_device(port, UsbSpeed::High) {
+            if let Err(e) = self.attach_device(port, UsbSpeed::High).await {
                 log::error!("Failed to attach device on port {}: {:?}", port, e);
             }
         }
@@ -788,7 +785,7 @@ impl EhciController {
     }
 
     /// Attach a device on a port
-    fn attach_device(&mut self, port: u8, speed: UsbSpeed) -> Result<(), UsbError> {
+    async fn attach_device(&mut self, port: u8, speed: UsbSpeed) -> Result<(), UsbError> {
         let address = self.next_address;
         if address >= 128 {
             return Err(UsbError::NoFreeSlots);
@@ -821,7 +818,7 @@ impl EhciController {
                             attempt + 1,
                             last_error
                         );
-                        self.reset_port_for_retry(port)?;
+                        self.reset_port_for_retry(port).await?;
                     }
                 }
             }
@@ -836,7 +833,7 @@ impl EhciController {
         self.devices[slot] = Some(device);
 
         // If this is a hub, enumerate its downstream ports
-        if is_hub && let Err(e) = self.enumerate_hub(slot, hub_address) {
+        if is_hub && let Err(e) = self.enumerate_hub(slot, hub_address).await {
             log::warn!("Failed to enumerate hub ports: {:?}", e);
             // Don't fail the device attachment, hub is still usable
         }
@@ -845,7 +842,7 @@ impl EhciController {
     }
 
     /// Attach a device on a hub port (for devices behind hubs)
-    fn attach_device_on_hub(
+    async fn attach_device_on_hub(
         &mut self,
         hub_port: u8,
         speed: UsbSpeed,
@@ -877,7 +874,7 @@ impl EhciController {
         self.devices[slot] = Some(device);
 
         // If this is a hub, enumerate its downstream ports (recursive)
-        if is_hub && let Err(e) = self.enumerate_hub(slot, new_hub_address) {
+        if is_hub && let Err(e) = self.enumerate_hub(slot, new_hub_address).await {
             log::warn!("Failed to enumerate nested hub ports: {:?}", e);
         }
 
@@ -904,7 +901,17 @@ impl EhciController {
     }
 
     /// Enumerate devices connected to a USB hub.
-    fn enumerate_hub(&mut self, hub_slot: usize, hub_addr: u8) -> Result<(), UsbError> {
+    ///
+    /// Boxed because hubs nest: attaching a hub port device may recurse here.
+    fn enumerate_hub(
+        &mut self,
+        hub_slot: usize,
+        hub_addr: u8,
+    ) -> BoxFuture<'_, Result<(), UsbError>> {
+        Box::pin(self.enumerate_hub_inner(hub_slot, hub_addr))
+    }
+
+    async fn enumerate_hub_inner(&mut self, hub_slot: usize, hub_addr: u8) -> Result<(), UsbError> {
         log::info!("EHCI: Enumerating hub at address {}", hub_addr);
 
         let hub_device = self.devices[hub_slot]
@@ -948,7 +955,7 @@ impl EhciController {
         }
 
         // Wait for power to stabilise (spec minimum 100 ms).
-        crate::time::delay_ms(power_on_delay.max(100));
+        exec::sleep_ms(power_on_delay.max(100)).await;
 
         // Reset and enumerate one port at a time.  Do not pre-reset every
         // connected port: that leaves multiple devices simultaneously in the
@@ -986,8 +993,8 @@ impl EhciController {
 
             log::info!("  Device detected on hub port {}", port);
 
-            if let Some(speed) = self.reset_hub_port(&hub_device, port, port_change)
-                && let Err(e) = self.attach_device_on_hub(port, speed, hub_addr, port)
+            if let Some(speed) = self.reset_hub_port(&hub_device, port, port_change).await
+                && let Err(e) = self.attach_device_on_hub(port, speed, hub_addr, port).await
             {
                 log::warn!("  Failed to attach device on hub port {}: {:?}", port, e);
             }
@@ -996,7 +1003,7 @@ impl EhciController {
         Ok(())
     }
 
-    fn reset_hub_port(
+    async fn reset_hub_port(
         &mut self,
         hub_device: &UsbDevice,
         port: u8,
@@ -1030,10 +1037,12 @@ impl EhciController {
         }
 
         // Wait at least 50 ms then poll for C_PORT_RESET.
-        crate::time::delay_ms(50);
+        exec::sleep_ms(50).await;
 
         let timeout = Timeout::from_ms(500);
-        while !timeout.is_expired() {
+        // Check status after the deadline too: other controllers may delay
+        // this task past it.
+        loop {
             let mut status_buf = [0u8; 4];
             if self
                 .hub_port_class_request(
@@ -1076,11 +1085,14 @@ impl EhciController {
                 };
 
                 log::info!("  Hub port {} reset complete, speed: {:?}", port, speed);
-                crate::time::delay_ms(10); // USB spec reset-recovery time
+                exec::sleep_ms(10).await; // USB spec reset-recovery time
                 return Some(speed);
             }
 
-            crate::time::delay_ms(10);
+            if timeout.is_expired() {
+                break;
+            }
+            exec::sleep_ms(10).await;
         }
 
         log::warn!("  Hub port {} reset timed out", port);

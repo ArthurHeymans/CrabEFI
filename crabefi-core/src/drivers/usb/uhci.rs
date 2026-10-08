@@ -16,6 +16,7 @@ use crate::arch::{flush_cache_range, invalidate_cache_range};
 use crate::barrier;
 use crate::drivers::pci::{self, PciAddress, PciDevice};
 use crate::efi;
+use crate::exec;
 use crate::time::{Timeout, wait_for};
 use core::ptr;
 use tock_registers::interfaces::{ReadWriteable, Readable, Writeable};
@@ -291,7 +292,7 @@ impl UhciController {
     const FRAME_LIST_SIZE: usize = 1024;
 
     /// Create a new UHCI controller from a PCI device
-    pub fn new(pci_dev: &PciDevice) -> Result<Self, UsbError> {
+    pub async fn new(pci_dev: &PciDevice) -> Result<Self, UsbError> {
         // UHCI uses I/O ports, not MMIO
         // BAR4 (or BAR0 on some) contains the I/O base
         let io_base = pci_dev.io_base().ok_or(UsbError::NotReady)? as u16;
@@ -327,7 +328,7 @@ impl UhciController {
             dma_buffer,
         };
 
-        controller.init()?;
+        controller.init().await?;
 
         // Port enumeration is deferred to rescan_ports(), called after all
         // USB controllers are initialized. On ICH8/9/10 chipsets, UHCI
@@ -392,7 +393,7 @@ impl UhciController {
     }
 
     /// Initialize the controller
-    fn init(&mut self) -> Result<(), UsbError> {
+    async fn init(&mut self) -> Result<(), UsbError> {
         // First disable legacy support (BIOS keyboard emulation via SMM)
         self.disable_legacy_support();
 
@@ -406,14 +407,14 @@ impl UhciController {
 
         // Global reset
         regs.usbcmd().write(USBCMD::GRESET::SET);
-        crate::time::delay_ms(50);
+        exec::sleep_ms(50).await;
         regs.usbcmd().set(0);
-        crate::time::delay_ms(10);
+        exec::sleep_ms(10).await;
 
         // Host controller reset
         regs.usbcmd().write(USBCMD::HCRESET::SET);
 
-        if !wait_for(100, || !regs.usbcmd().is_set(USBCMD::HCRESET)) {
+        if !exec::wait_for(100, || !regs.usbcmd().is_set(USBCMD::HCRESET)).await {
             return Err(UsbError::Timeout);
         }
 
@@ -450,9 +451,9 @@ impl UhciController {
             .write(USBCMD::RS::SET + USBCMD::CF::SET + USBCMD::MAXP::SET);
 
         // Wait for running
-        wait_for(100, || !regs.usbsts().is_set(USBSTS::HCHALTED));
+        exec::wait_for(100, || !regs.usbsts().is_set(USBSTS::HCHALTED)).await;
 
-        crate::time::delay_ms(100);
+        exec::sleep_ms(100).await;
 
         log::info!("UHCI controller initialized");
         Ok(())

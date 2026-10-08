@@ -11,6 +11,7 @@ use crate::arch::{flush_cache_range, invalidate_cache_range};
 use crate::barrier;
 use crate::drivers::pci::{self, PciAddress, PciDevice};
 use crate::efi;
+use crate::exec;
 use crate::time::{Timeout, wait_for};
 use core::ptr;
 use tock_registers::interfaces::{ReadWriteable, Readable, Writeable};
@@ -289,7 +290,7 @@ impl OhciController {
     const DMA_BUFFER_SIZE: usize = 64 * 1024;
 
     /// Create a new OHCI controller from a PCI device
-    pub fn new(pci_dev: &PciDevice) -> Result<Self, UsbError> {
+    pub async fn new(pci_dev: &PciDevice) -> Result<Self, UsbError> {
         let mmio_base = pci_dev.mmio_base().ok_or(UsbError::NotReady)?;
 
         // Enable the device (bus master + memory space)
@@ -342,8 +343,8 @@ impl OhciController {
             dma_buffer,
         };
 
-        controller.init()?;
-        controller.enumerate_ports()?;
+        controller.init().await?;
+        controller.enumerate_ports().await?;
 
         Ok(controller)
     }
@@ -395,7 +396,7 @@ impl OhciController {
     }
 
     /// Initialize the controller
-    fn init(&mut self) -> Result<(), UsbError> {
+    async fn init(&mut self) -> Result<(), UsbError> {
         // Save frame interval (raw access for complex bit manipulation)
         let fminterval = self.regs().hcfminterval.get();
         let fminterval_toggle = fminterval & (1 << 31);
@@ -404,7 +405,7 @@ impl OhciController {
         if self.regs().hccontrol.is_set(HCCONTROL::IR) {
             // Request ownership
             self.regs().hccommandstatus.write(HCCOMMANDSTATUS::OCR::SET);
-            wait_for(500, || !self.regs().hccontrol.is_set(HCCONTROL::IR));
+            exec::wait_for(500, || !self.regs().hccontrol.is_set(HCCONTROL::IR)).await;
         }
 
         // Determine current state
@@ -413,7 +414,7 @@ impl OhciController {
         if current_state != 0 {
             // HCFS::Reset == 0; if not in reset, put into reset
             self.regs().hccontrol.write(HCCONTROL::HCFS::Reset);
-            crate::time::delay_ms(50);
+            exec::sleep_ms(50).await;
         }
 
         // Reset the controller
@@ -465,14 +466,14 @@ impl OhciController {
         // Power on all ports (LPSC - Local Power Status Change)
         self.regs().hcrhstatus.write(HCRHSTATUS::LPSC::SET);
 
-        crate::time::delay_ms(100); // Wait for power to stabilize
+        exec::sleep_ms(100).await; // Wait for power to stabilize
 
         log::info!("OHCI controller initialized");
         Ok(())
     }
 
     /// Enumerate ports and attach devices
-    fn enumerate_ports(&mut self) -> Result<(), UsbError> {
+    async fn enumerate_ports(&mut self) -> Result<(), UsbError> {
         for port_num in 0..self.num_ports {
             let port = self.port(port_num);
             let portsc = port.portsc.get();
@@ -506,11 +507,12 @@ impl OhciController {
             self.port(port_num).portsc.write(HCRHPORTSTATUS::PRS::SET);
 
             // Wait for reset complete
-            wait_for(100, || {
+            exec::wait_for(100, || {
                 !self.port(port_num).portsc.is_set(HCRHPORTSTATUS::PRS)
-            });
+            })
+            .await;
 
-            crate::time::delay_ms(10); // Recovery time
+            exec::sleep_ms(10).await; // Recovery time
 
             // Clear status change
             self.port(port_num).portsc.write(HCRHPORTSTATUS::PRSC::SET);

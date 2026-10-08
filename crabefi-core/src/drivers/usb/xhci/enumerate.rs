@@ -5,7 +5,10 @@ use super::super::controller::{
 };
 use super::XhciError;
 use crate::barrier;
-use crate::time::Timeout;
+use crate::exec::{self, BoxFuture};
+use alloc::boxed::Box;
+use alloc::vec::Vec;
+use core::cell::RefCell;
 use xhci::ring::trb::command;
 
 impl super::XhciController {
@@ -13,7 +16,17 @@ impl super::XhciController {
     ///
     /// This mirrors the EHCI `enumerate_hub()` logic adapted for xHCI's
     /// route-string-based addressing model.
+    ///
+    /// Boxed because hubs nest: attaching a hub port device may recurse here.
     pub(super) fn configure_and_enumerate_hub(
+        &mut self,
+        hub_slot_id: u8,
+        root_port: u8,
+    ) -> BoxFuture<'_, Result<(), XhciError>> {
+        Box::pin(self.configure_and_enumerate_hub_inner(hub_slot_id, root_port))
+    }
+
+    async fn configure_and_enumerate_hub_inner(
         &mut self,
         hub_slot_id: u8,
         root_port: u8,
@@ -93,7 +106,7 @@ impl super::XhciController {
             );
         }
 
-        crate::time::delay_ms(power_delay.max(100));
+        exec::sleep_ms(power_delay.max(100)).await;
 
         // Check each port for connected devices
         for p in 1..=num_ports {
@@ -139,13 +152,15 @@ impl super::XhciController {
                 None,
             );
 
-            crate::time::delay_ms(60);
+            exec::sleep_ms(60).await;
 
             // Poll for reset completion
             let timeout = crate::time::Timeout::from_ms(500);
             let mut speed = 0u8;
             let mut reset_ok = false;
-            while !timeout.is_expired() {
+            // Check status after the deadline too: other controllers may
+            // delay this task past it.
+            loop {
                 let mut sb = [0u8; 4];
                 if self
                     .control_transfer(
@@ -185,7 +200,10 @@ impl super::XhciController {
                     }
                     break;
                 }
-                crate::time::delay_ms(10);
+                if timeout.is_expired() {
+                    break;
+                }
+                exec::sleep_ms(10).await;
             }
 
             if !reset_ok {
@@ -193,7 +211,7 @@ impl super::XhciController {
                 continue;
             }
 
-            crate::time::delay_ms(10);
+            exec::sleep_ms(10).await;
 
             // Build route string: parent's route | (port << (4 * tier))
             let parent_route = self
@@ -212,7 +230,10 @@ impl super::XhciController {
             }
 
             // Enable slot and address the downstream device
-            if let Err(e) = self.attach_device_on_hub(hub_slot_id, p, speed, route, root_port) {
+            if let Err(e) = self
+                .attach_device_on_hub(hub_slot_id, p, speed, route, root_port)
+                .await
+            {
                 log::warn!("Failed to attach device on hub port {}: {:?}", p, e);
             }
         }
@@ -260,7 +281,7 @@ impl super::XhciController {
     }
 
     /// Attach a device that is behind a USB hub.
-    pub(super) fn attach_device_on_hub(
+    pub(super) async fn attach_device_on_hub(
         &mut self,
         hub_slot_id: u8,
         hub_port: u8,
@@ -313,7 +334,7 @@ impl super::XhciController {
 
                 // Nested hub support (one level deep to keep it simple)
                 if class == 0x09
-                    && let Err(e) = self.configure_and_enumerate_hub(slot_id, root_port)
+                    && let Err(e) = self.configure_and_enumerate_hub(slot_id, root_port).await
                 {
                     log::debug!("Nested hub enum failed: {:?}", e);
                 }
@@ -327,212 +348,231 @@ impl super::XhciController {
     }
 
     /// Enumerate ports and attach devices
-    pub(super) fn enumerate_ports(&mut self) -> Result<(), XhciError> {
-        for port in 0..self.num_ports {
-            if !self.portsc(port).current_connect_status() {
-                continue;
-            }
+    pub(super) async fn enumerate_ports(&mut self) -> Result<(), XhciError> {
+        // Link bring-up (debounce, resets) only touches each port's own
+        // PORTSC, so run it for all root ports at once. Device attachment
+        // goes through the shared command ring and stays sequential.
+        let ports: Vec<u8> = (0..self.num_ports).collect();
+        let link_up = {
+            let this = RefCell::new(&mut *self);
+            exec::join_all(
+                ports
+                    .iter()
+                    .map(|&port| {
+                        Box::pin(Self::bring_up_root_port(&this, port)) as BoxFuture<'_, bool>
+                    })
+                    .collect(),
+            )
+            .await
+        };
 
-            let mut stable_count = 0;
-            for _ in 0..5 {
-                if self.portsc(port).current_connect_status() {
-                    stable_count += 1;
-                } else {
-                    stable_count = 0;
-                }
-                crate::time::delay_ms(10);
-            }
-            if stable_count < 3 {
-                continue;
-            }
-
-            let status = self.portsc(port);
-            let speed = status.port_speed();
-            let link_state = status.port_link_state();
-            let speed_name = match speed {
-                1 => "Full",
-                2 => "Low",
-                3 => "High",
-                4 => "Super",
-                _ => "Unknown",
-            };
-            let link_name = match link_state {
-                0 => "U0",
-                5 => "RxDetect",
-                7 => "Polling",
-                _ => "Other",
-            };
-            log::info!(
-                "USB device on port {}: {} speed, PLS={}",
-                port,
-                speed_name,
-                link_name
-            );
-
-            if link_state == 5 {
-                log::debug!("Port {}: RxDetect state (phantom device), skipping", port);
-                continue;
-            }
-
-            self.clear_port_changes(port);
-
-            let status = self.portsc(port);
-            let is_usb3 = speed == 4;
-            if is_usb3 && status.port_enabled_disabled() && status.port_link_state() == 0 {
-                log::debug!("Port {}: USB3 device already in U0, skipping reset", port);
-            } else if is_usb3 && status.port_link_state() == 7 {
-                log::debug!("Port {}: USB3 device in Polling, waiting for link", port);
-                let timeout = Timeout::from_ms(200);
-                let mut link_up = false;
-                while !timeout.is_expired() {
-                    let status = self.portsc(port);
-                    if status.port_link_state() == 0 && status.port_enabled_disabled() {
-                        link_up = true;
-                        break;
-                    }
-                    crate::time::delay_ms(1);
-                }
-                if !link_up {
-                    log::debug!(
-                        "Port {}: USB3 link training failed (PLS={}), skipping",
-                        port,
-                        self.portsc(port).port_link_state()
-                    );
-                    continue;
-                }
-            } else if !status.port_enabled_disabled() {
-                self.update_portsc(port, |portsc| {
-                    portsc.set_port_reset();
-                });
-
-                let timeout = Timeout::from_ms(150);
-                while !timeout.is_expired() {
-                    if self.portsc(port).port_reset_change() {
-                        self.update_portsc(port, |portsc| {
-                            portsc.clear_port_reset_change();
-                        });
-                        break;
-                    }
-                    crate::time::delay_ms(1);
-                }
-
-                if self.portsc(port).port_link_state() != 0 {
-                    if is_usb3 {
-                        log::debug!(
-                            "Port {}: USB3 normal reset failed (PLS={}), trying warm reset",
-                            port,
-                            self.portsc(port).port_link_state()
-                        );
-                        self.update_portsc(port, |portsc| {
-                            portsc.set_warm_port_reset();
-                        });
-
-                        let timeout = Timeout::from_ms(200);
-                        while !timeout.is_expired() {
-                            if self.portsc(port).warm_port_reset_change() {
-                                self.update_portsc(port, |portsc| {
-                                    portsc.clear_warm_port_reset_change();
-                                });
-                                break;
-                            }
-                            crate::time::delay_ms(1);
-                        }
-
-                        if self.portsc(port).port_link_state() != 0 {
-                            log::debug!(
-                                "Port {}: link not up after warm reset (PLS={}), skipping",
-                                port,
-                                self.portsc(port).port_link_state()
-                            );
-                            continue;
-                        }
-                        log::debug!("Port {}: warm reset successful", port);
-                    } else {
-                        log::debug!(
-                            "Port {}: link not up after reset (PLS={}), skipping",
-                            port,
-                            self.portsc(port).port_link_state()
-                        );
-                        continue;
-                    }
-                }
-            }
-
-            // USB2 speed is not reliable until reset has enabled the port.
-            let status = self.portsc(port);
-            if !status.current_connect_status() || !status.port_enabled_disabled() {
-                continue;
-            }
-            let speed = status.port_speed();
-
-            // Enable slot and address device
-            match self.enable_slot() {
-                Ok(slot_id) => {
-                    log::debug!("Enabled slot {}", slot_id);
-
-                    if let Err(e) = self.address_device(slot_id, port, speed) {
-                        log::error!("Failed to address device on port {}: {:?}", port, e);
-                        continue;
-                    }
-
-                    // Get device descriptor
-                    match self.get_device_descriptor(slot_id) {
-                        Ok(desc) => {
-                            // Copy fields to avoid alignment issues
-                            let vid = desc.vendor_id;
-                            let pid = desc.product_id;
-                            let class = desc.device_class;
-                            let num_configs = desc.num_configurations;
-
-                            log::info!("  VID={:04x} PID={:04x} Class={:02x}", vid, pid, class);
-
-                            if let Some(slot) = self
-                                .slots
-                                .get_mut(slot_id as usize)
-                                .and_then(|s| s.as_mut())
-                            {
-                                slot.device_desc = desc;
-                            }
-
-                            // Try to configure as mass storage (class 0x08)
-                            if (class == 0x08 || (class == 0x00 && num_configs > 0))
-                                && let Err(e) = self.configure_mass_storage(slot_id)
-                            {
-                                log::debug!("Not a mass storage device: {:?}", e);
-                            }
-
-                            // Try to configure as HID keyboard (class 0x03 or class 0x00)
-                            if (class == 0x03 || (class == 0x00 && num_configs > 0))
-                                && let Err(e) = self.configure_hid_keyboard(slot_id)
-                            {
-                                log::debug!("Not a HID keyboard: {:?}", e);
-                            }
-
-                            // Try to configure as HID mouse (class 0x03 or class 0x00)
-                            if (class == 0x03 || (class == 0x00 && num_configs > 0))
-                                && let Err(e) = self.configure_hid_mouse(slot_id)
-                            {
-                                log::debug!("Not a HID mouse: {:?}", e);
-                            }
-
-                            // If it's a hub, enumerate its downstream ports
-                            if (class == 0x09 || (class == 0x00 && num_configs > 0))
-                                && let Err(e) = self.configure_and_enumerate_hub(slot_id, port)
-                            {
-                                log::debug!("Not a hub or hub enum failed: {:?}", e);
-                            }
-                        }
-                        Err(e) => {
-                            log::error!("Failed to get device descriptor: {:?}", e);
-                        }
-                    }
-                }
-                Err(e) => {
-                    log::error!("Failed to enable slot for port {}: {:?}", port, e);
-                }
-            }
+        for (port, _) in ports.into_iter().zip(link_up).filter(|(_, up)| *up) {
+            self.attach_root_port_device(port).await;
         }
 
         Ok(())
+    }
+
+    /// Debounce a root port connection and bring its link to U0/enabled.
+    ///
+    /// `this` is only borrowed between awaits so all ports can share it.
+    async fn bring_up_root_port(this: &RefCell<&mut Self>, port: u8) -> bool {
+        let portsc = || this.borrow().portsc(port);
+        let update_portsc =
+            |update: fn(&mut xhci::registers::operational::PortStatusAndControlRegister)| {
+                this.borrow_mut().update_portsc(port, update)
+            };
+
+        if !portsc().current_connect_status() {
+            return false;
+        }
+
+        let mut stable_count = 0;
+        for _ in 0..5 {
+            if portsc().current_connect_status() {
+                stable_count += 1;
+            } else {
+                stable_count = 0;
+            }
+            exec::sleep_ms(10).await;
+        }
+        if stable_count < 3 {
+            return false;
+        }
+
+        let status = portsc();
+        let speed = status.port_speed();
+        let link_state = status.port_link_state();
+        let speed_name = match speed {
+            1 => "Full",
+            2 => "Low",
+            3 => "High",
+            4 => "Super",
+            _ => "Unknown",
+        };
+        let link_name = match link_state {
+            0 => "U0",
+            5 => "RxDetect",
+            7 => "Polling",
+            _ => "Other",
+        };
+        log::info!(
+            "USB device on port {}: {} speed, PLS={}",
+            port,
+            speed_name,
+            link_name
+        );
+
+        if link_state == 5 {
+            log::debug!("Port {}: RxDetect state (phantom device), skipping", port);
+            return false;
+        }
+
+        this.borrow_mut().clear_port_changes(port);
+
+        let status = portsc();
+        let is_usb3 = speed == 4;
+        if is_usb3 && status.port_enabled_disabled() && status.port_link_state() == 0 {
+            log::debug!("Port {}: USB3 device already in U0, skipping reset", port);
+        } else if is_usb3 && status.port_link_state() == 7 {
+            log::debug!("Port {}: USB3 device in Polling, waiting for link", port);
+            let link_up = exec::wait_for(200, || {
+                let status = portsc();
+                status.port_link_state() == 0 && status.port_enabled_disabled()
+            })
+            .await;
+            if !link_up {
+                log::debug!(
+                    "Port {}: USB3 link training failed (PLS={}), skipping",
+                    port,
+                    portsc().port_link_state()
+                );
+                return false;
+            }
+        } else if !status.port_enabled_disabled() {
+            update_portsc(|portsc| {
+                portsc.set_port_reset();
+            });
+
+            if exec::wait_for(150, || portsc().port_reset_change()).await {
+                update_portsc(|portsc| {
+                    portsc.clear_port_reset_change();
+                });
+            }
+
+            if portsc().port_link_state() != 0 {
+                if !is_usb3 {
+                    log::debug!(
+                        "Port {}: link not up after reset (PLS={}), skipping",
+                        port,
+                        portsc().port_link_state()
+                    );
+                    return false;
+                }
+                log::debug!(
+                    "Port {}: USB3 normal reset failed (PLS={}), trying warm reset",
+                    port,
+                    portsc().port_link_state()
+                );
+                update_portsc(|portsc| {
+                    portsc.set_warm_port_reset();
+                });
+
+                if exec::wait_for(200, || portsc().warm_port_reset_change()).await {
+                    update_portsc(|portsc| {
+                        portsc.clear_warm_port_reset_change();
+                    });
+                }
+
+                if portsc().port_link_state() != 0 {
+                    log::debug!(
+                        "Port {}: link not up after warm reset (PLS={}), skipping",
+                        port,
+                        portsc().port_link_state()
+                    );
+                    return false;
+                }
+                log::debug!("Port {}: warm reset successful", port);
+            }
+        }
+
+        true
+    }
+
+    /// Address and configure the device behind an enabled root port.
+    async fn attach_root_port_device(&mut self, port: u8) {
+        // USB2 speed is not reliable until reset has enabled the port.
+        let status = self.portsc(port);
+        if !status.current_connect_status() || !status.port_enabled_disabled() {
+            return;
+        }
+        let speed = status.port_speed();
+
+        // Enable slot and address device
+        match self.enable_slot() {
+            Ok(slot_id) => {
+                log::debug!("Enabled slot {}", slot_id);
+
+                if let Err(e) = self.address_device(slot_id, port, speed) {
+                    log::error!("Failed to address device on port {}: {:?}", port, e);
+                    return;
+                }
+
+                // Get device descriptor
+                match self.get_device_descriptor(slot_id) {
+                    Ok(desc) => {
+                        // Copy fields to avoid alignment issues
+                        let vid = desc.vendor_id;
+                        let pid = desc.product_id;
+                        let class = desc.device_class;
+                        let num_configs = desc.num_configurations;
+
+                        log::info!("  VID={:04x} PID={:04x} Class={:02x}", vid, pid, class);
+
+                        if let Some(slot) = self
+                            .slots
+                            .get_mut(slot_id as usize)
+                            .and_then(|s| s.as_mut())
+                        {
+                            slot.device_desc = desc;
+                        }
+
+                        // Try to configure as mass storage (class 0x08)
+                        if (class == 0x08 || (class == 0x00 && num_configs > 0))
+                            && let Err(e) = self.configure_mass_storage(slot_id)
+                        {
+                            log::debug!("Not a mass storage device: {:?}", e);
+                        }
+
+                        // Try to configure as HID keyboard (class 0x03 or class 0x00)
+                        if (class == 0x03 || (class == 0x00 && num_configs > 0))
+                            && let Err(e) = self.configure_hid_keyboard(slot_id)
+                        {
+                            log::debug!("Not a HID keyboard: {:?}", e);
+                        }
+
+                        // Try to configure as HID mouse (class 0x03 or class 0x00)
+                        if (class == 0x03 || (class == 0x00 && num_configs > 0))
+                            && let Err(e) = self.configure_hid_mouse(slot_id)
+                        {
+                            log::debug!("Not a HID mouse: {:?}", e);
+                        }
+
+                        // If it's a hub, enumerate its downstream ports
+                        if (class == 0x09 || (class == 0x00 && num_configs > 0))
+                            && let Err(e) = self.configure_and_enumerate_hub(slot_id, port).await
+                        {
+                            log::debug!("Not a hub or hub enum failed: {:?}", e);
+                        }
+                    }
+                    Err(e) => {
+                        log::error!("Failed to get device descriptor: {:?}", e);
+                    }
+                }
+            }
+            Err(e) => {
+                log::error!("Failed to enable slot for port {}: {:?}", port, e);
+            }
+        }
     }
 }

@@ -501,12 +501,7 @@ pub fn bind_drivers() {
 
     let devices = PCI.borrow().devices.clone();
 
-    let mut bound_count = 0;
-    for device in devices.iter() {
-        if driver::bind_driver(device).is_some() {
-            bound_count += 1;
-        }
-    }
+    let bound_count = driver::bind_all(&devices);
 
     log::info!("PCI driver binding complete: {} devices bound", bound_count);
 }

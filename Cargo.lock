@@ -119,6 +119,7 @@ dependencies = [
  "crabefi-pkcs7",
  "crabefi-runtime-abi",
  "crabefi-runtime-bundle",
+ "embassy-futures",
  "fdt",
  "heapless 0.9.3",
  "linked_list_allocator",
@@ -221,6 +222,12 @@ dependencies = [
  "block-buffer 0.12.1",
  "crypto-common 0.2.2",
 ]
+
+[[package]]
+name = "embassy-futures"
+version = "0.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dc2d050bdc5c21e0862a89256ed8029ae6c290a93aecefc73084b3002cdebb01"
 
 [[package]]
 name = "embedded-io"
