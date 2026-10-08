@@ -467,6 +467,9 @@ extern "efiapi" fn file_get_info(
         return fill_file_info(handle.file.entry(), name, buffer_size, buffer);
     }
     if guid == FILE_SYSTEM_VOLUME_LABEL_GUID {
+        if let Err(status) = with_fat(|_| Ok(())) {
+            return status;
+        }
         return unsafe { info::write_volume_label(buffer, buffer_size, VOLUME_LABEL) };
     }
     if guid != FILE_SYSTEM_INFO_GUID {

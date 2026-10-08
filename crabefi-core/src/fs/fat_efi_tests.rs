@@ -91,8 +91,54 @@ fn efi_file_identity_metadata_and_durability() {
     existing_read_only_file_cannot_be_overwritten();
     creation_preserves_attributes_and_utf16_names();
     filesystem_info_uses_the_flexible_label_offset();
+    volume_label_rejects_changed_media();
     opens_are_relative_to_the_source_location_not_its_access_mode();
     exhausted_handle_pool_does_not_create_a_file();
+}
+
+fn volume_label_rejects_changed_media() {
+    struct ChangingMediaDisk {
+        disk: RamDisk,
+        media_id: alloc::rc::Rc<core::cell::Cell<u32>>,
+    }
+    impl BlockDevice for ChangingMediaDisk {
+        fn info(&self) -> BlockDeviceInfo {
+            BlockDeviceInfo {
+                media_id: self.media_id.get(),
+                removable: true,
+                read_only: true,
+                ..self.disk.info()
+            }
+        }
+        fn read_blocks(&mut self, lba: u64, count: u32, out: &mut [u8]) -> Result<(), BlockError> {
+            self.disk.read_blocks(lba, count, out)
+        }
+    }
+
+    let media_id = alloc::rc::Rc::new(core::cell::Cell::new(1));
+    let root = mount_disk(ChangingMediaDisk {
+        disk: format(LAYOUTS[0]),
+        media_id: media_id.clone(),
+    });
+    let mut guid = ef::SYSTEM_VOLUME_LABEL_ID;
+    let mut buffer = [0u16; 4];
+    let mut size = core::mem::size_of_val(&buffer);
+    assert_eq!(
+        unsafe { ((*root).get_info)(root, &mut guid, &mut size, buffer.as_mut_ptr().cast()) },
+        Status::SUCCESS
+    );
+
+    media_id.set(2);
+    assert_eq!(
+        unsafe { ((*root).get_info)(root, &mut guid, &mut size, buffer.as_mut_ptr().cast()) },
+        Status::MEDIA_CHANGED
+    );
+    size = 0;
+    assert_eq!(
+        unsafe { ((*root).get_info)(root, &mut guid, &mut size, core::ptr::null_mut()) },
+        Status::MEDIA_CHANGED
+    );
+    assert_eq!(unsafe { ((*root).close)(root) }, Status::MEDIA_CHANGED);
 }
 
 fn exhausted_handle_pool_does_not_create_a_file() {
