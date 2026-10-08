@@ -9,7 +9,10 @@ pub mod regs;
 use crate::barrier;
 use crate::drivers::pci::{self, PciDevice};
 use crate::efi::dma::{DmaBuffer, DmaDirection, DmaMask};
+use crate::exec;
 use crate::time::{Timeout, wait_for};
+use alloc::boxed::Box;
+use alloc::vec::Vec;
 use core::ptr;
 use tock_registers::interfaces::{ReadWriteable, Readable, Writeable};
 
@@ -436,7 +439,7 @@ impl AhciController {
     }
 
     /// Create a new AHCI controller from a PCI device
-    pub fn new(pci_dev: &PciDevice) -> Result<Self, AhciError> {
+    pub async fn new(pci_dev: &PciDevice) -> Result<Self, AhciError> {
         // Per the AHCI specification the HBA register block (ABAR) lives in
         // BAR5 (PCI config offset 0x24). Other memory BARs on SATA controllers
         // (e.g. Intel's BAR0/BAR1) decode unrelated register blocks, so the
@@ -502,108 +505,73 @@ impl AhciController {
         controller.apply_intel_pcs_quirk(pci_dev);
 
         // Initialize ports (pass SSS capability)
-        controller.init_ports_with_sss(supports_sss)?;
+        controller.init_ports_with_sss(supports_sss).await?;
 
         Ok(controller)
     }
 
+    /// Bring up the SATA link of one port.
+    ///
+    /// Waits for an established link and gives DET=1/slow links one COMRESET.
+    /// Only touches this port's registers, so ports can be brought up
+    /// concurrently.
+    async fn establish_link(&self, port_num: u8, supports_sss: bool) -> bool {
+        let port_regs = self.port_regs(port_num);
+
+        // If staggered spin-up is supported, spin up the device
+        if supports_sss {
+            port_regs.cmd.modify(PORT_CMD::SUD::SET);
+        }
+
+        // Links train in parallel in hardware; one shared 100 ms budget.
+        exec::wait_for(100, || {
+            port_regs.ssts.read(PORT_SSTS::DET) == 3 && port_regs.ssts.read(PORT_SSTS::IPM) == 1
+        })
+        .await;
+
+        let mut det = port_regs.ssts.read(PORT_SSTS::DET);
+        if det != 3 && self.comreset_port_async(port_num).await {
+            det = port_regs.ssts.read(PORT_SSTS::DET);
+        }
+        if det != 3 {
+            log::debug!(
+                "AHCI Port {}: No stable link (DET={}, IPM={})",
+                port_num,
+                det,
+                port_regs.ssts.read(PORT_SSTS::IPM)
+            );
+        }
+        det == 3
+    }
+
     /// Initialize all implemented ports (with staggered spin-up support)
-    fn init_ports_with_sss(&mut self, supports_sss: bool) -> Result<(), AhciError> {
-        for port_num in 0..32u8 {
-            if self.ports_implemented & (1 << port_num) == 0 {
-                continue;
-            }
+    async fn init_ports_with_sss(&mut self, supports_sss: bool) -> Result<(), AhciError> {
+        let implemented: Vec<u8> = (0..32u8)
+            .filter(|port_num| self.ports_implemented & (1 << port_num) != 0)
+            .collect();
 
-            log::debug!("AHCI: Probing port {}...", port_num);
-
-            let port_regs = self.port_regs(port_num);
-
-            // If staggered spin-up is supported, spin up the device
-            if supports_sss {
-                port_regs.cmd.modify(PORT_CMD::SUD::SET);
-            }
-
-            // Wait for port to become active
-            let is_first = self.ports.is_empty();
-            let wait_time_ms = if supports_sss || is_first { 100 } else { 10 };
-
-            let timeout = Timeout::from_ms(wait_time_ms);
-            while !timeout.is_expired() {
-                let det = port_regs.ssts.read(PORT_SSTS::DET);
-                let ipm = port_regs.ssts.read(PORT_SSTS::IPM);
-                if det == 3 && ipm == 1 {
-                    break;
+        if supports_sss {
+            // Staggered spin-up limits inrush current: spin up and bring up
+            // one drive at a time.
+            for port_num in implemented {
+                if self.establish_link(port_num, true).await {
+                    self.probe_port(port_num).await;
                 }
-                crate::time::delay_us(100);
             }
-
-            // Require stable communication, but give DET=1/slow links one COMRESET.
-            let mut det = port_regs.ssts.read(PORT_SSTS::DET);
-            if det != 3 && self.comreset_port(port_num) {
-                det = self.port_regs(port_num).ssts.read(PORT_SSTS::DET);
-            }
-            let ipm = self.port_regs(port_num).ssts.read(PORT_SSTS::IPM);
-            if det != 3 {
-                log::debug!(
-                    "AHCI Port {}: No stable link (DET={}, IPM={})",
-                    port_num,
-                    det,
-                    ipm
-                );
-                continue;
-            }
-
-            // Clear error and interrupt status before init
-            port_regs.serr.set(0xFFFFFFFF);
-            port_regs.is.set(0xFFFFFFFF);
-
-            // Device is connected - initialize the port
-            match self.init_port(port_num) {
-                Ok(port) => {
-                    if port.device_type == DeviceType::Sata {
-                        log::info!(
-                            "AHCI Port {}: SATA drive, {} sectors",
-                            port_num,
-                            port.sector_count
-                        );
-                        if let Err(port) = self.ports.push(port) {
-                            log::warn!("AHCI: Failed to add port {} - port list full", port_num);
-                            self.discard_port_logged(port);
-                        }
-                    } else if port.device_type == DeviceType::Satapi {
-                        if port.sector_count == 0 {
-                            log::info!(
-                                "AHCI Port {}: SATAPI device has no readable media; stopping unused port",
-                                port_num
-                            );
-                            self.discard_port_logged(port);
-                        } else {
-                            log::info!(
-                                "AHCI Port {}: SATAPI device, {} sectors (sector_size={})",
-                                port_num,
-                                port.sector_count,
-                                port.sector_size
-                            );
-                            if let Err(port) = self.ports.push(port) {
-                                log::warn!(
-                                    "AHCI: Failed to add port {} - port list full",
-                                    port_num
-                                );
-                                self.discard_port_logged(port);
-                            }
-                        }
-                    } else {
-                        log::info!(
-                            "AHCI Port {}: {:?} device is unsupported; stopping port",
-                            port_num,
-                            port.device_type
-                        );
-                        self.discard_port_logged(port);
-                    }
-                }
-                Err(e) => {
-                    log::error!("Failed to initialize port {}: {:?}", port_num, e);
-                }
+        } else {
+            // Link bring-up dominates probe time (an empty port costs a
+            // COMRESET plus debounce), so do it for all ports at once.
+            let links = exec::join_all(
+                implemented
+                    .iter()
+                    .map(|&port_num| {
+                        Box::pin(self.establish_link(port_num, false)) as exec::BoxFuture<'_, bool>
+                    })
+                    .collect(),
+            )
+            .await;
+            for (port_num, _) in implemented.into_iter().zip(links).filter(|(_, up)| *up) {
+                self.probe_port(port_num).await;
             }
         }
 
@@ -611,8 +579,64 @@ impl AhciController {
         Ok(())
     }
 
+    /// Initialize a port with an established link and keep it if usable.
+    async fn probe_port(&mut self, port_num: u8) {
+        log::debug!("AHCI: Probing port {}...", port_num);
+
+        // Clear error and interrupt status before init
+        let port_regs = self.port_regs(port_num);
+        port_regs.serr.set(0xFFFFFFFF);
+        port_regs.is.set(0xFFFFFFFF);
+
+        // Device is connected - initialize the port
+        match self.init_port(port_num).await {
+            Ok(port) => {
+                if port.device_type == DeviceType::Sata {
+                    log::info!(
+                        "AHCI Port {}: SATA drive, {} sectors",
+                        port_num,
+                        port.sector_count
+                    );
+                    if let Err(port) = self.ports.push(port) {
+                        log::warn!("AHCI: Failed to add port {} - port list full", port_num);
+                        self.discard_port_logged(port);
+                    }
+                } else if port.device_type == DeviceType::Satapi {
+                    if port.sector_count == 0 {
+                        log::info!(
+                            "AHCI Port {}: SATAPI device has no readable media; stopping unused port",
+                            port_num
+                        );
+                        self.discard_port_logged(port);
+                    } else {
+                        log::info!(
+                            "AHCI Port {}: SATAPI device, {} sectors (sector_size={})",
+                            port_num,
+                            port.sector_count,
+                            port.sector_size
+                        );
+                        if let Err(port) = self.ports.push(port) {
+                            log::warn!("AHCI: Failed to add port {} - port list full", port_num);
+                            self.discard_port_logged(port);
+                        }
+                    }
+                } else {
+                    log::info!(
+                        "AHCI Port {}: {:?} device is unsupported; stopping port",
+                        port_num,
+                        port.device_type
+                    );
+                    self.discard_port_logged(port);
+                }
+            }
+            Err(e) => {
+                log::error!("Failed to initialize port {}: {:?}", port_num, e);
+            }
+        }
+    }
+
     /// Initialize a single port
-    fn init_port(&mut self, port_num: u8) -> Result<AhciPort, AhciError> {
+    async fn init_port(&mut self, port_num: u8) -> Result<AhciPort, AhciError> {
         // Stop command processing
         self.stop_port(port_num)?;
 
@@ -667,28 +691,20 @@ impl AhciController {
         }
 
         // Put port into active state and wait for ready.
-        let mut ready = false;
-        {
-            let port_regs = self.port_regs(port_num);
-            port_regs.cmd.modify(PORT_CMD::ICC::Active);
-            let timeout = Timeout::from_ms(30000);
-            while !timeout.is_expired() {
-                if !port_regs.tfd.is_set(PORT_TFD::STS_BSY)
-                    && !port_regs.tfd.is_set(PORT_TFD::STS_DRQ)
-                {
-                    ready = true;
-                    break;
-                }
-                crate::time::delay_us(10000);
-            }
-        }
+        self.port_regs(port_num).cmd.modify(PORT_CMD::ICC::Active);
+        // Spinning disks may stay busy for seconds while spinning up.
+        let ready = exec::wait_for(30000, || {
+            let regs = self.port_regs(port_num);
+            !regs.tfd.is_set(PORT_TFD::STS_BSY) && !regs.tfd.is_set(PORT_TFD::STS_DRQ)
+        })
+        .await;
 
         if !ready {
             log::warn!(
                 "AHCI Port {}: device busy after start; issuing COMRESET",
                 port_num
             );
-            if !self.comreset_port(port_num) {
+            if !self.comreset_port_async(port_num).await {
                 self.discard_port_logged(port);
                 return Err(AhciError::PortNotReady);
             }
@@ -696,10 +712,12 @@ impl AhciController {
                 self.discard_port_logged(port);
                 return Err(error);
             }
-            if !wait_for(5000, || {
+            if !exec::wait_for(5000, || {
                 let regs = self.port_regs(port_num);
                 !regs.tfd.is_set(PORT_TFD::STS_BSY) && !regs.tfd.is_set(PORT_TFD::STS_DRQ)
-            }) {
+            })
+            .await
+            {
                 self.discard_port_logged(port);
                 return Err(AhciError::PortNotReady);
             }
@@ -1368,14 +1386,14 @@ impl AhciController {
         wait_for(500, || !regs.cmd.is_set(PORT_CMD::CLO))
     }
 
-    fn debounce_link(&self, port_num: u8) -> bool {
+    async fn debounce_link(&self, port_num: u8) -> bool {
         let regs = self.port_regs(port_num);
         let timeout = Timeout::from_ms(2000);
         while !timeout.is_expired() {
-            crate::time::delay_us(5000);
+            exec::sleep_ms(5).await;
             let det = regs.ssts.read(PORT_SSTS::DET);
             if det != 1 {
-                crate::time::delay_us(100_000);
+                exec::sleep_ms(100).await;
                 if regs.ssts.read(PORT_SSTS::DET) == det {
                     return det == 3;
                 }
@@ -1385,6 +1403,10 @@ impl AhciController {
     }
 
     fn comreset_port(&self, port_num: u8) -> bool {
+        exec::block_on(self.comreset_port_async(port_num))
+    }
+
+    async fn comreset_port_async(&self, port_num: u8) -> bool {
         let regs = self.port_regs(port_num);
         regs.cmd.modify(PORT_CMD::ST::CLEAR);
         if !wait_for(500, || !regs.cmd.is_set(PORT_CMD::CR)) {
@@ -1405,11 +1427,11 @@ impl AhciController {
         let saved_sctl = regs.sctl.get() & !0xf;
         regs.sctl.set(saved_sctl | 1);
         let _ = regs.sctl.get();
-        crate::time::delay_us(1000);
+        exec::sleep_ms(1).await;
         regs.sctl.set(saved_sctl);
         let _ = regs.sctl.get();
         regs.cmd.modify(PORT_CMD::ICC::Active);
-        self.debounce_link(port_num)
+        self.debounce_link(port_num).await
     }
 
     fn recover_port(&mut self, port_num: u8) -> Result<(), AhciError> {
@@ -1759,6 +1781,13 @@ static AHCI_CONTROLLERS: super::ControllerRegistry<AhciController, 4> =
 // Failures are logged at the error site; callers only branch on success.
 #[allow(clippy::result_unit_err)]
 pub fn init_device(dev: &pci::PciDevice) -> Result<(), ()> {
+    exec::block_on(init_controller(dev)).and_then(|c| register_controller(dev.address, c))
+}
+
+/// Bring up an AHCI controller and its ports without publishing it.
+// Failures are logged at the error site; callers only branch on success.
+#[allow(clippy::result_unit_err)]
+pub async fn init_controller(dev: &pci::PciDevice) -> Result<AhciController, ()> {
     log::info!(
         "Initializing AHCI controller at {}: {:04x}:{:04x}",
         dev.address,
@@ -1766,16 +1795,21 @@ pub fn init_device(dev: &pci::PciDevice) -> Result<(), ()> {
         dev.device_id
     );
 
-    let controller = AhciController::new(dev).map_err(|e| {
+    AhciController::new(dev).await.map_err(|e| {
         log::error!(
             "Failed to initialize AHCI controller at {}: {:?}",
             dev.address,
             e
         );
-    })?;
+    })
+}
 
+/// Publish a controller from [`init_controller`] for block I/O.
+// Failures are logged at the error site; callers only branch on success.
+#[allow(clippy::result_unit_err)]
+pub fn register_controller(address: pci::PciAddress, controller: AhciController) -> Result<(), ()> {
     AHCI_CONTROLLERS.register(controller)?;
-    log::info!("AHCI controller at {} initialized", dev.address);
+    log::info!("AHCI controller at {} initialized", address);
     Ok(())
 }
 

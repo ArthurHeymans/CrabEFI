@@ -9,6 +9,7 @@ use crate::barrier;
 use crate::drivers::mmio::MmioRegion;
 use crate::drivers::pci::{self, BarType, PciAddress, PciBar, PciDevice};
 use crate::efi::dma::{DmaBuffer, DmaDirection, DmaDomain, DmaMask};
+use crate::exec;
 use crate::time::{Timeout, wait_for};
 use core::ptr;
 use tock_registers::interfaces::{ReadWriteable, Readable, Writeable};
@@ -599,7 +600,7 @@ impl NvmeController {
     }
 
     /// Create a new NVMe controller from a PCI device
-    pub fn new(pci_dev: &PciDevice) -> Result<Self, NvmeError> {
+    pub async fn new(pci_dev: &PciDevice) -> Result<Self, NvmeError> {
         // NVMe controller registers are in BAR0 (BAR1 is its upper half for
         // a 64-bit BAR), not an arbitrary later memory BAR.
         let bar = &pci_dev.bars[0];
@@ -708,12 +709,13 @@ impl NvmeController {
             dma_quarantined: false,
         };
 
-        if let Err(error) = controller.init() {
+        if let Err(error) = controller.init().await {
             let regs = unsafe { &*controller.regs };
             regs.cc.modify(CC::EN::CLEAR + CC::SHN.val(0));
-            let disabled = wait_for(cap_timeout_ms(regs.cap.read(CAP::TO)), || {
+            let disabled = exec::wait_for(cap_timeout_ms(regs.cap.read(CAP::TO)), || {
                 regs.csts.read(CSTS::RDY) == 0
-            });
+            })
+            .await;
             if !disabled {
                 log::error!(
                     "NVMe {}: initialization failed and RDY stayed set; leaking DMA allocations",
@@ -774,7 +776,7 @@ impl NvmeController {
     }
 
     /// Initialize the controller
-    fn init(&mut self) -> Result<(), NvmeError> {
+    async fn init(&mut self) -> Result<(), NvmeError> {
         // SAFETY: `self.regs` points to MMIO registers mapped by PCI BAR.
         // The pointer is valid for the lifetime of the NvmeController.
         let regs = unsafe { &*self.regs };
@@ -786,7 +788,7 @@ impl NvmeController {
         // Disable the controller
         regs.cc.modify(CC::EN::CLEAR);
 
-        if !wait_for(disable_timeout_ms, || regs.csts.read(CSTS::RDY) == 0) {
+        if !exec::wait_for(disable_timeout_ms, || regs.csts.read(CSTS::RDY) == 0).await {
             log::error!(
                 "NVMe: Timeout waiting {} ms for controller to disable",
                 disable_timeout_ms
@@ -868,22 +870,18 @@ impl NvmeController {
         log::debug!("NVMe CAP after CC programming: {:#018x}", regs.cap.get());
         regs.cc.modify(CC::EN::SET);
 
-        let timeout = Timeout::from_ms(enable_timeout_ms);
-        while !timeout.is_expired() {
-            if regs.csts.read(CSTS::RDY) != 0 {
-                log::debug!("NVMe controller ready");
-                break;
-            }
-            if regs.csts.read(CSTS::CFS) != 0 {
-                log::error!("Controller fatal status!");
-                return Err(NvmeError::NotReady);
-            }
-            core::hint::spin_loop();
+        exec::wait_for(enable_timeout_ms, || {
+            regs.csts.read(CSTS::RDY) != 0 || regs.csts.read(CSTS::CFS) != 0
+        })
+        .await;
+        if regs.csts.read(CSTS::CFS) != 0 {
+            log::error!("Controller fatal status!");
+            return Err(NvmeError::NotReady);
         }
-
         if regs.csts.read(CSTS::RDY) == 0 {
             return Err(NvmeError::NotReady);
         }
+        log::debug!("NVMe controller ready");
 
         log::info!("NVMe controller initialized");
 
@@ -1637,6 +1635,13 @@ static NVME_CONTROLLERS: super::ControllerRegistry<NvmeController, 4> =
 // Failures are logged at the error site; callers only branch on success.
 #[allow(clippy::result_unit_err)]
 pub fn init_device(dev: &pci::PciDevice) -> Result<(), ()> {
+    exec::block_on(init_controller(dev)).and_then(|c| register_controller(dev.address, c))
+}
+
+/// Bring up an NVMe controller and its namespaces without publishing it.
+// Failures are logged at the error site; callers only branch on success.
+#[allow(clippy::result_unit_err)]
+pub async fn init_controller(dev: &pci::PciDevice) -> Result<NvmeController, ()> {
     log::info!(
         "Initializing NVMe controller at {}: {:04x}:{:04x}",
         dev.address,
@@ -1644,16 +1649,21 @@ pub fn init_device(dev: &pci::PciDevice) -> Result<(), ()> {
         dev.device_id
     );
 
-    let controller = NvmeController::new(dev).map_err(|e| {
+    NvmeController::new(dev).await.map_err(|e| {
         log::error!(
             "Failed to initialize NVMe controller at {}: {:?}",
             dev.address,
             e
         );
-    })?;
+    })
+}
 
+/// Publish a controller from [`init_controller`] for block I/O.
+// Failures are logged at the error site; callers only branch on success.
+#[allow(clippy::result_unit_err)]
+pub fn register_controller(address: pci::PciAddress, controller: NvmeController) -> Result<(), ()> {
     NVME_CONTROLLERS.register(controller)?;
-    log::info!("NVMe controller at {} initialized", dev.address);
+    log::info!("NVMe controller at {} initialized", address);
     Ok(())
 }
 

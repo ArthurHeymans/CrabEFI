@@ -25,6 +25,7 @@ pub mod cell;
 pub mod cursor;
 pub mod drivers;
 pub mod efi;
+pub mod exec;
 #[cfg(feature = "fb-log")]
 pub mod fb_log;
 pub mod fdt;
