@@ -3,6 +3,7 @@
 //! This module provides a minimal AHCI driver for reading from SATA devices.
 //! It implements the basic AHCI command set needed for booting.
 
+mod debounce;
 pub mod logic;
 pub mod regs;
 
@@ -1389,17 +1390,12 @@ impl AhciController {
     async fn debounce_link(&self, port_num: u8) -> bool {
         let regs = self.port_regs(port_num);
         let timeout = Timeout::from_ms(2000);
-        while !timeout.is_expired() {
-            exec::sleep_ms(5).await;
-            let det = regs.ssts.read(PORT_SSTS::DET);
-            if det != 1 {
-                exec::sleep_ms(100).await;
-                if regs.ssts.read(PORT_SSTS::DET) == det {
-                    return det == 3;
-                }
-            }
-        }
-        false
+        debounce::debounce(
+            || regs.ssts.read(PORT_SSTS::DET),
+            || timeout.is_expired(),
+            exec::sleep_ms,
+        )
+        .await
     }
 
     fn comreset_port(&self, port_num: u8) -> bool {
