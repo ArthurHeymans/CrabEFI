@@ -387,14 +387,19 @@ impl super::XhciController {
                     ))),
                 ) => {
                     log::debug!(
-                        "xHCI: Bulk transfer failed with {:?} on slot={} dci={}, resetting endpoint",
+                        "xHCI: Bulk transfer failed with {:?} on slot={} dci={}, recovering endpoint",
                         error,
                         slot_id,
                         dci
                     );
-                    if let Err(recovery) = self.reset_endpoint(slot_id, dci as u8) {
+                    let recovery = if matches!(error, XhciError::Timeout) {
+                        self.stop_endpoint(slot_id, dci as u8)
+                    } else {
+                        self.reset_endpoint(slot_id, dci as u8)
+                    };
+                    if let Err(recovery) = recovery {
                         log::warn!("xHCI: Failed to recover bulk endpoint: {:?}", recovery);
-                        // Reset may have succeeded while Set TR Dequeue failed.
+                        // Stop/Reset may have succeeded while Set TR Dequeue failed.
                         // Keep the old buffer mapped and prevent future doorbells
                         // from restarting the endpoint at that old TD.
                         core::mem::forget(bounce);

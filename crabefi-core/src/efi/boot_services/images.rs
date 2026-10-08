@@ -274,6 +274,14 @@ pub(super) extern "efiapi" fn load_image(
         return Status::OUT_OF_RESOURCES;
     }
 
+    // SAFETY: the protocol was just allocated by us and is not yet published.
+    unsafe {
+        super::super::protocols::loaded_image::set_image_subsystem(
+            loaded_image_protocol,
+            image_subsystem,
+        );
+    }
+
     // Resolve buffer-loaded images against their supplied full path too: the
     // firmware parent itself has no filesystem device to inherit.
     if !owned_path.is_null() {
@@ -845,7 +853,7 @@ fn release_image(image_handle: Handle) -> Status {
     if !image.measurement_event_data.is_null() {
         let _ = allocator::free_pool(image.measurement_event_data);
     }
-    allocator::free_pages(image.alloc_base, image.num_pages)
+    allocator::free_pe_image(image.alloc_base, image.num_pages)
 }
 
 pub(super) extern "efiapi" fn exit_boot_services(image_handle: Handle, map_key: usize) -> Status {

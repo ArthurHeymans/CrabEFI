@@ -1,0 +1,41 @@
+[Test Case]
+Revision   = 0x00010000
+Guid       = 539675B8-D9B3-4DC7-A8D0-FF19BBA13B86
+Name       = Stall_Func
+Order      = 0x00000000
+Iterations = 0x00000001
+
+[Test Case]
+Revision   = 0x00010000
+Guid       = 4397A610-8D5D-441B-8E7D-C23377F3EB67
+Name       = CopyMem_Func
+Order      = 0x00000001
+Iterations = 0x00000001
+
+[Test Case]
+Revision   = 0x00010000
+Guid       = 315BE343-A32D-461D-A3CC-5E6895CC2CBA
+Name       = SetMem_Func
+Order      = 0x00000002
+Iterations = 0x00000001
+
+[Test Case]
+Revision   = 0x00010000
+Guid       = B510F99F-FEE9-4AF6-BB0F-3C958EF7F166
+Name       = CalculateCrc32_Func
+Order      = 0x00000003
+Iterations = 0x00000001
+
+[Test Case]
+Revision   = 0x00010000
+Guid       = 90023546-6C92-430A-B253-70110D9EFDFF
+Name       = AllocatePool_Conf
+Order      = 0x00000004
+Iterations = 0x00000001
+
+[Test Case]
+Revision   = 0x00010000
+Guid       = 49709F9F-A4D8-42D6-A684-4975EE0099DB
+Name       = FreePool_Conf
+Order      = 0x00000005
+Iterations = 0x00000001

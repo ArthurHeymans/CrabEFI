@@ -193,6 +193,11 @@ jobs:
       - name: Test nested image Exit and cleanup
         run: ./crabefi test --app image-exit-test --disable-kvm --timeout 120
 
+      - name: Test USB filesystem mutations and on-disk consistency
+        run: >-
+          ./crabefi test --app directory-test
+          --disable-kvm --timeout 180
+
   test-runtime-image:
     name: Test x86_64 (separate runtime image)
     runs-on: ubuntu-latest
@@ -251,6 +256,11 @@ jobs:
       - name: Run integration tests (AHCI)
         run: ./crabefi test --app hello --ahci --disable-kvm --timeout 120
 
+      - name: Test AHCI filesystem write protection
+        run: >-
+          ./crabefi test --app directory-test --ahci
+          --disable-kvm --timeout 180
+
   test-nvme:
     name: Test x86_64 (NVMe Storage)
     runs-on: ubuntu-latest
@@ -282,6 +292,11 @@ jobs:
 
       - name: Run integration tests (NVMe)
         run: ./crabefi test --app hello --nvme --disable-kvm --timeout 120
+
+      - name: Test NVMe filesystem write protection
+        run: >-
+          ./crabefi test --app directory-test --nvme
+          --disable-kvm --timeout 180
 
   test-sdhci:
     name: Test x86_64 (SD Card Storage)
@@ -414,6 +429,222 @@ jobs:
 
       - name: Run TCG protocol tests
         run: ./crabefi test --app tcg-test --disable-kvm --timeout 120
+
+  # ── UEFI SCT smoke subset ─────────────────────────────────────────────
+
+  build-sct-assets-x86_64:
+    name: Build SCT Assets x86_64
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Restore cached SCT assets
+        id: cache
+        uses: actions/cache@v6
+        with:
+          path: sct-assets/x86_64
+          key: sct-assets-x86_64-${{ hashFiles('ci/build-sct-assets.sh') }}
+
+      - name: Install SCT asset dependencies
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y curl p7zip-full
+
+      - name: Build SCT assets
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: ci/build-sct-assets.sh --arch x86_64
+
+      - name: Upload SCT assets
+        uses: actions/upload-artifact@v7
+        with:
+          name: sct-assets-x86_64
+          path: sct-assets/x86_64/
+          retention-days: 7
+
+  test-uefi-sct-smoke:
+    name: Test x86_64 (UEFI SCT smoke)
+    runs-on: ubuntu-latest
+    needs: [build, build-sct-assets-x86_64]
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchains
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src, llvm-tools-preview
+          targets: x86_64-unknown-none
+
+      - name: Install stable toolchain for xtask
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qemu-system-x86 mtools dosfstools zstd coreboot-utils
+
+      - name: Download CrabEFI ELF
+        uses: actions/download-artifact@v8
+        with:
+          name: crabefi-elf
+          path: target/x86_64-unknown-none/release/
+
+      - name: Download SCT assets
+        uses: actions/download-artifact@v8
+        with:
+          name: sct-assets-x86_64
+          path: sct-assets/x86_64/
+
+      - name: Run UEFI SCT smoke subset
+        run: >-
+          ./crabefi test --app uefi-sct-smoke
+          --sct-assets-dir sct-assets/x86_64 --disable-kvm --timeout 300
+
+      - name: Upload SCT smoke evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: sct-smoke-reports
+          path: target/sct-reports/smoke/
+          retention-days: 14
+          if-no-files-found: warn
+
+  # Selected passing cases, not full protocol compliance. Required gaps remain
+  # documented in docs/UEFI_CONFORMANCE.md and characterization sequences.
+  test-uefi-sct-profiles:
+    name: Test x86_64 (SCT ${{ matrix.profile }})
+    runs-on: ubuntu-latest
+    needs: [build, build-sct-assets-x86_64]
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        profile:
+          - boot-memory
+          - boot-services
+          - device-path
+          - block-io
+          - filesystem
+          - hii-string
+          - variables
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchains
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src, llvm-tools-preview
+          targets: x86_64-unknown-none
+
+      - name: Install stable toolchain for xtask
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qemu-system-x86 mtools dosfstools zstd coreboot-utils
+
+      - name: Download CrabEFI ELF
+        uses: actions/download-artifact@v8
+        with:
+          name: crabefi-elf
+          path: target/x86_64-unknown-none/release/
+
+      - name: Download SCT assets
+        uses: actions/download-artifact@v8
+        with:
+          name: sct-assets-x86_64
+          path: sct-assets/x86_64/
+
+      - name: Run selected SCT cases under TCG
+        run: >-
+          ./crabefi test --app uefi-sct-smoke
+          --sct-assets-dir sct-assets/x86_64
+          --sct-sequence ci/sct/${{ matrix.profile }}.seq
+          --sct-report-dir target/sct-reports/${{ matrix.profile }}
+          --disable-kvm --timeout 900
+
+      - name: Upload SCT evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: sct-${{ matrix.profile }}-reports
+          path: target/sct-reports/${{ matrix.profile }}/
+          retention-days: 14
+          if-no-files-found: warn
+
+  # ── Optional Windows Boot Manager smoke test ─────────────────────────────
+  # Opt-in trusted pushes only. WinPE media comes from authenticated private
+  # storage, never an Actions cache or artifact (base caches are readable by
+  # fork PRs even when the job that populated them is not run for PRs).
+
+  test-windows-boot-smoke:
+    name: Test x86_64 (Windows boot smoke)
+    runs-on: ubuntu-latest
+    needs: [build]
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master') && vars.ENABLE_WINDOWS_SMOKE == 'true'
+    env:
+      WINDOWS_SMOKE_SUCCESS_MARKER: ${{ vars.WINDOWS_SMOKE_SUCCESS_MARKER || 'CRABEFI_WINDOWS_BOOT_SMOKE_SUCCESS' }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchains
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src, llvm-tools-preview
+          targets: x86_64-unknown-none
+
+      - name: Install stable toolchain for xtask
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qemu-system-x86 mtools dosfstools zstd coreboot-utils
+
+      - name: Download CrabEFI ELF
+        uses: actions/download-artifact@v8
+        with:
+          name: crabefi-elf
+          path: target/x86_64-unknown-none/release/
+
+      - name: Fetch private WinPE smoke media
+        env:
+          MEDIA_URL: ${{ secrets.WINDOWS_SMOKE_MEDIA_URL }}
+          MEDIA_TOKEN: ${{ secrets.WINDOWS_SMOKE_MEDIA_TOKEN }}
+        run: |
+          test -n "$MEDIA_URL" && test -n "$MEDIA_TOKEN" || {
+            echo 'Windows smoke requires private media URL and token secrets' >&2
+            exit 1
+          }
+          curl --fail --silent --show-error --location \
+            --proto '=https' --proto-redir '=https' \
+            --header "Authorization: Bearer $MEDIA_TOKEN" \
+            "$MEDIA_URL" --output "$RUNNER_TEMP/winpe-media.tar.gz"
+          mkdir -p "$RUNNER_TEMP/winpe-media"
+          tar --extract --gzip --file "$RUNNER_TEMP/winpe-media.tar.gz" \
+            --directory "$RUNNER_TEMP/winpe-media" --no-same-owner --no-same-permissions
+
+      - name: Run Windows Boot Manager smoke test
+        run: |
+          ./crabefi test --app windows-boot-smoke \
+            --windows-media-dir "$RUNNER_TEMP/winpe-media" \
+            --windows-success-marker "$WINDOWS_SMOKE_SUCCESS_MARKER" \
+            --nvme \
+            --disable-kvm \
+            --timeout 900
+
+      - name: Remove private media
+        if: always()
+        run: rm -rf "$RUNNER_TEMP/winpe-media" "$RUNNER_TEMP/winpe-media.tar.gz"
 
   # ── GRUB + Linux boot-chain ─────────────────────────────────────────
 

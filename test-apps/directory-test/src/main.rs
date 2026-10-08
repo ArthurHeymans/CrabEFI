@@ -2,6 +2,8 @@
 //!
 //! This EFI application tests that CrabEFI correctly returns Long File Names
 //! when enumerating directory contents via the SimpleFileSystem protocol.
+//! It also exercises durable FAT writes, shared handles, truncation and deletion
+//! on the test harness's disposable disk.
 //!
 //! It opens \EFI\Linux\ and reads every directory entry, printing each
 //! filename. The test harness checks that filenames longer than 64 characters
@@ -110,6 +112,190 @@ unsafe fn char16_to_ascii(ptr: *const Char16) -> usize {
 }
 
 // ── test logic ───────────────────────────────────────────────────────────
+
+fn mutation_smoke_test(root: *mut r_efi::protocols::file::Protocol) -> Result<bool, &'static str> {
+    use r_efi::protocols::file;
+    let mut name = [b'a' as Char16; 256];
+    name[255] = 0;
+    let attributes = file::HIDDEN | file::SYSTEM;
+    let mut writer = core::ptr::null_mut();
+    let mut reader = core::ptr::null_mut();
+    let check = |status, message| {
+        if status == Status::SUCCESS {
+            Ok(())
+        } else {
+            Err(message)
+        }
+    };
+    // Callback pointers and buffers are owned by this test for the full call.
+    unsafe {
+        let mut guid = file::SYSTEM_INFO_ID;
+        let mut size = info_buf_len();
+        check(
+            ((*root).get_info)(root, &mut guid, &mut size, info_buf_ptr().cast()),
+            "get volume info",
+        )?;
+        let volume = info_buf_ptr().cast::<file::SystemInfo>().read_unaligned();
+        if bool::from(volume.read_only) {
+            if ((*root).open)(
+                root,
+                &mut writer,
+                name.as_mut_ptr(),
+                file::MODE_READ | file::MODE_WRITE | file::MODE_CREATE,
+                attributes,
+            ) != Status::WRITE_PROTECTED
+            {
+                return Err("read-only volume allowed creation");
+            }
+            return Ok(false);
+        }
+        check(
+            ((*root).open)(
+                root,
+                &mut writer,
+                name.as_mut_ptr(),
+                file::MODE_READ | file::MODE_WRITE | file::MODE_CREATE,
+                attributes,
+            ),
+            "create 255-character name",
+        )?;
+        check(
+            ((*root).open)(root, &mut reader, name.as_mut_ptr(), file::MODE_READ, 0),
+            "open second handle",
+        )?;
+        let mut payload = [0xa5u8; 600];
+        let mut size = payload.len();
+        check(
+            ((*writer).write)(writer, &mut size, payload.as_mut_ptr().cast()),
+            "initial write",
+        )?;
+        if size != payload.len() {
+            return Err("initial write count");
+        }
+        check(((*writer).set_position)(writer, 1024), "seek past EOF")?;
+        let mut tail = [0x5au8; 400];
+        size = tail.len();
+        check(
+            ((*writer).write)(writer, &mut size, tail.as_mut_ptr().cast()),
+            "extending write",
+        )?;
+        if size != tail.len() {
+            return Err("extending write count");
+        }
+        check(((*writer).close)(writer), "close/flush written file")?;
+        let mut output = [0u8; 2048];
+        size = output.len();
+        check(
+            ((*reader).read)(reader, &mut size, output.as_mut_ptr().cast()),
+            "shared-handle read",
+        )?;
+        if size != 1424
+            || output[..600] != payload
+            || output[600..1024].iter().any(|byte| *byte != 0)
+            || output[1024..1424] != tail
+        {
+            return Err("payload, zero gap or shared metadata");
+        }
+        check(
+            ((*root).open)(
+                root,
+                &mut writer,
+                name.as_mut_ptr(),
+                file::MODE_READ | file::MODE_WRITE,
+                0,
+            ),
+            "reopen writer",
+        )?;
+        let mut guid = file::INFO_ID;
+        size = info_buf_len();
+        check(
+            ((*writer).get_info)(writer, &mut guid, &mut size, info_buf_ptr().cast()),
+            "get file info",
+        )?;
+        let info = info_buf_ptr().cast::<FileInfo>();
+        if info.read_unaligned().attribute & attributes != attributes {
+            return Err("creation attributes");
+        }
+        core::ptr::addr_of_mut!((*info).file_size).write_unaligned(100);
+        check(
+            ((*writer).set_info)(writer, &mut guid, size, info_buf_ptr().cast()),
+            "truncate file",
+        )?;
+        check(((*reader).set_position)(reader, 0), "rewind shared handle")?;
+        size = output.len();
+        check(
+            ((*reader).read)(reader, &mut size, output.as_mut_ptr().cast()),
+            "read truncated file",
+        )?;
+        if size != 100 || output[..100] != payload[..100] {
+            return Err("shared truncate metadata");
+        }
+        check(((*writer).delete)(writer), "delete file")?;
+        check(
+            ((*root).open)(
+                root,
+                &mut writer,
+                name.as_mut_ptr(),
+                file::MODE_READ | file::MODE_WRITE | file::MODE_CREATE,
+                0,
+            ),
+            "create replacement",
+        )?;
+        size = 1;
+        check(
+            ((*writer).write)(writer, &mut size, payload.as_mut_ptr().cast()),
+            "write replacement",
+        )?;
+        size = 1;
+        if ((*reader).read)(reader, &mut size, output.as_mut_ptr().cast()) == Status::SUCCESS {
+            return Err("deleted handle accessed replacement");
+        }
+        check(((*reader).close)(reader), "close deleted handle")?;
+        check(((*writer).delete)(writer), "delete replacement")?;
+
+        // Leave a closed, flushed sentinel for independent host-side readback.
+        // It preserves the same zero-filled gap exercised above.
+        let mut name = [0u16; 14];
+        for (unit, byte) in name.iter_mut().zip(b"CRABWRITE.BIN") {
+            *unit = (*byte).into();
+        }
+        check(
+            ((*root).open)(
+                root,
+                &mut writer,
+                name.as_mut_ptr(),
+                file::MODE_READ | file::MODE_WRITE | file::MODE_CREATE,
+                0,
+            ),
+            "create persistence sentinel",
+        )?;
+        size = payload.len();
+        check(
+            ((*writer).write)(writer, &mut size, payload.as_mut_ptr().cast()),
+            "write sentinel head",
+        )?;
+        if size != payload.len() {
+            return Err("sentinel head write count");
+        }
+        check(
+            ((*writer).set_position)(writer, 1024),
+            "seek sentinel past EOF",
+        )?;
+        size = tail.len();
+        check(
+            ((*writer).write)(writer, &mut size, tail.as_mut_ptr().cast()),
+            "write sentinel tail",
+        )?;
+        if size != tail.len() {
+            return Err("sentinel tail write count");
+        }
+        check(
+            ((*writer).close)(writer),
+            "close/flush persistence sentinel",
+        )?;
+    }
+    Ok(true)
+}
 
 /// Open a SFS volume via BootServices, enumerate a directory, print every name.
 fn run_tests(image_handle: Handle, system_table: *mut SystemTable) -> bool {
@@ -282,9 +468,26 @@ fn run_tests(image_handle: Handle, system_table: *mut SystemTable) -> bool {
         }
     }
 
-    // Close the directory handle
-    unsafe { ((*linux_dir).close)(linux_dir) };
-    unsafe { ((*root).close)(root) };
+    // Close the directory handle before mutating the filesystem.
+    if unsafe { ((*linux_dir).close)(linux_dir) } != Status::SUCCESS {
+        println("[FAIL] close enumeration directory");
+        all_ok = false;
+    }
+    match mutation_smoke_test(root) {
+        Ok(true) => {
+            println("[PASS] filesystem_mutation: writes, shared handles, truncate and delete")
+        }
+        Ok(false) => println("[PASS] filesystem_read_only: creation correctly rejected"),
+        Err(message) => {
+            print("[FAIL] filesystem_mutation: ");
+            println(message);
+            all_ok = false;
+        }
+    }
+    if unsafe { ((*root).close)(root) } != Status::SUCCESS {
+        println("[FAIL] close root volume");
+        all_ok = false;
+    }
 
     println("");
 
@@ -355,6 +558,19 @@ pub extern "efiapi" fn efi_main(image_handle: Handle, system_table: *mut SystemT
         println("Directory enumeration test FAILED!");
     }
 
+    // Exit QEMU gracefully after every handle has closed so the host can
+    // inspect the backing disk, rather than relying on timeout's SIGKILL.
+    unsafe {
+        let runtime = (*system_table).runtime_services;
+        if !runtime.is_null() {
+            ((*runtime).reset_system)(
+                efi::RESET_SHUTDOWN,
+                Status::SUCCESS,
+                0,
+                core::ptr::null_mut(),
+            );
+        }
+    }
     Status::SUCCESS
 }
 

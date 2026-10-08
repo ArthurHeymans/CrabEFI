@@ -147,6 +147,7 @@ pub fn init_from_platform(config: &mut crate::platform::PlatformConfig) {
 /// protocol installations and table finalization that are identical in both
 /// paths.
 fn install_standard_protocols_and_finalize() {
+    init_hii();
     init_unicode_collation();
     init_memory_attribute();
     init_serial_io();
@@ -477,6 +478,38 @@ fn init_console() -> Option<efi::Handle> {
 
     log::debug!("Console protocols installed on handle {:?}", console_handle);
     Some(console_handle)
+}
+
+/// Initialize the HII Database and String protocols required by UEFI applications.
+fn init_hii() {
+    use r_efi::protocols::{hii_database, hii_string};
+
+    let Some(handle) = boot_services::create_handle() else {
+        log::error!("Failed to create HII protocol handle");
+        return;
+    };
+
+    let status = boot_services::install_protocol(
+        handle,
+        &hii_database::PROTOCOL_GUID,
+        protocols::hii::database_protocol(),
+    );
+    if status != Status::SUCCESS {
+        log::error!("Failed to install HII Database protocol: {:?}", status);
+        return;
+    }
+
+    let status = boot_services::install_protocol(
+        handle,
+        &hii_string::PROTOCOL_GUID,
+        protocols::hii::string_protocol(),
+    );
+    if status != Status::SUCCESS {
+        log::error!("Failed to install HII String protocol: {:?}", status);
+        return;
+    }
+
+    log::debug!("HII Database and String protocols installed");
 }
 
 /// Initialize Unicode Collation protocol

@@ -1,0 +1,8 @@
+# variables: edk2-test-stable202509, x86_64/Q35. See docs/UEFI_CONFORMANCE.md.
+
+[Test Case]
+Revision = 0x00010000
+Guid = E8014C92-15C4-42A8-8B0D-6080C47D3778
+Name = GetNextVariableName_Conf
+Order = 0x00000000
+Iterations = 0x00000001

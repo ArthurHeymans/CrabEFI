@@ -8,7 +8,7 @@
 nix develop
 ```
 
-This provides the Rust nightly toolchain, QEMU, mtools, dosfstools, cbfstool, and zstd.
+This provides the Rust nightly toolchain, QEMU, mtools, dosfstools, cbfstool, zstd, and p7zip.
 
 ### Manual Setup
 
@@ -24,7 +24,7 @@ rustup component add rust-src llvm-tools-preview
 **System Packages (Debian/Ubuntu):**
 
 ```bash
-sudo apt install qemu-system-x86 qemu-system-arm mtools dosfstools zstd coreboot-utils
+sudo apt install curl qemu-system-x86 qemu-system-arm mtools dosfstools zstd coreboot-utils p7zip-full
 ```
 
 ## Building
@@ -137,8 +137,12 @@ these commands; they consume the checked-in image selected by Cargo.
 # ConvertPointer, and post-SVAM reset (x86-64)
 ./crabefi test --app runtime-image-test --disable-kvm
 
-# Run directory enumeration test
-./crabefi test --app directory-test
+# Run directory enumeration, writable USB mutation and persistence checks
+./crabefi test --app directory-test --disable-kvm
+
+# Verify mutation is rejected on read-only backends
+./crabefi test --app directory-test --ahci --disable-kvm
+./crabefi test --app directory-test --nvme --disable-kvm
 
 # Disable KVM (when running inside a VM)
 ./crabefi test --app hello --disable-kvm
@@ -148,6 +152,13 @@ these commands; they consume the checked-in image selected by Cargo.
 ./crabefi test --arch aarch64 --machine virt --app hello --nvme --disable-kvm
 ```
 
+The directory test uses a disposable disk. USB runs must exercise writes,
+shared handles, truncation and deletion; AHCI/NVMe runs must reject creation.
+After QEMU exits, the harness runs `fsck.fat -n` on a copy of the ESP and uses
+`mtype` to verify the USB run's flushed payload and zero-filled gap independently.
+Both tools come from the existing dosfstools/mtools test dependencies. CI gates
+all three backends; this is not physical-media or power-loss qualification.
+
 ### Interactive QEMU
 
 ```bash
@@ -155,6 +166,106 @@ these commands; they consume the checked-in image selected by Cargo.
 ./crabefi run --app hello --nvme
 ./crabefi run --app hello --ahci --headless
 ```
+
+### UEFI SCT smoke subset
+
+CrabEFI can run a small public UEFI Self-Certification Test subset in QEMU. The
+test uses prebuilt public artifacts from `tianocore/edk2-test` and an EDK2 UEFI
+Shell binary from `pbatard/UEFI-Shell`; hashes are pinned in
+`ci/build-sct-assets.sh`.
+
+```bash
+# Download and verify SCT + UEFI Shell assets
+ci/build-sct-assets.sh --arch x86_64
+
+# Run the SCT smoke sequence
+./crabefi test --app uefi-sct-smoke \
+    --sct-assets-dir sct-assets/x86_64 \
+    --disable-kvm \
+    --timeout 300
+```
+
+The default `ci/sct/smoke.seq` retains the original six Boot Services cases.
+CI additionally gates 48 distinct cases across seven subsystem sequences:
+
+```bash
+./crabefi test --app uefi-sct-smoke --disable-kvm --timeout 900 \
+    --sct-sequence ci/sct/boot-memory.seq \
+    --sct-report-dir target/sct-reports/boot-memory
+```
+
+The selected sequence is the validation manifest; every dispatched instance
+must explicitly pass with zero assertion errors or warnings. Reports are
+retained in a unique directory under the requested report root (default:
+`target/sct-reports/smoke`), including failed runs. See
+[UEFI conformance priorities](UEFI_CONFORMANCE.md) for exact scopes, required
+interface gaps, and why these results are not a complete compliance claim.
+
+### Windows Boot Manager smoke test
+
+CrabEFI can also run a Windows/WinPE boot smoke test in QEMU. The preferred
+public-source path builds WinPE media from Microsoft's official Windows ADK and
+Windows PE add-on, then boots that media through CrabEFI and Windows Boot
+Manager. The generated WinPE image writes a deterministic marker to COM1 after
+`startnet.cmd` runs.
+
+The default marker is `CRABEFI_WINDOWS_BOOT_SMOKE_SUCCESS`. Generated WinPE
+markers must be nonempty printable ASCII. Success markers must not contain a
+failure marker such as `Recovery`, `Access Denied`, or `Status: 0xc000`.
+
+Build the WinPE media on Windows:
+
+```powershell
+ci/build-winpe-smoke-media.ps1 `
+    -Arch x86_64 `
+    -OutputDir windows-assets/x86_64/media `
+    -SuccessMarker CRABEFI_WINDOWS_BOOT_SMOKE_SUCCESS
+```
+
+Then run the smoke test from Linux:
+
+```bash
+./crabefi test --app windows-boot-smoke \
+    --windows-media-dir windows-assets/x86_64/media \
+    --windows-success-marker CRABEFI_WINDOWS_BOOT_SMOKE_SUCCESS \
+    --nvme \
+    --disable-kvm \
+    --timeout 900
+```
+
+For custom Windows or WinPE images, you can also pass a raw disk image instead:
+
+```bash
+./crabefi test --app windows-boot-smoke --windows-disk path/to/windows-smoke.img
+```
+
+If no explicit path is passed, the xtask looks for
+`windows-assets/x86_64/media` first, then `windows-assets/x86_64/windows-smoke.img`.
+Raw disk images are copied into a temporary directory before boot so the source
+artifact is not modified by QEMU.
+
+The GitHub Actions job is intentionally optional and runs only on pushes to
+`main` or `master`, never on PRs. Build and validate the media locally first,
+then package its contents (not the enclosing `media` directory):
+
+```bash
+tar -czf winpe-media.tar.gz -C windows-assets/x86_64/media .
+```
+
+Store this archive on an authenticated private HTTPS endpoint. Configure
+repository secrets `WINDOWS_SMOKE_MEDIA_URL` and `WINDOWS_SMOKE_MEDIA_TOKEN`
+(the endpoint must accept `Authorization: Bearer <token>`), then opt in with
+`ENABLE_WINDOWS_SMOKE=true`. The job fails if either secret is missing. The
+optional `WINDOWS_SMOKE_SUCCESS_MARKER` repository variable overrides the
+default serial marker and must match the provisioned media.
+
+WinPE media is **never stored in GitHub Actions caches or artifacts**: fork PRs
+can restore base-branch caches, regardless of the producing job's event guard.
+If upgrading from the earlier cache-based workflow, delete all
+`winpe-smoke-x86_64-*` caches before relying on this policy. Operators remain
+responsible for the media's licensing and private-storage access controls.
+Keep the job disabled until an actual successful Windows boot is obtained;
+a skipped job is not Windows validation.
 
 ### Test Applications
 

@@ -12,6 +12,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::{Arch, Machine};
 
+mod filesystem;
+pub(crate) mod sct;
+
 static RUNTIME_IMAGE_TWO_BOOT: AtomicBool = AtomicBool::new(false);
 static WRITABLE_TEST_FLASH: AtomicBool = AtomicBool::new(false);
 
@@ -1153,60 +1156,15 @@ pub fn run_tests(config: &QemuConfig, disk_path: &Path, app_name: &str) -> Resul
             }
         }
         "directory-test" => {
-            // Check that the test app started
-            if result.output.contains("Directory Enumeration Test") {
-                println!("[PASS] test_started: Directory enumeration test started");
-                passed += 1;
-            } else {
-                println!("[FAIL] test_started: Test did not start");
-                failed += 1;
-            }
-
-            // Check OpenVolume succeeded
-            if result.output.contains("[PASS] OpenVolume succeeded") {
-                println!("[PASS] open_volume: OpenVolume succeeded");
-                passed += 1;
-            } else {
-                println!("[FAIL] open_volume: OpenVolume failed");
-                failed += 1;
-            }
-
-            // Check that the long filename (>64 chars) was found intact
-            if result.output.contains("[PASS] long_filename:") {
-                println!("[PASS] long_filename: Filename >64 chars returned intact");
-                passed += 1;
-            } else {
-                println!(
-                    "[FAIL] long_filename: Filename >64 chars NOT found (LFN truncation bug?)"
-                );
-                failed += 1;
-            }
-
-            // Check that the long filename's .efi suffix was preserved
-            if result.output.contains("[PASS] long_filename_suffix:") {
-                println!("[PASS] long_filename_suffix: .efi suffix preserved on long name");
-                passed += 1;
-            } else {
-                println!("[FAIL] long_filename_suffix: .efi suffix lost on long filename");
-                failed += 1;
-            }
-
-            // Check that the short filename was also found
-            if result.output.contains("[PASS] short_filename:") {
-                println!("[PASS] short_filename: Short filename found");
-                passed += 1;
-            } else {
-                println!("[FAIL] short_filename: Short filename not found");
-                failed += 1;
-            }
-
-            // Check overall result
-            if result.output.contains("test PASSED!") {
-                println!("[PASS] overall: Directory enumeration test passed");
-                passed += 1;
-            } else {
-                println!("[FAIL] overall: Directory enumeration test failed");
-                failed += 1;
+            match filesystem::validate(&result.output, matches!(config.storage, StorageType::Usb)) {
+                Ok(()) => {
+                    println!("[PASS] filesystem: directory and mutation/protection checks passed");
+                    passed += 1;
+                }
+                Err(error) => {
+                    println!("[FAIL] filesystem: {error}");
+                    failed += 1;
+                }
             }
         }
         "device-path-test" => {
@@ -1400,7 +1358,265 @@ pub fn run_tests(config: &QemuConfig, disk_path: &Path, app_name: &str) -> Resul
         bail!("{} test(s) failed", failed);
     }
 
+    if app_name == "directory-test" {
+        crate::disk::check_test_filesystem(disk_path)?;
+        if matches!(config.storage, StorageType::Usb) {
+            filesystem::verify_persisted_write(disk_path)?;
+            println!("[PASS] filesystem_persistence: independent payload readback passed");
+        }
+    }
     Ok(())
+}
+
+/// Run the UEFI SCT smoke subset and parse its serial/log output.
+///
+/// # Arguments
+/// * `config` - QEMU configuration
+/// * `disk_path` - Disk image containing the UEFI Shell and SCT package
+///
+/// # Returns
+/// `Ok(())` only if every selected test has an explicit successful result and
+/// complete assertion counters, with no errors or warnings.
+pub fn run_uefi_sct_smoke_tests(
+    config: &QemuConfig,
+    disk_path: &Path,
+    sequence: &sct::Sequence,
+    report_dir: &Path,
+) -> Result<()> {
+    println!(
+        "=== UEFI SCT Tests ({:?}, {} cases) ===\n",
+        config.arch,
+        sequence.names.len()
+    );
+    fs::create_dir_all(report_dir)?;
+    // Fresh evidence for every run, without deleting a caller-supplied directory.
+    let report_dir = tempfile::Builder::new()
+        .prefix("sct-")
+        .tempdir_in(report_dir)?
+        .keep();
+    fs::write(report_dir.join("sequence.seq"), &sequence.text)?;
+    println!("SCT reports: {}", report_dir.display());
+    println!("Running SCT sequence in QEMU...\n");
+
+    let result = run_qemu_with_capture(config, disk_path)?;
+    fs::write(report_dir.join("serial.log"), &result.output)?;
+    let image = crate::disk::mtools_esp_image(disk_path);
+    for directory in ["::/Sct/Overall", "::/Sct/Log", "::/Sct/Report"] {
+        let status = Command::new("mcopy")
+            .args(["-s", "-i", &image, directory])
+            .arg(&report_dir)
+            .status()
+            .context("copying SCT reports")?;
+        if !status.success() {
+            println!("Could not copy {directory}; serial output retained");
+        }
+    }
+    let summary_log = extract_sct_log(disk_path, "::/Sct/Overall/Summary.log")?;
+    if let Some(ref summary) = summary_log {
+        fs::write(report_dir.join("summary.log"), summary)?;
+    }
+
+    println!("\n=== SCT Smoke Results ===");
+    println!("Serial output captured: {} bytes", result.output.len());
+    if let Some(ref summary) = summary_log {
+        println!("SCT Summary.log captured: {} bytes", summary.len());
+        println!("\n--- SCT Summary.log ---\n{}", summary);
+    } else {
+        println!("SCT Summary.log was not produced or could not be copied");
+    }
+
+    let validated = summary_log
+        .as_deref()
+        .context("SCT Summary.log was not produced")
+        .and_then(|summary| sct::validate(&result.output, summary, sequence));
+    use sha2::Digest;
+    let firmware_sha256 = format!(
+        "{:x}",
+        sha2::Sha256::digest(fs::read(&config.coreboot_rom)?)
+    );
+    fs::write(
+        report_dir.join("result.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "architecture": format!("{:?}", config.arch),
+            "machine": "q35",
+            "storage": format!("{:?}", config.storage),
+            "coreboot_rom_sha256": firmware_sha256,
+            "ci_revision": std::env::var("GITHUB_SHA").ok(),
+            "selected_cases": sequence.names,
+            "passed": validated.is_ok(),
+            "verified_instances": validated.as_ref().ok(),
+            "failure": validated.as_ref().err().map(|error| format!("{error:#}")),
+        }))?,
+    )?;
+    let instances = match validated {
+        Ok(instances) => instances,
+        Err(error) => {
+            println!("[FAIL] SCT: {error:#}");
+            println!("\n--- Captured Output ---\n{}", result.output);
+            return Err(error).context("UEFI SCT validation failed");
+        }
+    };
+    println!(
+        "[PASS] SCT: all {} selected cases across {} instances explicitly passed with zero errors or warnings",
+        sequence.names.len(),
+        instances
+    );
+    Ok(())
+}
+
+/// Run a Windows Boot Manager smoke test and parse its serial output.
+///
+/// The disk image is supplied by the caller because Windows and WinPE binaries
+/// are not redistributable by CrabEFI. The image should be configured to print
+/// a deterministic marker to COM1 after Windows or WinPE reaches userspace.
+///
+/// # Arguments
+/// * `config` - QEMU configuration
+/// * `disk_path` - Raw Windows/WinPE disk image
+/// * `success_markers` - Serial markers; any one marker indicates success
+///
+/// # Returns
+/// `Ok(())` if Windows reaches one of the configured markers without obvious
+/// boot-manager or loader failures.
+pub fn run_windows_boot_smoke_test(
+    config: &QemuConfig,
+    disk_path: &Path,
+    success_markers: &[String],
+) -> Result<()> {
+    println!("=== Windows Boot Smoke Test ({:?}) ===\n", config.arch);
+    println!("Running Windows/WinPE disk image in QEMU...\n");
+
+    let failure_markers = [
+        "No bootable device",
+        "BOOTMGR is missing",
+        "Windows failed to start",
+        "Recovery",
+        "Status: 0xc000",
+        "0xc000000f",
+        "0xc0000225",
+        "Access Denied",
+        "StartImage failed",
+        "Error loading image",
+        "CRABEFI: boot failed",
+    ];
+    validate_windows_markers(success_markers, &failure_markers)?;
+    let result = run_qemu_with_capture(config, disk_path)?;
+
+    println!("\n=== Windows Boot Smoke Results ===");
+    println!("Serial output captured: {} bytes", result.output.len());
+
+    let mut passed = 0;
+    let mut failed = 0;
+
+    if result.output.contains("CrabEFI") {
+        println!("[PASS] crabefi_started: CrabEFI produced serial output");
+        passed += 1;
+    } else {
+        println!("[FAIL] crabefi_started: CrabEFI serial output was not observed");
+        failed += 1;
+    }
+
+    let matched_markers = success_markers
+        .iter()
+        .filter(|marker| result.output.contains(marker.as_str()))
+        .collect::<Vec<_>>();
+    if matched_markers.is_empty() {
+        println!(
+            "[FAIL] windows_success_marker: none of {:?} appeared on serial",
+            success_markers
+        );
+        failed += 1;
+    } else {
+        println!(
+            "[PASS] windows_success_marker: matched {:?}",
+            matched_markers
+        );
+        passed += 1;
+    }
+
+    let found_failures = failure_markers
+        .iter()
+        .filter(|marker| result.output.contains(**marker))
+        .copied()
+        .collect::<Vec<_>>();
+    if found_failures.is_empty() {
+        println!("[PASS] no_windows_failure_markers: no failure markers found");
+        passed += 1;
+    } else {
+        println!(
+            "[FAIL] no_windows_failure_markers: found markers {:?}",
+            found_failures
+        );
+        failed += 1;
+    }
+
+    println!("\n=== Summary ===");
+    println!("Passed: {}", passed);
+    println!("Failed: {}", failed);
+
+    if failed > 0 {
+        println!("\n--- Captured Output ---");
+        println!("{}", result.output);
+        bail!("{} Windows boot smoke check(s) failed", failed);
+    }
+
+    Ok(())
+}
+
+fn validate_windows_markers(success: &[String], failure: &[&str]) -> Result<()> {
+    if success.is_empty() || success.iter().any(|marker| marker.trim().is_empty()) {
+        bail!("Windows success markers must not be empty");
+    }
+    if success
+        .iter()
+        .any(|success| failure.iter().any(|failure| success.contains(failure)))
+    {
+        bail!("Windows success marker overlaps a failure marker");
+    }
+    Ok(())
+}
+
+fn extract_sct_log(disk_path: &Path, src: &str) -> Result<Option<String>> {
+    let temp_dir = tempfile::tempdir()?;
+    let dest = temp_dir.path().join("sct.log");
+    let image = crate::disk::mtools_esp_image(disk_path);
+    let status = Command::new("mcopy")
+        .args(["-i", &image, src])
+        .arg(&dest)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .context("failed to run mcopy to extract SCT log")?;
+
+    if !status.success() || !dest.exists() {
+        return Ok(None);
+    }
+
+    let bytes = fs::read(dest)?;
+    let utf16_le = bytes.starts_with(&[0xff, 0xfe])
+        || bytes
+            .iter()
+            .skip(1)
+            .step_by(2)
+            .filter(|byte| **byte == 0)
+            .count()
+            > bytes.len() / 8;
+    let text = if utf16_le {
+        let start = if bytes.starts_with(&[0xff, 0xfe]) {
+            2
+        } else {
+            0
+        };
+        String::from_utf16_lossy(
+            &bytes[start..]
+                .chunks_exact(2)
+                .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+                .collect::<Vec<_>>(),
+        )
+    } else {
+        String::from_utf8_lossy(&bytes).into_owned()
+    };
+    Ok(Some(text))
 }
 
 /// Run QEMU and capture serial output
@@ -1749,6 +1965,25 @@ fn parse_qemu_output(output: &std::process::Output) -> Result<TestResult> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn windows_markers_reject_empty_and_failure_collisions() {
+        let failures = ["Recovery", "Status: 0xc000", "Access Denied"];
+        assert!(validate_windows_markers(&[], &failures).is_err());
+        for marker in [
+            "",
+            "  ",
+            "Recovery",
+            "OK: Access Denied",
+            "Status: 0xc000000f",
+        ] {
+            assert!(validate_windows_markers(&[marker.to_string()], &failures).is_err());
+        }
+        assert!(
+            validate_windows_markers(&["CRABEFI_WINDOWS_BOOT_SMOKE_SUCCESS".into()], &failures)
+                .is_ok()
+        );
+    }
 
     #[test]
     fn test_kvm_check() {

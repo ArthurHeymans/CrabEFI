@@ -82,6 +82,20 @@ pub struct UsbSlot {
     pub root_port: u8,
 }
 
+/// Reset is valid only for a halted endpoint. A timed-out transfer can still
+/// be running and must be stopped before its dequeue pointer is changed.
+fn endpoint_recovery_command(slot_id: u8, dci: u8, timed_out: bool) -> super::RawTrb {
+    if timed_out {
+        let mut command = command::StopEndpoint::new();
+        command.set_slot_id(slot_id).set_endpoint_id(dci);
+        command.into_raw()
+    } else {
+        let mut command = command::ResetEndpoint::new();
+        command.set_slot_id(slot_id).set_endpoint_id(dci);
+        command.into_raw()
+    }
+}
+
 impl super::XhciController {
     /// Reset an endpoint after a stall or other error
     ///
@@ -97,27 +111,28 @@ impl super::XhciController {
     /// # Returns
     /// Ok(()) on success, Err on failure
     pub(super) fn reset_endpoint(&mut self, slot_id: u8, dci: u8) -> Result<(), XhciError> {
-        log::debug!("xHCI: Resetting endpoint slot={} dci={}", slot_id, dci);
+        self.recover_endpoint(slot_id, dci, false)
+    }
 
-        // Step 1: Send Reset Endpoint command.
-        let mut command = command::ResetEndpoint::new();
-        command.set_slot_id(slot_id).set_endpoint_id(dci);
+    /// Stop an outstanding timed-out transfer before relinquishing its DMA.
+    pub(super) fn stop_endpoint(&mut self, slot_id: u8, dci: u8) -> Result<(), XhciError> {
+        self.recover_endpoint(slot_id, dci, true)
+    }
 
-        self.cmd_ring.enqueue(command, false);
+    fn recover_endpoint(&mut self, slot_id: u8, dci: u8, timed_out: bool) -> Result<(), XhciError> {
+        log::debug!(
+            "xHCI: {} endpoint slot={} dci={}",
+            if timed_out { "Stopping" } else { "Resetting" },
+            slot_id,
+            dci
+        );
+        self.cmd_ring
+            .enqueue(endpoint_recovery_command(slot_id, dci, timed_out), false);
         barrier::mmio_write();
         self.ring_doorbell(0, 0);
-
-        // Wait for Reset Endpoint completion
-        match self.wait_command_completion() {
-            Ok(_) => {
-                log::debug!("xHCI: Reset Endpoint command completed");
-            }
-            Err(e) => {
-                log::warn!("xHCI: Reset Endpoint command failed: {:?}", e);
-                return Err(e);
-            }
-        }
-
+        // Only successful Stop/Reset completion proves that the old TD is no
+        // longer running. Preserve the caller's DMA quarantine on failure.
+        self.wait_command_completion()?;
         self.discard_endpoint_transfers(slot_id, dci)
     }
 
@@ -367,5 +382,23 @@ impl super::XhciController {
         // SET_ADDRESS recovery interval (xHCI issues the USB request).
         crate::time::delay_ms(2);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::endpoint_recovery_command;
+    use xhci::ring::trb::command;
+
+    #[test]
+    fn timed_out_endpoint_is_stopped_not_reset() {
+        let stopped =
+            command::StopEndpoint::try_from(endpoint_recovery_command(7, 3, true)).unwrap();
+        assert_eq!(stopped.slot_id(), 7);
+        assert_eq!(stopped.endpoint_id(), 3);
+        let reset =
+            command::ResetEndpoint::try_from(endpoint_recovery_command(7, 3, false)).unwrap();
+        assert_eq!(reset.slot_id(), 7);
+        assert_eq!(reset.endpoint_id(), 3);
     }
 }
