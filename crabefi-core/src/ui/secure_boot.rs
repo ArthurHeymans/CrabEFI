@@ -34,17 +34,7 @@ pub fn show(fb: &FramebufferInfo) -> ScreenNav {
                 });
             } else if (selected, scroll_offset) != $before {
                 cursor.while_hidden(fb, || {
-                    if scroll_offset == $before.1 {
-                        [$before.0, selected].into_iter().for_each(|i| {
-                            paint_action_card(fb, i, selected, hovered, scroll_offset);
-                        });
-                    } else {
-                        let end = (scroll_offset + action_visible_slots(fb)).min(ACTION_COUNT);
-                        (scroll_offset..end).for_each(|i| {
-                            paint_action_card(fb, i, selected, hovered, scroll_offset);
-                        });
-                    }
-                    paint_action_scrollbar(fb, scroll_offset);
+                    repaint_actions(fb, selected, hovered, scroll_offset, $before);
                 });
             }
         };
@@ -83,7 +73,6 @@ pub fn show(fb: &FramebufferInfo) -> ScreenNav {
                     keep_action_visible(fb, selected, &mut scroll_offset);
                     reselect!(before, had_status);
                 }
-                KeyPress::Char('s') | KeyPress::Char('S') => {}
                 KeyPress::Char('f') | KeyPress::Char('F') => {
                     cursor.hide(fb);
                     return ScreenNav::Nav(NavItem::Firmware);
@@ -134,6 +123,8 @@ pub fn show(fb: &FramebufferInfo) -> ScreenNav {
                             keep_action_visible(fb, selected, &mut scroll_offset);
                             reselect!(before, had_status);
                         }
+                    } else {
+                        reselect!(before, had_status);
                     }
                 }
                 #[cfg(feature = "ui")]
@@ -146,7 +137,9 @@ pub fn show(fb: &FramebufferInfo) -> ScreenNav {
                     keep_action_visible(fb, selected, &mut scroll_offset);
                     reselect!(before, had_status);
                 }
-                _ => {}
+                _ => {
+                    reselect!(before, had_status);
+                }
             }
         }
         delay_ms(8);
@@ -286,7 +279,18 @@ fn paint_action_card(
     } else {
         theme::CONTAINER
     };
-    render::fill_rounded_rect(fb, cx, y, cw, card_h, theme::RADIUS, bg);
+    // The accent bar reaches outside the rounded body at its left corners.
+    // Clear the corners so deselecting the card leaves no cyan pixels behind.
+    let r = theme::RADIUS;
+    [
+        (cx, y),
+        (cx + cw as i32 - r as i32, y),
+        (cx, y + card_h as i32 - r as i32),
+        (cx + cw as i32 - r as i32, y + card_h as i32 - r as i32),
+    ]
+    .into_iter()
+    .for_each(|(x, y)| render::fill_rect(fb, x, y, r, r, theme::BG));
+    render::fill_rounded_rect(fb, cx, y, cw, card_h, r, bg);
 
     if is_sel {
         render::fill_rect(fb, cx, y + 2, theme::ACCENT_BAR, card_h - 4, theme::PRIMARY);
@@ -329,6 +333,25 @@ fn paint_action_card(
             Some(bg),
         );
     }
+}
+
+fn repaint_actions(
+    fb: &FramebufferInfo,
+    selected: usize,
+    hovered: Option<usize>,
+    scroll_offset: usize,
+    before: (usize, usize),
+) {
+    if scroll_offset == before.1 {
+        [before.0, selected]
+            .into_iter()
+            .for_each(|i| paint_action_card(fb, i, selected, hovered, scroll_offset));
+    } else {
+        let end = (scroll_offset + action_visible_slots(fb)).min(ACTION_COUNT);
+        (scroll_offset..end)
+            .for_each(|i| paint_action_card(fb, i, selected, hovered, scroll_offset));
+    }
+    paint_action_scrollbar(fb, scroll_offset);
 }
 
 fn paint_action_scrollbar(fb: &FramebufferInfo, scroll_offset: usize) {
@@ -495,4 +518,64 @@ fn fmt_kc<'a>(name: &str, count: u32, buf: &'a mut [u8; 16]) -> &'a str {
     p += 1;
     p += super::fmt_u32(count, &mut buf[p..]);
     core::str::from_utf8(&buf[..p]).unwrap_or("??")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn framebuffer(mem: &mut [u32], width: u32, height: u32) -> FramebufferInfo {
+        FramebufferInfo {
+            physical_address: mem.as_mut_ptr() as u64,
+            width,
+            height,
+            stride: width,
+            bits_per_pixel: 32,
+            red_mask_pos: 16,
+            red_mask_size: 8,
+            green_mask_pos: 8,
+            green_mask_size: 8,
+            blue_mask_pos: 0,
+            blue_mask_size: 8,
+        }
+    }
+
+    fn paint_list(fb: &FramebufferInfo, selected: usize, scroll_offset: usize) {
+        clear(fb);
+        let end = (scroll_offset + action_visible_slots(fb)).min(ACTION_COUNT);
+        (scroll_offset..end).for_each(|i| paint_action_card(fb, i, selected, None, scroll_offset));
+        paint_action_scrollbar(fb, scroll_offset);
+    }
+
+    #[test]
+    fn action_selection_repaint_matches_full_repaint() {
+        for (width, height) in [(1024, 768), (640, 480)] {
+            let mut inc_mem = std::vec![0u32; (width * height) as usize];
+            let mut ref_mem = std::vec![0u32; (width * height) as usize];
+            let inc = framebuffer(&mut inc_mem, width, height);
+            let full = framebuffer(&mut ref_mem, width, height);
+            let mut selected = 0;
+            let mut scroll_offset = 0;
+            paint_list(&inc, selected, scroll_offset);
+            let mut cursor = CursorRenderer::new();
+            cursor.update(&inc, 200, 250);
+
+            for next in (1..ACTION_COUNT).chain((0..ACTION_COUNT - 1).rev()) {
+                let before = (selected, scroll_offset);
+                selected = next;
+                keep_action_visible(&inc, selected, &mut scroll_offset);
+                cursor.while_hidden(&inc, || {
+                    repaint_actions(&inc, selected, None, scroll_offset, before);
+                });
+                paint_list(&full, selected, scroll_offset);
+                cursor.hide(&inc);
+                let differing_pixels = inc_mem.iter().zip(&ref_mem).filter(|(a, b)| a != b).count();
+                assert_eq!(
+                    differing_pixels, 0,
+                    "{width}x{height}: selected={selected}, scroll={scroll_offset}"
+                );
+                cursor.update(&inc, 200, 250);
+            }
+        }
+    }
 }
