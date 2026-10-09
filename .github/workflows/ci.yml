@@ -58,10 +58,10 @@ jobs:
         # cargo test works for all workspace library crates here.
         run: cargo test --workspace
 
-      - name: Run Secure Boot unit tests
-        # The auth modules are feature-gated and not built by the plain
-        # workspace test run above.
-        run: cargo test -p crabefi-core --features secure-boot
+      - name: Run Secure Boot and graphical UI unit tests
+        # Auth and graphical repaint tests are feature-gated and not built
+        # by the plain workspace test run above.
+        run: cargo test -p crabefi-core --features secure-boot,ui
 
       - name: Run runtime host tests
         run: |

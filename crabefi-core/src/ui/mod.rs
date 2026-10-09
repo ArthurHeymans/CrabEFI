@@ -215,6 +215,7 @@ fn sidebar_item_y(i: usize) -> i32 {
 /// Returns `true` if the hover state changed.
 pub fn update_sidebar_hover(
     fb: &FramebufferInfo,
+    cursor: &mut CursorRenderer,
     sidebar_hov: &mut Option<NavItem>,
     active: NavItem,
 ) -> bool {
@@ -224,14 +225,16 @@ pub fn update_sidebar_hover(
     }
     let old = *sidebar_hov;
     *sidebar_hov = new;
-    if let Some(o) = old {
-        let idx = nav_item_index(o);
-        paint_sidebar_item(fb, idx, o, NAV_ITEMS[idx].1, active, false);
-    }
-    if let Some(n) = new {
-        let idx = nav_item_index(n);
-        paint_sidebar_item(fb, idx, n, NAV_ITEMS[idx].1, active, true);
-    }
+    cursor.while_hidden(fb, || {
+        if let Some(o) = old {
+            let idx = nav_item_index(o);
+            paint_sidebar_item(fb, idx, o, NAV_ITEMS[idx].1, active, false);
+        }
+        if let Some(n) = new {
+            let idx = nav_item_index(n);
+            paint_sidebar_item(fb, idx, n, NAV_ITEMS[idx].1, active, true);
+        }
+    });
     true
 }
 
@@ -377,40 +380,37 @@ fn run_boot(fb: &FramebufferInfo, menu: &mut BootMenu) -> BootResult {
     loop {
         poll_and_render_cursor(fb, &mut cursor);
 
-        update_sidebar_hover(fb, &mut st.sidebar_hov, NavItem::Boot);
+        update_sidebar_hover(fb, &mut cursor, &mut st.sidebar_hov, NavItem::Boot);
 
         // ── Card hover ──
         let hov = boot_hit(fb, menu, &st);
         if hov != st.hovered {
             let prev = st.hovered;
             st.hovered = hov;
-            if let Some(i) = prev {
-                paint_boot_card(fb, menu, &st, i);
-            }
-            if let Some(i) = hov {
-                paint_boot_card(fb, menu, &st, i);
-            }
-            paint_boot_scrollbar(fb, menu, &st);
+            cursor.while_hidden(fb, || {
+                prev.into_iter()
+                    .chain(hov)
+                    .for_each(|i| paint_boot_card(fb, menu, &st, i));
+                paint_boot_scrollbar(fb, menu, &st);
+            });
         }
 
         if let Some(key) = menu_common::read_key() {
             if st.countdown > 0 {
                 st.countdown = 0;
-                paint_boot_footer(fb, &st);
+                cursor.while_hidden(fb, || paint_boot_footer(fb, &st));
             }
 
             match key {
                 KeyPress::Up | KeyPress::Char('k') => {
+                    let before = (st.sel, st.scroll_offset);
                     st.sel_prev();
-                    menu.selected = st.sel;
-                    keep_boot_selection_visible(fb, &mut st);
-                    paint_boot(fb, menu, &st);
+                    select_boot(fb, menu, &mut st, &mut cursor, before);
                 }
                 KeyPress::Down | KeyPress::Char('j') => {
+                    let before = (st.sel, st.scroll_offset);
                     st.sel_next();
-                    menu.selected = st.sel;
-                    keep_boot_selection_visible(fb, &mut st);
-                    paint_boot(fb, menu, &st);
+                    select_boot(fb, menu, &mut st, &mut cursor, before);
                 }
                 KeyPress::Enter => {
                     cursor.hide(fb);
@@ -443,22 +443,20 @@ fn run_boot(fb: &FramebufferInfo, menu: &mut BootMenu) -> BootResult {
                             cursor.hide(fb);
                             return BootResult::Selected(idx);
                         }
+                        let before = (st.sel, st.scroll_offset);
                         st.sel = idx;
-                        menu.selected = idx;
-                        keep_boot_selection_visible(fb, &mut st);
-                        paint_boot(fb, menu, &st);
+                        select_boot(fb, menu, &mut st, &mut cursor, before);
                     }
                 }
                 #[cfg(feature = "ui")]
                 KeyPress::MouseScroll(dz) => {
+                    let before = (st.sel, st.scroll_offset);
                     if dz > 0 {
                         st.sel_next();
                     } else {
                         st.sel_prev();
                     }
-                    menu.selected = st.sel;
-                    keep_boot_selection_visible(fb, &mut st);
-                    paint_boot(fb, menu, &st);
+                    select_boot(fb, menu, &mut st, &mut cursor, before);
                 }
                 _ => {}
             }
@@ -467,7 +465,7 @@ fn run_boot(fb: &FramebufferInfo, menu: &mut BootMenu) -> BootResult {
         if st.countdown > 0 && st.tick.is_expired() {
             st.countdown -= 1;
             st.tick = Timeout::from_ms(1000);
-            paint_boot_footer(fb, &st);
+            cursor.while_hidden(fb, || paint_boot_footer(fb, &st));
             if st.countdown == 0 {
                 cursor.hide(fb);
                 return BootResult::Selected(st.sel);
@@ -556,7 +554,7 @@ fn run_no_media(fb: &FramebufferInfo) -> ScreenNav {
     loop {
         poll_and_render_cursor(fb, &mut cursor);
 
-        update_sidebar_hover(fb, &mut sidebar_hov, NavItem::Boot);
+        update_sidebar_hover(fb, &mut cursor, &mut sidebar_hov, NavItem::Boot);
 
         if let Some(key) = menu_common::read_key() {
             match key {
@@ -681,6 +679,36 @@ fn paint_boot(fb: &FramebufferInfo, menu: &BootMenu, st: &BState) {
     paint_boot_footer(fb, st);
 }
 
+/// Repaint the boot list after `st.sel` changed from `before` (selection, scroll offset).
+///
+/// Only the two cards whose look changed are redrawn, or the visible cards when the list
+/// scrolled; header, sidebar and footer are left alone.
+fn select_boot(
+    fb: &FramebufferInfo,
+    menu: &mut BootMenu,
+    st: &mut BState,
+    cursor: &mut CursorRenderer,
+    before: (usize, usize),
+) {
+    let (old_sel, old_scroll) = before;
+    menu.selected = st.sel;
+    keep_boot_selection_visible(fb, st);
+    if (st.sel, st.scroll_offset) == before {
+        return;
+    }
+    cursor.while_hidden(fb, || {
+        if st.scroll_offset == old_scroll {
+            [old_sel, st.sel]
+                .into_iter()
+                .for_each(|i| paint_boot_card(fb, menu, st, i));
+        } else {
+            let end = (st.scroll_offset + boot_visible_slots(fb)).min(menu.entry_count());
+            (st.scroll_offset..end).for_each(|i| paint_boot_card(fb, menu, st, i));
+        }
+        paint_boot_scrollbar(fb, menu, st);
+    });
+}
+
 fn paint_boot_scrollbar(fb: &FramebufferInfo, menu: &BootMenu, st: &BState) {
     let (list_x, list_y, list_w, list_h) = boot_list_area(fb);
     draw_scrollbar(
@@ -710,16 +738,26 @@ fn paint_boot_card(fb: &FramebufferInfo, menu: &BootMenu, st: &BState, idx: usiz
         theme::CONT_LOW
     };
 
-    // Erase + glow
-    let gm = theme::GLOW_SPREAD as i32 + 1;
-    render::fill_rect(
-        fb,
-        cx - gm,
-        cy - gm,
-        cw + gm as u32 * 2,
-        ch + gm as u32 * 2,
-        theme::BG,
-    );
+    // Erase the glow ring around the card, including the corners of the card rect that the
+    // rounded body does not cover.  The rest of the body is overpainted below, and leaving
+    // it alone avoids flashing the card blank between repaints.
+    let gm = theme::GLOW_SPREAD + 1;
+    let (gx, gy) = (cx - gm as i32, cy - gm as i32);
+    let full_w = cw + gm * 2;
+    let (right, bottom) = (cx + cw as i32, cy + ch as i32);
+    let r = theme::RADIUS;
+    [
+        (gx, gy, full_w, gm),
+        (gx, bottom, full_w, gm),
+        (gx, cy, gm, ch),
+        (right, cy, gm, ch),
+        (cx, cy, r, r),
+        (right - r as i32, cy, r, r),
+        (cx, bottom - r as i32, r, r),
+        (right - r as i32, bottom - r as i32, r, r),
+    ]
+    .into_iter()
+    .for_each(|(x, y, w, h)| render::fill_rect(fb, x, y, w, h, theme::BG));
 
     if is_sel {
         render::draw_glow(
@@ -883,4 +921,130 @@ pub(super) fn fmt_u32(n: u32, out: &mut [u8]) -> usize {
         v /= 10;
     }
     len
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::drivers::storage::StorageId;
+    use crate::fs::gpt::Partition;
+    use crate::menu::{BootCategory, BootEntry, BootEntryKind};
+    use std::vec::Vec;
+
+    const W: u32 = 1024;
+    const H: u32 = 768;
+
+    /// A 32bpp framebuffer backed by host memory.
+    fn framebuffer(mem: &mut [u32]) -> FramebufferInfo {
+        FramebufferInfo {
+            physical_address: mem.as_mut_ptr() as u64,
+            width: W,
+            height: H,
+            stride: W,
+            bits_per_pixel: 32,
+            red_mask_pos: 16,
+            red_mask_size: 8,
+            green_mask_pos: 8,
+            green_mask_size: 8,
+            blue_mask_pos: 0,
+            blue_mask_size: 8,
+        }
+    }
+
+    fn pixels(fb: &FramebufferInfo) -> Vec<u32> {
+        // SAFETY: `fb` points at a live `W * H` buffer of u32.
+        unsafe { core::slice::from_raw_parts(fb.as_ptr() as *const u32, (W * H) as usize) }.to_vec()
+    }
+
+    /// Assert equality, reporting the bounding box of the differing pixels instead of a dump.
+    fn assert_same(got: &[u32], want: &[u32], sel: usize) {
+        let diff: Vec<(u32, u32)> = got
+            .iter()
+            .zip(want)
+            .enumerate()
+            .filter(|(_, (g, w))| g != w)
+            .map(|(i, _)| (i as u32 % W, i as u32 / W))
+            .collect();
+        let bbox = |f: fn(&(u32, u32)) -> u32| {
+            (
+                diff.iter().map(f).min().unwrap_or(0),
+                diff.iter().map(f).max().unwrap_or(0),
+            )
+        };
+        assert!(
+            diff.is_empty(),
+            "sel={sel}: {} pixels differ, x {:?} y {:?}",
+            diff.len(),
+            bbox(|p| p.0),
+            bbox(|p| p.1)
+        );
+    }
+
+    fn boot_menu(count: usize) -> BootMenu {
+        let mut menu = BootMenu::new();
+        (0..count).for_each(|i| {
+            let mut name = heapless::String::<64>::new();
+            let _ = core::fmt::write(&mut name, format_args!("Entry {i}"));
+            menu.add_entry(BootEntry {
+                name,
+                path: heapless::String::new(),
+                storage: StorageId::Nvme {
+                    controller_id: 0,
+                    nsid: 1,
+                },
+                pci: None,
+                partition_num: 1,
+                partition: Partition {
+                    type_guid: [0; 16],
+                    partition_guid: [0; 16],
+                    first_lba: 0,
+                    last_lba: 0,
+                    attributes: 0,
+                    is_esp: true,
+                    block_size: 512,
+                },
+                kind: BootEntryKind::Uefi,
+                category: BootCategory::Uefi,
+            });
+        });
+        menu
+    }
+
+    /// Stepping through the boot list with partial repaints, with the mouse cursor sitting
+    /// on top of the cards, must leave exactly the pixels of a full repaint and no cursor
+    /// residue.
+    #[test]
+    fn boot_selection_repaint_matches_full_repaint() {
+        const COUNT: usize = 12;
+        let mut menu = boot_menu(COUNT);
+        let mut inc_mem = std::vec![0u32; (W * H) as usize];
+        let mut ref_mem = std::vec![0u32; (W * H) as usize];
+        let (inc, full) = (framebuffer(&mut inc_mem), framebuffer(&mut ref_mem));
+
+        let mut st = BState::new(COUNT, 0, 0);
+        keep_boot_selection_visible(&inc, &mut st);
+        paint_boot(&inc, &menu, &st);
+        let mut cursor = CursorRenderer::new();
+        let (cx, cy) = (300, 200);
+        cursor.update(&inc, cx, cy);
+
+        let scrolled = (0..COUNT - 1)
+            .map(|_| {
+                let before = (st.sel, st.scroll_offset);
+                st.sel_next();
+                select_boot(&inc, &mut menu, &mut st, &mut cursor, before);
+
+                let mut expected = BState::new(COUNT, st.sel, 0);
+                expected.scroll_offset = st.scroll_offset;
+                paint_boot(&full, &menu, &expected);
+
+                cursor.hide(&inc);
+                assert_same(&pixels(&inc), &pixels(&full), st.sel);
+                cursor.update(&inc, cx, cy);
+                st.scroll_offset != before.1
+            })
+            .filter(|&scrolled| scrolled)
+            .count();
+        assert!(scrolled > 0, "test never exercised the scrolling path");
+    }
 }

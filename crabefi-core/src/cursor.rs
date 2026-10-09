@@ -163,6 +163,22 @@ impl CursorRenderer {
         self.erase(fb);
     }
 
+    /// Run `paint` with the cursor removed from the framebuffer, then put it
+    /// back where it was.
+    ///
+    /// Any drawing that may touch pixels under the cursor must go through this:
+    /// otherwise the sprite is overwritten and the save-under buffer goes stale,
+    /// so the next move "restores" old pixels and leaves artifacts.
+    pub fn while_hidden<R>(&mut self, fb: &FramebufferInfo, paint: impl FnOnce() -> R) -> R {
+        let was_visible = self.visible;
+        self.erase(fb);
+        let result = paint();
+        if was_visible {
+            self.draw(fb, self.last_x, self.last_y);
+        }
+        result
+    }
+
     /// Show the cursor at the current position.
     pub fn show(&mut self, fb: &FramebufferInfo, x: i32, y: i32) {
         if !self.visible {
