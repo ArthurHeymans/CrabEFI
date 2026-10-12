@@ -157,8 +157,8 @@ not implied by selecting Secure Boot or a basic feature profile.
 
 ## Toolchain and validation scope
 
-The development validation uses the existing `nightly` compiler:
-`rustc 1.100.0-nightly (e457a7b0d 2026-08-27)`, LLVM 23. This is newer than fstart's
+The development validation uses the workspace-pinned nightly compiler:
+`rustc 1.101.0-nightly (1d81eb4ad 2026-10-07)`, LLVM 23. This is newer than fstart's
 1.95 nightly pin; compatibility with that older pin is not established. Align
 source/toolchain pins deliberately rather than silently substituting compilers.
 Host tests and release builds are not hardware boot tests. Report normalized,

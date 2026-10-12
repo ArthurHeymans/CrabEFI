@@ -8,18 +8,26 @@
 nix develop
 ```
 
-This provides the Rust nightly toolchain, QEMU, mtools, dosfstools, cbfstool, zstd, and p7zip.
+This provides rustup, QEMU, mtools, dosfstools, cbfstool, zstd, and p7zip. The Rust
+toolchain itself is pinned by the workspace `rust-toolchain.toml` and installed by
+rustup on first use.
 
 ### Manual Setup
 
 **Rust Toolchain:**
 
+The workspace builds on nightly Rust, pinned by date in `rust-toolchain.toml`
+(currently nightly-2026-10-08). A nightly is required because the runtime
+image builds `core`/`alloc` from source (`-Z build-std`) with a small PIC code
+model, while the prebuilt `x86_64-unknown-none` std uses the kernel code model.
+Everything else also builds on stable. From the repository root:
+
 ```bash
-rustup toolchain install nightly
-rustup default nightly
-rustup target add x86_64-unknown-none aarch64-unknown-none
-rustup component add rust-src llvm-tools-preview
+rustup toolchain install   # installs the pinned toolchain, targets, and components
 ```
+
+After that, every `cargo`/`rustc` invocation inside the repository automatically
+uses the pinned toolchain; no `rustup default` change is needed.
 
 **System Packages (Debian/Ubuntu):**
 
@@ -81,7 +89,7 @@ map, symbols, disassembly, stack report, digest, and JSON audits are under
 | `Cargo.toml` | Virtual workspace root |
 | `crabefi-core/Cargo.toml` | Core library manifest |
 | `crabefi-coreboot/Cargo.toml` | Coreboot binary manifest |
-| `.cargo/config.toml` | `build-std` settings, target-specific rustflags |
+| `.cargo/config.toml` | target-specific rustflags |
 | `crabefi-coreboot/build.rs` | Runtime embedding, linker selection, `PAYLOAD_BASE` |
 | `crabefi-runtime-image/.cargo/config.toml` | Isolated runtime build with image-local bounded scratch allocation |
 | `crabefi-runtime-image/link/*.ld` | ET_DYN runtime image linker scripts |
@@ -308,7 +316,7 @@ cargo fmt --all --check
 # Direct workspace diagnostics use the image path and digest produced above.
 RUNTIME_IMAGE_PATH="$PWD/target/runtime/x86_64/runtime.img" \
 RUNTIME_IMAGE_SHA256="$(tr -d '\n' < target/runtime/x86_64/sha256)" \
-cargo +nightly -Z build-std=core,compiler_builtins,alloc \
+cargo -Z build-std=core,compiler_builtins,alloc \
   -Z build-std-features=compiler-builtins-mem \
   clippy --workspace --release --target x86_64-unknown-none -- -D warnings
 ```
@@ -341,6 +349,6 @@ cargo +nightly -Z build-std=core,compiler_builtins,alloc \
 
 **Disk image creation fails** -- Ensure `mtools` and `dosfstools` are installed.
 
-**Build fails with linker errors** -- Check the nightly toolchain and `rust-src` component.
+**Build fails with linker errors** -- Check the pinned toolchain is installed (`rustup toolchain install` in the repository root) and that no stale `RUSTUP_TOOLCHAIN` override is set.
 
 **Debug output** -- CrabEFI logs to serial (COM1 / PL011), CBMEM console, and optionally the framebuffer (`--features fb-log`).

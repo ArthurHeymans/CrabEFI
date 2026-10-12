@@ -1,4 +1,12 @@
 [toolchain]
-channel = "nightly"
-components = ["rust-src", "llvm-tools-preview"]
-targets = ["x86_64-unknown-none", "aarch64-unknown-none", "riscv64gc-unknown-none-elf"]
+# Pinned by date: the runtime image builds core/alloc from source
+# (`-Z build-std`) with a non-default code model, which stable cannot do.
+channel = "nightly-2026-10-08"
+components = ["rust-src", "clippy", "rustfmt", "llvm-tools-preview"]
+targets = [
+    "x86_64-unknown-none",
+    "x86_64-unknown-uefi",
+    "aarch64-unknown-none",
+    "aarch64-unknown-uefi",
+    "riscv64gc-unknown-none-elf",
+]

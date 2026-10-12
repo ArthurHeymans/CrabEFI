@@ -35,6 +35,24 @@ fn project_root() -> &'static Path {
     PROJECT_DIR.get().expect("PROJECT_DIR not initialized")
 }
 
+/// The Rust toolchain pinned by the workspace `rust-toolchain.toml`
+/// (e.g. `"nightly-2026-10-08"`). Subprocesses that run outside the project tree —
+/// where rustup cannot discover the file — pass it explicitly as
+/// `+<channel>` so every firmware build uses the same compiler.
+fn pinned_toolchain() -> Result<String> {
+    let path = project_root().join("rust-toolchain.toml");
+    let contents = fs::read_to_string(&path)
+        .with_context(|| format!("read pinned toolchain from {}", path.display()))?;
+    contents
+        .lines()
+        .find_map(|line| {
+            let (key, value) = line.split_once('=')?;
+            (key.trim() == "channel").then(|| value.trim().trim_matches('"').to_owned())
+        })
+        .filter(|channel| !channel.is_empty())
+        .with_context(|| format!("no channel pinned in {}", path.display()))
+}
+
 /// Target architecture for CrabEFI
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub enum Arch {
@@ -370,8 +388,9 @@ fn cmd_build(release: bool, ui: bool, arch: Arch, machine: Machine) -> Result<()
     let runtime = runtime::build(arch)?;
 
     let mut cmd = std::process::Command::new("cargo");
+    let toolchain = format!("+{}", pinned_toolchain()?);
     cmd.args([
-        "+nightly",
+        toolchain.as_str(),
         "-Z",
         "build-std=core,compiler_builtins,alloc",
         "-Z",

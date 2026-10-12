@@ -1,7 +1,6 @@
-# NOTE: Use ./xtask script to run xtask (it needs different build settings)
+# NOTE: Use the ./crabefi script to run xtask (it needs different build settings)
 #
 # Linker scripts are handled by crabefi-coreboot/build.rs.
-# Build-std is passed by xtask so host-side Cargo commands remain unaffected.
 
 # sha2_backend="soft" preserves the pre-0.11 `force-soft` behavior: pure
 # software SHA-256/512 with no runtime CPU-feature dispatch. This keeps hash
