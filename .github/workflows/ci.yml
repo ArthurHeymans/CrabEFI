@@ -22,8 +22,9 @@ jobs:
           persist-credentials: false
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@nightly
+        uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: nightly-2026-10-08
           components: rustfmt
 
       - name: Check formatting
@@ -45,17 +46,19 @@ jobs:
           persist-credentials: false
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-10-08
 
       - name: Run coreboot feature regression tests
         run: ci/run-coreboot-feature-tests.sh
 
-      - name: Install nightly toolchain for workspace unit tests
-        uses: dtolnay/rust-toolchain@nightly
+      - name: Install Rust toolchain for workspace unit tests
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-10-08
 
       - name: Run workspace library unit tests
-        # build-std is passed only on xtask's firmware invocations, so host
-        # cargo test works for all workspace library crates here.
         run: cargo test --workspace
 
       - name: Run Secure Boot and graphical UI unit tests
@@ -82,26 +85,29 @@ jobs:
           persist-credentials: false
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@nightly
+        uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: nightly-2026-10-08
           components: clippy, rust-src, llvm-tools-preview
           targets: x86_64-unknown-none
 
       - name: Install stable toolchain for xtask
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-10-08
 
       - name: Run clippy
         run: |
           ./crabefi build --arch x86-64
           RUNTIME_IMAGE_PATH="$PWD/target/runtime/x86_64/runtime.img" \
           RUNTIME_IMAGE_SHA256="$(tr -d '\n' < target/runtime/x86_64/sha256)" \
-          cargo +nightly -Z build-std=core,compiler_builtins,alloc \
+          cargo -Z build-std=core,compiler_builtins,alloc \
             -Z build-std-features=compiler-builtins-mem \
             clippy --workspace --release --target x86_64-unknown-none -- -D warnings
           cd "$HOME"
-          cargo +nightly clippy --manifest-path "$GITHUB_WORKSPACE/crabefi-runtime-abi/Cargo.toml" -- -D warnings
+          cargo +nightly-2026-10-08 clippy --manifest-path "$GITHUB_WORKSPACE/crabefi-runtime-abi/Cargo.toml" -- -D warnings
           cd "$GITHUB_WORKSPACE/crabefi-runtime-image"
-          cargo +nightly -Z build-std=core,compiler_builtins,alloc \
+          cargo -Z build-std=core,compiler_builtins,alloc \
             -Z build-std-features=compiler-builtins-mem \
             clippy --release --target x86_64-unknown-none -- -D warnings
 
@@ -114,13 +120,16 @@ jobs:
           persist-credentials: false
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@nightly
+        uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: nightly-2026-10-08
           components: rust-src, llvm-tools-preview
           targets: x86_64-unknown-none
 
       - name: Install stable toolchain for xtask
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-10-08
 
       - name: Build coreboot payload with Cargo-only runtime
         run: cargo build -p crabefi-coreboot --release --target x86_64-unknown-none
@@ -130,7 +139,7 @@ jobs:
 
       - name: Build Cargo-only library consumer
         run: |
-          cargo +nightly -Z build-std=core,compiler_builtins,alloc \
+          cargo -Z build-std=core,compiler_builtins,alloc \
             -Z build-std-features=compiler-builtins-mem \
             build --release \
             --manifest-path ci/fixtures/library-consumer/Cargo.toml \
@@ -162,13 +171,16 @@ jobs:
           persist-credentials: false
 
       - name: Install Rust toolchains
-        uses: dtolnay/rust-toolchain@nightly
+        uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: nightly-2026-10-08
           components: rust-src, llvm-tools-preview
           targets: x86_64-unknown-none, x86_64-unknown-uefi
 
       - name: Install stable toolchain for xtask
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-10-08
 
       - name: Install test dependencies
         run: |
@@ -208,13 +220,16 @@ jobs:
           persist-credentials: false
 
       - name: Install Rust toolchains
-        uses: dtolnay/rust-toolchain@nightly
+        uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: nightly-2026-10-08
           components: rust-src, llvm-tools-preview
           targets: x86_64-unknown-none, x86_64-unknown-uefi
 
       - name: Install stable toolchain for xtask
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-10-08
 
       - name: Install test dependencies
         run: |
@@ -234,13 +249,16 @@ jobs:
           persist-credentials: false
 
       - name: Install Rust toolchains
-        uses: dtolnay/rust-toolchain@nightly
+        uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: nightly-2026-10-08
           components: rust-src, llvm-tools-preview
           targets: x86_64-unknown-none, x86_64-unknown-uefi
 
       - name: Install stable toolchain for xtask
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-10-08
 
       - name: Install test dependencies
         run: |
@@ -271,13 +289,16 @@ jobs:
           persist-credentials: false
 
       - name: Install Rust toolchains
-        uses: dtolnay/rust-toolchain@nightly
+        uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: nightly-2026-10-08
           components: rust-src, llvm-tools-preview
           targets: x86_64-unknown-none, x86_64-unknown-uefi
 
       - name: Install stable toolchain for xtask
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-10-08
 
       - name: Install test dependencies
         run: |
@@ -308,13 +329,16 @@ jobs:
           persist-credentials: false
 
       - name: Install Rust toolchains
-        uses: dtolnay/rust-toolchain@nightly
+        uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: nightly-2026-10-08
           components: rust-src, llvm-tools-preview
           targets: x86_64-unknown-none, x86_64-unknown-uefi
 
       - name: Install stable toolchain for xtask
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-10-08
 
       - name: Install test dependencies
         run: |
@@ -340,13 +364,16 @@ jobs:
           persist-credentials: false
 
       - name: Install Rust toolchains
-        uses: dtolnay/rust-toolchain@nightly
+        uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: nightly-2026-10-08
           components: rust-src, llvm-tools-preview
           targets: x86_64-unknown-none, x86_64-unknown-uefi
 
       - name: Install stable toolchain for xtask
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-10-08
 
       - name: Install test dependencies
         run: |
@@ -375,13 +402,16 @@ jobs:
           persist-credentials: false
 
       - name: Install Rust toolchains
-        uses: dtolnay/rust-toolchain@nightly
+        uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: nightly-2026-10-08
           components: rust-src, llvm-tools-preview
           targets: x86_64-unknown-none, x86_64-unknown-uefi
 
       - name: Install stable toolchain for xtask
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-10-08
 
       - name: Install test dependencies
         run: |
@@ -407,13 +437,16 @@ jobs:
           persist-credentials: false
 
       - name: Install Rust toolchains
-        uses: dtolnay/rust-toolchain@nightly
+        uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: nightly-2026-10-08
           components: rust-src, llvm-tools-preview
           targets: x86_64-unknown-none, x86_64-unknown-uefi
 
       - name: Install stable toolchain for xtask
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-10-08
 
       - name: Install test dependencies
         run: |
@@ -474,13 +507,16 @@ jobs:
           persist-credentials: false
 
       - name: Install Rust toolchains
-        uses: dtolnay/rust-toolchain@nightly
+        uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: nightly-2026-10-08
           components: rust-src, llvm-tools-preview
           targets: x86_64-unknown-none
 
       - name: Install stable toolchain for xtask
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-10-08
 
       - name: Install test dependencies
         run: |
@@ -537,13 +573,16 @@ jobs:
           persist-credentials: false
 
       - name: Install Rust toolchains
-        uses: dtolnay/rust-toolchain@nightly
+        uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: nightly-2026-10-08
           components: rust-src, llvm-tools-preview
           targets: x86_64-unknown-none
 
       - name: Install stable toolchain for xtask
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-10-08
 
       - name: Install test dependencies
         run: |
@@ -597,13 +636,16 @@ jobs:
           persist-credentials: false
 
       - name: Install Rust toolchains
-        uses: dtolnay/rust-toolchain@nightly
+        uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: nightly-2026-10-08
           components: rust-src, llvm-tools-preview
           targets: x86_64-unknown-none
 
       - name: Install stable toolchain for xtask
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-10-08
 
       - name: Install test dependencies
         run: |
@@ -736,13 +778,16 @@ jobs:
           persist-credentials: false
 
       - name: Install Rust toolchains
-        uses: dtolnay/rust-toolchain@nightly
+        uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: nightly-2026-10-08
           components: rust-src, llvm-tools-preview
           targets: x86_64-unknown-none
 
       - name: Install stable toolchain for xtask
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-10-08
 
       - name: Install test dependencies
         run: |
@@ -774,13 +819,16 @@ jobs:
           persist-credentials: false
 
       - name: Install Rust toolchains
-        uses: dtolnay/rust-toolchain@nightly
+        uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: nightly-2026-10-08
           components: rust-src, llvm-tools-preview
           targets: aarch64-unknown-none
 
       - name: Install stable toolchain for xtask
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-10-08
 
       - name: Install test dependencies
         run: |
@@ -813,24 +861,27 @@ jobs:
           persist-credentials: false
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@nightly
+        uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: nightly-2026-10-08
           components: clippy, rust-src, llvm-tools-preview
           targets: aarch64-unknown-none
 
       - name: Install stable toolchain for xtask
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-10-08
 
       - name: Run clippy
         run: |
           ./crabefi build --arch aarch64 --machine sbsa
           RUNTIME_IMAGE_PATH="$PWD/target/runtime/aarch64/runtime.img" \
           RUNTIME_IMAGE_SHA256="$(tr -d '\n' < target/runtime/aarch64/sha256)" \
-          cargo +nightly -Z build-std=core,compiler_builtins,alloc \
+          cargo -Z build-std=core,compiler_builtins,alloc \
             -Z build-std-features=compiler-builtins-mem \
             clippy --workspace --release --target aarch64-unknown-none -- -D warnings
           cd "$GITHUB_WORKSPACE/crabefi-runtime-image"
-          cargo +nightly -Z build-std=core,compiler_builtins,alloc \
+          cargo -Z build-std=core,compiler_builtins,alloc \
             -Z build-std-features=compiler-builtins-mem \
             clippy --release --target aarch64-unknown-none -- -D warnings
 
@@ -843,20 +894,23 @@ jobs:
           persist-credentials: false
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@nightly
+        uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: nightly-2026-10-08
           components: rust-src, llvm-tools-preview
           targets: aarch64-unknown-none
 
       - name: Install stable toolchain for xtask
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-10-08
 
       - name: Build release
         run: ./crabefi build --arch aarch64 --machine sbsa
 
       - name: Build Cargo-only library consumer
         run: |
-          cargo +nightly -Z build-std=core,compiler_builtins,alloc \
+          cargo -Z build-std=core,compiler_builtins,alloc \
             -Z build-std-features=compiler-builtins-mem \
             build --release \
             --manifest-path ci/fixtures/library-consumer/Cargo.toml \
@@ -882,13 +936,16 @@ jobs:
           persist-credentials: false
 
       - name: Install Rust toolchains
-        uses: dtolnay/rust-toolchain@nightly
+        uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: nightly-2026-10-08
           components: rust-src, llvm-tools-preview
           targets: aarch64-unknown-none, aarch64-unknown-uefi
 
       - name: Install stable toolchain for xtask
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-10-08
 
       - name: Install test dependencies
         run: |
@@ -914,13 +971,16 @@ jobs:
           persist-credentials: false
 
       - name: Install Rust toolchains
-        uses: dtolnay/rust-toolchain@nightly
+        uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: nightly-2026-10-08
           components: rust-src, llvm-tools-preview
           targets: aarch64-unknown-none, aarch64-unknown-uefi
 
       - name: Install stable toolchain for xtask
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-10-08
 
       - name: Install test dependencies
         run: |
@@ -947,13 +1007,16 @@ jobs:
           persist-credentials: false
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@nightly
+        uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: nightly-2026-10-08
           components: rust-src, llvm-tools-preview
           targets: aarch64-unknown-none
 
       - name: Install stable toolchain for xtask
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-10-08
 
       - name: Build release (virt PAYLOAD_BASE)
         run: ./crabefi build --arch aarch64 --machine virt
@@ -977,13 +1040,16 @@ jobs:
           persist-credentials: false
 
       - name: Install Rust toolchains
-        uses: dtolnay/rust-toolchain@nightly
+        uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: nightly-2026-10-08
           components: rust-src, llvm-tools-preview
           targets: aarch64-unknown-none, aarch64-unknown-uefi
 
       - name: Install stable toolchain for xtask
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-10-08
 
       - name: Install test dependencies
         run: |
@@ -1010,24 +1076,27 @@ jobs:
           persist-credentials: false
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@nightly
+        uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: nightly-2026-10-08
           components: clippy, rust-src, llvm-tools-preview
           targets: riscv64gc-unknown-none-elf
 
       - name: Install stable toolchain for xtask
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-10-08
 
       - name: Run clippy
         run: |
           ./crabefi build --arch riscv64
           RUNTIME_IMAGE_PATH="$PWD/target/runtime/riscv64/runtime.img" \
           RUNTIME_IMAGE_SHA256="$(tr -d '\n' < target/runtime/riscv64/sha256)" \
-          cargo +nightly -Z build-std=core,compiler_builtins,alloc \
+          cargo -Z build-std=core,compiler_builtins,alloc \
             -Z build-std-features=compiler-builtins-mem \
             clippy --workspace --release --target riscv64gc-unknown-none-elf -- -D warnings
           cd "$GITHUB_WORKSPACE/crabefi-runtime-image"
-          cargo +nightly -Z build-std=core,compiler_builtins,alloc \
+          cargo -Z build-std=core,compiler_builtins,alloc \
             -Z build-std-features=compiler-builtins-mem \
             clippy --release --target riscv64gc-unknown-none-elf -- -D warnings
 
@@ -1040,20 +1109,23 @@ jobs:
           persist-credentials: false
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@nightly
+        uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: nightly-2026-10-08
           components: rust-src, llvm-tools-preview
           targets: riscv64gc-unknown-none-elf
 
       - name: Install stable toolchain for xtask
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-10-08
 
       - name: Build release
         run: ./crabefi build --arch riscv64
 
       - name: Build Cargo-only library consumer
         run: |
-          cargo +nightly -Z build-std=core,compiler_builtins,alloc \
+          cargo -Z build-std=core,compiler_builtins,alloc \
             -Z build-std-features=compiler-builtins-mem \
             build --release \
             --manifest-path ci/fixtures/library-consumer/Cargo.toml \
@@ -1113,13 +1185,16 @@ jobs:
           persist-credentials: false
 
       - name: Install Rust toolchains
-        uses: dtolnay/rust-toolchain@nightly
+        uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: nightly-2026-10-08
           components: rust-src, llvm-tools-preview
           targets: riscv64gc-unknown-none-elf
 
       - name: Install stable toolchain for xtask
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-10-08
 
       - name: Install test dependencies
         run: |
@@ -1184,13 +1259,16 @@ jobs:
           persist-credentials: false
 
       - name: Install Rust toolchains
-        uses: dtolnay/rust-toolchain@nightly
+        uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: nightly-2026-10-08
           components: rust-src, llvm-tools-preview
           targets: riscv64gc-unknown-none-elf
 
       - name: Install stable toolchain for xtask
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-10-08
 
       - name: Install test dependencies
         run: |

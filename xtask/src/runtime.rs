@@ -109,9 +109,10 @@ fn build_with_capabilities(arch: Arch, secure_boot: bool) -> Result<RuntimeArtif
     let rustflags = runtime_rustflags(arch, &map_path);
     let parent = root.parent().context("project root has no parent")?;
     let mut command = Command::new("cargo");
+    let toolchain = format!("+{}", crate::pinned_toolchain()?);
     command
         .args([
-            "+nightly",
+            toolchain.as_str(),
             "-Z",
             "build-std=core,compiler_builtins,alloc",
             "-Z",
@@ -132,7 +133,7 @@ fn build_with_capabilities(arch: Arch, secure_boot: bool) -> Result<RuntimeArtif
         .env_remove("RUSTFLAGS")
         .env("CARGO_ENCODED_RUSTFLAGS", rustflags)
         .status()
-        .context("failed to invoke nightly Cargo for the runtime image")?;
+        .context("failed to invoke pinned Cargo for the runtime image")?;
     if !status.success() {
         bail!("runtime image Cargo build failed for {target}");
     }
@@ -952,23 +953,24 @@ fn llvm_tool(name: &str) -> Result<PathBuf> {
     {
         return Ok(PathBuf::from(name));
     }
+    let toolchain = format!("+{}", crate::pinned_toolchain()?);
     let output = Command::new("rustc")
-        .args(["+nightly", "--print", "sysroot"])
+        .args([toolchain.as_str(), "--print", "sysroot"])
         .output()
-        .context("locate nightly Rust sysroot for LLVM tools")?;
+        .context("locate pinned Rust sysroot for LLVM tools")?;
     if !output.status.success() {
         bail!("cannot locate required LLVM tool {name}");
     }
     let sysroot = String::from_utf8(output.stdout)?.trim().to_owned();
     let verbose = Command::new("rustc")
-        .args(["+nightly", "-vV"])
+        .args([toolchain.as_str(), "-vV"])
         .output()
-        .context("query nightly Rust host triple for LLVM tools")?;
+        .context("query pinned Rust host triple for LLVM tools")?;
     if !verbose.status.success() {
-        bail!("cannot query nightly Rust host triple for required LLVM tool {name}");
+        bail!("cannot query pinned Rust host triple for required LLVM tool {name}");
     }
     let verbose = String::from_utf8(verbose.stdout)?;
-    let host = parse_rustc_host(&verbose).context("nightly rustc -vV has no valid host line")?;
+    let host = parse_rustc_host(&verbose).context("pinned rustc -vV has no valid host line")?;
     let executable = format!("{name}{}", std::env::consts::EXE_SUFFIX);
     let path = PathBuf::from(sysroot)
         .join("lib/rustlib")
