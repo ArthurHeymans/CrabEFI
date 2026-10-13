@@ -93,6 +93,23 @@ pub fn dma_cache_for_device(
     return riscv64::cache::sync_for_device(addr, size, operation);
 }
 
+/// Make freshly written code executable: synchronize the instruction
+/// cache with completed stores over `addr..addr + size`.
+///
+/// Call after copying and relocating any image that is about to be
+/// executed (PE images, ELF payloads, kernels, the runtime image).
+/// Without this, aarch64/riscv64 cores without coherent instruction
+/// caches may fetch stale bytes from previously used pages.
+#[inline]
+pub fn sync_instruction_cache(addr: u64, size: usize) {
+    #[cfg(target_arch = "x86_64")]
+    x86_64::cache::sync_instruction_cache(addr, size);
+    #[cfg(target_arch = "aarch64")]
+    aarch64::cache::sync_instruction_cache(addr, size);
+    #[cfg(target_arch = "riscv64")]
+    riscv64::cache::sync_instruction_cache(addr, size);
+}
+
 /// Perform non-coherent cache maintenance after CPU ownership resumes.
 #[inline]
 pub fn dma_cache_for_cpu(

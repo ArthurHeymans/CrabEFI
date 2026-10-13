@@ -192,6 +192,10 @@ impl Elf64 {
                 src_size,
                 mem_size.saturating_sub(src_size)
             );
+
+            // The segment may be executed next; synchronize instruction
+            // fetch with the copied bytes and the zeroed BSS.
+            crate::arch::sync_instruction_cache(segment.load_addr, mem_size);
         }
 
         Ok(())
