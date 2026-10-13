@@ -101,6 +101,13 @@ pub fn process_pending_capsules(backend: &mut dyn CapsuleBackend) -> usize {
 
         let disk_capsules = disk::scan_esp_for_capsules();
         disk_capsule_count = disk_capsules.len();
+
+        // Clear the OsIndications bits *before* applying anything: if
+        // processing crashes or power is lost part-way, the next boot must
+        // not re-enter capsule processing for the same request. The OS
+        // re-requests delivery if no capsule result reports success.
+        disk::clear_os_indications_capsule_bits();
+
         for (i, capsule) in disk_capsules.iter().enumerate() {
             log::info!(
                 "Processing ESP capsule '{}' ({} bytes)",
@@ -116,9 +123,6 @@ pub fn process_pending_capsules(backend: &mut dyn CapsuleBackend) -> usize {
                 applied_count += 1;
             }
         }
-
-        // Clear OsIndications bits to prevent re-processing
-        disk::clear_os_indications_capsule_bits();
     }
 
     if applied_count > 0 {
