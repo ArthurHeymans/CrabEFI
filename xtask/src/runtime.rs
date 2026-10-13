@@ -15,9 +15,9 @@ use sha2::{Digest, Sha256};
 
 use crabefi_runtime_abi::exports::{EXPORT_COUNT, ExportOffsets};
 use crabefi_runtime_abi::format::{
-    EFI_PAGE_SIZE, EXPORTS_SIZE, HEADER_SIZE, MAX_SECTIONS, RELOCATION_SIZE, RuntimeImageHeader,
-    SECTION_SIZE, ValidatedImage, architecture, relocation_kind as abi_relocation_kind,
-    section_flags as abi_section_flags,
+    ABI_VERSION, EFI_PAGE_SIZE, EXPORTS_SIZE, HEADER_SIZE, MAX_SECTIONS, RELOCATION_SIZE,
+    RuntimeImageHeader, SECTION_SIZE, ValidatedImage, architecture,
+    relocation_kind as abi_relocation_kind, section_flags as abi_section_flags,
 };
 
 use crate::{Arch, project_root};
@@ -346,6 +346,7 @@ fn normalize(
         relocation_count: u32::try_from(relocations.len())?,
         exports_offset: u32::try_from(exports_offset)?,
         feature_bits: capabilities,
+        abi_version: ABI_VERSION,
     };
     normalized[..HEADER_SIZE].copy_from_slice(&header.to_bytes());
 
