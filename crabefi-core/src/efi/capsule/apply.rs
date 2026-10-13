@@ -24,58 +24,77 @@ use super::header::{self, CapsuleHeader, CapsuleType};
 use super::result::{CapsuleResult, CapsuleResultStatus};
 use super::rmap;
 
+/// Maximum number of nested capsule-on-disk wrappers to unwrap.
+///
+/// Real delivery nests at most once (EDK2 wraps the on-disk file) or twice
+/// (the retained-reservation capsule). Anything deeper is malformed. The
+/// bound matters because unwrapping happens before any authentication: an
+/// unbounded walk over nested 28-byte headers from an ESP file would
+/// exhaust the boot stack.
+const MAX_CAPSULE_WRAPPERS: usize = 8;
+
 /// Apply a single capsule from a raw byte buffer.
 ///
 /// `data` must contain the entire capsule image starting from the
 /// `EFI_CAPSULE_HEADER`.
 ///
 /// Returns a `CapsuleResult` describing the outcome (success or failure).
-pub fn apply_capsule(data: &[u8], backend: &mut dyn CapsuleBackend) -> CapsuleResult {
-    let hdr = match header::parse_capsule_header(data) {
-        Ok(h) => h,
-        Err(e) => {
-            log::error!("Failed to parse capsule header: {:?}", e);
-            return CapsuleResult::report_only(CapsuleResultStatus::ErrorInvalidImage);
-        }
-    };
-    let capsule_type = header::identify_capsule_type(&hdr.capsule_guid);
-
-    if let Err(e) = header::validate_capsule(&hdr, data.len()) {
-        log::error!("Capsule validation failed: {:?}", e);
-        return if capsule_type == CapsuleType::Fmp {
-            CapsuleResult::failure(CapsuleResultStatus::ErrorInvalidImage, 0)
-        } else {
-            CapsuleResult::report_only(CapsuleResultStatus::ErrorInvalidImage)
-        };
-    }
-
-    log::info!(
-        "Processing capsule: type={:?}, size={}, flags={:#x}",
-        capsule_type,
-        hdr.capsule_image_size,
-        hdr.flags
-    );
-
-    match capsule_type {
-        CapsuleType::Fmp => apply_fmp_capsule(&hdr, data, backend),
-        CapsuleType::WindowsUx => {
-            log::info!("Skipping Windows UX capsule (informational only)");
-            CapsuleResult::report_only(CapsuleResultStatus::Success)
-        }
-        CapsuleType::CapsuleOnDisk => {
-            // Capsule-on-disk wrapper: the inner payload starts after the
-            // outer capsule header.
-            log::info!("Unwrapping capsule-on-disk wrapper");
-            let inner_offset = hdr.header_size as usize;
-            if inner_offset >= data.len() {
-                log::error!("Capsule-on-disk wrapper has no inner payload");
+pub fn apply_capsule(mut data: &[u8], backend: &mut dyn CapsuleBackend) -> CapsuleResult {
+    let mut wrappers = 0;
+    loop {
+        let hdr = match header::parse_capsule_header(data) {
+            Ok(h) => h,
+            Err(e) => {
+                log::error!("Failed to parse capsule header: {:?}", e);
                 return CapsuleResult::report_only(CapsuleResultStatus::ErrorInvalidImage);
             }
-            apply_capsule(&data[inner_offset..], backend)
+        };
+        let capsule_type = header::identify_capsule_type(&hdr.capsule_guid);
+
+        if let Err(e) = header::validate_capsule(&hdr, data.len()) {
+            log::error!("Capsule validation failed: {:?}", e);
+            return if capsule_type == CapsuleType::Fmp {
+                CapsuleResult::failure(CapsuleResultStatus::ErrorInvalidImage, 0)
+            } else {
+                CapsuleResult::report_only(CapsuleResultStatus::ErrorInvalidImage)
+            };
         }
-        CapsuleType::Unknown => {
-            log::warn!("Unknown capsule GUID — skipping");
-            CapsuleResult::report_only(CapsuleResultStatus::ErrorUnsupported)
+
+        log::info!(
+            "Processing capsule: type={:?}, size={}, flags={:#x}",
+            capsule_type,
+            hdr.capsule_image_size,
+            hdr.flags
+        );
+
+        match capsule_type {
+            CapsuleType::Fmp => return apply_fmp_capsule(&hdr, data, backend),
+            CapsuleType::WindowsUx => {
+                log::info!("Skipping Windows UX capsule (informational only)");
+                return CapsuleResult::report_only(CapsuleResultStatus::Success);
+            }
+            CapsuleType::CapsuleOnDisk => {
+                // Capsule-on-disk wrapper: the inner payload starts after the
+                // outer capsule header.
+                wrappers += 1;
+                if wrappers > MAX_CAPSULE_WRAPPERS {
+                    log::error!(
+                        "Capsule-on-disk wrapper nested more than {MAX_CAPSULE_WRAPPERS} times"
+                    );
+                    return CapsuleResult::report_only(CapsuleResultStatus::ErrorInvalidImage);
+                }
+                log::info!("Unwrapping capsule-on-disk wrapper");
+                let inner_offset = hdr.header_size as usize;
+                if inner_offset >= data.len() {
+                    log::error!("Capsule-on-disk wrapper has no inner payload");
+                    return CapsuleResult::report_only(CapsuleResultStatus::ErrorInvalidImage);
+                }
+                data = &data[inner_offset..];
+            }
+            CapsuleType::Unknown => {
+                log::warn!("Unknown capsule GUID — skipping");
+                return CapsuleResult::report_only(CapsuleResultStatus::ErrorUnsupported);
+            }
         }
     }
 }
@@ -327,6 +346,76 @@ fn guid_matches(guid: &r_efi::efi::Guid, bytes: &[u8; 16]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::platform::{FirmwareInfo, FmapRegion, StorageError};
+    use alloc::vec::Vec;
+    use r_efi::efi::Guid;
+
+    /// Backend for capsule types that must never reach the flash path.
+    struct UnusedBackend;
+
+    impl CapsuleBackend for UnusedBackend {
+        fn firmware_info(&self) -> Option<&FirmwareInfo> {
+            None
+        }
+
+        fn capsule_trust_store(&self) -> &[&[u8]] {
+            &[]
+        }
+
+        fn write_firmware_region(
+            &mut self,
+            _region_name: &str,
+            _offset: u32,
+            _data: &[u8],
+        ) -> Result<(), StorageError> {
+            unreachable!("wrapper-only capsules must not reach the backend")
+        }
+
+        fn fmap_regions(&mut self) -> &[FmapRegion] {
+            &[]
+        }
+    }
+
+    /// A capsule of `wrappers` nested capsule-on-disk headers around an
+    /// innermost header with `innermost_guid`. Every header is well-formed:
+    /// 28-byte header, image size covering the rest of the buffer.
+    fn wrapped_capsule(wrappers: usize, innermost_guid: &Guid) -> Vec<u8> {
+        const HEADER_SIZE: usize = 28;
+        let total = HEADER_SIZE * (wrappers + 1);
+        let mut data = alloc::vec![0u8; total];
+        for i in 0..=wrappers {
+            let offset = i * HEADER_SIZE;
+            let guid = if i == wrappers {
+                innermost_guid
+            } else {
+                &header::EDK2_CAPSULE_ON_DISK_GUID
+            };
+            data[offset..offset + 16].copy_from_slice(guid.as_bytes());
+            data[offset + 16..offset + 20].copy_from_slice(&(HEADER_SIZE as u32).to_le_bytes());
+            data[offset + 24..offset + 28]
+                .copy_from_slice(&((total - offset) as u32).to_le_bytes());
+        }
+        data
+    }
+
+    #[test]
+    fn capsule_on_disk_unwrap_is_bounded() {
+        // Nesting the maximum number of wrappers still reaches the payload.
+        let at_limit = wrapped_capsule(MAX_CAPSULE_WRAPPERS, &header::WINDOWS_UX_CAPSULE_GUID);
+        let result = apply_capsule(&at_limit, &mut UnusedBackend);
+        assert_eq!(result.status, CapsuleResultStatus::Success);
+
+        // One more wrapper is rejected rather than walked.
+        let over_limit =
+            wrapped_capsule(MAX_CAPSULE_WRAPPERS + 1, &header::WINDOWS_UX_CAPSULE_GUID);
+        let result = apply_capsule(&over_limit, &mut UnusedBackend);
+        assert_eq!(result.status, CapsuleResultStatus::ErrorInvalidImage);
+
+        // The pre-fix crash primitive: hundreds of nested 28-byte headers.
+        let hostile = wrapped_capsule(512, &header::WINDOWS_UX_CAPSULE_GUID);
+        let result = apply_capsule(&hostile, &mut UnusedBackend);
+        assert_eq!(result.status, CapsuleResultStatus::ErrorInvalidImage);
+    }
 
     #[test]
     fn rollback_failure_reports_the_attempted_capsule_version() {
