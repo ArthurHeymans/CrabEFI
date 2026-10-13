@@ -70,6 +70,7 @@ pub mod tpm_tags {
 /// Coreboot header structure
 #[repr(C, packed)]
 #[derive(FromBytes, Immutable, KnownLayout, Unaligned)]
+#[cfg_attr(test, derive(zerocopy::IntoBytes))]
 struct CbHeader {
     signature: [u8; 4],
     header_bytes: u32,
@@ -82,6 +83,7 @@ struct CbHeader {
 /// Coreboot record header
 #[repr(C, packed)]
 #[derive(FromBytes, Immutable, KnownLayout, Unaligned)]
+#[cfg_attr(test, derive(zerocopy::IntoBytes))]
 struct CbRecord {
     tag: u32,
     size: u32,
@@ -107,6 +109,7 @@ struct CbMemoryRange {
 /// - input_hertz: crystal/input frequency
 #[repr(C, packed)]
 #[derive(FromBytes, Immutable, KnownLayout, Unaligned)]
+#[cfg_attr(test, derive(zerocopy::IntoBytes))]
 struct CbSerial {
     tag: u32,
     size: u32,
@@ -141,6 +144,7 @@ struct CbFramebuffer {
 /// Forward pointer to another coreboot table
 #[repr(C, packed)]
 #[derive(FromBytes, Immutable, KnownLayout, Unaligned)]
+#[cfg_attr(test, derive(zerocopy::IntoBytes))]
 struct CbForward {
     tag: u32,
     size: u32,
@@ -497,6 +501,97 @@ impl CorebootInfo {
     }
 }
 
+/// Largest coreboot table byte count validated. coreboot allocates at
+/// most `COREBOOT_TABLE_SIZE` for the table (8 KiB on arm/riscv, 32 KiB
+/// on x86); the cap keeps a garbage length from making the checksum pass
+/// read far past it.
+const MAX_TABLE_BYTES: u32 = 64 * 1024;
+
+/// Deepest `CB_TAG_FORWARD` chain followed. Real firmware forwards at
+/// most once (low stub table to the high table).
+const MAX_FORWARD_DEPTH: usize = 4;
+
+/// RFC 1071 one's-complement checksum, byte-identical to coreboot's
+/// `ipchksum` on the little-endian targets supported here.
+fn ip_checksum(data: &[u8]) -> u16 {
+    let (words, remainder) = data.as_chunks::<2>();
+    // A u64 accumulator cannot overflow for any slice that fits in memory
+    // (coreboot accumulates in a 64-bit `wide_sum` as well).
+    let mut sum = words
+        .iter()
+        .map(|word| u64::from(u16::from_le_bytes(*word)))
+        .chain(remainder.iter().map(|&last| u64::from(last)))
+        .sum::<u64>();
+    while sum >> 16 != 0 {
+        sum = (sum & 0xFFFF) + (sum >> 16);
+    }
+    !(sum as u16)
+}
+
+/// Validate a candidate coreboot header: signature, bounded sizes, and
+/// both checksums coreboot stamps into the header. The signature alone
+/// proves nothing — the memory scans in this module will find the bytes
+/// `LBIO` in unrelated data eventually.
+///
+/// coreboot always writes `header_bytes == sizeof(struct lb_header)` and
+/// checksums exactly that struct, so any other header size is rejected.
+///
+/// # Safety
+///
+/// `header` must be readable for `available` bytes. Neither a signature nor
+/// a matching checksum establishes that the advertised table is readable.
+unsafe fn validate_header(header: *const CbHeader, available: usize) -> bool {
+    if available < size_of::<CbHeader>() {
+        return false;
+    }
+    // SAFETY: caller guarantees the header struct itself is readable.
+    let (signature, header_bytes, table_bytes, table_checksum) = unsafe {
+        let header = &*header;
+        (
+            header.signature,
+            header.header_bytes,
+            header.table_bytes,
+            header.table_checksum,
+        )
+    };
+    if &signature != b"LBIO"
+        || header_bytes != size_of::<CbHeader>() as u32
+        || table_bytes > MAX_TABLE_BYTES
+        || header_bytes as usize + table_bytes as usize > available
+    {
+        return false;
+    }
+    // SAFETY: both regions fit within the caller's readable extent.
+    unsafe {
+        let base = header as *const u8;
+        let header_slice = core::slice::from_raw_parts(base, header_bytes as usize);
+        // The header checksum covers the whole header including its own
+        // field, so a valid header checksums to zero.
+        if ip_checksum(header_slice) != 0 {
+            return false;
+        }
+        let table_slice =
+            core::slice::from_raw_parts(base.add(header_bytes as usize), table_bytes as usize);
+        ip_checksum(table_slice) == table_checksum as u16
+    }
+}
+
+/// React to unusable coreboot tables: fabricate the QEMU memory map when
+/// the `fallback-memory-map` feature is enabled, otherwise leave the info
+/// empty so startup fails visibly instead of booting on invented RAM.
+fn fallback_or_empty(info: &mut CorebootInfo, reason: &str) {
+    #[cfg(feature = "fallback-memory-map")]
+    {
+        log::warn!("{reason}; using fallback memory map");
+        create_fallback_memory_map(info);
+    }
+    #[cfg(not(feature = "fallback-memory-map"))]
+    {
+        let _ = info;
+        log::error!("{reason}; fallback memory map not compiled in");
+    }
+}
+
 /// Parse coreboot tables starting at the given pointer
 ///
 /// # Safety
@@ -524,31 +619,23 @@ pub unsafe fn parse(ptr: *const u8) -> CorebootInfo {
     let header = match header {
         Some(h) => h,
         None => {
-            log::warn!("Could not find coreboot header, using fallback memory map");
-            create_fallback_memory_map(&mut info);
+            fallback_or_empty(&mut info, "could not find a valid coreboot header");
             return info;
         }
     };
 
-    // Safety: We've validated that header points to a valid coreboot table
+    // Safety: find_header/scan_for_header only return headers accepted by
+    // validate_header (signature, sizes, and both checksums).
     unsafe {
-        // Verify signature "LBIO"
-        if &(*header).signature != b"LBIO" {
-            log::warn!("Invalid coreboot header signature");
-            create_fallback_memory_map(&mut info);
-            return info;
-        }
-
         let table_bytes = (*header).table_bytes;
         log::debug!("Found coreboot header: {} bytes of tables", table_bytes);
 
-        iterate_table_records(header, &mut info);
+        iterate_table_records(header, &mut info, 0);
     }
 
-    // If we still have no memory map, create a fallback
+    // If we still have no memory map, fall back (or fail visibly).
     if info.memory_map.is_empty() {
-        log::warn!("No memory map found in coreboot tables, using fallback");
-        create_fallback_memory_map(&mut info);
+        fallback_or_empty(&mut info, "no memory map found in coreboot tables");
     }
 
     info
@@ -556,6 +643,7 @@ pub unsafe fn parse(ptr: *const u8) -> CorebootInfo {
 
 /// Create a fallback memory map for when coreboot tables aren't available
 /// This is mainly useful for QEMU testing
+#[cfg(feature = "fallback-memory-map")]
 fn create_fallback_memory_map(info: &mut CorebootInfo) {
     log::info!("Creating fallback memory map for QEMU");
 
@@ -596,19 +684,24 @@ fn create_fallback_memory_map(info: &mut CorebootInfo) {
     );
 }
 
-/// Find the coreboot header, following forward pointers if needed
+/// Validate the exact table pointer supplied by the entry ABI or a forward record.
+///
+/// # Safety
+///
+/// Unlike a scan candidate, this pointer must address a firmware-provided
+/// table area: the header and its advertised body must be readable. Do not
+/// infer this contract from the signature or checksum. The body may exceed
+/// the 4 KiB search window used for legacy low-memory stubs.
 unsafe fn find_header(ptr: *const u8) -> Option<*const CbHeader> {
-    let header = ptr as *const CbHeader;
-
-    // Safety: caller guarantees ptr points to valid coreboot tables.
+    let header = ptr.cast::<CbHeader>();
+    // SAFETY: the caller guarantees the firmware-provided table area.
     unsafe {
-        // Check if this is a valid header
-        if (*header).signature == *b"LBIO" {
-            return Some(header);
+        let table_bytes = (*header).table_bytes;
+        if table_bytes > MAX_TABLE_BYTES {
+            return None;
         }
-
-        // Try scanning from the given address
-        scan_for_header_at(ptr, 0x1000)
+        let available = size_of::<CbHeader>() + table_bytes as usize;
+        validate_header(header, available).then_some(header)
     }
 }
 
@@ -645,30 +738,30 @@ unsafe fn scan_for_header() -> Option<*const CbHeader> {
     None
 }
 
-/// Scan a memory region for the coreboot header
+/// Scan a memory region for the first valid coreboot header.
+///
+/// The bytes `LBIO` turn up in unrelated data, so a candidate that fails
+/// [`validate_header`] does not end the scan.
 unsafe fn scan_for_header_at(base: *const u8, size: usize) -> Option<*const CbHeader> {
-    // Scan in 16-byte increments (coreboot header is aligned)
-    let mut offset = 0;
-    while offset < size {
-        // Safety: caller guarantees the memory region [base, base+size) is readable.
+    // coreboot aligns the header to 16 bytes; only slots whose whole
+    // header lies inside the region are candidates.
+    let last = size.checked_sub(size_of::<CbHeader>())?;
+    (0..=last).step_by(16).find_map(|offset| {
+        // Safety: caller guarantees [base, base+size) is readable, and the
+        // candidate header lies inside it.
         unsafe {
-            let ptr = base.add(offset);
-            let header = ptr as *const CbHeader;
-
-            // Check for "LBIO" signature
-            // We need to be careful not to read from invalid memory
-            // Use a simple check that won't fault on most systems
-            let sig_ptr = ptr as *const [u8; 4];
-            if *sig_ptr == *b"LBIO" {
-                log::debug!("Found LBIO signature at {:p}", ptr);
-                return Some(header);
+            let header = base.add(offset) as *const CbHeader;
+            if (*header).signature != *b"LBIO" {
+                return None;
+            }
+            if validate_header(header, size - offset) {
+                Some(header)
+            } else {
+                log::debug!("Ignoring LBIO at {:p}: failed validation", header);
+                None
             }
         }
-
-        offset += 16;
-    }
-
-    None
+    })
 }
 
 /// Parse a single coreboot record from a byte slice
@@ -679,7 +772,9 @@ unsafe fn scan_for_header_at(base: *const u8, size: usize) -> Option<*const CbHe
 ///
 /// This function is safe because it uses zerocopy to validate all struct parsing.
 /// The `parse_forward` case still requires unsafe internally to follow the pointer.
-fn parse_record(record_bytes: &[u8], info: &mut CorebootInfo) {
+/// `depth` is the current `CB_TAG_FORWARD` nesting, bounded by
+/// [`MAX_FORWARD_DEPTH`].
+fn parse_record(record_bytes: &[u8], info: &mut CorebootInfo, depth: usize) {
     let Ok((header, _)) = CbRecord::read_from_prefix(record_bytes) else {
         return;
     };
@@ -697,7 +792,7 @@ fn parse_record(record_bytes: &[u8], info: &mut CorebootInfo) {
         }
         tags::CB_TAG_FORWARD => {
             // This one still needs unsafe to follow the pointer
-            unsafe { parse_forward(record_bytes, info) };
+            unsafe { parse_forward(record_bytes, info, depth) };
         }
         tags::CB_TAG_ACPI_RSDP => {
             parse_acpi_rsdp(record_bytes, info);
@@ -887,9 +982,9 @@ fn parse_framebuffer(record_bytes: &[u8], info: &mut CorebootInfo) {
 /// to [`parse_record`].
 ///
 /// # Safety
-/// `header` must point to a valid `CbHeader` with a verified `"LBIO"` signature.
-unsafe fn iterate_table_records(header: *const CbHeader, info: &mut CorebootInfo) {
-    // Safety: caller guarantees header points to a valid CbHeader with verified "LBIO" signature.
+/// `header` must point to a `CbHeader` accepted by [`validate_header`].
+unsafe fn iterate_table_records(header: *const CbHeader, info: &mut CorebootInfo, depth: usize) {
+    // Safety: caller guarantees header points to a CbHeader accepted by validate_header.
     unsafe {
         let table_bytes = (*header).table_bytes;
         let header_bytes = (*header).header_bytes;
@@ -930,7 +1025,7 @@ unsafe fn iterate_table_records(header: *const CbHeader, info: &mut CorebootInfo
             }
 
             let record_bytes = core::slice::from_raw_parts(record_ptr, record_size as usize);
-            parse_record(record_bytes, info);
+            parse_record(record_bytes, info, depth);
 
             offset += record_size;
         }
@@ -942,7 +1037,11 @@ unsafe fn iterate_table_records(header: *const CbHeader, info: &mut CorebootInfo
 /// # Safety
 /// This function must follow a memory pointer from the coreboot tables,
 /// which requires trusting that the pointer is valid.
-unsafe fn parse_forward(record_bytes: &[u8], info: &mut CorebootInfo) {
+unsafe fn parse_forward(record_bytes: &[u8], info: &mut CorebootInfo, depth: usize) {
+    if depth >= MAX_FORWARD_DEPTH {
+        log::warn!("Refusing to follow coreboot forward pointer beyond depth {MAX_FORWARD_DEPTH}");
+        return;
+    }
     // Safely parse the forward record using zerocopy
     let Ok((forward, _)) = CbForward::read_from_prefix(record_bytes) else {
         log::warn!("Failed to parse forward record");
@@ -953,22 +1052,13 @@ unsafe fn parse_forward(record_bytes: &[u8], info: &mut CorebootInfo) {
 
     log::debug!("Following forward pointer to {:#x}", forward_addr);
 
-    // Safety: We trust the forward pointer from coreboot tables.
+    // Safety: find_header only returns a header accepted by
+    // validate_header; see it for the region contract.
     unsafe {
-        // Parse the forwarded table directly into info (no recursion)
-        let header = match find_header(new_ptr) {
-            Some(h) => h,
-            None => {
-                log::warn!("Could not find coreboot header at forwarded location");
-                return;
-            }
-        };
-
-        // Verify signature "LBIO"
-        if &(*header).signature != b"LBIO" {
-            log::warn!("Invalid coreboot header signature at forwarded location");
+        let Some(header) = find_header(new_ptr) else {
+            log::warn!("No valid coreboot header at forwarded location");
             return;
-        }
+        };
 
         let table_bytes = (*header).table_bytes;
         log::debug!(
@@ -976,7 +1066,7 @@ unsafe fn parse_forward(record_bytes: &[u8], info: &mut CorebootInfo) {
             table_bytes
         );
 
-        iterate_table_records(header, info);
+        iterate_table_records(header, info, depth + 1);
     }
 }
 
@@ -1468,4 +1558,149 @@ fn parse_boot_media_params(record_bytes: &[u8], info: &mut CorebootInfo) {
         cbfs_size,
         boot_media_size,
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::vec;
+    use zerocopy::IntoBytes;
+
+    fn stamp_header(bytes: &mut [u8]) {
+        let body = &bytes[size_of::<CbHeader>()..];
+        let mut header = CbHeader {
+            signature: *b"LBIO",
+            header_bytes: size_of::<CbHeader>() as u32,
+            header_checksum: 0,
+            table_bytes: body.len() as u32,
+            table_checksum: u32::from(ip_checksum(body)),
+            table_entries: 1,
+        };
+        header.header_checksum = u32::from(ip_checksum(header.as_bytes()));
+        bytes[..size_of::<CbHeader>()].copy_from_slice(header.as_bytes());
+    }
+
+    fn table(body: &[u8]) -> std::vec::Vec<u8> {
+        let mut bytes = vec![0; size_of::<CbHeader>() + body.len()];
+        bytes[size_of::<CbHeader>()..].copy_from_slice(body);
+        stamp_header(&mut bytes);
+        bytes
+    }
+
+    #[test]
+    fn missing_tables_respect_the_fallback_feature() {
+        let mut info = CorebootInfo::new();
+        fallback_or_empty(&mut info, "test: no usable tables");
+        #[cfg(feature = "fallback-memory-map")]
+        assert_eq!(info.memory_map.len(), 2);
+        #[cfg(not(feature = "fallback-memory-map"))]
+        assert!(info.memory_map.is_empty());
+    }
+
+    #[test]
+    fn checksum_matches_rfc1071_vector_and_odd_trailer() {
+        // RFC 1071's example checksums to 0x220d in network byte order.
+        assert_eq!(
+            ip_checksum(&[0, 1, 0xf2, 3, 0xf4, 0xf5, 0xf6, 0xf7]),
+            0x0d22
+        );
+        assert_eq!(ip_checksum(&[1, 2, 3]), 0xfdfb);
+        assert_eq!(ip_checksum(&[]), 0xffff);
+    }
+
+    #[test]
+    fn header_and_body_checksums_are_required() {
+        let bytes = table(&[1, 2, 3]);
+        assert!(unsafe { validate_header(bytes.as_ptr().cast(), bytes.len()) });
+        let mut bad_header = bytes.clone();
+        bad_header[8] ^= 1;
+        assert!(!unsafe { validate_header(bad_header.as_ptr().cast(), bad_header.len()) });
+        let mut bad_body = bytes;
+        *bad_body.last_mut().unwrap() ^= 1;
+        assert!(!unsafe { validate_header(bad_body.as_ptr().cast(), bad_body.len()) });
+    }
+
+    #[test]
+    fn scanner_rejects_a_body_outside_its_readable_extent() {
+        let bytes = table(&[0; 64]);
+        // The header is valid, but only its bytes are available to this scan.
+        assert!(!unsafe { validate_header(bytes.as_ptr().cast(), size_of::<CbHeader>()) });
+        assert!(unsafe { scan_for_header_at(bytes.as_ptr(), size_of::<CbHeader>()) }.is_none());
+        // Do not even read a header when the supplied extent is too short.
+        assert!(!unsafe { validate_header(core::ptr::dangling(), 0) });
+    }
+
+    #[test]
+    fn scanner_continues_after_an_invalid_candidate() {
+        let good = table(&[0; 8]);
+        let mut bytes = vec![0; 64 + good.len()];
+        bytes[..good.len()].copy_from_slice(&good);
+        bytes[size_of::<CbHeader>()] ^= 1;
+        bytes[64..].copy_from_slice(&good);
+        let found = unsafe { scan_for_header_at(bytes.as_ptr(), bytes.len()) }.unwrap();
+        assert_eq!(found as usize - bytes.as_ptr() as usize, 64);
+    }
+
+    #[test]
+    fn header_sizes_are_bounded_before_body_reads() {
+        let mut bytes = table(&[0; 8]);
+        let mut header = CbHeader::read_from_prefix(&bytes).unwrap().0;
+        header.table_bytes = MAX_TABLE_BYTES + 1;
+        header.header_checksum = 0;
+        header.header_checksum = u32::from(ip_checksum(header.as_bytes()));
+        bytes[..size_of::<CbHeader>()].copy_from_slice(header.as_bytes());
+        assert!(!unsafe { validate_header(bytes.as_ptr().cast(), bytes.len()) });
+        assert!(unsafe { find_header(bytes.as_ptr()) }.is_none());
+    }
+
+    #[test]
+    fn forwarding_accepts_a_table_larger_than_the_legacy_search_window() {
+        let mut body = vec![0; 8192];
+        body[..size_of::<CbRecord>()].copy_from_slice(
+            CbRecord {
+                tag: tags::CB_TAG_UNUSED,
+                size: 8192,
+            }
+            .as_bytes(),
+        );
+        body.extend_from_slice(
+            CbSerial {
+                tag: tags::CB_TAG_SERIAL,
+                size: size_of::<CbSerial>() as u32,
+                serial_type: 1,
+                baseaddr: 0x3f8,
+                baud: 115200,
+                regwidth: 1,
+                input_hertz: 1843200,
+            }
+            .as_bytes(),
+        );
+        let target = table(&body);
+        let outer = table(
+            CbForward {
+                tag: tags::CB_TAG_FORWARD,
+                size: size_of::<CbForward>() as u32,
+                forward: target.as_ptr() as u64,
+            }
+            .as_bytes(),
+        );
+        let mut info = CorebootInfo::new();
+        unsafe { iterate_table_records(outer.as_ptr().cast(), &mut info, 0) };
+        assert_eq!(info.serial.unwrap().baseaddr, 0x3f8);
+    }
+
+    #[test]
+    fn forwarding_cycles_stop_at_the_depth_bound() {
+        let mut bytes = table(&[0; size_of::<CbForward>()]);
+        let forward = CbForward {
+            tag: tags::CB_TAG_FORWARD,
+            size: size_of::<CbForward>() as u32,
+            forward: bytes.as_ptr() as u64,
+        };
+        bytes[size_of::<CbHeader>()..].copy_from_slice(forward.as_bytes());
+        stamp_header(&mut bytes);
+        let mut info = CorebootInfo::new();
+        unsafe { iterate_table_records(bytes.as_ptr().cast(), &mut info, 0) };
+        assert!(info.memory_map.is_empty());
+    }
 }
