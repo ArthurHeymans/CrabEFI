@@ -823,10 +823,10 @@ fn walkdir(root: &Path) -> Result<Vec<Result<std::fs::DirEntry, std::io::Error>>
         });
 
         for child in children {
-            if let Ok(ref entry) = child {
-                if entry.path().is_dir() {
-                    stack.push(entry.path());
-                }
+            if let Ok(ref entry) = child
+                && entry.path().is_dir()
+            {
+                stack.push(entry.path());
             }
             entries.push(child);
         }

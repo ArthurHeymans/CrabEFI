@@ -4,8 +4,8 @@
 //! pass-through protocols (NVMe, ATA, SCSI) implemented in CrabEFI.
 //!
 //! Tests performed:
-//! 1. Enumerate Storage Security Command protocols
-//! 2. Send TCG Discovery0 to detect Opal-capable drives
+//! 1. Validate Storage Security Command protocol argument handling
+//! 2. With `hardware-security-probes`, query supported security protocols and TCG Discovery0
 //! 3. Test NVMe Pass Through Protocol
 //! 4. Test ATA Pass Through Protocol
 //! 5. Test SCSI Pass Through Protocol
@@ -13,12 +13,13 @@
 #![no_std]
 #![no_main]
 
+mod ata_passthru;
 mod console;
 mod efi_helpers;
-mod storage_security;
 mod nvme_passthru;
-mod ata_passthru;
 mod scsi_passthru;
+mod storage_security;
+#[cfg(feature = "hardware-security-probes")]
 mod tcg_discovery;
 
 use core::panic::PanicInfo;
@@ -34,9 +35,7 @@ static mut SYSTEM_TABLE: *mut SystemTable = core::ptr::null_mut();
 
 /// Get the global console
 pub fn console() -> &'static mut Console {
-    unsafe {
-        CONSOLE.as_mut().expect("Console not initialized")
-    }
+    unsafe { CONSOLE.as_mut().expect("Console not initialized") }
 }
 
 /// Get the system table
@@ -69,89 +68,68 @@ pub extern "efiapi" fn efi_main(_image_handle: Handle, system_table: *mut System
     console().print_line("==============================================");
     console().print_line("");
 
-    // Run tests
-    let mut total_tests = 0;
-    let mut passed_tests = 0;
-
-    // Test 1: Storage Security Protocol enumeration
-    console().print_line("[1] Testing Storage Security Command Protocol...");
-    let result = storage_security::test_storage_security_protocol();
-    total_tests += 1;
-    if result {
-        passed_tests += 1;
-        console().print_line("    [PASS] Storage Security Protocol");
-    } else {
-        console().print_line("    [SKIP] No Storage Security devices found");
+    // Ok(false) means absent hardware/capability; errors are never skips.
+    type Probe = fn() -> Result<bool, Status>;
+    if !cfg!(feature = "hardware-security-probes") {
+        console().print_line("Active security/TCG transfers disabled; enable hardware-security-probes on capable hardware.");
     }
-    console().print_line("");
-
-    // Test 2: TCG Discovery0
-    console().print_line("[2] Testing TCG Opal Discovery...");
-    let result = tcg_discovery::test_tcg_discovery();
-    total_tests += 1;
-    if result {
-        passed_tests += 1;
-        console().print_line("    [PASS] TCG Discovery");
-    } else {
-        console().print_line("    [SKIP] No TCG-capable drives found");
+    let probes: &[(&str, Probe)] = &[
+        (
+            "Storage Security Protocol",
+            storage_security::test_storage_security_protocol,
+        ),
+        #[cfg(feature = "hardware-security-probes")]
+        ("TCG Discovery", tcg_discovery::test_tcg_discovery),
+        (
+            "NVMe Pass Through Protocol",
+            nvme_passthru::test_nvme_pass_thru,
+        ),
+        (
+            "ATA Pass Through Protocol",
+            ata_passthru::test_ata_pass_thru,
+        ),
+        (
+            "SCSI Pass Through Protocol",
+            scsi_passthru::test_scsi_pass_thru,
+        ),
+    ];
+    let mut passed = 0;
+    let mut skipped = 0;
+    let mut failed = 0;
+    for (name, probe) in probes {
+        console().print_line(name);
+        match probe() {
+            Ok(true) => {
+                passed += 1;
+                console().print_line("    [PASS]");
+            }
+            Ok(false) => {
+                skipped += 1;
+                console().print_line("    [SKIP] Hardware or optional capability unavailable");
+            }
+            Err(status) => {
+                failed += 1;
+                console().print("    [FAIL] Protocol operation failed: ");
+                console().print_hex(status.as_usize() as u64);
+                console().print_line("");
+            }
+        }
     }
-    console().print_line("");
 
-    // Test 3: NVMe Pass Through Protocol
-    console().print_line("[3] Testing NVMe Pass Through Protocol...");
-    let result = nvme_passthru::test_nvme_pass_thru();
-    total_tests += 1;
-    if result {
-        passed_tests += 1;
-        console().print_line("    [PASS] NVMe Pass Through Protocol");
-    } else {
-        console().print_line("    [SKIP] No NVMe devices found");
-    }
-    console().print_line("");
-
-    // Test 4: ATA Pass Through Protocol
-    console().print_line("[4] Testing ATA Pass Through Protocol...");
-    let result = ata_passthru::test_ata_pass_thru();
-    total_tests += 1;
-    if result {
-        passed_tests += 1;
-        console().print_line("    [PASS] ATA Pass Through Protocol");
-    } else {
-        console().print_line("    [SKIP] No ATA/SATA devices found");
-    }
-    console().print_line("");
-
-    // Test 5: SCSI Pass Through Protocol
-    console().print_line("[5] Testing SCSI Pass Through Protocol...");
-    let result = scsi_passthru::test_scsi_pass_thru();
-    total_tests += 1;
-    if result {
-        passed_tests += 1;
-        console().print_line("    [PASS] SCSI Pass Through Protocol");
-    } else {
-        console().print_line("    [SKIP] No USB SCSI devices found");
-    }
-    console().print_line("");
-
-    // Print summary
-    console().print_line("==============================================");
-    console().print("  Tests: ");
-    console().print_dec(passed_tests);
+    console().print("Tests: ");
+    console().print_dec(passed);
     console().print(" passed / ");
-    console().print_dec(total_tests);
-    console().print_line(" total");
-    console().print_line("==============================================");
-
-    if passed_tests > 0 {
-        console().print_line("");
-        console().print_line("Some tests passed! Storage protocols are working.");
+    console().print_dec(skipped);
+    console().print(" skipped / ");
+    console().print_dec(failed);
+    console().print_line(" failed");
+    console().print_line("STORAGE SECURITY TEST COMPLETED");
+    if failed == 0 {
+        console().print_line("STORAGE SECURITY TEST PASSED");
+        Status::SUCCESS
     } else {
-        console().print_line("");
-        console().print_line("No storage devices detected.");
-        console().print_line("This is expected in QEMU without attached drives.");
+        Status::DEVICE_ERROR
     }
-
-    Status::SUCCESS
 }
 
 #[panic_handler]

@@ -779,6 +779,12 @@ fn capture_when_ready(
     Ok(())
 }
 
+fn storage_security_test_passed(output: &str) -> bool {
+    output.contains("STORAGE SECURITY TEST COMPLETED")
+        && output.contains("STORAGE SECURITY TEST PASSED")
+        && !output.contains("[FAIL]")
+}
+
 /// Run integration tests in QEMU
 pub fn run_tests(config: &QemuConfig, disk_path: &Path, app_name: &str) -> Result<()> {
     RUNTIME_IMAGE_TWO_BOOT.store(app_name == "runtime-image-test", Ordering::Relaxed);
@@ -842,10 +848,13 @@ pub fn run_tests(config: &QemuConfig, disk_path: &Path, app_name: &str) -> Resul
                 failed += 1;
             }
 
-            // Check for any passed tests
-            if result.output.contains("[PASS]") {
-                println!("[PASS] some_tests_passed: At least one test passed");
+            // All probes may skip, but an operation error must fail the run.
+            if storage_security_test_passed(&result.output) {
+                println!("[PASS] completed: Storage security test completed without failures");
                 passed += 1;
+            } else {
+                println!("[FAIL] completed: Storage security test failed or did not finish");
+                failed += 1;
             }
         }
         "secure-boot-test" => {
@@ -919,8 +928,8 @@ pub fn run_tests(config: &QemuConfig, disk_path: &Path, app_name: &str) -> Resul
             if result.output.contains("All Secure Boot tests passed!") {
                 println!("[PASS] all_tests_passed: All Secure Boot tests passed");
                 passed += 1;
-            } else if result.output.contains("Some Secure Boot tests failed!") {
-                println!("[FAIL] all_tests_passed: Some Secure Boot tests failed");
+            } else {
+                println!("[FAIL] all_tests_passed: Secure Boot tests failed or did not finish");
                 failed += 1;
             }
         }
@@ -1215,13 +1224,12 @@ pub fn run_tests(config: &QemuConfig, disk_path: &Path, app_name: &str) -> Resul
                 if result.output.contains(&pattern) {
                     println!("[PASS] {}", tag);
                     passed += 1;
+                } else if result.output.contains(&format!("[FAIL] {}", tag)) {
+                    println!("[FAIL] {}", tag);
+                    failed += 1;
                 } else {
-                    let fail_pattern = format!("[FAIL] {}", tag);
-                    if result.output.contains(&fail_pattern) {
-                        println!("[FAIL] {}", tag);
-                        failed += 1;
-                    }
-                    // If neither PASS nor FAIL, the test may not have run (skip)
+                    println!("[FAIL] {}: no result reported", tag);
+                    failed += 1;
                 }
             }
 
@@ -1229,8 +1237,8 @@ pub fn run_tests(config: &QemuConfig, disk_path: &Path, app_name: &str) -> Resul
             if result.output.contains("All device path tests passed!") {
                 println!("[PASS] all_passed: All device path tests passed");
                 passed += 1;
-            } else if result.output.contains("Some device path tests FAILED!") {
-                println!("[FAIL] all_passed: Some device path tests failed");
+            } else {
+                println!("[FAIL] all_passed: device path tests failed or did not finish");
                 failed += 1;
             }
         }
@@ -1609,7 +1617,9 @@ fn extract_sct_log(disk_path: &Path, src: &str) -> Result<Option<String>> {
         };
         String::from_utf16_lossy(
             &bytes[start..]
-                .chunks_exact(2)
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
                 .collect::<Vec<_>>(),
         )
@@ -1965,6 +1975,26 @@ fn parse_qemu_output(output: &std::process::Output) -> Result<TestResult> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn storage_security_results_require_completion_and_no_failures() {
+        for outcome in ["[PASS] Protocol", "[SKIP] No hardware"] {
+            let output =
+                format!("{outcome}\nSTORAGE SECURITY TEST COMPLETED\nSTORAGE SECURITY TEST PASSED");
+            assert!(storage_security_test_passed(&output));
+            assert!(!storage_security_test_passed(&format!(
+                "[FAIL] Operation\n{output}"
+            )));
+        }
+        for output in [
+            "Storage Security Protocol Test\nTests: 0 passed / 5 total",
+            "[PASS] Protocol\nSTORAGE SECURITY TEST PASSED",
+            "[FAIL] Operation\nSTORAGE SECURITY TEST COMPLETED",
+            "STORAGE SECURITY TEST COMPLETED",
+        ] {
+            assert!(!storage_security_test_passed(output));
+        }
+    }
 
     #[test]
     fn windows_markers_reject_empty_and_failure_collisions() {

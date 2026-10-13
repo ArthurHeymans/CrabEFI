@@ -116,14 +116,14 @@ pub struct AtaPassThruProtocol {
 }
 
 /// Test ATA Pass Through Protocol
-pub fn test_ata_pass_thru() -> bool {
+pub fn test_ata_pass_thru() -> Result<bool, Status> {
     // Find all handles with ATA Pass Through Protocol
     let mut handles: [Handle; 16] = [core::ptr::null_mut(); 16];
-    let count = efi_helpers::locate_handle_buffer(&ATA_PASS_THRU_GUID, &mut handles);
+    let count = efi_helpers::locate_handle_buffer(&ATA_PASS_THRU_GUID, &mut handles)?;
 
     if count == 0 {
         console().print_line("    No ATA/SATA controllers found");
-        return false;
+        return Ok(false);
     }
 
     console().print("    Found ");
@@ -135,7 +135,7 @@ pub fn test_ata_pass_thru() -> bool {
     for i in 0..count {
         let handle = handles[i];
         if handle.is_null() {
-            continue;
+            return Err(Status::COMPROMISED_DATA);
         }
 
         console().print("    Controller ");
@@ -148,7 +148,7 @@ pub fn test_ata_pass_thru() -> bool {
 
         if protocol.is_null() {
             console().print_line("Failed to open protocol");
-            continue;
+            return Err(Status::DEVICE_ERROR);
         }
 
         // Enumerate ports
@@ -159,6 +159,10 @@ pub fn test_ata_pass_thru() -> bool {
             let status = unsafe { ((*protocol).get_next_port)(protocol, &mut port) };
 
             if status != Status::SUCCESS {
+                if status != Status::NOT_FOUND {
+                    efi_helpers::close_protocol(handle, &ATA_PASS_THRU_GUID);
+                    return Err(status);
+                }
                 break;
             }
 
@@ -180,5 +184,5 @@ pub fn test_ata_pass_thru() -> bool {
         efi_helpers::close_protocol(handle, &ATA_PASS_THRU_GUID);
     }
 
-    success
+    Ok(success)
 }

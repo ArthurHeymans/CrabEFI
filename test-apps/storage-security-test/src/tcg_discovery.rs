@@ -19,14 +19,14 @@ const FEATURE_PYRITE_V100: u16 = 0x0302;
 const FEATURE_PYRITE_V200: u16 = 0x0303;
 
 /// Test TCG Discovery0 on all Storage Security devices
-pub fn test_tcg_discovery() -> bool {
+pub fn test_tcg_discovery() -> Result<bool, Status> {
     // Find all handles with Storage Security Command Protocol
     let mut handles: [Handle; 16] = [core::ptr::null_mut(); 16];
-    let count = efi_helpers::locate_handle_buffer(&STORAGE_SECURITY_COMMAND_GUID, &mut handles);
+    let count = efi_helpers::locate_handle_buffer(&STORAGE_SECURITY_COMMAND_GUID, &mut handles)?;
 
     if count == 0 {
         console().print_line("    No Storage Security devices found");
-        return false;
+        return Ok(false);
     }
 
     let mut found_opal = false;
@@ -34,7 +34,7 @@ pub fn test_tcg_discovery() -> bool {
     for i in 0..count {
         let handle = handles[i];
         if handle.is_null() {
-            continue;
+            return Err(Status::COMPROMISED_DATA);
         }
 
         // Open the protocol
@@ -42,9 +42,16 @@ pub fn test_tcg_discovery() -> bool {
             efi_helpers::open_protocol(handle, &STORAGE_SECURITY_COMMAND_GUID);
 
         if protocol.is_null() {
-            continue;
+            return Err(Status::DEVICE_ERROR);
         }
 
+        let media_id = match efi_helpers::media_id(handle) {
+            Ok(id) => id,
+            Err(error) => {
+                efi_helpers::close_protocol(handle, &STORAGE_SECURITY_COMMAND_GUID);
+                return Err(error);
+            }
+        };
         // Send Discovery0 command
         let mut buffer: [u8; 2048] = [0; 2048];
         let mut transfer_size: usize = 0;
@@ -52,7 +59,7 @@ pub fn test_tcg_discovery() -> bool {
         let status = unsafe {
             ((*protocol).receive_data)(
                 protocol,
-                0,      // media_id - use 0 for test
+                media_id,
                 0,      // timeout - wait forever
                 0x01,   // Security Protocol 0x01 - TCG
                 0x0001, // ComID for Discovery (0x0001)
@@ -62,19 +69,23 @@ pub fn test_tcg_discovery() -> bool {
             )
         };
 
-        if status == Status::SUCCESS && transfer_size >= 48 {
-            console().print("    Device ");
-            console().print_dec(i as u64);
-            console().print_line(":");
-
-            // Parse Discovery0 response
-            found_opal |= parse_discovery0(&buffer[..transfer_size]);
-        }
-
         efi_helpers::close_protocol(handle, &STORAGE_SECURITY_COMMAND_GUID);
+        if status == Status::UNSUPPORTED {
+            continue; // TCG support is optional even on a security-capable drive.
+        }
+        if status != Status::SUCCESS {
+            return Err(status);
+        }
+        if !(48..=buffer.len()).contains(&transfer_size) {
+            return Err(Status::COMPROMISED_DATA);
+        }
+        console().print("    Device ");
+        console().print_dec(i as u64);
+        console().print_line(":");
+        found_opal |= parse_discovery0(&buffer[..transfer_size]);
     }
 
-    found_opal
+    Ok(found_opal)
 }
 
 /// Parse and display Discovery0 response
