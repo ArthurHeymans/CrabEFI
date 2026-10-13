@@ -516,7 +516,7 @@ fn audit_dynamic_entries(dynamic: &[u8], rela_entry_size: u64) -> Result<usize> 
     for entry in dynamic.as_chunks::<ELF64_DYN_SIZE>().0 {
         let tag = i64::from_le_bytes(entry[..8].try_into()?);
         let value = u64::from_le_bytes(entry[8..].try_into()?);
-        match tag {
+        match object::elf::DynamicTag(tag) {
             object::elf::DT_NULL => break,
             object::elf::DT_NEEDED => bail!("runtime ELF contains DT_NEEDED"),
             object::elf::DT_REL
@@ -588,7 +588,7 @@ fn audit_native_relocations(
     Ok(())
 }
 
-fn relative_relocation_type(arch: Arch) -> u32 {
+fn relative_relocation_type(arch: Arch) -> object::elf::RelocationType {
     match arch {
         Arch::X86_64 => object::elf::R_X86_64_RELATIVE,
         Arch::Aarch64 => object::elf::R_AARCH64_RELATIVE,
@@ -1211,10 +1211,10 @@ mod tests {
     #[test]
     fn dynamic_audit_accepts_relative_only_and_rejects_loader_dependencies() {
         let valid = dynamic(&[
-            (object::elf::DT_RELASZ, 24),
-            (object::elf::DT_RELAENT, 24),
-            (object::elf::DT_RELACOUNT, 1),
-            (object::elf::DT_NULL, 0),
+            (object::elf::DT_RELASZ.0, 24),
+            (object::elf::DT_RELAENT.0, 24),
+            (object::elf::DT_RELACOUNT.0, 1),
+            (object::elf::DT_NULL.0, 0),
         ]);
         assert_eq!(audit_dynamic_entries(&valid, 24).unwrap(), 1);
 
@@ -1225,9 +1225,9 @@ mod tests {
             object::elf::DT_PLTRELSZ,
         ] {
             let invalid = dynamic(&[
-                (tag, 1),
-                (object::elf::DT_RELASZ, 24),
-                (object::elf::DT_RELACOUNT, 1),
+                (tag.0, 1),
+                (object::elf::DT_RELASZ.0, 24),
+                (object::elf::DT_RELACOUNT.0, 1),
             ]);
             assert!(audit_dynamic_entries(&invalid, 24).is_err());
         }

@@ -842,10 +842,14 @@ pub fn run_tests(config: &QemuConfig, disk_path: &Path, app_name: &str) -> Resul
                 failed += 1;
             }
 
-            // Check for any passed tests
-            if result.output.contains("[PASS]") {
-                println!("[PASS] some_tests_passed: At least one test passed");
+            // Every probe may legitimately SKIP without devices, so the
+            // summary is the proof that the app ran to completion.
+            if result.output.contains(" passed / ") && result.output.contains(" total") {
+                println!("[PASS] completed: Storage security test printed its summary");
                 passed += 1;
+            } else {
+                println!("[FAIL] completed: Storage security test summary missing");
+                failed += 1;
             }
         }
         "secure-boot-test" => {
@@ -919,8 +923,8 @@ pub fn run_tests(config: &QemuConfig, disk_path: &Path, app_name: &str) -> Resul
             if result.output.contains("All Secure Boot tests passed!") {
                 println!("[PASS] all_tests_passed: All Secure Boot tests passed");
                 passed += 1;
-            } else if result.output.contains("Some Secure Boot tests failed!") {
-                println!("[FAIL] all_tests_passed: Some Secure Boot tests failed");
+            } else {
+                println!("[FAIL] all_tests_passed: Secure Boot tests failed or did not finish");
                 failed += 1;
             }
         }
@@ -1215,13 +1219,12 @@ pub fn run_tests(config: &QemuConfig, disk_path: &Path, app_name: &str) -> Resul
                 if result.output.contains(&pattern) {
                     println!("[PASS] {}", tag);
                     passed += 1;
+                } else if result.output.contains(&format!("[FAIL] {}", tag)) {
+                    println!("[FAIL] {}", tag);
+                    failed += 1;
                 } else {
-                    let fail_pattern = format!("[FAIL] {}", tag);
-                    if result.output.contains(&fail_pattern) {
-                        println!("[FAIL] {}", tag);
-                        failed += 1;
-                    }
-                    // If neither PASS nor FAIL, the test may not have run (skip)
+                    println!("[FAIL] {}: no result reported", tag);
+                    failed += 1;
                 }
             }
 
@@ -1229,8 +1232,8 @@ pub fn run_tests(config: &QemuConfig, disk_path: &Path, app_name: &str) -> Resul
             if result.output.contains("All device path tests passed!") {
                 println!("[PASS] all_passed: All device path tests passed");
                 passed += 1;
-            } else if result.output.contains("Some device path tests FAILED!") {
-                println!("[FAIL] all_passed: Some device path tests failed");
+            } else {
+                println!("[FAIL] all_passed: device path tests failed or did not finish");
                 failed += 1;
             }
         }
@@ -1609,7 +1612,9 @@ fn extract_sct_log(disk_path: &Path, src: &str) -> Result<Option<String>> {
         };
         String::from_utf16_lossy(
             &bytes[start..]
-                .chunks_exact(2)
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
                 .collect::<Vec<_>>(),
         )

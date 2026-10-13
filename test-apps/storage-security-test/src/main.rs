@@ -13,12 +13,12 @@
 #![no_std]
 #![no_main]
 
+mod ata_passthru;
 mod console;
 mod efi_helpers;
-mod storage_security;
 mod nvme_passthru;
-mod ata_passthru;
 mod scsi_passthru;
+mod storage_security;
 mod tcg_discovery;
 
 use core::panic::PanicInfo;
@@ -34,9 +34,7 @@ static mut SYSTEM_TABLE: *mut SystemTable = core::ptr::null_mut();
 
 /// Get the global console
 pub fn console() -> &'static mut Console {
-    unsafe {
-        CONSOLE.as_mut().expect("Console not initialized")
-    }
+    unsafe { CONSOLE.as_mut().expect("Console not initialized") }
 }
 
 /// Get the system table
