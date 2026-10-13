@@ -632,7 +632,9 @@ where
     } as u32;
 
     let mut offset = VARIABLE_DATA_OFFSET;
-    let end = VARIABLE_DATA_OFFSET + data_size;
+    let Some(end) = VARIABLE_DATA_OFFSET.checked_add(data_size) else {
+        return vars;
+    };
 
     while offset + hdr_size <= end {
         // Read the variable header
@@ -707,9 +709,17 @@ where
         let mut guid = [0u8; 16];
         guid.copy_from_slice(&hdr_buf[guid_offset as usize..guid_offset as usize + 16]);
 
-        // Read name (UTF-16LE)
-        let name_offset = offset + hdr_size;
-        if name_offset + name_size > end {
+        // Read name (UTF-16LE). Every size comes from the untrusted flash
+        // image, so each addition is checked: a wrapping comparison would
+        // pass the bounds check and go on to allocate and read out of the
+        // variable region.
+        let Some(name_offset) = offset.checked_add(hdr_size) else {
+            break;
+        };
+        let Some(name_end) = name_offset.checked_add(name_size) else {
+            break;
+        };
+        if name_end > end {
             break;
         }
         let mut name_bytes = vec![0u8; name_size as usize];
@@ -725,8 +735,11 @@ where
             .collect();
 
         // Read data
-        let data_offset = name_offset + name_size;
-        if data_offset + data_size_field > end {
+        let data_offset = name_end;
+        let Some(data_end) = data_offset.checked_add(data_size_field) else {
+            break;
+        };
+        if data_end > end {
             break;
         }
         let mut data = vec![0u8; data_size_field as usize];
@@ -748,8 +761,19 @@ where
         });
 
         // Advance to next record (aligned)
-        let total_size = hdr_size + name_size + data_size_field;
-        offset += align_up(total_size, HEADER_ALIGNMENT);
+        let Some(total_size) = hdr_size
+            .checked_add(name_size)
+            .and_then(|size| size.checked_add(data_size_field))
+        else {
+            break;
+        };
+        let Some(aligned) = checked_align_up(total_size, HEADER_ALIGNMENT) else {
+            break;
+        };
+        let Some(next) = offset.checked_add(aligned) else {
+            break;
+        };
+        offset = next;
     }
 
     vars
@@ -767,7 +791,9 @@ where
     } as u32;
 
     let mut offset = VARIABLE_DATA_OFFSET;
-    let end = VARIABLE_DATA_OFFSET + data_size;
+    let Some(end) = VARIABLE_DATA_OFFSET.checked_add(data_size) else {
+        return offset;
+    };
 
     while offset + hdr_size <= end {
         let mut start_id_buf = [0u8; 2];
@@ -810,8 +836,19 @@ where
             continue;
         }
 
-        let total_size = hdr_size + name_size + data_size_field;
-        offset += align_up(total_size, HEADER_ALIGNMENT);
+        let Some(total_size) = hdr_size
+            .checked_add(name_size)
+            .and_then(|size| size.checked_add(data_size_field))
+        else {
+            break;
+        };
+        let Some(aligned) = checked_align_up(total_size, HEADER_ALIGNMENT) else {
+            break;
+        };
+        let Some(next) = offset.checked_add(aligned) else {
+            break;
+        };
+        offset = next;
     }
 
     offset
@@ -1006,6 +1043,43 @@ mod tests {
             daylight: 3,
             pad2: 0,
         }
+    }
+
+    /// A data area holding one non-auth header with attacker-chosen
+    /// name/data sizes at the variable-data offset.
+    fn region_with_sizes(name_size: u32, data_size: u32) -> alloc::vec::Vec<u8> {
+        let mut region = alloc::vec![0u8; VARIABLE_DATA_OFFSET as usize + 0x100];
+        let base = VARIABLE_DATA_OFFSET as usize;
+        region[base..base + 2].copy_from_slice(&VARIABLE_DATA.to_le_bytes());
+        region[base + 2] = 0x3F; // state: valid
+        region[base + 4..base + 8].copy_from_slice(&7u32.to_le_bytes());
+        region[base + 8..base + 12].copy_from_slice(&name_size.to_le_bytes());
+        region[base + 12..base + 16].copy_from_slice(&data_size.to_le_bytes());
+        region
+    }
+
+    #[test]
+    fn walk_rejects_wrapping_record_sizes() {
+        // name_size near u32::MAX used to wrap the bounds comparison and
+        // reach an infallible multi-GiB allocation.
+        let region = region_with_sizes(0xFFFF_FFF0, 0x40);
+        let mut read = |offset: u32, buf: &mut [u8]| {
+            let start = offset as usize;
+            let Some(end) = start.checked_add(buf.len()) else {
+                return false;
+            };
+            if end > region.len() {
+                return false;
+            }
+            buf.copy_from_slice(&region[start..end]);
+            true
+        };
+        assert!(walk_variables(&mut read, false, 0x100).is_empty());
+        // The same wrap in find_write_offset must not move the offset.
+        assert_eq!(
+            find_write_offset(&mut read, false, 0x100),
+            VARIABLE_DATA_OFFSET
+        );
     }
 
     #[test]

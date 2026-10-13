@@ -118,7 +118,17 @@ impl BzImage {
         }
 
         let setup_size = header.setup_size();
-        let kernel_size = total_size.saturating_sub(setup_size);
+        // setup_sects is file-controlled: a claimed setup that covers (or
+        // exceeds) the whole file would otherwise saturate to a zero-byte
+        // kernel and jump into uninitialized memory.
+        let Some(kernel_size) = total_size.checked_sub(setup_size).filter(|size| *size > 0) else {
+            log::error!(
+                "bzImage setup ({}B) leaves no kernel in {}B file",
+                setup_size,
+                total_size
+            );
+            return Err(BzImageError::FileTooSmall);
+        };
 
         // Copy packed fields to local variables
         let version = header.version;
@@ -269,4 +279,46 @@ pub fn prepare_boot_params(
     params.set_cmdline(cmdline_addr);
 
     Ok(params)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloc::vec::Vec;
+
+    fn header_bytes(setup_sects: u8) -> Vec<u8> {
+        let mut data = Vec::new();
+        data.resize(1024, 0);
+        let base = HEADER_OFFSET;
+        let field = |offset: usize| base + offset;
+        data[field(core::mem::offset_of!(SetupHeader, setup_sects))] = setup_sects;
+        data[field(core::mem::offset_of!(SetupHeader, boot_flag))
+            ..field(core::mem::offset_of!(SetupHeader, boot_flag)) + 2]
+            .copy_from_slice(&SetupHeader::BOOT_FLAG_MAGIC.to_le_bytes());
+        data[field(core::mem::offset_of!(SetupHeader, header))
+            ..field(core::mem::offset_of!(SetupHeader, header)) + 4]
+            .copy_from_slice(&SetupHeader::HEADER_MAGIC);
+        data[field(core::mem::offset_of!(SetupHeader, version))
+            ..field(core::mem::offset_of!(SetupHeader, version)) + 2]
+            .copy_from_slice(&SetupHeader::MIN_VERSION.to_le_bytes());
+        data[field(core::mem::offset_of!(SetupHeader, relocatable_kernel))] = 1;
+        data
+    }
+
+    #[test]
+    fn setup_covering_whole_file_is_rejected() {
+        // 255 setup sectors claim 128 KiB of setup in a 4 KiB file: the
+        // protected-mode kernel would be empty (and previously loaded as
+        // a zero-byte image jumped into stale RAM).
+        let data = header_bytes(255);
+        assert!(matches!(
+            BzImage::parse_header(&data, 4096),
+            Err(BzImageError::FileTooSmall)
+        ));
+
+        let data = header_bytes(1);
+        let image = BzImage::parse_header(&data, 4096).unwrap();
+        assert_eq!(image.setup_size, 1024);
+        assert_eq!(image.kernel_size, 3072);
+    }
 }
