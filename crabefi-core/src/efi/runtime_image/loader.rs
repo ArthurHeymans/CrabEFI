@@ -99,7 +99,7 @@ pub fn load(
             unsafe { (patch as *mut u64).write_unaligned(value) };
             Ok(())
         })?;
-    synchronize_loaded_image(base, u64::from(header.image_size));
+    crate::arch::sync_instruction_cache(base, header.image_size as usize);
 
     let exports = image.exports().map_err(LoadError::InvalidFormat)?;
     // SAFETY: the exports come from the validated image just loaded and
@@ -242,51 +242,9 @@ const fn current_architecture() -> u16 {
 }
 
 #[cfg(any(target_arch = "aarch64", test))]
-const fn aarch64_cache_line_sizes(ctr_el0: u64) -> (u64, u64) {
-    let instruction = 4u64 << (ctr_el0 & 0x0f);
-    let data = 4u64 << ((ctr_el0 >> 16) & 0x0f);
-    (data, instruction)
-}
-
-fn synchronize_loaded_image(base: u64, size: u64) {
-    #[cfg(target_arch = "x86_64")]
-    unsafe {
-        let _ = (base, size);
-        // SAFETY: serializes completed relocation stores before first execution.
-        core::arch::asm!("mfence", "lfence", options(nostack, preserves_flags));
-    }
-    #[cfg(target_arch = "aarch64")]
-    unsafe {
-        let ctr_el0: u64;
-        core::arch::asm!("mrs {}, ctr_el0", out(reg) ctr_el0, options(nomem, nostack));
-        let (data_stride, instruction_stride) = aarch64_cache_line_sizes(ctr_el0);
-        let end = base.saturating_add(size);
-        let mut address = base & !(data_stride - 1);
-        while address < end {
-            // SAFETY: cache maintenance may round down to the containing line;
-            // it does not dereference memory outside the new image allocation.
-            core::arch::asm!("dc cvau, {}", in(reg) address, options(nostack));
-            address = address.saturating_add(data_stride);
-        }
-        core::arch::asm!("dsb ish", options(nostack));
-        address = base & !(instruction_stride - 1);
-        while address < end {
-            core::arch::asm!("ic ivau, {}", in(reg) address, options(nostack));
-            address = address.saturating_add(instruction_stride);
-        }
-        core::arch::asm!("dsb ish", "isb", options(nostack));
-    }
-    #[cfg(target_arch = "riscv64")]
-    unsafe {
-        let _ = (base, size);
-        // SAFETY: synchronizes instruction fetch with the copied image.
-        core::arch::asm!("fence.i", options(nostack));
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{aarch64_cache_line_sizes, validate_deferred_buffer};
+    use super::validate_deferred_buffer;
     use crate::platform::DeferredBufferConfig;
     use crabefi_runtime_abi::RuntimeExternalRange;
 
@@ -304,13 +262,6 @@ mod tests {
             super::validate_capabilities(expected ^ SECURE_BOOT),
             Err(super::LoadError::CapabilityMismatch)
         ));
-    }
-
-    #[test]
-    fn decodes_independent_aarch64_cache_line_sizes() {
-        assert_eq!(aarch64_cache_line_sizes(3 | (3 << 16)), (32, 32));
-        assert_eq!(aarch64_cache_line_sizes(4 | (5 << 16)), (128, 64));
-        assert_eq!(aarch64_cache_line_sizes(5 | (4 << 16)), (64, 128));
     }
 
     #[test]

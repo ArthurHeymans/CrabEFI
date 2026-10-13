@@ -46,3 +46,15 @@ pub fn clean_invalidate_cache_range(_addr: u64, _size: usize) {
     crate::barrier::publish_to_device();
     crate::barrier::consume_from_device();
 }
+
+/// Serialize completed code stores before first execution of a loaded image.
+///
+/// x86 instruction fetch snoops data writes, so the fences only need to
+/// order this core's stores ahead of the first fetch from the new code.
+#[inline]
+pub fn sync_instruction_cache(_addr: u64, _size: usize) {
+    // SAFETY: mfence/lfence take no operands and cannot fault at CPL0.
+    unsafe {
+        core::arch::asm!("mfence", "lfence", options(nostack, preserves_flags));
+    }
+}
