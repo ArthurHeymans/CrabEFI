@@ -1,5 +1,5 @@
 use crabefi_runtime_abi::{
-    AbiError, EXPORT_COUNT, EXPORTS_SIZE, HEADER_SIZE, HandoffError, RELOCATION_SIZE,
+    ABI_VERSION, AbiError, EXPORT_COUNT, EXPORTS_SIZE, HEADER_SIZE, HandoffError, RELOCATION_SIZE,
     RuntimeExternalRange, RuntimeHandoff, RuntimeImageHeader, SECTION_SIZE, ValidatedImage,
     architecture, feature_bits, reset_mechanism, time_mechanism,
 };
@@ -23,6 +23,7 @@ fn header(relocation_count: u32) -> RuntimeImageHeader {
         relocation_count,
         exports_offset: relocation_offset + relocation_count * RELOCATION_SIZE as u32,
         feature_bits: feature_bits::REQUIRED,
+        abi_version: ABI_VERSION,
     }
 }
 
@@ -165,6 +166,7 @@ fn rejects_invalid_relocation_slots_and_bounds() {
 fn valid_handoff(architecture: u16) -> RuntimeHandoff {
     let mut handoff = RuntimeHandoff::empty();
     handoff.architecture = architecture;
+    handoff.abi_version = ABI_VERSION;
     handoff.image_base = 0x10_0000;
     handoff.image_size = 0x1000;
     handoff.section_count = 1;

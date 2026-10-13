@@ -184,7 +184,10 @@ pub struct RuntimeHandoff {
     pub reserved0: u16,
     pub image_base: u64,
     pub image_size: u32,
-    pub reserved1: u32,
+    /// [`crate::format::ABI_VERSION`] the boot image stamps and the runtime
+    /// image requires; occupies the former `reserved1` slot, so a handoff
+    /// from a pre-versioning boot image reads as version 0.
+    pub abi_version: u32,
     pub boot_bridge: u64,
     pub deferred_buffer_base: u64,
     pub deferred_buffer_size: u64,
@@ -203,7 +206,7 @@ impl RuntimeHandoff {
             reserved0: 0,
             image_base: 0,
             image_size: 0,
-            reserved1: 0,
+            abi_version: 0,
             boot_bridge: 0,
             deferred_buffer_base: 0,
             deferred_buffer_size: 0,
@@ -247,6 +250,9 @@ impl RuntimeHandoff {
     }
 
     pub fn validate(&self) -> Result<(), HandoffError> {
+        if self.abi_version != crate::format::ABI_VERSION {
+            return Err(HandoffError::Version);
+        }
         let sections = self.sections()?;
         let ranges = self.ranges()?;
         if sections.is_empty() || self.image_base == 0 || self.image_size == 0 {
@@ -397,6 +403,7 @@ fn ranges_overlap(a_base: u64, a_len: u64, b_base: u64, b_len: u64) -> bool {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HandoffError {
+    Version,
     Count,
     Section,
     Range,
@@ -503,3 +510,21 @@ const _: () = assert!(core::mem::size_of::<BridgeRequest>() == 72);
 const _: () = assert!(core::mem::size_of::<ConfigurationRegistration>() == 32);
 const _: () = assert!(core::mem::size_of::<ConsoleRegistration>() == 24);
 const _: () = assert!(core::mem::size_of::<EsrtRegistration>() == 40);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validate_rejects_foreign_abi_version() {
+        // An unstamped handoff (pre-versioning boot image) reads as 0.
+        assert_eq!(
+            RuntimeHandoff::empty().validate(),
+            Err(HandoffError::Version)
+        );
+        let mut handoff = RuntimeHandoff::empty();
+        handoff.abi_version = crate::format::ABI_VERSION;
+        // Passes the version gate, then fails on the empty contents.
+        assert_eq!(handoff.validate(), Err(HandoffError::Count));
+    }
+}
