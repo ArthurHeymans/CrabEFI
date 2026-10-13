@@ -246,9 +246,14 @@ mod x86_calibration {
             let table_len = header.length as usize;
             let header_size = core::mem::size_of::<AcpiSdtHeader>();
 
-            // Calculate number of entries
+            // Calculate number of entries; the length comes from the table
+            // itself, so never let it underflow past the header.
             let entry_size = if is_xsdt { 8 } else { 4 };
-            let num_entries = (table_len - header_size) / entry_size;
+            let Some(entries_len) = table_len.checked_sub(header_size) else {
+                log::warn!("ACPI SDT length {table_len} smaller than its header");
+                return None;
+            };
+            let num_entries = entries_len / entry_size;
 
             log::debug!(
                 "ACPI: {} at {:#x}, {} entries",
@@ -464,7 +469,9 @@ pub fn init_from_platform(timer: &dyn crate::platform::Timer) {
 /// Spin-wait for approximately `us` microseconds
 #[inline]
 pub fn delay_us(us: u64) {
-    let cycles = us * TIMING.get().counter_cycles_per_us;
+    // Saturate instead of wrapping: an absurd delay request must not
+    // silently become a short one hardware setup depends on.
+    let cycles = us.saturating_mul(TIMING.get().counter_cycles_per_us);
     let start = read_counter();
     while read_counter().wrapping_sub(start) < cycles {
         core::hint::spin_loop();
@@ -474,7 +481,7 @@ pub fn delay_us(us: u64) {
 /// Spin-wait for approximately `ms` milliseconds
 #[inline]
 pub fn delay_ms(ms: u64) {
-    delay_us(ms * 1000);
+    delay_us(ms.saturating_mul(1000));
 }
 
 /// A deadline-based timeout for polling loops

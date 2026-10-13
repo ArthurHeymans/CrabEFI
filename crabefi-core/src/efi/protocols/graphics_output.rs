@@ -96,6 +96,42 @@ extern "efiapi" fn gop_set_mode(this: *mut GraphicsOutputProtocol, mode_number: 
     Status::SUCCESS
 }
 
+/// Whether the rectangle `(x, y, width, height)` lies inside a
+/// `bounds_width` x `bounds_height` surface. Checked arithmetic: caller-
+/// supplied coordinates near `usize::MAX` must not wrap past the test.
+fn rect_within(
+    x: usize,
+    y: usize,
+    width: usize,
+    height: usize,
+    bounds_width: usize,
+    bounds_height: usize,
+) -> bool {
+    x.checked_add(width).is_some_and(|end| end <= bounds_width)
+        && y.checked_add(height)
+            .is_some_and(|end| end <= bounds_height)
+}
+
+/// Whether every Blt buffer index for the rectangle can be computed
+/// without overflowing. The buffer itself is the caller's contract, but
+/// the index arithmetic must not wrap onto unrelated memory.
+fn buffer_indices_representable(
+    x: usize,
+    y: usize,
+    width: usize,
+    height: usize,
+    line_length: usize,
+) -> bool {
+    if width == 0 || height == 0 {
+        return true;
+    }
+    y.checked_add(height - 1)
+        .and_then(|last_row| last_row.checked_mul(line_length))
+        .zip(x.checked_add(width - 1))
+        .and_then(|(row_start, last_col)| row_start.checked_add(last_col))
+        .is_some()
+}
+
 /// Block transfer (Blt) operation
 extern "efiapi" fn gop_blt(
     this: *mut GraphicsOutputProtocol,
@@ -147,7 +183,14 @@ extern "efiapi" fn gop_blt(
                 return Status::INVALID_PARAMETER;
             }
 
-            if destination_x + width > fb_width || destination_y + height > fb_height {
+            if !rect_within(
+                destination_x,
+                destination_y,
+                width,
+                height,
+                fb_width,
+                fb_height,
+            ) {
                 return Status::INVALID_PARAMETER;
             }
 
@@ -170,7 +213,15 @@ extern "efiapi" fn gop_blt(
                 return Status::INVALID_PARAMETER;
             }
 
-            if source_x + width > fb_width || source_y + height > fb_height {
+            if !rect_within(source_x, source_y, width, height, fb_width, fb_height)
+                || !buffer_indices_representable(
+                    destination_x,
+                    destination_y,
+                    width,
+                    height,
+                    buffer_line_length,
+                )
+            {
                 return Status::INVALID_PARAMETER;
             }
 
@@ -194,7 +245,20 @@ extern "efiapi" fn gop_blt(
                 return Status::INVALID_PARAMETER;
             }
 
-            if destination_x + width > fb_width || destination_y + height > fb_height {
+            if !rect_within(
+                destination_x,
+                destination_y,
+                width,
+                height,
+                fb_width,
+                fb_height,
+            ) || !buffer_indices_representable(
+                source_x,
+                source_y,
+                width,
+                height,
+                buffer_line_length,
+            ) {
                 return Status::INVALID_PARAMETER;
             }
 
@@ -214,10 +278,17 @@ extern "efiapi" fn gop_blt(
 
         graphics_output::BLT_VIDEO_TO_VIDEO => {
             // Copy within video memory
-            if source_x + width > fb_width || source_y + height > fb_height {
+            if !rect_within(source_x, source_y, width, height, fb_width, fb_height) {
                 return Status::INVALID_PARAMETER;
             }
-            if destination_x + width > fb_width || destination_y + height > fb_height {
+            if !rect_within(
+                destination_x,
+                destination_y,
+                width,
+                height,
+                fb_width,
+                fb_height,
+            ) {
                 return Status::INVALID_PARAMETER;
             }
 
@@ -481,4 +552,34 @@ pub fn create_gop(framebuffer: &FramebufferConfig) -> *mut GraphicsOutputProtoco
     );
 
     protocol_ptr
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{buffer_indices_representable, rect_within};
+
+    #[test]
+    fn rect_within_checks_bounds_without_wrapping() {
+        assert!(rect_within(0, 0, 800, 600, 800, 600));
+        assert!(rect_within(800, 600, 0, 0, 800, 600));
+        assert!(!rect_within(799, 0, 2, 10, 800, 600));
+        assert!(!rect_within(0, 599, 10, 2, 800, 600));
+        // Would wrap to a small end coordinate with unchecked addition.
+        assert!(!rect_within(usize::MAX - 3, 0, 8, 10, 800, 600));
+        assert!(!rect_within(0, usize::MAX - 3, 10, 8, 800, 600));
+    }
+
+    #[test]
+    fn buffer_indices_reject_overflow() {
+        assert!(buffer_indices_representable(10, 20, 100, 50, 800));
+        assert!(buffer_indices_representable(0, 0, 0, 0, 0));
+        assert!(!buffer_indices_representable(
+            0,
+            usize::MAX / 2,
+            10,
+            10,
+            800
+        ));
+        assert!(!buffer_indices_representable(usize::MAX - 3, 0, 8, 10, 1));
+    }
 }
