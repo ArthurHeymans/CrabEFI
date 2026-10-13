@@ -905,15 +905,13 @@ fn stage_capsule(
     if !scatter_gather_list.is_multiple_of(8) {
         return Err(efi::Status::INVALID_PARAMETER);
     }
-    // SAFETY: UpdateCapsule defines scatter_gather_list as a readable physical
-    // EFI_CAPSULE_BLOCK_DESCRIPTOR list; only its first descriptor is read.
-    let first_block =
-        unsafe { (scatter_gather_list as *const deferred::CapsuleBlockDescriptor).read() };
+    // The list is physical and is only linked, never dereferenced, here:
+    // see DeferredRegion::stage_capsule.
     lease
         .state_mut()
         .deferred_region()
         .ok_or(efi::Status::UNSUPPORTED)?
-        .stage_capsule(header.capsule_image_size, scatter_gather_list, first_block)
+        .stage_capsule(scatter_gather_list)
 }
 
 /// Capsule staging requires retained storage and boot-time confirmation that
