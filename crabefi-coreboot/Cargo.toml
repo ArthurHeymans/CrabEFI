@@ -11,6 +11,10 @@ default = ["bundled-runtime-image"]
 bundled-runtime-image = ["crabefi/bundled-runtime-image"]
 external-runtime-image = []
 ui = ["crabefi/ui"]
+# Fabricate a QEMU-shaped memory map when coreboot tables are missing or
+# invalid, instead of failing startup with no memory map. Useful only for
+# table-less QEMU experiments; never enable for real hardware.
+fallback-memory-map = []
 
 [dependencies]
 crabefi = { package = "crabefi-core", path = "../crabefi-core", features = [
