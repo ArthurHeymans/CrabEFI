@@ -17,7 +17,7 @@
 
 use super::AuthError;
 #[cfg(feature = "secure-boot")]
-use super::crypto::verify_pkcs7_signature;
+use super::crypto::verify_pkcs7_signature_chain;
 #[cfg(feature = "secure-boot")]
 use super::signature::{is_certificate_forbidden, is_hash_allowed, is_hash_forbidden};
 #[cfg(feature = "secure-boot")]
@@ -537,12 +537,23 @@ fn verify_authenticode_signature(
             continue;
         }
 
-        match verify_pkcs7_signature(sig.pkcs7_data, image_hash, cert_der, false) {
-            Ok(true) => {
+        match verify_pkcs7_signature_chain(sig.pkcs7_data, image_hash, cert_der, false) {
+            Ok(Some(chain)) => {
+                // Revocation is not limited to the trust anchor: a dbx entry
+                // naming the signer or any intermediate in the verified
+                // chain revokes the image even though it chains to db.
+                if chain
+                    .certificates
+                    .iter()
+                    .any(|cert| is_certificate_forbidden(cert))
+                {
+                    log::warn!("Secure Boot: Signing chain contains a dbx-revoked certificate");
+                    return Ok(false);
+                }
                 log::info!("Secure Boot: Signature verified successfully");
                 return Ok(true);
             }
-            Ok(false) => continue,
+            Ok(None) => continue,
             Err(e) => {
                 log::debug!("Secure Boot: Signature verification error: {:?}", e);
                 continue;

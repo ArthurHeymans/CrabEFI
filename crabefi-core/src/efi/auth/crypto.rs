@@ -116,22 +116,8 @@ pub fn sha256(data: &[u8]) -> [u8; 32] {
 // PKCS#7/CMS Signature Verification
 // ============================================================================
 
-/// Verify a PKCS#7 detached signature
-///
-/// For UEFI Secure Boot, we verify that:
-/// 1. The PKCS#7 structure is valid
-/// 2. The signature in SignerInfo is cryptographically valid
-/// 3. The messageDigest attribute matches the hash of the signed data
-/// 4. One of the signer certificates chains to the trusted certificate (from db)
-///
-/// # Arguments
-///
-/// * `pkcs7_data` - The PKCS#7 SignedData structure (DER encoded)
-/// * `signed_data` - The data that was signed (the Authenticode hash or authenticated variable data)
-/// * `trusted_cert` - A trusted X.509 certificate (DER encoded) from db
-/// * `require_detached` - Reject attached eContent when the caller supplies the authenticated payload
-///
-/// # Returns
+/// Verify a PKCS#7 detached signature; see
+/// [`verify_pkcs7_signature_chain`] for the full contract.
 ///
 /// * `Ok(true)` - Signature is valid and chains to the trusted certificate
 /// * `Ok(false)` - Signature does not chain to this certificate
@@ -142,6 +128,44 @@ pub fn verify_pkcs7_signature(
     trusted_cert: &[u8],
     require_detached: bool,
 ) -> Result<bool, AuthError> {
+    Ok(
+        verify_pkcs7_signature_chain(pkcs7_data, signed_data, trusted_cert, require_detached)?
+            .is_some(),
+    )
+}
+
+/// Verify a PKCS#7 detached signature and return the validated chain.
+///
+/// For UEFI Secure Boot, we verify that:
+/// 1. The PKCS#7 structure is valid
+/// 2. The signature in SignerInfo is cryptographically valid
+/// 3. The messageDigest attribute matches the hash of the signed data
+/// 4. One of the signer certificates chains to the trusted certificate (from db)
+///
+/// Callers that must apply policy to every certificate in the chain —
+/// notably dbx revocation, which is not limited to the trust anchor —
+/// need the chain itself; that is what distinguishes this from
+/// [`verify_pkcs7_signature`].
+///
+/// # Arguments
+///
+/// * `pkcs7_data` - The PKCS#7 SignedData structure (DER encoded)
+/// * `signed_data` - The data that was signed (the Authenticode hash or authenticated variable data)
+/// * `trusted_cert` - A trusted X.509 certificate (DER encoded) from db
+/// * `require_detached` - Reject attached eContent when the caller supplies the authenticated payload
+///
+/// # Returns
+///
+/// * `Ok(Some(chain))` - Signature is valid; `chain` runs signer-first to
+///   the trusted certificate
+/// * `Ok(None)` - Signature does not chain to this certificate
+/// * `Err(...)` - Parse or verification error
+pub fn verify_pkcs7_signature_chain(
+    pkcs7_data: &[u8],
+    signed_data: &[u8],
+    trusted_cert: &[u8],
+    require_detached: bool,
+) -> Result<Option<CertificateChain>, AuthError> {
     // WIN_CERTIFICATE is 8-byte aligned, so the parser ignores alignment
     // padding after the ContentInfo.
     let pkcs7 = SignedData::parse(pkcs7_data).map_err(|e| {
@@ -256,7 +280,7 @@ pub fn verify_pkcs7_signature(
                     "Certificate chain verified successfully (depth: {})",
                     chain.len()
                 );
-                return Ok(true);
+                return Ok(Some(chain));
             }
             Err(e) => {
                 log::debug!("Chain building failed: {:?}", e);
@@ -266,7 +290,7 @@ pub fn verify_pkcs7_signature(
     }
 
     log::debug!("No valid signature chain found to trusted db certificate");
-    Ok(false)
+    Ok(None)
 }
 
 /// Find the certificate that corresponds to a SignerInfo
@@ -911,6 +935,16 @@ mod fixture_tests {
                 cms.len()
             );
         }
+    }
+
+    #[test]
+    fn pkcs7_chain_surfaces_signer_and_anchor() {
+        // The Authenticode path applies dbx revocation to every returned
+        // certificate, so the signer (not just the anchor) must be present.
+        let chain = verify_pkcs7_signature_chain(CMS_ATTRS, DATA, CA, true)
+            .unwrap()
+            .expect("fixture signature must chain to the CA");
+        assert_eq!(chain.certificates, [LEAF.to_vec(), CA.to_vec()]);
     }
 
     #[test]
