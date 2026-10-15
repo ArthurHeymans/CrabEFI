@@ -824,6 +824,11 @@ pub fn load_image(data: &[u8]) -> Result<LoadedImage, Status> {
         }
     }
 
+    // All stores to the image are complete (headers, sections,
+    // relocations); make them visible to instruction fetch before the
+    // image can be started.
+    crate::arch::sync_instruction_cache(load_addr, image_size as usize);
+
     log::info!(
         "PE: Loaded image at {:#x}, entry point at {:#x}",
         load_addr,

@@ -45,3 +45,14 @@ pub fn fence_i() {
         core::arch::asm!("fence.i", options(nostack, preserves_flags));
     }
 }
+
+/// Synchronize instruction fetch with freshly written code on this hart.
+///
+/// `fence.i` is the architecturally required operation. As with the DMA
+/// paths above, a non-coherent data cache would additionally need Zicbom
+/// cleans, which are not discovered yet; coherent implementations (QEMU
+/// virt included) are fully covered by the fence.
+#[inline]
+pub fn sync_instruction_cache(_addr: u64, _size: usize) {
+    fence_i();
+}
