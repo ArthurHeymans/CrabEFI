@@ -107,6 +107,7 @@ pub fn load(
     let mut client = unsafe { RuntimeImageClient::new(base, exports) };
     let mut handoff = RuntimeHandoff::empty();
     handoff.architecture = current_architecture();
+    handoff.abi_version = crabefi_runtime_abi::ABI_VERSION;
     handoff.image_base = base;
     handoff.image_size = header.image_size;
     handoff.section_count = header.section_count;
