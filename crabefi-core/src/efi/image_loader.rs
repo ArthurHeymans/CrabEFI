@@ -44,8 +44,11 @@ fn extract_file_path_from_device_path(
 
     let mut current = device_path;
 
+    // The path is caller-supplied and its total length is unknown, so cap
+    // the walk like the other parsers in this module: a path with no End
+    // node must not march the read pointer through memory.
     unsafe {
-        loop {
+        for _ in 0..MAX_DEVICE_PATH_NODES {
             let node_type = (*current).r#type;
             let node_subtype = (*current).sub_type;
             let node_length =
@@ -440,4 +443,59 @@ pub(crate) fn get_device_handle_from_parent(parent_handle: Handle) -> Handle {
                 })
         })
         .unwrap_or(core::ptr::null_mut())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloc::vec::Vec;
+
+    fn node(bytes: &mut Vec<u8>, node_type: u8, subtype: u8, payload: &[u8]) {
+        let len = (4 + payload.len()) as u16;
+        bytes.extend_from_slice(&[node_type, subtype]);
+        bytes.extend_from_slice(&len.to_le_bytes());
+        bytes.extend_from_slice(payload);
+    }
+
+    #[test]
+    fn extracts_file_path_from_well_formed_device_path() {
+        let path: Vec<u16> = "\\EFI\\BOOT\\BOOTX64.EFI"
+            .encode_utf16()
+            .chain(core::iter::once(0))
+            .collect();
+        let path_bytes: Vec<u8> = path.iter().flat_map(|c| c.to_le_bytes()).collect();
+        let mut bytes = Vec::new();
+        node(&mut bytes, DEVICE_PATH_TYPE_MEDIA, 1, &[0; 4]);
+        node(
+            &mut bytes,
+            DEVICE_PATH_TYPE_MEDIA,
+            DEVICE_PATH_SUBTYPE_FILE_PATH,
+            &path_bytes,
+        );
+        node(&mut bytes, DEVICE_PATH_TYPE_END, 0xFF, &[]);
+
+        let (ptr, len) =
+            extract_file_path_from_device_path(bytes.as_mut_ptr() as *mut DevicePathProtocol)
+                .expect("file path node must be found");
+        assert_eq!(len, path.len());
+        // SAFETY: the returned pointer addresses the path inside `bytes`,
+        // which outlives this read.
+        let found = unsafe { core::slice::from_raw_parts(ptr, len) };
+        assert_eq!(found, path.as_slice());
+    }
+
+    #[test]
+    fn walk_without_end_node_stops_at_node_bound() {
+        // 100 well-formed non-terminal nodes and no End node: the walk
+        // must stop at MAX_DEVICE_PATH_NODES instead of marching the read
+        // pointer past the buffer.
+        let mut bytes = Vec::new();
+        for _ in 0..100 {
+            node(&mut bytes, DEVICE_PATH_TYPE_MEDIA, 1, &[0; 4]);
+        }
+        assert!(
+            extract_file_path_from_device_path(bytes.as_mut_ptr() as *mut DevicePathProtocol)
+                .is_none()
+        );
+    }
 }
