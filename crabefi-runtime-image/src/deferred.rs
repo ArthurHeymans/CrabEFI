@@ -96,13 +96,13 @@ impl CapsuleHeader {
 }
 
 /// Block descriptors at the start of the region: the reservation capsule,
-/// then the staged capsule's first block and its terminator or continuation.
+/// then either the list terminator or a continuation to the staged
+/// capsule's scatter-gather list.
 #[repr(C)]
 #[derive(FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned)]
 struct Descriptors {
     reservation: CapsuleBlockDescriptor,
     staged: CapsuleBlockDescriptor,
-    staged_next: CapsuleBlockDescriptor,
 }
 
 #[repr(C)]
@@ -356,9 +356,7 @@ impl<'a> DeferredRegion<'a> {
             return Err(efi::Status::DEVICE_ERROR);
         }
         self.write_reservation_capsule()?;
-        let descriptors = self.descriptors()?;
-        descriptors.staged = CapsuleBlockDescriptor::new(0, 0);
-        descriptors.staged_next = CapsuleBlockDescriptor::new(0, 0);
+        self.descriptors()?.staged = CapsuleBlockDescriptor::new(0, 0);
         Ok(self.bytes.as_ptr() as u64)
     }
 
@@ -397,40 +395,18 @@ impl<'a> DeferredRegion<'a> {
 
     /// Stage one caller-provided capsule behind the reservation capsule.
     ///
-    /// # Arguments
-    /// * `capsule_size` - Total size of the capsule the list describes
-    /// * `scatter_gather_list` - Address of the caller's block descriptor list
-    /// * `first_block` - The first descriptor of that list
-    pub fn stage_capsule(
-        &mut self,
-        capsule_size: u32,
-        scatter_gather_list: u64,
-        first_block: CapsuleBlockDescriptor,
-    ) -> Result<(), efi::Status> {
-        if !self.has_journal() || capsule_size < CAPSULE_HEADER_SIZE as u32 {
+    /// The caller's scatter-gather list is linked in as a continuation
+    /// descriptor and never read here: its address is physical, so after
+    /// `SetVirtualAddressMap` it is not a dereferenceable pointer, and the
+    /// OS allocates it in ordinary memory no runtime mapping covers.
+    /// coreboot validates every block when it coalesces capsules on the
+    /// next boot (as EDK2 does, which also only records the address).
+    pub fn stage_capsule(&mut self, scatter_gather_list: u64) -> Result<(), efi::Status> {
+        if !self.has_journal() || scatter_gather_list == 0 {
             return Err(efi::Status::INVALID_PARAMETER);
         }
         reject_profile_mismatch(&read_header(self.journal()?)?)?;
-        let (length, address) = (first_block.length.get(), first_block.address.get());
-        if length == 0
-            || address == 0
-            || length > u64::from(capsule_size)
-            // The described physical block must not wrap; coreboot consumes
-            // this descriptor pair verbatim on the next boot.
-            || address.checked_add(length).is_none()
-        {
-            return Err(efi::Status::INVALID_PARAMETER);
-        }
-        let next_descriptor = scatter_gather_list
-            .checked_add(core::mem::size_of::<CapsuleBlockDescriptor>() as u64)
-            .ok_or(efi::Status::INVALID_PARAMETER)?;
-        let descriptors = self.descriptors()?;
-        descriptors.staged = first_block;
-        descriptors.staged_next = if length == u64::from(capsule_size) {
-            CapsuleBlockDescriptor::new(0, 0)
-        } else {
-            CapsuleBlockDescriptor::new(0, next_descriptor)
-        };
+        self.descriptors()?.staged = CapsuleBlockDescriptor::new(0, scatter_gather_list);
         Ok(())
     }
 
@@ -906,15 +882,18 @@ mod tests {
     }
 
     #[test]
-    fn stage_capsule_rejects_wrapping_scatter_gather_blocks() {
+    fn stage_capsule_links_caller_list_as_continuation() {
         let mut buffer = vec![0u8; 64 * 1024];
+        let mut region = DeferredRegion::new(&mut buffer);
+        region.prepare_retained().unwrap();
+        assert_eq!(region.stage_capsule(0), Err(efi::Status::INVALID_PARAMETER));
+        region.stage_capsule(0x1234_5000).unwrap();
+        let staged = &region.descriptors().unwrap().staged;
+        // Length zero with a non-zero address is a continuation: coreboot
+        // follows it straight into the caller's list.
         assert_eq!(
-            DeferredRegion::new(&mut buffer).stage_capsule(
-                u32::MAX,
-                0x1000,
-                CapsuleBlockDescriptor::new(u32::MAX.into(), u64::MAX),
-            ),
-            Err(efi::Status::INVALID_PARAMETER)
+            (staged.length.get(), staged.address.get()),
+            (0, 0x1234_5000)
         );
     }
 
