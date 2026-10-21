@@ -265,6 +265,8 @@ pub struct BootMenu {
     pub(crate) selected: usize,
     /// Timeout in seconds (0 = no timeout)
     pub(crate) timeout_seconds: u32,
+    /// `selected` is a `loader.conf` default, which the first one sets
+    default_chosen: bool,
 }
 
 impl Default for BootMenu {
@@ -280,6 +282,7 @@ impl BootMenu {
             entries: Vec::new(),
             selected: 0,
             timeout_seconds: DEFAULT_TIMEOUT_SECONDS,
+            default_chosen: false,
         }
     }
 
@@ -569,6 +572,14 @@ fn scan_partition_for_entries(
 
                 if !menu.add_entry(entry) {
                     return; // Menu full
+                }
+                // Boot the first loader.conf default that made it into the
+                // menu, like systemd-boot, instead of the first entry (often
+                // the removable-media fallback).
+                if !menu.default_chosen && bls_discovery.is_default(bls_entry) {
+                    menu.selected = menu.entry_count() - 1;
+                    menu.default_chosen = true;
+                    log::info!("loader.conf default: '{}'", bls_entry.display_title());
                 }
 
                 log::debug!(
