@@ -41,8 +41,8 @@ pub struct GrubEntry {
     pub title: String<64>,
     /// Path to Linux kernel
     pub linux: String<128>,
-    /// Path to initrd
-    pub initrd: String<128>,
+    /// The initrds, in order
+    pub initrds: crate::bls::Initrds,
     /// Kernel command line options
     pub options: String<512>,
     /// Entry class (for styling, ignored)
@@ -61,7 +61,7 @@ impl GrubEntry {
         Self {
             title: String::new(),
             linux: String::new(),
-            initrd: String::new(),
+            initrds: heapless::Vec::new(),
             options: String::new(),
             class: String::new(),
         }
@@ -194,6 +194,9 @@ fn parse_grub_content(content: &str) -> Result<GrubConfig, GrubError> {
     let mut current_entry: Option<GrubEntry> = None;
     let mut in_menuentry = false;
     let mut brace_depth = 0;
+    // The depth a menuentry starts at: it ends when the braces return
+    // there, also inside a submenu.
+    let mut entry_depth = 0;
 
     for line in content.lines() {
         let line = line.trim();
@@ -250,6 +253,7 @@ fn parse_grub_content(content: &str) -> Result<GrubConfig, GrubError> {
 
             current_entry = Some(entry);
             in_menuentry = true;
+            entry_depth = brace_depth;
         }
 
         // Update brace depth
@@ -257,7 +261,7 @@ fn parse_grub_content(content: &str) -> Result<GrubConfig, GrubError> {
         brace_depth = brace_depth.saturating_sub(close_braces);
 
         // Check for menuentry end
-        if in_menuentry && brace_depth == 0 && close_braces > 0 {
+        if in_menuentry && brace_depth == entry_depth && close_braces > 0 {
             if let Some(entry) = current_entry.take()
                 && entry.is_valid()
             {
@@ -267,9 +271,13 @@ fn parse_grub_content(content: &str) -> Result<GrubConfig, GrubError> {
             in_menuentry = false;
         }
 
-        // Parse content inside menuentry
-        if in_menuentry && let Some(ref mut entry) = current_entry {
-            parse_menuentry_line(line, entry);
+        // Parse content inside menuentry; drop an entry that can't boot
+        if in_menuentry
+            && let Some(entry) = current_entry.as_mut()
+            && parse_menuentry_line(line, entry).is_err()
+        {
+            log::warn!("Skipping GRUB entry '{}': too many initrds", entry.title);
+            current_entry = None;
         }
     }
 
@@ -322,33 +330,32 @@ fn parse_menuentry_class(line: &str) -> Option<&str> {
     Some(&after_class[..end])
 }
 
-/// Parse a line inside a menuentry block
-fn parse_menuentry_line(line: &str, entry: &mut GrubEntry) {
-    // Parse linux/linuxefi directive
-    if let Some(rest) = line
-        .strip_prefix("linux ")
-        .or_else(|| line.strip_prefix("linuxefi "))
-    {
-        let parts: Vec<&str, 2> = rest.splitn(2, char::is_whitespace).collect();
-        if let Some(path) = parts.first() {
+/// Parse a line inside a menuentry block. grub-mkconfig separates the
+/// directive from its arguments with a tab. Fails for more initrds than
+/// [`crate::bls::MAX_INITRDS`].
+fn parse_menuentry_line(line: &str, entry: &mut GrubEntry) -> Result<(), ()> {
+    let Some((directive, rest)) = line.split_once(char::is_whitespace) else {
+        return Ok(());
+    };
+    let rest = rest.trim();
+    match directive {
+        "linux" | "linuxefi" | "linux16" => {
+            let (path, opts) = rest.split_once(char::is_whitespace).unwrap_or((rest, ""));
             entry.linux.clear();
-            let normalized = normalize_grub_path(path);
-            let _ = entry.linux.push_str(&normalized);
-        }
-        if let Some(opts) = parts.get(1) {
+            let _ = entry.linux.push_str(&normalize_grub_path(path));
             entry.options.clear();
             let _ = entry.options.push_str(opts.trim());
         }
+        "initrd" | "initrdefi" | "initrd16" => {
+            let mut initrds = crate::bls::Initrds::new();
+            for path in rest.split_whitespace() {
+                initrds.push(normalize_grub_path(path)).map_err(|_| ())?;
+            }
+            entry.initrds = initrds;
+        }
+        _ => {}
     }
-    // Parse initrd/initrdefi directive
-    else if let Some(rest) = line
-        .strip_prefix("initrd ")
-        .or_else(|| line.strip_prefix("initrdefi "))
-    {
-        entry.initrd.clear();
-        let normalized = normalize_grub_path(rest.trim());
-        let _ = entry.initrd.push_str(&normalized);
-    }
+    Ok(())
 }
 
 /// Normalize a GRUB path to a clean path
@@ -433,4 +440,80 @@ pub fn has_grub_config(fs: &mut FatFilesystem<'_>) -> bool {
         }
     }
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// grub-mkconfig on Arch (BIOS, separate /boot): tabs after the
+    /// directives, a submenu, `${...}` variables and function blocks.
+    pub(super) const ARCH: &str = "\
+function load_video {
+  if [ x$feature_all_video_module = xy ]; then
+    insmod all_video
+  fi
+}
+if [ \"${next_entry}\" ] ; then
+   set default=\"${next_entry}\"
+fi
+set timeout=5
+menuentry 'Arch Linux' --class arch --class gnu-linux --class gnu --class os $menuentry_id_option 'gnulinux-simple-2f6c' {
+\tload_video
+\tset gfxpayload=keep
+\tinsmod part_msdos
+\tsearch --no-floppy --fs-uuid --set=root 1A2B-3C4D
+\techo\t'Loading Linux linux ...'
+\tlinux\t/vmlinuz-linux root=UUID=2f6c rw  loglevel=3 quiet
+\techo\t'Loading initial ramdisk ...'
+\tinitrd\t/amd-ucode.img /initramfs-linux.img
+}
+submenu 'Advanced options for Arch Linux' $menuentry_id_option 'gnulinux-advanced-2f6c' {
+\tmenuentry 'Arch Linux, with Linux linux' --class arch $menuentry_id_option 'gnulinux-linux-advanced-2f6c' {
+\t\tlinux\t/vmlinuz-linux root=UUID=2f6c rw  loglevel=3 quiet
+\t\tinitrd\t/amd-ucode.img /initramfs-linux.img
+\t}
+\tmenuentry 'Arch Linux, with Linux linux (fallback initramfs)' --class arch $menuentry_id_option 'gnulinux-linux-fallback-2f6c' {
+\t\tlinux\t/vmlinuz-linux root=UUID=2f6c rw  loglevel=3 quiet
+\t\tinitrd\t/amd-ucode.img /initramfs-linux-fallback.img
+\t}
+}
+";
+
+    #[test]
+    fn parses_grub_mkconfig_entries() {
+        let config = parse_grub_content(ARCH).unwrap();
+        let titles: heapless::Vec<&str, 4> =
+            config.entries.iter().map(|e| e.title.as_str()).collect();
+        assert_eq!(
+            titles,
+            [
+                "Arch Linux",
+                "Arch Linux, with Linux linux",
+                "Arch Linux, with Linux linux (fallback initramfs)"
+            ]
+        );
+        assert!(config.entries.iter().all(|e| e.linux == "vmlinuz-linux"));
+        assert_eq!(
+            config.entries[0].options,
+            "root=UUID=2f6c rw  loglevel=3 quiet"
+        );
+        assert_eq!(
+            config.entries[0].initrds,
+            ["amd-ucode.img", "initramfs-linux.img"]
+        );
+        assert_eq!(config.entries[2].initrds[1], "initramfs-linux-fallback.img");
+        assert_eq!(config.timeout, Some(5));
+    }
+
+    #[test]
+    fn drops_an_entry_with_too_many_initrds() {
+        let config = parse_grub_content(
+            "menuentry 'Many' {\n\tlinux\t/vmlinuz\n\tinitrd\t/a /b /c /d /e\n}\n\
+             menuentry 'Ok' {\n\tlinux\t/vmlinuz\n\tinitrd\t/a /b\n}\n",
+        )
+        .unwrap();
+        assert_eq!(config.entries.len(), 1);
+        assert_eq!(config.entries[0].title, "Ok");
+    }
 }
