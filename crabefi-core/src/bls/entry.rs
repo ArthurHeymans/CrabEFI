@@ -18,6 +18,9 @@ const MAX_SORT_KEY_LEN: usize = 32;
 /// A parsed BLS Type #1 entry
 #[derive(Debug, Clone)]
 pub struct BlsEntry {
+    /// The entry ID: its file name without `.conf`, which `loader.conf`'s
+    /// `default` names
+    pub id: String<MAX_TITLE_LEN>,
     /// Display title for the menu
     pub title: String<MAX_TITLE_LEN>,
     /// Kernel version string
@@ -48,6 +51,7 @@ impl BlsEntry {
     /// Create a new empty BLS entry
     pub const fn new() -> Self {
         Self {
+            id: String::new(),
             title: String::new(),
             version: String::new(),
             linux: String::new(),

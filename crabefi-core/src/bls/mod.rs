@@ -83,26 +83,16 @@ impl BlsDiscovery {
         self.entries.is_empty()
     }
 
-    /// Get the default entry index based on loader.conf
-    ///
-    /// Returns the index of the default entry, or 0 if no default is set
-    /// or the default entry is not found.
-    pub fn default_entry_index(&self) -> usize {
-        if let Some(ref conf) = self.loader_conf
-            && !conf.default.is_empty()
-        {
-            // Try to find entry matching the default pattern
-            // The default can be a wildcard like "fedora-*" or exact like "fedora-40"
-            for (i, entry) in self.entries.iter().enumerate() {
-                // Simple matching: check if entry title/version contains the pattern
-                if entry.title.contains(conf.default.as_str())
-                    || entry.version.contains(conf.default.as_str())
-                {
-                    return i;
-                }
-            }
-        }
-        0
+    /// Whether `loader.conf`'s `default` names `entry`: a glob over the
+    /// entry IDs, matched case-insensitively as in systemd-boot. False
+    /// without a default and for the `@saved` style special values.
+    pub fn is_default(&self, entry: &BlsEntry) -> bool {
+        self.loader_conf.as_ref().is_some_and(|conf| {
+            let pattern = conf.default.as_str();
+            !pattern.is_empty()
+                && !pattern.starts_with('@')
+                && glob_match(pattern.as_bytes(), entry.id.as_bytes())
+        })
     }
 
     /// Get the timeout from loader.conf (or None)
@@ -194,7 +184,11 @@ fn try_load_entry(fs: &mut FatFilesystem<'_>, path: &str) -> Option<BlsEntry> {
 
     // Parse the entry
     match BlsEntry::parse(content) {
-        Ok(entry) => {
+        Ok(mut entry) => {
+            let name = path.rsplit('\\').next().unwrap_or(path);
+            let _ = entry
+                .id
+                .push_str(name.strip_suffix(".conf").unwrap_or(name));
             log::debug!("Loaded BLS entry: {} ({})", entry.display_title(), path);
             Some(entry)
         }
@@ -203,6 +197,37 @@ fn try_load_entry(fs: &mut FatFilesystem<'_>, path: &str) -> Option<BlsEntry> {
             None
         }
     }
+}
+
+/// Match `text` against a glob `pattern` with `*` (any run) and `?` (any
+/// byte), ignoring ASCII case, as systemd-boot matches entry IDs. Iterative,
+/// backtracking only to the last `*`: at most `pattern.len() * text.len()`
+/// steps.
+fn glob_match(pattern: &[u8], text: &[u8]) -> bool {
+    let (mut p, mut t) = (0, 0);
+    // The last `*` and the text position it currently covers up to.
+    let mut star: Option<(usize, usize)> = None;
+    while t < text.len() {
+        match pattern.get(p) {
+            Some(b'*') => {
+                star = Some((p, t));
+                p += 1;
+            }
+            Some(&c) if c == b'?' || c.eq_ignore_ascii_case(&text[t]) => {
+                p += 1;
+                t += 1;
+            }
+            _ => match star {
+                Some((star_p, star_t)) => {
+                    star = Some((star_p, star_t + 1));
+                    p = star_p + 1;
+                    t = star_t + 1;
+                }
+                None => return false,
+            },
+        }
+    }
+    pattern[p..].iter().all(|&c| c == b'*')
 }
 
 /// Check if a filesystem has BLS entries
@@ -215,4 +240,60 @@ fn try_load_entry(fs: &mut FatFilesystem<'_>, path: &str) -> Option<BlsEntry> {
 pub fn has_bls_entries(fs: &mut FatFilesystem<'_>) -> bool {
     // Check if loader.conf or the entries directory exists
     fs.file_size(LOADER_CONF_PATH).is_ok() || fs.find_file(ENTRIES_DIR).is_ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn discovery(default: &str, ids: &[&str]) -> BlsDiscovery {
+        let mut discovery = BlsDiscovery::new();
+        let mut conf = LoaderConf::new();
+        let _ = conf.default.push_str(default);
+        discovery.loader_conf = Some(conf);
+        for id in ids {
+            let mut entry = BlsEntry::new();
+            let _ = entry.id.push_str(id);
+            let _ = discovery.entries.push(entry);
+        }
+        discovery
+    }
+
+    #[test]
+    fn the_default_names_an_entry_id() {
+        let ids = ["02-archiso-speech-linux", "01-archiso-linux"];
+        let default = |pattern| {
+            let discovery = discovery(pattern, &ids);
+            discovery
+                .entries
+                .iter()
+                .find(|e| discovery.is_default(e))
+                .map(|e| e.id.clone())
+        };
+        assert_eq!(
+            default("01-archiso-linux").as_deref(),
+            Some("01-archiso-linux")
+        );
+        assert_eq!(
+            default("*speech*").as_deref(),
+            Some("02-archiso-speech-linux")
+        );
+        assert_eq!(
+            default("0?-archiso-linux").as_deref(),
+            Some("01-archiso-linux")
+        );
+        assert_eq!(default("01-ARCHISO-*").as_deref(), Some("01-archiso-linux"));
+        assert_eq!(default("archiso"), None);
+        assert_eq!(default("@saved"), None);
+        assert_eq!(default(""), None);
+    }
+
+    #[test]
+    fn glob_work_is_bounded() {
+        assert!(glob_match(b"*a*b", b"xaxxb"));
+        assert!(glob_match(b"**", b""));
+        assert!(!glob_match(b"a*", b"b"));
+        let pattern = [b"*a".repeat(30).as_slice(), b"*b"].concat();
+        assert!(!glob_match(&pattern, &[b'a'; 120]));
+    }
 }
