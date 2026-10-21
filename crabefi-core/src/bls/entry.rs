@@ -11,6 +11,10 @@ use heapless::String;
 const MAX_TITLE_LEN: usize = 64;
 const MAX_VERSION_LEN: usize = 32;
 const MAX_PATH_LEN: usize = 128;
+/// The most initrds an entry may load (e.g. microcode, then the initramfs).
+pub const MAX_INITRDS: usize = 4;
+/// The initrds of an entry, in load order.
+pub type Initrds = heapless::Vec<String<MAX_PATH_LEN>, MAX_INITRDS>;
 const MAX_OPTIONS_LEN: usize = 512;
 const MAX_MACHINE_ID_LEN: usize = 33; // 32 hex chars + null
 const MAX_SORT_KEY_LEN: usize = 32;
@@ -24,8 +28,8 @@ pub struct BlsEntry {
     pub version: String<MAX_VERSION_LEN>,
     /// Path to the Linux kernel (relative to ESP root)
     pub linux: String<MAX_PATH_LEN>,
-    /// Path to the initrd (relative to ESP root)
-    pub initrd: String<MAX_PATH_LEN>,
+    /// The initrds, in order (relative to ESP root)
+    pub initrds: Initrds,
     /// Kernel command line options
     pub options: String<MAX_OPTIONS_LEN>,
     /// Machine ID (for sorting)
@@ -51,7 +55,7 @@ impl BlsEntry {
             title: String::new(),
             version: String::new(),
             linux: String::new(),
-            initrd: String::new(),
+            initrds: heapless::Vec::new(),
             options: String::new(),
             machine_id: String::new(),
             sort_key: String::new(),
@@ -113,10 +117,16 @@ impl BlsEntry {
                         let _ = entry.linux.push_str(normalize_path(value));
                     }
                     "initrd" => {
-                        // initrd can have multiple values, but we only take the first
-                        if entry.initrd.is_empty() {
-                            let _ = entry.initrd.push_str(normalize_path(value));
-                        }
+                        // Each initrd line adds one, in order. An entry
+                        // missing one of its initrds can't boot right, so
+                        // too long a path or too many initrds reject it.
+                        let mut path = String::new();
+                        path.push_str(normalize_path(value))
+                            .map_err(|_| BlsParseError::Initrd)?;
+                        entry
+                            .initrds
+                            .push(path)
+                            .map_err(|_| BlsParseError::Initrd)?;
                     }
                     "options" => {
                         entry.options.clear();
@@ -159,6 +169,8 @@ impl BlsEntry {
 pub enum BlsParseError {
     /// Missing required fields (title or linux)
     MissingRequired,
+    /// An initrd path longer than supported, or more than [`MAX_INITRDS`]
+    Initrd,
 }
 
 /// Split a line into key and value
@@ -274,5 +286,32 @@ impl LoaderConf {
         }
 
         conf
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::format;
+
+    #[test]
+    fn keeps_every_initrd_in_order() {
+        let entry = BlsEntry::parse(
+            "title Arch Linux\nlinux /vmlinuz-linux\ninitrd /amd-ucode.img\ninitrd /initramfs-linux.img\noptions root=UUID=2f6c rw\n",
+        )
+        .unwrap();
+        assert_eq!(entry.initrds, ["amd-ucode.img", "initramfs-linux.img"]);
+    }
+
+    #[test]
+    fn rejects_initrds_that_dont_fit() {
+        let with = |initrds: &str| {
+            BlsEntry::parse(&format!("title Arch\nlinux /vmlinuz-linux\n{initrds}")).map(|_| ())
+        };
+        let many = "initrd /a.img\n".repeat(MAX_INITRDS + 1);
+        assert!(matches!(with(&many), Err(BlsParseError::Initrd)));
+        let long = format!("initrd /{}.img\n", "x".repeat(MAX_PATH_LEN));
+        assert!(matches!(with(&long), Err(BlsParseError::Initrd)));
+        assert!(with(&"initrd /a.img\n".repeat(MAX_INITRDS)).is_ok());
     }
 }

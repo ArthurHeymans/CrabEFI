@@ -27,7 +27,7 @@
 
 pub mod entry;
 
-pub use entry::{BlsEntry, BlsParseError, LoaderConf};
+pub use entry::{BlsEntry, BlsParseError, Initrds, LoaderConf, MAX_INITRDS};
 
 use crate::fs::fat::FatFilesystem;
 use heapless::{String, Vec};

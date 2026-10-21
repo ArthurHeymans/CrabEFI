@@ -79,8 +79,8 @@ pub enum BootEntryKind {
     BlsLinux {
         /// Path to Linux kernel
         linux_path: String<128>,
-        /// Path to initrd
-        initrd_path: String<128>,
+        /// The initrds, in order
+        initrd_paths: crate::bls::Initrds,
         /// Kernel command line
         cmdline: String<512>,
     },
@@ -92,8 +92,8 @@ pub enum BootEntryKind {
     GrubLinux {
         /// Path to Linux kernel
         linux_path: String<128>,
-        /// Path to initrd
-        initrd_path: String<128>,
+        /// The initrds, in order
+        initrd_paths: crate::bls::Initrds,
         /// Kernel command line
         cmdline: String<512>,
     },
@@ -547,11 +547,11 @@ fn scan_partition_for_entries(
                 let _ = name.push_str(bls_entry.display_title());
 
                 // Also convert initrd path
-                let initrd_fat_path = if !bls_entry.initrd.is_empty() {
-                    linux_path_to_fat(&bls_entry.initrd)
-                } else {
-                    String::new()
-                };
+                let initrd_fat_paths = bls_entry
+                    .initrds
+                    .iter()
+                    .map(|path| linux_path_to_fat(path))
+                    .collect();
 
                 let entry = BootEntry::new_with_kind(
                     &name,
@@ -561,7 +561,7 @@ fn scan_partition_for_entries(
                     partition.clone(),
                     BootEntryKind::BlsLinux {
                         linux_path: fat_path.clone(),
-                        initrd_path: initrd_fat_path,
+                        initrd_paths: initrd_fat_paths,
                         cmdline: bls_entry.options.clone(),
                     },
                     BootCategory::Bls,
@@ -604,12 +604,12 @@ fn scan_partition_for_entries(
                     let mut name: String<64> = String::new();
                     let _ = name.push_str(&grub_entry.title);
 
-                    // Also convert initrd path
-                    let initrd_fat_path = if !grub_entry.initrd.is_empty() {
-                        linux_path_to_fat(&grub_entry.initrd)
-                    } else {
-                        String::new()
-                    };
+                    // Also convert the initrd paths
+                    let initrd_fat_paths = grub_entry
+                        .initrds
+                        .iter()
+                        .map(|path| linux_path_to_fat(path))
+                        .collect();
 
                     let entry = BootEntry::new_with_kind(
                         &name,
@@ -619,7 +619,7 @@ fn scan_partition_for_entries(
                         partition.clone(),
                         BootEntryKind::GrubLinux {
                             linux_path: fat_path.clone(),
-                            initrd_path: initrd_fat_path,
+                            initrd_paths: initrd_fat_paths,
                             cmdline: grub_entry.options.clone(),
                         },
                         BootCategory::Grub,

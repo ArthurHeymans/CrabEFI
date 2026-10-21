@@ -342,22 +342,22 @@ fn boot_selected_entry(entry: &menu::BootEntry) {
         // Direct Linux boot entries (BLS Type #1 or GRUB)
         menu::BootEntryKind::BlsLinux {
             linux_path,
-            initrd_path,
+            initrd_paths,
             cmdline,
         }
         | menu::BootEntryKind::GrubLinux {
             linux_path,
-            initrd_path,
+            initrd_paths,
             cmdline,
         } => {
             #[cfg(target_arch = "x86_64")]
             {
                 log::info!("Dispatching to direct Linux boot");
-                boot_linux_entry(entry, linux_path, initrd_path, cmdline);
+                boot_linux_entry(entry, linux_path, initrd_paths, cmdline);
             }
             #[cfg(not(target_arch = "x86_64"))]
             {
-                let _ = (linux_path, initrd_path, cmdline);
+                let _ = (linux_path, initrd_paths, cmdline);
                 log::warn!("Direct Linux boot not supported on this architecture");
             }
         }
@@ -411,7 +411,7 @@ fn boot_uefi_entry(entry: &menu::BootEntry) {
 fn boot_linux_entry(
     entry: &menu::BootEntry,
     linux_path: &heapless::String<128>,
-    initrd_path: &heapless::String<128>,
+    initrd_paths: &crate::bls::Initrds,
     cmdline: &heapless::String<512>,
 ) {
     use crate::fs;
@@ -430,7 +430,7 @@ fn boot_linux_entry(
 
     log::info!("Direct Linux boot: {}", entry.name);
     log::info!("  Kernel: {}", linux_path);
-    if !initrd_path.is_empty() {
+    for initrd_path in initrd_paths {
         log::info!("  Initrd: {}", initrd_path);
     }
     log::info!("  Cmdline: {}", cmdline);
@@ -443,20 +443,21 @@ fn boot_linux_entry(
             return;
         }
     };
-    let initrd_fat_path = if !initrd_path.is_empty() {
+    let mut initrd_fat_paths: crate::bls::Initrds = heapless::Vec::new();
+    for initrd_path in initrd_paths {
         match fs::linux_path_to_fat(initrd_path) {
-            Ok(p) => Some(p),
+            Ok(p) => {
+                let _ = initrd_fat_paths.push(p);
+            }
             Err(e) => {
                 log::error!("Invalid initrd path '{}': {:?}", initrd_path, e);
                 return;
             }
         }
-    } else {
-        None
-    };
+    }
 
     log::debug!("FAT kernel path: {}", kernel_path);
-    if let Some(ref p) = initrd_fat_path {
+    for p in &initrd_fat_paths {
         log::debug!("FAT initrd path: {}", p);
     }
 
@@ -474,7 +475,10 @@ fn boot_linux_entry(
             disk,
             entry.partition.first_lba,
             &kernel_path,
-            initrd_fat_path.as_deref(),
+            &initrd_fat_paths
+                .iter()
+                .map(|p| p.as_str())
+                .collect::<heapless::Vec<&str, { crate::bls::MAX_INITRDS }>>(),
             cmdline,
             acpi_rsdp,
             framebuffer.as_ref(),

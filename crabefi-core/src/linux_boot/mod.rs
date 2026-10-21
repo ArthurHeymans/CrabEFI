@@ -259,7 +259,7 @@ impl LoadedLinux {
 /// * `disk` - Block device to read from
 /// * `partition_start` - Starting LBA of the partition containing the kernel
 /// * `kernel_path` - Path to the kernel file (FAT path format)
-/// * `initrd_path` - Optional path to initrd file
+/// * `initrd_paths` - The initrd files, loaded back to back in order
 /// * `cmdline` - Kernel command line
 /// * `acpi_rsdp` - ACPI RSDP address (optional)
 /// * `framebuffer` - Framebuffer info (optional)
@@ -275,7 +275,7 @@ pub fn load_linux_from_disk(
     disk: &mut dyn BlockDevice,
     partition_start: u64,
     kernel_path: &str,
-    initrd_path: Option<&str>,
+    initrd_paths: &[&str],
     cmdline: &str,
     acpi_rsdp: Option<u64>,
     framebuffer: Option<&crate::platform::FramebufferConfig>,
@@ -430,76 +430,78 @@ pub fn load_linux_from_disk(
         efi_handover_entry
     );
 
-    // Load initrd if specified
+    // Load the initrds back to back, each padded to 4 bytes, as one range:
+    // the kernel unpacks concatenated cpio archives (e.g. microcode first,
+    // then the initramfs).
     let mut initrd_addr = None;
     let mut initrd_size = 0u32;
 
-    if let Some(initrd_path) = initrd_path
-        && !initrd_path.is_empty()
-    {
-        log::info!("Loading initrd: {}", initrd_path);
-
-        // Re-mount filesystem
+    if !initrd_paths.is_empty() {
         let mut fs =
             FatFilesystem::new(disk, partition_start).map_err(|_| LinuxBootError::FileRead)?;
-
-        // Get initrd size
-        let initrd_file_size = fs.file_size(initrd_path).map_err(|e| {
-            log::error!("Failed to get initrd file size: {:?}", e);
-            LinuxBootError::FileNotFound
-        })?;
-
-        log::info!(
-            "Initrd file size: {} bytes ({} MB)",
-            initrd_file_size,
-            initrd_file_size / (1024 * 1024)
-        );
-
-        if initrd_file_size as usize > MAX_INITRD_SIZE {
-            log::error!(
-                "Initrd too large: {} > {} bytes",
-                initrd_file_size,
-                MAX_INITRD_SIZE
-            );
-            return Err(LinuxBootError::InitrdTooLarge);
+        let mut sizes: heapless::Vec<usize, { crate::bls::MAX_INITRDS }> = heapless::Vec::new();
+        for path in initrd_paths {
+            let size = fs.file_size(path).map_err(|e| {
+                log::error!("Failed to get initrd file size of {}: {:?}", path, e);
+                LinuxBootError::FileNotFound
+            })?;
+            log::info!("Initrd {}: {} bytes", path, size);
+            sizes
+                .push(size as usize)
+                .map_err(|_| LinuxBootError::InitrdTooLarge)?;
         }
+        let total = sizes
+            .iter()
+            .try_fold(0usize, |total, &size| {
+                total.checked_add(size.next_multiple_of(4))
+            })
+            .filter(|&total| total <= MAX_INITRD_SIZE)
+            .ok_or_else(|| {
+                log::error!("Initrds too large (limit {} bytes)", MAX_INITRD_SIZE);
+                LinuxBootError::InitrdTooLarge
+            })?;
 
-        // Place the initrd in usable RAM above the loaded kernel, respecting
+        // Place the initrds in usable RAM above the loaded kernel, respecting
         // the kernel-provided initrd_addr_max limit.
         let min_initrd_addr = DEFAULT_KERNEL_ADDR
             .checked_add(pm_kernel_size as u64)
             .ok_or(LinuxBootError::MemoryError)?;
-        let initrd_load_addr =
-            find_initrd_address(&boot_params, initrd_file_size as u64, min_initrd_addr)?;
+        let initrd_load_addr = find_initrd_address(&boot_params, total as u64, min_initrd_addr)?;
 
-        log::info!("Loading initrd to {:#x}", initrd_load_addr);
+        log::info!(
+            "Loading {} byte(s) of initrd to {:#x}",
+            total,
+            initrd_load_addr
+        );
 
-        let initrd_buffer = unsafe {
-            core::slice::from_raw_parts_mut(initrd_load_addr as *mut u8, initrd_file_size as usize)
-        };
-
-        // Re-mount filesystem
-        let mut fs =
-            FatFilesystem::new(disk, partition_start).map_err(|_| LinuxBootError::FileRead)?;
-
-        let bytes_read = fs.read_file_all(initrd_path, initrd_buffer).map_err(|e| {
-            log::error!("Failed to read initrd: {:?}", e);
-            LinuxBootError::FileRead
-        })?;
-
-        if bytes_read != initrd_file_size as usize {
-            log::error!(
-                "Initrd read size mismatch: {} != {}",
-                bytes_read,
-                initrd_file_size
-            );
-            return Err(LinuxBootError::FileRead);
+        let initrd_buffer =
+            unsafe { core::slice::from_raw_parts_mut(initrd_load_addr as *mut u8, total) };
+        let mut offset = 0;
+        for (path, &size) in initrd_paths.iter().zip(&sizes) {
+            let bytes_read = fs
+                .read_file_all(path, &mut initrd_buffer[offset..offset + size])
+                .map_err(|e| {
+                    log::error!("Failed to read initrd {}: {:?}", path, e);
+                    LinuxBootError::FileRead
+                })?;
+            if bytes_read != size {
+                log::error!(
+                    "Initrd {} read size mismatch: {} != {}",
+                    path,
+                    bytes_read,
+                    size
+                );
+                return Err(LinuxBootError::FileRead);
+            }
+            let padded = offset + size.next_multiple_of(4);
+            initrd_buffer[offset + size..padded].fill(0);
+            offset = padded;
         }
 
         // Update boot params with initrd info
-        boot_params.set_initrd(initrd_load_addr as u32, initrd_file_size);
+        boot_params.set_initrd(initrd_load_addr as u32, total as u32);
         initrd_addr = Some(initrd_load_addr);
-        initrd_size = initrd_file_size;
+        initrd_size = total as u32;
 
         log::info!("Initrd loaded successfully");
     }
