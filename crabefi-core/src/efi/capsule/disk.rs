@@ -14,7 +14,6 @@
 //!
 //! - UEFI Specification 2.10, Section 8.5.5 — Delivery of Capsules via file on Mass Storage device
 
-use alloc::vec;
 use alloc::vec::Vec;
 
 use crabefi_efi_types::secure_boot::EFI_GLOBAL_VARIABLE_GUID;
@@ -22,6 +21,13 @@ use r_efi::efi::Guid;
 
 /// The directory on the ESP where capsule files are placed.
 pub const CAPSULE_FILE_DIRECTORY: &str = "EFI\\UpdateCapsule";
+
+/// Largest capsule file loaded from the ESP.
+///
+/// Real firmware images are far smaller. The cap keeps a corrupt FAT
+/// directory entry — or a hostile ESP — from forcing an unbounded
+/// allocation before any capsule validation has run.
+pub const MAX_CAPSULE_FILE_SIZE: u32 = 64 * 1024 * 1024;
 
 /// `OsIndications` bit for FMP capsule support.
 pub const EFI_OS_INDICATIONS_FMP_CAPSULE_SUPPORTED: u64 = 0x0000_0000_0000_0008;
@@ -153,8 +159,23 @@ fn scan_device_for_capsules(
                 continue;
             }
 
+            if file_size > MAX_CAPSULE_FILE_SIZE {
+                log::error!(
+                    "Capsule file {} is {} bytes (limit {}); skipping",
+                    path,
+                    file_size,
+                    MAX_CAPSULE_FILE_SIZE
+                );
+                continue;
+            }
+
             // Read the file
-            let mut buffer = vec![0u8; file_size as usize];
+            let mut buffer = Vec::new();
+            if buffer.try_reserve_exact(file_size as usize).is_err() {
+                log::error!("Out of memory loading capsule file {}", path);
+                continue;
+            }
+            buffer.resize(file_size as usize, 0);
             match fat_fs.read_file_all(&path, buffer.as_mut_slice()) {
                 Ok(bytes_read) => {
                     buffer.truncate(bytes_read);

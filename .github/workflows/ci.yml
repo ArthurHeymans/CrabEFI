@@ -1,31 +1,27 @@
 name: CI
-
 on:
   push:
     branches: [main, master, SBSA, RISCV64]
   pull_request: {}
-
 # Least privilege: no job in this workflow needs to write to the repository.
 permissions:
   contents: read
-
 env:
   CARGO_TERM_COLOR: always
-
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 jobs:
   fmt:
     name: Format
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
-
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@nightly
-        with:
-          components: rustfmt
-
+        uses: ./.github/actions/setup-rust
       - name: Check formatting
         run: |
           cargo fmt --all --check
@@ -33,36 +29,60 @@ jobs:
           cargo fmt --manifest-path "$GITHUB_WORKSPACE/xtask/Cargo.toml" -- --check
           cargo fmt --manifest-path "$GITHUB_WORKSPACE/crabefi-runtime-abi/Cargo.toml" -- --check
           cargo fmt --manifest-path "$GITHUB_WORKSPACE/crabefi-runtime-image/Cargo.toml" -- --check
-          cargo fmt --manifest-path "$GITHUB_WORKSPACE/test-apps/runtime-image-test/Cargo.toml" -- --check
           cargo fmt --manifest-path "$GITHUB_WORKSPACE/ci/fixtures/library-consumer/Cargo.toml" -- --check
-
+          for manifest in "$GITHUB_WORKSPACE"/test-apps/*/Cargo.toml; do
+            cargo fmt --manifest-path "$manifest" -- --check
+          done
+  audit:
+    name: Dependency audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Install cargo-audit
+        uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 # v2
+        with:
+          tool: cargo-audit
+      # Fetch the advisory database once, with retries, and audit every
+      # lockfile offline: a per-lockfile fetch turns one network blip into
+      # a red job.
+      - name: Fetch advisory database
+        run: |
+          for attempt in 1 2 3 4 5; do
+            rm -rf "$RUNNER_TEMP/advisory-db"
+            git clone --quiet --depth 1 https://github.com/RustSec/advisory-db.git \
+              "$RUNNER_TEMP/advisory-db" && exit 0
+            sleep $((attempt * 10))
+          done
+          exit 1
+      - name: Audit all lockfiles
+        run: |
+          for lock in $(git ls-files '*Cargo.lock'); do
+            echo "== $lock"
+            cargo-audit audit --no-fetch --db "$RUNNER_TEMP/advisory-db" --file "$lock"
+          done
   coreboot-feature-tests:
     name: Coreboot feature regression tests
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
-
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-
+        uses: ./.github/actions/setup-rust
       - name: Run coreboot feature regression tests
         run: ci/run-coreboot-feature-tests.sh
-
-      - name: Install nightly toolchain for workspace unit tests
-        uses: dtolnay/rust-toolchain@nightly
-
       - name: Run workspace library unit tests
-        # build-std is passed only on xtask's firmware invocations, so host
-        # cargo test works for all workspace library crates here.
-        run: cargo test --workspace
-
+        run: |
+          cargo test --workspace
+          cargo test -p crabefi-coreboot --lib --features fallback-memory-map
       - name: Run Secure Boot and graphical UI unit tests
         # Auth and graphical repaint tests are feature-gated and not built
         # by the plain workspace test run above.
         run: cargo test -p crabefi-core --features secure-boot,ui
-
       - name: Run runtime host tests
         run: |
           cd "$HOME"
@@ -70,117 +90,90 @@ jobs:
           cargo test --manifest-path "$GITHUB_WORKSPACE/crabefi-runtime-image/Cargo.toml"
           cargo test --manifest-path "$GITHUB_WORKSPACE/crabefi-runtime-bundle/Cargo.toml"
           cargo test --manifest-path "$GITHUB_WORKSPACE/xtask/Cargo.toml"
-
+      - name: Check additive capability boundaries
+        run: ci/check-capabilities.sh
   # ── x86_64 ────────────────────────────────────────────────────────────
-
   clippy:
     name: Clippy (x86_64)
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
-
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@nightly
-        with:
-          components: clippy, rust-src, llvm-tools-preview
-          targets: x86_64-unknown-none
-
-      - name: Install stable toolchain for xtask
-        uses: dtolnay/rust-toolchain@stable
-
+        uses: ./.github/actions/setup-rust
       - name: Run clippy
         run: |
           ./crabefi build --arch x86-64
           RUNTIME_IMAGE_PATH="$PWD/target/runtime/x86_64/runtime.img" \
           RUNTIME_IMAGE_SHA256="$(tr -d '\n' < target/runtime/x86_64/sha256)" \
-          cargo +nightly -Z build-std=core,compiler_builtins,alloc \
+          cargo -Z build-std=core,compiler_builtins,alloc \
             -Z build-std-features=compiler-builtins-mem \
             clippy --workspace --release --target x86_64-unknown-none -- -D warnings
           cd "$HOME"
-          cargo +nightly clippy --manifest-path "$GITHUB_WORKSPACE/crabefi-runtime-abi/Cargo.toml" -- -D warnings
+          cargo clippy --manifest-path "$GITHUB_WORKSPACE/crabefi-runtime-abi/Cargo.toml" -- -D warnings
           cd "$GITHUB_WORKSPACE/crabefi-runtime-image"
-          cargo +nightly -Z build-std=core,compiler_builtins,alloc \
+          cargo -Z build-std=core,compiler_builtins,alloc \
             -Z build-std-features=compiler-builtins-mem \
             clippy --release --target x86_64-unknown-none -- -D warnings
-
+      - name: Run clippy on xtask
+        run: cargo clippy --manifest-path xtask/Cargo.toml -- -D warnings
   build:
     name: Build (x86_64)
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
-
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@nightly
-        with:
-          components: rust-src, llvm-tools-preview
-          targets: x86_64-unknown-none
-
-      - name: Install stable toolchain for xtask
-        uses: dtolnay/rust-toolchain@stable
-
+        uses: ./.github/actions/setup-rust
       - name: Build coreboot payload with Cargo-only runtime
         run: cargo build -p crabefi-coreboot --release --target x86_64-unknown-none
-
       - name: Build release
         run: ./crabefi build --arch x86-64
-
       - name: Build Cargo-only library consumer
         run: |
-          cargo +nightly -Z build-std=core,compiler_builtins,alloc \
+          cargo -Z build-std=core,compiler_builtins,alloc \
             -Z build-std-features=compiler-builtins-mem \
             build --release \
             --manifest-path ci/fixtures/library-consumer/Cargo.toml \
             --target x86_64-unknown-none
-
       - name: Report reserved stack
         run: |
           stack_hex=$(readelf -SW target/x86_64-unknown-none/release/crabefi | awk '$3 == ".stack" { print $7 }')
           test -n "$stack_hex"
           printf '## x86_64 memory report\n\n- Reserved stack: %d KiB\n' "$((16#$stack_hex / 1024))" >> "$GITHUB_STEP_SUMMARY"
-
       - name: Upload CrabEFI ELF
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: crabefi-elf
           path: |
             target/x86_64-unknown-none/release/crabefi
             target/runtime/x86_64/
           retention-days: 7
-
   # x86_64 Integration tests with QEMU
   test-usb:
     name: Test x86_64 (USB Storage)
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     needs: build
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
-
       - name: Install Rust toolchains
-        uses: dtolnay/rust-toolchain@nightly
-        with:
-          components: rust-src, llvm-tools-preview
-          targets: x86_64-unknown-none, x86_64-unknown-uefi
-
-      - name: Install stable toolchain for xtask
-        uses: dtolnay/rust-toolchain@stable
-
+        uses: ./.github/actions/setup-rust
       - name: Install test dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y qemu-system-x86 mtools dosfstools zstd coreboot-utils
-
       - name: Download CrabEFI ELF
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: crabefi-elf
           path: target/x86_64-unknown-none/release/
-
       - name: Run integration tests (USB)
         run: |
           set -o pipefail
@@ -189,330 +182,305 @@ jobs:
             echo '## Q35 runtime memory report'
             grep -F 'MEMORY_REPORT' qemu.log || true
           } >> "$GITHUB_STEP_SUMMARY"
-
       - name: Test nested image Exit and cleanup
         run: ./crabefi test --app image-exit-test --disable-kvm --timeout 120
-
       - name: Test USB filesystem mutations and on-disk consistency
         run: >-
-          ./crabefi test --app directory-test
-          --disable-kvm --timeout 180
-
+          ./crabefi test --app directory-test --disable-kvm --timeout 180
   test-runtime-image:
     name: Test x86_64 (separate runtime image)
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     needs: build
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
-
       - name: Install Rust toolchains
-        uses: dtolnay/rust-toolchain@nightly
-        with:
-          components: rust-src, llvm-tools-preview
-          targets: x86_64-unknown-none, x86_64-unknown-uefi
-
-      - name: Install stable toolchain for xtask
-        uses: dtolnay/rust-toolchain@stable
-
+        uses: ./.github/actions/setup-rust
       - name: Install test dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y qemu-system-x86 mtools dosfstools zstd coreboot-utils
-
       - name: Validate runtime image boundary and variable services
         run: ./crabefi test --app runtime-image-test --disable-kvm --timeout 120
-
   test-ahci:
     name: Test x86_64 (AHCI Storage)
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     needs: build
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
-
       - name: Install Rust toolchains
-        uses: dtolnay/rust-toolchain@nightly
-        with:
-          components: rust-src, llvm-tools-preview
-          targets: x86_64-unknown-none, x86_64-unknown-uefi
-
-      - name: Install stable toolchain for xtask
-        uses: dtolnay/rust-toolchain@stable
-
+        uses: ./.github/actions/setup-rust
       - name: Install test dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y qemu-system-x86 mtools dosfstools zstd coreboot-utils
-
       - name: Download CrabEFI ELF
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: crabefi-elf
           path: target/x86_64-unknown-none/release/
-
       - name: Run integration tests (AHCI)
         run: ./crabefi test --app hello --ahci --disable-kvm --timeout 120
-
       - name: Test AHCI filesystem write protection
         run: >-
-          ./crabefi test --app directory-test --ahci
-          --disable-kvm --timeout 180
-
+          ./crabefi test --app directory-test --ahci --disable-kvm --timeout 180
   test-nvme:
     name: Test x86_64 (NVMe Storage)
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     needs: build
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
-
       - name: Install Rust toolchains
-        uses: dtolnay/rust-toolchain@nightly
-        with:
-          components: rust-src, llvm-tools-preview
-          targets: x86_64-unknown-none, x86_64-unknown-uefi
-
-      - name: Install stable toolchain for xtask
-        uses: dtolnay/rust-toolchain@stable
-
+        uses: ./.github/actions/setup-rust
       - name: Install test dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y qemu-system-x86 mtools dosfstools zstd coreboot-utils
-
       - name: Download CrabEFI ELF
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: crabefi-elf
           path: target/x86_64-unknown-none/release/
-
       - name: Run integration tests (NVMe)
         run: ./crabefi test --app hello --nvme --disable-kvm --timeout 120
-
       - name: Test NVMe filesystem write protection
         run: >-
-          ./crabefi test --app directory-test --nvme
-          --disable-kvm --timeout 180
-
+          ./crabefi test --app directory-test --nvme --disable-kvm --timeout 180
   test-sdhci:
     name: Test x86_64 (SD Card Storage)
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     needs: build
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
-
       - name: Install Rust toolchains
-        uses: dtolnay/rust-toolchain@nightly
-        with:
-          components: rust-src, llvm-tools-preview
-          targets: x86_64-unknown-none, x86_64-unknown-uefi
-
-      - name: Install stable toolchain for xtask
-        uses: dtolnay/rust-toolchain@stable
-
+        uses: ./.github/actions/setup-rust
       - name: Install test dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y qemu-system-x86 mtools dosfstools zstd coreboot-utils
-
       - name: Download CrabEFI ELF
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: crabefi-elf
           path: target/x86_64-unknown-none/release/
-
       - name: Run integration tests (SDHCI)
         run: ./crabefi test --app hello --sdhci --disable-kvm --timeout 120
-
   test-rng:
     name: Test x86_64 (Protocol tests)
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     needs: build
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
-
       - name: Install Rust toolchains
-        uses: dtolnay/rust-toolchain@nightly
-        with:
-          components: rust-src, llvm-tools-preview
-          targets: x86_64-unknown-none, x86_64-unknown-uefi
-
-      - name: Install stable toolchain for xtask
-        uses: dtolnay/rust-toolchain@stable
-
+        uses: ./.github/actions/setup-rust
       - name: Install test dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y qemu-system-x86 mtools dosfstools zstd coreboot-utils
-
       - name: Download CrabEFI ELF
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: crabefi-elf
           path: target/x86_64-unknown-none/release/
-
       - name: Run RNG protocol tests
         run: ./crabefi test --app rng-test --disable-kvm --timeout 120
-
       - name: Run protocol notify tests
         run: ./crabefi test --app protocol-notify-test --disable-kvm --timeout 120
-
   test-capsule:
     name: Test x86_64 (Capsule Update)
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     needs: build
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
-
       - name: Install Rust toolchains
-        uses: dtolnay/rust-toolchain@nightly
-        with:
-          components: rust-src, llvm-tools-preview
-          targets: x86_64-unknown-none, x86_64-unknown-uefi
-
-      - name: Install stable toolchain for xtask
-        uses: dtolnay/rust-toolchain@stable
-
+        uses: ./.github/actions/setup-rust
       - name: Install test dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y qemu-system-x86 mtools dosfstools zstd coreboot-utils
-
       - name: Download CrabEFI ELF
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: crabefi-elf
           path: target/x86_64-unknown-none/release/
-
       - name: Run capsule update tests
         run: ./crabefi test --app capsule-test --disable-kvm --timeout 120
-
   test-tcg:
     name: Test x86_64 (TCG Protocol)
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     needs: build
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
-
       - name: Install Rust toolchains
-        uses: dtolnay/rust-toolchain@nightly
-        with:
-          components: rust-src, llvm-tools-preview
-          targets: x86_64-unknown-none, x86_64-unknown-uefi
-
-      - name: Install stable toolchain for xtask
-        uses: dtolnay/rust-toolchain@stable
-
+        uses: ./.github/actions/setup-rust
       - name: Install test dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y qemu-system-x86 mtools dosfstools zstd coreboot-utils swtpm
           swtpm --version
-
       - name: Download CrabEFI ELF
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: crabefi-elf
           path: target/x86_64-unknown-none/release/
-
       - name: Run TCG protocol tests
         run: ./crabefi test --app tcg-test --disable-kvm --timeout 120
-
+  test-secure-boot:
+    name: Test x86_64 (Secure Boot test app)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    needs: build
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Install Rust toolchain
+        uses: ./.github/actions/setup-rust
+      - name: Install test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qemu-system-x86 mtools dosfstools zstd coreboot-utils
+      - name: Download CrabEFI ELF
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          name: crabefi-elf
+          path: target/x86_64-unknown-none/release/
+      - name: Run Secure Boot variable tests
+        run: ./crabefi test --app secure-boot-test --disable-kvm --timeout 120
+  test-device-path:
+    name: Test x86_64 (Device Path test app)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    needs: build
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Install Rust toolchain
+        uses: ./.github/actions/setup-rust
+      - name: Install test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qemu-system-x86 mtools dosfstools zstd coreboot-utils
+      - name: Download CrabEFI ELF
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          name: crabefi-elf
+          path: target/x86_64-unknown-none/release/
+      - name: Run device path conversion tests
+        run: ./crabefi test --app device-path-test --disable-kvm --timeout 120
+  test-storage-security:
+    name: Test x86_64 (Storage security test app)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    needs: build
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Install Rust toolchain
+        uses: ./.github/actions/setup-rust
+      - name: Install test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qemu-system-x86 mtools dosfstools zstd coreboot-utils
+      - name: Download CrabEFI ELF
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          name: crabefi-elf
+          path: target/x86_64-unknown-none/release/
+      - name: Build opt-in hardware security probes
+        run: >-
+          cargo build --locked --release --target x86_64-unknown-uefi
+          --manifest-path test-apps/storage-security-test/Cargo.toml
+          --features hardware-security-probes
+      - name: Run storage security API and pass-through tests
+        run: ./crabefi test --app storage-security-test --disable-kvm --timeout 120
   # ── UEFI SCT smoke subset ─────────────────────────────────────────────
-
   build-sct-assets-x86_64:
     name: Build SCT Assets x86_64
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
-
       - name: Restore cached SCT assets
         id: cache
-        uses: actions/cache@v6
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: sct-assets/x86_64
           key: sct-assets-x86_64-${{ hashFiles('ci/build-sct-assets.sh') }}
-
       - name: Install SCT asset dependencies
         if: steps.cache.outputs.cache-hit != 'true'
         run: |
           sudo apt-get update
           sudo apt-get install -y curl p7zip-full
-
       - name: Build SCT assets
         if: steps.cache.outputs.cache-hit != 'true'
         run: ci/build-sct-assets.sh --arch x86_64
-
       - name: Upload SCT assets
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: sct-assets-x86_64
           path: sct-assets/x86_64/
           retention-days: 7
-
   test-uefi-sct-smoke:
     name: Test x86_64 (UEFI SCT smoke)
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     needs: [build, build-sct-assets-x86_64]
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
-
       - name: Install Rust toolchains
-        uses: dtolnay/rust-toolchain@nightly
-        with:
-          components: rust-src, llvm-tools-preview
-          targets: x86_64-unknown-none
-
-      - name: Install stable toolchain for xtask
-        uses: dtolnay/rust-toolchain@stable
-
+        uses: ./.github/actions/setup-rust
       - name: Install test dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y qemu-system-x86 mtools dosfstools zstd coreboot-utils
-
       - name: Download CrabEFI ELF
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: crabefi-elf
           path: target/x86_64-unknown-none/release/
-
       - name: Download SCT assets
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: sct-assets-x86_64
           path: sct-assets/x86_64/
-
       - name: Run UEFI SCT smoke subset
         run: >-
-          ./crabefi test --app uefi-sct-smoke
-          --sct-assets-dir sct-assets/x86_64 --disable-kvm --timeout 300
-
+          ./crabefi test --app uefi-sct-smoke --sct-assets-dir sct-assets/x86_64 --disable-kvm --timeout 300
       - name: Upload SCT smoke evidence
         if: always()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: sct-smoke-reports
           path: target/sct-reports/smoke/
           retention-days: 14
           if-no-files-found: warn
-
   # Selected passing cases, not full protocol compliance. Required gaps remain
   # documented in docs/UEFI_CONFORMANCE.md and characterization sequences.
   test-uefi-sct-profiles:
@@ -532,90 +500,63 @@ jobs:
           - hii-string
           - variables
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
-
       - name: Install Rust toolchains
-        uses: dtolnay/rust-toolchain@nightly
-        with:
-          components: rust-src, llvm-tools-preview
-          targets: x86_64-unknown-none
-
-      - name: Install stable toolchain for xtask
-        uses: dtolnay/rust-toolchain@stable
-
+        uses: ./.github/actions/setup-rust
       - name: Install test dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y qemu-system-x86 mtools dosfstools zstd coreboot-utils
-
       - name: Download CrabEFI ELF
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: crabefi-elf
           path: target/x86_64-unknown-none/release/
-
       - name: Download SCT assets
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: sct-assets-x86_64
           path: sct-assets/x86_64/
-
       - name: Run selected SCT cases under TCG
         run: >-
-          ./crabefi test --app uefi-sct-smoke
-          --sct-assets-dir sct-assets/x86_64
-          --sct-sequence ci/sct/${{ matrix.profile }}.seq
-          --sct-report-dir target/sct-reports/${{ matrix.profile }}
-          --disable-kvm --timeout 900
-
+          ./crabefi test --app uefi-sct-smoke --sct-assets-dir sct-assets/x86_64 --sct-sequence ci/sct/${{ matrix.profile }}.seq --sct-report-dir target/sct-reports/${{ matrix.profile }} --disable-kvm --timeout 900
       - name: Upload SCT evidence
         if: always()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: sct-${{ matrix.profile }}-reports
           path: target/sct-reports/${{ matrix.profile }}/
           retention-days: 14
           if-no-files-found: warn
-
   # ── Optional Windows Boot Manager smoke test ─────────────────────────────
   # Opt-in trusted pushes only. WinPE media comes from authenticated private
   # storage, never an Actions cache or artifact (base caches are readable by
   # fork PRs even when the job that populated them is not run for PRs).
-
   test-windows-boot-smoke:
     name: Test x86_64 (Windows boot smoke)
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     needs: [build]
     if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master') && vars.ENABLE_WINDOWS_SMOKE == 'true'
     env:
       WINDOWS_SMOKE_SUCCESS_MARKER: ${{ vars.WINDOWS_SMOKE_SUCCESS_MARKER || 'CRABEFI_WINDOWS_BOOT_SMOKE_SUCCESS' }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
-
       - name: Install Rust toolchains
-        uses: dtolnay/rust-toolchain@nightly
-        with:
-          components: rust-src, llvm-tools-preview
-          targets: x86_64-unknown-none
-
-      - name: Install stable toolchain for xtask
-        uses: dtolnay/rust-toolchain@stable
-
+        uses: ./.github/actions/setup-rust
       - name: Install test dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y qemu-system-x86 mtools dosfstools zstd coreboot-utils
-
       - name: Download CrabEFI ELF
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: crabefi-elf
           path: target/x86_64-unknown-none/release/
-
       - name: Fetch private WinPE smoke media
         env:
           MEDIA_URL: ${{ secrets.WINDOWS_SMOKE_MEDIA_URL }}
@@ -632,7 +573,6 @@ jobs:
           mkdir -p "$RUNNER_TEMP/winpe-media"
           tar --extract --gzip --file "$RUNNER_TEMP/winpe-media.tar.gz" \
             --directory "$RUNNER_TEMP/winpe-media" --no-same-owner --no-same-permissions
-
       - name: Run Windows Boot Manager smoke test
         run: |
           ./crabefi test --app windows-boot-smoke \
@@ -641,430 +581,317 @@ jobs:
             --nvme \
             --disable-kvm \
             --timeout 900
-
       - name: Remove private media
         if: always()
         run: rm -rf "$RUNNER_TEMP/winpe-media" "$RUNNER_TEMP/winpe-media.tar.gz"
-
   # ── GRUB + Linux boot-chain ─────────────────────────────────────────
-
   build-boot-assets-x86_64:
     name: Build Boot Assets x86_64 (GRUB + Linux)
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
-
       - name: Restore cached boot assets
         id: cache
-        uses: actions/cache@v6
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: boot-assets/x86_64
           key: boot-assets-x86_64-${{ hashFiles('ci/build-boot-assets.sh') }}
-
       - name: Set up Go (for u-root)
         if: steps.cache.outputs.cache-hit != 'true'
-        uses: actions/setup-go@v7
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
         with:
           go-version: "stable"
-
       - name: Install kernel build dependencies
         if: steps.cache.outputs.cache-hit != 'true'
         run: |
           sudo apt-get update
           sudo apt-get install -y build-essential bc flex bison libelf-dev \
               curl xz-utils grub-common grub-efi-amd64-bin
-
       - name: Build boot assets
         if: steps.cache.outputs.cache-hit != 'true'
         run: ci/build-boot-assets.sh --arch x86_64
-
       - name: Upload boot assets
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: boot-assets-x86_64
           path: boot-assets/x86_64/
           retention-days: 7
-
   build-boot-assets-aarch64:
     name: Build Boot Assets aarch64 (GRUB + Linux)
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
-
       - name: Restore cached boot assets
         id: cache
-        uses: actions/cache@v6
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: boot-assets/aarch64
           key: boot-assets-aarch64-${{ hashFiles('ci/build-boot-assets.sh') }}
-
       - name: Set up Go (for u-root)
         if: steps.cache.outputs.cache-hit != 'true'
-        uses: actions/setup-go@v7
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
         with:
           go-version: "stable"
-
       - name: Install kernel build dependencies
         if: steps.cache.outputs.cache-hit != 'true'
         run: |
           sudo apt-get update
           sudo apt-get install -y build-essential bc flex bison libelf-dev \
               curl xz-utils grub-common gcc-aarch64-linux-gnu
-
       - name: Build boot assets
         if: steps.cache.outputs.cache-hit != 'true'
         run: ci/build-boot-assets.sh --arch aarch64
-
       - name: Upload boot assets
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: boot-assets-aarch64
           path: boot-assets/aarch64/
           retention-days: 7
-
   test-grub-linux:
     name: Test x86_64 (GRUB + Linux)
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     needs: [build, build-boot-assets-x86_64]
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
-
       - name: Install Rust toolchains
-        uses: dtolnay/rust-toolchain@nightly
-        with:
-          components: rust-src, llvm-tools-preview
-          targets: x86_64-unknown-none
-
-      - name: Install stable toolchain for xtask
-        uses: dtolnay/rust-toolchain@stable
-
+        uses: ./.github/actions/setup-rust
       - name: Install test dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y qemu-system-x86 mtools dosfstools zstd coreboot-utils
-
       - name: Download CrabEFI ELF
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: crabefi-elf
           path: target/x86_64-unknown-none/release/
-
       - name: Download boot assets
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: boot-assets-x86_64
           path: boot-assets/x86_64/
-
       - name: Run GRUB + Linux boot-chain test
         run: ./crabefi test --app grub-linux --boot-assets-dir boot-assets/x86_64 --disable-kvm --timeout 180
-
   test-grub-linux-aarch64:
     name: Test aarch64/sbsa (GRUB + Linux)
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     needs: [build-aarch64, build-boot-assets-aarch64]
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
-
       - name: Install Rust toolchains
-        uses: dtolnay/rust-toolchain@nightly
-        with:
-          components: rust-src, llvm-tools-preview
-          targets: aarch64-unknown-none
-
-      - name: Install stable toolchain for xtask
-        uses: dtolnay/rust-toolchain@stable
-
+        uses: ./.github/actions/setup-rust
       - name: Install test dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y qemu-system-arm mtools dosfstools zstd coreboot-utils
-
       - name: Download CrabEFI ELF (aarch64)
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: crabefi-elf-aarch64
           path: target/aarch64-unknown-none/release/
-
       - name: Download boot assets
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: boot-assets-aarch64
           path: boot-assets/aarch64/
-
       - name: Run GRUB + Linux boot-chain test (aarch64/sbsa)
         run: ./crabefi test --arch aarch64 --machine sbsa --app grub-linux --boot-assets-dir boot-assets/aarch64 --nvme --disable-kvm --timeout 180
-
   # ── aarch64 ───────────────────────────────────────────────────────────
-
   clippy-aarch64:
     name: Clippy (aarch64)
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
-
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@nightly
-        with:
-          components: clippy, rust-src, llvm-tools-preview
-          targets: aarch64-unknown-none
-
-      - name: Install stable toolchain for xtask
-        uses: dtolnay/rust-toolchain@stable
-
+        uses: ./.github/actions/setup-rust
       - name: Run clippy
         run: |
           ./crabefi build --arch aarch64 --machine sbsa
           RUNTIME_IMAGE_PATH="$PWD/target/runtime/aarch64/runtime.img" \
           RUNTIME_IMAGE_SHA256="$(tr -d '\n' < target/runtime/aarch64/sha256)" \
-          cargo +nightly -Z build-std=core,compiler_builtins,alloc \
+          cargo -Z build-std=core,compiler_builtins,alloc \
             -Z build-std-features=compiler-builtins-mem \
             clippy --workspace --release --target aarch64-unknown-none -- -D warnings
           cd "$GITHUB_WORKSPACE/crabefi-runtime-image"
-          cargo +nightly -Z build-std=core,compiler_builtins,alloc \
+          cargo -Z build-std=core,compiler_builtins,alloc \
             -Z build-std-features=compiler-builtins-mem \
             clippy --release --target aarch64-unknown-none -- -D warnings
-
   build-aarch64:
     name: Build (aarch64)
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
-
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@nightly
-        with:
-          components: rust-src, llvm-tools-preview
-          targets: aarch64-unknown-none
-
-      - name: Install stable toolchain for xtask
-        uses: dtolnay/rust-toolchain@stable
-
+        uses: ./.github/actions/setup-rust
       - name: Build release
         run: ./crabefi build --arch aarch64 --machine sbsa
-
       - name: Build Cargo-only library consumer
         run: |
-          cargo +nightly -Z build-std=core,compiler_builtins,alloc \
+          cargo -Z build-std=core,compiler_builtins,alloc \
             -Z build-std-features=compiler-builtins-mem \
             build --release \
             --manifest-path ci/fixtures/library-consumer/Cargo.toml \
             --target aarch64-unknown-none
-
       - name: Upload CrabEFI ELF (aarch64)
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: crabefi-elf-aarch64
           path: |
             target/aarch64-unknown-none/release/crabefi
             target/runtime/aarch64/
           retention-days: 7
-
   # aarch64 SBSA Integration tests with QEMU
   test-nvme-aarch64:
     name: Test aarch64/sbsa (NVMe Storage)
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     needs: build-aarch64
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
-
       - name: Install Rust toolchains
-        uses: dtolnay/rust-toolchain@nightly
-        with:
-          components: rust-src, llvm-tools-preview
-          targets: aarch64-unknown-none, aarch64-unknown-uefi
-
-      - name: Install stable toolchain for xtask
-        uses: dtolnay/rust-toolchain@stable
-
+        uses: ./.github/actions/setup-rust
       - name: Install test dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y qemu-system-arm mtools dosfstools zstd coreboot-utils
-
       - name: Download CrabEFI ELF (aarch64)
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: crabefi-elf-aarch64
           path: target/aarch64-unknown-none/release/
-
       - name: Run integration tests (NVMe, aarch64/sbsa)
         run: ./crabefi test --arch aarch64 --machine sbsa --app hello --nvme --disable-kvm --timeout 120
-
   test-rng-aarch64:
     name: Test aarch64/sbsa (RNG Protocol)
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     needs: build-aarch64
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
-
       - name: Install Rust toolchains
-        uses: dtolnay/rust-toolchain@nightly
-        with:
-          components: rust-src, llvm-tools-preview
-          targets: aarch64-unknown-none, aarch64-unknown-uefi
-
-      - name: Install stable toolchain for xtask
-        uses: dtolnay/rust-toolchain@stable
-
+        uses: ./.github/actions/setup-rust
       - name: Install test dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y qemu-system-arm mtools dosfstools zstd coreboot-utils
-
       - name: Download CrabEFI ELF (aarch64)
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: crabefi-elf-aarch64
           path: target/aarch64-unknown-none/release/
-
       - name: Run RNG protocol tests (aarch64/sbsa)
         run: ./crabefi test --arch aarch64 --machine sbsa --app rng-test --nvme --disable-kvm --timeout 120
-
   # ── aarch64 virt (FDT) ────────────────────────────────────────────────
-
   build-aarch64-virt:
     name: Build (aarch64/virt)
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
-
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@nightly
-        with:
-          components: rust-src, llvm-tools-preview
-          targets: aarch64-unknown-none
-
-      - name: Install stable toolchain for xtask
-        uses: dtolnay/rust-toolchain@stable
-
+        uses: ./.github/actions/setup-rust
       - name: Build release (virt PAYLOAD_BASE)
         run: ./crabefi build --arch aarch64 --machine virt
-
       - name: Upload CrabEFI ELF (aarch64-virt)
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: crabefi-elf-aarch64-virt
           path: |
             target/aarch64-unknown-none/release/crabefi
             target/runtime/aarch64/
           retention-days: 7
-
   test-nvme-aarch64-virt:
     name: Test aarch64/virt (NVMe Storage)
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     needs: build-aarch64-virt
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
-
       - name: Install Rust toolchains
-        uses: dtolnay/rust-toolchain@nightly
-        with:
-          components: rust-src, llvm-tools-preview
-          targets: aarch64-unknown-none, aarch64-unknown-uefi
-
-      - name: Install stable toolchain for xtask
-        uses: dtolnay/rust-toolchain@stable
-
+        uses: ./.github/actions/setup-rust
       - name: Install test dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y qemu-system-arm mtools dosfstools zstd coreboot-utils
-
       - name: Download CrabEFI ELF (aarch64-virt)
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: crabefi-elf-aarch64-virt
           path: target/aarch64-unknown-none/release/
-
       - name: Run integration tests (NVMe, aarch64/virt)
         run: ./crabefi test --arch aarch64 --machine virt --app hello --nvme --disable-kvm --timeout 120
-
   # ── riscv64 ──────────────────────────────────────────────────────────
-
   clippy-riscv64:
     name: Clippy (riscv64)
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
-
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@nightly
-        with:
-          components: clippy, rust-src, llvm-tools-preview
-          targets: riscv64gc-unknown-none-elf
-
-      - name: Install stable toolchain for xtask
-        uses: dtolnay/rust-toolchain@stable
-
+        uses: ./.github/actions/setup-rust
       - name: Run clippy
         run: |
           ./crabefi build --arch riscv64
           RUNTIME_IMAGE_PATH="$PWD/target/runtime/riscv64/runtime.img" \
           RUNTIME_IMAGE_SHA256="$(tr -d '\n' < target/runtime/riscv64/sha256)" \
-          cargo +nightly -Z build-std=core,compiler_builtins,alloc \
+          cargo -Z build-std=core,compiler_builtins,alloc \
             -Z build-std-features=compiler-builtins-mem \
             clippy --workspace --release --target riscv64gc-unknown-none-elf -- -D warnings
           cd "$GITHUB_WORKSPACE/crabefi-runtime-image"
-          cargo +nightly -Z build-std=core,compiler_builtins,alloc \
+          cargo -Z build-std=core,compiler_builtins,alloc \
             -Z build-std-features=compiler-builtins-mem \
             clippy --release --target riscv64gc-unknown-none-elf -- -D warnings
-
   build-riscv64:
     name: Build (riscv64)
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
-
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@nightly
-        with:
-          components: rust-src, llvm-tools-preview
-          targets: riscv64gc-unknown-none-elf
-
-      - name: Install stable toolchain for xtask
-        uses: dtolnay/rust-toolchain@stable
-
+        uses: ./.github/actions/setup-rust
       - name: Build release
         run: ./crabefi build --arch riscv64
-
       - name: Build Cargo-only library consumer
         run: |
-          cargo +nightly -Z build-std=core,compiler_builtins,alloc \
+          cargo -Z build-std=core,compiler_builtins,alloc \
             -Z build-std-features=compiler-builtins-mem \
             build --release \
             --manifest-path ci/fixtures/library-consumer/Cargo.toml \
             --target riscv64gc-unknown-none-elf
-
       - name: Show ELF info
         run: |
           ELF=target/riscv64gc-unknown-none-elf/release/crabefi
           file "$ELF"
           size "$ELF"
-
       - name: ELF to PE/COFF conversion (experimental)
         continue-on-error: true
         run: |
@@ -1090,124 +917,97 @@ jobs:
           else
             echo "::warning::llvm-objcopy not found, skipping PE/COFF conversion"
           fi
-
       - name: Upload CrabEFI ELF (riscv64)
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: crabefi-elf-riscv64
           path: |
             target/riscv64gc-unknown-none-elf/release/crabefi
             target/runtime/riscv64/
           retention-days: 7
-
   # riscv64 boot test with QEMU
   # No UEFI test apps (no riscv64gc-unknown-uefi target) — verifies CrabEFI
   # boots and initializes on coreboot + OpenSBI + QEMU virt.
   test-boot-riscv64:
     name: Test riscv64 (Boot)
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     needs: build-riscv64
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
-
       - name: Install Rust toolchains
-        uses: dtolnay/rust-toolchain@nightly
-        with:
-          components: rust-src, llvm-tools-preview
-          targets: riscv64gc-unknown-none-elf
-
-      - name: Install stable toolchain for xtask
-        uses: dtolnay/rust-toolchain@stable
-
+        uses: ./.github/actions/setup-rust
       - name: Install test dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y qemu-system-misc mtools dosfstools zstd coreboot-utils binutils-riscv64-linux-gnu
-
       - name: Download CrabEFI ELF (riscv64)
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: crabefi-elf-riscv64
           path: target/riscv64gc-unknown-none-elf/release/
-
       - name: Run integration test (riscv64/virt)
         run: ./crabefi test --arch riscv64 --app hello --disable-kvm --timeout 120
-
   build-boot-assets-riscv64:
     name: Build Boot Assets riscv64 (GRUB + Linux)
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
-
       - name: Restore cached boot assets
         id: cache
-        uses: actions/cache@v6
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: boot-assets/riscv64
           key: boot-assets-riscv64-${{ hashFiles('ci/build-boot-assets.sh') }}
-
       - name: Set up Go (for u-root)
         if: steps.cache.outputs.cache-hit != 'true'
-        uses: actions/setup-go@v7
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
         with:
           go-version: "stable"
-
       - name: Install kernel build dependencies
         if: steps.cache.outputs.cache-hit != 'true'
         run: |
           sudo apt-get update
           sudo apt-get install -y build-essential bc flex bison libelf-dev \
               curl xz-utils grub-common gcc-riscv64-linux-gnu
-
       - name: Build boot assets
         if: steps.cache.outputs.cache-hit != 'true'
         run: ci/build-boot-assets.sh --arch riscv64
-
       - name: Upload boot assets
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: boot-assets-riscv64
           path: boot-assets/riscv64/
           retention-days: 7
-
   test-grub-linux-riscv64:
     name: Test riscv64 (GRUB + Linux)
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     needs: [build-riscv64, build-boot-assets-riscv64]
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
-
       - name: Install Rust toolchains
-        uses: dtolnay/rust-toolchain@nightly
-        with:
-          components: rust-src, llvm-tools-preview
-          targets: riscv64gc-unknown-none-elf
-
-      - name: Install stable toolchain for xtask
-        uses: dtolnay/rust-toolchain@stable
-
+        uses: ./.github/actions/setup-rust
       - name: Install test dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y qemu-system-misc mtools dosfstools zstd coreboot-utils binutils-riscv64-linux-gnu
-
       - name: Download CrabEFI ELF (riscv64)
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: crabefi-elf-riscv64
           path: target/riscv64gc-unknown-none-elf/release/
-
       - name: Download boot assets
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: boot-assets-riscv64
           path: boot-assets/riscv64/
-
       - name: Run GRUB + Linux boot-chain test (riscv64/virt)
         run: ./crabefi test --arch riscv64 --app grub-linux --boot-assets-dir boot-assets/riscv64 --disable-kvm --timeout 180

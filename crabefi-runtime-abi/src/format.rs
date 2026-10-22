@@ -5,7 +5,15 @@ use core::fmt;
 use crate::exports::{EXPORT_COUNT, ExportOffsets};
 
 pub const MAGIC: [u8; 8] = *b"CRABRTI\0";
-pub const HEADER_SIZE: usize = 40;
+pub const HEADER_SIZE: usize = 48;
+/// Version of the boot<->runtime wire ABI: the normalized image format in
+/// this module and [`crate::handoff::RuntimeHandoff`].
+///
+/// Bump on any incompatible layout change. Both sides stamp and check it
+/// so a stale bundled runtime image (or a newer boot image) is rejected
+/// with a clear error instead of silently misinterpreting the other
+/// side's bytes. Pre-versioning images read as version 0 and are rejected.
+pub const ABI_VERSION: u32 = 1;
 pub const SECTION_SIZE: usize = 32;
 pub const RELOCATION_SIZE: usize = 24;
 /// Byte size of the export table: one image-relative `u32` per export.
@@ -50,6 +58,7 @@ pub mod relocation_kind {
 pub enum AbiError {
     Truncated,
     BadMagic,
+    UnsupportedVersion,
     BadArchitecture,
     BadAlignment,
     UnknownFeatures,
@@ -84,6 +93,8 @@ impl fmt::Display for AbiError {
 /// | 24     | relocation_count `u32`  |
 /// | 28     | exports_offset `u32`    |
 /// | 32     | feature_bits `u64`      |
+/// | 40     | abi_version `u32`       |
+/// | 44     | reserved `u32` (zero)   |
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RuntimeImageHeader {
     pub architecture: u16,
@@ -94,6 +105,7 @@ pub struct RuntimeImageHeader {
     pub relocation_count: u32,
     pub exports_offset: u32,
     pub feature_bits: u64,
+    pub abi_version: u32,
 }
 
 impl RuntimeImageHeader {
@@ -109,6 +121,7 @@ impl RuntimeImageHeader {
         bytes[24..28].copy_from_slice(&self.relocation_count.to_le_bytes());
         bytes[28..32].copy_from_slice(&self.exports_offset.to_le_bytes());
         bytes[32..40].copy_from_slice(&self.feature_bits.to_le_bytes());
+        bytes[40..44].copy_from_slice(&self.abi_version.to_le_bytes());
         bytes
     }
 }
@@ -189,9 +202,13 @@ impl<'a> ValidatedImage<'a> {
             relocation_count: read_u32(bytes, 24)?,
             exports_offset: read_u32(bytes, 28)?,
             feature_bits: read_u64(bytes, 32)?,
+            abi_version: read_u32(bytes, 40)?,
         };
         if header.architecture != architecture {
             return Err(AbiError::BadArchitecture);
+        }
+        if header.abi_version != ABI_VERSION {
+            return Err(AbiError::UnsupportedVersion);
         }
         if header.image_size == 0 {
             return Err(AbiError::ImageRange);
@@ -407,4 +424,47 @@ fn read_u64(bytes: &[u8], offset: usize) -> Result<u64, AbiError> {
         .try_into()
         .map_err(|_| AbiError::Truncated)?;
     Ok(u64::from_le_bytes(raw))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn header_bytes(abi_version: u32) -> [u8; HEADER_SIZE] {
+        RuntimeImageHeader {
+            architecture: architecture::X86_64,
+            section_count: 1,
+            image_size: 0,
+            section_offset: HEADER_SIZE as u32,
+            relocation_offset: 0,
+            relocation_count: 0,
+            exports_offset: 0,
+            feature_bits: feature_bits::REQUIRED,
+            abi_version,
+        }
+        .to_bytes()
+    }
+
+    #[test]
+    fn parse_rejects_foreign_abi_version() {
+        assert_eq!(
+            u32::from_le_bytes(header_bytes(ABI_VERSION)[40..44].try_into().unwrap()),
+            ABI_VERSION
+        );
+        // Version 0 is what a pre-versioning image carries in these bytes.
+        assert_eq!(
+            ValidatedImage::parse(&header_bytes(0), architecture::X86_64).err(),
+            Some(AbiError::UnsupportedVersion)
+        );
+        assert_eq!(
+            ValidatedImage::parse(&header_bytes(ABI_VERSION + 1), architecture::X86_64).err(),
+            Some(AbiError::UnsupportedVersion)
+        );
+        // The current version passes the gate and fails later validation
+        // (image_size is zero in this fixture).
+        assert_eq!(
+            ValidatedImage::parse(&header_bytes(ABI_VERSION), architecture::X86_64).err(),
+            Some(AbiError::ImageRange)
+        );
+    }
 }

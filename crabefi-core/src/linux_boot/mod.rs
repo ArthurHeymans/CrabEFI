@@ -409,6 +409,10 @@ pub fn load_linux_from_disk(
         return Err(LinuxBootError::FileRead);
     }
 
+    // The kernel text was just written by DMA/copy; make it visible to
+    // instruction fetch before any jump to the entry point.
+    crate::arch::sync_instruction_cache(DEFAULT_KERNEL_ADDR, pm_kernel_size);
+
     log::info!(
         "Kernel loaded directly to {:#x} ({} bytes via DMA)",
         DEFAULT_KERNEL_ADDR,

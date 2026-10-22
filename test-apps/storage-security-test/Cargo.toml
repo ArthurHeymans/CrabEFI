@@ -6,6 +6,11 @@ description = "Test EFI application for Storage Security and Pass-Through protoc
 
 [workspace]
 
+[features]
+# Active security/TCG transfers need capable hardware and an associated Block I/O media ID.
+# Default CI validates the EFI interface and pass-through enumeration without those prerequisites.
+hardware-security-probes = []
+
 [dependencies]
 r-efi = "5.3"
 

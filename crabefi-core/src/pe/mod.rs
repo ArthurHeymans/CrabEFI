@@ -11,6 +11,7 @@
 //! - Integer overflows in size calculations
 
 use crate::efi::allocator::{self, AllocateType, MemoryType, PAGE_SIZE};
+use alloc::vec::Vec;
 use object::read::pe::{
     ImageNtHeaders, ImageOptionalHeader as _, PeFile, PeFile32, PeFile64, optional_header_magic,
 };
@@ -431,6 +432,94 @@ pub struct LoadedImage {
 ///
 /// # Security
 /// All header fields are validated before use to prevent out-of-bounds access.
+/// One validated section copy: `len` bytes from file offset `src` to
+/// image offset `dst`.
+#[derive(Debug, PartialEq, Eq)]
+struct SectionCopy {
+    src: usize,
+    dst: usize,
+    len: usize,
+}
+
+/// Validate every section header and plan the copies [`load_image`]
+/// performs, without touching memory.
+///
+/// Strict on purpose: a section whose raw data leaves the file, whose
+/// virtual span leaves the image, or whose destination overlaps an
+/// earlier section rejects the whole image. Loading a partially copied
+/// image instead would execute bytes in a form the Authenticode hash
+/// never covered.
+fn plan_section_copies(
+    section_data: &[u8],
+    file_len: usize,
+    image_size: usize,
+) -> Result<Vec<SectionCopy>, Status> {
+    let mut copies: Vec<SectionCopy> = Vec::new();
+    for (i, chunk) in section_data
+        .as_chunks::<{ core::mem::size_of::<SectionHeader>() }>()
+        .0
+        .iter()
+        .enumerate()
+    {
+        let (section, _) =
+            SectionHeader::ref_from_prefix(chunk).map_err(|_| Status::INVALID_PARAMETER)?;
+        let raw_ptr = section.pointer_to_raw_data as usize;
+        let raw_size = section.size_of_raw_data as usize;
+        // A zero VirtualSize means the raw size is the in-memory size.
+        let virt_size = if section.virtual_size == 0 {
+            raw_size
+        } else {
+            section.virtual_size as usize
+        };
+        let virt_addr = section.virtual_address as usize;
+
+        // The section's whole in-memory span (copied bytes plus zero fill)
+        // must lie inside the loaded image.
+        let virt_end = virt_addr
+            .checked_add(virt_size)
+            .ok_or(Status::INVALID_PARAMETER)?;
+        if virt_end > image_size {
+            log::error!(
+                "PE: Section {i} virtual span {virt_addr:#x}..{virt_end:#x} exceeds image size {image_size:#x}"
+            );
+            return Err(Status::INVALID_PARAMETER);
+        }
+        if raw_size == 0 {
+            continue; // BSS: covered by the zero-filled image allocation.
+        }
+        if raw_ptr == 0 {
+            log::error!("PE: Section {i} has raw data but no file offset");
+            return Err(Status::INVALID_PARAMETER);
+        }
+        let src_end = raw_ptr
+            .checked_add(raw_size)
+            .ok_or(Status::INVALID_PARAMETER)?;
+        if src_end > file_len {
+            log::error!(
+                "PE: Section {i} raw data {raw_ptr:#x}..{src_end:#x} extends beyond file ({file_len:#x} bytes)"
+            );
+            return Err(Status::INVALID_PARAMETER);
+        }
+        let len = raw_size.min(virt_size);
+        if len == 0 {
+            continue;
+        }
+        if copies
+            .iter()
+            .any(|planned| virt_addr < planned.dst + planned.len && planned.dst < virt_addr + len)
+        {
+            log::error!("PE: Section {i} overlaps an earlier section in memory");
+            return Err(Status::INVALID_PARAMETER);
+        }
+        copies.push(SectionCopy {
+            src: raw_ptr,
+            dst: virt_addr,
+            len,
+        });
+    }
+    Ok(copies)
+}
+
 pub fn load_image(data: &[u8]) -> Result<LoadedImage, Status> {
     // Parse DOS header using zerocopy
     let dos_header = match DosHeader::ref_from_prefix(data) {
@@ -590,6 +679,11 @@ pub fn load_image(data: &[u8]) -> Result<LoadedImage, Status> {
         return Err(Status::INVALID_PARAMETER);
     }
 
+    // Validate all sections and plan the copies before allocating, so a
+    // malformed section table cannot produce a partially loaded image.
+    let section_data = &data[sections_offset..sections_end];
+    let section_copies = plan_section_copies(section_data, data.len(), image_size as usize)?;
+
     // Allocate memory for the image, respecting section alignment.
     // ARM64 PE images (e.g. Linux) typically require 64k alignment
     // (section_alignment = 0x10000).  Over-allocate so we can align
@@ -649,75 +743,14 @@ pub fn load_image(data: &[u8]) -> Result<LoadedImage, Status> {
         );
     }
 
-    // Parse section headers using zerocopy
-    // We iterate and parse each section header individually
-    const SECTION_HEADER_SIZE: usize = core::mem::size_of::<SectionHeader>();
-    let section_data = &data[sections_offset..sections_end];
-
-    // Copy sections with full bounds validation
-    for (i, chunk) in section_data
-        .as_chunks::<SECTION_HEADER_SIZE>()
-        .0
-        .iter()
-        .take(num_sections as usize)
-        .enumerate()
-    {
-        let section = match SectionHeader::ref_from_prefix(&chunk[..]) {
-            Ok((s, _)) => s,
-            Err(_) => break,
-        };
-        let virt_addr = section.virtual_address;
-        let virt_size = section.virtual_size;
-        let raw_data_ptr = section.pointer_to_raw_data;
-        let raw_data_size = section.size_of_raw_data;
-
-        if raw_data_size == 0 || raw_data_ptr == 0 {
-            continue;
-        }
-
-        let copy_size = raw_data_size.min(virt_size) as usize;
-
-        // Validate source bounds
-        let src_start = raw_data_ptr as usize;
-        let src_end = src_start.checked_add(copy_size).ok_or_else(|| {
-            log::error!("PE: Section {} source offset overflow", i);
-            Status::INVALID_PARAMETER
-        })?;
-        if src_end > data.len() {
-            log::error!(
-                "PE: Section {} raw data extends beyond file (ptr={}, size={}, file_len={})",
-                i,
-                raw_data_ptr,
-                copy_size,
-                data.len()
-            );
-            continue; // Skip this section rather than fail entirely
-        }
-
-        // Validate destination bounds
-        let dst_start = virt_addr as usize;
-        let dst_end = dst_start.checked_add(copy_size).ok_or_else(|| {
-            log::error!("PE: Section {} destination offset overflow", i);
-            Status::INVALID_PARAMETER
-        })?;
-        if dst_end > image_size as usize {
-            log::error!(
-                "PE: Section {} extends beyond image (vaddr={}, size={}, image_size={})",
-                i,
-                virt_addr,
-                copy_size,
-                image_size
-            );
-            // Free allocated memory and return error
-            let _ = allocator::free_pages(alloc_base, num_pages);
-            return Err(Status::INVALID_PARAMETER);
-        }
-
-        // Safety: We validated both source and destination bounds
+    // Copy the sections planned above.
+    for copy in &section_copies {
+        // SAFETY: plan_section_copies validated src within `data` and dst
+        // within image_size at load_addr, with no overlapping destinations.
         unsafe {
-            let src = data.as_ptr().add(src_start);
-            let dst = (load_addr as *mut u8).add(dst_start);
-            core::ptr::copy_nonoverlapping(src, dst, copy_size);
+            let src = data.as_ptr().add(copy.src);
+            let dst = (load_addr as *mut u8).add(copy.dst);
+            core::ptr::copy_nonoverlapping(src, dst, copy.len);
         }
     }
 
@@ -790,6 +823,11 @@ pub fn load_image(data: &[u8]) -> Result<LoadedImage, Status> {
             return Err(status);
         }
     }
+
+    // All stores to the image are complete (headers, sections,
+    // relocations); make them visible to instruction fetch before the
+    // image can be started.
+    crate::arch::sync_instruction_cache(load_addr, image_size as usize);
 
     log::info!(
         "PE: Loaded image at {:#x}, entry point at {:#x}",
@@ -1002,6 +1040,81 @@ mod tests {
         put_u32(&mut data, section + 16, 0x20);
         put_u32(&mut data, section + 20, 0x180);
         data
+    }
+
+    /// Build section-header bytes from (virtual_size, virtual_address,
+    /// size_of_raw_data, pointer_to_raw_data) tuples.
+    fn section_bytes(sections: &[(u32, u32, u32, u32)]) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.resize(sections.len() * core::mem::size_of::<SectionHeader>(), 0);
+        for (chunk, &(virt_size, virt_addr, raw_size, raw_ptr)) in bytes
+            .as_chunks_mut::<{ core::mem::size_of::<SectionHeader>() }>()
+            .0
+            .iter_mut()
+            .zip(sections)
+        {
+            put_u32(chunk, 8, virt_size);
+            put_u32(chunk, 12, virt_addr);
+            put_u32(chunk, 16, raw_size);
+            put_u32(chunk, 20, raw_ptr);
+        }
+        bytes
+    }
+
+    #[test]
+    fn section_plan_copies_well_formed_sections() {
+        // (virt_size, virt_addr, raw_size, raw_ptr)
+        let sections = section_bytes(&[
+            (0x200, 0x1000, 0x180, 0x200),
+            (0x100, 0x2000, 0x300, 0x400), // raw larger than virtual: copy clamps
+            (0x0, 0x3000, 0x40, 0x700),    // zero VirtualSize: raw size rules
+            (0x800, 0x4000, 0x0, 0x0),     // BSS: nothing to copy
+        ]);
+        assert_eq!(
+            plan_section_copies(&sections, 0x800, 0x5000).unwrap(),
+            [
+                SectionCopy {
+                    src: 0x200,
+                    dst: 0x1000,
+                    len: 0x180,
+                },
+                SectionCopy {
+                    src: 0x400,
+                    dst: 0x2000,
+                    len: 0x100,
+                },
+                SectionCopy {
+                    src: 0x700,
+                    dst: 0x3000,
+                    len: 0x40,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn section_plan_rejects_malformed_sections() {
+        // Raw data extends beyond the file (previously skipped silently,
+        // executing a partially copied image).
+        let sections = section_bytes(&[(0x200, 0x1000, 0x180, 0x700)]);
+        assert!(plan_section_copies(&sections, 0x800, 0x5000).is_err());
+
+        // Virtual span (including zero fill) extends beyond the image.
+        let sections = section_bytes(&[(0x2000, 0x4000, 0x10, 0x200)]);
+        assert!(plan_section_copies(&sections, 0x800, 0x5000).is_err());
+
+        // Pure BSS beyond the image.
+        let sections = section_bytes(&[(0x2000, 0x4000, 0x0, 0x0)]);
+        assert!(plan_section_copies(&sections, 0x800, 0x5000).is_err());
+
+        // Raw data claimed at file offset zero.
+        let sections = section_bytes(&[(0x200, 0x1000, 0x180, 0x0)]);
+        assert!(plan_section_copies(&sections, 0x800, 0x5000).is_err());
+
+        // Two sections copied over each other.
+        let sections =
+            section_bytes(&[(0x200, 0x1000, 0x180, 0x200), (0x200, 0x1100, 0x80, 0x380)]);
+        assert!(plan_section_copies(&sections, 0x800, 0x5000).is_err());
     }
 
     #[test]

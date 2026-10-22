@@ -36,14 +36,14 @@ fn main() {
         // Define the symbol before the linker script evaluates its PROVIDE fallback.
         println!("cargo:rerun-if-env-changed=PAYLOAD_BASE");
         let payload_base = std::env::var("PAYLOAD_BASE").unwrap_or_else(|_| "0x100000".to_string());
-        println!("cargo:rustc-link-arg=--defsym=__payload_base={payload_base}");
-        println!("cargo:rustc-link-arg=-T{}", ld.display());
-        println!("cargo:rustc-link-arg=-no-pie");
+        println!("cargo:rustc-link-arg-bin=crabefi=--defsym=__payload_base={payload_base}");
+        println!("cargo:rustc-link-arg-bin=crabefi=-T{}", ld.display());
+        println!("cargo:rustc-link-arg-bin=crabefi=-no-pie");
     } else if target.starts_with("aarch64") {
         let ld = manifest_path.join("aarch64-coreboot.ld");
         println!("cargo:rerun-if-changed={}", ld.display());
-        println!("cargo:rustc-link-arg=-T{}", ld.display());
-        println!("cargo:rustc-link-arg=-no-pie");
+        println!("cargo:rustc-link-arg-bin=crabefi=-T{}", ld.display());
+        println!("cargo:rustc-link-arg-bin=crabefi=-no-pie");
 
         // Allow overriding the aarch64 payload base address at build time.
         // Default is for QEMU SBSA (DRAM starts at 0x100_0000_0000).
@@ -51,19 +51,19 @@ fn main() {
         println!("cargo:rerun-if-env-changed=PAYLOAD_BASE");
         let payload_base =
             std::env::var("PAYLOAD_BASE").unwrap_or_else(|_| "0x10022000000".to_string());
-        println!("cargo:rustc-link-arg=--defsym=PAYLOAD_BASE={payload_base}");
+        println!("cargo:rustc-link-arg-bin=crabefi=--defsym=PAYLOAD_BASE={payload_base}");
     } else if target.starts_with("riscv64") {
         let ld = manifest_path.join("riscv64-coreboot.ld");
         println!("cargo:rerun-if-changed={}", ld.display());
-        println!("cargo:rustc-link-arg=-T{}", ld.display());
-        println!("cargo:rustc-link-arg=-no-pie");
+        println!("cargo:rustc-link-arg-bin=crabefi=-T{}", ld.display());
+        println!("cargo:rustc-link-arg-bin=crabefi=-no-pie");
 
         // Allow overriding the riscv64 payload base address at build time.
         // Default is for QEMU virt (DRAM at 0x80000000, payload at +16MB).
         println!("cargo:rerun-if-env-changed=PAYLOAD_BASE");
         let payload_base =
             std::env::var("PAYLOAD_BASE").unwrap_or_else(|_| "0x81000000".to_string());
-        println!("cargo:rustc-link-arg=--defsym=PAYLOAD_BASE={payload_base}");
+        println!("cargo:rustc-link-arg-bin=crabefi=--defsym=PAYLOAD_BASE={payload_base}");
     }
 }
 

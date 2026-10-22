@@ -1,0 +1,24 @@
+name: Setup pinned Rust
+description: Install the workspace toolchain, components, and targets
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      run: |
+        python3 - <<'PY'
+        import os
+        import subprocess
+        import tomllib
+        from pathlib import Path
+
+        pin = tomllib.loads(Path("rust-toolchain.toml").read_text())["toolchain"]
+        args = ["rustup", "toolchain", "install", pin["channel"],
+                "--profile", "minimal", "--no-self-update"]
+        for component in pin.get("components", []):
+            args.extend(["--component", component])
+        for target in pin.get("targets", []):
+            args.extend(["--target", target])
+        subprocess.run(args, check=True)
+        with open(os.environ["GITHUB_ENV"], "a") as env:
+            env.write(f"RUSTUP_TOOLCHAIN={pin['channel']}\n")
+        PY

@@ -1,0 +1,10 @@
+# cargo-audit configuration. Ignores must name the advisory and say why
+# the vulnerable code cannot be reached here.
+[advisories]
+ignore = [
+    # Marvin timing side-channel in the `rsa` crate. It is a
+    # dev-dependency of crabefi-runtime-image used only to *generate*
+    # test signatures on the host; the shipped verifier is crabefi-pkcs7
+    # and performs no RSA private-key operations.
+    "RUSTSEC-2023-0071",
+]

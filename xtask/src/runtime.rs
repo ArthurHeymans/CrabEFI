@@ -15,9 +15,9 @@ use sha2::{Digest, Sha256};
 
 use crabefi_runtime_abi::exports::{EXPORT_COUNT, ExportOffsets};
 use crabefi_runtime_abi::format::{
-    EFI_PAGE_SIZE, EXPORTS_SIZE, HEADER_SIZE, MAX_SECTIONS, RELOCATION_SIZE, RuntimeImageHeader,
-    SECTION_SIZE, ValidatedImage, architecture, relocation_kind as abi_relocation_kind,
-    section_flags as abi_section_flags,
+    ABI_VERSION, EFI_PAGE_SIZE, EXPORTS_SIZE, HEADER_SIZE, MAX_SECTIONS, RELOCATION_SIZE,
+    RuntimeImageHeader, SECTION_SIZE, ValidatedImage, architecture,
+    relocation_kind as abi_relocation_kind, section_flags as abi_section_flags,
 };
 
 use crate::{Arch, project_root};
@@ -109,9 +109,10 @@ fn build_with_capabilities(arch: Arch, secure_boot: bool) -> Result<RuntimeArtif
     let rustflags = runtime_rustflags(arch, &map_path);
     let parent = root.parent().context("project root has no parent")?;
     let mut command = Command::new("cargo");
+    let toolchain = format!("+{}", crate::pinned_toolchain()?);
     command
         .args([
-            "+nightly",
+            toolchain.as_str(),
             "-Z",
             "build-std=core,compiler_builtins,alloc",
             "-Z",
@@ -132,7 +133,7 @@ fn build_with_capabilities(arch: Arch, secure_boot: bool) -> Result<RuntimeArtif
         .env_remove("RUSTFLAGS")
         .env("CARGO_ENCODED_RUSTFLAGS", rustflags)
         .status()
-        .context("failed to invoke nightly Cargo for the runtime image")?;
+        .context("failed to invoke pinned Cargo for the runtime image")?;
     if !status.success() {
         bail!("runtime image Cargo build failed for {target}");
     }
@@ -345,6 +346,7 @@ fn normalize(
         relocation_count: u32::try_from(relocations.len())?,
         exports_offset: u32::try_from(exports_offset)?,
         feature_bits: capabilities,
+        abi_version: ABI_VERSION,
     };
     normalized[..HEADER_SIZE].copy_from_slice(&header.to_bytes());
 
@@ -514,7 +516,7 @@ fn audit_dynamic_entries(dynamic: &[u8], rela_entry_size: u64) -> Result<usize> 
     for entry in dynamic.as_chunks::<ELF64_DYN_SIZE>().0 {
         let tag = i64::from_le_bytes(entry[..8].try_into()?);
         let value = u64::from_le_bytes(entry[8..].try_into()?);
-        match tag {
+        match object::elf::DynamicTag(tag) {
             object::elf::DT_NULL => break,
             object::elf::DT_NEEDED => bail!("runtime ELF contains DT_NEEDED"),
             object::elf::DT_REL
@@ -586,7 +588,7 @@ fn audit_native_relocations(
     Ok(())
 }
 
-fn relative_relocation_type(arch: Arch) -> u32 {
+fn relative_relocation_type(arch: Arch) -> object::elf::RelocationType {
     match arch {
         Arch::X86_64 => object::elf::R_X86_64_RELATIVE,
         Arch::Aarch64 => object::elf::R_AARCH64_RELATIVE,
@@ -952,23 +954,24 @@ fn llvm_tool(name: &str) -> Result<PathBuf> {
     {
         return Ok(PathBuf::from(name));
     }
+    let toolchain = format!("+{}", crate::pinned_toolchain()?);
     let output = Command::new("rustc")
-        .args(["+nightly", "--print", "sysroot"])
+        .args([toolchain.as_str(), "--print", "sysroot"])
         .output()
-        .context("locate nightly Rust sysroot for LLVM tools")?;
+        .context("locate pinned Rust sysroot for LLVM tools")?;
     if !output.status.success() {
         bail!("cannot locate required LLVM tool {name}");
     }
     let sysroot = String::from_utf8(output.stdout)?.trim().to_owned();
     let verbose = Command::new("rustc")
-        .args(["+nightly", "-vV"])
+        .args([toolchain.as_str(), "-vV"])
         .output()
-        .context("query nightly Rust host triple for LLVM tools")?;
+        .context("query pinned Rust host triple for LLVM tools")?;
     if !verbose.status.success() {
-        bail!("cannot query nightly Rust host triple for required LLVM tool {name}");
+        bail!("cannot query pinned Rust host triple for required LLVM tool {name}");
     }
     let verbose = String::from_utf8(verbose.stdout)?;
-    let host = parse_rustc_host(&verbose).context("nightly rustc -vV has no valid host line")?;
+    let host = parse_rustc_host(&verbose).context("pinned rustc -vV has no valid host line")?;
     let executable = format!("{name}{}", std::env::consts::EXE_SUFFIX);
     let path = PathBuf::from(sysroot)
         .join("lib/rustlib")
@@ -1208,10 +1211,10 @@ mod tests {
     #[test]
     fn dynamic_audit_accepts_relative_only_and_rejects_loader_dependencies() {
         let valid = dynamic(&[
-            (object::elf::DT_RELASZ, 24),
-            (object::elf::DT_RELAENT, 24),
-            (object::elf::DT_RELACOUNT, 1),
-            (object::elf::DT_NULL, 0),
+            (object::elf::DT_RELASZ.0, 24),
+            (object::elf::DT_RELAENT.0, 24),
+            (object::elf::DT_RELACOUNT.0, 1),
+            (object::elf::DT_NULL.0, 0),
         ]);
         assert_eq!(audit_dynamic_entries(&valid, 24).unwrap(), 1);
 
@@ -1222,9 +1225,9 @@ mod tests {
             object::elf::DT_PLTRELSZ,
         ] {
             let invalid = dynamic(&[
-                (tag, 1),
-                (object::elf::DT_RELASZ, 24),
-                (object::elf::DT_RELACOUNT, 1),
+                (tag.0, 1),
+                (object::elf::DT_RELASZ.0, 24),
+                (object::elf::DT_RELACOUNT.0, 1),
             ]);
             assert!(audit_dynamic_entries(&invalid, 24).is_err());
         }

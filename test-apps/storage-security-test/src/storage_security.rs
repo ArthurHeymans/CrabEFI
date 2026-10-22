@@ -46,14 +46,14 @@ pub struct StorageSecurityCommandProtocol {
 }
 
 /// Test Storage Security Command Protocol
-pub fn test_storage_security_protocol() -> bool {
+pub fn test_storage_security_protocol() -> Result<bool, Status> {
     // Find all handles with Storage Security Command Protocol
     let mut handles: [Handle; 16] = [core::ptr::null_mut(); 16];
-    let count = efi_helpers::locate_handle_buffer(&STORAGE_SECURITY_COMMAND_GUID, &mut handles);
+    let count = efi_helpers::locate_handle_buffer(&STORAGE_SECURITY_COMMAND_GUID, &mut handles)?;
 
     if count == 0 {
         console().print_line("    No Storage Security devices found");
-        return false;
+        return Ok(false);
     }
 
     console().print("    Found ");
@@ -65,7 +65,7 @@ pub fn test_storage_security_protocol() -> bool {
     for i in 0..count {
         let handle = handles[i];
         if handle.is_null() {
-            continue;
+            return Err(Status::COMPROMISED_DATA);
         }
 
         console().print("    Device ");
@@ -78,52 +78,90 @@ pub fn test_storage_security_protocol() -> bool {
 
         if protocol.is_null() {
             console().print_line("Failed to open protocol");
-            continue;
+            return Err(Status::DEVICE_ERROR);
         }
 
-        // Try to query supported security protocols (Security Protocol 0x00)
-        let mut buffer: [u8; 512] = [0; 512];
-        let mut transfer_size: usize = 0;
-
+        #[cfg(feature = "hardware-security-probes")]
+        let media_id = match efi_helpers::media_id(handle) {
+            Ok(id) => id,
+            Err(error) => {
+                efi_helpers::close_protocol(handle, &STORAGE_SECURITY_COMMAND_GUID);
+                return Err(error);
+            }
+        };
+        #[cfg(not(feature = "hardware-security-probes"))]
+        let media_id = 0;
+        // The default CrabEFI probe checks that invalid outputs are rejected
+        // before media validation or device I/O; hardware probes use the public ID.
+        let mut transfer_size = 0;
         let status = unsafe {
             ((*protocol).receive_data)(
                 protocol,
-                0,      // media_id - use 0 for test
-                0,      // timeout - wait forever
-                0x00,   // Security Protocol 0x00 - Supported Protocol List
-                0x0000, // Security Protocol Specific
-                buffer.len(),
-                buffer.as_mut_ptr() as *mut c_void,
+                media_id,
+                0,
+                0,
+                0,
+                512,
+                core::ptr::null_mut(),
                 &mut transfer_size,
             )
         };
+        if status != Status::INVALID_PARAMETER {
+            efi_helpers::close_protocol(handle, &STORAGE_SECURITY_COMMAND_GUID);
+            return Err(Status::COMPROMISED_DATA);
+        }
+        #[cfg(not(feature = "hardware-security-probes"))]
+        {
+            console().print_line("Invalid-parameter contract verified");
+            efi_helpers::close_protocol(handle, &STORAGE_SECURITY_COMMAND_GUID);
+            success = true;
+        }
+        #[cfg(feature = "hardware-security-probes")]
+        {
+            // Only active hardware probes issue device-specific security commands.
+            let mut buffer: [u8; 512] = [0; 512];
+            let mut transfer_size: usize = 0;
 
-        if status == Status::SUCCESS {
+            let status = unsafe {
+                ((*protocol).receive_data)(
+                    protocol,
+                    media_id,
+                    0,      // timeout - wait forever
+                    0x00,   // Security Protocol 0x00 - Supported Protocol List
+                    0x0000, // Security Protocol Specific
+                    buffer.len(),
+                    buffer.as_mut_ptr() as *mut c_void,
+                    &mut transfer_size,
+                )
+            };
+
+            efi_helpers::close_protocol(handle, &STORAGE_SECURITY_COMMAND_GUID);
+            if status == Status::UNSUPPORTED {
+                continue; // An ordinary drive may not implement security commands.
+            }
+            if status != Status::SUCCESS {
+                return Err(status);
+            }
+            if !(8..=buffer.len()).contains(&transfer_size) {
+                return Err(Status::COMPROMISED_DATA);
+            }
             console().print_line("OK");
             console().print("      Received ");
             console().print_dec(transfer_size as u64);
             console().print_line(" bytes from Security Protocol 0x00");
 
-            // Parse supported protocols
-            if transfer_size >= 8 {
-                let list_length = u16::from_be_bytes([buffer[6], buffer[7]]) as usize;
-                console().print("      Supported protocols: ");
-                for j in 0..list_length.min((transfer_size - 8).min(16)) {
-                    console().print_hex(buffer[8 + j] as u64);
-                    console().print(" ");
-                }
-                console().print_line("");
+            let list_length = u16::from_be_bytes([buffer[6], buffer[7]]) as usize;
+            console().print("      Supported protocols: ");
+            for j in 0..list_length.min((transfer_size - 8).min(16)) {
+                console().print_hex(buffer[8 + j] as u64);
+                console().print(" ");
             }
-            success = true;
-        } else {
-            console().print("Error (status not SUCCESS)");
             console().print_line("");
+            success = true;
         }
-
-        efi_helpers::close_protocol(handle, &STORAGE_SECURITY_COMMAND_GUID);
     }
 
-    success
+    Ok(success)
 }
 
 /// Send a TCG Discovery0 command using Storage Security Protocol
