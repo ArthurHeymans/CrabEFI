@@ -299,7 +299,10 @@ impl super::XhciController {
         slot_ctx.set_speed(speed);
         slot_ctx.set_root_hub_port_number(route.root_port + 1);
         slot_ctx.set_route_string(route.route_string);
-        if let Some((hub_slot, hub_port)) = route.parent_hub {
+        // TT fields apply only to full/low-speed devices, not USB3 routing.
+        if matches!(speed, 1 | 2)
+            && let Some((hub_slot, hub_port)) = route.parent_hub
+        {
             slot_ctx.set_parent_hub_slot_id(hub_slot);
             slot_ctx.set_parent_port_number(hub_port);
         }

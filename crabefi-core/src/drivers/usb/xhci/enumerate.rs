@@ -11,6 +11,58 @@ use alloc::vec::Vec;
 use core::cell::RefCell;
 use xhci::ring::trb::command;
 
+const SUPER_SPEED_HUB_DESCRIPTOR_TYPE: u8 = 0x2a;
+const SET_HUB_DEPTH: u8 = 0x0c;
+
+fn hub_descriptor_type(speed: u8) -> u8 {
+    if speed >= 4 {
+        SUPER_SPEED_HUB_DESCRIPTOR_TYPE
+    } else {
+        HUB_DESCRIPTOR_TYPE
+    }
+}
+
+fn hub_depth(route: u32) -> u16 {
+    (0..5)
+        .take_while(|tier| (route >> (tier * 4)) & 0xf != 0)
+        .count() as u16
+}
+
+fn downstream_speed(hub_speed: u8, status: u16) -> u8 {
+    if hub_speed >= 4 {
+        // USB3.0 hubs use bit 9 for power, not USB2's low-speed indication.
+        4
+    } else if status & hub_port_status::HIGH_SPEED != 0 {
+        3
+    } else if status & hub_port_status::LOW_SPEED != 0 {
+        2
+    } else {
+        1
+    }
+}
+
+#[cfg(test)]
+mod hub_protocol_tests {
+    use super::*;
+
+    #[test]
+    fn hub_protocol_and_depth_follow_the_xhci_slot() {
+        assert_eq!(hub_descriptor_type(3), 0x29);
+        assert_eq!(hub_descriptor_type(4), 0x2a);
+        assert_eq!(hub_depth(0), 0);
+        assert_eq!(hub_depth(2), 1);
+        assert_eq!(hub_depth(0x321), 3);
+    }
+
+    #[test]
+    fn superspeed_power_bit_is_not_a_low_speed_device() {
+        assert_eq!(downstream_speed(4, 1 << 9), 4);
+        assert_eq!(downstream_speed(3, hub_port_status::HIGH_SPEED), 3);
+        assert_eq!(downstream_speed(3, hub_port_status::LOW_SPEED), 2);
+        assert_eq!(downstream_speed(3, 0), 1);
+    }
+}
+
 impl super::XhciController {
     /// Configure a hub device and enumerate its downstream ports.
     ///
@@ -54,13 +106,19 @@ impl super::XhciController {
             self.set_configuration(hub_slot_id, config_info.configuration_value)?;
         }
 
-        // Get hub descriptor
+        let (hub_speed, parent_route) = self
+            .slots
+            .get(hub_slot_id as usize)
+            .and_then(|slot| slot.as_ref())
+            .map(|slot| (slot.speed, slot.route_string))
+            .ok_or(XhciError::DeviceNotFound)?;
+        // Get the descriptor belonging to this hub's bus protocol.
         let mut hub_desc_buf = [0u8; 12];
         self.control_transfer(
             hub_slot_id,
             req_type::DIR_IN | req_type::TYPE_CLASS | req_type::RCPT_DEVICE,
             request::GET_DESCRIPTOR,
-            (HUB_DESCRIPTOR_TYPE as u16) << 8,
+            u16::from(hub_descriptor_type(hub_speed)) << 8,
             0,
             Some(&mut hub_desc_buf),
         )?;
@@ -79,6 +137,17 @@ impl super::XhciController {
             num_ports,
             power_delay
         );
+
+        if hub_speed >= 4 {
+            self.control_transfer(
+                hub_slot_id,
+                req_type::DIR_OUT | req_type::TYPE_CLASS | req_type::RCPT_DEVICE,
+                SET_HUB_DEPTH,
+                hub_depth(parent_route),
+                0,
+                None,
+            )?;
+        }
 
         // Mark slot as hub and store route info
         if let Some(slot) = self
@@ -189,13 +258,7 @@ impl super::XhciController {
                         None,
                     );
                     if ps & hub_port_status::ENABLE != 0 {
-                        speed = if ps & hub_port_status::HIGH_SPEED != 0 {
-                            3
-                        } else if ps & hub_port_status::LOW_SPEED != 0 {
-                            2
-                        } else {
-                            1
-                        };
+                        speed = downstream_speed(hub_speed, ps);
                         reset_ok = true;
                     }
                     break;
@@ -214,12 +277,6 @@ impl super::XhciController {
             exec::sleep_ms(10).await;
 
             // Build route string: parent's route | (port << (4 * tier))
-            let parent_route = self
-                .slots
-                .get(hub_slot_id as usize)
-                .and_then(|s| s.as_ref())
-                .map(|s| s.route_string)
-                .unwrap_or(0);
             // Find which nibble is the first zero (that's our tier)
             let mut route = parent_route;
             for tier in 0..5u32 {
