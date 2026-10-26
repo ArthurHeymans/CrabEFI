@@ -704,15 +704,6 @@ pub fn init_keyboard<C: UsbController>(
     Ok(())
 }
 
-/// Check if USB keyboard has keys
-pub fn has_key() -> bool {
-    USB_KEYBOARD
-        .lock()
-        .as_ref()
-        .map(|k| k.has_key())
-        .unwrap_or(false)
-}
-
 /// Get key from USB keyboard
 pub fn get_key() -> Option<(u16, u16)> {
     let mut keyboard = USB_KEYBOARD.lock();
@@ -861,4 +852,25 @@ pub fn is_available() -> bool {
 /// Get the controller index that has the keyboard
 pub fn controller_idx() -> Option<usize> {
     USB_KEYBOARD.lock().as_ref().map(|k| k.controller_idx())
+}
+
+/// The USB HID boot-protocol keyboard as a keyboard.
+pub(crate) struct UsbKeyboard;
+
+impl crate::drivers::keyboard_common::KeyboardDevice for UsbKeyboard {
+    fn read_key(&mut self) -> Option<crate::platform::Key> {
+        super::poll_keyboards();
+        get_key().map(|(scancode, unicode_char)| crate::platform::Key {
+            scancode,
+            unicode_char,
+        })
+    }
+
+    fn key_state(&mut self) -> crate::platform::KeyState {
+        let (shift_state, toggle_state) = get_efi_state();
+        crate::platform::KeyState {
+            shift_state,
+            toggle_state,
+        }
+    }
 }

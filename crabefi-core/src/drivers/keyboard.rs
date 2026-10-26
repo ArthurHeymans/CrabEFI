@@ -300,13 +300,6 @@ impl KeyboardState {
             }
         }
     }
-
-    /// Check if keyboard data is available (not mouse data)
-    fn has_data(&self) -> bool {
-        let status = self.ports.status_cmd.get();
-        // Check output buffer full and not from auxiliary device (mouse)
-        (status & masks::OUTPUT_FULL) != 0 && (status & masks::AUX_DATA) == 0
-    }
 }
 
 /// Global keyboard state
@@ -559,27 +552,6 @@ fn finish_init(kb: &mut KeyboardState) {
     log::info!("PS/2 keyboard initialized");
 }
 
-/// Check if keyboard data is available (PS/2 or USB)
-pub fn has_key() -> bool {
-    // Poll USB keyboard to get latest key state
-    crate::drivers::usb::poll_keyboards();
-
-    // Check USB keyboard first
-    if crate::drivers::usb::keyboard_has_key() {
-        return true;
-    }
-
-    // Drive deferred BAT state machine, then check PS/2
-    let mut kb = KEYBOARD.lock();
-    poll_bat_completion(&mut kb);
-
-    if !kb.is_ready() {
-        return false;
-    }
-
-    kb.has_data()
-}
-
 /// Cleanup the keyboard controller before ExitBootServices
 ///
 /// This re-enables keyboard interrupts (IRQ1) so Linux can properly
@@ -654,59 +626,35 @@ pub mod efi_toggle_state {
     pub const CAPS_LOCK_ACTIVE: u8 = 0x04;
 }
 
-/// Get the current EFI key shift state and toggle state from all keyboards
-///
-/// Returns (shift_state, toggle_state) with the VALID bits set.
-/// Combines state from PS/2 and USB keyboards.
-pub fn get_efi_key_state() -> (u32, u8) {
+/// Modifier and toggle state of the PS/2 keyboard, without VALID bits.
+fn key_state() -> crate::platform::KeyState {
     use efi_shift_state::*;
     use efi_toggle_state::*;
 
-    let mut shift_state = SHIFT_STATE_VALID;
-    let mut toggle_state = TOGGLE_STATE_VALID;
-
-    // PS/2 keyboard modifier state
-    {
-        let kb = KEYBOARD.lock();
-        if kb.is_ready() {
-            if kb.modifiers.shift {
-                shift_state |= LEFT_SHIFT_PRESSED;
-            }
-            if kb.modifiers.ctrl {
-                shift_state |= LEFT_CONTROL_PRESSED;
-            }
-            if kb.modifiers.alt {
-                shift_state |= LEFT_ALT_PRESSED;
-            }
-            if kb.modifiers.caps_lock {
-                toggle_state |= CAPS_LOCK_ACTIVE;
-            }
-        }
+    let kb = KEYBOARD.lock();
+    if !kb.is_ready() {
+        return crate::platform::KeyState::default();
     }
-
-    // USB keyboard modifier state (provides left/right distinction)
-    let usb_state = crate::drivers::usb::keyboard_get_efi_state();
-    shift_state |= usb_state.0;
-    toggle_state |= usb_state.1;
-
-    (shift_state, toggle_state)
+    let flag = |set: bool, bit| if set { bit } else { 0 };
+    crate::platform::KeyState {
+        shift_state: flag(kb.modifiers.shift, LEFT_SHIFT_PRESSED)
+            | flag(kb.modifiers.ctrl, LEFT_CONTROL_PRESSED)
+            | flag(kb.modifiers.alt, LEFT_ALT_PRESSED),
+        toggle_state: if kb.modifiers.caps_lock {
+            CAPS_LOCK_ACTIVE
+        } else {
+            0
+        },
+    }
 }
 
-/// Try to read a key from the keyboard (PS/2 or USB)
+/// Try to read a key from the PS/2 keyboard
 ///
 /// Returns Some((scan_code, unicode_char)) if a key is available, None otherwise.
 /// The scan_code and unicode_char follow EFI conventions:
 /// - For printable characters: scan_code = 0, unicode_char = ASCII code
 /// - For special keys: scan_code = EFI scan code, unicode_char = 0
-pub fn try_read_key() -> Option<(u16, u16)> {
-    // Poll USB keyboard to get latest key state
-    crate::drivers::usb::poll_keyboards();
-
-    // Try USB keyboard first
-    if let Some(key) = crate::drivers::usb::keyboard_get_key() {
-        return Some(key);
-    }
-
+fn try_read_key() -> Option<(u16, u16)> {
     // Drive deferred BAT, then try PS/2 keyboard
     let mut kb = KEYBOARD.lock();
     poll_bat_completion(&mut kb);
@@ -949,4 +897,24 @@ fn scancode_to_efi_normal(kb: &KeyboardState, code: u8) -> Option<(u16, u16)> {
     }
 
     Some((0, ch as u16))
+}
+
+/// The i8042 keyboard port as a keyboard.
+pub(crate) struct Ps2Keyboard;
+
+impl super::keyboard_common::KeyboardDevice for Ps2Keyboard {
+    fn read_key(&mut self) -> Option<crate::platform::Key> {
+        try_read_key().map(|(scancode, unicode_char)| crate::platform::Key {
+            scancode,
+            unicode_char,
+        })
+    }
+
+    fn key_state(&mut self) -> crate::platform::KeyState {
+        key_state()
+    }
+
+    fn stop(&mut self) {
+        cleanup();
+    }
 }

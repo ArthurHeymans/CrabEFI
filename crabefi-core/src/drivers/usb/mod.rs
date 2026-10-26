@@ -520,25 +520,6 @@ pub fn poll_keyboards() {
     }
 }
 
-/// Check if USB keyboard has input
-pub fn keyboard_has_key() -> bool {
-    hid_keyboard::has_key()
-}
-
-/// Get key from USB keyboard
-pub fn keyboard_get_key() -> Option<(u16, u16)> {
-    hid_keyboard::get_key()
-}
-
-/// Get EFI key shift/toggle state from USB keyboard
-///
-/// Returns (shift_state_bits, toggle_state_bits) without the VALID flags —
-/// the caller is responsible for OR-ing these into a combined state that
-/// already has the VALID bits set.
-pub fn keyboard_get_efi_state() -> (u32, u8) {
-    hid_keyboard::get_efi_state()
-}
-
 // ============================================================================
 // Controller Access
 // ============================================================================

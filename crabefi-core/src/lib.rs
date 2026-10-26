@@ -524,6 +524,19 @@ pub fn init_platform(mut config: PlatformConfig) -> ! {
 
     // ---- 8. Initialize keyboard subsystem ----
     drivers::keyboard_common::init();
+    if let Some(input) = config.console_input.take() {
+        // SAFETY: init_platform() is -> !, so the platform's console input
+        // lives for the entire firmware lifetime.
+        let input = unsafe {
+            core::mem::transmute::<
+                &mut dyn crate::platform::ConsoleInput,
+                &'static mut dyn crate::platform::ConsoleInput,
+            >(input)
+        };
+        drivers::keyboard_common::register(alloc::boxed::Box::new(
+            drivers::keyboard_common::PlatformKeyboard(input),
+        ));
+    }
 
     // ---- 9. Initialize EFI environment ----
     //
