@@ -15,6 +15,44 @@ pub(super) struct SlotRoute {
     pub parent_hub: Option<(u8, u8)>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct TransactionTranslator {
+    hub_slot: u8,
+    port: u8,
+}
+
+fn downstream_tt(
+    speed: u8,
+    hub_speed: u8,
+    hub_slot: u8,
+    hub_port: u8,
+    inherited: Option<TransactionTranslator>,
+) -> Option<TransactionTranslator> {
+    if !matches!(speed, 1 | 2) {
+        None
+    } else if hub_speed == 3 {
+        Some(TransactionTranslator {
+            hub_slot,
+            port: hub_port,
+        })
+    } else {
+        // A full-speed hub has no TT: retain its high-speed ancestor's TT,
+        // or None when the entire branch runs natively at full/low speed.
+        inherited
+    }
+}
+
+fn ep0_max_packet(speed: u8, is_superspeed: bool) -> u16 {
+    if is_superspeed {
+        512
+    } else {
+        match speed {
+            1 | 3 => 64, // Full speed is updated from bMaxPacketSize0
+            _ => 8,      // Low speed
+        }
+    }
+}
+
 /// Unpublished slot pages. Partial allocations are safe to release until the
 /// DCBAA/Address Device command exposes them to hardware.
 #[derive(Default)]
@@ -42,8 +80,12 @@ pub struct UsbSlot {
     pub device_desc: DeviceDescriptor,
     /// Port number
     pub port: u8,
-    /// Speed
+    /// Controller-local Protocol Speed ID.
     pub speed: u8,
+    /// The USB3 protocol, independent of controller-local speed ID numbering.
+    pub is_superspeed: bool,
+    /// Upstream high-speed hub's TT, inherited through full-speed hubs.
+    pub(super) transaction_translator: Option<TransactionTranslator>,
     /// Is this a mass storage device?
     pub is_mass_storage: bool,
     /// Mass storage interface number (for BOT reset recovery)
@@ -278,6 +320,20 @@ impl super::XhciController {
             log::error!("xHCI: slot ID {} outside tracked range", slot_id);
             return Err(XhciError::InvalidParameter);
         }
+        let is_superspeed = self.is_superspeed_port(route.root_port, speed);
+        let transaction_translator =
+            if !is_superspeed && let Some((hub_slot, hub_port)) = route.parent_hub {
+                let hub = self.get_slot(hub_slot).ok_or(XhciError::DeviceNotFound)?;
+                downstream_tt(
+                    speed,
+                    hub.speed,
+                    hub_slot,
+                    hub_port,
+                    hub.transaction_translator,
+                )
+            } else {
+                None
+            };
         let mut pages = SlotPages::default();
         for address in &mut pages.0 {
             let memory = efi::allocate_pages(1).ok_or(XhciError::AllocationFailed)?;
@@ -299,22 +355,13 @@ impl super::XhciController {
         slot_ctx.set_speed(speed);
         slot_ctx.set_root_hub_port_number(route.root_port + 1);
         slot_ctx.set_route_string(route.route_string);
-        // TT fields apply only to full/low-speed devices, not USB3 routing.
-        if matches!(speed, 1 | 2)
-            && let Some((hub_slot, hub_port)) = route.parent_hub
-        {
-            slot_ctx.set_parent_hub_slot_id(hub_slot);
-            slot_ctx.set_parent_port_number(hub_port);
+        if let Some(tt) = transaction_translator {
+            slot_ctx.set_parent_hub_slot_id(tt.hub_slot);
+            slot_ctx.set_parent_port_number(tt.port);
         }
 
-        // Set up control endpoint context
-        let max_packet = match speed {
-            1 => 64,  // Full speed: updated from bMaxPacketSize0 before longer transfers
-            2 => 8,   // Low speed
-            3 => 64,  // High speed
-            4 => 512, // Super speed
-            _ => 8,
-        };
+        // All SuperSpeed generations use a 512-byte EP0, including custom PSI IDs.
+        let max_packet = ep0_max_packet(speed, is_superspeed);
 
         let ep0_ctx = Self::input_ep_context(input_ptr, self.context_size, 0);
         ep0_ctx.set_endpoint_type(EndpointType::Control);
@@ -346,6 +393,8 @@ impl super::XhciController {
             device_desc: DeviceDescriptor::default(),
             port: route.port,
             speed,
+            is_superspeed,
+            transaction_translator,
             is_mass_storage: false,
             mass_storage_interface: 0,
             bulk_in_ep: 0,
@@ -390,8 +439,34 @@ impl super::XhciController {
 
 #[cfg(test)]
 mod tests {
-    use super::endpoint_recovery_command;
+    use super::{TransactionTranslator, downstream_tt, endpoint_recovery_command, ep0_max_packet};
     use xhci::ring::trb::command;
+
+    #[test]
+    fn superspeed_ep0_does_not_depend_on_the_protocol_speed_id() {
+        for id in [1, 4, 5, 6, 7, 8] {
+            assert_eq!(ep0_max_packet(id, true), 512);
+        }
+        assert_eq!(ep0_max_packet(1, false), 64);
+        assert_eq!(ep0_max_packet(2, false), 8);
+        assert_eq!(ep0_max_packet(3, false), 64);
+    }
+
+    #[test]
+    fn nested_full_speed_hubs_keep_the_high_speed_ancestors_tt() {
+        let tt = Some(TransactionTranslator {
+            hub_slot: 3,
+            port: 7,
+        });
+        let full_speed_hub = downstream_tt(1, 3, 3, 7, None);
+        assert_eq!(full_speed_hub, tt);
+        let nested_hub = downstream_tt(1, 1, 4, 2, full_speed_hub);
+        assert_eq!(nested_hub, tt);
+        assert_eq!(downstream_tt(2, 1, 5, 6, nested_hub), tt);
+        assert_eq!(downstream_tt(1, 1, 4, 2, None), None);
+        assert_eq!(downstream_tt(3, 3, 3, 7, None), None);
+        assert_eq!(downstream_tt(4, 4, 3, 7, None), None);
+    }
 
     #[test]
     fn timed_out_endpoint_is_stopped_not_reset() {

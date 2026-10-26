@@ -1,5 +1,6 @@
 //! xHCI controller init and port power.
 
+use super::speed::{LinkSpeed, Usb3Protocol};
 use super::{IdentityMapper, MAX_SLOTS, TrbRing, XHCI_MMIO_SIZE, XhciError};
 use crate::barrier;
 use crate::drivers::mmio::MmioRegion;
@@ -25,6 +26,58 @@ fn scratchpad_address(base: u64, page_size: u32) -> u64 {
 }
 
 impl super::XhciController {
+    fn usb3_protocols(
+        mmio_base: u64,
+        hccparams1: CapabilityParameters1,
+    ) -> alloc::vec::Vec<Usb3Protocol> {
+        // SAFETY: these accessors cover this controller's mapped extended capabilities.
+        let Some(mut capabilities) = (unsafe {
+            extended_capabilities::List::new(mmio_base as usize, hccparams1, IdentityMapper)
+        }) else {
+            return alloc::vec::Vec::new();
+        };
+        (&mut capabilities)
+            .into_iter()
+            .filter_map(|capability| {
+                let Ok(ExtendedCapability::XhciSupportedProtocol(capability)) = capability else {
+                    return None;
+                };
+                let header = capability.header.read_volatile();
+                if header.major_revision() != 3 || header.compatible_port_offset() == 0 {
+                    return None;
+                }
+                let mut protocol = Usb3Protocol::new(
+                    header.compatible_port_offset() - 1,
+                    header.compatible_port_count(),
+                    header.minor_revision(),
+                );
+                if let Some(psis) = capability.psis {
+                    for index in 0..usize::from(header.protocol_speed_id_count()) {
+                        protocol.add_psi(psis.read_volatile_at(index));
+                    }
+                }
+                Some(protocol)
+            })
+            .collect()
+    }
+
+    pub(super) fn is_superspeed_port(&self, port: u8, speed: u8) -> bool {
+        self.usb3_protocols
+            .iter()
+            .any(|protocol| protocol.contains(port))
+            || speed >= 4
+    }
+
+    pub(super) fn usb3_speed_id(&self, root_port: u8, link: LinkSpeed) -> Option<u8> {
+        self.usb3_protocols
+            .iter()
+            .find(|protocol| protocol.contains(root_port))
+            .map_or_else(
+                || Usb3Protocol::new(root_port, 1, 0).speed_id(link),
+                |protocol| protocol.speed_id(link),
+            )
+    }
+
     /// Take ownership of the controller from BIOS/SMM
     ///
     /// xHCI has an optional extended capability for BIOS ownership handoff.
@@ -135,6 +188,7 @@ impl super::XhciController {
             mmio,
             registers,
             num_ports,
+            usb3_protocols: Self::usb3_protocols(mmio_base, hccparams1),
             page_size,
             context_size,
             dcbaa: 0,
