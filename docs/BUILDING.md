@@ -139,6 +139,13 @@ let config = crabefi::PlatformConfigBuilder::new(/* ... */)
 matching driver, so a platform can leave unused controllers alone. Devices are
 stopped at ExitBootServices.
 
+The coreboot payload describes ACPI I2C devices that a built-in driver
+supports. It follows their `I2cSerialBus` and `GpioInt` resource sources to
+the controllers and takes those over as coreboot left them. Supported
+controllers are AMD DesignWare I2C (`AMDI0010`) and AMD GPIO (`AMD0030`).
+Disabled or powered-down devices and controllers are skipped. With `--ui`, the
+payload includes the ELAN touchpad driver.
+
 ### Updating the Cargo runtime bundle
 
 Maintainers regenerate a bundled image from the audited runtime build with:

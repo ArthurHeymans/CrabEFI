@@ -1146,8 +1146,14 @@ pub extern "C" fn rust_main(coreboot_table_ptr: u64) -> ! {
     let acpi_rsdp = config.acpi_rsdp;
     #[cfg(not(target_arch = "riscv64"))]
     if let Some(rsdp) = acpi_rsdp {
-        let acpi_info = unsafe { acpi::discover_platform(rsdp) };
+        // SAFETY: coreboot identity maps ACPI tables and device MMIO; no other
+        // CrabEFI driver uses the controllers of described peripherals.
+        let acpi::Discovery {
+            info: acpi_info,
+            peripherals,
+        } = unsafe { acpi::discover_platform(rsdp) };
         config.acpi_info = Some(acpi_info.clone());
+        config.peripherals = peripherals;
 
         #[cfg(target_arch = "x86_64")]
         if let Some((tpm_hid, device)) = ["MSFT0101", "PNP0C31"]
