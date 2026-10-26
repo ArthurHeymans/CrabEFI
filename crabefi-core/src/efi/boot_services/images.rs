@@ -968,6 +968,9 @@ pub(super) extern "efiapi" fn exit_boot_services(image_handle: Handle, map_key: 
         crate::efi::varstore::persistence::detach_backend();
         log::info!("Runtime image sealed successfully");
 
+        #[cfg(feature = "ui")]
+        crate::drivers::platform_pointer::detach();
+
         // Let platform glue clean up integration-specific handoff state only
         // after the final fallible step; hooks may disable non-runtime log
         // buffers needed to diagnose a seal failure.

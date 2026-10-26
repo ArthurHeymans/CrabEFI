@@ -6,7 +6,7 @@
 //!
 //! # Data Flow
 //!
-//! This module polls the raw PS/2 and USB mouse drivers directly rather than
+//! This module polls PS/2, USB and platform pointing devices directly rather than
 //! going through `mouse_cursor`, which is the internal UI abstraction.
 //! `mouse_cursor::poll()` consumes relative motion from the raw drivers to
 //! update its absolute cursor position, so using it here would drain the
@@ -16,7 +16,9 @@
 //!
 //! - UEFI Specification 2.10, Section 12.5
 
-use crate::cell::StaticMut;
+use crate::cell::{LocalCell, StaticMut};
+
+static REPORTED_BUTTONS: LocalCell<u32> = LocalCell::new(0);
 use crate::efi::boot_services::POINTER_EVENT_ID;
 use core::ffi::c_void;
 use r_efi::efi::{Boolean, Event, Status};
@@ -114,6 +116,7 @@ unsafe impl Sync for SimplePointerProtocol {}
 /// This triggers actual USB/PS2 communication so that the driver
 /// accumulators are updated with fresh data.
 fn poll_raw_hardware() {
+    crate::drivers::platform_pointer::poll();
     #[cfg(target_arch = "x86_64")]
     crate::drivers::mouse::poll();
 
@@ -139,7 +142,13 @@ fn consume_raw_motion() -> (i32, i32, i32, u32) {
     #[cfg(not(target_arch = "x86_64"))]
     let buttons = crate::drivers::usb::hid_mouse::get_buttons();
 
-    (ps2_dx + usb_dx, ps2_dy + usb_dy, ps2_dz, buttons)
+    let platform = crate::drivers::platform_pointer::take_state();
+    (
+        ps2_dx.saturating_add(usb_dx).saturating_add(platform.dx),
+        ps2_dy.saturating_add(usb_dy).saturating_add(platform.dy),
+        ps2_dz.saturating_add(platform.dz),
+        buttons | platform.buttons,
+    )
 }
 
 /// Check whether any raw mouse driver has pending motion data without
@@ -151,6 +160,17 @@ fn has_pending_motion() -> bool {
     }
 
     crate::drivers::usb::hid_mouse::has_motion()
+        || crate::drivers::platform_pointer::has_pending()
+        || current_buttons() != REPORTED_BUTTONS.get()
+}
+
+fn current_buttons() -> u32 {
+    #[cfg(target_arch = "x86_64")]
+    let ps2 = crate::drivers::mouse::get_buttons();
+    #[cfg(not(target_arch = "x86_64"))]
+    let ps2 = 0;
+    ps2 | crate::drivers::usb::hid_mouse::get_buttons()
+        | crate::drivers::platform_pointer::buttons()
 }
 
 // ============================================================================
@@ -164,7 +184,8 @@ unsafe extern "efiapi" fn pointer_reset(
 ) -> Status {
     // Poll to drain any stale data from the hardware and accumulators
     poll_raw_hardware();
-    let _ = consume_raw_motion();
+    let (_, _, _, buttons) = consume_raw_motion();
+    REPORTED_BUTTONS.set(buttons);
     Status::SUCCESS
 }
 
@@ -181,10 +202,11 @@ unsafe extern "efiapi" fn pointer_get_state(
     poll_raw_hardware();
     let (dx, dy, dz, buttons) = consume_raw_motion();
 
-    if dx == 0 && dy == 0 && dz == 0 {
+    if dx == 0 && dy == 0 && dz == 0 && buttons == REPORTED_BUTTONS.get() {
         return Status::NOT_READY;
     }
 
+    REPORTED_BUTTONS.set(buttons);
     unsafe {
         (*state).relative_movement_x = dx;
         (*state).relative_movement_y = dy;

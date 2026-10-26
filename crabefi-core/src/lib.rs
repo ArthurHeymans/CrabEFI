@@ -71,10 +71,10 @@ pub use platform::{
     BlockDevice, BlockDeviceInfo, BlockError, BootResult, CapsuleBackend, CapsuleRegion,
     ConsoleInput, DebugOutput, DeferredBufferConfig, FirmwareInfo, FmapRegion, FramebufferConfig,
     Key, KeyState, MemoryRegion, MemoryType, PciEcamRegion, PlatformConfig, PlatformConfigBuilder,
-    PlatformHooks, ResetHandler, ResetType, Rng, RngError, RuntimeImageSource,
-    RuntimePlatformConfig, StorageBackend, StorageError, Timer, TimestampRecorder, Tpm2Device,
-    Tpm2DeviceConfig, TpmDigest, TpmError, TpmEventLogConfig, TpmLogFormat, TpmPcrBanks,
-    VariableStorage,
+    PlatformHooks, PointerInput, PointerState, ResetHandler, ResetType, Rng, RngError,
+    RuntimeImageSource, RuntimePlatformConfig, StorageBackend, StorageError, Timer,
+    TimestampRecorder, Tpm2Device, Tpm2DeviceConfig, TpmDigest, TpmError, TpmEventLogConfig,
+    TpmLogFormat, TpmPcrBanks, VariableStorage,
 };
 #[cfg(feature = "spi-flash")]
 pub use platform::{
@@ -523,6 +523,22 @@ pub fn init_platform(mut config: PlatformConfig) -> ! {
 
     // ---- 8. Initialize keyboard subsystem ----
     drivers::keyboard_common::init();
+
+    #[cfg(feature = "ui")]
+    if let Some(pointer) = config.pointer_input.take() {
+        // SAFETY: init_platform never returns; detach before ExitBootServices
+        // so no boot-owned platform vtable remains reachable by the OS.
+        let pointer = unsafe {
+            core::mem::transmute::<&mut dyn PointerInput, &'static mut dyn PointerInput>(pointer)
+        };
+        drivers::platform_pointer::install(pointer);
+    }
+
+    #[cfg(not(feature = "ui"))]
+    if let Some(pointer) = config.pointer_input.take() {
+        log::warn!("Platform pointing input requires the ui feature");
+        pointer.stop();
+    }
 
     // ---- 9. Initialize EFI environment ----
     //

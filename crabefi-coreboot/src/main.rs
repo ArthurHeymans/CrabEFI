@@ -724,6 +724,7 @@ fn riscv_fdt_only_boot(fdt_ptr: u64, fdt_size: u32) -> ! {
         variable_storage: crabefi::VariableStorage::None,
         debug_output: None,
         console_input: None,
+        pointer_input: None,
         framebuffer: None,
         acpi_rsdp: None,
         smbios: None,
@@ -1045,6 +1046,7 @@ pub extern "C" fn rust_main(coreboot_table_ptr: u64) -> ! {
         variable_storage: crabefi::VariableStorage::Spi(&variable_store_locator),
         debug_output: None, // Already set up via serial::init_from_config()
         console_input: None,
+        pointer_input: None,
         framebuffer,
         acpi_rsdp: cb_info.acpi_rsdp,
         smbios: cb_info.smbios,

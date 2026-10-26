@@ -724,6 +724,29 @@ pub trait ConsoleInput {
     fn poll(&mut self) {}
 }
 
+/// One sample from a platform-owned relative pointing device.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct PointerState {
+    pub dx: i32,
+    pub dy: i32,
+    pub dz: i32,
+    /// Bit 0: left, bit 1: right, bit 2: middle. This is the current level,
+    /// not a mask of newly pressed buttons; releases must also be reported.
+    pub buttons: u32,
+}
+
+/// Boot-lifetime pointing input, independent of its bus or board wiring.
+/// Used by both the graphical UI and EFI Simple Pointer (`ui` feature).
+pub trait PointerInput {
+    /// Return a fresh sample, or `None` when idle. Polling must be bounded;
+    /// do not wait for user input. Losing contact must not synthesize motion.
+    fn read_state(&mut self) -> Option<PointerState>;
+
+    /// Stop polling/device activity before the OS takes ownership. Must not
+    /// allocate memory or change the EFI memory map.
+    fn stop(&mut self) {}
+}
+
 // ============================================================================
 // Framebuffer
 // ============================================================================
@@ -1316,6 +1339,9 @@ pub struct PlatformConfig<'a> {
     /// Keyboard/console input for `SimpleTextInput` and the boot menu.
     pub console_input: Option<&'a mut dyn ConsoleInput>,
 
+    /// Optional pointing device for the UI and Simple Pointer (`ui` feature).
+    pub pointer_input: Option<&'a mut dyn PointerInput>,
+
     /// Framebuffer for `EFI_GRAPHICS_OUTPUT_PROTOCOL` and the boot menu.
     pub framebuffer: Option<FramebufferConfig>,
 
@@ -1426,6 +1452,7 @@ pub struct PlatformConfigBuilder<'a> {
     variable_storage: VariableStorage<'a>,
     debug_output: Option<&'a mut dyn DebugOutput>,
     console_input: Option<&'a mut dyn ConsoleInput>,
+    pointer_input: Option<&'a mut dyn PointerInput>,
     framebuffer: Option<FramebufferConfig>,
     acpi_rsdp: Option<u64>,
     smbios: Option<u64>,
@@ -1464,6 +1491,7 @@ impl<'a> PlatformConfigBuilder<'a> {
             variable_storage: VariableStorage::None,
             debug_output: None,
             console_input: None,
+            pointer_input: None,
             framebuffer: None,
             acpi_rsdp: None,
             smbios: None,
@@ -1511,6 +1539,12 @@ impl<'a> PlatformConfigBuilder<'a> {
     /// Keyboard/console input for `SimpleTextInput` and the boot menu.
     pub fn console_input(mut self, value: &'a mut dyn ConsoleInput) -> Self {
         self.console_input = Some(value);
+        self
+    }
+
+    /// Pointing input for the UI and Simple Pointer (`ui` feature).
+    pub fn pointer_input(mut self, value: &'a mut dyn PointerInput) -> Self {
+        self.pointer_input = Some(value);
         self
     }
 
@@ -1612,6 +1646,7 @@ impl<'a> PlatformConfigBuilder<'a> {
             variable_storage: self.variable_storage,
             debug_output: self.debug_output,
             console_input: self.console_input,
+            pointer_input: self.pointer_input,
             framebuffer: self.framebuffer,
             acpi_rsdp: self.acpi_rsdp,
             smbios: self.smbios,

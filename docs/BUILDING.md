@@ -105,12 +105,48 @@ map, symbols, disassembly, stack report, digest, and JSON audits are under
 | `platform-entry` | off | Include CrabEFI's own `_start` entry point, EL2 page table setup, and exception vectors. Disable when integrating CrabEFI as a library into firmware that provides its own entry point. |
 | `global-allocator` | off | Register the built-in bump allocator as `#[global_allocator]` |
 | `fb-log` | off | Log to framebuffer (very slow, debugging only) |
+| `ui` | off | Graphical UI and EFI Simple Pointer |
+| `elan-i2c` | off | Native ELAN I2C touchpad driver using a platform-owned embedded-hal bus |
 
 The `crabefi-coreboot` binary enables both `platform-entry` and `global-allocator` automatically. External firmware that provides its own entry point and allocator should not enable these features.
 
 For the `crabefi-coreboot` package itself, `bundled-runtime-image` is enabled by
 default. `external-runtime-image` is mutually exclusive and is selected by the
 wrapper with `--no-default-features` when embedding a freshly audited artifact.
+
+### Platform I2C touchpads
+
+Enable `ui` and `elan-i2c` on `crabefi-core`. The platform owns controller
+initialization, bus timing, pad/power configuration, device address and the
+interrupt/data-ready signal. CrabEFI does not scan arbitrary I2C buses or
+hard-code board MMIO addresses.
+
+```rust,ignore
+let mut touchpad = crabefi::drivers::elan::ElanTouchpad::new(
+    i2c_bus,                  // embedded_hal::i2c::I2c
+    delay,                    // embedded_hal::delay::DelayNs
+    || touchpad_irq_asserted(),
+    touchpad_address,
+)?;
+let config = crabefi::PlatformConfigBuilder::new(
+    memory_map, timer, reset, block_devices, runtime_image, runtime,
+)
+.pointer_input(&mut touchpad)
+.framebuffer(framebuffer)
+.build();
+crabefi::init_platform(config);
+```
+
+The native ELAN driver supports 34-byte and high-precision 39-byte touch
+reports, relative cursor movement and physical buttons. It does not implement
+generic HID-over-I2C, gestures, tap-to-click or firmware updates. Finger lifts
+and contact-slot changes reset the motion origin. A failed transport is
+stopped rather than retried on every event-loop iteration.
+
+Platform input feeds both the boot-manager cursor and EFI Simple Pointer.
+Polling `WaitForInput` does not consume the sample or lose button-only
+press/release events. At `ExitBootServices` the source is stopped and its
+boot-owned reference detached before the OS takes ownership.
 
 ### Updating the Cargo runtime bundle
 

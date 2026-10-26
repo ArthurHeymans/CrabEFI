@@ -1,6 +1,6 @@
 //! Unified Mouse Cursor Abstraction
 //!
-//! Aggregates mouse input from PS/2 and USB HID mouse drivers into a single
+//! Aggregates PS/2, USB HID and platform pointing devices into a single
 //! cursor position with acceleration and speed control.
 //!
 //! This follows the same pattern as libpayload's `drivers/mouse_cursor.c`:
@@ -157,6 +157,15 @@ pub fn poll() {
             cursor = CURSOR.lock();
         }
     }
+
+    drop(cursor);
+    super::platform_pointer::poll();
+    let sample = super::platform_pointer::take_state();
+    total_dx = total_dx.saturating_add(sample.dx);
+    total_dy = total_dy.saturating_add(sample.dy);
+    total_dz = total_dz.saturating_add(sample.dz);
+    combined_buttons |= sample.buttons;
+    cursor = CURSOR.lock();
 
     if total_dx == 0 && total_dy == 0 && total_dz == 0 && combined_buttons == cursor.buttons {
         return;
