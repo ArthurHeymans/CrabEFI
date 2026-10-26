@@ -1188,22 +1188,6 @@ pub extern "C" fn rust_main(coreboot_table_ptr: u64) -> ! {
         } else {
             log::info!("No ACPI MMIO TIS TPM resource; skipping unsafe probe");
         }
-
-        // PNP0D40 is generic SDHCI; only known AMD eMMC HIDs use this path.
-        #[cfg(target_arch = "x86_64")]
-        for hid in ["AMDI0040", "AMDI0041"] {
-            let Some(dev) = acpi_info.find_device(hid) else {
-                continue;
-            };
-            if crabefi::drivers::sdhci::init_mmio_device(
-                dev,
-                crabefi::drivers::sdhci::SdhciMedia::Emmc,
-            )
-            .is_ok()
-            {
-                break;
-            }
-        }
     }
 
     // init_platform() parses the FDT before adding its MMIO windows, including

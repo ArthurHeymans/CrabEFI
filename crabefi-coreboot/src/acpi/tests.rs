@@ -36,7 +36,7 @@ fn interpreter() -> Interpreter<CrabEfiHandler> {
     let interpreter = Interpreter::new(handler, 2, registers, None);
     // The checked-in AML is generated from the adjacent, reviewable ASL.
     interpreter
-        .load_table(&include_bytes!("../../tests/fixtures/elan.aml")[36..])
+        .load_table(&include_bytes!("../../tests/fixtures/peripherals.aml")[36..])
         .unwrap();
     interpreter
 }
@@ -97,11 +97,44 @@ fn a_full_mmio_device_list_does_not_stop_peripheral_discovery() {
         assert!(info.dsdt_devices.push(DsdtDevice::empty()).is_ok());
     }
     let mut connections = Vec::new();
-    discover_namespace_devices(&interpreter, &mut info, &mut connections);
+    discover_namespace_devices(&interpreter, &mut info, &mut connections, &mut Vec::new());
     assert_eq!(
         connections,
         touchpad(&interpreter).into_iter().collect::<Vec<_>>()
     );
+}
+
+#[test]
+fn supported_mmio_devices_are_described() {
+    let interpreter = interpreter();
+    let mut mmio = Vec::new();
+    discover_namespace_devices(
+        &interpreter,
+        &mut PlatformInfo::new(),
+        &mut Vec::new(),
+        &mut mmio,
+    );
+    let [Peripheral::Mmio(emmc)] = mmio.as_slice() else {
+        panic!("expected one MMIO peripheral");
+    };
+    assert_eq!(emmc.ids, vec!["AMDI0040".to_string()]);
+    assert_eq!((emmc.base, emmc.size), (0xfedd5000, 0x1000));
+}
+
+#[test]
+fn absent_or_powered_down_mmio_devices_are_not_described() {
+    for method in ["\\DSTP", "\\SLPB", "\\POFF"] {
+        let interpreter = interpreter();
+        interpreter.evaluate(name(method), vec![]).unwrap();
+        let mut mmio = Vec::new();
+        discover_namespace_devices(
+            &interpreter,
+            &mut PlatformInfo::new(),
+            &mut Vec::new(),
+            &mut mmio,
+        );
+        assert!(mmio.is_empty(), "{method}");
+    }
 }
 
 #[test]

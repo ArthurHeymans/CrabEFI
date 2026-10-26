@@ -74,7 +74,7 @@ fn evaluate(
     interpreter.evaluate_if_present(AmlName::from_str(member)?.resolve(path)?, vec![])
 }
 
-fn present(interpreter: &Interpreter<CrabEfiHandler>, path: &AmlName) -> bool {
+pub(super) fn present(interpreter: &Interpreter<CrabEfiHandler>, path: &AmlName) -> bool {
     match evaluate(interpreter, path, "_STA") {
         Ok(None) => true,
         Ok(Some(value)) => matches!(&*value, Object::Integer(sta) if sta & 0x0b == 0x0b),
@@ -84,7 +84,7 @@ fn present(interpreter: &Interpreter<CrabEfiHandler>, path: &AmlName) -> bool {
 
 /// Whether coreboot left the device in D0. Never power up an unused bus or
 /// claim a controller left in D3. Some firmware has no `_PSC` method.
-fn powered(interpreter: &Interpreter<CrabEfiHandler>, path: &AmlName) -> bool {
+pub(super) fn powered(interpreter: &Interpreter<CrabEfiHandler>, path: &AmlName) -> bool {
     let in_d0 = match evaluate(interpreter, path, "_PSC") {
         Ok(None) => true,
         Ok(Some(value)) => matches!(&*value, Object::Integer(0)),

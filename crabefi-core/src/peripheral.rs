@@ -1,9 +1,10 @@
 //! Platform-described peripherals
 //!
 //! The platform owns the hardware it initializes: bus controllers, clocks,
-//! pads and power. It describes each device on those buses as a
-//! [`Peripheral`], handing over working embedded-hal handles. CrabEFI owns the
-//! device drivers and picks one by the device's identifiers.
+//! pads and power. It describes each device on those buses, and each
+//! memory-mapped SoC device, as a [`Peripheral`], handing over working
+//! embedded-hal handles. CrabEFI owns the device drivers and picks one by the
+//! device's identifiers.
 
 use alloc::{boxed::Box, string::String, vec::Vec};
 use embedded_hal::{
@@ -120,9 +121,20 @@ pub struct I2cPeripheral {
     pub interrupt: Option<Interrupt>,
 }
 
+/// A memory-mapped device, such as an ACPI-enumerated SoC controller.
+pub struct MmioPeripheral {
+    /// Identifiers in order of preference, such as an ACPI `_HID` followed by
+    /// its `_CID`s.
+    pub ids: Vec<String>,
+    /// Register window, identity mapped and owned by no other driver.
+    pub base: u64,
+    pub size: u64,
+}
+
 /// A platform-described device that CrabEFI drives.
 pub enum Peripheral {
     I2c(I2cPeripheral),
+    Mmio(MmioPeripheral),
 }
 
 struct I2cDriver {
@@ -139,9 +151,45 @@ const I2C_DRIVERS: &[I2cDriver] = &[
     },
 ];
 
-fn i2c_driver<'a>(ids: impl IntoIterator<Item = &'a str>) -> Option<&'static I2cDriver> {
+struct MmioDriver {
+    ids: &'static [&'static str],
+    /// Takes ownership of the device; logs its own failures.
+    bind: fn(MmioPeripheral),
+}
+
+const MMIO_DRIVERS: &[MmioDriver] = &[MmioDriver {
+    ids: crate::drivers::sdhci::EMMC_IDS,
+    bind: crate::drivers::sdhci::bind_emmc,
+}];
+
+/// A driver table entry, by the identifiers it handles.
+trait Driver {
+    fn ids(&self) -> &'static [&'static str];
+}
+
+impl Driver for I2cDriver {
+    fn ids(&self) -> &'static [&'static str] {
+        self.ids
+    }
+}
+
+impl Driver for MmioDriver {
+    fn ids(&self) -> &'static [&'static str] {
+        self.ids
+    }
+}
+
+/// The first driver handling one of `ids`, in the order of `ids`.
+fn find<'a, D: Driver>(
+    drivers: &'static [D],
+    ids: impl IntoIterator<Item = &'a str>,
+) -> Option<&'static D> {
     ids.into_iter()
-        .find_map(|id| I2C_DRIVERS.iter().find(|driver| driver.ids.contains(&id)))
+        .find_map(|id| drivers.iter().find(|driver| driver.ids().contains(&id)))
+}
+
+fn i2c_driver<'a>(ids: impl IntoIterator<Item = &'a str>) -> Option<&'static I2cDriver> {
+    find(I2C_DRIVERS, ids)
 }
 
 /// Whether this build has a driver for an I2C device with these identifiers.
@@ -149,6 +197,11 @@ fn i2c_driver<'a>(ids: impl IntoIterator<Item = &'a str>) -> Option<&'static I2c
 /// Lets a platform skip taking over a bus controller nothing will use.
 pub fn i2c_supported<'a>(ids: impl IntoIterator<Item = &'a str>) -> bool {
     i2c_driver(ids).is_some()
+}
+
+/// Whether this build has a driver for an MMIO device with these identifiers.
+pub fn mmio_supported<'a>(ids: impl IntoIterator<Item = &'a str>) -> bool {
+    find(MMIO_DRIVERS, ids).is_some()
 }
 
 /// Hand every peripheral to the first driver that matches its identifiers.
@@ -163,15 +216,32 @@ pub(crate) fn bind(peripherals: Vec<Peripheral>) {
                     device.address
                 ),
             },
+            Peripheral::Mmio(device) => {
+                match find(MMIO_DRIVERS, device.ids.iter().map(String::as_str)) {
+                    Some(driver) => (driver.bind)(device),
+                    None => log::info!(
+                        "No driver for MMIO device {:?} at {:#x}",
+                        device.ids,
+                        device.base
+                    ),
+                }
+            }
         }
     }
 }
 
-#[cfg(all(test, feature = "elan-i2c"))]
+#[cfg(test)]
 mod tests {
+    #[cfg(feature = "elan-i2c")]
     #[test]
     fn any_identifier_selects_a_driver() {
         assert!(super::i2c_supported(["VEND0001", "ELAN0000"]));
         assert!(!super::i2c_supported(["VEND9999"]));
+    }
+
+    #[test]
+    fn mmio_and_i2c_drivers_are_matched_separately() {
+        assert!(super::mmio_supported(["AMDI0041"]));
+        assert!(!super::i2c_supported(["AMDI0041"]));
     }
 }

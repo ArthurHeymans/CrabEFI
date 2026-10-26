@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
-// Regenerate: iasl -p elan elan.asl
-DefinitionBlock ("", "DSDT", 2, "CRABEF", "ELANTEST", 1)
+// Regenerate: iasl -p peripherals peripherals.asl
+DefinitionBlock ("", "DSDT", 2, "CRABEF", "PERIPHS", 1)
 {
     Name (TPST, 0x0F)
     Name (BUSS, Zero)
@@ -18,6 +18,14 @@ DefinitionBlock ("", "DSDT", 2, "CRABEF", "ELANTEST", 1)
             Name (_HID, "AMD0030")
             Method (_STA, 0) { Return (GPST) }
             Name (_CRS, ResourceTemplate () { Memory32Fixed (ReadWrite, 0xFED81500, 0x400) })
+        }
+        Device (EMMC)
+        {
+            Name (_HID, "AMDI0040")
+            Method (_STA, 0) { Return (TPST) }
+            Method (_PSC, 0) { Return (PWR0) }
+            Name (_PR0, Package () { \_SB.I2C2.PWRR })
+            Name (_CRS, ResourceTemplate () { Memory32Fixed (ReadWrite, 0xFEDD5000, 0x1000) })
         }
         Device (PCI0)
         {

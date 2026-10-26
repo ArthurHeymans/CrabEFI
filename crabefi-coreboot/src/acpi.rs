@@ -292,6 +292,7 @@ impl Handler for CrabEfiHandler {
 pub unsafe fn discover_platform(rsdp_addr: u64) -> Discovery {
     let mut info = PlatformInfo::new();
     let mut connections = Vec::new();
+    let mut mmio = Vec::new();
     let handler = CrabEfiHandler::new();
 
     // 1. Parse the RSDP → XSDT/RSDT table chain.
@@ -341,7 +342,7 @@ pub unsafe fn discover_platform(rsdp_addr: u64) -> Discovery {
     match acpi::platform::AcpiPlatform::new(tables, handler) {
         Ok(platform) => match acpi::aml::Interpreter::new_from_platform(&platform) {
             Ok(interpreter) => {
-                discover_namespace_devices(&interpreter, &mut info, &mut connections)
+                discover_namespace_devices(&interpreter, &mut info, &mut connections, &mut mmio)
             }
             Err(e) => log::warn!("ACPI: AML interpreter init failed: {:?}", e),
         },
@@ -392,11 +393,10 @@ pub unsafe fn discover_platform(rsdp_addr: u64) -> Discovery {
         }
     }
 
-    Discovery {
-        info,
-        // SAFETY: the caller's controller contract.
-        peripherals: unsafe { peripherals::adopt(connections) },
-    }
+    // SAFETY: the caller's controller contract.
+    let mut peripherals = unsafe { peripherals::adopt(connections) };
+    peripherals.append(&mut mmio);
+    Discovery { info, peripherals }
 }
 
 /// Locate a TPM 1.2 event log described by the ACPI TCPA table.
@@ -590,11 +590,13 @@ fn parse_spcr(tables: &AcpiTables<CrabEfiHandler>, info: &mut PlatformInfo) {
 // ---------------------------------------------------------------------------
 
 /// Walk the AML namespace and extract platform devices with `_HID` + `_CRS`,
-/// and the connections of I2C devices that a CrabEFI driver supports.
+/// the MMIO devices and the connections of I2C devices that a CrabEFI driver
+/// supports.
 fn discover_namespace_devices(
     interpreter: &acpi::aml::Interpreter<CrabEfiHandler>,
     info: &mut PlatformInfo,
     connections: &mut Vec<peripherals::Connection>,
+    mmio: &mut Vec<Peripheral>,
 ) {
     use acpi::aml::namespace::{AmlName, NamespaceLevelKind};
     use acpi::aml::object::Object;
@@ -720,6 +722,18 @@ fn discover_namespace_devices(
 
         // Only store MMIO devices. A full list must not stop the traversal,
         // which also finds I2C devices.
+        if mmio_base != 0
+            && mmio_size != 0
+            && crabefi::peripheral::mmio_supported(ids.iter().map(String::as_str))
+            && peripherals::present(interpreter, path)
+            && peripherals::powered(interpreter, path)
+        {
+            mmio.push(Peripheral::Mmio(crabefi::peripheral::MmioPeripheral {
+                ids: ids.clone(),
+                base: mmio_base,
+                size: mmio_size,
+            }));
+        }
         if mmio_base != 0 && mmio_size != 0 {
             let name = extract_device_name(path);
             let device = DsdtDevice {
