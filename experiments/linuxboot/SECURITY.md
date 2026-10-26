@@ -3,6 +3,8 @@
 These are disposable QEMU/KVM feature tests, **not a production trust-chain or
 physical-TPM certification**. Windows is the installed Pro 25H2 system from
 [INSTALLED.md](INSTALLED.md). There is no NIC, product key or real user data.
+The firmware/tool versions for these recorded results are documented in
+[README.md](README.md#recorded-result-provenance); they predate the PR rebase.
 
 ## Results (2026-10-26)
 

@@ -43,6 +43,16 @@ Windows media came from `Win11_25H2_EnglishInternational_x64.iso`, SHA-256
 `baaeb6c90dd51648154b64c40c9e0c14d93a427f611a1bb49c8077fa2ff73364`.
 No Microsoft binaries, images, or downloaded media are checked in.
 
+### Recorded-result provenance
+
+The recorded guest results use the CrabEFI core from `4d371cb7` (the original
+workspace also contained unrelated CI-only changes). The payload ELF SHA-256 is
+`0e39f9f936fb9634279d14c0054de45e3df16d3ad2a7c5e19b47838ef4a897bb`.
+The host tools used nixpkgs `4975466d324710c576dc11ad614684e6bd8cad8e`.
+These experiment files were subsequently rebased onto current `master` for the
+PR. The recorded Windows results are not a claim that the newer firmware core
+or the newer root flake inputs have been revalidated in those guests.
+
 ## Design
 
 - `pack.py` retains the original ELF64 payload's load segments inside an ELF32
@@ -71,6 +81,22 @@ No Microsoft binaries, images, or downloaded media are checked in.
 otherwise tries the file-based syscall first and its Multiboot path fails with
 `Invalid memory segment` before executing the payload. This experiment uses
 legacy `kexec_load`; it does not support a lockdown policy that prohibits it.
+
+## Where the integration belongs
+
+No u-root, Linux, coreboot, or kexec-tools source patch was required. This
+prototype uses BusyBox init plus the existing kexec-tools Multiboot loader.
+The new functionality is the Linux-side handoff collector and ELF/Multiboot
+adapter under this directory; Linux and coreboot need the supplied build
+configuration, and CrabEFI's existing coreboot payload is used unchanged.
+
+For a u-root-based LinuxBoot image, the integration point is its boot command:
+run this helper/adapter, or implement the equivalent metadata collection,
+reserved-memory staging, and payload loading there. Simply loading the ELF
+without preserving the firmware memory map, ACPI and SMBIOS is insufficient.
+A Go-native u-root implementation is a follow-up, not a prerequisite for this
+prototype. First-stage authentication/measurement and the remaining CrabEFI
+TCG2 or storage issues are separate from that launcher integration.
 
 ## Reproduce
 
@@ -149,10 +175,11 @@ bash -n experiments/linuxboot/{build-firmware.sh,build-initramfs.sh,prepare-medi
 - The memory map and RSDP are platform handoff metadata, not authenticated input.
   The fixed-address wrapper, QEMU-specific display setup, and lack of preserved
   TPM event-log handoff are unsuitable as a generic secure firmware interface.
-- Secure Boot, TPM/BitLocker, native durable runtime variable writes, and
-  firmware updates are not validated. The normal CrabEFI runtime-persistence
-  limitations still apply. The warm-reset deferred buffer's durability is not
-  established by this experiment.
+- The [security follow-up](SECURITY.md) validates selected EFI signature checks,
+  TPM operation and TPM-only BitLocker cold boots. It does not establish PCR7
+  binding or an authenticated/measured first LinuxBoot stage. Native durable
+  runtime variable writes and firmware updates remain unvalidated; the normal
+  CrabEFI runtime-persistence limitations still apply.
 - No attempt is made to reuse Linux drivers as UEFI callbacks. Only controllers
   CrabEFI can reinitialize are usable after the handover; Linux having a driver
   for a device does not provide CrabEFI with that driver.
