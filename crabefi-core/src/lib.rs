@@ -558,9 +558,6 @@ pub fn init_platform(mut config: PlatformConfig) -> ! {
         }
     }
 
-    // Platform-described devices need the EFI allocator and timer.
-    peripheral::bind(core::mem::take(&mut config.peripherals));
-
     // ---- 9b. Install the initial ESRT ----
     //
     // The ESRT is built from platform-provided firmware info and installed as

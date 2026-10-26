@@ -149,6 +149,11 @@ const I2C_DRIVERS: &[I2cDriver] = &[
         ids: crate::drivers::elan::IDS,
         bind: crate::drivers::elan::bind,
     },
+    #[cfg(feature = "tpm")]
+    I2cDriver {
+        ids: crate::efi::tcg::gsc_i2c::IDS,
+        bind: crate::efi::tcg::gsc_i2c::bind,
+    },
 ];
 
 struct MmioDriver {
@@ -197,6 +202,27 @@ fn i2c_driver<'a>(ids: impl IntoIterator<Item = &'a str>) -> Option<&'static I2c
 /// Lets a platform skip taking over a bus controller nothing will use.
 pub fn i2c_supported<'a>(ids: impl IntoIterator<Item = &'a str>) -> bool {
     i2c_driver(ids).is_some()
+}
+
+#[cfg(feature = "tpm")]
+static TPM: crate::cell::Local<Option<Box<dyn crate::platform::Tpm2Device>>> =
+    crate::cell::Local::new(None);
+
+/// Offer a bound TPM for measured boot. The first one wins.
+#[cfg(feature = "tpm")]
+pub(crate) fn provide_tpm(tpm: Box<dyn crate::platform::Tpm2Device>) {
+    let mut slot = TPM.borrow_mut();
+    if slot.is_some() {
+        log::warn!("Ignoring a second TPM peripheral");
+        return;
+    }
+    *slot = Some(tpm);
+}
+
+/// The TPM a peripheral driver bound, for the rest of boot services.
+#[cfg(feature = "tpm")]
+pub(crate) fn take_tpm() -> Option<&'static mut dyn crate::platform::Tpm2Device> {
+    TPM.borrow_mut().take().map(Box::leak)
 }
 
 /// Whether this build has a driver for an MMIO device with these identifiers.
