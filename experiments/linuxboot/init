@@ -1,0 +1,30 @@
+#!/bin/sh
+export PATH=/bin
+mount -t devtmpfs devtmpfs /dev
+mount -t proc proc /proc
+mount -t sysfs sysfs /sys
+exec </dev/console >/dev/console 2>&1
+echo LINUXBOOT_USERSPACE_RUNNING
+# Exercise real storage-driver ownership before kexec, rather than only PCI scan.
+if [ ! -d /sys/class/nvme/nvme0 ] && ! sh /modules/load; then
+    echo LINUXBOOT_STORAGE_INIT_FAILED
+    exec sh
+fi
+if [ ! -d /sys/class/nvme/nvme0 ]; then
+    echo LINUXBOOT_STORAGE_DEVICE_MISSING
+    exec sh
+fi
+ls /sys/class/nvme
+if ! /handoff --qemu-only > /handoff.bin; then
+    echo LINUXBOOT_HANDOFF_FAILED
+    exec sh
+fi
+if ! kexec -c -l --type=multiboot-x86 /crabefi-multiboot.elf --module=/handoff.bin; then
+    echo LINUXBOOT_KEXEC_LOAD_FAILED
+    exec sh
+fi
+echo LINUXBOOT_KEXEC_EXECUTING
+sync
+kexec -e
+echo LINUXBOOT_KEXEC_RETURNED
+exec sh
