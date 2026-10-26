@@ -942,7 +942,9 @@ jobs:
       - name: Install test dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y qemu-system-misc mtools dosfstools zstd coreboot-utils binutils-riscv64-linux-gnu
+          sudo apt-get install -y qemu-system-riscv mtools dosfstools zstd \
+            coreboot-utils binutils-riscv64-linux-gnu
+          qemu-system-riscv64 --version
       - name: Download CrabEFI ELF (riscv64)
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
@@ -998,7 +1000,9 @@ jobs:
       - name: Install test dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y qemu-system-misc mtools dosfstools zstd coreboot-utils binutils-riscv64-linux-gnu
+          sudo apt-get install -y qemu-system-riscv mtools dosfstools zstd \
+            coreboot-utils binutils-riscv64-linux-gnu
+          qemu-system-riscv64 --version
       - name: Download CrabEFI ELF (riscv64)
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:

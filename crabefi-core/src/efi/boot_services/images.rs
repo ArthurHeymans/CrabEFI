@@ -951,6 +951,8 @@ pub(super) extern "efiapi" fn exit_boot_services(image_handle: Handle, map_key: 
         // Clean up hardware state for OS handoff.
         // Re-enable keyboard interrupts so Linux's i8042 driver works.
         crate::drivers::keyboard_common::cleanup();
+        #[cfg(feature = "ui")]
+        crate::drivers::pointer::stop();
 
         // Seal only after the allocator accepted the map key, while boot-time
         // diagnostics are still reachable. A failed seal leaves no safe way to

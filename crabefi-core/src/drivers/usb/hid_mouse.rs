@@ -337,16 +337,25 @@ pub fn is_available() -> bool {
     USB_MOUSE.lock().is_some()
 }
 
-/// Check if USB mouse has pending motion.
-pub fn has_motion() -> bool {
-    USB_MOUSE
-        .lock()
-        .as_ref()
-        .map(|m| m.rel_x != 0 || m.rel_y != 0)
-        .unwrap_or(false)
-}
-
 /// Get the controller index that has the mouse.
 pub fn controller_idx() -> Option<usize> {
     USB_MOUSE.lock().as_ref().map(|m| m.controller_idx())
+}
+
+/// The USB HID boot-protocol mouse as a pointing device.
+#[cfg(feature = "ui")]
+pub(crate) struct UsbMouse;
+
+#[cfg(feature = "ui")]
+impl crate::drivers::pointer::PointerDevice for UsbMouse {
+    fn poll(&mut self) -> Option<crate::drivers::pointer::PointerReport> {
+        super::poll_mice_on_controller(controller_idx()?);
+        let (dx, dy) = get_relative_motion();
+        Some(crate::drivers::pointer::PointerReport {
+            dx,
+            dy,
+            dz: 0,
+            buttons: get_buttons(),
+        })
+    }
 }

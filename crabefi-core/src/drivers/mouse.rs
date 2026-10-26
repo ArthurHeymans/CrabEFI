@@ -674,13 +674,26 @@ pub fn get_buttons() -> u32 {
     MOUSE.lock().buttons
 }
 
-/// Check if PS/2 mouse has pending relative motion.
-pub fn has_motion() -> bool {
-    let mouse = MOUSE.lock();
-    mouse.rel_x != 0 || mouse.rel_y != 0 || mouse.rel_z != 0
-}
-
 /// Returns `true` if the PS/2 mouse (or Synaptics+TrackPoint) is ready.
 pub fn is_available() -> bool {
     MOUSE.lock().initialized
+}
+
+/// The i8042 AUX device as a pointing device.
+pub(crate) struct Ps2Mouse;
+
+impl super::pointer::PointerDevice for Ps2Mouse {
+    fn poll(&mut self) -> Option<super::pointer::PointerReport> {
+        if !is_available() {
+            return None;
+        }
+        poll();
+        let (dx, dy, dz) = get_relative_motion();
+        Some(super::pointer::PointerReport {
+            dx,
+            dy,
+            dz,
+            buttons: get_buttons(),
+        })
+    }
 }

@@ -6,17 +6,16 @@
 //!
 //! # Data Flow
 //!
-//! This module polls the raw PS/2 and USB mouse drivers directly rather than
-//! going through `mouse_cursor`, which is the internal UI abstraction.
-//! `mouse_cursor::poll()` consumes relative motion from the raw drivers to
-//! update its absolute cursor position, so using it here would drain the
-//! deltas before `GetState` can read them.
+//! This module reads the combined report of every registered pointing device
+//! (`drivers::pointer`) directly rather than going through `mouse_cursor`,
+//! which turns the same motion into an absolute UI cursor position.
 //!
 //! # References
 //!
 //! - UEFI Specification 2.10, Section 12.5
 
 use crate::cell::StaticMut;
+use crate::drivers::pointer;
 use crate::efi::boot_services::POINTER_EVENT_ID;
 use core::ffi::c_void;
 use r_efi::efi::{Boolean, Event, Status};
@@ -106,54 +105,6 @@ unsafe impl Send for SimplePointerProtocol {}
 unsafe impl Sync for SimplePointerProtocol {}
 
 // ============================================================================
-// Raw Driver Polling
-// ============================================================================
-
-/// Poll the raw mouse hardware without going through mouse_cursor.
-///
-/// This triggers actual USB/PS2 communication so that the driver
-/// accumulators are updated with fresh data.
-fn poll_raw_hardware() {
-    #[cfg(target_arch = "x86_64")]
-    crate::drivers::mouse::poll();
-
-    if let Some(ctrl_idx) = crate::drivers::usb::hid_mouse::controller_idx() {
-        crate::drivers::usb::poll_mice_on_controller(ctrl_idx);
-    }
-}
-
-/// Read and reset accumulated relative motion from all raw mouse drivers.
-///
-/// Returns `(dx, dy, dz, buttons)`.
-fn consume_raw_motion() -> (i32, i32, i32, u32) {
-    #[cfg(target_arch = "x86_64")]
-    let (ps2_dx, ps2_dy, ps2_dz) = crate::drivers::mouse::get_relative_motion();
-    #[cfg(not(target_arch = "x86_64"))]
-    let (ps2_dx, ps2_dy, ps2_dz) = (0i32, 0i32, 0i32);
-
-    let (usb_dx, usb_dy) = crate::drivers::usb::hid_mouse::get_relative_motion();
-
-    #[cfg(target_arch = "x86_64")]
-    let buttons =
-        crate::drivers::mouse::get_buttons() | crate::drivers::usb::hid_mouse::get_buttons();
-    #[cfg(not(target_arch = "x86_64"))]
-    let buttons = crate::drivers::usb::hid_mouse::get_buttons();
-
-    (ps2_dx + usb_dx, ps2_dy + usb_dy, ps2_dz, buttons)
-}
-
-/// Check whether any raw mouse driver has pending motion data without
-/// consuming it.
-fn has_pending_motion() -> bool {
-    #[cfg(target_arch = "x86_64")]
-    if crate::drivers::mouse::has_motion() {
-        return true;
-    }
-
-    crate::drivers::usb::hid_mouse::has_motion()
-}
-
-// ============================================================================
 // Protocol Implementation
 // ============================================================================
 
@@ -162,9 +113,9 @@ unsafe extern "efiapi" fn pointer_reset(
     _this: *mut SimplePointerProtocol,
     _extended_verification: Boolean,
 ) -> Status {
-    // Poll to drain any stale data from the hardware and accumulators
-    poll_raw_hardware();
-    let _ = consume_raw_motion();
+    // Drain stale motion and acknowledge the current button level.
+    pointer::poll();
+    let _ = pointer::take();
     Status::SUCCESS
 }
 
@@ -177,13 +128,17 @@ unsafe extern "efiapi" fn pointer_get_state(
         return Status::INVALID_PARAMETER;
     }
 
-    // Poll hardware and consume accumulated deltas
-    poll_raw_hardware();
-    let (dx, dy, dz, buttons) = consume_raw_motion();
-
-    if dx == 0 && dy == 0 && dz == 0 {
+    // Report motion and button-only transitions.
+    pointer::poll();
+    if !pointer::is_ready() {
         return Status::NOT_READY;
     }
+    let pointer::PointerReport {
+        dx,
+        dy,
+        dz,
+        buttons,
+    } = pointer::take();
 
     unsafe {
         (*state).relative_movement_x = dx;
@@ -239,9 +194,9 @@ pub fn guid() -> r_efi::efi::Guid {
 
 /// Check if pointer input is available.
 ///
-/// Polls the raw mouse hardware, then peeks at the driver accumulators
-/// without consuming them.  Used by `BS.WaitForEvent` / `BS.CheckEvent`.
+/// Polls every pointing device without consuming the pending report.
+/// Used by `BS.WaitForEvent` / `BS.CheckEvent`.
 pub(crate) fn pointer_check_ready() -> bool {
-    poll_raw_hardware();
-    has_pending_motion()
+    pointer::poll();
+    pointer::is_ready()
 }
