@@ -80,6 +80,26 @@ DefinitionBlock ("", "DSDT", 2, "CRABEF", "PERIPHS", 1)
                         "\\_SB.GPIO", 0, ResourceConsumer, , ) { 3 }
                 })
             }
+            Device (HIDT)
+            {
+                Name (_HID, "SYNA0001")
+                Name (_CID, "PNP0C50")
+                Method (_DSM, 4)
+                {
+                    If (LEqual (Arg0, ToUUID ("3cdff6f7-4267-4555-ad05-b30a3d8938de")))
+                    {
+                        If (LEqual (Arg2, Zero)) { Return (Buffer (One) { 0x03 }) }
+                        If (LEqual (Arg2, One)) { Return (0x20) }
+                    }
+                    Return (Buffer (One) { 0x00 })
+                }
+                Name (_CRS, ResourceTemplate () {
+                    I2cSerialBusV2 (0x2C, ControllerInitiated, 400000, AddressingMode7Bit,
+                        "\\_SB.I2C2", 0, ResourceConsumer, , Exclusive, )
+                    GpioInt (Level, ActiveLow, Exclusive, PullUp, 0,
+                        "\\_SB.GPIO", 0, ResourceConsumer, , ) { 10 }
+                })
+            }
             Device (MISS)
             {
                 Name (_HID, "ELAN0000")

@@ -37,6 +37,7 @@ pub(super) struct Connection {
     pub address: u8,
     pub speed_hz: u32,
     pub gpio: Option<(Controller, Line)>,
+    pub hid_descriptor_register: Option<u16>,
 }
 
 /// A `GpioInt` pin of a GPIO controller.
@@ -300,13 +301,42 @@ pub(super) fn connection(
             ))
         }
     };
+    let hid_descriptor_register = ids
+        .iter()
+        .any(|id| matches!(id.as_str(), "PNP0C50" | "ACPI0C50"))
+        .then(|| hid_descriptor_register(interpreter, path))
+        .flatten();
     Some(Connection {
         ids,
         bus,
         address: i2c.address,
         speed_hz: i2c.speed_hz,
         gpio,
+        hid_descriptor_register,
     })
+}
+
+/// The HID descriptor register from the HID-over-I2C `_DSM`, function 1.
+fn hid_descriptor_register(
+    interpreter: &Interpreter<CrabEfiHandler>,
+    path: &AmlName,
+) -> Option<u16> {
+    // 3cdff6f7-4267-4555-ad05-b30a3d8938de in ACPI ToUUID byte order.
+    const HID_I2C_DSM: [u8; 16] = [
+        0xf7, 0xf6, 0xdf, 0x3c, 0x67, 0x42, 0x55, 0x45, 0xad, 0x05, 0xb3, 0x0a, 0x3d, 0x89, 0x38,
+        0xde,
+    ];
+    let args = vec![
+        WrappedObject::new(Object::Buffer(HID_I2C_DSM.to_vec())),
+        WrappedObject::new(Object::Integer(1)),
+        WrappedObject::new(Object::Integer(1)),
+        WrappedObject::new(Object::Package(Vec::new())),
+    ];
+    let dsm = AmlName::from_str("_DSM").ok()?.resolve(path).ok()?;
+    match &*interpreter.evaluate_if_present(dsm, args).ok()?? {
+        Object::Integer(register) => u16::try_from(*register).ok(),
+        _ => None,
+    }
 }
 
 /// Take over the controllers of resolved connections. Devices on one
@@ -350,7 +380,7 @@ pub(super) unsafe fn adopt(connections: Vec<Connection>) -> Vec<Peripheral> {
                 bus: I2cBus::new(RcDevice::new(shared)),
                 address: connection.address,
                 interrupt,
-                hid_descriptor_register: None,
+                hid_descriptor_register: connection.hid_descriptor_register,
             }))
         })
         .collect()

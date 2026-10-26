@@ -103,6 +103,24 @@ fn edge_triggered_interrupts_are_described() {
 }
 
 #[test]
+fn hid_devices_carry_their_descriptor_register_from_dsm() {
+    let interpreter = interpreter();
+    let path = name("\\_SB.I2C2.HIDT");
+    let ids = peripherals::ids(&interpreter, &path);
+    let device = peripherals::connection(&interpreter, &path, ids).unwrap();
+    assert_eq!(
+        device.ids,
+        vec!["SYNA0001".to_string(), "PNP0C50".to_string()]
+    );
+    assert_eq!(device.hid_descriptor_register, Some(0x20));
+    // Other devices have no HID descriptor.
+    assert_eq!(
+        touchpad(&interpreter).unwrap().hid_descriptor_register,
+        None
+    );
+}
+
+#[test]
 fn absent_disabled_or_powered_down_devices_are_not_described() {
     for method in ["\\DSTP", "\\DSBS", "\\DSGP", "\\SLPB", "\\POFF"] {
         let interpreter = interpreter();
