@@ -1,12 +1,20 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
-//! AMD FCH GPIO pin level (ACPI `AMD0030`). Read-only: pad configuration
-//! stays with the firmware that owns the pin mux.
+//! AMD FCH GPIO pin level and latched interrupt status (ACPI `AMD0030`).
+//! Pad configuration stays with the firmware that owns the pin mux.
 
 use core::convert::Infallible;
 use embedded_hal::digital::{ErrorType, InputPin};
-use tock_registers::{interfaces::Readable, register_bitfields, registers::ReadOnly};
+use tock_registers::{
+    interfaces::{Readable, Writeable},
+    register_bitfields,
+    registers::ReadWrite,
+};
 
-register_bitfields![u32, Control [PIN OFFSET(16) NUMBITS(1) []]];
+register_bitfields![u32, Control [
+    PIN OFFSET(16) NUMBITS(1) [],
+    INTERRUPT_STATUS OFFSET(28) NUMBITS(1) [],
+    WAKE_STATUS OFFSET(29) NUMBITS(1) []
+]];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Error {
@@ -16,13 +24,14 @@ pub enum Error {
 
 /// One pin of an AMD GPIO bank, with one 32-bit control register per pin.
 pub struct GpioPin {
-    control: &'static ReadOnly<u32, Control::Register>,
+    control: &'static ReadWrite<u32, Control::Register>,
 }
 
 impl GpioPin {
     /// # Safety
     /// `base`/`size` describe the GPIO bank's decoded, UC-mapped MMIO.
-    /// Reading a pin's control register has no side effects.
+    /// Reading a pin's control register has no side effects; only
+    /// [`Self::take_interrupt_status`] writes it.
     pub unsafe fn new(base: usize, size: usize, pin: u16) -> Result<Self, Error> {
         if base == 0 || base & 3 != 0 || base.checked_add(size).is_none() {
             return Err(Error::InvalidRegion);
@@ -32,8 +41,21 @@ impl GpioPin {
             return Err(Error::PinOutOfRange);
         }
         // SAFETY: an aligned register inside the caller's validated bank.
-        let control = unsafe { &*((base + offset) as *const ReadOnly<u32, Control::Register>) };
+        let control = unsafe { &*((base + offset) as *const ReadWrite<u32, Control::Register>) };
         Ok(Self { control })
+    }
+
+    /// Whether the pad latched an interrupt, clearing the latch. The pad
+    /// must be configured to set its interrupt status.
+    pub fn take_interrupt_status(&mut self) -> bool {
+        let control = self.control.extract();
+        if !control.is_set(Control::INTERRUPT_STATUS) {
+            return false;
+        }
+        // Status bits are write-1-to-clear; keep a pending wake status.
+        self.control
+            .set(control.get() & !Control::WAKE_STATUS::SET.value);
+        true
     }
 }
 
@@ -70,5 +92,19 @@ mod tests {
             unsafe { GpioPin::new(base, 64, 16) }.err(),
             Some(Error::PinOutOfRange)
         );
+    }
+
+    #[test]
+    fn interrupt_status_is_taken_once_without_clearing_wake_status() {
+        let bank = Box::leak(Box::new([0u32; 4]));
+        let base = bank.as_ptr() as usize;
+        // SAFETY: RAM-backed fake bank.
+        let mut pin = unsafe { GpioPin::new(base, 16, 3) }.unwrap();
+        assert!(!pin.take_interrupt_status());
+        bank[3] = (1 << 28) | (1 << 29) | 0x1000;
+        assert!(pin.take_interrupt_status());
+        // The write sets the interrupt status bit (to clear it) and leaves
+        // wake status and configuration alone.
+        assert_eq!(bank[3], (1 << 28) | 0x1000);
     }
 }

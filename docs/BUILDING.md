@@ -196,7 +196,9 @@ driver supports. It follows their `I2cSerialBus` and `GpioInt` resource sources 
 the controllers and takes those over as coreboot left them. Supported
 controllers are AMD DesignWare I2C (`AMDI0010`) and AMD GPIO (`AMD0030`).
 Disabled or powered-down devices and controllers are skipped. With `--ui`, the
-payload includes the ELAN touchpad driver.
+payload includes the ELAN touchpad driver. A Google security chip TPM
+(`GOOG0005`) backs measured boot; its edge-triggered ready interrupt is read
+from the pad's latched interrupt status.
 
 ### Updating the Cargo runtime bundle
 

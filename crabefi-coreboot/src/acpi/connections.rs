@@ -16,6 +16,8 @@ pub(super) struct Interrupt<'a> {
     pub source: &'a str,
     pub pin: u16,
     pub active_low: bool,
+    /// Edge- rather than level-triggered.
+    pub edge: bool,
 }
 #[derive(Debug, Default, PartialEq, Eq)]
 pub(super) struct Connections<'a> {
@@ -144,10 +146,9 @@ pub(super) fn parse(bytes: &[u8]) -> Result<Connections<'_>, &'static str> {
                 if gpio.revision != 1
                     || gpio.flags.get() & 1 == 0
                     || gpio.source_index != 0
-                    || flags & 1 != 0
                     || polarity > 1
                 {
-                    return Err("report-ready GPIO must be a level interrupt");
+                    return Err("GPIO interrupt must be active high or low");
                 }
                 let pins = usize::from(gpio.pins_offset.get());
                 let source = usize::from(gpio.source_offset.get());
@@ -172,6 +173,7 @@ pub(super) fn parse(bytes: &[u8]) -> Result<Connections<'_>, &'static str> {
                     source,
                     pin,
                     active_low: polarity == 1,
+                    edge: flags & 1 != 0,
                 };
                 if result.interrupt.replace(interrupt).is_some() {
                     return Err("multiple GPIO interrupts");

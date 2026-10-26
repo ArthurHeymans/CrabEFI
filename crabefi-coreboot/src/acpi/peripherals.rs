@@ -12,9 +12,11 @@ use acpi::aml::{
         AddressSpaceResourceType, MemoryRangeDescriptor, Resource, resource_descriptor_list,
     },
 };
-use alloc::{rc::Rc, string::String, vec, vec::Vec};
+use alloc::{boxed::Box, rc::Rc, string::String, vec, vec::Vec};
 use core::{cell::RefCell, str::FromStr};
-use crabefi::peripheral::{I2cBus, I2cPeripheral, InputLine, Interrupt, Peripheral};
+use crabefi::peripheral::{
+    I2cBus, I2cPeripheral, InputLine, Interrupt, InterruptLatch, Peripheral,
+};
 use embedded_hal_bus::i2c::RcDevice;
 
 /// An MMIO controller found through a resource source.
@@ -34,16 +36,26 @@ pub(super) struct Connection {
     pub bus: Controller,
     pub address: u8,
     pub speed_hz: u32,
-    pub gpio: Option<(Controller, u16, bool)>,
+    pub gpio: Option<(Controller, Line)>,
+}
+
+/// A `GpioInt` pin of a GPIO controller.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct Line {
+    pub pin: u16,
+    pub active_low: bool,
+    /// Edge- rather than level-triggered.
+    pub edge: bool,
 }
 
 /// Take over a firmware-initialized I2C controller.
 type AttachI2c = unsafe fn(base: u64, size: u64, speed_hz: u32) -> Option<I2cBus>;
 /// Open one input pin of a GPIO controller.
-type OpenPin = unsafe fn(base: u64, size: u64, pin: u16) -> Option<InputLine>;
+/// Open a `GpioInt` of a GPIO controller as it was configured.
+type OpenInterrupt = unsafe fn(base: u64, size: u64, line: &Line) -> Option<Interrupt>;
 
 const I2C_CONTROLLERS: &[(&str, AttachI2c)] = &[("AMDI0010", designware)];
-const GPIO_CONTROLLERS: &[(&str, OpenPin)] = &[("AMD0030", amd_gpio)];
+const GPIO_CONTROLLERS: &[(&str, OpenInterrupt)] = &[("AMD0030", amd_gpio)];
 
 unsafe fn designware(base: u64, size: u64, speed_hz: u32) -> Option<I2cBus> {
     let (base, size) = (usize::try_from(base).ok()?, usize::try_from(size).ok()?);
@@ -59,11 +71,28 @@ unsafe fn designware(base: u64, size: u64, speed_hz: u32) -> Option<I2cBus> {
     }
 }
 
-unsafe fn amd_gpio(base: u64, size: u64, pin: u16) -> Option<InputLine> {
+/// The pad's interrupt status, which coreboot configures the pad to latch.
+struct AmdLatch(crabefi_hw::amd_gpio::GpioPin);
+
+impl InterruptLatch for AmdLatch {
+    fn take(&mut self) -> bool {
+        self.0.take_interrupt_status()
+    }
+}
+
+unsafe fn amd_gpio(base: u64, size: u64, line: &Line) -> Option<Interrupt> {
     let (base, size) = (usize::try_from(base).ok()?, usize::try_from(size).ok()?);
-    // SAFETY: the caller's identity-mapped controller; reads have no effect.
-    let pin = unsafe { crabefi_hw::amd_gpio::GpioPin::new(base, size, pin) }.ok()?;
-    Some(InputLine::new(pin))
+    // SAFETY: the caller's identity-mapped controller; only the latch of this
+    // pad is ever written.
+    let pin = unsafe { crabefi_hw::amd_gpio::GpioPin::new(base, size, line.pin) }.ok()?;
+    Some(if line.edge {
+        Interrupt::Latched(Box::new(AmdLatch(pin)))
+    } else {
+        Interrupt::Level {
+            line: InputLine::new(pin),
+            active_low: line.active_low,
+        }
+    })
 }
 
 fn evaluate(
@@ -261,7 +290,14 @@ pub(super) fn connection(
             if bus.base < gpio.base + gpio.size && gpio.base < bus.base + bus.size {
                 return None;
             }
-            Some((gpio, interrupt.pin, interrupt.active_low))
+            Some((
+                gpio,
+                Line {
+                    pin: interrupt.pin,
+                    active_low: interrupt.active_low,
+                    edge: interrupt.edge,
+                },
+            ))
         }
     };
     Some(Connection {
@@ -285,14 +321,10 @@ pub(super) unsafe fn adopt(connections: Vec<Connection>) -> Vec<Peripheral> {
         .filter_map(|connection| {
             let interrupt = match &connection.gpio {
                 None => None,
-                Some((gpio, pin, active_low)) => {
+                Some((gpio, line)) => {
                     let open = GPIO_CONTROLLERS.iter().find(|(hid, _)| *hid == gpio.hid)?.1;
                     // SAFETY: the caller's controller contract.
-                    let line = unsafe { open(gpio.base, gpio.size, *pin) }?;
-                    Some(Interrupt::Level {
-                        line,
-                        active_low: *active_low,
-                    })
+                    Some(unsafe { open(gpio.base, gpio.size, line) }?)
                 }
             };
             let bus = &connection.bus;

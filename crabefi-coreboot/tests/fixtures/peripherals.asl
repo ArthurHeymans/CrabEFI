@@ -70,6 +70,16 @@ DefinitionBlock ("", "DSDT", 2, "CRABEF", "PERIPHS", 1)
                         "\\_SB.GPIO", 0, ResourceConsumer, , ) { 9 }
                 })
             }
+            Device (GSC0)
+            {
+                Name (_HID, "GOOG0005")
+                Name (_CRS, ResourceTemplate () {
+                    I2cSerialBusV2 (0x50, ControllerInitiated, 400000, AddressingMode7Bit,
+                        "\\_SB.I2C2", 0, ResourceConsumer, , Exclusive, )
+                    GpioInt (Edge, ActiveLow, Exclusive, PullNone, 0,
+                        "\\_SB.GPIO", 0, ResourceConsumer, , ) { 3 }
+                })
+            }
             Device (MISS)
             {
                 Name (_HID, "ELAN0000")

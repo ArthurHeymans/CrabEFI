@@ -69,14 +69,37 @@ fn resolves_relative_sources_and_distinguishes_identically_named_controllers() {
     assert_eq!(device.bus.path, name("\\_SB.I2C2"));
     assert_eq!((device.bus.base, device.bus.size), (0xfedc4000, 0x1000));
     assert_eq!((device.address, device.speed_hz), (0x15, 400_000));
-    let (gpio, pin, active_low) = device.gpio.unwrap();
+    let (gpio, line) = device.gpio.unwrap();
+    assert_eq!((gpio.base, gpio.size), (0xfed81500, 0x400));
     assert_eq!(
-        (gpio.base, gpio.size, pin, active_low),
-        (0xfed81500, 0x400, 9, true)
+        line,
+        peripherals::Line {
+            pin: 9,
+            active_low: true,
+            edge: false
+        }
     );
     // A resource source naming no controller is not described.
     let path = name("\\_SB.I2C2.MISS");
     assert!(peripherals::connection(&interpreter, &path, Vec::new()).is_none());
+}
+
+#[test]
+fn edge_triggered_interrupts_are_described() {
+    let interpreter = interpreter();
+    let path = name("\\_SB.I2C2.GSC0");
+    let ids = peripherals::ids(&interpreter, &path);
+    let device = peripherals::connection(&interpreter, &path, ids).unwrap();
+    assert_eq!(device.ids, vec!["GOOG0005".to_string()]);
+    assert_eq!(device.address, 0x50);
+    assert_eq!(
+        device.gpio.unwrap().1,
+        peripherals::Line {
+            pin: 3,
+            active_low: true,
+            edge: true
+        }
+    );
 }
 
 #[test]
@@ -98,10 +121,7 @@ fn a_full_mmio_device_list_does_not_stop_peripheral_discovery() {
     }
     let mut connections = Vec::new();
     discover_namespace_devices(&interpreter, &mut info, &mut connections, &mut Vec::new());
-    assert_eq!(
-        connections,
-        touchpad(&interpreter).into_iter().collect::<Vec<_>>()
-    );
+    assert!(connections.contains(&touchpad(&interpreter).unwrap()));
 }
 
 #[test]
