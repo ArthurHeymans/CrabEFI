@@ -1316,6 +1316,9 @@ pub struct PlatformConfig<'a> {
     /// Keyboard/console input for `SimpleTextInput` and the boot menu.
     pub console_input: Option<&'a mut dyn ConsoleInput>,
 
+    /// Devices on platform-owned buses, bound to CrabEFI's drivers.
+    pub peripherals: alloc::vec::Vec<crate::peripheral::Peripheral>,
+
     /// Framebuffer for `EFI_GRAPHICS_OUTPUT_PROTOCOL` and the boot menu.
     pub framebuffer: Option<FramebufferConfig>,
 
@@ -1426,6 +1429,7 @@ pub struct PlatformConfigBuilder<'a> {
     variable_storage: VariableStorage<'a>,
     debug_output: Option<&'a mut dyn DebugOutput>,
     console_input: Option<&'a mut dyn ConsoleInput>,
+    peripherals: alloc::vec::Vec<crate::peripheral::Peripheral>,
     framebuffer: Option<FramebufferConfig>,
     acpi_rsdp: Option<u64>,
     smbios: Option<u64>,
@@ -1464,6 +1468,7 @@ impl<'a> PlatformConfigBuilder<'a> {
             variable_storage: VariableStorage::None,
             debug_output: None,
             console_input: None,
+            peripherals: alloc::vec::Vec::new(),
             framebuffer: None,
             acpi_rsdp: None,
             smbios: None,
@@ -1511,6 +1516,12 @@ impl<'a> PlatformConfigBuilder<'a> {
     /// Keyboard/console input for `SimpleTextInput` and the boot menu.
     pub fn console_input(mut self, value: &'a mut dyn ConsoleInput) -> Self {
         self.console_input = Some(value);
+        self
+    }
+
+    /// Add a device on a platform-owned bus.
+    pub fn peripheral(mut self, value: crate::peripheral::Peripheral) -> Self {
+        self.peripherals.push(value);
         self
     }
 
@@ -1612,6 +1623,7 @@ impl<'a> PlatformConfigBuilder<'a> {
             variable_storage: self.variable_storage,
             debug_output: self.debug_output,
             console_input: self.console_input,
+            peripherals: self.peripherals,
             framebuffer: self.framebuffer,
             acpi_rsdp: self.acpi_rsdp,
             smbios: self.smbios,
