@@ -7,6 +7,7 @@ use super::XhciError;
 use super::speed::{BOS_DESCRIPTOR_TYPE, BosHeader, LinkSpeed, SublinkSpeeds};
 use crate::barrier;
 use crate::exec::{self, BoxFuture};
+use crate::time::Timeout;
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 use core::cell::RefCell;
@@ -97,6 +98,22 @@ impl RootPortScan {
     fn has_new_connection(&self, connected: impl Fn(u8) -> bool) -> bool {
         self.untried().any(connected)
     }
+
+    async fn wait_for_new_connection(
+        &self,
+        timeout: Timeout,
+        connected: impl Fn(u8) -> bool,
+    ) -> bool {
+        loop {
+            if self.has_new_connection(&connected) {
+                return true;
+            }
+            if timeout.is_expired() {
+                return self.has_new_connection(connected);
+            }
+            exec::yield_now().await;
+        }
+    }
 }
 
 /// A port whose device neither attached nor stayed connected lost it to
@@ -126,6 +143,42 @@ mod root_port_scan_tests {
         let second = scan.take_new_connections(|port| port == 3 || port == 18);
         assert_eq!(second, [18]);
         assert!(!scan.has_new_connection(|port| port == 3 || port == 18));
+    }
+
+    #[test]
+    fn staggered_migrations_share_the_same_wait_window() {
+        use core::cell::Cell;
+
+        let mut scan = RootPortScan::new(26);
+        assert_eq!(
+            scan.take_new_connections(|port| port == 2 || port == 3),
+            [2, 3]
+        );
+        let timeout = Timeout::from_ms(MOVED_DEVICE_TIMEOUT_MS);
+
+        // Each SuperSpeed connection appears only after waiting. Attaching
+        // the first device must not end the wait for the second migration.
+        for port in [18, 19] {
+            let polls = Cell::new(0);
+            assert!(exec::block_on(scan.wait_for_new_connection(timeout, |p| {
+                if p != port {
+                    return false;
+                }
+                polls.set(polls.get() + 1);
+                polls.get() > 1
+            })));
+            assert_eq!(scan.take_new_connections(|p| p == port), [port]);
+        }
+
+        // Once the original deadline expires, an absent device cannot keep
+        // enumeration waiting, but an already-connected port is still found.
+        let expired = Timeout::from_raw(crate::time::read_counter());
+        assert!(!exec::block_on(
+            scan.wait_for_new_connection(expired, |_| false)
+        ));
+        assert!(exec::block_on(
+            scan.wait_for_new_connection(expired, |port| port == 20)
+        ));
     }
 
     #[test]
@@ -575,6 +628,7 @@ impl super::XhciController {
     /// Enumerate ports and attach devices
     pub(super) async fn enumerate_ports(&mut self) -> Result<(), XhciError> {
         let mut scan = RootPortScan::new(self.num_ports);
+        let mut migration_timeout = None;
 
         loop {
             let ports =
@@ -599,19 +653,21 @@ impl super::XhciController {
                 .await
             };
 
-            let mut moved = false;
             for (port, up) in ports.into_iter().zip(link_up) {
                 let attached = up && self.attach_root_port_device(port).await;
                 if device_moved(attached, self.portsc(port).current_connect_status()) {
                     log::debug!("Port {}: device disconnected during bring-up", port);
-                    moved = true;
+                    migration_timeout = Some(Timeout::from_ms(MOVED_DEVICE_TIMEOUT_MS));
                 }
             }
 
-            if !moved
-                || !exec::wait_for(MOVED_DEVICE_TIMEOUT_MS, || {
-                    scan.has_new_connection(|port| self.portsc(port).current_connect_status())
-                })
+            // Keep the deadline across successful passes: other devices may
+            // still be training their SuperSpeed links after the first moves.
+            let Some(timeout) = migration_timeout else {
+                break;
+            };
+            if !scan
+                .wait_for_new_connection(timeout, |port| self.portsc(port).current_connect_status())
                 .await
             {
                 break;
@@ -769,7 +825,8 @@ impl super::XhciController {
 
                 if let Err(e) = self.address_device(slot_id, port, speed) {
                     log::error!("Failed to address device on port {}: {:?}", port, e);
-                    return true;
+                    let status = self.portsc(port);
+                    return status.current_connect_status() && status.port_enabled_disabled();
                 }
 
                 // Get device descriptor
@@ -828,6 +885,7 @@ impl super::XhciController {
                 log::error!("Failed to enable slot for port {}: {:?}", port, e);
             }
         }
-        true
+        let status = self.portsc(port);
+        status.current_connect_status() && status.port_enabled_disabled()
     }
 }
