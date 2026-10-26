@@ -67,14 +67,14 @@ fn with_devices<R>(f: impl FnOnce(&mut Vec<Box<dyn KeyboardDevice>>) -> R) -> R 
     result
 }
 
-/// Initialize the PS/2 keyboard and register the built-in keyboards.
+/// Initialize and register the PS/2 keyboard. USB keyboards register when
+/// USB is enumerated.
 pub fn init() {
     #[cfg(target_arch = "x86_64")]
     {
         crate::drivers::keyboard::init();
         register(Box::new(crate::drivers::keyboard::Ps2Keyboard));
     }
-    register(Box::new(crate::drivers::usb::hid_keyboard::UsbKeyboard));
 }
 
 /// Hand every keyboard to the OS before ExitBootServices.

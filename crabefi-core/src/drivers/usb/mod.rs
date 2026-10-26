@@ -409,52 +409,53 @@ pub fn init_keyboards_public() {
     init_keyboards();
 }
 
-/// Initialize USB keyboards from all controllers (internal)
+/// Register every USB boot keyboard on every controller (internal)
 fn init_keyboards() {
-    let controllers = ALL_CONTROLLERS.lock();
-
-    for (idx, handle) in controllers.iter().enumerate() {
-        with_usb_controller!(handle, mut |controller| {
-            if let Err(e) = hid_keyboard::init_keyboard(controller, idx) {
-                log::debug!(
-                    "No HID keyboard on {} controller {}: {:?}",
-                    controller.controller_type(),
-                    idx,
-                    e
-                );
-            }
-        });
+    let keyboards = {
+        let controllers = ALL_CONTROLLERS.lock();
+        let mut keyboards = alloc::vec::Vec::new();
+        for (idx, handle) in controllers.iter().enumerate() {
+            with_usb_controller!(handle, mut |controller| {
+                let mut addresses = alloc::vec::Vec::new();
+                controller.for_each_hid_keyboard(&mut |address| addresses.push(address));
+                for address in addresses {
+                    match hid_keyboard::init_keyboard(controller, idx, address) {
+                        Ok(keyboard) => keyboards.push(keyboard),
+                        Err(e) => log::warn!("USB keyboard {} unusable: {:?}", address, e),
+                    }
+                }
+            });
+        }
+        keyboards
+    };
+    // Registered devices poll through the controller list themselves.
+    for keyboard in keyboards {
+        crate::drivers::keyboard_common::register(Box::new(keyboard));
     }
 }
 
-/// Initialize USB mice from all controllers
+/// Register every USB boot mouse on every controller
 #[cfg(feature = "ui")]
 pub fn init_mice() {
-    let controllers = ALL_CONTROLLERS.lock();
-
-    for (idx, handle) in controllers.iter().enumerate() {
-        with_usb_controller!(handle, mut |controller| {
-            if let Err(e) = hid_mouse::init_mouse(controller, idx) {
-                log::debug!(
-                    "No HID mouse on {} controller {}: {:?}",
-                    controller.controller_type(),
-                    idx,
-                    e
-                );
-            }
-        });
-    }
-}
-
-/// Poll USB mouse on a specific controller
-#[cfg(feature = "ui")]
-pub fn poll_mice_on_controller(controller_idx: usize) {
-    let controllers = ALL_CONTROLLERS.lock();
-
-    if let Some(handle) = controllers.get(controller_idx) {
-        with_usb_controller!(handle, mut |controller| {
-            hid_mouse::poll(controller);
-        });
+    let mice = {
+        let controllers = ALL_CONTROLLERS.lock();
+        let mut mice = alloc::vec::Vec::new();
+        for (idx, handle) in controllers.iter().enumerate() {
+            with_usb_controller!(handle, mut |controller| {
+                let mut addresses = alloc::vec::Vec::new();
+                controller.for_each_hid_mouse(&mut |address| addresses.push(address));
+                for address in addresses {
+                    match hid_mouse::init_mouse(controller, idx, address) {
+                        Ok(mouse) => mice.push(mouse),
+                        Err(e) => log::warn!("USB mouse {} unusable: {:?}", address, e),
+                    }
+                }
+            });
+        }
+        mice
+    };
+    for mouse in mice {
+        crate::drivers::pointer::register(Box::new(mouse));
     }
 }
 
@@ -500,24 +501,6 @@ pub fn find_mass_storage_devices() -> alloc::vec::Vec<(usize, u8)> {
         });
     }
     devices
-}
-
-/// Poll USB keyboards
-pub fn poll_keyboards() {
-    // Get which controller has the keyboard
-    let keyboard_ctrl_idx = match hid_keyboard::controller_idx() {
-        Some(idx) => idx,
-        None => return, // No keyboard initialized
-    };
-
-    let controllers = ALL_CONTROLLERS.lock();
-
-    // Only poll the specific controller that has the keyboard
-    if let Some(handle) = controllers.get(keyboard_ctrl_idx) {
-        with_usb_controller!(handle, mut |controller| {
-            hid_keyboard::poll(controller);
-        });
-    }
 }
 
 // ============================================================================
@@ -635,12 +618,12 @@ impl UsbController for XhciController {
         xhci::XhciController::for_each_mass_storage(self, f)
     }
 
-    fn find_hid_keyboard(&self) -> Option<u8> {
-        self.find_slot(|slot| slot.is_hid_keyboard)
+    fn for_each_hid_keyboard(&self, f: &mut dyn FnMut(u8)) {
+        xhci::XhciController::for_each_slot(self, |slot| slot.is_hid_keyboard, f)
     }
 
-    fn find_hid_mouse(&self) -> Option<u8> {
-        self.find_slot(|slot| slot.is_hid_mouse)
+    fn for_each_hid_mouse(&self, f: &mut dyn FnMut(u8)) {
+        xhci::XhciController::for_each_slot(self, |slot| slot.is_hid_mouse, f)
     }
 
     fn get_mouse_interrupt_endpoint(&self, device: u8) -> Option<self::controller::EndpointInfo> {

@@ -10,7 +10,6 @@
 
 use super::controller::{UsbController, UsbError, hid_request, req_type};
 use crate::time::Timeout;
-use spin::Mutex;
 
 #[cfg(test)]
 #[path = "hid_keyboard_tests.rs"]
@@ -123,6 +122,8 @@ pub struct UsbHidKeyboard {
     repeat_delay_timeout: Option<Timeout>,
     /// Timeout for repeat interval
     repeat_interval_timeout: Option<Timeout>,
+    /// Earliest time of the next poll
+    next_poll: Option<Timeout>,
 }
 
 impl UsbHidKeyboard {
@@ -150,11 +151,12 @@ impl UsbHidKeyboard {
             last_key: 0,
             repeat_delay_timeout: None,
             repeat_interval_timeout: None,
+            next_poll: None,
         }
     }
 
     /// Set boot protocol mode
-    pub fn set_boot_protocol<C: UsbController>(
+    pub fn set_boot_protocol<C: UsbController + ?Sized>(
         &mut self,
         controller: &mut C,
     ) -> Result<(), UsbError> {
@@ -173,7 +175,7 @@ impl UsbHidKeyboard {
     }
 
     /// Set idle rate (key repeat rate)
-    pub fn set_idle<C: UsbController>(
+    pub fn set_idle<C: UsbController + ?Sized>(
         &mut self,
         controller: &mut C,
         rate_ms: u8,
@@ -192,7 +194,10 @@ impl UsbHidKeyboard {
     }
 
     /// Set LED state
-    pub fn set_leds<C: UsbController>(&mut self, controller: &mut C) -> Result<(), UsbError> {
+    pub fn set_leds<C: UsbController + ?Sized>(
+        &mut self,
+        controller: &mut C,
+    ) -> Result<(), UsbError> {
         let mut led_byte = 0u8;
         if self.num_lock {
             led_byte |= 1;
@@ -641,30 +646,19 @@ impl UsbHidKeyboard {
 }
 
 // ============================================================================
-// Global USB Keyboard
+// Keyboard lifecycle
 // ============================================================================
-
-/// Global USB keyboard instance
-static USB_KEYBOARD: Mutex<Option<UsbHidKeyboard>> = Mutex::new(None);
 
 /// Minimum poll interval in milliseconds
 /// USB keyboards typically have 8-10ms poll intervals
 const MIN_POLL_INTERVAL_MS: u64 = 8;
 
-/// Next poll timeout (None = poll immediately)
-static NEXT_POLL_TIMEOUT: Mutex<Option<Timeout>> = Mutex::new(None);
-
-/// Initialize USB keyboard from a controller
-pub fn init_keyboard<C: UsbController>(
+/// Set up the boot-protocol keyboard at `device_addr`.
+pub fn init_keyboard<C: UsbController + ?Sized>(
     controller: &mut C,
     controller_idx: usize,
-) -> Result<(), UsbError> {
-    // Find HID keyboard device
-    let device_addr = controller
-        .find_hid_keyboard()
-        .ok_or(UsbError::DeviceNotFound)?;
-
-    // Get interrupt endpoint
+    device_addr: u8,
+) -> Result<UsbHidKeyboard, UsbError> {
     let ep_info = controller
         .get_interrupt_endpoint(device_addr)
         .ok_or(UsbError::DeviceNotFound)?;
@@ -684,92 +678,54 @@ pub fn init_keyboard<C: UsbController>(
         ep_info.interval,
     );
 
-    // Set boot protocol
-    log::debug!("Setting boot protocol for keyboard device {}", device_addr);
     if let Err(e) = keyboard.set_boot_protocol(controller) {
         log::warn!("Failed to set boot protocol: {:?}", e);
     }
-    log::debug!("Boot protocol set");
-
     // Set idle rate (30ms)
-    log::debug!("Setting idle rate");
     if let Err(e) = keyboard.set_idle(controller, 30) {
         log::warn!("Failed to set idle rate: {:?}", e);
     }
-    log::debug!("Idle rate set");
-
-    *USB_KEYBOARD.lock() = Some(keyboard);
-
-    log::info!("USB HID keyboard initialized");
-    Ok(())
+    Ok(keyboard)
 }
 
-/// Get key from USB keyboard
-pub fn get_key() -> Option<(u16, u16)> {
-    let mut keyboard = USB_KEYBOARD.lock();
-    let key = keyboard.as_mut()?.get_key()?;
-
-    let scan_code = (key >> 8) & 0xFF;
-    let unicode = key & 0xFF;
-    Some((scan_code, unicode))
-}
-
-/// Poll USB keyboard (called periodically)
-///
-/// This function implements rate limiting to avoid polling too frequently.
-/// USB keyboards typically have 8-10ms poll intervals, so polling faster
-/// than that provides no benefit and can cause issues with key repeat.
-pub fn poll<C: UsbController>(controller: &mut C) {
-    // Rate limit: only poll every MIN_POLL_INTERVAL_MS
-    {
-        let mut timeout_guard = NEXT_POLL_TIMEOUT.lock();
-        if let Some(ref timeout) = *timeout_guard
-            && !timeout.is_expired()
+impl UsbHidKeyboard {
+    /// Poll for a new report, at most every [`MIN_POLL_INTERVAL_MS`], and
+    /// generate key repeats.
+    fn poll<C: UsbController + ?Sized>(&mut self, controller: &mut C) {
+        if self
+            .next_poll
+            .as_ref()
+            .is_some_and(|next| !next.is_expired())
         {
-            // Not enough time has passed, skip this poll
-            // But still check key repeat with the current keyboard state
-            drop(timeout_guard); // Release lock before acquiring keyboard lock
-            let mut keyboard_guard = USB_KEYBOARD.lock();
-            if let Some(keyboard) = keyboard_guard.as_mut() {
-                keyboard.handle_repeat();
-            }
+            self.handle_repeat();
             return;
         }
-        // Set next poll timeout
-        *timeout_guard = Some(Timeout::from_ms(MIN_POLL_INTERVAL_MS));
+        self.next_poll = Some(Timeout::from_ms(MIN_POLL_INTERVAL_MS));
+        self.poll_report(controller);
     }
 
-    let mut keyboard_guard = USB_KEYBOARD.lock();
-    let keyboard = match keyboard_guard.as_mut() {
-        Some(k) => k,
-        None => return,
-    };
+    fn poll_report<C: UsbController + ?Sized>(&mut self, controller: &mut C) {
+        // Most real keyboards require interrupt IN; GET_REPORT is only a legacy
+        // controller fallback. A pending interrupt TD is not an all-keys-up report.
+        let mut report_buf = [0u8; 8];
+        let result = match controller.interrupt_transfer(
+            self.device_address,
+            self.endpoint,
+            &mut report_buf,
+        ) {
+            Err(UsbError::NotSupported) => controller.control_transfer(
+                self.device_address,
+                req_type::DIR_IN | req_type::TYPE_CLASS | req_type::RCPT_INTERFACE,
+                hid_request::GET_REPORT,
+                0x0100,
+                self.interface_number as u16,
+                Some(&mut report_buf),
+            ),
+            result => result,
+        };
 
-    poll_report(keyboard, controller);
-}
-
-fn poll_report<C: UsbController>(keyboard: &mut UsbHidKeyboard, controller: &mut C) {
-    // Most real keyboards require interrupt IN; GET_REPORT is only a legacy
-    // controller fallback. A pending interrupt TD is not an all-keys-up report.
-    let mut report_buf = [0u8; 8];
-    let result = match controller.interrupt_transfer(
-        keyboard.device_address(),
-        keyboard.endpoint,
-        &mut report_buf,
-    ) {
-        Err(UsbError::NotSupported) => controller.control_transfer(
-            keyboard.device_address(),
-            req_type::DIR_IN | req_type::TYPE_CLASS | req_type::RCPT_INTERFACE,
-            hid_request::GET_REPORT,
-            0x0100,
-            keyboard.interface_number as u16,
-            Some(&mut report_buf),
-        ),
-        result => result,
-    };
-
-    match result {
-        Ok(8) => {
+        // No completion, short report, or error: retain the held-key state.
+        if let Ok(8) = result {
             let report = KeyboardReport {
                 modifiers: report_buf[0],
                 reserved: report_buf[1],
@@ -782,92 +738,72 @@ fn poll_report<C: UsbController>(keyboard: &mut UsbHidKeyboard, controller: &mut
                     report_buf[7],
                 ],
             };
-            keyboard.process_report(&report);
+            self.process_report(&report);
         }
-        _ => {
-            // No completion, short report, or error: retain the held-key state.
-        }
-    }
 
-    keyboard.handle_repeat();
+        self.handle_repeat();
+    }
 }
 
-/// Get EFI shift/toggle state bits from USB keyboard
-///
-/// Returns (shift_state_bits, toggle_state_bits) without the VALID flags.
-pub fn get_efi_state() -> (u32, u8) {
-    use crate::drivers::keyboard_common::efi_shift_state::*;
-    use crate::drivers::keyboard_common::efi_toggle_state::*;
-
-    let guard = USB_KEYBOARD.lock();
-    let keyboard = match guard.as_ref() {
-        Some(k) => k,
-        None => return (0, 0),
-    };
-
-    let mods = keyboard.prev_report.modifiers;
-    let mut shift_state = 0u32;
-    let mut toggle_state = 0u8;
-
-    if mods & KeyboardReport::MOD_LEFT_SHIFT != 0 {
-        shift_state |= LEFT_SHIFT_PRESSED;
-    }
-    if mods & KeyboardReport::MOD_RIGHT_SHIFT != 0 {
-        shift_state |= RIGHT_SHIFT_PRESSED;
-    }
-    if mods & KeyboardReport::MOD_LEFT_CTRL != 0 {
-        shift_state |= LEFT_CONTROL_PRESSED;
-    }
-    if mods & KeyboardReport::MOD_RIGHT_CTRL != 0 {
-        shift_state |= RIGHT_CONTROL_PRESSED;
-    }
-    if mods & KeyboardReport::MOD_LEFT_ALT != 0 {
-        shift_state |= LEFT_ALT_PRESSED;
-    }
-    if mods & KeyboardReport::MOD_RIGHT_ALT != 0 {
-        shift_state |= RIGHT_ALT_PRESSED;
-    }
-    if mods & KeyboardReport::MOD_LEFT_GUI != 0 {
-        shift_state |= LEFT_LOGO_PRESSED;
-    }
-    if mods & KeyboardReport::MOD_RIGHT_GUI != 0 {
-        shift_state |= RIGHT_LOGO_PRESSED;
-    }
-
-    if keyboard.caps_lock {
-        toggle_state |= CAPS_LOCK_ACTIVE;
-    }
-    if keyboard.num_lock {
-        toggle_state |= NUM_LOCK_ACTIVE;
-    }
-
-    (shift_state, toggle_state)
-}
-
-/// Check if USB keyboard is available
-pub fn is_available() -> bool {
-    USB_KEYBOARD.lock().is_some()
-}
-
-/// Get the controller index that has the keyboard
-pub fn controller_idx() -> Option<usize> {
-    USB_KEYBOARD.lock().as_ref().map(|k| k.controller_idx())
-}
-
-/// The USB HID boot-protocol keyboard as a keyboard.
-pub(crate) struct UsbKeyboard;
-
-impl crate::drivers::keyboard_common::KeyboardDevice for UsbKeyboard {
+impl crate::drivers::keyboard_common::KeyboardDevice for UsbHidKeyboard {
     fn read_key(&mut self) -> Option<crate::platform::Key> {
-        super::poll_keyboards();
-        get_key().map(|(scancode, unicode_char)| crate::platform::Key {
-            scancode,
-            unicode_char,
+        super::with_controller(self.controller_idx, |controller| {
+            UsbHidKeyboard::poll(self, controller)
+        })?;
+        let key = self.get_key()?;
+        Some(crate::platform::Key {
+            scancode: (key >> 8) & 0xFF,
+            unicode_char: key & 0xFF,
         })
     }
 
     fn key_state(&mut self) -> crate::platform::KeyState {
-        let (shift_state, toggle_state) = get_efi_state();
+        self.efi_state()
+    }
+}
+
+impl UsbHidKeyboard {
+    /// EFI shift/toggle state bits, without the VALID flags.
+    fn efi_state(&self) -> crate::platform::KeyState {
+        use crate::drivers::keyboard_common::efi_shift_state::*;
+        use crate::drivers::keyboard_common::efi_toggle_state::*;
+
+        let mods = self.prev_report.modifiers;
+        let mut shift_state = 0u32;
+        let mut toggle_state = 0u8;
+
+        if mods & KeyboardReport::MOD_LEFT_SHIFT != 0 {
+            shift_state |= LEFT_SHIFT_PRESSED;
+        }
+        if mods & KeyboardReport::MOD_RIGHT_SHIFT != 0 {
+            shift_state |= RIGHT_SHIFT_PRESSED;
+        }
+        if mods & KeyboardReport::MOD_LEFT_CTRL != 0 {
+            shift_state |= LEFT_CONTROL_PRESSED;
+        }
+        if mods & KeyboardReport::MOD_RIGHT_CTRL != 0 {
+            shift_state |= RIGHT_CONTROL_PRESSED;
+        }
+        if mods & KeyboardReport::MOD_LEFT_ALT != 0 {
+            shift_state |= LEFT_ALT_PRESSED;
+        }
+        if mods & KeyboardReport::MOD_RIGHT_ALT != 0 {
+            shift_state |= RIGHT_ALT_PRESSED;
+        }
+        if mods & KeyboardReport::MOD_LEFT_GUI != 0 {
+            shift_state |= LEFT_LOGO_PRESSED;
+        }
+        if mods & KeyboardReport::MOD_RIGHT_GUI != 0 {
+            shift_state |= RIGHT_LOGO_PRESSED;
+        }
+
+        if self.caps_lock {
+            toggle_state |= CAPS_LOCK_ACTIVE;
+        }
+        if self.num_lock {
+            toggle_state |= NUM_LOCK_ACTIVE;
+        }
+
         crate::platform::KeyState {
             shift_state,
             toggle_state,

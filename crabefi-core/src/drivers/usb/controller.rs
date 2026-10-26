@@ -799,24 +799,22 @@ pub trait UsbController {
         for_each_mass_storage_device(self.devices(), f);
     }
 
-    /// Find a HID keyboard device
-    ///
-    /// # Returns
-    /// Device address/slot ID if found
-    fn find_hid_keyboard(&self) -> Option<u8> {
+    /// Visit every HID boot keyboard address/slot ID on this controller.
+    fn for_each_hid_keyboard(&self, f: &mut dyn FnMut(u8)) {
         self.devices()
             .iter()
-            .find_map(|h| h.as_ref().filter(|h| h.is_hid_keyboard).map(|h| h.address))
+            .flatten()
+            .filter(|device| device.is_hid_keyboard)
+            .for_each(|device| f(device.address));
     }
 
-    /// Find a HID mouse device
-    ///
-    /// # Returns
-    /// Device address/slot ID if found
-    fn find_hid_mouse(&self) -> Option<u8> {
+    /// Visit every HID boot mouse address/slot ID on this controller.
+    fn for_each_hid_mouse(&self, f: &mut dyn FnMut(u8)) {
         self.devices()
             .iter()
-            .find_map(|h| h.as_ref().filter(|h| h.is_hid_mouse).map(|h| h.address))
+            .flatten()
+            .filter(|device| device.is_hid_mouse)
+            .for_each(|device| f(device.address));
     }
 
     /// Get mouse interrupt endpoint info for a device
