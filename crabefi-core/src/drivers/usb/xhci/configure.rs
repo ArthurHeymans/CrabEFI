@@ -308,9 +308,12 @@ impl super::XhciController {
             //   For LS/FS: period = 2^(Interval) * 125µs, bInterval is in ms
             //   Use Interval such that 2^Interval ≈ bInterval * 8
             //   For HS: bInterval already is exponent+1
-            let xhci_interval = hid_interval(slot.speed, interrupt_interval);
+            let xhci_interval = hid_interval(
+                if slot.is_superspeed { 4 } else { slot.speed },
+                interrupt_interval,
+            );
             let max_packet = interrupt_max_packet & 0x7ff;
-            let max_burst = if slot.speed == 3 {
+            let max_burst = if !slot.is_superspeed && slot.speed == 3 {
                 ((interrupt_max_packet >> 11) & 3) as u8
             } else {
                 0

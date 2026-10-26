@@ -12,6 +12,7 @@ pub mod enumerate;
 pub mod init;
 pub mod ring;
 pub mod slots;
+mod speed;
 pub mod transfers;
 
 pub use ring::TrbRing;
@@ -105,6 +106,8 @@ pub struct XhciController {
     registers: Registers<IdentityMapper>,
     /// Number of ports
     num_ports: u8,
+    /// USB3 root-port ranges and their controller-local speed IDs.
+    usb3_protocols: alloc::vec::Vec<speed::Usb3Protocol>,
     /// Page size used by controller
     page_size: u32,
     /// Context stride (32 or 64 bytes based on HCCPARAMS1.CSZ)

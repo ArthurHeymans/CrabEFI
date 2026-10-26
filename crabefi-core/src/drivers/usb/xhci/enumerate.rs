@@ -4,14 +4,129 @@ use super::super::controller::{
     HUB_DESCRIPTOR_TYPE, hub_feature, hub_port_status, req_type, request,
 };
 use super::XhciError;
+use super::speed::{BOS_DESCRIPTOR_TYPE, BosHeader, LinkSpeed, SublinkSpeeds};
 use crate::barrier;
 use crate::exec::{self, BoxFuture};
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 use core::cell::RefCell;
 use xhci::ring::trb::command;
+use zerocopy::FromBytes;
+use zerocopy::byteorder::{LittleEndian, U32};
+
+const SUPER_SPEED_HUB_DESCRIPTOR_TYPE: u8 = 0x2a;
+const SET_HUB_DEPTH: u8 = 0x0c;
+
+fn hub_descriptor_type(is_superspeed: bool) -> u8 {
+    if is_superspeed {
+        SUPER_SPEED_HUB_DESCRIPTOR_TYPE
+    } else {
+        HUB_DESCRIPTOR_TYPE
+    }
+}
+
+fn hub_depth(route: u32) -> u16 {
+    (0..5)
+        .take_while(|tier| (route >> (tier * 4)) & 0xf != 0)
+        .count() as u16
+}
+
+fn usb2_downstream_speed(status: u16) -> u8 {
+    if status & hub_port_status::HIGH_SPEED != 0 {
+        3
+    } else if status & hub_port_status::LOW_SPEED != 0 {
+        2
+    } else {
+        1
+    }
+}
+
+#[cfg(test)]
+mod hub_protocol_tests {
+    use super::*;
+
+    #[test]
+    fn hub_protocol_and_depth_follow_the_xhci_slot() {
+        assert_eq!(hub_descriptor_type(false), 0x29);
+        assert_eq!(hub_descriptor_type(true), 0x2a);
+        assert_eq!(hub_depth(0), 0);
+        assert_eq!(hub_depth(2), 1);
+        assert_eq!(hub_depth(0x321), 3);
+    }
+
+    #[test]
+    fn usb2_port_speed_decodes_status_bits() {
+        assert_eq!(usb2_downstream_speed(hub_port_status::HIGH_SPEED), 3);
+        assert_eq!(usb2_downstream_speed(hub_port_status::LOW_SPEED), 2);
+        assert_eq!(usb2_downstream_speed(0), 1);
+    }
+}
 
 impl super::XhciController {
+    fn hub_sublink_speeds(&mut self, slot_id: u8) -> Result<Option<SublinkSpeeds>, XhciError> {
+        let mut header = [0u8; 5];
+        let length = self.control_transfer(
+            slot_id,
+            req_type::DIR_IN | req_type::TYPE_STANDARD | req_type::RCPT_DEVICE,
+            request::GET_DESCRIPTOR,
+            u16::from(BOS_DESCRIPTOR_TYPE) << 8,
+            0,
+            Some(&mut header),
+        )?;
+        if length != header.len() {
+            return Err(XhciError::InvalidParameter);
+        }
+        let length = BosHeader::total_length(&header)?;
+        if length > 4096 {
+            return Err(XhciError::InvalidParameter);
+        }
+        let mut bos = alloc::vec![0u8; length];
+        let received = self.control_transfer(
+            slot_id,
+            req_type::DIR_IN | req_type::TYPE_STANDARD | req_type::RCPT_DEVICE,
+            request::GET_DESCRIPTOR,
+            u16::from(BOS_DESCRIPTOR_TYPE) << 8,
+            0,
+            Some(&mut bos),
+        )?;
+        SublinkSpeeds::from_bos(&bos[..received])
+    }
+
+    fn superspeed_hub_port_speed(
+        &mut self,
+        hub_slot: u8,
+        port: u8,
+        root_port: u8,
+        sublinks: Option<&SublinkSpeeds>,
+    ) -> Result<u8, XhciError> {
+        let link = if let Some(sublinks) = sublinks {
+            // USB 3.1+ ordinary port status always reports the legacy 5-Gbit/s
+            // encoding. Extended status supplies hub-local IDs and lane counts.
+            let mut status = [0u8; 8];
+            let length = self.control_transfer(
+                hub_slot,
+                req_type::DIR_IN | req_type::TYPE_CLASS | req_type::RCPT_OTHER,
+                request::GET_STATUS,
+                2,
+                u16::from(port),
+                Some(&mut status),
+            )?;
+            if length != status.len() {
+                return Err(XhciError::InvalidParameter);
+            }
+            let extended = U32::<LittleEndian>::read_from_bytes(&status[4..])
+                .unwrap()
+                .get();
+            sublinks
+                .port_speed(extended)
+                .ok_or(XhciError::InvalidParameter)?
+        } else {
+            LinkSpeed::SUPER
+        };
+        self.usb3_speed_id(root_port, link)
+            .ok_or(XhciError::InvalidParameter)
+    }
+
     /// Configure a hub device and enumerate its downstream ports.
     ///
     /// This mirrors the EHCI `enumerate_hub()` logic adapted for xHCI's
@@ -54,13 +169,25 @@ impl super::XhciController {
             self.set_configuration(hub_slot_id, config_info.configuration_value)?;
         }
 
-        // Get hub descriptor
+        let (hub_is_superspeed, bcd_usb, parent_route) = self
+            .slots
+            .get(hub_slot_id as usize)
+            .and_then(|slot| slot.as_ref())
+            .map(|slot| {
+                (
+                    slot.is_superspeed,
+                    slot.device_desc.bcd_usb,
+                    slot.route_string,
+                )
+            })
+            .ok_or(XhciError::DeviceNotFound)?;
+        // Get the descriptor belonging to this hub's bus protocol.
         let mut hub_desc_buf = [0u8; 12];
         self.control_transfer(
             hub_slot_id,
             req_type::DIR_IN | req_type::TYPE_CLASS | req_type::RCPT_DEVICE,
             request::GET_DESCRIPTOR,
-            (HUB_DESCRIPTOR_TYPE as u16) << 8,
+            u16::from(hub_descriptor_type(hub_is_superspeed)) << 8,
             0,
             Some(&mut hub_desc_buf),
         )?;
@@ -79,6 +206,23 @@ impl super::XhciController {
             num_ports,
             power_delay
         );
+
+        let sublinks = if hub_is_superspeed && bcd_usb >= 0x0310 {
+            self.hub_sublink_speeds(hub_slot_id)?
+        } else {
+            None
+        };
+
+        if hub_is_superspeed {
+            self.control_transfer(
+                hub_slot_id,
+                req_type::DIR_OUT | req_type::TYPE_CLASS | req_type::RCPT_DEVICE,
+                SET_HUB_DEPTH,
+                hub_depth(parent_route),
+                0,
+                None,
+            )?;
+        }
 
         // Mark slot as hub and store route info
         if let Some(slot) = self
@@ -189,14 +333,25 @@ impl super::XhciController {
                         None,
                     );
                     if ps & hub_port_status::ENABLE != 0 {
-                        speed = if ps & hub_port_status::HIGH_SPEED != 0 {
-                            3
-                        } else if ps & hub_port_status::LOW_SPEED != 0 {
-                            2
+                        if hub_is_superspeed {
+                            match self.superspeed_hub_port_speed(
+                                hub_slot_id,
+                                p,
+                                root_port,
+                                sublinks.as_ref(),
+                            ) {
+                                Ok(port_speed) => {
+                                    speed = port_speed;
+                                    reset_ok = true;
+                                }
+                                Err(error) => {
+                                    log::warn!("Hub port {} speed unavailable: {:?}", p, error)
+                                }
+                            }
                         } else {
-                            1
-                        };
-                        reset_ok = true;
+                            speed = usb2_downstream_speed(ps);
+                            reset_ok = true;
+                        }
                     }
                     break;
                 }
@@ -214,12 +369,6 @@ impl super::XhciController {
             exec::sleep_ms(10).await;
 
             // Build route string: parent's route | (port << (4 * tier))
-            let parent_route = self
-                .slots
-                .get(hub_slot_id as usize)
-                .and_then(|s| s.as_ref())
-                .map(|s| s.route_string)
-                .unwrap_or(0);
             // Find which nibble is the first zero (that's our tier)
             let mut route = parent_route;
             for tier in 0..5u32 {
@@ -403,12 +552,16 @@ impl super::XhciController {
         let status = portsc();
         let speed = status.port_speed();
         let link_state = status.port_link_state();
-        let speed_name = match speed {
-            1 => "Full",
-            2 => "Low",
-            3 => "High",
-            4 => "Super",
-            _ => "Unknown",
+        let is_usb3 = this.borrow().is_superspeed_port(port, speed);
+        let speed_name = if is_usb3 {
+            "SuperSpeed"
+        } else {
+            match speed {
+                1 => "Full",
+                2 => "Low",
+                3 => "High",
+                _ => "Unknown",
+            }
         };
         let link_name = match link_state {
             0 => "U0",
@@ -431,7 +584,6 @@ impl super::XhciController {
         this.borrow_mut().clear_port_changes(port);
 
         let status = portsc();
-        let is_usb3 = speed == 4;
         if is_usb3 && status.port_enabled_disabled() && status.port_link_state() == 0 {
             log::debug!("Port {}: USB3 device already in U0, skipping reset", port);
         } else if is_usb3 && status.port_link_state() == 7 {

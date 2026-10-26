@@ -182,7 +182,7 @@ impl super::XhciController {
             .slots
             .get(slot_id as usize)
             .and_then(|slot| slot.as_ref())
-            .is_some_and(|slot| slot.speed == 1);
+            .is_some_and(|slot| !slot.is_superspeed && slot.speed == 1);
         if full_speed {
             self.update_full_speed_ep0_max_packet(slot_id, short_desc[7] as u16)?;
         }
