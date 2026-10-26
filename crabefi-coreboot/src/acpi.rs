@@ -15,7 +15,21 @@ use core::ptr::NonNull;
 use crabefi::PciEcamRegion;
 #[cfg(target_arch = "aarch64")]
 use crabefi::fdt::PciDmaDomain;
-use crabefi::fdt::{DsdtDevice, MAX_DSDT_DEVICES, MAX_ECAM_REGIONS, PlatformInfo};
+use crabefi::fdt::{DsdtDevice, MAX_ECAM_REGIONS, PlatformInfo};
+
+#[cfg(feature = "ui")]
+mod input;
+#[cfg(feature = "ui")]
+mod input_resources;
+#[cfg(all(test, feature = "ui"))]
+#[path = "acpi/input_tests.rs"]
+mod input_tests;
+
+pub struct Discovery {
+    pub info: PlatformInfo,
+    #[cfg(feature = "ui")]
+    pub touchpad: Option<crate::touchpad::Touchpad>,
+}
 
 // ---------------------------------------------------------------------------
 // Handler — bridges the `acpi` crate to CrabEFI's hardware
@@ -271,8 +285,10 @@ impl Handler for CrabEfiHandler {
 ///
 /// `rsdp_addr` must point to a valid ACPI RSDP in physical memory, and all
 /// table pointers reachable from it must reside in mapped memory.
-pub unsafe fn discover_platform(rsdp_addr: u64) -> PlatformInfo {
+pub unsafe fn discover_platform(rsdp_addr: u64) -> Discovery {
     let mut info = PlatformInfo::new();
+    #[cfg(feature = "ui")]
+    let mut touchpad = None;
     let handler = CrabEfiHandler::new();
 
     // 1. Parse the RSDP → XSDT/RSDT table chain.
@@ -280,7 +296,11 @@ pub unsafe fn discover_platform(rsdp_addr: u64) -> PlatformInfo {
         Ok(t) => t,
         Err(e) => {
             log::error!("ACPI: failed to parse tables: {:?}", e);
-            return info;
+            return Discovery {
+                info,
+                #[cfg(feature = "ui")]
+                touchpad,
+            };
         }
     };
 
@@ -318,7 +338,12 @@ pub unsafe fn discover_platform(rsdp_addr: u64) -> PlatformInfo {
     // 3. Try to build the full AML interpreter for DSDT device discovery.
     match acpi::platform::AcpiPlatform::new(tables, handler) {
         Ok(platform) => match acpi::aml::Interpreter::new_from_platform(&platform) {
-            Ok(interpreter) => discover_namespace_devices(&interpreter, &mut info),
+            Ok(interpreter) => discover_namespace_devices(
+                &interpreter,
+                &mut info,
+                #[cfg(feature = "ui")]
+                &mut touchpad,
+            ),
             Err(e) => log::warn!("ACPI: AML interpreter init failed: {:?}", e),
         },
         Err(e) => log::warn!("ACPI: platform init failed: {:?}", e),
@@ -368,7 +393,11 @@ pub unsafe fn discover_platform(rsdp_addr: u64) -> PlatformInfo {
         }
     }
 
-    info
+    Discovery {
+        info,
+        #[cfg(feature = "ui")]
+        touchpad,
+    }
 }
 
 /// Locate a TPM 1.2 event log described by the ACPI TCPA table.
@@ -565,6 +594,7 @@ fn parse_spcr(tables: &AcpiTables<CrabEfiHandler>, info: &mut PlatformInfo) {
 fn discover_namespace_devices(
     interpreter: &acpi::aml::Interpreter<CrabEfiHandler>,
     info: &mut PlatformInfo,
+    #[cfg(feature = "ui")] touchpad: &mut Option<crate::touchpad::Touchpad>,
 ) {
     use acpi::aml::namespace::{AmlName, NamespaceLevelKind};
     use acpi::aml::object::Object;
@@ -582,10 +612,6 @@ fn discover_namespace_devices(
         if level.kind != NamespaceLevelKind::Device {
             return Ok(true);
         }
-        if info.dsdt_devices.len() >= MAX_DSDT_DEVICES {
-            return Ok(false); // stop recursing, array full
-        }
-
         // --- _HID ---
         let hid_path = AmlName::from_str("_HID")
             .map_err(|e| {
@@ -625,6 +651,14 @@ fn discover_namespace_devices(
             && let Object::Integer(sta) = &*sta_obj
             && (*sta & 0x0b) != 0x0b
         {
+            return Ok(true);
+        }
+
+        #[cfg(feature = "ui")]
+        if &hid_buf[..hid_len] == b"ELAN0000" {
+            if touchpad.is_none() {
+                *touchpad = input::discover(interpreter, path);
+            }
             return Ok(true);
         }
 
@@ -686,7 +720,8 @@ fn discover_namespace_devices(
             }
         }
 
-        // Only store devices that have MMIO resources.
+        // Only store MMIO devices here. A full MMIO list must not stop
+        // traversal: connection-only peripherals are discovered independently.
         if mmio_base != 0 && mmio_size != 0 {
             let name = extract_device_name(path);
             let device = DsdtDevice {

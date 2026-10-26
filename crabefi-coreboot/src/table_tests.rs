@@ -3,7 +3,13 @@
 #![cfg(test)]
 #![allow(dead_code)]
 
+extern crate alloc;
 extern crate std;
+
+#[cfg(feature = "ui")]
+mod acpi;
+#[cfg(feature = "ui")]
+mod touchpad;
 
 mod framebuffer;
 mod memory;

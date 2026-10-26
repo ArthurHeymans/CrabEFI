@@ -148,13 +148,16 @@ dependencies = [
  "acpi",
  "cc",
  "crabefi-core",
+ "crabefi-i2c",
  "crabefi-runtime-abi",
+ "embedded-hal",
  "fdt",
  "heapless 0.9.3",
  "linked_list_allocator",
  "log",
  "r-efi",
  "sha2 0.10.9",
+ "tock-registers",
  "x86_64",
  "zerocopy",
 ]
@@ -164,6 +167,14 @@ name = "crabefi-efi-types"
 version = "0.1.0"
 dependencies = [
  "zerocopy",
+]
+
+[[package]]
+name = "crabefi-i2c"
+version = "0.1.0"
+dependencies = [
+ "embedded-hal",
+ "tock-registers",
 ]
 
 [[package]]

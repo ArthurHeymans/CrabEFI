@@ -79,6 +79,7 @@ jobs:
         run: |
           cargo test --workspace
           cargo test -p crabefi-coreboot --lib --features fallback-memory-map
+          cargo test -p crabefi-coreboot --lib --features ui
       - name: Run Secure Boot, graphical UI and touchpad unit tests
         # Auth, graphical repaint and I2C touchpad tests are feature-gated
         # and not built by the plain workspace test run above.

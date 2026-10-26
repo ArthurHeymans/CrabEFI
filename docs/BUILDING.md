@@ -148,6 +148,17 @@ Polling `WaitForInput` does not consume the sample or lose button-only
 press/release events. At `ExitBootServices` the source is stopped and its
 boot-owned reference detached before the OS takes ownership.
 
+For the standalone coreboot payload, `--features ui` also enables ACPI ELAN
+input discovery. It follows `ELAN0000`'s `I2cSerialBus` and level `GpioInt`
+resource-source paths to their controllers, including relative paths. The
+initial supported controller pair is AMD DesignWare (`AMDI0010`) and AMD GPIO
+(`AMD0030`); other transports and absent/disabled devices are left alone.
+Coreboot must leave the bus powered and initialized. A reported non-D0 `_PSC`,
+off `_PR0` power resource, unconfigured controller or incompatible bus speed is
+skipped rather than reprogramming clocks, power resources or GPIO pads. The shared `crabefi-i2c`
+transport preserves coreboot's SCL, SDA-hold and spike-filter timings; it is also
+used by fstart. Failed optional input initialization does not prevent boot.
+
 ### Updating the Cargo runtime bundle
 
 Maintainers regenerate a bundled image from the audited runtime build with:

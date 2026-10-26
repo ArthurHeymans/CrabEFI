@@ -43,6 +43,8 @@ mod runtime_blob;
 mod tables;
 #[cfg(target_arch = "x86_64")]
 mod timestamps;
+#[cfg(all(feature = "ui", not(target_arch = "riscv64")))]
+mod touchpad;
 
 use core::panic::PanicInfo;
 #[cfg(target_arch = "riscv64")]
@@ -1037,6 +1039,9 @@ pub extern "C" fn rust_main(coreboot_table_ptr: u64) -> ! {
 
     let mut capsule_backend = CorebootCapsuleBackend::new(firmware_info, cb_info.boot_media);
 
+    #[cfg(all(feature = "ui", not(target_arch = "riscv64")))]
+    let mut pointer_input = None;
+
     let mut config = crabefi::PlatformConfig {
         memory_map: &memory_regions[..region_count],
         timer: &timer,
@@ -1146,8 +1151,17 @@ pub extern "C" fn rust_main(coreboot_table_ptr: u64) -> ! {
     let acpi_rsdp = config.acpi_rsdp;
     #[cfg(not(target_arch = "riscv64"))]
     if let Some(rsdp) = acpi_rsdp {
-        let acpi_info = unsafe { acpi::discover_platform(rsdp) };
+        let discovery = unsafe { acpi::discover_platform(rsdp) };
+        let acpi_info = discovery.info;
         config.acpi_info = Some(acpi_info.clone());
+        #[cfg(feature = "ui")]
+        {
+            // SAFETY: discovery resolved the supported, enabled controllers
+            // from their full ACPI paths; no other CrabEFI I2C driver owns them.
+            pointer_input = discovery
+                .touchpad
+                .and_then(|device| unsafe { touchpad::bind(device) });
+        }
 
         #[cfg(target_arch = "x86_64")]
         if let Some((tpm_hid, device)) = ["MSFT0101", "PNP0C31"]
@@ -1198,6 +1212,13 @@ pub extern "C" fn rust_main(coreboot_table_ptr: u64) -> ! {
                 break;
             }
         }
+    }
+
+    #[cfg(all(feature = "ui", not(target_arch = "riscv64")))]
+    {
+        config.pointer_input = pointer_input
+            .as_mut()
+            .map(|device| &mut **device as &mut dyn crabefi::PointerInput);
     }
 
     // init_platform() parses the FDT before adding its MMIO windows, including

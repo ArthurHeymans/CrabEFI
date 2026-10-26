@@ -10,11 +10,16 @@ description = "CrabEFI as a coreboot payload binary"
 default = ["bundled-runtime-image"]
 bundled-runtime-image = ["crabefi/bundled-runtime-image"]
 external-runtime-image = []
-ui = ["crabefi/ui"]
+ui = ["crabefi/ui", "crabefi/elan-i2c", "dep:crabefi-i2c", "dep:embedded-hal", "dep:tock-registers"]
 # Fabricate a QEMU-shaped memory map when coreboot tables are missing or
 # invalid, instead of failing startup with no memory map. Useful only for
 # table-less QEMU experiments; never enable for real hardware.
 fallback-memory-map = []
+
+[target.'cfg(not(target_arch = "riscv64"))'.dependencies]
+crabefi-i2c = { path = "../crabefi-i2c", optional = true }
+embedded-hal = { version = "1", optional = true }
+tock-registers = { version = "0.10", optional = true }
 
 [dependencies]
 crabefi = { package = "crabefi-core", path = "../crabefi-core", features = [
