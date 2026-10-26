@@ -216,6 +216,18 @@ int main(int argc, char **argv) {
     uint32_t serial[] = {1, 0x3f8, 115200, 1, 1843200};
     record(0xf, serial, sizeof serial);
     qemu_framebuffer();
+    if (getenv("LINUXBOOT_PFLASH")) {
+        /* Opt-in metadata for the experiment's writable 8-MiB QEMU CFI ROM.
+         * No real SPI device or guest-discovered flash bounds are authorized. */
+        int fd = open("/dev/mem", O_RDONLY);
+        unsigned char magic[8];
+        if (fd < 0 || pread(fd, magic, sizeof magic, 0xff900000ULL) != sizeof magic ||
+            memcmp(magic, "__FMAP__", 8)) errx(1, "expected QEMU pflash FMAP missing");
+        close(fd);
+        uint64_t media[] = {0x100000, 0x101000, 0x6ff000, 0x800000};
+        record(0x30, media, sizeof media);
+        fprintf(stderr, "LINUXBOOT_PFLASH_READY bytes=8388608\n");
+    }
     size_t output_size = smbios();
     uint32_t header[] = {0x4f49424c, 24, 0, used - 24,
                          checksum(tables + 24, used - 24), records};

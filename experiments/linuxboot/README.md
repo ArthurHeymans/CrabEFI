@@ -2,6 +2,8 @@
 
 **Works in QEMU/KVM with Windows PE and installed Windows 11 Pro.** See
 [the installed-Windows results](INSTALLED.md) for setup and repeat cold boots.
+The [security follow-up](SECURITY.md) covers TPM 2.0, enforced EFI signature
+verification, and TPM-only BitLocker cold boots, including the PCR7/I/O limitations.
 This is a disposable x86-64/q35 experiment, not a production platform port. It does not change CrabEFI's core
 or resurrect the original firmware's Boot Services.
 
