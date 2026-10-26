@@ -127,6 +127,7 @@ map, symbols, disassembly, stack report, digest, and JSON audits are under
 | `fb-log` | off | Log to framebuffer (very slow, debugging only) |
 | `ui` | off | Graphical UI, mouse cursor and EFI Simple Pointer |
 | `elan-i2c` | off | Native ELAN I2C touchpad driver for platform-described peripherals (implies `ui`) |
+| `hid-i2c` | off | HID-over-I2C touchpads, mice and keyboards for platform-described peripherals (implies `ui`) |
 
 The `crabefi-coreboot` binary enables both `platform-entry` and `global-allocator` automatically. External firmware that provides its own entry point and allocator should not enable these features.
 
@@ -176,6 +177,7 @@ let touchpad = Peripheral::I2c(I2cPeripheral {
     bus: I2cBus::new(i2c_controller),
     address: 0x15,
     interrupt: Some(Interrupt::Level { line: InputLine::new(gpio_pin), active_low: true }),
+    hid_descriptor_register: None,
 });
 let config = crabefi::PlatformConfigBuilder::new(/* ... */)
     .peripheral(touchpad)

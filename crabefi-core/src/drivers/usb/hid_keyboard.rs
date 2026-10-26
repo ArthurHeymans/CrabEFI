@@ -104,8 +104,18 @@ pub struct UsbHidKeyboard {
     /// Polling interval in ms (USB endpoint hardware property)
     #[allow(dead_code)] // Endpoint descriptor shadow; completeness for re-enumeration.
     interval: u8,
+    /// Key translation, buffer and repeat
+    pub(crate) keys: BootKeys,
+    /// Earliest time of the next poll
+    next_poll: Option<Timeout>,
+}
+
+/// Boot-protocol keyboard reports turned into EFI keys, with a key buffer,
+/// key repeat and lock state. Shared by every HID keyboard transport.
+#[derive(Default)]
+pub struct BootKeys {
     /// Previous report (for detecting changes)
-    prev_report: KeyboardReport,
+    pub(crate) prev_report: KeyboardReport,
     /// Caps Lock state
     caps_lock: bool,
     /// Num Lock state
@@ -122,8 +132,6 @@ pub struct UsbHidKeyboard {
     repeat_delay_timeout: Option<Timeout>,
     /// Timeout for repeat interval
     repeat_interval_timeout: Option<Timeout>,
-    /// Earliest time of the next poll
-    next_poll: Option<Timeout>,
 }
 
 impl UsbHidKeyboard {
@@ -142,15 +150,7 @@ impl UsbHidKeyboard {
             endpoint,
             max_packet,
             interval,
-            prev_report: KeyboardReport::default(),
-            caps_lock: false,
-            num_lock: false,
-            key_buffer: [0; 16],
-            read_idx: 0,
-            write_idx: 0,
-            last_key: 0,
-            repeat_delay_timeout: None,
-            repeat_interval_timeout: None,
+            keys: BootKeys::default(),
             next_poll: None,
         }
     }
@@ -199,10 +199,10 @@ impl UsbHidKeyboard {
         controller: &mut C,
     ) -> Result<(), UsbError> {
         let mut led_byte = 0u8;
-        if self.num_lock {
+        if self.keys.num_lock {
             led_byte |= 1;
         }
-        if self.caps_lock {
+        if self.keys.caps_lock {
             led_byte |= 2;
         }
         // Scroll Lock would be bit 2
@@ -219,6 +219,18 @@ impl UsbHidKeyboard {
         Ok(())
     }
 
+    /// Get device address
+    pub fn device_address(&self) -> u8 {
+        self.device_address
+    }
+
+    /// Get controller index
+    pub fn controller_idx(&self) -> usize {
+        self.controller_idx
+    }
+}
+
+impl BootKeys {
     /// Process a keyboard report
     pub fn process_report(&mut self, report: &KeyboardReport) {
         // Collect new keycodes first to avoid borrow conflict
@@ -633,16 +645,6 @@ impl UsbHidKeyboard {
 
         Some(ch as u16)
     }
-
-    /// Get device address
-    pub fn device_address(&self) -> u8 {
-        self.device_address
-    }
-
-    /// Get controller index
-    pub fn controller_idx(&self) -> usize {
-        self.controller_idx
-    }
 }
 
 // ============================================================================
@@ -697,7 +699,7 @@ impl UsbHidKeyboard {
             .as_ref()
             .is_some_and(|next| !next.is_expired())
         {
-            self.handle_repeat();
+            self.keys.handle_repeat();
             return;
         }
         self.next_poll = Some(Timeout::from_ms(MIN_POLL_INTERVAL_MS));
@@ -738,10 +740,10 @@ impl UsbHidKeyboard {
                     report_buf[7],
                 ],
             };
-            self.process_report(&report);
+            self.keys.process_report(&report);
         }
 
-        self.handle_repeat();
+        self.keys.handle_repeat();
     }
 }
 
@@ -750,6 +752,17 @@ impl crate::drivers::keyboard_common::KeyboardDevice for UsbHidKeyboard {
         super::with_controller(self.controller_idx, |controller| {
             UsbHidKeyboard::poll(self, controller)
         })?;
+        self.keys.read_key()
+    }
+
+    fn key_state(&mut self) -> crate::platform::KeyState {
+        self.keys.efi_state()
+    }
+}
+
+impl BootKeys {
+    /// The next buffered key as an EFI key.
+    pub fn read_key(&mut self) -> Option<crate::platform::Key> {
         let key = self.get_key()?;
         Some(crate::platform::Key {
             scancode: (key >> 8) & 0xFF,
@@ -757,14 +770,8 @@ impl crate::drivers::keyboard_common::KeyboardDevice for UsbHidKeyboard {
         })
     }
 
-    fn key_state(&mut self) -> crate::platform::KeyState {
-        self.efi_state()
-    }
-}
-
-impl UsbHidKeyboard {
     /// EFI shift/toggle state bits, without the VALID flags.
-    fn efi_state(&self) -> crate::platform::KeyState {
+    pub fn efi_state(&self) -> crate::platform::KeyState {
         use crate::drivers::keyboard_common::efi_shift_state::*;
         use crate::drivers::keyboard_common::efi_toggle_state::*;
 

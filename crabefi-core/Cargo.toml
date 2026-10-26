@@ -43,9 +43,12 @@ fb-log = []
 ui = ["dep:noto-sans-mono-bitmap"]
 # Native ELAN I2C touchpads described by the platform as peripherals.
 elan-i2c = ["ui"]
+# HID-over-I2C touchpads, mice and keyboards described by the platform.
+hid-i2c = ["ui", "dep:hidreport"]
 
 [dependencies]
 embedded-hal = "1"
+hidreport = { version = "0.6", default-features = false, optional = true }
 crabefi-efi-types = { workspace = true }
 crabefi-pkcs7 = { workspace = true, optional = true }
 crabefi-runtime-bundle = { workspace = true, optional = true }

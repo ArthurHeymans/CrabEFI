@@ -119,6 +119,9 @@ pub struct I2cPeripheral {
     pub address: u8,
     /// Data-ready interrupt, if wired.
     pub interrupt: Option<Interrupt>,
+    /// HID descriptor register of a HID-over-I2C device, from ACPI `_DSM`
+    /// or board data.
+    pub hid_descriptor_register: Option<u16>,
 }
 
 /// A memory-mapped device, such as an ACPI-enumerated SoC controller.
@@ -148,6 +151,11 @@ const I2C_DRIVERS: &[I2cDriver] = &[
     I2cDriver {
         ids: crate::drivers::elan::IDS,
         bind: crate::drivers::elan::bind,
+    },
+    #[cfg(feature = "hid-i2c")]
+    I2cDriver {
+        ids: crate::drivers::hid_i2c::IDS,
+        bind: crate::drivers::hid_i2c::bind,
     },
     #[cfg(feature = "tpm")]
     I2cDriver {

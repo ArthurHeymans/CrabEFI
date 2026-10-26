@@ -92,17 +92,17 @@ fn interrupt_reports_preserve_keys_when_pending_or_short() {
     let mut controller = Controller::new();
     let mut keyboard = UsbHidKeyboard::new(0, 1, 1, 8, 10);
     keyboard.poll_report(&mut controller);
-    assert_eq!(keyboard.get_key(), Some(b'a' as u16));
-    assert_eq!(keyboard.prev_report.keys[0], 4);
+    assert_eq!(keyboard.keys.get_key(), Some(b'a' as u16));
+    assert_eq!(keyboard.keys.prev_report.keys[0], 4);
     controller.report.fill(0);
     for length in [0, 2, 7] {
         controller.length = length;
         keyboard.poll_report(&mut controller);
-        assert_eq!(keyboard.prev_report.keys[0], 4);
+        assert_eq!(keyboard.keys.prev_report.keys[0], 4);
     }
     controller.length = 8;
     keyboard.poll_report(&mut controller);
-    assert_eq!(keyboard.prev_report.keys[0], 0);
+    assert_eq!(keyboard.keys.prev_report.keys[0], 0);
     assert_eq!(controller.get_reports, 0);
 }
 

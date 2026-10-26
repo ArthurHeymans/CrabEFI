@@ -350,6 +350,7 @@ pub(super) unsafe fn adopt(connections: Vec<Connection>) -> Vec<Peripheral> {
                 bus: I2cBus::new(RcDevice::new(shared)),
                 address: connection.address,
                 interrupt,
+                hid_descriptor_register: None,
             }))
         })
         .collect()

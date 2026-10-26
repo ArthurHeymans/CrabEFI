@@ -83,7 +83,7 @@ jobs:
       - name: Run Secure Boot, graphical UI and touchpad unit tests
         # Auth, graphical repaint and touchpad tests are feature-gated and
         # not built by the plain workspace test run above.
-        run: cargo test -p crabefi-core --features secure-boot,ui,elan-i2c
+        run: cargo test -p crabefi-core --features secure-boot,ui,elan-i2c,hid-i2c
       - name: Run runtime host tests
         run: |
           cd "$HOME"
