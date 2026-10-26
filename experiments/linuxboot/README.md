@@ -1,7 +1,8 @@
 # LinuxBoot → kexec → CrabEFI → Windows experiment
 
-**Works in QEMU/KVM with Windows PE.** This is a disposable x86-64/q35
-experiment, not a production platform port. It does not change CrabEFI's core
+**Works in QEMU/KVM with Windows PE and installed Windows 11 Pro.** See
+[the installed-Windows results](INSTALLED.md) for setup and repeat cold boots.
+This is a disposable x86-64/q35 experiment, not a production platform port. It does not change CrabEFI's core
 or resurrect the original firmware's Boot Services.
 
 ## What was demonstrated
@@ -52,6 +53,10 @@ No Microsoft binaries, images, or downloaded media are checked in.
 - The adapter copies the handoff module into a fixed, reserved 1-MiB arena at
   `0x08000000`. This keeps the handoff/framebuffer record alive even when CrabEFI
   reuses the old Linux and kexec allocations.
+- SMBIOS is exported from Linux's DMI sysfs files into the same reserved arena.
+  SMBIOS 2/3 entry points are relocated, their checksums rebuilt, and a coreboot
+  SMBIOS record is emitted. Enable `CONFIG_DMI=y` and `CONFIG_DMI_SYSFS=y` in the
+  first kernel; merely preserving ACPI is not a complete firmware handoff.
 - QEMU std-vga is explicitly configured to 1024×768×32 through its VBE ports;
   the resulting framebuffer is passed as a coreboot record for CrabEFI's GOP.
 - Linux shuts down its NVMe driver through normal kexec; CrabEFI subsequently
@@ -115,7 +120,7 @@ python3 experiments/linuxboot/run.py linux \
 For an already-built modular kernel, `build-initramfs.sh` accepts its
 kernel-modules root instead of `builtin`, resolves NVMe module dependencies,
 and packages them. The matching kernel must provide firmware memmap, ACPI,
-`/dev/mem`, I/O permissions, and legacy kexec. This is **not** a guarantee that
+`/dev/mem`, DMI sysfs tables, I/O permissions, and legacy kexec. This is **not** a guarantee that
 an arbitrary distribution kernel will hand over successfully.
 
 Focused host checks:
@@ -127,8 +132,9 @@ bash -n experiments/linuxboot/{build-firmware.sh,build-initramfs.sh,prepare-medi
 
 ## Limits and findings
 
-- **Windows PE, not an installed Windows desktop.** Installation, updates,
-  hibernation, repeated OS restarts, and real hardware have not been tested.
+- The original results above cover Windows PE. See [the installed-Windows
+  follow-up](INSTALLED.md) for the separate deployment and desktop checks.
+  Updates, hibernation, and real hardware remain untested.
 - An initial NixOS Linux 7.2.9 kernel booted CrabEFI and Windows' loader but
   stalled after EBS, without the userspace marker (120–180-second timeouts).
   Removing GOP did not resolve it. The small kernel works under both coreboot

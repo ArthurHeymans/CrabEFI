@@ -146,6 +146,61 @@ static void qemu_framebuffer(void) {
     record(0x12, &fb, sizeof fb);
     fprintf(stderr, "LINUXBOOT_FRAMEBUFFER=%#llx\n", base);
 }
+static size_t read_file(const char *path, unsigned char *data, size_t capacity) {
+    FILE *f = fopen(path, "rb");
+    if (!f) err(1, "open %s (enable Linux DMI_SYSFS)", path);
+    size_t size = fread(data, 1, capacity, f);
+    if (ferror(f) || fgetc(f) != EOF) errx(1, "cannot read bounded %s", path);
+    fclose(f);
+    return size;
+}
+static uint8_t byte_sum(const unsigned char *data, size_t size) {
+    uint8_t sum = 0;
+    for (size_t i = 0; i < size; i++) sum += data[i];
+    return sum;
+}
+static size_t smbios(void) {
+    /* The Multiboot adapter copies this module to BASE+0x4000. Keep the entry
+     * point and its table there too: Linux's sysfs bytes are not physical RAM. */
+    enum { ENTRY = 0x1000, DATA = 0x1100 };
+    unsigned char entry[64];
+    size_t size = read_file("/sys/firmware/dmi/tables/smbios_entry_point", entry, sizeof entry);
+    size_t length = read_file("/sys/firmware/dmi/tables/DMI", tables + DATA, sizeof tables - DATA);
+    uint64_t address = BASE + 0x4000 + DATA;
+    if (!length) errx(1, "empty SMBIOS table");
+    if (size >= 24 && !memcmp(entry, "_SM3_", 5)) {
+        if (entry[6] < 24 || entry[6] > size || byte_sum(entry, entry[6]))
+            errx(1, "invalid SMBIOS 3 entry point");
+        uint32_t limit = length;
+        memcpy(entry + 12, &limit, sizeof limit);
+        memcpy(entry + 16, &address, sizeof address);
+        entry[5] = 0;
+        entry[5] = -byte_sum(entry, entry[6]);
+    } else if (size >= 31 && !memcmp(entry, "_SM_", 4)) {
+        if (entry[5] < 31 || entry[5] > size || byte_sum(entry, entry[5]) ||
+            memcmp(entry + 16, "_DMI_", 5) || byte_sum(entry + 16, 15))
+            errx(1, "invalid SMBIOS 2 entry point");
+        uint16_t limit = length;
+        uint32_t address32 = address;
+        memcpy(entry + 22, &limit, sizeof limit);
+        memcpy(entry + 24, &address32, sizeof address32);
+        entry[21] = 0;
+        entry[21] = -byte_sum(entry + 16, 15);
+        entry[4] = 0;
+        entry[4] = -byte_sum(entry, entry[5]);
+    } else {
+        errx(1, "unsupported SMBIOS entry point");
+    }
+    memcpy(tables + ENTRY, entry, size);
+    struct __attribute__((packed)) {
+        uint64_t address;
+        uint32_t size, id;
+    } cbmem = {BASE + 0x4000 + ENTRY, DATA + length - ENTRY, 0x534d4254};
+    record(0x31, &cbmem, sizeof cbmem);
+    if (used > ENTRY) errx(1, "coreboot records overlap staged SMBIOS");
+    fprintf(stderr, "LINUXBOOT_SMBIOS_READY bytes=%zu\n", length);
+    return DATA + length;
+}
 static uint16_t checksum(const unsigned char *p, size_t size) {
     uint32_t sum = 0;
     for (size_t i = 0; i < size; i++) sum += (uint32_t)p[i] << ((i & 1) * 8);
@@ -161,12 +216,13 @@ int main(int argc, char **argv) {
     uint32_t serial[] = {1, 0x3f8, 115200, 1, 1843200};
     record(0xf, serial, sizeof serial);
     qemu_framebuffer();
+    size_t output_size = smbios();
     uint32_t header[] = {0x4f49424c, 24, 0, used - 24,
                          checksum(tables + 24, used - 24), records};
     memcpy(tables, header, sizeof header);
     header[2] = checksum(tables, 24);
     memcpy(tables, header, sizeof header);
-    if (fwrite(tables, 1, used, stdout) != used || fflush(stdout)) err(1, "write handoff");
-    fprintf(stderr, "LINUXBOOT_HANDOFF_READY regions=%u bytes=%zu\n", nr, used);
+    if (fwrite(tables, 1, output_size, stdout) != output_size || fflush(stdout)) err(1, "write handoff");
+    fprintf(stderr, "LINUXBOOT_HANDOFF_READY regions=%u bytes=%zu\n", nr, output_size);
     return 0;
 }
