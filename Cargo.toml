@@ -6,6 +6,7 @@ members = [
   "crabefi-core",
   "crabefi-coreboot",
   "crabefi-efi-types",
+  "crabefi-hw",
   "crabefi-pkcs7",
   "crabefi-runtime-bundle",
 ]
