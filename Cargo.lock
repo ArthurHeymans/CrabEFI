@@ -120,6 +120,7 @@ dependencies = [
  "crabefi-runtime-abi",
  "crabefi-runtime-bundle",
  "embassy-futures",
+ "embedded-hal",
  "fdt",
  "heapless 0.9.3",
  "linked_list_allocator",

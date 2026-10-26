@@ -484,6 +484,15 @@ pub fn delay_ms(ms: u64) {
     delay_us(ms.saturating_mul(1000));
 }
 
+/// [`delay_us`] as an embedded-hal delay, for drivers written against it.
+pub struct Delay;
+
+impl embedded_hal::delay::DelayNs for Delay {
+    fn delay_ns(&mut self, ns: u32) {
+        delay_us(u64::from(ns).div_ceil(1000));
+    }
+}
+
 /// A deadline-based timeout for polling loops
 ///
 /// # Example

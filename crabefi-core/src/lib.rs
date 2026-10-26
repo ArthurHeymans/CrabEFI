@@ -40,6 +40,7 @@ pub mod menu;
 pub mod menu_common;
 pub mod payload;
 pub mod pe;
+pub mod peripheral;
 pub mod platform;
 #[cfg(feature = "secure-boot")]
 pub mod secure_boot_menu;
@@ -543,6 +544,9 @@ pub fn init_platform(mut config: PlatformConfig) -> ! {
             drivers::mouse_cursor::init(fb.width, fb.height);
         }
     }
+
+    // Platform-described devices need the EFI allocator and timer.
+    peripheral::bind(core::mem::take(&mut config.peripherals));
 
     // ---- 9b. Install the initial ESRT ----
     //
