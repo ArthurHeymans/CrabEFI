@@ -62,6 +62,82 @@ mod hub_protocol_tests {
     }
 }
 
+/// How long enumeration waits for a device that left its root port during
+/// bring-up to show up on another one. A USB3 device first appears on its
+/// USB2 port and drops that connection once its SuperSpeed link trains.
+const MOVED_DEVICE_TIMEOUT_MS: u64 = 500;
+
+/// Root ports already brought up during enumeration.
+struct RootPortScan {
+    tried: Vec<bool>,
+}
+
+impl RootPortScan {
+    fn new(num_ports: u8) -> Self {
+        Self {
+            tried: alloc::vec![false; usize::from(num_ports)],
+        }
+    }
+
+    fn untried(&self) -> impl Iterator<Item = u8> + '_ {
+        (0..self.tried.len())
+            .filter(|&port| !self.tried[port])
+            .map(|port| port as u8)
+    }
+
+    /// Connected ports that were not brought up yet; marks them as tried.
+    fn take_new_connections(&mut self, connected: impl Fn(u8) -> bool) -> Vec<u8> {
+        let ports: Vec<u8> = self.untried().filter(|&port| connected(port)).collect();
+        for &port in &ports {
+            self.tried[usize::from(port)] = true;
+        }
+        ports
+    }
+
+    fn has_new_connection(&self, connected: impl Fn(u8) -> bool) -> bool {
+        self.untried().any(connected)
+    }
+}
+
+/// A port whose device neither attached nor stayed connected lost it to
+/// another root port, e.g. a USB3 device moving to its SuperSpeed port.
+fn device_moved(attached: bool, still_connected: bool) -> bool {
+    !attached && !still_connected
+}
+
+#[cfg(test)]
+mod root_port_scan_tests {
+    use super::*;
+
+    #[test]
+    fn usb3_device_moving_from_usb2_port_is_picked_up_in_a_second_pass() {
+        let mut scan = RootPortScan::new(26);
+
+        // A keyboard on port 3, a USB3 stick seen on its USB2 port 2.
+        let first = scan.take_new_connections(|port| port == 2 || port == 3);
+        assert_eq!(first, [2, 3]);
+
+        // Resetting port 2 makes the stick train on SuperSpeed port 18.
+        assert!(device_moved(false, false));
+        assert!(!device_moved(true, true));
+        assert!(scan.has_new_connection(|port| port == 18));
+
+        // Only the new connection is brought up, not the attached keyboard.
+        let second = scan.take_new_connections(|port| port == 3 || port == 18);
+        assert_eq!(second, [18]);
+        assert!(!scan.has_new_connection(|port| port == 3 || port == 18));
+    }
+
+    #[test]
+    fn failed_device_that_stays_connected_is_not_retried() {
+        let mut scan = RootPortScan::new(4);
+
+        assert_eq!(scan.take_new_connections(|port| port == 1), [1]);
+        assert!(!device_moved(false, true));
+        assert!(scan.take_new_connections(|port| port == 1).is_empty());
+    }
+}
+
 impl super::XhciController {
     fn hub_sublink_speeds(&mut self, slot_id: u8) -> Result<Option<SublinkSpeeds>, XhciError> {
         let mut header = [0u8; 5];
@@ -498,25 +574,48 @@ impl super::XhciController {
 
     /// Enumerate ports and attach devices
     pub(super) async fn enumerate_ports(&mut self) -> Result<(), XhciError> {
-        // Link bring-up (debounce, resets) only touches each port's own
-        // PORTSC, so run it for all root ports at once. Device attachment
-        // goes through the shared command ring and stays sequential.
-        let ports: Vec<u8> = (0..self.num_ports).collect();
-        let link_up = {
-            let this = RefCell::new(&mut *self);
-            exec::join_all(
-                ports
-                    .iter()
-                    .map(|&port| {
-                        Box::pin(Self::bring_up_root_port(&this, port)) as BoxFuture<'_, bool>
-                    })
-                    .collect(),
-            )
-            .await
-        };
+        let mut scan = RootPortScan::new(self.num_ports);
 
-        for (port, _) in ports.into_iter().zip(link_up).filter(|(_, up)| *up) {
-            self.attach_root_port_device(port).await;
+        loop {
+            let ports =
+                scan.take_new_connections(|port| self.portsc(port).current_connect_status());
+            if ports.is_empty() {
+                break;
+            }
+
+            // Link bring-up (debounce, resets) only touches each port's own
+            // PORTSC, so run it for all root ports at once. Device attachment
+            // goes through the shared command ring and stays sequential.
+            let link_up = {
+                let this = RefCell::new(&mut *self);
+                exec::join_all(
+                    ports
+                        .iter()
+                        .map(|&port| {
+                            Box::pin(Self::bring_up_root_port(&this, port)) as BoxFuture<'_, bool>
+                        })
+                        .collect(),
+                )
+                .await
+            };
+
+            let mut moved = false;
+            for (port, up) in ports.into_iter().zip(link_up) {
+                let attached = up && self.attach_root_port_device(port).await;
+                if device_moved(attached, self.portsc(port).current_connect_status()) {
+                    log::debug!("Port {}: device disconnected during bring-up", port);
+                    moved = true;
+                }
+            }
+
+            if !moved
+                || !exec::wait_for(MOVED_DEVICE_TIMEOUT_MS, || {
+                    scan.has_new_connection(|port| self.portsc(port).current_connect_status())
+                })
+                .await
+            {
+                break;
+            }
         }
 
         Ok(())
@@ -652,11 +751,14 @@ impl super::XhciController {
     }
 
     /// Address and configure the device behind an enabled root port.
-    async fn attach_root_port_device(&mut self, port: u8) {
+    ///
+    /// Returns `false` when the port no longer has an enabled device.
+    async fn attach_root_port_device(&mut self, port: u8) -> bool {
         // USB2 speed is not reliable until reset has enabled the port.
         let status = self.portsc(port);
         if !status.current_connect_status() || !status.port_enabled_disabled() {
-            return;
+            log::debug!("Port {}: no enabled device after bring-up", port);
+            return false;
         }
         let speed = status.port_speed();
 
@@ -667,7 +769,7 @@ impl super::XhciController {
 
                 if let Err(e) = self.address_device(slot_id, port, speed) {
                     log::error!("Failed to address device on port {}: {:?}", port, e);
-                    return;
+                    return true;
                 }
 
                 // Get device descriptor
@@ -726,5 +828,6 @@ impl super::XhciController {
                 log::error!("Failed to enable slot for port {}: {:?}", port, e);
             }
         }
+        true
     }
 }
