@@ -537,8 +537,11 @@ pub fn init_platform(mut config: PlatformConfig) -> ! {
     // Must come after efi::init_from_platform(), which stores the framebuffer
     // in global state via handoff::store_framebuffer().
     #[cfg(feature = "ui")]
-    if let Some(fb) = handoff::framebuffer() {
-        drivers::mouse_cursor::init(fb.width, fb.height);
+    {
+        drivers::pointer::init();
+        if let Some(fb) = handoff::framebuffer() {
+            drivers::mouse_cursor::init(fb.width, fb.height);
+        }
     }
 
     // ---- 9b. Install the initial ESRT ----

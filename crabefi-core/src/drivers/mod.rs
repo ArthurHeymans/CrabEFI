@@ -151,6 +151,8 @@ pub mod mouse;
 pub mod mouse_cursor;
 pub mod nvme;
 pub mod pci;
+#[cfg(feature = "ui")]
+pub mod pointer;
 pub mod sdhci;
 pub mod serial;
 pub mod serial_regs;

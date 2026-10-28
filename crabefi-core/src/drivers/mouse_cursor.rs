@@ -1,6 +1,6 @@
 //! Unified Mouse Cursor Abstraction
 //!
-//! Aggregates mouse input from PS/2 and USB HID mouse drivers into a single
+//! Turns the combined report of every [`super::pointer`] device into a single
 //! cursor position with acceleration and speed control.
 //!
 //! This follows the same pattern as libpayload's `drivers/mouse_cursor.c`:
@@ -119,44 +119,18 @@ pub fn init(screen_width: u32, screen_height: u32) {
 ///
 /// Should be called from the main event loop.
 pub fn poll() {
-    let mut cursor = CURSOR.lock();
-    if !cursor.initialized {
+    if !CURSOR.lock().initialized {
         return;
     }
-
-    let mut total_dx: i32 = 0;
-    let mut total_dy: i32 = 0;
-    let mut total_dz: i32 = 0;
-    let mut combined_buttons: u32 = 0;
-
-    // Poll PS/2 mouse
-    #[cfg(target_arch = "x86_64")]
-    {
-        // Must drop cursor lock before calling poll (which acquires MOUSE lock)
-        drop(cursor);
-        super::mouse::poll();
-        let (dx, dy, dz) = super::mouse::get_relative_motion();
-        combined_buttons |= super::mouse::get_buttons();
-        total_dx += dx;
-        total_dy += dy;
-        total_dz += dz;
-        cursor = CURSOR.lock();
-    }
-
-    // Poll USB mouse
-    {
-        let mouse_ctrl_idx = super::usb::hid_mouse::controller_idx();
-        if let Some(ctrl_idx) = mouse_ctrl_idx {
-            drop(cursor);
-            // Poll the USB controller that has the mouse
-            super::usb::poll_mice_on_controller(ctrl_idx);
-            let (udx, udy) = super::usb::hid_mouse::get_relative_motion();
-            combined_buttons |= super::usb::hid_mouse::get_buttons();
-            total_dx += udx;
-            total_dy += udy;
-            cursor = CURSOR.lock();
-        }
-    }
+    // Device callbacks run without the cursor lock held.
+    super::pointer::poll();
+    let super::pointer::PointerReport {
+        dx: total_dx,
+        dy: total_dy,
+        dz: total_dz,
+        buttons: combined_buttons,
+    } = super::pointer::take();
+    let mut cursor = CURSOR.lock();
 
     if total_dx == 0 && total_dy == 0 && total_dz == 0 && combined_buttons == cursor.buttons {
         return;
