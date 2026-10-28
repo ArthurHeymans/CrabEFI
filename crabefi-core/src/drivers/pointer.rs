@@ -90,11 +90,10 @@ pub fn register(device: Box<dyn PointerDevice>) {
     DEVICES.borrow_mut().push(Entry { device, buttons: 0 });
 }
 
-/// Register the built-in PS/2 and USB HID mice.
+/// Register the PS/2 mouse. USB mice register when USB is enumerated.
 pub(crate) fn init() {
     #[cfg(target_arch = "x86_64")]
     register(Box::new(super::mouse::Ps2Mouse));
-    register(Box::new(super::usb::hid_mouse::UsbMouse));
 }
 
 /// Poll every device into the pending report.

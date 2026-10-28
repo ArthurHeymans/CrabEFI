@@ -152,13 +152,23 @@ unsafe fn tis_read_burst_count(base: u64) -> usize {
 // TPM TIS Driver
 // ============================================================================
 
-/// TPM TIS hardware driver.
-///
-/// Communicates with a TPM 2.0 device via the TIS MMIO register interface.
-/// Uses locality 0, which is the default for firmware-level TPM access.
-pub struct TpmTis {
+/// Moves one TPM command and its response, such as through a TIS FIFO.
+pub trait TpmTransport {
+    /// Send `cmd` and read the response into `response`, returning its
+    /// length.
+    fn send_command(&mut self, cmd: &[u8], response: &mut [u8]) -> Result<usize, TcgError>;
+}
+
+/// The TIS FIFO in MMIO, locality 0, which is the default for
+/// firmware-level TPM access.
+pub struct TisMmio {
     /// MMIO base address for locality 0.
     base: u64,
+}
+
+/// A TPM 2.0 device on any transport, with its cached capabilities.
+pub struct Tpm2<T> {
+    transport: T,
     /// Cached active hash algorithms (populated during init).
     active_algorithms: [u16; 5],
     /// Number of active algorithms.
@@ -171,6 +181,9 @@ pub struct TpmTis {
     max_response_size: u16,
 }
 
+/// TPM 2.0 behind the TIS MMIO register interface.
+pub type TpmTis = Tpm2<TisMmio>;
+
 /// TPM family detected behind a TIS FIFO transport.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TpmFamily {
@@ -180,10 +193,10 @@ pub enum TpmFamily {
 
 /// TPM 1.2 device using the TIS FIFO transport.
 pub struct Tpm12Tis {
-    transport: TpmTis,
+    transport: TisMmio,
 }
 
-impl TpmTis {
+impl TisMmio {
     /// Open the common TIS transport without assuming a TPM command family.
     unsafe fn open(base: u64) -> Result<Self, TcgError> {
         let did_vid = unsafe { tis_read32(base, TPM_DID_VID) };
@@ -203,81 +216,8 @@ impl TpmTis {
             (did_vid >> 16) & 0xFFFF,
         );
 
-        let mut tpm = Self {
-            base,
-            active_algorithms: [0; 5],
-            num_algorithms: 0,
-            manufacturer_id: 0,
-            max_command_size: 0,
-            max_response_size: 0,
-        };
+        let mut tpm = Self { base };
         unsafe { tpm.request_locality()? };
-        Ok(tpm)
-    }
-
-    fn detect_family_inner(&mut self) -> Result<TpmFamily, TcgError> {
-        // TPM2_GetCapability(TPM_PROPERTIES, MANUFACTURER, 1). A TPM 1.2
-        // device rejects the ordinal using a legacy response tag, while a
-        // TPM 2.0 device always replies with a TPM2 response tag.
-        let mut cmd = [0u8; 22];
-        cmd[0..2].copy_from_slice(&TPM_ST_NO_SESSIONS.to_be_bytes());
-        cmd[2..6].copy_from_slice(&22u32.to_be_bytes());
-        cmd[6..10].copy_from_slice(&TPM2_CC_GET_CAPABILITY.to_be_bytes());
-        cmd[10..14].copy_from_slice(&TPM2_CAP_TPM_PROPERTIES.to_be_bytes());
-        cmd[14..18].copy_from_slice(&TPM2_PT_MANUFACTURER.to_be_bytes());
-        cmd[18..22].copy_from_slice(&1u32.to_be_bytes());
-
-        let mut resp = [0u8; 64];
-        let n = self.send_command(&cmd, &mut resp)?;
-        if n < 10 {
-            return Err(TcgError::InternalError);
-        }
-        classify_response_tag(u16::from_be_bytes([resp[0], resp[1]]))
-    }
-
-    /// Detect whether the TIS device implements TPM 1.2 or TPM 2.0.
-    ///
-    /// # Safety
-    /// `base` must point to a valid TIS MMIO region.
-    pub unsafe fn detect_family(base: u64) -> Result<TpmFamily, TcgError> {
-        let mut tpm = unsafe { Self::open(base)? };
-        let family = tpm.detect_family_inner()?;
-        log::info!("TPM TIS command family: {:?}", family);
-        Ok(family)
-    }
-
-    /// Probe for a TPM at the given MMIO base address and initialize it.
-    ///
-    /// This performs:
-    /// 1. Check that a TPM device is present (DID/VID != 0xFFFFFFFF)
-    /// 2. Request locality 0
-    /// 3. Send TPM2_Startup(CLEAR)
-    /// 4. Send TPM2_SelfTest(incremental) best-effort
-    /// 5. Query capabilities (active PCR banks, manufacturer ID)
-    ///
-    /// # Safety
-    ///
-    /// `base` must point to a valid TIS MMIO region (e.g., `0xFED40000`).
-    pub unsafe fn probe(base: u64) -> Result<Self, TcgError> {
-        let mut tpm = unsafe { Self::open(base)? };
-        if tpm.detect_family_inner()? != TpmFamily::Tpm20 {
-            log::error!("TIS device at {:#x} is not a TPM 2.0 device", base);
-            return Err(TcgError::InternalError);
-        }
-
-        // TPM2_Startup(CLEAR).
-        tpm.startup()?;
-
-        // TPM2_SelfTest(fullTest = NO). Some dTPMs can exceed the normal
-        // command timeout for a full self-test, so continue if this best-effort
-        // command times out or otherwise fails in transport.
-        if let Err(e) = tpm.self_test() {
-            log::warn!("TPM2_SelfTest transport error: {:?} (continuing)", e);
-        }
-
-        // Query PCR banks and properties.
-        tpm.query_capabilities()?;
-
         Ok(tpm)
     }
 
@@ -503,6 +443,82 @@ impl TpmTis {
         self.finish_command();
 
         Ok(offset)
+    }
+}
+
+impl TpmTransport for TisMmio {
+    fn send_command(&mut self, cmd: &[u8], response: &mut [u8]) -> Result<usize, TcgError> {
+        TisMmio::send_command(self, cmd, response)
+    }
+}
+
+impl TpmTis {
+    /// Detect whether the TIS device implements TPM 1.2 or TPM 2.0.
+    ///
+    /// # Safety
+    /// `base` must point to a valid TIS MMIO region.
+    pub unsafe fn detect_family(base: u64) -> Result<TpmFamily, TcgError> {
+        let family = detect_family(&mut unsafe { TisMmio::open(base)? })?;
+        log::info!("TPM TIS command family: {:?}", family);
+        Ok(family)
+    }
+
+    /// Probe for a TPM 2.0 at the given TIS MMIO base and initialize it.
+    ///
+    /// # Safety
+    ///
+    /// `base` must point to a valid TIS MMIO region (e.g., `0xFED40000`).
+    pub unsafe fn probe(base: u64) -> Result<Self, TcgError> {
+        Self::new(unsafe { TisMmio::open(base)? })
+    }
+}
+
+impl<T: TpmTransport> Tpm2<T> {
+    /// Initialize a TPM 2.0 on `transport`.
+    ///
+    /// This performs:
+    /// 1. Check that the device speaks TPM 2.0
+    /// 2. Send TPM2_Startup(CLEAR)
+    /// 3. Send TPM2_SelfTest(incremental) best-effort
+    /// 4. Query capabilities (active PCR banks, manufacturer ID)
+    pub fn new(mut transport: T) -> Result<Self, TcgError> {
+        if detect_family(&mut transport)? != TpmFamily::Tpm20 {
+            log::error!("TPM is not a TPM 2.0 device");
+            return Err(TcgError::InternalError);
+        }
+        let mut tpm = Self {
+            transport,
+            active_algorithms: [0; 5],
+            num_algorithms: 0,
+            manufacturer_id: 0,
+            max_command_size: 0,
+            max_response_size: 0,
+        };
+
+        // TPM2_Startup(CLEAR).
+        tpm.startup()?;
+
+        // TPM2_SelfTest(fullTest = NO). Some dTPMs can exceed the normal
+        // command timeout for a full self-test, so continue if this best-effort
+        // command times out or otherwise fails in transport.
+        if let Err(e) = tpm.self_test() {
+            log::warn!("TPM2_SelfTest transport error: {:?} (continuing)", e);
+        }
+
+        // Query PCR banks and properties.
+        tpm.query_capabilities()?;
+
+        Ok(tpm)
+    }
+
+    /// Send a raw TPM command and receive the response.
+    pub fn send_command(&mut self, cmd: &[u8], response: &mut [u8]) -> Result<usize, TcgError> {
+        self.transport.send_command(cmd, response)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn transport(&self) -> &T {
+        &self.transport
     }
 
     /// Send TPM2_Startup(CLEAR).
@@ -868,7 +884,7 @@ impl Tpm12Tis {
     /// # Safety
     /// `base` must point to a valid TIS MMIO region.
     pub unsafe fn probe(base: u64) -> Result<Self, TcgError> {
-        let mut transport = unsafe { TpmTis::open(base)? };
+        let mut transport = unsafe { TisMmio::open(base)? };
 
         // Coreboot commonly starts the TPM before entering the payload, so a
         // second TPM_Startup legitimately returns TPM_INVALID_POSTINIT.
@@ -928,6 +944,26 @@ impl Tpm12Tis {
     }
 }
 
+fn detect_family(transport: &mut impl TpmTransport) -> Result<TpmFamily, TcgError> {
+    // TPM2_GetCapability(TPM_PROPERTIES, MANUFACTURER, 1). A TPM 1.2
+    // device rejects the ordinal using a legacy response tag, while a
+    // TPM 2.0 device always replies with a TPM2 response tag.
+    let mut cmd = [0u8; 22];
+    cmd[0..2].copy_from_slice(&TPM_ST_NO_SESSIONS.to_be_bytes());
+    cmd[2..6].copy_from_slice(&22u32.to_be_bytes());
+    cmd[6..10].copy_from_slice(&TPM2_CC_GET_CAPABILITY.to_be_bytes());
+    cmd[10..14].copy_from_slice(&TPM2_CAP_TPM_PROPERTIES.to_be_bytes());
+    cmd[14..18].copy_from_slice(&TPM2_PT_MANUFACTURER.to_be_bytes());
+    cmd[18..22].copy_from_slice(&1u32.to_be_bytes());
+
+    let mut resp = [0u8; 64];
+    let n = transport.send_command(&cmd, &mut resp)?;
+    if n < 10 {
+        return Err(TcgError::InternalError);
+    }
+    classify_response_tag(u16::from_be_bytes([resp[0], resp[1]]))
+}
+
 fn response_code(response: &[u8]) -> Result<u32, TcgError> {
     if response.len() < 10 {
         return Err(TcgError::InternalError);
@@ -950,7 +986,7 @@ fn classify_response_tag(tag: u16) -> Result<TpmFamily, TcgError> {
     }
 }
 
-impl Tpm2Device for TpmTis {
+impl<T: TpmTransport + Send> Tpm2Device for Tpm2<T> {
     fn active_pcr_banks(&self) -> TpmPcrBanks {
         TpmPcrBanks::new(self.active_algorithms())
     }
@@ -980,7 +1016,7 @@ impl Tpm2Device for TpmTis {
             out.algorithm = digest.algorithm;
             out.digest[..size].copy_from_slice(&digest.digest[..size]);
         }
-        TpmTis::pcr_extend(self, pcr_index, &tagged[..count]).map_err(tcg_to_platform_error)
+        Tpm2::pcr_extend(self, pcr_index, &tagged[..count]).map_err(tcg_to_platform_error)
     }
 
     fn submit_command(&mut self, command: &[u8], response: &mut [u8]) -> Result<usize, TpmError> {

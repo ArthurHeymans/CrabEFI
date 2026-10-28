@@ -127,6 +127,28 @@ pub fn init_from_platform(config: &mut crate::platform::PlatformConfig) {
     // Install standard protocols and finalize tables (shared with init)
     install_standard_protocols_and_finalize();
 
+    // Bind platform-described devices once the allocator, heap and timer are
+    // up, and before measured boot, so a TPM peripheral can back it.
+    crate::peripheral::bind(core::mem::take(&mut config.peripherals));
+
+    // A described TPM backs measured boot unless the platform chose another.
+    #[cfg(feature = "tpm")]
+    if let Some(tpm) = crate::peripheral::take_tpm() {
+        let tpm_config = config
+            .tpm_event_log
+            .get_or_insert(crate::platform::TpmEventLogConfig {
+                existing_log: None,
+                format: crate::platform::TpmLogFormat::CryptoAgile,
+                tpm2_device: crate::platform::Tpm2DeviceConfig::None,
+                tpm1_tis_base: None,
+            });
+        if tpm_config.tpm2_device.is_some() {
+            log::warn!("Platform TPM configured; ignoring the TPM peripheral");
+        } else {
+            tpm_config.tpm2_device = crate::platform::Tpm2DeviceConfig::Driver(tpm);
+        }
+    }
+
     // Install TCG protocols for measured boot if the platform requested it.
     #[cfg(feature = "tpm")]
     if let Some(ref mut tpm_config) = config.tpm_event_log {

@@ -204,6 +204,15 @@ impl XhciController {
         for_each_device_slot(&self.slots, |slot| slot.is_mass_storage, f);
     }
 
+    /// Visit every matching slot, including the highest one-based slot ID.
+    pub(in crate::drivers::usb) fn for_each_slot(
+        &self,
+        matches: impl FnMut(&UsbSlot) -> bool,
+        f: &mut dyn FnMut(u8),
+    ) {
+        for_each_device_slot(&self.slots, matches, f);
+    }
+
     /// Search the actual slot table, including its highest one-based slot ID.
     pub(super) fn find_slot(&self, matches: impl FnMut(&UsbSlot) -> bool) -> Option<u8> {
         find_device_slot(&self.slots, matches)

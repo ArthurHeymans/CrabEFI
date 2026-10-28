@@ -42,16 +42,10 @@ const HIGH_SPEED_CLOCK_HZ: u32 = 50_000_000;
 pub enum SdhciIdentity {
     /// PCI SDHCI controller.
     Pci(PciAddress),
-    /// ACPI-described MMIO SDHCI controller.
-    Acpi {
-        /// ACPI namespace name.
-        name: [u8; 4],
-        /// ACPI hardware ID.
-        hid: [u8; 16],
-        /// Hardware ID length.
-        hid_len: u8,
-        /// MMIO base from `_CRS`.
-        mmio_base: u64,
+    /// Platform-described MMIO SDHCI controller.
+    Mmio {
+        /// MMIO base address.
+        base: u64,
     },
 }
 
@@ -1365,7 +1359,7 @@ impl SdhciController {
     pub fn pci_address(&self) -> Option<PciAddress> {
         match self.identity {
             SdhciIdentity::Pci(address) => Some(address),
-            SdhciIdentity::Acpi { .. } => None,
+            SdhciIdentity::Mmio { .. } => None,
         }
     }
 
@@ -1429,41 +1423,37 @@ pub fn register_controller(address: PciAddress, controller: SdhciController) -> 
     Ok(())
 }
 
-/// Initialize an ACPI-described MMIO SDHCI controller.
-// Failures are logged at the error site; callers only branch on success.
-#[allow(clippy::result_unit_err)]
-pub fn init_mmio_device(dev: &crate::fdt::DsdtDevice, media: SdhciMedia) -> Result<(), ()> {
-    if dev.mmio_base == 0 || dev.mmio_size == 0 {
-        return Err(());
+/// ACPI identifiers of AMD eMMC controllers.
+pub(crate) const EMMC_IDS: &[&str] = &["AMDI0040", "AMDI0041"];
+
+/// Initialize a platform-described MMIO eMMC controller.
+pub(crate) fn bind_emmc(device: crate::peripheral::MmioPeripheral) {
+    if device.base == 0 || device.size < core::mem::size_of::<SdhciRegisters>() as u64 {
+        log::warn!("SDHCI {:?}: invalid MMIO window", device.ids);
+        return;
     }
-
     log::info!(
-        "Initializing MMIO SDHCI controller {} [{}] at {:#x}+{:#x}",
-        dev.name_str(),
-        dev.hid_str(),
-        dev.mmio_base,
-        dev.mmio_size,
+        "Initializing MMIO SDHCI controller {:?} at {:#x}+{:#x}",
+        device.ids,
+        device.base,
+        device.size,
     );
-
-    let controller = exec::block_on(SdhciController::new_mmio(
-        dev.mmio_base,
-        SdhciIdentity::Acpi {
-            name: dev.name,
-            hid: dev.hid,
-            hid_len: dev.hid_len,
-            mmio_base: dev.mmio_base,
-        },
-        media,
+    let controller = match exec::block_on(SdhciController::new_mmio(
+        device.base,
+        SdhciIdentity::Mmio { base: device.base },
+        SdhciMedia::Emmc,
         false,
         false,
-    ))
-    .map_err(|e| {
-        log::error!("Failed to initialize MMIO SDHCI controller: {:?}", e);
-    })?;
-
-    SDHCI_CONTROLLERS.register(controller)?;
-    log::info!("MMIO SDHCI controller initialized");
-    Ok(())
+    )) {
+        Ok(controller) => controller,
+        Err(e) => {
+            log::error!("Failed to initialize MMIO SDHCI controller: {:?}", e);
+            return;
+        }
+    };
+    if SDHCI_CONTROLLERS.register(controller).is_ok() {
+        log::info!("MMIO SDHCI controller initialized");
+    }
 }
 
 /// Shutdown all SDHCI controllers

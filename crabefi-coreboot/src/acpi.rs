@@ -7,15 +7,31 @@
 //! - **SPCR** — Serial port (UART) base address
 //! - **FADT → DSDT** — Full AML interpreter for platform device discovery
 //!   (`_HID`, `_CRS` resource templates with all memory descriptor types)
+//!   and I2C peripherals for CrabEFI's drivers
 
 use acpi::{AcpiTables, Handle, Handler, PciAddress, PhysicalMapping};
 use alloc::rc::Rc;
+use alloc::string::String;
+use alloc::vec::Vec;
 use core::cell::RefCell;
 use core::ptr::NonNull;
 use crabefi::PciEcamRegion;
 #[cfg(target_arch = "aarch64")]
 use crabefi::fdt::PciDmaDomain;
-use crabefi::fdt::{DsdtDevice, MAX_DSDT_DEVICES, MAX_ECAM_REGIONS, PlatformInfo};
+use crabefi::fdt::{DsdtDevice, MAX_ECAM_REGIONS, PlatformInfo};
+use crabefi::peripheral::Peripheral;
+
+mod connections;
+mod peripherals;
+#[cfg(test)]
+#[path = "acpi/tests.rs"]
+mod tests;
+
+/// What ACPI describes for `init_platform()`.
+pub struct Discovery {
+    pub info: PlatformInfo,
+    pub peripherals: Vec<Peripheral>,
+}
 
 // ---------------------------------------------------------------------------
 // Handler — bridges the `acpi` crate to CrabEFI's hardware
@@ -270,9 +286,13 @@ impl Handler for CrabEfiHandler {
 /// # Safety
 ///
 /// `rsdp_addr` must point to a valid ACPI RSDP in physical memory, and all
-/// table pointers reachable from it must reside in mapped memory.
-pub unsafe fn discover_platform(rsdp_addr: u64) -> PlatformInfo {
+/// table pointers reachable from it must reside in mapped memory. Controller
+/// MMIO of described peripherals is identity mapped and owned by no other
+/// CrabEFI driver.
+pub unsafe fn discover_platform(rsdp_addr: u64) -> Discovery {
     let mut info = PlatformInfo::new();
+    let mut connections = Vec::new();
+    let mut mmio = Vec::new();
     let handler = CrabEfiHandler::new();
 
     // 1. Parse the RSDP → XSDT/RSDT table chain.
@@ -280,7 +300,10 @@ pub unsafe fn discover_platform(rsdp_addr: u64) -> PlatformInfo {
         Ok(t) => t,
         Err(e) => {
             log::error!("ACPI: failed to parse tables: {:?}", e);
-            return info;
+            return Discovery {
+                info,
+                peripherals: Vec::new(),
+            };
         }
     };
 
@@ -318,7 +341,9 @@ pub unsafe fn discover_platform(rsdp_addr: u64) -> PlatformInfo {
     // 3. Try to build the full AML interpreter for DSDT device discovery.
     match acpi::platform::AcpiPlatform::new(tables, handler) {
         Ok(platform) => match acpi::aml::Interpreter::new_from_platform(&platform) {
-            Ok(interpreter) => discover_namespace_devices(&interpreter, &mut info),
+            Ok(interpreter) => {
+                discover_namespace_devices(&interpreter, &mut info, &mut connections, &mut mmio)
+            }
             Err(e) => log::warn!("ACPI: AML interpreter init failed: {:?}", e),
         },
         Err(e) => log::warn!("ACPI: platform init failed: {:?}", e),
@@ -368,7 +393,10 @@ pub unsafe fn discover_platform(rsdp_addr: u64) -> PlatformInfo {
         }
     }
 
-    info
+    // SAFETY: the caller's controller contract.
+    let mut peripherals = unsafe { peripherals::adopt(connections) };
+    peripherals.append(&mut mmio);
+    Discovery { info, peripherals }
 }
 
 /// Locate a TPM 1.2 event log described by the ACPI TCPA table.
@@ -561,10 +589,14 @@ fn parse_spcr(tables: &AcpiTables<CrabEfiHandler>, info: &mut PlatformInfo) {
 // DSDT — platform device discovery via AML interpreter
 // ---------------------------------------------------------------------------
 
-/// Walk the AML namespace and extract platform devices with `_HID` + `_CRS`.
+/// Walk the AML namespace and extract platform devices with `_HID` + `_CRS`,
+/// the MMIO devices and the connections of I2C devices that a CrabEFI driver
+/// supports.
 fn discover_namespace_devices(
     interpreter: &acpi::aml::Interpreter<CrabEfiHandler>,
     info: &mut PlatformInfo,
+    connections: &mut Vec<peripherals::Connection>,
+    mmio: &mut Vec<Peripheral>,
 ) {
     use acpi::aml::namespace::{AmlName, NamespaceLevelKind};
     use acpi::aml::object::Object;
@@ -582,10 +614,6 @@ fn discover_namespace_devices(
         if level.kind != NamespaceLevelKind::Device {
             return Ok(true);
         }
-        if info.dsdt_devices.len() >= MAX_DSDT_DEVICES {
-            return Ok(false); // stop recursing, array full
-        }
-
         // --- _HID ---
         let hid_path = AmlName::from_str("_HID")
             .map_err(|e| {
@@ -625,6 +653,12 @@ fn discover_namespace_devices(
             && let Object::Integer(sta) = &*sta_obj
             && (*sta & 0x0b) != 0x0b
         {
+            return Ok(true);
+        }
+
+        let ids = peripherals::ids(interpreter, path);
+        if crabefi::peripheral::i2c_supported(ids.iter().map(String::as_str)) {
+            connections.extend(peripherals::connection(interpreter, path, ids));
             return Ok(true);
         }
 
@@ -686,7 +720,20 @@ fn discover_namespace_devices(
             }
         }
 
-        // Only store devices that have MMIO resources.
+        // Only store MMIO devices. A full list must not stop the traversal,
+        // which also finds I2C devices.
+        if mmio_base != 0
+            && mmio_size != 0
+            && crabefi::peripheral::mmio_supported(ids.iter().map(String::as_str))
+            && peripherals::present(interpreter, path)
+            && peripherals::powered(interpreter, path)
+        {
+            mmio.push(Peripheral::Mmio(crabefi::peripheral::MmioPeripheral {
+                ids: ids.clone(),
+                base: mmio_base,
+                size: mmio_size,
+            }));
+        }
         if mmio_base != 0 && mmio_size != 0 {
             let name = extract_device_name(path);
             let device = DsdtDevice {

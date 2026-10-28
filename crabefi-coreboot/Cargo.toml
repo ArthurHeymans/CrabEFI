@@ -13,7 +13,7 @@ external-runtime-image = []
 # Use the long-mode RDI entry for u-root/LinuxBoot instead of coreboot's
 # default 32-bit stack-argument entry. Only supported on x86-64.
 entry64 = []
-ui = ["crabefi/ui"]
+ui = ["crabefi/ui", "crabefi/elan-i2c", "crabefi/hid-i2c"]
 # Fabricate a QEMU-shaped memory map when coreboot tables are missing or
 # invalid, instead of failing startup with no memory map. Useful only for
 # table-less QEMU experiments; never enable for real hardware.
@@ -49,6 +49,11 @@ acpi = { git = "https://github.com/rust-osdev/acpi.git", rev = "cb34d9d42c8d2795
 # firmware allocator in std test harnesses.
 [target.'cfg(not(target_os = "none"))'.dependencies]
 linked_list_allocator = { version = "0.10.6", default-features = false, features = ["use_spin"] }
+
+# Controllers of ACPI-described peripherals.
+[target.'cfg(not(target_arch = "riscv64"))'.dependencies]
+crabefi-hw = { path = "../crabefi-hw" }
+embedded-hal-bus = { version = "0.3", default-features = false, features = ["alloc"] }
 
 [target.'cfg(target_arch = "x86_64")'.dependencies]
 x86_64 = "0.15"

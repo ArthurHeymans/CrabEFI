@@ -91,18 +91,18 @@ impl UsbController for Controller {
 fn interrupt_reports_preserve_keys_when_pending_or_short() {
     let mut controller = Controller::new();
     let mut keyboard = UsbHidKeyboard::new(0, 1, 1, 8, 10);
-    poll_report(&mut keyboard, &mut controller);
-    assert_eq!(keyboard.get_key(), Some(b'a' as u16));
-    assert_eq!(keyboard.prev_report.keys[0], 4);
+    keyboard.poll_report(&mut controller);
+    assert_eq!(keyboard.keys.get_key(), Some(b'a' as u16));
+    assert_eq!(keyboard.keys.prev_report.keys[0], 4);
     controller.report.fill(0);
     for length in [0, 2, 7] {
         controller.length = length;
-        poll_report(&mut keyboard, &mut controller);
-        assert_eq!(keyboard.prev_report.keys[0], 4);
+        keyboard.poll_report(&mut controller);
+        assert_eq!(keyboard.keys.prev_report.keys[0], 4);
     }
     controller.length = 8;
-    poll_report(&mut keyboard, &mut controller);
-    assert_eq!(keyboard.prev_report.keys[0], 0);
+    keyboard.poll_report(&mut controller);
+    assert_eq!(keyboard.keys.prev_report.keys[0], 0);
     assert_eq!(controller.get_reports, 0);
 }
 
@@ -114,7 +114,7 @@ fn composite_interface_is_used_for_all_class_requests() {
     keyboard.set_idle(&mut controller, 0).unwrap();
     keyboard.set_leds(&mut controller).unwrap();
     controller.supported = false;
-    poll_report(&mut keyboard, &mut controller);
+    keyboard.poll_report(&mut controller);
     assert_eq!(controller.class_indices, [3, 3, 3, 3]);
     assert_eq!(controller.get_reports, 1);
 }

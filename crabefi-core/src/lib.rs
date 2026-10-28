@@ -524,6 +524,19 @@ pub fn init_platform(mut config: PlatformConfig) -> ! {
 
     // ---- 8. Initialize keyboard subsystem ----
     drivers::keyboard_common::init();
+    if let Some(input) = config.console_input.take() {
+        // SAFETY: init_platform() is -> !, so the platform's console input
+        // lives for the entire firmware lifetime.
+        let input = unsafe {
+            core::mem::transmute::<
+                &mut dyn crate::platform::ConsoleInput,
+                &'static mut dyn crate::platform::ConsoleInput,
+            >(input)
+        };
+        drivers::keyboard_common::register(alloc::boxed::Box::new(
+            drivers::keyboard_common::PlatformKeyboard(input),
+        ));
+    }
 
     // ---- 9. Initialize EFI environment ----
     //
@@ -544,9 +557,6 @@ pub fn init_platform(mut config: PlatformConfig) -> ! {
             drivers::mouse_cursor::init(fb.width, fb.height);
         }
     }
-
-    // Platform-described devices need the EFI allocator and timer.
-    peripheral::bind(core::mem::take(&mut config.peripherals));
 
     // ---- 9b. Install the initial ESRT ----
     //

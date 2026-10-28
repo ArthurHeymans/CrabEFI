@@ -3,8 +3,10 @@
 #![cfg(test)]
 #![allow(dead_code)]
 
+extern crate alloc;
 extern crate std;
 
+mod acpi;
 mod framebuffer;
 mod memory;
 mod tables;

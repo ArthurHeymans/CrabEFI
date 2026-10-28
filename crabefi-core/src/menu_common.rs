@@ -30,9 +30,8 @@ pub enum KeyPress {
     MouseScroll(i32),
 }
 
-/// Read a key from keyboard (PS/2, USB, or serial)
+/// Read a key from any keyboard or serial
 pub fn read_key() -> Option<KeyPress> {
-    // Try PS/2 keyboard first
     if let Some((scan_code, unicode_char)) = keyboard::try_read_key() {
         return match scan_code {
             0x01 => Some(KeyPress::Up),                         // SCAN_UP
@@ -41,20 +40,6 @@ pub fn read_key() -> Option<KeyPress> {
             0x04 => Some(KeyPress::Left),                       // SCAN_LEFT
             0x17 => Some(KeyPress::Escape),                     // SCAN_ESC
             0 if unicode_char == 0x0D => Some(KeyPress::Enter), // Carriage return
-            0 if unicode_char > 0 => Some(KeyPress::Char(unicode_char as u8 as char)),
-            _ => None,
-        };
-    }
-
-    // Try USB keyboard
-    if let Some((scan_code, unicode_char)) = crate::drivers::usb::keyboard_get_key() {
-        return match scan_code {
-            0x01 => Some(KeyPress::Up),
-            0x02 => Some(KeyPress::Down),
-            0x03 => Some(KeyPress::Right),
-            0x04 => Some(KeyPress::Left),
-            0x17 => Some(KeyPress::Escape),
-            0 if unicode_char == 0x0D => Some(KeyPress::Enter),
             0 if unicode_char > 0 => Some(KeyPress::Char(unicode_char as u8 as char)),
             _ => None,
         };

@@ -1,14 +1,12 @@
-//! Shared keyboard constants and arch-agnostic API
+//! Keyboards
 //!
-//! This module provides:
-//! - EFI key state constants (used by both PS/2 and USB keyboard drivers)
-//! - The public keyboard API that delegates to the appropriate backend
-//!
-//! On x86, this dispatches to both PS/2 (i8042) and USB HID keyboards.
-//! On aarch64, only USB HID keyboards are available.
+//! PS/2 and USB HID keyboards, the platform's console input and peripheral
+//! drivers each register a [`KeyboardDevice`]. Console and menu code read keys
+//! from all of them through [`try_read_key`] and [`get_efi_key_state`].
 
-// Re-export the EFI constants that were previously in drivers::keyboard
-// so that all existing callers (hid_keyboard.rs, etc.) can use them.
+use crate::cell::Local;
+use crate::platform::{Key, KeyState};
+use alloc::{boxed::Box, vec::Vec};
 
 /// EFI shift state flags (from UEFI spec Table 107)
 pub mod efi_shift_state {
@@ -33,68 +31,95 @@ pub mod efi_toggle_state {
 }
 
 // ============================================================================
-// Arch-agnostic public API
+// Keyboard devices
 // ============================================================================
 
-/// Initialize keyboard subsystem
+/// A keyboard or equivalent key source.
+pub trait KeyboardDevice {
+    /// Next key press, or `None` when none is waiting. Must not wait for input.
+    fn read_key(&mut self) -> Option<Key>;
+
+    /// Pressed modifiers and active toggles, without the VALID bits.
+    fn key_state(&mut self) -> KeyState {
+        KeyState::default()
+    }
+
+    /// Hand the device to the OS. Must not allocate or change the EFI memory
+    /// map.
+    fn stop(&mut self) {}
+}
+
+static DEVICES: Local<Vec<Box<dyn KeyboardDevice>>> = Local::new(Vec::new());
+
+/// Register a keyboard for the rest of boot services.
+pub fn register(device: Box<dyn KeyboardDevice>) {
+    DEVICES.borrow_mut().push(device);
+}
+
+/// Run `f` on the registered devices without holding a borrow across their
+/// callbacks.
+fn with_devices<R>(f: impl FnOnce(&mut Vec<Box<dyn KeyboardDevice>>) -> R) -> R {
+    let mut devices = core::mem::take(&mut *DEVICES.borrow_mut());
+    let result = f(&mut devices);
+    let mut registered = DEVICES.borrow_mut();
+    devices.append(&mut registered);
+    *registered = devices;
+    result
+}
+
+/// Initialize and register the PS/2 keyboard. USB keyboards register when
+/// USB is enumerated.
 pub fn init() {
     #[cfg(target_arch = "x86_64")]
-    crate::drivers::keyboard::init();
+    {
+        crate::drivers::keyboard::init();
+        register(Box::new(crate::drivers::keyboard::Ps2Keyboard));
+    }
 }
 
-/// Cleanup keyboard before ExitBootServices
+/// Hand every keyboard to the OS before ExitBootServices.
 pub fn cleanup() {
-    #[cfg(target_arch = "x86_64")]
-    crate::drivers::keyboard::cleanup();
+    let mut devices = core::mem::take(&mut *DEVICES.borrow_mut());
+    devices.iter_mut().for_each(|device| device.stop());
+    // No deallocation during the handoff.
+    core::mem::forget(devices);
 }
 
-/// Check if any keyboard has a key available
-#[cfg(target_arch = "x86_64")]
-pub fn has_key() -> bool {
-    // The PS/2 has_key() already polls USB internally
-    crate::drivers::keyboard::has_key()
-}
-
-/// Check if any keyboard has a key available
-#[cfg(not(target_arch = "x86_64"))]
-pub fn has_key() -> bool {
-    crate::drivers::usb::poll_keyboards();
-    crate::drivers::usb::keyboard_has_key()
-}
-
-/// Try to read a key from any keyboard
-#[cfg(target_arch = "x86_64")]
+/// Read a key from the first keyboard that has one.
+///
+/// Returns `(scan_code, unicode_char)` following EFI conventions.
 pub fn try_read_key() -> Option<(u16, u16)> {
-    // The PS/2 try_read_key() already tries USB first
-    crate::drivers::keyboard::try_read_key()
+    with_devices(|devices| devices.iter_mut().find_map(|device| device.read_key()))
+        .map(|key| (key.scancode, key.unicode_char))
 }
 
-/// Try to read a key from any keyboard
-#[cfg(not(target_arch = "x86_64"))]
-pub fn try_read_key() -> Option<(u16, u16)> {
-    crate::drivers::usb::poll_keyboards();
-    crate::drivers::usb::keyboard_get_key()
-}
-
-/// Get EFI key state from all keyboards
-#[cfg(target_arch = "x86_64")]
+/// Combined EFI shift and toggle state of every keyboard, with VALID bits.
 pub fn get_efi_key_state() -> (u32, u8) {
-    // The PS/2 get_efi_key_state() already combines USB state
-    crate::drivers::keyboard::get_efi_key_state()
+    let state = with_devices(|devices| {
+        devices.iter_mut().map(|device| device.key_state()).fold(
+            KeyState::default(),
+            |all, state| KeyState {
+                shift_state: all.shift_state | state.shift_state,
+                toggle_state: all.toggle_state | state.toggle_state,
+            },
+        )
+    });
+    (
+        state.shift_state | efi_shift_state::SHIFT_STATE_VALID,
+        state.toggle_state | efi_toggle_state::TOGGLE_STATE_VALID,
+    )
 }
 
-/// Get EFI key state from all keyboards
-#[cfg(not(target_arch = "x86_64"))]
-pub fn get_efi_key_state() -> (u32, u8) {
-    use efi_shift_state::SHIFT_STATE_VALID;
-    use efi_toggle_state::TOGGLE_STATE_VALID;
+/// The platform's console input as a keyboard.
+pub(crate) struct PlatformKeyboard(pub &'static mut dyn crate::platform::ConsoleInput);
 
-    let mut shift_state = SHIFT_STATE_VALID;
-    let mut toggle_state = TOGGLE_STATE_VALID;
+impl KeyboardDevice for PlatformKeyboard {
+    fn read_key(&mut self) -> Option<Key> {
+        self.0.poll();
+        self.0.read_key()
+    }
 
-    let usb_state = crate::drivers::usb::keyboard_get_efi_state();
-    shift_state |= usb_state.0;
-    toggle_state |= usb_state.1;
-
-    (shift_state, toggle_state)
+    fn key_state(&mut self) -> KeyState {
+        self.0.key_state()
+    }
 }

@@ -142,6 +142,8 @@ impl<T, const N: usize> ControllerRegistry<T, N> {
 pub mod block;
 #[cfg(feature = "elan-i2c")]
 pub(crate) mod elan;
+#[cfg(feature = "hid-i2c")]
+pub(crate) mod hid_i2c;
 #[cfg(target_arch = "x86_64")]
 pub mod keyboard;
 pub mod keyboard_common;
