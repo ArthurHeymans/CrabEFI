@@ -1,0 +1,2 @@
+# Unified-diff context includes a leading space before original indentation.
+firmware/*.patch -whitespace

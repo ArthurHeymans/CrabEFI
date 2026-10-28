@@ -55,6 +55,12 @@ The `./crabefi` wrapper invokes the xtask build system:
 
 The output ELF is at `target/<triple>/release/crabefi`.
 
+The x86 payload now requires the [version-1 64-bit entry ABI](X86_ENTRY_ABI.md).
+It has no 32-bit entry option. Direct coreboot integration requires the
+64-bit-caller patch and configuration described there; an old Q35 firmware
+image cannot be reused just by replacing its payload. The checked-in Q35 base
+fixture has been migrated to that caller.
+
 ### Direct Cargo build
 
 `crabefi-coreboot` uses the checked-in, architecture-matched runtime bundle by

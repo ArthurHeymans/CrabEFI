@@ -10,6 +10,7 @@ scratch allocation used on every architecture.
 - [Building](BUILDING.md) — build and test commands
 - [Architecture](ARCHITECTURE.md) — workspace and component organization
 - [Integration](INTEGRATION.md) — embedding the boot library and mandatory runtime image
+- [x86 Entry ABI](X86_ENTRY_ABI.md) — 64-bit-only payload contract and caller migration
 - [Memory Management](MEMORY.md) — boot/runtime ownership and EFI memory map
 - [Separate Runtime Image Architecture](RUNTIME_IMAGE_PLAN.md) — implemented runtime boundary, loader, SVAM transaction, and current platform limitations
 - [Platform Compatibility](COMPATIBILITY.md) — QEMU CI coverage per platform, time/authentication policy, and known limitations
