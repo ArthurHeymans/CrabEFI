@@ -55,6 +55,19 @@ The `./crabefi` wrapper invokes the xtask build system:
 
 The output ELF is at `target/<triple>/release/crabefi`.
 
+The default x86 build keeps coreboot's **32-bit protected-mode entry** and
+works with unmodified coreboot and the existing Q35 firmware fixture.
+
+For u-root/LinuxBoot, explicitly select the [64-bit entry](X86_ENTRY_ABI.md):
+
+```bash
+./crabefi build --arch x86-64 --entry64
+```
+
+This writes `target/entry64/x86_64-unknown-none/release/crabefi`, separately from
+the default coreboot payload. Native `run`, `test` and `screenshot` commands
+continue to build the default coreboot entry; they do not accept `--entry64`.
+
 ### Direct Cargo build
 
 `crabefi-coreboot` uses the checked-in, architecture-matched runtime bundle by
@@ -65,7 +78,14 @@ cargo build -p crabefi-coreboot --release --target x86_64-unknown-none
 ```
 
 This mode supports the normal `ui` feature and does not require runtime-image
-environment variables.
+environment variables. To select the entry for u-root instead of coreboot:
+
+```bash
+cargo build -p crabefi-coreboot --release --target x86_64-unknown-none --features entry64
+```
+
+Unlike the wrapper's separate output directory, direct Cargo builds use the
+usual target path; enabling/disabling the feature replaces that output ELF.
 
 ### Fresh audited runtime build
 
@@ -111,6 +131,8 @@ The `crabefi-coreboot` binary enables both `platform-entry` and `global-allocato
 For the `crabefi-coreboot` package itself, `bundled-runtime-image` is enabled by
 default. `external-runtime-image` is mutually exclusive and is selected by the
 wrapper with `--no-default-features` when embedding a freshly audited artifact.
+The `entry64` feature is off by default, applies only to x86-64, and changes
+only the payload entry contract for u-root/LinuxBoot.
 
 ### Updating the Cargo runtime bundle
 

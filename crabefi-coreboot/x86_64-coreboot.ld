@@ -9,12 +9,15 @@ PHDRS {
     rodata PT_LOAD FLAGS(4);
     data PT_LOAD FLAGS(6);
     defer PT_NULL FLAGS(0);
+    entry_abi PT_NOTE FLAGS(4);
 }
 
 SECTIONS {
     . = __payload_base;
     __boot_code_start = .;
-    .entry32 : ALIGN(4096) { *(.entry32) } :code
+    /* Exactly one entry is compiled: coreboot by default, or entry64. */
+    .entry32 : ALIGN(4096) { KEEP(*(.entry32)) } :code
+    .entry64 : ALIGN(4096) { KEEP(*(.entry64)) } :code
     .text : ALIGN(4096) {
         _text_start = .;
         *(.text .text.*)
@@ -28,6 +31,7 @@ SECTIONS {
         *(.rodata .rodata.*)
         _rodata_end = .;
     } :rodata
+    .note.crabefi : ALIGN(4) { KEEP(*(.note.crabefi)) } :rodata :entry_abi
     .got : ALIGN(8) { *(.got .got.*) } :rodata
     .data : ALIGN(4096) {
         _data_start = .;

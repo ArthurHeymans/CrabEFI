@@ -112,6 +112,10 @@ enum Commands {
         /// Enable graphical UI with mouse support
         #[arg(long)]
         ui: bool,
+
+        /// Build the 64-bit x86 entry for u-root/LinuxBoot (not coreboot)
+        #[arg(long)]
+        entry64: bool,
     },
 
     /// Regenerate the checked-in Cargo runtime bundle for one architecture
@@ -299,7 +303,11 @@ fn main() -> Result<()> {
     let machine = cli.machine;
 
     match cli.command {
-        Commands::Build { release, ui } => cmd_build(release, ui, arch, machine),
+        Commands::Build {
+            release,
+            ui,
+            entry64,
+        } => cmd_build_with_entry(release, ui, arch, machine, entry64),
         Commands::BundleRuntime { secure_boot } => runtime::bundle(arch, secure_boot),
         Commands::Run {
             coreboot_rom,
@@ -374,7 +382,21 @@ fn main() -> Result<()> {
     }
 }
 
+// Native coreboot run/test/screenshot commands always use the default entry.
 fn cmd_build(release: bool, ui: bool, arch: Arch, machine: Machine) -> Result<()> {
+    cmd_build_with_entry(release, ui, arch, machine, false)
+}
+
+fn cmd_build_with_entry(
+    release: bool,
+    ui: bool,
+    arch: Arch,
+    machine: Machine,
+    entry64: bool,
+) -> Result<()> {
+    if entry64 && arch != Arch::X86_64 {
+        bail!("--entry64 is only supported on x86-64");
+    }
     let label = match (arch, machine) {
         (Arch::X86_64, _) => "x86_64".to_string(),
         (Arch::Aarch64, Machine::Sbsa) => "aarch64/sbsa".to_string(),
@@ -404,12 +426,17 @@ fn cmd_build(release: bool, ui: bool, arch: Arch, machine: Machine) -> Result<()
     if release {
         cmd.arg("--release");
     }
-    let features = if ui {
-        "external-runtime-image,ui"
-    } else {
-        "external-runtime-image"
-    };
-    cmd.arg("--features").arg(features);
+    let mut features = vec!["external-runtime-image"];
+    if ui {
+        features.push("ui");
+    }
+    if entry64 {
+        features.push("entry64");
+        // Do not overwrite the default coreboot payload with an incompatible
+        // entry: regular run/test commands must still find the 32-bit build.
+        cmd.arg("--target-dir").arg("target/entry64");
+    }
+    cmd.arg("--features").arg(features.join(","));
 
     let target_triple = match arch {
         Arch::X86_64 => "x86_64-unknown-none",
@@ -457,7 +484,8 @@ fn cmd_build(release: bool, ui: bool, arch: Arch, machine: Machine) -> Result<()
     }
 
     let mode = if release { "release" } else { "debug" };
-    println!("Built: target/{}/{}/crabefi", target_triple, mode);
+    let target_dir = if entry64 { "target/entry64" } else { "target" };
+    println!("Built: {target_dir}/{target_triple}/{mode}/crabefi");
     Ok(())
 }
 
@@ -1072,6 +1100,43 @@ fn find_test_app_efi(name: &str, arch: Arch) -> Result<String> {
     }
 
     anyhow::bail!("No .efi file found in {}", target_dir.display())
+}
+
+#[cfg(test)]
+mod entry_tests {
+    use super::*;
+
+    #[test]
+    fn entry64_is_opt_in() {
+        for (args, want) in [
+            (&["crabefi", "build"][..], false),
+            (&["crabefi", "build", "--entry64"][..], true),
+        ] {
+            let cli = Cli::try_parse_from(args).unwrap();
+            let Commands::Build { entry64, .. } = cli.command else {
+                panic!("expected build command");
+            };
+            assert_eq!(entry64, want);
+        }
+    }
+
+    #[test]
+    fn native_coreboot_commands_do_not_accept_entry64() {
+        for command in ["run", "test"] {
+            assert!(Cli::try_parse_from(["crabefi", command, "--entry64"]).is_err());
+        }
+    }
+
+    #[test]
+    fn entry64_rejects_other_architectures_before_building() {
+        for arch in [Arch::Aarch64, Arch::Riscv64] {
+            let err = cmd_build_with_entry(true, false, arch, Machine::Sbsa, true).unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains("--entry64 is only supported on x86-64")
+            );
+        }
+    }
 }
 
 #[cfg(test)]
