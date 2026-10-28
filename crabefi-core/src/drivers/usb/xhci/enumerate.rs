@@ -71,13 +71,26 @@ const MOVED_DEVICE_TIMEOUT_MS: u64 = 500;
 /// Root ports already brought up during enumeration.
 struct RootPortScan {
     tried: Vec<bool>,
+    /// Devices that left their root port and haven't shown up on another.
+    moving: usize,
 }
 
 impl RootPortScan {
     fn new(num_ports: u8) -> Self {
         Self {
             tried: alloc::vec![false; usize::from(num_ports)],
+            moving: 0,
         }
+    }
+
+    /// A device left its root port during bring-up.
+    fn record_move(&mut self) {
+        self.moving += 1;
+    }
+
+    /// Whether a device that moved hasn't reappeared yet.
+    fn devices_moving(&self) -> bool {
+        self.moving > 0
     }
 
     fn untried(&self) -> impl Iterator<Item = u8> + '_ {
@@ -92,6 +105,7 @@ impl RootPortScan {
         for &port in &ports {
             self.tried[usize::from(port)] = true;
         }
+        self.moving = self.moving.saturating_sub(ports.len());
         ports
     }
 
@@ -179,6 +193,24 @@ mod root_port_scan_tests {
         assert!(exec::block_on(
             scan.wait_for_new_connection(expired, |port| port == 20)
         ));
+    }
+
+    #[test]
+    fn enumeration_waits_until_every_moved_device_reappears() {
+        let mut scan = RootPortScan::new(26);
+        assert_eq!(
+            scan.take_new_connections(|port| port == 1 || port == 2),
+            [1, 2]
+        );
+        scan.record_move();
+        scan.record_move();
+
+        // The first SuperSpeed connection leaves the second device moving,
+        // so enumeration waits for it in a fresh window after this pass.
+        assert_eq!(scan.take_new_connections(|port| port == 18), [18]);
+        assert!(scan.devices_moving());
+        assert_eq!(scan.take_new_connections(|port| port == 19), [19]);
+        assert!(!scan.devices_moving());
     }
 
     #[test]
@@ -628,7 +660,6 @@ impl super::XhciController {
     /// Enumerate ports and attach devices
     pub(super) async fn enumerate_ports(&mut self) -> Result<(), XhciError> {
         let mut scan = RootPortScan::new(self.num_ports);
-        let mut migration_timeout = None;
 
         loop {
             let ports =
@@ -657,15 +688,17 @@ impl super::XhciController {
                 let attached = up && self.attach_root_port_device(port).await;
                 if device_moved(attached, self.portsc(port).current_connect_status()) {
                     log::debug!("Port {}: device disconnected during bring-up", port);
-                    migration_timeout = Some(Timeout::from_ms(MOVED_DEVICE_TIMEOUT_MS));
+                    scan.record_move();
                 }
             }
 
-            // Keep the deadline across successful passes: other devices may
-            // still be training their SuperSpeed links after the first moves.
-            let Some(timeout) = migration_timeout else {
+            // Wait for the devices still moving from the end of this pass:
+            // attaching the others (hubs, storage) can take longer than the
+            // wait itself, and SuperSpeed links finish training one by one.
+            if !scan.devices_moving() {
                 break;
-            };
+            }
+            let timeout = Timeout::from_ms(MOVED_DEVICE_TIMEOUT_MS);
             if !scan
                 .wait_for_new_connection(timeout, |port| self.portsc(port).current_connect_status())
                 .await
