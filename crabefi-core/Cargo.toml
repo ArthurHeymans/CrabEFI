@@ -41,8 +41,11 @@ fb-log = []
 # Enable graphical UI with mouse support (PS/2 and USB HID mouse drivers,
 # cursor rendering, SimplePointerProtocol, and graphical setup utility)
 ui = ["dep:noto-sans-mono-bitmap"]
+# Native ELAN I2C touchpads described by the platform as peripherals.
+elan-i2c = ["ui"]
 
 [dependencies]
+embedded-hal = "1"
 crabefi-efi-types = { workspace = true }
 crabefi-pkcs7 = { workspace = true, optional = true }
 crabefi-runtime-bundle = { workspace = true, optional = true }

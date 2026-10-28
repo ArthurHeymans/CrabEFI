@@ -125,6 +125,8 @@ map, symbols, disassembly, stack report, digest, and JSON audits are under
 | `platform-entry` | off | Include CrabEFI's own `_start` entry point, EL2 page table setup, and exception vectors. Disable when integrating CrabEFI as a library into firmware that provides its own entry point. |
 | `global-allocator` | off | Register the built-in bump allocator as `#[global_allocator]` |
 | `fb-log` | off | Log to framebuffer (very slow, debugging only) |
+| `ui` | off | Graphical UI, mouse cursor and EFI Simple Pointer |
+| `elan-i2c` | off | Native ELAN I2C touchpad driver for platform-described peripherals (implies `ui`) |
 
 The `crabefi-coreboot` binary enables both `platform-entry` and `global-allocator` automatically. External firmware that provides its own entry point and allocator should not enable these features.
 
@@ -133,6 +135,31 @@ default. `external-runtime-image` is mutually exclusive and is selected by the
 wrapper with `--no-default-features` when embedding a freshly audited artifact.
 The `entry64` feature is off by default, applies only to x86-64, and changes
 only the payload entry contract for u-root/LinuxBoot.
+
+### Platform peripherals
+
+A platform hands CrabEFI the devices on buses it owns. It keeps the
+controller, clocks, pads and power; CrabEFI picks a driver by the device's
+identifiers, in order of preference. Bus and interrupt line are any
+embedded-hal `I2c` and `InputPin`:
+
+```rust,ignore
+use crabefi::peripheral::{I2cBus, I2cPeripheral, InputLine, Interrupt, Peripheral};
+
+let touchpad = Peripheral::I2c(I2cPeripheral {
+    ids: vec!["ELAN0000".into()],
+    bus: I2cBus::new(i2c_controller),
+    address: 0x15,
+    interrupt: Some(Interrupt::Level { line: InputLine::new(gpio_pin), active_low: true }),
+});
+let config = crabefi::PlatformConfigBuilder::new(/* ... */)
+    .peripheral(touchpad)
+    .build();
+```
+
+`crabefi::peripheral::i2c_supported(ids)` tells whether the build has a
+matching driver, so a platform can leave unused controllers alone. Devices are
+stopped at ExitBootServices.
 
 ### Updating the Cargo runtime bundle
 
