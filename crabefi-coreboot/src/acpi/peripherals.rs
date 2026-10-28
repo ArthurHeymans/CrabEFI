@@ -339,13 +339,48 @@ fn hid_descriptor_register(
     }
 }
 
+struct SharedBus<T> {
+    path: AmlName,
+    speed_hz: u32,
+    bus: Rc<RefCell<T>>,
+}
+
+/// Share only successfully adopted controllers at the validated speed. A
+/// device-specific attachment failure must not hide other devices on the bus.
+fn shared_bus<T>(
+    buses: &mut Vec<SharedBus<T>>,
+    path: &AmlName,
+    speed_hz: u32,
+    attach: impl FnOnce() -> Option<T>,
+) -> Option<Rc<RefCell<T>>> {
+    if let Some(shared) = buses.iter().find(|shared| shared.path == *path) {
+        if shared.speed_hz != speed_hz {
+            log::warn!(
+                "ACPI: I2C device on {} requests {} Hz, adopted bus uses {} Hz",
+                path,
+                speed_hz,
+                shared.speed_hz
+            );
+            return None;
+        }
+        return Some(shared.bus.clone());
+    }
+    let bus = Rc::new(RefCell::new(attach()?));
+    buses.push(SharedBus {
+        path: path.clone(),
+        speed_hz,
+        bus: bus.clone(),
+    });
+    Some(bus)
+}
+
 /// Take over the controllers of resolved connections. Devices on one
 /// controller share it.
 ///
 /// # Safety
 /// Controller MMIO is identity mapped and owned by no other CrabEFI driver.
 pub(super) unsafe fn adopt(connections: Vec<Connection>) -> Vec<Peripheral> {
-    let mut buses: Vec<(AmlName, Option<Rc<RefCell<I2cBus>>>)> = Vec::new();
+    let mut buses = Vec::new();
     connections
         .into_iter()
         .filter_map(|connection| {
@@ -358,17 +393,11 @@ pub(super) unsafe fn adopt(connections: Vec<Connection>) -> Vec<Peripheral> {
                 }
             };
             let bus = &connection.bus;
-            let shared = match buses.iter().find(|(path, _)| *path == bus.path) {
-                Some((_, shared)) => shared.clone(),
-                None => {
-                    let attach = I2C_CONTROLLERS.iter().find(|(hid, _)| *hid == bus.hid)?.1;
-                    // SAFETY: the caller's controller contract; attached once.
-                    let shared = unsafe { attach(bus.base, bus.size, connection.speed_hz) }
-                        .map(|bus| Rc::new(RefCell::new(bus)));
-                    buses.push((bus.path.clone(), shared.clone()));
-                    shared
-                }
-            }?;
+            let shared = shared_bus(&mut buses, &bus.path, connection.speed_hz, || {
+                let attach = I2C_CONTROLLERS.iter().find(|(hid, _)| *hid == bus.hid)?.1;
+                // SAFETY: the caller's controller contract; adopted once on success.
+                unsafe { attach(bus.base, bus.size, connection.speed_hz) }
+            })?;
             log::info!(
                 "ACPI: I2C device {:?} on {} at {:#x}",
                 connection.ids,
@@ -384,4 +413,29 @@ pub(super) unsafe fn adopt(connections: Vec<Connection>) -> Vec<Peripheral> {
             }))
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shared_buses_validate_each_devices_speed_without_reattaching() {
+        let path = AmlName::from_str("\\_SB.I2C2").unwrap();
+        let mut buses = Vec::new();
+        let first = shared_bus(&mut buses, &path, 400_000, || Some(())).unwrap();
+        assert!(shared_bus(&mut buses, &path, 100_000, || panic!("already adopted")).is_none());
+        let second = shared_bus(&mut buses, &path, 400_000, || panic!("already adopted")).unwrap();
+        assert!(Rc::ptr_eq(&first, &second));
+    }
+
+    #[test]
+    fn failed_attachment_does_not_hide_a_later_compatible_device() {
+        let path = AmlName::from_str("\\_SB.I2C2").unwrap();
+        let mut buses = Vec::new();
+        assert!(shared_bus(&mut buses, &path, 100_000, || None::<()>).is_none());
+        assert!(buses.is_empty());
+        assert!(shared_bus(&mut buses, &path, 400_000, || Some(())).is_some());
+        assert_eq!(buses.len(), 1);
+    }
 }
