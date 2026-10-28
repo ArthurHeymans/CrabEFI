@@ -7,6 +7,9 @@ use sha2::{Digest, Sha256};
 
 fn main() {
     let target = std::env::var("TARGET").unwrap_or_default();
+    if std::env::var_os("CARGO_FEATURE_ENTRY64").is_some() && !target.starts_with("x86_64") {
+        panic!("the entry64 feature is only supported on x86-64");
+    }
     let runtime_architecture = if target.starts_with("x86_64") {
         architecture::X86_64
     } else if target.starts_with("aarch64") {

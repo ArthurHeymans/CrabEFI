@@ -1,37 +1,70 @@
-# x86-64 payload entry ABI, version 1
+# x86 payload entries: coreboot by default, entry64 for u-root
 
-CrabEFI's x86 payload has a **64-bit-only** entry point. It does not contain a
-protected-mode entry or a 32-to-64-bit transition. The previous coreboot ABI,
-which passed an argument on a 32-bit stack, is not supported.
+CrabEFI supports **both callers**, selected at compile time. Default x86 builds
+keep the established coreboot entry. The optional `entry64` feature selects
+the long-mode entry used by u-root/LinuxBoot. Exactly one external entry is
+linked into each ELF; this is not runtime mode detection or a fallback.
 
-## Caller contract
+| Build | Caller | Entry argument | Output from wrapper |
+| --- | --- | --- | --- |
+| `./crabefi build` | unmodified coreboot, 32-bit protected mode | coreboot table pointer at `[esp+4]` | `target/x86_64-unknown-none/release/crabefi` |
+| `./crabefi build --entry64` | u-root/LinuxBoot, 64-bit long mode | full-width coreboot table pointer in RDI | `target/entry64/x86_64-unknown-none/release/crabefi` |
 
-The caller jumps or calls the ELF entry `_start` with:
+The separate wrapper output prevents an entry64 build from replacing the
+payload used by normal coreboot `run`, `test` and `screenshot` commands.
+The original Q35 fixture and example coreboot defconfigs are unchanged; no
+coreboot caller patch or firmware ABI migration is required.
 
-- Ring 0 long mode active, paging enabled, interrupts disabled, and PCID and
-  CET disabled. Four-level and five-level paging are both supported; entry
-  preserves the incoming `CR4.LA57` setting rather than toggling paging.
-- All `PT_LOAD` segments loaded at their physical addresses, with zero-filled
-  tails as specified by ELF. Physical and virtual segment addresses must match.
-  The caller must identity-map the complete segments, including writable page
-  tables, BSS, and stack. They must be within the first 64 GiB.
-- `RDI` holding the **full 64-bit physical address** of the coreboot table.
-  The table and everything it references must remain valid and accessible.
-  In particular, firmware RAM must not include the handoff table's storage.
+## Default coreboot entry
 
-No caller stack, GDT, segment selectors, or general-purpose register contents
-other than RDI are retained. Entry clears DF, preserves RDI in R12, establishes
-its own stack, initializes its own page tables, installs its GDT, clears BSS,
-enables SSE/NX, and calls `rust_main(RDI)`. It never leaves long mode. The
-payload does not return.
+Both build variants are ELF64 executables, because CrabEFI itself runs in
+64-bit mode. The default `_start` nevertheless executes in 32-bit protected
+mode, as coreboot requires. It reads the stack argument, initializes page
+tables, switches to long mode, establishes its stack, clears BSS and enters
+Rust. This is the existing coreboot path, not an obsolete or unsupported ABI.
+It does **not** advertise the entry64 ELF note.
 
-The new page tables identity-map the first 64 GiB using 2-MiB pages. An extra
-PML5 is used when the caller has five-level paging enabled. Page tables are
-outside BSS so clearing BSS cannot destroy the active address space.
+Direct Cargo builds retain this default:
 
-## ELF identification
+```sh
+cargo build -p crabefi-coreboot --release --target x86_64-unknown-none
+```
 
-The ELF has an allocated `.note.crabefi` section in a `PT_NOTE` program header:
+## Opt-in entry64 for u-root
+
+Select the feature explicitly:
+
+```sh
+./crabefi build --arch x86-64 --entry64
+# Or, using the checked-in Runtime Services bundle:
+cargo build -p crabefi-coreboot --release --target x86_64-unknown-none --features entry64
+```
+
+Direct Cargo commands use the normal target path, replacing its previous ELF;
+the wrapper instead keeps the two variants separate as shown above. The flag
+is x86-64-only. Native coreboot `run`/`test` commands deliberately do not accept
+`--entry64` and always build the default coreboot variant.
+
+The entry64 caller jumps to `_start` with:
+
+- Ring 0 long mode active, paging enabled, interrupts disabled, PCID and CET
+  disabled. Four- and five-level paging are accepted; `CR4.LA57` is preserved.
+- All identity-linked `PT_LOAD` segments loaded at their physical addresses,
+  with zero-filled ELF tails. The incoming identity map must cover the complete
+  segments, including writable page tables, BSS and stack, below 64 GiB.
+- RDI containing the full 64-bit physical coreboot table pointer. The table and
+  its references must remain valid, and its storage must be reserved rather
+  than advertised as reusable firmware RAM.
+
+This entry preserves RDI in R12, establishes its own stack, initializes its own
+64-GiB identity map, installs its GDT, clears BSS, enables SSE/NX and enters
+`rust_main`. It never leaves long mode or returns to the caller. Its paging
+structures are outside BSS; an extra PML5 is compiled only for this variant.
+No caller stack, GDT or other general-purpose register contents are retained.
+
+## Identifying the correct ELF
+
+Only entry64 builds have an allocated `.note.crabefi` section in `PT_NOTE`:
 
 | Field | Value |
 | --- | --- |
@@ -41,57 +74,28 @@ The ELF has an allocated `.note.crabefi` section in a `PT_NOTE` program header:
 | owner | `CrabEFI` followed by NUL |
 | descriptor | little-endian `uint32` value 1 |
 
-Names and descriptors use standard ELF note four-byte alignment. Consumers
-should inspect program headers, not require section or symbol tables. Other
-ELF notes may coexist with this one. `ELFCLASS64` alone is insufficient: the
-old payload was also an ELF64 file, but its entry executed 32-bit instructions.
-Loaders must reject missing or unsupported ABI versions rather than attempting
-a compatibility transition.
+Notes use standard ELF four-byte alignment. Loaders inspect program headers,
+not symbol or section tables. u-root requires this note and rejects a default
+coreboot build with an instruction to enable `entry64`; ELFCLASS64 alone is
+not enough to select the right entry contract. u-root still owns ELF loading,
+firmware handoff, filesystem cleanup and kexec execution, without a Multiboot
+adapter, external Rust launcher or kexec-tools dependency.
 
-## LinuxBoot / u-root
-
-Use u-root's native `boot.CrabEFIImage` implementation with support for this
-note. Its kexec entry stub executes `cli; cld`, loads RDI with the coreboot table
-address, loads RAX with the ELF entry, and jumps to RAX. Both operands are
-64-bit immediates. There is no Multiboot header, external Rust launcher, or
-32-bit trampoline in this path.
-
-u-root still owns image loading, filesystem cleanup, and `kexec` execution.
-The first kernel must expose the firmware map, ACPI, SMBIOS and a physical
-framebuffer; see u-root's `pkg/boot/crabefi/README.md` for those requirements.
-
-## Direct coreboot integration
-
-Upstream coreboot currently forces payloads back into protected mode, even
-when ramstage itself is 64-bit. Running only ramstage in long mode is therefore
-**not sufficient** for this payload.
-
-Apply [`firmware/coreboot-x86_64-payload.patch`](../firmware/coreboot-x86_64-payload.patch)
-and enable `CONFIG_USE_X86_64_SUPPORT=y` and `CONFIG_PAYLOAD_X86_64=y`.
-This keeps the payload call in long mode with the argument in RDI. There is no
-fallback to the old ABI. A firmware rebuild is mandatory; replacing only the
-payload in an old 32-bit-caller ROM will not work.
-
-The Q35 test fixture and x86 example defconfigs use this caller. The patch
-leaves coreboot's default for unrelated payloads unchanged. It is a dependency
-of this ABI migration until coreboot provides an equivalent upstream interface.
+CI builds and checks both variants with `ci/check-x86-entry.sh`, uploads them
+as separate artifacts, and keeps the normal QEMU tests on the default build.
 
 ## End-to-end validation
 
-The ABI migration was exercised on QEMU Q35/KVM with 4 GiB RAM and NVMe:
+Both paths booted installed Windows 11 Pro 25H2 (26200.6584) on QEMU Q35/KVM,
+4 GiB RAM, NVMe, networking disabled:
 
-- coreboot -> Linux 7.2.0-rc6 -> u-root's normal boot menu -> CrabEFI ->
-  installed Windows 11 Pro 25H2, build 26200.6584, including a cold repeat.
-- The same LinuxBoot chain with a freshly built/audited Runtime Services image.
-- Direct 64-bit coreboot -> CrabEFI -> the same installed Windows image.
-- `./crabefi test --app hello --nvme` using the replacement Q35 fixture.
+- Unmodified coreboot's 32-bit payload call -> default CrabEFI -> Windows.
+- coreboot -> Linux 7.2.0-rc6 -> u-root's normal boot menu -> explicitly built
+  entry64 CrabEFI -> Windows.
 
-Each Windows run used a disposable copy, networking disabled, and success and
-OS-diagnostic files deleted before boot. Windows regenerated the success marker,
-reported installation type `Client` and `SYSTEMDRIVE=C:`, and recorded
-`explorer.exe` running. These are full installed-OS boots, not WinPE or merely
-reaching Windows Boot Manager. No new Windows installation was performed.
-
-These tests do not establish Secure Boot, BitLocker, TPM continuity or physical
-board compatibility. Five-level entry is implemented but was not exercised by
-this four-level-paging test setup.
+The test used a disposable disk copy and deleted success and diagnostic files
+before each boot. Windows regenerated its success marker, reported `Client`
+and `SYSTEMDRIVE=C:`, and recorded `explorer.exe` running. These are installed
+full-OS boots, not WinPE or merely reaching Boot Manager. No Windows image or
+provisioning harness is committed. Secure Boot, BitLocker, TPM continuity,
+five-level execution and physical-board compatibility were not validated.

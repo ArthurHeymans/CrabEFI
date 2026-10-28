@@ -10,11 +10,8 @@
 CONFIG_VENDOR_EMULATION=y
 CONFIG_BOARD_EMULATION_QEMU_X86_I440FX=y
 
-# 64-bit-only CrabEFI entry ABI. Apply firmware/coreboot-x86_64-payload.patch
-# to coreboot first; 64-bit ramstage alone still calls legacy payloads in 32-bit.
+# Architecture
 CONFIG_ARCH_X86=y
-CONFIG_USE_X86_64_SUPPORT=y
-CONFIG_PAYLOAD_X86_64=y
 
 # Payload: ELF executable (CrabEFI)
 CONFIG_PAYLOAD_ELF=y

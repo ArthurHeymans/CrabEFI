@@ -15,6 +15,8 @@ PHDRS {
 SECTIONS {
     . = __payload_base;
     __boot_code_start = .;
+    /* Exactly one entry is compiled: coreboot by default, or entry64. */
+    .entry32 : ALIGN(4096) { KEEP(*(.entry32)) } :code
     .entry64 : ALIGN(4096) { KEEP(*(.entry64)) } :code
     .text : ALIGN(4096) {
         _text_start = .;

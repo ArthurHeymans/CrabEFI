@@ -133,6 +133,11 @@ jobs:
         run: cargo build -p crabefi-coreboot --release --target x86_64-unknown-none
       - name: Build release
         run: ./crabefi build --arch x86-64
+      - name: Build and check both x86 entry variants
+        run: |
+          ./crabefi build --arch x86-64 --entry64
+          ci/check-x86-entry.sh coreboot target/x86_64-unknown-none/release/crabefi
+          ci/check-x86-entry.sh entry64 target/entry64/x86_64-unknown-none/release/crabefi
       - name: Build Cargo-only library consumer
         run: |
           cargo -Z build-std=core,compiler_builtins,alloc \
@@ -152,6 +157,12 @@ jobs:
           path: |
             target/x86_64-unknown-none/release/crabefi
             target/runtime/x86_64/
+          retention-days: 7
+      - name: Upload LinuxBoot entry64 ELF
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: crabefi-linuxboot-elf
+          path: target/entry64/x86_64-unknown-none/release/crabefi
           retention-days: 7
   # x86_64 Integration tests with QEMU
   test-usb:

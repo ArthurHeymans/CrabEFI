@@ -10,6 +10,9 @@ description = "CrabEFI as a coreboot payload binary"
 default = ["bundled-runtime-image"]
 bundled-runtime-image = ["crabefi/bundled-runtime-image"]
 external-runtime-image = []
+# Use the long-mode RDI entry for u-root/LinuxBoot instead of coreboot's
+# default 32-bit stack-argument entry. Only supported on x86-64.
+entry64 = []
 ui = ["crabefi/ui"]
 # Fabricate a QEMU-shaped memory map when coreboot tables are missing or
 # invalid, instead of failing startup with no memory map. Useful only for

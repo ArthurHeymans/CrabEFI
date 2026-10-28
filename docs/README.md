@@ -10,15 +10,16 @@ scratch allocation used on every architecture.
 - [Building](BUILDING.md) — build and test commands
 - [Architecture](ARCHITECTURE.md) — workspace and component organization
 - [Integration](INTEGRATION.md) — embedding the boot library and mandatory runtime image
-- [x86 Entry ABI](X86_ENTRY_ABI.md) — 64-bit-only payload contract and caller migration
+- [x86 Entry ABIs](X86_ENTRY_ABI.md) — default coreboot entry and opt-in entry64 for u-root
 - [Memory Management](MEMORY.md) — boot/runtime ownership and EFI memory map
 - [Separate Runtime Image Architecture](RUNTIME_IMAGE_PLAN.md) — implemented runtime boundary, loader, SVAM transaction, and current platform limitations
 - [Platform Compatibility](COMPATIBILITY.md) — QEMU CI coverage per platform, time/authentication policy, and known limitations
 
-Use `./crabefi build --arch <arch>` rather than invoking the payload package
-directly: the wrapper builds, audits, normalizes, and binds the matching runtime
-artifact before compiling the payload. Direct payload Cargo commands intentionally
-require `RUNTIME_IMAGE_PATH` and `RUNTIME_IMAGE_SHA256` from that wrapper.
+Use `./crabefi build --arch <arch>` to build, audit, normalize and bind a fresh
+Runtime Services image. Direct payload Cargo builds instead use the checked-in
+runtime bundle by default. On x86, both commands retain coreboot's 32-bit entry
+unless `--entry64` (wrapper) or `--features entry64` (Cargo) is explicitly selected
+for u-root/LinuxBoot. See [Building](BUILDING.md) for output paths.
 
 The remaining verification work is physical-board coverage for board-specific
 reset, RTC, SPI compaction, and retained-MMIO wiring; no hardware is available
