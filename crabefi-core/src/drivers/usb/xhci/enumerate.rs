@@ -71,13 +71,21 @@ const MOVED_DEVICE_TIMEOUT_MS: u64 = 500;
 /// Root ports already brought up during enumeration.
 struct RootPortScan {
     tried: Vec<bool>,
+    /// A device left its root port; new connections cannot be matched to it.
+    migration_seen: bool,
 }
 
 impl RootPortScan {
     fn new(num_ports: u8) -> Self {
         Self {
             tried: alloc::vec![false; usize::from(num_ports)],
+            migration_seen: false,
         }
+    }
+
+    /// A device left its root port during bring-up.
+    fn record_move(&mut self) {
+        self.migration_seen = true;
     }
 
     fn untried(&self) -> impl Iterator<Item = u8> + '_ {
@@ -97,6 +105,19 @@ impl RootPortScan {
 
     fn has_new_connection(&self, connected: impl Fn(u8) -> bool) -> bool {
         self.untried().any(connected)
+    }
+
+    /// Rescan immediately, then allow a fresh quiet window after any migration.
+    async fn wait_for_next_pass(&self, connected: impl Fn(u8) -> bool) -> bool {
+        // Without port-pair information, even a new SuperSpeed connection
+        // could be unrelated. Keep waiting until a whole window is quiet.
+        let wait_ms = if self.migration_seen {
+            MOVED_DEVICE_TIMEOUT_MS
+        } else {
+            0
+        };
+        self.wait_for_new_connection(Timeout::from_ms(wait_ms), connected)
+            .await
     }
 
     async fn wait_for_new_connection(
@@ -146,7 +167,7 @@ mod root_port_scan_tests {
     }
 
     #[test]
-    fn staggered_migrations_share_the_same_wait_window() {
+    fn staggered_migrations_get_fresh_wait_windows() {
         use core::cell::Cell;
 
         let mut scan = RootPortScan::new(26);
@@ -154,13 +175,14 @@ mod root_port_scan_tests {
             scan.take_new_connections(|port| port == 2 || port == 3),
             [2, 3]
         );
-        let timeout = Timeout::from_ms(MOVED_DEVICE_TIMEOUT_MS);
+        scan.record_move();
+        scan.record_move();
 
         // Each SuperSpeed connection appears only after waiting. Attaching
         // the first device must not end the wait for the second migration.
         for port in [18, 19] {
             let polls = Cell::new(0);
-            assert!(exec::block_on(scan.wait_for_new_connection(timeout, |p| {
+            assert!(exec::block_on(scan.wait_for_next_pass(|p| {
                 if p != port {
                     return false;
                 }
@@ -170,7 +192,7 @@ mod root_port_scan_tests {
             assert_eq!(scan.take_new_connections(|p| p == port), [port]);
         }
 
-        // Once the original deadline expires, an absent device cannot keep
+        // Once a quiet window expires, an absent device cannot keep
         // enumeration waiting, but an already-connected port is still found.
         let expired = Timeout::from_raw(crate::time::read_counter());
         assert!(!exec::block_on(
@@ -179,6 +201,50 @@ mod root_port_scan_tests {
         assert!(exec::block_on(
             scan.wait_for_new_connection(expired, |port| port == 20)
         ));
+    }
+
+    #[test]
+    fn unrelated_connection_does_not_end_migration_wait() {
+        use core::cell::Cell;
+
+        let mut scan = RootPortScan::new(26);
+        assert_eq!(scan.take_new_connections(|port| port == 1), [1]);
+        scan.record_move();
+
+        // An unrelated device connects before the moved USB3 device.
+        assert_eq!(scan.take_new_connections(|port| port == 3), [3]);
+        assert!(scan.migration_seen);
+        let polls = Cell::new(0);
+        assert!(exec::block_on(scan.wait_for_next_pass(|port| {
+            if port != 18 {
+                return false;
+            }
+            polls.set(polls.get() + 1);
+            polls.get() > 1
+        })));
+        assert_eq!(scan.take_new_connections(|port| port == 18), [18]);
+    }
+
+    #[test]
+    fn connection_during_final_attachment_is_rescanned() {
+        let mut scan = RootPortScan::new(26);
+        assert_eq!(scan.take_new_connections(|port| port == 1), [1]);
+        scan.record_move();
+        assert_eq!(scan.take_new_connections(|port| port == 18), [18]);
+
+        // Another port connects while the last moved device is attached.
+        assert!(exec::block_on(scan.wait_for_next_pass(|port| port == 19)));
+        assert_eq!(scan.take_new_connections(|port| port == 19), [19]);
+    }
+
+    #[test]
+    fn no_migration_rescans_without_waiting() {
+        let mut scan = RootPortScan::new(4);
+        assert_eq!(scan.take_new_connections(|port| port == 1), [1]);
+        assert!(!scan.migration_seen);
+        assert!(exec::block_on(scan.wait_for_next_pass(|port| port == 2)));
+        assert_eq!(scan.take_new_connections(|port| port == 2), [2]);
+        assert!(!exec::block_on(scan.wait_for_next_pass(|_| false)));
     }
 
     #[test]
@@ -628,7 +694,6 @@ impl super::XhciController {
     /// Enumerate ports and attach devices
     pub(super) async fn enumerate_ports(&mut self) -> Result<(), XhciError> {
         let mut scan = RootPortScan::new(self.num_ports);
-        let mut migration_timeout = None;
 
         loop {
             let ports =
@@ -657,17 +722,16 @@ impl super::XhciController {
                 let attached = up && self.attach_root_port_device(port).await;
                 if device_moved(attached, self.portsc(port).current_connect_status()) {
                     log::debug!("Port {}: device disconnected during bring-up", port);
-                    migration_timeout = Some(Timeout::from_ms(MOVED_DEVICE_TIMEOUT_MS));
+                    scan.record_move();
                 }
             }
 
-            // Keep the deadline across successful passes: other devices may
-            // still be training their SuperSpeed links after the first moves.
-            let Some(timeout) = migration_timeout else {
-                break;
-            };
+            // Rescan ports that connected during attachment. After a move,
+            // wait from the end of each pass: attaching the other devices
+            // can take longer than the wait, and new connections may be
+            // unrelated to the devices whose links are still training.
             if !scan
-                .wait_for_new_connection(timeout, |port| self.portsc(port).current_connect_status())
+                .wait_for_next_pass(|port| self.portsc(port).current_connect_status())
                 .await
             {
                 break;
