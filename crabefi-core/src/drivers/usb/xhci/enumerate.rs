@@ -68,9 +68,13 @@ mod hub_protocol_tests {
 /// USB2 port and drops that connection once its SuperSpeed link trains.
 const MOVED_DEVICE_TIMEOUT_MS: u64 = 500;
 
+/// How often a root port is brought up again after its device left it.
+const MAX_PORT_RETRIES: u8 = 2;
+
 /// Root ports already brought up during enumeration.
 struct RootPortScan {
     tried: Vec<bool>,
+    retries: Vec<u8>,
     /// A device left its root port; new connections cannot be matched to it.
     migration_seen: bool,
 }
@@ -79,13 +83,22 @@ impl RootPortScan {
     fn new(num_ports: u8) -> Self {
         Self {
             tried: alloc::vec![false; usize::from(num_ports)],
+            retries: alloc::vec![0; usize::from(num_ports)],
             migration_seen: false,
         }
     }
 
-    /// A device left its root port during bring-up.
-    fn record_move(&mut self) {
+    /// The device of `port` left it during bring-up. A USB3 device can
+    /// connect to `port` again before its SuperSpeed link trains, and only
+    /// moves on after another reset there, so `port` is tried again, a
+    /// bounded number of times.
+    fn record_move(&mut self, port: u8) {
         self.migration_seen = true;
+        let port = usize::from(port);
+        if self.retries[port] < MAX_PORT_RETRIES {
+            self.retries[port] += 1;
+            self.tried[port] = false;
+        }
     }
 
     fn untried(&self) -> impl Iterator<Item = u8> + '_ {
@@ -175,8 +188,8 @@ mod root_port_scan_tests {
             scan.take_new_connections(|port| port == 2 || port == 3),
             [2, 3]
         );
-        scan.record_move();
-        scan.record_move();
+        scan.record_move(2);
+        scan.record_move(3);
 
         // Each SuperSpeed connection appears only after waiting. Attaching
         // the first device must not end the wait for the second migration.
@@ -209,7 +222,7 @@ mod root_port_scan_tests {
 
         let mut scan = RootPortScan::new(26);
         assert_eq!(scan.take_new_connections(|port| port == 1), [1]);
-        scan.record_move();
+        scan.record_move(1);
 
         // An unrelated device connects before the moved USB3 device.
         assert_eq!(scan.take_new_connections(|port| port == 3), [3]);
@@ -229,7 +242,7 @@ mod root_port_scan_tests {
     fn connection_during_final_attachment_is_rescanned() {
         let mut scan = RootPortScan::new(26);
         assert_eq!(scan.take_new_connections(|port| port == 1), [1]);
-        scan.record_move();
+        scan.record_move(1);
         assert_eq!(scan.take_new_connections(|port| port == 18), [18]);
 
         // Another port connects while the last moved device is attached.
@@ -245,6 +258,22 @@ mod root_port_scan_tests {
         assert!(exec::block_on(scan.wait_for_next_pass(|port| port == 2)));
         assert_eq!(scan.take_new_connections(|port| port == 2), [2]);
         assert!(!exec::block_on(scan.wait_for_next_pass(|_| false)));
+    }
+
+    #[test]
+    fn device_that_returns_to_its_port_is_tried_again() {
+        let mut scan = RootPortScan::new(26);
+        assert_eq!(scan.take_new_connections(|port| port == 1), [1]);
+        scan.record_move(1);
+        // The device connects to its USB2 port again before moving on.
+        assert_eq!(scan.take_new_connections(|port| port == 1), [1]);
+
+        // A device that keeps leaving its port is retried a bounded number
+        // of times.
+        scan.record_move(1);
+        assert_eq!(scan.take_new_connections(|port| port == 1), [1]);
+        scan.record_move(1);
+        assert!(scan.take_new_connections(|port| port == 1).is_empty());
     }
 
     #[test]
@@ -722,7 +751,7 @@ impl super::XhciController {
                 let attached = up && self.attach_root_port_device(port).await;
                 if device_moved(attached, self.portsc(port).current_connect_status()) {
                     log::debug!("Port {}: device disconnected during bring-up", port);
-                    scan.record_move();
+                    scan.record_move(port);
                 }
             }
 
