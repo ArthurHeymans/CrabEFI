@@ -138,6 +138,7 @@ pub fn init_from_platform(config: &mut crate::platform::PlatformConfig) {
             .tpm_event_log
             .get_or_insert(crate::platform::TpmEventLogConfig {
                 existing_log: None,
+                log_area: None,
                 format: crate::platform::TpmLogFormat::CryptoAgile,
                 tpm2_device: crate::platform::Tpm2DeviceConfig::None,
                 tpm1_tis_base: None,
@@ -206,18 +207,43 @@ fn init_tcg_protocols(config: &mut crate::platform::TpmEventLogConfig) {
     );
     let install_tcg1 = matches!(config.format, TpmLogFormat::Sha1Only | TpmLogFormat::Both);
 
+    // A platform log area is continued in place: `from_existing` copies the
+    // log back to where it already is, so the area keeps the whole log.
+    let mut log_area = config.log_area.take();
+    if let Some(log) = log_area.as_ref().filter(|log| log.used > log.area.len()) {
+        // The platform started measured boot, but its log cannot be
+        // continued: a fresh log would no longer match the PCRs.
+        log::error!(
+            "Platform event log area invalid ({} bytes used of {}); measured boot not continued",
+            log.used,
+            log.area.len()
+        );
+        return;
+    }
+    // An empty area holds no log yet: CrabEFI starts one there.
+    let area_log = log_area
+        .as_ref()
+        .filter(|log| log.used != 0)
+        .map(|log| log.area[..log.used].to_vec());
+    let existing_log = area_log.as_deref().or(config.existing_log);
+    PLATFORM_MEASURED.store(
+        existing_log.is_some(),
+        core::sync::atomic::Ordering::Relaxed,
+    );
+
     if install_tcg2 {
         let enable_sha1 = matches!(config.format, TpmLogFormat::Both);
         let tpm2_device = core::mem::replace(&mut config.tpm2_device, Tpm2DeviceConfig::None);
         let has_hardware_tpm = tpm2_device.is_some();
-        let existing_log = config.existing_log;
+        let area = log_area.take().map(|log| log.area);
+        let had_area = area.is_some();
         let tcg2_result = match tpm2_device {
-            Tpm2DeviceConfig::None => init_tcg2_protocol(existing_log, enable_sha1),
+            Tpm2DeviceConfig::None => init_tcg2_protocol(existing_log, area, enable_sha1),
             Tpm2DeviceConfig::TisMmio { base } => {
-                init_tcg2_protocol_tis(existing_log, base, enable_sha1)
+                init_tcg2_protocol_tis(existing_log, area, base, enable_sha1)
             }
             Tpm2DeviceConfig::Driver(driver) => {
-                init_tcg2_protocol_platform_tpm(existing_log, driver, enable_sha1)
+                init_tcg2_protocol_platform_tpm(existing_log, area, driver, enable_sha1)
             }
         };
 
@@ -230,7 +256,14 @@ fn init_tcg_protocols(config: &mut crate::platform::TpmEventLogConfig) {
                     "Hardware TPM not available: {}; installing TCG2 log-only protocol",
                     e
                 );
-                if let Err(e2) = init_tcg2_protocol(existing_log, enable_sha1) {
+                // The log-only copy is reachable through GetEventLog only:
+                // the platform's (ACPI) log area stops here.
+                if had_area {
+                    log::error!(
+                        "Platform event log area abandoned; ACPI log readers miss later events"
+                    );
+                }
+                if let Err(e2) = init_tcg2_protocol(existing_log, None, enable_sha1) {
                     log::error!("TCG2 log-only fallback failed: {}", e2);
                 }
             } else {
@@ -242,26 +275,45 @@ fn init_tcg_protocols(config: &mut crate::platform::TpmEventLogConfig) {
     if install_tcg1 {
         // For the TPM 1.2 log, only pass existing data if the format is Sha1Only
         // (if Both, the existing data is likely crypto-agile and not directly usable).
-        let existing = if config.format == TpmLogFormat::Sha1Only {
-            config.existing_log
+        let (existing, area) = if config.format == TpmLogFormat::Sha1Only {
+            (existing_log, log_area.take().map(|log| log.area))
         } else {
-            None
+            (None, None)
         };
-        if let Err(e) = init_tcg1_protocol(existing, config.tpm1_tis_base) {
+        if let Err(e) = init_tcg1_protocol(existing, area, config.tpm1_tis_base) {
             log::error!("TCG protocol init failed: {}", e);
         }
     }
 }
 
-/// Initialize and install EFI_TCG2_PROTOCOL (TPM 2.0).
+/// An earlier firmware phase started the event log: it is the S-CRTM and
+/// measured itself.
 #[cfg(feature = "tpm")]
-fn init_tcg2_protocol(existing_log: Option<&[u8]>, enable_sha1: bool) -> Result<(), &'static str> {
+static PLATFORM_MEASURED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// The platform's log area, or a fresh event log buffer.
+#[cfg(feature = "tpm")]
+fn event_log_buffer(area: Option<&'static mut [u8]>) -> Result<&'static mut [u8], &'static str> {
     use tcg::event_log::DEFAULT_EVENT_LOG_SIZE;
 
+    if let Some(area) = area {
+        return Ok(area);
+    }
     let log_pages = (DEFAULT_EVENT_LOG_SIZE as u64).div_ceil(allocator::PAGE_SIZE);
-    let tcg2_buffer = allocate_pages(log_pages)
+    allocate_pages(log_pages)
         .map(|buf| &mut buf[..DEFAULT_EVENT_LOG_SIZE])
-        .ok_or("failed to allocate TCG2 event log buffer")?;
+        .ok_or("failed to allocate the event log buffer")
+}
+
+/// Initialize and install EFI_TCG2_PROTOCOL (TPM 2.0).
+#[cfg(feature = "tpm")]
+fn init_tcg2_protocol(
+    existing_log: Option<&[u8]>,
+    area: Option<&'static mut [u8]>,
+    enable_sha1: bool,
+) -> Result<(), &'static str> {
+    let tcg2_buffer = event_log_buffer(area)?;
 
     protocols::tcg2::init_state(tcg2_buffer, existing_log, enable_sha1)
         .map_err(|_| "failed to initialize TCG2 state")?;
@@ -287,15 +339,11 @@ fn init_tcg2_protocol(existing_log: Option<&[u8]>, enable_sha1: bool) -> Result<
 #[cfg(feature = "tpm")]
 fn init_tcg2_protocol_tis(
     existing_log: Option<&[u8]>,
+    area: Option<&'static mut [u8]>,
     tpm_base: u64,
     enable_sha1: bool,
 ) -> Result<(), &'static str> {
-    use tcg::event_log::DEFAULT_EVENT_LOG_SIZE;
-
-    let log_pages = (DEFAULT_EVENT_LOG_SIZE as u64).div_ceil(allocator::PAGE_SIZE);
-    let tcg2_buffer = allocate_pages(log_pages)
-        .map(|buf| &mut buf[..DEFAULT_EVENT_LOG_SIZE])
-        .ok_or("failed to allocate TCG2 event log buffer")?;
+    let tcg2_buffer = event_log_buffer(area)?;
 
     unsafe {
         protocols::tcg2::init_state_with_hardware(tcg2_buffer, existing_log, tpm_base, enable_sha1)
@@ -326,15 +374,11 @@ fn init_tcg2_protocol_tis(
 #[cfg(feature = "tpm")]
 fn init_tcg2_protocol_platform_tpm(
     existing_log: Option<&[u8]>,
+    area: Option<&'static mut [u8]>,
     tpm: &'static mut dyn crate::platform::Tpm2Device,
     enable_sha1: bool,
 ) -> Result<(), &'static str> {
-    use tcg::event_log::DEFAULT_EVENT_LOG_SIZE;
-
-    let log_pages = (DEFAULT_EVENT_LOG_SIZE as u64).div_ceil(allocator::PAGE_SIZE);
-    let tcg2_buffer = allocate_pages(log_pages)
-        .map(|buf| &mut buf[..DEFAULT_EVENT_LOG_SIZE])
-        .ok_or("failed to allocate TCG2 event log buffer")?;
+    let tcg2_buffer = event_log_buffer(area)?;
 
     protocols::tcg2::init_state_with_platform_tpm(tcg2_buffer, existing_log, tpm, enable_sha1)
         .map_err(|_| "failed to initialize TCG2 state with platform TPM")?;
@@ -366,8 +410,11 @@ fn init_tcg2_protocol_platform_tpm(
 /// - Secure Boot variables into PCR 7 (with separator)
 #[cfg(feature = "tpm")]
 pub(crate) fn measure_initial_boot() {
-    // Measure S-CRTM version (firmware version string) into PCR 0.
-    tcg::measured_boot::measure_s_crtm_version_all(env!("CARGO_PKG_VERSION"));
+    // Measure S-CRTM version (firmware version string) into PCR 0, unless
+    // the platform firmware that started the log is the S-CRTM.
+    if !PLATFORM_MEASURED.load(core::sync::atomic::Ordering::Relaxed) {
+        tcg::measured_boot::measure_s_crtm_version_all(env!("CARGO_PKG_VERSION"));
+    }
 
     // Measure Secure Boot policy variables into PCR 7.
     tcg::measured_boot::measure_secure_boot_variables_all();
@@ -377,14 +424,13 @@ pub(crate) fn measure_initial_boot() {
 #[cfg(feature = "tpm")]
 fn init_tcg1_protocol(
     existing_log: Option<&[u8]>,
+    area: Option<&'static mut [u8]>,
     tpm_base: Option<u64>,
 ) -> Result<(), &'static str> {
     use tcg::event_log::DEFAULT_EVENT_LOG_SIZE;
 
     let log_pages = (DEFAULT_EVENT_LOG_SIZE as u64).div_ceil(allocator::PAGE_SIZE);
-    let tcg1_buffer = allocate_pages(log_pages)
-        .map(|buf| &mut buf[..DEFAULT_EVENT_LOG_SIZE])
-        .ok_or("failed to allocate TCG event log buffer")?;
+    let tcg1_buffer = event_log_buffer(area)?;
 
     if let Some(base) = tpm_base {
         let hardware_result =

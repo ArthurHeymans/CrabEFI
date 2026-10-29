@@ -1101,6 +1101,7 @@ pub extern "C" fn rust_main(coreboot_table_ptr: u64) -> ! {
             };
             crabefi::TpmEventLogConfig {
                 existing_log,
+                log_area: None,
                 format,
                 // Hardware TPM transport is selected after ACPI namespace discovery.
                 // Coreboot's TPM log record does not describe the transport.
