@@ -35,6 +35,8 @@ use tock_registers::interfaces::{Readable, Writeable};
 use crate::arch::x86_64::port_regs::{PortAliased8, PortReadWrite8};
 use crate::drivers::keyboard::{Status, masks, ports};
 
+use super::i8042::{self, Controller};
+
 // ============================================================================
 // PS/2 Mouse Constants
 // ============================================================================
@@ -52,7 +54,6 @@ mod mouse_cmd {
 mod aux_cmd {
     pub const ENABLE_AUX: u8 = 0xA8;
     pub const TEST_AUX: u8 = 0xA9;
-    pub const WRITE_AUX: u8 = 0xD4;
 }
 
 /// Synaptics magic identification byte in the second byte of a GET_INFO
@@ -119,6 +120,7 @@ impl MouseProtocol {
 
 struct MouseState {
     initialized: bool,
+    init_attempted: bool,
     protocol: MouseProtocol,
     /// Packet assembly buffer — large enough for 6-byte Synaptics packets.
     packet_buf: [u8; 6],
@@ -138,12 +140,31 @@ struct MouseState {
     syn_prev_z: i32,
 }
 
+impl Controller for MouseState {
+    fn status(&self) -> u8 {
+        self.status_port.get()
+    }
+
+    fn read_data(&self) -> u8 {
+        self.data_port.get()
+    }
+
+    fn write_data(&self, byte: u8) {
+        self.data_port.set(byte);
+    }
+
+    fn write_command(&self, byte: u8) {
+        self.status_port.set(byte);
+    }
+}
+
 static AUX_FIFO: Mutex<heapless::Deque<u8, 128>> = Mutex::new(heapless::Deque::new());
 
 impl MouseState {
     const fn new() -> Self {
         Self {
             initialized: false,
+            init_attempted: false,
             protocol: MouseProtocol::Standard,
             packet_buf: [0; 6],
             packet_idx: 0,
@@ -161,64 +182,23 @@ impl MouseState {
 
     // ── Port helpers ──────────────────────────────────────────────────────────
 
-    fn wait_input_ready(&self) -> bool {
-        for _ in 0..10000 {
-            if (self.status_port.get() & (1 << 1)) == 0 {
-                return true;
-            }
-            for _ in 0..50 {
-                core::hint::spin_loop();
-            }
-        }
-        false
-    }
-
     fn wait_output_ready(&self) -> bool {
-        for _ in 0..10000 {
-            if (self.status_port.get() & masks::OUTPUT_FULL) != 0 {
-                return true;
-            }
-            for _ in 0..50 {
-                core::hint::spin_loop();
-            }
-        }
-        false
+        Controller::wait_output_ready(self)
     }
 
     fn wait_aux_output(&self) -> bool {
-        for _ in 0..10000 {
-            let st = self.status_port.get();
-            if (st & masks::OUTPUT_FULL) != 0 && (st & masks::AUX_DATA) != 0 {
-                return true;
-            }
-            for _ in 0..50 {
-                core::hint::spin_loop();
-            }
-        }
-        false
+        self.wait_status(
+            masks::OUTPUT_FULL | masks::AUX_DATA,
+            masks::OUTPUT_FULL | masks::AUX_DATA,
+        )
     }
 
     fn send_controller_cmd(&self, cmd: u8) -> bool {
-        if !self.wait_input_ready() {
-            return false;
-        }
-        self.status_port.set(cmd);
-        self.wait_input_ready()
+        Controller::send_controller_cmd(self, cmd)
     }
 
-    /// Send a single byte to the AUX device and wait for ACK (0xFA).
     fn send_mouse_byte(&self, b: u8) -> bool {
-        if !self.send_controller_cmd(aux_cmd::WRITE_AUX) {
-            return false;
-        }
-        if !self.wait_input_ready() {
-            return false;
-        }
-        self.data_port.set(b);
-        if !self.wait_aux_output() {
-            return false;
-        }
-        self.data_port.get() == 0xFA
+        self.send_device_byte(true, b)
     }
 
     /// Send a two-byte command + argument to the AUX device, both with ACKs.
@@ -231,19 +211,6 @@ impl MouseState {
             Some(self.data_port.get())
         } else {
             None
-        }
-    }
-
-    /// Drain any pending bytes from the output buffer.
-    fn flush(&self) {
-        for _ in 0..128 {
-            if (self.status_port.get() & masks::OUTPUT_FULL) == 0 {
-                break;
-            }
-            let _ = self.data_port.get();
-            for _ in 0..10 {
-                core::hint::spin_loop();
-            }
         }
     }
 
@@ -380,7 +347,9 @@ impl MouseState {
 
         self.protocol = MouseProtocol::SynapticsAbsolute;
         self.packet_idx = 0;
-        self.flush();
+        if !self.flush_output() {
+            return false;
+        }
 
         log::info!("Synaptics absolute mode enabled");
 
@@ -549,93 +518,78 @@ pub fn push_aux_byte(byte: u8) {
 /// X280 and similar models.
 pub fn init() {
     let mut mouse = MOUSE.lock();
-    if mouse.initialized {
+    if mouse.init_attempted || !super::keyboard::ready_for_aux_init() {
         return;
     }
-
-    log::debug!("Initializing PS/2 mouse");
+    mouse.init_attempted = true;
 
     if mouse.status_port.get() == 0xFF {
         log::debug!("No i8042 controller");
         return;
     }
 
-    // ── Ensure AUX clock is running ───────────────────────────────────────────
-    // keyboard::init() may have left AUX_DISABLE (bit 5) set in the
-    // controller config byte, preventing any AUX communication.
-    if mouse.send_controller_cmd(0x20) && mouse.wait_output_ready() {
-        let mut cfg = mouse.data_port.get();
-        if cfg & (1 << 5) != 0 {
-            cfg &= !(1 << 5);
-            if mouse.send_controller_cmd(0x60) {
-                let _ = mouse.wait_input_ready();
-                mouse.data_port.set(cfg);
-            }
-        }
+    log::debug!("Initializing PS/2 mouse");
+    mouse.initialized = i8042::init_aux(&mut *mouse, init_device);
+    if mouse.initialized {
+        log::info!("PS/2 mouse initialized (protocol: {:?})", mouse.protocol);
     }
+}
 
-    mouse.flush();
-
-    // ── AUX port self-test ────────────────────────────────────────────────────
+/// Called with the keyboard inhibited for the entire AUX command exchange.
+fn init_device(mouse: &mut MouseState) -> bool {
     if !mouse.send_controller_cmd(aux_cmd::TEST_AUX) {
         log::debug!("AUX port test failed");
-        return;
+        return false;
     }
     if !mouse.wait_output_ready() {
         log::debug!("AUX port test timeout");
-        return;
+        return false;
     }
     let test = mouse.data_port.get();
     if test != 0x00 {
         log::debug!("AUX port test returned {:#x}", test);
-        return;
+        return false;
     }
 
     // Enable AUX port (0xA8); response may be absent on Lenovo H8 EC.
-    let _ = mouse.send_controller_cmd(aux_cmd::ENABLE_AUX);
-    mouse.flush();
+    if !mouse.send_controller_cmd(aux_cmd::ENABLE_AUX) {
+        return false;
+    }
 
-    // ── Basic PS/2 handshake (talks to the primary AUX device) ───────────────
     if !mouse.send_mouse_byte(mouse_cmd::DISABLE) {
         log::debug!("No AUX device responded to DISABLE");
-        return;
+        return false;
     }
     if !mouse.send_mouse_byte(mouse_cmd::GET_DEVICE_ID) {
         log::debug!("GET_DEVICE_ID failed");
-        return;
+        return false;
     }
     let id = mouse.read_aux_byte();
     if id != Some(0x00) {
         log::debug!("Unexpected device ID: {:?}", id);
-        return;
+        return false;
     }
 
-    // ── Try Synaptics absolute mode (required for ThinkPad TrackPoint) ────────
-    //
-    // If the AUX device is a Synaptics touchpad, switch it to absolute mode
-    // so that TrackPoint pass-through packets become available.  The basic
-    // DISABLE / GET_DEVICE_ID above always succeeds for Synaptics (it reports
-    // ID 0x00 in basic mode), so we attempt the Synaptics init unconditionally
-    // and fall back to Standard if it fails.
-    let synaptics_ok = mouse.try_synaptics_init();
-
-    if !synaptics_ok {
-        // Standard PS/2 mouse (or Synaptics without pass-through — use relative mode)
+    // Synaptics reports ID 0 in basic mode too. Try its absolute protocol
+    // (including TrackPoint pass-through), then fall back to relative mode.
+    if !mouse.try_synaptics_init() {
         mouse.protocol = MouseProtocol::Standard;
-        mouse.send_mouse_byte(mouse_cmd::SET_DEFAULTS);
-        if !mouse.send_mouse_byte(mouse_cmd::ENABLE) {
+        if !mouse.send_mouse_byte(mouse_cmd::SET_DEFAULTS)
+            || !mouse.send_mouse_byte(mouse_cmd::ENABLE)
+        {
             log::warn!("Failed to enable mouse data reporting");
-            return;
+            return false;
         }
     }
-
-    mouse.initialized = true;
-    log::info!("PS/2 mouse initialized (protocol: {:?})", mouse.protocol);
+    true
 }
 
 /// Poll for new data from both the FIFO (filled by keyboard driver) and
 /// directly from the i8042 output buffer.
 pub fn poll() {
+    // Cursor setup may run before keyboard BAT completes. Retry only that
+    // deferred start, not a failed AUX discovery, when the event loop polls.
+    init();
     let mut mouse = MOUSE.lock();
     if !mouse.initialized {
         return;
@@ -684,10 +638,10 @@ pub(crate) struct Ps2Mouse;
 
 impl super::pointer::PointerDevice for Ps2Mouse {
     fn poll(&mut self) -> Option<super::pointer::PointerReport> {
+        poll();
         if !is_available() {
             return None;
         }
-        poll();
         let (dx, dy, dz) = get_relative_motion();
         Some(super::pointer::PointerReport {
             dx,
