@@ -264,6 +264,97 @@ fn actual_loader_seal_svam_and_runtime_services_with_and_without_retained_stagin
             );
         }
         failure.store(0, Ordering::Relaxed);
+        #[cfg(feature = "secure-boot")]
+        {
+            use crabefi::efi::auth;
+            use crabefi_efi_types::secure_boot::{
+                EFI_GLOBAL_VARIABLE_GUID, PK_NAME, SECURE_BOOT_ENABLE_NAME, SecureBootVariable,
+            };
+            auth::boot::enroll_and_persist_default_keys().unwrap();
+            auth::enable_secure_boot();
+            assert!(!auth::is_setup_mode());
+            assert!(auth::is_secure_boot_enabled());
+
+            let pk_guid = efi::Guid::from_bytes(&EFI_GLOBAL_VARIABLE_GUID);
+            let mut pk_name = PK_NAME.to_vec();
+            pk_name.push(0);
+            // Public unsigned PK deletion is still forbidden in User Mode.
+            assert_eq!(
+                unsafe {
+                    ((*runtime).set_variable)(
+                        pk_name.as_mut_ptr(),
+                        &pk_guid as *const _ as *mut _,
+                        0,
+                        0,
+                        core::ptr::null_mut(),
+                    )
+                },
+                efi::Status::SECURITY_VIOLATION
+            );
+            let media_before = media.lock().unwrap().clone();
+            failure.store(1, Ordering::Relaxed);
+            assert!(auth::boot::clear_all_keys().is_err());
+            assert!(!auth::is_setup_mode());
+            assert!(auth::is_secure_boot_enabled());
+            assert_eq!(*media.lock().unwrap(), media_before);
+
+            failure.store(0, Ordering::Relaxed);
+            auth::boot::clear_all_keys().unwrap();
+            assert!(auth::is_setup_mode());
+            assert!(!auth::is_secure_boot_enabled());
+            for variable in [
+                SecureBootVariable::PK,
+                SecureBootVariable::Kek,
+                SecureBootVariable::Db,
+                SecureBootVariable::Dbx,
+            ] {
+                assert!(
+                    runtime_image::client::variables::get(
+                        &efi::Guid::from_bytes(variable.guid()),
+                        variable.name()
+                    )
+                    .is_none()
+                );
+            }
+            assert_eq!(
+                runtime_image::client::variables::get(&pk_guid, SECURE_BOOT_ENABLE_NAME)
+                    .unwrap()
+                    .1,
+                [0]
+            );
+            // Reinitialization must respect the saved clear-all choice rather
+            // than automatically enrolling Microsoft's defaults again.
+            assert!(auth::boot::init_secure_boot_default().unwrap().setup_mode);
+            auth::boot::clear_all_keys().unwrap();
+            // Explicit enrollment remains possible, but the setup deletion
+            // scope must not leak into later public SetVariable calls.
+            auth::boot::enroll_and_persist_default_keys().unwrap();
+            assert!(!auth::is_setup_mode());
+            assert_eq!(
+                unsafe {
+                    ((*runtime).set_variable)(
+                        pk_name.as_mut_ptr(),
+                        &pk_guid as *const _ as *mut _,
+                        0,
+                        0,
+                        core::ptr::null_mut(),
+                    )
+                },
+                efi::Status::SECURITY_VIOLATION
+            );
+            auth::boot::clear_all_keys().unwrap();
+
+            // The physical-presence transaction does not reopen boot imports.
+            assert_eq!(
+                client.import_variable(&crabefi_runtime_abi::VariableImport {
+                    guid: EFI_GLOBAL_VARIABLE_GUID,
+                    name_address: PK_NAME.as_ptr() as u64,
+                    name_len: PK_NAME.len() as u32,
+                    ..crabefi_runtime_abi::VariableImport::default()
+                }),
+                Err(efi::Status::UNSUPPORTED)
+            );
+        }
         let before = writes.load(Ordering::Relaxed);
         let mut descriptors = [allocator::MemoryDescriptor::new(0, 0, 0, 0); 32];
         let count = allocator::copy_runtime_descriptors(&mut descriptors).unwrap();
@@ -416,6 +507,17 @@ fn actual_loader_seal_svam_and_runtime_services_with_and_without_retained_stagin
             warm.replay_deferred().unwrap();
             assert_eq!(writes.load(Ordering::Relaxed), after_replay);
             warm.complete_import().unwrap();
+            #[cfg(feature = "secure-boot")]
+            {
+                // Cleared keys remain cleared after an actual fresh image
+                // reload from persistent media, including deferred replay.
+                assert!(
+                    crabefi::efi::auth::boot::init_secure_boot_default()
+                        .unwrap()
+                        .setup_mode
+                );
+                assert!(!crabefi::efi::auth::is_secure_boot_enabled());
+            }
             let mut restored = [0u8];
             let mut size = restored.len();
             let mut flags = 0;

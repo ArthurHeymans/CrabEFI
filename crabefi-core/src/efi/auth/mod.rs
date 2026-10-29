@@ -201,7 +201,7 @@ pub fn disable_secure_boot() {
 
 /// Persist the SecureBootEnable preference to non-volatile storage
 #[cfg(feature = "secure-boot")]
-fn persist_secure_boot_enable_preference(enabled: bool) {
+fn persist_secure_boot_enable_preference(enabled: bool) -> r_efi::efi::Status {
     let value: u8 = if enabled { 1 } else { 0 };
     let status = crate::efi::runtime_image::client::variables::set(
         &Guid::from_bytes(&EFI_GLOBAL_VARIABLE_GUID),
@@ -217,6 +217,7 @@ fn persist_secure_boot_enable_preference(enabled: bool) {
             status
         );
     }
+    status
 }
 
 // ============================================================================

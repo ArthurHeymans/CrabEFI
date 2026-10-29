@@ -537,8 +537,25 @@ fn apply_variable(
             .region
             .validate_profile()?;
     }
-    let secure_variable = check_write_policy(store, &request)?;
-    let verified = verify(store, &request)?;
+    let (secure_variable, verified) = if setup_pk_delete_authorized(store, &request, phase, bridge)
+    {
+        // Physical-presence setup can remove PK without its private key. Keep
+        // the existing authentication floor on the deletion tombstone; only
+        // authentication is bypassed, not staging, persistence or live commit.
+        (
+            Some(SecureBootVariable::PK),
+            Verified {
+                payload: &[],
+                timestamp: store.auth_history_timestamp(&request.guid, request.name),
+                secure_variable: Some(SecureBootVariable::PK),
+            },
+        )
+    } else {
+        (
+            check_write_policy(store, &request)?,
+            verify(store, &request)?,
+        )
+    };
     if verified.payload.len() > MAX_VARIABLE_DATA_SIZE {
         return Err(efi::Status::OUT_OF_RESOURCES);
     }
@@ -589,6 +606,35 @@ fn apply_variable(
     }
     store.refresh_policy();
     Ok(())
+}
+
+/// Ask boot setup for narrowly scoped physical-presence authorization. Never
+/// consult boot callbacks at runtime, or authorize enrollment/other databases.
+fn setup_pk_delete_authorized(
+    store: &VariableStore,
+    request: &VariableRequest<'_>,
+    phase: Phase,
+    bridge: u64,
+) -> bool {
+    cfg!(feature = "secure-boot")
+        && phase == Phase::BootActive
+        && !store.setup_mode()
+        && secure_boot::identify_key_database(&request.guid, request.name)
+            == Some(SecureBootVariable::PK)
+        && request.data.is_empty()
+        && !request.authenticated()
+        && !request.append()
+        && call_boot_bridge(
+            bridge,
+            &BridgeRequest {
+                operation: bridge_operation::AUTHORIZE_SETUP_PK_DELETE,
+                guid: request.guid,
+                name_address: request.name.as_ptr() as u64,
+                name_len: request.name.len() as u32,
+                ..BridgeRequest::default()
+            },
+        )
+        .is_ok()
 }
 
 /// Reject writes to protected variables and raw writes to authenticated ones.
@@ -1148,10 +1194,37 @@ mod tests {
         RAW_ATTRIBUTES.union(VariableAttributes::TIME_BASED_AUTHENTICATED_WRITE_ACCESS);
 
     extern "C" fn successful_bridge(request: *const BridgeRequest) -> usize {
-        if request.is_null() {
-            efi::Status::INVALID_PARAMETER.as_usize()
-        } else {
+        // SAFETY: tests call this synchronously with a live request.
+        let Some(request) = (unsafe { request.as_ref() }) else {
+            return efi::Status::INVALID_PARAMETER.as_usize();
+        };
+        match request.operation {
+            bridge_operation::PERSIST_WRITE | bridge_operation::PERSIST_DELETE => {
+                efi::Status::SUCCESS.as_usize()
+            }
+            _ => efi::Status::ACCESS_DENIED.as_usize(),
+        }
+    }
+
+    extern "C" fn setup_bridge(request: *const BridgeRequest) -> usize {
+        // SAFETY: same immediate-call contract as successful_bridge.
+        if unsafe { request.as_ref() }
+            .is_some_and(|request| request.operation == bridge_operation::AUTHORIZE_SETUP_PK_DELETE)
+        {
             efi::Status::SUCCESS.as_usize()
+        } else {
+            successful_bridge(request)
+        }
+    }
+
+    extern "C" fn failing_setup_bridge(request: *const BridgeRequest) -> usize {
+        // SAFETY: same immediate-call contract as successful_bridge.
+        if unsafe { request.as_ref() }
+            .is_some_and(|request| request.operation == bridge_operation::AUTHORIZE_SETUP_PK_DELETE)
+        {
+            efi::Status::SUCCESS.as_usize()
+        } else {
+            efi::Status::WRITE_PROTECTED.as_usize()
         }
     }
 
@@ -1196,12 +1269,31 @@ mod tests {
             attributes: VariableAttributes,
             data: &[u8],
         ) -> efi::Status {
+            self.write_using_bridge(
+                phase,
+                guid,
+                name,
+                attributes,
+                data,
+                successful_bridge as *const () as u64,
+            )
+        }
+
+        fn write_using_bridge(
+            &mut self,
+            phase: Phase,
+            guid: [u8; 16],
+            name: &[u16],
+            attributes: VariableAttributes,
+            data: &[u8],
+            bridge: u64,
+        ) -> efi::Status {
             efi::status(apply_variable(
                 VariableContext {
                     store: &mut self.store,
                     transaction: &mut self.transaction,
                     phase,
-                    bridge: successful_bridge as *const () as u64,
+                    bridge,
                     deferred: Some(DeferredSink {
                         transaction: &mut self.deferred_transaction,
                         region: DeferredRegion::new(&mut self.buffer),
@@ -1561,6 +1653,132 @@ mod tests {
         let mut lease = state::lease().unwrap();
         let runtime = lease.state_mut();
         (runtime.retained, runtime.capsule_delivery_enabled) = saved;
+    }
+
+    #[test]
+    fn setup_pk_delete_is_transactional_and_preserves_the_authentication_floor() {
+        let mut fixture = Fixture::retained();
+        fixture.enroll_raw();
+        let pk = include_bytes!("../tests/fixtures/pk.esl");
+        let floor = timestamp(2030);
+        fixture.import(
+            *SecureBootVariable::PK.guid(),
+            SecureBootVariable::PK.name(),
+            AUTH_ATTRIBUTES,
+            pk,
+            Some(floor),
+        );
+        assert_eq!(
+            fixture.write(
+                Phase::BootActive,
+                secure_boot::EFI_GLOBAL_VARIABLE_GUID,
+                secure_boot::SECURE_BOOT_ENABLE_NAME,
+                RAW_ATTRIBUTES,
+                &[1]
+            ),
+            efi::Status::SUCCESS
+        );
+        assert!(fixture.store.secure_boot_enabled());
+
+        // A normal unsigned User Mode deletion remains forbidden.
+        assert_eq!(
+            fixture.apply(
+                Phase::BootActive,
+                SecureBootVariable::PK,
+                VariableAttributes::empty(),
+                &[]
+            ),
+            efi::Status::SECURITY_VIOLATION
+        );
+        for (bridge, expected) in [
+            (
+                failing_setup_bridge as *const () as u64,
+                efi::Status::WRITE_PROTECTED,
+            ),
+            (setup_bridge as *const () as u64, efi::Status::SUCCESS),
+        ] {
+            assert_eq!(
+                fixture.write_using_bridge(
+                    Phase::BootActive,
+                    *SecureBootVariable::PK.guid(),
+                    SecureBootVariable::PK.name(),
+                    VariableAttributes::empty(),
+                    &[],
+                    bridge
+                ),
+                expected
+            );
+            if expected == efi::Status::SUCCESS {
+                assert!(fixture.store.setup_mode());
+                assert!(!fixture.store.secure_boot_enabled());
+                assert_eq!(
+                    fixture.store.key_database_data(SecureBootVariable::PK),
+                    None
+                );
+            } else {
+                assert!(!fixture.store.setup_mode());
+                assert!(fixture.store.secure_boot_enabled());
+                assert_eq!(
+                    fixture.store.key_database_data(SecureBootVariable::PK),
+                    Some(pk.as_slice())
+                );
+            }
+            assert_eq!(
+                fixture.store.auth_history_timestamp(
+                    SecureBootVariable::PK.guid(),
+                    SecureBootVariable::PK.name()
+                ),
+                Some(floor)
+            );
+        }
+    }
+
+    #[test]
+    fn setup_authorization_cannot_bypass_other_authentication_or_runtime_checks() {
+        let mut fixture = Fixture::retained();
+        fixture.enroll_raw();
+        let bridge = setup_bridge as *const () as u64;
+        for variable in [
+            SecureBootVariable::Kek,
+            SecureBootVariable::Db,
+            SecureBootVariable::Dbx,
+        ] {
+            assert_eq!(
+                fixture.write_using_bridge(
+                    Phase::BootActive,
+                    *variable.guid(),
+                    variable.name(),
+                    VariableAttributes::empty(),
+                    &[],
+                    bridge
+                ),
+                efi::Status::SECURITY_VIOLATION
+            );
+        }
+        for (phase, attributes, data) in [
+            (Phase::Importing, VariableAttributes::empty(), &[][..]),
+            (Phase::SealedPhysical, VariableAttributes::empty(), &[][..]),
+            (Phase::Virtual, VariableAttributes::empty(), &[][..]),
+            (Phase::BootActive, RAW_ATTRIBUTES, b"replacement".as_slice()),
+            (
+                Phase::BootActive,
+                RAW_ATTRIBUTES | VariableAttributes::APPEND_WRITE,
+                &[][..],
+            ),
+        ] {
+            assert_eq!(
+                fixture.write_using_bridge(
+                    phase,
+                    *SecureBootVariable::PK.guid(),
+                    SecureBootVariable::PK.name(),
+                    attributes,
+                    data,
+                    bridge
+                ),
+                efi::Status::SECURITY_VIOLATION
+            );
+            assert!(!fixture.store.setup_mode());
+        }
     }
 
     #[test]
