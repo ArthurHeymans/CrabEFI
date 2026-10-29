@@ -141,13 +141,13 @@ pub fn init_secure_boot(config: &SecureBootConfig) -> Result<EnrollmentStatus, A
 
     // Step 5: Load and apply SecureBootEnable preference from persistent storage
     // This is the user's saved preference from previous boot
-    if !is_setup_mode() {
-        if config.enable_secure_boot && !load_secure_boot_enable_preference() {
-            super::enable_secure_boot();
-        }
-        if super::is_secure_boot_enabled() {
-            log::info!("Secure Boot: Enabled (from persisted preference)");
-        }
+    if config.enable_secure_boot && !load_secure_boot_enable_preference() {
+        super::enable_secure_boot().map_err(|_| AuthError::CryptoError)?;
+    }
+    if super::is_secure_boot_enabled() {
+        log::info!("Secure Boot: Enabled (from persisted preference)");
+    } else if super::is_secure_boot_requested() {
+        log::info!("Secure Boot: Preference enabled, awaiting PK enrollment");
     }
 
     // Return final enrollment status
@@ -160,12 +160,7 @@ pub fn init_secure_boot(config: &SecureBootConfig) -> Result<EnrollmentStatus, A
 /// Called during boot initialization and by
 /// `handle_secure_boot_variable_update()` when PK is enrolled at runtime.
 pub fn load_secure_boot_enable_preference() -> bool {
-    if let Some(data) = get_variable_data(
-        &Guid::from_bytes(&EFI_GLOBAL_VARIABLE_GUID),
-        SECURE_BOOT_ENABLE_NAME,
-    ) && !data.is_empty()
-        && data[0] == 1
-    {
+    if super::is_secure_boot_requested() {
         log::debug!("Loaded SecureBootEnable preference: enabled");
         return true;
     }
