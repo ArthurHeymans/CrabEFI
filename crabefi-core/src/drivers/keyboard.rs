@@ -529,11 +529,7 @@ fn poll_bat_completion(kb: &mut KeyboardState) {
 fn finish_init(kb: &mut KeyboardState) {
     // Establish the scan set explicitly; do not rely on an EC's RESET defaults.
     // AUX is still inhibited, so its replies cannot steal these ACKs.
-    if !kb.send_keyboard_cmd(kb_cmd::DISABLE)
-        || !kb.send_keyboard_cmd(kb_cmd::SCAN_SET)
-        || !kb.send_keyboard_cmd(0x02)
-        || !kb.send_keyboard_cmd(kb_cmd::ENABLE)
-    {
+    if !configure_keyboard(|command| kb.send_keyboard_cmd(command)) {
         log::warn!("Failed to configure PS/2 keyboard scanning");
         kb.init_state = InitState::Failed;
         return;
@@ -541,6 +537,18 @@ fn finish_init(kb: &mut KeyboardState) {
 
     kb.init_state = InitState::Ready;
     log::info!("PS/2 keyboard initialized");
+}
+
+/// Retry the complete scan-set transaction after a missing ACK. AUX must stay
+/// inhibited until all four commands succeed or the bounded attempts run out;
+/// enabling scanning alone cannot establish the scan set expected by the parser.
+fn configure_keyboard(mut send: impl FnMut(u8) -> bool) -> bool {
+    for _ in 0..3 {
+        if send(kb_cmd::DISABLE) && send(kb_cmd::SCAN_SET) && send(0x02) && send(kb_cmd::ENABLE) {
+            return true;
+        }
+    }
+    false
 }
 
 /// Cleanup the keyboard controller before ExitBootServices
@@ -893,20 +901,6 @@ fn scancode_to_efi_normal(kb: &KeyboardState, code: u8) -> Option<(u16, u16)> {
 /// The i8042 keyboard port as a keyboard.
 pub(crate) struct Ps2Keyboard;
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn aux_discovery_must_not_consume_pending_reset_replies() {
-        assert!(!aux_init_allowed(InitState::NotStarted));
-        assert!(!aux_init_allowed(InitState::WaitingForBat { deadline: 0 }));
-        assert!(aux_init_allowed(InitState::Ready));
-        // A missing keyboard must not prevent an AUX-only device from probing.
-        assert!(aux_init_allowed(InitState::Failed));
-    }
-}
-
 impl super::keyboard_common::KeyboardDevice for Ps2Keyboard {
     fn read_key(&mut self) -> Option<crate::platform::Key> {
         try_read_key().map(|(scancode, unicode_char)| crate::platform::Key {
@@ -921,5 +915,57 @@ impl super::keyboard_common::KeyboardDevice for Ps2Keyboard {
 
     fn stop(&mut self) {
         cleanup();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const CONFIG_COMMANDS: [u8; 4] = [kb_cmd::DISABLE, kb_cmd::SCAN_SET, 0x02, kb_cmd::ENABLE];
+
+    #[test]
+    fn keyboard_configuration_succeeds_without_unnecessary_retries() {
+        let mut commands = alloc::vec::Vec::new();
+        assert!(configure_keyboard(|command| {
+            commands.push(command);
+            true
+        }));
+        assert_eq!(commands, CONFIG_COMMANDS);
+    }
+
+    #[test]
+    fn missing_ack_restarts_the_complete_configuration_at_every_stage() {
+        for failed_stage in 0..CONFIG_COMMANDS.len() {
+            let mut commands = alloc::vec::Vec::new();
+            assert!(configure_keyboard(|command| {
+                commands.push(command);
+                commands.len() != failed_stage + 1
+            }));
+            let mut expected = CONFIG_COMMANDS[..=failed_stage].to_vec();
+            expected.extend(CONFIG_COMMANDS);
+            assert_eq!(commands, expected);
+        }
+    }
+
+    #[test]
+    fn persistent_failure_at_any_stage_exhausts_bounded_full_attempts() {
+        for (failed_stage, &failed_command) in CONFIG_COMMANDS.iter().enumerate() {
+            let mut commands = alloc::vec::Vec::new();
+            assert!(!configure_keyboard(|command| {
+                commands.push(command);
+                command != failed_command
+            }));
+            assert_eq!(commands, CONFIG_COMMANDS[..=failed_stage].repeat(3));
+        }
+    }
+
+    #[test]
+    fn aux_discovery_must_not_consume_pending_reset_replies() {
+        assert!(!aux_init_allowed(InitState::NotStarted));
+        assert!(!aux_init_allowed(InitState::WaitingForBat { deadline: 0 }));
+        assert!(aux_init_allowed(InitState::Ready));
+        // A missing keyboard must not prevent an AUX-only device from probing.
+        assert!(aux_init_allowed(InitState::Failed));
     }
 }
