@@ -156,6 +156,10 @@ pub trait EventLog {
     /// the log size.
     fn last_entry_offset(&self) -> Option<usize>;
 
+    /// Check that a complete event can be appended before extending PCRs.
+    /// Marks the log truncated on capacity failure, but does not write bytes.
+    fn check_event(&mut self, digests: &[TaggedDigest], event_data: &[u8]) -> Result<(), TcgError>;
+
     /// Append a crypto-agile event to the log.
     ///
     /// For SHA1-only logs, only the SHA-1 digest from `digests` is used.
@@ -232,7 +236,8 @@ impl CryptoAgileEventLog {
     ///
     /// This is used when appending to a coreboot-provided log. The
     /// `existing_data` is copied into the beginning of `buffer`, and
-    /// new events are appended after it.
+    /// new events are appended after it. Malformed logs and buffers with no
+    /// append capacity are rejected before any bytes are copied.
     ///
     /// # Arguments
     /// * `buffer` - Pre-allocated buffer for the event log.
@@ -243,23 +248,17 @@ impl CryptoAgileEventLog {
         existing_data: &[u8],
         algorithms: &[u16],
     ) -> Result<Self, TcgError> {
-        if existing_data.len() > buffer.len() {
+        if existing_data.len() >= buffer.len() {
             return Err(TcgError::LogFull);
         }
+        let last_entry = parse_crypto_agile_last_entry_offset(existing_data)
+            .map_err(|()| TcgError::InternalError)?;
 
         buffer[..existing_data.len()].copy_from_slice(existing_data);
 
         let num_algorithms = algorithms.len().min(5);
         let mut algs = [0u16; 5];
         algs[..num_algorithms].copy_from_slice(&algorithms[..num_algorithms]);
-
-        let last_entry = match parse_crypto_agile_last_entry_offset(existing_data) {
-            Ok(offset) => offset,
-            Err(()) => {
-                log::warn!("Existing TCG2 event log could not be parsed for last-entry offset");
-                None
-            }
-        };
 
         Ok(Self {
             buffer,
@@ -331,6 +330,27 @@ impl CryptoAgileEventLog {
 }
 
 impl EventLog for CryptoAgileEventLog {
+    fn check_event(&mut self, digests: &[TaggedDigest], event_data: &[u8]) -> Result<(), TcgError> {
+        u32::try_from(event_data.len()).map_err(|_| TcgError::EventTooLarge)?;
+        u32::try_from(digests.len()).map_err(|_| TcgError::EventTooLarge)?;
+        let mut needed = 16usize; // PCR, type, digest count, event data size
+        for digest in digests {
+            let size = digest_size_for_algorithm(digest.algorithm)
+                .ok_or(TcgError::UnsupportedAlgorithm)?;
+            needed = needed
+                .checked_add(2 + size)
+                .ok_or(TcgError::EventTooLarge)?;
+        }
+        needed = needed
+            .checked_add(event_data.len())
+            .ok_or(TcgError::EventTooLarge)?;
+        if needed > self.buffer.len() - self.used {
+            self.truncated = true;
+            return Err(TcgError::LogFull);
+        }
+        Ok(())
+    }
+
     fn format(&self) -> EventLogFormat {
         EventLogFormat::CryptoAgile
     }
@@ -358,18 +378,13 @@ impl EventLog for CryptoAgileEventLog {
         digests: &[TaggedDigest],
         event_data: &[u8],
     ) -> Result<(), TcgError> {
+        self.check_event(digests, event_data)?;
         let event = CryptoAgileEvent {
             pcr_index,
             event_type,
             digests,
             event_data,
         };
-
-        let needed = event.serialized_size();
-        if self.used + needed > self.buffer.len() {
-            self.truncated = true;
-            return Err(TcgError::LogFull);
-        }
 
         // Record the offset of this event before writing — this is the
         // "last entry" pointer that GetEventLog returns.
@@ -414,21 +429,19 @@ impl Sha1EventLog {
     }
 
     /// Create from an existing log buffer (e.g., coreboot TCPA log).
+    ///
+    /// Malformed logs and buffers with no append capacity are rejected before
+    /// any bytes are copied.
     pub fn from_existing(
         buffer: &'static mut [u8],
         existing_data: &[u8],
     ) -> Result<Self, TcgError> {
-        if existing_data.len() > buffer.len() {
+        if existing_data.len() >= buffer.len() {
             return Err(TcgError::LogFull);
         }
+        let last_entry =
+            parse_sha1_last_entry_offset(existing_data).map_err(|()| TcgError::InternalError)?;
         buffer[..existing_data.len()].copy_from_slice(existing_data);
-        let last_entry = match parse_sha1_last_entry_offset(existing_data) {
-            Ok(offset) => offset,
-            Err(()) => {
-                log::warn!("Existing TCG event log could not be parsed for last-entry offset");
-                None
-            }
-        };
         Ok(Self {
             buffer,
             used: existing_data.len(),
@@ -439,6 +452,24 @@ impl Sha1EventLog {
 }
 
 impl EventLog for Sha1EventLog {
+    fn check_event(&mut self, digests: &[TaggedDigest], event_data: &[u8]) -> Result<(), TcgError> {
+        if !digests
+            .iter()
+            .any(|digest| digest.algorithm == super::types::TPM_ALG_SHA1)
+        {
+            return Err(TcgError::UnsupportedAlgorithm);
+        }
+        u32::try_from(event_data.len()).map_err(|_| TcgError::EventTooLarge)?;
+        let needed = core::mem::size_of::<TcgPcrEventHdr>()
+            .checked_add(event_data.len())
+            .ok_or(TcgError::EventTooLarge)?;
+        if needed > self.buffer.len() - self.used {
+            self.truncated = true;
+            return Err(TcgError::LogFull);
+        }
+        Ok(())
+    }
+
     fn format(&self) -> EventLogFormat {
         EventLogFormat::Sha1
     }
@@ -466,6 +497,7 @@ impl EventLog for Sha1EventLog {
         digests: &[TaggedDigest],
         event_data: &[u8],
     ) -> Result<(), TcgError> {
+        self.check_event(digests, event_data)?;
         // Extract the SHA-1 digest from the provided digests.
         // Return an error if no SHA-1 digest is present — silently using
         // a zero digest would produce a valid-looking but incorrect log entry.
@@ -487,13 +519,6 @@ impl EventLog for Sha1EventLog {
         };
 
         let header_size = core::mem::size_of::<TcgPcrEventHdr>();
-        let total = header_size + event_data.len();
-
-        if self.used + total > self.buffer.len() {
-            self.truncated = true;
-            return Err(TcgError::LogFull);
-        }
-
         // Record the offset of this event before writing.
         self.last_entry = Some(self.used);
 

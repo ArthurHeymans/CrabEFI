@@ -1025,7 +1025,8 @@ pub struct PlatformEventLog {
     /// The whole log area; the log is in its first `used` bytes and the rest
     /// is free.
     pub area: &'static mut [u8],
-    /// Bytes of the log written so far.
+    /// Bytes of the log written so far; must be less than `area.len()`.
+    /// Invalid or full areas are rejected without modifying their contents.
     pub used: usize,
 }
 

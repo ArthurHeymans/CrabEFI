@@ -124,6 +124,7 @@ fn extend_and_log(
     }
 
     let tpm = state.hardware_tpm.as_mut().ok_or(TcgError::InternalError)?;
+    state.event_log.check_event(&[tagged_digest], event_data)?;
     tpm.pcr_extend(pcr_index, sha1_digest)?;
     state.pcr_bank.extend(pcr_index as usize, sha1_digest)?;
     state

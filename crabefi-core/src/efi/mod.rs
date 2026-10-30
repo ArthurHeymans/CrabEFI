@@ -210,9 +210,10 @@ fn init_tcg_protocols(config: &mut crate::platform::TpmEventLogConfig) {
     // A platform log area is continued in place: `from_existing` copies the
     // log back to where it already is, so the area keeps the whole log.
     let mut log_area = config.log_area.take();
-    if let Some(log) = log_area.as_ref().filter(|log| log.used > log.area.len()) {
+    if let Some(log) = log_area.as_ref().filter(|log| log.used >= log.area.len()) {
         // The platform started measured boot, but its log cannot be
-        // continued: a fresh log would no longer match the PCRs.
+        // continued (invalid length or no append capacity): a fresh log
+        // would no longer match the PCRs.
         log::error!(
             "Platform event log area invalid ({} bytes used of {}); measured boot not continued",
             log.used,
