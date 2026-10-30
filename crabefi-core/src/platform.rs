@@ -979,6 +979,14 @@ pub struct TpmEventLogConfig<'a> {
     /// to create software-only attestable measurements.
     pub existing_log: Option<&'a [u8]>,
 
+    /// A log the platform firmware started in memory it owns, continued in
+    /// place instead of copied; takes precedence over `existing_log`.
+    ///
+    /// Use it when a table already points at the log, such as the log area
+    /// (LASA) of the ACPI `TPM2` or `TCPA` table: the OS then finds every
+    /// event of the boot there, not only the platform firmware's.
+    pub log_area: Option<PlatformEventLog>,
+
     /// Event log format of the existing data.
     ///
     /// This also determines which TCG protocol is installed:
@@ -1005,6 +1013,21 @@ pub struct TpmEventLogConfig<'a> {
     /// CrabEFI installs a hardware-backed `EFI_TCG_PROTOCOL` and forwards SHA-1
     /// PCR extensions and raw TPM 1.2 commands to this device.
     pub tpm1_tis_base: Option<u64>,
+}
+
+/// A TCG event log in platform-owned memory, see
+/// [`TpmEventLogConfig::log_area`].
+///
+/// An earlier log (from `existing_log` or here) means the platform firmware
+/// is the static root of trust and measured itself, so CrabEFI does not
+/// record an S-CRTM version of its own.
+pub struct PlatformEventLog {
+    /// The whole log area; the log is in its first `used` bytes and the rest
+    /// is free.
+    pub area: &'static mut [u8],
+    /// Bytes of the log written so far; must be less than `area.len()`.
+    /// Invalid or full areas are rejected without modifying their contents.
+    pub used: usize,
 }
 
 /// TPM event log format selection.

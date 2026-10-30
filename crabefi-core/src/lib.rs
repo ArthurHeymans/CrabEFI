@@ -72,7 +72,7 @@ pub use platform::{
     BlockDevice, BlockDeviceInfo, BlockError, BootResult, CapsuleBackend, CapsuleRegion,
     ConsoleInput, DebugOutput, DeferredBufferConfig, FirmwareInfo, FmapRegion, FramebufferConfig,
     Key, KeyState, MemoryRegion, MemoryType, PciEcamRegion, PlatformConfig, PlatformConfigBuilder,
-    PlatformHooks, ResetHandler, ResetType, Rng, RngError, RuntimeImageSource,
+    PlatformEventLog, PlatformHooks, ResetHandler, ResetType, Rng, RngError, RuntimeImageSource,
     RuntimePlatformConfig, StorageBackend, StorageError, Timer, TimestampRecorder, Tpm2Device,
     Tpm2DeviceConfig, TpmDigest, TpmError, TpmEventLogConfig, TpmLogFormat, TpmPcrBanks,
     VariableStorage,

@@ -22,6 +22,10 @@
 //! - TCG EFI Protocol Specification, Family "2.0", Level 00, Revision 00.13
 //! - EDK2 `SecurityPkg/Tcg/Tcg2Dxe/Tcg2Dxe.c`
 
+#[cfg(test)]
+#[path = "tcg2_tests.rs"]
+mod tests;
+
 use core::ffi::c_void;
 
 use r_efi::efi::Status;
@@ -145,7 +149,8 @@ impl Tcg2State {
 ///
 /// Must be called before the protocol is installed. The `existing_log`
 /// parameter allows prepopulating the event log with data from a previous
-/// firmware phase (e.g., coreboot's CBMEM TCPA log).
+/// firmware phase (e.g., coreboot's CBMEM TCPA log). Invalid existing logs
+/// are rejected without modifying `buffer`, which may be the original area.
 ///
 /// # Arguments
 /// * `buffer` - Pre-allocated buffer for the event log.
@@ -156,7 +161,13 @@ pub fn init_state(
     existing_log: Option<&[u8]>,
     enable_sha1: bool,
 ) -> Result<(), TcgError> {
-    let (alg_count, algorithms, existing_log) = software_log_selection(existing_log, enable_sha1);
+    let (alg_count, algorithms, selected_log) = software_log_selection(existing_log, enable_sha1);
+    // A rejected prior log must never be replaced with a fresh SpecID event:
+    // the destination may be the platform's ACPI-backed log area itself.
+    if existing_log.is_some() && selected_log.is_none() {
+        return Err(TcgError::InternalError);
+    }
+    let existing_log = selected_log;
     let algorithms = &algorithms[..alg_count];
 
     let event_log = if let Some(existing) = existing_log {
@@ -351,14 +362,14 @@ fn software_log_selection(
     };
 
     let Some((count, existing_algorithms)) = parse_spec_id_algorithms(existing) else {
-        log::warn!("Ignoring existing TCG2 log without a valid SpecID event");
+        log::warn!("Rejecting existing TCG2 log without a valid SpecID event");
         return (default.0, default.1, None);
     };
     let existing_algorithms = &existing_algorithms[..count];
 
     if let Some(unsupported) = unsupported_active_algorithm(existing_algorithms) {
         log::warn!(
-            "Ignoring existing TCG2 log with unsupported SpecID algorithm {:#06x}",
+            "Rejecting existing TCG2 log with unsupported SpecID algorithm {:#06x}",
             unsupported
         );
         return (default.0, default.1, None);
@@ -478,6 +489,11 @@ fn extend_and_maybe_log(
     let Some(ref mut tpm) = state.hardware_tpm else {
         return Err(TcgError::InternalError);
     };
+    // The state lock keeps this capacity check valid until the append below.
+    // EXTEND_ONLY intentionally does not require any event-log space.
+    if log_event {
+        state.event_log.check_event(digests, event_data)?;
+    }
     tpm.pcr_extend(pcr_index, digests)?;
 
     // Keep a software mirror for log verification, but only after hardware PCR
