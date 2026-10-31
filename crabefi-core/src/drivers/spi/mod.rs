@@ -6,7 +6,6 @@
 
 pub mod qemu;
 
-use alloc::boxed::Box;
 use rflasher_internal::{
     HostAccess, MmioAccess, PciAddress as RflasherPciAddress, PciConfigAccess,
 };
@@ -220,8 +219,12 @@ pub trait SpiController {
 }
 
 /// Enum containing an rflasher Intel/AMD controller or CrabEFI QEMU pflash.
+#[allow(
+    clippy::large_enum_variant,
+    reason = "the boot-lifetime controller is stored statically; avoid a heap allocation"
+)]
 pub enum AnySpiController {
-    Intel(Box<rflasher_internal::IchSpiController<CrabEfiPciAccess>>),
+    Intel(rflasher_internal::IchSpiController<CrabEfiPciAccess>),
     Amd(rflasher_internal::Spi100Controller<CrabEfiPciAccess>),
     Qemu(qemu::QemuPflashController),
 }
@@ -495,7 +498,7 @@ pub fn detect_and_init() -> Option<AnySpiController> {
                         "Intel SPI controller initialized in {} mode",
                         controller.mode()
                     );
-                    return Some(AnySpiController::Intel(Box::new(controller)));
+                    return Some(AnySpiController::Intel(controller));
                 }
                 Err(e) => log::error!("Failed to initialize Intel SPI controller: {}", e),
             }

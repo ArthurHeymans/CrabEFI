@@ -78,6 +78,10 @@ impl VarStoreState {
 /// Persistent variable-store bookkeeping.
 static VARSTORE: LocalCell<VarStoreState> = LocalCell::new(VarStoreState::new());
 /// Boot-lifetime backend, never callable from the sealed runtime image.
+#[allow(
+    clippy::large_enum_variant,
+    reason = "the backend lives in static STORAGE; initialization stack usage is bounded"
+)]
 enum Storage {
     Platform(&'static mut dyn StorageBackend),
     #[cfg(feature = "spi-flash")]
