@@ -31,6 +31,8 @@ pub(super) trait Controller {
         crate::time::delay_us(POLL_US);
     }
 
+    /// Poll selected status bits with an elapsed-time bound, not a CPU-speed
+    /// dependent iteration count.
     fn wait_status(&self, mask: u8, value: u8) -> bool {
         let start = self.now_us();
         loop {
@@ -52,6 +54,9 @@ pub(super) trait Controller {
         self.wait_status(OUTPUT_FULL, OUTPUT_FULL)
     }
 
+    /// Wait before and after sending a controller command. A timeout after
+    /// the write does not imply the command had no effect; callers must still
+    /// restore any interface they may have inhibited.
     fn send_controller_cmd(&self, command: u8) -> bool {
         if !self.wait_input_ready() {
             return false;
@@ -111,11 +116,15 @@ pub(super) trait Controller {
 /// have completed (or timed out) before calling this.
 #[cfg(any(feature = "ui", test))]
 pub(super) fn init_aux<C: Controller>(io: &mut C, init: impl FnOnce(&mut C) -> bool) -> bool {
-    if !io.send_controller_cmd(0xAD) {
-        return false;
-    }
     let result = (|| {
-        if !io.send_controller_cmd(0xA7) || !io.flush_output() {
+        // Even a failed wait after writing DISABLE_KB can leave the keyboard
+        // inhibited. Keep this command inside the keyboard-restoration path.
+        if !io.send_controller_cmd(0xAD) || !io.send_controller_cmd(0xA7) || !io.flush_output() {
+            return false;
+        }
+        // The AUX port-test reply is untagged too. Read it with both clocks
+        // inhibited, before the configuration write enables AUX traffic.
+        if !io.send_controller_cmd(0xA9) || !io.wait_output_ready() || io.read_data() != 0 {
             return false;
         }
         if !io.send_controller_cmd(0x20) || !io.wait_output_ready() {

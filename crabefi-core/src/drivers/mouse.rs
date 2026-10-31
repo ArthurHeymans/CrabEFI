@@ -53,7 +53,6 @@ mod mouse_cmd {
 
 mod aux_cmd {
     pub const ENABLE_AUX: u8 = 0xA8;
-    pub const TEST_AUX: u8 = 0xA9;
 }
 
 /// Synaptics magic identification byte in the second byte of a GET_INFO
@@ -181,10 +180,6 @@ impl MouseState {
     }
 
     // ── Port helpers ──────────────────────────────────────────────────────────
-
-    fn wait_output_ready(&self) -> bool {
-        Controller::wait_output_ready(self)
-    }
 
     fn wait_aux_output(&self) -> bool {
         self.wait_status(
@@ -535,22 +530,9 @@ pub fn init() {
     }
 }
 
-/// Called with the keyboard inhibited for the entire AUX command exchange.
+/// Called after the AUX port test, with the keyboard inhibited for the entire
+/// AUX device command exchange.
 fn init_device(mouse: &mut MouseState) -> bool {
-    if !mouse.send_controller_cmd(aux_cmd::TEST_AUX) {
-        log::debug!("AUX port test failed");
-        return false;
-    }
-    if !mouse.wait_output_ready() {
-        log::debug!("AUX port test timeout");
-        return false;
-    }
-    let test = mouse.data_port.get();
-    if test != 0x00 {
-        log::debug!("AUX port test returned {:#x}", test);
-        return false;
-    }
-
     // Enable AUX port (0xA8); response may be absent on Lenovo H8 EC.
     if !mouse.send_controller_cmd(aux_cmd::ENABLE_AUX) {
         return false;
