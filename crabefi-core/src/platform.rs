@@ -509,6 +509,10 @@ pub trait CapsuleBackend {
 pub trait PlatformHooks {
     /// Called after `ExitBootServices()` succeeds, before the system table's
     /// Boot Services pointer is cleared.
+    ///
+    /// Security-state transitions must be explicitly owned by the platform;
+    /// generic EFI code never infers a vendor SMC ABI from PSCI support.
+    /// Any transition must preserve access to the caller and continuation.
     fn on_exit_boot_services(&self) {}
 
     /// Return whether the platform exposes a firmware settings UI.
