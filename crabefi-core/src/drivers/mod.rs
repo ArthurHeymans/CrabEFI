@@ -145,6 +145,8 @@ pub(crate) mod elan;
 #[cfg(feature = "hid-i2c")]
 pub(crate) mod hid_i2c;
 #[cfg(target_arch = "x86_64")]
+mod i8042;
+#[cfg(target_arch = "x86_64")]
 pub mod keyboard;
 pub mod keyboard_common;
 pub mod mmio;

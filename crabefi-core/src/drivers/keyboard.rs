@@ -17,6 +17,7 @@ use spin::Mutex;
 use tock_registers::interfaces::{Readable, Writeable};
 use tock_registers::register_bitfields;
 
+use super::i8042::Controller;
 use crate::arch::x86_64::port_regs::{PortAliased8, PortReadWrite8};
 use crate::time::Timeout;
 
@@ -88,12 +89,14 @@ mod cmd {
     pub const TEST_KB: u8 = 0xAB;
     /// Disable keyboard port
     pub const DISABLE_KB: u8 = 0xAD;
-    /// Enable keyboard port
-    pub const ENABLE_KB: u8 = 0xAE;
 }
 
 /// Keyboard commands (written to port 0x60)
 mod kb_cmd {
+    /// Disable scanning and restore defaults
+    pub const DISABLE: u8 = 0xF5;
+    /// Select scancode set (followed by the set number)
+    pub const SCAN_SET: u8 = 0xF0;
     /// Enable scanning
     pub const ENABLE: u8 = 0xF4;
     /// Reset and self-test
@@ -122,6 +125,8 @@ pub(crate) mod masks {
     // Config byte bits
     pub const KB_INT: u8 = 1 << 0;
     pub const AUX_INT: u8 = 1 << 1;
+    pub const SYSTEM: u8 = 1 << 2;
+    pub const KB_DISABLE: u8 = 1 << 4;
     pub const AUX_DISABLE: u8 = 1 << 5;
     pub const TRANSLATION: u8 = 1 << 6;
 }
@@ -148,6 +153,24 @@ impl PS2Ports {
     }
 }
 
+impl Controller for PS2Ports {
+    fn status(&self) -> u8 {
+        self.status_cmd.get()
+    }
+
+    fn read_data(&self) -> u8 {
+        self.data.get()
+    }
+
+    fn write_data(&self, byte: u8) {
+        self.data.set(byte);
+    }
+
+    fn write_command(&self, byte: u8) {
+        self.status_cmd.set(byte);
+    }
+}
+
 // ============================================================================
 // Keyboard State
 // ============================================================================
@@ -156,7 +179,7 @@ impl PS2Ports {
 /// response after sending the RESET command.
 ///
 /// Laptop EC-emulated keyboards (ThinkPad H8 etc.) may need up to a second
-/// to respond. We use a 5 s window matching SeaBIOS's BAT read timeout.
+/// to respond. Allow the same total reset window as SeaBIOS (1 s ACK + 4 s BAT).
 /// If the deadline expires we enable scanning anyway — some firmware payload
 /// environments do the same ("just configure and go") because the EC may not
 /// be ready to respond at all when we start.
@@ -182,7 +205,7 @@ enum InitState {
     /// Keyboard fully initialized and ready for scancodes.
     Ready,
     /// Initialization failed (controller absent, self-test failed, or
-    /// BAT timed out). No further attempts will be made.
+    /// scanning could not be configured). No further attempts will be made.
     Failed,
 }
 
@@ -227,78 +250,24 @@ impl KeyboardState {
         matches!(self.init_state, InitState::Ready)
     }
 
-    /// Wait for the controller input buffer to be empty (ready to accept commands)
     fn wait_input_ready(&self) -> bool {
-        for _ in 0..10000 {
-            if !self.ports.status_cmd.is_set(Status::INPUT_FULL) {
-                return true;
-            }
-            // Small delay
-            for _ in 0..50 {
-                core::hint::spin_loop();
-            }
-        }
-        false
+        self.ports.wait_input_ready()
     }
 
-    /// Wait for data to be available in the output buffer
     fn wait_output_ready(&self) -> bool {
-        for _ in 0..10000 {
-            if self.ports.status_cmd.is_set(Status::OUTPUT_FULL) {
-                return true;
-            }
-            // Small delay
-            for _ in 0..50 {
-                core::hint::spin_loop();
-            }
-        }
-        false
+        self.ports.wait_output_ready()
     }
 
-    /// Send a command to the controller (port 0x64)
     fn send_controller_cmd(&self, command: u8) -> bool {
-        if !self.wait_input_ready() {
-            return false;
-        }
-        self.ports.status_cmd.set(command);
-        self.wait_input_ready()
+        self.ports.send_controller_cmd(command)
     }
 
-    /// Send a command to the keyboard (port 0x60) and wait for ACK
-    ///
-    /// Retries up to 3 times if the keyboard responds with RESEND (0xFE).
     fn send_keyboard_cmd(&self, command: u8) -> bool {
-        for _ in 0..3 {
-            if !self.wait_input_ready() {
-                return false;
-            }
-            self.ports.data.set(command);
-
-            // Wait for response
-            if !self.wait_output_ready() {
-                return false;
-            }
-
-            match self.ports.data.get() {
-                response::ACK => return true,
-                response::RESEND => continue,
-                _ => return false,
-            }
-        }
-        false
+        self.ports.send_device_byte(false, command)
     }
 
-    /// Flush any pending data from the controller
-    fn flush_output(&self) {
-        for _ in 0..100 {
-            if !self.ports.status_cmd.is_set(Status::OUTPUT_FULL) {
-                break;
-            }
-            let _ = self.ports.data.get();
-            for _ in 0..10 {
-                core::hint::spin_loop();
-            }
-        }
+    fn flush_output(&self) -> bool {
+        self.ports.flush_output()
     }
 }
 
@@ -318,8 +287,8 @@ static KEYBOARD: Mutex<KeyboardState> = Mutex::new(KeyboardState::new());
 /// Phase 2 sends the keyboard RESET command (0xFF) and returns immediately.
 /// The BAT (Basic Assurance Test) response is checked lazily on each
 /// `has_key()` / `try_read_key()` poll, so boot is never blocked waiting
-/// for a slow keyboard. This mirrors SeaBIOS's `etc/ps2-keyboard-spinup`
-/// approach.
+/// for a slow keyboard. AUX discovery is deferred too, until this transaction
+/// releases the shared controller.
 pub fn init() {
     let mut kb = KEYBOARD.lock();
 
@@ -339,11 +308,14 @@ pub fn init() {
     // ---- Phase 1: controller-side init (synchronous, fast) ----
 
     // Disable both ports during initialization
-    kb.send_controller_cmd(cmd::DISABLE_KB);
-    kb.send_controller_cmd(cmd::DISABLE_AUX);
-
-    // Flush any pending data
-    kb.flush_output();
+    if !kb.send_controller_cmd(cmd::DISABLE_KB)
+        || !kb.send_controller_cmd(cmd::DISABLE_AUX)
+        || !kb.flush_output()
+    {
+        log::warn!("Failed to inhibit PS/2 interfaces");
+        kb.init_state = InitState::Failed;
+        return;
+    }
 
     // Perform controller self-test
     if !kb.send_controller_cmd(cmd::SELF_TEST) {
@@ -361,6 +333,16 @@ pub fn init() {
     let result = kb.ports.data.get();
     if result != 0x55 {
         log::warn!("PS/2 controller self-test failed: {:#x}", result);
+        kb.init_state = InitState::Failed;
+        return;
+    }
+
+    // Self-test can reset the configuration. Inhibit both ports again before
+    // reading untagged controller replies.
+    if !kb.send_controller_cmd(cmd::DISABLE_KB)
+        || !kb.send_controller_cmd(cmd::DISABLE_AUX)
+        || !kb.flush_output()
+    {
         kb.init_state = InitState::Failed;
         return;
     }
@@ -385,10 +367,7 @@ pub fn init() {
         return;
     }
 
-    // Enable keyboard port
-    kb.send_controller_cmd(cmd::ENABLE_KB);
-
-    // Read and modify controller configuration
+    // Read and modify controller configuration while both ports are inhibited.
     if !kb.send_controller_cmd(cmd::READ_CONFIG) {
         log::warn!("Failed to read PS/2 controller config");
         kb.init_state = InitState::Failed;
@@ -403,15 +382,10 @@ pub fn init() {
 
     let mut config_byte = kb.ports.data.get();
 
-    // Enable translation (scancode set 2 -> set 1) and disable interrupts.
-    // We poll the keyboard instead of using interrupts.
-    // Clear AUX_DISABLE so the mouse AUX port clock remains enabled —
-    // without this, the PS/2 mouse can't communicate after keyboard init
-    // (critical on Lenovo H8 EC where ENABLE_AUX alone may not suffice).
-    config_byte |= masks::TRANSLATION;
-    config_byte &= !masks::KB_INT;
-    config_byte &= !masks::AUX_INT;
-    config_byte &= !masks::AUX_DISABLE;
+    // Poll translated set 2, enabling only the keyboard. AUX must stay
+    // inhibited until RESET/BAT and the keyboard command exchange complete.
+    config_byte |= masks::TRANSLATION | masks::SYSTEM | masks::AUX_DISABLE;
+    config_byte &= !(masks::KB_INT | masks::AUX_INT | masks::KB_DISABLE);
 
     if !kb.send_controller_cmd(cmd::WRITE_CONFIG) {
         log::warn!("Failed to write PS/2 controller config");
@@ -446,6 +420,20 @@ pub fn init() {
         deadline: deadline.raw_deadline(),
     };
     log::debug!("PS/2 keyboard RESET sent, waiting for BAT (deferred)");
+}
+
+/// AUX discovery shares the controller's untagged command replies. Do not
+/// start it while the keyboard RESET transaction still owns the data port.
+#[cfg(feature = "ui")]
+pub(super) fn ready_for_aux_init() -> bool {
+    let mut kb = KEYBOARD.lock();
+    poll_bat_completion(&mut kb);
+    aux_init_allowed(kb.init_state)
+}
+
+#[cfg(any(feature = "ui", test))]
+fn aux_init_allowed(state: InitState) -> bool {
+    matches!(state, InitState::Ready | InitState::Failed)
 }
 
 /// Drive the deferred keyboard BAT state machine forward.
@@ -539,17 +527,28 @@ fn poll_bat_completion(kb: &mut KeyboardState) {
 /// Complete keyboard initialization after BAT (or after BAT timeout
 /// fallback). Enables scanning and transitions to `Ready`.
 fn finish_init(kb: &mut KeyboardState) {
-    // Flush any remaining BAT bytes (some keyboards send extra data)
-    kb.flush_output();
-
-    // Enable keyboard scanning
-    if !kb.send_keyboard_cmd(kb_cmd::ENABLE) {
-        log::warn!("Failed to enable keyboard scanning");
-        // Continue anyway — might still work
+    // Establish the scan set explicitly; do not rely on an EC's RESET defaults.
+    // AUX is still inhibited, so its replies cannot steal these ACKs.
+    if !configure_keyboard(|command| kb.send_keyboard_cmd(command)) {
+        log::warn!("Failed to configure PS/2 keyboard scanning");
+        kb.init_state = InitState::Failed;
+        return;
     }
 
     kb.init_state = InitState::Ready;
     log::info!("PS/2 keyboard initialized");
+}
+
+/// Retry the complete scan-set transaction after a missing ACK. AUX must stay
+/// inhibited until all four commands succeed or the bounded attempts run out;
+/// enabling scanning alone cannot establish the scan set expected by the parser.
+fn configure_keyboard(mut send: impl FnMut(u8) -> bool) -> bool {
+    for _ in 0..3 {
+        if send(kb_cmd::DISABLE) && send(kb_cmd::SCAN_SET) && send(0x02) && send(kb_cmd::ENABLE) {
+            return true;
+        }
+    }
+    false
 }
 
 /// Cleanup the keyboard controller before ExitBootServices
@@ -916,5 +915,57 @@ impl super::keyboard_common::KeyboardDevice for Ps2Keyboard {
 
     fn stop(&mut self) {
         cleanup();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const CONFIG_COMMANDS: [u8; 4] = [kb_cmd::DISABLE, kb_cmd::SCAN_SET, 0x02, kb_cmd::ENABLE];
+
+    #[test]
+    fn keyboard_configuration_succeeds_without_unnecessary_retries() {
+        let mut commands = alloc::vec::Vec::new();
+        assert!(configure_keyboard(|command| {
+            commands.push(command);
+            true
+        }));
+        assert_eq!(commands, CONFIG_COMMANDS);
+    }
+
+    #[test]
+    fn missing_ack_restarts_the_complete_configuration_at_every_stage() {
+        for failed_stage in 0..CONFIG_COMMANDS.len() {
+            let mut commands = alloc::vec::Vec::new();
+            assert!(configure_keyboard(|command| {
+                commands.push(command);
+                commands.len() != failed_stage + 1
+            }));
+            let mut expected = CONFIG_COMMANDS[..=failed_stage].to_vec();
+            expected.extend(CONFIG_COMMANDS);
+            assert_eq!(commands, expected);
+        }
+    }
+
+    #[test]
+    fn persistent_failure_at_any_stage_exhausts_bounded_full_attempts() {
+        for (failed_stage, &failed_command) in CONFIG_COMMANDS.iter().enumerate() {
+            let mut commands = alloc::vec::Vec::new();
+            assert!(!configure_keyboard(|command| {
+                commands.push(command);
+                command != failed_command
+            }));
+            assert_eq!(commands, CONFIG_COMMANDS[..=failed_stage].repeat(3));
+        }
+    }
+
+    #[test]
+    fn aux_discovery_must_not_consume_pending_reset_replies() {
+        assert!(!aux_init_allowed(InitState::NotStarted));
+        assert!(!aux_init_allowed(InitState::WaitingForBat { deadline: 0 }));
+        assert!(aux_init_allowed(InitState::Ready));
+        // A missing keyboard must not prevent an AUX-only device from probing.
+        assert!(aux_init_allowed(InitState::Failed));
     }
 }
