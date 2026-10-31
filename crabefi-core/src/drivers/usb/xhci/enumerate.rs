@@ -1,7 +1,7 @@
 //! xHCI port enumeration and hubs.
 
 use super::super::controller::{
-    HUB_DESCRIPTOR_TYPE, hub_feature, hub_port_status, req_type, request,
+    HUB_DESCRIPTOR_TYPE, hub_feature, hub_port_change, hub_port_status, req_type, request,
 };
 use super::XhciError;
 use super::speed::{BOS_DESCRIPTOR_TYPE, BosHeader, LinkSpeed, SublinkSpeeds};
@@ -44,6 +44,35 @@ async fn debounce_root_connection(mut connected: impl FnMut() -> bool) -> bool {
     }
 }
 
+/// Poll and acknowledge the hub's connection-change latch so even a bounce
+/// between status reads restarts the stable interval.
+async fn debounce_hub_connection(
+    mut connection: impl FnMut() -> Result<(bool, bool), XhciError>,
+) -> Result<bool, XhciError> {
+    let timeout = Timeout::from_ms(CONNECTION_TIMEOUT_MS);
+    let mut stable: Option<Timeout> = None;
+    loop {
+        let (connected, changed) = connection()?;
+        if !connected || changed {
+            stable = None;
+        }
+        if connected {
+            let debounce = stable.get_or_insert_with(|| Timeout::from_ms(CONNECTION_DEBOUNCE_MS));
+            if debounce.is_expired() {
+                return Ok(true);
+            }
+        }
+        if timeout.is_expired() {
+            return Ok(false);
+        }
+        exec::sleep_ms(10).await;
+    }
+}
+
+fn hub_scan_complete(final_pass: bool, tried_before: u16, tried: u16, num_ports: u8) -> bool {
+    tried.count_ones() == u32::from(num_ports) || (final_pass && tried == tried_before)
+}
+
 fn hub_descriptor_type(is_superspeed: bool) -> u8 {
     if is_superspeed {
         SUPER_SPEED_HUB_DESCRIPTOR_TYPE
@@ -79,6 +108,78 @@ mod hub_protocol_tests {
         assert_eq!(hub_depth(0), 0);
         assert_eq!(hub_depth(2), 1);
         assert_eq!(hub_depth(0x321), 3);
+    }
+
+    #[test]
+    fn hub_debounce_restarts_after_disconnect_or_latched_bounce() {
+        // The change latch also catches a disconnect/reconnect between polls.
+        for bounce in [(false, false), (true, true)] {
+            let mut polls = 0;
+            let mut stable_deadline = None;
+            assert!(
+                exec::block_on(debounce_hub_connection(|| {
+                    polls += 1;
+                    let sample = if polls == 2 { bounce } else { (true, false) };
+                    let stable_poll = if bounce.0 { 2 } else { 3 };
+                    if polls == stable_poll {
+                        stable_deadline = Some(Timeout::from_ms(CONNECTION_DEBOUNCE_MS));
+                    }
+                    Ok(sample)
+                }))
+                .unwrap()
+            );
+            assert!(stable_deadline.unwrap().is_expired());
+        }
+    }
+
+    #[test]
+    fn hub_debounce_bounds_a_continuously_changing_connection() {
+        assert!(!exec::block_on(debounce_hub_connection(|| Ok((true, true)))).unwrap());
+    }
+
+    #[test]
+    fn hub_debounce_propagates_status_errors() {
+        assert!(matches!(
+            exec::block_on(debounce_hub_connection(|| Err(XhciError::InvalidParameter))),
+            Err(XhciError::InvalidParameter)
+        ));
+    }
+
+    #[test]
+    fn hub_final_pass_rescans_connections_during_nested_enumeration() {
+        let mut tried = 0u16;
+        let mut connected = 1u16 << 3;
+        let mut attached = Vec::new();
+        for pass in 0..3 {
+            let tried_before = tried;
+            for port in 1..=3 {
+                let bit = 1u16 << port;
+                if tried & bit != 0 || connected & bit == 0 {
+                    continue;
+                }
+                tried |= bit;
+                attached.push(port);
+                // Nested enumeration on ports 3 and 2 lets an earlier port
+                // connect, after that port was already scanned this pass.
+                if port > 1 {
+                    connected |= 1u16 << (port - 1);
+                }
+            }
+            // The first nested enumeration ran past the discovery deadline.
+            if hub_scan_complete(pass > 0, tried_before, tried, 3) {
+                assert_eq!(attached, [3, 2, 1]);
+                return;
+            }
+        }
+        panic!("hub scan did not terminate after trying every port");
+    }
+
+    #[test]
+    fn hub_scan_stops_after_a_quiet_final_pass() {
+        assert!(!hub_scan_complete(false, 0, 0, 3));
+        assert!(hub_scan_complete(true, 0, 0, 3));
+        assert!(hub_scan_complete(true, 0b1000, 0b1000, 3));
+        assert!(hub_scan_complete(false, 0, 0b1110, 3));
     }
 
     #[test]
@@ -538,12 +639,14 @@ impl super::XhciController {
         // A powered hub does not imply its children have connected yet.
         // Rescan absent ports for a bounded window, without resetting devices
         // we already tried. Nested enumeration can outlast the deadline, so
-        // always make a final pass after it has expired.
+        // rescan after any progress until a pass is quiet. The tried bitmap
+        // bounds these extra passes even after the deadline.
         let timeout = Timeout::from_ms(CONNECTION_TIMEOUT_MS);
         let mut tried = 0u16;
         let mut first_pass = true;
         loop {
             let final_pass = timeout.is_expired();
+            let tried_before = tried;
             for p in 1..=num_ports {
                 let bit = 1u16 << p;
                 if tried & bit != 0 {
@@ -576,20 +679,51 @@ impl super::XhciController {
                 if (port_status & hub_port_status::CONNECTION) == 0 {
                     continue;
                 }
+                let debounced = debounce_hub_connection(|| {
+                    let mut status = [0u8; 4];
+                    self.control_transfer(
+                        hub_slot_id,
+                        req_type::DIR_IN | req_type::TYPE_CLASS | req_type::RCPT_OTHER,
+                        request::GET_STATUS,
+                        0,
+                        p as u16,
+                        Some(&mut status),
+                    )?;
+                    let connected = u16::from_le_bytes([status[0], status[1]])
+                        & hub_port_status::CONNECTION
+                        != 0;
+                    let changed = u16::from_le_bytes([status[2], status[3]])
+                        & hub_port_change::C_CONNECTION
+                        != 0;
+                    if changed {
+                        self.control_transfer(
+                            hub_slot_id,
+                            req_type::DIR_OUT | req_type::TYPE_CLASS | req_type::RCPT_OTHER,
+                            request::CLEAR_FEATURE,
+                            hub_feature::C_PORT_CONNECTION,
+                            p as u16,
+                            None,
+                        )?;
+                    }
+                    Ok((connected, changed))
+                })
+                .await;
                 tried |= bit;
+                match debounced {
+                    Ok(true) => {}
+                    Ok(false) => continue,
+                    Err(error) => {
+                        log::warn!(
+                            "Hub {} port {} debounce failed: {:?}",
+                            hub_slot_id,
+                            p,
+                            error
+                        );
+                        continue;
+                    }
+                }
 
                 log::info!("xHCI: Device on hub slot {} port {}", hub_slot_id, p);
-                exec::sleep_ms(CONNECTION_DEBOUNCE_MS).await;
-
-                // Clear connection change
-                let _ = self.control_transfer(
-                    hub_slot_id,
-                    req_type::DIR_OUT | req_type::TYPE_CLASS | req_type::RCPT_OTHER,
-                    request::CLEAR_FEATURE,
-                    hub_feature::C_PORT_CONNECTION,
-                    p as u16,
-                    None,
-                );
 
                 // Reset the port
                 let _ = self.control_transfer(
@@ -692,7 +826,7 @@ impl super::XhciController {
                 }
             }
             first_pass = false;
-            if final_pass || tried.count_ones() == u32::from(num_ports) {
+            if hub_scan_complete(final_pass, tried_before, tried, num_ports) {
                 break;
             }
             exec::sleep_ms(10).await;
