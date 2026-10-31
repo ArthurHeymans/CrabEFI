@@ -18,6 +18,32 @@ use zerocopy::byteorder::{LittleEndian, U32};
 const SUPER_SPEED_HUB_DESCRIPTOR_TYPE: u8 = 0x2a;
 const SET_HUB_DEPTH: u8 = 0x0c;
 
+/// Devices and cascaded hubs can reconnect after controller/port power-up.
+const CONNECTION_TIMEOUT_MS: u64 = 1000;
+/// USB 2.0 requires a stable connection for at least 100 ms before reset.
+const CONNECTION_DEBOUNCE_MS: u64 = 100;
+
+async fn debounce_root_connection(mut connected: impl FnMut() -> bool) -> bool {
+    let timeout = Timeout::from_ms(CONNECTION_TIMEOUT_MS);
+    let mut stable: Option<Timeout> = None;
+    loop {
+        if connected() {
+            let debounce = stable.get_or_insert_with(|| Timeout::from_ms(CONNECTION_DEBOUNCE_MS));
+            if debounce.is_expired() {
+                return true;
+            }
+        } else {
+            // A bounce restarts debounce; it is not a failed enumeration
+            // attempt that should consume one of the root port retries.
+            stable = None;
+        }
+        if timeout.is_expired() {
+            return false;
+        }
+        exec::sleep_ms(10).await;
+    }
+}
+
 fn hub_descriptor_type(is_superspeed: bool) -> u8 {
     if is_superspeed {
         SUPER_SPEED_HUB_DESCRIPTOR_TYPE
@@ -159,6 +185,39 @@ fn device_moved(attached: bool, still_connected: bool) -> bool {
 #[cfg(test)]
 mod root_port_scan_tests {
     use super::*;
+
+    #[test]
+    fn transient_disconnect_restarts_root_debounce() {
+        use core::cell::Cell;
+
+        let polls = Cell::new(0);
+        assert!(exec::block_on(debounce_root_connection(|| {
+            polls.set(polls.get() + 1);
+            polls.get() != 2
+        })));
+        assert!(polls.get() > 2);
+    }
+
+    #[test]
+    fn initial_scan_waits_for_a_late_root_connection() {
+        use core::cell::Cell;
+
+        let mut scan = RootPortScan::new(4);
+        assert!(scan.take_new_connections(|_| false).is_empty());
+        let polls = Cell::new(0);
+        assert!(exec::block_on(scan.wait_for_new_connection(
+            Timeout::from_ms(CONNECTION_TIMEOUT_MS),
+            |port| {
+                if port != 1 {
+                    return false;
+                }
+                polls.set(polls.get() + 1);
+                polls.get() > 2
+            }
+        )));
+        assert_eq!(scan.take_new_connections(|port| port == 1), [1]);
+        assert!(scan.take_new_connections(|port| port == 1).is_empty());
+    }
 
     #[test]
     fn usb3_device_moving_from_usb2_port_is_picked_up_in_a_second_pass() {
@@ -476,139 +535,167 @@ impl super::XhciController {
 
         exec::sleep_ms(power_delay.max(100)).await;
 
-        // Check each port for connected devices
-        for p in 1..=num_ports {
-            let mut status_buf = [0u8; 4];
-            if self
-                .control_transfer(
+        // A powered hub does not imply its children have connected yet.
+        // Rescan absent ports for a bounded window, without resetting devices
+        // we already tried. Nested enumeration can outlast the deadline, so
+        // always make a final pass after it has expired.
+        let timeout = Timeout::from_ms(CONNECTION_TIMEOUT_MS);
+        let mut tried = 0u16;
+        let mut first_pass = true;
+        loop {
+            let final_pass = timeout.is_expired();
+            for p in 1..=num_ports {
+                let bit = 1u16 << p;
+                if tried & bit != 0 {
+                    continue;
+                }
+                let mut status_buf = [0u8; 4];
+                if let Err(error) = self.control_transfer(
                     hub_slot_id,
                     req_type::DIR_IN | req_type::TYPE_CLASS | req_type::RCPT_OTHER,
                     request::GET_STATUS,
                     0,
                     p as u16,
                     Some(&mut status_buf),
-                )
-                .is_err()
-            {
-                continue;
-            }
-
-            let port_status = u16::from_le_bytes([status_buf[0], status_buf[1]]);
-            if (port_status & hub_port_status::CONNECTION) == 0 {
-                continue;
-            }
-
-            log::info!("xHCI: Device on hub slot {} port {}", hub_slot_id, p);
-
-            // Clear connection change
-            let _ = self.control_transfer(
-                hub_slot_id,
-                req_type::DIR_OUT | req_type::TYPE_CLASS | req_type::RCPT_OTHER,
-                request::CLEAR_FEATURE,
-                hub_feature::C_PORT_CONNECTION,
-                p as u16,
-                None,
-            );
-
-            // Reset the port
-            let _ = self.control_transfer(
-                hub_slot_id,
-                req_type::DIR_OUT | req_type::TYPE_CLASS | req_type::RCPT_OTHER,
-                request::SET_FEATURE,
-                hub_feature::PORT_RESET,
-                p as u16,
-                None,
-            );
-
-            exec::sleep_ms(60).await;
-
-            // Poll for reset completion
-            let timeout = crate::time::Timeout::from_ms(500);
-            let mut speed = 0u8;
-            let mut reset_ok = false;
-            // Check status after the deadline too: other controllers may
-            // delay this task past it.
-            loop {
-                let mut sb = [0u8; 4];
-                if self
-                    .control_transfer(
-                        hub_slot_id,
-                        req_type::DIR_IN | req_type::TYPE_CLASS | req_type::RCPT_OTHER,
-                        request::GET_STATUS,
-                        0,
-                        p as u16,
-                        Some(&mut sb),
-                    )
-                    .is_err()
-                {
-                    break;
+                ) {
+                    tried |= bit;
+                    log::warn!("Hub {} port {} status failed: {:?}", hub_slot_id, p, error);
+                    continue;
                 }
-                let ps = u16::from_le_bytes([sb[0], sb[1]]);
-                let pc = u16::from_le_bytes([sb[2], sb[3]]);
 
-                if pc & 0x10 != 0 {
-                    // C_PORT_RESET
-                    let _ = self.control_transfer(
+                let port_status = u16::from_le_bytes([status_buf[0], status_buf[1]]);
+                if first_pass {
+                    log::debug!(
+                        "xHCI: Hub {} port {} status={:#06x} change={:#06x}",
                         hub_slot_id,
-                        req_type::DIR_OUT | req_type::TYPE_CLASS | req_type::RCPT_OTHER,
-                        request::CLEAR_FEATURE,
-                        hub_feature::C_PORT_RESET,
-                        p as u16,
-                        None,
+                        p,
+                        port_status,
+                        u16::from_le_bytes([status_buf[2], status_buf[3]])
                     );
-                    if ps & hub_port_status::ENABLE != 0 {
-                        if hub_is_superspeed {
-                            match self.superspeed_hub_port_speed(
-                                hub_slot_id,
-                                p,
-                                root_port,
-                                sublinks.as_ref(),
-                            ) {
-                                Ok(port_speed) => {
-                                    speed = port_speed;
-                                    reset_ok = true;
-                                }
-                                Err(error) => {
-                                    log::warn!("Hub port {} speed unavailable: {:?}", p, error)
-                                }
-                            }
-                        } else {
-                            speed = usb2_downstream_speed(ps);
-                            reset_ok = true;
-                        }
+                }
+                if (port_status & hub_port_status::CONNECTION) == 0 {
+                    continue;
+                }
+                tried |= bit;
+
+                log::info!("xHCI: Device on hub slot {} port {}", hub_slot_id, p);
+                exec::sleep_ms(CONNECTION_DEBOUNCE_MS).await;
+
+                // Clear connection change
+                let _ = self.control_transfer(
+                    hub_slot_id,
+                    req_type::DIR_OUT | req_type::TYPE_CLASS | req_type::RCPT_OTHER,
+                    request::CLEAR_FEATURE,
+                    hub_feature::C_PORT_CONNECTION,
+                    p as u16,
+                    None,
+                );
+
+                // Reset the port
+                let _ = self.control_transfer(
+                    hub_slot_id,
+                    req_type::DIR_OUT | req_type::TYPE_CLASS | req_type::RCPT_OTHER,
+                    request::SET_FEATURE,
+                    hub_feature::PORT_RESET,
+                    p as u16,
+                    None,
+                );
+
+                exec::sleep_ms(60).await;
+
+                // Poll for reset completion
+                let timeout = crate::time::Timeout::from_ms(500);
+                let mut speed = 0u8;
+                let mut reset_ok = false;
+                // Check status after the deadline too: other controllers may
+                // delay this task past it.
+                loop {
+                    let mut sb = [0u8; 4];
+                    if self
+                        .control_transfer(
+                            hub_slot_id,
+                            req_type::DIR_IN | req_type::TYPE_CLASS | req_type::RCPT_OTHER,
+                            request::GET_STATUS,
+                            0,
+                            p as u16,
+                            Some(&mut sb),
+                        )
+                        .is_err()
+                    {
+                        break;
                     }
-                    break;
+                    let ps = u16::from_le_bytes([sb[0], sb[1]]);
+                    let pc = u16::from_le_bytes([sb[2], sb[3]]);
+
+                    if pc & 0x10 != 0 {
+                        // C_PORT_RESET
+                        let _ = self.control_transfer(
+                            hub_slot_id,
+                            req_type::DIR_OUT | req_type::TYPE_CLASS | req_type::RCPT_OTHER,
+                            request::CLEAR_FEATURE,
+                            hub_feature::C_PORT_RESET,
+                            p as u16,
+                            None,
+                        );
+                        if ps & hub_port_status::ENABLE != 0 {
+                            if hub_is_superspeed {
+                                match self.superspeed_hub_port_speed(
+                                    hub_slot_id,
+                                    p,
+                                    root_port,
+                                    sublinks.as_ref(),
+                                ) {
+                                    Ok(port_speed) => {
+                                        speed = port_speed;
+                                        reset_ok = true;
+                                    }
+                                    Err(error) => {
+                                        log::warn!("Hub port {} speed unavailable: {:?}", p, error)
+                                    }
+                                }
+                            } else {
+                                speed = usb2_downstream_speed(ps);
+                                reset_ok = true;
+                            }
+                        }
+                        break;
+                    }
+                    if timeout.is_expired() {
+                        break;
+                    }
+                    exec::sleep_ms(10).await;
                 }
-                if timeout.is_expired() {
-                    break;
+
+                if !reset_ok {
+                    log::debug!("Hub port {} reset failed", p);
+                    continue;
                 }
+
                 exec::sleep_ms(10).await;
-            }
 
-            if !reset_ok {
-                log::debug!("Hub port {} reset failed", p);
-                continue;
-            }
+                // Build route string: parent's route | (port << (4 * tier))
+                // Find which nibble is the first zero (that's our tier)
+                let mut route = parent_route;
+                for tier in 0..5u32 {
+                    if (route >> (tier * 4)) & 0xF == 0 {
+                        route |= (p as u32 & 0xF) << (tier * 4);
+                        break;
+                    }
+                }
 
-            exec::sleep_ms(10).await;
-
-            // Build route string: parent's route | (port << (4 * tier))
-            // Find which nibble is the first zero (that's our tier)
-            let mut route = parent_route;
-            for tier in 0..5u32 {
-                if (route >> (tier * 4)) & 0xF == 0 {
-                    route |= (p as u32 & 0xF) << (tier * 4);
-                    break;
+                // Enable slot and address the downstream device
+                if let Err(e) = self
+                    .attach_device_on_hub(hub_slot_id, p, speed, route, root_port)
+                    .await
+                {
+                    log::warn!("Failed to attach device on hub port {}: {:?}", p, e);
                 }
             }
-
-            // Enable slot and address the downstream device
-            if let Err(e) = self
-                .attach_device_on_hub(hub_slot_id, p, speed, route, root_port)
-                .await
-            {
-                log::warn!("Failed to attach device on hub port {}: {:?}", p, e);
+            first_pass = false;
+            if final_pass || tried.count_ones() == u32::from(num_ports) {
+                break;
             }
+            exec::sleep_ms(10).await;
         }
 
         Ok(())
@@ -723,6 +810,16 @@ impl super::XhciController {
     /// Enumerate ports and attach devices
     pub(super) async fn enumerate_ports(&mut self) -> Result<(), XhciError> {
         let mut scan = RootPortScan::new(self.num_ports);
+        // The first root connection can arrive after the controller's short
+        // startup delay, even when no device has migrated between ports.
+        if !scan
+            .wait_for_new_connection(Timeout::from_ms(CONNECTION_TIMEOUT_MS), |port| {
+                self.portsc(port).current_connect_status()
+            })
+            .await
+        {
+            return Ok(());
+        }
 
         loop {
             let ports =
@@ -784,16 +881,7 @@ impl super::XhciController {
             return false;
         }
 
-        let mut stable_count = 0;
-        for _ in 0..5 {
-            if portsc().current_connect_status() {
-                stable_count += 1;
-            } else {
-                stable_count = 0;
-            }
-            exec::sleep_ms(10).await;
-        }
-        if stable_count < 3 {
+        if !debounce_root_connection(|| portsc().current_connect_status()).await {
             return false;
         }
 
