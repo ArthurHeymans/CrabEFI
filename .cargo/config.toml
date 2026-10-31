@@ -17,11 +17,13 @@ rustflags = [
     "--cfg", "sha2_backend_soft=\"compact\"",
 ]
 
+# AArch64: ARMv8 SHA-256 instructions. Measured boot hashes every loaded
+# image; the compact software hash makes that take seconds per kernel.
+# Requires FEAT_SHA256 (present on MT8196 and QEMU's cortex-a53/a72).
 [target.aarch64-unknown-none]
 rustflags = [
     "-C", "relocation-model=static",
-    "--cfg", "sha2_backend=\"soft\"",
-    "--cfg", "sha2_backend_soft=\"compact\"",
+    "-C", "target-feature=+sha2",
 ]
 
 [target.riscv64gc-unknown-none-elf]

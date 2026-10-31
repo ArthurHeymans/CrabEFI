@@ -194,6 +194,9 @@ fn runtime_rustflags(arch: Arch, map_path: &Path) -> OsString {
             OsString::from("-C"),
             OsString::from("target-feature=+reserve-x18"),
         ]);
+        // CARGO_ENCODED_RUSTFLAGS replaces .cargo/config.toml: repeat its
+        // SHA-256 instructions (authenticated variables hash too).
+        arguments.extend([OsString::from("-C"), OsString::from("target-feature=+sha2")]);
     }
     arguments.extend([
         OsString::from("-C"),
