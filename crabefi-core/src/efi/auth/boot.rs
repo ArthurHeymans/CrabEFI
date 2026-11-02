@@ -558,6 +558,13 @@ pub fn get_enrollment_summary() -> (usize, usize, usize, usize) {
 pub fn clear_all_keys() -> Result<(), AuthError> {
     log::warn!("Clearing all Secure Boot keys by physical-presence setup action!");
 
+    // Record the user's clear intent durably before deleting any keys. If
+    // clearing is interrupted after PK deletion, initialization must not
+    // mistake the partial state for a fresh store and re-enroll defaults.
+    if super::persist_secure_boot_enable_preference(false) != r_efi::efi::Status::SUCCESS {
+        return Err(AuthError::CryptoError);
+    }
+
     // Public SetVariable still rejects unsigned PK deletion in User Mode.
     // The setup-only authorization uses that same transactional service, so
     // persistence must succeed before the live policy enters Setup Mode.
@@ -590,9 +597,6 @@ pub fn clear_all_keys() -> Result<(), AuthError> {
     // An already-absent variable is an idempotent delete, but stale boot-only
     // caches must still be discarded.
     force_refresh_key_databases();
-    if super::persist_secure_boot_enable_preference(false) != r_efi::efi::Status::SUCCESS {
-        return Err(AuthError::CryptoError);
-    }
     update_status_variables()?;
     log::info!("All Secure Boot keys cleared - system in Setup Mode");
     Ok(())

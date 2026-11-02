@@ -99,6 +99,24 @@ impl StorageBackend for Region {
             _ => {}
         }
         let mut media = self.bytes.lock().unwrap();
+        #[cfg(feature = "secure-boot")]
+        if self.failure.load(Ordering::Relaxed) == 6 {
+            use crabefi_efi_types::secure_boot::{EFI_GLOBAL_VARIABLE_GUID, PK_NAME};
+            // Interrupt clear-all once the on-media PK deletion commits. Do
+            // not consult live runtime state while its transaction is active.
+            let mut data = vec![0; media.len()];
+            if varstore::edk2::read_variable_data_from_region(
+                &media,
+                &EFI_GLOBAL_VARIABLE_GUID,
+                PK_NAME,
+                &mut data,
+            )
+            .unwrap_or(0)
+                == 0
+            {
+                return Err(StorageError::IoError);
+            }
+        }
         let target = media
             .get_mut(offset as usize..offset as usize + bytes.len())
             .ok_or(StorageError::InvalidArgument)?;
@@ -238,6 +256,67 @@ fn enroll_keys_at_runtime(runtime: *mut efi::RuntimeServices) {
     }
 }
 
+/// Start without a saved preference, interrupt clearing after PK deletion,
+/// and reboot using only persistent media (not the old runtime's RAM).
+#[cfg(feature = "secure-boot")]
+fn interrupted_key_clear_survives_reset(config: RuntimePlatformConfig) {
+    use crabefi::efi::auth;
+    use crabefi_efi_types::secure_boot::{
+        EFI_GLOBAL_VARIABLE_GUID, SECURE_BOOT_ENABLE_NAME, SecureBootVariable,
+    };
+    let media = Arc::new(Mutex::new(vec![0xff; 64 * 1024]));
+    let writes = Arc::new(AtomicUsize::new(0));
+    let failure = Arc::new(AtomicUsize::new(0));
+    let boot = || {
+        let client = runtime_image::load(crabefi::BUNDLED_RUNTIME_IMAGE, config).unwrap();
+        runtime_image::install(client);
+        varstore::init_persistence(VariableStorage::Platform(Box::leak(Box::new(Region {
+            bytes: media.clone(),
+            writes: writes.clone(),
+            failure: failure.clone(),
+        }))))
+        .unwrap();
+        client.complete_import().unwrap();
+        client
+    };
+    boot();
+    auth::boot::enroll_and_persist_default_keys().unwrap();
+    let guid = efi::Guid::from_bytes(&EFI_GLOBAL_VARIABLE_GUID);
+    assert!(runtime_image::client::variables::get(&guid, SECURE_BOOT_ENABLE_NAME).is_none());
+    let media_before = media.lock().unwrap().clone();
+
+    // A failed intent write must prevent any key deletion.
+    failure.store(1, Ordering::Relaxed);
+    assert!(auth::boot::clear_all_keys().is_err());
+    assert!(!auth::is_setup_mode());
+    assert_eq!(*media.lock().unwrap(), media_before);
+    assert!(runtime_image::client::variables::get(&guid, SECURE_BOOT_ENABLE_NAME).is_none());
+
+    failure.store(6, Ordering::Relaxed);
+    assert!(auth::boot::clear_all_keys().is_err());
+    assert!(auth::is_setup_mode());
+    for variable in [SecureBootVariable::Kek, SecureBootVariable::Db] {
+        assert!(
+            runtime_image::client::variables::get(
+                &efi::Guid::from_bytes(variable.guid()),
+                variable.name(),
+            )
+            .is_some(),
+            "clearing must have been interrupted before deleting {variable:?}"
+        );
+    }
+
+    failure.store(0, Ordering::Relaxed);
+    let rebooted = boot();
+    let writes_before = writes.load(Ordering::Relaxed);
+    assert!(auth::boot::init_secure_boot_default().unwrap().setup_mode);
+    assert_eq!(secure_boot_flags(rebooted.runtime_services()), (1, 0, 0));
+    assert!(runtime_image::client::variables::get(&guid, SecureBootVariable::PK.name()).is_none());
+    assert_eq!(writes.load(Ordering::Relaxed), writes_before);
+    // The interrupted action remains retryable.
+    auth::boot::clear_all_keys().unwrap();
+}
+
 #[test]
 fn actual_loader_seal_svam_and_runtime_services_with_and_without_retained_staging() {
     let ram = Ram::new();
@@ -269,6 +348,10 @@ fn actual_loader_seal_svam_and_runtime_services_with_and_without_retained_stagin
             external_ranges: &[],
             deferred_buffer,
         };
+        #[cfg(feature = "secure-boot")]
+        if !retained {
+            interrupted_key_clear_survives_reset(config);
+        }
         let client = runtime_image::load(crabefi::BUNDLED_RUNTIME_IMAGE, config)
             .expect("actual core image loader");
         runtime_image::install(client);
