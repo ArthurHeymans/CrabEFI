@@ -187,6 +187,17 @@ fn runtime_rustflags(arch: Arch, map_path: &Path) -> OsString {
     if matches!(arch, Arch::Riscv64) {
         arguments.extend([OsString::from("-C"), OsString::from("link-arg=--no-relax")]);
     }
+    if matches!(arch, Arch::Aarch64) {
+        // UEFI (AArch64 calling convention, 2.3.6.4): x18 is reserved for the
+        // OS across runtime calls; Linux reports a firmware bug otherwise.
+        arguments.extend([
+            OsString::from("-C"),
+            OsString::from("target-feature=+reserve-x18"),
+        ]);
+        // CARGO_ENCODED_RUSTFLAGS replaces .cargo/config.toml: repeat its
+        // SHA-256 instructions (authenticated variables hash too).
+        arguments.extend([OsString::from("-C"), OsString::from("target-feature=+sha2")]);
+    }
     arguments.extend([
         OsString::from("-C"),
         OsString::from("linker=rust-lld"),

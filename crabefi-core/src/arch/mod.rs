@@ -11,6 +11,12 @@ pub mod x86_64;
 #[cfg(target_arch = "aarch64")]
 pub mod aarch64;
 
+// Exercise the architecture-independent trampoline encoding checks on the
+// host too; actual AArch64 execution remains compiled only for that target.
+#[cfg(all(test, not(target_arch = "aarch64")))]
+#[path = "aarch64/ns_switch.rs"]
+mod ns_switch_encoding_tests;
+
 #[cfg(target_arch = "riscv64")]
 pub mod riscv64;
 

@@ -13,34 +13,36 @@ const PSCI_SYSTEM_RESET: u32 = 0x8400_0009;
 /// PSCI SYSTEM_OFF function ID (SMC32 calling convention)
 const PSCI_SYSTEM_OFF: u32 = 0x8400_0008;
 
-/// Perform a system reset via PSCI
+/// Request a PSCI operation through the monitor at EL3.
 ///
-/// Issues an HVC (Hypervisor Call) to request a system reset.
-/// On QEMU SBSA, coreboot runs at EL2, so we use HVC to reach
-/// TF-A's PSCI handler at EL3. If HVC doesn't work (e.g., because
-/// PSCI is exposed via SMC conduit), fall back to SMC.
-///
-/// This function should not return.
-pub fn system_reset() -> ! {
-    // Try HVC first (coreboot on SBSA runs at EL2)
+/// At EL2, HVC does not reach EL3 and can take an undefined-instruction
+/// exception, so it cannot be used to probe for a conduit. Use SMC directly
+/// there. Retain the existing HVC-first path for EL1 under a hypervisor.
+fn psci_request(function: u32) {
+    let current_el: u64;
     unsafe {
+        core::arch::asm!("mrs {}, CurrentEL", out(reg) current_el,
+            options(nomem, nostack, preserves_flags));
+        if current_el == 4 {
+            core::arch::asm!(
+                "hvc #0",
+                inout("x0") u64::from(function) => _,
+                clobber_abi("C"),
+                options(nostack)
+            );
+        }
         core::arch::asm!(
-            "mov w0, {func_id:w}",
-            "hvc #0",
-            func_id = in(reg) PSCI_SYSTEM_RESET,
-            options(nomem, nostack)
-        );
-    }
-
-    // If HVC didn't work, try SMC
-    unsafe {
-        core::arch::asm!(
-            "mov w0, {func_id:w}",
             "smc #0",
-            func_id = in(reg) PSCI_SYSTEM_RESET,
-            options(nomem, nostack)
+            inout("x0") u64::from(function) => _,
+            clobber_abi("C"),
+            options(nostack)
         );
     }
+}
+
+/// Perform a system reset via PSCI. This function should not return.
+pub fn system_reset() -> ! {
+    psci_request(PSCI_SYSTEM_RESET);
 
     // If neither worked, halt
     loop {
@@ -52,18 +54,10 @@ pub fn system_reset() -> ! {
 
 /// Attempt system reset via keyboard controller
 ///
-/// On aarch64 this is a no-op; the equivalent is PSCI system_reset.
+/// On aarch64 this requests PSCI SYSTEM_RESET.
 /// Provided for API compatibility with x86.
 pub fn keyboard_controller_reset() {
-    // PSCI system_reset is the aarch64 equivalent
-    unsafe {
-        core::arch::asm!(
-            "mov w0, {func_id:w}",
-            "hvc #0",
-            func_id = in(reg) PSCI_SYSTEM_RESET,
-            options(nomem, nostack)
-        );
-    }
+    psci_request(PSCI_SYSTEM_RESET);
 }
 
 /// Force a system reset (equivalent to x86 triple fault)
@@ -75,25 +69,9 @@ pub fn triple_fault() -> ! {
 
 /// Perform a system shutdown via PSCI
 ///
-/// Issues an HVC/SMC to request system power off.
+/// Issues a PSCI request for system power off.
 pub fn system_off() -> ! {
-    unsafe {
-        core::arch::asm!(
-            "mov w0, {func_id:w}",
-            "hvc #0",
-            func_id = in(reg) PSCI_SYSTEM_OFF,
-            options(nomem, nostack)
-        );
-    }
-
-    unsafe {
-        core::arch::asm!(
-            "mov w0, {func_id:w}",
-            "smc #0",
-            func_id = in(reg) PSCI_SYSTEM_OFF,
-            options(nomem, nostack)
-        );
-    }
+    psci_request(PSCI_SYSTEM_OFF);
 
     loop {
         unsafe {
