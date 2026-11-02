@@ -219,6 +219,10 @@ pub trait SpiController {
 }
 
 /// Enum containing an rflasher Intel/AMD controller or CrabEFI QEMU pflash.
+#[allow(
+    clippy::large_enum_variant,
+    reason = "the boot-lifetime controller is stored statically; avoid a heap allocation"
+)]
 pub enum AnySpiController {
     Intel(rflasher_internal::IchSpiController<CrabEfiPciAccess>),
     Amd(rflasher_internal::Spi100Controller<CrabEfiPciAccess>),
