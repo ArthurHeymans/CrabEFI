@@ -69,7 +69,7 @@ static KEY_DATABASE_SNAPSHOTS: spin::Mutex<[DatabaseSnapshot; 4]> =
 /// Secure Boot initialization configuration
 #[derive(Debug, Clone)]
 pub struct SecureBootConfig {
-    /// Whether to automatically enroll default Microsoft keys if none exist
+    /// Whether to enroll defaults on a fresh store with no saved user choice.
     pub auto_enroll_defaults: bool,
     /// Whether to enable Secure Boot after enrollment
     pub enable_secure_boot: bool,
@@ -113,7 +113,16 @@ pub fn init_secure_boot(config: &SecureBootConfig) -> Result<EnrollmentStatus, A
         log::info!("Secure Boot: In Setup Mode (no PK enrolled)");
 
         // Step 3: Optionally enroll default keys
-        if config.auto_enroll_defaults {
+        // A saved preference also records an explicit setup choice. In
+        // particular, clear-all persists false so a later boot must not
+        // silently re-enroll the keys the user deliberately removed.
+        if config.auto_enroll_defaults
+            && get_variable_data(
+                &Guid::from_bytes(&EFI_GLOBAL_VARIABLE_GUID),
+                SECURE_BOOT_ENABLE_NAME,
+            )
+            .is_none()
+        {
             log::info!("Auto-enrolling Microsoft default keys...");
             match enroll_and_persist_default_keys() {
                 Ok(()) => {
@@ -132,13 +141,13 @@ pub fn init_secure_boot(config: &SecureBootConfig) -> Result<EnrollmentStatus, A
 
     // Step 5: Load and apply SecureBootEnable preference from persistent storage
     // This is the user's saved preference from previous boot
-    if !is_setup_mode() {
-        if config.enable_secure_boot && !load_secure_boot_enable_preference() {
-            super::enable_secure_boot();
-        }
-        if super::is_secure_boot_enabled() {
-            log::info!("Secure Boot: Enabled (from persisted preference)");
-        }
+    if config.enable_secure_boot && !load_secure_boot_enable_preference() {
+        super::enable_secure_boot().map_err(|_| AuthError::CryptoError)?;
+    }
+    if super::is_secure_boot_enabled() {
+        log::info!("Secure Boot: Enabled (from persisted preference)");
+    } else if super::is_secure_boot_requested() {
+        log::info!("Secure Boot: Preference enabled, awaiting PK enrollment");
     }
 
     // Return final enrollment status
@@ -151,12 +160,7 @@ pub fn init_secure_boot(config: &SecureBootConfig) -> Result<EnrollmentStatus, A
 /// Called during boot initialization and by
 /// `handle_secure_boot_variable_update()` when PK is enrolled at runtime.
 pub fn load_secure_boot_enable_preference() -> bool {
-    if let Some(data) = get_variable_data(
-        &Guid::from_bytes(&EFI_GLOBAL_VARIABLE_GUID),
-        SECURE_BOOT_ENABLE_NAME,
-    ) && !data.is_empty()
-        && data[0] == 1
-    {
+    if super::is_secure_boot_requested() {
         log::debug!("Loaded SecureBootEnable preference: enabled");
         return true;
     }
@@ -554,22 +558,20 @@ pub fn get_enrollment_summary() -> (usize, usize, usize, usize) {
 pub fn clear_all_keys() -> Result<(), AuthError> {
     log::warn!("Clearing all Secure Boot keys by physical-presence setup action!");
 
-    // Public SetVariable correctly rejects an unsigned PK deletion in User
-    // Mode, even when signature verification has been disabled. Firmware setup
-    // is the physical-presence authority, so remove PK through the privileged
-    // pre-boot persistence/import path first. This transitions the live policy
-    // into Setup Mode; the remaining databases can then use ordinary unsigned
-    // SetVariable deletes.
+    // Record the user's clear intent durably before deleting any keys. If
+    // clearing is interrupted after PK deletion, initialization must not
+    // mistake the partial state for a fresh store and re-enroll defaults.
+    if super::persist_secure_boot_enable_preference(false) != r_efi::efi::Status::SUCCESS {
+        return Err(AuthError::CryptoError);
+    }
+
+    // Public SetVariable still rejects unsigned PK deletion in User Mode.
+    // The setup-only authorization uses that same transactional service, so
+    // persistence must succeed before the live policy enters Setup Mode.
     if !is_setup_mode() {
-        let guid = Guid::from_bytes(&EFI_GLOBAL_VARIABLE_GUID);
-        if crate::efi::varstore::persistence::persist_firmware_variable(
-            &guid,
-            PK_NAME,
-            SECURE_BOOT_KEY_ATTRS,
-            &[],
-        )
-        .is_err()
-        {
+        let status = crate::efi::runtime_image::bridge::delete_pk_from_setup();
+        if status != r_efi::efi::Status::SUCCESS {
+            log::error!("Setup PK deletion failed: {:?}", status);
             force_refresh_key_databases();
             return Err(AuthError::CryptoError);
         }

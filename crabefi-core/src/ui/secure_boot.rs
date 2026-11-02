@@ -149,19 +149,7 @@ pub fn show(fb: &FramebufferInfo) -> ScreenNav {
 fn handle_action(idx: usize) -> Option<(&'static str, bool)> {
     use crate::efi::auth;
     match idx {
-        0 => {
-            if auth::is_secure_boot_enabled() {
-                auth::disable_secure_boot();
-                Some(("Secure Boot disabled", true))
-            } else {
-                auth::enable_secure_boot();
-                if auth::is_secure_boot_enabled() {
-                    Some(("Secure Boot enabled", true))
-                } else {
-                    Some(("Cannot enable: no PK enrolled", false))
-                }
-            }
-        }
+        0 => Some(crate::secure_boot_menu::toggle_secure_boot_action()),
         1 => {
             if !auth::is_setup_mode() {
                 Some(("Keys already enrolled", false))
@@ -199,7 +187,7 @@ fn action_hit(fb: &FramebufferInfo, scroll_offset: usize) -> Option<usize> {
 const ACTION_ITEMS: [(&str, &str); ACTION_COUNT] = [
     (
         "Toggle Secure Boot",
-        "Enable or disable signature verification",
+        "Save preference; enroll PK to start enforcing",
     ),
     (
         "Enroll Default Keys",
@@ -410,8 +398,9 @@ fn draw_screen(
     y += render::font_height(FontSize::Display) as i32 + 16;
 
     // ── Hero state card ──
-    let sb_on = crate::efi::auth::is_secure_boot_enabled();
-    let setup_mode = crate::efi::auth::is_setup_mode();
+    let state = crate::efi::auth::secure_boot_state();
+    let sb_on = state.enforcing;
+    let setup_mode = state.setup_mode;
     let enroll = crate::efi::auth::enrollment::get_enrollment_status();
 
     let state_h = 56u32;
@@ -419,17 +408,19 @@ fn draw_screen(
 
     let state_color = if sb_on {
         theme::SECONDARY
+    } else if state.requested {
+        theme::ORANGE
     } else {
         theme::ERROR
     };
     render::fill_rect(fb, cx, y, theme::ACCENT_BAR, state_h, state_color);
 
-    let state_label = if sb_on { "ACTIVE" } else { "INACTIVE" };
+    let state_label = crate::secure_boot_menu::secure_boot_state_label(state);
     render::draw_text_spaced(
         fb,
         cx + 16,
         y + 6,
-        "CURRENT STATE",
+        "ENFORCEMENT",
         FontSize::Small,
         1,
         theme::OUTLINE,

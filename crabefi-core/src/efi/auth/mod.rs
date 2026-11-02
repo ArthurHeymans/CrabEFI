@@ -156,6 +156,47 @@ pub fn is_secure_boot_enabled() -> bool {
         == Some(1)
 }
 
+/// Saved user preference, independent of whether a PK is enrolled.
+#[cfg(feature = "secure-boot")]
+pub fn is_secure_boot_requested() -> bool {
+    crate::efi::runtime_image::client::variables::get(
+        &Guid::from_bytes(&EFI_GLOBAL_VARIABLE_GUID),
+        SECURE_BOOT_ENABLE_NAME,
+    )
+    .and_then(|(_, data)| data.first().copied())
+        == Some(1)
+}
+
+/// Setup UI state: the requested policy is not the effective UEFI status.
+#[cfg(feature = "secure-boot")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SecureBootState {
+    pub requested: bool,
+    pub setup_mode: bool,
+    pub enforcing: bool,
+}
+
+#[cfg(feature = "secure-boot")]
+pub fn secure_boot_state() -> SecureBootState {
+    SecureBootState {
+        requested: is_secure_boot_requested(),
+        setup_mode: is_setup_mode(),
+        enforcing: is_secure_boot_enabled(),
+    }
+}
+
+/// Toggle the saved preference, including while waiting for PK enrollment.
+/// Both setup interfaces use this action rather than toggling enforcement.
+#[cfg(feature = "secure-boot")]
+pub fn toggle_secure_boot() -> Result<SecureBootState, r_efi::efi::Status> {
+    if is_secure_boot_requested() {
+        disable_secure_boot()?;
+    } else {
+        enable_secure_boot()?;
+    }
+    Ok(secure_boot_state())
+}
+
 /// Verify a PE image after refreshing disposable boot-only key caches through
 /// the standard Runtime Services GetVariable entry point.
 #[cfg(feature = "secure-boot")]
@@ -179,29 +220,35 @@ pub fn enter_setup_mode() {
     log::info!("Secure Boot: Entering Setup Mode");
 }
 
-/// Enable Secure Boot (only valid in User Mode).
+/// Request Secure Boot. In Setup Mode enforcement stays off until PK enrollment.
 #[cfg(feature = "secure-boot")]
-pub fn enable_secure_boot() {
-    if !is_setup_mode() {
-        persist_secure_boot_enable_preference(true);
-        if is_secure_boot_enabled() {
-            log::info!("Secure Boot: Enabled");
-        }
+pub fn enable_secure_boot() -> Result<(), r_efi::efi::Status> {
+    let status = persist_secure_boot_enable_preference(true);
+    if status != r_efi::efi::Status::SUCCESS {
+        return Err(status);
     }
+    if is_secure_boot_enabled() {
+        log::info!("Secure Boot: Enabled");
+    } else {
+        log::info!("Secure Boot: Enabled preference, awaiting PK enrollment");
+    }
+    Ok(())
 }
 
-/// Disable Secure Boot.
+/// Disable the saved preference and enforcement.
 #[cfg(feature = "secure-boot")]
-pub fn disable_secure_boot() {
-    persist_secure_boot_enable_preference(false);
-    if !is_secure_boot_enabled() {
-        log::info!("Secure Boot: Disabled");
+pub fn disable_secure_boot() -> Result<(), r_efi::efi::Status> {
+    let status = persist_secure_boot_enable_preference(false);
+    if status != r_efi::efi::Status::SUCCESS {
+        return Err(status);
     }
+    log::info!("Secure Boot: Disabled");
+    Ok(())
 }
 
 /// Persist the SecureBootEnable preference to non-volatile storage
 #[cfg(feature = "secure-boot")]
-fn persist_secure_boot_enable_preference(enabled: bool) {
+fn persist_secure_boot_enable_preference(enabled: bool) -> r_efi::efi::Status {
     let value: u8 = if enabled { 1 } else { 0 };
     let status = crate::efi::runtime_image::client::variables::set(
         &Guid::from_bytes(&EFI_GLOBAL_VARIABLE_GUID),
@@ -217,6 +264,7 @@ fn persist_secure_boot_enable_preference(enabled: bool) {
             status
         );
     }
+    status
 }
 
 // ============================================================================

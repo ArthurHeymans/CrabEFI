@@ -31,9 +31,7 @@ impl MenuOption {
     fn label(&self, secure_boot_enabled: bool, setup_mode: bool) -> &'static str {
         match self {
             MenuOption::ToggleSecureBoot => {
-                if setup_mode {
-                    "Enable Secure Boot (unavailable in Setup Mode)"
-                } else if secure_boot_enabled {
+                if secure_boot_enabled {
                     "Disable Secure Boot"
                 } else {
                     "Enable Secure Boot"
@@ -61,12 +59,12 @@ impl MenuOption {
 
     fn is_enabled(&self, _secure_boot_enabled: bool, setup_mode: bool) -> bool {
         match self {
-            MenuOption::ToggleSecureBoot => !setup_mode, // Can only toggle in User Mode
+            MenuOption::ToggleSecureBoot => true, // Preference is valid in Setup Mode too
             MenuOption::EnrollDefaultKeys => setup_mode, // Can only enroll in Setup Mode
-            MenuOption::EnrollCustomPK => setup_mode,    // Can only enroll in Setup Mode
-            MenuOption::ImportDbxUpdate => true,         // Can import dbx anytime
-            MenuOption::ClearAllKeys => true,            // Always available
-            MenuOption::ReturnToBootMenu => true,        // Always available
+            MenuOption::EnrollCustomPK => setup_mode, // Can only enroll in Setup Mode
+            MenuOption::ImportDbxUpdate => true,  // Can import dbx anytime
+            MenuOption::ClearAllKeys => true,     // Always available
+            MenuOption::ReturnToBootMenu => true, // Always available
         }
     }
 }
@@ -94,7 +92,9 @@ pub fn show_secure_boot_menu() {
     loop {
         // Get current state
         let setup_mode = auth::is_setup_mode();
-        let secure_boot_enabled = auth::is_secure_boot_enabled();
+        // Action labels/toggles follow the saved preference. Enforcement is
+        // rendered separately and remains off in Setup Mode.
+        let secure_boot_enabled = auth::is_secure_boot_requested();
         let (pk_count, kek_count, db_count, dbx_count) = secure_boot::get_enrollment_summary();
 
         // Clear and draw
@@ -143,13 +143,7 @@ pub fn show_secure_boot_menu() {
                         // Execute the action
                         match option {
                             MenuOption::ToggleSecureBoot => {
-                                if secure_boot_enabled {
-                                    auth::disable_secure_boot();
-                                    status_message = Some(("Secure Boot disabled", true));
-                                } else {
-                                    auth::enable_secure_boot();
-                                    status_message = Some(("Secure Boot enabled", true));
-                                }
+                                status_message = Some(toggle_secure_boot_action());
                                 // Update status variables
                                 let _ = secure_boot::update_status_variables();
                             }
@@ -272,6 +266,27 @@ pub fn show_secure_boot_menu() {
             }
             delay_ms(10);
         }
+    }
+}
+
+/// Shared action for graphical and text setup; report persistence failures.
+pub(crate) fn toggle_secure_boot_action() -> (&'static str, bool) {
+    match auth::toggle_secure_boot() {
+        Ok(state) if !state.requested => ("Secure Boot disabled", true),
+        Ok(state) if state.enforcing => ("Secure Boot enabled", true),
+        Ok(_) => ("Secure Boot enabled; awaiting PK enrollment", true),
+        Err(_) => ("Failed to save Secure Boot preference", false),
+    }
+}
+
+/// Effective state displayed independently from the requested preference.
+pub(crate) fn secure_boot_state_label(state: auth::SecureBootState) -> &'static str {
+    if state.enforcing {
+        "ACTIVE"
+    } else if state.requested {
+        "AWAITING PK"
+    } else {
+        "DISABLED"
     }
 }
 
@@ -412,11 +427,12 @@ fn draw_status(
     } else {
         "User Mode"
     };
-    let sb_str = if secure_boot_enabled {
-        "ENABLED"
-    } else {
-        "Disabled"
-    };
+    let enforcing = auth::is_secure_boot_enabled();
+    let sb_str = secure_boot_state_label(auth::SecureBootState {
+        requested: secure_boot_enabled,
+        setup_mode,
+        enforcing,
+    });
 
     // Mode color: yellow for setup, green for user
     let mode_color = if setup_mode {
@@ -425,9 +441,10 @@ fn draw_status(
         Color::new(0, 255, 0)
     };
 
-    // Secure boot color: green if enabled, red if disabled
-    let sb_color = if secure_boot_enabled {
+    let sb_color = if enforcing {
         Color::new(0, 255, 0)
+    } else if secure_boot_enabled {
+        Color::new(255, 190, 0)
     } else {
         Color::new(255, 100, 100)
     };
@@ -446,8 +463,10 @@ fn draw_status(
     serial_driver::write_str("\x1b[0m\r\n");
 
     serial_driver::write_str("    Secure Boot: ");
-    if secure_boot_enabled {
+    if enforcing {
         serial_driver::write_str("\x1b[32m"); // Green
+    } else if secure_boot_enabled {
+        serial_driver::write_str("\x1b[33m"); // Pending enrollment
     } else {
         serial_driver::write_str("\x1b[31m"); // Red
     }
@@ -566,4 +585,52 @@ fn draw_status_message(
     is_success: bool,
 ) {
     menu_common::draw_status_message(row, message, is_success, fb_console);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn setup_mode_can_enable_and_disable_the_pending_preference() {
+        let option = MenuOption::ToggleSecureBoot;
+        for setup in [false, true] {
+            assert!(option.is_enabled(false, setup));
+            assert!(option.is_enabled(true, setup));
+            assert_eq!(option.label(false, setup), "Enable Secure Boot");
+            assert_eq!(option.label(true, setup), "Disable Secure Boot");
+        }
+    }
+
+    #[test]
+    fn displayed_pending_state_is_not_reported_as_active_enforcement() {
+        for (state, label) in [
+            (
+                auth::SecureBootState {
+                    requested: false,
+                    setup_mode: true,
+                    enforcing: false,
+                },
+                "DISABLED",
+            ),
+            (
+                auth::SecureBootState {
+                    requested: true,
+                    setup_mode: true,
+                    enforcing: false,
+                },
+                "AWAITING PK",
+            ),
+            (
+                auth::SecureBootState {
+                    requested: true,
+                    setup_mode: false,
+                    enforcing: true,
+                },
+                "ACTIVE",
+            ),
+        ] {
+            assert_eq!(secure_boot_state_label(state), label);
+        }
+    }
 }

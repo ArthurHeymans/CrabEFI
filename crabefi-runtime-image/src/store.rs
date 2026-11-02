@@ -415,11 +415,26 @@ impl VariableStore {
             return Ok(());
         }
 
+        // Slot order differs from payload order after replacing a variable.
+        // Compact in increasing source-offset order so every move is leftward
+        // and cannot overwrite another live payload before it is read. The
+        // bounded scan needs only one flag per slot, not a second arena.
+        let mut moved = [false; MAX_VARIABLES];
         let mut used = 0usize;
-        for (index, slot) in self.slots.iter_mut().enumerate() {
-            if index == prepared.slot || slot.in_use == 0 {
-                continue;
-            }
+        loop {
+            let next = self
+                .slots
+                .iter()
+                .zip(&moved)
+                .enumerate()
+                .filter(|(index, (slot, done))| {
+                    *index != prepared.slot && slot.in_use != 0 && !**done
+                })
+                .min_by_key(|(_, (slot, _))| slot.data_offset)
+                .map(|(index, _)| index);
+            let Some(index) = next else { break };
+            let slot = self.slots.get_mut(index).ok_or(Status::DEVICE_ERROR)?;
+            *moved.get_mut(index).ok_or(Status::DEVICE_ERROR)? = true;
             let old = slot.data_offset as usize;
             let len = usize::from(slot.data_len);
             let old_end = old.checked_add(len).ok_or(Status::DEVICE_ERROR)?;
@@ -428,15 +443,10 @@ impl VariableStore {
                 return Err(Status::DEVICE_ERROR);
             }
             if old != used {
+                let arena = self.arena.as_mut_ptr();
                 // SAFETY: both source and destination ranges were checked
                 // against the arena above. `ptr::copy` permits overlap.
-                unsafe {
-                    core::ptr::copy(
-                        self.arena.as_ptr().add(old),
-                        self.arena.as_mut_ptr().add(used),
-                        len,
-                    );
-                }
+                unsafe { core::ptr::copy(arena.add(old), arena.add(used), len) };
                 slot.data_offset = used as u32;
             }
             used = new_end;
@@ -501,5 +511,98 @@ impl VariableStore {
                 .map(|(_, variable)| usize::from(variable.data_len))
                 .sum(),
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn compaction_preserves_payloads_after_replacement_reorders_slots() {
+        let mut store = VariableStore::new();
+        let mut transaction = VariableTransaction::new();
+        let guid = [0x77; 16];
+        let names = [[b'A' as u16], [b'B' as u16], [b'C' as u16]];
+        let attributes =
+            VariableAttributes::BOOTSERVICE_ACCESS | VariableAttributes::RUNTIME_ACCESS;
+        let mut expected = [std::vec![0xa1; 17], std::vec![1], std::vec![0xc3; 31]];
+        for (name, data) in names.iter().zip(&expected) {
+            store
+                .import(&mut transaction, guid, name, attributes, data, None)
+                .unwrap();
+        }
+        // Updating A moves its data past B and C without changing its slot.
+        // Updating C must not move A over B's still-unread source bytes.
+        for (round, (index, len)) in [(0, 1), (2, 48), (1, 3), (0, 62), (1, 5), (2, 11)]
+            .into_iter()
+            .enumerate()
+        {
+            expected[index] = std::vec![0xb0 + round as u8; len];
+            store
+                .import(
+                    &mut transaction,
+                    guid,
+                    &names[index],
+                    attributes,
+                    &expected[index],
+                    None,
+                )
+                .unwrap();
+            for (name, expected) in names.iter().zip(&expected) {
+                let slot = store.find(&guid, name, false).unwrap();
+                assert_eq!(
+                    store.data(slot),
+                    Some(expected.as_slice()),
+                    "name={name:?}, round={round}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn compaction_matches_reference_across_deletions_and_slot_reuse() {
+        let mut store = VariableStore::new();
+        let mut transaction = VariableTransaction::new();
+        let guid = [0x77; 16];
+        let attributes =
+            VariableAttributes::BOOTSERVICE_ACCESS | VariableAttributes::RUNTIME_ACCESS;
+        let mut expected: [std::vec::Vec<u8>; 8] = core::array::from_fn(|_| std::vec::Vec::new());
+        let mut random = 0x12345678u32;
+        for step in 0..256 {
+            random = random.wrapping_mul(1664525).wrapping_add(1013904223);
+            let index = (random >> 24) as usize % expected.len();
+            let len = if step % 5 == 0 {
+                0
+            } else {
+                1 + ((random >> 8) as usize % 97)
+            };
+            if len == 0 && expected[index].is_empty() {
+                continue;
+            }
+            expected[index] = std::vec![step as u8; len];
+            store
+                .import(
+                    &mut transaction,
+                    guid,
+                    &[b'A' as u16 + index as u16],
+                    attributes,
+                    &expected[index],
+                    None,
+                )
+                .unwrap();
+            for (index, expected) in expected.iter().enumerate() {
+                let actual = store.find(&guid, &[b'A' as u16 + index as u16], false);
+                if expected.is_empty() {
+                    assert!(actual.is_none());
+                } else {
+                    assert_eq!(
+                        store.data(actual.unwrap()),
+                        Some(expected.as_slice()),
+                        "index={index}, step={step}"
+                    );
+                }
+            }
+        }
     }
 }
