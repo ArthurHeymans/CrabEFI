@@ -49,6 +49,19 @@ fn init_storage_subsystem() {
     timestamp::record(timestamp::TS_CRABEFI_STORAGE_INIT_DONE);
 }
 
+/// Choose a usable menu and avoid waiting forever without a framebuffer.
+///
+/// A serial driver may be output-only or fail after the menu starts, so its
+/// presence cannot guarantee that an indefinitely waiting menu is usable.
+fn menu_configuration(ui: bool, framebuffer: bool, timeout: u32) -> (bool, u32) {
+    let timeout = if !framebuffer && timeout == 0 {
+        5
+    } else {
+        timeout
+    };
+    (ui && framebuffer, timeout)
+}
+
 /// Run the UEFI boot manager.
 ///
 /// Implements the boot dispatch sequence from UEFI Specification Section 3.1:
@@ -167,16 +180,28 @@ pub(crate) fn run(boot_var_state: boot_vars::BootVarState) {
         return;
     }
 
-    // Apply Timeout variable to the menu
+    let (graphical, timeout_seconds) = menu_configuration(
+        cfg!(feature = "ui"),
+        crate::handoff::framebuffer().is_some(),
+        timeout_seconds,
+    );
     boot_menu.set_timeout(timeout_seconds);
 
     log::debug!("Showing boot menu...");
 
-    // Use graphical UI when feature is enabled, text menu otherwise
+    // The graphical menu requires a framebuffer; the text menu also works
+    // headlessly and will boot the selected entry when its timeout expires.
     #[cfg(feature = "ui")]
-    let selected = crate::ui::show_graphical_menu(&mut boot_menu);
+    let selected = if graphical {
+        crate::ui::show_graphical_menu(&mut boot_menu)
+    } else {
+        menu::show_menu(&mut boot_menu)
+    };
     #[cfg(not(feature = "ui"))]
-    let selected = menu::show_menu(&mut boot_menu);
+    let selected = {
+        let _ = graphical;
+        menu::show_menu(&mut boot_menu)
+    };
     log::info!("Menu returned: {:?}", selected);
 
     if let Some(selected_index) = selected {
@@ -195,6 +220,25 @@ pub(crate) fn run(boot_var_state: boot_vars::BootVarState) {
     }
 
     log::info!("Boot manager finished");
+}
+
+#[cfg(test)]
+mod menu_configuration_tests {
+    use super::menu_configuration;
+
+    #[test]
+    fn graphical_menu_requires_a_framebuffer() {
+        assert_eq!(menu_configuration(true, true, 0), (true, 0));
+        assert_eq!(menu_configuration(true, false, 7), (false, 7));
+        assert_eq!(menu_configuration(false, true, 0), (false, 0));
+    }
+
+    #[test]
+    fn headless_menu_never_waits_indefinitely() {
+        assert_eq!(menu_configuration(true, false, 0), (false, 5));
+        assert_eq!(menu_configuration(false, false, 0), (false, 5));
+        assert_eq!(menu_configuration(true, false, 12), (false, 12));
+    }
 }
 
 /// Attempt to boot a Boot#### load option.
