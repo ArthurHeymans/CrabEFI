@@ -9,24 +9,28 @@
 //! Dependency evaluation is supported: options whose dependencies are not
 //! met are hidden or shown as inactive according to their flags.
 
+#[cfg(feature = "ui")]
+use crate::FramebufferConfig as FramebufferInfo;
 use crate::cfr::{self, CfrInfo, CfrOption, CfrOptionType, CfrValue};
+use crate::drivers::serial as serial_driver;
+use crate::framebuffer_console::{
+    Color, DEFAULT_BG, DEFAULT_FG, FramebufferConsole, HIGHLIGHT_BG, HIGHLIGHT_FG,
+};
+use crate::menu_common::{self, KeyPress, SerialWriter};
+use crate::time::delay_ms;
+#[cfg(feature = "ui")]
+use crate::ui::{self, NavItem, render, theme};
 use alloc::string::String;
 use alloc::vec::Vec;
 use core::fmt::Write;
-#[cfg(feature = "ui")]
-use crabefi::FramebufferConfig as FramebufferInfo;
-use crabefi::drivers::serial as serial_driver;
-use crabefi::framebuffer_console::{
-    Color, DEFAULT_BG, DEFAULT_FG, FramebufferConsole, HIGHLIGHT_BG, HIGHLIGHT_FG,
-};
-use crabefi::menu_common::{self, KeyPress, SerialWriter};
-use crabefi::time::delay_ms;
-#[cfg(feature = "ui")]
-use crabefi::ui::{self, NavItem, render, theme};
 
 use heapless::String as StackString;
 #[cfg(feature = "ui")]
 use render::{FontSize, Rgb};
+
+/// A screen rectangle: x, y, width, height.
+#[cfg(feature = "ui")]
+type Rect = (i32, i32, u32, u32);
 
 /// Menu title
 const MENU_TITLE: &str = "Firmware Settings";
@@ -114,12 +118,12 @@ pub fn show_cfr_menu() {
     };
 
     #[cfg(feature = "ui")]
-    if let Some(fb) = crabefi::handoff::framebuffer() {
+    if let Some(fb) = crate::handoff::framebuffer() {
         show_cfr_menu_graphical(cfr_info, &fb);
         return;
     }
 
-    let fb_info = crabefi::handoff::framebuffer();
+    let fb_info = crate::handoff::framebuffer();
     let mut fb_console = fb_info.as_ref().map(FramebufferConsole::new);
 
     let mut items = build_menu_items(cfr_info);
@@ -239,7 +243,7 @@ fn build_menu_items(cfr: &CfrInfo) -> Vec<MenuItem> {
     let mut crabefi_name = String::new();
     crabefi_name.push_str("CrabEFI");
     items.push(MenuItem::FormHeader { name: crabefi_name });
-    let current_level = crabefi::logger::configured_level();
+    let current_level = crate::logger::configured_level();
     items.push(MenuItem::CrabLogLevel {
         current_level,
         original_level: current_level,
@@ -496,9 +500,9 @@ fn increment_option(cfr: &CfrInfo, items: &mut [MenuItem], index: usize) -> bool
     }
 
     if let Some(MenuItem::CrabLogLevel { current_level, .. }) = items.get_mut(index) {
-        let current_idx = crabefi::logger::level_index(*current_level);
-        let next_idx = (current_idx + 1) % crabefi::logger::LEVEL_CHOICES.len();
-        *current_level = crabefi::logger::LEVEL_CHOICES[next_idx];
+        let current_idx = crate::logger::level_index(*current_level);
+        let next_idx = (current_idx + 1) % crate::logger::LEVEL_CHOICES.len();
+        *current_level = crate::logger::LEVEL_CHOICES[next_idx];
         return true;
     }
 
@@ -558,13 +562,13 @@ fn decrement_option(cfr: &CfrInfo, items: &mut [MenuItem], index: usize) -> bool
     }
 
     if let Some(MenuItem::CrabLogLevel { current_level, .. }) = items.get_mut(index) {
-        let current_idx = crabefi::logger::level_index(*current_level);
+        let current_idx = crate::logger::level_index(*current_level);
         let prev_idx = if current_idx == 0 {
-            crabefi::logger::LEVEL_CHOICES.len().saturating_sub(1)
+            crate::logger::LEVEL_CHOICES.len().saturating_sub(1)
         } else {
             current_idx - 1
         };
-        *current_level = crabefi::logger::LEVEL_CHOICES[prev_idx];
+        *current_level = crate::logger::LEVEL_CHOICES[prev_idx];
         return true;
     }
 
@@ -632,7 +636,7 @@ fn save_all_changes(cfr: &CfrInfo, items: &[MenuItem]) -> (usize, usize) {
                 current_level,
                 original_level,
             } if current_level != original_level => {
-                match crabefi::logger::set_configured_level(*current_level) {
+                match crate::logger::set_configured_level(*current_level) {
                     Ok(()) => saved += 1,
                     Err(e) => {
                         log::warn!("Failed to save CrabEFI log level: {:?}", e);
@@ -848,7 +852,7 @@ fn show_cfr_menu_graphical(cfr_info: &CfrInfo, fb: &FramebufferInfo) {
         return;
     }
 
-    let mut cursor = crabefi::cursor::CursorRenderer::new();
+    let mut cursor = crate::cursor::CursorRenderer::new();
     let mut state = GraphicalState::new(find_first_selectable(cfr_info, &items, 0));
 
     draw_graphical_menu(cfr_info, &items, &state, fb);
@@ -916,7 +920,7 @@ fn show_cfr_menu_graphical(cfr_info: &CfrInfo, fb: &FramebufferInfo) {
                     state.status_message = Some(("Already in firmware settings", true));
                 }
                 KeyPress::Char('r') | KeyPress::Char('R') => {
-                    crabefi::reset_system();
+                    crate::reset_system();
                 }
                 KeyPress::Escape | KeyPress::Char('q') | KeyPress::Char('Q') => {
                     cursor.hide(fb);
@@ -945,25 +949,23 @@ fn show_cfr_menu_graphical(cfr_info: &CfrInfo, fb: &FramebufferInfo) {
                     }
                 }
                 KeyPress::MouseClick { .. } => {
-                    if let Some(item_idx) = state.hovered {
-                        if is_selectable(&items[item_idx]) {
-                            state.selected = item_idx;
-                            if can_edit_item(cfr_info, &items, item_idx) {
-                                if let Some(MenuItem::Option {
-                                    form_idx,
-                                    option_idx,
-                                    current_value,
-                                    ..
-                                }) = items.get_mut(item_idx)
-                                {
-                                    if let Some(option) =
-                                        get_option(cfr_info, *form_idx, *option_idx)
-                                    {
-                                        toggle_value(option, current_value);
-                                    }
-                                } else {
-                                    increment_option(cfr_info, &mut items, item_idx);
+                    if let Some(item_idx) = state.hovered
+                        && is_selectable(&items[item_idx])
+                    {
+                        state.selected = item_idx;
+                        if can_edit_item(cfr_info, &items, item_idx) {
+                            if let Some(MenuItem::Option {
+                                form_idx,
+                                option_idx,
+                                current_value,
+                                ..
+                            }) = items.get_mut(item_idx)
+                            {
+                                if let Some(option) = get_option(cfr_info, *form_idx, *option_idx) {
+                                    toggle_value(option, current_value);
                                 }
+                            } else {
+                                increment_option(cfr_info, &mut items, item_idx);
                             }
                         }
                     }
@@ -987,7 +989,7 @@ fn show_cfr_menu_graphical(cfr_info: &CfrInfo, fb: &FramebufferInfo) {
 }
 
 #[cfg(feature = "ui")]
-fn graphical_canvas(fb: &FramebufferInfo) -> (i32, i32, u32, u32) {
+fn graphical_canvas(fb: &FramebufferInfo) -> Rect {
     let x = theme::SIDEBAR_W as i32 + theme::PAD as i32;
     let y = (theme::HEADER_H + theme::PAD) as i32;
     let w = fb.width - theme::SIDEBAR_W - theme::PAD * 2;
@@ -996,7 +998,7 @@ fn graphical_canvas(fb: &FramebufferInfo) -> (i32, i32, u32, u32) {
 }
 
 #[cfg(feature = "ui")]
-fn graphical_list_area(fb: &FramebufferInfo) -> (i32, i32, u32, u32) {
+fn graphical_list_area(fb: &FramebufferInfo) -> Rect {
     let (cx, cy, cw, ch) = graphical_canvas(fb);
     let y = cy + GFX_TITLE_H as i32;
     (cx, y, cw, ch.saturating_sub(GFX_TITLE_H))
@@ -1128,6 +1130,7 @@ fn draw_graphical_title(fb: &FramebufferInfo, cx: i32, cy: i32, cw: u32, modifie
     );
 }
 
+#[allow(clippy::too_many_arguments)]
 #[cfg(feature = "ui")]
 fn draw_graphical_item(
     cfr: &CfrInfo,
@@ -1218,7 +1221,7 @@ fn draw_graphical_log_level(
         theme::PRIMARY,
     );
 
-    let label = crabefi::logger::level_name(level);
+    let label = crate::logger::level_name(level);
     let value_w = value_width(label).min(w / 2);
     let value_x = x + w as i32 - value_w as i32 - 14;
     let name_max_w = (value_x - x - 34).max(32) as u32;
@@ -1244,6 +1247,7 @@ fn draw_graphical_log_level(
     draw_value_pill(fb, value_x, y + 12, value_w, label, true);
 }
 
+#[allow(clippy::too_many_arguments)]
 #[cfg(feature = "ui")]
 fn draw_graphical_option(
     fb: &FramebufferInfo,
@@ -1341,7 +1345,7 @@ fn graphical_item_hit(
     state: &GraphicalState,
     fb: &FramebufferInfo,
 ) -> Option<usize> {
-    let (mx, my) = crabefi::drivers::mouse_cursor::position();
+    let (mx, my) = crate::drivers::mouse_cursor::position();
     let (x, y, w, _) = graphical_list_area(fb);
     if mx < x || mx >= x + w as i32 || my < y {
         return None;
@@ -1458,7 +1462,7 @@ fn truncate_for_width(text: &str, max_width: u32, size: FontSize) -> StackString
 
 #[cfg(feature = "ui")]
 fn show_help_graphical(fb: &FramebufferInfo, option: &CfrOption) {
-    let mut cursor = crabefi::cursor::CursorRenderer::new();
+    let mut cursor = crate::cursor::CursorRenderer::new();
     draw_help_graphical(fb, option);
     loop {
         ui::poll_and_render_cursor(fb, &mut cursor);
@@ -1520,6 +1524,7 @@ fn draw_help_graphical(fb: &FramebufferInfo, option: &CfrOption) {
     );
 }
 
+#[allow(clippy::too_many_arguments)]
 #[cfg(feature = "ui")]
 fn draw_wrapped_text(
     fb: &FramebufferInfo,
@@ -1564,7 +1569,7 @@ fn draw_wrapped_text(
 
 #[cfg(feature = "ui")]
 fn confirm_save_graphical(fb: &FramebufferInfo) -> bool {
-    let mut cursor = crabefi::cursor::CursorRenderer::new();
+    let mut cursor = crate::cursor::CursorRenderer::new();
     draw_confirm_save_graphical(fb);
     loop {
         ui::poll_and_render_cursor(fb, &mut cursor);
@@ -1648,7 +1653,7 @@ fn draw_confirm_save_graphical(fb: &FramebufferInfo) {
 }
 
 #[cfg(feature = "ui")]
-fn confirm_button_rects(fb: &FramebufferInfo) -> ((i32, i32, u32, u32), (i32, i32, u32, u32)) {
+fn confirm_button_rects(fb: &FramebufferInfo) -> (Rect, Rect) {
     let (cx, cy, cw, ch) = graphical_canvas(fb);
     let modal_w = cw.min(520);
     let modal_h = 180;
@@ -1666,7 +1671,7 @@ fn confirm_button_rects(fb: &FramebufferInfo) -> ((i32, i32, u32, u32), (i32, i3
 }
 
 #[cfg(feature = "ui")]
-fn draw_button(fb: &FramebufferInfo, rect: (i32, i32, u32, u32), label: &str, primary: bool) {
+fn draw_button(fb: &FramebufferInfo, rect: Rect, label: &str, primary: bool) {
     let (x, y, w, h) = rect;
     let bg = if primary {
         theme::PRIMARY
@@ -1683,7 +1688,7 @@ fn draw_button(fb: &FramebufferInfo, rect: (i32, i32, u32, u32), label: &str, pr
 }
 
 #[cfg(feature = "ui")]
-fn point_in_rect(px: i32, py: i32, rect: (i32, i32, u32, u32)) -> bool {
+fn point_in_rect(px: i32, py: i32, rect: Rect) -> bool {
     let (x, y, w, h) = rect;
     px >= x && px < x + w as i32 && py >= y && py < y + h as i32
 }
@@ -1718,7 +1723,7 @@ fn show_save_result_graphical(fb: &FramebufferInfo, saved: usize, failed: usize)
 
 #[cfg(feature = "ui")]
 fn show_no_options_graphical(fb: &FramebufferInfo) {
-    let mut cursor = crabefi::cursor::CursorRenderer::new();
+    let mut cursor = crate::cursor::CursorRenderer::new();
     ui::clear(fb);
     ui::draw_header(fb);
     ui::draw_sidebar(fb, NavItem::Firmware, None);
@@ -1930,7 +1935,7 @@ fn draw_log_level_item(
     let name = "CrabEFI log level";
     let mut value_str = String::new();
     value_str.push('[');
-    value_str.push_str(crabefi::logger::level_name(level));
+    value_str.push_str(crate::logger::level_name(level));
     value_str.push(']');
 
     let ansi_row = row + 1;

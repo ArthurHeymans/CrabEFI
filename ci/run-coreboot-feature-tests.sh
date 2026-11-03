@@ -49,7 +49,7 @@ do
     "$TMPDIR/$test_name"
 done
 
-python3 - "$ROOT/crabefi-coreboot/src/cfr.rs" <<'PY'
+python3 - "$ROOT/crabefi-core/src/cfr.rs" <<'PY'
 import re
 import sys
 from pathlib import Path

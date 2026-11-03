@@ -32,8 +32,6 @@ mod arch_entry;
 #[path = "arch/x86_64/entry.rs"]
 mod arch_entry;
 mod cbmem_console;
-mod cfr;
-mod cfr_menu;
 mod fmap;
 mod framebuffer;
 mod memory;
@@ -209,7 +207,7 @@ impl crabefi::PlatformHooks for CorebootHooks {
     }
 
     fn show_firmware_settings(&self) -> bool {
-        cfr_menu::show_cfr_menu();
+        crabefi::cfr_menu::show_cfr_menu();
         true
     }
 }
@@ -1199,14 +1197,14 @@ pub extern "C" fn rust_main(coreboot_table_ptr: u64) -> ! {
     // Parse coreboot firmware configuration options now that the heap is
     // available. cb_info.cfr_raw is still in scope — no static needed.
     if let Some(cfr_raw) = cb_info.cfr_raw
-        && let Some(cfr) = cfr::parse_cfr(cfr_raw)
+        && let Some(cfr) = crabefi::cfr::parse_cfr(cfr_raw)
     {
         log::info!(
             "CFR: {} forms, {} options",
             cfr.forms.len(),
             cfr.total_options()
         );
-        cfr::store_cfr(cfr);
+        crabefi::cfr::store_cfr(cfr);
     }
 
     // ================================================================

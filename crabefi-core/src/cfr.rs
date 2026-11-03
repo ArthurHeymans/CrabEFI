@@ -4,6 +4,10 @@
 //! configuration options to payloads. CFR allows displaying and modifying
 //! boot-time configurable options like "Hyper-Threading Enable", "SATA Mode", etc.
 //!
+//! coreboot hands CFR over in its tables; a host firmware that links CrabEFI
+//! as a library passes the same record to [`parse_cfr`] and [`store_cfr`],
+//! and shows [`crate::cfr_menu::show_cfr_menu`] from its platform hooks.
+//!
 //! # CFR Structure
 //!
 //! CFR records form a tree structure where:
@@ -966,7 +970,7 @@ fn ascii_to_ucs2(s: &str) -> Vec<u16> {
 /// Returns the stored value or falls back to the CFR default.
 pub fn read_option_value(option: &CfrOption) -> CfrValue {
     let name = ascii_to_ucs2(&option.opt_name);
-    let data = crabefi::efi::runtime_image::client::variables::get(&COREBOOT_CFR_GUID, &name)
+    let data = crate::efi::runtime_image::client::variables::get(&COREBOOT_CFR_GUID, &name)
         .map(|(_, data)| data);
     data.map_or_else(
         || CfrValue::from_option_type(&option.option_type),
@@ -1000,7 +1004,7 @@ fn read_cfr_number(data: &[u8]) -> u32 {
 /// All numeric types (Bool, Number, Enum) are stored as 4-byte LE u32
 /// for compatibility with coreboot's get_uint_option() which returns unsigned int.
 pub fn write_option_value(option: &CfrOption, value: &CfrValue) -> Result<(), &'static str> {
-    use crabefi::efi::runtime_image::client::variables;
+    use crate::efi::runtime_image::client::variables;
     use r_efi::efi;
 
     let name = ascii_to_ucs2(&option.opt_name);
@@ -1044,7 +1048,7 @@ pub fn write_option_value(option: &CfrOption, value: &CfrValue) -> Result<(), &'
 // ci/run-coreboot-feature-tests.sh; no menu path calls it yet.
 #[allow(dead_code)]
 pub fn delete_option_value(option: &CfrOption) -> Result<(), &'static str> {
-    use crabefi::efi::runtime_image::client::variables;
+    use crate::efi::runtime_image::client::variables;
     use r_efi::efi;
 
     let name = ascii_to_ucs2(&option.opt_name);
