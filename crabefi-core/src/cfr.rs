@@ -965,10 +965,42 @@ fn ascii_to_ucs2(s: &str) -> Vec<u16> {
     result
 }
 
+/// Storage a platform keeps some options in instead of EFI variables, such
+/// as CMOS RAM. Options it does not keep stay EFI variables.
+pub trait OptionStore {
+    /// Whether this store keeps `option`.
+    fn keeps(&self, option: &CfrOption) -> bool;
+    /// The stored value of a kept option; `None` while it is unset.
+    fn read(&self, option: &CfrOption) -> Option<CfrValue>;
+    /// Store a kept option.
+    fn write(&self, option: &CfrOption, value: &CfrValue) -> Result<(), &'static str>;
+}
+
+static OPTION_STORE: AtomicPtr<&'static dyn OptionStore> = AtomicPtr::new(core::ptr::null_mut());
+
+/// Keep the options `store` keeps there. Call once, before the menu runs.
+pub fn set_option_store(store: &'static dyn OptionStore) {
+    let old = OPTION_STORE.swap(Box::into_raw(Box::new(store)), Ordering::SeqCst);
+    assert!(old.is_null(), "set_option_store must only be called once");
+}
+
+/// The platform store keeping `option`, if any.
+fn store_of(option: &CfrOption) -> Option<&'static dyn OptionStore> {
+    let ptr = OPTION_STORE.load(Ordering::SeqCst);
+    // SAFETY: set once from a leaked box, never freed.
+    let store = unsafe { ptr.as_ref() }.copied()?;
+    store.keeps(option).then_some(store)
+}
+
 /// Read a CFR option value from storage
 ///
 /// Returns the stored value or falls back to the CFR default.
 pub fn read_option_value(option: &CfrOption) -> CfrValue {
+    if let Some(store) = store_of(option) {
+        return store
+            .read(option)
+            .unwrap_or_else(|| CfrValue::from_option_type(&option.option_type));
+    }
     let name = ascii_to_ucs2(&option.opt_name);
     let data = crate::efi::runtime_image::client::variables::get(&COREBOOT_CFR_GUID, &name)
         .map(|(_, data)| data);
@@ -1004,6 +1036,9 @@ fn read_cfr_number(data: &[u8]) -> u32 {
 /// All numeric types (Bool, Number, Enum) are stored as 4-byte LE u32
 /// for compatibility with coreboot's get_uint_option() which returns unsigned int.
 pub fn write_option_value(option: &CfrOption, value: &CfrValue) -> Result<(), &'static str> {
+    if let Some(store) = store_of(option) {
+        return store.write(option, value);
+    }
     use crate::efi::runtime_image::client::variables;
     use r_efi::efi;
 
