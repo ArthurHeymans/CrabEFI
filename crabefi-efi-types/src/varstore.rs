@@ -92,17 +92,20 @@ pub struct FvValidation {
     pub data_size: u32,
 }
 
-/// The data-area size of a store whose header says `vs_size`, as coreboot
-/// (data only) or EDK2 (header included) count it.
+/// The data-area size of a store whose header says `vs_size`.
+///
+/// PI/EDK2 includes the variable-store header in Size. Older CrabEFI images
+/// instead wrote the full FV data capacity, excluding that header. Recognize
+/// that exact legacy value only; smaller stores use the PI convention. A
+/// partial legacy data-only store cannot be distinguished from a PI store.
 pub fn variable_data_size(vs_size: u32, region_size: u32) -> Option<u32> {
     let data_capacity = region_size.checked_sub(VARIABLE_DATA_OFFSET)?;
-    if vs_size <= data_capacity {
-        // Coreboot treats Size as the bytes after the variable-store header.
-        return Some(vs_size);
+    if vs_size == data_capacity {
+        return Some(data_capacity);
     }
 
-    // PI/EDK2 defines Size as including the variable-store header. Accept that
-    // convention too, while always returning a data-only size to callers.
+    // Select the PI convention before calculating the data bound. In
+    // particular, a partial store must not gain 28 bytes of readable data.
     let store_capacity = region_size.checked_sub(FV_HEADER_LENGTH as u32)?;
     (vs_size <= store_capacity)
         .then(|| vs_size.checked_sub(VS_HEADER_LENGTH as u32))
@@ -181,10 +184,15 @@ pub fn validate(header_bytes: &[u8], region_size: u32) -> Option<FvValidation> {
     }
 
     let header_length = u16::from_le_bytes([header_bytes[0x30], header_bytes[0x31]]) as usize;
-    if header_length > header_bytes.len()
-        || header_length < 0x38
-        || !header_length.is_multiple_of(2)
-    {
+    // The record reader below uses fixed offsets for this 72-byte FV layout.
+    // Do not accept another HeaderLength and then read its VS at offset 72.
+    if header_length != FV_HEADER_LENGTH {
+        return None;
+    }
+
+    let fv_length = u64::from_le_bytes(header_bytes[0x20..0x28].try_into().ok()?);
+    let fv_length = u32::try_from(fv_length).ok()?;
+    if fv_length > region_size || fv_length < VARIABLE_DATA_OFFSET {
         return None;
     }
 
@@ -212,7 +220,7 @@ pub fn validate(header_bytes: &[u8], region_size: u32) -> Option<FvValidation> {
     }
 
     let vs_size = u32::from_le_bytes([vs[0x10], vs[0x11], vs[0x12], vs[0x13]]);
-    let data_size = variable_data_size(vs_size, region_size)?;
+    let data_size = variable_data_size(vs_size, fv_length)?;
 
     Some(FvValidation {
         valid: true,
@@ -249,7 +257,7 @@ where
         .checked_mul(2)
         .and_then(|len| u32::try_from(len).ok())?;
 
-    let mut found_len = None;
+    let mut found = None;
     let mut offset = VARIABLE_DATA_OFFSET;
     let end = VARIABLE_DATA_OFFSET.checked_add(data_area_size)?;
     let end_with_header = end.checked_add(hdr_size)?;
@@ -301,19 +309,15 @@ where
             && name_size == stored_name_size
             && variable_name_matches(read_fn, name_offset, name, target_name_chars)
         {
-            if data_size as usize > data_out.len() {
-                return None;
-            }
-            if !read_fn(data_offset, &mut data_out[..data_size as usize]) {
-                return None;
-            }
-            found_len = Some(data_size as usize);
+            found = Some((data_offset, data_size as usize));
         }
 
         offset = next_offset;
     }
 
-    found_len
+    let (data_offset, data_len) = found?;
+    let output = data_out.get_mut(..data_len)?;
+    read_fn(data_offset, output).then_some(data_len)
 }
 
 fn variable_name_matches<F>(

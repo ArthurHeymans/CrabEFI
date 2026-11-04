@@ -87,6 +87,41 @@ External ranges are retained MMIO mappings used only by image-local
 architecture mechanisms. Each range must have page-aligned physical bounds and
 its descriptor must retain `EFI_MEMORY_RUNTIME` plus the declared attributes.
 
+## Firmware settings (CFR)
+
+Enable `cfr` (also included in `full`) to use the shared settings menu. After
+heap initialization, parse the platform's CFR record with `cfr::parse_cfr` and
+publish it with `cfr::store_cfr`. Pass a `PlatformHooks` implementation through
+`PlatformConfig::hooks` (or the builder's `.hooks(&hooks)`):
+
+```rust,ignore
+impl crabefi::PlatformHooks for Hooks {
+    fn firmware_settings_available(&self) -> bool {
+        crabefi::cfr::get_cfr().is_some_and(|info| info.total_options() != 0)
+    }
+
+    fn show_firmware_settings(&self) -> bool {
+        crabefi::cfr_menu::show_cfr_menu();
+        true
+    }
+}
+```
+
+Options normally use EFI variables under the CFR GUID. A platform that keeps
+some options elsewhere, such as CMOS, can register a static `cfr::OptionStore`
+once with `cfr::set_option_store`, after the heap is ready and before showing
+the menu. The store must be `Sync`; synchronize mutable state internally. A kept
+option that is unset uses its CFR default, not an EFI-variable override. Deleting
+a kept option is unsupported; writing its default value is supported.
+
+For reads before heap or EFI initialization (including when booting another
+payload), depend only on `crabefi-efi-types` and use
+`varstore::read_variable_data_from_region` with the bounded memory-mapped FV
+slice, `varstore::COREBOOT_CFR_GUID`, a UTF-16 option name and an output buffer.
+Numeric CFR values are little-endian `u32`; strings are NUL-terminated UTF-8.
+This reads committed flash records only: a platform must separately handle its
+CMOS-kept options and any pending warm-reset deferred journal.
+
 ## Retained deferred buffer
 
 Use `DeferredBufferConfig::disabled()` (zero base and size together) to omit

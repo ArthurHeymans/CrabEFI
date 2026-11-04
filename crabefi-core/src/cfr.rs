@@ -961,7 +961,7 @@ fn ascii_to_ucs2(s: &str) -> Vec<u16> {
 
 /// Storage a platform keeps some options in instead of EFI variables, such
 /// as CMOS RAM. Options it does not keep stay EFI variables.
-pub trait OptionStore {
+pub trait OptionStore: Sync {
     /// Whether this store keeps `option`.
     fn keeps(&self, option: &CfrOption) -> bool;
     /// The stored value of a kept option; `None` while it is unset.
@@ -974,8 +974,20 @@ static OPTION_STORE: AtomicPtr<&'static dyn OptionStore> = AtomicPtr::new(core::
 
 /// Keep the options `store` keeps there. Call once, before the menu runs.
 pub fn set_option_store(store: &'static dyn OptionStore) {
-    let old = OPTION_STORE.swap(Box::into_raw(Box::new(store)), Ordering::SeqCst);
-    assert!(old.is_null(), "set_option_store must only be called once");
+    let ptr = Box::into_raw(Box::new(store));
+    if OPTION_STORE
+        .compare_exchange(
+            core::ptr::null_mut(),
+            ptr,
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        )
+        .is_err()
+    {
+        // SAFETY: publication failed, so no reader can hold this allocation.
+        unsafe { drop(Box::from_raw(ptr)) };
+        panic!("set_option_store must only be called once");
+    }
 }
 
 /// The platform store keeping `option`, if any.
@@ -993,6 +1005,17 @@ pub fn read_option_value(option: &CfrOption) -> CfrValue {
     if let Some(store) = store_of(option) {
         return store
             .read(option)
+            .filter(|value| {
+                matches!(
+                    (&option.option_type, value),
+                    (CfrOptionType::Bool { .. }, CfrValue::Bool(_))
+                        | (
+                            CfrOptionType::Number { .. } | CfrOptionType::Enum { .. },
+                            CfrValue::Number(_)
+                        )
+                        | (CfrOptionType::Varchar { .. }, CfrValue::Varchar(_))
+                )
+            })
             .unwrap_or_else(|| CfrValue::from_option_type(&option.option_type));
     }
     let name = ascii_to_ucs2(&option.opt_name);
@@ -1077,6 +1100,9 @@ pub fn write_option_value(option: &CfrOption, value: &CfrValue) -> Result<(), &'
 // ci/run-coreboot-feature-tests.sh; no menu path calls it yet.
 #[allow(dead_code)]
 pub fn delete_option_value(option: &CfrOption) -> Result<(), &'static str> {
+    if store_of(option).is_some() {
+        return Err("Cannot delete option kept by platform store");
+    }
     use crate::efi::runtime_image::client::variables;
     use r_efi::efi;
 
