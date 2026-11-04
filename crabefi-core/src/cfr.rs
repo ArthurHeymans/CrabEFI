@@ -924,14 +924,8 @@ fn parse_enum_value(data: &[u8]) -> Option<CfrEnumChoice> {
 /// This is the GUID used by coreboot's `get_uint_option()` / `set_uint_option()`
 /// in `src/drivers/efi/option.c`. It must match exactly for coreboot to find
 /// the variables we write.
-pub const COREBOOT_CFR_GUID: r_efi::efi::Guid = r_efi::efi::Guid::from_fields(
-    0xceae4c1d,
-    0x335b,
-    0x4685,
-    0xa4,
-    0xa0,
-    &[0xfc, 0x4a, 0x94, 0xee, 0xa0, 0x85],
-);
+pub const COREBOOT_CFR_GUID: r_efi::efi::Guid =
+    r_efi::efi::Guid::from_bytes(&crabefi_efi_types::varstore::COREBOOT_CFR_GUID);
 
 /// Value types for CFR options
 #[derive(Debug, Clone, PartialEq)]

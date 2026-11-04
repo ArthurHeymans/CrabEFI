@@ -25,56 +25,18 @@
 use alloc::vec;
 use alloc::vec::Vec;
 
+use crabefi_efi_types::varstore::{
+    self, EFI_AUTH_VARIABLE_GUID, EFI_SYSTEM_NV_DATA_FV_GUID, FV_REVISION, FV_SIGNATURE,
+    HEADER_ALIGNMENT, VAR_DELETED, VAR_HEADER_VALID_ONLY, VARIABLE_DATA, VARIABLE_STORE_FORMATTED,
+    VARIABLE_STORE_HEALTHY, align_up, checked_align_up,
+};
+pub use crabefi_efi_types::varstore::{
+    AUTH_VAR_HEADER_SIZE, FV_HEADER_LENGTH, FvValidation, VAR_ADDED, VAR_HEADER_SIZE,
+    VARIABLE_DATA_OFFSET, VS_HEADER_LENGTH, read_variable_data_from_region,
+};
 use crabefi_runtime_abi::VariableTimestamp;
 use zerocopy::byteorder::{I16, LittleEndian, U16, U32, U64};
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned};
-
-// ============================================================================
-// Constants
-// ============================================================================
-
-/// EFI Firmware Volume Header signature: "_FVH"
-const FV_SIGNATURE: u32 = 0x4856_465F;
-
-/// FV header revision
-const FV_REVISION: u8 = 0x02;
-
-/// Firmware Volume header length (including one block map entry + terminator)
-pub const FV_HEADER_LENGTH: usize = 0x48; // 72 bytes
-
-/// Variable Store header length
-pub const VS_HEADER_LENGTH: usize = 0x1C; // 28 bytes
-
-/// Offset where variable records begin (FV header + VS header)
-pub const VARIABLE_DATA_OFFSET: u32 = (FV_HEADER_LENGTH + VS_HEADER_LENGTH) as u32;
-
-/// Variable record start marker
-const VARIABLE_DATA: u16 = 0x55AA;
-
-/// Variable record alignment
-const HEADER_ALIGNMENT: u32 = 4;
-
-/// Variable store format byte: formatted
-const VARIABLE_STORE_FORMATTED: u8 = 0x5A;
-
-/// Variable store state byte: healthy
-const VARIABLE_STORE_HEALTHY: u8 = 0xFE;
-
-// Variable states (bits cleared in 0xFF flash):
-/// Variable is fully valid (bits 7 and 6 cleared)
-pub const VAR_ADDED: u8 = 0x3F;
-/// Header written, data may not be complete (bit 7 cleared)
-const VAR_HEADER_VALID_ONLY: u8 = 0x7F;
-/// Variable is being deleted (bit 0 cleared from VAR_ADDED)
-const _VAR_IN_DELETED_TRANSITION: u8 = 0xFE;
-/// Variable is deleted
-const VAR_DELETED: u8 = 0xFD;
-
-/// Non-authenticated variable header size
-pub const VAR_HEADER_SIZE: usize = 32;
-
-/// Authenticated variable header size used for all newly written records.
-pub const AUTH_VAR_HEADER_SIZE: usize = 60;
 
 #[repr(C, packed)]
 #[derive(Clone, Copy, FromBytes, IntoBytes, Immutable, KnownLayout, Unaligned)]
@@ -116,28 +78,6 @@ const _: () = assert!(core::mem::offset_of!(AuthenticatedVariableHeader, timesta
 const _: () = assert!(core::mem::offset_of!(AuthenticatedVariableHeader, name_size) == 0x24);
 const _: () = assert!(core::mem::offset_of!(AuthenticatedVariableHeader, data_size) == 0x28);
 const _: () = assert!(core::mem::offset_of!(AuthenticatedVariableHeader, vendor_guid) == 0x2c);
-
-// ============================================================================
-// GUID constants (as raw LE bytes, matching coreboot's layout)
-// ============================================================================
-
-/// EFI System NV Data FV GUID: {fff12b8d-7696-4c8b-a985-2747075b4f50}
-/// Used in the Firmware Volume header's FileSystemGuid field.
-const EFI_SYSTEM_NV_DATA_FV_GUID: [u8; 16] = [
-    0x8d, 0x2b, 0xf1, 0xff, 0x96, 0x76, 0x8b, 0x4c, 0xa9, 0x85, 0x27, 0x47, 0x07, 0x5b, 0x4f, 0x50,
-];
-
-/// EFI Variable GUID (non-authenticated format): {ddcf3616-3275-4164-98b6-fe85707ffe7d}
-/// Used in the Variable Store header's Signature field.
-const EFI_VARIABLE_GUID: [u8; 16] = [
-    0x16, 0x36, 0xcf, 0xdd, 0x75, 0x32, 0x64, 0x41, 0x98, 0xb6, 0xfe, 0x85, 0x70, 0x7f, 0xfe, 0x7d,
-];
-
-/// EFI Authenticated Variable GUID: {aaf32c78-947b-439a-a180-2e144ec37792}
-/// Indicates the variable store uses authenticated variable headers.
-const EFI_AUTH_VARIABLE_GUID: [u8; 16] = [
-    0x78, 0x2c, 0xf3, 0xaa, 0x7b, 0x94, 0x9a, 0x43, 0xa1, 0x80, 0x2e, 0x14, 0x4e, 0xc3, 0x77, 0x92,
-];
 
 // ============================================================================
 // FV header construction / validation
@@ -220,32 +160,6 @@ fn compute_fv_checksum(header: &[u8]) -> u16 {
     0u16.wrapping_sub(sum)
 }
 
-/// Validation result for an existing FV region
-pub struct FvValidation {
-    /// Whether the region has a valid FV + VS header
-    pub valid: bool,
-    /// Whether the variable store uses authenticated headers
-    pub auth_format: bool,
-    /// Size of the variable store data area (after VS header)
-    pub data_size: u32,
-}
-
-fn variable_data_size(vs_size: u32, region_size: u32) -> Option<u32> {
-    let data_capacity = region_size.checked_sub(VARIABLE_DATA_OFFSET)?;
-    if vs_size <= data_capacity {
-        // Coreboot treats Size as the bytes after the variable-store header.
-        return Some(vs_size);
-    }
-
-    // PI/EDK2 defines Size as including the variable-store header. Accept that
-    // convention too, while always returning a data-only size to callers.
-    let store_capacity = region_size.checked_sub(FV_HEADER_LENGTH as u32)?;
-    (vs_size <= store_capacity)
-        .then(|| vs_size.checked_sub(VS_HEADER_LENGTH as u32))
-        .flatten()
-        .filter(|size| *size <= data_capacity)
-}
-
 /// Validate an existing Firmware Volume in a flash region.
 ///
 /// `header_bytes` must be at least `FV_HEADER_LENGTH + VS_HEADER_LENGTH` bytes,
@@ -253,98 +167,14 @@ fn variable_data_size(vs_size: u32, region_size: u32) -> Option<u32> {
 ///
 /// Returns validation result with format details needed for reading.
 pub fn validate_fv(header_bytes: &[u8], region_size: u32) -> FvValidation {
-    let invalid = FvValidation {
-        valid: false,
-        auth_format: false,
-        data_size: 0,
-    };
-
-    if header_bytes.len() < FV_HEADER_LENGTH + VS_HEADER_LENGTH {
-        return invalid;
-    }
-
-    // Check FV signature at offset 0x28
-    let sig = u32::from_le_bytes([
-        header_bytes[0x28],
-        header_bytes[0x29],
-        header_bytes[0x2A],
-        header_bytes[0x2B],
-    ]);
-    if sig != FV_SIGNATURE {
-        log::debug!(
-            "FV signature mismatch: {:#x} (expected {:#x})",
-            sig,
-            FV_SIGNATURE
-        );
-        return invalid;
-    }
-
-    // Check revision at offset 0x37
-    if header_bytes[0x37] != FV_REVISION {
-        log::debug!("FV revision mismatch: {}", header_bytes[0x37]);
-        return invalid;
-    }
-
-    // Check FileSystemGuid at offset 0x10
-    if header_bytes[0x10..0x20] != EFI_SYSTEM_NV_DATA_FV_GUID {
-        log::debug!("FV FileSystemGuid mismatch");
-        return invalid;
-    }
-
-    // Check FV header checksum
-    let header_length = u16::from_le_bytes([header_bytes[0x30], header_bytes[0x31]]) as usize;
-    if header_length > header_bytes.len()
-        || header_length < 0x38
-        || !header_length.is_multiple_of(2)
-    {
-        log::debug!("FV header length invalid: {}", header_length);
-        return invalid;
-    }
-    let mut checksum: u16 = 0;
-    for i in (0..header_length).step_by(2) {
-        let lo = header_bytes[i] as u16;
-        let hi = header_bytes[i + 1] as u16;
-        checksum = checksum.wrapping_add(lo | (hi << 8));
-    }
-    if checksum != 0 {
-        log::debug!("FV header checksum failed: {:#x}", checksum);
-        return invalid;
-    }
-
-    // Check variable store header at FV_HEADER_LENGTH
-    let vs = &header_bytes[FV_HEADER_LENGTH..];
-
-    // Determine auth vs non-auth format from VS Signature GUID
-    let auth_format = if vs[..16] == EFI_VARIABLE_GUID {
-        false
-    } else if vs[..16] == EFI_AUTH_VARIABLE_GUID {
-        true
-    } else {
-        log::debug!("VS Signature GUID not recognized");
-        return invalid;
-    };
-
-    // Check Format and State
-    if vs[0x14] != VARIABLE_STORE_FORMATTED || vs[0x15] != VARIABLE_STORE_HEALTHY {
-        log::debug!(
-            "VS format/state invalid: format={:#x} state={:#x}",
-            vs[0x14],
-            vs[0x15]
-        );
-        return invalid;
-    }
-
-    let vs_size = u32::from_le_bytes([vs[0x10], vs[0x11], vs[0x12], vs[0x13]]);
-    let Some(data_size) = variable_data_size(vs_size, region_size) else {
-        log::debug!("VS size exceeds region");
-        return invalid;
-    };
-
-    FvValidation {
-        valid: true,
-        auth_format,
-        data_size,
-    }
+    varstore::validate(header_bytes, region_size).unwrap_or_else(|| {
+        log::debug!("FV or variable store header invalid");
+        FvValidation {
+            valid: false,
+            auth_format: false,
+            data_size: 0,
+        }
+    })
 }
 
 // ============================================================================
@@ -368,249 +198,6 @@ pub struct FvVariable {
     /// Offset of this record's State byte in the storage region
     /// (relative to storage base, i.e., absolute within the region)
     pub state_offset: u32,
-}
-
-/// Read one variable's data from an EDK2-compatible variable-store region.
-///
-/// This helper is intentionally allocation-free and silent so platforms can use
-/// it during early boot before the heap and normal logging policy are ready.
-/// If multiple active records match, the last one wins.
-///
-/// # Arguments
-/// * `region` - Full EDK2 FV variable-store region bytes.
-/// * `guid_bytes` - EFI variable GUID in mixed-endian UEFI byte order.
-/// * `name` - UTF-16 variable name, with or without a trailing NUL. Stored
-///   EDK2 names are matched with their required trailing NUL.
-/// * `data_out` - Buffer that receives the variable data.
-///
-/// # Returns
-/// The number of bytes copied into `data_out`, or `None` if the store is
-/// invalid, the variable was not found, or the output buffer is too small.
-pub fn read_variable_data_from_region(
-    region: &[u8],
-    guid_bytes: &[u8; 16],
-    name: &[u16],
-    data_out: &mut [u8],
-) -> Option<usize> {
-    if region.len() > u32::MAX as usize {
-        return None;
-    }
-
-    let validation = validate_fv_silent(region, region.len() as u32)?;
-    let mut read_fn = |offset: u32, buf: &mut [u8]| -> bool {
-        let offset = offset as usize;
-        let Some(end) = offset.checked_add(buf.len()) else {
-            return false;
-        };
-        let Some(src) = region.get(offset..end) else {
-            return false;
-        };
-        buf.copy_from_slice(src);
-        true
-    };
-
-    read_variable_data(
-        &mut read_fn,
-        validation.auth_format,
-        validation.data_size,
-        guid_bytes,
-        name,
-        data_out,
-    )
-}
-
-fn validate_fv_silent(header_bytes: &[u8], region_size: u32) -> Option<FvValidation> {
-    if header_bytes.len() < FV_HEADER_LENGTH + VS_HEADER_LENGTH {
-        return None;
-    }
-
-    let sig = u32::from_le_bytes([
-        header_bytes[0x28],
-        header_bytes[0x29],
-        header_bytes[0x2A],
-        header_bytes[0x2B],
-    ]);
-    if sig != FV_SIGNATURE || header_bytes[0x37] != FV_REVISION {
-        return None;
-    }
-
-    if header_bytes[0x10..0x20] != EFI_SYSTEM_NV_DATA_FV_GUID {
-        return None;
-    }
-
-    let header_length = u16::from_le_bytes([header_bytes[0x30], header_bytes[0x31]]) as usize;
-    if header_length > header_bytes.len()
-        || header_length < 0x38
-        || !header_length.is_multiple_of(2)
-    {
-        return None;
-    }
-
-    let mut checksum: u16 = 0;
-    for i in (0..header_length).step_by(2) {
-        let lo = header_bytes[i] as u16;
-        let hi = header_bytes[i + 1] as u16;
-        checksum = checksum.wrapping_add(lo | (hi << 8));
-    }
-    if checksum != 0 {
-        return None;
-    }
-
-    let vs = &header_bytes[FV_HEADER_LENGTH..];
-    let auth_format = if vs[..16] == EFI_VARIABLE_GUID {
-        false
-    } else if vs[..16] == EFI_AUTH_VARIABLE_GUID {
-        true
-    } else {
-        return None;
-    };
-
-    if vs[0x14] != VARIABLE_STORE_FORMATTED || vs[0x15] != VARIABLE_STORE_HEALTHY {
-        return None;
-    }
-
-    let vs_size = u32::from_le_bytes([vs[0x10], vs[0x11], vs[0x12], vs[0x13]]);
-    let data_size = variable_data_size(vs_size, region_size)?;
-
-    Some(FvValidation {
-        valid: true,
-        auth_format,
-        data_size,
-    })
-}
-
-fn read_variable_data<F>(
-    read_fn: &mut F,
-    auth_format: bool,
-    data_area_size: u32,
-    guid_bytes: &[u8; 16],
-    name: &[u16],
-    data_out: &mut [u8],
-) -> Option<usize>
-where
-    F: FnMut(u32, &mut [u8]) -> bool,
-{
-    let hdr_size = if auth_format {
-        AUTH_VAR_HEADER_SIZE
-    } else {
-        VAR_HEADER_SIZE
-    } as u32;
-
-    let target_name_chars = name.iter().position(|&ch| ch == 0).unwrap_or(name.len());
-    if target_name_chars == 0 {
-        return None;
-    }
-    let stored_name_size = target_name_chars
-        .checked_add(1)?
-        .checked_mul(2)
-        .and_then(|len| u32::try_from(len).ok())?;
-
-    let mut found_len = None;
-    let mut offset = VARIABLE_DATA_OFFSET;
-    let end = VARIABLE_DATA_OFFSET.checked_add(data_area_size)?;
-    let end_with_header = end.checked_add(hdr_size)?;
-    let mut hdr_buf = [0u8; AUTH_VAR_HEADER_SIZE];
-
-    while offset
-        .checked_add(hdr_size)
-        .is_some_and(|header_end| header_end <= end)
-    {
-        let hdr = &mut hdr_buf[..hdr_size as usize];
-        if !read_fn(offset, hdr) {
-            break;
-        }
-
-        let start_id = u16::from_le_bytes([hdr[0], hdr[1]]);
-        let state = hdr[2];
-        if start_id != VARIABLE_DATA || state == 0xFF {
-            break;
-        }
-
-        let (name_size, data_size, guid_offset) = if auth_format {
-            let attributes = u32::from_le_bytes([hdr[0x04], hdr[0x05], hdr[0x06], hdr[0x07]]);
-            let name_size = u32::from_le_bytes([hdr[0x24], hdr[0x25], hdr[0x26], hdr[0x27]]);
-            let data_size = u32::from_le_bytes([hdr[0x28], hdr[0x29], hdr[0x2A], hdr[0x2B]]);
-            if attributes == 0xFFFF_FFFF || name_size == 0xFFFF_FFFF || data_size == 0xFFFF_FFFF {
-                break;
-            }
-            (name_size, data_size, 0x2Cusize)
-        } else {
-            let attributes = u32::from_le_bytes([hdr[0x04], hdr[0x05], hdr[0x06], hdr[0x07]]);
-            let name_size = u32::from_le_bytes([hdr[0x08], hdr[0x09], hdr[0x0A], hdr[0x0B]]);
-            let data_size = u32::from_le_bytes([hdr[0x0C], hdr[0x0D], hdr[0x0E], hdr[0x0F]]);
-            if attributes == 0xFFFF_FFFF || name_size == 0xFFFF_FFFF || data_size == 0xFFFF_FFFF {
-                break;
-            }
-            (name_size, data_size, 0x10usize)
-        };
-
-        let name_offset = offset.checked_add(hdr_size)?;
-        let data_offset = name_offset.checked_add(name_size)?;
-        let record_size = hdr_size.checked_add(name_size)?.checked_add(data_size)?;
-        let next_offset = offset.checked_add(checked_align_up(record_size, HEADER_ALIGNMENT)?)?;
-        if data_offset.checked_add(data_size)? > end || next_offset > end_with_header {
-            break;
-        }
-
-        if state == VAR_ADDED
-            && hdr[guid_offset..guid_offset + 16] == *guid_bytes
-            && name_size == stored_name_size
-            && variable_name_matches(read_fn, name_offset, name, target_name_chars)
-        {
-            if data_size as usize > data_out.len() {
-                return None;
-            }
-            if !read_fn(data_offset, &mut data_out[..data_size as usize]) {
-                return None;
-            }
-            found_len = Some(data_size as usize);
-        }
-
-        offset = next_offset;
-    }
-
-    found_len
-}
-
-fn variable_name_matches<F>(
-    read_fn: &mut F,
-    name_offset: u32,
-    name: &[u16],
-    target_name_chars: usize,
-) -> bool
-where
-    F: FnMut(u32, &mut [u8]) -> bool,
-{
-    let mut buf = [0u8; 2];
-    for (idx, &expected) in name.iter().take(target_name_chars).enumerate() {
-        let Some(offset) = idx
-            .checked_mul(2)
-            .and_then(|offset| u32::try_from(offset).ok())
-            .and_then(|offset| name_offset.checked_add(offset))
-        else {
-            return false;
-        };
-
-        if !read_fn(offset, &mut buf) {
-            return false;
-        }
-        if u16::from_le_bytes(buf) != expected {
-            return false;
-        }
-    }
-
-    let Some(terminator_offset) = target_name_chars
-        .checked_mul(2)
-        .and_then(|offset| u32::try_from(offset).ok())
-        .and_then(|offset| name_offset.checked_add(offset))
-    else {
-        return false;
-    };
-
-    if !read_fn(terminator_offset, &mut buf) {
-        return false;
-    }
-    u16::from_le_bytes(buf) == 0
 }
 
 /// Walk all variable records in the FV data area.
@@ -991,22 +578,6 @@ pub fn is_var_added(state: u8) -> bool {
     state == VAR_ADDED
 }
 
-// ============================================================================
-// Helpers
-// ============================================================================
-
-/// Align a value up to the given alignment (must be a power of 2).
-fn align_up(value: u32, alignment: u32) -> u32 {
-    (value + alignment - 1) & !(alignment - 1)
-}
-
-/// Checked variant of [`align_up`] for parsing untrusted variable records.
-fn checked_align_up(value: u32, alignment: u32) -> Option<u32> {
-    value
-        .checked_add(alignment.checked_sub(1)?)
-        .map(|value| value & !(alignment - 1))
-}
-
 /// Convert an `r_efi::efi::Guid` to the 16-byte mixed-endian representation
 /// used in EDK2 on-disk format.
 pub fn guid_to_bytes(guid: &r_efi::efi::Guid) -> [u8; 16] {
@@ -1028,6 +599,7 @@ pub fn name_matches(on_disk: &[u16], name: &[u16]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crabefi_efi_types::varstore::EFI_VARIABLE_GUID;
 
     fn timestamp() -> VariableTimestamp {
         VariableTimestamp {
