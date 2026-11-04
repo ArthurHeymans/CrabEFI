@@ -1094,7 +1094,37 @@ fn validate_query_attributes(attributes: u32, boot_services: bool) -> Result<(),
     if attributes.contains(VariableAttributes::AUTHENTICATED_WRITE_ACCESS) {
         return Err(efi::Status::UNSUPPORTED);
     }
+    if !cfg!(feature = "secure-boot")
+        && attributes.contains(VariableAttributes::TIME_BASED_AUTHENTICATED_WRITE_ACCESS)
+    {
+        return Err(efi::Status::UNSUPPORTED);
+    }
     Ok(())
+}
+
+#[cfg(test)]
+mod query_tests {
+    use super::*;
+
+    #[test]
+    fn time_based_queries_require_secure_boot_support() {
+        let bs = VariableAttributes::BOOTSERVICE_ACCESS;
+        let rt = VariableAttributes::RUNTIME_ACCESS;
+        let nv = VariableAttributes::NON_VOLATILE;
+        let auth = VariableAttributes::TIME_BASED_AUTHENTICATED_WRITE_ACCESS;
+        for attrs in [bs, bs | rt, nv | bs | rt] {
+            assert_eq!(validate_query_attributes(attrs.bits(), true), Ok(()));
+            let expected = if cfg!(feature = "secure-boot") {
+                Ok(())
+            } else {
+                Err(efi::Status::UNSUPPORTED)
+            };
+            assert_eq!(
+                validate_query_attributes((attrs | auth).bits(), true),
+                expected
+            );
+        }
+    }
 }
 
 fn call_boot_bridge(address: u64, request: &BridgeRequest) -> Result<(), efi::Status> {
