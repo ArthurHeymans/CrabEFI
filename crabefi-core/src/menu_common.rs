@@ -10,12 +10,16 @@ use crate::time::delay_ms;
 use core::fmt::Write;
 
 /// Key press types for menu navigation
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KeyPress {
     Up,
     Down,
     Left,
     Right,
+    Home,
+    End,
+    PageUp,
+    PageDown,
     Enter,
     Escape,
     Char(char),
@@ -34,11 +38,15 @@ pub enum KeyPress {
 pub fn read_key() -> Option<KeyPress> {
     if let Some((scan_code, unicode_char)) = keyboard::try_read_key() {
         return match scan_code {
-            0x01 => Some(KeyPress::Up),                         // SCAN_UP
-            0x02 => Some(KeyPress::Down),                       // SCAN_DOWN
-            0x03 => Some(KeyPress::Right),                      // SCAN_RIGHT
-            0x04 => Some(KeyPress::Left),                       // SCAN_LEFT
-            0x17 => Some(KeyPress::Escape),                     // SCAN_ESC
+            0x01 => Some(KeyPress::Up),    // SCAN_UP
+            0x02 => Some(KeyPress::Down),  // SCAN_DOWN
+            0x03 => Some(KeyPress::Right), // SCAN_RIGHT
+            0x04 => Some(KeyPress::Left),  // SCAN_LEFT
+            0x05 => Some(KeyPress::Home),
+            0x06 => Some(KeyPress::End),
+            0x09 => Some(KeyPress::PageUp),
+            0x0A => Some(KeyPress::PageDown),
+            0x17 => Some(KeyPress::Escape), // SCAN_ESC
             0 if unicode_char == 0x0D => Some(KeyPress::Enter), // Carriage return
             0 if unicode_char > 0 => Some(KeyPress::Char(unicode_char as u8 as char)),
             _ => None,
@@ -76,6 +84,20 @@ pub fn read_key() -> Option<KeyPress> {
                         Some(b'B') => Some(KeyPress::Down),
                         Some(b'C') => Some(KeyPress::Right),
                         Some(b'D') => Some(KeyPress::Left),
+                        Some(b'H') => Some(KeyPress::Home),
+                        Some(b'F') => Some(KeyPress::End),
+                        Some(code @ (b'1' | b'4' | b'5' | b'6' | b'7' | b'8')) => {
+                            if serial_driver::try_read() == Some(b'~') {
+                                Some(match code {
+                                    b'1' | b'7' => KeyPress::Home,
+                                    b'4' | b'8' => KeyPress::End,
+                                    b'5' => KeyPress::PageUp,
+                                    _ => KeyPress::PageDown,
+                                })
+                            } else {
+                                None
+                            }
+                        }
                         _ => Some(KeyPress::Escape),
                     }
                 } else {

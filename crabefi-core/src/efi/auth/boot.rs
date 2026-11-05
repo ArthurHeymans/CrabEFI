@@ -270,6 +270,25 @@ fn get_variable_data(guid: &Guid, name: &[u16]) -> Option<Vec<u8>> {
     crate::efi::runtime_image::client::variables::get(guid, name).map(|(_, data)| data)
 }
 
+/// Authentication preflight must not use verification-cache timestamps: those
+/// intentionally are not refreshed on every write and are cleared with keys.
+/// The persistence facade includes active zero-length deletion-history records.
+pub(crate) fn dbx_replay_floor() -> EfiTime {
+    let cached = *dbx_database().timestamp();
+    let persisted = get_variable_timestamp(
+        &Guid::from_bytes(&EFI_IMAGE_SECURITY_DATABASE_GUID),
+        DBX_NAME,
+    );
+    replay_floor(cached, persisted)
+}
+
+fn replay_floor(cached: EfiTime, persisted: Option<VariableTimestamp>) -> EfiTime {
+    match persisted.map(efi_time_from_timestamp) {
+        Some(timestamp) if timestamp.is_after(&cached) => timestamp,
+        _ => cached,
+    }
+}
+
 fn efi_time_from_timestamp(timestamp: VariableTimestamp) -> EfiTime {
     EfiTime {
         year: timestamp.year,
@@ -606,7 +625,8 @@ pub fn clear_all_keys() -> Result<(), AuthError> {
 mod tests {
     use super::{
         DatabaseSnapshot, EFI_UNSPECIFIED_TIMEZONE, FIRMWARE_TIMESTAMP_FLOOR, SOURCE_DATE_EPOCH,
-        efi_time_from_unix, next_timestamp_after, utc_seconds,
+        efi_time_from_timestamp, efi_time_from_unix, next_timestamp_after, replay_floor,
+        utc_seconds,
     };
     use crate::efi::utils::ucs2_eq;
     use alloc::vec;
@@ -620,6 +640,41 @@ mod tests {
         assert!(ucs2_eq(&name1, &name1));
         assert!(ucs2_eq(&name2, &name1));
         assert!(ucs2_eq(&name1, &name2));
+    }
+
+    #[test]
+    fn replay_floor_survives_same_session_refresh_and_authenticated_deletion() {
+        let accepted = crabefi_runtime_abi::VariableTimestamp {
+            year: 2028,
+            month: 1,
+            day: 1,
+            ..Default::default()
+        };
+        let older = efi_time_from_timestamp(crabefi_runtime_abi::VariableTimestamp {
+            year: 2027,
+            month: 1,
+            day: 1,
+            ..Default::default()
+        });
+        let cleared_cache = EfiTime {
+            year: 0,
+            month: 0,
+            day: 0,
+            ..older
+        };
+        let same_update = efi_time_from_timestamp(accepted);
+        // An unchanged verification cache must not make an accepted update newer.
+        assert!(!same_update.is_after(&replay_floor(older, Some(accepted))));
+        // Deleting dbx clears its cache but leaves the active persistent tombstone.
+        assert!(!same_update.is_after(&replay_floor(cleared_cache, Some(accepted))));
+        assert!(replay_floor(cleared_cache, Some(accepted)).is_after(&older));
+        let newer = EfiTime {
+            year: 2029,
+            ..same_update
+        };
+        assert!(newer.is_after(&replay_floor(cleared_cache, Some(accepted))));
+        // Keep the in-memory floor on platforms without readable persistence metadata.
+        assert!(!older.is_after(&replay_floor(older, None)));
     }
 
     #[test]

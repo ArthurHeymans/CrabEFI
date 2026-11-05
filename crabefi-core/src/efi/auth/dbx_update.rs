@@ -48,8 +48,8 @@ use crabefi_efi_types::{
     },
 };
 
-use super::crypto::verify_pkcs7_signature;
-use super::variables::{dbx_database, kek_database, pk_database};
+use super::crypto::{sha256, verify_pkcs7_signature_chain};
+use super::variables::{kek_database, pk_database};
 use super::{AuthError, is_setup_mode};
 use crate::drivers::block::BlockDevice;
 use crate::fs::fat::FatFilesystem;
@@ -110,6 +110,29 @@ pub struct DbxEnrollmentResult {
     pub x509_count: usize,
     /// Source where dbx was found
     pub source: &'static str,
+}
+
+/// Verified preview of the exact owned update the user may choose to import.
+/// Text-only builds consume `entries` but do not display the identity metadata.
+#[cfg_attr(not(feature = "ui"), allow(dead_code))]
+pub(crate) struct DbxPreview {
+    pub entries: DbxEnrollmentResult,
+    pub timestamp: Option<EfiTime>,
+    /// SHA-256 of the cryptographically verified signer, not an arbitrary CMS cert.
+    pub signer_sha256: Option<[u8; 32]>,
+}
+
+#[cfg(feature = "ui")]
+pub(crate) fn preview_dbx_update(data: &[u8], source: DbxSource) -> Result<DbxPreview, AuthError> {
+    match source {
+        DbxSource::Authenticated(src) => inspect_authenticated_dbx_update(data, src),
+        DbxSource::Raw(src) if is_setup_mode() => Ok(DbxPreview {
+            entries: apply_raw_dbx_update(data, src)?,
+            timestamp: None,
+            signer_sha256: None,
+        }),
+        DbxSource::Raw(_) => Err(AuthError::SignatureVerificationFailed),
+    }
 }
 
 /// Search all available ESPs for dbx update files
@@ -211,6 +234,15 @@ pub fn enroll_dbx_from_file() -> Result<DbxEnrollmentResult, AuthError> {
         AuthError::NoSuitableKey
     })?;
 
+    enroll_dbx_data(data, source)
+}
+
+/// Import exactly the bytes the graphical UI verified and previewed. Revalidate
+/// at commit time too; never reopen a file after consent.
+pub(crate) fn enroll_dbx_data(
+    data: Vec<u8>,
+    source: DbxSource,
+) -> Result<DbxEnrollmentResult, AuthError> {
     let source_str = source.as_str();
     log::info!("Found dbx update ({} bytes) on {}", data.len(), source_str);
 
@@ -243,7 +275,9 @@ pub fn enroll_dbx_from_file() -> Result<DbxEnrollmentResult, AuthError> {
         return Err(if status == r_efi::efi::Status::OUT_OF_RESOURCES {
             AuthError::BufferTooSmall
         } else {
-            AuthError::SignatureVerificationFailed
+            // Signature and replay checks already succeeded above. A runtime
+            // policy/storage refusal is not evidence of a bad signing key.
+            AuthError::AccessDenied
         });
     }
     super::boot::refresh_key_databases();
@@ -269,6 +303,13 @@ fn apply_authenticated_dbx_update(
     data: &[u8],
     source: &'static str,
 ) -> Result<DbxEnrollmentResult, AuthError> {
+    inspect_authenticated_dbx_update(data, source).map(|preview| preview.entries)
+}
+
+fn inspect_authenticated_dbx_update(
+    data: &[u8],
+    source: &'static str,
+) -> Result<DbxPreview, AuthError> {
     // Parse the EFI_VARIABLE_AUTHENTICATION_2 header
     let auth_header = EfiVariableAuthentication2::from_bytes(data).ok_or_else(|| {
         log::error!("Failed to parse EFI_VARIABLE_AUTHENTICATION_2 header");
@@ -295,9 +336,8 @@ fn apply_authenticated_dbx_update(
 
     // Anti-downgrade check: verify timestamp is newer than current dbx
     {
-        let dbx = dbx_database();
-        let current_timestamp = dbx.timestamp();
-        if !update_timestamp.is_after(current_timestamp) {
+        let current_timestamp = super::boot::dbx_replay_floor();
+        if !update_timestamp.is_after(&current_timestamp) {
             log::error!(
                 "dbx update timestamp is not newer than current (possible downgrade attack)"
             );
@@ -322,14 +362,18 @@ fn apply_authenticated_dbx_update(
     let signed_data = build_dbx_signed_data(&update_timestamp, sig_list_data);
 
     // Verify signature against KEK or PK
-    if !verify_dbx_signature(pkcs7_data, &signed_data)? {
+    let signer_sha256 = verify_dbx_signer(pkcs7_data, &signed_data)?.ok_or_else(|| {
         log::error!("dbx update signature verification failed");
-        return Err(AuthError::SignatureVerificationFailed);
-    }
+        AuthError::SignatureVerificationFailed
+    })?;
 
     log::info!("dbx update signature verified successfully");
 
-    apply_signature_list_entries(sig_list_data, source)
+    Ok(DbxPreview {
+        entries: apply_signature_list_entries(sig_list_data, source)?,
+        timestamp: Some(update_timestamp),
+        signer_sha256: Some(signer_sha256),
+    })
 }
 
 /// Apply a raw dbx update (Setup Mode only)
@@ -387,17 +431,17 @@ fn build_dbx_signed_data(timestamp: &EfiTime, content: &[u8]) -> Vec<u8> {
 }
 
 /// Verify the dbx update signature against KEK or PK
-fn verify_dbx_signature(pkcs7_data: &[u8], signed_data: &[u8]) -> Result<bool, AuthError> {
+fn verify_dbx_signer(pkcs7_data: &[u8], signed_data: &[u8]) -> Result<Option<[u8; 32]>, AuthError> {
     // Try to verify against KEK certificates
     {
         let kek = kek_database();
         for cert_data in kek.x509_certificates() {
-            match verify_pkcs7_signature(pkcs7_data, signed_data, cert_data, true) {
-                Ok(true) => {
+            match verify_pkcs7_signature_chain(pkcs7_data, signed_data, cert_data, true) {
+                Ok(Some(chain)) => {
                     log::info!("dbx update verified with KEK certificate");
-                    return Ok(true);
+                    return Ok(chain.end_entity().map(sha256));
                 }
-                Ok(false) => continue,
+                Ok(None) => continue,
                 Err(e) => {
                     log::debug!("KEK verification error: {:?}", e);
                     continue;
@@ -410,12 +454,12 @@ fn verify_dbx_signature(pkcs7_data: &[u8], signed_data: &[u8]) -> Result<bool, A
     {
         let pk = pk_database();
         for cert_data in pk.x509_certificates() {
-            match verify_pkcs7_signature(pkcs7_data, signed_data, cert_data, true) {
-                Ok(true) => {
+            match verify_pkcs7_signature_chain(pkcs7_data, signed_data, cert_data, true) {
+                Ok(Some(chain)) => {
                     log::info!("dbx update verified with PK certificate");
-                    return Ok(true);
+                    return Ok(chain.end_entity().map(sha256));
                 }
-                Ok(false) => continue,
+                Ok(None) => continue,
                 Err(e) => {
                     log::debug!("PK verification error: {:?}", e);
                     continue;
@@ -425,7 +469,7 @@ fn verify_dbx_signature(pkcs7_data: &[u8], signed_data: &[u8]) -> Result<bool, A
     }
 
     log::warn!("dbx update signature did not verify against any KEK or PK certificate");
-    Ok(false)
+    Ok(None)
 }
 
 /// Apply signature list entries to the dbx database

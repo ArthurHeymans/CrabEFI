@@ -433,12 +433,13 @@ fn boot_uefi_entry(entry: &menu::BootEntry) {
     };
     boot::install_block_io_protocols(entry.storage, info, &path_info);
 
-    if boot::try_boot_from_esp(
+    if boot::try_boot_path_from_esp(
         &entry.partition,
         entry.partition_num,
         &path_info,
         entry.storage,
         info.block_size,
+        &entry.path,
     ) {
         return;
     }

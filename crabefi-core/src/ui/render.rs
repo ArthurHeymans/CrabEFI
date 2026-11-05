@@ -92,7 +92,27 @@ pub fn font_width(size: FontSize) -> u32 {
 
 /// Pixel width of a string at the given size.
 pub fn text_width(s: &str, size: FontSize) -> u32 {
-    s.len() as u32 * font_width(size)
+    s.chars().count() as u32 * font_width(size)
+}
+
+/// Width-bounded labels, preserving UTF-8 boundaries and reserving an ellipsis.
+pub fn ellipsize(s: &str, width: u32, size: FontSize) -> heapless::String<256> {
+    let columns = (width / font_width(size)) as usize;
+    let mut out = heapless::String::new();
+    let truncated = s.chars().count() > columns || s.len() > out.capacity();
+    for ch in s
+        .chars()
+        .take(columns.saturating_sub(usize::from(truncated)))
+    {
+        if out.len() + ch.len_utf8() + usize::from(truncated) > out.capacity() {
+            break;
+        }
+        let _ = out.push(ch);
+    }
+    if truncated && columns > 0 {
+        let _ = out.push('~');
+    }
+    out
 }
 
 // ═══════════════════════════════════════════════════════════════════════

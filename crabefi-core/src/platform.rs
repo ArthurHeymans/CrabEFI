@@ -523,6 +523,14 @@ pub trait PlatformHooks {
     fn show_firmware_settings(&self) -> bool {
         false
     }
+
+    /// Graphical settings may navigate directly to another menu screen.
+    /// Existing providers retain their show-and-return behavior by default.
+    #[cfg(feature = "ui")]
+    fn show_graphical_firmware_settings(&self) -> crate::ui::ScreenNav {
+        self.show_firmware_settings();
+        crate::ui::ScreenNav::Back
+    }
 }
 
 // ============================================================================

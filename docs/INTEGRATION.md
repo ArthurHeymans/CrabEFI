@@ -107,6 +107,23 @@ impl crabefi::PlatformHooks for Hooks {
 }
 ```
 
+With `ui`, also override the graphical hook to preserve sidebar navigation and
+route it through the menu's unsaved-changes guard:
+
+```rust,ignore
+fn show_graphical_firmware_settings(&self) -> crabefi::ui::ScreenNav {
+    crabefi::cfr_menu::show_graphical_firmware_settings()
+}
+```
+
+The default graphical hook calls `show_firmware_settings()` and returns to Boot,
+so existing platform providers remain compatible. The graphical menu uses `B`,
+`S`, and `F` for navigation, `W` for Save, `?` for Help, and `D` for a draft default.
+Page Up/Down and Home/End navigate long lists. Changes remain drafts until saved;
+Escape cancels dialogs, and failed writes remain editable and retryable. A
+partial save commits successful writes only; Discard reverts unsaved drafts, not
+already committed values.
+
 Options normally use EFI variables under the CFR GUID. A platform that keeps
 some options elsewhere, such as CMOS, can register a static `cfr::OptionStore`
 once with `cfr::set_option_store`, after the heap is ready and before showing

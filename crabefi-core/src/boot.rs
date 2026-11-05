@@ -216,6 +216,25 @@ pub fn try_boot_from_esp(
     storage: StorageId,
     block_size: u32,
 ) -> bool {
+    try_boot_path_from_esp(
+        esp,
+        partition_num,
+        path_info,
+        storage,
+        block_size,
+        crate::menu::EFI_BOOT_PATH,
+    )
+}
+
+/// Honor the selected entry's path rather than silently loading the fallback.
+pub(crate) fn try_boot_path_from_esp(
+    esp: &fs::gpt::Partition,
+    partition_num: u32,
+    path_info: &DevicePathInfo,
+    storage: StorageId,
+    block_size: u32,
+    boot_path: &str,
+) -> bool {
     // Mounting the SimpleFileSystem also validates the FAT filesystem.
     let sfs_protocol =
         simple_file_system::init_partition(storage, esp.first_lba, esp.size_sectors());
@@ -307,7 +326,6 @@ pub fn try_boot_from_esp(
 
     // Read the bootloader, then release the disk before executing it: the
     // loaded image reads through the same disk via the installed protocols.
-    let boot_path = crate::menu::EFI_BOOT_PATH;
     let image = match storage::with_disk(storage, |disk| {
         read_bootloader(disk, esp.first_lba, boot_path)
     }) {

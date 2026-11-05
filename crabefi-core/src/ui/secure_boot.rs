@@ -1,13 +1,15 @@
 //! Graphical Secure Boot screen — Kinetic Command design.
 
 use super::{
-    NavItem, ScreenNav, canvas, clear, draw_footer, draw_header, draw_scrollbar, draw_sidebar,
-    poll_and_render_cursor, render, theme, update_sidebar_hover,
+    NavItem, ScreenNav, canvas, clear, dialog, draw_footer, draw_header, draw_scrollbar,
+    draw_sidebar, poll_and_render_cursor, render, theme, update_sidebar_hover,
 };
 use crate::FramebufferConfig as FramebufferInfo;
 use crate::cursor::CursorRenderer;
 use crate::menu_common::{self, KeyPress};
 use crate::time::delay_ms;
+use alloc::{string::String, vec::Vec};
+use core::fmt::Write;
 use render::FontSize;
 
 const ACTION_COUNT: usize = 6;
@@ -73,18 +75,34 @@ pub fn show(fb: &FramebufferInfo) -> ScreenNav {
                     keep_action_visible(fb, selected, &mut scroll_offset);
                     reselect!(before, had_status);
                 }
+                key @ (KeyPress::Home | KeyPress::End | KeyPress::PageUp | KeyPress::PageDown) => {
+                    if let Some(next) =
+                        super::page_selection(key, selected, ACTION_COUNT, action_visible_slots(fb))
+                    {
+                        selected = next;
+                    }
+                    keep_action_visible(fb, selected, &mut scroll_offset);
+                    reselect!(before, had_status);
+                }
                 KeyPress::Char('f') | KeyPress::Char('F') => {
                     cursor.hide(fb);
                     return ScreenNav::Nav(NavItem::Firmware);
                 }
                 KeyPress::Char('r') | KeyPress::Char('R') => {
-                    crate::reset_system();
+                    cursor.hide(fb);
+                    super::confirm_reset(fb, NavItem::Security);
+                    draw_screen(fb, selected, hovered, sidebar_hov, scroll_offset, status);
                 }
-                KeyPress::Escape | KeyPress::Char('q') | KeyPress::Char('Q') => {
+                KeyPress::Escape
+                | KeyPress::Char('b')
+                | KeyPress::Char('B')
+                | KeyPress::Char('q')
+                | KeyPress::Char('Q') => {
                     return ScreenNav::Back;
                 }
                 KeyPress::Enter => {
-                    status = handle_action(selected);
+                    cursor.hide(fb);
+                    status = handle_action(fb, selected);
                     if selected == ACTION_BACK {
                         return ScreenNav::Back;
                     }
@@ -104,7 +122,8 @@ pub fn show(fb: &FramebufferInfo) -> ScreenNav {
                     // Card click
                     if let Some(idx) = hovered {
                         if idx == selected {
-                            status = handle_action(selected);
+                            cursor.hide(fb);
+                            status = handle_action(fb, selected);
                             if selected == ACTION_BACK {
                                 return ScreenNav::Back;
                             }
@@ -146,27 +165,205 @@ pub fn show(fb: &FramebufferInfo) -> ScreenNav {
     }
 }
 
-fn handle_action(idx: usize) -> Option<(&'static str, bool)> {
-    use crate::efi::auth;
-    match idx {
-        0 => Some(crate::secure_boot_menu::toggle_secure_boot_action()),
-        1 => {
-            if !auth::is_setup_mode() {
-                Some(("Keys already enrolled", false))
-            } else {
-                match auth::boot::enroll_and_persist_default_keys() {
-                    Ok(_) => Some(("Default keys enrolled", true)),
-                    Err(_) => Some(("Failed to enroll keys", false)),
-                }
-            }
-        }
-        4 => match auth::boot::clear_all_keys() {
-            Ok(_) => Some(("All keys cleared", true)),
-            Err(_) => Some(("Failed to clear keys", false)),
-        },
-        ACTION_BACK => None,
-        _ => Some(("Not implemented", false)),
+fn unavailable_reason(idx: usize) -> Option<&'static str> {
+    if matches!(idx, 1 | 2) && !crate::efi::auth::is_setup_mode() {
+        Some("Requires Setup Mode; an owner key is already enrolled")
+    } else if idx == 4 && crate::efi::auth::boot::get_enrollment_summary() == (0, 0, 0, 0) {
+        Some("No keys enrolled; there is nothing to clear")
+    } else {
+        None
     }
+}
+
+/// Keep the file bytes owned across preview and consent: a subsequent ESP file
+/// replacement must not change the material that is actually enrolled.
+enum PendingImport {
+    Keys(crate::efi::auth::key_files::KeyFileSearchResult),
+    Dbx(Vec<u8>, crate::efi::auth::dbx_update::DbxSource),
+}
+
+fn fingerprint(hash: &[u8; 32]) -> String {
+    let mut text = String::new();
+    for (i, byte) in hash.iter().enumerate() {
+        if i > 0 && i.is_multiple_of(4) {
+            text.push(' ');
+        }
+        let _ = write!(text, "{byte:02x}");
+    }
+    text
+}
+
+fn prepare_import(idx: usize) -> Result<Option<(PendingImport, String)>, &'static str> {
+    use crate::efi::auth::{self, dbx_update, key_files, sha256};
+    match idx {
+        2 => {
+            let keys = key_files::find_key_files().ok_or_else(|| {
+                crate::secure_boot_menu::custom_pk_error(auth::AuthError::NoSuitableKey)
+            })?;
+            key_files::validate_key_files(&keys)
+                .map_err(crate::secure_boot_menu::custom_pk_error)?;
+            let pk = keys.pk.as_deref().ok_or("No PK certificate supplied")?;
+            let mut identity = alloc::format!(
+                "Source: {}. PK SHA256: {}.",
+                keys.source,
+                fingerprint(&sha256(pk))
+            );
+            if let Some(kek) = &keys.kek {
+                let _ = write!(identity, " KEK SHA256: {}.", fingerprint(&sha256(kek)));
+            }
+            if let Some(db) = &keys.db {
+                let _ = write!(identity, " Custom db SHA256: {}.", fingerprint(&sha256(db)));
+            }
+            Ok(Some((PendingImport::Keys(keys), identity)))
+        }
+        3 => {
+            let (data, source) = dbx_update::find_dbx_file().ok_or_else(|| {
+                crate::secure_boot_menu::dbx_error(auth::AuthError::NoSuitableKey)
+            })?;
+            let preview = dbx_update::preview_dbx_update(&data, source)
+                .map_err(crate::secure_boot_menu::dbx_error)?;
+            let mut identity = alloc::format!(
+                "Source: {}. {} hashes, {} certificates.",
+                preview.entries.source,
+                preview.entries.sha256_count,
+                preview.entries.x509_count
+            );
+            if let Some(time) = preview.timestamp {
+                let (year, month, day, hour, minute, second) = (
+                    time.year,
+                    time.month,
+                    time.day,
+                    time.hour,
+                    time.minute,
+                    time.second,
+                );
+                let _ = write!(
+                    identity,
+                    " Timestamp: {year:04}-{month:02}-{day:02} {hour:02}:{minute:02}:{second:02}."
+                );
+            }
+            if let Some(signer) = preview.signer_sha256 {
+                let _ = write!(
+                    identity,
+                    " Verified signer SHA256: {}.",
+                    fingerprint(&signer)
+                );
+            } else {
+                identity.push_str(" UNSIGNED: Setup Mode provisioning only.");
+            }
+            let _ = write!(identity, " File SHA256: {}.", fingerprint(&sha256(&data)));
+            Ok(Some((PendingImport::Dbx(data, source), identity)))
+        }
+        _ => Ok(None),
+    }
+}
+
+fn handle_action(fb: &FramebufferInfo, idx: usize) -> Option<(&'static str, bool)> {
+    use crate::efi::auth;
+    if idx == ACTION_BACK {
+        return None;
+    }
+    if unavailable_reason(idx).is_some() {
+        // The reason is already visible on the unavailable card.
+        return None;
+    }
+    let (title, message, confirm) = match idx {
+        0 if auth::is_secure_boot_requested() => (
+            "Disable Secure Boot?",
+            "Signature enforcement will stop immediately. Untrusted boot software will be allowed. Enrolled keys are kept.",
+            "Disable",
+        ),
+        0 => (
+            "Enable Secure Boot?",
+            "Signed boot software will be required once an owner key (PK) is enrolled. In Setup Mode the preference is saved, but enforcement stays off until enrollment.",
+            "Enable",
+        ),
+        1 => (
+            "Trust default keys?",
+            "Install the bundled Microsoft UEFI certificates (PK, KEK and db). This leaves Setup Mode and may activate signature enforcement immediately.",
+            "Enroll",
+        ),
+        2 => (
+            "Enroll custom owner key?",
+            "Replace PK/KEK/db using EFI\\keys\\PK.cer (or PK.der), optional KEK/db files AND bundled Microsoft UEFI CA trust. Without KEK.cer, PK also becomes KEK. dbx is kept. Enrolling PK leaves Setup Mode and may start enforcement now.",
+            "Enroll",
+        ),
+        3 => (
+            "Import revocations?",
+            if auth::is_setup_mode() {
+                "Load EFI\\keys\\dbxupdate.auth or dbx.auth. Setup Mode also allows unsigned dbx.bin or dbx.esl. Revoked boot software may stop booting. Only import a revocation list you trust."
+            } else {
+                "Load EFI\\keys\\dbxupdate.auth or dbx.auth, signed by an enrolled KEK or PK. Unsigned .bin/.esl files are not accepted in User Mode. Revoked boot software may stop booting."
+            },
+            "Import",
+        ),
+        4 => (
+            "Clear all Secure Boot keys?",
+            "Remove PK, KEK, db and dbx. Signature enforcement stops and Setup Mode is restored. You will need trusted key files to restore custom keys.",
+            "Clear keys",
+        ),
+        _ => return None,
+    };
+    if matches!(idx, 2 | 3) {
+        draw_screen(
+            fb,
+            idx,
+            None,
+            None,
+            0,
+            Some(("Loading and verifying file identities...", true)),
+        );
+    }
+    let prepared = match prepare_import(idx) {
+        Ok(prepared) => prepared,
+        Err(error) => return Some((error, false)),
+    };
+    let consent = prepared
+        .as_ref()
+        .map(|(_, identity)| alloc::format!("{message} {identity}"));
+    if dialog::choose(
+        fb,
+        NavItem::Security,
+        title,
+        consent.as_deref().unwrap_or(message),
+        &["Cancel", confirm],
+    ) == 0
+    {
+        return Some(("Cancelled; no changes made", true));
+    }
+    draw_screen(
+        fb,
+        idx,
+        None,
+        None,
+        0,
+        Some(("Working; please wait...", true)),
+    );
+    let result = match idx {
+        0 => return Some(crate::secure_boot_menu::toggle_secure_boot_action()),
+        1 => auth::boot::enroll_and_persist_default_keys()
+            .map(|_| "Default keys enrolled")
+            .map_err(|_| "Failed to enroll keys; check variable storage"),
+        2 | 3 => match prepared.map(|(pending, _)| pending) {
+            Some(PendingImport::Keys(keys)) => auth::key_files::enroll_key_files(keys)
+                .map(|_| "Custom PK enrolled; previewed identities committed")
+                .map_err(crate::secure_boot_menu::custom_pk_error),
+            Some(PendingImport::Dbx(data, source)) => {
+                auth::dbx_update::enroll_dbx_data(data, source)
+                    .map(|_| "dbx imported; previewed update committed")
+                    .map_err(crate::secure_boot_menu::dbx_error)
+            }
+            None => Err("No verified import was prepared"),
+        },
+        4 => auth::boot::clear_all_keys()
+            .map(|_| "All keys cleared; Setup Mode restored")
+            .map_err(|_| "Failed to clear keys; check variable storage"),
+        _ => return None,
+    };
+    Some(match result {
+        Ok(msg) => (msg, true),
+        Err(msg) => (msg, false),
+    })
 }
 
 /// Hit-test action cards.
@@ -186,15 +383,18 @@ fn action_hit(fb: &FramebufferInfo, scroll_offset: usize) -> Option<usize> {
 
 const ACTION_ITEMS: [(&str, &str); ACTION_COUNT] = [
     (
-        "Toggle Secure Boot",
-        "Save preference; enroll PK to start enforcing",
+        "Enable Secure Boot",
+        "Require signed boot software after PK enrollment",
     ),
     (
         "Enroll Default Keys",
         "Install Microsoft UEFI CA certificates",
     ),
     ("Enroll Custom PK", "Load PK from EFI\\keys\\PK.cer on ESP"),
-    ("Import dbx Update", "Load dbx revocation list from ESP"),
+    (
+        "Import dbx Update",
+        "Load signed dbxupdate.auth / dbx.auth from ESP",
+    ),
     ("Clear All Keys", "Remove all keys, return to Setup Mode"),
     ("Back to Boot Menu", "Return to boot entry selection"),
 ];
@@ -207,7 +407,8 @@ fn action_list_area(fb: &FramebufferInfo) -> (i32, i32, u32, u32) {
         render::font_height(FontSize::Small) + 4 + render::font_height(FontSize::Display) + 16;
     let used_h = header_h + hero_h + 16;
     let base_y = cy + used_h as i32;
-    (cx, base_y, cw, ch.saturating_sub(used_h))
+    // Keep feedback separate from the last card at every resolution.
+    (cx, base_y, cw, ch.saturating_sub(used_h + 40))
 }
 
 fn action_visible_slots(fb: &FramebufferInfo) -> usize {
@@ -256,7 +457,15 @@ fn paint_action_card(
     let Some((cx, y, cw, card_h)) = action_card_rect(fb, scroll_offset, i) else {
         return;
     };
-    let (title, desc) = ACTION_ITEMS[i];
+    let (mut title, mut desc) = ACTION_ITEMS[i];
+    if i == 0 && crate::efi::auth::is_secure_boot_requested() {
+        title = "Disable Secure Boot";
+        desc = "Stop enforcing signatures; keep enrolled keys";
+    }
+    let unavailable = unavailable_reason(i);
+    if let Some(reason) = unavailable {
+        desc = reason;
+    }
     let is_sel = i == selected;
     let is_hov = hovered == Some(i) && !is_sel;
 
@@ -295,22 +504,26 @@ fn paint_action_card(
         fb,
         tx,
         y + 4,
-        title,
+        &render::ellipsize(title, cw.saturating_sub(64), FontSize::Normal),
         FontSize::Normal,
-        theme::TEXT,
+        if unavailable.is_some() {
+            theme::TEXT_DIM
+        } else {
+            theme::TEXT
+        },
         Some(bg),
     );
     render::draw_text(
         fb,
         tx,
         y + 4 + render::font_height(FontSize::Normal) as i32 + 2,
-        desc,
+        &render::ellipsize(desc, cw.saturating_sub(64), FontSize::Small),
         FontSize::Small,
         theme::TEXT_DIM,
         Some(bg),
     );
 
-    if is_sel {
+    if is_sel && unavailable.is_none() {
         render::draw_text(
             fb,
             cx + cw as i32 - 28,
@@ -368,7 +581,7 @@ fn draw_screen(
     draw_sidebar(fb, NavItem::Security, sidebar_hov);
     draw_footer(
         fb,
-        "Up/Down Navigate  Enter Select  S Security  F Firmware  R Reset  Esc Back",
+        "Arrows/Pg/Home/End Select   Enter Open   F Firmware   Esc Back",
     );
 
     let (cx, cy, cw, _ch) = canvas(fb);
@@ -475,7 +688,7 @@ fn draw_screen(
             theme::GHOST
         };
         render::draw_pill(fb, kx, ky, s, theme::TEXT, pbg);
-        kx += (render::text_width(s, FontSize::Small) + 24) as i32;
+        kx += (render::text_width(s, FontSize::Small) + 18) as i32;
     }
 
     let _ = y; // y was used to position hero card; action cards use action_card_rect()
@@ -490,9 +703,9 @@ fn draw_screen(
 
     // Status toast
     if let Some((msg, ok)) = status {
-        let msg_y = fb.height as i32 - theme::FOOTER_H as i32 - 24;
-        let color = if ok { theme::SECONDARY } else { theme::ERROR };
-        render::draw_text_centered(fb, 0, msg_y, fb.width, msg, FontSize::Normal, color, None);
+        let msg_y = fb.height as i32 - theme::FOOTER_H as i32 - 46;
+        let color = if ok { theme::GREEN } else { theme::ERROR };
+        dialog::wrapped(fb, (cx, msg_y, cw, 40), msg, color);
     }
 }
 
@@ -514,6 +727,14 @@ fn fmt_kc<'a>(name: &str, count: u32, buf: &'a mut [u8; 16]) -> &'a str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn identity_fingerprint_preserves_every_sha256_byte() {
+        let formatted = fingerprint(&[0xab; 32]);
+        assert_eq!(formatted.replace(' ', ""), "ab".repeat(32));
+        assert_eq!(formatted.len(), 71);
+        assert_eq!(formatted.split_whitespace().count(), 8);
+    }
 
     fn framebuffer(mem: &mut [u32], width: u32, height: u32) -> FramebufferInfo {
         FramebufferInfo {

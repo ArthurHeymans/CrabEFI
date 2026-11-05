@@ -19,8 +19,7 @@ pub fn show(fb: &FramebufferInfo) -> ScreenNav {
         return show_no_settings(fb);
     }
 
-    hooks.show_firmware_settings();
-    ScreenNav::Back
+    hooks.show_graphical_firmware_settings()
 }
 
 fn show_no_settings(fb: &FramebufferInfo) -> ScreenNav {
@@ -65,9 +64,15 @@ fn show_no_settings(fb: &FramebufferInfo) -> ScreenNav {
                 }
                 KeyPress::Char('f') | KeyPress::Char('F') => {}
                 KeyPress::Char('r') | KeyPress::Char('R') => {
-                    crate::reset_system();
+                    cursor.hide(fb);
+                    super::confirm_reset(fb, NavItem::Firmware);
+                    return ScreenNav::Nav(NavItem::Firmware);
                 }
-                KeyPress::Escape | KeyPress::Char('q') | KeyPress::Char('Q') => {
+                KeyPress::Escape
+                | KeyPress::Char('b')
+                | KeyPress::Char('B')
+                | KeyPress::Char('q')
+                | KeyPress::Char('Q') => {
                     return ScreenNav::Back;
                 }
                 #[cfg(feature = "ui")]

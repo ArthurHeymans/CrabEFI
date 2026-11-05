@@ -5,6 +5,7 @@
 //! hero cards, and a divider-free layout.  Multi-size anti-aliased Noto Sans
 //! Mono font for modern typography hierarchy.
 
+pub mod dialog;
 pub mod firmware_settings;
 pub mod render;
 #[cfg(feature = "secure-boot")]
@@ -49,10 +50,10 @@ enum BootResult {
 }
 
 const NAV_ITEMS: &[(NavItem, &str)] = &[
-    (NavItem::Boot, "BOOT"),
+    (NavItem::Boot, "BOOT [B]"),
     #[cfg(feature = "secure-boot")]
-    (NavItem::Security, "SECURITY"),
-    (NavItem::Firmware, "FIRMWARE"),
+    (NavItem::Security, "SECURITY [S]"),
+    (NavItem::Firmware, "FIRMWARE [F]"),
 ];
 
 fn nav_item_index(item: NavItem) -> usize {
@@ -97,7 +98,15 @@ pub fn draw_header(fb: &FramebufferInfo) {
     );
     let vx = 14 + render::text_width("CRABEFI", FontSize::Heading) as i32 + 12;
     let vy = (theme::HEADER_H as i32 - render::font_height(FontSize::Small) as i32) / 2;
-    render::draw_text(fb, vx, vy, "v0.1.0", FontSize::Small, theme::OUTLINE, None);
+    render::draw_text(
+        fb,
+        vx,
+        vy,
+        concat!("v", env!("CARGO_PKG_VERSION")),
+        FontSize::Small,
+        theme::TEXT_DIM,
+        None,
+    );
 }
 
 /// Draw the left sidebar with navigation items.
@@ -124,6 +133,57 @@ pub fn draw_sidebar(fb: &FramebufferInfo, active: NavItem, hovered: Option<NavIt
     // Nav items
     for (i, (item, label)) in NAV_ITEMS.iter().enumerate() {
         paint_sidebar_item(fb, i, *item, label, active, hovered == Some(*item));
+    }
+    if fb.height >= 480 {
+        let y = (fb.height - theme::FOOTER_H - 112) as i32;
+        #[cfg(feature = "secure-boot")]
+        {
+            let state = crate::efi::auth::secure_boot_state();
+            render::draw_text(
+                fb,
+                14,
+                y,
+                "SECURE BOOT",
+                FontSize::Small,
+                theme::TEXT_DIM,
+                None,
+            );
+            render::draw_text(
+                fb,
+                14,
+                y + 22,
+                crate::secure_boot_menu::secure_boot_state_label(state),
+                FontSize::Small,
+                if state.enforcing {
+                    theme::SECONDARY
+                } else {
+                    theme::ORANGE
+                },
+                None,
+            );
+        }
+        render::draw_text(
+            fb,
+            14,
+            y + 60,
+            "R  Restart",
+            FontSize::Small,
+            theme::TEXT_DIM,
+            None,
+        );
+        render::draw_text(
+            fb,
+            14,
+            y + 82,
+            if active == NavItem::Boot {
+                "F  Firmware"
+            } else {
+                "Esc  Back"
+            },
+            FontSize::Small,
+            theme::TEXT_DIM,
+            None,
+        );
     }
 }
 
@@ -185,9 +245,40 @@ pub fn draw_footer(fb: &FramebufferInfo, hint: &str) {
         w,
         hint,
         FontSize::Small,
-        theme::OUTLINE,
+        theme::TEXT_DIM,
         None,
     );
+}
+
+/// Bounded page navigation shared by contiguous graphical lists.
+pub(crate) fn page_selection(
+    key: KeyPress,
+    current: usize,
+    count: usize,
+    page: usize,
+) -> Option<usize> {
+    let last = count.checked_sub(1)?;
+    Some(match key {
+        KeyPress::Home => 0,
+        KeyPress::End => last,
+        KeyPress::PageUp => current.saturating_sub(page.max(1)),
+        KeyPress::PageDown => current.saturating_add(page.max(1)).min(last),
+        _ => return None,
+    })
+}
+
+/// Reset is never a one-key destructive action in the graphical menu.
+pub(crate) fn confirm_reset(fb: &FramebufferInfo, nav: NavItem) {
+    if dialog::choose(
+        fb,
+        nav,
+        "Restart the system?",
+        "The system will restart now. Attach any new boot devices before restarting.",
+        &["Cancel", "Restart"],
+    ) == 1
+    {
+        crate::reset_system();
+    }
 }
 
 pub fn poll_and_render_cursor(fb: &FramebufferInfo, cursor: &mut CursorRenderer) {
@@ -197,7 +288,7 @@ pub fn poll_and_render_cursor(fb: &FramebufferInfo, cursor: &mut CursorRenderer)
 }
 
 /// Main canvas origin (x, y) and size (w, h) — right of sidebar, below header, above footer.
-fn canvas(fb: &FramebufferInfo) -> (i32, i32, u32, u32) {
+pub(crate) fn canvas(fb: &FramebufferInfo) -> (i32, i32, u32, u32) {
     let x = theme::SIDEBAR_W as i32 + theme::PAD as i32;
     let y = (theme::HEADER_H + theme::PAD) as i32;
     let w = fb.width - theme::SIDEBAR_W - theme::PAD * 2;
@@ -239,7 +330,7 @@ pub fn update_sidebar_hover(
 }
 
 /// Hit-test sidebar: which nav item is the mouse over?
-fn sidebar_hit() -> Option<NavItem> {
+pub(crate) fn sidebar_hit() -> Option<NavItem> {
     let (mx, my) = mouse_cursor::position();
     if mx < 0 || mx >= theme::SIDEBAR_W as i32 {
         return None;
@@ -376,9 +467,17 @@ fn run_boot(fb: &FramebufferInfo, menu: &mut BootMenu) -> BootResult {
     keep_boot_selection_visible(fb, &mut st);
 
     paint_boot(fb, menu, &st);
+    let mut pointer = mouse_cursor::position();
 
     loop {
         poll_and_render_cursor(fb, &mut cursor);
+        let new_pointer = mouse_cursor::position();
+        if new_pointer != pointer {
+            pointer = new_pointer;
+            if cancel_boot_countdown(menu, &mut st) {
+                cursor.while_hidden(fb, || paint_boot_footer(fb, &st));
+            }
+        }
 
         update_sidebar_hover(fb, &mut cursor, &mut st.sidebar_hov, NavItem::Boot);
 
@@ -396,8 +495,7 @@ fn run_boot(fb: &FramebufferInfo, menu: &mut BootMenu) -> BootResult {
         }
 
         if let Some(key) = menu_common::read_key() {
-            if st.countdown > 0 {
-                st.countdown = 0;
+            if cancel_boot_countdown(menu, &mut st) {
                 cursor.while_hidden(fb, || paint_boot_footer(fb, &st));
             }
 
@@ -410,6 +508,15 @@ fn run_boot(fb: &FramebufferInfo, menu: &mut BootMenu) -> BootResult {
                 KeyPress::Down | KeyPress::Char('j') => {
                     let before = (st.sel, st.scroll_offset);
                     st.sel_next();
+                    select_boot(fb, menu, &mut st, &mut cursor, before);
+                }
+                key @ (KeyPress::Home | KeyPress::End | KeyPress::PageUp | KeyPress::PageDown) => {
+                    let before = (st.sel, st.scroll_offset);
+                    if let Some(next) =
+                        page_selection(key, st.sel, st.count, boot_visible_slots(fb))
+                    {
+                        st.sel = next;
+                    }
                     select_boot(fb, menu, &mut st, &mut cursor, before);
                 }
                 KeyPress::Enter => {
@@ -426,7 +533,9 @@ fn run_boot(fb: &FramebufferInfo, menu: &mut BootMenu) -> BootResult {
                     return BootResult::Nav(NavItem::Firmware);
                 }
                 KeyPress::Char('r') | KeyPress::Char('R') => {
-                    crate::reset_system();
+                    cursor.hide(fb);
+                    confirm_reset(fb, NavItem::Boot);
+                    paint_boot(fb, menu, &st);
                 }
                 #[cfg(feature = "ui")]
                 KeyPress::MouseClick { .. } => {
@@ -473,6 +582,14 @@ fn run_boot(fb: &FramebufferInfo, menu: &mut BootMenu) -> BootResult {
         }
         delay_ms(8);
     }
+}
+
+/// Cancellation belongs to the menu session, not an individual screen visit.
+fn cancel_boot_countdown(menu: &mut BootMenu, state: &mut BState) -> bool {
+    let was_running = state.countdown > 0;
+    state.countdown = 0;
+    menu.timeout_seconds = 0;
+    was_running
 }
 
 fn run_no_media(fb: &FramebufferInfo) -> ScreenNav {
@@ -536,18 +653,18 @@ fn run_no_media(fb: &FramebufferInfo) -> ScreenNav {
         cx,
         mid_y + 72,
         cw,
-        "Mouse active -- move to test tracking",
+        "Settings are available without a boot device.",
         FontSize::Small,
-        theme::OUTLINE,
+        theme::TEXT_DIM,
         None,
     );
 
     draw_footer(
         fb,
         if cfg!(feature = "secure-boot") {
-            "S: Security  F: Firmware  R: Reset  Esc: Halt"
+            "S Security   F Firmware   R Restart   Esc Halt"
         } else {
-            "F: Firmware  R: Reset  Esc: Halt"
+            "F Firmware   R Restart   Esc Halt"
         },
     );
 
@@ -559,7 +676,9 @@ fn run_no_media(fb: &FramebufferInfo) -> ScreenNav {
         if let Some(key) = menu_common::read_key() {
             match key {
                 KeyPress::Char('r') | KeyPress::Char('R') => {
-                    crate::reset_system();
+                    cursor.hide(fb);
+                    confirm_reset(fb, NavItem::Boot);
+                    return ScreenNav::Nav(NavItem::Boot);
                 }
                 #[cfg(feature = "secure-boot")]
                 KeyPress::Char('s') | KeyPress::Char('S') => {
@@ -594,7 +713,7 @@ fn boot_list_area(fb: &FramebufferInfo) -> (i32, i32, u32, u32) {
     let header_h =
         render::font_height(FontSize::Small) + 4 + render::font_height(FontSize::Display) + 12;
     let y = cy + header_h as i32;
-    (cx, y, cw, ch.saturating_sub(header_h))
+    (cx, y, cw, ch.saturating_sub(header_h + 28))
 }
 
 fn boot_visible_slots(fb: &FramebufferInfo) -> usize {
@@ -797,7 +916,7 @@ fn paint_boot_card(fb: &FramebufferInfo, menu: &BootMenu, st: &BState, idx: usiz
         fb,
         tx,
         ty,
-        &entry.name,
+        &render::ellipsize(&entry.name, cw.saturating_sub(120), FontSize::Normal),
         FontSize::Normal,
         theme::TEXT,
         Some(bg),
@@ -818,7 +937,11 @@ fn paint_boot_card(fb: &FramebufferInfo, menu: &BootMenu, st: &BState, idx: usiz
         fb,
         info_x,
         row2 + 3,
-        &entry.path,
+        &render::ellipsize(
+            &entry.path,
+            (cx + cw as i32 - info_x - 16).max(0) as u32,
+            FontSize::Small,
+        ),
         FontSize::Small,
         theme::TEXT_DIM,
         Some(bg),
@@ -826,7 +949,7 @@ fn paint_boot_card(fb: &FramebufferInfo, menu: &BootMenu, st: &BState, idx: usiz
 
     // Right side hint for selected
     if is_sel {
-        let label = "SELECT >";
+        let label = "BOOT >";
         let lw = render::text_width(label, FontSize::Small);
         render::draw_text(
             fb,
@@ -841,50 +964,44 @@ fn paint_boot_card(fb: &FramebufferInfo, menu: &BootMenu, st: &BState, idx: usiz
 }
 
 fn paint_boot_footer(fb: &FramebufferInfo, st: &BState) {
-    let w = fb.width;
-    let fy = fb.height - theme::FOOTER_H;
-    render::fill_rect(fb, 0, fy as i32, w, theme::FOOTER_H, theme::BG);
-
+    let (x, _, w, _) = canvas(fb);
+    let y = (fb.height - theme::FOOTER_H - 28) as i32;
+    render::fill_rect(fb, x, y, w, 28, theme::BG);
     if st.countdown > 0 && st.init_timeout > 0 {
-        let bar_x = (theme::SIDEBAR_W + theme::PAD) as i32;
-        let bar_w = w - theme::SIDEBAR_W - theme::PAD * 2 - 120;
-        let frac = st.countdown as f32 / st.init_timeout as f32;
-        let bar_y = fy as i32 + (theme::FOOTER_H as i32 - theme::PROGRESS_H as i32) / 2;
-        render::draw_progress_bar(
-            fb,
-            bar_x,
-            bar_y,
-            bar_w,
-            theme::PROGRESS_H,
-            frac,
-            theme::PRIMARY,
-            theme::CONT_HIGH,
-            theme::PROGRESS_RADIUS,
-        );
-
         let mut buf = [0u8; 16];
-        let s = fmt_cd(st.countdown, &mut buf);
-        let text_y =
-            fy as i32 + (theme::FOOTER_H as i32 - render::font_height(FontSize::Small) as i32) / 2;
+        let label = alloc::format!(
+            "{}  |  Move mouse or press any key to cancel",
+            fmt_cd(st.countdown, &mut buf)
+        );
         render::draw_text(
             fb,
-            bar_x + bar_w as i32 + 12,
-            text_y,
-            s,
+            x,
+            y,
+            &render::ellipsize(&label, w, FontSize::Small),
             FontSize::Small,
             theme::PRIMARY,
             None,
         );
-    } else {
-        draw_footer(
+        render::draw_progress_bar(
             fb,
-            if cfg!(feature = "secure-boot") {
-                "Up/Down Navigate  Enter Boot  S Security  F Firmware  R Reset"
-            } else {
-                "Up/Down Navigate  Enter Boot  F Firmware  R Reset"
-            },
+            x,
+            y + 20,
+            w,
+            theme::PROGRESS_H,
+            st.countdown as f32 / st.init_timeout as f32,
+            theme::PRIMARY,
+            theme::CONT_HIGH,
+            theme::PROGRESS_RADIUS,
         );
     }
+    draw_footer(
+        fb,
+        if cfg!(feature = "secure-boot") {
+            "Arrows/Pg/Home/End Select   Enter Boot   S Security   F Firmware"
+        } else {
+            "Up/Down Select   Enter / Click again Boot   F Firmware"
+        },
+    );
 }
 
 fn fmt_cd(secs: u32, buf: &mut [u8; 16]) -> &str {
@@ -1008,6 +1125,28 @@ mod tests {
             });
         });
         menu
+    }
+
+    #[test]
+    fn page_navigation_is_bounded_and_handles_empty_lists() {
+        assert_eq!(page_selection(KeyPress::End, 0, 40, 6), Some(39));
+        assert_eq!(page_selection(KeyPress::Home, 30, 40, 6), Some(0));
+        assert_eq!(page_selection(KeyPress::PageDown, 38, 40, 6), Some(39));
+        assert_eq!(page_selection(KeyPress::PageUp, 2, 40, 6), Some(0));
+        assert_eq!(page_selection(KeyPress::PageDown, 0, 0, 6), None);
+    }
+
+    #[test]
+    fn countdown_cancellation_survives_returning_from_settings() {
+        let mut menu = boot_menu(1);
+        menu.timeout_seconds = 5;
+        let mut state = BState::new(1, 0, menu.timeout_seconds);
+        assert!(cancel_boot_countdown(&mut menu, &mut state));
+        assert_eq!(state.countdown, 0);
+        assert_eq!(menu.timeout_seconds, 0);
+        let returned = BState::new(1, menu.selected, menu.timeout_seconds);
+        assert_eq!(returned.countdown, 0);
+        assert!(!cancel_boot_countdown(&mut menu, &mut state));
     }
 
     /// Stepping through the boot list with partial repaints, with the mouse cursor sitting
