@@ -386,6 +386,51 @@ mod tests {
     }
 
     #[test]
+    fn query_variable_info_reports_capacities_and_enforces_runtime_access() {
+        use crate::store::VariableStore;
+        use crabefi_runtime_abi::MAX_VARIABLE_DATA_SIZE;
+
+        let _guard = RUNTIME_TEST.lock().unwrap();
+        let (previous_phase, expected_remaining) = {
+            let lease = state::lease().unwrap();
+            (lease.phase(), lease.variables().remaining_storage())
+        };
+        let bs = efi::VARIABLE_BOOTSERVICE_ACCESS;
+        let rt = efi::VARIABLE_RUNTIME_ACCESS;
+        let nv = efi::VARIABLE_NON_VOLATILE;
+        for phase in [Phase::BootActive, Phase::SealedPhysical, Phase::Virtual] {
+            state::lease().unwrap().advance(phase);
+            for attributes in [
+                bs,
+                bs | rt,
+                nv | bs | rt,
+                nv | bs | rt | efi::VARIABLE_APPEND_WRITE,
+            ] {
+                let (mut maximum, mut remaining, mut variable) = (u64::MAX, u64::MAX, u64::MAX);
+                let status = services::query_variable_info(
+                    attributes,
+                    &mut maximum,
+                    &mut remaining,
+                    &mut variable,
+                );
+                if phase.runtime() && attributes & rt == 0 {
+                    assert_eq!(status, efi::Status::INVALID_PARAMETER);
+                    assert_eq!(
+                        (maximum, remaining, variable),
+                        (u64::MAX, u64::MAX, u64::MAX)
+                    );
+                } else {
+                    assert_eq!(status, efi::Status::SUCCESS);
+                    assert_eq!(maximum, VariableStore::maximum_storage());
+                    assert_eq!(remaining, expected_remaining);
+                    assert_eq!(variable, MAX_VARIABLE_DATA_SIZE as u64);
+                }
+            }
+        }
+        state::lease().unwrap().advance(previous_phase);
+    }
+
+    #[test]
     fn variable_import_rejects_odd_utf16_address_before_dereference() {
         let _guard = RUNTIME_TEST.lock().unwrap();
         let import = VariableImport {

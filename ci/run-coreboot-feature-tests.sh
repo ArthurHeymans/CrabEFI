@@ -49,7 +49,7 @@ do
     "$TMPDIR/$test_name"
 done
 
-python3 - "$ROOT/crabefi-coreboot/src/cfr.rs" <<'PY'
+python3 - "$ROOT/crabefi-core/src/cfr.rs" <<'PY'
 import re
 import sys
 from pathlib import Path
@@ -68,6 +68,9 @@ assert "variables::set(&COREBOOT_CFR_GUID, &name, attrs, &data)" in write_block,
 )
 assert "status != efi::Status::SUCCESS" in write_block, (
     "CFR writes must propagate runtime-image failures"
+)
+assert "store_of(option)" in write_block and "store.write(option, value)" in write_block, (
+    "Kept CFR options must be written through the platform OptionStore"
 )
 
 delete_match = re.search(r"pub fn delete_option_value\(.*?\n}\n\Z", src, re.S)

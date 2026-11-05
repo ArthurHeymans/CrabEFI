@@ -20,6 +20,10 @@ pub mod boot_vars;
 #[cfg(feature = "bundled-runtime-image")]
 mod bundled_runtime;
 pub mod cell;
+#[cfg(feature = "cfr")]
+pub mod cfr;
+#[cfg(feature = "cfr")]
+pub mod cfr_menu;
 #[cfg(feature = "ui")]
 pub mod cursor;
 pub mod drivers;

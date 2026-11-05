@@ -1054,14 +1054,7 @@ fn variable_info(
     {
         return Err(efi::Status::INVALID_PARAMETER);
     }
-    let attributes =
-        VariableAttributes::from_bits(attributes).ok_or(efi::Status::INVALID_PARAMETER)?;
-    if !attributes
-        .contains(VariableAttributes::NON_VOLATILE | VariableAttributes::BOOTSERVICE_ACCESS)
-        || attributes.contains(VariableAttributes::APPEND_WRITE)
-    {
-        return Err(efi::Status::INVALID_PARAMETER);
-    }
+    validate_query_attributes(attributes, Phase::current().boot_services())?;
     let lease = state::lease()?;
     // Without retained staging the RAM store still answers: volatile writes
     // remain possible and SetVariable stays the authority on NV failures.
@@ -1072,6 +1065,66 @@ fn variable_info(
         maximum_variable_size.write(MAX_VARIABLE_DATA_SIZE as u64);
     }
     Ok(())
+}
+
+/// QueryVariableInfo attribute checks (UEFI 2.10 §8.2.6, as EDK II's
+/// variable driver): volatile and non-volatile queries are both valid, and
+/// so is `APPEND_WRITE` (Linux asks with the attributes of an appending
+/// write). Volatile and non-volatile variables share one arena, so both
+/// get the same answer.
+fn validate_query_attributes(attributes: u32, boot_services: bool) -> Result<(), efi::Status> {
+    let attributes =
+        VariableAttributes::from_bits(attributes).ok_or(efi::Status::INVALID_PARAMETER)?;
+    if attributes.is_empty() {
+        return Err(efi::Status::UNSUPPORTED);
+    }
+    if !attributes.contains(VariableAttributes::BOOTSERVICE_ACCESS) {
+        return Err(efi::Status::INVALID_PARAMETER);
+    }
+    if !boot_services && !attributes.contains(VariableAttributes::RUNTIME_ACCESS) {
+        return Err(efi::Status::INVALID_PARAMETER);
+    }
+    if attributes.contains(VariableAttributes::HARDWARE_ERROR_RECORD) {
+        return Err(if attributes.contains(VariableAttributes::NON_VOLATILE) {
+            efi::Status::UNSUPPORTED
+        } else {
+            efi::Status::INVALID_PARAMETER
+        });
+    }
+    if attributes.contains(VariableAttributes::AUTHENTICATED_WRITE_ACCESS) {
+        return Err(efi::Status::UNSUPPORTED);
+    }
+    if !cfg!(feature = "secure-boot")
+        && attributes.contains(VariableAttributes::TIME_BASED_AUTHENTICATED_WRITE_ACCESS)
+    {
+        return Err(efi::Status::UNSUPPORTED);
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod query_tests {
+    use super::*;
+
+    #[test]
+    fn time_based_queries_require_secure_boot_support() {
+        let bs = VariableAttributes::BOOTSERVICE_ACCESS;
+        let rt = VariableAttributes::RUNTIME_ACCESS;
+        let nv = VariableAttributes::NON_VOLATILE;
+        let auth = VariableAttributes::TIME_BASED_AUTHENTICATED_WRITE_ACCESS;
+        for attrs in [bs, bs | rt, nv | bs | rt] {
+            assert_eq!(validate_query_attributes(attrs.bits(), true), Ok(()));
+            let expected = if cfg!(feature = "secure-boot") {
+                Ok(())
+            } else {
+                Err(efi::Status::UNSUPPORTED)
+            };
+            assert_eq!(
+                validate_query_attributes((attrs | auth).bits(), true),
+                expected
+            );
+        }
+    }
 }
 
 fn call_boot_bridge(address: u64, request: &BridgeRequest) -> Result<(), efi::Status> {
@@ -1177,6 +1230,35 @@ mod tests {
     use crabefi_efi_types::authentication::EfiVariableAuthentication2;
 
     use crate::auth;
+
+    #[test]
+    fn query_variable_info_accepts_volatile_and_append_queries() {
+        let bs = VariableAttributes::BOOTSERVICE_ACCESS;
+        let rt = VariableAttributes::RUNTIME_ACCESS;
+        let nv = VariableAttributes::NON_VOLATILE;
+        let query = |a: VariableAttributes, boot| validate_query_attributes(a.bits(), boot);
+        // shim's MokList state: volatile, boot services.
+        assert!(query(bs, true).is_ok());
+        assert!(query(bs | rt, true).is_ok());
+        assert!(query(nv | bs | rt, true).is_ok());
+        assert!(query(nv | bs | rt | VariableAttributes::APPEND_WRITE, true).is_ok());
+        assert!(query(RAW_ATTRIBUTES, false).is_ok());
+        assert_eq!(query(bs, false), Err(efi::Status::INVALID_PARAMETER));
+        assert_eq!(query(rt, true), Err(efi::Status::INVALID_PARAMETER));
+        assert_eq!(query(nv, true), Err(efi::Status::INVALID_PARAMETER));
+        assert_eq!(
+            query(VariableAttributes::empty(), true),
+            Err(efi::Status::UNSUPPORTED)
+        );
+        assert_eq!(
+            query(nv | bs | VariableAttributes::HARDWARE_ERROR_RECORD, true),
+            Err(efi::Status::UNSUPPORTED)
+        );
+        assert_eq!(
+            validate_query_attributes(1 << 31, true),
+            Err(efi::Status::INVALID_PARAMETER)
+        );
+    }
 
     #[test]
     fn bounded_name_read_rejects_missing_terminator_without_exceeding_declared_extent() {

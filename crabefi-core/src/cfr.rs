@@ -4,6 +4,10 @@
 //! configuration options to payloads. CFR allows displaying and modifying
 //! boot-time configurable options like "Hyper-Threading Enable", "SATA Mode", etc.
 //!
+//! coreboot hands CFR over in its tables; a host firmware that links CrabEFI
+//! as a library passes the same record to [`parse_cfr`] and [`store_cfr`],
+//! and shows [`crate::cfr_menu::show_cfr_menu`] from its platform hooks.
+//!
 //! # CFR Structure
 //!
 //! CFR records form a tree structure where:
@@ -920,14 +924,8 @@ fn parse_enum_value(data: &[u8]) -> Option<CfrEnumChoice> {
 /// This is the GUID used by coreboot's `get_uint_option()` / `set_uint_option()`
 /// in `src/drivers/efi/option.c`. It must match exactly for coreboot to find
 /// the variables we write.
-pub const COREBOOT_CFR_GUID: r_efi::efi::Guid = r_efi::efi::Guid::from_fields(
-    0xceae4c1d,
-    0x335b,
-    0x4685,
-    0xa4,
-    0xa0,
-    &[0xfc, 0x4a, 0x94, 0xee, 0xa0, 0x85],
-);
+pub const COREBOOT_CFR_GUID: r_efi::efi::Guid =
+    r_efi::efi::Guid::from_bytes(&crabefi_efi_types::varstore::COREBOOT_CFR_GUID);
 
 /// Value types for CFR options
 #[derive(Debug, Clone, PartialEq)]
@@ -961,12 +959,67 @@ fn ascii_to_ucs2(s: &str) -> Vec<u16> {
     result
 }
 
+/// Storage a platform keeps some options in instead of EFI variables, such
+/// as CMOS RAM. Options it does not keep stay EFI variables.
+pub trait OptionStore: Sync {
+    /// Whether this store keeps `option`.
+    fn keeps(&self, option: &CfrOption) -> bool;
+    /// The stored value of a kept option; `None` while it is unset.
+    fn read(&self, option: &CfrOption) -> Option<CfrValue>;
+    /// Store a kept option.
+    fn write(&self, option: &CfrOption, value: &CfrValue) -> Result<(), &'static str>;
+}
+
+static OPTION_STORE: AtomicPtr<&'static dyn OptionStore> = AtomicPtr::new(core::ptr::null_mut());
+
+/// Keep the options `store` keeps there. Call once, before the menu runs.
+pub fn set_option_store(store: &'static dyn OptionStore) {
+    let ptr = Box::into_raw(Box::new(store));
+    if OPTION_STORE
+        .compare_exchange(
+            core::ptr::null_mut(),
+            ptr,
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        )
+        .is_err()
+    {
+        // SAFETY: publication failed, so no reader can hold this allocation.
+        unsafe { drop(Box::from_raw(ptr)) };
+        panic!("set_option_store must only be called once");
+    }
+}
+
+/// The platform store keeping `option`, if any.
+fn store_of(option: &CfrOption) -> Option<&'static dyn OptionStore> {
+    let ptr = OPTION_STORE.load(Ordering::SeqCst);
+    // SAFETY: set once from a leaked box, never freed.
+    let store = unsafe { ptr.as_ref() }.copied()?;
+    store.keeps(option).then_some(store)
+}
+
 /// Read a CFR option value from storage
 ///
 /// Returns the stored value or falls back to the CFR default.
 pub fn read_option_value(option: &CfrOption) -> CfrValue {
+    if let Some(store) = store_of(option) {
+        return store
+            .read(option)
+            .filter(|value| {
+                matches!(
+                    (&option.option_type, value),
+                    (CfrOptionType::Bool { .. }, CfrValue::Bool(_))
+                        | (
+                            CfrOptionType::Number { .. } | CfrOptionType::Enum { .. },
+                            CfrValue::Number(_)
+                        )
+                        | (CfrOptionType::Varchar { .. }, CfrValue::Varchar(_))
+                )
+            })
+            .unwrap_or_else(|| CfrValue::from_option_type(&option.option_type));
+    }
     let name = ascii_to_ucs2(&option.opt_name);
-    let data = crabefi::efi::runtime_image::client::variables::get(&COREBOOT_CFR_GUID, &name)
+    let data = crate::efi::runtime_image::client::variables::get(&COREBOOT_CFR_GUID, &name)
         .map(|(_, data)| data);
     data.map_or_else(
         || CfrValue::from_option_type(&option.option_type),
@@ -1000,7 +1053,10 @@ fn read_cfr_number(data: &[u8]) -> u32 {
 /// All numeric types (Bool, Number, Enum) are stored as 4-byte LE u32
 /// for compatibility with coreboot's get_uint_option() which returns unsigned int.
 pub fn write_option_value(option: &CfrOption, value: &CfrValue) -> Result<(), &'static str> {
-    use crabefi::efi::runtime_image::client::variables;
+    if let Some(store) = store_of(option) {
+        return store.write(option, value);
+    }
+    use crate::efi::runtime_image::client::variables;
     use r_efi::efi;
 
     let name = ascii_to_ucs2(&option.opt_name);
@@ -1044,7 +1100,10 @@ pub fn write_option_value(option: &CfrOption, value: &CfrValue) -> Result<(), &'
 // ci/run-coreboot-feature-tests.sh; no menu path calls it yet.
 #[allow(dead_code)]
 pub fn delete_option_value(option: &CfrOption) -> Result<(), &'static str> {
-    use crabefi::efi::runtime_image::client::variables;
+    if store_of(option).is_some() {
+        return Err("Cannot delete option kept by platform store");
+    }
+    use crate::efi::runtime_image::client::variables;
     use r_efi::efi;
 
     let name = ascii_to_ucs2(&option.opt_name);

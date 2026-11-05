@@ -23,7 +23,10 @@ capsule-update = ["pkcs7", "variable-store"]
 # image.
 pkcs7 = ["dep:sha1", "dep:crabefi-pkcs7"]
 # Preserve the standalone payload's existing non-graphical capabilities explicitly.
-full = ["tpm", "xhci", "spi-flash", "secure-boot", "capsule-update"]
+full = ["tpm", "xhci", "spi-flash", "secure-boot", "capsule-update", "cfr"]
+# CFR (coreboot form representation) firmware settings: the parser and the
+# menu. Values are EFI variables under the CFR GUID, through the runtime image.
+cfr = []
 # Direct flash variable persistence; omitted when the host provides no flash store.
 variable-store = []
 spi-flash = ["variable-store", "dep:rflasher-core", "dep:rflasher-internal"]
