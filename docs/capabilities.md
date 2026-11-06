@@ -155,6 +155,31 @@ whether retained staging is acceptable or implement a genuinely runtime-safe
 bounded persistent service. Selecting final fstart post-EBS persistence policy is
 not implied by selecting Secure Boot or a basic feature profile.
 
+## Reboot to firmware UI
+
+`OsIndicationsSupported` advertises `EFI_OS_INDICATIONS_BOOT_TO_FW_UI` (`0x1`)
+only with writable variable persistence, a successfully prepared/replayed
+retained runtime NV journal, and either a framebuffer or a live native
+bidirectional serial console. The text setup menu is always built; `ui` is not
+required. An arbitrary platform `DebugOutput` alone is not assumed to accept
+input. Capsule capability bits are independent and retain their existing gates.
+
+After import/replay, a valid NV/BS/RT eight-byte `OsIndications` request is
+consumed through the runtime variable facade. Only bit zero is cleared; all
+other bits and the variable's attributes remain unchanged. Setup is entered
+only after the persistent clear succeeds; malformed requests and clear failures
+fall back to normal boot rather than creating reset loops. Setup bypasses both
+BootNext and BootOrder without deleting BootNext and disables autoboot regardless
+of `Timeout`. Firmware/security settings remain reachable without boot media.
+A later reset follows the ordinary boot sequence.
+
+Pre-ExitBootServices tools (GRUB `fwsetup`, systemd-boot) write through the
+boot-time persistent backend. OS runtime requests use the existing retained RAM
+journal and warm-reset replay; this does **not** add power-loss-safe runtime
+flash persistence. Embedders without retained staging intentionally do not
+advertise this feature, even if pre-ExitBootServices NV writes would work.
+The dedicated QEMU regression is documented in [Building](BUILDING.md).
+
 ## Toolchain and validation scope
 
 The development validation uses the workspace-pinned nightly compiler:

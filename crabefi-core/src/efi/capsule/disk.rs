@@ -208,11 +208,15 @@ const fn supported_capsule_indications(capsule_delivery_usable: bool) -> u64 {
 
 /// Install the `OsIndicationsSupported` EFI variable.
 ///
-/// This tells the OS which capsule delivery mechanisms are available.
-/// Called during boot initialization after persistence and the applying backend
-/// have both been validated.
-pub fn install_os_indications_supported(capsule_delivery_usable: bool) {
-    let supported = supported_capsule_indications(capsule_delivery_usable);
+/// Publish only usable capsule and firmware-UI capabilities, after validating
+/// persistence, the capsule backend, and the availability of an interactive UI.
+pub fn install_os_indications_supported(capsule_delivery_usable: bool, firmware_ui_usable: bool) {
+    let supported = supported_capsule_indications(capsule_delivery_usable)
+        | if firmware_ui_usable {
+            crate::os_indications::BOOT_TO_FW_UI
+        } else {
+            0
+        };
 
     let name: &[u16] = &[
         'O' as u16, 's' as u16, 'I' as u16, 'n' as u16, 'd' as u16, 'i' as u16, 'c' as u16,
@@ -234,7 +238,8 @@ pub fn install_os_indications_supported(capsule_delivery_usable: bool) {
     );
 
     log::info!(
-        "OsIndicationsSupported set: FMP={}, FileCapsule={}",
+        "OsIndicationsSupported set: FW_UI={}, FMP={}, FileCapsule={}",
+        (supported & crate::os_indications::BOOT_TO_FW_UI) != 0,
         (supported & EFI_OS_INDICATIONS_FMP_CAPSULE_SUPPORTED) != 0,
         (supported & EFI_OS_INDICATIONS_FILE_CAPSULE_DELIVERY_SUPPORTED) != 0
     );

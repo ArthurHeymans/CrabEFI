@@ -42,6 +42,7 @@ pub mod linux_boot;
 pub mod logger;
 pub mod menu;
 pub mod menu_common;
+mod os_indications;
 pub mod payload;
 pub mod pe;
 pub mod peripheral;
@@ -229,10 +230,12 @@ fn init_persistence_and_boot(
         .expect("runtime image missing before deferred replay");
     let capsule_backend_available = cfg!(feature = "capsule-update") && capsule_backend.is_some();
     let mut capsule_delivery_usable = false;
+    let mut retained_staging_ready = false;
     if persistence_available {
         if persistence_writable && retained_staging {
             match runtime.prepare_retained_staging() {
                 Ok(()) => {
+                    retained_staging_ready = true;
                     let boot_consumer_ready = supports_capsule_delivery(
                         persistence_writable,
                         true,
@@ -252,6 +255,7 @@ fn init_persistence_and_boot(
                 }
             }
             if let Err(status) = runtime.replay_deferred() {
+                retained_staging_ready = false;
                 log::warn!("Runtime image deferred replay failed: {:?}", status);
             }
         }
@@ -286,7 +290,16 @@ fn init_persistence_and_boot(
     if let Some(firmware) = firmware_info {
         efi::esrt::install_esrt(&firmware, capsule_delivery_usable);
     }
-    efi::capsule::disk::install_os_indications_supported(capsule_delivery_usable);
+    let firmware_ui_supported = os_indications::firmware_ui_supported(
+        persistence_writable,
+        retained_staging_ready,
+        handoff::framebuffer().is_some(),
+        drivers::serial::supports_console_input(),
+    );
+    efi::capsule::disk::install_os_indications_supported(
+        capsule_delivery_usable,
+        firmware_ui_supported,
+    );
 
     // Persistent records and firmware-created status values have now been
     // copied into the authoritative Runtime Services store.
@@ -306,7 +319,8 @@ fn init_persistence_and_boot(
     log_stack_usage("before_boot_manager");
 
     let boot_var_state = boot_vars::read_boot_var_state();
-    boot_manager::run(boot_var_state);
+    let firmware_ui_requested = os_indications::take_firmware_ui_request(firmware_ui_supported);
+    boot_manager::run(boot_var_state, firmware_ui_requested);
 
     #[cfg(all(feature = "platform-entry", target_arch = "x86_64"))]
     log_stack_usage("after_boot_manager");

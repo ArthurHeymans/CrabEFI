@@ -692,9 +692,10 @@ fn scan_partition_for_entries(
 ///
 /// The index of the selected boot entry, or `None` if no selection was made.
 pub fn show_menu(menu: &mut BootMenu) -> Option<usize> {
+    // An empty, indefinite menu still provides firmware/security settings.
+    // The boot manager uses this for explicit setup requests without media.
     if menu.entry_count() == 0 {
-        log::error!("No boot entries to display");
-        return None;
+        menu.set_timeout(0);
     }
 
     // Get framebuffer for console and cursor rendering.
@@ -756,7 +757,7 @@ pub fn show_menu(menu: &mut BootMenu) -> Option<usize> {
                     menu.select_next();
                     draw_menu(menu, &mut fb_console);
                 }
-                KeyPress::Enter => {
+                KeyPress::Enter if menu.entry_count() > 0 => {
                     // Show booting message before returning
                     if let Some(entry) = menu.entries.get(menu.selected) {
                         log::info!(
@@ -1020,6 +1021,13 @@ fn draw_menu(menu: &BootMenu, fb_console: &mut Option<FramebufferConsole>) {
     }
     if scroll_offset + visible_rows < total_rows {
         draw_scroll_indicator(start_row + visible_rows, "v", fb_console);
+    }
+
+    if menu.entry_count() == 0 {
+        draw_status(
+            "No bootable media - firmware settings are still available",
+            fb_console,
+        );
     }
 
     // Draw help text
