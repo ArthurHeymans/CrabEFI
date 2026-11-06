@@ -19,8 +19,9 @@ use crate::timestamp;
 
 /// Initialize storage subsystem (PCI drivers, USB keyboards, etc.)
 ///
-/// This is called once before the boot manager starts trying boot options.
-fn init_storage_subsystem() {
+/// Called once before firmware-UI capability checks and boot dispatch, so USB
+/// input is enumerated before an indefinite setup session can be accepted.
+pub(crate) fn init_storage_subsystem() {
     log::info!("Initializing storage subsystem...");
     timestamp::record(timestamp::TS_CRABEFI_STORAGE_INIT_START);
 
@@ -79,8 +80,6 @@ fn menu_configuration(
 /// 5. **Fallback** — discover boot entries from ESPs (removable media path)
 /// 6. Show interactive boot menu if nothing booted automatically
 pub(crate) fn run(boot_var_state: boot_vars::BootVarState, firmware_ui_requested: bool) {
-    init_storage_subsystem();
-
     // Apply timeout from the Timeout variable (if set) to the boot menu default
     let timeout_seconds = boot_var_state.timeout.unwrap_or(5) as u32;
 
@@ -183,6 +182,7 @@ fn try_automatic_boot(boot_var_state: &boot_vars::BootVarState) {
     }
 }
 
+/// Discover boot entries and show setup indefinitely only on an explicit request.
 fn show_boot_menu(timeout_seconds: u32, firmware_ui_requested: bool) {
     // ---- Phase 3: Fallback to device discovery and interactive menu ----
     log::info!("=== Fallback: discovering boot entries from storage ===");

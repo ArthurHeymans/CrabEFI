@@ -619,6 +619,10 @@ pub fn is_available() -> bool {
 pub(crate) struct Ps2Mouse;
 
 impl super::pointer::PointerDevice for Ps2Mouse {
+    fn is_available(&self) -> bool {
+        is_available()
+    }
+
     fn poll(&mut self) -> Option<super::pointer::PointerReport> {
         poll();
         if !is_available() {

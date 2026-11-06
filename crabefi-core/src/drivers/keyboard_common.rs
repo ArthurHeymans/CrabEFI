@@ -36,6 +36,12 @@ pub mod efi_toggle_state {
 
 /// A keyboard or equivalent key source.
 pub trait KeyboardDevice {
+    /// Whether initialization succeeded and this device can accept input.
+    /// Deferred drivers must override this; registration alone is not readiness.
+    fn is_available(&mut self) -> bool {
+        true
+    }
+
     /// Next key press, or `None` when none is waiting. Must not wait for input.
     fn read_key(&mut self) -> Option<Key>;
 
@@ -65,6 +71,11 @@ fn with_devices<R>(f: impl FnOnce(&mut Vec<Box<dyn KeyboardDevice>>) -> R) -> R 
     devices.append(&mut registered);
     *registered = devices;
     result
+}
+
+/// Whether any registered keyboard is ready, without consuming a key.
+pub fn is_available() -> bool {
+    with_devices(|devices| devices.iter_mut().any(|device| device.is_available()))
 }
 
 /// Initialize and register the PS/2 keyboard. USB keyboards register when

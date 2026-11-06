@@ -3,24 +3,31 @@
 pub(crate) const BOOT_TO_FW_UI: u64 = 1;
 
 /// The text menu is always built, including settings without boot media.
-/// A framebuffer or a known bidirectional native serial console can host an
-/// indefinite session. An output-only platform DebugOutput is not sufficient.
+/// A framebuffer needs a ready keyboard, or a pointer with the graphical UI.
+/// A bidirectional native serial console supplies both input and output.
+/// An output-only platform DebugOutput is not sufficient.
 /// The retained journal is also required so OS runtime NV writes can survive
 /// reset, not just writes from pre-ExitBootServices tools such as GRUB.
 pub(crate) const fn firmware_ui_supported(
     writable_persistence: bool,
     retained_staging_ready: bool,
     framebuffer: bool,
+    keyboard: bool,
+    graphical_pointer: bool,
     serial_console: bool,
 ) -> bool {
-    writable_persistence && retained_staging_ready && (framebuffer || serial_console)
+    writable_persistence
+        && retained_staging_ready
+        && (serial_console || (framebuffer && (keyboard || graphical_pointer)))
 }
 
+/// Return the request with only FW_UI cleared, rejecting malformed values.
 fn cleared_request(data: &[u8]) -> Option<[u8; 8]> {
     let value = u64::from_le_bytes(data.try_into().ok()?);
     (value & BOOT_TO_FW_UI != 0).then(|| (value & !BOOT_TO_FW_UI).to_le_bytes())
 }
 
+/// Accept setup only when its one-shot clear was successfully persisted.
 fn consume_request(data: &[u8], persist_clear: impl FnOnce(&[u8; 8]) -> bool) -> bool {
     cleared_request(data).is_some_and(|cleared| persist_clear(&cleared))
 }
@@ -72,15 +79,31 @@ mod tests {
         for persistent in [false, true] {
             for retained in [false, true] {
                 for display in [false, true] {
-                    for serial in [false, true] {
-                        assert_eq!(
-                            firmware_ui_supported(persistent, retained, display, serial),
-                            persistent && retained && (display || serial)
-                        );
+                    for keyboard in [false, true] {
+                        for pointer in [false, true] {
+                            for serial in [false, true] {
+                                assert_eq!(
+                                    firmware_ui_supported(
+                                        persistent, retained, display, keyboard, pointer, serial
+                                    ),
+                                    persistent
+                                        && retained
+                                        && (serial || (display && (keyboard || pointer)))
+                                );
+                            }
+                        }
                     }
                 }
             }
         }
+    }
+
+    #[test]
+    fn output_only_setup_does_not_consume_a_request() {
+        let available = firmware_ui_supported(true, true, true, false, false, false);
+        assert!(!available);
+        // No runtime access is needed or allowed when setup has no input.
+        assert!(!take_firmware_ui_request(available));
     }
 
     #[test]

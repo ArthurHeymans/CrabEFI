@@ -718,8 +718,10 @@ pub fn show_menu(menu: &mut BootMenu) -> Option<usize> {
     let mut remaining_seconds = menu.timeout_seconds;
     let mut last_second_check = Timeout::from_ms(1000);
 
-    // Show initial countdown
-    draw_countdown(remaining_seconds, &mut fb_console);
+    // Zero disables autoboot; do not announce "Booting now..." in setup.
+    if remaining_seconds > 0 {
+        draw_countdown(remaining_seconds, &mut fb_console);
+    }
 
     // Initialize cursor renderer for mouse support
     #[cfg(feature = "ui")]

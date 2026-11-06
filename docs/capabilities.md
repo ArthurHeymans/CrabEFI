@@ -159,10 +159,13 @@ not implied by selecting Secure Boot or a basic feature profile.
 
 `OsIndicationsSupported` advertises `EFI_OS_INDICATIONS_BOOT_TO_FW_UI` (`0x1`)
 only with writable variable persistence, a successfully prepared/replayed
-retained runtime NV journal, and either a framebuffer or a live native
-bidirectional serial console. The text setup menu is always built; `ui` is not
-required. An arbitrary platform `DebugOutput` alone is not assumed to accept
-input. Capsule capability bits are independent and retain their existing gates.
+retained runtime NV journal, and either a live native bidirectional serial
+console or a framebuffer with a ready keyboard (or a ready pointer with the
+`ui` feature). USB input is enumerated before the capability check. A framebuffer
+alone and a failed or still-initializing PS/2 device are not usable input paths.
+The text setup menu is always built; `ui` is not required. An arbitrary platform
+`DebugOutput` alone is not assumed to accept input. Capsule capability bits are
+independent and retain their existing gates.
 
 After import/replay, a valid NV/BS/RT eight-byte `OsIndications` request is
 consumed through the runtime variable facade. Only bit zero is cleared; all

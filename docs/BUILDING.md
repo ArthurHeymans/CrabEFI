@@ -272,11 +272,13 @@ GRUB `fwsetup`/systemd-boot, not those bootloaders themselves. It checks the glo
 BootNext/BootOrder and remains interactive for eight seconds (beyond both the
 configured two-second and default five-second timeouts), then sends Enter.
 The app checks that only the request bit was cleared and BootNext was preserved;
-further resets verify normal BootNext and BootOrder dispatch. A second request
-is written after ExitBootServices and replayed from retained memory on warm
-reset. The host repeats with the disk removed between QEMU processes, tests
-empty-menu Enter and firmware settings access, and checks the next reboot is
-normal. The temporary SMMSTORE flash is file-backed and writable, not a volatile
+further resets verify distinct BootNext and BootOrder options through BootCurrent.
+The host also rejects a misleading “Booting now” message during setup. A second
+request is written after ExitBootServices and replayed from retained memory on
+warm reset. The host repeats with the disk removed between QEMU processes, tests
+empty-menu Enter, requires the text-menu header and firmware settings navigation,
+and checks the next reboot is normal. The temporary SMMSTORE flash is file-backed
+and writable, not a volatile
 variable mock or a QEMU snapshot. Serial logs, stderr and QEMU commands are kept
 under `target/fwui-reports/` on success and failure.
 

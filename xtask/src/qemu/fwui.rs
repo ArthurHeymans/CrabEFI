@@ -21,12 +21,15 @@ impl Drop for Vm {
     }
 }
 impl Vm {
+    /// Read the current serial log, including output from earlier warm resets.
     fn output(&self) -> String {
         fs::read_to_string(&self.serial).unwrap_or_default()
     }
+    /// Wait for one marker while checking guest failures and the deadline.
     fn wait_for(&mut self, marker: &str) -> Result<String> {
         self.wait_for_n(marker, 1)
     }
+    /// Wait for a specific occurrence so an earlier boot cannot satisfy it.
     fn wait_for_n(&mut self, marker: &str, count: usize) -> Result<String> {
         loop {
             let text = self.output();
@@ -51,11 +54,13 @@ impl Vm {
             std::thread::sleep(Duration::from_millis(50));
         }
     }
+    /// Inject a keyboard event through QEMU's monitor.
     fn key(&self, key: &str) -> Result<()> {
         let mut monitor = UnixStream::connect(&self.monitor)?;
         monitor.write_all(format!("sendkey {key}\n").as_bytes())?;
         Ok(())
     }
+    /// Prove an accepted request stays in setup beyond the normal boot timeout.
     fn stays_in_setup(&mut self, request_number: usize) -> Result<()> {
         let text = self.wait_for_n(MENU, request_number)?;
         let after_reset = text
@@ -79,6 +84,7 @@ impl Vm {
                 || text.contains("FWUI MANUAL BOOT")
                 || text.contains("FWUI TEST FAILED")
                 || text.contains("Menu returned:")
+                || text.contains("Booting now")
             {
                 bail!(
                     "setup exited/autobooted without input; see {}",
@@ -90,6 +96,7 @@ impl Vm {
         println!("[PASS] setup stayed interactive for 8s without autoboot");
         Ok(())
     }
+    /// Wait for guest termination without exceeding this VM's deadline.
     fn wait_exit(&mut self) -> Result<()> {
         while self.child.try_wait()?.is_none() {
             if Instant::now() >= self.deadline {
@@ -101,6 +108,7 @@ impl Vm {
     }
 }
 
+/// Start a disposable Q35 guest with writable persistent flash and saved logs.
 fn start(
     config: &QemuConfig,
     flash: &Path,
@@ -157,6 +165,7 @@ fn start(
     })
 }
 
+/// Exercise one-shot setup requests, distinct automatic boot paths, and no-media setup.
 pub(super) fn run(config: &QemuConfig, disk: &Path) -> Result<()> {
     if !matches!(config.arch, Arch::X86_64) {
         bail!("fwui-test currently requires x86-64 QEMU");
@@ -223,16 +232,15 @@ pub(super) fn run(config: &QemuConfig, disk: &Path) -> Result<()> {
     if setup.child.try_wait()?.is_some() || setup.output().contains("Menu returned:") {
         bail!("empty setup menu exited on Enter");
     }
-    // The fixture has no framebuffer: verify the text menu's setup access,
-    // not just that an empty loop remains alive.
-    if setup.output().contains("CrabEFI Boot Menu") {
-        let menus = setup.output().matches("CrabEFI Boot Menu").count();
-        setup.key("f")?;
-        setup.wait_for("Firmware Settings")?;
-        setup.key("esc")?;
-        setup.wait_for_n("CrabEFI Boot Menu", menus + 1)?;
-        println!("[PASS] firmware settings accessible without boot media");
-    }
+    // This fixture is deliberately a text-menu regression (also with --ui's
+    // fallback). A graphical fixture needs its own settings-navigation test.
+    let output = setup.wait_for("CrabEFI Boot Menu")?;
+    let menus = output.matches("CrabEFI Boot Menu").count();
+    setup.key("f")?;
+    setup.wait_for("Firmware Settings")?;
+    setup.key("esc")?;
+    setup.wait_for_n("CrabEFI Boot Menu", menus + 1)?;
+    println!("[PASS] firmware settings accessible without boot media");
     setup.key("r")?;
     setup.wait_exit()?;
     drop(setup);

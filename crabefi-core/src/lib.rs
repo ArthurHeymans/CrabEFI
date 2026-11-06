@@ -290,17 +290,6 @@ fn init_persistence_and_boot(
     if let Some(firmware) = firmware_info {
         efi::esrt::install_esrt(&firmware, capsule_delivery_usable);
     }
-    let firmware_ui_supported = os_indications::firmware_ui_supported(
-        persistence_writable,
-        retained_staging_ready,
-        handoff::framebuffer().is_some(),
-        drivers::serial::supports_console_input(),
-    );
-    efi::capsule::disk::install_os_indications_supported(
-        capsule_delivery_usable,
-        firmware_ui_supported,
-    );
-
     // Persistent records and firmware-created status values have now been
     // copied into the authoritative Runtime Services store.
     runtime
@@ -318,6 +307,26 @@ fn init_persistence_and_boot(
     #[cfg(all(feature = "platform-entry", target_arch = "x86_64"))]
     log_stack_usage("before_boot_manager");
 
+    // Enumerate input devices before publishing or accepting an indefinite
+    // setup session. A framebuffer by itself is only an output device.
+    boot_manager::init_storage_subsystem();
+    #[cfg(feature = "ui")]
+    let graphical_pointer =
+        drivers::mouse_cursor::is_initialized() && drivers::pointer::is_available();
+    #[cfg(not(feature = "ui"))]
+    let graphical_pointer = false;
+    let firmware_ui_supported = os_indications::firmware_ui_supported(
+        persistence_writable,
+        retained_staging_ready,
+        handoff::framebuffer().is_some(),
+        drivers::keyboard_common::is_available(),
+        graphical_pointer,
+        drivers::serial::supports_console_input(),
+    );
+    efi::capsule::disk::install_os_indications_supported(
+        capsule_delivery_usable,
+        firmware_ui_supported,
+    );
     let boot_var_state = boot_vars::read_boot_var_state();
     let firmware_ui_requested = os_indications::take_firmware_ui_request(firmware_ui_supported);
     boot_manager::run(boot_var_state, firmware_ui_requested);
