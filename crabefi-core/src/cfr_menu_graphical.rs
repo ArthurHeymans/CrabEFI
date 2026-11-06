@@ -2210,6 +2210,37 @@ mod graphical_tests {
     }
 
     #[test]
+    fn hidden_dependencies_are_read_once_per_session_not_per_poll() {
+        install_store();
+        let mut hidden = option(900);
+        hidden.opt_name = String::from("ui_hidden_900");
+        hidden.flags = cfr::CFR_OPTFLAG_SUPPRESS;
+        let mut dependent: Vec<_> = (1..=10).map(option).collect();
+        for o in &mut dependent {
+            o.dependency_id = 900;
+        }
+        let mut options = alloc::vec![hidden];
+        options.extend(dependent);
+        let cfr = CfrInfo {
+            version: 0,
+            forms: alloc::vec![CfrForm {
+                object_id: 10,
+                dependency_id: 0,
+                ui_name: String::from("Test"),
+                flags: 0,
+                options,
+                dep_values: Vec::new(),
+            }],
+        };
+        let items = build_menu_items(&cfr);
+        let header = visible_sections(&cfr, &items)[1];
+        for _ in 0..50 {
+            assert_eq!(section_rows(&cfr, &items, header).len(), 10);
+        }
+        assert_eq!(STORE.hidden_reads.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
     fn picker_tags_distinguish_saved_default_and_unsaved() {
         assert_eq!(
             choice_tags(Some(1), Some(1), 2),
@@ -2221,16 +2252,33 @@ mod graphical_tests {
         );
     }
 
-    struct FailingStore {
+    /// One store per test process: `set_option_store` may run only once.
+    struct TestStore {
         fail: AtomicBool,
         first_writes: AtomicUsize,
         second_writes: AtomicUsize,
+        hidden_reads: AtomicUsize,
     }
-    impl OptionStore for FailingStore {
+    static STORE: TestStore = TestStore {
+        fail: AtomicBool::new(true),
+        first_writes: AtomicUsize::new(0),
+        second_writes: AtomicUsize::new(0),
+        hidden_reads: AtomicUsize::new(0),
+    };
+    fn install_store() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| cfr::set_option_store(&STORE));
+    }
+    impl OptionStore for TestStore {
         fn keeps(&self, option: &CfrOption) -> bool {
             option.opt_name.starts_with("ui_regression_")
+                || option.opt_name.starts_with("ui_hidden_")
         }
-        fn read(&self, _: &CfrOption) -> Option<CfrValue> {
+        fn read(&self, option: &CfrOption) -> Option<CfrValue> {
+            if option.opt_name.starts_with("ui_hidden_") {
+                self.hidden_reads.fetch_add(1, Ordering::SeqCst);
+                return Some(CfrValue::Bool(true));
+            }
             None
         }
         fn write(&self, option: &CfrOption, _: &CfrValue) -> Result<(), &'static str> {
@@ -2248,12 +2296,7 @@ mod graphical_tests {
 
     #[test]
     fn partial_save_preserves_failed_drafts_and_retries_only_unsaved_options() {
-        static STORE: FailingStore = FailingStore {
-            fail: AtomicBool::new(true),
-            first_writes: AtomicUsize::new(0),
-            second_writes: AtomicUsize::new(0),
-        };
-        cfr::set_option_store(&STORE);
+        install_store();
         let cfr = CfrInfo {
             version: 0,
             forms: alloc::vec![CfrForm {

@@ -231,6 +231,7 @@ pub fn show_cfr_menu() {
 /// Dependencies are evaluated dynamically at draw/interaction time so that
 /// toggling a "parent" option immediately shows or hides dependent items.
 fn build_menu_items(cfr: &CfrInfo) -> Vec<MenuItem> {
+    STORED_DEPENDENCIES.lock().clear();
     let mut items = Vec::new();
 
     let mut crabefi_name = String::new();
@@ -312,9 +313,20 @@ fn find_live_numeric_value(cfr: &CfrInfo, items: &[MenuItem], object_id: u64) ->
             };
         }
     }
-    // Fallback to stored value
-    cfr.find_numeric_value(object_id)
+    // Options outside the menu (for example suppressed ones) cannot change
+    // while it is open. Read each once per session: a variable-store read on
+    // every pointer poll made the graphical loop too slow to see clicks.
+    let mut cache = STORED_DEPENDENCIES.lock();
+    if let Some((_, value)) = cache.iter().find(|(id, _)| *id == object_id) {
+        return *value;
+    }
+    let value = cfr.find_numeric_value(object_id);
+    cache.push((object_id, value));
+    value
 }
+
+/// Stored values of dependencies that are not menu items, for one session.
+static STORED_DEPENDENCIES: spin::Mutex<Vec<(u64, Option<u32>)>> = spin::Mutex::new(Vec::new());
 
 /// Evaluate whether a dependency is met using live (in-flight) menu values.
 fn is_dep_met_live(
