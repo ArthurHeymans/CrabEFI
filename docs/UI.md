@@ -1,99 +1,109 @@
 # Native setup UI
 
 The `ui` feature provides a keyboard-first framebuffer interface for Boot,
-Secure Boot and platform settings. It uses W3C APG interaction conventions and
+Secure Boot and platform settings. People open firmware setup rarely, so every
+screen says what it does, shows its keys, and explains the selected item in
+place. It uses W3C APG interaction conventions and
 [WCAG2ICT](https://www.w3.org/TR/wcag2ict-22/) as design guidance, not as a claim
 of WCAG conformance or assistive-technology compatibility.
 
+## Design ("Ledger")
+
+- **Paper and ink.** Warm off-white surfaces, near-black text and one muted
+  green for the single filled action on a surface. Amber marks unsaved drafts,
+  countdowns and weakening actions; red marks destructive ones. Every state
+  also has a non-colour cue: a `*` for drafts, an outline for keyboard focus, a
+  left bar and bold text for the selection, and explicit wording for danger.
+- **Folder tabs.** Boot, Security and Firmware are tabs whose first letter is
+  underlined: it is the shortcut. `Firmware *` shows unsaved drafts from any
+  page. The header chip shows the Secure Boot state.
+- **Tables and a details pane.** Lists are ruled tables. A details pane beside
+  them explains the selected entry, option or action, lists its facts, and
+  holds its buttons with their keys.
+- **Notice strip.** One full-width line states the page's situation: the boot
+  countdown, unsaved changes with Save and Discard, a successful save with
+  Restart now, a failed save with Try again, or an operation's result.
+- **Key legend.** The footer lists the page's own keys on the left and the
+  fixed global keys on the right (B/S/F pages, F8 text size, R restart).
+  Dialogs and editors replace it with their own keys.
+- **Bitmap honest.** Only `noto-sans-mono-bitmap` (Regular and Bold, ASCII),
+  solid rectangles, 1-2 px rules and dots are used. Truncation uses `...`.
+  Modal backdrops repaint the screen through a darker palette instead of
+  reading back and blending framebuffer pixels.
+
+The design targets **1024 x 768** (for example a ThinkPad X61) with compact
+typography and **1920 x 1080** with large typography. Below 860 px wide the
+details panes give way to an action bar (Boot, Security) or the Details dialog
+(`?`, Firmware). The smallest supported graphical viewport is 640 x 400;
+smaller displays use the text interface.
+
 ## Interaction contract
 
-- **Tab / Shift+Tab:** move between navigation, content and contextual actions.
-  Arrows move within the focused group. Activating the current navigation tab
-  does not leave the screen or prompt to discard drafts.
-- **Enter:** open the selected setting/action, or boot from the boot list.
-  Space activates a focused button, but never boots from the boot list.
-- **B / S / F:** Boot, Security and Settings shortcuts, where available.
-  Shortcuts are not dispatched while editing a field.
-- **Escape:** cancel a dialog without committing, or leave a settings screen
-  through its unsaved-changes decision. With no bootable media, Back from
-  Settings or Security returns to the restart screen.
-- **F8:** switch compact/large text and layout for the current session. The
-  preference is not persisted. High-resolution displays default to larger text;
-  resolution is not assumed to reveal physical display DPI.
-- **Pointer:** one list click selects, without activating. Use the explicit
-  Boot/Open/Edit action to activate. Clicking above/below a scrollbar thumb
-  pages the list; dragging is not required or implemented. Wheel reports, where
-  supplied by the device, also scroll the viewport. Neither retargets selection.
-  Keyboard navigation reveals the selected target again.
-- **Settings shortcuts:** paging, j/k, +/- and D (draft default) belong to the
-  content group. W is an explicit screen-wide Save shortcut, outside editors.
-
-The visible focus indicator is a strong outline. Selection has a persistent
-marker; changed drafts have an asterisk and a changed-count summary. Read-only
-values use `[R]` and have an explanation in Details. Dangerous operations have
-explicit warning text and still require confirmation. Accent-filled buttons
-represent an action, not keyboard focus: Cancel can own focus without looking
-like the recommended affirmative operation.
+- **Tab / Shift+Tab:** move between the tabs, the page's lists (Firmware also
+  has its Sections list) and its buttons. Arrows move within the focused group.
+  Activating the current tab does not leave the page or prompt.
+- **Enter:** boot the selected entry, open the selected action, or edit the
+  selected option. Space activates a focused button but never boots.
+- **Escape:** cancel a dialog, picker or editor without committing, or go back
+  to Boot through the unsaved-changes decision. It never discards drafts.
+- **F10 (or W):** save firmware settings. **R:** restart, guarded the same way
+  as leaving when drafts exist. **F8:** compact/large text for the session.
+- **Boot:** `E` edits the selected Linux entry's command line once, in the
+  details pane. Enter boots with it; nothing is written back to disk.
+- **Firmware:** Left/Right change the selected value in place; Enter opens a
+  picker or field editor anchored to the row; `D` sets the default as a draft;
+  `?` shows full help. Read-only and unavailable options say why.
+- **Pointer:** a list click selects without activating. Buttons, tabs, section
+  rows and picker choices are clickable; a picker choice is applied with
+  "Use value". Clicking above or below a scrollbar thumb pages the list.
+  Wheel reports, where delivered, scroll the viewport and never retarget the
+  selection.
 
 ## Dialogs and review
 
-Modal dialogs replace the interactive shell while open. Their controls have a
-local, bidirectional focus sequence; returning leaves the invoking screen's
-selection, focus group and drafts intact.
+Modal dialogs focus their safe choice first (Cancel, Keep editing, Close) and
+return it on Escape. Destructive confirmations are outlined in red and never
+filled. The unsaved-changes guard names the destination ("You are going to the
+Boot page", "You are restarting the computer") and lists each change as
+`saved -> unsaved`.
 
-Text editors begin with field focus. They support Left/Right/Home/End/Delete,
-Backspace and Ctrl+U, plus Tab traversal to Cancel and Apply. Validation retains
-the draft and returns focus to the field. Input is explicitly ASCII, at most
-255 bytes; existing UTF-8 values retain valid caret/deletion boundaries, but
-this is not a claim of internationalized input or font coverage.
-
-Enum editors offer Cancel, Choice details and an explicit Apply draft button.
-A row click only selects a choice. Reopening or changing text size reveals the
-current choice; viewport-only scrolling leaves its labeled target unchanged.
-Details exposes complete labels and Draft/Saved/Default values on narrow screens.
-
-Trust review uses labeled blocks rather than concatenated paragraphs. Source,
-operation, certificates, signer, timestamp, counts, replacement warnings and file
-identity remain distinct. Fingerprint blocks fit together on a review page;
-long prose repeats its label when continued. Previous/Next buttons and keyboard
-paging expose the complete review. Reused PK/KEK/db certificates are identified
-as the same certificate rather than needlessly repeating an identity.
-
-The import still commits the owned bytes verified before review. Changing the
-ESP file while a review is open must not change what is enrolled. This UI does
-not replace runtime authentication, persistence or replay enforcement.
+Trust review shows identities before consent: source, result, and every
+certificate that will be enrolled, including the bundled Microsoft UEFI CA,
+each with subject, labelled SHA-256 fingerprint and validity. Byte-identical
+certificates are identified as the same certificate. Identity blocks are never
+split; long reviews page by whole blocks, and the confirm button stays
+unavailable until every page was shown. The import commits the owned bytes
+verified before review; changing the ESP file while a review is open does not
+change what is enrolled. This UI does not replace runtime authentication,
+persistence or replay enforcement.
 
 ## Layout and implementation
 
-- Supported graphical viewport: at least **640 x 400**. Smaller boot-menu
-  viewports use the existing text interface instead of squeezing clipped controls.
-- Content width is bounded; wider layouts provide nearby contextual details.
-  Narrow layouts retain a Details action rather than forcing a side pane.
-- `ui/layout.rs` owns typography and physical metrics.
-- `ui/controls.rs` owns focus-group traversal, control rendering contracts and
-  viewport movement. Borrowed descriptors derive from live state, not a second
-  retained widget tree.
-- Screens retain domain state and their cursor-safe repaint paths. Focus
-  movement, selection and activation are different operations.
-- Keyboard input samples modifiers from the source device at dequeue time;
-  this is not a historical per-keystroke modifier snapshot. Serial CSI BackTab,
-  Delete and F8 are normalized alongside physical-keyboard input.
+- `ui/theme.rs` owns the palette and the dimmed backdrop mapping.
+- `ui/layout.rs` owns typography and physical metrics for both modes.
+- `ui/kit.rs` owns chrome: header and tabs, key legend, notice strip, pane
+  titles, fact sheets and modal frames.
+- `ui/controls.rs` owns focus groups, rows, buttons and viewport movement.
+- `ui/dialog.rs` owns modals, trust review, anchored pickers and editors.
+- Screens keep their domain state and cursor-safe partial repaints; unit tests
+  compare partial and full repaints pixel for pixel.
 
 There is no browser DOM, native OS accessibility API or exported accessibility
-service. Internal control descriptions and semantic-state tests do not make the
-framebuffer screen-reader accessible. Serial keyboard input is supported, and
-text-only builds remain available, but full nonvisual parity and usability with
-real assistive technology require separate work and testing.
+service. Serial keyboard input is supported (including BackTab, Delete, F8 and
+F10), and text-only builds remain available, but full nonvisual parity requires
+separate work and testing.
 
 ## Validation
 
 Unit tests cover focus traversal, safe activation, editor state and caret
-boundaries, complete fingerprint blocks, palette contrast, bounded layout,
-scroll/selection independence and cursor-safe repainting. QEMU checks should
-exercise actual input and rendering at 640 x 400, 640 x 480, 800 x 600 and native
-1920 x 1080, including both text sizes, failed saves and authentication consent.
-Synthetic CFR fixtures exercise the real guest parser and settings backend;
-they are not physical-machine configuration claims.
+boundaries, whole-block review paging, palette contrast, bounded layouts at
+640 x 400 to 1920 x 1080, scroll/selection independence and cursor-safe
+repainting. QEMU checks exercise real input and rendering at 640 x 480,
+1024 x 768, 1280 x 800 and 1920 x 1080: countdown, one-shot command line handed
+to a real Linux kernel, pickers, number editing, unsaved/leave/restart guards,
+save and failed save, custom key review and enrollment, key listing and the
+Clear all keys confirmation. Synthetic CFR fixtures exercise the real guest
+parser and settings backend; they are not physical-machine configuration claims.
 
 Relevant references:
 

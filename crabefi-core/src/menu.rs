@@ -1389,7 +1389,8 @@ fn edit_cmdline(entry: &mut BootEntry, fb_console: &mut Option<FramebufferConsol
                 | KeyPress::Tab
                 | KeyPress::BackTab
                 | KeyPress::Delete
-                | KeyPress::F8 => {}
+                | KeyPress::F8
+                | KeyPress::F10 => {}
                 // Mouse events are ignored in the command line editor
                 #[cfg(feature = "ui")]
                 KeyPress::MouseClick { .. } | KeyPress::MouseScroll(_) => {}

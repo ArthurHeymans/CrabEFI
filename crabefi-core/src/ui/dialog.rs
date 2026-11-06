@@ -1,11 +1,14 @@
-//! Modal focus scopes, structured trust review and caret-aware field editing.
-//! Escape never commits; every visible action is reachable in both directions.
+//! Modal focus scopes, structured trust review, anchored pickers and caret-aware
+//! field editing. Escape never commits; every visible action is reachable in
+//! both directions. Modals repaint the invoking screen with a dimmed solid
+//! palette as their backdrop; popovers keep it at full strength.
 
 use super::{
-    NavItem,
     controls::{self, ButtonKind, Control, Role},
+    kit::{self, Tone},
     layout::{self, Metrics},
-    render, theme,
+    render::{self, Rgb},
+    theme,
 };
 use crate::{
     FramebufferConfig,
@@ -16,13 +19,11 @@ use crate::{
 use alloc::{string::String, vec::Vec};
 
 pub type Rect = (i32, i32, u32, u32);
+/// Repaints the invoking screen (without cursor handling).
+pub type Backdrop<'a> = &'a dyn Fn();
+
 pub fn contains(rect: Rect, x: i32, y: i32) -> bool {
     x >= rect.0 && y >= rect.1 && x < rect.0 + rect.2 as i32 && y < rect.1 + rect.3 as i32
-}
-pub fn button(fb: &FramebufferConfig, rect: Rect, label: &str, focused: bool) {
-    let mut c = Control::new(0, Role::Button, label);
-    c.focused = focused;
-    controls::button(fb, rect, &c, ButtonKind::Neutral);
 }
 
 /// Paragraph boundaries are meaningful, including in machine-identity details.
@@ -49,276 +50,251 @@ pub fn wrap_lines(text: &str, columns: usize) -> Vec<String> {
     }
     lines
 }
-pub fn wrapped(fb: &FramebufferConfig, rect: Rect, text: &str, color: render::Rgb) {
+/// Compatibility: wrapped small text clipped to `rect`.
+pub fn wrapped(fb: &FramebufferConfig, rect: Rect, text: &str, color: Rgb) {
     let m = Metrics::for_fb(fb);
-    let lines = wrap_lines(text, (rect.2 / render::font_width(m.small)) as usize);
-    let slots = (rect.3 / m.line) as usize;
-    for (i, line) in lines.iter().take(slots).enumerate() {
-        let label = if i + 1 == slots && lines.len() > slots {
-            alloc::format!("{line} ...")
-        } else {
-            line.clone()
-        };
-        render::draw_text(
-            fb,
-            rect.0,
-            rect.1 + (i as u32 * m.line) as i32,
-            &render::ellipsize(&label, rect.2, m.small),
-            m.small,
-            color,
-            None,
-        );
+    let lines = (rect.3 / m.small_line).max(1) as usize;
+    kit::prose(fb, rect.0, rect.1, rect.2, text, m.small, color, lines);
+}
+
+// ─── Modal content ──────────────────────────────────────────────────────
+
+pub enum Block {
+    Text(String),
+    Muted(String),
+    Fact {
+        key: String,
+        value: String,
+        color: Rgb,
+        bold: bool,
+    },
+    /// "name   from -> to", the new value emphasised as an unsaved draft.
+    Change {
+        name: String,
+        from: String,
+        to: String,
+    },
+}
+impl Block {
+    pub fn text(text: &str) -> Self {
+        Self::Text(String::from(text))
+    }
+    pub fn muted(text: &str) -> Self {
+        Self::Muted(String::from(text))
+    }
+    pub fn fact(key: &str, value: &str) -> Self {
+        Self::Fact {
+            key: String::from(key),
+            value: String::from(value),
+            color: theme::INK2,
+            bold: false,
+        }
+    }
+    pub fn strong_fact(key: &str, value: &str) -> Self {
+        Self::Fact {
+            key: String::from(key),
+            value: String::from(value),
+            color: theme::INK,
+            bold: true,
+        }
+    }
+    pub fn change(name: &str, from: &str, to: &str) -> Self {
+        Self::Change {
+            name: String::from(name),
+            from: String::from(from),
+            to: String::from(to),
+        }
     }
 }
 
-fn modal_rect(fb: &FramebufferConfig) -> Rect {
-    modal_rect_with_height(fb, 720)
+pub struct Choice<'a> {
+    pub label: &'a str,
+    pub key: Option<&'a str>,
+    pub kind: ButtonKind,
 }
-fn modal_rect_with_height(fb: &FramebufferConfig, preferred: u32) -> Rect {
+impl<'a> Choice<'a> {
+    pub const fn new(label: &'a str, key: Option<&'a str>, kind: ButtonKind) -> Self {
+        Self { label, key, kind }
+    }
+}
+
+fn block_key_width(fb: &FramebufferConfig, blocks: &[Block]) -> u32 {
     let m = Metrics::for_fb(fb);
-    let w = fb.width.saturating_sub(32).min(760);
-    let h = fb.height.saturating_sub(m.footer + 32).min(preferred);
+    blocks
+        .iter()
+        .filter_map(|b| match b {
+            Block::Fact { key, .. } => Some(render::text_width(key, m.body)),
+            Block::Change { name, .. } => Some(render::text_width(name, m.body)),
+            _ => None,
+        })
+        .max()
+        .map_or(0, |w| w + 16)
+}
+
+/// Lays out blocks, optionally painting. Returns the height used.
+fn blocks(fb: &FramebufferConfig, x: i32, y: i32, w: u32, blocks: &[Block], paint: bool) -> u32 {
+    let m = Metrics::for_fb(fb);
+    let cols = (w / render::font_width(m.body)).max(1) as usize;
+    let key_w = block_key_width(fb, blocks).min(w / 2);
+    let value_cols = ((w - key_w) / render::font_width(m.body)).max(1) as usize;
+    let mut cy = y;
+    let mut previous_fact = false;
+    for (i, block) in blocks.iter().enumerate() {
+        let fact = matches!(block, Block::Fact { .. } | Block::Change { .. });
+        if i > 0 && !(fact && previous_fact) {
+            cy += (m.gap / 2) as i32;
+        }
+        previous_fact = fact;
+        match block {
+            Block::Text(text) | Block::Muted(text) => {
+                let color = if matches!(block, Block::Text(_)) {
+                    theme::INK
+                } else {
+                    theme::INK2
+                };
+                for line in wrap_lines(text, cols) {
+                    if paint {
+                        render::draw_text(fb, x, cy, &line, m.body, color, None);
+                    }
+                    cy += m.line as i32;
+                }
+            }
+            Block::Fact {
+                key,
+                value,
+                color,
+                bold,
+            } => {
+                if paint {
+                    render::draw_text_bold(fb, x, cy, key, m.body, theme::INK, None);
+                }
+                for line in wrap_lines(value, value_cols) {
+                    if paint {
+                        render::draw_text_weight(
+                            fb,
+                            x + key_w as i32,
+                            cy,
+                            &line,
+                            m.body,
+                            *bold,
+                            *color,
+                            None,
+                        );
+                    }
+                    cy += m.line as i32;
+                }
+            }
+            Block::Change { name, from, to } => {
+                if paint {
+                    render::draw_text(fb, x, cy, name, m.body, theme::INK, None);
+                    let vx = x + key_w as i32;
+                    let lead = alloc::format!("{from} -> ");
+                    let lw = render::draw_text(
+                        fb,
+                        vx,
+                        cy,
+                        &render::ellipsize(&lead, w - key_w, m.body),
+                        m.body,
+                        theme::INK3,
+                        None,
+                    );
+                    render::draw_text_bold(
+                        fb,
+                        vx + lw as i32,
+                        cy,
+                        &render::ellipsize(to, (w - key_w).saturating_sub(lw), m.body),
+                        m.body,
+                        theme::WARN,
+                        None,
+                    );
+                }
+                cy += m.line as i32;
+            }
+        }
+    }
+    (cy - y) as u32
+}
+
+fn modal_width(fb: &FramebufferConfig, preferred: u32) -> u32 {
+    let m = Metrics::for_fb(fb);
+    fb.width.saturating_sub(m.pad * 2).min(preferred)
+}
+fn center_modal(fb: &FramebufferConfig, w: u32, h: u32) -> Rect {
+    let m = Metrics::for_fb(fb);
+    let avail = fb.height.saturating_sub(m.header + m.footer);
+    let h = h.min(avail.saturating_sub(16));
     (
         ((fb.width - w) / 2) as i32,
-        ((fb.height - m.footer - h) / 2) as i32,
+        (m.header + avail.saturating_sub(h) / 2) as i32,
         w,
         h,
     )
 }
-fn surface(fb: &FramebufferConfig, title: &str, rect: Rect) -> Rect {
+
+/// Right-aligned button row. Returns rectangles in choice order.
+fn choice_row(
+    fb: &FramebufferConfig,
+    right: i32,
+    y: i32,
+    choices: &[Choice<'_>],
+    focused: Option<usize>,
+    enabled: &[bool],
+) -> Vec<Rect> {
     let m = Metrics::for_fb(fb);
-    // Do not paint bright, apparently interactive navigation behind a modal.
-    render::fill_rect(fb, 0, 0, fb.width, fb.height, theme::CONT_LOW);
-    render::fill_rect(fb, rect.0, rect.1, rect.2, rect.3, theme::CONTAINER);
-    render::draw_thick_border(fb, rect.0, rect.1, rect.2, rect.3, 2, theme::BORDER);
-    render::draw_text(
-        fb,
-        rect.0 + 20,
-        rect.1 + 16,
-        &render::ellipsize(title, rect.2 - 40, m.title),
-        m.title,
-        theme::TEXT,
-        Some(theme::CONTAINER),
-    );
-    rect
+    let widths: Vec<u32> = choices
+        .iter()
+        .map(|c| controls::button_width(fb, c.label, c.key).max(if m.large { 180 } else { 140 }))
+        .collect();
+    let total: u32 = widths.iter().sum::<u32>() + 12 * widths.len().saturating_sub(1) as u32;
+    let mut x = right - total as i32;
+    let mut rects = Vec::new();
+    for (i, (choice, w)) in choices.iter().zip(&widths).enumerate() {
+        let rect = (x, y, *w, m.button);
+        let mut c = Control::new(i as u64, Role::Button, choice.label);
+        c.focused = focused == Some(i);
+        c.enabled = enabled.get(i).copied().unwrap_or(true);
+        controls::button_with_key(fb, rect, &c, choice.kind, choice.key);
+        rects.push(rect);
+        x += *w as i32 + 12;
+    }
+    rects
 }
 
-pub struct ReviewSection {
-    pub label: String,
-    pub text: String,
-}
-impl ReviewSection {
-    pub fn new(label: &str, text: &str) -> Self {
-        Self {
-            label: String::from(label),
-            text: String::from(text),
-        }
-    }
+fn modal_keys(fb: &FramebufferConfig, esc: &str, extra: &[(&str, &str)]) {
+    let mut keys: Vec<(&str, &str)> =
+        alloc::vec![("Tab Left Right", "Move"), ("Enter", "Activate")];
+    keys.extend_from_slice(extra);
+    keys.push(("Esc", esc));
+    kit::draw_keys(fb, &keys, false);
 }
 
-/// Pack logical blocks, not arbitrary prose slices. A fingerprint block fits
-/// whole at the minimum viewport. Oversized non-identity prose repeats its label.
-fn review_pages(sections: &[ReviewSection], columns: usize, slots: usize) -> Vec<Vec<String>> {
-    let slots = slots.max(3);
-    let mut pages = Vec::new();
-    let mut page = Vec::new();
-    for section in sections {
-        let body = wrap_lines(&section.text, columns);
-        let mut label = wrap_lines(&section.label, columns);
-        if section.label.is_empty() {
-            label.clear();
-        }
-        if label.len() + body.len() <= slots {
-            let needed = label.len() + body.len() + usize::from(!page.is_empty());
-            if page.len() + needed > slots && !page.is_empty() {
-                pages.push(core::mem::take(&mut page));
-            }
-            if !page.is_empty() {
-                page.push(String::new());
-            }
-            page.extend(label);
-            page.extend(body);
-        } else {
-            if !page.is_empty() {
-                pages.push(core::mem::take(&mut page));
-            }
-            let heading = if section.label.is_empty() {
-                "Details"
-            } else {
-                &section.label
-            };
-            // One bounded heading line is repeated on every continuation page.
-            for (i, chunk) in body.chunks(slots - 1).enumerate() {
-                let mut next = alloc::vec![if i == 0 {
-                    String::from(heading)
-                } else {
-                    alloc::format!("{heading} (continued)")
-                }];
-                next.extend_from_slice(chunk);
-                pages.push(next);
-            }
-        }
-    }
-    if !page.is_empty() {
-        pages.push(page);
-    }
-    if pages.is_empty() {
-        pages.push(Vec::new());
-    }
-    pages
-}
-fn review_geometry(fb: &FramebufferConfig, rect: Rect) -> (Rect, Rect, Rect, usize, usize) {
-    let m = Metrics::for_fb(fb);
-    let (x, y, w, h) = rect;
-    let buttons = (
-        x + 20,
-        y + h as i32 - m.button as i32 - 16,
-        w - 40,
-        m.button,
-    );
-    let pages = (x + 20, buttons.1 - m.button as i32 - 8, w - 40, m.button);
-    let content = (
-        x + 20,
-        y + 28 + render::font_height(m.title) as i32,
-        w - 40,
-        (pages.1 - y - 40 - render::font_height(m.title) as i32).max(0) as u32,
-    );
-    (
-        content,
-        pages,
-        buttons,
-        (content.2 / render::font_width(m.small)) as usize,
-        (content.3 / m.line) as usize,
-    )
-}
-fn cycle_focus(current: usize, enabled: &[usize], backwards: bool) -> usize {
-    let index = enabled.iter().position(|id| *id == current).unwrap_or(0);
-    enabled[(index + if backwards { enabled.len() - 1 } else { 1 }) % enabled.len()]
-}
-fn choice_kind(label: &str, index: usize) -> ButtonKind {
-    if index == 0 {
-        ButtonKind::Neutral
-    } else if matches!(
-        label,
-        "Restart" | "Discard" | "Clear keys" | "Disable" | "Enroll" | "Import"
-    ) {
-        ButtonKind::Danger
-    } else {
-        ButtonKind::Primary
-    }
-}
-
-/// Compatibility choice API; trust imports use labeled sections directly.
-pub fn choose(
+/// Focus starts on, and Escape returns, choice 0: callers put the safe
+/// option first.
+pub fn modal(
     fb: &FramebufferConfig,
-    nav: NavItem,
+    backdrop: Backdrop<'_>,
+    tone: Tone,
     title: &str,
-    message: &str,
-    labels: &[&str],
+    content: &[Block],
+    choices: &[Choice<'_>],
 ) -> usize {
-    review_choice(fb, nav, title, &[ReviewSection::new("", message)], labels)
-}
-pub fn review(
-    fb: &FramebufferConfig,
-    nav: NavItem,
-    title: &str,
-    sections: &[ReviewSection],
-    confirm: &str,
-) -> bool {
-    review_choice(fb, nav, title, sections, &["Cancel", confirm]) == 1
-}
-fn review_choice(
-    fb: &FramebufferConfig,
-    _nav: NavItem,
-    title: &str,
-    sections: &[ReviewSection],
-    labels: &[&str],
-) -> usize {
-    assert!(!labels.is_empty() && labels.len() <= 3);
+    assert!(!choices.is_empty() && choices.len() <= 3);
     let mut cursor = CursorRenderer::new();
-    let mut page = 0usize;
-    let mut focused = 2usize; // Stable ID 2 is always the safe first action.
+    let mut focused = 0usize;
     loop {
         cursor.hide(fb);
         let m = Metrics::for_fb(fb);
-        let width = modal_rect(fb).2;
-        let columns = ((width - 40) / render::font_width(m.small)) as usize;
-        let needed = sections
-            .iter()
-            .map(|s| {
-                wrap_lines(&s.text, columns).len()
-                    + if s.label.is_empty() {
-                        0
-                    } else {
-                        wrap_lines(&s.label, columns).len()
-                    }
-                    + 1
-            })
-            .sum::<usize>();
-        let preferred = render::font_height(m.title)
-            + (needed as u32).saturating_mul(m.line)
-            + m.button * 2
-            + 80;
-        let rect = surface(fb, title, modal_rect_with_height(fb, preferred));
-        let (content, pager, actions, columns, slots) = review_geometry(fb, rect);
-        let pages = review_pages(sections, columns, slots);
-        page = page.min(pages.len() - 1);
-        for (i, line) in pages[page].iter().enumerate() {
-            render::draw_text(
-                fb,
-                content.0,
-                content.1 + (i as u32 * m.line) as i32,
-                &render::ellipsize(line, content.2, m.small),
-                m.small,
-                theme::TEXT_DIM,
-                None,
-            );
-        }
-        let mut rects = Vec::new();
-        let mut enabled = Vec::new();
-        if pages.len() > 1 {
-            let bw = (pager.2 - 12) / 3;
-            for (i, label) in ["Previous", "Next"].iter().enumerate() {
-                let rect = (pager.0 + (i as u32 * (bw + 6)) as i32, pager.1, bw, pager.3);
-                let mut c = Control::new(i as u64, Role::Button, label);
-                c.enabled = if i == 0 {
-                    page > 0
-                } else {
-                    page + 1 < pages.len()
-                };
-                c.focused = focused == i;
-                controls::button(fb, rect, &c, ButtonKind::Neutral);
-                if c.enabled {
-                    enabled.push(i);
-                }
-                rects.push((i, rect, c.enabled));
-            }
-            render::draw_text(
-                fb,
-                pager.0 + (2 * (bw + 6)) as i32,
-                pager.1 + 10,
-                &alloc::format!("{} / {}", page + 1, pages.len()),
-                m.small,
-                theme::TEXT_DIM,
-                None,
-            );
-        }
-        let bw = (actions.2 - (labels.len() as u32 - 1) * 8) / labels.len() as u32;
-        for (i, label) in labels.iter().enumerate() {
-            let id = i + 2;
-            let rect = (
-                actions.0 + (i as u32 * (bw + 8)) as i32,
-                actions.1,
-                bw,
-                actions.3,
-            );
-            let mut c = Control::new(id as u64, Role::Button, label);
-            c.focused = focused == id;
-            controls::button(fb, rect, &c, choice_kind(label, i));
-            enabled.push(id);
-            rects.push((id, rect, true));
-        }
-        super::draw_footer(fb, "PgUp/PgDn Read   Tab Focus   Enter Choose   Esc Cancel");
+        let w = modal_width(fb, if m.large { 820 } else { 720 });
+        let inner = w - m.pad * 2;
+        let body_h = blocks(fb, 0, 0, inner, content, false);
+        let h = kit::modal_head_height(fb) + m.gap * 3 + body_h + m.button + 4;
+        let rect = center_modal(fb, w, h);
+        theme::dimmed(backdrop);
+        let body = kit::modal_frame(fb, rect, tone, title);
+        blocks(fb, body.0, body.1, body.2, content, true);
+        let by = rect.1 + rect.3 as i32 - m.button as i32 - m.gap as i32;
+        let rects = choice_row(fb, body.0 + body.2 as i32, by, choices, Some(focused), &[]);
+        modal_keys(fb, choices[0].label, &[]);
         loop {
             super::poll_and_render_cursor(fb, &mut cursor);
             if let Some(key) = menu_common::read_key() {
@@ -329,63 +305,25 @@ fn review_choice(
                     }
                     KeyPress::F8 => {
                         layout::toggle_text_size(fb);
-                        focused = 2;
                         break;
                     }
                     KeyPress::Tab | KeyPress::Right | KeyPress::Down => {
-                        focused = cycle_focus(focused, &enabled, false);
+                        focused = (focused + 1) % choices.len();
                         break;
                     }
                     KeyPress::BackTab | KeyPress::Left | KeyPress::Up => {
-                        focused = cycle_focus(focused, &enabled, true);
-                        break;
-                    }
-                    KeyPress::PageDown | KeyPress::End => {
-                        page = if key == KeyPress::End {
-                            pages.len() - 1
-                        } else {
-                            (page + 1).min(pages.len() - 1)
-                        };
-                        focused = 2;
-                        break;
-                    }
-                    KeyPress::PageUp | KeyPress::Home => {
-                        page = if key == KeyPress::Home {
-                            0
-                        } else {
-                            page.saturating_sub(1)
-                        };
-                        focused = 2;
-                        break;
-                    }
-                    KeyPress::MouseScroll(dz) => {
-                        controls::scroll(&mut page, dz, pages.len(), 1);
-                        focused = 2;
+                        focused = (focused + choices.len() - 1) % choices.len();
                         break;
                     }
                     KeyPress::Enter | KeyPress::Char(' ') => Some(focused),
-                    KeyPress::MouseClick { x, y } => rects
-                        .iter()
-                        .find(|(_, r, on)| *on && contains(*r, x as i32, y as i32))
-                        .map(|(id, _, _)| *id),
+                    KeyPress::MouseClick { x, y } => {
+                        rects.iter().position(|r| contains(*r, x as i32, y as i32))
+                    }
                     _ => None,
                 };
-                if let Some(id) = activation {
-                    if id < 2 {
-                        page = if id == 0 {
-                            page.saturating_sub(1)
-                        } else {
-                            (page + 1).min(pages.len() - 1)
-                        };
-                        focused = if (id == 0 && page > 0) || (id == 1 && page + 1 < pages.len()) {
-                            id
-                        } else {
-                            2
-                        };
-                        break;
-                    }
+                if let Some(i) = activation {
                     cursor.hide(fb);
-                    return id - 2;
+                    return i;
                 }
             }
             delay_ms(8);
@@ -393,222 +331,441 @@ fn review_choice(
     }
 }
 
-/// Enum list selection and Cancel have independent keyboard focus. Current
-/// value is labeled independently of the focused draft choice.
-pub fn select(
-    fb: &FramebufferConfig,
-    title: &str,
-    labels: &[&str],
-    initial: usize,
-) -> Option<usize> {
-    if labels.is_empty() {
-        return None;
+fn choice_kind(label: &str, index: usize) -> ButtonKind {
+    if index == 0 {
+        ButtonKind::Neutral
+    } else if matches!(
+        label,
+        "Discard" | "Clear keys" | "Clear all keys" | "Disable"
+    ) {
+        ButtonKind::Danger
+    } else if matches!(label, "Enroll" | "Import") {
+        ButtonKind::Accent
+    } else {
+        ButtonKind::Primary
     }
-    let initial = initial.min(labels.len() - 1);
-    let mut selected = initial;
-    let mut offset = 0;
-    let mut focus = 0usize; // list, Cancel, full choice details, Apply draft
-    let mut reveal_selection = true;
+}
+
+/// Compatibility choice API: one paragraph, safe choice first.
+pub fn choose(
+    fb: &FramebufferConfig,
+    backdrop: Backdrop<'_>,
+    title: &str,
+    message: &str,
+    labels: &[&str],
+) -> usize {
+    let choices: Vec<Choice<'_>> = labels
+        .iter()
+        .enumerate()
+        .map(|(i, l)| Choice::new(l, (i == 0).then_some("Esc"), choice_kind(l, i)))
+        .collect();
+    let content: Vec<Block> = message.split("\n\n").map(Block::text).collect();
+    modal(fb, backdrop, Tone::Neutral, title, &content, &choices)
+}
+
+// ─── Trust review ───────────────────────────────────────────────────────
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LineKind {
+    Body,
+    /// "SHA-256 <hex groups>", prefix drawn quieter.
+    Fingerprint,
+    Note,
+    Warn,
+}
+pub struct ReviewLine {
+    pub kind: LineKind,
+    pub text: String,
+}
+/// One identity or fact group; always shown whole, never split across pages.
+pub struct ReviewSection {
+    pub label: String,
+    pub lines: Vec<ReviewLine>,
+}
+impl ReviewSection {
+    pub fn new(label: &str, text: &str) -> Self {
+        Self {
+            label: String::from(label),
+            lines: alloc::vec![ReviewLine {
+                kind: LineKind::Body,
+                text: String::from(text),
+            }],
+        }
+    }
+    pub fn labelled(label: &str) -> Self {
+        Self {
+            label: String::from(label),
+            lines: Vec::new(),
+        }
+    }
+    pub fn line(mut self, kind: LineKind, text: &str) -> Self {
+        self.lines.push(ReviewLine {
+            kind,
+            text: String::from(text),
+        });
+        self
+    }
+    /// Text of the section, for tests and serial logs.
+    pub fn text(&self) -> String {
+        let mut s = String::new();
+        for line in &self.lines {
+            if !s.is_empty() {
+                s.push('\n');
+            }
+            s.push_str(&line.text);
+        }
+        s
+    }
+}
+
+fn section_label_width(fb: &FramebufferConfig, sections: &[ReviewSection]) -> u32 {
+    let m = Metrics::for_fb(fb);
+    sections
+        .iter()
+        .map(|s| render::text_width(&s.label, m.body))
+        .max()
+        .unwrap_or(0)
+        .max(if m.large { 70 } else { 40 })
+        + 14
+}
+
+/// Lays out one section, optionally painting. Returns its height.
+fn review_section(
+    fb: &FramebufferConfig,
+    x: i32,
+    y: i32,
+    w: u32,
+    label_w: u32,
+    section: &ReviewSection,
+    paint: bool,
+) -> u32 {
+    let m = Metrics::for_fb(fb);
+    let tx = x + label_w as i32;
+    let tw = w.saturating_sub(label_w);
+    if paint {
+        render::fill_rect(fb, x, y, w, 1, theme::RULE);
+        render::draw_text_bold(fb, x, y + 8, &section.label, m.body, theme::INK, None);
+    }
+    let mut cy = y + 8;
+    for (i, line) in section.lines.iter().enumerate() {
+        let (size, advance) = if line.kind == LineKind::Note {
+            (m.small, m.small_line)
+        } else {
+            (m.body, m.line)
+        };
+        let cols = (tw / render::font_width(size)).max(1) as usize;
+        if i > 0 && line.kind == LineKind::Body {
+            cy += 4;
+        }
+        for (j, text) in wrap_lines(&line.text, cols).iter().enumerate() {
+            if paint {
+                match line.kind {
+                    LineKind::Fingerprint if j == 0 && text.starts_with("SHA-256 ") => {
+                        let pw = render::draw_text(fb, tx, cy, "SHA-256 ", size, theme::INK3, None);
+                        render::draw_text(
+                            fb,
+                            tx + pw as i32,
+                            cy,
+                            &text[8..],
+                            size,
+                            theme::INK,
+                            None,
+                        );
+                    }
+                    LineKind::Note => {
+                        render::draw_text(fb, tx, cy, text, size, theme::INK3, None);
+                    }
+                    LineKind::Warn => {
+                        render::draw_text_bold(fb, tx, cy, text, size, theme::WARN, None);
+                    }
+                    _ => {
+                        render::draw_text(fb, tx, cy, text, size, theme::INK, None);
+                    }
+                }
+            }
+            cy += advance as i32;
+        }
+    }
+    (cy - y) as u32 + 6
+}
+
+/// Greedy whole-section pages. A section taller than a page gets one alone.
+fn paginate(heights: &[u32], room: u32) -> Vec<(usize, usize)> {
+    let mut pages = Vec::new();
+    let mut start = 0;
+    while start < heights.len() {
+        let mut used = 0;
+        let mut end = start;
+        while end < heights.len() && (end == start || used + heights[end] <= room) {
+            used += heights[end];
+            end += 1;
+        }
+        pages.push((start, end));
+        start = end;
+    }
+    if pages.is_empty() {
+        pages.push((0, 0));
+    }
+    pages
+}
+
+/// Identity-before-consent review. `intro`/`outro` stay fixed; sections page
+/// by whole blocks. Confirm stays unavailable until every page was shown.
+pub fn review(
+    fb: &FramebufferConfig,
+    backdrop: Backdrop<'_>,
+    title: &str,
+    intro: &[Block],
+    sections: &[ReviewSection],
+    outro: &[Block],
+    confirm: Option<&str>,
+) -> bool {
     let mut cursor = CursorRenderer::new();
+    let mut page = 0usize;
+    let mut seen = 0usize;
+    let mut focused = 0usize;
     loop {
         cursor.hide(fb);
         let m = Metrics::for_fb(fb);
-        let height = (labels.len() as u32)
-            .saturating_mul(m.row + 4)
-            .saturating_add(render::font_height(m.title) + m.button + m.line + 88);
-        let rect = surface(fb, title, modal_rect_with_height(fb, height));
-        let cancel = (
-            rect.0 + 20,
-            rect.1 + rect.3 as i32 - m.button as i32 - 16,
-            (rect.2 - 56) / 3,
-            m.button,
+        let w = modal_width(fb, if m.large { 1000 } else { 984 });
+        let inner = w - m.pad * 2;
+        let label_w = section_label_width(fb, sections);
+        let measure = |w| -> Vec<u32> {
+            sections
+                .iter()
+                .map(|s| review_section(fb, 0, 0, w, label_w, s, false))
+                .collect()
+        };
+        // Reserve the scroll gutter only when the list actually pages.
+        let mut list_w = inner;
+        let mut heights = measure(list_w);
+        let intro_h = blocks(fb, 0, 0, inner, intro, false);
+        let outro_h = blocks(fb, 0, 0, inner, outro, false);
+        let counter_h = m.small_line + 8;
+        let fixed =
+            kit::modal_head_height(fb) + m.gap * 5 + intro_h + outro_h + m.button + counter_h;
+        let avail = fb.height.saturating_sub(m.header + m.footer + 16);
+        let natural: u32 = heights.iter().sum();
+        let room = avail.saturating_sub(fixed).max(m.line * 3);
+        if natural > room {
+            list_w = inner - controls::SCROLL_GUTTER;
+            heights = measure(list_w);
+        }
+        let natural: u32 = heights.iter().sum();
+        let pages = paginate(&heights, room);
+        page = page.min(pages.len() - 1);
+        seen = seen.max(page);
+        let all_seen = seen + 1 >= pages.len();
+        let list_h = if pages.len() == 1 { natural } else { room };
+        let h = fixed + list_h;
+        let rect = center_modal(fb, w, h);
+        theme::dimmed(backdrop);
+        let body = kit::modal_frame(fb, rect, Tone::Ok, title);
+        let mut y = body.1;
+        blocks(fb, body.0, y, inner, intro, true);
+        y += (intro_h + m.gap) as i32;
+        let list_top = y;
+        let (first, last) = pages[page];
+        for section in &sections[first..last] {
+            y += review_section(fb, body.0, y, list_w, label_w, section, true) as i32;
+        }
+        let list = (body.0, list_top, inner, list_h);
+        controls::scrollbar(fb, list, pages.len(), page, 1);
+        y = list_top + list_h as i32 + 4;
+        render::fill_rect(fb, body.0, y - 4, inner, 1, theme::RULE);
+        let counter = alloc::format!(
+            "{} {} to {} of {}",
+            if sections.len() == 1 { "Item" } else { "Items" },
+            first + usize::from(last > first),
+            last,
+            sections.len()
         );
-        let details = (cancel.0 + cancel.2 as i32 + 8, cancel.1, cancel.2, cancel.3);
-        let apply = (
-            details.0 + details.2 as i32 + 8,
-            details.1,
-            details.2,
-            details.3,
-        );
-        let buttons = [cancel, details, apply];
-        let top = rect.1 + render::font_height(m.title) as i32 + 40 + m.line as i32;
-        let slots = ((cancel.1 - top - 12).max(0) as u32 / (m.row + 4)).max(1) as usize;
-        let list = (rect.0 + 20, top, rect.2 - 40, (slots as u32) * (m.row + 4));
-        reconcile_choice_view(
-            &mut offset,
-            selected,
-            labels.len(),
-            slots,
-            &mut reveal_selection,
-        );
-        render::draw_text(
+        render::draw_text(fb, body.0, y + 2, &counter, m.small, theme::INK2, None);
+        if pages.len() > 1 {
+            let hint = if page + 1 < pages.len() {
+                alloc::format!(
+                    "PgDn shows the next {}",
+                    if pages.len() - page - 1 == 1 {
+                        "page"
+                    } else {
+                        "pages"
+                    }
+                )
+            } else {
+                String::from("PgUp shows earlier items")
+            };
+            render::draw_text_right(fb, body.0, y + 2, inner, &hint, m.small, theme::INK3, None);
+        }
+        y += counter_h as i32 + m.gap as i32 / 2;
+        blocks(fb, body.0, y, inner, outro, true);
+        let by = rect.1 + rect.3 as i32 - m.button as i32 - m.gap as i32;
+        let choices = match confirm {
+            Some(confirm) => alloc::vec![
+                Choice::new("Cancel", Some("Esc"), ButtonKind::Neutral),
+                Choice::new(confirm, None, ButtonKind::Accent),
+            ],
+            None => alloc::vec![Choice::new("Close", Some("Esc"), ButtonKind::Neutral)],
+        };
+        focused = focused.min(choices.len() - 1);
+        let rects = choice_row(
             fb,
-            rect.0 + 20,
-            rect.1 + render::font_height(m.title) as i32 + 24,
-            &render::ellipsize(
-                &alloc::format!("Selected: {}", labels[selected]),
-                rect.2 - 40,
-                m.small,
-            ),
-            m.small,
-            theme::TEXT_DIM,
-            None,
+            body.0 + inner as i32,
+            by,
+            &choices,
+            Some(focused),
+            &[true, all_seen],
         );
-        for (i, choice) in labels.iter().enumerate().skip(offset).take(slots) {
-            let row = (
-                list.0,
-                list.1 + ((i - offset) as u32 * (m.row + 4)) as i32,
-                list.2 - controls::SCROLL_GUTTER,
-                m.row,
-            );
-            let mut c = Control::new(i as u64, Role::Option, choice);
-            c.focused = focus == 0 && i == selected;
-            c.selected = i == initial;
-            let bg = controls::frame(fb, row, &c, false);
-            let label = alloc::format!(
-                "{} {} {}",
-                if i == selected { ">" } else { " " },
-                if i == initial {
-                    "[current]"
+        if !all_seen && confirm.is_some() {
+            let note = alloc::format!(
+                "Review {} more {} first",
+                pages.len() - seen - 1,
+                if pages.len() - seen - 1 == 1 {
+                    "page"
                 } else {
-                    "         "
-                },
-                choice
+                    "pages"
+                }
             );
-            render::draw_text(
+            render::draw_text_right(
                 fb,
-                row.0 + 14,
-                row.1 + 10,
-                &render::ellipsize(&label, row.2 - 28, m.small),
+                body.0,
+                by + ((m.button - render::font_height(m.small)) / 2) as i32,
+                inner - rects.iter().map(|r| r.2 + 12).sum::<u32>() - 8,
+                &note,
                 m.small,
-                theme::TEXT,
-                Some(bg),
+                theme::WARN,
+                None,
             );
         }
-        super::draw_scrollbar(
+        modal_keys(
             fb,
-            list.0 + list.2 as i32 - 22,
-            list.1,
-            list.3,
-            labels.len(),
-            offset,
-            slots,
-        );
-        controls::viewport_focus(fb, list, focus == 0, selected, offset, slots);
-        let mut c = Control::new(u64::MAX, Role::Button, "Cancel");
-        c.focused = focus == 1;
-        controls::button(fb, cancel, &c, ButtonKind::Neutral);
-        let mut c = Control::new(u64::MAX - 1, Role::Button, "Choice details");
-        c.focused = focus == 2;
-        controls::button(fb, details, &c, ButtonKind::Neutral);
-        let mut c = Control::new(u64::MAX - 2, Role::Button, "Apply draft");
-        c.focused = focus == 3;
-        controls::button(fb, apply, &c, ButtonKind::Primary);
-        super::draw_footer(
-            fb,
-            "Tab Focus   Arrows Choose   Enter Apply draft   ? Details   Esc Cancel",
+            if confirm.is_some() { "Cancel" } else { "Close" },
+            if pages.len() > 1 {
+                &[("PgUp PgDn", "Scroll")]
+            } else {
+                &[]
+            },
         );
         loop {
             super::poll_and_render_cursor(fb, &mut cursor);
             if let Some(key) = menu_common::read_key() {
-                match key {
+                let activation = match key {
                     KeyPress::Escape => {
                         cursor.hide(fb);
-                        return None;
-                    }
-                    KeyPress::Enter | KeyPress::Char(' ') => {
-                        cursor.hide(fb);
-                        if matches!(choice_action(focus, selected), ChoiceAction::Apply(_)) {
-                            return Some(selected);
-                        }
-                        if focus == 1 {
-                            return None;
-                        }
-                        choice_details(fb, labels[selected], selected == initial);
-                        break;
-                    }
-                    KeyPress::Char('?') => {
-                        cursor.hide(fb);
-                        choice_details(fb, labels[selected], selected == initial);
-                        break;
-                    }
-                    KeyPress::Tab | KeyPress::BackTab => {
-                        focus = (focus + if key == KeyPress::BackTab { 3 } else { 1 }) % 4;
-                        if focus == 0 {
-                            controls::ensure_visible(&mut offset, selected, labels.len(), slots);
-                        }
-                        break;
+                        return false;
                     }
                     KeyPress::F8 => {
                         layout::toggle_text_size(fb);
-                        reveal_selection = true; // Reconcile only after computing the new slots.
                         break;
                     }
-                    KeyPress::Up if focus == 0 => {
-                        selected = selected.saturating_sub(1);
-                        controls::ensure_visible(&mut offset, selected, labels.len(), slots);
+                    KeyPress::Tab | KeyPress::Right | KeyPress::BackTab | KeyPress::Left => {
+                        focused = (focused + 1) % choices.len();
                         break;
                     }
-                    KeyPress::Down if focus == 0 => {
-                        selected = (selected + 1).min(labels.len() - 1);
-                        controls::ensure_visible(&mut offset, selected, labels.len(), slots);
+                    KeyPress::PageDown | KeyPress::Down => {
+                        page = (page + 1).min(pages.len() - 1);
                         break;
                     }
-                    KeyPress::Home | KeyPress::End | KeyPress::PageUp | KeyPress::PageDown
-                        if focus == 0 =>
-                    {
-                        selected = super::page_selection(key, selected, labels.len(), slots)
-                            .unwrap_or(selected);
-                        controls::ensure_visible(&mut offset, selected, labels.len(), slots);
+                    KeyPress::PageUp | KeyPress::Up => {
+                        page = page.saturating_sub(1);
+                        break;
+                    }
+                    KeyPress::End => {
+                        page = pages.len() - 1;
+                        break;
+                    }
+                    KeyPress::Home => {
+                        page = 0;
                         break;
                     }
                     KeyPress::MouseScroll(dz) => {
-                        controls::scroll(&mut offset, dz, labels.len(), slots);
+                        controls::scroll(&mut page, dz, pages.len(), 1);
                         break;
                     }
+                    KeyPress::Enter | KeyPress::Char(' ') => Some(focused),
                     KeyPress::MouseClick { x, y } => {
-                        if let Some(action) =
-                            choice_pointer_action(&buttons, x as i32, y as i32, selected)
-                        {
-                            cursor.hide(fb);
-                            match action {
-                                ChoiceAction::Cancel => return None,
-                                ChoiceAction::Apply(value) => return Some(value),
-                                ChoiceAction::Details => {
-                                    choice_details(fb, labels[selected], selected == initial);
-                                    focus = 2;
-                                    break;
-                                }
-                            }
-                        }
                         if controls::scroll_track(
-                            &mut offset,
+                            &mut page,
                             list,
                             (x as i32, y as i32),
-                            labels.len(),
-                            slots,
+                            pages.len(),
+                            1,
                         ) {
                             break;
                         }
-                        if contains(
-                            (list.0, list.1, list.2 - controls::SCROLL_GUTTER, list.3),
-                            x as i32,
-                            y as i32,
-                        ) && (y as i32 - list.1) as u32 % (m.row + 4) < m.row
-                        {
-                            let i = offset + ((y as i32 - list.1) as u32 / (m.row + 4)) as usize;
-                            if i < labels.len() {
-                                selected = i;
-                                focus = 0;
-                            }
-                            break;
-                        }
+                        rects.iter().position(|r| contains(*r, x as i32, y as i32))
                     }
-                    _ => {}
+                    _ => None,
+                };
+                match activation {
+                    Some(0) => {
+                        cursor.hide(fb);
+                        return false;
+                    }
+                    // Unseen identities: confirm advances instead of committing.
+                    Some(_) if !all_seen => {
+                        page = (page + 1).min(pages.len() - 1);
+                        break;
+                    }
+                    Some(_) => {
+                        cursor.hide(fb);
+                        return true;
+                    }
+                    None => {}
                 }
             }
             delay_ms(8);
         }
+    }
+}
+
+// ─── Anchored popovers ──────────────────────────────────────────────────
+
+/// Below the anchor's value side, flipped above when there is no room.
+fn popover_rect(fb: &FramebufferConfig, anchor: Option<Rect>, w: u32, h: u32) -> Rect {
+    let m = Metrics::for_fb(fb);
+    let top_limit = m.header as i32 + 4;
+    let bottom_limit = (fb.height - m.footer) as i32 - 4;
+    let h = h.min((bottom_limit - top_limit) as u32);
+    let Some((ax, ay, aw, ah)) = anchor else {
+        let (x, y, w, h) = center_modal(fb, w, h);
+        return (x, y, w, h);
+    };
+    let x = (ax + aw as i32 - w as i32).clamp(m.pad as i32, (fb.width - w - m.pad) as i32);
+    let below = ay + ah as i32 - 1;
+    let y = if below + h as i32 <= bottom_limit {
+        below
+    } else if ay + 1 - (h as i32) >= top_limit {
+        ay + 1 - h as i32
+    } else {
+        bottom_limit - h as i32
+    };
+    (x, y, w, h)
+}
+
+fn popover_frame(fb: &FramebufferConfig, rect: Rect, title: &str) -> i32 {
+    let m = Metrics::for_fb(fb);
+    let (x, y, w, h) = rect;
+    render::fill_rect(fb, x, y, w, h, theme::SHEET);
+    render::draw_thick_border(fb, x, y, w, h, 2, theme::INK);
+    let th = m.small_line + 12;
+    render::draw_text(
+        fb,
+        x + 12,
+        y + 7,
+        &render::ellipsize(title, w - 24, m.small),
+        m.small,
+        theme::INK3,
+        None,
+    );
+    render::fill_rect(fb, x + 2, y + th as i32, w - 4, 1, theme::RULE);
+    y + th as i32 + 1
+}
+
+fn radio(fb: &FramebufferConfig, cx: i32, cy: i32, on: bool, bg: Rgb) {
+    render::draw_dot(fb, cx, cy, 7, theme::INK2);
+    render::draw_dot(fb, cx, cy, 5, bg);
+    if on {
+        render::draw_dot(fb, cx, cy, 3, theme::INK);
     }
 }
 
@@ -616,17 +773,15 @@ pub fn select(
 enum ChoiceAction {
     Apply(usize),
     Cancel,
-    Details,
 }
 fn choice_action(focus: usize, selected: usize) -> ChoiceAction {
     match focus {
         1 => ChoiceAction::Cancel,
-        2 => ChoiceAction::Details,
         _ => ChoiceAction::Apply(selected),
     }
 }
 fn choice_pointer_action(
-    buttons: &[Rect; 3],
+    buttons: &[Rect; 2],
     x: i32,
     y: i32,
     selected: usize,
@@ -651,42 +806,264 @@ fn reconcile_choice_view(
     }
 }
 
-fn choice_details(fb: &FramebufferConfig, label: &str, current: bool) {
-    choose(
-        fb,
-        NavItem::Firmware,
-        "Choice details",
-        &alloc::format!(
-            "{}\n\n{label}",
-            if current {
-                "Current value (unchanged)"
-            } else {
-                "Draft choice (not yet applied)"
+/// Enum picker anchored to the setting row. Keyboard focus (outline) and the
+/// current value (filled radio) are distinct. A row click only moves focus;
+/// "Use value" or Enter applies, Escape or Cancel leaves the value alone.
+#[allow(clippy::too_many_arguments)]
+pub fn select(
+    fb: &FramebufferConfig,
+    backdrop: Backdrop<'_>,
+    anchor: Option<Rect>,
+    title: &str,
+    labels: &[&str],
+    initial: usize,
+    tags: &[(usize, &str)],
+) -> Option<usize> {
+    if labels.is_empty() {
+        return None;
+    }
+    let initial = initial.min(labels.len() - 1);
+    let mut selected = initial;
+    let mut offset = 0;
+    let mut focus = 0usize; // list, Cancel, Use value
+    let mut reveal_selection = true;
+    let mut cursor = CursorRenderer::new();
+    loop {
+        cursor.hide(fb);
+        let m = Metrics::for_fb(fb);
+        let tag_w = tags
+            .iter()
+            .map(|(_, t)| render::text_width(t, m.small))
+            .max()
+            .unwrap_or(0);
+        let label_w = labels
+            .iter()
+            .map(|l| render::text_width(l, m.body))
+            .max()
+            .unwrap_or(0);
+        let base = if m.large { 460 } else { 400 };
+        let gutter_w = controls::SCROLL_GUTTER;
+        let w = (label_w + tag_w + 80 + gutter_w)
+            .clamp(base, fb.width.saturating_sub(m.pad * 2).min(680));
+        let text_w = w - 60 - tag_w - gutter_w;
+        let long = render::text_width(labels[selected], m.body) > text_w;
+        let detail_h = if long { m.line * 3 + 12 } else { 0 };
+        let chrome = m.small_line + 13 + detail_h + m.button + 28;
+        let max_h = fb.height.saturating_sub(m.header + m.footer + 8);
+        let slots = ((max_h.saturating_sub(chrome)) / m.row).clamp(1, labels.len() as u32) as usize;
+        let rect = popover_rect(fb, anchor, w, chrome + slots as u32 * m.row);
+        let slots = ((rect.3.saturating_sub(chrome)) / m.row).max(1) as usize;
+        reconcile_choice_view(
+            &mut offset,
+            selected,
+            labels.len(),
+            slots,
+            &mut reveal_selection,
+        );
+        backdrop();
+        let top = popover_frame(fb, rect, title);
+        let list = (rect.0 + 2, top, rect.2 - 4, slots as u32 * m.row);
+        let gutter = if labels.len() > slots {
+            controls::SCROLL_GUTTER
+        } else {
+            0
+        };
+        for (i, choice) in labels.iter().enumerate().skip(offset).take(slots) {
+            let row = (
+                list.0,
+                list.1 + ((i - offset) as u32 * m.row) as i32,
+                list.2 - gutter,
+                m.row,
+            );
+            let mut c = Control::new(i as u64, Role::Option, choice);
+            c.selected = i == selected;
+            c.focused = focus == 0 && i == selected;
+            let bg = controls::row(fb, row, &c, false);
+            let ty = row.1 + ((m.row - render::font_height(m.body)) / 2) as i32;
+            radio(fb, row.0 + 18, row.1 + m.row as i32 / 2, i == initial, bg);
+            render::draw_text_weight(
+                fb,
+                row.0 + 34,
+                ty,
+                &render::ellipsize(choice, text_w, m.body),
+                m.body,
+                i == selected,
+                theme::INK,
+                Some(bg),
+            );
+            if let Some((_, tag)) = tags.iter().find(|(j, _)| *j == i) {
+                render::draw_text_right(
+                    fb,
+                    row.0,
+                    ty + 2,
+                    row.2 - 10,
+                    tag,
+                    m.small,
+                    if *tag == "unsaved" {
+                        theme::WARN
+                    } else {
+                        theme::INK3
+                    },
+                    Some(bg),
+                );
             }
-        ),
-        &["Back"],
-    );
+        }
+        controls::scrollbar(fb, list, labels.len(), offset, slots);
+        controls::viewport_focus(fb, list, focus == 0, selected, offset, slots);
+        let mut y = list.1 + list.3 as i32 + 6;
+        if long {
+            kit::prose(
+                fb,
+                rect.0 + 12,
+                y,
+                rect.2 - 24,
+                labels[selected],
+                m.body,
+                theme::INK2,
+                3,
+            );
+            y += detail_h as i32;
+        }
+        let bw = (rect.2 - 36) / 2;
+        let cancel = (rect.0 + 12, y + 4, bw, m.button);
+        let apply = (cancel.0 + bw as i32 + 12, cancel.1, bw, m.button);
+        let mut c = Control::new(u64::MAX, Role::Button, "Cancel");
+        c.focused = focus == 1;
+        controls::button_with_key(fb, cancel, &c, ButtonKind::Neutral, Some("Esc"));
+        let mut c = Control::new(u64::MAX - 1, Role::Button, "Use value");
+        c.focused = focus == 2;
+        controls::button_with_key(fb, apply, &c, ButtonKind::Primary, Some("Enter"));
+        let buttons = [cancel, apply];
+        kit::draw_keys(
+            fb,
+            &[
+                ("Up Down", "Choose"),
+                ("Enter", "Use value"),
+                ("Tab", "Buttons"),
+                ("Esc", "Cancel"),
+            ],
+            false,
+        );
+        loop {
+            super::poll_and_render_cursor(fb, &mut cursor);
+            if let Some(key) = menu_common::read_key() {
+                match key {
+                    KeyPress::Escape => {
+                        cursor.hide(fb);
+                        return None;
+                    }
+                    KeyPress::Enter | KeyPress::Char(' ') => {
+                        cursor.hide(fb);
+                        return match choice_action(focus, selected) {
+                            ChoiceAction::Apply(v) => Some(v),
+                            ChoiceAction::Cancel => None,
+                        };
+                    }
+                    KeyPress::Tab | KeyPress::BackTab => {
+                        focus = (focus + if key == KeyPress::BackTab { 2 } else { 1 }) % 3;
+                        if focus == 0 {
+                            controls::ensure_visible(&mut offset, selected, labels.len(), slots);
+                        }
+                        break;
+                    }
+                    KeyPress::F8 => {
+                        layout::toggle_text_size(fb);
+                        reveal_selection = true; // Reconcile only after computing the new slots.
+                        break;
+                    }
+                    KeyPress::Up if focus == 0 => {
+                        selected = selected.saturating_sub(1);
+                        controls::ensure_visible(&mut offset, selected, labels.len(), slots);
+                        break;
+                    }
+                    KeyPress::Down if focus == 0 => {
+                        selected = (selected + 1).min(labels.len() - 1);
+                        controls::ensure_visible(&mut offset, selected, labels.len(), slots);
+                        break;
+                    }
+                    KeyPress::Left | KeyPress::Right if focus != 0 => {
+                        focus = if focus == 1 { 2 } else { 1 };
+                        break;
+                    }
+                    KeyPress::Home | KeyPress::End | KeyPress::PageUp | KeyPress::PageDown
+                        if focus == 0 =>
+                    {
+                        selected = super::page_selection(key, selected, labels.len(), slots)
+                            .unwrap_or(selected);
+                        controls::ensure_visible(&mut offset, selected, labels.len(), slots);
+                        break;
+                    }
+                    KeyPress::MouseScroll(dz) => {
+                        controls::scroll(&mut offset, dz, labels.len(), slots);
+                        break;
+                    }
+                    KeyPress::MouseClick { x, y } => {
+                        if let Some(action) =
+                            choice_pointer_action(&buttons, x as i32, y as i32, selected)
+                        {
+                            cursor.hide(fb);
+                            return match action {
+                                ChoiceAction::Apply(v) => Some(v),
+                                ChoiceAction::Cancel => None,
+                            };
+                        }
+                        if controls::scroll_track(
+                            &mut offset,
+                            list,
+                            (x as i32, y as i32),
+                            labels.len(),
+                            slots,
+                        ) {
+                            break;
+                        }
+                        if contains(
+                            (list.0, list.1, list.2 - gutter, list.3),
+                            x as i32,
+                            y as i32,
+                        ) {
+                            let i = offset + ((y as i32 - list.1) as u32 / m.row) as usize;
+                            if i < labels.len() {
+                                selected = i;
+                                focus = 0;
+                            }
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            delay_ms(8);
+        }
+    }
 }
 
+// ─── Field editor ───────────────────────────────────────────────────────
+
 #[derive(Debug, PartialEq, Eq)]
-enum EditEvent {
+pub enum EditEvent {
     Changed,
     Apply,
     Cancel,
 }
-struct Editor {
-    value: String,
-    caret: usize,
-    focus: usize,
-    error: Option<&'static str>,
+/// Caret editor model. Focus stops: 0 field, 1 Cancel, 2 Apply.
+pub struct Editor {
+    pub value: String,
+    pub caret: usize,
+    pub focus: usize,
+    pub error: Option<&'static str>,
+    limit: usize,
 }
 impl Editor {
-    fn new(initial: &str) -> Self {
+    pub fn new(initial: &str) -> Self {
+        Self::with_limit(initial, 255)
+    }
+    pub fn with_limit(initial: &str, limit: usize) -> Self {
         Self {
             value: String::from(initial),
             caret: initial.len(),
             focus: 0,
             error: None,
+            limit,
         }
     }
     fn control<'a>(&'a self, index: usize, title: &'a str) -> Control<'a> {
@@ -700,7 +1077,7 @@ impl Editor {
             match index {
                 0 => title,
                 1 => "Cancel",
-                _ => "Apply draft",
+                _ => "Set",
             },
         );
         c.focused = self.focus == index;
@@ -710,7 +1087,7 @@ impl Editor {
         }
         c
     }
-    fn key(&mut self, key: KeyPress) -> EditEvent {
+    pub fn key(&mut self, key: KeyPress) -> EditEvent {
         match key {
             KeyPress::Escape => return EditEvent::Cancel,
             KeyPress::Tab => self.focus = (self.focus + 1) % 3,
@@ -766,12 +1143,12 @@ impl Editor {
                 self.error = None;
             }
             KeyPress::Char(ch) if ch.is_ascii() && !ch.is_control() => {
-                if self.value.len() < 255 {
+                if self.value.len() < self.limit {
                     self.value.insert(self.caret, ch);
                     self.caret += 1;
                     self.error = None;
                 } else {
-                    self.error = Some("Maximum 255 bytes. Delete text before adding more.");
+                    self.error = Some("Maximum length reached. Delete text before adding more.");
                 }
             }
             _ => {}
@@ -780,83 +1157,127 @@ impl Editor {
     }
 }
 
+/// Single-line field editor. With an anchor it is a popover on the row;
+/// without one it is a modal over the dimmed screen.
+#[allow(clippy::too_many_arguments)]
 pub fn input(
     fb: &FramebufferConfig,
+    backdrop: Backdrop<'_>,
+    anchor: Option<Rect>,
     title: &str,
     hint: &str,
     initial: &str,
+    limit: usize,
     validate: impl Fn(&str) -> Result<(), &'static str>,
 ) -> Option<String> {
-    let mut editor = Editor::new(initial);
+    let mut editor = Editor::with_limit(initial, limit);
     let mut cursor = CursorRenderer::new();
     loop {
         cursor.hide(fb);
         let m = Metrics::for_fb(fb);
-        let height = render::font_height(m.title) + m.line * 5 + m.button * 2 + 72;
-        let rect = surface(fb, title, modal_rect_with_height(fb, height));
-        let hint_y = rect.1 + render::font_height(m.title) as i32 + 32;
-        wrapped(
-            fb,
-            (rect.0 + 20, hint_y, rect.2 - 40, m.line * 3),
-            hint,
-            theme::TEXT_DIM,
-        );
-        let field = (
-            rect.0 + 20,
-            hint_y + (m.line * 3 + 8) as i32,
-            rect.2 - 40,
-            m.button + 4,
-        );
+        let w = if anchor.is_some() {
+            if m.large { 520 } else { 400 }
+        } else {
+            modal_width(fb, if m.large { 820 } else { 720 })
+        };
+        let field_h = render::font_height(m.body) + 16;
+        let message_h = m.small_line * 2 + 8;
+        let (inner_x, mut y, inner_w, rect) = if anchor.is_some() {
+            let h = m.small_line + 13 + field_h + message_h + m.button + 36;
+            let rect = popover_rect(fb, anchor, w, h);
+            backdrop();
+            let top = popover_frame(fb, rect, title);
+            (rect.0 + 12, top + 10, rect.2 - 24, rect)
+        } else {
+            let h = kit::modal_head_height(fb) + m.gap * 3 + field_h + message_h + m.button + 12;
+            let rect = center_modal(fb, w, h);
+            theme::dimmed(backdrop);
+            let body = kit::modal_frame(fb, rect, Tone::Neutral, title);
+            (body.0, body.1, body.2, rect)
+        };
+        let field = (inner_x, y, inner_w, field_h);
         let c = editor.control(0, title);
-        let bg = controls::frame(fb, field, &c, false);
-        let columns = (field.2.saturating_sub(24) / render::font_width(m.body)).max(2) as usize;
+        render::fill_rect(fb, field.0, field.1, field.2, field.3, theme::SHEET);
+        render::draw_thick_border(
+            fb,
+            field.0,
+            field.1,
+            field.2,
+            field.3,
+            2,
+            if c.invalid {
+                theme::BAD
+            } else if c.focused {
+                theme::INK
+            } else {
+                theme::RULE_STRONG
+            },
+        );
+        let fw = render::font_width(m.body);
+        let columns = (field.2.saturating_sub(20) / fw).max(2) as usize;
         let before = editor.value[..editor.caret].chars().count();
-        let start = before.saturating_sub(columns - 2);
-        let shown: String = editor.value.chars().skip(start).take(columns - 1).collect();
+        let start = before.saturating_sub(columns - 1);
+        let shown: String = editor.value.chars().skip(start).take(columns).collect();
+        let ty = field.1 + 8;
         render::draw_text(
             fb,
             field.0 + 10,
-            field.1 + 10,
+            ty,
             &shown,
             m.body,
-            theme::TEXT,
-            Some(bg),
+            theme::INK,
+            Some(theme::SHEET),
         );
         if editor.focus == 0 {
-            render::fill_rect(
-                fb,
-                field.0 + 10 + ((before - start) as u32 * render::font_width(m.body)) as i32,
-                field.1 + 8,
-                2,
-                render::font_height(m.body) + 4,
-                theme::TEXT,
-            );
+            let cx = field.0 + 10 + ((before - start) as u32 * fw) as i32;
+            render::fill_rect(fb, cx, ty, fw, render::font_height(m.body), theme::INK);
+            if let Some(ch) = editor.value[editor.caret..].chars().next() {
+                render::draw_char(fb, cx, ty, ch, m.body, theme::SHEET, Some(theme::INK));
+            }
         }
+        y += field_h as i32 + 6;
         if let Some(error) = editor.error {
-            wrapped(
+            kit::prose(
                 fb,
-                (
-                    rect.0 + 20,
-                    field.1 + field.3 as i32 + 8,
-                    rect.2 - 40,
-                    m.line * 2,
-                ),
+                inner_x,
+                y,
+                inner_w,
                 &alloc::format!("Error: {error}"),
-                theme::ERROR,
+                m.small,
+                theme::BAD,
+                2,
             );
+        } else {
+            kit::prose(fb, inner_x, y, inner_w, hint, m.small, theme::INK2, 2);
         }
-        let cancel = (
-            rect.0 + 20,
-            rect.1 + rect.3 as i32 - m.button as i32 - 16,
-            (rect.2 - 48) / 2,
-            m.button,
-        );
-        let apply = (cancel.0 + cancel.2 as i32 + 8, cancel.1, cancel.2, cancel.3);
-        controls::button(fb, cancel, &editor.control(1, title), ButtonKind::Neutral);
-        controls::button(fb, apply, &editor.control(2, title), ButtonKind::Primary);
-        super::draw_footer(
+        let by = rect.1 + rect.3 as i32 - m.button as i32 - 12;
+        let bw = (inner_w - 12) / 2;
+        let cancel = (inner_x, by, bw, m.button);
+        let apply = (inner_x + bw as i32 + 12, by, bw, m.button);
+        controls::button_with_key(
             fb,
-            "Tab Focus   Arrows Edit   Del Delete   Enter Apply   Esc Cancel",
+            cancel,
+            &editor.control(1, title),
+            ButtonKind::Neutral,
+            Some("Esc"),
+        );
+        controls::button_with_key(
+            fb,
+            apply,
+            &editor.control(2, title),
+            ButtonKind::Primary,
+            Some("Enter"),
+        );
+        kit::draw_keys(
+            fb,
+            &[
+                ("Left Right", "Move"),
+                ("Home End", "Jump"),
+                ("Tab", "Buttons"),
+                ("Enter", "Set"),
+                ("Esc", "Cancel"),
+            ],
+            false,
         );
         loop {
             super::poll_and_render_cursor(fb, &mut cursor);
@@ -872,9 +1293,7 @@ pub fn input(
                         EditEvent::Apply
                     } else if contains(field, x as i32, y as i32) {
                         editor.focus = 0;
-                        let index = start
-                            + ((x as i32 - field.0 - 10).max(0) as u32 / render::font_width(m.body))
-                                as usize;
+                        let index = start + ((x as i32 - field.0 - 10).max(0) as u32 / fw) as usize;
                         editor.caret = editor
                             .value
                             .char_indices()
@@ -925,23 +1344,16 @@ mod tests {
         assert_eq!(wrap_lines("A\n\nB", 40), ["A", "", "B"]);
     }
     #[test]
-    fn identities_are_whole_labeled_blocks_on_short_displays() {
-        let hash = "00010203 04050607 08090a0b 0c0d0e0f 10111213 14151617 18191a1b 1c1d1e1f";
-        let sections = [
-            ReviewSection::new("Consequences", &"Review carefully. ".repeat(20)),
-            ReviewSection::new("PK SHA256", hash),
-            ReviewSection::new("KEK SHA256", hash),
-        ];
-        for (columns, slots) in [(50, 6), (56, 4), (70, 12)] {
-            let pages = review_pages(&sections, columns, slots);
-            assert!(pages.iter().all(|p| p.len() <= slots));
-            for label in ["PK SHA256", "KEK SHA256"] {
-                let page = pages.iter().find(|p| p.iter().any(|s| s == label)).unwrap();
-                let joined = page.join(" ");
-                assert!(joined.contains("00010203 04050607"));
-                assert!(joined.contains("18191a1b 1c1d1e1f"));
-            }
+    fn identities_page_as_whole_blocks() {
+        // Heights of six identity blocks; a page holds about two and a half.
+        let heights = [80, 80, 40, 80, 80, 200];
+        let pages = paginate(&heights, 190);
+        assert_eq!(pages, [(0, 2), (2, 4), (4, 5), (5, 6)]);
+        for (a, b) in &pages {
+            assert!(b > a, "every page shows at least one whole block");
         }
+        assert_eq!(paginate(&heights, 10_000), [(0, 6)]);
+        assert_eq!(paginate(&[], 100), [(0, 0)]);
     }
     #[test]
     fn editor_focus_describes_the_actual_field_and_actions() {
@@ -959,21 +1371,17 @@ mod tests {
     }
     #[test]
     fn enum_pointer_buttons_can_apply_the_selected_draft() {
-        let buttons = [(0, 0, 100, 40), (108, 0, 100, 40), (216, 0, 100, 40)];
+        let buttons = [(0, 0, 100, 40), (108, 0, 100, 40)];
         assert_eq!(
-            choice_pointer_action(&buttons, 230, 10, 17),
+            choice_pointer_action(&buttons, 120, 10, 17),
             Some(ChoiceAction::Apply(17))
         );
         assert_eq!(
             choice_pointer_action(&buttons, 10, 10, 17),
             Some(ChoiceAction::Cancel)
         );
-        assert_eq!(
-            choice_pointer_action(&buttons, 120, 10, 17),
-            Some(ChoiceAction::Details)
-        );
-        assert_eq!(choice_pointer_action(&buttons, 105, 10, 17), None);
-        assert_eq!(choice_action(0, 17), choice_action(3, 17));
+        assert_eq!(choice_pointer_action(&buttons, 104, 10, 17), None);
+        assert_eq!(choice_action(0, 17), choice_action(2, 17));
     }
 
     #[test]
@@ -1021,5 +1429,8 @@ mod tests {
         e.key(KeyPress::Char('y'));
         assert_eq!(e.value.len(), 255);
         assert!(e.error.is_some());
+        let mut e = Editor::with_limit(&"x".repeat(300), 511);
+        e.key(KeyPress::Char('y'));
+        assert_eq!(e.value.len(), 301);
     }
 }

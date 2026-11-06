@@ -24,6 +24,7 @@ pub enum KeyPress {
     BackTab,
     Delete,
     F8,
+    F10,
     Enter,
     Escape,
     Char(char),
@@ -59,6 +60,7 @@ fn decode_keyboard_key(scan_code: u16, unicode_char: u16, shift: u32) -> Option<
         0x0A => Some(KeyPress::PageDown),
         0x08 => Some(KeyPress::Delete),
         0x12 => Some(KeyPress::F8),
+        0x14 => Some(KeyPress::F10),
         0x17 => Some(KeyPress::Escape), // SCAN_ESC
         0 if unicode_char == 0x0D => Some(KeyPress::Enter), // Carriage return
         0 if unicode_char == 9 => Some(if shift & 3 != 0 {
@@ -158,6 +160,7 @@ impl SerialKeyParser {
                             6 => Some(KeyPress::PageDown),
                             3 => Some(KeyPress::Delete),
                             19 => Some(KeyPress::F8),
+                            21 => Some(KeyPress::F10),
                             _ => None,
                         },
                         _ => serial_navigation_key(byte),
@@ -231,7 +234,7 @@ mod serial_tests {
         assert_eq!(decode_keyboard_key(0, 9, 2), Some(KeyPress::BackTab));
         assert_eq!(decode_keyboard_key(8, 0, 0), Some(KeyPress::Delete));
         let mut p = SerialKeyParser::new();
-        let keys: alloc::vec::Vec<_> = b"\t\x1b[Z\x1b[3~\x1b[19~"
+        let keys: alloc::vec::Vec<_> = b"\t\x1b[Z\x1b[3~\x1b[19~\x1b[21~"
             .iter()
             .filter_map(|b| p.feed(*b))
             .collect();
@@ -241,7 +244,8 @@ mod serial_tests {
                 KeyPress::Tab,
                 KeyPress::BackTab,
                 KeyPress::Delete,
-                KeyPress::F8
+                KeyPress::F8,
+                KeyPress::F10
             ]
         );
     }

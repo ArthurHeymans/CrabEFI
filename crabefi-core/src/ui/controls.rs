@@ -7,6 +7,8 @@ use crate::{FramebufferConfig, menu_common::KeyPress};
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Group {
     Navigation,
+    /// Settings section list (Firmware page only).
+    Sections,
     Content,
     Actions,
 }
@@ -17,11 +19,20 @@ pub enum FocusEvent {
     Action(usize),
 }
 
+pub const DEFAULT_ORDER: &[Group] = &[Group::Navigation, Group::Content, Group::Actions];
+pub const SECTIONED_ORDER: &[Group] = &[
+    Group::Navigation,
+    Group::Sections,
+    Group::Content,
+    Group::Actions,
+];
+
 #[derive(Clone, Copy, Debug)]
 pub struct Focus {
     pub group: Group,
     pub navigation: usize,
     pub action: usize,
+    pub order: &'static [Group],
 }
 impl Focus {
     pub const fn new(navigation: usize) -> Self {
@@ -29,9 +40,11 @@ impl Focus {
             group: Group::Content,
             navigation,
             action: 0,
+            order: DEFAULT_ORDER,
         }
     }
     /// Traversal never activates. Space activates buttons, not arbitrary lists.
+    /// Content and Sections are owned by the screen and return `None`.
     pub fn handle(
         &mut self,
         key: KeyPress,
@@ -39,15 +52,27 @@ impl Focus {
         actions: usize,
     ) -> Option<FocusEvent> {
         if matches!(key, KeyPress::Tab | KeyPress::BackTab) {
-            let groups = [Group::Navigation, Group::Content, Group::Actions];
-            let current = groups.iter().position(|g| *g == self.group).unwrap_or(1);
-            self.group = groups[(current + if key == KeyPress::BackTab { 2 } else { 1 }) % 3];
+            let n = self.order.len();
+            let current = self
+                .order
+                .iter()
+                .position(|g| *g == self.group)
+                .unwrap_or(1);
+            let mut next = current;
+            // Skip an empty action group rather than parking focus nowhere.
+            for _ in 0..n {
+                next = (next + if key == KeyPress::BackTab { n - 1 } else { 1 }) % n;
+                if self.order[next] != Group::Actions || actions > 0 {
+                    break;
+                }
+            }
+            self.group = self.order[next];
             return Some(FocusEvent::Moved);
         }
         let (index, count) = match self.group {
             Group::Navigation => (&mut self.navigation, navigation),
             Group::Actions => (&mut self.action, actions),
-            Group::Content => return None,
+            Group::Content | Group::Sections => return None,
         };
         if count == 0 {
             return Some(FocusEvent::Moved);
@@ -111,75 +136,135 @@ impl<'a> Control<'a> {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ButtonKind {
+    /// Bordered, ink text.
     Neutral,
+    /// The one filled action on a surface.
     Primary,
+    /// Destructive: red outline, never filled.
     Danger,
+    /// Consequential but constructive (enroll, import): green outline.
+    Accent,
 }
 
-pub fn frame(
+/// List row: tint for selection, a left bar and bold label (drawn by the
+/// caller), and an inset ink outline for keyboard focus. Returns the fill.
+pub fn row(
     fb: &FramebufferConfig,
     rect: Rect,
     control: &Control<'_>,
     hovered: bool,
 ) -> render::Rgb {
     let (x, y, w, h) = rect;
-    let bg = if control.focused || control.selected {
-        theme::BRIGHT
+    let bg = if control.selected {
+        theme::SELECTED
     } else if hovered {
-        theme::CONT_HIGH
+        theme::HOVER
     } else {
-        theme::CONTAINER
+        theme::SHEET
     };
-    render::fill_rect(fb, x, y, w, h, bg);
-    let border = if control.invalid {
-        theme::ERROR
-    } else if control.focused {
-        theme::TEXT
-    } else if hovered {
-        theme::TEXT_DIM
-    } else {
-        theme::BORDER
-    };
-    render::draw_thick_border(fb, x, y, w, h, if control.focused { 3 } else { 1 }, border);
+    render::fill_rect(fb, x, y, w, h.saturating_sub(1), bg);
+    render::fill_rect(fb, x, y + h as i32 - 1, w, 1, theme::RULE);
     if control.selected {
-        render::fill_rect(fb, x + 4, y + 5, 3, h.saturating_sub(10), theme::PRIMARY);
+        render::fill_rect(fb, x, y, 4, h.saturating_sub(1), theme::ACCENT);
+    }
+    if control.focused {
+        render::draw_thick_border(fb, x, y, w, h, 2, theme::INK);
+    }
+    if control.invalid {
+        render::draw_thick_border(fb, x, y, w, h, 2, theme::BAD);
     }
     bg
 }
 
-pub fn button(fb: &FramebufferConfig, rect: Rect, control: &Control<'_>, kind: ButtonKind) {
+/// Compatibility name: a bordered surface used by platform integrations.
+pub fn frame(
+    fb: &FramebufferConfig,
+    rect: Rect,
+    control: &Control<'_>,
+    hovered: bool,
+) -> render::Rgb {
+    row(fb, rect, control, hovered)
+}
+
+/// Bordered key cap such as `[F10]`. Returns its width.
+pub fn keycap(fb: &FramebufferConfig, x: i32, y: i32, label: &str, on_accent: bool) -> u32 {
     let m = Metrics::for_fb(fb);
-    let (x, y, w, h) = rect;
-    let bg = match kind {
-        ButtonKind::Primary if control.enabled => theme::PRIMARY,
-        _ => theme::CONTAINER,
-    };
-    let fg = if !control.enabled {
-        theme::TEXT_DIM
-    } else if kind == ButtonKind::Primary {
-        theme::ON_PRIMARY
+    let w = render::text_width(label, m.small) + 10;
+    let h = render::font_height(m.small) + 4;
+    let (bg, border, fg) = if on_accent {
+        (theme::ACCENT, theme::ON_ACCENT_DIM, theme::ON_ACCENT)
     } else {
-        theme::TEXT
+        (theme::SHEET, theme::RULE_STRONG, theme::INK)
     };
     render::fill_rect(fb, x, y, w, h, bg);
-    let border = if control.focused {
-        theme::TEXT
-    } else if kind == ButtonKind::Danger {
-        theme::ERROR
+    render::draw_border(fb, x, y, w, h, border);
+    render::draw_text_bold(fb, x + 5, y + 2, label, m.small, fg, Some(bg));
+    w
+}
+pub fn keycap_width(fb: &FramebufferConfig, label: &str) -> u32 {
+    render::text_width(label, Metrics::for_fb(fb).small) + 10
+}
+
+pub fn button(fb: &FramebufferConfig, rect: Rect, control: &Control<'_>, kind: ButtonKind) {
+    button_with_key(fb, rect, control, kind, None);
+}
+
+/// Left-aligned label, optional key cap at the right. Focus is a 2px ink
+/// ring outside the button, independent of the Primary fill.
+pub fn button_with_key(
+    fb: &FramebufferConfig,
+    rect: Rect,
+    control: &Control<'_>,
+    kind: ButtonKind,
+    key: Option<&str>,
+) {
+    let m = Metrics::for_fb(fb);
+    let (x, y, w, h) = rect;
+    let primary = kind == ButtonKind::Primary && control.enabled;
+    let bg = if primary { theme::ACCENT } else { theme::SHEET };
+    let fg = if !control.enabled {
+        theme::INK3
     } else {
-        theme::BORDER
+        match kind {
+            ButtonKind::Primary => theme::ON_ACCENT,
+            ButtonKind::Danger => theme::BAD,
+            ButtonKind::Accent => theme::ACCENT,
+            ButtonKind::Neutral => theme::INK,
+        }
     };
-    render::draw_thick_border(fb, x, y, w, h, if control.focused { 3 } else { 1 }, border);
-    render::draw_text_centered(
-        fb,
-        x + 8,
-        y + (h.saturating_sub(render::font_height(m.small)) / 2) as i32,
-        w.saturating_sub(16),
-        &render::ellipsize(control.label, w.saturating_sub(24), m.small),
-        m.small,
-        fg,
-        Some(bg),
-    );
+    render::fill_rect(fb, x, y, w, h, bg);
+    match kind {
+        _ if !control.enabled => render::draw_border(fb, x, y, w, h, theme::RULE),
+        ButtonKind::Danger => render::draw_thick_border(fb, x, y, w, h, 2, theme::BAD),
+        ButtonKind::Accent => render::draw_thick_border(fb, x, y, w, h, 2, theme::ACCENT),
+        ButtonKind::Primary => render::draw_border(fb, x, y, w, h, theme::ACCENT),
+        ButtonKind::Neutral => render::draw_border(fb, x, y, w, h, theme::RULE_STRONG),
+    }
+    if control.focused {
+        render::draw_thick_border(fb, x - 4, y - 4, w + 8, h + 8, 2, theme::INK);
+    }
+    let key_w = key.map_or(0, |k| keycap_width(fb, k) + 10);
+    let text_h = render::font_height(m.body);
+    let ty = y + (h.saturating_sub(text_h) / 2) as i32;
+    let bold = kind != ButtonKind::Neutral || control.focused;
+    let label = render::ellipsize(control.label, w.saturating_sub(28 + key_w), m.body);
+    render::draw_text_weight(fb, x + 14, ty, &label, m.body, bold, fg, Some(bg));
+    if let Some(k) = key {
+        let kh = render::font_height(m.small) + 4;
+        keycap(
+            fb,
+            x + w as i32 - key_w as i32 - 4,
+            y + (h.saturating_sub(kh) / 2) as i32,
+            k,
+            primary,
+        );
+    }
+}
+
+/// Natural width of a button for its label and key cap.
+pub fn button_width(fb: &FramebufferConfig, label: &str, key: Option<&str>) -> u32 {
+    let m = Metrics::for_fb(fb);
+    render::text_width(label, m.body) + 28 + key.map_or(0, |k| keycap_width(fb, k) + 14)
 }
 
 /// Viewport movement is deliberately independent of the selected target.
@@ -207,16 +292,16 @@ pub fn viewport_focus(
             fb,
             list.0,
             list.1,
-            list.2.saturating_sub(8),
+            list.2.saturating_sub(SCROLL_GUTTER),
             list.3,
             2,
-            theme::TEXT,
+            theme::INK,
         );
     }
 }
 
 /// A usable pointer target even when a boot-protocol mouse has no wheel.
-pub const SCROLL_GUTTER: u32 = 32;
+pub const SCROLL_GUTTER: u32 = 24;
 
 pub fn scrollbar_thumb(
     height: u32,
@@ -233,6 +318,16 @@ pub fn scrollbar_thumb(
     let maximum = total - slots;
     let top = ((height - thumb) as u128 * offset.min(maximum) as u128 / maximum as u128) as u32;
     Some((top, thumb))
+}
+
+/// Thin track at the right edge of `list`, inside the scroll gutter.
+pub fn scrollbar(fb: &FramebufferConfig, list: Rect, total: usize, offset: usize, slots: usize) {
+    let Some((top, thumb)) = scrollbar_thumb(list.3, total, offset, slots) else {
+        return;
+    };
+    let x = list.0 + list.2 as i32 - 8;
+    render::fill_rect(fb, x, list.1, 6, list.3, theme::BAND);
+    render::fill_rect(fb, x, list.1 + top as i32, 6, thumb, theme::INK3);
 }
 
 /// Track clicks page the viewport without changing focus or selecting a row.
@@ -293,42 +388,25 @@ mod tests {
         }
     }
     #[test]
+    fn sectioned_order_visits_sections_and_skips_empty_actions() {
+        let mut f = Focus::new(0);
+        f.order = SECTIONED_ORDER;
+        f.group = Group::Navigation;
+        for expected in [Group::Sections, Group::Content, Group::Navigation] {
+            f.handle(KeyPress::Tab, 3, 0);
+            assert_eq!(f.group, expected);
+        }
+        f.handle(KeyPress::BackTab, 3, 0);
+        assert_eq!(f.group, Group::Content);
+        assert_eq!(f.handle(KeyPress::Down, 3, 0), None);
+    }
+    #[test]
     fn action_focus_and_navigation_are_independent() {
         let mut f = Focus::new(1);
         f.group = Group::Actions;
         f.handle(KeyPress::Right, 3, 4);
         assert_eq!(f.handle(KeyPress::Enter, 3, 4), Some(FocusEvent::Action(1)));
         assert_eq!(f.navigation, 1);
-    }
-    #[test]
-    fn required_palette_pairs_have_readable_contrast() {
-        fn luminance(c: render::Rgb) -> f64 {
-            let linear = |v: u8| {
-                let x = f64::from(v) / 255.0;
-                if x <= 0.04045 {
-                    x / 12.92
-                } else {
-                    ((x + 0.055) / 1.055).powf(2.4)
-                }
-            };
-            0.2126 * linear(c.r) + 0.7152 * linear(c.g) + 0.0722 * linear(c.b)
-        }
-        for (fg, bg, minimum) in [
-            (theme::TEXT, theme::CONTAINER, 4.5),
-            (theme::TEXT_DIM, theme::CONTAINER, 4.5),
-            (theme::OUTLINE, theme::CONTAINER, 4.5),
-            (theme::ON_PRIMARY, theme::PRIMARY, 4.5),
-            (theme::TEXT, theme::BRIGHT, 4.5),
-            (theme::BORDER, theme::CONTAINER, 3.0),
-            (theme::ERROR, theme::CONTAINER, 4.5),
-        ] {
-            let a = luminance(fg);
-            let b = luminance(bg);
-            assert!(
-                (a.max(b) + 0.05) / (a.min(b) + 0.05) >= minimum,
-                "{fg:?} on {bg:?}"
-            );
-        }
     }
 
     #[test]

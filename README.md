@@ -7,8 +7,9 @@ CrabEFI implements enough UEFI to boot Linux via shim/GRUB2 or systemd-boot on r
 ![CrabEFI graphical boot menu](docs/screenshot.jpg)
 
 *Graphical boot menu (`--features ui`) running headlessly in QEMU at
-800×600 with BLS test entries from an EFI System Partition. Captured with
-QEMU `screendump` and converted from PNG to JPEG using ImageMagick.*
+1024×768 with BLS test entries from an EFI System Partition, during the
+autoboot countdown. Captured with QEMU `screendump` and converted from PNG to
+JPEG using ImageMagick. See [docs/UI.md](docs/UI.md) for the design.*
 
 ## Documentation
 
