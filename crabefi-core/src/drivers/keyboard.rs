@@ -902,6 +902,16 @@ fn scancode_to_efi_normal(kb: &KeyboardState, code: u8) -> Option<(u16, u16)> {
 pub(crate) struct Ps2Keyboard;
 
 impl super::keyboard_common::KeyboardDevice for Ps2Keyboard {
+    fn is_available(&mut self) -> bool {
+        let mut kb = KEYBOARD.lock();
+        // RESET can leave both ACK and BAT queued. Advance initialization
+        // without consuming scancodes or waiting for an absent keyboard.
+        for _ in 0..2 {
+            poll_bat_completion(&mut kb);
+        }
+        matches!(kb.init_state, InitState::Ready)
+    }
+
     fn read_key(&mut self) -> Option<crate::platform::Key> {
         try_read_key().map(|(scancode, unicode_char)| crate::platform::Key {
             scancode,

@@ -1,0 +1,36 @@
+name: Firmware UI reset regression
+on:
+  push:
+    branches: [main, master, SBSA, RISCV64]
+  pull_request: {}
+permissions:
+  contents: read
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  fwui:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Install Rust toolchain
+        uses: ./.github/actions/setup-rust
+      - name: Install test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qemu-system-x86 mtools dosfstools \
+            zstd coreboot-utils
+      - name: Validate one-shot firmware UI requests across reset
+        run: ./crabefi test --app fwui-test --disable-kvm --timeout 120
+      - name: Preserve reset regression logs
+        if: always()
+        # actions/upload-artifact v7 (same pin as ci.yml)
+        uses: >-
+          actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: fwui-reset-reports
+          path: target/fwui-reports/
+          if-no-files-found: ignore

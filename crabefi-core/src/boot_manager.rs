@@ -3,9 +3,10 @@
 //! Implements the UEFI boot dispatch sequence (Specification Section 3.1):
 //!
 //! 1. Initialize storage subsystem (PCI drivers)
-//! 2. **BootNext** — try the designated one-shot boot option
-//! 3. **BootOrder** — iterate Boot#### entries in order
-//! 4. **Fallback** — discover boot entries from ESPs, show interactive menu
+//! 2. Honor a consumed firmware-UI request, bypassing automatic boot
+//! 3. **BootNext** — try the designated one-shot boot option
+//! 4. **BootOrder** — iterate Boot#### entries in order
+//! 5. **Fallback** — discover boot entries from ESPs, show interactive menu
 //!
 //! The individual boot paths (UEFI, direct Linux, payload chainload) are
 //! dispatched from [`boot_selected_entry`].
@@ -18,8 +19,9 @@ use crate::timestamp;
 
 /// Initialize storage subsystem (PCI drivers, USB keyboards, etc.)
 ///
-/// This is called once before the boot manager starts trying boot options.
-fn init_storage_subsystem() {
+/// Called once before firmware-UI capability checks and boot dispatch, so USB
+/// input is enumerated before an indefinite setup session can be accepted.
+pub(crate) fn init_storage_subsystem() {
     log::info!("Initializing storage subsystem...");
     timestamp::record(timestamp::TS_CRABEFI_STORAGE_INIT_START);
 
@@ -49,12 +51,17 @@ fn init_storage_subsystem() {
     timestamp::record(timestamp::TS_CRABEFI_STORAGE_INIT_DONE);
 }
 
-/// Choose a usable menu and avoid waiting forever without a framebuffer.
-///
-/// A serial driver may be output-only or fail after the menu starts, so its
-/// presence cannot guarantee that an indefinitely waiting menu is usable.
-fn menu_configuration(ui: bool, framebuffer: bool, timeout: u32) -> (bool, u32) {
-    let timeout = if !framebuffer && timeout == 0 {
+/// Keep ordinary headless boot bounded. An explicit setup request has already
+/// been gated on an interactive console and must never autoboot.
+fn menu_configuration(
+    ui: bool,
+    framebuffer: bool,
+    timeout: u32,
+    firmware_ui_requested: bool,
+) -> (bool, u32) {
+    let timeout = if firmware_ui_requested {
+        0
+    } else if !framebuffer && timeout == 0 {
         5
     } else {
         timeout
@@ -67,16 +74,24 @@ fn menu_configuration(ui: bool, framebuffer: bool, timeout: u32) -> (bool, u32) 
 /// Implements the boot dispatch sequence from UEFI Specification Section 3.1:
 ///
 /// 1. Initialize storage subsystem (PCI drivers)
-/// 2. **BootNext** — if set, delete it and try that Boot#### entry
-/// 3. **BootOrder** — iterate Boot#### entries in order, try each active one
-/// 4. **Fallback** — discover boot entries from ESPs (removable media path)
-/// 5. Show interactive boot menu if nothing booted automatically
-pub(crate) fn run(boot_var_state: boot_vars::BootVarState) {
-    init_storage_subsystem();
-
+/// 2. On an explicit firmware-UI request, skip directly to an indefinite menu
+/// 3. **BootNext** — if set, delete it and try that Boot#### entry
+/// 4. **BootOrder** — iterate Boot#### entries in order, try each active one
+/// 5. **Fallback** — discover boot entries from ESPs (removable media path)
+/// 6. Show interactive boot menu if nothing booted automatically
+pub(crate) fn run(boot_var_state: boot_vars::BootVarState, firmware_ui_requested: bool) {
     // Apply timeout from the Timeout variable (if set) to the boot menu default
     let timeout_seconds = boot_var_state.timeout.unwrap_or(5) as u32;
 
+    if !firmware_ui_requested {
+        try_automatic_boot(&boot_var_state);
+    }
+
+    show_boot_menu(timeout_seconds, firmware_ui_requested);
+}
+
+/// Automatic boot is deliberately separate: setup must not even delete BootNext.
+fn try_automatic_boot(boot_var_state: &boot_vars::BootVarState) {
     // ---- Phase 1: BootNext ----
     if let Some(boot_next_num) = boot_var_state.boot_next {
         log::info!("=== BootNext: attempting Boot{:04X} ===", boot_next_num);
@@ -165,13 +180,16 @@ pub(crate) fn run(boot_var_state: boot_vars::BootVarState) {
             }
         }
     }
+}
 
+/// Discover boot entries and show setup indefinitely only on an explicit request.
+fn show_boot_menu(timeout_seconds: u32, firmware_ui_requested: bool) {
     // ---- Phase 3: Fallback to device discovery and interactive menu ----
     log::info!("=== Fallback: discovering boot entries from storage ===");
 
     let mut boot_menu = menu::discover_boot_entries();
 
-    if boot_menu.entry_count() == 0 {
+    if boot_menu.entry_count() == 0 && !firmware_ui_requested {
         log::warn!("No bootable media found!");
 
         #[cfg(feature = "ui")]
@@ -184,10 +202,29 @@ pub(crate) fn run(boot_var_state: boot_vars::BootVarState) {
         cfg!(feature = "ui"),
         crate::handoff::framebuffer().is_some(),
         timeout_seconds,
+        firmware_ui_requested,
     );
     boot_menu.set_timeout(timeout_seconds);
 
-    log::debug!("Showing boot menu...");
+    log::info!(
+        "Showing {}boot menu (autoboot timeout: {}s)",
+        if firmware_ui_requested {
+            "firmware UI: "
+        } else {
+            ""
+        },
+        boot_menu.timeout_seconds
+    );
+    if firmware_ui_requested && boot_menu.entry_count() == 0 {
+        #[cfg(feature = "ui")]
+        if graphical {
+            crate::ui::show_no_media_screen();
+            return;
+        }
+        // The text menu also exposes firmware/security settings without media.
+    }
+
+    log::debug!("Showing boot menu..."); // Also used by the screenshot harness.
 
     // The graphical menu requires a framebuffer; the text menu also works
     // headlessly and will boot the selected entry when its timeout expires.
@@ -228,16 +265,30 @@ mod menu_configuration_tests {
 
     #[test]
     fn graphical_menu_requires_a_framebuffer() {
-        assert_eq!(menu_configuration(true, true, 0), (true, 0));
-        assert_eq!(menu_configuration(true, false, 7), (false, 7));
-        assert_eq!(menu_configuration(false, true, 0), (false, 0));
+        assert_eq!(menu_configuration(true, true, 0, false), (true, 0));
+        assert_eq!(menu_configuration(true, false, 7, false), (false, 7));
+        assert_eq!(menu_configuration(false, true, 0, false), (false, 0));
     }
 
     #[test]
-    fn headless_menu_never_waits_indefinitely() {
-        assert_eq!(menu_configuration(true, false, 0), (false, 5));
-        assert_eq!(menu_configuration(false, false, 0), (false, 5));
-        assert_eq!(menu_configuration(true, false, 12), (false, 12));
+    fn explicit_setup_never_autoboots() {
+        for ui in [false, true] {
+            for framebuffer in [false, true] {
+                for timeout in [0, 2, 5, 65535] {
+                    assert_eq!(
+                        menu_configuration(ui, framebuffer, timeout, true),
+                        (ui && framebuffer, 0)
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn ordinary_headless_menu_never_waits_indefinitely() {
+        assert_eq!(menu_configuration(true, false, 0, false), (false, 5));
+        assert_eq!(menu_configuration(false, false, 0, false), (false, 5));
+        assert_eq!(menu_configuration(true, false, 12, false), (false, 12));
     }
 }
 

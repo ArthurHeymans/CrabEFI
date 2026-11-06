@@ -21,6 +21,12 @@ pub struct PointerReport {
 
 /// A relative pointing device.
 pub trait PointerDevice {
+    /// Whether initialization succeeded and this device can accept input.
+    /// Deferred drivers must override this; registration alone is not readiness.
+    fn is_available(&self) -> bool {
+        true
+    }
+
     /// Return motion since the previous call and the current button level,
     /// or `None` when idle. Must not wait for user input.
     fn poll(&mut self) -> Option<PointerReport>;
@@ -88,6 +94,14 @@ static PENDING: Local<Pending> = Local::new(Pending::new());
 /// Register a pointing device for the rest of boot services.
 pub fn register(device: Box<dyn PointerDevice>) {
     DEVICES.borrow_mut().push(Entry { device, buttons: 0 });
+}
+
+/// Whether any registered pointing device is ready, without consuming input.
+pub fn is_available() -> bool {
+    DEVICES
+        .borrow()
+        .iter()
+        .any(|entry| entry.device.is_available())
 }
 
 /// Register the PS/2 mouse. USB mice register when USB is enumerated.

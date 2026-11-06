@@ -497,6 +497,17 @@ impl AnySerial {
         }
     }
 
+    /// Whether this is a live, bidirectional native console. A DebugOutput
+    /// adapter may be output-only; pending input is not a capability query.
+    fn supports_console_input(&self) -> bool {
+        match self {
+            Self::Uart16550(serial) => serial.functional,
+            #[cfg(target_arch = "aarch64")]
+            Self::Pl011(serial) => serial.functional,
+            Self::Platform(_) => false,
+        }
+    }
+
     /// Check whether the active serial backend has pending input.
     fn has_input(&self) -> bool {
         match self {
@@ -667,6 +678,16 @@ pub fn write_byte(byte: u8) {
     if let Some(sink) = &mut serial_state.debug_sink {
         sink.write_byte(byte);
     }
+}
+
+/// Whether a known bidirectional console is available, even with no pending key.
+/// Used for capabilities which require an indefinite interactive session.
+pub fn supports_console_input() -> bool {
+    SERIAL
+        .borrow()
+        .driver
+        .as_ref()
+        .is_some_and(AnySerial::supports_console_input)
 }
 
 /// Check if there is input available on the serial port.

@@ -237,6 +237,10 @@ these commands; they consume the checked-in image selected by Cargo.
 # ConvertPointer, and post-SVAM reset (x86-64)
 ./crabefi test --app runtime-image-test --disable-kvm
 
+# Reboot to firmware UI: real persistent flash, EFI ResetSystem, manual menu
+# selection, subsequent normal boots, post-EBS request, and no-media setup
+./crabefi test --app fwui-test --disable-kvm --timeout 120
+
 # Run directory enumeration, writable USB mutation and persistence checks
 ./crabefi test --app directory-test --disable-kvm
 
@@ -258,6 +262,30 @@ After QEMU exits, the harness runs `fsck.fat -n` on a copy of the ESP and uses
 `mtype` to verify the USB run's flushed payload and zero-filled gap independently.
 Both tools come from the existing dosfstools/mtools test dependencies. CI gates
 all three backends; this is not physical-media or power-loss qualification.
+
+### Firmware UI reset regression
+
+`fwui-test` is an x86-64 Q35 regression using an EFI application equivalent to
+GRUB `fwsetup`/systemd-boot, not those bootloaders themselves. It checks the global
+`OsIndicationsSupported` bit and attributes, ORs a request into persistent
+`OsIndications`, and calls `ResetSystem`. The host verifies the menu bypasses
+BootNext/BootOrder and remains interactive for eight seconds (beyond both the
+configured two-second and default five-second timeouts), then sends Enter.
+The app checks that only the request bit was cleared and BootNext was preserved;
+further resets verify distinct BootNext and BootOrder options through BootCurrent.
+The host also rejects a misleading “Booting now” message during setup. A second
+request is written after ExitBootServices and replayed from retained memory on
+warm reset. The host repeats with the disk removed between QEMU processes, tests
+empty-menu Enter, requires the text-menu header and firmware settings navigation,
+and checks the next reboot is normal. The temporary SMMSTORE flash is file-backed
+and writable, not a volatile
+variable mock or a QEMU snapshot. Serial logs, stderr and QEMU commands are kept
+under `target/fwui-reports/` on success and failure.
+
+The checked-in Q35 ROM currently supplies no framebuffer, so this tests the
+interactive serial/text menu (also with `--ui`'s text fallback), not graphical
+rendering. Runtime requests use retained-memory warm-reset staging, not
+power-loss-safe runtime flash writes. See [capabilities](capabilities.md).
 
 ### Interactive QEMU
 
@@ -376,6 +404,7 @@ Test apps live in `test-apps/` and target `x86_64-unknown-uefi` / `aarch64-unkno
 | `hello` | Basic EFI services smoke test |
 | `rng-test` | `EFI_RNG_PROTOCOL` validation |
 | `directory-test` | Filesystem and long filename tests |
+| `fwui-test` | x86-64 persistent reboot-to-setup and subsequent normal boot |
 | `storage-security-test` | Storage security command tests |
 | `secure-boot-test` | Secure Boot verification tests |
 | `fw-dump` | Firmware info dump utility |
