@@ -295,8 +295,10 @@ pub fn modal(
         let by = rect.1 + rect.3 as i32 - m.button as i32 - m.gap as i32;
         let rects = choice_row(fb, body.0 + body.2 as i32, by, choices, Some(focused), &[]);
         modal_keys(fb, choices[0].label, &[]);
+        let mut hover = super::Hover::default();
         loop {
             super::poll_and_render_cursor(fb, &mut cursor);
+            super::track_hover(fb, &mut cursor, &mut hover, None);
             if let Some(key) = menu_common::read_key() {
                 let activation = match key {
                     KeyPress::Escape => {
@@ -645,7 +647,9 @@ pub fn review(
                 &[]
             },
         );
+        let mut hover = super::Hover::default();
         loop {
+            super::track_hover(fb, &mut cursor, &mut hover, None);
             super::poll_and_render_cursor(fb, &mut cursor);
             if let Some(key) = menu_common::read_key() {
                 let activation = match key {
@@ -806,6 +810,54 @@ fn reconcile_choice_view(
     }
 }
 
+struct ChoiceRow<'a> {
+    rect: Rect,
+    label: &'a str,
+    selected: bool,
+    focused: bool,
+    current: bool,
+    tag: Option<&'a str>,
+    text_w: u32,
+    hovered: bool,
+}
+
+fn paint_choice_row(fb: &FramebufferConfig, r: &ChoiceRow<'_>) {
+    let m = Metrics::for_fb(fb);
+    let row = r.rect;
+    let mut c = Control::new(0, Role::Option, r.label);
+    c.selected = r.selected;
+    c.focused = r.focused;
+    let bg = controls::row(fb, row, &c, r.hovered);
+    let ty = row.1 + ((m.row - render::font_height(m.body)) / 2) as i32;
+    radio(fb, row.0 + 18, row.1 + m.row as i32 / 2, r.current, bg);
+    render::draw_text_weight(
+        fb,
+        row.0 + 34,
+        ty,
+        &render::ellipsize(r.label, r.text_w, m.body),
+        m.body,
+        r.selected,
+        theme::INK,
+        Some(bg),
+    );
+    if let Some(tag) = r.tag {
+        render::draw_text_right(
+            fb,
+            row.0,
+            ty + 2,
+            row.2 - 10,
+            tag,
+            m.small,
+            if tag == "unsaved" {
+                theme::WARN
+            } else {
+                theme::INK3
+            },
+            Some(bg),
+        );
+    }
+}
+
 /// Enum picker anchored to the setting row. Keyboard focus (outline) and the
 /// current value (filled radio) are distinct. A row click only moves focus;
 /// "Use value" or Enter applies, Escape or Cancel leaves the value alone.
@@ -861,6 +913,8 @@ pub fn select(
             &mut reveal_selection,
         );
         backdrop();
+        // The page behind a popover is visible but not clickable.
+        controls::clear_buttons();
         let top = popover_frame(fb, rect, title);
         let list = (rect.0 + 2, top, rect.2 - 4, slots as u32 * m.row);
         let gutter = if labels.len() > slots {
@@ -868,45 +922,28 @@ pub fn select(
         } else {
             0
         };
-        for (i, choice) in labels.iter().enumerate().skip(offset).take(slots) {
-            let row = (
+        // Snapshot of this paint: any change below breaks out and repaints.
+        let (offset_now, selected_now, focus_now) = (offset, selected, focus);
+        let row_rect = move |i: usize| {
+            (
                 list.0,
-                list.1 + ((i - offset) as u32 * m.row) as i32,
+                list.1 + ((i - offset_now) as u32 * m.row) as i32,
                 list.2 - gutter,
                 m.row,
-            );
-            let mut c = Control::new(i as u64, Role::Option, choice);
-            c.selected = i == selected;
-            c.focused = focus == 0 && i == selected;
-            let bg = controls::row(fb, row, &c, false);
-            let ty = row.1 + ((m.row - render::font_height(m.body)) / 2) as i32;
-            radio(fb, row.0 + 18, row.1 + m.row as i32 / 2, i == initial, bg);
-            render::draw_text_weight(
-                fb,
-                row.0 + 34,
-                ty,
-                &render::ellipsize(choice, text_w, m.body),
-                m.body,
-                i == selected,
-                theme::INK,
-                Some(bg),
-            );
-            if let Some((_, tag)) = tags.iter().find(|(j, _)| *j == i) {
-                render::draw_text_right(
-                    fb,
-                    row.0,
-                    ty + 2,
-                    row.2 - 10,
-                    tag,
-                    m.small,
-                    if *tag == "unsaved" {
-                        theme::WARN
-                    } else {
-                        theme::INK3
-                    },
-                    Some(bg),
-                );
-            }
+            )
+        };
+        let choice_row = |i: usize, hovered: bool| ChoiceRow {
+            rect: row_rect(i),
+            label: labels[i],
+            selected: i == selected_now,
+            focused: focus_now == 0 && i == selected_now,
+            current: i == initial,
+            tag: tags.iter().find(|(j, _)| *j == i).map(|(_, t)| *t),
+            text_w,
+            hovered,
+        };
+        for i in (offset..labels.len()).take(slots) {
+            paint_choice_row(fb, &choice_row(i, false));
         }
         controls::scrollbar(fb, list, labels.len(), offset, slots);
         controls::viewport_focus(fb, list, focus == 0, selected, offset, slots);
@@ -944,8 +981,35 @@ pub fn select(
             ],
             false,
         );
+        let mut hover = super::Hover::default();
+        let mut hovered_row: Option<usize> = None;
         loop {
             super::poll_and_render_cursor(fb, &mut cursor);
+            super::track_hover(fb, &mut cursor, &mut hover, None);
+            let (mx, my) = crate::drivers::mouse_cursor::position();
+            let under = contains((list.0, list.1, list.2 - gutter, list.3), mx, my)
+                .then(|| offset + ((my - list.1) as u32 / m.row) as usize)
+                .filter(|i| *i < labels.len() && *i < offset + slots);
+            if under != hovered_row {
+                let previous = core::mem::replace(&mut hovered_row, under);
+                cursor.while_hidden(fb, || {
+                    for (i, on) in previous
+                        .map(|i| (i, false))
+                        .into_iter()
+                        .chain(under.map(|i| (i, true)))
+                    {
+                        paint_choice_row(fb, &choice_row(i, on));
+                    }
+                    controls::viewport_focus(
+                        fb,
+                        list,
+                        focus_now == 0,
+                        selected_now,
+                        offset_now,
+                        slots,
+                    );
+                });
+            }
             if let Some(key) = menu_common::read_key() {
                 match key {
                     KeyPress::Escape => {
@@ -1186,6 +1250,8 @@ pub fn input(
             let h = m.small_line + 13 + field_h + message_h + m.button + 36;
             let rect = popover_rect(fb, anchor, w, h);
             backdrop();
+            // The page behind a popover is visible but not clickable.
+            controls::clear_buttons();
             let top = popover_frame(fb, rect, title);
             (rect.0 + 12, top + 10, rect.2 - 24, rect)
         } else {
@@ -1279,7 +1345,9 @@ pub fn input(
             ],
             false,
         );
+        let mut hover = super::Hover::default();
         loop {
+            super::track_hover(fb, &mut cursor, &mut hover, None);
             super::poll_and_render_cursor(fb, &mut cursor);
             if let Some(key) = menu_common::read_key() {
                 if key == KeyPress::F8 {

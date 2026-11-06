@@ -50,9 +50,23 @@ const NAV_ITEMS: &[(NavItem, &str)] = &[
 ];
 
 /// Firmware settings hold unsaved drafts; shown as "Firmware *" on every page.
+#[cfg(not(test))]
 static FIRMWARE_DIRTY: AtomicBool = AtomicBool::new(false);
+#[cfg(test)]
+std::thread_local! {
+    static FIRMWARE_DIRTY: AtomicBool = const { AtomicBool::new(false) };
+}
+fn firmware_dirty() -> bool {
+    #[cfg(not(test))]
+    return FIRMWARE_DIRTY.load(Ordering::Relaxed);
+    #[cfg(test)]
+    FIRMWARE_DIRTY.with(|d| d.load(Ordering::Relaxed))
+}
 pub fn set_firmware_dirty(dirty: bool) {
+    #[cfg(not(test))]
     FIRMWARE_DIRTY.store(dirty, Ordering::Relaxed);
+    #[cfg(test)]
+    FIRMWARE_DIRTY.with(|d| d.store(dirty, Ordering::Relaxed));
 }
 
 pub(crate) fn nav_item_index(item: NavItem) -> usize {
@@ -96,7 +110,7 @@ pub(crate) fn draw_navigation(
     focus: Option<usize>,
     hovered: Option<NavItem>,
 ) {
-    let dirty = FIRMWARE_DIRTY.load(Ordering::Relaxed);
+    let dirty = firmware_dirty();
     let tabs: Vec<kit::Tab<'_>> = NAV_ITEMS
         .iter()
         .enumerate()
@@ -120,6 +134,7 @@ pub(crate) fn draw_shell(
     focus: &Focus,
     hovered: Option<NavItem>,
 ) {
+    controls::clear_buttons();
     clear(fb);
     draw_header(fb);
     draw_navigation(
@@ -150,6 +165,57 @@ pub fn update_sidebar_hover(
     *hovered = next;
     cursor.while_hidden(fb, || draw_navigation(fb, active, None, next));
     true
+}
+
+/// Pointer hover shared by every page: tabs and buttons highlight the same
+/// way everywhere. Rows are highlighted by each page's own list painter.
+#[derive(Default)]
+pub(crate) struct Hover {
+    tab: Option<NavItem>,
+    button: Option<usize>,
+}
+impl Hover {
+    /// A full repaint drew everything unhighlighted.
+    pub(crate) fn reset(&mut self) {
+        *self = Self::default();
+    }
+}
+
+/// Call once per poll. `tabs` is the active page and focus when the tab row
+/// is live; dialogs and editors pass `None`.
+pub(crate) fn track_hover(
+    fb: &FramebufferInfo,
+    cursor: &mut CursorRenderer,
+    hover: &mut Hover,
+    tabs: Option<(NavItem, &Focus)>,
+) {
+    let (x, y) = mouse_cursor::position();
+    if let Some((active, focus)) = tabs {
+        let tab = navigation_hit(fb, x, y).filter(|t| *t != active);
+        if tab != hover.tab {
+            hover.tab = tab;
+            cursor.while_hidden(fb, || {
+                draw_navigation(
+                    fb,
+                    active,
+                    (focus.group == Group::Navigation).then_some(focus.navigation),
+                    tab,
+                )
+            });
+        }
+    }
+    let button = controls::button_at(x, y);
+    if button != hover.button {
+        let previous = core::mem::replace(&mut hover.button, button);
+        cursor.while_hidden(fb, || {
+            if let Some(i) = previous {
+                controls::repaint_button(fb, i, false);
+            }
+            if let Some(i) = button {
+                controls::repaint_button(fb, i, true);
+            }
+        });
+    }
 }
 
 /// Handle common focus/navigation only. Callers still gate leaving unsaved forms.
@@ -404,11 +470,14 @@ pub(crate) fn empty_screen(
     let mut cursor = CursorRenderer::new();
     let mut focus = Focus::new(nav_item_index(nav));
     focus.group = Group::Actions;
+    let mut hover = Hover::default();
     loop {
         cursor.hide(fb);
         let restart = empty_screen_paint(fb, nav, &focus, title, message);
+        hover.reset();
         loop {
             poll_and_render_cursor(fb, &mut cursor);
+            track_hover(fb, &mut cursor, &mut hover, Some((nav, &focus)));
             if let Some(key) = menu_common::read_key() {
                 let snapshot = focus;
                 let backdrop = || {
@@ -1044,14 +1113,22 @@ fn run_boot(fb: &FramebufferInfo, menu: &mut BootMenu, default: usize) -> BootRe
     state.default = default;
     keep_boot_selection_visible(fb, &mut state);
     let mut buttons = paint_boot(fb, menu, &state);
+    let mut hover = Hover::default();
     let origin = mouse_cursor::position();
     loop {
         poll_and_render_cursor(fb, &mut cursor);
+        // Tabs are not live while the command-line editor owns the keys.
+        let tabs = state
+            .edit
+            .is_none()
+            .then_some((NavItem::Boot, &state.focus));
+        track_hover(fb, &mut cursor, &mut hover, tabs);
         if deliberate_pointer_motion(origin, mouse_cursor::position())
             && cancel_boot_countdown(menu, &mut state)
         {
             keep_boot_selection_visible(fb, &mut state);
             buttons = cursor.while_hidden(fb, || paint_boot(fb, menu, &state));
+            hover.reset();
         }
         let hovered = boot_hit(fb, menu, &state);
         if hovered != state.hovered {
@@ -1073,6 +1150,7 @@ fn run_boot(fb: &FramebufferInfo, menu: &mut BootMenu, default: usize) -> BootRe
                     }
                     None => {
                         buttons = cursor.while_hidden(fb, || paint_boot(fb, menu, &state));
+                        hover.reset();
                         delay_ms(8);
                         continue;
                     }
@@ -1185,6 +1263,7 @@ fn run_boot(fb: &FramebufferInfo, menu: &mut BootMenu, default: usize) -> BootRe
             }
             menu.selected = state.sel;
             buttons = cursor.while_hidden(fb, || paint_boot(fb, menu, &state));
+            hover.reset();
         }
         if state.countdown > 0 && state.tick.is_expired() {
             state.countdown -= 1;

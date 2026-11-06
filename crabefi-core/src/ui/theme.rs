@@ -28,6 +28,8 @@ pub const INK2: Rgb = Rgb::new(0x4f, 0x4d, 0x47);
 pub const INK3: Rgb = Rgb::new(0x63, 0x5f, 0x56);
 /// The only filled-action colour.
 pub const ACCENT: Rgb = Rgb::new(0x2d, 0x5b, 0x4c);
+/// Primary button under the pointer.
+pub const ACCENT_HOVER: Rgb = Rgb::new(0x24, 0x4a, 0x3e);
 /// Selected row tint.
 pub const SELECTED: Rgb = Rgb::new(0xdd, 0xe7, 0xde);
 pub const ON_ACCENT: Rgb = Rgb::new(0xf7, 0xf4, 0xec);
@@ -54,24 +56,43 @@ pub const BORDER: Rgb = RULE_STRONG;
 
 const DIM_TARGET: Rgb = Rgb::new(30, 32, 35);
 const DIM_AMOUNT: u8 = 107; // ~42%
+#[cfg(not(test))]
 static DIM: AtomicBool = AtomicBool::new(false);
+// Unit tests paint concurrently; firmware has one UI thread.
+#[cfg(test)]
+std::thread_local! {
+    static DIM: AtomicBool = const { AtomicBool::new(false) };
+}
+#[cfg(not(test))]
+fn dim_flag<R>(f: impl FnOnce(&AtomicBool) -> R) -> R {
+    f(&DIM)
+}
+#[cfg(test)]
+fn dim_flag<R>(f: impl FnOnce(&AtomicBool) -> R) -> R {
+    DIM.with(f)
+}
 
 /// Colours are mapped here, at the primitive level. A modal backdrop is the
 /// invoking screen repainted with a darker solid palette: no framebuffer
 /// read-back or per-pixel blending is involved.
 pub fn tone(c: Rgb) -> Rgb {
-    if DIM.load(Ordering::Relaxed) {
+    if dim_flag(|d| d.load(Ordering::Relaxed)) {
         c.lerp(DIM_TARGET, DIM_AMOUNT)
     } else {
         c
     }
 }
 
+/// Whether painting currently targets a dimmed modal backdrop.
+pub fn is_dimmed() -> bool {
+    dim_flag(|d| d.load(Ordering::Relaxed))
+}
+
 /// Paint `f` with the dimmed palette.
 pub fn dimmed<R>(f: impl FnOnce() -> R) -> R {
-    let previous = DIM.swap(true, Ordering::Relaxed);
+    let previous = dim_flag(|d| d.swap(true, Ordering::Relaxed));
     let result = f();
-    DIM.store(previous, Ordering::Relaxed);
+    dim_flag(|d| d.store(previous, Ordering::Relaxed));
     result
 }
 

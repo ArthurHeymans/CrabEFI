@@ -580,8 +580,15 @@ pub fn show(fb: &FramebufferInfo) -> ScreenNav {
     cursor.hide(fb);
     let mut button = draw_screen(fb, selected, &focus, status);
     let mut hovered = None;
+    let mut hover = super::Hover::default();
     loop {
         super::poll_and_render_cursor(fb, &mut cursor);
+        super::track_hover(
+            fb,
+            &mut cursor,
+            &mut hover,
+            Some((NavItem::Security, &focus)),
+        );
         let (mx, my) = crate::drivers::mouse_cursor::position();
         let l = sec_layout(fb, status.is_some());
         let next = (0..ACTION_COUNT).find(|i| dialog::contains(l.rows[*i], mx, my));
@@ -651,6 +658,7 @@ pub fn show(fb: &FramebufferInfo) -> ScreenNav {
             cursor.hide(fb);
             button = draw_screen(fb, selected, &focus, status);
             hovered = None;
+            hover.reset();
         }
         delay_ms(8);
     }

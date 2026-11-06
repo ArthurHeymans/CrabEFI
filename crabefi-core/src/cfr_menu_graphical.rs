@@ -17,6 +17,8 @@ pub(super) struct GraphicalState {
     pub(super) section: usize,
     pub(super) selected: usize,
     pub(super) hovered: Option<usize>,
+    /// FormHeader item index of the section row under the pointer.
+    pub(super) hovered_section: Option<usize>,
     pub(super) scroll_offset: usize,
     pub(super) status_message: Option<(&'static str, bool)>,
     pub(super) save_result: Option<(usize, usize)>,
@@ -31,6 +33,7 @@ impl GraphicalState {
             section: 0,
             selected,
             hovered: None,
+            hovered_section: None,
             scroll_offset: 0,
             status_message: None,
             save_result: None,
@@ -398,7 +401,7 @@ fn paint_section_row(
     let mut c = Control::new(header as u64, Role::Option, section_name(items, header));
     c.selected = header == state.section;
     c.focused = c.selected && state.focus.group == Group::Sections;
-    let bg = controls::row(fb, rect, &c, false);
+    let bg = controls::row(fb, rect, &c, state.hovered_section == Some(header));
     let ty = rect.1 + ((m.row - render::font_height(m.body)) / 2) as i32;
     if dirty {
         render::draw_text_bold(fb, rect.0 + 10, ty, "*", m.body, theme::WARN, Some(bg));
@@ -1073,22 +1076,29 @@ pub(super) fn show_cfr_menu_graphical(cfr_info: &CfrInfo, fb: &FramebufferInfo) 
     let first = find_first_selectable(cfr_info, &items, 0);
     let mut state = GraphicalState::new(first);
     state.section = section_of(&items, first);
-    let mut tab_hover = None;
+    let mut hover = ui::Hover::default();
     let mut clickable = draw_graphical_menu(cfr_info, &items, &state, fb);
 
     loop {
         ui::poll_and_render_cursor(fb, &mut cursor);
+        ui::track_hover(
+            fb,
+            &mut cursor,
+            &mut hover,
+            Some((NavItem::Firmware, &state.focus)),
+        );
         let (mx, my) = crate::drivers::mouse_cursor::position();
-        let next_tab = ui::navigation_hit(fb, mx, my);
-        if next_tab != tab_hover {
-            tab_hover = next_tab;
+        let section = section_hit(cfr_info, &items, fb, mx, my);
+        if section != state.hovered_section {
+            let previous = core::mem::replace(&mut state.hovered_section, section);
             cursor.while_hidden(fb, || {
-                ui::draw_navigation(
-                    fb,
-                    NavItem::Firmware,
-                    (state.focus.group == Group::Navigation).then_some(state.focus.navigation),
-                    tab_hover,
-                )
+                let l = fw_layout(fb);
+                let sections = visible_sections(cfr_info, &items);
+                for header in previous.into_iter().chain(section) {
+                    if let Some(pos) = sections.iter().position(|h| *h == header) {
+                        paint_section_row(fb, &l, cfr_info, &items, &state, pos, header);
+                    }
+                }
             });
         }
         let hovered = hovered_item(cfr_info, &items, &state, fb);
@@ -1118,6 +1128,7 @@ pub(super) fn show_cfr_menu_graphical(cfr_info: &CfrInfo, fb: &FramebufferInfo) 
                     }
                     clickable = cursor
                         .while_hidden(fb, || draw_graphical_menu(cfr_info, &items, &state, fb));
+                    hover.reset();
                     continue;
                 }
                 Some(FocusEvent::Moved) => {
@@ -1126,6 +1137,7 @@ pub(super) fn show_cfr_menu_graphical(cfr_info: &CfrInfo, fb: &FramebufferInfo) 
                     }
                     clickable = cursor
                         .while_hidden(fb, || draw_graphical_menu(cfr_info, &items, &state, fb));
+                    hover.reset();
                     continue;
                 }
                 Some(FocusEvent::Action(i)) => action = acts.get(i).copied(),
@@ -1371,7 +1383,7 @@ pub(super) fn show_cfr_menu_graphical(cfr_info: &CfrInfo, fb: &FramebufferInfo) 
             state.focus.action = state.focus.action.min(acts.len().saturating_sub(1));
             clickable =
                 cursor.while_hidden(fb, || draw_graphical_menu(cfr_info, &items, &state, fb));
-            tab_hover = None;
+            hover.reset();
         }
         delay_ms(8);
     }
