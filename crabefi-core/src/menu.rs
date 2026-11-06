@@ -1373,8 +1373,24 @@ fn edit_cmdline(entry: &mut BootEntry, fb_console: &mut Option<FramebufferConsol
                         needs_redraw = true;
                     }
                 }
-                // Ignore Up/Down in editor
-                KeyPress::Up | KeyPress::Down => {}
+                KeyPress::Home => {
+                    cursor_pos = 0;
+                    needs_redraw = true;
+                }
+                KeyPress::End => {
+                    cursor_pos = buffer.len();
+                    needs_redraw = true;
+                }
+                // These have no meaning in the legacy single-line editor.
+                KeyPress::Up
+                | KeyPress::Down
+                | KeyPress::PageUp
+                | KeyPress::PageDown
+                | KeyPress::Tab
+                | KeyPress::BackTab
+                | KeyPress::Delete
+                | KeyPress::F8
+                | KeyPress::F10 => {}
                 // Mouse events are ignored in the command line editor
                 #[cfg(feature = "ui")]
                 KeyPress::MouseClick { .. } | KeyPress::MouseScroll(_) => {}

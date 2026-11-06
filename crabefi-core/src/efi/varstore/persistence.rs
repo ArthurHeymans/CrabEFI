@@ -639,17 +639,38 @@ fn load_variables_from_storage() -> Result<(), VarStoreError> {
 
 /// Get the latest durable authenticated timestamp, including deletion floors.
 pub fn get_variable_timestamp(guid: &r_efi::efi::Guid, name: &[u16]) -> Option<VariableTimestamp> {
+    try_get_variable_timestamp(guid, name).ok().flatten()
+}
+
+/// Unlike the compatibility accessor, distinguish absent authentication
+/// history from an unreadable store. Consent preflight must fail closed.
+pub fn try_get_variable_timestamp(
+    guid: &r_efi::efi::Guid,
+    name: &[u16],
+) -> Result<Option<VariableTimestamp>, VarStoreError> {
     let variable_store = VARSTORE.get();
-    if !variable_store.initialized || !variable_store.auth_format {
-        return None;
+    if !variable_store.initialized {
+        return Err(VarStoreError::NotInitialized);
+    }
+    if !variable_store.auth_format {
+        return Ok(None);
     }
     let guid = edk2::guid_to_bytes(guid);
     with_storage_mut(|storage| {
-        let mut read_fn = |offset: u32, buffer: &mut [u8]| storage.read(offset, buffer).is_ok();
+        let mut failed = false;
+        let mut read_fn = |offset: u32, buffer: &mut [u8]| {
+            let ok = storage.read(offset, buffer).is_ok();
+            failed |= !ok;
+            ok
+        };
         let variables = edk2::walk_variables(&mut read_fn, true, variable_store.data_size);
-        latest_matching_timestamp(&variables, &guid, name)
+        if failed {
+            Err(VarStoreError::StorageFailure)
+        } else {
+            Ok(latest_matching_timestamp(&variables, &guid, name))
+        }
     })
-    .flatten()
+    .unwrap_or(Err(VarStoreError::NotInitialized))
 }
 
 fn latest_matching_timestamp(

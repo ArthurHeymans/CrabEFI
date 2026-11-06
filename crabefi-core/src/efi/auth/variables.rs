@@ -199,6 +199,15 @@ impl KeyDatabase {
         })
     }
 
+    /// Get all SHA-256 hash entries in the database
+    pub fn sha256_hashes(&self) -> impl Iterator<Item = &[u8]> {
+        let sha256_guid = EFI_CERT_SHA256_GUID;
+        self.entries
+            .iter()
+            .filter(move |e| e.cert_type == sha256_guid)
+            .map(|e| e.data.as_slice())
+    }
+
     /// Get all X.509 certificates in the database
     pub fn x509_certificates(&self) -> impl Iterator<Item = &[u8]> {
         let x509_guid = EFI_CERT_X509_GUID;

@@ -92,7 +92,27 @@ pub fn font_width(size: FontSize) -> u32 {
 
 /// Pixel width of a string at the given size.
 pub fn text_width(s: &str, size: FontSize) -> u32 {
-    s.len() as u32 * font_width(size)
+    s.chars().count() as u32 * font_width(size)
+}
+
+/// Width-bounded labels, preserving UTF-8 boundaries and reserving an ellipsis.
+pub fn ellipsize(s: &str, width: u32, size: FontSize) -> heapless::String<256> {
+    let columns = (width / font_width(size)) as usize;
+    let mut out = heapless::String::new();
+    let truncated = s.chars().count() > columns || s.len() > out.capacity();
+    // ASCII-only marker: the bitmap font has no ellipsis glyph.
+    let marker = if columns >= 6 { 3 } else { 1 };
+    let reserve = if truncated { marker } else { 0 };
+    for ch in s.chars().take(columns.saturating_sub(reserve)) {
+        if out.len() + ch.len_utf8() + reserve > out.capacity() {
+            break;
+        }
+        let _ = out.push(ch);
+    }
+    if truncated && columns > 0 {
+        let _ = out.push_str(if marker == 3 { "..." } else { "~" });
+    }
+    out
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -101,6 +121,7 @@ pub fn text_width(s: &str, size: FontSize) -> u32 {
 
 /// Fill a rectangle with a solid color (bounds-clipped).
 pub fn fill_rect(fb: &FramebufferInfo, x: i32, y: i32, w: u32, h: u32, c: Rgb) {
+    let c = super::theme::tone(c);
     let x0 = x.max(0) as u32;
     let y0 = y.max(0) as u32;
     let x1 = ((x as i64 + w as i64) as u32).min(fb.width);
@@ -332,6 +353,7 @@ pub fn draw_dot(fb: &FramebufferInfo, cx: i32, cy: i32, r: u32, c: Rgb) {
                 let py = cy + dy;
                 if px >= 0 && py >= 0 && px < fb.width as i32 && py < fb.height as i32 {
                     // SAFETY: bounds checked
+                    let c = super::theme::tone(c);
                     unsafe { fb.write_pixel(px as u32, py as u32, c.r, c.g, c.b) };
                 }
             }
@@ -401,9 +423,31 @@ pub fn draw_char(
     fg: Rgb,
     bg: Option<Rgb>,
 ) {
-    let raster = match get_raster(ch, FontWeight::Regular, size.raster_height()) {
+    draw_char_weight(fb, px, py, ch, size, false, fg, bg);
+}
+
+/// Bold is reserved for focus, titles and values that must survive dim KVMs.
+#[allow(clippy::too_many_arguments)]
+pub fn draw_char_weight(
+    fb: &FramebufferInfo,
+    px: i32,
+    py: i32,
+    ch: char,
+    size: FontSize,
+    bold: bool,
+    fg: Rgb,
+    bg: Option<Rgb>,
+) {
+    let fg = super::theme::tone(fg);
+    let bg = bg.map(super::theme::tone);
+    let weight = if bold {
+        FontWeight::Bold
+    } else {
+        FontWeight::Regular
+    };
+    let raster = match get_raster(ch, weight, size.raster_height()) {
         Some(r) => r,
-        None => match get_raster('?', FontWeight::Regular, size.raster_height()) {
+        None => match get_raster('?', weight, size.raster_height()) {
             Some(r) => r,
             None => return,
         },
@@ -458,13 +502,40 @@ pub fn draw_text(
     fg: Rgb,
     bg: Option<Rgb>,
 ) -> u32 {
+    draw_text_weight(fb, px, py, s, size, false, fg, bg)
+}
+
+/// Draw a bold string. Returns pixel width.
+pub fn draw_text_bold(
+    fb: &FramebufferInfo,
+    px: i32,
+    py: i32,
+    s: &str,
+    size: FontSize,
+    fg: Rgb,
+    bg: Option<Rgb>,
+) -> u32 {
+    draw_text_weight(fb, px, py, s, size, true, fg, bg)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn draw_text_weight(
+    fb: &FramebufferInfo,
+    px: i32,
+    py: i32,
+    s: &str,
+    size: FontSize,
+    bold: bool,
+    fg: Rgb,
+    bg: Option<Rgb>,
+) -> u32 {
     let gw = font_width(size) as i32;
     let mut x = px;
     for ch in s.chars() {
-        draw_char(fb, x, py, ch, size, fg, bg);
+        draw_char_weight(fb, x, py, ch, size, bold, fg, bg);
         x += gw;
     }
-    s.len() as u32 * gw as u32
+    s.chars().count() as u32 * gw as u32
 }
 
 /// Draw text with extra letter-spacing (for "tracking-widest" labels).
