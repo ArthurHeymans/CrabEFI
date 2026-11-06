@@ -1213,7 +1213,10 @@ pub(super) fn show_cfr_menu_graphical(cfr_info: &CfrInfo, fb: &FramebufferInfo) 
             if !graphical_key_allowed(state.focus.group, key) {
                 continue;
             }
+            // Opening a section (Enter/Space in Sections) edits nothing, so it
+            // must not dismiss a failed-save notice or its Try again action.
             if action.is_none()
+                && matches!(state.focus.group, Group::Content | Group::Actions)
                 && (matches!(
                     key,
                     KeyPress::Enter | KeyPress::Char(' ' | 'w' | 'W') | KeyPress::F10

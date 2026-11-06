@@ -914,28 +914,35 @@ fn enrolled_key_sections() -> Vec<ReviewSection> {
             any = true;
             sections.push(certificate_lines(ReviewSection::labelled(label), der, ""));
         }
-        let other = db.len() - db.x509_certificates().count();
+        let hashes = db.sha256_hashes().count();
+        let other = db.len() - db.x509_certificates().count() - hashes;
         if !any {
             sections.push(
                 ReviewSection::labelled(label).line(LineKind::Note, "No certificates enrolled"),
             );
         }
+        if hashes > 0 {
+            sections.push(ReviewSection::labelled(label).line(
+                LineKind::Body,
+                &alloc::format!("{hashes} SHA-256 hash entries"),
+            ));
+        }
         if other > 0 {
             sections.push(ReviewSection::labelled(label).line(
                 LineKind::Body,
-                &alloc::format!("{other} SHA-256 hash entries"),
+                &alloc::format!("{other} entries of other signature types"),
             ));
         }
     }
     let dbx = auth::dbx_database();
     let certs = dbx.x509_certificates().count();
-    sections.push(ReviewSection::labelled("dbx").line(
-        LineKind::Body,
-        &alloc::format!(
-            "{} revoked hashes, {certs} revoked certificates",
-            dbx.len() - certs
-        ),
-    ));
+    let hashes = dbx.sha256_hashes().count();
+    let other = dbx.len() - certs - hashes;
+    let mut line = alloc::format!("{hashes} revoked hashes, {certs} revoked certificates");
+    if other > 0 {
+        let _ = write!(line, ", {other} other entries");
+    }
+    sections.push(ReviewSection::labelled("dbx").line(LineKind::Body, &line));
     sections
 }
 

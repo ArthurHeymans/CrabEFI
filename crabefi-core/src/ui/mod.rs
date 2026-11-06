@@ -1165,7 +1165,11 @@ fn run_boot(fb: &FramebufferInfo, menu: &mut BootMenu, default: usize) -> BootRe
                     cursor.hide(fb);
                     return BootResult::Nav(nav_at(i));
                 }
-                Some(FocusEvent::Action(i)) => activate = Some(i),
+                // Space activates buttons, but never the one that boots.
+                Some(FocusEvent::Action(i)) if !(i == 0 && key == KeyPress::Char(' ')) => {
+                    activate = Some(i)
+                }
+                Some(FocusEvent::Action(_)) => {}
                 Some(FocusEvent::Moved) => {}
                 None => match key {
                     KeyPress::Enter if state.focus.group == Group::Content => activate = Some(0),
@@ -1234,14 +1238,16 @@ fn run_boot(fb: &FramebufferInfo, menu: &mut BootMenu, default: usize) -> BootRe
                         && let Some(cmdline) = entry.get_cmdline()
                     {
                         if boot_layout(fb, false).side.is_some() {
-                            state.edit = Some(dialog::Editor::with_limit(cmdline, 511));
+                            let mut editor = dialog::Editor::with_limit(cmdline, 511);
+                            editor.space_commits = false;
+                            state.edit = Some(editor);
                         } else {
                             cursor.hide(fb);
                             let edited = {
                                 let backdrop = || {
                                     paint_boot(fb, menu, &state);
                                 };
-                                dialog::input(
+                                dialog::input_with(
                                     fb,
                                     &backdrop,
                                     None,
@@ -1249,6 +1255,7 @@ fn run_boot(fb: &FramebufferInfo, menu: &mut BootMenu, default: usize) -> BootRe
                                     "Not saved. Enter boots with this command line.",
                                     cmdline,
                                     511,
+                                    false,
                                     |_| Ok(()),
                                 )
                             };

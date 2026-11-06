@@ -775,7 +775,9 @@ pub fn review(
                 fb,
                 body.0,
                 by + ((m.button - render::font_height(m.small)) / 2) as i32,
-                inner - rects.iter().map(|r| r.2 + 12).sum::<u32>() - 8,
+                inner
+                    .saturating_sub(rects.iter().map(|r| r.2 + 12).sum::<u32>())
+                    .saturating_sub(8),
                 &note,
                 m.small,
                 theme::WARN,
@@ -1261,6 +1263,9 @@ pub struct Editor {
     pub focus: usize,
     pub error: Option<&'static str>,
     limit: usize,
+    /// Whether Space on the Apply button commits. Off when Apply boots:
+    /// Space never boots.
+    pub space_commits: bool,
 }
 impl Editor {
     pub fn new(initial: &str) -> Self {
@@ -1273,6 +1278,7 @@ impl Editor {
             focus: 0,
             error: None,
             limit,
+            space_commits: true,
         }
     }
     fn control<'a>(&'a self, index: usize, title: &'a str) -> Control<'a> {
@@ -1311,8 +1317,10 @@ impl Editor {
             KeyPress::Char(' ') if self.focus != 0 => {
                 return if self.focus == 1 {
                     EditEvent::Cancel
-                } else {
+                } else if self.space_commits {
                     EditEvent::Apply
+                } else {
+                    EditEvent::Changed
                 };
             }
             _ if self.focus != 0 => {}
@@ -1379,7 +1387,26 @@ pub fn input(
     limit: usize,
     validate: impl Fn(&str) -> Result<(), &'static str>,
 ) -> Option<String> {
+    input_with(
+        fb, backdrop, anchor, title, hint, initial, limit, true, validate,
+    )
+}
+
+/// `input`, choosing whether Space on the Apply button commits.
+#[allow(clippy::too_many_arguments)]
+pub fn input_with(
+    fb: &FramebufferConfig,
+    backdrop: Backdrop<'_>,
+    anchor: Option<Rect>,
+    title: &str,
+    hint: &str,
+    initial: &str,
+    limit: usize,
+    space_commits: bool,
+    validate: impl Fn(&str) -> Result<(), &'static str>,
+) -> Option<String> {
     let mut editor = Editor::with_limit(initial, limit);
+    editor.space_commits = space_commits;
     let mut cursor = CursorRenderer::new();
     loop {
         cursor.hide(fb);
@@ -1701,6 +1728,19 @@ mod tests {
         assert_eq!(e.value, "15bsfr0");
         assert_eq!(e.key(KeyPress::Escape), EditEvent::Cancel);
     }
+    #[test]
+    fn space_does_not_commit_when_apply_boots() {
+        let mut e = Editor::new("quiet");
+        e.space_commits = false;
+        e.key(KeyPress::Tab);
+        e.key(KeyPress::Tab);
+        assert_eq!(e.focus, 2);
+        assert_eq!(e.key(KeyPress::Char(' ')), EditEvent::Changed);
+        assert_eq!(e.key(KeyPress::Enter), EditEvent::Apply);
+        e.key(KeyPress::BackTab);
+        assert_eq!(e.key(KeyPress::Char(' ')), EditEvent::Cancel);
+    }
+
     #[test]
     fn unicode_initial_values_keep_valid_caret_boundaries() {
         let mut e = Editor::new("éx");
