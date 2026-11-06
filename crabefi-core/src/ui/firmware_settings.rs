@@ -1,92 +1,18 @@
-//! Graphical Firmware Settings screen — Kinetic Command design.
+//! Platform-owned settings share the native shell and focus contracts.
 
-use super::{
-    NavItem, ScreenNav, canvas, clear, draw_footer, draw_header, draw_sidebar,
-    poll_and_render_cursor, render, theme, update_sidebar_hover,
-};
-use crate::FramebufferConfig as FramebufferInfo;
-use crate::cursor::CursorRenderer;
-use crate::menu_common::{self, KeyPress};
-use crate::time::delay_ms;
-use render::FontSize;
+use super::{NavItem, ScreenNav};
+use crate::FramebufferConfig;
 
-pub fn show(fb: &FramebufferInfo) -> ScreenNav {
-    let Some(hooks) = crate::handoff::callbacks().hooks else {
-        return show_no_settings(fb);
-    };
-
-    if !hooks.firmware_settings_available() {
-        return show_no_settings(fb);
+pub fn show(fb: &FramebufferConfig) -> ScreenNav {
+    if let Some(hooks) = crate::handoff::callbacks().hooks
+        && hooks.firmware_settings_available()
+    {
+        return hooks.show_graphical_firmware_settings();
     }
-
-    hooks.show_graphical_firmware_settings()
-}
-
-fn show_no_settings(fb: &FramebufferInfo) -> ScreenNav {
-    let mut cursor = CursorRenderer::new();
-    let mut sidebar_hov: Option<NavItem> = None;
-
-    clear(fb);
-    draw_header(fb);
-    draw_sidebar(fb, NavItem::Firmware, None);
-
-    let (cx, cy, cw, ch) = canvas(fb);
-    let mid = cy + ch as i32 / 2 - 20;
-    render::draw_text_centered(
+    super::empty_screen(
         fb,
-        cx,
-        mid,
-        cw,
-        "No firmware settings available",
-        FontSize::Normal,
-        theme::TEXT_DIM,
-        None,
-    );
-    draw_footer(
-        fb,
-        if cfg!(feature = "secure-boot") {
-            "S Security  F Firmware  R Reset  Esc Back"
-        } else {
-            "F Firmware  R Reset  Esc Back"
-        },
-    );
-
-    loop {
-        poll_and_render_cursor(fb, &mut cursor);
-        update_sidebar_hover(fb, &mut cursor, &mut sidebar_hov, NavItem::Firmware);
-
-        if let Some(key) = menu_common::read_key() {
-            match key {
-                #[cfg(feature = "secure-boot")]
-                KeyPress::Char('s') | KeyPress::Char('S') => {
-                    cursor.hide(fb);
-                    return ScreenNav::Nav(NavItem::Security);
-                }
-                KeyPress::Char('f') | KeyPress::Char('F') => {}
-                KeyPress::Char('r') | KeyPress::Char('R') => {
-                    cursor.hide(fb);
-                    super::confirm_reset(fb, NavItem::Firmware);
-                    return ScreenNav::Nav(NavItem::Firmware);
-                }
-                KeyPress::Escape
-                | KeyPress::Char('b')
-                | KeyPress::Char('B')
-                | KeyPress::Char('q')
-                | KeyPress::Char('Q') => {
-                    return ScreenNav::Back;
-                }
-                #[cfg(feature = "ui")]
-                KeyPress::MouseClick { .. } => {
-                    if let Some(nav) = sidebar_hov
-                        && nav != NavItem::Firmware
-                    {
-                        cursor.hide(fb);
-                        return ScreenNav::Nav(nav);
-                    }
-                }
-                _ => {}
-            }
-        }
-        delay_ms(8);
-    }
+        NavItem::Firmware,
+        "No firmware settings",
+        "This platform does not expose configurable settings. Boot and Security remain available through the navigation bar.",
+    )
 }

@@ -99,7 +99,7 @@ pub fn show_cfr_menu() {
     };
 
     #[cfg(feature = "ui")]
-    if let Some(fb) = crate::handoff::framebuffer() {
+    if let Some(fb) = crate::handoff::framebuffer().filter(ui::supports_framebuffer) {
         // Legacy providers cannot return a destination through their bool hook.
         // Honor navigation locally instead of silently dropping it.
         let mut nav = show_cfr_menu_graphical(cfr_info, &fb);
@@ -824,16 +824,21 @@ fn show_no_options_message(fb_console: &mut Option<FramebufferConsole>) {
 // ============================================================================
 
 #[cfg(feature = "ui")]
-const GFX_ITEM_H: u32 = 50;
+const GFX_ITEM_H: u32 = 44;
 #[cfg(feature = "ui")]
-const GFX_ITEM_GAP: u32 = 6;
+const GFX_ITEM_GAP: u32 = 4;
 #[cfg(feature = "ui")]
-const GFX_ITEM_STRIDE: u32 = GFX_ITEM_H + GFX_ITEM_GAP;
+fn graphical_stride(fb: &FramebufferInfo) -> u32 {
+    ui::layout::Metrics::for_fb(fb).row + GFX_ITEM_GAP
+}
 #[cfg(feature = "ui")]
-const GFX_TITLE_H: u32 = 92;
+fn graphical_title_height(fb: &FramebufferInfo) -> u32 {
+    render::font_height(ui::layout::Metrics::for_fb(fb).title) + 12
+}
 
 #[cfg(feature = "ui")]
 struct GraphicalState {
+    focus: ui::controls::Focus,
     selected: usize,
     hovered: Option<usize>,
     scroll_offset: usize,
@@ -845,6 +850,7 @@ struct GraphicalState {
 impl GraphicalState {
     fn new(selected: usize) -> Self {
         Self {
+            focus: ui::controls::Focus::new(ui::nav_item_index(NavItem::Firmware)),
             selected,
             hovered: None,
             scroll_offset: 0,
@@ -857,7 +863,7 @@ impl GraphicalState {
 /// Graphical platform-hook entry point, preserving the requested destination.
 #[cfg(feature = "ui")]
 pub fn show_graphical_firmware_settings() -> ui::ScreenNav {
-    let Some(fb) = crate::handoff::framebuffer() else {
+    let Some(fb) = crate::handoff::framebuffer().filter(ui::supports_framebuffer) else {
         return ui::ScreenNav::Back;
     };
     let empty = CfrInfo::new();
@@ -870,8 +876,7 @@ fn show_cfr_menu_graphical(cfr_info: &CfrInfo, fb: &FramebufferInfo) -> ui::Scre
     let mut items = build_menu_items(cfr_info);
 
     if items.is_empty() {
-        show_no_options_graphical(fb);
-        return ui::ScreenNav::Back;
+        return show_no_options_graphical(fb);
     }
 
     let mut cursor = crate::cursor::CursorRenderer::new();
@@ -882,7 +887,20 @@ fn show_cfr_menu_graphical(cfr_info: &CfrInfo, fb: &FramebufferInfo) -> ui::Scre
 
     loop {
         ui::poll_and_render_cursor(fb, &mut cursor);
-        ui::update_sidebar_hover(fb, &mut cursor, &mut sidebar_hover, NavItem::Firmware);
+        let (mx, my) = crate::drivers::mouse_cursor::position();
+        let next_nav = ui::navigation_hit(fb, mx, my);
+        if next_nav != sidebar_hover {
+            sidebar_hover = next_nav;
+            cursor.while_hidden(fb, || {
+                ui::draw_navigation(
+                    fb,
+                    NavItem::Firmware,
+                    (state.focus.group == ui::controls::Group::Navigation)
+                        .then_some(state.focus.navigation),
+                    sidebar_hover,
+                )
+            });
+        }
 
         let hovered = graphical_item_hit(cfr_info, &items, &state, fb);
         if hovered != state.hovered {
@@ -898,28 +916,81 @@ fn show_cfr_menu_graphical(cfr_info: &CfrInfo, fb: &FramebufferInfo) -> ui::Scre
                             cfr_info,
                             &items[i],
                             i == state.selected,
+                            state.focus.group == ui::controls::Group::Content
+                                && i == state.selected,
                             hovered == Some(i),
                             fb,
                             x,
-                            y + ((pos - state.scroll_offset) as u32 * GFX_ITEM_STRIDE) as i32,
-                            w,
+                            y + ((pos - state.scroll_offset) as u32 * graphical_stride(fb)) as i32,
+                            w - ui::controls::SCROLL_GUTTER,
                         );
                     }
+                }
+                if let Some(pos) = visible_position_of(cfr_info, &items, state.selected) {
+                    ui::controls::viewport_focus(
+                        fb,
+                        graphical_list_area(fb),
+                        state.focus.group == ui::controls::Group::Content,
+                        pos,
+                        state.scroll_offset,
+                        graphical_visible_slots(fb),
+                    );
                 }
             });
         }
 
-        if let Some(key) = menu_common::read_key() {
-            state.status_message = None;
-            state.save_result = None;
+        if let Some(mut key) = menu_common::read_key() {
+            let mut viewport_only = matches!(key, KeyPress::MouseScroll(_));
+            match ui::chrome_key(fb, key, &mut state.focus, NavItem::Firmware, 4) {
+                Some(ui::controls::FocusEvent::Navigate(i)) => {
+                    cursor.hide(fb);
+                    if leave_graphical(cfr_info, &mut items, &mut state, fb) {
+                        return ui::ScreenNav::Nav(ui::nav_at(i));
+                    }
+                    cursor.while_hidden(fb, || draw_graphical_menu(cfr_info, &items, &state, fb));
+                    continue;
+                }
+                Some(ui::controls::FocusEvent::Moved) => {
+                    if state.focus.group == ui::controls::Group::Content {
+                        keep_graphical_selection_visible(cfr_info, &items, &mut state, fb);
+                    }
+                    cursor.while_hidden(fb, || draw_graphical_menu(cfr_info, &items, &state, fb));
+                    continue;
+                }
+                Some(ui::controls::FocusEvent::Action(i)) => {
+                    key = match i {
+                        0 => KeyPress::Enter,
+                        1 => KeyPress::Char('?'),
+                        2 => KeyPress::Char('w'),
+                        _ => KeyPress::Escape,
+                    };
+                }
+                None => {}
+            }
+            if !graphical_key_allowed(state.focus.group, key) {
+                continue;
+            }
+            if matches!(key, KeyPress::Enter | KeyPress::Char(' ' | 'w' | 'W'))
+                || (state.focus.group == ui::controls::Group::Content
+                    && matches!(key, KeyPress::Char('+' | '=' | '-' | 'd' | 'D')))
+            {
+                state.status_message = None;
+                state.save_result = None;
+            }
             match key {
-                KeyPress::Up | KeyPress::Char('k') => {
+                KeyPress::Up | KeyPress::Char('k')
+                    if state.focus.group == ui::controls::Group::Content =>
+                {
                     state.selected = find_prev_selectable(cfr_info, &items, state.selected);
                 }
-                KeyPress::Down | KeyPress::Char('j') => {
+                KeyPress::Down | KeyPress::Char('j')
+                    if state.focus.group == ui::controls::Group::Content =>
+                {
                     state.selected = find_next_selectable(cfr_info, &items, state.selected);
                 }
-                key @ (KeyPress::Home | KeyPress::End | KeyPress::PageUp | KeyPress::PageDown) => {
+                key @ (KeyPress::Home | KeyPress::End | KeyPress::PageUp | KeyPress::PageDown)
+                    if state.focus.group == ui::controls::Group::Content =>
+                {
                     state.selected = graphical_page_selection(
                         cfr_info,
                         &items,
@@ -932,12 +1003,14 @@ fn show_cfr_menu_graphical(cfr_info: &CfrInfo, fb: &FramebufferInfo) -> ui::Scre
                     cursor.hide(fb);
                     edit_graphical_item(cfr_info, &mut items, &mut state, fb);
                 }
-                KeyPress::Right | KeyPress::Char('+') | KeyPress::Char('=') => {
+                KeyPress::Char('+') | KeyPress::Char('=')
+                    if state.focus.group == ui::controls::Group::Content =>
+                {
                     if !increment_option(cfr_info, &mut items, state.selected) {
                         state.status_message = Some(("Option cannot be increased", false));
                     }
                 }
-                KeyPress::Left | KeyPress::Char('-') => {
+                KeyPress::Char('-') if state.focus.group == ui::controls::Group::Content => {
                     if !decrement_option(cfr_info, &mut items, state.selected) {
                         state.status_message = Some(("Option cannot be decreased", false));
                     }
@@ -975,12 +1048,22 @@ fn show_cfr_menu_graphical(cfr_info: &CfrInfo, fb: &FramebufferInfo) -> ui::Scre
                     cursor.hide(fb);
                     help_graphical_item(cfr_info, &mut items, &mut state, fb);
                 }
-                KeyPress::Char('d') | KeyPress::Char('D') => {
+                KeyPress::Char('d') | KeyPress::Char('D')
+                    if state.focus.group == ui::controls::Group::Content =>
+                {
                     restore_graphical_default(cfr_info, &mut items, &mut state);
                 }
                 KeyPress::MouseClick { x, y } => {
                     cursor.hide(fb);
-                    if let Some(nav) = ui::sidebar_hit()
+                    if ui::controls::scroll_track(
+                        &mut state.scroll_offset,
+                        graphical_list_area(fb),
+                        (x as i32, y as i32),
+                        visible_count(cfr_info, &items),
+                        graphical_visible_slots(fb),
+                    ) {
+                        viewport_only = true;
+                    } else if let Some(nav) = ui::sidebar_hit()
                         && nav != NavItem::Firmware
                     {
                         if leave_graphical(cfr_info, &mut items, &mut state, fb) {
@@ -990,6 +1073,10 @@ fn show_cfr_menu_graphical(cfr_info: &CfrInfo, fb: &FramebufferInfo) -> ui::Scre
                         .iter()
                         .position(|r| dialog::contains(*r, x as i32, y as i32))
                     {
+                        state.focus.group = ui::controls::Group::Actions;
+                        state.focus.action = action;
+                        state.status_message = None;
+                        state.save_result = None;
                         match action {
                             0 => edit_graphical_item(cfr_info, &mut items, &mut state, fb),
                             1 => help_graphical_item(cfr_info, &mut items, &mut state, fb),
@@ -1003,24 +1090,24 @@ fn show_cfr_menu_graphical(cfr_info: &CfrInfo, fb: &FramebufferInfo) -> ui::Scre
                     } else if let Some(item_idx) = graphical_item_hit(cfr_info, &items, &state, fb)
                         && is_selectable(&items[item_idx])
                     {
-                        if state.selected == item_idx {
-                            edit_graphical_item(cfr_info, &mut items, &mut state, fb);
-                        } else {
-                            state.selected = item_idx;
-                        }
+                        state.selected = item_idx;
+                        state.focus.group = ui::controls::Group::Content;
                     }
                 }
                 KeyPress::MouseScroll(dz) => {
-                    if dz > 0 {
-                        state.selected = find_next_selectable(cfr_info, &items, state.selected);
-                    } else {
-                        state.selected = find_prev_selectable(cfr_info, &items, state.selected);
-                    }
+                    ui::controls::scroll(
+                        &mut state.scroll_offset,
+                        dz,
+                        visible_count(cfr_info, &items),
+                        graphical_visible_slots(fb),
+                    );
                 }
                 _ => {}
             }
 
-            keep_graphical_selection_visible(cfr_info, &items, &mut state, fb);
+            if !viewport_only {
+                keep_graphical_selection_visible(cfr_info, &items, &mut state, fb);
+            }
             cursor.while_hidden(fb, || draw_graphical_menu(cfr_info, &items, &state, fb));
             sidebar_hover = None;
         }
@@ -1029,26 +1116,51 @@ fn show_cfr_menu_graphical(cfr_info: &CfrInfo, fb: &FramebufferInfo) -> ui::Scre
     }
 }
 
+/// Character accelerators and paging belong to the content group. W remains
+/// an explicit screen-wide Save shortcut, never dispatched inside an editor.
+#[cfg(feature = "ui")]
+fn graphical_key_allowed(group: ui::controls::Group, key: KeyPress) -> bool {
+    group == ui::controls::Group::Content
+        || !matches!(
+            key,
+            KeyPress::Up
+                | KeyPress::Down
+                | KeyPress::Home
+                | KeyPress::End
+                | KeyPress::PageUp
+                | KeyPress::PageDown
+                | KeyPress::Char('j' | 'k' | '+' | '=' | '-' | 'd' | 'D')
+        )
+}
+
 #[cfg(feature = "ui")]
 fn graphical_canvas(fb: &FramebufferInfo) -> Rect {
-    let x = theme::SIDEBAR_W as i32 + theme::PAD as i32;
-    let y = (theme::HEADER_H + theme::PAD) as i32;
-    let w = fb.width - theme::SIDEBAR_W - theme::PAD * 2;
-    let h = fb.height - theme::HEADER_H - theme::FOOTER_H - theme::PAD * 2;
-    (x, y, w, h)
+    ui::canvas(fb)
 }
 
 #[cfg(feature = "ui")]
 fn graphical_list_area(fb: &FramebufferInfo) -> Rect {
     let (cx, cy, cw, ch) = graphical_canvas(fb);
-    let y = cy + GFX_TITLE_H as i32;
-    (cx, y, cw, ch.saturating_sub(GFX_TITLE_H + 92))
+    let m = ui::layout::Metrics::for_fb(fb);
+    let title = graphical_title_height(fb);
+    let status = if ch > 350 { m.line * 2 } else { m.line };
+    let detail = if cw < 1050 && ch > 350 {
+        m.line * 3 + 12
+    } else {
+        0
+    };
+    (
+        cx,
+        cy + title as i32,
+        if cw >= 1050 { cw * 3 / 5 - 16 } else { cw },
+        ch.saturating_sub(title + m.button + status + 20 + detail),
+    )
 }
 
 #[cfg(feature = "ui")]
 fn graphical_visible_slots(fb: &FramebufferInfo) -> usize {
     let (_, _, _, h) = graphical_list_area(fb);
-    (h / GFX_ITEM_STRIDE).max(1) as usize
+    (h / graphical_stride(fb)).max(1) as usize
 }
 
 #[cfg(feature = "ui")]
@@ -1090,8 +1202,9 @@ fn keep_graphical_selection_visible(
     fb: &FramebufferInfo,
 ) {
     let Some(sel_vis_pos) = visible_position_of(cfr, items, state.selected) else {
-        state.selected = find_first_selectable(cfr, items, 0);
-        state.scroll_offset = 0;
+        state.selected = find_first_selectable(cfr, items, state.selected);
+        let selected = visible_position_of(cfr, items, state.selected).unwrap_or(0);
+        state.scroll_offset = selected.saturating_sub(graphical_visible_slots(fb) - 1);
         return;
     };
     let slots = graphical_visible_slots(fb);
@@ -1112,59 +1225,70 @@ fn draw_graphical_menu(
     state: &GraphicalState,
     fb: &FramebufferInfo,
 ) {
-    ui::clear(fb);
-    ui::draw_header(fb);
-    ui::draw_sidebar(fb, NavItem::Firmware, None);
-
+    ui::draw_shell(fb, NavItem::Firmware, &state.focus, None);
+    let m = ui::layout::Metrics::for_fb(fb);
     ui::draw_footer(
         fb,
-        "Pg/Home/End Move   Enter Edit   ? Help   D Default   W Save   Esc Back",
+        "Tab Focus   Arrows Move   Enter Edit   W Save   Esc Back",
     );
-
     let (cx, cy, cw, _) = graphical_canvas(fb);
-    draw_graphical_title(fb, cx, cy, cw, has_changes(items));
-    render::draw_text(
-        fb,
-        cx,
-        cy + 62,
-        if cfr.total_options() == 0 {
-            "No platform options supplied. CrabEFI settings only."
-        } else {
-            "Select, then Edit. Dependent options update as you edit."
-        },
-        FontSize::Small,
-        theme::TEXT_DIM,
-        None,
-    );
+    draw_graphical_title(fb, cx, cy, cw, changed_count(items));
 
     let slots = graphical_visible_slots(fb);
     let visible_len = visible_count(cfr, items);
-    let (_, list_y, _, _) = graphical_list_area(fb);
+    let (list_x, list_y, list_w, _) = graphical_list_area(fb);
 
     for screen_idx in 0..slots {
         let Some(item_idx) = visible_index_at(cfr, items, state.scroll_offset + screen_idx) else {
             break;
         };
-        let y = list_y + (screen_idx as u32 * GFX_ITEM_STRIDE) as i32;
+        let y = list_y + (screen_idx as u32 * graphical_stride(fb)) as i32;
         draw_graphical_item(
             cfr,
             &items[item_idx],
             item_idx == state.selected,
+            state.focus.group == ui::controls::Group::Content && item_idx == state.selected,
             state.hovered == Some(item_idx),
             fb,
-            cx,
+            list_x,
             y,
-            cw,
+            list_w - ui::controls::SCROLL_GUTTER,
         );
     }
 
     draw_graphical_scroll(fb, visible_len, state.scroll_offset, slots);
+    if let Some(pos) = visible_position_of(cfr, items, state.selected) {
+        ui::controls::viewport_focus(
+            fb,
+            graphical_list_area(fb),
+            state.focus.group == ui::controls::Group::Content,
+            pos,
+            state.scroll_offset,
+            slots,
+        );
+    }
+    draw_graphical_details(cfr, items, state, fb);
+    let changed = changed_count(items);
+    let save_label = alloc::format!("Save {changed}");
     for (i, (rect, label)) in toolbar_rects(fb)
         .into_iter()
-        .zip(["Edit", "Help", "Save (W)", "Back"])
+        .zip(["Edit", "Details", &save_label, "Back"])
         .enumerate()
     {
-        dialog::button(fb, rect, label, i == 2 && has_changes(items));
+        let mut control =
+            ui::controls::Control::new(5000 + i as u64, ui::controls::Role::Button, label);
+        control.focused =
+            state.focus.group == ui::controls::Group::Actions && state.focus.action == i;
+        ui::controls::button(
+            fb,
+            rect,
+            &control,
+            if i == 2 && changed > 0 {
+                ui::controls::ButtonKind::Primary
+            } else {
+                ui::controls::ButtonKind::Neutral
+            },
+        );
     }
 
     let result_message = state.save_result.map(|(saved, failed)| {
@@ -1180,45 +1304,43 @@ fn draw_graphical_menu(
         .or(state.status_message);
     if let Some((msg, ok)) = feedback {
         let color = if ok { theme::GREEN } else { theme::ERROR };
+        let (_, _, _, ch) = graphical_canvas(fb);
+        let h = if ch > 350 { m.line * 2 } else { m.line };
+        let y = toolbar_rects(fb)[0].1 - h as i32 - 8;
         dialog::wrapped(
             fb,
-            (cx, (fb.height - theme::FOOTER_H - 88) as i32, cw, 40),
-            msg,
+            (cx, y, cw, h),
+            &alloc::format!("{}: {msg}", if ok { "Done" } else { "Error" }),
             color,
         );
     }
 }
 
 #[cfg(feature = "ui")]
-fn draw_graphical_title(fb: &FramebufferInfo, cx: i32, cy: i32, cw: u32, modified: bool) {
-    render::draw_text_spaced(
-        fb,
-        cx,
-        cy,
-        "HARDWARE CONFIGURATION",
-        FontSize::Small,
-        2,
-        theme::PRIMARY.darken(80),
-        None,
-    );
-    let title_y = cy + render::font_height(FontSize::Small) as i32 + 4;
+fn draw_graphical_title(fb: &FramebufferInfo, cx: i32, cy: i32, cw: u32, changed: usize) {
+    let m = ui::layout::Metrics::for_fb(fb);
+    let title_y = cy;
     render::draw_text(
         fb,
         cx,
         title_y,
-        "Firmware Settings",
-        FontSize::Display,
+        "Firmware settings",
+        m.title,
         theme::TEXT,
         None,
     );
     render::draw_text_right(
         fb,
         cx,
-        title_y + 10,
+        title_y + 4,
         cw,
-        if modified { "UNSAVED" } else { "SAVED" },
-        FontSize::Small,
-        if modified {
+        &if changed > 0 {
+            alloc::format!("{changed} changed")
+        } else {
+            String::from("No changes")
+        },
+        m.small,
+        if changed > 0 {
             theme::ORANGE
         } else {
             theme::TEXT_DIM
@@ -1233,6 +1355,7 @@ fn draw_graphical_item(
     cfr: &CfrInfo,
     item: &MenuItem,
     selected: bool,
+    focused: bool,
     hovered: bool,
     fb: &FramebufferInfo,
     x: i32,
@@ -1241,14 +1364,14 @@ fn draw_graphical_item(
 ) {
     match item {
         MenuItem::FormHeader { name } => {
-            render::draw_text_spaced(
+            let m = ui::layout::Metrics::for_fb(fb);
+            render::draw_text(
                 fb,
-                x,
-                y + 16,
-                &truncate_for_width(name, w.saturating_sub(24), FontSize::Small),
-                FontSize::Small,
-                2,
-                theme::PRIMARY,
+                x + 8,
+                y + 12,
+                &render::ellipsize(name, w.saturating_sub(24), m.small),
+                m.small,
+                theme::TEXT_DIM,
                 None,
             );
             render::draw_separator(fb, x, y + GFX_ITEM_H as i32 - 8, w, theme::GHOST, theme::BG);
@@ -1288,6 +1411,7 @@ fn draw_graphical_item(
                     current_value,
                     current_value != original_value,
                     selected,
+                    focused,
                     hovered,
                     x,
                     y,
@@ -1304,6 +1428,7 @@ fn draw_graphical_item(
                 *current_level,
                 current_level != original_level,
                 selected,
+                focused,
                 hovered,
                 x,
                 y,
@@ -1320,60 +1445,24 @@ fn draw_graphical_log_level(
     level: log::LevelFilter,
     modified: bool,
     selected: bool,
+    focused: bool,
     hovered: bool,
     x: i32,
     y: i32,
     w: u32,
 ) {
-    let bg = if selected {
-        theme::BRIGHT
-    } else if hovered {
-        theme::CONT_HIGH
-    } else {
-        theme::CONTAINER
-    };
-    render::fill_rounded_rect(fb, x, y, w, GFX_ITEM_H, theme::RADIUS, bg);
-    render::fill_rect(
+    let mut control =
+        ui::controls::Control::new(u64::MAX, ui::controls::Role::Option, "CrabEFI log level");
+    control.value = Some(crate::logger::level_name(level));
+    control.changed = modified;
+    control.selected = selected;
+    control.focused = focused;
+    draw_setting_row(
         fb,
-        x,
-        y + 3,
-        theme::ACCENT_BAR,
-        GFX_ITEM_H - 6,
-        theme::PRIMARY,
+        (x, y, w, ui::layout::Metrics::for_fb(fb).row),
+        &control,
+        hovered,
     );
-
-    let label = crate::logger::level_name(level);
-    let value_w = value_width(label).min(w / 2);
-    let value_x = x + w as i32 - value_w as i32 - 14;
-    let name_max_w = (value_x - x - 34).max(32) as u32;
-
-    render::draw_text(
-        fb,
-        x + 18,
-        y + 8,
-        &truncate_for_width(
-            if modified {
-                "* CrabEFI log level"
-            } else {
-                "CrabEFI log level"
-            },
-            name_max_w,
-            FontSize::Normal,
-        ),
-        FontSize::Normal,
-        theme::TEXT,
-        Some(bg),
-    );
-    render::draw_text(
-        fb,
-        x + 18,
-        y + 31,
-        "Serial verbosity; applies on Save",
-        FontSize::Small,
-        theme::OUTLINE,
-        Some(bg),
-    );
-    draw_value_pill(fb, value_x, y + 12, value_w, label, true);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1384,86 +1473,176 @@ fn draw_graphical_option(
     value: &CfrValue,
     modified: bool,
     selected: bool,
+    focused: bool,
     hovered: bool,
     x: i32,
     y: i32,
     w: u32,
 ) {
-    let editable = option.is_editable();
-    let bg = if selected {
-        theme::BRIGHT
-    } else if hovered {
-        theme::CONT_HIGH
-    } else {
-        theme::CONTAINER
-    };
-    render::fill_rounded_rect(fb, x, y, w, GFX_ITEM_H, theme::RADIUS, bg);
+    let label = format_value(option, value);
+    let mut control = ui::controls::Control::new(
+        option.object_id,
+        ui::controls::Role::Option,
+        &option.ui_name,
+    );
+    control.value = Some(&label);
+    control.changed = modified;
+    control.selected = selected;
+    control.focused = focused;
+    control.read_only = !option.is_editable();
+    draw_setting_row(
+        fb,
+        (x, y, w, ui::layout::Metrics::for_fb(fb).row),
+        &control,
+        hovered,
+    );
+}
 
-    let accent = if selected {
-        theme::PRIMARY
-    } else if editable {
-        theme::GHOST
-    } else {
-        theme::CONT_LOW
-    };
-    render::fill_rect(fb, x, y + 3, theme::ACCENT_BAR, GFX_ITEM_H - 6, accent);
-
-    let value_label = format_value(option, value);
-    let value_w = value_width(&value_label).min(w / 2);
-    let value_x = x + w as i32 - value_w as i32 - 14;
-    let name_max_w = (value_x - x - 34).max(32) as u32;
-    let name_color = if editable {
-        theme::TEXT
-    } else {
-        theme::TEXT_DIM
-    };
-
+#[cfg(feature = "ui")]
+fn draw_setting_row(
+    fb: &FramebufferInfo,
+    rect: Rect,
+    control: &ui::controls::Control<'_>,
+    hovered: bool,
+) {
+    let m = ui::layout::Metrics::for_fb(fb);
+    let bg = ui::controls::frame(fb, rect, control, hovered);
+    let label = alloc::format!(
+        "{}{}{}",
+        if control.selected { "> " } else { "  " },
+        if control.changed { "* " } else { "" },
+        control.label
+    );
+    let value = alloc::format!(
+        "{}{}",
+        if control.read_only { "[R] " } else { "" },
+        control.value.unwrap_or("")
+    );
+    let label_w = rect.2 * 3 / 5;
     render::draw_text(
         fb,
-        x + 18,
-        y + 8,
-        &truncate_for_width(
-            &alloc::format!("{}{}", if modified { "* " } else { "" }, option.ui_name),
-            name_max_w,
-            FontSize::Normal,
-        ),
-        FontSize::Normal,
-        name_color,
+        rect.0 + 14,
+        rect.1 + 10,
+        &render::ellipsize(&label, label_w - 24, m.body),
+        m.body,
+        if control.read_only {
+            theme::TEXT_DIM
+        } else {
+            theme::TEXT
+        },
         Some(bg),
     );
-
-    let description = if option.flags & cfr::CFR_OPTFLAG_READONLY != 0 {
-        "Read-only: supplied by firmware"
-    } else if !editable {
-        "Unavailable: fixed by firmware"
-    } else if option.ui_helptext.is_empty() {
-        "Select, then Edit to change the draft"
-    } else {
-        &option.ui_helptext
-    };
-    render::draw_text(
+    render::draw_text_right(
         fb,
-        x + 18,
-        y + 31,
-        &truncate_for_width(description, w.saturating_sub(40), FontSize::Small),
-        FontSize::Small,
-        theme::TEXT_DIM,
+        rect.0 + label_w as i32,
+        rect.1 + 10,
+        rect.2 - label_w - 14,
+        &render::ellipsize(&value, rect.2 - label_w - 20, m.body),
+        m.body,
+        if control.changed {
+            theme::ORANGE
+        } else {
+            theme::TEXT
+        },
         Some(bg),
     );
+}
 
+#[cfg(feature = "ui")]
+fn changed_count(items: &[MenuItem]) -> usize {
+    items
+        .iter()
+        .filter(|item| match item {
+            MenuItem::Option {
+                current_value,
+                original_value,
+                ..
+            } => current_value != original_value,
+            MenuItem::CrabLogLevel {
+                current_level,
+                original_level,
+            } => current_level != original_level,
+            _ => false,
+        })
+        .count()
+}
+
+#[cfg(feature = "ui")]
+fn full_value(option: &CfrOption, value: &CfrValue) -> String {
     match (&option.option_type, value) {
-        (CfrOptionType::Bool { .. }, CfrValue::Bool(on)) => {
-            draw_value_pill(
-                fb,
-                value_x,
-                y + 4,
-                value_w,
-                if *on { "Enabled" } else { "Disabled" },
-                editable,
-            );
+        (_, CfrValue::Varchar(text)) => text.clone(),
+        (CfrOptionType::Enum { choices, .. }, CfrValue::Number(n)) => {
+            choices.iter().find(|c| c.value == *n).map_or_else(
+                || alloc::format!("Unlisted value {n}"),
+                |c| c.ui_name.clone(),
+            )
         }
-        _ => draw_value_pill(fb, value_x, y + 4, value_w, &value_label, editable),
+        _ => String::from(format_value(option, value).as_str()),
     }
+}
+
+#[cfg(feature = "ui")]
+fn draw_graphical_details(
+    cfr: &CfrInfo,
+    items: &[MenuItem],
+    state: &GraphicalState,
+    fb: &FramebufferInfo,
+) {
+    let m = ui::layout::Metrics::for_fb(fb);
+    let (cx, cy, cw, ch) = graphical_canvas(fb);
+    let (lx, ly, lw, lh) = graphical_list_area(fb);
+    let rect = if cw >= 1050 {
+        (lx + lw as i32 + 16, ly, cw - lw - 16, lh)
+    } else if ch > 350 {
+        (cx, ly + lh as i32 + 4, cw, m.line * 3 + 8)
+    } else {
+        return;
+    };
+    let text = match items.get(state.selected) {
+        Some(MenuItem::Option {
+            form_idx,
+            option_idx,
+            current_value,
+            original_value,
+        }) => {
+            let Some(option) = get_option(cfr, *form_idx, *option_idx) else {
+                return;
+            };
+            alloc::format!(
+                "{}\n{}\nDraft: {}\nSaved: {}\nDefault: {}\n\n{}\n\nEnter edits the draft. Save persists it. Details shows complete values and help.",
+                option.ui_name,
+                if option.is_editable() {
+                    "Editable"
+                } else {
+                    "Read-only / unavailable: supplied by firmware"
+                },
+                full_value(option, current_value),
+                full_value(option, original_value),
+                full_value(option, &CfrValue::from_option_type(&option.option_type)),
+                option.ui_helptext
+            )
+        }
+        Some(MenuItem::CrabLogLevel {
+            current_level,
+            original_level,
+        }) => alloc::format!(
+            "CrabEFI log level\nDraft: {}\nSaved: {}\nDefault: {}\n\nControls serial verbosity. Applies on Save.",
+            crate::logger::level_name(*current_level),
+            crate::logger::level_name(*original_level),
+            crate::logger::level_name(crate::logger::DEFAULT_LEVEL)
+        ),
+        _ => return,
+    };
+    let control =
+        ui::controls::Control::new(6000, ui::controls::Role::Option, "Selected setting details");
+    ui::controls::frame(fb, rect, &control, false);
+    dialog::wrapped(
+        fb,
+        (rect.0 + 12, rect.1 + 8, rect.2 - 24, rect.3 - 16),
+        &text,
+        theme::TEXT_DIM,
+    );
+    let _ = cy;
 }
 
 #[cfg(feature = "ui")]
@@ -1473,17 +1652,16 @@ fn draw_graphical_scroll(
     scroll_offset: usize,
     visible_slots: usize,
 ) {
-    if visible_len <= visible_slots {
-        return;
-    }
-    let (cx, list_y, cw, list_h) = graphical_list_area(fb);
-    let track_x = cx + cw as i32 - 4;
-    render::fill_rounded_rect(fb, track_x, list_y, 4, list_h, 2, theme::SIDE);
-    let fraction = visible_slots as u32 * 255 / visible_len as u32;
-    let thumb_h = (list_h * fraction / 255).max(24).min(list_h);
-    let max_off = visible_len.saturating_sub(visible_slots).max(1);
-    let thumb_y = list_y + ((list_h - thumb_h) as usize * scroll_offset / max_off) as i32;
-    render::fill_rounded_rect(fb, track_x, thumb_y, 4, thumb_h, 2, theme::PRIMARY);
+    let (x, y, w, h) = graphical_list_area(fb);
+    ui::draw_scrollbar(
+        fb,
+        x + w as i32 - 22,
+        y,
+        h,
+        visible_len,
+        scroll_offset,
+        visible_slots,
+    );
 }
 
 #[cfg(feature = "ui")]
@@ -1495,10 +1673,15 @@ fn graphical_item_hit(
 ) -> Option<usize> {
     let (mx, my) = crate::drivers::mouse_cursor::position();
     let (x, y, w, _) = graphical_list_area(fb);
-    if mx < x || mx >= x + w as i32 || my < y || (my - y) as u32 % GFX_ITEM_STRIDE >= GFX_ITEM_H {
+    let stride = graphical_stride(fb);
+    if mx < x
+        || mx >= x + w as i32 - ui::controls::SCROLL_GUTTER as i32
+        || my < y
+        || (my - y) as u32 % stride >= ui::layout::Metrics::for_fb(fb).row
+    {
         return None;
     }
-    let slot = ((my - y) as u32 / GFX_ITEM_STRIDE) as usize;
+    let slot = ((my - y) as u32 / stride) as usize;
     if slot >= graphical_visible_slots(fb) {
         return None;
     }
@@ -1558,215 +1741,46 @@ fn format_value(option: &CfrOption, value: &CfrValue) -> StackString<96> {
 }
 
 #[cfg(feature = "ui")]
-fn value_width(label: &str) -> u32 {
-    render::text_width(label, FontSize::Small) + 18
-}
-
-#[cfg(feature = "ui")]
-fn draw_value_pill(fb: &FramebufferInfo, x: i32, y: i32, w: u32, label: &str, editable: bool) {
-    let bg = if editable {
-        theme::CONT_LOW
-    } else {
-        theme::SIDE
-    };
-    let fg = if editable {
-        theme::PRIMARY
-    } else {
-        theme::TEXT_DIM
-    };
-    render::fill_rounded_rect(fb, x, y, w, 26, 13, bg);
-    render::draw_text_centered(
-        fb,
-        x,
-        y + 5,
-        w,
-        &truncate_for_width(label, w.saturating_sub(16), FontSize::Small),
-        FontSize::Small,
-        fg,
-        Some(bg),
-    );
-}
-
-#[cfg(feature = "ui")]
 fn truncate_for_width(text: &str, max_width: u32, size: FontSize) -> StackString<256> {
     render::ellipsize(text, max_width, size)
 }
 
 #[cfg(feature = "ui")]
 fn show_help_graphical(fb: &FramebufferInfo, option: &CfrOption, details: &str) -> bool {
-    let mut cursor = crate::cursor::CursorRenderer::new();
-    let (x, y, w, h) = graphical_canvas(fb);
     let text = alloc::format!(
-        "{} {}",
+        "{}\n\n{}\n\n{}\n\n{}",
+        option.ui_name,
         details,
+        if option.is_editable() {
+            "Editable. Default changes the draft only."
+        } else {
+            "Read-only: this value is supplied by firmware."
+        },
         if option.ui_helptext.is_empty() {
             "No additional help supplied."
         } else {
             &option.ui_helptext
         }
     );
-    let lines = dialog::wrap_lines(
-        &text,
-        (w.saturating_sub(32) / render::font_width(FontSize::Small)) as usize,
-    );
-    let slots = (h.saturating_sub(120) / 20).max(1) as usize;
-    let mut offset = 0;
-    loop {
-        cursor.hide(fb);
-        draw_help_graphical(fb, option, &lines, offset, slots);
-        let back = (
-            x,
-            y + 76 + help_card_height(lines.len(), slots, h) as i32,
-            (w - 8) / 2,
-            38,
-        );
-        let defaults = (x + back.2 as i32 + 8, back.1, back.2, 38);
-        dialog::button(fb, back, "Back", true);
-        dialog::button(
-            fb,
-            defaults,
-            if option.is_editable() {
-                "Use default (D)"
-            } else {
-                "Read-only"
-            },
-            false,
-        );
-        loop {
-            ui::poll_and_render_cursor(fb, &mut cursor);
-            if let Some(key) = menu_common::read_key() {
-                match key {
-                    KeyPress::Escape | KeyPress::Enter => {
-                        cursor.hide(fb);
-                        return false;
-                    }
-                    KeyPress::Char('d') | KeyPress::Char('D') if option.is_editable() => {
-                        cursor.hide(fb);
-                        return true;
-                    }
-                    key @ (KeyPress::Home
-                    | KeyPress::End
-                    | KeyPress::PageUp
-                    | KeyPress::PageDown) => {
-                        offset = ui::page_selection(
-                            key,
-                            offset,
-                            lines.len().saturating_sub(slots) + 1,
-                            slots,
-                        )
-                        .unwrap_or(offset);
-                        break;
-                    }
-                    KeyPress::Down | KeyPress::MouseScroll(1..) => {
-                        offset = (offset + 1).min(lines.len().saturating_sub(slots));
-                        break;
-                    }
-                    KeyPress::Up | KeyPress::MouseScroll(..=-1) => {
-                        offset = offset.saturating_sub(1);
-                        break;
-                    }
-                    KeyPress::MouseClick { x, y } => {
-                        if dialog::contains(back, x as i32, y as i32) {
-                            cursor.hide(fb);
-                            return false;
-                        }
-                        if option.is_editable() && dialog::contains(defaults, x as i32, y as i32) {
-                            cursor.hide(fb);
-                            return true;
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            delay_ms(8);
-        }
-    }
-}
-
-#[cfg(feature = "ui")]
-fn help_card_height(lines: usize, slots: usize, canvas_h: u32) -> u32 {
-    (lines.min(slots).max(1) as u32 * 20 + 16).min(canvas_h.saturating_sub(120))
-}
-
-#[cfg(feature = "ui")]
-fn draw_help_graphical(
-    fb: &FramebufferInfo,
-    option: &CfrOption,
-    lines: &[String],
-    offset: usize,
-    slots: usize,
-) {
-    ui::clear(fb);
-    ui::draw_header(fb);
-    ui::draw_sidebar(fb, NavItem::Firmware, None);
-    ui::draw_footer(
-        fb,
-        "Pg/Home/End Scroll   D Default draft   Enter / Esc Back",
-    );
-
-    let (cx, cy, cw, ch) = graphical_canvas(fb);
-    render::draw_text_spaced(
-        fb,
-        cx,
-        cy,
-        "SETTING HELP",
-        FontSize::Small,
-        2,
-        theme::PRIMARY.darken(80),
-        None,
-    );
-    render::draw_text(
-        fb,
-        cx,
-        cy + render::font_height(FontSize::Small) as i32 + 4,
-        &truncate_for_width(&option.ui_name, cw, FontSize::Display),
-        FontSize::Display,
-        theme::TEXT,
-        None,
-    );
-
-    let card_y = cy + 64;
-    render::fill_rounded_rect(
-        fb,
-        cx,
-        card_y,
-        cw,
-        help_card_height(lines.len(), slots, ch),
-        theme::RADIUS,
-        theme::CONTAINER,
-    );
-    for (i, line) in lines.iter().skip(offset).take(slots).enumerate() {
-        render::draw_text(
-            fb,
-            cx + 16,
-            card_y + 8 + i as i32 * 20,
-            line,
-            FontSize::Small,
-            theme::TEXT_DIM,
-            None,
-        );
-    }
-    ui::draw_scrollbar(
-        fb,
-        cx + cw as i32 - 4,
-        card_y,
-        help_card_height(lines.len(), slots, ch),
-        lines.len(),
-        offset,
-        slots,
-    );
+    let labels: &[&str] = if option.is_editable() {
+        &["Back", "Use default"]
+    } else {
+        &["Back"]
+    };
+    dialog::choose(fb, NavItem::Firmware, &option.ui_name, &text, labels) == 1
 }
 
 #[cfg(feature = "ui")]
 fn toolbar_rects(fb: &FramebufferInfo) -> [Rect; 4] {
-    let (x, _, w, _) = graphical_canvas(fb);
+    let (x, y, w, h) = graphical_canvas(fb);
+    let m = ui::layout::Metrics::for_fb(fb);
     let bw = (w - 24) / 4;
     core::array::from_fn(|i| {
         (
             x + i as i32 * (bw + 8) as i32,
-            (fb.height - theme::FOOTER_H - 42) as i32,
+            y + h as i32 - m.button as i32,
             bw,
-            34,
+            m.button,
         )
     })
 }
@@ -1886,19 +1900,33 @@ fn help_graphical_item(
         let default = CfrValue::from_option_type(&option.option_type);
         let mut details = alloc::format!(
             "Draft: {}. Saved: {}. Default: {}.",
-            format_value(option, current_value),
-            format_value(option, original_value),
-            format_value(option, &default)
+            full_value(option, current_value),
+            full_value(option, original_value),
+            full_value(option, &default)
         );
         if let CfrOptionType::Number { min, max, step, .. } = option.option_type {
             let _ = write!(details, " Range {min} to {max}; step {step}.");
         }
         show_help_graphical(fb, option, &details)
+    } else if let Some(MenuItem::CrabLogLevel {
+        current_level,
+        original_level,
+    }) = items.get(state.selected)
+    {
+        let details = alloc::format!(
+            "CrabEFI log level\n\nDraft: {}\nSaved: {}\nDefault: {}\n\nControls serial verbosity. Changes apply on Save. A default changes the draft only.",
+            crate::logger::level_name(*current_level),
+            crate::logger::level_name(*original_level),
+            crate::logger::level_name(crate::logger::DEFAULT_LEVEL)
+        );
+        dialog::choose(
+            fb,
+            NavItem::Firmware,
+            "CrabEFI log level",
+            &details,
+            &["Back", "Use default"],
+        ) == 1
     } else {
-        state.status_message = Some((
-            "Log level controls serial verbosity; applies on Save. +/- changes it.",
-            true,
-        ));
         false
     };
     if restore {
@@ -1908,6 +1936,7 @@ fn help_graphical_item(
 
 #[cfg(feature = "ui")]
 fn restore_graphical_default(cfr: &CfrInfo, items: &mut [MenuItem], state: &mut GraphicalState) {
+    state.save_result = None;
     if !can_edit_item(cfr, items, state.selected) {
         state.status_message = Some((
             "Read-only or unavailable; defaults cannot be changed.",
@@ -1962,7 +1991,10 @@ fn edit_graphical_item(
     fb: &FramebufferInfo,
 ) {
     if !can_edit_item(cfr, items, state.selected) {
-        state.status_message = Some(("Read-only or unavailable; choose Help for details.", false));
+        state.status_message = Some((
+            "Read-only or unavailable; choose Details for the reason.",
+            false,
+        ));
         return;
     }
     let Some(MenuItem::Option {
@@ -1972,7 +2004,20 @@ fn edit_graphical_item(
         ..
     }) = items.get_mut(state.selected)
     else {
-        increment_option(cfr, items, state.selected);
+        if let Some(MenuItem::CrabLogLevel { current_level, .. }) = items.get_mut(state.selected) {
+            let labels: Vec<&str> = crate::logger::LEVEL_CHOICES
+                .iter()
+                .map(|level| crate::logger::level_name(*level))
+                .collect();
+            if let Some(i) = dialog::select(
+                fb,
+                "CrabEFI log level",
+                &labels,
+                crate::logger::level_index(*current_level),
+            ) {
+                *current_level = crate::logger::LEVEL_CHOICES[i];
+            }
+        }
         return;
     };
     let Some(option) = get_option(cfr, *form_idx, *option_idx) else {
@@ -2025,35 +2070,13 @@ fn edit_graphical_item(
 }
 
 #[cfg(feature = "ui")]
-fn show_no_options_graphical(fb: &FramebufferInfo) {
-    let mut cursor = crate::cursor::CursorRenderer::new();
-    ui::clear(fb);
-    ui::draw_header(fb);
-    ui::draw_sidebar(fb, NavItem::Firmware, None);
-    ui::draw_footer(fb, "Esc Back");
-
-    let (cx, cy, cw, ch) = graphical_canvas(fb);
-    render::draw_text_centered(
+fn show_no_options_graphical(fb: &FramebufferInfo) -> ui::ScreenNav {
+    ui::empty_screen(
         fb,
-        cx,
-        cy + ch as i32 / 2 - 12,
-        cw,
-        "No configurable options found",
-        FontSize::Normal,
-        theme::TEXT_DIM,
-        None,
-    );
-
-    loop {
-        ui::poll_and_render_cursor(fb, &mut cursor);
-        if let Some(key) = menu_common::read_key()
-            && matches!(key, KeyPress::Escape | KeyPress::Enter | KeyPress::Char(_))
-        {
-            cursor.hide(fb);
-            return;
-        }
-        delay_ms(8);
-    }
+        NavItem::Firmware,
+        "No settings available",
+        "This platform did not supply configurable settings.",
+    )
 }
 
 // ============================================================================
@@ -2479,6 +2502,7 @@ mod graphical_tests {
             &cfr,
             &clean,
             true,
+            true,
             false,
             &framebuffer(&mut clean_pixels),
             184,
@@ -2488,6 +2512,7 @@ mod graphical_tests {
         draw_graphical_item(
             &cfr,
             &dirty,
+            true,
             true,
             false,
             &framebuffer(&mut dirty_pixels),
@@ -2514,6 +2539,27 @@ mod graphical_tests {
         assert!(summary.contains("+98 more"));
         assert!(summary.chars().count() < 240);
         assert!(dialog::wrap_lines(&summary, 50).len() <= 6);
+    }
+
+    #[test]
+    fn paging_and_content_accelerators_cannot_retarget_other_focus_groups() {
+        for group in [
+            ui::controls::Group::Navigation,
+            ui::controls::Group::Actions,
+        ] {
+            for key in [
+                KeyPress::Char('j'),
+                KeyPress::Char('k'),
+                KeyPress::PageDown,
+                KeyPress::PageUp,
+                KeyPress::Char('d'),
+                KeyPress::Char('+'),
+            ] {
+                assert!(!graphical_key_allowed(group, key));
+                assert!(graphical_key_allowed(ui::controls::Group::Content, key));
+            }
+            assert!(graphical_key_allowed(group, KeyPress::Char('w')));
+        }
     }
 
     #[test]

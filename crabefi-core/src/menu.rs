@@ -1381,8 +1381,15 @@ fn edit_cmdline(entry: &mut BootEntry, fb_console: &mut Option<FramebufferConsol
                     cursor_pos = buffer.len();
                     needs_redraw = true;
                 }
-                // Vertical navigation has no meaning in a single-line editor.
-                KeyPress::Up | KeyPress::Down | KeyPress::PageUp | KeyPress::PageDown => {}
+                // These have no meaning in the legacy single-line editor.
+                KeyPress::Up
+                | KeyPress::Down
+                | KeyPress::PageUp
+                | KeyPress::PageDown
+                | KeyPress::Tab
+                | KeyPress::BackTab
+                | KeyPress::Delete
+                | KeyPress::F8 => {}
                 // Mouse events are ignored in the command line editor
                 #[cfg(feature = "ui")]
                 KeyPress::MouseClick { .. } | KeyPress::MouseScroll(_) => {}

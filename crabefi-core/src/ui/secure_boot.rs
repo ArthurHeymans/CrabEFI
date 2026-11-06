@@ -1,165 +1,182 @@
-//! Graphical Secure Boot screen — Kinetic Command design.
+//! Secure Boot setup: inspect state, choose an operation, review owned bytes.
 
 use super::{
-    NavItem, ScreenNav, canvas, clear, dialog, draw_footer, draw_header, draw_scrollbar,
-    draw_sidebar, poll_and_render_cursor, render, theme, update_sidebar_hover,
+    NavItem, ScreenNav, canvas,
+    controls::{self, ButtonKind, Control, Focus, FocusEvent, Group, Role},
+    dialog::{self, Rect, ReviewSection},
+    layout::Metrics,
+    render, theme,
 };
-use crate::FramebufferConfig as FramebufferInfo;
-use crate::cursor::CursorRenderer;
-use crate::menu_common::{self, KeyPress};
-use crate::time::delay_ms;
+use crate::{
+    FramebufferConfig as FramebufferInfo,
+    cursor::CursorRenderer,
+    menu_common::{self, KeyPress},
+    time::delay_ms,
+};
 use alloc::{string::String, vec::Vec};
 use core::fmt::Write;
-use render::FontSize;
 
 const ACTION_COUNT: usize = 6;
-/// Index of the "Back to Boot Menu" action (last item).
-const ACTION_BACK: usize = ACTION_COUNT - 1;
+const ACTION_BACK: usize = 5;
+/// Organize by intent, with disruptive operations after enrollment/revocations.
+const ACTION_ORDER: [usize; ACTION_COUNT] = [1, 2, 3, 0, 4, 5];
+const ACTION_ITEMS: [(&str, &str); ACTION_COUNT] = [
+    (
+        "Enable Secure Boot",
+        "Protection: require signed boot software after key enrollment",
+    ),
+    (
+        "Enroll default keys",
+        "Keys: trust bundled Microsoft UEFI certificates",
+    ),
+    (
+        "Enroll custom owner key",
+        "Keys: inspect certificates from EFI\\keys\\ on the ESP",
+    ),
+    (
+        "Import revocations",
+        "Revocations: inspect a dbx update before importing",
+    ),
+    (
+        "Clear all keys",
+        "DANGER: remove trust and revocations; stop protection",
+    ),
+    (
+        "Back to Boot",
+        "Return without changing Secure Boot configuration",
+    ),
+];
 
 pub fn show(fb: &FramebufferInfo) -> ScreenNav {
     let mut cursor = CursorRenderer::new();
-    let mut selected: usize = 0;
-    let mut hovered: Option<usize> = None;
-    let mut sidebar_hov: Option<NavItem> = None;
-    let mut scroll_offset: usize = 0;
-    let mut status: Option<(&str, bool)> = None;
-
-    draw_screen(fb, selected, hovered, sidebar_hov, scroll_offset, status);
-
-    // Repaint after `selected`/`scroll_offset` changed from `before`: just the cards, unless
-    // a status toast has to be wiped, which needs the full screen.
-    macro_rules! reselect {
-        ($before:expr, $had_status:expr) => {
-            if $had_status {
-                cursor.while_hidden(fb, || {
-                    draw_screen(fb, selected, hovered, sidebar_hov, scroll_offset, status)
-                });
-            } else if (selected, scroll_offset) != $before {
-                cursor.while_hidden(fb, || {
-                    repaint_actions(fb, selected, hovered, scroll_offset, $before);
-                });
-            }
-        };
-    }
-
+    let mut focus = Focus::new(super::nav_item_index(NavItem::Security));
+    let mut selected = if crate::efi::auth::is_setup_mode() {
+        0
+    } else {
+        2
+    };
+    let mut offset = 0usize;
+    let mut status: Option<(&'static str, bool)> = None;
+    controls::ensure_visible(
+        &mut offset,
+        selected,
+        ACTION_COUNT,
+        action_visible_slots(fb),
+    );
+    cursor.hide(fb);
+    draw_screen(fb, selected, offset, &focus, status);
+    let mut hovered = None;
     loop {
-        poll_and_render_cursor(fb, &mut cursor);
-
-        update_sidebar_hover(fb, &mut cursor, &mut sidebar_hov, NavItem::Security);
-
-        // ── Card hover ──
-        let new_hov = action_hit(fb, scroll_offset);
-        if new_hov != hovered {
-            let prev = core::mem::replace(&mut hovered, new_hov);
+        super::poll_and_render_cursor(fb, &mut cursor);
+        let (mx, my) = crate::drivers::mouse_cursor::position();
+        let next = (offset..(offset + action_visible_slots(fb)).min(ACTION_COUNT)).find(|i| {
+            action_card_rect(fb, offset, *i).is_some_and(|r| dialog::contains(r, mx, my))
+        });
+        if hovered != next {
+            let previous = core::mem::replace(&mut hovered, next);
             cursor.while_hidden(fb, || {
-                prev.into_iter().chain(new_hov).for_each(|i| {
-                    paint_action_card(fb, i, selected, hovered, scroll_offset);
-                });
-                paint_action_scrollbar(fb, scroll_offset);
+                for i in previous.into_iter().chain(next) {
+                    paint_action_card(fb, i, selected, next, offset, &focus);
+                }
             });
         }
-
         if let Some(key) = menu_common::read_key() {
-            let had_status = status.take().is_some();
-            let before = (selected, scroll_offset);
-            match key {
-                KeyPress::Up | KeyPress::Char('k') => {
-                    selected = selected.saturating_sub(1);
-                    keep_action_visible(fb, selected, &mut scroll_offset);
-                    reselect!(before, had_status);
-                }
-                KeyPress::Down | KeyPress::Char('j') => {
-                    if selected < ACTION_COUNT - 1 {
-                        selected += 1;
-                    }
-                    keep_action_visible(fb, selected, &mut scroll_offset);
-                    reselect!(before, had_status);
-                }
-                key @ (KeyPress::Home | KeyPress::End | KeyPress::PageUp | KeyPress::PageDown) => {
-                    if let Some(next) =
-                        super::page_selection(key, selected, ACTION_COUNT, action_visible_slots(fb))
-                    {
-                        selected = next;
-                    }
-                    keep_action_visible(fb, selected, &mut scroll_offset);
-                    reselect!(before, had_status);
-                }
-                KeyPress::Char('f') | KeyPress::Char('F') => {
+            let event = super::chrome_key(fb, key, &mut focus, NavItem::Security, 2);
+            let mut open = false;
+            let mut inspect = false;
+            let mut reveal = true;
+            match event {
+                Some(FocusEvent::Navigate(i)) => {
                     cursor.hide(fb);
-                    return ScreenNav::Nav(NavItem::Firmware);
+                    return ScreenNav::Nav(super::nav_at(i));
                 }
-                KeyPress::Char('r') | KeyPress::Char('R') => {
-                    cursor.hide(fb);
-                    super::confirm_reset(fb, NavItem::Security);
-                    draw_screen(fb, selected, hovered, sidebar_hov, scroll_offset, status);
+                Some(FocusEvent::Moved) => {}
+                Some(FocusEvent::Action(i)) => {
+                    open = i == 0;
+                    inspect = i == 1;
                 }
-                KeyPress::Escape
-                | KeyPress::Char('b')
-                | KeyPress::Char('B')
-                | KeyPress::Char('q')
-                | KeyPress::Char('Q') => {
-                    return ScreenNav::Back;
-                }
-                KeyPress::Enter => {
-                    cursor.hide(fb);
-                    status = handle_action(fb, selected);
-                    if selected == ACTION_BACK {
+                None => match key {
+                    KeyPress::Escape | KeyPress::Char('q' | 'Q') => {
+                        cursor.hide(fb);
                         return ScreenNav::Back;
                     }
-                    cursor.while_hidden(fb, || {
-                        draw_screen(fb, selected, hovered, sidebar_hov, scroll_offset, status)
-                    });
-                }
-                #[cfg(feature = "ui")]
-                KeyPress::MouseClick { .. } => {
-                    // Sidebar click
-                    if let Some(nav) = sidebar_hov
-                        && nav != NavItem::Security
+                    KeyPress::Up | KeyPress::Char('k') if focus.group == Group::Content => {
+                        selected = selected.saturating_sub(1)
+                    }
+                    KeyPress::Down | KeyPress::Char('j') if focus.group == Group::Content => {
+                        selected = (selected + 1).min(ACTION_COUNT - 1)
+                    }
+                    KeyPress::Home | KeyPress::End | KeyPress::PageUp | KeyPress::PageDown
+                        if focus.group == Group::Content =>
                     {
+                        selected = super::page_selection(
+                            key,
+                            selected,
+                            ACTION_COUNT,
+                            action_visible_slots(fb),
+                        )
+                        .unwrap_or(selected)
+                    }
+                    KeyPress::Enter if focus.group == Group::Content => open = true,
+                    KeyPress::Char('r' | 'R') => {
                         cursor.hide(fb);
-                        return ScreenNav::Nav(nav);
+                        super::confirm_reset(fb, NavItem::Security);
                     }
-                    // Card click
-                    if let Some(idx) = hovered {
-                        if idx == selected {
-                            cursor.hide(fb);
-                            status = handle_action(fb, selected);
-                            if selected == ACTION_BACK {
-                                return ScreenNav::Back;
-                            }
-                            cursor.while_hidden(fb, || {
-                                draw_screen(
-                                    fb,
-                                    selected,
-                                    hovered,
-                                    sidebar_hov,
-                                    scroll_offset,
-                                    status,
-                                )
-                            });
-                        } else {
-                            selected = idx;
-                            keep_action_visible(fb, selected, &mut scroll_offset);
-                            reselect!(before, had_status);
+                    KeyPress::MouseScroll(dz) => {
+                        controls::scroll(&mut offset, dz, ACTION_COUNT, action_visible_slots(fb));
+                        reveal = false;
+                    }
+                    KeyPress::MouseClick { x, y } => {
+                        let buttons = action_buttons(fb);
+                        if controls::scroll_track(
+                            &mut offset,
+                            action_list_area(fb),
+                            (x as i32, y as i32),
+                            ACTION_COUNT,
+                            action_visible_slots(fb),
+                        ) {
+                            reveal = false;
+                        } else if dialog::contains(buttons[0], x as i32, y as i32) {
+                            open = true;
+                            focus.group = Group::Actions;
+                            focus.action = 0;
+                        } else if dialog::contains(buttons[1], x as i32, y as i32) {
+                            inspect = true;
+                            focus.group = Group::Actions;
+                            focus.action = 1;
+                        } else if let Some(i) = hovered {
+                            selected = i;
+                            focus.group = Group::Content;
                         }
-                    } else {
-                        reselect!(before, had_status);
                     }
-                }
-                #[cfg(feature = "ui")]
-                KeyPress::MouseScroll(dz) => {
-                    if dz > 0 && selected < ACTION_COUNT - 1 {
-                        selected += 1;
-                    } else if dz < 0 && selected > 0 {
-                        selected -= 1;
-                    }
-                    keep_action_visible(fb, selected, &mut scroll_offset);
-                    reselect!(before, had_status);
-                }
-                _ => {
-                    reselect!(before, had_status);
-                }
+                    _ => {}
+                },
             }
+            if open {
+                cursor.hide(fb);
+                let index = ACTION_ORDER[selected];
+                if index == ACTION_BACK {
+                    return ScreenNav::Back;
+                }
+                status = handle_action(fb, index);
+            }
+            if inspect {
+                cursor.hide(fb);
+                show_key_details(fb);
+            }
+            if reveal {
+                controls::ensure_visible(
+                    &mut offset,
+                    selected,
+                    ACTION_COUNT,
+                    action_visible_slots(fb),
+                );
+            }
+            // Wheel changes the viewport only; do not reveal selection again
+            // before painting, or the scroll operation would be undone.
+            cursor.hide(fb);
+            draw_screen(fb, selected, offset, &focus, status);
+            hovered = None;
         }
         delay_ms(8);
     }
@@ -175,13 +192,11 @@ fn unavailable_reason(idx: usize) -> Option<&'static str> {
     }
 }
 
-/// Keep the file bytes owned across preview and consent: a subsequent ESP file
-/// replacement must not change the material that is actually enrolled.
+/// Keep the verified bytes owned across review. Never reopen ESP files after consent.
 enum PendingImport {
     Keys(crate::efi::auth::key_files::KeyFileSearchResult),
     Dbx(Vec<u8>, crate::efi::auth::dbx_update::DbxSource),
 }
-
 fn fingerprint(hash: &[u8; 32]) -> String {
     let mut text = String::new();
     for (i, byte) in hash.iter().enumerate() {
@@ -192,8 +207,10 @@ fn fingerprint(hash: &[u8; 32]) -> String {
     }
     text
 }
-
-fn prepare_import(idx: usize) -> Result<Option<(PendingImport, String)>, &'static str> {
+fn key_identity(label: &str, data: &[u8]) -> ReviewSection {
+    ReviewSection::new(label, &fingerprint(&crate::efi::auth::sha256(data)))
+}
+fn prepare_import(idx: usize) -> Result<Option<(PendingImport, Vec<ReviewSection>)>, &'static str> {
     use crate::efi::auth::{self, dbx_update, key_files, sha256};
     match idx {
         2 => {
@@ -203,18 +220,36 @@ fn prepare_import(idx: usize) -> Result<Option<(PendingImport, String)>, &'stati
             key_files::validate_key_files(&keys)
                 .map_err(crate::secure_boot_menu::custom_pk_error)?;
             let pk = keys.pk.as_deref().ok_or("No PK certificate supplied")?;
-            let mut identity = alloc::format!(
-                "Source: {}. PK SHA256: {}.",
-                keys.source,
-                fingerprint(&sha256(pk))
-            );
-            if let Some(kek) = &keys.kek {
-                let _ = write!(identity, " KEK SHA256: {}.", fingerprint(&sha256(kek)));
+            let mut sections = alloc::vec![
+                ReviewSection::new("Source", keys.source),
+                key_identity("Owner key (PK) - SHA-256", pk)
+            ];
+            match keys.kek.as_deref() {
+                Some(kek) if kek != pk => {
+                    sections.push(key_identity("Update key (KEK) - SHA-256", kek))
+                }
+                _ => sections.push(ReviewSection::new(
+                    "Update key (KEK)",
+                    "Same certificate as the owner key (PK).",
+                )),
             }
-            if let Some(db) = &keys.db {
-                let _ = write!(identity, " Custom db SHA256: {}.", fingerprint(&sha256(db)));
+            if let Some(db) = keys.db.as_deref() {
+                if db == pk {
+                    sections.push(ReviewSection::new(
+                        "Custom boot signer (db)",
+                        "Same certificate as the owner key (PK).",
+                    ));
+                } else if keys.kek.as_deref() == Some(db) {
+                    sections.push(ReviewSection::new(
+                        "Custom boot signer (db)",
+                        "Same certificate as the update key (KEK).",
+                    ));
+                } else {
+                    sections.push(key_identity("Custom boot signer (db) - SHA-256", db));
+                }
             }
-            Ok(Some((PendingImport::Keys(keys), identity)))
+            sections.push(ReviewSection::new("Additional boot trust","Bundled Microsoft UEFI CA certificates are also added to db. Existing dbx revocations are kept."));
+            Ok(Some((PendingImport::Keys(keys), sections)))
         }
         3 => {
             let (data, source) = dbx_update::find_dbx_file().ok_or_else(|| {
@@ -222,38 +257,44 @@ fn prepare_import(idx: usize) -> Result<Option<(PendingImport, String)>, &'stati
             })?;
             let preview = dbx_update::preview_dbx_update(&data, source)
                 .map_err(crate::secure_boot_menu::dbx_error)?;
-            let mut identity = alloc::format!(
-                "Source: {}. {} hashes, {} certificates.",
-                preview.entries.source,
-                preview.entries.sha256_count,
-                preview.entries.x509_count
-            );
-            if let Some(time) = preview.timestamp {
-                let (year, month, day, hour, minute, second) = (
-                    time.year,
-                    time.month,
-                    time.day,
-                    time.hour,
-                    time.minute,
-                    time.second,
-                );
-                let _ = write!(
-                    identity,
-                    " Timestamp: {year:04}-{month:02}-{day:02} {hour:02}:{minute:02}:{second:02}."
-                );
+            let mut sections = alloc::vec![
+                ReviewSection::new("Source", preview.entries.source),
+                ReviewSection::new(
+                    "Update contents",
+                    &alloc::format!(
+                        "{} SHA-256 hashes; {} certificates.",
+                        preview.entries.sha256_count,
+                        preview.entries.x509_count
+                    )
+                )
+            ];
+            if let Some(t) = preview.timestamp {
+                let (year, month, day, hour, minute, second) =
+                    (t.year, t.month, t.day, t.hour, t.minute, t.second);
+                sections.push(ReviewSection::new(
+                    "Update timestamp",
+                    &alloc::format!(
+                        "{year:04}-{month:02}-{day:02} {hour:02}:{minute:02}:{second:02}"
+                    ),
+                ));
             }
             if let Some(signer) = preview.signer_sha256 {
-                let _ = write!(
-                    identity,
-                    " Verified signer SHA256: {}.",
-                    fingerprint(&signer)
-                );
+                sections.push(ReviewSection::new(
+                    "Verified signer - SHA-256",
+                    &fingerprint(&signer),
+                ));
             } else {
-                identity.push_str(" UNSIGNED: Setup Mode provisioning only.");
+                sections.push(ReviewSection::new(
+                    "UNSIGNED update",
+                    "Signature not verified. Allowed only for provisioning in Setup Mode.",
+                ));
             }
-            identity.push_str(" Replaces dbx: existing revocations absent from this file will be REMOVED, potentially allowing previously revoked boot software.");
-            let _ = write!(identity, " File SHA256: {}.", fingerprint(&sha256(&data)));
-            Ok(Some((PendingImport::Dbx(data, source), identity)))
+            sections.push(ReviewSection::new("WARNING - replaces existing dbx","Existing revocations absent from this file will be REMOVED. Previously revoked boot software may become bootable."));
+            sections.push(ReviewSection::new(
+                "Reviewed file - SHA-256",
+                &fingerprint(&sha256(&data)),
+            ));
+            Ok(Some((PendingImport::Dbx(data, source), sections)))
         }
         _ => Ok(None),
     }
@@ -264,9 +305,15 @@ fn handle_action(fb: &FramebufferInfo, idx: usize) -> Option<(&'static str, bool
     if idx == ACTION_BACK {
         return None;
     }
-    if unavailable_reason(idx).is_some() {
-        // The reason is already visible on the unavailable card.
-        return None;
+    if let Some(reason) = unavailable_reason(idx) {
+        dialog::choose(
+            fb,
+            NavItem::Security,
+            "Action unavailable",
+            reason,
+            &["Back"],
+        );
+        return Some((reason, false));
     }
     let (title, message, confirm) = match idx {
         0 if auth::is_secure_boot_requested() => (
@@ -286,15 +333,15 @@ fn handle_action(fb: &FramebufferInfo, idx: usize) -> Option<(&'static str, bool
         ),
         2 => (
             "Enroll custom owner key?",
-            "Replace PK/KEK/db using EFI\\keys\\PK.cer (or PK.der), optional KEK/db files AND bundled Microsoft UEFI CA trust. Without KEK.cer, PK also becomes KEK. dbx is kept. Enrolling PK leaves Setup Mode and may start enforcement now.",
+            "Replace PK/KEK/db using the reviewed ESP certificates and bundled Microsoft UEFI CA trust. Without a KEK file, PK also becomes KEK. Enrolling PK leaves Setup Mode and may start enforcement now.",
             "Enroll",
         ),
         3 => (
             "Import revocations?",
             if auth::is_setup_mode() {
-                "Load EFI\\keys\\dbxupdate.auth or dbx.auth. Setup Mode also allows unsigned dbx.bin or dbx.esl. Revoked boot software may stop booting. Only import a revocation list you trust."
+                "Import the reviewed dbx file. Setup Mode also allows unsigned provisioning. Revoked boot software may stop booting. Only import a revocation list you trust."
             } else {
-                "Load EFI\\keys\\dbxupdate.auth or dbx.auth, signed by an enrolled KEK or PK. Unsigned .bin/.esl files are not accepted in User Mode. Revoked boot software may stop booting."
+                "Import the reviewed dbx file, verified against an enrolled KEK or PK. Unsigned files are not accepted in User Mode. Revoked boot software may stop booting."
             },
             "Import",
         ),
@@ -306,40 +353,22 @@ fn handle_action(fb: &FramebufferInfo, idx: usize) -> Option<(&'static str, bool
         _ => return None,
     };
     if matches!(idx, 2 | 3) {
-        draw_screen(
-            fb,
-            idx,
-            None,
-            None,
-            0,
-            Some(("Loading and verifying file identities...", true)),
-        );
+        draw_progress(fb, idx, "Loading and verifying identities...");
     }
-    let prepared = match prepare_import(idx) {
-        Ok(prepared) => prepared,
+    let mut prepared = match prepare_import(idx) {
+        Ok(p) => p,
         Err(error) => return Some((error, false)),
     };
-    let consent = prepared
-        .as_ref()
-        .map(|(_, identity)| alloc::format!("{message} {identity}"));
-    if dialog::choose(
-        fb,
-        NavItem::Security,
-        title,
-        consent.as_deref().unwrap_or(message),
-        &["Cancel", confirm],
-    ) == 0
-    {
+    let consent = if let Some((_, sections)) = prepared.as_mut() {
+        sections.insert(0, ReviewSection::new("Operation and consequences", message));
+        dialog::review(fb, NavItem::Security, title, sections, confirm)
+    } else {
+        dialog::choose(fb, NavItem::Security, title, message, &["Cancel", confirm]) == 1
+    };
+    if !consent {
         return Some(("Cancelled; no changes made", true));
     }
-    draw_screen(
-        fb,
-        idx,
-        None,
-        None,
-        0,
-        Some(("Working; please wait...", true)),
-    );
+    draw_progress(fb, idx, "Working; please wait...");
     let result = match idx {
         0 => return Some(crate::secure_boot_menu::toggle_secure_boot_action()),
         1 => auth::boot::enroll_and_persist_default_keys()
@@ -347,11 +376,11 @@ fn handle_action(fb: &FramebufferInfo, idx: usize) -> Option<(&'static str, bool
             .map_err(|_| "Failed to enroll keys; check variable storage"),
         2 | 3 => match prepared.map(|(pending, _)| pending) {
             Some(PendingImport::Keys(keys)) => auth::key_files::enroll_key_files(keys)
-                .map(|_| "Custom PK enrolled; previewed identities committed")
+                .map(|_| "Custom PK enrolled; reviewed identities committed")
                 .map_err(crate::secure_boot_menu::custom_pk_error),
             Some(PendingImport::Dbx(data, source)) => {
                 auth::dbx_update::enroll_dbx_data(data, source)
-                    .map(|_| "dbx imported; previewed update committed")
+                    .map(|_| "dbx imported; reviewed update committed")
                     .map_err(crate::secure_boot_menu::dbx_error)
             }
             None => Err("No verified import was prepared"),
@@ -362,382 +391,304 @@ fn handle_action(fb: &FramebufferInfo, idx: usize) -> Option<(&'static str, bool
         _ => return None,
     };
     Some(match result {
-        Ok(msg) => (msg, true),
-        Err(msg) => (msg, false),
+        Ok(message) => (message, true),
+        Err(message) => (message, false),
     })
 }
 
-/// Hit-test action cards.
-fn action_hit(fb: &FramebufferInfo, scroll_offset: usize) -> Option<usize> {
-    let (mx, my) = crate::drivers::mouse_cursor::position();
-    let end = (scroll_offset + action_visible_slots(fb)).min(ACTION_COUNT);
-    for i in scroll_offset..end {
-        let Some((ax, ay, aw, ah)) = action_card_rect(fb, scroll_offset, i) else {
-            continue;
-        };
-        if mx >= ax && mx < ax + aw as i32 && my >= ay && my < ay + ah as i32 {
-            return Some(i);
-        }
-    }
-    None
+fn action_buttons(fb: &FramebufferInfo) -> [Rect; 2] {
+    let m = Metrics::for_fb(fb);
+    let (x, y, w, h) = canvas(fb);
+    let bw = ((w - 12) / 2).min(280);
+    [
+        (x, y + h as i32 - m.button as i32, bw, m.button),
+        (
+            x + bw as i32 + 12,
+            y + h as i32 - m.button as i32,
+            bw,
+            m.button,
+        ),
+    ]
 }
-
-const ACTION_ITEMS: [(&str, &str); ACTION_COUNT] = [
+fn action_list_area(fb: &FramebufferInfo) -> Rect {
+    let m = Metrics::for_fb(fb);
+    let (x, y, w, h) = canvas(fb);
+    let heading = render::font_height(m.title) + 12 + if h > 350 { m.line * 2 + 12 } else { 0 };
+    let status = if h > 350 { m.line * 2 } else { m.line };
     (
-        "Enable Secure Boot",
-        "Require signed boot software after PK enrollment",
-    ),
-    (
-        "Enroll Default Keys",
-        "Install Microsoft UEFI CA certificates",
-    ),
-    ("Enroll Custom PK", "Load PK from EFI\\keys\\PK.cer on ESP"),
-    (
-        "Import dbx Update",
-        "Load signed dbxupdate.auth / dbx.auth from ESP",
-    ),
-    ("Clear All Keys", "Remove all keys, return to Setup Mode"),
-    ("Back to Boot Menu", "Return to boot entry selection"),
-];
-
-fn action_list_area(fb: &FramebufferInfo) -> (i32, i32, u32, u32) {
-    let (cx, cy, cw, ch) = canvas(fb);
-    // Section header + hero card + gap
-    let hero_h = 56u32;
-    let header_h =
-        render::font_height(FontSize::Small) + 4 + render::font_height(FontSize::Display) + 16;
-    let used_h = header_h + hero_h + 16;
-    let base_y = cy + used_h as i32;
-    // Keep feedback separate from the last card at every resolution.
-    (cx, base_y, cw, ch.saturating_sub(used_h + 40))
+        x,
+        y + heading as i32,
+        if w >= 1050 { w * 3 / 5 - 16 } else { w },
+        h.saturating_sub(heading + m.button + status + 20),
+    )
 }
-
+fn action_row_height(fb: &FramebufferInfo) -> u32 {
+    let m = Metrics::for_fb(fb);
+    if canvas(fb).3 < 300 { m.row } else { m.entry }
+}
 fn action_visible_slots(fb: &FramebufferInfo) -> usize {
-    let (_, _, _, h) = action_list_area(fb);
-    let card_h = 44u32;
-    if h < card_h {
-        1
-    } else {
-        ((h + theme::GAP) / (card_h + theme::GAP)).max(1) as usize
-    }
+    (action_list_area(fb).3 / (action_row_height(fb) + 4)).max(1) as usize
 }
-
-fn keep_action_visible(fb: &FramebufferInfo, selected: usize, scroll_offset: &mut usize) {
-    let slots = action_visible_slots(fb);
-    if selected < *scroll_offset {
-        *scroll_offset = selected;
-    } else if selected >= *scroll_offset + slots {
-        *scroll_offset = selected - slots + 1;
-    }
-}
-
-/// Rect for the i-th action card.
-fn action_card_rect(
-    fb: &FramebufferInfo,
-    scroll_offset: usize,
-    i: usize,
-) -> Option<(i32, i32, u32, u32)> {
-    if i < scroll_offset || i >= scroll_offset + action_visible_slots(fb) {
+fn action_card_rect(fb: &FramebufferInfo, offset: usize, i: usize) -> Option<Rect> {
+    if i < offset || i >= offset + action_visible_slots(fb) {
         return None;
     }
-    let (cx, base_y, cw, _) = action_list_area(fb);
-    let card_h = 44u32;
-    let slot = i - scroll_offset;
-    let y = base_y + (slot as i32 * (card_h as i32 + theme::GAP as i32));
-    Some((cx, y, cw, card_h))
+    let (x, y, w, _) = action_list_area(fb);
+    let h = action_row_height(fb);
+    Some((
+        x,
+        y + ((i - offset) as u32 * (h + 4)) as i32,
+        w - controls::SCROLL_GUTTER,
+        h,
+    ))
 }
-
-/// Repaint a single action card (avoids full-screen redraw on hover changes).
 fn paint_action_card(
     fb: &FramebufferInfo,
     i: usize,
     selected: usize,
     hovered: Option<usize>,
-    scroll_offset: usize,
+    offset: usize,
+    focus: &Focus,
 ) {
-    let Some((cx, y, cw, card_h)) = action_card_rect(fb, scroll_offset, i) else {
+    let Some(rect) = action_card_rect(fb, offset, i) else {
         return;
     };
-    let (mut title, mut desc) = ACTION_ITEMS[i];
-    if i == 0 && crate::efi::auth::is_secure_boot_requested() {
+    let m = Metrics::for_fb(fb);
+    let idx = ACTION_ORDER[i];
+    let (mut title, mut desc) = ACTION_ITEMS[idx];
+    let danger = idx == 4 || (idx == 0 && crate::efi::auth::is_secure_boot_requested());
+    if idx == 0 && crate::efi::auth::is_secure_boot_requested() {
         title = "Disable Secure Boot";
-        desc = "Stop enforcing signatures; keep enrolled keys";
+        desc = "DANGER: stop signature enforcement; enrolled keys are kept";
     }
-    let unavailable = unavailable_reason(i);
+    let unavailable = unavailable_reason(idx);
     if let Some(reason) = unavailable {
         desc = reason;
     }
-    let is_sel = i == selected;
-    let is_hov = hovered == Some(i) && !is_sel;
-
-    let bg = if is_sel {
-        theme::SURFACE_HI
-    } else if is_hov {
-        theme::CONT_HIGH
-    } else {
-        theme::CONTAINER
-    };
-    // The accent bar reaches outside the rounded body at its left corners.
-    // Clear the corners so deselecting the card leaves no cyan pixels behind.
-    let r = theme::RADIUS;
-    [
-        (cx, y),
-        (cx + cw as i32 - r as i32, y),
-        (cx, y + card_h as i32 - r as i32),
-        (cx + cw as i32 - r as i32, y + card_h as i32 - r as i32),
-    ]
-    .into_iter()
-    .for_each(|(x, y)| render::fill_rect(fb, x, y, r, r, theme::BG));
-    render::fill_rounded_rect(fb, cx, y, cw, card_h, r, bg);
-
-    if is_sel {
-        render::fill_rect(fb, cx, y + 2, theme::ACCENT_BAR, card_h - 4, theme::PRIMARY);
+    let mut c = Control::new(idx as u64, Role::Option, title);
+    c.focused = focus.group == Group::Content && i == selected;
+    c.selected = i == selected;
+    c.enabled = unavailable.is_none();
+    let bg = controls::frame(fb, rect, &c, hovered == Some(i));
+    if danger {
+        render::fill_rect(fb, rect.0 + 8, rect.1 + 5, 3, rect.3 - 10, theme::ERROR);
     }
-
-    let tx = cx
-        + theme::PAD as i32
-        + if is_sel {
-            theme::ACCENT_BAR as i32 + 4
-        } else {
-            0
-        };
+    let label = alloc::format!(
+        "{} {}{}",
+        if i == selected { ">" } else { " " },
+        if danger { "! " } else { "" },
+        title
+    );
     render::draw_text(
         fb,
-        tx,
-        y + 4,
-        &render::ellipsize(title, cw.saturating_sub(64), FontSize::Normal),
-        FontSize::Normal,
-        if unavailable.is_some() {
-            theme::TEXT_DIM
-        } else {
+        rect.0 + 16,
+        rect.1 + 8,
+        &render::ellipsize(&label, rect.2 - 32, m.body),
+        m.body,
+        if c.enabled {
             theme::TEXT
+        } else {
+            theme::TEXT_DIM
         },
         Some(bg),
     );
-    render::draw_text(
-        fb,
-        tx,
-        y + 4 + render::font_height(FontSize::Normal) as i32 + 2,
-        &render::ellipsize(desc, cw.saturating_sub(64), FontSize::Small),
-        FontSize::Small,
-        theme::TEXT_DIM,
-        Some(bg),
-    );
-
-    if is_sel && unavailable.is_none() {
+    if rect.3 >= m.entry {
         render::draw_text(
             fb,
-            cx + cw as i32 - 28,
-            y + 12,
-            ">",
-            FontSize::Normal,
-            theme::PRIMARY,
+            rect.0 + 30,
+            rect.1 + 12 + render::font_height(m.body) as i32,
+            &render::ellipsize(desc, rect.2 - 44, m.small),
+            m.small,
+            theme::TEXT_DIM,
             Some(bg),
         );
     }
-}
-
-fn repaint_actions(
-    fb: &FramebufferInfo,
-    selected: usize,
-    hovered: Option<usize>,
-    scroll_offset: usize,
-    before: (usize, usize),
-) {
-    if scroll_offset == before.1 {
-        [before.0, selected]
-            .into_iter()
-            .for_each(|i| paint_action_card(fb, i, selected, hovered, scroll_offset));
-    } else {
-        let end = (scroll_offset + action_visible_slots(fb)).min(ACTION_COUNT);
-        (scroll_offset..end)
-            .for_each(|i| paint_action_card(fb, i, selected, hovered, scroll_offset));
-    }
-    paint_action_scrollbar(fb, scroll_offset);
-}
-
-fn paint_action_scrollbar(fb: &FramebufferInfo, scroll_offset: usize) {
-    let (list_x, list_y, list_w, list_h) = action_list_area(fb);
-    draw_scrollbar(
+    controls::viewport_focus(
         fb,
-        list_x + list_w as i32 - 4,
-        list_y,
-        list_h,
-        ACTION_COUNT,
-        scroll_offset,
+        action_list_area(fb),
+        focus.group == Group::Content,
+        selected,
+        offset,
         action_visible_slots(fb),
     );
 }
-
 fn draw_screen(
     fb: &FramebufferInfo,
     selected: usize,
-    hovered: Option<usize>,
-    sidebar_hov: Option<NavItem>,
-    scroll_offset: usize,
+    offset: usize,
+    focus: &Focus,
     status: Option<(&str, bool)>,
 ) {
-    clear(fb);
-    draw_header(fb);
-    draw_sidebar(fb, NavItem::Security, sidebar_hov);
-    draw_footer(
-        fb,
-        "Arrows/Pg/Home/End Select   Enter Open   F Firmware   Esc Back",
-    );
-
-    let (cx, cy, cw, _ch) = canvas(fb);
-    let mut y = cy;
-
-    // ── Section label ──
-    render::draw_text_spaced(
-        fb,
-        cx,
-        y,
-        "SECURITY CONFIGURATION",
-        FontSize::Small,
-        2,
-        theme::PRIMARY.darken(80),
-        None,
-    );
-    y += render::font_height(FontSize::Small) as i32 + 4;
+    super::draw_shell(fb, NavItem::Security, focus, None);
+    let m = Metrics::for_fb(fb);
+    let (x, y, w, h) = canvas(fb);
+    let state = crate::efi::auth::secure_boot_state();
+    let label = if state.enforcing {
+        "ON"
+    } else if state.requested {
+        "Pending"
+    } else {
+        "OFF"
+    };
     render::draw_text(
         fb,
-        cx,
+        x,
         y,
-        "Secure Boot",
-        FontSize::Display,
+        &alloc::format!("Secure Boot: {label}"),
+        m.title,
         theme::TEXT,
         None,
     );
-    y += render::font_height(FontSize::Display) as i32 + 16;
-
-    // ── Hero state card ──
-    let state = crate::efi::auth::secure_boot_state();
-    let sb_on = state.enforcing;
-    let setup_mode = state.setup_mode;
-    let enroll = crate::efi::auth::enrollment::get_enrollment_status();
-
-    let state_h = 56u32;
-    render::fill_rounded_rect(fb, cx, y, cw, state_h, theme::RADIUS, theme::CONT_LOW);
-
-    let state_color = if sb_on {
-        theme::SECONDARY
-    } else if state.requested {
-        theme::ORANGE
-    } else {
-        theme::ERROR
-    };
-    render::fill_rect(fb, cx, y, theme::ACCENT_BAR, state_h, state_color);
-
-    let state_label = crate::secure_boot_menu::secure_boot_state_label(state);
-    render::draw_text_spaced(
-        fb,
-        cx + 16,
-        y + 6,
-        "ENFORCEMENT",
-        FontSize::Small,
-        1,
-        theme::OUTLINE,
-        Some(theme::CONT_LOW),
-    );
-    render::draw_text(
-        fb,
-        cx + 16,
-        y + 6 + render::font_height(FontSize::Small) as i32 + 4,
-        state_label,
-        FontSize::Heading,
-        state_color,
-        Some(theme::CONT_LOW),
-    );
-
-    // Right side: mode + key summary
-    let mode_label = if setup_mode {
-        "SETUP MODE"
-    } else {
-        "USER MODE"
-    };
-    let mode_color = if setup_mode {
-        theme::ORANGE
-    } else {
-        theme::GREEN
-    };
-    let right_x = cx + cw as i32 / 2;
-    render::draw_text(
-        fb,
-        right_x,
-        y + 6,
-        mode_label,
-        FontSize::Small,
-        mode_color,
-        Some(theme::CONT_LOW),
-    );
-
-    let mut kx = right_x;
-    let ky = y + 6 + render::font_height(FontSize::Small) as i32 + 6;
-    let keys: [(&str, usize); 4] = [
-        ("PK", enroll.pk_count),
-        ("KEK", enroll.kek_count),
-        ("db", enroll.db_count),
-        ("dbx", enroll.dbx_count),
-    ];
-    for (name, count) in &keys {
-        let mut buf = [0u8; 16];
-        let s = fmt_kc(name, *count as u32, &mut buf);
-        let pbg = if *count > 0 {
-            theme::ACCENT_DIM
-        } else {
-            theme::GHOST
-        };
-        render::draw_pill(fb, kx, ky, s, theme::TEXT, pbg);
-        kx += (render::text_width(s, FontSize::Small) + 18) as i32;
+    if h > 350 {
+        dialog::wrapped(
+            fb,
+            (
+                x,
+                y + render::font_height(m.title) as i32 + 10,
+                w,
+                m.line * 2,
+            ),
+            if state.enforcing {
+                "Only signed, trusted boot software is allowed. Keys and revocations define that trust."
+            } else if state.setup_mode {
+                "Setup Mode: no owner key is enrolled. Signature protection is not active."
+            } else {
+                "Signature protection is off. Enrolled keys are kept."
+            },
+            theme::TEXT_DIM,
+        );
     }
-
-    let _ = y; // y was used to position hero card; action cards use action_card_rect()
-
-    // ── Action cards ──
-    let end = (scroll_offset + action_visible_slots(fb)).min(ACTION_COUNT);
-    for i in scroll_offset..end {
-        paint_action_card(fb, i, selected, hovered, scroll_offset);
+    for i in offset..(offset + action_visible_slots(fb)).min(ACTION_COUNT) {
+        paint_action_card(fb, i, selected, None, offset, focus);
     }
-
-    paint_action_scrollbar(fb, scroll_offset);
-
-    // Status toast
-    if let Some((msg, ok)) = status {
-        let msg_y = fb.height as i32 - theme::FOOTER_H as i32 - 46;
-        let color = if ok { theme::GREEN } else { theme::ERROR };
-        dialog::wrapped(fb, (cx, msg_y, cw, 40), msg, color);
+    let (lx, ly, lw, lh) = action_list_area(fb);
+    super::draw_scrollbar(
+        fb,
+        lx + lw as i32 - 22,
+        ly,
+        lh,
+        ACTION_COUNT,
+        offset,
+        action_visible_slots(fb),
+    );
+    controls::viewport_focus(
+        fb,
+        (lx, ly, lw, lh),
+        focus.group == Group::Content,
+        selected,
+        offset,
+        action_visible_slots(fb),
+    );
+    if w >= 1050 {
+        let rect = (lx + lw as i32 + 16, ly, w - lw - 16, lh);
+        let c = Control::new(900, Role::Option, "Current trust");
+        controls::frame(fb, rect, &c, false);
+        dialog::wrapped(
+            fb,
+            (rect.0 + 16, rect.1 + 16, rect.2 - 32, rect.3 - 32),
+            &key_details_text(),
+            theme::TEXT_DIM,
+        );
     }
+    let buttons = action_buttons(fb);
+    let target = match ACTION_ORDER[selected] {
+        0 if state.requested => "Disable protection",
+        0 => "Enable protection",
+        1 => "Default keys",
+        2 => "Custom owner key",
+        3 => "Revocations",
+        4 => "Clear all keys",
+        _ => "Back to Boot",
+    };
+    let open = alloc::format!("Open: {target}");
+    for (i, label) in [open.as_str(), "Current key details"].iter().enumerate() {
+        let mut c = Control::new(1000 + i as u64, Role::Button, label);
+        c.focused = focus.group == Group::Actions && focus.action == i;
+        controls::button(fb, buttons[i], &c, ButtonKind::Neutral);
+    }
+    if let Some((message, ok)) = status {
+        draw_feedback(
+            fb,
+            message,
+            if ok { Feedback::Done } else { Feedback::Error },
+        );
+    }
+    super::draw_footer(fb, "Tab Focus   Arrows Move   Enter Open   Esc Back");
+}
+enum Feedback {
+    Info,
+    Done,
+    Error,
+}
+fn draw_feedback(fb: &FramebufferInfo, message: &str, feedback: Feedback) {
+    let m = Metrics::for_fb(fb);
+    let (x, _, w, h) = canvas(fb);
+    let height = if h > 350 { m.line * 2 } else { m.line };
+    let (prefix, color) = match feedback {
+        Feedback::Info => ("Info", theme::TEXT_DIM),
+        Feedback::Done => ("Done", theme::GREEN),
+        Feedback::Error => ("Error", theme::ERROR),
+    };
+    dialog::wrapped(
+        fb,
+        (x, action_buttons(fb)[0].1 - height as i32 - 8, w, height),
+        &alloc::format!("{prefix}: {message}"),
+        color,
+    );
+}
+fn draw_progress(fb: &FramebufferInfo, index: usize, message: &str) {
+    let selected = ACTION_ORDER.iter().position(|i| *i == index).unwrap_or(0);
+    let mut offset = 0;
+    controls::ensure_visible(
+        &mut offset,
+        selected,
+        ACTION_COUNT,
+        action_visible_slots(fb),
+    );
+    let focus = Focus::new(super::nav_item_index(NavItem::Security));
+    draw_screen(fb, selected, offset, &focus, None);
+    draw_feedback(fb, message, Feedback::Info);
 }
 
-fn fmt_kc<'a>(name: &str, count: u32, buf: &'a mut [u8; 16]) -> &'a str {
-    let mut p = 0;
-    for &b in name.as_bytes() {
-        if p >= buf.len() - 6 {
-            break; // leave room for ':' + digits
-        }
-        buf[p] = b;
-        p += 1;
-    }
-    buf[p] = b':';
-    p += 1;
-    p += super::fmt_u32(count, &mut buf[p..]);
-    core::str::from_utf8(&buf[..p]).unwrap_or("??")
+fn key_details_text() -> String {
+    let s = crate::efi::auth::secure_boot_state();
+    let e = crate::efi::auth::enrollment::get_enrollment_status();
+    alloc::format!(
+        "Current trust\n\nMode: {}\nProtection: {}\n\nOwner key (PK): {}\nControls platform ownership.\n\nUpdate keys (KEK): {}\nAuthorize trust-database updates.\n\nAllowed signers (db): {}\nMay sign boot software.\n\nRevocations (dbx): {}\nBlock revoked boot software.\n\nClear all keys also removes revocations.",
+        if s.setup_mode {
+            "Setup Mode"
+        } else {
+            "User Mode"
+        },
+        if s.enforcing { "ON" } else { "OFF" },
+        e.pk_count,
+        e.kek_count,
+        e.db_count,
+        e.dbx_count
+    )
+}
+fn show_key_details(fb: &FramebufferInfo) {
+    dialog::choose(
+        fb,
+        NavItem::Security,
+        "Current Secure Boot trust",
+        &key_details_text(),
+        &["Back"],
+    );
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
     #[test]
     fn identity_fingerprint_preserves_every_sha256_byte() {
-        let formatted = fingerprint(&[0xab; 32]);
-        assert_eq!(formatted.replace(' ', ""), "ab".repeat(32));
-        assert_eq!(formatted.len(), 71);
-        assert_eq!(formatted.split_whitespace().count(), 8);
+        let hash = core::array::from_fn(|i| i as u8);
+        assert_eq!(
+            fingerprint(&hash),
+            "00010203 04050607 08090a0b 0c0d0e0f 10111213 14151617 18191a1b 1c1d1e1f"
+        );
     }
-
-    fn framebuffer(mem: &mut [u32], width: u32, height: u32) -> FramebufferInfo {
+    fn fb(mem: &mut [u32], width: u32, height: u32) -> FramebufferInfo {
         FramebufferInfo {
             physical_address: mem.as_mut_ptr() as u64,
             width,
@@ -752,42 +703,53 @@ mod tests {
             blue_mask_size: 8,
         }
     }
-
-    fn paint_list(fb: &FramebufferInfo, selected: usize, scroll_offset: usize) {
-        clear(fb);
-        let end = (scroll_offset + action_visible_slots(fb)).min(ACTION_COUNT);
-        (scroll_offset..end).for_each(|i| paint_action_card(fb, i, selected, None, scroll_offset));
-        paint_action_scrollbar(fb, scroll_offset);
-    }
-
     #[test]
-    fn action_selection_repaint_matches_full_repaint() {
-        for (width, height) in [(1024, 768), (640, 480)] {
-            let mut inc_mem = std::vec![0u32; (width * height) as usize];
-            let mut ref_mem = std::vec![0u32; (width * height) as usize];
-            let inc = framebuffer(&mut inc_mem, width, height);
-            let full = framebuffer(&mut ref_mem, width, height);
+    fn action_focus_and_hover_repaints_match_a_full_list() {
+        for (width, height) in [(640, 400), (640, 480), (1024, 768), (1920, 1080)] {
+            let mut pixels = std::vec![0;width as usize*height as usize];
+            let f = fb(&mut pixels, width, height);
+            let focus = Focus::new(1);
+            let mut offset = 0;
             let mut selected = 0;
-            let mut scroll_offset = 0;
-            paint_list(&inc, selected, scroll_offset);
+            for i in 0..action_visible_slots(&f).min(ACTION_COUNT) {
+                paint_action_card(&f, i, selected, None, offset, &focus);
+            }
             let mut cursor = CursorRenderer::new();
-            cursor.update(&inc, 200, 250);
-
-            for next in (1..ACTION_COUNT).chain((0..ACTION_COUNT - 1).rev()) {
-                let before = (selected, scroll_offset);
+            cursor.update(&f, 200, 250);
+            for next in 1..ACTION_COUNT {
+                let old = selected;
+                let old_offset = offset;
                 selected = next;
-                keep_action_visible(&inc, selected, &mut scroll_offset);
-                cursor.while_hidden(&inc, || {
-                    repaint_actions(&inc, selected, None, scroll_offset, before);
-                });
-                paint_list(&full, selected, scroll_offset);
-                cursor.hide(&inc);
-                let differing_pixels = inc_mem.iter().zip(&ref_mem).filter(|(a, b)| a != b).count();
-                assert_eq!(
-                    differing_pixels, 0,
-                    "{width}x{height}: selected={selected}, scroll={scroll_offset}"
+                controls::ensure_visible(
+                    &mut offset,
+                    selected,
+                    ACTION_COUNT,
+                    action_visible_slots(&f),
                 );
-                cursor.update(&inc, 200, 250);
+                cursor.while_hidden(&f, || {
+                    if old_offset != offset {
+                        let (x, y, w, h) = action_list_area(&f);
+                        render::fill_rect(&f, x, y, w, h, theme::BG);
+                        for i in offset..(offset + action_visible_slots(&f)).min(ACTION_COUNT) {
+                            paint_action_card(&f, i, selected, None, offset, &focus);
+                        }
+                    } else {
+                        paint_action_card(&f, old, selected, None, offset, &focus);
+                        paint_action_card(&f, selected, selected, None, offset, &focus);
+                    }
+                });
+                cursor.hide(&f);
+                let mut expected = std::vec![0;pixels.len()];
+                let e = fb(&mut expected, width, height);
+                if old_offset != offset {
+                    let (x, y, w, h) = action_list_area(&e);
+                    render::fill_rect(&e, x, y, w, h, theme::BG);
+                }
+                for i in offset..(offset + action_visible_slots(&e)).min(ACTION_COUNT) {
+                    paint_action_card(&e, i, selected, None, offset, &focus);
+                }
+                assert_eq!(pixels, expected, "{width}x{height}, selected={selected}");
+                cursor.update(&f, 200, 250);
             }
         }
     }

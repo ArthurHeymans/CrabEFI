@@ -20,6 +20,10 @@ pub enum KeyPress {
     End,
     PageUp,
     PageDown,
+    Tab,
+    BackTab,
+    Delete,
+    F8,
     Enter,
     Escape,
     Char(char),
@@ -36,23 +40,38 @@ pub enum KeyPress {
 
 /// Read a key from any keyboard or serial
 pub fn read_key() -> Option<KeyPress> {
-    if let Some((scan_code, unicode_char)) = keyboard::try_read_key() {
-        return match scan_code {
-            0x01 => Some(KeyPress::Up),    // SCAN_UP
-            0x02 => Some(KeyPress::Down),  // SCAN_DOWN
-            0x03 => Some(KeyPress::Right), // SCAN_RIGHT
-            0x04 => Some(KeyPress::Left),  // SCAN_LEFT
-            0x05 => Some(KeyPress::Home),
-            0x06 => Some(KeyPress::End),
-            0x09 => Some(KeyPress::PageUp),
-            0x0A => Some(KeyPress::PageDown),
-            0x17 => Some(KeyPress::Escape), // SCAN_ESC
-            0 if unicode_char == 0x0D => Some(KeyPress::Enter), // Carriage return
-            0 if unicode_char > 0 => Some(KeyPress::Char(unicode_char as u8 as char)),
-            _ => None,
-        };
+    if let Some((key, state)) = keyboard::try_read_key_with_state() {
+        return decode_keyboard_key(key.scancode, key.unicode_char, state.shift_state);
     }
 
+    read_pointer_or_serial()
+}
+
+fn decode_keyboard_key(scan_code: u16, unicode_char: u16, shift: u32) -> Option<KeyPress> {
+    match scan_code {
+        0x01 => Some(KeyPress::Up),    // SCAN_UP
+        0x02 => Some(KeyPress::Down),  // SCAN_DOWN
+        0x03 => Some(KeyPress::Right), // SCAN_RIGHT
+        0x04 => Some(KeyPress::Left),  // SCAN_LEFT
+        0x05 => Some(KeyPress::Home),
+        0x06 => Some(KeyPress::End),
+        0x09 => Some(KeyPress::PageUp),
+        0x0A => Some(KeyPress::PageDown),
+        0x08 => Some(KeyPress::Delete),
+        0x12 => Some(KeyPress::F8),
+        0x17 => Some(KeyPress::Escape), // SCAN_ESC
+        0 if unicode_char == 0x0D => Some(KeyPress::Enter), // Carriage return
+        0 if unicode_char == 9 => Some(if shift & 3 != 0 {
+            KeyPress::BackTab
+        } else {
+            KeyPress::Tab
+        }),
+        0 if unicode_char > 0 => char::from_u32(u32::from(unicode_char)).map(KeyPress::Char),
+        _ => None,
+    }
+}
+
+fn read_pointer_or_serial() -> Option<KeyPress> {
     // Check mouse state (if UI feature is enabled).
     // Note: callers must call mouse_cursor::poll() before read_key() —
     // we only inspect the current state here, we do NOT poll again.
@@ -109,6 +128,7 @@ impl SerialKeyParser {
                     self.state = SerialState::Escape;
                     None
                 }
+                b'\t' => Some(KeyPress::Tab),
                 b'\r' | b'\n' => Some(KeyPress::Enter),
                 byte => Some(KeyPress::Char(byte as char)),
             },
@@ -136,6 +156,8 @@ impl SerialKeyParser {
                             4 | 8 => Some(KeyPress::End),
                             5 => Some(KeyPress::PageUp),
                             6 => Some(KeyPress::PageDown),
+                            3 => Some(KeyPress::Delete),
+                            19 => Some(KeyPress::F8),
                             _ => None,
                         },
                         _ => serial_navigation_key(byte),
@@ -170,6 +192,7 @@ fn serial_navigation_key(byte: u8) -> Option<KeyPress> {
         b'D' => Some(KeyPress::Left),
         b'H' => Some(KeyPress::Home),
         b'F' => Some(KeyPress::End),
+        b'Z' => Some(KeyPress::BackTab),
         _ => None,
     }
 }
@@ -200,6 +223,28 @@ fn read_serial_key() -> Option<KeyPress> {
 #[cfg(test)]
 mod serial_tests {
     use super::*;
+
+    #[test]
+    fn physical_and_serial_backward_tab_and_delete_agree() {
+        assert_eq!(decode_keyboard_key(0, 9, 0), Some(KeyPress::Tab));
+        assert_eq!(decode_keyboard_key(0, 9, 1), Some(KeyPress::BackTab));
+        assert_eq!(decode_keyboard_key(0, 9, 2), Some(KeyPress::BackTab));
+        assert_eq!(decode_keyboard_key(8, 0, 0), Some(KeyPress::Delete));
+        let mut p = SerialKeyParser::new();
+        let keys: alloc::vec::Vec<_> = b"\t\x1b[Z\x1b[3~\x1b[19~"
+            .iter()
+            .filter_map(|b| p.feed(*b))
+            .collect();
+        assert_eq!(
+            keys,
+            [
+                KeyPress::Tab,
+                KeyPress::BackTab,
+                KeyPress::Delete,
+                KeyPress::F8
+            ]
+        );
+    }
 
     #[test]
     fn modified_and_fragmented_sequences_never_leak_editor_characters() {
