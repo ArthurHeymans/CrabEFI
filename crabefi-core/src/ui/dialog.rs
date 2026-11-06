@@ -375,11 +375,13 @@ pub enum LineKind {
     Note,
     Warn,
 }
+#[derive(Clone)]
 pub struct ReviewLine {
     pub kind: LineKind,
     pub text: String,
 }
-/// One identity or fact group; always shown whole, never split across pages.
+/// One identity or fact group; kept whole on a page whenever it fits.
+#[derive(Clone)]
 pub struct ReviewSection {
     pub label: String,
     pub lines: Vec<ReviewLine>,
@@ -431,24 +433,30 @@ fn section_label_width(fb: &FramebufferConfig, sections: &[ReviewSection]) -> u3
         + 14
 }
 
-/// Lays out one section, optionally painting. Returns its height.
-fn review_section(
+/// One painted line of a review section.
+struct VLine {
+    kind: LineKind,
+    text: String,
+    /// Space above this line (paragraph spacing inside a section).
+    gap: u32,
+    advance: u32,
+    /// First wrapped line of a fingerprint keeps its quieter "SHA-256" prefix.
+    first: bool,
+}
+
+/// Section chrome around its lines: rule plus padding above, padding below.
+const SECTION_TOP: u32 = 8;
+const SECTION_BOTTOM: u32 = 6;
+
+fn layout_section(
     fb: &FramebufferConfig,
-    x: i32,
-    y: i32,
     w: u32,
     label_w: u32,
     section: &ReviewSection,
-    paint: bool,
-) -> u32 {
+) -> Vec<VLine> {
     let m = Metrics::for_fb(fb);
-    let tx = x + label_w as i32;
     let tw = w.saturating_sub(label_w);
-    if paint {
-        render::fill_rect(fb, x, y, w, 1, theme::RULE);
-        render::draw_text_bold(fb, x, y + 8, &section.label, m.body, theme::INK, None);
-    }
-    let mut cy = y + 8;
+    let mut out = Vec::new();
     for (i, line) in section.lines.iter().enumerate() {
         let (size, advance) = if line.kind == LineKind::Note {
             (m.small, m.small_line)
@@ -456,63 +464,170 @@ fn review_section(
             (m.body, m.line)
         };
         let cols = (tw / render::font_width(size)).max(1) as usize;
-        if i > 0 && line.kind == LineKind::Body {
-            cy += 4;
-        }
-        for (j, text) in wrap_lines(&line.text, cols).iter().enumerate() {
-            if paint {
-                match line.kind {
-                    LineKind::Fingerprint if j == 0 && text.starts_with("SHA-256 ") => {
-                        let pw = render::draw_text(fb, tx, cy, "SHA-256 ", size, theme::INK3, None);
-                        render::draw_text(
-                            fb,
-                            tx + pw as i32,
-                            cy,
-                            &text[8..],
-                            size,
-                            theme::INK,
-                            None,
-                        );
-                    }
-                    LineKind::Note => {
-                        render::draw_text(fb, tx, cy, text, size, theme::INK3, None);
-                    }
-                    LineKind::Warn => {
-                        render::draw_text_bold(fb, tx, cy, text, size, theme::WARN, None);
-                    }
-                    _ => {
-                        render::draw_text(fb, tx, cy, text, size, theme::INK, None);
-                    }
-                }
-            }
-            cy += advance as i32;
+        for (j, text) in wrap_lines(&line.text, cols).into_iter().enumerate() {
+            out.push(VLine {
+                kind: line.kind,
+                text,
+                gap: if i > 0 && j == 0 && line.kind == LineKind::Body {
+                    4
+                } else {
+                    0
+                },
+                advance,
+                first: j == 0,
+            });
         }
     }
-    (cy - y) as u32 + 6
+    out
 }
 
-/// Greedy whole-section pages. A section taller than a page gets one alone.
-fn paginate(heights: &[u32], room: u32) -> Vec<(usize, usize)> {
-    let mut pages = Vec::new();
-    let mut start = 0;
-    while start < heights.len() {
-        let mut used = 0;
-        let mut end = start;
-        while end < heights.len() && (end == start || used + heights[end] <= room) {
-            used += heights[end];
-            end += 1;
+fn vlines_height(lines: &[VLine]) -> u32 {
+    lines.iter().map(|l| l.gap + l.advance).sum::<u32>() + SECTION_TOP + SECTION_BOTTOM
+}
+
+fn paint_vlines(
+    fb: &FramebufferConfig,
+    x: i32,
+    y: i32,
+    w: u32,
+    label_w: u32,
+    label: &str,
+    lines: &[VLine],
+) -> u32 {
+    let m = Metrics::for_fb(fb);
+    let tx = x + label_w as i32;
+    render::fill_rect(fb, x, y, w, 1, theme::RULE);
+    render::draw_text_bold(
+        fb,
+        x,
+        y + SECTION_TOP as i32,
+        label,
+        m.body,
+        theme::INK,
+        None,
+    );
+    let mut cy = y + SECTION_TOP as i32;
+    for line in lines {
+        cy += line.gap as i32;
+        let size = if line.kind == LineKind::Note {
+            m.small
+        } else {
+            m.body
+        };
+        match line.kind {
+            LineKind::Fingerprint if line.first && line.text.starts_with("SHA-256 ") => {
+                let pw = render::draw_text(fb, tx, cy, "SHA-256 ", size, theme::INK3, None);
+                render::draw_text(
+                    fb,
+                    tx + pw as i32,
+                    cy,
+                    &line.text[8..],
+                    size,
+                    theme::INK,
+                    None,
+                );
+            }
+            LineKind::Note => {
+                render::draw_text(fb, tx, cy, &line.text, size, theme::INK3, None);
+            }
+            LineKind::Warn => {
+                render::draw_text_bold(fb, tx, cy, &line.text, size, theme::WARN, None);
+            }
+            _ => {
+                render::draw_text(fb, tx, cy, &line.text, size, theme::INK, None);
+            }
         }
-        pages.push((start, end));
-        start = end;
+        cy += line.advance as i32;
     }
-    if pages.is_empty() {
-        pages.push((0, 0));
+    (cy - y) as u32 + SECTION_BOTTOM
+}
+
+/// A page shows, for each listed section, a range of its visual lines.
+type Page = Vec<(usize, core::ops::Range<usize>)>;
+
+/// Whole sections per page where they fit. A section taller than a page is
+/// split between its lines, preferring line-group (fingerprint) boundaries,
+/// so nothing is ever painted outside the list area.
+fn paginate(sections: &[Vec<VLine>], room: u32) -> Vec<Page> {
+    let mut pages: Vec<Page> = Vec::new();
+    let mut page: Page = Vec::new();
+    let mut used = 0;
+    let body_room = room.saturating_sub(SECTION_TOP + SECTION_BOTTOM).max(1);
+    for (s, lines) in sections.iter().enumerate() {
+        let h = vlines_height(lines);
+        if h <= room {
+            if used + h > room && !page.is_empty() {
+                pages.push(core::mem::take(&mut page));
+                used = 0;
+            }
+            page.push((s, 0..lines.len()));
+            used += h;
+            continue;
+        }
+        if !page.is_empty() {
+            pages.push(core::mem::take(&mut page));
+            used = 0;
+        }
+        let mut start = 0;
+        while start < lines.len() {
+            let mut end = start;
+            let mut acc = 0;
+            while end < lines.len() {
+                let line_h = lines[end].gap + lines[end].advance;
+                if end > start && acc + line_h > body_room {
+                    // Prefer not to split a wrapped line group across pages.
+                    let group_start = (start..=end).rev().find(|i| lines[*i].first).unwrap_or(end);
+                    if group_start > start {
+                        end = group_start;
+                    }
+                    break;
+                }
+                acc += line_h;
+                end += 1;
+            }
+            pages.push(alloc::vec![(s, start..end)]);
+            start = end;
+        }
+    }
+    if !page.is_empty() || pages.is_empty() {
+        pages.push(page);
     }
     pages
 }
 
-/// Identity-before-consent review. `intro`/`outro` stay fixed; sections page
-/// by whole blocks. Confirm stays unavailable until every page was shown.
+fn mark_shown(shown: &mut [Vec<bool>], page: &Page) {
+    for (s, range) in page {
+        shown[*s][range.clone()].fill(true);
+    }
+}
+
+/// Indices of pages that still hold a line the user has not seen.
+fn unseen_pages<'a>(pages: &'a [Page], shown: &'a [Vec<bool>]) -> impl Iterator<Item = usize> + 'a {
+    pages
+        .iter()
+        .enumerate()
+        .filter(|(_, p)| p.iter().any(|(s, r)| shown[*s][r.clone()].contains(&false)))
+        .map(|(i, _)| i)
+}
+
+fn block_sections(blocks: &[Block]) -> Vec<ReviewSection> {
+    blocks
+        .iter()
+        .map(|b| match b {
+            Block::Text(t) => ReviewSection::labelled("").line(LineKind::Body, t),
+            Block::Muted(t) => ReviewSection::labelled("").line(LineKind::Body, t),
+            Block::Fact { key, value, .. } => {
+                ReviewSection::labelled(key).line(LineKind::Body, value)
+            }
+            Block::Change { name, from, to } => ReviewSection::labelled(name)
+                .line(LineKind::Body, &alloc::format!("{from} -> {to}")),
+        })
+        .collect()
+}
+
+/// Identity-before-consent review. Normally `intro`/`outro` stay fixed and
+/// sections page by whole blocks; on short screens they join the pages.
+/// Confirm stays unavailable until every line was actually on screen.
 pub fn review(
     fb: &FramebufferConfig,
     backdrop: Backdrop<'_>,
@@ -524,82 +639,115 @@ pub fn review(
 ) -> bool {
     let mut cursor = CursorRenderer::new();
     let mut page = 0usize;
-    let mut seen = 0usize;
     let mut focused = 0usize;
+    // Shown lines per (paged entry, visual line); reset when the layout changes.
+    let mut shown: Vec<Vec<bool>> = Vec::new();
+    let mut layout_key = None;
     loop {
         cursor.hide(fb);
         let m = Metrics::for_fb(fb);
         let w = modal_width(fb, if m.large { 1000 } else { 984 });
         let inner = w - m.pad * 2;
-        let label_w = section_label_width(fb, sections);
-        let measure = |w| -> Vec<u32> {
-            sections
-                .iter()
-                .map(|s| review_section(fb, 0, 0, w, label_w, s, false))
-                .collect()
-        };
-        // Reserve the scroll gutter only when the list actually pages.
-        let mut list_w = inner;
-        let mut heights = measure(list_w);
+        let counter_h = m.small_line + 8;
+        let avail = fb.height.saturating_sub(m.header + m.footer + 16);
         let intro_h = blocks(fb, 0, 0, inner, intro, false);
         let outro_h = blocks(fb, 0, 0, inner, outro, false);
-        let counter_h = m.small_line + 8;
-        let fixed =
-            kit::modal_head_height(fb) + m.gap * 5 + intro_h + outro_h + m.button + counter_h;
-        let avail = fb.height.saturating_sub(m.header + m.footer + 16);
-        let natural: u32 = heights.iter().sum();
+        let base = kit::modal_head_height(fb) + m.gap * 3 + m.button + counter_h;
+        let normal_fixed = base + m.gap * 2 + intro_h + outro_h;
+        let label_w_of = |entries: &[ReviewSection]| section_label_width(fb, entries);
+        let tallest = {
+            let lw = label_w_of(sections);
+            sections
+                .iter()
+                .map(|s| vlines_height(&layout_section(fb, inner - controls::SCROLL_GUTTER, lw, s)))
+                .max()
+                .unwrap_or(0)
+        };
+        // Short screens: page the summary too, rather than squeeze identities.
+        let compact = avail.saturating_sub(normal_fixed) < tallest.max(m.line * 3);
+        let entries: Vec<ReviewSection> = if compact {
+            let mut all = block_sections(intro);
+            all.extend(sections.iter().cloned());
+            all.extend(block_sections(outro));
+            all
+        } else {
+            sections.to_vec()
+        };
+        let fixed = if compact { base } else { normal_fixed };
         let room = avail.saturating_sub(fixed).max(m.line * 3);
+        let label_w = label_w_of(&entries);
+        let lay = |w| -> Vec<Vec<VLine>> {
+            entries
+                .iter()
+                .map(|s| layout_section(fb, w, label_w, s))
+                .collect()
+        };
+        let mut list_w = inner;
+        let mut lines = lay(list_w);
+        let natural: u32 = lines.iter().map(|l| vlines_height(l)).sum();
         if natural > room {
             list_w = inner - controls::SCROLL_GUTTER;
-            heights = measure(list_w);
+            lines = lay(list_w);
         }
-        let natural: u32 = heights.iter().sum();
-        let pages = paginate(&heights, room);
+        let natural: u32 = lines.iter().map(|l| vlines_height(l)).sum();
+        let pages = paginate(&lines, room);
+        if layout_key != Some((m.large, w, compact)) {
+            layout_key = Some((m.large, w, compact));
+            shown = lines.iter().map(|l| alloc::vec![false; l.len()]).collect();
+            page = 0;
+        }
         page = page.min(pages.len() - 1);
-        seen = seen.max(page);
-        let all_seen = seen + 1 >= pages.len();
+        mark_shown(&mut shown, &pages[page]);
+        let unseen = unseen_pages(&pages, &shown).count();
+        let all_seen = unseen == 0;
         let list_h = if pages.len() == 1 { natural } else { room };
         let h = fixed + list_h;
         let rect = center_modal(fb, w, h);
         theme::dimmed(backdrop);
         let body = kit::modal_frame(fb, rect, Tone::Ok, title);
         let mut y = body.1;
-        blocks(fb, body.0, y, inner, intro, true);
-        y += (intro_h + m.gap) as i32;
+        if !compact {
+            blocks(fb, body.0, y, inner, intro, true);
+            y += (intro_h + m.gap) as i32;
+        }
         let list_top = y;
-        let (first, last) = pages[page];
-        for section in &sections[first..last] {
-            y += review_section(fb, body.0, y, list_w, label_w, section, true) as i32;
+        for (s, range) in &pages[page] {
+            y += paint_vlines(
+                fb,
+                body.0,
+                y,
+                list_w,
+                label_w,
+                &entries[*s].label,
+                &lines[*s][range.clone()],
+            ) as i32;
         }
         let list = (body.0, list_top, inner, list_h);
         controls::scrollbar(fb, list, pages.len(), page, 1);
         y = list_top + list_h as i32 + 4;
         render::fill_rect(fb, body.0, y - 4, inner, 1, theme::RULE);
-        let counter = alloc::format!(
-            "{} {} to {} of {}",
-            if sections.len() == 1 { "Item" } else { "Items" },
-            first + usize::from(last > first),
-            last,
-            sections.len()
-        );
+        let counter = if pages.len() > 1 {
+            alloc::format!("Page {} of {}", page + 1, pages.len())
+        } else {
+            alloc::format!(
+                "All {} {} shown",
+                entries.len(),
+                if entries.len() == 1 { "item" } else { "items" }
+            )
+        };
         render::draw_text(fb, body.0, y + 2, &counter, m.small, theme::INK2, None);
         if pages.len() > 1 {
             let hint = if page + 1 < pages.len() {
-                alloc::format!(
-                    "PgDn shows the next {}",
-                    if pages.len() - page - 1 == 1 {
-                        "page"
-                    } else {
-                        "pages"
-                    }
-                )
+                String::from("PgDn shows the next page")
             } else {
-                String::from("PgUp shows earlier items")
+                String::from("PgUp shows earlier pages")
             };
             render::draw_text_right(fb, body.0, y + 2, inner, &hint, m.small, theme::INK3, None);
         }
         y += counter_h as i32 + m.gap as i32 / 2;
-        blocks(fb, body.0, y, inner, outro, true);
+        if !compact {
+            blocks(fb, body.0, y, inner, outro, true);
+        }
         let by = rect.1 + rect.3 as i32 - m.button as i32 - m.gap as i32;
         let choices = match confirm {
             Some(confirm) => alloc::vec![
@@ -620,12 +768,8 @@ pub fn review(
         if !all_seen && confirm.is_some() {
             let note = alloc::format!(
                 "Review {} more {} first",
-                pages.len() - seen - 1,
-                if pages.len() - seen - 1 == 1 {
-                    "page"
-                } else {
-                    "pages"
-                }
+                unseen,
+                if unseen == 1 { "page" } else { "pages" }
             );
             render::draw_text_right(
                 fb,
@@ -649,8 +793,8 @@ pub fn review(
         );
         let mut hover = super::Hover::default();
         loop {
-            super::track_hover(fb, &mut cursor, &mut hover, None);
             super::poll_and_render_cursor(fb, &mut cursor);
+            super::track_hover(fb, &mut cursor, &mut hover, None);
             if let Some(key) = menu_common::read_key() {
                 let activation = match key {
                     KeyPress::Escape => {
@@ -705,9 +849,10 @@ pub fn review(
                         cursor.hide(fb);
                         return false;
                     }
-                    // Unseen identities: confirm advances instead of committing.
+                    // Unseen identities: confirm moves to the first page that
+                    // still has unseen lines instead of committing.
                     Some(_) if !all_seen => {
-                        page = (page + 1).min(pages.len() - 1);
+                        page = unseen_pages(&pages, &shown).next().unwrap_or(page);
                         break;
                     }
                     Some(_) => {
@@ -1411,17 +1556,88 @@ mod tests {
         );
         assert_eq!(wrap_lines("A\n\nB", 40), ["A", "", "B"]);
     }
+    /// A section of `groups` line groups, each `per` wrapped lines of 20 px.
+    fn section(groups: usize, per: usize) -> Vec<VLine> {
+        (0..groups)
+            .flat_map(|g| {
+                (0..per).map(move |j| VLine {
+                    kind: LineKind::Body,
+                    text: String::new(),
+                    gap: 0,
+                    advance: 20,
+                    first: j == 0,
+                })
+            })
+            .collect()
+    }
+    fn page_height(sections: &[Vec<VLine>], page: &Page) -> u32 {
+        page.iter()
+            .map(|(s, r)| vlines_height(&sections[*s][r.clone()]))
+            .sum()
+    }
+
     #[test]
     fn identities_page_as_whole_blocks() {
-        // Heights of six identity blocks; a page holds about two and a half.
-        let heights = [80, 80, 40, 80, 80, 200];
-        let pages = paginate(&heights, 190);
-        assert_eq!(pages, [(0, 2), (2, 4), (4, 5), (5, 6)]);
-        for (a, b) in &pages {
-            assert!(b > a, "every page shows at least one whole block");
+        // Section heights: 3 lines = 74 px, 1 line = 34 px.
+        let sections = [section(3, 1), section(3, 1), section(1, 1), section(3, 1)];
+        let pages = paginate(&sections, 190);
+        assert_eq!(pages.len(), 2);
+        for page in &pages {
+            for (s, r) in page {
+                assert_eq!(
+                    r.clone(),
+                    0..sections[*s].len(),
+                    "whole blocks when they fit"
+                );
+            }
+            assert!(page_height(&sections, page) <= 190);
         }
-        assert_eq!(paginate(&heights, 10_000), [(0, 6)]);
-        assert_eq!(paginate(&[], 100), [(0, 0)]);
+        assert_eq!(paginate(&sections, 10_000).len(), 1);
+        assert_eq!(paginate(&[], 100).len(), 1);
+    }
+
+    #[test]
+    fn oversized_blocks_split_between_lines_and_never_overflow() {
+        // A 2-line fingerprint group must not be split when the page can hold it.
+        let sections = [section(1, 1), section(6, 2)];
+        let room = 110;
+        let pages = paginate(&sections, room);
+        let mut covered = std::vec![std::vec![0; 1], std::vec![0; 12]];
+        for page in &pages {
+            assert!(
+                page_height(&sections, page) <= room,
+                "nothing painted outside"
+            );
+            for (s, r) in page {
+                for i in r.clone() {
+                    covered[*s][i] += 1;
+                }
+                if *s == 1 {
+                    assert!(
+                        sections[1][r.start].first,
+                        "pages start at a group boundary"
+                    );
+                }
+            }
+        }
+        assert!(
+            covered.iter().flatten().all(|n| *n == 1),
+            "every line exactly once"
+        );
+    }
+
+    #[test]
+    fn jumping_to_the_last_page_does_not_count_as_review() {
+        let sections = [section(4, 1), section(4, 1), section(4, 1)];
+        let pages = paginate(&sections, 100);
+        assert_eq!(pages.len(), 3);
+        let mut shown: Vec<Vec<bool>> =
+            sections.iter().map(|s| std::vec![false; s.len()]).collect();
+        mark_shown(&mut shown, &pages[0]);
+        mark_shown(&mut shown, &pages[2]); // End
+        assert_eq!(unseen_pages(&pages, &shown).collect::<Vec<_>>(), [1]);
+        mark_shown(&mut shown, &pages[1]);
+        assert_eq!(unseen_pages(&pages, &shown).count(), 0);
     }
     #[test]
     fn editor_focus_describes_the_actual_field_and_actions() {

@@ -19,6 +19,8 @@ pub(super) struct GraphicalState {
     pub(super) hovered: Option<usize>,
     /// FormHeader item index of the section row under the pointer.
     pub(super) hovered_section: Option<usize>,
+    /// First visible row of the Sections list.
+    pub(super) section_offset: usize,
     pub(super) scroll_offset: usize,
     pub(super) status_message: Option<(&'static str, bool)>,
     pub(super) save_result: Option<(usize, usize)>,
@@ -34,6 +36,7 @@ impl GraphicalState {
             selected,
             hovered: None,
             hovered_section: None,
+            section_offset: 0,
             scroll_offset: 0,
             status_message: None,
             save_result: None,
@@ -137,6 +140,7 @@ struct FwLayout {
     strip: Rect,
     sections: Rect,
     sec_rows_y: i32,
+    sec_slots: usize,
     options: Rect,
     rows_y: i32,
     slots: usize,
@@ -163,6 +167,7 @@ fn fw_layout(fb: &FramebufferInfo) -> FwLayout {
         strip,
         sections: (cx, top, sw, (bottom - top) as u32),
         sec_rows_y: top + title_h as i32,
+        sec_slots: (((bottom - top - title_h as i32).max(0) as u32) / m.row).max(1) as usize,
         options: (ox, top, ow, (bottom - top) as u32),
         rows_y,
         slots: (((bottom - rows_y).max(0) as u32) / m.row).max(1) as usize,
@@ -184,6 +189,11 @@ fn keep_graphical_selection_visible(
     {
         state.selected = first;
     }
+    let l = fw_layout(fb);
+    let sections = visible_sections(cfr, items).len();
+    state.section_offset = state
+        .section_offset
+        .min(sections.saturating_sub(l.sec_slots));
     let pos = rows.iter().position(|i| *i == state.selected).unwrap_or(0);
     controls::ensure_visible(
         &mut state.scroll_offset,
@@ -376,6 +386,40 @@ fn actions(
 
 // ─── Painting ───────────────────────────────────────────────────────────
 
+/// Row of the `pos`-th visible section, if it is inside the viewport.
+fn section_rect(
+    fb: &FramebufferInfo,
+    l: &FwLayout,
+    state: &GraphicalState,
+    pos: usize,
+    total: usize,
+) -> Option<Rect> {
+    let m = Metrics::for_fb(fb);
+    if pos < state.section_offset || pos >= state.section_offset + l.sec_slots {
+        return None;
+    }
+    let gutter = if total > l.sec_slots {
+        controls::SCROLL_GUTTER
+    } else {
+        0
+    };
+    Some((
+        l.sections.0,
+        l.sec_rows_y + ((pos - state.section_offset) as u32 * m.row) as i32,
+        l.sections.2 - gutter,
+        m.row,
+    ))
+}
+
+fn sections_area(fb: &FramebufferInfo, l: &FwLayout) -> Rect {
+    (
+        l.sections.0,
+        l.sec_rows_y,
+        l.sections.2,
+        l.sec_slots as u32 * Metrics::for_fb(fb).row,
+    )
+}
+
 fn paint_section_row(
     fb: &FramebufferInfo,
     l: &FwLayout,
@@ -385,16 +429,10 @@ fn paint_section_row(
     pos: usize,
     header: usize,
 ) {
-    let m = Metrics::for_fb(fb);
-    let rect = (
-        l.sections.0,
-        l.sec_rows_y + (pos as u32 * m.row) as i32,
-        l.sections.2,
-        m.row,
-    );
-    if rect.1 + rect.3 as i32 > l.sections.1 + l.sections.3 as i32 {
+    let Some(rect) = section_rect(fb, l, state, pos, visible_sections(cfr, items).len()) else {
         return;
-    }
+    };
+    let m = Metrics::for_fb(fb);
     let rows = section_rows(cfr, items, header);
     let count = rows.iter().filter(|i| is_selectable(&items[**i])).count();
     let dirty = rows.iter().any(|i| is_changed(&items[*i]));
@@ -915,9 +953,22 @@ fn draw_graphical_menu(
     // Sections column.
     let (sx, sy, sw, _) = l.sections;
     kit::pane_title(fb, sx, sy, sw, "Sections", "", false);
-    for (pos, header) in visible_sections(cfr, items).into_iter().enumerate() {
-        paint_section_row(fb, &l, cfr, items, state, pos, header);
+    let sections = visible_sections(cfr, items);
+    for (pos, header) in sections
+        .iter()
+        .enumerate()
+        .skip(state.section_offset)
+        .take(l.sec_slots)
+    {
+        paint_section_row(fb, &l, cfr, items, state, pos, *header);
     }
+    controls::scrollbar(
+        fb,
+        sections_area(fb, &l),
+        sections.len(),
+        state.section_offset,
+        l.sec_slots,
+    );
 
     // Options ledger.
     let rows = section_rows(cfr, items, state.section);
@@ -1040,30 +1091,46 @@ fn hovered_item(
         .filter(|i| is_selectable(&items[*i]))
 }
 
+/// Same geometry as painting: only rows inside the Sections viewport hit.
 fn section_hit(
     cfr: &CfrInfo,
     items: &[MenuItem],
+    state: &GraphicalState,
     fb: &FramebufferInfo,
     x: i32,
     y: i32,
 ) -> Option<usize> {
-    let m = Metrics::for_fb(fb);
     let l = fw_layout(fb);
-    let (sx, _, sw, _) = l.sections;
-    if x < sx || x >= sx + sw as i32 || y < l.sec_rows_y {
-        return None;
-    }
-    visible_sections(cfr, items)
-        .get(((y - l.sec_rows_y) as u32 / m.row) as usize)
-        .copied()
+    let sections = visible_sections(cfr, items);
+    (state.section_offset..(state.section_offset + l.sec_slots).min(sections.len()))
+        .find(|pos| {
+            section_rect(fb, &l, state, *pos, sections.len())
+                .is_some_and(|r| dialog::contains(r, x, y))
+        })
+        .map(|pos| sections[pos])
 }
 
-fn open_section(cfr: &CfrInfo, items: &[MenuItem], state: &mut GraphicalState, header: usize) {
+fn open_section(
+    cfr: &CfrInfo,
+    items: &[MenuItem],
+    state: &mut GraphicalState,
+    fb: &FramebufferInfo,
+    header: usize,
+) {
     if state.section != header {
         state.section = header;
         state.scroll_offset = 0;
         let rows = section_rows(cfr, items, header);
         state.selected = first_selectable(items, &rows).unwrap_or(header);
+    }
+    let sections = visible_sections(cfr, items);
+    if let Some(pos) = sections.iter().position(|h| *h == header) {
+        controls::ensure_visible(
+            &mut state.section_offset,
+            pos,
+            sections.len(),
+            fw_layout(fb).sec_slots,
+        );
     }
 }
 
@@ -1088,7 +1155,7 @@ pub(super) fn show_cfr_menu_graphical(cfr_info: &CfrInfo, fb: &FramebufferInfo) 
             Some((NavItem::Firmware, &state.focus)),
         );
         let (mx, my) = crate::drivers::mouse_cursor::position();
-        let section = section_hit(cfr_info, &items, fb, mx, my);
+        let section = section_hit(cfr_info, &items, &state, fb, mx, my);
         if section != state.hovered_section {
             let previous = core::mem::replace(&mut state.hovered_section, section);
             cursor.while_hidden(fb, || {
@@ -1172,12 +1239,12 @@ pub(super) fn show_cfr_menu_graphical(cfr_info: &CfrInfo, fb: &FramebufferInfo) 
                 match key {
                     KeyPress::Up | KeyPress::Char('k') => {
                         let header = sections[pos.saturating_sub(1)];
-                        open_section(cfr_info, &items, &mut state, header);
+                        open_section(cfr_info, &items, &mut state, fb, header);
                         key = KeyPress::Char('\0');
                     }
                     KeyPress::Down | KeyPress::Char('j') => {
                         let header = sections[(pos + 1).min(sections.len() - 1)];
-                        open_section(cfr_info, &items, &mut state, header);
+                        open_section(cfr_info, &items, &mut state, fb, header);
                         key = KeyPress::Char('\0');
                     }
                     KeyPress::Enter | KeyPress::Char(' ') | KeyPress::Right => {
@@ -1342,8 +1409,16 @@ pub(super) fn show_cfr_menu_graphical(cfr_info: &CfrInfo, fb: &FramebufferInfo) 
                                 ui::confirm_reset(fb, &backdrop);
                             }
                         }
-                    } else if let Some(header) = section_hit(cfr_info, &items, fb, x, y) {
-                        open_section(cfr_info, &items, &mut state, header);
+                    } else if controls::scroll_track(
+                        &mut state.section_offset,
+                        sections_area(fb, &l),
+                        (x, y),
+                        visible_sections(cfr_info, &items).len(),
+                        l.sec_slots,
+                    ) {
+                        viewport_only = true;
+                    } else if let Some(header) = section_hit(cfr_info, &items, &state, fb, x, y) {
+                        open_section(cfr_info, &items, &mut state, fb, header);
                         state.focus.group = Group::Sections;
                     } else if let Some(item_idx) = hovered_item(cfr_info, &items, &state, fb) {
                         state.selected = item_idx;
@@ -1366,7 +1441,7 @@ pub(super) fn show_cfr_menu_graphical(cfr_info: &CfrInfo, fb: &FramebufferInfo) 
             if !sections.contains(&state.section)
                 && let Some(first) = sections.first()
             {
-                open_section(cfr_info, &items, &mut state, *first);
+                open_section(cfr_info, &items, &mut state, fb, *first);
             }
             if !viewport_only {
                 keep_graphical_selection_visible(cfr_info, &items, &mut state, fb);
@@ -2250,6 +2325,52 @@ mod graphical_tests {
             assert_eq!(section_rows(&cfr, &items, header).len(), 10);
         }
         assert_eq!(STORE.hidden_reads.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn far_sections_scroll_into_view_and_hit_where_painted() {
+        let forms: Vec<CfrForm> = (0..20)
+            .map(|i| CfrForm {
+                object_id: 1000 + i,
+                dependency_id: 0,
+                ui_name: alloc::format!("Section {i}"),
+                flags: 0,
+                options: alloc::vec![option(2000 + i)],
+                dep_values: Vec::new(),
+            })
+            .collect();
+        let cfr = CfrInfo { version: 0, forms };
+        let mut items = Vec::new();
+        for (f, form) in cfr.forms.iter().enumerate() {
+            items.push(MenuItem::FormHeader {
+                name: form.ui_name.clone(),
+            });
+            items.push(MenuItem::Option {
+                form_idx: f,
+                option_idx: 0,
+                current_value: CfrValue::Bool(false),
+                original_value: CfrValue::Bool(false),
+            });
+        }
+        let fb = framebuffer(&mut [], 640, 400);
+        let l = fw_layout(&fb);
+        let sections = visible_sections(&cfr, &items);
+        assert!(sections.len() > l.sec_slots, "fixture must overflow");
+        let mut state = GraphicalState::new(1);
+        let last = *sections.last().unwrap();
+        open_section(&cfr, &items, &mut state, &fb, last);
+        assert!(state.section_offset > 0);
+        let rect = section_rect(&fb, &l, &state, sections.len() - 1, sections.len())
+            .expect("selected section is visible");
+        assert!(rect.1 + rect.3 as i32 <= l.sections.1 + l.sections.3 as i32);
+        assert_eq!(
+            section_hit(&cfr, &items, &state, &fb, rect.0 + 10, rect.1 + 5),
+            Some(last)
+        );
+        assert_eq!(
+            section_hit(&cfr, &items, &state, &fb, rect.0 + 10, l.sec_rows_y - 2),
+            None
+        );
     }
 
     #[test]

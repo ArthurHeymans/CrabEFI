@@ -1029,7 +1029,9 @@ fn paint_code_box(fb: &FramebufferInfo, area: (i32, i32, u32), text: &str, max_y
     render::draw_border(fb, x, y, w, h, theme::RULE);
     for (i, line) in lines.iter().take(shown).enumerate() {
         let line = if i + 1 == shown && lines.len() > shown {
-            alloc::format!("{}...", &line[..line.len().min(cols.saturating_sub(3))])
+            // Character columns, never byte offsets: BLS options are arbitrary UTF-8.
+            let kept: String = line.chars().take(cols.saturating_sub(3)).collect();
+            alloc::format!("{kept}...")
         } else {
             line.clone()
         };
@@ -1538,6 +1540,23 @@ mod tests {
         let mut expected = std::vec![0; pixels.len()];
         paint_boot(&framebuffer(&mut expected, width, height), &menu, &state);
         assert!(pixels == expected);
+    }
+
+    #[test]
+    fn long_multibyte_command_lines_paint_without_splitting_characters() {
+        let (width, height) = (1024, 768);
+        let mut pixels = std::vec![0; width as usize * height as usize];
+        let fb = framebuffer(&mut pixels, width, height);
+        let mut menu = boot_menu(1);
+        let mut cmdline = heapless::String::<512>::new();
+        while cmdline.push_str("é ünïcødé ").is_ok() {}
+        menu.entries[0].kind = BootEntryKind::BlsLinux {
+            linux_path: heapless::String::new(),
+            initrd_paths: heapless::Vec::new(),
+            cmdline,
+        };
+        let state = BState::new(1, 0, 0);
+        paint_boot(&fb, &menu, &state);
     }
 
     #[test]

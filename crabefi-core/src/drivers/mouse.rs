@@ -135,6 +135,9 @@ struct MouseState {
     /// one device's packets cannot release the other's held button.
     stick_buttons: u32,
     pad_buttons: u32,
+    /// Synaptics ClickPad (ext. capability 0x0c bit 20): the pad itself is
+    /// the primary button and reports through the "middle" bit.
+    clickpad: bool,
     data_port: PortReadWrite8<()>,
     status_port: PortAliased8<Status::Register, ()>,
     // Synaptics absolute → relative state
@@ -181,6 +184,7 @@ impl MouseState {
             pressed: 0,
             stick_buttons: 0,
             pad_buttons: 0,
+            clickpad: false,
             data_port: PortReadWrite8::new(ports::DATA),
             status_port: PortAliased8::new(ports::STATUS_CMD),
             syn_prev_x: 0,
@@ -264,7 +268,7 @@ impl MouseState {
     /// Capability query (`SYN_QUE_CAPABILITIES = 0x02`):
     ///   sliced_cmd(0x02)  +  STATUS_REQUEST → read 3 bytes.
     ///   Byte[0] bit 5 = pass-through port present.
-    fn detect_synaptics(&self) -> Option<bool> {
+    fn detect_synaptics(&mut self) -> Option<bool> {
         // ── Identify ──────────────────────────────────────────────────────────
         if !self.synaptics_sliced_cmd(0x00) {
             return None;
@@ -292,11 +296,23 @@ impl MouseState {
         }
         let cap = self.read_aux_bytes::<3>()?;
         let has_pt = (cap[0] & SYN_CAP_PASS_THROUGH_BIT) != 0;
+        // Extended capability 0x0c, when at least four extended queries are
+        // supported (SYN_EXT_CAP_REQUESTS >= 4): bit 20 = 1-button ClickPad.
+        // Reference: `synaptics_capability()` and SYN_CAP_CLICKPAD in Linux.
+        self.clickpad = false;
+        if (cap[0] & 0x70) >> 4 >= 4
+            && self.synaptics_sliced_cmd(0x0c)
+            && self.send_mouse_byte(mouse_cmd::STATUS_REQUEST)
+            && let Some(ext) = self.read_aux_bytes::<3>()
+        {
+            self.clickpad = ext[0] & 0x10 != 0;
+        }
         log::info!(
-            "Synaptics caps={:#010b} ext={:#x} pass-through={}",
+            "Synaptics caps={:#010b} ext={:#x} pass-through={} clickpad={}",
             cap[0],
             cap[1],
-            has_pt
+            has_pt,
+            self.clickpad
         );
         Some(has_pt)
     }
@@ -494,11 +510,12 @@ impl MouseState {
             (((buf[3] as u32 & 0x20) << 7) | ((buf[1] as u32 & 0xf0) << 4) | buf[5] as u32) as i32;
         let z = buf[2] as i32;
 
-        // Buttons (left = bit 0, right = bit 1 of byte 0). A ClickPad press is
-        // the "middle" bit: byte 0 and byte 3 disagree in bit 0. It is the
-        // pad's primary button, so report it as left (as Linux does).
-        let clickpad = ((buf[0] ^ buf[3]) & 0x01) as u32;
-        self.pad_buttons = (buf[0] & 0x03) as u32 | clickpad;
+        // Buttons (left = bit 0, right = bit 1 of byte 0). Byte 0 and byte 3
+        // disagreeing in bit 0 is the "middle" button; on a ClickPad that is
+        // the pad's primary button, so it is reported as left (as Linux does).
+        let middle = ((buf[0] ^ buf[3]) & 0x01) as u32;
+        let extra = if self.clickpad { middle } else { middle << 2 };
+        self.pad_buttons = (buf[0] & 0x03) as u32 | extra;
         self.set_buttons(self.stick_buttons | self.pad_buttons);
 
         if z > SYN_Z_THRESHOLD && self.syn_prev_z > SYN_Z_THRESHOLD {
@@ -698,10 +715,19 @@ mod click_tests {
     fn clickpad_press_is_a_left_click() {
         let mut mouse = MouseState::new();
         mouse.protocol = MouseProtocol::SynapticsAbsolute;
+        mouse.clickpad = true;
         // ClickPad: bit 0 of byte 0 and byte 3 differ while pressed.
         feed(&mut mouse, &[0x81, 0, 0, 0xc0, 0, 0]);
         assert_eq!(mouse.take_buttons() & 1, 1);
         feed(&mut mouse, &[0x80, 0, 0, 0xc0, 0, 0]);
         assert_eq!(mouse.take_buttons() & 1, 0);
+    }
+
+    #[test]
+    fn middle_button_on_other_touchpads_is_not_a_left_click() {
+        let mut mouse = MouseState::new();
+        mouse.protocol = MouseProtocol::SynapticsAbsolute;
+        feed(&mut mouse, &[0x80, 0, 0, 0xc1, 0, 0]);
+        assert_eq!(mouse.take_buttons(), 4, "reported as middle, not left");
     }
 }
