@@ -130,6 +130,31 @@ pub fn wrapped(fb: &FramebufferConfig, rect: Rect, text: &str, color: render::Rg
     }
 }
 
+/// Keep every line of a long trust preview reachable, including on short
+/// displays. Reserve two lines for the page hint and its word wrapping.
+fn confirmation_pages(message: &str, width: u32, canvas_h: u32) -> alloc::vec::Vec<String> {
+    let columns = (width.saturating_sub(40) / render::font_width(FontSize::Small)) as usize;
+    let lines = wrap_lines(message, columns);
+    let slots = (canvas_h.saturating_sub(132) / 20).max(1) as usize;
+    if lines.len() <= slots {
+        return alloc::vec![String::from(message)];
+    }
+    let per_page = slots.saturating_sub(2).max(1);
+    let count = lines.len().div_ceil(per_page);
+    lines
+        .chunks(per_page)
+        .enumerate()
+        .map(|(i, lines)| {
+            alloc::format!(
+                "{} [Page {}/{}: PgUp/PgDn or wheel]",
+                lines.join(" "),
+                i + 1,
+                count
+            )
+        })
+        .collect()
+}
+
 /// Choice 0 must be the non-destructive default. Escape always returns 0.
 pub fn choose(
     fb: &FramebufferConfig,
@@ -141,9 +166,12 @@ pub fn choose(
     assert!(!labels.is_empty() && labels.len() <= 3);
     let mut cursor = CursorRenderer::new();
     let mut selected = 0;
+    let (_, _, cw, ch) = canvas(fb);
+    let pages = confirmation_pages(message, cw.min(600), ch);
+    let mut page = 0usize;
     loop {
         cursor.hide(fb);
-        let (x, y, w, h) = surface(fb, nav, title, message, 0);
+        let (x, y, w, h) = surface(fb, nav, title, &pages[page], 0);
         let bw = (w - 40 - (labels.len() as u32 - 1) * 8) / labels.len() as u32;
         let rects: alloc::vec::Vec<_> = labels
             .iter()
@@ -170,6 +198,33 @@ pub fn choose(
                     KeyPress::Enter => {
                         cursor.hide(fb);
                         return selected;
+                    }
+                    KeyPress::PageUp | KeyPress::Home => {
+                        page = if key == KeyPress::Home {
+                            0
+                        } else {
+                            page.saturating_sub(1)
+                        };
+                        selected = 0;
+                        break;
+                    }
+                    KeyPress::PageDown | KeyPress::End => {
+                        page = if key == KeyPress::End {
+                            pages.len() - 1
+                        } else {
+                            (page + 1).min(pages.len() - 1)
+                        };
+                        selected = 0;
+                        break;
+                    }
+                    KeyPress::MouseScroll(dz) => {
+                        page = if dz > 0 {
+                            (page + 1).min(pages.len() - 1)
+                        } else {
+                            page.saturating_sub(1)
+                        };
+                        selected = 0;
+                        break;
                     }
                     KeyPress::Left | KeyPress::Up => {
                         selected = (selected + labels.len() - 1) % labels.len();
@@ -435,6 +490,32 @@ pub fn input(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn short_displays_can_read_every_preview_line() {
+        let message = alloc::format!(
+            "{} PK {} KEK {} db {}",
+            "Review identities. ".repeat(20),
+            "a1b2c3d4 ".repeat(8),
+            "11223344 ".repeat(8),
+            "ffeeddcc ".repeat(8)
+        );
+        let pages = confirmation_pages(&message, 440, 292);
+        assert!(pages.len() > 1);
+        let combined = pages.join(" ");
+        for identity in ["a1b2c3d4", "11223344", "ffeeddcc"] {
+            assert_eq!(combined.matches(identity).count(), 8);
+        }
+        for page in pages {
+            assert!(
+                wrap_lines(&page, 400 / render::font_width(FontSize::Small) as usize).len() <= 8
+            );
+        }
+        assert_eq!(
+            confirmation_pages("Short confirmation", 440, 292),
+            alloc::vec![String::from("Short confirmation")]
+        );
+    }
 
     #[test]
     fn wrapping_bounds_long_words_and_unicode() {

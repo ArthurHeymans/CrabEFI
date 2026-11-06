@@ -250,7 +250,7 @@ pub(crate) fn refresh_key_databases() {
     refresh_key_databases_with_force(false);
 }
 
-fn force_refresh_key_databases() {
+pub(crate) fn force_refresh_key_databases() {
     refresh_key_databases_with_force(true);
 }
 
@@ -273,13 +273,17 @@ fn get_variable_data(guid: &Guid, name: &[u16]) -> Option<Vec<u8>> {
 /// Authentication preflight must not use verification-cache timestamps: those
 /// intentionally are not refreshed on every write and are cleared with keys.
 /// The persistence facade includes active zero-length deletion-history records.
-pub(crate) fn dbx_replay_floor() -> EfiTime {
+pub(crate) fn dbx_replay_floor() -> Result<EfiTime, AuthError> {
     let cached = *dbx_database().timestamp();
-    let persisted = get_variable_timestamp(
+    let persisted = crate::efi::varstore::persistence::try_get_variable_timestamp(
         &Guid::from_bytes(&EFI_IMAGE_SECURITY_DATABASE_GUID),
         DBX_NAME,
-    );
-    replay_floor(cached, persisted)
+    )
+    .map_err(|_| {
+        log::error!("Cannot determine the persisted dbx replay floor");
+        AuthError::AccessDenied
+    })?;
+    Ok(replay_floor(cached, persisted))
 }
 
 fn replay_floor(cached: EfiTime, persisted: Option<VariableTimestamp>) -> EfiTime {
@@ -490,7 +494,10 @@ fn efi_time_from_unix(seconds: i64) -> EfiTime {
 ///
 /// The write carries [`next_firmware_timestamp`], so it passes the same
 /// monotonic timestamp check as any other authenticated update.
-fn persist_key_variable(var_type: SecureBootVariable, data: &[u8]) -> Result<(), AuthError> {
+pub(crate) fn persist_key_variable(
+    var_type: SecureBootVariable,
+    data: &[u8],
+) -> Result<(), AuthError> {
     let (guid, name) = match var_type {
         SecureBootVariable::PK => (Guid::from_bytes(&EFI_GLOBAL_VARIABLE_GUID), PK_NAME),
         SecureBootVariable::Kek => (Guid::from_bytes(&EFI_GLOBAL_VARIABLE_GUID), KEK_NAME),
@@ -567,6 +574,22 @@ pub fn get_enrollment_summary() -> (usize, usize, usize, usize) {
     let db_count = db_database().len();
     let dbx_count = dbx_database().len();
     (pk_count, kek_count, db_count, dbx_count)
+}
+
+/// Recovery must remain available even when a stored database cannot be parsed.
+#[cfg(feature = "ui")]
+pub(crate) fn has_stored_keys() -> bool {
+    [
+        SecureBootVariable::PK,
+        SecureBootVariable::Kek,
+        SecureBootVariable::Db,
+        SecureBootVariable::Dbx,
+    ]
+    .iter()
+    .any(|variable| {
+        get_variable_data(&Guid::from_bytes(variable.guid()), variable.name())
+            .is_some_and(|data| !data.is_empty())
+    })
 }
 
 /// Clear all Secure Boot keys and return to Setup Mode

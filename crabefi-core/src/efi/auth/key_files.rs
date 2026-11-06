@@ -159,6 +159,9 @@ pub(crate) fn validate_key_files(result: &KeyFileSearchResult) -> Result<(), Aut
 
 /// Enroll exactly the owned bytes previewed by the user, without reopening ESP files.
 pub(crate) fn enroll_key_files(result: KeyFileSearchResult) -> Result<&'static str, AuthError> {
+    if !super::is_setup_mode() {
+        return Err(AuthError::AccessDenied);
+    }
     validate_key_files(&result)?;
     let pk_data = result.pk.ok_or_else(|| {
         log::warn!("No PK certificate found (looked for EFI\\keys\\PK.cer)");
@@ -171,50 +174,57 @@ pub(crate) fn enroll_key_files(result: KeyFileSearchResult) -> Result<&'static s
         result.source
     );
 
-    // All supplied certificates were validated before any cache mutation.
-    // Clear existing keys first
-    {
-        let mut pk_db = super::variables::pk_database();
-        pk_db.clear();
-    }
-    {
-        let mut kek_db = super::variables::kek_database();
-        kek_db.clear();
-    }
-    {
-        let mut db_db = super::variables::db_database();
-        db_db.clear();
-    }
+    // Always reconcile disposable drafts with the authoritative store, including
+    // after a partial enrollment or an allocation/persistence failure.
+    let enrollment = (|| {
+        // All supplied certificates were validated before any cache mutation.
+        // Clear existing keys first
+        {
+            let mut pk_db = super::variables::pk_database();
+            pk_db.clear();
+        }
+        {
+            let mut kek_db = super::variables::kek_database();
+            kek_db.clear();
+        }
+        {
+            let mut db_db = super::variables::db_database();
+            db_db.clear();
+        }
 
-    // Enroll Microsoft db certificates for shim/GRUB compatibility
-    enrollment::enroll_microsoft_uefi_ca_db()?;
-    log::info!("Enrolled Microsoft UEFI CA for shim/GRUB compatibility");
+        // Enroll Microsoft db certificates for shim/GRUB compatibility
+        enrollment::enroll_microsoft_uefi_ca_db()?;
+        log::info!("Enrolled Microsoft UEFI CA for shim/GRUB compatibility");
 
-    // Enroll custom KEK if found, otherwise use the custom PK as KEK too
-    if let Some(kek_data) = result.kek {
-        log::info!("Found custom KEK certificate ({} bytes)", kek_data.len());
-        enrollment::enroll_kek(&kek_data, &USER_OWNER_GUID)?;
-    } else {
-        // Use the PK as KEK (common for self-managed systems)
-        enrollment::enroll_kek(&pk_data, &USER_OWNER_GUID)?;
-        log::info!("Using custom PK as KEK");
-    }
+        // Enroll custom KEK if found, otherwise use the custom PK as KEK too
+        if let Some(kek_data) = result.kek {
+            log::info!("Found custom KEK certificate ({} bytes)", kek_data.len());
+            enrollment::enroll_kek(&kek_data, &USER_OWNER_GUID)?;
+        } else {
+            // Use the PK as KEK (common for self-managed systems)
+            enrollment::enroll_kek(&pk_data, &USER_OWNER_GUID)?;
+            log::info!("Using custom PK as KEK");
+        }
 
-    // Enroll custom db certificate if found
-    if let Some(db_data) = result.db {
-        log::info!("Found custom db certificate ({} bytes)", db_data.len());
-        enrollment::enroll_db_certificate(&db_data, &USER_OWNER_GUID)?;
-    }
+        // Enroll custom db certificate if found
+        if let Some(db_data) = result.db {
+            log::info!("Found custom db certificate ({} bytes)", db_data.len());
+            enrollment::enroll_db_certificate(&db_data, &USER_OWNER_GUID)?;
+        }
 
-    // Enroll the custom PK
-    enrollment::enroll_pk(&pk_data, &USER_OWNER_GUID)?;
+        // Enroll the custom PK
+        enrollment::enroll_pk(&pk_data, &USER_OWNER_GUID)?;
 
-    // Enter User Mode
-    enter_user_mode();
+        // Enter User Mode
+        enter_user_mode();
 
-    // Persist all key databases
-    super::boot::persist_key_databases()?;
-    super::boot::update_status_variables()?;
+        // Persist all key databases
+        super::boot::persist_key_databases()?;
+        super::boot::update_status_variables()?;
+        Ok::<(), AuthError>(())
+    })();
+    super::boot::force_refresh_key_databases();
+    enrollment?;
 
     log::info!("Custom PK enrolled successfully from {}", result.source);
     Ok(result.source)

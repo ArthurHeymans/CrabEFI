@@ -6,7 +6,7 @@
 use crate::drivers::keyboard_common as keyboard;
 use crate::drivers::serial as serial_driver;
 use crate::framebuffer_console::{Color, FramebufferConsole, TITLE_COLOR};
-use crate::time::delay_ms;
+use crate::time::{Timeout, delay_ms};
 use core::fmt::Write;
 
 /// Key press types for menu navigation
@@ -72,44 +72,164 @@ pub fn read_key() -> Option<KeyPress> {
         }
     }
 
-    // Try serial input
-    if let Some(byte) = serial_driver::try_read() {
-        return match byte {
-            0x1B => {
-                // Escape - check for escape sequence
-                delay_ms(10);
-                if let Some(b'[') = serial_driver::try_read() {
-                    match serial_driver::try_read() {
-                        Some(b'A') => Some(KeyPress::Up),
-                        Some(b'B') => Some(KeyPress::Down),
-                        Some(b'C') => Some(KeyPress::Right),
-                        Some(b'D') => Some(KeyPress::Left),
-                        Some(b'H') => Some(KeyPress::Home),
-                        Some(b'F') => Some(KeyPress::End),
-                        Some(code @ (b'1' | b'4' | b'5' | b'6' | b'7' | b'8')) => {
-                            if serial_driver::try_read() == Some(b'~') {
-                                Some(match code {
-                                    b'1' | b'7' => KeyPress::Home,
-                                    b'4' | b'8' => KeyPress::End,
-                                    b'5' => KeyPress::PageUp,
-                                    _ => KeyPress::PageDown,
-                                })
-                            } else {
-                                None
-                            }
-                        }
-                        _ => Some(KeyPress::Escape),
-                    }
-                } else {
-                    Some(KeyPress::Escape)
-                }
-            }
-            b'\r' | b'\n' => Some(KeyPress::Enter),
-            c => Some(KeyPress::Char(c as char)),
-        };
+    read_serial_key()
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SerialState {
+    Ground,
+    Escape,
+    Csi,
+    Ss3,
+}
+
+/// Retain incomplete escape sequences across polls. Unsupported sequences are
+/// consumed through their final byte, never replayed as command/editor input.
+struct SerialKeyParser {
+    state: SerialState,
+    primary: u16,
+    first_parameter: bool,
+    pending: Option<u8>,
+}
+
+impl SerialKeyParser {
+    const fn new() -> Self {
+        Self {
+            state: SerialState::Ground,
+            primary: 0,
+            first_parameter: true,
+            pending: None,
+        }
     }
 
+    fn feed(&mut self, byte: u8) -> Option<KeyPress> {
+        match self.state {
+            SerialState::Ground => match byte {
+                0x1b => {
+                    self.state = SerialState::Escape;
+                    None
+                }
+                b'\r' | b'\n' => Some(KeyPress::Enter),
+                byte => Some(KeyPress::Char(byte as char)),
+            },
+            SerialState::Escape => {
+                self.state = match byte {
+                    b'[' => SerialState::Csi,
+                    b'O' => SerialState::Ss3,
+                    _ => {
+                        self.pending = Some(byte);
+                        SerialState::Ground
+                    }
+                };
+                self.primary = 0;
+                self.first_parameter = true;
+                (self.state == SerialState::Ground).then_some(KeyPress::Escape)
+            }
+            SerialState::Csi | SerialState::Ss3 => {
+                if byte == 0x1b {
+                    self.state = SerialState::Escape;
+                } else if (0x40..=0x7e).contains(&byte) {
+                    self.state = SerialState::Ground;
+                    return match byte {
+                        b'~' => match self.primary {
+                            1 | 7 => Some(KeyPress::Home),
+                            4 | 8 => Some(KeyPress::End),
+                            5 => Some(KeyPress::PageUp),
+                            6 => Some(KeyPress::PageDown),
+                            _ => None,
+                        },
+                        _ => serial_navigation_key(byte),
+                    };
+                } else if byte == b';' {
+                    self.first_parameter = false;
+                } else if self.first_parameter && byte.is_ascii_digit() {
+                    self.primary = self
+                        .primary
+                        .saturating_mul(10)
+                        .saturating_add(u16::from(byte - b'0'));
+                }
+                None
+            }
+        }
+    }
+
+    fn finish_escape(&mut self) -> Option<KeyPress> {
+        if self.state != SerialState::Escape {
+            return None;
+        }
+        self.state = SerialState::Ground;
+        Some(KeyPress::Escape)
+    }
+}
+
+fn serial_navigation_key(byte: u8) -> Option<KeyPress> {
+    match byte {
+        b'A' => Some(KeyPress::Up),
+        b'B' => Some(KeyPress::Down),
+        b'C' => Some(KeyPress::Right),
+        b'D' => Some(KeyPress::Left),
+        b'H' => Some(KeyPress::Home),
+        b'F' => Some(KeyPress::End),
+        _ => None,
+    }
+}
+
+fn read_serial_key() -> Option<KeyPress> {
+    static SERIAL: spin::Mutex<(SerialKeyParser, Option<Timeout>)> =
+        spin::Mutex::new((SerialKeyParser::new(), None));
+    let mut serial = SERIAL.lock();
+    let (parser, deadline) = &mut *serial;
+    // Bound work per poll even if serial input is continuously available.
+    for _ in 0..32 {
+        let Some(byte) = parser.pending.take().or_else(serial_driver::try_read) else {
+            break;
+        };
+        let key = parser.feed(byte);
+        *deadline = (parser.state == SerialState::Escape).then(|| Timeout::from_ms(30));
+        if key.is_some() {
+            return key;
+        }
+    }
+    if deadline.as_ref().is_some_and(Timeout::is_expired) {
+        *deadline = None;
+        return parser.finish_escape();
+    }
     None
+}
+
+#[cfg(test)]
+mod serial_tests {
+    use super::*;
+
+    #[test]
+    fn modified_and_fragmented_sequences_never_leak_editor_characters() {
+        let mut parser = SerialKeyParser::new();
+        let keys: alloc::vec::Vec<_> = b"\x1b[1;5C"
+            .iter()
+            .filter_map(|b| parser.feed(*b))
+            .collect();
+        assert_eq!(keys, [KeyPress::Right]);
+        for byte in b"\x1b[5" {
+            assert_eq!(parser.feed(*byte), None);
+        }
+        assert_eq!(parser.finish_escape(), None); // Incomplete CSI survives polls.
+        assert_eq!(parser.feed(b'~'), Some(KeyPress::PageUp));
+        for byte in b"\x1b[99;5~" {
+            assert_eq!(parser.feed(*byte), None);
+        }
+        assert_eq!(parser.feed(b'x'), Some(KeyPress::Char('x')));
+        assert_eq!(parser.feed(0x1b), None);
+        assert_eq!(parser.finish_escape(), Some(KeyPress::Escape));
+    }
+
+    #[test]
+    fn escape_does_not_eat_the_next_ordinary_character() {
+        let mut parser = SerialKeyParser::new();
+        assert_eq!(parser.feed(0x1b), None);
+        assert_eq!(parser.feed(b'f'), Some(KeyPress::Escape));
+        let pending = parser.pending.take().unwrap();
+        assert_eq!(parser.feed(pending), Some(KeyPress::Char('f')));
+    }
 }
 
 /// Clear both serial and framebuffer screens

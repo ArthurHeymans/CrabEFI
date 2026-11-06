@@ -168,7 +168,7 @@ pub fn show(fb: &FramebufferInfo) -> ScreenNav {
 fn unavailable_reason(idx: usize) -> Option<&'static str> {
     if matches!(idx, 1 | 2) && !crate::efi::auth::is_setup_mode() {
         Some("Requires Setup Mode; an owner key is already enrolled")
-    } else if idx == 4 && crate::efi::auth::boot::get_enrollment_summary() == (0, 0, 0, 0) {
+    } else if idx == 4 && !crate::efi::auth::boot::has_stored_keys() {
         Some("No keys enrolled; there is nothing to clear")
     } else {
         None
@@ -251,6 +251,7 @@ fn prepare_import(idx: usize) -> Result<Option<(PendingImport, String)>, &'stati
             } else {
                 identity.push_str(" UNSIGNED: Setup Mode provisioning only.");
             }
+            identity.push_str(" Replaces dbx: existing revocations absent from this file will be REMOVED, potentially allowing previously revoked boot software.");
             let _ = write!(identity, " File SHA256: {}.", fingerprint(&sha256(&data)));
             Ok(Some((PendingImport::Dbx(data, source), identity)))
         }

@@ -100,8 +100,17 @@ pub fn show_cfr_menu() {
 
     #[cfg(feature = "ui")]
     if let Some(fb) = crate::handoff::framebuffer() {
-        let _ = show_cfr_menu_graphical(cfr_info, &fb);
-        return;
+        // Legacy providers cannot return a destination through their bool hook.
+        // Honor navigation locally instead of silently dropping it.
+        let mut nav = show_cfr_menu_graphical(cfr_info, &fb);
+        loop {
+            nav = match nav {
+                #[cfg(feature = "secure-boot")]
+                ui::ScreenNav::Nav(NavItem::Security) => ui::secure_boot::show(&fb),
+                ui::ScreenNav::Nav(NavItem::Firmware) => show_cfr_menu_graphical(cfr_info, &fb),
+                _ => return,
+            };
+        }
     }
 
     let fb_info = crate::handoff::framebuffer();
@@ -187,6 +196,9 @@ pub fn show_cfr_menu() {
                         if has_changes(&items) && confirm_save(&mut fb_console) {
                             let (saved, failed) = save_all_changes(cfr_info, &mut items);
                             show_save_result(saved, failed, &mut fb_console);
+                            if failed > 0 {
+                                break; // Keep failed drafts available for retry or discard.
+                            }
                         }
                         return;
                     }
@@ -461,15 +473,35 @@ fn toggle_value(option: &CfrOption, value: &mut CfrValue) -> bool {
             false
         }
         (CfrOptionType::Number { min, max, step, .. }, CfrValue::Number(n)) => {
-            let new_val = (*n).saturating_add(*step);
-            if new_val <= *max {
-                *n = new_val;
-            } else {
-                *n = *min; // Wrap around
+            if min > max {
+                return false;
             }
+            *n = stepped_number(*n, *min, *max, *step, true).unwrap_or(*min);
             true
         }
         _ => false,
+    }
+}
+
+/// Move to the next representable value on the minimum-relative step grid.
+/// Never clamp to an unaligned maximum or overflow at either u32 boundary.
+fn stepped_number(current: u32, min: u32, max: u32, step: u32, forward: bool) -> Option<u32> {
+    if min > max {
+        return None;
+    }
+    let step = step.max(1);
+    if forward {
+        if current < min {
+            return Some(min);
+        }
+        let offset = (current - min) / step;
+        min.checked_add(offset.checked_add(1)?.checked_mul(step)?)
+            .filter(|next| *next <= max)
+    } else if current > min {
+        let bound = current.saturating_sub(1).min(max);
+        Some(min + (bound - min) / step * step)
+    } else {
+        None
     }
 }
 
@@ -518,14 +550,9 @@ fn increment_option(cfr: &CfrInfo, items: &mut [MenuItem], index: usize) -> bool
                 false
             }
         }
-        (CfrOptionType::Number { max, step, .. }, CfrValue::Number(n)) => {
-            let new_val = (*n).saturating_add(*step);
-            if new_val <= *max {
-                *n = new_val;
-                true
-            } else if *n < *max {
-                // Unaligned: clamp to max
-                *n = *max;
+        (CfrOptionType::Number { min, max, step, .. }, CfrValue::Number(n)) => {
+            if let Some(next) = stepped_number(*n, *min, *max, *step, true) {
+                *n = next;
                 true
             } else {
                 false
@@ -588,13 +615,9 @@ fn decrement_option(cfr: &CfrInfo, items: &mut [MenuItem], index: usize) -> bool
                 false
             }
         }
-        (CfrOptionType::Number { min, step, .. }, CfrValue::Number(n)) => {
-            if *n >= *min + *step {
-                *n -= *step;
-                true
-            } else if *n > *min {
-                // Unaligned: clamp to min
-                *n = *min;
+        (CfrOptionType::Number { min, max, step, .. }, CfrValue::Number(n)) => {
+            if let Some(next) = stepped_number(*n, *min, *max, *step, false) {
+                *n = next;
                 true
             } else {
                 false
@@ -1565,24 +1588,8 @@ fn draw_value_pill(fb: &FramebufferInfo, x: i32, y: i32, w: u32, label: &str, ed
 }
 
 #[cfg(feature = "ui")]
-fn truncate_for_width(text: &str, max_width: u32, size: FontSize) -> StackString<128> {
-    let max_chars = (max_width / render::font_width(size)).max(1) as usize;
-    let char_count = text.chars().count();
-    if char_count <= max_chars {
-        let mut out = StackString::new();
-        let _ = out.push_str(text);
-        return out;
-    }
-
-    let mut out = StackString::new();
-    for (idx, ch) in text.chars().enumerate() {
-        if idx + 1 >= max_chars {
-            let _ = out.push('~');
-            break;
-        }
-        let _ = out.push(ch);
-    }
-    out
+fn truncate_for_width(text: &str, max_width: u32, size: FontSize) -> StackString<256> {
+    render::ellipsize(text, max_width, size)
 }
 
 #[cfg(feature = "ui")]
@@ -1908,17 +1915,24 @@ fn restore_graphical_default(cfr: &CfrInfo, items: &mut [MenuItem], state: &mut 
         ));
         return;
     }
-    if let Some(MenuItem::Option {
-        form_idx,
-        option_idx,
-        current_value,
-        ..
-    }) = items.get_mut(state.selected)
-        && let Some(option) = get_option(cfr, *form_idx, *option_idx)
-    {
-        *current_value = CfrValue::from_option_type(&option.option_type);
-        state.status_message = Some(("Default restored in draft. Choose Save to keep it.", true));
+    match items.get_mut(state.selected) {
+        Some(MenuItem::CrabLogLevel { current_level, .. }) => {
+            *current_level = crate::logger::DEFAULT_LEVEL;
+        }
+        Some(MenuItem::Option {
+            form_idx,
+            option_idx,
+            current_value,
+            ..
+        }) => {
+            let Some(option) = get_option(cfr, *form_idx, *option_idx) else {
+                return;
+            };
+            *current_value = CfrValue::from_option_type(&option.option_type);
+        }
+        _ => return,
     }
+    state.status_message = Some(("Default restored in draft. Choose Save to keep it.", true));
 }
 
 /// Numeric editors accept an explicit decimal or 0x-prefixed hexadecimal value.
@@ -1967,14 +1981,17 @@ fn edit_graphical_item(
     match (&option.option_type, current_value) {
         (CfrOptionType::Bool { .. }, CfrValue::Bool(value)) => *value = !*value,
         (CfrOptionType::Enum { choices, .. }, CfrValue::Number(value)) => {
-            let labels: Vec<&str> = choices.iter().map(|c| c.ui_name.as_str()).collect();
-            if let Some(i) = dialog::select(
-                fb,
-                &option.ui_name,
-                &labels,
-                choices.iter().position(|c| c.value == *value).unwrap_or(0),
-            ) {
-                *value = choices[i].value;
+            let current = choices.iter().position(|c| c.value == *value);
+            let unknown = alloc::format!("Unlisted value {value} (keep unchanged)");
+            let mut labels: Vec<&str> = choices.iter().map(|c| c.ui_name.as_str()).collect();
+            let extra = usize::from(current.is_none());
+            if extra > 0 {
+                labels.insert(0, &unknown);
+            }
+            if let Some(i) = dialog::select(fb, &option.ui_name, &labels, current.unwrap_or(0))
+                && let Some(choice) = i.checked_sub(extra).and_then(|i| choices.get(i))
+            {
+                *value = choice.value;
             }
         }
         (CfrOptionType::Number { min, max, step, .. }, CfrValue::Number(value)) => {
@@ -2497,6 +2514,52 @@ mod graphical_tests {
         assert!(summary.contains("+98 more"));
         assert!(summary.chars().count() < 240);
         assert!(dialog::wrap_lines(&summary, 50).len() <= 6);
+    }
+
+    #[test]
+    fn shortcuts_stay_on_the_editors_step_grid_without_overflow() {
+        assert_eq!(stepped_number(10, 0, 12, 5, true), None);
+        assert_eq!(stepped_number(12, 0, 12, 5, false), Some(10));
+        assert_eq!(stepped_number(8, 2, 12, 5, true), Some(12));
+        assert_eq!(stepped_number(8, 2, 12, 5, false), Some(7));
+        assert_eq!(
+            stepped_number(u32::MAX, u32::MAX - 1, u32::MAX, 5, false),
+            Some(u32::MAX - 1)
+        );
+        assert_eq!(stepped_number(u32::MAX, 0, u32::MAX, 1, true), None);
+        assert_eq!(stepped_number(0, 0, 12, 0, true), Some(1));
+        for n in 0..=12 {
+            for forward in [false, true] {
+                if let Some(next) = stepped_number(n, 0, 12, 5, forward) {
+                    assert!(parse_graphical_number(&alloc::format!("{next}"), 0, 12, 5).is_ok());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn long_help_text_is_capacity_aware_on_wide_displays() {
+        let text = "Description ".repeat(30);
+        let label = truncate_for_width(&text, 1800, FontSize::Small);
+        assert!(label.starts_with("Description "));
+        assert!(label.ends_with('~'));
+        assert!(label.len() <= 256);
+    }
+
+    #[test]
+    fn log_level_default_updates_the_draft_and_feedback() {
+        let cfr = CfrInfo::new();
+        let mut items = alloc::vec![MenuItem::CrabLogLevel {
+            current_level: log::LevelFilter::Trace,
+            original_level: log::LevelFilter::Trace,
+        }];
+        let mut state = GraphicalState::new(0);
+        restore_graphical_default(&cfr, &mut items, &mut state);
+        assert!(
+            matches!(items[0], MenuItem::CrabLogLevel { current_level, original_level }
+            if current_level == crate::logger::DEFAULT_LEVEL && original_level == log::LevelFilter::Trace)
+        );
+        assert!(state.status_message.is_some_and(|(_, ok)| ok));
     }
 
     #[test]

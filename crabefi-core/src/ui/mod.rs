@@ -467,16 +467,14 @@ fn run_boot(fb: &FramebufferInfo, menu: &mut BootMenu) -> BootResult {
     keep_boot_selection_visible(fb, &mut st);
 
     paint_boot(fb, menu, &st);
-    let mut pointer = mouse_cursor::position();
+    let pointer_origin = mouse_cursor::position();
 
     loop {
         poll_and_render_cursor(fb, &mut cursor);
-        let new_pointer = mouse_cursor::position();
-        if new_pointer != pointer {
-            pointer = new_pointer;
-            if cancel_boot_countdown(menu, &mut st) {
-                cursor.while_hidden(fb, || paint_boot_footer(fb, &st));
-            }
+        if deliberate_pointer_motion(pointer_origin, mouse_cursor::position())
+            && cancel_boot_countdown(menu, &mut st)
+        {
+            cursor.while_hidden(fb, || paint_boot_footer(fb, &st));
         }
 
         update_sidebar_hover(fb, &mut cursor, &mut st.sidebar_hov, NavItem::Boot);
@@ -582,6 +580,12 @@ fn run_boot(fb: &FramebufferInfo, menu: &mut BootMenu) -> BootResult {
         }
         delay_ms(8);
     }
+}
+
+/// Ignore small sensor jitter, but allow slow intentional motion to accumulate
+/// relative to the initial position. Clicks and scrolling still cancel at once.
+fn deliberate_pointer_motion(origin: (i32, i32), current: (i32, i32)) -> bool {
+    origin.0.abs_diff(current.0) >= 8 || origin.1.abs_diff(current.1) >= 8
 }
 
 /// Cancellation belongs to the menu session, not an individual screen visit.
@@ -710,8 +714,11 @@ fn run_no_media(fb: &FramebufferInfo) -> ScreenNav {
 
 fn boot_list_area(fb: &FramebufferInfo) -> (i32, i32, u32, u32) {
     let (cx, cy, cw, ch) = canvas(fb);
-    let header_h =
-        render::font_height(FontSize::Small) + 4 + render::font_height(FontSize::Display) + 12;
+    let header_h = if fb.height < 400 {
+        render::font_height(FontSize::Heading) + 12
+    } else {
+        render::font_height(FontSize::Small) + 4 + render::font_height(FontSize::Display) + 12
+    };
     let y = cy + header_h as i32;
     (cx, y, cw, ch.saturating_sub(header_h + 28))
 }
@@ -765,25 +772,31 @@ fn paint_boot(fb: &FramebufferInfo, menu: &BootMenu, st: &BState) {
 
     let (cx, cy, _cw, _) = canvas(fb);
 
-    // Section label with letter-spacing
+    // Compact the heading before allowing the list to overlap the countdown.
     let mut y = cy;
-    render::draw_text_spaced(
-        fb,
-        cx,
-        y,
-        "PRIORITY SEQUENCE",
-        FontSize::Small,
-        3,
-        theme::PRIMARY.darken(80),
-        None,
-    );
-    y += render::font_height(FontSize::Small) as i32 + 4;
+    if fb.height >= 400 {
+        render::draw_text_spaced(
+            fb,
+            cx,
+            y,
+            "PRIORITY SEQUENCE",
+            FontSize::Small,
+            3,
+            theme::PRIMARY.darken(80),
+            None,
+        );
+        y += render::font_height(FontSize::Small) as i32 + 4;
+    }
     render::draw_text(
         fb,
         cx,
         y,
         "Boot Selection",
-        FontSize::Display,
+        if fb.height < 400 {
+            FontSize::Heading
+        } else {
+            FontSize::Display
+        },
         theme::TEXT,
         None,
     );
@@ -997,7 +1010,7 @@ fn paint_boot_footer(fb: &FramebufferInfo, st: &BState) {
     draw_footer(
         fb,
         if cfg!(feature = "secure-boot") {
-            "Arrows/Pg/Home/End Select   Enter Boot   S Security   F Firmware"
+            "Up/Down/Pg/Home/End Select   Enter Boot   S Security   F Firmware"
         } else {
             "Up/Down Select   Enter / Click again Boot   F Firmware"
         },
@@ -1134,6 +1147,27 @@ mod tests {
         assert_eq!(page_selection(KeyPress::PageDown, 38, 40, 6), Some(39));
         assert_eq!(page_selection(KeyPress::PageUp, 2, 40, 6), Some(0));
         assert_eq!(page_selection(KeyPress::PageDown, 0, 0, 6), None);
+    }
+
+    #[test]
+    fn mouse_jitter_does_not_cancel_unattended_boot() {
+        for x in 393..408 {
+            assert!(!deliberate_pointer_motion((400, 300), (x, 301)));
+        }
+        assert!(deliberate_pointer_motion((400, 300), (408, 300)));
+        assert!(deliberate_pointer_motion((400, 300), (400, 292)));
+    }
+
+    #[test]
+    fn short_boot_framebuffer_keeps_the_card_above_the_countdown() {
+        let mut mem = std::vec![0; 800 * 240];
+        let mut fb = framebuffer(&mut mem);
+        fb.width = 800;
+        fb.height = 240;
+        fb.stride = 800;
+        let state = BState::new(1, 0, 5);
+        let (_, y, _, h) = card_rect(&fb, &state, 0).unwrap();
+        assert!(y + h as i32 <= (fb.height - theme::FOOTER_H - 28) as i32);
     }
 
     #[test]

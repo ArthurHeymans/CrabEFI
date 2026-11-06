@@ -41,6 +41,7 @@
 use crabefi_efi_types::{
     authentication::{
         EfiTime, EfiVariableAuthentication2, SignatureIterator, SignatureListIterator,
+        validate_signature_database,
     },
     secure_boot::{
         DBX_NAME, EFI_CERT_SHA256_GUID, EFI_CERT_TYPE_PKCS7_GUID, EFI_CERT_X509_GUID,
@@ -246,28 +247,30 @@ pub(crate) fn enroll_dbx_data(
     let source_str = source.as_str();
     log::info!("Found dbx update ({} bytes) on {}", data.len(), source_str);
 
-    let (result, attributes) = match source {
-        DbxSource::Authenticated(src) => (
-            apply_authenticated_dbx_update(&data, src)?,
-            super::attributes::SECURE_BOOT_ATTRS,
-        ),
+    let result = match source {
+        DbxSource::Authenticated(src) => apply_authenticated_dbx_update(&data, src)?,
         DbxSource::Raw(src) => {
             if !is_setup_mode() {
                 log::error!("Raw dbx files require Setup Mode");
                 return Err(AuthError::SignatureVerificationFailed);
             }
-            (
-                apply_raw_dbx_update(&data, src)?,
-                super::attributes::SECURE_BOOT_ATTRS
-                    & !super::attributes::TIME_BASED_AUTHENTICATED_WRITE_ACCESS,
-            )
+            let result = apply_raw_dbx_update(&data, src)?;
+            // Setup Mode may omit a signature, but not authentication history.
+            // Reuse firmware enrollment's strictly newer timestamped envelope,
+            // including when dbx was previously deleted authentically.
+            super::boot::persist_key_variable(
+                crabefi_efi_types::secure_boot::SecureBootVariable::Dbx,
+                &data,
+            )?;
+            super::boot::refresh_key_databases();
+            return Ok(result);
         }
     };
 
     let status = crate::efi::runtime_image::client::variables::set(
         &r_efi::efi::Guid::from_bytes(&EFI_IMAGE_SECURITY_DATABASE_GUID),
         DBX_NAME,
-        attributes,
+        super::attributes::SECURE_BOOT_ATTRS,
         &data,
     );
     if status != r_efi::efi::Status::SUCCESS {
@@ -310,6 +313,10 @@ fn inspect_authenticated_dbx_update(
     data: &[u8],
     source: &'static str,
 ) -> Result<DbxPreview, AuthError> {
+    // Runtime authentication has a tighter envelope bound than ESP loading.
+    if data.len() > 48 * 1024 {
+        return Err(AuthError::BufferTooSmall);
+    }
     // Parse the EFI_VARIABLE_AUTHENTICATION_2 header
     let auth_header = EfiVariableAuthentication2::from_bytes(data).ok_or_else(|| {
         log::error!("Failed to parse EFI_VARIABLE_AUTHENTICATION_2 header");
@@ -317,7 +324,10 @@ fn inspect_authenticated_dbx_update(
     })?;
 
     // Verify the certificate type is PKCS#7
-    if auth_header.auth_info.cert_type != EFI_CERT_TYPE_PKCS7_GUID {
+    if auth_header.auth_info.cert_type != EFI_CERT_TYPE_PKCS7_GUID
+        || auth_header.auth_info.hdr.w_revision != super::WIN_CERT_REVISION
+        || auth_header.auth_info.hdr.w_certificate_type != super::WIN_CERT_TYPE_EFI_GUID
+    {
         log::error!("dbx update certificate type is not PKCS#7");
         return Err(AuthError::InvalidHeader);
     }
@@ -336,7 +346,7 @@ fn inspect_authenticated_dbx_update(
 
     // Anti-downgrade check: verify timestamp is newer than current dbx
     {
-        let current_timestamp = super::boot::dbx_replay_floor();
+        let current_timestamp = super::boot::dbx_replay_floor()?;
         if !update_timestamp.is_after(&current_timestamp) {
             log::error!(
                 "dbx update timestamp is not newer than current (possible downgrade attack)"
@@ -432,10 +442,26 @@ fn build_dbx_signed_data(timestamp: &EfiTime, content: &[u8]) -> Vec<u8> {
 
 /// Verify the dbx update signature against KEK or PK
 fn verify_dbx_signer(pkcs7_data: &[u8], signed_data: &[u8]) -> Result<Option<[u8; 32]>, AuthError> {
+    // Boot image verification supports larger RSA keys than authenticated
+    // runtime variables. Do not ask for consent to a signer runtime cannot use.
+    let signed =
+        crabefi_pkcs7::cms::SignedData::parse(pkcs7_data).map_err(|_| AuthError::InvalidHeader)?;
+    for (i, certificate) in signed.certificates().enumerate() {
+        if i >= 16 || certificate.tag != crabefi_pkcs7::der::tag::SEQUENCE {
+            return Err(AuthError::InvalidHeader);
+        }
+        validate_dbx_certificate(certificate.encoded)?;
+    }
+    if signed.signers().count() > 8 {
+        return Err(AuthError::InvalidHeader);
+    }
     // Try to verify against KEK certificates
     {
         let kek = kek_database();
         for cert_data in kek.x509_certificates() {
+            if validate_dbx_certificate(cert_data).is_err() {
+                continue;
+            }
             match verify_pkcs7_signature_chain(pkcs7_data, signed_data, cert_data, true) {
                 Ok(Some(chain)) => {
                     log::info!("dbx update verified with KEK certificate");
@@ -454,6 +480,9 @@ fn verify_dbx_signer(pkcs7_data: &[u8], signed_data: &[u8]) -> Result<Option<[u8
     {
         let pk = pk_database();
         for cert_data in pk.x509_certificates() {
+            if validate_dbx_certificate(cert_data).is_err() {
+                continue;
+            }
             match verify_pkcs7_signature_chain(pkcs7_data, signed_data, cert_data, true) {
                 Ok(Some(chain)) => {
                     log::info!("dbx update verified with PK certificate");
@@ -472,11 +501,40 @@ fn verify_dbx_signer(pkcs7_data: &[u8], signed_data: &[u8]) -> Result<Option<[u8
     Ok(None)
 }
 
+/// Match runtime authenticated-variable certificate limits, not the more
+/// permissive boot-image RSA verifier (which also supports 8192-bit keys).
+fn validate_dbx_certificate(der: &[u8]) -> Result<(), AuthError> {
+    use crabefi_pkcs7::x509::{AlgorithmIdentifier, Certificate};
+    if der.len() > 16 * 1024 {
+        return Err(AuthError::BufferTooSmall);
+    }
+    let cert = Certificate::parse(der).map_err(|_| AuthError::CertificateParseError)?;
+    let algorithm = AlgorithmIdentifier::parse(cert.signature_algorithm)
+        .map_err(|_| AuthError::CertificateParseError)?;
+    if !algorithm.is(crabefi_pkcs7::oid::SHA256_WITH_RSA_ENCRYPTION) {
+        return Err(AuthError::CryptoError);
+    }
+    let key = cert
+        .rsa_public_key()
+        .map_err(|_| AuthError::CertificateParseError)?;
+    if !runtime_rsa_supported(key.modulus.len(), key.exponent()) {
+        return Err(AuthError::CryptoError);
+    }
+    Ok(())
+}
+
+fn runtime_rsa_supported(bytes: usize, exponent: Option<u64>) -> bool {
+    bytes <= 512 && exponent.is_some_and(|exponent| exponent <= u32::MAX as u64)
+}
+
 /// Apply signature list entries to the dbx database
 fn apply_signature_list_entries(
     data: &[u8],
     source: &'static str,
 ) -> Result<DbxEnrollmentResult, AuthError> {
+    if !validate_signature_database(data) {
+        return Err(AuthError::InvalidHeader);
+    }
     let mut sha256_count = 0usize;
     let mut x509_count = 0usize;
 
@@ -514,4 +572,49 @@ fn apply_signature_list_entries(
         x509_count,
         source,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn signature_list() -> Vec<u8> {
+        let mut data = Vec::new();
+        data.extend_from_slice(&EFI_CERT_SHA256_GUID);
+        data.extend_from_slice(&76u32.to_le_bytes());
+        data.extend_from_slice(&0u32.to_le_bytes());
+        data.extend_from_slice(&48u32.to_le_bytes());
+        data.extend_from_slice(&[0; 16]);
+        data.extend_from_slice(&[0xab; 32]);
+        data
+    }
+
+    #[test]
+    fn preview_rejects_a_valid_prefix_followed_by_malformed_data() {
+        let mut data = signature_list();
+        assert_eq!(apply_raw_dbx_update(&data, "test").unwrap().sha256_count, 1);
+        data.push(0);
+        assert!(matches!(
+            apply_raw_dbx_update(&data, "test"),
+            Err(AuthError::InvalidHeader)
+        ));
+        data.extend_from_slice(&signature_list());
+        assert!(apply_raw_dbx_update(&data, "test").is_err());
+    }
+
+    #[test]
+    fn preview_matches_runtime_rsa_limits() {
+        assert!(runtime_rsa_supported(256, Some(65537)));
+        assert!(runtime_rsa_supported(512, Some(65537)));
+        assert!(!runtime_rsa_supported(1024, Some(65537)));
+        assert!(!runtime_rsa_supported(256, Some(1 << 32)));
+        assert!(!runtime_rsa_supported(256, None));
+        assert!(
+            validate_dbx_certificate(include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../crabefi-pkcs7/testdata/ca.der"
+            )))
+            .is_ok()
+        );
+    }
 }
