@@ -330,7 +330,9 @@ where
             break;
         }
         let mut data = vec![0u8; data_size_field as usize];
-        if !read_fn(data_offset, &mut data) {
+        // Authenticated deletion records have no payload. Some flash backends
+        // reject even an empty read at the exclusive end of their mapping.
+        if !data.is_empty() && !read_fn(data_offset, &mut data) {
             break;
         }
 
@@ -749,6 +751,30 @@ mod tests {
         assert_eq!(variables[0].guid, guid);
         assert_eq!(variables[0].name, name);
         assert_eq!(variables[0].data, b"policy");
+    }
+
+    #[test]
+    fn deletion_at_region_end_keeps_its_timestamp_without_an_empty_read() {
+        let guid = [0x5a; 16];
+        let name = [b'd' as u16, b'b' as u16, b'x' as u16, 0];
+        let mut record = build_variable_record(&guid, &name, 0x27, &[], Some(timestamp())).unwrap();
+        record[2] = VAR_ADDED;
+        let data_size = record.len() as u32;
+        let mut region = vec![0xff; VARIABLE_DATA_OFFSET as usize];
+        region.extend_from_slice(&record);
+        let mut read = |offset: u32, output: &mut [u8]| {
+            assert!(!output.is_empty(), "never read an empty tombstone payload");
+            let start = offset as usize;
+            let Some(source) = region.get(start..start + output.len()) else {
+                return false;
+            };
+            output.copy_from_slice(source);
+            true
+        };
+        let variables = walk_variables(&mut read, true, data_size);
+        assert_eq!(variables.len(), 1);
+        assert!(variables[0].data.is_empty());
+        assert_eq!(variables[0].timestamp, Some(timestamp()));
     }
 
     #[test]
