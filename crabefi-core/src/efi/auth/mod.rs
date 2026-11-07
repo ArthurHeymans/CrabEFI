@@ -314,6 +314,9 @@ pub enum AuthError {
     ChainTooDeep,
     /// Could not build a valid certificate chain to a trusted root
     ChainBuildingFailed,
+    /// Enrollment failed after some key databases were already persisted;
+    /// the stored keys no longer match either the old or the reviewed set.
+    PartialEnrollment,
 }
 
 /// DER decode failures are certificate-structure errors. Boundaries that
@@ -335,6 +338,7 @@ impl From<AuthError> for r_efi::efi::Status {
             AuthError::SignatureVerificationFailed => r_efi::efi::Status::SECURITY_VIOLATION,
             AuthError::NoSuitableKey => r_efi::efi::Status::SECURITY_VIOLATION,
             AuthError::CertificateParseError => r_efi::efi::Status::INVALID_PARAMETER,
+            AuthError::PartialEnrollment => r_efi::efi::Status::DEVICE_ERROR,
             AuthError::CertificateNotYetValid => r_efi::efi::Status::SECURITY_VIOLATION,
             AuthError::CertificateExpired => r_efi::efi::Status::SECURITY_VIOLATION,
             AuthError::CertificateNotCA => r_efi::efi::Status::SECURITY_VIOLATION,

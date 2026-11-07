@@ -51,7 +51,7 @@ impl MenuOption {
                     "Enroll Custom PK (requires Setup Mode)"
                 }
             }
-            MenuOption::ImportDbxUpdate => "Import dbx Update from ESP (EFI\\keys\\dbx.bin)",
+            MenuOption::ImportDbxUpdate => "Import dbx Update from ESP (EFI\\keys\\dbxupdate.auth)",
             MenuOption::ClearAllKeys => "Clear All Keys (return to Setup Mode)",
             MenuOption::ReturnToBootMenu => "Return to Boot Menu",
         }
@@ -296,7 +296,7 @@ fn enroll_default_keys() -> Result<(), &'static str> {
 }
 
 /// Enroll custom PK from ESP
-fn enroll_custom_pk() -> Result<&'static str, &'static str> {
+pub(crate) fn enroll_custom_pk() -> Result<&'static str, &'static str> {
     use crate::efi::auth::key_files;
 
     match key_files::enroll_pk_from_file() {
@@ -309,16 +309,23 @@ fn enroll_custom_pk() -> Result<&'static str, &'static str> {
                 _ => Ok("Custom PK enrolled successfully!"),
             }
         }
-        Err(auth::AuthError::NoSuitableKey) => {
-            Err("No PK file found (place PK.cer in EFI\\keys\\)")
+        Err(error) => Err(custom_pk_error(error)),
+    }
+}
+
+pub(crate) fn custom_pk_error(error: auth::AuthError) -> &'static str {
+    match error {
+        auth::AuthError::NoSuitableKey => "No PK file found (place PK.cer in EFI\\keys\\)",
+        auth::AuthError::CertificateParseError => "Invalid certificate format",
+        auth::AuthError::PartialEnrollment => {
+            "Enrollment only partly applied; check the key state above, then retry or clear keys"
         }
-        Err(auth::AuthError::CertificateParseError) => Err("Invalid certificate format"),
-        Err(_) => Err("Failed to enroll custom PK"),
+        _ => "Failed to enroll custom PK",
     }
 }
 
 /// Import dbx (forbidden signature database) update from ESP
-fn import_dbx_update() -> Result<&'static str, &'static str> {
+pub(crate) fn import_dbx_update() -> Result<&'static str, &'static str> {
     use crate::efi::auth::dbx_update;
 
     match dbx_update::enroll_dbx_from_file() {
@@ -339,11 +346,32 @@ fn import_dbx_update() -> Result<&'static str, &'static str> {
                 _ => Ok("dbx update imported successfully!"),
             }
         }
-        Err(auth::AuthError::NoSuitableKey) => {
-            Err("No dbx file found (place dbx.bin in EFI\\keys\\)")
+        Err(error) => Err(dbx_error(error)),
+    }
+}
+
+pub(crate) fn dbx_error(error: auth::AuthError) -> &'static str {
+    match error {
+        auth::AuthError::NoSuitableKey if auth::is_setup_mode() => {
+            "No dbx found; use dbxupdate.auth, dbx.bin or dbx.esl in EFI\\keys\\"
         }
-        Err(auth::AuthError::InvalidHeader) => Err("Invalid dbx file format"),
-        Err(_) => Err("Failed to import dbx update"),
+        auth::AuthError::NoSuitableKey => {
+            "No signed dbx found; use EFI\\keys\\dbxupdate.auth or dbx.auth"
+        }
+        auth::AuthError::InvalidTimestamp => {
+            "dbx timestamp is invalid or not newer; obtain a newer update"
+        }
+        auth::AuthError::SignatureVerificationFailed => {
+            "dbx rejected; verify the update is signed by an enrolled KEK or PK"
+        }
+        auth::AuthError::AccessDenied => {
+            "Runtime refused dbx; check authentication history, policy or variable storage"
+        }
+        auth::AuthError::BufferTooSmall => {
+            "Not enough variable storage for dbx; free space before retrying"
+        }
+        auth::AuthError::InvalidHeader => "Invalid dbx file format",
+        _ => "Failed to import dbx update",
     }
 }
 
